@@ -2713,6 +2713,217 @@ The sampler's EL1 share disagrees with the resident buckets (`hackbench` 70% aga
 at EL1), so its numbers are used only within EL0. The fill table of the PCID counter is 64 Ki entries: `mem`'s working set
 overflows it (3.5 M collisions), so its refault count is a lower bound (its first-in-root installs, 79 k, bound the rest).
 
+### Measured (chunk 25: an STI that starts its block, and STMXCSR/VSTMXCSR, translated inline, November 5; uncommitted on afb2897, series60-stmxcsr)
+
+Evidence: `natemu-raw/inline2-20261105-01/` (README there). FEX: two commits on the fork clone's local branch `natemu-chunk25`
+(from `natemu` 455698b5, not pushed): 09dd3ca19 (FexcInterruptFlagOp's comment: an inline STI may start its block; no code
+change) and ab62c7e06 (STMXCSR, which VSTMXCSR dispatches to, stores a new op `FexcMxcsr` under slice 1). Compilers
+series59-sti (09dd3ca19) and series60-stmxcsr (ab62c7e06), each with this tree's shim; natemu's submodule pin is unchanged.
+
+**Measured first** (`meas/`; HEAD's code with scratch counters in a perf resident, `meas/scratch-count.diff`, not kept; one
+run each, whole run with boot). Resident-run STIs, all at CPL 0, IF = 0 before every one:
+
+| | `locks` 1 | `mem` 1 | `hackbench` 1 | `build` 1 | `build` 4 | installer 1 | `luajit` 1 | `zstd` 1 | `cray` 1 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| STIs run by the resident, k | 6,374 | 4,661 | 581 | 387 | 382 | 312 | 209 | 172 | 124 |
+| reached by a literal exit / the dispatcher's miss, k | 122 / 6,252 | 4,574 / 87 | 548 / 33 | 374 / 13 | 368 / 14 | 298 / 15 | 200 / 9 | 165 / 7 | 122 / 2 |
+| an event held there (IF = 0, one pending) | 399 | 672 | 989 | 213 | 366 | 194 | 87 | 81 | 58 |
+| next instruction a block / a system instruction, k | 6,373 / 0 | 4,660 / 0 | 580 / 0 | 387 / 0 | 379 / 2.7 | 312 / 0 | 209 / 0 | 172 / 0 | 124 / 0 |
+
+None followed another system instruction in the same lookup; the rest (a few hundred) were shadow steps with an event
+pending. So every one is first in its block and the chunk-15 rule "never first" alone keeps it the resident's: the next
+instruction is always translatable. In this kernel 561 of its 569 STI sites follow a `call` (static count over
+`vmlinux.elf`), so the STI starts the block entered when the call returns (Linux's `local_irq_enable()` after an out-of-line
+call); `locks` reaches it by `ret` (the dispatcher's miss), `mem` and the rest by literal exits. VSTMXCSR: 4,000,000 on
+`luajit` N = 1, all at CPL 3 and reached by literal exits, STMXCSR 0-1 elsewhere;
+LDMXCSR and VLDMXCSR 2.2-2.5 k per run on every workload, so LDMXCSR is not built. The run-time decodes put the VSTMXCSRs at
+two RIPs of the statically linked `luajit`, each `vstmxcsr [rsp+0x18]; mov edx, [rsp+0x18]; ...; and edx, 0x6000; jne`:
+glibc libm's rounding-mode guard (SET_RESTORE_ROUND: read MXCSR, LDMXCSR only when RC is not round-to-nearest) in its FMA
+`sin`/`cos` (the `|x|` high-word test follows); the same guard is in 36 VSTMXCSR and the STMXCSR sites of the dynamic
+`libm.so.6` and in glibc's `fe*` functions. Estimate (chunk 24): `locks` 0.8-1.1 s, `mem` 1.07 s, `luajit` 1.09 s; go.
+
+**Built.**
+1. **STI first in its block** (shim `Cut`, admission, host, abi, resident).
+   - fexc: under `--cpl0` the one-byte STI is translated wherever the next instruction is (`Follows`: not last, not before
+     a REP string, LOCK NEG or a system instruction), now also as its block's first instruction. Its code is chunk 15's:
+     a load of the event-pending byte; set, a literal exit to its own RIP (here the block's own start); clear, IF = 1.
+   - Admission (`interrupt_flag`) admits an STI at guest offset 0 and returns it as the block's `sti_first`; the host passes it
+     with the reply (`State::sti_first`); the resident marks the block (`cache::STI_FIRST`, kept by the in-resident copies of
+     chunk 10 and compared by their check).
+   - `find`: a found block (kept, copied or just placed) marked STI_FIRST is not entered when its STI would take the slow
+     path at this very boundary or must not run as its first instruction: IF = 0 with an event held (`events::held`, what
+     `enter` would write into the pending byte), a MOV SS or STI shadow (entering would end it before the STI completes,
+     and the STI's exit to its own start would then put a boundary inside it), or RF set (that exit would clear RF with no
+     instruction completed). There the resident runs the STI itself (`system`, as its kept decode ran before: shadow, the
+     step of the next instruction, the delivery) and the search goes on after it.
+   - Linker: a block marked STI_FIRST is never linked to one marked STI_FIRST at the same RIP, i.e. to itself (the exit
+     of its STI to its own start must reach `find`; linked, an event held would loop in generated code). Its other exits and every exit into it link as before.
+2. **STMXCSR / VSTMXCSR** (FEX ab62c7e06, shim, abi, admission field, resident).
+   - fexc: the plain STMXCSR m32 (0f ae /3, no 66/F2/F3) is translated, gated as every SSE form (`--sse-gated` cuts it: #UD
+     with CR0.EM or without CR4.OSFXSR, #NM with CR0.TS, the resident's); VSTMXCSR m32 likewise with the AVX gating (VEX.L 1
+     and VEX.vvvv other than 1111b stay #UD cuts); LDMXCSR and VLDMXCSR stay the resident's. The value is `FexcMxcsr`
+     (JIT form in `fexc_sites.inc`): `ldr wD, [x28, #mxcsr]; mrs x0, fpsr; ldrb w1, [x28, #simd_flags]; orr; and w1, w0, #1;
+     orr; ubfx w1, w0, #1, #4; orr .., lsl #2; ubfx w0, w0, #7, #1; bic w0, w0, wD, lsr #6; orr .., lsl #1`, stored by an
+     ordinary access site (#PF, #GP/#SS non-canonical, #AC at CPL 3 with AC, data breakpoints, the page-crossing split).
+   - The resident writes MXCSR (controls and the flags banked so far) into FEX's `CPUState::mxcsr` (`frame::MXCSR`, 0x3cc) at
+     every `enter` and never reads it back; admission lets generated code load those 4 bytes (`frame::GUEST_STATE`).
+   - No change at CPL: STMXCSR is not privileged and the field holds the vCPU's own MXCSR.
+
+**Why it is exact.**
+- *STI.* At CPL 0 STI cannot fault (CPL <= IOPL; no VME/PVI in 64-bit mode); IF = 1, and the shadow only when IF was 0 (SDM
+  Vol.2 STI; Vol.3 7.8.1). Where the inline STI runs, nothing is pending (else `find` ran it) and its next instruction is in
+  the same block, so the shadow's boundary is inside the block: an event arriving after the STI arms a stop taken at a
+  later exit (chunk 15's argument, unchanged); one arriving before its pending-byte load, at the block's first word, stops
+  there at once (`interrupted`; no block marked STI_FIRST is entered with a shadow, so `shadow_entry` never names it) and
+  `find` runs the STI; one arriving between the first word and the load writes the byte, the STI exits to its own start, an
+  instruction boundary at which no instruction ran, and `find` runs it there. Every entry into such a block outside `find`
+  (a link, the dispatcher's L1, `sys_fast`'s direct entry) reaches the STI with the pending byte written at its chain's
+  entry or by a doorbell since, so the worst case is that one exit. NMIs: taken by `find` at the STI's boundary when
+  unblocked (they do not need IF), blocked in the STI shadow as before (the model's choice). MOV SS then STI: the shadow
+  condition sends it to the resident, which keeps the MOV SS shadow over the STI and lets the STI replace it. TF: blocks
+  never run with TF (steps are compiled without `--cpl0`, so a traced STI is decoded and the resident's). An instruction
+  breakpoint at the STI: found by `find` before the lookup; with RF set the resident runs the STI. So every STI either runs
+  as before (the resident's transaction at the same boundary) or inline exactly as chunk 15's mid-block STI does.
+- *STMXCSR.* x86 stores MXCSR, flags included, and changes nothing else; a fault on the store leaves memory and MXCSR as
+  they were (SDM Vol.2 STMXCSR). natemu's MXCSR at an instruction boundary inside a block is, by `sse::bank`, the bank's
+  value at the block chain's entry OR `mxcsr_flags(FPSR | SIMD flag byte, that value)`: FPSR is cleared and the byte emptied
+  at every `enter`, linked blocks keep accumulating both, x87 ops save and restore FPSR around themselves, and the resident's
+  mid-block work (helpers, divisions, shadow misses, splits, doorbells) resumes with the captured FPSR and does not rewrite
+  the page, while every change of MXCSR's controls (LDMXCSR, FXRSTOR, XRSTOR, #XM) is a resident transaction followed by an
+  `enter`. `FexcMxcsr` computes exactly that value at the instruction (DE from IDC only without DAZ, as the bank), so the
+  stored word equals what the resident's STMXCSR stored after banking. Gating comes first (a cut), then the store's own
+  faults (its site), as the SDM orders them; with the store faulting nothing is written and the bank later ORs the same
+  flags it would have anyway.
+
+**Admission and code shape.** Host tests (with `FEXC`): `cpl0_translates_cli_and_sti_inline` (STI first: inline, marked,
+its exit to its own start a link point; first but before HLT, a REP string, LOCK NEG or alone: the resident's; a CPL-3
+request cuts it), `interrupt_flag_forms` (STI first admitted, also twice; first before a self-exit or alone refused),
+`stmxcsr_is_translated` (STMXCSR with FS, with SIB, after an ADDSS, VSTMXCSR: translated and admitted with the code shape at
+either CPL; LDMXCSR, VLDMXCSR, the SSE- and AVX-gated forms cut), `guest_state_fields_and_i1_words` and the abi layout test
+with the new readable field; `test_slice1.py` (VSTMXCSR and STMXCSR translated, LDMXCSR/VLDMXCSR cut). Containment: the
+STI's exit is to a RIP of the block's own bytes through the linker's usual checks; the MXCSR field is this vCPU's own
+architectural state (a guest store into the page, the recorded deviation, changes what its STMXCSRs store until the next
+entry, as for FCW's field: recorded in abi `GUEST_STATE_VA`); `FexcMxcsr` adds no word class the code shape did not know
+(`mrs fpsr` was already admitted for the I5c checks).
+
+**Tests.** `run_k2.py stifirst` (new, judged by the SDM and the delivery model, CPL 0, the program's own IDT, at block
+sizes default and 1 where noted): `held-find` (a hook posts 0x40, then `sti; inc r9; inc r10`: taken once after `inc r9`),
+`held-linked` (2,000 rounds; in round 1,001 the event is posted before a JMP already linked to the STI's block, which is
+entered with it held: taken once after the next instruction, R9 = R10 + 1), `nmi-held` (0x40 and an NMI before the STI: the
+NMI at the STI with IF = 0 in its frame, then 0x40 after `inc r9`), `mov-ss` (`mov ss; sti` with 0x40 held), `tf` (#DB after
+each of six traced instructions from the STI on), `forge-pending` (1,000 rounds of a CPL-0 store of 1 into the
+event-pending byte, then a linked JMP to the STI: every round completes), `cpl3-forge` (CPL 3 stores 1 into the pending
+byte and 0 into IF's, takes 0x40 at CPL 3, SYSCALLs into a kernel side that starts with STI: IF = 1 after it and back at CPL
+3), `kicks-jmp`, `kicks-ret`, `kicks-movss` (4,000,000 rounds `cli; inc [W1]; X; sti; inc [W2]` with X a JMP, a CALL to a RET,
+or `mov eax, ss; mov ss, eax`, under 0x40 and NMIs posted at random times: no 0x40 with IF = 0 or right after the STI, no NMI
+right after the STI (nor at it after MOV SS), W1 = W2, more than 100 of each taken); at the default size no STI is decoded
+but under TF and after MOV SS with an event held. `run_k2.py stmxcsr` (new, judged by the SDM and by the resident's FXSAVE
+of the same state, CPL 0 and 3, block sizes default and 1): `flags` (SQRTSS of -1, 1 + the smallest denormal, 1 / 0,
+FLT_MAX * 2, FLT_MIN * FLT_MIN, 1 + 2^-30, each on a fresh MXCSR, the last by VSTMXCSR: IE, DE PE, ZE, OE PE, UE PE, PE;
+IE, ZE, PE raised in three blocks with a CPUID between: all three), `controls` (LDMXCSR of every flag, of FTZ | RC 11 | DAZ,
+of RC 01: stored as loaded; DAZ with a denormal: no flag; FTZ with FLT_MIN * 0.5: UE PE; ZM unmasked: PE through the SIMD
+flag byte), `place` (odd and page-crossing destinations), `ac` (CPL 3 with CR0.AM and AC: #AC(0) at the STMXCSR, nothing
+stored); no STMXCSR or VSTMXCSR decoded. The existing STMXCSR/VSTMXCSR fault cases (`run_slice1_faults.py`: read-only and
+crossing destinations, non-canonical through RSP, FS, the CR0/CR4/XCR0 gating) and the event programs (`ev-sti-ret`, `-jmp`,
+`ev-mov-ss*`: STIs that start their blocks) now run the new forms.
+
+Negative controls (`nc/mutant-*.diff`, `nc/red-*.txt`; scratch builds, reverted): `find` never running the STI itself:
+7 cases red (`held-find`, `held-linked`, `nmi-held`, `mov-ss`, the three kicks: the vCPU loops between the STI's exit and its
+block until the watchdog); the linker allowed to link the block to itself: `forge-pending` red (stuck at round 2); the
+shadow condition dropped: `kicks-movss` red (139 NMIs at the STI after MOV SS); the field not written at `enter`: 12 of 14
+`stmxcsr` cases red; written without its flags: 12 red; `FexcMxcsr` without FPSR: 4 red (`flags` and `controls`, default size;
+at size 1 every flag is banked by the exit before the STMXCSR's block, so the field path alone is exercised there), without
+the SIMD flag byte: `controls` red (the unmasked case), with the flag field shifted by 1: 4 red. Not controls by
+construction: the RF condition (it only matters when an event arrives between the block's entry and its STI's load, not
+reproducible on demand), and `FexcMxcsr`'s DAZ term (with FEAT_AFP's FIZ an input flushed under DAZ does not set IDC, so
+the term never fires on this host; it keeps the value equal to the bank's formula).
+
+**Measured** (`camp/`, `camp2/`: `campaign25.sh`, `campaign25b.sh`, `summ25.py`; the `natemu` stub, cache off,
+`mitigations=off nokaslr`, 2 GiB; base: HEAD's code with series58-channel-r1; change 1: STI first (series59-sti); change 2:
+both changes (series60-stmxcsr); interleaved, the order rotating; three rounds of every cell, three more of the cells slower
+by median; every run verified or reached and uncontended; median (min-max), seconds; CPU s the process's with its fexc
+servers, mean):
+
+| Benchmark | N | base | change 1 (STI first) | changes 1 and 2 (+ STMXCSR) | change 1 | change 2 | CPU s base / 1 / 1+2 | runs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `locks` | 1 | 5.25 (5.05-5.33) | 3.80 (3.79-3.83) | 3.81 (3.79-3.85) | -27.7% | +0.2% | 8.0 / 6.6 / 6.6 | 6 each |
+|  | 4 | 7.12 (7.03-7.19) | 7.44 (7.20-7.60) | 7.51 (7.34-7.59) | +4.5% | +1.0% | 31.9 / 33.0 / 33.4 | 6 each |
+| `mem` | 1 | 9.65 (9.44-9.82) | 8.44 (8.41-8.54) | 8.49 (8.45-8.56) | -12.6% | +0.6% | 12.6 / 11.4 / 11.5 | 6 each |
+|  | 4 | 3.10 (3.01-3.14) | 2.74 (2.71-2.79) | 2.77 (2.75-2.79) | -11.7% | +1.0% | 15.0 / 13.8 / 13.8 | 6 each |
+| `luajit` | 1 | 5.39 (5.30-5.41) | 5.34 (5.31-5.39) | 4.09 (4.07-4.12) | -0.9% | -23.5% | 8.5 / 8.4 / 7.2 | 3 each |
+|  | 4 | 1.68 (1.66-1.77) | 1.73 (1.71-1.79) | 1.46 (1.44-1.52) | +2.9% | -15.8% | 10.7 / 10.7 / 9.4 | 6 each |
+| Installer, cache off | 1 | 5.45 (5.39-5.56) | 5.42 (5.32-5.47) | 5.33 (5.30-5.44) | -0.7% | -1.5% | 6.9 / 6.9 / 6.8 | 3 each |
+| `hackbench` | 1 | 11.83 (11.51-12.01) | 11.73 (11.60-11.84) | 11.78 (11.63-11.84) | -0.9% | +0.4% | 14.7 / 14.5 / 14.5 | 6 each |
+| `build` | 1 | 11.49 (11.32-11.69) | 11.44 (11.22-11.48) | 11.43 (11.36-11.46) | -0.5% | -0.0% | 16.0 / 15.9 / 15.9 | 6 each |
+| `zstd` | 1 | 1.93 (1.92-1.94) | 1.92 (1.90-1.95) | 1.88 (1.88-1.94) | -0.2% | -2.0% | 4.9 / 4.8 / 4.8 | 3 each |
+| `cray` | 1 | 0.42 (0.41-0.44) | 0.42 (0.36-0.43) | 0.43 (0.40-0.44) | +0.7% | +2.5% | 3.2 / 3.2 / 3.2 | 6 each |
+
+Change 1: `locks` N = 1 -27.7% and `mem` N = 1 and 4 -12.6% and -11.7%, beyond their spreads; the installer, `build`,
+`hackbench` and `zstd` medians 0.2-0.9% lower within their spreads. `luajit` N = 4 +2.9% with overlapping ranges. `locks` N
+= 4 is +4.5% (7.12 to 7.44 s, ranges 7.03-7.19 and 7.20-7.60): the guest makes more futex calls, as in chunk 15. Perf
+resident, two runs each, alternating (`meas/m5.sh`): guest SYSCALLs 31.5 and 29.8 M with the base, 34.7 and 34.5 M with
+change 1 (the `sched_yield`s and boot are 3.1 M of each), resident-run STIs 6.9 M against 70-83 k, interrupts 107-113 k
+against 76-89 k; the extra 3-5 M system calls (about 0.57 us each, chunk 22's fast path) are the wall difference's order.
+Change 2: `luajit` N = 1 -23.5% (5.34 to 4.09 s, 0.31 us per VSTMXCSR) and N = 4 -15.8%, beyond their spreads; every other
+cell within 2.5% by median with overlapping ranges. Perf resident (`meas/`), `luajit` N = 1: system instructions 4.99 M to
+0.78 M, linker entries 5.41 M to 1.21 M, no VSTMXCSR left; `locks` N = 1 with change 1: resident-run STIs 6.37 M to 275 (the
+slow path and the steps).
+
+**Applies to.** Change 1: every Linux kernel path that enables interrupts right after a call returns (`local_irq_enable()`
+following an out-of-line call: 561 of this kernel's 569 STIs follow a `call`), whatever the workload: 0.12-0.58 M resident
+trips per run on every benchmark and the installer (table above), 6.4 M on `locks` (futex and scheduler paths) and 4.7 M on
+`mem` (page faults, mmap); the condition is architectural (CPL 0, the plain one-byte STI first, its next instruction
+translatable). Change 2: any code that reads MXCSR: glibc libm's rounding-mode guard (SET_RESTORE_ROUND, in `sin`, `cos` and
+the other functions that need round-to-nearest: 36 VSTMXCSR sites in `libm.so.6` and the legacy STMXCSR forms in its
+non-FMA variants), the C99 `fe*` functions (`fegetenv`, `feholdexcept`, `fetestexcept`, ...), `getcontext`/`swapcontext`,
+and JITs or runtimes that save MXCSR around calls; measured here only on `luajit` (its benchmarks call `math.sin`/`cos`
+through glibc 4 M times). The installer and the other benchmarks execute almost none (0-1 per run).
+
+**Checks** (`suite25.sh`, `suite/`, the final tree, series60-stmxcsr, one VM runner at a time, each case's output deleted as
+it ended): `cargo test` 111 + 2 ignored (host), abi 65, also with
+`FEXC` set; the resident stack audit `ok` (gate bound 16,768 of 32,768 bytes); the Python unit tests 317 OK; fixtures 64
+and seed 44 at both block sizes; the i7 corpus at CPL 0 69 at both; faults 7,912 at both; `run_k1.py` 336 runs, no
+problem; `run_k2.py` all ok (104 lines, `stifirst` and `stmxcsr` included) and `stifirst`, `stmxcsr`, `sysfast`, `swapgs`
+again (52 ok); `run_slice3_vm.py` `system`, `delivery`, `events`, `contain`, `smp` 0 failures; `run_x3.py` 54/54 and every
+group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`, `run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a`, `r1b`
+ok (negative controls flagged); FEX ASM 2,270: 1,898 pass, 48 precision deviations, 324 unsupported, no failure;
+`test_fexc.py` and `test_slice1.py` 47 OK. `--check-reuse --code-shape` boots, cache off (`checkboot25.py`,
+`check/`; the last one run by `suite25c.sh`, after the suite's runner hit its time limit): installer N = 1 (865,604 resident copies checked against the host) and N = 4 (259,338)
+reached the dialog; `luajit`, `mem` and `locks` at N = 1 verified; no halt, no admission refusal.
+
+**Independent review** (read-only, of the diff): no blocking defect; applied (`-r1`; compiler series61-chunk25-r1, FEX
+unchanged at ab62c7e06 with this tree's shim, `obj/fexc` SHA-256 `c9062170...3906`):
+1. The linker's exclusion states its invariant: no link from a block marked STI_FIRST to one marked STI_FIRST at the same RIP
+   (one live block per RIP and context makes it the block itself).
+2. Admission requires the PC table's first entry at guest offset 0, so an STI at the block's start is always seen and the
+   block marked. Host test `cpl0_translates_cli_and_sti_inline` refuses an object whose offset-0 entries name the NOP
+   after the STI; red without the requirement (admitted, unmarked).
+3. The shim's STMXCSR rule tests the 66/F2/F3 prefixes itself, whichever two-byte map FEX files the form under;
+   `stmxcsr_is_translated` checks that `66/f3/f2 0f ae 18` give no code. Not red without the test: FEX does not decode
+   those forms (its group-15 table has no prefixed /3 memory entry), so they are cut as not decoded first.
+4. New cases, each red under its mutation (`nc/mutant-r1-*.diff`, `nc/red-r1-*.txt`): `stifirst` `sysfast-held` (SYSCALL,
+   a literal exit after a hook posts 0x40 at CPL 3 with IF = 0, goes through the fast path into a kernel side that starts
+   with STI: 0x40 once after its next instruction; red when `enter` writes the event-pending byte as 0) and `reuse-copy`
+   (frame F at two upper-half pages: the block run once through the first, then, with 0x40 held, reached at the second as
+   an in-resident copy, reported by the driver: 0x40 once after its STI's next instruction; red, a hang, when the copy
+   does not keep STI_FIRST; a template below 4 GiB is never copied, since FEX moves such RIPs with 32-bit `movz/movk`, which
+   the relocator refuses); `stmxcsr` `link` (ZE raised, a JMP linked from round 2 on to the STMXCSR's block: 50 stores
+   with ZE; red when `FexcMxcsr` drops FPSR) and `resumes` (ZE, then in the same block an x87 FSQRT of -1, a 128/64 DIV
+   through the division helper, or a first load from a fresh page (a shadow miss, retried), then STMXCSR: ZE alone; red
+   when the x87 ops do not restore FPSR, and when `resume` loses the captured FPSR). The weakened self-link rule removed
+   entirely: `forge-pending` red, as before.
+Rerun on the final tree (`review-r1/`): `run_k2.py stifirst,stmxcsr,sysfast,swapgs` 63 of 63 ok; `cargo test` 111 + 2
+ignored, abi 65, with and without `FEXC`; `test_slice1.py` ok. No resident hot path changed but the two conditions (the
+link test and the PC-table check), so the wall measurements stand.
+
+**Not done.** LDMXCSR/VLDMXCSR stay the resident's (2.2-2.5 k per run). A block that starts with an STI is never linked to itself, so a
+loop whose head is that STI takes the linker at every back edge: `run_k2.py cost`'s `sti` row (`1: sti; dec r8; jnz 1b`)
+stays 0.20 us per iteration (0.23 before, the resident's STI), the other rows unchanged (`nop_sti` 0.01, CLI, SWAPGS, RDTSC
+0.00, CPUID 0.24, `div` 0.13, `syscall` 0.51). Telling the STI's own exit from a back edge to the same RIP (both link points
+target the block's start) would need admission to mark the link point by its place in the PC table; not built. A shadow step
+after MOV SS of an STI that starts a block now asks the host for the step's decode (the kept decode at that RIP is a block),
+a host round trip only in that rare case. `locks` N = 4 is slower (more guest contention, as after chunk 15).
+
 ## 3. Candidate chunks
 
 Each ships only if wall improves beyond the spread of three runs with nothing slower, and ends with the standing suite

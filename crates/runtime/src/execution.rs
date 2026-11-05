@@ -236,7 +236,7 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
                     s.requests += 1;
                     let p = crate::perf::enter(crate::perf::PLACE);
                     let walked = walked(s);
-                    let placed = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, walked, s.link_points, s.dispatch_exit, s.rep_exits, s.relocatable != 0);
+                    let placed = cache::place(&h, STAGING_VA as *const u8, context, s.source_gpa, walked, s.link_points, s.dispatch_exit, s.rep_exits, s.relocatable != 0, s.sti_first != 0);
                     crate::perf::leave(p);
                     let Some(block) = placed else {
                         // Full: flush (which also drops this vCPU's marks) and miss again; an empty cache holds any block.
@@ -287,6 +287,17 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
                 }
             },
         };
+        // Perf chunk 25: a block whose first instruction is a translated STI is not entered where that STI would take its
+        // slow path, an exit to this very boundary (IF = 0 with an event held, `events::held`, as the event-pending byte
+        // `enter` writes would say), nor under a shadow (`enter` would end it before the STI completes, and the STI's exit
+        // to its own start would then put a boundary inside it) or with RF set (that exit would clear RF with no
+        // instruction completed): the STI runs here as its kept decode ran before, and the search goes on after it.
+        if block.flags & cache::STI_FIRST != 0
+            && (s.cpu.mov_ss | s.sti_shadow != 0 || s.cpu.rflags & RFLAGS_RF != 0 || s.cpu.rflags & RFLAGS_IF == 0 && events::held(s))
+        {
+            system(s, System { kind: system::STI, length: 1, ..System::NONE });
+            continue;
+        }
         // S4: a block at an armed instruction breakpoint is entered only from here, after the check above.
         if !at_breakpoint(&s.cpu, block) {
             cache::fill_l1(s.cpu.rip, block);
@@ -488,6 +499,10 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             Some(_) if target.flags & cache::STEP != 0 => {}
             // S4: nor a block at an armed instruction breakpoint.
             Some(_) if at_breakpoint(&s.cpu, target) => {}
+            // Perf chunk 25: nor, from a block that starts with a translated STI, a block that starts with one at the same
+            // RIP (the STI's exit to its own start must reach `find`, which runs it when an event is held: linked, it would
+            // re-enter the block in a loop; one live block per RIP and context makes this the block itself).
+            Some(source) if target.flags & source.flags & cache::STI_FIRST != 0 && target.rip == source.rip => {}
             Some(source) => match {
                 let p = crate::perf::enter(crate::perf::PATCH);
                 let linked = cache::link(source, target);
@@ -838,6 +853,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                 && (0..u64::from(h.code_size) / 4).all(|k| (copy.dispatch_exit != 0 && 4 * k == u64::from(copy.dispatch_exit)) || code(k) == staged(k))
                 && sites == staged_sites
                 && (s.link_points, s.dispatch_exit, s.rep_exits, s.source_gpa) == (copy.links, u64::from(copy.dispatch_exit), u64::from(copy.rep_exits), copy.source_gpa)
+                && (s.sti_first != 0) == (copy.flags & cache::STI_FIRST != 0)
                 && dispatch
                 && inherited
         }
@@ -1088,6 +1104,9 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     unsafe { (FRAME_VA as *mut u64).byte_add(frame::KERNEL_GS_BASE as usize).write_volatile(kernel_gs) };
     // I6: FCW, which FNSTCW reads there; like the FS base, never read back.
     unsafe { (FRAME_VA as *mut u16).byte_add(frame::X87_FCW as usize).write_volatile(s.cpu.fcw as u16) };
+    // Perf chunk 25: MXCSR, which a translated STMXCSR reads there with the flags raised since (FPSR is cleared and the SIMD
+    // flag byte emptied below, so the two together are what the next bank ORs in); likewise never read back.
+    unsafe { (FRAME_VA as *mut u32).byte_add(frame::MXCSR as usize).write_volatile(s.cpu.mxcsr as u32) };
     // Perf chunk 15: the TSC offset an inline RDTSC adds ([`tsc`]); never read back (WRMSR of the TSC is a transaction).
     unsafe { (FRAME_VA as *mut u64).byte_add(frame::TSC_OFFSET as usize).write_volatile(msr_get(cpu::msr(cpu::MSR_TSC).unwrap())) };
     // I5c: the SIMD flag byte (banked into MXCSR at every resident entry) and the x87 instruction's pending flags (an

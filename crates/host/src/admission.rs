@@ -141,6 +141,9 @@ pub(crate) struct Admitted {
     /// X2: the RIP of the REP string instruction that ends the block (proven from the guest bytes): its self-exits are
     /// the link points to it.
     pub rep_self: Option<u64>,
+    /// Perf chunk 25: its first instruction is a translated STI ([`interrupt_flag`]): the resident runs that STI itself
+    /// where the block's slow path would exit to the block's own start, and never links that exit.
+    pub sti_first: bool,
     /// The guest offset of its last instruction (the performance log reads it for a call's return site).
     pub last: u32,
 }
@@ -239,10 +242,10 @@ struct Parts {
 
 /// Perf chunk 15: the translated CLI and STI of a block (`starts`: its instructions' guest offsets, ascending, from fexc's PC
 /// table; `end` its guest bytes): each must be the one-byte form in a CPL-0 block (fexc translates no other: at CPL 0
-/// neither faults, and a prefix makes it the resident's), and an STI neither the block's first instruction nor its last,
-/// nor right before a REP string or LOCK NEG (whose exits to their own RIP would put a resident boundary inside the
-/// shadow), so the boundary its shadow covers is inside the block (a doorbell there arms a stop at a later exit) and an
-/// entry at the STI runs the resident's. Returns the STIs' RIPs: each one's exit to its own RIP (taken when an event is pending) is a literal-exit
+/// neither faults, and a prefix makes it the resident's), and an STI never the block's last instruction, nor right before
+/// a REP string or LOCK NEG (whose exits to their own RIP would put a resident boundary inside the shadow), so the
+/// boundary its shadow covers is inside the block (a doorbell there arms a stop at a later exit). Perf chunk 25: it may be
+/// the first ([`Admitted::sti_first`]). Returns the STIs' RIPs: each one's exit to its own RIP (taken when an event is pending) is a literal-exit
 /// target. Containment: IF's flag byte is guest state the resident banks like DF (it decides only which events are taken),
 /// and the exit is to a RIP of the block's own bytes. Likewise a translated RDTSC is the two-byte form in a CPL-0 block (no
 /// CR4.TSD check is needed there), the only place its counter read may be ([`structure`]).
@@ -268,8 +271,8 @@ fn interrupt_flag(source: &[u8], starts: &[u32], end: u32, rip: u64, cpl0: bool)
         }
         if insn[0] == 0xfb {
             let after = &source[next as usize..starts.get(k + 2).copied().unwrap_or(end) as usize];
-            if g == 0 || next == end || rep_string(after) || lock_neg(after) {
-                return Err(format!("object refused: STI at guest offset {g:#x} first or last in its block, or before a self-exit"));
+            if next == end || rep_string(after) || lock_neg(after) {
+                return Err(format!("object refused: STI at guest offset {g:#x} last in its block, or before a self-exit"));
             }
             sti.push(rip.wrapping_add(u64::from(g)));
         }
@@ -332,7 +335,9 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64, cpl0: bo
     let sorted = |a: &[u32]| a.windows(2).all(|w| w[0] < w[1]);
     // Dense, in emission order: the block entry, every guest instruction, and the
     // block end when code follows the last instruction (guest offset = guest bytes).
+    // (Perf chunk 25: the first entry is the block's start, guest offset 0, so an STI there is always seen and marked.)
     if pcs.len() <= h.guest_insns as usize
+        || pcs.first().map(|p| p.guest_offset) != Some(0)
         || pcs.windows(2).any(|w| w[0].native_offset > w[1].native_offset || w[0].guest_offset > w[1].guest_offset)
         || pcs.iter().any(|p| p.native_offset < ENTRY_OFFSET || p.native_offset >= region || p.guest_offset > h.guest_bytes)
     {
@@ -419,13 +424,14 @@ fn admit_records(bytes: &[u8], rip: u64, source: &[u8], supported: u64, cpl0: bo
         }
     }
     let admitted =
-        Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None, rep_self: None, last: last as u32 };
+        Admitted { object: out, guest_bytes: h.guest_bytes, guest_insns: h.guest_insns, end_reason: h.end_reason, links: Vec::new(), dispatch_exit: None, rep_self: None, sti_first: false, last: last as u32 };
     let tail = &source[last..h.guest_bytes as usize];
     let own = (rep_string(tail) || lock_neg(tail)).then_some(rip.wrapping_add(last as u64));
     let admitted = Admitted { rep_self: own.filter(|_| rep_string(tail)), ..admitted };
     let mut starts: Vec<u32> = pcs.iter().map(|p| p.guest_offset).filter(|&g| g < h.guest_bytes).collect();
     starts.dedup();
     let sti = interrupt_flag(source, &starts, h.guest_bytes, rip, cpl0)?;
+    let admitted = Admitted { sti_first: sti.first() == Some(&rip), ..admitted };
     let targets = [Some(end), target, own].into_iter().flatten().chain(sti).collect();
     Ok((admitted, Parts { header: h, sites, pcs, relocs, literals, targets }))
 }
@@ -654,8 +660,8 @@ mod tests {
         }
     }
 
-    /// Perf chunk 15: translated CLI/STI only in one-byte form in a CPL-0 block, STI neither first nor last; each STI's RIP
-    /// is an exit target; 0f fa (PSUBD) is no CLI.
+    /// Perf chunk 15: translated CLI/STI only in one-byte form in a CPL-0 block, STI never last (perf chunk 25: first is
+    /// allowed); each STI's RIP is an exit target; 0f fa (PSUBD) is no CLI.
     #[test]
     fn interrupt_flag_forms() {
         let f = |src: &[u8], starts: &[u32], cpl0| super::interrupt_flag(src, starts, src.len() as u32, 0x1000, cpl0);
@@ -663,8 +669,12 @@ mod tests {
         assert_eq!(f(&[0xfa, 0x90, 0xfb, 0xfa], &[0, 1, 2, 3], true), Ok(vec![0x1002]));
         assert_eq!(f(&[0x0f, 0xfa, 0xc1, 0x90], &[0, 3], false), Ok(vec![]));
         assert_eq!(f(&[0x0f, 0x31, 0xfb, 0x90], &[0, 2, 3], true), Ok(vec![0x1002])); // rdtsc; sti; nop
+        // Perf chunk 25: an STI first in its block (sti; nop, sti; sti; nop), not before a self-exit (sti; rep stosb).
+        assert_eq!(f(&[0xfb, 0x90], &[0, 1], true), Ok(vec![0x1000]));
+        assert_eq!(f(&[0xfb, 0xfb, 0x90], &[0, 1, 2], true), Ok(vec![0x1000, 0x1001]));
         assert!(f(&[0x0f, 0x31], &[0], false).is_err() && f(&[0x48, 0x0f, 0x31], &[0], true).is_err());
-        for (src, starts, cpl0) in [(&[0xfa, 0x90][..], &[0, 1][..], false), (&[0x90, 0xfb, 0x90], &[0, 1, 2], false), (&[0xfb, 0x90], &[0, 1], true),
+        for (src, starts, cpl0) in [(&[0xfa, 0x90][..], &[0, 1][..], false), (&[0x90, 0xfb, 0x90], &[0, 1, 2], false), (&[0xfb, 0x90], &[0, 1], false), (&[0xfb], &[0], true),
+                                    (&[0xfb, 0xf3, 0xaa], &[0, 1], true),
                                     (&[0x90, 0xfb], &[0, 1], true), (&[0x90, 0x66, 0xfb, 0x90], &[0, 1, 3], true), (&[0xf0, 0xfa, 0x90], &[0, 2], true),
                                     (&[0x90, 0xfb, 0xf3, 0xaa], &[0, 1, 2], true), (&[0x90, 0xfb, 0xf0, 0xf7, 0x18], &[0, 1, 2], true)] {
             assert!(f(src, starts, cpl0).is_err(), "{src:02x?}");

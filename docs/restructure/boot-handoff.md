@@ -73,7 +73,7 @@ build and sign `natemu-host` themselves.
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series58-channel-r1/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series61-chunk25-r1/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -616,7 +616,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series58-channel-r1/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
+F=../natemu-raw/fexc-native-20261026-01/series61-chunk25-r1/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -721,6 +721,9 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 
 ## 6. Compiler reproducibility
 
+**series61-chunk25-r1** (November 5; perf plan "Measured (chunk 25)", after its review): the fork's `natemu` branch at
+ab62c7e06 (an inline STI may start its block; STMXCSR/VSTMXCSR store `FexcMxcsr`) and this tree's shim; `obj/fexc` SHA-256
+`c906217071ee7258d832d10a90706c2e0497f02e1637e77c7f044cf50bb43906`, reproduced by `tools/fexc/build.sh` from the pin. Before it,
 **series58-channel-r1** (November 4; perf plan "Measured (chunk 21)", after its review): series57-fork's patches and shim;
 `fexc.cpp`'s server also answers through a shared mapping (`--serve --channel FD`, with a layout magic), which the host now
 requires; every reply byte-identical to series57-fork's over the pipe on recorded installer and `build` streams; `obj/fexc`

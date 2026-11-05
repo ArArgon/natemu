@@ -20,7 +20,7 @@ use natemu_abi::execution::{
     ENTRY_OFFSET, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
     cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
-pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, SYSTEM};
+pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, STI_FIRST, SYSTEM};
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
 /// L1's code (the dispatcher's head ends there).
 pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
@@ -567,6 +567,7 @@ pub fn place(
     dispatch_exit: u64,
     rep_exits: u64,
     relocatable: bool,
+    sti_first: bool,
 ) -> Option<&'static Block> {
     let c = control();
     // Perf chunk 10: a template keeps its guest-RIP relocations (packed after its sites); one that cannot be packed is none.
@@ -595,7 +596,7 @@ pub fn place(
         sites_count: h.sites_count,
         guest_bytes: h.guest_bytes,
         number: 0,
-        flags: walked & (GLOBAL | LARGE) | if relocatable { RELOCATABLE | count << RELOCS_SHIFT } else { 0 },
+        flags: walked & (GLOBAL | LARGE) | if relocatable { RELOCATABLE | count << RELOCS_SHIFT } else { 0 } | if sti_first { STI_FIRST } else { 0 },
         dispatch_exit: dispatch_exit as u32,
         rep_exits: rep_exits as u32,
         links,
@@ -666,7 +667,7 @@ pub fn copy(b: &Block, rip: u64, source_gpa: [u64; 2], walked: u32) -> Result<Op
         lnext: [0; 2],
         code: code as u32,
         number: 0,
-        flags: walked & (GLOBAL | LARGE) | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT),
+        flags: walked & (GLOBAL | LARGE) | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST),
         links,
         ..*b
     };

@@ -2102,6 +2102,7 @@ fn translation(
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
     state.dispatch_exit = block.dispatch_exit.map_or(0, u64::from);
     state.rep_exits = block.links.iter().enumerate().filter(|(_, p)| Some(p.target) == block.rep_self).fold(0, |m, (k, _)| m | 1 << k);
+    state.sti_first = u64::from(block.sti_first);
     compiler.charge(crate::perf::STAGE, t);
     Ok(Ok(exec::REPLY_ADMITTED))
 }
@@ -2322,8 +2323,9 @@ mod tests {
         assert_eq!((c.compiles, c.hits), (5, 2));
     }
 
-    /// With `FEXC` set (perf chunk 15): at CPL 0 the one-byte CLI is translated inline anywhere and STI where it is neither
-    /// the first nor the last instruction of its block (its exit to its own RIP a link point); a prefix, a following system
+    /// With `FEXC` set (perf chunk 15): at CPL 0 the one-byte CLI is translated inline anywhere and STI where it is not the
+    /// last instruction of its block (its exit to its own RIP a link point; perf chunk 25: first too, the block marked
+    /// `sti_first`); a prefix, a following system
     /// instruction, REP string or LOCK NEG keeps it the resident's; a CPL-3 request cuts both, and never reuses a CPL-0
     /// answer that read the flag; admission refuses the inline forms outside a CPL-0 block.
     #[test]
@@ -2341,9 +2343,28 @@ mod tests {
         assert!(inline.links.iter().any(|p| p.target == 0x1002), "the STI's exit to its own RIP");
         assert_eq!(block(&mut c, &[0xfa, 0xc3]).unwrap().guest_insns, 2); // CLI first
         assert_eq!(block(&mut c, &[0x90, 0xfb, 0xfa, 0xc3]).unwrap().guest_insns, 4); // sti; cli
-        assert_eq!(block(&mut c, &[0xfb, 0x90, 0xc3]).err(), Some(exec::system::STI)); // STI first
+        // Perf chunk 25: STI first (sti; nop; ret): inline, the block marked, its exit to its own start a link point.
+        let first = block(&mut c, &[0xfb, 0x90, 0xc3]).unwrap();
+        assert!(first.guest_insns == 3 && first.sti_first && first.links.iter().any(|p| p.target == 0x1000));
+        assert!(!inline.sti_first && !block(&mut c, &[0xfa, 0xc3]).unwrap().sti_first);
+        // Admission's PC table starts at guest offset 0: an object whose entries at offset 0 (the block entry and the STI)
+        // name the NOP after the STI instead (which would leave the STI unseen and the block unmarked) is refused.
+        let Answer::Object(mut o) = c.answers.find(&[0xfb, 0x90, 0xc3], 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        let h: natemu_abi::code_object::Header = unsafe { o.as_ptr().cast::<natemu_abi::code_object::Header>().read_unaligned() };
+        assert!(admission::admit(&o, 0x1000, &[0xfb, 0x90, 0xc3], u64::MAX, true, true).is_ok_and(|a| a.sti_first));
+        for k in 0..h.pcs_count as usize {
+            let at = h.pcs_offset as usize + k * size_of::<natemu_abi::code_object::PcEntry>() + std::mem::offset_of!(natemu_abi::code_object::PcEntry, guest_offset);
+            if o[at..at + 4] == [0; 4] {
+                o[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+            }
+        }
+        assert!(admission::admit(&o, 0x1000, &[0xfb, 0x90, 0xc3], u64::MAX, true, true).err().unwrap().contains("PC table"));
         for kept in [&[0x90, 0xfb, 0xf4][..], &[0x90, 0xfb, 0xf3, 0xaa], &[0x90, 0xfb, 0xf0, 0xf7, 0x18], &[0x90, 0x66, 0xfb, 0x90, 0xc3], &[0x90, 0xfb]] {
             assert_eq!(block(&mut c, kept).unwrap().guest_insns, 1, "{kept:02x?}"); // sti; hlt / rep stosb / lock neg / 66 sti / last
+        }
+        // First, but before a system instruction, a self-exit, or alone: still the resident's.
+        for kept in [&[0xfb, 0xf4][..], &[0xfb, 0xf3, 0xaa], &[0xfb, 0xf0, 0xf7, 0x18], &[0xfb]] {
+            assert_eq!(block(&mut c, kept).err(), Some(exec::system::STI), "{kept:02x?}");
         }
         // RDTSC with `--tsc` (CPL 0, a 24 MHz counter), first or not; with REX, or without the flag, the resident's.
         c.tsc = true;
@@ -2361,10 +2382,48 @@ mod tests {
         c.cpl0 = false;
         assert_eq!(block(&mut c, &[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3]).unwrap().guest_insns, 1);
         assert_eq!(block(&mut c, &[0xfa, 0xc3]).err(), Some(exec::system::CLI));
+        assert_eq!(block(&mut c, &[0xfb, 0x90, 0xc3]).err(), Some(exec::system::STI)); // a CPL-3 STI first: never the CPL-0 answer
         let Answer::Object(o) = c.answers.find(&[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3], 0x1000, None, &{ let mut g = c.gating(); g[8] = 1; g[9] = 0; g }).0.unwrap().answer.clone() else { panic!() };
         let source = [0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3];
         assert!(admission::admit(&o, 0x1000, &source, u64::MAX, true, true).is_ok());
         assert!(admission::admit(&o, 0x1000, &source, u64::MAX, false, false).err().unwrap().contains("CLI/STI"));
+    }
+
+    /// With `FEXC` set (perf chunk 25): STMXCSR m32 and VSTMXCSR m32 are translated (their stores access sites; the MXCSR
+    /// field's load admitted with the code shape), at either CPL; under the SSE or AVX gating or as LDMXCSR/VLDMXCSR they
+    /// stay the resident's, and with a 66/F2/F3 prefix (not STMXCSR) fexc makes no code.
+    #[test]
+    fn stmxcsr_is_translated() {
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.shape = true;
+        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+            Code::Block(b) => Ok(b),
+            Code::System(s) => Err(s.kind),
+            Code::None(r) => panic!("{r}"),
+        };
+        // stmxcsr [rax]; ret / stmxcsr fs:[rbx + 8*rcx + 0x40]; ret / addss xmm0, xmm1; stmxcsr [rsp - 4]; ret / vstmxcsr [rdi]; ret
+        for code in [&[0x0f, 0xae, 0x18, 0xc3][..], &[0x64, 0x0f, 0xae, 0x5c, 0xcb, 0x40, 0xc3], &[0xf3, 0x0f, 0x58, 0xc1, 0x0f, 0xae, 0x5c, 0x24, 0xfc, 0xc3],
+                     &[0xc5, 0xf8, 0xae, 0x1f, 0xc3]] {
+            let b = block(&mut c, code).unwrap();
+            assert!(b.guest_insns >= 2, "{code:02x?}");
+            let Answer::Object(o) = c.answers.find(code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+            for cpl0 in [false, true] {
+                assert!(admission::admit(&o, 0x1000, code, u64::MAX, true, cpl0).is_ok(), "{code:02x?}");
+            }
+        }
+        // 66, F3 or F2 before 0f ae /3 m: not STMXCSR (no code; the host's), whatever map FEX files it under.
+        for code in [&[0x66, 0x0f, 0xae, 0x18, 0xc3][..], &[0xf3, 0x0f, 0xae, 0x18, 0xc3], &[0xf2, 0x0f, 0xae, 0x18, 0xc3]] {
+            assert!(matches!(c.compile(code, 0x1000, false, &mut ()).unwrap(), Code::None(_)), "{code:02x?}");
+        }
+        assert_eq!(block(&mut c, &[0x0f, 0xae, 0x10, 0xc3]).err(), Some(exec::system::LDMXCSR));
+        assert_eq!(block(&mut c, &[0xc5, 0xf8, 0xae, 0x17, 0xc3]).err(), Some(exec::system::VLDMXCSR));
+        c.sse_gated = true;
+        assert_eq!(block(&mut c, &[0x0f, 0xae, 0x18, 0xc3]).err(), Some(exec::system::SSE_GATED));
+        assert!(block(&mut c, &[0xc5, 0xf8, 0xae, 0x1f, 0xc3]).is_ok());
+        c.sse_gated = false;
+        c.avx_gated = true;
+        assert_eq!(block(&mut c, &[0xc5, 0xf8, 0xae, 0x1f, 0xc3]).err(), Some(exec::system::AVX_GATED));
     }
 
     /// With `FEXC` set (perf chunk 17, fexc patch 0033): at CPL 0 the plain SWAPGS is translated inline, first or not, twice in

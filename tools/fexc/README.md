@@ -36,7 +36,10 @@ The fork is the source of truth for the patches (November 4: moved from `tools/f
 `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
 (`a81a2f24...1fd8`); an installer N = 1 stream of 126,017 requests replayed through both gave no difference.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series58-channel-r1` (November 4, perf plan "Measured
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series61-chunk25-r1` (November 5, perf plan "Measured
+(chunk 25)"): the fork's `natemu` branch at ab62c7e06 (an inline STI may start its block; STMXCSR/VSTMXCSR stored inline
+by `FexcMxcsr`) and this tree's shim; `obj/fexc` SHA-256 `c906217071ee7258d832d10a90706c2e0497f02e1637e77c7f044cf50bb43906`.
+Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series58-channel-r1` (November 4, perf plan "Measured
 (chunk 21)", after its review): series57-fork's patches and shim with `fexc.cpp`'s server answering through a shared channel
 (`--serve --channel FD`, below "Compile server"); every reply byte-identical to series57-fork's over the pipe on an installer
 and a `build` boot's recorded streams; `obj/fexc` SHA-256 `8bd3b7eaff3ef4c2cb101ffb34b55d2e83aa7f6747e22a186b65e493aca83e59`

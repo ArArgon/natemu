@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast] [--n 100000] [--reps 3]
+    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
@@ -30,6 +30,11 @@
   the SYSCALL, EFER.SCE cleared, a non-canonical RCX, interrupts at random times (see `sysfast`); and (see `sysfast_more`)
   an A-bit write into the code's own page after a CR3 reload, a user-side spin only an interrupt ends, a peer's code
   write, the LAPIC timer, a REP MOVSB at the return RIP, NMI blocking across SYSRET, a division (#DE or not) after SYSRET.
+- `stifirst` (perf chunk 25): an STI that starts its block, translated inline at CPL 0, keeps STI's semantics with an
+  interrupt or NMI held at it, entered through a link, after MOV SS, under TF, with the event-pending byte forged at CPL 0
+  or CPL 3, and under interrupts and NMIs at random times (see `stifirst`).
+- `stmxcsr` (perf chunk 25): STMXCSR and VSTMXCSR, translated, store MXCSR with the sticky flags the code before them raised,
+  as the resident's FXSAVE (its bank) does and as the SDM gives them, at both CPLs and block sizes (see `stmxcsr`).
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, subprocess, sys, time
@@ -47,7 +52,7 @@ OBS_IF = 'pushfq\npop rax\nshr eax, 9\nand eax, 1'
 COSTS = {
     'cli': ('cli', {}),
     'sti': ('sti', {}),
-    # Perf chunk 15: STI mid-block at CPL 0 is translated inline (the row above starts its block: the resident's).
+    # Perf chunk 15: STI mid-block at CPL 0 is translated inline (perf chunk 25: so is the row above, which starts its block).
     'nop_sti': ('nop\nsti', {}),
     'popf': ('pushfq\npopfq', {}),
     'swapgs': ('swapgs', {}),
@@ -63,6 +68,8 @@ COSTS = {
     'syscall': (None, {}),
 }
 USER_GS, KERNEL_GS, KERNEL_RIP = 0x2a0000, 0x2b0000, 0x200000
+# The guest-state page's alias (abi `GUEST_STATE_VA`, the recorded deviation): IF's byte at +0x3f9, the event-pending byte at +0x406.
+GUEST_STATE_VA = 0xffff_4000_0000_1000
 # Linux's entry_SYSCALL_64 and its SYSRET exit, in shape: ENDBR64; SWAPGS; the user RSP saved and the kernel's loaded through
 # GS; ...; SWAPGS; a 7-byte NOP; SYSRETQ.
 LINUX_KERNEL = ('endbr64\nswapgs\nmov gs:[16], rsp\nmov rsp, gs:[24]\npush rcx\npop rcx\nmov rsp, gs:[16]\nswapgs\n'
@@ -956,11 +963,314 @@ cmp r12, [{UC:#x}]\nje 9f
         + ([] if (word(c, QSUM), word(c, RSUM)) == (want_q, want_r) else [f'quotient, remainder sums {word(c, QSUM)}, {word(c, RSUM)}, want {want_q}, {want_r}']))
 
 
+def stifirst(a, report):
+    """Perf chunk 25: an STI that starts its block is translated inline at CPL 0 (the block marked; where its slow path would
+    exit to the block's own start the resident runs the STI itself). Judged by the SDM (STI, Vol.3 7.8.1, 7.9 Table 7-2;
+    MOV SS; 18.3.1.4) and natemu's delivery model (both shadows block NMIs too), natemu only, every case at block sizes
+    default and 1 (where the STI is alone, the resident's) unless noted. CPL 0, IF = 0, the program's own IDT (gates on
+    IST 1): the interrupt (0x40) and NMI handlers count, record the first frame (RIP, CS, RFLAGS) and R9, R10 at entry, and
+    count as bad a delivery at a forbidden boundary (for 0x40 also one with IF = 0 in the frame); the #DB handler records the
+    RIPs of its first 8 frames. At the default block size no STI may be decoded (it is translated, first in its block).
+    - `held-find`: a hook posts 0x40, then `sti; inc r9; inc r10`: taken once after `inc r9` (R9 1, R10 0).
+    - `held-linked`: 2,000 rounds `jmp x; x: sti; inc r9; inc r10; cli`; in round 1,001 a hook posts 0x40 before the `jmp`,
+      which by then is linked to the STI's block, entered with the event held: taken once after `inc r9` (R9 = R10 + 1).
+    - `nmi-held`: hooks post 0x40, then an NMI, then the STI: the NMI at the STI (IF = 0 in its frame), then 0x40 after
+      `inc r9`.
+    - `mov-ss`: a hook posts 0x40, `mov ss, eax; sti; inc r9; inc r10`: 0x40 after `inc r9`.
+    - `tf`: POPFQ sets TF, then `sti; nop; nop; pushfq; and; popfq` (clearing it): #DB traps after each of the six (each
+      instruction stepped alone, compiled without `--cpl0`: the STI decoded).
+    - `forge-pending`: 1,000 rounds of a CPL-0 store of 1 into the event-pending byte (the guest-state alias) then `jmp x;
+      x: sti; inc r9; cli`: every round completes (the STI's exit to its own block is never linked to itself).
+    - `cpl3-forge` (default size): CPL 3 stores 1 into the event-pending byte and 0 into IF's, a hook posts 0x40 (taken at
+      CPL 3 at once), SYSCALL into `sti; pushfq; pop r12; cli; sysretq`: IF = 1 after the kernel's STI and back at CPL 3.
+    - `kicks-jmp`, `kicks-ret`, `kicks-movss` (default size): 4,000,000 rounds `cli; inc [W1]; X; sti; inc [W2]` with X a
+      `jmp` to the STI, a `call` to a `ret` returning to it, or `mov eax, ss; mov ss, eax`, under 0x40 and NMIs posted at
+      random times: 0x40 never with IF = 0 nor right after the STI, an NMI never right after the STI (nor at it after MOV
+      SS), W1 = W2 = 4,000,000, more than 100 of each taken.
+    - `sysfast-held` (review): SYSCALL's fast path enters a kernel side starting with STI with 0x40 held (see below).
+    - `reuse-copy` (review): an STI-first block reached as an in-resident copy of a template at another RIP (`reuse_copy`)."""
+    asm, failures, runs = ref.assemble, [], []
+    TABLES, IDTR = 0x300000, 0x300800
+    SLOT = {1: 0x300900, 2: 0x300980, 0x40: 0x3009c0}
+    BAD, FORBID, FORBIDN, W1, W2 = 0x300a00, 0x300a40, 0x300a60, 0x300a80, 0x300a88
+    PEND, IFB = GUEST_STATE_VA + 0x406, GUEST_STATE_VA + 0x3f9
+    def handler(v):
+        s = SLOT[v]
+        if v == 1:
+            return (f'h1:\npush rax\npush rcx\nmov rcx, [{s:#x}]\ncmp rcx, 8\njae 2f\nmov rax, [rsp + 16]\nmov [{s + 8:#x} + rcx * 8], rax\n'
+                    f'2: inc qword ptr [{s:#x}]\npop rcx\npop rax\niretq\n')
+        forbid = FORBID if v == 0x40 else FORBIDN
+        checks = ''.join(f'mov rax, [{forbid + 8 * k:#x}]\ntest rax, rax\njz 3f\ncmp rax, [rsp + 8]\njne 3f\ninc qword ptr [{BAD:#x}]\n3:\n' for k in range(4))
+        if v == 0x40:
+            checks += f'test qword ptr [rsp + 24], 0x200\njnz 3f\ninc qword ptr [{BAD:#x}]\n3:\n'
+        first = ''.join(f'mov rax, [rsp + {8 + 8 * k}]\nmov [{s + 8 + 8 * k:#x}], rax\n' for k in range(3)) + f'mov [{s + 32:#x}], r9\nmov [{s + 40:#x}], r10\n'
+        eoi = 'push rcx\npush rdx\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rdx\npop rcx\n' if v == 0x40 else ''
+        return f'h{v}:\npush rax\ninc qword ptr [{s:#x}]\ncmp qword ptr [{s:#x}], 1\njne 2f\n{first}2:\n{checks}{eoi}pop rax\niretq\n'
+    setup = (f'lidt [{IDTR:#x}]\nmov ecx, 0x1b\nmov eax, 0xfee00d00\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nwrmsr\n')
+    def run(name, body, want, block=None, posts=(), forbid=(), forbidn=(), extra=(), user=None, check=None, decoded=False):
+        code, lab = asm(setup + (user or '') + body + '\njmp done\n' + ''.join(handler(v) for v in SLOT) + 'done:', labels=True)
+        at = lambda l: CODE + lab[l]
+        gates = bytearray(16 * 0x41)
+        for v in SLOT:
+            h = at(f'h{v}')
+            # IST 1 only where an event may come from CPL 3 (the driver's TSS); else none, so an NMI may nest in the 0x40 handler.
+            gates[16 * v:16 * v + 16] = ((h & 0xffff | 0x08 << 16 | (1 if user else 0) << 32 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little')
+                                         + (h >> 32).to_bytes(8, 'little'))
+        tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (0x41 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+        tables += bytes(FORBID - TABLES - len(tables)) + b''.join(at(l).to_bytes(8, 'little') for l in forbid) + bytes(8 * (4 - len(forbid)))
+        tables += bytes(FORBIDN - TABLES - len(tables)) + b''.join(at(l).to_bytes(8, 'little') for l in forbidn) + bytes(8 * (4 - len(forbidn)))
+        tables += bytes(W2 + 8 - TABLES - len(tables))
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nsvr 0x1ff\nmemory {TABLES:#x} {tables.hex()}\n'
+                f'region 0x3e0000 0x10000\n' + ''.join(f'{"nmi" if v == 2 else "post"} {at(l):#x}{"" if v == 2 else f" {v:#x}"}\n' for l, v in posts))
+        tag = f'{name}-{block}'
+        _, out, err = driver(a, text, a.out / 'stifirst' / tag, [*([block] if block else []), '--watchdog-ms', '60000', *extra])
+        problems = []
+        if not out:
+            problems.append(f'driver: {err}')
+        else:
+            def mem(addr):
+                return next((int.from_bytes(bytes.fromhex(m['data'])[addr - int(m['addr'], 0):][:8], 'little') for m in out['memory']
+                             if int(m['addr'], 0) <= addr < int(m['addr'], 0) + len(m['data']) // 2), None)
+            g = [int(x, 0) for x in out['gpr']]
+            if out['stop'] != 'reached':
+                problems.append(f"stop {out['stop']} {out.get('reason')} rip {out.get('rip')}")
+            for v, w in want.items():
+                s = SLOT[v]
+                if v == 1:
+                    got = [mem(s)] + [mem(s + 8 + 8 * k) for k in range(min(mem(s) or 0, 8))]
+                    exp = [len(w)] + [at(l) for l in w]
+                    if got != exp: problems.append(f'#DB count and RIPs {[hex(x) for x in got]}, want {[hex(x) for x in exp]}')
+                    continue
+                count, rip, cs, rflags, r9, r10 = (mem(s + 8 * k) for k in range(6))
+                if callable(w):
+                    problems += w(count, rip, cs, rflags, r9, r10)
+                    continue
+                c, l, if_, regs = w
+                if (count, rip) != (c, at(l) if l else 0) or (c and (bool(rflags & 0x200) != if_ or (regs and regs(r9, r10)))):
+                    problems.append(f'vector {v:#x}: count {count} RIP {rip:#x} RFLAGS {rflags:#x} r9 {r9} r10 {r10}, want {c} at {l} IF {if_}')
+            for v in SLOT:
+                if v not in want and mem(SLOT[v]):
+                    problems.append(f'vector {v:#x} delivered {mem(SLOT[v])} times')
+            if mem(BAD):
+                problems.append(f'{mem(BAD)} deliveries at a forbidden boundary or with IF = 0')
+            if check: problems += check(g, mem)
+            if not block and not decoded and out['stats']['decodes'].get('0x41'):
+                problems.append(f"STI decoded {out['stats']['decodes']['0x41']} times: not translated")
+        taken = {f'{v:#x}': mem(SLOT[v]) for v in SLOT} if out else {}
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems, 'taken': taken})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'stifirst {tag}: {problems}')
+    shadow = 'x: sti\na: inc r9\nb: inc r10\n'
+    after = (1, 'b', True, None)
+    for block in (None, 1):
+        run('held-find', 'hk: nop\n' + shadow, {0x40: (1, 'b', True, lambda r9, r10: (r9, r10) != (1, 0))}, block, [('hk', 0x40)], ['x', 'a'])
+        run('held-linked', 'mov r8, 2000\nlp: cmp r8, 1000\njne sk\nhk: nop\nsk: jmp x\n' + shadow + 'cli\ndec r8\njnz lp\n',
+            {0x40: (1, 'b', True, lambda r9, r10: r9 != r10 + 1)}, block, [('hk', 0x40)], ['x', 'a'],
+            check=lambda g, mem: [] if (g[9], g[10]) == (2000, 2000) else [f'r9 {g[9]} r10 {g[10]}'])
+        run('nmi-held', 'hk: nop\nhn: nop\n' + shadow, {2: (1, 'x', False, None), 0x40: after}, block, [('hk', 0x40), ('hn', 2)], ['x', 'a'], ['a'])
+        run('mov-ss', 'mov eax, ss\nhk: nop\nmov ss, eax\n' + shadow, {0x40: after}, block, [('hk', 0x40)], ['x', 'a'])
+        run('tf', 'pushfq\nor qword ptr [rsp], 0x100\npopfq\nx: sti\na: nop\nb: nop\nc: pushfq\nd: and qword ptr [rsp], -0x101\ne: popfq\nf: nop\n',
+            {1: ['a', 'b', 'c', 'd', 'e', 'f']}, block, decoded=True)
+        run('forge-pending', f'mov r8, 1000\nmov rbx, {PEND:#x}\nlp: mov byte ptr [rbx], 1\njmp x\nx: sti\na: inc r9\ncli\ndec r8\njnz lp\n', {}, block,
+            check=lambda g, mem: [] if g[9] == 1000 else [f'r9 {g[9]}, want 1000'])
+    # CPL 3 forges both bytes, then SYSCALL into a kernel side that starts with STI (STAR: SYSCALL CS 0x08, SYSRET CS 0x23).
+    sysc = ('mov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\n' + wrmsr(0xc0000081, 0x10 << 48 | 0x08 << 32) + 'lea rax, [rip + x]\nmov rdx, rax\nshr rdx, 32\n'
+            'mov ecx, 0xc0000082\nwrmsr\n' + wrmsr(0xc0000084, 0x47700) + 'lea rcx, [rip + user]\nmov r11d, 0x202\nsysretq\n'
+            f'user:\nmov rax, {PEND:#x}\nmov byte ptr [rax], 1\nmov rax, {IFB:#x}\nmov byte ptr [rax], 0\nhk: nop\nu1: syscall\npushfq\npop r13\njmp done\n'
+            'x: sti\npushfq\npop r12\ncli\nsysretq\n')
+    run('cpl3-forge', '', {0x40: lambda c, rip, cs, rf, r9, r10: [] if (c, cs) == (1, 0x23) and rf & 0x200 else [f'0x40: count {c} CS {cs:#x} RFLAGS {rf:#x}']},
+        None, [('hk', 0x40)], user=sysc,
+        check=lambda g, mem: [] if g[12] & 0x200 and g[13] & 0x200 else [f'r12 {g[12]:#x} r13 {g[13]:#x}: IF lost'])
+    # Review: SYSCALL's fast path into a kernel side that starts with STI, with 0x40 held (posted at CPL 3 with IF = 0, which
+    # the SYSRET's R11 left; FMASK clears IF anyway), the SYSCALL a literal exit of the block after the hook (so the fast
+    # path runs it): the fast path enters the kernel's block directly, its STI exits to its own start and the resident runs
+    # it: 0x40 once, after the kernel's `inc r9`. 2,000 round trips, the post in round 1,001.
+    held = ('mov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\n' + wrmsr(0xc0000081, 0x10 << 48 | 0x08 << 32) + 'lea rax, [rip + x]\nmov rdx, rax\nshr rdx, 32\n'
+            'mov ecx, 0xc0000082\nwrmsr\n' + wrmsr(0xc0000084, 0x47700) + 'lea rcx, [rip + user]\nmov r11d, 0x2\nsysretq\n'
+            'user:\nmov r8, 2000\n1: cmp r8, 1000\njne 2f\nhk: nop\n2: inc r12\nsyscall\ndec r8\njnz 1b\njmp done\n'
+            'x: sti\na: inc r9\nb: inc r10\ncli\nsysretq\n')
+    for block in (None, 1):
+        run('sysfast-held', '', {0x40: lambda c, rip, cs, rf, r9, r10, b=block: [] if (c, cs) == (1, 0x08) and rf & 0x200 and r9 == r10 + 1 else
+                                 [f'0x40: count {c} CS {cs:#x} RFLAGS {rf:#x} r9 {r9} r10 {r10}']},
+            block, [('hk', 0x40)], ['x', 'a'], user=held,
+            check=lambda g, mem: [] if (g[9], g[10]) == (2000, 2000) else [f'r9 {g[9]} r10 {g[10]}'])
+    reuse_copy(a, runs, failures, handler, setup, SLOT, BAD, TABLES, IDTR)
+    kick = ['--kick-vcpu', '0', '--kicks', '5000', '--kick-every-us', '5', '--kick-jitter-us', '10', '--kick-events', '0x40,nmi']
+    some = lambda c, *_: [] if c and c > 100 else [f'only {c} taken']
+    for name, x, nmi in (('kicks-jmp', 'jmp x\n', ['a']), ('kicks-ret', 'call f\n', ['a']), ('kicks-movss', 'mov eax, ss\nmov ss, eax\n', ['x', 'a'])):
+        n = 4_000_000
+        exact = lambda g, mem, n=n: [] if (mem(W1), mem(W2)) == (n, n) else [f'W1 {mem(W1)} W2 {mem(W2)}']
+        # (After MOV SS an event held by its shadow steps the STI alone, compiled without `--cpl0`: decoded.)
+        run(name, f'mov r8, {n}\nlp: cli\ninc qword ptr [{W1:#x}]\n{x}x: sti\na: inc qword ptr [{W2:#x}]\ndec r8\njnz lp\njmp done\nf: ret\n',
+            {0x40: some, 2: some}, None, [], ['x', 'a'], nmi, kick, check=exact, decoded=name == 'kicks-movss')
+    report['stifirst'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
+def reuse_copy(a, runs, failures, handler, setup, SLOT, BAD, TABLES, IDTR):
+    """Perf chunk 25 review, `stifirst` `reuse-copy` (default block size): the guest's own identity tables (as `walk-ad`) map a
+    frame F at two upper-half linear pages L1 and L2, F holding `sti; inc r9; inc r10; jmp r13`. Run once through F (the host's block,
+    a template, run through L1), IF = 0 again, a hook posts 0x40, then a jump to L2: the resident copies the template (perf chunk 10, same
+    frame, page offset and half), the copy keeps STI_FIRST and its STI runs as the resident's: 0x40 once at L2 + 4 (after
+    `inc r9`, R9 2, R10 1). The driver must report the copy (its k1 `reuse.copies` at least 1)."""
+    asm = ref.assemble
+    # Frame F at two upper-half pages L1 and L2 (FEX moves a RIP below 4 GiB with 32-bit `movz/movk w0`, which the relocator
+    # does not rewrite, so a low template is never copied; the kernel's are 64-bit moves).
+    F, L1, L2 = 0x104000, 0xffff_ffff_8010_4000, 0xffff_ffff_8070_4000
+    PML4, PDPT, PD, PT0, PT1, PT3 = 0x110000, 0x111000, 0x112000, 0x113000, 0x114000, 0x115000
+    PDPTH, PDH, PTH0, PTH3 = 0x116000, 0x117000, 0x118000, 0x119000
+    NONLEAF, WSTACK = P.P | P.RW | P.US | P.A, 0x3d0000
+    code, lab = asm(f'mov eax, {PML4:#x}\nmov cr3, rax\n' + setup + f'lea r13, [rip + v0]\nmov rax, {L1:#x}\njmp rax\nv0: cli\nhk: nop\n'
+                    f'lea r13, [rip + v1]\nmov rax, {L2:#x}\njmp rax\nv1: jmp done\n' + ''.join(handler(v) for v in SLOT) + 'done:', labels=True)
+    page = asm('sti\ninc r9\ninc r10\njmp r13')
+    gates = bytearray(16 * 0x41)
+    for v in SLOT:
+        h = CODE + lab[f'h{v}']
+        gates[16 * v:16 * v + 16] = ((h & 0xffff | 0x08 << 16 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (h >> 32).to_bytes(8, 'little'))
+    tables_mem = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (0x41 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+    tables_mem += bytes(BAD + 0x100 - TABLES - len(tables_mem))
+    tables = {PML4: {0: PDPT | NONLEAF, 511: PDPTH | NONLEAF}, PDPT: {0: PD | NONLEAF}, PD: {0: PT0 | NONLEAF, 1: PT1 | NONLEAF},
+              PDPTH: {510: PDH | NONLEAF}, PDH: {0: PTH0 | NONLEAF, 3: PTH3 | NONLEAF},
+              PTH0: {(L1 >> 12) & 511: F | P.LEAF}, PTH3: {(L2 >> 12) & 511: F | P.LEAF},
+              PT0: {(v >> 12) & 511: v | P.LEAF for v in (CODE, CODE + 0x1000)},
+              PT1: {(v >> 12) & 511: v | P.LEAF for v in [TABLES, *range(0x3c0000, WSTACK, 0x1000), *(0x3e8000 + o for o in (0, 0x1000, 0x3000, 0x4000, 0x5000, 0x6000))]},
+              }
+    items = ''.join(f'memory {t_:#x} {b"".join(e.get(i, 0).to_bytes(8, "little") for i in range(512)).hex()}\n' for t_, e in tables.items())
+    text = (f'identity\nrip {CODE:#x}\nrflags 0x2\n{gprs({4: WSTACK})}\ncode {code.hex()}\nbody {F:#x} {page.hex()}\ncpl 0\nif 0\nsvr 0x1ff\n'
+            f'memory {TABLES:#x} {tables_mem.hex()}\n{items}region 0x3c0000 {WSTACK - 0x3c0000:#x}\npost {CODE + lab["hk"]:#x} 0x40\n')
+    _, out, err = driver(a, text, a.out / 'stifirst' / 'reuse-copy', ['--watchdog-ms', '60000'])
+    problems = []
+    if not out:
+        problems.append(f'driver: {err}')
+    else:
+        def mem(addr):
+            return next((int.from_bytes(bytes.fromhex(m['data'])[addr - int(m['addr'], 0):][:8], 'little') for m in out['memory']
+                         if int(m['addr'], 0) <= addr < int(m['addr'], 0) + len(m['data']) // 2), None)
+        s = SLOT[0x40]
+        count, rip, cs, rflags, r9, r10 = (mem(s + 8 * k) for k in range(6))
+        copies = out['stats']['k1']['reuse']['copies']
+        if out['stop'] != 'reached': problems.append(f"stop {out['stop']} {out.get('reason')} rip {out.get('rip')}")
+        if (count, rip, r9, r10) != (1, L2 + 4, 2, 1): problems.append(f'0x40: count {count} RIP {rip} r9 {r9} r10 {r10}, want 1 at {L2 + 4:#x}, 2, 1')
+        if not copies: problems.append(f'no in-resident copy made ({copies})')
+        if mem(BAD): problems.append(f'{mem(BAD)} bad deliveries')
+    runs.append({'case': 'reuse-copy-None', 'ok': not problems, 'problems': problems})
+    print(json.dumps(runs[-1]), flush=True)
+    if problems: failures.append(f'stifirst reuse-copy: {problems}')
+
+
+def stmxcsr(a, report):
+    """Perf chunk 25: STMXCSR and VSTMXCSR are translated (no decode of either) and store MXCSR with the exception flags
+    generated code raised since the last bank (FPSR and the SIMD flag byte), DAZ, FTZ, RC and the masks as loaded. Judged by
+    the SDM (Vol.1 10.2.3, 11.5.2: the flags each operation sets, masked responses; LDMXCSR; STMXCSR) and against the
+    resident's own bank: every store is followed by an FXSAVE (a resident transaction), whose MXCSR must be the same value.
+    Each case at CPL 0 and 3 and block sizes default and 1; a case is a series of `ldmxcsr CTL; OP; [V]STMXCSR [OUT+4k];
+    fxsave [FX+512k]` steps (OP's flags, from operands in memory, raised on a fresh MXCSR):
+    - `flags`: SQRTSS of -1 (IE), 1 + the smallest denormal (DE, PE), 1 / 0 (ZE), FLT_MAX * 2 (OE, PE), FLT_MIN * FLT_MIN
+      (UE, PE), 1 + 2^-30 (PE), the last by VSTMXCSR; and IE, ZE and PE raised in three blocks (a JMP, then a CPUID between):
+      all three stored.
+    - `controls`: LDMXCSR of every flag set, of FTZ | RC 11 | DAZ, of RC 01: stored as loaded; DAZ with a denormal operand
+      (no DE, exact); FTZ with FLT_MIN * 0.5 (zero, UE, PE); ZM unmasked with an inexact add (PE through the SIMD flag byte).
+    - `place`: a store to an odd address and one crossing into the next page (the bytes, no fault); at CPL 3 with CR0.AM and
+      RFLAGS.AC an odd address is #AC(0) at the STMXCSR, nothing stored.
+    - `link` (review): ZE raised before a JMP linked to the STMXCSR's block (no resident entry between): 50 stores of it.
+    - `resumes` (review): ZE, then in the same block an x87 FSQRT of -1 (its IE is FSW's only), a 128/64 DIV through the
+      division helper (resumed mid-block), or a first load from a fresh page (a shadow miss, retried): ZE alone stored."""
+    asm, failures, runs = ref.assemble, [], []
+    D, OUT, FX = 0x300000, 0x300400, 0x302000
+    consts = {'m1': 0xbf800000, 'one': 0x3f800000, 'den': 1, 'zero': 0, 'max': 0x7f7fffff, 'two': 0x40000000, 'min': 0x00800000,
+              'tiny': 0x30800000, 'half': 0x3f000000}
+    at = {k: D + 4 * i for i, k in enumerate(consts)}
+    CTL = D + 0x100
+    ld = lambda r, k: f'movss {r}, dword ptr [{at[k]:#x}]\n'
+    ops = {'ie': ld('xmm1', 'm1') + 'sqrtss xmm0, xmm1', 'de': ld('xmm0', 'one') + ld('xmm1', 'den') + 'addss xmm0, xmm1',
+           'ze': ld('xmm0', 'one') + ld('xmm1', 'zero') + 'divss xmm0, xmm1', 'oe': ld('xmm0', 'max') + ld('xmm1', 'two') + 'mulss xmm0, xmm1',
+           'ue': ld('xmm0', 'min') + ld('xmm1', 'min') + 'mulss xmm0, xmm1', 'pe': ld('xmm0', 'one') + ld('xmm1', 'tiny') + 'addss xmm0, xmm1',
+           'half': ld('xmm0', 'min') + ld('xmm1', 'half') + 'mulss xmm0, xmm1', 'none': 'nop'}
+    def run(name, steps, cpl, block, extra_lines='', tail='', check=None):
+        """steps: (ctl, op asm, store mnemonic, want)."""
+        body, ctls = '', []
+        for k, (ctl, op, store, want) in enumerate(steps):
+            ctls.append(ctl)
+            body += (f'ldmxcsr dword ptr [{CTL + 4 * k:#x}]\n{op}\n{store} dword ptr [{OUT + 4 * k:#x}]\nfxsave [{FX + 512 * k:#x}]\n')
+        code, lab = asm(body + tail + '\nnop', labels=True)
+        data = b''.join(v.to_bytes(4, 'little') for v in consts.values())
+        data += bytes(CTL - D - len(data)) + b''.join(c.to_bytes(4, 'little') for c in ctls)
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl {cpl}\nsse 1\nxcr0 7\nmemory {D:#x} {data.hex()}\n'
+                f'memory {OUT:#x} {bytes(0x400).hex()}\nmemory {FX:#x} {bytes(512 * len(steps)).hex()}\nregion 0x3e0000 0x10000\n{extra_lines}')
+        tag = f'{name}-cpl{cpl}-{block}'
+        _, out, err = driver(a, text, a.out / 'stmxcsr' / tag, [block] if block else [])
+        problems = []
+        if not out:
+            problems.append(f'driver: {err}')
+        else:
+            def word(addr):
+                return next((int.from_bytes(bytes.fromhex(m['data'])[addr - int(m['addr'], 0):][:4], 'little') for m in out['memory']
+                             if int(m['addr'], 0) <= addr < int(m['addr'], 0) + len(m['data']) // 2), None)
+            if check:
+                problems += check(out, word, lab)
+            else:
+                if out['stop'] != 'reached':
+                    problems.append(f"stop {out['stop']} {out.get('reason')} rip {out.get('rip')} fault {out.get('fault')}")
+                for k, (ctl, op, store, want) in enumerate(steps):
+                    got, banked = word(OUT + 4 * k), word(FX + 512 * k + 24)
+                    if (got, banked) != (want, want):
+                        problems.append(f'step {k} ({op.splitlines()[-1]}, {store}): stored {got:#x}, FXSAVE {banked:#x}, want {want:#x}')
+            if out['stats']['decodes'].get(f'{0x20:#x}') or out['stats']['decodes'].get(f'{0x33:#x}'):
+                problems.append(f"STMXCSR/VSTMXCSR decoded: {out['stats']['decodes']}")
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'stmxcsr {tag}: {problems}')
+    R = 0x1f80
+    flags = [(R, ops['ie'], 'stmxcsr', R | 0x01), (R, ops['de'], 'stmxcsr', R | 0x22), (R, ops['ze'], 'stmxcsr', R | 0x04),
+             (R, ops['oe'], 'stmxcsr', R | 0x28), (R, ops['ue'], 'stmxcsr', R | 0x30), (R, ops['pe'], 'vstmxcsr', R | 0x20),
+             (R, ops['ie'] + '\njmp 1f\n1:\n' + ops['ze'] + '\nxor eax, eax\ncpuid\n' + ops['pe'], 'stmxcsr', R | 0x25)]
+    controls = [(R | 0x3f, ops['none'], 'stmxcsr', R | 0x3f), (0xffc0, ops['none'], 'vstmxcsr', 0xffc0), (0x3f80, ops['none'], 'stmxcsr', 0x3f80),
+                (R | 0x40, ops['de'], 'stmxcsr', R | 0x40), (0x9f80, ops['half'], 'stmxcsr', 0x9f80 | 0x30), (R & ~0x200, ops['pe'], 'stmxcsr', (R & ~0x200) | 0x20)]
+    # Review: flags carried across a patched link (50 rounds `ldmxcsr; divss 1/0; jmp 3f; 3: stmxcsr`: from round 2 the JMP
+    # is linked, so no resident entry lies between the DIVSS and the STMXCSR: ZE only in FPSR), and STMXCSR in the block of
+    # an x87 op (FSQRT of -1: IE in FSW only), after a division helper's resume and after a shadow miss's retry.
+    FRESH = D + 0x3000
+    link = (f'xor ecx, ecx\n2: ldmxcsr dword ptr [{CTL:#x}]\n{ops["ze"]}\njmp 3f\n3: stmxcsr dword ptr [{OUT + 0x40:#x} + rcx * 4]\n'
+            'inc ecx\ncmp ecx, 50\njb 2b')
+    resumes = [(R, ops['ze'] + f'\nfld dword ptr [{at["m1"]:#x}]\nfsqrt\nfstp st(0)', 'stmxcsr', R | 0x04),
+               (R, ops['ze'] + '\nmov edx, 1\nmov eax, 7\nmov r9d, 2\ndiv r9', 'stmxcsr', R | 0x04),
+               (R, ops['ze'] + f'\nmov eax, dword ptr [{FRESH:#x}]', 'vstmxcsr', R | 0x04)]
+    for cpl in (0, 3):
+        for block in (None, 1):
+            run('link', [(R, 'nop', 'stmxcsr', R)], cpl, block, extra_lines=f'memory {FRESH:#x} {bytes(16).hex()}\n', tail=link,
+                check=lambda out, word, lab: ([] if out['stop'] == 'reached' and all(word(OUT + 0x40 + 4 * k) == R | 4 for k in range(50)) else
+                                             [f"stop {out['stop']} {out.get('reason')} stored {[hex(word(OUT + 0x40 + 4 * k) or 0) for k in range(50) if word(OUT + 0x40 + 4 * k) != R | 4][:6]}"]))
+            run('resumes', resumes, cpl, block, extra_lines=f'memory {FRESH:#x} {bytes(16).hex()}\n')
+            run('flags', flags, cpl, block)
+            run('controls', controls, cpl, block)
+            # Odd and page-crossing destinations (no fault): the bytes.
+            run('place', [(R | 0x05, 'nop', 'stmxcsr', R | 0x05)], cpl, block,
+                tail=f'stmxcsr dword ptr [{OUT + 0x101:#x}]\nvstmxcsr dword ptr [{OUT + 0x3fe:#x}]',
+                check=lambda out, word, lab: ([] if out['stop'] == 'reached' and word(OUT + 0x101) == R | 5 and word(OUT + 0x3fe) == R | 5 else
+                                             [f"stop {out['stop']} {out.get('reason')} odd {word(OUT + 0x101)} crossing {word(OUT + 0x3fe)}"]))
+    # #AC(0): CR0.AM and RFLAGS.AC, then CPL 3 (a switch hook), an odd destination.
+    code, lab = asm(f'mov rax, cr0\nor rax, 0x40000\nmov cr0, rax\npushfq\nor qword ptr [rsp], 0x40000\npopfq\nsw: nop\nx: stmxcsr dword ptr [{OUT + 0x101:#x}]\nnop', labels=True)
+    for block in (None, 1):
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nsse 1\nswitch {CODE + lab["sw"]:#x} 3\n'
+                f'memory {OUT:#x} {bytes(0x400).hex()}\nregion 0x3e0000 0x10000\n')
+        tag = f'ac-cpl3-{block}'
+        _, out, err = driver(a, text, a.out / 'stmxcsr' / tag, [block] if block else [])
+        problems = [f'driver: {err}'] if not out else (
+            [] if out['stop'] == 'guest_fault' and int(out['fault'][0], 0) == 17 and int(out['rip'], 0) == CODE + lab['x'] and
+            not any(int(m['data'][k:k + 2], 16) for m in out['memory'] if int(m['addr'], 0) == OUT for k in range(0, len(m['data']), 2))
+            else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')}"])
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'stmxcsr {tag}: {problems}')
+    report['stmxcsr'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--xmc-rewrites', type=int, default=2000, help='xmc: rewrites, each checked (one per XMC_K or more iterations of vCPU 0)')
@@ -980,6 +1290,8 @@ def main():
     if 'tsc' in a.only: failures += tsc(a, report)
     if 'swapgs' in a.only: failures += swapgs(a, report)
     if 'sysfast' in a.only: failures += sysfast(a, report)
+    if 'stifirst' in a.only: failures += stifirst(a, report)
+    if 'stmxcsr' in a.only: failures += stmxcsr(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)

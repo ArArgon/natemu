@@ -187,6 +187,27 @@ void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask) {
 DEF_OP(FexcSimdCheck) {
   FexcSimdCheckWords(IROp->C<IR::IROp_FexcSimdCheck>()->Mask);
 }
+// Perf chunk 25: STMXCSR/VSTMXCSR's value (FEX's `FexcMxcsr`, fexc_slice1.inc `Classify`): MXCSR as the resident wrote it at the
+// block's entry (FEX's CPUState::mxcsr, frame::MXCSR on the host: the controls and the flags banked so far) with the flags
+// generated code raised since, exactly as the resident's bank computes them (`sse::bank`, `mxcsr_flags`): FPSR's IOC, DZC,
+// OFC, UFC, IXC as IE, ZE, OE, UE, PE and IDC as DE unless DAZ, FPSR or-ed with the SIMD flag byte (the flags checked
+// instructions moved there under unmasked exceptions). Only x0/x1 and the destination are written.
+//   ldr wD, [x28, #mxcsr]; mrs x0, fpsr; ldrb w1, [x28, #simd_flags]; orr w0, w0, w1; and w1, w0, #1; orr wD, wD, w1;
+//   ubfx w1, w0, #1, #4; orr wD, wD, w1, lsl #2; ubfx w0, w0, #7, #1; bic w0, w0, wD, lsr #6; orr wD, wD, w0, lsl #1
+DEF_OP(FexcMxcsr) {
+  const auto Dst = GetReg(Node);
+  ldr(Dst.W(), STATE, offsetof(FEXCore::Core::CPUState, mxcsr));
+  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  ldrb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
+  and_(ARMEmitter::Size::i32Bit, TMP2, TMP1, 1);
+  orr(ARMEmitter::Size::i32Bit, Dst, Dst, TMP2);
+  ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP1, 1, 4);
+  orr(ARMEmitter::Size::i32Bit, Dst, Dst, TMP2, ARMEmitter::ShiftType::LSL, 2);
+  ubfx(ARMEmitter::Size::i32Bit, TMP1, TMP1, 7, 1);
+  bic(ARMEmitter::Size::i32Bit, TMP1, TMP1, Dst, ARMEmitter::ShiftType::LSR, 6);
+  orr(ARMEmitter::Size::i32Bit, Dst, Dst, TMP1, ARMEmitter::ShiftType::LSL, 1);
+}
 // DPPS's first add level, between VFAddV's two `faddp` (SDM DPPS: "Exceptions are determined separately for each add and
 // multiply operation, in the order of their execution"; the multiply has its own check op, PlaceFPChecks): the two sums'
 // exact-tiny test and their check. Nothing of the instruction is committed yet, so the state before it holds here too.

@@ -307,9 +307,9 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   if (op == 0x77 && map == 1) { Verdict v = Allow(); v.avx = true; return v; }
   if (!has_modrm || ((r & MEM) && mod == 3) || ((r & REG) && mod != 3)) return Ud("AVX form with an operand x86 makes #UD");
   if (refuse) { Verdict v = Uns(refuse); v.avx = true; return v; }
-  // VLDMXCSR/VSTMXCSR m32: the resident's LDMXCSR/STMXCSR transaction (the host's VLDMXCSR/VSTMXCSR: no CR0.EM/CR4.OSFXSR
-  // gating, the AVX gating being this cut's).
-  if (mxcsr) { Verdict v = Sys("vldmxcsr/vstmxcsr (the resident's MXCSR transaction)"); v.avx = true; return v; }
+  // VLDMXCSR m32: the resident's LDMXCSR transaction (the host's VLDMXCSR: no CR0.EM/CR4.OSFXSR gating, the AVX gating being
+  // this cut's). Perf chunk 25: VSTMXCSR m32 (VEX.L 0, VEX.vvvv 1111b: else #UD above) translated as STMXCSR, AVX-gated.
+  if (mxcsr && reg == 2) { Verdict v = Sys("vldmxcsr (the resident's MXCSR transaction)"); v.avx = true; return v; }
   Verdict v = Allow();
   v.avx = true;
   v.align = mod != 3 && (r & ALIGN);
@@ -599,8 +599,14 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     // INSERTPS m32 whose zero mask clears the inserted element: FEX drops the load, and with it the access's #PF.
     else if (v.kind == ALLOW && map == 6 && op == 0x21 && mod != 3 && (b[d.InstSize - 1] & 0xF) & (1 << (b[d.InstSize - 1] >> 4 & 3)))
       v = Uns("insertps m32 whose zero mask clears the inserted element (FEX drops the load and its #PF)");
-    // LDMXCSR/STMXCSR m32 (0f ae /2, /3): MXCSR is the resident's (its gating, #GP for reserved bits, the exception flags).
-    if (d.FexcMap == FEXC_MAP_TWO && op == 0xAE && has_modrm && mod != 3 && (reg == 2 || reg == 3)) return Sys("ldmxcsr/stmxcsr");
+    // LDMXCSR m32 (0f ae /2): MXCSR is the resident's (its gating, #GP for reserved bits, the new controls re-key the code).
+    if (d.FexcMap == FEXC_MAP_TWO && op == 0xAE && has_modrm && mod != 3 && reg == 2) return Sys("ldmxcsr");
+    // Perf chunk 25: STMXCSR m32 (0f ae /3, no 66/F2/F3) is translated (FEX's STMXCSR under slice1: `FexcMxcsr`, the value the
+    // resident would store after banking the flags), gated as every SSE form (CR0.EM, CR4.OSFXSR: #UD; CR0.TS: #NM; the
+    // host's --sse-gated cut); its store is an access site (#PF, #GP/#SS, #AC at CPL 3, data breakpoints).
+    // (The prefix test is this rule's own, whichever two-byte map FEX files a 66/F2/F3 form under.)
+    if (d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66 && op == 0xAE && has_modrm && mod != 3 && reg == 3 &&
+        !(f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX))) { v = Allow(); v.simd = true; }
   }
   // x87 (I6): d8..df with their ModRM, WAIT/FWAIT. A documented form is cut as gated under CR0.EM/TS (#NM comes first,
   // whatever else the form is), WAIT under CR0.TS with CR0.MP; the prefixes are checked below as for any admitted form.
@@ -804,10 +810,11 @@ inline unsigned FexcUdLength(uint64_t rip) {
 
 // Perf chunk 15: the one-byte CLI (fa) and STI (fb) of a CPL-0 request are translated inline (patch 0031). At CPL 0 neither
 // faults (#GP(0) needs CPL > IOPL; 64-bit mode has no VME/PVI); with any prefix they stay the resident's (LOCK: #UD; the
-// others: the host's decode). STI only where its shadow stays inside the block: never as its first instruction (an entry at
-// the STI, as its own exit with an event pending, after a MOV SS or by a branch, runs the resident's STI) nor its last: the
-// next instruction is translated in the same block ([`Follows`]), so no block boundary falls where the shadow holds events.
+// others: the host's decode). STI only where its shadow stays inside the block: never its last instruction: the next
+// instruction is translated in the same block ([`Follows`]), so no block boundary falls where the shadow holds events.
 // Never before a REP string or LOCK NEG either: their exits to their own RIP would put a resident boundary inside the shadow.
+// Perf chunk 25: an STI may be its block's first instruction: the host marks the block, and the resident runs the STI itself
+// where the block's slow path would exit to its own start (an event held with IF = 0, a shadow, RF), never linking that exit.
 inline bool PlainFlag(const DecodedInst& d, uint8_t op) {
   return d.FexcMap == FEXC_MAP_PRIMARY && d.OPRaw == op && d.InstSize == 1;
 }
@@ -860,7 +867,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
   }
   const bool decoded = !failed && d.TableInfo != nullptr;
   if (decoded && (PlainFlag(d, 0xFA) || PlainFlag(d, 0xFB)) && fexc_cpl0 &&
-      (d.OPRaw == 0xFA || (!first && Follows(next, next_last && status != S::SUCCESS))))
+      (d.OPRaw == 0xFA || Follows(next, next_last && status != S::SUCCESS)))
     return false;
   if (decoded && PlainRdtsc(d) && fexc_tsc) return false;
   if (decoded && PlainSwapgs(d) && fexc_cpl0) return false;

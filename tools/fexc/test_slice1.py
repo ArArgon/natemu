@@ -320,11 +320,18 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual(d['guest']['end']['reason'], want)
 
     def test_vldmxcsr_is_a_system_cut(self):
-        for hexs in ('c5f8ae10', 'c5f8ae18', 'c4c178ae5c2408'):
+        for hexs in ('c5f8ae10', 'c4c178ae542408'):
             with self.subTest(hexs):
                 d, _ = run(hexs + '90')
-                self.assertIn('vldmxcsr/vstmxcsr', d['guest']['end']['detail'])
+                self.assertIn('vldmxcsr', d['guest']['end']['detail'])
                 self.assertEqual(d['guest']['end']['reason'], 'system_instruction')
+        # Perf chunk 25: VSTMXCSR and STMXCSR are translated; LDMXCSR stays a cut.
+        for hexs in ('c5f8ae18', 'c4c178ae5c2408', '0fae18'):
+            with self.subTest(hexs):
+                d, _ = run(hexs + '90')
+                self.assertEqual(d['guest']['instructions_translated'], 2, hexs)
+        d, _ = run('0fae1090')
+        self.assertEqual(d['guest']['end']['reason'], 'system_instruction')
 
     def test_prefix_before_vex_is_ud(self):
         for name, x in VEX_UD.items():

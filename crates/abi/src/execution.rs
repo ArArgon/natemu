@@ -89,7 +89,9 @@ pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 /// TSC offset (useless without the count: admission refuses counter reads outside a CPL-0 RDTSC, and RDTSC at CPL 3 stays
 /// the resident's, which faults under CR4.TSD). Perf chunk 17: IA32_KERNEL_GS_BASE ([`frame::KERNEL_GS_BASE`], 0 at CPL 3)
 /// and the GS base are read back after CPL-0 code (a CPL-0 store into either acts as SWAPGS's writes would; a CPL-3 one
-/// changes neither). Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
+/// changes neither). Perf chunk 25: MXCSR's entry value ([`frame::MXCSR`]), which only a translated STMXCSR reads: a store
+/// into it changes what that vCPU's STMXCSRs store until its next block entry, as a store into FCW's field changes what
+/// its FNSTCWs store. Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
 /// with LAM_SUP it would alias a canonical kernel address (neither is advertised).
 pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
 pub const FRAME_POINTER: u64 = GUEST_STATE_VA;
@@ -495,6 +497,10 @@ pub mod cache {
     /// for its copies): its packed relocations ([`crate::execution::RELOC_MOVE`]) follow its sites, as many as its flags
     /// hold at [`RELOCS_SHIFT`].
     pub const RELOCATABLE: u32 = 128;
+    /// Perf chunk 25: its first instruction is a translated STI (the host's [`super::State::sti_first`]; kept by its
+    /// copies): where its slow path would exit to its own start the resident runs the STI itself, and that exit (a link
+    /// from the block to itself) is never linked.
+    pub const STI_FIRST: u32 = 256;
     pub const RELOCS_SHIFT: u32 = 16;
     pub const MAX_RELOCS: u32 = 0xff;
     impl Block {
@@ -648,6 +654,10 @@ pub mod frame {
     /// translation's inline SWAPGS exchanges it with [`GS_BASE`] (admission allows those loads and stores only in a CPL-0
     /// block, with the code shape only inside a SWAPGS), and the resident banks both after every CPL-0 exit and fault.
     pub const KERNEL_GS_BASE: u32 = 0xa0;
+    /// Perf chunk 25: MXCSR at the block's entry (the bank's: its controls and the exception flags banked so far), 4 bytes in
+    /// FEX's `CPUState::mxcsr` (no generated code but STMXCSR's reads it), written by the resident at every entry and never read
+    /// back. A translated STMXCSR/VSTMXCSR stores it with the flags FPSR and [`SIMD_FLAGS`] gathered since, as the bank would.
+    pub const MXCSR: u32 = 0x3cc;
     /// x87 (I6, FEX's reduced-precision mode): FEX's flag bytes for FSW.IE (only FEX's own IE: its other exception flags
     /// are in [`X87_EXCEPTIONS`]), C0, C1, C2, C3 (each 0/1) and TOP (0..7); ST(i) as a double in the low 8 bytes of the
     /// 16-byte `mm[(TOP + i) & 7]` (the high 8 are unused); FCW (written from the bank at every block entry, never read back);
@@ -682,9 +692,10 @@ pub mod frame {
     /// reset with the rest of the page.
     pub const AVX_HIGH: u32 = 0xc0;
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
-    /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's. Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 16] = [
-        (TSC_OFFSET, 8), (AVX_HIGH, 256), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6), (EVENT_PENDING, 1),
+    /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's (perf chunk 25: its entry value readable,
+    /// [`MXCSR`]). Every other x28 access is refused.
+    pub const GUEST_STATE: [(u32, u32); 17] = [
+        (TSC_OFFSET, 8), (AVX_HIGH, 256), (MXCSR, 4), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6), (EVENT_PENDING, 1),
         (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
     ];
     /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IOPL, NT, AC, VIF,
@@ -1955,6 +1966,9 @@ pub struct State {
     /// step; no breakpoint, hook or stop cut its bytes and no halving retry; fexc's answer read neither to its bytes' end
     /// nor beyond the block's pages; not `unsupported_form`), else 0.
     pub relocatable: u64,
+    /// With a block reply (perf chunk 25): 1 when the block's first instruction is a translated STI (admission proves it
+    /// from the guest bytes); the resident keeps it in the block ([`cache::STI_FIRST`]).
+    pub sti_first: u64,
 }
 /// S4: [`State::debug`]'s fields.
 pub mod debug {
@@ -2039,6 +2053,7 @@ impl State {
             mailbox_mark_ticks: 0,
             debug: 0,
             relocatable: 0,
+            sti_first: 0,
         }
     }
 }
