@@ -2515,13 +2515,14 @@ mod tests {
 
     /// Perf chunk 21: a stand-in for `fexc --serve --channel FD` (a Python script; no wakes, so the host sees each reply
     /// at its next slice) that answers request 1 with `reply` (Python statements on `m`, the mapping, and `n`, the
-    /// request number) and request 2 and later with a well-formed empty reply.
+    /// request number) and request 2 and later with a well-formed empty reply. It exits once orphaned, so a test process that
+    /// dies (a negative control's crash) leaves no stand-in behind.
     fn fake_server(name: &str, reply: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("natemu-fake-fexc-{name}-{}.py", std::process::id()));
         let script = format!(
             "#!/usr/bin/python3\nimport mmap, os, signal, struct, sys, time\nassert sys.argv[1:3] == ['--serve', '--channel'] and len(sys.argv) == 4, sys.argv\n\
              m = mmap.mmap(int(sys.argv[3]), {bytes})\nREP = {rep}\nassert struct.unpack_from('<I', m, 8)[0] == {magic}\n\
-             struct.pack_into('<I', m, 72, {magic})\nfor n in range(1, 1 << 30):\n    while struct.unpack_from('<I', m, 0)[0] >> 1 != n: time.sleep(0.0002)\n\
+             struct.pack_into('<I', m, 72, {magic})\nfor n in range(1, 1 << 30):\n    while struct.unpack_from('<I', m, 0)[0] >> 1 != n: time.sleep(0.0002); os.getppid() == 1 and sys.exit(1)\n\
              \x20   if struct.unpack_from('<I', m, 4)[0] == 0: sys.exit(0)\n    if n == 1:\n{reply}\n    else:\n\
              \x20       struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<II', m, 68, 20, {magic})\n\
              \x20   struct.pack_into('<I', m, 64, n << 1)\n",
@@ -2621,7 +2622,7 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         assert!(server.failed(e).contains("signal: 9"));
         std::fs::remove_file(path).unwrap();
-        let path = fake_server("hung", "time.sleep(3600)");
+        let path = fake_server("hung", "while os.getppid() != 1: time.sleep(0.05)");
         let mut server = Server::start(&path).unwrap();
         let t = Instant::now();
         let e = server.request(b"\0\0\0\0", t + Duration::from_millis(300)).err().unwrap();
