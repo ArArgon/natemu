@@ -48,7 +48,10 @@ Then, as the numbers dictate:
 7. **Remaining exits and per-request costs**: fast paths for the commonest system instructions (~2.5 M entries per
    installer boot; done for the syscall path in perf chunk 12: `hackbench` N = 1 51.2 -> 30.1 s; CLI, STI, RDTSC inline at CPL 0 in
    chunk 15; SWAPGS inline at CPL 0 in chunk 17: `hackbench` N = 1 16.3 -> 13.8 s, `locks` N = 4 7.29 -> 6.54 s, [perf-plan.md](perf-plan.md),
-   "Measured (chunk 17)"; SYSCALL and SYSRET remain two resident trips per system call), fexc's fixed per-request setup (argument parsing, feature table and Config per request), a shared-memory request channel to the
+   "Measured (chunk 17)"; SYSCALL and SYSRET remain two resident trips per system call), fexc's fixed per-request setup (argument parsing, feature table and Config per request), a SYSCALL/SYSRET fast path in the
+   resident (chunk 17: two trips of about 0.2 us fixed cost each per system call, about 3.8 lookup passes per trip; going
+   straight to the IA32_LSTAR block or the return RIP; estimate, unmeasured: about 0.1 us per call, about 1.6 s `hackbench`
+   N = 1; measure first), a shared-memory request channel to the
    compile server in place of the pipe (keeps the process boundary; most of chunk 18's 3.5 us per compile is pipe and wake-up), an in-VM random-number generator or the Arm RNDR if the
    VM sees it (owner: after batch 1), a cheaper disk-cache key (fast hash plus stored request bytes), huge pages for the code
    area.
