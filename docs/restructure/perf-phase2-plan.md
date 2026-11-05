@@ -60,6 +60,11 @@ Then, as the numbers dictate:
    page-fault, mmap and fork cases), floating-point/vector compute (e.g. c-ray or SciMark). Each test-run on the AMD machine
    and timed against QEMU like the existing ones; added before generated-code quality, which needs them. Per-change checks
    stay on a small subset; the full set runs at batch end.
+   Chosen and staged (November 4, `natemu-raw/bench-20261104-02/`, the old four unchanged in the same initramfs): `luajit`
+   (LuaJIT 2.1 openresty 20250117, 16 programs of Mike Pall's suite, N at a time, md5-checked), `mem` (stress-ng 0.19.02
+   `--verify`, fixed op counts: vm, mmap, fork phases), `cray` (c-ray 1.1 `c-ray-mt`, sphfract 400x300, PPM md5). Seconds,
+   N = 1 / 4: AMD reference 1.78 / 0.61, 4.65 / 1.46, 0.37 / 0.12; QEMU like-for-like 18.1 / 5.3, 16.5 / 4.9, 12.6 / 4.5;
+   QEMU max 18.8 / 5.3, 27.3 / 8.0, 14.8 / 4.5. natemu runs next, after perf chunk 21.
    QEMU is reported twice from now on (owner, November 4): like-for-like (CPU features matched to natemu's, so the guest
    does the same work) and at its best (`-cpu max`, every feature TCG offers). QEMU does not change between our chunks, so
    both are measured once per benchmark set or QEMU version, not per change. A feature that makes QEMU faster goes on
