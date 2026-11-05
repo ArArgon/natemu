@@ -2869,8 +2869,9 @@ cell within 2.5% by median with overlapping ranges. Perf resident (`meas/`), `lu
 0.78 M, linker entries 5.41 M to 1.21 M, no VSTMXCSR left; `locks` N = 1 with change 1: resident-run STIs 6.37 M to 275 (the
 slow path and the steps).
 
-**Applies to.** Change 1: every Linux kernel path that enables interrupts right after a call returns (`local_irq_enable()`
-following an out-of-line call: 561 of this kernel's 569 STIs follow a `call`), whatever the workload: 0.12-0.58 M resident
+**Applies to.** Change 1: any kernel that enables interrupts with a one-byte STI at the start of a block (the condition is
+only CPL 0, the plain STI, its place in the block and a translatable next instruction); in Linux this is `local_irq_enable()`
+after an out-of-line call (561 of this kernel's 569 STIs follow a `call`), whatever the workload: 0.12-0.58 M resident
 trips per run on every benchmark and the installer (table above), 6.4 M on `locks` (futex and scheduler paths) and 4.7 M on
 `mem` (page faults, mmap); the condition is architectural (CPL 0, the plain one-byte STI first, its next instruction
 translatable). Change 2: any code that reads MXCSR: glibc libm's rounding-mode guard (SET_RESTORE_ROUND, in `sin`, `cos` and
@@ -3073,10 +3074,10 @@ the REP's own RIP with RCX = 0 is a boundary past the instruction (`rep_exited`)
 passes entered the linker (a scratch count by the exiting block, `diag/scratch-linker.diff`). The pass now ends the
 instruction by a branch after its last element (5188b9fa0), and `repbulk`'s `linked` case pins it.
 
-**Applies to.** Change 1: every OS's page zeroing by REP STOS in 64-bit code: Linux's `clear_page` (`rep stosq`, and `rep stosb`
-with ERMS) on every anonymous page fault, page-table page, `__GFP_ZERO` allocation and page-cache fill of a hole; Windows' and
+**Applies to.** Change 1: every OS's page zeroing by REP STOS in 64-bit code: Linux's `clear_page` (`rep stosq`; `rep stosb` only
+with ERMS, which natemu's profile does not advertise today) on every anonymous page fault, page-table page, `__GFP_ZERO` allocation and page-cache fill of a hole; Windows' and
 the BSDs' page zeroing where it uses REP STOS; `memset`/`bzero` in kernels and firmware built to REP STOS (GCC and MSVC
-inline it at -Os, glibc uses `rep stosb` for large sizes when ERMS is set); the condition is architectural (64-bit addressing,
+inline it at -Os, glibc uses `rep stosb` for large sizes only when ERMS is set, which the profile does not advertise); the condition is architectural (64-bit addressing,
 DF = 0, RDI's alignment, the count, the page end; no alignment checking or data breakpoint). Measured here on `mem` (fault and
 mmap churn); the others clear fewer pages. Change 2: every page-fault handler that reads CR2 at CPL 0 (Linux's `exc_page_fault`,
 every 64-bit OS's #PF entry), so every page-fault-heavy workload: fork and exec, mmap/munmap churn, first touches, copy on write.

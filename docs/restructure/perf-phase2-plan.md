@@ -139,6 +139,17 @@ Warm against off: `build` -4% (N = 1) and -11% (N = 4) with or without KASLR; th
 only CPL-3 code (kernel-mode code neither looked up nor stored), measured as its own chunk. Done in perf chunk 27
 (`natemu-raw/diskcache2-20261105-01/`): KASLR installer warm -1.4% / -1.5% against off, `build` -3.7% / -9.4%.
 
+## Benchmark conventions (audit, November 5, `natemu-raw/audit-generic-20261105-01/`)
+
+All comparisons boot with `mitigations=off nokaslr` (owner decision; a default command line costs the installer about 2.1x
+on natemu, perf-plan "Measured" mitigations) and with the compile cache off (QEMU starts cold; a default first boot is 2-6%
+slower than cache off and a repeat boot 1-9% faster, chunk 27), so neither is exactly what a default boot gets. Summaries
+count a benchmark run only when it is verified (not merely reached). The CPL-3-only disk cache (chunk 27) uses an
+architectural condition but was chosen because KASLR (Linux's and Windows' default) defeats kernel hits; a kernel that does
+not move loses its hits too (installer `nokaslr` warm -6.4/-8.3% → -3.7/0%); a generic alternative — stop storing kernel
+entries only once they stop hitting — is recorded, not built. The audit found no condition keyed on a program, guest
+address, OS symbol, kernel layout, benchmark or command line.
+
 ## Backlog (owner, November 4)
 
 - In-process FEX: about 0.6 s installer N = 1 and 0.7 s `build` N = 1 (chunk 20 estimate), but four concurrent compiles in
