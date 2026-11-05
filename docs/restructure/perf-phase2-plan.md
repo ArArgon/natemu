@@ -65,6 +65,12 @@ Then, as the numbers dictate:
    `--verify`, fixed op counts: vm, mmap, fork phases), `cray` (c-ray 1.1 `c-ray-mt`, sphfract 400x300, PPM md5). Seconds,
    N = 1 / 4: AMD reference 1.78 / 0.61, 4.65 / 1.46, 0.37 / 0.12; QEMU like-for-like 18.1 / 5.3, 16.5 / 4.9, 12.6 / 4.5;
    QEMU max 18.8 / 5.3, 27.3 / 8.0, 14.8 / 4.5. natemu runs next, after perf chunk 21.
+   Extended (November 5, `natemu-raw/bench-20261105-03/`): four more existing programs — `luajit-interp` (the same LuaJIT,
+   `-joff`), `7zip` (7-Zip 25.01, LZMA2 on 12 MiB of Silesia, then `7zz t`), `sqlite` (SQLite 3.46.1 `speedtest1 --memdb
+   --verify --size 160`, single-process), `avx` (x264 0.164, AVX2 paths, 300 CIF frames) — and every boot now runs its
+   benchmark twice, cold then warm, timed and verified separately. Resized for 3-10 s of natemu work: `zstd` -9 → -12, `cray`
+   400x300 → 1280x960. QEMU like-for-like N = 1 cold / warm: luajit-interp 30.4 / 30.5, 7zip 21.1 / 15.0, sqlite 22.8 / 22.6,
+   avx 45.0 / 44.9, zstd 29.8 / 29.0, cray 130.1 / 129.4 s. This is the batch-end set; per-change runs stay a subset.
    QEMU is reported twice from now on (owner, November 4): like-for-like (CPU features matched to natemu's, so the guest
    does the same work) and at its best (`-cpu max`, every feature TCG offers). QEMU does not change between our chunks, so
    both are measured once per benchmark set or QEMU version, not per change. A feature that makes QEMU faster goes on
