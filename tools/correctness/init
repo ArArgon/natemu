@@ -1,0 +1,17 @@
+#!/bin/sh
+# Correctness initramfs /init: mount the pseudo file systems, bring up loopback, then run one suite part and power off.
+# Kernel command line words: ct=SUITE (ltp, torture, libm) and part=K/N (default 0/1: the whole suite).
+# Serial output: CT-BEGIN, one CT-RESULT line per test (runner-specific fields), CT-END; nothing else is needed.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C TZ=UTC
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
+mkdir -p /dev/pts /dev/shm; mount -t devpts devpts /dev/pts; mount -t tmpfs shm /dev/shm
+mount -t tmpfs tmp /tmp; mount -t tmpfs run /run; chmod 1777 /tmp
+echo 1 > /proc/sys/kernel/printk; hostname natemu-ct; ip link set lo up 2>/dev/null
+suite=none; part=0/1
+for a in $(cat /proc/cmdline); do case $a in ct=*) suite=${a#ct=};; part=*) part=${a#part=};; esac; done
+exec </dev/null >/dev/ttyS0 2>&1
+echo "CT-BEGIN suite=$suite part=$part cpus=$(nproc) kernel=$(uname -r)"
+t0=$(cut -d' ' -f1 /proc/uptime)
+/ct/run-$suite.sh /ct "$part"; rc=$?
+echo "CT-END suite=$suite part=$part rc=$rc guest_s=$(awk -v a=$t0 '{print $1-a}' /proc/uptime)"
+sync; poweroff -f
