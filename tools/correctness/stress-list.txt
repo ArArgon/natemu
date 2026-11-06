@@ -1,0 +1,179 @@
+# stress-list.txt: FAMILY STRESSOR OPS [EXTRA-OPTIONS...] for run-stress.sh (one stress-ng run per line, --verify).
+# OPS: the bogo ops the AMD machine did in 5 s at 4 instances (part cal=5, stress-check.py ops; at most 1e8,
+# stress-ng's limit; userfaultfd, skipped there as a user, set by hand); sizes keep 4 instances of a
+# family's largest stressor under about 512 MiB (the guest has 2 GiB). Not listed: memthrash (no verification; with
+# an op limit its threads run on to the 240 s timeout, natively too; 1 GiB at 4 instances).
+# memory and copy
+mem1 vm 368833 --vm-bytes 64M
+mem1 vm-rw 14984 --vm-rw-bytes 16M
+mem1 memcpy 14176
+mem1 memrate 238 --memrate-bytes 32M
+mem1 stream 4918 --stream-l3-size 4M
+mem1 mmap 1830 --mmap-bytes 32M
+mem1 mremap 4414 --mremap-bytes 32M
+mem1 madvise 709
+mem1 mprotect 11534423
+mem1 userfaultfd 200000 --userfaultfd-bytes 16M
+mem1 msync 10795 --msync-bytes 16M
+mem1 msyncmany 3176
+mem2 mmapfork 201
+mem2 mmapmany 1791159
+mem2 mmapfixed 943
+mem2 mmapaddr 1302415
+mem2 munmap 87586
+mem2 pagemove 9358
+mem2 remap 1500
+mem2 rmap 1049
+mem2 vm-addr 307
+mem2 vm-segv 237
+mem2 mmapcow 2092821
+mem2 mmaptorture 16 --mmaptorture-bytes 16M
+mem3 bigheap 757683 --bigheap-bytes 64M
+mem3 brk 4704054 --brk-bytes 64M
+mem3 malloc 55983836 --malloc-bytes 1M
+mem3 stack 2219108
+mem3 stackmmap 353
+mem3 mincore 35996
+mem3 mlock 455561
+mem3 memfd 2509 --memfd-bytes 32M
+mem3 ptr-chase 100000000
+mem3 pageswap 1077939
+# CPU, atomics and synchronisation
+cpu1 atomic 3085
+cpu1 futex 2196213
+cpu1 mutex 3867484
+cpu1 spinmem 1381
+cpu1 dekker 77458658
+cpu1 peterson 51053376
+cpu1 mtx 100000000
+cpu1 prio-inv 25065700
+cpu2 cpu 45095 --cpu-method all
+cpu2 matrix 128160
+cpu2 matrix-3d 2344
+cpu2 vecmath 139082
+cpu2 vecwide 1975246
+cpu2 vecfp 78720
+cpu2 vecshuf 15910
+cpu3 veccmp 632168
+cpu3 fma 25033624
+cpu3 fp 3456
+cpu3 hash 4161410
+cpu3 crypt 63952
+cpu3 bitops 4980150
+cpu3 intmath 1809587
+cpu3 regs 181241
+cpu3 tsc 20808768
+cpu3 x86cpuid 454656
+cpu3 rdrand 5799936
+# processes and signals (exec and spawn refuse root: run as nobody in the guest)
+proc1 fork 154141
+proc1 vfork 662122
+proc1 vforkmany 954626
+proc1 clone 5311
+proc1 exec:user 30516
+proc1 spawn:user 38953
+proc1 pthread 274432
+proc1 exit-group 10123
+proc1 zombie 92382
+proc1 wait 26460
+proc1 prctl 93056
+proc1 ptrace 3289308
+proc2 sigsegv 8111878
+proc2 sigpipe 11893395
+proc2 signal 7982438
+proc2 sigq 5096507
+proc2 kill 694507
+proc2 sigfpe 7633028
+proc2 sigill 6347913
+proc2 sigtrap 10625246
+proc2 sigbus 9263067
+proc2 sigabrt 8
+proc3 sigchld 172827
+proc3 sigrt 3212530
+proc3 sigsuspend 3010855
+proc3 sigfd 6587374
+proc3 signest 10127927
+proc3 sigpending 6999412
+proc3 context 109976
+proc3 bad-altstack 4
+proc3 longjmp 5276553
+proc3 priv-instr 12152319
+proc3 usersyscall 9405026
+proc3 x86syscall 100000000
+# scheduling and IPC
+ipc1 pipe 6947817
+ipc1 pipeherd 9712541
+ipc1 eventfd 2176796
+ipc1 mq 4133336
+ipc1 sem 18839939
+ipc1 sem-sysv 729821
+ipc1 shm 6043 --shm-bytes 8M
+ipc1 shm-sysv 112
+ipc1 msg 22064222
+ipc1 fifo 5315763
+ipc2 switch 5065870
+ipc2 yield 17682882
+ipc2 affinity 1955434
+ipc2 poll 1323050
+ipc2 schedmix 12604
+ipc2 resched 3747144
+ipc2 race-sched 27871
+ipc2 sockpair 1193947
+# cache and TLB; code1: code written or mapped and run (natemu runs icache, far-branch, funccall and prefetch 25-250 times
+# slower than the AMD machine: far-branch reaches the 240 s timeout before its op count)
+cache1 cache 10155739
+cache1 cacheline 11034
+cache1 cachehammer 4840090
+cache1 l1cache 8192
+cache1 tlb-shootdown 135853
+code1 icache 13006
+cache1 prefetch 86
+cache1 flushcache 9545
+cache1 membarrier 1240
+cache1 llc-affinity 7088
+code1 far-branch 968
+code1 funccall 17040
+code1 funcret 760475
+code1 branch 5612787
+code1 goto 21506482
+# split: misaligned accesses one method at a time (mem3's `misaligned` (all methods) and cpu1's `lockbus` moved here:
+# their atomic methods and lockbus's locked increments at buffer+1 and +10 walking by 4 bytes (with or without
+# --lockbus-nosplit) are LOCKed accesses crossing 16 bytes, which natemu refuses with a machine stop
+# (unsupported_atomic, a documented limit): native only, family splitx). split: the 16- and 32-bit methods, split2:
+# the 64- and 128-bit ones (natemu runs misaligned stores slowly).
+split misaligned:int16rd 45045945 --misaligned-method int16rd
+split misaligned:int16wr 15827321 --misaligned-method int16wr
+split misaligned:int16inc 21625570 --misaligned-method int16inc
+split misaligned:int32rd 52848592 --misaligned-method int32rd
+split misaligned:int32wr 17598610 --misaligned-method int32wr
+split misaligned:int32wrnt 515174 --misaligned-method int32wrnt
+split misaligned:int32inc 17250397 --misaligned-method int32inc
+split2 misaligned:int64rd 54952230 --misaligned-method int64rd
+split2 misaligned:int64wr 18875021 --misaligned-method int64wr
+split2 misaligned:int64wrnt 556438 --misaligned-method int64wrnt
+split2 misaligned:int64wrds 4 --misaligned-method int64wrds
+split2 misaligned:int64inc 17206184 --misaligned-method int64inc
+split2 misaligned:int128rd 50826714 --misaligned-method int128rd
+split2 misaligned:int128wr 17870036 --misaligned-method int128wr
+split2 misaligned:int128inc 16916919 --misaligned-method int128inc
+splitx lockbus:nosplit 3130083 --lockbus-nosplit
+splitx misaligned:int16atomic 63255 --misaligned-method int16atomic
+splitx misaligned:int32atomic 63855 --misaligned-method int32atomic
+splitx misaligned:int64atomic 64679 --misaligned-method int64atomic
+splitx misaligned:int128atomic 62219 --misaligned-method int128atomic
+splitx lockbus:split 124056
+splitx misaligned:all 14600
+# shmx: shm-sysv alone, as root and as nobody (ipc1's shm-sysv did no bogo op in 240 s in natemu at N=4)
+shmx shm-sysv 112
+shmx shm-sysv:user 112
+# mix: one stress-ng run of many stressors at once (part n=1: one instance each), each to the 240 s timeout (op count
+# 1e8, not reached): page-table copies (fork, mmapfork, clone, ptrace), code written and run (icache, far-branch,
+# funcret), TLB shootdowns, faults and signals, all on the vCPUs together
+mix vm:mix1 100000000 --vm-bytes 64M --mmapfork 1 --fork 1 --pthread 1 --icache 1 --far-branch 1 --tlb-shootdown 1 --sigsegv 1 --switch 1 --atomic 1 --futex 1
+mix mprotect:mix2 100000000 --mremap 1 --mremap-bytes 32M --userfaultfd 1 --vm-rw 1 --vm-rw-bytes 16M --clone 1 --signal 1 --sigq 1 --cache 1 --funcret 1 --mmapcow 1 --ptrace 1 --membarrier 1
+# ipc1t: the tail of ipc1 (shm-sysv as nobody, msg, fifo), for boots where ipc1 reached the 900 s cap (N=2)
+ipc1t shm-sysv:user 112
+ipc1t msg 22064222
+ipc1t fifo 5315763
+# code1t: the tail of code1 (goto), for boots where code1 reached the 900 s cap (N=2)
+code1t goto 21506482
