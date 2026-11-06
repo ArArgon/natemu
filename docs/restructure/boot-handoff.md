@@ -94,11 +94,16 @@ stub or `boot-linux` feeds standard input to COM1's receive line, so a person ca
 `target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 rdinit=/bin/busybox -- sh' --serial-stdin`.
 A terminal is put in raw mode (as QEMU's `-serial stdio`: no echo or line editing, Ctrl-C goes to the guest), restored at
 exit, at a panic and at a second SIGINT/SIGTERM; **Ctrl-A x** cancels the run (`Cancelled`, exit 2), Ctrl-A Ctrl-A sends
-one Ctrl-A. A pipe works too (scripted input, verbatim but for the same escapes). A host thread feeds the bytes as QEMU's
-character backend does (only as many as the FIFO advertises, so host input never overruns) and raises IRQ4 itself,
-including the FIFO timeout, holding a busy guard; keystrokes before the guest opens ttyS0 are lost, as on hardware
-(library: `Boot::serial_input`, `linux::serial_stdin`, `uart::feed`). `run_boot_smoke.py`'s `stdin` case pipes
-`echo hello-$((6*7))` and `poweroff -f` into busybox `sh` and checks `hello-42` on serial.
+one Ctrl-A, Ctrl-A with any other byte sends nothing. A pipe works too (scripted input, verbatim but for the same
+escapes: a 0x01 byte in piped input is taken as an escape, never passed on alone). A reader thread takes input as it
+arrives and acts on the escapes at once, so Ctrl-A x works while the guest reads nothing (hung, or before its driver
+opens the port); the rest waits in a 4 KiB queue (bytes past it are dropped), and a second thread gives it to the UART as
+QEMU's character backend does (only as many as the FIFO advertises, so host input never overruns) and raises IRQ4 itself,
+including the FIFO timeout, holding a busy guard; keystrokes before the guest opens ttyS0 are lost, as on hardware.
+Raw mode starts only after the signal handlers are installed. Library: `Prepared::serial_input` (before `run`),
+`linux::serial_stdin`, `uart::feed`. `run_boot_smoke.py`'s `stdin` case pipes `echo hello-$((6*7))` and `poweroff -f`
+into busybox `sh` and checks `hello-42` on serial; `stdin-quit` pipes bytes nobody reads during the kernel's boot, then
+Ctrl-A x, and checks the stub ends `Cancelled` within 5 s.
 
 **Library entry** (`crates/host/src/linux.rs`, package `natemu`): `natemu::linux::Boot` (every manifest field below,
 defaults from `Boot::new(runtime, fexc, kernel)`), `Boot::prepare()` (guest RAM, loader, ACPI tables, each vCPU's state,

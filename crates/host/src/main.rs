@@ -54,12 +54,12 @@ fn boot(args: &[String]) -> natemu::Result<Stop> {
             _ => return Err(USAGE.into()),
         }
     }
-    if serial_stdin {
-        boot.serial_input = Some(natemu::linux::serial_stdin());
-    }
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
     let prepared = boot.prepare()?;
     prepared.canceller().on_signals();
+    if serial_stdin {
+        prepared.serial_input(natemu::linux::serial_stdin()); // raw mode only once the signals are handled
+    }
     // The stop of the vCPU whose end ended the run (any vCPU may power off), else the BSP's.
     let mut outcome = prepared.run()?;
     if let Some(e) = prepared.serial_error() {

@@ -43,9 +43,6 @@ pub struct Boot {
     /// Where COM1's output goes as it is sent (default none: the UART keeps it; [`Prepared::serial_bytes`] counts it either
     /// way, [`Prepared::serial_error`] reports a failed write).
     pub serial: Option<Box<dyn Write + Send>>,
-    /// Where COM1's input comes from (default none): a thread feeds it to the UART for the run ([`uart::feed`]; Ctrl-A x
-    /// cancels the run). [`serial_stdin`] gives the process's standard input, `--serial-stdin` / `NATEMU_SERIAL_STDIN`.
-    pub serial_input: Option<Box<dyn Read + Send>>,
     /// An unassigned port or page access is a typed stop instead of all-ones (L3; default off).
     pub strict_unassigned: bool,
     /// The periodic sources' lost-tick policies (L5; default `LostTicks::DEFAULT`).
@@ -81,7 +78,6 @@ impl Boot {
             rsdp: boot::ACPI_NVS.0,
             code_bytes: exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES,
             serial: None,
-            serial_input: None,
             strict_unassigned: false,
             lost_ticks: clock::LostTicks::DEFAULT,
             watchdog: Duration::from_secs(60),
@@ -144,7 +140,7 @@ impl Boot {
             code_shape: self.code_shape,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
-            serial_input: Mutex::new(self.serial_input),
+            serial_input: Mutex::new(None),
         })
     }
 
@@ -173,7 +169,7 @@ pub struct Prepared {
     ran: AtomicBool,
     /// The run's cancellation flag ([`Prepared::canceller`]).
     cancel: Arc<AtomicBool>,
-    /// [`Boot::serial_input`], taken by the run.
+    /// [`Prepared::serial_input`], taken by the run.
     serial_input: Mutex<Option<Box<dyn Read + Send>>>,
 }
 
@@ -246,10 +242,10 @@ extern "C" fn restore_terminal() {
         unsafe { tcsetattr(0, 0, t) }; // TCSANOW
     }
 }
-/// The process's standard input as COM1's input ([`Boot::serial_input`]). On a terminal, raw mode first, as QEMU's
+/// The process's standard input as COM1's input ([`Prepared::serial_input`]). On a terminal, raw mode first, as QEMU's
 /// `-serial stdio` (`char-stdio.c`: output processing kept, no echo, no line editing, no signal keys: Ctrl-C goes to the
-/// guest), restored at exit, at a panic and at the second SIGINT/SIGTERM's exit ([`Canceller::on_signals`]). Once per
-/// process.
+/// guest), restored at exit, at a panic and at the second SIGINT/SIGTERM's exit ([`Canceller::on_signals`]: call this
+/// after it, so no signal can end the process with the terminal raw). Once per process.
 pub fn serial_stdin() -> Box<dyn Read + Send> {
     let mut t = std::mem::MaybeUninit::<Termios>::uninit();
     if unsafe { isatty(0) == 1 && tcgetattr(0, t.as_mut_ptr()) == 0 } {
@@ -299,7 +295,8 @@ impl Prepared {
         let (backing, vcpus) = (&self.backing, self.backing.n);
         let machine = Machine::create(backing.memory.clone())?;
         self.irqs.attach(machine.doorbell());
-        // COM1's host input: a detached thread (it blocks in its read), holding a busy guard while it may still feed.
+        // COM1's host input: a detached thread (it blocks in its read), holding a busy guard while it may still feed (the
+        // rule `irq.rs` sets for asynchronous sources; no Linux boot reads it today).
         if let Some(input) = self.serial_input.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let (uart, busy, cancel) = (self.uart.clone(), self.irqs.busy(), self.canceller());
             std::thread::spawn(move || {
@@ -420,6 +417,12 @@ impl Prepared {
     fn end(&self) {
         self.irqs.detach();
         self.board.stop();
+    }
+    /// Where COM1's input comes from (default none), set before [`Prepared::run`]: a thread feeds it to the UART for the
+    /// run ([`uart::feed`]; Ctrl-A x cancels the run). [`serial_stdin`] gives the process's standard input
+    /// (`--serial-stdin` / `NATEMU_SERIAL_STDIN`).
+    pub fn serial_input(&self, input: Box<dyn Read + Send>) {
+        *self.serial_input.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
     }
     /// A handle that cancels this boot's run ([`Canceller`]).
     pub fn canceller(&self) -> Canceller {

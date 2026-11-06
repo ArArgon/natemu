@@ -22,8 +22,9 @@
 //! the board treats an edge as a 0 -> 1 change (QEMU's edge-mode I/O APIC delivers on every raise, a raise while already
 //! high included: a departure recorded in `ioapic.rs`). Host input is asynchronous: [`feed`]'s thread receives bytes and
 //! runs the CTI on time under the UART's lock, so the line rises without an access, through the same hook (IRQ4 into
-//! `irq::Irqs::line`, whose delivery rings a halted vCPU); its caller holds an `Irqs::busy` guard while it runs (X3's
-//! rule for ending halted vCPUs). ponytail: a CTI due after a guest's partial read, with no host input, still waits for
+//! `irq::Irqs::line`, whose delivery rings a halted vCPU). `linux::Prepared::run` holds an `Irqs::busy` guard while it
+//! runs, as `irq.rs` asks of asynchronous sources; nothing in a Linux boot reads it today (only the program driver
+//! ends halted vCPUs, by `Irqs::live`). ponytail: a CTI due after a guest's partial read, with no host input, still waits for
 //! the next access (Linux's 8250 handler drains the FIFO, so it does not arise there).
 use crate::devices::Device;
 use std::collections::VecDeque;
@@ -340,32 +341,78 @@ impl Device for Uart {
     }
 }
 
-/// Feeds `input` to `uart`'s receive line until it ends (EOF or a read error) or the escape Ctrl-A x, which calls `quit`
-/// (QEMU's mux escapes: Ctrl-A Ctrl-A sends one Ctrl-A, Ctrl-A and any other byte sends nothing). Every other byte is
-/// passed on, Ctrl-C included. Each byte waits until the UART can take it ([`Uart::can_receive`]); after each read the
-/// FIFO timeout is run when it falls due. For a thread of its own: it blocks in `input`.
-pub fn feed(uart: &Mutex<Uart>, mut input: impl Read, quit: impl FnOnce()) {
+/// Host input bytes [`feed`] holds for the UART (a reader's bytes past them are dropped while it is full).
+const QUEUE: usize = 4096;
+
+/// Feeds `input` to `uart`'s receive line until it ends (EOF or a read error: queued bytes are still delivered) or the
+/// escape Ctrl-A x, which calls `quit` at once (QEMU's mux escapes: Ctrl-A Ctrl-A sends one Ctrl-A, Ctrl-A and any other
+/// byte sends nothing; on piped input too, so a lone 0x01 byte is never passed on). Every other byte is passed on,
+/// Ctrl-C included. A reader thread takes `input` as it arrives, acts on the escapes and queues the rest (at most
+/// [`QUEUE`] bytes; past that, bytes are dropped), so the escape works while the guest reads nothing; this thread gives
+/// each queued byte to the UART when it can take it ([`Uart::can_receive`]) and runs the FIFO timeout when it falls due
+/// with nothing queued. For a thread of its own: it returns when the reader ends (which blocks in `input`).
+pub fn feed(uart: &Mutex<Uart>, mut input: impl Read + Send, quit: impl FnOnce() + Send) {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::mpsc::{TryRecvError, sync_channel};
     let lock = || uart.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut buf, mut escape) = ([0u8; 256], false);
-    loop {
-        let n = match input.read(&mut buf) {
-            Ok(0) => return,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
-        };
-        for &byte in &buf[..n] {
-            match (std::mem::take(&mut escape), byte) {
-                (false, 1) => {
-                    escape = true;
-                    continue;
+    let (queue, queued) = sync_channel::<u8>(QUEUE);
+    let quitting = &AtomicBool::new(false);
+    std::thread::scope(|s| {
+        // `move`: the reader's end drops the queue's sender, which ends this thread's wait.
+        s.spawn(move || {
+            let (mut buf, mut escape) = ([0u8; 256], false);
+            loop {
+                let n = match input.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                };
+                for &byte in &buf[..n] {
+                    match (std::mem::take(&mut escape), byte) {
+                        (false, 1) => escape = true,
+                        (true, b'x') => {
+                            quitting.store(true, SeqCst);
+                            return quit();
+                        }
+                        (true, b) if b != 1 => {}
+                        // ponytail: a full queue drops the byte silently; count drops if anyone needs to know.
+                        _ => _ = queue.try_send(byte),
+                    }
                 }
-                (true, b'x') => return quit(),
-                (true, b) if b != 1 => continue,
-                _ => {}
             }
+        });
+        loop {
+            let byte = match queued.try_recv() {
+                Ok(byte) => byte,
+                Err(ended) => {
+                    // Nothing queued: the FIFO timeout on time, then wait for input (unless it ended).
+                    loop {
+                        let mut u = lock();
+                        let now = Instant::now();
+                        u.timeout(now);
+                        match u.timeout_at {
+                            Some(at) if !u.recv.is_empty() => {
+                                drop(u);
+                                std::thread::sleep(at.saturating_duration_since(now));
+                            }
+                            _ => break,
+                        }
+                    }
+                    if ended == TryRecvError::Disconnected {
+                        return;
+                    }
+                    match queued.recv() {
+                        Ok(byte) => byte,
+                        Err(_) => return,
+                    }
+                }
+            };
             // ponytail: polls every millisecond for room; a condvar signalled by RBR reads if typing latency matters.
             loop {
+                if quitting.load(SeqCst) {
+                    return;
+                }
                 let mut u = lock();
                 let now = Instant::now();
                 u.timeout(now);
@@ -377,19 +424,7 @@ pub fn feed(uart: &Mutex<Uart>, mut input: impl Read, quit: impl FnOnce()) {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        loop {
-            let mut u = lock();
-            let now = Instant::now();
-            u.timeout(now);
-            match u.timeout_at {
-                Some(at) if !u.recv.is_empty() => {
-                    drop(u);
-                    std::thread::sleep(at.saturating_duration_since(now));
-                }
-                _ => break,
-            }
-        }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -487,11 +522,9 @@ mod tests {
             r.fetch_add(usize::from(level), std::sync::atomic::Ordering::SeqCst);
         }));
         let u = Mutex::new(u);
-        let quit = std::sync::atomic::AtomicBool::new(false);
-        // Two reads: the CTI runs after the first, the escape ends the second.
-        feed(&u, Read::chain(&b"ab\x01\x01c\x01zd"[..], &b"\x01xe"[..]), || quit.store(true, std::sync::atomic::Ordering::SeqCst));
+        // The input ends: what was queued is delivered and the CTI runs before `feed` returns.
+        feed(&u, &b"ab\x01\x01c\x01zd"[..], || panic!("no Ctrl-A x"));
         let mut g = u.lock().unwrap();
-        assert!(quit.into_inner());
         assert_eq!((g.recv.iter().copied().collect::<Vec<_>>(), g.line), (b"ab\x01cd".to_vec(), true));
         assert_eq!((g.read_at(2, Instant::now()) & 0x0f, rises.load(std::sync::atomic::Ordering::SeqCst)), (IIR_CTI, 1));
         g.write_at(2, 0, Instant::now()); // FIFO off (and cleared)
@@ -505,5 +538,28 @@ mod tests {
         });
         let mut g = u.lock().unwrap();
         assert_eq!((g.lsr & (LSR_DR | LSR_OE), g.read_at(0, Instant::now())), (LSR_DR, b'y'));
+    }
+
+    /// Review of b55a0f4: Ctrl-A x works while the guest reads nothing (no FIFO: one byte fits, the rest wait), on input
+    /// that has not ended; `feed` returns at once.
+    #[test]
+    fn the_escape_is_not_stuck_behind_unread_input() {
+        let u = Mutex::new(Uart::new());
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let quit = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let fed = s.spawn(|| feed(&u, reader, move || quit.0.send(()).unwrap()));
+            writer.write_all(b"abc").unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(u.lock().unwrap().rbr, b'a');
+            writer.write_all(b"\x01x").unwrap();
+            assert!(quit.1.recv_timeout(Duration::from_secs(2)).is_ok());
+            let t = Instant::now();
+            while !fed.is_finished() && t.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(fed.is_finished());
+        });
+        drop(writer);
     }
 }

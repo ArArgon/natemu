@@ -144,9 +144,6 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if let Some(path) = &serial {
         boot.serial = Some(Box::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?));
     }
-    if serial_stdin {
-        boot.serial_input = Some(natemu::linux::serial_stdin()); // the stub's `--serial-stdin`
-    }
     let trace = match &trace {
         Some(path) => Some(std::io::BufWriter::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?)),
         None => None,
@@ -164,6 +161,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     // counts (`clock::TickStats`) and the LAPIC timer's expiries taken, merged and reinjected (its record, read racily).
     let tracing = std::sync::atomic::AtomicBool::new(trace.is_some());
     prepared.canceller().on_signals();
+    if serial_stdin {
+        prepared.serial_input(natemu::linux::serial_stdin()); // the stub's `--serial-stdin`, after the signals
+    }
     let outcome = std::thread::scope(|scope| -> Result<_> {
         if let Some(mut file) = trace {
             let tracing = &tracing;
