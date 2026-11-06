@@ -53,7 +53,7 @@ pub struct Boot {
     pub max_block: Option<u32>,
     /// End the run when the BSP is about to execute this linear address (a block boundary, nothing fetched there).
     pub stop_at: Option<u64>,
-    /// The persistent compile cache (default off; [`compile_cache::Config::from_env`] opts in).
+    /// The persistent compile cache (default off; [`compile_cache::Config::new`] opts in).
     pub compile_cache: compile_cache::Config,
     /// Debug: every answer used at another RIP than its own is compiled there too and must equal it (`Compiler::check_reuse`).
     pub check_reuse: bool,
@@ -264,10 +264,6 @@ pub fn serial_stdin() -> Box<dyn Read + Send> {
         }
     }
     Box::new(std::io::stdin())
-}
-/// `NATEMU_SERIAL_STDIN` is 1, on, true or yes.
-pub fn env_serial_stdin() -> bool {
-    std::env::var("NATEMU_SERIAL_STDIN").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
 }
 
 /// How a run ended.

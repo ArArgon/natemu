@@ -216,3 +216,39 @@ different host load and CPU frequency (the harness's calibration read 2.9-3.9 GH
 1% of `mem64`) are not resolved. Word counts are per iteration at the linked steady state, not per guest instruction retired. The spread
 targets (5%) were missed for mem64, mem4096 and one branchy pair. Compile cost, QEMU word counts, the linux-user column and PMU cycles were
 not measured.
+
+## Boot benchmarks (`run.py`, `boot.py`)
+
+The Linux boot harnesses of the performance phase, brought into the repository on November 5 with the stub's named
+command line (from `natemu-raw/bench-20261105-03/scripts/bench.py` and `natemu-raw/qcmp-20261103-01/boot.py`; their
+measurement, verification and record fields are unchanged; natemu now runs as the `natemu` stub, not `natemu-host
+boot-linux`, which had the same 60 s watchdog and default code cache). Kernel and initramfs are arguments; nothing defaults
+to natemu-raw.
+
+    python3 tools/bench/run.py --out DIR --name NAME --emu natemu --vcpus 1 --bench zstd --kernel BZIMAGE --initrd bench.cpio \
+        --fexc FEXC [--compile-cache off]
+    python3 tools/bench/boot.py --out DIR --name NAME --emu natemu --vcpus 1 --kernel BZIMAGE --initrd INSTALLER_INITRD \
+        --fexc FEXC --cache off
+
+`run.py`: one boot of the bench initramfs (built by natemu-raw/bench-20261105-03/scripts/build.sh), the benchmark run twice
+in the guest, each timed START to END on the serial console (`wall_s`, `wall2_s`; the guest's own `guest_s`, `guest2_s`;
+per phase `phases`, `phases2`) and verified (`verified1`, `verified2`); a line per boot in DIR/bench.jsonl. `boot.py`: the
+Debian boot timed from process start to its end-point line (the installer's "Select a language", or the root-fs panic
+without an initrd), `wall_s`, a line per boot in DIR/boots.jsonl. Both record `contended` (foreign VM processes seen every
+0.5 s through `vms.sh`, whose own command line names no VM binary) and exit 0 good, 1 not reached or not verified, 3 good
+but contended. QEMU (`--emu qemu-multi|qemu-single`) uses qcmp-20261103-01's board and CPU model. Run each boot under the
+VM lock (`/usr/bin/lockf -k .../natemu-raw/.vm.lock`) with no other VM running.
+
+The scripts kept as evidence in natemu-raw (these two originals, their campaign drivers and the other campaigns' scripts)
+use the older command lines: the stub's positional `natemu RUNTIME FEXC BZIMAGE [OPTIONS]`, which the stub no longer
+accepts after November 5, and `natemu-host RUNTIME boot-linux FEXC BZIMAGE`, which still works. Leave them as they are; use
+these copies for new measurements.
+
+Regression check of the clap change (November 5, M4, cache off, one VM at a time under the lock, none contended; records in
+`natemu-raw/clap-compare-20261105-01`): the stub at 71feccb (positional, through a shell shim that `exec`s it) against the
+clap stub, the same resident and fexc (series65-p2). Startup, 20 interleaved runs each, median: `--help` 2.64 ms old (a
+usage refusal) vs 2.70 ms new; an immediate exit (missing kernel) 2.65 vs 2.67 ms. Three interleaved rounds, median
+(range): installer N = 1 to "Select a language" 5.343 s (5.312-5.398) old vs 5.215 s (5.169-5.295) new; `zstd` N = 1 of
+bench-20261105-03's initramfs, run 1 `wall_s` 3.064 (3.037-3.087) vs 3.055 (2.997-3.075), run 2 `wall2_s` 2.884
+(2.840-2.907) vs 2.920 (2.851-3.787; the 3.787 run's own `guest2_s` is 3.76), every run verified. No slowdown. The
+installer's ranges do not overlap, the new stub 0.13 s (2.4%) faster; not explained (the shim's `sh` costs milliseconds).

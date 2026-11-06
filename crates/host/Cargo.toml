@@ -9,5 +9,5 @@ natemu-abi = { path = "../abi" }
 
 [features]
 # Test drivers only (crates/driver): raw writes into a vCPU's records and code cache, and the hook's reply, object and
-# compile-server calls and arbitrary system replies. Build the `natemu` stub alone (`-p natemu`) to leave it out.
+# compile-server calls and arbitrary system replies. Build the `natemu` stub alone (`-p natemu-cli`) to leave it out.
 testing = []

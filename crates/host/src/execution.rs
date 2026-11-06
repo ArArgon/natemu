@@ -186,12 +186,6 @@ pub fn host_feature(name: &str) -> bool {
     let rc = unsafe { sysctlbyname(key.as_ptr(), (&raw mut value).cast(), &mut len, std::ptr::null_mut(), 0) };
     rc == 0 && len == size_of::<i32>() && value == 1
 }
-/// Whether `NATEMU_SPECULATION_BARRIERS` is set to a truthy value (`1`, `on`, `true`, `yes`; case-insensitive): the
-/// environment switch for the page-walk barriers. The stub reads this only (its parser takes a value after every
-/// option); the `boot-linux` test driver reads it too and also accepts `--speculation-barriers`.
-pub fn env_speculation_barriers() -> bool {
-    std::env::var("NATEMU_SPECULATION_BARRIERS").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
-}
 /// Sets the vCPU's initial architectural state (before it first runs). `speculation_barriers` turns on the resident's
 /// page-walk barriers (PCID plan P1) and, together with the host's FEAT_CSV3, is the sole condition for advertising
 /// RDCL_NO: a guest never sees "not susceptible to Meltdown" without the barriers that make it true.

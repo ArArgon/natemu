@@ -19,20 +19,26 @@ snapshot.debian.org archive date pinned in `rootfs.sh` (`SNAP`), so a rebuild gi
 ## Boot
 
 Kernel command line: `console=ttyS0 mitigations=off nokaslr` (no `rdinit=` needed: `/init`). With natemu, from the
-repository root (build once: `cargo build --release -p natemu`, `cargo build --release -p natemu-runtime --target
+repository root (build once: `cargo build --release -p natemu-cli` (it fetches clap from crates.io the first time; `--offline` builds work after that), `cargo build --release -p natemu-runtime --target
 aarch64-unknown-none`, then `codesign --force --sign - --entitlements crates/host/entitlements.plist
 target/release/natemu`; FEXC is a compiler built by `tools/fexc/build.sh`):
 
 ```sh
 P=~/Library/Caches/natemu/play
-target/release/natemu target/aarch64-unknown-none/release/natemu-runtime "$FEXC" $P/bzImage --initrd $P/play.cpio.zst \
-  --cmdline 'console=ttyS0 mitigations=off nokaslr' --ram 2147483648 --vcpus 2 --serial-stdin
+target/release/natemu --fexc "$FEXC" --kernel $P/bzImage --initrd $P/play.cpio.zst \
+  --cmdline 'console=ttyS0 mitigations=off nokaslr' --ram 2G --vcpus 2 --serial-stdin
 ```
 
+`--runtime FILE` names the resident; left out, it is the one built beside the binary
+(`target/aarch64-unknown-none/release/natemu-runtime`). `target/release/natemu --help` lists every option.
 `--serial-stdin` makes the terminal the guest's console (raw mode; Ctrl-C goes to the guest; Ctrl-A x quits natemu,
 Ctrl-A Ctrl-A sends Ctrl-A). The first boot compiles everything (a few seconds); later boots reuse the compile cache
-(`NATEMU_COMPILE_CACHE=off` disables it). Terminal size is not passed on: run `stty rows R cols C` for full-screen
+(`--compile-cache off` disables it). Terminal size is not passed on: run `stty rows R cols C` for full-screen
 programs.
+
+The stub's command line is named since November 5 (clap). Scripts kept as evidence in natemu-raw use the older
+positional form, `natemu RUNTIME FEXC BZIMAGE [OPTIONS]`, which the stub no longer accepts: run them against a stub built
+before that change, or rewrite the first three arguments as `--runtime`, `--fexc` and `--kernel`.
 
 You get a root shell on ttyS0 (no login, hostname natemu-play). Leave with `poweroff -f`; typing `exit` restarts the
 shell. QEMU check: `qemu-system-x86_64 -nodefaults -machine pc,hpet=off,i8042=off,vmport=off -accel tcg,thread=multi

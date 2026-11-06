@@ -34,7 +34,7 @@
 //! entry state) and, after a run, the stop and the final state. SIGINT or SIGTERM cancels the run (the library's
 //! canceller; the report is still printed), a second one exits 130 at once, as the `natemu` stub.
 //!
-//! Performance phase (perf plan §2): `NATEMU_PERF_LOG=FILE` turns on the library's timing log (`natemu::perf`): process
+//! Performance phase (perf plan §2): `--perf-log FILE` (or `NATEMU_PERF_LOG=FILE`) turns on the library's timing log (`natemu::perf`): process
 //! phases and one line per vCPU in FILE, one line per translation request in FILE.vN. The resident's buckets need a
 //! runtime built with `--features perf` (else they read zero and `"magic":false`).
 use super::super::*;
@@ -44,8 +44,6 @@ use natemu_abi::execution::{self as exec, Cpu, State};
 use natemu_abi::guest_memory::GuestRam;
 use std::fmt::Write as _;
 
-const USAGE: &str = "usage: natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] \
-                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned] [--lost-ticks SPEC] [--clock-trace FILE]";
 /// Largest image or initrd read (the protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
 
@@ -57,49 +55,83 @@ fn number(text: &str) -> Result<u64> {
     .map_err(|_| format!("bad number {text}"))
 }
 
-pub(crate) fn run(args: &[String]) -> Result<()> {
-    if let Some(path) = std::env::var_os("NATEMU_PERF_LOG") {
+/// Boot a bzImage on the library's boot entry and print one JSON report. Numbers are decimal or 0x hex.
+#[derive(clap::Args)]
+pub(crate) struct Args {
+    /// The fexc compiler (`unused` with --load-only)
+    fexc: String,
+    /// The Linux bzImage
+    image: String,
+    #[arg(long, value_name = "FILE")]
+    initrd: Option<String>,
+    #[arg(long, value_name = "TEXT", default_value = "", allow_hyphen_values = true)]
+    cmdline: String,
+    /// Guest RAM, the map's low RAM end [default: the boot map's 2 GiB]
+    #[arg(long, value_name = "BYTES", value_parser = number)]
+    ram: Option<u64>,
+    /// The RSDP's address [default: the ACPI NVS range's start]
+    #[arg(long, value_name = "ADDR", value_parser = number)]
+    rsdp: Option<u64>,
+    #[arg(long, value_name = "N", value_parser = number, default_value = "1")]
+    vcpus: u64,
+    /// The code cache [default: the largest]
+    #[arg(long = "code-cache", value_name = "BYTES", value_parser = number)]
+    code_bytes: Option<u64>,
+    /// Load into host memory and run nothing (RUNTIME and FEXC are not opened)
+    #[arg(long)]
+    load_only: bool,
+    /// Write the loader's writes as records [u64 gpa][u64 length][bytes]
+    #[arg(long, value_name = "FILE")]
+    dump: Option<String>,
+    /// End the run when the BSP is about to execute linear ADDR
+    #[arg(long, value_name = "ADDR", value_parser = number)]
+    stop_at: Option<u64>,
+    /// Write guest-physical bytes after the run (repeatable)
+    #[arg(long, num_args = 3, value_names = ["ADDR", "LEN", "FILE"])]
+    save: Vec<String>,
+    #[arg(long, value_name = "MS", value_parser = number, default_value = "60000")]
+    watchdog_ms: u64,
+    #[arg(long, value_name = "N", value_parser = number)]
+    max_block: Option<u64>,
+    #[arg(long)]
+    check_reuse: bool,
+    #[arg(long)]
+    code_shape: bool,
+    #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
+    speculation_barriers: bool,
+    #[arg(long, value_name = "FILE")]
+    serial: Option<String>,
+    #[arg(long, env = "NATEMU_SERIAL_STDIN", value_parser = clap::builder::BoolishValueParser::new())]
+    serial_stdin: bool,
+    #[arg(long = "strict-unassigned")]
+    strict: bool,
+    /// pit=reinject|discard,rtc=..,lapic=..
+    #[arg(long = "lost-ticks", value_name = "SPEC", value_parser = crate::clock::LostTicks::parse)]
+    lost: Option<crate::clock::LostTicks>,
+    #[arg(long = "clock-trace", value_name = "FILE")]
+    trace: Option<String>,
+    /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
+    #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
+    compile_cache: Option<std::path::PathBuf>,
+    /// The compile cache's cap in MiB [default: 512]
+    #[arg(long, value_name = "N", env = "NATEMU_COMPILE_CACHE_MB")]
+    compile_cache_mb: Option<u64>,
+    /// Write the timing log (natemu::perf) to FILE
+    #[arg(long, value_name = "FILE", env = "NATEMU_PERF_LOG")]
+    perf_log: Option<std::path::PathBuf>,
+}
+
+pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
+    let Args { fexc, image, initrd, cmdline, ram, rsdp, vcpus, code_bytes, load_only, dump, stop_at, save, watchdog_ms, max_block, check_reuse, code_shape, speculation_barriers, serial, serial_stdin, strict, lost, trace, compile_cache, compile_cache_mb, perf_log } = args;
+    if let Some(path) = perf_log {
         natemu::perf::enable(path)?;
         natemu::perf::mark("main");
     }
-    let [_, resident, _, fexc, image, options @ ..] = args else {
-        return Err(USAGE.into());
-    };
-    let (mut initrd, mut cmdline, mut ram, mut rsdp, mut load_only, mut dump) = (None, String::new(), None, boot::ACPI_NVS.0, false, None);
-    let mut vcpus = 1;
-    let (mut stop_at, mut saves, mut watchdog_ms, mut max_block) = (None, Vec::new(), 60_000, None);
-    let (mut check_reuse, mut code_shape) = (false, false);
-    let mut speculation_barriers = natemu::execution::env_speculation_barriers();
-    let mut code_bytes = exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES;
-    let (mut serial, mut strict, mut serial_stdin) = (None, false, natemu::linux::env_serial_stdin());
-    let (mut lost, mut trace) = (crate::clock::LostTicks::DEFAULT, None);
-    let mut options = options.iter();
-    while let Some(option) = options.next() {
-        let mut value = || options.next().ok_or_else(|| USAGE.to_string());
-        match option.as_str() {
-            "--initrd" => initrd = Some(value()?.clone()),
-            "--cmdline" => cmdline = value()?.clone(),
-            "--ram" => ram = Some(number(value()?)?),
-            "--rsdp" => rsdp = number(value()?)?,
-            "--vcpus" => vcpus = number(value()?)? as usize,
-            "--code-cache" => code_bytes = number(value()?)? as usize,
-            "--load-only" => load_only = true,
-            "--check-reuse" => check_reuse = true,
-            "--code-shape" => code_shape = true,
-            "--speculation-barriers" => speculation_barriers = true,
-            "--serial" => serial = Some(value()?.clone()),
-            "--strict-unassigned" => strict = true,
-            "--serial-stdin" => serial_stdin = true,
-            "--lost-ticks" => lost = crate::clock::LostTicks::parse(value()?)?,
-            "--clock-trace" => trace = Some(value()?.clone()),
-            "--dump" => dump = Some(value()?.clone()),
-            "--stop-at" => stop_at = Some(number(value()?)?),
-            "--save" => saves.push((number(value()?)?, number(value()?)?, value()?.clone())),
-            "--watchdog-ms" => watchdog_ms = number(value()?)?,
-            "--max-block" => max_block = Some(u32::try_from(number(value()?)?).map_err(|_| "--max-block: too large")?),
-            _ => return Err(USAGE.into()),
-        }
-    }
+    let (fexc, image, rsdp, vcpus) = (&fexc, &image, rsdp.unwrap_or(boot::ACPI_NVS.0), vcpus as usize);
+    let code_bytes = code_bytes.map_or(exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES, |b| b as usize);
+    let max_block = max_block.map(|n| u32::try_from(n).map_err(|_| "--max-block: too large")).transpose()?;
+    let saves = save.chunks(3).map(|s| Ok((number(&s[0])?, number(&s[1])?, s[2].clone()))).collect::<Result<Vec<_>>>()?;
+    let lost = lost.unwrap_or(crate::clock::LostTicks::DEFAULT);
     let image = memory::read_input(image, MAX_INPUT)?;
     let initrd = initrd.map(|p| memory::read_input(&p, MAX_INPUT)).transpose()?;
     if !(1..=exec::cache::MAX_VCPUS).contains(&vcpus) {
@@ -135,7 +167,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         watchdog: std::time::Duration::from_millis(watchdog_ms),
         max_block,
         stop_at,
-        compile_cache: crate::compile_cache::Config::from_env()?,
+        compile_cache: crate::compile_cache::Config::new(compile_cache.as_deref().map(|p| p.as_os_str()), compile_cache_mb)?,
         check_reuse,
         code_shape,
         speculation_barriers,

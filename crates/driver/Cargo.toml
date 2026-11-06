@@ -7,3 +7,4 @@ rust-version.workspace = true
 [dependencies]
 natemu = { path = "../host", features = ["testing"] }
 natemu-abi = { path = "../abi" }
+clap.workspace = true

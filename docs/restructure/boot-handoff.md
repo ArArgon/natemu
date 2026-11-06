@@ -56,42 +56,70 @@ owner's K1 and P3 decisions.
 
 ## 1. Boot commands
 
-**Build and sign** (from the repository root; Rust 1.97.0, offline, locked):
+**Build and sign** (from the repository root; Rust 1.97.0, offline, locked; on a fresh machine run `cargo +1.97.0 fetch
+--locked` once first, the dependency policy below):
 
 ```sh
-cargo +1.97.0 build --offline --locked --release -p natemu --bin natemu      # the stub alone: no `testing` feature
+cargo +1.97.0 build --offline --locked --release -p natemu-cli                # the stub alone: no `testing` feature
 codesign --force --sign - --entitlements crates/host/entitlements.plist target/release/natemu
 cargo +1.97.0 build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
 tools/fexc/build.sh ../natemu-raw/fexc-$(date +%Y%m%d)-01                  # a fresh directory: it must not exist (about 30 s)
 ```
 
-series48-lean already exists, so `build.sh` refuses it: build into a new directory and pass its `obj/fexc` (§6). Build the stub with `-p natemu` alone: a whole-workspace build unifies the driver's `testing` feature (raw record and
+series48-lean already exists, so `build.sh` refuses it: build into a new directory and pass its `obj/fexc` (§6). Build the stub with `-p natemu-cli` alone (package `natemu-cli`, binary `natemu`; `-p natemu` is the library only): a whole-workspace build unifies the driver's `testing` feature (raw record and
 code-cache writes, the hook's reply/object/compile-server calls) into it (plan, Built (L0), review round). The runners
 build and sign `natemu-host` themselves.
 
-**Boot stub** (`crates/host/src/main.rs`):
+**Dependency policy** (owner, November 5): host binaries may use clap (derive, `default-features = false` with `std`,
+`derive`, `env`, `help`, `usage`, `error-context`, `suggestions`; exact version pinned in the workspace `Cargo.toml` and
+`Cargo.lock`), and only they: the `natemu` stub (`crates/cli`, package `natemu-cli`) and the `natemu-host` test driver
+(`crates/driver`). The library (`crates/host`, package `natemu`), the abi and the resident take no registry dependency.
+The crates come from crates.io (not vendored, owner, November 5), every version pinned in `Cargo.lock` (`--locked`). A
+fresh machine needs the network once, `cargo +1.97.0 fetch --locked` (or the first build without `--offline`), before
+the `--offline` builds above work; after that the local cargo cache serves them. Adding a registry crate needs the
+owner's sign-off. At adoption: clap 4.6.7, clap_builder 4.6.7, clap_derive 4.6.7, clap_lex 1.1.1, anstyle 1.0.14, strsim
+0.11.1, heck 0.5.0, proc-macro2 1.0.107, quote 1.0.47, syn 3.0.9, unicode-ident 1.0.27 (each released at least two
+weeks before adoption).
+
+**Boot stub** (`crates/cli/src/main.rs`):
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
 F=../natemu-raw/fexc-native-20261026-01/series65-p2/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
-target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
-target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
+target/release/natemu --runtime "$R" --fexc "$F" --kernel "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
+target/release/natemu --runtime "$R" --fexc "$F" --kernel "$K" --initrd "$I" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
 ```
 
 The initrd boot hung after "Run /init" at c8e6216 (device interrupts through a dangling pointer); fixed after R2 (§4,
 "Blocking defect found at R2 (resolved)").
 
-`natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE] [--serial-stdin]`: COM1's output
-to standard output (or `--serial FILE`) as it is sent; the stop of the vCPU that ended the run on standard error; exit 0
-when the guest powered off (ACPI S5), 2 at any other stop (reset, a typed stop, a watchdog, `Cancelled`), 1 on a host
-error (a failed serial write included). SIGINT or SIGTERM cancels the run (the library's canceller below; `Cancelled`,
-exit 2); a second one exits 130 at once. It opts into the persistent compile cache from the environment (§2).
+`natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N] [--serial FILE]
+[--serial-stdin] [--speculation-barriers] [--compile-cache DIR|off] [--compile-cache-mb N] [--perf-log FILE]` (named
+arguments, clap, since November 5; `natemu --help`): COM1's output to standard output (or `--serial FILE`) as it is sent;
+the stop of the vCPU that ended the run on standard error; exit 0 when the guest powered off (ACPI S5), 2 at any other
+stop (reset, a typed stop, a watchdog, `Cancelled`), 1 on a host error (a failed serial write and a refused command line
+included; `--help` exits 0). `--runtime` defaults to the resident built beside the binary
+(`<target>/aarch64-unknown-none/<profile>/natemu-runtime` for `<target>/<profile>/natemu`) when that file exists. `--ram`
+takes bytes, 0x hex, or a K/M/G suffix (binary: `2G` = `2048M` = `0x80000000`). SIGINT or SIGTERM cancels the run (the
+library's canceller below; `Cancelled`, exit 2); a second one exits 130 at once. The persistent compile cache is on by
+default (§2). The positional form `natemu RUNTIME FEXC BZIMAGE [OPTIONS]` of earlier commits is gone; the scripts kept as
+evidence in natemu-raw use it (run them with a stub built before November 5, or name the first three arguments).
+
+**Environment variables.** Every variable that affects a normal run is also a flag, on the stub and on `boot-linux`, with
+the variable as the fallback (shown in `--help`; an explicit flag wins; a switch's variable takes 1/0, true/false,
+yes/no, on/off, anything else is refused): `--serial-stdin` (`NATEMU_SERIAL_STDIN`), `--speculation-barriers`
+(`NATEMU_SPECULATION_BARRIERS`), `--compile-cache DIR|off` (`NATEMU_COMPILE_CACHE`), `--compile-cache-mb N`
+(`NATEMU_COMPILE_CACHE_MB`), `--perf-log FILE` (`NATEMU_PERF_LOG`). Test and diagnostic variables stay variables only:
+`NATEMU_RAM` and `NATEMU_PLACE` (the `run-program` driver's defaults for `--ram` and `--place`, §5), `NATEMU_EXIT_LOG`
+(the program driver's exit log), `NATEMU_ADMIT_CORPUS` (admission's ignored corpus test), `NATEMU_REPLAY`,
+`NATEMU_REPLAY_OLD`, `NATEMU_REPLAY_ARGS` (the ignored replay test); the runners' own `FEXC`,
+`NATEMU_PREBUILT` and `NATEMU_RAW_ROOT` are not read by the binaries.
 
 **Interactive serial** (November 5, a convenience; off by default): `--serial-stdin` (or `NATEMU_SERIAL_STDIN=1`) on the
 stub or `boot-linux` feeds standard input to COM1's receive line, so a person can type into a booted guest, e.g.
-`target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 rdinit=/bin/busybox -- sh' --serial-stdin`.
+`target/release/natemu --runtime "$R" --fexc "$F" --kernel "$K" --initrd "$I" --cmdline 'console=ttyS0 rdinit=/bin/busybox -- sh' --serial-stdin`.
 A terminal is put in raw mode (as QEMU's `-serial stdio`: no echo or line editing, Ctrl-C goes to the guest), restored at
 exit, at a panic and at a second SIGINT/SIGTERM; **Ctrl-A x** cancels the run (`Cancelled`, exit 2), Ctrl-A Ctrl-A sends
 one Ctrl-A, Ctrl-A with any other byte sends nothing. A pipe works too (scripted input, verbatim but for the same
@@ -116,11 +144,12 @@ threads stop) returning `Outcome` (each vCPU's `Stop` and compile count, `ended_
 gives the loader's placement, the devices, the count of serial bytes sent (`serial_bytes`) and a failed serial write
 (`serial_error`). Guest RAM by value (`Prepared::guest`, `Backing::ram`) is `unsafe`: a `GuestRam` is a `Copy` view of
 the backing's mapping and must not outlive it; `vm::Machine::create` takes the backing's `Arc<Memory>` and keeps it
-mapped while the VM exists. `Boot::run()` is both. The compile cache is off unless the caller sets
-`compile_cache::Config::from_env()?`. No hook, fixture or tamper code is in the library (plan, Built (L0)).
+mapped while the VM exists. `Boot::run()` is both. The compile cache is off unless the caller sets one
+(`compile_cache::Config::new(dir, mb)?`, as the stub does from its flags). No hook, fixture or tamper code is in the library (plan, Built (L0)).
 
-**Test driver boot** (`crates/driver/src/drivers/linux.rs`): `natemu-host RUNTIME boot-linux FEXC BZIMAGE` with the
-stub's options plus `--rsdp`, `--code-cache`, `--watchdog-ms` (default 60,000), `--max-block`, `--stop-at`,
+**Test driver boot** (`crates/driver/src/drivers/linux.rs`): `natemu-host RUNTIME boot-linux FEXC BZIMAGE` (positional
+as before, the runners' form; parsed by clap since November 5, `natemu-host RUNTIME boot-linux --help`; a repeated
+option's last value wins; numbers decimal or 0x hex) with the stub's options plus `--rsdp`, `--code-cache`, `--watchdog-ms` (default 60,000), `--max-block`, `--stop-at`,
 `--load-only`, `--dump`, `--save`, `--strict-unassigned`, `--lost-ticks`, `--clock-trace`, `--check-reuse` (perf chunk 4,
 debug: every translation reused at another RIP is also compiled there and must be byte-equal, else a host error; the
 program driver's `--code-shape` turns the same check on), `--code-shape` (debug, off by default: admission's code-shape
@@ -130,8 +159,8 @@ placement, the BSP's stop, state and stats, each vCPU's stop and counters). Same
 cancels its run as the stub's does (the report is still printed; a second one exits 130; both use
 `Canceller::on_signals`).
 
-**Performance log** (perf plan §2, "Measured (chunk 1)"; off by default): `NATEMU_PERF_LOG=FILE` on `natemu-host
-boot-linux` or the `natemu` stub turns on the library's timing log (`crates/host/src/perf.rs`, `natemu::perf::enable`
+**Performance log** (perf plan §2, "Measured (chunk 1)"; off by default): `--perf-log FILE` (or `NATEMU_PERF_LOG=FILE`)
+on `natemu-host boot-linux` or the `natemu` stub turns on the library's timing log (`crates/host/src/perf.rs`, `natemu::perf::enable`
 for an embedder): FILE gets one `mark NAME NS` line per process phase (both entries: `main`, `run`, `disk_open`,
 `server_startN`, `first_entryN`, `cancel`, `disk_written`, `destroyed`; `boot-linux` only: `prepared`, `report`, `exit`) and one `vcpu {JSON}` line per
 vCPU at its end (host time by loop part and exit kind, the translation-request parts, thread CPU, its fexc server's CPU
@@ -162,7 +191,7 @@ analysis (`boot.py`, `analyze.py`, `aggregate.py`, `campaign.sh`) are in `natemu
 | Firmware tables | `rsdp` (default 0x600000) | ACPI 6.5 RSDP, XSDT, FADT, FACS, DSDT, MADT with the version-0 wakeup mailbox for N processors (`crates/host/src/boot/acpi.rs`; no `_CST`/P_BLK, HPET, MCFG or EFI); `acpi_rsdp_addr` in boot_params. MTRRs as the virtual firmware leaves them: all RAM WB, the hole and [R, 4 GiB) UC (plan, Built (M2 addendum 1)) |
 | CPU profile | built in (`crates/abi/src/cpu_profile.rs` from `tools/models/cpu_profile.json`) | the accepted Intel Haswell-class profile (INV-03-01 CLM-03-01-16/-17): SSE to SSE4.2, AVX/AVX2/FMA/F16C, XSAVE (XCR0 7) with XSAVEOPT and XSAVEC (owner, November 3), MOVBE, AES-NI/PCLMULQDQ, SHA, ADX, CLFLUSHOPT/CLWB (owner, November 3), BMI1/2, RDRAND, x2APIC, IA32_ARCH_CAPABILITIES (read-only, CPUID.(7,0):EDX[29]; PCID plan P1, November 5: TAA_NO, IF_PSCHANGE_MC_NO, the three MMIO stale-data bits, GDS_NO, RFDS_NO, ITS_NO always; RDCL_NO only with the speculation-barrier switch on and host FEAT_CSV3; MDS_NO and MD_CLEAR 0, owner); no PCID, 1 GiB pages, LA57, SMAP, TSC-deadline, PMU, MPX/CET/AVX-512. The page-walk speculation barriers are off by default (`--speculation-barriers` / `NATEMU_SPECULATION_BARRIERS`; RDCL_NO coupled to them, so a default command line keeps PTI; FEAT_SB required when on) |
 | Compiler | `fexc`, FEXC | the path of a fexc binary; one `fexc --serve` child per vCPU; each answer is validated by admission |
-| Compile cache | `compile_cache` (`Config::from_env`) | `NATEMU_COMPILE_CACHE=DIR|off` (default `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` (default 512; not a whole number: an error, not the default); keyed by the fexc binary's SHA-256 and the exact request, so a rebuilt identical fexc reuses it; CPL-3 requests only (kernel code moves with KASLR); past 3/4 of the cap other builds' packs, then the oldest, are evicted (`crates/host/src/compile_cache.rs`) |
+| Compile cache | `compile_cache` (`Config::new`), `--compile-cache`, `--compile-cache-mb` | `--compile-cache DIR|off` or `NATEMU_COMPILE_CACHE` (default `~/Library/Caches/natemu/fexc`), `--compile-cache-mb N` or `NATEMU_COMPILE_CACHE_MB` (default 512; not a whole number: an error, not the default); keyed by the fexc binary's SHA-256 and the exact request, so a rebuilt identical fexc reuses it; CPL-3 requests only (kernel code moves with KASLR); past 3/4 of the cap other builds' packs, then the oldest, are evicted (`crates/host/src/compile_cache.rs`) |
 | Code cache | `code_bytes`, `--code-cache` | 128 MiB less its head per vCPU (`CODE_BYTES_MAX`) |
 | Serial | `serial`, `--serial` | the stub: standard output; the library: none (the UART keeps the bytes only without a sink; `Prepared::serial_bytes` counts them either way; a failed sink write is kept in `Prepared::serial_error` and the sink dropped) |
 | Other | `strict_unassigned`, `lost_ticks`, `watchdog`, `max_block`, `stop_at` | off; PIT reinject, RTC and LAPIC discard (QEMU's defaults, `clock::LostTicks::DEFAULT`); 60 s; fexc's own; none |

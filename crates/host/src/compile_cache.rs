@@ -22,8 +22,9 @@
 //! the cap, other builds' packs go (they can never hit), then the oldest of this build's, until it is at most 3/4 of the
 //! cap, so every run has a quarter of the cap to write into; during a run, nothing more is written once the total reaches
 //! the cap.
-//! Configuration: [`Config`], from the environment by [`Config::from_env`]: `NATEMU_COMPILE_CACHE` = a directory or `off`
-//! (default `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` = the cap (default 512). Only the boot entry opens it
+//! Configuration: [`Config`], by [`Config::new`] from the entries' `--compile-cache DIR|off` (default
+//! `~/Library/Caches/natemu/fexc`) and `--compile-cache-mb N` (the cap, default 512), whose fallbacks are the environment's
+//! `NATEMU_COMPILE_CACHE` and `NATEMU_COMPILE_CACHE_MB`. Only the boot entry opens it
 //! ([`shared`]: `natemu`, `natemu-host boot-linux`); the test drivers never do.
 
 use std::collections::{HashMap, HashSet};
@@ -379,21 +380,15 @@ pub struct Config {
 }
 impl Config {
     pub const OFF: Self = Self { dir: None, cap: 0 };
-    /// The configuration from the environment (callers opt in): `NATEMU_COMPILE_CACHE` = a directory or `off` (default
-    /// `~/Library/Caches/natemu/fexc`), `NATEMU_COMPILE_CACHE_MB` = the cap (default 512; anything but a whole number of
-    /// MiB is an error, not the default).
-    pub fn from_env() -> Result<Self, String> {
-        let dir = match std::env::var_os("NATEMU_COMPILE_CACHE") {
+    /// The configuration callers opt into: `dir` a directory or `off` (default `~/Library/Caches/natemu/fexc`), `mb` the
+    /// cap in MiB (default 512).
+    pub fn new(dir: Option<&std::ffi::OsStr>, mb: Option<u64>) -> Result<Self, String> {
+        let dir = match dir {
             Some(v) if v == "off" => None,
             Some(v) => Some(PathBuf::from(v)),
             None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/natemu/fexc")),
         };
-        let cap = match std::env::var_os("NATEMU_COMPILE_CACHE_MB") {
-            None => 512 << 20,
-            Some(v) => v.to_str().and_then(|v| v.parse::<u64>().ok()).and_then(|mb| mb.checked_mul(1 << 20)).ok_or_else(|| {
-                format!("NATEMU_COMPILE_CACHE_MB={}: a whole number of MiB", v.to_string_lossy())
-            })?,
-        };
+        let cap = mb.unwrap_or(512).checked_mul(1 << 20).ok_or_else(|| format!("compile cache cap {} MiB: too large", mb.unwrap_or(0)))?;
         Ok(Self { dir, cap })
     }
 }

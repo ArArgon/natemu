@@ -549,10 +549,6 @@ fn log_images(base: u64) -> [Vec<u8>; 2] {
     [page, idt]
 }
 
-const USAGE: &str = "usage: natemu-host RUNTIME.elf run-program FEXC PROGRAM.txt WORKDIR [MAX_BLOCK_INSTRUCTIONS] \
-                     [--code-shape] [--check-reuse] [--code-cache BYTES] [--ram BYTES] [--place GPA] [--watchdog-ms MS] [--tamper-vcpu V] [--forge-exit] [--tamper offset|word|record|system] [--tamper-after word|record] \
-                     [--forge-stop] [--forge-entry HEX[,HEX]...] [--kick-vcpu V]... [--kicks M] [--kick-every-us P] [--kick-jitter-us J] [--kick-events E,..] [--tamper next-page|site|site-kind|armed|dispatch|target] [--ignore-kicks] [--kill-compiler N] [--stall-compiler N] [--compile-deadline-ms MS] [--strict-unassigned] [--device-at GPA]... [--irq-source PORT] [--irq-source-no-veto]";
-
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
 /// `svc #LINK`) flips. A one-word move would change the link point's first word itself, which the host's self-check
 /// refuses after the run; the RIPs of test programs need two words.
@@ -831,93 +827,118 @@ fn finished(stop: &Stop) -> bool {
     )
 }
 
-pub(crate) fn run(args: &[String]) -> Result<()> {
-    let [_, resident, _, fexc, description, _work, options @ ..] = args else {
-        return Err(USAGE.into());
-    };
-    let (mut max_instructions, mut code_bytes, mut watchdog_ms, mut forge, mut target) = (None, exec::cache::CODE_BYTES, 10_000, false, 0);
-    let (mut tamper, mut tamper_after): (Option<Tamper>, Option<Corrupt>) = (None, None);
-    let (mut forge_stop, mut forged, mut kicked, mut kicks, mut every_us, mut jitter_us) = (false, None, Vec::new(), 10_000, 0, 0);
-    let mut kick_events: Vec<u64> = Vec::new();
-    let (mut ignore_kicks, mut signal_at, mut deadline_ms) = (false, None, execution::COMPILE_DEADLINE.as_millis() as u64);
-    let (mut code_shape, mut device_tamper, mut strict, mut check_reuse) = (false, false, false, false);
-    let mut device_at: Vec<u64> = Vec::new();
-    // L4a: the asynchronous test source's ports, and whether its requests veto ending halted vCPUs.
-    let (mut irq_source, mut irq_veto) = (None, true);
-    // L5: the lost-tick policies (`clock::LostTicks`).
-    let mut lost = crate::clock::LostTicks::DEFAULT;
+/// Run a program description in the VM, one program per vCPU, and print the final state as JSON. ADDR, GPA and PORT
+/// values are hex (0x optional); counts, sizes and times decimal.
+#[derive(clap::Args)]
+pub(crate) struct Args {
+    /// The fexc compiler
+    fexc: String,
+    /// The program description
+    description: String,
+    /// The work directory (unused)
+    work: String,
+    /// Block size limit: every program runs as blocks of at most this many instructions
+    max_instructions: Option<u32>,
+    #[arg(long)]
+    code_shape: bool,
+    #[arg(long)]
+    check_reuse: bool,
+    #[arg(long = "strict-unassigned")]
+    strict: bool,
+    /// A test device's page (repeatable)
+    #[arg(long, value_name = "GPA", value_parser = number)]
+    device_at: Vec<u64>,
+    /// The asynchronous test source's ports
+    #[arg(long, value_name = "PORT", value_parser = number)]
+    irq_source: Option<u64>,
+    #[arg(long)]
+    irq_source_no_veto: bool,
+    /// pit=reinject|discard,rtc=..,lapic=..
+    #[arg(long = "lost-ticks", value_name = "SPEC", value_parser = crate::clock::LostTicks::parse)]
+    lost: Option<crate::clock::LostTicks>,
+    #[arg(long = "code-cache", value_name = "BYTES", default_value_t = exec::cache::CODE_BYTES)]
+    code_bytes: usize,
+    /// Guest RAM, hex [default: NATEMU_RAM, else 2 GiB]
+    #[arg(long, value_name = "BYTES", value_parser = number)]
+    ram: Option<u64>,
+    /// Where the driver places pages from, hex [default: NATEMU_PLACE, else 0x1000]
+    #[arg(long, value_name = "GPA", value_parser = number)]
+    place: Option<u64>,
+    #[arg(long, value_name = "MS", default_value_t = 10_000)]
+    watchdog_ms: u64,
+    #[arg(long = "tamper-vcpu", value_name = "V", default_value_t = 0)]
+    target: usize,
+    #[arg(long = "forge-exit")]
+    forge: bool,
+    #[arg(long)]
+    forge_stop: bool,
+    #[arg(long, value_name = "HEX[,HEX]...")]
+    forge_entry: Option<String>,
+    #[arg(long)]
+    ignore_kicks: bool,
+    #[arg(long = "compile-deadline-ms", value_name = "MS", default_value_t = execution::COMPILE_DEADLINE.as_millis() as u64)]
+    deadline_ms: u64,
+    /// Kill the compile server before the request after its first N
+    #[arg(long, value_name = "N", conflicts_with = "stall_compiler")]
+    kill_compiler: Option<u64>,
+    /// Stop (SIGSTOP) the compile server before the request after its first N
+    #[arg(long, value_name = "N")]
+    stall_compiler: Option<u64>,
+    /// Run a kicker on vCPU V (repeatable)
+    #[arg(long = "kick-vcpu", value_name = "V")]
+    kicked: Vec<usize>,
+    #[arg(long, value_name = "M", default_value_t = 10_000)]
+    kicks: usize,
+    #[arg(long = "kick-every-us", value_name = "P", default_value_t = 0)]
+    every_us: u64,
+    #[arg(long = "kick-jitter-us", value_name = "J", default_value_t = 0)]
+    jitter_us: u64,
+    /// Vectors (hex, 0x10..0xff) or `nmi`, comma-separated
+    #[arg(long, value_name = "E,..")]
+    kick_events: Vec<String>,
+    #[arg(long, value_name = "KIND", value_parser = ["offset", "word", "record", "system", "mmio", "next-page", "site", "site-kind", "armed", "dispatch", "target"])]
+    tamper: Option<String>,
+    #[arg(long, value_name = "KIND", value_parser = ["word", "record"])]
+    tamper_after: Option<String>,
+}
+
+pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
+    let Args { fexc, description, max_instructions, code_shape, check_reuse, strict, device_at, irq_source, lost, code_bytes, watchdog_ms, target, forge, forge_stop, ignore_kicks, deadline_ms, kicked, kicks, every_us, jitter_us, .. } = args;
+    let (fexc, description) = (&fexc, &description);
+    // L4a: whether the asynchronous test source's requests veto ending halted vCPUs. L5: the lost-tick policies.
+    let (irq_veto, lost) = (!args.irq_source_no_veto, lost.unwrap_or(crate::clock::LostTicks::DEFAULT));
     // M1: the VM's guest RAM and where the driver starts placing pages; the environment's defaults let a whole suite run
     // at another size or placement unchanged.
     let env = |name: &str, default: u64| std::env::var(name).map_or(Ok(default), |v| number(&v));
-    let (mut ram_bytes, mut place) = (env("NATEMU_RAM", 2 << 30)?, env("NATEMU_PLACE", 0x1000)?);
-    let mut options = options.iter();
-    while let Some(option) = options.next() {
-        let mut value = || -> Result<usize> { options.next().and_then(|v| v.parse().ok()).ok_or(USAGE.into()) };
-        match option.as_str() {
-            "--code-shape" => code_shape = true,
-            "--check-reuse" => check_reuse = true,
-            "--strict-unassigned" => strict = true,
-            "--device-at" => device_at.push(number(options.next().ok_or(USAGE)?)?),
-            "--irq-source" => irq_source = Some(number(options.next().ok_or(USAGE)?)?),
-            "--irq-source-no-veto" => irq_veto = false,
-            "--lost-ticks" => lost = crate::clock::LostTicks::parse(options.next().ok_or(USAGE)?)?,
-            "--code-cache" => code_bytes = value()?,
-            "--ram" => ram_bytes = number(options.next().ok_or(USAGE)?)?,
-            "--place" => place = number(options.next().ok_or(USAGE)?)?,
-            "--watchdog-ms" => watchdog_ms = value()? as u64,
-            "--tamper-vcpu" => target = value()?,
-            "--forge-exit" => forge = true,
-            "--forge-stop" => forge_stop = true,
-            "--forge-entry" => {
-                let words = options.next().ok_or(USAGE)?.split(',').map(|w| u32::from_str_radix(w.trim_start_matches("0x"), 16));
-                forged = Some(words.collect::<std::result::Result<Vec<u32>, _>>().map_err(|_| "--forge-entry: hex words")?);
-            }
-            "--ignore-kicks" => ignore_kicks = true,
-            "--compile-deadline-ms" => deadline_ms = value()? as u64,
-            "--kill-compiler" => signal_at = Some((value()? as u64, SIGKILL)),
-            "--stall-compiler" => signal_at = Some((value()? as u64, SIGSTOP)),
-            "--kick-vcpu" => kicked.push(value()?),
-            "--kicks" => kicks = value()?,
-            "--kick-every-us" => every_us = value()? as u64,
-            "--kick-jitter-us" => jitter_us = value()? as u64,
-            "--kick-events" => {
-                for e in options.next().ok_or(USAGE)?.split(',') {
-                    kick_events.push(match e {
-                        "nmi" => execution::NMI,
-                        v => number(v).ok().filter(|v| (16..256).contains(v)).ok_or(USAGE)?,
-                    });
-                }
-            }
-            "--tamper" => {
-                tamper = Some(match options.next().map(String::as_str) {
-                    Some("offset") => tamper_offset,
-                    Some("word") => tamper_word,
-                    Some("record") => tamper_record,
-                    Some("system") => tamper_system,
-                    Some("mmio") => {
-                        device_tamper = true;
-                        tamper_mmio
-                    }
-                    Some("next-page") => tamper_next_page,
-                    Some("site") => tamper_site,
-                    Some("site-kind") => tamper_site_kind,
-                    Some("armed") => tamper_armed,
-                    Some("dispatch") => tamper_dispatch,
-                    Some("target") => tamper_target,
-                    _ => return Err(USAGE.into()),
-                })
-            }
-            "--tamper-after" => {
-                tamper_after = Some(match options.next().map(String::as_str) {
-                    Some("word") => Corrupt::Word,
-                    Some("record") => Corrupt::Record,
-                    _ => return Err(USAGE.into()),
-                })
-            }
-            n if max_instructions.is_none() => max_instructions = Some(n.parse().map_err(|_| "bad block size limit")?),
-            _ => return Err(USAGE.into()),
-        }
+    let ram_bytes = args.ram.map_or_else(|| env("NATEMU_RAM", 2 << 30), Ok)?;
+    let place = args.place.map_or_else(|| env("NATEMU_PLACE", 0x1000), Ok)?;
+    let forged = match &args.forge_entry {
+        Some(words) => Some(words.split(',').map(|w| u32::from_str_radix(w.trim_start_matches("0x"), 16)).collect::<std::result::Result<Vec<u32>, _>>().map_err(|_| "--forge-entry: hex words")?),
+        None => None,
+    };
+    let signal_at = args.kill_compiler.map(|n| (n, SIGKILL)).or(args.stall_compiler.map(|n| (n, SIGSTOP)));
+    let mut kick_events: Vec<u64> = Vec::new();
+    for e in args.kick_events.iter().flat_map(|e| e.split(',')) {
+        kick_events.push(match e {
+            "nmi" => execution::NMI,
+            v => number(v).ok().filter(|v| (16..256).contains(v)).ok_or(format!("--kick-events {e}: a vector 0x10..0xff or nmi"))?,
+        });
     }
+    let device_tamper = args.tamper.as_deref() == Some("mmio");
+    let tamper: Option<Tamper> = args.tamper.as_deref().map(|kind| match kind {
+        "offset" => tamper_offset,
+        "word" => tamper_word,
+        "record" => tamper_record,
+        "system" => tamper_system,
+        "mmio" => tamper_mmio,
+        "next-page" => tamper_next_page,
+        "site" => tamper_site,
+        "site-kind" => tamper_site_kind,
+        "armed" => tamper_armed,
+        "dispatch" => tamper_dispatch,
+        _ => tamper_target,
+    });
+    let tamper_after = args.tamper_after.as_deref().map(|kind| if kind == "word" { Corrupt::Word } else { Corrupt::Record });
     let forged_entry = if forge_stop { Some(vec![exec::STOP_WORD]) } else { forged };
     if let Some(words) = &forged_entry {
         FORGED_ENTRY.set(words.clone()).map_err(|_| "forged entry set twice")?;

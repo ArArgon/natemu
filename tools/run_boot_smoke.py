@@ -29,9 +29,9 @@ CMDLINE = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr rdinit=/bin
 
 
 def build():
-    """The stub alone (`-p natemu`: no `testing` feature) and the resident; the stub signed with the entitlements."""
+    """The stub alone (`-p natemu-cli`: no `testing` feature) and the resident; the stub signed with the entitlements."""
     cargo = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
-    subprocess.run(cargo + ['-p', 'natemu', '--bin', 'natemu'], cwd=ROOT, check=True)
+    subprocess.run(cargo + ['-p', 'natemu-cli', '--bin', 'natemu'], cwd=ROOT, check=True)
     subprocess.run(cargo + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=ROOT, check=True)
     target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))
     stub = target / 'release/natemu'
@@ -41,7 +41,7 @@ def build():
 
 def boot(stub, runtime, a, n):
     serial = a.out / f'smoke-{n}.serial'
-    cmd = [stub, runtime, a.fexc, a.kernel, '--initrd', a.initrd, '--cmdline', CMDLINE, '--vcpus', str(n), '--serial', serial]
+    cmd = [stub, '--runtime', runtime, '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd, '--cmdline', CMDLINE, '--vcpus', str(n), '--serial', serial]
     t0 = time.monotonic()
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
@@ -64,7 +64,7 @@ def cancel(stub, runtime, a, group=False):
     """`group`: SIGINT to the stub's whole process group, as a terminal's Ctrl-C does (the fexc servers must not get it)."""
     name = 'cancel-group' if group else 'cancel'
     serial = a.out / f'{name}.serial'
-    cmd = [stub, runtime, a.fexc, a.kernel, '--cmdline', 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr', '--vcpus', '4',
+    cmd = [stub, '--runtime', runtime, '--fexc', a.fexc, '--kernel', a.kernel, '--cmdline', 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr', '--vcpus', '4',
            '--serial', serial]
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=group)
     time.sleep(1.5)
@@ -87,7 +87,7 @@ def cancel(stub, runtime, a, group=False):
 
 def stdin_quit(stub, runtime, a):
     serial = a.out / 'stdin-quit.serial'
-    cmd = [stub, runtime, a.fexc, a.kernel, '--cmdline', 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr', '--serial', serial,
+    cmd = [stub, '--runtime', runtime, '--fexc', a.fexc, '--kernel', a.kernel, '--cmdline', 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr', '--serial', serial,
            '--serial-stdin']
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     p.stdin.write('a' * 64)
@@ -112,7 +112,7 @@ def stdin_quit(stub, runtime, a):
 def stdin(stub, runtime, a):
     serial = a.out / 'stdin.serial'
     cmdline = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr rdinit=/bin/busybox -- sh'
-    cmd = [stub, runtime, a.fexc, a.kernel, '--initrd', a.initrd, '--cmdline', cmdline, '--serial', serial, '--serial-stdin']
+    cmd = [stub, '--runtime', runtime, '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd, '--cmdline', cmdline, '--serial', serial, '--serial-stdin']
     t0 = time.monotonic()
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
