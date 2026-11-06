@@ -190,6 +190,15 @@ either way, faster only when the OS maps its global pages there, as Linux, Windo
 
 ## Backlog (owner, November 4)
 
+- Arm-feature ideas (owner, November 5: backlog only, not investigated). (1) A PAC-protected return-address cache for x86
+  CALL/RET: generated code keeps host return sites beside guest return addresses on a stack EL0 can write; entries are
+  signed (PACIA, key set by the resident at EL1, modifier from guest RSP and the address space) and authenticated at RET,
+  so a forged or stale entry falls back to the dispatcher (FPAC) and a hit lets Arm's return predictor predict it; target:
+  the dispatcher's computed-exit cost (chunk 28: build 16.5%, hackbench 12.8% of generated-code samples). (2) FEAT_AFP
+  (FPCR.AH/FIZ) to drop FEX's x86-exactness fix-ups in SSE code where AFP gives the x86 result exactly. Each starts with a
+  feasibility check (what HVF exposes and lets EL1 configure in the VM: PAC keys, AFP) and a measure-first count. Ruled
+  out for now: SME/SME2 streaming mode for AVX2 (mode-switch cost; mixed scalar/vector code), MTE (not on the M4).
+
 - Precise x87 (owner, November 5): natemu runs x87 at FEX's reduced precision (64-bit significand arithmetic), a known
   deviation that breaks programs relying on 80-bit `long double` (gcc torture ieee/inf-2, inf-3, pr36332, pr39228:
   LDBL_MAX does not survive FLD m80 / FSTP m80; repro in natemu-raw/correct-us-20261105-01/repro/x87/). A slow but exact
