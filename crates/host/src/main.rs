@@ -2,15 +2,17 @@
 //! cache from the environment ([`natemu::compile_cache::Config::from_env`]).
 //!
 //!   natemu RUNTIME.elf FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]
+//!       [--serial-stdin]
 //!
 //! COM1's output goes to `--serial FILE` (default standard output). The stop of the vCPU that ended the run is written to
 //! standard error. Exits 0 when the guest powered off, 2 at any other stop (SIGINT or SIGTERM cancels the run: `Cancelled`;
 //! a second one exits 130 at once), 1 on a host error (a failed serial write included). `NATEMU_PERF_LOG=FILE` turns on
-//! the library's timing log (`natemu::perf`).
+//! the library's timing log (`natemu::perf`). `--serial-stdin` (or `NATEMU_SERIAL_STDIN=1`; off by default) feeds standard
+//! input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode, Ctrl-C to the guest, Ctrl-A x cancels the run.
 use natemu::execution::Stop;
 use natemu::linux::Boot;
 
-const USAGE: &str = "usage: natemu RUNTIME.elf FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]";
+const USAGE: &str = "usage: natemu RUNTIME.elf FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE] [--serial-stdin]";
 /// Largest image or initrd read (the boot protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
 
@@ -35,8 +37,13 @@ fn boot(args: &[String]) -> natemu::Result<Stop> {
     boot.compile_cache = natemu::compile_cache::Config::from_env()?;
     boot.serial = Some(Box::new(std::io::stdout()));
     boot.speculation_barriers = natemu::execution::env_speculation_barriers();
+    let mut serial_stdin = natemu::linux::env_serial_stdin();
     let mut options = options.iter();
     while let Some(option) = options.next() {
+        if option == "--serial-stdin" {
+            serial_stdin = true;
+            continue;
+        }
         let value = options.next().ok_or(USAGE)?;
         match option.as_str() {
             "--initrd" => boot.initrd = Some(natemu::memory::read_input(value, MAX_INPUT)?),
@@ -46,6 +53,9 @@ fn boot(args: &[String]) -> natemu::Result<Stop> {
             "--serial" => boot.serial = Some(Box::new(std::fs::File::create(value).map_err(|e| format!("{value}: {e}"))?)),
             _ => return Err(USAGE.into()),
         }
+    }
+    if serial_stdin {
+        boot.serial_input = Some(natemu::linux::serial_stdin());
     }
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
     let prepared = boot.prepare()?;

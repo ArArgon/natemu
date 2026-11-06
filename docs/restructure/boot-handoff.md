@@ -83,11 +83,22 @@ target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 earl
 The initrd boot hung after "Run /init" at c8e6216 (device interrupts through a dangling pointer); fixed after R2 (§4,
 "Blocking defect found at R2 (resolved)").
 
-`natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]`: COM1's output
+`natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE] [--serial-stdin]`: COM1's output
 to standard output (or `--serial FILE`) as it is sent; the stop of the vCPU that ended the run on standard error; exit 0
 when the guest powered off (ACPI S5), 2 at any other stop (reset, a typed stop, a watchdog, `Cancelled`), 1 on a host
 error (a failed serial write included). SIGINT or SIGTERM cancels the run (the library's canceller below; `Cancelled`,
 exit 2); a second one exits 130 at once. It opts into the persistent compile cache from the environment (§2).
+
+**Interactive serial** (November 5, a convenience; off by default): `--serial-stdin` (or `NATEMU_SERIAL_STDIN=1`) on the
+stub or `boot-linux` feeds standard input to COM1's receive line, so a person can type into a booted guest, e.g.
+`target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 rdinit=/bin/busybox -- sh' --serial-stdin`.
+A terminal is put in raw mode (as QEMU's `-serial stdio`: no echo or line editing, Ctrl-C goes to the guest), restored at
+exit, at a panic and at a second SIGINT/SIGTERM; **Ctrl-A x** cancels the run (`Cancelled`, exit 2), Ctrl-A Ctrl-A sends
+one Ctrl-A. A pipe works too (scripted input, verbatim but for the same escapes). A host thread feeds the bytes as QEMU's
+character backend does (only as many as the FIFO advertises, so host input never overruns) and raises IRQ4 itself,
+including the FIFO timeout, holding a busy guard; keystrokes before the guest opens ttyS0 are lost, as on hardware
+(library: `Boot::serial_input`, `linux::serial_stdin`, `uart::feed`). `run_boot_smoke.py`'s `stdin` case pipes
+`echo hello-$((6*7))` and `poweroff -f` into busybox `sh` and checks `hello-42` on serial.
 
 **Library entry** (`crates/host/src/linux.rs`, package `natemu`): `natemu::linux::Boot` (every manifest field below,
 defaults from `Boot::new(runtime, fexc, kernel)`), `Boot::prepare()` (guest RAM, loader, ACPI tables, each vCPU's state,

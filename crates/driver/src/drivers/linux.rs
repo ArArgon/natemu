@@ -4,7 +4,7 @@
 //!
 //!   natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--rsdp ADDR]
 //!       [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N]
-//!       [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--strict-unassigned]
+//!       [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned]
 //!
 //! `--check-reuse` (perf chunk 4, debug): every translation reused at another RIP than its own is compiled there too and the
 //! two must be equal (`Compiler::check_reuse`). `--code-shape` (debug, off by default): admission's code-shape check on every
@@ -45,7 +45,7 @@ use natemu_abi::guest_memory::GuestRam;
 use std::fmt::Write as _;
 
 const USAGE: &str = "usage: natemu-host RUNTIME.elf boot-linux FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] \
-                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--strict-unassigned] [--lost-ticks SPEC] [--clock-trace FILE]";
+                     [--rsdp ADDR] [--vcpus N] [--code-cache BYTES] [--load-only] [--dump FILE] [--stop-at ADDR] [--save ADDR LEN FILE] [--watchdog-ms MS] [--max-block N] [--check-reuse] [--code-shape] [--speculation-barriers] [--serial FILE] [--serial-stdin] [--strict-unassigned] [--lost-ticks SPEC] [--clock-trace FILE]";
 /// Largest image or initrd read (the protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
 
@@ -71,7 +71,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let (mut check_reuse, mut code_shape) = (false, false);
     let mut speculation_barriers = natemu::execution::env_speculation_barriers();
     let mut code_bytes = exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES;
-    let (mut serial, mut strict) = (None, false);
+    let (mut serial, mut strict, mut serial_stdin) = (None, false, natemu::linux::env_serial_stdin());
     let (mut lost, mut trace) = (crate::clock::LostTicks::DEFAULT, None);
     let mut options = options.iter();
     while let Some(option) = options.next() {
@@ -89,6 +89,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             "--speculation-barriers" => speculation_barriers = true,
             "--serial" => serial = Some(value()?.clone()),
             "--strict-unassigned" => strict = true,
+            "--serial-stdin" => serial_stdin = true,
             "--lost-ticks" => lost = crate::clock::LostTicks::parse(value()?)?,
             "--clock-trace" => trace = Some(value()?.clone()),
             "--dump" => dump = Some(value()?.clone()),
@@ -142,6 +143,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     };
     if let Some(path) = &serial {
         boot.serial = Some(Box::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?));
+    }
+    if serial_stdin {
+        boot.serial_input = Some(natemu::linux::serial_stdin()); // the stub's `--serial-stdin`
     }
     let trace = match &trace {
         Some(path) => Some(std::io::BufWriter::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?)),

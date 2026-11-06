@@ -17,10 +17,10 @@ use crate::vm::{Machine, Vcpu, hv, require_vcpus};
 use crate::{Result, clock, compile_cache, devices, owners, uart};
 use natemu_abi::execution::{self as exec, State};
 use natemu_abi::guest_memory::GuestRam;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// What to boot and how.
@@ -43,6 +43,9 @@ pub struct Boot {
     /// Where COM1's output goes as it is sent (default none: the UART keeps it; [`Prepared::serial_bytes`] counts it either
     /// way, [`Prepared::serial_error`] reports a failed write).
     pub serial: Option<Box<dyn Write + Send>>,
+    /// Where COM1's input comes from (default none): a thread feeds it to the UART for the run ([`uart::feed`]; Ctrl-A x
+    /// cancels the run). [`serial_stdin`] gives the process's standard input, `--serial-stdin` / `NATEMU_SERIAL_STDIN`.
+    pub serial_input: Option<Box<dyn Read + Send>>,
     /// An unassigned port or page access is a typed stop instead of all-ones (L3; default off).
     pub strict_unassigned: bool,
     /// The periodic sources' lost-tick policies (L5; default `LostTicks::DEFAULT`).
@@ -78,6 +81,7 @@ impl Boot {
             rsdp: boot::ACPI_NVS.0,
             code_bytes: exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES,
             serial: None,
+            serial_input: None,
             strict_unassigned: false,
             lost_ticks: clock::LostTicks::DEFAULT,
             watchdog: Duration::from_secs(60),
@@ -140,6 +144,7 @@ impl Boot {
             code_shape: self.code_shape,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
+            serial_input: Mutex::new(self.serial_input),
         })
     }
 
@@ -168,6 +173,8 @@ pub struct Prepared {
     ran: AtomicBool,
     /// The run's cancellation flag ([`Prepared::canceller`]).
     cancel: Arc<AtomicBool>,
+    /// [`Boot::serial_input`], taken by the run.
+    serial_input: Mutex<Option<Box<dyn Read + Send>>>,
 }
 
 /// Stops a [`Prepared::run`] from any thread (an integrator's stop button, the stub's SIGINT): every vCPU stops at its next
@@ -189,6 +196,7 @@ impl Canceller {
                 fn _exit(status: i32) -> !;
             }
             if INTERRUPTED.swap(true, SeqCst) {
+                restore_terminal();
                 unsafe { _exit(130) };
             }
         }
@@ -209,6 +217,61 @@ impl Canceller {
             self.cancel();
         });
     }
+}
+
+/// The terminal settings [`serial_stdin`] replaced.
+static TERMINAL: OnceLock<Termios> = OnceLock::new();
+/// Darwin's `struct termios` (`tcflag_t` and `speed_t` are `unsigned long`, `NCCS` 20).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Termios {
+    iflag: u64,
+    oflag: u64,
+    cflag: u64,
+    lflag: u64,
+    cc: [u8; 20],
+    ispeed: u64,
+    ospeed: u64,
+}
+unsafe extern "C" {
+    fn isatty(fd: i32) -> i32;
+    fn tcgetattr(fd: i32, t: *mut Termios) -> i32;
+    fn tcsetattr(fd: i32, action: i32, t: *const Termios) -> i32;
+    fn cfmakeraw(t: *mut Termios);
+    fn atexit(f: extern "C" fn()) -> i32;
+}
+/// Puts back the terminal settings [`serial_stdin`] replaced (async-signal-safe: `tcsetattr` only).
+extern "C" fn restore_terminal() {
+    if let Some(t) = TERMINAL.get() {
+        unsafe { tcsetattr(0, 0, t) }; // TCSANOW
+    }
+}
+/// The process's standard input as COM1's input ([`Boot::serial_input`]). On a terminal, raw mode first, as QEMU's
+/// `-serial stdio` (`char-stdio.c`: output processing kept, no echo, no line editing, no signal keys: Ctrl-C goes to the
+/// guest), restored at exit, at a panic and at the second SIGINT/SIGTERM's exit ([`Canceller::on_signals`]). Once per
+/// process.
+pub fn serial_stdin() -> Box<dyn Read + Send> {
+    let mut t = std::mem::MaybeUninit::<Termios>::uninit();
+    if unsafe { isatty(0) == 1 && tcgetattr(0, t.as_mut_ptr()) == 0 } {
+        let saved = unsafe { t.assume_init() };
+        if TERMINAL.set(saved).is_ok() {
+            unsafe { atexit(restore_terminal) };
+            let panic = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal();
+                panic(info)
+            }));
+            let mut raw = saved;
+            unsafe { cfmakeraw(&mut raw) };
+            raw.oflag |= 1; // OPOST
+            unsafe { tcsetattr(0, 0, &raw) };
+        }
+    }
+    Box::new(std::io::stdin())
+}
+/// `NATEMU_SERIAL_STDIN` is 1, on, true or yes.
+pub fn env_serial_stdin() -> bool {
+    std::env::var("NATEMU_SERIAL_STDIN").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
 }
 
 /// How a run ended.
@@ -236,6 +299,14 @@ impl Prepared {
         let (backing, vcpus) = (&self.backing, self.backing.n);
         let machine = Machine::create(backing.memory.clone())?;
         self.irqs.attach(machine.doorbell());
+        // COM1's host input: a detached thread (it blocks in its read), holding a busy guard while it may still feed.
+        if let Some(input) = self.serial_input.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let (uart, busy, cancel) = (self.uart.clone(), self.irqs.busy(), self.canceller());
+            std::thread::spawn(move || {
+                uart::feed(&uart, input, || cancel.cancel());
+                drop(busy);
+            });
+        }
         let stops = execution::Stops::new(backing);
         let prepare = |v: usize| -> Result<Vcpu> {
             let cpu = Vcpu::create()?;

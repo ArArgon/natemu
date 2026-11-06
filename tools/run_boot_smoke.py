@@ -9,6 +9,9 @@ user space wrote appeared). Pass at each N: the marker on serial and exit 0 (ACP
 SIGINT 1.5 s in (the kernel is booting), to the stub alone and (`cancel-group`) to its whole process group as a terminal's
 Ctrl-C (the fexc servers run in their own groups); pass: the stub ends within 5 s of the signal with exit 2 and the stop
 `Cancelled`.
+`stdin` (`--serial-stdin` from a pipe): the initrd at 1 vCPU with init `rdinit=/bin/busybox -- sh` on ttyS0, standard input
+64 newlines (keystrokes before the 8250 port is opened are lost, as on hardware), `echo hello-$((6*7))` and `poweroff -f`;
+pass: a serial line ending in `hello-42` (the echoed input reads `hello-$((6*7))`) and exit 0.
 
     tools/with-env python3 tools/run_boot_smoke.py --fexc FEXC --out DIR [--vcpus 1 4] [--kernel BZIMAGE] [--initrd FILE]
         [--timeout SECONDS]
@@ -80,6 +83,23 @@ def cancel(stub, runtime, a, group=False):
     return dict(case=name, vcpus=4, rc=p.returncode, serial_bytes=sent, ok=ok, after_signal_s=round(time.monotonic() - t0, 2), stop=stop)
 
 
+def stdin(stub, runtime, a):
+    serial = a.out / 'stdin.serial'
+    cmdline = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr rdinit=/bin/busybox -- sh'
+    cmd = [stub, runtime, a.fexc, a.kernel, '--initrd', a.initrd, '--cmdline', cmdline, '--serial', serial, '--serial-stdin']
+    t0 = time.monotonic()
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        _, err = p.communicate('\n' * 64 + 'echo hello-$((6*7))\npoweroff -f\n', timeout=a.timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        _, err = p.communicate()
+    text = serial.read_text(errors='replace') if serial.exists() else ''
+    printed = any(line.rstrip().endswith('hello-42') for line in text.splitlines())
+    return dict(case='stdin', vcpus=1, rc=p.returncode, marker=printed, ok=printed and p.returncode == 0,
+                wall_s=round(time.monotonic() - t0, 2), stop=err.strip().splitlines()[-1:] if err else [])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--fexc', required=True)
@@ -101,6 +121,9 @@ def main():
         r = cancel(stub, runtime, a, group)
         print(json.dumps(r), flush=True)
         results.append(r)
+    r = stdin(stub, runtime, a)
+    print(json.dumps(r), flush=True)
+    results.append(r)
     (a.out / 'smoke.json').write_text(json.dumps(results, indent=1) + '\n')
     ok = all(r['ok'] for r in results)
     print(f'boot smoke: {sum(r["ok"] for r in results)}/{len(results)} ' + ('ok' if ok else 'FAILED'))

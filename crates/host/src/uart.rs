@@ -10,8 +10,9 @@
 //! modem control (QEMU's `serial_update_msl` with a file or null backend sets `poll_msl` -1): MSR reads DCD|DSR|CTS
 //! with no deltas, and in loopback the MCR outputs (OUT2 -> DCD, OUT1 -> RI, RTS -> CTS, DTR -> DSR). Transmission is
 //! instantaneous, as in QEMU (THRE and TEMT are set again by the time the THR write completes); in loopback a
-//! transmitted byte is received. Output goes to [`Uart::output`] and the driver's sink; no input source yet (the
-//! receive path is [`Uart::receive`]).
+//! transmitted byte is received. Output goes to [`Uart::output`] and the driver's sink; input from the host comes through
+//! [`feed`] (`--serial-stdin`), as QEMU's character backend gives it (`serial_can_receive` 557-576: never more than the
+//! FIFO advertises, so host input never overruns; a guest's own loopback bytes can).
 //!
 //! **Time.** The FIFO character timeout (CTI, 4 character times after the last receive or RBR read with data left)
 //! is evaluated at each register access from the host's monotonic clock: its effect on IIR and the line is the timer's
@@ -19,12 +20,15 @@
 //! interrupt output (high while IIR names an interrupt), wired by L4a (`irq::install`) to ISA IRQ 4: PIC input 4 and I/O
 //! APIC pin 4. Today every change is made by a vCPU's own access (synchronous). The hook reports level changes only, and
 //! the board treats an edge as a 0 -> 1 change (QEMU's edge-mode I/O APIC delivers on every raise, a raise while already
-//! high included: a departure recorded in `ioapic.rs`). ponytail: the CTI and any host input source are asynchronous:
-//! they need a host timer or thread calling `irq::Irqs::line` and holding an `Irqs::busy` guard while they can fire
-//! (X3's rule for ending halted vCPUs).
+//! high included: a departure recorded in `ioapic.rs`). Host input is asynchronous: [`feed`]'s thread receives bytes and
+//! runs the CTI on time under the UART's lock, so the line rises without an access, through the same hook (IRQ4 into
+//! `irq::Irqs::line`, whose delivery rings a halted vCPU); its caller holds an `Irqs::busy` guard while it runs (X3's
+//! rule for ending halted vCPUs). ponytail: a CTI due after a guest's partial read, with no host input, still waits for
+//! the next access (Linux's 8250 handler drains the FIFO, so it does not arise there).
 use crate::devices::Device;
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const LCR_DLAB: u8 = 0x80;
@@ -163,6 +167,16 @@ impl Uart {
                 self.timeout_ipending = true;
                 self.update_irq();
             }
+        }
+    }
+
+    /// How many bytes the receive line may take now (QEMU's `serial_can_receive`, 557-576).
+    fn can_receive(&self) -> usize {
+        match self.fcr & FCR_FE != 0 {
+            true if self.recv.len() >= FIFO => 0,
+            true if self.recv.len() <= self.recv_itl => self.recv_itl - self.recv.len(),
+            true => 1,
+            false => usize::from(self.lsr & LSR_DR == 0),
         }
     }
 
@@ -326,6 +340,58 @@ impl Device for Uart {
     }
 }
 
+/// Feeds `input` to `uart`'s receive line until it ends (EOF or a read error) or the escape Ctrl-A x, which calls `quit`
+/// (QEMU's mux escapes: Ctrl-A Ctrl-A sends one Ctrl-A, Ctrl-A and any other byte sends nothing). Every other byte is
+/// passed on, Ctrl-C included. Each byte waits until the UART can take it ([`Uart::can_receive`]); after each read the
+/// FIFO timeout is run when it falls due. For a thread of its own: it blocks in `input`.
+pub fn feed(uart: &Mutex<Uart>, mut input: impl Read, quit: impl FnOnce()) {
+    let lock = || uart.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut buf, mut escape) = ([0u8; 256], false);
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        for &byte in &buf[..n] {
+            match (std::mem::take(&mut escape), byte) {
+                (false, 1) => {
+                    escape = true;
+                    continue;
+                }
+                (true, b'x') => return quit(),
+                (true, b) if b != 1 => continue,
+                _ => {}
+            }
+            // ponytail: polls every millisecond for room; a condvar signalled by RBR reads if typing latency matters.
+            loop {
+                let mut u = lock();
+                let now = Instant::now();
+                u.timeout(now);
+                if u.can_receive() > 0 {
+                    u.receive(byte, now);
+                    break;
+                }
+                drop(u);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        loop {
+            let mut u = lock();
+            let now = Instant::now();
+            u.timeout(now);
+            match u.timeout_at {
+                Some(at) if !u.recv.is_empty() => {
+                    drop(u);
+                    std::thread::sleep(at.saturating_duration_since(now));
+                }
+                _ => break,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +471,39 @@ mod tests {
         u.write_at(1, IER_THRI, Instant::now()); // THRE pending: the line rises
         u.write_at(0, b'x', Instant::now()); // the THR write lowers it, the instantaneous transmit raises it again (an edge)
         assert_eq!(*seen.lock().unwrap(), [true, false, true]);
+    }
+
+    /// Host input on a thread: bytes below the trigger level raise the line by the CTI with no access; the escapes; no
+    /// FIFO: the second byte waits until the first is read (no overrun).
+    #[test]
+    fn feed_raises_the_line_and_waits_for_room() {
+        let t = Instant::now();
+        let mut u = Uart::new();
+        u.write_at(2, FCR_FE | 0x80, t); // FIFO, trigger 8
+        u.write_at(1, IER_RDI, t);
+        let rises = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = rises.clone();
+        u.irq = Some(Box::new(move |level| {
+            r.fetch_add(usize::from(level), std::sync::atomic::Ordering::SeqCst);
+        }));
+        let u = Mutex::new(u);
+        let quit = std::sync::atomic::AtomicBool::new(false);
+        // Two reads: the CTI runs after the first, the escape ends the second.
+        feed(&u, Read::chain(&b"ab\x01\x01c\x01zd"[..], &b"\x01xe"[..]), || quit.store(true, std::sync::atomic::Ordering::SeqCst));
+        let mut g = u.lock().unwrap();
+        assert!(quit.into_inner());
+        assert_eq!((g.recv.iter().copied().collect::<Vec<_>>(), g.line), (b"ab\x01cd".to_vec(), true));
+        assert_eq!((g.read_at(2, Instant::now()) & 0x0f, rises.load(std::sync::atomic::Ordering::SeqCst)), (IIR_CTI, 1));
+        g.write_at(2, 0, Instant::now()); // FIFO off (and cleared)
+        drop(g);
+        std::thread::scope(|s| {
+            s.spawn(|| feed(&u, &b"xy"[..], || {}));
+            std::thread::sleep(Duration::from_millis(20));
+            let mut g = u.lock().unwrap();
+            assert_eq!((g.lsr & (LSR_DR | LSR_OE), g.rbr), (LSR_DR, b'x'));
+            assert_eq!(g.read_at(0, Instant::now()), b'x');
+        });
+        let mut g = u.lock().unwrap();
+        assert_eq!((g.lsr & (LSR_DR | LSR_OE), g.read_at(0, Instant::now())), (LSR_DR, b'y'));
     }
 }
