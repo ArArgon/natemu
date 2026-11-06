@@ -190,6 +190,11 @@ either way, faster only when the OS maps its global pages there, as Linux, Windo
 
 ## Backlog (owner, November 4)
 
+- Precise x87 (owner, November 5): natemu runs x87 at FEX's reduced precision (64-bit significand arithmetic), a known
+  deviation that breaks programs relying on 80-bit `long double` (gcc torture ieee/inf-2, inf-3, pr36332, pr39228:
+  LDBL_MAX does not survive FLD m80 / FSTP m80; repro in natemu-raw/correct-us-20261105-01/repro/x87/). A slow but exact
+  x87 mode goes here, off by default when built; not fixed now.
+
 - In-process FEX: about 0.6 s installer N = 1 and 0.7 s `build` N = 1 (chunk 20 estimate), but four concurrent compiles in
   one process share FEX's global Config and the shim's globals (a lock serialises N = 4; per-thread state needs FEX patches),
   a hung compile can no longer be killed, and a FEX memory bug lands in the host process. Not now; only when necessary or

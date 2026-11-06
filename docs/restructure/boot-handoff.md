@@ -871,6 +871,9 @@ Severity: **medium** = a real cost or gap an integrator will meet, **low** = a l
 deviation, or a contained corner.
 
 - The next phase is performance (owner decision 1); the correctness pass comes after it.
+- **medium**, deviation (owner, November 5): x87 runs at reduced precision (FEX's 64-bit significand), so 80-bit `long
+  double` results can differ from hardware (e.g. LDBL_MAX through FLD/FSTP m80 becomes infinity; four gcc torture tests
+  abort). A precise, slower x87 mode is in the backlog, off by default when built.
 - **low**, correctness pass (PCID plan P1, speculation-barrier switch, off by default): the page-walk barriers cover the
   walk's own descent and A/D loads and its paging permission checks (checked by `tools/check_resident_barriers.py`). Two
   Spectre-v1-shaped reads sit outside RDCL's paging definition and are not covered, both older than P1: (1) a caller that
