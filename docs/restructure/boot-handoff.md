@@ -85,7 +85,7 @@ weeks before adoption).
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series65-p2/obj/fexc
+F=../natemu-raw/fexc-native-20261026-01/series66-gather/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu --runtime "$R" --fexc "$F" --kernel "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -712,7 +712,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series65-p2/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
+F=../natemu-raw/fexc-native-20261026-01/series66-gather/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -817,6 +817,9 @@ tools/with-env python3 tools/run_r1.py r1b --fexc "$F" --out "$O/r1b"   # R1b: m
 
 ## 6. Compiler reproducibility
 
+**series66-gather** (November 6; correctness-userspace "Finding 2 fixed"): the fork's `natemu` branch at 8d812cadd (unchanged)
+and this tree's shim (the VEX gathers a system cut); `obj/fexc` SHA-256
+`dd60f9850896e864671df2d71ed1d92f618089f3c13de494c3308c10c5ade47d`, reproduced by `tools/fexc/build.sh`. Before it,
 **series65-p2** (November 5; pcid-plan "Measured (P2)", after its review): the fork's `natemu` branch at 8d812cadd (VERW m16
 inline at CPL 0) and this tree's shim; `obj/fexc` SHA-256 `701a5946f874190f0465d8719eedf289f947bbc96e58055f4932c60772ca9555`, reproduced by `tools/fexc/build.sh` from the pin.
 Before it, **series64-chunk26-r1** (November 5; perf plan "Measured (chunk 26)", after its review): the fork's `natemu` branch at
