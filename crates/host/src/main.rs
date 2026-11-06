@@ -26,12 +26,15 @@ fn number(text: &str) -> natemu::Result<u64> {
 
 fn boot(args: &[String]) -> natemu::Result<Stop> {
     let [_, runtime, fexc, image, options @ ..] = args else {
-        return Err(USAGE.into());
+        return Err(format!("expected RUNTIME.elf FEXC BZIMAGE, got {} argument(s)\n{USAGE}", args.len().saturating_sub(1)));
     };
     // Performance phase (perf plan §2): the library's timing log (`natemu::perf`), off unless set.
     if let Some(path) = std::env::var_os("NATEMU_PERF_LOG") {
         natemu::perf::enable(path)?;
         natemu::perf::mark("main");
+    }
+    for (what, path) in [("RUNTIME.elf", runtime), ("FEXC", fexc)] {
+        std::fs::metadata(path).map_err(|e| format!("{what} {path}: {e}"))?;
     }
     let mut boot = Boot::new(runtime, fexc, natemu::memory::read_input(image, MAX_INPUT)?);
     boot.compile_cache = natemu::compile_cache::Config::from_env()?;
@@ -44,14 +47,16 @@ fn boot(args: &[String]) -> natemu::Result<Stop> {
             serial_stdin = true;
             continue;
         }
-        let value = options.next().ok_or(USAGE)?;
+        if !matches!(option.as_str(), "--initrd" | "--cmdline" | "--ram" | "--vcpus" | "--serial") {
+            return Err(format!("unknown option {option}\n{USAGE}"));
+        }
+        let value = options.next().ok_or_else(|| format!("{option} needs a value\n{USAGE}"))?;
         match option.as_str() {
             "--initrd" => boot.initrd = Some(natemu::memory::read_input(value, MAX_INPUT)?),
             "--cmdline" => boot.cmdline = value.clone(),
             "--ram" => boot.ram = number(value)?,
             "--vcpus" => boot.vcpus = number(value)? as usize,
-            "--serial" => boot.serial = Some(Box::new(std::fs::File::create(value).map_err(|e| format!("{value}: {e}"))?)),
-            _ => return Err(USAGE.into()),
+            _ => boot.serial = Some(Box::new(std::fs::File::create(value).map_err(|e| format!("{value}: {e}"))?)),
         }
     }
     // SIGINT/SIGTERM cancel the run (a second one exits at once).

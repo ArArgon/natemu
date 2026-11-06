@@ -106,12 +106,12 @@ fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
 }
 pub fn read_input(path: &str, max: usize) -> Result<Vec<u8>> {
-    if fs::metadata(path).map_err(|e| e.to_string())?.len() > max as u64 {
-        return Err("oversized input".into());
+    if fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len() > max as u64 {
+        return Err(format!("{path}: oversized input"));
     }
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     if bytes.len() > max {
-        return Err("input grew beyond limit".into());
+        return Err(format!("{path}: input grew beyond limit"));
     }
     Ok(bytes)
 }
