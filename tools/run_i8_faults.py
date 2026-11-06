@@ -16,7 +16,7 @@ instruction's exception table; Vol.3 6.15):
   - #GP(0), or #SS(0) through RSP, for a non-canonical operand (any byte);
   - #PF with CR2 = the first faulting byte's page in address order (a 32-byte access crossing into a not-present or
     read-only second page: CR2 = that page), error P | W | U;
-  - refusals (typed, before any effect): VMASKMOV/VPMASKMOV (FEX's element loop), the gathers, VCVTPS2PH to memory (its
+  - refusals (typed, before any effect): VMASKMOV/VPMASKMOV (FEX's element loop), VCVTPS2PH to memory (its
     conversion's MXCSR flags would be committed before a faulting store); an encoding x86 makes #UD is #UD under the
     gating too (I10: delivered); VLDMXCSR/VSTMXCSR run LDMXCSR/STMXCSR's transaction under the AVX gating;
   - the YMM upper halves exact at a fault right after register-only vector instructions (they stay cached there);
@@ -138,9 +138,10 @@ def cases():
     loop = ['xor r8d, r8d', 'L: vaddps ymm0, ymm1, ymm2', 'test r8d, r8d', 'jnz F', 'inc r8d', 'xor ecx, ecx', 'mov eax, 3',
             'xor edx, edx', 'xsetbv', 'jmp L', 'F: nop']
     out.append(case('xsetbv-then-ud', 'vaddps', [], UD, cpl=0, lines=loop, at=1))
-    # Refusals: typed stops before any effect (the masked forms would need a non-faulting masked-off element; refused).
+    # Refusals: typed stops before any effect (the masked forms would need a non-faulting masked-off element; refused). The
+    # gathers run in the resident since the correctness pass (`run_k2.py gather`); their gating stays above.
     for g in ['vmaskmovps ymm0, ymm1, ymmword ptr [rax]', 'vmaskmovps ymmword ptr [rax], ymm1, ymm2', 'vpmaskmovd ymmword ptr [rax], ymm1, ymm2',
-              'vpgatherdd ymm0, dword ptr [rax + ymm1*4], ymm2', 'vmaskmovdqu xmm1, xmm2',
+              'vmaskmovdqu xmm1, xmm2',
               'vcvtps2ph xmmword ptr [rax], ymm6, 4']:
         out.append(case(f'refused-{g.split()[0]}{"-st" if "ymmword ptr [rax]," in g else ""}', g, [], ['nocode', 'unsupported_form'],
                         prelude=['mov eax, 0x200100']))
