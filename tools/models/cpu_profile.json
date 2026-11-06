@@ -1,0 +1,3230 @@
+{
+ "schema": 1,
+ "title": "Presented CPU: CPU 16 as accepted (INV-03-01 CLM-03-01-16) plus CPU 17 compatibility registers",
+ "sources": {
+  "CPU 9": "INV-03-01 CLM-03-01-09 MSR dispatch",
+  "CPU 10": "CLM-03-01-10 EFER validation",
+  "CPU 12": "CLM-03-01-12 control-state transaction",
+  "CPU 13": "CLM-03-01-13 TSC/crystal/LAPIC rates",
+  "CPU 16": "CLM-03-01-16 Intel profile",
+  "CPU 17": "CLM-03-01-17 MISC_ENABLE and microcode",
+  "K": "Linux v6.12.107 arch/x86 (scratchpad bootsrc); paths relative to arch/x86 unless prefixed",
+  "SDM": "Intel SDM revision 092 volume/section named in each entry",
+  "census": "experiments/track03/kernel-census/results.md and forms-kernel.tsv"
+ },
+ "identity": {
+  "vendor": "GenuineIntel",
+  "family": 6,
+  "model": "0x3c",
+  "stepping": 3,
+  "signature": "0x306c3",
+  "brand": "Natemu Virtual x86-64 CPU",
+  "hypervisor_id": "NatemuNatemu",
+  "maxphyaddr": 40,
+  "maxlinaddr": 48,
+  "tsc_hz": 1000000000,
+  "crystal_hz": 24000000,
+  "cache_line": 64,
+  "max_basic_leaf": "0x15",
+  "max_basic_leaf_limited": "0x2",
+  "max_ext_leaf": "0x80000008",
+  "max_hypervisor_leaf": "0x40000000",
+  "logical_cpus": {
+   "min": 1,
+   "max": 64,
+   "default_smp": 2
+  },
+  "source": "CPU 16 (CLM-03-01-16)"
+ },
+ "cpuid_out_of_range": {
+  "rule": "a basic/extended leaf above the maximum returns the data of the highest basic leaf (0x15, or 0x2 while MISC_ENABLE bit 22 is set); holes inside the range return zero",
+  "source": "CPU 16 (CLM-03-01-16), SDM Vol.2A CPUID \"highest basic information leaf\"",
+  "open": "leaves 0x40000001..0x4fffffff: treated like other out-of-range leaves here; the records only say there are no further hypervisor leaves",
+  "holes_within_range": {
+   "holes_basic": [
+    "0x3",
+    "0x5",
+    "0x8",
+    "0x9",
+    "0xa",
+    "0xc",
+    "0xe",
+    "0xf",
+    "0x10",
+    "0x11",
+    "0x12",
+    "0x13",
+    "0x14"
+   ],
+   "source": "CPU 16 (CLM-03-01-16): \"Unsupported holes within advertised ranges return zero\" (leaf 0xa PMU = 0; leaf 5 MONITOR/MWAIT absent)"
+  }
+ },
+ "feature_names": {
+  "1.edx": {
+   "0": "FPU",
+   "1": "VME",
+   "2": "DE",
+   "3": "PSE",
+   "4": "TSC",
+   "5": "MSR",
+   "6": "PAE",
+   "7": "MCE",
+   "8": "CX8",
+   "9": "APIC",
+   "11": "SEP",
+   "12": "MTRR",
+   "13": "PGE",
+   "14": "MCA",
+   "15": "CMOV",
+   "16": "PAT",
+   "17": "PSE36",
+   "18": "PSN",
+   "19": "CLFSH",
+   "21": "DS",
+   "22": "ACPI",
+   "23": "MMX",
+   "24": "FXSR",
+   "25": "SSE",
+   "26": "SSE2",
+   "27": "SS",
+   "28": "HTT",
+   "29": "TM",
+   "31": "PBE"
+  },
+  "1.ecx": {
+   "0": "SSE3",
+   "1": "PCLMULQDQ",
+   "2": "DTES64",
+   "3": "MONITOR",
+   "4": "DS_CPL",
+   "5": "VMX",
+   "6": "SMX",
+   "7": "EIST",
+   "8": "TM2",
+   "9": "SSSE3",
+   "10": "CNXT_ID",
+   "11": "SDBG",
+   "12": "FMA",
+   "13": "CX16",
+   "14": "XTPR",
+   "15": "PDCM",
+   "17": "PCID",
+   "18": "DCA",
+   "19": "SSE4_1",
+   "20": "SSE4_2",
+   "21": "X2APIC",
+   "22": "MOVBE",
+   "23": "POPCNT",
+   "24": "TSC_DEADLINE",
+   "25": "AES",
+   "26": "XSAVE",
+   "27": "OSXSAVE",
+   "28": "AVX",
+   "29": "F16C",
+   "30": "RDRAND",
+   "31": "HYPERVISOR"
+  },
+  "7.0.ebx": {
+   "0": "FSGSBASE",
+   "1": "TSC_ADJUST",
+   "2": "SGX",
+   "3": "BMI1",
+   "4": "HLE",
+   "5": "AVX2",
+   "6": "FDP_EXCPTN_ONLY",
+   "7": "SMEP",
+   "8": "BMI2",
+   "9": "ERMS",
+   "10": "INVPCID",
+   "11": "RTM",
+   "12": "RDT_M",
+   "14": "MPX",
+   "15": "RDT_A",
+   "16": "AVX512F",
+   "18": "RDSEED",
+   "19": "ADX",
+   "20": "SMAP",
+   "23": "CLFLUSHOPT",
+   "24": "CLWB",
+   "25": "PT",
+   "29": "SHA"
+  },
+  "7.0.ecx": {
+   "2": "UMIP",
+   "3": "PKU",
+   "4": "OSPKE",
+   "5": "WAITPKG",
+   "7": "CET_SS",
+   "8": "GFNI",
+   "13": "TME_EN",
+   "16": "LA57",
+   "22": "RDPID",
+   "23": "KL",
+   "24": "BUS_LOCK_DETECT",
+   "25": "CLDEMOTE",
+   "27": "MOVDIRI",
+   "28": "MOVDIR64B",
+   "29": "ENQCMD",
+   "30": "SGX_LC",
+   "31": "PKS"
+  },
+  "7.0.edx": {
+   "4": "FSRM",
+   "5": "UINTR",
+   "10": "MD_CLEAR",
+   "14": "SERIALIZE",
+   "16": "TSXLDTRK",
+   "20": "CET_IBT",
+   "26": "SPEC_CTRL",
+   "27": "STIBP",
+   "28": "L1D_FLUSH",
+   "29": "ARCH_CAPABILITIES",
+   "30": "CORE_CAPABILITIES",
+   "31": "SSBD"
+  },
+  "6.eax": {
+   "0": "DTS",
+   "1": "TURBO",
+   "2": "ARAT",
+   "4": "PLN",
+   "6": "PTM",
+   "7": "HWP"
+  },
+  "13.1.eax": {
+   "0": "XSAVEOPT",
+   "1": "XSAVEC",
+   "2": "XGETBV1",
+   "3": "XSAVES",
+   "4": "XFD"
+  },
+  "0x80000001.ecx": {
+   "0": "LAHF",
+   "5": "LZCNT",
+   "8": "PREFETCHW"
+  },
+  "0x80000001.edx": {
+   "11": "SYSCALL",
+   "20": "NX",
+   "26": "PAGE1GB",
+   "27": "RDTSCP",
+   "29": "LM"
+  },
+  "0x80000007.edx": {
+   "8": "INVARIANT_TSC"
+  }
+ },
+ "parameters": {
+  "mtrr_initial": {
+   "decision": "owner decision Oct 28, boot-features-plan.md (MTRRs enabled by the virtual firmware, RAM write-back, device ranges uncached); resolves Q3 second half",
+   "selected": "enabled",
+   "ram_limit_L": "0x80000000",
+   "derivation": "Ranges follow the M69 memory map (INV-03-03 CLM-03-03-69, \"Guest physical range\" table): 0x1000..0xa0000 conventional RAM, 0xa0000..0x100000 reserved legacy hole, L..4GiB non-RAM aperture holding LAPIC 0xfee00000, IOAPIC 0xfec00000 and virtio-MMIO 0xf0000000.., everything else RAM (including NVS and loader areas, below L and above 4 GiB). Encoding follows SDM Vol.3 11.11.2.2 (fixed-range layout, one type byte per range) and 11.11.2.3 (variable pair: base aligned to a power-of-two size, mask = ~(size-1), V bit 11). The fixed split (0-0x9ffff WB, 0xa0000-0xfffff UC) is derived from M69, NOT copied from a firmware image: no SeaBIOS/OVMF/edk2 source was fetched, so \"typical firmware\" values (for example WB shadow ROM in 0xc0000-0xfffff) are not claimed. Default type WB with UC variable ranges for the aperture is the minimal encoding of \"RAM WB, devices UC\"; variable pairs are decomposed into power-of-two blocks, so L other than 2 GiB uses up to 3 pairs (cpu_profile.uc_pairs).",
+   "msr_values_for_default_L": {
+    "0x2ff": "0xc06",
+    "0x200": "0x80000000",
+    "0x201": "0xff80000800",
+    "0x250": "0x606060606060606",
+    "0x258": "0x606060606060606",
+    "0x259": "0x0",
+    "0x268": "0x0",
+    "0x269": "0x0",
+    "0x26a": "0x0",
+    "0x26b": "0x0",
+    "0x26c": "0x0",
+    "0x26d": "0x0",
+    "0x26e": "0x0",
+    "0x26f": "0x0"
+   },
+   "choices": {
+    "disabled": {
+     "IA32_MTRR_DEF_TYPE": "0x0 (E=0, FE=0, default type UC)",
+     "variable_pairs": "all 0 (V=0)",
+     "fixed": "all 0",
+     "meaning": "SDM Vol.3 11.11.2.1: the architectural reset state. NOT selected; kept for tests that start from reset."
+    },
+    "enabled": {
+     "IA32_MTRR_DEF_TYPE": "0xc06 (E=1, FE=1, default type WB)",
+     "variable_pairs": "UC for [L, 4 GiB) in power-of-two blocks (L = 2 GiB: one pair, base 0x80000000, mask 0xff80000800); L is the VM's guest RAM (M1), and when [L, 4 GiB) needs more pairs than MTRRCAP.VCNT the same map is encoded with default type UC and [0, L) in WB pairs (cpu_profile.py mtrr_state)",
+     "fixed": "0x00000-0x9ffff WB (0x250, 0x258 = 0x0606060606060606); 0xa0000-0xbffff UC (0x259 = 0); 0xc0000-0xfffff UC (0x268-0x26f = 0)",
+     "meaning": "SELECTED. Linux reads it (kernel/cpu/mtrr/mtrr.c:587-600) and, when it reprograms, brackets the writes with CR0.CD and WBINVD (cacheinfo.c:1052-1110, 1115-1129), so CD, WBINVD, MTRR writes with TLB invalidation and the PAT interaction must all be implemented. UC RAM keeps x86 strong ordering: its accesses run one instruction at a time between full barriers (plan M2, owner decision November 2)."
+    }
+   }
+  }
+ },
+ "cpuid": [
+  {
+   "leaf": "0x0",
+   "subleaf": null,
+   "eax": "0x15",
+   "ebx": "0x756e6547",
+   "ecx": "0x6c65746e",
+   "edx": "0x49656e69",
+   "source": "CPU 16 (CLM-03-01-16), Intel Vol.2A leaf 0",
+   "dynamic": {
+    "eax": "IA32_MISC_ENABLE bit 22 set -> 2 (CPU 17)"
+   }
+  },
+  {
+   "leaf": "0x1",
+   "subleaf": null,
+   "eax": "0x306c3",
+   "ebx": "0x800",
+   "ecx": "0xf6f83203",
+   "edx": "0x78bb97d",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "ebx": "bits 31:24 initial APIC ID (x2APIC ID & 0xff); bits 23:16 = N logical CPUs (CPU 16); bits 15:8 = 8 (CLFLUSH line 64 B / 8)",
+    "ecx": "OSXSAVE (bit 27) = CR4.OSXSAVE",
+    "edx": "APIC (bit 9) = IA32_APIC_BASE.EN; HTT (bit 28) = N > 1"
+   },
+   "fields": {
+    "ecx": {
+     "0": {
+      "name": "SSE3",
+      "state": "advertised"
+     },
+     "1": {
+      "name": "PCLMULQDQ",
+      "state": "advertised"
+     },
+     "2": {
+      "name": "DTES64",
+      "state": "clear"
+     },
+     "3": {
+      "name": "MONITOR",
+      "state": "clear"
+     },
+     "4": {
+      "name": "DS_CPL",
+      "state": "clear"
+     },
+     "5": {
+      "name": "VMX",
+      "state": "clear"
+     },
+     "6": {
+      "name": "SMX",
+      "state": "clear"
+     },
+     "7": {
+      "name": "EIST",
+      "state": "clear"
+     },
+     "8": {
+      "name": "TM2",
+      "state": "clear"
+     },
+     "9": {
+      "name": "SSSE3",
+      "state": "advertised"
+     },
+     "10": {
+      "name": "CNXT_ID",
+      "state": "clear"
+     },
+     "11": {
+      "name": "SDBG",
+      "state": "clear"
+     },
+     "12": {
+      "name": "FMA",
+      "state": "advertised"
+     },
+     "13": {
+      "name": "CX16",
+      "state": "advertised"
+     },
+     "14": {
+      "name": "XTPR",
+      "state": "clear"
+     },
+     "15": {
+      "name": "PDCM",
+      "state": "clear"
+     },
+     "17": {
+      "name": "PCID",
+      "state": "clear"
+     },
+     "18": {
+      "name": "DCA",
+      "state": "clear"
+     },
+     "19": {
+      "name": "SSE4_1",
+      "state": "advertised"
+     },
+     "20": {
+      "name": "SSE4_2",
+      "state": "advertised"
+     },
+     "21": {
+      "name": "X2APIC",
+      "state": "advertised"
+     },
+     "22": {
+      "name": "MOVBE",
+      "state": "advertised"
+     },
+     "23": {
+      "name": "POPCNT",
+      "state": "advertised"
+     },
+     "24": {
+      "name": "TSC_DEADLINE",
+      "state": "clear"
+     },
+     "25": {
+      "name": "AES",
+      "state": "advertised"
+     },
+     "26": {
+      "name": "XSAVE",
+      "state": "advertised"
+     },
+     "27": {
+      "name": "OSXSAVE",
+      "state": "dynamic",
+      "rule": "committed CR4.OSXSAVE (CPU 16, CPU 12)"
+     },
+     "28": {
+      "name": "AVX",
+      "state": "advertised"
+     },
+     "29": {
+      "name": "F16C",
+      "state": "advertised"
+     },
+     "30": {
+      "name": "RDRAND",
+      "state": "advertised"
+     },
+     "31": {
+      "name": "HYPERVISOR",
+      "state": "advertised"
+     }
+    },
+    "edx": {
+     "0": {
+      "name": "FPU",
+      "state": "advertised"
+     },
+     "1": {
+      "name": "VME",
+      "state": "clear"
+     },
+     "2": {
+      "name": "DE",
+      "state": "advertised"
+     },
+     "3": {
+      "name": "PSE",
+      "state": "advertised"
+     },
+     "4": {
+      "name": "TSC",
+      "state": "advertised"
+     },
+     "5": {
+      "name": "MSR",
+      "state": "advertised"
+     },
+     "6": {
+      "name": "PAE",
+      "state": "advertised"
+     },
+     "7": {
+      "name": "MCE",
+      "state": "clear"
+     },
+     "8": {
+      "name": "CX8",
+      "state": "advertised"
+     },
+     "9": {
+      "name": "APIC",
+      "state": "dynamic",
+      "rule": "IA32_APIC_BASE bit 11 (EN); SVR software-disable does not clear it (CPU 16, Intel Vol.3 13.4.3)"
+     },
+     "11": {
+      "name": "SEP",
+      "state": "advertised"
+     },
+     "12": {
+      "name": "MTRR",
+      "state": "advertised"
+     },
+     "13": {
+      "name": "PGE",
+      "state": "advertised"
+     },
+     "14": {
+      "name": "MCA",
+      "state": "clear"
+     },
+     "15": {
+      "name": "CMOV",
+      "state": "advertised"
+     },
+     "16": {
+      "name": "PAT",
+      "state": "advertised"
+     },
+     "17": {
+      "name": "PSE36",
+      "state": "advertised"
+     },
+     "18": {
+      "name": "PSN",
+      "state": "clear"
+     },
+     "19": {
+      "name": "CLFSH",
+      "state": "advertised"
+     },
+     "21": {
+      "name": "DS",
+      "state": "clear"
+     },
+     "22": {
+      "name": "ACPI",
+      "state": "clear"
+     },
+     "23": {
+      "name": "MMX",
+      "state": "advertised"
+     },
+     "24": {
+      "name": "FXSR",
+      "state": "advertised"
+     },
+     "25": {
+      "name": "SSE",
+      "state": "advertised"
+     },
+     "26": {
+      "name": "SSE2",
+      "state": "advertised"
+     },
+     "27": {
+      "name": "SS",
+      "state": "clear"
+     },
+     "28": {
+      "name": "HTT",
+      "state": "dynamic",
+      "rule": "set iff N > 1 (CPU 16)"
+     },
+     "29": {
+      "name": "TM",
+      "state": "clear"
+     },
+     "31": {
+      "name": "PBE",
+      "state": "clear"
+     }
+    }
+   },
+   "note": "EAX = family 6, model 0x3c, stepping 3 (CPU 16). Brand index 0. CPUID.1 execution also refreshes the UCODE_REV latch high half to 0 (CPU 17)."
+  },
+  {
+   "leaf": "0x2",
+   "subleaf": null,
+   "eax": "0xff01",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "descriptor byte 0xff: use leaf 4"
+  },
+  {
+   "leaf": "0x4",
+   "subleaf": 0,
+   "eax": "0x121",
+   "ebx": "0x1c0003f",
+   "ecx": "0x3f",
+   "edx": "0x1",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "eax": "bits 25:14 = (N-1 if shared by all N logical CPUs, else 0); bits 31:26 = N-1"
+   },
+   "note": "L1D 32 KiB, 8-way, 64 B lines, 1 partition; EAX bit 8 self-initializing; EDX bit0 = 1 (CPU 16)"
+  },
+  {
+   "leaf": "0x4",
+   "subleaf": 1,
+   "eax": "0x122",
+   "ebx": "0x1c0003f",
+   "ecx": "0x3f",
+   "edx": "0x1",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "eax": "bits 25:14 = (N-1 if shared by all N logical CPUs, else 0); bits 31:26 = N-1"
+   },
+   "note": "L1I 32 KiB, 8-way, 64 B lines, 1 partition; EAX bit 8 self-initializing; EDX bit0 = 1 (CPU 16)"
+  },
+  {
+   "leaf": "0x4",
+   "subleaf": 2,
+   "eax": "0x143",
+   "ebx": "0x1c0003f",
+   "ecx": "0x1ff",
+   "edx": "0x1",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "eax": "bits 25:14 = (N-1 if shared by all N logical CPUs, else 0); bits 31:26 = N-1"
+   },
+   "note": "L2 256 KiB, 8-way, 64 B lines, 1 partition; EAX bit 8 self-initializing; EDX bit0 = 1 (CPU 16)"
+  },
+  {
+   "leaf": "0x4",
+   "subleaf": 3,
+   "eax": "0x163",
+   "ebx": "0x3c0003f",
+   "ecx": "0x1fff",
+   "edx": "0x1",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "eax": "bits 25:14 = (N-1 if shared by all N logical CPUs, else 0); bits 31:26 = N-1"
+   },
+   "note": "L3 8192 KiB, 16-way, 64 B lines, 1 partition; EAX bit 8 self-initializing; EDX bit0 = 1 (CPU 16)"
+  },
+  {
+   "leaf": "0x4",
+   "subleaf": 4,
+   "eax": "0x0",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "terminator: cache type 0 (all registers zero)"
+  },
+  {
+   "leaf": "0x6",
+   "subleaf": null,
+   "eax": "0x4",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "fields": {
+    "eax": {
+     "0": {
+      "name": "DTS",
+      "state": "clear"
+     },
+     "1": {
+      "name": "TURBO",
+      "state": "clear"
+     },
+     "2": {
+      "name": "ARAT",
+      "state": "advertised"
+     },
+     "4": {
+      "name": "PLN",
+      "state": "clear"
+     },
+     "6": {
+      "name": "PTM",
+      "state": "clear"
+     },
+     "7": {
+      "name": "HWP",
+      "state": "clear"
+     }
+    }
+   }
+  },
+  {
+   "leaf": "0x7",
+   "subleaf": 0,
+   "eax": "0x0",
+   "ebx": "0x218801a9",
+   "ecx": "0x4",
+   "edx": "0x20000000",
+   "source": "CPU 16 (CLM-03-01-16); ECX.UMIP by owner decision November 3 (boot-features plan, Built (UMIP)); EDX.ARCH_CAPABILITIES[29] by the PCID plan P1 (owner policy: accurate not-vulnerable bits, November 5)",
+   "fields": {
+    "ebx": {
+     "0": {
+      "name": "FSGSBASE",
+      "state": "advertised"
+     },
+     "1": {
+      "name": "TSC_ADJUST",
+      "state": "clear"
+     },
+     "2": {
+      "name": "SGX",
+      "state": "clear"
+     },
+     "3": {
+      "name": "BMI1",
+      "state": "advertised"
+     },
+     "4": {
+      "name": "HLE",
+      "state": "clear"
+     },
+     "5": {
+      "name": "AVX2",
+      "state": "advertised"
+     },
+     "6": {
+      "name": "FDP_EXCPTN_ONLY",
+      "state": "clear"
+     },
+     "7": {
+      "name": "SMEP",
+      "state": "advertised"
+     },
+     "8": {
+      "name": "BMI2",
+      "state": "advertised"
+     },
+     "9": {
+      "name": "ERMS",
+      "state": "clear"
+     },
+     "10": {
+      "name": "INVPCID",
+      "state": "clear"
+     },
+     "11": {
+      "name": "RTM",
+      "state": "clear"
+     },
+     "12": {
+      "name": "RDT_M",
+      "state": "clear"
+     },
+     "14": {
+      "name": "MPX",
+      "state": "clear"
+     },
+     "15": {
+      "name": "RDT_A",
+      "state": "clear"
+     },
+     "16": {
+      "name": "AVX512F",
+      "state": "clear"
+     },
+     "18": {
+      "name": "RDSEED",
+      "state": "clear"
+     },
+     "19": {
+      "name": "ADX",
+      "state": "advertised"
+     },
+     "20": {
+      "name": "SMAP",
+      "state": "clear"
+     },
+     "23": {
+      "name": "CLFLUSHOPT",
+      "state": "advertised"
+     },
+     "24": {
+      "name": "CLWB",
+      "state": "advertised"
+     },
+     "25": {
+      "name": "PT",
+      "state": "clear"
+     },
+     "29": {
+      "name": "SHA",
+      "state": "advertised"
+     }
+    },
+    "ecx": {
+     "2": {
+      "name": "UMIP",
+      "state": "advertised"
+     },
+     "3": {
+      "name": "PKU",
+      "state": "clear"
+     },
+     "4": {
+      "name": "OSPKE",
+      "state": "clear"
+     },
+     "5": {
+      "name": "WAITPKG",
+      "state": "clear"
+     },
+     "7": {
+      "name": "CET_SS",
+      "state": "clear"
+     },
+     "8": {
+      "name": "GFNI",
+      "state": "clear"
+     },
+     "13": {
+      "name": "TME_EN",
+      "state": "clear"
+     },
+     "16": {
+      "name": "LA57",
+      "state": "clear"
+     },
+     "22": {
+      "name": "RDPID",
+      "state": "clear"
+     },
+     "23": {
+      "name": "KL",
+      "state": "clear"
+     },
+     "24": {
+      "name": "BUS_LOCK_DETECT",
+      "state": "clear"
+     },
+     "25": {
+      "name": "CLDEMOTE",
+      "state": "clear"
+     },
+     "27": {
+      "name": "MOVDIRI",
+      "state": "clear"
+     },
+     "28": {
+      "name": "MOVDIR64B",
+      "state": "clear"
+     },
+     "29": {
+      "name": "ENQCMD",
+      "state": "clear"
+     },
+     "30": {
+      "name": "SGX_LC",
+      "state": "clear"
+     },
+     "31": {
+      "name": "PKS",
+      "state": "clear"
+     }
+    },
+    "edx": {
+     "4": {
+      "name": "FSRM",
+      "state": "clear"
+     },
+     "5": {
+      "name": "UINTR",
+      "state": "clear"
+     },
+     "10": {
+      "name": "MD_CLEAR",
+      "state": "clear"
+     },
+     "14": {
+      "name": "SERIALIZE",
+      "state": "clear"
+     },
+     "16": {
+      "name": "TSXLDTRK",
+      "state": "clear"
+     },
+     "20": {
+      "name": "CET_IBT",
+      "state": "clear"
+     },
+     "26": {
+      "name": "SPEC_CTRL",
+      "state": "clear"
+     },
+     "27": {
+      "name": "STIBP",
+      "state": "clear"
+     },
+     "28": {
+      "name": "L1D_FLUSH",
+      "state": "clear"
+     },
+     "29": {
+      "name": "ARCH_CAPABILITIES",
+      "state": "advertised"
+     },
+     "30": {
+      "name": "CORE_CAPABILITIES",
+      "state": "clear"
+     },
+     "31": {
+      "name": "SSBD",
+      "state": "clear"
+     }
+    }
+   },
+   "note": "EAX (max subleaf) = 0: \"no further structured-feature subleaf\" (CPU 16). Other subleaves: all zero (hole). EBX.SHA[29] advertised by owner decision Nov 3 (boot-features plan, Built (SHA)): SHA1*/SHA256* run through FEX's Arm FEAT_SHA1/FEAT_SHA256 lowering. EBX.ADX[19] advertised by owner decision Nov 3 (boot-features plan, Built (ADX)): ADCX/ADOX through FEX's ADC with CF/OF routing. EBX.CLFLUSHOPT[23] and EBX.CLWB[24] advertised by owner decision Nov 3 (Built (CLFLUSHOPT, CLWB)): the resident's CLFLUSH transaction (a byte load's faults; RAM is coherent, nothing to flush)."
+  },
+  {
+   "leaf": "0xb",
+   "subleaf": 0,
+   "eax": "0x0",
+   "ebx": "0x1",
+   "ecx": "0x100",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "edx": "x2APIC ID of this vCPU"
+   },
+   "note": "SMT level: shift 0, 1 logical processor, level type 1"
+  },
+  {
+   "leaf": "0xb",
+   "subleaf": 1,
+   "eax": "0x0",
+   "ebx": "0x0",
+   "ecx": "0x201",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "eax": "ceil(log2 N)",
+    "ebx": "N",
+    "edx": "x2APIC ID of this vCPU"
+   },
+   "note": "core level: type 2"
+  },
+  {
+   "leaf": "0xb",
+   "subleaf": 2,
+   "eax": "0x0",
+   "ebx": "0x0",
+   "ecx": "0x2",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "edx": "x2APIC ID of this vCPU"
+   },
+   "note": "terminating level: count/type 0, ECX[7:0] = input subleaf (CPU 16); same for every subleaf >= 2"
+  },
+  {
+   "leaf": "0xd",
+   "subleaf": 0,
+   "eax": "0x7",
+   "ebx": "0x340",
+   "ecx": "0x340",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "dynamic": {
+    "ebx": "832 when XCR0 bit 2 set, else 576 (CPU 16)"
+   },
+   "note": "EAX = supported XCR0 low (x87|SSE|AVX); ECX = size for all supported = 832; EDX = 0"
+  },
+  {
+   "leaf": "0xd",
+   "subleaf": 1,
+   "eax": "0x3",
+   "ebx": "0x340",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16); owner decision November 3 (XSAVEOPT, XSAVEC)",
+   "dynamic": {
+    "ebx": "XSAVEC size for XCR0 (EAX[3] = 0, EAX[1] = 1; SDM Vol.1 13.2): 832 when XCR0 bit 2 set, else 576 (AVX, the only extended component, sits at 576 compacted too)"
+   },
+   "fields": {
+    "eax": {
+     "0": {
+      "name": "XSAVEOPT",
+      "state": "advertised"
+     },
+     "1": {
+      "name": "XSAVEC",
+      "state": "advertised"
+     },
+     "2": {
+      "name": "XGETBV1",
+      "state": "clear"
+     },
+     "3": {
+      "name": "XSAVES",
+      "state": "clear"
+     },
+     "4": {
+      "name": "XFD",
+      "state": "clear"
+     }
+    }
+   },
+   "note": "EAX = 3: XSAVEOPT (bit 0) and XSAVEC with the compacted format (bit 1) advertised by owner decision November 3 (boot-features plan, Built (XSAVEOPT, XSAVEC)); XGETBV1/XSAVES/XFD not exposed; EDX:ECX = 0 (no supervisor state)"
+  },
+  {
+   "leaf": "0xd",
+   "subleaf": 2,
+   "eax": "0x100",
+   "ebx": "0x240",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "AVX (YMM_Hi128) component: size 256, standard offset 576, user-state flag 0"
+  },
+  {
+   "leaf": "0x15",
+   "subleaf": null,
+   "eax": "0x3",
+   "ebx": "0x7d",
+   "ecx": "0x16e3600",
+   "edx": "0x0",
+   "source": "CPU 13 (CLM-03-01-13)",
+   "note": "TSC = crystal * 125/3 = 1 GHz exactly; leaf 0x16 not advertised"
+  },
+  {
+   "leaf": "0x40000000",
+   "subleaf": null,
+   "eax": "0x40000000",
+   "ebx": "0x6574614e",
+   "ecx": "0x614e756d",
+   "edx": "0x756d6574",
+   "source": "CPU 16 (CLM-03-01-16) (vendor string only)",
+   "note": "ID string \"NatemuNatemu\" in EBX,ECX,EDX. EAX = 0x40000000 (no further hypervisor leaves) is the records' implication, not a stated value: OPEN."
+  },
+  {
+   "leaf": "0x80000000",
+   "subleaf": null,
+   "eax": "0x80000008",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)"
+  },
+  {
+   "leaf": "0x80000001",
+   "subleaf": null,
+   "eax": "0x306c3",
+   "ebx": "0x0",
+   "ecx": "0x21",
+   "edx": "0x28100000",
+   "source": "CPU 16 (CLM-03-01-16), Intel Vol.2A leaf 80000001H",
+   "dynamic": {
+    "edx": "SYSCALL (bit 11) = 1 only in 64-bit mode"
+   },
+   "fields": {
+    "ecx": {
+     "0": {
+      "name": "LAHF",
+      "state": "advertised"
+     },
+     "5": {
+      "name": "LZCNT",
+      "state": "advertised"
+     },
+     "8": {
+      "name": "PREFETCHW",
+      "state": "clear"
+     }
+    },
+    "edx": {
+     "11": {
+      "name": "SYSCALL",
+      "state": "dynamic",
+      "rule": "1 only while executing in 64-bit mode (CPU 16)"
+     },
+     "20": {
+      "name": "NX",
+      "state": "advertised"
+     },
+     "26": {
+      "name": "PAGE1GB",
+      "state": "clear"
+     },
+     "27": {
+      "name": "RDTSCP",
+      "state": "advertised"
+     },
+     "29": {
+      "name": "LM",
+      "state": "advertised"
+     }
+    }
+   },
+   "note": "ECX/EDX per CPU 16. EAX = leaf-1 signature is NOT stated in the records (Table 3-8 calls it \"extended processor signature\"): OPEN, chosen to equal CPUID.1.EAX."
+  },
+  {
+   "leaf": "0x80000002",
+   "subleaf": null,
+   "eax": "0x6574614e",
+   "ebx": "0x5620756d",
+   "ecx": "0x75747269",
+   "edx": "0x78206c61",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "brand string \"Natemu Virtual x86-64 CPU\", NUL padded to 48 bytes"
+  },
+  {
+   "leaf": "0x80000003",
+   "subleaf": null,
+   "eax": "0x362d3638",
+   "ebx": "0x50432034",
+   "ecx": "0x55",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "brand string \"Natemu Virtual x86-64 CPU\", NUL padded to 48 bytes"
+  },
+  {
+   "leaf": "0x80000004",
+   "subleaf": null,
+   "eax": "0x0",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "brand string \"Natemu Virtual x86-64 CPU\", NUL padded to 48 bytes"
+  },
+  {
+   "leaf": "0x80000005",
+   "subleaf": null,
+   "eax": "0x0",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)"
+  },
+  {
+   "leaf": "0x80000006",
+   "subleaf": null,
+   "eax": "0x0",
+   "ebx": "0x0",
+   "ecx": "0x1006040",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "L2 256 KiB, 8-way (encoding 6), 64 B line"
+  },
+  {
+   "leaf": "0x80000007",
+   "subleaf": null,
+   "eax": "0x0",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x100",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "fields": {
+    "edx": {
+     "8": {
+      "name": "INVARIANT_TSC",
+      "state": "advertised"
+     }
+    }
+   }
+  },
+  {
+   "leaf": "0x80000008",
+   "subleaf": null,
+   "eax": "0x3028",
+   "ebx": "0x0",
+   "ecx": "0x0",
+   "edx": "0x0",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "note": "physical 40 bits, linear 48 bits"
+  }
+ ],
+ "control": {
+  "cr0": {
+   "bits": {
+    "PE": {
+     "bit": 0,
+     "gate": "arch",
+     "valid": true
+    },
+    "MP": {
+     "bit": 1,
+     "gate": "arch",
+     "valid": true
+    },
+    "EM": {
+     "bit": 2,
+     "gate": "arch",
+     "valid": true
+    },
+    "TS": {
+     "bit": 3,
+     "gate": "arch",
+     "valid": true
+    },
+    "ET": {
+     "bit": 4,
+     "gate": "arch",
+     "valid": true
+    },
+    "NE": {
+     "bit": 5,
+     "gate": "arch",
+     "valid": true
+    },
+    "WP": {
+     "bit": 16,
+     "gate": "arch",
+     "valid": true
+    },
+    "AM": {
+     "bit": 18,
+     "gate": "arch",
+     "valid": true
+    },
+    "NW": {
+     "bit": 29,
+     "gate": "arch",
+     "valid": true
+    },
+    "CD": {
+     "bit": 30,
+     "gate": "arch",
+     "valid": true
+    },
+    "PG": {
+     "bit": 31,
+     "gate": "arch",
+     "valid": true
+    }
+   },
+   "reserved_high32_gp": true,
+   "extra_rules": [
+    "PG=1 requires PE=1",
+    "NW=1 requires CD=1",
+    "clearing PG in 64-bit mode is #GP",
+    "reserved low bits ignored, not #GP (CPU 12)"
+   ],
+   "source": [
+    "CPU 12 (CLM-03-01-12)",
+    "SDM Vol.3 2.5"
+   ]
+  },
+  "cr4": {
+   "bits": {
+    "VME": {
+     "bit": 0,
+     "gate": "1.edx.VME",
+     "valid": false
+    },
+    "PVI": {
+     "bit": 1,
+     "gate": "1.edx.VME",
+     "valid": false
+    },
+    "TSD": {
+     "bit": 2,
+     "gate": "arch",
+     "valid": true
+    },
+    "DE": {
+     "bit": 3,
+     "gate": "1.edx.DE",
+     "valid": true
+    },
+    "PSE": {
+     "bit": 4,
+     "gate": "1.edx.PSE",
+     "valid": true
+    },
+    "PAE": {
+     "bit": 5,
+     "gate": "1.edx.PAE",
+     "valid": true
+    },
+    "MCE": {
+     "bit": 6,
+     "gate": "1.edx.MCE",
+     "valid": false
+    },
+    "PGE": {
+     "bit": 7,
+     "gate": "1.edx.PGE",
+     "valid": true
+    },
+    "PCE": {
+     "bit": 8,
+     "gate": "arch",
+     "valid": true
+    },
+    "OSFXSR": {
+     "bit": 9,
+     "gate": "1.edx.FXSR",
+     "valid": true
+    },
+    "OSXMMEXCPT": {
+     "bit": 10,
+     "gate": "1.edx.SSE",
+     "valid": true
+    },
+    "UMIP": {
+     "bit": 11,
+     "gate": "7.0.ecx.UMIP",
+     "valid": true
+    },
+    "LA57": {
+     "bit": 12,
+     "gate": "7.0.ecx.LA57",
+     "valid": false
+    },
+    "VMXE": {
+     "bit": 13,
+     "gate": "1.ecx.VMX",
+     "valid": false
+    },
+    "SMXE": {
+     "bit": 14,
+     "gate": "1.ecx.SMX",
+     "valid": false
+    },
+    "FSGSBASE": {
+     "bit": 16,
+     "gate": "7.0.ebx.FSGSBASE",
+     "valid": true
+    },
+    "PCIDE": {
+     "bit": 17,
+     "gate": "1.ecx.PCID",
+     "valid": false
+    },
+    "OSXSAVE": {
+     "bit": 18,
+     "gate": "1.ecx.XSAVE",
+     "valid": true
+    },
+    "KL": {
+     "bit": 19,
+     "gate": "7.0.ecx.KL",
+     "valid": false
+    },
+    "SMEP": {
+     "bit": 20,
+     "gate": "7.0.ebx.SMEP",
+     "valid": true
+    },
+    "SMAP": {
+     "bit": 21,
+     "gate": "7.0.ebx.SMAP",
+     "valid": false
+    },
+    "PKE": {
+     "bit": 22,
+     "gate": "7.0.ecx.PKU",
+     "valid": false
+    },
+    "CET": {
+     "bit": 23,
+     "gate": "7.0.ecx.CET_SS",
+     "valid": false
+    },
+    "PKS": {
+     "bit": 24,
+     "gate": "7.0.ecx.PKS",
+     "valid": false
+    },
+    "UINTR": {
+     "bit": 25,
+     "gate": "7.0.edx.UINTR",
+     "valid": false
+    }
+   },
+   "extra_rules": [
+    "changing PAE or LA57 in IA-32e mode is #GP",
+    "bits above 25 reserved"
+   ],
+   "source": [
+    "CPU 12 (CLM-03-01-12)",
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.3 2.5 (each bit is valid only if its CPUID feature is present)"
+   ],
+   "note": "PCE and TSD have no CPUID gate. The plan lists PCE valid, but CPUID.0AH = 0 so RDPMC has no counters (see census flags)."
+  },
+  "efer": {
+   "bits": {
+    "SCE": {
+     "bit": 0,
+     "gate": "arch",
+     "valid": true
+    },
+    "LME": {
+     "bit": 8,
+     "gate": "arch",
+     "valid": true
+    },
+    "LMA": {
+     "bit": 10,
+     "gate": "arch-ro",
+     "valid": true
+    },
+    "NXE": {
+     "bit": 11,
+     "gate": "0x80000001.edx.NX",
+     "valid": true
+    }
+   },
+   "source": [
+    "CPU 10 (CLM-03-01-10)",
+    "CPU 12 (CLM-03-01-12)",
+    "Intel Vol.4 Table 2-2"
+   ]
+  },
+  "cr3": {
+   "reserved_above": "MAXPHYADDR (bit 40 and up) with PCIDE=0; low bits ignored",
+   "source": [
+    "CPU 12 (CLM-03-01-12)"
+   ]
+  },
+  "xcr0": {
+   "supported_mask": "0x7",
+   "reset": "0x1",
+   "rules": [
+    "bit 0 must be 1",
+    "bit 2 requires bit 1",
+    "no bit outside the supported mask"
+   ],
+   "valid_values": [
+    "0x1",
+    "0x3",
+    "0x7"
+   ],
+   "source": [
+    "CPU 12 (CLM-03-01-12)",
+    "CPU 16 (CLM-03-01-16)"
+   ]
+  }
+ },
+ "msrs": [
+  {
+   "index": "0x10",
+   "name": "IA32_TIME_STAMP_COUNTER",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [],
+   "side_effects": [
+    "write sets the per-vCPU offset; crystal and LAPIC countdown unchanged; read = common TSC + offset"
+   ],
+   "source": [
+    "CPU 13 (CLM-03-01-13)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "kernel": [
+    "reached as RDTSC/RDTSCP, not by a WRMSR in the fetched sources"
+   ],
+   "note": "Linux boot sets TSC through tsc_adjust/sync only when TSC_ADJUST exists: not advertised"
+  },
+  {
+   "index": "0x17",
+   "name": "IA32_PLATFORM_ID",
+   "scope": "per_vcpu",
+   "access": "ro",
+   "reset": "0x0",
+   "writable_mask": null,
+   "write_rules": [
+    "always_gp_on_write"
+   ],
+   "side_effects": [],
+   "source": [
+    "CPU 17 (CLM-03-01-17)"
+   ],
+   "kernel": [
+    "microcode Intel loader reads it"
+   ]
+  },
+  {
+   "index": "0x1b",
+   "name": "IA32_APIC_BASE",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0xfee00800",
+   "writable_mask": "0xfffffffd00",
+   "write_rules": [
+    "reserved_gp",
+    "apic_base_extd_needs_en"
+   ],
+   "side_effects": [
+    "EN/EXTD select LAPIC mode; EN clear clears CPUID.1.EDX.APIC; base moves the MMIO page; BSP (bit 8) is stored. Mode transitions that need the current value (SDM Vol.3 13.12.5, Figure 13-37), for the LAPIC chunk: x2APIC -> xAPIC (EN=1, EXTD 1 -> 0) and disabled -> x2APIC (EN 0 -> 1 with EXTD=1) are #GP; xAPIC -> x2APIC and x2APIC -> disabled are allowed (not modelled statelessly here)"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.3 13.4 (IA32_APIC_BASE: BSP bit 8, EXTD bit 10, EN bit 11, base 35:12 up to MAXPHYADDR)",
+    "SDM Vol.4 Table 2-2 IA32_APIC_BASE: 7:0 reserved, 8 BSP flag (R/W), 9 reserved, 10 EXTD, 11 EN, MAXPHYADDR-1:12 base, 63:MAXPHYADDR reserved"
+   ],
+   "reset_bsp": "0xfee00900",
+   "kernel": [
+    "K kernel/apic/apic.c:1713-1729 (disable then set EXTD)",
+    "apic.c:1180-1182,1965-1993,2465-2468"
+   ],
+   "note": "Reset 0xfee00900 for the BSP (BSP bit 8), 0xfee00800 for APs: SDM default base, not stated in a CPU record. Bit 8 is R/W (SDM Vol.4 Table 2-2; KVM's reserved mask is 0x2ff and the bits above MAXPHYADDR): writable, so the BSP may write back the value it reads."
+  },
+  {
+   "index": "0x79",
+   "name": "IA32_BIOS_UPDT_TRIG",
+   "scope": "per_vcpu",
+   "access": "none",
+   "reset": "0x0",
+   "writable_mask": null,
+   "write_rules": [
+    "always_gp"
+   ],
+   "side_effects": [],
+   "source": [
+    "CPU 17 (CLM-03-01-17)"
+   ],
+   "note": "read and write #GP(0); no guest buffer is dereferenced"
+  },
+  {
+   "index": "0x8b",
+   "name": "IA32_BIOS_SIGN_ID (UCODE_REV)",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffff00000000",
+   "write_rules": [
+    "ucode_low32_zero"
+   ],
+   "side_effects": [
+    "per-vCPU 64-bit latch; WRMSR stores the high 32 only; CPUID.1 execution refreshes the high 32 to 0 (virtual revision 0); reads return the latch"
+   ],
+   "source": [
+    "CPU 17 (CLM-03-01-17)"
+   ],
+   "kernel": [
+    "K include/asm/microcode.h:62-75 (write 0, CPUID 1, read high half)",
+    "kernel/cpu/intel.c:246"
+   ]
+  },
+  {
+   "index": "0xfe",
+   "name": "IA32_MTRRCAP",
+   "scope": "per_vcpu",
+   "access": "ro",
+   "reset": "0x508",
+   "writable_mask": null,
+   "write_rules": [
+    "always_gp_on_write"
+   ],
+   "side_effects": [],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.3 11.11.1 (VCNT 7:0, FIX bit 8, WC bit 10)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:587"
+   ],
+   "note": "VCNT = 8, FIX = 1, WC = 1, SMRR = 0"
+  },
+  {
+   "index": "0x10a",
+   "name": "IA32_ARCH_CAPABILITIES",
+   "scope": "per_vcpu",
+   "access": "ro",
+   "reset": "0x400000000c00e140",
+   "writable_mask": null,
+   "write_rules": [
+    "always_gp_on_write"
+   ],
+   "side_effects": [
+    "the host sets RDCL_NO (bit 0, `host_bits`) at start-up only when the page-walk speculation-barrier switch is on AND the host reports FEAT_CSV3 (sysctl hw.optional.arm.FEAT_CSV3 = 1); off by default (owner, November 5)"
+   ],
+   "host_bits": {
+    "mask": "0x1",
+    "condition": "speculation-barrier switch on AND FEAT_CSV3"
+   },
+   "bits": {
+    "0": {
+     "name": "RDCL_NO",
+     "value": "1 only with the speculation-barrier switch on and host FEAT_CSV3 (both; default switch off so 0)",
+     "why": "\"not susceptible to Rogue Data Cache Load\". Translated CPL-3 code runs at EL0 in the user shadow space, which holds only translations the walker granted at CPL 3 (a supervisor page has no EL0 mapping); the resident's private region with the guest-RAM alias is EL1-only; FEAT_CSV3 keeps a faulting load's data from feeding speculative execution. With the barrier switch on, every resident access on the guest's behalf uses an address paging::walk returned, and walk masks each non-leaf level's next-table base with a conditional select to 0 plus CSDB (checking present, the reserved bits 51:40 and PS) and ends the leaf's permission check in an Arm SB. Coupled (owner, Nov 5): advertised only when the barriers run, and off by default, so a default command line keeps PTI (expected). See the PCID plan P1 'Measured (P1)' and tools/check_resident_barriers.py."
+    },
+    "1": {
+     "name": "IBRS_ALL",
+     "value": 0,
+     "why": "no IA32_SPEC_CTRL (enhanced IBRS is a control natemu does not have)"
+    },
+    "2": {
+     "name": "RSBA",
+     "value": 0,
+     "why": "not evaluated (owner, November 5: out of scope); 0 as Linux saw it before"
+    },
+    "3": {
+     "name": "SKIP_L1DFL_VMENTRY",
+     "value": 0,
+     "why": "VMX not presented"
+    },
+    "4": {
+     "name": "SSB_NO",
+     "value": 0,
+     "why": "speculative store bypass is general out-of-order behaviour of the host; the host has no SSBS control (FEAT_SSBS = 0)"
+    },
+    "5": {
+     "name": "MDS_NO",
+     "value": 0,
+     "why": "owner decision November 5 (PCID plan): the host's load value and address predictors (FLOP, SLAP) are not published as tagged by ASID or exception level, and an emulated VERW cannot clear them"
+    },
+    "6": {
+     "name": "IF_PSCHANGE_MC_NO",
+     "value": 1,
+     "why": "no machine check is ever raised (MCE/MCA not presented); a code page's size change without invalidation is handled by the shadow and code caches, never a machine check"
+    },
+    "7": {
+     "name": "TSX_CTRL",
+     "value": 0,
+     "why": "no IA32_TSX_CTRL (TSX not presented)"
+    },
+    "8": {
+     "name": "TAA_NO",
+     "value": 1,
+     "why": "TAA needs Intel TSX; RTM and HLE are not presented (Intel TAA guidance: CPUs that do not support Intel TSX are not affected)"
+    },
+    "13": {
+     "name": "SBDR_SSDP_NO",
+     "value": 1,
+     "why": "MMIO is an exit to natemu's device models and mapped RAM is ordinary memory: no shared (uncore) buffer an MMIO read could return stale data from"
+    },
+    "14": {
+     "name": "FBSDP_NO",
+     "value": 1,
+     "why": "as SBDR_SSDP_NO: no fill-buffer stale-data propagation through MMIO; host buffer sampling in general is MDS_NO's question (kept 0)"
+    },
+    "15": {
+     "name": "PSDP_NO",
+     "value": 1,
+     "why": "as FBSDP_NO, for the primary stale-data propagator"
+    },
+    "17": {
+     "name": "FB_CLEAR",
+     "value": 0,
+     "why": "VERW clears nothing on the host (MD_CLEAR also 0)"
+    },
+    "18": {
+     "name": "FB_CLEAR_CTRL",
+     "value": 0,
+     "why": "no IA32_MCU_OPT_CTRL"
+    },
+    "19": {
+     "name": "RRSBA",
+     "value": 0,
+     "why": "not evaluated (owner, November 5: out of scope); 0 as Linux saw it before"
+    },
+    "20": {
+     "name": "BHI_NO",
+     "value": 0,
+     "why": "host branch-predictor behaviour, not claimed"
+    },
+    "24": {
+     "name": "PBRSB_NO",
+     "value": 0,
+     "why": "host return-predictor behaviour, not claimed"
+    },
+    "25": {
+     "name": "GDS_CTRL",
+     "value": 0,
+     "why": "no IA32_MCU_OPT_CTRL"
+    },
+    "26": {
+     "name": "GDS_NO",
+     "value": 1,
+     "why": "GDS is the gather unit forwarding stale vector-register data; natemu has no gather unit: AVX2 gathers are translated to ordinary loads"
+    },
+    "27": {
+     "name": "RFDS_NO",
+     "value": 1,
+     "why": "RFDS is a flaw of Intel Atom register files; the guest's registers live in host registers and memory, no such register file"
+    },
+    "28": {
+     "name": "RFDS_CLEAR",
+     "value": 0,
+     "why": "VERW clears nothing on the host"
+    },
+    "62": {
+     "name": "ITS_NO",
+     "value": 1,
+     "why": "Intel designates the bit for a hypervisor to tell a guest it is not affected by Indirect Target Selection (Intel ITS guidance, Migration Pools: 1 = not affected; the CPUID-enumeration document 8.0 and SDM Vol.4 093 print the two values' meanings swapped, the ITS page, the bit's name and Linux read 1 as not affected); ITS is a flaw of Intel's branch-target selection, which no host predictor implements. Spectre v2 stays reported, so Linux keeps its Spectre v2 mitigation"
+    },
+    "other": {
+     "value": 0,
+     "why": "controls, MSR enumerations and reserved bits natemu does not have (9-12, 16, 21-23, 29-61, 63)"
+    }
+   },
+   "source": [
+    "PCID plan P1 (owner policy: accurate bits; MDS_NO decision November 5; RSBA/RRSBA out of scope)",
+    "Intel CPUID Enumeration and Architectural MSRs 8.0 (10/22/2026), artifacts/research/track01/source-snapshots/2026-11-05/cpuid-enum.txt",
+    "SDM Vol.4 335592-093 Table 2-2 10AH (R/O), artifacts/research/track01/source-snapshots/2026-11-05/sdm-vol4-table2-2-ia32-arch-capabilities.txt",
+    "Intel guidance pages TAA, MMIO stale data, GDS, RFDS, ITS, RDCL (artifacts/research/track01/source-snapshots/2026-11-05/MANIFEST.md)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:1320-1321 (read when CPUID.7.0:EDX[29])",
+    "kernel/cpu/common.c cpu_set_bug_bits",
+    "kernel/apic/apic.c:1696-1700 (XAPIC_DISABLE_STATUS only with bit 21)"
+   ],
+   "note": "Read-only (SDM Vol.4: R/O): WRMSR #GP(0). RDCL_NO (bit 0) is the only host-conditional bit; it needs the speculation-barrier switch on and host FEAT_CSV3. Known gap for the correctness pass (not RDCL's paging definition): a caller reading Translation.gpa from an Err result under a mispredicted Ok/Err branch, and the non-paging limit checks in segments::descriptor and the TSS I/O-bitmap (Spectre-v1-shaped, older than P1) are not covered by the walk's barriers."
+  },
+  {
+   "index": "0x174",
+   "name": "IA32_SYSENTER_CS",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [],
+   "side_effects": [
+    "validated before commit; used by SYSENTER (CPUID.1.EDX.SEP advertised)"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.2D WRMSR (canonical check list includes IA32_SYSENTER_ESP/EIP)",
+    "SDM Vol.4 Table 2-2 IA32_SYSENTER_CS: 15:0 CS selector (R/W), 31:16 and 63:32 not used, can be read and written"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2019-2021 (unsafe, gated on SEP)",
+    "common.c:2131-2139 (_safe)"
+   ],
+   "note": "All 64 bits are stored: bits 63:16 are 'not used, can be read and written' (SDM Vol.4 Table 2-2). QEMU keeps only 15:0 (a QEMU deviation)."
+  },
+  {
+   "index": "0x175",
+   "name": "IA32_SYSENTER_ESP",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "canonical"
+   ],
+   "side_effects": [
+    "validated before commit; used by SYSENTER (CPUID.1.EDX.SEP advertised)"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.2D WRMSR (canonical check list includes IA32_SYSENTER_ESP/EIP)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2019-2021 (unsafe, gated on SEP)",
+    "common.c:2131-2139 (_safe)"
+   ]
+  },
+  {
+   "index": "0x176",
+   "name": "IA32_SYSENTER_EIP",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "canonical"
+   ],
+   "side_effects": [
+    "validated before commit; used by SYSENTER (CPUID.1.EDX.SEP advertised)"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.2D WRMSR (canonical check list includes IA32_SYSENTER_ESP/EIP)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2019-2021 (unsafe, gated on SEP)",
+    "common.c:2131-2139 (_safe)"
+   ]
+  },
+  {
+   "index": "0x1a0",
+   "name": "IA32_MISC_ENABLE",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x1801",
+   "writable_mask": "0x401881",
+   "write_rules": [
+    "misc_enable"
+   ],
+   "side_effects": [
+    "bit 22 commits the CPUID dispatch generation (max basic leaf 2); bits 7/11/12 are fixed 0/1/1 and writes to them are ignored; INIT preserves, cold reset = 0x1801"
+   ],
+   "source": [
+    "CPU 17 (CLM-03-01-17)",
+    "Intel Vol.4 Table 2-20 (model 3c row)"
+   ],
+   "kernel": [
+    "K kernel/cpu/intel.c:233 (clear bit 22)",
+    "intel.c:333 (read: fast string)",
+    "verify_cpu.S:93-97 (plan row)"
+   ],
+   "note": "A write is accepted iff every set bit is within {0,7,11,12,22}; then only bits 0 and 22 are committed and 7/11/12 read back as 0/1/1 (CPU 17).",
+   "committed_bits": "0x400001"
+  },
+  {
+   "index": "0x200",
+   "name": "IA32_MTRR_PHYSBASE0",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x201",
+   "name": "IA32_MTRR_PHYSMASK0",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x202",
+   "name": "IA32_MTRR_PHYSBASE1",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x203",
+   "name": "IA32_MTRR_PHYSMASK1",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x204",
+   "name": "IA32_MTRR_PHYSBASE2",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x205",
+   "name": "IA32_MTRR_PHYSMASK2",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x206",
+   "name": "IA32_MTRR_PHYSBASE3",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x207",
+   "name": "IA32_MTRR_PHYSMASK3",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x208",
+   "name": "IA32_MTRR_PHYSBASE4",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x209",
+   "name": "IA32_MTRR_PHYSMASK4",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x20a",
+   "name": "IA32_MTRR_PHYSBASE5",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x20b",
+   "name": "IA32_MTRR_PHYSMASK5",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x20c",
+   "name": "IA32_MTRR_PHYSBASE6",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x20d",
+   "name": "IA32_MTRR_PHYSMASK6",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x20e",
+   "name": "IA32_MTRR_PHYSBASE7",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff0ff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "MTRR write: TLB invalidation including global entries (CPU 9); memory-policy generation"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (type 7:0, base 39:12 for MAXPHYADDR 40)"
+   ],
+   "kernel": [
+    "K kernel/cpu/mtrr/mtrr.c:584-600, cacheinfo.c:1115-1129 (when MTRRdefType.E=1)"
+   ]
+  },
+  {
+   "index": "0x20f",
+   "name": "IA32_MTRR_PHYSMASK7",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xfffffff800",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "as above"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.3 (V bit 11, mask 39:12)"
+   ]
+  },
+  {
+   "index": "0x250",
+   "name": "IA32_MTRR_FIX64K_00000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x258",
+   "name": "IA32_MTRR_FIX16K_80000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x259",
+   "name": "IA32_MTRR_FIX16K_A0000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x268",
+   "name": "IA32_MTRR_FIX4K_C0000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x269",
+   "name": "IA32_MTRR_FIX4K_C8000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x26a",
+   "name": "IA32_MTRR_FIX4K_D0000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x26b",
+   "name": "IA32_MTRR_FIX4K_D8000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x26c",
+   "name": "IA32_MTRR_FIX4K_E0000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x26d",
+   "name": "IA32_MTRR_FIX4K_E8000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x26e",
+   "name": "IA32_MTRR_FIX4K_F0000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x26f",
+   "name": "IA32_MTRR_FIX4K_F8000",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "mtrr_type_all_bytes"
+   ],
+   "side_effects": [
+    "as PHYSBASE"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.2"
+   ]
+  },
+  {
+   "index": "0x277",
+   "name": "IA32_PAT",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x7040600070406",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "pat_type_all_bytes"
+   ],
+   "side_effects": [
+    "memory-policy generation; walker must evaluate PAT (plan M2); INIT retains, cold reset 0x0007040600070406"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.12.2 (reset value; valid types 0,1,4,5,6,7)"
+   ],
+   "kernel": [
+    "K mm/pat/memtype.c:234 (write), :257-258 (read), :344 (WB,WC,UC-,UC,WB,WP,UC-,WT)"
+   ]
+  },
+  {
+   "index": "0x2ff",
+   "name": "IA32_MTRR_DEF_TYPE",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xcff",
+   "write_rules": [
+    "mtrr_type_low_byte",
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "E (bit 11) and FE (bit 10) enable/disable all MTRRs; cache-disable sequence in Linux (CR0.CD + WBINVD)"
+   ],
+   "source": [
+    "CPU 16 (CLM-03-01-16)",
+    "CPU 9 (CLM-03-01-09)",
+    "SDM Vol.3 11.11.2.1"
+   ],
+   "kernel": [
+    "K kernel/cpu/cacheinfo.c:1052-1110 (CD set + WBINVD around programming)"
+   ],
+   "note": "0 shown is the architectural reset (E = 0). The virtual firmware then sets the selected parameters.mtrr_initial state (owner decision Oct 28): DEF_TYPE 0xc06."
+  },
+  {
+   "index": "0xc0000080",
+   "name": "IA32_EFER",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xd01",
+   "write_rules": [
+    "efer"
+   ],
+   "side_effects": [
+    "LMA derived (ignored in the written value); LME change with CR0.PG=1 is #GP (CPU 10); SCE changes syscall admission; NXE changes paging reserved-bit interpretation; end shadow/dispatch assumptions"
+   ],
+   "source": [
+    "CPU 10 (CLM-03-01-10)",
+    "CPU 12 (CLM-03-01-12)",
+    "Intel Vol.4 Table 2-2"
+   ],
+   "kernel": [
+    "K kernel/head_64.S:378-396 (SCE+NX)"
+   ],
+   "note": "Bits 8, 0, 11 writable; bit 10 (LMA) accepted and ignored; every other bit reserved -> #GP (CPU 10). FFXSR/SVME/TCE etc. are reserved: their CPUID bits are clear."
+  },
+  {
+   "index": "0xc0000081",
+   "name": "IA32_STAR",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [],
+   "side_effects": [
+    "SYSCALL/SYSRET selectors"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2158"
+   ]
+  },
+  {
+   "index": "0xc0000082",
+   "name": "IA32_LSTAR",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "canonical"
+   ],
+   "side_effects": [
+    "SYSCALL RIP"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.2D WRMSR"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2121"
+   ]
+  },
+  {
+   "index": "0xc0000083",
+   "name": "IA32_CSTAR",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [],
+   "side_effects": [
+    "stored, unused by Intel SYSCALL"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2108-2116 (skips the write on Intel)",
+    "common.c:2136 (_cstar via wrmsrl_cstar)"
+   ],
+   "note": "defined, no canonical check (records: canonicality only where the specification requires it)"
+  },
+  {
+   "index": "0xc0000084",
+   "name": "IA32_FMASK (SFMASK)",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffff",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "RFLAGS clear mask on SYSCALL"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)",
+    "SDM Vol.4 Table 2-2 IA32_FMASK: 31:0 system call flag mask (R/W), 63:32 reserved; SDM Vol.3 Figure 5-14 (IA32_FMASK 63:32 reserved); SDM Vol.2D WRMSR: setting a reserved bit is #GP(0)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2146"
+   ],
+   "note": "bits 63:32 reserved (#GP on a set bit), per the SDM citations above"
+  },
+  {
+   "index": "0xc0000100",
+   "name": "IA32_FS_BASE",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "canonical"
+   ],
+   "side_effects": [
+    "same canonical predicate as WRFSBASE"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:1795-1799 (writes 1)",
+    ":2341"
+   ]
+  },
+  {
+   "index": "0xc0000101",
+   "name": "IA32_GS_BASE",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "canonical"
+   ],
+   "side_effects": [
+    "same canonical predicate as WRGSBASE"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:768",
+    "K kernel/head_64.S:61-69,365-368 (plan row)"
+   ]
+  },
+  {
+   "index": "0xc0000102",
+   "name": "IA32_KERNEL_GS_BASE",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffffffffffff",
+   "write_rules": [
+    "canonical"
+   ],
+   "side_effects": [
+    "SWAPGS exchange"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2342"
+   ]
+  },
+  {
+   "index": "0xc0000103",
+   "name": "IA32_TSC_AUX",
+   "scope": "per_vcpu",
+   "access": "rw",
+   "reset": "0x0",
+   "writable_mask": "0xffffffff",
+   "write_rules": [
+    "reserved_gp"
+   ],
+   "side_effects": [
+    "returned in ECX by RDTSCP"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 13 (CLM-03-01-13)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "kernel": [
+    "K kernel/cpu/common.c:2213-2214 (written because RDTSCP is advertised)"
+   ],
+   "note": "upper 32 bits reserved (CPU 9)"
+  },
+  {
+   "index": "0x800",
+   "index_last": "0x8ff",
+   "name": "x2APIC registers",
+   "scope": "per_vcpu",
+   "access": "owned-by-LAPIC",
+   "reset": null,
+   "writable_mask": null,
+   "write_rules": [
+    "lapic_owner"
+   ],
+   "side_effects": [
+    "index holes, read-only, write-only and reserved fields, EOI/ICR effects are the LAPIC owner's; only valid while APIC_BASE.EXTD=1, else #GP"
+   ],
+   "source": [
+    "CPU 9 (CLM-03-01-09)",
+    "CPU 16 (CLM-03-01-16)"
+   ],
+   "note": "register-by-register table belongs to the LAPIC chunk, not S1"
+  }
+ ],
+ "absent_msrs": [
+  {
+   "index": "0x3a",
+   "name": "IA32_FEATURE_CONTROL",
+   "reason": "VMX/SMX/SGX not advertised",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/bugs.c:3149"
+   ]
+  },
+  {
+   "index": "0x3b",
+   "name": "IA32_TSC_ADJUST",
+   "reason": "CPUID.7.0.EBX[1] clear; no TSC_ADJUST",
+   "source": "CPU 9 (CLM-03-01-09), CPU 13 (CLM-03-01-13)",
+   "kernel": [
+    "K kernel/tsc.c:1100 (art, gated)"
+   ]
+  },
+  {
+   "index": "0x4e",
+   "name": "MSR_PPIN_CTL",
+   "reason": "safe probe, #GP handled",
+   "source": "CPU 9 (CLM-03-01-09)",
+   "kernel": [
+    "K kernel/cpu/common.c:154-165 (_safe)"
+   ]
+  },
+  {
+   "index": "0x48",
+   "name": "IA32_SPEC_CTRL",
+   "reason": "no speculative-control MSR contract",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/bugs.c:93,112,158 (gated on MSR_SPEC_CTRL feature)"
+   ]
+  },
+  {
+   "index": "0x33",
+   "name": "MSR_TEST_CTRL",
+   "reason": "safe probe",
+   "source": "CPU 17 (CLM-03-01-17)",
+   "kernel": [
+    "K kernel/cpu/intel.c:997-1005 (_safe)"
+   ]
+  },
+  {
+   "index": "0xbd",
+   "name": "IA32_XAPIC_DISABLE_STATUS",
+   "reason": "gated on ARCH_CAPABILITIES bit",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/apic/apic.c:1696-1700"
+   ]
+  },
+  {
+   "index": "0xce",
+   "name": "MSR_PLATFORM_INFO",
+   "reason": "absent: no CPUID faulting",
+   "source": "CPU 17 (CLM-03-01-17)",
+   "kernel": [
+    "K kernel/cpu/intel.c:528 (_safe)"
+   ]
+  },
+  {
+   "index": "0xcf",
+   "name": "IA32_CORE_CAPABILITIES",
+   "reason": "CPUID.7.0.EDX[30] clear",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/intel.c:1244-1252 (gated)"
+   ]
+  },
+  {
+   "index": "0x119",
+   "name": "MSR_IA32_BBL_CR_CTL",
+   "reason": "CPUID.1.EDX.PSN clear",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/common.c:330-340 (gated on PN)"
+   ]
+  },
+  {
+   "index": "0x123",
+   "name": "IA32_MCU_OPT_CTRL",
+   "reason": "feature-gated; no mitigation MSRs",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/bugs.c:666-851 (gated)"
+   ]
+  },
+  {
+   "index": "0x140",
+   "name": "MSR_MISC_FEATURES_ENABLES",
+   "reason": "absent: no CPUID faulting",
+   "source": "CPU 17 (CLM-03-01-17)",
+   "kernel": [
+    "K kernel/cpu/intel.c:538 (_safe); process.c:344 (gated on CPUID_FAULT)"
+   ]
+  },
+  {
+   "index": "0x179",
+   "name": "IA32_MCG_CAP",
+   "reason": "MCE/MCA not exposed",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": []
+  },
+  {
+   "index": "0x1c4",
+   "name": "IA32_XFD",
+   "reason": "CPUID.D.1.EAX[4] clear",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/fpu/xstate.c:928 (gated)"
+   ]
+  },
+  {
+   "index": "0x1c5",
+   "name": "IA32_XFD_ERR",
+   "reason": "XFD not exposed",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/traps.c:1353-1357 (gated)"
+   ]
+  },
+  {
+   "index": "0x1d9",
+   "name": "IA32_DEBUGCTL",
+   "reason": "not in the accepted whitelist; CPU 16 requires \"selected guest debug behavior\" without optional debug MSRs; reached only by block-step (BTF) and bus-lock detect",
+   "source": "CPU 16 (CLM-03-01-16) (not listed)",
+   "kernel": [
+    "K kernel/process.c:718-722",
+    "K kernel/traps.c:1087-1089",
+    "K kernel/cpu/intel.c:1174-1188 (BUS_LOCK_DETECT gated)"
+   ]
+  },
+  {
+   "index": "0x6a0",
+   "name": "IA32_U_CET",
+   "reason": "CET not advertised",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/common.c:569-629 (gated on IBT/SHSTK)"
+   ]
+  },
+  {
+   "index": "0x6a2",
+   "name": "IA32_S_CET",
+   "reason": "CET not advertised",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/common.c:569-629 (gated on IBT/SHSTK)"
+   ]
+  },
+  {
+   "index": "0x6e0",
+   "name": "IA32_TSC_DEADLINE",
+   "reason": "CPUID.1.ECX[24] clear",
+   "source": "CPU 9 (CLM-03-01-09), CPU 13 (CLM-03-01-13), CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/apic/apic.c:428,452 (gated on TSC_DEADLINE_TIMER)"
+   ]
+  },
+  {
+   "index": "0x982",
+   "name": "IA32_TME_ACTIVATE",
+   "reason": "TME not advertised",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/cpu/intel.c:197 (gated)"
+   ]
+  },
+  {
+   "index": "0xd93",
+   "name": "IA32_PASID",
+   "reason": "not exposed",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/traps.c:708 (gated)"
+   ]
+  },
+  {
+   "index": "0xda0",
+   "name": "IA32_XSS",
+   "reason": "XSAVES/supervisor state not exposed",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/fpu/xstate.c:200-202,653,662,923 (gated on XSAVES)"
+   ]
+  },
+  {
+   "index": "0xc1",
+   "index_last": "0xc8",
+   "name": "IA32_PMCx / PERFEVTSEL range and all PMU MSRs (0x38d..0x391, 0x186..)",
+   "reason": "CPUID.0AH = 0; no PMU",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": []
+  },
+  {
+   "index": "0x400",
+   "index_last": "0x473",
+   "name": "MCi_CTL/STATUS/ADDR/MISC banks and MCG_STATUS/CTL",
+   "reason": "MCE/MCA not exposed",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": []
+  },
+  {
+   "index": "0xc0010000",
+   "index_last": "0xc001ffff",
+   "name": "AMD MSRs (LS_CFG, VIRT_SPEC_CTRL, K8_INT_PENDING_MSG...)",
+   "reason": "Intel identity",
+   "source": "CPU 16 (CLM-03-01-16)",
+   "kernel": [
+    "K kernel/process.c:569-615,980 (AMD paths)"
+   ]
+  }
+ ],
+ "kernel_msr_sites": [
+  {
+   "site": "kernel/cpu/common.c:154-165",
+   "msr": "0x4e",
+   "safe": true,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:338-340",
+   "msr": "0x119",
+   "safe": false,
+   "gate": "1.edx.PSN"
+  },
+  {
+   "site": "kernel/cpu/common.c:569-629",
+   "msr": "0x6a2",
+   "safe": false,
+   "gate": "7.0.edx.CET_IBT"
+  },
+  {
+   "site": "kernel/cpu/common.c:768",
+   "msr": "0xc0000101",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:1321",
+   "msr": "0x10a",
+   "safe": false,
+   "gate": "7.0.edx.ARCH_CAPABILITIES"
+  },
+  {
+   "site": "kernel/cpu/common.c:1795-1799",
+   "msr": "0xc0000100",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:2019-2021",
+   "msr": "0x174",
+   "safe": false,
+   "gate": "1.edx.SEP"
+  },
+  {
+   "site": "kernel/cpu/common.c:2019-2021",
+   "msr": "0x175",
+   "safe": false,
+   "gate": "1.edx.SEP"
+  },
+  {
+   "site": "kernel/cpu/common.c:2019-2021",
+   "msr": "0x176",
+   "safe": false,
+   "gate": "1.edx.SEP"
+  },
+  {
+   "site": "kernel/cpu/common.c:2131-2139",
+   "msr": "0x174",
+   "safe": true,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:2121",
+   "msr": "0xc0000082",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:2116",
+   "msr": "0xc0000083",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:2146",
+   "msr": "0xc0000084",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:2158",
+   "msr": "0xc0000081",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:2214",
+   "msr": "0xc0000103",
+   "safe": false,
+   "gate": "0x80000001.edx.RDTSCP"
+  },
+  {
+   "site": "kernel/cpu/common.c:2341",
+   "msr": "0xc0000100",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/common.c:2342",
+   "msr": "0xc0000102",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/intel.c:233",
+   "msr": "0x1a0",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/intel.c:333",
+   "msr": "0x1a0",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/intel.c:576",
+   "msr": "0x1a0",
+   "safe": false,
+   "gate": "1.edx.DS"
+  },
+  {
+   "site": "kernel/cpu/intel.c:528",
+   "msr": "0xce",
+   "safe": true,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/intel.c:538",
+   "msr": "0x140",
+   "safe": true,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/intel.c:997",
+   "msr": "0x33",
+   "safe": true,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/intel.c:1174-1188",
+   "msr": "0x1d9",
+   "safe": false,
+   "gate": "7.0.ecx.BUS_LOCK_DETECT"
+  },
+  {
+   "site": "kernel/cpu/intel.c:1252",
+   "msr": "0xcf",
+   "safe": false,
+   "gate": "7.0.edx.CORE_CAPABILITIES"
+  },
+  {
+   "site": "kernel/cpu/intel.c:197",
+   "msr": "0x982",
+   "safe": false,
+   "gate": "7.0.ecx.TME_EN"
+  },
+  {
+   "site": "kernel/process.c:718-722",
+   "msr": "0x1d9",
+   "safe": false,
+   "gate": "cond:block-step"
+  },
+  {
+   "site": "kernel/traps.c:1087-1089",
+   "msr": "0x1d9",
+   "safe": false,
+   "gate": "cond:block-step"
+  },
+  {
+   "site": "kernel/process.c:344",
+   "msr": "0x140",
+   "safe": false,
+   "gate": "cond:cpuid-fault"
+  },
+  {
+   "site": "kernel/apic/apic.c:428",
+   "msr": "0x6e0",
+   "safe": false,
+   "gate": "1.ecx.TSC_DEADLINE"
+  },
+  {
+   "site": "kernel/apic/apic.c:1180-1182",
+   "msr": "0x1b",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/apic/apic.c:1700",
+   "msr": "0xbd",
+   "safe": false,
+   "gate": "cond:IA32_ARCH_CAPABILITIES.XAPIC_DISABLE_STATUS (bit 21), clear"
+  },
+  {
+   "site": "kernel/apic/apic.c:1713-1729",
+   "msr": "0x1b",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/apic/apic.c:1965-1993",
+   "msr": "0x1b",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/apic/apic.c:2465-2468",
+   "msr": "0x1b",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "mm/pat/memtype.c:234",
+   "msr": "0x277",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "mm/pat/memtype.c:258",
+   "msr": "0x277",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "include/asm/microcode.h:66",
+   "msr": "0x8b",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "include/asm/microcode.h:72",
+   "msr": "0x8b",
+   "safe": false,
+   "gate": null
+  },
+  {
+   "site": "kernel/cpu/mtrr/mtrr.c:587",
+   "msr": "0xfe",
+   "safe": false,
+   "gate": "1.edx.MTRR"
+  },
+  {
+   "site": "kernel/fpu/xstate.c:201",
+   "msr": "0xda0",
+   "safe": false,
+   "gate": "13.1.eax.XSAVES"
+  },
+  {
+   "site": "kernel/fpu/xstate.c:928",
+   "msr": "0x1c4",
+   "safe": false,
+   "gate": "13.1.eax.XFD"
+  },
+  {
+   "site": "kernel/traps.c:708",
+   "msr": "0xd93",
+   "safe": false,
+   "gate": "cond:pasid"
+  },
+  {
+   "site": "kernel/traps.c:1353-1357",
+   "msr": "0x1c5",
+   "safe": false,
+   "gate": "13.1.eax.XFD"
+  },
+  {
+   "site": "kernel/tsc.c:1100",
+   "msr": "0x3b",
+   "safe": false,
+   "gate": "7.0.ebx.TSC_ADJUST"
+  },
+  {
+   "site": "kernel/cpu/bugs.c:93-158",
+   "msr": "0x48",
+   "safe": false,
+   "gate": "7.0.edx.SPEC_CTRL"
+  },
+  {
+   "site": "kernel/cpu/bugs.c:666-851",
+   "msr": "0x123",
+   "safe": false,
+   "gate": "cond:mitigation-feature"
+  }
+ ],
+ "census_flags": [
+  {
+   "slug": "bmi1-bmi2-lzcnt-tzcnt",
+   "feature": "7.0.ebx.BMI1, 7.0.ebx.BMI2, 0x80000001.ecx.LZCNT",
+   "state": "advertised",
+   "census": "The decompressor code part has 401 BMI-class instructions (table A) with first uses of shlx, lzcnt, tzcnt, shrx, bzhi, andn (table B); in the kernel overall lzcntl x68, tzcntl x8, tzcntq x946 (encoded F3 0F BC, i.e. \"rep bsf\"), shlxq/shrxq x755; vmlinux .text has 1,454 BMI-class instructions.",
+   "meaning": "With BMI1 and ABM advertised, F3 0F BC executes as TZCNT and F3 0F BD as LZCNT (operand size result for a zero source, CF set for zero), not as BSF/BSR. BMI2 forms run in the decompressor. The decoder must pick the TZCNT/LZCNT meaning from the profile, not from the encoding alone.",
+   "audience": "implementers (admission/FEX BMI), owner (Q3 offers dropping BMI)"
+  },
+  {
+   "slug": "cet-shadow-stack",
+   "feature": "7.0.ecx.CET_SS, 7.0.edx.CET_IBT, CR4.CET",
+   "state": "clear (confirmed)",
+   "census": "wrussq x4 (vmlinux .text@ffffffff8109cf0a), xsaves64 x3 / xrstors64 x8 (XSAVES, gated on the XSAVES bit, which is clear).",
+   "meaning": "CPU 16 keeps CET unadvertised. Linux guards setup on cpu_feature_enabled(IBT/SHSTK) (K kernel/cpu/common.c:568-625) so S_CET/U_CET writes (:569-629) and WRUSS are not reached. If executed anyway: CR4.CET is reserved (#GP on set), WRUSS is #UD without CET, IA32_S_CET/U_CET are absent (#GP).",
+   "audience": "implementers (#UD for WRUSS, XSAVES/XRSTORS)"
+  },
+  {
+   "slug": "rdseed",
+   "feature": "7.0.ebx.RDSEED",
+   "state": "clear (confirmed)",
+   "census": "rdseedq x2 (vmlinux .init.text@ffffffff833c2f04).",
+   "meaning": "arch_get_random_seed_longs tests static_cpu_has(X86_FEATURE_RDSEED) before rdseed_long (K include/asm/archrandom.h:55-58, :27-33), so the two sites are not reached; rdrand.c:47 also clears the bit on a failed self-test. RDSEED executed with the bit clear is expected to #UD per SDM Vol.2 RDSEED (confirm in the S3 entropy chunk).",
+   "audience": "implementers"
+  },
+  {
+   "slug": "smap-clac-stac",
+   "feature": "7.0.ebx.SMAP, CR4.SMAP",
+   "state": "clear (confirmed)",
+   "census": "clac x190 and stac x106, all in .altinstr_replacement (results.md B3).",
+   "meaning": "alternatives apply a replacement only when boot_cpu_has(a->cpuid) (K kernel/alternative.c:636); SMAP is clear, so the original NOP sites stay and CLAC/STAC never run. CR4.SMAP is reserved (the fault-model test for bit 21). setup_smap (common.c:378) does not set CR4.SMAP. If executed anyway CLAC/STAC are #UD without the feature.",
+   "audience": "implementers, fault model (rederived)"
+  },
+  {
+   "slug": "popcnt",
+   "feature": "1.ecx.POPCNT",
+   "state": "advertised",
+   "census": "popcntq x36 / popcntl x30, all in .altinstr_replacement.",
+   "meaning": "POPCNT is advertised, so alternative.c:636 applies those replacements: POPCNT is executed by the kernel (bitmap/hweight paths). It is currently a refused form (class BMI in the census) and must be implemented before boot.",
+   "audience": "implementers (X chunk)"
+  },
+  {
+   "slug": "rdtscp-tsc-aux",
+   "feature": "0x80000001.edx.RDTSCP",
+   "state": "advertised",
+   "census": "rdtscp x19 and rdtsc x19 in .altinstr_replacement; rdtsc x112 overall.",
+   "meaning": "RDTSCP is advertised, so Linux writes IA32_TSC_AUX (K kernel/cpu/common.c:2213-2214) and may use RDTSCP for ordered TSC reads; which of lfence;rdtsc and rdtscp is applied is decided by alternatives order (LFENCE_RDTSC is also set, intel.c:570), so both must work. RDTSCP returns TSC_AUX[31:0] in ECX.",
+   "audience": "implementers"
+  },
+  {
+   "slug": "invpcid-pcid",
+   "feature": "7.0.ebx.INVPCID, 1.ecx.PCID",
+   "state": "clear (confirmed)",
+   "census": "invpcid x2 (system class).",
+   "meaning": "common.c:257-277 clears PCID/INVPCID when absent; CR4.PCIDE is reserved. If executed anyway INVPCID is #UD.",
+   "audience": "implementers"
+  },
+  {
+   "slug": "fsgsbase",
+   "feature": "7.0.ebx.FSGSBASE",
+   "state": "advertised",
+   "census": "rdfsbaseq x4, wrfsbaseq x2, rdgsbaseq x2, wrgsbaseq x4 (system class).",
+   "meaning": "Linux sets CR4.FSGSBASE on every CPU (K kernel/cpu/common.c:2290-2292) and entry code is patched to RDGSBASE/WRGSBASE; they are on every exception entry. #GP for a non-canonical source (CPU 9 sibling-path note).",
+   "audience": "implementers"
+  },
+  {
+   "slug": "pkru-umip-lam-etc",
+   "feature": "7.0.ecx.PKU, UMIP, LA57; 7.0.edx.UINTR",
+   "state": "clear (confirmed)",
+   "census": "rdpkru x18, wrpkru x7, lkgs x2 in vmlinux text.",
+   "meaning": "All guarded by their features (common.c:385-389 UMIP, :524 PKU); CR4.UMIP, PKE, LA57, UINTR are reserved. Previous fault-model profile accepted UMIP, PKE, LA57, VMXE, SMXE and MCE writes; they now #GP.",
+   "audience": "fault model (rederived)"
+  },
+  {
+   "slug": "xsave-family",
+   "feature": "0xd.1.eax (XSAVEOPT, XSAVEC, XGETBV1, XSAVES, XFD)",
+   "state": "clear (confirmed)",
+   "census": "xsave64 x3, xrstor64 x8 (plain); xsaveopt64 x2 and xsavec64 x2 in alternatives; xsaves64 x3 and xrstors64 x8 in XSAVES-gated code.",
+   "meaning": "Plain XSAVE/XRSTOR with XCR0 = 7 is the path; IA32_XSS is only written under X86_FEATURE_XSAVES (K kernel/fpu/xstate.c:200-202). XSAVEOPT/XSAVEC replacements are not applied.",
+   "audience": "implementers (I5b)"
+  },
+  {
+   "slug": "monitor-mwait",
+   "feature": "1.ecx.MONITOR",
+   "state": "clear (confirmed)",
+   "census": "monitor x8, mwait x9, monitorx x1, mwaitx x1.",
+   "meaning": "K kernel/process.c:884 (mwait_usable) returns without MWAIT; idle is HLT (process.c:751-755). Leaf 5 is a zero hole.",
+   "audience": "implementers"
+  },
+  {
+   "slug": "erms-fsrm",
+   "feature": "7.0.ebx.ERMS, 7.0.edx.FSRM",
+   "state": "clear",
+   "census": "rep movsb x103, rep stosb x84.",
+   "meaning": "uaccess_64.h:128-129,192-193 use ALT_NOT(FSRM)/ALT_NOT(FSRS): with the bits clear the kernel calls rep_movs_alternative (rep movsq loops) instead of rep movsb. MISC_ENABLE bit 0 is 1 (fast strings) but ERMS stays unadvertised (CPU 17). The decompressor and user space still execute REP MOVSB/STOSB.",
+   "audience": "implementers (I2)"
+  },
+  {
+   "slug": "rdrand",
+   "feature": "1.ecx.RDRAND",
+   "state": "advertised",
+   "census": "rdrandq x7.",
+   "meaning": "Decompressor KASLR (K lib/kaslr.c:64; has_cpuflag) and the boot self-test (kernel/cpu/rdrand.c:24-47) execute it: typed entropy service with architectural CF; Q3 offers removal.",
+   "audience": "owner (Q3), implementers (S3)"
+  },
+  {
+   "slug": "vmcall-vmmcall-hypervisor",
+   "feature": "1.ecx.HYPERVISOR (set), leaf 0x40000000 NatemuNatemu",
+   "state": "advertised bit, unknown vendor id",
+   "census": "vmcall x12, vmmcall x51, tdcall x3, pvalidate/psmash/rmpadjust/rmpupdate x11, encls x23 in kernel text.",
+   "meaning": "Linux does not recognise NatemuNatemu, so paravirtual hypercall sites are not selected. VMCALL outside VMX operation and VMMCALL on Intel are #UD; ENCLS without SGX is #UD.",
+   "audience": "implementers (#UD checks)"
+  },
+  {
+   "slug": "rdpmc-cr4-pce",
+   "feature": "CR4.PCE (plan lists valid), CPUID.0AH = 0",
+   "state": "bit valid, no counters",
+   "census": "rdpmc x1 (system class).",
+   "meaning": "The plan keeps CR4.PCE valid but the profile has no PMU, so RDPMC for any counter index has nothing to read (SDM: invalid index is #GP). Not a records conflict, an unspecified combination: implementers need a decision (CR4.PCE valid with every RDPMC #GP is the minimal reading).",
+   "audience": "owner/implementers"
+  },
+  {
+   "slug": "x2apic-advertised",
+   "feature": "1.ecx.X2APIC",
+   "state": "advertised",
+   "census": "-",
+   "meaning": "Linux can switch the CPU to x2APIC through IA32_APIC_BASE (K kernel/apic/apic.c:1713-1729), after which LAPIC registers are MSRs 0x800-0x8ff; TSC_DEADLINE (not advertised) is not used, the LAPIC counts down from the 24 MHz crystal (CPU 13).",
+   "audience": "LAPIC chunk"
+  },
+  {
+   "slug": "cpuid-7-1-and-d-1",
+   "feature": "CPUID.7.0.EAX = 0",
+   "state": "confirmed",
+   "census": "-",
+   "meaning": "K kernel/cpu/common.c:1001-1005 reads leaf 7 subleaf 1 only if 7.0.EAX >= 1; our EAX = 0. Leaf 0xD subleaf 1 is read unconditionally (common.c:1007-1009) and returns zero.",
+   "audience": "implementers"
+  },
+  {
+   "slug": "speculation-mitigations",
+   "feature": "7.0.edx.ARCH_CAPABILITIES, SPEC_CTRL, MD_CLEAR",
+   "state": "ARCH_CAPABILITIES advertised (PCID plan P1); SPEC_CTRL, MD_CLEAR clear",
+   "census": "verw x17, wbinvd x23 (system class).",
+   "meaning": "No ARCH_CAPABILITIES, so Linux marks the family 6 model 0x3c identity vulnerable (plan row VERW); the owner boots with mitigations=off, but VERW (a descriptor-checking instruction) is still in the kernel text. IA32_SPEC_CTRL, ARCH_CAPABILITIES, PRED_CMD are absent (#GP); Linux reads them only under feature guards. Since the PCID plan P1, IA32_ARCH_CAPABILITIES is read-only with the accurate bits (the profile entry gives each bit's reason); MD_CLEAR stays clear (owner decision November 5).",
+   "audience": "implementers (VERW), owner"
+  },
+  {
+   "slug": "serialize-clwb-etc",
+   "feature": "7.0.edx.SERIALIZE, 7.0.ebx.CLFLUSHOPT, CLWB, 7.0.ecx.WAITPKG",
+   "state": "clear",
+   "census": "serialize x7, clflushopt x4, clwb x1, tpause x1.",
+   "meaning": "All reached only through alternatives or static_cpu_has (K include/asm/sync_core.h:64); with the bits clear the SERIALIZE sync is replaced by the IRET-based path and the others stay as NOP sites.",
+   "audience": "implementers"
+  },
+  {
+   "slug": "debugctl",
+   "feature": "MSR 0x1d9 (not in the accepted list)",
+   "state": "absent",
+   "census": "-",
+   "meaning": "K kernel/process.c:718-722 and traps.c:1087-1089 touch IA32_DEBUGCTL only for block-stepping (ptrace); the accepted whitelist does not contain it, so it #GPs. The plan chunk S4 (TF and breakpoints) may need it for BTF; decide there.",
+   "audience": "owner (S4)"
+  },
+  {
+   "slug": "open-details",
+   "feature": "various",
+   "state": "open",
+   "census": "-",
+   "meaning": "Not stated by the accepted records and left open in cpu_profile.json: CPUID.0x40000000 EAX, CPUID.0x80000001 EAX, APIC_BASE bit 8 write, SYSENTER_CS / FMASK reserved bits, leaves 0x40000001+, SYSENTER_ESP/EIP canonical check (taken from the SDM WRMSR text, not from the plan list \"FS/GS/KERNEL_GS/LSTAR\").",
+   "audience": "implementers, reviewer"
+  }
+ ]
+}

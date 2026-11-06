@@ -1,0 +1,15 @@
+[package]
+name = "natemu-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# The `natemu` boot stub, a package apart from the library so the library stays dependency-free (dependency policy:
+# docs/restructure/boot-handoff.md §1). Build it alone (`-p natemu-cli`): no `testing` feature.
+[dependencies]
+natemu = { path = "../host" }
+clap.workspace = true
+
+[[bin]]
+name = "natemu"
+path = "src/main.rs"

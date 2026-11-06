@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/abi", "crates/host", "crates/cli", "crates/driver", "crates/runtime"]
+default-members = ["crates/abi", "crates/host", "crates/cli", "crates/driver"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+
+# Host binaries only (the `natemu` stub, the `natemu-host` test driver), from crates.io, pinned in Cargo.lock; the resident, abi and the
+# library take no registry dependency (boot-handoff §1, dependency policy).
+[workspace.dependencies]
+clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "suggestions"] }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[profile.dev]
+panic = "abort"
+
+# Bounded resident text: avoid unrolling volatile architectural-state copies.
+[profile.release.package.natemu-runtime]
+opt-level = "s"

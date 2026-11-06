@@ -1,0 +1,295 @@
+class	mnemonic	operand_shape	count	first_use_region	note
+SSE	ldmxcsr	m	1	vmlinux:.text@ffffffff81051b38	fxsave/ldmxcsr/xsave group
+SSE	emms		1	vmlinux:.text@ffffffff81051bca	
+SSE	movdqu	m,x	3	vmlinux:.text@ffffffff810b297d	
+SSE	movdqa	m,x	3	vmlinux:.text@ffffffff810b2986	
+SSE	movd	r,x	1	vmlinux:.text@ffffffff810b299e	
+SSE	movdqa	x,x	7	vmlinux:.text@ffffffff810b29c0	
+SSE	paddq	x,x	1	vmlinux:.text@ffffffff810b29ca	
+SSE	pxor	m,x	1	vmlinux:.text@ffffffff810b29dc	
+SSE	movd	m,x	16	vmlinux:.text@ffffffff810b29ee	
+SSE	punpckldq	x,x	8	vmlinux:.text@ffffffff810b2a0e	
+SSE	punpcklqdq	x,x	4	vmlinux:.text@ffffffff810b2a16	
+SSE	paddd	x,x	12	vmlinux:.text@ffffffff810b2a1a	
+SSE	pxor	x,x	12	vmlinux:.text@ffffffff810b2a22	
+SSE	pshufb	x,x	4	vmlinux:.text@ffffffff810b2a26	incl. AES/SHA/PCLMUL
+SSE	psrld	i,x	4	vmlinux:.text@ffffffff810b2a39	
+SSE	pslld	i,x	4	vmlinux:.text@ffffffff810b2a3e	
+SSE	por	x,x	4	vmlinux:.text@ffffffff810b2a44	
+SSE	pshufd	i,x,x	6	vmlinux:.text@ffffffff810b2aa8	
+SSE	movdqu	x,m	3	vmlinux:.text@ffffffff810b2bb0	
+AVX	vmovdqu	m,x	3	vmlinux:.text@ffffffff810b2be4	vex/evex
+AVX	vmovd	r,x	1	vmlinux:.text@ffffffff810b2bf2	vex/evex
+AVX	vmovdqa	m,x	2	vmlinux:.text@ffffffff810b2bf6	vex/evex
+AVX	vmovdqa	x,x	3	vmlinux:.text@ffffffff810b2c20	vex/evex
+AVX	vpaddq	x,x,x	1	vmlinux:.text@ffffffff810b2c28	vex/evex
+AVX	vpxor	x,x,x	13	vmlinux:.text@ffffffff810b2c30	vex/evex
+AVX	vmovdqu	m,y	2	vmlinux:.text@ffffffff810b2c35	vex/evex
+AVX	vmovdqa	m,y	2	vmlinux:.text@ffffffff810b2c4f	vex/evex
+AVX	vpermi2d	y,y,y	2	vmlinux:.text@ffffffff810b2c59	vex/evex
+AVX	vmovdqa	y,y	2	vmlinux:.text@ffffffff810b2c65	vex/evex
+AVX	vpaddd	x,x,x	12	vmlinux:.text@ffffffff810b2c6d	vex/evex
+AVX	vprord	i,x,x	8	vmlinux:.text@ffffffff810b2c7a	vex/evex
+AVX	vextracti128	i,y,x	2	vmlinux:.text@ffffffff810b2c90	vex/evex
+AVX	vpshufd	i,x,x	6	vmlinux:.text@ffffffff810b2cb9	vex/evex
+AVX	vmovdqu	x,m	3	vmlinux:.text@ffffffff810b2d46	vex/evex
+AVX	vzeroupper		1	vmlinux:.text@ffffffff810b2d54	vex/evex
+AVX	tilerelease		1	vmlinux:.text@ffffffff81d01048	vex/evex
+x87	fninit		7	dec:.text@1d5d0	
+x87	fnstsw	m	2	dec:.text@1d5d2	
+x87	fnstcw	m	2	dec:.text@1d5d6	
+x87	fxsave	m	1	vmlinux:.init.text@ffffffff83369a1d	fxsave/ldmxcsr/xsave group
+x87	fldl	m	2	vmlinux:.init.text@ffffffff83369aef	
+x87	fdivl	m	1	vmlinux:.init.text@ffffffff83369af5	
+x87	fmull	m	1	vmlinux:.init.text@ffffffff83369afb	
+x87	fsubp	st,m	1	vmlinux:.init.text@ffffffff83369b07	
+x87	fistpl	m	1	vmlinux:.init.text@ffffffff83369b09	
+x87	wait		2	vmlinux:.init.text@ffffffff83369b0d	
+x87	fxsave64	m	4	vmlinux:.init.text@ffffffff8336a7df	fxsave/ldmxcsr/xsave group
+x87	fnclex		1	vmlinux:.text@ffffffff81051bc8	
+x87	fildl	m	1	vmlinux:.text@ffffffff81051bcc	
+x87	fxrstor64	m	5	vmlinux:.text@ffffffff81051c06	fxsave/ldmxcsr/xsave group
+LOCK	lock xaddl	r,m	2557	vmlinux:.init.text@ffffffff83354219	
+LOCK	lock orb	i,m	1250	vmlinux:.init.text@ffffffff83356808	LOCK on an admitted opcode
+LOCK	lock addl	i,m	606	vmlinux:.init.text@ffffffff83358727	LOCK on an admitted opcode
+LOCK	lock andb	i,m	720	vmlinux:.init.text@ffffffff83361875	LOCK on an admitted opcode
+LOCK	lock btrq	r,m	215	vmlinux:.init.text@ffffffff83362b9b	LOCK on an admitted opcode
+LOCK	lock btsq	r,m	340	vmlinux:.init.text@ffffffff83362bc4	LOCK on an admitted opcode
+LOCK	lock xaddq	r,m	136	vmlinux:.init.text@ffffffff83385fc8	
+LOCK	lock incl	m	679	vmlinux:.init.text@ffffffff8338a430	LOCK on an admitted opcode
+LOCK	lock cmpxchgl	r,m	688	vmlinux:.init.text@ffffffff83398230	
+LOCK	lock decl	m	941	vmlinux:.init.text@ffffffff833998f0	LOCK on an admitted opcode
+LOCK	lock incq	m	163	vmlinux:.init.text@ffffffff8339ef31	LOCK on an admitted opcode
+LOCK	lock addq	r,m	152	vmlinux:.init.text@ffffffff8339f534	LOCK on an admitted opcode
+LOCK	lock btsq	i,m	315	vmlinux:.init.text@ffffffff833c1850	LOCK on an admitted opcode
+LOCK	lock subq	r,m	48	vmlinux:.text@ffffffff810036c1	LOCK on an admitted opcode
+LOCK	lock cmpxchgq	r,m	355	vmlinux:.text@ffffffff81012fbb	
+LOCK	lock btrq	i,m	112	vmlinux:.text@ffffffff81014e71	LOCK on an admitted opcode
+LOCK	lock subq	i,m	282	vmlinux:.text@ffffffff810748dd	LOCK on an admitted opcode
+LOCK	lock decq	m	54	vmlinux:.text@ffffffff8107ec2c	LOCK on an admitted opcode
+LOCK	lock cmpxchgb	r,m	6	vmlinux:.text@ffffffff8109781c	
+LOCK	lock addq	i,m	100	vmlinux:.text@ffffffff810d292f	LOCK on an admitted opcode
+LOCK	lock orl	i,m	36	vmlinux:.text@ffffffff8112698a	LOCK on an admitted opcode
+LOCK	lock orl	r,m	6	vmlinux:.text@ffffffff8113b024	LOCK on an admitted opcode
+LOCK	lock andq	i,m	9	vmlinux:.text@ffffffff81149db1	LOCK on an admitted opcode
+LOCK	lock subl	i,m	22	vmlinux:.text@ffffffff8117211e	LOCK on an admitted opcode
+LOCK	lock subl	r,m	72	vmlinux:.text@ffffffff81180f06	LOCK on an admitted opcode
+LOCK	lock addl	r,m	98	vmlinux:.text@ffffffff8119c107	LOCK on an admitted opcode
+LOCK	lock andl	r,m	5	vmlinux:.text@ffffffff811b8777	LOCK on an admitted opcode
+LOCK	lock xorl	r,m	1	vmlinux:.text@ffffffff8127734b	LOCK on an admitted opcode
+LOCK	lock xorq	r,m	1	vmlinux:.text@ffffffff81277523	LOCK on an admitted opcode
+LOCK	lock orq	r,m	1	vmlinux:.text@ffffffff81277598	LOCK on an admitted opcode
+LOCK	lock andq	r,m	6	vmlinux:.text@ffffffff812775d4	LOCK on an admitted opcode
+LOCK	lock xorb	r,m	1	vmlinux:.text@ffffffff8131ff75	LOCK on an admitted opcode
+LOCK	lock xorb	i,m	21	vmlinux:.text@ffffffff813200e9	LOCK on an admitted opcode
+LOCK	lock cmpxchg16b	m	5	vmlinux:.text@ffffffff813b9ebc	
+LOCK	lock andl	i,m	10	vmlinux:.text@ffffffff8161d722	LOCK on an admitted opcode
+LOCK	lock cmpxchgw	r,m	2	vmlinux:.text@ffffffff81862941	
+LOCK	lock orq	i,m	4	vmlinux:.text@ffffffff81d0cf10	LOCK on an admitted opcode
+LOCK	lock btsl	i,m	1	vmlinux:.text@ffffffff81d12d38	LOCK on an admitted opcode
+string	rep stosl	r,m	600	dec:.text@a9	
+string	rep movsq	m,m	423	dec:.text@2aa	
+string	rep stosq	r,m	4326	dec:.text@29	
+string	rep movsl	m,m	158	dec:.text@1a3f3	
+string	rep cmpsb	m,m	3	dec:.text@1cc75	
+string	rep movsb	m,m	103	dec:.text@1d1e5	
+string	rep stosb	r,m	84	vmlinux:.init.text@ffffffff83354844	
+string	movsb	m,m	8	vmlinux:.text@ffffffff816bc6b8	
+string	movsw	m,m	4	vmlinux:.text@ffffffff81750757	
+string	rep stosw	r,m	16	vmlinux:.text@ffffffff817b91a9	
+system	cli		475	dec:.text@1	
+system	lgdtl	m	1	dec:.text@1a	
+system	movl	r,sr	112	dec:.text@22	
+system	lretl		3	dec:.text@3b	
+system	movl	cr,r	1	dec:.text@76	
+system	movl	r,cr	3	dec:.text@7c	
+system	rdmsr		60	dec:.text@10b	
+system	wrmsr		81	dec:.text@111	
+system	lldtw	r	3	dec:.text@115	
+system	ltrw	r	3	dec:.text@11d	
+system	lgdtq	m	8	dec:.text@257	
+system	lretq		3	dec:.text@264	
+system	movq	cr,r	77	dec:.text@276	
+system	movq	r,cr	76	dec:.text@27e	
+system	popfq		22	dec:.text@292	
+system	hlt		12	dec:.text@49	
+system	pushfq		539	dec:.text@52	
+system	cpuid		59	dec:.text@5b	
+system	outb	r,r	279	dec:.text@156	
+system	inb	r,r	155	dec:.text@164	
+system	outw	r,r	45	dec:.text@176	
+system	rdtsc		112	dec:.text@1e01f	
+system	clflush	m	14	dec:.text@1f392	
+system	lidtq	m	6	dec:.text@1fb8a	
+system	vmmcall		51	vmlinux:.text@ffffffff8100002b	
+system	xgetbv		5	vmlinux:.text@ffffffff81000303	
+system	ud2		9839	vmlinux:.text@ffffffff8100062c	
+system	rmpadjust		6	vmlinux:.text@ffffffff81000965	
+system	iretq		12	vmlinux:.init.text@ffffffff8336474f	
+system	inb	i,r	42	vmlinux:.init.text@ffffffff8336af39	
+system	vmcall		12	vmlinux:.init.text@ffffffff83374092	
+system	inl	r,r	40	vmlinux:.init.text@ffffffff833740b5	
+system	outb	r,i	118	vmlinux:.init.text@ffffffff8337ab3c	
+system	movw	sr,r	47	vmlinux:.init.text@ffffffff833864ce	
+system	outl	r,r	40	vmlinux:.init.text@ffffffff833da815	
+system	sti		569	vmlinux:.text@ffffffff81005528	
+system	pvalidate		3	vmlinux:.text@ffffffff81005d62	
+system	inw	i,r	2	vmlinux:.text@ffffffff81029c01	
+system	outw	r,i	2	vmlinux:.text@ffffffff81029c22	
+system	outl	r,i	1	vmlinux:.text@ffffffff81029c2a	
+system	outsb	m,r	1	vmlinux:.text@ffffffff8102d06a	
+system	syscall		2	vmlinux:.text@ffffffff8103328b	
+system	sgdtq	m	4	vmlinux:.text@ffffffff8103c402	
+system	movl	sr,r	49	vmlinux:.text@ffffffff8103c418	
+system	rdfsbaseq	r	4	vmlinux:.text@ffffffff8103e6ab	
+system	wrfsbaseq	r	2	vmlinux:.text@ffffffff8103ed00	
+system	rdpkru		18	vmlinux:.text@ffffffff8103ed18	
+system	wrpkru		7	vmlinux:.text@ffffffff8103ed2f	
+system	larl	r,r	2	vmlinux:.text@ffffffff8103fc05	
+system	serialize		7	vmlinux:.text@ffffffff8104acde	
+system	verw	m	17	vmlinux:.text@ffffffff8105096f	
+system	wbinvd		23	vmlinux:.text@ffffffff810509ad	
+system	xsetbv		2	vmlinux:.text@ffffffff81054a15	
+system	lkgs	r	2	vmlinux:.text@ffffffff8105b804	
+system	invlpg	m	3	vmlinux:.text@ffffffff8106de93	
+system	encls		23	vmlinux:.text@ffffffff8107b813	
+system	ljmpl	*m	1	vmlinux:.text@ffffffff81083344	
+system	monitor		8	vmlinux:.text@ffffffff81085b25	
+system	mwait		9	vmlinux:.text@ffffffff81085b2e	
+system	strl	r	1	vmlinux:.text@ffffffff81098ef4	
+system	rdpmc		1	vmlinux:.text@ffffffff81099017	
+system	invpcid	m,r	2	vmlinux:.text@ffffffff810a8807	
+system	psmash		1	vmlinux:.text@ffffffff810bc912	
+system	rmpupdate		1	vmlinux:.text@ffffffff810bcb3e	
+system	inw	r,r	12	vmlinux:.text@ffffffff816ac728	
+system	rep insb	r,m	1	vmlinux:.text@ffffffff816acf62	
+system	rep insw	r,m	1	vmlinux:.text@ffffffff816ad038	
+system	rep insl	r,m	1	vmlinux:.text@ffffffff816ad114	
+system	rep outsb	m,r	2	vmlinux:.text@ffffffff816ad1f4	
+system	rep outsw	m,r	1	vmlinux:.text@ffffffff816ad2d8	
+system	rep outsl	m,r	1	vmlinux:.text@ffffffff816ad3b4	
+system	sidtq	m	2	vmlinux:.text@ffffffff81c7cae9	
+system	movw	m,sr	1	vmlinux:.text@ffffffff81c7ce2a	
+system	monitorx		1	vmlinux:.text@ffffffff81ca6b2d	
+system	mwaitx		1	vmlinux:.text@ffffffff81ca6b49	
+system	sldtw	m	1	vmlinux:.text@ffffffff81cb0931	
+system	tdcall		3	vmlinux:.text@ffffffff81cfdc5e	
+system	swapgs		22	vmlinux:.text@ffffffff81cfee4e	
+system	wrgsbaseq	r	4	vmlinux:.text@ffffffff81cfee51	
+system	rdgsbaseq	r	2	vmlinux:.text@ffffffff81cfee88	
+system	movq	r,dr	6	vmlinux:.text@ffffffff81d035c9	
+system	movq	dr,r	6	vmlinux:.text@ffffffff81d03639	
+system	ud1l	r,r	3764	vmlinux:.text@ffffffff81d14305	
+system	sysretq		1	vmlinux:.text@ffffffff81e001c8	
+system	lsll	r,r	1	vmlinux:.text@ffffffff81e01b4e	
+system	sysretl		2	vmlinux:.text@ffffffff81e01fd0	
+system	clac		190	vmlinux:.altinstr_replacement@ffffffff8372290f	
+system	rdtscp		19	vmlinux:.altinstr_replacement@ffffffff83722f65	
+system	stac		106	vmlinux:.altinstr_replacement@ffffffff83723afa	
+system	clflushopt	m	4	vmlinux:.altinstr_replacement@ffffffff83725c74	
+int3	int3		3030120	dec:.text@13f	alignment padding / breakpoint
+BMI	shlxl	r,r,r	21	dec:.text@100f	vex/evex
+BMI	lzcntl	r,r	68	dec:.text@116b	popcnt/tzcnt/lzcnt
+BMI	tzcntl	r,r	8	dec:.text@176c	popcnt/tzcnt/lzcnt
+BMI	shrxl	r,m,r	9	dec:.text@1a83	vex/evex
+BMI	shrxl	r,r,r	3	dec:.text@1b3c	vex/evex
+BMI	shlxq	r,r,r	251	dec:.text@1f86	vex/evex
+BMI	shrxq	r,r,r	438	dec:.text@1f8b	vex/evex
+BMI	shlxq	r,m,r	66	dec:.text@34d3	vex/evex
+BMI	bzhiq	r,r,r	48	dec:.text@3596	vex/evex
+BMI	andnq	r,r,r	4	dec:.text@8254	vex/evex
+BMI	tzcntq	r,r	926	vmlinux:.init.text@ffffffff83358e27	popcnt/tzcnt/lzcnt
+BMI	tzcntq	m,r	20	vmlinux:.text@ffffffff810b247f	popcnt/tzcnt/lzcnt
+BMI	rorxl	i,r,r	5	vmlinux:.text@ffffffff816c2002	vex/evex
+BMI	sarxq	r,r,r	6	vmlinux:.text@ffffffff816d45d9	vex/evex
+BMI	popcntq	r,r	36	vmlinux:.altinstr_replacement@ffffffff83722d14	popcnt/tzcnt/lzcnt
+BMI	popcntl	r,r	30	vmlinux:.altinstr_replacement@ffffffff83722f25	popcnt/tzcnt/lzcnt
+FS/GS	movq	m,r	15389	vmlinux:.text@ffffffff81000058	override on an admitted opcode
+FS/GS	subq	m,r	11489	vmlinux:.text@ffffffff8100018d	override on an admitted opcode
+FS/GS	movq	r,m	164	vmlinux:.init.text@ffffffff83353f75	override on an admitted opcode
+FS/GS	incl	m	2094	vmlinux:.init.text@ffffffff83358679	override on an admitted opcode
+FS/GS	movl	m,r	1905	vmlinux:.init.text@ffffffff8335869b	override on an admitted opcode
+FS/GS	decl	m	2362	vmlinux:.init.text@ffffffff833586fa	override on an admitted opcode
+FS/GS	cmpq	i,m	15	vmlinux:.init.text@ffffffff8335dc7f	override on an admitted opcode
+FS/GS	movl	r,m	27	vmlinux:.init.text@ffffffff8335e06d	override on an admitted opcode
+FS/GS	testl	i,m	35	vmlinux:.init.text@ffffffff83360f3d	override on an admitted opcode
+FS/GS	cmpl	i,m	5	vmlinux:.init.text@ffffffff83362a09	override on an admitted opcode
+FS/GS	movq	i,m	51	vmlinux:.init.text@ffffffff8337ea60	override on an admitted opcode
+FS/GS	movl	i,m	30	vmlinux:.init.text@ffffffff833878eb	override on an admitted opcode
+FS/GS	movslq	m,r	111	vmlinux:.init.text@ffffffff83389a79	override on an admitted opcode
+FS/GS	addq	m,r	756	vmlinux:.text@ffffffff8100223c	override on an admitted opcode
+FS/GS	cmovel	m,r	41	vmlinux:.text@ffffffff810057b4	override on an admitted opcode
+FS/GS	addl	r,m	21	vmlinux:.text@ffffffff8100ebd0	override on an admitted opcode
+FS/GS	testb	i,m	98	vmlinux:.text@ffffffff810136bb	override on an admitted opcode
+FS/GS	cmpl	r,m	29	vmlinux:.text@ffffffff81028207	override on an admitted opcode
+FS/GS	cmpb	i,m	69	vmlinux:.text@ffffffff81029826	override on an admitted opcode
+FS/GS	movb	i,m	147	vmlinux:.text@ffffffff81029843	override on an admitted opcode
+FS/GS	movw	r,m	9	vmlinux:.text@ffffffff8102c7eb	override on an admitted opcode
+FS/GS	testw	i,m	135	vmlinux:.text@ffffffff8102ccb2	override on an admitted opcode
+FS/GS	movzwl	m,r	18	vmlinux:.text@ffffffff8102cd78	override on an admitted opcode
+FS/GS	andl	i,m	19	vmlinux:.text@ffffffff810377bf	override on an admitted opcode
+FS/GS	cmpq	r,m	25	vmlinux:.text@ffffffff8103ea79	override on an admitted opcode
+FS/GS	cmpq	m,r	98	vmlinux:.text@ffffffff8103f0d3	override on an admitted opcode
+FS/GS	addl	i,m	125	vmlinux:.text@ffffffff810444c9	override on an admitted opcode
+FS/GS	cmoveq	m,r	1	vmlinux:.text@ffffffff810448d6	override on an admitted opcode
+FS/GS	movzbl	m,r	36	vmlinux:.text@ffffffff8104b839	override on an admitted opcode
+FS/GS	orq	i,m	1	vmlinux:.text@ffffffff81061044	override on an admitted opcode
+FS/GS	movb	r,m	22	vmlinux:.text@ffffffff810617ea	override on an admitted opcode
+FS/GS	cmpl	m,r	37	vmlinux:.text@ffffffff8106d326	override on an admitted opcode
+FS/GS	decq	m	295	vmlinux:.text@ffffffff8107b2e6	override on an admitted opcode
+FS/GS	incq	m	939	vmlinux:.text@ffffffff810ab6e8	override on an admitted opcode
+FS/GS	cmpw	i,m	15	vmlinux:.text@ffffffff810cae95	override on an admitted opcode
+FS/GS	orw	r,m	5	vmlinux:.text@ffffffff810cb6d2	override on an admitted opcode
+FS/GS	orw	i,m	2	vmlinux:.text@ffffffff810cbb3d	override on an admitted opcode
+FS/GS	addq	r,m	145	vmlinux:.text@ffffffff81132c28	override on an admitted opcode
+FS/GS	orq	m,r	7	vmlinux:.text@ffffffff81149837	override on an admitted opcode
+FS/GS	orl	r,m	1	vmlinux:.text@ffffffff811571b1	override on an admitted opcode
+FS/GS	orl	i,m	4	vmlinux:.text@ffffffff8115b4ee	override on an admitted opcode
+FS/GS	subl	m,r	1	vmlinux:.text@ffffffff812024c5	override on an admitted opcode
+FS/GS	movsbq	m,r	13	vmlinux:.text@ffffffff81353644	override on an admitted opcode
+FS/GS	movsbl	m,r	4	vmlinux:.text@ffffffff81353cff	override on an admitted opcode
+FS/GS	cmovsl	m,r	2	vmlinux:.text@ffffffff8143767b	override on an admitted opcode
+FS/GS	incw	m	9	vmlinux:.text@ffffffff81a3ac1a	override on an admitted opcode
+FS/GS	decw	m	8	vmlinux:.text@ffffffff81a3ac3c	override on an admitted opcode
+FS/GS	addq	i,m	2	vmlinux:.text@ffffffff81b50a18	override on an admitted opcode
+FS/GS	shlq	i,m	1	vmlinux:.text@ffffffff81d13dd4	override on an admitted opcode
+FS/GS	pushq	m	1	vmlinux:.text@ffffffff81e000ad	override on an admitted opcode
+FS/GS	btq	r,m	4	vmlinux:.text@ffffffff81e00189	override on an admitted opcode
+FS/GS	btrq	r,m	6	vmlinux:.text@ffffffff81e00194	override on an admitted opcode
+FS/GS	sarq	i,m	26	vmlinux:.altinstr_replacement@ffffffff837228e9	override on an admitted opcode
+small-int	cld		61	dec:.text@0	
+small-int	std		3	dec:.text@2a9	
+small-int	prefetcht1	m	8	dec:.text@1d22	
+small-int	prefetcht0	m	696	dec:.text@4106	
+small-int	leave		217	vmlinux:.text@ffffffff81000da7	
+small-int	shrdq	r,r,r	10	vmlinux:.init.text@ffffffff83373e27	
+small-int	cmpxchgl	r,m	19	vmlinux:.text@ffffffff81002c36	
+small-int	cmpxchgq	r,m	44	vmlinux:.text@ffffffff8100de6c	
+small-int	xaddb	r,m	10	vmlinux:.text@ffffffff810698c3	
+small-int	shldq	r,r,r	1	vmlinux:.text@ffffffff81098047	
+small-int	shrdq	i,r,r	56	vmlinux:.text@ffffffff810997fe	
+small-int	xaddw	r,m	1	vmlinux:.text@ffffffff810a7b5a	
+small-int	xaddl	r,m	54	vmlinux:.text@ffffffff81202fc6	
+small-int	xaddq	r,m	16	vmlinux:.text@ffffffff81217e84	
+small-int	cmpxchgb	r,m	11	vmlinux:.text@ffffffff8135364b	
+small-int	shldq	i,r,r	63	vmlinux:.text@ffffffff813746c7	
+small-int	prefetcht0	a	1	vmlinux:.text@ffffffff81638733	
+small-int	shldl	i,r,r	1	vmlinux:.text@ffffffff817427a7	
+small-int	cmpxchg16b	m	19	vmlinux:.text@ffffffff818e7a38	cmpxchg8b/16b
+small-int	shrdl	i,r,r	1	vmlinux:.text@ffffffff81c79a70	
+small-int	movntiq	r,m	14	vmlinux:.text@ffffffff81ca63af	
+small-int	movntil	r,m	4	vmlinux:.text@ffffffff81ca6416	
+small-int	clc		3	vmlinux:.text@ffffffff81ca6606	
+small-int	prefetchw	m	17	vmlinux:.altinstr_replacement@ffffffff837259c6	
+other	rdrandq	r	7	dec:.text@1e002	
+other	xrstors64	m	8	vmlinux:.init.text@ffffffff8336a7c2	
+other	xrstor64	m	8	vmlinux:.init.text@ffffffff8336a7d3	fxsave/ldmxcsr/xsave group
+other	rdseedq	r	2	vmlinux:.init.text@ffffffff833c2f04	
+other	xsave64	m	3	vmlinux:.text@ffffffff81051a47	fxsave/ldmxcsr/xsave group
+other	xsaves64	m	3	vmlinux:.text@ffffffff810550f9	
+other	wrussq	r,m	4	vmlinux:.text@ffffffff8109cf0a	
+other	tpause	r	1	vmlinux:.text@ffffffff81ca6af6	fxsave/ldmxcsr/xsave group
+other	xsaveopt64	m	2	vmlinux:.altinstr_replacement@ffffffff837240b2	fxsave/ldmxcsr/xsave group
+other	xsavec64	m	2	vmlinux:.altinstr_replacement@ffffffff837240b6	
+other	clwb	m	1	vmlinux:.altinstr_replacement@ffffffff8372aea4	fxsave/ldmxcsr/xsave group
+bad	decl	r	3	dec:.text@56	

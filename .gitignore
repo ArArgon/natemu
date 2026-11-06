@@ -19,3 +19,6 @@ artifacts/
 results/
 downloads/
 scratch/
+
+# Rust workspace build output
+/target/

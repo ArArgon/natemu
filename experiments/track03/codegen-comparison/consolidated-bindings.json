@@ -1,0 +1,248 @@
+{
+  "schema": "natemu.track03.consolidated-slices.v1",
+  "purpose": "source-and-byte binding, not execution acceptance",
+  "candidates": {
+    "box64": {
+      "fp_addsub": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/box64-consolidated-01/outputs/fp_addsub.native",
+        "raw_bytes": 48,
+        "raw_sha256": "894c9311403aa58c7d040514ded7709c19a2b859d95db7680566e9743e1586ab",
+        "ranges": [
+          {
+            "start": 0,
+            "end": 28,
+            "sha256": "3dae21ab580825c642c96f1fadbe5c835dd3ea7f462bb18989b2b2f8d0496c0e",
+            "hex": "0024c03d0128c03d1828611e0007086e1838611e0007086e0024803d"
+          }
+        ],
+        "status": "leaf-no-code-relocations"
+      },
+      "fp_muldiv": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/box64-consolidated-01/outputs/fp_muldiv.native",
+        "raw_bytes": 48,
+        "raw_sha256": "39c1cad95e5068d27e318457a0133955adb9caf7f4d8a98ebe9e1ca8eb9b16a8",
+        "ranges": [
+          {
+            "start": 0,
+            "end": 28,
+            "sha256": "178f9f7dfb1ee014c81d72aae3cca58bef5fdb45dae74192ee4b081e6ef2a646",
+            "hex": "0024c03d0128c03d1808611e0007086e1818611e0007086e0024803d"
+          }
+        ],
+        "status": "leaf-no-code-relocations"
+      },
+      "fp_sqrt": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/box64-consolidated-01/outputs/fp_sqrt.native",
+        "raw_bytes": 40,
+        "raw_sha256": "7fa9bb3d539d108b54e20818cdaa4ed68d91f9f192f6af4eaab395da1ff709f7",
+        "ranges": [
+          {
+            "start": 0,
+            "end": 20,
+            "sha256": "c43b85f2652a1722239e9b58e2f780afd8704be6c648cc4e02d782fb9777a7ab",
+            "hex": "0024c03d0128c03d38c0611e0007086e0024803d"
+          }
+        ],
+        "status": "leaf-no-code-relocations"
+      },
+      "branch_zero": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/box64-consolidated-01/outputs/branch_zero.native",
+        "raw_bytes": 88,
+        "raw_sha256": "8ef1ec62e92ddc26b6643e136144fd9db1b5b18399db97f7868786035a9fb283",
+        "ranges": [
+          {
+            "start": 0,
+            "end": 44,
+            "sha256": "5b34cc1cf45d60a6d57f5c724ccb7d437993a36d828402dc86b332b514f8e519",
+            "hex": "6b0140d2aa0140f90024c03d0128c03d001c216ee3078052034c04b963010bea033002f9e10000540024803d"
+          }
+        ],
+        "status": "requires-two-exit-adapter",
+        "condition_raw_offset": 36,
+        "condition_raw_target": 64,
+        "condition": "NE",
+        "true_guest_rip": 4198432,
+        "false_guest_rip": 4198416,
+        "fault_raw_offset": 4
+      },
+      "branch_carry": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/box64-consolidated-01/outputs/branch_carry.native",
+        "raw_bytes": 120,
+        "raw_sha256": "0b95955f75990195871df608e95b904562a4a011a787fc0afefd23d04ed54a3f",
+        "ranges": [
+          {
+            "start": 0,
+            "end": 72,
+            "sha256": "6d124da70b748810db03ae6870baac01e9e1c69d692786401830f96d3d52d6e7",
+            "hex": "0b2802f90c2c02f9e3008052034c04b96b010cab0b3002f9aa0140f90024c03d0128c03d001c216ee3179f1a6c1c40b3e1179f1a3a001a33e1379f1a3a000033e30000540024803d"
+          }
+        ],
+        "status": "requires-two-exit-adapter",
+        "condition_raw_offset": 64,
+        "condition_raw_target": 92,
+        "condition": "CC",
+        "true_guest_rip": 4198431,
+        "false_guest_rip": 4198415,
+        "fault_raw_offset": 24
+      },
+      "integer_div": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/box64-consolidated-01/outputs/integer_div.native",
+        "raw_bytes": 152,
+        "raw_sha256": "93f22b338ad39fdc15f9cb064481e759a64401647ae783ef1dcd603362979d7f",
+        "ranges": [
+          {
+            "start": 0,
+            "end": 16,
+            "sha256": "51958feec72048417a82a4f3646edf6534dd94201c54ca69f11917e5af02d3c3",
+            "hex": "8c010c4aea030baa1f4c04b98c0200b4"
+          },
+          {
+            "start": 92,
+            "end": 132,
+            "sha256": "ab1591443515b6758e5de1671cc7efe94fb8e68a1ee3920c543927d1880d4b91",
+            "hex": "4209cd9a4ca80d9bea0302aa1f4c04b9fa031533fa030033fa031c335a031a32fa0319335a031e32"
+          }
+        ],
+        "status": "restricted-fast-path-with-explicit-adapter",
+        "condition_raw_offset": 12,
+        "condition_raw_target": 92,
+        "unreachable_helper_call_raw_offset": 56,
+        "required_domain": "RBX!=0; actual initial XOR makes RDX=0; DIV flags excluded"
+      }
+    },
+    "tcg": {
+      "branch_zero": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/tcg-consolidated-01/outputs/branch_zero.native",
+        "raw_bytes": 116,
+        "raw_sha256": "bed3325d08f316f768ba8b61de79bb9ccf3fdfae2bd220214fb419948d2024c6",
+        "ranges": [
+          {
+            "start": 12,
+            "end": 108,
+            "sha256": "ddd7b75918aba4d28f1b3cc5a89b5b0e3470ea4b0435214acd3a61e8f6ad9205",
+            "hex": "740640f9940240d2740600f9748a00f9750e40f9b56a7ff8750200f960f2c03d6102c13d001c216e60f2803d3500805275421f3875038052752a01b9b40000b4140282521408a072748200f9a5ffff17140482521408a072748200f9a1ffff17"
+          }
+        ],
+        "status": "requires-exit-relocation",
+        "condition_raw_offset": 72,
+        "condition_raw_target": 92,
+        "condition": "CBZ x20",
+        "exit_raw_offsets": [
+          88,
+          104
+        ],
+        "true_guest_rip": 4198432,
+        "false_guest_rip": 4198416,
+        "fault_raw_offset": 32
+      },
+      "branch_carry": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/tcg-consolidated-01/outputs/branch_carry.native",
+        "raw_bytes": 148,
+        "raw_sha256": "6cf3cce20567f85beb2b088c313e2f6c81aecac8e41318bdbfe0651234220c56",
+        "ranges": [
+          {
+            "start": 12,
+            "end": 140,
+            "sha256": "7e70d9d6d993e8b42717645401f1597db2df5f37374fbe9688e198c58fb247b4",
+            "hex": "740640f9750a40f99402158b740600f9748a00f9f60315aa768e00f9770e40f9f76a7ff8770200f960f2c03d6102c13d001c216e60f2803d9f0200f1f7179f1af51e40b3750a00f93500805275421f3875018052752a01b99f0216eba3000054f40182521408a072748200f99dffff17f40382521408a072748200f999ffff17"
+          }
+        ],
+        "status": "requires-exit-relocation",
+        "condition_raw_offset": 104,
+        "condition_raw_target": 124,
+        "condition": "LO",
+        "exit_raw_offsets": [
+          120,
+          136
+        ],
+        "true_guest_rip": 4198431,
+        "false_guest_rip": 4198415,
+        "fault_raw_offset": 44
+      },
+      "fp_addsub": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/tcg-consolidated-01/outputs/fp_addsub.native",
+        "raw_bytes": 112,
+        "raw_sha256": "190f8f161b041076b37e6338a4fb5b3d955cd93216e0a6dc45f01a7f6c33c552",
+        "ranges": [
+          {
+            "start": 12,
+            "end": 68,
+            "sha256": "ab82f82beabb4c33ef3a092fc0d3a37b4eb77ff9d43ad3b667af0a56c64e0ff6",
+            "hex": "61020f9162020f9163021091e00313aa3002005800023fd63400805274421f3861020f9162020f9163021091e00313aa7001005800023fd6"
+          }
+        ],
+        "status": "unbound-helper",
+        "call_raw_offsets": [
+          32,
+          64
+        ],
+        "literal_raw_offsets": [
+          96,
+          104
+        ]
+      },
+      "fp_muldiv": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/tcg-consolidated-01/outputs/fp_muldiv.native",
+        "raw_bytes": 112,
+        "raw_sha256": "07bd8b72476145ce6372e6083fb13240ead4efdd025766ee04eebcdf1550ae1d",
+        "ranges": [
+          {
+            "start": 12,
+            "end": 68,
+            "sha256": "ab82f82beabb4c33ef3a092fc0d3a37b4eb77ff9d43ad3b667af0a56c64e0ff6",
+            "hex": "61020f9162020f9163021091e00313aa3002005800023fd63400805274421f3861020f9162020f9163021091e00313aa7001005800023fd6"
+          }
+        ],
+        "status": "unbound-helper",
+        "call_raw_offsets": [
+          32,
+          64
+        ],
+        "literal_raw_offsets": [
+          96,
+          104
+        ]
+      },
+      "fp_sqrt": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/tcg-consolidated-01/outputs/fp_sqrt.native",
+        "raw_bytes": 72,
+        "raw_sha256": "d90868976c4bebcc901b3b6883e25748652dc6b65cbf50ea649017c3dcb9f0f3",
+        "ranges": [
+          {
+            "start": 16,
+            "end": 40,
+            "sha256": "cd9be5ef01f7d788cb90ac316bbec503ba2de4924a5eaef68b9a640d10f84a9f",
+            "hex": "61020f9162020f9163021091e00313aa1001005800023fd6"
+          }
+        ],
+        "status": "unbound-helper",
+        "call_raw_offsets": [
+          36
+        ],
+        "literal_raw_offsets": [
+          64
+        ]
+      },
+      "integer_div": {
+        "raw_path": "/private/tmp/natemu-track03-comparison-raw/tcg-consolidated-01/outputs/integer_div.native",
+        "raw_bytes": 96,
+        "raw_sha256": "2246b98c776eccb0c928ced84251ed943cfbaa554ecee303d25a08e096c099f3",
+        "ranges": [
+          {
+            "start": 12,
+            "end": 60,
+            "sha256": "5ef655d0ab39f74211b47b2b500be67d1461cf576b326d9c7cc6f74cc6832de6",
+            "hex": "7f0a00f994088052748e00f9740640f9740200f93400805274421f38610e40f9e00313aa5001005800023fd67f2a01b9"
+          }
+        ],
+        "status": "unbound-helper",
+        "call_raw_offsets": [
+          52
+        ],
+        "literal_raw_offsets": [
+          88
+        ]
+      }
+    }
+  }
+}

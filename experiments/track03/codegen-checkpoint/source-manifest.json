@@ -1,0 +1,15 @@
+{
+  "project": "FEX-Emu/FEX",
+  "revision": "48d71752e2a363d5535181f803b0b0e9666c1825",
+  "status": "unbuilt observation-only partial preparation",
+  "targets": {
+    "FEXCore/Source/Interface/IR/Passes/RegisterAllocationPass.cpp": {
+      "sha256": "81f98229a48235c346766b777401405bfa1015abd8885a151d28e779d135eff6",
+      "bytes": 28385
+    },
+    "Source/Tools/CodeSizeValidation/Main.cpp": {
+      "sha256": "b7049a8f66fa81a0c5da0b9e045277615f11e9975ee9a770c7537c443dc926d2",
+      "bytes": 29025
+    }
+  }
+}

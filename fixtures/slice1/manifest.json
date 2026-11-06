@@ -1,0 +1,22 @@
+{
+ "generator": {
+  "script": "tools/reference/gen_slice1.py",
+  "seed": 20261026
+ },
+ "qemu": {
+  "format": "natemu-reference-v2",
+  "image": "sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac",
+  "qemu_sha256": "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594",
+  "qemu_package": "qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64",
+  "qemu_argv": [
+   "/qemu",
+   "-cpu",
+   "qemu64",
+   "-d",
+   "in_asm",
+   "-D",
+   "qemu.log",
+   "prog.elf"
+  ]
+ }
+}

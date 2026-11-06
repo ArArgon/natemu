@@ -1,0 +1,23 @@
+#!/bin/sh
+# play initramfs /init: mount the pseudo filesystems, set the hostname, then keep a login bash on the serial console
+# (ttyS0, job control via setsid -c) and restart it if it exits. PID 1 stays this script, never the shell.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C TERM=vt100
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmp /tmp
+mount -t tmpfs run /run
+chmod 1777 /tmp
+echo 4 > /proc/sys/kernel/printk
+hostname natemu-play
+tty=ttyS0
+for a in $(cat /proc/cmdline); do case $a in console=*) tty=${a#console=}; tty=${tty%%,*};; esac; done
+[ -c /dev/$tty ] || tty=console
+cat /etc/motd
+while :; do
+    setsid -c bash -l </dev/$tty >/dev/$tty 2>&1
+    echo "shell exited; restarting (use poweroff -f to stop)" >/dev/$tty
+    sleep 1
+done

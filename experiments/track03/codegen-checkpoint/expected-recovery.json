@@ -1,0 +1,54 @@
+{
+  "status": "requirements only; no generated map or conformance result",
+  "fault_origin": "marked scalar MOV data-access phase, after instruction-start checks and before access commit",
+  "arithmetic": {
+    "s": "post-ADD RCX",
+    "b": "unchanged RDX",
+    "a": "(s-b) mod 2^64",
+    "CF": "s < b (unsigned)",
+    "ZF": "s == 0",
+    "SF": "bit63(s)",
+    "OF": "bit63(~(a^b) & (a^s))",
+    "AF": "bit4(a^b^s)",
+    "PF": "even parity of low8(s)"
+  },
+  "live_roots": {
+    "s": 64,
+    "b": 64,
+    "old_RAX": 64,
+    "XMM0_after_PXOR": 128
+  },
+  "additional_bindings": [
+    "effective address: RBX or old_RAX",
+    "explicit bindings for remaining exposed non-arithmetic flags, excluding phase-owned RF",
+    "all unaffected GPR/vector/x87/MXCSR state",
+    "exposed upper lanes untouched by legacy PXOR"
+  ],
+  "bare_fixtures": "preserve incoming arithmetic flags and vector state; apply the admitted data-phase RF rule; do not apply ADD recipe",
+  "allowed_locations": [
+    "valid native register at exact fault site",
+    "initialized resident spill slot live at exact fault site",
+    "authoritative resident field",
+    "constant or bounded pure expression over retained roots"
+  ],
+  "reject": [
+    "uninitialized or obsolete spill assignment",
+    "post-access reload used as pre-access location",
+    "guest offset or IR node treated as native fault PC",
+    "completed store replay",
+    "low128 location assumed to preserve upper lanes"
+  ],
+  "not_implemented": [
+    "complete architectural-field root insertion and metadata-use liveness",
+    "complete architectural-field post-RA fault-site binding",
+    "native code byte export",
+    "machine-checkable map oracle",
+    "hardware-TSO configuration variant",
+    "guest execution or fault injection"
+  ],
+  "flags_phase": {
+    "checkpoint_RF": 0,
+    "saved_page_fault_frame_RF": 1,
+    "basis": "INV-03-02 claim 33; Intel Vol3B 253669-079US section 18.3.1.1; earlier breakpoint phases require separate maps"
+  }
+}

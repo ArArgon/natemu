@@ -1,0 +1,70 @@
+{
+  "Features": {
+    "Bitness": 64,
+    "EnabledHostFeatures": [
+      "TSO"
+    ],
+    "DisabledHostFeatures": [
+      "SVE128",
+      "SVE256",
+      "LRCPC",
+      "LRCPC2"
+    ]
+  },
+  "Instructions": {
+    "bare_load": {
+      "x86Insts": [
+        "mov rax, [rbx]"
+      ],
+      "ExpectedBytes": "488b03",
+      "FaultInstructionIndex": 0
+    },
+    "live_load": {
+      "x86Insts": [
+        "pxor xmm0, xmm1",
+        "add rcx, rdx",
+        "mov rax, [rbx]",
+        "setz dl",
+        "movdqu [rdi], xmm0"
+      ],
+      "ExpectedBytes": "660fefc14801d1488b030f94c2f30f7f07",
+      "FaultInstructionIndex": 2
+    },
+    "bare_store": {
+      "x86Insts": [
+        "mov [rbx], rax"
+      ],
+      "ExpectedBytes": "488903",
+      "FaultInstructionIndex": 0
+    },
+    "live_store": {
+      "x86Insts": [
+        "pxor xmm0, xmm1",
+        "add rcx, rdx",
+        "mov [rbx], rax",
+        "setz dl",
+        "movdqu [rdi], xmm0"
+      ],
+      "ExpectedBytes": "660fefc14801d14889030f94c2f30f7f07",
+      "FaultInstructionIndex": 2
+    },
+    "bare_alias_load": {
+      "x86Insts": [
+        "mov rax, [rax]"
+      ],
+      "ExpectedBytes": "488b00",
+      "FaultInstructionIndex": 0
+    },
+    "live_alias_load": {
+      "x86Insts": [
+        "pxor xmm0, xmm1",
+        "add rcx, rdx",
+        "mov rax, [rax]",
+        "setz dl",
+        "movdqu [rdi], xmm0"
+      ],
+      "ExpectedBytes": "660fefc14801d1488b000f94c2f30f7f07",
+      "FaultInstructionIndex": 2
+    }
+  }
+}

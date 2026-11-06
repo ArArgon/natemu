@@ -1,0 +1,18 @@
+[package]
+name = "natemu-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+natemu-abi = { path = "../abi" }
+
+# Performance phase, first chunk: the resident's time accounting (`src/perf.rs`); off by default (no code).
+[features]
+perf = []
+
+[[bin]]
+name = "natemu-runtime"
+path = "src/main.rs"
+test = false
+bench = false

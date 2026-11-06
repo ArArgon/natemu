@@ -1,0 +1,8 @@
+[build]
+jobs = 2
+
+[target.aarch64-unknown-none]
+# No jump tables in the resident: tools/check_resident_stack.py refuses any unlisted indirect branch (`br`).
+# LSE atomics (single CAS/LDSET/SWP instructions, M4 has them): an LL/SC retry loop can livelock when every pass is
+# interrupted by a vCPU exit (an exception return clears the exclusive monitor), seen once in a page-walk CAS (M1).
+rustflags = ["-C", "link-arg=-Tcrates/runtime/linker.ld", "-C", "relocation-model=static", "-C", "jump-tables=no", "-C", "target-feature=+lse"]

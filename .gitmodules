@@ -1,0 +1,5 @@
+[submodule "third_party/FEX"]
+	path = third_party/FEX
+	url = https://github.com/ArArgon/natemu-fex.git
+	branch = natemu
+	shallow = true

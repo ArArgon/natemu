@@ -1,28 +1,57 @@
 # Scope and success
 
 This track defines what research must settle first. It is a roadmap, not a
-finding: nothing here is evidence. Work on it follows the
-[research governance](../README.md), the [evidence policy](../evidence-policy.md),
-and the [executor guide](../executor-guide.md).
+finding: nothing here is evidence. Work on it follows the [research workflow](../README.md).
 
 ## Initial target
 
 The starting envelope, subject to revision by this track's own outcomes:
 
-- public macOS APIs only, on at least two Apple Silicon generations and at
-  least two supported macOS releases;
+- Apple silicon and macOS capabilities, documented or undocumented, including hardware controls
+  reachable from a Hypervisor.framework guest, on Apple silicon under macOS 26;
+  the host of record for research is the M4, with an M2 Pro/Max as the second
+  generation when available; no App Store or distribution constraint (experiment
+  project); a second macOS release is not a research or product requirement; assess M2/M4
+  discrepancies when key features depend on them, without a general M2 parity gate;
 - unmodified modern x86-64 Linux guests with direct boot;
 - SMP as a baseline, not an extension; and
 - a minimal headless device set — timer/APIC, serial, block, network,
   entropy, and shutdown, as enumerated in the
   [research governance](../README.md).
 
+Design direction: a thin EL1 shim inside a Hypervisor.framework VM that uses the
+native stage-1 page tables, exceptions, timer/interrupt controller and TSO switch,
+with translation on the host. Feasibility is judged for this design against QEMU
+TCG; other families are comparators, not co-equal candidates. A mechanism missing
+on one chip generation narrows applicability; it does not kill the design.
+
 This envelope is an input to be questioned, not a settled scope. Every
 narrowing or widening must be recorded as a question in the
 [question backlog](../question-backlog.md) and resolved through the applicable
-gates (see [gate completion](../evidence-policy.md#gate-completion)).
+gates.
+
+Licensing implications are recorded as warnings, not candidate-selection blockers.
+
+**Owner clarification, September 20 — x87 accuracy versus cost:** x87 numerical
+accuracy is secondary when its performance or adaptation cost is too high.
+Full80 numerical fidelity is not an unconditional acceptance requirement.
+Compare cheaper inherited implementations using measured cost, numerical limits
+and effects on target workloads; disclose the selected accuracy/compatibility
+tradeoff. No specific error tolerance or cost threshold is fixed by this ruling.
+This is permission to trade x87 numerical accuracy, not a blanket relaxation of
+CPU state, memory safety or unrelated instruction semantics. INV-03-02 owns the
+component assessment and Q-00-02 owns the resulting compatibility boundary.
 
 ## Required definitions
+
+The [backlog's scope record](../question-backlog.md#scope) identifies historical
+acceptance labels whose supporting records are unavailable. Before relying on
+them, bind an extant applicable record or resolve the missing definition under
+its existing question. ABI drafting may proceed within the current envelope;
+fixture coverage does not narrow product scope. Concrete workload, compatibility,
+quantitative success and economic inputs remain required before dependent
+comparisons or synthesis use them. Raise consequential scope choices at the
+workflow's [owner checkpoints](../README.md#owner-alignment).
 
 The track must produce, with evidence labels, and with review where
 applicable:
@@ -41,8 +70,10 @@ applicable:
   baselines.
 - **Measurable "materially better."** A quantitative definition of what
   materially better than the baselines means — metrics, magnitudes,
-  workloads, and confidence — agreed before any performance evidence is
-  collected, so success cannot be redefined after the fact.
+  workloads, and confidence — agreed before collecting evidence intended to
+  judge product success, so success cannot be redefined after the fact. Bounded
+  component comparisons may proceed with their own predeclared decision criteria;
+  they do not establish that the product is materially better.
 - **Non-goals.** What the project explicitly will not attempt in this phase,
   including deferred platforms, device classes, and security objectives
   beyond isolation and crash containment.

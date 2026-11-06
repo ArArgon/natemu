@@ -1,30 +1,42 @@
 # Performance estimation
 
-This track defines how research must estimate, before full measurement,
-whether the surviving options carried forward by
-[Architecture options](03-architecture-options.md) — its
-recommendation, plus any family whose rejection a recorded falsifier has
-reopened — can plausibly meet the "materially better" definition from
-[Scope and success](00-scope-and-success.md); the track estimates only that
-set. It is a roadmap, not a finding, and it makes no performance claims.
-Work on it follows the
-[research governance](../README.md), the
-[evidence policy](../evidence-policy.md), and the
-[executor guide](../executor-guide.md).
+This track estimates costs and sensitivities for candidates being developed in
+[Architecture and implementation direction](03-architecture-options.md), against
+the success criteria in [Scope and success](00-scope-and-success.md). Estimates
+inform architectural choices before a final selection. Work follows the
+[research workflow](../README.md); projections are distinguished from measured
+performance.
+
+## Contribution to the ABI-first milestone
+
+Support [Track 03's current milestone](03-architecture-options.md#current-milestone--execution-abi-and-experimental-runtime)
+through Q-04-01 and the [implementation plan](../../implementation.md#performance-alongside-construction).
+Start with counters/costs of the supported fragment and helper paths, then actual
+compilation, dispatch, recovery and shared coordination. Measure during development
+when the result changes a choice; boot is not a prerequisite to component costs.
+Separate event cost from frequency, cold compilation from warmed execution and
+codegen from runtime/backend effects. Explore N-vCPU sensitivity through
+coordinator waits, drain latency, queue/backlog and retained memory. Use actual
+observations when available and label unknown inputs rather than inventing rates.
+
+The milestone can proceed without a completed whole-emulator cost model.
+Q-04-01 still owns full component ranges and scaling analysis; the ABI experiment
+does not settle them. Workload-wide or economic comparisons also need Track 00's
+extant workload, success and stop criteria. Missing historical scope records must
+be resolved by their owners before those criteria are used.
 
 ## Estimation rules
 
 Every estimate produced under this track must be a range with an explicit
-sensitivity analysis over its inputs, never a point claim. Each input carries
-its evidence label, and the estimate inherits the weakest label among its
-load-bearing inputs, per the label ordering declared in the
-[evidence policy](../evidence-policy.md). Combining estimates must not
+sensitivity analysis over its inputs, never a point claim. Each input carries its evidence type, applicability and uncertainty under the
+[research workflow](../README.md). State which assumptions drive the estimate;
+evidence types have no universal ranking. Combining estimates must not
 multiply overlapping speedups: cost components that share a mechanism, a
 bottleneck, or a workload phase may not be composed as if independent, and
-every composition must state its independence argument. Estimates from
-configurations whose correctness status is unresolved cannot support
-conclusions, per the precondition in
-[Correctness](02-correctness.md).
+every composition must state its independence argument. Conditional models may explore provisional designs with explicit assumptions.
+They cannot establish measured speedup or acceptance of a design whose required
+correctness is unresolved. Measurements must qualify the behavior measured under
+[Track 03](03-architecture-options.md).
 
 ## Cost components
 
@@ -34,8 +46,7 @@ exhibit is recorded `not-applicable` with a reason rather than silently
 skipped, so the component set favors no family in advance. Each component
 becomes questions in the
 [question backlog](../question-backlog.md), resolved with labelled evidence
-through the applicable gates (see
-[gate completion](../evidence-policy.md#gate-completion)):
+through the applicable gates:
 
 - **Translated execution.** The steady-state cost of executing translated
   guest code.
