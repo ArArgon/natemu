@@ -2400,6 +2400,31 @@ mod tests {
     }
 
     #[test]
+    fn cpl0_translates_verw_inline() {
+        // Perf P2: VERW m16 (a REX allowed) after another instruction of a CPL-0 request is translated, its exit to its own RIP a
+        // link point; first in its block, the register form, with a legacy prefix, VERR, or at CPL 3 it is the resident's.
+        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        (c.shape, c.cpl0) = (true, true);
+        let compile = |c: &mut super::Compiler, code: &[u8]| c.compile(code, 0x1000, false, &mut ()).unwrap();
+        for code in [&[0x90, 0x0f, 0x00, 0x28, 0xc3][..], &[0x90, 0x41, 0x0f, 0x00, 0x29, 0xc3], &[0x90, 0x0f, 0x00, 0x2d, 0x10, 0, 0, 0, 0xc3],
+                     &[0x90, 0x42, 0x0f, 0x00, 0x2c, 0x8b, 0xc3], &[0x90, 0x48, 0x0f, 0x00, 0x6e, 0x08, 0xc3]] {
+            assert!(matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 3 && b.links.iter().any(|p| p.target == 0x1001)), "{code:02x?}");
+        }
+        for code in [&[0x90, 0x66, 0x0f, 0x00, 0xe8, 0xc3][..], &[0x90, 0x64, 0x0f, 0x00, 0x28, 0xc3], &[0x90, 0x67, 0x0f, 0x00, 0x28, 0xc3],
+                     &[0x90, 0xf3, 0x0f, 0x00, 0x28, 0xc3], &[0x90, 0x0f, 0x00, 0x20, 0xc3], &[0x90, 0x0f, 0x00, 0xe8, 0xc3], &[0x90, 0x41, 0x0f, 0x00, 0xe9, 0xc3]] {
+            assert!(matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 1), "{code:02x?}");
+        }
+        assert!(matches!(compile(&mut c, &[0x0f, 0x00, 0x28, 0xc3]), Code::System(_)));
+        let code = [0x90, 0x0f, 0x00, 0x28, 0xc3];
+        let Answer::Object(o) = c.answers.find(&code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        assert!(admission::admit(&o, 0x1000, &code, u64::MAX, true, true).is_ok());
+        assert!(admission::admit(&o, 0x1000, &code, u64::MAX, false, false).err().unwrap().contains("VERW"));
+        c.cpl0 = false;
+        assert!(matches!(compile(&mut c, &code), Code::Block(b) if b.guest_insns == 1));
+    }
+
+    #[test]
     fn bulk_rep_stos_only_when_asked() {
         let Some(fexc) = std::env::var_os("FEXC") else { return };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);

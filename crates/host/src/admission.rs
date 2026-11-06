@@ -250,7 +250,9 @@ struct Parts {
 /// the first ([`Admitted::sti_first`]). Returns the STIs' RIPs: each one's exit to its own RIP (taken when an event is pending) is a literal-exit
 /// target. Containment: IF's flag byte is guest state the resident banks like DF (it decides only which events are taken),
 /// and the exit is to a RIP of the block's own bytes. Likewise a translated RDTSC is the two-byte form in a CPL-0 block (no
-/// CR4.TSD check is needed there), the only place its counter read may be ([`structure`]).
+/// CR4.TSD check is needed there), the only place its counter read may be ([`structure`]). Perf P2: the RIPs of the
+/// translated VERWs follow (each exits to its own RIP when the resident must decide); none is the block's first, so the
+/// first RIP returned is the block's start only for an STI ([`Admitted::sti_first`]).
 fn interrupt_flag(source: &[u8], starts: &[u32], end: u32, rip: u64, cpl0: bool) -> Result<Vec<u64>, String> {
     let mut sti = Vec::new();
     for (k, &g) in starts.iter().enumerate() {
@@ -264,6 +266,16 @@ fn interrupt_flag(source: &[u8], starts: &[u32], end: u32, rip: u64, cpl0: bool)
         // is a prefix).
         if insn.get(o..o + 3) == Some(&[0x0f, 0x01, 0xf8]) && (!cpl0 || insn.len() != 3) {
             return Err(format!("object refused: SWAPGS translated at guest offset {g:#x} outside a CPL-0 block or with a prefix"));
+        }
+        // Perf P2: a translated VERW (0f 00 /5) is the form fexc translates, a memory operand and no prefix but a REX, in a
+        // CPL-0 block and never its first instruction (its slow path exits to its own RIP, a literal-exit target, where the
+        // resident runs it: a block starting there would be this one again).
+        if insn.get(o..o + 2) == Some(&[0x0f, 0x00]) && insn.get(o + 2).is_some_and(|m| m >> 3 & 7 == 5) {
+            if !cpl0 || g == 0 || insn[o + 2] >> 6 == 3 || !(o == 0 || o == 1 && insn[0] & 0xf0 == 0x40) {
+                return Err(format!("object refused: VERW translated at guest offset {g:#x} outside a CPL-0 block, first, or with a prefix"));
+            }
+            sti.push(rip.wrapping_add(u64::from(g)));
+            continue;
         }
         if !matches!(insn.get(o), Some(0xfa | 0xfb)) {
             continue;
@@ -687,6 +699,18 @@ mod tests {
         assert_eq!(f(&[0x0f, 0x01, 0xf9], &[0], false), Ok(vec![]));
         for (src, cpl0) in [(&[0x0f, 0x01, 0xf8][..], false), (&[0x48, 0x0f, 0x01, 0xf8], true), (&[0x66, 0x0f, 0x01, 0xf8], true), (&[0xf0, 0x0f, 0x01, 0xf8], true)] {
             assert!(f(src, &[0], cpl0).is_err_and(|e| e.contains("SWAPGS")), "{src:02x?}");
+        }
+        // Perf P2: a translated VERW (memory forms, a REX) after another instruction of a CPL-0 block, its own RIP an exit
+        // target; never first, at CPL 3, with a register operand or with a legacy prefix. VERR (0f 00 /4) is no VERW.
+        assert_eq!(f(&[0x90, 0x0f, 0x00, 0x28, 0x90], &[0, 1, 4], true), Ok(vec![0x1001]));
+        assert_eq!(f(&[0x90, 0x41, 0x0f, 0x00, 0x2d, 1, 0, 0, 0], &[0, 1], true), Ok(vec![0x1001]));
+        assert_eq!(f(&[0xfb, 0x90, 0x0f, 0x00, 0x6e, 8], &[0, 1, 2], true), Ok(vec![0x1000, 0x1002]));
+        assert_eq!(f(&[0x90, 0x0f, 0x00, 0x20], &[0, 1], false), Ok(vec![]));
+        for (src, starts, cpl0) in [(&[0x0f, 0x00, 0x28, 0x90][..], &[0, 3][..], true), (&[0x90, 0x0f, 0x00, 0x28], &[0, 1], false),
+                                    (&[0x90, 0x0f, 0x00, 0xe8], &[0, 1], true), (&[0x90, 0x41, 0x0f, 0x00, 0xe9], &[0, 1], true),
+                                    (&[0x90, 0x66, 0x0f, 0x00, 0x28], &[0, 1], true), (&[0x90, 0x64, 0x0f, 0x00, 0x28], &[0, 1], true),
+                                    (&[0x90, 0x67, 0x0f, 0x00, 0x28], &[0, 1], true), (&[0x90, 0x66, 0x48, 0x0f, 0x00, 0x28], &[0, 1], true)] {
+            assert!(f(src, starts, cpl0).is_err_and(|e| e.contains("VERW")), "{src:02x?}");
         }
     }
     #[test]

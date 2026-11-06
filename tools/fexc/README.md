@@ -36,7 +36,9 @@ The fork is the source of truth for the patches (November 4: moved from `tools/f
 `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
 (`a81a2f24...1fd8`); an installer N = 1 stream of 126,017 requests replayed through both gave no difference.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series64-chunk26-r1` (November 5, perf plan "Measured
+Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series65-p2` (November 5, pcid-plan "Measured (P2)"):
+the fork's `natemu` branch at 8d812cadd (VERW m16 inline at CPL 0). Before it,
+`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series64-chunk26-r1` (November 5, perf plan "Measured
 (chunk 26)", after its review): the fork clone's local branch `natemu-chunk26` at 0430dc8a6 (on `natemu` ab62c7e06: REP STOS in
 bulk inside a page with `--bulk`, `FexcRepStos`, only while IA32_MISC_ENABLE's fast-string bit is set; MOV r64, CR2 inline
 under `--cpl0`, `FexcMovFromCROp`, 0f 20's ModRM decoded register-only) and this tree's shim; `obj/fexc` SHA-256

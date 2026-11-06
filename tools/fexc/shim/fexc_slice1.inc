@@ -838,6 +838,17 @@ inline bool PlainMovFromCr2(const DecodedInst& d) {
   const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
   return d.InstSize == 4 && b && (b[0] & 0xF4) == 0x40;
 }
+// Perf P2: VERW m16 (0f 00 /5, a memory operand) with no prefix but a REX (the forms FexcVerwOp translates), in a CPL-0
+// request and never as its block's first instruction: its slow path exits to its own RIP, where a block starting with it
+// would be this block again; as a first instruction it stays a system cut, which the resident runs (SDM Vol.2 VERR/VERW: at
+// CPL 0 the m16 form faults only on its operand, and a #PF reading the descriptor is the inline read's own). The register
+// form stays the resident's.
+inline bool PlainVerw(const DecodedInst& d) {
+  if (d.FexcMap != FEXC_MAP_TWO || d.OPRaw != 0x00 || ((d.ModRM >> 3) & 7) != 5 || (d.ModRM >> 6) == 3 ||
+      !(d.Flags & DecodeFlags::FLAG_DECODED_MODRM)) return false;
+  const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
+  return b && (b[0] == 0x0F || ((b[0] & 0xF0) == 0x40 && b[1] == 0x0F));
+}
 // Whether `n` (the instruction after an STI, `failed`: its decode ended the block with an error) is translated in the block:
 // an inline CLI or RDTSC, or an admitted form other than a REP string, a LOCK NEG and a direct branch to a non-canonical target (the
 // checks `Cut` makes after the verdict).
@@ -862,7 +873,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
                 const DecodedInst* next, bool next_last) {
   using S = Frontend::Decoder::DecodedBlockStatus;
   // A REP string instruction (I2) or a LOCK NEG (I3) ends its block: the next instruction starts the next block.
-  if (first) fexc_after_rep = 0;
+  if (first) fexc_after_rep = 0, fexc_self_exits = 0;
   if (!first && rip == fexc_after_rep) {
     fexc_cut = {FEXC_CUT_STRING, rip, d.FexcMap, d.OPRaw, d.ModRM, false, "?", "after a self-exiting instruction (REP string, LOCK NEG)"};
     return true;
@@ -877,11 +888,14 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
   }
   const bool decoded = !failed && d.TableInfo != nullptr;
   if (decoded && (PlainFlag(d, 0xFA) || PlainFlag(d, 0xFB)) && fexc_cpl0 &&
-      (d.OPRaw == 0xFA || Follows(next, next_last && status != S::SUCCESS)))
+      (d.OPRaw == 0xFA || (!(fexc_self_exits & 2) && Follows(next, next_last && status != S::SUCCESS)))) {
+    if (d.OPRaw == 0xFB) fexc_self_exits |= 1;
     return false;
+  }
   if (decoded && PlainRdtsc(d) && fexc_tsc) return false;
   if (decoded && PlainSwapgs(d) && fexc_cpl0) return false;
   if (decoded && PlainMovFromCr2(d) && fexc_cpl0) return false;
+  if (decoded && !first && !fexc_self_exits && PlainVerw(d) && fexc_cpl0) return fexc_self_exits = 2, false;
   Verdict v = Classify(d, decoded);
   // I10 review: a #UD encoding FEX did not decode (it stops at the byte it does not know) is #UD once the instruction is
   // fetched: its bytes through the ModRM (FexcUdLength) must be in the supplied bytes, else `partial_decode` (the host fetches

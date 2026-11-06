@@ -10,7 +10,8 @@
 //!   is never written and addresses only FEX's guest-state fields: loads of `frame::GUEST_STATE`, stores only to
 //!   `frame::GUEST_STATE_WRITABLE` (DF), and in a CPL-0 block to IF's byte (perf chunk 15: its CLI and STI, which the code
 //!   shape checks) and to the GS base and IA32_KERNEL_GS_BASE's field, which it may also load (perf chunk 17: its SWAPGS,
-//!   likewise); x25 is written only by `mrs x25,
+//!   likewise), and in a CPL-0 block it may load CR2's field (perf chunk 26: its MOV r64, CR2) and the GDT base and limit
+//!   fields (perf P2: its VERW); x25 is written only by `mrs x25,
 //!   nzcv` (the pre-NZCV save the resident reads at `nzcv=saved` sites); the only `svc`s are `#LINK`, `#DIV_U`,
 //!   `#DIV_S`, `#X87` and `#STRING`; direct branches go forward to a word of the code region, but the one back edge of a
 //!   bulk REP STOS loop (perf chunk 26, [`Verifier::bulk_loop`]: its exact words, whose count is at most 256); no word falls
@@ -373,6 +374,12 @@ fn x86_mov_from_cr2(insn: &[u8]) -> bool {
         [rex, 0x0f, 0x20, m] => rex & 0xf4 == 0x40 && m >> 3 == 0b11_010,
         _ => false,
     }
+}
+/// Perf P2: VERW m16 as fexc translates it (`--cpl0`): an optional REX, 0f 00, ModRM with reg 5 and a memory operand (its
+/// bytes after it).
+fn x86_verw(insn: &[u8]) -> bool {
+    let o = usize::from(insn.first().is_some_and(|b| b & 0xf0 == 0x40));
+    insn.get(o..o + 2) == Some(&[0x0f, 0x00]) && insn.get(o + 2).is_some_and(|m| m >> 3 & 7 == 5 && m >> 6 != 3)
 }
 /// Perf chunk 26: the element width of a REP STOS in 64-bit addressing (legacy prefixes with F3, no 67; 66 for words; REX.W
 /// for quadwords), or `None`.
@@ -864,7 +871,13 @@ impl<'a> Verifier<'a> {
             let insn = self.instruction(at).map(|(g, _)| self.guest_insn(g));
             m.load && self.c.cpl0 && (offset, m.size) == (i64::from(frame::CR2), 8) && (!self.c.shape || insn.is_some_and(x86_mov_from_cr2))
         };
-        if matches!(m.form, Form::Unsigned | Form::Pair) && (fields.iter().any(inside) || flag() || (m.form == Form::Unsigned && (swapgs() || cr2()))) {
+        // Perf P2: a CPL-0 block's VERW loads the GDT base and limit fields (with the code shape: only inside a VERW).
+        let verw = || {
+            let insn = self.instruction(at).map(|(g, _)| self.guest_insn(g));
+            let field = [frame::VERW_GDT_BASE, frame::VERW_GDT_LIMIT].iter().any(|&f| (offset, m.size) == (i64::from(f), 8));
+            m.load && self.c.cpl0 && field && (!self.c.shape || insn.is_some_and(x86_verw))
+        };
+        if matches!(m.form, Form::Unsigned | Form::Pair) && (fields.iter().any(inside) || flag() || (m.form == Form::Unsigned && (swapgs() || cr2() || verw()))) {
             Ok(())
         } else {
             Err(format!("frame access {:#010x} at {at:#x}: not a guest-state field", self.word(at)))
@@ -2008,6 +2021,17 @@ mod tests {
         // ldr w21, [x28, #0xa0]; ldp x20, x21, [x28, #0xa0]; ldur x21, [x28, #0xa0]; str x21, [x28, #0x3e8] (the FS base: never written)
         for word in [0xb940_a395, 0xa94a_5794, 0xf84a_0395, 0xf901_f795] {
             assert!(cpl0(word, false).is_err_and(|e| e.contains("frame access")), "{word:#010x}");
+        }
+        // Perf P2: the VERW fields (GDT base 0x4a0, limit 0x4a8): loads only in a CPL-0 block (with the code shape only inside a
+        // VERW, which this fixture lacks); never stored; 8-byte loads only.
+        for word in [0xf942_5395, 0xf942_5795] {
+            refused(ADDRESS, at, old, word, "frame access"); // ldr x21, [x28, #0x4a0] | #0x4a8
+            validated(ADDRESS, at, old, word, Some("frame access"));
+            assert_eq!(cpl0(word, false), Ok(()), "{word:#010x}");
+            assert!(cpl0(word, true).is_err_and(|e| e.contains("frame access")), "{word:#010x}");
+        }
+        for word in [0xf902_5394, 0xb944_a395] {
+            assert!(cpl0(word, false).is_err_and(|e| e.contains("frame access")), "{word:#010x}"); // str x20, [x28, #0x4a0]; ldr w21, [x28, #0x4a0]
         }
         // I7: the segment bases (gs_cached 992, fs_cached 1000) are loads only.
         admitted(0xf941_f794); // ldr x20, [x28, #1000]: an FS-prefixed access reads FS.base

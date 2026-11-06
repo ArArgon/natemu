@@ -127,6 +127,10 @@ struct FexcCut {
 };
 inline FexcCut fexc_cut {};
 inline uint64_t fexc_after_rep = 0;   // slice1: the RIP after the block's self-exiting instruction (REP string, LOCK NEG; 0: none yet)
+// Perf P2: the inline instructions with an exit to their own RIP translated so far in the block (bit 0 an STI, bit 1 a VERW):
+// a block has at most four literal exits (abi MAX_LINK_POINTS), its end and a branch target among them, so a VERW is
+// translated only in a block with no other such instruction, and no STI after it.
+inline uint8_t fexc_self_exits = 0;
 // Profile slice1, filled by FexcPrecision::Prescan before register allocation (post-RA the JIT sees physical registers,
 // not the SSA nodes behind them); keys are IR node IDs, which RA does not change.
 inline std::map<uint32_t, int64_t> fexc_rip_relative;   // guest-memory op -> its base EntrypointOffset (offset from the block RIP)
@@ -176,6 +180,13 @@ constexpr uint32_t FEXC_KERNEL_GS_BASE = 0xa0;
 // translated inline, a load of CR2 from FEXC_CR2 (FEX's `L1Mask`, which no generated code uses), which the resident writes
 // at every entry while a CPL-0 block runs (frame::CR2 on the host).
 constexpr uint32_t FEXC_CR2 = 0xa8;
+// Profile slice1 (perf P2): with `--cpl0` VERW m16 (0f 00 /5, no prefix but a REX; never first in its block) is translated
+// inline (FEX's FexcVerwOp): ZF = 1 for a writable data segment of the GDT with DPL >= RPL, read through the shadow; anything
+// else exits to the VERW's RIP, which the resident runs. The resident writes the GDT base and its limit less 7 (0 when the
+// inline form may not read the table) at every entry while a CPL-0 block runs, in FEX's `segment_arrays` (which no 64-bit
+// code uses): frame::VERW_GDT_BASE and frame::VERW_GDT_LIMIT on the host.
+constexpr uint32_t FEXC_VERW_GDT_BASE = 0x4a0;
+constexpr uint32_t FEXC_VERW_GDT_LIMIT = 0x4a8;
 // Profile slice1 (I3), recorded by the dispatcher: guest RIP of each LOCK CMPXCHG / CMPXCHG8B / CMPXCHG16B, whose casal/caspal
 // the JIT precedes with `dmb ish` (x86 orders a failing locked compare; a failing Arm CAS writes nothing, acquire only).
 inline std::set<uint64_t> fexc_lock_cas;

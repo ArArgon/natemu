@@ -91,8 +91,10 @@ pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 /// and the GS base are read back after CPL-0 code (a CPL-0 store into either acts as SWAPGS's writes would; a CPL-3 one
 /// changes neither). Perf chunk 25: MXCSR's entry value ([`frame::MXCSR`]), which only a translated STMXCSR reads: a store
 /// into it changes what that vCPU's STMXCSRs store until its next block entry, as a store into FCW's field changes what
-/// its FNSTCWs store. Needs 48-bit linear addresses and no LAM: with LA57 it would be canonical,
-/// with LAM_SUP it would alias a canonical kernel address (neither is advertised).
+/// its FNSTCWs store. Perf P2: the GDT base and limit a CPL-0 inline VERW reads ([`frame::VERW_GDT_BASE`], 0 at CPL 3): a
+/// CPL-0 store into either changes which memory that vCPU's inline VERWs read as its GDT until its next block entry (a load
+/// through the shadow at CPL 0, nothing it could not read anyway). Needs 48-bit linear addresses and no LAM: with LA57 it
+/// would be canonical, with LAM_SUP it would alias a canonical kernel address (neither is advertised).
 pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
 pub const FRAME_POINTER: u64 = GUEST_STATE_VA;
 /// The alias's level-1, level-2 and leaf tables (window pages after the guest-RAM alias's level-2 tables).
@@ -667,6 +669,14 @@ pub mod frame {
     /// only in the resident (a #PF delivery, MOV to CR2), each followed by an entry. A CPL-0 translation's inline MOV r64, CR2
     /// loads it (admission allows that load only in a CPL-0 block, with the code shape only inside that instruction).
     pub const CR2: u32 = 0xa8;
+    /// Perf P2: the GDT a CPL-0 block's inline VERW reads (FEX's `segment_arrays[0]` and `[1]`, which no 64-bit code
+    /// uses), 8 bytes each, written by the resident at every entry: the GDTR base, and the GDTR limit less 7 (the offset
+    /// of the last whole descriptor) when the base is 8-aligned (no descriptor crosses a page), [base, base + limit] is
+    /// canonical and the limit is at least 8; else, and at CPL > 0, both 0 (the inline VERW then exits for every selector:
+    /// the resident decides). Never read back. A CPL-0 translation's inline VERW loads them (admission allows those loads
+    /// only in a CPL-0 block, with the code shape only inside a VERW).
+    pub const VERW_GDT_BASE: u32 = 0x4a0;
+    pub const VERW_GDT_LIMIT: u32 = 0x4a8;
     /// Perf chunk 25: MXCSR at the block's entry (the bank's: its controls and the exception flags banked so far), 4 bytes in
     /// FEX's `CPUState::mxcsr` (no generated code but STMXCSR's reads it), written by the resident at every entry and never read
     /// back. A translated STMXCSR/VSTMXCSR stores it with the flags FPSR and [`SIMD_FLAGS`] gathered since, as the bank would.
@@ -2386,6 +2396,9 @@ mod tests {
         // Perf chunk 26: CR2 in FEX's `L1Mask`, right after it, likewise in neither list (only a CPL-0 MOV r64, CR2 loads it).
         assert_eq!(frame::CR2, frame::KERNEL_GS_BASE + 8);
         assert!((frame::CR2..frame::CR2 + 8).all(|b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)));
+        // Perf P2: the VERW fields lie between the x87 slots and FCW, outside every admitted field.
+        assert_eq!((frame::VERW_GDT_BASE, frame::VERW_GDT_LIMIT), (frame::X87_MM + 128, frame::X87_FCW - 8));
+        assert!((frame::VERW_GDT_BASE..frame::VERW_GDT_LIMIT + 8).all(|b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)));
     }
 
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr,repbulk,cr2] [--n 100000] [--reps 3]
+    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr,repbulk,cr2,verw] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
   WRMSR KERNEL_GS_BASE, FLD+FSTP m80) at CPL 0 on 1 vCPU, as the slope (t(2N) - t(N)) / N of the driver's wall time
   (start-up and compiles fall into the intercept); every run must reach its end. With the stats `decode_exits` per
   run: after K2 a loop's decode exits do not grow with N. Perf chunk 17: `syscall`, one SYSCALL -> kernel -> SYSRET round trip
-  from a CPL-3 loop, the kernel side shaped as Linux's (`endbr64; swapgs; ...; swapgs; 7-byte NOP; sysretq`).
+  from a CPL-3 loop, the kernel side shaped as Linux's (`endbr64; swapgs; ...; swapgs; 7-byte NOP; sysretq`). Perf P2:
+  `verw` and `verw_null` (VERW m16 of a writable data selector, inline, and of the null one, the resident's), and
+  `syscall_verw` (the round trip with Linux's VERW before SYSRETQ in place of the NOP).
 - `rdrand`: 4,000 RDRANDs in a loop (the pool holds 32): all succeed, about one entropy refill exit per 32, values differ.
 - `xmc`: cross-modifying code at a system instruction, by the x86 protocol (deterministic: see `xmc`): vCPU 1 rewrites
   one byte of X (CLI <-> NOP, CLI <-> STI, SWAPGS <-> RDTSCP, FLD m80 <-> FILD m32, CLI -> INT3) paced by vCPU 0's
@@ -40,6 +42,8 @@
   translated code (see `repbulk`).
 - `cr2` (perf chunk 26): MOV r64, CR2 translated inline at CPL 0 reads CR2 after #PF deliveries (nested too), MOV to CR2, under
   TF; at CPL 3 it is #GP(0) and the guest-state page holds no CR2 (see `cr2`).
+- `verw` (perf P2): VERW m16 translated inline at CPL 0 gives the SDM's ZF for every selector class, form and table change,
+  faults as the resident's, and leaves every other flag (see `verw`).
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, subprocess, sys, time
@@ -74,6 +78,11 @@ COSTS = {
     # Perf chunk 26: 4 KiB of REP STOSQ and REP STOSB (RDI page-aligned), one iteration each.
     'stosq_4k': ('mov edi, 0x300000\nmov ecx, 512\nrep stosq', {}),
     'stosb_4k': ('mov edi, 0x300000\nmov ecx, 4096\nrep stosb', {}),
+    # Perf P2: VERW m16 at CPL 0 of the driver's DPL-0 data selector (inline), and of the null selector (ZF = 0: the
+    # resident's); each after the store of its selector. `syscall_verw`: `syscall` with Linux's VERW before SYSRETQ.
+    'verw': ('mov word ptr [rbx], 0x10\nverw word ptr [rbx]', {3: DATA + 16}),
+    'verw_null': ('mov word ptr [rbx], 0\nverw word ptr [rbx]', {3: DATA + 16}),
+    'syscall_verw': (None, {}),
 }
 USER_GS, KERNEL_GS, KERNEL_RIP = 0x2a0000, 0x2b0000, 0x200000
 # The guest-state page's alias (abi `GUEST_STATE_VA`, the recorded deviation): IF's byte at +0x3f9, the event-pending byte at +0x406.
@@ -82,6 +91,10 @@ GUEST_STATE_VA = 0xffff_4000_0000_1000
 # GS; ...; SWAPGS; a 7-byte NOP; SYSRETQ.
 LINUX_KERNEL = ('endbr64\nswapgs\nmov gs:[16], rsp\nmov rsp, gs:[24]\npush rcx\npop rcx\nmov rsp, gs:[16]\nswapgs\n'
                 '.byte 0x0f,0x1f,0x80,0,0,0,0\nsysretq')
+# Perf P2: the same with Linux's MDS clearing (mitigations on, MDS_NO clear): VERW of __KERNEL_DS (here the driver's 0x10)
+# RIP-relative after the last SWAPGS, as `CLEAR_CPU_BUFFERS` before SYSRETQ.
+LINUX_KERNEL_VERW = ('endbr64\nswapgs\nmov gs:[16], rsp\nmov rsp, gs:[24]\npush rcx\npop rcx\nmov rsp, gs:[16]\nswapgs\n'
+                     'verw word ptr [rip + kds]\nsysretq\nkds: .word 0x10')
 
 
 def wrmsr(index, value):
@@ -125,7 +138,7 @@ def cost(a, report):
         for rep in range(a.reps + 1):
             for n in (a.n, 2 * a.n):
                 text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n, **regs})}\ncode {code.hex()}\ncpl 0\nif 0\n'
-                        f'memory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n') if body else syscall_program('1: syscall\ndec r8\njnz 1b', LINUX_KERNEL, {8: n})
+                        f'memory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n') if body else syscall_program('1: syscall\ndec r8\njnz 1b', LINUX_KERNEL_VERW if name == 'syscall_verw' else LINUX_KERNEL, {8: n})
                 dt, out, err = driver(a, text, a.out / 'cost' / f'{name}-{n}')
                 if out is None or out['stop'] != 'reached' or int(out['gpr'][8], 0) != 0:
                     failures.append(f"cost {name} n={n}: {err if out is None else (out['stop'], out['reason'])}")
@@ -1660,11 +1673,353 @@ def cr2(a, report):
     return failures
 
 
+def verw_model(sel, gdt, gdt_limit, ldt=None, ldt_limit=0, cpl=0):
+    """SDM Vol.2 VERR/VERW, VERW in 64-bit mode: ZF for selector `sel` at `cpl` with the tables {offset: descriptor} and
+    limits (ldt None: LDTR null). Null, outside the limit, a system or code segment, read-only data, DPL < CPL or DPL < RPL
+    (data is never conforming): 0. The descriptor's P bit is not checked."""
+    if sel & 0xfffc == 0: return 0
+    table, limit = (ldt, ldt_limit) if sel & 4 else (gdt, gdt_limit)
+    if table is None or (sel & 0xfff8) + 7 > limit: return 0
+    d = table.get(sel & 0xfff8, 0)
+    s_, kind, dpl = d >> 44 & 1, d >> 40 & 15, d >> 45 & 3
+    return int(bool(s_) and not kind & 8 and bool(kind & 2) and dpl >= cpl and dpl >= (sel & 3))
+
+
+def seg(access, base=0, limit=0xfffff, flags=0xc):
+    return limit & 0xffff | (base & 0xffffff) << 16 | access << 40 | (limit >> 16 & 0xf) << 48 | flags << 52 | (base >> 24 & 0xff) << 56
+
+
+def verw(a, report):
+    """Perf P2: VERW m16 at CPL 0 translated inline (ZF = 1 for a writable data segment of the GDT with DPL >= RPL, the
+    descriptor read through the shadow; anything else exits to the resident's VERW, the reference). Judged by the SDM (Vol.2
+    VERR/VERW, `verw_model`), at block sizes default (inline) and 1 (every VERW the resident's), and the two must agree:
+    - `table`: 100 selectors (every GDT entry of a 22-entry table at RPL 0-3: null, 64-bit code, writable, read-only and
+      expand-down data at DPL 0-3, conforming code, a data segment not present or not accessed, LDT, TSS, call gate; beyond
+      the limit by one byte and far; LDT selectors), each by five VERW forms (absolute, [rbx], [rbx + r9 * 2] (REX.X),
+      [r12 + 8] (REX.B), RIP-relative) and the register form (the resident's), under three arithmetic-flag patterns: RFLAGS
+      & 8D5H after each is the pattern with only ZF changed. Five phases: LDTR null; after LLDT; after LGDT with the limit one
+      byte short of the last entry; one byte past it (the next entry in); after LGDT of another table with other answers.
+      (Phase A loads a null LDTR first: the reset LDTR is present with base 0.)
+      At the default size exactly the GDT selectors' ZF = 1 cases of the memory forms do not reach the resident (inline).
+    - `alias`: the GDT page read-only (as Linux's fixmap GDT), written through a writable alias of its frame between VERWs
+      of one block: each VERW sees the last write (writable, read-only, DPL 3, back).
+    - `smp`: a peer rewrites a descriptor through the alias (writable / read-only by round) and then raises a round flag;
+      vCPU 0 waits for the flag and VERWs: 20,000 rounds, every answer the round's.
+    - `faults`: the m16 operand in a not-present page (#PF, error 0, CR2 the operand), crossing into one (CR2 the next
+      page), non-canonical through RBX (#GP(0)) and RBP (#SS(0)); the descriptor in a not-present page (#PF, error 0, CR2
+      the descriptor); a selector beyond the limit there (ZF = 0, no fault).
+    - `cpl3`: at CPL 3 (the resident's VERW) DPL-3 data 1, DPL-0 data and RPL 3 0; the guest-state page's VERW fields read 0
+      there (and the GDTR base and limit - 7 at CPL 0).
+    - `watch`: a data breakpoint on the descriptor is not met by VERW's implicit read (no #DB), one on the m16 operand is
+      (one #DB); ZF = 1 both times.
+    - `misaligned`, `edge`, `uc`: a GDT base 4 mod 8, one in the last canonical page of the lower half (base + limit not
+      canonical), a GDT page of type UC: every answer as the SDM's (the inline form defers to the resident; for `edge` a
+      descriptor at a non-canonical address gives ZF = 0, the resident's rule).
+    - `misaligned-op`, `straddle-op`, `cross-op`, `end-op`, `own-group`, `watch-group`: the m16 operand at +3, at +7 (two
+      8-byte groups), crossing into a mapped page, two bytes before a page not mapped, as the GDT slot its own selector
+      names, and with a watchpoint on another byte of its 8-byte group; each with a selector accepted inline, one refused by
+      DPL and one beyond the limit: ZF as the SDM's, every other flag kept, no fault, no #DB.
+    - `misaligned-cross-mapped`, `-unmapped`: a GDT base 4 mod 8 whose descriptor crosses a page: ZF = 1, or #PF at the next
+      page. Fault cases also check the delivered frame's RFLAGS (the flag pattern: nothing of the VERW committed); `watch`
+      and the `misaligned`/`edge`/`uc` re-runs check every flag after the VERW.
+    - `first-many`: a VERW at a branch target (its block's first: the resident's), each answer; six VERWs in one straight
+      block (one translated, the block's literal exits stay within four), each answer; selector 0xfff8 (beyond the limit)
+      as the low word of an 8-byte group that reads as a writable data descriptor: ZF = 0.
+    - `kicks`: 200,000 SYSCALL round trips whose kernel side ends `swapgs; verw [rip + KDS]; jnz bad; sysretq` (Linux's
+      shape) under 20,000 precise stops at random times: counts exact, no wrong answer."""
+    # Every VERW meant to be translated follows a `jmp` to the instruction before it: one per block (a block translates at
+    # most one; whether a later one is depends on where the slow paths of earlier ones end blocks).
+    asm, failures, runs = ref.assemble, [], []
+    T, LDT, GDTR, SELS, SLOT, RES, T2 = 0x300000, 0x301000, 0x302000, 0x303000, 0x304000, 0x305000, 0x30c000
+    def record(tag, problems):
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'verw {tag}: {problems}')
+    def mem(out, at, n=8):
+        memory = out['memory'] if 'memory' in out else out['cpus'][0]['memory']
+        return next((int.from_bytes(bytes.fromhex(m['data'])[at - int(m['addr'], 0):][:n], 'little') for m in memory
+                     if int(m['addr'], 0) <= at < int(m['addr'], 0) + len(m['data']) // 2), None)
+    def raw(out, at, n):
+        m = next(m for m in out['memory'] if int(m['addr'], 0) <= at < int(m['addr'], 0) + len(m['data']) // 2)
+        return bytes.fromhex(m['data'])[at - int(m['addr'], 0):][:n]
+    def image(table, n):
+        b = bytearray(n)
+        for o, d in table.items(): b[o:o + 8] = d.to_bytes(8, 'little')
+        return bytes(b)
+    def gdtr(base, limit): return limit.to_bytes(2, 'little') + base.to_bytes(8, 'little') + bytes(6)
+    def space(items, at=0x300000, n=0x10000):
+        """One memory item of n bytes at `at` holding {address: bytes} (the driver reports memory items only)."""
+        b = bytearray(n)
+        for x, d in items.items(): b[x - at:x - at + len(d)] = d
+        return f'memory {at:#x} {bytes(b).hex()}\n'
+    # The driver's first five entries (CS 0x08 stays usable for delivery), then the cases.
+    A = {0x08: 0x00af9b000000ffff, 0x10: seg(0x93), 0x18: seg(0xf3), 0x20: 0x00affb000000ffff, 0x28: seg(0x91), 0x30: seg(0x97),
+         0x38: seg(0xb3), 0x40: seg(0xd3), 0x48: seg(0x9f), 0x50: seg(0xff), 0x58: seg(0x13), 0x60: seg(0x92),
+         0x68: seg(0x82, LDT & 0xffffffff, 0x17, 0), 0x70: LDT >> 32, 0x78: seg(0x89, 0x3a0000, 0x67, 0), 0x80: 0,
+         0x88: 0x0000_8c00_0008_1000, 0x90: 0, 0x98: seg(0xf1), 0xa0: seg(0x93), 0xa8: seg(0x93)}
+    B = dict(A); B.update({0x10: seg(0x91), 0x28: seg(0x93), 0x18: seg(0xd3), 0x38: seg(0x9b), 0xa0: seg(0xf1)})
+    L = {0x00: seg(0x93), 0x08: seg(0xf3), 0x10: seg(0x9b)}
+    sels = sorted({o | r for o in range(0, 0xb0, 8) for r in range(4)} | {0x04, 0x07, 0x0c, 0x0e, 0x0f, 0x14, 0x17, 0x1c, 0xfff8, 0xfffb, 0xfffc, 0xffff})
+    PHASES = [('A', T, 0xa7, None), ('B', T, 0xa7, 0x68), ('C', T, 0xa6, 0x68), ('D', T, 0xaf, 0x68), ('E', T2, 0xaf, 0x68)]
+    FORMS = ['verw word ptr [0x304000]', 'verw word ptr [rbx]', 'verw word ptr [rbx + r9 * 2]', 'verw word ptr [r12 + 8]', 'RIP', 'verw ax']
+    PAT = [('mov edx, 0\ncmp edx, 1', 0x95), ('mov dl, 0x7f\nadd dl, 1', 0x890), ('mov edx, 5\ncmp edx, 5', 0x44)]
+    body, k = '', 0
+    for f in FORMS:
+        p, _ = PAT[k % 3]; k += 1
+        form = f'rv{k}: .byte 0x0f, 0x00, 0x2d, 0, 0, 0, 0' if f == 'RIP' else f
+        body += f'{p}\nmov r10d, ecx\n{form}\npushfq\npop rdx\nmov [rdi], dx\nadd rdi, 2\njmp f{k}\nf{k}:\n'   # one VERW per block
+    loop = (f'run: lea rsi, [{SELS:#x}]\nmov ecx, {len(sels)}\n1: movzx eax, word ptr [rsi]\nmov [rbx], ax\n{body}add rsi, 2\ndec ecx\njnz 1b\nret\n')
+    main_ = ''
+    for n, (ph, base, limit, ldtr) in enumerate(PHASES):
+        main_ += f'lgdt [{GDTR + 16 * n:#x}]\n' + (f'mov eax, {ldtr or 0:#x}\nlldt ax\n' if n < 2 else '') + f'mov rdi, {RES + 0x1000 * n:#x}\ncall run\n'
+    code, lab = asm(f'mov rbx, {SLOT:#x}\nxor r9d, r9d\nmov r12, {SLOT - 8:#x}\n' + main_ + 'jmp done\n' + loop + 'done: nop', labels=True)
+    code = bytearray(code)
+    for j in range(1, len(FORMS) + 1):
+        if f'rv{j}' in lab:
+            at = lab[f'rv{j}']; code[at + 3:at + 7] = (SLOT - (CODE + at + 7)).to_bytes(4, 'little', signed=True)
+    gdtrs = b''.join(gdtr(base, limit) for _, base, limit, _ in PHASES)
+    tables = space({T: image(A, 0xb0), LDT: image(L, 0x18), GDTR: gdtrs, SELS: b"".join(x.to_bytes(2, "little") for x in sels), T2: image(B, 0xb0)})
+    text = f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {bytes(code).hex()}\ncpl 0\nif 0\nregion 0x3e0000 0x10000\n{tables}'
+    systems = {}
+    results = {}
+    for block in (None, 1):
+        _, out, err = driver(a, text, a.out / 'verw' / f'table-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out['reason']} fault {out.get('fault')}"])
+        if out and not problems:
+            systems[block] = out['stats']['systems']
+            got = {}
+            for n, (ph, base, limit, ldtr) in enumerate(PHASES):
+                data = raw(out, RES + 0x1000 * n, 2 * len(FORMS) * len(sels))
+                gdt = A if base == T else B
+                for i, sel in enumerate(sels):
+                    want = verw_model(sel, gdt, limit, L if ldtr else None, 0x17)
+                    for j, f in enumerate(FORMS):
+                        fl = int.from_bytes(data[2 * (len(FORMS) * i + j):][:2], 'little') & 0x8d5
+                        pat = PAT[j % 3][1]
+                        got[(ph, sel, j)] = fl
+                        if fl != (pat & ~0x40) | want << 6:
+                            problems.append(f'{ph} sel {sel:#06x} form {j}: flags {fl:#x}, want {(pat & ~0x40) | want << 6:#x}')
+            results[block] = got
+        record(f'table-{block}', problems[:12])
+    if len(results) == 2 and results[None] != results[1]:
+        record('table-agree', ['block sizes differ'])
+    # Inline: every memory form of a GDT selector with ZF = 1 (an LDT selector exits to the resident).
+    ins = sum(verw_model(s_, A if b == T else B, lim, L if ld else None, 0x17) for _, b, lim, ld in PHASES for s_ in sels if not s_ & 4) * 5
+    if len(systems) == 2:
+        record('table-inline', [] if systems[1] - systems[None] == ins else [f'systems at size 1 {systems[1]}, default {systems[None]}: {ins} inline expected'])
+
+    # alias: identity space; the GDT page read-only, its frame's alias at 0x310000 writable.
+    G, AL, ISTACK = 0x300000, 0x310000, 0x2f0000
+    gd = {0x08: 0x00af9b000000ffff, 0x10: seg(0x93)}
+    steps = [(0x93, 1), (0x91, 0), (0xf3, 1), (0x9b, 0), (0x93, 1)]
+    body = ''.join(f'mov byte ptr [{AL + 0x15:#x}], {acc:#x}\njmp a{i}\na{i}: nop\nverw word ptr [rbx]\nsetz byte ptr [{RES + i:#x}]\n' for i, (acc, _) in enumerate(steps))
+    code = asm(f'lgdt [{GDTR:#x}]\nmov rbx, {SLOT:#x}\nmov word ptr [rbx], 0x10\n' + body + 'nop')
+    for block in (None, 1):
+        text = (f'identity\nrip {CODE:#x}\nrflags 0x2\n{gprs({4: ISTACK})}\ncode {code.hex()}\ncpl 0\nif 0\n{space({G: image(gd, 0x18), GDTR: gdtr(G, 0x17)}, n=0x11000)}'
+                f'region {ISTACK - 0x10000:#x} 0x10000\nreadonly {G:#x}\nentry {AL:#x} 1 clear 0xffffffffff000\nentry {AL:#x} 1 set {G:#x}\n')
+        _, out, err = driver(a, text, a.out / 'verw' / f'alias-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            got = [mem(out, RES + i, 1) for i in range(len(steps))]
+            if out['stop'] != 'reached' or got != [w for _, w in steps]:
+                problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')} answers {got}, want {[w for _, w in steps]}")
+        record(f'alias-{block}', problems)
+
+    # smp: vCPU 1 rewrites the descriptor through the alias, then the round flag; vCPU 0 VERWs after seeing the flag.
+    N = 20000
+    v0 = asm(f'lgdt [{GDTR:#x}]\nmov rbx, {SLOT:#x}\nmov word ptr [rbx], 0x10\nmov r8d, 1\n'
+             f'1: cmp dword ptr [{RES + 0x100:#x}], r8d\njne 1b\nnop\nverw word ptr [rbx]\nsetz al\nmov edx, r8d\nand edx, 1\ncmp al, dl\n'
+             f'je 2f\ninc qword ptr [{RES + 0x108:#x}]\n2: mov dword ptr [{RES + 0x110:#x}], r8d\ninc r8d\ncmp r8d, {N + 1}\njne 1b\nnop')
+    v1 = asm(f'mov r8d, 1\n1: mov eax, r8d\nand eax, 1\nmov edx, 0x91\nmov ecx, 0x93\ntest eax, eax\ncmovnz edx, ecx\nmov byte ptr [{AL + 0x15:#x}], dl\n'
+             f'mov dword ptr [{RES + 0x100:#x}], r8d\n2: cmp dword ptr [{RES + 0x110:#x}], r8d\njne 2b\ninc r8d\ncmp r8d, {N + 1}\njne 1b\nnop')
+    for block in (None, 1):
+        text = (f'identity\nbody {CODE:#x} {v0.hex()}\nbody {CODE + 0x10000:#x} {v1.hex()}\n{space({G: image(gd, 0x18), GDTR: gdtr(G, 0x17)}, n=0x11000)}'
+                f'region {ISTACK - 0x10000:#x} 0x10000\nreadonly {G:#x}\nentry {AL:#x} 1 clear 0xffffffffff000\nentry {AL:#x} 1 set {G:#x}\n'
+                f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({4: ISTACK})}\ncpl 0\nif 0\ncpu\nrip {CODE + 0x10000:#x}\nrflags 0x2\n{gprs({4: ISTACK - 0x8000})}\ncpl 0\nif 0\n')
+        _, out, err = driver(a, text, a.out / 'verw' / f'smp-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            if any(c['stop'] != 'reached' for c in out['cpus']) or mem(out, RES + 0x108) != 0 or mem(out, RES + 0x110, 4) != N:
+                problems.append(f"stops {[c['stop'] for c in out['cpus']]} wrong {mem(out, RES + 0x108)} rounds {mem(out, RES + 0x110, 4)}")
+        record(f'smp-{block}', problems)
+
+    # faults (the driver's IDT reports them): [vector, CR2, error, RIP].
+    P_, NC = 0x320000, 0x0000_8000_0000_0000
+    fg = {0x08: 0x00af9b000000ffff, 0x10: seg(0x93), 0x1008: seg(0x93), 0x1010: seg(0x93)}
+    cases = [('pf-operand', f'mov rbx, {P_ + 0x10:#x}', 'verw word ptr [rbx]', [14, P_ + 0x10, 0], None),
+             ('pf-cross', f'mov rbx, {P_ - 1:#x}', 'verw word ptr [rbx]', [14, P_, 0], None),
+             ('gp-noncanonical', f'mov rbx, {NC:#x}', 'verw word ptr [rbx]', [13, 0, 0], None),
+             ('ss-noncanonical', f'mov rbp, {NC:#x}', 'verw word ptr [rbp]', [12, 0, 0], None),
+             ('pf-descriptor', f'mov rbx, {SLOT:#x}\nmov word ptr [rbx], 0x1008', 'verw word ptr [rbx]', [14, 0x330000 + 0x1008, 0], None),
+             ('beyond-limit', f'mov rbx, {SLOT:#x}\nmov word ptr [rbx], 0x1010', 'verw word ptr [rbx]', None, 0)]
+    for name, setup, insn, want, zf in cases:
+        code, lab = asm(f'lgdt [{GDTR:#x}]\n{setup}\nmov edx, 0\ncmp edx, 1\nnop\nx: {insn}\nsetz al\nnop', labels=True)
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({0: 0x77})}\ncode {code.hex()}\ncpl 0\nif 0\n{space({GDTR: gdtr(0x330000, 0x100f)})}region 0x3e0000 0x10000\n'
+                    f'region {P_ - 0x1000:#x} 0x2000\nunmap {P_:#x}\nmemory 0x330000 {image(fg, 0x1018).hex()}\nunmap 0x331000\n')
+            _, out, err = driver(a, text, a.out / 'verw' / f'{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                if want is not None:
+                    f = [int(x, 0) for x in out['fault']]
+                    frame = [int(x, 0) if isinstance(x, str) else x for x in out.get('delivered', {}).get('frame', [0] * 6)]
+                    if out['stop'] != 'guest_fault' or f[:3] != want or f[3] != CODE + lab['x'] or frame[2] & 0x8d5 != 0x95:
+                        problems.append(f"stop {out['stop']} {out['reason']} fault {[hex(x) for x in f]}, want {[hex(x) for x in want]} at {CODE + lab['x']:#x}, "
+                                        f"frame RFLAGS {frame[2]:#x} (want the pattern 0x95: nothing of the VERW committed)")
+                elif out['stop'] != 'reached' or int(out['gpr'][0], 0) & 0xff != zf:
+                    problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')} al {out['gpr'][0]}")
+            record(f'{name}-{block}', problems)
+
+    # cpl3: the driver's GDT (0x10 DPL-0 data, 0x18 DPL-3 data); the alias's VERW fields at CPL 0, then at CPL 3.
+    FB, FL = GUEST_STATE_VA + 0x4a0, GUEST_STATE_VA + 0x4a8
+    code, lab = asm(f'mov rax, {FB:#x}\nmov r12, [rax]\nmov rax, {FL:#x}\nmov r13, [rax]\nsgdt [{RES + 0x40:#x}]\nsw: nop\n'
+                    f'mov rax, {FB:#x}\nmov r14, [rax]\nmov rax, {FL:#x}\nmov r15, [rax]\nmov rbx, {SLOT:#x}\n'
+                    + ''.join(f'mov word ptr [rbx], {s_:#x}\njmp c{i}\nc{i}: nop\nverw word ptr [rbx]\nsetz byte ptr [{RES + i:#x}]\n' for i, s_ in enumerate((0x10, 0x13, 0x18, 0x1b, 0x20)))
+                    + 'nop', labels=True)
+    for block in (None, 1):
+        text = f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nswitch {CODE + lab["sw"]:#x} 3\n{space({})}region 0x3e0000 0x10000\n'
+        _, out, err = driver(a, text, a.out / 'verw' / f'cpl3-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            g = [int(x, 0) for x in out['gpr']]
+            got = [mem(out, RES + i, 1) for i in range(5)]
+            base, limit = mem(out, RES + 0x42), mem(out, RES + 0x40, 2)
+            if out['stop'] != 'reached' or got != [0, 0, 1, 1, 0] or (g[12], g[13]) != (base, limit - 7) or (g[14], g[15]) != (0, 0):
+                problems.append(f"stop {out['stop']} {out['reason']} answers {got} CPL-0 fields {g[12]:#x} {g[13]:#x} (GDTR {base:#x} {limit:#x}) CPL-3 {g[14]:#x} {g[15]:#x}")
+        record(f'cpl3-{block}', problems)
+
+    # watch: DR0 on the descriptor (8 bytes, read/write), then DR1 on the operand (2 bytes); a #DB handler counts.
+    TB, IDTR_ = 0x306000, 0x306800
+    def dr7(n, ln): return (1 << 2 * n) | (3 << 16 + 4 * n) | ({2: 1, 8: 2}[ln] << 18 + 4 * n)
+    code, lab = asm(f'lidt [{IDTR_:#x}]\nlgdt [{GDTR:#x}]\nmov rbx, {SLOT:#x}\nmov word ptr [rbx], 0x10\nmov rax, {T + 0x10:#x}\nmov dr0, rax\n'
+                    f'mov rax, {dr7(0, 8):#x}\nmov dr7, rax\nmov edx, 0\ncmp edx, 1\nnop\nverw word ptr [rbx]\npushfq\npop qword ptr [{RES + 0x10:#x}]\nsetz byte ptr [{RES:#x}]\n'
+                    f'mov rax, {SLOT:#x}\nmov dr1, rax\nmov rax, {dr7(1, 2):#x}\nmov dr7, rax\nmov edx, 0\ncmp edx, 1\nnop\nverw word ptr [rbx]\npushfq\npop qword ptr [{RES + 0x18:#x}]\nsetz byte ptr [{RES + 1:#x}]\n'
+                    f'xor eax, eax\nmov dr7, rax\njmp done\nh1: inc qword ptr [{RES + 8:#x}]\niretq\ndone: nop', labels=True)
+    h = CODE + lab['h1']
+    gates = bytearray(16 * 2); gates[16:32] = (h & 0xffff | 0x08 << 16 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (h >> 32).to_bytes(8, 'little')
+    for block in (None, 1):
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nregion 0x3e0000 0x10000\n'
+                f'{space({T: image(A, 0xb0), GDTR: gdtr(T, 0xaf), TB: bytes(gates), IDTR_: gdtr(TB, 31)})}')
+        _, out, err = driver(a, text, a.out / 'verw' / f'watch-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out and (out['stop'] != 'reached' or [mem(out, RES, 1), mem(out, RES + 1, 1), mem(out, RES + 8)] != [1, 1, 1]
+                    or [mem(out, RES + 0x10) & 0x8d5, mem(out, RES + 0x18) & 0x8d5] != [0xd5, 0xd5]):
+            problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')} answers {[mem(out, RES, 1), mem(out, RES + 1, 1)]} #DBs {mem(out, RES + 8)} "
+                            f"flags {[hex((mem(out, RES + o) or 0) & 0x8d5) for o in (0x10, 0x18)]} (want 0xd5: only ZF changed)")
+        record(f'watch-{block}', problems)
+
+    # misaligned, edge, uc: the inline form defers; the answers are the SDM's (edge: a non-canonical descriptor gives 0).
+    EDGE = 0x7fff_ffff_f000
+    probe = (0x10, 0x13, 0x18, 0x28, 0x30, 0x48, 0xa0)
+    variants = [('misaligned', T + 4, 0xaf, {T + 4: image(A, 0xb0)}, '', {s_: verw_model(s_, A, 0xaf) for s_ in probe}),
+                ('edge', EDGE, 0xffff, {}, f'memory {EDGE:#x} {image(A, 0x1000).hex()}\n', {**{s_: verw_model(s_, A, 0xaf) for s_ in probe}, 0x1010: 0}),
+                ('uc', T, 0xaf, {T: image(A, 0xb0)}, f'entry {T:#x} 1 set 0x18\n', {s_: verw_model(s_, A, 0xaf) for s_ in probe})]
+    for name, base, limit, items, extra_, want in variants:
+        code = asm(f'lgdt [{GDTR:#x}]\nmov rbx, {SLOT:#x}\n' + ''.join(f'mov word ptr [rbx], {s_:#x}\nmov edx, 0\ncmp edx, 1\njmp e{i}\ne{i}: nop\nverw word ptr [rbx]\n'
+                                                                    f'pushfq\npop qword ptr [{RES + 0x40 + 8 * i:#x}]\nsetz byte ptr [{RES + i:#x}]\n'
+                                                                    for i, s_ in enumerate(want)) + 'nop')
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nregion 0x3e0000 0x10000\n'
+                    f'{space({**items, GDTR: gdtr(base, limit)})}{extra_}')
+            _, out, err = driver(a, text, a.out / 'verw' / f'{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                got = [mem(out, RES + i, 1) for i in range(len(want))]
+                flags = [mem(out, RES + 0x40 + 8 * i) & 0x8d5 for i in range(len(want))]
+                if out['stop'] != 'reached' or got != list(want.values()) or flags != [0x95 & ~0x40 | z << 6 for z in want.values()]:
+                    problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')} answers {got}, want {list(want.values())}; flags {[hex(x) for x in flags]}")
+                if name == 'uc' and not out['stats']['k1']['uncached']['resident']:
+                    problems.append(f"no UC access by the resident: {out['stats']['k1']['uncached']}")
+            record(f'{name}-{block}', problems)
+
+    # operand: where the m16 operand lies decides the inline form's fallback read (the operand's own 8-byte group): misaligned
+    # (+3), straddling two groups (+7), crossing into a mapped page, two bytes before a page not mapped (the fallback must not
+    # cross), the operand itself the GDT slot its selector names (an exit), and a watchpoint on a byte of the operand's group
+    # outside the operand (met by the fallback read only: the instruction runs alone, no #DB). Each with a selector accepted
+    # inline (0x10), one refused by DPL (0x13: the descriptor read) and one beyond the limit (0xfff8: the fallback read);
+    # RFLAGS & 8D5H after each the pattern 95H with only ZF changed.
+    own = dict(A); own[0x40] = seg(0x93, 0, 0x40)   # its low word, the selector stored there, is 0x40
+    places = [('misaligned-op', SLOT + 3, A, ''), ('straddle-op', SLOT + 7, A, ''), ('cross-op', 0x30afff, A, ''),
+              ('end-op', 0x30fffe, A, ''), ('own-group', T + 0x40, own, ''),
+              ('watch-group', SLOT, A, f'mov rax, {SLOT + 4:#x}\nmov dr0, rax\nmov rax, {(1 | 3 << 16 | 0 << 18):#x}\nmov dr7, rax\n')]
+    for name, op, gdt, arm in places:
+        sels = (0x40,) if name == 'own-group' else (0x10, 0x13, 0xfff8)
+        body = ''.join((f'mov word ptr [rbx], {x:#x}\n' if name != 'own-group' else '') + f'mov edx, 0\ncmp edx, 1\njmp o{i}\no{i}: nop\nverw word ptr [rbx]\n'
+                       f'pushfq\npop qword ptr [{RES + 8 * i:#x}]\n' for i, x in enumerate(sels))
+        code = asm(f'lgdt [{GDTR:#x}]\nmov rbx, {op:#x}\n{arm}' + body + 'xor eax, eax\nmov dr7, rax\nnop')
+        want = [verw_model(x, gdt, 0xaf) for x in sels]
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nregion 0x3e0000 0x10000\n'
+                    f'{space({T: image(gdt, 0xb0), GDTR: gdtr(T, 0xaf), **({T + 0x40: (0x40).to_bytes(2, "little")} if name == "own-group" else {})})}')
+            _, out, err = driver(a, text, a.out / 'verw' / f'{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                flags = [(mem(out, RES + 8 * i) or 0) & 0x8d5 for i in range(len(sels))]
+                if out['stop'] != 'reached' or flags != [0x95 & ~0x40 | z << 6 for z in want]:
+                    problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')} flags {[hex(x) for x in flags]}, want ZF {want} over 0x95")
+                if name == 'watch-group' and block is None and not out['stats']['watch_hits']:
+                    problems.append('the fallback read met no watchpoint')
+            record(f'{name}-{block}', problems)
+
+    # misaligned-cross: a GDT base 4 mod 8 whose 0x10 descriptor crosses a page, the next page mapped (ZF = 1) or not (#PF at
+    # the VERW, CR2 the next page): the resident's answers (no inline read: the base is not 8-aligned).
+    for name, base, items, mapped in (('misaligned-cross-mapped', 0x30a000 - 0x14, {}, True), ('misaligned-cross-unmapped', 0x310000 - 0x14, {}, False)):
+        img = {base: image(A, 0x18)} if mapped else {base: image(A, 0x14)}
+        code, lab = asm(f'lgdt [{GDTR:#x}]\nmov rbx, {SLOT:#x}\nmov word ptr [rbx], 0x10\nmov edx, 0\ncmp edx, 1\njmp mc\nmc: nop\nx: verw word ptr [rbx]\n'
+                        f'pushfq\npop qword ptr [{RES:#x}]\nnop', labels=True)
+        tail = '' if mapped else f'memory 0x310000 {image({0: A[0x10] >> 32}, 8).hex()}\nunmap 0x310000\n'
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nregion 0x3e0000 0x10000\n'
+                    f'{space({**img, GDTR: gdtr(base, 0xaf)})}{tail}')
+            _, out, err = driver(a, text, a.out / 'verw' / f'{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                if mapped and (out['stop'] != 'reached' or (mem(out, RES) or 0) & 0x8d5 != 0xd5):
+                    problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')} flags {hex((mem(out, RES) or 0) & 0x8d5)}")
+                if not mapped and (out['stop'] != 'guest_fault' or [int(x, 0) for x in out['fault']] != [14, 0x310000, 0, CODE + lab['x']]):
+                    problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')}, want #PF at 0x310000")
+            record(f'{name}-{block}', problems)
+
+    # first: a VERW starting its block (a branch target) is the resident's (a translated one's exit would re-enter its own
+    # block), with ZF 0 and 1; many: six VERWs in one straight block (one translated: a block has at most four literal exits).
+    # fake: the m16 operand is the low word of an 8-byte group that reads as a writable DPL-0 data descriptor (selector
+    # 0xfff8, beyond the limit): the inline form reads that group in place of a descriptor and must not accept it (ZF = 0).
+    sl = (0x10, 0x0, 0x13, 0x18, 0x28, 0x10)
+    first = ''.join(f'mov word ptr [rbx], {x:#x}\njmp v{i}\nv{i}: verw word ptr [rbx]\nsetz byte ptr [{RES + i:#x}]\n' for i, x in enumerate(sl))
+    many = ''.join(f'mov word ptr [r{8 + i}], {x:#x}\n' for i, x in enumerate(sl)) + 'nop\n' + ''.join(
+        f'verw word ptr [r{8 + i}]\nsetz byte ptr [{RES + 8 + i:#x}]\n' for i in range(len(sl)))
+    fake = f'jmp fk\nfk: mov rax, {seg(0x93, 0, 0xffff8):#x}\nmov [rbx + 0x40], rax\nnop\nverw word ptr [rbx + 0x40]\nsetz byte ptr [{RES + 0x10:#x}]\n'
+    code = asm(f'lgdt [{GDTR:#x}]\nmov rbx, {SLOT:#x}\n' + ''.join(f'lea r{8 + i}, [rbx + {2 * i}]\n' for i in range(len(sl))) + first + 'jmp m\nm: ' + many + fake + 'nop')
+    want = [verw_model(x, A, 0xaf) for x in sl]
+    for block in (None, 1):
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nregion 0x3e0000 0x10000\n'
+                f'{space({T: image(A, 0xb0), GDTR: gdtr(T, 0xaf)})}')
+        _, out, err = driver(a, text, a.out / 'verw' / f'first-many-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            got = [mem(out, RES + i, 1) for i in range(len(sl))], [mem(out, RES + 8 + i, 1) for i in range(len(sl))], mem(out, RES + 0x10, 1)
+            if out['stop'] != 'reached' or got != (want, want, 0):
+                problems.append(f"stop {out['stop']} {out['reason']} first {got[0]} many {got[1]} fake {got[2]}, want {want} and 0")
+        record(f'first-many-{block}', problems)
+
+    # kicks: Linux's return shape under precise stops; the driver's GDT has 0x10 as the kernel data segment.
+    BAD = KERNEL_GS + 16
+    kicks = syscall_program('1: inc qword ptr gs:[8]\nsyscall\ndec r8\njnz 1b',
+                            f'swapgs\ninc qword ptr gs:[0]\nswapgs\nverw word ptr [rip + kds]\njnz 2f\nsysretq\n2: inc qword ptr [{BAD:#x}]\nsysretq\nkds: .word 0x10', {8: 200000})
+    _, out, err = driver(a, kicks, a.out / 'verw' / 'kicks', ['--kick-vcpu', '0', '--kicks', '20000', '--kick-every-us', '2', '--kick-jitter-us', '6'])
+    problems = [f'driver: {err}'] if not out else []
+    if out and (out['stop'] != 'reached' or (mem(out, USER_GS + 8), mem(out, KERNEL_GS), mem(out, BAD)) != (200000, 200000, 0) or out['kicks']['stops'] < 1000):
+        problems.append(f"stop {out['stop']} {out['reason']} counts {mem(out, USER_GS + 8)} {mem(out, KERNEL_GS)} bad {mem(out, BAD)} stops {out['kicks']['stops']}")
+    record('kicks', problems)
+    report['verw'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2', 'verw'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cost-rows', type=lambda s: s.split(','), default=None, help='cost: only these rows')
@@ -1689,6 +2044,7 @@ def main():
     if 'stmxcsr' in a.only: failures += stmxcsr(a, report)
     if 'repbulk' in a.only: failures += repbulk(a, report)
     if 'cr2' in a.only: failures += cr2(a, report)
+    if 'verw' in a.only: failures += verw(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)

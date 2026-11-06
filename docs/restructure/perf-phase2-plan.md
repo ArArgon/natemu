@@ -101,7 +101,9 @@ full matrix at batch end; cold cache for comparisons with QEMU; per-case outputs
 - Large-scale differential fuzzing against QEMU and the reference AMD machine; real workloads in the standing suite.
 - Re-verify every decision taken on QEMU's word or inferred processor behaviour (owner rule: SDM-defined → SDM; open or
   reserved → the AMD machine). Most are confirmed (`natemu-raw/hwcheck-20261103-01/`, `-02/`); lowest-priority interrupt
-  delivery and undefined MTRR overlaps need bare metal.
+  delivery and undefined MTRR overlaps need bare metal. Added by the PCID phase's P2 review: VERR/VERW (and LAR/LSL) take
+  a descriptor straddling the table limit (offset <= limit < offset + 7) as outside it, and do not check P (the resident's
+  `segments::inspect`, QEMU's rule; the SDM's pseudocode compares the offset alone): probe both on the AMD machine.
 - Judging models written from memory (segment, syscall, delivery, ACPI) re-derived with SDM page citations.
 - i8b: coverage after the first two-NaN operation; MIN/MAX under DAZ.
 - Narrow the library's public interface (about 190 items).

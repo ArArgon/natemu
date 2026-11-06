@@ -140,7 +140,9 @@ SELECTORS = (0x00, 0x03, 0x08, 0x10, 0x13, 0x18, 0x1b, 0x20, 0x23, 0x28, 0x30, 0
 # (mnemonic text with {r} the result address, model call, destination width)
 FORMS = (('db 0x48\n    lar ebx, eax', 'lar', 8), ('lsl ebx, eax', 'lsl', 4), ('lar bx, ax', 'lar', 2), ('db 0x48\n    lsl ebx, eax', 'lsl', 8),
          ('lsl bx, ax', 'lsl', 2),
-         ('verr ax', 'verr', None), ('verw ax', 'verw', None))
+         ('verr ax', 'verr', None), ('verw ax', 'verw', None),
+         # Perf P2: VERW m16 at CPL 0 is translated inline (the selector read from the list itself).
+         ('verw word [rsi]', 'verw', None))
 
 
 def table_text(r):

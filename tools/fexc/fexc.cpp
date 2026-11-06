@@ -367,7 +367,7 @@ static void ResetGlobals() {
   Cap = {};
   Diagnostics.clear();
   W = {};
-  fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0;
+  fexc_sites.clear(); fexc_insns.clear(); fexc_cf_inverted.clear(); fexc_spill_bytes = 0; fexc_cut = {}; fexc_after_rep = 0; fexc_self_exits = 0;
   fexc_rip_relative.clear(); fexc_target_check.clear(); fexc_div_width.clear(); fexc_movs.clear(); fexc_lock_cas.clear();
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();

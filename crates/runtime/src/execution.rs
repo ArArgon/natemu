@@ -1106,6 +1106,19 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     // resident changes CR2: a #PF delivery or MOV to CR2, each followed by an entry).
     let cr2 = if s.cpu.cpl == 0 { s.cpu.cr2 } else { 0 };
     unsafe { (FRAME_VA as *mut u64).byte_add(frame::CR2 as usize).write_volatile(cr2) };
+    // Perf P2: the GDT a CPL-0 block's inline VERW reads: base and limit less 7 when every whole descriptor inside the limit
+    // lies in one page at a canonical address (base 8-aligned, [base, base + limit] canonical without wrapping), else 0 and
+    // 0, as at CPL > 0 (every inline VERW then exits to the resident's). Never read back: GDTR changes only in the resident
+    // (LGDT), an entry follows.
+    let g = s.cpu.gdtr;
+    let end = g.base.wrapping_add(g.limit);
+    let (verw_base, verw_limit) = if s.cpu.cpl == 0 && g.base & 7 == 0 && g.limit >= 8 && end >= g.base && paging::canonical(g.base) && paging::canonical(end) {
+        (g.base, g.limit - 7)
+    } else {
+        (0, 0)
+    };
+    unsafe { (FRAME_VA as *mut u64).byte_add(frame::VERW_GDT_BASE as usize).write_volatile(verw_base) };
+    unsafe { (FRAME_VA as *mut u64).byte_add(frame::VERW_GDT_LIMIT as usize).write_volatile(verw_limit) };
     // Perf chunk 26: IA32_MISC_ENABLE's fast-string bit, which a bulk REP STOS tests (WRMSR is a transaction: an entry follows).
     let fast = (msr_get(cpu::msr(cpu::MSR_MISC_ENABLE).unwrap()) & 1) as u8;
     unsafe { (FRAME_VA as *mut u8).add(frame::FAST_STRINGS as usize).write_volatile(fast) };

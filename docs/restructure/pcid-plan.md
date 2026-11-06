@@ -62,7 +62,9 @@ gate's numbers; criteria 1, 2 and 5 apply only when PCID is built.
 Vol.3A citations are to the local snapshot `artifacts/research/track01/source-snapshots/2026-09-03/intel-sdm-vol3a.txt`
 (edition 253668-092US), where paging is chapter 5. P1 added `source-snapshots/2026-11-05/` (edition 093, September 2026):
 all of Vol.4, Vol.1 Table 21-21 (the CPUID leaf-7 bit lists, moved from Vol.2A to Vol.1 chapter 21 in 093) and Vol.2B/2D
-RDMSR/WRMSR. Vol.2 INVPCID, MOV CR and VERR/VERW are not saved yet: P2 and P4 add them before anything is coded from them. Where the SDM leaves an order or a behaviour open, the reference AMD machine decides (owner rule) if P3 finds it can run a
+RDMSR/WRMSR, and (P2) Vol.2C VERR/VERW (`sdm-vol2c-verr-verw.txt`). Vol.2 INVPCID and MOV CR are not saved yet: P4 adds
+them before anything is coded from them. Where the SDM leaves an order or a behaviour open, the reference AMD machine
+decides (owner rule) if P3 finds it can run a
 ring-0 probe. That machine is itself a VM (a KVM guest), so a probe there shows the hardware under its hypervisor.
 
 Code comments to correct in a later code chunk (they cite chapter-4 numbers of an older edition; paging is chapter 5 in 092):
@@ -626,6 +628,204 @@ the barrier-on monomorphisation; the Python model tests and `gen_cpu_profile_rs.
 its negative controls behave as above; `stack` is unchanged. `python3 tools/run_suite.py` (series64-chunk26-r1) on P1-r2: 116/116 passed, including `cargo test` with and
 without FEXC, `stack`, `barriers` and `system` (`natemu-raw/pcid-p1-20261105-01/suite-results.txt`; default off, the
 `barriers` step verifies the on-path statically).
+
+## Measured (P2), November 5, 2026
+
+Built on 2ac1a50 (P1 committed) plus P2 (uncommitted). Evidence in `natemu-raw/pcid-p2-20261105-01/` (README). FEX: one
+commit on the fork clone's local branch `natemu-p2` (from `natemu` 0430dc8a6, not pushed): 8d812cadd (VERW m16 inline,
+`FexcVerwOp`); compiler series65-p2 (`obj/fexc` SHA-256 `701a5946...ca9555`); natemu's submodule pin is unchanged.
+Source: SDM Vol.2C VERR/VERW (325462-093, pp. 5-162 and 5-163), saved as
+`artifacts/research/track01/source-snapshots/2026-11-05/sdm-vol2c-verr-verw.txt` (`MANIFEST.md`). **Applies to:** every
+kernel that executes VERW with a memory operand at CPL 0 on a selector of its GDT naming a writable data segment, keyed only
+on architectural state (CPL 0, the instruction's form, GDTR, the descriptor's bytes): Linux's buffer clearing for MDS (and
+TAA, MMIO stale data, RFDS when those are mitigated by it), `CLEAR_CPU_BUFFERS` before every SYSRET and IRET to user mode
+and on NMI exit, which runs on every default command line here because MDS_NO stays 0 (owner); other kernels' MDS
+mitigations (by their descriptions, FreeBSD's VERW handler and Windows' MD_CLEAR use) also run VERW before returning to user
+mode, their operand forms not checked (not tested here). MD_CLEAR (CPUID.(7,0):EDX[10]) stays 0: VERW clears no host buffer, and natemu does not claim it does.
+
+### Measured first
+
+HEAD (2ac1a50), compiler series64-chunk26-r1, the perf resident, one run per cell, whole run (boot and both benchmark runs),
+`nokaslr` and otherwise Linux's defaults (`meas/*.perf`, `scripts/perfsum.py`):
+
+| Cell (N = 1) | switch on (PTI off): VERWs, their transactions, of vCPU time | switch off (PTI on): VERWs, transactions, of vCPU time |
+| --- | --- | --- |
+| installer | 120 k, 0.03 s of 5.6 s | 121 k, 0.03 s of 14.2 s |
+| `hackbench` | 32.0 M, 6.63 s of 34.9 s (`system` bucket 9.80 s) | 25.3 M, 6.17 s of 900 s (capped: one run took 568.6 s) |
+| `locks` | 6.26 M, 1.35 s of 11.4 s | 6.27 M, 1.64 s of 180 s |
+| `build` | 290 k, 0.07 s of 24.8 s | 301 k, 0.07 s of 74.7 s |
+
+Each VERW was a resident system instruction chained into SYSRET's or IRET's entry; its transaction alone cost 0.21 us,
+mostly two guest page walks (the m16 operand, then the descriptor). End to end, one plain round, switch on, Linux's default
+against `mds=off` (no VERW at all): `hackbench` 16.44 -> 11.62 s (-29%, 16.0 M VERWs per run: 0.30 us each), `locks` 4.82 ->
+3.87 s (-20%), `build` 11.55 -> 11.40 s, installer 5.68 -> 5.40 s (one run each). With PTI on (switch off) VERW is under 1%
+of every cell (PTI's CR3 traffic dominates: `hackbench` about 34 times slower than with PTI off), so the gain is in the
+switch-on cells; `hackbench` and `locks` are far above the 3% bar. The `run_k2.py cost` rows (us per iteration): VERW m16 of
+a writable data selector 0.339, of the null one 0.285, a Linux-shaped SYSCALL round trip 0.500, with Linux's VERW before
+SYSRETQ 0.694.
+
+### Design
+
+- **What the SDM requires** (Vol.2C VERR/VERW; 64-bit mode, CPL 0): ZF = 1 iff the selector is not null, its descriptor
+  lies within the GDT's (TI = 0) or LDT's (TI = 1) limit, it is a code or data segment (not a system segment or gate), and for
+  VERW a writable data segment (code is never verified writable, so the conforming-code exception never applies to VERW)
+  with DPL >= CPL and DPL >= RPL; else ZF = 0. P is not checked (the pseudocode; `syscall_model` C9; QEMU agrees). Only ZF
+  changes. The selector checks raise nothing; the only exceptions are the operand's (64-bit mode: #GP(0) non-canonical,
+  #SS(0) non-canonical through SS, #PF, #AC at CPL 3, #UD with LOCK) and a #PF reading the descriptor (an implicit
+  supervisor read). Compatibility mode has the segment-limit forms; natemu runs no CPL-0 compatibility-mode code (a
+  transfer there stops `unsupported_mode`), and the inline form exists only in CPL-0 translations.
+- **Cache rejected.** A cached answer (the last selector with GDTR, LDTR and CPL) would also depend on the descriptor's
+  bytes, which x86 reads from memory every time (no descriptor cache for VERW), so it would need every write to the GDT's
+  page caught, from any vCPU, alias or device; Linux rewrites three TLS entries in that page on every context switch
+  (`native_load_tls`, through the direct-map alias of the fixmap GDT). Reading the descriptor inline needs nothing
+  invalidated: it reads it as the hardware does, through the TLB (here the shadow).
+- **Inline form (FEX `FexcVerwOp`; shim `PlainVerw` and `Cut`).** In a CPL-0 request, VERW m16 (0f 00 /5 with a memory
+  operand, no legacy prefix, a REX allowed) that is not its block's first instruction and has no other self-exiting
+  instruction (an inline STI or VERW) before it in its block. In one IR block (FEX keeps no value across a branch): load the
+  selector; in-table = TI = 0 and 1 <= index * 8 <= L, one unsigned compare of index * 8 - 1 with L (the null selector
+  wraps); read 8 bytes at base + index * 8 when in-table, else at the operand's own 8-byte group (just read, same page: no
+  read outside the table can fault), the value then taken as 0; accept iff in-table, bits 44:41 with E ignored are
+  1011b (S = 1, data, W = 1) and DPL >= RPL; accepted: ZF = 1 (`rmif`, no other flag); else exit to the VERW's own RIP,
+  where the resident runs it as its transaction (`segments::inspect`, the reference). 34 A64 words with the exit and the
+  ZF write, no spill (`meas/fexc/verw-m16.json`, `scripts/disasm.py`). The register form stays the resident's: it has no operand address to read
+  in place of a descriptor outside the table.
+- **Fields** (abi `frame::VERW_GDT_BASE` 0x4a0 and `VERW_GDT_LIMIT` 0x4a8, FEX's `segment_arrays`, unused in 64-bit code),
+  written by the resident at every entry: GDTR.base and L = limit - 7 when the base is 8-aligned (no descriptor crosses a
+  page), the limit is at least 8 and [base, base + limit] is canonical without wrapping; else, and at CPL > 0, 0 and 0 (every
+  inline VERW exits). Never read back. GDTR changes only in the resident (LGDT); an entry follows.
+- **Admission.** A translated VERW must be that form, in a CPL-0 block, not first (`interrupt_flag`; its RIP becomes a
+  literal-exit target); the fields are loaded only in a CPL-0 block, as one 8-byte load each, with the code shape only inside
+  a VERW, and never stored (`structure`).
+- **At most one per block.** A block has at most four literal exits (abi `MAX_LINK_POINTS`; more is a refusal), its end and a
+  branch target among them, so a block translates one VERW and then no STI; a later VERW in it is a system cut (the next
+  block, starting after it, may translate the next one). Found by the first `table` run ("6 literal exits, at most 4").
+
+### Why it is exact
+
+1. Everything the inline form does before an exit is two loads: nothing architectural changes there (the A bits a load sets
+   are set by the resident's own walks of the same pages too), so an exit leaves the state before the VERW and the
+   resident's transaction decides, as without P2. Re-reading in the resident is the instruction executing at that later
+   time.
+2. Its acceptance is the SDM's condition at CPL 0 restricted to the GDT: in-table is the limit check (index * 8 + 7 <=
+   limit), the type test is S = 1, type bit 3 = 0, bit 1 = 1, the privilege test DPL >= RPL (DPL >= 0 = CPL always holds).
+3. The m16 read is an ordinary explicit CPL-0 load: its faults (#PF with the operand's address and error code, #GP(0)/#SS(0)
+   from the site record for a non-canonical address, a crossing load's second page), a data breakpoint on it, UC and device
+   pages are handled as for any load.
+4. The descriptor read is an ordinary CPL-0 load through the supervisor shadow at an address inside the limit, 8-aligned,
+   canonical: that is the implicit supervisor read (SMAP and PKS are not advertised), its #PF has U/S = 0, W = 0 and RIP at
+   the VERW, as the resident's. The shadow is an SDM-permitted TLB (K1's invariants: no entry after an invalidation the SDM
+   requires). Differences from an implicit read are all routed to the resident: a data breakpoint met by it (an implicit
+   read meets none) runs the instruction again alone, which is the resident's VERW (no #DB); UC RAM runs the instruction
+   alone; a device page has no completion record and stops, as the resident's read does (`unsupported_mmio`).
+5. Outside the table (or TI = 1) the read is of the operand's own 8-byte group, already read (same page, same type,
+   same breakpoint outcome: a breakpoint on another byte of the group steps, as in 4), and its value is replaced by 0, which
+   no test accepts; a descriptor slot that is itself the operand's group is taken as outside too (an exit).
+6. Peers and other aliases: the descriptor is memory read in program order under TSO (the `smp` case).
+7. Events and stops: VERW is not serialising and has no shadow; its exit is a literal exit (a precise stop patches it as
+   any), and an event arriving meanwhile is taken at the next boundary; TF steps (steps are compiled without `--cpl0`);
+   instruction breakpoints cut blocks; a VERW is never translated first, so its exit never re-enters its own block and RF
+   never matters.
+8. The fallback read cannot fault (review r1): the operand's group lies in a page the m16 load has just read through this
+   vCPU's shadow, and nothing can drop that shadow between the two loads. Shadows are per vCPU and change only in this
+   vCPU's resident; invalidations (a peer's shadow-reset request, listed pages, flushes) are taken only at resident
+   entries; a doorbell inside a block arms a stop and resumes without taking any (`interrupted`); the only entry between the
+   two loads would be an abort at the second load itself, which reads a page already shadowed for reading (a watchpoint
+   there runs the instruction alone, 4). An m16 load that missed was retried after its fill, so the fill precedes it.
+
+**Inherited, not hardware-probed (review r1; for the correctness pass's hardware re-verification list).** The SDM's
+pseudocode tests only `SRC(Offset) > GDTR(Limit)`; natemu, the resident and the inline form alike, requires the whole
+descriptor inside the limit (offset + 7 <= limit), as QEMU does (`load_segment`) and, per the review, Bochs and AMD's
+wording; and P is not checked (the pseudocode; QEMU agrees). Both come from the resident's S3 `segments::inspect`, not
+from a probe of hardware; a selector whose descriptor straddles the limit (offset <= limit < offset + 7) is the case
+that would tell.
+
+Deviation (recorded in abi `GUEST_STATE_VA`): a CPL-0 guest store into the guest-state page's alias (the documented
+non-canonical deviation) changes which memory that vCPU's inline VERWs read as its GDT until its next entry; the read is a
+CPL-0 load through the shadow (nothing the guest could not read), and at CPL 3 the fields are 0 (UMIP keeps GDTR from CPL 3).
+
+### Tests
+
+- `run_k2.py verw` (new, 32 cases, block sizes default and 1, the latter every VERW the resident's): `table` (100 selectors:
+  every entry of a 22-entry GDT at RPL 0-3, LDT selectors, beyond the limit by one byte and far; five memory forms and the
+  register form; three flag patterns; five phases: null LDTR, after LLDT, LGDT one byte short of the last entry, one byte
+  past it, another table: 3,000 VERWs, RFLAGS & 8D5H the pattern with only ZF changed, as `verw_model` (the SDM) gives; both
+  sizes identical; exactly the 335 GDT ZF = 1 memory-form cases skip the resident), `alias` (the GDT page read-only, written
+  through an alias between VERWs), `smp` (20,000 peer rewrites, each seen), `pf-operand`, `pf-cross`, `gp-noncanonical`,
+  `ss-noncanonical`, `pf-descriptor`, `beyond-limit`, `cpl3` (the resident's VERW; the fields 0 at CPL 3, GDTR at CPL 0),
+  `watch` (a breakpoint on the descriptor: no #DB; on the operand: one), `misaligned`, `edge`, `uc`, `first-many` (a VERW at a
+  branch target; six in one block; the fake descriptor), `kicks` (200,000 Linux-shaped round trips under 20,000 precise
+  stops). `cost` gains `verw`, `verw_null` and `syscall_verw`.
+- QEMU: `run_slice3_vm.py system`'s LAR/LSL/VERR/VERW tables (`tools/bench/smp/syscalls.py`, 28 selectors over a GDT and LDT
+  at CPL 0 and 3, against QEMU system mode and `syscall_model`) gain the form `verw word [rsi]` (inline at CPL 0).
+- Host (with `FEXC`): `cpl0_translates_verw_inline`; `interrupt_flag_forms` and `guest_state_fields_and_i1_words` extended;
+  abi layout test.
+- Negative controls (`nc/`, `scripts/mutate.py`: one replacement each, built, judged, restored and its SHA-256 checked):
+  each red: FEX's DPL test dropped (`table`, `table-agree`, `table-inline`, `first-many` default size: RPL 3 over DPL 0
+  accepted), its type test of the zeroed fallback dropped (`fex-no-valid`: `first-many`'s fake descriptor accepted), the
+  fallback dropped (reading base + index * 8 outside the table: `table`, `beyond-limit`, `misaligned`, `edge`), the TI test
+  dropped (`table`: LDT selectors judged by the GDT), the ZF write dropped (`table`, `alias`, `first-many`, `kicks`); the
+  shim translating a first VERW (refused by admission at every such block: 21 cases red, block size 1 too), or more than
+  one per block (`first-many`: "7 literal exits, at most 4"); the resident's L one larger (`table` phase C, `cpl3`), the
+  fields written at CPL 3 (`cpl3`: the GDTR base readable there), its canonical test dropped (`edge`: #GP(0) where ZF = 0),
+  `segments::inspect` not clearing ZF (every case judging a ZF = 0 outcome, both sizes); admission without the CPL-0, the
+  not-first or the memory-form condition on a translated VERW (`interrupt_flag_forms`, and for the CPL-0 one
+  `cpl0_translates_verw_inline`), or without the CPL-0 or the code-shape condition on the field loads
+  (`guest_state_fields_and_i1_words`). The 8-byte alignment of an eligible GDT base: see the review round (green by
+  construction). (`nc/summary.txt`; each file is restored
+  with a fresh mtime: an earlier round, discarded, found ninja keeping a mutant's objects when the copy kept the old one.)
+- Results: `run_k2.py cost` (us per iteration, three runs): VERW m16 0.339 -> 0.006, null 0.285 -> 0.310 (both the
+  resident's), SYSCALL round trip 0.500 -> 0.491, with Linux's VERW 0.694 -> 0.481.
+
+### Measured
+
+`camp/` (`scripts/campaign.py`, `scripts/summ.py`): base HEAD 2ac1a50 with series64-chunk26-r1, P2 with series65-p2,
+interleaved, the order alternating by round, three rounds (mitigations=off `hackbench` six), every run verified or reached
+and uncontended, cache off, N = 1; median (min-max), seconds:
+
+| Command line | Cell (N = 1) | base | P2 | change |
+| --- | --- | --- | --- | --- |
+| default, switch on | installer | 5.56 (5.49-5.56) | 5.48 (5.38-5.67) | -1.4% |
+| | `hackbench` | 16.29 (15.82-16.33) | **11.68** (11.46-11.81) | -28.3% |
+| | `locks` | 4.76 (4.70-4.79) | **3.83** (3.75-3.87) | -19.7% |
+| | `build` | 11.43 (11.35-11.43) | 11.37 (11.35-11.37) | -0.5% |
+| `mitigations=off` | installer | 5.27 (5.22-5.34) | 5.32 (5.22-5.48) | +0.9% |
+| | `hackbench` (6 rounds) | 11.41 (11.30-11.50) | 11.57 (11.29-11.61) | +1.5% |
+| | `build` | 11.24 (11.15-11.27) | 11.14 (11.10-11.26) | -0.9% |
+
+With the switch on, a default command line now costs `hackbench` 11.68 s against 11.57 s with mitigations off (it was 16.29),
+and `locks` 3.83 s (3.87 with `mds=off` before). The mitigations-off canaries move within their run-to-run ranges (`hackbench`
+cold +1.5% by median, ranges overlapping; its warm runs 11.40 -> 11.41 s). Perf runs after P2 (`meas/p2-*.perf`, whole runs
+with boot): no VERW reaches the resident in any of the four cells; `hackbench` vCPU time 34.9 -> 25.9 s, its `system` bucket
+9.80 -> 3.10 s, generated code 11.55 -> 11.64 s.
+
+### Checks
+
+`python3 tools/run_suite.py --fexc series65-p2` (now with `k2-verw`): 117/117 passed (`suite/run1/results.txt`), among them
+`cargo test` without and with `FEXC` (host 116 + 2 ignored, abi 67), `system` (the S3 tables with the new m16 VERW form at
+CPL 0 and 3: QEMU and `syscall_model` agree), `k2-verw`, `k2-cost`, the stack and barrier audits. `--check-reuse --code-shape`
+boots on the default command line with the switch on (`check/`, `scripts/checkboot.py`), where VERW runs at every return to
+user mode: installer N = 1 (862,538 resident copies checked) and N = 4 reached the dialog, `hackbench` and `locks` N = 1
+verified; no halt, no admission refusal.
+
+**Review round (r1)** (independent review: no blocking defect; patch `pcid-p2-2ac1a50-r1.patch`, no FEX change: branch head
+still 8d812cadd, compiler series65-p2 unchanged). Exactness item 8 (why the fallback read cannot fault) and the
+inherited-limit note above were written down; the hardware re-verification list of the correctness pass
+(perf-phase2-plan.md) gained the straddling-limit and P cases. `run_k2.py verw` gained 16 cases (48 in all, green): the m16
+operand at +3, at +7 (two 8-byte groups), crossing into a mapped page, two bytes before an unmapped page, as the GDT slot
+its own selector names, with a watchpoint on another byte of its group (the fallback read meets it: the instruction runs
+alone, no #DB), each with an inline accept, a DPL refusal and a beyond-limit selector; a misaligned GDT base whose
+descriptor crosses into a mapped page (ZF = 1) or an unmapped one (#PF at the next page); the fault cases now compare the
+delivered frame's RFLAGS with the flag pattern before the VERW, and `watch` and the `misaligned`/`edge`/`uc` re-runs every
+flag after it. New negative controls (`nc/`): the fallback read at the operand's own address instead of its 8-byte group
+(`end-op` red: #PF reading across into the unmapped page), `segments::inspect` clearing the other arithmetic flags (`table`,
+`watch`, `misaligned`, `edge`, `uc` and the new operand cases red, at both sizes), the site records' saved-NZCV recovery disabled (`pf-descriptor`: the frame
+holds the inline compares' flags; `watch`, `watch-group`, `uc`, `kicks` red). Green by construction: ZF written before the
+loads (an exit's resident VERW rewrites ZF, and a fault restores the instruction's incoming NZCV from the site record),
+and the 8-alignment eligibility rule removed (a crossing descriptor load is completed or faulted at the next page by the
+abort path exactly as the resident's read: both `misaligned-cross` cases stay green), so that rule only keeps the inline
+read in one page. Checks: `run_suite.py --fexc series65-p2`: 117/117 (`suite/run-r1/`: 107 including `cargo test` with and without `FEXC`, `k2-verw` 48 cases and `system`, then the run was stopped while its serial phase waited on another session holding the machine; the 10 remaining serial steps in `suite/run-r1-ser/`, all passed).
+
+**Not done.** The register form and LDT selectors stay the resident's (neither occurs on Linux's paths); VERR is unchanged.
 
 ## 6. Owner decisions needed
 

@@ -11,7 +11,7 @@ case $build in /*) ;; *) build=$PWD/$build ;; esac   # git -C below would resolv
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 fex=$root/third_party/FEX
-pin=0430dc8a64b82e017ae2e756b723d7456895e47d   # == the third_party/FEX gitlink: the fork's `natemu` branch (perf chunk 26)
+pin=8d812cadd94f4be5c62bad609b53a7515c7c077f   # == the third_party/FEX gitlink: the fork's `natemu` branch (PCID-phase P2)
 externals="fmt xxhash unordered_dense"
 git -C "$root" submodule update --init --depth 1 third_party/FEX
 for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done

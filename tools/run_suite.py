@@ -107,7 +107,7 @@ def steps(F, O):
     s3('delivery', 'delivery')
     s3('events', 'events', '--kicks', '2000', est=10)
     vm('m3', 'run_m3.py', est=18, w=4)
-    for g in ('cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2'):
+    for g in ('cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2', 'verw'):
         vm(f'k2-{g}', 'run_k2.py', '--only', g)
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
