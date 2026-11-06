@@ -48,7 +48,7 @@ long), everything needing a FIPS module or shared libraries.
   Settings: `LTP_TIMEOUT_MUL=4`, `LTP_RUNTIME_MUL=0.2` (runtime-bounded tests run a fifth as long), outer kill 900 s.
 - glibc math: none. Eight tests that reach libmvec's AVX2 exp/log/pow/powf are skipped in the natemu runs only (they stop
   the machine, finding 2): `test-{double-libmvec-{exp,log,pow},double-vlen4-avx2-{exp,log,pow},float-libmvec-powf,float-vlen8-avx2-pow}-avx2`-style
-  names, listed in `natemu-raw/correct-us-20261105-01/libm-skip.txt`.
+  names, listed in `natemu-raw/correct-us-20261105-01/libm-skip.txt`. Since the fix (November 6) all eight pass.
 
 ## Summary
 
@@ -113,6 +113,7 @@ was rerun with world-accessible directories, as runltp's.
    call the same functions), so the skip list is all eight tests that reach the AVX2 exp/log/pow/powf variants
    (`libm-skip.txt`). Expected behaviour per the SDM: the gather executes (AVX2 is advertised). If natemu keeps the
    refusal, the least it owes is a guest-visible #UD with AVX2 not advertised; a host stop is not an x86 behaviour.
+   **Fixed** (November 6, below: "Finding 2 fixed").
 3. **Not wrong execution: `return-addr` output.** It prints stack addresses (`printf("%p ...")`); natively two runs
    give different output and with ASLR off (`setarch -R`) the same; exit 0 everywhere. Load-address dependent.
 4. **Resolved into finding 1: `basic-test` "long double isinf (inf) == 1" and `test-nan-payload`.** Repro
@@ -125,11 +126,91 @@ was rerun with world-accessible directories, as runltp's.
 
 ## Next steps
 
-1. Finding 2: decide between translating the VEX gathers (VPGATHERDD/QD, VGATHERDPS/DPD/QPS/QPD) and a guest-visible
-   answer (not advertising AVX2, or #UD); either way a CPL-3 instruction must not stop the machine. Rerun glibc math
-   without `libm-skip.txt` afterwards (`libm.cpio.zst`, `ct=libm`) and `repro/gather.img`.
+1. Finding 2: done (below). The advertised forms still refused (a machine stop) are listed there.
 2. Finding 1 needs nothing until the precise x87 mode (backlog) exists; then rerun torture and libm: the 8 torture runs
    and 332 libm tests are the check.
 3. LTP coverage: the old-style device tests (TBROK "Failed to acquire device") could join the exclusion rule
    (`tst_device` in the source); adding a loop device (a virtio disk, integration phase) would open 172 + those tests.
 4. Not run: QEMU for OpenSSL (natemu equals native on every recipe and path), the torture `builtins/` directory.
+
+## Finding 2 fixed: the AVX2 gathers run in the resident (November 6, 2026)
+
+Branch `gather-fix` (from `correctness` 5a0d7ba), compiler **series66-gather** (FEX `natemu` 8d812cadd unchanged, this tree's
+shim; `obj/fexc` SHA-256 `dd60f985...c5ade47d`). Evidence: `natemu-raw/gather-20261105-01/` (scripts there).
+
+**Cause.** The shim's AVX table (`fexc_slice1.inc` `Avx`) refused VEX.66.0F38 90..93 (`unsupported_form`: "FEX's gather is an
+element loop (one site per element)"). A refusal at a block's first instruction is `Code::None`, which ends the vCPU's run
+(host `execution.rs` `answered`): unless the host maps the bytes to an SDM exception (`system::undefined`, `branch`), every
+refused form is a machine stop. FEX's own translation was not usable: its gather is a loop of element loads with no access
+site per element and no partial mask, so a fault could neither be delivered at its element nor leave the SDM's partial state,
+and admission has no site model for VSIB's per-element addresses.
+
+**Design.** The gather is now a system instruction run by the resident, element by element (`system::GATHER`; shim: a system
+cut, AVX-gated first, the encoding #UDs kept as fexc's `cut_ud`: no SIB, a register operand, two of destination, mask and
+index the same; host `system.rs`: the VSIB operand, VEX.R/X/B/vvvv/L/W; resident `execution/gather.rs`). Each element in
+index order: if its mask MSB is set, base + sign-extended index << scale + displacement (mod 2^64, 2^32 with 0x67) + the FS/GS
+base is read as one explicit load at the CPL (`segments::copy`, `linear` without its #AC check: page walks with A bits, #PF
+with CR2 its first faulting byte, #GP(0)/#SS(0) when non-canonical, data breakpoints, UC RAM; a device page stops
+`unsupported_mmio` as any vector form there); then its mask element is cleared. Completed: the whole mask 0, the destination
+past the gathered elements 0 to bit 255. The cost is one resident transaction per gather (about 0.3 us).
+
+**Why it is exact.** It is the SDM's operation (Vol.2 VPGATHERDD/QD, VPGATHERDQ/QQ, VGATHERDPS/QPS, VGATHERDPD/QPD) with the
+Type 12 exceptions (Vol.2 Table 2-27: the encoding #UDs, then #UD without CR4.OSXSAVE or XCR0[2:1] = 11b, then #NM with
+CR0.TS, checked by the host's gated cut and again in the transaction; #PF, #GP(0)/#SS(0) per element; never #AC). Where the
+SDM leaves room the reference AMD machine decides (`probe/gprobe.c`, user mode, every form at k = 0..n-1): at a fault on
+element k the elements below k are done (destination loaded where masked in, mask 0) and nothing else of either register
+changes, not the mask elements from k on (the pseudocode's MSB extension is not visible to software: only the MSB is read on
+the restart) nor the parts no element covers; faults are delivered lowest element first and no element above the faulting
+one is gathered. Returning to the instruction restarts it from that state. A data breakpoint met by an element completed
+before the fault is delivered in lieu of the fault, the instruction partly done, RIP at it and RF = 1 in the frame (SDM: "If
+any traps or interrupts are pending from already gathered elements, they will be delivered in lieu of the exception"), as a
+boundary between two REP iterations; the restart then meets the fault. The elements are separate loads in order under the
+VM's TSO, and the gather's loads are ordered with the loads around it.
+
+**Tests.** `run_k2.py gather` (new, 88 cases, block sizes default and 1, judged by `gather_model`, the SDM's operation with the
+AMD machine's partial state): every form at VEX.128 and VEX.256 with scales 1/2/4/8, five mask patterns, negative indices,
+displacements, high registers (VEX.R/X/vvvv), five base registers and none, garbage in every unused input bit, 0x67 with a
+32-bit wrap, FS (323 gathers per program, at CPL 3 and CPL 0); per form a fault on each element, a masked-off element on the
+fault page, a page-crossing element, two faulting elements, each with CR2, error, RIP and the partial state at the #PF and the
+restart's result (the done elements' indices pointed elsewhere: not read again); CPL 3 #PF error 4 and 5, #GP(0), #SS(0)
+through RSP, a masked-off non-canonical element; #UD for the three overlaps, no SIB, a register operand, LOCK, 66 before VEX,
+CR4.OSXSAVE clear, XCR0 = 3, #NM with CR0.TS; a data breakpoint on an element (#DB after it), on a masked-off one (none), on
+element 0 with element 2 faulting (the #DB in lieu, RF = 1, then the #PF), TF (and after a #PF), an instruction breakpoint at
+a faulting gather; no #AC with CR0.AM and AC; UC; a device page (stop) and a masked-off element there (completes); TSO
+across two vCPUs. Negative controls (`nc/summary.txt`, `mutate.py`: one replacement each, built, judged, restored by
+SHA-256), each red: masked-off elements not cleared before a fault (42 cases), the destination's upper part kept (24), the
+partial state dropped at a fault (42), no trap in lieu (`inlieu`), indices zero-extended (24), #AC checked (`ac`), elements
+in reverse order (42), bit 0 as the mask (32), 0x67 ignored (`forms`), the FS base ignored (`forms`), the host dropping VEX.X
+or VEX.R (`forms`). Host test `system::tests::gathers`; `test_slice1.py` (the eight forms are system cuts). FEX's ASM suite:
+its 97 gather tests (`VEX/vgather_*`, `vpgather_*`, `FEX_bugs/vgather_xmm4`) leave the runner's REFUSED list and all pass.
+User mode (`probe/gprobe`, a static program over every form, scale, mask kind, fault position, crossing, 0x67, no base, the
+#UD encodings; SIGSEGV handler records si_addr and the YMM state from the signal frame, then maps the page and returns):
+933 lines, natemu N = 1 (Linux guest, `runs/gprobe-natemu1.serial`), QEMU 11.1.2 TCG and the AMD machine natively
+byte-identical. The repro prints `17 16 15 14 13 12 11 10`. glibc math rerun at N = 1 without the skip list
+(`runs/libm-natemu1.serial`): 1,859 results; the eight libmvec AVX2 tests pass; against the earlier run with them skipped
+only those eight differ (386 differences from native: the 54 AVX-512 and 332 x87 ones of finding 1).
+
+Checks: `python3 tools/run_suite.py --fexc series66-gather` (now with `k2-gather`; `suite/`): 115 of 118; `i8-faults` at both
+block sizes still expected the gather refused (its case removed, `suite-r1/`: both and `k2-gather` pass, 850 cases and 88)
+and `pytests` fails only `test_check_setup` (the worktree's path layout; 327 run). Its `asm` step finds no tests in a
+worktree (no `third_party/FEX` checkout); run with series66-gather's FEX tree: 2,270 tests, 1,995 pass, 48 precision
+deviations, 227 unsupported, no failure (chunk 26: 1,898 / 48 / 324). `cargo +1.97.0 test --offline --locked` with and
+without `FEXC`: host 119 + 2 ignored, abi 67. Measured (`bench/`, `bench.sh`, the `natemu` stub, cache off,
+N = 1, base `correctness` with series65-p2 against this branch with series66-gather, interleaved, three rounds; median
+(min-max), seconds, cold run; every run verified, none contended): `avx` (x264) 8.90 (8.85-8.92) against 8.87
+(8.87-8.92), warm 8.64 against 8.66; `zstd` 3.07 (3.03-3.10) against 3.07 (3.04-3.08), warm 2.92 and 2.92. No change: neither
+runs a gather (the change adds no code to any other path).
+
+**Advertised forms still refused** (a machine stop, `unsupported_form`; not built in this change): MASKMOVQ (SSE), MASKMOVDQU
+(SSE2), VMASKMOVDQU, VMASKMOVPS/PD (AVX), VPMASKMOVD/Q (AVX2); VCVTPS2PH with a memory destination (F16C); the scalar VEX LIG
+forms with VEX.L = 1 (AVX, FMA: hardware ignores L); INSERTPS/VINSERTPS m32 whose zero mask clears the inserted element
+(SSE4.1, AVX); and of the base instruction set RCL/RCR m, BT* m, r with 0x67, 16-bit BSWAP/SHLD/SHRD, ENTER with a nesting
+level, 66 on PUSHF/ENTER/LEAVE/RET/indirect branches/CMPXCHG8B/16B, FBLD/FBSTP, the undocumented x87, SAL /6 and TEST /1
+aliases, and the prefix combinations the SDM reserves (REPNE on MOVS/STOS/LODS, REP/REPNE on non-string forms, 66 with
+F2/F3 on an SSE form). The masked moves fit the gather's resident path (element loads and stores with per-element fault
+suppression) but have implementation-dependent parts (A/D bits of masked-off elements, faults and breakpoints with an
+all-zero mask, the non-temporal hint) that need the AMD machine first. Separately, the x86-selftest lane's `mov_ss_trap_64`
+hang (ICEBP after MOV SS with a data breakpoint on its operand, at CPL 3 under Linux: a resident watchdog, not a refused
+form) is another mechanism: ICEBP alone and after MOV SS deliver #DB at CPL 3, and the same sequence at CPL 0 in the program
+driver gives the hardware's two #DBs (the pending data breakpoint at the handler's first instruction, then INT1's;
+`icebp/probe.py`); not changed here.
