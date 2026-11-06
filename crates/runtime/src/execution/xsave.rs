@@ -197,11 +197,11 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
 }
 
 /// Quadword `q` (0..32) of YMM_Hi128 in the guest-state page ([`frame::AVX_HIGH`]), and its write.
-fn ymm_hi(q: usize) -> u64 {
+pub(super) fn ymm_hi(q: usize) -> u64 {
     // SAFETY: FRAME_VA maps the vCPU's frame page; AVX_HIGH + 256 lies inside it.
     unsafe { (FRAME_VA as *const u64).byte_add(frame::AVX_HIGH as usize + 8 * (q & 31)).read_volatile() }
 }
-fn set_ymm_hi(q: usize, v: u64) {
+pub(super) fn set_ymm_hi(q: usize, v: u64) {
     // SAFETY: as in ymm_hi.
     unsafe { (FRAME_VA as *mut u64).byte_add(frame::AVX_HIGH as usize + 8 * (q & 31)).write_volatile(v) }
 }

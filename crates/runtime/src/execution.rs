@@ -20,6 +20,7 @@ use super::*;
 use crate::cache::{self, Block};
 mod delivery;
 mod events;
+mod gather;
 mod helpers;
 mod lapic;
 mod mmio;
@@ -1593,6 +1594,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             }
             halt(s, stop::BAD_REPLY) // the host cut it as gated under these very controls
         }
+        // The AVX2 gathers, element by element ([`gather`]; any CPL); each commits itself.
+        system::GATHER => return gather::transaction(s, i),
         // I9: an MMX form under its gating: #UD with CR0.EM, else #NM with CR0.TS (SDM Vol.3 Table 12-1).
         system::MMX_GATED => {
             if s.cpu.cr0 & CR0_EM != 0 {

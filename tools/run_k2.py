@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """K2 checks: system instructions run from the decoded record kept in the code cache (boot-features plan, K2).
 
-    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr,repbulk,cr2,verw] [--n 100000] [--reps 3]
+    tools/with-env python3 tools/run_k2.py --fexc FEXC --out DIR [--only cost,rdrand,xmc,coherence,rollback,nopruns,tsc,swapgs,sysfast,stifirst,stmxcsr,repbulk,cr2,verw,gather] [--n 100000] [--reps 3]
         [--xmc-rewrites N] [--host HOST --runtime RUNTIME]
 
 - `cost`: microseconds per loop iteration of one system instruction (CLI, STI, PUSHFQ+POPFQ, SWAPGS, RDTSC, CPUID,
@@ -44,6 +44,9 @@
   TF; at CPL 3 it is #GP(0) and the guest-state page holds no CR2 (see `cr2`).
 - `verw` (perf P2): VERW m16 translated inline at CPL 0 gives the SDM's ZF for every selector class, form and table change,
   faults as the resident's, and leaves every other flag (see `verw`).
+- `gather` (correctness pass, finding 2): the AVX2 gathers, the resident's element-by-element transaction: every form, width,
+  scale and mask pattern, faults on each element with the partial state and the restart, #UD and gating, data breakpoints
+  (the trap in lieu of a fault), TF, UC and device pages, TSO (see `gather`).
 
 Writes DIR/k2.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, subprocess, sys, time
@@ -2015,11 +2018,410 @@ def verw(a, report):
     return failures
 
 
+# The AVX2 gathers (VEX.66.0F38 90..93): (mnemonic, element bytes, index bytes, VEX.L). Each executes in the resident.
+GATHERS = [(m, ew, iw, L) for m, ew, iw in (('vpgatherdd', 4, 4), ('vpgatherqd', 4, 8), ('vpgatherdq', 8, 4), ('vpgatherqq', 8, 8),
+                                             ('vgatherdps', 4, 4), ('vgatherqps', 4, 8), ('vgatherdpd', 8, 4), ('vgatherqpd', 8, 8))
+           for L in (0, 1)]
+
+
+def gather_model(ew, iw, L, d, m, x, address, read):
+    """SDM Vol.2 VPGATHERDD/DQ/QD/QQ, VGATHERDPS/DPD/QPS/QPD, 64-bit mode: element j (lowest first) is read when its mask
+    element's MSB is set, at `address(sign-extended index j)`; `read(addr, n)` gives its bytes or an exception tuple, which
+    ends the instruction. d, m, x: the destination, mask and index registers (32 bytes each). Completed: the whole mask 0,
+    the destination past the gathered elements 0 (to bit 255). At a fault on element k: elements 0..k-1 done (destination
+    elements loaded where masked in, mask elements 0), nothing else changed, as on the reference AMD machine
+    (natemu-raw/gather-20261105-01/probe). Returns (d, m, exception or None)."""
+    n = (16 << L) // max(ew, iw)
+    d, m = bytearray(d), bytearray(m)
+    for j in range(n):
+        if m[ew * j + ew - 1] & 0x80:
+            ix = int.from_bytes(x[iw * j:iw * j + iw], 'little', signed=True)
+            r = read(address(ix), ew)
+            if isinstance(r, tuple):
+                return bytes(d), bytes(m), r
+            d[ew * j:ew * j + ew] = r
+        m[ew * j:ew * j + ew] = bytes(ew)
+    d[ew * n:] = bytes(32 - ew * n)
+    return bytes(d), bytes(32), None
+
+
+def gather(a, report):
+    """The AVX2 gathers (VPGATHERDD/DQ/QD/QQ, VGATHERDPS/DPD/QPS/QPD; correctness pass finding 2), the resident's
+    element-by-element transaction. Judged by `gather_model` (the SDM's operation and exceptions, Type 12; the partial state at
+    a fault as the reference AMD machine leaves it), natemu only, block sizes default and 1:
+    - `forms-cplN`: every form at VEX.128 and VEX.256, scales 1/2/4/8, masks all set, none, MSB only alternating with every
+      other bit, MSB with low garbage, random; positive and negative indices, displacements, five register triples (VEX.R,
+      VEX.X, VEX.vvvv high registers) and base registers (none: disp32); garbage in every unused bit of the inputs; 0x67
+      (32-bit addresses, a qword index wrapping past 2^32) and an FS override; at CPL 3 and CPL 0: the 32-byte destination
+      and mask after each.
+    - `fault-FORM`: CPL 0 with the program's own IDT: the element k (each k) at a not-present page, a masked-off element there
+      (no fault), an element crossing into it (CR2 the page start), two faulting elements: #PF with CR2, error 0, RIP at the
+      gather, the destination and mask at the fault (the elements below k done, the rest unchanged); the handler points the
+      faulting index (and the done elements', at other memory) elsewhere and returns: the gather restarts from that state and
+      completes, the done elements not read again.
+    - `user-*`: CPL 3, the driver's logging IDT: #PF error 4 (not present) and 5 (a supervisor page) with the partial state;
+      #GP(0) for a non-canonical element, #SS(0) through an RSP base; a masked-off non-canonical element: completes.
+    - `ud-*`: #UD with the registers unchanged for destination = index, mask = index, destination = mask, no SIB, a register
+      operand, LOCK, a 66 prefix before VEX; CR4.OSXSAVE clear and XCR0 = 3 (#UD), CR0.TS (#NM at CPL 0).
+    - `watch`, `watch-masked`, `inlieu`, `tf`, `tf-fault`, `codebreak` (CPL 0, own IDT): a data breakpoint on an element: one
+      #DB after the gather (B0); on a masked-off element: none; on element 0 with element 2 faulting: the #DB in lieu of the
+      #PF, RIP at the gather, RF = 1 in its frame, elements 0..1 done, then the #PF on the restart; TF: one #DB (BS) after
+      it, after a #PF and its restart too; an instruction breakpoint at a gather that faults: #DB, #PF (its frame RF = 1),
+      completed without a second #DB.
+    - `ac`: CPL 3 with CR0.AM and RFLAGS.AC: misaligned elements, no #AC (a misaligned MOV after it: #AC).
+    - `uc`: elements on a UC page: read (the UC count grows). `mmio`: an element on a device page stops `unsupported_mmio`; a
+      masked-off one there completes.
+    - `tso`: two vCPUs: vCPU 1 stores X then Y (a counter) 100,000 times; vCPU 0 loads Y, then gathers X: never older."""
+    asm, failures, runs = ref.assemble, [], []
+    D, T, R, FIXV, TABLES, IDTR, LOG = 0x400000, 0x600000, 0x700000, 0x680000, 0x300000, 0x300800, 0x310000
+    B = D + 0x5000                       # the common base; D..D+0xa000 mapped, the fault page FP = B - 0x1000 in fault runs
+    FP = B - 0x1000
+    CNT, FIXP = LOG - 16, LOG - 8
+    pattern = bytes((r * 7 + (r >> 8) * 13 + 1) & 0xff for r in range(0xa000))
+    rng = __import__('random').Random(20261105)
+    rb = lambda n: bytes(rng.getrandbits(8) for _ in range(n))
+
+    def record(tag, problems, extra=None):
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems, **(extra or {})})
+        print(json.dumps(runs[-1]), flush=True)
+        if problems: failures.append(f'gather {tag}: {problems}')
+    def mem(out, addr, n):
+        for m in out['memory']:
+            lo = int(m['addr'], 0)
+            if lo <= addr and addr + n <= lo + len(m['data']) // 2:
+                return bytes.fromhex(m['data'])[addr - lo:addr - lo + n]
+        return None
+    def ymm(out, r):
+        x = [int(v, 0) for v in out['xmm']]
+        h = [int(v, 0) for v in out['ymmh']]
+        return b''.join(q.to_bytes(8, 'little') for q in (x[2 * r], x[2 * r + 1], h[2 * r], h[2 * r + 1]))
+    def reader(unmapped=(), supervisor=(), cpl=0, ss=False):
+        def read(addr, n):
+            last = (addr + n - 1) % (1 << 64)
+            canon = lambda v: v < 1 << 47 or v >= (1 << 64) - (1 << 47)
+            if not canon(addr) or not canon(last) or last < addr:
+                return (12 if ss else 13, 0)
+            for p in sorted({addr & ~0xfff, last & ~0xfff}):
+                if p in unmapped: return (14, max(p, addr), 0 if cpl == 0 else 4)
+                if p in supervisor and cpl == 3: return (14, max(p, addr), 5)
+            return pattern[addr - D:addr - D + n]
+        return read
+    def widths(ew, iw, L):
+        n = (16 << L) // max(ew, iw)
+        return n, 'ymm' if n * ew == 32 else 'xmm', 'ymm' if n * iw == 32 else 'xmm'
+    def insn(mn, ew, iw, L, rd, ri, rm, base, s, disp, seg=''):
+        n, dw, xw = widths(ew, iw, L)
+        addr = (f'{base} + ' if base else '') + f'{xw}{ri}*{s}' + (f' + {disp:#x}' if disp >= 0 else f' - {-disp:#x}')
+        return f'{mn} {dw}{rd}, {seg}[{addr}], {dw}{rm}'
+    def inputs(ew, iw, L, offs, s, kind):
+        """Destination, index (offsets / scale, the unused bytes random) and mask (kind) registers."""
+        n = (16 << L) // max(ew, iw)
+        d, x, m = bytearray(rb(32)), bytearray(rb(32)), bytearray(rb(32))
+        top = 1 << (8 * ew - 1)
+        for j in range(n):
+            x[iw * j:iw * j + iw] = (offs[j] // s).to_bytes(iw, 'little', signed=True) if iw == 8 or -2**31 <= offs[j] // s < 2**31 \
+                else ((offs[j] // s) % (1 << 32)).to_bytes(4, 'little')
+            v = {'all': (1 << 8 * ew) - 1, 'none': 0, 'sparse': top if j % 2 == 0 else top - 1, 'msb': top | j * 0x01010101,
+                 'random': rng.getrandbits(8 * ew)}[kind]
+            m[ew * j:ew * j + ew] = v.to_bytes(ew, 'little')
+        return bytes(d), bytes(x), bytes(m)
+
+    # forms: one program per CPL and block size, every case's result stored at R + 64 i.
+    triples = [(0, 1, 2), (8, 15, 4), (3, 9, 14), (12, 5, 13), (7, 6, 10)]
+    bases = [('rdi', 7), ('r13', 13), ('rbp', 5), ('r9', 9), (None, None)]
+    cases = []
+    for fi, (mn, ew, iw, L) in enumerate(GATHERS):
+        n = (16 << L) // max(ew, iw)
+        for si, s in enumerate((1, 2, 4, 8)):
+            for ki, kind in enumerate(('all', 'none', 'sparse', 'msb', 'random')):
+                disp = (0, 0x10, -0x20, 0x7f, 0x234)[(fi + si + ki) % 5]
+                offs = [rng.randrange(-0x4f00, 0x4c00) // s * s for _ in range(n)]
+                rd, ri, rm = triples[(fi + ki) % 5]
+                base, breg = bases[(si + ki) % 5]
+                d, x, m = inputs(ew, iw, L, offs, s, kind)
+                cases.append(dict(insn=insn(mn, ew, iw, L, rd, ri, rm, base, s, disp if base else B + disp), regs=(rd, ri, rm), breg=breg, bval=B,
+                                  form=(ew, iw, L), d=d, x=x, m=m, addr=lambda ix, s=s, disp=disp: B + ix * s + disp))
+    # 0x67 (EDI base; a qword index wrapping past 2^32 to D) and an FS override (RDI = B - FS.base).
+    FSB = 0x10000
+    for mn, ew, iw, L, s in (('vpgatherdd', 4, 4, 1, 4), ('vpgatherqq', 8, 8, 1, 8)):
+        n = (16 << L) // max(ew, iw)
+        offs = [0x80 * j for j in range(n)]
+        if iw == 8: offs[2] = (1 << 32) + 0x100 - 0x5000
+        d, x, m = inputs(ew, iw, L, offs, s, 'all')
+        cases.append(dict(insn=insn(mn, ew, iw, L, 0, 1, 2, 'edi', s, 0), regs=(0, 1, 2), breg=7, bval=B, form=(ew, iw, L), d=d, x=x, m=m,
+                          addr=lambda ix, s=s: (B + ix * s) % (1 << 32)))
+    d, x, m = inputs(4, 4, 1, [0x40 * j - 0x200 for j in range(8)], 4, 'msb')
+    cases.append(dict(insn=insn('vpgatherdd', 4, 4, 1, 0, 1, 2, 'rdi', 4, 8, seg='fs:'), regs=(0, 1, 2), breg=7, bval=B - FSB, form=(4, 4, 1),
+                      d=d, x=x, m=m, addr=lambda ix: B - FSB + ix * 4 + 8 + FSB))
+    body = ''
+    for i, c in enumerate(cases):
+        rd, ri, rm = c['regs']
+        body += (f'vmovdqu ymm{rd}, [{T + 96 * i:#x}]\nvmovdqu ymm{ri}, [{T + 96 * i + 32:#x}]\nvmovdqu ymm{rm}, [{T + 96 * i + 64:#x}]\n'
+                 + (f'mov {["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"][c["breg"]]}, {c["bval"]:#x}\n' if c['breg'] is not None else '')
+                 + c['insn'] + f'\nvmovdqu [{R + 64 * i:#x}], ymm{rd}\nvmovdqu [{R + 64 * i + 32:#x}], ymm{rm}\n')
+    code = asm(body + 'nop')
+    table = b''.join(c['d'] + c['x'] + c['m'] for c in cases)
+    for cpl in (3, 0):
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl {cpl}\nsse 1\nxcr0 7\nfsbase {FSB:#x}\nmemory {D:#x} {pattern.hex()}\n'
+                    f'memory {T:#x} {table.hex()}\nmemory {R:#x} {bytes(64 * len(cases)).hex()}\nregion 0x3e0000 0x10000\n')
+            tag = f'forms-cpl{cpl}-{block}'
+            _, out, err = driver(a, text, a.out / 'gather' / tag, [block] if block else [])
+            problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')}"])
+            if out and not problems:
+                for i, c in enumerate(cases):
+                    wd, wm, e = gather_model(*c['form'], c['d'], c['m'], c['x'], c['addr'], reader())
+                    got = mem(out, R + 64 * i, 64)
+                    if e or got != wd + wm:
+                        problems.append(f"{c['insn']}: dest {got[:32][::-1].hex()} mask {got[32:][::-1].hex()}, want {wd[::-1].hex()} {wm[::-1].hex()}")
+                decodes = out['stats']['decodes'].get(f'{0x7a:#x}', 0)
+                if block is None and decodes == 0: problems.append('no gather decoded')
+            record(tag, problems[:6], {'cases': len(cases)})
+
+    # CPL 0 with the program's own IDT (#DB 1, #PF 14): handlers log (CR2 or DR6, error, RIP, RFLAGS, vector, -, YMM0, YMM2)
+    # per entry at LOG + 128 k; #PF loads YMM1 from the next FIX vector ([FIXP], advanced by 32) and returns; #DB sets RF in
+    # its frame (after logging it) and clears DR6.
+    def idt_program(body, extra=''):
+        h = (f'h14:\npush rax\npush rbx\nmov rbx, [{CNT:#x}]\nshl rbx, 7\nadd rbx, {LOG:#x}\nmov rax, cr2\nmov [rbx], rax\nmov rax, [rsp + 16]\n'
+             f'mov [rbx + 8], rax\nmov rax, [rsp + 24]\nmov [rbx + 16], rax\nmov rax, [rsp + 40]\nmov [rbx + 24], rax\nmov qword ptr [rbx + 32], 14\n'
+             f'vmovdqu [rbx + 64], ymm0\nvmovdqu [rbx + 96], ymm2\nmov rax, [{FIXP:#x}]\nvmovdqu ymm1, [rax]\nadd qword ptr [{FIXP:#x}], 32\n'
+             f'inc qword ptr [{CNT:#x}]\npop rbx\npop rax\nadd rsp, 8\niretq\n'
+             f'h1:\npush rax\npush rbx\nmov rbx, [{CNT:#x}]\nshl rbx, 7\nadd rbx, {LOG:#x}\nmov rax, dr6\nmov [rbx], rax\nmov rax, [rsp + 16]\n'
+             f'mov [rbx + 16], rax\nmov rax, [rsp + 32]\nmov [rbx + 24], rax\nmov qword ptr [rbx + 32], 1\nvmovdqu [rbx + 64], ymm0\n'
+             f'vmovdqu [rbx + 96], ymm2\nxor eax, eax\nmov dr6, rax\nor qword ptr [rsp + 32], 0x10000\ninc qword ptr [{CNT:#x}]\npop rbx\npop rax\niretq\n')
+        code, lab = asm(f'lidt [{IDTR:#x}]\n' + body + '\njmp done\n' + h + 'done: nop', labels=True)
+        gates = bytearray(16 * 16)
+        for v in (1, 14):
+            hv = CODE + lab[f'h{v}']
+            gates[16 * v:16 * v + 16] = (hv & 0xffff | 0x08 << 16 | 0x8e << 40 | (hv >> 16 & 0xffff) << 48).to_bytes(8, 'little') + (hv >> 32).to_bytes(8, 'little')
+        tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (16 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
+        return (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nsse 1\nxcr0 7\nmemory {TABLES:#x} {tables.hex()}\n'
+                f'memory {D:#x} {pattern.hex()}\nmemory {LOG - 16:#x} {bytes(16 + 128 * 64).hex()}\nregion 0x3e0000 0x10000\n{extra}'), lab
+    def logs(out, k):
+        raw = mem(out, LOG + 128 * k, 128)
+        q = lambda at: int.from_bytes(raw[at:at + 8], 'little')
+        return dict(a=q(0), error=q(8), rip=q(16), rflags=q(24), vector=q(32), d=raw[64:96], m=raw[96:128])
+    def count(out): return int.from_bytes(mem(out, CNT, 8), 'little')
+
+    # fault-FORM: per form one program of cases, each `set FIXP; load YMM0..2; gather; store YMM0, YMM2`.
+    for fi, (mn, ew, iw, L) in enumerate(GATHERS):
+        n, _, _ = widths(ew, iw, L)
+        s = 4 if iw == 4 else 8
+        fcases = []
+        def good(j): return 0x100 + 0x48 * j
+        for k in range(n):
+            offs = [good(j) for j in range(n)]; offs[k] = -0x800
+            fcases.append((f'k{k}', offs, 'all', s, [[good(j) + (0x200 if j < k else 0) for j in range(n)]]))
+        if n >= 3:
+            offs = [good(j) for j in range(n)]; offs[1] = offs[2] = -0x800
+            fcases.append(('sparse', offs, 'sparse', s, [[good(j) for j in range(n)]]))   # element 1 masked off, 2 faults
+            offs = [good(j) for j in range(n)]; offs[1] = -0x700; offs[n - 1] = -0xf00
+            fcases.append(('two', offs, 'all', s, [[good(j) if j == 1 else offs[j] for j in range(n)], [good(j) for j in range(n)]]))
+        offs = [good(j) for j in range(n)]; offs[n - 1] = -0x1000 - 2
+        fcases.append(('cross', offs, 'all', 1 if ew == 4 else 2, [[good(j) for j in range(n)]]))
+        body, fix, model = '', b'', []
+        for i, (name, offs, kind, sc, fixes) in enumerate(fcases):
+            d, x, m = inputs(ew, iw, L, offs, sc, kind)
+            fx = [inputs(ew, iw, L, f, sc, 'none')[1] for f in fixes]
+            at = FIXV + len(fix)
+            fix += b''.join(fx)
+            body += (f'mov qword ptr [{FIXP:#x}], {at:#x}\nvmovdqu ymm0, [{T + 96 * i:#x}]\nvmovdqu ymm1, [{T + 96 * i + 32:#x}]\nvmovdqu ymm2, [{T + 96 * i + 64:#x}]\n'
+                     f'mov rdi, {B:#x}\ng{i}: {insn(mn, ew, iw, L, 0, 1, 2, "rdi", sc, 0)}\nvmovdqu [{R + 64 * i:#x}], ymm0\nvmovdqu [{R + 64 * i + 32:#x}], ymm2\n')
+            # The expected log entries and result: fault, fix, restart until done.
+            addr = lambda ix, sc=sc: B + ix * sc
+            read, entries, cur = reader(unmapped={FP}), [], (d, m, x)
+            for f in fx + [None]:
+                wd, wm, e = gather_model(ew, iw, L, cur[0], cur[1], cur[2], addr, read)
+                if not e: break
+                entries.append((e, wd, wm))
+                cur = (wd, wm, f if f is not None else cur[2])
+            model.append((name, entries, wd + wm, d + x + m))
+        text, lab = idt_program(body, f'memory {T:#x} {b"".join(c[3] for c in model).hex()}\nmemory {R:#x} {bytes(64 * len(model)).hex()}\n'
+                                      f'memory {FIXV:#x} {fix.hex()}\nunmap {FP:#x}\n')
+        for block in (None, 1):
+            tag = f'fault-{mn}-{"xy"[L]}-{block}'
+            _, out, err = driver(a, text, a.out / 'gather' / tag, [block] if block else [])
+            problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')}"])
+            if out and not problems:
+                k = 0
+                for i, (name, entries, want, _) in enumerate(model):
+                    for e, wd, wm in entries:
+                        g = logs(out, k); k += 1
+                        if (g['vector'], g['a'], g['error'], g['rip'], g['d'], g['m']) != (14, e[1], e[2], CODE + lab[f'g{i}'], wd, wm):
+                            problems.append(f"{name}: #{g['vector']} cr2 {g['a']:#x} error {g['error']} rip {g['rip']:#x} dest {g['d'][::-1].hex()} mask {g['m'][::-1].hex()}, "
+                                            f"want #PF {e[1]:#x} {e[2]} dest {wd[::-1].hex()} mask {wm[::-1].hex()}")
+                    if mem(out, R + 64 * i, 64) != want:
+                        problems.append(f'{name}: after the restart dest+mask {mem(out, R + 64 * i, 64)[::-1].hex()}, want {want[::-1].hex()}')
+                if count(out) != k: problems.append(f'{count(out)} handler entries, want {k}')
+            record(tag, problems[:6])
+
+    # user-*: CPL 3, one fault each through the driver's logging IDT; the state at the fault from `xmm`/`ymmh`.
+    def user(name, mn, ew, iw, L, offs, kind, extra='', base='rdi', bval=B, s=4, read=None):
+        d, x, m = inputs(ew, iw, L, offs, s, kind)
+        code, lab = asm(f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov {base}, {bval:#x}\n'
+                        f'g: {insn(mn, ew, iw, L, 0, 1, 2, base, s, 0)}\nnop', labels=True)
+        wd, wm, e = gather_model(ew, iw, L, d, m, x, lambda ix: bval + ix * s, read or reader(cpl=3))
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nsse 1\nxcr0 7\nmemory {D:#x} {pattern.hex()}\nmemory {T:#x} {(d + x + m).hex()}\n'
+                    f'region 0x3e0000 0x10000\n{extra}')
+            _, out, err = driver(a, text, a.out / 'gather' / f'{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                f = [int(v, 0) for v in out['fault']]
+                if e is None:
+                    if out['stop'] != 'reached': problems.append(f"stop {out['stop']} {out.get('reason')} fault {f}")
+                else:
+                    wf = [e[0], e[1] if e[0] == 14 else 0, e[2] if e[0] == 14 else 0, CODE + lab['g']]
+                    if out['stop'] != 'guest_fault' or f != wf: problems.append(f"stop {out['stop']} fault {[hex(v) for v in f]}, want {[hex(v) for v in wf]}")
+                if (ymm(out, 0), ymm(out, 2)) != (wd, wm):
+                    problems.append(f'dest {ymm(out, 0)[::-1].hex()} mask {ymm(out, 2)[::-1].hex()}, want {wd[::-1].hex()} {wm[::-1].hex()}')
+            record(f'{name}-{block}', problems)
+    good8 = [0x100 + 0x48 * j for j in range(8)]
+    user('user-pf', 'vpgatherdd', 4, 4, 1, good8[:3] + [-0x800] + good8[4:], 'all', f'unmap {FP:#x}\n', read=reader(unmapped={FP}, cpl=3))
+    user('user-us', 'vpgatherqq', 8, 8, 1, good8[:2] + [-0x800, good8[3]], 'msb', f'entry {FP:#x} 1 clear 4\n', s=8, read=reader(supervisor={FP}, cpl=3))
+    user('user-gp', 'vpgatherqq', 8, 8, 1, [0, 8, 0x4000000000000000, 16], 'all', s=8)
+    user('user-ss', 'vpgatherqq', 8, 8, 0, [0, 0x4000000000000000], 'all', base='rsp', s=8, read=reader(cpl=3, ss=True))
+    user('user-nc-masked', 'vpgatherqq', 8, 8, 1, [0, 0x4000000000000000, 0x48, 0x4000000000000000], 'sparse', s=8)
+
+    # ud-*: #UD at the gather (CPL 3, logging IDT), YMM0..2 unchanged; gating.
+    def ud(name, hexs, extra='xcr0 7\n', cpl=3, pre='', vector=6):
+        # Without AVX enabled no VEX load can set the registers first: then only the #UD at the gather is judged.
+        load = f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\n' if 'xcr0 7' in extra else ''
+        code, lab = asm(f'{load}mov rax, {B:#x}\n{pre}g: .byte {",".join("0x" + hexs[i:i + 2] for i in range(0, len(hexs), 2))}\nnop', labels=True)
+        regs = rb(96)
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl {cpl}\nsse 1\n{extra}memory {D:#x} {pattern.hex()}\nmemory {T:#x} {regs.hex()}\n'
+                    'region 0x3e0000 0x10000\n')
+            _, out, err = driver(a, text, a.out / 'gather' / f'ud-{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                f = [int(v, 0) for v in out['fault']]
+                if out['stop'] != 'guest_fault' or f[0] != vector or f[3] != CODE + lab['g']:
+                    problems.append(f"stop {out['stop']} {out.get('reason')} fault {f}, want #{vector} at {CODE + lab['g']:#x}")
+                if load and ymm(out, 0) + ymm(out, 1) + ymm(out, 2) != regs: problems.append('registers changed')
+            record(f'ud-{name}-{block}', problems)
+    ud('mask-index', 'c4e27590048890')          # vpgatherdd ymm0, [rax + ymm1*4], ymm1
+    ud('dest-index', 'c4e26d900c8890')          # vpgatherdd ymm1, [rax + ymm1*4], ymm2
+    ud('dest-mask', 'c4e26d90148890')           # vpgatherdd ymm2, [rax + ymm1*4], ymm2
+    ud('no-sib', 'c4e26d900090')                # vpgatherdd ymm0, [rax], ymm2
+    ud('register', 'c4e26d90c190')              # vpgatherdd ymm0, ymm1, ymm2
+    ud('lock', 'f0c4e26d90048890')
+    ud('66', '66c4e26d90048890')
+    ud('no-osxsave', 'c4e26d90048890', extra='')
+    ud('xcr0-3', 'c4e26d90048890', extra='xcr0 3\n')
+    ud('ts', 'c4e26d90048890', cpl=0, pre='mov rbx, cr0\nor rbx, 8\nmov cr0, rbx\n', vector=7)
+
+    # Debug: watch, watch-masked, inlieu, tf, tf-fault, codebreak (one program each, CPL 0, own IDT).
+    def debug_case(name, setup, offs, kind, fixes, want_log, after=''):
+        d, x, m = inputs(4, 4, 1, offs, 4, kind)
+        fx = b''.join(inputs(4, 4, 1, f, 4, 'none')[1] for f in fixes)
+        body = (f'mov qword ptr [{FIXP:#x}], {FIXV:#x}\nvmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov rdi, {B:#x}\n'
+                + setup + f'g: vpgatherdd ymm0, [rdi + ymm1*4], ymm2\nn: {after}vmovdqu [{R:#x}], ymm0\nvmovdqu [{R + 32:#x}], ymm2\n'
+                + 'pushfq\nand qword ptr [rsp], -0x101\npopfq\nxor eax, eax\nmov dr7, rax\n')
+        text, lab = idt_program(body, f'memory {T:#x} {(d + x + m).hex()}\nmemory {R:#x} {bytes(64).hex()}\nmemory {FIXV:#x} {(fx or bytes(32)).hex()}\nunmap {FP:#x}\n')
+        cur, read = (d, m, x), reader(unmapped={FP})
+        for f in [*(inputs(4, 4, 1, f, 4, 'none')[1] for f in fixes), None]:
+            wd, wm, e = gather_model(4, 4, 1, *cur[:2], cur[2], lambda ix: B + ix * 4, read)
+            if not e: break
+            cur = (wd, wm, f if f is not None else cur[2])
+        for block in (None, 1):
+            _, out, err = driver(a, text, a.out / 'gather' / f'{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else ([] if out['stop'] == 'reached' else [f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')}"])
+            if out and not problems:
+                got = [logs(out, k) for k in range(min(count(out), 16))]
+                problems += want_log(got, lab, d, m)
+                if mem(out, R, 64) != wd + wm: problems.append(f'result {mem(out, R, 64)[::-1].hex()}, want {(wd + wm)[::-1].hex()}')
+            record(f'{name}-{block}', problems)
+    E = [0x100 + 0x48 * j for j in range(8)]
+    dr0 = lambda addr, rw=3: f'mov rax, {addr:#x}\nmov dr0, rax\nmov eax, {0x1 | rw << 16 | 3 << 18 if rw else 1:#x}\nmov dr7, rax\n'
+    RF, BS = 1 << 16, 1 << 14
+    def want(*spec):
+        """spec: (vector, check(entry, lab, d, m) -> problem or None) per entry."""
+        def judge(got, lab, d, m):
+            if len(got) != len(spec): return [f'{len(got)} handler entries {[(g["vector"], hex(g["rip"])) for g in got]}, want {len(spec)}']
+            return [p for g, (v, c) in zip(got, spec) for p in [f'entry vector {g["vector"]}, want {v}' if g['vector'] != v else c(g, lab, d, m)] if p]
+        return judge
+    done_at = lambda k: lambda g, lab, d, m: None if g['m'][:4 * k] == bytes(4 * k) and g['m'][4 * k:] == m[4 * k:] else f'mask {g["m"][::-1].hex()} at the entry'
+    def chk(cond, text): return lambda g, lab, d, m: None if cond(g, lab) else f'{text}: rip {g["rip"]:#x} rflags {g["rflags"]:#x} dr6/cr2 {g["a"]:#x}'
+    debug_case('watch', dr0(B + E[1]), E, 'all', [], want((1, chk(lambda g, l: g['rip'] == CODE + l['n'] and g['a'] & 1 and not g['rflags'] & RF, 'trap after it, B0')),))
+    debug_case('watch-masked', dr0(B + E[1]), E, 'sparse', [], want())
+    debug_case('inlieu', dr0(B + E[0]), E[:2] + [-0x800] + E[3:], 'all', [E],
+               want((1, lambda g, lab, d, m: chk(lambda g, l: g['rip'] == CODE + l['g'] and g['a'] & 1 and g['rflags'] & RF, 'in lieu: at the gather, RF, B0')(g, lab, d, m) or done_at(2)(g, lab, d, m)),
+                    (14, lambda g, lab, d, m: chk(lambda g, l: g['rip'] == CODE + l['g'] and g['a'] == FP + 0x800, '#PF at element 2')(g, lab, d, m) or done_at(2)(g, lab, d, m))))
+    tf = 'pushfq\nor qword ptr [rsp], 0x100\npopfq\n'
+    debug_case('tf', tf, E, 'all', [], want((1, chk(lambda g, l: g['rip'] == CODE + l['n'] and g['a'] & BS, 'BS after it')), (1, chk(lambda g, l: True, '')),
+                                         (1, chk(lambda g, l: True, '')), (1, chk(lambda g, l: True, '')), (1, chk(lambda g, l: True, '')), (1, chk(lambda g, l: True, ''))))
+    debug_case('tf-fault', tf, E[:1] + [-0x800] + E[2:], 'all', [E],
+               want((14, chk(lambda g, l: g['rip'] == CODE + l['g'], '#PF at it')), (1, chk(lambda g, l: g['rip'] == CODE + l['n'] and g['a'] & BS, 'BS after it')),
+                    (1, chk(lambda g, l: True, '')), (1, chk(lambda g, l: True, '')), (1, chk(lambda g, l: True, '')), (1, chk(lambda g, l: True, '')), (1, chk(lambda g, l: True, ''))))
+    debug_case('codebreak', 'lea rax, [rip + g]\nmov dr0, rax\nmov eax, 1\nmov dr7, rax\n', E[:1] + [-0x800] + E[2:], 'all', [E],
+               want((1, chk(lambda g, l: g['rip'] == CODE + l['g'] and g['a'] & 1 and not g['rflags'] & RF, 'instruction breakpoint at it')),
+                    (14, chk(lambda g, l: g['rip'] == CODE + l['g'] and g['rflags'] & RF, '#PF at it, RF in its frame'))))
+    # uc, mmio.
+    for name, extra, kind, ok_stop in (('uc', f'entry {B:#x} 1 set 0x18\n', 'all', 'reached'), ('mmio', f'mmio {B:#x} 0xfd000000\n', 'all', 'resident'),
+                                       ('mmio-masked', f'mmio {B:#x} 0xfd000000\n', 'sparse', 'reached')):
+        # Even elements on B's page (the UC or device page), odd ones on the next; `mmio-masked`: the other way round, so the
+        # device page holds only masked-off elements (the sparse mask loads the even ones).
+        on = (lambda j: j % 2 == 1) if name == 'mmio-masked' else (lambda j: j % 2 == 0)
+        d, x, m = inputs(4, 4, 1, [0x48 * j if on(j) else 0x1000 + 0x48 * j for j in range(8)], 4, kind)
+        code = asm(f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov rdi, {B:#x}\nvpgatherdd ymm0, [rdi + ymm1*4], ymm2\n'
+                   f'vmovdqu [{R:#x}], ymm0\nvmovdqu [{R + 32:#x}], ymm2\nnop')
+        for block in (None, 1):
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\nsse 1\nxcr0 7\nmemory {D:#x} {pattern.hex()}\nmemory {T:#x} {(d + x + m).hex()}\n'
+                    f'memory {R:#x} {bytes(64).hex()}\nregion 0x3e0000 0x10000\n{extra}')
+            _, out, err = driver(a, text, a.out / 'gather' / f'{name}-{block}', [block] if block else [])
+            problems = [f'driver: {err}'] if not out else []
+            if out:
+                if out['stop'] != ok_stop or (ok_stop == 'resident' and not out['reason'].startswith('unsupported_mmio')):
+                    problems.append(f"stop {out['stop']} {out.get('reason')}")
+                elif name == 'uc':
+                    wd, wm, _ = gather_model(4, 4, 1, d, m, x, lambda ix: B + ix * 4, reader())
+                    if mem(out, R, 64) != wd + wm or not out['stats']['k1'].get('uncached', {}).get('resident', 0):
+                        problems.append(f"result {mem(out, R, 64)[::-1].hex()} uncached {out['stats']['k1'].get('uncached')}")
+            record(f'{name}-{block}', problems)
+    # ac: CR0.AM and RFLAGS.AC at CPL 3: misaligned elements raise no #AC (exception class 12); the misaligned MOV after
+    # the gather does (#AC(0) there: alignment checking was on).
+    d, x, m = inputs(8, 4, 1, [0x101 + 0x43 * j for j in range(4)], 1, 'all')
+    wd, wm, _ = gather_model(8, 4, 1, d, m, x, lambda ix: B + ix, reader())
+    code, lab = asm(f'mov rax, cr0\nor rax, 0x40000\nmov cr0, rax\npushfq\nor qword ptr [rsp], 0x40000\npopfq\nsw: nop\n'
+                    f'vmovdqu ymm0, [{T:#x}]\nvmovdqu ymm1, [{T + 32:#x}]\nvmovdqu ymm2, [{T + 64:#x}]\nmov rdi, {B:#x}\n'
+                    f'vpgatherdq ymm0, [rdi + xmm1*1], ymm2\nvmovdqu [{R:#x}], ymm0\nvmovdqu [{R + 32:#x}], ymm2\nx: mov eax, [{B + 1:#x}]\nnop', labels=True)
+    for block in (None, 1):
+        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nswitch {CODE + lab["sw"]:#x} 3\nsse 1\nxcr0 7\n'
+                f'memory {D:#x} {pattern.hex()}\nmemory {T:#x} {(d + x + m).hex()}\nmemory {R:#x} {bytes(64).hex()}\nregion 0x3e0000 0x10000\n')
+        _, out, err = driver(a, text, a.out / 'gather' / f'ac-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            f = [int(v, 0) for v in out['fault']]
+            if out['stop'] != 'guest_fault' or f[0] != 17 or f[3] != CODE + lab['x']: problems.append(f"stop {out['stop']} {out.get('reason')} fault {f}")
+            if mem(out, R, 64) != wd + wm: problems.append(f'result {mem(out, R, 64)[::-1].hex()}, want {(wd + wm)[::-1].hex()}')
+        record(f'ac-{block}', problems)
+    # tso: vCPU 1 stores X (B + 0x100) then Y (B + 0x200) := r, rounds 1..N; vCPU 0 loads Y, then gathers X (element 0; the
+    # others read B): X >= that Y. R8 counts violations.
+    N = 100_000
+    c0 = asm(f'mov ecx, {N}\nvpcmpeqd ymm4, ymm4, ymm4\nvpxor ymm5, ymm5, ymm5\n'
+             f'mov rdi, {B:#x}\n1: mov rax, [{B + 0x200:#x}]\nvmovdqa ymm2, ymm4\nvpinsrq xmm1, xmm5, qword ptr [{T:#x}], 0\n'
+             f'vpgatherqq ymm0, [rdi + ymm1*1], ymm2\nvmovq rbx, xmm0\ncmp rbx, rax\njae 2f\ninc r8\n2: dec ecx\njnz 1b\nnop')
+    c1 = asm(f'mov ecx, {N}\nxor eax, eax\n1: inc rax\nmov [{B + 0x100:#x}], rax\nmov [{B + 0x200:#x}], rax\ndec ecx\njnz 1b\nnop')
+    for block in (None, 1):
+        text = (f'body {CODE:#x} {c0.hex()}\nbody 0x200000 {c1.hex()}\nmemory {D:#x} {bytes(0xa000).hex()}\nmemory {T:#x} {(0x100).to_bytes(8, "little").hex()}\n'
+                'region 0x3e0000 0x10000\n'
+                f'cpu\nrip {CODE:#x}\nrflags 0x2\n{gprs({})}\nsse 1\nxcr0 7\ncpu\nrip 0x200000\nrflags 0x2\n{gprs({4: STACK - 0x8000})}\n')
+        _, out, err = driver(a, text, a.out / 'gather' / f'tso-{block}', [block] if block else [])
+        problems = [f'driver: {err}'] if not out else []
+        if out:
+            stops = [c['stop'] for c in out['cpus']]
+            if stops != ['reached', 'reached'] or int(out['cpus'][0]['gpr'][8], 0): problems.append(f"stops {stops} violations {out['cpus'][0]['gpr'][8]}")
+        record(f'tso-{block}', problems)
+    report['gather'] = {'runs': runs, 'failures': failures}
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
-    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2', 'verw'])
+    ap.add_argument('--only', type=lambda s: s.split(','), default=['cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2', 'verw', 'gather'])
     ap.add_argument('--n', type=int, default=100_000)
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cost-rows', type=lambda s: s.split(','), default=None, help='cost: only these rows')
@@ -2045,6 +2447,7 @@ def main():
     if 'repbulk' in a.only: failures += repbulk(a, report)
     if 'cr2' in a.only: failures += cr2(a, report)
     if 'verw' in a.only: failures += verw(a, report)
+    if 'gather' in a.only: failures += gather(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)

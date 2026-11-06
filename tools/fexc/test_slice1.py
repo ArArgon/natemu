@@ -52,6 +52,10 @@ SYSTEM = {
     'rdfsbase': 'f3480faec0', 'wrfsbase': 'f3480faed0', 'ud2': '0f0b',
     # S3: rdrand (/6), rdseed (/7), rdpid (f3 /7): register forms of group 9
     'rdrand': '0fc7f0', 'rdrand ax': '660fc7f0', 'rdseed': '0fc7f8', 'rdpid': 'f30fc7f8',
+    # The AVX2 gathers (VEX.66.0F38 90..93, VSIB [rdi + vreg1], mask vreg2): the resident's element-by-element transaction.
+    'vpgatherdd ymm': 'c4e26d90040f', 'vpgatherdq xmm': 'c4e2e990040f', 'vpgatherqd xmm': 'c4e26991040f',
+    'vpgatherqq ymm': 'c4e2ed91040f', 'vgatherdps xmm': 'c4e26992040f', 'vgatherdpd ymm': 'c4e2ed92040f',
+    'vgatherqps ymm index': 'c4e26d93040f', 'vgatherqpd xmm': 'c4e2e993040f',
 }
 
 # name -> hex. Decodable instructions that are not slice-1 forms, and admitted opcodes with an excluded prefix or operand.
@@ -67,7 +71,7 @@ UNSUPPORTED = {
     'maskmovq (I9: a masked store)': '0ff7c1', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
     'insertps m32 zeroing its element': '660f3a21000f',
     # I8: AVX forms FEX cannot do exactly (I10: the encodings x86 makes #UD are in UD)
-    'vpgatherdd': 'c4e26d90040f', 'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca',
+    'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca',
     'vcvtps2ph m': 'c4e37d1d3004', 'vaddss L=1 (LIG)': 'c5f658c2',
     'vinsertps m32 zeroing its element': 'c4e37921001f',
     'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',

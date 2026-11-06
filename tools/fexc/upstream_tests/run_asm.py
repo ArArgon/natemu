@@ -129,7 +129,6 @@ def scalar_l1(op):
             and (pp >= 2 or (o in (0x2e, 0x2f) and pp <= 1))) or \
            (m == 2 and pp == 1 and o in (0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf)) or (m == 3 and pp == 1 and o in (0x0a, 0x0b))
 REFUSED = [
-    ('VEX gathers', lambda p, rex, op, w: re.match(r'vp?gather', w)),
     ('MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV', lambda p, rex, op, w: re.match(r'v?p?maskmov', w) and not p & {0xf2, 0xf3}),
     ('VCVTPS2PH m', lambda p, rex, op, w: w == 'vcvtps2ph' and vex(op)[1] != 3),
     ('scalar VEX.L = 1 forms', lambda p, rex, op, w: scalar_l1(op)),

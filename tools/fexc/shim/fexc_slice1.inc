@@ -216,7 +216,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   // A form x86 defines but I8 refuses: its own row first, so an encoding x86 makes #UD stays an encoding refusal (never a
   // gated #UD/#NM); `refuse` is returned (avx set, so a valid encoding is gated first) only after the encoding checks.
   const char* refuse = nullptr;
-  bool mxcsr = false;
+  bool mxcsr = false, gather = false;
   uint16_t r = NONE;
   if (map == 1 && pp == 0) {
     if (in(op, {0x10, 0x11, 0x51, 0x52, 0x53, 0x5a, 0x5b})) r = LL | NOV;
@@ -273,7 +273,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
     else if (in(op, {0x2c, 0x2d, 0x2e, 0x2f, 0x8c, 0x8e})) {
       r = LL | MEM | (op <= 0x2f ? W0 : 0);
       refuse = "vmaskmovps/pd, vpmaskmovd/q: FEX's masked load and store are element loops (branches over accesses)";
-    } else if (op >= 0x90 && op <= 0x93) { r = LL | MEM; refuse = "vgather*/vpgather*: FEX's gather is an element loop (one site per element)"; }
+    } else if (op >= 0x90 && op <= 0x93) { r = LL | MEM; gather = true; }      // vpgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd
     else if (op == 0xdb) r = L0 | NOV;                                           // vaesimc (I9)
     else if (op >= 0xdc && op <= 0xdf) r = L0;                                   // vaesenc/last, vaesdec/last (I9; VAES's L1 not advertised)
   } else if (map == 3 && pp == 1) {
@@ -307,6 +307,9 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   if (op == 0x77 && map == 1) { Verdict v = Allow(); v.avx = true; return v; }
   if (!has_modrm || ((r & MEM) && mod == 3) || ((r & REG) && mod != 3)) return Ud("AVX form with an operand x86 makes #UD");
   if (refuse) { Verdict v = Uns(refuse); v.avx = true; return v; }
+  // The AVX2 gathers: the resident's transaction, element by element with the SDM's partial progress at a fault (the host's
+  // `system::GATHER`); AVX-gated first. FEX's gather (an element loop with no per-element site and no partial mask) is not used.
+  if (gather) { Verdict v = Sys("vgather*/vpgather*: the resident's element-by-element gather"); v.avx = true; return v; }
   // VLDMXCSR m32: the resident's LDMXCSR transaction (the host's VLDMXCSR: no CR0.EM/CR4.OSFXSR gating, the AVX gating being
   // this cut's). Perf chunk 25: VSTMXCSR m32 (VEX.L 0, VEX.vvvv 1111b: else #UD above) translated as STMXCSR, AVX-gated.
   if (mxcsr && reg == 2) { Verdict v = Sys("vldmxcsr (the resident's MXCSR transaction)"); v.avx = true; return v; }
