@@ -144,7 +144,7 @@ Warm against off: `build` -4% (N = 1) and -11% (N = 4) with or without KASLR; th
 only CPL-3 code (kernel-mode code neither looked up nor stored), measured as its own chunk. Done in perf chunk 27
 (`natemu-raw/diskcache2-20261105-01/`): KASLR installer warm -1.4% / -1.5% against off, `build` -3.7% / -9.4%.
 
-## Phase result (November 5, 82462c2, `natemu-raw/batch2-final-20261105-01/`)
+## Phase result (November 5, 244f270, `natemu-raw/batch2-final-20261105-01/`)
 
 All 11 benchmarks and the installer, N = 1 and 4, three rounds each, every run verified; compile cache off, `mitigations=off
 nokaslr`; QEMU 11.1.2 like-for-like; AMD native from bench-20261105-03. natemu cold, seconds (QEMU cold; native):
@@ -210,7 +210,7 @@ fixes upstream.
 
 ## Baseline (November 4)
 
-HEAD 1be744d (clean), the `natemu` stub (`-p natemu`, signed), series49-sha, cache off, `mitigations=off nokaslr`, 2 GiB; QEMU
+HEAD fa96fbf (clean), the `natemu` stub (`-p natemu`, signed), series49-sha, cache off, `mitigations=off nokaslr`, 2 GiB; QEMU
 11.1.2 TCG with the like-for-like flags (`+sha-ni`); the benchmarks of `natemu-raw/bench-20261103-01/`; wall seconds from the
 START to the END line on the serial console (boot excluded), median of three runs, one emulator at a time (none contended,
 every run's VERIFY line ok). Records, scripts and the full table (ranges, QEMU `thread=single` at N = 1 and 4, zstd phases,
@@ -251,20 +251,20 @@ QEMU show); `build` none (no N = 1). natemu / QEMU multi time ratio: `zstd` 0.13
 1.4-7.9x. QEMU `thread=single` at N = 4: `build` 30.2, `zstd` 20.4, `hackbench` 22.7, `locks` 11.1 s.
 
 Rows "chunk 14" (every cell rerun): after the kept global shadows and the vCPU QoS class ([perf-plan.md](perf-plan.md),
-"Measured (chunk 14)", edfcee9 plus the change, series52-adox66, `natemu-raw/mcore-20261104-01/`; its own before, edfcee9, in
+"Measured (chunk 14)", 9b845e8 plus the change, series52-adox66, `natemu-raw/mcore-20261104-01/`; its own before, 9b845e8, in
 the same interleaved campaign: `build` 20.67 / 13.11 / 10.46 / 9.61, `zstd` 2.13 / 1.45 / 1.28 / 1.24, `hackbench` 30.32 / 16.17 /
 11.55 / 9.41, `locks` 11.01 / 5.87 / 4.55 / 5.00). Speedup N = 1 to 4 now: `zstd` 1.87, `hackbench` 3.35, `locks` 2.33, `build` 2.20.
 
-Rows "chunk 16": the compile-ahead pool on (`NATEMU_AHEAD=on`; [perf-plan.md](perf-plan.md), "Measured (chunk 16)", d2a3b0d
-plus the change, `natemu-raw/ahead-20261104-02/`); its own before, d2a3b0d: `build` 20.01 / 9.28; installer cache off N = 1
+Rows "chunk 16": the compile-ahead pool on (`NATEMU_AHEAD=on`; [perf-plan.md](perf-plan.md), "Measured (chunk 16)", 6956fe0
+plus the change, `natemu-raw/ahead-20261104-02/`); its own before, 6956fe0: `build` 20.01 / 9.28; installer cache off N = 1
 8.10 -> 8.06, N = 4 6.54 -> 6.34. Within spread: the pool is off by default, so the shipped tree's numbers are chunk 14's.
 
-Rows "chunk 11": after the link-record fix ([perf-plan.md](perf-plan.md), "Measured (chunk 11)", November 4, 245700d plus
+Rows "chunk 11": after the link-record fix ([perf-plan.md](perf-plan.md), "Measured (chunk 11)", November 4, c7c703e plus
 the change; `natemu-raw/linkfix-20261104-01/`, same harness and rules, median of three; `-`: not rerun). Rows "chunk 12":
-after the system-instruction fast paths ([perf-plan.md](perf-plan.md), "Measured (chunk 12)", f6e8820 plus the change,
-`natemu-raw/sysfast-20261104-01/`; its own before, f6e8820: `build` N = 1 20.89, `hackbench` 51.17 / 15.36, `locks` N = 4 6.42).
-Rows "chunk 13": after the shared answer cache ([perf-plan.md](perf-plan.md), "Measured (chunk 13)", 18ee440 plus the change,
-`natemu-raw/shared-20261104-01/`; its own before, 18ee440: `build` N = 4 12.95, `hackbench` N = 4 9.60; installer cache off
+after the system-instruction fast paths ([perf-plan.md](perf-plan.md), "Measured (chunk 12)", 8252249 plus the change,
+`natemu-raw/sysfast-20261104-01/`; its own before, 8252249: `build` N = 1 20.89, `hackbench` 51.17 / 15.36, `locks` N = 4 6.42).
+Rows "chunk 13": after the shared answer cache ([perf-plan.md](perf-plan.md), "Measured (chunk 13)", 250b382 plus the change,
+`natemu-raw/shared-20261104-01/`; its own before, 250b382: `build` N = 4 12.95, `hackbench` N = 4 9.60; installer cache off
 N = 1 8.65 -> 8.70, N = 4 9.17 -> 6.63).
 
 **Findings.**
@@ -288,7 +288,7 @@ N = 1 8.65 -> 8.70, N = 4 9.17 -> 6.63).
    is not known. vCPU thread CPU is 2.4-3.8 s of 10 s wall (halted 4.8-5.5 s). Whether threads land on efficiency cores
    cannot be seen without root (`powermetrics`); the machine has 4 performance and 6 efficiency cores, and at N = 4 the four
    vCPU threads and up to four compile servers compete for the four performance cores.
-5. (Perf chunk 14, measured at edfcee9 within the START-END window; [perf-plan.md](perf-plan.md), "Measured (chunk 14)".)
+5. (Perf chunk 14, measured at 9b845e8 within the START-END window; [perf-plan.md](perf-plan.md), "Measured (chunk 14)".)
    Finding 3's halted times included the 3-4 s boot. In the window, vCPUs rarely halt: `hackbench` and `locks` N = 4 0.1-0.3 s
    of 5-10 s per vCPU, `zstd` compress 0.19-0.24 of 0.73 s (the guest's own time: 74% busy), decompress and verify one
    thread; a wake costs 8-9 us to the end of `wfi` and 12-14 us to the event, over a few hundred wakes per vCPU. Threads sit

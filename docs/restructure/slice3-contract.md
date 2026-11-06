@@ -463,7 +463,7 @@ their campaigns retire:** runtime/abi family code (modes are layered: `translati
   `i3_producer`), `i4v_qemu`, their tests and testdata, the outer-supervisor tests (`test_containment_supervisor.py`,
   `test_supervisor_ownership.py`: the outer supervisor and its container ownership retired, S3h table, 57 and 60) and `fixtures/i1`, `fixtures/i4v`, `fixtures/i4v-qemu`. The
   32-bit families go under decision 3, and with them the legacy two-level walker `paging32.rs` (no general-path caller;
-  recover it from commit 4902ee5 if the boot phase needs legacy paging). Moved:
+  recover it from commit a6b299b if the boot phase needs legacy paging). Moved:
   the four models to `tools/models/` (`ordering_model`, `coherence_model`, `pae_model`, `modes_model`, a package; their
   tests with them); the QEMU pins to `tools/reference/ref.py` (`IMAGE`, `PINS`); the old producer's pinned bodies, which
   `tools/fexc/test_fexc.py` compares fexc against, to `tools/fexc/producer_bodies.json`. Contracts §3's model fixes

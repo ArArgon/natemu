@@ -1,6 +1,6 @@
 # Performance phase plan (draft)
 
-Status: draft, November 3, 2026, HEAD 335c070 (series47-seg); revised after independent review; chunks 1-12 measured below (chunk 5 uncommitted on d89bc4c, chunk 7 on 0da552a, chunk 6 on ea11225, chunk 8 on 1c4d8b9, chunk 9 on 9ba60d5, chunk 10 on 851cbd2, chunk 11 (phase 2, November 4) on 245700d, chunk 12 on f6e8820). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
+Status: draft, November 3, 2026, HEAD 3694324 (series47-seg); revised after independent review; chunks 1-12 measured below (chunk 5 uncommitted on 78fb6ae, chunk 7 on a159d20, chunk 6 on 7af0435, chunk 8 on b2720d5, chunk 9 on 808cf24, chunk 10 on 94145e7, chunk 11 (phase 2, November 4) on c7c703e, chunk 12 on 8252249). Scope: owner decisions of November 2/3 ([boot-features plan](boot-features-plan.md) §5): faster first-time
 code, measured first; the correctness pass follows. Principles: measure first; native mechanisms; nothing keyed to
 Linux (a KASLR boot must gain too); every object still admitted; checks green; no debt.
 
@@ -18,7 +18,7 @@ From [boot-handoff.md](boot-handoff.md) §4 (Debian 6.12.107, 2 GiB, `nokaslr`, 
 (QEMU columns: the like-for-like rerun of §5, `nokaslr`, replacing R2's 1.97/1.95, 1.70/1.86, 7.27/7.25, 5.46/7.62.)
 
 Known (plan, Built (P3)): cache off, the installer makes 1,142,555 compiles and waits 35.4 s of 68.0 s for fexc
-(7a2f714); a first-time block costs about 35 us cold, 20 us on a disk hit, 4-6 us on a memory
+(20a9665); a first-time block costs about 35 us cold, 20 us on a disk hit, 4-6 us on a memory
 hit, 2 us resident. The RIP is in every key, so user code at randomized addresses compiles again per process; with
 `norandmaps`, 140 k compiles and 33.7 s (one cold run, old cache code). So about 28-33 s lies outside compiles and mostly
 does not scale with them; a few seconds may (about 3 us of host cost per request fits, admission about 2 us per block).
@@ -65,7 +65,7 @@ for 30 s of user space; in the guest, the log's CR3 groups compiles by address s
 Guest-RIP sampling only if guest execution exceeds a quarter of wall at either N. Gate: the owner sees the tables and
 ranked candidates before any optimisation, and sets the phase's target.
 
-### Measured (chunk 1, November 3; uncommitted on a73b858, series47-seg)
+### Measured (chunk 1, November 3; uncommitted on e0234ca, series47-seg)
 
 **Built.** Host: `crates/host/src/perf.rs` (`NATEMU_PERF_LOG=FILE` on `natemu-host boot-linux` and the `natemu` stub;
 handoff §1 "Performance log"): process phase marks; per vCPU thread, every stretch of its service loop charged to a
@@ -78,7 +78,7 @@ one of 24 buckets (generated code; host exit; HLT park; mailbox wait; resident e
 them, exclusively: `enter`, block lookup, exit patching, placement, system instruction, TLB flush, delivery,
 revalidation walk, shadow-miss walk, fetch walk, shootdown wait, L1 clear), with entry counts; record at
 `STATE_OFFSET + 0xe40`; an entry is charged to its kind from `returned`'s first instructions (the stop disarm and a
-watch step included). Off, the resident's `.text` is byte-identical to a73b858's (only panic line numbers in `.rodata`
+watch step included). Off, the resident's `.text` is byte-identical to e0234ca's (only panic line numbers in `.rodata`
 move); the host's off path is a test per lap and per request part. `boot-linux` now cancels on SIGINT/SIGTERM like the
 stub (the report prints; both through `Canceller::on_signals`). After review: log write failures counted and reported,
 1 GiB cap per request file, a warning when a `perf` resident runs with the log off, the server's `wait4` bounded (killed
@@ -180,7 +180,7 @@ through `CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS` = the config's flags plus 
 first "on" pass set `RUSTFLAGS`, which replaces the config's linker flags: every run refused the resident ELF; rerun as
 above.)
 
-### Measured (chunk 2: fexc's report off the serve path, November 3; uncommitted on e9214c8, series48-lean)
+### Measured (chunk 2: fexc's report off the serve path, November 3; uncommitted on 9e41892, series48-lean)
 
 **Built.** `tools/fexc/fexc.cpp`: the server (`fexc --serve`) no longer builds the JSON report. Its reply's JSON is what the
 host reads (`Reply::payload`, `Answer::new`, `end_reason`, `system_cut`): `{"status":"ok"}` for an object; for no code the
@@ -239,7 +239,7 @@ the I7 corpus's 6,313 at both; ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 an
 measurement boots reached the dialog. Not rerun (no fexc change can reach them beyond the objects shown identical): the
 rest of the suite.
 
-### Measured (chunk 3: relocation proof, November 3; analysis on bc0c934, series48-lean, no code change)
+### Measured (chunk 3: relocation proof, November 3; analysis on 534cfac, series48-lean, no code change)
 
 **Question.** Can fexc's answer for bytes B at RIP r become the answer for B at r' (same page offset, half and arguments
 but `--rip`) by its relocation records alone? **Answer: yes, with three refusals the relocator checks; no FEX change.**
@@ -297,7 +297,7 @@ needed; a fixed four-word guest-RIP move would remove the 0.07% refusals at the 
 KASLR is not a reuse problem within a run (the kernel stays at the address chosen at boot); across boots its relocated text
 differs in bytes, so only the persistent cache's hits for the kernel are lost (chunk 1, corrected).
 
-### Measured (chunk 4: reuse across load addresses, November 3; uncommitted on a24c785, series48-lean)
+### Measured (chunk 4: reuse across load addresses, November 3; uncommitted on 9a0777c, series48-lean)
 
 **Built** (host only; fexc and the resident unchanged). `crates/host/src/relocation.rs`: the relocator of chunk 3 with the
 review's corrections: `object(raw, from, to)` writes `guest_rip`, adds `to - from` to every guest-RIP literal and move
@@ -347,7 +347,7 @@ compiled again and equal; 884 refused; 0 fallbacks (`natemu-raw/perf4-20261103-0
 program driver's check on (`suite/`, 2 GiB, both block sizes): as chunk 2 (below), no check failure.
 
 **Measured** (chunk 1's method; `natemu-host boot-linux`, installer to "Select a language", 2 GiB, `mitigations=off
-nokaslr`, one VM at a time; three interleaved rounds per cell, before (a24c785) and after each with its own warm cache after
+nokaslr`, one VM at a time; three interleaved rounds per cell, before (9a0777c) and after each with its own warm cache after
 a warm-up boot; `natemu-raw/perf4-20261103-01/`: `campaign4.sh`, `rest4.sh` (the campaign's shell was stopped by a
 30-minute limit after 43 of 48 boots; the last five ran from it), `boot.py`, `table4.py`, `tables4.json`, `runs/`;
 counts summed over the vCPU threads of the log-on runs, means of 3):
@@ -378,13 +378,13 @@ ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 and 196/196; i10 faults 296 at bo
 `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); all 51 boots (50 measured, 1 check) reached the dialog.
 Not rerun: fexc's own tests (fexc unchanged) and the suite's other runners.
 
-### Measured (chunk 5: one L1 table per code context, November 3; uncommitted on d89bc4c, series48-lean)
+### Measured (chunk 5: one L1 table per code context, November 3; uncommitted on 78fb6ae, series48-lean)
 
-**Breakdown on d89bc4c** (chunk 1's method and scripts, `natemu-raw/perf5-20261103-01/`: `campaign5.sh`, `boot.py`,
+**Breakdown on 78fb6ae** (chunk 1's method and scripts, `natemu-raw/perf5-20261103-01/`: `campaign5.sh`, `boot.py`,
 `analyze.py`, `aggregate.py`; installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time,
 three rounds after a warm-up boot; `step1/` alone, `step3/` interleaved with the fix; s of vCPU 0's window, mean of 3, log on):
 
-| s, vCPU 0 (log on) | N=1 d89bc4c (step1) | N=1 d89bc4c (step3) | N=1 **after** | N=4 d89bc4c (step1) | N=4 d89bc4c (step3) | N=4 **after** |
+| s, vCPU 0 (log on) | N=1 78fb6ae (step1) | N=1 78fb6ae (step3) | N=1 **after** | N=4 78fb6ae (step1) | N=4 78fb6ae (step3) | N=4 **after** |
 | --- | --- | --- | --- | --- | --- | --- |
 | Host, fexc round trip | 2.16 | 2.13 | 2.14 | 1.86 | 1.98 | 1.91 |
 | Host, admission / rest of the request / bookkeeping / log line | 1.28 / 1.00 / 0.82 / 0.45 | 1.33 / 1.01 / 0.84 / 0.46 | 1.36 / 1.03 / 0.87 / 0.51 | 0.45 / 0.34 / 0.41 / 0.16 | 0.43 / 0.33 / 0.40 / 0.15 | 0.51 / 0.39 / 0.47 / 0.19 |
@@ -445,7 +445,7 @@ decodes to that table.
 
 **Measured** (`step3/`, three interleaved rounds before and after, log off; mean, min-max):
 
-| Installer, cache off | d89bc4c | after | change |
+| Installer, cache off | 78fb6ae | after | change |
 | --- | --- | --- | --- |
 | N = 1 wall s | 27.65 (27.61-27.71) | **17.38** (17.27-17.45) | -10.27 s (-37%) |
 | N = 4 wall s | 22.59 (22.49-22.67) | **15.56** (15.50-15.66) | -7.03 s (-31%) |
@@ -490,7 +490,7 @@ controls), `run_x1.py` 6/6 and 196/196, `run_i5c.py` 255, `run_r1.py r1a` 7/7 an
 `run_k1.py` (200 cases, with the extended `contexts`), `run_k2.py`, fixtures at both block sizes, `run_boot_smoke.py` 4/4; all 33 installer boots of `step1/`, `step3/`
 and `flush/` reached the dialog.
 
-### Measured (chunk 6: whole-cache flushes, November 3; uncommitted on ea11225, series48-lean)
+### Measured (chunk 6: whole-cache flushes, November 3; uncommitted on 7af0435, series48-lean)
 
 **Question 1, the refill** (`natemu-raw/perf6-20261103-02/`: `campaign6.sh`, `boot.py`, `refill6.py`, `table6.py`, `runs/`;
 installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot each, three
@@ -541,9 +541,9 @@ failures (423 controls); `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r1b` 
 before-build boots and the after build's 6 at N = 1 reached the dialog. Not rerun: the rest of the standing suite (the resident
 is unchanged). Per-request logs deleted after analysis (also the inherited `perf6-20261103-01/refill/`).
 
-### Measured (chunk 7: host per-request cleanups, November 3; uncommitted on 0da552a, series48-lean)
+### Measured (chunk 7: host per-request cleanups, November 3; uncommitted on a159d20, series48-lean)
 
-**Built** (host only; fexc and the resident unchanged; the study is the per-request host work at 0da552a, chunk 5's
+**Built** (host only; fexc and the resident unchanged; the study is the per-request host work at a159d20, chunk 5's
 breakdown). `execution::run`: the watchdog no longer gets a channel send at every entry and exit (each woke its thread:
 a cross-core wake twice per exit). The vCPU stores its entry time (`perf::now`) into an atomic before `hv_vcpu_run` and 0
 after; the watchdog thread sleeps until that entry's deadline (entry + `watchdog`) and, if the same entry is still in the
@@ -563,7 +563,7 @@ Every object still goes through full admission. Not changed (measured small): th
 
 **Measured** (chunk 1's method and scripts, `natemu-raw/perf7-20261103-01/`: `campaign7.sh`, `runs/`, `table7.txt`;
 installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot each, three
-interleaved rounds before (0da552a) and after; mean, min-max; parts in s, log on):
+interleaved rounds before (a159d20) and after; mean, min-max; parts in s, log on):
 
 | Installer, cache off | N = 1 before | N = 1 after | N = 4 before | N = 4 after |
 | --- | --- | --- | --- | --- |
@@ -601,7 +601,7 @@ review (nothing blocking): `run_l4a.py halt` gains the halt program with a 20 ms
 stopped `watchdog`, no delivery; `natemu-raw/perf7-20261103-01/review/`). With `--check-reuse`, the check's fexc round trip
 is in `fexc` and its comparison in no part (it was inside `admit` before). Not rerun: the rest of the standing suite.
 
-### Measured (chunk 8: links kept across TLB events, November 3; uncommitted on 1c4d8b9, series48-lean)
+### Measured (chunk 8: links kept across TLB events, November 3; uncommitted on b2720d5, series48-lean)
 
 **Cause first** (a temporary diagnostic, `natemu-raw/perf8-20261103-01/diag/diag.patch`, removed: each undone link counted
 by the event that undid it and classified; one boot each, cache off, log off). At N = 1 3.03 M links are undone:
@@ -665,7 +665,7 @@ where a peer wrote), links into dead blocks kept (a `bad_link` stop). Not testab
 
 **Measured** (`natemu-raw/perf8-20261103-01/`; installer to "Select a language", 2 GiB, `mitigations=off nokaslr`, cache
 off, one VM at a time; mean, min-max). The record: `runs2/` (`one.sh`), log off, three interleaved rounds at N = 1 before
-(1c4d8b9) and after, then one boot each at N = 4, with the machine idle (checked for other VMs and QEMU after each boot):
+(b2720d5) and after, then one boot each at N = 4, with the machine idle (checked for other VMs and QEMU after each boot):
 N = 1 **15.56 (15.27-15.84) to 13.55 (13.51-13.58) s**, N = 4 **13.39 to 12.42 s**. The parts below are from the full
 campaign before it (`campaign8.sh`, `table8.py`, `table8.txt`, `tables8.json`, `runs/`: chunk 1's method, a warm-up boot each,
 three interleaved rounds, log on and off at N = 1 and 4): another session's QEMU probe overlapped one of its boots for up to
@@ -706,10 +706,10 @@ flagged), all 0 failures; every measurement boot reached the dialog. The reworke
 block sizes, red under the 2 MiB mutation (r9 6). Not rerun: the rest of the standing suite (the change is in the resident's
 link and TLB bookkeeping, which these exercise).
 
-### Measured (chunk 9: cheaper resident entry, November 3; uncommitted on 9ba60d5, series48-lean)
+### Measured (chunk 9: cheaper resident entry, November 3; uncommitted on 808cf24, series48-lean)
 
-**Cause first** (design study on 0da552a: about 550 of the about 990 cycles of an `enter` were copies; measured here with a
-new perf bucket `enter_copy`, the copies inside `enter`, the rest staying in `enter`). Before (9ba60d5), N = 1 cache off, log
+**Cause first** (design study on a159d20: about 550 of the about 990 cycles of an `enter` were copies; measured here with a
+new perf bucket `enter_copy`, the copies inside `enter`, the rest staying in `enter`). Before (808cf24), N = 1 cache off, log
 on, all threads: 6.39 M entries, `enter` 0.21 s plus `enter_copy` 0.98 s (0.15 us of copying per entry: an 800-byte
 `memset` of the frame, a 1,408-byte `memcpy` of the state into `write_record`'s argument, then the volatile copies of the
 state and the frame, 8 bytes a step). Around it, each dispatcher miss loaded the state and `memcpy`d it into `dispatch`, which
@@ -747,7 +747,7 @@ frame holds a field it does not write"; 10 of 10, the unchanged build 0); v16 le
 "Select a language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot per build, three
 interleaved rounds over the five builds; N = 4 one boot each; one log-on boot per build; mean, min-max; no other VM ran):
 
-| Installer, cache off | before (9ba60d5) | 1. by reference | 2. 32-byte copies | 3. frame in place | 4. one `block_at` (**after**) |
+| Installer, cache off | before (808cf24) | 1. by reference | 2. 32-byte copies | 3. frame in place | 4. one `block_at` (**after**) |
 | --- | --- | --- | --- | --- | --- |
 | N = 1 wall s, log off | 13.09 (13.03-13.20) | 12.19 (12.09-12.25) | 11.10 (11.02-11.18) | 10.89 (10.81-11.00) | **10.82** (10.78-10.87) |
 | "Run /init" guest s, N = 1 | 3.02 | 2.87 | 2.72 | 2.68 | 2.66 |
@@ -774,7 +774,7 @@ filled it); after space was freed `suite9.sh` reran from `system` on (`FROM=syst
 ended (`results-pass1.txt` keeps the first pass). Per-case outputs and the
 per-request logs deleted after analysis.
 
-### Measured (chunk 10: reuse inside the resident, November 3; uncommitted on 851cbd2, series48-lean)
+### Measured (chunk 10: reuse inside the resident, November 3; uncommitted on 94145e7, series48-lean)
 
 **Built** (resident, abi, host; fexc unchanged; the design study of chunk 6's question 2, with chunk 8's records). A block miss
 whose translation another block of this vCPU already holds at another RIP is placed by the resident itself, with no host exit:
@@ -835,7 +835,7 @@ dialog. Every suite runner below ran with the check on (the suites' `--code-shap
 language", 2 GiB, `mitigations=off nokaslr`, cache off, one VM at a time, a warm-up boot per build, three interleaved rounds at
 N = 1, one boot each at N = 4 and one log-on boot (perf resident) per build at N = 1; mean, min-max):
 
-| Installer, cache off | before (851cbd2) | after |
+| Installer, cache off | before (94145e7) | after |
 | --- | --- | --- |
 | N = 1 wall s, log off | 10.71 (10.65-10.78) | **8.57** (8.55-8.61) |
 | N = 4 wall s, log off (one boot) | 10.98 | **9.37** |
@@ -864,7 +864,7 @@ relocations and template bit; rerun (`followup/`): `cargo test` 162 + 1 ignored 
 runs) green, a `--check-reuse` installer boot at N = 1 851,238 copies checked, 0 mismatches, 968 + 7 refused (as before).
 Noted, not changed: a refused crossing copy leaves its second page marked and walked (A bits; conservative); and, before this
 chunk, the host ignored a limit at the first byte of the next page (`fetched`'s `span`), which in-VM reuse cannot reach (it
-refuses at any armed breakpoint and fence). Fixed after 87c40c1: a limit at a page's end now cuts its bytes there, so the next
+refuses at any armed breakpoint and fence). Fixed after 7e991dc: a limit at a page's end now cuts its bytes there, so the next
 page is neither fetched nor asked for (before, a block starting on the previous page ran past a breakpoint, hook or stop RIP at
 the next page's first byte); the resident's fence test is `natemu_abi::execution::reuse_fenced`, unit-tested at the page
 boundaries and the top of the address space. Rerun (`span/`): `cargo test` 163 + 1 ignored with `FEXC` set, fixtures 64,
@@ -885,16 +885,16 @@ both block sizes), no failure, 14 and 14 requests at K and 2K rounds; `run_k2.py
 reached the dialog. Not rerun: the rest of the standing suite (the change is in the resident's miss path and placement, which
 these exercise, every one with the reuse check on).
 
-### Batch 1 result (November 3, HEAD 4ed8e3a, series48-lean)
+### Batch 1 result (November 3, HEAD c9d6e27, series48-lean)
 
 Chunks 1-10 against the starting point and QEMU, rerun at the batch's end: the `natemu` stub (built alone, signed) and QEMU 11.1.2
 TCG in the like-for-like harness of §5 (handoff §4; `natemu-raw/batch1-final-20261103-01/timing/`: 149 boots, every one reached
-its end point, none contended), `nokaslr`, 2 GiB, wall s mean of 3, one VM at a time. Start = the handoff's stub rows at 335c070
+its end point, none contended), `nokaslr`, 2 GiB, wall s mean of 3, one VM at a time. Start = the handoff's stub rows at 3694324
 (one boot per cell, R2's harness; the plan's §1 table differs by up to 0.1 s). The standing suite is green at both RAM sizes
 (handoff §5, "Full suite at the end of performance batch 1"; the 7 known i8b departures only; `--check-reuse` installer boots
 0 mismatches).
 
-| Wall s | start (335c070) | end (4ed8e3a) | QEMU multi | QEMU single | end / QEMU multi |
+| Wall s | start (3694324) | end (c9d6e27) | QEMU multi | QEMU single | end / QEMU multi |
 | --- | --- | --- | --- | --- | --- |
 | Installer N = 1, cache off | 67.8 | **8.85** | 6.10 | 6.12 | 1.45x |
 | Installer N = 4, cache off | 53.1 | **9.39** | 4.81 | 6.26 | 1.95x |
@@ -913,7 +913,7 @@ inside the resident) 10.7 to 8.6 / 11.0 to 9.4. Chunks 1 (instrumentation), 3 (r
 wall time. Chunks 2, 4 and 5 account for 50 of the 59 s at N = 1; the later four, each about 2 s, bring it from 17.4 to 8.6 s. At N = 4
 the installer is no faster than at N = 1 with the cache off (9.39 against 8.85 s): the next phase's focus is multi-core.
 
-### Measured (chunk 11: link records at capacity, November 4; uncommitted on 245700d, series49-sha)
+### Measured (chunk 11: link records at capacity, November 4; uncommitted on c7c703e, series49-sha)
 
 **Cause** (phase-2 baseline, [perf-phase2-plan.md](perf-phase2-plan.md) "Baseline (November 4)"; reproduced here,
 `natemu-raw/linkfix-20261104-01/repro/`: `build` at N = 1, perf resident, 60 s cap: `patch` 52.9 of 57.6 s of thread CPU, 252,731
@@ -977,7 +977,7 @@ at both block sizes; faults 7,912 at both; `run_slice3_vm.py` `contain`, `smp`, 
 `run_k2.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` and `r1b` ok (negative controls flagged). Not rerun: `run_s4.py`,
 `run_x1.py`, `delivery` (the change is in the link records, which these exercise only as the cases above do).
 
-### Measured (chunk 12: block exits into system instructions, November 4; uncommitted on f6e8820, series49-sha)
+### Measured (chunk 12: block exits into system instructions, November 4; uncommitted on 8252249, series49-sha)
 
 **Cause** (`natemu-raw/sysfast-20261104-01/measure/`; the perf resident with new per-kind counters, `hackbench` N = 1, 50.9 s):
 114.5 M system instructions, 98.5 M linker entries and 16.0 M dispatcher misses into them, 115.8 M block entries. By kind: SWAPGS
@@ -1044,7 +1044,7 @@ comment.
 `mitigations=off nokaslr`, 2 GiB, one VM at a time, base and fix interleaved, every run verified, runs another agent's VM
 overlapped discarded (`clean.py` retries them); median (min-max) of three, START to END seconds):
 
-| Benchmark | N | before (f6e8820) | after | QEMU multi |
+| Benchmark | N | before (8252249) | after | QEMU multi |
 | --- | --- | --- | --- | --- |
 | `hackbench` | 1 | 51.17 (50.01-51.55) | **30.10** (29.61-30.10) | 16.4 |
 | | 4 | 15.36 (15.15-15.59) | **9.57** (9.45-9.63) | 5.08 |
@@ -1068,8 +1068,8 @@ all ok; `run_l4a.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7 and `r
 `sharedpt`, `coherence`, `run_m1.py`, `run_x4.py` (the change is in system transactions, the boundary checks, block placement and
 the dispatcher, which the runs above exercise).
 
-**Follow-up tests** (after an independent review of 330e014, no blocking defect; `natemu-raw/sysfast-followup-20261104-01/`,
-series52-adox66, HEAD 18ee440; each with a scratch mutant, `mutant-*.diff`, that turned it red, then reverted):
+**Follow-up tests** (after an independent review of 8eb8a86, no blocking defect; `natemu-raw/sysfast-followup-20261104-01/`,
+series52-adox66, HEAD 250b382; each with a scratch mutant, `mutant-*.diff`, that turned it red, then reverted):
 `run_k2.py rollback` (SYSRET with a non-canonical RCX, WRGSBASE with a non-canonical value: #GP(0) with the frame's RIP, CS
 and RFLAGS, RCX and the GS base as before; red when SYSRET writes RFLAGS, or WRGSBASE the base, before the check);
 `run_k1.py hint-reset` (a flush between rounds renumbers blocks at the same code addresses; 1-4 vCPUs green; red with the
@@ -1083,7 +1083,7 @@ new bytes; red when runs are on no page's chain, which also breaks own writes). 
 (block size 1 green under the mutants). `--check-reuse --code-shape` installer boots, cache off: N = 1 852,497 copies checked,
 N = 4 (vCPU 0) 205,825, no halt, both reached the dialog.
 
-### Measured (chunk 13: one answer cache for every vCPU, November 4; uncommitted on 18ee440, series49-sha)
+### Measured (chunk 13: one answer cache for every vCPU, November 4; uncommitted on 250b382, series49-sha)
 
 **Built** (host only: `execution.rs`, `linux.rs`; relocation, admission, the disk cache and the resident unchanged; the design
 study of the phase-2 plan's item 2). `Answers`: fexc's answers as kept before (raw reply, the RIP compiled at, the bytes to the
@@ -1115,7 +1115,7 @@ mismatches; 132.2 k compiles; the dialog reached.
 
 **Measured** (`natemu-raw/shared-20261104-01/`: `campaign.py`, `run1.sh`, `bench.py`, `boot.py` (now reaping with `wait4`:
 process CPU and max RSS, the fexc children not included), `summ.py`, `table.txt`, `inst/`, `runs/`, `log/`; the `natemu` stub,
-cache off, `mitigations=off nokaslr`, 2 GiB, one VM at a time, base (18ee440) and fix interleaved, every run uncontended and
+cache off, `mitigations=off nokaslr`, 2 GiB, one VM at a time, base (250b382) and fix interleaved, every run uncontended and
 reached or verified; median (min-max) of three; installer to "Select a language", benchmarks START to END; both stubs built
 with the test driver, so with the host's `testing` hooks):
 
@@ -1168,13 +1168,13 @@ bounds (a sixteenth of the old per-vCPU bound; `runs3/`, `log3/`, `table3.txt`):
 three interleaved rounds: 19.76 (19.73-19.77) against 19.78 (19.65-19.91) s, process CPU 23.07 against 23.06 s, max RSS 1,300
 against 1,117 MB; compiles 229.8 k both (no extra compile from hot-shard flips). `cargo test` 168 + 1 ignored, also with `FEXC`.
 
-### Measured (chunk 14: multi-core costs, November 4; uncommitted on edfcee9, series52-adox66)
+### Measured (chunk 14: multi-core costs, November 4; uncommitted on 9b845e8, series52-adox66)
 
 **Measurement** (`natemu-raw/mcore-20261104-01/`: `bench.py` now samples `proc_pid_rusage` v6 at each marker (CPU, CPU on
 performance cores, runnable time; `tools/prusage.c`, `usage.py`); the perf log gains a 5 ms per-vCPU bucket sampler (`snap`
 lines, `snaps.py` cuts them at the markers) and the perf resident a wake record (`resident.wakes`: post to the end of `wfi`,
 post to the end of the park, own timer expiry to the end of the park; the sender stamps `Events::rung`). Diagnosis runs at HEAD
-0df11b8/edfcee9 with series49-sha (`meas/`, `perf/`, `try/`), campaign with series52-adox66.)
+b6758db/9b845e8 with series49-sha (`meas/`, `perf/`, `try/`), campaign with series52-adox66.)
 1. **Wakes and halted time.** The phase-2 finding of 3 s halted in `zstd` N = 4 was the boot. Within START-END, `hackbench` and
    `locks` N = 4 halt 0.08-0.28 s of 6.4-9.7 s per vCPU; `zstd` compress 0.19-0.24 of 0.73 s (busybox `time`: 74% of the vCPUs
    busy; zstd's own serial work), decompress and verify run one thread. Parks are 500-900 per vCPU per run, boot included; a
@@ -1222,7 +1222,7 @@ keeping resumes; INVLPG reaches a kept shadow; a full reset returns the top and 
 capacity; a link into a returned page is corrupt. The existing pool test now expects the kept half's tables at the top.
 
 **Measured** (`campaign.sh`, `summ.py`, `table.txt`, `runs/`, `inst/`; the `natemu` stub, cache off, `mitigations=off nokaslr`,
-2 GiB, series52-adox66, base (edfcee9) and c14 interleaved, three rounds, one VM at a time, every run verified or reached and
+2 GiB, series52-adox66, base (9b845e8) and c14 interleaved, three rounds, one VM at a time, every run verified or reached and
 uncontended; median (min-max), seconds):
 
 | Benchmark | N | before s | after s | change | CPU s base / c14 |
@@ -1270,7 +1270,7 @@ writable bits can force a peer's shootdown and a full reset where a CR3 load use
 **Next** (from the evidence): the syscall path (`locks` N = 1 sys 2 us per `sched_yield`, `hackbench`'s linker/entry/system
 buckets), single-thread codegen (`zstd`'s decompress 0.16-0.24 s and verify 0.28 s against 0.07-0.09 natively), then PCID.
 
-### Measured (compile-ahead gate, November 4; uncommitted on 1d2719c, series52-adox66)
+### Measured (compile-ahead gate, November 4; uncommitted on bf5d953, series52-adox66)
 
 The gate before building compile-ahead (design: a host pool of fexc servers compiling the exits of each admitted block
 ahead into the shared answers; version 1 only targets on pages the request fetched; 2 workers, a 64-job newest-first
@@ -1306,10 +1306,10 @@ optimistic); bytes and gating taken equal at the same guest-physical address (an
 compiles, are never counted as served: conservative); four busy loops stood in for the vCPUs in the cost replay; the
 worker's admission (to read the links) is not timed.
 
-### Measured (chunk 16, November 4; uncommitted on d2a3b0d, series52-adox66)
+### Measured (chunk 16, November 4; uncommitted on 6956fe0, series52-adox66)
 
 **Outcome: not shipped.** The pool missed the ship threshold, so its code was not committed; the patch is kept at
-`natemu-raw/ahead-20261104-02/chunk16-pool.patch` (896 lines, against d2a3b0d) for a later ahead-of-use placement step, which
+`natemu-raw/ahead-20261104-02/chunk16-pool.patch` (896 lines, against 6956fe0) for a later ahead-of-use placement step, which
 would need its own gate. `NATEMU_AHEAD` below refers to that patch, not to the committed tree.
 
 **Built** (compile ahead, step 1 of the design: host only; `crates/host/src/execution/ahead.rs`, `execution.rs`, `linux.rs`).
@@ -1334,7 +1334,7 @@ exits to depth 2, a vCPU uses them without compiling (each counted served once, 
 an ahead answer whose bytes changed before the request is not used.
 
 **Measured** (`natemu-raw/ahead-20261104-02/`: `campaign.sh`, `fill.sh`, `summ.py`, `runs/`, `inst/`, `log/`, `tune/`, `qos/`;
-the `natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB; base d2a3b0d and c16 (pool 2:3) interleaved, three rounds, one VM
+the `natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB; base 6956fe0 and c16 (pool 2:3) interleaved, three rounds, one VM
 at a time, a run another VM overlapped rerun; every boot reached and benchmark verified; median (min-max), seconds; CPU and RSS
 the natemu process's):
 
@@ -1383,7 +1383,7 @@ answers share the in-memory generation bounds.
 for answers in time (about a third here) and keeps the interference; it needs its own gate on these counts first. Otherwise
 the syscall path and single-thread code generation, as chunk 14 found.
 
-### Measured (chunk 15: CLI, STI and RDTSC inline at CPL 0, November 4; uncommitted on e2f8aba, measured on 1d2719c, series54-inline-tsc)
+### Measured (chunk 15: CLI, STI and RDTSC inline at CPL 0, November 4; uncommitted on d6e80bf, measured on bf5d953, series54-inline-tsc)
 
 **Measured first** (`natemu-raw/inline-20261104-01/`; the syscall design study's option (b), `meas/`): `run_k2.py --only cost` at
 HEAD: CLI 0.194 us, NOP 0.002, so a full trip costs 0.19 us; `div` (a helper trip, no transaction) 0.104 us, the light-trip
@@ -1466,7 +1466,7 @@ block not writing the pending byte (the event is then taken at the block's next 
 event that arrives after the STI): it only moves deliveries later (`ev-window`'s inline-STI exits).
 
 **Measured** (`natemu-raw/inline-20261104-01/`: `campaign.sh`, `run1.sh`, `summ15.py`, `runs/`, `inst/`, `k2/`; the `natemu`
-stub, cache off, `mitigations=off nokaslr`, 2 GiB, base (1d2719c, series52-adox66) and chunk 15 (series54-inline-tsc)
+stub, cache off, `mitigations=off nokaslr`, 2 GiB, base (bf5d953, series52-adox66) and chunk 15 (series54-inline-tsc)
 interleaved, three rounds, one VM at a time, every run verified or reached and uncontended; median (min-max), seconds):
 
 | Benchmark | N | before | after | change | CPU s before / after | QEMU multi |
@@ -1492,7 +1492,7 @@ SYSCALL, with all three forms inline (scratch builds, not kept):
 
 | `locks`, N = 4 | wall | futex calls / 1,000 rounds | guest remote-wakeup IPIs | guest context switches |
 | --- | --- | --- | --- | --- |
-| before (1d2719c) | 4.49 (4.33-4.79) | 15.1 (13.9-19.2) | 1,018 | 3,682 |
+| before (bf5d953) | 4.49 (4.33-4.79) | 15.1 (13.9-19.2) | 1,018 | 3,682 |
 | this chunk, none inline | 4.76 (4.72-4.86) | 18.4 (17.2-18.7) | 1,313 | 3,655 |
 | RDTSC inline only | 5.16 (4.84-5.23) | 30.3 (27.4-32.4) | 3,428 | 7,011 |
 | CLI and STI inline only | 6.58 (6.52-6.67) | 64.4 (62.2-65.5) | 24,160 | 48,550 |
@@ -1518,7 +1518,7 @@ in the guest its futex count equals the resident's SYSCALL count, 72.08 against 
 | `locks2`, N = 4 | guest time s | slow-path entries | futex calls | waits that slept | waits returning EAGAIN | wakes |
 | --- | --- | --- | --- | --- | --- | --- |
 | native (three runs) | 3.92-3.95 | 59.3-59.6 | 145.6-146.3 | 2.18-2.21 | 50.9-51.2 | 92.5-92.9 |
-| natemu before (1d2719c, two runs) | 4.57, 4.74 | 6.7, 7.6 | 20.6, 21.9 | 0.01, 0.02 | 9.7, 10.2 | 10.9, 11.7 |
+| natemu before (bf5d953, two runs) | 4.57, 4.74 | 6.7, 7.6 | 20.6, 21.9 | 0.01, 0.02 | 9.7, 10.2 | 10.9, 11.7 |
 | natemu this chunk, none inline (two) | 4.22, 4.36 | 5.8, 6.1 | 16.7, 18.2 | 0.01, 0.01 | 7.7, 8.5 | 9.0, 9.7 |
 | natemu this chunk (two) | 5.45, 6.01 | 21.5, 23.6 | 72.1, 82.7 | 0.17, 0.19 | 33.8, 38.8 | 38.1, 43.8 |
 
@@ -1532,7 +1532,7 @@ the probe does: only 0.17-0.19 of the futex calls per 1,000 rounds sleep, and th
 once and wakes that find no waiter, neither of which involves an interrupt; native shows the same shape at a higher level.
 The "native" rows are the AMD reference machine, a 4-vCPU KVM guest, not bare metal.
 
-**Independent replication** (`natemu-raw/locks-20261104-01/replication/`: own builds of e2f8aba plus this patch and the
+**Independent replication** (`natemu-raw/locks-20261104-01/replication/`: own builds of d6e80bf plus this patch and the
 switch diff, one VM at a time): native `locks` 4.16-4.21 s, `locks2` 145.6-146.0 futex calls per 1,000 rounds; counted
 natively with `perf stat` tracepoints, `sched_yield` is exactly 3,125,000 and futex 95.9 (`locks`) and 100.2 (`locks2`,
 its own count 100.17) per 1,000 rounds, tracing itself lowering the count from 146. natemu N = 4, three runs each: none
@@ -1543,8 +1543,8 @@ rate, rescheduling IPIs about 25, function-call IPIs about one per two context s
 it ended): `cargo test` 104 + 1 ignored (host), abi 65, also with `FEXC` set; the resident stack audit `ok`; the Python unit
 tests; fixtures 64 and seed 44 at both block sizes; the i7 corpus at CPL 0 (`--cpl 0`) 69 at both; faults 7,912 at both;
 `run_k1.py` no problem; `run_k2.py` all ok (`tsc` included); `run_slice3_vm.py` `delivery`, `events`, `contain`, `smp` 0
-failures, `system` 1: `sysfault-cr4-umip` ("the model expects no fault"), which fails the same at 1d2719c (UMIP advertised
-since edfcee9; not this chunk's); `run_x3.py` 54/54 and every group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`,
+failures, `system` 1: `sysfault-cr4-umip` ("the model expects no fault"), which fails the same at bf5d953 (UMIP advertised
+since 9b845e8; not this chunk's); `run_x3.py` 54/54 and every group, `run_x4.py` 33/28/6, `run_l4a.py`, `run_l4b.py`,
 `run_s4.py` all ok; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7, `r1b` 12/12 (negative controls flagged); FEX ASM 2,270:
 1,898 pass, 48 precision deviations, 324 unsupported, no failure. The first pass found the code-shape check refusing the
 `isb` of an inline RDTSC on a vCPU without FEAT_ECV (`system`'s `profile`, `x3`, `x4`, `l4a`); admission now allows it there
@@ -1556,8 +1556,8 @@ CPL-3 store into the guest-state page (the recorded deviation) could set or clea
 `x2-cpl3-if-byte` and its negative control above; the deviation record in abi `GUEST_STATE_VA` and the boot-features plan
 now says a CPL-0 store acts as CLI/STI and what CPL 3 can read). Also applied: admission refuses an STI right before a REP
 string or LOCK NEG; `held`'s timer caveat stated; a CPL-0 relocation test; the `locks` comparison with native counts (since replaced by the measured one above).
-Rerun on the fixes, rebased on e2f8aba (`review/`): `cargo test` with `FEXC` (105 + 1 ignored, abi 65), the stack audit,
-`run_k2.py`, `events` (the new case included), `contain` and `system` (0 failures: e2f8aba dropped the stale UMIP case), and
+Rerun on the fixes, rebased on d6e80bf (`review/`): `cargo test` with `FEXC` (105 + 1 ignored, abi 65), the stack audit,
+`run_k2.py`, `events` (the new case included), `contain` and `system` (0 failures: d6e80bf dropped the stale UMIP case), and
 `--check-reuse --code-shape` installer boots, cache off: N = 1 852,075 and N = 4 219,815 resident copies checked, no halt,
 both reached the dialog.
 
@@ -1565,9 +1565,9 @@ both reached the dialog.
 about 13 ns for the event-pending look (SWAPGS's cost row); the remaining trips per system call are SYSCALL and SYSRET
 (design study option (c+) next).
 
-### Measured (chunk 17: SWAPGS inline at CPL 0, November 4; uncommitted on 114c9eb, series55-swapgs)
+### Measured (chunk 17: SWAPGS inline at CPL 0, November 4; uncommitted on ddbbf09, series55-swapgs)
 
-**Measured first** (`natemu-raw/sysfast2-20261104-01/meas/`; HEAD 114c9eb, series54-inline-tsc). `rtcost.py` (one vCPU, the
+**Measured first** (`natemu-raw/sysfast2-20261104-01/meas/`; HEAD ddbbf09, series54-inline-tsc). `rtcost.py` (one vCPU, the
 slope of the driver's wall time as `run_k2.py cost`): a SYSCALL -> kernel -> SYSRET round trip from a CPL-3 loop costs
 0.69 us with a kernel side shaped as Linux's (`endbr64; swapgs; ...; swapgs; 7-byte NOP; sysretq`: two resident entries
 carrying six system instructions: SYSCALL, NOP run, SWAPGS; SWAPGS, NOP run, SYSRET), 0.29 us with a bare `sysretq` (one
@@ -1636,7 +1636,7 @@ Unsigned-form condition is held by the size test too (a pair is 16 bytes): dropp
 output is in `nc/red-*.txt` (`nc/README.md`).
 
 **Measured** (`natemu-raw/sysfast2-20261104-01/`: `campaign.sh`, `run1.sh`, `summ17.py`, `runs/`, `inst/`, `k2/`; the
-`natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB, base (114c9eb, series54-inline-tsc) and chunk 17
+`natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB, base (ddbbf09, series54-inline-tsc) and chunk 17
 (series55-swapgs) interleaved, three rounds (the installer at N = 4 once), one VM at a time, every run verified or reached
 and uncontended; median (min-max), seconds):
 
@@ -1677,7 +1677,7 @@ allowed no non-zero byte outside the guest-state fields (it now admits the KERNE
 shadow-space switch (the `syscall` row's 0.59 us). Making them lighter needs a shorter resident path (no state copy in and
 out, one `find` pass), not translation: the CPL, and with it TTBR and the code context, changes only at EL1.
 
-### Measured (chunk 18: breakdown at HEAD, November 4; analysis on 1d75dc7, series55-swapgs, no code change kept)
+### Measured (chunk 18: breakdown at HEAD, November 4; analysis on c5d5e2d, series55-swapgs, no code change kept)
 
 **Question.** Where the time goes now on the two workloads that still trail QEMU or did not move: the installer boot (cache
 off, N = 1 7.67 s against QEMU 6.10 s; N = 4 6.26 against 4.81) and `build` (19.8 / 9.3 s, flat under chunks 15 and 17; QEMU
@@ -1815,7 +1815,7 @@ chunk on these numbers (at most 0.2 s on the installer), and generated code has 
 **Not done.** No optimisation built; no instrumentation kept (the four scratch diffs are in the evidence directory; the
 tree is HEAD's). Not measured: the share of HVF's second-stage TLB misses in generated code (no counter reachable).
 
-### Measured (chunk 19: exact large-page regions and a larger dispatcher L1, November 4; uncommitted on f74c3ea, series55-swapgs)
+### Measured (chunk 19: exact large-page regions and a larger dispatcher L1, November 4; uncommitted on d5ebd3a, series55-swapgs)
 
 Evidence: `natemu-raw/lookup-20261104-01/` (README there). Setup as chunk 18: the `natemu` stub, cache off,
 `mitigations=off nokaslr`, 2 GiB, compiler series55-swapgs (unchanged), one VM at a time. Walls are uninstrumented runs
@@ -1954,9 +1954,9 @@ test, `run_k1.py` 336 runs, all green.
 treats PS at level 3 as reserved and the profile does not advertise 1 GiB pages); revisit if they are added (the region test
 covers 2 MiB regions only).
 
-### Measured (chunk 20: fexc's per-request setup, November 4; uncommitted on 5d80597, series56-setup)
+### Measured (chunk 20: fexc's per-request setup, November 4; uncommitted on a69c973, series56-setup)
 
-Evidence: `natemu-raw/fexsetup-20261104-01/` (README there). Setup as chunk 18: the `natemu` stub at HEAD 5d80597, cache
+Evidence: `natemu-raw/fexsetup-20261104-01/` (README there). Setup as chunk 18: the `natemu` stub at HEAD a69c973, cache
 off, `mitigations=off nokaslr`, 2 GiB, one VM at a time. Old compiler series55-swapgs, new series56-setup. Host and
 resident unchanged.
 
@@ -2066,10 +2066,10 @@ not measured again. The recorded streams were deleted afterwards (0.83 GB; `rec/
 **Not done.** The shim's recorder containers are still freed and refilled per request (`ResetGlobals`, 4% of the new
 server's busy time), and the host still formats the argument strings for every request (host side, unchanged).
 
-### Measured (chunk 21: a shared-memory channel to the compile server, November 4; uncommitted on af2acf6, series58-channel-r1)
+### Measured (chunk 21: a shared-memory channel to the compile server, November 4; uncommitted on d8676ac, series58-channel-r1)
 
 Evidence: `natemu-raw/shmchan-20261104-01/` (README there). Setup as chunk 18: the `natemu` stub, cache off,
-`mitigations=off nokaslr`, 2 GiB, one VM at a time. Old: HEAD af2acf6 with compiler series57-fork over the pipe. New: the
+`mitigations=off nokaslr`, 2 GiB, one VM at a time. Old: HEAD d8676ac with compiler series57-fork over the pipe. New: the
 working tree with **series58-channel** (`obj/fexc` SHA-256 `da337021...87315c`, reproduced by a second `build.sh`), measured;
 after the independent review **series58-channel-r1** (`8bd3b7ea...a83e59`, reproduced likewise; below, "Review"). fexc stays a
 separate process; no FEX change.
@@ -2218,9 +2218,9 @@ the replays and debugging, and the host no longer uses it. `test_serve.py` runs 
 the replays, `test_channel.py`, the unit tests and every VM run. No test guards against a fork on the spawn (one would have to
 read the source); the stress cases are what caught it.
 
-### Measured (chunk 22: a SYSCALL/SYSRET fast path in the resident, November 4; branch perf22-sysfast on 71aae61, series58-channel-r1)
+### Measured (chunk 22: a SYSCALL/SYSRET fast path in the resident, November 4; branch perf22-sysfast on a342b87, series58-channel-r1)
 
-Evidence and harness: `natemu-raw/sysfast3-20261104-01/` (README there). Base: 71aae61 (chunk 21) with its resident; the
+Evidence and harness: `natemu-raw/sysfast3-20261104-01/` (README there). Base: a342b87 (chunk 21) with its resident; the
 change: this branch, the same host binaries (chunk 22 changes only the resident and `run_k2.py`). Compiler series58-channel-r1
 for both; the `natemu` stub, cache off, `mitigations=off nokaslr`, 2 GiB, one VM at a time.
 
@@ -2389,7 +2389,7 @@ carries the gate's frame copy) 7.04 / 6.62, the shadow-space switch 1.26 / 1.30,
 Benchmarks (`camp/`, `campaign22.sh`, `summ22.py`: three interleaved rounds, order alternating, every run verified or
 reached and uncontended; median (min-max), seconds; CPU s the process's, its fexc servers included, mean):
 
-| Benchmark | N | before (71aae61) | after | change | CPU s before / after |
+| Benchmark | N | before (a342b87) | after | change | CPU s before / after |
 | --- | --- | --- | --- | --- | --- |
 | `hackbench` | 1 | 13.85 (13.80-14.14) | **12.19** (11.85-12.24) | -12.0% | 16.9 / 15.0 |
 | | 4 | 3.88 (3.83-3.91) | 3.78 (3.44-3.85) | -2.7% | 19.0 / 18.4 |
@@ -2409,11 +2409,11 @@ decode lookup) and then, for any other target, the linker's own path as before.
 
 **Decode first** (a24fc30): the decode is probed before anything else, so every other literal exit declines after one
 probe and goes to the linker. Tests rerun (`tests2/`): `run_k2.py --only sysfast,rollback,swapgs` 26/26; each of the six
-variants rebuilt on it turns only its expected cases red. Benchmarks, base 71aae61 against a24fc30 (`camp2/` rounds 1-2,
+variants rebuilt on it turns only its expected cases red. Benchmarks, base a342b87 against a24fc30 (`camp2/` rounds 1-2,
 `camp3/` rounds 3-5, `camp4/` ten more `cray` and four more installer rounds; `camp2`'s third round stopped when its run was
 interrupted, its two finished base runs kept; every run verified or reached and uncontended; median (min-max), seconds):
 
-| Benchmark | N | before (71aae61) | after (a24fc30) | change | CPU s before / after | runs |
+| Benchmark | N | before (a342b87) | after (a24fc30) | change | CPU s before / after | runs |
 | --- | --- | --- | --- | --- | --- | --- |
 | `hackbench` | 1 | 13.57 (13.13-13.85) | **11.56** (11.49-11.70) | -14.8% | 16.3 / 14.4 | 6 / 5 |
 | | 4 | 4.02 (3.89-4.12) | **3.62** (3.25-3.71) | -10.0% | 19.5 / 17.8 | 5 / 5 |
@@ -2436,7 +2436,7 @@ SCTLR_EL1.EOS makes ERET one; not built, unmeasured). `bank`'s and `enter`'s XMM
 is, but the frame is rebuilt from the bank). A SYSCALL reached by a computed exit (through the dispatcher's miss) takes the
 general path.
 
-### Measured (chunk 23: a metadata arena and block index twice as large, November 5; uncommitted on 5554c12, series58-channel-r1)
+### Measured (chunk 23: a metadata arena and block index twice as large, November 5; uncommitted on 8b45d28, series58-channel-r1)
 
 Evidence: `natemu-raw/flush-20261105-01/` (README there). Setup as chunk 18: the `natemu` stub, cache off,
 `mitigations=off nokaslr`, 2 GiB, compiler series58-channel-r1 (unchanged), one VM at a time; the initramfs of
@@ -2535,7 +2535,7 @@ both builds (campaigns and perf runs), reached it. Not reproduced or investigate
 about 2.7 times HEAD's arena and index, past the identity map's room at four vCPUs. Smaller records (a block averages 276
 bytes, sites 40 bytes each) or an eviction by age would be the next step; neither is built.
 
-### Measured (chunk 24: breakdown at HEAD, November 5; analysis on 4afd86a, series58-channel-r1, no code change kept)
+### Measured (chunk 24: breakdown at HEAD, November 5; analysis on 0feafab, series58-channel-r1, no code change kept)
 
 **Question.** Where the time goes at HEAD on the installer and the seven benchmarks, and three gates: per-address-space
 copies (PCID), compiling a page's region in one request, and compiling ahead on idle cores; then a ranked list.
@@ -2713,7 +2713,7 @@ The sampler's EL1 share disagrees with the resident buckets (`hackbench` 70% aga
 at EL1), so its numbers are used only within EL0. The fill table of the PCID counter is 64 Ki entries: `mem`'s working set
 overflows it (3.5 M collisions), so its refault count is a lower bound (its first-in-root installs, 79 k, bound the rest).
 
-### Measured (chunk 25: an STI that starts its block, and STMXCSR/VSTMXCSR, translated inline, November 5; uncommitted on afb2897, series60-stmxcsr)
+### Measured (chunk 25: an STI that starts its block, and STMXCSR/VSTMXCSR, translated inline, November 5; uncommitted on c919d38, series60-stmxcsr)
 
 Evidence: `natemu-raw/inline2-20261105-01/` (README there). FEX: two commits on the fork clone's local branch `natemu-chunk25`
 (from `natemu` 455698b5, not pushed): 09dd3ca19 (FexcInterruptFlagOp's comment: an inline STI may start its block; no code
@@ -2925,7 +2925,7 @@ target the block's start) would need admission to mark the link point by its pla
 after MOV SS of an STI that starts a block now asks the host for the step's decode (the kept decode at that RIP is a block),
 a host round trip only in that rare case. `locks` N = 4 is slower (more guest contention, as after chunk 15).
 
-### Measured (chunk 26: REP STOS in bulk inside a page, and MOV r64, CR2 inline at CPL 0, November 5; uncommitted on 625df3c, series64-chunk26-r1)
+### Measured (chunk 26: REP STOS in bulk inside a page, and MOV r64, CR2 inline at CPL 0, November 5; uncommitted on 69bfcad, series64-chunk26-r1)
 
 Evidence: `natemu-raw/repfault-20261105-01/` (README there). FEX: three commits on the fork clone's local branch `natemu-chunk26`
 (from `natemu` ab62c7e06, not pushed): 5188b9fa0 (REP STOS in bulk, `FexcRepStos`; the bulk pass's last element ends the
@@ -2933,7 +2933,7 @@ instruction by a branch), 57323cdd3 (MOV r64, CR2: 0f 20 decoded with its ModRM,
 0430dc8a6 (0f 20's ModRM decoded register-only; `FexcMovFromCROp` checks its form). Final compiler series64-chunk26-r1 (below,
 "Review round"). Compilers
 series62-repstos (5188b9fa0, the shim without the CR2 rule) and series63-cr2 (57323cdd3, this tree's shim); natemu's
-submodule pin is unchanged. 625df3c only added the suite runner: the code measured against is 3dd4fb5's.
+submodule pin is unchanged. 69bfcad only added the suite runner: the code measured against is ee8d4a5's.
 
 **Measured first.** REP strings (chunk 24's sampler, `breakdown-20261105-01/prof/profcls.json`, and the I2 throughput rows of the
 boot-features plan): REP-string blocks are 17% of `mem`'s generated-code samples (the kernel's `clear_page`, `rep stosq` of a
@@ -3098,7 +3098,7 @@ against the host) and N = 4 reached the dialog; `mem` and `build` at N = 1 verif
 
 **Review round** (independent review: no blocking defect; two SDM gaps fixed and hardening, `-r1`: FEX 0430dc8a6 on the
 two commits above, compiler series64-chunk26-r1, `obj/fexc` SHA-256 `71c8349f...05ba6c`, `bin/r1`, patch
-`chunk26-repfault-625df3c-r1.patch`):
+`chunk26-repfault-69bfcad-r1.patch`):
 1. Fast-string conditions (SDM Vol.1 7.3.9.3, Vol.3 11.2.4.1: grouping iterations needs IA32_MISC_ENABLE bit 0 and WB or WC
    memory; natemu lets the guest clear bit 0 and runs WT/WP RAM natively). The resident writes bit 0 into a flag byte of the
    guest-state page (`frame::FAST_STRINGS`, FEX's flags[23], which FEX never used) at every entry; `FexcRepStos` starts with
@@ -3142,7 +3142,7 @@ to stay exact, only leaf entries already present with A set (writable only with 
 INVLPG/CR3 invalidation as today; whether it pays depends on how many of `mem`'s installs a neighbour's would have served,
 which needs a census of the installs (user or kernel, the neighbours' A bits, refaults after INVLPG) first.
 
-### Measured (chunk 27: the persistent compile cache for CPL-3 code only, November 5; on 6b2905b, series64-chunk26-r1)
+### Measured (chunk 27: the persistent compile cache for CPL-3 code only, November 5; on f201715, series64-chunk26-r1)
 
 Evidence: `natemu-raw/diskcache2-20261105-01/` (README there; the harness of `diskcache-20261105-01/`, the phase-2 plan's
 "Disk cache").
@@ -3193,7 +3193,7 @@ passed; `cargo test` 115 + 2 ignored (host), abi 65, with and without `FEXC`. Th
 the default raw directory with its resolved path: the worktree reached `natemu-raw` through a symlink, which resolves
 elsewhere. Without the symlink the Python tests pass (299, the ones needing raw files skipped).
 
-### Measured (chunk 28: three generated-code shapes, November 5; analysis on 6b2905b, series64-chunk26-r1, no code change kept)
+### Measured (chunk 28: three generated-code shapes, November 5; analysis on f201715, series64-chunk26-r1, no code change kept)
 
 **Question.** Of three costs every block pays, which is largest across workloads and can be made cheaper exactly: (a) the
 page-crossing check before each store wider than a byte, (b) a SIMD load into a scratch register and then a 128-bit move to
@@ -3372,7 +3372,7 @@ only); both emulators with and without `nokaslr`; natemu cache warm and off; thr
 "Built" note holds before/after tables; the handoff's boot tables and INV-03-01's "Next phase" row are updated. Claims
 beyond development results get pre-execution review and replication.
 
-**Measured like for like** (integrity audit, November 3; `natemu-raw/qcmp-20261103-01/`, natemu at 1c4d8b9 plus the audit's
+**Measured like for like** (integrity audit, November 3; `natemu-raw/qcmp-20261103-01/`, natemu at b2720d5 plus the audit's
 change, series48-lean; method and the one QEMU boot that missed its end point in the handoff §4):
 
 | To the root-fs panic: wall s mean (min-max; guest s) | N = 1 | N = 2 | N = 3 | N = 4 |

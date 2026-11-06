@@ -6,9 +6,9 @@ Scratch evidence: `/private/tmp/claude-501/-Users-liaozping-orca-natemu/025ed521
 (`src/`: the upstream source files read; `tramp32.lst`, `tramp64.lst`: encodings of the transcribed trampoline).
 **Later change (S3i, October 28):** the families this plan would have let S3i delete are deleted under decision 3; the
 models it cross-checks against are now `tools/models/pae_model.py`, `modes_model.py` and `coherence_model.py`; the deleted
-code (32-bit families, `paging_off32`, `controls`, `modes`, `pae`, `mixed32`) is in git history at `8d529f9`. The legacy
+code (32-bit families, `paging_off32`, `controls`, `modes`, `pae`, `mixed32`) is in git history at `ed11ab1`. The legacy
 two-level walker `crates/abi/src/paging32.rs` (PSE off) had no general-path caller: deleted at S3i1; recover it from commit
-4902ee5 (`crates/abi/src/paging32.rs`) if the boot phase needs legacy paging.
+a6b299b (`crates/abi/src/paging32.rs`) if the boot phase needs legacy paging.
 
 ## 1. Which kernel code runs in 32-bit mode
 

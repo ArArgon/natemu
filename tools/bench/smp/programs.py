@@ -930,7 +930,7 @@ SYS_FAULTS = {
     'cr4-pcide': 'mov rax, cr4\n    bts rax, 17\n    mov cr4, rax',
     'cr4-smap': 'mov rax, cr4\n    bts rax, 21\n    mov cr4, rax',
     'cr4-pae-clear': 'mov rax, cr4\n    btr rax, 5\n    mov cr4, rax',
-    # Profile cases (tools/models/cpu_profile.json via system_fault_model): CR4 bits whose CPUID feature is clear (not UMIP: advertised since edfcee9, its cases are run_x1.py `umip-*`), and WRMSR/RDMSR the profile refuses.
+    # Profile cases (tools/models/cpu_profile.json via system_fault_model): CR4 bits whose CPUID feature is clear (not UMIP: advertised since 9b845e8, its cases are run_x1.py `umip-*`), and WRMSR/RDMSR the profile refuses.
     'cr4-vme': 'mov rax, cr4\n    bts rax, 0\n    mov cr4, rax',
     'cr4-pvi': 'mov rax, cr4\n    bts rax, 1\n    mov cr4, rax',
     'cr4-mce': 'mov rax, cr4\n    bts rax, 6\n    mov cr4, rax',

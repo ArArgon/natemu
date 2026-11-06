@@ -2,51 +2,51 @@
 
 Status: November 2, 2026, end of the boot-features phase (chunk R2 of the
 [boot-features plan](boot-features-plan.md), "the plan" below; its §4 checklist says what is met). Emulator code at
-e6b2bf5 (the fix of the blocking interrupt defect found at R2, §4) plus the fixes of the independent phase-end review,
-uncommitted on e6b2bf5 (plan, Built (R2 review fixes)); the
+1774618 (the fix of the blocking interrupt defect found at R2, §4) plus the fixes of the independent phase-end review,
+uncommitted on 1774618 (plan, Built (R2 review fixes)); the
 compiler is fexc **series48-lean** (November 3, perf plan "Measured (chunk 2)": series47-seg with the compile server sending
 only what the host reads; objects, extent and args_read byte-identical; series47-seg is series46-br66's patches with the owner's segment-prefix decisions in the shim
 and `fexc.cpp`: CS/DS/ES/SS prefixes ignored, the last FS/GS prefix applies, FS/GS with no memory operand ignored; plan §5
 and Built (segment prefixes, November 3); series46-br66 is series45-r2fix plus patch 0029 and its shim change: 66 on near
 direct branches ignored as on Intel; series45-r2fix is series44-r2, byte-identical to the hand-built series43-x1, plus the
 review's shim change: segment prefixes on near direct branches ignored; §6), built by `tools/fexc/build.sh`. Since perf
-chunk 4 (uncommitted on a24c785) the host reuses a translation at every RIP of the same half and page offset by its
+chunk 4 (uncommitted on 9a0777c) the host reuses a translation at every RIP of the same half and page offset by its
 relocation records (`crates/host/src/relocation.rs`; perf plan "Measured (chunk 4)"): installer N = 1 cache off 27.7 s.
-Since perf chunk 5 (uncommitted on d89bc4c) the resident keeps four dispatcher L1 tables, one per code context, and a CPL
+Since perf chunk 5 (uncommitted on 78fb6ae) the resident keeps four dispatcher L1 tables, one per code context, and a CPL
 change switches tables instead of clearing L1 (`crates/runtime/src/cache.rs` `select_l1`; perf plan "Measured (chunk 5)"):
-installer N = 1 cache off 17.4 s, N = 4 15.6 s. Since perf chunk 7 (uncommitted on 0da552a) the host's per-request work
+installer N = 1 cache off 17.4 s, N = 4 15.6 s. Since perf chunk 7 (uncommitted on a159d20) the host's per-request work
 is leaner: the watchdog samples an entry-time word instead of being woken by two channel sends per exit, the block RIP set
 is kept only for the program driver, guest bytes are copied a word at a time, and the memory cache is looked up in one pass
 under a universal hash (perf plan "Measured (chunk 7)"): installer N = 1 cache off 15.9 s, N = 4 13.6 s. Since perf
-chunk 8 (uncommitted on 1c4d8b9) fewer block links are undone at TLB events: a block placed from global pages is global at
+chunk 8 (uncommitted on b2720d5) fewer block links are undone at TLB events: a block placed from global pages is global at
 once, a link within one page and frame (`cache::local`) stays across CR3 loads, global flushes and INVLPGs, and INVLPG (and
 a #PF) reaches only its 4 KiB page and blocks from a 2 MiB leaf around it (perf plan "Measured (chunk 8)"): installer N = 1
-cache off 13.6 s, N = 4 12.4 s (15.6 and 13.4 s before, in the same rounds). Since perf chunk 9 (uncommitted on 9ba60d5)
+cache off 13.6 s, N = 4 12.4 s (15.6 and 13.4 s before, in the same rounds). Since perf chunk 9 (uncommitted on 808cf24)
 a resident entry copies less: the state passes by reference to `dispatch`, `enter` and `step`, records are copied 32 bytes a
 step, the entry frame is built in place in `Shared::initial` (its unwritten rest stays zero; the host checks it at every
 resident stop) and the linker searches the block index once (perf plan "Measured (chunk 9)"): installer N = 1 cache off
-10.8 s, N = 4 11.0 s (13.1 and 12.5 s before, in the same rounds). Since perf chunk 10 (uncommitted on 851cbd2) the resident
+10.8 s, N = 4 11.0 s (13.1 and 12.5 s before, in the same rounds). Since perf chunk 10 (uncommitted on 94145e7) the resident
 places most blocks the host would only relocate itself: a miss whose frame, page offset and context a live block of this
 vCPU holds at another RIP copies that block and rewrites its RIP-dependent words by the host relocator's rules
 (`natemu_abi::execution::relocate_code`, a hint table by frame in the lookup area, `execution::reused`), refusing to the host
 whatever it cannot prove; `--check-reuse` (and the suites' `--code-shape`) asks the host for every copy too and stops
 `reuse_mismatch` on any difference (perf plan "Measured (chunk 10)"): installer N = 1 cache off 8.6 s, N = 4 9.4 s (10.7
 and 11.0 s before, in the same rounds), 854 k of 1.16 M host requests avoided at N = 1.
-Since perf chunk 15 (uncommitted on e2f8aba, fexc series54-inline-tsc) a CPL-0 translation runs the one-byte CLI and STI
+Since perf chunk 15 (uncommitted on d6e80bf, fexc series54-inline-tsc) a CPL-0 translation runs the one-byte CLI and STI
 and the two-byte RDTSC inline instead of a resident round trip each: IF lives in its guest-state byte (banked at every
 exit), an inline STI reads the resident's event-pending byte and, with an event pending, exits to its own RIP so the
 resident's STI (shadow, delivery) runs; STI is never first or last in its block; RDTSC computes the resident's TSC from
 the virtual count, which EL0 may now read (CNTKCTL_EL1.EL0VCTEN only; perf plan "Measured (chunk 15)").
-Since perf chunk 17 (uncommitted on 114c9eb, fexc series55-swapgs) a CPL-0 translation also runs the plain SWAPGS inline: it
+Since perf chunk 17 (uncommitted on ddbbf09, fexc series55-swapgs) a CPL-0 translation also runs the plain SWAPGS inline: it
 exchanges the guest-state page's GS base with IA32_KERNEL_GS_BASE, which the resident writes there at every CPL-0 entry (0
 at CPL 3) and banks back, with the GS base, after CPL-0 code; Linux's system call then takes two resident trips (SYSCALL,
 SYSRET) instead of two trips with six system instructions (perf plan "Measured (chunk 17)").
-Performance batch 1 ended at 4ed8e3a (November 3): the whole standing suite green at both RAM sizes (§5 "Full suite at the end of performance batch 1"), the §4 comparison rerun with the stub: installer N = 1 and 4 cache off 8.85 and 9.39 s, warm 6.89 and 5.80 s, against QEMU `thread=multi` 6.10 and 4.81 s.
-Perf chunk 6 (uncommitted on ea11225) measured the whole-cache flushes and left the cache as it is: only 123 k requests per
+Performance batch 1 ended at c9d6e27 (November 3): the whole standing suite green at both RAM sizes (§5 "Full suite at the end of performance batch 1"), the §4 comparison rerun with the stub: installer N = 1 and 4 cache off 8.85 and 9.39 s, warm 6.89 and 5.80 s, against QEMU `thread=multi` 6.10 and 4.81 s.
+Perf chunk 6 (uncommitted on 7af0435) measured the whole-cache flushes and left the cache as it is: only 123 k requests per
 installer boot (N = 1) refill blocks placed before a flush, and a record arena and index sized for the code area were no
 faster (+261 MiB); the performance log gains four request-line fields, and up to 870 k requests at N = 1 could reuse a block
 of the same physical page inside the resident (perf plan "Measured (chunk 6)").
-The integrity audit of November 3 (uncommitted on 1c4d8b9) tightened the ASM runner (unsupported only for a documented
+The integrity audit of November 3 (uncommitted on b2720d5) tightened the ASM runner (unsupported only for a documented
 refusal), made SSE4a EXTRQ/INSERTQ #UD and F2/F3 on SMSW ignored, added `boot-linux --code-shape`, listed the reserved forms
 refused (§4), and replaced the QEMU comparison by a like-for-like one (§4 boots, §5 "Rerun with the integrity-audit fixes").
 This page is enough to start the boot integration: how to build and run a boot, what a boot takes as input, what is
@@ -80,7 +80,7 @@ target/release/natemu "$R" "$F" "$K" --cmdline 'console=ttyS0 earlyprintk=serial
 target/release/natemu "$R" "$F" "$K" --initrd "$I" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr'
 ```
 
-The initrd boot hung after "Run /init" at 16b0576 (device interrupts through a dangling pointer); fixed after R2 (§4,
+The initrd boot hung after "Run /init" at c8e6216 (device interrupts through a dangling pointer); fixed after R2 (§4,
 "Blocking defect found at R2 (resolved)").
 
 `natemu RUNTIME FEXC BZIMAGE [--initrd FILE] [--cmdline TEXT] [--ram BYTES] [--vcpus N] [--serial FILE]`: COM1's output
@@ -266,35 +266,35 @@ line appearing in the serial file (polled every 50 ms), the same for both emulat
 not included; guest time is the kernel's printk timestamp at the panic, or at "Run /init". End points: "VFS: Unable to
 mount root fs" without initrd, the installer's "Select a language" dialog with it. Warm = the default compile cache after
 a warm-up boot, off = `NATEMU_COMPILE_CACHE=off`. Raw records `natemu-raw/r2-20261102-01/boot/boots.jsonl`, serial logs
-beside it; the natemu rows to "Select a language" were rerun on the build with the review fixes (e6b2bf5 plus them; a
+beside it; the natemu rows to "Select a language" were rerun on the build with the review fixes (1774618 plus them; a
 warm-up boot first), `natemu-raw/r2-final-20261102-01/boot/boots.jsonl`. R2's rows labelled "with the fix" for
 `boot-linux` and the cache-off stub came from the scratch rebind experiment, not the committed fix; these replace them,
-and agree with them within 0.6 s. The `natemu` stub cache-warm rows were remeasured on series47-seg at 335c070, the stub
+and agree with them within 0.6 s. The `natemu` stub cache-warm rows were remeasured on series47-seg at 3694324, the stub
 built alone with `-p natemu` and signed, the same method, after a warm-up boot at N = 1 without and with the initrd, one boot per cell
 (`natemu-raw/final-suite-20261103-01/boot/boots.jsonl`); the perf chunk 2 rows are three interleaved boots per cell at
-e9214c8, old and new compiler each with its own warm cache after a warm-up boot, the log off (`natemu-raw/perf2-20261103-01/`,
-perf plan "Measured (chunk 2)"); the perf chunk 4 rows likewise, before (a24c785) and after (the uncommitted reuse across
+9e41892, old and new compiler each with its own warm cache after a warm-up boot, the log off (`natemu-raw/perf2-20261103-01/`,
+perf plan "Measured (chunk 2)"); the perf chunk 4 rows likewise, before (9a0777c) and after (the uncommitted reuse across
 load addresses) each with its own warm cache (`natemu-raw/perf4-20261103-01/`, perf plan "Measured (chunk 4)"); the
-perf chunk 5 row is three interleaved boots per cell, cache off, before (d89bc4c) and after (the per-context L1 tables)
-(`natemu-raw/perf5-20261103-01/step3/`, perf plan "Measured (chunk 5)"); the perf chunk 7 row likewise, before (0da552a) and
+perf chunk 5 row is three interleaved boots per cell, cache off, before (78fb6ae) and after (the per-context L1 tables)
+(`natemu-raw/perf5-20261103-01/step3/`, perf plan "Measured (chunk 5)"); the perf chunk 7 row likewise, before (a159d20) and
 after (the host cleanups) (`natemu-raw/perf7-20261103-01/runs/`, perf plan "Measured (chunk 7)"); the perf chunk 8 row
-likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and after (links kept across TLB events)
+likewise at N = 1 and one boot each at N = 4, log off, before (b2720d5) and after (links kept across TLB events)
 (`natemu-raw/perf8-20261103-01/runs2/`, perf plan
-"Measured (chunk 8)"); the perf chunk 9 row likewise, before (9ba60d5) and after (cheaper resident entry)
+"Measured (chunk 8)"); the perf chunk 9 row likewise, before (808cf24) and after (cheaper resident entry)
 (`natemu-raw/perf9-20261103-01/runs/`, perf plan "Measured (chunk 9)"); the other rows are R2's.)
 
 | To the root-fs panic, wall s (guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
-| `natemu` stub, cache warm (series47-seg, 335c070) | 2.40 (1.26) | 2.19 (1.43) | 2.26 (1.54) | 2.36 (1.61) |
+| `natemu` stub, cache warm (series47-seg, 3694324) | 2.40 (1.26) | 2.19 (1.43) | 2.26 (1.54) | 2.36 (1.61) |
 | `natemu-host boot-linux`, cache warm | 2.46 (1.19) | 2.04 (1.34) | 2.19 (1.47) | 2.26 (1.55) |
 | `natemu` stub, cache off | 4.15 (2.83) | 4.68 (3.70) | 5.33 (4.32) | 5.70 (4.65) |
 | `natemu-host boot-linux`, cache off | 4.51 (3.12) | 5.24 (4.13) | 5.58 (4.48) | 6.06 (5.03) |
-| `natemu` stub, cache warm, **batch 1 end** (4ed8e3a, series48-lean; like-for-like harness below, mean of 3, `nokaslr`) | **1.69** (0.82) | **1.59** (1.10) | **1.51** (1.01) | **1.57** (1.06) |
+| `natemu` stub, cache warm, **batch 1 end** (c9d6e27, series48-lean; like-for-like harness below, mean of 3, `nokaslr`) | **1.69** (0.82) | **1.59** (1.10) | **1.51** (1.01) | **1.57** (1.06) |
 | `natemu` stub, cache off, **batch 1 end** (same) | **2.69** (1.68) | **2.80** (2.13) | **3.05** (2.40) | **3.31** (2.62) |
 
 | To "Select a language" (initrd), wall s ("Run /init" guest s) | N = 1 | N = 2 | N = 3 | N = 4 |
 | --- | --- | --- | --- | --- |
-| `natemu` stub, cache warm (series47-seg, 335c070) | 68.2 (5.24) | 53.4 (5.26) | | 50.2 (5.51) |
+| `natemu` stub, cache warm (series47-seg, 3694324) | 68.2 (5.24) | 53.4 (5.26) | | 50.2 (5.51) |
 | `natemu-host boot-linux`, cache warm | 67.3 (5.15) | | | 49.5 (5.39) |
 | `natemu` stub, cache off | 67.8 (7.12) | | | 53.1 (9.47) |
 | `natemu-host boot-linux`, cache off | 68.0 (7.22) | | | 52.5 (8.95) |
@@ -304,19 +304,19 @@ likewise at N = 1 and one boot each at N = 4, log off, before (1c4d8b9) and afte
 | `natemu-host boot-linux`, cache off, **series48-lean** (perf chunk 2, mean of 3) | **49.3** (5.13) | | | **37.6** (6.32) |
 | `natemu-host boot-linux`, cache warm, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **26.2** (2.95) | | | **18.8** (3.08) |
 | `natemu-host boot-linux`, cache off, series48-lean, **reuse across addresses** (perf chunk 4, mean of 3) | **27.7** (4.00) | | | **22.8** (5.43) |
-| `natemu-host boot-linux`, cache off, series48-lean, **per-context L1 tables** (perf chunk 5, mean of 3; d89bc4c in the same rounds: 27.7 (4.04), 22.6 (5.38)) | **17.4** (3.57) | | | **15.6** (5.05) |
-| `natemu-host boot-linux`, cache off, series48-lean, **host per-request cleanups** (perf chunk 7, mean of 3; 0da552a in the same rounds: 17.8 (3.62), 15.7 (5.00)) | **15.9** (3.29) | | | **13.6** (4.51) |
-| `natemu-host boot-linux`, cache off, series48-lean, **links kept across TLB events** (perf chunk 8, N = 1 mean of 3, N = 4 one boot; 1c4d8b9 in the same rounds: 15.6 (3.22), 13.4 (4.45)) | **13.6** (3.10) | | | **12.4** (4.29) |
-| `natemu-host boot-linux`, cache off, series48-lean, **cheaper resident entry** (perf chunk 9, N = 1 mean of 3, N = 4 one boot; 9ba60d5 in the same rounds: 13.1 (3.02), 12.5 (4.42)) | **10.8** (2.66) | | | **11.0** (4.16) |
-| `natemu-host boot-linux`, cache off, series48-lean, **reuse inside the resident** (perf chunk 10, N = 1 mean of 3, N = 4 one boot; 851cbd2 in the same rounds: 10.7 (2.64), 11.0 (4.14)) | **8.6** (2.42) | | | **9.4** (3.98) |
-| `natemu` stub, cache warm, series48-lean, **batch 1 end** (4ed8e3a, like-for-like harness, mean of 3) | **6.89** (1.50) | | | **5.80** (1.78) |
-| `natemu` stub, cache off, series48-lean, **batch 1 end** (4ed8e3a, same) | **8.85** (2.51) | | | **9.39** (3.78) |
-| `natemu` stub and `boot-linux` at 16b0576, warm or off | never (hangs after "Run /init", see below) | never | | never |
+| `natemu-host boot-linux`, cache off, series48-lean, **per-context L1 tables** (perf chunk 5, mean of 3; 78fb6ae in the same rounds: 27.7 (4.04), 22.6 (5.38)) | **17.4** (3.57) | | | **15.6** (5.05) |
+| `natemu-host boot-linux`, cache off, series48-lean, **host per-request cleanups** (perf chunk 7, mean of 3; a159d20 in the same rounds: 17.8 (3.62), 15.7 (5.00)) | **15.9** (3.29) | | | **13.6** (4.51) |
+| `natemu-host boot-linux`, cache off, series48-lean, **links kept across TLB events** (perf chunk 8, N = 1 mean of 3, N = 4 one boot; b2720d5 in the same rounds: 15.6 (3.22), 13.4 (4.45)) | **13.6** (3.10) | | | **12.4** (4.29) |
+| `natemu-host boot-linux`, cache off, series48-lean, **cheaper resident entry** (perf chunk 9, N = 1 mean of 3, N = 4 one boot; 808cf24 in the same rounds: 13.1 (3.02), 12.5 (4.42)) | **10.8** (2.66) | | | **11.0** (4.16) |
+| `natemu-host boot-linux`, cache off, series48-lean, **reuse inside the resident** (perf chunk 10, N = 1 mean of 3, N = 4 one boot; 94145e7 in the same rounds: 10.7 (2.64), 11.0 (4.14)) | **8.6** (2.42) | | | **9.4** (3.98) |
+| `natemu` stub, cache warm, series48-lean, **batch 1 end** (c9d6e27, like-for-like harness, mean of 3) | **6.89** (1.50) | | | **5.80** (1.78) |
+| `natemu` stub, cache off, series48-lean, **batch 1 end** (c9d6e27, same) | **8.85** (2.51) | | | **9.39** (3.78) |
+| `natemu` stub and `boot-linux` at c8e6216, warm or off | never (hangs after "Run /init", see below) | never | | never |
 
 The QEMU rows these tables held until November 3 (R2's harness: `-machine pc` with its default devices and HPET,
 `-cpu Haswell,-pcid,-hle,-rtm,-invpcid`, and `ps -M` thread polling on the QEMU side only) were replaced by a like-for-like
 comparison (integrity audit, November 3; `natemu-raw/qcmp-20261103-01/`: `boot.py`, `campaign.py`, `aggregate.py`), and
-the tables below are that comparison rerun at the end of performance batch 1 (November 3, **HEAD 4ed8e3a**, clean tree,
+the tables below are that comparison rerun at the end of performance batch 1 (November 3, **HEAD c9d6e27**, clean tree,
 series48-lean, Rust 1.97.0; `natemu-raw/batch1-final-20261103-01/timing/`: `boot.py`, `campaign.py`, `aggregate.py`, `runs/boots.jsonl`,
 serial logs, `table.md`; the audit's `cpu/` flag lists are in `natemu-raw/audit-fix-20261103-01/`). One harness for both
 emulators: wall from process start to the end-point line, serial polled every 50 ms, nothing else polled but a check every
@@ -363,7 +363,7 @@ with the cache off; with KASLR the warm cache still gains little for the kernel 
 bytes every boot, so the persistent cache misses: §6a; warm N = 4 ranges 2.49-3.78 s) and is 1.4-2.1x QEMU, as is cache off
 (1.4-2.0x). To the installer the stub is 1.13x (N = 1) and 1.21x (N = 4) multi-threaded QEMU with a warm cache and `nokaslr`
 (0.93x single-threaded QEMU at N = 4), 1.45x and 1.95x with the cache off, 1.44-2.05x with KASLR. QEMU's own KASLR and
-`nokaslr` rows agree within 0.1 s. Against the audit's table (1c4d8b9, `boot-linux`: installer N = 1 and 4 cache off 16.04 and
+`nokaslr` rows agree within 0.1 s. Against the audit's table (b2720d5, `boot-linux`: installer N = 1 and 4 cache off 16.04 and
 13.67 s, warm 13.88 and 10.13 s; kernel only warm 2.25 and 2.01 s, off 3.27 and 3.76 s), the end of batch 1 is 8.85 and 9.39 s,
 6.89 and 5.80 s, 1.69 and 1.57 s, 2.69 and 3.31 s (the audit's build predates perf chunks 8-10; the rows now use the stub, not `boot-linux`).
 
@@ -373,13 +373,13 @@ but `Boot::prepare` (`crates/host/src/linux.rs`) calls it on its local `backing`
 returned `Prepared`, so every interrupt a device raises later (`Lapics::memory()` in posting and ringing) reads the
 `Memory` through a stale stack address: undefined behaviour in the host. Seen as: no user-space console output (the
 8250's THRE interrupt, IRQ 4, is never taken: 6 IIR reads against 14 before the split), so the installer's init blocks
-in its first tty write and never prints; `rdinit=/bin/busybox -- echo r2hello` prints nothing on natemu at 16b0576 at
-N = 1 and 2, prints on 959e430 (before the host split L0, 3c12567) and on QEMU. The kernel's own console is polled, so
+in its first tty write and never prints; `rdinit=/bin/busybox -- echo r2hello` prints nothing on natemu at c8e6216 at
+N = 1 and 2, prints on e6265c1 (before the host split L0, a1350d4) and on QEMU. The kernel's own console is polled, so
 the boots to the root-fs panic still reach it. The test driver's `run-program` keeps its backing in place, so the
 suite's interrupt tests (`r1-serial`, `run_l4a.py`, `run_x3.py`) cannot see it, and L0's checks booted only to a
 `poweroff -f` init. Experimental fix (scratch build only, never committed;
 `natemu-raw/r2-20261102-01/diag/rebind-experiment.diff`): `Prepared::run` re-points the pointer at `self.backing.memory`
-before the VM starts; with it the echo prints and both boot paths reach the installer dialog (table above). **Fix** (after R2, committed as e6b2bf5): `Backing::memory` is an `Arc<Memory>` and the
+before the VM starts; with it the echo prints and both boot paths reach the installer dialog (table above). **Fix** (after R2, committed as 1774618): `Backing::memory` is an `Arc<Memory>` and the
 chipset's `Lapics` holds a clone of it (no raw pointer, no `unsafe impl Send`; `Memory` is `Send` as a mapping handle),
 so the chipset keeps the mapping alive itself; the vCPU path still borrows `&Memory` through `Area` (unchanged). That
 alone did not make the public API sound (R2 review): `GuestRam` is `Copy` with safe writes, so a copy taken from
@@ -389,7 +389,7 @@ public field (a reassignment would strand `ram`), and the machine owns an `Arc<M
 mapping only while something keeps it mapped. No other
 pointer or reference captured during `prepare` outlives the move: devices, the UART hook, PIT/RTC/PM and `Devices` hold
 `Arc`s, `GuestRam` and the watchdog's `halted` word address the mmap (which does not move), the doorbell and compile
-cache are set up in `run`. Checks, red at b3f6841 and green with the fix: `tools/run_boot_smoke.py` (§5; the busybox
+cache are set up in `run`. Checks, red at a05e6e2 and green with the fix: `tools/run_boot_smoke.py` (§5; the busybox
 echo marker on serial at N = 1 and 4: 0/2 before, 2/2 after) and the unit test
 `linux::tests::interrupts_reach_the_backing_after_prepare_moves_it` (prepare, move into a `Box`, overwrite the old
 stack, COM1's THRE interrupt must post vector 0x41 into the moved backing's vCPU 0: it panicked on the stale `Memory`
@@ -432,7 +432,7 @@ controls), `delivery` 0 failures, `run_x3.py` (9/9, 4/4, 24/24, 6/6, 10/10, 54/5
 `run_m3.py` 0 failures, `run_m2.py` 112/112 at 2 GiB and at 4 MiB, `run_r1.py r1a` 7/7 and `r1b` 12/12 (negative
 controls flagged), and the initrd boots to "Select a language" at N = 1 and 4 (§4 table).
 
-**Rerun with the integrity-audit fixes** (`natemu-raw/audit-fix-20261103-01/suite/`, 2 GiB, 1c4d8b9 plus the uncommitted
+**Rerun with the integrity-audit fixes** (`natemu-raw/audit-fix-20261103-01/suite/`, 2 GiB, b2720d5 plus the uncommitted
 change, series48-lean; no fexc change): `cargo test` 159 + 1 ignored, also with `FEXC` set; Python 317 run, 0 skipped (with
 `FEXC` set, a release `natemu-host` and the loader dump; without them `test_fexc.py` and `test_slice1.py` skip, and
 `test_acpi_model.py`'s 18 tests count as one skipped module: 299 + 1 skipped in a copy with no `../natemu-raw`); ASM
@@ -453,7 +453,7 @@ that ends the run); admission took 112 against 85 ms without the option on a ker
 (`natemu-raw/audit-fix-20261103-01/code-shape/`). The rest of the block was not rerun: the change reaches only the host's
 system decode (66/F2 `0f 78/79`, F2/F3 SMSW), the ASM runner and the boot driver's option.
 
-**Full suite at the end of performance batch 1** (HEAD 4ed8e3a, clean tree, series48-lean (SHA-256 `8c8bd659...fda4f592`), Rust 1.97.0, the
+**Full suite at the end of performance batch 1** (HEAD c9d6e27, clean tree, series48-lean (SHA-256 `8c8bd659...fda4f592`), Rust 1.97.0, the
 blocks of this section exactly, with `FEXC` set for `cargo test` and the Python tests; `natemu-raw/batch1-final-20261103-01/`:
 `suite/2g/` and `suite/4m/` each hold `results.txt` (exit code and seconds per command, with a rerun's beside it), `logs/`
 and the commands; `check/` the installer boots; `timing/` the §4 comparison; per-case outputs deleted as each case ended; one
@@ -470,14 +470,14 @@ language"): N = 1 852,326 resident copies each also answered by the host and equ
 1,008 second frame), 31.1 s; N = 4 vCPU 0 149,013 copies and checks, 0 mismatches, every vCPU ended `Cancelled`, 25.2 s.
 
 **Rerun with reuse inside the resident** (perf plan "Measured (chunk 10)"; `natemu-raw/perf10-20261103-01/final/`, 2 GiB,
-851cbd2 plus the uncommitted change, series48-lean, every runner with the reuse check on): `cargo test` 162 + 1 ignored, also
+94145e7 plus the uncommitted change, series48-lean, every runner with the reuse check on): `cargo test` 162 + 1 ignored, also
 with `FEXC` set; `check_resident_stack.py` `ok` (16,656 / 20,832 / 8,912 bytes); fixtures 64, seed 44, faults 7,912, each at
 both block sizes; `contain` (423 controls), `smp`, `sharedpt`, `coherence`, `delivery` 0 failures; `run_k1.py` 280 runs (four
 reuse programs new); `run_k2.py`; `run_s4.py`; `run_x1.py` 6/6 and 196/196; `run_boot_smoke.py` 4/4; `run_r1.py r1a` 7/7,
 `r1b` 12/12; installer boots with `--check-reuse` at N = 1 and 4: 0 mismatches; every boot reached the dialog.
 
 **Rerun with the cheaper resident entry** (perf plan "Measured (chunk 9)"; `natemu-raw/perf9-20261103-01/suite/`, 2 GiB,
-9ba60d5 plus the uncommitted change, series48-lean): `cargo test` 160 + 1 ignored, also with `FEXC` set;
+808cf24 plus the uncommitted change, series48-lean): `cargo test` 160 + 1 ignored, also with `FEXC` set;
 `check_resident_stack.py` `ok` (16,368 / 20,512 / 8,672 bytes); fixtures 64, seed 44, faults 7,912, `run_i5c.py` 255,
 `run_i6b.py` corpus 112 and cases 129, each at both block sizes; `delivery`, `events`, `system`, `contain` (423 controls),
 `smp` 0 failures; `run_k1.py` 248 runs; `run_k2.py`; `run_s4.py` (QEMU's known `s4-d-stack` aborts as departures);
@@ -486,20 +486,20 @@ reuse programs new); `run_k2.py`; `run_s4.py`; `run_x1.py` 6/6 and 196/196; `run
 reran from there with each case's output deleted as it ended. The rest of the block was not rerun.
 
 **Rerun with the chunk-6 log fields, window check and capacity cases** (perf plan "Measured (chunk 6)";
-`natemu-raw/perf6-20261103-02/suite/`, 2 GiB, ea11225 plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored,
+`natemu-raw/perf6-20261103-02/suite/`, 2 GiB, 7af0435 plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored,
 also with `FEXC` set; `check_resident_stack.py` `ok`; Python 317; fixtures 64 and faults 7,912 at both block sizes;
 `run_slice2_probes.py` 85 (two new cases fill the block index and the metadata arena at the largest code cache and still match;
 negative controls red); `run_k1.py` 200 cases; `run_k2.py`; `contain` 0 failures (423 controls); `run_boot_smoke.py` 4/4;
 `run_r1.py r1a` 7/7, `r1b` 12/12. The rest of the block was not rerun.
 
 **Rerun with the host per-request cleanups** (perf plan "Measured (chunk 7)"; `natemu-raw/perf7-20261103-01/suite/`, 2 GiB,
-0da552a plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored, also with `FEXC` set; `run_boot_smoke.py`
+a159d20 plus the uncommitted change, series48-lean): `cargo test` 159 + 1 ignored, also with `FEXC` set; `run_boot_smoke.py`
 4/4; `contain` 0 failures (423 controls); faults 7,912; `run_slice2_probes.py` 74; `run_x3.py`, `run_x4.py`, `run_l4a.py`,
 `run_l4b.py` all green (the counts above; `run_l4a.py halt` now also runs the halt program under a 20 ms watchdog, 3/3, red
 when the watchdog kicks halted vCPUs); all 26 installer boots reached the dialog. The rest of the block was not rerun.
 
 **Rerun with per-context L1 tables** (perf plan "Measured (chunk 5)"; `natemu-raw/perf5-20261103-01/suite/` and `final/`, 2 GiB,
-d89bc4c plus the uncommitted change, series48-lean): every command of the block below at both block sizes, green but the 7
+78fb6ae plus the uncommitted change, series48-lean): every command of the block below at both block sizes, green but the 7
 known i8b departures; `cargo test` 159 + 1 ignored, also with `FEXC` set; `check_resident_stack.py` `ok` (same depths);
 Python 317; `run_k1.py` gains `contexts` (one block called through the dispatcher under six code contexts, more than the
 four L1 tables, then an INVLPG, a code write and a CR3 reload made under one context reaching the block another context's
@@ -507,14 +507,14 @@ table holds; its negative controls, no table switch, an evicted table reused unc
 limited to the dispatcher's table, fail as they must).
 
 **Rerun with reuse across load addresses** (perf plan "Measured (chunk 4)"; `natemu-raw/perf4-20261103-01/suite/`, 2 GiB,
-a24c785 plus the uncommitted change, series48-lean; the program driver's `--code-shape` now also compiles every answer
+9a0777c plus the uncommitted change, series48-lean; the program driver's `--code-shape` now also compiles every answer
 reused at another RIP and requires it equal): `cargo test` 157 + 1 ignored, also with `FEXC` set; the same runners and
 counts as the series48-lean rerun below (fixtures 64, seed 44, I8 136, I8b 329 + the same 7 QEMU departures, I9 120, I9-big
 5, I10 88, REX 37, 66-on-branches 12, I7 69, at both block sizes; faults 7,912 and 6,313 at both; ASM 1,875 / 0 / 48 / 347;
 `run_x1.py` 6/6 and 196/196; i10 faults 296; `run_i5c.py` 255; `run_boot_smoke.py` 4/4; `run_r1.py` 7/7 and 12/12); one
 installer boot with `--check-reuse` (919,666 reused answers compiled again, all equal); all 51 boots reached the dialog.
 
-**Rerun on series48-lean** (`natemu-raw/perf2-20261103-01/suite/` and `checks/`, 2 GiB, e9214c8 plus the uncommitted
+**Rerun on series48-lean** (`natemu-raw/perf2-20261103-01/suite/` and `checks/`, 2 GiB, 9e41892 plus the uncommitted
 change; perf plan "Measured (chunk 2)"; its objects equal series47-seg's on a boot's 1.14 M recorded requests): `cargo test` 152 + 1 ignored, also with `FEXC` set; fexc
 `test_slice1.py` 35, `test_fexc.py` 10, `check_sites.py --slice1` 64 programs (779 sites, 0 errors), `verify_precision.py`
 PASS, `test_serve.py` (both modes and against series47-seg's CLI); `run_slice1_vm.py` at both block sizes: fixtures 64, seed 44, I8 136, I8b 329 + the 7 known
@@ -524,7 +524,7 @@ the I7 corpus's 6,313 at both; ASM 1,875 / 0 fail / 48 / 347; `run_x1.py` 6/6 an
 measurement boots reached the dialog. Not rerun (no fexc change can reach them beyond the objects shown identical): the
 rest of the suite. The rest of the suite below ran on series47-seg.
 
-**Rerun on series47-seg** (`natemu-raw/seg-check-20261103-01/green/`, 2 GiB, HEAD 4a56356 plus the uncommitted change;
+**Rerun on series47-seg** (`natemu-raw/seg-check-20261103-01/green/`, 2 GiB, HEAD b150609 plus the uncommitted change;
 plan, Built (segment prefixes, November 3)): `cargo test` 151 + 1 ignored (also with `FEXC` set), `check_resident_stack.py`
 `ok`, Python 317, fexc `test_slice1.py` 35 and `check_sites.py --slice1` 64; fixtures 64, REX 37, 66-on-branches 12, I10 88
 and the new I7 corpus 69 (also at CPL 0) at both block sizes; faults 7,912 and the I7 corpus's page mutations 6,313 at both;
@@ -549,7 +549,7 @@ plan, Built (R2 review fixes)): green but the 7 known i8b departures at both blo
 `run_r1.py r1a` 7/7 and `r1b` 12/12, `run_boot_smoke.py` 3/3 (with `cancel`); at 4 MiB the three relocated runners
 (above); the installer boots (§4 table).
 
-**Full suite on the final build** (series47-seg at HEAD 335c070, clean tree; `natemu-raw/final-suite-20261103-01/`: `2g/` and
+**Full suite on the final build** (series47-seg at HEAD 3694324, clean tree; `natemu-raw/final-suite-20261103-01/`: `2g/` and
 `4m/` each hold `results.txt` (exit code and seconds per command) and `logs/`, `extra/` the reruns, `boot/` the boots; per-case outputs
 deleted): every command of the block below, one VM runner at a time with no other `natemu-host` running, once at 2 GiB
 (78 commands) and once at 4 MiB (`NATEMU_RAM=0x400000`, the 69 VM commands; `run_boot_smoke.py`, which sets its own RAM, runs at
@@ -651,7 +651,7 @@ line per step as it ends (phase, PASS/FAIL, exit code, seconds, log), then the w
 step's output; a passing step's `--out` and temporary directories are deleted, a failing step's kept; exit 1 on any
 failure.
 
-Validation at HEAD 4920f47 (a clean export of HEAD with the generated `fixtures/slice1` files,
+Validation at HEAD 9254a6e (a clean export of HEAD with the generated `fixtures/slice1` files,
 `natemu-raw/suite-runner-20261105-01/`, series58-channel-r1; each directory's `results.txt`): the old way (`serial.sh`:
 this block one command at a time, plus I7 at CPL 0; 87 commands) took 2,628 s of runner time, 2,949 s with lock waits.
 The runner at `-j 4`: 1,290 s (`par1`: pre 7, parallel 1,149, serial 122) and 1,316 s (`par2`: 7, 1,169, 140); with both
@@ -842,7 +842,7 @@ wall), the same patches and pinned FEX commit with the working tree's shim (the 
 (a new binary hash). Before it:
 
 `tools/fexc/build.sh ../natemu-raw/fexc-native-20261026-01/series44-r2` (R2, 21 s wall) applies `patches/0001-0028` to
-the pinned FEX commit `48d71752` and builds with the shim and `fexc.cpp` at 9730c4d. Its `obj/fexc` is byte-identical
+the pinned FEX commit `48d71752` and builds with the shim and `fexc.cpp` at 441c7cd. Its `obj/fexc` is byte-identical
 to series43-x1's, which was built by hand with cmake from the same patches and shim (SHA-256
 `6c282011...a7c293d` both); the source trees are identical too. Only `libfexcore.a` differs (archive member
 timestamps), which does not reach the linked binary. Series43-x1 and series44-r2 are therefore the same compiler, and

@@ -10,7 +10,7 @@ upfront whole-suite audit.
 
 Later change (S3a2, October 27, 2026): the I1–I3, address and stack cells, their host drivers and their I3-only tools
 are deleted; [slice3-contract.md](slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
-each of their checks to a general-path check or a retirement reason. References below stay as of `577a7f2`.
+each of their checks to a general-path check or a retirement reason. References below stay as of `5683d76`.
 
 Later change (S3i, October 28, 2026): every runner, checker, worker, producer and fixture named below
 (`run_i1.py`, `run_i4v.py`, `run_i4v_qemu.py`, `check_i*.py`, `i4v_*.py`, the workers, `tools/i4v_producer`,
@@ -18,11 +18,11 @@ Later change (S3i, October 28, 2026): every runner, checker, worker, producer an
 be run. The four independent models moved to `tools/models/` (`ordering_model.py`, `coherence_model.py`,
 `pae_model.py`, `modes_model.py`). [slice3-contract.md](slice3-contract.md) §3, its S3a2 and S3h tables and §5 map
 each old check to a general-path check, a retirement reason (32-bit and paging-off families: owner decision 3,
-deferred to the boot phase) or a boot-phase item. References below stay as of `577a7f2`.
+deferred to the boot phase) or a boot-phase item. References below stay as of `5683d76`.
 
-Later change (boot-features, October 30, 2026): the rows of the table below were brought up to `9110c6f` (I5a-I10, K1/K2, M1/M3,
+Later change (boot-features, October 30, 2026): the rows of the table below were brought up to `819343d` (I5a-I10, K1/K2, M1/M3,
 L1-L4, X1-X4, S4, P3 and the guest-state page move G1; [the plan's Built notes](boot-features-plan.md)). The contract bodies in §1
-still read as of `577a7f2`.
+still read as of `5683d76`.
 
 ### General-path check per contract (S3i2, October 28, 2026)
 
@@ -106,7 +106,7 @@ against QEMU 7.2 and `run_i5a_faults.py`, `run_i5a_de.py`, `run_i5b.py`, `run_i6
 | 63 | fexc unit tests (`fexc/test_slice1.py`: unsupported forms and window ends cut, never compiled), admission; the host copies only the walked guest-physical page and the resident walks the next one (S3d); an instruction that needs bytes past the end gets `partial_decode`, the host then asks for the next page (`host/src/execution.rs:1217-1236`), and a 16th byte is never fetched (`straddle-*`, `long-*` cases). |
 | 64 | `fexc/check_sites.py`, precision verifier, admission (every memory word must be a described site), contain `site`/`site-kind`. |
 
-Source state: working tree at commit `577a7f2`. The starting point is the accepted
+Source state: working tree at commit `5683d76`. The starting point is the accepted
 [I4-V contract-to-test matrix](../research/reviews/INV-03-01-i4v-coverage.md).
 Every runner, checker and model under `tools/` was read, plus
 [the ARM64 execution ABI](../research/specs/arm64-execution-abi.md). File names

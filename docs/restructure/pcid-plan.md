@@ -3,7 +3,7 @@
 **Status (owner, Nov 5): PCID not built; the phase is P1 (accurate bits, speculation-barrier switch) and P2 (exact inline VERW); P3-P8 kept as a record for a later revisit.**
 
 
-Status: plan, November 5, 2026, at 28eca9a (branch `restructure`), revised after an independent review the same day and
+Status: plan, November 5, 2026, at 6b037ab (branch `restructure`), revised after an independent review the same day and
 after the owner's MDS decision (below). Nothing here is built or measured yet. Inputs: [perf-phase2-plan.md](perf-phase2-plan.md)
 (item 6, "Phase result", the backlog, "Applicability", "Benchmark conventions"); [perf-plan.md](perf-plan.md) "Measured
 (chunk 8)" (local links), "Measured (chunk 14)" (global kernel shadows kept across CR3 loads, supervisor upper half only),
@@ -46,7 +46,7 @@ gate's numbers; criteria 1, 2 and 5 apply only when PCID is built.
    measured with Linux's default `pti=auto` and no PCID, where Linux keeps the kernel image global; with `pti=on` and PCID it
    makes the kernel image non-global, so both the cost and what copies keep change.
 3. Every mitigations-off cell of the batch-end matrix (11 benchmarks and the installer, N = 1 and 4) unchanged or faster
-   within its run-to-run range against the phase result (82462c2), rerun the same day. Chunk 24 bounds the possible gain
+   within its run-to-run range against the phase result (244f270), rerun the same day. Chunk 24 bounds the possible gain
    there at 0.19 s (`luajit`, 3.5%); a slowdown beyond the range blocks the phase.
 4. A default command line boots with Linux printing PTI disabled; MDS is reported as vulnerable with buffer clearing attempted
    (MDS_NO and MD_CLEAR stay 0) and TAA, MMIO stale data, GDS, RFDS and ITS as not affected, and the VERW it runs is
@@ -525,7 +525,7 @@ shadow and FreeBSD's PTI use PCID by their published descriptions; not tested he
 
 ## Measured (P1), November 5, 2026
 
-Built at 42feb9f plus P1 (uncommitted; the owner-decision records 95e104b and 8a33c05 on top are docs only, so the
+Built at f9312df plus P1 (uncommitted; the owner-decision records c80308b and 5cdfb85 on top are docs only, so the
 emulator baseline is unchanged). Evidence in `natemu-raw/pcid-p1-20261105-01/` (README). Host: Apple M4, FEAT_CSV3 =
 FEAT_CSV2 = FEAT_SB = 1, FEAT_SSBS = 0 (`sysctl hw.optional.arm`). Sources in
 `artifacts/research/track01/source-snapshots/2026-11-05/` (`MANIFEST.md`, SHA-256 and URLs); per-bit verdicts and reasons
@@ -631,7 +631,7 @@ without FEXC, `stack`, `barriers` and `system` (`natemu-raw/pcid-p1-20261105-01/
 
 ## Measured (P2), November 5, 2026
 
-Built on 2ac1a50 (P1 committed) plus P2 (uncommitted). Evidence in `natemu-raw/pcid-p2-20261105-01/` (README). FEX: one
+Built on b7a41d5 (P1 committed) plus P2 (uncommitted). Evidence in `natemu-raw/pcid-p2-20261105-01/` (README). FEX: one
 commit on the fork clone's local branch `natemu-p2` (from `natemu` 0430dc8a6, not pushed): 8d812cadd (VERW m16 inline,
 `FexcVerwOp`); compiler series65-p2 (`obj/fexc` SHA-256 `701a5946...ca9555`); natemu's submodule pin is unchanged.
 Source: SDM Vol.2C VERR/VERW (325462-093, pp. 5-162 and 5-163), saved as
@@ -645,7 +645,7 @@ mode, their operand forms not checked (not tested here). MD_CLEAR (CPUID.(7,0):E
 
 ### Measured first
 
-HEAD (2ac1a50), compiler series64-chunk26-r1, the perf resident, one run per cell, whole run (boot and both benchmark runs),
+HEAD (b7a41d5), compiler series64-chunk26-r1, the perf resident, one run per cell, whole run (boot and both benchmark runs),
 `nokaslr` and otherwise Linux's defaults (`meas/*.perf`, `scripts/perfsum.py`):
 
 | Cell (N = 1) | switch on (PTI off): VERWs, their transactions, of vCPU time | switch off (PTI on): VERWs, transactions, of vCPU time |
@@ -778,7 +778,7 @@ CPL-0 load through the shadow (nothing the guest could not read), and at CPL 3 t
 
 ### Measured
 
-`camp/` (`scripts/campaign.py`, `scripts/summ.py`): base HEAD 2ac1a50 with series64-chunk26-r1, P2 with series65-p2,
+`camp/` (`scripts/campaign.py`, `scripts/summ.py`): base HEAD b7a41d5 with series64-chunk26-r1, P2 with series65-p2,
 interleaved, the order alternating by round, three rounds (mitigations=off `hackbench` six), every run verified or reached
 and uncontended, cache off, N = 1; median (min-max), seconds:
 
@@ -807,7 +807,7 @@ boots on the default command line with the switch on (`check/`, `scripts/checkbo
 user mode: installer N = 1 (862,538 resident copies checked) and N = 4 reached the dialog, `hackbench` and `locks` N = 1
 verified; no halt, no admission refusal.
 
-**Review round (r1)** (independent review: no blocking defect; patch `pcid-p2-2ac1a50-r1.patch`, no FEX change: branch head
+**Review round (r1)** (independent review: no blocking defect; patch `pcid-p2-b7a41d5-r1.patch`, no FEX change: branch head
 still 8d812cadd, compiler series65-p2 unchanged). Exactness item 8 (why the fallback read cannot fault) and the
 inherited-limit note above were written down; the hardware re-verification list of the correctness pass
 (perf-phase2-plan.md) gained the straddling-limit and P cases. `run_k2.py verw` gained 16 cases (48 in all, green): the m16

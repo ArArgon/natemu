@@ -445,7 +445,7 @@ reproduction or full I4-V. Offline evidence replay is not a new native run.
 ## Development review — actual stack actor rotation, October 26, 2026 UTC
 
 `/root/i4v_final_review` independently reviewed the current changes against
-`168e208`, then rechecked the corrected Rust role bindings, Python oracles and
+`59d461a`, then rechecked the corrected Rust role bindings, Python oracles and
 unchanged retained run `i4v-progress-dev-20261026-11`. The reviewer authored none
 of the implementation or oracle changes and launched no build, compiler or
 native job. **The stack actor-rotation source and demonstrated native coverage

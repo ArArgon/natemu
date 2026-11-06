@@ -1,10 +1,10 @@
 # Guest x86 program inventory for the current validation suite
 
-Generated 2026-10-26 from the working tree at commit `577a7f2` (no git history read, VM not run). Decoded with GNU objdump (`/opt/homebrew/opt/binutils/bin/objdump -D -b binary -m i386[:x86-64] -M intel`); each program was decoded in the mode(s) the suite actually executes it in. Where independent Python oracles exist (`tools/i4v_controls_check.py`, `tools/i4v_modes_model.py`) they were run, unmodified, only to learn which instructions of the control programs execute, in what mode, and where they fault.
+Generated 2026-10-26 from the working tree at commit `5683d76` (no git history read, VM not run). Decoded with GNU objdump (`/opt/homebrew/opt/binutils/bin/objdump -D -b binary -m i386[:x86-64] -M intel`); each program was decoded in the mode(s) the suite actually executes it in. Where independent Python oracles exist (`tools/i4v_controls_check.py`, `tools/i4v_modes_model.py`) they were run, unmodified, only to learn which instructions of the control programs execute, in what mode, and where they fault.
 
 Later change (S3a2, October 27, 2026): the I1–I3, address and stack cells, their host drivers and their I3-only tools
 are deleted; [slice3-contract.md](slice3-contract.md#s3a2-covering-and-deleting-the-i1i3-address-and-stack-paths) maps
-each of their checks to a general-path check or a retirement reason. References below stay as of `577a7f2`.
+each of their checks to a general-path check or a retirement reason. References below stay as of `5683d76`.
 
 Later change (S3i, October 28, 2026): every runner, checker, worker, producer and fixture named below
 (`run_i1.py`, `run_i4v.py`, `run_i4v_qemu.py`, `check_i*.py`, `i4v_*.py`, the workers, `tools/i4v_producer`,
@@ -12,7 +12,7 @@ Later change (S3i, October 28, 2026): every runner, checker, worker, producer an
 be run. The four independent models moved to `tools/models/` (`ordering_model.py`, `coherence_model.py`,
 `pae_model.py`, `modes_model.py`). [slice3-contract.md](slice3-contract.md) §3, its S3a2 and S3h tables and §5 map
 each old check to a general-path check, a retirement reason (32-bit and paging-off families: owner decision 3,
-deferred to the boot phase) or a boot-phase item. References below stay as of `577a7f2`.
+deferred to the boot phase) or a boot-phase item. References below stay as of `5683d76`.
 
 ## 0. Scope, counting rules and mode glossary
 
