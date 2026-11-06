@@ -1695,6 +1695,13 @@ pub mod system {
     /// then); a translate request only.
     pub const NOP_RUN: u32 = 0x79;
     pub const MAX_NOP_RUN: u32 = 4096;
+    /// The AVX2 gathers (VEX.66.0F38 90..93 with a VSIB operand: VPGATHERDD/DQ, VPGATHERQD/QQ, VGATHERDPS/DPD,
+    /// VGATHERQPS/QPD; SDM Vol.2 each, exceptions Type 12), element by element: `reg` the destination, `cr` bits 3:0 the
+    /// mask register, bit 4 VEX.L, bit 5 qword indices (opcodes 91, 93); `index` the vector index register (VSIB, not a
+    /// general register), `base`/`scale`/`disp`/`segment`/`prefixes` the rest of the address as for any memory operand
+    /// (never RIP-relative); `size` the element width (4: VEX.W 0, 8: VEX.W 1). The three registers differ (the overlap is
+    /// fexc's #UD cut).
+    pub const GATHER: u32 = 0x7a;
     /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand (0x67): the effective address is truncated
     /// to 32 bits and zero-extended before the FS/GS base.
     pub const REP: u32 = 1;
@@ -1728,6 +1735,11 @@ pub mod system {
                     LOCK_UD => self.lock == 1,
                     LDMXCSR | STMXCSR | VLDMXCSR | VSTMXCSR => self.memory == 1 && address,
                     SSE_GATED | AVX_GATED | MMX_GATED => true,
+                    GATHER => {
+                        let mask = self.cr & 15;
+                        self.memory == 1 && address && self.base != RIP && reg(self.reg) && reg(self.index) && self.cr < 64
+                            && matches!(self.size, 4 | 8) && self.reg != mask && self.reg != self.index && mask != self.index
+                    }
                     INT => self.cr < 256,
                     INT3 | INT1 | INTO | UD | TOO_LONG => true,
                     SWAPGS | SYSCALL | WBINVD | CLTS | SYSENTER => true,

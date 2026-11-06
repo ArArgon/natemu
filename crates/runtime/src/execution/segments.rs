@@ -174,6 +174,12 @@ pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, superv
             return Err([17, 0, 0]);
         }
     }
+    copy(s, va, buf, write, supervisor, noncanonical)
+}
+/// [`linear`] without its alignment check: for the explicit accesses that never raise #AC (the gathers' elements, SDM
+/// Vol.2 2.5 exception class 12).
+pub(super) fn copy(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
+    let n = buf.len() as u64;
     let gpa = pages(s, va, n, write, supervisor, noncanonical)?;
     // S4: an explicit access meets data breakpoints; an implicit supervisor one (descriptor tables, TSS, IDT) never does.
     if !supervisor {

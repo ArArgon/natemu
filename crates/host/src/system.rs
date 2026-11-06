@@ -71,6 +71,8 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         at += 1;
     }
     let mut rep_used = false;
+    // The VEX prefix's R byte and its W vvvv L pp byte (I8; the R bit alone for a C5 form).
+    let mut vex = (0u8, 0u8);
     let (w, r) = (rex & 8 != 0, u32::from(rex >> 2 & 1) << 3);
     match map {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
@@ -80,8 +82,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         MAP_PRIMARY if *bytes.get(at)? == opcode => at += 1,
         MAP_0F38 if bytes.get(at..at + 3)? == [0x0f, 0x38, opcode] => at += 3,
         MAP_0F3A if bytes.get(at..at + 3)? == [0x0f, 0x3a, opcode] => at += 3,
-        // I8: only VLDMXCSR/VSTMXCSR: map 0F, pp 0, VEX.L 0, VEX.vvvv 1111b (fexc admitted nothing else here); VEX.B and VEX.X
-        // extend the ModRM operand's base and index as REX would. No legacy SSE prefix or REX before VEX (`vex_ud`).
+        // I8: VLDMXCSR/VSTMXCSR: map 0F, pp 0, VEX.L 0, VEX.vvvv 1111b (fexc admitted nothing else here); and the AVX2 gathers
+        // (map 0F38, pp 66, opcodes 90..93, either VEX.L and VEX.W). VEX.B and VEX.X extend the ModRM operand's base and index
+        // as REX would. No legacy SSE prefix or REX before VEX (`vex_ud`).
         MAP_VEX if rex == 0 && !operand16 && rep == 0 => {
             let (b1, b2) = (*bytes.get(at + 1)?, *bytes.get(at + 2)?);
             let (map_select, p, op_at, xb) = match bytes[at] {
@@ -89,10 +92,11 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 0xc4 => (b1 & 31, b2, at + 3, (!b1 >> 5 & 1) | (!b1 >> 6 & 1) << 1),
                 _ => return None,
             };
-            if map_select != 1 || p & 0x7f != 0x78 || *bytes.get(op_at)? != opcode {
+            let gather = map_select == 2 && p & 3 == 1 && matches!(opcode, 0x90..=0x93);
+            if !(gather || (map_select == 1 && p & 0x7f == 0x78)) || *bytes.get(op_at)? != opcode {
                 return None;
             }
-            rex = xb;
+            (rex, vex) = (xb, (b1, p));
             at = op_at + 1;
         }
         _ => return None,
@@ -381,6 +385,22 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             if s.memory == 0 {
                 return None;
             }
+        }
+        // The gathers' VSIB operand (SDM Vol.2 2.3.12): a SIB byte whose index (with VEX.X) names a vector register, 100b
+        // included; base, scale and displacement as any SIB form. Without a SIB byte or with a register operand fexc cuts it
+        // as #UD (`cut_ud`), never decoded here. Only the C4 form reaches here (map 0F38).
+        (MAP_VEX, 0x90..=0x93) => {
+            let (modrm, sib) = (*bytes.get(at)?, *bytes.get(at + 1)?);
+            if modrm >> 6 == 3 || modrm & 7 != 4 {
+                return None;
+            }
+            rm(bytes, &mut at, rex, &mut s)?;
+            let (b1, p) = vex;
+            s.kind = system::GATHER;
+            s.reg = u32::from(modrm >> 3 & 7) | u32::from(!b1 >> 7 & 1) << 3;
+            s.index = u32::from(sib >> 3 & 7) | u32::from(rex >> 1 & 1) << 3;
+            s.cr = u32::from(!p >> 3 & 15) | u32::from(p >> 2 & 1) << 4 | u32::from(opcode & 1) << 5;
+            s.size = if p & 0x80 != 0 { 8 } else { 4 };
         }
         (MAP_VEX, 0xae) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
@@ -948,6 +968,32 @@ mod tests {
             assert_eq!(p(hex, 0xff).map(|s| s.kind), Some(UD), "{hex}"); // X1c: far JMP/CALL with a register operand
         }
         assert_eq!(d("f30f00e0", 0x00), None); // f3 verr (X1c: 0f 00 /7 decodes, `x1c_forms`)
+    }
+
+    /// The AVX2 gathers (VEX.66.0F38 90..93, VSIB): destination ModRM.reg with VEX.R, mask VEX.vvvv, vector index SIB.index
+    /// with VEX.X (100b included), VEX.L and the index width in `cr`, the element width from VEX.W.
+    #[test]
+    fn gathers() {
+        let v = |hex: &str, op| {
+            let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+            decode(&[bytes, vec![0x90; 4]].concat(), MAP_VEX, op)
+        };
+        let g = |reg, cr, index, base, scale, disp, size, length| {
+            Some(System { kind: GATHER, reg, cr, index, base, scale, disp, size, length, memory: 1, ..System::NONE })
+        };
+        assert_eq!(v("c4e26d90048f", 0x90), g(0, 2 | 16, 1, 7, 2, 0, 4, 6)); // vpgatherdd ymm0, [rdi+ymm1*4], ymm2
+        assert_eq!(v("c4e2e99104c8", 0x91), g(0, 2 | 32, 1, 0, 3, 0, 8, 6)); // vpgatherqq xmm0, [rax+xmm1*8], xmm2
+        assert_eq!(v("c4e2e9934c2010", 0x93), g(1, 2 | 32, 4, 0, 0, 0x10, 8, 7)); // vgatherqpd xmm1, [rax+xmm4+0x10], xmm2
+        assert_eq!(v("c442e592040d78563412", 0x92), g(8, 3 | 16, 1, NO_REG, 0, 0x12345678, 8, 10)); // vgatherdpd ymm8, [ymm1+disp32], ymm3
+        assert_eq!(v("c4a26593443d00", 0x93), g(0, 3 | 16 | 32, 15, 5, 0, 0, 4, 7)); // vgatherqps xmm0, [rbp+ymm15], xmm3
+        assert_eq!(v("67c4e26d90048f", 0x90).map(|s| s.prefixes), Some(ADDRESS32));
+        assert_eq!(v("64c4e26d90048f", 0x90).map(|s| s.segment), Some(SREG_FS as u32));
+        // A register operand or no SIB byte: fexc's #UD, never decoded; the 0F map's 90 is no gather; F2/66 before VEX: `vex_ud`.
+        for (hex, op) in [("c4e26d90c1", 0x90), ("c4e26d9000", 0x90), ("c4e16d90048f", 0x90), ("66c4e26d90048f", 0x90), ("c4e26c90048f", 0x90)] {
+            assert_eq!(v(hex, op), None, "{hex}");
+        }
+        // Overlapping registers are refused by the resident's check (fexc cut them as #UD first).
+        assert!(v("c4e27590048f", 0x90).is_none()); // mask = index = ymm1
     }
 
     #[test]
