@@ -93,7 +93,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 _ => return None,
             };
             let gather = map_select == 2 && p & 3 == 1 && matches!(opcode, 0x90..=0x93);
-            if !(gather || (map_select == 1 && p & 0x7f == 0x78)) || *bytes.get(op_at)? != opcode {
+            if !(gather || (map_select == 1 && p & 0x7f == 0x78 && opcode == 0xae)) || *bytes.get(op_at)? != opcode {
                 return None;
             }
             (rex, vex) = (xb, (b1, p));
@@ -388,7 +388,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         }
         // The gathers' VSIB operand (SDM Vol.2 2.3.12): a SIB byte whose index (with VEX.X) names a vector register, 100b
         // included; base, scale and displacement as any SIB form. Without a SIB byte or with a register operand fexc cuts it
-        // as #UD (`cut_ud`), never decoded here. Only the C4 form reaches here (map 0F38).
+        // as #UD (`cut_ud`), never decoded here. Map 0F38 only (the VEX arm above admits these opcodes nowhere else).
         (MAP_VEX, 0x90..=0x93) => {
             let (modrm, sib) = (*bytes.get(at)?, *bytes.get(at + 1)?);
             if modrm >> 6 == 3 || modrm & 7 != 4 {
@@ -989,7 +989,8 @@ mod tests {
         assert_eq!(v("67c4e26d90048f", 0x90).map(|s| s.prefixes), Some(ADDRESS32));
         assert_eq!(v("64c4e26d90048f", 0x90).map(|s| s.segment), Some(SREG_FS as u32));
         // A register operand or no SIB byte: fexc's #UD, never decoded; the 0F map's 90 is no gather; F2/66 before VEX: `vex_ud`.
-        for (hex, op) in [("c4e26d90c1", 0x90), ("c4e26d9000", 0x90), ("c4e16d90048f", 0x90), ("66c4e26d90048f", 0x90), ("c4e26c90048f", 0x90)] {
+        for (hex, op) in [("c4e26d90c1", 0x90), ("c4e26d9000", 0x90), ("c4e16d90048f", 0x90), ("66c4e26d90048f", 0x90), ("c4e26c90048f", 0x90),
+                          ("c5f8900c90", 0x90), ("c4e178900c90", 0x90)] {
             assert_eq!(v(hex, op), None, "{hex}");
         }
         // Overlapping registers are refused by the resident's check (fexc cut them as #UD first).
