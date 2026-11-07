@@ -238,6 +238,42 @@ def cases():
                           ('fild16-1', 'fild word ptr [rdi + 1]', True), ('fist32-2', 'fist dword ptr [rdi + 2]', True), ('fst32-4', 'fst dword ptr [rdi + 4]', False)):
         out.append({'name': f'ac-{tag}', 'lines': head + ['nop', 'fninit', 'fld1', insn] + AFTER, 'setup': ['rflags 0x40202', f'switch {nop_at:#x} 3'],
                     'want': ['ac', 17, 0, 0] if ac else None, 'cpl': 0, 'mem_check': None, 'x87': None, 'insn': insn})
+    # Conversion flags belong to a completed instruction: #PF/#GP takes priority over a masked x87 store's PE/OE/UE/IE.
+    # Existing access cases store exact zero, so they cannot detect prematurely committed FPSR flags.
+    stores = [('fist-pe', 'fist dword ptr [{a}]', 4, 1.5),
+              ('fistp-pe', 'fistp qword ptr [{a}]', 8, 1.5),
+              ('fisttp-pe', 'fisttp word ptr [{a}]', 2, 1.5),
+              ('fst-oe', 'fst dword ptr [{a}]', 4, 1e300),
+              ('fstp-ue', 'fstp dword ptr [{a}]', 4, 2.0 ** -150),
+              ('fist-ie', 'fist dword ptr [{a}]', 4, float('inf'))]
+    for name, text, width, value in stores:
+        bits = struct.unpack('<Q', struct.pack('<d', value))[0]
+        pre = ['fninit', 'fld qword ptr [rdi]', 'fnclex']
+        state = {'top': 7, 'ftw': 0x80, 'st': {7: bits}}
+        for kind, addr, setup, fault in (
+            ('notpresent', D + 0x1010, [f'unmap {D + 0x1000:#x}'], PF(D + 0x1010, True, False)),
+            ('readonly', D + 0x1010, [f'readonly {D + 0x1000:#x}'], PF(D + 0x1010, True, True)),
+            ('crossing', D + 0x1000 - width // 2, [f'unmap {D + 0x1000:#x}'], PF(D + 0x1000, True, False)),
+            ('noncanonical', NONCANON, [], ['gp', 13, 0, 0])):
+            # A 64-bit address is explicit in a register: x86 disp32 cannot encode NONCANON.
+            insn = text.format(a='rbx')
+            out.append({'name': f'commit-{name}-{kind}', 'lines': pre + [insn] + AFTER,
+                        'setup': [f'memory {D + 0x200:#x} {struct.pack("<d", value).hex()}', f'gpr-rbx {addr:#x}'] + setup,
+                        'want': fault, 'cpl': 3, 'mem_check': (addr, width) if kind in ('readonly', 'crossing') else None,
+                        'x87': state, 'insn': insn})
+    # A masked stack underflow has priority over denormal arithmetic flags (SDM Vol.1 4.9.2).
+    for mnemonic in ('fadd', 'fcom'):
+        insn = f'{mnemonic} qword ptr [rdi]'
+        out.append({'name': f'commit-stack-{mnemonic}', 'lines': ['fninit', insn] + AFTER,
+                    'setup': [f'memory {D + 0x200:#x} 0100000000000000'], 'want': None, 'cpl': 3,
+                    'mem_check': None, 'x87': None, 'insn': insn,
+                    'check': lambda vm, mem: (vm['x87']['ie'] == 1 and vm['x87']['sf'] == 1 or 'missing stack fault',
+                                              int(vm['x87']['exceptions'], 0) & ~1 == 0 or f"extra operation flags {vm['x87']['exceptions']}")})
+    out.append({'name': 'commit-stack-fld-overflow', 'lines': ['fninit'] + ['fld1'] * 8 + ['fld qword ptr [rdi]'] + AFTER,
+                'setup': [f'memory {D + 0x200:#x} 0100000000000000'], 'want': None, 'cpl': 3,
+                'mem_check': None, 'x87': None, 'insn': 'fld qword',
+                'check': lambda vm, mem: (vm['x87']['ie'] == 1 and vm['x87']['sf'] == 1 or 'missing stack fault',
+                                          int(vm['x87']['exceptions'], 0) & ~1 == 0 or f"extra operation flags {vm['x87']['exceptions']}")})
     # Linux's FPU probes.
     out.append({'name': 'probe-has-fpu', 'lines': ['mov word ptr [rdi], 0xffff', 'fninit', 'fnstsw ax', 'fnstcw word ptr [rdi]'] + AFTER,
                 'setup': [], 'want': None, 'cpl': 0, 'mem_check': None, 'x87': None, 'insn': 'fninit',
@@ -276,8 +312,9 @@ def judge(c, code, vm, offsets, regs):
         if vm['stop'] != 'resident' or not vm['reason'].startswith(want[1]) or int(vm['rip'], 0) != rip:
             problems.append(f"stop {vm['stop']} {vm['reason']} rip {vm['rip']}, want {want[1]} at {rip:#x}")
     elif want and want[0] == 'nocode':
-        if vm['stop'] != 'no_code' or vm['reason'] != want[1] or int(vm['rip'], 0) != rip:
-            problems.append(f"stop {vm['stop']} {vm['reason']} rip {vm['rip']}, want no code ({want[1]}) at {rip:#x}")
+        # A refused form: since the no-stop change #UD at the instruction (a REFUSED decode), not a stop.
+        if vm['stop'] != 'guest_fault' or int(vm['fault'][0], 0) != 6 or int(vm['rip'], 0) != rip or not vm['stats']['decodes'].get(f'{0x7b:#x}'):
+            problems.append(f"stop {vm['stop']} {vm['reason']} {vm['fault']} rip {vm['rip']}, want the REFUSED #UD ({want[1]}) at {rip:#x}")
     elif want:
         _, vector, cr2, error = want
         got = [int(v, 0) for v in vm['fault']]
@@ -317,6 +354,8 @@ def main():
         (work / 'program.txt').write_text(text)
         run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + ([str(a.max_block)] if a.max_block else []) +
                              vm1.CODE_SHAPE, capture_output=True, text=True)
+        (work / 'stdout').write_text(run.stdout)
+        (work / 'stderr').write_text(run.stderr)
         problems = [f'driver: {run.stderr.strip()[-300:]}'] if run.returncode else judge(c, code, json.loads(run.stdout), offsets, regs)
         bad += bool(problems)
         results.append({'name': c['name'], 'insn': c['insn'], 'ok': not problems, 'problems': problems})

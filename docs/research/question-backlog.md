@@ -7,6 +7,10 @@ New questions follow [the workflow](README.md). The [implementation plan](../imp
 owns executable order: Rust-first, an early host FEX producer loop, configured N
 and performance alongside development. Historical dependencies do not gate it.
 
+The current [CPU/RAM correctness backlog](../restructure/correctness-backlog.md) lists concrete remaining
+implementation gaps, validation questions and deferred/won’t-fix dispositions; these historical research rows
+are not a current defect inventory.
+
 ## Status vocabulary
 
 The following vocabulary describes unmigrated historical rows in other tracks:

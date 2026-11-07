@@ -18,13 +18,18 @@
 //! peer's SGI): each stops the vCPU precisely at a block boundary ([`interrupted`]) and the resident drains there.
 use super::*;
 use crate::cache::{self, Block};
+use natemu_abi::execution::perf::SysFastDecline;
 mod delivery;
 mod events;
 mod gather;
+mod maskmov;
 mod helpers;
 mod lapic;
 mod mmio;
 mod ports;
+mod rotate;
+mod stack;
+mod half;
 mod segments;
 mod sse;
 mod syscalls;
@@ -94,7 +99,7 @@ pub unsafe fn start() -> ! {
     // The entry frame's fields `enter` never writes are zero ([`enter`]).
     unsafe { (*shared()).initial = NativeFrame::ZERO };
     let mut s = unsafe { load() };
-    if s.cpu.control().is_none() || s.request != NONE || s.vcpu >= s.vcpus || s.vcpus as usize > cache::MAX_VCPUS {
+    if !guest_state_alias_valid(cache::control().guest_state_va) || s.cpu.control().is_none() || s.request != NONE || s.vcpu >= s.vcpus || s.vcpus as usize > cache::MAX_VCPUS {
         // Before anything is shadowed or marked (and before the vCPU number is known to be valid).
         s.stop = stop::UNSUPPORTED_MODE;
         unsafe { write_record(record(), &s) };
@@ -557,23 +562,23 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     let found = cache::current_at(rip, s.cpu.code_context());
     crate::perf::leave(p);
     let Some(i) = found.filter(|b| b.flags & cache::SYSTEM != 0).map(cache::system_of).filter(|i| matches!(i.kind, system::SYSCALL | system::SYSRET)) else {
-        return declined(s, rip, DECLINED_NOT_CURRENT);
+        return declined(s, rip, SysFastDecline::NotCurrent);
     };
     let debugging = s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0;
     if debugging || s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0 || cache::pending() || lapic::due() {
-        return declined(s, rip, DECLINED_BOUNDARY);
+        return declined(s, rip, SysFastDecline::Boundary);
     }
     let svc = elr.wrapping_sub(4);
-    let Some(ran) = cache::block_at(svc) else { return declined(s, rip, DECLINED_BOUNDARY) };
+    let Some(ran) = cache::block_at(svc) else { return declined(s, rip, SysFastDecline::Boundary) };
     let ordinary = ran.flags & (cache::STEP | cache::DEAD) == 0 && !link_point_of(ran, svc).is_some_and(|o| ran.rep_exit(o));
     if !ordinary || !ran.links.iter().any(|p| p.offset != 0 && p.target == rip) {
-        return declined(s, rip, DECLINED_BOUNDARY);
+        return declined(s, rip, SysFastDecline::Boundary);
     }
     bank(&mut s.cpu, frame, frame.nzcv, true);
     s.cpu.rip = rip;
     completed(s);
     if !events::none(s) {
-        return declined(s, rip, DECLINED_BOUNDARY);
+        return declined(s, rip, SysFastDecline::Boundary);
     }
     let commits = i.lock == 0
         && s.cpu.efer & EFER_SCE != 0
@@ -583,14 +588,14 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
             _ => false,
         };
     if !commits {
-        return declined(s, rip, DECLINED_OTHER);
+        return declined(s, rip, SysFastDecline::Other);
     }
     let generation = s.generation;
     s.linker += 1;
     s.l2_hits += 1;
     system(s, i);
     if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || !events::none(s) {
-        declined(s, rip, DECLINED_AFTER);
+        declined(s, rip, SysFastDecline::After);
         unsafe { after_system(ran, generation) }
     }
     let context = s.cpu.code_context();
@@ -599,7 +604,7 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     let found = cache::lookup(s.cpu.rip, context, |b| mapped(s, b));
     crate::perf::leave(p);
     let Some(target) = found.filter(|b| b.flags & cache::SYSTEM == 0) else {
-        declined(s, rip, DECLINED_AFTER);
+        declined(s, rip, SysFastDecline::After);
         unsafe { after_system(ran, generation) }
     };
     s.l2_hits += 1;
@@ -619,24 +624,19 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
 /// SYSCALLs and SYSRETs [`sys_fast`] ran to the end (the host reports it as `"?"`).
 #[cfg(feature = "perf")]
 const SYS_FAST: usize = crate::perf::BUCKETS;
-/// Perf chunk 22, `perf` resident: why a literal exit to a kept SYSCALL or SYSRET did not run [`sys_fast`] to the end, in
-/// [`Control::system_counts`] slots past every kind (the host prints them as kinds 0x7c..0x7f): no current decode (a CR3
+/// Why a literal exit to a kept SYSCALL or SYSRET did not run `sys_fast` to the end: no current decode (a CR3
 /// load or TLB flush since it was last used); the boundary before it had something to do, or the exit was not an
 /// ordinary one; the decode current but not committing; after the instruction, a trap or event to take or a target not
 /// kept (`after_system`). An exit whose target holds no kept SYSCALL or SYSRET decode is not counted.
-const DECLINED_NOT_CURRENT: usize = 0x7c;
-const DECLINED_BOUNDARY: usize = 0x7d;
-const DECLINED_OTHER: usize = 0x7e;
-const DECLINED_AFTER: usize = 0x7f;
 /// Counts a decline (`perf` resident only); before the instruction, only when the exit's RIP holds a kept SYSCALL or
 /// SYSRET decode (current or not; looked up without a walk). The default resident does nothing here.
 #[inline(always)]
-fn declined(s: &State, rip: u64, reason: usize) {
+fn declined(s: &State, rip: u64, reason: SysFastDecline) {
     #[cfg(feature = "perf")]
     {
         let syscall = |b: &Block| b.flags & cache::SYSTEM != 0 && matches!(cache::system_of(b).kind, system::SYSCALL | system::SYSRET);
-        if reason == DECLINED_AFTER || cache::kept_at(rip, s.cpu.code_context()).is_some_and(syscall) {
-            cache::control().system_counts[reason] += 1;
+        if reason == SysFastDecline::After || cache::kept_at(rip, s.cpu.code_context()).is_some_and(syscall) {
+            cache::control().record_sys_fast_decline(reason);
         }
     }
     #[cfg(not(feature = "perf"))]
@@ -1145,7 +1145,7 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     let (nzcv, pf, af) = native_flags(s.cpu.rflags);
     f.x[SRA[16] as usize] = pf;
     f.x[SRA[17] as usize] = af;
-    f.x[28] = FRAME_POINTER;
+    f.x[28] = cache::control().guest_state_va;
     f.sp = STACK_TOP;
     sse::fill(f, &s.cpu);
     s.blocks += 1;
@@ -1526,10 +1526,15 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         }
         // S4: INT1 delivers #DB as a trap (RIP past it, the current RF; model A12), DR6 unchanged.
         system::INT1 => {
+            // ICEBP consumes a deferred MOV SS data trap: unlike INT n/INT3 it does not owe another #DB
+            // at the handler boundary (Linux x86 mov_ss_trap). Keeping it would overwrite the first
+            // frame on an IST stack before the handler can run. INT1 itself leaves DR6 unchanged.
+            s.debug &= !debug::TRAP;
             deliver(s, Event::Debug { length: u64::from(i.length), mid_string: false });
             return Ok(());
         }
-        system::INTO | system::UD => return Err(UD),
+        // REFUSED: a form natemu cannot run yet, delivered as #UD (the recorded deviation; the host logged it).
+        system::INTO | system::UD | system::REFUSED => return Err(UD),
         // X1c: a Reserved-NOP cell: completes, nothing accessed (LOCK was #UD above).
         system::RESERVED_NOP => return Ok(commit(s, i, false)),
         // Perf chunk 12: no-operation instructions before a system instruction, completed at once (`find` goes on at it).
@@ -1570,6 +1575,18 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             s.plain_step = 1;
             return Ok(());
         }
+        system::ROTATE | system::DOUBLE_SHIFT16 => {
+            rotate::execute(s, i)?;
+            return Ok(commit(s, i, false));
+        }
+        system::ENTER => {
+            stack::enter(s, i)?;
+            return Ok(commit(s, i, false));
+        }
+        system::CVTPS2PH => {
+            half::store(s, i)?;
+            return Ok(commit(s, i, false));
+        }
         system::CLI | system::STI | system::POPF | system::HLT | system::EVENT_HOOK => {
             events::transaction(s, i)?;
             commit(s, i, false);
@@ -1596,6 +1613,8 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         }
         // The AVX2 gathers, element by element ([`gather`]; any CPL); each commits itself.
         system::GATHER => return gather::transaction(s, i),
+        // The masked moves ([`maskmov`]; any CPL), all or nothing; each commits itself.
+        system::MASKMOV => return maskmov::transaction(s, i),
         // I9: an MMX form under its gating: #UD with CR0.EM, else #NM with CR0.TS (SDM Vol.3 Table 12-1).
         system::MMX_GATED => {
             if s.cpu.cr0 & CR0_EM != 0 {
@@ -1966,7 +1985,7 @@ pub fn set_cpl(s: &mut State, cpl: u64) {
 /// value but 0 being set; the other flag bytes are the bank's own, never written by code). Every exit and fault banks
 /// through here, and every entry ([`enter`]) writes both bytes from the bank, so the page holds the instruction stream's IF.
 /// IF only at CPL 0 (the CPL of the code that ran: no CPL changes inside a block): only CPL-0 blocks may write it, and a
-/// CPL-3 store into the page (the recorded deviation, `GUEST_STATE_VA`) must not change IF, which CPL 3 may not.
+/// CPL-3 store into the page (the recorded deviation at the per-VM alias) must not change IF, which CPL 3 may not.
 fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
     let reg = |i: usize| f.x[SRA[i] as usize];
     for (i, value) in cpu.gpr.iter_mut().enumerate() {
@@ -2245,7 +2264,7 @@ fn translate(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, va: u64, ac
 
 /// A synchronous exception from generated code (EL0) other than an `svc` or a stop, classified by site first: a `brk`
 /// at a check stub of the block holding ELR, or a data abort at one of its access sites whose recorded address range
-/// holds FAR ([`access_aborted`]: a shadow miss to retry, or a guest fault; any non-canonical address, the private
+/// holds FAR ([`access_aborted`]: a shadow miss to retry, or a guest fault; a trapped non-canonical address, the private
 /// window included, is #GP or #SS). Only an exception at no site, or not of its site's kind, halts: an instruction the
 /// hardware refused at EL0 (`trapped`), an abort in the resident's private window or the guest-state alias's slot
 /// (`private_access`), else
@@ -2365,26 +2384,23 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     // X2: under x86 alignment checking (SCTLR_EL1.A while it runs), a misaligned access is #AC(0) after the canonical
     // check (made first, as for every access) and before any page walk, so before a split lock too. A 16- or 32-byte vector
     // access (I8: a VEX.256 operand, one Q-register pair) that is 8-byte aligned is not one the SDM lets fault (MOVUPS and the
-    // like: "may or may not" only below 8-byte alignment, Vol.3 7.15); completing it is not built: refused with the state at
-    // the instruction.
+    // like: "may or may not" only below 8-byte alignment, Vol.3 7.15); complete that native access in the resident.
     if alignment && alignment_check(&s.cpu) != 0 {
         if touched.is_none() {
             guest_fault(s, f, b, site, noncanonical(site))
         }
         if width >= 16 && site.data_class == object::CLASS_FPR && address & 7 == 0 {
-            bank_at(&mut s, f, b, site);
-            halt(&s, stop::UNSUPPORTED_MODE)
+            unsafe { vector_aligned(s, f, b, site, address, elr, spsr) }
         }
         guest_fault(s, f, b, site, [17, 0, 0])
     }
-    // A swap or atomic whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, not
-    // completed (owner decision: LOCKed accesses crossing 16 bytes stop), unless x86's canonical check (made first) fails.
+    // A swap or atomic whose operand crosses 16 bytes takes an alignment fault (LSE2) before any effect: a split lock, made
+    // by the resident ([`split_lock`]), unless x86's canonical check (made first) fails.
     if swap && alignment && (address & 15) + width > 16 {
         if touched.is_none() {
             guest_fault(s, f, b, site, noncanonical(site))
         }
-        bank_at(&mut s, f, b, site);
-        halt(&s, stop::UNSUPPORTED_ATOMIC)
+        unsafe { split_lock(s, f, b, site, address, width, elr, spsr) }
     }
     // Data abort from EL0, translation or permission fault, direction, intent and FAR as recorded.
     if esr >> 26 != 0x24
@@ -2445,6 +2461,96 @@ unsafe fn access_aborted(mut s: State, f: &NativeFrame, b: &Block, site: &Site, 
     }
 }
 
+/// Arm alignment checking is stricter than x86 for an 8-byte-aligned vector operand. Complete the one admitted
+/// native access, then let the remaining generated instructions finish the x86 operation (including its flags).
+#[inline(never)]
+unsafe fn vector_aligned(mut s: State, f: &NativeFrame, b: &Block, site: &Site, address: u64, elr: u64, spsr: u64) -> ! {
+    let width = usize::from(site.width);
+    let write = matches!(site.kind, object::kind::STORE | object::kind::STORE_PAIR);
+    if !matches!((site.kind, width), (object::kind::LOAD | object::kind::STORE, 16) | (object::kind::LOAD_PAIR | object::kind::STORE_PAIR, 32)) {
+        halt(&s, stop::SITE_MISMATCH)
+    }
+    let hits = data_hits(&s.cpu.dr, address, width as u64, write);
+    if hits != 0 && b.flags & cache::STEP == 0 {
+        step_from(s, f, b, site)
+    }
+    let touched = pages(address, width as u64).unwrap(); // the abort path checked the whole range first
+    let mut gpa = [0; 2];
+    let mut uncached = false;
+    // Complete all walks before touching data, so a fault on the second page leaves the entire access uncommitted.
+    for (k, va) in touched.into_iter().enumerate() {
+        if let Some(va) = va {
+            let Some((pa, uc)) = translate(&mut s, f, b, site, va, if write { Access::Write } else { Access::Read }) else {
+                unsafe {
+                    write_record(record(), &s);
+                    resume(&s, &raw const (*shared()).captured, elr, spsr)
+                }
+            };
+            gpa[k] = pa;
+            uncached |= uc;
+        }
+    }
+    if touched.into_iter().enumerate().any(|(k, va)| va.is_some() && !mmio::ram(gpa[k])) {
+        mmio::device(s, f, b, site, Some(gpa[0]).filter(|_| touched[1].is_none()))
+    }
+    split_wait(&mut s, &gpa[..1 + usize::from(touched[1].is_some())]);
+    let head = width.min((4096 - (address & 4095)) as usize);
+    let parts = [(gpa[0], head), (gpa[1], width - head)];
+    let mut bytes = [0u8; 32];
+    if write {
+        bytes[..16].copy_from_slice(&f.q[site.data_reg[0] as usize & 31]);
+        if width == 32 {
+            bytes[16..].copy_from_slice(&f.q[site.data_reg[1] as usize & 31]);
+        }
+    }
+    if uncached {
+        cache::control().uncached_resident += 1;
+    }
+    // Conservative ordering on this cold completion path, with indivisible aligned eight-byte pieces.
+    unsafe { asm!("dmb ish") };
+    let mut offset = 0;
+    for (pa, count) in parts {
+        if count != 0 {
+            let Some(ptr) = guest_ram().range(pa, count as u64) else { halt(&s, stop::SHADOW) };
+            for at in (0..count).step_by(8) {
+                unsafe {
+                    let p = ptr.add(at).cast::<u64>();
+                    if write {
+                        core::ptr::write_volatile(p, u64::from_le_bytes(bytes[offset + at..offset + at + 8].try_into().unwrap()));
+                    } else {
+                        bytes[offset + at..offset + at + 8].copy_from_slice(&core::ptr::read_volatile(p).to_le_bytes());
+                    }
+                }
+            }
+            if write {
+                cache::rechecked(pa);
+            }
+        }
+        offset += count;
+    }
+    unsafe { asm!("dsb ish") };
+    s.debug |= hits << debug::HITS;
+    let frame = unsafe { &raw mut (*shared()).captured };
+    unsafe {
+        if !write {
+            (*frame).q[site.data_reg[0] as usize & 31].copy_from_slice(&bytes[..16]);
+            if width == 32 {
+                (*frame).q[site.data_reg[1] as usize & 31].copy_from_slice(&bytes[16..]);
+            }
+        }
+        if site.writeback != object::WB_NONE {
+            let base = address.wrapping_sub(site.imm as i64 as u64).wrapping_add(site.writeback_delta as i64 as u64);
+            match site.base_reg {
+                31 => (*frame).sp = base,
+                n => (*frame).x[n as usize] = base,
+            }
+        }
+        s.splits += 1;
+        write_record(record(), &s);
+        resume(&s, frame, elr + 4, spsr)
+    }
+}
+
 /// `ACCESS_COMPLETED` for a page-crossing store (split stub): translate both pages
 /// with write intent, then write the access's data register through owned RAM in
 /// guest byte order, apply its writeback and resume after it. A fault on either page
@@ -2494,6 +2600,7 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
         mmio::refuse(s, f, b, stub, natemu_abi::execution::mmio::CROSSING)
     }
     let gpa = [gpa0, gpa1];
+    split_wait(&mut s, &gpa);
     // One data register: a general one, or the low `width` bytes of a vector one (I5a); or MOVAPS m128's X-register pair
     // (I5a, `STORE_PAIR`: aligned, so it never crosses a page, but completed alike); or a VEX.256 operand's Q-register pair
     // (I8: `stp qA, qB`, 32 bytes, low half first).
@@ -2546,6 +2653,144 @@ unsafe fn split(mut s: State, f: &NativeFrame, b: &Block, all: &[Site], stub: &S
     }
 }
 
+/// A split lock (no-stop change, November 6, 2026; was the stop `unsupported_atomic`): the Arm atomic at `elr` (FEX's
+/// lowering of a LOCKed read-modify-write, XCHG with memory, CMPXCHG8B/16B: SWPAL, LDADDAL, LDCLRAL, LDEORAL, LDSETAL,
+/// CASAL, CASPAL, admission's closed set) on `[address, address + width)`, which crosses 16 bytes, made here with plain
+/// loads and stores under the VM's split lock ([`cache::split_begin`]: no other vCPU accesses the pages meanwhile), so it
+/// is atomic for every vCPU as x86's locked access is (split locks across a cache line too: x86 only makes them slow). Its
+/// result registers are written as the Arm instruction's and the block resumes after it: FEX's code around it computes the
+/// x86 result and flags as for an aligned operand. Faults first, before any byte moves: both pages walked for write in
+/// address order (a locked access is a write whatever it computes: #PF with CR2 the first faulting byte's page start);
+/// #AC was checked before; a device page is refused (`unsupported_mmio`, as any atomic there). A data breakpoint on the
+/// operand runs the instruction alone (step block) so its trap follows it. Cost: one shadow reset of every other vCPU
+/// holding shadows, and their refaults, paid only by split locks.
+#[allow(clippy::too_many_arguments)]
+unsafe fn split_lock(mut s: State, f: &NativeFrame, b: &Block, site: &Site, address: u64, width: u64, elr: u64, spsr: u64) -> ! {
+    if s.cpu.dr[5] & DR7_ENABLES != 0 && data_hits(&s.cpu.dr, address, width, true) != 0 {
+        if b.flags & cache::STEP == 0 {
+            step_from(s, f, b, site)
+        }
+        s.debug |= data_hits(&s.cpu.dr, address, width, true) << debug::HITS;
+    }
+    let mut gpa = [u64::MAX; 2];
+    let touched = pages(address, width).into_iter().flatten().flatten();
+    for (k, va) in touched.enumerate() {
+        match translate(&mut s, f, b, site, va, Access::Write) {
+            None => unsafe {
+                write_record(record(), &s);
+                resume(&s, &raw const (*shared()).captured, elr, spsr)
+            },
+            Some((g, _)) if !mmio::ram(g) => mmio::refuse(s, f, b, site, natemu_abi::execution::mmio::ATOMIC),
+            Some((g, _)) => gpa[k] = g & !4095,
+        }
+    }
+    if gpa[1] == u64::MAX {
+        gpa[1] = gpa[0];
+    }
+    // The Arm instruction (admission's encodings, `admission/structure.rs`).
+    let at = elr.wrapping_sub(natemu_abi::execution::cache::CODE_VA);
+    let word = if let Some(o) = elr.checked_sub(natemu_abi::execution::cache::SLOT_VA).filter(|&o| o < natemu_abi::execution::cache::SLOT_BYTES as u64) {
+        unsafe { ((natemu_abi::execution::cache::SLOT_WRITE_VA + o) as *const u32).read_volatile() }
+    } else {
+        unsafe { ((natemu_abi::execution::cache::CODE_WRITE_VA + at) as *const u32).read_volatile() }
+    };
+    let reg = |shift: u32| (word >> shift & 31) as usize;
+    let (rs, rt) = (reg(16), reg(0));
+    // (kind, element size): 0 SWP, 1 LD<op> (op in bits 14:12), 2 CAS, 3 CASP (a pair of elements).
+    let (kind, size) = match word {
+        w if w & 0x3fe0_fc00 == 0x38e0_8000 => (0, 1u64 << (w >> 30)),
+        w if w & 0x3fe0_cc00 == 0x38e0_0000 => (1, 1 << (w >> 30)),
+        w if w & 0x3fe0_fc00 == 0x08e0_fc00 => (2, 1 << (w >> 30)),
+        w if w & 0xbfe0_fc00 == 0x0860_fc00 => (3, 4 << (w >> 30 & 1)),
+        _ => halt(&s, stop::SITE_MISMATCH),
+    };
+    if width != if kind == 3 { 2 * size } else { size } {
+        halt(&s, stop::SITE_MISMATCH)
+    }
+    let x = |r: usize| if r == 31 { 0 } else { f.x[r] };
+    let mask = if size == 8 { u64::MAX } else { (1 << (8 * size)) - 1 };
+    let head = (4096 - (address & 4095)).min(width) as usize;
+    let parts = [(gpa[0] | address & 4095, head), (gpa[1], width as usize - head)];
+    let p = crate::perf::enter(crate::perf::SHOOTDOWN);
+    cache::split_begin(gpa, s.vcpus as usize, || {
+        if cache::take_shadows() {
+            reset_shadows(&mut s)
+        }
+    });
+    crate::perf::leave(p);
+    let mut old = [0u8; 24];
+    let mut done = 0;
+    for &(g, n) in &parts {
+        if n != 0 && !guest_ram().copy_out(g, &mut old[done..done + n]) {
+            halt(&s, stop::SHADOW)
+        }
+        done += n;
+    }
+    // The old element(s): the low one at the address, CASP's high one `size` bytes on.
+    let element = |at: usize| u64::from_le_bytes(old[at..at + 8].try_into().unwrap()) & mask;
+    let (lo, hi) = (element(0), if kind == 3 { element(size as usize) } else { 0 });
+    let new: [u64; 2] = match kind {
+        0 => [x(rs) & mask, 0],
+        1 => [match word >> 12 & 7 {
+            0 => lo.wrapping_add(x(rs)),
+            1 => lo & !x(rs),
+            2 => lo ^ x(rs),
+            _ => lo | x(rs),
+        } & mask, 0],
+        2 => [if lo == x(rs) & mask { x(rt) & mask } else { lo }, 0],
+        _ => if [lo, hi] == [x(rs) & mask, x(rs + 1) & mask] { [x(rt) & mask, x(rt + 1) & mask] } else { [lo, hi] },
+    };
+    let mut bytes = [0u8; 24];
+    bytes[..8].copy_from_slice(&new[0].to_le_bytes());
+    if kind == 3 {
+        bytes[size as usize..size as usize + 8].copy_from_slice(&new[1].to_le_bytes());
+    }
+    let mut done = 0;
+    for &(g, n) in &parts {
+        if n != 0 {
+            if cache::translated(g) {
+                FetchWrites(&mut s).code_write(g);
+            }
+            if !guest_ram().copy_in(g, &bytes[done..done + n]) {
+                halt(&s, stop::SHADOW)
+            }
+            cache::rechecked(g);
+        }
+        done += n;
+    }
+    cache::split_end();
+    // The Arm results: SWP and LD<op> Rt := the old value, CAS Rs := it, CASP Rs, Rs+1 := the old pair (XZR discards).
+    let frame = unsafe { &raw mut (*shared()).captured };
+    let set = |r: usize, v: u64| if r != 31 { unsafe { (*frame).x[r] = v } };
+    match kind {
+        0 | 1 => set(rt, lo),
+        2 => set(rs, lo),
+        _ => (set(rs, lo), set(rs + 1, hi)).0,
+    }
+    s.splits += 1;
+    unsafe {
+        write_record(record(), &s);
+        resume(&s, frame, elr + 4, spsr)
+    }
+}
+
+/// Protects all pages of a resident access from split locks. Serving a shadow-drop request clears our holding bit:
+/// re-mark and recheck the whole set afterwards, since waiting on a later page can invalidate an earlier check.
+pub(super) fn split_wait(s: &mut State, gpa: &[u64]) {
+    loop {
+        cache::holding();
+        if !gpa.iter().any(|&page| cache::split_held(page)) {
+            return;
+        }
+        while gpa.iter().any(|&page| cache::split_held(page)) {
+            if cache::take_shadows() {
+                reset_shadows(s)
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// L3 (amendment): shadows linear page `va` (of an unassigned guest-physical page) read-only onto the all-ones page; on
 /// table capacity exhaustion evicts every shadow once and retries.
 fn install_ones(s: &mut State, va: u64) {
@@ -2564,10 +2809,12 @@ fn install_ones(s: &mut State, va: u64) {
 /// set again and the marks read again, and a page marked meanwhile is shadowed read-only (the access faults again and
 /// takes the code-write path).
 fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
+    split_wait(s, &[gpa]);
     match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {
             reset_shadows(s);
+            split_wait(s, &[gpa]); // the reset cleared this vCPU's shadow flag: set again before the install
             let writable = writable && {
                 cache::shadowed_writable(gpa);
                 !cache::translated(gpa)

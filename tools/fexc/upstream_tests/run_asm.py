@@ -120,24 +120,12 @@ def vex(op):
     if op[0] == 0xc5: return op[1] >> 2 & 1, op[3] >> 6, 1, op[1] & 3, op[2]
     if op[0] == 0xc4: return op[2] >> 2 & 1, op[4] >> 6, op[1] & 31, op[2] & 3, op[3]
     return None
-def scalar_l1(op):
-    """VEX.L = 1 on a scalar LIG form: the shim's `lig`, `fma_scalar` and `rmwlig` sets."""
-    v = vex(op)
-    if not v or not v[0]: return False
-    _, _, m, pp, o = v
-    return (m == 1 and o in (0x10, 0x11, 0x2a, 0x2c, 0x2d, 0x2e, 0x2f, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2)
-            and (pp >= 2 or (o in (0x2e, 0x2f) and pp <= 1))) or \
-           (m == 2 and pp == 1 and o in (0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf)) or (m == 3 and pp == 1 and o in (0x0a, 0x0b))
 REFUSED = [
-    ('MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV', lambda p, rex, op, w: re.match(r'v?p?maskmov', w) and not p & {0xf2, 0xf3}),
-    ('VCVTPS2PH m', lambda p, rex, op, w: w == 'vcvtps2ph' and vex(op)[1] != 3),
-    ('scalar VEX.L = 1 forms', lambda p, rex, op, w: scalar_l1(op)),
-    ('RCL/RCR m', lambda p, rex, op, w: op[0] in (0xc0, 0xc1, 0xd0, 0xd1, 0xd2, 0xd3) and op[1] >> 6 != 3 and op[1] >> 3 & 7 in (2, 3)),
-    ('BT* m, r with 0x67', lambda p, rex, op, w: 0x67 in p and op[0] == 0x0f and op[1] in (0xa3, 0xab, 0xb3, 0xbb) and op[2] >> 6 != 3),
-    ('16-bit BSWAP/SHLD/SHRD', lambda p, rex, op, w: 0x66 in p and op[0] == 0x0f and (op[1] in (0xa4, 0xa5, 0xac, 0xad) or (0xc8 <= op[1] <= 0xcf and not rex & 8))),
-    ('ENTER with nesting', lambda p, rex, op, w: op[0] == 0xc8 and op[3] & 0x1f),
-    ('66 on PUSHF/ENTER/LEAVE/RET/indirect branches/CMPXCHG8B/16B', lambda p, rex, op, w: 0x66 in p and (
-        op[0] in (0x9c, 0xc8, 0xc9, 0xc2, 0xc3) or (op[0] == 0xff and 2 <= op[1] >> 3 & 7 <= 5) or (op[0] == 0x0f and op[1] == 0xc7 and op[2] >> 3 & 7 == 1))),
+    # The masked moves, scalar VEX.L = 1 forms, 16-bit BSWAP, RCL/RCR m with every count and 16-bit SHLD/SHRD with
+    # defined counts up to 16 run; undefined CL counts are classified from live RCX below.
+    ('16-bit SHLD/SHRD with an immediate count above 16', lambda p, rex, op, w: 0x66 in p and not rex & 8 and op[0] == 0x0f and
+        op[1] in (0xa4, 0xac) and imm8(op) & 0x1f > 16),
+    ('66 on CMPXCHG8B/16B', lambda p, rex, op, w: 0x66 in p and op[0] == 0x0f and op[1] == 0xc7 and op[2] >> 3 & 7 == 1),
     ('FBLD/FBSTP and undocumented x87 aliases', lambda p, rex, op, w: (op[0] == 0xdf and op[1] >> 6 != 3 and op[1] >> 3 & 7 in (4, 6)) or x87_alias(op[0], op[1])),
     ('REPNE on MOVS/STOS/LODS', lambda p, rex, op, w: 0xf2 in p and op[0] in (0xa4, 0xa5, 0xaa, 0xab, 0xac, 0xad)),
     ('REP/REPNE on BT*, INC/DEC, CMPXCHG8B/16B', lambda p, rex, op, w: p & {0xf2, 0xf3} and (
@@ -146,6 +134,14 @@ REFUSED = [
     ('66 with F2/F3 on an SSE form', lambda p, rex, op, w: 0x66 in p and p & {0xf2, 0xf3} and op[0] == 0x0f and
         (0x10 <= op[1] <= 0x7f or op[1] >= 0xc2 or op[1] in (0x38, 0x3a))),
 ]
+def imm8(op):
+    """The imm8 after the ModRM operand of `op` (bytes from the opcode: one-byte opcodes c0/c1, two-byte 0f a4/ac)."""
+    at = 1 if op[0] != 0x0f else 2
+    m = op[at]
+    mod, rm = m >> 6, m & 7
+    n = at + 1 + (rm == 4 and mod != 3)
+    n += {0: 4 if rm == 5 or (rm == 4 and op[at + 1] & 7 == 5) else 0, 1: 1, 2: 4, 3: 0}[mod]
+    return op[n]
 def refused(code, at):
     """The REFUSED name of the instruction at the start of `code` (`at`: its ndisasm mnemonic), or None."""
     p, rex, op = split(code)
@@ -354,11 +350,22 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
                 return {**rec, 'outcome': 'unsupported', 'reason': f"split lock: {rec.get('at', '?')}"}
             at = lambda a, n: binary[a - CODE:a - CODE + n].hex() if CODE <= a and a + n <= CODE + len(binary) else ''
             vector = int(s['fault'][0], 0) if s['stop'] == 'guest_fault' else None
+            if vector == 6 and s['stats']['decodes'].get('0x7e') and CODE <= rip < CODE + len(binary):
+                p, rex, op = split(binary[rip - CODE:rip - CODE + 15])
+                count = int(s['gpr'][1], 0) & 31
+                if 0x66 in p and not rex & 8 and op[:2] in (b'\x0f\xa5', b'\x0f\xad') and count > 16:
+                    return {**rec, 'outcome': 'unsupported', 'reason': f'undefined result:16-bit SHLD/SHRD CL count {count} exceeds operand width'}
             if (vector == 3 and at(rip - 1, 1) == 'cc') or (vector is not None and at(rip - 2, 2) == f'cd{vector:02x}') \
                     or (vector == 6 and (at(rip, 1) == 'ce' or at(rip, 2) in ('0f0b', '0fb9', '0fff'))):
                 # X1a: INT3/INT n/INTO/UD0-2 are delivered through the driver's logging IDT; these tests expect Linux's
                 # signal for them (before X1a: no code, `system_instruction`).
                 return {**rec, 'outcome': 'unsupported', 'reason': f"software interrupt or #UD instruction delivered (vector {int(s['fault'][0], 0)}): {rec.get('at', '?')}"}
+            # No-stop change: a form natemu does not run yet is #UD at it (`REFUSED`, counted in the decodes): unsupported for a
+            # documented refusal, as its no-code stop was before; anywhere else a failure.
+            if vector == 6 and s['stats']['decodes'].get(f'{0x7b:#x}') and CODE <= rip < CODE + len(binary):
+                form = 'at' in rec and refused(binary[rip - CODE:rip - CODE + 15], rec['at'])
+                if form: return {**rec, 'outcome': 'unsupported', 'reason': f"refused form (handoff §4): {form}: {rec['at']}"}
+                return {**rec, 'outcome': 'fail', 'reason': 'no code: refused (#UD) outside the documented list', 'detail': rec['stop']}
             if vector == 6 and (rec.get('at') or '').split()[-1:] and (rec.get('at') or '').split()[-1] in NOT_ADVERTISED:
                 # S3: #UD for an instruction the presented CPU (tools/models/cpu_profile.json) does not advertise, as the SDM
                 # gives; FEX's tests assume its host's features.
@@ -432,6 +439,10 @@ def category(reason):
 
 
 SELFTEST = {   # synthetic tests: (source, expected outcome, reason prefix)
+    'shift16_defined.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x2468"}}\n%endif\nmov eax, 0x1234\nmov edx, 0\nmov ecx, 1\nshld ax, dx, cl\nhlt\n', 'pass', ''),
+    'shift16_undefined.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nmov ecx, 17\nshld ax, dx, cl\nhlt\n', 'unsupported', 'undefined result:'),
+    'shift16_zero_fault.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor ecx, ecx\nshld word [0x70000000], dx, cl\nhlt\n', 'fail', 'did not reach hlt'),
+    'stack16_defined.asm': ('%ifdef CONFIG\n{"RegData":{"RSP":"0xe0000022","RBP":"0xe0001234"}}\n%endif\nmov rsp, 0xe0000020\npushfw\npop ax\nmov word [rsp], 0x1234\nmov rbp, rsp\no16 leave\nhlt\n', 'pass', ''),
     'pass.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x1","RSP":"0xE0000020","RIP":"0x1000a"}}\n%endif\nmov rsp, 0xe0000020\nmov eax, 1\nhlt\n', 'pass', ''),
     'wrong.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x2"}}\n%endif\nmov eax, 1\nhlt\n', 'fail', 'registers differ'),
     'memory.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0x0807060504030201","RBX":"0x1234"},"MemoryRegions":{"0x100000000":"4096"},"MemoryData":{"0x100000000":"0102030405060708"}}\n%endif\n'
@@ -452,9 +463,9 @@ SELFTEST = {   # synthetic tests: (source, expected outcome, reason prefix)
     'range_ok.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x478f"]}}\n%endif\nfld tword [rel v]\nhlt\nv: dq 0x8000000000000000\ndw 0x478f\n', 'precision deviation', '80-bit'),
     'hole_range.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x478f"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
     'mm_far.asm': ('%ifdef CONFIG\n{"RegData":{"MM7":["0x8000000000000000","0x4000"]}}\n%endif\nfld1\nhlt\n', 'fail', 'registers differ'),
-    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\nmaskmovq mm0, mm1\nhlt\n', 'unsupported', 'refused form'),
-    # An `unsupported_form` outside REFUSED fails: INSERTPS m32 whose zero mask clears the inserted element (fexc refuses it).
-    'unlisted_form.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\ninsertps xmm0, [rel v], 0x01\nhlt\nv: dd 0\n', 'fail', 'no code: unsupported_form'),
+    'vector_insn.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\nfbld [rax]\nhlt\n', 'unsupported', 'refused form'),
+    # An `unsupported_form` outside REFUSED fails: reserved repeat prefix on a register x87 form.
+    'unlisted_form.asm': ('%ifdef CONFIG\n{"RegData":{"RAX":"0"}}\n%endif\nxor eax,eax\ndb 0xf2, 0xd9, 0xc0\nhlt\n', 'fail', 'no code: refused (#UD) outside the documented list'),
     'xmm.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x1","0x0"],"XMM1":["0x0","0x0","0x0","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'pass', ''),
     'xmm_wrong.asm': ('%ifdef CONFIG\n{"RegData":{"XMM0":["0x2","0x0"]}}\n%endif\nmov eax, 1\nmovd xmm0, eax\nhlt\n', 'fail', 'registers differ'),
     'bits32.asm': ('%ifdef CONFIG\n{"Mode":"32BIT","RegData":{"RAX":"0"}}\n%endif\nhlt\n', 'unsupported', '32-bit'),
@@ -504,6 +515,7 @@ def main():
         print(f'{flag}: ' + ', '.join(f"{r['test']}={r['outcome']}" for r in sel))
     for r in results:
         if r['outcome'] == 'fail': print('FAIL', r['test'], r.get('reason'), r.get('detail', ''))
+    sys.exit(1 if c['fail'] else 0)
 
 
 if __name__ == '__main__': main()

@@ -85,7 +85,7 @@ weeks before adoption).
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-native-20261026-01/series66-gather/obj/fexc
+F=../natemu-raw/correctness-forms-20261107-02/candidate-bin/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu --runtime "$R" --fexc "$F" --kernel "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -115,7 +115,9 @@ yes/no, on/off, anything else is refused): `--serial-stdin` (`NATEMU_SERIAL_STDI
 `NATEMU_RAM` and `NATEMU_PLACE` (the `run-program` driver's defaults for `--ram` and `--place`, §5), `NATEMU_EXIT_LOG`
 (the program driver's exit log), `NATEMU_ADMIT_CORPUS` (admission's ignored corpus test), `NATEMU_REPLAY`,
 `NATEMU_REPLAY_OLD`, `NATEMU_REPLAY_ARGS` (the ignored replay test); the runners' own `FEXC`,
-`NATEMU_PREBUILT` and `NATEMU_RAW_ROOT` are not read by the binaries.
+`NATEMU_PREBUILT`, `NATEMU_RAW_ROOT` and `NATEMU_TEST_GUEST_STATE_ALIAS` are not read by the binaries. The last
+one is a regression-harness override forwarded only to the test driver's `run-program --guest-state-alias VA`;
+production startup always randomizes the frame alias. The driver reports the selected VA as `guest_state_alias`.
 
 **Interactive serial** (November 5, a convenience; off by default): `--serial-stdin` (or `NATEMU_SERIAL_STDIN=1`) on the
 stub or `boot-linux` feeds standard input to COM1's receive line, so a person can type into a booted guest, e.g.
@@ -178,6 +180,12 @@ resident gets it with `CARGO_TARGET_DIR=target/perf` and `CARGO_TARGET_AARCH64_U
 byte-identical with and without this code (only panic-location line numbers in `.rodata` move). The harness and
 analysis (`boot.py`, `analyze.py`, `aggregate.py`, `campaign.sh`) are in `natemu-raw/perf1-20261103-01/`.
 
+Since the November 7 counter repair, K1 `systems.declined` reports fast SYSCALL/SYSRET rejection counts by
+`not_current`, `boundary`, `other` and `after`. `systems.kinds` counts only instruction kinds. Rebuild host and resident
+together for this layout. Older logs mixed these rejection counts into kinds 0x7c–0x7f; those totals cannot identify
+MASKMOV/ROTATE/DOUBLE_SHIFT16 executions or be separated retrospectively. Decline increments are compiled out of
+the default resident. This repair was functionally checked with plain/perf boots, not measured as a performance change.
+
 ## 2. Manifest inputs
 
 | Input | Field / option | Default and limits |
@@ -236,10 +244,11 @@ results, their comparisons and integer conversions, PE/OE/UE and C1's round-up b
 FLD m80/FRSTOR round, FSTP m80/FNSAVE/FXSAVE widen exactly; FIP/FDP/FOP read 0; transcendentals are double libm results
 computed by the resident. MMX aliasing of the x87 registers is not exact (plan, Built (I9) deviations 1-2).
 
-**Declared deviations still in force:** the guest-state page `0xffff_4000_0000_1000` (one 4 KiB page per vCPU,
-non-canonical: a guest data access there reaches the vCPU's own DF, FS/GS bases, MXCSR, x87, MMX and YMM upper halves
-instead of #GP/#SS; needs no LA57 and no LAM; plan, Built (I1, G1 minimum), owner decision October 28); LOCK BTS/BTR/BTC
-as a byte atomic (plan, Built (I3)); no #AC for a misaligned BT unit past the canonical top (Built (X2)); FXSAVE/XSAVE
+**Declared deviations still in force:** the guest-state alias (one 4 KiB page per vCPU at a shared VA, now randomized
+per VM within `0xffff400000000000..0xffff408000000000`; formerly fixed at `0xffff400000001000`): a guest data access
+to the selected noncanonical page reaches the vCPU's own DF, FS/GS bases, MXCSR, x87, MMX and YMM upper halves
+instead of #GP/#SS. This is a mitigation, not isolation; see the [current backlog](correctness-backlog.md) and
+[measured follow-up](correctness-cpu-ram.md#correctness-question-follow-up-and-profiler-repair). FXSAVE/XSAVE
 image bytes 10-15 of each ST slot zero (Built (I5b)); the recorded choices where the SDM leaves room (implicit
 supervisor accesses never hit data breakpoints, Built (S4); Reserved-NOP cells and BND on near branches execute,
 Built (X1b, X1c); the TSC is CNTVCT scaled to 1 GHz, Built (S1), L5). Aligned 16-byte vector moves are one LDP/STP, so
@@ -247,33 +256,55 @@ no tearing is declared any more (Built (I5a)). The I/O APIC (R2 review): a fixed
 with vector 0-15 is dropped at the chipset without the target LAPIC's receive-illegal-vector ESR bit (SDM Vol.3 11.5.3
 sets it; only the target's resident keeps its ESR); SMI and INIT delivery modes deliver nothing (no SMM in the profile;
 INIT has no model, the AP start is the mailbox), nor do the reserved modes 3 and 6 (as QEMU). Linux programs none of
-these.
+these. **Compatibility mode at CPL 3** (owner decision, November 6; compatibility mode is not built, owner decision 3): a
+transfer that would run CPL-3 code in a 32-bit or 16-bit code segment (CS.L = 0, or L = D = 1) is contained to the program
+instead of stopping the machine. JMP/CALL far at CPL 3 and RET far or IRET/IRETQ whose new CS has RPL 3 (from any CPL, so the
+kernel's IRET of a sigreturn or of Linux's SYSENTER compat path too) raise #GP(that selector) at the instruction before any
+change, after the descriptor checks x86 makes first; from CPL 0 the #GP is the kernel's, at its IRET, which Linux's bad-IRET
+fixup (`entry_64.S` `native_irq_return_iret`, `fixup_bad_iret`: "#SS, #GP and #NP" on the return to user space) turns into
+the program's #GP, a SIGSEGV. SYSRET and SYSEXIT with a 32-bit operand size complete (RFLAGS, SS, RSP, CPL 3, RIP its target)
+and the first instruction at the target takes #GP(the new CS selector) at CPL 3 (an OS returns by SYSRET with the user's stack
+and GS base loaded, so a CPL-0 fault there could not be handled; a fault after a completed SYSRET is what AMD processors give
+for a non-canonical RCX); a TF the return loads gives no trap before it. A call gate at CPL 3 is #GP(its selector) too (call
+gates are not built). x86 would run the code: a recorded deviation. CPL-0 code entering compatibility mode keeps the typed
+stop below. Checks: `run_slice3_vm.py system` (`seg-*-compat*`, `seg-cpl3-*`, `sc-sysretl`: segment_model's and
+syscall_model's `Deviation`, natemu only), the kernel x86 selftests sigreturn_64, single_step_syscall_64,
+syscall_arg_fault_64 and sysret_ss_attrs_64 ([correctness-nostop.md](correctness-nostop.md)).
 
 **Typed refusals** (a stop naming the reason, never a silent wrong result; `crates/abi/src/execution.rs` stop kinds):
-`unsupported_atomic` for a LOCKed access or an unlocked CMPXCHG8B crossing 16 bytes (split locks; owner decision);
-`unsupported_mode` for CPL 1/2, compatibility-mode code (far transfers or SYSRET/SYSEXIT into 32-bit code), 32-bit and
-paging-off modes (owner decision 3), page tables outside guest RAM; `unsupported_system` for call gates, an ICR INIT/start-up IPI or
+(`unsupported_atomic`, a LOCKed access or an unlocked CMPXCHG8B crossing 16 bytes, is no longer a stop since November 6: split
+locks run atomically in the resident under a VM-wide split lock, [correctness-nostop.md](correctness-nostop.md) §3);
+`unsupported_mode` for CPL 1/2, compatibility-mode code at CPL 0 (JMP/CALL far at CPL 0 or RET far/IRET to RPL 0 into a
+32- or 16-bit code segment; at CPL 3 it is the deviation above), 32-bit and paging-off modes (owner decision 3), page tables
+outside guest RAM; `unsupported_system` for call gates at CPL 0, an ICR INIT/start-up IPI or
 any delivery mode but fixed, lowest priority and NMI (the mailbox is the AP start; `execution/lapic.rs`), a LAPIC base moved onto RAM, DR7 R/W = 10 without
 CR4.DE, more data breakpoints than the host offers; `unsupported_mmio` for RMW, atomic, pair, page-crossing, string and
 vector forms on a device page; `unsupported_ferr` for a pending x87 exception with CR0.NE = 0; `unsupported_port` for
-an SLP_TYP other than S5; `fetch_not_ram` for code on a non-RAM page; `unsupported_form` for forms fexc refuses and the
-SDM gives no exception for: VEX gathers, MASKMOVQ, MASKMOVDQU, VMASKMOV/VPMASKMOV (owner decision October 30 (2): 10
-gather sites in `libmvec.so.1`, 0 masked stores in the census), VCVTPS2PH m, scalar VEX.L = 1 forms, RCL/RCR m, BT* m, r
-with 0x67, 16-bit BSWAP/SHLD/SHRD, ENTER with nesting, 66 on PUSHF/ENTER/LEAVE/RET/indirect branches/CMPXCHG8B, FBLD/FBSTP and
-undocumented x87 aliases (`tools/fexc/shim/fexc_slice1.inc`; segment prefixes on near direct branches, reserved by the
-SDM, are ignored as processors do since series45-r2fix: plan §5, owner rule, and its list to verify on x86 hardware; 66 on
-near direct branches is ignored as the SDM defines for 64-bit mode since series46-br66: plan, Built (66 on near direct
-branches); no segment-prefix form is refused since series47-seg: CS/DS/ES/SS ignored, so the default segment decides #SS/#GP,
-the last FS/GS prefix applies, FS/GS with no memory operand ignored, owner decisions of November 3 from the reference AMD
-machine, plan §5); and forms the SDM leaves reserved (Vol.2 2.1.1: "use of repeat prefixes and/or undefined opcodes
-with other Intel 64 or IA-32 instructions is reserved", and it gives 66 next to a mandatory F2/F3 prefix no meaning), refused by
-policy and not checked on hardware: REPNE (F2) on MOVS/STOS/LODS (the REP page defines only F3 there; hardware repeats as with
-REP), REP or REPNE on a form that defines neither (not a string, mandatory-prefix, BND, PAUSE or `rep ret` form; the
-suites reach BT*, INC/DEC and CMPXCHG8B/16B), and 66 with F2/F3 on an SSE form (`66 f3 0f 2c`, CVTTSS2SI), 66 on CMPXCHG16B as on CMPXCHG8B; `no_code` `spill_area` for a block fexc can
-only compile with a spill area at one instruction (admission verifies no spill-slot code; a longer block is translated
-again with half its instructions first, as for `code_too_large`; fexc spilled on no corpus and no boot). The ASM runner
-(`tools/fexc/upstream_tests/run_asm.py`, `REFUSED`) counts a test unsupported only at a form of this list; an `unsupported_form`
-stop anywhere else, or any other no-code stop, fails it (integrity audit, November 3). Since that audit, F2/F3 on SMSW are ignored
+an SLP_TYP other than S5; `fetch_not_ram` for code on a non-RAM page. **No longer stops** (no-stop change, November 6;
+[correctness-nostop.md](correctness-nostop.md) §2): a form fexc refuses at a block's first instruction (once `unsupported_form`),
+a system instruction the host does not decode, a decoder or dispatcher failure and a compiler limit at one instruction (once
+`spill_area`) are #UD at the instruction (`system::REFUSED`, the recorded deviation; the first 32 logged on standard error),
+unless the SDM gives the encoding its own exception (the host's `undefined`, `branch`, fexc's `cut_ud`). Run since then: the
+VEX gathers (the resident, November 6), all masked moves including MASKMOVQ, the scalar VEX.L = 1 forms, 16-bit BSWAP,
+16-bit SHLD/SHRD with immediate or CL counts up to 16, all memory RCL/RCR counts, INSERTPS/VINSERTPS memory sources,
+and 16-bit PUSHF/LEAVE. The [November 7 CPU/RAM fixes](correctness-cpu-ram.md) also repair BT memory width, vector
+alignment-abort completion and x87 flag publication. The [instruction-form repairs](correctness-instruction-forms.md)
+implement VCVTPS2PH m, BT* m, r with 0x67, nested/16-bit ENTER, prefixed near transfers and 16-bit far transfers.
+Still #UD: 16-bit SHLD/SHRD with an undefined count above 16, 66 on CMPXCHG8B/16B,
+FBLD/FBSTP and the undocumented x87, SAL /6 and TEST /1 aliases (`tools/fexc/shim/fexc_slice1.inc`; segment prefixes on near
+direct branches, reserved by the SDM, are ignored as processors do since series45-r2fix: plan §5, owner rule, and its list to
+verify on x86 hardware; 66 on near direct branches is ignored as the SDM defines for 64-bit mode since series46-br66: plan,
+Built (66 on near direct branches); no segment-prefix form is refused since series47-seg: CS/DS/ES/SS ignored, so the default
+segment decides #SS/#GP, the last FS/GS prefix applies, FS/GS with no memory operand ignored, owner decisions of November 3
+from the reference AMD machine, plan §5); and the forms the SDM leaves reserved (Vol.2 2.1.1: "use of repeat prefixes and/or
+undefined opcodes with other Intel 64 or IA-32 instructions is reserved", and it gives 66 next to a mandatory F2/F3 prefix no
+meaning), not checked on hardware: REPNE (F2) on MOVS/STOS/LODS (the REP page defines only F3 there; hardware repeats as with
+REP), REP or REPNE on a form that defines neither (not a string, mandatory-prefix, BND, PAUSE or `rep ret` form; the suites
+reach BT*, INC/DEC and CMPXCHG8B/16B), and 66 with F2/F3 on an SSE form (`66 f3 0f 2c`, CVTTSS2SI), 66 on CMPXCHG16B as on
+CMPXCHG8B. A block fexc can only compile with a spill area is translated again with half its instructions first, as for
+`code_too_large` (admission verifies no spill-slot code; fexc spilled on no corpus and no boot). The ASM runner
+(`tools/fexc/upstream_tests/run_asm.py`, `REFUSED`) counts a test unsupported only at a form of this list (since November 6: a
+REFUSED #UD there); one anywhere else, or any no-code stop, fails it (integrity audit, November 3). Since that audit, F2/F3 on SMSW are ignored
 (reserved by 2.1.1; owner rule: the reference AMD machine, a user-mode probe where Linux enables UMIP: every F2/F3 and 66
 register and memory form took plain SMSW's UMIP #GP, none #UD; `natemu-raw/audit-fix-20261103-01/probe/`) and AMD's SSE4a
 EXTRQ/INSERTQ (66/F2 `0f 78/79`, not advertised: CPUID.80000001H:ECX[6] = 0) are #UD (the host's system decode,
@@ -640,10 +671,10 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `tools/run_i8_faults.py`, `tools/reference/gen_i8.py` | I8 AVX/AVX2/FMA/F16C: the QEMU 7.2 corpus (`gen_i8.py`, VEX.128 and VEX.256 forms, every rounding mode, FTZ/DAZ; run with `run_slice1_vm.py`), and the fault matrix by the SDM rules against the run cut before the instruction: #PF on 32-byte crossings with no partial update, alignment #GP (16/32), non-canonical #GP/#SS, #UD/#NM gating (OSXSAVE, XCR0, TS; EM/OSFXSR/BMI not gated; legacy prefixes before VEX; XSETBV re-keying), refusals, device and all-ones pages, the XSAVE round trip with live YMM state, DE/MXCSR hand cases (boot-features plan, Built (I8)) |
 | `tools/run_i6b.py`, `tools/reference/gen_i6b.py` | I6b PCMPxSTRx and the x87 transcendental, remainder, scale and extract forms (resident `svc`): `corpus` against QEMU 7.2 (every imm8 in every form, legacy/VEX, REX.W/VEX.W lengths where QEMU agrees; x87 results QEMU computes in 80 bits within 2 ulps), `cases` by the SDM (C2 at and around 2^63, FPREM/FPREM1 quotient bits and partial remainders, stack underflow/overflow responses, IE/ZE/OE/UE/PE, PCMPxSTRx #PF/#GP/#SS with no partial update, no alignment fault, 64-bit lengths against an SDM model) (boot-features plan, Built (I6b)) |
 | `tools/run_x4.py` | X4 AP start through the ACPI wakeup mailbox: `units` OS scripts at 2-4 vCPUs (each AP in turn, in reverse, an absent or the BSP's APIC ID and a reserved command ignored, a second wakeup for a woken AP ignored) judged by the independently written `tools/models/mailbox_model.py` (outcome and trace; the vector read before the acknowledgement is a code-inspected invariant, no test sees it) plus the ACPI wake state, block sizes default and 1, wake latency reported; `adversarial` the X4 review's cases (command before APIC ID, a Wakeup before any vCPU runs, the mailbox through an alias page, stores into the page's OS area, two Wakeups without waiting); `trampoline` Linux 6.12's `trampoline_start64` 64-bit branch and the `secondary_startup_64` prefix to the lock release, transcribed, run by every AP at 2-4 vCPUs vs pinned QEMU (its stub starts the APs at the same vector) (boot-features plan, Built (X4)) |
-| `tools/run_i9_faults.py`, `tools/reference/gen_i9.py` | I9 MOVBE, MMX, AES-NI/PCLMULQDQ (legacy and VEX.128), PDEP/PEXT, FFREEP: the QEMU 7.2 corpus (`gen_i9.py`; run with `run_slice1_vm.py`), and the fault matrix by the SDM rules against the run cut before the instruction, the x87/MMX state included (#PF/#GP/#SS, m32 PUNPCKL*, alignment of the legacy m128 forms, MMX gating #UD/#NM, #UD for MOVBE register forms and ADX, #AC, MASKMOVQ refused; since November 3 the SHA forms' faults, alignment, gating and 66/F2/F3 #UD) (boot-features plan, Built (I9), Built (SHA)) |
+| `tools/run_i9_faults.py`, `tools/reference/gen_i9.py` | I9 MOVBE, MMX, AES-NI/PCLMULQDQ (legacy and VEX.128), PDEP/PEXT, FFREEP: the QEMU 7.2 corpus (`gen_i9.py`; run with `run_slice1_vm.py`), and the fault matrix by the SDM rules against the run cut before the instruction, the x87/MMX state included (#PF/#GP/#SS, m32 PUNPCKL*, alignment of the legacy m128 forms, MMX gating #UD/#NM, #UD for MOVBE register forms and ADX, #AC, MASKMOVQ execution; since November 3 the SHA forms' faults, alignment, gating and 66/F2/F3 #UD) (boot-features plan, Built (I9), Built (SHA)) |
 | `tools/reference/gen_adx.py`, `tools/reference/gen_xsave.py` | ADX and XSAVEOPT/XSAVEC (November 4): 56 programs each, expected from the AMD machine (`ref_native.py --require-flag adx` / `xsavec`); ADX's model programs also replayed through the SDM (`gen_adx.py --check`), XSAVE images compared byte for byte; run with `run_slice1_vm.py` (boot-features plan, Built (ADX), Built (XSAVEOPT, XSAVEC)) |
 | `tools/reference/gen_sha.py`, `tools/reference/ref_native.py` | SHA (November 3): 60 programs, all seven instructions, every SHA1RNDS4 imm8, register and memory forms with REX, 0x67 and ignored prefixes; the reference is the AMD machine running each program's ELF natively (`ref_native.py`; pinned QEMU 7.2 has no SHA), checked against the SDM pseudocode (`gen_sha.py --check`); run with `run_slice1_vm.py` (boot-features plan, Built (SHA)) |
-| `tools/run_i10_faults.py`, `tools/reference/gen_i10.py` | I10 0x67 address size, XLAT, #UD forms, CET hint space: the QEMU 7.2 corpus (`gen_i10.py`: EA forms with garbage upper halves and 4 GiB wrap, FS-based, EIP-relative, moffs32, XLAT, addr32 call/jmp, strings with ESI/EDI/ECX, LOOP/JECXZ; run with `run_slice1_vm.py`), and the case matrix by the SDM rules against the run cut before the instruction (#PF at the truncated address, no #GP for garbage upper halves, FS.base + EA non-canonical #GP, EIP wrap, host-decoded forms with 0x67, #AC, zero-extended ESI/EDI/ECX at a midway REP fault, LOOP/JECXZ on ECX, BT* m, r refused, every #UD form, #UD before #NM, the 0f 1e NOPs) (boot-features plan, Built (I10)) |
+| `tools/run_i10_faults.py`, `tools/reference/gen_i10.py` | I10 0x67 address size, XLAT, #UD forms, CET hint space: the QEMU 7.2 corpus (`gen_i10.py`: EA forms with garbage upper halves and 4 GiB wrap, FS-based, EIP-relative, moffs32, XLAT, addr32 call/jmp, strings with ESI/EDI/ECX, LOOP/JECXZ; run with `run_slice1_vm.py`), and the case matrix by the SDM rules against the run cut before the instruction (#PF at the truncated address, no #GP for garbage upper halves, FS.base + EA non-canonical #GP, EIP wrap, host-decoded forms with 0x67, #AC, zero-extended ESI/EDI/ECX at a midway REP fault, LOOP/JECXZ on ECX, BT* m, r signed-index paging, every #UD form, #UD before #NM, the 0f 1e NOPs) (boot-features plan, Built (I10)) |
 | `tools/run_i5b.py` | I5b FXSAVE/FXRSTOR, XSAVE/XRSTOR, XGETBV/XSETBV (since November 4 XSAVEOPT, XSAVEC and the compacted XRSTOR: their faults by the SDM, natemu only for XSAVEC): `images` (FXSAVE/XSAVE/XRSTOR images and XCR0/CPUID.0DH sequences byte by byte against QEMU's Haswell model, block sizes default and 1, declared differences compared on natemu's side), `faults` (alignment, #PF at page boundaries with no partial update, #NM/#UD gating, XSETBV/XGETBV and XRSTOR header #GP, refusals, #AC never; SDM rules, QEMU where it can run the case) (boot-features plan, Built (I5b)) |
 | `tools/run_s4.py` | S4 debug: `programs` (tools/bench/smp/debug.py: TF through mixed instructions, REP strings, CALL/RET, CPUID; POPF/IRETQ/SYSRET/SYSCALL with TF; MOV SS; INT3/INT n/INT1 under TF; UD2/#GP/#PF under TF; instruction breakpoints mid-block, at a loop head, at a kept system instruction, inside an instruction, after MOV SS, at a REP, by CALL RAX, armed over translated code; DR6/DR7 read-back, DR4/DR5, DR7.GD, sticky DR6; data breakpoints for every R/W x LEN at range edges, RMW/LOCK/XCHG/CMPXCHG, BT units, x87/SSE/AVX, string and stack forms, IRETQ/POPF, an exception frame, MOV SS, a page-crossing store; I/O breakpoints on IN/OUT/INS/OUTS) judged by the SDM's expected event logs and against pinned QEMU, block sizes default and 1; `cases` HLT under TF, device-page accesses, per-vCPU registers, R/W 10 without CR4.DE refused (boot-features plan, Built (S4)) |
 | `tools/run_m2.py` | M2 memory types: `qemu` CPL 0 programs on their own tables with Linux's PAT and PAT indices 0-7 in PTEs, PWT/PCD in the PML4E/PDPTE/PDE and CR3, 2 MiB leaves with each index, the SDM's MTRR update sequence with UC/WC/WT/WP variable ranges and MTRRs disabled (loads, stores, LOCK, XCHG, MOVNTI, CLFLUSH, strings, code run from each page) vs pinned QEMU at 1/2 CPUs, block sizes default and 1; `types` the resident's data shadows by type (`stats.k1.memory_types`) against the SDM's Table 14-7 and MTRR precedences (reset and Linux PAT, upper-level and CR3 bits, large leaves, ranges and overlaps, fixed ranges with FE set and clear, MTRRs disabled); `devices` a device page with each PAT index under UC/WC/WB MTRRs and MTRRs disabled: one device access each, never shadowed; `firmware` (addendum 1) the firmware's MTRRs read back at 4 MiB, 1, 2 and 3 GiB of RAM equal `cpu_profile.py`'s `mtrr_state(R)`: all RAM WB, the hole and [R, 4 GiB) UC; addendum 2 (UC RAM strongly ordered): `qemu` also `uc` (every access form on UC pages, straddles both ways, a UC stack, code from UC), `faults` (#PF/U-S/R-W/WP/reserved/#AC/data breakpoints on UC pages equal to WB and to the SDM), `litmus` (store buffering on UC pages at 2-4 vCPUs never shows every load old; the WB control at 2 does; at 2 one location UC and one WB never both old), `types` also a PAT write turning a WB-shadowed page UC (after a CR3 reload or INVLPG it takes the UC path), `cost` (reported) (boot-features plan, Built (M2), Built (M2 addendum 1, 2)) |
@@ -665,6 +696,16 @@ python3 tools/run_suite.py --list                # steps, phase, internal parall
 python3 tools/run_suite.py --only 'k1-*,fix'     # or --skip; names or fnmatch patterns; --fexc FEXC (default: F below)
 NATEMU_RAM=0x400000 python3 tools/run_suite.py   # the 4 MiB suite: the environment passes through
 ```
+
+November 7's frame-randomization follow-up adds `frame-alias`/`frame-alias-1` and
+`frame-randomization`/`frame-randomization-1` (134 steps total). The first pair checks unmapped noncanonical
+addresses with the actual frame deliberately placed elsewhere; the second pair explicitly tests the retained
+selected-page hole, private per-vCPU backing and execution transitions. The suite sets
+`NATEMU_TEST_GUEST_STATE_ALIAS=0xffff407abcde0000` for fixed-address `faults`, `events`, `privilege` and
+K2 `swapgs`/`cr2`/`stifirst`/`verw` controls, and `0xffff400000001000` for S4's frame watchpoints. Use the same
+test override when reproducing those groups individually. Ordinary runs and performance tests use fresh OS entropy.
+Randomization does not make guest access to the selected page architecturally correct; see
+[the mitigation evidence and limitation](correctness-cpu-ram.md#correctness-question-follow-up-and-profiler-repair).
 
 1. One at a time: the cargo builds and tests, `run_l1.py`, `run_l2.py`, `run_l2_iasl.py` (they run cargo), then every
    binary the runners build, signed. Later steps run with `NATEMU_PREBUILT=1`, under which `run_slice1_vm.build()` (every VM
@@ -712,7 +753,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-native-20261026-01/series66-gather/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
+F=../natemu-raw/correctness-forms-20261107-02/candidate-bin/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results
@@ -736,6 +777,8 @@ python3 tools/check_resident_stack.py
 FEXC="$F" python3 -B -m unittest discover -s tools -p 'test_*.py'   # record "Ran N" with its skip count: test_fexc.py and test_slice1.py skip without a fexc, test_acpi_model.py without target/release/natemu-host and ../natemu-raw (or L2_DUMP)
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/fix"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/fix-1" --max-block 1
+tools/with-env python3 tools/run_instruction_gaps.py --fexc "$F" --out "$O/instruction-gaps" --max-block 0
+tools/with-env python3 tools/run_instruction_gaps.py --fexc "$F" --out "$O/instruction-gaps-1" --max-block 1
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/seed" "$SEED/programs.json" "$SEED/expected.json"
 tools/with-env python3 tools/run_slice1_vm.py --fexc "$F" --out "$O/seed-1" --max-block 1 "$SEED/programs.json" "$SEED/expected.json"
 tools/with-env python3 tools/run_slice1_faults.py --fexc "$F" --out "$O/faults"
@@ -947,7 +990,13 @@ admission of relocated hits is about 0.8 s at N = 1 (perf plan "Measured (chunk 
   arbitration, undefined MTRR overlaps.
 - **low**, boot: Linux's `quick_pit_calibrate` fails when first-time blocks fall inside its 24 us windows (§4); the evidence
   boots take the TSC rate from the profile and never need it.
-- **low**, refusals: `spill_area` (a block fexc can only compile with a spill area at one instruction; never seen); the other typed
+- **low**, deviation (owner, November 6): CPL-3 code entering compatibility mode (far transfers, IRET, SYSRET/SYSEXIT into a
+  32- or 16-bit code segment) gets #GP(selector) instead of running (§4, "Compatibility mode at CPL 3"); 32-bit programs and
+  the 32-bit parts of 64-bit ones (Wine, `call32` thunks) end with SIGSEGV. Building compatibility mode removes it.
+- **low**, deviation (no-stop change, November 6): the forms natemu does not run yet (§4, "No longer stops") are #UD in the
+  guest instead of a machine stop: a program using one gets SIGILL where x86 would run it. Remaining valid forms include
+  FBLD/FBSTP; VCVTPS2PH memory stores are implemented by the [instruction-form repairs](correctness-instruction-forms.md).
+- **low**, refusals: a block fexc can only compile with a spill area at one instruction (never seen; #UD since November 6); the other typed
   refusals of §4.
 - **low**, devices: I/O APIC vectors 0-15 dropped without the target's ESR bit, SMI/INIT modes deliver nothing (§4
   deviations; `irq.rs`, ponytail).

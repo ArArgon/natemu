@@ -6,9 +6,14 @@
 //! CR0.WP decides writes to read-only pages); operand and stack accesses are explicit, at the CPL. The SDM's accessed-bit
 //! write on a segment load and LTR's busy-bit write are real guest writes: a clear A bit in a read-only GDT page faults,
 //! as on hardware. Flat 64-bit only (plan D1, owner decision 3): bases and limits of CS/SS/DS/ES are not used, FS/GS
-//! loads set the bank's bases; a transfer to a compatibility-mode code segment (CS.L = 0, or L = D = 1) stops
-//! `unsupported_mode` with that CS in the record and RIP at the instruction, nothing else changed; a call gate stops
-//! `unsupported_system`. `tools/models/segment_model.py` (and `delivery_model.py`'s IRETQ) is the oracle; the check order
+//! loads set the bank's bases. Compatibility mode is not built (owner decision 3): a transfer to a compatibility-mode code
+//! segment (CS.L = 0, or L = D = 1) that would run CPL 3 code (JMP/CALL far at CPL 3, RET far or IRET whose new CS has
+//! RPL 3, from any CPL) raises #GP(that selector) at the instruction before any change (owner decision, November 6: a
+//! recorded deviation, x86 would run the code; the OS sees a bad transfer and ends the program: an IRET from CPL 0 faults in
+//! the kernel, where Linux's bad-IRET fixup turns it into the user's #GP); one that would run CPL 0 code stops
+//! `unsupported_mode` with that CS in the record and RIP at the instruction, nothing else changed. A call gate stops
+//! `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no CPL-3 transfer stops the
+//! machine). `tools/models/segment_model.py` (and `delivery_model.py`'s IRETQ) is the oracle; the check order
 //! follows it where the SDM lists several conditions without a priority.
 use super::*;
 
@@ -252,6 +257,7 @@ pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: boo
             }
         };
     }
+    super::split_wait(s, &gpa[..1 + usize::from(crosses)]);
     Ok(gpa)
 }
 /// Updates the guest byte at linear `va` atomically, as an implicit supervisor write (walked for write first: a
@@ -387,6 +393,9 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
     let (code_or_data, kind, dpl, present) = fields(raw);
     let cpl = s.cpu.cpl;
     if !code_or_data && kind == 0xc {
+        if cpl == 3 {
+            return Err(gp(selector)); // the deviation above: call gates are not built
+        }
         halt(s, stop::UNSUPPORTED_SYSTEM)
     }
     let conforming = kind & 4 != 0;
@@ -410,13 +419,18 @@ fn load_cs(s: &mut State, selector: u16, raw: u64) {
         halt(s, stop::UNSUPPORTED_MODE)
     }
 }
-/// Halts `unsupported_mode` before any effect when `raw` is not a 64-bit code segment (L = 1, D = 0).
-fn refuse_compatibility(s: &State, selector: u16, raw: u64) {
+/// When `raw` is not a 64-bit code segment (L = 1, D = 0), before any effect: #GP(`selector`) when the code it would run is
+/// at CPL 3 (`cpl`, the new CPL), else halts `unsupported_mode` (module doc).
+fn refuse_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
     if raw >> 53 & 3 != 1 {
+        if cpl == 3 {
+            return Err(gp(selector));
+        }
         let mut refused = *s;
         refused.cpu.seg[SREG_CS] = Segment { base: 0, ..Segment::loaded(selector, raw) };
         halt(&refused, stop::UNSUPPORTED_MODE)
     }
+    Ok(())
 }
 
 /// JMP/CALL far through an m16:`size` pointer to a code segment at the same CPL (SDM Vol.2 JMP, CALL): the target checks
@@ -426,13 +440,13 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
     let c = s.cpu;
     let w = i.size as usize;
     let mut pointer = [0u8; 10];
-    linear(s, address(&c, &i), &mut pointer[..w + 2], false, false, noncanonical(&i))?;
+    aligned_operand(s, address(&c, &i), &mut pointer[..w + 2], w, if w == 2 { 2 } else { 4 }, false, noncanonical(&i))?;
     let (mut offset, mut word) = ([0u8; 8], [0u8; 2]);
     offset[..w].copy_from_slice(&pointer[..w]);
     word.copy_from_slice(&pointer[w..w + 2]);
     let (rip, selector) = (u64::from_le_bytes(offset), u16::from_le_bytes(word));
     let (va, raw) = far_target(s, selector)?;
-    refuse_compatibility(s, selector, raw);
+    refuse_compatibility(s, selector, raw, c.cpl)?;
     let call = i.kind == system::CALL_FAR;
     let rsp = c.gpr[4].wrapping_sub(if call { 2 * w as u64 } else { 0 });
     if call && (!paging::canonical(rsp) || !paging::canonical(c.gpr[4].wrapping_sub(1))) {
@@ -446,7 +460,7 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
         let mut frame = [0u8; 16];
         frame[..w].copy_from_slice(&c.rip.wrapping_add(u64::from(i.length)).to_le_bytes()[..w]);
         frame[w..2 * w].copy_from_slice(&u64::from(c.seg[SREG_CS].selector).to_le_bytes()[..w]);
-        linear(s, rsp, &mut frame[..2 * w], true, false, SS0)?;
+        aligned_operand(s, rsp, &mut frame[..2 * w], w, w as u64, true, SS0)?;
         s.cpu.gpr[4] = rsp;
     }
     load_cs(s, selector & !3 | c.cpl as u16, raw);
@@ -456,7 +470,7 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
 /// RET far (`size`-byte pops, imm16 `disp` released) and IRET (SDM Vol.2 RET, IRET, IA-32e mode): IRET #GP(0) with
 /// RFLAGS.NT; the pops (#SS(0) when not canonical); the return CS: #GP(0) null, #GP(selector) outside the table, not
 /// code, RPL < CPL, conforming with DPL > RPL, nonconforming with DPL != RPL, #NP(selector) not present; a
-/// compatibility-mode CS is refused; then, for IRET and for a return to an outer level, SS:RSP from the stack: a null SS
+/// compatibility-mode CS is #GP(selector) for RPL 3, else refused ([`refuse_compatibility`]); then, for IRET and for a return to an outer level, SS:RSP from the stack: a null SS
 /// only for a new CPL < 3 with RPL = the new CPL (SDM IRET/RET 64-bit mode #GP(0)), else #GP(selector) unless RPL = DPL =
 /// the new CPL and a writable data segment, #SS(selector) not present; #GP(0) for a non-canonical RIP, checked before SS
 /// for IRET (delivery_model's order) and after it for RET (its pseudocode; segment_model B4). A return to CPL 1 or 2 is
@@ -472,7 +486,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     }
     let pops = |s: &mut State, at: u64, n: usize| -> Result<[u64; 5], Exception> {
         let mut b = [0u8; 40];
-        linear(s, at, &mut b[..n * w as usize], false, false, SS0)?;
+        aligned_operand(s, at, &mut b[..n * w as usize], w as usize, w, false, SS0)?;
         let mut words = [0u64; 5];
         for (k, word) in words.iter_mut().enumerate().take(n) {
             let mut q = [0u8; 8];
@@ -496,7 +510,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     if !present {
         return Err(np(selector));
     }
-    refuse_compatibility(s, selector, raw);
+    refuse_compatibility(s, selector, raw, rpl)?;
     if iret && !paging::canonical(rip) {
         return Err(GP0);
     }
@@ -533,7 +547,8 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     }
     let mut rflags = c.rflags;
     if iret {
-        let mask = IRET_ALWAYS | if cpl <= (c.rflags & RFLAGS_IOPL) >> 12 { RFLAGS_IF } else { 0 } | if cpl == 0 { IRET_CPL0 } else { 0 };
+        let mask = (IRET_ALWAYS | if cpl <= (c.rflags & RFLAGS_IOPL) >> 12 { RFLAGS_IF } else { 0 } | if cpl == 0 { IRET_CPL0 } else { 0 })
+            & if w == 2 { 0xffff } else { u64::MAX };
         rflags = (c.rflags & !mask | words[2] & mask) & !RFLAGS_VM | 2;
         // RF comes from the frame (X1a) and lasts until the next instruction completes (`execution::completed`); it
         // suppresses an instruction breakpoint there (S4).
@@ -565,6 +580,55 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
         set_cpl(s, rpl);
     }
     Ok(rip)
+}
+
+/// Far pointers and stack frames have alignment independent of the aggregate byte count (SDM Vol.3A Table 7-7).
+fn aligned_operand(s: &mut State, at: u64, bytes: &mut [u8], slot: usize, alignment: u64, write: bool, nc: Exception) -> Result<(), Exception> {
+    let last = at.wrapping_add(bytes.len() as u64 - 1);
+    if !paging::canonical(at) || !paging::canonical(last) || last < at { return Err(nc); }
+    if s.cpu.alignment_check() && at & (alignment - 1) != 0 { return Err([17, 0, 0]); }
+    // Preflight the entire pointer/frame, then transfer its operand-sized slots (a pointer's last selector is2bytes).
+    // Naturally aligned slots cannot tear; the frame as a whole need not be atomic. Pointer alignment and offset
+    // width are distinct: m16:64 aligns4 but its offset is an8byte load.
+    let gpa = pages(s, at, bytes.len() as u64, write, false, nc)?;
+    let head = bytes.len().min((4096 - (at & 4095)) as usize);
+    if !mmio::ram(gpa[0]) || (head < bytes.len() && !mmio::ram(gpa[1])) { mmio::system_access(s); }
+    if write {
+        for (pa, count) in [(gpa[0], head), (gpa[1], bytes.len() - head)] {
+            if count != 0 && cache::translated(pa) { FetchWrites(s).code_write(pa); }
+        }
+        unsafe { asm!("dmb ish") };
+    }
+    for (k, word) in bytes.chunks_mut(slot).enumerate() {
+        let offset = slot * k;
+        let pa = if offset < head { gpa[0] + offset as u64 } else { gpa[1] + (offset - head) as u64 };
+        if offset < head && offset + word.len() > head {
+            // Only an unaligned slot can straddle a page; its pieces may tear, but permissions are settled.
+            let (lo, hi) = word.split_at_mut(head - offset);
+            for (p, part) in [(pa, lo), (gpa[1], hi)] {
+                let ok = if write { guest_ram().copy_in(p, part) } else { guest_ram().copy_out(p, part) };
+                if !ok { halt(s, stop::SHADOW); }
+            }
+        } else {
+            let width = word.len();
+            let Some(p) = guest_ram().range(pa, width as u64) else { halt(s, stop::SHADOW) };
+            let mut value = [0u8; 8];
+            // SAFETY: the slot lies in fully preflighted RAM pages held against split-lock exclusion.
+            unsafe {
+                if write {
+                    value[..width].copy_from_slice(word);
+                    rotate::store(p, width as u64, u64::from_le_bytes(value));
+                } else { word.copy_from_slice(&rotate::load(p, width as u64).to_le_bytes()[..width]); }
+            }
+        }
+    }
+    unsafe { if write { asm!("dsb ish") } else { asm!("dmb ish") } };
+    if write {
+        cache::rechecked(gpa[0]);
+        if head < bytes.len() { cache::rechecked(gpa[1]); }
+    }
+    watch::access(s, at, bytes.len() as u64, write);
+    Ok(())
 }
 
 /// LAR, LSL, VERR, VERW (S3; SDM Vol.2 LAR, LSL, VERR/VERW, IA-32e mode): the selector from a register or an m16 operand

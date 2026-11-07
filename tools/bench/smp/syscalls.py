@@ -136,7 +136,7 @@ def round_trip(n):
 # Not 0xa0 (a 64-bit TSS whose upper half has a nonzero type field): whether IA-32e LAR/LSL check the upper half is not
 # settled by the SDM text at hand (syscall_model C8), so no result is asserted for it.
 SELECTORS = (0x00, 0x03, 0x08, 0x10, 0x13, 0x18, 0x1b, 0x20, 0x23, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x5b, 0x60,
-             0x70, 0x80, 0x90, 0xb0, 0xc0, 0xc8, 0xd0, 0x0c, 0x0f, 0x14)
+             0x70, 0x80, 0x90, 0xb0, 0xc0, 0xc8, 0xd0, 0xd8, 0xdb, 0xe0, 0x0c, 0x0f, 0x14)
 # (mnemonic text with {r} the result address, model call, destination width)
 FORMS = (('db 0x48\n    lar ebx, eax', 'lar', 8), ('lsl ebx, eax', 'lsl', 4), ('lar bx, ax', 'lar', 2), ('db 0x48\n    lsl ebx, eax', 'lsl', 8),
          ('lsl bx, ax', 'lsl', 2),
@@ -314,8 +314,8 @@ def cases():
         ('sysret-sce0', '', None, 'o64 sysret', lambda: sc.sysret(state(0, gpr={'rcx': u, 'r11': 2})), 0),
         ('sysret-noncanonical', SCE + f'    mov rcx, {NONCANONICAL:#x}\n    mov r11d, 2\n', None, 'o64 sysret',
          lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': NONCANONICAL, 'r11': 2})), 0),
-        ('sysretl', SCE + f'    mov ecx, {u:#x}\n    mov r11d, 2\n', None, 'sysret',
-         lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': u, 'r11': 2}), width=4), 0, 'unsupported_mode'),
+        ('sysretl', SCE + wrmsr(0xc0000081, STAR) + f'    mov ecx, {u:#x}\n    mov r11d, 2\n', None, 'sysret',
+         lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': u, 'r11': 2}), width=4), 0),
         ('swapgs-cpl3', '', '', 'swapgs', lambda: sc.swapgs(state(3)), 3),
         ('rdfsbase-disabled', '', None, 'rdfsbase rax', lambda: sc.fsgsbase(state(0), 'rdfsbase', 'rax'), 0),
         ('wrgsbase-disabled-cpl3', '', '', 'wrgsbase rax', lambda: sc.fsgsbase(state(3, gpr={'rax': 0}), 'wrgsbase', 'rax'), 3),
@@ -365,7 +365,8 @@ def fault_programs():
         r = call()
         # An exception without an error code (#UD) is recorded with 0 by both QEMU's stub and the driver's log.
         zero = lambda x: x and [x[0], x[1] or 0, x[2]]
-        prog['params'] = {'model': {'outcome': r['outcome'], 'fault': zero(r['fault']), 'at': at, 'reason': r['reason'],
+        prog['params'] = {'model': {'outcome': r['outcome'], 'fault': zero(r['fault']), 'at': r.get('fault_rip') or at, 'reason': r['reason'],
+                                    'deviation': r.get('deviation', False), 'rsp': r['state'].get('rsp'),
                                     'permitted': sorted(([o, zero(list(x)) if x else None] for o, x in r['permitted']), key=str)}}
         if stop:
             prog['params']['stop'] = stop

@@ -33,7 +33,7 @@
   an A-bit write into the code's own page after a CR3 reload, a user-side spin only an interrupt ends, a peer's code
   write, the LAPIC timer, a REP MOVSB at the return RIP, NMI blocking across SYSRET, a division (#DE or not) after SYSRET.
 - `stifirst` (perf chunk 25): an STI that starts its block, translated inline at CPL 0, keeps STI's semantics with an
-  interrupt or NMI held at it, entered through a link, after MOV SS, under TF, with the event-pending byte forged at CPL 0
+  interrupt or NMI held at it, entered through a link, after MOV SS, under TF, after rejected frame-alias stores at CPL 0
   or CPL 3, and under interrupts and NMIs at random times (see `stifirst`).
 - `stmxcsr` (perf chunk 25): STMXCSR and VSTMXCSR, translated, store MXCSR with the sticky flags the code before them raised,
   as the resident's FXSAVE (its bank) does and as the SDM gives them, at both CPLs and block sizes (see `stmxcsr`).
@@ -41,7 +41,7 @@
   page crossing and DF; faults mid-string; interrupts at random times; TF; a data breakpoint; UC memory; writes into
   translated code (see `repbulk`).
 - `cr2` (perf chunk 26): MOV r64, CR2 translated inline at CPL 0 reads CR2 after #PF deliveries (nested too), MOV to CR2, under
-  TF; at CPL 3 it is #GP(0) and the guest-state page holds no CR2 (see `cr2`).
+  TF; at CPL 3 it is #GP(0), as is a guest load from the frame alias (see `cr2`).
 - `verw` (perf P2): VERW m16 translated inline at CPL 0 gives the SDM's ZF for every selector class, form and table change,
   faults as the resident's, and leaves every other flag (see `verw`).
 - `gather` (correctness pass, finding 2): the AVX2 gathers, the resident's element-by-element transaction: every form, width,
@@ -88,7 +88,9 @@ COSTS = {
     'syscall_verw': (None, {}),
 }
 USER_GS, KERNEL_GS, KERNEL_RIP = 0x2a0000, 0x2b0000, 0x200000
-# The guest-state page's alias (abi `GUEST_STATE_VA`, the recorded deviation): IF's byte at +0x3f9, the event-pending byte at +0x406.
+# The noncanonical guest-state alias: guest accesses must #GP; generated frame-relative accesses remain internal.
+# The suite selects a distant alias for these fixed-address GP controls. The actual selected-page
+# hole is exercised by run_frame_randomization.py and the preserved original containment probes.
 GUEST_STATE_VA = 0xffff_4000_0000_1000
 # Linux's entry_SYSCALL_64 and its SYSRET exit, in shape: ENDBR64; SWAPGS; the user RSP saved and the kernel's loaded through
 # GS; ...; SWAPGS; a 7-byte NOP; SYSRETQ.
@@ -119,7 +121,7 @@ def driver(a, text, work, extra=()):
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     t0 = time.perf_counter()
-    run = subprocess.run([a.host, a.runtime, 'run-program', a.fexc, work / 'program.txt', work, '--watchdog-ms', '600000', *map(str, extra)],
+    run = subprocess.run([a.host, a.runtime, 'run-program', a.fexc, work / 'program.txt', work, *vm.frame_alias_args(), '--watchdog-ms', '600000', *map(str, extra)],
                          capture_output=True, text=True, timeout=900)
     dt = time.perf_counter() - t0
     return dt, (json.loads(run.stdout) if run.returncode == 0 else None), run.stderr[-1500:]
@@ -130,6 +132,18 @@ def gprs(values):
     g[4] = STACK
     for r, v in values.items(): g[r] = v
     return 'gpr ' + ' '.join(f'{v:#x}' for v in g)
+
+
+def gp_at(out, rip, regs, cpl, flags=2, cr2=None):
+    """An intercepted #GP must identify the rejected instruction and preserve its inputs."""
+    fault = [int(x, 0) for x in out.get('fault', [])]
+    frame = [int(x, 0) if isinstance(x, str) else x for x in out.get('delivered', {}).get('frame', [])]
+    g = [int(x, 0) for x in out['gpr']]
+    ok = (out.get('frame_intact', False) and out['stop'] == 'guest_fault' and fault == [13, 0, 0, rip] and int(out['rip'], 0) == rip
+          and len(frame) >= 3 and frame[1] & 3 == cpl and frame[2] & ~0x10000 == flags
+          and all(g[r] == value for r, value in regs.items())
+          and (cr2 is None or int(out.get('delivered', {}).get('cr2', '-1'), 0) == cr2))
+    return [] if ok else [f"#GP state: stop {out['stop']} fault {fault} frame {frame} regs {[hex(x) for x in g]} delivered {out.get('delivered')}"]
 
 
 def cost(a, report):
@@ -547,9 +561,9 @@ def swapgs(a, report):
     - `events`: 4,000,000 rounds of a CPL-0 loop `swapgs; inc qword gs:[0]; jmp 2f; 2: swapgs; inc qword gs:[8]` with IF = 1
       and an IDT, under interrupts posted at random times (vector 0x40, whose handler counts it and ends it with an x2APIC EOI): both counts exact, some
       interrupts taken.
-    - `contain`: CPL 3 loads the guest-state page's KERNEL_GS_BASE field (the recorded deviation's alias: it must read 0, not
-      the kernel's value), stores a forged value there, then SYSCALLs; the kernel's SWAPGS must load the real
-      KERNEL_GS_BASE (GS:[0] is B's marker) and RDMSR must read B."""
+    - `contain-syscall`: CPL 3 SYSCALLs; the kernel's SWAPGS loads the real KERNEL_GS_BASE and RDMSR reads B.
+    - `contain-load/store`: CPL-3 accesses to the noncanonical KERNEL_GS_BASE alias #GP(0) at that instruction,
+      preserving the destination, following instruction's sentinel and both banked bases (default and block size 1)."""
     asm, failures, runs = ref.assemble, [], []
     A, B, N = USER_GS, KERNEL_GS, 200000
     markers = f'memory {A:#x} {(0xaaaa).to_bytes(32, "little").hex()}\nmemory {B:#x} {(0xbbbb).to_bytes(32, "little").hex()}\n'
@@ -593,13 +607,20 @@ def swapgs(a, report):
         ['--kick-vcpu', '0', '--kicks', '5000', '--kick-every-us', '5', '--kick-jitter-us', '10', '--kick-events', '0x40'],
         lambda out, g: ([] if out['stop'] == 'reached' and (mem(out, A + 8), mem(out, B)) == (20 * N, 0xbbbb + 20 * N) and mem(out, count) > 100 else
                         [f"stop {out['stop']} {out['reason']} counts {mem(out, A + 8)} {mem(out, B) - 0xbbbb} interrupts {mem(out, count)}"]) + bases(out, A, B))
-    field = 0xffff_4000_0000_1000 + 0xa0
-    contain = syscall_program(f'mov rax, {field:#x}\nmov r10, [rax]\nmov qword ptr [rax], 0x123000\nsyscall',
-                              'mov r13, rcx\nswapgs\nmov r9, gs:[0]\nswapgs\nmov ecx, 0xc0000102\nrdmsr\nshl rdx, 32\nor rax, rdx\nmov r12, rax\nmov rcx, r13\nsysretq',
-                              {}, markers)
-    run('contain', contain, [],
-        lambda out, g: ([] if out['stop'] == 'reached' and (g[10], g[9], g[12]) == (0, 0xbbbb, B) else
-                        [f"stop {out['stop']} {out['reason']} CPL-3 read {g[10]:#x} kernel GS:[0] {g[9]:#x} RDMSR {g[12]:#x}"]) + bases(out, A, B))
+    # Keep the legitimate CPL-3 syscall/SWAPGS path, then independently reject both alias access intents.
+    kernel = ('mov r13, rcx\nswapgs\nmov r9, gs:[0]\nswapgs\nmov ecx, 0xc0000102\nrdmsr\nshl rdx, 32\nor rax, rdx\n'
+              'mov r12, rax\nmov rcx, r13\nsysretq')
+    run('contain-syscall', syscall_program('syscall', kernel, {}, markers), [],
+        lambda out, g: ([] if out['stop'] == 'reached' and (g[9], g[12]) == (0xbbbb, B) else
+                        [f"stop {out['stop']} kernel GS:[0] {g[9]:#x} RDMSR {g[12]:#x}"]) + bases(out, A, B))
+    field = GUEST_STATE_VA + 0xa0
+    for intent, ins in [('load', 'mov r10, [rax]'), ('store', 'mov qword ptr [rax], 0x123000')]:
+        code, lab = asm(wrmsr(0xc0000101, A) + wrmsr(0xc0000102, B)
+                        + f'push 2\npopfq\nsw: nop\nmov rax, {field:#x}\nx: {ins}\ninc r11', labels=True)
+        for block in (None, 1):
+            run(f'contain-{intent}-{block}', f'rip {CODE:#x}\n{gprs({10: 0x12345678, 11: 0x87654321})}\ncode {code.hex()}\n{head}'
+                f'switch {CODE + lab["sw"]:#x} 3\n', [block] if block else [],
+                lambda out, g, rip=CODE + lab['x']: gp_at(out, rip, {0: field, 10: 0x12345678, 11: 0x87654321}, 3) + bases(out, A, B))
     report['swapgs'] = {'runs': runs, 'failures': failures}
     return failures
 
@@ -1004,10 +1025,11 @@ def stifirst(a, report):
     - `mov-ss`: a hook posts 0x40, `mov ss, eax; sti; inc r9; inc r10`: 0x40 after `inc r9`.
     - `tf`: POPFQ sets TF, then `sti; nop; nop; pushfq; and; popfq` (clearing it): #DB traps after each of the six (each
       instruction stepped alone, compiled without `--cpl0`: the STI decoded).
-    - `forge-pending`: 1,000 rounds of a CPL-0 store of 1 into the event-pending byte (the guest-state alias) then `jmp x;
-      x: sti; inc r9; cli`: every round completes (the STI's exit to its own block is never linked to itself).
-    - `cpl3-forge` (default size): CPL 3 stores 1 into the event-pending byte and 0 into IF's, a hook posts 0x40 (taken at
-      CPL 3 at once), SYSCALL into `sti; pushfq; pop r12; cli; sysretq`: IF = 1 after the kernel's STI and back at CPL 3.
+    - `forge-pending`: 1,000 CPL-0 stores to the event-pending alias each #GP(0). The handler validates RIP, CS, error and
+      pre-fault flags, skips the rejected store, and returns to `jmp x; x: sti; inc r9; cli`: every round completes.
+    - `cpl3-forge` (default size): both CPL-3 stores (pending=1, IF=0) #GP(0) and are skipped by the same checked handler;
+      a hook then posts 0x40 (taken at CPL 3 at once), followed by SYSCALL into `sti; pushfq; pop r12; cli; sysretq`:
+      IF = 1 after the kernel's STI and back at CPL 3. Rejected stores cannot forge pending state or clear IF.
     - `kicks-jmp`, `kicks-ret`, `kicks-movss` (default size): 4,000,000 rounds `cli; inc [W1]; X; sti; inc [W2]` with X a
       `jmp` to the STI, a `call` to a `ret` returning to it, or `mov eax, ss; mov ss, eax`, under 0x40 and NMIs posted at
       random times: 0x40 never with IF = 0 nor right after the STI, an NMI never right after the STI (nor at it after MOV
@@ -1018,7 +1040,7 @@ def stifirst(a, report):
     TABLES, IDTR = 0x300000, 0x300800
     SLOT = {1: 0x300900, 2: 0x300980, 0x40: 0x3009c0}
     BAD, FORBID, FORBIDN, W1, W2 = 0x300a00, 0x300a40, 0x300a60, 0x300a80, 0x300a88
-    PEND, IFB = GUEST_STATE_VA + 0x406, GUEST_STATE_VA + 0x3f9
+    PEND, IFB, GPLOG = GUEST_STATE_VA + 0x406, GUEST_STATE_VA + 0x3f9, 0x300b00
     def handler(v):
         s = SLOT[v]
         if v == 1:
@@ -1032,11 +1054,20 @@ def stifirst(a, report):
         eoi = 'push rcx\npush rdx\nmov ecx, 0x80b\nxor eax, eax\nxor edx, edx\nwrmsr\npop rdx\npop rcx\n' if v == 0x40 else ''
         return f'h{v}:\npush rax\ninc qword ptr [{s:#x}]\ncmp qword ptr [{s:#x}], 1\njne 2f\n{first}2:\n{checks}{eoi}pop rax\niretq\n'
     setup = (f'lidt [{IDTR:#x}]\nmov ecx, 0x1b\nmov eax, 0xfee00d00\nxor edx, edx\nwrmsr\nmov ecx, 0x80f\nmov eax, 0x1ff\nwrmsr\n')
-    def run(name, body, want, block=None, posts=(), forbid=(), forbidn=(), extra=(), user=None, check=None, decoded=False):
-        code, lab = asm(setup + (user or '') + body + '\njmp done\n' + ''.join(handler(v) for v in SLOT) + 'done:', labels=True)
+    def run(name, body, want, block=None, posts=(), forbid=(), forbidn=(), extra=(), user=None, check=None, decoded=False, gp=()):
+        # Only these alias stores are recoverable: validate every frame before changing its return RIP.
+        h13 = ''
+        if gp:
+            h13 = (f'h13: push rax\ncmp qword ptr [rsp + 8], 0\njne gp_bad\ncmp qword ptr [rsp + 24], {0x23 if user else 8}\njne gp_bad\n'
+                   'mov rax, [rsp + 32]\nand rax, -0x10001\ncmp rax, r14\njne gp_bad\n')
+            for i, (fault, resume, count) in enumerate(gp):
+                h13 += (f'lea rax, [rip + {fault}]\ncmp rax, [rsp + 16]\njne gp_next{i}\ninc qword ptr [{GPLOG + 8 * i:#x}]\n'
+                        f'lea rax, [rip + {resume}]\nmov [rsp + 16], rax\npop rax\nadd rsp, 8\niretq\ngp_next{i}:\n')
+            h13 += f'gp_bad: inc qword ptr [{BAD:#x}]\npop rax\njmp done\n'
+        code, lab = asm(setup + (user or '') + body + '\njmp done\n' + ''.join(handler(v) for v in SLOT) + h13 + 'done:', labels=True)
         at = lambda l: CODE + lab[l]
         gates = bytearray(16 * 0x41)
-        for v in SLOT:
+        for v in (*SLOT, *((13,) if gp else ())):
             h = at(f'h{v}')
             # IST 1 only where an event may come from CPL 3 (the driver's TSS); else none, so an NMI may nest in the 0x40 handler.
             gates[16 * v:16 * v + 16] = ((h & 0xffff | 0x08 << 16 | (1 if user else 0) << 32 | 0x8e << 40 | (h >> 16 & 0xffff) << 48).to_bytes(8, 'little')
@@ -1044,7 +1075,7 @@ def stifirst(a, report):
         tables = bytes(gates) + bytes(IDTR - TABLES - len(gates)) + (0x41 * 16 - 1).to_bytes(2, 'little') + TABLES.to_bytes(8, 'little')
         tables += bytes(FORBID - TABLES - len(tables)) + b''.join(at(l).to_bytes(8, 'little') for l in forbid) + bytes(8 * (4 - len(forbid)))
         tables += bytes(FORBIDN - TABLES - len(tables)) + b''.join(at(l).to_bytes(8, 'little') for l in forbidn) + bytes(8 * (4 - len(forbidn)))
-        tables += bytes(W2 + 8 - TABLES - len(tables))
+        tables += bytes(max(W2 + 8, GPLOG + 8 * len(gp) if gp else 0) - TABLES - len(tables))
         text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nif 0\nsvr 0x1ff\nmemory {TABLES:#x} {tables.hex()}\n'
                 f'region 0x3e0000 0x10000\n' + ''.join(f'{"nmi" if v == 2 else "post"} {at(l):#x}{"" if v == 2 else f" {v:#x}"}\n' for l, v in posts))
         tag = f'{name}-{block}'
@@ -1078,11 +1109,16 @@ def stifirst(a, report):
                     problems.append(f'vector {v:#x} delivered {mem(SLOT[v])} times')
             if mem(BAD):
                 problems.append(f'{mem(BAD)} deliveries at a forbidden boundary or with IF = 0')
+            if gp and not out.get('frame_intact', False): problems.append('frame sentinel changed')
+            for i, (fault, resume, count) in enumerate(gp):
+                if mem(GPLOG + 8 * i) != count:
+                    problems.append(f'#GP at {fault}: {mem(GPLOG + 8 * i)} deliveries, want {count}')
             if check: problems += check(g, mem)
             if not block and not decoded and out['stats']['decodes'].get('0x41'):
                 problems.append(f"STI decoded {out['stats']['decodes']['0x41']} times: not translated")
         taken = {f'{v:#x}': mem(SLOT[v]) for v in SLOT} if out else {}
-        runs.append({'case': tag, 'ok': not problems, 'problems': problems, 'taken': taken})
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems, 'taken': taken,
+                     **({'gp': {fault: mem(GPLOG + 8 * i) for i, (fault, _, _) in enumerate(gp)}} if out and gp else {})})
         print(json.dumps(runs[-1]), flush=True)
         if problems: failures.append(f'stifirst {tag}: {problems}')
     shadow = 'x: sti\na: inc r9\nb: inc r10\n'
@@ -1096,16 +1132,18 @@ def stifirst(a, report):
         run('mov-ss', 'mov eax, ss\nhk: nop\nmov ss, eax\n' + shadow, {0x40: after}, block, [('hk', 0x40)], ['x', 'a'])
         run('tf', 'pushfq\nor qword ptr [rsp], 0x100\npopfq\nx: sti\na: nop\nb: nop\nc: pushfq\nd: and qword ptr [rsp], -0x101\ne: popfq\nf: nop\n',
             {1: ['a', 'b', 'c', 'd', 'e', 'f']}, block, decoded=True)
-        run('forge-pending', f'mov r8, 1000\nmov rbx, {PEND:#x}\nlp: mov byte ptr [rbx], 1\njmp x\nx: sti\na: inc r9\ncli\ndec r8\njnz lp\n', {}, block,
-            check=lambda g, mem: [] if g[9] == 1000 else [f'r9 {g[9]}, want 1000'])
-    # CPL 3 forges both bytes, then SYSCALL into a kernel side that starts with STI (STAR: SYSCALL CS 0x08, SYSRET CS 0x23).
+        run('forge-pending', f'mov r8, 1000\nmov rbx, {PEND:#x}\nlp: pushfq\npop r14\nforge: mov byte ptr [rbx], 1\nresume: jmp x\nx: sti\na: inc r9\ncli\ndec r8\njnz lp\n', {}, block,
+            check=lambda g, mem: [] if (g[8], g[9], g[3]) == (0, 1000, PEND) else [f'r8 {g[8]} r9 {g[9]} rbx {g[3]:#x}'],
+            gp=[('forge', 'resume', 1000)])
+    # CPL 3 attempts both stores (each rejected and skipped), then SYSCALL into a kernel side that starts with STI (STAR: SYSCALL CS 0x08, SYSRET CS 0x23).
     sysc = ('mov ecx, 0xc0000080\nrdmsr\nor eax, 1\nwrmsr\n' + wrmsr(0xc0000081, 0x10 << 48 | 0x08 << 32) + 'lea rax, [rip + x]\nmov rdx, rax\nshr rdx, 32\n'
             'mov ecx, 0xc0000082\nwrmsr\n' + wrmsr(0xc0000084, 0x47700) + 'lea rcx, [rip + user]\nmov r11d, 0x202\nsysretq\n'
-            f'user:\nmov rax, {PEND:#x}\nmov byte ptr [rax], 1\nmov rax, {IFB:#x}\nmov byte ptr [rax], 0\nhk: nop\nu1: syscall\npushfq\npop r13\njmp done\n'
+            f'user:\nmov rax, {PEND:#x}\npushfq\npop r14\nforge_pending: mov byte ptr [rax], 1\nresume_pending: mov rax, {IFB:#x}\npushfq\npop r14\nforge_if: mov byte ptr [rax], 0\nhk: nop\nu1: syscall\npushfq\npop r13\njmp done\n'
             'x: sti\npushfq\npop r12\ncli\nsysretq\n')
     run('cpl3-forge', '', {0x40: lambda c, rip, cs, rf, r9, r10: [] if (c, cs) == (1, 0x23) and rf & 0x200 else [f'0x40: count {c} CS {cs:#x} RFLAGS {rf:#x}']},
         None, [('hk', 0x40)], user=sysc,
-        check=lambda g, mem: [] if g[12] & 0x200 and g[13] & 0x200 else [f'r12 {g[12]:#x} r13 {g[13]:#x}: IF lost'])
+        check=lambda g, mem: [] if g[12] & 0x200 and g[13] & 0x200 else [f'r12 {g[12]:#x} r13 {g[13]:#x}: IF lost'],
+        gp=[('forge_pending', 'resume_pending', 1), ('forge_if', 'hk', 1)])
     # Review: SYSCALL's fast path into a kernel side that starts with STI, with 0x40 held (posted at CPL 3 with IF = 0, which
     # the SYSRET's R11 left; FMASK clears IF anyway), the SYSCALL a literal exit of the block after the hook (so the fast
     # path runs it): the fast path enters the kernel's block directly, its STI exits to its own start and the resident runs
@@ -1567,8 +1605,8 @@ def cr2(a, report):
       CR2 again: the outer fault's address, then the inner's.
     - `mov-to-cr2`: MOV to CR2 of a value, then MOV r64, CR2 (in the next block, and after a JMP in a later one): that value.
     - `tf`: under TF, MOV r64, CR2 (stepped, the resident's): the value, #DB after it.
-    - `cpl3`: a CPL-0 MOV to CR2, a switch to CPL 3, the guest-state page's CR2 field (the alias, readable there) read as 0,
-      then MOV r64, CR2: #GP(0) at it.
+    - `cpl3`, `cpl3-alias`: after a CPL-0 MOV to CR2 and switch to CPL 3, MOV r64, CR2 and a load of its noncanonical
+      frame alias independently #GP(0), leaving CR2, destination and the following instruction's sentinel unchanged.
     - `mod-cpl3`, `mod-cpl0` (review): MOV r64, CRn with mod other than 11 as a page's last three bytes, the next page not
       mapped (the hardware ignores mod): #GP(0) at it at CPL 3; MOV RBP, CR2 then a fetch #PF at the next page at CPL 0.
     - `cr3` (review): MOV r64, CR3 at CPL 0 reads CR3, not CR2.
@@ -1622,16 +1660,16 @@ def cr2(a, report):
         text, lab = program('mov rax, 0xfedc000\nmov cr2, rax\npushfq\nor qword ptr [rsp], 0x100\npopfq\nmov rbx, cr2\npushfq\nand qword ptr [rsp], -0x101\npopfq\n'
                             'mov [0x300900], rbx', h1 + h14)
         go('tf', text, 3, [0xfedc000, 0, 4])   # #DB after the MOV, the PUSHFQ, the AND, the POPFQ (TF cleared by it)
-        # CPL 3: the alias's CR2 field reads 0, then MOV r64, CR2 is #GP(0).
-        code, lab = asm(f'mov rax, 0xabc000\nmov cr2, rax\nsw: nop\nmov rdx, {GUEST_STATE_VA + 0xa8:#x}\nmov rbx, qword ptr [rdx]\nx: mov rcx, cr2\nnop', labels=True)
-        text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({})}\ncode {code.hex()}\ncpl 0\nswitch {CODE + lab["sw"]:#x} 3\nregion 0x3e0000 0x10000\n')
-        _, out, err = driver(a, text, a.out / 'cr2' / f'cpl3-{block}', extra)
-        problems = [f'driver: {err}'] if not out else []
-        if out:
-            g = [int(x, 0) for x in out['gpr']]
-            if out['stop'] != 'guest_fault' or int(out['fault'][0], 0) != 13 or int(out['rip'], 0) != CODE + lab['x'] or g[3] != 0 or g[1] != 0:
-                problems.append(f"stop {out['stop']} {out.get('reason')} fault {out.get('fault')} rip {out.get('rip')} rbx {g[3]:#x} rcx {g[1]:#x}")
-        record(f'cpl3-{block}', problems)
+        # Test alias isolation and the real MOV CR2 privilege check separately; neither may hide the other.
+        for name, ins, addr in [('cpl3-alias', 'mov rbx, qword ptr [rdx]', GUEST_STATE_VA + 0xa8),
+                                ('cpl3', 'mov rcx, cr2', 0)]:
+            code, lab = asm(f'mov rax, 0xabc000\nmov cr2, rax\nsw: nop\nmov rdx, {addr:#x}\nx: {ins}\ninc r11', labels=True)
+            text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({3: 0x12345678, 1: 0x87654321, 11: 0xabcdef})}\ncode {code.hex()}\ncpl 0\nif 0\n'
+                    f'switch {CODE + lab["sw"]:#x} 3\nregion 0x3e0000 0x10000\n')
+            _, out, err = driver(a, text, a.out / 'cr2' / f'{name}-{block}', extra)
+            problems = [f'driver: {err}'] if not out else gp_at(out, CODE + lab['x'],
+                {0: 0xabc000, 2: addr, 3: 0x12345678, 1: 0x87654321, 11: 0xabcdef}, 3, cr2=0xabc000)
+            record(f'{name}-{block}', problems)
     # Review: MOV r64, CRn with mod other than 11 (the hardware ignores mod: three bytes) as the last bytes of a page whose
     # successor is not mapped: at CPL 3 #GP(0) at it (not a fetch #PF); at CPL 0 `0f 20 15` is MOV RBP, CR2, then the fetch of
     # the next page faults. And MOV r64, CR3 at CPL 0 reads CR3 (never CR2).
@@ -1873,10 +1911,8 @@ def verw(a, report):
                     problems.append(f"stop {out['stop']} {out['reason']} fault {out.get('fault')} al {out['gpr'][0]}")
             record(f'{name}-{block}', problems)
 
-    # cpl3: the driver's GDT (0x10 DPL-0 data, 0x18 DPL-3 data); the alias's VERW fields at CPL 0, then at CPL 3.
-    FB, FL = GUEST_STATE_VA + 0x4a0, GUEST_STATE_VA + 0x4a8
-    code, lab = asm(f'mov rax, {FB:#x}\nmov r12, [rax]\nmov rax, {FL:#x}\nmov r13, [rax]\nsgdt [{RES + 0x40:#x}]\nsw: nop\n'
-                    f'mov rax, {FB:#x}\nmov r14, [rax]\nmov rax, {FL:#x}\nmov r15, [rax]\nmov rbx, {SLOT:#x}\n'
+    # Keep the legitimate CPL-3 VERW checks independent of rejected accesses to its internal frame fields.
+    code, lab = asm(f'sw: nop\nmov rbx, {SLOT:#x}\n'
                     + ''.join(f'mov word ptr [rbx], {s_:#x}\njmp c{i}\nc{i}: nop\nverw word ptr [rbx]\nsetz byte ptr [{RES + i:#x}]\n' for i, s_ in enumerate((0x10, 0x13, 0x18, 0x1b, 0x20)))
                     + 'nop', labels=True)
     for block in (None, 1):
@@ -1884,12 +1920,21 @@ def verw(a, report):
         _, out, err = driver(a, text, a.out / 'verw' / f'cpl3-{block}', [block] if block else [])
         problems = [f'driver: {err}'] if not out else []
         if out:
-            g = [int(x, 0) for x in out['gpr']]
             got = [mem(out, RES + i, 1) for i in range(5)]
-            base, limit = mem(out, RES + 0x42), mem(out, RES + 0x40, 2)
-            if out['stop'] != 'reached' or got != [0, 0, 1, 1, 0] or (g[12], g[13]) != (base, limit - 7) or (g[14], g[15]) != (0, 0):
-                problems.append(f"stop {out['stop']} {out['reason']} answers {got} CPL-0 fields {g[12]:#x} {g[13]:#x} (GDTR {base:#x} {limit:#x}) CPL-3 {g[14]:#x} {g[15]:#x}")
+            if out['stop'] != 'reached' or got != [0, 0, 1, 1, 0]:
+                problems.append(f"stop {out['stop']} {out['reason']} answers {got}")
         record(f'cpl3-{block}', problems)
+        for cpl in (0, 3):
+            for field, offset in [('base', 0x4a0), ('limit', 0x4a8)]:
+                addr = GUEST_STATE_VA + offset
+                alias, labels = asm(f'mov rax, {addr:#x}\nx: mov r12, [rax]\ninc r13', labels=True)
+                text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({12: 0x12345678, 13: 0x87654321})}\ncode {alias.hex()}\ncpl {cpl}\nif 0\n'
+                        f'{space({})}region 0x3e0000 0x10000\n')
+                tag = f'frame-{field}-cpl{cpl}-{block}'
+                _, out, err = driver(a, text, a.out / 'verw' / tag, [block] if block else [])
+                problems = [f'driver: {err}'] if not out else gp_at(out, CODE + labels['x'], {0: addr, 12: 0x12345678, 13: 0x87654321}, cpl)
+                if out and mem(out, RES) != 0: problems.append('frame access changed result memory')
+                record(tag, problems)
 
     # watch: DR0 on the descriptor (8 bytes, read/write), then DR1 on the operand (2 bytes); a #DB handler counts.
     TB, IDTR_ = 0x306000, 0x306800

@@ -12,7 +12,10 @@ TSS available/busy, C = call gate), "TSS Descriptor in 64-bit Mode" and "LDT" (1
 
 Scope: IA-32e mode, CS a 64-bit code segment (L = 1, D = 0). Compatibility mode is not built (natemu's owner decision 3):
 a far transfer or return whose target CS is not a 64-bit code segment (L = 0, or L = D = 1) is `refused`, after the
-descriptor checks the SDM makes before the mode matters; so is a 64-bit call gate (not built). An IRET loading TF is
+descriptor checks the SDM makes before the mode matters; so is a 64-bit call gate (not built). Owner decision of November 6:
+where the code would run at CPL 3 (JMP/CALL far at CPL 3, RET far/IRET to RPL 3; a call gate at CPL 3) it is instead
+natemu's recorded deviation, #GP(selector) with nothing changed (a `Deviation` fault: the result's `deviation` is True;
+x86 would run the code, so no x86 reference applies). An IRET loading TF is
 done (its single-step trap after the next instruction is natemu's S4). Paging is delivery_model's abstraction (`memory`: page number -> {'data', 'write',
 'user'}); descriptor-table and TSS-descriptor accesses are implicit supervisor accesses (CPL 0 rights, U/S = 0 in a #PF),
 operand and stack accesses are made at the CPL.
@@ -60,6 +63,14 @@ SREGS = ('es', 'cs', 'ss', 'ds', 'fs', 'gs')
 
 class Refused(Exception):
     pass
+
+
+class Deviation(Fault):
+    """natemu's recorded deviation where x86 would run compatibility-mode code at CPL 3: #GP(selector). `rip`: where it is
+    raised when not at the instruction (SYSRET/SYSEXIT to compatibility mode: at the target, syscall_model)."""
+    def __init__(self, vector, error, rip=None):
+        super().__init__(vector, error)
+        self.rip = rip
 
 
 def attributes(raw):
@@ -138,7 +149,8 @@ def _run(state, body):
     except Fault as f:
         fault = (f.vector, f.error, f.cr2 or 0)
         return dict(outcome='fault', state=copy.deepcopy(state), diff={}, fault=fault, reason=None,
-                    permitted=frozenset({('fault', fault)}) | getattr(f, 'permitted', frozenset()))
+                    permitted=frozenset({('fault', fault)}) | getattr(f, 'permitted', frozenset()),
+                    deviation=isinstance(f, Deviation), fault_rip=getattr(f, 'rip', None))
     except Refused as r:
         return dict(outcome='refused', state=copy.deepcopy(state), diff={}, fault=None, reason=str(r),
                     permitted=frozenset({('refused', None)}))
@@ -237,9 +249,12 @@ def load(state, sreg, sel):
     return _run(state, lambda s, bus: _load(s, bus, sreg, sel))
 
 
-def _refuse_compatibility(raw):
+def _refuse_compatibility(raw, sel, cpl):
+    """`cpl`: the CPL the target code would run at."""
     _, _, _, _, l, d = fields(raw)
     if not l or d:
+        if cpl == 3:
+            raise Deviation(GP, sel & 0xFFFC)
         raise Refused('compatibility-mode code segment')
 
 
@@ -254,12 +269,14 @@ def far(state, kind, addr, width=8, stack=False):
         st, t, dpl, p, l, d = fields(raw)
         cpl = s['cpl']
         if not st and t == 0xC:
+            if cpl == 3:
+                raise Deviation(GP, sel & 0xFFFC)
             raise Refused('call gate')
         if not st or not t & 8 or ((dpl > cpl) if t & 4 else (sel & 3 > cpl or dpl != cpl)) or (l and d):
             raise _gp(sel)
         if not p:
             raise _np(sel)
-        _refuse_compatibility(raw)
+        _refuse_compatibility(raw, sel, cpl)
         rsp = s['rsp'] - (2 * width if kind == 'call' else 0)
         if kind == 'call' and not (canonical(rsp) and canonical(s['rsp'] - 1)):
             raise Fault(SS, 0)
@@ -295,7 +312,7 @@ def ret(state, width=8, release=0, iret=False):
             raise _gp(sel)
         if not p:
             raise _np(sel)
-        _refuse_compatibility(raw)
+        _refuse_compatibility(raw, sel, rpl)
         if iret and not canonical(rip):
             raise Fault(GP, 0)                                     # B4: IRETQ checks RIP before SS
         outer = rpl > cpl

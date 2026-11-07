@@ -62,8 +62,9 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   case 0x8F: return has_modrm && reg == 0 ? Allow() : Ud("8f /1../7: XOP (not advertised) or reserved (#UD)");
   case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3:
     if (!has_modrm || reg == 6) return Uns("shift group /6 alias");
-    // FEX branches around the whole access for a static or dynamic zero count of rcl/rcr, losing a guest #PF.
-    if ((reg == 2 || reg == 3) && mod != 3) return Uns("rcl/rcr with a memory operand (FEX skips the access for a zero count)");
+    // The resident completes CL/zero-count memory carry rotates: FEX branches over their memory access at count zero.
+    // Static nonzero forms stay native.
+    if ((reg == 2 || reg == 3) && mod != 3 && (op == 0xD2 || op == 0xD3)) return Sys("memory rcl/rcr with CL: resident completion");
     return Allow();
   // Group 11 /1../6 is reserved; /7 is XABORT (c6 f8 ib) / XBEGIN (c7 f8 rel), #UD with CPUID.7.0:EBX.RTM[11] = 0 (I10).
   case 0xC6: case 0xC7: return has_modrm && reg == 0 ? Allow() : Ud("group 11 other than mov: RTM xabort/xbegin (not advertised) or reserved (#UD)");
@@ -127,7 +128,7 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   if (!plain) return Uns("mandatory-prefix (F3/F2/66) overlay opcode");
   switch (op) {
   case 0x1F: return Allow();                                        // multi-byte nop
-  case 0xA4: case 0xA5: case 0xAC: case 0xAD: return Allow();       // shld/shrd (16-bit refused below)
+  case 0xA4: case 0xA5: case 0xAC: case 0xAD: return Allow();       // shld/shrd (16-bit policy below)
   case 0xB0: case 0xB1: case 0xC0: case 0xC1: return Allow();       // cmpxchg/xadd, with or without LOCK (I3)
   // cmpxchg8b/16b (I3): FEX's caspal with or without LOCK (an unlocked one is atomic too, which x86 allows); the other
   // group-9 forms (rdrand, rdseed, rdpid, vmptrld...) are not admitted.
@@ -216,7 +217,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   // A form x86 defines but I8 refuses: its own row first, so an encoding x86 makes #UD stays an encoding refusal (never a
   // gated #UD/#NM); `refuse` is returned (avx set, so a valid encoding is gated first) only after the encoding checks.
   const char* refuse = nullptr;
-  bool mxcsr = false, gather = false;
+  bool mxcsr = false, gather = false, masked = false;
   uint16_t r = NONE;
   if (map == 1 && pp == 0) {
     if (in(op, {0x10, 0x11, 0x51, 0x52, 0x53, 0x5a, 0x5b})) r = LL | NOV;
@@ -241,7 +242,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
     else if (op == 0xc5) r = L0 | NOV | REG;
     else if (op == 0x71 || op == 0x72 || op == 0x73) {                          // shifts by imm8: VEX.vvvv is the destination
       if (has_modrm && mod == 3 && (reg == 2 || reg == 6 || (op != 0x73 && reg == 4) || (op == 0x73 && (reg == 3 || reg == 7)))) r = LL;
-    } else if (op == 0xf7) { r = L0 | NOV | REG; refuse = "vmaskmovdqu: a byte-masked store (FEX stores all 16 bytes)"; }
+    } else if (op == 0xf7) { r = L0 | NOV | REG; masked = true; }                 // vmaskmovdqu
     else if (in(op, {0x14, 0x15, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0x74, 0x75, 0x76, 0x7c, 0x7d, 0xc2, 0xc6, 0xd0}) ||
              (op >= 0x60 && op <= 0x6d) || (op >= 0xd1 && op <= 0xd5) || (op >= 0xd8 && op <= 0xe5) || (op >= 0xe8 && op <= 0xef) ||
              (op >= 0xf1 && op <= 0xf6) || (op >= 0xf8 && op <= 0xfe))
@@ -270,10 +271,8 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
     else if (op == 0x41) r = L0 | NOV;                                           // vphminposuw
     else if (in(op, {0x96, 0x97, 0x98, 0x9a, 0x9c, 0x9e, 0xa6, 0xa7, 0xa8, 0xaa, 0xac, 0xae, 0xb6, 0xb7, 0xb8, 0xba, 0xbc, 0xbe})) r = LL;
     else if (in(op, {0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf})) r = L0;   // FMA scalar
-    else if (in(op, {0x2c, 0x2d, 0x2e, 0x2f, 0x8c, 0x8e})) {
-      r = LL | MEM | (op <= 0x2f ? W0 : 0);
-      refuse = "vmaskmovps/pd, vpmaskmovd/q: FEX's masked load and store are element loops (branches over accesses)";
-    } else if (op >= 0x90 && op <= 0x93) { r = LL | MEM; gather = true; }      // vpgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd
+    else if (in(op, {0x2c, 0x2d, 0x2e, 0x2f, 0x8c, 0x8e})) { r = LL | MEM | (op <= 0x2f ? W0 : 0); masked = true; }   // vmaskmovps/pd, vpmaskmovd/q
+    else if (op >= 0x90 && op <= 0x93) { r = LL | MEM; gather = true; }      // vpgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd
     else if (op == 0xdb) r = L0 | NOV;                                           // vaesimc (I9)
     else if (op >= 0xdc && op <= 0xdf) r = L0;                                   // vaesenc/last, vaesdec/last (I9; VAES's L1 not advertised)
   } else if (map == 3 && pp == 1) {
@@ -292,21 +291,25 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   }
   // I10: the encodings x86 makes #UD are delivered (`Ud`, before any gating: decode faults come first, SDM Vol.3 Table 6-2):
   // a VEX form the four advertised features do not define (AVX-VNNI, VAES/VPCLMULQDQ ymm, GFNI, AVX-512 mask forms, AMX...),
-  // reserved VEX.L, VEX.W, VEX.vvvv or operand kind. Scalar LIG forms with VEX.L = 1 stay refused (policy: hardware ignores L).
+  // reserved VEX.L, VEX.W, VEX.vvvv or operand kind. No-stop change: a scalar LIG form with VEX.L = 1 runs as with L = 0
+  // (SDM "LIG": VEX.L is ignored; the reference AMD machine gives the same results, natemu-raw/nostop-20261106-01/probe),
+  // FEX's tables ignoring L for every one (FLAGS_VEX_L_IGNORE; VROUNDSS/SD since FEX `natemu-nostop` 20ff20257).
   if (r == NONE) return Ud("VEX form the advertised AVX/AVX2/FMA/F16C/BMI1/BMI2/AES/PCLMULQDQ do not define (#UD)");
   if (!(r & (L ? L1 : L0))) {
     const bool lig = L && in(op, {0x10, 0x11, 0x2a, 0x2c, 0x2d, 0x2e, 0x2f, 0x51, 0x52, 0x53, 0x58, 0x59, 0x5a, 0x5c, 0x5d, 0x5e, 0x5f, 0xc2}) &&
                      map == 1 && (pp >= 2 || ((op == 0x2e || op == 0x2f) && pp <= 1));
     const bool fma_scalar = L && map == 2 && pp == 1 && in(op, {0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf});
     const bool rmwlig = L && map == 3 && pp == 1 && (op == 0x0a || op == 0x0b);   // vroundss/sd: LIG
-    if (lig || fma_scalar || rmwlig) return Uns("VEX.L = 1 on a scalar LIG form (hardware ignores VEX.L: refused by policy)");
-    return Ud(L ? "VEX.L = 1 on a 128-bit-only form (#UD)" : "VEX.L = 0 on a 256-bit-only form (#UD)");
+    if (!(lig || fma_scalar || rmwlig)) return Ud(L ? "VEX.L = 1 on a 128-bit-only form (#UD)" : "VEX.L = 0 on a 256-bit-only form (#UD)");
   }
   if (((r & W0) && W) || ((r & W1) && !W)) return Ud("VEX.W the form does not define (#UD)");
   if ((r & NOV) && vvvv != 0) return Ud("VEX.vvvv not 1111b on a form without a VEX.vvvv operand (#UD)");
   if (op == 0x77 && map == 1) { Verdict v = Allow(); v.avx = true; return v; }
   if (!has_modrm || ((r & MEM) && mod == 3) || ((r & REG) && mod != 3)) return Ud("AVX form with an operand x86 makes #UD");
   if (refuse) { Verdict v = Uns(refuse); v.avx = true; return v; }
+  // The masked moves: the resident's transaction, element by element with no access to a masked-off element (the host's
+  // `system::MASKMOV`); AVX-gated first. FEX's (element loops of branches over accesses, or a whole 16-byte store) is not used.
+  if (masked) { Verdict v = Sys("vmaskmovps/pd, vpmaskmovd/q, vmaskmovdqu: the resident's masked move"); v.avx = true; return v; }
   // The AVX2 gathers: the resident's transaction, element by element with the SDM's partial progress at a fault (the host's
   // `system::GATHER`); AVX-gated first. FEX's gather (an element loop with no per-element site and no partial mask) is not used.
   if (gather) { Verdict v = Sys("vgather*/vpgather*: the resident's element-by-element gather"); v.avx = true; return v; }
@@ -327,7 +330,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
 // EMMS empties the tags. Memory operands are m64, m32 for PUNPCKL* (patch 0024: FEX loaded 8 bytes) and MOVD, m16 for PINSRW;
 // no alignment check. `mmx`: gated by CR0.EM (#UD) and CR0.TS (#NM) only (SDM Vol.3 Table 12-1; Vol.2 MMX instructions'
 // exception tables), cut under the host's `--x87-gated`; the forms with an XMM operand (CVTPI2PS/PD, CVT(T)PS2PI, CVT(T)PD2PI,
-// MOVQ2DQ, MOVDQ2Q) are SSE/SSE2 instructions with SSE's gating (`simd`). Refused: MASKMOVQ (a byte-masked store), the shift
+// MOVQ2DQ, MOVDQ2Q) are SSE/SSE2 instructions with SSE's gating (`simd`). MASKMOVQ uses the resident masked-store engine. Refused: the shift
 // groups' encodings x86 makes #UD, 3DNow! (not advertised). Returns {UNSUPPORTED, .., nullptr} for an opcode that is no MMX form.
 inline Verdict Mmx(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   const Verdict none {UNSUPPORTED, false, nullptr};
@@ -343,9 +346,10 @@ inline Verdict Mmx(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
     else if (op >= 0x71 && op <= 0x73) {                                        // psrl/psra/psll mm, imm8 (0f 73: /2 and /6 only)
       if (!(has_modrm && mod == 3 && (reg == 2 || reg == 6 || (op != 0x73 && reg == 4)))) return Ud("MMX shift group encoding x86 makes #UD");
       pure = reg_only = true;
-    } else if (op == 0xf7) {   // refused, but gated first (#UD/#NM come before anything else: I8's rule)
-      Verdict v = Uns("maskmovq: a byte-masked store (FEX stores all 8 bytes)");
-      v.mmx = true;
+    } else if (op == 0xf7) {
+      if (!has_modrm || mod != 3) return Ud("MASKMOVQ requires two MMX registers");
+      Verdict v = Sys("maskmovq: resident masked store");
+      v.mmx = v.mmreg = true;
       return v;
     }
     else if (in(op, {0x2a, 0x2c, 0x2d})) mixed = true;                          // cvtpi2ps, cvttps2pi, cvtps2pi (SSE)
@@ -422,7 +426,13 @@ inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
     form = M128;   // SHA1NEXTE/MSG1/MSG2, SHA256RNDS2/MSG1/MSG2, SHA1RNDS4 (CPUID.7.0:EBX.SHA[29]; class 4, aligned): Arm SHA1*/SHA256*
   }
   if (form == NO) {
-    if (map == 1 && pfx == 0x66 && op == 0xf7) return Uns("maskmovdqu: FEX stores all 16 bytes (a masked store needs its own lowering)");
+    // MASKMOVDQU (register operands; a memory operand is #UD): the resident's masked store (the host's `system::MASKMOV`),
+    // SSE-gated first (#UD/#NM: the gated cut).
+    if (map == 1 && pfx == 0x66 && op == 0xf7) {
+      if (!has_modrm || mod != 3) return Ud("maskmovdqu with a memory operand (#UD)");
+      if (fexc_sse_gated) { Verdict v = Sys("SSE gated by CR0.EM/TS or CR4.OSFXSR (#UD/#NM)"); v.simd = true; return v; }
+      return Sys("maskmovdqu: the resident's masked store");
+    }
     if ((map == 5 || map == 6) && pfx == 0) return Ud("0f 38 / 0f 3a form without a prefix that is no MMX form: none advertised (#UD)");
     return none;
   }
@@ -599,9 +609,6 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
       v = Uns("SSE form with several mandatory prefixes (66 with F2/F3, or F2 with F3)");
     else if (v.kind == ALLOW && map == 1 && fexpfx != pfx && !(op >= 0x71 && op <= 0x73))
       v = Uns("SSE form FEX decoded under another mandatory prefix");
-    // INSERTPS m32 whose zero mask clears the inserted element: FEX drops the load, and with it the access's #PF.
-    else if (v.kind == ALLOW && map == 6 && op == 0x21 && mod != 3 && (b[d.InstSize - 1] & 0xF) & (1 << (b[d.InstSize - 1] >> 4 & 3)))
-      v = Uns("insertps m32 whose zero mask clears the inserted element (FEX drops the load and its #PF)");
     // LDMXCSR m32 (0f ae /2): MXCSR is the resident's (its gating, #GP for reserved bits, the new controls re-key the code).
     if (d.FexcMap == FEXC_MAP_TWO && op == 0xAE && has_modrm && mod != 3 && reg == 2) return Sys("ldmxcsr");
     // Perf chunk 25: STMXCSR m32 (0f ae /3, no 66/F2/F3) is translated (FEX's STMXCSR under slice1: `FexcMxcsr`, the value the
@@ -701,16 +708,10 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // X2: BT/BTS/BTR/BTC m, r and m, imm8 (0f a3/ab/b3/bb, 0f ba /4../7) under alignment checking (the host's --alignment-gated):
   // the resident checks the operand-size alignment (#AC), then steps the instruction compiled without this flag.
   // (The form first: fexc_alignment_gated is read only for the forms it gates; see FexcArg.)
-  if ((f & DecodeFlags::FLAG_ADDRESS_SIZE) && d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66 && has_modrm && mod != 3 &&
-      (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB))
-    return Uns("address-size override on bt/bts/btr/btc m, r (no SDM rule for the bit offset with a 32-bit address)");
   if (d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66 && has_modrm && mod != 3 &&
       (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || (op == 0xBA && reg >= 4)) && fexc_alignment_gated)
     return Sys("bt/bts/btr/btc with a memory operand under alignment checking (#AC: the resident's check)");
   const bool primary = d.FexcMap == FEXC_MAP_PRIMARY;
-  // Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPNE/LOOPE/LOOP/JrCXZ
-  const bool near_direct = (primary && ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
-                           (d.FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
   // LOCK (I3): admitted on every lockable form (the others are cut above as #UD). FEX lowers each to one LSE atomic (LOCK NEG:
   // one compare-and-swap per pass, patch 0016). 66 on cmpxchg8b/16b is refused by policy (the SDM gives it no meaning).
   if (d.FexcMap == FEXC_MAP_TWO && op == 0xC7 && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on cmpxchg8b/16b");
@@ -739,28 +740,30 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // 0x67 (I10): 32-bit address size. FEX computes the effective address in 64 bits, truncates it to 32 bits and zero-extends
   // it before the FS/GS base (Addressing.cpp LoadEffectiveAddress: `Bfe`), RIP-relative included (EIP-relative: RIP + disp
   // truncated); moffs is 4 bytes; strings use ESI/EDI/ECX, LOOP/JECXZ ECX, XLAT EBX + AL (patch 0025); a direct branch, RET and
-  // the stack's own accesses ignore it. The sites see the truncated address (BT* m, r: refused above).
-  // 66 on a near direct branch (Jcc rel8/rel32, JMP rel8/rel32, CALL rel32, LOOPcc/JrCXZ) is ignored, as on Intel (patch
-  // 0029: the operand size stays 64 bits, the displacement rel8/rel32; SDM Vol.2 CALL/JMP/Jcc, Appendix A "f64"). On RET and
-  // the indirect CALL/JMP it stays refused.
-  if (v.branch && !near_direct && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("operand-size prefix on a branch");
-  if (d.FexcMap == FEXC_MAP_TWO && op >= 0xC8 && op <= 0xCF && (f & DecodeFlags::FLAG_OPERAND_SIZE) && !(f & DecodeFlags::FLAG_REX_WIDENING))
-    return Uns("16-bit bswap (undefined result)");
-  if (d.FexcMap == FEXC_MAP_TWO && (op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) && (f & DecodeFlags::FLAG_OPERAND_SIZE))
-    return Uns("16-bit shld/shrd (result undefined for counts above 16)");
-  if (primary && (op == 0x9C || op == 0xC8 || op == 0xC9) && (f & DecodeFlags::FLAG_OPERAND_SIZE))
-    return Uns("operand-size prefix on pushf/enter/leave (16-bit stack forms)");
-  if (primary && op == 0xC8 && ((d.Src[0].Literal() >> 16) & 0x1F) != 0)
-    return Uns("enter with a nesting level (several stores)");
+  // the stack's own accesses ignore it. BT* m,r adds its signed bit-string displacement before truncation and FS/GS.
+  // Intel SDM Vol.1 6.4.7: 66 is ignored on near CALL/JMP/RET, including indirect forms. The frontend keeps
+  // target and stack widths at 64 bits; 67 still controls an explicit memory operand's address size.
+  // No-stop change: 16-bit BSWAP (an undefined result in the SDM) is FEX's, which zeroes the low 16 bits as the reference AMD
+  // machine does (natemu-raw/nostop-20261106-01/probe). 16-bit SHLD/SHRD with an imm8 count masking to 16 or less is FEX's;
+  // CL forms use the resident for defined counts0..16; larger counts retain the undefined-result refusal because
+  // FEX's result differs from the reference AMD machine.
+  if (d.FexcMap == FEXC_MAP_TWO && (op == 0xA5 || op == 0xAD) && (f & DecodeFlags::FLAG_OPERAND_SIZE) && !(f & DecodeFlags::FLAG_REX_WIDENING))
+    return Sys("16-bit shld/shrd with CL: resident completion of defined counts");
+  if (d.FexcMap == FEXC_MAP_TWO && (op == 0xA4 || op == 0xAC) && (f & DecodeFlags::FLAG_OPERAND_SIZE)) {
+    const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
+    if (!b || (b[d.InstSize - 1] & 0x1F) > 16) return Uns("16-bit shld/shrd with a count above 16 (the result is not the AMD machine's)");
+  }
+  // RCL/RCR m with an imm8 (c0/c1 /2 /3): admitted when the count, masked (to 6 bits with REX.W, else 5), is not 0.
+  if (primary && (op == 0xC0 || op == 0xC1) && has_modrm && mod != 3 && (reg == 2 || reg == 3)) {
+    const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
+    const bool w = op == 0xC1 && (f & DecodeFlags::FLAG_REX_WIDENING);
+    if (!b || (b[d.InstSize - 1] & (w ? 0x3F : 0x1F)) == 0) return Sys("memory rcl/rcr with zero count: resident completion");
+  }
+  if (primary && op == 0xC8)
+    return Sys("enter: ordered frame stores and final-stack permission check");
   // I8: VCVTPS2PH m: the conversion raises its MXCSR flags (FPSR) before the store, which may fault; x86 commits neither.
   if (d.FexcMap == FEXC_MAP_VEX && v.avx && (d.FexcVex & 3) == 3 && d.FexcVexOp == 0x1D && has_modrm && mod != 3)
-    return Uns("vcvtps2ph m: its MXCSR flags would be raised before the store, which may fault");
-  // I8: VINSERTPS m32 whose zero mask clears the inserted element: FEX drops the load and its #PF (as INSERTPS, I5a).
-  if (d.FexcMap == FEXC_MAP_VEX && v.avx && (d.FexcVex & 3) == 3 && d.FexcVexOp == 0x21 && has_modrm && mod != 3) {
-    const uint8_t* b = fexc_guest_bytes(d.PC, d.InstSize);
-    const uint8_t imm = b[d.InstSize - 1];
-    if ((imm & 0xF) & (1 << (imm >> 4 & 3))) return Uns("vinsertps m32 whose zero mask clears the inserted element (FEX drops the load and its #PF)");
-  }
+    return Sys("vcvtps2ph m: transactional conversion flags and destination store");
   return v;
 }
 

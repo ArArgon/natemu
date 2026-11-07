@@ -59,7 +59,7 @@ fn user(cpl: u64) -> bool {
 
 /// Loads the shadow space of `cpl` (TTBR0 with its ASID, and TTBR1), unless it is loaded: called before every entry
 /// into generated code, so a CPL change needs no flush. Both spaces' lower roots map the resident's private region alike,
-/// and both upper roots the guest-state page's EL0 alias (G1, `execution::GUEST_STATE_VA`, an upper-root entry below 256
+/// and both upper roots the guest-state page's EL0 alias (G1, `cache::Control::guest_state_va`, an upper-root entry below 256
 /// that no shadow uses). TTBR1 carries no ASID (TCR_EL1.A1 = 0: TTBR0's tags both halves), so TTBR1 walks are disabled
 /// (EPD1) while the roots change: no walk ever pairs one space's upper root with the other's ASID. EPD1 is set only
 /// inside this function, at EL1 with generated code not running, and cleared before it returns, so the alias is

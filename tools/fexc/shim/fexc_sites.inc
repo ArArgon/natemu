@@ -92,7 +92,7 @@ void Arm64JITCore::FexcRoundEnd(IR::RoundMode Mode) {
 
 // I6: the floating-point ops of an admitted x87 instruction (reduced precision: scalar doubles). Each runs with FPSR cleared
 // (x3 keeps MXCSR's flags) and, when the host gave one, under the x87 FPCR (x2 keeps MXCSR's); after it, its FPSR flags go into
-// the x87 exception word (x0, x1 are free between ops). None of these ops uses x0..x3 itself (FEX's TMP1..TMP4).
+// pending flags committed at instruction completion (x0, x1 are free between ops). None uses x0..x3 itself (FEX's TMP1..TMP4).
 bool Arm64JITCore::FexcX87Op(const IR::IROp_Header* IROp) {
   using IR::IROps;
   if (!fexc_slice1 || !fexc_x87.count(Entry + FexcGuest)) return false;
@@ -149,17 +149,10 @@ void Arm64JITCore::FexcX87End() {
   if (fexc_x87_fpcr) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
   mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
   msr(ARMEmitter::SystemRegister::FPSR, TMP4);
-  if (fexc_x87_unmasked) {
-    // I5c: under unmasked x87 exceptions the instruction's flags gather in FEXC_X87_PENDING, which its check reads and the x87
-    // stack pass folds into the exception word at its end (so a fault or check stub inside it leaves FSW unchanged).
-    ldrb(TMP2.W(), STATE, FEXC_X87_PENDING);
-    orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
-    strb(TMP2.W(), STATE, FEXC_X87_PENDING);
-    return;
-  }
-  ldr(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
+  // Flags commit at the x87 instruction's end, after any store and stack-fault precedence, even when every exception is masked.
+  ldrb(TMP2.W(), STATE, FEXC_X87_PENDING);
   orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
-  str(TMP2.W(), STATE, FEXC_X87_EXCEPTIONS);
+  strb(TMP2.W(), STATE, FEXC_X87_PENDING);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -591,8 +584,9 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 //                                                            store wider than 1 byte crossing a 4 KiB page (A = base or x1)
 //   target  eor x0, T, T, lsl #16; tbnz x0, #63, stub       indirect jmp/call/ret: T = the exit's computed RIP (x86 raises
 //                                                            #GP at the branch, before its push, pop or RIP change)
-// There is no address guard (E3): generated code runs at EL0, where every non-canonical address is unmapped, EL1-only or
-// execute-only, so a data access to it faults in hardware at its site and the runtime raises #GP/#SS from the site.
+// There is no address guard (E3): apart from the selected EL0 guest-state frame alias, non-canonical addresses are
+// unmapped, EL1-only or execute-only. A hardware fault at an access site becomes #GP/#SS; the randomized frame alias
+// remains guest-accessible as a documented deviation.
 // A RIP-relative address (base = EntrypointOffset, no index) is a compile-time constant: a page-crossing store gets an
 // unconditional `b` to its split stub instead. Direct branches to non-canonical targets are cut at decode (FexcSlice1::Cut).
 // ---------------------------------------------------------------------------------------------

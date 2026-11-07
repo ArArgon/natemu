@@ -23,6 +23,11 @@ import ref  # noqa: E402
 # tools/bench/run_natemu.py (the host's default admission).
 CODE_SHAPE = ['--code-shape']
 
+def frame_alias_args():
+    """Test-driver override only: make selected-page and unmapped-hole probes deterministic."""
+    va = os.environ.get('NATEMU_TEST_GUEST_STATE_ALIAS')
+    return ['--guest-state-alias', va] if va is not None else []
+
 def at_hlt(out, rip):
     """The driver's report `out` ended at the `hlt` at `rip` with the state there: HLT is the resident's transaction since
     X2, #GP(0) at CPL 3 (delivered through the driver's logging IDT, the state banked at it), a park at CPL 0 that the
@@ -57,8 +62,9 @@ def description(p):
     return '\n'.join(lines) + '\n'
 
 def declared_limit(vm):
-    """The slice's declared limit: an instruction it cannot compile."""
+    """The slice's declared limit: an instruction it cannot compile (since the no-stop change, its #UD: a REFUSED decode)."""
     if vm['stop'] == 'no_code' and vm['reason'] == 'unsupported_form': return 'unsupported_form'
+    if vm['stop'] == 'guest_fault' and int(vm['fault'][0], 0) == 6 and vm.get('stats', {}).get('decodes', {}).get(f'{0x7b:#x}'): return 'refused (#UD)'
     return None
 
 def page_checks(p, vm):
@@ -92,7 +98,7 @@ def run_program(host, runtime, fexc, p, expected, work, max_block=None):
     (work / 'program.txt').write_text(description(p))
     limit = [str(max_block)] if max_block else []
     limit += CODE_SHAPE
-    run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + limit, capture_output=True, text=True)
+    run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + frame_alias_args() + limit, capture_output=True, text=True)
     entry = {'name': p['name'], 'returncode': run.returncode, 'stderr': run.stderr[-2000:]}
     if run.returncode == 0:
         vm = json.loads(run.stdout)

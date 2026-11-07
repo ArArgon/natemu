@@ -71,20 +71,24 @@ pub const PRE_NZCV_REG: u8 = 25;
 pub const STATE_OFFSET: usize = 0x22000;
 pub const STATE_VA: u64 = PRIVATE + STATE_OFFSET as u64;
 /// FEX `CpuStateFrame` (one page per vCPU, the guest-state page): the resident's EL1-only alias. Admitted code accesses
-/// only its guest-state fields ([`frame::GUEST_STATE`]), through x28 = [`FRAME_POINTER`].
+/// only its guest-state fields ([`frame::GUEST_STATE`]), through x28 = [`cache::Control::guest_state_va`].
 pub const FRAME_OFFSET: usize = 0x23000;
 pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
-/// The guest-state page's EL0 read/write alias (G1, I1): x28 points here at every block entry, so generated code reaches
+/// A deterministic test address for the guest-state page's EL0 read/write alias (G1, I1). Production selects a fresh
+/// random page in [`GUEST_STATE_SLOT`] per VM; x28 points to that selected page at every block entry, so generated code reaches
 /// the guest-state fields at EL0. It lies outside the private window, in the upper Arm translation table's entries
 /// 0..255 (`0xffff_0000_0000_0000..0xffff_8000_0000_0000`: non-canonical on x86 with bit 63 set, never a guest shadow,
 /// `shadow::Space` refuses it), mapped by both shadow spaces' upper roots through the owner's own tables
 /// ([`GUEST_STATE_TABLES`], written by the host, never mapped in the window). Bit 63 matters: Linux's user-access paths
 /// fold or refuse an address with it set before any access (`put_user`'s `sar $63; or`, `access_ok`), so a user pointer
-/// naming the page faults there, as on x86, instead of the kernel storing into it. Documented deviation: a guest access
-/// inside this page reaches the vCPU's own guest state instead of #GP; every other address of its table slot faults (#GP).
-/// The page holds nothing but guest state (the resident rewrites the flag bytes and the FS/GS bases from its bank at
-/// every block entry and reads back only DF, and, after a CPL-0 block, IF: perf chunk 15, so a CPL-0 store into the page
-/// acts as CLI/STI would; a CPL-3 one changes nothing). Perf chunk 15 adds two resident-written fields CPL 3 may read there:
+/// naming the page faults there, as on x86, instead of the kernel storing into it. Documented deviation: ordinary
+/// translated guest accesses can reach the selected page instead of faulting; the rest of its slot is unmapped
+/// (#GP/#SS for guest data accesses). Randomization does not isolate the selected page.
+/// The page contains designated guest-state fields and padding. The resident rewrites flag bytes and FS/GS bases
+/// from its bank at every block entry. Of the flag bytes it reads back DF and, after a CPL-0 block, IF (perf chunk 15):
+/// a CPL-0 store to IF's byte acts as CLI/STI would; a CPL-3 store to IF does not change banked IF.
+/// Other frame bytes remain guest-accessible.
+/// Perf chunk 15 adds two resident-written fields CPL 3 may read there:
 /// the event-pending byte (whether an interrupt is pending, which the vCPU's own code sees anyway when IF is set) and the
 /// TSC offset (useless without the count: admission refuses counter reads outside a CPL-0 RDTSC, and RDTSC at CPL 3 stays
 /// the resident's, which faults under CR4.TSD). Perf chunk 17: IA32_KERNEL_GS_BASE ([`frame::KERNEL_GS_BASE`], 0 at CPL 3)
@@ -96,12 +100,15 @@ pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 /// through the shadow at CPL 0, nothing it could not read anyway). Needs 48-bit linear addresses and no LAM: with LA57 it
 /// would be canonical, with LAM_SUP it would alias a canonical kernel address (neither is advertised).
 pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
-pub const FRAME_POINTER: u64 = GUEST_STATE_VA;
 /// The alias's level-1, level-2 and leaf tables (window pages after the guest-RAM alias's level-2 tables).
 pub const GUEST_STATE_TABLES: [usize; 3] = [RAM_TABLES_OFFSET + 0x3000, RAM_TABLES_OFFSET + 0x4000, RAM_TABLES_OFFSET + 0x5000];
-/// The alias's top-level slot (512 GiB, one upper-root entry): every address in it walks only the owner's tables.
+/// The alias's top-level slot (512 GiB, 2^27 pages, one upper-root entry): every address walks only the owner's tables.
 pub const GUEST_STATE_SLOT: core::ops::Range<u64> = (GUEST_STATE_VA & !((1 << 39) - 1))..(GUEST_STATE_VA & !((1 << 39) - 1)) + (1 << 39);
 const _: () = assert!(GUEST_STATE_SLOT.start >= 0xffff_0000_0000_0000 && GUEST_STATE_SLOT.end <= crate::shadow::HIGH_BASE);
+/// A complete aligned frame page inside the reserved noncanonical slot.
+pub const fn guest_state_alias_valid(va: u64) -> bool {
+    va >= GUEST_STATE_SLOT.start && va < GUEST_STATE_SLOT.end && va & 4095 == 0
+}
 /// Host-written admitted object (header, code, tables).
 pub const STAGING_OFFSET: usize = 0x70000;
 pub const STAGING_BYTES: usize = 0x20000;
@@ -276,13 +283,17 @@ pub mod cache {
     pub const WRITABLE_PAGES: usize = CODE_PAGES + MASK_BYTES;
     pub const RECORDS: usize = WRITABLE_PAGES + MASK_BYTES;
     pub const RESETS: usize = 0x3000;
+    /// Split locks (no-stop change, November 6): the owner of the split lock (vCPU + 1; 0: free), then the two
+    /// guest-physical page numbers + 1 it holds (0: none), then per vCPU a word that is 1 while it may hold a shadow
+    /// (runtime `cache::split_begin`).
+    pub const SPLIT: usize = RESETS + 0x80;
     /// Per-vCPU [`Events`] records (X2).
     pub const EVENTS: usize = 0x3100;
     /// vCPUs of one VM (bits of the mask nibbles).
     pub const MAX_VCPUS: usize = 4;
 
     /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's size, head included) and
-    /// `ram_bytes` (the VM's guest RAM, R) at prepare; the resident owns the rest.
+    /// `ram_bytes` (the VM's guest RAM, R) and `guest_state_va` at prepare; the resident owns the rest.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Control {
@@ -437,6 +448,18 @@ pub mod cache {
         pub large_count: u64,
         /// Perf chunk 19: the length of each L1 table's list ([`L1_LISTS`]).
         pub l1_listed: [u64; L1_TABLES],
+        /// Why a kept SYSCALL/SYSRET declined the fast path (`perf` resident only), indexed by
+        /// [`super::perf::SysFastDecline`]. Separate from instruction-kind counts; appended to keep earlier offsets.
+        pub sys_fast_declined: [u64; 4],
+        /// Host-selected EL0 frame alias; immutable for this VM's lifetime, preserved across cache/shadow resets.
+        /// Every vCPU uses this VA, mapped to its own frame. Appended to preserve earlier field offsets.
+        pub guest_state_va: u64,
+    }
+    impl Control {
+        #[inline(always)]
+        pub fn record_sys_fast_decline(&mut self, reason: super::perf::SysFastDecline) {
+            self.sys_fast_declined[reason as usize] += 1;
+        }
     }
     pub const LARGE_REGIONS: usize = 64;
     pub const PC_HINTS: usize = 2048;
@@ -620,7 +643,7 @@ pub mod cache {
     const _: () = assert!(MAX_VCPUS <= 4); // a nibble per page
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= CODE_PAGES && CODE_PAGES % 8 == 0);
     const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= GLOBAL_BYTES && MASK_BYTES % 8 == 0);
-    const _: () = assert!(RESETS + MAX_VCPUS * 8 <= EVENTS && EVENTS % 64 == 0);
+    const _: () = assert!(RESETS + MAX_VCPUS * 8 <= SPLIT && SPLIT + (3 + MAX_VCPUS) * 8 <= EVENTS && EVENTS % 64 == 0);
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= GLOBAL_BYTES);
 }
 
@@ -1628,6 +1651,8 @@ pub mod system {
     /// S4: INT1 (`f1`, ICEBP): #DB delivered as a trap (RIP past it) with EXT = 1 and no gate DPL check (a privileged
     /// software exception, SDM Vol.2 INT n/INTO/INT3/INT1); DR6 unchanged.
     pub const INT1: u32 = 0x46;
+    /// VCVTPS2PH memory destination: `reg` source XMM/YMM, `size` destination bytes (8/16), `cr` the immediate byte.
+    pub const CVTPS2PH: u32 = 0x47;
     /// x87 (I6, numbered apart): an x87 instruction under CR0.EM or CR0.TS, or WAIT under CR0.TS and CR0.MP (fexc cut it,
     /// `--x87-gated`/`--wait-gated`): #NM (`length` is not used). FNINIT (`db e3`), FNCLEX (`db e2`), FLDCW m16 (`d9 /5`),
     /// FLDENV/FNSTENV m (`d9 /4`, `/6`; `size` 2 with a 66 prefix: the 14-byte image, else 4: 28 bytes), FRSTOR/FNSAVE m
@@ -1702,6 +1727,26 @@ pub mod system {
     /// (never RIP-relative); `size` the element width (4: VEX.W 0, 8: VEX.W 1). The three registers differ (the overlap is
     /// fexc's #UD cut).
     pub const GATHER: u32 = 0x7a;
+    /// A form natemu cannot run yet (fexc refused it at the first instruction of a block and x86 gives it no exception the
+    /// host decodes): #UD at the instruction, a recorded guest-visible deviation (owner rule, November 6: no instruction a
+    /// guest program can execute stops the machine). The host logs the first ones (`execution::Compiler`).
+    pub const REFUSED: u32 = 0x7b;
+    /// The masked moves (SDM Vol.2 MASKMOVDQU, VMASKMOVDQU, VMASKMOVPS/PD (VEX.66.0F38 2C..2F), VPMASKMOVD/Q (8C, 8E)),
+    /// element by element: `reg` the data register (the load's destination, the store's source), `cr` bits 3:0 the mask
+    /// register (VEX.vvvv; ModRM.rm for MASKMOVDQU), bit 4 VEX.L, bit 5 a store, bit 6 a VEX form (AVX gating; else SSE's);
+    /// bit 7 MASKMOVQ (MMX gating, registers 0..7, size 1, store set, VEX/L clear, eight bytes);
+    /// `size` the element width (1: the byte masks of MASKMOVDQU, 4, 8); the memory operand as for any (MASKMOVDQU: DS:RDI,
+    /// EDI with 0x67, an FS/GS override applies).
+    pub const MASKMOV: u32 = 0x7c;
+    /// Memory RCL/RCR whose count is CL (`reg`=1) or an immediate (`reg`=NO_REG, `cr` bits8:1).
+    /// `cr` bit0 is RCR; `size` is 1/2/4/8. Even a zero count accesses the destination for write.
+    pub const ROTATE: u32 = 0x7d;
+    /// SHLD/SHRD r/m16, r16, CL: `cr` bits3:0 source, bit4 SHRD; `reg` is the destination for a register operand.
+    /// Defined masked counts0..16 execute; larger counts retain the profile's undefined-result refusal.
+    pub const DOUBLE_SHIFT16: u32 = 0x7e;
+    /// ENTER: `size` the pushed operand width (2 or 8), `cr` the nesting level modulo 32,
+    /// `disp` the unsigned 16-bit allocation. Stack addresses remain 64-bit.
+    pub const ENTER: u32 = 0x7f;
     /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand (0x67): the effective address is truncated
     /// to 32 bits and zero-extended before the FS/GS base.
     pub const REP: u32 = 1;
@@ -1730,8 +1775,8 @@ pub mod system {
                     LGDT..=SIDT => self.memory == 1 && address,
                     SLDT..=MOV_FROM_SREG => rm && self.cr < 8 && matches!(self.size, 2 | 4 | 8),
                     LLDT..=MOV_TO_SREG => rm && self.cr < 8,
-                    JMP_FAR..=CALL_FAR => self.memory == 1 && address && matches!(self.size, 4 | 8),
-                    RET_FAR..=IRET => matches!(self.size, 4 | 8) && (self.kind == IRET || (0..=0xffff).contains(&self.disp)),
+                    JMP_FAR..=CALL_FAR => self.memory == 1 && address && matches!(self.size, 2 | 4 | 8),
+                    RET_FAR..=IRET => matches!(self.size, 2 | 4 | 8) && (self.kind == IRET || (0..=0xffff).contains(&self.disp)),
                     LOCK_UD => self.lock == 1,
                     LDMXCSR | STMXCSR | VLDMXCSR | VSTMXCSR => self.memory == 1 && address,
                     SSE_GATED | AVX_GATED | MMX_GATED => true,
@@ -1740,8 +1785,15 @@ pub mod system {
                         self.memory == 1 && address && self.base != RIP && reg(self.reg) && reg(self.index) && self.cr < 64
                             && matches!(self.size, 4 | 8) && self.reg != mask && self.reg != self.index && mask != self.index
                     }
+                    MASKMOV => self.memory == 1 && address && if self.cr & 128 != 0 {
+                        self.reg < 8 && self.cr & !7 == 160 && self.size == 1
+                    } else { reg(self.reg) && self.cr < 128 && matches!(self.size, 1 | 4 | 8) },
+                    CVTPS2PH => self.memory == 1 && address && reg(self.reg) && self.cr < 256 && matches!(self.size, 8 | 16),
+                    ROTATE => self.memory == 1 && address && matches!(self.reg, 1 | NO_REG) && self.cr < 512 && matches!(self.size, 1 | 2 | 4 | 8),
+                    DOUBLE_SHIFT16 => rm && self.cr < 32 && self.size == 2,
+                    ENTER => self.memory == 0 && matches!(self.size, 2 | 8) && self.cr < 32 && (0..=0xffff).contains(&self.disp),
                     INT => self.cr < 256,
-                    INT3 | INT1 | INTO | UD | TOO_LONG => true,
+                    INT3 | INT1 | INTO | UD | TOO_LONG | REFUSED => true,
                     SWAPGS | SYSCALL | WBINVD | CLTS | SYSENTER => true,
                     SMSW => rm && matches!(self.size, 2 | 4 | 8),
                     LMSW => rm,
@@ -2190,6 +2242,16 @@ const _: () = assert!(STAGING_OFFSET + STAGING_BYTES <= crate::resident::TEXT_OF
 /// buckets add up to the time since `since` was first set. A switch to an entry kind counts it. The host reads the
 /// record after the run (all zero from a default resident). A record of its own in the state page.
 pub mod perf {
+    /// Reasons a kept SYSCALL/SYSRET did not finish the resident fast path; never system instruction kinds.
+    #[repr(usize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SysFastDecline {
+        NotCurrent,
+        Boundary,
+        Other,
+        After,
+    }
+    pub const SYS_FAST_DECLINE_NAMES: [&str; 4] = ["not_current", "boundary", "other", "after"];
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     pub struct Perf {
@@ -2348,7 +2410,14 @@ mod tests {
         }
         assert!(frame::GUEST_STATE_WRITABLE.iter().all(|&(o, n)| (o..o + n).all(|b| inside(&frame::GUEST_STATE, b))));
         assert_eq!(GUEST_STATE_VA % 4096, 0);
-        assert_eq!(FRAME_POINTER, GUEST_STATE_VA);
+        for va in [GUEST_STATE_SLOT.start, GUEST_STATE_VA, GUEST_STATE_SLOT.end - 4096] {
+            assert!(guest_state_alias_valid(va));
+            assert!(!crate::paging::canonical(va) && !crate::paging::canonical(va + 4095));
+            assert_eq!(va >> 63, 1);
+        }
+        for va in [0, GUEST_STATE_SLOT.start - 4096, GUEST_STATE_SLOT.start + 1, GUEST_STATE_SLOT.end, u64::MAX] {
+            assert!(!guest_state_alias_valid(va));
+        }
         // G1: x86 non-canonical with bit 63 set (Linux's user-access paths refuse it), outside the window and outside
         // every guest shadow (both halves), and inside its own slot.
         assert!(!crate::paging::canonical(GUEST_STATE_VA) && !crate::paging::canonical(GUEST_STATE_VA + 4095));
@@ -2504,12 +2573,13 @@ mod tests {
         let far = System { kind: system::JMP_FAR, length: 3, memory: 1, size: 8, base: 0, segment: SREG_GS as u32, ..System::NONE };
         let ret = System { kind: system::RET_FAR, length: 3, size: 4, disp: 0xffff, ..System::NONE };
         assert!(ltr.well_formed() && far.well_formed() && ret.well_formed());
+        assert!(System { kind: system::IRET, size: 2, ..mov }.well_formed());
         assert!(!System { disp: 0x1_0000, ..ret }.well_formed() && !System { memory: 1, base: 17, ..ltr }.well_formed());
         for bad in [
             System { kind: 31, ..mov },
             System { kind: system::INT, cr: 256, ..mov }, // no such vector
             System { kind: system::LGDT, ..mov }, // no memory operand
-            System { kind: system::IRET, size: 2, ..mov },
+            System { kind: system::IRET, size: 1, ..mov },
             System { kind: system::MOV_FROM_SREG, size: 8, memory: 0, reg: 16, ..mov },
             System { kind: system::JMP_FAR, size: 8, memory: 1, segment: 1, ..mov }, // CS: never decoded (ignored)
             System { kind: system::JMP_FAR, size: 8, memory: 1, segment: SREG_SS as u32, ..mov }, // SS: never decoded (ignored)

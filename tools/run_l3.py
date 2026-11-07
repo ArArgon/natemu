@@ -285,8 +285,10 @@ hlt'''
             return p
         return check
     case('lock-in', 'mov dx, 0x3ff\n.byte 0xf0, 0xec', fault(6))
+    # F3 on IN (reserved; the host does not decode it): since the no-stop change #UD at it (a REFUSED decode), the port unread.
     def refused(o, code):
-        return [] if o['stop'] not in ('reached', 'guest_fault') and o['stop'] != 'driver' and 'ports' not in o else [f"stop {o['stop']} {o['reason']} {o.get('ports')}"]
+        ok = o['stop'] == 'guest_fault' and int(o['fault'][0], 0) == 6 and o['stats']['decodes'].get(f'{0x7b:#x}') and 0x3ff not in counts(o)
+        return [] if ok else [f"stop {o['stop']} {o['reason']} {o.get('fault')} {o.get('ports')}"]
     case('f3-in', 'mov dx, 0x3ff\n.byte 0xf3, 0xec', refused)
     def device(o, code):
         p = stop('unsupported_mmio', lambda c: CODE + len(c) - 2, status='system')(o, code)

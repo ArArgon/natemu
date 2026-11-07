@@ -169,8 +169,8 @@ fn popf(s: &mut State, i: System) -> Result<(), Exception> {
     Ok(())
 }
 
-/// BT/BTS/BTR/BTC with a memory operand under alignment checking (fexc cut it: FEX accesses only the byte holding the bit,
-/// so the operand-size access x86 checks never happens natively). LOCK BT is #UD. The operand at EA (and, for a register
+/// BT/BTS/BTR/BTC with a memory operand under alignment checking or data breakpoints (fexc cut it for the
+/// operand-unit precheck). LOCK BT is #UD. The operand at EA (and, for a register
 /// bit offset, the operand-sized unit EA + size * (offset >> log2(bits)) it selects, which has EA's alignment) must be
 /// aligned to its size: #AC(0) when it is not and that unit is canonical (a non-canonical one is the step's #GP/#SS, which
 /// comes first). Otherwise `Ok`: the caller steps the instruction compiled without the cut.
@@ -179,23 +179,22 @@ pub(super) fn bit_test(s: &mut State, i: System) -> Result<(), Exception> {
         return Err(UD);
     }
     let size = u64::from(i.size);
-    let ea = super::segments::address(&s.cpu, &i);
-    let unit = if i.reg == system::NO_REG {
-        ea
-    } else {
+    let mut operand = i;
+    if i.reg != system::NO_REG {
         let r = s.cpu.gpr[i.reg as usize];
         let offset = match size {
             2 => r as i16 as i64,
             4 => r as i32 as i64,
             _ => r as i64,
         };
-        ea.wrapping_add((offset >> (size * 8).trailing_zeros()) as u64 * size)
-    };
+        operand.disp = operand.disp.wrapping_add((offset >> (size * 8).trailing_zeros()).wrapping_mul(size as i64));
+    }
+    let unit = super::segments::address(&s.cpu, &operand);
     let last = unit.wrapping_add(size - 1);
-    // S4: the operand-sized unit x86 accesses (a read, a write too for BTS/BTR/BTC) meets data breakpoints; the plain step
-    // that follows touches only the byte holding the bit.
+    // S4: the complete operand-sized unit meets data breakpoints. The following native step now accesses that same
+    // unit; duplicate hit bits are harmless and a fault suppresses the pending data-breakpoint trap.
     super::watch::access(s, unit, size, i.cr != 0);
-    if s.cpu.alignment_check() && ea & (size - 1) != 0 && paging::canonical(unit) && paging::canonical(last) && last > unit {
+    if s.cpu.alignment_check() && unit & (size - 1) != 0 && paging::canonical(unit) && paging::canonical(last) && last > unit {
         return Err([17, 0, 0]);
     }
     Ok(())

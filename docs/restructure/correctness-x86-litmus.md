@@ -1,5 +1,9 @@
 # Correctness pass: kernel x86 selftests and x86-TSO litmus tests in a Linux guest
 
+**Update November 7 UTC:** the ICEBP stall is fixed and independently reviewed. The new regression passes 20/20;
+the original full `mov_ss_trap_64` passes at N=1/N=4 on the preserved no-stop snapshot plus this fix.
+See [the fix and validation](#icebp-fix-and-validation-november-7-utc). Original campaign results below remain historical.
+
 Status: **done** (November 6, 2026). Evidence, rerun steps and raw logs: `natemu-raw/correct-x86-20261106-01/`
 (README there). Scripts: `tools/correctness/` (this lane's new files `x86-remote.sh`, `run-x86st.sh`, `run-litmus.sh`,
 `run-x86con.sh`, `litmus-gen.py`, `litmus-check.py`, `x86-overlay.sh`, `x86-campaign.sh`; lane 1's harness reused unchanged: `boot.py`, `vm.sh`,
@@ -46,7 +50,7 @@ executed on the Intel-profiled guests.
 
 | | natemu N=1 | natemu N=4 | QEMU N=4 | native (AMD, user) |
 | --- | --- | --- | --- | --- |
-| finish with native's result up to environment | 20 | 20 | 24 | 25 run: 24 exit 0, test_shadow_stack exit 1 (uretprobe, as a user) |
+| finish with native's result up to environment | 20 | 20 | 24 | 25 run: 22 exit 0, amx/lam exit 4 (feature skips), test_shadow_stack exit 1 (uretprobe, as a user) |
 | stop the whole machine | 5 | 5 | 0 | - |
 | wrong result | 0 | 0 | 1 (mov_ss_trap, QEMU's) | - |
 
@@ -128,7 +132,7 @@ weaker evidence natemu sits between QEMU and the AMD machine.
 
 ## Findings
 
-1. **natemu defect: ICEBP right after MOV SS with a data breakpoint on the MOV SS operand stops the machine.**
+1. **Original natemu defect, now repaired: ICEBP right after MOV SS with a data breakpoint on the MOV SS operand stopped the machine.**
    `mov_ss_trap_64` hangs natemu at `[RUN] MOV SS; ICEBP` (the vCPU spins; cancelled at the cap, N=1, twice). Minimal
    repro `natemu-raw/correct-x86-20261106-01/repro/icebp/icebp.c` (`icebp STEP`): step 1 (ICEBP alone) and step 2
    (`mov ss; icebp`) give SIGTRAP after the 0xF1 byte under natemu as natively; step 3 (DR0 = read/write watchpoint on
@@ -151,7 +155,7 @@ weaker evidence natemu sits between QEMU and the AMD machine.
    subtest before the stop matched native. These belong with the excluded 32-bit programs; the record only notes that
    CPL-3 code reaching compatibility mode ends the whole machine rather than the process, by design.
 
-## Summary
+## Original campaign summary
 
 Two suites. Kernel x86 selftests (Debian 6.12.107 source, 25 64-bit programs, one per boot at N=1 and N=4): 20 equal
 native up to environment and equal QEMU; one natemu defect, **ICEBP after MOV SS with a data breakpoint pending stops the
@@ -162,10 +166,156 @@ natemu shows fewer of the allowed relaxed outcomes than the AMD machine (weaker 
 
 ## Next steps
 
-1. Finding 1: rerun `repro/icebp.img` (`ct=repro`, expect three SIGTRAPs) and `x86st` part 9/25 (`mov_ss_trap_64`, expect
-   `[OK] I aten't dead`) after a fix; the gather-fix lane has it.
-2. Not covered: string instructions and LOCK XADD (herd7 7.58's X86_64 has neither: a hand-written harness), unaligned,
+1. Finding 1 is repaired by the November 7 ICEBP fix below. Preserve its regression when integrating the separate
+   no-stop worktree; its final dirty corrections and series69 compiler remain necessary for that branch's results.
+2. Not covered by this ordering corpus: string instructions and LOCK XADD (herd7 7.58's X86_64 has neither: a hand-written harness), unaligned,
    page-crossing and mixed-size accesses (not attempted; herdtools7 has a mixed-size x86 model, `x86tso-mixed.cat`), and
    accesses to pages natemu's resident emulates. The 89
    allowed conditions natemu never showed could be retried with litmus7's other modes (`-mem indirect`, `-st`, a
    different `-affinity`) if stronger evidence on fences is wanted.
+
+## Retained-result audit and branch status (November 6, 2026)
+
+Independent rereading of `runs/runs.jsonl` finds 19 unfinished boots out of 72. They are repeated observations of two
+causes, not 19 distinct defects: four cap cancellations at the MOV SS/ICEBP test (the initial whole-suite attempt,
+the isolated movss repro, and the N=1/N=4 part-9 runs), one resident watchdog in the minimal ICEBP repro, and fourteen
+compatibility-mode stops (initial suite attempts, individual tests and console-output localization). These caps do
+not become passes because the runner terminates cleanly. The minimal repro isolates the trigger to MOV SS followed
+by ICEBP with a watchpoint on the MOV SS operand; either instruction sequence without that watchpoint works.
+
+The watchdog PC `0x8000400ac8f4` maps to `execution::watch::program + 0x1c` in the retained runtime (SHA-256
+`bb4e8736901389111632da5552ee36384a4455529beee79a0ae0575606bad2b2`, identical to the userspace lane's retained binary).
+This is a sampled PC during debug-register programming, **not proof that this instruction itself loops**. The pending
+debug-trap/delivery interaction under Linux remains the unresolved defect; the earlier program-driver probe passing
+at CPL 0 does not establish the CPL-3/Linux path. No successful rerun of this trigger is retained in the no-stop lane.
+
+The separate, unmerged `no-stop` worktree changes finding 2's containment, not compatibility-mode support. Its final
+`natemu-raw/nostop-20261106-01/runs/f-x86st-n{1,4}-{13,15,16,20}.serial` logs all reach CT-END: `sigreturn_64` and
+`sysret_ss_attrs_64` exit 139 (the process receives SIGSEGV on the unavailable transition), while
+`single_step_syscall_64` and `syscall_arg_fault_64` exit 0 with five OKs each (their signal handlers recover). Those
+first two are contained test failures under the recorded deviation, not successful compatibility execution. The
+original results above belong to `178ffd8`; they must not be relabeled with the branch's outcome before integration
+and a current-build check. The other exclusions remain: 24 32-bit programs, absent AMX/LAM/CET, root/user differences,
+the N=1 CPU-affinity skips, and the Debian vsyscall/signal-frame differences. QEMU's early watchpoint delivery in
+`mov_ss_trap` and the native shadow-stack uretprobe failure are reference/environment failures, not natemu passes.
+
+Rerunning `litmus-check.py` over all seven retained result groups reproduces the table: zero failed-to-run tests,
+zero unknown-oracle tests and zero forbidden states. The initial N=2 run explicitly skips 1,081 tests with more than
+two threads; they ran in the full N=4 campaign. The 100-million-iteration follow-ups are selected subsets (198 tests
+at N=4, 10 at N=2), not replacement full campaigns. The 89 allowed conditions still absent after the N=4 follow-up
+are coverage limits, not failures or timeouts; nothing in these retained observations diagnoses their scheduling
+cause. String/LOCK-XADD, unaligned, crossing, mixed-size and resident-emulated accesses remain outside this corpus.
+Separate no-stop XADD, split-lock and mixed-overlap probes pass; those functional checks do not establish systematic
+ordering coverage across these placements and paths. Keep litmus7 and add focused tests with reviewed x86 outcomes;
+herd's mixed-size model helps define those outcomes but is not itself a complete executable suite.
+
+### ICEBP: original hypothesis and discriminating check (superseded by validation below)
+
+The initial hypothesis was **a second #DB overwriting the first #DB's IST frame before its handler starts**.
+The resident source establishes the following path: `segments::transaction` sets `mov_ss` after reading its watched
+operand; `commit`/`stepped` move that access's hit into `s.debug`'s pending trap bits; `trap_due` retains them during
+the MOV SS shadow. `system` clears the shadow before executing ICEBP, whose `transaction` arm calls
+`deliver(Event::Debug { length: 1, ... })`. `delivery::delivery` preserves the old pending trap bits. On returning to
+`find_from`, `trap_due` therefore delivers another #DB **at the first handler's entry, before any handler instruction**.
+`delivery::attempt` rereads the TSS IST pointer for each delivery. If the gate has nonzero IST, both 40-byte frames
+occupy the same addresses: the second replaces the user's return RIP/CS/RSP with the handler entry, kernel CS and
+that same frame's address. A handler IRET can then return to its own entry repeatedly.
+
+This fits Linux's entry structure: the [v6.12 IDT table](https://github.com/torvalds/linux/blob/v6.12/arch/x86/kernel/idt.c)
+assigns #DB an IST stack; the exact [v6.12.107 entry stub](https://github.com/gregkh/linux/blob/v6.12.107/arch/x86/entry/entry_64.S)
+(`idtentry_mce_db`) switches a user entry off IST only after several instructions. Its
+[debug handlers](https://github.com/gregkh/linux/blob/v6.12.107/arch/x86/kernel/traps.c)
+(`exc_debug_kernel`, `debug_read_reset_dr6`) write debug registers, consistent with sampling `watch::program`, which
+natemu calls on guest MOV-to-DR instructions. The earlier `gather-20261105-01/icebp/probe.py` installs a #DB gate with
+**IST = 0**: its nested frames use successively lower RSPs, so it cannot expose this overwrite. Likewise MOV SS; INT3
+first enters a different vector, unlike two immediate deliveries through the same #DB IST gate.
+
+At that audit this was a likely explanation, **not yet a confirmed root cause**: the running Debian
+guest's actual gate/IST and the two frame writes have not been captured. The next bounded check is the existing
+minimal step-3 repro with a diagnostic stop immediately before a second vector-1 frame write when
+`old RIP == gate target`, `old RSP == new frame base` and `IST != 0`. Capture both deliveries' source RIP/CPL/RSP,
+pending debug bits, DR6/DR7, gate IST, TSS-selected stack pointer and five frame slots. A matching pair proves the
+overwrite path in the failing guest; absence redirects diagnosis toward watchpoint/restart handling. An independent
+program-driver control should differ only by #DB gate IST=0 versus IST=1 with a fixed TSS IST pointer. No diagnostic
+instrumentation or execution was performed here. The correct architectural treatment of coincident deferred #DB and
+ICEBP still needs a reference check before choosing a fix; the retained user signal handler uses `siglongjmp`, so its
+single observed SIGTRAP alone does not establish the CPU's complete delivery sequence.
+
+### ICEBP fix and validation (November 7 UTC)
+
+Evidence: `natemu-raw/icebp-fix-20261107-01/`. A fresh unpatched Linux repro stalls at step 3. The bounded driver
+reproduces two deliveries with IST=0 and an overwritten return frame with IST=1. A temporary Linux diagnostic stops
+immediately before the second write: current RIP equals the #DB entry, current RSP equals the new frame base,
+and the existing IST3 frame still contains the valid user return state. Diagnostic instrumentation was removed.
+
+The fix clears the old pending trap before ICEBP delivery. Clearing before delivery preserves newly generated
+frame-store watchpoints; INT3 and other interrupt behavior stay unchanged. It is integrated in `correctness`, with
+`tools/run_icebp.py`. Independent code review accepted the change and root replicated all 20 cases.
+
+| Check | Result |
+| --- | --- |
+| New frame/count regression, IST=0/1 and default/one-instruction blocks | Before: 4/20 fail; after: 20/20 pass; independent replay: 20/20 pass |
+| Existing S4 debug controls, six programs at both block sizes | 12/12 pass |
+| Minimal Linux repro, all three steps, current source N=1/N=4 | All six executions pass |
+| Same minimal repro on copied final no-stop source plus fix, N=1/N=4 | All six executions pass |
+| Original full `mov_ss_trap_64`, copied no-stop source plus fix, N=1/N=4 | Both pass, rc=0, fail=0, skip=0, including final `[OK] I aten't dead` |
+
+Current `correctness` alone passes ICEBP in the full test but stops later at its existing SYSENTER mode boundary.
+The no-stop snapshot includes all twelve dirty tracked files and series69; its original worktree was untouched.
+Two empty full-test selections during harness setup are excluded, as are the superseded initial driver setup results.
+No final successful run was capped or contended. Resident stack audit and the 53 delivery-model tests pass.
+
+The hardware reference was unreachable. Exact DR6 merging of a deferred watchpoint into ICEBP remains unasserted:
+Intel specifies that INT1 itself sets no DR6 bits, but the reviewed wording does not settle coincident deferred
+causes. This fix establishes removal of the stale second delivery, not complete debug-register conformance.
+
+## Subtests hidden behind earlier stops (November 7 UTC)
+
+The owner requested execution of cases skipped after machine stalls or previous failures. Fresh source inspection
+found **22 later subtests without execution evidence**: seven MOV-SS cases after ICEBP and fifteen sigreturn calls
+after the first compatibility transition. The no-stop reruns had contained the latter failure but still terminated
+the process before its later assertions. `single_step_syscall` and `syscall_arg_fault` already completed their five
+OKs on no-stop. `sysret_ss_attrs` has no independent tail: its sole assertion requires a compatibility-mode access
+on every iteration.
+
+Evidence is retained in `natemu-raw/correctness-blocked-20261107-01/x86tail-v2/`. The build is the retained final
+unmerged no-stop state (`129784c` plus twelve dirty files), with copied signed binaries and explicit series69 compiler;
+the parent manifest, source archive/patch and hashes identify it separately from the older baseline.
+
+The original Debian source archive was unavailable locally. Sources were recovered from upstream **v6.12.107**, with
+URLs and hashes retained; no byte-for-byte comparison against that original archive is claimed. The original build
+record states Debian's patches do not touch tools/testing. Selection gates change only which main-body cases execute;
+original helpers, handlers, assertions and instruction sequences remain. A named MOV-SS/NOP sequence lives in one
+`noinline,noclone` helper to prevent GCC from duplicating its assembly label. The rejected first wrapper and its seven
+compile failures remain in `x86tail/`; those were setup failures, not executed MOV-SS tests.
+
+Each missing subtest ran in its own natemu boot at N=1 and N=4. All **44 boots** reached CT-END, without caps,
+recorded contention or compilation failures. The same two guest-built executables have identical SHA-256s at
+N=1, N=4 and QEMU N=4 (`6cf459eb…e6da6b` MOV-SS; `7d31e18b…90c092` sigreturn). The independently reviewed checker
+verifies exact selections/RUN lines, source and binary hashes, result counts and the recorded DR0/DR1/DR7 watchpoint
+setup; it reports zero evidence-integrity errors.
+
+| Selected subtests | N=1 | N=4 |
+| --- | --- | --- |
+| MOV SS followed by CLI, page fault, INT 1, SYSCALL, breakpointed NOP, SYSENTER, INT 0x80 | 7 pass | 7 pass |
+| sigreturn: 64-bit CS/16-bit SS; eight invalid-descriptor cases; non-strict SS restoration | 10 pass | 10 pass |
+| sigreturn: valid 16-bit CS/32-bit SS; valid 32/16-bit CS with 16-bit SS; two corrupted-final-SS cases requiring 32-bit execution | 5 exit 139 | 5 exit 139 |
+
+The ten SIGSEGV outcomes are **failed tests, not skips or passes**. Their selected paths require valid 16/32-bit
+execution and are consistent with no-stop's documented containment of unsupported compatibility transitions; no
+new runtime fault trace was captured. The important recovered coverage is that the other ten sigreturn calls do
+not disappear behind that deviation. Passing assertions do not establish identical fault behavior: `bad32-code`
+and `bad16-code` report #GP(0x20)/#GP(0x34) in natemu, versus QEMU's #GP(0x30). The upstream bad-IRET helper accepts
+any trapped signal. The differing selectors are consistent with no-stop rejecting the compatibility CS before
+validating SS (`execution/segments.rs`'s `refuse_compatibility` check, used by `far_return`), rather than full architectural agreement.
+The MOV-SS cases are upstream survival checks; their passing result does not
+establish every detail of debug-trap ordering. ICEBP itself was already executed and failed in the older evidence;
+this continuation bypasses it to expose its tails and does not resolve or freshly retest its defect.
+
+QEMU runs all 28 isolates, including two already-reached controls and four conditional GDT cases: **23 pass, one
+fails** (MOV SS/SYSCALL, SIGSEGV, matching its earlier watchpoint-delivery problem), **four are unavailable** because
+the kernel refuses the required GDT descriptors. Zero RUN lines are explicitly classified as unavailable, even if
+the child returns zero. The first reference pilot also observed an extra RF bit (`0x246` versus `0x10246`) in
+`corrupt32-ss16`; the corrected-wrapper reference passes that case with the identical sigreturn binary. This is an
+intermittent reference observation, not evidence of a natemu defect. The original native full-run results remain
+the hardware reference; no new remote native run was possible during this continuation.

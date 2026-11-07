@@ -77,11 +77,12 @@ class FastCalls(unittest.TestCase):
         self.assertEqual(m.sysret(dict(s, efer=0xD00, cpl=3))['fault'], UD)               # #UD before the CPL check
         self.assertEqual(m.sysret(dict(s, cpl=3))['fault'], GP)
         self.assertEqual(m.sysret(dict(s, cpl=3), width=4)['fault'], GP)
-        self.assertEqual(m.sysret(s, width=4)['outcome'], 'refused')                    # compatibility mode
+        r = m.sysret(s, width=4)                                                        # compatibility mode: the deviation
+        self.assertEqual((r['fault'][:2], r['deviation'], r['fault_rip']), ((GP[0], (s['msrs']['star'] >> 48 | 3) & 0xFFFC), True, 0x40_0000))
         bad = machine()
         bad['gpr'].update(rcx=0x0000_8000_0000_0000, r11=0x302)
         self.assertEqual(m.sysret(bad)['fault'], GP)                                    # non-canonical before TF
-        self.assertEqual(m.sysret(bad, width=4)['outcome'], 'refused')                  # SYSRETL: no RCX check
+        self.assertEqual(m.sysret(bad, width=4)['fault_rip'], 0)                        # SYSRETL: no RCX check, ECX
         s['gpr']['r11'] = 0x302
         self.assertEqual(done(self, m.sysret(s))['rflags'], 0x302)                     # TF after (C3)
         s['gpr']['r11'] = 0x202
