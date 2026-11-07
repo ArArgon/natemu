@@ -148,7 +148,7 @@ def driver(host, runtime, fexc, text, work, extra=(), timeout=None):
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     try:
-        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *CODE_SHAPE, *map(str, extra)],
+        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *vm.frame_alias_args(), *CODE_SHAPE, *map(str, extra)],
                              capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         err = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
@@ -1168,19 +1168,20 @@ def x2_cases():
     # Perf chunk 15: at CPL 0, PUSHFQ reads the IF an inline CLI or STI just wrote (one block).
     flags = ref.assemble('nop\ncli\npushfq\npop rbx\nnop\nsti\npushfq\npop rcx\ncli\ncmp r11, r11')
     cases.append(('x2-cli-sti-pushf-cpl0', f'cpl 0\nrflags 0x202\nrip {base:#x}\n{stack}code {flags.hex()}\n', reached(rbx=0x2, rcx=0x202)))
-    # Perf chunk 15 review: a CPL-3 store to IF's byte in the guest-state page (the recorded deviation, abi GUEST_STATE_VA)
-    # changes nothing: the resident banks that byte only after a CPL-0 block. After the store and a block boundary (CPUID),
-    # PUSHFQ sees IF = 1 and an interrupt posted then is taken (frame IF = 1).
+    # This historical fixed address is noncanonical and unmapped with the suite's distant alias override.
+    # It must #GP before changing IF; run_frame_randomization.py separately tests the selected-page hole.
     va = 0xffff_4000_0000_13f9
-    user, lab = ref.assemble(f'nop\nu: nop\nmov rax, {va:#x}\nmov byte ptr [rax], 0\nxor eax, eax\ncpuid\npushfq\npop rbx\nh: nop\nnop\ncmp r11, r11', labels=True)
+    user, lab = ref.assemble(f'nop\nu: nop\nmov rax, {va:#x}\nalias: mov byte ptr [rax], 0\nxor eax, eax\ncpuid\npushfq\npop rbx\nh: nop\nnop\ncmp r11, r11', labels=True)
 
-    def taken_with_if(out):
-        f = [smp.num(x) for x in out.get('fault') or []]
-        rbx = smp.num(out['gpr'][smp.REGS.index('rbx')])
-        ok = out['stop'] == 'guest_fault' and f[:1] == [0x40] and smp.num(out['rflags']) & 0x200 and rbx & 0x200
-        return [] if ok else [f"{out['stop']} {out['reason']} at {out['rip']} fault {f} rflags {out.get('rflags')} rbx {rbx:#x}"]
+    def alias_gp(out):
+        problems = fault(13, base + lab['alias'])(out)
+        if not out.get('frame_intact'): problems.append('FEX frame changed')
+        g = [smp.num(x) for x in out['gpr']]
+        if (g[0], g[1], g[2], g[3], smp.num(out['rflags'])) != (va, 0, 0, 0, 0x202):
+            problems.append(f"alias store changed state: GPR {g} RFLAGS {out['rflags']}")
+        return problems
     cases.append(('x2-cpl3-if-byte', f"cpl 0\nrflags 0x202\nrip {base:#x}\nswitch {base + lab['u']:#x} 3\n{stack}svr 0x1ff\npost {base + lab['h']:#x} 0x40\n"
-                  f"code {user.hex()}\n", taken_with_if))
+                  f"code {user.hex()}\n", alias_gp))
     lock_cli = bytes([0x90, 0xf0, 0xfa]) + ref.assemble('cmp r11, r11')
     cases.append(('x2-lock-cli', f'cpl 0\nrip {base:#x}\ncode {lock_cli.hex()}\n', fault(6, base + 1)))
     # HLT with no event that can wake it: IF = 0 and an interrupt pending (masked, model A10), or nothing pending. The
@@ -1227,11 +1228,11 @@ def ac_cases(fault, reached, refused):
     case('push', asm('push rbx'), fault(17, at), rsp=0x201801)
     case('popf', asm('popfq'), fault(17, at), rsp=0x201804)
     # No #AC: aligned, bytes, AC cleared by POPF at CPL 3 (AC is writable there), AM clear, CPL 0 (no switch effect needed:
-    # the access before the switch), an 8-byte aligned 16-byte MOVUPS (the SDM permits no #AC there: refused, not built).
+    # the access before the switch), an 8-byte aligned 16-byte MOVUPS (the SDM permits no #AC there: resident completion).
     case('aligned', asm('mov rcx, [rbx+8]\nmov [rbx+16], ecx\nmov dx, [rbx+2]\nmov al, [rbx+1]\nmov ebx, 1'), reached(rbx=1))
     case('popf-clears-ac', asm('push 0x202\npopfq\nmov rcx, [rbx+1]\nmov ebx, 1'), reached(rbx=1))
     case('am-clear', asm('mov rcx, [rbx+1]\nmov ebx, 1'), reached(rbx=1), am=False)
-    case('movups8', asm('movups xmm0, [rbx+8]'), refused('unsupported_mode'), extra='sse 1\n')
+    case('movups8', asm('movups xmm0, [rbx+8]'), reached(), extra='sse 1\n')
     # BT/BTS/BTR/BTC on memory (fexc cuts them under alignment checking: FEX touches one byte): #AC(0) when the operand is
     # misaligned at its size (with a register bit offset, the unit it selects has EA's alignment), else they run (results
     # checked), with LOCK too; AM clear: no #AC.
@@ -1409,6 +1410,21 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
                 entry['runs'].append({'max_block': limit[0] if limit else None, 'ok': ok})
                 if not ok: failures.append(f"{name}{' (max-block 1)' if limit else ''}: want {want_stop} at {model['at']:#x}, got {rc} {cpu and (cpu['stop'], cpu['reason'], cpu['rip'])} {err.strip()[-200:]}")
             print(f"{name}: {'ok' if all(r['ok'] for r in entry['runs']) else 'FAIL'} (refused: {model['reason']})", flush=True)
+            report.append(entry)
+            continue
+        if model and model.get('deviation'):
+            # natemu's recorded deviation (compatibility-mode code at CPL 3, owner decision of November 6): the model's #GP at
+            # its RIP (the instruction, or a SYSRET's target), RSP as the model leaves it; QEMU runs the code, so it is not run.
+            want_fault = (model['fault'][0], model['fault'][1], model['at'], 0)
+            for limit in ([], [1]):
+                rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
+                cpu = out and out['cpus'][0]
+                got = cpu and (vm_fault(cpu), smp.num(cpu['gpr'][4]))
+                ok = rc == 0 and got == (want_fault, model['rsp'])
+                entry['runs'].append({'max_block': limit[0] if limit else None, 'ok': ok, 'got': str(got)})
+                if not ok: failures.append(f"{name}{' (max-block 1)' if limit else ''}: want {want_fault} rsp {model['rsp']:#x}, got {rc} {got} "
+                                           f"{cpu and (cpu['stop'], cpu['reason'])} {err.strip()[-200:]}")
+            print(f"{name}: {'ok' if all(r['ok'] for r in entry['runs']) else 'FAIL'} (deviation: {want_fault})", flush=True)
             report.append(entry)
             continue
         want, rc = qemu(prog, name, timeout=30 if name in QEMU_DIFFERS else 120)
@@ -1801,14 +1817,13 @@ def priv_programs(i):
     both = lambda c: (None, {3: f1(c), 8: f1(c), 9: f2(c), 10: f2(c)})
     smep = (PRIV_HEAD + 'mov rax, cr4\nbts rax, 20\nmov cr4, rax\nmov rbx, qword ptr [{UW}]\n' + PRIV_TO_USER
             + 'mov r8, qword ptr [{UW}]\nsw_0: nop\nafter: mov r9, 1\n')
-    # G1: the guest-state page's EL0 alias (abi GUEST_STATE_VA) and its former address in the private window (PRIVATE +
-    # 0x24000), each accessed at CPL0 and at CPL3 through a computed pointer. The former address is #GP(0) like every
-    # non-canonical address; the alias is the documented deviation at both CPLs: a store and a load back reach the vCPU's
-    # own page (a non-field qword, restored to 0, so the frame check holds).
+    # These historical addresses are noncanonical and unmapped with the suite's distant alias override.
+    # The selected-page hole is tested in run_frame_randomization.py. Here the first access must #GP(0),
+    # preserving the source value and leaving later loads/stores unexecuted.
     old = lambda tail: lambda c: ((13, 0, c['labels'][tail], 0), {})
-    new = lambda c: (None, {8: 0x1234, 9: 1})
+    new = lambda c: ((13, 0, c['labels']['alias'], 0), {0: G1_PAGE, 1: 0x1234, 8: 0, 9: 0})
     old_access = 'tail: mov rbx, qword ptr [rax]\n'
-    new_access = 'mov rcx, 0x1234\nmov qword ptr [rax+8], rcx\nmov r8, qword ptr [rax+8]\nmov qword ptr [rax+8], 0\nmov r9, 1\n'
+    new_access = 'mov rcx, 0x1234\nalias: mov qword ptr [rax+8], rcx\nmov r8, qword ptr [rax+8]\nmov qword ptr [rax+8], 0\nmov r9, 1\n'
     guest_state = {
         'gs-old0': (PRIV_HEAD + f'mov rax, {G1_OLD:#x}\n' + old_access, 1, old('tail')),
         'gs-old3': (PRIV_HEAD + PRIV_TO_USER + f'mov rax, {G1_OLD:#x}\n' + old_access, 1, old('tail')),
@@ -1891,7 +1906,8 @@ def cmd_privilege(a, host, runtime):
             for n in (1, 4):
                 bad = len(failures)
                 cpus = [dict(priv_cpu(i, n, text, wp), i=i) for i in range(n)]
-                run(f'{name}{n}', cpus, [expect(c) for c in cpus], limit)
+                check = (lambda v, cpu: [] if smp.num(cpu['rflags']) == 0x202 else [f"cpu{v} alias store changed RFLAGS {cpu['rflags']}"]) if name.startswith('gs-new') else None
+                run(f'{name}{n}', cpus, [expect(c) for c in cpus], limit, check)
                 print(f"{name} at {n} vCPU(s){' max-block 1' if limit else ''}: {'ok' if len(failures) == bad else 'FAIL'}", flush=True)
         seen = {}
         for name, (text, expect, rounds) in loops.items():

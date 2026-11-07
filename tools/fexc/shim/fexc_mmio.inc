@@ -42,7 +42,9 @@ inline void FexcMmioRecord(const DecodedInst& d, uint64_t rip) {
     const bool w = f & FLAG_REX_WIDENING;                       // 16-bit MOV, REX.W sign-extends m32, else a 32-bit MOV
     width = (f & FLAG_OPERAND_SIZE) && !w ? 2 : 4; dest = w ? 8 : width; sign = w; has_reg = true;
   } else if (!primary && (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF) && memory) {
-    width = src; dest = dst; sign = op >= 0xBE; has_reg = true;
+    // No-stop change: a sign extension only when it widens (66 0f bf, MOVSX r16, m16, is a 16-bit move; its record with the
+    // sign bit set was refused by admission, ending the run).
+    width = src; dest = dst; sign = op >= 0xBE && dst > src; has_reg = true;
   } else {
     return;
   }

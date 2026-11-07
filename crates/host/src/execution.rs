@@ -117,6 +117,36 @@ impl Area<'_> {
 /// address space and shared record in place; guest RAM is zero. Each vCPU's code cache holds `code_bytes` of generated
 /// code (at most `cache::CODE_BYTES_MAX`).
 pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) -> Result<Backing> {
+    unsafe extern "C" {
+        fn getentropy(buf: *mut u8, len: usize) -> i32;
+    }
+    let va = random_guest_state_alias(|bytes| {
+        // SAFETY: the buffer is writable and 8 bytes, below getentropy's 256-byte limit.
+        unsafe { getentropy(bytes.as_mut_ptr(), bytes.len()) }
+    })?;
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va)
+}
+
+fn random_guest_state_alias(fill: impl FnOnce(&mut [u8; 8]) -> i32) -> Result<u64> {
+    let mut bytes = [0; 8];
+    if fill(&mut bytes) != 0 {
+        return Err(format!("guest-state alias entropy: {}", std::io::Error::last_os_error()));
+    }
+    // Uniform among all 2^27 pages; no fallback to a fixed, time-derived or process-derived address.
+    let mask = (exec::GUEST_STATE_SLOT.end - exec::GUEST_STATE_SLOT.start - 1) & !4095;
+    Ok(exec::GUEST_STATE_SLOT.start + (u64::from_ne_bytes(bytes) & mask))
+}
+
+/// Deterministic alias selection for test drivers only, before any tables are populated. Production always uses entropy.
+#[cfg(feature = "testing")]
+pub fn prepare_with_guest_state_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize, va: u64) -> Result<Backing> {
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va)
+}
+
+fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize, va: u64) -> Result<Backing> {
+    if !exec::guest_state_alias_valid(va) {
+        return Err(format!("guest-state alias {va:#x}: an aligned page inside the reserved slot is required"));
+    }
     if !(1..=cache::MAX_VCPUS).contains(&n) {
         return Err(format!("{n} vCPUs: the execution mode runs 1 to {}", cache::MAX_VCPUS));
     }
@@ -159,11 +189,12 @@ pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) ->
         ]);
         private_space(&memory, base, &spans, true);
         // The guest-state page's EL0 alias (x28 of generated code), backed by the frame page (G1).
-        guest_state_alias(&memory, base, base + exec::FRAME_OFFSET);
+        guest_state_alias(&memory, base, base + exec::FRAME_OFFSET, va);
         // SAFETY: Control is plain integers; the resident owns everything but the capacity.
         let mut control: cache::Control = unsafe { std::mem::zeroed() };
         control.code_bytes = (cache::HEAD_BYTES + code_bytes) as u64;
         control.ram_bytes = ram_bytes as u64;
+        control.guest_state_va = va;
         memory.write_record(base + cache::LOOKUP_OFFSET + cache::CONTROL, control);
         // SAFETY: Shared is plain integers; all-zero is its empty value.
         let mut shared: Shared = unsafe { std::mem::zeroed() };
@@ -344,9 +375,10 @@ pub fn k1_stats(area: Area) -> String {
     let types: Vec<String> = (0..8).filter(|&t| c.memory_types[t] != 0).map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t])).collect();
     // Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
     let kinds: Vec<String> = (0..128).filter(|&k| c.system_counts[k] != 0).map(|k| format!("\"{k:#x}\":[{},{}]", c.system_counts[k], ticks_ns(c.system_ticks[k]) / 1000)).collect();
+    let declined: Vec<String> = natemu_abi::execution::perf::SYS_FAST_DECLINE_NAMES.iter().zip(c.sys_fast_declined).map(|(name, count)| format!("\"{name}\":{count}")).collect();
     let from: Vec<String> = (0..32).filter(|&b| c.system_from[b] != 0).map(|b| format!("\"{}\":{}", natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"), c.system_from[b])).collect();
     format!(
-        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{}}}}}",
+        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}}}}",
         c.cr3_loads, c.global_flushes, c.invlpgs, c.revalidated, c.remapped, c.capacity_flushes, c.killed, c.unvalidated,
         ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned,
         types.join(","),
@@ -373,7 +405,8 @@ pub fn k1_stats(area: Area) -> String {
         c.kept_resets,
         kinds.join(","),
         from.join(","),
-        c.system_chained
+        c.system_chained,
+        declined.join(",")
     )
 }
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
@@ -1344,7 +1377,7 @@ impl Compiler {
                         r.halved = true;
                     }
                 }
-                Err((_, reason)) => return Ok(Code::None(reason.into())),
+                Err((_, reason)) => return Ok(Self::refused(reason, bytes, rip)),
             }
         }
     }
@@ -1518,15 +1551,33 @@ impl Compiler {
                     _ if reason == "unsupported_form" && cut.is_some() => {
                         match crate::system::branch(bytes, rip).or_else(|| crate::system::undefined(bytes)) {
                             Some(s) => Ok(Code::System(s)),
-                            None => Ok(Code::None(reason.clone())),
+                            None => Ok(Self::refused(reason, bytes, rip)),
                         }
                     }
-                    _ => Ok(Code::None(reason.clone())),
+                    _ => Ok(Self::refused(reason, bytes, rip)),
                 }
             }
         })
     }
-    /// The request body for `bytes` at `rip` (protocol in tools/fexc/fexc.cpp).
+    /// A no-code answer at `rip`: the fetch-limited ones (`partial_decode`, `end_of_input`: the caller fetches on or delivers the
+/// fetch fault) stay no code; every other one is an instruction natemu cannot run yet (a refused form, a system instruction
+/// the host does not decode, a decoder or dispatcher failure, a compiler limit at one instruction), which x86 would run or
+/// fault on: it is delivered as #UD at the instruction ([`exec::system::REFUSED`], the recorded deviation of the owner's rule
+/// of November 6: no instruction a guest program can execute stops the machine), never a machine stop. The first ones are
+/// logged on standard error.
+fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
+    if matches!(reason, "partial_decode" | "end_of_input") {
+        return Code::None(reason.into());
+    }
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // ponytail: the first 32 per process; a per-form count would need a map behind a lock.
+    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+        let hex: String = bytes.iter().take(15).map(|b| format!("{b:02x}")).collect();
+        eprintln!("natemu: {reason} at {rip:#x} ({hex}): delivered as #UD (a form natemu does not run yet)");
+    }
+    Code::System(exec::System { kind: exec::system::REFUSED, length: 1, ..exec::System::NONE })
+}
+/// The request body for `bytes` at `rip` (protocol in tools/fexc/fexc.cpp).
     fn body(&self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Vec<u8> {
         self.body_with(bytes, format!("{rip:#x}"), limit)
     }
@@ -2149,6 +2200,50 @@ fn translation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frame_alias_entropy_selects_full_slot_and_fails_closed() {
+        for word in [0, 4095, 4096, (1 << 21) - 1, 1 << 21, 1 << 30, u64::MAX] {
+            let va = random_guest_state_alias(|bytes| { *bytes = word.to_ne_bytes(); 0 }).unwrap();
+            assert!(exec::guest_state_alias_valid(va));
+            assert_eq!(va, exec::GUEST_STATE_SLOT.start + (word & ((1 << 39) - 4096)));
+        }
+        assert_eq!(random_guest_state_alias(|bytes| { *bytes = u64::MAX.to_ne_bytes(); 0 }).unwrap(), exec::GUEST_STATE_SLOT.end - 4096);
+        assert!(random_guest_state_alias(|bytes| { *bytes = [0xff; 8]; -1 }).is_err());
+        // Reject invalid overrides before loading a resident or allocating memory.
+        for va in [0, exec::GUEST_STATE_SLOT.start + 1, exec::GUEST_STATE_SLOT.end] {
+            assert!(prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va).err().unwrap().starts_with("guest-state alias"));
+        }
+    }
+
+    #[test]
+    fn sys_fast_declines_do_not_count_as_system_instructions() {
+        use natemu_abi::execution::{perf::SysFastDecline, system};
+        let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
+        let ram = unsafe { GuestRam::new(0, 0, memory.0 as u64) };
+        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram };
+        let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
+        let mut c: cache::Control = area.read_record(offset);
+        // All old aliases, including the presently unused 0x7f, remain genuine kind slots.
+        for (n, kind) in [system::MASKMOV, system::ROTATE, system::DOUBLE_SHIFT16, 0x7f].into_iter().enumerate() {
+            c.system_counts[kind as usize] = 10 + n as u64;
+        }
+        let counts = c.system_counts;
+        for (n, reason) in [SysFastDecline::NotCurrent, SysFastDecline::Boundary, SysFastDecline::Other, SysFastDecline::After].into_iter().enumerate() {
+            for _ in 0..=n {
+                // This is the same increment used by the perf resident's declined() path.
+                c.record_sys_fast_decline(reason);
+            }
+            assert_eq!(c.system_counts, counts);
+            assert_eq!(c.system_ticks, [0; 128]);
+        }
+        assert_eq!(c.sys_fast_declined, [1, 2, 3, 4]);
+        area.write_record(offset, c);
+        let output = crate::json::parse(&k1_stats(area)).unwrap();
+        let systems = output.get("systems").unwrap();
+        assert_eq!(systems.get("kinds"), Some(&crate::json::parse(r#"{"0x7c":[10,0],"0x7d":[11,0],"0x7e":[12,0],"0x7f":[13,0]}"#).unwrap()));
+        assert_eq!(systems.get("declined"), Some(&crate::json::parse(r#"{"not_current":1,"boundary":2,"other":3,"after":4}"#).unwrap()));
+    }
+
     /// Changes every answer `c` keeps (no other reference is held between compiles).
     fn edit(c: &mut Compiler, f: impl Fn(&mut Entry)) {
         for s in &c.answers.shards {
@@ -2276,7 +2371,8 @@ mod tests {
         assert_eq!(answers.get().unwrap().kept().1, 1);
     }
     /// With `FEXC` set (R2 review): an answer with a spill area is not a host error. The block is translated again with half
-    /// its instructions; a spill area at one instruction is the typed stop `spill_area`. fexc spills on none of the corpora,
+    /// its instructions; a spill area at one instruction is delivered as #UD (`REFUSED`, no-stop change; it was the typed stop
+    /// `spill_area`). fexc spills on none of the corpora,
     /// so the cached answers are given a spill area (header `spill_bytes`).
     #[test]
     fn spill_areas_retry_then_stop() {
@@ -2293,6 +2389,7 @@ mod tests {
         let insns = |c: &mut super::Compiler| match c.compile(&code, 0x1000, false, &mut ()).unwrap() {
             Code::Block(b) => Ok(b.guest_insns),
             Code::None(reason) => Err(reason),
+            Code::System(s) if s.kind == exec::system::REFUSED => Err("refused".into()),
             Code::System(_) => panic!("system"),
         };
         assert_eq!(insns(&mut c), Ok(4));
@@ -2300,7 +2397,7 @@ mod tests {
         assert_eq!(insns(&mut c), Ok(2)); // translated again at 2
         c.compile(&code, 0x1000, true, &mut ()).unwrap(); // the step translation (limit 1) cached too
         spill(&mut c);
-        assert_eq!(insns(&mut c), Err("spill_area".into()));
+        assert_eq!(insns(&mut c), Err("refused".into()));
     }
 
     /// With `FEXC` set: a repeated request is answered from the cache, a different RIP, bytes or block limit is compiled.
@@ -2525,9 +2622,10 @@ mod tests {
                 assert!(admission::admit(&o, 0x1000, code, u64::MAX, true, cpl0).is_ok(), "{code:02x?}");
             }
         }
-        // 66, F3 or F2 before 0f ae /3 m: not STMXCSR (no code; the host's), whatever map FEX files it under.
+        // 66, F3 or F2 before 0f ae /3 m: not STMXCSR (no code: delivered as #UD, the no-stop change's REFUSED), whatever map
+        // FEX files it under.
         for code in [&[0x66, 0x0f, 0xae, 0x18, 0xc3][..], &[0xf3, 0x0f, 0xae, 0x18, 0xc3], &[0xf2, 0x0f, 0xae, 0x18, 0xc3]] {
-            assert!(matches!(c.compile(code, 0x1000, false, &mut ()).unwrap(), Code::None(_)), "{code:02x?}");
+            assert!(matches!(c.compile(code, 0x1000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::REFUSED), "{code:02x?}");
         }
         assert_eq!(block(&mut c, &[0x0f, 0xae, 0x10, 0xc3]).err(), Some(exec::system::LDMXCSR));
         assert_eq!(block(&mut c, &[0xc5, 0xf8, 0xae, 0x17, 0xc3]).err(), Some(exec::system::VLDMXCSR));

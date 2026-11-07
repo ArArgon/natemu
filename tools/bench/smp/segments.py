@@ -15,7 +15,7 @@ from models import segment_model as sm, delivery_model as dm
 # Per CPU i, offsets from programs.SYS_D(i): GDT (writable), its copy on the read-only page R, LDT, TSS, pointers (P,
 # not captured), results (C, captured), user code and stack (user pages: every data page is P|RW|US|A|D).
 GDT, RO, LDT, TSS, PTR, CAP, UCODE, USTACK = 0x8000, P.R, 0xd000, 0xc000, 0xb000, 0xe000, 0x9000, 0xa800
-LIMIT = 0xcf
+LIMIT = 0xdf
 
 
 def gdt_image(i):
@@ -23,7 +23,7 @@ def gdt_image(i):
     e = {0x08: sm.code(), 0x10: sm.data(), 0x18: sm.data(3), 0x20: sm.code(3), 0x28: sm.data(present=False),
          0x30: sm.code(readable=False), 0x38: sm.code(l=0, d=1), 0x40: sm.data(writable=False), 0x48: sm.data(accessed=False),
          0x50: sm.data(base=0x1234_5678 + i), 0x58: sm.code(3, conforming=True), 0xc0: sm.code(present=False),
-         0xc8: sm.data(present=False)}
+         0xc8: sm.data(present=False), 0xd0: sm.code(3, l=0, d=0), 0xd8: sm.code(3, l=0, d=1)}
     image = bytearray(LIMIT + 1)
     for sel, raw in e.items():
         image[sel:sel + 8] = raw.to_bytes(8, 'little')
@@ -361,7 +361,7 @@ def cases():
     c = []
     load = lambda sreg, sel, **o: (f'    mov eax, {sel:#x}\n', f'    mov {sreg}, eax\n', lambda s: sm.load(s, sreg, sel), o)
     c.append(('fs-ldt-null', '    lldt ax\n    mov eax, 0x0c\n', '    mov fs, eax\n', lambda s: sm.load(s, 'fs', 0x0c), {}))
-    for name, sreg, sel in (('ds-not-present', 'ds', 0x28), ('es-execute-only', 'es', 0x30), ('ds-rpl', 'ds', 0x13), ('gs-limit', 'gs', 0xd0), ('ss-read-only', 'ss', 0x40),
+    for name, sreg, sel in (('ds-not-present', 'ds', 0x28), ('es-execute-only', 'es', 0x30), ('ds-rpl', 'ds', 0x13), ('gs-limit', 'gs', 0xe0), ('ss-read-only', 'ss', 0x40),
                             ('ss-not-present', 'ss', 0xc8), ('ss-code', 'ss', 0x08), ('ss-dpl3', 'ss', 0x1b),
                             ('ss-null-rpl1', 'ss', 0x1), ('ds-tss', 'ds', 0x70)):
         c.append((name,) + load(sreg, sel))
@@ -391,6 +391,12 @@ def cases():
     c.append(('jmp-far-compat',) + far(0x38) + (lambda s: sm.far(_ptr(s, 0x110000, 0x38), 'jmp', d + PTR + 0x90), {}))
     c.append(('jmp-far-call-gate',) + far(0xb0) + (lambda s: sm.far(_ptr(s, 0x110000, 0xb0), 'jmp', d + PTR + 0x90), {}))
     c.append(('lret-compat',) + ret([0x110000, 0x38]))
+    # Owner decision (November 6): a transfer to compatibility-mode code at CPL 3 is #GP(selector) with nothing changed (a
+    # recorded deviation, judged by segment_model alone: x86 runs the code). From CPL 0: IRETQ and an outer RET to the 32-bit
+    # (0xdb) and 16-bit (0xd3) DPL 3 code segments.
+    c.append(('iret-compat-cpl3',) + iret([0x110000, 0xdb, 2, d + USTACK, 0x1b]))
+    c.append(('iret-compat16-cpl3',) + iret([0x110000, 0xd3, 2, d + USTACK, 0x1b]))
+    c.append(('lret-compat-cpl3',) + ret([0x110000, 0xdb, d + USTACK, 0x1b]))
     # (An IRETQ loading TF is no longer a refusal: its single-step trap is S4's, tools/run_s4.py `s4-popf-iret`.)
     c.append(('iret-null-ss-rpl',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x1]))
     c.append(('iret-dpl3-ss',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x18]))
@@ -401,13 +407,28 @@ def cases():
                              ('ss-dpl0', '    mov eax, 0x13\n    mov ss, eax\n', lambda s: sm.load(s, 'ss', 0x13)),
                              ('lgdt', '    lgdt [rsp]\n', lambda s: sm.lgdt(s, d + USTACK)),
                              ('ltr', '    mov eax, 0x70\n    ltr ax\n', lambda s: sm.ltr(s, 0x70)),
-                             ('lret-to-cpl0', '    push 0x08\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0x08])))):
+                             ('lret-to-cpl0', '    push 0x08\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0x08]))),
+                             # The compatibility-mode deviation at CPL 3 (above): far JMP and CALL, RET far, IRETQ; a call gate.
+                             ('jmp-far-compat', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    jmp far [rsp-16]\n',
+                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xdb), 'jmp', s['rsp'] - 16, stack=True)),
+                             ('call-far-compat16', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xd3\n    call far [rsp-16]\n',
+                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xd3), 'call', s['rsp'] - 16, stack=True)),
+                             ('lret-compat', '    push 0xdb\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0xdb]))),
+                             ('iret-compat', '    mov rax, rsp\n    push 0x1b\n    push rax\n    push 2\n    push 0xdb\n    push 0x110000\n    iretq\n',
+                              lambda s: sm.iret(_stack(s, [0x110000, 0xdb, 2, s['rsp'], 0x1b]))),
+                             ('jmp-far-call-gate', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xb3\n    jmp far [rsp-16]\n',
+                              lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xb3), 'jmp', s['rsp'] - 16, stack=True))):
         c.append((f'cpl3-{name}', None, insn, call, {'cpl': 3}))
     return c
 
 
 def _ptr(s, off, sel):
     dm.place(s['memory'], P.SYS_D(0) + PTR + 0x90, off.to_bytes(8, 'little') + sel.to_bytes(2, 'little'))
+    return s
+
+
+def _ptr_at(s, at, off, sel):
+    dm.place(s['memory'], at, off.to_bytes(8, 'little') + sel.to_bytes(2, 'little'))
     return s
 
 
@@ -438,6 +459,7 @@ def fault_programs():
             at = P.SYS_CODE(0) + len(P.asm(full)) - len(tail)
         r = call(state)
         prog['params'] = {'model': {'outcome': r['outcome'], 'fault': r['fault'], 'at': at, 'reason': r['reason'],
+                                    'deviation': r.get('deviation', False), 'rsp': r['state']['rsp'],
                                     'permitted': sorted(([o, list(f) if f else None] for o, f in r['permitted']), key=str)}}
         out.append(prog)
     return out

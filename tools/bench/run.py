@@ -11,7 +11,8 @@ NATEMU-BENCH-END line on the serial console (START2/END2 for run 2; boot exclude
 benchmark with phases (zstd: compress, decompress, verify; 7zip: compress, test; mem: vm, mmap, fork) is also timed per
 phase, each from the previous marker to its NATEMU-BENCH-PHASE (PHASE2) line (`phases` / `phases2`: name, host seconds,
 the guest's own guest_s and rc). Record fields: `wall_s` / `guest_s` / `phases` / `verified1` are run 1, `wall2_s` /
-`guest2_s` / `phases2` / `verified2` run 2, `verified` both runs.
+`guest2_s` / `phases2` / `verified2` run 2, `verified` both runs. Marker times use the end of their serial read;
+`timing` retains monotonic read brackets, and `wall_bounds_s` / `wall2_bounds_s` (also on phases) expose polling uncertainty.
 
 The serial file is polled every 50 ms; every 0.5 s `vms.sh` lists foreign VM processes (another natemu stub, natemu-host
 or QEMU, not this boot's own children), recorded as `contended`. natemu: the stub (`--natemu`, default
@@ -67,46 +68,69 @@ def main():
                '-display', 'none', '-monitor', 'none', '-serial', f'file:{serial}', '-no-reboot']
     t0 = time.monotonic()
     p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=open(f'{out}/{name}.stdout', 'w'), stderr=open(f'{out}/{name}.stderr', 'w'))
-    # markers carry a trailing space so START does not match START2; each is the host time the line first appeared
-    M = {k: None for k in ('START ', 'END ', 'START2 ', 'END2 ')}; text = ''; others = set(); last = 0.0; seen = [[], []]   # PHASE / PHASE2 host times
+    # Trailing spaces distinguish START/START2; timestamps are read ends, not pre-process-query times.
+    M = {k: None for k in ('START ', 'END ', 'START2 ', 'END2 ')}; text = ''; others = set(); last = 0.0; seen = [[], []]
+    bounds = {}; phase_bounds = [[], []]; previous_read_start = t0
+
+    def read_serial():
+        nonlocal text, previous_read_start
+        before = time.monotonic()
+        try:
+            with open(serial, errors='replace') as f: data = f.read()
+        except FileNotFoundError:
+            return
+        after = time.monotonic()
+        # A marker may arrive during the previous read; its start is the conservative lower bound.
+        bracket = dict(lower_s=previous_read_start, upper_s=after, read_start_s=before)
+        previous_read_start = before
+        text = data[:data.rfind('\n') + 1]   # defer partial lines until their terminating newline arrives
+        for k in M:
+            if M[k] is None and 'NATEMU-BENCH-' + k in text:
+                M[k] = after; bounds[k] = bracket
+        for i, tag in enumerate(('PHASE ', 'PHASE2 ')):
+            added = text.count('NATEMU-BENCH-' + tag) - len(seen[i])
+            seen[i] += [after] * added; phase_bounds[i] += [bracket] * added
+
     while time.monotonic() - t0 < cap and p.poll() is None:
         time.sleep(0.05)
         now = time.monotonic()
         if now - last >= 0.5:
             others |= foreign(p.pid); last = now
-        try:
-            text = open(serial, errors='replace').read()
-        except FileNotFoundError:
-            continue
-        for k in M:
-            if M[k] is None and 'NATEMU-BENCH-' + k in text: M[k] = now
-        for i, tag in enumerate(('PHASE ', 'PHASE2 ')):
-            seen[i] += [now] * (text.count('NATEMU-BENCH-' + tag) - len(seen[i]))
+        read_serial()
     if p.poll() is None:
         p.send_signal(signal.SIGINT)
         try: p.wait(10)
         except subprocess.TimeoutExpired: p.kill(); p.wait()
+    read_serial()   # the process can append its last markers just before exiting
     total = time.monotonic() - t0
-    text = open(serial, errors='replace').read() if os.path.exists(serial) else ''
 
-    def run(sfx, start, end, seen):
+    def elapsed_bounds(a, b):
+        return [b['lower_s'] - a['upper_s'], b['upper_s'] - a['lower_s']] if a is not None and b is not None else None
+
+    def run(sfx, start, end, seen, phase_bounds):
         m = re.search(r'NATEMU-BENCH-END%s \S+ \S+ rc=(\d+) guest_s=([0-9.]+)' % sfx, text)
         marks = [start] + seen
-        ph = [dict(name=p[0], wall_s=round(seen[i] - marks[i], 3) if start and i < len(seen) else None, rc=int(p[1]), guest_s=float(p[2]))
+        brackets = [bounds.get('START' + sfx + ' ')] + phase_bounds
+        ph = [dict(name=p[0], wall_s=round(seen[i] - marks[i], 3) if start is not None and i < len(seen) else None,
+                   wall_bounds_s=elapsed_bounds(brackets[i], phase_bounds[i]), rc=int(p[1]), guest_s=float(p[2]))
               for i, p in enumerate(re.findall(r'NATEMU-BENCH-PHASE%s \S+ \S+ name=(\S+) rc=(\d+) guest_s=([0-9.]+)' % sfx, text))]
         return dict(reached=end is not None, verified=('NATEMU-BENCH-VERIFY%s ok' % sfx) in text and ('NATEMU-BENCH-VERIFY%s FAIL' % sfx) not in text,
-                    wall_s=round(end - start, 3) if start and end else None, guest_s=float(m.group(2)) if m else None,
+                    wall_s=round(end - start, 3) if start is not None and end is not None else None,
+                    wall_bounds_s=elapsed_bounds(bounds.get('START' + sfx + ' '), bounds.get('END' + sfx + ' ')), guest_s=float(m.group(2)) if m else None,
                     rc_bench=int(m.group(1)) if m else None, phases=ph)
-    r1 = run('', M['START '], M['END '], seen[0]); r2 = run('2', M['START2 '], M['END2 '], seen[1])
+    r1 = run('', M['START '], M['END '], seen[0], phase_bounds[0]); r2 = run('2', M['START2 '], M['END2 '], seen[1], phase_bounds[1])
     verified = r1['verified'] and r2['verified']
     start = M['START ']
     rec = dict(name=name, emu=emu, vcpus=int(n), bench=bench, jobs=int(jobs), reached=r1['reached'] and r2['reached'], verified=verified,
-               verified1=r1['verified'], verified2=r2['verified'], wall_s=r1['wall_s'], wall2_s=r2['wall_s'], guest_s=r1['guest_s'],
+               verified1=r1['verified'], verified2=r2['verified'], wall_s=r1['wall_s'], wall2_s=r2['wall_s'],
+               wall_bounds_s=r1['wall_bounds_s'], wall2_bounds_s=r2['wall_bounds_s'], guest_s=r1['guest_s'],
                guest2_s=r2['guest_s'], rc_bench=r1['rc_bench'], rc_bench2=r2['rc_bench'], phases=r1['phases'], phases2=r2['phases'],
-               boot_to_start_s=round(start - t0, 3) if start else None,
+               boot_to_start_s=round(start - t0, 3) if start is not None else None,
+               timing=dict(clock='monotonic', marker_time='read_end', markers={k.strip(): v for k, v in bounds.items()},
+                           phases=phase_bounds[0], phases2=phase_bounds[1]),
                total_s=round(total, 3), cpus=re.findall(r'cpus=(\d+)', text)[:1], contended=sorted(others), rc=p.returncode,
-               cmd=[str(c) for c in cmd], stderr=open(f'{out}/{name}.stderr').read()[-300:])
-    open(f'{out}/bench.jsonl', 'a').write(json.dumps(rec) + '\n')
+               cmd=[str(c) for c in cmd], stderr=pathlib.Path(f'{out}/{name}.stderr').read_text()[-300:])
+    with open(f'{out}/bench.jsonl', 'a') as f: f.write(json.dumps(rec) + '\n')
     print(json.dumps({k: rec[k] for k in ('name', 'verified', 'wall_s', 'wall2_s', 'guest_s', 'guest2_s', 'phases', 'phases2', 'boot_to_start_s', 'total_s', 'contended')}))
     sys.exit(1 if not verified else 3 if others else 0)
 

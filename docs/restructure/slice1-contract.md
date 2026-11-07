@@ -63,9 +63,13 @@ names, and none of that instruction's effects is committed. FEX patches that pro
    `PRIVATE`, both classified at the site. RIP-relative addresses are checked at compile time; this relies on admission requiring every guest-RIP
    relocation to equal the compile RIP's value (a future relocating code cache must re-check). Stubs (`brk`) are sites.
    *Superseded by E3 (fexc series13):* there is no address guard. Translated code runs at EL0, where every
-   non-canonical address is unmapped, EL1-only or execute-only, so the access faults in hardware at its own site; the
+   non-canonical address was unmapped, EL1-only or execute-only, so the access faults in hardware at its own site; the
    resident classifies an abort by site first and raises #GP(0), or #SS(0) for a stack-segment site, from the site's
    recorded address (`crates/runtime/src/execution.rs` `aborted`, `access_aborted`). The branch-target check stays.
+   **Later G1 exception:** the FEX guest-state frame has an EL0 read/write alias in the x86 noncanonical hole.
+   Ordinary guest accesses to that page can succeed. November 7's measured inline-guard prototype was too costly;
+   the authorized fallback randomizes the page per VM within its reserved 512 GiB slot. This reduces predictable
+   collisions but does not fix the selected-page deviation. See `correctness-cpu-ram.md` for evidence and limits.
 8. Split check for every guest store wider than 1 byte, including RMW, push/call and pair stores:
    `add x0, a, #w-1; eor x0, x0, a; tbnz x0, #12, split`. The split stub is a service site: the runtime walks both pages
    with write intent, writes both parts through owned RAM or neither (#PF), applies any recorded writeback, and resumes
@@ -188,6 +192,6 @@ invalidation on read-only → writable upgrade; plus §6 step 2's single guest-m
    *Superseded by E3:* the guard is gone (hardware faults at EL0, site-first classification, as in item 7). Admission
    always validates the object (records, exits, link points, x25/x28 and control-flow rules); its code-shape check
    (split, branch-target and #DE forms, the instruction allowlist) is a debug option the test runners turn on.
-   Isolation rests on the hardware, not on admission or the producer.
+   Hardware protects the EL1 private state; the later EL0 guest-state alias is the explicit exception in item 7.
 5. **TSO evidence before two vCPUs** (§2); upkeep of patches to upstream RA, flag elimination and dispatcher. Slice 1
    drops block linking, L1 lookup, call-ret stack and push/pop fusion (code-cache step restores them). No scope change.

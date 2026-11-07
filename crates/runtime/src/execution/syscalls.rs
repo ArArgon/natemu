@@ -8,8 +8,8 @@
 //!   SS := STAR[47:32] + 8 (unmasked, as the SDM writes it) with the SDM's fixed flat attributes (no descriptor is read), CPL 0, RIP := IA32_LSTAR. No stack switch.
 //! - SYSRET (#UD without EFER.SCE, then #GP(0) at CPL > 0, then #GP(0) for a non-canonical RCX, Intel's check at CPL 0
 //!   before any change): RIP := RCX, RFLAGS := R11 & 3C7FD7H | 2, CS := (STAR[63:48] + 16) | 3 (64-bit) and SS :=
-//!   (STAR[63:48] + 8) | 3 with the fixed attributes, CPL 3. SYSRETL returns to compatibility mode, which is not built:
-//!   [`set_cpl`] stops `unsupported_mode` with the new RFLAGS, CS and SS and RIP at the instruction. CR0.AM with an AC from R11
+//!   (STAR[63:48] + 8) | 3 with the fixed attributes, CPL 3. SYSRETL returns to compatibility mode, which is not built
+//!   ([`compatibility`]: it completes, then its target takes #GP(CS) at CPL 3, a recorded deviation). CR0.AM with an AC from R11
 //!   turns alignment checking on (X2): the SYSRET completes and the next misaligned access at CPL 3 is #AC(0).
 //! - S4, single-step: SYSCALL and SYSRET trap (#DB, DR6.BS) right after themselves when the TF they leave is 1, not when
 //!   TF was 1 at their start: a SYSCALL whose FMASK clears TF enters CPL 0 without a trap, and a SYSRET loading TF = 1
@@ -23,7 +23,7 @@
 //!   RSP := IA32_SYSENTER_ESP, RIP := IA32_SYSENTER_EIP (both canonical: WRMSR checks them).
 //! - SYSEXIT (X1c): #GP(0) when IA32_SYSENTER_CS[15:2] = 0 or CPL > 0, then (REX.W) for a non-canonical RCX or RDX; RSP :=
 //!   RCX, RIP := RDX, CS := (SYSENTER_CS + 32) | 3 (64-bit) and SS := CS + 8, DPL 3, CPL 3; RFLAGS unchanged. Without REX.W
-//!   it returns to compatibility mode (not built): [`set_cpl`] stops `unsupported_mode`, as SYSRETL.
+//!   it returns to compatibility mode (not built): [`compatibility`], as SYSRETL.
 //! - RDFSBASE..WRGSBASE (#UD without CR4.FSGSBASE, any CPL): 32-bit forms read the low half zero-extended and write the
 //!   zero-extended low half; a 64-bit write of a non-canonical value is #GP(0).
 //! - RDRAND: the next word of the vCPU's entropy pool ([`Entropy`], filled by the host): CF = 1, OF SF ZF AF PF = 0, the
@@ -52,9 +52,8 @@ const RFLAGS_VM: u64 = 1 << 17;
 /// RFLAGS bits SYSRET loads from R11 (SDM Vol.2 SYSRET: RF, VM and the reserved bits 3, 5, 15, 22..63 cleared).
 const SYSRET_FLAGS: u64 = 0x3c_7fd7;
 /// The fixed hidden attributes SYSCALL and SYSRET load (SDM Vol.2 SYSCALL, SYSRET; `Segment::attributes` encoding):
-/// execute/read accessed code, S, P, G and L (64-bit) or D (compatibility); read/write accessed data, S, P, B, G; DPL 0 or 3.
+/// execute/read accessed code, S, P, G and L (64-bit); read/write accessed data, S, P, B, G; DPL 0 or 3.
 const CS64: u16 = 0xa09b;
-const CS32: u16 = 0xc09b;
 const SS_FLAT: u16 = 0xc093;
 const DPL3: u16 = 3 << 5;
 
@@ -66,7 +65,7 @@ fn flat(selector: u16, attributes: u16) -> Segment {
 }
 
 /// Executes `i` (SWAPGS ..= CLFLUSH, SYSENTER, SYSEXIT). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: SYSCALL or SYSRET
-/// committed to `rip`. On `Err` nothing changed.
+/// committed to `rip`. On `Err` nothing changed, but after a SYSRET or SYSEXIT to compatibility mode ([`compatibility`]).
 pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception> {
     // Perf chunk 12: the fields read, not a copy of the bank (every value is read before the first write).
     let (cpl, efer, cr4, rip, rflags) = (s.cpu.cpl, s.cpu.efer, s.cpu.cr4, s.cpu.rip, s.cpu.rflags);
@@ -109,8 +108,11 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             let rflags = s.cpu.gpr[11] & SYSRET_FLAGS | 2;
             let base = (msr_get(slot(cpu::MSR_STAR)) >> 48) as u16;
             s.cpu.rflags = rflags;
-            s.cpu.seg[SREG_CS] = flat(base.wrapping_add(if wide { 16 } else { 0 }) | 3, if wide { CS64 } else { CS32 } | DPL3);
             s.cpu.seg[SREG_SS] = flat(base.wrapping_add(8) | 3, SS_FLAT | DPL3);
+            if !wide {
+                return compatibility(s, base | 3, rip);
+            }
+            s.cpu.seg[SREG_CS] = flat(base.wrapping_add(16) | 3, CS64 | DPL3);
             set_cpl(s, 3);
             s.debug = s.debug & !debug::STEP | if rflags & RFLAGS_TF != 0 { debug::STEP } else { 0 };
             return Ok(Some(rip));
@@ -140,8 +142,11 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             }
             let selector = cs.wrapping_add(if wide { 32 } else { 16 }) | 3;
             s.cpu.gpr[4] = rsp;
-            s.cpu.seg[SREG_CS] = flat(selector, if wide { CS64 } else { CS32 } | DPL3);
             s.cpu.seg[SREG_SS] = flat(selector.wrapping_add(8), SS_FLAT | DPL3);
+            if !wide {
+                return compatibility(s, selector, rip);
+            }
+            s.cpu.seg[SREG_CS] = flat(selector, CS64 | DPL3);
             set_cpl(s, 3);
             return Ok(Some(rip));
         }
@@ -198,6 +203,19 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         _ => halt(s, stop::BAD_REPLY),
     }
     Ok(None)
+}
+/// SYSRET or SYSEXIT to compatibility mode (owner decision, November 6; compatibility mode is not built): the return
+/// completes (RFLAGS, SS and RSP as loaded, CPL 3, RIP its target), then the first instruction there takes #GP(`selector`, the
+/// 32-bit CS): a recorded deviation (x86 runs it) that the OS sees as a fault in its program. Not at the instruction, as far
+/// transfers are ([`segments`]): an OS returns by SYSRET with the user's stack and GS base already loaded, so a fault at CPL 0
+/// there could not be handled (Linux has no fixup for SYSRETL); a fault after a completed SYSRET is what AMD processors give
+/// for a non-canonical RCX. The CS's selector reaches the frame; 64-bit attributes stand in for it while the fault is
+/// delivered (which replaces CS). A TF the return loads gives no trap before the fault.
+fn compatibility(s: &mut State, selector: u16, rip: u64) -> Result<Option<u64>, Exception> {
+    s.cpu.seg[SREG_CS] = flat(selector, CS64 | DPL3);
+    s.cpu.rip = rip;
+    set_cpl(s, 3);
+    Err([13, u64::from(selector & 0xfffc), 0])
 }
 /// K2: an empty entropy pool is refilled by one host exit (the host tops it up at every exit). The state goes to the
 /// record and back in place (no copy on this frame: it is on the gate's deepest path).

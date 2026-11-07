@@ -1341,8 +1341,63 @@ pub fn shadowed_writable(gpa: u64) {
 /// This vCPU's shadows were all removed (and the TLB invalidated): clears its writable bits, then counts the reset
 /// (a peer waiting for this vCPU to drop its writable shadows waits for the counter to change).
 pub fn shadows_reset() {
+    split_word(3 + vcpu()).store(0, SeqCst);
     clear_own(area::WRITABLE_PAGES);
     resets(vcpu()).fetch_add(1, SeqCst);
+}
+
+/// Split locks (no-stop change, November 6, 2026): a LOCKed access (or XCHG, or CMPXCHG8B/16B) crossing 16 bytes, which
+/// no Arm atomic performs, is made by the resident with plain loads and stores while no other vCPU can access its pages
+/// ([`split_begin`] .. [`split_end`]): one split lock for the VM; its owner names the pages, then makes every peer that may
+/// hold a shadow drop all of them ([`SHADOWS`], a kick) and waits for each reset, so every peer access to the pages from
+/// then on misses its shadows and waits in its resident ([`split_wait`], before installing a shadow or making an access of
+/// its own) until the owner is done. `serve` is called while waiting (the caller drains its record: two vCPUs waiting for
+/// each other both progress). The x86 locked access is atomic against every access of every vCPU and orders as a fence:
+/// a peer's reset completes its earlier stores (the TLB invalidation's `dsb`), and the owner's stores complete before it
+/// releases. While waiting, a vCPU serves only shadow-drop requests ([`take_shadows`]): enough for every wait to progress
+/// (peers wait on one another only for shadow resets), and safe with a block of its own live.
+fn split_word(k: usize) -> &'static AtomicU64 {
+    unsafe { AtomicU64::from_ptr(global::<u64>(area::SPLIT).wrapping_add(k)) }
+}
+/// This vCPU may hold a shadow from now on (set before a shadow is installed, cleared by [`shadows_reset`]).
+pub fn holding() {
+    split_word(3 + vcpu()).store(1, SeqCst);
+}
+pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
+    while split_word(0).compare_exchange(0, vcpu() as u64 + 1, SeqCst, SeqCst).is_err() {
+        serve();
+        core::hint::spin_loop();
+    }
+    split_word(1).store((gpa[0] >> 12) + 1, SeqCst);
+    split_word(2).store((gpa[1] >> 12) + 1, SeqCst);
+    for p in (0..vcpus).filter(|&p| p != vcpu()) {
+        let count = resets_of(p);
+        if split_word(3 + p).load(SeqCst) == 0 {
+            continue;
+        }
+        ask_shadows(p);
+        while resets_of(p) == count {
+            serve();
+            core::hint::spin_loop();
+        }
+    }
+}
+pub fn split_end() {
+    unsafe { asm!("dsb ish") };
+    split_word(1).store(0, SeqCst);
+    split_word(2).store(0, SeqCst);
+    split_word(0).store(0, SeqCst);
+}
+/// While waiting on a split lock: serves only a peer's request to drop all shadows ([`SHADOWS`]; whether to reset them now),
+/// leaving the rest of the record (code invalidations, a flush) to the next resident entry, as a block of this vCPU may be
+/// live here (its abort handler resumes it).
+pub fn take_shadows() -> bool {
+    record_word(vcpu(), None).fetch_and(!SHADOWS, SeqCst) & SHADOWS != 0
+}
+/// Another vCPU holds the split lock over `gpa`'s page.
+pub fn split_held(gpa: u64) -> bool {
+    let page = (gpa >> 12) + 1;
+    split_word(0).load(SeqCst) != vcpu() as u64 + 1 && (split_word(1).load(SeqCst) == page || split_word(2).load(SeqCst) == page)
 }
 
 /// Perf chunk 22: [`drain`] would find something pending (its first load).

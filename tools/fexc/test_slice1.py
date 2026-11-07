@@ -28,6 +28,12 @@ PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
 
 # name -> hex. Architecturally: privilege/descriptor/MSR/segment/interrupt/IO/TLB/cache/flag-control, or VM-owned values.
 SYSTEM = {
+    'enter': 'c8080000', 'enter level 1': 'c8080001', 'enter16': '66c8080001',
+    'vcvtps2ph m': 'c4e37d1d3004', 'iretw': '66cf', 'retfw': '66cb', 'call far16': '66ff18', 'jmp far16': '66ff28',
+    'maskmovq': '0ff7c1',
+    'o16 shrd cl': '660fadc1', 'o16 shld cl': '660fa5d3',
+    'rcr qword [rax],cl': '48d318', 'rcr qword [rax],0': '48c11800', 'rcl byte [rax],cl': 'd210',
+    'rcl dword [rax],cl': 'd310', 'rcr dword [rax+rcx*4+8],cl': 'd35c8808', 'rcl byte [rax],32': 'c01020', 'rcr qword [rax],64': '48c11840',
     # X1c: Reserved-NOP cells (owner decision: NOPs, the resident's RESERVED_NOP)
     '0f 0d /0 m': '0f0d00', 'prefetch /4 m': '0f1820', 'prefetch reg': '0f18c0', 'f3 prefetchnta': 'f30f1800', '0f 19 m': '0f1900',
     '66 0f 1a m (bndmov form)': '660f1a00', 'f2 0f 1b reg': 'f20f1bc0', '0f 1c reg': '0f1cc0', '66 cldemote': '660f1c00', '0f 1d m': '0f1d00',
@@ -56,6 +62,9 @@ SYSTEM = {
     'vpgatherdd ymm': 'c4e26d90040f', 'vpgatherdq xmm': 'c4e2e990040f', 'vpgatherqd xmm': 'c4e26991040f',
     'vpgatherqq ymm': 'c4e2ed91040f', 'vgatherdps xmm': 'c4e26992040f', 'vgatherdpd ymm': 'c4e2ed92040f',
     'vgatherqps ymm index': 'c4e26d93040f', 'vgatherqpd xmm': 'c4e2e993040f',
+    # No-stop change: the masked moves, the resident's (VMASKMOVPS/PD, VPMASKMOVD/Q, VMASKMOVDQU, MASKMOVDQU).
+    'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca', 'maskmovdqu': '660ff7c1',
+    'vpmaskmovq ld': 'c4e2f58c00', 'vpmaskmovd st': 'c4e2758e08',
 }
 
 # name -> hex. Decodable instructions that are not slice-1 forms, and admitted opcodes with an excluded prefix or operand.
@@ -66,23 +75,13 @@ UNSUPPORTED = {
     'rep lock add [rax],rcx': 'f3f0480108', 'repne lock xadd [rax],ecx': 'f2f00fc108', 'o16 cmpxchg8b': '660fc708',
     # I2: string forms outside the allowlist (REPNE only on cmps/scas, never with REP)
     'repne movsb': 'f2a4', 'repne stosq': 'f248ab', 'rep repne cmpsb': 'f3f2a6',
-    # I10: 0x67 on BT/BTS/BTR/BTC m, r (no SDM rule for the register's offset with a 32-bit address)
-    'addr32 bt [eax],ecx': '670fa308', 'addr32 bts [eax],rcx': '67480fab08',
-    'maskmovq (I9: a masked store)': '0ff7c1', 'maskmovdqu': '660ff7c1', 'f3 66 movss': 'f3660f10c1',
-    'insertps m32 zeroing its element': '660f3a21000f',
+    'f3 66 movss': 'f3660f10c1',
     # I8: AVX forms FEX cannot do exactly (I10: the encodings x86 makes #UD are in UD)
-    'vmaskmovps ld': 'c4e2752c00', 'vmaskmovps st': 'c4e2752e08', 'vmaskmovdqu': 'c5f9f7ca',
-    'vcvtps2ph m': 'c4e37d1d3004', 'vaddss L=1 (LIG)': 'c5f658c2',
-    'vinsertps m32 zeroing its element': 'c4e37921001f',
-    'o16 pushf': '669c', 'o16 leave': '66c9', 'enter level 1': 'c8080001', 'o16 shld': '660fa4c101', 'o16 shrd cl': '660fadc1',
+    'o16 shld by 17': '660fa4c111',
     'movnti reg': '0fc3c1',
     'rep popcnt-like f2 0f b8': 'f20fb8c1',
-    'sal /6 alias': 'd1f0', 'o16 call rax': '66ffd0', 'o16 jmp [rax]': '66ff20',
-    'bnd loop (BND is not a LOOP prefix)': 'f2e2fe', 'o16 ret': '66c3', 'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8',
-    # FEX branches around the whole access for a zero count (static or dynamic), losing a guest #PF
-    'rcl dword [rax],1': 'd110', 'rcr qword [rax],cl': '48d318', 'rcr qword [rax],0': '48c11800', 'rcl byte [rax],cl': 'd210',
-    'rcr word [rax],5': '66c11805', 'rcl dword [rax],cl': 'd310', 'rcr dword [rax+rcx*4+8],cl': 'd35c8808', 'rcl byte [rax],32': 'c01020',
-    'rcr [rax],imm (c1, rex.w)': '48c11805',
+    'sal /6 alias': 'd1f0',
+    'bnd loop (BND is not a LOOP prefix)': 'f2e2fe',
 }
 
 # I10: encodings the presented CPU raises #UD for, reserved or not advertised: a system cut with `cut_ud` (the host's UD).
@@ -115,6 +114,15 @@ VEX_UD = {'rex andn': '48c4e278f2c1', 'o16 andn': '66c4e278f2c1', 'o16 vzerouppe
           'f2 vpbroadcastb': 'f2c4e27d78ff'}
 
 ALLOWED = {
+    'vinsertps m32 zeroing its element': 'c4e37921001f',
+
+    'insertps m32 zeroing its element': '660f3a21000f',
+
+    # No-stop change: scalar VEX forms with VEX.L = 1 (LIG), 16-bit BSWAP (FEX zeroes the low half, as the AMD machine),
+    # 16-bit SHLD/SHRD by an imm8 up to 16, RCL/RCR m by a static nonzero count.
+    'vaddss L=1 (LIG)': 'c5f658c2', 'vroundss L=1 (LIG)': 'c4e3750ac204', 'vfmadd231ss L=1': 'c4e275b9c2', 'vcmpss L=1': 'c5f6c2c201',
+    'bswap r9w (undefined)': '66410fc9', 'bswap ax': '660fc8', 'o16 shld': '660fa4c101', 'o16 shrd by 16': '660facc110',
+    'rcl dword [rax],1': 'd110', 'rcr word [rax],5': '66c11805', 'rcr [rax],imm (c1, rex.w)': '48c11805', 'rcl qword [rax],33': '48c11021',
     # X1c: the hints PREFETCHW m8 and CLDEMOTE m8 (SDM: no #UD without their CPUID bits; CLDEMOTE "treated as a NOP")
     'prefetchw [rax]': '0f0d08', 'cldemote [rax]': '0f1c00',
     # I10: 0x67 (32-bit addresses), XLAT, the CET hint space 0f 1e as NOPs (ENDBR, RDSSP)
@@ -181,7 +189,9 @@ ALLOWED = {
     'lock xchg [rax],rcx': 'f0488708', 'pause': 'f390', 'lfence': '0faee8', 'mfence': '0faef0', 'sfence': '0faef8', 'rcl rax,cl': '48d3d0', 'rcr eax,1': 'd1d8', 'rcl al,5': 'c0d005', 'pop rbx': '5b', 'push imm8': '6a01', 'push imm32': '6800010000', 'push [rax]': 'ff30', 'pop [rax]': '8f00', 'push ax': '6650',
     # I1: flag moves, pushf, small integer and BMI forms
     'cld': 'fc', 'std': 'fd', 'clc': 'f8', 'stc': 'f9', 'cmc': 'f5', 'lahf': '9f', 'sahf': '9e', 'pushfq': '9c',
-    'leave': 'c9', 'enter': 'c8080000', 'shld': '0fa4c101', 'shrd': '0facc101', 'shld [rax],cl': '480fa508', 'shrd [rax],5': '0fac0805',
+    '66 rex.w shld cl': '66480fa5d3', '66 rex.w shrd cl': '66480fadd3',
+    'o16 pushf': '669c', 'o16 leave': '66c9', 'leave': 'c9', 'shld': '0fa4c101', 'shrd': '0facc101', 'shld [rax],cl': '480fa508', 'shrd [rax],5': '0fac0805',
+    'addr32 bt [eax],ecx': '670fa308', 'addr32 bts [eax],rcx': '67480fab08',
     'cmpxchg [rax],ecx': '0fb108', 'cmpxchg [rax],cl': '0fb008', 'cmpxchg rcx,rdx': '480fb1d1', 'xadd [rax],ecx': '0fc108', 'xadd rcx,rdx': '480fc1d1',
     'popcnt': 'f3480fb8c1', 'popcnt [rax]': 'f30fb800', 'o16 popcnt': '66f30fb8c1', 'tzcnt': 'f30fbcc1', 'lzcnt': 'f30fbdc1', 'tzcnt [rax]': 'f3480fbc00',
     'prefetcht0': '0f1808', 'prefetchnta': '0f1800', 'prefetcht1': '0f1810', 'prefetcht2': '0f1818', 'movnti [rax],rcx': '480fc308',
@@ -228,6 +238,7 @@ BRANCHES = {
     # I10: 0x67: ECX for LOOP/JECXZ, ignored by direct branches (a relaxed `addr32 call`), the memory operand's address
     'addr32 loop': '67e205', 'jecxz': '67e305', 'addr32 call rel32': '67e805000000', 'addr32 jmp rel8': '67eb05', 'addr32 jne rel32': '670f8505000000',
     'addr32 call [eax]': '67ff10', 'addr32 jmp [eip+8]': '67ff2508000000', 'addr32 ret': '67c3',
+    'o16 call rax': '66ffd0', 'o16 jmp [rax]': '66ff20', 'o16 ret': '66c3', 'o16 ret imm16': '66c21000',
     # X1c: BND (F2) on near branches, ignored without MPX (owner decision, November 2)
     'bnd ret': 'f2c3', 'bnd jmp rel8': 'f2eb05', 'bnd call rel32': 'f2e805000000', 'bnd jne rel8': 'f27505', 'bnd jmp rax': 'f2ffe0',
     # 66 on a near direct branch: ignored as on Intel, rel8/rel32 kept (patch 0029; SDM Vol.2 CALL/JMP/Jcc, Appendix A "f64")
@@ -487,7 +498,7 @@ class Slice1Cutting(unittest.TestCase):
         cut, bad, fixtures = scan_skips.scan()
         self.assertEqual(bad, {})
         self.assertGreaterEqual(fixtures, 60)
-        self.assertTrue(cut and all(k.startswith(('rcl', 'rcr')) and '[rax]' in k for k in cut), cut)
+        self.assertTrue(cut and all(k == 'enter [rsp]' or (k.startswith(('rcl', 'rcr')) and '[rax]' in k) for k in cut), cut)
 
     def test_object_matches_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -660,6 +671,25 @@ class Slice1Exits(unittest.TestCase):
         print(f'\nfixtures: {full} translate completely, {cut} are cut (unsupported_form)')
         self.assertEqual((full, cut), (64, 0))
 
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class Slice1X87Commit(unittest.TestCase):
+    def test_fault_site_allows_pending_flags_but_rejects_early_architectural_flags(self):
+        import verify_precision as vp
+        d, rc = run('df38')  # FISTP qword ptr [rax]: conversion precedes the faultable store.
+        self.assertEqual(rc, 0)
+        code = bytes.fromhex(d['code']['hex'])
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(vp.verify(d, Path(t))[0], [])
+            dis = check_sites.disassemble(code, d['code']['layout']['code_region_end'], Path(t))
+            at = next(o for o, text in dis.items()
+                      if check_sites.native_access(text) == ('store', 1, 'x28', None, vp.X87_PENDING, 'none'))
+            old = int.from_bytes(code[at:at + 4], 'little')
+            # Change the scratch-byte store to a word store into architectural x87 exception flags.
+            word = 0xb9000000 | (0x4b4 // 4) << 10 | (old & 0x3ff)
+            bad = dict(d, code=dict(d['code'], hex=(code[:at] + word.to_bytes(4, 'little') + code[at + 4:]).hex()))
+            self.assertTrue(any('store' in e and 'before the site' in e for e in vp.verify(bad, Path(t))[0]))
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')

@@ -15,7 +15,7 @@ Expected:
   - a 0x67 REP string faulting midway: ESI/EDI/ECX written zero-extended per element (RSI/RDI/RCX upper halves cleared);
     LOOP with 0x67 writes ECX zero-extended; JECXZ tests ECX only;
   - #AC(0) at CPL 3 (CR0.AM, RFLAGS.AC) for a misaligned 0x67 operand, by its truncated address;
-  - BT/BTS/BTR/BTC m, r with 0x67: refused (`unsupported_form`; no SDM rule for the bit offset with a 32-bit address);
+  - BT/BTS/BTR/BTC m, r with 0x67: the signed bit-string displacement participates in the 32-bit address calculation;
   - #UD (SDM Vol.3 6.15 reserved opcodes; Vol.2 per instruction): XOP (8f /1../7), EVEX (62), RTM XBEGIN/XABORT (CPUID RTM 0),
     group 11 /1../6, VIA PadLock (0f a6/a7), the reserved VEX L/W/vvvv/operand-kind encodings and VEX opcodes the profile
     does not define, the MMX/SSE shift groups' reserved encodings, F3 MOVBE, 3DNow!, invalid-in-64-bit opcodes, group 4/5/8
@@ -106,9 +106,10 @@ def cases():
                           ('store64-4', 'mov qword ptr [edi + 4], rcx', True), ('rep-movsd', 'rep movsd dword ptr es:[edi], dword ptr [esi]', True)]:
         out.append(case(f'ac-{tag}', insn, ['rflags 0x40202', f'switch {nop_at:#x} 3'], AC if ac else None, prelude=head + ['nop'], cpl=0,
                         regs={'rdi': GARBAGE | (D + 0x100), 'rsi': GARBAGE | (D + 0x202), 'rcx': GARBAGE | 4}))
-    # BT* m, r with 0x67: refused before any effect
+    # COR-05: the register bit index selects the operand eight bytes beyond the base; upper address bits are ignored.
     for g in ['bt dword ptr [edi], ecx', 'bts qword ptr [edi], rcx']:
-        out.append(case(f'refused-{g.split()[0]}', g, [], ['nocode', 'unsupported_form']))
+        out.append(case(f'addr32-{g.split()[0]}-index-pf', g, [f'unmap {D + 0x1000:#x}'],
+                        PF(D + 0x1028, g.startswith('bts'), False), regs={'rdi': GARBAGE | (D + 0x1020), 'rcx': 64}))
     # strings: a 0x67 REP faulting midway (16 elements done: RSI/RDI/RCX written zero-extended)
     rs = {'rsi': GARBAGE | (D + 0xff0), 'rdi': GARBAGE | (D + 0x100), 'rcx': GARBAGE | 0x20}
     c = case('rep-movsb-midway', 'rep movsb byte ptr es:[edi], byte ptr [esi]', [f'unmap {D + 0x1000:#x}'], PF(D + 0x1000, False, False), regs=rs)

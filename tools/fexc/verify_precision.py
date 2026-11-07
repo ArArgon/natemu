@@ -9,7 +9,7 @@ Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_sk
 For every compile, from the disassembly, the sites, the dense PC table and the static register (SRA) map:
   P1  between the native start of a site's guest instruction (its PC-table entry) and the site, no instruction writes a
       guest static register (the SRA map: 16 GPRs, PF x26, AF x27, the xmm registers), or stores to memory (the x28
-      frame included); the window holds no other guest instruction's entry;
+      frame included, except the fault-discarded x87 pending-flags byte); the window holds no other guest instruction's entry;
   P2  no NZCV write in that window unless the site says nzcv=saved, and then the pre-NZCV save `mrs x25, nzcv`
       (state_offsets.natemu_pre_nzcv_register) is the window's first word, and nothing else in the window writes x25;
   P3  a load site's destination is not a static register (DDI0487 D1.4.1.4: UNKNOWN after an abort). The destinations are
@@ -628,9 +628,9 @@ GUEST_STATE_DF = {0x3f0 + 10}
 GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8))
 # I6: the x87 state (abi `frame::X87_*`): FEX's IE, C0..C2, TOP and C3 bytes, the abridged tag word and the x87 exception word,
 # read and written; FCW read only; ST(i) through `add x0, x28, xI, lsl #4; ldr|str dN, [x0, #0x420]` (check_sites.x87_slot).
-X87_STATE = ((0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4))
+X87_STATE = ((0x412, 1), (0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4))
 X87_FCW = (0x4b0, 2)
-X87_EXCEPTIONS = 0x4b4
+X87_PENDING = 0x412
 # I8: the YMM upper halves (abi `frame::AVX_HIGH`, FEX's avx_high[16][2]), read and written (single or paired Q, `stp xzr`).
 AVX_HIGH = ((0xc0, 256),)
 
@@ -664,7 +664,6 @@ def entry_and_branches(d, dis, order):
     return out
 
 
-X87_EARLY = set()   # I6: sites after which the x87 exception word was already updated (reported, not a violation)
 
 
 def verify(d, tmp, insns=None):
@@ -714,8 +713,8 @@ def verify(d, tmp, insns=None):
                 out.append(f'{tag}: +{off} "{text}" writes x{pre}, the pre-NZCV register, before the site')
             if nzcv and first_nzcv is None:
                 first_nzcv = off
-            if acc and acc[0] == 'store' and acc[2] == 'x28' and acc[4] == X87_EXCEPTIONS:
-                X87_EARLY.add(tag)   # I6: the recorded deviation (an x87 store's FPSR flags already in the exception word)
+            if acc and acc[:5] == ('store', 1, 'x28', None, X87_PENDING) and acc[5] == 'none':
+                pass   # Private per-instruction flags; discarded on a fault, committed only at the instruction's end.
             elif acc and acc[0] == 'store':
                 out.append(f'{tag}: store +{off} "{text}" before the site')
             bad = dests & sra
@@ -872,7 +871,7 @@ def run_corpus(label, progs, tmp, before=None):
         if 'asm' in p:
             check_sites.FEXC, check_sites.PROFILE = FEXC, ['--profile', 'slice1']
             cp, _ = check_sites.check_program(p, tmp)
-            problems += [f'{k}: {m}' for k, m in cp if k != 'NARROWED' and m not in problems]   # code_vs_sites already ran in verify()
+            problems += [f'{k}: {m}' for k, m in cp if m not in problems]   # code_vs_sites already ran in verify()
         for m in problems:
             print(f'  {label} {p["name"]}: {m}')
         bad += bool(problems)
@@ -914,7 +913,6 @@ def main():
     with tempfile.TemporaryDirectory() as t:
         for label, progs in corpora:
             bad += run_corpus(label, progs, Path(t), before if label != 'matrix' else None)
-    if X87_EARLY: print(f'I6 deviation (recorded): {len(X87_EARLY)} x87 store sites after their FPSR flags reached the x87 exception word')
     print('PASS' if not bad else f'FAIL: {bad} programs with violations')
     return 1 if bad else 0
 

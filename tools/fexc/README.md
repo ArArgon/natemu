@@ -22,8 +22,7 @@ tools/fexc/build.sh BUILD_DIR
 
 `BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX` (`.gitmodules`: the fork
 `https://github.com/ArArgon/natemu-fex`, branch `natemu`, `shallow = true`), pinned to the fork's commit
-`455698b577d343e1c1dc8c776dc39c237e312f85`: upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the patch series 0001-0033
-as thirty-three commits, one per patch (tree `de278977...`). The script initialises the submodule (only when it is not already
+`1df70f05044e3bf5a51652c79e5e6310eddaf6fe`: upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
 at the pin) and the three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the
 revision FEX pins), checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the
 three externals into it (`git archive`), configures `CMakeLists.txt` against that tree, builds with 4 jobs and runs
@@ -36,7 +35,13 @@ The fork is the source of truth for the patches (November 4: moved from `tools/f
 `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
 (`a81a2f24...1fd8`); an installer N = 1 stream of 126,017 requests replayed through both gave no difference.
 
-Current tree: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series65-p2` (November 5, pcid-plan "Measured (P2)"):
+Current tree: `natemu-raw/correctness-forms-20261107-02/fexc` (November 7), FEX `1df70f050` and this tree's shim;
+validation uses the frozen `candidate-bin/fexc`. The dependency commit is local; the same evidence directory contains
+`fex-forms.bundle` for fetching it into a clone with the prior `a4689cef1` pin. COR-02/03/05/06 add transactional
+VCVTPS2PH memory stores, resident ENTER, address32 register-index BT forms, and the selected Intel near/far widths.
+See [instruction-form validation](../../docs/restructure/correctness-instruction-forms.md) for results and remaining oracle limits.
+
+Before it: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series65-p2` (November 5, pcid-plan "Measured (P2)"):
 the fork's `natemu` branch at 8d812cadd (VERW m16 inline at CPL 0). Before it,
 `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series64-chunk26-r1` (November 5, perf plan "Measured
 (chunk 26)", after its review): the fork clone's local branch `natemu-chunk26` at 0430dc8a6 (on `natemu` ab62c7e06: REP STOS in
@@ -670,9 +675,10 @@ Known deviations of FEX from x86 in the default profile, fixed under `--profile 
 then dead-code elimination; `check_sites.py` reports ELIMINATED without `--slice1`). `push`/`pop` of adjacent guest
 instructions are fused. Load and pop destinations can be static registers.
 
-Accepted natemu policy: `bt`/`bts`/`btr`/`btc` with a memory operand access ONE byte (the byte holding the bit), for an
-immediate and for a register bit index alike, not the x86 operand width. The fault, CR2 and A/D bits are those of that byte.
-`check_sites.py` reports these as NARROWED and does not fail them.
+Since the November 7 CPU/RAM fixes, `bt`/`bts`/`btr`/`btc` access the full 16/32/64-bit memory unit, including locked
+operations. An immediate chooses a bit within that unit; a register index selects a signed unit offset and a bit within
+it. Fault addresses, canonical checks, A/D bits and watchpoints cover that complete access. The old selected-byte
+policy is superseded; `check_sites.py` must reject narrowed accesses.
 
 The site's `imm`, `writeback` and `writeback_delta` (address = base register value before the access + `imm`; pre-index: `imm`
 equals `writeback_delta`, post-index: `imm` is 0) are read from the emitted instruction word (FEX's `Push` with

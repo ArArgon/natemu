@@ -17,7 +17,8 @@ pub const NO_REG: u8 = 0xff;
 /// [`Site::kind`]. Guard and split sites (profile slice1) are check stubs: `brk #1` / `brk #2` words after the block
 /// body, each reached only by its check. `GUARD` is a non-canonical indirect branch target in `base_reg` (#GP(0)),
 /// `guest_offset2` = [`NONE32`]; until E3 (fexc series12) it was also the address guard of an access site, which
-/// admission now refuses (a non-canonical access faults in hardware at its own site). `SPLIT` is a store wider than
+/// admission now refuses. Non-canonical accesses fault at their sites except for the selected EL0 frame alias,
+/// which remains guest-accessible as a documented deviation. `SPLIT` is a store wider than
 /// one byte (read-modify-write stores included) crossing a 4 KiB page (access site in `guest_offset2`): the runtime
 /// writes the access site's data register to both pages or neither, applies the access site's writeback and resumes
 /// after that store.

@@ -530,7 +530,7 @@ mod tests {
         // Both spaces' guest halves are unlinked; the private region index stays.
         m[USER_LOWER_ROOT / 8 + 256] = 7;
         // G1: the guest-state alias's upper-root entry (below 256) stays in both spaces.
-        let alias = (crate::execution::GUEST_STATE_VA >> 39 & 511) as usize;
+        let alias = (crate::execution::GUEST_STATE_SLOT.start >> 39 & 511) as usize;
         for [_, upper] in ROOTS {
             m[upper / 8 + alias] = 9;
         }

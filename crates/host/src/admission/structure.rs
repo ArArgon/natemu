@@ -1,6 +1,7 @@
 //! Structural verification of a slice-1 code region, in two parts. Generated code runs at EL0, where the hardware
-//! isolates the resident (system instructions trap, private pages are EL1-only or execute-only, every non-canonical
-//! address faults); its only ways into the resident are `svc`, the check stubs, aborts and interrupts, and the resident
+//! protects EL1 resident pages (system instructions trap, private pages are EL1-only or execute-only). The selected
+//! EL0 FEX-frame alias remains guest-accessible, a documented deviation. Entry into the resident is through `svc`,
+//! the check stubs, aborts and interrupts, and the resident
 //! classifies each by the block's records. One linear pass decodes every word with a small table of the A64 classes
 //! fexc emits.
 //!
@@ -53,8 +54,9 @@
 //! - Every stub is reached by exactly one branch, which is one of the checks above, and no branch enters a check's
 //!   window (from the check's first word to the access, exit or divide) from before it.
 //!
-//! There is no address guard (E3): a guest access to a non-canonical address faults at its site and the resident
-//! raises #GP/#SS from the record. x30 is an ordinary allocator temporary: no `bl` is admitted.
+//! There is no address guard (E3): non-canonical accesses outside the selected frame alias fault at their site,
+//! where the resident raises #GP/#SS from the record. Randomization does not isolate the selected alias.
+//! x30 is an ordinary allocator temporary: no `bl` is admitted.
 use std::ops::Range;
 
 use natemu_abi::code_object::{self as object, PcEntry, Reloc, Site};

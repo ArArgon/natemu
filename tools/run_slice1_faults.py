@@ -34,8 +34,8 @@ Cases are derived from program descriptions, never written per program:
   probes expect the QEMU full run (`NOFAULT`). shld/shrd with a memory destination and a count masking to 0 is a
   write-intent read-modify-write like a shift by 0 (#PF W on a read-only page): the SDM gives the value ("no
   operation") but not the access; the pinned QEMU faults with error 7 for shld/shrd by 0, 64 (64-bit), 32 (32-bit) and
-  CL = 0 alike (October 28), and fexc series14 writes the value back. The guest-state page (G1) is a documented
-  deviation: `guest_state_probes`. Any corpus of `tools/reference/gen_i1.py` works as input too.
+  CL = 0 alike (October 28), and fexc series14 writes the value back. `guest_state_probes` requires #GP at the
+  noncanonical frame alias. Any corpus of `tools/reference/gen_i1.py` works as input too.
 * I7: an FS/GS-overridden operand's address is the program's `fsbase`/`gsbase` + EA (mod 2^64) and it is never a stack
   reference (#GP(0), not #SS(0), when non-canonical, whatever its base register); `segment_probes` cover every memory form
   at a far, a negative and a wrapping base with a not-present page (CR2 = base + EA), a page-crossing access, a
@@ -45,10 +45,10 @@ Cases are derived from program descriptions, never written per program:
   operand's default segment decides, SS-class for an RSP/RBP base, else DS-class; `null_segment_probes` put CS/DS/ES on
   RSP/RBP bases and SS on others.
 * I3: DATA_FORMS also holds LOCK forms (one atomic each, write intent: a read-only page faults W even when LOCK CMPXCHG's
-  comparison fails, the SDM's write cycle; LOCK NEG a load then a compare-and-swap; LOCK BTS FEX's byte). CMPXCHG8B/16B are
+  comparison fails, the SDM's write cycle; LOCK NEG a load then a compare-and-swap; LOCK BTS its complete operand). CMPXCHG8B/16B are
   probes only (the pinned QEMU's full runs keep stale flags after them; the prefix state is right): not-present and
   read-only pages, CMPXCHG16B not 16-byte aligned (#GP(0) before the page walk, QEMU's order), split locks (every LOCK
-  form and CMPXCHG8B, locked or not, crossing 16 bytes, a line or a page: `unsupported_atomic` with the QEMU prefix state),
+  form and CMPXCHG8B, locked or not, crossing 16 bytes, a line or a page: since the no-stop change they run, the QEMU full run),
   and LOCK on forms that are not lockable (#UD, nothing executed: a register destination, a non-lockable opcode, a system
   instruction). Any corpus of `tools/reference/gen_i3.py` works as input (bt* with a register bit offset is skipped).
 * Built-in probes (PROBES below): non-canonical data and stack addresses (#GP(0)/#SS(0)), stack accesses across the
@@ -69,7 +69,7 @@ error code U | W (write intent; a read-modify-write's load is write intent) | P 
 checked after the accesses that produce it and before a call's push. div/idiv: after its memory divisor is read, #DE
 (no error code) when the divisor is zero or the quotient does not fit the destination (SDM DIV/IDIV), computed from the
 prefix state. Fetch #PF: CR2 = the first instruction byte in the faulting page, error U | I (with NXE or SMEP) | P | RSVD.
-bt-family memory forms access one byte (natemu policy, tools/fexc/README.md). Instruction fetch is checked before the
+bt-family memory forms access their complete operand-sized unit (AMD APM vol.3 BT/BTC/BTR/BTS). Instruction fetch is checked before the
 instruction's data accesses. Page-walk outcomes and error codes follow SDM vol. 3 ch. 4 (`Machine`); A/D: natemu's
 walker policy (`Machine`), leaf A/D bits compared per page (data exactly; code pages A where fetched, else either).
 
@@ -228,9 +228,12 @@ def events(text, regs, next_rip):
     i = mems[0]; a, w, ss = mem(ops[i])
     w = w or reg_width(ops[1 - i] if len(ops) > 1 else '', 0)
     if not w: raise Unsupported(text)
-    if m in gen.flags.BITTEST:      # natemu policy: the one byte holding the bit (immediate bit offsets only)
+    if m in gen.flags.BITTEST:
+        # AMD APM vol.3 BT/BTC/BTR/BTS: access2/4/8 bytes for16/32/64-bit operands. An immediate offset is
+        # modulo the operand width; it selects a bit inside this unit and never moves the unit's address.
+        # Register offsets can select a different signed unit; that form remains outside this runner's model.
         if not re.fullmatch(r'-?\d+|0x[0-9a-f]+', ops[1]): raise Unsupported(text)
-        return [('access', (a + (int(ops[1], 0) % (8 * w)) // 8) & M64, 1, m != 'bt', ss)]
+        return [('access', a, w, m != 'bt', ss)]
     # A memory destination is written (mov/setcc) or read-modify-written (write intent); cmp/test only read, and
     # so does the implicit-destination one-operand group (mul/imul/div/idiv). xchg writes its memory operand either way.
     write = (i == 0 or m == 'xchg') and m not in ('cmp', 'test', 'mul', 'imul', 'div', 'idiv')
@@ -438,10 +441,11 @@ STRADDLE_FORMS = [('load', 'rbx', 0, 'mov rax, qword ptr [rbx]'), ('store', 'rbx
                   ('lock-add', 'rbx', 0, 'lock add qword ptr [rbx], rcx'), ('lock-cmpxchg16b', 'rbx', 0, 'lock cmpxchg16b xmmword ptr [rbx]')]
 
 # G1: the guest-state page's EL0 alias (abi GUEST_STATE_VA), outside the window in the upper half's x86 non-canonical
-# range: an access inside it reaches the vCPU's own guest state (documented deviation): a non-field byte reads 0, the IF
-# byte the banked IF (1), and a store to a non-field qword reads back (then restored to 0, as the frame check needs). Its
-# extent is pinned by straddles into it (from the unmapped page below in its slot) and out of it, and by the page above:
-# each #GP. The window's former alias (PRIVATE + 0x24000) is a WINDOW class above.
+# range: guest accesses must #GP before reading or changing the frame. The generated address guard excludes the
+# mapped page; adjacent and straddling probes check the surrounding hole. The window's former alias
+# (PRIVATE + 0x24000) is a WINDOW class above.
+# The suite selects a distant frame alias, so these historical-address probes test an unmapped hole.
+# run_frame_randomization.py separately requires the remaining selected-page deviation.
 GUEST_STATE = 0xffff_4000_0000_1000
 GUEST_STATE_EDGES = [GUEST_STATE - 4, GUEST_STATE + 0xffc, GUEST_STATE + 0x1000]
 GUEST_STATE_FORMS = [('load', 'mov rax, qword ptr [rbx]'), ('store', 'mov qword ptr [rbx], rax'), ('rmw', 'add qword ptr [rbx], 1')]
@@ -449,10 +453,10 @@ GUEST_STATE_FORMS = [('load', 'mov rax, qword ptr [rbx]'), ('store', 'mov qword 
 def guest_state_probes():
     out = [('window-guest-state', REGS, PRELUDE + [f'movabs rbx, {GUEST_STATE}', 'mov rax, qword ptr [rbx]',
                                                     'movzx ecx, byte ptr [rbx + 0x3f9]'], len(PRELUDE) + 1,
-            {'deviation': {'rax': 0, 'rcx': 1}}),
+            {}),
            ('window-guest-state-store', REGS, PRELUDE + [f'movabs rbx, {GUEST_STATE}', 'mov qword ptr [rbx + 8], rdx',
                                                           'mov rcx, qword ptr [rbx + 8]', 'mov qword ptr [rbx + 8], 0'], len(PRELUDE) + 1,
-            {'deviation': {'rcx': 2}})]
+            {})]
     for a in GUEST_STATE_EDGES:
         for name, line in GUEST_STATE_FORMS:
             out.append((f'guest-state-edge-{a:#x}-{name}', REGS, PRELUDE + [f'movabs rbx, {a}', line] + AFTER, len(PRELUDE) + 1, {}))
@@ -493,18 +497,20 @@ def probes(window=True):
     # half and above the start of the upper half, a pop starting in the gap or at the last bytes before it.
     for a, name, line in SS_SPAN:
         out.append((f'noncanonical-ss-span-{name}-{a:#x}', REGS, PRELUDE + [f'movabs rsp, {a}', line] + AFTER, len(PRELUDE) + 1, {}))
-    # A memory XCHG whose operand crosses 16 bytes (inside a line, across a line, across a page) is a split lock: the
-    # VM stops `unsupported_atomic` at it with nothing written (the QEMU prefix state); expected by `atomic`, not a fault.
+    # A memory XCHG whose operand crosses 16 bytes (inside a line, across a line, across a page) is a split lock: since the
+    # no-stop change it runs (the resident's split lock), the QEMU full run the reference (it stopped `unsupported_atomic`).
     for name, line in [('16', 'xchg qword ptr [rbx + 0xc], rax'), ('line', 'xchg dword ptr [rbx + 0x3e], ecx'),
                        ('page', 'xchg qword ptr [rbx + 0xefc], rax'), ('16-word', 'xchg word ptr [rbp + 0xf], dx')]:
-        out.append((f'xchg-crossing-{name}', REGS, PRELUDE + [line] + AFTER, len(PRELUDE), {'atomic': True}))
-    # I3: every LOCK form crossing 16 bytes (owner decision: LOCKed crossing accesses stop) and CMPXCHG8B, locked or not (one
-    # caspal either way: an unlocked one crossing 16 bytes stops too, a documented deviation).
+        out.append((f'xchg-crossing-{name}', REGS, PRELUDE + [line] + AFTER, len(PRELUDE), {'nofault': True}))
+    # I3: every LOCK form crossing 16 bytes and CMPXCHG8B, locked or not (one caspal either way): split locks, run since the
+    # no-stop change, the QEMU full run the reference (they stopped `unsupported_atomic`, owner decision of the boot phase).
     for name, line in [('add-16', 'lock add qword ptr [rbx + 0xc], rcx'), ('xadd-line', 'lock xadd dword ptr [rbx + 0x3e], ecx'),
                        ('cmpxchg-page', 'lock cmpxchg qword ptr [rbx + 0xefc], rcx'), ('neg-16', 'lock neg word ptr [rbp + 0xf]'),
                        ('inc-16', 'lock inc dword ptr [rsi + 0xe]'), ('sbb-16', 'lock sbb qword ptr [rbx + 0x9], rax'),
                        ('cmpxchg8b-16', 'lock cmpxchg8b qword ptr [rbx + 0xc]'), ('cmpxchg8b-unlocked-line', 'cmpxchg8b qword ptr [rbx + 0x3c]')]:
-        out.append((f'lock-crossing-{name}', REGS, PRELUDE + [line] + AFTER, len(PRELUDE), {'atomic': True}))
+        # CMPXCHG8B: the pinned QEMU's full run keeps stale flags (PAIR_PROBES), so only ZF, the one it changes (SDM), is
+        # compared there; natemu's flags are the SDM's at aligned and split operands (natemu-raw/nostop-20261106-01/cx8flags.py).
+        out.append((f'lock-crossing-{name}', REGS, PRELUDE + [line] + AFTER, len(PRELUDE), {'nofault': True, **({'zf_only': True} if 'cmpxchg8b' in name else {})}))
     # I3: CMPXCHG8B/16B faults (prefix-state references only: see DATA_FORMS), CMPXCHG16B's alignment #GP(0) before its page
     # walk, LOCK on forms that are not lockable (#UD; a register destination, a non-lockable opcode, a system instruction).
     for name, line, mut in [('cmpxchg16b-unmapped', 'lock cmpxchg16b xmmword ptr [rbx]', {'unmap': [D]}),
@@ -655,7 +661,7 @@ def segment_probes():
 # CS/DS/ES/SS prefixes on the other class's operands (64-bit mode adds no base; ignored, owner decision of November 3, as on
 # the reference AMD machine: hwcheck-20261103-01/probe-output.txt lines 273-280, hwcheck-20261103-02/probe2-output.txt lines
 # 11-36): an RSP/RBP-based operand stays SS-class (#SS(0) when non-canonical), any other DS-class (#GP(0)). Every target of
-# SEGMENT_TARGETS but `pf-crossing` for the locked forms (a split lock) and BT* (its one byte does not cross).
+# SEGMENT_TARGETS but `pf-crossing` for the locked forms (covered by the dedicated split-lock probes).
 NULL_SEGMENT_FORMS = [(s, *f) for s in ('ds', 'es', 'cs') for f in [
     ('rbp-load', 'rbp', 16, 'mov rax, qword ptr {s}:[rbp + 16]'), ('rsp-store', 'rsp', 8, 'mov qword ptr {s}:[rsp + 8], rax'),
     ('rbp-rmw', 'rbp', 0, 'xor qword ptr {s}:[rbp], rax'), ('rbp-lock', 'rbp', 0, 'lock add qword ptr {s}:[rbp], rax'),
@@ -669,7 +675,7 @@ def null_segment_probes():
     out = []
     for seg, name, reg, ea, line in NULL_SEGMENT_FORMS:
         for tname, target, mut in SEGMENT_TARGETS:
-            if tname == 'pf-crossing' and name.endswith(('lock', 'xchg', 'bts', 'btr')): continue    # split lock; BT*'s byte
+            if tname == 'pf-crossing' and name.endswith(('lock', 'xchg')): continue    # dedicated split-lock probes
             regs = dict(REGS, **{reg: (target - ea) & M64})
             out.append((f'null-segment-{seg}-{name}-{tname}', regs, PRELUDE + [line.format(s=seg)] + AFTER, len(PRELUDE), mut))
     return out
@@ -940,14 +946,10 @@ def expectations(programs, probe_specs, work, paging=True):
             evs = []
         if mut.get('atomic') or mut.get('refused'):
             cases.append((p['name'], p, mut, None, offs[k], r, ATOMIC if mut.get('atomic') else REFUSED, None)); continue
-        if mut.get('deviation'):    # the guest-state page: runs to its end, the QEMU prefix plus the loads' values
-            r = json.loads(json.dumps(r))
-            for reg, v in mut['deviation'].items(): r['qemu']['gpr'][ref.REGS.index(reg)] = ref.hx(v)
-            r['qemu']['rip'] = ref.hx(rip + offs[-1])
-            cases.append((p['name'], p, {}, None, offs[-1], r, 'guest-state deviation', None)); continue
         if mut.get('nofault'):      # the full run: the program reaches its end
             if first_fault(evs, m, reader(r)): raise ValueError(f"{p['name']}: a no-fault probe faults in the model")
             r['qemu']['rip'] = ref.hx(rip + offs[-1])
+            if mut.get('zf_only'): r = dict(r, rflags_compare_mask=ref.hx(0x40))
             cases.append((p['name'], p, {}, None, offs[-1], r, 'runs to its end', None)); continue
         f = fetched or mut.get('expect') or first_fault(evs, m, reader(r))
         if not f: raise ValueError(f"{p['name']}: the probe does not fault")
@@ -1005,8 +1007,12 @@ def evaluate(case, out):
     if case[6] in (ATOMIC, REFUSED):
         # Data and registers are those of the QEMU prefix. The leaf A/D bits are NOT checked here: the swap's write-intent
         # walk may already have set A (and D) before the alignment fault stopped it.
-        stop = 'resident' if case[6] == ATOMIC else 'no_code'
-        diffs = [] if (out['stop'], out['reason'].split(' ')[0]) == (stop, case[6]) else [f"stopped {out['stop']} {out['reason']} at {out['rip']}, not {case[6]}"]
+        # A refused form: since the no-stop change #UD at the instruction (a REFUSED decode), not a stop.
+        if case[6] == REFUSED:
+            ok = out['stop'] == 'guest_fault' and ref.num(out['fault'][0]) == 6 and out['stats']['decodes'].get(f'{0x7b:#x}')
+            diffs = [] if ok else [f"stopped {out['stop']} {out['reason']} {out['fault']} at {out['rip']}, not the REFUSED #UD"]
+        else:
+            diffs = [] if (out['stop'], out['reason'].split(' ')[0]) == ('resident', case[6]) else [f"stopped {out['stop']} {out['reason']} at {out['rip']}, not {case[6]}"]
         diffs += ref.compare(prefix, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
         if not out['frame_intact']: diffs.append('FEX frame changed')
         return {**entry, 'outcome': 'fail' if diffs else 'match' if case[6] == ATOMIC else 'unsupported', 'diffs': diffs}
@@ -1053,7 +1059,7 @@ def main():
         work = a.out / 'work' / f'c{n:04d}'; work.mkdir(parents=True, exist_ok=True)
         (work / 'program.txt').write_text(case_description(case))
         limit = [str(a.max_block)] if a.max_block else []
-        run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + limit + vm.CODE_SHAPE, capture_output=True, text=True)
+        run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + vm.frame_alias_args() + limit + vm.CODE_SHAPE, capture_output=True, text=True)
         entry = {'case': name, 'kind': kind, 'returncode': run.returncode, 'stderr': run.stderr[-1000:]}
         if run.returncode:
             entry['outcome'], diffs = 'fail', ['host error']

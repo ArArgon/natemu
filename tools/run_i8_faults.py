@@ -16,9 +16,8 @@ instruction's exception table; Vol.3 6.15):
   - #GP(0), or #SS(0) through RSP, for a non-canonical operand (any byte);
   - #PF with CR2 = the first faulting byte's page in address order (a 32-byte access crossing into a not-present or
     read-only second page: CR2 = that page), error P | W | U;
-  - refusals (typed, before any effect): VMASKMOV/VPMASKMOV (FEX's element loop), VCVTPS2PH to memory (its
-    conversion's MXCSR flags would be committed before a faulting store); an encoding x86 makes #UD is #UD under the
-    gating too (I10: delivered); VLDMXCSR/VSTMXCSR run LDMXCSR/STMXCSR's transaction under the AVX gating;
+  - VCVTPS2PH memory stores complete transactionally; an encoding x86 makes #UD is #UD under the gating too
+    (I10: delivered); VLDMXCSR/VSTMXCSR run LDMXCSR/STMXCSR's transaction under the AVX gating;
   - the YMM upper halves exact at a fault right after register-only vector instructions (they stay cached there);
   - HADD/HSUB with two QNaNs: the SDM's operand order (HADD high element first) with the first-source rule.
 At a fault: RIP the instruction, and the general registers, XMM, the YMM upper halves, MXCSR and the data region exactly as
@@ -138,13 +137,9 @@ def cases():
     loop = ['xor r8d, r8d', 'L: vaddps ymm0, ymm1, ymm2', 'test r8d, r8d', 'jnz F', 'inc r8d', 'xor ecx, ecx', 'mov eax, 3',
             'xor edx, edx', 'xsetbv', 'jmp L', 'F: nop']
     out.append(case('xsetbv-then-ud', 'vaddps', [], UD, cpl=0, lines=loop, at=1))
-    # Refusals: typed stops before any effect (the masked forms would need a non-faulting masked-off element; refused). The
-    # gathers run in the resident since the correctness pass (`run_k2.py gather`); their gating stays above.
-    for g in ['vmaskmovps ymm0, ymm1, ymmword ptr [rax]', 'vmaskmovps ymmword ptr [rax], ymm1, ymm2', 'vpmaskmovd ymmword ptr [rax], ymm1, ymm2',
-              'vmaskmovdqu xmm1, xmm2',
-              'vcvtps2ph xmmword ptr [rax], ymm6, 4']:
-        out.append(case(f'refused-{g.split()[0]}{"-st" if "ymmword ptr [rax]," in g else ""}', g, [], ['nocode', 'unsupported_form'],
-                        prelude=['mov eax, 0x200100']))
+    # COR-02: memory-destination conversion completes; fault/rounding details live in run_instruction_gaps.py.
+    out.append(case('vcvtps2ph-store', 'vcvtps2ph xmmword ptr [rax], ymm6, 4', [], ['mem', D + 0x100, '00' * 16],
+                    prelude=['mov eax, 0x200100', 'vxorps ymm6, ymm6, ymm6']))
     # XSAVE/XRSTOR with live YMM state (component 2 is FEX's avx_high, the same copy the VEX forms use): the image's XMM and
     # YMM_Hi128 areas hold the registers, and after VZEROALL, XRSTOR brings every register back.
     rt = ['mov eax, 7', 'xor edx, edx', f'xsave [{D + 0x800}]', 'vzeroall', f'xrstor [{D + 0x800}]']
@@ -292,8 +287,9 @@ def judge(a, host, runtime, c):
         if not any(q(img, 576)): problems.append('YMM_Hi128 all zero: the case tests nothing')
         return problems
     if want[0] == 'nocode':
-        ok = vm['stop'] == 'no_code' and vm['reason'] == want[1] and int(vm['rip'], 0) == rip
-        return [] if ok else [f"stop {vm['stop']} {vm['reason']} rip {vm['rip']}, want no_code {want[1]} at {rip:#x}"]
+        # A refused form (fexc's `want[1]`): since the no-stop change #UD at the instruction, a REFUSED decode, not a stop.
+        ok = vm['stop'] == 'guest_fault' and int(vm['fault'][0], 0) == 6 and int(vm['rip'], 0) == rip and vm['stats']['decodes'].get(f'{0x7b:#x}')
+        return [] if ok else [f"stop {vm['stop']} {vm['reason']} {vm['fault']} rip {vm['rip']}, want the REFUSED #UD ({want[1]}) at {rip:#x}"]
     problems = []
     got = [int(v, 0) for v in vm['fault']]
     if vm['stop'] != 'guest_fault' or got[:3] != want or got[3] != rip:

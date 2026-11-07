@@ -57,7 +57,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from models.delivery_model import Fault, canonical, GP, UD, TF, RF
-from models.segment_model import Refused, _run as _segment_run, _operand, descriptor, fields, limit
+from models.segment_model import Deviation, Refused, _run as _segment_run, _operand, descriptor, fields, limit
 from models import cpu_profile
 
 PROFILE = cpu_profile.load()
@@ -125,8 +125,9 @@ def syscall(state):
 def sysret(state, width=8):
     """Vol. 2B SYSRET: #UD unless 64-bit mode and EFER.SCE; #GP(0) at CPL != 0; 64-bit: #GP(0) for non-canonical RCX,
     RIP := RCX, RFLAGS := (R11 & 3C7FD7H) | 2, CS := (STAR[63:48] + 16) | 3, SS := (STAR[63:48] + 8) | 3, CPL := 3.
-    width 4 (to compatibility mode) is 'refused' after the CPL check. Reads gpr rcx/r11, rflags, efer, msrs, cr0, cpl;
-    writes rip, rflags, cs, ss, seg cs/ss, cpl."""
+    width 4 (to compatibility mode, not built): natemu's recorded deviation (owner decision, November 6) after the CPL
+    check: the return completes, then its target (ECX) takes #GP(STAR[63:48] | 3) at CPL 3 (a `Deviation` raised at that
+    RIP). Reads gpr rcx/r11, rflags, efer, msrs, cr0, cpl; writes rip, rflags, cs, ss, seg cs/ss, cpl."""
     def body(s, bus, alts):
         _mode64(s)
         if not s['efer'] & SCE:
@@ -134,7 +135,7 @@ def sysret(state, width=8):
         if s['cpl']:
             raise Fault(GP, 0)
         if width != 8:
-            raise Refused('SYSRET to compatibility mode')
+            raise Deviation(GP, (s['msrs']['star'] >> 48 | 3) & 0xFFFC, rip=s['gpr']['rcx'] & 0xFFFFFFFF)
         rcx = s['gpr']['rcx']
         if not canonical(rcx):
             raise Fault(GP, 0)                                      # C4

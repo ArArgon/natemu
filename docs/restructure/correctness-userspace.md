@@ -64,7 +64,7 @@ CPU at N=1), or output that depends on load addresses. LTP is identical to QEMU 
 | Suite | Native (AMD) | natemu N=1 | natemu N=4 | QEMU N=4 |
 | --- | --- | --- | --- | --- |
 | torture (3,448) | 3,448 exit 0 | 10 differ | 10 differ (the same) | 2 differ (return-addr only) |
-| glibc math (1,859) | 1,859 PASS | 1,465 PASS; 394 differ: 54 AVX-512 variants UNSUPPORTED (environment: natemu's profile has no AVX-512, the AMD machine has it), 8 skipped (finding 2), 332 FAIL, all reduced x87 precision (finding 1: 320 long double / `_Float64x` / narrowing tests, 12 others that pass long doubles or use x87 internally; `basic-test` and `test-nan-payload` checked, finding 4) | 0 differ from N=1 | 1,804 PASS, 54 AVX-512 UNSUPPORTED, 1 FAIL (`test-fenv`, a QEMU defect: natemu and native pass it); QEMU passes every long double test and the AVX2 gather tests |
+| glibc math (1,859) | 1,859 PASS | 1,465 PASS; 394 differ: 54 AVX-512 variants UNSUPPORTED (environment: natemu's profile has no AVX-512, the AMD machine has it), 8 skipped (finding 2), 332 FAIL, all reduced x87 precision (finding 1: 320 long double / `_Float64x` / narrowing tests, 12 others that pass long doubles or use x87 internally; `basic-test` and `test-nan-payload` checked, finding 4) | 0 differ from N=1 | 1,804 PASS, 54 AVX-512 UNSUPPORTED, 1 FAIL (`test-fenv`, QEMU-only: natemu and native pass it; the retained excerpt does not locate the failing assertion); QEMU passes every long double test and the AVX2 gather tests |
 | LTP (1,446) | 895 pass, 514 TCONF, 25 TBROK, 8 TFAIL, 4 other (non-root on Ubuntu 7.0: not like-for-like) | identical to N=4 except `getcwd04` (TCONF: `.min_cpus = 2`) | 1,207 pass, 205 TCONF, 21 TBROK, 10 TWARN+TCONF, 1 TFAIL, 2 other; **0 differ from QEMU** but 2 that QEMU fails (`getrusage04`, `pselect01_64`: timing, QEMU too slow) | 1,205 pass, 205 TCONF, 21 TBROK, 10 TWARN+TCONF, 3 TFAIL, 2 other |
 | OpenSSL (41 x 6 = 246) | 246 pass | 246 pass, 0 differ | 246 pass, 0 differ (subtest counts equal too) | not run |
 
@@ -83,6 +83,58 @@ look for `/lib/modules` (TWARN + TCONF: the image has no modules), `keyctl05` (m
 built). A first natemu N=4 pass with 0700 per-test directories (tests that drop to `nobody` got EACCES; `runs/ltp-tmp700/`)
 was rerun with world-accessible directories, as runltp's.
 
+### Retained-result audit (November 6, 2026)
+
+Independent rereading of the final `CT-RESULT` rows reproduces every suite total above, with no missing tests and no
+per-test timeout exit (124/137) in those completed runs. This is an audit of the named producing builds, not a fresh
+execution of the current checkout. The three unfinished boots in `runs/runs.jsonl` are the first two libm attempts
+(159 and 308 results) and the gather repro; all end in `NoCode("unsupported_form")`, the same subsequently fixed gather
+defect. The replacement full runs account for their missing tests. The earlier LTP runs with an empty `KCONFIG_PATH`
+or 0700 working directories are superseded harness failures, not extra emulator failures.
+
+Torture has eight aborts (four x87 programs at two optimization levels) and two successful address-printing programs
+whose hashes differ. The 332 libm failures are 330 exits of 1 plus `bug-nextafter` and `bug-nexttoward` returning 14;
+their logs contain failed long-double range/exception checks, not timeout records. The 320 extended/narrowing cases
+include `_Float32`-from-`_Float64x` tests. The remaining twelve are enumerated in finding 1. The 54 unsupported tests
+are absent AVX-512 coverage, and the eight gather skips are historical: the later gather build completes them. OpenSSL
+has no failed or skipped selected recipe: all 246 result fields, including subtest counts, equal native at both N values.
+
+All **34 LTP results other than pass/TCONF** at N=4 have a concrete retained explanation, shared with QEMU:
+
+| Cause in this image/harness | Entries | Result |
+| --- | --- | --- |
+| No usable block device | `fgetxattr02`, `fstatfs01_64`, `lchown03`, `lchown03_16`, `linkat02`, `lstat03_64`, `mknod07`, `mknodat02`, `open12`, `preadv03_64`, `preadv203_64`, `pwritev03_64`, `rename11`, `renameat01`, `stat04_64`, `statfs01_64`, `umount2_01` | 17 TBROK; `fgetxattr02` reports ENXIO, the others cannot acquire a device |
+| Modules absent | `ioctl_loop01`–`ioctl_loop07`, `fsetxattr02`, `madvise11`, `cve-2021-3609`; `keyctl05` | 10 TWARN+TCONF for missing module metadata; 1 TBROK from modprobe |
+| Network prerequisites absent | `accept02`, `cve-2020-25705` | 2 TBROK: multicast setsockopt ENODEV; veth creation EOPNOTSUPP |
+| Runtime setting | `nice05` | TBROK: `Runtime not set!` under this runner's runtime multiplier |
+| Kernel/test expectation mismatch | `epoll_ctl04` | TFAIL: ELOOP rather than the expected EINVAL at nesting depth 5 |
+| Build exclusion left in the run list | `listmount04` | exit 127: executable not built |
+| Missing account tools | `prot_hsymlinks` | exit 134 after `useradd` and `userdel` are not found |
+
+The remaining 205 TCONF rows match QEMU by test name and result; N=1 adds only `getcwd04` (needs two CPUs). Their exact
+individual reasons were **not retained**: `run-ltp.sh` discards output for exit 32, so matching the reference supports
+an environment classification but does not recover each skip reason. A future rerun must retain TCONF output to make
+that ledger complete. The two QEMU-only TFAILs have explicit timing assertions (`getrusage04`: system time above
+5,000 us; `pselect01_64`: slept too long); neither is a natemu failure. The 256 pre-execution exclusions are separately
+enumerated, with reasons, in `native/ltp-excluded.txt`; they are not passes. In particular its timer-source rule missed
+the `_64` pselect variant, and its device rule missed the 17 old-style/device cases above.
+
+The native, non-root LTP reference has 37 non-pass/non-TCONF results, separately accounted for in
+`native/native-ltp.txt`: 14 namespace `unshare` EPERM failures; ten other permission failures (`cachestat03`,
+`process_vm_readv02/03`, `process_vm_writev02`, `semctl06`, `perf_event_open01`, `trace_sched01`, `pty05`,
+`cve-2017-1000380`, `proc01`); three inaccessible-device cases (`open12`, `preadv03_64`, `pwritev03_64`); two
+file-mode mismatches (`open14`, `openat03`, 1775 rather than 7775); four existing-IPC-object failures
+(`semget01/05`, `semop01/03`, EEXIST); two errno expectation failures (`epoll_ctl04`, and `timer_create02` getting
+EOPNOTSUPP rather than EINVAL); missing `listmount04`; and **`kill11`'s internal 120-second timeout**, reported as
+TBROK/exit 2 rather than an outer timeout exit. `kill11` passes on both natemu and QEMU; the retained native log does
+not explain its lack of progress. The mode/IPC symptoms are likewise native-environment anomalies, not diagnosed
+emulator defects. These differences and 514 native TCONF rows are why native LTP is not the like-for-like oracle.
+
+The retained QEMU `test-fenv` output is only the first 60 lines and contains no failing assertion. Its nonzero exit is
+real and absent on natemu/native; an exact QEMU root cause is not established by these files. Similarly, full closure
+of every x87 subtest is not claimed: the runner retains only the first 60 lines per failed libm program. The known
+precision mechanism and retained repros explain the failure families, while precise x87 support remains deferred.
+
 ## Findings
 
 1. **Known deviation: reduced x87 precision** (owner, November 5: accepted for now; a slow precise x87 mode is
@@ -95,7 +147,7 @@ was rerun with world-accessible directories, as runltp's.
    (`test-double-ldouble-*`, `test-ldouble-*`) are expected to fail for the same reason (first run: `test-double-ldouble-sub`
    FAIL with inexact/overflow flags and results of the double range); they are classified with this deviation. In the
    natemu N=1 run (and identically at N=4), the 332 FAILs are: 320 `test-ldouble-*`, `test-float64x-*` and
-   `test-{float,double,float32x,float64}-{ldouble,float64x}-*` tests; the nexttoward tests (`bug-nexttoward`,
+   `test-{float,double,float32,float32x,float64}-{ldouble,float64x}-*` tests; the nexttoward tests (`bug-nexttoward`,
    `test-{float,double}-nexttoward`: a long double argument); `bug-nextafter` (nextafterl overflow/underflow);
    `test-misc` (`2^16384: mantissa incorrect`, values beyond the double range); `test-canonical-ldbl-96` and
    `tst-ldbl-nonnormal-printf` (80-bit pseudo-NaN/pseudo-infinity/unnormal encodings, which an FLD m80 into a double
@@ -201,7 +253,8 @@ N = 1, base `correctness` with series65-p2 against this branch with series66-gat
 (8.87-8.92), warm 8.64 against 8.66; `zstd` 3.07 (3.03-3.10) against 3.07 (3.04-3.08), warm 2.92 and 2.92. No change: neither
 runs a gather (the change adds no code to any other path).
 
-**Advertised forms still refused** (a machine stop, `unsupported_form`; not built in this change): MASKMOVQ (SSE), MASKMOVDQU
+**Historical pre-no-stop inventory:** the no-stop work and [November 7 CPU/RAM fixes](correctness-cpu-ram.md)
+supersede the list below; newly supported forms are recorded there. **Original advertised-form refusals** (a machine stop, `unsupported_form`; not built in this change): MASKMOVQ (SSE), MASKMOVDQU
 (SSE2), VMASKMOVDQU, VMASKMOVPS/PD (AVX), VPMASKMOVD/Q (AVX2); VCVTPS2PH with a memory destination (F16C); the scalar VEX LIG
 forms with VEX.L = 1 (AVX, FMA: hardware ignores L); INSERTPS/VINSERTPS m32 whose zero mask clears the inserted element
 (SSE4.1, AVX); and of the base instruction set RCL/RCR m, BT* m, r with 0x67, 16-bit BSWAP/SHLD/SHRD, ENTER with a nesting
@@ -211,6 +264,50 @@ F2/F3 on an SSE form). The masked moves fit the gather's resident path (element 
 suppression) but have implementation-dependent parts (A/D bits of masked-off elements, faults and breakpoints with an
 all-zero mask, the non-temporal hint) that need the AMD machine first. Separately, the x86-selftest lane's `mov_ss_trap_64`
 hang (ICEBP after MOV SS with a data breakpoint on its operand, at CPL 3 under Linux: a resident watchdog, not a refused
-form) is another mechanism: ICEBP alone and after MOV SS deliver #DB at CPL 3, and the same sequence at CPL 0 in the program
-driver gives the hardware's two #DBs (the pending data breakpoint at the handler's first instruction, then INT1's;
-`icebp/probe.py`); not changed here.
+form) was another mechanism. The old CPL-0 program-driver probe (`icebp/probe.py`) observed two #DB deliveries in
+natemu with IST=0; it was not a hardware observation and does not establish the correct delivery sequence. The later
+[ICEBP investigation and fix](correctness-x86-litmus.md#icebp-fix-and-validation-november-7-utc) confirms the stale
+second delivery and its IST-frame overwrite. That stall is now repaired; exact deferred-cause DR6 merging remains
+unverified.
+
+## No-stop branch validation: retained exceptions (November 6, 2026)
+
+This later evidence belongs to the still-unmerged `no-stop` worktree and compiler `series69-nostop`, not the producing
+builds in the totals above. Its `natemu-raw/nostop-20261106-01/suite/summary.txt` contains earlier failures of `faults`,
+`faults-1` and `corpora`: the split CMPXCHG8B probes compared flags the pinned QEMU full run keeps stale. The corrected
+comparison checks ZF (CMPXCHG8B's changed flag); `suite/c2.log` reruns all three and records 4/4 passes including release.
+The remaining `pytests` failure is a reproducible worktree-path assertion in `test_check_setup`: resolved raw root
+`/Users/liaozping/orca/natemu-raw` versus expected `.claude/worktrees/natemu-raw`. It is a setup-test failure, not guest
+CPU evidence, and is not silently counted as passing. The negative-control `nc/summary.txt` reports eleven mutations
+RED as intended; those are successful rejection controls.
+
+Both retained ASM runs (`suite/asm/results.jsonl`, `suite/asm1/results.jsonl`) contain 2,270 results: 2,055 pass,
+48 reduced-x87 precision deviations, 167 unsupported, zero failures. The 167 are accounted for, not hidden passes:
+89 recorded refused-form deviations, 61 forms absent from the CPU profile, one SYSCALL needing EFER.SCE, seven tests
+requiring FEX's user-mode descriptor tables, one software interrupt requiring an OS, one region beyond the driver's
+4 MiB RAM, two AMD-specific near-branch expectations, three FEX-specific/undefined-result expectations, and two
+x87/MMX representation limitations. The 89 refused cases comprise REPNE string forms (29), 16-bit SHLD/SHRD counts
+(16), BCD/undocumented x87 forms (14), VCVTPS2PH to memory (10), REP-prefixed BT/INC/DEC/CMPXCHG forms (9), operand-size
+prefixes on stack/branch/CMPXCHG forms (7), and one each RCL/RCR memory count, mixed SSE prefixes, nested ENTER and
+MASKMOVQ. These remain implementation coverage gaps even when refusal is now delivered as a guest #UD.
+
+All 26 retained no-stop guest boots reach CT-END. That establishes machine containment for those probes, not success
+of every guest test: the two compatibility tests intentionally terminate with SIGSEGV, as the
+[x86 lane's branch-status audit](correctness-x86-litmus.md#retained-result-audit-and-branch-status-november-6-2026)
+records. ICEBP/MOV-SS with a pending watchpoint remains unresolved; the branch also leaves the documented device-MMIO,
+vector-alignment and CR0.NE=0 stops outside its change. No fresh VM or remote execution was performed for this audit.
+
+## Previously blocked N=4 gather cases (November 7 UTC)
+
+The later gather campaign had rerun the eight excluded AVX2 math cases at N=1 only. The owner-requested blocked-case
+continuation now runs all eight at N=4 on the retained final no-stop build: `129784c` plus its twelve dirty files,
+stub `6b81435c…91a1d`, runtime `c3f464e4…74a32`, compiler series69 `bfc17e9a…96d46`. This is separate from the old
+baseline and does not imply integration of the worktree. Source snapshots, patches and binary hashes are retained
+under `natemu-raw/correctness-blocked-20261107-01/`.
+
+`extra/runs/libm-gather-n4.serial` has exactly eight results, all exit 0: double libmvec exp/log/pow AVX2, double
+vlen4 exp/log/pow AVX2, float libmvec powf AVX2 and float vlen8 pow AVX2. The commands are byte-identical to the
+original native selection; only the command list is narrowed and the old skip list emptied. The boot reaches CT-END
+in 0.48 guest seconds without contention. Independent preparation and result reviews accepted this selected rerun.
+Together with the retained N=1 gather results, these remove the original eight-case skip at both CPU counts; this is
+not a fresh run of all 1,859 math programs on no-stop.

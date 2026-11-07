@@ -839,6 +839,9 @@ pub(crate) struct Args {
     work: String,
     /// Block size limit: every program runs as blocks of at most this many instructions
     max_instructions: Option<u32>,
+    /// Deterministic frame-alias VA for isolation/deviation probes (test driver only; default OS-random per VM)
+    #[arg(long, value_name = "VA", value_parser = number)]
+    guest_state_alias: Option<u64>,
     #[arg(long)]
     code_shape: bool,
     #[arg(long)]
@@ -954,7 +957,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     if let Some(&(_, gpa, _)) = d.spaces.iter().flat_map(|s| &s.mmio).find(|m| m.1 < ram_bytes && !exec::LEGACY_HOLE.contains(&m.1)) {
         return Err(format!("mmio page {gpa:#x} is guest RAM"));
     }
-    let backing = execution::prepare(resident, code_bytes, n, ram_bytes as usize)?;
+    let backing = match args.guest_state_alias {
+        Some(va) => execution::prepare_with_guest_state_alias(resident, code_bytes, n, ram_bytes as usize, va)?,
+        None => execution::prepare(resident, code_bytes, n, ram_bytes as usize)?,
+    };
     require_vcpus(n)?;
     // SAFETY: the builder and the tables it makes are dropped before `backing` (this function owns both).
     let mut builder = Builder { ram: unsafe { backing.ram() }, next: place, top: ram_bytes, reserved: Default::default() };
@@ -1439,6 +1445,8 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     // I8: YMM0..15's upper halves (the guest-state page's avx_high, two quadwords per register).
     let ymmh: Vec<u64> = (0..32).map(|q| u64::from_le_bytes(frame[(exec::frame::AVX_HIGH + 8 * q) as usize..][..8].try_into().unwrap())).collect();
     let _ = write!(out, ",\"ymmh\":[{}]", list(&ymmh));
+    // Test output only: lets probes verify which page is actually mapped rather than testing a stale fixed address.
+    let _ = write!(out, ",\"guest_state_alias\":\"{:#x}\"", control.guest_state_va);
     // Perf chunk 17: GS.base (the bank's) and IA32_KERNEL_GS_BASE (the MSR record's), which an inline SWAPGS exchanges.
     let msrs: natemu_abi::cpu::Msrs = area.read_record(exec::MSRS_OFFSET);
     let _ = write!(out, ",\"gs_base\":\"{:#x}\",\"kernel_gs_base\":\"{:#x}\"", s.cpu.gs_base, msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_KERNEL_GS_BASE).unwrap()]);
@@ -1553,10 +1561,10 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
     )
 }
 
-/// The FEX frame holds nothing outside its guest-state fields (guest code cannot have written private memory there; I8:
-/// YMM_Hi128 is one of them; perf chunk 17: IA32_KERNEL_GS_BASE's field, which the resident writes at every entry and only a
-/// CPL-0 block's SWAPGS may access; perf chunk 26: CR2's, likewise written at every entry, loaded only by a CPL-0 MOV r64, CR2;
-/// perf P2: the GDT base and limit, likewise, loaded only by a CPL-0 VERW).
+/// Checks that frame padding remains zero outside the admitted guest-state fields. Selected-alias deviation probes
+/// intentionally write that padding and must report false. Trusted frame-relative accesses include YMM_Hi128 (I8),
+/// KERNEL_GS_BASE (CPL-0 SWAPGS), CR2 (CPL-0 MOV CR2), and the GDT base/limit (CPL-0 VERW); ordinary guest accesses
+/// to the selected alias are not constrained by those instruction-specific admission rules.
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
     let field = |at: u32| at as usize..at as usize + 8;

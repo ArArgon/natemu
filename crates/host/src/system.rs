@@ -78,7 +78,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         MAP_TWO if *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
         // X1c: a Reserved-NOP cell under a mandatory-prefix overlay map (F3, F2, 66): the same two-byte opcode; also FEX's
         // SSE4a overlays of 0f 78/79 (66 EXTRQ, F2 INSERTQ).
-        MAP_TWO_F3..=MAP_TWO_66 if matches!(opcode, 0x0d | 0x18..=0x1d | 0x78 | 0x79) && *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
+        MAP_TWO_F3..=MAP_TWO_66 if matches!(opcode, 0x0d | 0x18..=0x1d | 0x78 | 0x79 | 0xf7) && *bytes.get(at)? == 0x0f && *bytes.get(at + 1)? == opcode => at += 2,
         MAP_PRIMARY if *bytes.get(at)? == opcode => at += 1,
         MAP_0F38 if bytes.get(at..at + 3)? == [0x0f, 0x38, opcode] => at += 3,
         MAP_0F3A if bytes.get(at..at + 3)? == [0x0f, 0x3a, opcode] => at += 3,
@@ -93,7 +93,10 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 _ => return None,
             };
             let gather = map_select == 2 && p & 3 == 1 && matches!(opcode, 0x90..=0x93);
-            if !(gather || (map_select == 1 && p & 0x7f == 0x78 && opcode == 0xae)) || *bytes.get(op_at)? != opcode {
+            let half = map_select == 3 && p & 3 == 1 && opcode == 0x1d;
+            // No-stop change: the masked moves (VMASKMOVPS/PD, VPMASKMOVD/Q: map 0F38, pp 66; VMASKMOVDQU: map 0F, pp 66).
+            let masked = p & 3 == 1 && ((map_select == 2 && matches!(opcode, 0x2c..=0x2f | 0x8c | 0x8e)) || (map_select == 1 && opcode == 0xf7));
+            if !(gather || masked || half || (map_select == 1 && p & 0x7f == 0x78 && opcode == 0xae)) || *bytes.get(op_at)? != opcode {
                 return None;
             }
             (rex, vex) = (xb, (b1, p));
@@ -102,9 +105,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         _ => return None,
     }
     let mut s = System { lock: u32::from(lock), ..System::NONE };
-    // Operand size of a register destination (66: 16 bits, REX.W wins) and of far pointers and pops (66 refused).
+    // Operand size of a register destination and far pointers/pops (66: 16 bits, REX.W wins).
     let size = if w { 8 } else if operand16 { 2 } else { 4 };
-    let far_size = if w { Some(8) } else if operand16 { None } else { Some(4) };
+    let far_size = if w { 8 } else if operand16 { 2 } else { 4 };
     match (map, opcode) {
         (MAP_TWO, 0x20..=0x23) => {
             // The mod field is ignored: the operand is always a register.
@@ -213,7 +216,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         (MAP_PRIMARY, 0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f | 0x9a | 0xea) => (s.kind, rep_used) = (system::UD, true),
         (MAP_TWO, 0x07) => {
             s.kind = system::SYSRET;
-            s.size = far_size?;
+            s.size = far_size;
         }
         // INVD, WBINVD and (f3) WBNOINVD.
         (MAP_TWO, 0x08 | 0x09) => {
@@ -279,12 +282,12 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             if s.memory == 0 {
                 s.kind = system::UD;
             } else {
-                s.size = far_size?;
+                s.size = far_size;
             }
         }
         (MAP_PRIMARY, 0xca | 0xcb | 0xcf) => {
             s.kind = if opcode == 0xcf { system::IRET } else { system::RET_FAR };
-            s.size = far_size?;
+            s.size = far_size;
             if opcode == 0xca {
                 s.disp = i64::from(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().unwrap()));
                 at += 2;
@@ -336,6 +339,31 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             } else {
                 s.reg = 2;
             }
+        }
+        (MAP_PRIMARY, 0xc8) => {
+            s.kind = system::ENTER;
+            s.size = if operand16 && !w { 2 } else { 8 };
+            s.disp = i64::from(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+            s.cr = u32::from(*bytes.get(at + 2)? & 31);
+            at += 3;
+        }
+        (MAP_PRIMARY, 0xc0 | 0xc1 | 0xd2 | 0xd3) => {
+            let op = rm(bytes, &mut at, rex, &mut s)?;
+            if s.memory == 0 || !matches!(op, 2 | 3) { return None; }
+            s.kind = system::ROTATE;
+            s.size = if opcode & 1 == 0 { 1 } else { size };
+            s.cr = op - 2;
+            if opcode < 0xd0 {
+                s.reg = system::NO_REG;
+                s.cr |= u32::from(*bytes.get(at)?) << 1;
+                at += 1;
+            } else {
+                s.reg = 1;
+            }
+        }
+        (MAP_TWO, 0xa5 | 0xad) if size == 2 => {
+            let source = rm(bytes, &mut at, rex, &mut s)? | r;
+            (s.kind, s.cr, s.size) = (system::DOUBLE_SHIFT16, source | if opcode == 0xad {16} else {0}, 2);
         }
         // X2: BT/BTS/BTR/BTC with a memory operand, cut only under alignment checking (fexc --alignment-gated): `cr` names
         // the operation, `reg` the bit-offset register (NO_REG for the imm8 form, its immediate skipped), `size` the operand.
@@ -401,6 +429,57 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             s.index = u32::from(sib >> 3 & 7) | u32::from(rex >> 1 & 1) << 3;
             s.cr = u32::from(!p >> 3 & 15) | u32::from(p >> 2 & 1) << 4 | u32::from(opcode & 1) << 5;
             s.size = if p & 0x80 != 0 { 8 } else { 4 };
+        }
+        // The masked moves ([`system::MASKMOV`]). VMASKMOVPS/PD and VPMASKMOVD/Q: data ModRM.reg (VEX.R), mask VEX.vvvv, memory
+        // ModRM.rm (fexc's #UD for a register operand and for VEX.W outside the PS/PD forms' W0); loads 2c/2d/8c, stores
+        // 2e/2f/8e; elements of 4 bytes (PS, D: VEX.W 0) or 8 (PD, Q: VEX.W 1). VMASKMOVDQU (VEX.128, vvvv 1111b: fexc's #UD
+        // otherwise): data ModRM.reg, mask ModRM.rm (a register), memory DS:RDI.
+        (MAP_VEX, 0x1d) => {
+            let (b1, p) = vex;
+            if p & 0xf8 != 0x78 { return None; }
+            let source = rm(bytes, &mut at, rex, &mut s)? | u32::from(!b1 >> 7 & 1) << 3;
+            if s.memory != 1 { return None; }
+            (s.kind, s.reg, s.cr, s.size) = (system::CVTPS2PH, source, u32::from(*bytes.get(at)?), 8 << (p >> 2 & 1));
+            at += 1;
+        }
+        (MAP_VEX, 0x2c..=0x2f | 0x8c | 0x8e | 0xf7) => {
+            let (b1, p) = vex;
+            let modrm = *bytes.get(at)?;
+            rm(bytes, &mut at, rex, &mut s)?;
+            let data = u32::from(modrm >> 3 & 7) | u32::from(!b1 >> 7 & 1) << 3;
+            if opcode == 0xf7 {
+                if s.memory != 0 || p & 0x7c != 0x78 {
+                    return None;
+                }
+                let mask = s.reg;
+                (s.memory, s.base, s.reg, s.cr, s.size) = (1, 7, data, mask | 32 | 64, 1);
+            } else {
+                if s.memory == 0 {
+                    return None;
+                }
+                let store = u32::from(opcode & 2 != 0);
+                let wide = if opcode < 0x80 { opcode & 1 != 0 } else { p & 0x80 != 0 };
+                s.cr = u32::from(!p >> 3 & 15) | u32::from(p >> 2 & 1) << 4 | store << 5 | 64;
+                (s.reg, s.size) = (data, if wide { 8 } else { 4 });
+            }
+            s.kind = system::MASKMOV;
+        }
+        // MASKMOVDQU (66 0f f7, register operands only: a memory operand is the host's #UD, [`undefined`]): data ModRM.reg
+        // (REX.R), mask ModRM.rm (REX.B), memory DS:RDI; F2/F3 with it is not decoded.
+        (MAP_TWO, 0xf7) if !operand16 => {
+            // MMX has only eight registers; REX.R/B do not extend their ModRM fields (SDM Vol.2A 2.2.1.2).
+            let data = rm(bytes, &mut at, 0, &mut s)?;
+            if s.memory != 0 { return None; }
+            let mask = s.reg;
+            (s.memory, s.base, s.reg, s.cr, s.size, s.kind) = (1, 7, data, mask | 32 | 128, 1, system::MASKMOV);
+        }
+        (MAP_TWO | MAP_TWO_66, 0xf7) if operand16 => {
+            let data = rm(bytes, &mut at, rex, &mut s)? | r;
+            if s.memory != 0 {
+                return None;
+            }
+            let mask = s.reg;
+            (s.memory, s.base, s.reg, s.cr, s.size, s.kind) = (1, 7, data, mask | 32, 1, system::MASKMOV);
         }
         (MAP_VEX, 0xae) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
@@ -961,13 +1040,38 @@ mod tests {
         assert_eq!(p("678e18", 0x8e), Some(System { cr: 3, size: 4, prefixes: ADDRESS32, ..mem(MOV_TO_SREG, 0, 0, 3) }));
         assert_eq!(d("670f011580000000", 0x01), Some(System { prefixes: ADDRESS32, ..mem(LGDT, RIP, 0x80, 8) }));
         assert_eq!(p("362e8e18", 0x8e).map(|s| s.segment), Some(0)); // two null prefixes: ignored
-        for (hex, op) in [("66cb", 0xcb), ("66ff28", 0xff), ("ff20", 0xff), ("8ed8", 0x8c)] {
+        assert_eq!(p("66cb", 0xcb), Some(System { kind: RET_FAR, size: 2, length: 2, ..System::NONE }));
+        assert_eq!(p("66cf", 0xcf), Some(System { kind: IRET, size: 2, length: 2, ..System::NONE }));
+        assert_eq!(p("66ff28", 0xff), Some(System { size: 2, ..mem(JMP_FAR, 0, 0, 3) }));
+        for (hex, op) in [("ff20", 0xff), ("8ed8", 0x8c)] {
             assert_eq!(p(hex, op), None, "{hex}");
         }
         for hex in ["ffe8", "ffd8", "66ffe8"] {
             assert_eq!(p(hex, 0xff).map(|s| s.kind), Some(UD), "{hex}"); // X1c: far JMP/CALL with a register operand
         }
         assert_eq!(d("f30f00e0", 0x00), None); // f3 verr (X1c: 0f 00 /7 decodes, `x1c_forms`)
+    }
+
+    #[test]
+    fn enter_width_and_nesting() {
+        for (hex, size, length) in [("c8ffff21", 8, 4), ("66c8ffff21", 2, 5), ("6648c8ffff21", 8, 6), ("4866c8ffff21", 2, 6)] {
+            let i = p(hex, 0xc8).unwrap();
+            assert_eq!((i.kind, i.size, i.cr, i.disp, i.length), (ENTER, size, 1, 65535, length));
+            assert!(i.well_formed());
+        }
+    }
+
+    #[test]
+    fn half_store_decode() {
+        for (hex, reg, size, length) in [("c4e3791d0703", 0, 8, 6), ("c4637d1d0f04", 9, 16, 6), ("c4e3791d0501000000ff", 0, 8, 10)] {
+            let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|k| u8::from_str_radix(&hex[k..k + 2], 16).unwrap()).collect();
+            let i = decode(&bytes, MAP_VEX, 0x1d).unwrap();
+            assert_eq!((i.kind, i.reg, i.size, i.length), (CVTPS2PH, reg, size, length));
+            assert!(i.well_formed());
+        }
+        for bytes in [[0xc4, 0xe3, 0xf9, 0x1d, 7, 0], [0xc4, 0xe3, 0x71, 0x1d, 7, 0]] {
+            assert!(decode(&bytes, MAP_VEX, 0x1d).is_none());
+        }
     }
 
     /// The AVX2 gathers (VEX.66.0F38 90..93, VSIB): destination ModRM.reg with VEX.R, mask VEX.vvvv, vector index SIB.index
@@ -1043,6 +1147,31 @@ mod tests {
         assert_eq!(super::decode(&[0x66, 0x48, 0x9d], MAP_PRIMARY, 0x9d), s(POPF, 8, 3)); // REX.W wins
         assert_eq!(super::decode(&[0xf0, 0xfa], MAP_PRIMARY, 0xfa).map(|s| (s.kind, s.lock)), Some((CLI, 1))); // #UD by LOCK
         assert!(s(POPF, 2, 2).unwrap().well_formed() && !System { size: 4, ..s(POPF, 4, 1).unwrap() }.well_formed());
+    }
+
+    #[test]
+    fn memory_carry_rotates() {
+        let p = |hex: &str, op| {
+            let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+            decode(&bytes, MAP_PRIMARY, op)
+        };
+        for (hex, op, size, cr, reg) in [
+            ("d210", 0xd2, 1, 0, 1), ("66d318", 0xd3, 2, 1, 1),
+            ("d310", 0xd3, 4, 0, 1), ("48d318", 0xd3, 8, 1, 1),
+            ("c01800", 0xc0, 1, 1, NO_REG), ("48c11040", 0xc1, 8, 128, NO_REG),
+        ] {
+            let s = p(hex, op).unwrap();
+            assert_eq!((s.kind, s.size, s.cr, s.reg, s.memory, s.base), (ROTATE, size, cr, reg, 1, 0));
+            assert!(s.well_formed());
+        }
+        assert_eq!(p("6764d318", 0xd3).map(|s| (s.prefixes, s.segment)), Some((ADDRESS32, SREG_FS as u32)));
+        for (hex, op) in [("d3d0", 0xd3), ("d300", 0xd3), ("c010", 0xc0)] { assert!(p(hex, op).is_none()); }
+        let left = d("660fa5d3", 0xa5).unwrap();
+        assert_eq!((left.kind, left.cr, left.reg, left.memory, left.size), (DOUBLE_SHIFT16, 2, 3, 0, 2));
+        let right = d("66440fad10", 0xad).unwrap();
+        assert_eq!((right.kind, right.cr, right.base, right.memory, right.size), (DOUBLE_SHIFT16, 26, 0, 1, 2));
+        assert!(left.well_formed() && right.well_formed());
+        assert!(d("0fa5d3", 0xa5).is_none());
     }
 
     #[test]
@@ -1179,6 +1308,38 @@ mod tests {
         ] {
             let got = decode(&bytes(hex), map, op);
             assert_eq!(got.is_some(), hex == "0f017810", "{hex}");
+        }
+    }
+
+    /// No-stop change: the masked moves' decode (`system::MASKMOV`): data, mask, L, store, VEX, width and the operand.
+    #[test]
+    fn masked_moves() {
+        let bytes = |hex: &str| -> Vec<u8> { (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect() };
+        for (hex, map, op, reg, cr, size, base) in [
+            ("c4e2752c00", MAP_VEX, 0x2c, 0, 1 | 16 | 64, 4, 0),           // vmaskmovps ymm0, ymm1, [rax]
+            ("c4e2752e08", MAP_VEX, 0x2e, 1, 1 | 16 | 32 | 64, 4, 0),      // vmaskmovps [rax], ymm1, ymm1
+            ("c4e2e98c17", MAP_VEX, 0x8c, 2, 2 | 64, 8, 7),                // vpmaskmovq xmm2, xmm2, [rdi]
+            ("c462698e0f", MAP_VEX, 0x8e, 9, 2 | 32 | 64, 4, 7),           // vpmaskmovd [rdi], xmm2, xmm9
+            ("c4c2712d03", MAP_VEX, 0x2d, 0, 1 | 64, 8, 11),               // vmaskmovpd xmm0, xmm1, [r11]
+            ("c5f9f7ca", MAP_VEX, 0xf7, 1, 2 | 32 | 64, 1, 7),             // vmaskmovdqu xmm1, xmm2
+            ("660ff7ca", MAP_TWO_66, 0xf7, 1, 2 | 32, 1, 7),               // maskmovdqu xmm1, xmm2
+            ("66440ff7c1", MAP_TWO, 0xf7, 8, 1 | 32, 1, 7),
+            ("0ff7ca", MAP_TWO, 0xf7, 1, 2 | 32 | 128, 1, 7),
+            ("4f0ff7ca", MAP_TWO, 0xf7, 1, 2 | 32 | 128, 1, 7),                // maskmovq mm1, mm2; REX ignored
+        ] {
+            let s = decode(&bytes(hex), map, op).unwrap_or_else(|| panic!("{hex}"));
+            assert_eq!((s.kind, s.reg, s.cr, s.size, s.memory, s.base, s.length as usize), (MASKMOV, reg, cr, size, 1, base, hex.len() / 2), "{hex}");
+        }
+        let mm = decode(&bytes("0ff7ca"), MAP_TWO, 0xf7).unwrap();
+        assert!(mm.well_formed());
+        for cr in [128, 160 | 8, 160 | 16, 160 | 64, 160 | 256] {
+            assert!(!System { cr, ..mm }.well_formed());
+        }
+        assert!(!System { reg: 8, ..mm }.well_formed());
+        assert!(!System { size: 8, ..mm }.well_formed());
+        // A register operand of the VEX.0F38 forms, a memory one of MASKMOVDQU, VMASKMOVDQU with VEX.L = 1: not decoded.
+        for (hex, map, op) in [("0ff700", MAP_TWO, 0xf7), ("c4e2752cc0", MAP_VEX, 0x2c), ("660ff700", MAP_TWO_66, 0xf7), ("c5fdf7ca", MAP_VEX, 0xf7)] {
+            assert!(decode(&bytes(hex), map, op).is_none(), "{hex}");
         }
     }
 

@@ -315,12 +315,12 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
     }
 }
 
-/// G1: the guest-state page's EL0 alias (`execution::GUEST_STATE_VA`, x28 of generated code), EL0 and EL1 read/write,
+/// G1: the guest-state page's EL0 alias (the host-selected `va`, x28 of generated code), EL0 and EL1 read/write,
 /// never executable, backed by window `window`'s page at backing offset `target` (its frame page): one upper-root entry of
 /// both shadow spaces (an entry below 256, which no shadow uses) links the owner's own tables
 /// (`execution::GUEST_STATE_TABLES`, never mapped in the window), whose only leaf is this page.
-pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize) {
-    let va = natemu_abi::execution::GUEST_STATE_VA;
+pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, va: u64) {
+    assert!(natemu_abi::execution::guest_state_alias_valid(va));
     let [l1, l2, leaf] = natemu_abi::execution::GUEST_STATE_TABLES;
     let index = |level: u32| (va >> (39 - 9 * level) & 511) as usize * 8;
     let word = |at: usize, value| memory.word(window + at, value);
@@ -450,33 +450,39 @@ pub(crate) mod tests {
     /// (no guest shadow's), and no window page is EL0 data (the old alias, `PRIVATE + 0x24000`, is unmapped).
     #[test]
     fn guest_state_alias_is_one_el0_page_outside_the_window() {
-        use natemu_abi::execution::{FRAME_OFFSET, GUEST_STATE_VA};
-        let memory = Memory::new().unwrap();
-        let mut spans = resident_text(0);
-        spans.push(Span::data(FRAME_OFFSET, 4096, FRAME_OFFSET));
-        private_space(&memory, 0, &spans, true);
-        guest_state_alias(&memory, 0, FRAME_OFFSET);
-        let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(offset));
-        let walk = |root: usize, va: u64| {
-            let mut table = root;
-            for level in 0..4 {
-                let entry = word(table + (va >> (39 - 9 * level) & 511) as usize * 8);
-                if level == 3 || entry & 1 == 0 {
-                    return entry;
+        use natemu_abi::execution::{FRAME_OFFSET, GUEST_STATE_SLOT, cache::MAX_VCPUS};
+        for offset in [0, 4096, (1 << 21) - 4096, 1 << 21, (1 << 30) - 4096, 1 << 30, (1 << 39) - 4096] {
+            let va = GUEST_STATE_SLOT.start + offset;
+            let memory = Memory::with_size(MAX_VCPUS * RAM_SIZE).unwrap();
+            for v in 0..MAX_VCPUS {
+                let window = v * RAM_SIZE;
+                let mut spans = resident_text(window);
+                spans.push(Span::data(FRAME_OFFSET, 4096, window + FRAME_OFFSET));
+                private_space(&memory, window, &spans, true);
+                guest_state_alias(&memory, window, window + FRAME_OFFSET, va);
+                let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(window + offset));
+                let walk = |root: usize, va: u64| {
+                    let mut table = root;
+                    for level in 0..4 {
+                        let entry = word(table + (va >> (39 - 9 * level) & 511) as usize * 8);
+                        if level == 3 || entry & 1 == 0 {
+                            return entry;
+                        }
+                        table = (entry & 0x0000_ffff_ffff_f000) as usize - IPA as usize - window;
+                    }
+                    unreachable!()
+                };
+                assert!((va >> 39 & 511) < 256);
+                for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT] {
+                    assert_eq!(walk(root, va), (IPA + (window + FRAME_OFFSET) as u64) | PAGE | EL0_DATA | PXN | UXN);
+                    assert_eq!([walk(root, va - 4096), walk(root, va + 4096)], [0, 0]);
                 }
-                table = (entry & 0x0000_ffff_ffff_f000) as usize - IPA as usize;
+                for offset in (0..RAM_SIZE).step_by(4096) {
+                    assert_eq!(word(PRIVATE_LEAF + offset / 4096 * 8) & EL0_DATA, 0, "{offset:#x}");
+                }
+                assert_eq!(word(PRIVATE_LEAF + 0x24000 / 4096 * 8), 0);
             }
-            unreachable!()
-        };
-        assert!((GUEST_STATE_VA >> 39 & 511) < 256);
-        for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT] {
-            assert_eq!(walk(root, GUEST_STATE_VA), (IPA + FRAME_OFFSET as u64) | PAGE | EL0_DATA | PXN | UXN);
-            assert_eq!([walk(root, GUEST_STATE_VA - 4096), walk(root, GUEST_STATE_VA + 4096)], [0, 0]);
         }
-        for offset in (0..RAM_SIZE).step_by(4096) {
-            assert_eq!(word(PRIVATE_LEAF + offset / 4096 * 8) & EL0_DATA, 0, "{offset:#x}");
-        }
-        assert_eq!(word(PRIVATE_LEAF + 0x24000 / 4096 * 8), 0);
     }
 
     #[test]

@@ -21,7 +21,7 @@ Expected (SDM Vol.2 per instruction; Vol.3 Table 12-1 and 6.15):
     66 with F3 on 0f 38 f6 (either order) is ADOX with 66 ignored, as on the AMD machine; F2 then F3 is refused (a `no_code`
     stop, `system_instruction`; the AMD machine runs it as ADOX), F3 then F2 #UD;
   - #AC(0) at CPL 3 with CR0.AM and RFLAGS.AC for a misaligned MOVBE (2/4/8), MOVQ/MOVD/PINSRW MMX operand (8/4/2);
-  - MASKMOVQ refused (`unsupported_form`) before any effect.
+  - MASKMOVQ completes with TOP zero and all tags valid (focused byte-mask/fault tests: run_maskmovq.py).
 """
 import argparse, json, pathlib, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -115,7 +115,6 @@ def cases():
         out.append(case(f'ts-{tag}', g, [], NM, prelude=ts, cpl=0))
         out.append(case(f'em-{tag}', g, [], UD, prelude=em, cpl=0))
         out.append(case(f'emts-{tag}', g, [], UD, prelude=emts, cpl=0))
-        if g.startswith('maskmovq'): continue
         out.append(case(f'noosfxsr-{tag}-runs', g, [], None, prelude=['mov eax, 0x200100'], sse=False, ymmh=False, xcr0=0))
     for g in ['cvtpi2ps xmm1, mm2', 'cvtps2pi mm1, xmm2', 'movq2dq xmm1, mm2']:
         out.append(case(f'ts-{g.split()[0]}', g, [], NM, prelude=ts, cpl=0))
@@ -176,7 +175,7 @@ def cases():
                             prelude=[f'mov rax, {v:#x}', 'movq mm0, rax', f'mov rax, {c:#x}', 'movq mm1, rax']))
             if c < 256:
                 out.append(case(f'shift-{op}-imm{c}', f'{op} mm0, {c}', [], ['mm', 0, mmx_shift(op, v, c)], prelude=[f'mov rax, {v:#x}', 'movq mm0, rax']))
-    out.append(case('maskmovq-refused', 'maskmovq mm0, mm1', [], ['nocode', 'unsupported_form'], prelude=X87PRE))
+    out.append(case('maskmovq-state', 'maskmovq mm0, mm1', [], ['x87', 0, 0xff], prelude=X87PRE))
     return out
 
 

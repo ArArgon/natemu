@@ -152,6 +152,11 @@ class Transfers(unittest.TestCase):
         self.assertEqual(m.ret(push(machine(), 0x40_2000, 0x23, 0x7000, 0x13))['fault'][:2], (dm.GP, 0x10))
         self.assertEqual(m.ret(push(machine(cpl=3), 0x40_2000, 0x08))['fault'][:2], (dm.GP, 0x08))  # RPL < CPL
         self.assertEqual(m.ret(push(machine(), 0x40_2000, 0x38))['outcome'], 'refused')
+        # The compatibility-mode deviation: a return to RPL 3 compatibility-mode code is #GP(selector), at CPL 0 too.
+        s = machine()
+        dm.place(s['memory'], GDT + 0x48, m.code(3, l=0, d=1).to_bytes(8, 'little'))
+        r = m.ret(push(s, 0x40_2000, 0x4B, 0x7000, 0x1B))
+        self.assertEqual((r['fault'][:2], r['deviation']), ((dm.GP, 0x48), True))
         self.assertEqual(m.ret(push(machine(), 1 << 47, 0x08))['fault'][:2], (dm.GP, 0))
 
     def test_iretq_agrees_with_the_delivery_model(self):

@@ -44,6 +44,34 @@ class MachineTests(unittest.TestCase):
         for line in ('xchg qword ptr [rbx], rax', 'xchg rax, qword ptr [rbx]'):
             self.assertEqual(F.events(line, F.REGS, 0), [('access', F.REGS['rbx'], 8, True, False)])
 
+    def test_bit_tests_access_the_complete_operand_unit(self):
+        # The selected bit can be in any byte, but CR2 is the operand unit's first byte on a missing first page.
+        for size, width in [('word', 2), ('dword', 4), ('qword', 8)]:
+            for op in ('bt', 'bts', 'btr', 'btc', 'lock bts', 'lock btr', 'lock btc'):
+                write = op != 'bt'
+                for bit in (0, width * 8 - 1, 255):
+                    line = f'{op} {size} ptr [rbx], {bit}'
+                    evs = F.events(line, dict(F.REGS, rbx=DATA+3), 0)
+                    self.assertEqual(evs, [('access', DATA+3, width, write, False)])
+                    self.assertEqual(F.first_fault(evs, machine(unmap=[DATA]), lambda *_: b''),
+                                     (14, DATA+3, 4 | (2 if write else 0)))
+                # Even bit0 requires the last operand byte. The previous byte-only model misses this page fault.
+                evs = F.events(f'{op} {size} ptr [rbx], 0', dict(F.REGS, rbx=DATA+4097-width), 0)
+                m = F.Machine({CODE}, {DATA, DATA+4096}, {'unmap':[DATA+4096]})
+                self.assertEqual(F.first_fault(evs, m, lambda *_: b''), (14, DATA+4096, 4 | (2 if write else 0)))
+
+    def test_bit_test_canonical_span_precedes_paging(self):
+        for base, vector in [('rbx',13), ('rbp',12)]:
+            evs = F.events(f'bts qword ptr [{base}], 5', dict(F.REGS, **{base:0x7ffffffffffc}), 0)
+            self.assertEqual(F.first_fault(evs, machine(), lambda *_: b''), (vector,0,0))
+
+    def test_bit_test_full_span_updates_both_pages_before_later_fault(self):
+        m = F.Machine({CODE}, {DATA, DATA+4096}, {'readonly':[DATA]})
+        evs = F.events('bt qword ptr [rbx], 0', dict(F.REGS, rbx=DATA+4095), 0)
+        self.assertIsNone(F.first_fault(evs, m, lambda *_: b''))
+        self.assertEqual(m.a, {(1, DATA >> 12), (1, (DATA+4096) >> 12)})
+        self.assertEqual(m.d, set())
+
     def test_stack_accesses_across_the_canonical_gap(self):
         for a, name, line in F.SS_SPAN:
             evs = F.events(line, dict(F.REGS, rsp=a), 0)

@@ -24,7 +24,7 @@ class SetupChecks(unittest.TestCase):
             result = subprocess.run(command, cwd=directory, env=env,
                                     capture_output=True, text=True, check=True)
             self.assertEqual(Path(result.stdout.strip()).resolve(),
-                             check_setup.REPO.parent / "natemu-raw")
+                             (check_setup.REPO.parent / "natemu-raw").resolve())
             env["NATEMU_RAW_ROOT"] = directory
             result = subprocess.run(command, env=env, capture_output=True,
                                     text=True, check=True)

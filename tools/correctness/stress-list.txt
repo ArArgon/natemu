@@ -136,10 +136,10 @@ code1 funccall 17040
 code1 funcret 760475
 code1 branch 5612787
 code1 goto 21506482
-# split: misaligned accesses one method at a time (mem3's `misaligned` (all methods) and cpu1's `lockbus` moved here:
+# Misaligned accesses one method at a time. mem3's `misaligned` (all methods) and cpu1's `lockbus` moved here:
 # their atomic methods and lockbus's locked increments at buffer+1 and +10 walking by 4 bytes (with or without
-# --lockbus-nosplit) are LOCKed accesses crossing 16 bytes, which natemu refuses with a machine stop
-# (unsupported_atomic, a documented limit): native only, family splitx). split: the 16- and 32-bit methods, split2:
+# --lockbus-nosplit) are LOCKed accesses crossing 16 bytes. These formerly stopped natemu; the no-stop implementation
+# now handles them. Keep family splitx separate for targeted regression runs. split: the 16- and 32-bit methods, split2:
 # the 64- and 128-bit ones (natemu runs misaligned stores slowly).
 split misaligned:int16rd 45045945 --misaligned-method int16rd
 split misaligned:int16wr 15827321 --misaligned-method int16wr
@@ -156,7 +156,10 @@ split2 misaligned:int64inc 17206184 --misaligned-method int64inc
 split2 misaligned:int128rd 50826714 --misaligned-method int128rd
 split2 misaligned:int128wr 17870036 --misaligned-method int128wr
 split2 misaligned:int128inc 16916919 --misaligned-method int128inc
-splitx lockbus:nosplit 3130083 --lockbus-nosplit
+# stress-ng 0.19.02 advances misaligned pointers without wrapping its 16 MiB allocation.
+# Keep each worker below 524288 iterations; the old 3130083 total overran it even at N4.
+# This bounds the unchanged public binary; see correctness-cpu-ram.md for retained original failures/controls.
+splitx lockbus:nosplit 500000 --lockbus-nosplit
 splitx misaligned:int16atomic 63255 --misaligned-method int16atomic
 splitx misaligned:int32atomic 63855 --misaligned-method int32atomic
 splitx misaligned:int64atomic 64679 --misaligned-method int64atomic

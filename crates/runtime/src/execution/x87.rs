@@ -51,6 +51,11 @@ pub(super) fn abridged() -> u64 {
 pub(super) fn set_abridged(v: u64) {
     set8(frame::X87_FTW, v & 0xff)
 }
+/// Complete a successful MMX instruction without changing its physical registers or other x87 status.
+pub(super) fn enter_mmx() {
+    set8(frame::X87_TOP, 0);
+    set_abridged(0xff);
+}
 fn valid(r: u64) -> bool {
     get8(frame::X87_FTW) >> (r & 7) & 1 != 0
 }

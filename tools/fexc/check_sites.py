@@ -17,13 +17,10 @@ For each program in fixtures/slice1/programs.json (compiled at its rip, 64-bit):
      such an instruction of the matching width, base register and direction.
   3. the dense (default) and --sparse-pc tables give identical code bytes (sparse sites are unreliable: an instruction
      without a GuestOpcode is attributed to the previous one); the binary `--object` file agrees with the JSON.
-Mismatches are reported, never skipped, in three kinds. `ERROR` is always a failure.
+Mismatches are reported, never skipped, in two kinds. `ERROR` is always a failure, including narrowed BT operands.
   ELIMINATED  a cmp/test/bt memory read whose flags are overwritten later has no native access at all (flag elimination
               deletes the flag computation, then dead-code elimination deletes the load): its fault is lost. Belongs to
               the precision work (S1b); fails unless --known-ok is given.
-  NARROWED    bt/bts/btr/btc with a memory operand, whether the bit index is an immediate or a register, access ONE byte
-              (the byte holding the bit), not the x86 operand width. ACCEPTED natemu policy (documented in the README):
-              the fault, CR2 and A/D bits are those of that byte; never a failure.
 Exit status 1 if any ERROR, or any ELIMINATED without --known-ok.
 """
 import json
@@ -103,13 +100,13 @@ def expected(asm):
     ops = [o.strip() for o in rest.split(',')] if rest else []
     mem = [i for i, o in enumerate(ops) if '[' in o]
     ptr = lambda o: dict(WIDTH, xmmword=16, ymmword=32)[o.split(' ptr')[0].split()[-1]]
-    # I3: a LOCK read-modify-write is one atomic site (bt*: FEX's byte at the bit, as unlocked); LOCK NEG loads, then
+    # I3: a LOCK read-modify-write is one operand-width atomic site; LOCK NEG loads, then
     # compare-and-swaps (patch 0016); cmpxchg8b/16b are one caspal, locked or not.
     if mn in ('cmpxchg8b', 'cmpxchg16b'):
         return [('atomic', ptr(ops[0]))]
     if locked and mn != 'xchg':
         w = ptr(ops[0])
-        return [('atomic', 1)] if mn in ('bts', 'btr', 'btc') else [('load', w), ('atomic', w)] if mn == 'neg' else [('atomic', w)]
+        return [('load', w), ('atomic', w)] if mn == 'neg' else [('atomic', w)]
     if mn == 'push':
         if mem:
             return [('load', ptr(ops[0])), ('push', ptr(ops[0]))]
@@ -342,8 +339,6 @@ def check_program(p, tmp):
         msg = f'guest +{off} "{a}": expected {exp.get(off)} sites {got.get(off)}'
         if got.get(off) is None and mn in LOAD_DST:
             problems.append(('ELIMINATED', msg))
-        elif mn in ('bt', 'bts', 'btr', 'btc') and [(k, 1) for k, _ in exp[off]] == got.get(off):
-            problems.append(('NARROWED', msg))
         else:
             problems.append(('ERROR', msg))
     for s in sites:
@@ -410,7 +405,7 @@ def main():
         FEXC = args[0]
     programs = fixture_programs()
     bad = 0
-    count = {'ERROR': 0, 'ELIMINATED': 0, 'NARROWED': 0}
+    count = {'ERROR': 0, 'ELIMINATED': 0}
     total = 0
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
@@ -421,8 +416,8 @@ def main():
                 count[kind] += 1
                 print(f"{kind:10} {p['name']}: {msg}")
             bad += any(k == 'ERROR' or (k == 'ELIMINATED' and not KNOWN_OK) for k, _ in problems)
-    print(f'{len(programs)} programs, {total} sites; {count["ERROR"]} errors, {count["ELIMINATED"]} eliminated loads, '
-          f'{count["NARROWED"]} narrowed bt accesses; {len(programs) - bad} programs pass')
+    print(f'{len(programs)} programs, {total} sites; {count["ERROR"]} errors, {count["ELIMINATED"]} eliminated loads; '
+          f'{len(programs) - bad} programs pass')
     return 1 if bad else 0
 
 

@@ -39,6 +39,7 @@ SERIAL_WHY = {
                   'delays between line changes)',
     'k1-c4': 'each run killed after 300 s: link-full at 4 vCPUs, block size 1, exceeded it in the parallel phase at -j 6',
     'boot-smoke': 'Ctrl-C must end the stub within 5 s; boots under a 120 s timeout',
+    'vector-split-smp': 'three vCPUs exercise split-lock ownership and vector completion concurrently',
 }
 
 
@@ -75,6 +76,19 @@ def steps(F, O):
     add('stack', ['python3', 'tools/check_resident_stack.py'])
     add('barriers', ['python3', 'tools/check_resident_barriers.py'])   # PCID plan P1: the page walk's speculation barriers
     add('pytests', ['env', f'FEXC={F}', 'python3', '-B', '-m', 'unittest', 'discover', '-s', 'tools', '-p', 'test_*.py'], est=10)
+    add('split-wait-model', ['python3', '-B', '-m', 'unittest', 'discover', '-s', 'tools/models', '-p', 'test_split_wait_model.py'])
+    vm('icebp', 'run_icebp.py')
+    vm('instruction-gaps', 'run_instruction_gaps.py', '--max-block', '0', est=180)
+    vm('instruction-gaps-1', 'run_instruction_gaps.py', '--max-block', '1', est=180)
+    vm('frame-alias', 'run_frame_alias.py', '--guest-state-alias', '0xffff407abcde0000')
+    vm('frame-alias-1', 'run_frame_alias.py', '--max-block', '1', '--guest-state-alias', '0xffff407abcde0000')
+    vm('frame-randomization', 'run_frame_randomization.py')
+    vm('frame-randomization-1', 'run_frame_randomization.py', '--max-block', '1')
+    vm('vector-ac', 'run_vector_ac.py')
+    vm('cpu-forms', 'run_cpu_forms.py', est=120)
+    vm('vector-split-smp', 'run_vector_split_smp.py')
+    vm('maskmovq', 'run_maskmovq.py', '--no-build')
+    vm('maskmovq-1', 'run_maskmovq.py', '--no-build', '--max-block', '1')
     corpora = {'seed': 's1d1-seed4242', 'i8': 'i8-corpus-20261030-01', 'i8b': 'i8-corpus-20261030-02', 'i9': 'i9-corpus-20261030-01',
                'i9-big': 'i9-big-20261030-01', 'sha': 'sha-corpus-20261103-01', 'adx': 'adx-corpus-20261104-01',
                'xsave': 'xsave-corpus-20261104-01', 'i10': 'i10-corpus-20261030-01', 'rex': 'rex-corpus-20261102-02',
@@ -94,6 +108,7 @@ def steps(F, O):
     for size in ('default', '1', '2'): vm(f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=90)
     vm('probes', 'run_slice2_probes.py', est=115)
     vm('asm', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', est=15, w=4)
+    vm('asm-1', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', '--max-block', '1', est=15, w=4)
     s3('corpora', 'corpora', '--parallel', '4', est=290, w=4)    # per --cpus shards each redo its QEMU references: slower
     s3('smp', 'smp', '--parallel', '2', w=2)
     s3('limits', 'limits')
@@ -109,6 +124,9 @@ def steps(F, O):
     vm('m3', 'run_m3.py', est=18, w=4)
     for g in ('cost', 'rdrand', 'xmc', 'coherence', 'rollback', 'nopruns', 'tsc', 'swapgs', 'sysfast', 'stifirst', 'stmxcsr', 'repbulk', 'cr2', 'verw', 'gather'):
         vm(f'k2-{g}', 'run_k2.py', '--only', g)
+    # No-stop change (correctness-nostop.md): masked moves, split locks, refused forms as #UD, the opcode-map sweep.
+    for g in ('maskmov', 'splitlock', 'refused', 'sweep'):
+        vm(f'nostop-{g}', 'run_nostop.py', '--only', g)
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
     for n, est in ((1, 150), (2, 280), (3, 320), (4, 200)): vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, est=est)
@@ -125,6 +143,12 @@ def steps(F, O):
     vm('r1a', 'run_r1.py', 'r1a')
     vm('boot-smoke', 'run_boot_smoke.py', est=13)
     for n in (2, 3, 4): vm(f'r1b-c{n}', 'run_r1.py', 'r1b', '--cpus', n, est=25)
+    # Fixed-address GP probes must name an unmapped page; DR watchpoints must name the actual frame.
+    distant = {'faults', 'faults-1', 'events', 'privilege', 'k2-swapgs', 'k2-cr2', 'k2-stifirst', 'k2-verw'}
+    for step in S:
+        alias = '0xffff407abcde0000' if step.name in distant else '0xffff400000001000' if step.name == 's4' else None
+        if alias is not None:
+            step.argv = ['env', f'NATEMU_TEST_GUEST_STATE_ALIAS={alias}', *step.argv]
     return S
 
 

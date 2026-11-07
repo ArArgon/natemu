@@ -1,6 +1,12 @@
 # Correctness pass: stress-ng self-verifying stress runs in a Linux guest
 
-Status: **done** (November 6, 2026; about 7 hours of natemu boots). Evidence, rerun steps and raw logs: `natemu-raw/correct-stress-20261106-01/`
+Status: **selected campaign and missing-result follow-up complete; known limitations remain** (November 7 UTC / November 6 local, 2026).
+The subsequent [CPU/RAM integration and rerun](correctness-cpu-ram.md) includes the no-stop fixes and completes the
+previous integration next step. It also invalidates the original high-count `lockbus --lockbus-nosplit` result as
+correctness evidence: stress-ng 0.19.02 walks beyond its allocation at those counts, even when it reports success.
+The project selection now uses 500,000 total operations; separate baseline/final controls at N1/N4 pass without
+patching the public binary. Original logs and the other campaign observations remain retained.
+The original campaign used about 7 hours of natemu boots. Evidence, rerun steps and raw logs: `natemu-raw/correct-stress-20261106-01/`
 (README there). Scripts: `tools/correctness/` (this lane's new files `stress-remote.sh`, `run-stress.sh`,
 `stress-list.txt`, `stress-check.py` (op counts from calibration; per-stressor comparison with native and the kernel-log
 scan), `stress-campaign.sh` (the boot queue, waiting while any `run_suite.py` runs); lane 1's harness reused unchanged: `boot.py`, `vm.sh`, `idle-boot.sh`, `init`, `remote.sh`'s
@@ -33,8 +39,9 @@ of work.
 
 ## Families
 
-Every family ran in natemu at N=4 with seeds 1 and 2 and at N=2 with seed 1 (one boot each, 900 s cap), and natively
-with the same parts. Per stressor the instance count is N (part `n=`), the op count fixed (the list); a stressor that
+The original primary families were attempted in natemu at N=4 with seeds 1 and 2 and at N=2 with seed 1 (one boot
+each, 900 s cap), and natively with the same parts; mix and splitx have the exceptions shown below. Per stressor
+the instance count is N (part `n=`), the op count fixed (the list); a stressor that
 reaches stress-ng's 240 s timeout first stops there (natively too for `mutex`, `mtx`, `pipeherd`, `sem`, `schedmix`,
 `yield`, `vforkmany`: their op limit does not stop them).
 
@@ -46,7 +53,7 @@ reaches stress-ng's 240 s timeout first stops there (natively too for `mutex`, `
 | cpu1 | atomic, futex, mutex, spinmem, dekker, peterson, mtx, prio-inv | 3 | 24 | 24 | 0 | clean | 36 min |
 | cpu2 | cpu (all methods), matrix, matrix-3d, vecmath, vecwide, vecfp, vecshuf | 3 | 21 | 21 | 0 | clean | 18 min |
 | cpu3 | veccmp, fma, fp, hash, crypt, bitops, intmath, regs, tsc, x86cpuid, rdrand | 3 | 33 | 33 | 0 | clean | 27 min |
-| proc1 | fork, vfork, vforkmany, clone, exec, spawn (as nobody), pthread, exit-group, zombie, wait, prctl, ptrace | 3 (+1 as root) | 36 (+12) | 36 (+12; exec/spawn skipped as root) | 0 | clean | 25 min (+6) |
+| proc1 | fork, vfork, vforkmany, clone, exec, spawn (as nobody), pthread, exit-group, zombie, wait, prctl, ptrace | 3 (+1 as root) | 36 (+12) | 36 (+10 passes, 2 root skips) | 0 | clean | 25 min (+6) |
 | proc2 | sigsegv, sigpipe, signal, sigq, kill, sigfpe, sigill, sigtrap, sigbus, sigabrt | 3 | 30 | 30 | 0 | clean | 9 min |
 | proc3 | sigchld, sigrt, sigsuspend, sigfd, signest, sigpending, context, bad-altstack, longjmp, priv-instr, usersyscall, x86syscall | 3 | 36 | 36 | 0 | clean | 15 min |
 | ipc1 | pipe, pipeherd, eventfd, mq, sem, sem-sysv, shm, shm-sysv, msg, fifo | 3 (N2 capped after 7) | 27 | 27 | 0 | clean (N2: not captured) | 44 min |
@@ -58,12 +65,12 @@ reaches stress-ng's 240 s timeout first stops there (natively too for `mutex`, `
 | mix | two runs of 11-12 stressors at once, one instance each, 240 s each (vm, mmapfork, fork, pthread, icache, far-branch, tlb-shootdown, sigsegv, switch, atomic, futex; mprotect, mremap, userfaultfd, vm-rw, clone, signal, sigq, cache, funcret, mmapcow, ptrace, membarrier) | 1 (N4 s1; the other three were not run, wrap-up) | 2 (23 stressor instances) | 2 (all 23 passed) | 0 | 5 stress-ng OOM kills, else clean | 8 min |
 | splitx | lockbus (split and nosplit), misaligned all and its 4 atomic methods | native only (natemu: stop, finding 1) | - | - | - | - | - |
 
-The four N=2 boots that reached the 900 s cap (ipc1, code1, split, split2) were not hangs: every stressor that finished
-passed, and the one running at the cap was ordinary slow work (ipc1: `shm-sysv`, which spends its 240 s as root doing
-no op on natemu and QEMU alike, below; code1: `goto` after `branch` passed; split/split2: misaligned stores, which
-natemu runs about 25 times slower than the AMD machine, at their 240 s timeouts one after the other). The work is sized
-for 4 instances (fixed total op counts); at N=2 the same ops take about twice as long. Their remaining stressors
-(`msg`, `fifo`, `goto`, `misaligned:int32inc`, `int128inc`) passed at N=4 with both seeds; they were not rerun at N=2.
+The four N=2 boots reached the 900 s cap after 702–889 seconds of completed stressors (ipc1, code1, split, split2).
+Every completed stressor passed or recorded an explicit skip; the unfinished stressor has no verdict. The retained
+order puts the cap during `shm-sysv`, `goto`, `misaligned:int32inc` and `misaligned:int128inc`, respectively.
+Repeated 240-second stressor timeouts explain the cumulative budget pressure; completion elsewhere does not rule
+out a hang in an unfinished invocation. The following `msg`/`fifo` also lacked N=2 results. The isolated follow-up
+below addresses these tails without discarding the capped observations.
 
 Native (AMD, the same parts): every stressor run passed, but `misaligned:int64wrds` (no MOVDIRI: skipped or nothing
 exercised, as in natemu) and `userfaultfd` (skipped as a user). In the calibration runs (no op limit) `shm-sysv` failed
@@ -136,10 +143,11 @@ address after the checksum; boot-features plan, L2).
 ## Totals
 
 natemu: 58 boots, about 7.0 hours of guest time (49 stress boots of record, 6.5 h; the rest repros, probes, the pilot).
-447 stressor runs in the 49 (16 families x 3 boots, the mix boot, the root proc1, round 1's capped 16-method split
-and splitx; the two round 1 boots that stopped add 12 more passes): 446 passed,
-1 skipped (int64wrds, as natively), **0 stress-ng verification errors (`fail:` lines), 0 failed stressors, 0 crashes or
-hangs of a stressor**, and in the 42 boots whose kernel log was captured **no kernel oops, BUG, WARNING, general
+447 result entries in the 49 `s-*` boots: **444 passing and 3 skipped** (root `exec` and `spawn`, plus N=2
+`int64wrds`). The two `stop-*` round-one boots add 12 passing entries, giving 459 entries: 456 passing and 3 skipped
+when included. The former 446-pass/1-skip tally incorrectly counted the two root-only skips as passes.
+There are **0 stress-ng verification errors (`fail:` lines) and 0 failed completed stressors**; incomplete stressors
+at a cap have no verdict. In the 42 boots whose kernel log was captured there is **no kernel oops, BUG, WARNING, general
 protection fault, soft lockup, hung task, RCU stall or bad page**: the kernel logs hold only stress-ng's own OOM kills
 (163, all of its children: mmapmany, mmapcow, stack and the mix in a 2 GiB guest) and the known MADT checksum line.
 Machine stops: 8, all `unsupported_atomic` (finding 1: the 2 round 1 boots, the round 1 split2 boot at its last
@@ -151,12 +159,128 @@ written and run (icache, far-branch, funccall/funcret), signal delivery, or the 
 
 ## Next steps
 
-1. Finding 1 has been handed to the no-stop fix (a CPL-3 instruction must not stop the machine; the gather and ICEBP
-   findings of lanes 1 and 2 are the same class). After it: boot `repro/splitlock` (`ct=repro part=14` and `62`; expect
-   `lock add + xchg ok`), then run `splitx` and the original `mem3` (with `misaligned`) and `cpu1` (with `lockbus`) in
-   natemu (remake the image with `x86-overlay.sh` from `stress.cpio.zst` and a list putting them back).
-2. Not run, for a later pass: the mix family's other three boots (seeds 2, 3 at N=4, seed 1 at N=2; queue `q8.txt`,
-   stopped at wrap-up) and longer mixes; the file-system and file-descriptor stressors (a natemu disk would add the
-   device ones); the excluded timing-judged stressors only with tolerances.
+1. The no-stop state, its compiler dependency and the MOV-SS/ICEBP fix are now integrated and validated in the
+   [CPU/RAM follow-up](correctness-cpu-ram.md). Original worktrees remain intact. The blocked-case continuation below
+   records the earlier source state; its high-count nosplit result has the later validity correction noted above.
+2. The five unfinished `q8` jobs and two isolated N=2 misaligned tails now have results (follow-up below).
+   Longer mixes, the excluded file-system/file-descriptor families and timing-judged stressors remain outside this
+   completed selection; they are not missing outputs from these seven jobs.
 3. Slow paths seen (performance, not correctness): misaligned stores about 25x the AMD machine's time, far-branch about
    250x, icache, funccall and prefetch 25-40x.
+
+## Follow-up of missing and non-passing results (November 7 UTC)
+
+The owner requested execution of planned jobs without outputs and analysis of failed/skipped/capped cases. New raw
+data: `natemu-raw/correctness-followup-20261107-01/`. This is a continuation using the original clean 8c48965 producing
+snapshot, its retained signed stub/runtime (hashes above), series65-p2 and the same kernel, not a new-build replication.
+The deleted stress10 image was reconstructed from the retained base plus `ov/ct/`; that overlay is byte-identical to
+the repository's final runner/list. `manifest.json` and `snapshot-sha256.json` retain input and harness identities.
+The independent reviewer accepted seven serial development boots with 900-second caps; no timing or general
+architecture claim follows. Original outputs are unchanged.
+
+All five missing `q8` jobs completed: mix N=4 seeds 2/3 and N=2 seed 1, IPC tail N=2 seed 1, code tail N=2
+seed 1. Two additional isolated tails retain exactly the original options, op counts, seed and instance count:
+`misaligned:int32inc` and `misaligned:int128inc` at N=2. Their only list change is the family label used to select
+one stressor per boot (`tails/manifest.json`). Every boot reached CT-END and exited zero, without recorded contention,
+host cap, unexpected skip, verification failure or kernel-fault diagnostic. `analyze.py` independently checks exact
+result IDs/counts, outcome fields and kernel diagnostics; `analysis.json` retains its complete output.
+
+| New boot | Result entries | Passed instances | Guest seconds | stress-ng child OOM kills |
+| --- | ---: | ---: | ---: | ---: |
+| mix N=4 seed 2 | 2 | 11 + 12 | 484.16 | 4 |
+| mix N=4 seed 3 | 2 | 11 + 12 | 484.46 | 4 |
+| mix N=2 seed 1 | 2 | 11 + 12 | 484.87 | 2 |
+| ipc1t N=2 seed 1 (shm-sysv as nobody, msg, fifo) | 3 | 2 each | 29.85 | 0 |
+| code1t N=2 seed 1 (goto) | 1 | 2 | 39.32 | 0 |
+| split1t N=2 seed 1 (int32inc) | 1 | 2 | 240.54 | 0 |
+| split2t N=2 seed 1 (int128inc) | 1 | 2 | 235.76 | 0 |
+
+Total: **7 boots, 12 passing result entries, 81 passed stressor instances, zero unexpected skips/failures**, 1,998.96
+guest seconds. The mixed runs' ten OOM victims are stress-ng's disposable children, marked `oom_score_adj=1000`;
+the kernel logs have no other failure diagnostic. Native mix2 has 11 passes and one `userfaultfd` skip; the guest
+has 12 passes because it can exercise that root-only facility. Other selected outcome fields match native.
+
+Completion means the bounded stress-ng run finished and verified its work. `int32inc` reached its normal 240-second
+stressor timeout at 17,147,157 of 17,250,397 requested operations; it is not a full-operation-target pass. `int128inc`
+reached its target (16,916,920 observed, 16,916,919 requested), as did `goto`. Mixed groups likewise retain their
+predeclared time/operation stopping rules. These are distinct from the original 900-second host cancellations,
+which left no final verdict for the active stressor.
+
+Independent findings review by `/root/rerun_review` checked the retained outcomes and accepted this bounded
+follow-up; no new-build replication, general race-freedom or performance claim is made.
+
+The six original host-cap cancellations were the cache/code pilot, the original unsplit misaligned family, and
+N=2 ipc1, code1, split and split2. Their completed stressors already consumed 702–889 seconds of the 900-second
+boot budget. This supports cumulative budget exhaustion; it does not prove the unfinished stressor completed.
+The first two were superseded by smaller families. The four N=2 tails are the focused follow-up above. The eight
+`unsupported_atomic` machine stops are distinct from these caps and retain finding 1; this continuation uses the
+old build and does not validate the unmerged `no-stop` fix.
+
+Skip interpretation: `exec`/`spawn` refused root and were subsequently exercised as nobody; native `userfaultfd`
+is unavailable to the unprivileged reference user but runs in the guest; `int64wrds` reports direct-store support
+unavailable or "nothing exercised". Even its exit-zero rows provide no exercised direct-store coverage. Root
+`shm-sysv`'s zero-op run is also not functional coverage: the retained nobody/QEMU controls distinguish the environment
+path, and the IPC-tail follow-up runs it as nobody. Expected stress-ng child OOM kills remain counted separately
+from kernel faults and verification failures.
+
+## Cases blocked by the atomic stop (November 7 UTC)
+
+The owner additionally requested cases skipped after machine stalls or earlier failures. The original `splitx`
+N=4, seed-1 boot stopped before its first result; no later no-stop guest run had exercised these seven stress-ng
+cases. The continuation in `natemu-raw/correctness-blocked-20261107-01/` runs each in a separate boot with unchanged
+operation counts, options and four instances. It uses the retained final **unmerged no-stop** build (`129784c` plus
+twelve dirty files), not the old correctness snapshot. Signed stub/runtime/compiler copies, source archive and dirty
+patch/files, original compiler build provenance and input hashes are retained. Compiler series69 is selected
+explicitly; the older no-stop wrapper default is not used.
+
+All seven boots reach CT-END, with four passed instances each, zero skips/failures, no contention or kernel-fault
+diagnostics, and every operation target reached. Their actual operation totals equal the retained native results:
+
+| Case | Requested / completed operations | Guest seconds |
+| --- | ---: | ---: |
+| lockbus, nosplit | 3,130,083 / 3,130,084 | 86.22 |
+| misaligned int16atomic | 63,255 / 63,256 | 52.71 |
+| misaligned int32atomic | 63,855 / 63,856 | 51.32 |
+| misaligned int64atomic | 64,679 / 64,680 | 51.98 |
+| misaligned int128atomic | 62,219 / 62,220 | 50.35 |
+| lockbus, split | 124,056 / 124,056 | 35.89 |
+| misaligned, all available methods | 14,600 / 14,600 | 57.67 |
+
+The last case exercises eighteen methods; `int64wrds` remains disabled on both native and guest. Independent
+preexecution and completed-result reviews accepted these seven bounded observations (28 passed instances).
+`analysis.json` preserves exact result identities and diagnostics. These results close the seven previously
+unexecuted selections on this no-stop build; they do not establish general split-lock race freedom or change the
+old baseline's recorded stops.
+
+Later CPU/RAM diagnosis supersedes acceptance of the `lockbus, nosplit` row above: its pointers overrun the 16 MiB
+allocation after 524,287 valid iterations, while this N4 target requests 782,521 per worker. An apparent pass can
+therefore overwrite adjacent writable mappings. N1 crashes on baseline/final and QEMU at the same locked-add
+instruction after crossing into a protected mapping. See the linked follow-up for fault captures and the separate
+allocation-safe controls. The historical row is retained as an observed result, not a valid correctness pass.
+
+The original `mem3` group was also restored, retaining the original order/options and `misaligned` at 14,600
+operations. Only the already documented `memthrash` exclusion remains: it was excluded for lacking verification,
+not hidden behind a VM stop. All eleven entries pass at N=4, seed 1, with all operation targets reached, in 275.08
+guest seconds. Its 45 OOM victims (35 in stack, ten in mlock) are stress-ng's disposable children with
+`oom_score_adj=1000`; there is no other kernel-fault diagnostic. The original post-stop `ptr-chase` and `pageswap`
+now pass in this restored same-boot context. Independent review accepted the exact selection and results.
+
+The restored `cpu1` group also completes all nine entries at N=4, seed 1, in 797.41 guest seconds: atomic, futex,
+mutex, spinmem, lockbus, dekker, peterson, mtx and prio-inv. Every entry reports four passed instances and zero
+skips/failures. Lockbus retains the original 123,212-operation limit, not the later splitx control's 124,056.
+There is no cap, contention or kernel-fault diagnostic. Peterson verifies 10,355,963 of 51,053,376 requested
+operations before its normal 240-second limit (241 seconds including completion). Prio-inv reports 24,812,200 of
+25,065,700 after seven seconds; its reported aggregate is also below the configured target. These are successful
+bounded stress-ng verifications, not a claim that every configured operation count was attained. Mutex and mtx
+also spend their normal 240-second budgets but report counts at or above their targets.
+
+Prio-inv's below-target successful count also appears in retained native controls (17,754,651 and 22,537,664 at
+N=4), so this observation is not new or natemu-only. Those unprivileged controls fall back to SCHED_OTHER when FIFO
+is unavailable; they do not establish identical scheduling conditions. The pinned 0.19.02-1 source counts work,
+signals/reaps children and returns its verification status without asserting final aggregate-count equality. It is
+not a timeout, and the precise shortfall mechanism has not been traced. The source URL/hash and control references
+are retained in `extra/stress-prio-inv-source.json`.
+
+Across this continuation: **27 passing stress entries, 108 passed instances**, comprising seven isolates and twenty
+restored-family entries. The 45 expected OOM victims are confined to mem3. The separate N=4 math and x86-tail results
+are recorded in their own reports and must not be folded into these stress totals.

@@ -381,11 +381,11 @@ def cases():
     h3 = ref.assemble('mov rsp, 0x500800\npush 0x10\npush 0')
     out.append(('pop-fs-dpl0-cpl3', h3 + b'\x90' + bytes.fromhex('0fa90fa1'), f'switch {CODE + len(h3):#x} 3\n',
                 lambda o: gp_at(CODE + len(h3) + 3, 0x10)(o) + ([] if reg(o, 'rsp') == 0x500800 - 8 else [f"RSP {reg(o, 'rsp'):#x}"])))
-    # The guest-RIP-relative split lock (`xchg [rip + d], eax` on 0x50000e..0x500011, crossing 16 bytes): the typed stop
-    # `unsupported_atomic` at the instruction (it was a host error at admission).
+    # The guest-RIP-relative split lock (`xchg [rip + d], eax` on 0x50000e..0x500011, crossing 16 bytes): it was a host error
+    # at admission, then the typed stop `unsupported_atomic`; since the no-stop change it runs (the resident's split lock).
     xchg = b'\x90\x87\x05' + (0x50000e - (CODE + 7)).to_bytes(4, 'little')
-    out.append(('split-lock-rip', xchg, '', lambda o: [] if (o['stop'], o['reason'].split()[0], smp.num(o['rip'])) == ('resident', 'unsupported_atomic', CODE + 1)
-                else [f"want unsupported_atomic at {CODE + 1:#x}, got {o['stop']} {o['reason']} at {o['rip']}"]))
+    out.append(('split-lock-rip', xchg, '', lambda o: [] if o['stop'] == 'reached'
+                else [f"want it to run to the end, got {o['stop']} {o['reason']} at {o['rip']}"]))
     # Code on a page that is not guest RAM (an unassigned guest-physical page, mapped executable): the typed stop `no_code`
     # `fetch_not_ram` at its RIP (it was a host error; no SDM exception exists for fetching from memory-mapped I/O).
     out.append(('fetch-not-ram', 'mov rax, 0x700000\njmp rax', 'mmio 0x700000 0xfe000000 unassigned\nentry 0x700000 1 clear 0x8000000000000000\n',

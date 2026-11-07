@@ -5,8 +5,9 @@
 //! `svc`s and control flow, everything the resident relies on. The code-shape check (that fexc emitted exactly the
 //! split, branch-target and #DE checks and only the instruction classes it is known to emit) is a debug option
 //! (the caller's [`crate::execution::Compiler::shape`]: the program driver's `--code-shape`, which the test runners
-//! pass, except `run_slice3_vm.py contain`): isolation is the hardware's (translated code runs at EL0), so a
-//! violation stays a producer bug confined to the vCPU's guest. The tail's literal slot is resolved here; the literal
+//! pass, except `run_slice3_vm.py contain`): hardware protects EL1 resident mappings from translated EL0 code; the
+//! selected EL0 FEX-frame alias remains a guest-accessible deviation. A producer bug stays confined to the vCPU's guest.
+//! The tail's literal slot is resolved here; the literal
 //! exits are returned as link points and the computed exit's branch for the resident to relocate.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
 use natemu_abi::execution::{ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, PRE_NZCV_REG, SRA, STAGING_BYTES, cache::MAX_BLOCK_BYTES};
