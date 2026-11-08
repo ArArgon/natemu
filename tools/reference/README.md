@@ -14,6 +14,12 @@ binary, SHA-256 checked against `ref.PINS`), run files in `.../run/` (ELFs, QEMU
 per program). Override with `--qemu`, `--workdir`. Requires host `clang` (assembles the harness stubs; the
 generator also assembles programs) and Docker.
 
+For `ref.run_programs` callers, `NATEMU_REFERENCE_BACKEND=apple` uses Apple container with the separately pinned
+Debian ARM64 image in `ref.APPLE_IMAGE`. It runs the same SHA-256-checked QEMU executable, with networking disabled,
+a read-only root, and two CPUs/512 MiB. A shell/coreutils launcher supplies the same per-job arguments and 60-second
+bound; the output parser is shared. Provenance records the actual backend, image and Linux kernel, rather than claiming
+the original Docker environment. Corpus-build scripts that invoke Docker directly still need Docker.
+
 ## Program (input) and result (output) JSON
 
     program: {"name": label only, "code": hex, "rip": addr, "gpr": [16], "rflags": value,

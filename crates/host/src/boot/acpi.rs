@@ -357,12 +357,12 @@ mod tests {
         out
     }
 
-    /// MADT <-> CPUID <-> LAPIC model <-> DSDT processors <-> mailbox <-> e820, N = 1..4.
+    /// MADT <-> CPUID <-> LAPIC model <-> DSDT processors <-> mailbox <-> e820 through the CPU-mask capacity.
     #[test]
     fn cross_agreement() {
         let map = Layout::DEFAULT.e820().unwrap();
         let kind = |a: u64, len: u64| map.iter().find(|e| e.addr <= a && a + len <= e.addr + e.size).map(|e| e.kind);
-        for n in 1..=4 {
+        for n in [1, 2, 3, 4, 10, 16, 17, 32, 64] {
             let t = build(n, ACPI_NVS.0);
             let x = at(&t, u64_at(at(&t, t.rsdp), 24));
             let (f, m) = (at(&t, u64_at(x, 36)), at(&t, u64_at(x, 44)));

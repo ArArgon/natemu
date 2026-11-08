@@ -20,8 +20,10 @@ _start:
     br x9
 private_start:
     // Remove the temporary low alias before guest addresses are admitted.
-    ldr x9, ={identity_entry}
-    str xzr, [x9]
+    ldr x9, ={identity_table}
+    mrs x10, ttbr0_el1
+    ubfx x10, x10, #30, #9
+    str xzr, [x9, x10, lsl #3]
     dsb ishst
     tlbi vmalle1
     dsb ish

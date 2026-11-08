@@ -155,6 +155,7 @@ def steps(F, O):
 class Suite:
     def __init__(self, a):
         self.a, self.O, self.lock, self.procs, self.failed = a, a.out, threading.Lock(), set(), []
+        self.finished = set()
         for d in ('logs', 'out', 'tmp'): (a.out / d).mkdir(parents=True, exist_ok=True)
         self.results = open(a.out / 'results.txt', 'a', buffering=1)
         self.vmlock = os.open(RAW / '.vm.lock', os.O_RDWR | os.O_CREAT, 0o644)
@@ -185,8 +186,9 @@ class Suite:
         if rerun: line = f"{s.name:<18} {s.phase:<4} {'PASS' if ok else 'FAIL'} first: rc={r[1]} {r[2]:.0f}s {r[3].relative_to(self.O)}; rerun: rc={rc} {dt:.0f}s {log.relative_to(self.O)}"
         line += f' ({note})' if note else ''
         with self.lock:
-            self.results.write(line + '\n'); print(line, flush=True)
+            self.results.write(line + '\n'); self.finished.add(s.name)
             if not ok: self.failed.append(s.name)
+            print(line, flush=True)
         if ok:
             for d in ('out', 'tmp'): shutil.rmtree(self.O / d / s.name, ignore_errors=True)
         return ok
@@ -264,6 +266,10 @@ def main():
         phase_s['ser'] = time.monotonic() - t
     except BaseException:
         suite.kill(); raise
+    missing = sorted({s.name for s in todo} - suite.finished)
+    if missing:
+        suite.failed.extend(n for n in missing if n not in suite.failed)
+        print('Missing results: ' + ', '.join(missing), flush=True)
     summary = f"# wall {time.monotonic() - t0:.0f}s ({', '.join(f'{k} {v:.0f}s' for k, v in phase_s.items())}); " \
               f"{len(todo) - len(suite.failed)}/{len(todo)} passed" + (f"; FAILED: {' '.join(suite.failed)}" if suite.failed else '')
     suite.results.write(summary + '\n'); print(summary)

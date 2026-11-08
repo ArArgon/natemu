@@ -115,9 +115,16 @@ full matrix at batch end; cold cache for comparisons with QEMU; per-case outputs
 
 Disks, network and console input as virtio devices with interrupt coalescing.
 
-## Owner-deferred items
+## Capacity expansion (owner, November 7)
 
-Raising and testing RAM beyond 3 GiB and vCPUs beyond 4.
+The owner lifted the earlier RAM/CPU deferral: no explicit software ceiling unless bounded by design or system.
+The current change supports up to the system's vCPU ceiling (64 on this M4, also the peer-mask width), and derives
+34 GiB installed RAM from available resident page-table storage. The PC device hole remains at 3–4 GiB; high RAM
+resumes at 4 GiB. The 14 capacity checks, six 64-vCPU APIC checks, and two Linux 8 GiB checks pass.
+All 136 standing-suite entries are accounted for after three corrected reruns; the capacity and Linux checks
+also passed an independent rebuild/replay. All 186 benchmark boots and 60 focused timing follow-ups are valid and
+independently reviewed. Short-workload slowdowns were not reproduced; N4 installer retains a small 0.0575-second
+paired median cost. See [absolute timings and references](capacity.md#performance-results).
 
 ## CPU profile additions (owner, November 3)
 
@@ -189,6 +196,88 @@ survive a CR3 load only in the supervisor space's upper (canonical) half (`crate
 either way, faster only when the OS maps its global pages there, as Linux, Windows, the BSDs and XNU do.
 
 ## Backlog (owner, November 4)
+
+### Code-first refresh (November 7)
+
+These are remaining candidates, not measured gains or permission to weaken correctness. The earlier phase-2 list is
+historical: shared host answers, shared-memory compiler transport, cached FEX request setup, resident SYSCALL/SYSRET
+fast paths, inline STI/STMXCSR, bulk STOS/CR2 handling, the CPL-3 disk cache, and hardware SHA-256 are already built.
+
+| Candidate | Effort / priority | Evidence and next check |
+| --- | --- | --- |
+| Avoid retaining exact duplicate completed compiler answers | Small; modest memory cleanup, not first speed priority | `Answers::insert` detects an already-held answer but still inserts it. The fresh exact census below finds about 3–8 MiB of redundant accounted storage in build; useful RIP/answer variants must remain. The older matching-answer counter did not establish exact duplicates. No saved compile or elapsed-time gain is established. |
+| Visit only set peer bits when posting code invalidations | Small; negligible measured budget in this set | `cache::post` filters all 64 indices. A set-bit loop could preserve target records and ordering, but the entire non-kick portion costs under 0.0002 seconds per measured launch, including work the change would keep. Do not prioritize this for speed. |
+| Adapt compiler-channel spinning when the host is oversubscribed | Small–moderate; first candidate for a controlled experiment | Sampled host spinning consumes about 1.8–2.6 CPU-seconds per build launch. This includes useful waiting and is not promised wall-time savings. Measure CPU and elapsed time together; retain the low-N fast path unless it improves. Server-side spinning remains unmeasured. |
+| Reduce sparse ownership-summary scanning | Moderate; low measured priority | Ownership clears and reverse-head resets together cost about 0.003 seconds at N4/2 GiB and 0.024–0.027 seconds at N10/8 GiB per launch, summed across CPUs. These whole-operation budgets include necessary updates. An extra index is not justified by a large measured saving here. |
+| Computed-exit target census, then a per-site cache | Moderate–large; strongest prior sampled lead | The dispatcher accounted for 16.5% of generated-code samples in build. Establish target stability and invalidation cost before designing the cache; sample share is not a speedup estimate. |
+| Prove aligned stack stores can skip crossing checks | Small–moderate | Prior estimate 1–3%; removing all checks was an inexact 3.7–6.7% ceiling, not an implementable gain. Preserve unaligned and page-crossing semantics. |
+
+### Measured sizing of the small candidates (November 7)
+
+All 16 author boots and four independent diagnostic repetitions passed. A separate
+snapshot of the accepted capacity source adds outer-operation timers, an exact
+live-answer census and sampled thread CPU clocks. It changes no public workload
+or production optimization. Full per-request profiling and its periodic sampler
+were disabled to avoid distorting the short spin window. The
+[independent audit](../../../natemu-raw/perf-sizing-20261107-01/independent/sizing-review.json)
+checks source and binary hashes, commands, serial verification, counters and calculations.
+
+Ranges below cover three diagnostic runs per configuration, one independently
+executed. Each workload launch includes boot **and both cold/warm passes**;
+installer ends at the language-selection endpoint plus shutdown. Runtime times
+are summed per-vCPU elapsed budgets, including descheduling and instrumentation,
+not critical-path wall savings. CPU-seconds are CPU consumed across host threads.
+
+| Configuration | Posting excluding measured kick time (seconds) | Ownership clears + reverse resets (seconds) | Estimated host spin (CPU-seconds) | Live duplicate accounted storage (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Installer, 4 CPUs / 2 GiB | 0.000073–0.000074 | 0.00334–0.00359 | 0.785–0.819 | 0.30–0.40 |
+| Build, 4 CPUs / 2 GiB | 0.000071–0.000076 | 0.00295–0.00316 | 1.815–1.962 | 2.99–8.05 |
+| Build, 10 CPUs / 8 GiB | 0.000137–0.000152 | 0.02426–0.02663 | 2.489–2.619 | 3.51–6.61 |
+| Locks, 10 CPUs / 8 GiB | 0.000136–0.000150 | 0.02382–0.02545 | 0.601–0.635 | 0.65–1.41 |
+
+The posting budget still includes atomic record writes and timing overhead; only
+part could disappear with a different loop. Clear/reset budgets include necessary
+nonzero updates. The separate drain path took 0.018–0.069 seconds including real
+invalidations; that is not an empty-summary scanning estimate and overlaps other
+timed work. Do not add these nested budgets.
+
+Duplicates require the same stored RIP, read dependencies, prefix, whole-input
+flag and answer contents; owner and unread gating values do not matter. The census
+checks both cache generations. Bytes are the cache's `Entry::size()` accounting,
+not RSS, cumulative allocations or a guaranteed amount reclaimable without aging
+effects. Build scheduling changes the observed duplicate count substantially.
+
+Host spin samples every 64th reply with offsets varied across CPUs and repetitions;
+the measured window ends at reply readiness or spin expiry, before sleeping and
+copying. CPU estimates include both productive and expired spins: they are not all
+waste. At N10 build, 472/4012 and 536/4101 author samples expired their spin budget,
+versus 29/4031 and 57/3987 at N4. This supports testing high-N adaptation, not a
+claim that eliminating spinning saves 2.6 seconds of wall time. FEX's separate
+20-µs spin loop was not instrumented.
+
+Two plain controls per configuration run in balanced alternating order. Instrumented-minus-
+plain installer times were +0.278 and +0.118 seconds; other cold differences ranged
+from −0.369 to +0.447 seconds. Observer effects and run variation prevent using this
+census to explain the earlier 0.058-second boot signal or promise millisecond wall
+gains. **Next useful experiment:** vary the host spin budget at N4/N10 and measure
+both CPU consumption and elapsed time. The other three candidates are deprioritized
+for speed on this workload set; none has been implemented by this sizing pass.
+
+Implemented during capacity validation: split-lock acquisition now posts peer shadow-reset requests before waiting
+for acknowledgements. The 64-vCPU SMC/split-lock checks pass at both block sizes. Earlier sequential requests made
+this stress case slow; retained runs motivated the change but are not a paired performance estimate. Ordinary-workload
+measurements are complete: no reproduced short-workload slowdown, with the small installer cost above retained.
+
+Measured follow-up: profile the remaining N4 installer cost (4.5175 → 4.5750 s in the six-pair focused run).
+Five of six pairs are slower beyond observer bounds; this is not dismissed as noise. The source candidates above
+are hypotheses, not an attribution of that cost.
+
+Lower-priority checks: false sharing among per-CPU split-lock flags; larger-N host-answer-cache lock contention
+(old N=4 build lock time was only 5.4 ms); page-table-copy fault-around after a fault census. Retain PCID/INVPCID,
+bulk MOVS/CMPS/SCAS, IRET fast paths, and adaptive kernel disk caching as larger or smaller-payoff work already listed.
+Compile-ahead and in-flight waiting remain unselected after no wall-time benefit. The latest BT-only six-pair
+comparison had a +0.54% cold median, range −6.34%..+2.40%, with a strong run-order effect; it is not a demonstrated
+regression to optimize. Evidence: `natemu-raw/cpu-ram-perf-diagnosis-20261107-01/ablation-review.txt`.
 
 - Arm-feature ideas (owner, November 5: backlog only, not investigated). (1) A PAC-protected return-address cache for x86
   CALL/RET: generated code keeps host return sites beside guest return addresses on a stack EL0 can write; entries are

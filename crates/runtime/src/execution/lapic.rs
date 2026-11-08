@@ -592,7 +592,7 @@ pub(super) fn set_base(s: &mut State, new: u64) -> Result<(), Exception> {
 /// Sends the IPI `icr` (ICR low in bits 31:0, the destination in 63:56 in xAPIC mode, 63:32 in x2APIC mode).
 fn send(s: &mut State, icr: u64, x2apic: bool) {
     let (vector, mode, me) = (icr & 0xff, icr::mode(icr), s.vcpu);
-    let all = (1u64 << s.vcpus) - 1;
+    let all = natemu_abi::execution::vcpu_mask(s.vcpus);
     let dest = if x2apic { icr >> 32 } else { icr >> 56 };
     let targets = match icr::shorthand(icr) {
         icr::SELF => 1 << me,

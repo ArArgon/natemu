@@ -247,7 +247,9 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
     word(shadow::LOWER_ROOT + 256 * 8, table(0x12000));
     word(shadow::USER_LOWER_ROOT + 256 * 8, table(0x12000));
     // Low alias exists only for MMU enable and is removed by startup.
-    word(0x11000 + 8, IPA | 1 | 1 << 10 | 1 << 11 | 3 << 8);
+    let identity = IPA + window as u64;
+    word(0x11000 + ((identity >> 30) as usize) * 8,
+        (identity & !((1 << 30) - 1)) | 1 | 1 << 10 | 1 << 11 | 3 << 8);
     word(0x11000, table(0x15000));
     word(0x15000, table(shadow::LOWER_LEAF));
     for g in 0..PRIVATE_GIBS {
@@ -505,7 +507,20 @@ pub(crate) mod tests {
         assert_eq!(ram(1, gib - 2 * mib), IPA | BLOCK | PXN | UXN);
         assert_eq!(ram(2, 0), (IPA + 2 * mib as u64) | BLOCK | PXN | UXN);
         assert_eq!(ram(3, gib - 2 * mib), IPA | BLOCK | PXN | UXN);
-        assert_eq!((PRIVATE_GIBS, private_l2(1), private_l2(3)), (4, 0x25000, 0x27000));
+        assert_eq!((PRIVATE_GIBS, private_l2(1), private_l2(3)), (37, 0x25000, 0x27000));
+    }
+
+    #[test]
+    fn startup_identity_follows_owner_backing_above_first_gib() {
+        for window in [0, (1 << 30) - (2 << 20), 1 << 30, 17 << 30, 36 << 30] {
+            let memory = Memory::with_size(window + 2 * RAM_SIZE).unwrap();
+            private_space(&memory, window, &resident_text(window), true);
+            let ipa = IPA + window as u64;
+            let index = (ipa >> 30) as usize;
+            let word = |i| u64::from_le_bytes(memory.read::<8>(window + 0x11000 + 8 * i));
+            assert_eq!(word(index) & 0x0000_ffff_c000_0000, ipa & !((1 << 30) - 1));
+            if index != 1 { assert_eq!(word(1), 0); }
+        }
     }
 
     #[test]
