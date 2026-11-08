@@ -98,7 +98,7 @@ steps, stale links, invalidations, stops and shootdowns are reported.
 from N vCPUs while one clears A/D and INVLPGs, remap with per-vCPU INVLPG, 2 MiB <-> 4 KiB changes, aliases across vCPUs,
 contended A/D walks (data, fetch, both) that must never halt; at 2 and 4 vCPUs (default), block sizes default and 1.
 
-`limits`: 5 vCPUs are refused (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
+`limits`: 65 vCPUs are refused (above the 64-bit peer-mask limit) (0 cannot be written: a description without `cpu` lines is one vCPU; the host's
 `prepare` refuses 0 in its unit test); a forged literal exit (its RIP move altered after admission) on vCPU V of 4 (V = 0..3; the others spin in a linked
 loop) halts V with bad_reply (the resident decodes each link point's move at the reply), cancels and joins the others, and the VM is destroyed (the driver reports only then).
 
@@ -396,10 +396,10 @@ def cmd_litmus(a, host, runtime):
 def cmd_limits(a, host, runtime):
     failures, report = [], {}
     loop = 'body 0x100000 ebfe\n'                  # jmp $: a linked loop with no exit
-    five = loop + ''.join('cpu\nrip 0x100000\n' for _ in range(5))
-    rc, out, err = driver(host, runtime, a.fexc, five, a.out / 'work' / 'five')
-    report['five'] = {'returncode': rc, 'stderr': err.strip()}
-    if rc == 0 or '5 vCPUs' not in err: failures.append(f'5 vCPUs not refused: {rc} {err.strip()[-200:]}')
+    over_capacity = loop + ''.join('cpu\nrip 0x100000\n' for _ in range(65))
+    rc, out, err = driver(host, runtime, a.fexc, over_capacity, a.out / 'work' / 'over-capacity')
+    report['over_capacity'] = {'returncode': rc, 'stderr': err.strip()}
+    if rc == 0 or '65 vCPUs' not in err: failures.append(f'65 vCPUs not refused: {rc} {err.strip()[-200:]}')
     straight = vm.description(json.loads((ROOT / 'fixtures/slice1/programs.json').read_text())['programs'][0])
     for v in range(4):
         text = ''.join('cpu\n' + (straight if w == v else 'rip 0x100000\nbody 0x100000 ebfe\n') for w in range(4))
@@ -784,7 +784,7 @@ def profile_program(n):
     prog = {'format': 'natemu-smp-v1', 'name': f'profile@{n}', 'ncpu': n, 'system': True, 'bodies': bodies, 'cpus': cpus, 'memory': memory}
     # The firmware's MTRRs follow the VM's guest RAM (the driver's `--ram`/NATEMU_RAM, hex; default 2 GiB).
     ram = int(os.environ.get('NATEMU_RAM', '0x80000000').removeprefix('0x'), 16)
-    reset = {**{m: cp._i(P.msr(m)['reset']) for m in readable}, **P.mtrr_state(ram)}
+    reset = {**{m: cp._i(P.msr(m)['reset']) for m in readable}, **P.mtrr_state(min(ram, 3 << 30))}
     # IA32_ARCH_CAPABILITIES: RDCL_NO is advertised only with the speculation-barrier switch on (and host FEAT_CSV3); the
     # program driver runs it off (PCID plan P1, "Measured (P1)"), so RDCL_NO is 0 here whatever the host.
     reset[0x10a] = P.arch_capabilities(False)

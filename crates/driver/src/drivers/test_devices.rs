@@ -186,7 +186,9 @@ mod tests {
         assert_eq!([0, 1, 2].map(|_| t.read(1, TestDevice::COUNTER, 4)), [Some(0), Some(1), Some(2)]);
         assert!(t.write(2, TestDevice::SEQUENCE, 8, 0) && t.write(2, TestDevice::SEQUENCE, 8, 5));
         assert!(t.write(0, 0x10, 4, 0xdead_beef));
-        assert_eq!((t.read(0, 0x11, 2), t.order_errors, t.reads, t.writes), (Some(0xadbe), 1, [1, 3, 0, 0], [1, 0, 2, 0]));
+        assert_eq!((t.read(0, 0x11, 2), t.order_errors), (Some(0xadbe), 1));
+        assert_eq!((&t.reads[..4], &t.writes[..4]), (&[1, 3, 0, 0][..], &[1, 0, 2, 0][..]));
+        assert!(t.reads[4..].iter().chain(&t.writes[4..]).all(|&n| n == 0));
     }
 
     #[test]

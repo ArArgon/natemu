@@ -96,10 +96,10 @@ impl Boot {
         if self.speculation_barriers && !execution::host_feature("FEAT_SB") {
             return Err("--speculation-barriers: this host lacks FEAT_SB (sysctl hw.optional.arm.FEAT_SB)".into());
         }
-        let layout = Layout { low_end: self.ram, high: 0 };
+        let layout = Layout { low_end: self.ram.min(exec::LOW_RAM_END), high: self.ram.saturating_sub(exec::LOW_RAM_END) };
         layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
-        let backing = execution::prepare(&self.runtime.to_string_lossy(), self.code_bytes, self.vcpus, layout.low_end as usize)?;
         require_vcpus(self.vcpus)?;
+        let backing = execution::prepare(&self.runtime.to_string_lossy(), self.code_bytes, self.vcpus, self.ram as usize)?;
         let tables = boot::acpi::build(self.vcpus, self.rsdp);
         let inputs = Inputs { image: &self.kernel, cmdline: &self.cmdline, initrd: self.initrd.as_deref(), acpi: Some(&tables) };
         let loaded = boot::load(&backing.ram, &layout, &inputs).map_err(|e| e.to_string())?;
@@ -117,7 +117,7 @@ impl Boot {
         // L3: COM1 and the unassigned rule.
         let uart = Arc::new(Mutex::new(uart::Uart::new()));
         uart.lock().unwrap().sink = self.serial;
-        let mut devices = devices::Devices::new(layout.low_end);
+        let mut devices = devices::Devices::new(self.ram);
         devices.register_ports(boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
         // L4a: the I/O APIC, the 8259 pair and their wires.
         let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;

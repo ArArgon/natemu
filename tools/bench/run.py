@@ -43,6 +43,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     for name in ('--out', '--name', '--emu', '--vcpus', '--bench', '--kernel', '--initrd'): ap.add_argument(name, required=True)
     ap.add_argument('--jobs')
+    ap.add_argument('--ram', type=int, default=2048, help='installed guest RAM in MiB (default: 2048)')
     ap.add_argument('--fexc')
     ap.add_argument('--natemu', default=str(ROOT / 'target/release/natemu'))
     ap.add_argument('--runtime')
@@ -50,6 +51,7 @@ def main():
     ap.add_argument('--cap', type=float, default=600)
     ap.add_argument('--qemu', default='/opt/homebrew/bin/qemu-system-x86_64')
     a = ap.parse_args()
+    if a.ram < 2 or a.ram % 2: ap.error('--ram must be a positive multiple of 2 MiB')
     out, name, emu, n, bench, cap = a.out, a.name, a.emu, a.vcpus, a.bench, a.cap
     jobs = a.jobs or n
     cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr bench={bench} jobs={jobs}'
@@ -61,10 +63,10 @@ def main():
     if emu == 'natemu':
         if not a.fexc: ap.error('--emu natemu needs --fexc')
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd,
-               '--cmdline', cmdline, '--vcpus', n, '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else [])]
+               '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else [])]
     else:
         cmd = [a.qemu, '-nodefaults', '-machine', 'pc,hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}",
-               '-cpu', 'max' if emu.endswith('-max') else QCPU, '-m', '2048', '-smp', n, '-kernel', a.kernel, '-initrd', a.initrd, '-append', cmdline,
+               '-cpu', 'max' if emu.endswith('-max') else QCPU, '-m', str(a.ram), '-smp', n, '-kernel', a.kernel, '-initrd', a.initrd, '-append', cmdline,
                '-display', 'none', '-monitor', 'none', '-serial', f'file:{serial}', '-no-reboot']
     t0 = time.monotonic()
     p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=open(f'{out}/{name}.stdout', 'w'), stderr=open(f'{out}/{name}.stderr', 'w'))
@@ -121,7 +123,7 @@ def main():
     r1 = run('', M['START '], M['END '], seen[0], phase_bounds[0]); r2 = run('2', M['START2 '], M['END2 '], seen[1], phase_bounds[1])
     verified = r1['verified'] and r2['verified']
     start = M['START ']
-    rec = dict(name=name, emu=emu, vcpus=int(n), bench=bench, jobs=int(jobs), reached=r1['reached'] and r2['reached'], verified=verified,
+    rec = dict(name=name, emu=emu, vcpus=int(n), ram_mib=a.ram, bench=bench, jobs=int(jobs), reached=r1['reached'] and r2['reached'], verified=verified,
                verified1=r1['verified'], verified2=r2['verified'], wall_s=r1['wall_s'], wall2_s=r2['wall_s'],
                wall_bounds_s=r1['wall_bounds_s'], wall2_bounds_s=r2['wall_bounds_s'], guest_s=r1['guest_s'],
                guest2_s=r2['guest_s'], rc_bench=r1['rc_bench'], rc_bench2=r2['rc_bench'], phases=r1['phases'], phases2=r2['phases'],

@@ -211,7 +211,7 @@ impl Machine {
     /// Routes vCPU `v`'s SPI to it (Aff0 = `v`). Written after the vCPU exists: HVF delivers an SPI whose route was
     /// written before then to no one (`experiments/track03/native-interrupts/`, the IROUTER quirk).
     pub fn route(&self, v: usize) -> Result<()> {
-        self.set_distributor(GICD_IROUTER + 8 * (self.spi + v as u32) as u16, v as u64)
+        self.set_distributor(GICD_IROUTER + 8 * (self.spi + v as u32) as u16, natemu_abi::execution::vcpu_affinity(v))
     }
     /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
     pub(crate) fn ring(&self, v: usize) -> Result<()> {
@@ -324,7 +324,7 @@ impl Vcpu {
         // (X3: the LAPIC timer's doorbell) to group 1 and leaves the rest in group 0 (only group 1 reaches the resident,
         // ICC_IGRPEN1_EL1).
         let bit = 1 << natemu_abi::execution::KICK_SGI | 1 << VTIMER_PPI;
-        self.set_sys(MPIDR_EL1, v as u64)?;
+        self.set_sys(MPIDR_EL1, natemu_abi::execution::vcpu_affinity(v))?;
         let _gic = gic();
         unsafe {
             hv(hv_vcpu_set_vtimer_offset(self.id, 0), "hv_vcpu_set_vtimer_offset")?;

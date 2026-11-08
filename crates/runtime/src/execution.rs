@@ -973,7 +973,7 @@ impl CodePages for FetchWrites<'_> {
 /// see [`find`]).
 fn mark(s: &mut State, gpa: u64) {
     let writers = cache::mark(gpa);
-    let own = 1u8 << s.vcpu;
+    let own = (1 as natemu_abi::execution::cache::CpuMask) << s.vcpu;
     if writers & own != 0 {
         reset_shadows(s);
     }

@@ -6,7 +6,7 @@
 //! body holding its start RIP ends: that RIP is its stop address. Prints the final
 //! state as JSON. An optional block size limit makes every program run as several blocks;
 //! `--code-cache BYTES` sets each code cache's capacity and `--watchdog-ms MS`
-//! the watchdog (default 10 s). M1: `--ram BYTES` is the VM's guest RAM (a 2 MiB multiple to 3 GiB; default 2 GiB, or
+//! the watchdog (default 10 s). M1: `--ram BYTES` is the VM's installed guest RAM (a 2 MiB multiple; default 2 GiB, or
 //! `NATEMU_RAM`) and `--place GPA` the guest-physical page the driver places tables and pages from, upwards (default
 //! 0x1000, or `NATEMU_PLACE`); the environment defaults let a suite's runner run unchanged at another size or placement. After the run each vCPU's cache link points are
 //! self-checked ([`execution::check_links`]). Run-time defence checks, which corrupt what admission or the resident
@@ -340,7 +340,10 @@ struct Builder {
 }
 impl Builder {
     fn page(&mut self) -> Result<u64> {
-        while self.reserved.contains(&self.next) || exec::LEGACY_HOLE.contains(&self.next) {
+        loop {
+            if exec::LEGACY_HOLE.contains(&self.next) { self.next = exec::LEGACY_HOLE.end; }
+            if (exec::LOW_RAM_END..exec::HIGH_RAM_START).contains(&self.next) { self.next = exec::HIGH_RAM_START; }
+            if !self.reserved.contains(&self.next) { break; }
             self.next += 4096;
         }
         let gpa = self.next;
@@ -351,6 +354,7 @@ impl Builder {
         Ok(gpa)
     }
     fn large(&mut self) -> Result<u64> {
+        if self.top > exec::LOW_RAM_END && self.top <= exec::HIGH_RAM_START { self.top = exec::LOW_RAM_END; }
         let gpa = self.top.saturating_sub(LARGE) & !(LARGE - 1);
         if gpa == 0 || gpa < self.next {
             return Err("guest RAM exhausted (2 MiB frame)".into());
@@ -511,28 +515,40 @@ fn page_span(start: u64, length: usize) -> impl Iterator<Item = u64> {
 /// `log_base + 0x2000 + 16n`. Each vCPU starts with GDTR, IDTR and TR (hidden part, busy) naming them. The handler page is
 /// never mapped or fetched: reaching it ends the run (`Stop::Hooked(LOGGED)`, before any fetch) and the report reads the frame
 /// from the vCPU's stack, as a handler that logs and halts would. A program that loads its own GDT, IDT, TSS or tables
-/// owns delivery from then on. Pages: GDT and TSSs at +0, IDT at +0x1000, stacks at +0x3000 + 0x1000v (vCPUs 0..3), all
+/// owns delivery from then on. Pages: GDT and the first 16 TSSs at +0, IDT at +0x1000, stacks at +0x3000 + 0x1000v,
+/// further TSSs after the maximum stack range. Old fixture addresses remain unchanged. All pages are
 /// writable, supervisor-only (CPL 3 code cannot change them), not executable; at `LOG_BASE` (its own PML4 entry) in driver-built spaces, identity-mapped at
 /// `LOG_IDENTITY` in identity spaces (inside the ranges `tools/bench/smp/programs.py` `sys_tables` maps, so programs
 /// that load those tables keep them).
 const LOG_BASE: u64 = 0xffff_ff00_0000_0000;
 const LOG_IDENTITY: u64 = 0x3e_8000;
-const LOG_PAGES: [u64; 6] = [0, 0x1000, 0x3000, 0x4000, 0x5000, 0x6000];
 const LOG_HANDLERS: u64 = 0x2000;
 const LOG_TSS: u64 = 0x800;
+const LOG_EXTRA_TSS: u64 = 0x3000 + cache::MAX_VCPUS as u64 * 4096;
+fn log_tss(v: usize) -> u64 {
+    if v < 16 { LOG_TSS + 0x80 * v as u64 } else { LOG_EXTRA_TSS + 0x80 * (v - 16) as u64 }
+}
+fn log_pages(n: usize) -> Vec<u64> {
+    let mut pages = vec![0, 0x1000];
+    pages.extend((0..n.max(4)).map(|v| 0x3000 + v as u64 * 4096));
+    if n > 16 {
+        pages.extend((LOG_EXTRA_TSS..(log_tss(n - 1) + 0x80).next_multiple_of(4096)).step_by(4096));
+    }
+    pages
+}
 fn log_base(identity: bool) -> u64 {
     if identity { LOG_IDENTITY } else { LOG_BASE }
 }
 /// The GDT/TSS page and the IDT page at `base`.
-fn log_images(base: u64) -> [Vec<u8>; 2] {
+fn log_images(base: u64, n: usize) -> Vec<(u64, Vec<u8>)> {
     let mut gdt: Vec<u64> = vec![0, 0x00af_9b00_0000_ffff, 0x00cf_9300_0000_ffff, 0x00cf_f300_0000_ffff, 0x00af_fb00_0000_ffff, 0x00cf_9b00_0000_ffff];
-    let mut page = vec![0u8; 4096];
-    for v in 0..cache::MAX_VCPUS as u64 {
-        let tss = base + LOG_TSS + 0x80 * v;
+    let mut page = vec![0u8; (log_tss(n.max(4) - 1) + 0x80).next_multiple_of(4096) as usize];
+    for v in 0..n.max(4) {
+        let tss = base + log_tss(v);
         gdt.push(0x67 | (tss & 0xff_ffff) << 16 | 0x8b << 40 | (tss >> 24 & 0xff) << 56);
         gdt.push(tss >> 32);
-        let stack = (base + 0x4000 + 0x1000 * v).to_le_bytes();
-        let at = (LOG_TSS + 0x80 * v) as usize;
+        let stack = (base + 0x4000 + 0x1000 * v as u64).to_le_bytes();
+        let at = log_tss(v) as usize;
         page[at + 4..at + 12].copy_from_slice(&stack); // RSP0
         page[at + 0x24..at + 0x2c].copy_from_slice(&stack); // IST1
     }
@@ -546,7 +562,11 @@ fn log_images(base: u64) -> [Vec<u8>; 2] {
         idt[16 * n as usize..16 * n as usize + 8].copy_from_slice(&lo.to_le_bytes());
         idt[16 * n as usize + 8..16 * n as usize + 16].copy_from_slice(&(offset >> 32).to_le_bytes());
     }
-    [page, idt]
+    let mut images = vec![(0, page[..4096].to_vec()), (0x1000, idt)];
+    if n > 16 {
+        images.push((LOG_EXTRA_TSS, page[LOG_EXTRA_TSS as usize..].to_vec()));
+    }
+    images
 }
 
 /// Every literal exit's RIP move puts another RIP in x0: bit 0 of the immediate of its last word (the one before its
@@ -951,31 +971,31 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     if kicked.iter().any(|&v| v >= n) {
         return Err(format!("--kick-vcpu: {n} vCPUs"));
     }
-    if place % 4096 != 0 || place == 0 || place >= ram_bytes {
+    if place % 4096 != 0 || place == 0 || !exec::ram_contains(ram_bytes, place) {
         return Err(format!("--place {place:#x}: a nonzero page inside guest RAM"));
     }
-    if let Some(&(_, gpa, _)) = d.spaces.iter().flat_map(|s| &s.mmio).find(|m| m.1 < ram_bytes && !exec::LEGACY_HOLE.contains(&m.1)) {
+    if let Some(&(_, gpa, _)) = d.spaces.iter().flat_map(|s| &s.mmio).find(|m| exec::ram_contains(ram_bytes, m.1)) {
         return Err(format!("mmio page {gpa:#x} is guest RAM"));
     }
+    require_vcpus(n)?;
     let backing = match args.guest_state_alias {
         Some(va) => execution::prepare_with_guest_state_alias(resident, code_bytes, n, ram_bytes as usize, va)?,
         None => execution::prepare(resident, code_bytes, n, ram_bytes as usize)?,
     };
-    require_vcpus(n)?;
     // SAFETY: the builder and the tables it makes are dropped before `backing` (this function owns both).
-    let mut builder = Builder { ram: unsafe { backing.ram() }, next: place, top: ram_bytes, reserved: Default::default() };
+    let mut builder = Builder { ram: unsafe { backing.ram() }, next: place, top: exec::ram_end(ram_bytes), reserved: Default::default() };
     // Identity-mapped pages first: the allocator never hands them out (the logging pages of identity spaces too).
     for c in d.cpus.iter().filter(|c| d.spaces[c.space].identity) {
         for page in identity_pages(&d.spaces[c.space], c.rip) {
-            if page >= ram_bytes || page == 0 || exec::LEGACY_HOLE.contains(&page) {
+            if !exec::ram_contains(ram_bytes, page) || page == 0 {
                 return Err(format!("identity page {page:#x} outside guest RAM (or page 0, or the legacy hole)"));
             }
-            if (LOG_IDENTITY..LOG_IDENTITY + 0x7000).contains(&page) {
+            if page == LOG_IDENTITY + LOG_HANDLERS || log_pages(n).contains(&(page.wrapping_sub(LOG_IDENTITY))) {
                 return Err(format!("identity page {page:#x} is the driver's logging IDT"));
             }
             builder.reserved.insert(page);
         }
-        builder.reserved.extend(LOG_PAGES.map(|o| LOG_IDENTITY + o));
+        builder.reserved.extend(log_pages(n).into_iter().map(|o| LOG_IDENTITY + o));
     }
     // M3: one test device per distinct `mmio` page, registered for every vCPU.
     let mut test_devices: BTreeMap<u64, Arc<Mutex<TestDevice>>> = BTreeMap::new();
@@ -1014,23 +1034,24 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let stop_at = ends;
     // The logging IDT's pages, after every space (the spaces' own pages keep their places): one set for the driver-built
     // spaces, the identity set for identity spaces.
-    let mut log_gpa = None;
+    let mut log_gpa: Option<Vec<u64>> = None;
     for (k, t) in spaces.iter_mut().enumerate() {
         let Some(t) = t else { continue };
         let identity = d.spaces[k].identity;
         let base = log_base(identity);
-        let gpas = match (identity, log_gpa) {
-            (true, _) => LOG_PAGES.map(|o| base + o),
-            (false, Some(g)) => g,
-            (false, None) => *log_gpa.insert([(); 6].map(|_| builder.page()).into_iter().collect::<Result<Vec<_>>>()?.try_into().unwrap()),
+        let pages = log_pages(n);
+        let gpas = match (identity, &log_gpa) {
+            (true, _) => pages.iter().map(|o| base + o).collect(),
+            (false, Some(g)) => g.clone(),
+            (false, None) => log_gpa.insert(pages.iter().map(|_| builder.page()).collect::<Result<Vec<_>>>()?).clone(),
         };
         let nx = if d.cpus.iter().find(|c| c.space == k).is_some_and(|c| c.nxe) { NO_EXECUTE } else { 0 };
-        for (o, gpa) in LOG_PAGES.iter().zip(gpas) {
+        for (o, gpa) in pages.iter().zip(gpas) {
             t.map_at(&mut builder, base + o, gpa, WRITABLE | nx)?;
         }
-        let [gdt, idt] = log_images(base);
-        t.copy_in(base, &gdt);
-        t.copy_in(base + 0x1000, &idt);
+        for (offset, bytes) in log_images(base, n) {
+            t.copy_in(base + offset, &bytes);
+        }
     }
     execution::guest_ram_written(backing.memory());
     for (v, c) in d.cpus.iter().enumerate() {
@@ -1058,8 +1079,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 dr: exec::DR_RESET,
                 seg: exec::flat_segments(c.cpl),
                 ldtr: exec::LDTR_RESET,
-                tr: exec::Segment { selector: 0x30 + 16 * v as u16, attributes: 0x8b, limit: 0x67, base: log_base(d.spaces[c.space].identity) + LOG_TSS + 0x80 * v as u64 },
-                gdtr: exec::Table { base: log_base(d.spaces[c.space].identity), limit: 0x6f },
+                tr: exec::Segment { selector: 0x30 + 16 * v as u16, attributes: 0x8b, limit: 0x67, base: log_base(d.spaces[c.space].identity) + log_tss(v) },
+                gdtr: exec::Table { base: log_base(d.spaces[c.space].identity), limit: (0x30 + 16 * n.max(4) - 1) as u64 },
                 idtr: exec::Table { base: log_base(d.spaces[c.space].identity) + 0x1000, limit: 0xfff },
                 mov_ss: 0,
             },
@@ -1453,7 +1474,8 @@ fn report(area: Area, space: &Space, guest: &Tables, log: u64, ran: Ran, tamperi
     let l = execution::lapic(area);
     let _ = write!(out, ",\"lapic\":{{\"cntfrq\":{},\"svr\":\"{:#x}\",\"tpr\":\"{:#x}\",\"isr\":[{}],\"esr\":\"{:#x}\"}}", l.frequency, l.svr, s.cpu.cr8, list(&l.isr), l.esr);
     out += ",\"pages\":[";
-    for (i, (va, &(_, leaf))) in guest.pages.iter().filter(|(va, _)| !(log..log + 0x7000).contains(*va)).enumerate() {
+    let logging = log_pages(s.vcpus as usize);
+    for (i, (va, &(_, leaf))) in guest.pages.iter().filter(|(va, _)| !logging.contains(&va.wrapping_sub(log))).enumerate() {
         let entry = guest.ram.read::<u64>(leaf).unwrap();
         let _ = write!(
             out,
@@ -1577,6 +1599,27 @@ fn frame_intact(area: Area) -> bool {
 mod tests {
     use super::*;
     use natemu::memory::Memory;
+    #[test]
+    fn logging_tables_cover_every_cpu() {
+        for n in [1, 4, 16, 17, 32, 64] {
+            let pages = log_pages(n);
+            let images = log_images(LOG_BASE, n);
+            for v in 0..n {
+                let tss = log_tss(v);
+                let (offset, image) = images.iter().find(|(o, data)| *o <= tss && tss + 0x80 <= *o + data.len() as u64).unwrap();
+                let at = (tss - offset) as usize;
+                assert_eq!(u64::from_le_bytes(image[at + 4..at + 12].try_into().unwrap()), LOG_BASE + 0x4000 + v as u64 * 4096);
+                assert!(pages.contains(&(tss & !4095)));
+                assert!(pages.contains(&(0x3000 + v as u64 * 4096)));
+                let gdt = &images[0].1;
+                let at = 0x30 + 16 * v;
+                let lo = u64::from_le_bytes(gdt[at..at + 8].try_into().unwrap());
+                let hi = u64::from_le_bytes(gdt[at + 8..at + 16].try_into().unwrap());
+                assert_eq!((lo >> 16 & 0xff_ffff) | (lo >> 56 << 24) | (hi << 32), LOG_BASE + tss);
+            }
+        }
+        assert_eq!(log_pages(4), vec![0, 0x1000, 0x3000, 0x4000, 0x5000, 0x6000]);
+    }
     #[test]
     fn description_parses_and_rejects_malformed_lines() {
         let d = parse("rip 0x100000\nrflags 0x1\ngpr 0 1 2 3 4 5 6 7 8 9 a b c d e f\ncode 90c3\nmemory 0x200000 0102\nunmap 0x200010\nreadonly 0x201000\ncpl 0\nwp 0\nsmep 1\nnxe 0\nlarge 0x3fffff\nentry 0x200000 2 set 0x10000000000\nentry 0x200000 4 clear 4\n").unwrap();

@@ -20,6 +20,7 @@ import flags
 # The pinned QEMU container image (Debian bookworm, qemu-user-static 7.2) and the SHA-256 of its QEMU binaries and
 # sources (the pins of the earlier I4-V QEMU check, run_i4v_qemu.py, deleted at S3i).
 IMAGE = 'sha256:27475cb39ecb4500d02b7c6e73c9d598e8d9f0736f0dc217d2d985e5cbe01aac'
+APPLE_IMAGE = 'docker.io/library/debian@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6'
 PINS = {
 'qemu-arm64.deb':'e420c417c12b42ca774795b62888d5388da0e08c1ef263dea1490e5ce4e32a0b',
 'qemu-x86_64-static':'16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594',
@@ -421,6 +422,66 @@ def run_programs(programs, workdir, qemu):
         elif (d / 'cpu').exists(): (d / 'cpu').unlink()
     token = uuid.uuid4().hex; name = 'natemu-ref-' + token; cidfile = workdir / 'container-id'
     if cidfile.exists(): cidfile.unlink()
+    backend = os.environ.get('NATEMU_REFERENCE_BACKEND', 'docker')
+    require(backend in ('docker', 'apple'), 'NATEMU_REFERENCE_BACKEND must be docker or apple')
+    if backend == 'apple':
+        # The reference executable is unchanged and hash-checked above. The base
+        # image needs only sh/coreutils, avoiding a second Python/package build.
+        (workdir / 'container_entry.sh').write_text('''#!/bin/sh
+set -eu
+qemu=$1
+uname -a > /work/container.kernel
+for d in /work/jobs/*; do
+    debug=in_asm
+    [ ! -f "$d/flow" ] || debug=in_asm,exec,nochain
+    step=
+    [ ! -f "$d/faults" ] || step=-singlestep
+    cpu=qemu64
+    [ ! -f "$d/cpu" ] || cpu=$(cat "$d/cpu")
+    (cd "$d"
+     rc=0
+     timeout -s KILL 60 "$qemu" -cpu "$cpu" $step -d "$debug" -D qemu.log prog.elf > qemu.stdout 2> qemu.stderr || rc=$?
+     echo "$rc" > rc)
+done
+''')
+        args = ['container', 'run', '--rm', '--name', name, '--network', 'none', '--read-only', '--cpus', '2', '--memory', '512m',
+                '--mount', f'type=bind,source={workdir},target=/work',
+                '--mount', f'type=bind,source={qemu.parent},target=/reference,readonly',
+                '--workdir', '/work', APPLE_IMAGE, '/bin/sh', '/work/container_entry.sh', '/reference/' + qemu.name]
+        (workdir / 'container-command.json').write_text(json.dumps(args) + '\n')
+        try:
+            r = subprocess.run(args, capture_output=True, timeout=1200)
+            (workdir / 'container.stderr').write_bytes(r.stderr)
+            require(r.returncode == 0, 'container failed: ' + r.stderr.decode()[-500:])
+        finally:
+            subprocess.run(['container', 'delete', '--force', name], capture_output=True, timeout=30)
+    else:
+        run_docker_reference(workdir, qemu, name, token, cidfile)
+    results = []
+    for i, (src, p) in enumerate(zip(programs, progs)):
+        d = workdir / 'jobs' / f'p{i:04d}'
+        require((d / 'rc').read_text().strip() == '0', f'QEMU exit status {(d / "rc").read_text().strip()} for program {i}')
+        final, fault = parse_output(p, (d / 'qemu.stdout').read_bytes())
+        if p['flow']:
+            text, executed, path_ix = check_flow(p, (d / 'qemu.log').read_text(), num(final['rip']) if fault else None)
+            und = flags.analyze(executed)
+        else:
+            text = check_annotations(p, (d / 'qemu.log').read_text())
+            und = flags.analyze(p['insns'])
+        results.append({'name': p['name'], 'qemu': final, 'disasm': text, 'undefined_flags': hx(und), 'rflags_compare_mask': hx(flags.TRACKED & ~und)}
+                       | ({'prefix': p['prefix']} if p['prefix'] is not None else {})
+                       | ({'cpu': p['cpu']} if p['cpu'] != 'qemu64' else {})
+                       | ({'executed_insns': len(executed)} if p['flow'] else {})
+                       | ({'fault': fault, 'path_ix': path_ix} if fault else {}))
+    prov = {'format': FORMAT, 'image': APPLE_IMAGE if backend == 'apple' else IMAGE, 'container_backend': backend,
+            'qemu_sha256': digest, 'qemu_package': 'qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64',
+            'qemu_argv': [('/reference/' + qemu.name) if backend == 'apple' else '/qemu', '-cpu', 'qemu64', '-d', 'in_asm', '-D', 'qemu.log', 'prog.elf'],
+            'rflags_fixed_bits': hx(flags.FIXED)}
+    if backend == 'apple': prov['container_kernel'] = (workdir / 'container.kernel').read_text().strip()
+    return results, prov
+
+
+def run_docker_reference(workdir, qemu, name, token, cidfile):
     args = ['docker', 'create', '--name', name, '--label', 'natemu.qemu.token=' + token, '--cidfile', str(cidfile), '--network', 'none', '--read-only',
             '--cpus', '2', '--memory', '512m', '--pids-limit', '128', '--tmpfs', '/tmp:rw,size=32m', '--tmpfs', '/var/lib/postgresql/data:rw,size=1m',
             '--mount', f'type=bind,source={workdir},target=/work', '--mount', f'type=bind,source={qemu},target=/qemu,readonly',
@@ -433,25 +494,6 @@ def run_programs(programs, workdir, qemu):
         require(r.returncode == 0, 'container failed: ' + r.stderr.decode()[-500:])
     finally:
         subprocess.run(['docker', 'rm', '--force', '--volumes', name], capture_output=True, timeout=30)
-    results = []
-    for i, (src, p) in enumerate(zip(programs, progs)):
-        d = workdir / 'jobs' / f'p{i:04d}'
-        require((d / 'rc').read_text().strip() == '0', f'QEMU exit status {(d / "rc").read_text().strip()} for program {i}')
-        final, fault = parse_output(p, (d / 'qemu.stdout').read_bytes())
-        if p['flow']:      # the flags rule runs along the executed path (the same instructions as QEMU executed, in order)
-            text, executed, path_ix = check_flow(p, (d / 'qemu.log').read_text(), num(final['rip']) if fault else None)
-            und = flags.analyze(executed)
-        else:
-            text = check_annotations(p, (d / 'qemu.log').read_text())
-            und = flags.analyze(p['insns'])
-        results.append({'name': p['name'], 'qemu': final, 'disasm': text, 'undefined_flags': hx(und), 'rflags_compare_mask': hx(flags.TRACKED & ~und)}
-                       | ({'prefix': p['prefix']} if p['prefix'] is not None else {})
-                       | ({'cpu': p['cpu']} if p['cpu'] != 'qemu64' else {})
-                       | ({'executed_insns': len(executed)} if p['flow'] else {})
-                       | ({'fault': fault, 'path_ix': path_ix} if fault else {}))
-    prov = {'format': FORMAT, 'image': IMAGE, 'qemu_sha256': digest, 'qemu_package': 'qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64',
-            'qemu_argv': ['/qemu', '-cpu', 'qemu64', '-d', 'in_asm', '-D', 'qemu.log', 'prog.elf'], 'rflags_fixed_bits': hx(flags.FIXED)}
-    return results, prov
 
 
 def compare(result, gpr, rflags, rip, memory):

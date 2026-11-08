@@ -64,7 +64,7 @@ impl Device for At {
 /// counted). The report's page `reads` are therefore fills, its `writes` accesses.
 pub struct Devices {
     ranges: Vec<(u64, u64, Shared)>,
-    /// The end of the VM's guest RAM (M1: its run-time size): no device below it but in the legacy hole.
+    /// Installed RAM size; the legacy and 3–4 GiB holes remain device space.
     ram_end: u64,
     /// L3: port ranges `[base, end)`.
     ports: Vec<(u32, u32, Shared)>,
@@ -159,7 +159,9 @@ impl Devices {
         Ok(())
     }
     fn not_ram(&self, base: u64, end: u64) -> bool {
-        base >= self.ram_end || exec::LEGACY_HOLE.contains(&base) && end <= exec::LEGACY_HOLE.end
+        base >= exec::ram_end(self.ram_end)
+            || exec::LEGACY_HOLE.contains(&base) && end <= exec::LEGACY_HOLE.end
+            || base >= self.ram_end.min(exec::LOW_RAM_END) && end <= exec::HIGH_RAM_START
     }
     pub fn find(&self, gpa: u64) -> Option<(&Shared, u64)> {
         self.ranges.iter().find(|&&(b, e, _)| (b..e).contains(&gpa)).map(|(b, _, d)| (d, gpa - b))
@@ -245,4 +247,22 @@ pub(crate) fn serve_port(area: Area, state: &mut State, devices: Option<&Devices
     };
     area.write_record(MMIO_OFFSET, m);
     state.reply = exec::REPLY_PORT;
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    #[test]
+    fn high_ram_cannot_be_registered_as_device_space() {
+        let d = Devices::new(8 << 30);
+        for (base, end, device) in [
+            (0xa0000, 0x100000, true),
+            ((3 << 30) - 4096, 3 << 30, false),
+            (3 << 30, 4 << 30, true),
+            ((4 << 30) - 4096, (4 << 30) + 4096, false),
+            (4 << 30, (4 << 30) + 4096, false),
+            ((9 << 30) - 4096, 9 << 30, false),
+            (9 << 30, (9 << 30) + 4096, true),
+        ] { assert_eq!(d.not_ram(base, end), device, "{base:#x}..{end:#x}"); }
+    }
 }

@@ -17,8 +17,8 @@ use natemu_abi::code_object::{Header, Reloc, Site};
 use core::mem::align_of;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::execution::{
-    ENTRY_OFFSET, KICK_SGI, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
-    cache::{self as area, Control, LinkRecord, Record, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
+    ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
+    cache::{self as area, Control, CpuMask, LinkRecord, Record, MASK_PAGES_PER_WORD, SLOT, SLOT_BYTES, SLOT_VA, SLOT_WRITE_VA},
 };
 pub use natemu_abi::execution::cache::{Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, STI_FIRST, SYSTEM};
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
@@ -29,17 +29,17 @@ pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 fn vcpu() -> usize {
     unsafe { (&raw const (*(STATE_VA as *const State)).vcpu).read_volatile() as usize }
 }
-/// This vCPU's bit in the mask nibbles.
-fn own() -> u8 {
+/// This vCPU's bit in the mask page masks.
+fn own() -> CpuMask {
     1 << vcpu()
 }
-/// This vCPU's bit in every nibble of a mask word.
+/// This vCPU's bit in every page mask of a mask word.
 fn own_all() -> u64 {
-    0x1111_1111_1111_1111 << vcpu()
+    1 << vcpu()
 }
 /// Guest-physical pages of guest RAM (the VM's R / 4096; the host set `ram_bytes` at prepare).
 fn pages() -> usize {
-    (control().ram_bytes / 4096) as usize
+    (natemu_abi::execution::ram_end(control().ram_bytes) / 4096) as usize
 }
 /// Code placement alignment (a cache line).
 const CODE_ALIGN: u64 = 64;
@@ -87,13 +87,14 @@ fn record(i: usize) -> *mut LinkRecord {
 fn global<T>(offset: usize) -> *mut T {
     (area::GLOBAL_VA + offset as u64) as *mut T
 }
-/// The word of the mask at global offset `at` (code or writable pages) holding `page`'s nibble, and the nibble's shift.
+/// The word of the mask at global offset `at` (code or writable pages) holding `page`'s peer bits, and their shift.
 fn mask(at: usize, page: usize) -> (&'static AtomicU64, u32) {
-    (unsafe { AtomicU64::from_ptr(global::<u64>(at).wrapping_add(page / 16)) }, 4 * (page % 16) as u32)
+    let (word, shift) = area::mask_location(page);
+    (unsafe { AtomicU64::from_ptr(global::<u64>(at).wrapping_add(word)) }, shift)
 }
-/// The vCPUs whose bits are set in nibble `shift` of mask word `w`.
-fn nibble(w: u64, shift: u32) -> u8 {
-    (w >> shift) as u8 & 0xf
+/// The vCPUs whose bits are set in mask at `shift` of mask word `w`.
+fn peers(w: u64, shift: u32) -> CpuMask {
+    area::mask_peers(w, shift)
 }
 /// The code-page mask word and shift of guest-physical `gpa`; `None` outside guest RAM.
 fn code_page(gpa: u64) -> Option<(&'static AtomicU64, u32)> {
@@ -108,14 +109,14 @@ fn summary(mask: usize) -> *mut u64 {
 fn set_own(mask_at: usize, page: usize) {
     let (m, shift) = mask(mask_at, page);
     m.fetch_or(u64::from(own()) << shift, SeqCst);
-    unsafe { *summary(mask_at).add(page / 16 / 64) |= 1 << (page / 16 % 64) };
+    unsafe { *summary(mask_at).add(page / MASK_PAGES_PER_WORD / 64) |= 1 << (page / MASK_PAGES_PER_WORD % 64) };
 }
 /// Clears this vCPU's bits in the mask at `mask_at`: only in the words its summary names (only this vCPU sets its bits, so
 /// no other word holds one; peers only clear them), and empties the summary. Its cost follows what was marked, not R:
 /// zero summary words are only read, and a word whose load shows none of its bits (a peer cleared them) is not written.
 fn clear_own(mask_at: usize) {
     let own = own_all();
-    for k in 0..pages().div_ceil(16 * 64) {
+    for k in 0..pages().div_ceil(MASK_PAGES_PER_WORD * 64) {
         let s = unsafe { summary(mask_at).add(k) };
         let mut bits = unsafe { s.read() };
         if bits == 0 {
@@ -188,11 +189,11 @@ pub fn reset() {
     unsafe { ptr::write_bytes(lookup_area::<u8>(area::L2), 0, area::L2_ENTRIES * 16) };
     unsafe { ptr::write_bytes(lhead(0), 0, area::LINEAR_BUCKETS) };
     // The reverse map's heads: only pages this vCPU marked (its code summary) can hold one.
-    for k in 0..pages().div_ceil(16 * 64) {
+    for k in 0..pages().div_ceil(MASK_PAGES_PER_WORD * 64) {
         let mut bits = unsafe { summary(area::CODE_PAGES).add(k).read() };
         while bits != 0 {
-            let first = 16 * (64 * k + bits.trailing_zeros() as usize);
-            unsafe { ptr::write_bytes(head(first), 0, 16) };
+            let first = MASK_PAGES_PER_WORD * (64 * k + bits.trailing_zeros() as usize);
+            unsafe { ptr::write_bytes(head(first), 0, MASK_PAGES_PER_WORD) };
             bits &= bits - 1;
         }
     }
@@ -715,7 +716,7 @@ unsafe fn file(record: Block, tail: *const u8, tail_bytes: usize, extra: usize) 
                 next[k] = head(page).read();
                 head(page).write(n as u32 + 1);
                 // In the code summary even if a reset came between its mark and here, so the next reset clears the head.
-                *summary(area::CODE_PAGES).add(page / 16 / 64) |= 1 << (page / 16 % 64);
+                *summary(area::CODE_PAGES).add(page / MASK_PAGES_PER_WORD / 64) |= 1 << (page / MASK_PAGES_PER_WORD % 64);
             }
         }
         let mut lnext = [0; 2];
@@ -1020,7 +1021,7 @@ fn unlink(r: LinkRecord) -> Option<()> {
 /// alias is followed by [`rechecked`].
 pub fn written(gpa: u64) -> Option<u64> {
     if let Some((m, shift)) = code_page(gpa) {
-        post(nibble(m.fetch_and(!(0xf << shift), SeqCst), shift) & !own(), gpa);
+        post(peers(m.fetch_and(!(u64::from(CpuMask::MAX) << shift), SeqCst), shift) & !own(), gpa);
     }
     invalidate(gpa)
 }
@@ -1030,14 +1031,14 @@ pub fn written(gpa: u64) -> Option<u64> {
 pub fn rechecked(gpa: u64) {
     if let Some((m, shift)) = code_page(gpa) {
         unsafe { asm!("dmb ish") };
-        let peers = 0xf & !own();
-        if nibble(m.load(SeqCst), shift) & peers != 0 {
-            post(nibble(m.fetch_and(!(u64::from(peers) << shift), SeqCst), shift) & peers, gpa);
+        let others = !own();
+        if peers(m.load(SeqCst), shift) & others != 0 {
+            post(peers(m.fetch_and(!(u64::from(others) << shift), SeqCst), shift) & others, gpa);
         }
     }
 }
 /// Posts `gpa`'s page to the vCPUs whose bits are set in `peers` and kicks them.
-fn post(peers: u8, gpa: u64) {
+fn post(peers: CpuMask, gpa: u64) {
     let page = (gpa >> 12) as usize;
     for v in (0..MAX_VCPUS).filter(|v| peers & 1 << v != 0) {
         record_word(v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
@@ -1046,11 +1047,11 @@ fn post(peers: u8, gpa: u64) {
         kick(v);
     }
 }
-/// Rings vCPU `v`'s doorbell (SGI [`KICK_SGI`] to Aff0 = `v`, its MPIDR): it stops at its next block boundary and
+/// Rings vCPU `v`'s doorbell (SGI to its grouped Arm affinity): it stops at its next block boundary and
 /// drains its record. The `dsb` makes this vCPU's record updates visible before the interrupt.
 pub fn kick(v: usize) {
     let c = control();
-    let sgi = KICK_SGI << 24 | 1 << v;
+    let sgi = natemu_abi::execution::vcpu_sgi(v);
     let (t0, t1): (u64, u64);
     unsafe {
         asm!("dsb ish", "isb", "mrs {t0}, cntvct_el0", "msr S3_0_C12_C11_5, {sgi}", "isb", "mrs {t1}, cntvct_el0",
@@ -1297,7 +1298,7 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
 /// Marks `gpa`'s page as holding this vCPU's translations, before its bytes are copied for a block: from here on a
 /// write to the page posts it to this vCPU. Returns the vCPUs that may hold a writable shadow of it, read after the
 /// mark (a writable install sets its bit before it reads the marks, so it either sees this mark or is returned here).
-pub fn mark(gpa: u64) -> u8 {
+pub fn mark(gpa: u64) -> CpuMask {
     if code_page(gpa).is_none() {
         return 0;
     }
@@ -1307,16 +1308,16 @@ pub fn mark(gpa: u64) -> u8 {
 /// This vCPU's mark of `gpa`'s page is still set (no write cleared it since [`mark`]); pages outside guest RAM count as
 /// marked (no code is fetched from them).
 pub fn marked(gpa: u64) -> bool {
-    code_page(gpa).is_none_or(|(m, shift)| nibble(m.load(SeqCst), shift) & own() != 0)
+    code_page(gpa).is_none_or(|(m, shift)| peers(m.load(SeqCst), shift) & own() != 0)
 }
 /// The vCPUs that may hold a writable shadow of `gpa`'s page.
-pub fn writable(gpa: u64) -> u8 {
+pub fn writable(gpa: u64) -> CpuMask {
     let page = (gpa >> 12) as usize;
     if page >= pages() {
         return 0;
     }
     let (m, shift) = mask(area::WRITABLE_PAGES, page);
-    nibble(m.load(SeqCst), shift)
+    peers(m.load(SeqCst), shift)
 }
 /// vCPU `v`'s shadow-reset count (it moves each time `v` drops all its shadows, see [`shadows_reset`]).
 pub fn resets_of(v: usize) -> u64 {
@@ -1329,7 +1330,7 @@ pub fn ask_shadows(v: usize) {
 }
 /// Some vCPU holds translations from `gpa`'s page: shadows of it stay read-only.
 pub fn translated(gpa: u64) -> bool {
-    code_page(gpa).is_some_and(|(m, shift)| nibble(m.load(SeqCst), shift) != 0)
+    code_page(gpa).is_some_and(|(m, shift)| peers(m.load(SeqCst), shift) != 0)
 }
 /// Records that this vCPU shadows `gpa`'s page writable.
 pub fn shadowed_writable(gpa: u64) {
@@ -1370,16 +1371,24 @@ pub fn split_begin(gpa: [u64; 2], vcpus: usize, mut serve: impl FnMut()) {
     }
     split_word(1).store((gpa[0] >> 12) + 1, SeqCst);
     split_word(2).store((gpa[1] >> 12) + 1, SeqCst);
+    let mut counts = [0; area::MAX_VCPUS];
+    let mut requested = 0u64;
     for p in (0..vcpus).filter(|&p| p != vcpu()) {
-        let count = resets_of(p);
+        counts[p] = resets_of(p);
         if split_word(3 + p).load(SeqCst) == 0 {
             continue;
         }
+        requested |= 1 << p;
         ask_shadows(p);
-        while resets_of(p) == count {
+    }
+    // Let peers reset concurrently; serialize only the locked memory access.
+    while requested != 0 {
+        let p = requested.trailing_zeros() as usize;
+        while resets_of(p) == counts[p] {
             serve();
             core::hint::spin_loop();
         }
+        requested &= requested - 1;
     }
 }
 pub fn split_end() {

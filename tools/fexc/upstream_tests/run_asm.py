@@ -329,7 +329,7 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
         run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work] + ([str(max_block)] if max_block else []) + vm1.CODE_SHAPE, capture_output=True, text=True, timeout=120)
         if run.returncode:
             err = run.stderr.strip()[-300:]
-            if 'guest RAM exhausted' in err: return {**rec, 'outcome': 'unsupported', 'reason': 'region beyond 4 MiB guest RAM'}
+            if 'guest RAM exhausted' in err: return {**rec, 'outcome': 'unsupported', 'reason': 'region beyond configured guest RAM'}
             return {**rec, 'outcome': 'fail', 'reason': 'harness: driver error', 'detail': err}
         s = json.loads(run.stdout)
         rip = int(s['rip'], 0)
@@ -498,6 +498,7 @@ def main():
     tests = sorted(p for p in a.src.rglob('*.asm') if 'Includes' not in p.parts)
     if a.only: tests = [t for t in tests if a.only in str(t.relative_to(a.src))]
     if a.limit: tests = tests[:a.limit]
+    if not tests: ap.error(f'no ASM tests found under {a.src} for the requested selection')
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         results = list(ex.map(lambda p: one(host, runtime, a.fexc, a.src, a.out, p, known, disabled, a.keep, a.max_block), tests))
     (a.out / 'results.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in results))

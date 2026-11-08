@@ -25,7 +25,7 @@
 //! `ended_first` names the vCPU whose end ended the run and its stop; `vcpus` lists every vCPU's stop, RIP, blocks,
 //! compiles, shootdowns asked and mailbox record ([GPA still waited on, sleeps, the guest TSC at its acknowledgement, us
 //! spent marking the page]).
-//! The map's low RAM ends at `--ram` (default: the boot map's 2 GiB), which is also the VM's guest RAM (M1).
+//! `--ram` is installed RAM (default 2 GiB); low RAM ends at 3 GiB and additional RAM starts at 4 GiB.
 //! `--code-cache BYTES` sets the code cache (default: the largest, `CODE_BYTES_MAX` less its head). `--load-only` loads into host memory and runs nothing (no VM: RUNTIME and FEXC are not opened).
 //! `--dump FILE` writes what the loader wrote into guest RAM (before any run) as records `[u64 gpa][u64 length][bytes]`,
 //! one per write ([`Loaded::writes`]; guest RAM is zero elsewhere). `--stop-at ADDR` ends the run when the BSP is about to
@@ -137,15 +137,17 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     if !(1..=exec::cache::MAX_VCPUS).contains(&vcpus) {
         return Err(format!("--vcpus {vcpus}: 1..={}", exec::cache::MAX_VCPUS));
     }
-    let layout = Layout { low_end: ram.unwrap_or(Layout::DEFAULT.low_end), high: 0 };
+    let ram = ram.unwrap_or(Layout::DEFAULT.low_end);
+    if ram > exec::MAX_GUEST_RAM_BYTES as u64 { return Err("RAM exceeds the resident page-table layout capacity".into()); }
+    let layout = Layout { low_end: ram.min(exec::LOW_RAM_END), high: ram.saturating_sub(exec::LOW_RAM_END) };
     layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
     if load_only {
         let tables = boot::acpi::build(vcpus, rsdp);
         let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), acpi: Some(&tables) };
         // Zero-filled on demand: only the pages the loader writes are touched.
-        let mut host = vec![0u64; layout.low_end as usize / 8];
+        let mut host = vec![0u64; exec::ram_end(ram) as usize / 8];
         // SAFETY: `host` backs [0, L) and outlives `guest`.
-        let guest = unsafe { GuestRam::new(0, layout.low_end, host.as_mut_ptr() as u64) };
+        let guest = unsafe { exec::guest_ram(ram, host.as_mut_ptr() as u64) };
         let loaded = boot::load(&guest, &layout, &inputs).map_err(|e| e.to_string())?;
         if let Some(path) = &dump {
             write_dump(path, &guest, &loaded)?;
@@ -158,7 +160,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let mut boot = natemu::linux::Boot {
         initrd,
         cmdline,
-        ram: layout.low_end,
+        ram,
         vcpus,
         rsdp,
         code_bytes,

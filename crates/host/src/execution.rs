@@ -163,7 +163,8 @@ fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usiz
     let code_mapped = (cache::HEAD_BYTES + code_bytes).next_multiple_of(cache::BLOCK);
     let stride = exec::BACKING_BYTES + code_mapped;
     let ram_offset = n * stride;
-    let memory = Memory::with_size(ram_offset + ram_bytes)?;
+    let ram_span = exec::ram_end(ram_bytes as u64) as usize;
+    let memory = Memory::with_size(ram_offset + ram_span)?;
     load_resident(&memory, resident)?;
     for v in 0..n {
         let base = v * stride;
@@ -179,7 +180,7 @@ fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usiz
             own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
             own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
-            Span::data((exec::GUEST_RAM_VA - PRIVATE) as usize, ram_bytes, ram_offset),
+            Span::data((exec::GUEST_RAM_VA - PRIVATE) as usize, ram_bytes.min(exec::LOW_RAM_END as usize), ram_offset),
             // Generated code runs at EL0 from the code area (EL0 execute-only); the resident writes it through its alias.
             Span::code((cache::CODE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
             Span::data((cache::CODE_WRITE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
@@ -187,6 +188,10 @@ fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usiz
             Span::data((cache::LOOKUP_VA - PRIVATE) as usize, cache::LOOKUP_BYTES, base + cache::LOOKUP_OFFSET),
             Span::data((cache::GLOBAL_VA - PRIVATE) as usize, cache::GLOBAL_BYTES, cache::GLOBAL_OFFSET),
         ]);
+        if ram_bytes as u64 > exec::LOW_RAM_END {
+            spans.push(Span::data((exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize,
+                ram_bytes - exec::LOW_RAM_END as usize, ram_offset + exec::HIGH_RAM_START as usize));
+        }
         private_space(&memory, base, &spans, true);
         // The guest-state page's EL0 alias (x28 of generated code), backed by the frame page (G1).
         guest_state_alias(&memory, base, base + exec::FRAME_OFFSET, va);
@@ -202,7 +207,7 @@ fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usiz
         memory.write_record(base + SHARED_OFFSET, shared);
         memory.flush_instruction_cache(base, RAM_SIZE);
     }
-    // SAFETY: the alias is the backing's last `ram_bytes`, which lives as long as the Backing holding this value.
+    // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
     Ok(Backing { memory: Arc::new(memory), n, stride, ram, epoch: unsafe { mach_absolute_time() } })
 }
@@ -232,7 +237,7 @@ pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     let mut control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     control.speculation_barriers = u64::from(speculation_barriers);
     area.write_record(cache::LOOKUP_OFFSET + cache::CONTROL, control);
-    natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes);
+    natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes.min(exec::LOW_RAM_END));
     // IA32_ARCH_CAPABILITIES: RDCL_NO only with the barriers on AND a host whose own loads do not pass faulting data on
     // (FEAT_CSV3). Off by default, so a default-command-line guest keeps PTI (owner decision, November 5).
     let rdcl_no = speculation_barriers && host_feature("FEAT_CSV3");
@@ -605,7 +610,7 @@ pub enum Stop {
     /// The watchdog forced the vCPU out (imprecise: the bank is not current) at native `pc`: in generated code (`el0`: a
     /// guest loop ran past the budget) or in the resident (EL1: a resident wait, e.g. for a peer's shadow reset, never
     /// ended); `asked` = the peers whose `SHADOWS` request was still pending then (bit p: vCPU p).
-    Watchdog { pc: u64, el0: bool, asked: u8 },
+    Watchdog { pc: u64, el0: bool, asked: u64 },
     /// A peer's failure cancelled the run (imprecise when the vCPU was forced out).
     Cancelled,
     /// L4b: a port write asked the platform to power off (PM1a_CNT SLP_EN with `_S5`'s SLP_TYP, `pm::POWEROFF`) or to
@@ -2366,7 +2371,9 @@ mod tests {
         };
         let (a, ..) = std::thread::scope(|s| s.spawn(|| run(0, 0x7f12_3456_7100)).join().unwrap());
         let (b, compiles, relocated, checks, by) = std::thread::scope(|s| s.spawn(|| run(1, 0x7f12_3456_8100)).join().unwrap());
-        assert_eq!((a.guest_insns, b.guest_insns, compiles, relocated, checks, by), (4, 4, 0, 1, 1, [1, 0, 0, 0]));
+        assert_eq!((a.guest_insns, b.guest_insns, compiles, relocated, checks), (4, 4, 0, 1, 1));
+        assert_eq!(by[0], 1);
+        assert!(by[1..].iter().all(|&n| n == 0));
         assert_ne!(a.object, b.object);
         assert_eq!(answers.get().unwrap().kept().1, 1);
     }
@@ -2965,12 +2972,12 @@ mod tests {
     }
 
     #[test]
-    fn one_to_four_vcpus() {
+    fn configured_capacity_limits() {
         for n in [0, cache::MAX_VCPUS + 1] {
             let e = super::prepare("/nonexistent", cache::CODE_BYTES, n, 4 << 20).err().unwrap();
             assert!(e.contains(&format!("{n} vCPUs")), "{e}");
         }
-        assert_eq!(cache::MAX_VCPUS, 4);
+        assert_eq!(cache::MAX_VCPUS, 64);
         // M1: guest RAM is a nonzero 2 MiB multiple up to 3 GiB.
         for ram in [0, 3 << 20, exec::MAX_GUEST_RAM_BYTES + (2 << 20)] {
             let e = super::prepare("/nonexistent", cache::CODE_BYTES, 1, ram).err().unwrap();

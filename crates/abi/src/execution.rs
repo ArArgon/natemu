@@ -23,6 +23,17 @@ pub const TRANSLATE_HVC: u64 = 0x4b;
 /// The GIC SGI a resident sends a peer to stop it ([`STOP_WORD`]; `ICC_SGI1R_EL1`). The host's doorbell for vCPU v is
 /// the SPI `spi_base + v` (`hv_gic_set_spi`), routed to it.
 pub const KICK_SGI: u64 = 1;
+/// Arm interrupt affinity, independent of the guest's linear x86 APIC IDs.
+/// Sixteen targets per affinity group avoid depending on GIC range-selector support.
+pub const fn vcpu_affinity(v: usize) -> u64 {
+    ((v as u64 >> 4) << 8) | (v as u64 & 15)
+}
+pub const fn vcpu_sgi(v: usize) -> u64 {
+    KICK_SGI << 24 | ((v as u64 >> 4) << 16) | (1 << (v % 16))
+}
+pub const fn vcpu_mask(count: u64) -> u64 {
+    if count == 0 { 0 } else { u64::MAX >> (64 - count) }
+}
 /// A precise stop by IRQ-triggered unlinking: the resident's IRQ handler (a doorbell: a host SPI or a peer's SGI) stops a
 /// vCPU interrupted in the dispatcher, L1 or at a block's first word at once; interrupted inside a block, it patches
 /// every exit of that block (each link point's first word and the computed exit's `b`) to this `brk`, so the block
@@ -101,7 +112,8 @@ pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 /// would be canonical, with LAM_SUP it would alias a canonical kernel address (neither is advertised).
 pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
 /// The alias's level-1, level-2 and leaf tables (window pages after the guest-RAM alias's level-2 tables).
-pub const GUEST_STATE_TABLES: [usize; 3] = [RAM_TABLES_OFFSET + 0x3000, RAM_TABLES_OFFSET + 0x4000, RAM_TABLES_OFFSET + 0x5000];
+const GUEST_STATE_TABLES_START: usize = (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES - 3 * 4096;
+pub const GUEST_STATE_TABLES: [usize; 3] = [GUEST_STATE_TABLES_START, GUEST_STATE_TABLES_START + 4096, GUEST_STATE_TABLES_START + 8192];
 /// The alias's top-level slot (512 GiB, 2^27 pages, one upper-root entry): every address walks only the owner's tables.
 pub const GUEST_STATE_SLOT: core::ops::Range<u64> = (GUEST_STATE_VA & !((1 << 39) - 1))..(GUEST_STATE_VA & !((1 << 39) - 1)) + (1 << 39);
 const _: () = assert!(GUEST_STATE_SLOT.start >= 0xffff_0000_0000_0000 && GUEST_STATE_SLOT.end <= crate::shadow::HIGH_BASE);
@@ -115,35 +127,57 @@ pub const STAGING_BYTES: usize = 0x20000;
 pub const STAGING_VA: u64 = PRIVATE + STAGING_OFFSET as u64;
 /// Native stack mapped below `crate::STACK_TOP` while code runs (SP_EL0; admitted code never uses it).
 pub const STACK_BYTES: usize = 0x8000;
-/// Guest-physical RAM `[0, R)` (M1): R is the VM's, chosen at run time (a 2 MiB multiple up to [`MAX_GUEST_RAM_BYTES`],
-/// the boot map's largest low RAM; [`cache::Control::ram_bytes`]). The resident's EL1-only alias starts at the private
-/// window's second GiB and is mapped in 2 MiB blocks through one level-2 table per GiB (window pages from
+/// Installed RAM R is chosen at run time (a 2 MiB multiple up to [`MAX_GUEST_RAM_BYTES`];
+/// [`cache::Control::ram_bytes`]). RAM above 3 GiB resumes at 4 GiB, preserving the PC device hole.
+/// The resident's EL1-only alias starts 2 GiB into the private window and is mapped in 2 MiB blocks through one level-2 table per GiB (window pages from
 /// [`RAM_TABLES_OFFSET`], written by the host, never mapped); the backing holds RAM after every vCPU's block (the host's
 /// `Backing`).
-pub const GUEST_RAM_VA: u64 = PRIVATE + (1 << 30);
-pub const MAX_GUEST_RAM_BYTES: usize = 3 << 30;
-/// Guest-physical pages the per-page structures cover (only the VM's first R / 4096 are used).
-pub const MAX_GUEST_PAGES: usize = MAX_GUEST_RAM_BYTES / 4096;
+pub const GUEST_RAM_VA: u64 = PRIVATE + (2 << 30);
+/// Capacity follows the private page-table space below the resident stacks.
+pub const MAX_GUEST_RAM_BYTES: usize = MAX_GUEST_PHYS_BYTES - (HIGH_RAM_START - LOW_RAM_END) as usize;
+/// Keep the PC's device aperture below 4 GiB; additional RAM starts above it.
+pub const LOW_RAM_END: u64 = 3 << 30;
+pub const HIGH_RAM_START: u64 = 4 << 30;
+pub const fn ram_end(bytes: u64) -> u64 {
+    if bytes > LOW_RAM_END { bytes + HIGH_RAM_START - LOW_RAM_END } else { bytes }
+}
+pub const PRIVATE_GIBS: usize = 1 + (GUEST_STATE_TABLES_START - RAM_TABLES_OFFSET) / 4096;
+pub const MAX_GUEST_PHYS_BYTES: usize = (PRIVATE_GIBS << 30) - (GUEST_RAM_VA - PRIVATE) as usize;
+/// Guest-physical pages the per-page structures cover, including unused address-hole slots.
+pub const MAX_GUEST_PAGES: usize = MAX_GUEST_PHYS_BYTES / 4096;
 pub const RAM_TABLES_OFFSET: usize = 0x25000;
+const RAM_TABLES_END: usize = RAM_TABLES_OFFSET + (PRIVATE_GIBS - 1) * 4096;
 /// The PC's legacy hole (VGA memory and option/system ROM on a PC) is not RAM (owner decision, October 29: unassigned
 /// ports and addresses behave as on a PC): an access goes the device path (unassigned until a device claims it: a read
 /// then shadows the page read-only onto the shared all-ones page, `crate::ALL_ONES_IPA`, never onto its RAM alias), a
 /// fetch from it is not RAM. Its alias and per-page slots exist but are never used. Everything else
 /// below 16 MiB that the boot map reserves (loader tables, the NVS ranges) is RAM, as on a PC.
 pub const LEGACY_HOLE: core::ops::Range<u64> = 0xa_0000..0x10_0000;
-/// Guest RAM `[0, bytes)` less [`LEGACY_HOLE`], aliased from `va` (host or resident).
+/// Whether a byte belongs to installed RAM rather than a PC address hole.
+pub const fn ram_contains(bytes: u64, gpa: u64) -> bool {
+    gpa < ram_end(bytes) && !(gpa >= LEGACY_HOLE.start && gpa < LEGACY_HOLE.end)
+        && !(gpa >= LOW_RAM_END && gpa < HIGH_RAM_START)
+}
+/// Installed guest RAM, excluding both PC holes, aliased from `va` (host or resident).
 ///
 /// # Safety
-/// As `GuestRam::new`: `[va, va + bytes)` backs `[0, bytes)` while the value is used; `bytes` >= 1 MiB.
+/// As `GuestRam::new`: `[va, va + ram_end(bytes))` backs the physical span while the value is used;
+/// `bytes` >= 1 MiB. The two holes need no accessible backing.
 pub const unsafe fn guest_ram(bytes: u64, va: u64) -> crate::guest_memory::GuestRam {
     let (start, end) = (LEGACY_HOLE.start, LEGACY_HOLE.end);
-    unsafe { crate::guest_memory::GuestRam::new(0, start, va).and(end, bytes - end, va + end) }
+    let low = if bytes > LOW_RAM_END { LOW_RAM_END } else { bytes };
+    let ram = unsafe { crate::guest_memory::GuestRam::new(0, start, va).and(end, low - end, va + end) };
+    if bytes > low {
+        unsafe { ram.and(HIGH_RAM_START, bytes - low, va + HIGH_RAM_START) }
+    } else {
+        ram
+    }
 }
-/// The private window: the first GiB's areas ([`cache`]), then the guest-RAM alias.
-pub const PRIVATE_BYTES: u64 = (1 << 30) + MAX_GUEST_RAM_BYTES as u64;
+/// The private window: per-vCPU areas, shared bookkeeping, then the guest-RAM alias.
+pub const PRIVATE_BYTES: u64 = (PRIVATE_GIBS as u64) << 30;
 const _: () = assert!(MAX_GUEST_RAM_BYTES % (2 << 20) == 0 && MAX_GUEST_PAGES % 64 == 0);
 const _: () = assert!(FRAME_OFFSET + frame::BYTES <= RAM_TABLES_OFFSET);
-const _: () = assert!(RAM_TABLES_OFFSET + (MAX_GUEST_RAM_BYTES >> 30) * 4096 <= GUEST_STATE_TABLES[0]);
+const _: () = assert!(RAM_TABLES_END <= GUEST_STATE_TABLES[0]);
 const _: () = assert!(GUEST_STATE_TABLES[2] + 4096 <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
 
 /// The code cache (slice 2). Per vCPU: an executable code area with a writable
@@ -212,8 +246,8 @@ pub mod cache {
     pub const META_BYTES: usize = 128 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
     pub const LOOKUP_BYTES: usize = (HINTS + 4 * HINT_ENTRIES).next_multiple_of(BLOCK);
-    pub const GLOBAL_VA: u64 = PRIVATE + 0x3c00_0000;
-    pub const GLOBAL_BYTES: usize = 2 * MIB;
+    pub const GLOBAL_VA: u64 = PRIVATE + (1 << 30);
+    pub const GLOBAL_BYTES: usize = (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(BLOCK);
     /// Mapping granule of the areas.
     pub const BLOCK: usize = 2 * MIB;
 
@@ -273,24 +307,32 @@ pub mod cache {
 
     /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident): one
     /// shadow-reset counter (u64) per vCPU and the per-vCPU [`Events`] in its first 64 KiB; then the per-page structures,
-    /// sized for [`super::MAX_GUEST_PAGES`] (the VM uses its first R / 4096 pages; pages never touched are never backed):
-    /// the code-page mask (bit v of a page's nibble: vCPU v holds translations from the page) and the writable mask
-    /// (bit v: vCPU v may hold a writable shadow of it), 4 bits per page, page p's nibble at bit 4 (p % 16) of u64 word
-    /// p / 16, so one atomic word operation reads or changes every vCPU's bit of a page (M1); then one invalidation
+    /// sized for [`super::MAX_GUEST_PAGES`] (the VM uses its physical span; pages never touched are never backed):
+    /// the code-page mask (bit v: vCPU v holds translations from the page) and the writable mask
+    /// (bit v: vCPU v may hold a writable shadow of it), one u64 per page, so one atomic word operation
+    /// reads or changes every vCPU's bit of a page; then one invalidation
     /// [`Record`] per vCPU.
     pub const CODE_PAGES: usize = 0x1_0000;
-    pub const MASK_BYTES: usize = super::MAX_GUEST_PAGES / 2;
+    pub type CpuMask = u64;
+    pub const MAX_VCPUS: usize = CpuMask::BITS as usize;
+    pub const MASK_BITS: usize = MAX_VCPUS;
+    pub const MASK_PAGES_PER_WORD: usize = 64 / MASK_BITS;
+    pub const MASK_BYTES: usize = super::MAX_GUEST_PAGES * MASK_BITS / 8;
+    pub const fn mask_location(page: usize) -> (usize, u32) {
+        (page / MASK_PAGES_PER_WORD, (MASK_BITS * (page % MASK_PAGES_PER_WORD)) as u32)
+    }
+    pub const fn mask_peers(word: u64, shift: u32) -> CpuMask {
+        (word >> shift) as CpuMask
+    }
     pub const WRITABLE_PAGES: usize = CODE_PAGES + MASK_BYTES;
     pub const RECORDS: usize = WRITABLE_PAGES + MASK_BYTES;
     pub const RESETS: usize = 0x3000;
     /// Split locks (no-stop change, November 6): the owner of the split lock (vCPU + 1; 0: free), then the two
     /// guest-physical page numbers + 1 it holds (0: none), then per vCPU a word that is 1 while it may hold a shadow
     /// (runtime `cache::split_begin`).
-    pub const SPLIT: usize = RESETS + 0x80;
+    pub const SPLIT: usize = RESETS + MAX_VCPUS * 8;
     /// Per-vCPU [`Events`] records (X2).
-    pub const EVENTS: usize = 0x3100;
-    /// vCPUs of one VM (bits of the mask nibbles).
-    pub const MAX_VCPUS: usize = 4;
+    pub const EVENTS: usize = (SPLIT + (3 + MAX_VCPUS) * 8).next_multiple_of(64);
 
     /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's size, head included) and
     /// `ram_bytes` (the VM's guest RAM, R) and `guest_state_va` at prepare; the resident owns the rest.
@@ -617,12 +659,12 @@ pub mod cache {
     // The window's 2 MiB (its pages and the shadow pool) precede the areas in a vCPU's block.
     const _: () = assert!(crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= LOOKUP_OFFSET && LOOKUP_OFFSET % BLOCK == 0);
     // Every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned, below the guest RAM alias (its own GiBs).
-    const _: () = assert!(crate::execution::GUEST_RAM_VA == PRIVATE + (1 << 30));
+    const _: () = assert!(crate::execution::GUEST_RAM_VA == PRIVATE + (2 << 30));
     const _: () = assert!(CODE_VA + CODE_BYTES_MAX as u64 <= CODE_WRITE_VA);
     const _: () = assert!(CODE_WRITE_VA + CODE_BYTES_MAX as u64 <= META_VA);
     const _: () = assert!(META_VA + META_BYTES as u64 <= LOOKUP_VA);
     const _: () = assert!(LOOKUP_VA + LOOKUP_BYTES as u64 <= GLOBAL_VA);
-    const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= PRIVATE + (1 << 30));
+    const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= super::GUEST_RAM_VA);
     const _: () = assert!(HEAD_BYTES + CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
     const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
     const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
@@ -640,7 +682,7 @@ pub mod cache {
     // The largest step record: its Block and a sites table, which lies inside one staged object (admission).
     const _: () = assert!(core::mem::size_of::<Block>() + crate::execution::STAGING_BYTES <= STEP_RECORD_BYTES);
     const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= LOOKUP_BYTES && SUMMARY_BYTES * 64 == MASK_BYTES);
-    const _: () = assert!(MAX_VCPUS <= 4); // a nibble per page
+    const _: () = assert!(MAX_VCPUS <= 64 && 64 % MASK_BITS == 0);
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= CODE_PAGES && CODE_PAGES % 8 == 0);
     const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= GLOBAL_BYTES && MASK_BYTES % 8 == 0);
     const _: () = assert!(RESETS + MAX_VCPUS * 8 <= SPLIT && SPLIT + (3 + MAX_VCPUS) * 8 <= EVENTS && EVENTS % 64 == 0);
@@ -652,7 +694,7 @@ pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 // Every vCPU's window starts below IPA + 1 GiB: `_start` runs with the MMU just enabled through the host's temporary
 // identity alias, one 1 GiB block at [IPA, IPA + 1 GiB) (host `memory::private_space`). Perf chunk 6: a 256 MiB arena put
 // vCPU 3's window past it, and that vCPU faulted at its first instruction (an AP that never comes up at N = 4).
-const _: () = assert!((cache::MAX_VCPUS - 1) * (BACKING_BYTES + cache::CODE_BYTES_MAX) + 2 * crate::RAM_SIZE <= 1 << 30);
+const _: () = assert!(crate::IPA + ((cache::MAX_VCPUS - 1) * (BACKING_BYTES + cache::CODE_BYTES_MAX) + 2 * crate::RAM_SIZE) as u64 <= 1 << 39);
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
 pub mod frame {
@@ -2383,6 +2425,50 @@ mod tests {
         assert_eq!(super::bitmask(0x3200_0000), Some(0x1_0000_0001)); // N = 0, imms = 0: one bit per 32
     }
     use super::*;
+
+    #[test]
+    fn capacity_boundaries_and_interrupt_affinities() {
+        assert_eq!(MAX_GUEST_RAM_BYTES, 34usize << 30);
+        for bytes in [3 << 30, (3 << 30) + (2 << 20), 4 << 30, MAX_GUEST_RAM_BYTES as u64] {
+            let low = bytes.min(LOW_RAM_END);
+            assert!(ram_contains(bytes, low - 1));
+            assert!(!ram_contains(bytes, low));
+            assert!(!ram_contains(bytes, HIGH_RAM_START - 1));
+            assert_eq!(ram_contains(bytes, HIGH_RAM_START), bytes > LOW_RAM_END);
+            assert!(ram_contains(bytes, ram_end(bytes) - 1));
+            assert!(!ram_contains(bytes, ram_end(bytes)));
+            assert!(!ram_contains(bytes, LEGACY_HOLE.start));
+        }
+        for v in [0, 15, 16, 31, 32, 47, 48, 63] {
+            let affinity = vcpu_affinity(v);
+            let sgi = vcpu_sgi(v);
+            assert_eq!((sgi >> 16) & 255, (affinity >> 8) & 255);
+            assert_eq!(sgi & 0xffff, 1 << (affinity & 255));
+            assert_eq!((sgi >> 24) & 15, KICK_SGI);
+            assert_eq!(vcpu_mask(v as u64 + 1).count_ones(), v as u32 + 1);
+        }
+        assert_eq!(vcpu_mask(0), 0);
+    }
+
+    #[test]
+    fn ownership_masks_preserve_high_peers_and_neighbor_pages() {
+        use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let words = [AtomicU64::new(0), AtomicU64::new(0)];
+        for page in 0..2 {
+            let (word, shift) = cache::mask_location(page);
+            for v in [0, 15, 16, 31, 32, 63] {
+                words[word].fetch_or(1 << (v + shift), SeqCst);
+            }
+        }
+        let (word, shift) = cache::mask_location(0);
+        let before = cache::mask_peers(words[word].fetch_and(!(1 << (63 + shift)), SeqCst), shift);
+        assert_eq!(before.count_ones(), 6);
+        assert_eq!(before & (1 << 63), 1 << 63);
+        assert_eq!(words[0].load(SeqCst).count_ones(), 5);
+        assert_eq!(words[1].load(SeqCst).count_ones(), 6);
+        let (last, _) = cache::mask_location(MAX_GUEST_PAGES - 1);
+        assert!((last + 1) * 8 <= cache::MASK_BYTES);
+    }
 
     /// S4: data breakpoint ranges (LEN masks the address), R/W 01 writes only, 11 either, straddles, several bits.
     #[test]
