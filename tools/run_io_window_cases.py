@@ -15,8 +15,8 @@ import subprocess
 import time
 
 import run_io_windows as windows
+from io_common import ROOT, VM_LOCK
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
 CASES = ('high', 'pte', 'hlt', 'ap', 'pte-code', 'pde-code')
 A, B = 0x1122334455667788, 0x8877665544332211
 
@@ -219,7 +219,7 @@ def main():
     parser.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
     parser.add_argument('--prepare-only', action='store_true')
     for name in ('host', 'runtime', 'fexc'): parser.add_argument('--' + name, type=pathlib.Path)
-    parser.add_argument('--lock', type=pathlib.Path, default=pathlib.Path.home() / 'orca/natemu-raw/.vm.lock')
+    parser.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
     args = parser.parse_args()
     if len(set(args.cases)) != len(args.cases): parser.error('duplicate cases')
     if not args.prepare_only:

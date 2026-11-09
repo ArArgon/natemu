@@ -23,6 +23,7 @@ import tarfile
 import time
 
 from run_virtio_rng import KVER, KERNEL_SHA, ROOT, stop_group
+from io_common import digest, write_json
 
 KERNEL_DEB_SHA = '7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e99'
 DISK_BYTES = 512 << 20
@@ -126,17 +127,6 @@ echo "VIRTIO-BLOCK-PASS phase=$phase"
 poweroff -f
 fail poweroff-returned
 '''
-
-
-def digest(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for b in iter(lambda: f.read(1 << 20), b''): h.update(b)
-    return h.hexdigest()
-
-
-def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2) + '\n')
 
 
 def checked(command, log, env=None):

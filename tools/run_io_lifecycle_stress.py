@@ -17,13 +17,13 @@ import time
 
 import run_virtio_lifecycle as life
 import run_io_windows as windows
+from io_common import VM_LOCK, write_json as save
 
 ROOT = windows.ROOT
 BASE, TEMPLATE, EXPECT, FLAGS = life.BASE, 0x800000, 0x900000, 0xa00000
 ROUNDS = 64
 
 
-def save(p, obj): p.write_text(json.dumps(obj, indent=2) + '\n')
 def num(v): return int(v, 0) if isinstance(v, str) else v
 
 
@@ -199,7 +199,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--self-check',action='store_true');p.add_argument('--prepare-only',action='store_true')
     for n in ('host','runtime','fexc','out'):p.add_argument('--'+n,type=Path)
     p.add_argument('--case',choices=('reset','disable'),default='reset');p.add_argument('--corrupt-cycle',type=int,choices=range(1,ROUNDS+1),default=0,help='negative control: corrupt one fresh completion before its guest check; the unchanged positive oracle must fail')
-    p.add_argument('--lock',type=Path,default=Path.home()/'orca/natemu-raw/.vm.lock');a=p.parse_args()
+    p.add_argument('--lock',type=Path,default=VM_LOCK);a=p.parse_args()
     if a.self_check:self_check();return 0
     if not a.out or (not a.prepare_only and any(getattr(a,n) is None for n in ('host','runtime','fexc'))):p.error('out and run artifacts required')
     a.out=a.out.resolve();a.out.mkdir(parents=True,exist_ok=False);meta=fixture(a.case,a.out,a.corrupt_cycle)

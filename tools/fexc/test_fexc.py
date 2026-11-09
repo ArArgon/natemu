@@ -13,7 +13,8 @@ import sys
 import unittest
 from pathlib import Path
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20/obj/fexc')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1])); from raw_root import RAW_ROOT  # noqa: E402
+FEXC = os.environ.get('FEXC', str(RAW_ROOT / 'fexc-native-20261026-01/series20/obj/fexc'))
 HERE = Path(__file__).resolve().parent
 
 # (name, x86 hex, rip, bitness, decoded instructions, expected end reason)

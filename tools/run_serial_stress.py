@@ -19,8 +19,8 @@ import subprocess
 import tempfile
 import time
 import run_virtio_rng as rng
+from io_common import digest, write_json, ROOT, VM_LOCK
 
-ROOT=Path(__file__).resolve().parent.parent
 BUSYBOX_SHA='7ae95c260622412ceba6eb9f45d68f616cdc091a1d71d6c0a08b5875bb2c31dd'
 PAYLOAD_BYTES=4_656_640
 CHUNK=65536
@@ -34,8 +34,6 @@ LOAD_RECORDS=('load-version','load-status','load-live',*LOAD_NAMES)
 LOAD_LOG_BOUND=128<<10
 ERROR=r'SERIAL-STRESS-FAIL|BUG:|Oops:|Kernel panic|Call Trace:|soft lockup|hung task|rcu:.*(?:stall|starved)|Out of memory:|oom-kill:|Killed process'
 
-def digest(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
-def write_json(p,v):Path(p).write_text(json.dumps(v,indent=2)+'\n')
 def payload(factor=1):
     if factor not in (1,3):raise ValueError("payload factor must be1or3")
     # 80 ASCII bytes per line, unique sequence plus deterministic content; no marker collisions.
@@ -476,7 +474,7 @@ def main():
     prep=sub.add_parser('prepare');prep.add_argument('--matrix-inputs',type=Path,required=True);prep.add_argument('--out',type=Path,required=True);prep.add_argument('--factor',type=int,choices=(1,3),default=1);prep.add_argument('--cpu-load',action='store_true');prep.add_argument('--stress',type=Path);prep.add_argument('--stress-source',type=Path)
     runp=sub.add_parser('run');runp.add_argument('--mode',choices=('unpaced','paced'),required=True)
     for name in ('inputs','natemu','runtime','fexc','out'):runp.add_argument('--'+name,type=Path,required=True)
-    runp.add_argument('--lock',type=Path,default=Path.home()/'orca/natemu-raw/.vm.lock')
+    runp.add_argument('--lock',type=Path,default=VM_LOCK)
     a=p.parse_args()
     if a.command=='self-check':self_check();return 0
     if a.command=='prepare':prepare(a);return 0

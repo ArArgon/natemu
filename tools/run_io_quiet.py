@@ -15,8 +15,8 @@ import tempfile
 import time
 
 import run_io_windows as windows
+from io_common import ROOT, VM_LOCK
 
-ROOT = Path(__file__).resolve().parent.parent
 A, B = 0x1122334455667788, 0x8877665544332211
 BASE, FUNCTION, PTE = 0x200000, 0x110000, 0x503000
 MARKER = 0x7175696574000000
@@ -149,7 +149,7 @@ def self_check():
 def main():
     p = argparse.ArgumentParser(description=__doc__); p.add_argument('--self-check', action='store_true'); p.add_argument('--prepare-only', action='store_true')
     for n in ('host', 'runtime', 'fexc', 'out'): p.add_argument('--' + n, type=Path)
-    p.add_argument('--lock', type=Path, default=Path.home() / 'orca/natemu-raw/.vm.lock')
+    p.add_argument('--lock', type=Path, default=VM_LOCK)
     args = p.parse_args()
     if args.self_check: self_check(); return 0
     if args.out is None: p.error('--out required')

@@ -32,7 +32,7 @@ about 50 MB plus 10 MB git data, a build about 70 MB.
 
 The fork is the source of truth for the patches (November 4: moved from `tools/fexc/patches/*.patch`, which no longer exist;
 `git format-patch 48d71752..natemu` in the fork regenerates them). The first build from the fork,
-`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
+`natemu-raw/fexc-native-20261026-01/series57-fork`, has the same `obj/fexc` SHA-256 as series56-setup-r1
 (`a81a2f24...1fd8`); an installer N = 1 stream of 126,017 requests replayed through both gave no difference.
 
 Current tree: `natemu-raw/correctness-forms-20261107-02/fexc` (November 7), FEX `1df70f050` and this tree's shim;
@@ -41,49 +41,49 @@ validation uses the frozen `candidate-bin/fexc`. The dependency commit is local;
 VCVTPS2PH memory stores, resident ENTER, address32 register-index BT forms, and the selected Intel near/far widths.
 See [instruction-form validation](../../docs/restructure/correctness-instruction-forms.md) for results and remaining oracle limits.
 
-Before it: `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series65-p2` (November 5, pcid-plan "Measured (P2)"):
+Before it: `natemu-raw/fexc-native-20261026-01/series65-p2` (November 5, pcid-plan "Measured (P2)"):
 the fork's `natemu` branch at 8d812cadd (VERW m16 inline at CPL 0). Before it,
-`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series64-chunk26-r1` (November 5, perf plan "Measured
+`natemu-raw/fexc-native-20261026-01/series64-chunk26-r1` (November 5, perf plan "Measured
 (chunk 26)", after its review): the fork clone's local branch `natemu-chunk26` at 0430dc8a6 (on `natemu` ab62c7e06: REP STOS in
 bulk inside a page with `--bulk`, `FexcRepStos`, only while IA32_MISC_ENABLE's fast-string bit is set; MOV r64, CR2 inline
 under `--cpl0`, `FexcMovFromCROp`, 0f 20's ModRM decoded register-only) and this tree's shim; `obj/fexc` SHA-256
 `71c8349f5258352c01246ebfda3eb9d535192870a74c559df433f353e505ba6c`. (Before the review: `series63-cr2`, FEX 57323cdd3,
 SHA-256 `f2b735938d23d8fdc71cbdafdb6d85b4a77dbfee378152cecd537425f3f34f9e`.)
-Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series61-chunk25-r1` (November 5, perf plan "Measured
+Before it, `natemu-raw/fexc-native-20261026-01/series61-chunk25-r1` (November 5, perf plan "Measured
 (chunk 25)"): the fork's `natemu` branch at ab62c7e06 (an inline STI may start its block; STMXCSR/VSTMXCSR stored inline
 by `FexcMxcsr`) and this tree's shim; `obj/fexc` SHA-256 `c906217071ee7258d832d10a90706c2e0497f02e1637e77c7f044cf50bb43906`.
-Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series58-channel-r1` (November 4, perf plan "Measured
+Before it, `natemu-raw/fexc-native-20261026-01/series58-channel-r1` (November 4, perf plan "Measured
 (chunk 21)", after its review): series57-fork's patches and shim with `fexc.cpp`'s server answering through a shared channel
 (`--serve --channel FD`, below "Compile server"); every reply byte-identical to series57-fork's over the pipe on an installer
 and a `build` boot's recorded streams; `obj/fexc` SHA-256 `8bd3b7eaff3ef4c2cb101ffb34b55d2e83aa7f6747e22a186b65e493aca83e59`
 (reproduced by a second build). The host since chunk 21 needs it (it starts the server with `--channel` and checks the
 layout's magic). Before it, `series58-channel` (`da337021...87315c`, before the review). Before it,
-`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series57-fork` (November 4, the same bytes as series56-setup-r1, built from the fork; above), which is `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series56-setup-r1` (November 4, perf plan "Measured
+`natemu-raw/fexc-native-20261026-01/series57-fork` (November 4, the same bytes as series56-setup-r1, built from the fork; above), which is `natemu-raw/fexc-native-20261026-01/series56-setup-r1` (November 4, perf plan "Measured
 (chunk 20)", after its review): series55-swapgs's patches and shim with `fexc.cpp`'s server parsing and configuring once per
 distinct argument list less the RIP (below, "Compile server"); every reply byte-identical to series55-swapgs's on an
 installer and a `build` boot's recorded request streams; `obj/fexc` SHA-256 `a81a2f241b6bf368cd7b6e8b87c5892efacd9747127f6f8dea97ae936add1fd8`. Before it,
 `series56-setup` (`d3222fda...7db064`, the same change before the review's fixes: the guest window set before a new
 context, the reply's extent and args_read cleared per request, the Config values derived at parse time).
-Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series55-swapgs` (November 4, perf plan "Measured
+Before it, `natemu-raw/fexc-native-20261026-01/series55-swapgs` (November 4, perf plan "Measured
 (chunk 17)"): patches 0001-0033 (0033: the plain SWAPGS translated inline for a CPL-0 request, exchanging `gs_cached` with
 IA32_KERNEL_GS_BASE, which the resident keeps at FEX's `L1Pointer`) and the shim's `Cut` rule for it (`--cpl0`, the
 three-byte form only); `obj/fexc` SHA-256 `4a50bda9ac5231db9faa2ce7f5e901da840666a435215f7b8aa47654baa8ecae`. Before it,
-`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series54-inline-tsc` (November 4, perf plan "Measured
+`natemu-raw/fexc-native-20261026-01/series54-inline-tsc` (November 4, perf plan "Measured
 (chunk 15)"): patches 0001-0032 (0031: CLI and STI translated inline for a CPL-0 request, `--cpl0`; 0032: RDTSC inline with
 the resident's 24 MHz formula, `--tsc`) and the shim's rules for them in `Cut` (one-byte CLI anywhere; one-byte STI neither
 first nor last in its block, never before a REP string or LOCK NEG; two-byte RDTSC); `obj/fexc` SHA-256
 `81fa0932da3a89e3fffd14889c48a42803d9ee7c635651fe25f5c3a6c8eab134` (`series53-inline`: 0031 only). Before it,
-`/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series52-adox66` (November 4, owner decision of
+`natemu-raw/fexc-native-20261026-01/series52-adox66` (November 4, owner decision of
 November 3: ADX, CLFLUSHOPT/CLWB, XSAVEOPT/XSAVEC; boot-features plan, Built (ADX), Built (CLFLUSHOPT, CLWB), Built (XSAVEOPT,
 XSAVEC)): patches 0001-0030 (0030: ADOX with a 66 prefix decoded as ADOX, 66 ignored, as on the reference AMD machine) and
 `fexc.cpp` with the shim admitting ADCX/ADOX (66 or F3 0f 38 f6, ADOX also with 66; never with F2) and its cut reasons naming
 XSAVEOPT, CLWB, CLFLUSHOPT and XSAVEC as the resident's; `obj/fexc` SHA-256
 `bef4081c9444d030413448159e0c02d197d2bbf50c6f53b543a0f5479c7e9fe8`. Before it (intermediate builds of the same work):
 `series51-xsave` (`9600ebd1...1892`, no patch 0030), `series50-adx` (`8a25ab6c...196e`), `series50-adx-r0` (refused ADOX by the
-REP-prefix rule), and `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series49-sha` (November 3, owner decision: SHA
+REP-prefix rule), and `natemu-raw/fexc-native-20261026-01/series49-sha` (November 3, owner decision: SHA
 advertised; boot-features plan, Built (SHA)): series48-lean's patches and `fexc.cpp` with the shim admitting SHA1*/SHA256*
 (NP 0f 38 c8..cd, NP 0f 3a cc) as aligned-m128 SSE forms instead of cutting them as #UD; `obj/fexc` SHA-256
-`fe1631cbea73342f32a3a3689593c6bf5f9263577e0691e68f3b76d9208e1f61`. Before it, `/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series48-lean` (November 3, perf plan "Measured
+`fe1631cbea73342f32a3a3689593c6bf5f9263577e0691e68f3b76d9208e1f61`. Before it, `natemu-raw/fexc-native-20261026-01/series48-lean` (November 3, perf plan "Measured
 (chunk 2)": series47-seg's patches and shim with `fexc.cpp`'s server sending only what the host reads, below "Compile
 server"; objects, extent and args_read byte-identical to series47-seg's; `obj/fexc` SHA-256
 `8c8bd6594a5cbe557d8928c483f2f6c3887f9c68b8797d84e83e1912fda4f592`). Before it, series47-seg (November 3: series46-br66's patches

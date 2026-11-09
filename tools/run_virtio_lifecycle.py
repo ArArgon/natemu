@@ -20,6 +20,7 @@ import time
 from run_io_windows import ROOT, digest, stop_group
 sys.path.insert(0, str(ROOT / 'tools/reference'))
 import ref
+from io_common import VM_LOCK
 
 BASE, CODE, STACK, MMIO = 0x400000, 0x100000, 0x300000, 0xf0000000
 SIZE, DISK_SIZE = 0x20000, 2 * 1024 * 1024
@@ -433,7 +434,7 @@ def main():
     prepare = sub.add_parser('prepare'); prepare.add_argument('--out', required=True, type=pathlib.Path)
     run = sub.add_parser('run')
     for key in ('host', 'runtime', 'fexc', 'out'): run.add_argument('--' + key, type=pathlib.Path, required=True)
-    run.add_argument('--lock', type=pathlib.Path, default=pathlib.Path.home() / 'orca/natemu-raw/.vm.lock')
+    run.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
     run.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
     args = parser.parse_args()
     if args.action == 'self-check': self_check(); return 0

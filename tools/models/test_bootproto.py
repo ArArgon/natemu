@@ -7,8 +7,9 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))   # tools: runnable by path from the repo root
 from models import bootproto as bp
+from raw_root import RAW_ROOT
 
-DEBIAN = pathlib.Path("/Users/liaozping/orca/natemu-raw/kernel-census-20261028-01/dl/linux")
+DEBIAN = RAW_ROOT / "kernel-census-20261028-01/dl/linux"
 DEBIAN_SHA = "2b2358b37674d2505350528875bb17afae2a36522a9e8a9417eaca65a7da0e08"   # experiments/track03/kernel-census/README.md
 MIB = 1 << 20
 
