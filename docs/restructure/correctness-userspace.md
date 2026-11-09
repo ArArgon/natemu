@@ -277,7 +277,7 @@ builds in the totals above. Its `natemu-raw/nostop-20261106-01/suite/summary.txt
 `faults-1` and `corpora`: the split CMPXCHG8B probes compared flags the pinned QEMU full run keeps stale. The corrected
 comparison checks ZF (CMPXCHG8B's changed flag); `suite/c2.log` reruns all three and records 4/4 passes including release.
 The remaining `pytests` failure is a reproducible worktree-path assertion in `test_check_setup`: resolved raw root
-`/Users/liaozping/orca/natemu-raw` versus expected `.claude/worktrees/natemu-raw`. It is a setup-test failure, not guest
+`natemu-raw` versus expected `.claude/worktrees/natemu-raw`. It is a setup-test failure, not guest
 CPU evidence, and is not silently counted as passing. The negative-control `nc/summary.txt` reports eleven mutations
 RED as intended; those are successful rejection controls.
 

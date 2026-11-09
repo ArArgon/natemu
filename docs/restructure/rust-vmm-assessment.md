@@ -1,5 +1,9 @@
 # How much natemu could use or contribute to rust-vmm
 
+> **Background assessment.** This is a broad, noncommittal survey of what natemu
+> could adopt from or contribute to rust-vmm. It commits to nothing. The
+> [rust-vmm reuse record](rust-vmm-reuse.md) owns the I/O reuse decisions and results.
+
 November 7, 2026. **Research-only assessment**, requested out of curiosity.
 This proposes neither a migration nor an upstream submission. No runtime,
 dependency or build changes were made for this assessment. The separately
@@ -18,7 +22,7 @@ not a single VMM into which natemu must fit. Its [current crate inventory][catal
 contains memory, virtio, device dispatch, ACPI, allocators, loaders and OS-specific
 utilities. This permits gradual adoption with no requirement to import its
 KVM execution model. For the immediate I/O milestone, use the
-[reuse survey](io-rust-reuse.md); broader migration has no demonstrated payoff.
+[I/O reuse record](rust-vmm-reuse.md); broader migration has no demonstrated payoff.
 
 ## Adoption map
 
@@ -27,7 +31,7 @@ are source-backed; suitability and priority are engineering inferences.
 
 | Natemu responsibility | Possible rust-vmm reuse | Assessment |
 | --- | --- | --- |
-| New virtio transport and queues; existing [device registry](../../crates/host/src/devices.rs) | `virtio-queue`, `virtio-bindings`, selected `virtio-device` helpers | Strongest fit. Useful work is still ahead, so reuse can prevent duplication. Keep natemu's MMIO completion, resource limits, reset and IRQ ownership; the [completed exploratory probe](io0-rust-vmm-evaluation.md) identifies concrete gaps. |
+| New virtio transport and queues; existing [device registry](../../crates/host/src/devices.rs) | `virtio-queue`, `virtio-bindings`, selected `virtio-device` helpers | Strongest fit. Useful work is still ahead, so reuse can prevent duplication. Keep natemu's MMIO completion, resource limits, reset and IRQ ownership; the [completed exploratory probe](rust-vmm-reuse.md) identifies concrete gaps. |
 | [RAM backing](../../crates/host/src/memory.rs), [guest access](../../crates/abi/src/guest_memory.rs) | [`vm-memory` access traits][memory] | A host-side adapter is plausible. Full allocation migration is optional and low priority. Preserve separate guest RAM/private runtime ranges, holes, aliases and backing lifetime; generic dirty tracking cannot replace code/PTE coherence. |
 | [HVF VM/vCPU wrapper](../../crates/host/src/vm.rs) | No HVF replacement in the inspected catalog; [`kvm-ioctls`][kvm] is specifically KVM | Retain. The current thread-affine vCPU ownership, GIC serialization and destroy order are required behavior. A Rust ecosystem dependency does not turn Apple HVF into KVM. |
 | [Resident execution](../../crates/runtime/src/execution.rs), [shadow tables](../../crates/runtime/src/tables.rs), [code cache](../../crates/runtime/src/cache.rs), [FEX admission](../../crates/host/src/admission.rs) | No corresponding cross-ISA execution engine in the inspected catalog | Retain. Guest x86 semantics, fault/effect recovery, Arm gateways, translated-source invalidation and FEX adaptations are the specialized emulator. Ordinary VMM crates do not discharge those contracts. |
@@ -50,7 +54,7 @@ other crates.
    pointer is not permission to write guest RAM while generated code runs.
    Preserve admitted snapshots/commits, pending-translation checks and payload →
    status/ring → IRQ ordering. `vm-memory`'s memory-map snapshot is not a snapshot
-   of guest data. See [its contract][memory] and the [I/O survey](io-rust-reuse.md).
+   of guest data. See [its contract][memory] and the [I/O reuse record](rust-vmm-reuse.md).
 2. **Importing host/guest equivalence assumptions.** The loader's architecture
    guards are a concrete example. KVM/eventfd/epoll assumptions also arise in
    adjoining crates. Check each selected feature and target rather than treating

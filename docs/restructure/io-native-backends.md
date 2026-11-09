@@ -1,6 +1,6 @@
 # Native Apple I/O and the rust-vmm memory seam
 
-November 7, 2026. Source-only follow-up to the [queue evaluation](io0-rust-vmm-evaluation.md).
+November 7, 2026. Source-only follow-up to the [queue evaluation](rust-vmm-reuse.md).
 This note recommends an evaluation direction; it does not select a backend,
 change the current device profile, or claim integrated correctness/performance.
 Apple evidence is the installed macOS26.4 SDK plus current first-party documentation.
@@ -43,7 +43,7 @@ snapshot or completion commit. Host I/O operates on owned request/packet buffers
 after the view ends. The earlier synthetic `Window` uses private `GuestMemoryMmap`;
 it is not an implemented adapter over natemu `GuestRam`. Volatile slices, address
 validation and dirty tracking do not supply resident coherence or lifetime admission.
-See the [evaluation's integration limits](io0-rust-vmm-evaluation.md#the-main-remaining-integration-work).
+See the [reuse record's integration limits](rust-vmm-reuse.md#the-main-remaining-integration-work).
 
 ## Which Apple framework supplies what
 
@@ -110,6 +110,44 @@ enough explanation to establish its replacement semantics. Verify the actual
 signed launch/package model; neither SDK availability nor a Rust binding proves
 permission to create interfaces. No privileged helper is proposed by this note.
 
+## Packet contract and admission gate for vmnet
+
+Moved here from the plan; the plan keeps only the decisions.
+
+Plain-frame vmnet TX strips the validated virtio header; RX constructs the modern
+12-byte virtio header even without merged receive buffers (RX num_buffers=1, TX
+num_buffers=0). Ignore fields and bits the selected spec says to ignore; do not
+reject valid packets merely for inactive checksum metadata. An iovec must never
+accidentally send that header as Ethernet payload. Avoid redundant host buffer
+concatenation where iovecs suffice, but retain any copy needed for packet-worker
+isolation.
+
+The initial network profile is 2048-byte guest frame slots and MTU1500. Preserve
+03-57's initial admission requirement that vmnet report MTU1500 and a maximum
+packet size of at most 2048, and supply receive buffers at least that reported
+size. A larger reported maximum needs a deliberate worker storage/profile
+amendment before admission, not an undersized receive call. Reject or drop
+oversize frames under a recorded bounded policy; do not overrun guest slots. Do
+not enable native segmentation/checksum modes whose input/output metadata the
+guest path cannot interpret.
+
+For the later offload step, vmnet virtio-header mode and the checksum-offload
+configuration key are mutually exclusive, and receive capacity must account for
+the reported maximum packet size plus its 12-byte header. Support for that mode
+through the newer start_with_network interface remains unverified; select the
+start interface only after checking it. These are offload gates, not requirements
+for the plain-frame baseline.
+
+**Admission gate details:** Apple's
+[vm.networking entitlement][entitlement] is restricted; adding a plist key does
+not establish entitlement availability. Record the revised role manifest: the
+packet worker has only its configured vmnet interface and a bounded owned packet
+channel, no guest RAM, disk FD or task-memory authority; the trusted
+execution/device owner has no general network-service authority. Apple services
+replace the libslirp-specific DNS/ICMP socket construction only after their
+behavior and capabilities are checked. Configure intended services explicitly
+where supported; default IPv6 services do not establish accepted IPv6 coverage.
+
 ## Native persistent storage
 
 **Source-backed:** VZ's disk-image attachment exposes cache and synchronization
@@ -162,17 +200,18 @@ design whose implementation may differ. Neither is enabled in our reference.
 [multiprocess design](https://www.qemu.org/docs/master/devel/multi-process.html).
 
 **Apple's public queues do not reveal its built-in worker topology.** The SDK's
-`VZVirtualMachine.queue` serializes API calls and callbacks; it does not specify
-a disk worker count or process model. [SDK VM contract][vz-vm]. The newer custom
-Virtio API has a serial `deviceQueue`, with a delegate provider running in the
-same process as the `VZVirtualMachine` object. That describes custom-device
-callbacks, not the internals of Apple's built-in block backend.
-[Custom device](https://developer.apple.com/documentation/virtualization/vzcustomvirtiodevice),
-[delegate provider](https://developer.apple.com/documentation/virtualization/vzcustomvirtiodevicedelegateprovider).
-Apple introduces this API for macOS27, outside our macOS26 baseline, and its
-example dequeues, processes and returns elements from a VZ-owned VM.
-[WWDC26/224][wwdc]. Built-in VZ worker/process topology remains unestablished by
-this source review; profiling a concrete VZ workload would be separate evidence.
+`VZVirtualMachine.queue` serializes API calls and callbacks; it does not specify a disk worker
+count or process model. [SDK VM contract][vz-vm]. The newer custom Virtio API has a serial
+`deviceQueue`, with a delegate provider running in the same process as the `VZVirtualMachine`
+object. That describes custom-device callbacks, not the internals of Apple's built-in block
+backend. [Custom
+device](https://developer.apple.com/documentation/virtualization/vzcustomvirtiodevice),
+[delegate
+provider](https://developer.apple.com/documentation/virtualization/vzcustomvirtiodevicedelegateprovider).
+Apple introduces this API for macOS27, outside our macOS26 baseline, and its example dequeues,
+processes and returns elements from a VZ-owned VM. [WWDC26/224][wwdc]. Built-in VZ
+worker/process topology remains unestablished by this source review; profiling a concrete VZ
+workload would be separate evidence.
 
 **Consequence for natemu (design inference):** its current device owner and
 single native lane already separate guest protocol from native I/O, but admit
@@ -188,15 +227,16 @@ contract, and supplies no new runtime benchmark.
 
 ### Resident proxy to VZ-owned devices — assessment only
 
-The proposed path is architecturally plausible:
-`x86 virtio frontend → ARM resident virtio driver → Apple VZ block/network device → native backend`.
-VZ would own the outer ARM machine, with natemu implementing the x86 machine
-inside its resident. This is a different machine ownership boundary, not a
-standalone Apple device attached to today's HVF VM. Apple's built-in virtio block
-and network configurations already exist on the macOS26 baseline (both SDK
-declarations date to macOS11); this proxy idea does **not** require macOS27 custom
-Virtio APIs. [Block SDK](</Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZVirtioBlockDeviceConfiguration.h>),
-[network SDK](</Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZVirtioNetworkDeviceConfiguration.h>).
+The proposed path is architecturally plausible: `x86 virtio frontend → ARM resident virtio
+driver → Apple VZ block/network device → native backend`. VZ would own the outer ARM machine,
+with natemu implementing the x86 machine inside its resident. This is a different machine
+ownership boundary, not a standalone Apple device attached to today's HVF VM. Apple's built-in
+virtio block and network configurations already exist on the macOS26 baseline (both SDK
+declarations date to macOS11); this proxy idea does **not** require macOS27 custom Virtio APIs.
+Block
+SDK (`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZVirtioBlockDeviceConfiguration.h`),
+network
+SDK (`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZVirtioNetworkDeviceConfiguration.h`).
 
 **Potential benefit, not established performance:** resident-side request handling
 could avoid some current host coordination transitions while reusing Apple's
@@ -206,25 +246,26 @@ is established by the public API.
 
 The consequential unanswered compatibility questions are:
 
-- **Boot and execution control.** `VZLinuxBootLoader` documents a Linux kernel,
-  and Apple's sample requires an architecture-matching kernel (aarch64 on Apple
-  silicon). Neither establishes that the existing bare resident can be booted
-  unchanged. Its EL1 entry, shadow mappings, exceptions, IRQ/timer ownership and
-  debug facilities need a concrete VZ-compatible route.
-  [Linux boot sample](https://developer.apple.com/documentation/virtualization/running-linux-in-a-virtual-machine),
-  [boot-loader SDK](</Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZLinuxBootLoader.h>).
+- **Boot and execution control.** `VZLinuxBootLoader` documents a Linux kernel, and Apple's
+  sample requires an architecture-matching kernel (aarch64 on Apple silicon). Neither
+  establishes that the existing bare resident can be booted unchanged. Its EL1 entry, shadow
+  mappings, exceptions, IRQ/timer ownership and debug facilities need a concrete VZ-compatible
+  route. [Linux boot
+  sample](https://developer.apple.com/documentation/virtualization/running-linux-in-a-virtual-machine),
+  boot-loader
+  SDK (`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZLinuxBootLoader.h`).
 - **Memory ordering.** Today's host explicitly writes `ACTLR_EL1 = 2` through
   HVF, and the resident checks that TSO bit at entry. VZ's VM-level configuration
   does not establish an equivalent control contract. Whether the resident can
   obtain and retain the required regime is unresolved, not proof of impossibility.
   [Current setup](../../crates/host/src/vm.rs#L367),
   [resident check](../../crates/runtime/src/main.rs#L57), [VZ VM SDK][vz-vm].
-- **Host services and lifetime.** The current host FEX compiler, shared memory,
-  HVC request/reply, debug inspection, cancellation and vCPU teardown require
-  replacements, not just a new block driver. VZ virtio sockets offer a documented
-  host/guest data channel; they do not themselves preserve the existing shared-
-  memory or precise exit/cancellation contracts.
-  [Socket SDK](</Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZVirtioSocketDevice.h>).
+- **Host services and lifetime.** The current host FEX compiler, shared memory, HVC
+  request/reply, debug inspection, cancellation and vCPU teardown require replacements, not just
+  a new block driver. VZ virtio sockets offer a documented host/guest data channel; they do not
+  themselves preserve the existing shared- memory or precise exit/cancellation contracts.
+  Socket
+  SDK (`/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks/Virtualization.framework/Headers/VZVirtioSocketDevice.h`).
 
 A staged resident-owned DMA pool would be the conservative candidate: snapshot
 x86 payloads coherently, let the outer VZ device access only that pool, and commit
@@ -239,15 +280,14 @@ by this note.
 
 ### Zero-copy and the current contract
 
-The [I/O plan](io-plan.md) and accepted
-[INV-03-04 claim26](../research/investigations/INV-03-04.md#qualified-handoff-bound-to-backend-and-source-ownership)
-explicitly require immutable outgoing snapshots and incoming host-owned storage
-before admitted RAM commit. Filesystem/network waits and arbitrary callbacks
-cannot run inside a granted RAM window. Claims27–29 additionally depend on staged
-read failure leaving guest payload untouched. Thus a backend retaining live
-guest payload pointers across I/O is excluded by the selected design. Earlier
-references to later zero-copy optimization mean a possible design revision,
-not permission to bypass these requirements.
+The [I/O plan](io-plan.md) and accepted [INV-03-04
+claim26](../research/investigations/INV-03-04.md#qualified-handoff-bound-to-backend-and-source-ownership)
+explicitly require immutable outgoing snapshots and incoming host-owned storage before admitted
+RAM commit. Filesystem/network waits and arbitrary callbacks cannot run inside a granted RAM
+window. Claims27–29 additionally depend on staged read failure leaving guest payload untouched.
+Thus a backend retaining live guest payload pointers across I/O is excluded by the selected
+design. Earlier references to later zero-copy optimization mean a possible design revision, not
+permission to bypass these requirements.
 
 Avoiding redundant copies between owned host stages is compatible. Direct mapped
 guest-memory views also avoid an extra register transport, but the selected
@@ -368,7 +408,8 @@ not supply the reader inventory required for RX exclusion.
 Compare complete paths: staging already requires admitted snapshots/commits and
 both paths need metadata/completion ordering. A useful differential model is:
 
-`direct − staged = extra coordination + extra contention/refills + other path differences − eliminated copy cost`
+`direct − staged = extra coordination + extra contention/refills + other path differences −
+eliminated copy cost`
 
 This must be evaluated separately for CPU consumption, throughput and tail latency;
 overlapping costs cannot simply be summed as wall time. Expected direction:
@@ -388,7 +429,7 @@ The next useful evidence would compare staged and leased paths with identical
 backend behavior, transfer sizes/batches, vCPU counts and buffer reuse patterns;
 count copies, acknowledgements, shadow refaults and blocked guest time alongside
 throughput/CPU/tail latency. No such experiment was assigned or run here.
-Independent `/root/io_scope_review` checked current code and these reuse/cost
+An independent reviewer checked current code and these reuse/cost
 premises; no implementation or design adoption follows from this assessment.
 
 ### Alignment is a layered contract
@@ -438,8 +479,8 @@ coherence cases to the eventual integration matrix; no extra experiment ran here
 
 ## Source review
 
-`/root/rust_io_research` authored this note; root inspected it against the pinned
-memory trait and installed SDK. Independent `/root/io_scope_review` separately
+An earlier research agent authored this note; the main session inspected it against
+the pinned memory trait and installed SDK. An independent reviewer separately
 checked the memory-adapter, native-offload and VZ-boundary premises. Its key
 qualifications—mutually exclusive checksum/header modes, fragmented-packet
 limits, large-frame requirements and unmeasured performance—are incorporated.
@@ -447,7 +488,7 @@ This is assessment only; the current no-offload milestone and backend selection
 remain unchanged.
 
 The November 8 I/O-thread comparison and resident-proxy assessment were authored separately by
-`/root/io_scope_review`; root checked its pinned QEMU request/submission/reset
+an independent reviewer; the main session checked its pinned QEMU request/submission/reset
 paths, actual benchmark arguments and Apple's queue/provider contracts against
 the linked primary sources. It supplies design context, not measured worker
 placement or an adopted concurrency change.

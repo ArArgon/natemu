@@ -1,25 +1,29 @@
-# Existing tools for representative integrated I/O measurements
+# I/O benchmark record
 
-November 8, 2026. Research and proposed measurement matrix. This supplements
-[the I/O plan](io-plan.md); [Track05](../research/tracks/05-benchmarking-and-validation.md)
-still owns comparison validity and QEMU TCG remains the required baseline.
-Tool capabilities below are source-backed; selection, workload sizes and controls
-are recommendations, not measured results or a claim of product-wide coverage.
+November 8-9, 2026. This is the measured I/O benchmark record: the one home for every measured
+number in the copy-first I/O work, followed by the original tool-selection rationale (the tools
+chosen and why, near the end of the file). It supplements [the I/O plan](io-plan.md);
+[Track05](../research/tracks/05-benchmarking-and-validation.md) still owns comparison validity
+and QEMU TCG remains the required baseline. Review verdicts live in the [findings
+ledger](../research/reviews/INV-03-01-findings.md) and current status in
+[INV-03-01](../research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026).
+The measured sections come first. Tool capabilities in the later selection sections are
+source-backed, but their workload sizes and controls are recommendations, and the original
+matrix and next-step plan are kept as historical planning, superseded by the measured sections.
+Results are scoped to the stated workloads, not a claim of product-wide coverage.
 
-**Implementation follow-up:** signed-index-verified fio 3.39-1 and its dependency
-closure are staged outside the repository; eleven finite profiles have static
-review. The first installed-root admission attempt timed out during its 64 MiB
-CRC workload. Following reviewed targeted DMA invalidation changes, the unchanged
-original workload passes primary and independent write/relaunch pairs, including
-all profile/library checks, CRC readback, persisted hashes, clean S5 and fsck.
-This establishes functional tool admission, not a performance score or causal
-speedup. The retained preparation, failures, diagnostics and passing pairs are at
-`natemu-raw/io-benchmark-prep-20261108-01` and
-`natemu-raw/io-fio-admission-20261108-01`. All seven bounded launches are accounted
-for; no additional run is assigned. Stock QEMU's segment/size feature profile and fdatasync/fsync flush
-path differ from natemu's current profile/F_FULLFSYNC: use it as a disclosed
-whole-system baseline, not an exact device or durability match. No network
-benchmark endpoint has been contacted.
+**Implementation follow-up:** signed-index-verified fio 3.39-1 and its dependency closure are
+staged outside the repository; eleven finite profiles have static review. The first
+installed-root admission attempt timed out during its 64 MiB CRC workload. Following reviewed
+targeted DMA invalidation changes, the unchanged original workload passes primary and
+independent write/relaunch pairs, including all profile/library checks, CRC readback, persisted
+hashes, clean S5 and fsck. This establishes functional tool admission, not a performance score
+or causal speedup. The retained preparation, failures, diagnostics and passing pairs are at
+`natemu-raw/io-benchmark-prep-20261108-01` and `natemu-raw/io-fio-admission-20261108-01`. All
+seven bounded launches are accounted for; no additional run is assigned. Stock QEMU's
+segment/size feature profile and fdatasync/fsync flush path differ from natemu's current
+profile/F_FULLFSYNC: use it as a disclosed whole-system baseline, not an exact device or
+durability match. No network benchmark endpoint has been contacted.
 
 The network clients are now staged separately at
 `natemu-raw/io-network-tools-20261108-01`: iperf3 `3.18-2+deb13u2`, curl
@@ -116,25 +120,25 @@ A 30-microsecond acknowledgement-spin candidate was rejected. It improved fio to
 The final version keeps yielding and adds descriptor-prefix reuse. This is a
 finite, fixed-order comparison, not an optimal polling-policy search.
 
-The final source passes 175 host-library and 72 ABI tests (two existing tests
-remain ignored), resident stack audit and 11 targeted live checks: N4 split-atomic
-windows/cache preservation, high RAM, held compiler reply timeout/resume,
-reset/disable, full queue, malformed captured successor, contained shutdown-sync
-error, and three network queue/IRQ cases. Earlier N1/N2/N4 and PTE/PDE checks pass;
-fresh independent final PTE/PDE replays also pass. An isolated late-SHADOWS control
-forces requests after all acknowledgements while release is withheld; the real
-resident services them, while removing only that wait servicing produces the
-expected pre-grant deadline with clean release/teardown. Malformed-later validates
-one valid completion followed by rejection with no second backend effect; the
-alias unit test establishes owned-snapshot semantics, not a forced live DMA alias.
+The final source passes 175 host-library and 72 ABI tests (two existing tests remain ignored),
+resident stack audit and 11 targeted live checks: N4 split-atomic windows/cache preservation,
+high RAM, held compiler reply timeout/resume, reset/disable, full queue, malformed captured
+successor, contained shutdown-sync error, and three network queue/IRQ cases. Earlier N1/N2/N4
+and PTE/PDE checks pass; fresh independent final PTE/PDE replays also pass. An isolated late
+shadow-reset control (a peer vCPU servicing a shadow-reset request late, after parking) forces
+requests after all acknowledgements while release is withheld; the real resident services them,
+while removing only that wait servicing produces the expected pre-grant deadline with clean
+release/teardown. Malformed-later validates one valid completion followed by rejection with no
+second backend effect; the alias unit test establishes owned-snapshot semantics, not a forced
+live DMA alias.
 
-All sources, build failures, diagnostics, intermediate candidates, rejected spin
-results and final replays are retained at `natemu-raw/io-perf-repair-20261108-01`.
-`summary.json` and `summarize.py` bind timings, source/binary/oracle manifests and
-all 39 of the 40 bounded VM launches; storage is about 3.1 GiB of 4 GiB. Independent
-source/method and [final findings review](../research/reviews/INV-03-01-findings.md#io-performance-repair-final-independent-rebuild-and-replay--november-8-2026)
-are recorded in INV-03-01. No retries or weakened workloads were used to accept
-the final candidate.
+All sources, build failures, diagnostics, intermediate candidates, rejected spin results and
+final replays are retained at `natemu-raw/io-perf-repair-20261108-01`. `summary.json` and
+`summarize.py` bind timings, source/binary/oracle manifests and all 39 of the 40 bounded VM
+launches; storage is about 3.1 GiB of 4 GiB. Independent source/method and [final findings
+review](../research/reviews/INV-03-01-findings.md#io-performance-repair-final-independent-rebuild-and-replay--november-8-2026)
+are recorded in INV-03-01. No retries or weakened workloads were used to accept the final
+candidate.
 
 ## I/O wake-up ordering — November 8
 
@@ -179,27 +183,26 @@ QEMU 1.898–2.041-second observations, while restart reads remain above QEMU's
 still prevent an equivalent-device or general QEMU-parity claim. This remains a
 finite correctness-verified workload, not sustained-storage characterization.
 
-An independent adversarial reproduction holds each resident immediately before
-doorbell drain, publishes a real copy request and confirms its GIC kick is pending.
-Both old loops hit the specific acknowledgement deadline with no copy effects;
-both fixed loops complete the real copy. All four pass exact RAM/state/teardown
-oracles. The mailbox control uses one vCPU directly in the firmware wait path,
-not SMP startup; private wait counters do not sample the CPU's WFI instruction.
-The [forced reproduction](../research/reviews/INV-03-01-findings.md#io-wait-loop-doorbell-ordering--independent-forced-reproduction)
+An independent adversarial reproduction holds each resident immediately before doorbell drain,
+publishes a real copy request and confirms its GIC kick is pending. Both old loops hit the
+specific acknowledgement deadline with no copy effects; both fixed loops complete the real copy.
+All four pass exact RAM/state/teardown oracles. The mailbox control uses one vCPU directly in
+the firmware wait path, not SMP startup; private wait counters do not sample the CPU's WFI
+instruction. The [forced
+reproduction](../research/reviews/INV-03-01-findings.md#io-wait-loop-doorbell-ordering--independent-forced-reproduction)
 records patches, provenance, 36 negative parser controls and scope.
 
-Nine final normal-build live regressions pass: HLT/AP window cases, N4 split
-atomics/cache preservation, reset, disable, shutdown with a halted peer,
-malformed successor, full queue, and network halt/IRQ. Fresh builds pass resident
-stack audits; the workspace normal CLI/resident are rebuilt and signed from
-matching source. [Independent final review/replay](../research/reviews/INV-03-01-findings.md#lost-io-wake-independent-source-review-control-review-and-replay--november-8-2026)
-accepts the finite evidence and verifies all 916 producing inputs;
-only the wait-loop source differs from candidate06. Evidence, hashes, timings,
-forced controls and final regressions are retained at
-`natemu-raw/io-perf-pipeline-20261108-01`, with `summary.json`/`summarize.py`.
-The increment used 21 of 24 bounded VM launches, including diagnostics and
-expected-negative controls; no VM retry or weakened workload was used. An earlier
-forced-control preparation anchor failure is retained separately and launched no VM.
+Nine final normal-build live regressions pass: HLT/AP window cases, N4 split atomics/cache
+preservation, reset, disable, shutdown with a halted peer, malformed successor, full queue, and
+network halt/IRQ. Fresh builds pass resident stack audits; the workspace normal CLI/resident are
+rebuilt and signed from matching source. [Independent final
+review/replay](../research/reviews/INV-03-01-findings.md#lost-io-wake-independent-source-review-control-review-and-replay--november-8-2026)
+accepts the finite evidence and verifies all 916 producing inputs; only the wait-loop source
+differs from candidate06. Evidence, hashes, timings, forced controls and final regressions are
+retained at `natemu-raw/io-perf-pipeline-20261108-01`, with `summary.json`/`summarize.py`. The
+increment used 21 of 24 bounded VM launches, including diagnostics and expected-negative
+controls; no VM retry or weakened workload was used. An earlier forced-control preparation
+anchor failure is retained separately and launched no VM.
 
 ### Post-fix profile: coordination versus copying
 
@@ -240,12 +243,12 @@ consume a later kick; it is an assessment, not an implemented or accepted design
 Additional backend concurrency has less measured headroom here and should be
 reconsidered for longer native I/O or broader workloads.
 
-The data does not identify raw copying as the dominant cost. Zero-copy could
-still help by eliminating global rendezvous, but that requires a separate safe
-ownership/coherency mechanism; removing a memcpy alone does not supply it, and
-queue metadata/completions still need synchronization. This motivated the fewer-round-trip experiment below while retaining owned
-payloads. Remaining guest execution, MMIO and IRQ costs need further measurement. Large sustained
-transfers and native networking are outside this diagnostic.
+The data does not identify raw copying as the dominant cost. Zero-copy could still help by
+eliminating global rendezvous, but that requires a separate safe ownership/coherency mechanism;
+removing a memcpy alone does not supply it, and queue metadata/completions still need
+synchronization. This motivated the fewer-round-trip experiment below while retaining owned
+payloads. Remaining guest execution, MMIO and IRQ costs need further measurement. Large
+sustained transfers and native networking are outside this diagnostic.
 
 ## Avoiding redundant block scans — November 8
 
@@ -337,7 +340,7 @@ consistent restart regression. Fast B runs have substantially more fio context
 switches (354/361 versus 38/41), but that alone does not identify the responsible
 host or guest scheduling path.
 
-Candidate C skips a native doorbell only when the participant has already
+Candidate C skips a native wake-up doorbell as redundant, only when the participant has already
 acknowledged the exact newly published window epoch. Every callback still checks
 whether its participant has ended under the existing stop mutex. The copier still
 waits for every matching acknowledgement and retains cancellation, grant,
@@ -429,19 +432,44 @@ never removed or replaced by successful retries.
 
 ## Ordinary disk use and scaling matrix — November 8
 
-Measured with the selected, uninstrumented exact-ACK doorbell build, pinned fio 3.39 and QEMU 11.1.2 TCG on the M4 (10 host CPUs, 16 GiB RAM), macOS 26.6.2 (25G83). Each guest has 2 GiB RAM and the same 2 GiB raw ext4 root, stock Debian 6.12.107 kernel/modules, BusyBox and fio. Four 256 MiB files provide 1 GiB of data; single-job profiles use one 256 MiB file. Native host scores from the earlier 64 MiB workload are not comparable new-matrix baselines.
+Measured with the selected, uninstrumented exact-ACK doorbell build, pinned fio 3.39 and QEMU
+11.1.2 TCG on the M4 (10 host CPUs, 16 GiB RAM), macOS 26.6.2 (25G83). Each guest has 2 GiB RAM
+and the same 2 GiB raw ext4 root, stock Debian 6.12.107 kernel/modules, BusyBox and fio. Four
+256 MiB files provide 1 GiB of data; single-job profiles use one 256 MiB file. Native host
+scores from the earlier 64 MiB workload are not comparable new-matrix baselines.
 
-**Result: all 16 VM launches (eight main/relaunch pairs) pass, including independent N4 repeats.** The harness also passes 396 negative controls, six valid serial cases and guest shell syntax checks. No production code changed.
+**Result: all 16 VM launches (eight main/relaunch pairs) pass, including independent N4
+repeats.** The harness also passes 396 negative controls, six valid serial cases and guest shell
+syntax checks. No production code changed.
 
-**Acceptance:** each pair boots/mounts the installed root, performs create/overwrite/copy/compare/rename/unlink on known 4 MiB fixture data, checks that renamed/unlinked source paths are absent, preconditions all four files with CRC32C, runs all nine workload profiles, verifies all 1 GiB, records file hashes, remounts read-only and powers off. Offline fsck follows; a fresh read-only VM verifies all 1 GiB again and matches every saved hash while the entire disk image remains byte-identical. This uses a scripted installed BusyBox root, not a full distribution init/login acceptance test.
+**Acceptance:** each pair boots/mounts the installed root, performs
+create/overwrite/copy/compare/rename/unlink on known 4 MiB fixture data, checks that
+renamed/unlinked source paths are absent, preconditions all four files with CRC32C, runs all
+nine workload profiles, verifies all 1 GiB, records file hashes, remounts read-only and powers
+off. Offline fsck follows; a fresh read-only VM verifies all 1 GiB again and matches every saved
+hash while the entire disk image remains byte-identical. This uses a scripted installed BusyBox
+root, not a full distribution init/login acceptance test.
 
-Eight timed profiles run for 5 s each. Pure-read profiles verify CRC inline; writes generate 4 KiB CRC headers (including 128 KiB requests). Mixed reads are not verified inline; the later full sweep checks stored data after mixed writes. serialize_overlap prevents workload-induced overlapping writes. The finite fsync case writes 64 × 4 KiB, reports 63 periodic sync samples and performs a required final end_fsync, which fio excludes from its sync count/latency distribution. Final-sync errors are rejected. These are checksum-bearing guest workloads, not raw device bandwidth.
+Eight timed profiles run for 5 s each. Pure-read profiles verify CRC inline; writes generate 4
+KiB CRC headers (including 128 KiB requests). Mixed reads are not verified inline; the later
+full sweep checks stored data after mixed writes. serialize_overlap prevents workload-induced
+overlapping writes. The finite fsync case writes 64 × 4 KiB, reports 63 periodic sync samples
+and performs a required final end_fsync, which fio excludes from its sync count/latency
+distribution. Final-sync errors are rejected. These are checksum-bearing guest workloads, not
+raw device bandwidth.
 
-Preconditioning and hash checks warm host caches; guest direct I/O does not bypass the macOS backing-file cache. No affinity, host-cache purge, queue tuning or production code changes. QEMU uses the prior disclosed PCI/features/threaded backend, versus natemu MMIO/one native request; QEMU fsync and natemu F_FULLFSYNC are different durability paths. Large-request advantages can include translated checksum CPU work and must not be called SSD speedups.
+Preconditioning and hash checks warm host caches; guest direct I/O does not bypass the macOS
+backing-file cache. No affinity, host-cache purge, queue tuning or production code changes. QEMU
+uses the prior disclosed PCI/features/threaded backend, versus natemu MMIO/one native request;
+QEMU fsync and natemu F_FULLFSYNC are different durability paths. Large-request advantages can
+include translated checksum CPU work and must not be called SSD speedups.
 
-Primary order: natemu N1, QEMU N1, QEMU N2, natemu N2, natemu N4, QEMU N4. Independent repeated N4 order: QEMU N4, natemu N4, using the independently built matching natemu binaries. Every row below retains the primary result; repeats are separate, not substituted for slower samples.
+Primary order: natemu N1, QEMU N1, QEMU N2, natemu N2, natemu N4, QEMU N4. Independent repeated
+N4 order: QEMU N4, natemu N4, using the independently built matching natemu binaries. Every row
+below retains the primary result; repeats are separate, not substituted for slower samples.
 
-**Primary throughput and latency:** each cell is natemu / QEMU. Higher throughput is better; lower time/latency is better.
+**Primary throughput and latency:** each cell is natemu / QEMU. Higher throughput is better;
+lower time/latency is better.
 
 | Workload | 1 vCPU | 2 vCPUs | 4 vCPUs |
 | --- | ---: | ---: | ---: |
@@ -462,7 +490,11 @@ Primary order: natemu N1, QEMU N1, QEMU N2, natemu N2, natemu N4, QEMU N4. Indep
 | Q64 | 2.900 / 4.424 | 2.998 / 3.293 | 6.914 / 4.178 |
 | Four jobs, Q16 each; worst per-job p99 | 16.908 / 17.170 | 24.248 / 6.390 | 12.911 / 4.293 |
 
-Aggregate concurrent-job rates divide all bytes/I/Os by the union of job_start..job_start+job_runtime intervals (all jobs overlap). Latency percentiles are retained per job; the four-job table shows the worst per-job p99, not an aggregate percentile. Full per-direction rates, p50/p95/p99, actual read fractions and achieved-depth distributions remain in summary.json and raw fio JSON.
+Aggregate concurrent-job rates divide all bytes/I/Os by the union of
+job_start..job_start+job_runtime intervals (all jobs overlap). Latency percentiles are retained
+per job; the four-job table shows the worst per-job p99, not an aggregate percentile. Full
+per-direction rates, p50/p95/p99, actual read fractions and achieved-depth distributions remain
+in summary.json and raw fio JSON.
 
 **Independent N4 repetition:**
 
@@ -478,7 +510,9 @@ Aggregate concurrent-job rates divide all bytes/I/Os by the union of job_start..
 | Mixed random 70/30, 4 KiB Q16, total MiB/s | 42.460 / 34.896 | 118.201 / 119.013 |
 | 64 writes with fsync, total job seconds | 0.626 / 0.631 | 0.016 / 0.022 |
 
-**Combined VM process totals:** main workload boot plus read-only verification boot, including guest CRC/hash work. These exclude outer cloning/hashing/offline fsck; the separately retained wrapper_seconds includes those. They are not directly the earlier full-admission-wrapper timer.
+**Combined VM process totals:** main workload boot plus read-only verification boot, including
+guest CRC/hash work. These exclude outer cloning/hashing/offline fsck; the separately retained
+wrapper_seconds includes those. They are not directly the earlier full-admission-wrapper timer.
 
 | Primary configuration | Natemu elapsed / host CPU, seconds | QEMU elapsed / host CPU, seconds |
 | --- | ---: | ---: |
@@ -498,17 +532,40 @@ Aggregate concurrent-job rates divide all bytes/I/Os by the union of job_start..
 | 2 vCPU | 9.145 / 11.207 | 0.187 / 1.548 |
 | 4 vCPU | 9.103 / 14.352 | 0.130 / 1.565 |
 
-**Observed result:** natemu preserves ordinary filesystem and persistence behavior in every tested pair, but four-vCPU small-I/O scaling is a clear weakness in these runs. Its random-read Q16 rate is 8.78/9.24 kIOPS in primary/repeat, and four-job throughput is 18.27/18.98 kIOPS against QEMU 55.65/54.70 kIOPS. The primary N2 four-job result favors natemu throughput (33.39 versus 28.36 kIOPS) while worsening the worst per-job p99 (24.25 versus 6.39 ms). Large 128 KiB transfers favor natemu in both N4 runs. The primary N4 combined elapsed times are close (191.25 versus 197.29 s), but natemu consumes 593.97 versus 256.18 host CPU-seconds. More vCPUs do not automatically improve this device path. These finite samples do not establish statistical confidence or isolate the cause; coordination and fairness merit the next bounded investigation before making a zero-copy decision.
+**Observed result:** natemu preserves ordinary filesystem and persistence behavior in every
+tested pair, but four-vCPU small-I/O scaling is a clear weakness in these runs. Its random-read
+Q16 rate is 8.78/9.24 kIOPS in primary/repeat, and four-job throughput is 18.27/18.98 kIOPS
+against QEMU 55.65/54.70 kIOPS. The primary N2 four-job result favors natemu throughput (33.39
+versus 28.36 kIOPS) while worsening the worst per-job p99 (24.25 versus 6.39 ms). Large 128 KiB
+transfers favor natemu in both N4 runs. The primary N4 combined elapsed times are close (191.25
+versus 197.29 s), but natemu consumes 593.97 versus 256.18 host CPU-seconds. More vCPUs do not
+automatically improve this device path. These finite samples do not establish statistical
+confidence or isolate the cause; coordination and fairness merit the next bounded investigation
+before making a zero-copy decision.
 
-Root-mounted markers are host observations polled every 250 ms, with guest uptime also retained; they are not full-distribution readiness times. Filesystem and persistence checks pass independently of throughput rankings.
+Root-mounted markers are host observations polled every 250 ms, with guest uptime also retained;
+they are not full-distribution readiness times. Filesystem and persistence checks pass
+independently of throughput rankings.
 
-Evidence: natemu-raw/io-matrix-20261108-01, including frozen oracle-01/inputs-02, source/binary bindings, all original fio JSON, host timing, kernel/serial logs, offline fsck, per-file hashes, and independent replay. Preparation inputs-01 and the initial native sync-count assertion failure are retained; the final 63-sync oracle is supported by fio source and native observations. No failed VM is replaced by a passing retry.
+Evidence: natemu-raw/io-matrix-20261108-01, including frozen oracle-01/inputs-02, source/binary
+bindings, all original fio JSON, host timing, kernel/serial logs, offline fsck, per-file hashes,
+and independent replay. Preparation inputs-01 and the initial native sync-count assertion
+failure are retained; the final 63-sync oracle is supported by fio source and native
+observations. No failed VM is replaced by a passing retry.
 
-Independent [evidence review](../research/reviews/INV-03-01-findings.md#installed-root-io-matrix--independent-review-and-n4-replication-november-8-2026) accepts this bounded result: all eight pairs were reparsed, all 72 workload rows recomputed, the published throughput/latency cells checked, and both replica final image hashes independently verified. The review retains the scaling, CPU, durability and workload limitations above.
+Independent [evidence
+review](../research/reviews/INV-03-01-findings.md#installed-root-io-matrix--independent-review-and-n4-replication-november-8-2026)
+accepts this bounded result: all eight pairs were reparsed, all 72 workload rows recomputed, the
+published throughput/latency cells checked, and both replica final image hashes independently
+verified. The review retains the scaling, CPU, durability and workload limitations above.
 
-Coverage limits: one disk, whole-device ext4, direct-kernel boot and scripted userspace. Partitioned disks, a full distro/login, guest-initiated reboot, disk-full/crash recovery, native networking and long-duration/cold-host-storage behavior are not qualified by this matrix.
+Coverage limits: one disk, whole-device ext4, direct-kernel boot and scripted userspace.
+Partitioned disks, a full distro/login, guest-initiated reboot, disk-full/crash recovery, native
+networking and long-duration/cold-host-storage behavior are not qualified by this matrix.
 
-Resource use: 16 of 20 allowed VM launches, no VM failures/retries, approximately 10.72 GiB retained against the 12 GiB bound. Four reserve launches remain unused; the campaign is complete.
+Resource use: 16 of 20 allowed VM launches, no VM failures/retries, approximately 10.72 GiB
+retained against the 12 GiB bound. Four reserve launches remain unused; the campaign is
+complete.
 
 ## HLT coordination repair — November 8
 
@@ -650,7 +707,7 @@ and negative reports with the corrected oracle. The cancellation fixture tests
 a pre-canceled request that announces no epoch, not cancellation after announce.
 
 The normal N4 split-atomic/code fixture, AP-mailbox wake fixture and a forced
-late-SHADOWS request after four exact ACKs all pass. The late-SHADOWS test uses
+late shadow-reset request after four exact ACKs all pass. The late shadow-reset test uses
 only a retained host injection and the unchanged candidate resident; its older
 missing-service negative control remains in the prior repair campaign. This
 covers active parked service; it does not deterministically force every race
@@ -666,10 +723,11 @@ concern. Reproducible Cargo intermediates were removed after builds/primary runs
 all bound binary hashes, source snapshots, recipes, logs and disk images remain.
 Approximately 10.14 GiB is retained within the revised 11-GiB bound.
 
-The [final independent review](../research/reviews/INV-03-01-findings.md#hlt-quiescence--final-independent-acceptance-november-8-2026)
-accepts this targeted N4 improvement, independently recomputing all 63 workload
-rows and checking all 135 published numeric cells. It retains the write/fairness
-limitations and finds no substantive blocker in the selected increment.
+The [final independent
+review](../research/reviews/INV-03-01-findings.md#hlt-quiescence--final-independent-acceptance-november-8-2026)
+accepts this targeted N4 improvement, independently recomputing all 63 workload rows and
+checking all 135 published numeric cells. It retains the write/fairness limitations and finds no
+substantive blocker in the selected increment.
 
 Evidence: `natemu-raw/io-smp-fix-20261108-01`, including the failed candidate
 screens, isolated profiler and replay, candidate-build-03, replica-build-01,
@@ -687,11 +745,11 @@ The patch introduces neither zero-copy nor weaker durability.
 
 ## Safety stress performance — November 8
 
-The safety extension keeps normal runtime instructions unchanged: independent
-ELF comparison finds the entire `.boot` and `.text` identical to HLT candidate
-C3. Test hooks are feature-gated and built separately. This is additional
-correctness/load evidence, not a new optimization or a zero-copy experiment.
-See [the safety coverage](io-plan.md#io-safety-stress--november-8).
+The safety extension keeps normal runtime instructions unchanged: independent ELF comparison
+finds the entire `.boot` and `.text` identical to the earlier accepted HLT-quiescence candidate
+build, which later sections call the control build. Test hooks are feature-gated and built
+separately. This is additional correctness/load evidence, not a new optimization or a zero-copy
+experiment. See [the safety coverage](io-plan.md#io-safety-stress--november-8).
 
 `io-safety-stress-20261108-01/soak-primary-02` passes its main and fresh read-only
 VMs. The stock Linux guest has four vCPUs, 2 GiB RAM, one 512-MiB ext4 disk and
@@ -780,15 +838,15 @@ pass. Host/ABI unit tests pass 254 with two existing ignored tests. The default
 workspace build is restored without test hooks; no production optimization is
 introduced by this coverage increment.
 
-All 24 launches are accounted for: 18 healthy VMs, three deliberate negative
-controls and three unexpected failed attempts (the two fixture-MMIO errors and
-the original serial-export stall). The independent audit reparses cycle counters,
-lifecycle native-call/commit traces, decoded logs, hashes and both full soak pairs.
-All failures, sources, binaries, commands and results are retained under
-`natemu-raw/io-safety-stress-20261108-01`, about 2.32 GiB within the 4-GiB bound.
-The [independent review](../research/reviews/INV-03-01-findings.md#independent-fresh-build-replay-and-final-disposition)
-accepts the stated finite I/O safety coverage, with the UART limitation
-above still open; it is not acceptance of all ordinary-VM behavior.
+All 24 launches are accounted for: 18 healthy VMs, three deliberate negative controls and three
+unexpected failed attempts (the two fixture-MMIO errors and the original serial-export stall).
+The independent audit reparses cycle counters, lifecycle native-call/commit traces, decoded
+logs, hashes and both full soak pairs. All failures, sources, binaries, commands and results are
+retained under `natemu-raw/io-safety-stress-20261108-01`, about 2.32 GiB within the 4-GiB bound.
+The [independent
+review](../research/reviews/INV-03-01-findings.md#independent-fresh-build-replay-and-final-disposition)
+accepts the stated finite I/O safety coverage, with the UART limitation above still open; it is
+not acceptance of all ordinary-VM behavior.
 
 ### Sustained UART reproduction and readiness tuning — November 8
 
@@ -860,36 +918,36 @@ installed busy-guard acquisition, reset/loopback byte preservation, first sink
 write/flush errors and concurrent idempotent shutdown drain.
 
 All failures and frozen sources, commands, binaries, inputs and logs remain in
-`natemu-raw/io-load-repair-20261108-01`. The
-[author inventory](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/uart-author-summary-01.json),
-[tuning comparison](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/uart-tuning-analysis-01.json)
-and [common-oracle rejudging](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/serial-oracle-05/existing-evidence-rejudge.json)
-bind the results. No kernel warning threshold or payload pacing changed in the
-candidate unpaced runs.
+`natemu-raw/io-load-repair-20261108-01`. The author inventory
+(`natemu-raw/io-load-repair-20261108-01/uart-author-summary-01.json`), tuning comparison
+(`natemu-raw/io-load-repair-20261108-01/uart-tuning-analysis-01.json`) and common-oracle
+rejudging
+(`natemu-raw/io-load-repair-20261108-01/serial-oracle-05/existing-evidence-rejudge.json`) bind
+the results. No kernel warning threshold or payload pacing changed in the candidate unpaced
+runs.
 
-The primary CPU-loaded extension runs the same triple unpaced payload while
-three workers from the pinned stress-ng 0.19.02 binary each perform 180 seconds of
-verified `int64` work. It samples actual worker PID, process group, start time and CPU
-ticks, requires consecutive observations covering the whole output interval,
-and explicitly drains the guest console before recording output completion.
-The first [loaded attempt remains failed](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/final-loaded-serial-01/result.json):
-although bytes, heartbeat, worker verification and S5 checks passed, two worker
-observation sequences each lacked one sample. The observer passed a changing
-`/proc/*/stat` glob as ordinary BusyBox awk input; source inspection shows a
-vanished input can terminate that scan. An unrelated process disappearing is a
-plausible cause, **not a confirmed retrospective explanation**, because that
+The primary CPU-loaded extension runs the same triple unpaced payload while three workers from
+the pinned stress-ng 0.19.02 binary each perform 180 seconds of verified `int64` work. It
+samples actual worker PID, process group, start time and CPU ticks, requires consecutive
+observations covering the whole output interval, and explicitly drains the guest console before
+recording output completion. The first loaded attempt remains failed
+(`natemu-raw/io-load-repair-20261108-01/final-loaded-serial-01/result.json`): although bytes,
+heartbeat, worker verification and S5 checks passed, two worker observation sequences each
+lacked one sample. The observer passed a changing `/proc/*/stat` glob as ordinary BusyBox awk
+input; source inspection shows a vanished input can terminate that scan. An unrelated process
+disappearing is a plausible cause, **not a confirmed retrospective explanation**, because that
 attempt did not retain the failed scan's error/status.
 
 The reviewed fixture correction uses nonfatal per-path `getline` reads. The
-[retained change](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/serial-oracle-07/observer.patch)
+retained change (`natemu-raw/io-load-repair-20261108-01/serial-oracle-07/observer.patch`)
 changes only the observer and its input checksum; kernel, BusyBox, stress-ng,
 payload, init, worker recipe and strict consecutive-sample oracle are unchanged.
-A [synthetic check](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/serial-oracle-07/selfcheck.log)
+A synthetic check (`natemu-raw/io-load-repair-20261108-01/serial-oracle-07/selfcheck.log`)
 places a vanished unrelated path before a stable worker and requires its row;
 removing the actual worker still causes oracle rejection. The original failure
 is not reclassified.
 
-The [fresh primary run](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/final-loaded-serial-02/result.json)
+The fresh primary run (`natemu-raw/io-load-repair-20261108-01/final-loaded-serial-02/result.json`)
 passes with the final combined build: exactly 14,144,544 wire bytes in **95.34
 seconds**, maximum per-CPU heartbeat gap **1.15 seconds**, no kernel errors and
 clean S5. Each worker has **92 consecutive observations**, from guest uptime
@@ -900,29 +958,29 @@ or skipped workers and exactly one zero untrustworthy-metrics summary. Whole-VM
 time is 185.85 seconds and 610.93 host CPU-seconds. These costs include the full
 180-second load, boot and export; they are not payload-only costs.
 
-The [fresh independent loaded replay](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/replica-serial-loaded-01/result.json)
-also passes: the same exact payload in 101.52 seconds, heartbeat gaps at most
-1.15 seconds, and 96 consecutive actual-worker observations spanning the drained
-output. Each worker completes verified 180-second work with zero failure/trust
-records; shutdown is clean. Whole-VM wall/CPU are 185.94/620.42 seconds. Together
-these establish the tested CPU-loaded serial behavior, not arbitrary pressure
-or universal fairness. The original observer failure remains failed.
-[Run bindings](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/final-loaded-serial-02/manifest.json)
-and [fixture comparison](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/serial-oracle-07/bindings.json)
-bind oracle `244d3f8b…`, input manifest `40d789dc…` and initramfs `4061cbac…`
-to the final binaries. The independent replay binds the same fixture to its
-fresh build. Neither run establishes a worst-case latency bound.
+The fresh independent loaded replay
+(`natemu-raw/io-load-repair-20261108-01/replica-serial-loaded-01/result.json`) also passes: the
+same exact payload in 101.52 seconds, heartbeat gaps at most 1.15 seconds, and 96 consecutive
+actual-worker observations spanning the drained output. Each worker completes verified
+180-second work with zero failure/trust records; shutdown is clean. Whole-VM wall/CPU are
+185.94/620.42 seconds. Together these establish the tested CPU-loaded serial behavior, not
+arbitrary pressure or universal fairness. The original observer failure remains failed. Run
+bindings (`natemu-raw/io-load-repair-20261108-01/final-loaded-serial-02/manifest.json`) and
+fixture comparison (`natemu-raw/io-load-repair-20261108-01/serial-oracle-07/bindings.json`) bind
+oracle `244d3f8b…`, input manifest `40d789dc…` and initramfs `4061cbac…` to the final binaries.
+The independent replay binds the same fixture to its fresh build. Neither run establishes a
+worst-case latency bound.
 
 ### Load-coordination diagnostic follow-up — November 8
 
-The next investigation keeps the same N4 guest, two 64-MiB fio files and
-60-second unloaded/300-second loaded phases. Four bounded native thread samples
-in [the normal C3 diagnostic](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/baseline-profile-01-analysis.json)
-find the I/O owner inside copy-window coordination in 57–58% of its unloaded
-samples and 69–73% of its loaded samples. Native disk-thread pread/pwrite samples
-are about 3–4% unloaded and 2% loaded. These are sampled thread-stack proportions,
-not whole-process CPU attribution; resident guest execution and resident waiting
-cannot be separated by those host samples alone.
+The next investigation keeps the same N4 guest, two 64-MiB fio files and 60-second
+unloaded/300-second loaded phases. Four bounded native thread samples in the normal
+control-build diagnostic
+(`natemu-raw/io-load-repair-20261108-01/baseline-profile-01-analysis.json`) find the I/O owner
+inside copy-window coordination in 57–58% of its unloaded samples and 69–73% of its loaded
+samples. Native disk-thread pread/pwrite samples are about 3–4% unloaded and 2% loaded. These
+are sampled thread-stack proportions, not whole-process CPU attribution; resident guest
+execution and resident waiting cannot be separated by those host samples alone.
 
 An independently checked breakdown of those same samples finds 217/200 loaded
 observations under the owner's kick path, including 194/174 inside
@@ -930,26 +988,26 @@ observations under the owner's kick path, including 194/174 inside
 framework call. Most sampled framework work is wake/trap activity. These are
 inclusive stack observations, not CPU percentages or per-call timings; they do
 not justify removing the lifetime/serialization lock. The
-[retained breakdown](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/baseline-kick-sample-breakdown-01)
+retained breakdown (`natemu-raw/io-load-repair-20261108-01/baseline-kick-sample-breakdown-01`)
 instead motivates evaluating fewer coordination rounds through bounded queue
 capture/completion batches. That remains a future design hypothesis with its own
 ownership, reset, cancellation and fairness obligations.
 
-An isolated source snapshot therefore adds cumulative host stage counters,
-per-thread CPU observations and resident ACK-to-release elapsed counters.
-It keeps guest jobs, queue limits, copy-first ownership and integrity oracles
-unchanged. The initial [instrumented-profile-01](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/instrumented-profile-01/write/result.json)
-is **failed and retained**: the pre-existing 5-ms live perf reader exceeded the
-32-MiB log cap after 217.8 seconds. There was no completed oracle or restart;
-zero errors in partial I/O counters do not turn this into a pass. The corrected
-snapshot disables only that live reader, retaining final owned vCPU records and
-new cumulative counters. Marker observation also switches from Python's
-process-relative clock origin to the same native `clock_gettime_nsec_np(8)`
-used by the Rust counters, with calibration retained per VM.
+An isolated source snapshot therefore adds cumulative host stage counters, per-thread CPU
+observations and resident ACK-to-release elapsed counters. It keeps guest jobs, queue limits,
+copy-first ownership and integrity oracles unchanged. The initial instrumented-profile-01
+(`natemu-raw/io-load-repair-20261108-01/instrumented-profile-01/write/result.json`) is **failed
+and retained**: the pre-existing 5-ms live perf reader exceeded the 32-MiB log cap after 217.8
+seconds. There was no completed oracle or restart; zero errors in partial I/O counters do not
+turn this into a pass. The corrected snapshot disables only that live reader, retaining final
+owned vCPU records and new cumulative counters. Marker observation also switches from Python's
+process-relative clock origin to the same native `clock_gettime_nsec_np(8)` used by the Rust
+counters, with calibration retained per VM.
 
-The [corrected baseline and replayable analysis](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/instrumented-profile-01b-analysis-02/natemu-load-baseline-analysis.json)
-pass both the full soak and read-only restart. Interior host counter brackets
-cover 59.337 seconds unloaded and 299.468 seconds loaded:
+The corrected baseline and replayable analysis
+(`natemu-raw/io-load-repair-20261108-01/instrumented-profile-01b-analysis-02/natemu-load-baseline-analysis.json`)
+pass both the full soak and read-only restart. Interior host counter brackets cover 59.337
+seconds unloaded and 299.468 seconds loaded:
 
 | Average diagnostic cost | Unloaded | Loaded |
 | --- | ---: | ---: |
@@ -961,7 +1019,7 @@ cover 59.337 seconds unloaded and 299.468 seconds loaded:
 | Owner wait for native lane per job, µs | 5.588 | 10.696 |
 
 Resident ACK-to-release elapsed shares range from 14.0–21.3% per vCPU unloaded
-to 24.2–33.2% loaded. They include descheduling and late private SHADOWS service,
+to 24.2–33.2% loaded. They include descheduling and late private shadow-reset service,
 exclude quiet-skipped epochs and work before ACK/after release, and are **not CPU
 time**. The owner uses 0.645/0.632 CPU-seconds per elapsed second in its own
 unloaded/loaded brackets; the disk lane uses 0.173/0.130. Each counter family has
@@ -972,58 +1030,58 @@ checks and barriers, not just native ringing. Stage and lane times overlap other
 reported intervals and must not be added as independent CPU buckets. A guest
 clock-watchdog read-back-delay/skipped-skew warning remains in the baseline log.
 
-The source then tests only an interactive QoS request for the I/O owner, matching
-the existing vCPU request. One-time queries confirm owner class 21→33 while all
-vCPUs remain 33 and the native disk lane remains 21; lane inheritance must not be
-assumed. These are requested classes, not effective priority or core placement.
-The [QoS02 pair and complete comparison](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/instrumented-profile-02-analysis/comparison.json)
-pass the same integrity/restart checks but give **no adoption signal**: loaded
-window time is 13.271→13.296 µs, kick 6.899→6.961, ACK wait 5.709→5.697 and the
-whole post-ACK stage 0.312→0.312. Diagnostic read/write rates are
-43.384/30.348→41.599/29.342 MiB/s. These two sequential instrumented runs neither
-establish a statistical regression nor support a speedup; the owner-QoS candidate
-is rejected for this increment. Independent review accepts source isolation,
-clock/counter arithmetic, final invariants and this limited disposition.
+The source then tests only an interactive QoS request for the I/O owner, matching the existing
+vCPU request. One-time queries confirm owner class 21→33 while all vCPUs remain 33 and the
+native disk lane remains 21; lane inheritance must not be assumed. These are requested classes,
+not effective priority or core placement. The QoS02 pair and complete comparison
+(`natemu-raw/io-load-repair-20261108-01/instrumented-profile-02-analysis/comparison.json`) pass
+the same integrity/restart checks but give **no adoption signal**: loaded window time is
+13.271→13.296 µs, kick 6.899→6.961, ACK wait 5.709→5.697 and the whole post-ACK stage
+0.312→0.312. Diagnostic read/write rates are 43.384/30.348→41.599/29.342 MiB/s. These two
+sequential instrumented runs neither establish a statistical regression nor support a speedup;
+the owner-QoS candidate is rejected for this increment. Independent review accepts source
+isolation, clock/counter arithmetic, final invariants and this limited disposition.
 
-A separate [source-only patch](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/lazy-kick-error-01/change.patch)
-changes `Stops::kick_if_needed` from eager `ok_or(format!(...))` to
-`ok_or_else(|| format!(...))`. It avoids formatting the invalid-index error on
-successful participant checks, preserving the error text and synchronization.
-Its isolated gain is unmeasured; the completed normal-build, independent and
-reverse-control results below do not attribute a benchmark improvement to it. These
-diagnostics concern the current small-request profile and do not establish a
-universal conclusion about copying, zero-copy designs or native networking.
+A separate source-only patch
+(`natemu-raw/io-load-repair-20261108-01/lazy-kick-error-01/change.patch`) changes
+`Stops::kick_if_needed` from eager `ok_or(format!(...))` to `ok_or_else(|| format!(...))`. It
+avoids formatting the invalid-index error on successful participant checks, preserving the error
+text and synchronization. Its isolated gain is unmeasured; the completed normal-build,
+independent and reverse-control results below do not attribute a benchmark improvement to it.
+These diagnostics concern the current small-request profile and do not establish a universal
+conclusion about copying, zero-copy designs or native networking.
 
 ### Completed normal combined comparison — November 8–9
 
-Twelve normal VM runs pass: the initial C3 baseline, selected candidate and QEMU
-soak pairs and candidate N4 ordinary-disk matrix, followed by an independent
-fresh-build candidate soak pair and a reverse-order C3 control pair. The selected
-[final build](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/final-build-01/build-manifest.json)
-contains the 20-us UART repair and lazy error formatting, with the rejected owner
-QoS change removed. The
-[independent build](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/replica-build-01/build-manifest.json)
-uses the same production source manifest. No diagnostic counters, perf sampler
-or test hooks run here. All use frozen `inputs-03`, including the final guest
-console drain. The initial baseline/candidate pass a later offline rejudge with
-oracle02; subsequent pairs use it directly. Natemu's compile cache is disabled;
-backing-file host caching remains unchanged, with no host cache purge.
+Twelve normal VM runs pass: the initial control-build baseline (the earlier accepted
+HLT-quiescence candidate, used unchanged), selected candidate and QEMU soak pairs and candidate
+N4 ordinary-disk matrix, followed by an independent fresh-build candidate soak pair and a
+reverse-order control pair. The selected final build
+(`natemu-raw/io-load-repair-20261108-01/final-build-01/build-manifest.json`) contains the 20-us
+UART repair and lazy error formatting, with the rejected owner QoS change removed. The
+independent build (`natemu-raw/io-load-repair-20261108-01/replica-build-01/build-manifest.json`)
+uses the same production source manifest. No diagnostic counters, perf sampler or test hooks run
+here. All use frozen `inputs-03`, including the final guest console drain. The initial
+baseline/candidate pass a later offline rejudge with oracle02; subsequent pairs use it directly.
+Natemu's compile cache is disabled; backing-file host caching remains unchanged, with no host
+cache purge.
 
-The [complete summary, analyzer and input bindings](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/final-normal-analysis-02/summary.json)
-retain every job's IOPS, completion p50/p95/p99, intervals, actual stress work,
-CPU time and warnings. The reverse C3 control follows the independent candidate
-because both candidate observations were below the first C3 write rate; it uses
-the original C3 binaries and the same workload/settings, without another change.
+The complete summary, analyzer and input bindings
+(`natemu-raw/io-load-repair-20261108-01/final-normal-analysis-02/summary.json`) retain every
+job's IOPS, completion p50/p95/p99, intervals, actual stress work, CPU time and warnings. The
+reverse-order control follows the independent candidate because both candidate observations were
+below the first control write rate; it uses the original control binaries and the same
+workload/settings, without another change.
 
 | Normal build / phase | Read, MiB/s | Write, MiB/s | Read p99, ms | Write p99, ms |
 | --- | ---: | ---: | ---: | ---: |
-| C3 first, unloaded | 102.579 | 62.159 | 0.864 | 2.007 |
-| C3 reverse control, unloaded | 98.971 | 60.516 | 0.856 | 2.023 |
+| Control first, unloaded | 102.579 | 62.159 | 0.864 | 2.007 |
+| Control reverse-order run, unloaded | 98.971 | 60.516 | 0.856 | 2.023 |
 | Candidate author, unloaded | 102.504 | 57.641 | 0.889 | 2.474 |
 | Candidate independent, unloaded | 103.671 | 59.242 | 0.881 | 2.408 |
 | QEMU 11.1.2, unloaded | 82.475 | 74.320 | 0.823 | 0.963 |
-| C3 first, loaded | 44.403 | 34.077 | 5.997 | 7.438 |
-| C3 reverse control, loaded | 45.054 | 31.121 | 6.062 | 7.766 |
+| Control first, loaded | 44.403 | 34.077 | 5.997 | 7.438 |
+| Control reverse-order run, loaded | 45.054 | 31.121 | 6.062 | 7.766 |
 | Candidate author, loaded | 45.037 | 31.327 | 6.324 | 7.766 |
 | Candidate independent, loaded | 43.827 | 31.772 | 6.259 | 7.635 |
 | QEMU 11.1.2, loaded | 55.666 | 33.276 | 5.014 | 7.504 |
@@ -1031,13 +1089,13 @@ the original C3 binaries and the same workload/settings, without another change.
 There is **no established throughput gain** from the combined change and no
 isolated gain attributed to lazy formatting. The initial loaded write deficit
 is not consistent against the reverse control: both candidate rates,
-31.327–31.772 MiB/s, lie inside the two C3 observations' 31.121–34.077 MiB/s range.
+31.327–31.772 MiB/s, lie inside the two control observations' 31.121–34.077 MiB/s range.
 That does not prove equal performance or rule out a smaller loaded cost.
 
 The unloaded write deficit remains: candidate rates are 57.641–59.242 versus
-C3's 60.516–62.159 MiB/s, a 2.1–7.3% difference across these comparisons.
+The control build's 60.516–62.159 MiB/s, a 2.1–7.3% difference across these comparisons.
 Candidate write p99 is also higher, 2.408–2.474 versus 2.007–2.023 ms. Both
-candidate observations are below both C3 rate observations, so this remains an
+candidate observations are below both control rate observations, so this remains an
 unresolved small-write performance cost to investigate. These are observed ranges
 from two controls and two candidates, not confidence intervals or an isolated
 causal estimate; order was not randomized and no further timing runs are
@@ -1048,13 +1106,13 @@ Each stress worker runs for about 360 seconds, but completes different work:
 
 | Normal build | CPU0 operations | CPU1 operations | Memory operations | Summed worker guest CPU, s |
 | --- | ---: | ---: | ---: | ---: |
-| C3 first | 331,658 | 335,672 | 49,061,888 | 934.59 |
-| C3 reverse control | 340,567 | 343,451 | 52,609,024 | 932.08 |
+| Control first | 331,658 | 335,672 | 49,061,888 | 934.59 |
+| Control reverse-order run | 340,567 | 343,451 | 52,609,024 | 932.08 |
 | Candidate author | 323,236 | 314,396 | 48,136,192 | 926.18 |
 | Candidate independent | 335,995 | 334,593 | 49,815,552 | 932.36 |
 | QEMU 11.1.2 | 116,382 | 119,668 | 36,069,376 | 885.74 |
 
-The author candidate completes less stress work than the first C3 control;
+The author candidate completes less stress work than the first control run;
 the independent candidate and reverse control have different completed work
 too. Equal duration must not be treated as equal CPU/memory load or used to
 explain away the unloaded write deficit. QEMU completes much less CPU work
@@ -1065,8 +1123,8 @@ with warm host caching, not matched cold-storage or per-write stable-media rates
 
 | Normal build | Main VM wall / host CPU, s | Read-only restart wall / host CPU, s |
 | --- | ---: | ---: |
-| C3 first | 483.21 / 1,791.73 | 11.25 / 13.28 |
-| C3 reverse control | 482.00 / 1,781.17 | 11.10 / 13.48 |
+| Control first | 483.21 / 1,791.73 | 11.25 / 13.28 |
+| Control reverse-order run | 482.00 / 1,781.17 | 11.10 / 13.48 |
 | Candidate author | 483.50 / 1,780.47 | 11.56 / 14.40 |
 | Candidate independent | 481.81 / 1,783.97 | 11.42 / 14.31 |
 | QEMU 11.1.2 | 477.42 / 1,688.84 | 15.09 / 14.25 |
@@ -1101,17 +1159,16 @@ is not the flush latency. Full fio JSON retains the separate synchronization
 statistics. This first matrix pair establishes the tested profiles' success,
 not an independently replicated performance improvement.
 
-Retained evidence stays recoverable within the campaign's storage bound. The
-[closed-file archival records](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/reverse-closed-archive-01/result.json)
-preserve exact byte counts/SHA256 and restore commands for compressed logs and
-inactive serial initramfs files, including failed attempts; restore their original
-paths before rerunning an older analyzer or input check. Only rebuildable build
-intermediates were pruned, with inventories and final executable hashes checked.
-The [closed-input deduplication record](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/closed-blob-dedup-01/before.json)
-preserves every pinned byte/path/mode/owner for identical inactive blobs and
-explicitly records normalized host mtimes and how to restore unique old mtimes.
-Frozen initramfs archives retain original guest metadata. Active soak inputs,
-build sources and binaries were not changed by this cleanup.
+Retained evidence stays recoverable within the campaign's storage bound. The closed-file
+archival records (`natemu-raw/io-load-repair-20261108-01/reverse-closed-archive-01/result.json`)
+preserve exact byte counts/SHA256 and restore commands for compressed logs and inactive serial
+initramfs files, including failed attempts; restore their original paths before rerunning an
+older analyzer or input check. Only rebuildable build intermediates were pruned, with
+inventories and final executable hashes checked. The closed-input deduplication record
+(`natemu-raw/io-load-repair-20261108-01/closed-blob-dedup-01/before.json`) preserves every
+pinned byte/path/mode/owner for identical inactive blobs and explicitly records normalized host
+mtimes and how to restore unique old mtimes. Frozen initramfs archives retain original guest
+metadata. Active soak inputs, build sources and binaries were not changed by this cleanup.
 
 ### Strict stress-metric validation correction
 
@@ -1121,24 +1178,23 @@ During final-result inspection, the old checker was found to match
 validating that summary. Other worker pass/fail/skip, progress and verification
 checks remained active; this was a gap in the untrustworthy-metrics check.
 
-The [checker correction](/Users/liaozping/orca/natemu/tools/run_io_soak.py:274)
-accepts either separator and requires exactly one literal zero summary. Missing,
-duplicate, malformed and nonzero summaries are rejected. The frozen
-[oracle02 source manifest](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/final-soak-oracle-02/source-sha256.json)
-changes only this parser and its sample/self-check coverage; workload inputs are
-unchanged. Its retained self-check passes 212 negative controls and two valid
-serial cases.
+The [checker correction](../../tools/run_io_soak.py) accepts either separator and requires
+exactly one literal zero summary. Missing, duplicate, malformed and nonzero summaries are
+rejected. The frozen oracle02 source manifest
+(`natemu-raw/io-load-repair-20261108-01/final-soak-oracle-02/source-sha256.json`) changes only
+this parser and its sample/self-check coverage; workload inputs are unchanged. Its retained
+self-check passes 212 negative controls and two valid serial cases.
 
-The [supplementary audit](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/strict-worker-rejudge-01/result.json)
-revalidates 21 actual worker logs from seven accepted pairs, all with zero
-untrustworthy metrics. For the prior safety primary/independent pairs, normal
-sampled profile and two completed counter diagnostics, the scope is strict
-worker-log validation only; it does not replace their historical whole-run
-oracles. For the two final natemu soak pairs, the full current guest judge also
-passes both phases offline. Original results, raw serial/exported-worker hashes
-and the new checker binding are preserved. The incomplete capped diagnostic
-remains failed and is not promoted by this audit. QEMU, the independent candidate
-and the reverse C3 control subsequently pass oracle02 directly.
+The supplementary audit
+(`natemu-raw/io-load-repair-20261108-01/strict-worker-rejudge-01/result.json`) revalidates 21
+actual worker logs from seven accepted pairs, all with zero untrustworthy metrics. For the prior
+safety primary/independent pairs, normal sampled profile and two completed counter diagnostics,
+the scope is strict worker-log validation only; it does not replace their historical whole-run
+oracles. For the two final natemu soak pairs, the full current guest judge also passes both
+phases offline. Original results, raw serial/exported-worker hashes and the new checker binding
+are preserved. The incomplete capped diagnostic remains failed and is not promoted by this
+audit. QEMU, the independent candidate and the reverse-order control subsequently pass oracle02
+directly.
 
 ## Additional native VM references — November 8 suggestion
 
@@ -1186,7 +1242,11 @@ selected profile exposes the required controls; pin its profile independently of
 the harness version and disable automatic profile drift. It is optional for this
 small matrix, not a reason to accept opaque defaults or install a large suite.
 
-## Bounded initial matrix
+## Bounded initial matrix (historical)
+
+Historical (November 8 planning; superseded by the measured sections above).
+Kept as the original tool-selection plan; the cases below were proposals, and
+the measured sections report what was actually run.
 
 Workload clients execute in the guest, including the CPU work; network servers
 run on the separately controlled peer. The following values
@@ -1310,7 +1370,10 @@ tests; fio/iperf success cannot substitute for them. Clean restart is not a
 power-loss or crash-consistency proof. Quarantine timings affected by a correctness
 failure rather than accepting a fast invalid result.
 
-## Next bounded step
+## Next bounded step (historical)
+
+Historical (November 8 planning; superseded by the measured sections above).
+The matrix was later authorized and run; see the measured results.
 
 After IO3/IO4 are runnable, pin binaries and existing zstd inputs; prepare exact
 job files and an endpoint/image manifest. First use one exploratory30-second pass

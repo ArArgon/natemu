@@ -2,7 +2,7 @@
 
 Status: **complete: 400 initial boots plus 42 follow-ups**. This is a bounded correctness campaign on
 `correctness` commit `8a2a6c4`, not a claim of exhaustive CPU coverage.
-Artifacts: `/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/`.
+Artifacts: `natemu-raw/public-cpu-ram-20261107-01/`.
 The [source survey](../research/notes/cpu-ram-test-suites.md) explains selection.
 
 **No new natemu CPU/RAM defect was confirmed.** Every one of the 442 attempts has
@@ -200,16 +200,16 @@ Independent agents reviewed test setup, suite-specific assertions, failure
 diagnoses and result integrity. The parent reviewed and reran the accounting
 checks. Public suite sources and emulator runtime code were not modified.
 
-- [400-boot final accounting](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/public-accounting-final.json)
-- [Original 422-attempt inventory](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/final-inventory.json)
-- [Final 442-attempt inventory](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/final-inventory-with-torture.json)
-- [16 IRQ locking and extended RCU/SRCU results](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/torture-audit-final.json)
-- [Prior 426-attempt inventory including GUP](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/final-inventory-with-gup.json)
-- [Four GUP-enabled COW retries](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/gup-cow-audit.json)
-- [16 fixture/ptrace follow-ups](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/public-supplemental-final.json)
-- [Six code-patching repetitions](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/crossmod-01/independent-results.txt)
-- [Ptrace wait-cycle diagnosis](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/ptrace-02/independent-diagnosis.txt)
-- [Kernel assertion and LKMM audit](/Users/liaozping/orca/natemu-raw/public-cpu-ram-20261107-01/independent/kernel-oracle.json)
+- 400-boot final accounting (`natemu-raw/public-cpu-ram-20261107-01/independent/public-accounting-final.json`)
+- Original 422-attempt inventory (`natemu-raw/public-cpu-ram-20261107-01/independent/final-inventory.json`)
+- Final 442-attempt inventory (`natemu-raw/public-cpu-ram-20261107-01/independent/final-inventory-with-torture.json`)
+- 16 IRQ locking and extended RCU/SRCU results (`natemu-raw/public-cpu-ram-20261107-01/independent/torture-audit-final.json`)
+- Prior 426-attempt inventory including GUP (`natemu-raw/public-cpu-ram-20261107-01/independent/final-inventory-with-gup.json`)
+- Four GUP-enabled COW retries (`natemu-raw/public-cpu-ram-20261107-01/independent/gup-cow-audit.json`)
+- 16 fixture/ptrace follow-ups (`natemu-raw/public-cpu-ram-20261107-01/independent/public-supplemental-final.json`)
+- Six code-patching repetitions (`natemu-raw/public-cpu-ram-20261107-01/crossmod-01/independent-results.txt`)
+- Ptrace wait-cycle diagnosis (`natemu-raw/public-cpu-ram-20261107-01/ptrace-02/independent-diagnosis.txt`)
+- Kernel assertion and LKMM audit (`natemu-raw/public-cpu-ram-20261107-01/independent/kernel-oracle.json`)
 
 The 42 follow-ups are `fixtures-01` (8), `layout-01` (4), `ptrace-02` (4),
 `crossmod-01` (6), `gup-cow-01` (4), and `torture-01` (16). `ptrace-01` was

@@ -541,7 +541,7 @@ requires the complete primary/replica campaign under its original budgets.
 ### Retained exact-input disposition — 09:43:36 UTC
 
 **ACCEPT for one same-RAM full recheck:** independently verified all 27 files
-of `/Users/liaozping/orca/natemu-raw/q33-code-oracle-03`, byte-identical to the
+of `natemu-raw/q33-code-oracle-03`, byte-identical to the
 reviewed candidate, including inventory SHA256
 `c117cf6ca030611f7926686b1000852d6a7804f83bbc5b9c1e0d16a1383779e9`.
 Use unchanged producer 04/runtime `q33-code-02` and supervisor 01 for new retained
@@ -734,7 +734,7 @@ Q33 resolution and no automatic extension beyond the original six VM slots.
 
 **ACCEPT producer 05 / oracle 04 / supervisor 01 for the remaining primary
 05(two CPUs), then 06(four CPUs), each followed by its full check.** All 49 sealed
-oracle 04 files at `/Users/liaozping/orca/natemu-raw/q33-code-oracle-04` were
+oracle 04 files at `natemu-raw/q33-code-oracle-04` were
 independently rehashed and compared byte-for-byte with the reviewed candidate;
 inventory `62c673259397b4efb0f3c161622641242c08451ec0529a462010bb58d90388cc`
 is unchanged. Producer 05's128-entry inventory and corrected source/budget were

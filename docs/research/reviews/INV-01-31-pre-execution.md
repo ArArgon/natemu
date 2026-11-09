@@ -295,7 +295,7 @@ Producer compile-only build 01 is superseded; final review must inspect build
 ### Build 02 retained-input check
 
 The reviewer independently verified all 77 inventory checksums in
-`/Users/liaozping/orca/natemu-raw/q31-faults-build-02`, its 18 passed build
+`natemu-raw/q31-faults-build-02`, its 18 passed build
 commands and six passed preparation checks. All inspected producer sources
 match that retained source directory. `guest.bin` is 1,179,648 bytes, within
 the 2 MiB reservation; the manifest is explicitly build-only and no VM host
@@ -323,7 +323,7 @@ guest semantics, and the documented Intel/Arm obligations do not establish
 this shim's composition. The proposed native experiment remains necessary for
 the explicitly scoped hand-block/metadata design on M4 with 2/4 vCPUs.
 
-Concrete retained inputs, all under `/Users/liaozping/orca/natemu-raw`:
+Concrete retained inputs, all under `natemu-raw`:
 
 - `q31-faults-build-02`: all 77 inventory checksums independently verified;
   18 build commands and six preparation checks passed. Reviewed `q31.c` SHA256
@@ -399,7 +399,7 @@ It does not itself establish that overlap will occur on hardware.
 **Accept build 03 in place of build 02**, with the unchanged oracle 01,
 supervisor 01, scope and campaign limits in the preceding verdict. The
 concrete producer directory is
-`/Users/liaozping/orca/natemu-raw/q31-faults-build-03`; `q31.c` SHA256 is
+`natemu-raw/q31-faults-build-03`; `q31.c` SHA256 is
 `ef41873a618e2457d07b638fae21f4b38e0d1ad64dfbac672afd763da5448a5e`.
 All 77 retained inventory checksums and inventory completeness were
 independently verified, along with 18 passed build commands, six passed
@@ -416,7 +416,7 @@ had started, and no native-concurrency or observed-result claim is made.
 
 `/root/track01_understanding_check`, 2026-09-07: **accept the independent
 replica preparation** at
-`/Users/liaozping/orca/natemu-raw/q31-faults-replica-prep-01` for the already
+`natemu-raw/q31-faults-replica-prep-01` for the already
 reviewed separate replication method. The preparing agent is
 `/root/q31_independent_replication`, whose retained context states that it
 neither authored producer/oracle/supervisor changes nor supplied primary-run

@@ -2205,7 +2205,7 @@ retained checksums, equality of frozen sources with the workspace and exact
 correspondence of the44-byte FEX body to producer `outputs/002.native[12:56]`.
 It independently rechecked all14 result JSONs. Root rechecked the final manifest,
 source equality and all checksums. Producing files are under
-`/Users/liaozping/orca/natemu-raw/i1-independent-20261025-01`; earlier developmental
+`natemu-raw/i1-independent-20261025-01`; earlier developmental
 run `i1-development-20261025-01` is retained separately. Frozen Track01 files were
 reused unchanged, not edited.
 
@@ -4390,2977 +4390,1508 @@ installer difference remains unexplained; this experiment does not attribute it.
 
 ## I/O scope and Rust reuse review — November 7, 2026
 
-**Authors/context:** `/root` authored `docs/restructure/io-plan.md` and the
-networking additions to `io-rust-reuse.md`; `/root/rust_io_research` authored its
-queue/transport/block survey. Independent `/root/io_scope_review` inspected both
-in a separate read-only context, following its initial current-code scope review.
-The owner selected persistent disk plus basic networking, with full device/network
-requirements retained as later coverage. No implementation or execution occurred.
+**Verdict: accepted for the source-only evaluation direction; no substantive blocker.** An
+independent reviewer inspected the I/O plan and the Rust-reuse survey in a separate read-only
+context, checked the current device, RAM-write, interrupt and teardown interfaces, and
+independently verified the cited upstream paths (block parsing assumes dedicated
+header/data/status descriptors; the optional stdio executor touches guest memory during I/O,
+uses fsync and a Linux-only utility; MMIO defaults need notification and lifecycle
+integration; libkrun keeps worker guest-memory access and declines reset on non-Windows;
+vmnet needs an entitlement or elevation). Upstream observations are moving or archived
+source, not a pinned build. The owner chose persistent disk plus basic networking, with the
+full device and network requirements kept as later coverage.
 
-**Evidence validity: accepted for the source-only evaluation direction.** The
-review checked current device, RAM-write, IRQ and teardown interfaces and the
-accepted device/memory contracts. It independently verified cited upstream paths:
-block parsing assumes dedicated header/data/status descriptors; the optional
-stdio executor accesses guest memory during I/O, uses fsync and imports a
-Linux-only utility; MMIO defaults need notification/lifecycle integration;
-libkrun retains worker guest-memory access and declines reset on non-Windows;
-vmnet documents entitlement/elevation and macOS26 requirements. The survey
-explicitly separates moving/archived source observations from a pinned build.
-No macOS build, platform admission, integration or performance result is claimed.
+**Decision:** evaluate rust-vmm queue reuse and the memory adapter before writing a new queue;
+assess transport helpers separately; random-number device, then block, then network. Keep
+truthful flush behavior and teardown from the first writable-disk slice, installed-root
+admission, and independent concurrency tests. The review's clarification that worker and
+capability containment must precede external network exposure was incorporated as an
+existing requirement made explicit.
 
-**Decision relevance: accepted, no substantive blocker.** Evaluate rust-vmm
-queue reuse and the memory adapter before authoring a new queue implementation;
-retain device profiles and assess transport helpers separately. RNG then block
-then network is an appropriate sequence. Preserve truthful flush behavior and
-teardown from the first writable-disk slice, actual installed-root admission,
-and independent concurrency/coherence tests. Basic network success does not
-complete the full IPv4/IPv6/ICMP contract. The network backend and a host-library
-dependency-policy change remain explicit choices rather than silently adopted.
-
-**Return disposition:** incorporated the review's clarification that IO4 must
-establish worker/capability containment before external network exposure. This
-makes an existing requirement explicit; it adds no experiment or approval gate.
-The bounded planning/source pass stops here. Follow-on execution budgets and
-independent implementation acceptance belong to the selected executable slice.
+**Not established:** no macOS build, platform admission, integration or performance result;
+basic network success does not complete the full IPv4/IPv6/ICMP contract; the network backend
+and any host-library dependency change remain explicit owner choices.
 
 ## IO0 queue/transport assessment review — November 7, 2026
 
-**Authors/context:** `/root` authored the isolated probe and
-[evaluation](../../restructure/io0-rust-vmm-evaluation.md);
-`/root/rust_io_research` authored the
-[broader assessment](../../restructure/rust-vmm-assessment.md).
-Independent `/root/io_scope_review` reviewed upstream source, the harness and
-both sets of claims, then performed one copied-source, fresh-target offline
-rebuild. The owner authorized this exploratory queue/transport evaluation;
-broader adoption and possible contributions remain assessment only.
+**Verdict: accepted for exploratory API observations and for a selective-reuse
+investigation; no correction required.** An independent reviewer read the upstream source,
+the probe harness and both write-ups, then did one copied-source, fresh-target offline
+rebuild. The pinned upstream is clean, source checksums match, and the replica probe is
+identical to the author's successful attempt. All 16 probe cases pass in both runs; several
+deliberately reproduce unsuitable upstream behavior. One author attempt failed on an import
+path and is retained. The reviewer's preparation script was sent before running but inspected
+by the main session only afterward, so this is exploratory replication, not
+pre-execution-reviewed decision evidence.
 
-**Evidence validity: accepted for exploratory API observations.** The pinned
-upstream is clean, original source checksums match, and the replica probe is
-identical to the successful author attempt. All 16 cases pass in both runs;
-several deliberately reproduce unsuitable upstream behavior. Four total
-build/test invocations include the retained author import-path failure.
-Source/build retention is about 225 MiB within the 1 GiB bound. The reviewer
-sent its preparation script before running, but root inspected it only afterward:
-this is exploratory replication, not pre-execution-reviewed decision evidence.
-The [retained independent report](/Users/liaozping/orca/natemu-raw/rust-vmm-io0-20261107-01/replica-io-scope-review-01/review.md)
-links source identity, logs and outcome. No substantive correction was required.
+**Findings:** queue primitives are a plausible reuse point given explicit chain and feature
+checks, owned snapshots and pre-validated completion publication. Generic MMIO handling needs
+queue-disable, register-validation, feature-policy and interrupt integration. Suppression
+behavior is an efficiency or contract-selection matter, not automatically a spec violation.
+The broader assessment supports keeping natemu's execution and coherence engine, hypervisor
+ownership and current chipset; no migration payoff or upstream acceptance is asserted.
 
-**Decision relevance: accepted for selective reuse investigation.** Queue
-primitives are a plausible reuse point with explicit chain/feature checks,
-owned snapshots and prevalidated completion publication. Generic MMIO handling
-requires queue-disable, register-validation, feature-policy and IRQ integration.
-Suppression behavior is an efficiency/selected-contract concern, not automatically
-a mandatory-spec violation. The broader review supports retaining natemu's
-execution/coherence engine, HVF ownership and current chipset; no migration payoff
-or upstream maintainer acceptance is asserted.
+**Not established:** private synthetic RAM and callback fixtures do not show resident
+exclusion, concurrent coherence, reset or drain, backend containment or a security boundary.
+No VM, real disk or network workload, performance test or production dependency change
+occurred; the concrete completion contract stayed open.
 
-**Limits/return:** private synthetic RAM and callback fixtures do not establish
-resident exclusion, concurrent coherence, reset/drain, backend containment or a
-security boundary. No VM, real disk/network workload, performance test or
-production dependency change occurred. IO0's concrete completion contract remains
-open. Findings and review qualifications are incorporated in the evaluation;
-no additional execution is needed for the requested assessment.
+Evaluation and assessment: [rust-vmm reuse](../../restructure/rust-vmm-reuse.md). Retained review: `natemu-raw/rust-vmm-io0-20261107-01/replica-io-scope-review-01/review.md`.
 
 ## Copy-first virtio plan review — November 8, 2026
 
-Owner request: digest the I/O discussion, record notes and plan persistent disk
-plus basic networking with native features, current-runtime compatibility and
-future direct-payload options. Root consolidated [the plan](../../restructure/io-plan.md),
-with independent read-only reviews by `/root/io_scope_review` (runtime/concurrency)
-and `/root/rust_io_research` (native backends). Both accept the corrected plan
-as an implementation direction, not integrated correctness evidence.
+**Verdict: the corrected plan is accepted as an implementation direction, not as integrated
+correctness evidence.** Two independent read-only reviews (runtime/concurrency and native
+backends) covered the consolidated [plan](../../restructure/io-plan.md) for persistent disk
+plus basic networking.
 
-Corrections incorporated: immutable ring snapshots and separate readable-stream
-capture include device headers; parsing/host waits stay outside RAM windows;
-queue and slot bounds preserve accepted profiles; MMIO lifecycle gains a proposed
-completed/deferred/refused result with progress-capable safe recovery and ordered
-readback; IRQ publication serializes with ACK; S5 drains before existing teardown.
-The spec's QueueReady last-written/readback rule excludes a synthetic busy value.
-Native review retains vmnet entitlement/worker admission and callback retirement
-as gates, and checksum/GSO header/size constraints as later work. The proposed
-vmnet choice does not silently replace the accepted libslirp contract.
+**Corrections incorporated:** immutable ring snapshots and separate readable-stream capture
+include device headers; parsing and host waits stay outside RAM windows; queue and slot
+bounds preserve the accepted profiles; MMIO lifecycle gains a completed/deferred/refused
+result with progress-capable recovery and ordered readback; interrupt publication serializes
+with acknowledgement; shutdown drains before existing teardown. The spec's rule that
+QueueReady reads back the last written value excludes a synthetic busy value. The native
+review keeps vmnet entitlement and worker admission, and callback retirement, as gates;
+checksum/segmentation-offload header constraints are later work; the vmnet choice does not
+silently replace the accepted libslirp contract.
 
-No code/dependency changes, builds, VM runs or disk/network operations occurred.
-Concrete ABI/participant/budget mapping is the next proposed IO0 assignment;
-finite adversarial execution belongs to IO1 after implementation authorization.
-The suggested segment-helper discrepancy deferral remains distinct from formal
-acceptance or an ISA fix, and is not a new I/O milestone blocker.
+**Not established:** no code, dependency, build, VM or disk/network operation occurred. The
+suggested segment-helper discrepancy deferral stays distinct from formal acceptance or an ISA
+fix and is not a new I/O blocker.
 
 ## I/O window and checked queue foundation — November 8, 2026
 
-Owner authorized local implementation in natemu and the supplied rust-vmm
-checkout. Authors: `/root/io_window_author` (ABI/coordinator/resident),
-`/root/rust_io_research` (checked queue and live driver/runner). Independent
-reviewer `/root/io_scope_review` inspected the actual source, tests, lifecycle
-and retained execution, and performed fresh builds/replays. Root integrated
-the work and resolved review feedback without changing the authors' algorithms.
+**Verdict: accepted within the development scope as the runnable foundation for continued
+virtio integration; no unresolved substantive blocker.** An independent reviewer inspected
+source, tests, lifecycle and retained execution, rebuilt host and resident code in a fresh
+offline target, passed the stack/gateway audit, and repeated the four-vCPU native check
+successfully. Checked queue tests pass (existing, new public-API cases and doctests) in both
+author and fresh replica; coordinator host tests pass, with synthetic acknowledgements
+qualifying only host protocol and error handling. Native checks at one, two and four vCPUs
+cross locked operations over 64 designated snapshots with per-vCPU progress, ordered overlap,
+patched-code visibility and clean teardown. No retry or VM failure occurred.
 
-**Evidence validity: accepted within the development scope.** Queue tests pass
-56 existing, ten new public-API cases and four doctests in both author and fresh
-offline replica. Seven coordinator host tests pass; synthetic acknowledgements
-qualify host protocol/error handling only. Retained-source native checks pass at
-N=1/2/4, each with 64 designated snapshots while crossing-16/cacheline locked
-operations execute, per-vCPU progress, ordered overlap, previously executed code
-patch visibility and clean teardown. The reviewer independently rebuilt host and
-resident, passed the stack/gateway audit, and repeated N=4 successfully. Its
-[retained review](/Users/liaozping/orca/natemu-raw/io1-20261108-01/windows-replica-01/review.md)
-links commands, hashes, outputs and limitations. The author runner's region-size
-notation was corrected before any VM execution; both versions are retained.
+**Corrections raised and incorporated:** the polling deadline cannot bound native doorbell
+scheduling (documentation now distinguishes them); a 256-descriptor network chain needs more
+than 256 spans once ring bookkeeping counts, so the bound is 512 spans / 256 KiB. The author
+runner's region-size notation was corrected before any VM execution; both versions are
+retained. Each resident flushes before guest reentry, and the host release does not claim all
+flushes finished. Paused residents still consume the native-run watchdog budget.
 
-**Decision relevance: accept the runnable foundation for continued virtio
-integration.** No unresolved substantive blocker in this scope. Review raised
-two corrections: the polling deadline cannot bound native doorbell scheduling,
-and a 256-descriptor net chain needs more than 256 spans once ring bookkeeping
-is included. Documentation now distinguishes the deadline, and the bound is
-512 spans / 256 KiB. Each resident flushes before guest reentry; the host release
-does not claim all flushes have finished. Paused residents still consume the
-native-run watchdog budget. Author/reviewer source ownership stayed separate.
+**Not established:** these are exploratory development results, not performance or
+architecture acceptance. Deferred MMIO, asynchronous device ownership, queue incarnation,
+interrupt, reset and shutdown integration and real backends were still unimplemented; native
+HLT/application-processor, high-RAM, page-table-alias and timeout interleavings are not
+covered by the live fixture. The wider queue evaluation and Track03 stayed open.
 
-Queue checks used two of six invocations; live checks used four of 24 launches,
-with no retry or VM failure. These are development/exploratory results, not a
-performance or architecture acceptance campaign. Deferred MMIO, asynchronous
-device ownership, queue incarnation/IRQ/reset/shutdown integration and real
-backends remain unimplemented. Native HLT/AP, high RAM, PTE aliases and timeout
-interleavings are not established by the live fixture. The next assignment is
-the common asynchronous completion path followed by virtio-rng; IO1 and Track03
-remain open.
-
+Retained review: `natemu-raw/io1-20261108-01/windows-replica-01/review.md`.
 
 ## Virtio-rng Linux integration — November 8, 2026
 
-Authors: `/root/rust_io_research` implemented checked snapshot traversal and the
-virtio-MMIO RNG owner; `/root/io_window_author` implemented deferred MMIO and
-cancelable RAM-window admission and authored the guest runner; root integrated
-Boot/ACPI/CLI and shutdown ordering. Independent `/root/io_scope_review` reviewed
-source, the runner/oracles and retained results. `/root/io_window_author` made a
-fresh-target retained-source N=4 rebuild/replay, independent of the RNG/Boot
-authors but not of its own RAM-window/deferred implementation or guest oracle.
-That distinction limits the independence claim; the earlier window replication
-and this separate source/method review remain applicable.
+**Verdict: accepted for the finite development baseline; real random-number-device
+integration is the baseline for block and network work.** An independent reviewer examined
+source, the guest runner and oracles and retained results. A fresh-target, retained-source
+four-vCPU rebuild and replay was made by the author of the RAM-window and deferred-MMIO code,
+who is independent of the random-device and boot authors but not of the window implementation
+or the guest oracle; that limits the independence claim, and the earlier window replication
+plus this separate source review remain applicable.
 
-**Evidence validity: accepted for the finite development baseline.** Retained
-`natemu-raw/io2-rng-20261108-01/build-02` contains natemu and sibling rust-vmm
-sources and produces the tested binaries. Host tests pass 154 with two ignored;
-resident build and stack/gateway audit pass. ACPICA checks N=1..4 include the
-existing DSDT roundtrip plus an independently compiled symbolic RNG Device AML
-comparison. The latter checks resource encoding; guest discovery is checked
-separately. Earlier missing cpu_profile.json test input and unsuitable DSL-token
-oracle failures remain retained in build-01; they were corrected before live
-execution rather than excluded from the record.
+**Scope reviewed:** host tests, resident build and stack/gateway audit pass; ACPICA checks
+for one to four vCPUs include the existing DSDT roundtrip and an independently compiled
+symbolic AML comparison of the device resource encoding (guest discovery checked separately).
+The unchanged Debian 6.12.107 kernel with static BusyBox finds the device through normal ACPI,
+binds the driver, reads four distinct nonzero 4096-byte payloads across unbind/rebind,
+observes delivered interrupts and exits through normal poweroff, at one, two and (fresh
+replica) four vCPUs, without retries or timeouts.
 
-Author Linux runs N=1/2 and the fresh-target replica N=4 all pass without retries
-or timeout. The unchanged Debian 6.12.107 kernel/modules and static BusyBox use
-normal ACPI discovery, find the expected MMIO resource and virtio-rng binding,
-read four distinct nonzero 4096-byte payloads across platform unbind/rebind,
-observe delivered GSI18 interrupts, and exit through normal S5 poweroff. The
-runner checks CPU/kernel identity, exact markers, payload lengths/hashes, binding,
-interrupt counts, kernel diagnostics and host return status; negative parser
-controls and shell syntax checks pass. Sources, input/artifact hashes, commands,
-full logs and outcomes are retained in `linux-01` and `replica-01`; the replica
-records 715 unchanged source inputs and its new build targets. Three of twelve
-120-second VM launches are used, with approximately 543 MiB of the 4 GiB storage
-bound consumed. Runtime durations are diagnostic, not performance measurements.
+**Failures and corrections kept:** a missing cpu_profile.json test input and an unsuitable
+DSL-token oracle failed in the first build; both were fixed before live execution and remain
+retained rather than excluded. Source review raised no unresolved blocker; corrections made
+before execution: completion-time suppression reads, ready/status-gated rescheduling, queue
+geometry preserved on disable, and admission closed before a vCPU is marked ended.
 
-**Decision relevance: accept real RNG integration as the baseline for block and
-network work.** Source review found no unresolved blocker in deferred access
-identity/recovery, permit cancellation versus grant, copied queue parsing,
-ordered completion publication, serialized IRQ/ACK, feature/geometry validation
-or owner join before VM destruction. Corrections incorporated before execution
-include completion-time suppression reads, ready/status-gated rescheduling,
-queue geometry preservation on disable, and closing admission before a vCPU is
-marked ended. Checked rust-vmm traversal is now a production snapshot consumer.
+**Not established:** unbind/rebind does not prove an adversarial reset at every
+grant/backend/interrupt phase; payload differences do not show entropy quality; no
+high-RAM or alias, native timeout race, persistent disk, packet delivery, durability, new
+shutdown drain or performance result. This baseline predates the power-wait/quiesce change.
 
-**Limits/return:** unbind/rebind exercises the Linux lifecycle but does not prove
-an adversarial reset arriving at every grant/backend/IRQ phase. Neither payload
-hash differences nor successful reads establish entropy quality. These runs do
-not establish high-RAM/PTE-alias behavior, native timeout races, persistent disk,
-packet delivery, durability, new S5 drain behavior, native backend containment or
-I/O performance. The first RNG baseline uses the then-current immediate S5 stop;
-the subsequently edited power-wait/quiesce path is not covered by these results.
-Full IO1 lifecycle coverage and the persistent disk/network/combined goal remain
-open. Next: ordered block backend and durability with progress-capable S5 drain,
-followed by basic networking and combined acceptance.
-
+Retained campaign: `natemu-raw/io2-rng-20261108-01` (`build-02`, `linux-01`, `replica-01`).
 
 ## Block and S5 source review before live IO3 — November 8, 2026
 
-Author `/root` implemented shared Virtio transport, the ordered raw-file lane,
-block stream parser, Boot/CLI wiring and S5 control wait. Independent reviewer
-`/root/io_scope_review` inspected those implementations and the subsequently
-added lifecycle tests and `tools/run_l4b.py` assertions. No production code was
-changed by the reviewer, and no reviewer build, VM or disk experiment was run.
+**Verdict: source design and finite unit-test coverage accepted; no unresolved source blocker
+to bounded live block validation.** An independent reviewer inspected the shared virtio
+transport, ordered raw-file lane, block stream parser, boot/CLI wiring, shutdown (S5) control
+wait, lifecycle tests and runner assertions. The reviewer changed no production code and ran no
+build, VM or disk experiment.
 
-**Evidence validity: source design and finite unit-test coverage accepted.** The
-review covers arbitrary descriptor splits of the logical header/data/status
-streams, selected segment/request limits, validated completion spans and
-conservative used-prefix lengths; immutable OUT snapshots, failed IN discard,
-positive-short suffix progression and no automatic EINTR replay; serialized
-reset/grant/IRQ state; and a single native lane retaining only its owned file
-and buffers on fatal abandonment. S5 closes dequeue admission while preserving
-the active request, then runs final full-sync and joins the idle lane before
-publishing drained with IRQ cleanup under the state lock. The requesting port
-instruction, or one REP element, commits before entering a nonreturning resident
-wait that acknowledges RAM windows. Host polls do not wait on native I/O.
+**Reviewed:** arbitrary descriptor splits of the header/data/status streams, segment and
+request limits, validated completion spans, conservative used lengths; immutable outgoing
+snapshots, discarded failed reads, positive-short progression and no automatic EINTR replay;
+serialized reset, grant and interrupt state; one native lane retaining only its owned file and
+buffers on fatal abandonment. Shutdown closes dequeue admission while preserving the active
+request, then final full-sync and joins the idle lane before publishing drained. Requested
+tests were added for quiesce versus later reset/notify, final-sync success and failure, and
+cancellation while the worker is blocked; these are host simulations, not induced native
+filesystem hangs. The reviewer checked the macOS 26.4 SDK headers and man page: F_FULLFSYNC
+exists as called, pread/pwrite match the lane, and the call is fsync plus drive flush that can
+take a long time and is documented for APFS. This supports the API choice and the need for
+containment; it does not establish every backing mount or physical power loss, and no weaker
+sync fallback is used on failure.
 
-Review requested and the author added tests for quiesce versus later reset/notify,
-final-sync success/failure and cancellation while the worker is blocked. The
-worker seam runs the same production channel/execute loop with test-only Calls
-implementations; release and destructor observations verify retained ownership
-and that an abandoned result cannot block eventual retirement. These are host
-simulations, not induced native filesystem hangs or full resident concurrency
-proofs. Retained `natemu-raw/io3-block-20261108-01/build-01/step-0.log` reports
-163 passing host tests and two ignored, including fifteen virtio tests. The new
-L4b scalar S5 oracle checks RIP after OUT; the REP OUTSW oracle checks RIP stays
-on the instruction with RCX=1 and RSI advanced two bytes. Their source matches
-the fixture's three-byte REP OUTSW encoding; live outcomes remain pending.
+**Caveats:** a fatal timeout may leave only file/buffer storage in a detached lane until the
+per-VM process ends (embedders must treat it as worker-fatal and not retry indefinitely).
+The author corrected return-lifetime documentation and placed drained publication after
+interrupt cleanup. New scalar and repeated-OUT shutdown oracles had no live outcome yet.
+Installed-root boot/write/relaunch, actual full-sync outcomes and combined regressions were
+still required; this does not accept block completion, networking, performance or the plan.
 
-The reviewer independently checked the current macOS 26.4 SDK selected by
-`xcrun --show-sdk-path`: `usr/include/sys/fcntl.h:259` defines F_FULLFSYNC=51,
-matching the native call, and line 605 declares the variadic fcntl signature.
-`usr/include/unistd.h:587,589` declares pread/pwrite with the positioned offsets
-used by the lane. The bundled `usr/share/man/man2/fcntl.2` F_FULLFSYNC entry says
-it performs fsync followed by the drive flush, ignores the argument, and can take
-a long time; it lists APFS support. This supports the selected API/ABI and the
-need for containment. It does not establish support on every backing mount or
-physical power-loss behavior. No weaker sync fallback is used on failure.
-
-**Decision relevance: no unresolved source blocker to bounded live IO3
-validation.** The normal CLI is the per-VM process boundary. A fatal timeout may
-leave only file/buffer storage in a detached native lane until it returns or that
-process terminates; no guest-memory authority survives. Embedders must treat it
-as worker-process fatal, not retry indefinitely while accumulating lanes. The
-author corrected the return-lifetime documentation and placed drained publication
-after IRQ cleanup. Installed-root boot/write/shutdown/relaunch, actual full-sync
-outcomes, live power-instruction commits and combined RNG/block regressions are
-still required. This review does not accept IO3 completion, network capability,
-performance or the full copy-first plan.
-
+Retained build log: `natemu-raw/io3-block-20261108-01/build-01/step-0.log`.
 
 ## IO3 installed-root independent replay — November 8, 2026
 
-Independent `/root/io_scope_review` verified and copied the producing
-`io3-block-20261108-01/build-01` natemu/rust-vmm inputs, retained the original
-oracle files, then overlaid the separately reviewed frozen `oracle-01` runner
-with recorded hashes. All 905 final source inputs remained unchanged. It built
-into a fresh target, using offline locked Rust 1.97.0 on macOS 26.6.2/SDK 26.4:
-163 host library tests pass (two ignored), the ordinary CLI built alone without
-`testing`, resident build/signing and stack/gateway audit pass, and the runner
-self-check passes. An initial wrong-package `--lib` invocation failed before
-compilation and remains retained; correcting the command was the only retry.
+**Verdict: accepted for installed-root persistence at the tested one, two and four vCPU
+baseline, with fresh four-vCPU reproduction; not full block completion.** An independent
+reviewer, independent of both the block/shutdown authors and the fixture authors, verified and
+copied the producing inputs (905 source inputs unchanged), overlaid the separately reviewed
+frozen oracle runner, and built in a fresh target with offline locked Rust. Host tests, an
+ordinary CLI build without the testing feature, resident build and signing, stack/gateway
+audit and the runner self-check pass. An initial wrong-package `--lib` command failed before
+compiling; correcting it was the only retry and is retained.
 
-**Evidence validity: accepted for the finite development baseline.** Exactly
-two new N4 processes run the installed ext4-root write/shutdown and read-only
-relaunch checks, with no VM retries or timeouts. Both exit normally through S5;
-file data, partial overwrite, receipt, rename/deletion and offline e2fsck checks
-pass. The fresh read-only boot leaves the entire post-write image hash unchanged.
-It also reads entropy, and its log shows delivered block and RNG interrupts.
-Producing inputs, commands, binaries, full logs and results are retained in
-`io3-block-20261108-01/replica-01`; the
-[reviewer report](/Users/liaozping/orca/natemu-raw/io3-block-20261108-01/replica-01/review.md)
-records hashes, qualifications and the retained setup failure. The reviewer is
-independent of both production block/S5 and fixture authors; the execution uses
-the same separately source-reviewed guest oracle. Together with the six author
-Linux launches, this uses eight of twelve; four of eight port checks were
-reported by root. Retained IO3 storage is approximately 770 MiB of 4 GiB.
+**Result:** two new four-vCPU runs of the installed ext4-root write/shutdown and read-only
+relaunch both exit normally through S5 without retries or timeouts; file data, partial
+overwrite, receipt, rename/deletion and offline e2fsck pass, and the read-only boot leaves the
+post-write image hash unchanged while reading entropy and showing delivered block and random
+interrupts. Four of eight port checks were reported by the main session.
 
-**Decision relevance: accept installed-root persistence at the tested N=1/2/4
-baseline, with fresh N4 reproduction.** This is a meaningful disk/RNG capability
-increment, not full IO3 or plan completion. Guest sync/remount before poweroff
-does not force S5 while native I/O remains outstanding. Deterministic active-job
-reset/quiesce/error publication, broader IO1 alias/participant/IRQ cases,
-networking, concurrent combined acceptance and matched performance work remain
-open. Actual successful full-sync is supported by the executed native return
-path; physical power loss and every backing filesystem/hardware combination are
-not established. No additional execution is needed to repeat this same baseline.
+**Not established:** guest sync/remount before poweroff does not force shutdown while native
+I/O is outstanding; deterministic active-job reset/quiesce/error publication, broader
+alias/participant/interrupt cases, networking, combined acceptance and matched performance
+remain open; physical power loss and every backing filesystem are not shown. No repeat of this
+baseline is needed.
 
+Retained review: `natemu-raw/io3-block-20261108-01/replica-01/review.md`.
 
 ## Deterministic block lifecycle source and oracle review — November 8, 2026
 
-Authors: `/root` implemented the testing-only native-call seam and driver
-integration; `/root/io_window_author` authored `tools/run_virtio_lifecycle.py`.
-Independent `/root/io_scope_review` inspected both and the corrected oracle.
-The reviewer changed no production or fixture code and ran no VM for this review.
-The frozen-source build is being retained under
-`natemu-raw/io3-lifecycle-20261108-01`; the development bound is sixteen VM
-launches, 120 seconds each, and 1 GiB retained. No lifecycle VM had run at this
-source-review return.
+**Verdict: source and method accepted for the first bounded live lifecycle run; no unresolved
+blocker.** An independent reviewer inspected the testing-only native-call seam, driver
+integration and the corrected oracle runner; no production or fixture change and no VM was run
+by the reviewer. The seam wraps the same production disk lane (it may hold before a call, cap
+one call, or inject the next error) without supplying guest completions or bypassing parsing,
+queue state, RAM windows, interrupt logic or shutdown drain.
 
-**Evidence validity: source and method accepted for the first bounded run.**
-The ordinary CLI has no testing feature. The driver installs a finite Calls
-wrapper in the same production disk lane: real positioned reads/writes execute
-on its owned File/private buffers; the wrapper may hold before a call, cap the
-first actual call to 256 bytes, or inject the next EIO without issuing another
-native call. It neither supplies guest completions nor bypasses parsing, queue
-state, CopyPermit, RAM windows, IRQ logic or S5 drain. Reset/disable release the
-barrier only after the actual control operation has closed its incarnation and
-become deferred. Power release follows the real REQUEST_POWER_POLL, after the
-resident commits OUT or one REP element. The metadata fixture port only reports
-backend-entry state. Trace locking has no wait on guest/backend progress;
-only the backend's bounded condition-variable hold waits. The driver stops and
-joins device owners before VM teardown and reads final state/RAM only afterward.
+**Scope:** nine guests covering reset and queue-disable during accepted work, scalar and
+repeated-OUT shutdown, failed final sync, partial read/write errors, an out-of-RAM descriptor
+suffix, and all 128 descriptors occupied by 64 flush chains (a full descriptor table, not index
+wrap). Expected file contents and the complete declared RAM image are built before execution;
+oracles check disk and RAM effects, register progress, status and used entries, interrupt
+acknowledgement, trace order and clean teardown.
 
-The nine guests cover reset and QueueReady disable during accepted backend work
-with fresh-queue recovery; scalar and REP S5 with an accepted OUT; failed final
-sync; partial IN/OUT error propagation and recovery; an out-of-RAM descriptor
-suffix followed by reset/recovery; and all 128 descriptors occupied by 64 FLUSH
-chains. The last is a full descriptor table, not 128 available heads or index
-wrap. Expected file contents and the complete 128 KiB declared RAM image are
-constructed before execution. Guest code uses ordinary virtio MMIO and port I/O;
-no reply tampering is enabled. Oracles check exact disk/RAM effects, architectural
-RIP/register progress, status/used entries, interrupt-status ACK behavior, trace
-ordering/counts, bounded schedules, process outcome and clean teardown.
+**Blocker raised and closed:** the failed-sync branch initially skipped the RAM comparison. The
+driver now emits bounded post-VM RAM records even on errors and every case compares its full
+image; missing, duplicate or corrupt records are rejected. The reviewer checked the author's
+negative-control logic but does not count those self-checks as live evidence.
 
-Review found that the failed-sync branch initially skipped RAM comparison.
-The corrected driver emits bounded post-VM `io-memory` records even on errors,
-with a 4 MiB aggregate admission limit; every case now compares its complete
-expected RAM image. Missing/duplicate/corrupt records are rejected. The FLUSH-only
-case correctly expects no positioned-call entry and disables/readbacks the queue
-before its final ACK to avoid racing the last IRQ offer. The author reports nine
-guests assemble and 77 negative oracle controls pass; this source review checks
-the control logic but does not independently promote those self-checks into live
-evidence. The runner retains commands, source/artifact hashes, inputs, logs and
-results, refuses output-directory reuse, serializes VMs under the shared lock,
-stops on the first failure and does not retry cases.
+**Interpretation notes:** the trace's call count counts wrapper attempts (an injected error
+makes no syscall); "backend held" is a pre-syscall barrier, not a suspended kernel call.
 
-**Decision relevance: no unresolved source/oracle blocker to the first live
-lifecycle development run.** The trace's `calls` counts positioned-call wrapper
-attempts, including an injected error that makes no syscall; sync calls have
-separate events. `backend-held` is a pre-syscall barrier, not a suspended kernel
-call. `commit` records completed RAM/used publication before IRQ offer and owner
-retirement. These distinctions are required when interpreting results.
+**Not established:** one vCPU only with polled interrupt status; reset is forced during backend
+work, not during a pending-copy closing window; injected errors test propagation, not macOS
+failure atomicity or real stalled kernel calls; no multi-vCPU reset or power peers, high-RAM or
+alias, old compiler replies, descriptor-mutation races, network or performance.
 
-**Limits/return:** N=1 only; IF=0 polls interrupt status and ACK, rather than
-establishing delivered guest IRQ races. Reset is forced during backend work,
-not during a pending CopyPermit closing window. Injected errors validate their
-propagation, not macOS failure atomicity or actual stalled-kernel containment.
-No SMP reset/power peers, high-RAM/PTE aliases, old compiler replies, descriptor
-mutation races, networking or performance are established. Actual live outcomes
-and independent reproduction remain pending; full IO1/IO3 and combined acceptance
-remain open.
-
+Retained campaign: `natemu-raw/io3-lifecycle-20261108-01`.
 
 ## Deterministic lifecycle findings and independent replay — November 8, 2026
 
-All nine authored N1 cases pass on their first live run under
-`io3-lifecycle-20261108-01/live-01`. Independent reviewer
-`/root/io_scope_review` verified the retained producing source manifest, copied
-natemu/rust-vmm into a new replica, and built the testing host driver and resident
-into a fresh target with offline locked Rust 1.97.0. Signing, stack/gateway audit
-and the nine-guest/77-negative-control self-check pass. Sources remain unchanged;
-no build or VM retry was needed. The ordinary CLI build without this test feature
-was qualified separately by the installed-root baseline.
+**Verdict: accepted for the finite one-vCPU lifecycle development cases.** All nine authored
+cases passed on their first live run. An independent reviewer verified the producing source
+manifest, copied the sources, built the testing driver and resident in a fresh offline target
+(signing, stack/gateway audit and the nine-guest self-check pass; no retry), and repeated the
+reset, repeated-OUT shutdown, failed final sync and failed read cases successfully. Each
+compares the full declared RAM image and the file, including the intentionally failed
+shutdown. The failed-sync case exits 1 rather than reporting clean power-off; all cases tear
+down cleanly without timeout. The guest oracle is shared with the author run and was
+separately source reviewed.
 
-**Evidence validity: accepted for the finite N1 lifecycle development cases.**
-The independent run repeats reset, REP power, failed final sync and failed IN,
-all successfully. Each compares the full declared 128 KiB RAM image and 2 MiB
-file, including the intentionally failed shutdown. Retained final records also
-confirm old reset status remains 0xa5 with old used index zero, REP RCX=1/RSI+2
-with RIP still at the instruction, and failed IN's IOERR/zero used-prefix length.
-The final-sync failure exits 1 rather than reporting normal power success; all
-four cases join/destroy their vCPU and VM cleanly, without timeout. Trace orders
-match the reviewed barriers and production effect sequence. The
-[retained independent report](/Users/liaozping/orca/natemu-raw/io3-lifecycle-20261108-01/replica-01/review.md)
-links producing inputs, script, command logs, hashes and detailed qualifications.
-The guest oracle is shared with the author run and was separately source reviewed.
+**What this shows:** a stale backend result is suppressed across full reset; accepted writes
+drain through shutdown after one repeated-OUT element; failed final sync does not look like a
+clean shutdown; a failed staged read publishes an error with no partial payload.
 
-**Decision relevance: accept this finite lifecycle/error increment for continued
-integration.** A stale backend result is suppressed across full reset; accepted
-OUT work drains through S5 after one REP element; failed final sync does not
-masquerade as clean shutdown; and failed staged IN publishes truthful error
-status without partial payload. The author's other cases additionally cover
-queue disable/recovery, scalar S5, partial OUT recovery/flush, malformed-range
-recovery and 64 FLUSH chains filling all 128 descriptors. These are development
-results, not performance or universal durability evidence. Thirteen of sixteen
-launches are used; retained storage is approximately 377 MiB of 1 GiB.
+**Not established:** the earlier limits stand (one vCPU, polled interrupts, pre-syscall
+barriers, injected errors; no reset during a pending copy, stalled kernel calls, multi-vCPU
+races, delivered interrupt races, pending compiler replies, network or combined load). These
+are development results, not performance or universal durability evidence; no repeat needed.
 
-The preceding source-review limits remain: N1 and polled IRQ status; pre-syscall
-barriers and injected errors; no forced reset during CopyPermit closing, real
-stalled kernel calls, SMP lifecycle races, delivered IRQ/ACK races, pending
-compiler replies, network or combined workload acceptance. This result does not
-close the complete IO1 matrix or the owner's full I/O goal. No further repetition
-of these same cases is needed for the scoped conclusion.
-
+Retained review: `natemu-raw/io3-lifecycle-20261108-01/replica-01/review.md`.
 
 ## Extended RAM-window findings and independent replay — November 8, 2026
 
-`/root/rust_io_research` authored `tools/run_io_window_cases.py`, reusing its
-previous window worker. Independent `/root/io_scope_review` reviewed the source,
-then repeated all four N2 cases after the root's four first-attempt passes. Both
-runs use the unchanged production window implementation. The reviewer reused
-its freshly built lifecycle host/resident only after verifying both binaries
-and all 907 original source inputs against the retained author manifest. The
-new Python runner (sha256 aa1ad54d3040a500e571e9034dda6107cfe3311afbfe43c0c3b6c685655e9954)
-is an append-only uncompiled input with a separate manifest; no compiled input
-or previous manifest was changed and no new build was needed.
+**Verdict: accepted for the stated development cases (high RAM, page-table entry change,
+HLT and application-processor waits, two vCPUs); not broadened to forced-interleaving
+claims.** An independent reviewer reviewed the source, then repeated all four cases after the
+author's four first-attempt passes, reusing its freshly built host and resident only after
+verifying both binaries and all 907 original source inputs; the new Python runner is an
+append-only uncompiled input with its own manifest. All four cases pass independently without
+retries or timeouts. Observations: copied data and executed or patched code above 4 GiB; both
+vCPUs see old and new values after a copied byte changes a mapped frame; HLT participants
+record halts and interrupts; the application processor records a mailbox wait and a successful
+wake acknowledgement; per-vCPU progress, ordered overlap and clean teardown.
 
-**Evidence validity: accepted for the stated development cases.** High RAM,
-PTE, HLT and AP cases all pass in the independent run without retries/timeouts,
-using 71/71/72/204 windows respectively, each with 64 designated snapshots,
-per-CPU split atomics/progress, ordered overlap, code-patch visibility and clean
-teardown. High RAM puts both copied data and executed/patched code above 4 GiB.
-Both CPUs in the PTE case observe the expected old/new values after a copied byte
-changes the mapped PFN. Each HLT participant records 67 halts and 68 interrupts;
-the AP records mailbox waiting and a successful wake acknowledgement. Producing
-inputs, logs/results and checksums are retained in
-`io1-20261108-01/windows-extended-01` and
-`io1-20261108-01/windows-extended-replica-01`; the
-[independent report](/Users/liaozping/orca/natemu-raw/io1-20261108-01/windows-extended-replica-01/review.md)
-records source identity and the detailed limits. Total IO1 live launches are
-12 of 24, with approximately 900 MiB of its 4 GiB retained-storage bound used.
+**Not established:** the page-table entry was read initially, but earlier write windows may
+reset its cached translation before the final entry-changing copy, so the fixture does not
+guarantee a hot entry at the last write. HLT and application-processor waits coexist with
+windows, but no specific grant is forced while a participant occupies that wait. Pending
+compiler replies stay excluded. The guest and oracle are shared with the author (separately
+source reviewed). No multi-vCPU device reset or interrupt races, networking, combined
+acceptance or performance. No repeat is needed.
 
-**Decision relevance: accept these concrete high-bank, mapping-outcome and
-progress observations; do not broaden them into forced-interleaving claims.**
-The PTE was initially read, but earlier write windows may reset its cached
-translation before the final PTE-changing copy; the fixture does not guarantee
-that entry is hot at the final write. HLT/AP waits coexist with windows but no
-specific grant is forced and identified while a participant occupies that wait.
-Pending compiler replies remain excluded. The same guest/oracle is shared with
-the author and has separate source review. These results do not establish SMP
-device reset/IRQ races, networking, combined-workload acceptance or performance.
-No further repetition of these same cases is needed for this scoped conclusion.
-
+Retained review: `natemu-raw/io1-20261108-01/windows-extended-replica-01/review.md`.
 
 ## Forced HLT and power-wait cooperation — November 8, 2026
 
-Independent `/root/io_scope_review` reviewed the `hold-power-halt` metadata-only
-barrier and N2 `power-rep-halt` guest/oracle before execution. The author run
-passes in `io3-lifecycle-20261108-01/live-02`. The reviewer verified all 908
-retained `build-02` inputs, copied them into `replica-02`, rebuilt the testing
-host driver and resident in a fresh target using locked offline Rust 1.97.0,
-and passed signing, stack/gateway audit and the ten-guest/96-negative-control
-self-check. Exactly one independent N2 replay passes, without retry or timeout;
-source hashes remain unchanged.
+**Verdict: accepted for the forced two-vCPU development schedule; closes the specific forced
+HLT-park / power-wait completion and shutdown-drain gap.** An independent reviewer reviewed the
+metadata-only hold barrier and the guest oracle before execution, verified all 908 retained
+build inputs, rebuilt the testing driver and resident in a fresh offline target (signing,
+stack/gateway audit and the ten-guest negative-control self-check pass) and replayed the case
+once successfully without retry or timeout.
 
-**Evidence validity: accepted for the forced N2 development schedule.** The
-trace orders actual power poll and helper parked-state observation before
-backend release, positioned write, completion commit, successful full-sync and
-lane join. Both complete RAM images and the full disk match. The initiator
-retains REP RIP with RCX=1 and RSI advanced two bytes; the helper retains its
-post-HLT RIP, marker and unchanged forbidden-progress register, records one
-halt and zero interrupts, and ends cancelled. Both vCPUs join/destroy cleanly.
-The hook supplies neither a guest result nor a window acknowledgement: the
-subsequent completion requires resident acknowledgements through the parked
-helper and committed power-wait initiator. Producing hashes, command logs,
-results and qualifications are in the
-[independent report](/Users/liaozping/orca/natemu-raw/io3-lifecycle-20261108-01/replica-02/review.md).
+**Result:** the trace orders the actual power poll and the helper's parked-state observation
+before backend release, positioned write, completion commit, successful full-sync and lane
+join. Both RAM images and the disk match; the initiator keeps its repeated-instruction
+position, the helper keeps its post-HLT position and ends cancelled, and both vCPUs tear down
+cleanly. The hook supplies neither a guest result nor a window acknowledgement; completion needs
+resident acknowledgements through the parked helper and the committed initiator.
 
-**Decision relevance: closes this specific forced HLT-park/power-wait completion
-and S5-drain gap.** It does not prove native WFI had already executed when the
-park state was sampled, general SMP reset/IRQ safety, forced AP/compile waits,
-reset during CopyPermit closing, hot PTE mutation, real stalled kernel calls,
-networking, combined-workload acceptance or performance. The barrier is before
-the native call and the independently reviewed oracle is shared with the author.
-Cumulative lifecycle use is 15 of 16 launches and approximately 694 MiB of 1 GiB.
-No additional repetition is needed for this scoped finding.
+**Not established:** that native wait-for-interrupt had already executed when the park state
+was sampled; general multi-vCPU reset or interrupt safety; forced application-processor or
+compile waits; reset during a pending copy; hot page-table mutation; real stalled kernel calls;
+networking, combined acceptance or performance. The barrier sits before the native call, and the
+oracle is shared with the author. No repeat is needed.
 
+Retained review: `natemu-raw/io3-lifecycle-20261108-01/replica-02/review.md`.
 
 ## Network frontend and fio preparation source review — November 8, 2026
 
-Independent `/root/io_scope_review` inspected the two-queue owner in
-`crates/host/src/virtio/mod.rs`, owned packet endpoint and SG path in `net.rs`,
-and the block request conversion to explicit device/queue identity. This is
-source review before live network execution; no backend admission, packet
-exchange, unit-test outcome or VM result is inferred. No production code was
-edited by the reviewer.
+**Verdict: the frontend source is suitable as an implementation seam once one shutdown defect
+is fixed (fixed and closed in the return below); the fio profiles are accepted as inputs to a
+later bounded guest correctness pilot, not as performance results.** An independent reviewer
+inspected the two-queue network owner, the owned packet endpoint and scatter-gather path, and the
+block request conversion, before any live network run; the reviewer edited no production code
+and nothing was executed.
 
-**Evidence validity: one substantive shutdown correction required.** At review,
-`owner` entered quiescence before checking `backend_error`, and `drain` published
-`drained` without rechecking that error under its final state lock. Terminal
-endpoint failure recorded just before or during quiescence could therefore be
-reported as clean S5 drain. The requested correction is to inspect failure
-before entering drain and atomically check failure with final drained
-publication; test both already-recorded failure and the final-publication race.
-Intentional endpoint drop after stopped/drained remains benign. This finding
-was sent to the production author; closure requires inspection of the fix and
-focused test evidence.
+**Blocker raised:** the owner entered quiescence before checking for a backend error, and drain
+published "drained" without rechecking it under the final state lock, so a terminal endpoint
+failure just before or during quiescence could be reported as a clean power-off. Required fix:
+check failure before entering drain and atomically with the final publication; test both the
+already-failed case and the final-publication race. Intentional endpoint drop after drained
+stays benign. Otherwise, per-queue reset and generation checks preserve the peer queue and the
+shared interrupt status, receive arrival reserves its frame under the reset lock, transmit uses
+owned bytes and waits for the backend before completing, scatter-gather validation precedes
+effects, and a too-small receive chain drops the frame without consuming the head. External
+backend supervision must still stop and join its work.
 
-The inspected queue-specific reset/generation predicates preserve the other
-queue's request, indices, pending work and shared IRQ status. RX arrival reserves
-its bounded frame and identity under the same state lock as reset, schedules a
-scan independently of a second guest kick, and refuses arrivals while RX is
-active/full. TX uses owned bytes and waits for the backend result before guest
-completion; reset cannot replay a submitted packet. Complete SG/range validation
-precedes effects, and a valid RX chain too small for an incoming frame drops the
-frame without consuming the head. Source review found no further substantive
-defect in these paths. External backend supervision must still stop/join its
-work; bounded channels alone do not establish native callback retirement.
+**fio preparation (static scope only):** the reviewer inspected the benchmark preparation
+README and all eleven fio profiles and verified seventeen checksums. Valid: finite CRC
+verification and clean restart are separate from timed workloads; the 64 MiB pilot is explicitly
+warm host cache; requested depth is not achieved native concurrency; stock QEMU's flush path is
+not labelled equivalent to full-sync. Not independently rerun: package closure and downloaded
+package provenance. Required before scoring: untimed flush/drain and restore between paired
+cases so dirty tail work cannot leak into the next case. io_uring support, package execution,
+queue topology and durability still need executable checks.
 
-**Decision relevance:** the concrete packet port is a suitable implementation
-seam once the shutdown error race is fixed and tested. It does not choose a
-native/user-space backend or establish the full network, integrated workload or
-performance goal. Runtime queue/reset/IRQ and packet-boundary coverage remain
-needed for the declared executable slice.
-
-The reviewer separately inspected `io-benchmark-prep-20261108-01/README.md` and
-all eleven fio profiles, verified seventeen README/profile/source checksums,
-and checked retained QEMU source for segment limits and flush behavior.
-**Preparation evidence is valid within its static scope:** finite CRC verification
-and clean restart are separate from timed workloads; the 64 MiB pilot is
-explicitly warm host-cache; Q1/Q16 means requested fio depth, not achieved native
-concurrency; and stock QEMU's flush path is not labelled equivalent to
-F_FULLFSYNC. The reader/loader package closure and downloaded package provenance
-were not independently rerun in this review. No target binary, fio job or VM
-was executed.
-
-**Decision relevance:** accept these profiles as inputs to the next separately
-bounded guest parse/correctness pilot, not as performance results or ready-to-run
-measurement acceptance. Before scoring, specify untimed flush/drain and
-restore/precondition behavior between paired cases so dirty tail work cannot
-contaminate the next case or be included asymmetrically. Actual io_uring support,
-package/dlopen execution, negotiated queue topology, durability conditions and
-metrics still require the declared executable checks.
+**Not established:** native or user-space backend choice, network runtime, integrated workload
+or performance.
 
 ### Network shutdown correction return
 
-The same independent reviewer re-read the correction: `owner` now checks
-`backend_error` before entering quiescence, and `drain` checks it under the same
-final state lock that publishes `drained`. `PacketPort::fail` takes that lock, so
-failure before publication prevents clean success; intentional endpoint closure
-after publication is ignored. The added
-`terminal_backend_failure_cannot_become_successful_poweroff` test covers failure
-recorded before quiescence, failure recorded between quiescence and final drain,
-normal post-drain closure, and unexpected endpoint drop. This exercises both
-sides of the publication boundary deterministically, not a threaded race. The
-author reports all twenty virtio tests pass; the reviewer inspected the test
-source but did not independently execute it.
-
-**Disposition: shutdown blocker closed by source review and focused author test
-evidence.** The lock establishes the required failure-versus-success ordering.
-Out-of-profile incoming frames now report a normal drop (`false` in the final
-boolean receive API), so they cannot accidentally be propagated as terminal
-endpoint loss by a conventional adapter. The frontend is
-ready for its bounded direct-guest integration fixture review; network runtime,
-backend admission and full I/O acceptance remain open.
-
+**Disposition: shutdown blocker closed by source review plus focused author test evidence.**
+The owner now checks failure before quiescence and drain checks it under the same lock that
+publishes drained, so failure before publication cannot become clean success; endpoint closure
+after publication is ignored. A new test covers failure before quiescence, between quiescence and
+final drain, normal post-drain closure and unexpected drop, deterministically rather than as a
+threaded race. The author reports all virtio tests passing; the reviewer read the test source
+but did not run it. Out-of-profile incoming frames now report a normal drop, so an adapter cannot
+mistake them for endpoint loss. Network runtime, backend admission and full acceptance remain open.
 
 ## Network direct-guest fixture pre-execution review — November 8, 2026
 
-Independent `/root/io_scope_review` inspected `tools/run_virtio_net.py`,
-`program_net.rs`, and `program.rs` integration before any live frontend run.
-The four N1 cases exercise split/combined 12-byte headers and legal ignored
-fields, maximum single-VLAN frame with untouched RX padding, large-packet drop
-followed by a fitting packet using the same short RX head, alternating queue
-disable/reconfiguration with preserved peer indices, full reset, and malformed
-TX direction/out-of-RAM suffix followed by recovery.
+**Verdict: method accepted after one correction, for the four authored one-vCPU frontend
+cases.** An independent reviewer inspected the runner, the guest programs and the integration
+before any live frontend run. Cases: split and combined 12-byte headers with legal ignored
+fields; maximum single-VLAN frame with untouched receive padding; a large-packet drop followed by
+a fitting packet on the same short receive head; alternating queue disable and reconfiguration
+with preserved peer indices and full reset; malformed transmit direction and out-of-RAM suffix
+followed by recovery.
 
-**Method validity: accepted after one correction.** The original queue-preserve
-helper read the write-only QueueDescLow register; the reviewer reported that
-execution defect and the author removed the read/assertion without changing
-production behavior. QueueReady readback, peer used index and later successful
-completion through the original peer queue establish the intended preservation.
-The author reports the four-guest/54-negative-control self-check passes again;
-no live outcome is inferred from those synthetic checks.
+**Defect raised and fixed:** the queue-preserve helper read the write-only QueueDescLow
+register; the author removed that read and assertion (production unchanged). QueueReady
+readback, peer used index and later completion establish the intended preservation. The echo
+endpoint sees only owned packet bytes and never edits guest results; the exact RAM oracle,
+packet counts, admissions, final architecture state and teardown are checked, with bounded
+frames, endpoint service and process time and a shared VM lock.
 
-The echo endpoint sees only owned packet bytes, attempts RX once before TX
-acknowledgement and never edits guest results. Together with the production
-owner's alternating selection, this forces the oversized short-RX frame to be
-processed before the next TX supplies the fitting frame. The exact 384 KiB RAM
-oracle includes unchanged bytes and all used entries/lengths. Malformed cases
-require no native packet callback or used publication before reset/recovery.
-Exact packet bytes/counts, receive admissions, final architecture, duplicate or
-missing output records and owner/vCPU teardown are checked; full logs, frozen
-inputs, hashes and no-retry outcomes are retained. The driver bounds frames at
-64 and endpoint service at 45 seconds, with joins before VM destruction; the
-runner adds its 120-second process-group bound and shared VM lock.
-
-**Decision relevance:** proceed with the declared four authored runs, then
-fresh independent headers/queues reproduction within IO4's eight-launch/1 GiB
-bound. This validates only the direct frontend slice if it passes. Queue
-disables follow completed requests: the fixture does not force a disable while
-the other queue is active/pending, nor SMP reset/IRQ races. IRQ status is polled
-with interrupts disabled. No native networking, privilege/admission, S5 network
-shutdown, full Linux network stack, throughput or combined-workload conclusion
-follows. No VM or fio job was run by this review.
-
+**Not established:** queue disables follow completed requests (no disable forced while the other
+queue is active or pending); no multi-vCPU reset or interrupt races; interrupt status is polled
+with interrupts disabled. No native networking, privilege admission, network shutdown, full
+Linux network stack, throughput or combined result. Nothing was run by this review.
 
 ## Network frontend findings and independent replay — November 8, 2026
 
-All four authored N1 cases pass on their first live attempt in
-`io4-frontend-20261108-01/live-01`. Independent `/root/io_scope_review` verified
-all 911 retained source inputs, copied them into `replica-01`, and rebuilt the
-testing host driver and resident into a fresh target using locked offline
-Rust 1.97.0. Signing, stack/gateway audit and the four-guest/54-negative-control
-self-check pass. Exactly two independent live cases, headers and queues, pass
-without retries or timeouts; source hashes remain unchanged.
+**Verdict: accepted for the finite direct frontend development slice, for continued backend
+integration.** All four authored cases passed on their first live attempt. An independent
+reviewer verified all 911 retained source inputs, rebuilt the testing driver and resident in a
+fresh offline target (signing, audit and the negative-control self-check pass) and ran two of
+the cases (headers and queues) successfully without retries or timeouts, comparing complete RAM
+images, exact packet bytes and counts, endpoint admissions and close, architectural completion
+and clean teardown. The short-receive and malformed-recovery cases passed in the author run;
+their outcomes were inspected but not independently rerun. The shared fixture had separate
+source review.
 
-**Evidence validity: accepted for the finite direct frontend development slice.**
-Both independent cases compare complete 384 KiB RAM images, exact packet
-bytes/counts and endpoint admissions/close, guest architectural completion and
-clean teardown. Headers emits 64-byte and 1518-byte frames with used indices
-2/2, including split headers, ignored fields and RX tail preservation. Queues
-emits four 64-byte frames, preserving old/new used indices 1/2/2/1/1/1 across
-alternating disable/reconfiguration and full reset. Both finish with R15 zero,
-stop reached and one vCPU joined/destroyed. The author's short-RX and malformed
-recovery cases also pass; their outcomes were inspected but not independently
-rerun. The shared fixture received separate independent source review. See the
-[retained independent report](/Users/liaozping/orca/natemu-raw/io4-frontend-20261108-01/replica-01/review.md)
-for exact input/binary hashes, commands, logs and reproduction limits.
+**Not established:** queue disables follow completed requests; active peer-queue reset,
+multi-vCPU lifecycle and delivered interrupt races untested; status polled with interrupts
+masked. An owned-packet echo shows no native network admission, Linux network stack, network
+shutdown drain, protocol connectivity, combined workload or performance. The full I/O goal
+remains open; no repeat needed.
 
-**Decision relevance: accept this frontend increment for continued backend
-integration.** Queue disables follow completed requests; active peer-queue
-reset, SMP lifecycle and delivered IRQ/ACK races remain untested. Status is
-polled with IF clear. No native network admission, Linux network stack, network
-S5 drain, protocol connectivity, combined-workload or performance result follows
-from an owned-packet echo. The complete I/O goal remains open. Six of eight IO4
-launches and approximately 333 MiB of 1 GiB are used; no additional repetition
-of these same cases is required for this scoped conclusion.
-
+Retained review: `natemu-raw/io4-frontend-20261108-01/replica-01/review.md`.
 
 ## Pending compiler window method review — November 8, 2026
 
-Independent `/root/io_scope_review` inspected the proposed retained
-`io1-20261108-01/pending-compiler-method.md` against `Server::request`,
-`Compiler::compile_once`, resident `find_from`/`interrupted`/`io_checkpoint`, and
-the actual RAM-window admission loop. No implementation or VM was run.
+**Verdict: a useful overlap test, accepted once one oracle correction was made.** An
+independent reviewer checked the proposed method against the compiler request path, the resident
+checkpoint code and the real RAM-window admission loop (nothing run). A testing observer after
+the real channel post and before response consumption can hold a pending host compiler service;
+the correct claim is "response consumption held", not "the compiler still computing". A stable
+exact epoch with one vCPU acknowledged, the other not, release below that epoch, unchanged
+written epoch and a pending copy establishes the intended gate dependency. The timeout must be
+the announced epoch's acknowledgement timeout, with no competing window and a releasable,
+finitely bounded observer.
 
-**Method validity: useful overlap test with one required oracle correction.**
-A testing observer after the real channel post and before response consumption
-can force a pending host compiler service. The compiler process may already
-have finished; the correct claim is response consumption held, not FEX still
-computing. A stable exact epoch with CPU1 acknowledged, CPU0 unacknowledged,
-release below that epoch, unchanged written epoch and a still-pending copy
-positively establishes the intended gate dependency. The timeout must be the
-announced epoch's acknowledgement timeout, not prevalidation/coordinator failure.
-Use no competing window during that observation and bound/release the observer
-on every error path; its own hold cannot rely solely on a deadline inside the
-not-yet-entered reply reader.
-
-The proposed mandatory first-store marker value of one is not justified.
-`find_from` does not checkpoint again after successful ordinary block placement,
-but `interrupted` explicitly dispatches immediately when a pending doorbell
-arrives at an ordinary block's entry, before its first instruction. Thus a
-safely banked pre-instruction boundary may acknowledge the copy with marker
-zero. Requiring one would falsely reject that path. Retain the exact-epoch gate
-oracle, allow a truthful zero marker at that boundary with eventual guest
-progress, or separately justify a route with an already-owed instruction; do
-not change production dispatch to satisfy this fixture. This correction was
-sent to root before execution.
-
-**Decision relevance:** timeout/no-effects followed by release/exact-epoch
-progress and observed patched code can close the finite delayed compiler-service
-coverage gap. It does not establish compiler-process busy time, universal
-instruction completion before a safe checkpoint, or arbitrary pending reply
-races. Final fixture/source review remains required after the author implements
-and corrects the oracle; no live acceptance is recorded here.
-
-### fio installed-root admission harness — November 8, root independent review
-
-Author `/root/rust_io_research`; reviewer `/root`, separate from the harness and
-package-preparation author. Inspected the new `tools/run_fio_admission.py`, imported
-block/rng helpers, fixed profiles, signed-index/package and ELF checks, cloned
-root creation, bounded process/log supervision and full guest-output/persistence
-oracles. Root reran the shell/symlink/negative-result self-checks.
-
-A reproduction defect was fixed before preparation: log count alone could accept
-a missing output replaced by an unexpected name. The final checker requires the
-exact 27 names and complete BEGIN/END framing; renamed/missing/stray/duplicate
-controls pass. Frozen oracle SHA-256:
-`7285f523371fc07389618d47733cc153637a9e90f046c02c86950218fda3953c`.
-
-**Evidence validity:** accept the method for bounded functional execution, not
-an observed fio pass. The genuine package, complete dependency tree and existing
-stock kernel/bootstrap are retained; only a separate test root/init changes.
-The ordinary IO4 CLI build is reused with hashes matched against IO3 linux-03,
-and the new oracle is separately retained rather than relabelled as build input.
-
-**Decision relevance:** establish dynamic-loader/io_uring/fio and clean-restart
-verification capability before using those jobs for performance. Four N2 launches
-of 240 seconds and 2 GiB are the full primary/independent bound. No scored timing,
-QEMU parity, power-loss durability or network capability follows. Retained method
-and results belong under `natemu-raw/io-fio-admission-20261108-01`.
-
+**Correction:** requiring a first-store marker of one was unjustified. An ordinary block entry
+with a pending doorbell can dispatch before its first instruction, so marker zero at grant is
+legitimate. The method now allows zero or one at grant with eventual one after release; the
+oracle must not force a production dispatch change. The correction was accepted and the method
+document amended.
 
 ### Pending compiler method correction return
 
-Root accepted the marker correction. At root's request, the independent reviewer
-amended only the retained method document: marker zero or one at grant is
-permitted, marker one is required eventually after release, the held tuple must
-be bracketed by the same request epoch, and the timeout must specifically be
-acknowledgement timeout for the announced epoch. The observer has an independent
-finite bound and cancellation release. The method now explicitly permits an
-ordinary block-entry interrupt before its first instruction. **Method blocker
-closed; implementation and fixture review remain pending.** No runtime/fixture
-code was edited and no VM was run by this return.
-
+**Disposition: method blocker closed.** At the main session's request the reviewer amended only
+the retained method document: marker zero or one at grant, eventual one after release, the held
+tuple bracketed by the same request epoch, the timeout specifically the announced epoch's
+acknowledgement timeout, an independent finite bound and cancellation release for the observer,
+and explicit permission for a block-entry interrupt before the first instruction. No code was
+edited and no VM run. Implementation and fixture review remained pending.
 
 ### Pending compiler implementation review — observation ordering correction
 
-The independent reviewer inspected `program_pending.rs`,
-`run_io_pending_compiler.py`, the testing compiler-post observer and read-only
-`WindowStatus` accessor. The implementation uses real channel publication, a
-finite five-second releasable observer, exact target request identity, production
-copy permits, timeout/no-effects safe reads, legal marker zero/one followed by
-eventual one, and final per-CPU code/progress/whole-region checks. Normal compiler
-reply bytes and resident dispatch are unchanged.
+The reviewer inspected the compiler-pending program, runner, testing observer and read-only
+window-status accessor: real channel publication, a finite releasable observer, exact request
+identity, production copy permits, timeout with no effects, legal marker zero/one, final per-vCPU
+code and progress and whole-region checks; normal compiler reply bytes and resident dispatch
+unchanged.
 
-**One method blocker remains:** the status accessor initially loaded `released`
-before acknowledgement words and bracketed only `request`. A timeout could
-release the epoch after that early load, followed by a late CPU1 acknowledgement.
-The mixed tuple could then claim an unreleased epoch and matching peer ack even
-though those conditions never coexisted. The reviewer requested a release-word
-load after the acknowledgements, required still below the same epoch in both
-the Rust observation and Python oracle, plus a negative control. The existing
-SeqCst ordering then establishes the positive overlap without changing the
-coordinator. This is a measurement defect, not an observed production gate
-failure. No VM was run; closure awaits the observer/oracle correction.
-
-### Network external-arrival lifetime review
-
-Root identified that `PacketPort` can admit future RX with no queued request,
-while the existing all-halted termination rule requires every such external
-source to retain an `Irqs::busy` guard. The independent reviewer confirmed the
-contract in `irq.rs` and the existing UART input owner. A separate endpoint
-lifetime guard acquired before boot and dropped only after endpoint shutdown
-is the smallest compatible fix; empty RX buffers still do not count as active
-queue work. A constructor/stop-or-drain/drop counter test establishes ownership,
-not live IRQ delivery from an all-HLT guest. The previously retained frontend
-runs spin and remain scoped evidence for their frozen source. No live-HLT or
-native-network claim follows from this source review.
-
+**One method blocker:** the status accessor loaded the release word before the acknowledgement
+words and bracketed only the request. A timeout could release the epoch after that load, followed
+by a late peer acknowledgement, producing a mixed sample claiming conditions that never coexisted.
+Required: load release after the acknowledgements, require it still below the same epoch in both
+the Rust observation and the Python oracle, plus a negative control. This was a measurement
+defect, not an observed production gate failure; no VM was run.
 
 ### Pending compiler observation correction return
 
-The independent reviewer inspected the final `WindowStatus` load order: both
-request words bracket the sample, and `released_after` is loaded after the
-acknowledgement words. Rust admission observation and Python judging require
-that release still be below the same epoch, the peer acknowledgement match,
-the held CPU acknowledgement differ, written remain unchanged, and the copy
-worker remain unfinished. The successful attempt repeats those conditions for
-the same epoch after at least 100 ms immediately before releasing the held
-consumer. The focused negative controls now reject late release, a finished
-worker, changed epoch/written state and premature held-CPU acknowledgement.
-The author reports 22 negative controls pass; this return inspected source
-without executing them.
+**Disposition: the positive-overlap oracle blocker is closed; accepted for one bounded primary
+two-vCPU run from frozen inputs (source and oracle acceptance only).** The release word is now
+loaded after the acknowledgements; the successful attempt repeats the pending conditions for the
+same epoch after at least 100 ms before releasing the held consumer; and focused negative controls
+reject late release, a finished worker, changed epoch or written state and premature acknowledgement
+by the held vCPU. The author reports the controls pass; the reviewer inspected the source without
+running them. No coordinator or resident behavior changed. Observed results and independent
+reproduction were still outstanding.
 
-**Disposition: positive-overlap oracle blocker closed; accepted for the one
-bounded N2 primary run from frozen inputs.** The post-acknowledgement release
-load closes the identified mixed-tuple timeout race; the second held sample
-and unfinished-worker checks prevent a completed copy from being presented
-as pending merely because its thread is joined later. Marker zero/one at grant
-remains legal, with eventual one and per-CPU patched-code progress required.
-This is pre-execution source/oracle acceptance only; observed results and fresh
-independent reproduction remain outstanding. No coordinator/resident behavior
-was changed by these observation corrections.
+The same return verified the network endpoint-lifetime guard (see the arrival-lifetime review
+below): its test proves guard ownership (live while the endpoint is owned, released on drop), not
+all-HLT packet arrival or interrupt delivery, and does not alter the frozen frontend evidence.
 
-The reviewer also verified the actual network `_arrival: Busy` field is acquired
-in `Virtio::network` and lives in `PacketPort` until drop. Its focused test
-checks live=1 with no pending queue work, retains live=1 after drain while the
-endpoint remains owned, and obtains live=0 after drop. **Endpoint guard source
-correction accepted.** The test proves guard ownership, not all-HLT packet
-arrival/IRQ delivery, and does not retroactively alter the frozen IO4 evidence.
+## fio installed-root admission harness — November 8, root independent review
 
+**Verdict: method accepted for bounded functional execution, not an observed fio pass.** The
+main session, separate from the harness and package-preparation author, inspected the admission
+runner, imported block/random helpers, fixed profiles, signed-index/package and ELF checks, cloned
+root creation, bounded supervision and full output and persistence oracles, and reran the
+self-checks. The real package, complete dependency tree and stock kernel/bootstrap are retained;
+only a separate test root and init change. The ordinary network-era CLI build is reused with hashes
+matched; the oracle is retained separately, not relabelled as build input.
+
+**Defect fixed before preparation:** log count alone could accept a missing output replaced by an
+unexpected name. The checker now requires the exact 27 names and complete BEGIN/END framing, with
+renamed, missing, stray and duplicate controls passing.
+
+**Purpose and limits:** establish dynamic loader, io_uring, fio and clean-restart capability
+before using the jobs for performance. No scored timing, QEMU parity, power-loss durability or
+network capability follows.
+
+Campaign: `natemu-raw/io-fio-admission-20261108-01`.
+
+## Network external-arrival lifetime review — November 8, 2026
+
+**Verdict: the endpoint-lifetime source correction is accepted (source review only).** The main
+session found that the packet port can admit future receive traffic with no queued request, while
+the all-HLT termination rule requires every external source to hold a busy guard. The independent
+reviewer confirmed the contract in the interrupt code and the existing UART input owner. A
+separate endpoint guard acquired before boot and dropped only after endpoint shutdown is the
+smallest compatible fix; empty receive buffers do not count as active work. The actual guard field
+and its focused test (live with no pending work, still live after drain while the endpoint is
+owned, released on drop) were verified in the later pending-compiler return.
+
+**Not established:** the test proves guard ownership, not live interrupt delivery from an all-HLT
+guest, and does not retroactively alter the frozen frontend evidence (those runs spin). No native
+network claim.
 
 ## Pending compiler findings and independent replay — November 8, 2026
 
-The authored N2 run passes in `io1-20261108-01/pending-live-01`. Independent
-`/root/io_scope_review` verified and copied all 914 retained inputs into
-`pending-replica-01`, rebuilt host driver and resident into a fresh target with
-locked offline Rust 1.97.0, and passed signing, stack/gateway audit and the
-22-negative-control self-check. Exactly one independent N2 replay passes
-without retry or timeout; source hashes remain unchanged. The primary host
-test log separately records 170 passed and two ignored.
+**Verdict: accepted for the forced held-response development case; closes this finite delayed
+compiler-service window gap.** The authored two-vCPU run passed. An independent reviewer verified
+and copied all 914 retained inputs, rebuilt the driver and resident in a fresh offline target
+(signing, audit and the 22 negative controls pass) and replayed once successfully without retry or
+timeout.
 
-**Evidence validity: accepted for the forced held-response development case.**
-The independent timeout attempt announces epoch 5 with ack [4,5], both release
-loads 4, written 4 and unfinished copy. It returns acknowledgement timeout with
-release 5, written still 4 and CPU0 still unacknowledged. Later safe reads
-confirm unchanged sentinel/function bytes. The successful attempt observes
-epoch 10 with ack [9,10], both release loads 9, written 9 and unfinished copy,
-then observes the same conditions again after 102 ms. Releasing the host
-consumer yields successful copy with ack [10,10], release/written 10. The
-marker read at grant is zero, as permitted for an ordinary block-entry stop;
-eventual markers [1,1], code [2,2], 64 split-atomic snapshots, increasing
-per-CPU counters and exact final RAM all pass. Both CPUs reach their expected
-ends and join/destroy cleanly. See the
-[independent report](/Users/liaozping/orca/natemu-raw/io1-20261108-01/pending-replica-01/review.md)
-for producing hashes, commands, traces and reproduction limits.
+**Result:** the timeout attempt returns an acknowledgement timeout with the release word advanced,
+the written epoch unchanged and the first vCPU unacknowledged, and later safe reads confirm
+unchanged bytes; the successful attempt observes the pending conditions twice (the second after
+about 100 ms), then releasing the held consumer yields a successful copy. The marker at grant is
+zero, as permitted for a block-entry stop, with eventual one, patched-code progress, split-atomic
+snapshots and exact final RAM; both vCPUs end and tear down cleanly.
 
-**Decision relevance: closes this finite delayed compiler-service/window
-coverage gap.** Real compiler requests were posted and host response
-consumption was held; no assertion is made that FEX remained busy. The result
-does not require an instruction not yet begun to complete before acknowledgement
-and does not establish arbitrary reply/crash races, networking, performance
-or complete I/O acceptance. The independently reviewed guest/oracle is shared
-with the author; build and execution are independently reproduced. IO1 uses
-14 of 24 launches and approximately 1218 MiB of 4 GiB. No further repetition
-of this same case is needed for the scoped conclusion.
+**Not established:** the claim is that real compiler requests were posted and host response
+consumption held, not that FEX stayed busy; an instruction not yet begun is not required to
+complete before acknowledgement; arbitrary reply or crash races, networking, performance and full
+acceptance are not covered. The guest and oracle are shared with the author. No repeat needed.
 
+Retained review: `natemu-raw/io1-20261108-01/pending-replica-01/review.md`.
 
 ## fio progress diagnostic findings review — November 8, 2026
 
-Independent `/root/io_scope_review` inspected the original failed admission,
-the retained `diagnostic-method.md` and root's method/source review, then the
-completed `io-fio-admission-20261108-01/diagnostic-live-01` phase records, raw
-serial/proc observations, framed cumulative fio JSON, host process accounting
-and six native sample reports. The reviewer launched no VM, build or profiler
-and made no production changes. This is findings review of one diagnostic,
-not independent execution or performance qualification.
+**Verdict: accepted as bounded progress and location observations of one diagnostic; not an
+independent execution, a performance qualification or an admission pass.** An independent
+reviewer examined the original failed admission, the diagnostic method and the completed
+diagnostic records (serial and process observations, cumulative fio output, host accounting and
+six native sample reports), launching no VM, build or profiler. The diagnostic stopped at its
+observation deadline (exit 2): fio had started but never reached exit, final verification,
+sync, remount, shutdown or restart, so `admission_pass` stays false. The earlier 240-second
+failed image stays separate; its changed hash and unrecovered journal do not show filesystem
+corruption or completed fio bytes.
 
-**Evidence validity: accepted as bounded progress/location observations.**
-The diagnostic stops at its observation deadline after 152.751 seconds, exit 2;
-fio had started but had no exit, final verification, sync/remount/S5 or restart.
-`admission_pass` remains false. The original 240-second failed image remains
-separate; its changed hash and an unrecovered journal do not establish
-filesystem corruption or completed fio bytes. Version and eleven parses had
-returned zero in that original attempt, even though timeout prevented final
-export/oracle completion.
+**Findings:** roughly 24 seconds precede the workload within the version-command interval and
+must not be charged to block verification; the diagnostic also omits the original repeated
+library hash and parse startup and adds monitoring, so its duration is not comparable
+throughput. The reviewer decoded and hash-verified every cumulative-output snapshot: reported
+write bytes, I/O counts and runtime advance monotonically with no job errors and no reads, and
+guest worker and block counters also advance. That rules out a total I/O stall over the observed
+intervals but not an unfinished verification or clean persistence. Host samples show the disk
+lane almost always idle waiting for a job, the compiler children quiet, and the vCPU stacks
+split between hypervisor execution and repeated cached-code re-admission; these are sampled
+stack locations, not CPU-cost shares, and host sampling cannot separate guest code from resident
+work. The guest monitor's heartbeats are sequential and potentially expensive, not simultaneous
+snapshots; native samples cover two brief windows; monitoring overhead is unqualified.
 
-The diagnostic's host-received version markers occur at 7.727 and 32.112
-seconds; fio-start occurs at 32.529 seconds. Thus roughly 24.4 seconds precede
-the workload inside the version command interval and must not be charged to
-block verification work. This diagnostic omits the original repeated library
-hash/parse startup, changes warmup and adds monitoring; its duration is not
-comparable baseline throughput.
+**Decision:** prioritize a narrow investigation of execution, reuse, re-admission and coherence
+costs without claiming a proven cause. No sustained completion or interrupt stall, continuously
+blocked native disk syscall or dominant fresh compilation is supported. Repeated host admission
+does not alone prove window flushes cause the delay or justify a correctness-affecting
+optimization; write preparation and CRC work may contribute, and the verification-read phase had
+not begun. The unchanged original admission with clean shutdown and read-only restart remains
+required after diagnosis. One more VM was used (two of four campaign launches). No throughput,
+speedup, durability or acceptance follows.
 
-The reviewer independently decoded all five complete base64 snapshot frames,
-verified their hashes and parsed their complete JSON objects. They contain
-zero/four/ten/fifteen/twenty cumulative objects respectively, with twenty
-distinct observations after deduplication. Reported write `io_bytes` advances
-monotonically from 937,984 to 19,218,432, `total_ios` from 246 to 4,708, and write
-runtime from 4,704 to 100,817 ms; every observed job error is zero and read
-`io_bytes` remains zero. These fields are retained as reported, not summed
-across retransmitted cumulative history or treated as a final job result.
-Independent guest counters also advance: worker write_bytes reaches 22,622,208
-in the final partial heartbeat; block completed writes/sectors rise from
-82/15,160 in the first heartbeat to 5,260/57,272 in the last block record.
-Block counters include filesystem/journal work. This rules out a total I/O
-stall over the observed progress intervals; it does not establish completed
-verification or clean persistence.
-
-Host `ps` at 151.640 seconds reports cumulative CPU 301.40 seconds for natemu
-and 1.12/0.69 seconds for its two actual FEX children. In the two native sample
-sets, the disk lane is waiting for a channel job in 167 of 168 and 169 of 170
-thread observations; the second set has one fcntl observation. FEX reports show
-wait/poll stacks, and its process CPU changes little after startup. vCPU stacks
-contain both Hypervisor execution and repeated
-`Compiler::reuse -> answered -> admission` work. For example, the second set
-has 43 and 52 observations on that dominant reuse branch for vCPU0/vCPU1
-respectively, out of 170 per thread, alongside 95/90 hv_trap observations.
-These are sampled stack locations, not exclusive CPU-cost percentages. Host
-sampling cannot resolve guest code versus resident work beneath hv_trap.
-
-**Decision relevance: prioritize a narrow investigation of execution/reuse/
-readmission and coherence costs, without claiming the cause is proven.**
-Observed progress contradicts a sustained global completion/IRQ stall over
-these intervals. Predominantly idle disk-lane samples and quiet FEX children
-provide no support for a continuously blocked native disk syscall or expensive
-fresh compilation as the dominant sampled activity. Repeated host admission
-is concrete evidence of work to inspect, but does not alone prove RAM-window
-flushes cause the overall delay, establish the share spent copying, or justify
-a correctness-affecting optimization. Write preparation/CRC CPU work may still
-contribute; the verification-read phase has not begun in the retained fio
-objects. A discriminating next step should identify why cached code repeatedly
-requires admission and relate that path to actual window invalidations before
-choosing a fix.
-
-The guest monitor's complete heartbeat starts are 32.12, 37.56, 62.91, 90.05
-and 115.61 guest uptime seconds despite a five-second sleep, so each multi-PID
-record is sequential and potentially expensive, not a simultaneous five-second
-snapshot. Native samples cover only two brief windows; status/monitor/profiler
-overhead is unqualified. No throughput, product-speedup, durability, causal
-optimization or full I/O acceptance follows. The unchanged original admission
-with clean shutdown and read-only restart remains required after diagnosis.
-This diagnostic consumed one additional VM (two of the four fio admission/
-diagnostic launches used); no new launch was requested by this review.
-
+Campaign: `natemu-raw/io-fio-admission-20261108-01` (`diagnostic-live-01`).
 
 ### fio host-accounting diagnostic pre-execution return
 
-Independent `/root/io_scope_review` compared the proposed diagnostic runner
-with its retained predecessor and inspected the existing CLI/logger/cancellation
-paths. The changes select the existing `--perf-log`, record its use in the
-manifest and choose a 60- or 120-second post-start observation limit. Production
-binaries, resident, prepared image and exact workload remain unchanged.
-**Accepted for the third exploratory launch**, with 180 seconds total, 60 after
-fio-start and the existing log budget; no performance or causal conclusion is
-pre-approved. No VM/build was run by this review.
+**Verdict: accepted for the third exploratory launch (180 seconds total, 60 after fio start); no
+performance or causal conclusion pre-approved.** An independent reviewer compared the proposed
+runner with its predecessor and the existing logger and cancellation paths: it selects the existing
+performance log and a 60- or 120-second post-start limit; binaries, resident, image and workload
+are unchanged. Nothing was run.
 
-The top-level size accounting includes `host-perf.log` and `.v0`/`.v1`. However,
-its 60 MiB polling threshold plus 4 MiB reserve is a soft operational bound:
-two 1 MiB request buffers can flush during shutdown, and the process may keep
-logging during its two-second SIGTERM grace. Record the final total including
-all performance files and classify any 64 MiB overrun. Retain rather than
-truncate an over-budget result.
+**Source limits raised before execution:** the 60 MiB polling threshold plus reserve is a soft
+bound (shutdown flushes and the termination grace period can keep logging), so the final total
+must include every performance file and any overrun be classified and retained, not truncated.
+Final vCPU records are written after compiler cleanup and can be lost to a forced kill, so
+aggregate conclusions require exactly two distinct vCPU records with no failed writes or dropped
+lines; missing statistics are unavailable, not zero. The normal resident does not enable its
+optional buckets, so zero buckets are not measured zero time. Cache-flush counters are
+unconditional but combine boot, version and workload. Per-request generation fields can relate
+admissions to flushes but do not say why a flush happened or that avoiding it is safe.
 
-Final vCPU log records are written after compiler cleanup; SIGKILL after the
-two-second grace can prevent them. Aggregate conclusions therefore require
-exactly two distinct vCPU final records, no failed writes and no dropped request
-lines. Missing statistics are unavailable evidence, not zero costs. The normal
-resident does not enable its optional perf buckets: false perf magic and zero
-buckets cannot be interpreted as measured zero resident time. K1 flush counts
-and flush_us are unconditional but include boot/version/workload together.
-Per-request start and generation fields can relate repeated admissions to
-flush generations; they do not alone identify why a flush happened or establish
-that avoiding it is safe. These source limits were sent to root before execution.
-
-
-Root added and the reviewer inspected final evidence checks: a separate
-`host-perf-summary.json` requires exactly two distinct vCPU IDs 0/1 and zero
-failed/dropped log counts, retaining parse/missing-file errors and an explicit
-incomplete flag. The result records all non-image output bytes before its own
-write and a 4096-byte final-result reserve against 64 MiB. These checks address
-the identified teardown/statistics and final-size reporting gaps. Source
-acceptance for the frozen exploratory run is unchanged; incomplete/over-budget
-outputs remain retained limitations rather than fabricated zero observations.
-
+The main session then added, and the reviewer inspected, a summary check requiring two distinct
+vCPU records, zero failed or dropped counts, retained parse errors with an explicit incomplete
+flag, and final size accounting against the 64 MiB bound. Source acceptance is unchanged.
 
 ### fio host-accounting diagnostic outcome — boot-only log limit
 
-Independent `/root/io_scope_review` inspected retained
-`io-fio-admission-20261108-01/diagnostic-live-02` after execution. The run stops
-after 6.322 seconds at the 60 MiB live-log threshold, exit 2. No diagnostic
-phase marker or fio-start appears; serial ends during boot after block-device
-detection. `admission_pass` is false. The final pre-result output total is
-64,791,306 bytes and the reported 64 MiB bound check passes; the two request
-logs account for 36,056,879 and 28,037,240 bytes. This is a retained observation
-failure to reach the target workload, not a completed fio diagnostic.
-
-Both distinct final vCPU records were preserved, with zero failed writes and
-zero dropped request lines. The normal resident's perf magic is false. K1
-records 39 flushes for each CPU, flush_us 62,814/60,415, and zero capacity
-flushes. Whole-launch host admission totals are 228,515,393/184,987,316 ns,
-while compiler hit counters are 143,248/136,499. These are boot-only cumulative
-observations; they neither isolate I/O-caused flushes nor explain fio's later
-slow progress. Disabled resident buckets remain unavailable.
-
-**Evidence validity:** accept the stop/resource/completeness observations and
-their explicitly boot-only counter scope. **Decision relevance:** the per-request
-logger exhausts this diagnostic budget before the workload; the run does not
-test the fio cache-flush/readmission hypothesis and provides no optimization
-or performance qualification. Do not extrapolate a fio speedup or change the
-workload to manufacture completion. The previous advancing-write diagnostic
-remains the relevant workload observation. No fourth repetition is planned;
-three of four fio campaign launches are used. No VM/build was performed by
-this review. Any production invalidation change requires its own correctness
-review/tests, and any claimed fio improvement requires fresh original admission
-and subsequently qualified measurements.
-
-
-### Targeted DMA invalidation — independent fresh-build replication
-
-Independent reviewer `/root/io_scope_review` reproduced the accepted targeted
-invalidation slice on November 8, 2026, without editing production or fixture
-sources. Raw evidence is retained at
-`/Users/liaozping/orca/natemu-raw/io1-20261108-01/targeted-replica-01`.
-Production design/code review was performed separately by `/root/io_window_author`;
-this entry establishes independent build/input verification and bounded replay,
-not a second exhaustive production review.
-
-**Inputs and method.** All 915 files in `targeted-build-02/source-sha256.json`
-were verified before copying into a new replica directory. Its original manifest
-hash is `280113b2c42c3f00f3a5963c57c87c992eff7fd25dfb0af7e25c40a2e8adaabd`.
-All 379 oracle02 hashes were also verified. Exactly two Python fixtures differ
-from the producing build snapshot: `run_io_windows.py` and
-`run_io_window_cases.py`; all shared compiled inputs match. Original tool copies,
-the original manifest, a separate overlay record and the resulting 915-file
-manifest are retained. The final input-manifest hash is
-`5459f2f6a89cb73f5da3adde9e1aebbf29bd30219c8ef72ce8878aca1f0ad81c`.
-Every input was rechecked after building and running.
-
-A fresh target directory built `natemu-host`, then the ordinary `natemu-cli` in
-a separate Cargo invocation, then the resident, using Rust 1.97.0 with locked,
-offline release builds. Host executables were signed with the retained
-entitlements; the resident stack audit passed. No full host-test repeat was
-needed for this replication; the author's reported 172 passing/2 ignored tests
-remain author evidence. The driver, ordinary CLI and resident SHA256 values are,
-respectively, `d3432c896d7556c0cd8a52ff6fe76cf07e828f4bf4b18fd9d67e504d140e2ba9`,
-`3c26461da1684505340f320c19d4036494af11bbbb2d5c0b4f1652325a4cc173`, and
-`2eac27aab329574ef99357109e90c0a113af40456fb58726ee59fde86b718fd6`.
-The existing pinned FEX artifact was hash-verified, not rebuilt:
-`3ccb420ccc8d4dc0b6f81366985ddedbbfe68e52f69a8d591f586dbe82d9d2f4`.
-An initial local script syntax-check command could not write Python bytecode to
-macOS's cache directory; an in-memory syntax check succeeded before any build
-or VM. This did not consume a VM or alter inputs.
-
-The root checked the exact commands before execution. Three serial VMs ran
-under the shared nonblocking lock, each with a 120-second runner bound: N4
-`run_io_windows.py --cpus 4 --preserve-code`, then N2 `pte-code` and `pde-code`
-through `run_io_window_cases.py`. All passed on their first attempt, with no
-retry or timeout and clean vCPU/compiler/VM teardown. Each reported 71 windows,
-64 snapshots, ordered overlap, code value 2, and progress for every participant.
-The N4 split counts were 4420/3396/2907/2480. Full-cache flush counts were exactly
-one per CPU in all three runs, satisfying the initialization-only allowance.
-
-Both PTE CPUs observed executable value `0x1122334455667788` before the host leaf
-edit and `0x8877665544332211` afterward. Both PDE CPUs observed those same old/new
-values for code and for data within the global 2-MiB mapping. The fixture enables
-PGE and reuses VA 0 after the shared function returns before publishing value 2;
-the PDE case additionally reuses the data address. Its wait flag starts at 2.
-These details avoid a stale initial observation or premature completion being
-mistaken for the intended remapping schedule. The guest performs no intervening
-INVLPG for the final host edit. Logs, generated programs, commands, individual
-verdicts and output hashes are retained in `windows/`, `cases/`, `completion.json`
-and the step records.
-
-**Evidence validity:** accepted for these concrete schedules: split-atomic
-snapshot coherence and progress, targeted code patch visibility, executable
-4-KiB/global 2-MiB mapping changes, and absence of additional whole-cache flushes
-in a small cache-fitting fixture. This is an independent fresh-source rebuild
-and replay of separately reviewed author fixtures; it is not an independently
-invented oracle, a fresh FEX build, or proof that every translation remained
-resident at the exact final-write instant. The full-flush counter does not by
-itself measure individual object retention or elapsed invalidation cost.
-
-**Decision relevance:** supports the scoped correctness/retention acceptance of
-the targeted invalidation change. It does not establish fio causality, improved
-throughput, Linux filesystem regression behavior after this change, or broad
-performance acceptance. Those require their separate unchanged-workload runs.
-This replication consumes exactly three launches, taking IO1 to 22/24. Cumulative
-retained IO1 storage measured approximately 1667 MiB (replica approximately
-82 MiB), within the 4 GiB bound. No further VM/build is part of this review.
-
-
-### Targeted DMA invalidation — source and executable-remap method review
-
-Reviewer `/root/io_window_author` independently reviewed the new targeted
-invalidation change and root-authored executable-remap fixtures on November 8,
-2026. This reviewer authored the earlier RAM-window/deferred-access foundation,
-but did not author this invalidation patch or the two new remap cases. This is
-source/method review, not independent execution; the fresh-build replay above
-was performed by a separate reviewer.
-
-**Source contract: accept.** In `crates/host/src/execution/io.rs`,
-`invalidate_page` uses the same physical-page ownership layout and atomic
-stale/summary/PAGES publication as the resident. `copy_with_permit` validates
-all spans, obtains all exact resident acknowledgements and the final one-use
-grant, and publishes every touched write page before the first RAM copy.
-Existing pending invalidations are OR-preserved. Cancellation before grant
-changes neither ownership records nor RAM. Configured participants are bounded
-to 1..64; bit 63 and high-RAM physical-page indices use the existing ABI layout.
-Unaligned and crossing-page spans cover both endpoints, and only checked,
-installed RAM ranges reach the copy. The private test backing now includes the
-complete global metadata layout; the crossing-page/owner/pending/cancel checks
-exercise actual record locations rather than a smaller substitute map.
-
-Keeping `written` for **every** write is necessary: a destination with no code
-owner can contain a guest PTE/PDE. Pre-ack shadow reset alone does not invalidate
-compiled-fetch mapping currency. On release, `io_checkpoint` drains pending
-page invalidations and calls the global `tlb(s, true)` wrapper before another
-acknowledgement or guest access. That wrapper conservatively resets shadows
-again; this is safe even though pre-ack reset already removed them. Existing
-`cache::invalidate`/`cut` remove stale objects and their incoming/outgoing links;
-`current` revalidates surviving objects against changed mapping currency.
-Retained local links rely on the unchanged source-page subset invariant.
-All-vCPU acknowledgement still excludes pending host compilation/publication;
-no host acknowledgement is synthesized. No checkpoint was added while a
-selected step/block, active memory operation, or raw completion metadata is
-live. The uncached step path therefore retains its prior exclusion premise.
-No correctness blocker was found in these connected paths.
-
-The page-iteration comment was clarified after review: counting visits rather
-than unique pages, many short crossing spans can each touch two pages. This
-was a documentation bound correction, not a runtime defect. Retained producing
-source and later comment-only workspace revision remain distinguishable.
-
-**Oracle scope and corrections.** `run_io_windows.py --preserve-code` rejects
-more than one whole-cache flush per CPU. This tiny fixture fits the cache and
-has one initialization flush from the loader, so the allowance is meaningful:
-the retained old implementation had four. Existing split-atomic snapshots,
-ordered overlapping copies, code-patch observations and per-CPU progress remain
-required. The flag is now recorded in manifests/results. This proves the
-absence of additional full flushes in that finite fixture, not universal object
-residency, invalidation latency, or a fio bottleneck.
-
-Two substantive defects in the initially unexecuted `pte-code`/`pde-code`
-method were corrected before freeze/execution. The large-PDE wait byte starts
-at 2, so its loop now compares against 2 rather than prematurely completing on
-a nonzero byte. Both cases now rewarm executable VA 0 **after** calling the
-shared function and **before** publishing its saved result; the PDE case also
-rewarms data VA 0x1000. Observing the patched shared-function result on both
-CPUs therefore establishes rewarming after the preceding code-patch window,
-without imposing a false requirement that an object must remain resident at
-every subsequent scheduling instant. A prelude-only warmup, or a warmup before
-the function call, would not establish that ordering.
-
-The final host byte edit changes a global executable 4-KiB PTE from physical
-16 MiB to 16 MiB + 64 KiB, or a global executable 2-MiB PDE from physical 32 MiB
-to 16 MiB. PGE is enabled, code/stacks/page tables remain mapped independently,
-and the guest performs no intervening INVLPG for the final edit. Both CPUs must
-observe old/new code constants; the large case additionally checks old/new data
-constants. Scratch bytes occupy unused table entries. Both cases retain the
-full-flush allowance. Corrected oracle02 was accepted for bounded execution;
-oracle01 remains retained and unrun. Broader permission changes, aliases and
-link combinations remain outside this finite method.
-
-### fio original-admission continuation — independent method review
-
-Reviewer `/root/io_window_author` accepts the continuation method after the
-separate targeted-invalidation review and fresh-build replication. No build or
-VM was performed during this review. The original campaign's three consumed
-launches remain failures/diagnostics; extending its declared limit to seven
-launches and 3 GiB leaves exactly two N2 write/relaunch pairs. Stop at the first
-failure in either pair, retain it, and reassess rather than retrying.
-
-The frozen `io-fio-admission-20261108-01/oracle-01/natemu/tools/` runner hashes
-match the original prepared input manifest and the unchanged workspace copies:
-`run_fio_admission.py` SHA256
-`7285f523371fc07389618d47733cc153637a9e90f046c02c86950218fda3953c`,
-`run_virtio_block.py` SHA256
-`93e5d8233c4795000aa2d03f3513d7437fde885acdd4f76328c1724b03ab77b3`, and
-`run_virtio_rng.py` SHA256
-`f7103db0b326cb6f2bd45d6a2c0986286911b9a803236ade41f8ac930c8fc9f7`.
-Original `inputs-01/inputs.json` SHA256 is
-`59429f6adf4b0e00dc7829de72d77e5acd458eeab49e6a8bebc774f5c2859cd2`.
-The primary's `io1-20261108-01/targeted-build-02/fio-build-manifest.json`
-correctly binds all three supplied binaries, the source-manifest hash and eight
-retained build-result hashes; these were recomputed and matched. The independent
-pair needs its own equivalent binding to its independently rebuilt binaries.
-
-Each pair clones the pristine 512 MiB root and checks its hash, rather than
-reusing a timed-out or previously written image. The unchanged runner checks
-prepared inputs and binaries before execution and records its exact oracle and
-command. Both boots keep N2, 2 GiB guest RAM, compile-cache off, the original
-240-second limit and a bounded log size. `NATEMU_PERF_LOG` is removed from the
-child environment. There are no diagnostic workload or parsing shortcuts.
-The original guest verifies its library/profile hashes, parses all eleven jobs,
-and executes the genuine 64 MiB, 4-KiB, direct io_uring depth-16 CRC workload.
-The write job keeps verification and end_fsync; the restart job cannot create
-a missing file. Admission requires all bytes read/verified, clean guest status,
-remount-read-only, S5, matching whole-file hash after relaunch, an unchanged
-whole disk during that read-only boot, and offline read-only fsck. Native-tool
-timeouts are retained and converted into failures; any first-phase failure
-prevents the second launch.
-
-**Decision relevance:** this is eligible continuation of the original functional
-admission criterion with a separately reviewed production revision. No reduced
-workload or relaxed oracle was substituted. Passing would qualify this concrete
-application/workload and restart path; it would not establish the cause of the
-previous timeout, a measured speedup, sustained throughput, latency, or comparative
-durability. Those conclusions require separate qualified measurements.
-
-
-### Original fio admission — independent normal-CLI replay after targeted invalidation
-
-Independent `/root/io_scope_review` reproduced the original two-boot functional
-fio admission on November 8, 2026. Evidence is retained at
-`/Users/liaozping/orca/natemu-raw/io-fio-admission-20261108-01/replica-01`, with
-separate `replica-01-build-manifest.json`, command, reproduction script and run
-records in the campaign directory. Root reviewed the exact binding/command
-before execution and released the shared lock after its primary pair and the
-separate frontend regressions completed.
-
-The normal CLI and resident came from the independent fresh-target build in
-`io1-20261108-01/targeted-replica-01`, described above. The CLI was built separately
-from the testing driver; the guest ran through ordinary CLI/Boot/block/S5 paths.
-All 915 final build-input hashes were reverified, as were CLI, resident and
-pinned FEX hashes against that independent build record. No new compiler build
-was needed. The original oracle's three files, all prepared output hashes and
-native filesystem-tool hashes were verified. The runner remained exactly
-`7285f523371fc07389618d47733cc153637a9e90f046c02c86950218fda3953c`.
-Prepared-input manifest hash remained
-`59429f6adf4b0e00dc7829de72d77e5acd458eeab49e6a8bebc774f5c2859cd2`.
-The original image/workload and its 64 MiB length were not reduced or rewritten;
-a fresh image clone was made for this pair. These checks establish immutable
-input reuse, not an independent reconstruction of the Debian package/image
-preparation or independently invented oracle.
-
-Exactly two serial N2 boots ran under the nonblocking shared VM lock, with the
-unchanged 240-second per-VM and 64 MiB live-log limits, no retry. Both passed:
-
-- Write boot: genuine fio 3.39 loaded its dependencies; all 11 profiles parsed;
-  the `io_uring`, direct=1, iodepth=16, 4-KiB, CRC32C verification job reported
-  error 0, 67,108,864 bytes written and 67,108,864 bytes read back.
-- Read-only restart: all version/profile checks passed again; verification
-  reported error 0, 67,108,864 bytes read and zero bytes written. The persisted
-  file hash matched the write boot, and the entire disk image was unchanged.
-- Both guests remounted root read-only and reached `Power(1)`; both native
-  `e2fsck -fn` runs completed all five passes with exit 0. Neither boot timed out
-  or exceeded the log limit. Recorded phase elapsed times were 105.471 and
-  98.010 seconds, used here only to establish compliance with the execution bound.
-
-The within-pair file SHA256 is
-`80e7cf1242d8b625db127243a84f3ba77fd0306c61fd9523daf53f932af0d6ed`.
-The post-write/pre-verify/post-verify image SHA256 is
-`86b58ea9bf2ca7a206551129f726cae097bd1e8f5a8b4a1cc967d87146585a37`.
-Cross-run equality with the author's separately generated file is not required
-by this oracle; persistence is checked across this replica's own relaunch.
-
-**Evidence validity:** accept functional admission of the unmodified installed
-fio workload and its required userspace/kernel interfaces through the production
-copy-first block path, including full CRC verification, successful S5, clean
-filesystem and read-only persistent restart. Guest-reported achieved fio depth
-is retained; it does not imply that the backend processed 16 native jobs
-concurrently. This is an independent execution using independently built normal
-CLI/resident binaries and the original reviewed oracle/inputs. The FEX binary
-and image preparation are shared retained inputs.
-
-**Decision relevance:** the unchanged original admission now completes in both
-author and independent executions after the targeted invalidation change.
-This qualifies the functional slice and a post-change integrated Linux/block
-regression. It does not isolate the cause of the earlier timeout, quantify an
-optimization speedup, qualify benchmark scores, compare QEMU, establish host
-cache bypass from guest direct I/O, or replace remaining network/combined-load
-acceptance. The original timeout and diagnostic failures remain retained.
-The reviewed extension is exhausted at 7/7 campaign launches, including those
-failures; cumulative allocated storage measured approximately 1775 MiB, within
-3 GiB. No additional build or VM is included in this review.
-
-
-### Network endpoint all-HLT lifetime — independent review and replication
-
-Independent `/root/io_scope_review` reviewed the root-authored arrival fixture,
-idle observation and positive/negative oracles before execution, then rebuilt
-and replayed the positive case from frozen inputs. Evidence is retained under
-`/Users/liaozping/orca/natemu-raw/io4-halt-20261108-01`, including the independent
-`replica-01` and both negative attempts. No production or fixture source was
-edited by the reviewer.
-
-**Source/method review.** The existing idle observer requires all configured
-participants to be nonended, equal double-read park states and an unchanged
-idle tuple across at least 100 ms. It reads the existing liveness metadata after
-the park reads and requires live=1, kickers=0 and io_active=false. The observation
-adds no veto, Busy guard, doorbell or guest-RAM access. Its trace precedes release
-of the packet worker's atomic latch. The worker owns bytes, attempts receive
-once, and exits normally when the port closes. The guest issues no QueueNotify
-or TX; a configured RX chain alone does not schedule owner work. Thus the
-PacketPort arrival guard is the remaining asynchronous liveness source.
-
-The guest programs level-triggered GSI17 through the I/O APIC to LAPIC vector
-0x40, then STI/HLT. The handler records InterruptStatus 1 before ACK and 0 after,
-increments its marker, and performs LAPIC EOI. Exact 384 KiB RAM comparisons
-cover the RX header/payload, unchanged padding, descriptors/rings, IDT and
-handler status/marker bytes. Final interrupt count must be exactly one; the
-positive stop is poweroff at the post-OUT RIP with forbidden post-power R15
-still zero. The negative oracle requires the specific resident HALTED completion,
-zero interrupts, unchanged initial RAM and only the closed endpoint trace.
-Timeout, cancellation and arbitrary resident exits do not satisfy it.
-
-**Primary and isolated negative evidence.** The primary positive run observed
-101,214 us at tuple [1,0], followed by exactly arrival:true and closed, one HLT,
-one IRQ and clean poweroff. The isolated negative build's source manifest differs
-from the positive build only at `crates/host/src/virtio/net.rs`: the endpoint's
-real `device.irqs.busy()` guard is replaced with a Busy holding an unconnected
-atomic counter initialized to 1. Its precise diff is retained; workspace
-production was not mutated. This removes the liveness veto without removing
-the endpoint or changing guest/oracle inputs.
-
-The first negative attempt (`negative-live-01`) remains **FAIL**: the expected
-underlying behavior occurred, but the original oracle expected stop label
-`halted`. Actual serialization is stop=`resident`, reason=`halted status=1
-detail=32`, as `program.rs` serializes `Stop::Resident`. Its RIP was 0x100246,
-halts=1, interrupts=0, RAM unchanged and trace only closed. This source/oracle
-mismatch was missed in the initial review and was corrected only in the test
-oracle, retaining the failed attempt. The revised oracle requires the exact
-reason as well as the resident label and adds a wrong-reason negative control.
-A fresh corrected negative run (`negative-live-02`) passed with that same
-specific HALTED/no-packet/no-IRQ/no-RAM-effect outcome. Neither attempt is
-rewritten or retroactively promoted.
-
-**Independent reproduction.** All 915 frozen `build-01` file hashes were verified
-and copied into a new replica with a fresh target. Original source-manifest hash:
-`f5f13a301eea5146163803effd5483927ce673e37a7de2b88b36eff284420535`.
-Only the separately frozen corrected `run_virtio_net.py` was overlaid, hash
-`bb4a32960cb09c93cc5f46405c1e7680f8ac9f1573c45f99d5d972962b031c9e`;
-original tool and original/final manifests plus overlay record are retained.
-The final manifest hash is
-`e714aba041b40221fd764624abdff88c7076b3cad29b09d3d0d318602558c1b0`.
-Locked/offline Rust 1.97.0 release builds of the program driver and resident,
-host signing, resident stack audit and five-guest/77-negative-control self-check
-all passed. Driver SHA256 is
-`1c371d2fcb19cb983212c6bef4b24e4bd5cb54841a96f86779678017a7effab9`;
-resident is `2eac27aab329574ef99357109e90c0a113af40456fb58726ee59fde86b718fd6`.
-The existing pinned FEX binary was hash-verified, not rebuilt. Inputs were
-rechecked unchanged after building and execution.
-
-One positive N1 replay ran under the shared nonblocking VM lock with the
-120-second bound and no retry. It passed on the first attempt: held_us=100723,
-first=last=[[1,0]], live=1, kickers=0, io_active=false, followed by exactly
-arrival:true and closed. The guest ended poweroff at 0x1002d8 with R15=0,
-halts=1 and interrupts=1; exact RAM and complete vCPU/compiler/VM teardown
-checks passed. The post-ACK bytes are zero, marker and prior status are one,
-and RX used.idx=1/used.len=76. No native backend was launched.
-
-**Evidence validity:** accept independent reproduction of this concrete N1
-all-HLT endpoint-liveness schedule, owned RX arrival, production queue/DMA path,
-real GSI/I/O-APIC/LAPIC interrupt delivery and ACK, and successful completed-RX
-S5 shutdown/endpoint joining. The separately inspected isolated negative gives
-specific evidence that the fixture detects the missing lifetime guard. The
-reviewer independently built/replayed the positive; the negative build/runs
-remain root-authored evidence. The oracle and pinned FEX are shared inputs.
-
-**Decision relevance and limits:** closes the frontend's concrete asynchronous
-arrival-after-all-HLT gap. Stable resident park metadata is not proof that a
-particular ARM WFI was executing at the observation instant. S5 follows RX
-completion, so this does not test shutdown with an RX transaction still active.
-It does not establish native networking, Linux network behavior, SMP packet
-wakeups, backend privilege admission, combined workload behavior or performance.
-The four-launch campaign is exhausted at 4/4, including the retained oracle
-failure; allocated storage measured approximately 245 MiB, below 1 GiB. No
-additional build or VM is part of this review.
-
-### Active network TX lifecycle — pre-execution independent review
-
-Independent `/root/io_scope_review` reviewed the root-authored `program_net.rs`
-Hold/HoldPort seam, program-driver registration/power hook and the
-`active-other-queue`/`active-power` fixtures and exact RAM/trace oracles before
-any live run in `io4-active-20261108-01`. No production changes, builds or VMs
-were performed by this review. **Accepted for the declared four-launch,
-120-second-per-VM, 1 GiB campaign**, subject to retaining frozen inputs and
-primary/independent outcomes; this is method acceptance, not observed execution.
-
-The first callback holds already-owned TX bytes. Its entered flag is published
-under the hold mutex; the guest waits for that flag and verifies both used
-indices remain zero. The condition-variable wait releases its mutex and has a
-five-second deadline, below the production TX-retirement deadline. It neither
-holds a RAM window nor creates guest-memory authority. The callback still returns
-through the production PacketPort completion channel and normal queue owner.
-
-For the other-queue case, reaching the guest release port requires RX disable
-and readback to finish while TX remains held, with the TX queue still ready and
-used index zero. The callback's first loopback receive must then be rejected.
-A second packet uses the same TX queue and a newly configured RX queue; exact
-RAM checks bind old-RX non-effects, two distinct TX completions and fresh RX
-completion. For the power case, only the existing `REQUEST_POWER_POLL` hook
-releases TX. The preceding power-port service has already called device quiesce,
-and resident scalar OUT commitment precedes that poll. The test therefore
-forces S5 entry while the first native callback is held, rejection of its later
-RX arrival, and accepted TX completion before successful shutdown. Exact
-post-OUT RIP/R15, whole 384 KiB RAM, ordered packet/release/closed trace and
-clean teardown constrain the result. No guest completion or IRQ is fabricated
-by the fixture.
-
-One nonblocking metadata correction was reported before freeze: both active
-cases issue zero RX QueueNotify writes, whereas the generic `rx_notifications`
-field defaulted to one. The effect oracle does not depend on that field; record
-zero for these cases. Source acceptance does not establish live success,
-backend failure behavior, same-queue active reset, SMP scheduling, real network
-connectivity or performance. The guest-control case specifically tests disabling
-the idle RX peer queue while TX is active; the power case tests one accepted TX
-transaction, not arbitrary concurrent traffic.
-
-
-### Active network TX lifecycle — independent fresh-build results
-
-Independent `/root/io_scope_review` verified and reproduced both accepted active
-TX schedules. Evidence is retained at
-`/Users/liaozping/orca/natemu-raw/io4-active-20261108-01/replica-01`.
-All 915 original `build-01` hashes and all 915 `oracle-02` hashes were checked;
-the sole difference is the reviewed RX-notification metadata correction in
-`tools/run_virtio_net.py`, consistent with `binding.json`. Original and final
-manifests and binding hashes are retained. The original manifest SHA256 is
-`ee04c270ab5c27e59de128f38919e453efa7d21109c785bb638abca3f5a4bae3`;
-the oracle/final manifest is
-`2326d32f53a0a2f05f4127db95665cbda4fcaca7a73fd4bcbd907086f7492b24`.
-No reviewer production or fixture edits were made.
-
-A fresh target built the driver and resident from copied oracle02 sources plus
-sibling rust-vmm using locked/offline Rust 1.97.0 release builds. Host signing,
-resident stack audit and the seven-guest/111-negative-control fixture self-check
-passed. Driver SHA256 is
-`7d0ed4413b57717c6e15e0aaa8a0586642707925891477758d342cca0b0c8206`;
-resident is `2eac27aab329574ef99357109e90c0a113af40456fb58726ee59fde86b718fd6`.
-The existing pinned FEX artifact was verified, not rebuilt. Source hashes were
-rechecked unchanged after building and running.
-
-Exactly two N1 VMs ran serially under the shared nonblocking lock, bounded to
-120 seconds each, with no retry. Both passed on their first attempt:
-
-- `active-other-queue`: exact trace shows first TX held, guest release after RX
-  disable/readback, rejected first loopback RX, then a second TX with accepted
-  fresh RX, and closed endpoint. Independent inspection of all 393,216 RAM
-  bytes matches the expected image. The original RX's entire 64 KiB region is
-  unchanged; old-RX/TX/new-RX used indices are 0/2/1, and TX used entries are
-  heads 0 and 4 with length zero. The guest reaches its expected final RIP with
-  R15 zero. This observes peer-queue disable while the first callback is active,
-  followed by continued use of that same TX queue.
-- `active-power`: exact trace shows first TX held, release by the real power
-  poll hook, rejected loopback RX after quiescence, then closed endpoint. Exact
-  RAM matches, original RX remains unchanged, and TX used.idx is one with
-  head 0/length zero. The guest stops poweroff at post-OUT RIP 0x10023f with R15
-  zero, so the forbidden following marker did not execute. Both cases report
-  complete vCPU/compiler/VM teardown.
-
-**Evidence validity:** accepted for these concrete active-TX schedules and
-independent fresh-build reproduction. The root-authored primary outcomes were
-also inspected and have the same exact queue/RAM effects. Source review binds
-port release to completed peer disable and power release to committed S5;
-callbacks use owned bytes and return through production completion paths.
-The fixture and pinned FEX remain shared inputs rather than independently
-invented/rebuilt components.
-
-**Decision relevance and limits:** closes the specified peer-queue preservation
-and accepted-TX S5-drain frontend gaps. It does not qualify same-queue active
-reset, SMP interleavings, terminal native callback failures, Linux networking,
-real connectivity/backend privileges or performance. The corrected notification
-count is metadata only and changes no compiled path. The campaign now uses
-4/4 launches with approximately 172.5 MiB allocated, within 1 GiB. No further
-build or VM is part of this review.
-
-
-### Network tool inputs — independent static preparation review
-
-Reviewer `/root/io_window_author` accepts the retained preparation at
-`/Users/liaozping/orca/natemu-raw/io-network-tools-20261108-01` as static inputs
-for later guest admission. No material preparation defect was found. This
-review did not author the preparation scripts, download packages, execute guest
-binaries, start a packet service or launch a VM. The independent verifier and
-result are retained in `review-01/`; that later review directory is explicitly
-outside the original input manifest. `verify.py` SHA256 is
-`638e2f975a3603516861ecb4507c961168036aad83d5ddedae50c14b337f1127`.
-
-The reviewer reran native `gpgv`: all three signatures validate against the
-expected retained primary fingerprints. Copied InRelease, amd64 index, keyring
-and public-key files match the earlier signed fio preparation. The index hash
-and byte count match the signed InRelease entry. This is the selected signed
-snapshot, not a claim of current package/security freshness. All 66 selected
-archives independently match signed package names, versions, architecture,
-filenames, byte counts and SHA256. All 162 Depends/Pre-Depends edges satisfy
-their recorded version alternatives, and the complete package set is reachable
-from the four requested roots. The recorded 49 reused and 17 fetched archives
-are accounted for; no Recommends closure is claimed.
-
-All 2016 original file/link bindings match `input-files.json`, whose SHA256 is
-`ac32d7e5ac46f21e0e1986f7809b675da12817603cdacb395561109d57202700`.
-An independent archive traversal reconstructed expected regular-file contents,
-permissions and symlink/hardlink results. The 1937 staged root files/links match
-exactly, including the two declared loader aliases and generated certificate
-bundle. Source inspection confirms regular files are extracted before guest
-symlinks, hardlinks precede symlinks, archive traversal paths are rejected, and
-no maintenance scripts or target executables run. The copied preparation log,
-package records and producer scripts remain bound by the original manifest.
-
-The bundle is exactly 150 packaged PEM roots, ordered by path with normalized
-trailing newlines, all enabled. Every root matches its archive and the bundle
-hash is `714d457d580922dbf1d0be8bd35ba236a842b50b0072ae791582a19adef772a5`.
-Native OpenSSL successfully parsed all 150 certificates. This explicit CA-file
-policy does not reproduce a locally customized Debian trust selection or create
-OpenSSL's hashed CA directory; neither capability is claimed by preparation.
-
-An independent ELF64/x86-64 parser checked all five entry points (`iperf3`,
-`curl`, `netperf`, `netserver`, `openssl`), their interpreter and DT_NEEDED edges,
-content hashes and guest-relative symlink resolution. Exactly 41 objects are
-reachable, with none missing and no RPATH/RUNPATH in this concrete closure.
-Default Debian library-directory resolution matches the recorded targets.
-Static closure does not test symbol-version loading, runtime dlopen/providers,
-NSS/DNS, TLS configuration, command-line options or package post-install state.
-Those remain guest admission tasks, along with real connectivity, the native
-backend decision and every network/combined performance claim. Preparation
-remains within its declared 128-package/512-MiB/zero-VM scope; this review adds
-no runtime acceptance or public-endpoint evidence.
-
-
-### Native/QEMU fio baselines — independent source review and reproduction
-
-Independent `/root/io_scope_review` reviewed the exploratory method and runner
-before execution, then freshly rebuilt native fio and replayed one QEMU pair
-and one native pair. Raw evidence is under
-`/Users/liaozping/orca/natemu-raw/io-fio-baselines-20261108-01` in
-`replica-build-01`, `replica-qemu-01` and `replica-native-01`. No source/workload
-changes, downloads or automatic retries were made by the reviewer. Root held
-other builds/benchmarks while this replication ran, and the shared lock serialized
-both backends. The independent runs consumed the remaining two guest launches
-and two native jobs.
-
-**Reviewed method.** The runner uses the unchanged original Linux kernel,
-bootstrap and 512 MiB ext4 root. CONFIG_VIRTIO_PCI is built into this kernel;
-the earlier attempted module preparation failed before a VM and its unused
-outputs remain retained. QEMU is pinned 11.1.2, i440fx-11.1, TCG multi-threaded,
-CPU=max, two vCPUs/2 GiB, modern virtio-blk PCI, one queue of 128, writeback and
-threaded native AIO; indirect/event-index/packed/reset/discard/write-zeroes are
-disabled. This still differs from natemu's MMIO device, advertised segment
-limits, CPUID and one-active-request backend. Guest queue parameters and full
-commands are retained rather than claimed equal.
-
-The original admission oracle checks all 11 profile parses, genuine fio3.39,
-full CRC32C bytes, clean S5, offline filesystem checks and unchanged whole image
-on read-only relaunch. Native profiles differ only in filename and
-ioengine=posixaio, retaining direct=1, 4 KiB, depth16, 64 MiB, CRC32C and final
-fsync on the write job. The native file is recreated for each pair and checked
-unchanged by the second process. The reviewer requested and verified fixes for
-malformed timing-record retention, native fio.json size accounting, transitive
-runner-source hashes and the native build-manifest binding before primary runs.
-The frozen baseline runner hash is
-`c5f2b22a343102a5b71e82eacc9c2ff26e8e190484b332ac5f9c08b9e0b63c77`.
-
-**Independent inputs/build.** All four frozen oracle02 hashes, prepared-output
-hashes and original input-manifest binding were verified. QEMU binary hash
-matches the primary manifest:
-`a1b97665fb9f341a65acf9b0e7dc4c7235972aae61182545ed1aacf5ffca87fa`.
-Native fio was extracted into a new directory from the retained upstream3.39
-archive, SHA256
-`e2f4ff137061b44ceb83a55eb9ca8856fe188db6d9b00cb59f8629c9162afe0a`,
-then built with default `./configure` and `make -j4 fio`. All 693 extracted source
-files remain unchanged. Version/architecture checks pass; the independent
-config-host.h equals the primary default-build configuration. Independent arm64
-binary hash is
-`7e7cd449798e9f6e6e98046ac766bcc7a06f53e1bccdc9644a0db723469ea2fc`.
-Its separate binary manifest is checked by the runner. The earlier portable
-primary binary remains retained but was not used in these observations.
-
-**Observed correctness.** Both independent pairs passed first attempt, without
-timeout or log limit. Each write job reports error0, 67,108,864 write bytes and
-67,108,864 CRC-verification read bytes; each subsequent read job reports error0,
-67,108,864 read bytes and zero write bytes. Both QEMU boots pass all 11 parses,
-reach powerdown with exit0 and pass all five e2fsck phases. The replica QEMU file
-hash is `5b498bf27e9f64899929ba9552e8309dc169f83539f054da507304b4f7ef86d1`;
-the post-write/restart image hash stays
-`e359c44c640e2a829d9477fee2c9f2ce631c5d8e76713211e2daaf1178aa3fb3`.
-The replica native file hash stays
-`9b2bc4dfa4867dd2c8743d1aafbb086a8f74deac185213bc54dd6dd0b06d471c`
-across its pair. Cross-run generated-file equality is not required; preservation
-is checked within each pair.
-
-**Timing observations, seconds.** The ranges below are the two raw observations
-(primary and independent), not confidence intervals or repeated benchmark
-qualification. Job columns are fio's reported job_runtime; the write job includes
-its verification phase. Do not derive a phase total by summing independently
-rounded read/write runtime fields.
-
-| Configuration | Write + verification job | Restart/read-only job | Write process wall | Read process wall |
-| --- | ---: | ---: | ---: | ---: |
-| QEMU TCG, two observations | 1.898–2.041 | 0.823–0.831 | 9.492–9.883 | 8.615–8.835 |
-| Native arm64, two observations | 0.220–0.221 | 0.042–0.045 | 0.596–0.601 | 0.343–0.346 |
-| Natemu matching primary pair, one observation | 68.928 | 40.661 | unavailable separately | unavailable separately |
-
-The natemu admission runner's recorded 125.075/97.897-second durations include
-post-exit image hashing and fsck, so they are whole-phase durations rather than
-strict process-wall equivalents. Its full byte/CRC/S5/fsck checks also pass.
-These finite observations show natemu substantially slower on the tested
-configuration; they do not isolate why. Both guest configurations report about
-99.908% at requested fio depth16. Native reports only 15.277–15.323% at depth16
-for the write/verify job and 7.208–7.489% for the read job, spending most operations
-at depth8. Guest fio depth is not native-backend concurrency.
-
-**Source comparability limits.** Retained native source implements direct mode
-through F_NOCACHE (`os/os-mac.h`), and its enabled POSIX-AIO sync path calls
-`aio_fsync(O_SYNC)`. Natemu's block sync calls fcntl command51/F_FULLFSYNC;
-QEMU's threaded raw-file flush calls `qemu_fdatasync`, whose upstream implementation
-uses fdatasync when configured and fsync otherwise, rather than F_FULLFSYNC.
-See [QEMU raw-file flush](https://github.com/qemu/qemu/blob/v11.1.2/block/file-posix.c#L1601)
-and [the sync wrapper](https://github.com/qemu/qemu/blob/v11.1.2/util/osdep.c#L581). Native APFS/arm64/posixaio, guest
-ext4/x86/io_uring, CPU=max versus natemu's CPUID profile, cache behavior, segment
-limits, transport and backend concurrency all differ. The native destination is
-on the host Data volume, confirmed APFS by mount output. No host caches were
-purged, no cold-storage or sustained-SSD claim is made, and process times include
-startup. CRC work itself can use different ISA implementations. The native
-source build is independent; QEMU, guest image/preparation and the reviewed
-runner are shared retained inputs.
-
-**Evidence validity/relevance:** accept these bounded correctness-passing
-end-to-end baseline observations and their independent reproduction. They fill
-the requested missing reference/native measurements and motivate targeted
-profiling; they are not product-wide performance qualification or causal
-attribution to copying, invalidation, emulation, engine or storage alone. No
-connectivity/backend-privilege work occurred. The campaign is exhausted at
-6/6 guest launches and 4/4 native jobs; cumulative allocated storage measured
-approximately 1075 MiB, within3 GiB. Further runs require a new bounded assignment.
-
-### Selective DMA mapping invalidation: independent source/method review — November 8, 2026
-
-**Scope and disposition:** accept the candidate for the bounded, uninstrumented
-execution campaign; no remaining substantive source blocker found. This is a
-source review, not an independent runtime or performance result. The author
-reports candidate builds, focused tests and initial ordinary/PTE/PDE passes;
-independent reproduction remains assigned separately.
-
-The review followed the actual fetch, data-fault and segment/helper walkers
-(`runtime/src/execution.rs` and `execution/segments.rs`) into
-`GuestTables::read`. All three production consumers use `CodeWrites`, whose
-required `CodePages::table_read` hook now marks the physical page before loading
-an entry. Failed and repeated reads also mark; no current host-side page-table
-walker bypass was found. The host compiler consumes resident-resolved fetch
-GPAs. This coverage must be preserved if another walker is introduced.
-
-The global bitmap is conservative and monotonic for the VM lifetime. It covers
-the physical span, including high RAM, rather than compact installed-RAM indices;
-cache/shadow resets and physical-page reuse do not erase dependencies. The host
-checks it only after every exact resident acknowledgement and the one-use permit
-grant. Every write still publishes `written` and physical code invalidations;
-only table-page overlap publishes `tables_written`. Residents drain code posts
-and, where required, invalidate global fetch currency before acknowledging a
-later request or re-entering guest code. Keeping shadow reset before each
-acknowledgement preserves existing split-access progress and data mapping
-coherence. Cancellation before grant cannot publish either write epoch. A later
-successful epoch cannot overtake an unconsumed prior write on one resident,
-because it needs that resident's new acknowledgement. Monotonic epoch values
-avoid losing an owed table invalidation across canceled or adjacent windows.
-
-The appended bitmap and window field leave compiler-visible code/lookup/global
-virtual bases and existing mask/record offsets unchanged. Host backing offsets,
-stride and mappings derive from the enlarged global extent; layout assertions
-bound it. FEX slice-one exits enter the resident linker/dispatcher and do not
-address the appended state. Host and resident must be rebuilt together; this
-review does not claim arbitrary mixed-version ABI compatibility.
-
-**Resolved method defect:** the first helper revision required zero global
-mapping flushes for PTE/PDE fixtures as well as ordinary writes. That would reject
-correct intentional mapping invalidation. The reviewed correction makes
-`ordinary_writes=True` explicit only for the ordinary/code-write preservation
-fixture. PTE/PDE fixtures retain their actual changed execution/data-route
-oracles and no-full-code-cache-flush checks. The focused source tests additionally
-cover mark-before-load, failed/repeated reads, a page-crossing write, a mark
-published by the final participant, read windows, page reuse and canceled grant.
-
-**Relevance and limits:** selective invalidation removes a demonstrated source
-of unnecessary global currency/L1 work without relaxing copy-first quiescence or
-source-code coherence. It does not eliminate read-window shadow resets, and
-historical table-page reuse can conservatively reduce its benefit over time.
-The original complete fio write/CRC/relaunch workload, durability policy,
-timeout and correctness oracle remain unchanged. The declared campaign is
-bounded to 16 VM launches and 4 GiB, with isolated instrumentation and independent
-fresh-build replay. No speedup or causal fraction is accepted from source review;
-unchanged-workload final binaries and independently checked effects are required.
-
-### Retaining ordinary DMA shadows: independent source/method review — November 8, 2026
-
-The second candidate removes unconditional shadow reset from `io_checkpoint`,
-retains the full barrier before its exact acknowledgement, serves only
-`take_shadows`/`reset_shadows` while release is withheld, and unconditionally
-drains invalidations afterward. Tracked table writes still invoke global
-translation invalidation. Source review finds no substantive blocker: parked
-residents cannot access guest RAM, ordinary physical writes do not change their
-mapping routes, and holding/writable bits remain accurate until an actual reset.
-A peer asking after the acknowledgement can therefore finish its split or code
-mark operation and acknowledge the window. An ask racing release is handled by
-the post-release drain or the existing holding/kick/reset handshake. No generated
-continuation may be live at this checkpoint, as before.
-
-The proposed isolated host-only late-SHADOWS control is accepted in principle,
-pending inspection of its concrete source/oracle. After all exact acknowledgements
-and before grant, it records reset counters, posts real SHADOWS requests, and
-withholds release until counters advance and the request bits clear. Retain the
-epoch, all acknowledgement values, unreleased state and before/after counters;
-check cancellation and the existing finite admission deadline. Use the same
-instrumented host with a resident differing only by removal of the parked
-service block for the negative control. That run must show the named late-SHADOWS
-admission timeout, no copy/write publication, release and joined teardown;
-a generic watchdog timeout is not evidence of the intended dependency. This
-control observes the actual shared protocol and does not require guest-RAM
-access, a fabricated reset count or a production testing API.
-
-No build, VM or performance run was performed by this reviewer for this stage.
-The first selective-invalidation replica was deliberately held before copying or
-compilation while the author evaluates the next candidate. Ordinary/PTE/PDE,
-reset/network and full unchanged fio acceptance still require final uninstrumented
-binaries and independent retained-source reproduction. Source acceptance does
-not establish that the remaining performance gap has been resolved.
-
-The concrete late-SHADOWS control was reviewed before launch at
-`io-perf-repair-20261108-01/late-shadow-build-02`, with wrapper
-`/private/tmp/natemu-late-shadow-run.py`. An initial combined cancellation/deadline
-branch could label cancellation as the intended timeout; it was corrected before
-execution to record both causes, with the negative oracle requiring
-`canceled=false deadline_expired=true`. The final source checks reset advancement
-and cleared request bits while release is withheld. The wrapper requires the
-unchanged healthy-window oracle for positive, preserves the negative raw failure,
-and produces a separate expected-negative verdict checking the exact admission
-error, no service event, no outer timeout and joined teardown. Accepted for two
-bounded control launches. Bindings must retain both producing source manifests
-and the isolated diff: the inner runner's candidate04 source manifest alone does
-not describe the injected host binary. This paragraph records pre-execution
-method acceptance only.
-
-### Bounded acknowledgement spin: independent source/method review — November 8, 2026
-
-The candidate adds one 30-microsecond spin budget after the host posts all kicks.
-Every acknowledgement-poll iteration still checks cancellation and the original
-admission deadline before requiring exact acknowledgements from every participant;
-the one-use grant CAS remains after that loop. Once the budget expires the owner
-yields, and coordinator-lock contention continues to yield. No substantive source
-blocker found. This is a bounded scheduling policy candidate, not an established
-optimal duration or a high-vCPU-count performance result.
-
-Accept the proposed unchanged original fio comparison with `/usr/bin/time -lp`
-applied to the same whole runner for both spin-on and spin-off pairs. Report
-user/system CPU and fio job durations separately: runner CPU includes boot,
-children, hashing and fsck and is not the device owner's isolated CPU cost.
-Keep byte/CRC/durability/relaunch checks unchanged, serialize runs, retain failures
-and independently rebuild/replay the selected final candidate. Source review
-alone does not establish improved efficiency, and short owner-stack samples are
-a hypothesis for this policy rather than a measured causal fraction. No build or
-VM was executed by this reviewer during the comparison.
-
-### Owned descriptor-prefix reuse: independent source review — November 8, 2026
-
-The concrete `Snapshot`/owner change is accepted for bounded testing. It reuses
-only already-captured metadata while its available index remains ahead of
-`next_avail` in the same queue/device incarnation. Exhaustion or identity change
-forces a new capture; Empty, Canceled and Invalid dispositions discard the cache.
-Each subsequent chain still receives complete checked traversal and physical
-range validation. Payload capture, backend submission, completion publication
-and the fresh post-publication suppression read remain unchanged. Queue geometry
-is stable under the existing ready/active register-write guard; disable/reset
-advances checked generation counters. The owner still admits only one request
-and checks quiescence before selecting another, so prefetch does not expand the
-S5 accepted-work frontier.
-
-[Virtio 1.2 §3.3.1](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
-prohibits changing exposed, not-yet-used queue entries; §4.2.3 prohibits queue
-geometry access while QueueReady is nonzero. Permitting metadata prefetch is an
-inference from those ownership rules and the absence of a required reread, not
-an explicit normative endorsement of this cache. A prior completion aliasing
-later captured descriptor bytes retains the captured interpretation; freshly
-captured payloads and per-request validation still bound effects. Document this
-prefix-snapshot interpretation explicitly rather than attributing the precise
-alias outcome to the specification.
-
-The new unit tests cover captured-prefix use, exhaustion/new publication,
-incarnation mismatch/discard, malformed later traversal and index wrap. The
-`live_table` clone test checks owned-snapshot semantics; it does not execute an
-actual DMA alias schedule or prove owner notification progress. A focused live
-valid-first/malformed-second publication is recommended to verify reuse through
-the production owner with one backend effect/used entry, NEEDS_RESET and untouched
-second destinations. Existing fullqueue, reset/disable and network interleaving
-checks remain relevant. No build or VM was run by this reviewer for this change;
-no performance benefit is yet accepted.
-
-The added live `malformed-later` lifecycle fixture was independently reviewed
-before execution. It exposes valid read head0 and malformed read head3 together;
-head3 contains an out-of-RAM suffix after a valid writable prefix. The guest
-requires used index1, first status0, NEEDS_RESET/IRQ3 and untouched second status,
-then resets. The host oracle requires exactly one native call and commit, the
-valid 512-byte read, complete 128 KiB expected RAM, whole unchanged disk, exact
-terminal RIP/assertion marker and joined teardown. This is accepted as a bounded
-production-owner check of later captured-head validation. It does not force a
-live metadata alias or independently observe which snapshot path was taken;
-that linkage comes from the reviewed owner source. The author reports assembly
-and synthetic oracle checks; this reviewer has not executed the case.
-
-### I/O performance repair: final independent rebuild and replay — November 8, 2026
-
-**Disposition:** accept candidate06's bounded correctness and measured improvement,
-with no unresolved source blocker found. This does not establish completion of
-the broader performance objective, native networking or combined workload scope.
-The selected production change comprises monotonic table-dependency tracking,
-servicing shadow-drop requests while preserving otherwise valid parked mappings,
-and owned descriptor-prefix reuse. The 30-microsecond host spin experiment is
-excluded: its faster fio job came with worse complete-run wall and CPU cost.
-
-**Independent reproduction:** all 916 frozen inputs from
-`io-perf-repair-20261108-01/candidate-build-06` were hash-verified, copied to
-`replica-build-01` and rebuilt into a fresh target. Separate offline/locked Rust
-1.97 release builds produced the normal CLI, testing driver and uninstrumented
-resident; both host binaries were signed and the resident stack audit passed.
-No source or oracle was edited for the replay. The source manifest SHA-256 is
-`fc83da9133e682b63801689c9045cac352f17d1954d909e614706f4e24f3f3c7`.
-Final artifact hashes are:
-
-- Normal CLI: `69589dd9fd3ec7218b35c01fe35b3a7a78144d201985fdd09faa1eb8c3a75250`.
-- Testing driver: `20abda81939c597109f8158d165861b65925de7cdcc739e822c9c587c16f5211`.
-- Resident: `6f59db8b88a573f20233efb3e8497cb2671cebd81f3ebd1a69628a535fddce79`.
-- Shared pinned FEX: `3ccb420ccc8d4dc0b6f81366985ddedbbfe68e52f69a8d591f586dbe82d9d2f4`.
-
-Exactly four independently launched VMs passed first attempt, without retries.
-The N2 PTE/PDE cases each completed 64 snapshots and 72/71 total windows, changed
-code result from `0x1122334455667788` to `0x8877665544332211` on both CPUs, and
-preserved progress. The PDE case also changed the data route to the expected
-value. Each CPU reported three global mapping invalidations, one initialization
-full-cache flush and one killed patched block. This preserves intentional mapping
-invalidation while retaining unrelated code. The test warms relevant mappings
-but does not observe exact hardware TLB residency at the final write instant.
-
-The original fio oracle (`7285f523371fc07389618d47733cc153637a9e90f046c02c86950218fda3953c`)
-and original prepared image were reused, with their transitive sources/tool/input
-hashes verified. The write boot wrote and CRC-verified exactly 67,108,864 bytes;
-the restart boot verified that amount with zero writes. Both report fio error 0,
-16,384 reads, and 99.908447% achieved depth 16. All eleven profile parsing checks,
-library checks, clean S5 and offline e2fsck pass. The persisted file hash is
-`27be87e98cb8f76a0bd1a5e60fc5f785e406314630cba2415700f85da5d8d88a`;
-the complete image hash remains
-`4b3823b04c57a5b00f9bc2138c6a7c9ff3632c7b9aa023abfd2abee90dff9ccc`
-across read-only relaunch. File hashes need not match another write run: fio
-creates the verified file anew; persistence is checked within each pair.
-
-| Observation | Write + CRC job | Inline verification read | Restart verification job | Complete write/verify phases |
-| --- | ---: | ---: | ---: | ---: |
-| Primary candidate06 | 3.122 s | 1.004 s | 5.399 s | 35.718 / 28.970 s |
-| Independent candidate06 | 3.050 s | 1.143 s | 1.184 s | 36.256 / 33.487 s |
-
-Independent write-only runtime is 1.906 seconds; restart read runtime is 1.183
-seconds. `/usr/bin/time -lp` around the entire original pair reports 70.56 seconds
-real, 111.55 user and 18.87 system (130.42 CPU seconds). These include boot, child
-processes, hashing and fsck; they are not isolated device CPU costs or strict
-per-VM wall times. The independent complete verification phase is longer despite
-its shorter fio job. The primary's large inline-versus-restart read difference
-is mostly absent in the replica. Placement, warm execution, scheduling and
-storage explanations remain hypotheses; these two observations do not isolate
-the cause or justify selecting only the faster restart result.
-
-The write/CRC job improved from the retained 68.928-second baseline to 3.050–3.122
-seconds, about 22.1–22.6 times faster for this finite workload. Against earlier
-QEMU observations 1.898–2.041 seconds it is still about 1.49–1.64 times slower.
-Restart verification ranges 1.184–5.399 seconds versus QEMU 0.823–0.831 seconds;
-that variability prevents a stable near-parity claim. The earlier documented
-CPU/transport/backend/cache/durability differences remain, including natemu's
-F_FULLFSYNC and the reference's weaker flush path. These are exploratory complete
-correctness-passing observations, not a broad or sustained-storage score.
-
-**Additional evidence reviewed, not independently rerun here:** the late-SHADOWS
-positive control records exact epoch 1 acknowledgements, release 0 and reset
-counts `[0,0]`→`[1,1]` while release remains withheld. The isolated no-service
-resident instead records the named pre-grant deadline with canceled=false,
-released 1 and unchanged write epochs, and joined teardown; its raw healthy-window
-FAIL remains separate from the expected-negative PASS. The author also reports
-final reset/disable/fullqueue/malformed-later, contained sync failure, held compiler,
-high-RAM and network lifecycle/IRQ regressions. Their shared fixtures and primary
-execution remain separate from the four fresh-build independent replays above.
-
-All source and binary hashes were rechecked after execution. Producing commands,
-logs, manifests and 96 retained output hashes are in `replica-build-01`,
-`replica-tables-01` and `replica-fio-01`; `review-results.json` records machine-readable
-results. The campaign uses 39/40 launches and approximately 3085 MiB of 4 GiB.
-No additional run is assigned. Shared guest preparation, original Python oracle
-and pinned FEX limit independence; source build and the four executions are fresh.
-
-
-### I/O wait-loop doorbell ordering — independent forced reproduction
-
-`/root/io_window_author` independently built and exercised an isolated forced
-schedule for both production wait loops on November 8, 2026. This reviewer
-authored the earlier RAM-window foundation but neither the new production
-ordering fix nor the normal fio timing run. `/root/io_scope_review` reviewed
-the instrumentation and final oracle before execution. Evidence is retained at
-`/Users/liaozping/orca/natemu-raw/io-perf-pipeline-20261108-01/forced-controls-02`.
-No workspace production source was changed by this reproduction.
-
-**Construction.** Both variants derive from the verified `candidate-build-01`
-source and retained sibling dependencies. Four files change only in isolated
-copies: ABI private observation words, host observation/release methods,
-resident observation hooks, and a replacement for the test driver's existing
-window worker. Across the complete old/fixed source manifests, the only differing
-file is `runtime/src/execution/events.rs`, where the two wait-loop call orders
-differ. Old is checkpoint then doorbells; fixed is doorbells then checkpoint.
-The same bounded latch is immediately before doorbells in each variant. It
-never touches guest RAM, synthesizes an acknowledgement or enters a host call.
-The host runs real `copy_guest`, observes its published epoch and a real pending
-GIC kick via `Stops::ringing`, and only then releases the private latch.
-
-Both hosts/residents were freshly built offline with locked dependencies, signed
-where required, and passed resident stack audits. Original pinned FEX was
-hash-verified, not rebuilt. Post-run source hashes still match. Old/fixed source
-manifest SHA256 values are respectively
-`093a41c8feef22e1e1e9913ab647b465a5492fb5b09e5779950cddecd1e8a18f` and
-`a98bbaf60446bdeae1c8fa95d25c73e86f2d38d69b7219a7c6d1f0b14fe18763`.
-Binary bindings, exact commands, patches, generated programs and output hashes
-are retained. An earlier preparation script rejected an incorrect source anchor;
-`forced-controls-01` retains that failure, with zero builds/VMs. The corrected
-source derivation is distinct. A pre-execution oracle field-format correction
-was also completed before freezing the final runner.
-
-**Method.** Four N1 launches cover old/fixed HLT and old/fixed firmware-mailbox
-wait, under the shared VM lock and 120-second per-process limit. HLT uses CLI,
-HLT and a forbidden following register write, with no timer/interrupt setup.
-The mailbox case starts the sole vCPU directly in the production firmware wait
-path with a zero command/vector page; it is not an SMP AP-startup test. Private
-counters record acknowledged doorbells, wait-path entry and return. The old-order
-oracle requires pending epoch 1, acknowledgement 0, unreleased/unwritten state,
-a real kick changing from pending to cleared, and wait entry without a recorded
-return. These must hold at two observations separated by a 100-ms host delay,
-while the copy thread remains unfinished. Its only accepted failure is the
-normal 700-ms I/O acknowledgement deadline. The host read buffer must remain
-0xee, and full post-teardown guest RAM must retain the initial 0xa5 byte.
-
-Fixed-order cases use the same forced publication/kick schedule and require a
-successful real copy: the read returns 0xa5, acknowledgement/written/released
-all reach epoch 1, and guest RAM contains 0x5a. Every case checks the full
-0x308-byte target region; mailbox cases also check all 4096 mailbox bytes stay
-zero. Precise post-HLT or never-executed mailbox RIP, the untouched forbidden
-register, normal halted stop, intact frame/link checks and joined VM/compiler
-teardown are required. Thirty-six negative parser controls passed before launch.
-The final runner SHA256 is
-`585a5d365e75a2cdac79b6c7fabc94e0cf8b4c19c8fd5c782a36d09ce38ba7f3`.
-
-**Outcome: reproduced and corrected in the forced schedule.** All four cases
-pass on their first launch, without retry, process timeout or hook timeout.
-Both old cases observe exactly one drained kick and one wait entry with zero
-returns, remain unacknowledged at both positive observations, then report the
-specific acknowledgement timeout with no copy effect. Both fixed cases grant
-and publish the exact expected bytes. All four terminate `halted status=1
-detail=32`, with RIP 0x100002 for HLT or 0x100000 for the unstarted mailbox
-vCPU, and clean teardown. A later end-of-test kick may legitimately acknowledge
-the already released old epoch; the pending/final worker records precede that
-teardown kick and distinguish it from a successful copy.
-
-**Limits and decision relevance.** Pre-wait/return counters establish wait-path
-entry without an observed return, not instruction-level WFI PC sampling. This
-adversarial schedule demonstrates the lost-doorbell mechanism and that checking
-the request after draining its wake fixes these concrete paths. It does not
-measure the race's natural frequency, establish general SMP firmware behavior,
-or isolate its contribution to fio performance. Four reserved VM launches were
-consumed; the retained fixture is approximately 147 MiB. The exclusive build/VM
-slot was released before independent normal timing resumed.
-
-### Lost I/O wake: independent source review, control review and replay — November 8, 2026
-
-**Disposition:** accept the two wait-loop ordering changes and their finite
-correctness/performance evidence. The only differing input among the 916 frozen
-candidate01 and prior candidate06 source manifests is
-`crates/runtime/src/execution/events.rs`: HLT and firmware-mailbox loops now drain
-doorbells before checking the I/O request. No metadata batching, payload pipeline,
-extra backend concurrency, spin policy or guest-memory authority change entered
-this candidate. There is no unresolved substantive review blocker.
-
-**Mechanism:** old ordering can check an empty request, consume a newly posted
-request's sole kick, then enter its wait without acknowledging the request.
-New ordering checks the work after draining its wake. A kick arriving later
-remains pending to wake the wait. The audit found the relevant WFI sites in
-`lapic::wait` and the mailbox loop; the LAPIC helper does not drain the GIC.
-Deferred MMIO and power waits poll through HVC rather than draining then sleeping.
-No guest-memory access moved before the checkpoint.
-
-**Forced evidence, independently reviewed but executed by the separate fixture
-author:** `forced-controls-02` retains four source-derived, instrumented controls.
-Old/fixed variants differ only in the checkpoint placement around identical
-private-metadata latch/drain hooks. The host starts real `copy_guest`, observes
-request 1/ACK 0/release 0 and a pending GIC kick before releasing the latch. For both
-old HLT and old mailbox, the kick then becomes nonpending, the drain and pre-wait
-counters increment, and two observations including a 100 ms recheck show no wait
-return or acknowledgement. Both hit the specific 700 ms ACK deadline, release 1
-with written 0/ACK 0, unchanged destination and untouched read buffer 0xee. Fixed
-HLT and mailbox acknowledge 1, return the original byte 0xa5, write 0x5a and release
-successfully. Complete target memory and the all-zero AP mailbox are checked;
-all four end with exact `halted status=1 detail=32`, expected RIP, unchanged
-forbidden marker and joined teardown. Source/oracle hashes and actual records
-were reverified. The earlier preparation-anchor error is retained with zero VMs.
-
-These controls reproduce the consumed-wake path, not a statistical incidence or
-performance sample. Pre-wait/no-return counters do not sample an exact WFI PC;
-the AP0 fixture tests the firmware-mailbox path on one vCPU, not SMP startup.
-The standalone control oracle's 36 synthetic negative checks are author evidence.
-
-**Independent build and execution:** candidate01's 916 inputs were hash-verified,
-copied to `io-perf-pipeline-20261108-01/replica-build-01` and built into a fresh
-target with separate offline/locked Rust 1.97 normal-CLI and uninstrumented-resident
-release builds, signing and resident stack audit. The source-manifest hash is
-`a6bc68fbc8d62901a1a0bc1b54d258c5f02f1a1ee9d47be411a41903a89b51f8`;
-normal CLI is `fdacd5a29cd647f87835a9c58e0aa76867c40b431ed2cd8fc1dc3e990ce72441`,
-resident is `33d7b6fe80d42112d95406212bd38089782214cc380a4af3b18915595cba2bf4`.
-The pinned FEX, original prepared image and original fio oracle remain unchanged.
-The contemporaneous old baseline uses the previously independently built
-candidate06 binaries, whose producing source and binary hashes were rechecked.
-
-Exactly four independent VM launches ran serially under the shared lock: the
-old pair followed by the fresh fixed pair. Both pairs passed first attempt,
-without retries: all profiles/libraries, exact 64 MiB write and CRC readback,
-64 MiB restart read with zero writes, fio error 0, clean S5/e2fsck, persisted file
-hash and byte-identical read-only image. Each read has 16,384 I/Os and achieved
-depth16 is 99.908447%. The final fixed persisted file is
-`5c46ac543b65173f0953069e50400f65dbda262ea516fa344e32677e01376c8f`;
-the unchanged restart image is
-`7932aaf071b43ca6b287b34427d6cf9276932ffcbabf31cd988a946b16ef39f8`.
-
-| Observation | Write + CRC job | Restart verification job | Full write/verify phases | Whole pair real / CPU |
-| --- | ---: | ---: | ---: | ---: |
-| Contemporaneous retained old baseline | 4.072 s | 10.326 s | 76.970 / 26.450 s | 104.24 / 198.33 s |
-| Fixed primary | 1.619 s | 0.989 s | 9.113 / 7.998 s | 17.97 / 25.02 s |
-| Fresh fixed independent | 1.662 s | 0.992 s | 9.152 / 7.973 s | 17.94 / 24.84 s |
-
-Fresh fixed inline readback takes 0.542 seconds and writing 1.119 seconds; restart
-read runtime is 0.990 seconds. Its whole wrapper records 22.45 user and 2.39 system
-CPU seconds. The identical `/usr/bin/time -lp` wrappers include boot, hashing,
-postprocessing, offline checks and child processes, not isolated I/O CPU cost.
-No competing VM/build ran during the timing pairs.
-
-The contemporaneous pair shows about 5.81 times lower complete wall time and
-7.98 times lower CPU time. The old baseline varies substantially from its earlier
-65.55/70.56-second observations; the fixed primary and independent observations
-agree closely, but two fixed samples and a fixed old→new run order do not
-establish a stable general speedup distribution. Earlier QEMU write/CRC jobs
-were 1.898–2.041 seconds and restart reads 0.823–0.831 seconds. The fixed write job
-is faster in these finite observations, while restart verification is slower;
-previous filesystem/CPU/device/durability qualifications remain. This is not
-product-wide QEMU superiority, an SSD score, or proof that every earlier delay
-was this race. Broader workloads and native networking remain separate work.
-
-Nine additional normal-driver regression results were inspected, not rerun by
-this reviewer: HLT/AP, N4 split/cache preservation, reset, disable, power with
-halted peer, malformed-later, fullqueue and network halt/IRQ all pass. Source and
-binary hashes were checked again after independent execution; 179 output hashes,
-`review-results.json`, build commands/logs and the exact production diff are
-retained beside this review. Campaign accounting is 21/24 VMs, four launched by
-this reviewer, with approximately 1362 MiB of the 4 GiB cap at review time. No more
-VMs are assigned. Shared guest preparation/oracle/FEX limit independence; the
-fixed source build and four comparison executions are fresh.
-
-
-### Block completion rearming — independent forced regression controls
-
-`/root/io_window_author` authored and ran six isolated N1 controls for the new
-completion-time avail-index observation and retirement logic. The production
-increment was authored by `/root`; `/root/io_scope_review` reviewed the hooks,
-complete oracles and final narrow revision before execution. This fixture author
-previously authored the RAM-window foundation, but not this queue-retirement
-change. Final evidence is retained at
-`/Users/liaozping/orca/natemu-raw/io-perf-notify-20261108-01/forced-controls-03`.
-No workspace production source was edited for these controls.
-
-**Construction and provenance.** Four isolated variants derive from the verified
-`candidate-build-01` source and sibling dependencies: production behavior with
-observation hooks, plus three explicit counterfactuals. The counterfactuals
-respectively replace notification-preserving OR with assignment, remove the
-owned-prefix fallback, or force the completion's pending result false. They do
-not change native data buffers, queue validation, copy windows or guest replies.
-The same guest program is used for each positive/negative pair. New test-control
-ports release metadata-only holds; all queue publication and notifications are
-ordinary guest instructions. Hooks log fresh captured indices, owned snapshot
-indices and retirement inputs. No hook accesses guest RAM directly.
-
-A post-copy hold is before retirement/IRQ publication; the pre-copy hold is
-before the completion window grant. Neither holds `Virtio.state`; the isolated
-observer clones its Control Arc and releases `disk.control` before blocking.
-Owner-idle observations are made under the actual state lock and require no
-active request/notification, equal next_avail/next_used, the same live identity,
-a ready queue, DRIVER_OK without NEEDS_RESET/failure, and no closing, stopped or
-quiescing state. Its trace is appended before the phase becomes guest-visible,
-within the metadata gate. The guest records the observed phase before sending
-any separately traced rescue notification.
-
-All four hosts built and were signed; one fresh shared resident passed its stack
-audit, with identical resident/ABI inputs verified across variants. Existing FEX
-was hash-verified rather than rebuilt. All producing source hashes were rechecked
-after execution. The good source-manifest SHA256 is
-`2b0180cfe8b0bcff75077c7cacb809b45ae61acf081b0d94311e8f681411d8ba`.
-Final runner SHA256 is
-`f2cce8ae55eb9afbf5924255a427180f161ced639e97c1fdb9210d8e91cfb4d5`;
-51 negative parser controls passed. Exact commands, variant patches, manifests,
-guest assembly, full expected bytes and result hashes are retained.
-
-**Schedules and observed distinctions.** All six VM launches pass on their first
-VM attempt, without process/hook timeouts or retries:
-
-- After-capture notification: the first completion observes avail.idx 1 and
-  pending=false, then pauses. The guest publishes head 2 and QueueNotify before
-  retirement. Both variants record `retire:1:false:true:false`: no fresh-index
-  work or owned successor, but a real intervening notification. Production
-  drains head 2; the assignment counterfactual records idle at index 1 before
-  the traced rescue notification permits that request to run.
-- Owned-prefix alias: the first snapshot owns two heads. Its first IN payload
-  aliases live avail.idx to 1, so fresh pending is false while the captured
-  prefix still contains head 2. Both record `retire:1:false:false:true`.
-  Production drains the owned successor; the no-prefix counterfactual reaches
-  idle 1 and needs the explicit rescue. The second aliased payload sets live
-  avail.idx to 2, allowing a clean exhausted-queue observation afterward.
-- Before-capture publication: the guest publishes head 2 during the pre-copy
-  hold without a second QueueNotify. The completion sees avail.idx 2 and
-  pending=true. Production records `retire:1:true:false:false` and drains it;
-  the forced-false counterfactual records `retire:1:false:false:false`, reaches
-  idle 1, and requires rescue. This tests this implementation's fresh-index
-  guarantee, not a general permission for virtio drivers to omit notification.
-
-Every positive reaches idle 2 without rescue. Every negative must positively
-record idle 1, then the rescue marker and actual QueueNotify, before the second
-native read; a timeout or unexplained lack of progress cannot pass. All six then
-publish a third request after the observed idle decision and complete it through
-ordinary notification. This checks publication after idle, not that the owner
-had necessarily entered its native condition-variable sleep.
-
-Each case performs exactly three successful 512-byte native reads at offsets
-0, 512 and 1024, retires the three expected used entries/statuses, and retains the
-same device/queue incarnation in idle observations. The complete 128-KiB guest
-RAM image and whole 2-MiB disk match their byte oracles; the latter remains
-unchanged. Full post-VM records agree with normal reports, guest checks finish
-normally, and all vCPU/compiler/VM teardown checks pass. Final queue disable and
-IRQ acknowledgement are ordinary guest accesses after idle 3.
-
-**Corrections and accounting.** `forced-controls-01` was built but never run:
-review found that its idle phase preceded the trace append. Separate revision
-02 fixes that ordering. Its first process invocation was rejected by Clap's
-unchanged test-schedule allow-list before VM creation; command, stderr and
-failure remain retained. Revision 03 changes only that test-driver allow-list
-relative to 02, and its runner changes only the retained-root path. Guest inputs
-and oracle logic remain identical. All new modes were verified in native help
-output and the narrow delta reviewed before execution. Accounting is six actual
-VM launches plus one rejected CLI process with zero VM launches; the unrun and
-help invocations add no VM launches. The exclusive slot was released immediately
-after the six results for independent normal timing.
-
-**Decision relevance:** these controls support the three specific rearming
-premises and demonstrate that each counterfactual loses work until rescue. They
-are finite N1 correctness evidence, not performance samples, arbitrary alias
-liveness guarantees, SMP/reset coverage or a replacement for the separate
-integrated fio and reverse-order fresh-build comparison.
-
-### Completion-index scheduling — independent review and reverse replay, November 8, 2026
-
-**Disposition:** accept this small scheduling change and its scoped correctness
-evidence. No substantive source or reproduction blocker remains. It removes an
-unnecessary empty queue scan when a block completion observes no further work;
-it does not change backend concurrency, request admission, guest-memory authority,
-durability, reset or S5 ordering. Write/CRC job improvement appears in both run
-orders, while the evidence does **not** establish a substantial whole-workflow
-speedup or a reliable restart-read improvement.
-
-**Source:** the 916-entry frozen candidate differs from the prior wake-order
-candidate only in `host/src/virtio/{mod,block,net}.rs`. Block completion reads
-four available-ring bytes after all payload/status/used publication writes in
-the same granted window. Flags retain their existing IRQ meaning; the index is
-compared against wrapped `next_avail + 1`. The actual owner calls `retire_request`,
-which retires once and OR-preserves both a late notification and an already-owned
-snapshot successor under the existing incarnation, ready, status and quiescing
-gates. Reset retirement follows. RNG/network retain their previous rearming
-behavior. The two new unit tests cover 16 truth-table combinations, seven lifecycle
-gates and one stale snapshot; their temporal coverage is supplied separately below.
-Notification progress assumes conforming queue ownership. The code does not
-promise liveness for arbitrary aliases that corrupt device-owned `used.flags`.
-
-**Forced schedules:** the separate fixture author executed all six cases in
-`forced-controls-03`; this reviewer inspected source, hooks, oracle and actual
-records independently, and reconstructed the complete final 128 KiB declared
-RAM from initial memory plus the three native disk sectors. All exact effects
-match. Each case performs exactly three native reads and three committed used
-entries, retains an unchanged 2 MiB disk, and joins/destroys cleanly.
-
-The first schedule publishes and notifies after the first completion observation
-but before retirement, then publishes again after the second idle retirement.
-Replacing OR with assignment strands the second request. The second schedule
-captures two heads whose input payloads overwrite the live available index;
-removing the captured-prefix fallback strands the successor. The third publishes
-before the completion window; forcing pending=false strands work that the fresh
-index detects. Each negative records actual owner-idle at index one with the
-correct incarnation and no active, notified, closing, stopped or quiescing work,
-then a separately traced rescue notification; positives reach idle two without
-rescue. Exact event order, hook timeout rejection, guest markers, IRQ/status and
-full memory checks are enforced. The third case tests this implementation's
-fresh-index guarantee, not permission for arbitrary drivers to omit required
-notifications. These are single-vCPU instrumented correctness controls, not
-performance samples or exhaustive schedule exploration.
-
-The reviewer caught a trace-order race: phase publication preceded recording
-owner-idle. It was corrected by recording the event before exposing the phase
-under the same control mutex. `forced-controls-01` was built but unrun. The first
-`forced-controls-02` process was rejected by the CLI allowlist before any VM was
-created; that command/error is retained. The isolated `-03` correction adds only
-three testing mode names to the CLI allowlist in each variant; guest programs,
-oracle logic and expected effects remain unchanged. All six actual VM schedules
-passed first launch, with no hook timeout. The 51 synthetic oracle controls are
-author evidence, not independently rerun by this reviewer.
-
-**Independent production reproduction:** all 916 candidate inputs and the prior
-baseline source were hash-verified. A fresh target built the ordinary CLI and
-uninstrumented resident separately, offline and locked with Rust 1.97; signing
-and stack audit passed. The producing manifest is
-`62669f3c8ad72f19febc5d0706e4fdb110a39afa4ad113fd57aa4cee7fca36bd`.
-Fresh CLI SHA-256 is
-`4c0a8b7f3ffd8750773e53a13474d2b77b783c5b93c0c7b8c35b42a2980319e1`;
-resident is unchanged
-`33d7b6fe80d42112d95406212bd38089782214cc380a4af3b18915595cba2bf4`.
-Original prepared inputs, fio oracle and pinned FEX were reverified unchanged.
-
-The author ran old→new; this reviewer ran new→old under the shared VM lock,
-with no competing build or VM during timing. All four independent launches
-passed first attempt, no retries: exact 64 MiB writes/readback, 64 MiB restart
-read with zero writes, CRC, library/profile checks, persisted file identity,
-clean S5/fsck and byte-identical read-only whole-image restart. Each read has
-16,384 I/Os; depth16 remains 99.908447% in the independent jobs.
-
-| Observation | Write + CRC job | Restart verification job | Whole pair real / CPU |
-| --- | ---: | ---: | ---: |
-| Author baseline, first | 1.653 s | 0.568 s | 17.27 / 24.40 s |
-| Author candidate, second | 1.356 s | 0.935 s | 17.37 / 23.85 s |
-| Independent fresh candidate, third | 1.393 s | 0.883 s | 17.15 / 23.55 s |
-| Independent baseline, fourth | 1.894 s | 0.925 s | 17.62 / 25.08 s |
-
-Fresh candidate full write/restart phases are 8.589/7.746 seconds; baseline
-phases are 8.893/7.912. Fresh candidate writing takes 0.916 seconds and inline
-readback 0.476 seconds; restart read runtime is 0.882 seconds. Baseline values
-are 1.109, 0.783 and 0.924 seconds. Whole-wrapper CPU includes boot, guest work,
-hashing, offline checks and children. Reverse ordering reduces one ordering
-confound but four pairs are still finite observations without cache purging or
-a controlled latency distribution. The mixed restart results and nearly flat
-integrated time must remain visible. Earlier QEMU/native comparisons retain
-their platform, topology, cache and durability qualifications.
-
-Eight later normal-driver regressions were inspected, not rerun by this reviewer:
-reset, disable, halted-peer poweroff, read error, write error, malformed successor,
-full queue and network halt/IRQ all pass their oracles. Four VMs were executed by
-this reviewer; campaign accounting is 24/24 actual VMs including the six forced
-controls, eight regressions and final two diagnostic phases, plus the retained
-pre-VM CLI rejection. Final allocation was about 2.45 GiB within 4 GiB. `replica-build-01/review-results.json`,
-219 output hashes, source/binary bindings, build/run commands and full logs retain
-reproduction details. No further VM is assigned. Native networking and broader
-combined-capability acceptance remain outside this performance increment.
-
-
-**Final mechanism diagnostic:** the two additional author-executed phases passed
-the full original oracles and produced complete, distinct vCPU0/1 performance
-records with zero failed/dropped logs. This reviewer checked their actual records
-and the earlier post-wake diagnostic. Last periodic write/read window counters
-fall from 132096/67584 to 101376/52224; empty scans fall from 30545/15416 to 137/82.
-The last native-job periodic counters are 33792/17408 in both diagnostics.
-These support removal of redundant empty scans and their memory windows.
-Counters omit final partial 1024-event intervals, and different counter families
-are not atomically sampled; matching periodic native counts are not proof of exact
-whole-run request-count equality. Instrumented timings are not normal benchmark
-scores and do not alter the mixed restart-read or nearly flat integrated-time
-conclusions above. The campaign's 24 command records include these two phases;
-no further build or VM is requested of this reviewer.
-
-### Restart investigation — final kick-elision source and independent full-pair review, November 8, 2026
-
-**Disposition:** accept final `io-perf-restart-20261108-01/candidate-build-02`
-for its narrow correctness-preserving change. A vCPU already acknowledged for
-this exact unreleased I/O epoch does not need another doorbell. The candidate
-still checks that participant's terminal state under the existing stop mutex;
-it skips only the native ring. There is no unresolved substantive source or
-replication blocker. Restart measurements remain variable, so this review does
-not establish a broad or stable performance improvement.
-
-**Source/lifecycle review:** `copy_with_permit` invokes its participant callback
-for every vCPU with an exact-epoch acknowledgement flag. Production dispatches
-to `Stops::kick_if_needed`, which checks `ended` under the existing mutex before
-its optional ring. Ordinary `kick` delegates with `needed=true`. The callback
-flag cannot become stale within this serialized, unreleased epoch: resident DSB
-precedes acknowledgement, and guest access cannot resume before release. Old or
-late acknowledgements cannot satisfy a later epoch. Per-peer cancellation, exact
-all-ACK admission, final permit grant and release-on-error remain unchanged.
-
-The first provisional implementation skipped the entire callback and therefore
-also skipped its ended check. Although the current device owners cancel pending
-permits before participant departure, that narrowed the public copy API's
-terminal guarantee. Independent review required the final unconditional callback
-and optional ring. Earlier candidate01 timings are provisional evidence, not
-qualification of the corrected candidate02. The final unit test checks an
-exact-ACK-but-ended peer is observed and rejected with zero guest-write effects,
-written epoch zero and release epoch one. The two-epoch test also checks that
-prior-epoch ACKs do not suppress later rings. Tests use the generic seam; the
-production stop-lock ordering was independently source-reviewed.
-
-The restart-only runner was separately reviewed. It validates a prior successful
-read-only restart, file hash and actual unchanged image; each run clones and
-rehashes the same seed. Default full-pair behavior and all original CRC,
-library/profile, S5, fsck, persisted-file and whole-image checks are preserved.
-The declared A B B A B A A B ordering balances run positions and removes image
-content/layout as a between-build difference, but does not control every host
-scheduling/cache effect or identify a cause by itself.
-
-**Independent reproduction:** all 916 frozen final inputs were verified and
-copied to a fresh target; normal CLI and unchanged resident were separately built
-offline/locked with Rust 1.97, signed and stack-audited. Relative to the prior
-notify candidate, only `host/src/execution.rs`, `host/src/execution/io.rs` and the
-separately reviewed restart-runner source differ. Producing manifest SHA-256:
-`3f780aa2d91e3b09acdb81d28ff4f7cfb925d3a7a15c3c67f299f5a711f32b8c`.
-Fresh CLI: `891b541c906d490c3f72bdd35b1c762646a3e98c456d1a58375700592bd2e30c`.
-Resident: `33d7b6fe80d42112d95406212bd38089782214cc380a4af3b18915595cba2bf4`.
-The original full-pair oracle, prepared inputs and pinned FEX were reverified.
-
-Exactly two independent normal VMs ran under the shared lock, without competing
-build/VM work or retry. Both passed the unchanged original write→restart oracle:
-64 MiB written plus CRC readback, 64 MiB restart read with zero writes, full
-profile/library checks, clean S5/fsck, persistent file identity and unchanged
-read-only whole image. The actual image was independently rehashed after run.
-File SHA-256 is `cb6bf0efd4783348f7a7188a55649582343287bdca25ce9e6cdc621aa139d311`;
-unchanged restart-image SHA-256 is
-`2dad4abe8329e29c0a6c32661eb841ec09ebc53b8d1a996026c303ef362ab41e`.
-
-The write/CRC job takes 1.375 seconds (0.899 writing, 0.475 inline readback);
-restart verification takes 0.488 seconds (read runtime 0.487). Full phases take
-8.987/7.587 seconds; the whole wrapper takes 17.40 seconds real and 23.85 CPU
-seconds (21.98 user, 1.87 system). Wrapper costs include boot, hashing, checks and
-child processes. These are finite observations, not isolated backend latency.
-
-The author's final same-seed C B B C comparison also passes: corrected candidate
-restart jobs are 0.476/0.749 seconds versus prior candidate 0.909/0.506 seconds.
-Both builds still vary; integrated full-restart times overlap. Four normal-driver
-regression oracle records were inspected, not rerun by this reviewer: N4 split
-atomics/code preservation, pending-compiler timeout/resume, active reset and HLT
-cooperation all pass. Shared guest preparation/oracle/FEX limit independence;
-producing source verification, compilation and the two full-pair executions are
-independent.
-
-Evidence is retained under `replica-build-01` and `replica-fio-01`, including
-`review-results.json`, 80 output hashes, exact commands, full logs and build/source
-bindings. The campaign finished all 32/32 authorized VM launches successfully, including
-provisional comparisons, final comparisons, four regressions, four diagnostics
-and two full pairs. The initial replica-review allocation was approximately
-1.64 GiB within the 4 GiB cap; later successful identical read-only images were
-deduplicated with paths and hashes retained. No more VMs are
-assigned to this reviewer. Native networking and broader combined-capability
-acceptance remain separate work.
-
-
-**Final primary and diagnostic follow-up:** the primary final-candidate full pair
-also passed first attempt: write/CRC 1.331 seconds, restart 0.768 seconds, full
-phases 8.517/7.703 seconds, wrapper 17.03 seconds real and 23.60 CPU seconds.
-The independent full pair above remains a fresh production build/execution,
-not a replay of the profile binary.
-
-This reviewer separately inspected all four completed baseline-profile runs.
-Every extent classifier reports exactly 16,384 unique admissions and successful
-completions, invalid zero; both natural-HVC boundaries exist for both vCPUs.
-Each log has exactly two terminal vCPU records, with failed/dropped zero. Their
-fio jobs take 0.499, 0.500, 0.916 and 0.789 seconds; the classified first-admission
-to last-publication envelopes take 0.483, 0.484, 0.900 and 0.774 seconds. These
-are distinct boundaries, not interchangeable timers.
-
-In the two faster observations, QueueNotify accesses come from vCPU0 and IRQ-ACK
-accesses from vCPU1. The slower third observation records both on vCPU1; vCPU0
-has 876.5 ms in the resident halted bucket, but 413.7 ms of host-thread CPU time.
-The fourth observation has mixed notification placement (1876 on vCPU0, 14507 on
-vCPU1). Native execution stays at 18.3–19.0 ms and the copy-window copy portion
-at 6.8–7.4 ms, while total window time varies from 212.9 to 420.5 ms. The source
-supports interpreting this as an association between vCPU work/coordination
-placement and restart variability; it does not show exact fio-thread identity,
-prove placement causes the difference, or isolate every guest/host contribution.
-
-The halted bucket includes resident `io_checkpoint` activity within the HLT path,
-so it is not pure host sleep. Natural-exit snapshots are not simultaneous with
-the phase boundaries; CPU0 skew reaches 2.815 ms at the third begin and 4.331 ms
-at its end, and 4.079 ms at the fourth end. Host/resident categories and native/
-lane-wait times overlap and must not be added as disjoint costs. Boundary counter
-arrays and MMIO access arrays are separately sampled. This profiler uses the
-notify baseline with unconditional kicks, not selected candidate02; its results
-do not measure the selected optimization's causal effect. Instrumented timings
-are diagnostic, not new benchmark scores. No general restart speedup or blanket
-performance-completion claim is added by these observations.
+**Negative result: the run never reached the workload.** An independent reviewer inspected the
+retained results. The diagnostic stopped after about six seconds at the live-log threshold (exit
+2), during boot after block-device detection, with no phase marker or fio start;
+`admission_pass` is false. The 64 MiB size bound check passes, and both final vCPU records were
+preserved with zero failed or dropped lines. The counters (cache flushes, admission time, compiler
+hits) are boot-only cumulative observations; they neither isolate I/O-caused flushes nor explain
+fio's later slow progress, and the disabled resident buckets stay unavailable.
+
+**Decision:** the per-request logger exhausted the budget before the workload, so the
+flush/re-admission hypothesis was not tested and no optimization or performance claim follows. Do
+not extrapolate a speedup or alter the workload to force completion. The earlier advancing-write
+diagnostic remains the relevant observation. No fourth repetition was planned (three of four
+launches used). Any production invalidation change needs its own correctness review, and any fio
+improvement claim needs a fresh original admission and qualified measurements.
+
+Campaign: `natemu-raw/io-fio-admission-20261108-01` (`diagnostic-live-02`); method review
+`natemu-raw/io-fio-admission-20261108-01/diagnostic-oracle-01/review.md`.
+
+## Targeted DMA invalidation — independent fresh-build replication
+
+**Verdict: accepted for the scoped correctness and retention of the targeted invalidation
+change (concrete schedules below); not a second exhaustive production review.** An independent
+reviewer, without editing production or fixture sources, verified all 915 input files and 379
+oracle hashes (only two Python fixtures differ from the producing snapshot; the original
+manifests and an overlay record are retained), rebuilt the driver, ordinary CLI and resident in a
+fresh offline target (stack audit passes; the pinned FEX artifact was hash-verified, not
+rebuilt), and ran three VMs once each: four vCPUs with preserved code, and two vCPUs for
+page-table-entry and page-directory-entry remaps. All passed on the first attempt with clean
+teardown, ordered overlap, patched code and per-participant progress, and exactly one
+whole-cache flush per vCPU (the initialization-only allowance). Both vCPUs saw the executable
+value change after the host edited a 4 KiB leaf and a global 2 MiB entry (and its data), with PGE
+on and no intervening INVLPG; the fixture reuses the address after the shared function returns
+so a stale initial value or premature completion cannot be mistaken for the remap. A local
+script syntax check failed once on bytecode-cache writing and was redone in memory before any
+build or VM.
+
+**Not established:** this is a rebuild and replay of separately reviewed author fixtures, not an
+independently invented oracle or a fresh FEX build; it does not prove every translation stayed
+resident at the exact final write; the flush counter does not measure object retention or
+invalidation cost; no fio causality, throughput, Linux filesystem regression behavior or
+performance. The author's host-test count remains author evidence.
+
+Retained review: `natemu-raw/io1-20261108-01/targeted-replica-01/review.md`.
+
+## Targeted DMA invalidation — source and executable-remap method review
+
+**Verdict: source contract accepted; no correctness blocker; two oracle defects corrected before
+execution.** A reviewer who wrote the earlier RAM-window foundation (but neither this
+invalidation patch nor the two new remap cases) reviewed source and method; it was not an
+execution, which the fresh-build replication above provides.
+
+**Source:** the host invalidation uses the resident's physical-page ownership layout and atomic
+publication; the copy validates all spans, gathers every exact acknowledgement and the one-use
+grant, and publishes every touched page before the first RAM copy; pending invalidations are
+preserved; cancellation before grant changes neither ownership nor RAM; participants are bounded;
+high-RAM and unaligned or page-crossing spans cover both endpoints. Marking the written range for
+every write is necessary because a destination without a code owner can hold a guest page-table
+entry; after release the checkpoint drains pending invalidations and conservatively resets
+shadows again before any further guest access. Existing cache removal and link cutting remove
+stale objects, surviving objects revalidate against changed mapping currency, no host
+acknowledgement is synthesized, and no checkpoint was added during a live step, memory operation
+or raw completion metadata. A page-iteration comment was corrected (it counts visits, not unique
+pages); documentation only.
+
+**Oracle corrections:** the large-entry wait byte started at 2 so its loop prematurely completed
+on any nonzero byte; both remap cases now rewarm the executable address after the shared function
+returns and before publishing its result (the page-directory case also rewarms data), so
+patched-result observation on both vCPUs establishes rewarming after the code-patch window
+without demanding residency at every later instant. The "no extra whole-cache flush" check
+(the old implementation had four) proves only the absence of extra flushes in this fixture, not
+residency, latency or a fio bottleneck. Corrected oracle accepted; the first version stays
+retained and unrun. Broader permission changes, aliases and link combinations are outside this
+method.
+
+## fio original-admission continuation — independent method review
+
+**Verdict: the continuation method is accepted, with no build or VM run by the review.** A
+reviewer (author of the earlier RAM-window work) checked that the frozen runner, prepared input
+and the three supplied binaries bind to the retained manifests (hashes recomputed and matched);
+the independent pair needs its own equivalent binding for its independently rebuilt binaries. The
+original campaign's three consumed launches remain failures or diagnostics; extending to seven
+launches leaves exactly two write/relaunch pairs, stopping and retaining the first failure in
+either.
+
+**Method:** each pair clones the pristine root and checks its hash (never reusing a timed-out or
+written image); two vCPUs, 2 GiB RAM, compile cache off, the original 240-second limit and no
+performance log. There are no diagnostic workload or parsing shortcuts: the genuine 64 MiB 4 KiB
+direct io_uring depth-16 CRC workload with verification and end-of-job fsync; the restart job
+cannot create a missing file. Admission needs all bytes read and verified, clean guest status,
+read-only remount, power-off, matching whole-file hash after relaunch, an unchanged whole disk
+during the read-only boot and an offline read-only fsck; native-tool timeouts count as failures.
+
+**Not established:** passing would qualify this application, workload and restart path only; not
+the cause of the earlier timeout, a speedup, sustained throughput, latency or comparative
+durability.
+
+## Original fio admission — independent normal-CLI replay after targeted invalidation
+
+**Verdict: accepted as functional admission of the unmodified installed fio workload through the
+production copy-first block path, including full CRC verification, successful shutdown, clean
+filesystem and read-only persistent restart.** An independent reviewer reproduced the original
+two-boot admission using independently built normal CLI and resident binaries (from the fresh
+targeted-invalidation rebuild; the CLI was built separately from the testing driver, and the guest
+ran through the ordinary CLI, boot, block and shutdown paths), the original reviewed oracle and
+inputs (all input, prepared-output and tool hashes reverified, runner and manifest unchanged), and
+a fresh clone of the original image and unreduced 64 MiB workload. The main session reviewed the
+exact command before execution.
+
+**Result:** two serial two-vCPU boots under the shared lock with the unchanged limits and no retry
+both passed. The write boot loaded genuine fio 3.39, parsed all 11 profiles and completed the
+direct io_uring depth-16 CRC32C job with no errors and all bytes written and read back. The
+read-only restart repeated the checks, read all bytes, wrote none, found the persisted file hash
+matching and the whole disk unchanged. Both guests remounted read-only, powered off, and passed
+offline e2fsck; neither timed out.
+
+**Not established:** this does not isolate the cause of the earlier timeout, quantify any speedup,
+qualify benchmark scores, compare with QEMU, show host-cache bypass from guest direct I/O, or
+replace the network and combined-load acceptance. Guest-reported depth does not mean sixteen
+concurrent native jobs. The compiler binary and the image preparation are shared retained inputs,
+not independently rebuilt. The original timeout and diagnostic failures remain retained. The
+extension is exhausted at its launch limit including those failures.
+
+Retained: `natemu-raw/io-fio-admission-20261108-01/replica-01/review.md`.
+
+## Network endpoint all-HLT lifetime — independent review and replication
+
+**Verdict: accepted: independent reproduction of the one-vCPU all-HLT endpoint-liveness schedule
+(owned receive arrival, production queue and DMA path, real interrupt delivery and acknowledgement,
+successful completed-receive shutdown), plus specific evidence that the fixture detects a missing
+lifetime guard.** An independent reviewer reviewed the arrival fixture, idle observation and
+positive and negative oracles before execution, then rebuilt and replayed the positive case from
+frozen inputs (915 input hashes verified; only the corrected network runner overlaid, with the
+overlay recorded; locked offline builds, signing, audit and five-guest self-check pass; compiler
+binary hash-verified, not rebuilt). The reviewer edited no source.
+
+**Method:** the idle observer requires all participants non-ended, equal park reads and an
+unchanged tuple over at least 100 ms, then live metadata showing the arrival guard held and no
+kickers or active I/O, adding no veto, guard, doorbell or guest-RAM access. The guest does no queue
+notify or transmit; a configured receive chain alone schedules no owner work, so the packet-port
+guard is the sole liveness source. The guest takes a level-triggered interrupt through the I/O
+APIC to the local APIC, records status before and after acknowledgement, and exact RAM, final
+interrupt count and poweroff position are checked.
+
+**Negative evidence and a failure kept:** an isolated build replaces the real busy guard with a
+disconnected counter (diff retained; workspace production never mutated), removing the veto without
+removing the endpoint. The first negative attempt FAILED: the expected behavior occurred but the
+oracle expected stop label "halted" whereas the program serializes a resident stop with reason
+"halted status=1 detail=32". This source/oracle mismatch was missed in the initial review and was
+corrected only in the test oracle (it now requires the exact reason and has a wrong-reason negative
+control); the failed attempt is retained. The corrected negative run passed: the specific halted
+outcome with no packet, no interrupt and no RAM effect. The independent replay of the positive case
+passed first time (observed idle tuple held about 100 ms, one halt, one interrupt, clean teardown).
+The negative build and runs remain main-session evidence; the oracle and compiler are shared.
+
+**Not established:** stable park metadata does not prove a particular native wait-for-interrupt was
+executing at the instant; shutdown follows receive completion, so shutdown with an active receive
+is untested; no native networking, Linux network behavior, multi-vCPU packet wakeups, privilege
+admission, combined load or performance. The four-launch campaign is exhausted, including the
+retained oracle failure.
+
+Retained: `natemu-raw/io4-halt-20261108-01/replica-01/review.md`.
+
+## Active network TX lifecycle — pre-execution independent review
+
+**Verdict: method accepted for the declared four-launch campaign; method acceptance only, no
+observed execution.** An independent reviewer reviewed the testing hold seam on the first transmit
+callback, program-driver registration and power hook, the two active fixtures and their exact RAM and
+trace oracles before any run, changing and running nothing. The hold publishes an entered flag under
+its mutex, releases the mutex while waiting with a five-second deadline below the production
+retirement deadline, holds no RAM window and creates no guest-memory authority; completion still
+returns through the production channel and queue owner.
+
+**Cases:** in the other-queue case the release requires the idle receive queue's disable and
+readback to finish while transmit stays held and its used index remains zero; the first loopback
+receive must be rejected, then a second packet uses the same transmit queue and a newly configured
+receive queue. In the power case only the real power-poll hook releases transmit, so shutdown
+entry is forced while the first callback is held, its later receive is rejected and its transmit
+completes before shutdown. No guest completion or interrupt is fabricated.
+
+**Correction:** both cases issue zero receive-notify writes while the generic field defaulted to
+one; metadata only (the effect oracle did not depend on it), recorded as zero.
+
+**Not established:** live success, backend failure, same-queue active reset, multi-vCPU scheduling,
+real connectivity or performance; the tests cover peer-queue disable during active transmit and one
+accepted transmit during shutdown, not arbitrary concurrent traffic.
+
+## Active network TX lifecycle — independent fresh-build results
+
+**Verdict: accepted for both concrete active-TX schedules, with independent fresh-build
+reproduction.** An independent reviewer verified all 915 original and 915 oracle hashes (the sole
+difference is the reviewed notification-metadata correction), built the driver and resident in a
+fresh offline target (signing, audit and the seven-guest self-check pass; compiler artifact
+verified, not rebuilt) and ran two one-vCPU VMs once each, both passing first time with no retry.
+The main session's primary outcomes were inspected and match.
+
+**Result:** in the other-queue case the first transmit is held, the guest releases it after the
+receive disable and readback, the first loopback receive is rejected, a second transmit then
+accepts a fresh receive and the original receive region is entirely unchanged (all 384 KiB of RAM
+inspected). In the power case the real power poll releases transmit, a later receive is rejected
+after quiescence, the transmit completes, and the guest stops after the power instruction without
+executing the following marker; both tear down cleanly.
+
+**Not established:** same-queue active reset, multi-vCPU interleavings, terminal native callback
+failures, Linux networking, real connectivity or backend privileges, performance. The fixture and
+compiler are shared rather than independently invented or rebuilt. The campaign launch budget is
+used.
+
+Retained: `natemu-raw/io4-active-20261108-01/replica-01/review.md`.
+
+## Network tool inputs — independent static preparation review
+
+**Verdict: accepted as static inputs for later guest admission; no material defect.** A reviewer who
+did not author the preparation re-verified it without downloading, executing guest binaries,
+starting a packet service or launching a VM: native signature checks pass; the signed index, all 66
+selected package archives, all dependency edges and reachability from the four requested tools, all
+2016 input bindings and the 1937 staged root files and links match; extraction order and path
+rejection are as described; the CA bundle is exactly the 150 packaged roots, all parsed by OpenSSL;
+and an independent ELF parser confirmed the entry points and 41 reachable objects with none missing
+and no run-path overrides. The independent verifier lives outside the original manifest, in the
+retained review directory.
+
+**Not established:** this is a selected signed snapshot, not current package or security freshness;
+the explicit CA-file policy does not reproduce a customized Debian trust selection or a hashed CA
+directory; static closure does not test symbol-version loading, runtime dlopen, name resolution,
+TLS configuration, options or post-install state. Guest admission, real connectivity, the native
+backend decision and any network performance claim remain open.
+
+Retained: `natemu-raw/io-network-tools-20261108-01` (`review-01`).
+
+## Native/QEMU fio baselines — independent source review and reproduction
+
+**Verdict: accepted as bounded, correctness-passing end-to-end baseline observations with
+independent reproduction; not product-wide performance qualification and not a causal
+attribution.** An independent reviewer reviewed the exploratory method and runner before execution
+(requesting and verifying fixes for timing-record retention, native output size accounting,
+transitive runner-source hashes and the native build-manifest binding), freshly built native fio
+from the retained upstream 3.39 archive, and replayed one QEMU pair and one native pair. The main
+session held other builds and benchmarks during the run; no source or workload changes, downloads
+or retries. Both pairs passed first time: all bytes written, CRC-verified and read back, all
+profiles parsed, clean shutdown, clean filesystem checks, image unchanged on read-only relaunch.
+
+**Method limits:** QEMU is pinned (TCG, two vCPUs, a modern single-queue virtio block PCI device
+with several features disabled) and still differs from natemu's MMIO device, segment limits, CPU
+identification and one-active-request backend; native fio differs only in file name and POSIX-AIO
+engine. The earlier attempted kernel-module preparation failed before any VM and is retained.
+Sync semantics differ: native uses an asynchronous sync, natemu uses the full-sync call, and QEMU's
+flush uses fdatasync or fsync rather than full-sync. APFS/arm64 native, guest ext4/x86/io_uring,
+CPU profile, caching, backend concurrency and CRC implementations all differ; no host caches were
+purged, no cold-storage or sustained-SSD claim; process times include startup. Guest-reported
+depth is about full for the emulated guests but native shows mostly lower achieved depth: guest
+depth is not native-backend concurrency. The native source build is independent; QEMU, the guest
+image and the runner are shared.
+
+**Result:** natemu is substantially slower than both references on the tested configuration; this
+does not show why (numbers and the comparison table are in `docs/restructure/io-benchmarks.md`).
+The natemu admission runner's durations include post-exit hashing and filesystem check, so they are
+whole-phase, not process-wall, figures. The campaign is exhausted (guest launches and native jobs);
+further runs need a new bounded assignment.
+
+Retained: `natemu-raw/io-fio-baselines-20261108-01/replica-build-01/review.md`.
+
+## Selective DMA mapping invalidation: independent source/method review — November 8, 2026
+
+**Verdict: the candidate is accepted for the bounded, uninstrumented execution campaign; no
+remaining substantive source blocker.** This is source review only, not a runtime or performance
+result; independent reproduction was assigned separately. The reviewer followed the instruction
+fetch, data-fault and segment-helper page walkers into the guest-table read: all three production
+consumers go through the code-write tracker whose hook now marks the physical page before loading
+an entry (failed and repeated reads also mark); no host-side walker bypass was found, and that
+coverage must be preserved if another walker is added. The page-table bitmap is conservative and
+monotonic for the VM lifetime, spans high RAM, and is checked only after every exact resident
+acknowledgement and the one-use grant; every write still publishes its written range and code
+invalidations, and only table-page overlap publishes the table-written epoch. Cancellation before
+grant publishes neither epoch, a later epoch cannot overtake an unconsumed earlier write on one
+resident, and monotonic epochs avoid losing an owed table invalidation. The appended state leaves
+compiler-visible bases and offsets unchanged; host and resident must be rebuilt together (no mixed-
+version compatibility is claimed).
+
+**Defect resolved before execution:** the first helper revision required zero global mapping
+flushes for the page-table-entry and page-directory-entry fixtures as well as ordinary writes,
+which would reject correct intentional mapping invalidation; the zero-flush requirement now applies
+only to the ordinary-write preservation fixture, while the remap fixtures keep their real changed-
+route oracles and no-full-code-cache-flush checks.
+
+**Limits:** selective invalidation removes a demonstrated source of unnecessary global work without
+relaxing copy-first quiescence, but does not remove read-window shadow resets, and historical table-
+page reuse can conservatively reduce the benefit. No speedup or causal fraction is accepted from
+source review; unchanged-workload final binaries and independent checks are required.
+
+## Retaining ordinary DMA shadows: independent source/method review — November 8, 2026
+
+**Verdict: the second candidate has no substantive source blocker; accepted in principle with one
+control accepted for two bounded launches.** The candidate removes the unconditional shadow reset at
+the checkpoint, keeps the full barrier before the exact acknowledgement, serves only shadow-drop
+requests while release is withheld, and always drains invalidations afterward (tracked table writes
+still invalidate global translations). The reviewer found parked residents cannot touch guest RAM,
+ordinary physical writes do not change mapping routes, and a peer that asks after the
+acknowledgement can still finish and acknowledge; a request racing release is handled by the post-
+release drain or the existing handshake. No build, VM or performance run was done; the first
+selective-invalidation replica was held while the author evaluated this candidate.
+
+**Late shadow-drop control:** a host-only control where a peer vCPU services a shadow-reset request
+late (after parking) was accepted in principle, then reviewed concretely before launch. It records
+reset counters, posts real requests and withholds release until the counters advance and request
+bits clear; a negative control uses a resident differing only by removal of the parked service block
+and must show the named admission timeout, no write publication, and joined teardown (a generic
+watchdog timeout is not evidence). **Defect corrected before execution:** a combined cancellation or
+deadline branch could label cancellation as the intended timeout; both causes are now recorded and
+the negative oracle requires deadline-expired with cancellation false. The injected host binary's
+source manifest is not described by the inner runner's manifest, so bindings must retain both
+manifests and the isolated diff. Method acceptance only; ordinary, remap, reset, network and full
+fio acceptance still need final uninstrumented binaries and independent reproduction, and nothing
+here shows the remaining performance gap resolved.
+
+## Bounded acknowledgement spin: independent source/method review — November 8, 2026
+
+**Verdict: no substantive source blocker; a scheduling-policy candidate, not an established optimum
+or a high-vCPU-count result.** The candidate adds one short spin budget after the host posts all
+kicks; each poll still checks cancellation and the admission deadline and requires exact
+acknowledgements before the one-use grant, and the owner yields once the budget expires. The
+proposed unchanged fio comparison was accepted, measuring the whole runner with the same timing
+wrapper for spin-on and spin-off pairs, reporting CPU and job durations separately (runner CPU
+includes boot, children, hashing and filesystem check, so it is not the owner's isolated cost),
+with unchanged correctness and durability checks, serialized runs, retained failures and an
+independent rebuild of the selected final candidate. Source review establishes no efficiency
+improvement, and owner-stack samples are a hypothesis, not a measured cause. No build or VM was run
+by the reviewer. (Outcome: the 30-microsecond spin was later rejected because it cost more CPU and
+wall time; see the performance repair entry below.)
+
+## Owned descriptor-prefix reuse: independent source review — November 8, 2026
+
+**Verdict: the owner change is accepted for bounded testing; no performance benefit accepted.** The
+change reuses only already-captured descriptor metadata while the available index stays ahead of the
+next one in the same queue and device incarnation; exhaustion or identity change forces a new
+capture, and empty, canceled or invalid outcomes discard the cache. Each later chain still gets full
+checked traversal and range validation; payload capture, backend submission, completion publication
+and the post-publication suppression read are unchanged. Queue geometry is stable under the ready
+guard, reset and disable advance generation counters, and the owner still admits one request, so
+prefetch does not widen the shutdown accepted-work frontier.
+
+**Specification caveat:** virtio 1.2 forbids changing exposed, not-yet-used entries and forbids
+geometry access while QueueReady is nonzero; permitting metadata prefetch is an inference from those
+ownership rules, not an explicit endorsement. A prior completion aliasing later captured descriptor
+bytes keeps the captured interpretation; document this prefix-snapshot reading explicitly rather than
+attributing the alias outcome to the specification. Unit tests cover prefix use, exhaustion, mismatch,
+malformed later traversal and index wrap, but not an actual DMA alias schedule or notification
+progress. A live "valid first, malformed second" lifecycle fixture was recommended and reviewed
+before execution: it requires one backend effect and used entry, the reset-needed flag, untouched
+second destinations, the complete expected RAM and an unchanged disk. It does not force a live
+metadata alias or observe which path was taken (that linkage comes from the owner source). No build
+or VM was run by the reviewer.
+
+## I/O performance repair: final independent rebuild and replay — November 8, 2026
+
+**Verdict: the final candidate's bounded correctness and measured improvement are accepted; no
+unresolved source blocker. This does not complete the performance objective, native networking or
+the combined workload.** The selected production change is monotonic table-dependency tracking,
+servicing shadow-drop requests while preserving otherwise valid parked mappings, and owned
+descriptor-prefix reuse. **The 30-microsecond host spin experiment is rejected:** its faster fio job
+came with worse complete-run wall time and CPU cost.
+
+**Reproduction:** an independent reviewer verified all 916 frozen inputs, rebuilt the normal CLI,
+testing driver and uninstrumented resident in a fresh offline target (signing and audit pass, no
+source or oracle edit) and ran four VMs once each, all first-attempt passes. Two-vCPU page-table-
+entry and directory-entry remaps changed the executed code result on both vCPUs (and the data route
+for the directory case) with progress preserved; each vCPU recorded a few global mapping
+invalidations, one initialization full flush and one killed patched block, so intentional mapping
+invalidation is preserved while unrelated code is retained (the test warms mappings but does not
+observe hardware TLB residency at the final write). The original fio oracle and prepared image were
+reused: the write boot wrote and verified the exact bytes, the restart boot verified them with zero
+writes, with all profile and library checks, clean shutdown, clean fsck, persisted file hash and the
+image unchanged across read-only relaunch.
+
+**Performance reading (numbers in `docs/restructure/io-benchmarks.md`):** the write-and-verify job
+improved about twenty-two-fold over the retained baseline for this finite workload, but is still
+slower than the QEMU reference; restart verification varied several-fold between the primary and
+independent observations (the primary's large inline-versus-restart difference was mostly absent in
+the replica), so no stable near-parity claim is possible and the faster restart result must not be
+cherry-picked. Placement, warm execution, scheduling and storage explanations remain hypotheses.
+Whole-pair timing wrapper CPU includes boot, children, hashing and fsck; it is not isolated device
+cost. Earlier CPU, transport, backend, cache and durability differences remain, including natemu's
+full-sync versus the reference's weaker flush. These are exploratory correctness-passing
+observations, not a sustained-storage score.
+
+**Additional evidence inspected, not independently rerun:** the late shadow-drop positive control
+(acknowledgements at epoch one with release withheld while reset counts advance) and the isolated
+no-service negative (named pre-grant deadline, no write, joined teardown; its raw healthy-window FAIL
+stays separate from the expected-negative PASS); the author's reset, disable, full-queue, malformed-
+later, contained sync failure, held compiler, high-RAM and network lifecycle regressions. Shared
+fixtures and primary execution stay separate from the four fresh replays. Shared guest preparation,
+the original oracle and the compiler binary limit independence; the source build and the four
+executions are fresh. No additional run assigned.
+
+Retained review: `natemu-raw/io-perf-repair-20261108-01/replica-build-01/review.md`.
+
+## I/O wait-loop doorbell ordering — independent forced reproduction
+
+**Verdict: the lost-wake mechanism is reproduced in a forced schedule and the reordering fix is
+confirmed for both production wait loops (halt and firmware mailbox).** A reviewer who wrote the
+earlier RAM-window foundation (not the ordering fix nor the normal timing run) built and exercised
+the isolated schedule; a second independent reviewer reviewed the instrumentation and final oracle
+before execution; workspace production source was not changed. Old and fixed variants derive from
+the same verified candidate and differ only in the order of two calls in the wait loops (old:
+checkpoint then doorbells; fixed: doorbells then checkpoint), with a bounded latch before the
+doorbells that never touches guest RAM, forges an acknowledgement or enters a host call. The host
+runs a real copy, observes its published epoch and a real pending interrupt kick, and only then
+releases the latch.
+
+**Result:** four one-vCPU VMs (old and fixed, halt and mailbox) passed first time. In both old cases
+the kick was drained, the wait was entered with no return, no acknowledgement was seen at two
+observations 100 ms apart and the copy hit the specific acknowledgement timeout with no effect; in
+both fixed cases the copy was granted and published the exact bytes. All ended in the expected
+halted stop and clean teardown. A late end-of-test kick can legitimately acknowledge the already
+released old epoch; the pending and final worker records precede it.
+
+**Failure and correction kept:** an earlier preparation script rejected an incorrect source anchor
+(no builds or VMs; retained as the first attempt) and a field-format oracle fix preceded freezing.
+
+**Limits:** counters show wait-path entry without a return, not instruction-level sampling of the
+wait; the forced schedule does not measure the race's natural frequency, general multi-vCPU firmware
+behavior or its share of fio slowness; the mailbox case is a single vCPU, not application-processor
+startup.
+
+Retained campaign: `natemu-raw/io-perf-pipeline-20261108-01/forced-controls-02`.
+
+## Lost I/O wake: independent source review, control review and replay — November 8, 2026
+
+**Verdict: the two wait-loop ordering changes and their finite correctness and performance evidence
+are accepted; no unresolved blocker.** Across the frozen candidate sources the only differing file
+is the execution events file, where halt and firmware-mailbox loops now drain doorbells before
+checking the I/O request; no batching, payload pipeline, extra backend concurrency, spin policy or
+guest-memory authority change entered. Mechanism: the old order could see an empty request, consume
+a newly posted request's only kick and then sleep without acknowledging it; the new order checks the
+work after draining. A later kick stays pending to wake the wait. The audit found the relevant wait
+sites; deferred MMIO and power waits poll through hypercalls rather than drain-then-sleep; no guest-
+memory access moved before the checkpoint.
+
+**Forced controls** (independently reviewed, executed by their author) reproduce the consumed-wake
+path as in the previous entry. The control oracle's negative checks are author evidence. They do not
+give an incidence or performance sample, do not sample the exact wait instruction, and the mailbox
+fixture is one vCPU, not startup of other processors.
+
+**Independent build and execution:** an independent reviewer verified 916 inputs, rebuilt a fresh
+normal CLI and uninstrumented resident (signing and audit pass) and ran four VMs: the old pair
+(previously independently built binaries) and the fresh fixed pair, all first-attempt passes with
+all profiles, exact write and CRC readback, restart read with no writes, clean shutdown and fsck, and
+a byte-identical read-only image. The fixed build's complete wall and CPU times were several-fold
+lower than the contemporaneous old baseline and agreed closely between primary and independent runs.
+
+**Caveats:** two fixed samples and a fixed old-then-new run order do not establish a stable speedup
+distribution; the old baseline varied substantially from its own earlier observations; the fixed
+write job is faster than the QEMU reference in these finite runs while restart verification is
+slower; timing wrappers include boot, hashing and checks, not isolated I/O CPU. This is not product-
+wide QEMU superiority, an SSD score, or proof every earlier delay was this race. Nine normal-driver
+regressions (halt and application processor, four-vCPU split and cache preservation, reset, disable,
+power with a halted peer, malformed-later, full queue, network halt and interrupt) were inspected,
+not rerun. Shared preparation, oracle and compiler limit independence; the source build and four
+executions are fresh. Broader workloads and native networking remain separate work.
+
+Retained review: `natemu-raw/io-perf-pipeline-20261108-01/replica-build-01/review.md`.
+
+## Block completion rearming — independent forced regression controls
+
+**Verdict: the three specific rearming premises are supported by six forced one-vCPU controls;
+finite correctness evidence only.** A reviewer who wrote the earlier RAM-window foundation (not this
+queue-retirement change, which the main session authored) built and ran six isolated controls for
+the new completion-time available-index observation and retirement logic; a second independent
+reviewer reviewed the hooks, complete oracles and the final narrow revision before execution.
+Workspace production source was not edited. The controls compare production behavior with three
+explicit counterfactuals: replacing the notification-preserving OR with assignment, removing the
+owned-prefix fallback, and forcing the completion's "more work pending" result false. Data buffers,
+queue validation, copy windows and guest replies are untouched; queue publication and notifications
+are ordinary guest instructions, and the metadata-only holds touch no guest RAM and do not hold the
+device state lock.
+
+**Observed distinctions (all six passed first time):** (1) a notification arriving after capture but
+before retirement is drained in production, while the assignment variant goes idle and needs a rescue
+notification; (2) an owned prefix whose payload aliases the live available index is still drained
+through the captured successor in production, while the no-prefix variant needs a rescue; (3) a
+request published before the completion window is detected by the fresh index in production, while
+the forced-false variant needs a rescue. Every positive reaches idle without rescue; every negative
+must positively record the idle decision, then the rescue, before proceeding (a timeout cannot pass).
+All six then publish a third request after the idle decision; this checks publication after idle, not
+that the owner had entered its native sleep. Complete RAM image and disk match their byte oracles,
+and teardown is clean. The third case tests this implementation's fresh-index guarantee, not
+permission for drivers to omit notifications.
+
+**Corrections and failures kept:** the first control build was never run because review found its
+idle phase preceded the trace append (fixed in revision 02). Revision 02's first process was rejected
+by the command-line parser's unchanged test-schedule allow-list before any VM existed (command and
+error retained); revision 03 changed only that allow-list and the runner's retained-root path. The
+rejected process launched no VM.
+
+**Not established:** performance, arbitrary alias liveness, multi-vCPU or reset coverage, or a
+replacement for the integrated fio and reverse-order comparison.
+
+Retained campaign: `natemu-raw/io-perf-notify-20261108-01/forced-controls-03`.
+
+## Completion-index scheduling — independent review and reverse replay, November 8, 2026
+
+**Verdict: the small scheduling change and its scoped correctness evidence are accepted; no
+unresolved blocker.** It removes an unnecessary empty queue scan when a block completion sees no
+further work, without changing backend concurrency, admission, memory authority, durability, reset or
+shutdown ordering. The write-and-verify job improves in both run orders, but the evidence does NOT
+establish a substantial whole-workflow speedup or a reliable restart-read improvement; mixed restart
+results and nearly flat integrated time must stay visible.
+
+**Source:** relative to the prior candidate only the host virtio sources differ. Block completion
+reads the available index after all publication writes in the same window and compares it against the
+wrapped next-available plus one; the owner's retirement preserves both late notifications and an
+already-owned successor under the existing incarnation, ready, status and quiescing gates. Random-
+number and network devices keep their prior behavior. Unit tests cover the truth table, lifecycle
+gates and a stale snapshot. Liveness assumes conforming queue ownership; arbitrary aliases that
+corrupt device-owned flags are not promised.
+
+**Forced schedules:** the six controls of the previous entry were inspected independently (source,
+hooks, oracle and actual records, with the final 128 KiB RAM image reconstructed from initial memory
+plus the three native sectors); all exact effects match. The reviewer caught a trace-order race
+(phase published before owner-idle recorded); corrected by recording under the same control mutex.
+The unrun first build and the parser-rejected first process are retained. The author's negative oracle
+controls were not rerun by the reviewer.
+
+**Independent reproduction:** all 916 inputs and the prior baseline were hash-verified; a fresh
+offline target built the ordinary CLI and resident separately (signing and audit pass). The author
+ran old then new; the reviewer ran new then old (reverse order) under the shared lock with no
+competing work. All four independent launches passed first time: exact writes and CRC readback,
+restart read with no writes, clean shutdown and fsck, unchanged read-only image. Caveats: four pairs
+are finite observations without cache purging or a latency distribution; earlier QEMU and native
+comparisons keep their platform, topology, cache and durability qualifications. Eight later normal-
+driver regressions (reset, disable, halted-peer poweroff, read error, write error, malformed
+successor, full queue, network halt and interrupt) were inspected, not rerun. The campaign used its
+whole launch budget, including the pre-VM parser rejection. Native networking and combined acceptance
+are outside this increment.
+
+**Final mechanism diagnostic:** two further author-run instrumented phases passed the full original
+oracles with complete distinct vCPU performance records and no failed or dropped logs. Window and
+empty-scan counters fall sharply with the change, supporting removal of redundant empty scans and
+their windows; native-job counts match. Counters omit final partial intervals and are not sampled
+atomically, so matching counts do not prove exact request-count equality, and instrumented timings
+are not benchmark scores.
+
+Retained review: `natemu-raw/io-perf-notify-20261108-01/replica-build-01/review.md`.
+
+## Restart investigation — final kick-elision source and independent full-pair review, November 8, 2026
+
+**Verdict: the final candidate's narrow correctness-preserving change is accepted; restart
+measurements remain variable, so no broad or stable improvement is established.** The change: a vCPU
+that has already acknowledged the current, unreleased memory-window epoch needs no further wake-up
+doorbell (the candidate skips a redundant doorbell, but still checks that participant's terminal state
+under the existing stop mutex). No unresolved source or replication blocker.
+
+**Source:** the acknowledgement flag cannot go stale within this serialized unreleased epoch (the
+resident's barrier precedes acknowledgement and guest access cannot resume before release); old or
+late acknowledgements cannot satisfy a later epoch; per-peer cancellation, exact all-acknowledgement
+admission, final grant and release-on-error are unchanged.
+
+**Blocker raised and closed:** the first provisional implementation skipped the entire callback and so
+also skipped the ended-peer check, narrowing the public copy API's terminal guarantee (current device
+owners cancel pending permits first, but the guarantee mattered). Independent review required the
+final unconditional callback with only the ring optional; the earlier timings are provisional and do
+not qualify the corrected build. The final test checks an acknowledged-but-ended peer is observed and
+rejected with no guest-write effects; a two-epoch test checks that prior-epoch acknowledgements do not
+suppress later wake-ups. Tests use the generic seam; production stop-lock ordering was source-reviewed.
+The restart-only runner was reviewed (validates a prior read-only restart, clones and rehashes the same
+seed; original checks preserved; the alternating control/candidate run order balances positions and
+removes image layout as a between-build difference without controlling all host scheduling effects).
+
+**Independent reproduction:** all 916 frozen inputs verified, normal CLI and resident built in a fresh
+offline target (signing and audit pass); two independent full-pair VMs, both first-attempt passes of
+the unchanged original oracle (clean shutdown and fsck, persistent file identity, unchanged read-only
+image, image rehashed after run). Wrapper costs include boot, hashing and checks and are not isolated
+backend latency. The author's final same-seed comparison also passes but both builds vary and
+integrated restart times overlap. Four normal regressions (four-vCPU split atomics and code
+preservation, pending-compiler timeout and resume, active reset, HLT cooperation) were inspected, not
+rerun. Shared preparation, oracle and compiler limit independence. The campaign used all authorized
+launches; retained storage was within bound, with identical read-only images deduplicated and paths
+and hashes kept.
+
+**Follow-up diagnostic (baseline-profile runs inspected):** all four profile runs classify every
+request as a unique successful admission with two terminal vCPU records and no failed or dropped
+logs. In the two faster runs notification and interrupt-acknowledgement accesses come from different
+vCPUs; in a slower run both land on the second vCPU, and the other vCPU spends much of its time in the
+resident halted bucket; native execution and the copy portion stay steady while total window time
+varies. This suggests an association between vCPU placement and restart variability; it does not show
+exact fio-thread identity, prove placement is the cause, or isolate every guest and host contribution.
+The halted bucket includes checkpoint work within the HLT path, so it is not pure host sleep; snapshots
+are skewed relative to phase boundaries; categories overlap and must not be added; the profiler uses
+the earlier baseline with unconditional doorbells, not the selected candidate, so it does not measure
+the optimization's effect. Instrumented timings are diagnostic, not benchmark scores.
+
+Retained review: `natemu-raw/io-perf-restart-20261108-01/replica-build-01/review.md`.
+
 ## Installed-root I/O matrix — independent review and N4 replication, November 8, 2026
 
-**Disposition: accepted as bounded functional and workload evidence.** All six
-primary pairs and both independent N4 pairs pass: 16/20 authorized VM launches,
-no retries. This review changed no production source, workload or guest options.
-The matrix covers installed ext4 root operations, nine measured profiles,
-four 256 MiB files, full CRC sweeps and fresh read-only relaunches. It does not
-complete native networking or establish general storage/performance acceptance.
+**Verdict: accepted as bounded functional and workload evidence; not native networking and not
+general storage or performance acceptance.** All six primary pairs and both independent four-vCPU
+pairs pass without retries; the review changed no production source, workload or guest options. The
+matrix covers installed ext4 root operations, nine measured profiles, four 256 MiB files, full CRC
+sweeps and fresh read-only relaunches.
 
-The independent replicas used the final production CLI/resident previously
-fresh-built by this reviewer from the restart candidate02 snapshot. All 916
-retained source hashes, binary/FEX bindings, five frozen oracle files, QEMU
-binary and prepared inputs were verified again. Rebuilding unchanged inputs
-was unnecessary; these are independent executions with independently built
-natemu binaries, not a newly authored workload or independently authored oracle.
-QEMU N4 ran before natemu N4, under the shared VM lock, with no concurrent
-benchmark/build. Both pairs passed on their first attempts within the declared
-600-second main / 120-second verify limits.
+**Scope reviewed:** the independent replicas used the final production CLI and resident previously
+built fresh by the reviewer from the restart candidate; all 916 source hashes, binary and compiler
+bindings, five frozen oracle files, the QEMU binary and prepared inputs were verified again. These are
+independent executions with independently built natemu binaries, not a newly authored workload or
+oracle. The QEMU four-vCPU run preceded the natemu one, serialized under the shared lock with no
+concurrent work, and both passed on first attempts within the limits. The review reparsed all eight
+pairs from raw serial output with the frozen oracle, independently recomputed all 72 workload rows and
+the primary table aggregates, and re-hashed both replica final images; every phase has no process or
+oracle errors, clean fsck, a complete 1 GiB CRC sweep and four file hashes, ordinary filesystem
+operations and clean shutdown. Aggregation is valid for these records (concurrent jobs share a common
+clock window; per-job latency percentiles are kept per job, not averaged; VM totals cover only timed
+processes; mounted-root times are polled host observations).
 
-Evidence lives in
-`/Users/liaozping/orca/natemu-raw/io-matrix-20261108-01/replica-review-01`:
-`binding.json`, exact commands, `reproduce.py`, wrapper logs, `review.py`,
-`review-results.json` and 816 retained output hashes. Raw independent pair
-records are `qemu-n4-replica-01` and `natemu-n4-replica-01` beside that directory.
-The review reparsed all eight pairs from raw serial using the frozen oracle,
-checked those results against saved JSON, independently recomputed all 72
-workload rows, and checked primary table aggregates. Every phase has zero
-process/oracle errors, successful offline fsck, complete 1 GiB CRC sweep and
-four complete file hashes. Each read-only relaunch preserves the four hashes
-and whole-image SHA; both replica final image hashes were independently
-recomputed after execution. Ordinary create/patch/copy/rename/unlink checks and
-clean S5 are present. The campaign occupies approximately 10.72 GiB of its
-12 GiB allowance at review completion.
+**Findings (numbers in `docs/restructure/io-benchmarks.md`):** a concrete scaling limitation, not a
+blanket win. natemu's single-job random read falls sharply from one to four vCPUs and is well below
+QEMU at four; its four-job aggregate at two vCPUs exceeds QEMU's but worst per-job tail latency is
+several times higher; at four vCPUs it nearly matches QEMU elapsed time while using over twice the CPU.
+Sequential read and write are far faster than the QEMU reference. Higher requested depth is not an
+established throughput gain. These are finite observations without confidence intervals or cause.
+The fsync row's periodic sync latency is far higher for natemu, but durability differs (natemu uses
+the full-sync call, QEMU its fsync path), so it is not an equivalent-durability ratio; the final sync
+stays required and an explicit failure is rejected.
 
-The aggregation is valid for these records: bytes and completed I/Os are summed
-over the common-clock union from earliest `job_start` to latest
-`job_start + job_runtime`; all concurrent jobs have positive overlap. fio3.39
-emits both values in milliseconds. Per-job p50/p95/p99 values are retained,
-not averaged or presented as aggregate percentiles. VM elapsed/CPU totals sum
-only the timed VM processes and children; they exclude outer image cloning,
-hashing, Python and offline fsck. Mounted-root times are host observations
-polled at 250 ms, not exact instruction-boundary boot times.
+**Caveats:** pure timed reads check CRC inline but mixed reads do not (the later sweep checks stored
+data, not bytes previously returned by mixed reads). Five-second timed rows over a 1 GiB dataset; no
+host cache purge; guest `direct=1` does not make these physical SSD measurements; QEMU's device and
+scheduling differ from natemu's MMIO and one active native request; shared preparation, kernel, fio
+and oracle limit independence; one-vCPU and two-vCPU have one primary pair each. The results justify
+reporting real capability and prioritizing multi-vCPU random I/O, CPU-cost and latency work, without
+attributing gaps to a mechanism or weakening synchronization or durability to improve a score.
 
-N4 primary/independent observations:
+**Documentation check:** every primary and repeat throughput, random-read tail and fsync cell in the
+published benchmark tables was independently checked against raw results; no substantive consistency
+defect remains.
 
-| Workload or resource | natemu | QEMU |
-| --- | ---: | ---: |
-| 4 KiB random read Q16 | 8.78–9.24 kIOPS | 17.14–19.10 kIOPS |
-| Four-job 4 KiB random read, Q16 each | 18.27–18.98 kIOPS | 54.70–55.65 kIOPS |
-| Worst per-job p99 in that four-job row | 10.42–12.91 ms | 4.29–4.49 ms |
-| 128 KiB sequential read Q16 | 971.55–983.12 MiB/s | 156.90–159.25 MiB/s |
-| 128 KiB sequential write Q16 | 709.82–733.10 MiB/s | 142.18–143.14 MiB/s |
-| Both VM phases, elapsed | 190.63–191.25 s | 195.19–197.29 s |
-| Both VM phases, CPU | 593.97–599.78 s | 253.51–256.18 s |
+Retained review: `natemu-raw/io-matrix-20261108-01/replica-review-01/review.md`.
 
-These observations support a concrete scaling limitation, not a blanket win:
-natemu's primary single-job random Q16 falls from 27.20 kIOPS at N1 to 22.77 at
-N2 and 8.78 at N4; the N4 replica is similarly low. Its N2 four-job aggregate
-33.39 kIOPS exceeds QEMU's 28.36, but worst per-job p99 is 24.25 versus 6.39 ms.
-The N4 pair nearly matches QEMU elapsed time while consuming over twice its CPU.
-Other rows vary materially: natemu N4 random Q64 is 9.08–12.60 kIOPS, so increased
-requested depth is not an established throughput gain. These are finite
-observations, not confidence intervals or evidence identifying the cause.
-
-The fsync row records exactly 64 data writes and 63 periodic sync samples;
-required final `end_fsync` is outside fio's reported sync sample accounting.
-N4 mean periodic sync latency is 9.00–9.10 ms for natemu versus 0.130–0.176 ms for
-QEMU. Durability differs: natemu uses `F_FULLFSYNC`, QEMU its fsync path, so this
-is not an equivalent-durability performance ratio. The final sync remains
-required and an explicit failure is rejected.
-
-Pure timed reads perform inline CRC checking. Mixed reads do not; the later
-sweep checks stored data after mixed writes, not the bytes previously returned
-by mixed reads. All figures are checksum-bearing whole-system workloads with
-five-second timed rows and a 1 GiB dataset. No host cache purge occurred; guest
-`direct=1` does not make them physical SSD measurements. QEMU PCI/TCG/max-CPU
-and backend scheduling differ from natemu MMIO/one active native request.
-Shared guest preparation, kernel, fio and oracle limit evidence independence.
-N1/N2 have one primary pair each; N4 has two observations per backend. The
-results justify reporting real capability and prioritizing SMP/random-I/O,
-CPU-cost and latency work, without attributing those gaps to a particular
-mechanism or modifying synchronization/durability to improve a score.
-
-**Final documentation check:** the benchmark matrix, implementation summary and
-INV current result preserve the finite scope and open compatibility/performance
-work. Every primary/repeat throughput cell, random-read p99 cell and periodic
-fsync mean/p99 cell in the published benchmark tables was independently checked
-against raw results. No substantive claim-consistency defect remains. The
-benchmark section links this review; the raw review remains beside its bindings.
 ## N4 I/O diagnosis — independent profiler replay, November 8, 2026
 
-**Evidence validity: accepted for diagnostic attribution, not performance scores.**
-The reviewer checked the isolated baseline profiler's counter mapping and
-lifetime boundaries, then verified all 917 instrumented source hashes, three
-binary bindings and six frozen oracle files. One independent N4 read-only probe
-was executed using the same author-built profiler, without a new build, sampling,
-production changes or retries. The shared VM lease excluded competing builds and
-benchmarks. The probe passed within 26.741 seconds; all original two-profile
-options, inline CRC, four full file hashes, clean S5, offline fsck and unchanged
-read-only image checks passed. The final image was rehashed and only then
-hardlinked to the immutable byte-identical prepared image; future runs clone it.
-Failed or active images were not modified.
+**Verdict: accepted for diagnostic attribution, not for performance scores.** The reviewer checked the
+isolated baseline profiler's counter mapping and lifetime boundaries, verified all 917 instrumented
+source hashes, three binary bindings and six frozen oracle files, and ran one independent four-vCPU
+read-only probe with the same author-built profiler (no new build, sampling, production change or
+retry). It passed all original checks (inline CRC, four file hashes, clean shutdown, fsck, unchanged
+image). The primary and independent runs each contain four valid terminal resident records, four
+complete host logger records with no failed or dropped counts and one final owner-drained aggregate; the
+audit reconciles window, phase, ring and per-vCPU epoch totals with all error counters zero. No late
+shadow-reset service occurred in either run, so these do not replace its forced control.
 
-The primary and independent runs each contain four distinct valid terminal
-resident records, four complete host logger records with failed/dropped zero,
-and one final owner-drained aggregate. The independent audit reconciles window,
-phase, ring/skip and per-vCPU epoch totals; native job and lane-wait counts match,
-and all window/kick/native/lane errors are zero. No late SHADOWS service occurs
-in either diagnostic, so these observations do not replace its forced control.
+**Findings:** host acknowledgement waiting and the doorbell phase dominate host coordination; the
+copy phase (which includes invalidation and barriers) and native lane execution are small; a large
+share of resident I/O waits, roughly 35-45 percent, was entered from the HLT context. These are
+cumulative whole-probe counters including boot, both timed profiles, hashing and shutdown; per-CPU
+durations are summed across overlapping CPUs; host, resident and native times overlap and must not be
+added as independent costs. HLT attribution names the prior resident bucket, not pure host sleep or
+guest placement, and includes checkpoints on initial HLT entry, so it is not an exact count of
+occasions a future quiet-before-wait path could skip, and is not a proven recoverable wall-time share.
+Instrumented throughput identifies the executed workload and is not a normal-build score. Independence
+is limited to source and method review plus fresh execution, not independent profiler authorship.
 
-| Whole-probe diagnostic | Primary | Independent |
-| --- | ---: | ---: |
-| Completed nonempty windows | 366,726 | 348,524 |
-| Actual I/O doorbell rings | 1,083,870 | 1,063,688 |
-| Host ACK wait | 6.720 s | 6.390 s |
-| Host kick phase | 1.739 s | 1.677 s |
-| Grant/invalidation/copy/release phase | 0.224 s | 0.233 s |
-| Native lane execution | 0.326 s | 0.318 s |
-| Summed resident I/O waits | 21.832 s | 19.899 s |
-| Summed I/O waits entered from HLT | 7.730 s | 8.852 s |
-| HLT-context I/O epochs / all CPU epochs | 571,569 / 1,466,904 | 661,021 / 1,394,096 |
-| VM elapsed / CPU seconds | 27.00 / 64.23 | 26.71 / 61.97 |
+**Decision:** investigate unnecessary coordination of HLT-context participants before copying or native
+throughput. This neither proves the source of late acknowledgements nor validates a quiet-admission
+protocol; skipped-epoch table currency, clear-quiet and request publication ordering, late shadow-
+reset service, terminal checks and application-processor mailbox wake remain load-bearing requirements
+for any such change; the existing exact-acknowledgement path stays the reference. No production adoption
+or performance claim follows. One VM was used.
 
-These are cumulative whole-probe counters, including boot, both timed profiles,
-full-file hashing and shutdown. Per-CPU durations are summed across overlapping
-CPUs, not additional elapsed time. Host ACK/kick/copy phases, resident waits and
-native/lane timings overlap and must not be added as independent costs. The
-copy phase includes invalidation and barriers, not just memcpy. Periodic family
-loads are nontransactional; final publication follows native final-sync/join.
-Resident wait accounting starts after ACK publication and ends when release is
-observed, includes late shadow-reset work if present, and excludes the pre-ACK
-DSB and post-release invalidation work. Zero-spin epochs still count.
+Retained review: `natemu-raw/io-smp-fix-20261108-01/probe-profile-replica-01/review.md`.
 
-Real division and both reuse attribution sites were redirected to other buckets;
-no ABI dimensions changed. HLT attribution identifies the prior resident bucket,
-not pure host sleep or guest userspace placement. It includes checkpoints on
-initial HLT entry, so it is not an exact count of occasions eligible for a future
-quiet-before-WFI fast path. Non-HLT includes AP and other resident contexts.
-The measured HLT share is 35.4% / 44.5% of summed I/O waits; it is not a proven
-recoverable wall-time percentage.
-
-The instrumented Q16 rows vary from 11.25 to 9.14 kIOPS and the four-job rows
-from 18.21 to 18.41 kIOPS, with worst per-job p99 13.30 / 10.16 ms. These numbers
-identify the executed workload; they are not new normal-build benchmark scores.
-Shared profiler/harness/binaries limit independence to source/method review and
-fresh execution, not independent profiler authorship or rebuilding.
-
-**Decision relevance:** the repeated profile supports investigating unnecessary
-coordination of HLT-context participants before copying or native I/O throughput.
-It neither proves the specific source of late ACKs nor validates a quiet-admission
-protocol. Skipped-epoch table currency, clear-quiet/request publication ordering,
-late SHADOWS, terminal checks and AP mailbox wake behavior remain load-bearing
-requirements for any such change. The existing exact-ACK path remains the reference;
-no production adoption or performance-completion claim follows from this replay.
-
-Evidence: `natemu-raw/io-smp-fix-20261108-01/profile-replica-binding.json` and
-`probe-profile-replica-01/{review.py,review-results.json,review-output-sha256.json,review.md}`,
-including 47 output hashes, full logs, commands, counter records and dedup metadata.
-This replay consumed one VM, bringing the declared campaign to 7/24 at this point.
 ## HLT quiescence — independent source review and forced replay, November 8, 2026
 
-**Evidence validity:** candidate03's production handshake is accepted at source
-level and its forced skipped-epoch/resume behavior is independently reproduced.
-This is not yet acceptance of a performance improvement; full-matrix comparisons
-remain pending. The reviewer verified and copied all 919 frozen candidate inputs,
-rebuilt normal CLI and test driver separately into a fresh target, rebuilt the
-normal resident, signed both host binaries and passed the resident stack audit.
-The resident SHA matches the producer's
-`0fa888b7926545377cb34ee0e2974831665c5ce15a6593f4f0d9f870a7e71b74`.
-No spin/read-first experiment is part of candidate03. The source review checks
-DSB before quiet publication, clear+DSB before the next request check, the
-host publication barrier, terminal callback preservation and final grant CAS.
-Only the private HLT wait publishes quiet; AP/compile/MMIO/power waits retain
-ordinary acknowledgement. Existing ABI offsets stay fixed; the new array fits
-the reserved area. Table invalidation compares against the prior serviced epoch,
-so a later read-only request cannot conceal an earlier skipped table write.
+**Verdict: the third candidate's production handshake is accepted at source level and its forced
+skipped-epoch and resume behavior is independently reproduced; this is not yet acceptance of a
+performance improvement.** The reviewer verified and copied all 919 frozen inputs, rebuilt the normal
+CLI, test driver and normal resident in a fresh target (signing and stack audit pass; the resident
+hash matches the producer's). The source review checks the barrier before quiet publication, clear
+plus barrier before the next request check, the host publication barrier, terminal callback
+preservation and the final grant compare-and-swap. Only the private HLT wait publishes quiet;
+application-processor, compile, MMIO and power waits keep ordinary acknowledgement; the existing ABI
+offsets are unchanged; table invalidation compares against the prior serviced epoch so a later read-
+only request cannot hide an earlier skipped table write. No spin or read-first experiment is part of
+this candidate.
 
-The reviewer found and closed a fixture oracle gap: final acknowledgements were
-not checked. The corrected oracle requires both exact final ACKs and rejects a
-synthetic stale-final-ACK report. It is retained separately in
-`replica-quiet-oracle-01`, with dependency hashes and its patch; producing compiled
-sources remain the untouched frozen candidate snapshot. Rejudging saved primary
-outputs with that oracle yields positive PASS and exactly two stale-r13 errors
-for the isolated old-table-test negative, all other checks passing. No original
-failure was relabeled as an ordinary successful VM.
+**Gap found and closed:** the fixture oracle did not check final acknowledgements. The corrected
+oracle (retained separately with dependency hashes and patch) requires both exact final acknowledgements
+and rejects a synthetic stale-final-acknowledgement report; rejudging the saved primary outputs gives a
+positive PASS and exactly two stale-register errors for the isolated old-table-test negative, all other
+checks passing. No original failure was relabeled as an ordinary successful VM.
 
-One independent positive VM passed first attempt in 0.327 seconds. Both CPUs
-first read data A and execute cached function1, then reach actual quiet=[1,1].
-Three granted windows leave their ACKs=[0,0]: warm read1, PTE/code write2,
-read-only3. The pre-canceled request announces no epoch and causes no effect.
-An explicit interrupt wake yields data B, function2 and one handler execution on
-each CPU, followed by clean end, quiet=[0,0], ACK=[3,3], and joined/destroyed
-teardown. The test does not force cancellation after announcing a window, every
-clear-quiet/publication interleaving, or late-SHADOWS service; those are separate
-source obligations/regressions. The negative mutant was rejudged, not rerun by
-this reviewer. Shared fixture/FEX limit independence; fresh source verification,
-compilation and positive execution are independent.
+**Replay:** one independent positive VM passed first time: both CPUs read data A and run cached
+code, reach quiet, three granted windows leave their acknowledgements unmoved, a pre-canceled request
+announces no epoch and has no effect, and an explicit interrupt wake yields the new data and code on
+each CPU, then clean end, quiet cleared, acknowledgements caught up and joined teardown.
 
-**Decision relevance:** the replay validates the load-bearing skipped-table-epoch
-repair and real HLT admission/resume for this schedule, rather than only host
-unit-test state. It supports proceeding to unchanged full-workload comparison;
-it does not establish all-ISA/platform coverage or performance completion.
-Evidence is retained beneath `natemu-raw/io-smp-fix-20261108-01` in
-`replica-build-01`, `replica-quiet-oracle-01`, and `quiet-replica-01`. This is
-campaign VM11/24, replacing the generic HLT regression allocation. No full-matrix
-replica has been launched yet.
+**Not established:** cancellation after announcing a window, every clear-quiet and publication
+interleaving, and late shadow-reset service are not forced here (separate source obligations and
+regressions); the negative mutant was rejudged, not rerun; shared fixture and compiler limit
+independence; no all-ISA or platform coverage; no performance completion. The full-matrix comparison
+was still pending.
+
+Retained: `natemu-raw/io-smp-fix-20261108-01/quiet-replica-01/review.md`.
+
 ## HLT quiescence — independent full N4 matrix replay, November 8, 2026
 
-The independent candidate03 full N4 matrix pair passes on its first attempt,
-using the reviewer's fresh 919-input production build, unchanged frozen original
-matrix oracle/inputs, pinned FEX and the shared VM lock. Source, artifact and
-oracle hashes were verified again after build-intermediate cleanup. No build,
-competing VM, native benchmark, guest-affinity/cache adjustment or workload
-change accompanied the measured pair. The normal CLI and resident are distinct
-from the diagnostic profiler. All nine rows execute with their original options.
+**Verdict: the selected four-vCPU random-read and integrated CPU/elapsed improvement is independently
+reproduced with correctness retained; it does not show every row improves, and final cross-profile
+acceptance was pending a matched one-vCPU comparison.** The independent full pair passed first time using
+the reviewer's fresh 919-input production build, the unchanged frozen oracle and inputs and the shared
+lock, with no competing work and no guest-affinity, cache or workload change; the normal CLI and
+resident are distinct from the profiler. Both phases pass inline and readback checks, full CRC sweeps,
+four persisted file hashes, filesystem checks, clean shutdown and fsck, and the read-only relaunch keeps
+the image hash (re-hashed by the reviewer). The last five campaign pairs were reparsed and all 45
+workload rows recomputed.
 
-Both phases pass inline/readback checks, full 1 GiB CRC sweeps, four persisted
-file hashes, ordinary filesystem checks, clean S5 and offline fsck. The read-only
-relaunch preserves the complete image hash; the reviewer independently rehashed
-that final image after execution. The final five completed campaign pairs were
-reparsed and all 45 workload rows independently recomputed, retaining 510 output
-hashes under `io-smp-fix-20261108-01/replica-review-01`. Fresh-build/source bindings
-and the exact wrapper/command are retained separately. This execution completes
-VM23–24 of the originally declared 24; a separately recorded extension for a
-matched N1 regression check is pending and is not part of this result.
+**Reading (numbers in `docs/restructure/io-benchmarks.md`):** four-vCPU random-read throughput roughly
+quadruples, combined CPU falls to about a third and elapsed time to about 60 percent of the fresh
+baseline in both the primary and independent runs. But sequential write throughput varies substantially
+(the independent run is well below the primary and below the baseline) and the independent fsync row
+worsens; two-vCPU four-job tails and the first one-vCPU sequential-write row also need explicit
+reporting. No slower run is replaced by the repeat. Per-job tails are not aggregate percentiles.
 
-| N4 observation | Fresh baseline | Candidate primary | Independent candidate |
-| --- | ---: | ---: | ---: |
-| Random read4KiB Q16, kIOPS | 9.228 | 36.618 | 36.983 |
-| Four-job random read4KiB Q16 each, kIOPS | 18.437 | 46.318 | 44.958 |
-| Q16 p99 completion, ms | 2.474 | 0.569 | 0.518 |
-| Four-job worst per-job p99, ms | 15.270 | 12.780 | 8.159 |
-| Combined VM elapsed, seconds | 193.76 | 113.07 | 114.73 |
-| Combined VM CPU, seconds | 599.43 | 215.55 | 205.15 |
-| Sequential write128KiB Q16, MiB/s | 689.53 | 792.11 | 453.54 |
-| Mean periodic fsync, ms | 8.425 | 8.506 | 10.175 |
+**Also inspected, not rerun:** the current-source late shadow-reset positive record (all exact
+acknowledgements precede the post, reset counters advance and pending bits clear before release). Finite
+tests do not enumerate every withdrawal interleaving.
 
-**Evidence validity:** the selected N4 random-read and integrated CPU/elapsed
-improvement is independently reproduced with correctness retained. These are
-checksum-bearing whole-system workloads; VM totals exclude outer clone/hash/fsck
-work. Per-job p99s are not aggregate percentiles. The result does not show that
-every row improves: sequential write throughput varies substantially and the
-replica fsync row worsens. N2 four-job tails and the primary N1 sequential-write
-row also require explicit reporting. No slower run is replaced by the repeat.
-
-The current-source N4 late-SHADOWS positive record was inspected, not rerun by
-this reviewer: all four exact ACKs precede the post with release0, all four reset
-counters advance0→1 and pending bits clear before release. The ordinary split/AP
-regressions and forced quiet replay serve different obligations. Production
-source safety remains accepted as reviewed; finite tests do not enumerate every
-withdrawal interleaving.
-
-**Decision relevance:** this is strong scoped evidence for the intended N4
-coordination improvement. Final cross-profile acceptance remains pending the
-bounded fresh matched N1 baseline/candidate comparison, because its initial
-501.16MiB/s write result was materially below the earlier808.32MiB/s baseline.
-The independent N4 write variation reinforces the need to retain all rows and
-avoid inferring a cause. A small host-context check after the replica reports
-96% APFS data-volume usage with approximately10.0GiB available; timed stderr
-reports zero swaps in the inspected baseline/candidate runs. Neither observation
-identifies the write-variation mechanism. No additional VM was launched by this
-reviewer, and the lease was returned before the N1 comparison.
+**Open item:** the first one-vCPU write result was materially below the earlier baseline; the independent
+four-vCPU write variation reinforces retaining all rows and not inferring a cause. A host-context check
+(disk nearly full with about 10 GiB free; no swaps in the inspected runs) does not identify the
+mechanism. No VM was launched by this review; the lease was returned before the one-vCPU comparison.
 
 ## HLT quiescence — final independent acceptance, November 8, 2026
 
-**Disposition:** accept the selected candidate03 as a targeted N4 read/CPU
-coordination repair. No substantive source, execution or reproduction blocker
-remains in this increment. This closes the pending matched-N1 assessment above;
-it does not qualify every workload or complete the broader I/O plan.
+**Verdict: the selected candidate is accepted as a targeted four-vCPU read and CPU coordination repair;
+no substantive source, execution or reproduction blocker remains in this increment.** It closes the pending
+one-vCPU assessment but does not qualify every workload or complete the I/O plan. The final audit reparsed
+all seven full pairs with the frozen oracle, recomputed all 63 workload rows and pair totals, and checked
+all 135 rendered numeric cells (including the earlier QEMU and two-vCPU references and fsync tails)
+against the benchmark document; all seven pairs pass CRC and file hashes, clean shutdown, fsck and
+unchanged read-only images. No additional VM was launched.
 
-The final audit reparsed all seven full pairs with the unchanged frozen matrix
-oracle, independently recomputed all 63 workload rows and pair timing totals,
-and retained 714 output hashes in
-`natemu-raw/io-smp-fix-20261108-01/replica-review-01`. Every row and pair total
-matches canonical `summary.json`. All 135 rendered numeric cells were separately
-checked against phase results, including the explicitly earlier QEMU/N2
-references and periodic-fsync p99s. The retained report matches the benchmark
-document. All seven pairs pass CRC/file hashes, clean S5, fsck and unchanged
-read-only relaunch images; the independent N4 image was independently rehashed.
-This extends the previous five-pair audit, without launching additional VMs.
+**Open and negative observations kept:** in the fresh matched one-vCPU comparison the unchanged baseline
+also fell well below the earlier write figure, so a consistent candidate-specific write regression does
+not reproduce, and the cause of the write variation is unknown. The first candidate's low one-vCPU write
+result, the independent four-vCPU write result, the worse replica fsync tails and the two-vCPU four-reader
+tail all remain visible. Host swap and capacity snapshots do not establish a cause or exclude memory
+pressure. Four-reader throughput and worst per-job tail still trail the earlier QEMU reference. These short,
+checksum-bearing, warm-cache observations do not establish uniform write gains, statistical bounds, storage
+bandwidth or QEMU parity.
 
-The fresh matched N1 baseline/candidate write results are 436.446/711.971 MiB/s,
-with combined VM elapsed 126.52/126.60 seconds and CPU 154.66/156.02 seconds.
-The unchanged baseline also falls below the earlier 808.32 MiB/s observation.
-A consistent candidate-specific write regression therefore does not reproduce;
-the cause of the variation remains unknown. The first candidate's 501.16 MiB/s,
-independent N4's 453.54 MiB/s, worse replica fsync tails and N2 four-reader p99
-remain visible. Host swap usage and capacity snapshots do not establish a cause
-or absence of memory pressure; process rusage swaps are a different measure.
+**Source:** final review confirms the ordered HLT-only promise, the withdrawal checkpoint, the previously
+serviced table epoch, unchanged terminal and cancellation checks and the exact-acknowledgement path for
+application processors; the design plan and virtio README match. The selected patch excludes the withdrawn
+shadow-read and spin experiments, and its source bindings match the earlier accepted candidate build (the
+unchanged control for this comparison). Primary unit and live regressions are author executions; the fresh
+build, forced quiet positive and full pair are independent; shared fixtures and compiler, and finite
+schedules, limit independence and coverage; the late shadow-reset positive and stale-table negative were
+inspected or rejudged, not rerun.
 
-The independently reproduced N4 Q16 gain (9.228k to 36.618k/36.983k IOPS),
-four-reader gain (18.437k to 46.318k/44.958k), and CPU reduction
-(599.43 to 215.55/205.15 seconds) support selection. Four-reader throughput and
-worst per-job p99 still trail the earlier QEMU reference. These short,
-checksum-bearing, warm-cache observations do not establish uniform write gains,
-statistical bounds, storage-device bandwidth or general QEMU parity.
+**Accounting:** the campaign closed at its extended launch limit with 27 healthy runs and one intentional
+stale-table negative; no unexpected VM failure or retry is hidden; removed build intermediates left binaries,
+source, recipes and results retained. Full distro, partition, reboot and recovery coverage, native
+networking, write variability and four-reader fairness remain separate work.
 
-Final source review confirms the ordered HLT-only promise, withdrawal checkpoint,
-previously-serviced table epoch, unchanged terminal/cancellation checks and
-exact-ACK AP path. The source contract in `io-plan.md` and the virtio README
-matches these obligations. The selected patch excludes the withdrawn shadow-read
-and spin experiments. Workspace production source bindings match frozen C3;
-the rebuilt resident hash matches the independently built resident. Primary unit
-and live regressions remain author executions; the fresh build, forced quiet
-positive and full N4 pair are independent executions. Shared fixtures/FEX and
-finite schedules limit independence and coverage; the late-SHADOWS positive and
-stale-table negative were independently inspected/rejudged, not rerun here.
-
-The campaign closes at 28/28 launches: 27 healthy runs and one intentional
-stale-table negative. The separately declared N1 extension enlarged 24/8 GiB
-to 28/11 GiB; approximately 10.14 GiB remains. No unexpected VM failure or retry
-is hidden. Removal of reproducible build intermediates retained bound binaries,
-source, recipes and results. Final benchmark, implementation and investigation
-claims are consistent with this scoped acceptance. Full distro/partition/reboot
-and recovery coverage, native networking, write variability and four-reader
-fairness/tails remain separate work.
+Retained review: `natemu-raw/io-smp-fix-20261108-01/replica-review-01/review.md`.
 
 ## I/O safety stress — independent pre-execution review, November 8, 2026
 
-The native, lifecycle and Linux-soak methods are accepted for bounded execution,
-not yet as completed coverage. Authors and reviewer remain separate. The reviewer
-performed source/oracle inspection only in this preparation; no VM or build.
+**Verdict: the native, lifecycle and Linux-soak methods are accepted for bounded execution, not yet
+as completed coverage.** Authors and reviewer stayed separate; the reviewer did source and oracle
+inspection only (no VM or build). Source and oracle acceptance does not establish live completion, all
+interleavings, cross-platform memory ordering or general I/O compatibility.
 
-The native fixture uses normal, uninstrumented N2/N4 repeated cycles separately
-from six compile-time-only scheduling hooks. Each normal cycle includes mixed
-active/HLT and all-active read windows, real split LOCK NOT operations, global
-PTE and cached-code changes, quiet/read-only successors and IRQ wake. Review
-added quiet-boundary parity against stable per-CPU operation counts: a zero/all-
-ones check alone detects tearing but misses lost toggles. Parity still cannot
-detect every even compensating error. Forced hooks retain actual pending epochs,
-ACK/quiet observations, cancellation outcomes, late-SHADOWS/reset service and
-timeouts; they never manufacture production protocol acknowledgements. Strong
-hook atomics establish selected schedules, not the necessity or sufficiency of
-production barriers. Normal runs remain necessary empirical coverage.
+**Native fixture:** normal, uninstrumented two- and four-vCPU repeated cycles (mixed active and HLT
+read windows, all-active windows, real split LOCK NOT operations, global page-table and cached-code
+changes, quiet read-only successors, interrupt wake) are kept separate from six compile-time-only
+scheduling hooks. Review added quiet-boundary parity against stable per-vCPU operation counts, since an
+all-zero or all-ones check detects tearing but not lost toggles (parity still misses an even
+compensating error); before freeze the author added a second shared cross-16-byte LOCK INC counter
+after each NOT, and the oracle compares its exact quiet-boundary increase with the sum of per-vCPU
+completed loops, closing the parity-only gap for that operation. Forced hooks keep real pending epochs,
+acknowledgements, cancellation outcomes, late shadow-reset service and timeouts and never manufacture
+production acknowledgements; they establish selected schedules, not the necessity or sufficiency of
+production barriers, so normal runs remain necessary empirical coverage. Forced-prelude operations are
+outside the later rebaselined counts, and a scope guard releases latches before joins on error. The
+normal resident differs from the earlier accepted build as an ELF file but the independent section
+comparison shows identical boot and text bytes (only diagnostic source-line numbers in read-only data
+differ) and no hook symbols, establishing executable hook absence without claiming byte-identical
+binaries. The forced failure diagnostic was accepted; an isolated mutant missing the CPU0 wait service
+must reach the real-peer schedule and fail with an acknowledgement timeout, unchanged late-service
+counter, zero hook timeouts and clean teardown (post-release reset advances are not evidence of the
+missing service).
 
-Repeated reset/disable fixtures check old sentinels and fresh status/used-entry
-metadata plus both complete payloads before reusing queue RAM in every generation.
-Review caught missing intermediate fresh metadata checks that final RAM alone
-would not detect. A cycle-7 guest corruption must fail the unchanged positive
-oracle at its expected assertion with clean teardown, rather than count arbitrary
-failure as a successful falsifier. Two initial executions remain failures of the
-fixture: absolute MMIO displacement sign extension, then unsupported memory CMP.
-The corrected closure uses MOV through R12+0x44 and register TEST. The reviewer
-accepted the address correction before noticing the separate CMP-form issue;
-both attempts remain retained and consume launches. No production defect or
-retroactive pass is inferred from them.
+**Lifecycle and soak:** repeated reset and disable fixtures check old sentinels, fresh status and used
+entries and both complete payloads before reusing queue RAM each generation; review caught missing
+intermediate metadata checks that final RAM alone would not detect. A guest corruption in cycle seven
+must fail at its expected assertion with clean teardown. The soak uses disjoint 64 MiB files: pure random
+reads verified inline and random writes with CRC headers followed by full verification (fio's ordinary
+mixed read-write does not acquire verification from the CRC option; the design was corrected). Review
+strengthened job overlap, worker identity and CPU observations, readiness, interval-log parsing and
+failed-process-group cleanup. The loaded comparison is fixed-order, not causal; the 256 MiB verified
+memory worker is bounded load, not near-capacity pressure; sampled progress is not continuous
+observation.
 
-The soak uses disjoint 64 MiB files: pure random reads verified inline and random
-writes with CRC headers followed by full verification. fio3.39 ordinary mixed
-randrw reads do not acquire verification merely from the CRC option; the design
-was corrected accordingly. Review strengthened common fio-job overlap, actual
-worker PID/starttime/CPU observations, readiness, interval-log parsing and failed-
-process-group cleanup. The loaded comparison is fixed-order, not causal or a
-matrix-equivalent benchmark. The 256 MiB verified memory worker is bounded load,
-not near-capacity pressure; sampled progress is not continuous observation, and
-its final timeout-interrupted pass need not complete. Full CRC before
-repreconditioning and final hash/fsck/read-only persistence checks remain required.
+**Failures kept:** two initial executions failed in the fixture itself (absolute MMIO displacement sign
+extension, then an unsupported memory compare form; the corrected closure uses MOV through a register
+displacement and register TEST); both attempts consume launches and no production defect or retroactive
+pass is inferred. **The first Linux soak is rejected:** an RCU stall occurred while exporting large serial
+logs after the workload ran. A separately reviewed correction uses bounded, paced gzip/base64 framing with
+exact decoded lengths and checksums, keeping the original CSV bytes and workload checks; malformed frames,
+extra streams, excessive expansion and kernel errors stay fatal; no error suppression or workload
+reduction. The revision is accepted for a new run, the original failure is not promoted to a pass, and
+neither the UART or runtime cause nor a production fix is established; whole-VM timing now includes the
+changed export overhead.
 
-These methods address specific previously uncovered schedules and longer combined
-load. Source and oracle acceptance does not establish successful live completion,
-all interleavings, cross-platform memory ordering or general I/O compatibility.
-
-Before freeze, the native author added a second shared cross-16-byte LOCK INC
-counter after each NOT, publishing the local loop count only after both complete.
-The final reviewed oracle compares its exact quiet-boundary increase with checked
-sums of all per-CPU completed loops, alongside the NOT tearing/parity checks.
-This closes the parity-only even-loss gap for the counter operation. Both
-baselines come from one quiet snapshot; normal baselines must be zero. Final RAM,
-counter ranges, rate arithmetic and request/grant/canceled-epoch/release/ACK
-accounting are checked. Forced-prelude operations are explicitly outside the
-subsequent rebaselined cycle counts. A controller-local scope guard releases all
-latches before implicit thread joins on errors or panic. These final changes are
-accepted for freeze; independent fresh normal/forced builds and six replay
-launches are planned only after the execution lease is granted.
-
-The normal native-build-01 resident differs from C3 as an ELF file, but independent
-section comparison finds identical `.boot` and entire `.text` bytes and addresses.
-All 41 changed `.rodata` bytes decode as diagnostic source-line numbers, with
-identical filename/column and identical referenced source statements. Normal
-symbols contain no `io_test`; the forced binary contains its hook function.
-The reproducible comparison and artifact hashes are retained in campaign
-`replica-binary-review-01`. This establishes executable hook absence without
-claiming byte-identical complete binaries.
-
-The first Linux soak remains rejected: an RCU stall occurred while exporting
-large serial logs after workload execution. A separately reviewed correction
-uses bounded, paced gzip/base64 framing with exact decoded lengths and SHA256,
-retaining the original CSV bytes and workload checks. Malformed/truncated frames,
-extra streams, excessive expansion and serial/decoded kernel errors remain fatal.
-No printk/error suppression or workload reduction was introduced. The source
-revision is accepted for a new run; the original failure is not promoted to a
-pass, and neither the UART/runtime cause nor a production fix is established.
-Whole-VM timing includes changed export overhead, unlike separately retained fio
-workload metrics. The final reviewed source hash is
-`8ca35332d1620ebb7ddb02abe2ab7a951de799eeacd6e114e52a12df3e2472b5`
-(the final edit says the stall occurred during export, without assigning cause).
-
-The first forced-scope failure diagnostic is also accepted: it releases latches
-before joining, retains both the primary failure and exact copy error, and logs
-actual epoch/service/timeout evidence. An isolated missing-CPU0-wait-service
-mutant must reach the real-peer-SHADOWS schedule and fail with an acknowledgement
-timeout and unchanged late-service counter, zero hook timeouts and clean teardown.
-The unchanged outer drain may legitimately advance reset counters after release;
-that is not evidence of the missing in-window service occurring.
+Retained: `natemu-raw/io-safety-stress-20261108-01`.
 
 ### Independent fresh-build replay and final disposition
 
-Accepted for the stated finite safety/load coverage. The reviewer independently
-verified all 926 frozen source hashes, copied those inputs into
-`io-safety-stress-20261108-01/replica-build-01`, and rebuilt the normal CLI alone,
-normal driver/resident, and separately featured driver/resident into fresh
-targets. Both resident stack audits, signing and all three runner self-checks
-passed. The source manifest is
-`c3fb5990ffb01adf7d6ebf3af66614ee0ea196b07be84fbb380379cbf28a1e35`.
-Build commands, logs, source/oracle/input and binary bindings remain retained;
-the normal resident hash `27b7abeb…` matches the independently inspected binary.
-No production or fixture edits were made by the reviewer.
+**Verdict: accepted for the stated finite safety and load coverage; no substantive acceptance
+blocker.** The reviewer verified all 926 frozen source hashes, rebuilt the normal CLI alone, the normal
+driver and resident, and the separately featured driver and resident in fresh targets (stack audits,
+signing and three runner self-checks pass), with no production or fixture edits. Seven replica launches
+ran without retries: normal four-vCPU 512 cycles, forced two-vCPU 64 cycles, reset and disable with 64
+generations each, the missing-service negative control, and the Linux soak main and restart pair. The
+six positive VMs passed; the negative VM remains an ordinary oracle failure with a separate precise
+expected-negative verdict (its mutant resident and the compiler are shared pinned inputs, not
+independently rebuilt).
 
-Seven authorized replica launches completed without retries: normal N4 with 512
-cycles, forced N2 with 64 cycles, reset and disable with 64 generations each,
-the missing-service negative control, and the Linux soak main/restart pair.
-The six positive VMs passed. The negative VM remains an ordinary oracle failure,
-with a separate precise expected-negative verdict. Its driver was freshly built;
-its mutant resident and the FEX compiler are shared pinned inputs, not independently
-rebuilt components. No extra launch was needed.
+**Checks:** post-run recomputation of every native cycle's cumulative increment count and NOT parity
+(the forced run also keeps 64 distinct increasing canceled epochs and complete accounting); each
+lifecycle run has the exact expected native reads and commits with ordered old-generation cancellation
+and recovery and full RAM and disk agreement. The mutant reaches the real-peer schedule, times out
+specifically waiting for acknowledgement with zero late-service and hook timeouts, and tears down. The
+reviewer reparsed both soak pairs' serial framing and decoded logs, rechecked all oracles and recomputed
+rates, and verified fsck, full CRC sweeps, file hashes and unchanged read-only images. Loaded throughput
+was less than half of unloaded with several-fold worse read and write tails (numbers in
+`docs/restructure/io-benchmarks.md`); the loaded sampling gap and incomplete histogram tails stay
+qualified.
 
-Independent post-run recomputation checked every native cycle's cumulative exact
-increment count and NOT parity: normal N4 completed 22,276 operations from zero;
-forced N2 completed 3,291 operations after its five-operation prelude baseline.
-Both final RAM records agree. The forced run also retains 64 distinct increasing
-announced canceled epochs and complete final accounting. Each lifecycle run has
-exactly 128 native reads and 64 published commits, ordered old-generation
-cancellation/fresh recovery and complete RAM/disk agreement; both active peers
-record thousands of actual split operations. The mutant reaches real peer
-SHADOWS with ACK `[2,1]`, times out specifically waiting for acknowledgement,
-keeps late-service count zero and all hook timeout counts zero, releases epoch2
-without a written/table epoch, and tears down both CPUs. Post-release reset
-counter advancement is retained rather than misclassified.
+**Not established:** a randomized performance comparison or physical-disk score (fixed-order
+observations support contention and progress only); the bulk-UART stall cause stays unresolved; progress
+sampling is not continuous; memory pressure is bounded; forced-hook ordering has limits; no universal
+concurrency proof. The earlier two lifecycle fixture failures, the original RCU-stall soak and the
+deliberate negatives remain visible.
 
-The reviewer reparsed both successful soak pairs' serial framing and original
-decoded logs, checked all fio/stress/interval/worker oracles, recomputed rates
-from bytes/I/Os and actual direction runtime, and verified fsck, full 128 MiB CRC
-sweeps, persistent file hashes and unchanged read-only image hashes. The replica
-final 512 MiB image was separately rehashed. Common job overlap was 60.020 seconds
-unloaded and 300.000 seconds loaded. Replica observations are:
-
-| Context | Read IOPS | Write IOPS | Read p99, ms | Write p99, ms |
-| --- | ---: | ---: | ---: | ---: |
-| Unloaded | 27,123.54 | 16,924.77 | 0.872448 | 1.892352 |
-| Loaded | 11,618.05 | 8,019.59 | 6.127616 | 7.766016 |
-
-Replica main/restart host process times were 483.16/11.25 seconds and
-1,787.97/13.10 CPU-seconds. The longest retained loaded sampling gap was 1.270
-seconds; incomplete histogram tails remain explicitly qualified. Each of the
-three stress processes passed one worker with zero failed/skipped workers.
-Primary benchmark table cells, whole-process timing and method qualifications
-were independently checked against retained data and agree. These fixed-order
-observations support contention/progress under this workload, not a randomized
-performance comparison or physical-disk score.
-
-The reproducible independent audit, 130 output hashes, exact effects, numerical
-summary and review are retained in
-`io-safety-stress-20261108-01/replica-review-01`. The seven replica launches bring
-the campaign to 24 of its 32-launch allowance; measured storage after replication
-was 2,427,852 KiB (about 2.315 GiB), within 4 GiB. Earlier two lifecycle fixture
-failures, the original RCU-stall soak and deliberate negatives remain visible.
-The reviewed plan/benchmark conclusions preserve the unresolved bulk-UART stall,
-sampled rather than continuous worker observation, bounded memory pressure,
-forced-hook ordering limitations and lack of a universal concurrency proof.
-No substantive acceptance blocker remains for this scoped coverage increment.
+Retained review: `natemu-raw/io-safety-stress-20261108-01/replica-review-01/review.md`.
 
 ## Loaded I/O diagnostic and UART repair review — November 8, 2026
 
-Reviewer `/root/io_scope_review` independently inspected the retained diagnostic
-sources/analyzers and recomputed host phase deltas and per-window means from
-stderr. The corrected baseline analysis is in
-`io-load-repair-20261108-01/instrumented-profile-01b-analysis-02`; the owner-QoS
-comparison is in `instrumented-profile-02-analysis`. Their final accounting,
-four-vCPU logger validity, full-pair correctness and read-only-image invariants
-pass. This review executed no VM or build.
+**Verdict: the diagnostic and its analysis are accepted; the owner-priority experiment is recommended
+for dropping; the UART repair's final acceptance is carried by the returns below.** An independent
+reviewer inspected the retained diagnostic sources and analyzers and recomputed host phase deltas and
+per-window means; the corrected baseline analysis, the four-vCPU logger validity, full-pair correctness
+and read-only-image invariants pass. No VM or build was run by this review.
 
-The baseline main phase retires 20,014,866 successful windows, 80,059,464
-participant checks and 8,469,134 native jobs. Interior unloaded/loaded mean
-window elapsed time is 5.073/13.271 us; kick/check elapsed time is 1.351/6.899 us,
-ACK wait is 3.421/5.709 us and post-ACK copy is 0.134/0.312 us. Resident elapsed
-park shares rise from approximately 14–21% to 24–33% per vCPU. These are not CPU
-percentages: parked duration includes descheduling and late-SHADOWS service,
-excludes quiet-skipped epochs and pre-ACK/post-release work, and cannot be added
-to CPU/perf buckets. Native execution overlaps inclusive lane wait. Kick timing
-includes all participant checks/barriers/skips, not just native ring calls.
+**Findings:** under load the mean window time, the doorbell and check phase and the acknowledgement wait
+all rise, and resident park shares rise from about 14-21% to 24-33% per vCPU. These are not CPU
+percentages: parked time includes descheduling and late shadow-reset service, excludes quiet-skipped
+epochs and pre-acknowledgement and post-release work, and cannot be added to CPU or profiler buckets;
+native execution overlaps inclusive lane wait; kick timing includes all participant checks, not only
+native ring calls. Counter families are sampled by separate nontransactional brackets; the 500 ms margins
+around marker timestamps are not a bound on guest phase-edge error; scheduling can exceed the nominal
+observation cadence.
 
-Counters use separate nontransactional interior brackets for each family.
-The 500-ms margins are around observed marker timestamps, not a guaranteed bound
-on guest phase-edge error; scheduling can exceed the nominal 250-ms observation
-cadence. Corrected markers use the same native CLOCK_UPTIME_RAW API as host
-counters. The first diagnostic's log-cap failure and incompatible Python clock
-origin remain retained; the corrected version disables only the old 5-ms live
-perf reader while preserving final owned-vCPU counters. The baseline guest
-clock-watchdog readback/skipped-skew warning remains visible despite passing I/O
-oracles. The retained audit now resolves its sibling analyzer instead of a
-temporary-file dependency; corrected analysis values are unchanged.
+**Failures kept:** the first diagnostic's log-cap failure and incompatible Python clock origin remain
+retained; the corrected version disables only the old 5 ms live performance reader and uses the same
+native clock as host counters. The baseline guest clock-watchdog warning remains visible despite passing
+I/O oracles. The audit now resolves its sibling analyzer rather than a temporary file; values unchanged.
 
-The QoS comparison's source manifests differ only in `linux.rs`; the resident
-binary is unchanged. Queries succeed and report owner DEFAULT (21) becoming
-USER_INTERACTIVE (33), vCPUs staying 33 and the disk lane staying 21. They do not
-report effective overrides or physical-core placement. Loaded elapsed window
-time is 13.271→13.296 us, kick/check 6.899→6.961 us, ACK 5.709→5.697 us and copy
-0.312→0.312 us. Diagnostic read/write throughput is 43.384→41.599 and
-30.348→29.342 MiB/s. Native elapsed/job is 5.803→8.330 us and inclusive lane wait
-10.696→13.038 us. These sequential instrumented runs show no useful positive
-signal for the owner-only change; they do not establish a statistical regression
-or priority-inversion cause. The reviewer recommends dropping QoS02, rather than
-expanding scheduler-policy changes on this evidence. Parent reports its exact
-reversal; final selected-source binding remains part of subsequent qualification.
+**Owner-priority comparison:** raising the owner thread's quality-of-service class (queries succeed and
+show owner default to user-interactive, vCPUs unchanged, disk lane unchanged; they do not report effective
+overrides or core placement) showed no useful positive signal: window, doorbell, acknowledgement and copy
+times were flat, diagnostic throughput slightly lower, native per-job and lane waits higher. These
+sequential instrumented runs do not establish a statistical regression or priority-inversion cause. The
+reviewer recommends dropping the change rather than expanding scheduler-policy changes; the author reports
+its exact reversal, and final selected-source binding stays part of later qualification.
 
-UART implementation, readiness experiments, focused regressions, terminal-drain
-controls and the remaining normal/independent qualification are covered by the
-[pre-execution review](INV-03-01-pre-execution.md#loaded-io-and-uart-repair--november-8-2026).
-Source/method acceptance does not yet accept a final UART policy, universal
-fairness, a combined performance improvement or completion of this repair campaign.
+**Not established:** a final UART policy, universal fairness, a combined performance improvement or
+completion of the repair campaign. UART implementation, readiness experiments, regressions and terminal-
+drain controls are covered by the [pre-execution review](INV-03-01-pre-execution.md#loaded-io-and-uart-repair--november-8-2026).
+
+Retained: `natemu-raw/io-load-repair-20261108-01` (`instrumented-profile-01b-analysis-02`,
+`instrumented-profile-02-analysis`).
 
 ### Stress metrics-summary validator correction
 
-During final qualification the author found that `stress_result` searched for
-`metrics-untrustworthy:` while the pinned stress-ng emits `metrics untrustworthy:`.
-Its `all(...)` over an empty match list therefore did not enforce the intended
-trustworthiness check. This is a real validator gap, not evidence that earlier
-worker logs reported untrustworthy metrics. Existing worker pass/fail/skip and
-positive-work checks are separate.
+**Verdict: a real validator gap found and source-accepted (not evidence that earlier worker logs reported
+untrustworthy metrics).** During final qualification the author found the stress check searched for a
+hyphenated "metrics-untrustworthy" string while the pinned stress-ng emits it with a space, so an
+all-over-empty-list test enforced nothing. The reviewer verified the patch's before and after hashes and
+syntax tree: only the stress-result function, its synthetic sample and self-check change. The correction
+requires exactly one complete zero-valued summary, accepts either separator, and rejects missing,
+duplicate, nonzero and mixed-spelling duplicates and trailing garbage. The reviewer ran nothing during the
+active timed pair.
 
-The reviewer source-accepts `soak-metrics-oracle-01/change.patch`, independently
-verifying its before/after hashes and AST. Only `stress_result`, its synthetic
-sample and self-check change; init, jobs, thresholds and runner remain identical.
-The correction requires exactly one complete zero-valued summary, accepting
-either separator spelling. Missing, duplicate, nonzero and mixed-spelling
-duplicates are rejected by added controls; trailing garbage cannot pass as zero.
-No self-check or VM was run by the reviewer during the active timed pair.
-
-Corrected oracle results must remain separate supplementary judgments over the
-retained decoded logs, binding old results/logs and the new oracle; original
-results are not rewritten. The independent build will retain its original
-frozen compilation inputs and bind the corrected soak oracle separately.
-Successful supplementary rejudgment, rather than this source review alone, is
-required before retaining earlier stress-metrics acceptance claims.
+**Condition:** corrected results must remain separate supplementary judgments over the retained decoded
+logs (binding old results, logs and the new oracle; originals not rewritten); the independent build keeps
+its original frozen compilation inputs and binds the corrected oracle separately. A successful
+supplementary rejudgment, not this source review alone, is required before retaining earlier
+stress-metrics acceptance claims.
 
 ### Independent final UART/combined-build qualification — November 9
 
-**Correctness acceptance: accepted for the stated finite scope. Performance
-disposition: reverse-order control still pending.** The independent reviewer
-verified and copied all 927 frozen final-build-01 source entries, then built the
-normal CLI alone, driver and normal resident into a fresh target. Signing, the
-resident stack audit, serial self-check, corrected soak self-check (212 negative
-controls) and native-stress self-check passed. The compilation manifest is
-`29b8b032bef2d4a2af565f3b554a81f314c630d8d5d4a6ea52094008c11e64a6`.
-CLI/driver hashes are independently built artifacts (`49aa4010…`/`2b93eaaa…`),
-not claimed byte-identical to the producing host binaries. Resident `27b7abeb…`
-matches the selected artifact; FEX `3ccb420c…` remains a shared pinned input.
-Corrected soak oracle02 and loaded-serial oracle07/input02 are separately bound;
-they do not mutate the frozen compilation snapshot.
+**Verdict: correctness accepted for the stated finite scope; performance disposition was pending the
+reverse-order control (next entry).** The reviewer verified and copied all 927 frozen final-build inputs
+and built the normal CLI, driver and normal resident in a fresh target (signing, stack audit, serial,
+corrected soak and native-stress self-checks pass). The CLI and driver are independently built artifacts,
+not claimed byte-identical to the producing host binaries; the resident matches the selected artifact;
+the compiler binary is a shared pinned input; the corrected soak and loaded-serial oracles are bound
+separately without mutating the frozen snapshot.
 
-One preparation-only attempt used oracle06's manifest filename/schema for
-oracle07, which instead has `bindings.json/oracle_sha256`. It failed before
-source copying, building or VM execution. The empty attempt, recipe and failure
-are retained in `replica-prepare-attempt-01`; correcting that binding lookup did
-not change production or test behavior. No VM was retried.
+**Failure kept:** one preparation-only attempt used the wrong manifest filename and schema for the newest
+loaded-serial oracle; it failed before any copying, building or VM, is retained, and the correction changed
+no production or test behavior. The first loaded primary run also remains a FAIL (missing observer
+samples); its corrected fresh primary and the fresh independent run pass the unchanged strict consecutive-
+observation oracle, which does not retroactively change that failure. The one-fold independent serial
+repetition was deliberately omitted under the reviewed budget reallocation; primary one-fold evidence and
+the independently repeated longer payload are distinguished.
 
-Five authorized independent launches pass: threefold unpaced serial, soak
-main/read-only restart, normal native N4×512 and CPU-loaded threefold serial.
-The onefold independent repetition was deliberately omitted by the reviewed
-budget reallocation; primary onefold evidence and the independently repeated
-longer payload are distinguished. The first loaded primary remains FAIL for
-missing observer samples. Its corrected fresh primary and this fresh independent
-run pass the unchanged strict consecutive-observation oracle; neither result
-retroactively changes the failure.
+**Result (five independent launches, all passed):** threefold unpaced serial and CPU-loaded serial
+emitted exactly the expected bytes with maximum heartbeat gaps near one second and clean shutdown; all
+three distinct worker identities showed consecutive progress with increasing CPU, verified work, zero
+failures and exactly one zero trustworthiness summary (finite CPU-loaded output and progress coverage, not
+memory pressure or a fairness guarantee); the normal uninstrumented four-vCPU native run agreed with the
+exact counter and parity oracles (no new forced-hook or two-vCPU VM claimed); the strict soak pair passed
+full CRC sweeps, file hashes, clean shutdown and fsck, with the final image re-hashed by the reviewer.
+Compared with the fresh earlier-accepted control build, candidate writes were about 5% lower unloaded and
+7% lower loaded; older variation does not dismiss this, so the agreed reverse-order control pair was
+warranted and no throughput gain or absence of regression was accepted yet (numbers in
+`docs/restructure/io-benchmarks.md`).
 
-Independent unloaded serial emits exactly 14,144,544 wire bytes in 89.42 guest
-seconds, with maximum heartbeat gap 1.04 seconds and clean S5. Whole-process
-time is 98.29 seconds and 98.94 CPU-seconds. CPU-loaded serial emits those same
-bytes over the drained interval 8.93–110.45 (101.52 seconds); its maximum heartbeat
-gap is 1.15 seconds. All three distinct actual worker identities have 96
-consecutive observations spanning 5.92–112.21, maximum observation gap 1.22
-seconds, increasing CPU ticks, 180-second verified work, zero exit/failure/skip
-and exactly one zero trustworthiness summary. Whole-process time is 185.94
-seconds and 620.42 CPU-seconds. This is finite CPU-loaded output/progress
-coverage, not memory-pressure coverage or a universal fairness guarantee.
+**Source:** the UART readiness, staging, lifetime and shutdown repair and lazy error formatting are
+accepted: all-THR/REP acceptance and sink-error visibility preserved, pending transmit owns liveness
+through interrupt publication, teardown drains under the serialized timer halt, and allocation removal
+changes neither error nor synchronization semantics. Lazy formatting has no isolated gain claim. Arbitrary
+blocking sinks and the accelerated nonphysical timing model remain limitations. The benchmark document
+matches the retained results; its GIC sample paragraph keeps batching as a future hypothesis.
 
-Native N4 uses the normal, uninstrumented resident for 512 seeded cycles. Its
-22,546 split operations agree with the exact increment counter and final NOT
-parity; the existing full state/RAM/teardown oracle passes. Whole-process time is
-1.64 seconds and 4.35 CPU-seconds. No new forced-hook or N2 VM is claimed here.
-
-The strict soak pair passes full 128-MiB CRC sweeps, both persistent file hashes,
-clean S5 and offline fsck. The reviewer independently rehashes the final 512-MiB
-image as `219283d74544fac8e8e060f1d6caeb2165be825330fffffbfb822608dfc53513`,
-equal to both read-only phase image hashes. Recomputed rates use actual direction
-bytes/I/Os/runtime, with job overlap 59.995/299.986 seconds:
-
-| Context | Read MiB/s | Write MiB/s | Read p99, ms | Write p99, ms |
-| --- | ---: | ---: | ---: | ---: |
-| Unloaded | 103.671 | 59.242 | 0.880640 | 2.408448 |
-| Loaded | 43.827 | 31.772 | 6.258688 | 7.634944 |
-
-Main/restart process times are 481.81/11.42 seconds and 1,783.97/14.31 CPU-seconds.
-The three soak workers complete 335,995 / 334,593 / 49,815,552 operations with
-strictly valid summaries. Compared with the fresh C3 control, writes remain
-approximately 4.7% lower unloaded and 6.8% lower loaded. Older variation does not
-dismiss this observation. The agreed reverse-order C3 pair is warranted; no
-combined throughput gain or absence of regression is accepted yet.
-
-The source review accepts the UART readiness/staging/lifetime/shutdown repair
-and lazy error formatting: all-THR/REP acceptance and sink-error visibility are
-preserved, pending TX owns liveness through IRQ publication, teardown drains
-under the serialized timer halt, and allocation removal changes neither error
-nor synchronization semantics. Source, focused controls and the five fresh runs
-support this correctness disposition. Lazy formatting has no isolated gain claim.
-Arbitrary blocking sinks and the accelerated nonphysical timing model remain
-explicit limitations.
-
-The reproducible small-result/worker audit and bindings are retained in
-`io-load-repair-20261108-01/replica-review-01`; final image/resource proof is in
-`replica-build-01/final-image-resource-audit.json`. At lease release the campaign
-contains 4,208,185,344 allocated bytes (about 3.919 GiB), within 4 GiB, with
-4,982,435,840 bytes free. The five replicas bring the campaign to 38 VMs before
-the reserved reverse-order pair. No further reviewer execution is authorized by
-this disposition. Current benchmark tables match retained primary rates/tails
-and times; the strict-metrics section correctly separates supplementary worker
-rejudgment from historical whole-run oracles. The GIC sample paragraph correctly
-distinguishes framework wake/trap observations from natemu mutex blocking and
-keeps batching as a future hypothesis, not an adopted synchronization change.
+Retained: `natemu-raw/io-load-repair-20261108-01/replica-review-01/review.md`; storage ended within the
+bound.
 
 ### Reverse-order control and qualified disposition — November 9
 
-The final C3 control in `final-reverse-baseline-soak01` passes both phases,
-strict worker summaries, fsck, persistent file hashes and unchanged read-only
-image checks. The reviewer independently recomputes rates from direction bytes
-and runtime and checks that its artifact map exactly matches the first C3
-control. All four normal natemu pairs use the same drain-aware input manifest.
-No production or workload change occurs between these comparisons.
+**Verdict: qualified acceptance. The sustained-console correctness repair and finite progress and
+lifecycle coverage are established by the reviewed source, controls and independent replay; an overall
+I/O performance improvement is NOT.** The reverse-order control run of the earlier accepted build passed
+both phases, strict worker summaries, fsck, file hashes and unchanged read-only images; the reviewer
+recomputed rates and checked its artifact map matches the first control; all four normal natemu pairs use
+the same input manifest with no production or workload change between comparisons.
 
-| Reverse C3 context | Read MiB/s | Write MiB/s | Read p99, ms | Write p99, ms |
-| --- | ---: | ---: | ---: | ---: |
-| Unloaded | 98.971 | 60.516 | 0.856064 | 2.023424 |
-| Loaded | 45.054 | 31.121 | 6.062080 | 7.766016 |
+**Reading:** loaded candidate writes fall inside the range of the two control observations, resolving the
+claim of a consistent loaded deficit, but that does not prove equal performance or explain the variation.
+**Unloaded candidate writes remain below both control results (an observed cost of roughly 2-7%) and
+unloaded write tails are also higher;** these costs are unresolved and must not be presented as fixed or
+dismissed with older measurements. Competing work differed between observations, and the fixed-order runs
+do not establish a statistical causal regression either.
 
-Loaded candidate writes (31.327–31.772 MiB/s) fall within the two C3 observations
-(31.121–34.077). This resolves the claim that the observed loaded deficit is
-consistent across these controls; it does not prove equal performance or identify
-the source of variation. Unloaded candidate writes remain below both C3 results:
-57.641–59.242 versus 60.516–62.159 MiB/s, an observed cross-range cost of
-2.1–7.3%. Unloaded write p99 is also higher: 2.408–2.474 versus 2.007–2.023 ms.
-These costs remain unresolved and must not be presented as fixed or dismissed
-using older measurements. The reverse control completes 340,567 / 343,451 /
-52,609,024 stress operations; competing work still differs between observations.
+**Not established / decisions:** no isolated gain is assigned to lazy error formatting; no synchronization
+is removed; native-network and VZ alternatives remain outside this implementation. Future performance work
+should keep the unloaded write cost and tails as explicit comparison targets rather than weakening
+workloads or correctness checks.
 
-The qualified conclusion is accepted: the sustained-console correctness repair
-and finite progress/lifecycle coverage are established by the reviewed source,
-controls and independent replay; an overall I/O performance improvement is not.
-The fixed-order observations do not establish a statistical causal regression
-either. No isolated gain is assigned to lazy error formatting, no synchronization
-is removed, and native-network/VZ alternatives remain outside this implementation.
-Future performance work should retain the unloaded write cost and tails as
-explicit comparison targets rather than weakening workload or correctness checks.

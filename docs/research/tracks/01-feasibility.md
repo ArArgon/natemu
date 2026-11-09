@@ -211,7 +211,7 @@ Each investigation and its findings review remain authoritative for its claims.
 
 ## Retained evidence and scratch retirement
 
-Raw evidence remains outside Git under `/Users/liaozping/orca/natemu-raw`.
+Raw evidence remains outside Git under `natemu-raw`.
 Each historical run retains its own producing sources, build inputs, manifest,
 outputs and checksums, including failed and partial outcomes. Final producer
 `q34-startup-build-05/source`, independent `q34-startup-oracle-01` and bounded
@@ -222,7 +222,7 @@ A future experiment needs its own reviewed budget and fresh output identity.
 After final independent acceptance, root removed only `experiments/track01`
 and `experiments/track01-replication`. Immediately before removal, every current
 file and file-set was compared with the sealed
-[retirement archive](/Users/liaozping/orca/natemu-raw/track01-scratch-retirement-01).
+retirement archive (`natemu-raw/track01-scratch-retirement-01`).
 All 36 working files are recoverable; the 37-entry archive inventory is
 `e0451acf8128000784cfcc474e9e9ec6ceab2c337a883ad1d4c1a7fbb8c96247`.
 The independent reviewer also verified the archive against the working files.
