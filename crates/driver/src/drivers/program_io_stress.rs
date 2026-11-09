@@ -7,6 +7,7 @@ use natemu::{
     },
     vm::Machine,
 };
+use serde_json::{Value, json};
 use std::{
     sync::atomic::{AtomicBool, Ordering::SeqCst},
     time::{Duration, Instant},
@@ -138,7 +139,7 @@ pub(super) fn run(
     cycles: u64,
     seed: u64,
     forced: bool,
-) -> Result<String> {
+) -> Result<Value> {
     let mut r = Run {
         b,
         m,
@@ -162,10 +163,10 @@ pub(super) fn run(
     let forced_report = if forced {
         forced::run(&mut r)?
     } else {
-        String::from("null")
+        Value::Null
     };
     #[cfg(not(feature = "io-test-hooks"))]
-    let forced_report = String::from("null");
+    let forced_report = Value::Null;
     // Forced prelude has extra IRQ-driven operations. Rebaseline only once all real
     // pending IRQs have been consumed and every CPU has reentered idle HLT.
     r.quiet()?;
@@ -184,7 +185,7 @@ pub(super) fn run(
     let mut mixed_reads = 0u64;
     let mut digest = 0u64;
     #[allow(unused_mut)]
-    let mut cancellations = Vec::<String>::new();
+    let mut cancellations = Vec::<Value>::new();
     for generation in 1..=cycles {
         r.quiet()?;
         r.jitter();
@@ -375,18 +376,84 @@ pub(super) fn run(
         "final request/grant/cancel accounting or resident ACK mismatch",
     )?;
     let seconds = r.began.elapsed().as_secs_f64();
-    Ok(format!(
-        "{{\"cycles\":{cycles},\"seed\":{seed},\"cpus\":{},\"instrumented\":{},\"forced\":{},\"windows\":{},\"canceled_epochs\":{canceled_epochs},\"active_reads\":{},\"mixed_reads\":{mixed_reads},\"seconds\":{seconds},\"cycles_per_second\":{},\"digest\":{digest},\"split_baseline\":{split_baseline},\"split_final\":{split_final},\"split_operations\":{split_operations},\"counter_baseline\":{counter_baseline},\"counter_final\":{counter_final},\"forced_evidence\":{forced_report},\"announced_cancellations\":[{}]}}",
-        r.n,
-        cfg!(feature = "io-test-hooks"),
-        forced,
-        r.windows,
-        r.active_reads,
-        cycles as f64 / seconds,
-        cancellations.join(",")
-    ))
+    Ok(json!({
+        "cycles": cycles,
+        "seed": seed,
+        "cpus": r.n,
+        "instrumented": cfg!(feature = "io-test-hooks"),
+        "forced": forced,
+        "windows": r.windows,
+        "canceled_epochs": canceled_epochs,
+        "active_reads": r.active_reads,
+        "mixed_reads": mixed_reads,
+        "seconds": seconds,
+        "cycles_per_second": cycles as f64 / seconds,
+        "digest": digest,
+        "split_baseline": split_baseline,
+        "split_final": split_final,
+        "split_operations": split_operations,
+        "counter_baseline": counter_baseline,
+        "counter_final": counter_final,
+        "forced_evidence": forced_report,
+        "announced_cancellations": cancellations,
+    }))
 }
 
 #[cfg(feature = "io-test-hooks")]
 #[path = "program_io_stress_forced.rs"]
 mod forced;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The result against the former format string, over the same values (the `json!` copied from `run`).
+    #[test]
+    fn json_matches_the_former_format() {
+        let (cycles, seed, n, forced, windows, active_reads) =
+            (200u64, 7u64, 2usize, false, 260u64, 31u64);
+        let (canceled_epochs, mixed_reads, seconds, digest) =
+            (2usize, 12u64, 1.234_567_891_2f64, u64::MAX - 5);
+        let (split_baseline, split_final, split_operations) = (0u64, u64::MAX, 41u64);
+        let (counter_baseline, counter_final) = (0u64, 41u64);
+        let forced_old = "null";
+        let forced_report = Value::Null;
+        let cancellations = vec![
+            json!({"pending": {"stage": "a"}, "completed": {"stage": "b"}, "cancel_won": true});
+            2
+        ];
+        let old_cancellations: Vec<String> = cancellations.iter().map(Value::to_string).collect();
+        let old = format!(
+            "{{\"cycles\":{cycles},\"seed\":{seed},\"cpus\":{},\"instrumented\":{},\"forced\":{},\"windows\":{},\"canceled_epochs\":{canceled_epochs},\"active_reads\":{},\"mixed_reads\":{mixed_reads},\"seconds\":{seconds},\"cycles_per_second\":{},\"digest\":{digest},\"split_baseline\":{split_baseline},\"split_final\":{split_final},\"split_operations\":{split_operations},\"counter_baseline\":{counter_baseline},\"counter_final\":{counter_final},\"forced_evidence\":{forced_old},\"announced_cancellations\":[{}]}}",
+            n,
+            cfg!(feature = "io-test-hooks"),
+            forced,
+            windows,
+            active_reads,
+            cycles as f64 / seconds,
+            old_cancellations.join(",")
+        );
+        let new = json!({
+            "cycles": cycles,
+            "seed": seed,
+            "cpus": n,
+            "instrumented": cfg!(feature = "io-test-hooks"),
+            "forced": forced,
+            "windows": windows,
+            "canceled_epochs": canceled_epochs,
+            "active_reads": active_reads,
+            "mixed_reads": mixed_reads,
+            "seconds": seconds,
+            "cycles_per_second": cycles as f64 / seconds,
+            "digest": digest,
+            "split_baseline": split_baseline,
+            "split_final": split_final,
+            "split_operations": split_operations,
+            "counter_baseline": counter_baseline,
+            "counter_final": counter_final,
+            "forced_evidence": forced_report,
+            "announced_cancellations": cancellations,
+        });
+        assert_eq!(serde_json::from_str::<Value>(&old).unwrap(), new);
+    }
+}

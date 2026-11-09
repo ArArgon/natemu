@@ -531,7 +531,7 @@ pub fn k1_stats(area: Area) -> K1 {
     K1::new(&area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL))
 }
 /// [`k1_stats`]: a vCPU's TLB, code-cache and system-instruction counters (times in us).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct K1 {
     cr3_loads: u64,
     global_flushes: u64,
@@ -562,19 +562,19 @@ pub struct K1 {
     kept_resets: u64,
     systems: K1Systems,
 }
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 struct K1Uncached {
     steps: u64,
     resident: u64,
 }
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 struct K1Reuse {
     copies: u64,
     refused: [u64; 5],
     checks: u64,
 }
 /// Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 struct K1Systems {
     kinds: Members<String, [u64; 2]>,
     from: Members<&'static str, u64>,

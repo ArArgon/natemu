@@ -1,5 +1,6 @@
 //! Bounded owned-packet loopback for the program driver; no guest-memory authority.
 use natemu::{Result, virtio::PacketPort};
+use serde_json::{Value, json};
 use std::{
     sync::{
         Arc, Condvar, Mutex,
@@ -14,11 +15,8 @@ impl Trace {
     fn event(&self, value: String) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).push(value);
     }
-    pub(super) fn json(&self) -> String {
-        format!(
-            "{{\"events\":{:?}}}",
-            self.0.lock().unwrap_or_else(|e| e.into_inner())
-        )
+    pub(super) fn json(&self) -> Value {
+        json!({"events": *self.0.lock().unwrap_or_else(|e| e.into_inner())})
     }
 }
 
@@ -46,7 +44,15 @@ impl Arrival {
         trace: &Trace,
     ) {
         if !self.ready.load(SeqCst) {
-            trace.event(format!("all-halted:{{\"held_us\":{},\"first\":{first:?},\"last\":{last:?},\"live\":1,\"kickers\":0,\"io_active\":false}}", held.as_micros()));
+            let observation = json!({
+                "held_us": held.as_micros() as u64,
+                "first": first,
+                "last": last,
+                "live": 1,
+                "kickers": 0,
+                "io_active": false,
+            });
+            trace.event(format!("all-halted:{observation}"));
             self.ready.store(true, SeqCst);
         }
     }
@@ -152,5 +158,37 @@ pub(super) fn echo(
         if !sent {
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trace and its idle observation against the former format strings, over the same values.
+    #[test]
+    fn json_matches_the_former_format() {
+        let (held, first, last) = (
+            Duration::from_micros(123_456),
+            [[0x101u64, 1]],
+            [[0x101u64, 1]],
+        );
+        let trace = Trace::default();
+        Arrival::new(vec![0; 60])
+            .unwrap()
+            .release(held, &first, &last, &trace);
+        trace.event("closed".into());
+        let old_halted = format!(
+            "all-halted:{{\"held_us\":{},\"first\":{first:?},\"last\":{last:?},\"live\":1,\"kickers\":0,\"io_active\":false}}",
+            held.as_micros()
+        );
+        let new = trace.json();
+        let new_halted = new["events"][0].as_str().unwrap();
+        let observation = |s: &str| -> Value {
+            serde_json::from_str(s.strip_prefix("all-halted:").unwrap()).unwrap()
+        };
+        assert_eq!(observation(&old_halted), observation(new_halted));
+        let old = format!("{{\"events\":{:?}}}", [new_halted, "closed"]);
+        assert_eq!(serde_json::from_str::<Value>(&old).unwrap(), new);
     }
 }

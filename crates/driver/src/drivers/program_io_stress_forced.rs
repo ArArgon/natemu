@@ -35,22 +35,23 @@ fn clean(h: &Hooks<'_>, n: usize) -> Result<()> {
     }
     Ok(())
 }
-fn event(name: &str, s: &WindowStatus, pending: bool) -> String {
-    let row = format!(
-        "{{\"stage\":\"{name}\",\"request\":{},\"released\":{},\"released_after\":{},\"write_windows\":{},\"tables_written\":{},\"ack\":{:?},\"quiet\":{:?},\"copy_pending\":{pending}}}",
-        s.request,
-        s.released,
-        s.released_after,
-        s.write_windows,
-        s.tables_written,
-        s.acknowledged,
-        s.quiescent
-    );
+fn event(name: &str, s: &WindowStatus, pending: bool) -> Value {
+    let row = json!({
+        "stage": name,
+        "request": s.request,
+        "released": s.released,
+        "released_after": s.released_after,
+        "write_windows": s.write_windows,
+        "tables_written": s.tables_written,
+        "ack": s.acknowledged,
+        "quiet": s.quiescent,
+        "copy_pending": pending,
+    });
     eprintln!("io-stress-stage: {row}");
     row
 }
 
-pub(super) fn run(r: &mut Run<'_>) -> Result<String> {
+pub(super) fn run(r: &mut Run<'_>) -> Result<Value> {
     let h = Hooks::new(r.b);
     for v in 0..r.n {
         need(
@@ -120,29 +121,19 @@ pub(super) fn run(r: &mut Run<'_>) -> Result<String> {
                 Ok(Err(error)) => Some(error),
                 Err(_) => Some(String::from("forced copy worker panicked")),
             };
-            let copy_error_json = copy_error.as_ref().map_or_else(
-                || String::from("null"),
-                |error| {
-                    let body: String = error
-                        .chars()
-                        .map(|c| match c {
-                            '\"' => String::from("\\\""),
-                            '\\' => String::from("\\\\"),
-                            c if c < ' ' => format!("\\u{:04x}", c as u32),
-                            c => c.to_string(),
-                        })
-                        .collect();
-                    format!("\"{body}\"")
-                },
-            );
             let status = event("late-shadow-failure", &r.b.io_window_status(), false);
             let timeouts: Vec<_> = (0..r.n).chain([HOST]).map(|v| h.get(v, TIMEOUT)).collect();
-            let last = rows.last().map(String::as_str).unwrap_or("null");
-            eprintln!(
-                "io-stress-late-failure: {{\"last_stage\":{last},\"status\":{status},\"late_before\":{late},\"late_after\":{},\"resets_before\":{resets},\"resets_after\":{},\"hook_timeouts\":{timeouts:?},\"copy_error\":{copy_error_json}}}",
-                h.get(0, LATE_SHADOWS),
-                h.resets(0)
-            );
+            let failure = json!({
+                "last_stage": rows.last(),
+                "status": status,
+                "late_before": late,
+                "late_after": h.get(0, LATE_SHADOWS),
+                "resets_before": resets,
+                "resets_after": h.resets(0),
+                "hook_timeouts": timeouts,
+                "copy_error": copy_error,
+            });
+            eprintln!("io-stress-late-failure: {failure}");
             return Err(primary);
         }
         let bytes = worker.join().map_err(|_| "forced copy worker panicked")??;
@@ -155,7 +146,13 @@ pub(super) fn run(r: &mut Run<'_>) -> Result<String> {
     r.windows += 1;
     r.quiet()?;
     clean(&h, r.n)?;
-    rows.push(format!("{{\"stage\":\"late-shadow-served\",\"late_before\":{late},\"late_after\":{},\"resets_before\":{resets},\"resets_after\":{}}}",h.get(0,LATE_SHADOWS),h.resets(0)));
+    rows.push(json!({
+        "stage": "late-shadow-served",
+        "late_before": late,
+        "late_after": h.get(0, LATE_SHADOWS),
+        "resets_before": resets,
+        "resets_after": h.resets(0),
+    }));
     // Publication precedes quiet entry; the actual kick is still pending at the resident hold.
     for (name, point) in [
         ("request-before-quiet", BEFORE_QUIET),
@@ -336,19 +333,17 @@ pub(super) fn run(r: &mut Run<'_>) -> Result<String> {
     clean(&h, r.n)?;
     let hits: Vec<_> = (0..r.n).chain([HOST]).map(|v| h.get(v, HITS)).collect();
     let timeouts: Vec<_> = (0..r.n).chain([HOST]).map(|v| h.get(v, TIMEOUT)).collect();
-    rows.push(format!(
-        "{{\"stage\":\"hook-counts\",\"hits\":{hits:?},\"timeouts\":{timeouts:?}}}"
-    ));
-    Ok(format!("[{}]", rows.join(",")))
+    rows.push(json!({"stage": "hook-counts", "hits": hits, "timeouts": timeouts}));
+    Ok(Value::Array(rows))
 }
 
 /// Announced cancellation after each cycle's table/code writes and read-only successor.
-pub(super) fn cancel_epoch(r: &mut Run<'_>) -> Result<String> {
+pub(super) fn cancel_epoch(r: &mut Run<'_>) -> Result<Value> {
     let h = Hooks::new(r.b);
     let tag = h.arm(HOST, BEFORE_GRANT)?;
     let before = r.b.io_window_status();
     let permit = CopyPermit::new();
-    let mut announced = String::new();
+    let mut announced = Value::Null;
     std::thread::scope(|scope| -> Result<()> {
         let _abort_before_join = Abort(&h);
         let b = r.b;
@@ -406,7 +401,107 @@ pub(super) fn cancel_epoch(r: &mut Run<'_>) -> Result<String> {
     )?;
     clean(&h, r.n)?;
     let completed = event("announced-canceled", &after, false);
-    Ok(format!(
-        "{{\"pending\":{announced},\"completed\":{completed},\"cancel_won\":true}}"
-    ))
+    Ok(json!({"pending": announced, "completed": completed, "cancel_won": true}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stage rows, failure line and results against the former format strings, over the same values (the inline
+    /// `json!`s copied).
+    #[test]
+    fn json_matches_the_former_format() {
+        let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        let s = WindowStatus {
+            request: 4,
+            released: 3,
+            tables_written: 1,
+            acknowledged: vec![4, 3],
+            quiescent: vec![0, 1],
+            write_windows: 2,
+            released_after: 3,
+            request_after: 4,
+        };
+        let (name, pending) = ("real-peer-shadows", true);
+        let old_event = format!(
+            "{{\"stage\":\"{name}\",\"request\":{},\"released\":{},\"released_after\":{},\"write_windows\":{},\"tables_written\":{},\"ack\":{:?},\"quiet\":{:?},\"copy_pending\":{pending}}}",
+            s.request,
+            s.released,
+            s.released_after,
+            s.write_windows,
+            s.tables_written,
+            s.acknowledged,
+            s.quiescent
+        );
+        let row = event(name, &s, pending);
+        assert_eq!(parse(&old_event), row);
+        // The late-shadow failure, with and without a copy error (escaped by hand before, by serde_json now).
+        let (late, resets, late_after, resets_after, timeouts) =
+            (5u64, 6u64, 7u64, 8u64, vec![0u64, 1, 0]);
+        for copy_error in [None, Some(String::from("bad \"copy\"\\ \u{1}\n"))] {
+            for rows in [vec![], vec![row.clone()]] {
+                let copy_error_json = copy_error.as_ref().map_or_else(
+                    || String::from("null"),
+                    |error| {
+                        let body: String = error
+                            .chars()
+                            .map(|c| match c {
+                                '\"' => String::from("\\\""),
+                                '\\' => String::from("\\\\"),
+                                c if c < ' ' => format!("\\u{:04x}", c as u32),
+                                c => c.to_string(),
+                            })
+                            .collect();
+                        format!("\"{body}\"")
+                    },
+                );
+                let old_rows: Vec<String> = rows.iter().map(Value::to_string).collect();
+                let last = old_rows.last().map(String::as_str).unwrap_or("null");
+                let status = &old_event;
+                let old = format!(
+                    "{{\"last_stage\":{last},\"status\":{status},\"late_before\":{late},\"late_after\":{},\"resets_before\":{resets},\"resets_after\":{},\"hook_timeouts\":{timeouts:?},\"copy_error\":{copy_error_json}}}",
+                    late_after, resets_after
+                );
+                let new = json!({
+                    "last_stage": rows.last(),
+                    "status": row,
+                    "late_before": late,
+                    "late_after": late_after,
+                    "resets_before": resets,
+                    "resets_after": resets_after,
+                    "hook_timeouts": timeouts,
+                    "copy_error": copy_error,
+                });
+                assert_eq!(parse(&old), new);
+            }
+        }
+        let old = format!(
+            "{{\"stage\":\"late-shadow-served\",\"late_before\":{late},\"late_after\":{},\"resets_before\":{resets},\"resets_after\":{}}}",
+            late_after, resets_after
+        );
+        let new = json!({
+            "stage": "late-shadow-served",
+            "late_before": late,
+            "late_after": late_after,
+            "resets_before": resets,
+            "resets_after": resets_after,
+        });
+        assert_eq!(parse(&old), new);
+        let hits = vec![3u64, 4, 5];
+        let old =
+            format!("{{\"stage\":\"hook-counts\",\"hits\":{hits:?},\"timeouts\":{timeouts:?}}}");
+        let new = json!({"stage": "hook-counts", "hits": hits, "timeouts": timeouts});
+        assert_eq!(
+            parse(&format!("[{old},{old_event}]")),
+            Value::Array(vec![new, row.clone()])
+        );
+        let (announced, completed) = (&old_event, &old_event);
+        let old =
+            format!("{{\"pending\":{announced},\"completed\":{completed},\"cancel_won\":true}}");
+        assert_eq!(
+            parse(&old),
+            json!({"pending": row, "completed": row, "cancel_won": true})
+        );
+    }
 }

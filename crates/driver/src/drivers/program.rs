@@ -120,11 +120,13 @@ use super::test_devices::TestDevice;
 use crate::devices::Devices;
 use crate::execution::{self, Area, Compiler, Stop};
 use crate::owners;
+use natemu::report::{Hex, Members, hexes};
 use natemu_abi::execution::{self as exec, Cpu, State, cache};
 use natemu_abi::guest_memory::GuestRam;
 use natemu_abi::paging::Fault;
+use serde::Serialize;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -1213,7 +1215,7 @@ fn io_windows(
     ended: &AtomicBool,
     base: u64,
     code: u64,
-) -> Result<String> {
+) -> Result<Value> {
     use execution::io::Transfer::{Read, Write};
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(45);
@@ -1320,9 +1322,14 @@ fn io_windows(
         gpa: base,
         bytes: &[1],
     }])?;
-    Ok(format!(
-        "{{\"windows\":{windows},\"snapshots\":64,\"progress_before\":{before:?},\"progress_after\":{after:?},\"ordered_overlap\":true,\"code_observed\":2}}"
-    ))
+    Ok(json!({
+        "windows": windows,
+        "snapshots": 64,
+        "progress_before": before,
+        "progress_after": after,
+        "ordered_overlap": true,
+        "code_observed": 2,
+    }))
 }
 
 pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
@@ -2163,31 +2170,25 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let states: Vec<_> = (0..n)
             .map(|v| {
                 let cpu = backing.vcpu(v).read_record::<State>(exec::STATE_OFFSET).cpu;
-                format!("{{\"rip\":\"{:#x}\",\"gpr\":{:?}}}", cpu.rip, cpu.gpr)
+                json!({"rip": Hex(cpu.rip), "gpr": cpu.gpr})
             })
             .collect();
-        eprintln!("io-state: [{}]", states.join(","));
-        let memories: Vec<_> = d
+        eprintln!("io-state: {}", Value::Array(states));
+        let memories: Vec<Vec<_>> = d
             .cpus
             .iter()
             .map(|c| {
                 let table = spaces[c.space].as_ref().unwrap();
-                let entries: Vec<_> = d.spaces[c.space]
+                d.spaces[c.space]
                     .memory
                     .iter()
                     .map(|(address, data)| {
-                        let bytes: String = table
-                            .copy_out(*address, data.len())
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect();
-                        format!("{{\"addr\":\"{address:#x}\",\"data\":\"{bytes}\"}}")
+                        MemoryBytes::new(*address, &table.copy_out(*address, data.len()))
                     })
-                    .collect();
-                format!("[{}]", entries.join(","))
+                    .collect::<Vec<_>>()
             })
             .collect();
-        eprintln!("io-memory: [{}]", memories.join(","));
+        eprintln!("io-memory: {}", serde_json::to_string(&memories).unwrap());
     }
     let supervision = supervision?;
     hv(destroyed, "destroy VM")?;
@@ -2205,7 +2206,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let tampering = v == target && (tamper.is_some() || tamper_after.is_some());
         let tampering = tampering || (v == target && forged_entry.is_some());
         let log = log_base(d.spaces[d.cpus[v].space].identity);
-        let mut json = report(
+        let mut result = report(
             backing.vcpu(v),
             &d.spaces[d.cpus[v].space],
             tables,
@@ -2214,37 +2215,38 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             tampering,
             tamper_after.filter(|_| v == target),
         )?;
-        json.pop();
         let m: exec::Mmio = backing.vcpu(v).read_record(exec::MMIO_OFFSET);
+        result.kicks = Some(kick_report(backing.vcpu(v), &stops));
         // With test devices, or once the vCPU made a device access (X3: its xAPIC page) or had one refused.
-        let mmio = if test_devices.is_empty() && m.completed == 0 && m.status == 0 {
-            String::new()
-        } else {
-            // The address only where the host answered for it (a refusal before any request names none).
-            let address = if matches!(m.status, exec::mmio::UNASSIGNED | exec::mmio::DEVICE) {
-                format!(",\"address\":\"{:#x}\"", m.gpa)
-            } else {
-                String::new()
-            };
-            format!(
-                ",\"mmio\":{{\"completed\":{},\"status\":\"{}\"{address}}}",
-                m.completed,
-                exec::mmio::name(m.status)
-            )
-        };
-        out.push(json + &kick_report(backing.vcpu(v), &stops) + &mmio + "}");
+        if !(test_devices.is_empty() && m.completed == 0 && m.status == 0) {
+            result.mmio = Some(MmioState {
+                completed: m.completed,
+                status: exec::mmio::name(m.status),
+                // The address only where the host answered for it (a refusal before any request names none).
+                address: matches!(m.status, exec::mmio::UNASSIGNED | exec::mmio::DEVICE)
+                    .then_some(Hex(m.gpa)),
+            });
+        }
+        out.push(result);
     }
-    let devices = test_devices.iter().map(|(gpa, d)| {
-        let d = d.lock().unwrap();
-        let log: Vec<String> = d.log.iter().map(|e| format!("[{},{},{},{},\"{:#x}\"]", e[0], e[1], e[2], e[3], e[4])).collect();
-        format!("{{\"gpa\":\"{gpa:#x}\",\"reads\":{:?},\"writes\":{:?},\"order_errors\":{},\"log\":[{}]}}", &d.reads[..n], &d.writes[..n], d.order_errors, log.join(","))
-    });
-    let mut devices = if test_devices.is_empty() {
-        String::new()
-    } else {
-        format!(",\"devices\":[{}]", devices.collect::<Vec<_>>().join(","))
-    };
-    if let Some(result) = io_result {
+    let devices = test_devices
+        .iter()
+        .map(|(gpa, d)| {
+            let d = d.lock().unwrap();
+            TestDeviceReport {
+                gpa: Hex(*gpa),
+                reads: d.reads[..n].to_vec(),
+                writes: d.writes[..n].to_vec(),
+                order_errors: d.order_errors,
+                log: d
+                    .log
+                    .iter()
+                    .map(|e| (e[0], e[1], e[2], e[3], Hex(e[4])))
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let fixture = io_result.map(|result| {
         let name = if args.io_pending {
             "io_pending"
         } else if args.io_quiet {
@@ -2254,34 +2256,76 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         } else {
             "io_windows"
         };
-        let _ = write!(devices, ",\"{name}\":{result}");
-    }
-    if let Some(control) = &io_control {
-        let _ = write!(
-            devices,
-            ",\"io_disk\":{}",
-            serde_json::to_string(&control.report()).unwrap()
-        );
-    }
-    if args.io_net {
-        let _ = write!(devices, ",\"io_net\":{}", packet_trace.json());
-    }
+        Members(vec![(name, result)])
+    });
     // L3: port and unassigned-page counts and the UART's output, once there are any.
-    let counts = serde_json::to_string(&registry.report()).unwrap();
-    let counts = &counts[1..counts.len() - 1];
+    let counts = registry.report();
     let output = std::mem::take(&mut uart.lock().unwrap_or_else(|e| e.into_inner()).output);
-    if counts != "\"ports\":[],\"unassigned_pages\":[]" || !output.is_empty() {
-        let hex: String = output.iter().map(|b| format!("{b:02x}")).collect();
-        let _ = write!(devices, ",{counts},\"uart\":\"{hex}\"");
-    }
-    if d.sections {
-        println!("{{\"cpus\":[{}]{devices}}}", out.join(","));
+    let (counts, uart) = if counts.is_empty() && output.is_empty() {
+        (None, None)
     } else {
-        let mut one = out.swap_remove(0);
-        one.pop();
-        println!("{one}{devices}}}");
-    }
+        (
+            Some(counts),
+            Some(output.iter().map(|b| format!("{b:02x}")).collect()),
+        )
+    };
+    let extra = RunExtra {
+        devices: (!devices.is_empty()).then_some(devices),
+        fixture,
+        io_disk: io_control.as_ref().map(|control| control.report()),
+        io_net: args.io_net.then(|| packet_trace.json()),
+        counts,
+        uart,
+    };
+    let line = if d.sections {
+        serde_json::to_string(&Sections { cpus: out, extra })
+    } else {
+        serde_json::to_string(&One {
+            cpu: out.swap_remove(0),
+            extra,
+        })
+    };
+    println!("{}", line.unwrap());
     Ok(())
+}
+/// A test device's per-vCPU reads and writes, ordering errors and access log `[vcpu, offset, width, write, value]`.
+#[derive(Serialize)]
+struct TestDeviceReport {
+    gpa: Hex,
+    reads: Vec<u64>,
+    writes: Vec<u64>,
+    order_errors: u64,
+    log: Vec<(u64, u64, u64, u64, Hex)>,
+}
+/// The run's members after the vCPUs' results, each where there is one.
+#[derive(Serialize)]
+struct RunExtra {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devices: Option<Vec<TestDeviceReport>>,
+    /// An I/O fixture's result, under its name.
+    #[serde(flatten)]
+    fixture: Option<Members<&'static str, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    io_disk: Option<natemu::virtio::testing::ControlReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    io_net: Option<Value>,
+    #[serde(flatten)]
+    counts: Option<natemu::devices::AccessCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uart: Option<String>,
+}
+#[derive(Serialize)]
+struct Sections {
+    cpus: Vec<CpuResult>,
+    #[serde(flatten)]
+    extra: RunExtra,
+}
+#[derive(Serialize)]
+struct One {
+    #[serde(flatten)]
+    cpu: CpuResult,
+    #[serde(flatten)]
+    extra: RunExtra,
 }
 
 /// The `teardown:` line, written after the joins (every vCPU thread has returned) and the VM's destroy: of `n` vCPUs,
@@ -2346,15 +2390,9 @@ fn report(
     ran: Ran,
     tampering: bool,
     tamper_after: Option<Corrupt>,
-) -> Result<String> {
+) -> Result<CpuResult> {
     let mut s: State = area.read_record(exec::STATE_OFFSET);
-    let list = |v: &[u64]| {
-        v.iter()
-            .map(|x| format!("\"{x:#x}\""))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let mut delivered = String::new();
+    let mut delivered = None;
     if matches!(ran.stop, Stop::Hooked(LOGGED)) {
         let vector = (s.cpu.rip - log - LOG_HANDLERS) / 16;
         // From the event, not the vector: INT n to an error-code vector pushes none.
@@ -2381,12 +2419,14 @@ fn report(
             unreachable!()
         };
         s.fault = [vector, if vector == 14 { s.cpu.cr2 } else { 0 }, e, rip];
-        delivered = format!(
-            ",\"delivered\":{{\"vector\":{vector},\"frame\":[{}],\"error_code\":{error},\"handler_rsp\":\"{at:#x}\",\"cpl\":{},\"cr2\":\"{:#x}\"}}",
-            list(&[rip, cs, rflags, rsp, ss, e]),
-            s.cpu.cpl,
-            s.cpu.cr2
-        );
+        delivered = Some(Delivered {
+            vector,
+            frame: hexes(&[rip, cs, rflags, rsp, ss, e]),
+            error_code: error,
+            handler_rsp: Hex(at),
+            cpl: s.cpu.cpl,
+            cr2: Hex(s.cpu.cr2),
+        });
         (s.cpu.gpr[4], s.cpu.rip, s.cpu.rflags) = (rsp, rip, rflags & !(1 << 16));
     }
     let shared: Shared = area.read_record(SHARED_OFFSET);
@@ -2449,50 +2489,35 @@ fn report(
     let mut rips: Vec<u64> = ran.rips.iter().copied().collect();
     rips.sort_unstable();
     // K2: decodes by kind ("0x7": n). A suite can collect them: with NATEMU_EXIT_LOG set, one line per vCPU is appended.
-    let decodes = ran
+    let decodes: Members<String, u64> = ran
         .decodes
         .iter()
-        .map(|(k, n)| format!(r#""{k:#x}":{n}"#))
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|(k, &n)| (format!("{k:#x}"), n))
+        .collect();
     // S4's counters live in the cache's control record (not copied with the state).
     let control: natemu_abi::execution::cache::Control = area.read_record(
         natemu_abi::execution::cache::LOOKUP_OFFSET + natemu_abi::execution::cache::CONTROL,
     );
     if let Some(path) = std::env::var_os("NATEMU_EXIT_LOG") {
         use std::io::Write as _;
-        let line = format!(
-            r#"{{"systems":{},"entropy":{},"decodes":{{{decodes}}}}}"#,
-            s.systems, ran.entropy
-        ) + "\n";
+        let line = serde_json::to_string(&ExitLog {
+            systems: s.systems,
+            entropy: ran.entropy,
+            decodes: &decodes,
+        })
+        .unwrap()
+            + "\n";
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .and_then(|mut f| f.write_all(line.as_bytes()));
     }
-    let mut out = format!(
-        "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"xmm\":[{}],\"mxcsr\":\"{:#x}\",\"memory\":[",
-        area.vcpu(),
-        shared.actlr & 2 != 0,
-        list(&s.cpu.gpr),
-        s.cpu.rip,
-        s.cpu.rflags,
-        list(s.cpu.xmm.as_flattened()),
-        s.cpu.mxcsr
-    );
-    for (i, (address, data)) in space.memory.iter().enumerate() {
-        let bytes: String = guest
-            .copy_out(*address, data.len())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let _ = write!(
-            out,
-            "{}{{\"addr\":\"{address:#x}\",\"data\":\"{bytes}\"}}",
-            if i > 0 { "," } else { "" }
-        );
-    }
+    let memory = space
+        .memory
+        .iter()
+        .map(|(address, data)| MemoryBytes::new(*address, &guest.copy_out(*address, data.len())))
+        .collect();
     // I6: the x87 state (FCW from the bank; the rest from the guest-state page: TOP, C0..C3, FEX's IE byte, the exception
     // word, the abridged tag byte, ST's physical registers mm[0..8] as doubles).
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
@@ -2502,176 +2527,348 @@ fn report(
             frame[at as usize..at as usize + 4].try_into().unwrap(),
         ))
     };
-    let mm: Vec<u64> = (0..8)
-        .map(|r| {
-            u64::from_le_bytes(
-                frame[(exec::frame::X87_MM + 16 * r) as usize..][..8]
-                    .try_into()
-                    .unwrap(),
-            )
-        })
-        .collect();
-    let _ = write!(
-        out,
-        "],\"x87\":{{\"fcw\":\"{:#x}\",\"top\":{},\"c\":[{},{},{},{}],\"ie\":{},\"pe\":{},\"sf\":{},\"exceptions\":\"{:#x}\",\"ftw\":\"{:#x}\",\"mm\":[{}]}}",
-        s.cpu.fcw,
-        byte(exec::frame::X87_TOP),
-        byte(exec::frame::X87_C0),
-        byte(exec::frame::X87_C1),
-        byte(exec::frame::X87_C2),
-        byte(exec::frame::X87_C3),
-        byte(exec::frame::X87_IE),
-        byte(exec::frame::X87_PE),
-        byte(exec::frame::X87_SF),
-        word(exec::frame::X87_EXCEPTIONS),
-        byte(exec::frame::X87_FTW),
-        list(&mm)
-    );
+    let quad = |at: u32| u64::from_le_bytes(frame[at as usize..][..8].try_into().unwrap());
+    let mm: Vec<u64> = (0..8).map(|r| quad(exec::frame::X87_MM + 16 * r)).collect();
     // I8: YMM0..15's upper halves (the guest-state page's avx_high, two quadwords per register).
     let ymmh: Vec<u64> = (0..32)
-        .map(|q| {
-            u64::from_le_bytes(
-                frame[(exec::frame::AVX_HIGH + 8 * q) as usize..][..8]
-                    .try_into()
-                    .unwrap(),
-            )
-        })
+        .map(|q| quad(exec::frame::AVX_HIGH + 8 * q))
         .collect();
-    let _ = write!(out, ",\"ymmh\":[{}]", list(&ymmh));
-    // Test output only: lets probes verify which page is actually mapped rather than testing a stale fixed address.
-    let _ = write!(
-        out,
-        ",\"guest_state_alias\":\"{:#x}\"",
-        control.guest_state_va
-    );
     // Perf chunk 17: GS.base (the bank's) and IA32_KERNEL_GS_BASE (the MSR record's), which an inline SWAPGS exchanges.
     let msrs: natemu_abi::cpu::Msrs = area.read_record(exec::MSRS_OFFSET);
-    let _ = write!(
-        out,
-        ",\"gs_base\":\"{:#x}\",\"kernel_gs_base\":\"{:#x}\"",
-        s.cpu.gs_base,
-        msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_KERNEL_GS_BASE).unwrap()]
-    );
     let l = execution::lapic(area);
-    let _ = write!(
-        out,
-        ",\"lapic\":{{\"cntfrq\":{},\"svr\":\"{:#x}\",\"tpr\":\"{:#x}\",\"isr\":[{}],\"esr\":\"{:#x}\"}}",
-        l.frequency,
-        l.svr,
-        s.cpu.cr8,
-        list(&l.isr),
-        l.esr
-    );
-    out += ",\"pages\":[";
     let logging = log_pages(s.vcpus as usize);
-    for (i, (va, &(_, leaf))) in guest
+    let pages = guest
         .pages
         .iter()
         .filter(|(va, _)| !logging.contains(&va.wrapping_sub(log)))
-        .enumerate()
-    {
-        let entry = guest.ram.read::<u64>(leaf).unwrap();
-        let _ = write!(
-            out,
-            "{}{{\"va\":\"{va:#x}\",\"accessed\":{},\"dirty\":{}}}",
-            if i > 0 { "," } else { "" },
-            entry & natemu_abi::paging::ACCESSED != 0,
-            entry & natemu_abi::paging::DIRTY != 0
-        );
-    }
-    let _ = write!(
-        out,
-        "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"debug_steps\":{},\"debug_traps\":{},\"code_breaks\":{},\"watch_hits\":{},\"watchpoints\":{},\"mailbox\":[{},{},{},{}],\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
-        s.blocks,
-        s.l2_hits,
-        s.requests,
-        ran.rips.len(),
-        ran.blocks,
-        s.generation,
-        ran.compiles,
-        ran.slowest.as_micros(),
-        s.steps,
-        s.shootdowns,
-        s.stops,
-        s.systems,
-        s.invalidations,
-        s.retries,
-        s.upgrades,
-        s.evictions,
-        execution::shadow_resets(area),
-        s.splits,
-        s.linker,
-        s.links,
-        s.unlinks,
-        s.stale_links,
-        s.full_links,
-        link_points,
-        linked,
-        execution::placed_blocks(area)
-            .iter()
-            .filter(|b| b.dispatch_exit != 0)
-            .count(),
-        s.interrupts,
-        s.nmis,
-        s.halts,
-        s.shadow_steps,
-        control.debug_steps,
-        control.debug_traps,
-        control.code_breaks,
-        control.watch_hits,
-        control.watchpoints,
-        s.mailbox,
-        s.mailbox_wakes,
-        // As the guest's TSC (ns since the VM's epoch, the MSR's offset), 0 if never acknowledged.
-        if s.mailbox_acked == 0 {
-            0
-        } else {
-            execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(area.epoch())
+        .map(|(&va, &(_, leaf))| {
+            let entry = guest.ram.read::<u64>(leaf).unwrap();
+            PageBits {
+                va: Hex(va),
+                accessed: entry & natemu_abi::paging::ACCESSED != 0,
+                dirty: entry & natemu_abi::paging::DIRTY != 0,
+            }
+        })
+        .collect();
+    Ok(CpuResult {
+        vcpu: area.vcpu(),
+        tso: shared.actlr & 2 != 0,
+        stop: kind,
+        reason,
+        gpr: hexes(&s.cpu.gpr),
+        rip: Hex(s.cpu.rip),
+        rflags: Hex(s.cpu.rflags),
+        xmm: hexes(s.cpu.xmm.as_flattened()),
+        mxcsr: Hex(s.cpu.mxcsr),
+        memory,
+        x87: X87 {
+            fcw: Hex(s.cpu.fcw),
+            top: byte(exec::frame::X87_TOP),
+            c: [
+                byte(exec::frame::X87_C0),
+                byte(exec::frame::X87_C1),
+                byte(exec::frame::X87_C2),
+                byte(exec::frame::X87_C3),
+            ],
+            ie: byte(exec::frame::X87_IE),
+            pe: byte(exec::frame::X87_PE),
+            sf: byte(exec::frame::X87_SF),
+            exceptions: Hex(word(exec::frame::X87_EXCEPTIONS)),
+            ftw: Hex(byte(exec::frame::X87_FTW)),
+            mm: hexes(&mm),
         },
-        execution::ticks_ns(s.mailbox_mark_ticks) / 1000,
-        ran.decodes.values().sum::<u64>(),
-        decodes,
-        ran.entropy,
-        serde_json::to_string(&execution::k1_stats(area)).unwrap(),
-        list(&fault),
-        list(&s.native),
-        frame_intact(area),
+        ymmh: hexes(&ymmh),
+        // Test output only: lets probes verify which page is actually mapped rather than testing a stale fixed address.
+        guest_state_alias: Hex(control.guest_state_va),
+        gs_base: Hex(s.cpu.gs_base),
+        kernel_gs_base: Hex(
+            msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_KERNEL_GS_BASE).unwrap()]
+        ),
+        lapic: LapicState {
+            cntfrq: l.frequency,
+            svr: Hex(l.svr),
+            tpr: Hex(s.cpu.cr8),
+            isr: hexes(&l.isr),
+            esr: Hex(l.esr),
+        },
+        pages,
+        stats: CpuStats {
+            blocks: s.blocks,
+            l2_hits: s.l2_hits,
+            requests: s.requests,
+            distinct: ran.rips.len(),
+            host_requests: ran.blocks,
+            flushes: s.generation,
+            compiles: ran.compiles,
+            compile_max_us: ran.slowest.as_micros(),
+            steps: s.steps,
+            shootdowns: s.shootdowns,
+            stops: s.stops,
+            systems: s.systems,
+            invalidations: s.invalidations,
+            retries: s.retries,
+            upgrades: s.upgrades,
+            evictions: s.evictions,
+            shadow_resets: execution::shadow_resets(area),
+            splits: s.splits,
+            linker: s.linker,
+            links: s.links,
+            unlinks: s.unlinks,
+            stale_links: s.stale_links,
+            full_links: s.full_links,
+            link_points,
+            linked,
+            dispatch_exits: execution::placed_blocks(area)
+                .iter()
+                .filter(|b| b.dispatch_exit != 0)
+                .count(),
+            interrupts: s.interrupts,
+            nmis: s.nmis,
+            halts: s.halts,
+            shadow_steps: s.shadow_steps,
+            debug_steps: control.debug_steps,
+            debug_traps: control.debug_traps,
+            code_breaks: control.code_breaks,
+            watch_hits: control.watch_hits,
+            watchpoints: control.watchpoints,
+            mailbox: [
+                s.mailbox,
+                s.mailbox_wakes,
+                // As the guest's TSC (ns since the VM's epoch, the MSR's offset), 0 if never acknowledged.
+                if s.mailbox_acked == 0 {
+                    0
+                } else {
+                    execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(area.epoch())
+                },
+                execution::ticks_ns(s.mailbox_mark_ticks) / 1000,
+            ],
+            decode_exits: ran.decodes.values().sum::<u64>(),
+            decodes,
+            entropy_exits: ran.entropy,
+            k1: execution::k1_stats(area),
+        },
+        fault: hexes(&fault),
+        native: hexes(&s.native),
+        frame_intact: frame_intact(area),
         tampered,
-        links_check.replace('"', "'"),
-        list(&rips),
-        delivered
-    );
-    Ok(out)
+        links_check,
+        block_rips: hexes(&rips),
+        delivered,
+        kicks: None,
+        mmio: None,
+    })
 }
 
-/// `,"kicks":{..}` for vCPU `area.vcpu`: its host kicks, the resident's doorbells and stops, and the latency
-/// distribution from each ring to the stop that followed.
-fn kick_report(area: Area, stops: &execution::Stops) -> String {
-    let k = stops.report(area.vcpu());
-    let s: State = area.read_record(exec::STATE_OFFSET);
-    let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
-    let quantiles = |host: bool| {
-        let mut ns: Vec<u64> = k
-            .latency
-            .iter()
-            .filter(|l| l.1 == host)
-            .map(|l| l.0)
-            .collect();
+/// One vCPU's result line (or `cpus` entry): its final state, its space's memory and A/D bits, and its counters; the
+/// run adds its kicks and, where it made a device access, `mmio`.
+#[derive(Serialize)]
+struct CpuResult {
+    vcpu: usize,
+    tso: bool,
+    stop: &'static str,
+    reason: String,
+    gpr: Vec<Hex>,
+    rip: Hex,
+    rflags: Hex,
+    xmm: Vec<Hex>,
+    mxcsr: Hex,
+    memory: Vec<MemoryBytes>,
+    x87: X87,
+    ymmh: Vec<Hex>,
+    guest_state_alias: Hex,
+    gs_base: Hex,
+    kernel_gs_base: Hex,
+    lapic: LapicState,
+    pages: Vec<PageBits>,
+    stats: CpuStats,
+    fault: Vec<Hex>,
+    native: Vec<Hex>,
+    frame_intact: bool,
+    tampered: bool,
+    links_check: String,
+    block_rips: Vec<Hex>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered: Option<Delivered>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kicks: Option<Kicks>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mmio: Option<MmioState>,
+}
+/// Guest bytes at `addr`, as lowercase hex.
+#[derive(Serialize)]
+struct MemoryBytes {
+    addr: Hex,
+    data: String,
+}
+impl MemoryBytes {
+    fn new(addr: u64, bytes: &[u8]) -> Self {
+        Self {
+            addr: Hex(addr),
+            data: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        }
+    }
+}
+#[derive(Serialize)]
+struct X87 {
+    fcw: Hex,
+    top: u64,
+    c: [u64; 4],
+    ie: u64,
+    pe: u64,
+    sf: u64,
+    exceptions: Hex,
+    ftw: Hex,
+    mm: Vec<Hex>,
+}
+#[derive(Serialize)]
+struct LapicState {
+    cntfrq: u64,
+    svr: Hex,
+    tpr: Hex,
+    isr: Vec<Hex>,
+    esr: Hex,
+}
+#[derive(Serialize)]
+struct PageBits {
+    va: Hex,
+    accessed: bool,
+    dirty: bool,
+}
+#[derive(Serialize)]
+struct CpuStats {
+    blocks: u64,
+    l2_hits: u64,
+    requests: u64,
+    distinct: usize,
+    host_requests: u64,
+    flushes: u64,
+    compiles: u64,
+    compile_max_us: u128,
+    steps: u64,
+    shootdowns: u64,
+    stops: u64,
+    systems: u64,
+    invalidations: u64,
+    retries: u64,
+    upgrades: u64,
+    evictions: u64,
+    shadow_resets: u64,
+    splits: u64,
+    linker: u64,
+    links: u64,
+    unlinks: u64,
+    stale_links: u64,
+    full_links: u64,
+    link_points: u64,
+    linked: u64,
+    dispatch_exits: usize,
+    interrupts: u64,
+    nmis: u64,
+    halts: u64,
+    shadow_steps: u64,
+    debug_steps: u64,
+    debug_traps: u64,
+    code_breaks: u64,
+    watch_hits: u64,
+    watchpoints: u64,
+    /// Address, wakes, acknowledged (guest TSC ns) and the mark's us.
+    mailbox: [u64; 4],
+    decode_exits: u64,
+    decodes: Members<String, u64>,
+    entropy_exits: u64,
+    k1: execution::K1,
+}
+#[derive(Serialize)]
+struct Delivered {
+    vector: u64,
+    frame: Vec<Hex>,
+    error_code: bool,
+    handler_rsp: Hex,
+    cpl: u64,
+    cr2: Hex,
+}
+/// NATEMU_EXIT_LOG's line.
+#[derive(Serialize)]
+struct ExitLog<'a> {
+    systems: u64,
+    entropy: u64,
+    decodes: &'a Members<String, u64>,
+}
+/// A vCPU's last device access: completed accesses, the status and, where the host answered, the address.
+#[derive(Serialize)]
+struct MmioState {
+    completed: u64,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<Hex>,
+}
+/// vCPU `area.vcpu`'s host kicks, the resident's doorbells and stops, and the latency distribution from each ring to
+/// the stop that followed.
+#[derive(Serialize)]
+struct Kicks {
+    issued: u64,
+    in_host: u64,
+    pending: bool,
+    irqs: u64,
+    irq_sgis: u64,
+    merged: u64,
+    arms: u64,
+    stops: u64,
+    stops_entry: u64,
+    stops_dispatch: u64,
+    stops_l1: u64,
+    stops_exit: u64,
+    stops_resident: u64,
+    irqs_step: u64,
+    rearms: u64,
+    armed_at_end: u64,
+    sgis_sent: u64,
+    ack_ns_mean: u64,
+    sgi_ns_mean: u64,
+    ring_ns_mean: u64,
+    latency_ns: Quantiles,
+    latency_in_host_ns: Quantiles,
+}
+#[derive(Serialize)]
+struct Quantiles {
+    n: usize,
+    min: u64,
+    p50: u64,
+    p90: u64,
+    p99: u64,
+    p999: u64,
+    max: u64,
+}
+impl Quantiles {
+    fn new(mut ns: Vec<u64>) -> Self {
         ns.sort_unstable();
         let q = |f: f64| {
             ns.get(((ns.len() as f64 - 1.0) * f).round() as usize)
                 .copied()
                 .unwrap_or(0)
         };
-        format!(
-            "{{\"n\":{},\"min\":{},\"p50\":{},\"p90\":{},\"p99\":{},\"p999\":{},\"max\":{}}}",
-            ns.len(),
-            q(0.0),
-            q(0.5),
-            q(0.9),
-            q(0.99),
-            q(0.999),
-            q(1.0)
+        Self {
+            n: ns.len(),
+            min: q(0.0),
+            p50: q(0.5),
+            p90: q(0.9),
+            p99: q(0.99),
+            p999: q(0.999),
+            max: q(1.0),
+        }
+    }
+}
+fn kick_report(area: Area, stops: &execution::Stops) -> Kicks {
+    let k = stops.report(area.vcpu());
+    let s: State = area.read_record(exec::STATE_OFFSET);
+    let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    let latency = |host: bool| {
+        Quantiles::new(
+            k.latency
+                .iter()
+                .filter(|l| l.1 == host)
+                .map(|l| l.0)
+                .collect(),
         )
     };
     let mean = |ticks: u64, n: u64| {
@@ -2681,35 +2878,34 @@ fn kick_report(area: Area, stops: &execution::Stops) -> String {
             execution::ticks_ns(ticks) / n
         }
     };
-    format!(
-        ",\"kicks\":{{\"issued\":{},\"in_host\":{},\"pending\":{},\"irqs\":{},\"irq_sgis\":{},\"merged\":{},\"arms\":{},\"stops\":{},\"stops_entry\":{},\"stops_dispatch\":{},\"stops_l1\":{},\"stops_exit\":{},\"stops_resident\":{},\"irqs_step\":{},\"rearms\":{},\"armed_at_end\":{},\"sgis_sent\":{},\"ack_ns_mean\":{},\"sgi_ns_mean\":{},\"ring_ns_mean\":{},\"latency_ns\":{},\"latency_in_host_ns\":{}}}",
-        k.issued,
-        k.in_host,
-        k.pending,
-        c.irqs,
-        c.irq_sgis,
-        s.merged,
-        s.arms,
-        s.stops,
-        s.stops_entry,
-        s.stops_dispatch,
-        s.stops_l1,
-        s.stops_exit,
-        s.stops_resident,
-        s.irqs_step,
-        c.rearms,
-        c.armed,
-        c.sgis,
-        mean(c.irq_ticks, c.irqs),
-        mean(c.sgi_ticks, c.sgis),
-        if k.issued == 0 {
+    Kicks {
+        issued: k.issued,
+        in_host: k.in_host,
+        pending: k.pending,
+        irqs: c.irqs,
+        irq_sgis: c.irq_sgis,
+        merged: s.merged,
+        arms: s.arms,
+        stops: s.stops,
+        stops_entry: s.stops_entry,
+        stops_dispatch: s.stops_dispatch,
+        stops_l1: s.stops_l1,
+        stops_exit: s.stops_exit,
+        stops_resident: s.stops_resident,
+        irqs_step: s.irqs_step,
+        rearms: c.rearms,
+        armed_at_end: c.armed,
+        sgis_sent: c.sgis,
+        ack_ns_mean: mean(c.irq_ticks, c.irqs),
+        sgi_ns_mean: mean(c.sgi_ticks, c.sgis),
+        ring_ns_mean: if k.issued == 0 {
             0
         } else {
             k.ring_ns / k.issued
         },
-        quantiles(false),
-        quantiles(true)
-    )
+        latency_ns: latency(false),
+        latency_in_host_ns: latency(true),
+    }
 }
 
 /// Checks that frame padding remains zero outside the admitted guest-state fields. Selected-alias deviation probes
@@ -2911,5 +3107,539 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+    }
+}
+
+/// Each JSON line against the former formatters (their format strings copied), over the same values.
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    fn parse(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
+    }
+    fn list(v: &[Hex]) -> String {
+        v.iter()
+            .map(|x| format!("\"{x:#x}\"", x = x.0))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    fn quantiles(ns: &[u64]) -> Quantiles {
+        Quantiles::new(ns.to_vec())
+    }
+    fn quantiles_old(q: &Quantiles) -> String {
+        format!(
+            "{{\"n\":{},\"min\":{},\"p50\":{},\"p90\":{},\"p99\":{},\"p999\":{},\"max\":{}}}",
+            q.n, q.min, q.p50, q.p90, q.p99, q.p999, q.max
+        )
+    }
+    fn cpu_result(
+        seed: u64,
+        reason: &str,
+        delivered: bool,
+        mmio: Option<Option<u64>>,
+    ) -> CpuResult {
+        let mut n = seed;
+        let mut next = || {
+            n += 1_000_003;
+            n
+        };
+        let mut decodes = BTreeMap::new();
+        decodes.insert(7u32, next());
+        decodes.insert(0x1f, next());
+        let decodes: Members<String, u64> = decodes
+            .iter()
+            .map(|(k, &n)| (format!("{k:#x}"), n))
+            .collect();
+        CpuResult {
+            vcpu: 1,
+            tso: true,
+            stop: "guest_fault",
+            reason: reason.into(),
+            gpr: (0..16).map(|_| Hex(next())).collect(),
+            rip: Hex(next()),
+            rflags: Hex(0x202),
+            xmm: (0..32).map(|_| Hex(next())).collect(),
+            mxcsr: Hex(0x1f80),
+            memory: vec![
+                MemoryBytes::new(0x1000, &[0, 0xab, 0x10]),
+                MemoryBytes::new(0x2000, &[]),
+            ],
+            x87: X87 {
+                fcw: Hex(0x37f),
+                top: 7,
+                c: [0, 1, 0, 1],
+                ie: 1,
+                pe: 0,
+                sf: 1,
+                exceptions: Hex(0x41),
+                ftw: Hex(0xff),
+                mm: (0..8).map(|_| Hex(next())).collect(),
+            },
+            ymmh: (0..32).map(|_| Hex(next())).collect(),
+            guest_state_alias: Hex(next()),
+            gs_base: Hex(next()),
+            kernel_gs_base: Hex(u64::MAX),
+            lapic: LapicState {
+                cntfrq: 24_000_000,
+                svr: Hex(0x1ff),
+                tpr: Hex(0),
+                isr: hexes(&[0, 1 << 63, 0, 2]),
+                esr: Hex(0),
+            },
+            pages: vec![
+                PageBits {
+                    va: Hex(0x40_0000),
+                    accessed: true,
+                    dirty: false,
+                },
+                PageBits {
+                    va: Hex(0x40_1000),
+                    accessed: false,
+                    dirty: true,
+                },
+            ],
+            stats: CpuStats {
+                blocks: next(),
+                l2_hits: next(),
+                requests: next(),
+                distinct: 4,
+                host_requests: next(),
+                flushes: next(),
+                compiles: next(),
+                compile_max_us: 123_456,
+                steps: next(),
+                shootdowns: next(),
+                stops: next(),
+                systems: next(),
+                invalidations: next(),
+                retries: next(),
+                upgrades: next(),
+                evictions: next(),
+                shadow_resets: next(),
+                splits: next(),
+                linker: next(),
+                links: next(),
+                unlinks: next(),
+                stale_links: next(),
+                full_links: next(),
+                link_points: next(),
+                linked: next(),
+                dispatch_exits: 3,
+                interrupts: next(),
+                nmis: next(),
+                halts: next(),
+                shadow_steps: next(),
+                debug_steps: next(),
+                debug_traps: next(),
+                code_breaks: next(),
+                watch_hits: next(),
+                watchpoints: next(),
+                mailbox: [next(), next(), next(), next()],
+                decode_exits: next(),
+                decodes,
+                entropy_exits: next(),
+                k1: execution::K1::default(),
+            },
+            fault: hexes(&[14, 0xdead, 2, 0x1000]),
+            native: hexes(&[1, 2, 3]),
+            frame_intact: true,
+            tampered: false,
+            links_check: "ok".into(),
+            block_rips: hexes(&[0x1000, 0x1010]),
+            delivered: delivered.then(|| Delivered {
+                vector: 14,
+                frame: hexes(&[0x1000, 0x8, 0x202, 0x7ff0, 0x10, 2]),
+                error_code: true,
+                handler_rsp: Hex(0x7fc8),
+                cpl: 0,
+                cr2: Hex(0xdead),
+            }),
+            kicks: Some(Kicks {
+                issued: next(),
+                in_host: next(),
+                pending: true,
+                irqs: next(),
+                irq_sgis: next(),
+                merged: next(),
+                arms: next(),
+                stops: next(),
+                stops_entry: next(),
+                stops_dispatch: next(),
+                stops_l1: next(),
+                stops_exit: next(),
+                stops_resident: next(),
+                irqs_step: next(),
+                rearms: next(),
+                armed_at_end: next(),
+                sgis_sent: next(),
+                ack_ns_mean: next(),
+                sgi_ns_mean: next(),
+                ring_ns_mean: next(),
+                latency_ns: quantiles(&[5, 1, 9, 3]),
+                latency_in_host_ns: quantiles(&[]),
+            }),
+            mmio: mmio.map(|address| MmioState {
+                completed: 9,
+                status: "device",
+                address: address.map(Hex),
+            }),
+        }
+    }
+    /// The former `report` + `kick_report` + mmio line for `r`.
+    fn cpu_result_old(r: &CpuResult) -> String {
+        let s = &r.stats;
+        let kind = r.stop;
+        let reason = &r.reason;
+        let mut out = format!(
+            "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"xmm\":[{}],\"mxcsr\":\"{:#x}\",\"memory\":[",
+            r.vcpu,
+            r.tso,
+            list(&r.gpr),
+            r.rip.0,
+            r.rflags.0,
+            list(&r.xmm),
+            r.mxcsr.0
+        );
+        for (i, m) in r.memory.iter().enumerate() {
+            let (address, bytes) = (m.addr.0, &m.data);
+            let _ = write!(
+                out,
+                "{}{{\"addr\":\"{address:#x}\",\"data\":\"{bytes}\"}}",
+                if i > 0 { "," } else { "" }
+            );
+        }
+        let x = &r.x87;
+        let _ = write!(
+            out,
+            "],\"x87\":{{\"fcw\":\"{:#x}\",\"top\":{},\"c\":[{},{},{},{}],\"ie\":{},\"pe\":{},\"sf\":{},\"exceptions\":\"{:#x}\",\"ftw\":\"{:#x}\",\"mm\":[{}]}}",
+            x.fcw.0,
+            x.top,
+            x.c[0],
+            x.c[1],
+            x.c[2],
+            x.c[3],
+            x.ie,
+            x.pe,
+            x.sf,
+            x.exceptions.0,
+            x.ftw.0,
+            list(&x.mm)
+        );
+        let _ = write!(out, ",\"ymmh\":[{}]", list(&r.ymmh));
+        let _ = write!(
+            out,
+            ",\"guest_state_alias\":\"{:#x}\"",
+            r.guest_state_alias.0
+        );
+        let _ = write!(
+            out,
+            ",\"gs_base\":\"{:#x}\",\"kernel_gs_base\":\"{:#x}\"",
+            r.gs_base.0, r.kernel_gs_base.0
+        );
+        let l = &r.lapic;
+        let _ = write!(
+            out,
+            ",\"lapic\":{{\"cntfrq\":{},\"svr\":\"{:#x}\",\"tpr\":\"{:#x}\",\"isr\":[{}],\"esr\":\"{:#x}\"}}",
+            l.cntfrq,
+            l.svr.0,
+            l.tpr.0,
+            list(&l.isr),
+            l.esr.0
+        );
+        out += ",\"pages\":[";
+        for (i, p) in r.pages.iter().enumerate() {
+            let va = p.va.0;
+            let _ = write!(
+                out,
+                "{}{{\"va\":\"{va:#x}\",\"accessed\":{},\"dirty\":{}}}",
+                if i > 0 { "," } else { "" },
+                p.accessed,
+                p.dirty
+            );
+        }
+        let decodes = s
+            .decodes
+            .0
+            .iter()
+            .map(|(k, n)| {
+                format!(
+                    r#""{k:#x}":{n}"#,
+                    k = u64::from_str_radix(&k[2..], 16).unwrap()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let delivered = r.delivered.as_ref().map_or(String::new(), |d| {
+            let (vector, error, at) = (d.vector, d.error_code, d.handler_rsp.0);
+            format!(",\"delivered\":{{\"vector\":{vector},\"frame\":[{}],\"error_code\":{error},\"handler_rsp\":\"{at:#x}\",\"cpl\":{},\"cr2\":\"{:#x}\"}}", list(&d.frame), d.cpl, d.cr2.0)
+        });
+        let _ = write!(
+            out,
+            "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"debug_steps\":{},\"debug_traps\":{},\"code_breaks\":{},\"watch_hits\":{},\"watchpoints\":{},\"mailbox\":[{},{},{},{}],\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
+            s.blocks,
+            s.l2_hits,
+            s.requests,
+            s.distinct,
+            s.host_requests,
+            s.flushes,
+            s.compiles,
+            s.compile_max_us,
+            s.steps,
+            s.shootdowns,
+            s.stops,
+            s.systems,
+            s.invalidations,
+            s.retries,
+            s.upgrades,
+            s.evictions,
+            s.shadow_resets,
+            s.splits,
+            s.linker,
+            s.links,
+            s.unlinks,
+            s.stale_links,
+            s.full_links,
+            s.link_points,
+            s.linked,
+            s.dispatch_exits,
+            s.interrupts,
+            s.nmis,
+            s.halts,
+            s.shadow_steps,
+            s.debug_steps,
+            s.debug_traps,
+            s.code_breaks,
+            s.watch_hits,
+            s.watchpoints,
+            s.mailbox[0],
+            s.mailbox[1],
+            s.mailbox[2],
+            s.mailbox[3],
+            s.decode_exits,
+            decodes,
+            s.entropy_exits,
+            serde_json::to_string(&s.k1).unwrap(),
+            list(&r.fault),
+            list(&r.native),
+            r.frame_intact,
+            r.tampered,
+            r.links_check.replace('"', "'"),
+            list(&r.block_rips),
+            delivered
+        );
+        out.pop();
+        let k = r.kicks.as_ref().unwrap();
+        let kicks = format!(
+            ",\"kicks\":{{\"issued\":{},\"in_host\":{},\"pending\":{},\"irqs\":{},\"irq_sgis\":{},\"merged\":{},\"arms\":{},\"stops\":{},\"stops_entry\":{},\"stops_dispatch\":{},\"stops_l1\":{},\"stops_exit\":{},\"stops_resident\":{},\"irqs_step\":{},\"rearms\":{},\"armed_at_end\":{},\"sgis_sent\":{},\"ack_ns_mean\":{},\"sgi_ns_mean\":{},\"ring_ns_mean\":{},\"latency_ns\":{},\"latency_in_host_ns\":{}}}",
+            k.issued,
+            k.in_host,
+            k.pending,
+            k.irqs,
+            k.irq_sgis,
+            k.merged,
+            k.arms,
+            k.stops,
+            k.stops_entry,
+            k.stops_dispatch,
+            k.stops_l1,
+            k.stops_exit,
+            k.stops_resident,
+            k.irqs_step,
+            k.rearms,
+            k.armed_at_end,
+            k.sgis_sent,
+            k.ack_ns_mean,
+            k.sgi_ns_mean,
+            k.ring_ns_mean,
+            quantiles_old(&k.latency_ns),
+            quantiles_old(&k.latency_in_host_ns)
+        );
+        let mmio = r.mmio.as_ref().map_or(String::new(), |m| {
+            let address = m
+                .address
+                .map_or(String::new(), |a| format!(",\"address\":\"{:#x}\"", a.0));
+            format!(
+                ",\"mmio\":{{\"completed\":{},\"status\":\"{}\"{address}}}",
+                m.completed, m.status
+            )
+        });
+        out + &kicks + &mmio + "}"
+    }
+
+    #[test]
+    fn cpu_results_match_the_former_format() {
+        for (delivered, mmio) in [
+            (false, None),
+            (true, Some(None)),
+            (true, Some(Some(0xfee0_0300))),
+        ] {
+            let r = cpu_result(5, "delivered", delivered, mmio);
+            assert_eq!(
+                parse(&cpu_result_old(&r)),
+                serde_json::to_value(&r).unwrap()
+            );
+        }
+        let q = quantiles(&[7]);
+        assert_eq!(parse(&quantiles_old(&q)), serde_json::to_value(&q).unwrap());
+    }
+
+    /// The former report wrote `reason` unescaped and replaced `"` in `links_check` with `'`.
+    #[test]
+    fn free_text_round_trips() {
+        let text = "Error { message: \"q\\b\u{1}\" }";
+        let mut r = cpu_result(1, text, false, None);
+        r.links_check = text.into();
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            (&v["reason"], &v["links_check"]),
+            (&Value::from(text), &Value::from(text))
+        );
+        assert!(serde_json::from_str::<Value>(&cpu_result_old(&r)).is_err());
+    }
+
+    #[test]
+    fn run_lines_match_the_former_format() {
+        let reads = [3u64, 1, 0];
+        let writes = [0u64, 2, 0];
+        let n = 2;
+        let gpa = 0xf000_0000u64;
+        let log = vec![[0u64, 8, 4, 1, 0x1234], [1, 0, 1, 0, 0xff]];
+        let device = TestDeviceReport {
+            gpa: Hex(gpa),
+            reads: reads[..n].to_vec(),
+            writes: writes[..n].to_vec(),
+            order_errors: 1,
+            log: log
+                .iter()
+                .map(|e| (e[0], e[1], e[2], e[3], Hex(e[4])))
+                .collect(),
+        };
+        let old_log: Vec<String> = log
+            .iter()
+            .map(|e| format!("[{},{},{},{},\"{:#x}\"]", e[0], e[1], e[2], e[3], e[4]))
+            .collect();
+        let old_device = format!(
+            "{{\"gpa\":\"{gpa:#x}\",\"reads\":{:?},\"writes\":{:?},\"order_errors\":{},\"log\":[{}]}}",
+            &reads[..n],
+            &writes[..n],
+            1,
+            old_log.join(",")
+        );
+        let fixture = json!({"windows": 3, "snapshots": 64});
+        let net = json!({"events": ["closed"]});
+        let disk = natemu::virtio::testing::Control::new("normal").unwrap();
+        disk.event("backend-held");
+        let uart = "6869";
+        for sections in [true, false] {
+            for full in [true, false] {
+                let cpus = vec![
+                    cpu_result(1, "", false, None),
+                    cpu_result(2, "x", true, Some(None)),
+                ];
+                let mut devices = String::new();
+                if full {
+                    devices = format!(",\"devices\":[{}]", old_device);
+                    let (name, result) = ("io_stress", &fixture);
+                    let _ = write!(devices, ",\"{name}\":{result}");
+                    let _ = write!(
+                        devices,
+                        ",\"io_disk\":{}",
+                        serde_json::to_string(&disk.report()).unwrap()
+                    );
+                    let _ = write!(devices, ",\"io_net\":{}", net);
+                    let counts = "\"ports\":[],\"unassigned_pages\":[]";
+                    let hex = uart;
+                    let _ = write!(devices, ",{counts},\"uart\":\"{hex}\"");
+                }
+                let out: Vec<String> = cpus.iter().map(cpu_result_old).collect();
+                let old = if sections {
+                    format!("{{\"cpus\":[{}]{devices}}}", out.join(","))
+                } else {
+                    let mut one = out[0].clone();
+                    one.pop();
+                    format!("{one}{devices}}}")
+                };
+                let extra = RunExtra {
+                    devices: full.then(|| {
+                        vec![TestDeviceReport {
+                            gpa: Hex(gpa),
+                            reads: device.reads.clone(),
+                            writes: device.writes.clone(),
+                            order_errors: 1,
+                            log: device.log.clone(),
+                        }]
+                    }),
+                    fixture: full.then(|| Members(vec![("io_stress", fixture.clone())])),
+                    io_disk: full.then(|| disk.report()),
+                    io_net: full.then(|| net.clone()),
+                    counts: full.then(Default::default),
+                    uart: full.then(|| uart.into()),
+                };
+                let new = if sections {
+                    serde_json::to_string(&Sections { cpus, extra })
+                } else {
+                    serde_json::to_string(&One {
+                        cpu: cpus.into_iter().next().unwrap(),
+                        extra,
+                    })
+                }
+                .unwrap();
+                assert_eq!(parse(&old), parse(&new));
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_and_stderr_lines_match_the_former_format() {
+        // io_windows' result.
+        let (windows, before, after) = (5u64, vec![1u64, 2], vec![3u64, 4]);
+        let old = format!(
+            "{{\"windows\":{windows},\"snapshots\":64,\"progress_before\":{before:?},\"progress_after\":{after:?},\"ordered_overlap\":true,\"code_observed\":2}}"
+        );
+        let new = json!({
+            "windows": windows,
+            "snapshots": 64,
+            "progress_before": before,
+            "progress_after": after,
+            "ordered_overlap": true,
+            "code_observed": 2,
+        });
+        assert_eq!(parse(&old), new);
+        // io-state and io-memory.
+        let (rip, gpr) = (0x1234u64, [7u64; 16]);
+        let old = format!(
+            "[{}]",
+            format!("{{\"rip\":\"{:#x}\",\"gpr\":{:?}}}", rip, gpr)
+        );
+        assert_eq!(
+            parse(&old),
+            Value::Array(vec![json!({"rip": Hex(rip), "gpr": gpr})])
+        );
+        let (address, bytes) = (0x2000u64, "00ff");
+        let old = format!(
+            "[[{}],[]]",
+            format!("{{\"addr\":\"{address:#x}\",\"data\":\"{bytes}\"}}")
+        );
+        let new = vec![vec![MemoryBytes::new(address, &[0, 0xff])], vec![]];
+        assert_eq!(parse(&old), serde_json::to_value(&new).unwrap());
+        // NATEMU_EXIT_LOG.
+        let decodes: Members<String, u64> = [("0x7".to_string(), 3), ("0x1f".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let old_decodes = "\"0x7\":3,\"0x1f\":1";
+        let old = format!(
+            r#"{{"systems":{},"entropy":{},"decodes":{{{decodes}}}}}"#,
+            10,
+            2,
+            decodes = old_decodes
+        );
+        let new = ExitLog {
+            systems: 10,
+            entropy: 2,
+            decodes: &decodes,
+        };
+        assert_eq!(old, serde_json::to_string(&new).unwrap(), "byte for byte");
     }
 }
