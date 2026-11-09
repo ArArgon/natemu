@@ -61,7 +61,17 @@ pub(crate) struct Pm {
 impl Pm {
     pub(crate) fn new(irqs: &Irqs, frequency: u64, power: Arc<AtomicU8>) -> Self {
         let start = scale(clock::now(), PM_TIMER_HZ, frequency);
-        Self { sts: 0, en: 0, cnt: SCI_EN, overflow: 1 << 23, frequency, start, irqs: irqs.clone(), busy: None, power }
+        Self {
+            sts: 0,
+            en: 0,
+            cnt: SCI_EN,
+            overflow: 1 << 23,
+            frequency,
+            start,
+            irqs: irqs.clone(),
+            busy: None,
+            power,
+        }
     }
     /// The PM timer's count since creation (not wrapped).
     fn ticks(&self) -> u64 {
@@ -77,8 +87,13 @@ impl Pm {
     /// `acpi_update_sci`: the SCI level, and the overflow scheduled (with its guard) while TMR_EN and TMR_STS clear.
     fn update_sci(&mut self) {
         let sts = self.status();
-        self.irqs.line(9, sts & self.en & (RTC | PWRBTN | GBL | TMR) != 0);
-        self.busy = if self.en & TMR != 0 && sts & TMR == 0 { self.busy.take().or_else(|| Some(self.irqs.busy())) } else { None };
+        self.irqs
+            .line(9, sts & self.en & (RTC | PWRBTN | GBL | TMR) != 0);
+        self.busy = if self.en & TMR != 0 && sts & TMR == 0 {
+            self.busy.take().or_else(|| Some(self.irqs.busy()))
+        } else {
+            None
+        };
     }
     fn image(&mut self, offset: u64) -> u32 {
         match offset {
@@ -105,7 +120,9 @@ impl Device for Pm {
         Some(u64::from(self.image(base)) >> (8 * (offset - base)) & (u64::MAX >> (64 - 8 * size)))
     }
     fn write(&mut self, _vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
-        let Some((base, _)) = block(offset).filter(|&(b, l)| offset + size <= b + l) else { return false };
+        let Some((base, _)) = block(offset).filter(|&(b, l)| offset + size <= b + l) else {
+            return false;
+        };
         let shift = 8 * (offset - base);
         let (mask, value) = ((u64::MAX >> (64 - 8 * size)) << shift, value << shift);
         match base {
@@ -123,7 +140,9 @@ impl Device for Pm {
             }
             CNT => {
                 let v = (u64::from(self.cnt) & !mask | value & mask) as u16;
-                if v & SLP_EN != 0 && u64::from(v >> 10 & 7) != u64::from(crate::boot::acpi::platform::S5_SLP_TYP) {
+                if v & SLP_EN != 0
+                    && u64::from(v >> 10 & 7) != u64::from(crate::boot::acpi::platform::S5_SLP_TYP)
+                {
                     return false;
                 }
                 self.cnt = v & !SLP_EN | SCI_EN;
@@ -143,7 +162,9 @@ impl Device for Pm {
 }
 impl Timed for Pm {
     fn next(&self) -> Option<u64> {
-        self.busy.as_ref().map(|_| count_at(self.start + self.overflow, PM_TIMER_HZ, self.frequency))
+        self.busy
+            .as_ref()
+            .map(|_| count_at(self.start + self.overflow, PM_TIMER_HZ, self.frequency))
     }
     fn fire(&mut self, _at: u64) {
         self.update_sci();

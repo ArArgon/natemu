@@ -145,7 +145,11 @@ pub fn highest(bits: &[u64; 4]) -> Option<u64> {
 /// vector's class.
 pub fn ppr(tpr: u64, isr: &[u64; 4]) -> u64 {
     let isrv = highest(isr).unwrap_or(0);
-    if tpr >> 4 & 0xf >= isrv >> 4 { tpr & 0xff } else { isrv & 0xf0 }
+    if tpr >> 4 & 0xf >= isrv >> 4 {
+        tpr & 0xff
+    } else {
+        isrv & 0xf0
+    }
 }
 /// The interrupt the APIC delivers to the core (11.8.4): the highest pending vector, if its class is above the PPR's.
 pub fn deliverable(irr: &[u64; 4], tpr: u64, isr: &[u64; 4]) -> Option<u64> {
@@ -204,14 +208,34 @@ pub const LINT1_NMI: u64 = 1 << 44;
 pub const LINT0_FIXED: u64 = 1 << 45;
 pub fn published(apic_base: u64, l: &Lapic, id: u64) -> u64 {
     let (en, extd) = (apic_base >> 11 & 1 != 0, apic_base >> 10 & 1 != 0);
-    let ldr = if extd { x2apic_ldr(id) } else { l.ldr & 0xff00_0000 };
+    let ldr = if extd {
+        x2apic_ldr(id)
+    } else {
+        l.ldr & 0xff00_0000
+    };
     ldr | (l.dfr >> 28 & 0xf) << 32
         | if en { HW_ENABLED } else { 0 }
         | if en && extd { X2APIC } else { 0 }
-        | if en && l.svr & SVR_ENABLE != 0 { SW_ENABLED } else { 0 }
-        | if !en || l.lvt[LINT0] & (MASKED | 0x700) == 0x700 { EXTINT } else { 0 }
-        | if en && l.lvt[LINT1] & (MASKED | 0x700) == 0x400 { LINT1_NMI } else { 0 }
-        | if en && l.lvt[LINT0] & (MASKED | 0x700 | 0x8000) == 0 { LINT0_FIXED | (l.lvt[LINT0] & 0xff) << 48 } else { 0 }
+        | if en && l.svr & SVR_ENABLE != 0 {
+            SW_ENABLED
+        } else {
+            0
+        }
+        | if !en || l.lvt[LINT0] & (MASKED | 0x700) == 0x700 {
+            EXTINT
+        } else {
+            0
+        }
+        | if en && l.lvt[LINT1] & (MASKED | 0x700) == 0x400 {
+            LINT1_NMI
+        } else {
+            0
+        }
+        | if en && l.lvt[LINT0] & (MASKED | 0x700 | 0x8000) == 0 {
+            LINT0_FIXED | (l.lvt[LINT0] & 0xff) << 48
+        } else {
+            0
+        }
 }
 /// The target `id` with published word `word` is in the destination `dest` (11.6.2): physical (the ID; all-ones
 /// broadcast, 11.6.2.1) or logical (11.6.2.2: xAPIC flat: LDR[31:24] AND dest, so all ones reaches every APIC with a
@@ -257,13 +281,25 @@ mod tests {
         assert_eq!(deliverable(&set(&[0x41]), 0, &set(&[0x40])), None); // same class in service
         assert_eq!(deliverable(&set(&[0x51]), 0, &set(&[0x40])), Some(0x51));
         assert_eq!(deliverable(&set(&[0x51]), 0x50, &set(&[])), None); // TPR class 5 masks class 5
-        assert_eq!(deliverable(&set(&[0x61, 0x51]), 0x50, &set(&[])), Some(0x61));
+        assert_eq!(
+            deliverable(&set(&[0x61, 0x51]), 0x50, &set(&[])),
+            Some(0x61)
+        );
         assert_eq!(deliverable(&set(&[0x20]), 0x1f, &set(&[])), Some(0x20));
         assert_eq!(deliverable(&set(&[0x20]), 0x20, &set(&[])), None);
     }
     #[test]
     fn divider() {
-        let want = [(0, 2), (1, 4), (2, 8), (3, 16), (8, 32), (9, 64), (0xa, 128), (0xb, 1)];
+        let want = [
+            (0, 2),
+            (1, 4),
+            (2, 8),
+            (3, 16),
+            (8, 32),
+            (9, 64),
+            (0xa, 128),
+            (0xb, 1),
+        ];
         for (dcr, d) in want {
             assert_eq!(divisor(dcr), d);
             assert_eq!(divisor(dcr | 4), d); // bit 2 is not part of the encoding
@@ -275,43 +311,111 @@ mod tests {
         let n = 5;
         let one: Vec<u64> = (0..8).map(|t| current_count(n, false, t)).collect();
         assert_eq!(one, [5, 4, 3, 2, 1, 0, 0, 0]);
-        assert_eq!((0..8).map(|t| expiries(n, false, t)).collect::<Vec<_>>(), [0, 0, 0, 0, 0, 1, 1, 1]);
-        assert_eq!((next_expiry(n, false, 0), next_expiry(n, false, 1)), (Some(5), None));
+        assert_eq!(
+            (0..8).map(|t| expiries(n, false, t)).collect::<Vec<_>>(),
+            [0, 0, 0, 0, 0, 1, 1, 1]
+        );
+        assert_eq!(
+            (next_expiry(n, false, 0), next_expiry(n, false, 1)),
+            (Some(5), None)
+        );
         // Periodic: reloaded as it reaches 0: period N, the count in N..=1.
         let per: Vec<u64> = (0..11).map(|t| current_count(n, true, t)).collect();
         assert_eq!(per, [5, 4, 3, 2, 1, 5, 4, 3, 2, 1, 5]);
-        assert_eq!((0..11).map(|t| expiries(n, true, t)).collect::<Vec<_>>(), [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2]);
+        assert_eq!(
+            (0..11).map(|t| expiries(n, true, t)).collect::<Vec<_>>(),
+            [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2]
+        );
         for k in 0..4 {
             let at = next_expiry(n, true, k).unwrap();
-            assert_eq!((expiries(n, true, at - 1), expiries(n, true, at)), (k, k + 1));
+            assert_eq!(
+                (expiries(n, true, at - 1), expiries(n, true, at)),
+                (k, k + 1)
+            );
         }
-        assert_eq!((current_count(0, true, 9), expiries(0, true, 9), next_expiry(0, false, 0)), (0, 0, None));
-        assert_eq!(current_count(u32::MAX as u64, true, 1 << 40), u32::MAX as u64 - (1 << 40) % u32::MAX as u64);
+        assert_eq!(
+            (
+                current_count(0, true, 9),
+                expiries(0, true, 9),
+                next_expiry(0, false, 0)
+            ),
+            (0, 0, None)
+        );
+        assert_eq!(
+            current_count(u32::MAX as u64, true, 1 << 40),
+            u32::MAX as u64 - (1 << 40) % u32::MAX as u64
+        );
     }
     #[test]
     fn destinations() {
-        let l = |ldr, dfr| Lapic { ldr, dfr, svr: SVR_ENABLE, ..RESET };
+        let l = |ldr, dfr| Lapic {
+            ldr,
+            dfr,
+            svr: SVR_ENABLE,
+            ..RESET
+        };
         let flat = published(0xfee0_0800, &l(0x0400_0000, DFR_RESET), 2);
-        assert_eq!(flat & (HW_ENABLED | X2APIC | SW_ENABLED), HW_ENABLED | SW_ENABLED);
-        assert!(in_destination(flat, 2, 0x04, true, false) && in_destination(flat, 2, 0x0c, true, false));
+        assert_eq!(
+            flat & (HW_ENABLED | X2APIC | SW_ENABLED),
+            HW_ENABLED | SW_ENABLED
+        );
+        assert!(
+            in_destination(flat, 2, 0x04, true, false)
+                && in_destination(flat, 2, 0x0c, true, false)
+        );
         assert!(!in_destination(flat, 2, 0x03, true, false));
-        assert!(in_destination(flat, 2, 0xff, true, false) && in_destination(flat, 2, 0xff, false, false));
+        assert!(
+            in_destination(flat, 2, 0xff, true, false)
+                && in_destination(flat, 2, 0xff, false, false)
+        );
         let unset = published(0xfee0_0800, &l(0, DFR_RESET), 3); // flat, LDR 0: no logical destination reaches it
-        assert!(!in_destination(unset, 3, 0xff, true, false) && in_destination(unset, 3, 0xff, false, false));
-        assert!(in_destination(flat, 2, 2, false, false) && !in_destination(flat, 2, 3, false, false));
+        assert!(
+            !in_destination(unset, 3, 0xff, true, false)
+                && in_destination(unset, 3, 0xff, false, false)
+        );
+        assert!(
+            in_destination(flat, 2, 2, false, false) && !in_destination(flat, 2, 3, false, false)
+        );
         let cluster = published(0xfee0_0800, &l(0x2100_0000, 0x0fff_ffff), 1);
-        assert!(in_destination(cluster, 1, 0x21, true, false) && in_destination(cluster, 1, 0x23, true, false));
-        assert!(!in_destination(cluster, 1, 0x11, true, false) && !in_destination(cluster, 1, 0x22, true, false));
+        assert!(
+            in_destination(cluster, 1, 0x21, true, false)
+                && in_destination(cluster, 1, 0x23, true, false)
+        );
+        assert!(
+            !in_destination(cluster, 1, 0x11, true, false)
+                && !in_destination(cluster, 1, 0x22, true, false)
+        );
         assert!(in_destination(cluster, 1, 0xff, true, false));
         let x2 = published(0xfee0_0c00, &l(0, DFR_RESET), 0x13);
         assert_eq!(x2 & 0xffff_ffff, 0x1_0008);
-        assert!(in_destination(x2, 0x13, 0x1_0008, true, true) && in_destination(x2, 0x13, 0x1_000c, true, true));
-        assert!(!in_destination(x2, 0x13, 0x0_0008, true, true) && in_destination(x2, 0x13, 0xffff_ffff, true, true));
-        assert!(in_destination(x2, 0x13, 0x13, false, true) && !in_destination(x2, 0x13, 0xff, false, true));
-        assert_eq!(published(0xfee0_0000, &l(0, DFR_RESET), 0) & (HW_ENABLED | SW_ENABLED), 0);
+        assert!(
+            in_destination(x2, 0x13, 0x1_0008, true, true)
+                && in_destination(x2, 0x13, 0x1_000c, true, true)
+        );
+        assert!(
+            !in_destination(x2, 0x13, 0x0_0008, true, true)
+                && in_destination(x2, 0x13, 0xffff_ffff, true, true)
+        );
+        assert!(
+            in_destination(x2, 0x13, 0x13, false, true)
+                && !in_destination(x2, 0x13, 0xff, false, true)
+        );
+        assert_eq!(
+            published(0xfee0_0000, &l(0, DFR_RESET), 0) & (HW_ENABLED | SW_ENABLED),
+            0
+        );
         // L4a's LINT inputs: a hardware-disabled APIC passes the 8259 through (EXTINT whatever its LVT); LINT0 ExtINT,
         // fixed edge (with its vector), LINT1 NMI; masked or level-triggered fixed: none.
-        let lint = |base, lint0, lint1| published(base, &Lapic { lvt: [MASKED, MASKED, MASKED, lint0, lint1, MASKED], ..l(0, DFR_RESET) }, 0) >> 43;
+        let lint = |base, lint0, lint1| {
+            published(
+                base,
+                &Lapic {
+                    lvt: [MASKED, MASKED, MASKED, lint0, lint1, MASKED],
+                    ..l(0, DFR_RESET)
+                },
+                0,
+            ) >> 43
+        };
         assert_eq!(lint(0xfee0_0000, MASKED, MASKED), 1);
         assert_eq!(lint(0xfee0_0800, MASKED | 0x700, MASKED | 0x400), 0);
         assert_eq!(lint(0xfee0_0800, 0x700, 0x400), 0b011);

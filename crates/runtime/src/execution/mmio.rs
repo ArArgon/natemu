@@ -21,7 +21,10 @@
 //! Cost: each device access ends its block (the resident dispatches at the next RIP, an L1/L2 lookup, not a re-entry of
 //! the rest of the block) and, unless [`local`] serves it, makes one host exit plus polls if completion is deferred.
 use super::*;
-use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_DEVICE, REPLY_DEVICE_POLL, REPLY_PAGE, REQUEST_DEVICE, REQUEST_DEVICE_POLL, REQUEST_PAGE, mmio as status};
+use natemu_abi::execution::{
+    MMIO_VA, Mmio, REPLY_DEVICE, REPLY_DEVICE_POLL, REPLY_PAGE, REQUEST_DEVICE,
+    REQUEST_DEVICE_POLL, REQUEST_PAGE, mmio as status,
+};
 
 /// `gpa` is guest RAM (anything else is a device page).
 pub(super) fn ram(gpa: u64) -> bool {
@@ -34,7 +37,14 @@ fn exchange() -> *mut Mmio {
 fn stop_with(s: &State, why: u64) -> ! {
     unsafe {
         let m = read_record(exchange());
-        write_record(exchange(), &Mmio { status: why, completed: m.completed, ..Mmio::default() });
+        write_record(
+            exchange(),
+            &Mmio {
+                status: why,
+                completed: m.completed,
+                ..Mmio::default()
+            },
+        );
     }
     halt(s, stop::UNSUPPORTED_MMIO)
 }
@@ -54,12 +64,23 @@ pub(super) fn system_access(s: &State) -> ! {
 /// retries the instruction, which then runs natively, any read form). `false`: a page is a device's (this vCPU's LAPIC page
 /// whatever its mode, or one the host's registry claims): the device path. Under the strict switch the read stops
 /// (`unassigned`). The host counts each page asked about as a read (a fill), also one then found next to a claimed page.
-pub(super) fn ones(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, touched: [Option<u64>; 2], device: [Option<u64>; 2]) -> bool {
+pub(super) fn ones(
+    s: &mut State,
+    f: &NativeFrame,
+    b: &Block,
+    site: &Site,
+    touched: [Option<u64>; 2],
+    device: [Option<u64>; 2],
+) -> bool {
     if device.iter().flatten().any(|&g| super::lapic::claims(g)) {
         return false;
     }
     // A page already shadowed onto the all-ones page (the access aborted on its other page) is not asked about again.
-    let ones = |va: Option<u64>| va.is_some_and(|va| tables::descriptor(s.cpu.cpl, va) & 0xffff_ffff_f001 == natemu_abi::ALL_ONES_IPA | 1);
+    let ones = |va: Option<u64>| {
+        va.is_some_and(|va| {
+            tables::descriptor(s.cpu.cpl, va) & 0xffff_ffff_f001 == natemu_abi::ALL_ONES_IPA | 1
+        })
+    };
     let fresh = [0, 1].map(|k| device[k].filter(|_| !ones(touched[k])));
     let mut claimed = false;
     for &gpa in fresh.iter().flatten() {
@@ -84,7 +105,14 @@ pub(super) fn ones(s: &mut State, f: &NativeFrame, b: &Block, site: &Site, touch
 unsafe fn page(s: &mut State, gpa: u64) -> u64 {
     unsafe {
         let completed = read_record(exchange()).completed;
-        write_record(exchange(), &Mmio { gpa, completed, ..Mmio::default() });
+        write_record(
+            exchange(),
+            &Mmio {
+                gpa,
+                completed,
+                ..Mmio::default()
+            },
+        );
         (s.request, s.reply) = (REQUEST_PAGE, NONE);
         write_record(record(), s);
         let p = crate::perf::enter(crate::perf::HOST);
@@ -116,10 +144,18 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
         object::kind::SWAP | object::kind::ATOMIC => refuse(s, f, b, site, status::ATOMIC),
         _ => refuse(s, f, b, site, status::SITE),
     }
-    let Some(c) = object::completion(site) else { refuse(s, f, b, site, status::FORM) };
-    let Some(gpa) = gpa else { refuse(s, f, b, site, status::CROSSING) };
+    let Some(c) = object::completion(site) else {
+        refuse(s, f, b, site, status::FORM)
+    };
+    let Some(gpa) = gpa else {
+        refuse(s, f, b, site, status::CROSSING)
+    };
     let width = u64::from(c.width);
-    let mask = if width == 8 { u64::MAX } else { (1 << (8 * width)) - 1 };
+    let mask = if width == 8 {
+        u64::MAX
+    } else {
+        (1 << (8 * width)) - 1
+    };
     // A store's data: the site's transfer register as the translated instruction holds it (xzr: 0).
     let data = c.store.then(|| if site.data_reg[0] == 31 { 0 } else { f.x[site.data_reg[0] as usize] } & mask);
     // A deferred reply can flush the cache while parked. Retain only owned completion data and
@@ -130,7 +166,14 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
         Some(v) => v,
         None => unsafe {
             let done = read_record(exchange()).completed;
-            let request = Mmio { gpa, width, write: u64::from(c.store), value: data.unwrap_or(0), completed: done, ..Mmio::default() };
+            let request = Mmio {
+                gpa,
+                width,
+                write: u64::from(c.store),
+                value: data.unwrap_or(0),
+                completed: done,
+                ..Mmio::default()
+            };
             write_record(exchange(), &request);
             (s.request, s.reply) = (REQUEST_DEVICE, NONE);
             write_record(record(), &s);
@@ -153,8 +196,10 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
             loop {
                 match m.status {
                     status::DONE => break m.value,
-                    status::UNASSIGNED | status::DEVICE | status::FAILED => halt(&s, stop::UNSUPPORTED_MMIO),
-                    status::PENDING => {},
+                    status::UNASSIGNED | status::DEVICE | status::FAILED => {
+                        halt(&s, stop::UNSUPPORTED_MMIO)
+                    }
+                    status::PENDING => {}
                     _ => halt(&s, stop::BAD_REPLY),
                 }
                 io_checkpoint(&mut s);
@@ -165,7 +210,9 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
                 crate::perf::leave(p);
                 s = load();
                 s.request = NONE;
-                if s.reply != REPLY_DEVICE_POLL { halt(&s, stop::BAD_REPLY) }
+                if s.reply != REPLY_DEVICE_POLL {
+                    halt(&s, stop::BAD_REPLY)
+                }
                 m = read_record(exchange());
             }
         },
@@ -173,7 +220,11 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     // Committed: the load's register with x86's merge, RIP past the instruction (it completed: shadows and RF end with it).
     if !c.store {
         let bits = 64 - 8 * u32::from(c.width);
-        let v = if c.signed { (((value << bits) as i64) >> bits) as u64 } else { value & mask };
+        let v = if c.signed {
+            (((value << bits) as i64) >> bits) as u64
+        } else {
+            value & mask
+        };
         let old = s.cpu.gpr[c.reg as usize];
         s.cpu.gpr[c.reg as usize] = match (c.dest, c.high) {
             (1, true) => old & !0xff00 | (v & 0xff) << 8,

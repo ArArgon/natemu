@@ -130,13 +130,16 @@ impl Machine {
             // this host) is raised when it does not, up to its maximum.
             let bits = 64 - (IPA + memory.1 as u64 - 1).leading_zeros();
             let (mut default, mut max) = (0, 0);
-            let sized = hv(hv_vm_config_get_default_ipa_size(&mut default), "default IPA size")
-                .and_then(|()| hv(hv_vm_config_get_max_ipa_size(&mut max), "maximum IPA size"))
-                .and_then(|()| match bits {
-                    b if b <= default => Ok(()),
-                    b if b <= max => hv(hv_vm_config_set_ipa_size(config, b), "set IPA size"),
-                    b => Err(format!("backing needs {b} IPA bits; HVF allows {max}")),
-                });
+            let sized = hv(
+                hv_vm_config_get_default_ipa_size(&mut default),
+                "default IPA size",
+            )
+            .and_then(|()| hv(hv_vm_config_get_max_ipa_size(&mut max), "maximum IPA size"))
+            .and_then(|()| match bits {
+                b if b <= default => Ok(()),
+                b if b <= max => hv(hv_vm_config_set_ipa_size(config, b), "set IPA size"),
+                b => Err(format!("backing needs {b} IPA bits; HVF allows {max}")),
+            });
             if let Err(e) = sized {
                 os_release(config);
                 return Err(e);
@@ -146,19 +149,36 @@ impl Machine {
             created?;
         }
         // From here on every early return destroys the VM (Drop).
-        let mut machine = Self { spi: 0, memory, live: true };
+        let mut machine = Self {
+            spi: 0,
+            memory,
+            live: true,
+        };
         let (base, bytes) = (machine.memory.0, machine.memory.1);
         unsafe {
             // After the VM, before any vCPU (hv_gic.h).
             let gic = hv_gic_config_create();
-            let created = hv(hv_gic_config_set_distributor_base(gic, GIC_DISTRIBUTOR), "GIC distributor base")
-                .and_then(|()| hv(hv_gic_config_set_redistributor_base(gic, GIC_REDISTRIBUTORS), "GIC redistributor base"))
-                .and_then(|()| hv(hv_gic_create(gic), "hv_gic_create (macOS 15 or later)"));
+            let created = hv(
+                hv_gic_config_set_distributor_base(gic, GIC_DISTRIBUTOR),
+                "GIC distributor base",
+            )
+            .and_then(|()| {
+                hv(
+                    hv_gic_config_set_redistributor_base(gic, GIC_REDISTRIBUTORS),
+                    "GIC redistributor base",
+                )
+            })
+            .and_then(|()| hv(hv_gic_create(gic), "hv_gic_create (macOS 15 or later)"));
             os_release(gic);
             created?;
         }
         let (mut spi, mut count) = (0, 0);
-        unsafe { hv(hv_gic_get_spi_interrupt_range(&mut spi, &mut count), "GIC SPI range")? };
+        unsafe {
+            hv(
+                hv_gic_get_spi_interrupt_range(&mut spi, &mut count),
+                "GIC SPI range",
+            )?
+        };
         if (count as usize) < natemu_abi::execution::cache::MAX_VCPUS {
             return Err(format!("{count} GIC SPIs: one per vCPU needed"));
         }
@@ -183,25 +203,47 @@ impl Machine {
         unsafe { hv(hv_vm_map(base.cast(), IPA, bytes, MAPPED), "hv_vm_map")? };
         // L3 (amendment): the shared all-ones page that shadows of unassigned guest-physical pages map, read-only here too.
         // ponytail: one page per VM leaked for the process (a VM per process today); free it with the VM if VMs come and go.
-        let ones = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(ALL_ONES as usize, ALL_ONES as usize).unwrap()) };
+        let ones = unsafe {
+            std::alloc::alloc(
+                std::alloc::Layout::from_size_align(ALL_ONES as usize, ALL_ONES as usize).unwrap(),
+            )
+        };
         if ones.is_null() {
             return Err("all-ones page: out of memory".into());
         }
         unsafe {
             ones.write_bytes(0xff, ALL_ONES as usize);
-            hv(hv_vm_map(ones.cast(), natemu_abi::ALL_ONES_IPA, ALL_ONES as usize, READ), "hv_vm_map all-ones page")?;
+            hv(
+                hv_vm_map(
+                    ones.cast(),
+                    natemu_abi::ALL_ONES_IPA,
+                    ALL_ONES as usize,
+                    READ,
+                ),
+                "hv_vm_map all-ones page",
+            )?;
         }
         Ok(machine)
     }
     fn distributor(&self, reg: u16) -> Result<u64> {
         let mut value = 0;
         let _gic = gic();
-        unsafe { hv(hv_gic_get_distributor_reg(reg, &mut value), "read GIC distributor")? };
+        unsafe {
+            hv(
+                hv_gic_get_distributor_reg(reg, &mut value),
+                "read GIC distributor",
+            )?
+        };
         Ok(value)
     }
     fn set_distributor(&self, reg: u16, value: u64) -> Result<()> {
         let _gic = gic();
-        unsafe { hv(hv_gic_set_distributor_reg(reg, value), "write GIC distributor") }
+        unsafe {
+            hv(
+                hv_gic_set_distributor_reg(reg, value),
+                "write GIC distributor",
+            )
+        }
     }
     /// Disables vCPU `v`'s host doorbell (a test driver's peer that never answers).
     pub fn silence(&self, v: usize) -> Result<()> {
@@ -211,7 +253,10 @@ impl Machine {
     /// Routes vCPU `v`'s SPI to it (Aff0 = `v`). Written after the vCPU exists: HVF delivers an SPI whose route was
     /// written before then to no one (`experiments/track03/native-interrupts/`, the IROUTER quirk).
     pub fn route(&self, v: usize) -> Result<()> {
-        self.set_distributor(GICD_IROUTER + 8 * (self.spi + v as u32) as u16, natemu_abi::execution::vcpu_affinity(v))
+        self.set_distributor(
+            GICD_IROUTER + 8 * (self.spi + v as u32) as u16,
+            natemu_abi::execution::vcpu_affinity(v),
+        )
     }
     /// Rings vCPU `v`'s host doorbell (an edge on its SPI), from any thread.
     pub(crate) fn ring(&self, v: usize) -> Result<()> {
@@ -327,10 +372,19 @@ impl Vcpu {
         self.set_sys(MPIDR_EL1, natemu_abi::execution::vcpu_affinity(v))?;
         let _gic = gic();
         unsafe {
-            hv(hv_vcpu_set_vtimer_offset(self.id, 0), "hv_vcpu_set_vtimer_offset")?;
-            hv(hv_gic_set_redistributor_reg(self.id, GICR_IGROUPR0, bit), "GICR_IGROUPR0")?;
+            hv(
+                hv_vcpu_set_vtimer_offset(self.id, 0),
+                "hv_vcpu_set_vtimer_offset",
+            )?;
+            hv(
+                hv_gic_set_redistributor_reg(self.id, GICR_IGROUPR0, bit),
+                "GICR_IGROUPR0",
+            )?;
             if enabled {
-                hv(hv_gic_set_redistributor_reg(self.id, GICR_ISENABLER0, bit), "GICR_ISENABLER0")?;
+                hv(
+                    hv_gic_set_redistributor_reg(self.id, GICR_ISENABLER0, bit),
+                    "GICR_ISENABLER0",
+                )?;
             }
             Ok(())
         }
@@ -381,8 +435,14 @@ impl Vcpu {
         // S4: the VM owns its debug registers and debug exceptions: the resident programs the watchpoints that implement
         // x86 data breakpoints and takes their exceptions and its own software steps (never the host's).
         unsafe {
-            hv(hv_vcpu_set_trap_debug_reg_accesses(self.id, false), "hv_vcpu_set_trap_debug_reg_accesses")?;
-            hv(hv_vcpu_set_trap_debug_exceptions(self.id, false), "hv_vcpu_set_trap_debug_exceptions")?;
+            hv(
+                hv_vcpu_set_trap_debug_reg_accesses(self.id, false),
+                "hv_vcpu_set_trap_debug_reg_accesses",
+            )?;
+            hv(
+                hv_vcpu_set_trap_debug_exceptions(self.id, false),
+                "hv_vcpu_set_trap_debug_exceptions",
+            )?;
         }
         // EL0 may read the virtual count (EL0VCTEN, bit 1: CNTVCT_EL0, CNTVCTSS_EL0 and CNTFRQ_EL0, read-only; perf chunk 15's
         // inline RDTSC, which admission allows only there): the value the guest already reads, scaled, by RDTSC. Everything
@@ -407,7 +467,10 @@ impl Vcpu {
     }
     fn unexpected(&self, reason: u32, syndrome: u64, ipa: u64) -> String {
         let va = unsafe { (*self.exit).exception.virtual_address };
-        format!("unexpected exit: reason={reason} syndrome={syndrome:#x} PC={:#x} VA={va:#x} IPA={ipa:#x}", self.reg(PC).unwrap_or(0))
+        format!(
+            "unexpected exit: reason={reason} syndrome={syndrome:#x} PC={:#x} VA={va:#x} IPA={ipa:#x}",
+            self.reg(PC).unwrap_or(0)
+        )
     }
     /// Destroys the vCPU now and returns the framework status.
     pub(crate) fn destroy(&mut self) -> i32 {

@@ -21,7 +21,10 @@ pub(crate) unsafe fn copy_record(dst: *mut u8, src: *const u8, count: usize) {
         done += 32;
     }
     // As MaybeUninit words: a record's padding bytes are copied without being read as integers.
-    let (dst, src) = (dst.cast::<MaybeUninit<u64>>(), src.cast::<MaybeUninit<u64>>());
+    let (dst, src) = (
+        dst.cast::<MaybeUninit<u64>>(),
+        src.cast::<MaybeUninit<u64>>(),
+    );
     for i in done / 8..count / 8 {
         unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
     }

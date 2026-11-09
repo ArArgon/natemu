@@ -61,7 +61,12 @@ fn slot(index: u32) -> usize {
     cpu::msr(index).unwrap()
 }
 fn flat(selector: u16, attributes: u16) -> Segment {
-    Segment { selector, attributes, limit: u32::MAX, base: 0 }
+    Segment {
+        selector,
+        attributes,
+        limit: u32::MAX,
+        base: 0,
+    }
 }
 
 /// Executes `i` (SWAPGS ..= CLFLUSH, SYSENTER, SYSEXIT). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: SYSCALL or SYSRET
@@ -90,7 +95,12 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             s.cpu.seg[SREG_CS] = flat(selector & 0xfffc, CS64);
             s.cpu.seg[SREG_SS] = flat(selector.wrapping_add(8), SS_FLAT);
             set_cpl(s, 0);
-            s.debug = s.debug & !debug::STEP | if s.cpu.rflags & RFLAGS_TF != 0 { debug::STEP } else { 0 };
+            s.debug = s.debug & !debug::STEP
+                | if s.cpu.rflags & RFLAGS_TF != 0 {
+                    debug::STEP
+                } else {
+                    0
+                };
             return Ok(Some(msr_get(slot(cpu::MSR_LSTAR))));
         }
         system::SYSRET => {
@@ -101,7 +111,11 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 return Err(GP0);
             }
             let wide = i.size == 8;
-            let rip = if wide { s.cpu.gpr[1] } else { s.cpu.gpr[1] & 0xffff_ffff };
+            let rip = if wide {
+                s.cpu.gpr[1]
+            } else {
+                s.cpu.gpr[1] & 0xffff_ffff
+            };
             if !paging::canonical(rip) {
                 return Err(GP0);
             }
@@ -114,7 +128,12 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             }
             s.cpu.seg[SREG_CS] = flat(base.wrapping_add(16) | 3, CS64 | DPL3);
             set_cpl(s, 3);
-            s.debug = s.debug & !debug::STEP | if rflags & RFLAGS_TF != 0 { debug::STEP } else { 0 };
+            s.debug = s.debug & !debug::STEP
+                | if rflags & RFLAGS_TF != 0 {
+                    debug::STEP
+                } else {
+                    0
+                };
             return Ok(Some(rip));
         }
         system::SYSENTER => {
@@ -163,7 +182,11 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 if !paging::canonical(v) {
                     return Err(GP0);
                 }
-                *if fs { &mut s.cpu.fs_base } else { &mut s.cpu.gs_base } = v;
+                *if fs {
+                    &mut s.cpu.fs_base
+                } else {
+                    &mut s.cpu.gs_base
+                } = v;
             }
         }
         system::LAR..=system::VERW => segments::inspect(s, i)?,

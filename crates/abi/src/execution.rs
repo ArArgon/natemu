@@ -32,7 +32,11 @@ pub const fn vcpu_sgi(v: usize) -> u64 {
     KICK_SGI << 24 | ((v as u64 >> 4) << 16) | (1 << (v % 16))
 }
 pub const fn vcpu_mask(count: u64) -> u64 {
-    if count == 0 { 0 } else { u64::MAX >> (64 - count) }
+    if count == 0 {
+        0
+    } else {
+        u64::MAX >> (64 - count)
+    }
 }
 /// A precise stop by IRQ-triggered unlinking: the resident's IRQ handler (a doorbell: a host SPI or a peer's SGI) stops a
 /// vCPU interrupted in the dispatcher, L1 or at a block's first word at once; interrupted inside a block, it patches
@@ -112,11 +116,20 @@ pub const FRAME_VA: u64 = PRIVATE + FRAME_OFFSET as u64;
 /// would be canonical, with LAM_SUP it would alias a canonical kernel address (neither is advertised).
 pub const GUEST_STATE_VA: u64 = 0xffff_4000_0000_1000;
 /// The alias's level-1, level-2 and leaf tables (window pages after the guest-RAM alias's level-2 tables).
-const GUEST_STATE_TABLES_START: usize = (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES - 3 * 4096;
-pub const GUEST_STATE_TABLES: [usize; 3] = [GUEST_STATE_TABLES_START, GUEST_STATE_TABLES_START + 4096, GUEST_STATE_TABLES_START + 8192];
+const GUEST_STATE_TABLES_START: usize =
+    (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES - 3 * 4096;
+pub const GUEST_STATE_TABLES: [usize; 3] = [
+    GUEST_STATE_TABLES_START,
+    GUEST_STATE_TABLES_START + 4096,
+    GUEST_STATE_TABLES_START + 8192,
+];
 /// The alias's top-level slot (512 GiB, 2^27 pages, one upper-root entry): every address walks only the owner's tables.
-pub const GUEST_STATE_SLOT: core::ops::Range<u64> = (GUEST_STATE_VA & !((1 << 39) - 1))..(GUEST_STATE_VA & !((1 << 39) - 1)) + (1 << 39);
-const _: () = assert!(GUEST_STATE_SLOT.start >= 0xffff_0000_0000_0000 && GUEST_STATE_SLOT.end <= crate::shadow::HIGH_BASE);
+pub const GUEST_STATE_SLOT: core::ops::Range<u64> =
+    (GUEST_STATE_VA & !((1 << 39) - 1))..(GUEST_STATE_VA & !((1 << 39) - 1)) + (1 << 39);
+const _: () = assert!(
+    GUEST_STATE_SLOT.start >= 0xffff_0000_0000_0000
+        && GUEST_STATE_SLOT.end <= crate::shadow::HIGH_BASE
+);
 /// A complete aligned frame page inside the reserved noncanonical slot.
 pub const fn guest_state_alias_valid(va: u64) -> bool {
     va >= GUEST_STATE_SLOT.start && va < GUEST_STATE_SLOT.end && va & 4095 == 0
@@ -134,12 +147,17 @@ pub const STACK_BYTES: usize = 0x8000;
 /// `Backing`).
 pub const GUEST_RAM_VA: u64 = PRIVATE + (2 << 30);
 /// Capacity follows the private page-table space below the resident stacks.
-pub const MAX_GUEST_RAM_BYTES: usize = MAX_GUEST_PHYS_BYTES - (HIGH_RAM_START - LOW_RAM_END) as usize;
+pub const MAX_GUEST_RAM_BYTES: usize =
+    MAX_GUEST_PHYS_BYTES - (HIGH_RAM_START - LOW_RAM_END) as usize;
 /// Keep the PC's device aperture below 4 GiB; additional RAM starts above it.
 pub const LOW_RAM_END: u64 = 3 << 30;
 pub const HIGH_RAM_START: u64 = 4 << 30;
 pub const fn ram_end(bytes: u64) -> u64 {
-    if bytes > LOW_RAM_END { bytes + HIGH_RAM_START - LOW_RAM_END } else { bytes }
+    if bytes > LOW_RAM_END {
+        bytes + HIGH_RAM_START - LOW_RAM_END
+    } else {
+        bytes
+    }
 }
 pub const PRIVATE_GIBS: usize = 1 + (GUEST_STATE_TABLES_START - RAM_TABLES_OFFSET) / 4096;
 pub const MAX_GUEST_PHYS_BYTES: usize = (PRIVATE_GIBS << 30) - (GUEST_RAM_VA - PRIVATE) as usize;
@@ -155,7 +173,8 @@ const RAM_TABLES_END: usize = RAM_TABLES_OFFSET + (PRIVATE_GIBS - 1) * 4096;
 pub const LEGACY_HOLE: core::ops::Range<u64> = 0xa_0000..0x10_0000;
 /// Whether a byte belongs to installed RAM rather than a PC address hole.
 pub const fn ram_contains(bytes: u64, gpa: u64) -> bool {
-    gpa < ram_end(bytes) && !(gpa >= LEGACY_HOLE.start && gpa < LEGACY_HOLE.end)
+    gpa < ram_end(bytes)
+        && !(gpa >= LEGACY_HOLE.start && gpa < LEGACY_HOLE.end)
         && !(gpa >= LOW_RAM_END && gpa < HIGH_RAM_START)
 }
 /// Installed guest RAM, excluding both PC holes, aliased from `va` (host or resident).
@@ -165,8 +184,13 @@ pub const fn ram_contains(bytes: u64, gpa: u64) -> bool {
 /// `bytes` >= 1 MiB. The two holes need no accessible backing.
 pub const unsafe fn guest_ram(bytes: u64, va: u64) -> crate::guest_memory::GuestRam {
     let (start, end) = (LEGACY_HOLE.start, LEGACY_HOLE.end);
-    let low = if bytes > LOW_RAM_END { LOW_RAM_END } else { bytes };
-    let ram = unsafe { crate::guest_memory::GuestRam::new(0, start, va).and(end, low - end, va + end) };
+    let low = if bytes > LOW_RAM_END {
+        LOW_RAM_END
+    } else {
+        bytes
+    };
+    let ram =
+        unsafe { crate::guest_memory::GuestRam::new(0, start, va).and(end, low - end, va + end) };
     if bytes > low {
         unsafe { ram.and(HIGH_RAM_START, bytes - low, va + HIGH_RAM_START) }
     } else {
@@ -178,7 +202,8 @@ pub const PRIVATE_BYTES: u64 = (PRIVATE_GIBS as u64) << 30;
 const _: () = assert!(MAX_GUEST_RAM_BYTES % (2 << 20) == 0 && MAX_GUEST_PAGES % 64 == 0);
 const _: () = assert!(FRAME_OFFSET + frame::BYTES <= RAM_TABLES_OFFSET);
 const _: () = assert!(RAM_TABLES_END <= GUEST_STATE_TABLES[0]);
-const _: () = assert!(GUEST_STATE_TABLES[2] + 4096 <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
+const _: () =
+    assert!(GUEST_STATE_TABLES[2] + 4096 <= (crate::STACK_TOP - PRIVATE) as usize - STACK_BYTES);
 
 /// The code cache (slice 2). Per vCPU: an executable code area with a writable
 /// alias, a metadata arena (block records and their access sites) and the lookup
@@ -319,7 +344,10 @@ pub mod cache {
     pub const MASK_PAGES_PER_WORD: usize = 64 / MASK_BITS;
     pub const MASK_BYTES: usize = super::MAX_GUEST_PAGES * MASK_BITS / 8;
     pub const fn mask_location(page: usize) -> (usize, u32) {
-        (page / MASK_PAGES_PER_WORD, (MASK_BITS * (page % MASK_PAGES_PER_WORD)) as u32)
+        (
+            page / MASK_PAGES_PER_WORD,
+            (MASK_BITS * (page % MASK_PAGES_PER_WORD)) as u32,
+        )
     }
     pub const fn mask_peers(word: u64, shift: u32) -> CpuMask {
         (word >> shift) as CpuMask
@@ -329,7 +357,8 @@ pub mod cache {
     /// One bit per physical 4 KiB page ever read as a guest page table, at any level. Residents
     /// publish before reading; the host inspects only inside a granted I/O window. Never cleared
     /// during this VM's lifetime: page reuse may cause extra invalidations, never missed ones.
-    pub const TABLE_PAGES: usize = (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(8);
+    pub const TABLE_PAGES: usize =
+        (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(8);
     pub const TABLE_PAGE_BYTES: usize = super::MAX_GUEST_PAGES.div_ceil(64) * 8;
     pub const RESETS: usize = 0x3000;
     /// Split locks (no-stop change, November 6): the owner of the split lock (vCPU + 1; 0: free), then the two
@@ -341,7 +370,8 @@ pub mod cache {
     /// Copy-first I/O rendezvous. Only the host coordinator publishes epochs; each resident acknowledges
     /// at a banked instruction boundary after completing a full memory barrier. Parked residents
     /// retain mappings but serve peer shadow-drop requests until release, then drain invalidations.
-    pub const IO_WINDOW: usize = (EVENTS + MAX_VCPUS * core::mem::size_of::<Events>()).next_multiple_of(64);
+    pub const IO_WINDOW: usize =
+        (EVENTS + MAX_VCPUS * core::mem::size_of::<Events>()).next_multiple_of(64);
     #[repr(C)]
     pub struct IoWindow {
         /// Monotonically increasing request (0 before the first window), serialized by the host.
@@ -364,7 +394,8 @@ pub mod cache {
 
     /// Private scheduling-test metadata in an existing unused gap. No production offsets change.
     pub mod io_test {
-        pub const BASE: usize = (super::IO_WINDOW + core::mem::size_of::<super::IoWindow>()).next_multiple_of(64);
+        pub const BASE: usize =
+            (super::IO_WINDOW + core::mem::size_of::<super::IoWindow>()).next_multiple_of(64);
         pub const STRIDE: usize = 64;
         pub const HOST: usize = super::MAX_VCPUS;
         pub const ARM: usize = 0;
@@ -635,11 +666,16 @@ pub mod cache {
         /// Link point `offset` (a native offset in the block, 0 = none) is the self-exit of the REP string instruction
         /// that ends the block (X2, [`Block::rep_exits`]).
         pub fn rep_exit(&self, offset: u64) -> bool {
-            self.links.iter().enumerate().any(|(k, p)| self.rep_exits >> k & 1 != 0 && p.offset != 0 && u64::from(p.offset) == offset)
+            self.links.iter().enumerate().any(|(k, p)| {
+                self.rep_exits >> k & 1 != 0 && p.offset != 0 && u64::from(p.offset) == offset
+            })
         }
         /// The block starts with a REP string instruction (X2): one of its self-exits goes to its own RIP.
         pub fn starts_with_rep(&self) -> bool {
-            self.links.iter().enumerate().any(|(k, p)| self.rep_exits >> k & 1 != 0 && p.offset != 0 && p.target == self.rip)
+            self.links
+                .iter()
+                .enumerate()
+                .any(|(k, p)| self.rep_exits >> k & 1 != 0 && p.offset != 0 && p.target == self.rip)
         }
     }
     /// A patched link point: the first word of link point `offset` of block `source` (block numbers) was `original`
@@ -707,7 +743,10 @@ pub mod cache {
     pub const HALTED_SEEN_SHIFT: u32 = 8;
 
     // The window's 2 MiB (its pages and the shadow pool) precede the areas in a vCPU's block.
-    const _: () = assert!(crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= LOOKUP_OFFSET && LOOKUP_OFFSET % BLOCK == 0);
+    const _: () = assert!(
+        crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= LOOKUP_OFFSET
+            && LOOKUP_OFFSET % BLOCK == 0
+    );
     // Every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned, below the guest RAM alias (its own GiBs).
     const _: () = assert!(crate::execution::GUEST_RAM_VA == PRIVATE + (2 << 30));
     const _: () = assert!(CODE_VA + CODE_BYTES_MAX as u64 <= CODE_WRITE_VA);
@@ -717,27 +756,54 @@ pub mod cache {
     const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= super::GUEST_RAM_VA);
     const _: () = assert!(HEAD_BYTES + CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
     const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
-    const _: () = assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
+    const _: () =
+        assert!((CODE_VA | CODE_WRITE_VA | META_VA | LOOKUP_VA | GLOBAL_VA) % BLOCK as u64 == 0);
     const _: () = assert!(CODE_OFFSET % BLOCK == 0 && META_BYTES % BLOCK == 0);
-    const _: () = assert!(core::mem::size_of::<Control>() <= L1_OWNERS && L1_LISTS + 4 * L1_ENTRIES * L1_TABLES <= L2 && L2 + L2_ENTRIES * 16 <= INDEX);
+    const _: () = assert!(
+        core::mem::size_of::<Control>() <= L1_OWNERS
+            && L1_LISTS + 4 * L1_ENTRIES * L1_TABLES <= L2
+            && L2 + L2_ENTRIES * 16 <= INDEX
+    );
     const _: () = assert!(MAX_BLOCKS < L1_LISTED as usize);
-    const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= HINTS && HINTS + 4 * HINT_ENTRIES <= LOOKUP_BYTES);
+    const _: () = assert!(
+        WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS
+            && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS
+            && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= HINTS
+            && HINTS + 4 * HINT_ENTRIES <= LOOKUP_BYTES
+    );
     // The dispatcher's form: its `and` takes the mask as a logical immediate, its `adrp` names a table by its page, and
     // each entry's `b` to the miss reaches ±128 MiB.
     const _: () = assert!(L1_MASK == (1 << L1_BITS) - 1 && L1_BITS <= 16 && L1_ENTRY_BYTES == 32);
-    const _: () = assert!(L1_CODE % 4096 == 0 && L1_TABLE_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
+    const _: () =
+        assert!(L1_CODE % 4096 == 0 && L1_TABLE_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
-    const _: () = assert!(STEP_RECORD + STEP_RECORD_BYTES <= CODE_SUMMARY && STEP_RECORD % core::mem::align_of::<Block>() == 0);
+    const _: () = assert!(
+        STEP_RECORD + STEP_RECORD_BYTES <= CODE_SUMMARY
+            && STEP_RECORD % core::mem::align_of::<Block>() == 0
+    );
     // The largest step record: its Block and a sites table, which lies inside one staged object (admission).
-    const _: () = assert!(core::mem::size_of::<Block>() + crate::execution::STAGING_BYTES <= STEP_RECORD_BYTES);
-    const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= LOOKUP_BYTES && SUMMARY_BYTES * 64 == MASK_BYTES);
+    const _: () = assert!(
+        core::mem::size_of::<Block>() + crate::execution::STAGING_BYTES <= STEP_RECORD_BYTES
+    );
+    const _: () = assert!(
+        WRITABLE_SUMMARY + SUMMARY_BYTES <= LOOKUP_BYTES && SUMMARY_BYTES * 64 == MASK_BYTES
+    );
     const _: () = assert!(MAX_VCPUS <= 64 && 64 % MASK_BITS == 0);
-    const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= CODE_PAGES && CODE_PAGES % 8 == 0);
-    const _: () = assert!(IO_WINDOW + core::mem::size_of::<IoWindow>() <= CODE_PAGES && IO_WINDOW % 64 == 0);
-    const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= TABLE_PAGES && MASK_BYTES % 8 == 0);
+    const _: () = assert!(
+        EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= CODE_PAGES && CODE_PAGES % 8 == 0
+    );
+    const _: () =
+        assert!(IO_WINDOW + core::mem::size_of::<IoWindow>() <= CODE_PAGES && IO_WINDOW % 64 == 0);
+    const _: () = assert!(
+        RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= TABLE_PAGES && MASK_BYTES % 8 == 0
+    );
     const _: () = assert!(TABLE_PAGES % 8 == 0 && TABLE_PAGES + TABLE_PAGE_BYTES <= GLOBAL_BYTES);
-    const _: () = assert!(RESETS + MAX_VCPUS * 8 <= SPLIT && SPLIT + (3 + MAX_VCPUS) * 8 <= EVENTS && EVENTS % 64 == 0);
+    const _: () = assert!(
+        RESETS + MAX_VCPUS * 8 <= SPLIT
+            && SPLIT + (3 + MAX_VCPUS) * 8 <= EVENTS
+            && EVENTS % 64 == 0
+    );
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= GLOBAL_BYTES);
 }
 
@@ -746,7 +812,12 @@ pub const BACKING_BYTES: usize = cache::CODE_OFFSET;
 // Every vCPU's window starts below IPA + 1 GiB: `_start` runs with the MMU just enabled through the host's temporary
 // identity alias, one 1 GiB block at [IPA, IPA + 1 GiB) (host `memory::private_space`). Perf chunk 6: a 256 MiB arena put
 // vCPU 3's window past it, and that vCPU faulted at its first instruction (an AP that never comes up at N = 4).
-const _: () = assert!(crate::IPA + ((cache::MAX_VCPUS - 1) * (BACKING_BYTES + cache::CODE_BYTES_MAX) + 2 * crate::RAM_SIZE) as u64 <= 1 << 39);
+const _: () = assert!(
+    crate::IPA
+        + ((cache::MAX_VCPUS - 1) * (BACKING_BYTES + cache::CODE_BYTES_MAX) + 2 * crate::RAM_SIZE)
+            as u64
+        <= 1 << 39
+);
 
 /// FEX `CpuStateFrame` fields admitted code may access (pinned FEX build).
 pub mod frame {
@@ -835,15 +906,39 @@ pub mod frame {
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's (perf chunk 25: its entry value readable,
     /// [`MXCSR`]). Every other x28 access is refused.
     pub const GUEST_STATE: [(u32, u32); 18] = [
-        (TSC_OFFSET, 8), (AVX_HIGH, 256), (MXCSR, 4), (GS_BASE, 8), (FS_BASE, 8), (FLAGS + 8, 3), (FLAGS + 12, 1), (FLAGS + 14, 1), (FLAGS + 16, 6), (EVENT_PENDING, 1),
+        (TSC_OFFSET, 8),
+        (AVX_HIGH, 256),
+        (MXCSR, 4),
+        (GS_BASE, 8),
+        (FS_BASE, 8),
+        (FLAGS + 8, 3),
+        (FLAGS + 12, 1),
+        (FLAGS + 14, 1),
+        (FLAGS + 16, 6),
+        (EVENT_PENDING, 1),
         (FAST_STRINGS, 1),
-        (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FCW, 8),
+        (X87_IE, 1),
+        (SIMD_FLAGS, 2),
+        (X87_PE, 2),
+        (X87_C0, 4),
+        (X87_C3, 1),
+        (X87_MM, 128),
+        (X87_FCW, 8),
     ];
     /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IOPL, NT, AC, VIF,
     /// VIP and ID are the resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions); IF too but in a CPL-0
     /// block's CLI and STI ([`IF`]).
-    pub const GUEST_STATE_WRITABLE: [(u32, u32); 9] =
-        [(AVX_HIGH, 256), (DF, 1), (X87_IE, 1), (SIMD_FLAGS, 2), (X87_PE, 2), (X87_C0, 4), (X87_C3, 1), (X87_MM, 128), (X87_FTW, 6)];
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 9] = [
+        (AVX_HIGH, 256),
+        (DF, 1),
+        (X87_IE, 1),
+        (SIMD_FLAGS, 2),
+        (X87_PE, 2),
+        (X87_C0, 4),
+        (X87_C3, 1),
+        (X87_MM, 128),
+        (X87_FTW, 6),
+    ];
     pub const BYTES: usize = 4096;
     /// RFLAGS bits held in the flag bytes.
     const BITS: [u32; 10] = [8, 9, 10, 12, 14, 16, 17, 18, 19, 20];
@@ -853,12 +948,21 @@ pub mod frame {
         let mut out = [(0, 0); 11];
         for (slot, &b) in out.iter_mut().zip(BITS.iter().chain(&[21])) {
             let bit = (rflags >> b & 1) as u8;
-            *slot = (FLAGS + b, match b {
-                10 => if bit == 1 { 0xff } else { 1 },
-                12 => (rflags >> 12 & 3) as u8,
-                16 | 17 => 0,
-                _ => bit,
-            });
+            *slot = (
+                FLAGS + b,
+                match b {
+                    10 => {
+                        if bit == 1 {
+                            0xff
+                        } else {
+                            1
+                        }
+                    }
+                    12 => (rflags >> 12 & 3) as u8,
+                    16 | 17 => 0,
+                    _ => bit,
+                },
+            );
         }
         out
     }
@@ -882,20 +986,30 @@ pub struct LinkPoint {
     pub target: u64,
 }
 impl LinkPoint {
-    pub const NONE: Self = Self { offset: 0, word: 0, target: 0 };
+    pub const NONE: Self = Self {
+        offset: 0,
+        word: 0,
+        target: 0,
+    };
 }
 /// The value of a logical-immediate word's bitmask (DecodeBitMasks), `None` if reserved.
 pub fn bitmask(w: u32) -> Option<u64> {
     let (n, immr, imms) = (w >> 22 & 1, w >> 16 & 63, w >> 10 & 63);
     // N = 0 with imms = 0b111111 has no element size (reserved): no set bit, so `checked_sub` (a debug build overflowed).
     let len = 31u32.checked_sub((n << 6 | (!imms & 63)).leading_zeros())?;
-    let esize = 1u32.checked_shl(len).filter(|&e| e >= 2 && (w >> 31 == 1 || e <= 32))?;
+    let esize = 1u32
+        .checked_shl(len)
+        .filter(|&e| e >= 2 && (w >> 31 == 1 || e <= 32))?;
     let (s, r) = (imms & (esize - 1), immr & (esize - 1));
     if s == esize - 1 {
         return None;
     }
     let ones = (1u64 << (s + 1)) - 1;
-    let emask = if esize == 64 { u64::MAX } else { (1 << esize) - 1 };
+    let emask = if esize == 64 {
+        u64::MAX
+    } else {
+        (1 << esize) - 1
+    };
     let elem = (ones >> r | ones << (esize - r) % esize) & emask;
     Some((0..64 / esize).fold(0, |v, i| v | elem << (i * esize)))
 }
@@ -914,7 +1028,10 @@ pub fn move_value(words: &[u32], reg: u32) -> Option<(usize, u64)> {
         0x3200_0000 if w >> 5 & 31 == 31 => bitmask(w)? & mask, // orr xD, xzr, #bitmask
         _ => return None,
     };
-    let n = 1 + words[1..].iter().take_while(|&&k| k & 0xff80_001f == (0x7280_0000 | sf << 31 | reg)).count();
+    let n = 1 + words[1..]
+        .iter()
+        .take_while(|&&k| k & 0xff80_001f == (0x7280_0000 | sf << 31 | reg))
+        .count();
     for &k in &words[1..n] {
         let (imm, sh) = part(k);
         value = (value & !(0xffff << sh) | imm << sh) & mask;
@@ -928,7 +1045,11 @@ pub fn canonical(a: u64) -> bool {
 }
 /// The logical-immediate fields (N, immr, imms) of `v` as a `width`-bit bitmask, if it is one.
 pub fn logical_immediate(v: u64, width: u32) -> Option<(u32, u32, u32)> {
-    let mask = if width == 64 { u64::MAX } else { (1 << width) - 1 };
+    let mask = if width == 64 {
+        u64::MAX
+    } else {
+        (1 << width) - 1
+    };
     if v & !mask != 0 || v == 0 || v == mask {
         return None;
     }
@@ -939,7 +1060,11 @@ pub fn logical_immediate(v: u64, width: u32) -> Option<(u32, u32, u32)> {
     let emask = if e == 64 { u64::MAX } else { (1 << e) - 1 };
     let elem = v & emask;
     let ones = elem.count_ones();
-    let run = if ones == 64 { u64::MAX } else { (1 << ones) - 1 };
+    let run = if ones == 64 {
+        u64::MAX
+    } else {
+        (1 << ones) - 1
+    };
     // elem = ROR(run, r): find r by rotating elem left until it is the run at the bottom.
     let r = (0..e).find(|&r| (elem << r | elem >> ((e - r) % e)) & emask == run)?;
     let n = u32::from(e == 64);
@@ -948,7 +1073,9 @@ pub fn logical_immediate(v: u64, width: u32) -> Option<(u32, u32, u32)> {
 /// FEX's `Arm64Emitter::LoadConstant(i64, reg, c, NOPAD)` (series48-lean): the words that build `c` in `reg`, and how many.
 pub fn load_constant(c: u64, reg: u8) -> ([u32; 4], usize) {
     let rd = u32::from(reg);
-    let mov = |op: u32, sf: u32, imm: u64, hw: u32| op | sf << 31 | hw << 21 | ((imm & 0xffff) as u32) << 5 | rd;
+    let mov = |op: u32, sf: u32, imm: u64, hw: u32| {
+        op | sf << 31 | hw << 21 | ((imm & 0xffff) as u32) << 5 | rd
+    };
     const MOVN: u32 = 0x1280_0000;
     const MOVZ: u32 = 0x5280_0000;
     const MOVK: u32 = 0x7280_0000;
@@ -962,7 +1089,15 @@ pub fn load_constant(c: u64, reg: u8) -> ([u32; 4], usize) {
     let part = |i: u32| c >> (16 * i) & 0xffff;
     if (0..segments).filter(|&i| part(i) != 0).count() > 1 {
         if let Some((n, immr, imms)) = logical_immediate(c, if sf == 1 { 64 } else { 32 }) {
-            return ([0x3200_0000 | sf << 31 | n << 22 | immr << 16 | imms << 10 | 31 << 5 | rd, 0, 0, 0], 1);
+            return (
+                [
+                    0x3200_0000 | sf << 31 | n << 22 | immr << 16 | imms << 10 | 31 << 5 | rd,
+                    0,
+                    0,
+                    0,
+                ],
+                1,
+            );
         }
     }
     if sf == 1 && !c >> 32 == 0 {
@@ -1011,7 +1146,11 @@ pub fn relocate_move(words: &[u32], reg: u32, d: u64) -> Option<([u32; 4], usize
 pub fn link_point(word: impl Fn(u64) -> u32, code_size: u32, p: &LinkPoint) -> bool {
     let at = u64::from(p.offset);
     let svc_link = 0xd400_0001 | u32::from(svc::LINK) << 5;
-    if at % 4 != 0 || at < u64::from(ENTRY_OFFSET) || at + 8 > u64::from(code_size) || word(at) != p.word {
+    if at % 4 != 0
+        || at < u64::from(ENTRY_OFFSET)
+        || at + 8 > u64::from(code_size)
+        || word(at) != p.word
+    {
         return false;
     }
     let mut words = [0u32; 5];
@@ -1030,10 +1169,14 @@ pub const RELOC_MOVE: u32 = 1 << 5;
 /// is in (named symbol, dispatch branch); `None` for one that cannot be packed (it is then no template).
 pub fn pack_reloc(r: &crate::code_object::Reloc, code_size: u32) -> Option<Option<u32>> {
     use crate::code_object as o;
-    let fits = |bytes: u32| r.offset % 4 == 0 && r.offset.checked_add(bytes).is_some_and(|e| e <= code_size);
+    let fits = |bytes: u32| {
+        r.offset % 4 == 0 && r.offset.checked_add(bytes).is_some_and(|e| e <= code_size)
+    };
     match r.kind {
         o::RELOC_GUEST_RIP_LITERAL if fits(8) => Some(Some(r.offset / 4 << 6)),
-        o::RELOC_GUEST_RIP_MOVE if fits(4) && r.register < 31 => Some(Some(r.offset / 4 << 6 | RELOC_MOVE | u32::from(r.register))),
+        o::RELOC_GUEST_RIP_MOVE if fits(4) && r.register < 31 => {
+            Some(Some(r.offset / 4 << 6 | RELOC_MOVE | u32::from(r.register)))
+        }
         o::RELOC_NAMED_SYMBOL_LITERAL | o::RELOC_DISPATCH_BRANCH => Some(None),
         _ => None,
     }
@@ -1069,13 +1212,25 @@ pub mod refusal {
 /// re-encoded in as many 64-bit words ([`relocate_move`]), each link point still a move of its new target into x0 and
 /// `svc #LINK` ([`link_point`]). Link points are first restored to their admitted words (a copy may be linked). `Err`:
 /// the [`refusal`] kind (nothing else may be assumed of `code` then).
-pub fn relocate_code(code: &mut [u8], relocs: &[u32], links: &mut [LinkPoint; MAX_LINK_POINTS], from: u64, to: u64, guest_bytes: u32) -> Result<(), usize> {
+pub fn relocate_code(
+    code: &mut [u8],
+    relocs: &[u32],
+    links: &mut [LinkPoint; MAX_LINK_POINTS],
+    from: u64,
+    to: u64,
+    guest_bytes: u32,
+) -> Result<(), usize> {
     let d = to.wrapping_sub(from);
-    if (from ^ to) & (1 << 63 | 0xfff) != 0 || !canonical(to) || !to.checked_add(guest_bytes.into()).is_some_and(canonical) {
+    if (from ^ to) & (1 << 63 | 0xfff) != 0
+        || !canonical(to)
+        || !to.checked_add(guest_bytes.into()).is_some_and(canonical)
+    {
         return Err(refusal::PLACE);
     }
     let size = code.len();
-    let word = |code: &[u8], at: usize| u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+    let word = |code: &[u8], at: usize| {
+        u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+    };
     for p in links.iter().filter(|p| p.offset != 0) {
         let at = p.offset as usize;
         if at % 4 != 0 || at + 4 > size {
@@ -1110,12 +1265,18 @@ pub fn relocate_code(code: &mut [u8], relocs: &[u32], links: &mut [LinkPoint; MA
             *w = word(code, at + 4 * k);
         }
         let reg = r & 31;
-        let Some((new, k, _)) = relocate_move(&words[..n], reg, d) else { return Err(refusal::MOVE) };
+        let Some((new, k, _)) = relocate_move(&words[..n], reg, d) else {
+            return Err(refusal::MOVE);
+        };
         free = at + 4 * k;
         for (j, w) in new[..k].iter().enumerate() {
             code[at + 4 * j..at + 4 * j + 4].copy_from_slice(&w.to_le_bytes());
         }
-        for (i, p) in links.iter_mut().enumerate().filter(|(_, p)| p.offset != 0 && p.offset as usize == at) {
+        for (i, p) in links
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, p)| p.offset != 0 && p.offset as usize == at)
+        {
             if reg != 0 || moved[i] {
                 return Err(refusal::LINK);
             }
@@ -1137,7 +1298,9 @@ pub const DISPATCH_PLACEHOLDER: u32 = 0x1400_0000;
 pub const MAX_LINK_POINTS: usize = 4;
 /// The static-register map (FEX `x64::SRA`) admission pins for every block: native registers of RAX..R15, then PF
 /// and AF. Guest state is in these registers at every block entry and exit.
-pub const SRA: [u8; 18] = [4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29, 26, 27];
+pub const SRA: [u8; 18] = [
+    4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29, 26, 27,
+];
 /// The native frame a block is entered with (`Shared::initial`) is built in place: at every entry the resident writes
 /// the static registers ([`SRA`]: GPRs, PF, AF), x28, SP, v16..v31, FPCR and FPSR, and nothing writes the rest, which
 /// the host zeroes and the resident's start zeroes again. Whether that rest is zero (the host checks it at every stop).
@@ -1244,7 +1407,11 @@ pub const FPSR_PRE: u64 = 1 | 2 | 0x80;
 /// pre-computation flags only (post-computation conditions are not looked for), else all of them, masked ones included.
 pub const fn simd_fault_flags(raised: u64, mxcsr: u64) -> u64 {
     let pre = raised & FPSR_PRE;
-    if pre & fpsr_bits(simd_unmasked(mxcsr)) != 0 { pre } else { raised & (FPSR_PRE | 0x1c) }
+    if pre & fpsr_bits(simd_unmasked(mxcsr)) != 0 {
+        pre
+    } else {
+        raised & (FPSR_PRE | 0x1c)
+    }
 }
 /// I5c: what an x87 instruction whose check found an unmasked exception that leaves its operands unaltered sets in FSW, from
 /// its check word `w` (its FPSR flags in 7:0, then its stack fault (8), stack overflow (9), invalid operand (10: FIST's NaN or
@@ -1267,7 +1434,11 @@ pub const fn x87_fault_flags(w: u64, fcw: u64) -> (u64, Option<bool>) {
 /// FSW.ES (error summary) and B (busy): set while an exception flag (FSW 5:0) whose FCW mask is clear is set (SDM Vol.1
 /// 8.1.3.1, 8.1.3.3: B reflects ES).
 pub const fn fsw_summary(fsw: u64, fcw: u64) -> u64 {
-    if fsw & x87_unmasked(fcw) != 0 { 1 << 7 | 1 << 15 } else { 0 }
+    if fsw & x87_unmasked(fcw) != 0 {
+        1 << 7 | 1 << 15
+    } else {
+        0
+    }
 }
 /// MXCSR exception flags for the FPSR cumulative flags generated code raised under `mxcsr`: IOC -> IE, DZC -> ZE, OFC -> OE,
 /// UFC -> UE, IXC -> PE, and IDC -> DE unless DAZ. With FPCR.AH = 1 and FIZ = 0 the M4 sets IDC for a denormal input it
@@ -1275,8 +1446,17 @@ pub const fn fsw_summary(fsw: u64, fcw: u64) -> u64 {
 /// integer conversions, FRINT* or the reciprocal estimates; the I5a review's measurements, `tools/run_i5a_de.py`). Under DAZ
 /// (FIZ = 1) IDC marks a flushed input, where x86 sets no DE.
 pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64) -> u64 {
-    let de = if mxcsr & MXCSR_DAZ == 0 { fpsr >> 7 & 1 } else { 0 };
-    (fpsr & 1) | de << 1 | (fpsr >> 1 & 1) << 2 | (fpsr >> 2 & 1) << 3 | (fpsr >> 3 & 1) << 4 | (fpsr >> 4 & 1) << 5
+    let de = if mxcsr & MXCSR_DAZ == 0 {
+        fpsr >> 7 & 1
+    } else {
+        0
+    };
+    (fpsr & 1)
+        | de << 1
+        | (fpsr >> 1 & 1) << 2
+        | (fpsr >> 2 & 1) << 3
+        | (fpsr >> 3 & 1) << 4
+        | (fpsr >> 4 & 1) << 5
 }
 /// MXCSR.DAZ (denormal source operands are zeros: no DE).
 pub const MXCSR_DAZ: u64 = 1 << 6;
@@ -1319,7 +1499,12 @@ pub const ATTR_P: u16 = 0x80;
 pub const ATTR_L: u16 = 1 << 13;
 pub const ATTR_D: u16 = 1 << 14;
 impl Segment {
-    pub const NULL: Self = Self { selector: 0, attributes: 0, limit: 0, base: 0 };
+    pub const NULL: Self = Self {
+        selector: 0,
+        attributes: 0,
+        limit: 0,
+        base: 0,
+    };
     /// `selector` loaded from the 8-byte descriptor `raw` (SDM Vol.3 3.4.5): its attributes, its limit scaled by G, and
     /// the 32-bit base (the low half of a 16-byte system descriptor's).
     pub const fn loaded(selector: u16, raw: u64) -> Self {
@@ -1338,19 +1523,38 @@ impl Segment {
 /// null (its IRETQ nulls DS/ES). Flat descriptors, accessed bit set.
 pub const fn flat_segments(cpl: u64) -> [Segment; 6] {
     let (code, data) = if cpl == 3 {
-        (Segment::loaded(0x23, 0x00af_fb00_0000_ffff), Segment::loaded(0x1b, 0x00cf_f300_0000_ffff))
+        (
+            Segment::loaded(0x23, 0x00af_fb00_0000_ffff),
+            Segment::loaded(0x1b, 0x00cf_f300_0000_ffff),
+        )
     } else {
-        (Segment::loaded(0x08, 0x00af_9b00_0000_ffff), Segment::loaded(0x10, 0x00cf_9300_0000_ffff))
+        (
+            Segment::loaded(0x08, 0x00af_9b00_0000_ffff),
+            Segment::loaded(0x10, 0x00cf_9300_0000_ffff),
+        )
     };
     let other = if cpl == 3 { Segment::NULL } else { data };
     [other, code, data, other, Segment::NULL, Segment::NULL]
 }
 /// GDTR and IDTR at reset (SDM Vol.3 Table 10-1: base 0, limit FFFFH).
-pub const TABLE_RESET: Table = Table { base: 0, limit: 0xffff };
+pub const TABLE_RESET: Table = Table {
+    base: 0,
+    limit: 0xffff,
+};
 /// LDTR and TR at reset (SDM Vol.3 Table 10-1: selector 0, base 0, limit FFFFH, present; an LDT and a busy TSS). The
 /// QEMU stub never loads LDTR, so a TI = 1 selector reaches this LDT there too.
-pub const LDTR_RESET: Segment = Segment { selector: 0, attributes: 0x82, limit: 0xffff, base: 0 };
-pub const TR_RESET: Segment = Segment { selector: 0, attributes: 0x8b, limit: 0xffff, base: 0 };
+pub const LDTR_RESET: Segment = Segment {
+    selector: 0,
+    attributes: 0x82,
+    limit: 0xffff,
+    base: 0,
+};
+pub const TR_RESET: Segment = Segment {
+    selector: 0,
+    attributes: 0x8b,
+    limit: 0xffff,
+    base: 0,
+};
 
 pub const CR0_PE: u64 = 1;
 /// MP, EM, TS (SDM Vol.3 2.5, Table 2-2): recorded; they gate x87/MMX/SSE (#NM, #UD), which no admitted form is yet (I5, I6).
@@ -1415,10 +1619,14 @@ pub fn dr_range(dr: &[u64; 6], n: usize) -> (u64, u64) {
 /// access inside the breakpoint's range, R/W 01 for a write, 11 for a read or a write (SDM Vol.3 18.2.4, 18.2.5). LE and
 /// GE are ignored (breakpoints are exact on these processors).
 pub fn data_hits(dr: &[u64; 6], va: u64, width: u64, write: bool) -> u64 {
-    (0..4).filter(|&n| dr7_enabled(dr[5], n) && matches!((dr7_rw(dr[5], n), write), (1, true) | (3, _))).fold(0, |m, n| {
-        let (base, len) = dr_range(dr, n);
-        m | u64::from(base.wrapping_sub(va) < width || va.wrapping_sub(base) < len) << n
-    })
+    (0..4)
+        .filter(|&n| {
+            dr7_enabled(dr[5], n) && matches!((dr7_rw(dr[5], n), write), (1, true) | (3, _))
+        })
+        .fold(0, |m, n| {
+            let (base, len) = dr_range(dr, n);
+            m | u64::from(base.wrapping_sub(va) < width || va.wrapping_sub(base) < len) << n
+        })
 }
 /// [`Cpu::dr`] at reset (SDM Vol.3 Table 10-1: DR0..DR3 0, DR6 FFFF0FF0H, DR7 400H).
 pub const DR_RESET: [u64; 6] = [0, 0, 0, 0, DR6_FIXED, DR7_FIXED];
@@ -1443,13 +1651,17 @@ impl Cpu {
             && self.efer & (EFER_LME | EFER_LMA) == EFER_LME | EFER_LMA;
         // 64-bit mode: CS.L = 1, CS.D = 0 (compatibility mode is not built, owner decision 3).
         let bits64 = self.seg[SREG_CS].attributes & (ATTR_L | ATTR_D) == ATTR_L;
-        (long && bits64 && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0).then_some(Control {
-            cr3: self.cr3 & paging::PA_MASK,
-            cpl: self.cpl,
-            wp: u64::from(self.cr0 & CR0_WP != 0),
-            nxe: u64::from(self.efer & EFER_NXE != 0),
-            smep: u64::from(self.cr4 & CR4_SMEP != 0),
-        })
+        (long
+            && bits64
+            && matches!(self.cpl, 0 | 3)
+            && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0)
+            .then_some(Control {
+                cr3: self.cr3 & paging::PA_MASK,
+                cpl: self.cpl,
+                wp: u64::from(self.cr0 & CR0_WP != 0),
+                nxe: u64::from(self.efer & EFER_NXE != 0),
+                smep: u64::from(self.cr4 & CR4_SMEP != 0),
+            })
     }
     /// x86 alignment checking is on (SDM Vol.3 7.15 #AC: CR0.AM, RFLAGS.AC and CPL 3; X2).
     pub fn alignment_check(&self) -> bool {
@@ -1470,7 +1682,9 @@ impl Cpu {
     /// (Vol.3 18.2.5); this matches the address exactly, as pinned QEMU does. The host ends every block before each
     /// one, so each is the first instruction of whatever runs it, and the resident checks it there.
     pub fn code_breakpoints(&self) -> impl Iterator<Item = u64> + '_ {
-        (0..4).filter(|&n| dr7_enabled(self.dr[5], n) && dr7_rw(self.dr[5], n) == 0).map(|n| self.dr[n])
+        (0..4)
+            .filter(|&n| dr7_enabled(self.dr[5], n) && dr7_rw(self.dr[5], n) == 0)
+            .map(|n| self.dr[n])
     }
     /// What code at a RIP is compiled and cached under besides the RIP and its source bytes (K1: not CR3; a block's
     /// guest-physical source pages are checked against the current tables instead): a word of the CPL, the code mode
@@ -1856,7 +2070,19 @@ pub mod system {
     pub const ADDRESS32: u32 = 2;
     impl super::System {
         pub const NONE: Self = Self {
-            kind: 0, length: 0, lock: 0, cr: 0, reg: 0, base: NO_REG, index: NO_REG, scale: 0, disp: 0, memory: 0, size: 0, segment: 0, prefixes: 0,
+            kind: 0,
+            length: 0,
+            lock: 0,
+            cr: 0,
+            reg: 0,
+            base: NO_REG,
+            index: NO_REG,
+            scale: 0,
+            disp: 0,
+            memory: 0,
+            size: 0,
+            segment: 0,
+            prefixes: 0,
         };
         /// Field ranges the resident relies on (it checks every reply).
         pub fn well_formed(&self) -> bool {
@@ -1866,35 +2092,80 @@ pub mod system {
                 && self.scale <= 3
                 && (self.base != RIP || self.index == NO_REG)
                 && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS);
-            let rm = if self.memory == 1 { address } else { self.memory == 0 && reg(self.reg) && self.segment == 0 };
-            ((1..=15).contains(&self.length) || (self.kind == NOP_RUN && (1..=MAX_NOP_RUN).contains(&self.length)))
+            let rm = if self.memory == 1 {
+                address
+            } else {
+                self.memory == 0 && reg(self.reg) && self.segment == 0
+            };
+            ((1..=15).contains(&self.length)
+                || (self.kind == NOP_RUN && (1..=MAX_NOP_RUN).contains(&self.length)))
                 && self.lock <= 1
-                && (self.prefixes == 0 || matches!(self.kind, INS | OUTS) || (self.memory == 1 && self.prefixes == ADDRESS32))
+                && (self.prefixes == 0
+                    || matches!(self.kind, INS | OUTS)
+                    || (self.memory == 1 && self.prefixes == ADDRESS32))
                 && match self.kind {
-                    MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => reg(self.cr) && reg(self.reg),
+                    MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => {
+                        reg(self.cr) && reg(self.reg)
+                    }
                     INVLPG => address && self.segment == 0,
                     RDMSR | WRMSR | CPUID | RDTSC | RDTSCP | RDPMC => true,
                     SET_CPL => matches!(self.cr, 0 | 3),
                     LGDT..=SIDT => self.memory == 1 && address,
                     SLDT..=MOV_FROM_SREG => rm && self.cr < 8 && matches!(self.size, 2 | 4 | 8),
                     LLDT..=MOV_TO_SREG => rm && self.cr < 8,
-                    JMP_FAR..=CALL_FAR => self.memory == 1 && address && matches!(self.size, 2 | 4 | 8),
-                    RET_FAR..=IRET => matches!(self.size, 2 | 4 | 8) && (self.kind == IRET || (0..=0xffff).contains(&self.disp)),
+                    JMP_FAR..=CALL_FAR => {
+                        self.memory == 1 && address && matches!(self.size, 2 | 4 | 8)
+                    }
+                    RET_FAR..=IRET => {
+                        matches!(self.size, 2 | 4 | 8)
+                            && (self.kind == IRET || (0..=0xffff).contains(&self.disp))
+                    }
                     LOCK_UD => self.lock == 1,
                     LDMXCSR | STMXCSR | VLDMXCSR | VSTMXCSR => self.memory == 1 && address,
                     SSE_GATED | AVX_GATED | MMX_GATED => true,
                     GATHER => {
                         let mask = self.cr & 15;
-                        self.memory == 1 && address && self.base != RIP && reg(self.reg) && reg(self.index) && self.cr < 64
-                            && matches!(self.size, 4 | 8) && self.reg != mask && self.reg != self.index && mask != self.index
+                        self.memory == 1
+                            && address
+                            && self.base != RIP
+                            && reg(self.reg)
+                            && reg(self.index)
+                            && self.cr < 64
+                            && matches!(self.size, 4 | 8)
+                            && self.reg != mask
+                            && self.reg != self.index
+                            && mask != self.index
                     }
-                    MASKMOV => self.memory == 1 && address && if self.cr & 128 != 0 {
-                        self.reg < 8 && self.cr & !7 == 160 && self.size == 1
-                    } else { reg(self.reg) && self.cr < 128 && matches!(self.size, 1 | 4 | 8) },
-                    CVTPS2PH => self.memory == 1 && address && reg(self.reg) && self.cr < 256 && matches!(self.size, 8 | 16),
-                    ROTATE => self.memory == 1 && address && matches!(self.reg, 1 | NO_REG) && self.cr < 512 && matches!(self.size, 1 | 2 | 4 | 8),
+                    MASKMOV => {
+                        self.memory == 1
+                            && address
+                            && if self.cr & 128 != 0 {
+                                self.reg < 8 && self.cr & !7 == 160 && self.size == 1
+                            } else {
+                                reg(self.reg) && self.cr < 128 && matches!(self.size, 1 | 4 | 8)
+                            }
+                    }
+                    CVTPS2PH => {
+                        self.memory == 1
+                            && address
+                            && reg(self.reg)
+                            && self.cr < 256
+                            && matches!(self.size, 8 | 16)
+                    }
+                    ROTATE => {
+                        self.memory == 1
+                            && address
+                            && matches!(self.reg, 1 | NO_REG)
+                            && self.cr < 512
+                            && matches!(self.size, 1 | 2 | 4 | 8)
+                    }
                     DOUBLE_SHIFT16 => rm && self.cr < 32 && self.size == 2,
-                    ENTER => self.memory == 0 && matches!(self.size, 2 | 8) && self.cr < 32 && (0..=0xffff).contains(&self.disp),
+                    ENTER => {
+                        self.memory == 0
+                            && matches!(self.size, 2 | 8)
+                            && self.cr < 32
+                            && (0..=0xffff).contains(&self.disp)
+                    }
                     INT => self.cr < 256,
                     INT3 | INT1 | INTO | UD | TOO_LONG | REFUSED => true,
                     SWAPGS | SYSCALL | WBINVD | CLTS | SYSENTER => true,
@@ -1904,25 +2175,58 @@ pub mod system {
                     BRANCH => self.cr <= 21 && matches!(self.size, 4 | 8),
                     RESERVED_NOP => true,
                     NOP_RUN => self.lock == 0,
-                    PUSH_SREG | POP_SREG => matches!(self.cr as usize, super::SREG_FS | super::SREG_GS) && matches!(self.size, 2 | 8),
+                    PUSH_SREG | POP_SREG => {
+                        matches!(self.cr as usize, super::SREG_FS | super::SREG_GS)
+                            && matches!(self.size, 2 | 8)
+                    }
                     SYSRET => matches!(self.size, 4 | 8),
-                    RDFSBASE..=WRGSBASE => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 4 | 8),
+                    RDFSBASE..=WRGSBASE => {
+                        self.memory == 0
+                            && reg(self.reg)
+                            && self.segment == 0
+                            && matches!(self.size, 4 | 8)
+                    }
                     LAR | LSL => rm && reg(self.cr) && matches!(self.size, 2 | 4 | 8),
                     VERR | VERW => rm,
-                    RDRAND => self.memory == 0 && reg(self.reg) && self.segment == 0 && matches!(self.size, 2 | 4 | 8),
+                    RDRAND => {
+                        self.memory == 0
+                            && reg(self.reg)
+                            && self.segment == 0
+                            && matches!(self.size, 2 | 4 | 8)
+                    }
                     CLFLUSH => self.memory == 1 && address,
                     CLI | STI | HLT => true,
                     POPF => matches!(self.size, 2 | 8),
                     EVENT_HOOK => self.length == 1,
-                    BT_ALIGNED => self.memory == 1 && address && self.cr < 4 && (reg(self.reg) || self.reg == NO_REG) && matches!(self.size, 2 | 4 | 8),
+                    BT_ALIGNED => {
+                        self.memory == 1
+                            && address
+                            && self.cr < 4
+                            && (reg(self.reg) || self.reg == NO_REG)
+                            && matches!(self.size, 2 | 4 | 8)
+                    }
                     X87_GATED | FNINIT | FNCLEX => true,
                     FLDCW | FLD80 | FSTP80 => self.memory == 1 && address,
                     FLDENV..=FNSAVE => self.memory == 1 && address && matches!(self.size, 2 | 4),
                     FXSAVE..=XRSTOR | XSAVEC => self.memory == 1 && address,
                     XGETBV | XSETBV => self.memory == 0,
-                    IN | OUT => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && (self.reg == 2 || (self.reg == NO_REG && self.cr < 256)),
-                    INS => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && self.prefixes < 4 && self.segment == 0,
-                    OUTS => self.memory == 0 && matches!(self.size, 1 | 2 | 4) && self.prefixes < 4 && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS),
+                    IN | OUT => {
+                        self.memory == 0
+                            && matches!(self.size, 1 | 2 | 4)
+                            && (self.reg == 2 || (self.reg == NO_REG && self.cr < 256))
+                    }
+                    INS => {
+                        self.memory == 0
+                            && matches!(self.size, 1 | 2 | 4)
+                            && self.prefixes < 4
+                            && self.segment == 0
+                    }
+                    OUTS => {
+                        self.memory == 0
+                            && matches!(self.size, 1 | 2 | 4)
+                            && self.prefixes < 4
+                            && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS)
+                    }
                     _ => false,
                 }
         }
@@ -2445,9 +2749,34 @@ pub mod perf {
     pub const WAKES_VA: u64 = crate::PRIVATE + WAKES_OFFSET as u64;
     const _: () = assert!(super::ENTROPY_OFFSET + size_of::<super::Entropy>() <= WAKES_OFFSET);
     const _: () = assert!(WAKES_OFFSET + size_of::<Wakes>() <= super::MMIO_OFFSET);
-    pub const NAMES: [&str; BUCKETS] = ["start", "guest", "host", "halted", "mailbox", "link", "miss", "division", "helper",
-        "stop", "irq", "abort", "place", "system", "tlb", "delivery", "revalidate", "shadow", "fetch", "shootdown",
-        "lookup", "patch", "enter", "l1", "enter_copy", "reuse"];
+    pub const NAMES: [&str; BUCKETS] = [
+        "start",
+        "guest",
+        "host",
+        "halted",
+        "mailbox",
+        "link",
+        "miss",
+        "division",
+        "helper",
+        "stop",
+        "irq",
+        "abort",
+        "place",
+        "system",
+        "tlb",
+        "delivery",
+        "revalidate",
+        "shadow",
+        "fetch",
+        "shootdown",
+        "lookup",
+        "patch",
+        "enter",
+        "l1",
+        "enter_copy",
+        "reuse",
+    ];
 }
 
 #[cfg(test)]
@@ -2458,15 +2787,41 @@ mod tests {
     #[test]
     fn reuse_fences_reach_the_bytes_fetched() {
         let rip = 0x7f00_0000_1ff0;
-        assert!(!reuse_fenced(rip, false, [0x7f00_0000_2000, 0x7f00_0000_2001]));
-        assert!(reuse_fenced(rip, true, [0x7f00_0000_2000, 0x7f00_0000_2001]));
-        assert!(reuse_fenced(rip, false, [0x7f00_0000_1fff, 0x7f00_0000_2000]));
-        assert!(!reuse_fenced(rip, true, [0x7f00_0000_3000, 0x7f00_0000_3001]));
-        assert!(reuse_fenced(rip, false, [rip, rip + 1]) && !reuse_fenced(rip, false, [rip - 16, rip]));
+        assert!(!reuse_fenced(
+            rip,
+            false,
+            [0x7f00_0000_2000, 0x7f00_0000_2001]
+        ));
+        assert!(reuse_fenced(
+            rip,
+            true,
+            [0x7f00_0000_2000, 0x7f00_0000_2001]
+        ));
+        assert!(reuse_fenced(
+            rip,
+            false,
+            [0x7f00_0000_1fff, 0x7f00_0000_2000]
+        ));
+        assert!(!reuse_fenced(
+            rip,
+            true,
+            [0x7f00_0000_3000, 0x7f00_0000_3001]
+        ));
+        assert!(
+            reuse_fenced(rip, false, [rip, rip + 1]) && !reuse_fenced(rip, false, [rip - 16, rip])
+        );
         assert!(reuse_fenced(rip, true, [0, u64::MAX]));
         let top = 0xffff_ffff_ffff_f800;
-        assert!(reuse_fenced(top, false, [0xffff_ffff_ffff_fff0, 0xffff_ffff_ffff_fff1]));
-        assert!(reuse_fenced(0xffff_ffff_ffff_e800, true, [0xffff_ffff_ffff_f000, 0xffff_ffff_ffff_f001]));
+        assert!(reuse_fenced(
+            top,
+            false,
+            [0xffff_ffff_ffff_fff0, 0xffff_ffff_ffff_fff1]
+        ));
+        assert!(reuse_fenced(
+            0xffff_ffff_ffff_e800,
+            true,
+            [0xffff_ffff_ffff_f000, 0xffff_ffff_ffff_f001]
+        ));
         // No stop RIP (`u64::MAX`): its range [MAX, 0) is empty.
         assert!(!reuse_fenced(top, false, [u64::MAX, 0]));
     }
@@ -2477,8 +2832,14 @@ mod tests {
         assert!(entry_frame_rest_zero(&f));
         (f.x[4], f.x[28], f.sp, f.fpcr, f.q[16], f.q[31]) = (1, 2, 3, 4, [5; 16], [6; 16]);
         assert!(entry_frame_rest_zero(&f));
-        let pokes: [fn(&mut crate::NativeFrame); 6] =
-            [|f| f.x[0] = 1, |f| f.x[18] = 1, |f| f.x[30] = 1, |f| f.q[15][0] = 1, |f| f.nzcv = 1 << 30, |f| f.reserved = 1];
+        let pokes: [fn(&mut crate::NativeFrame); 6] = [
+            |f| f.x[0] = 1,
+            |f| f.x[18] = 1,
+            |f| f.x[30] = 1,
+            |f| f.q[15][0] = 1,
+            |f| f.nzcv = 1 << 30,
+            |f| f.reserved = 1,
+        ];
         for poke in pokes {
             let mut g = f;
             poke(&mut g);
@@ -2497,7 +2858,12 @@ mod tests {
     #[test]
     fn capacity_boundaries_and_interrupt_affinities() {
         assert_eq!(MAX_GUEST_RAM_BYTES, 34usize << 30);
-        for bytes in [3 << 30, (3 << 30) + (2 << 20), 4 << 30, MAX_GUEST_RAM_BYTES as u64] {
+        for bytes in [
+            3 << 30,
+            (3 << 30) + (2 << 20),
+            4 << 30,
+            MAX_GUEST_RAM_BYTES as u64,
+        ] {
             let low = bytes.min(LOW_RAM_END);
             assert!(ram_contains(bytes, low - 1));
             assert!(!ram_contains(bytes, low));
@@ -2542,7 +2908,14 @@ mod tests {
     #[test]
     fn data_breakpoint_hits() {
         // DR0: 4 bytes at 0x1003 (masked to 0x1000), write only; DR1: 8 bytes at 0x1008, read or write; DR2 disabled.
-        let dr = [0x1003, 0x1008, 0x1000, 0, DR6_FIXED, 0x400 | 1 | 4 | (1 | 3 << 2) << 16 | (3 | 2 << 2) << 20];
+        let dr = [
+            0x1003,
+            0x1008,
+            0x1000,
+            0,
+            DR6_FIXED,
+            0x400 | 1 | 4 | (1 | 3 << 2) << 16 | (3 | 2 << 2) << 20,
+        ];
         assert_eq!(dr_range(&dr, 0), (0x1000, 4));
         assert_eq!(dr_range(&dr, 1), (0x1008, 8));
         assert_eq!(data_hits(&dr, 0x1000, 1, false), 0);
@@ -2559,81 +2932,201 @@ mod tests {
     #[test]
     fn guest_state_page_layout() {
         let inside = |f: &[(u32, u32)], at: u32| f.iter().any(|&(o, n)| (o..o + n).contains(&at));
-        for &(o, n) in frame::GUEST_STATE.iter().chain(&frame::GUEST_STATE_WRITABLE) {
+        for &(o, n) in frame::GUEST_STATE
+            .iter()
+            .chain(&frame::GUEST_STATE_WRITABLE)
+        {
             assert!(o as usize + n as usize <= frame::BYTES);
         }
-        assert!(frame::GUEST_STATE_WRITABLE.iter().all(|&(o, n)| (o..o + n).all(|b| inside(&frame::GUEST_STATE, b))));
+        assert!(
+            frame::GUEST_STATE_WRITABLE
+                .iter()
+                .all(|&(o, n)| (o..o + n).all(|b| inside(&frame::GUEST_STATE, b)))
+        );
         assert_eq!(GUEST_STATE_VA % 4096, 0);
-        for va in [GUEST_STATE_SLOT.start, GUEST_STATE_VA, GUEST_STATE_SLOT.end - 4096] {
+        for va in [
+            GUEST_STATE_SLOT.start,
+            GUEST_STATE_VA,
+            GUEST_STATE_SLOT.end - 4096,
+        ] {
             assert!(guest_state_alias_valid(va));
             assert!(!crate::paging::canonical(va) && !crate::paging::canonical(va + 4095));
             assert_eq!(va >> 63, 1);
         }
-        for va in [0, GUEST_STATE_SLOT.start - 4096, GUEST_STATE_SLOT.start + 1, GUEST_STATE_SLOT.end, u64::MAX] {
+        for va in [
+            0,
+            GUEST_STATE_SLOT.start - 4096,
+            GUEST_STATE_SLOT.start + 1,
+            GUEST_STATE_SLOT.end,
+            u64::MAX,
+        ] {
             assert!(!guest_state_alias_valid(va));
         }
         // G1: x86 non-canonical with bit 63 set (Linux's user-access paths refuse it), outside the window and outside
         // every guest shadow (both halves), and inside its own slot.
-        assert!(!crate::paging::canonical(GUEST_STATE_VA) && !crate::paging::canonical(GUEST_STATE_VA + 4095));
-        assert!(GUEST_STATE_VA >> 63 == 1 && GUEST_STATE_SLOT.contains(&GUEST_STATE_VA) && GUEST_STATE_SLOT.contains(&(GUEST_STATE_VA + 4095)));
+        assert!(
+            !crate::paging::canonical(GUEST_STATE_VA)
+                && !crate::paging::canonical(GUEST_STATE_VA + 4095)
+        );
+        assert!(
+            GUEST_STATE_VA >> 63 == 1
+                && GUEST_STATE_SLOT.contains(&GUEST_STATE_VA)
+                && GUEST_STATE_SLOT.contains(&(GUEST_STATE_VA + 4095))
+        );
         assert!(!(PRIVATE..PRIVATE + PRIVATE_BYTES).contains(&GUEST_STATE_VA));
         // ... which holds only with 48-bit linear addresses and no masking of the upper bits: no LA57 (CPUID 7.0:ECX[16],
         // CR4 bit 12), 48 linear bits (80000008H:EAX[15:8]), and no LAM (CPUID 7.1:EAX[26], CR4 bit 28 LAM_SUP: it would
         // make the alias's supervisor address canonical by ignoring bits 62:48).
-        let d = crate::cpu::Dynamic { vcpus: 1, vcpu: 0, cr4: 0, apic_base: 0xfee0_0800, misc_enable: 0x1801, xcr0: 1 };
+        let d = crate::cpu::Dynamic {
+            vcpus: 1,
+            vcpu: 0,
+            cr4: 0,
+            apic_base: 0xfee0_0800,
+            misc_enable: 0x1801,
+            xcr0: 1,
+        };
         let leaf = |l: u32, sub: u32| crate::cpu::cpuid(l, sub, &d);
-        assert!(leaf(7, 0)[2] & 1 << 16 == 0 && crate::cpu_profile::CR4_VALID & 1 << 12 == 0 && leaf(0x8000_0008, 0)[0] >> 8 & 0xff == 48);
+        assert!(
+            leaf(7, 0)[2] & 1 << 16 == 0
+                && crate::cpu_profile::CR4_VALID & 1 << 12 == 0
+                && leaf(0x8000_0008, 0)[0] >> 8 & 0xff == 48
+        );
         assert!(leaf(7, 1)[0] & 1 << 26 == 0 && crate::cpu_profile::CR4_VALID & 1 << 28 == 0);
-        for rflags in [0x2u64, 0x202, 0x3202, 0x7_7702, 0x24_7f02, 0x40d02, 0x30_0302 | 1 << 14] {
+        for rflags in [
+            0x2u64,
+            0x202,
+            0x3202,
+            0x7_7702,
+            0x24_7f02,
+            0x40d02,
+            0x30_0302 | 1 << 14,
+        ] {
             let mut image = 0u64;
             for (at, v) in frame::flag_bytes(rflags) {
                 assert!(inside(&frame::GUEST_STATE, at), "{at:#x}");
                 let b = at - frame::FLAGS;
-                image |= if b == 10 { u64::from(frame::df(v)) } else { u64::from(v) } << b;
+                image |= if b == 10 {
+                    u64::from(frame::df(v))
+                } else {
+                    u64::from(v)
+                } << b;
             }
             assert_eq!(image, rflags & 0x3f_7700 & !(3 << 16), "{rflags:#x}");
-            assert_eq!(frame::df(frame::flag_bytes(rflags)[2].1), rflags & 0x400 != 0);
+            assert_eq!(
+                frame::df(frame::flag_bytes(rflags)[2].1),
+                rflags & 0x400 != 0
+            );
         }
         assert!(!frame::df(0) && !frame::df(1) && frame::df(0xff));
         // I7: FEX's gs_cached/fs_cached, 8 bytes each right below the flag bytes, readable, never writable.
         assert_eq!((frame::GS_BASE, frame::FS_BASE), (992, 1000));
         for at in [frame::GS_BASE, frame::FS_BASE] {
-            assert!((at..at + 8).all(|b| inside(&frame::GUEST_STATE, b)) && !inside(&frame::GUEST_STATE_WRITABLE, at));
+            assert!(
+                (at..at + 8).all(|b| inside(&frame::GUEST_STATE, b))
+                    && !inside(&frame::GUEST_STATE_WRITABLE, at)
+            );
         }
         // I6: FEX's x87 fields in the pinned CPUState (TOP and C0..C3 are flag bytes 43, 40..42, 46; mm[8][2] after the 48
         // flag bytes; FCW and AbridgedFTW after the segment arrays), the x87 exception word in the padding after the tag word.
         assert_eq!(frame::X87_SF, frame::X87_PE + 1);
-        let x87 = [frame::X87_IE, frame::X87_PE, frame::X87_C0, frame::X87_C1, frame::X87_C2, frame::X87_TOP, frame::X87_C3, frame::X87_MM];
-        assert_eq!(x87, [0x410, 0x415, 0x418, 0x419, 0x41a, 0x41b, 0x41e, 0x420]);
-        assert_eq!((frame::X87_FCW, frame::X87_FTW, frame::X87_EXCEPTIONS), (0x4b0, 0x4b2, 0x4b4));
-        for at in x87.into_iter().chain([frame::X87_MM + 127, frame::X87_FTW, frame::X87_EXCEPTIONS, frame::X87_EXCEPTIONS + 3]) {
+        let x87 = [
+            frame::X87_IE,
+            frame::X87_PE,
+            frame::X87_C0,
+            frame::X87_C1,
+            frame::X87_C2,
+            frame::X87_TOP,
+            frame::X87_C3,
+            frame::X87_MM,
+        ];
+        assert_eq!(
+            x87,
+            [0x410, 0x415, 0x418, 0x419, 0x41a, 0x41b, 0x41e, 0x420]
+        );
+        assert_eq!(
+            (frame::X87_FCW, frame::X87_FTW, frame::X87_EXCEPTIONS),
+            (0x4b0, 0x4b2, 0x4b4)
+        );
+        for at in x87.into_iter().chain([
+            frame::X87_MM + 127,
+            frame::X87_FTW,
+            frame::X87_EXCEPTIONS,
+            frame::X87_EXCEPTIONS + 3,
+        ]) {
             assert!(inside(&frame::GUEST_STATE_WRITABLE, at), "{at:#x}");
         }
-        assert!(inside(&frame::GUEST_STATE, frame::X87_FCW + 1) && !inside(&frame::GUEST_STATE_WRITABLE, frame::X87_FCW));
-        assert!(!inside(&frame::GUEST_STATE, frame::X87_MM + 128) && !inside(&frame::GUEST_STATE, frame::X87_IE + 3));
+        assert!(
+            inside(&frame::GUEST_STATE, frame::X87_FCW + 1)
+                && !inside(&frame::GUEST_STATE_WRITABLE, frame::X87_FCW)
+        );
+        assert!(
+            !inside(&frame::GUEST_STATE, frame::X87_MM + 128)
+                && !inside(&frame::GUEST_STATE, frame::X87_IE + 3)
+        );
         // I5c: the SIMD flag byte and the x87 pending byte, FEX's flag bytes 33 and 34, readable and writable.
         assert_eq!((frame::SIMD_FLAGS, frame::X87_PENDING), (0x411, 0x412));
-        assert!([frame::SIMD_FLAGS, frame::X87_PENDING].iter().all(|&b| inside(&frame::GUEST_STATE_WRITABLE, b)));
+        assert!(
+            [frame::SIMD_FLAGS, frame::X87_PENDING]
+                .iter()
+                .all(|&b| inside(&frame::GUEST_STATE_WRITABLE, b))
+        );
         // I8: FEX's avx_high[16][2] (the pinned CPUState), readable and writable, nothing around it.
-        assert!((frame::AVX_HIGH..frame::AVX_HIGH + 256).all(|b| inside(&frame::GUEST_STATE_WRITABLE, b)));
+        assert!(
+            (frame::AVX_HIGH..frame::AVX_HIGH + 256)
+                .all(|b| inside(&frame::GUEST_STATE_WRITABLE, b))
+        );
         assert!(!inside(&frame::GUEST_STATE, frame::AVX_HIGH + 256));
         // Perf chunk 15: the TSC offset right below them (FEX's `_pad1`), readable, never writable; the event-pending byte
         // (flags[22]) likewise; nothing below the offset.
-        assert_eq!((frame::TSC_OFFSET + 8, frame::EVENT_PENDING), (frame::AVX_HIGH, 0x406));
-        for at in [frame::TSC_OFFSET, frame::TSC_OFFSET + 7, frame::EVENT_PENDING] {
-            assert!(inside(&frame::GUEST_STATE, at) && !inside(&frame::GUEST_STATE_WRITABLE, at), "{at:#x}");
+        assert_eq!(
+            (frame::TSC_OFFSET + 8, frame::EVENT_PENDING),
+            (frame::AVX_HIGH, 0x406)
+        );
+        for at in [
+            frame::TSC_OFFSET,
+            frame::TSC_OFFSET + 7,
+            frame::EVENT_PENDING,
+        ] {
+            assert!(
+                inside(&frame::GUEST_STATE, at) && !inside(&frame::GUEST_STATE_WRITABLE, at),
+                "{at:#x}"
+            );
         }
-        assert!(!inside(&frame::GUEST_STATE, frame::TSC_OFFSET - 1) && !inside(&frame::GUEST_STATE_WRITABLE, frame::IF));
+        assert!(
+            !inside(&frame::GUEST_STATE, frame::TSC_OFFSET - 1)
+                && !inside(&frame::GUEST_STATE_WRITABLE, frame::IF)
+        );
         // Perf chunk 17: IA32_KERNEL_GS_BASE in FEX's `L1Pointer` (CPUState 0xa0: 16 bytes of header and PF/AF, RIP, 16 GPRs),
         // in neither list (admission allows it only in a CPL-0 block's SWAPGS), 8-aligned for one `ldr`/`str`.
-        assert_eq!((frame::KERNEL_GS_BASE, frame::KERNEL_GS_BASE % 8), (0x18 + 8 + 16 * 8, 0));
-        assert!((frame::KERNEL_GS_BASE..frame::KERNEL_GS_BASE + 8).all(|b| !inside(&frame::GUEST_STATE, b)));
+        assert_eq!(
+            (frame::KERNEL_GS_BASE, frame::KERNEL_GS_BASE % 8),
+            (0x18 + 8 + 16 * 8, 0)
+        );
+        assert!(
+            (frame::KERNEL_GS_BASE..frame::KERNEL_GS_BASE + 8)
+                .all(|b| !inside(&frame::GUEST_STATE, b))
+        );
         // Perf chunk 26: CR2 in FEX's `L1Mask`, right after it, likewise in neither list (only a CPL-0 MOV r64, CR2 loads it).
         assert_eq!(frame::CR2, frame::KERNEL_GS_BASE + 8);
-        assert!((frame::CR2..frame::CR2 + 8).all(|b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)));
+        assert!(
+            (frame::CR2..frame::CR2 + 8).all(
+                |b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)
+            )
+        );
         // Perf P2: the VERW fields lie between the x87 slots and FCW, outside every admitted field.
-        assert_eq!((frame::VERW_GDT_BASE, frame::VERW_GDT_LIMIT), (frame::X87_MM + 128, frame::X87_FCW - 8));
-        assert!((frame::VERW_GDT_BASE..frame::VERW_GDT_LIMIT + 8).all(|b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)));
+        assert_eq!(
+            (frame::VERW_GDT_BASE, frame::VERW_GDT_LIMIT),
+            (frame::X87_MM + 128, frame::X87_FCW - 8)
+        );
+        assert!(
+            (frame::VERW_GDT_BASE..frame::VERW_GDT_LIMIT + 8).all(|b| !inside(
+                &frame::GUEST_STATE,
+                b
+            ) && !inside(
+                &frame::GUEST_STATE_WRITABLE,
+                b
+            ))
+        );
     }
 
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.
@@ -2642,10 +3135,16 @@ mod tests {
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET), 0);
         for rc in 0..4u64 {
             assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | rc << 13), 0);
-            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13), fpcr(MXCSR_RESET | rc << 13));
+            assert_eq!(
+                x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13),
+                fpcr(MXCSR_RESET | rc << 13)
+            );
         }
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15), fpcr(MXCSR_RESET)); // FTZ
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ), fpcr(MXCSR_RESET));
+        assert_eq!(
+            x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ),
+            fpcr(MXCSR_RESET)
+        );
         assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET), 0); // precision control has no FPCR effect (doubles throughout)
     }
 
@@ -2654,17 +3153,57 @@ mod tests {
     fn unmasked_exceptions_and_flush_to_zero() {
         assert_eq!(fpcr(MXCSR_RESET | 1 << 15) & 1 << 24, 1 << 24);
         assert_eq!(fpcr((MXCSR_RESET | 1 << 15) & !(1 << 11)) & 1 << 24, 0);
-        assert_eq!((simd_unmasked(MXCSR_RESET), simd_unmasked(0), simd_unmasked(MXCSR_DAZ), simd_unmasked(MXCSR_RESET & !(1 << 9))), (0, 0x3f, 0x3d, 4));
-        assert_eq!((x87_unmasked(FCW_INIT), x87_unmasked(0x37b), x87_unmasked(0x340)), (0, 4, 0x3f));
-        let mut c = Cpu { gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
-                          dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
-                          xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1 };
+        assert_eq!(
+            (
+                simd_unmasked(MXCSR_RESET),
+                simd_unmasked(0),
+                simd_unmasked(MXCSR_DAZ),
+                simd_unmasked(MXCSR_RESET & !(1 << 9))
+            ),
+            (0, 0x3f, 0x3d, 4)
+        );
+        assert_eq!(
+            (
+                x87_unmasked(FCW_INIT),
+                x87_unmasked(0x37b),
+                x87_unmasked(0x340)
+            ),
+            (0, 4, 0x3f)
+        );
+        let mut c = Cpu {
+            gpr: [0; 16],
+            rip: 0,
+            rflags: 2,
+            cr0: 0,
+            cr3: 0,
+            cr4: 0,
+            efer: 0,
+            cpl: 3,
+            fs_base: 0,
+            gs_base: 0,
+            cr2: 0,
+            cr8: 0,
+            dr: DR_RESET,
+            seg: flat_segments(3),
+            ldtr: LDTR_RESET,
+            tr: TR_RESET,
+            gdtr: TABLE_RESET,
+            idtr: TABLE_RESET,
+            mov_ss: 0,
+            xmm: [[0; 2]; 16],
+            mxcsr: MXCSR_RESET,
+            fcw: FCW_INIT,
+            xcr0: 1,
+        };
         let masked = c.code_context();
         c.mxcsr &= !(1 << 12);
         assert_eq!(c.code_context(), masked | 32 << 18);
         c.fcw = 0x37e;
         assert_eq!(c.code_context(), masked | 32 << 18 | 1 << 24);
-        assert_eq!((fpsr_bits(0x3f), fpsr_bits(2), fpsr_bits(4)), (0x9f, 0x80, 2));
+        assert_eq!(
+            (fpsr_bits(0x3f), fpsr_bits(2), fpsr_bits(4)),
+            (0x9f, 0x80, 2)
+        );
     }
 
     /// I5c: the flags an unmasked SIMD or x87 exception leaves (SDM Vol.1 4.9.2, 8.5, 11.5.3).
@@ -2675,15 +3214,28 @@ mod tests {
         assert_eq!(simd_fault_flags(ioc | ofc | ixc, 0x1f80 & !(1 << 7)), ioc);
         assert_eq!(simd_fault_flags(idc | ixc, 0x1f80 & !(1 << 12)), idc | ixc);
         assert_eq!(simd_fault_flags(idc | ofc | ixc, 0x1f80 & !(1 << 8)), idc);
-        assert_eq!(simd_fault_flags(idc | ufc | ixc, (0x1f80 | MXCSR_DAZ) & !(1 << 8 | 1 << 11)), idc | ufc | ixc);
+        assert_eq!(
+            simd_fault_flags(idc | ufc | ixc, (0x1f80 | MXCSR_DAZ) & !(1 << 8 | 1 << 11)),
+            idc | ufc | ixc
+        );
         // x87: a stack overflow with IE unmasked; an unmasked ZE; FST m64 with UE unmasked (an exact tiny result); FIST's invalid.
-        assert_eq!(x87_fault_flags(1 << 8 | 1 << 9 | idc, 0x37e), (ioc | 0x40, Some(true)));
+        assert_eq!(
+            x87_fault_flags(1 << 8 | 1 << 9 | idc, 0x37e),
+            (ioc | 0x40, Some(true))
+        );
         assert_eq!(x87_fault_flags(1 << 8, 0x37e), (ioc | 0x40, Some(false)));
         assert_eq!(x87_fault_flags(dzc, 0x37b), (dzc, None));
         assert_eq!(x87_fault_flags(1 << 11, 0x36f), (ufc, Some(false)));
         assert_eq!(x87_fault_flags(ofc | ixc, 0x377), (ofc, Some(false)));
         assert_eq!(x87_fault_flags(1 << 10, 0x37e), (ioc, None));
-        assert_eq!((fsw_summary(0x20, 0x37f), fsw_summary(0x20, 0x35f), fsw_summary(0x40, 0x340)), (0, 0x8080, 0));
+        assert_eq!(
+            (
+                fsw_summary(0x20, 0x37f),
+                fsw_summary(0x20, 0x35f),
+                fsw_summary(0x40, 0x340)
+            ),
+            (0, 0x8080, 0)
+        );
     }
 
     #[test]
@@ -2720,24 +3272,105 @@ mod tests {
 
     #[test]
     fn system_replies_are_range_checked() {
-        let mov = System { kind: system::MOV_TO_CR, length: 3, cr: 3, ..System::NONE };
-        let invlpg = System { kind: system::INVLPG, length: 7, base: system::RIP, ..System::NONE };
+        let mov = System {
+            kind: system::MOV_TO_CR,
+            length: 3,
+            cr: 3,
+            ..System::NONE
+        };
+        let invlpg = System {
+            kind: system::INVLPG,
+            length: 7,
+            base: system::RIP,
+            ..System::NONE
+        };
         assert!(mov.well_formed() && invlpg.well_formed());
-        let ltr = System { kind: system::LTR, length: 3, reg: 0, ..System::NONE };
-        let far = System { kind: system::JMP_FAR, length: 3, memory: 1, size: 8, base: 0, segment: SREG_GS as u32, ..System::NONE };
-        let ret = System { kind: system::RET_FAR, length: 3, size: 4, disp: 0xffff, ..System::NONE };
+        let ltr = System {
+            kind: system::LTR,
+            length: 3,
+            reg: 0,
+            ..System::NONE
+        };
+        let far = System {
+            kind: system::JMP_FAR,
+            length: 3,
+            memory: 1,
+            size: 8,
+            base: 0,
+            segment: SREG_GS as u32,
+            ..System::NONE
+        };
+        let ret = System {
+            kind: system::RET_FAR,
+            length: 3,
+            size: 4,
+            disp: 0xffff,
+            ..System::NONE
+        };
         assert!(ltr.well_formed() && far.well_formed() && ret.well_formed());
-        assert!(System { kind: system::IRET, size: 2, ..mov }.well_formed());
-        assert!(!System { disp: 0x1_0000, ..ret }.well_formed() && !System { memory: 1, base: 17, ..ltr }.well_formed());
+        assert!(
+            System {
+                kind: system::IRET,
+                size: 2,
+                ..mov
+            }
+            .well_formed()
+        );
+        assert!(
+            !System {
+                disp: 0x1_0000,
+                ..ret
+            }
+            .well_formed()
+                && !System {
+                    memory: 1,
+                    base: 17,
+                    ..ltr
+                }
+                .well_formed()
+        );
         for bad in [
             System { kind: 31, ..mov },
-            System { kind: system::INT, cr: 256, ..mov }, // no such vector
-            System { kind: system::LGDT, ..mov }, // no memory operand
-            System { kind: system::IRET, size: 1, ..mov },
-            System { kind: system::MOV_FROM_SREG, size: 8, memory: 0, reg: 16, ..mov },
-            System { kind: system::JMP_FAR, size: 8, memory: 1, segment: 1, ..mov }, // CS: never decoded (ignored)
-            System { kind: system::JMP_FAR, size: 8, memory: 1, segment: SREG_SS as u32, ..mov }, // SS: never decoded (ignored)
-            System { kind: system::MOV_FROM_DR, cr: 16, ..mov },
+            System {
+                kind: system::INT,
+                cr: 256,
+                ..mov
+            }, // no such vector
+            System {
+                kind: system::LGDT,
+                ..mov
+            }, // no memory operand
+            System {
+                kind: system::IRET,
+                size: 1,
+                ..mov
+            },
+            System {
+                kind: system::MOV_FROM_SREG,
+                size: 8,
+                memory: 0,
+                reg: 16,
+                ..mov
+            },
+            System {
+                kind: system::JMP_FAR,
+                size: 8,
+                memory: 1,
+                segment: 1,
+                ..mov
+            }, // CS: never decoded (ignored)
+            System {
+                kind: system::JMP_FAR,
+                size: 8,
+                memory: 1,
+                segment: SREG_SS as u32,
+                ..mov
+            }, // SS: never decoded (ignored)
+            System {
+                kind: system::MOV_FROM_DR,
+                cr: 16,
+                ..mov
+            },
             System { length: 0, ..mov },
             System { length: 16, ..mov },
             System { reg: 16, ..mov },
@@ -2745,7 +3378,11 @@ mod tests {
             System { lock: 2, ..mov },
             System { index: 3, ..invlpg }, // RIP-relative has no index
             System { base: 17, ..invlpg },
-            System { scale: 4, base: 0, ..invlpg },
+            System {
+                scale: 4,
+                base: 0,
+                ..invlpg
+            },
         ] {
             assert!(!bad.well_formed(), "{bad:?}");
         }
@@ -2781,20 +3418,65 @@ mod tests {
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));
         // The driver's flat segments (QEMU stub's selectors) and a descriptor's hidden part.
-        assert_eq!(flat_segments(0)[SREG_CS], Segment { selector: 0x08, attributes: 0xa09b, limit: 0xffff_ffff, base: 0 });
-        assert_eq!(flat_segments(3)[SREG_SS], Segment { selector: 0x1b, attributes: 0xc0f3, limit: 0xffff_ffff, base: 0 });
+        assert_eq!(
+            flat_segments(0)[SREG_CS],
+            Segment {
+                selector: 0x08,
+                attributes: 0xa09b,
+                limit: 0xffff_ffff,
+                base: 0
+            }
+        );
+        assert_eq!(
+            flat_segments(3)[SREG_SS],
+            Segment {
+                selector: 0x1b,
+                attributes: 0xc0f3,
+                limit: 0xffff_ffff,
+                base: 0
+            }
+        );
         assert_eq!(flat_segments(3)[SREG_DS], Segment::NULL);
-        assert_eq!(Segment::loaded(0x50, 0x12cf_9334_5678_0067), Segment { selector: 0x50, attributes: 0xc093, limit: 0xf006_7fff, base: 0x1234_5678 });
+        assert_eq!(
+            Segment::loaded(0x50, 0x12cf_9334_5678_0067),
+            Segment {
+                selector: 0x50,
+                attributes: 0xc093,
+                limit: 0xf006_7fff,
+                base: 0x1234_5678
+            }
+        );
         assert_eq!(Segment::loaded(0x70, 0x0000_8900_0000_0067).limit, 0x67); // byte-granular
         for bad in [
             Cpu { cr0: CR0_PE, ..cpu },
             Cpu { cr4: 0, ..cpu },
-            Cpu { cr4: CR4_PAE | CR4_LA57, ..cpu },
-            Cpu { efer: EFER_LME, ..cpu },
+            Cpu {
+                cr4: CR4_PAE | CR4_LA57,
+                ..cpu
+            },
+            Cpu {
+                efer: EFER_LME,
+                ..cpu
+            },
             Cpu { cpl: 1, ..cpu },
-            Cpu { cr3: 0x1000 | 1 << 40, ..cpu },
-            Cpu { seg: [Segment { attributes: 0xc0fb, ..cpu.seg[1] }; 6], ..cpu }, // compatibility mode (CS.L = 0)
-            Cpu { seg: [Segment { attributes: 0xe0fb, ..cpu.seg[1] }; 6], ..cpu }, // CS.L = CS.D = 1
+            Cpu {
+                cr3: 0x1000 | 1 << 40,
+                ..cpu
+            },
+            Cpu {
+                seg: [Segment {
+                    attributes: 0xc0fb,
+                    ..cpu.seg[1]
+                }; 6],
+                ..cpu
+            }, // compatibility mode (CS.L = 0)
+            Cpu {
+                seg: [Segment {
+                    attributes: 0xe0fb,
+                    ..cpu.seg[1]
+                }; 6],
+                ..cpu
+            }, // CS.L = CS.D = 1
         ] {
             assert_eq!(bad.control(), None);
         }
@@ -2803,10 +3485,25 @@ mod tests {
         assert_eq!(Cpu { cr3: 0x1fff, ..cpu }.control().unwrap().cr3, 0x1000);
         // AM or AC alone, or both at CPL 0, check nothing; both at CPL 3 run with alignment checking (X2).
         for fine in [
-            Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, ..cpu },
-            Cpu { cr0: cpu.cr0 | CR0_AM, ..cpu },
-            Cpu { rflags: cpu.rflags | RFLAGS_AC, ..cpu },
-            Cpu { cr0: cpu.cr0 | CR0_AM, rflags: cpu.rflags | RFLAGS_AC, cpl: 0, ..cpu },
+            Cpu {
+                cr0: cpu.cr0 | CR0_AM,
+                rflags: cpu.rflags | RFLAGS_AC,
+                ..cpu
+            },
+            Cpu {
+                cr0: cpu.cr0 | CR0_AM,
+                ..cpu
+            },
+            Cpu {
+                rflags: cpu.rflags | RFLAGS_AC,
+                ..cpu
+            },
+            Cpu {
+                cr0: cpu.cr0 | CR0_AM,
+                rflags: cpu.rflags | RFLAGS_AC,
+                cpl: 0,
+                ..cpu
+            },
         ] {
             assert!(fine.control().is_some());
         }

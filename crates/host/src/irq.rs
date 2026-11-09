@@ -93,7 +93,9 @@ impl Lapics {
             // Lowest priority: the lowest-numbered software-enabled member (X3's arbitration, SDM 11.6.2.4: model
             // specific; QEMU takes the lowest-numbered member, enabled or not).
             1 => {
-                let accepting = self.targets(&m).find(|&t| execution::published(self.memory(), t) & lapic::SW_ENABLED != 0);
+                let accepting = self
+                    .targets(&m)
+                    .find(|&t| execution::published(self.memory(), t) & lapic::SW_ENABLED != 0);
                 accepting.is_some_and(|t| post(t, u64::from(m.vector)))
             }
             4 => all(execution::NMI),
@@ -126,7 +128,13 @@ pub(crate) struct Chipset {
 }
 impl Chipset {
     fn wires(&mut self) -> (&mut Ioapic, Wires<'_>) {
-        (&mut self.ioapic, Wires { pic: &mut self.pic, lapics: &self.lapics })
+        (
+            &mut self.ioapic,
+            Wires {
+                pic: &mut self.pic,
+                lapics: &self.lapics,
+            },
+        )
     }
     /// The master PIC's output onto every LINT0, when it changed (a rise posts to and rings the APICs taking ExtINTs).
     fn sync(&mut self) {
@@ -160,16 +168,30 @@ impl Chipset {
             let (chip, bit) = (irq / 8, 1u8 << (irq % 8));
             let was = self.pic.chips[chip].irr_bits() & bit != 0;
             self.pic.set_irq(irq as u8, level);
-            let taker = (0..self.lapics.vcpus).any(|v| execution::published(self.lapics.memory(), v) & (lapic::EXTINT | lapic::LINT0_FIXED) != 0);
+            let taker = (0..self.lapics.vcpus).any(|v| {
+                execution::published(self.lapics.memory(), v) & (lapic::EXTINT | lapic::LINT0_FIXED)
+                    != 0
+            });
             if level && taker && !self.pic.masked(irq as u8) {
-                pic = if was { Delivery::Coalesced } else { Delivery::Fresh };
+                pic = if was {
+                    Delivery::Coalesced
+                } else {
+                    Delivery::Fresh
+                };
             }
         }
-        let pin = if irq == 0 { crate::boot::acpi::platform::IRQ0_GSI as usize } else { irq };
+        let pin = if irq == 0 {
+            crate::boot::acpi::platform::IRQ0_GSI as usize
+        } else {
+            irq
+        };
         let (a, mut w) = self.wires();
         a.set_irq(pin, level, &mut w);
         self.sync();
-        match (self.lapics.fresh.get() > fresh, self.lapics.coalesced.get() > coalesced) {
+        match (
+            self.lapics.fresh.get() > fresh,
+            self.lapics.coalesced.get() > coalesced,
+        ) {
             (true, _) => Delivery::Fresh,
             (_, true) => Delivery::Coalesced,
             _ => pic,
@@ -306,12 +328,37 @@ impl Device for View {
 }
 
 /// Puts the chipset on `devices` for a VM of `vcpus` vCPUs on `memory`, and wires `uart`'s IRQ (COM1, ISA IRQ 4) into it.
-pub fn install(devices: &mut Devices, memory: &Arc<Memory>, vcpus: usize, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Irqs> {
-    let lapics = Lapics { memory: memory.clone(), vcpus, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
-    let chipset = Chipset { ioapic: Ioapic::new(), pic: Pic::new(), lines: 0, lapics };
-    let irqs = Irqs { chipset: Arc::new(Mutex::new(chipset)), live: Arc::default() };
+pub fn install(
+    devices: &mut Devices,
+    memory: &Arc<Memory>,
+    vcpus: usize,
+    uart: &Arc<Mutex<crate::uart::Uart>>,
+) -> crate::Result<Irqs> {
+    let lapics = Lapics {
+        memory: memory.clone(),
+        vcpus,
+        doorbell: None,
+        lint0: false,
+        messages: Default::default(),
+        fresh: Default::default(),
+        coalesced: Default::default(),
+    };
+    let chipset = Chipset {
+        ioapic: Ioapic::new(),
+        pic: Pic::new(),
+        lines: 0,
+        lapics,
+    };
+    let irqs = Irqs {
+        chipset: Arc::new(Mutex::new(chipset)),
+        live: Arc::default(),
+    };
     let view = |kind| -> Shared { Arc::new(Mutex::new(View(irqs.clone(), kind))) };
-    devices.register(crate::boot::acpi::platform::IOAPIC_BASE.into(), 4096, view(Kind::Ioapic))?;
+    devices.register(
+        crate::boot::acpi::platform::IOAPIC_BASE.into(),
+        4096,
+        view(Kind::Ioapic),
+    )?;
     devices.register_ports(0x20, 2, view(Kind::Pic(0)))?;
     devices.register_ports(0xa0, 2, view(Kind::Pic(1)))?;
     devices.register_ports(0x4d0, 2, view(Kind::Elcr))?;
@@ -350,8 +397,21 @@ mod tests {
     /// ISA IRQ0 enters pin 2, IRQ n pin n and PIC input n. No vCPU (`vcpus` 0): only the messages are counted.
     #[test]
     fn line_changes_only() {
-        let lapics = Lapics { memory: Arc::new(Memory::with_size(4096).unwrap()), vcpus: 0, doorbell: None, lint0: false, messages: Default::default(), fresh: Default::default(), coalesced: Default::default() };
-        let mut c = Chipset { ioapic: Ioapic::new(), pic: Pic::new(), lines: 0, lapics };
+        let lapics = Lapics {
+            memory: Arc::new(Memory::with_size(4096).unwrap()),
+            vcpus: 0,
+            doorbell: None,
+            lint0: false,
+            messages: Default::default(),
+            fresh: Default::default(),
+            coalesced: Default::default(),
+        };
+        let mut c = Chipset {
+            ioapic: Ioapic::new(),
+            pic: Pic::new(),
+            lines: 0,
+            lapics,
+        };
         for (sel, v) in [(0x10 + 2 * 4, 0x41), (0x10 + 2 * 2, 0x42)] {
             let (a, mut w) = c.wires();
             a.write(0, 4, sel, &mut w);
@@ -364,7 +424,10 @@ mod tests {
         c.line(4, true);
         assert_eq!(c.lapics.messages.get(), 2);
         c.line(0, true);
-        assert_eq!((c.lapics.messages.get(), c.pic.chips[0].irr_bits()), (3, 0x11));
+        assert_eq!(
+            (c.lapics.messages.get(), c.pic.chips[0].irr_bits()),
+            (3, 0x11)
+        );
         c.line(24, true); // no such line
         assert_eq!(c.lines, 0x11);
     }

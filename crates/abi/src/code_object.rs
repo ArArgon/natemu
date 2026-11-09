@@ -289,11 +289,17 @@ pub fn completion(site: &Site) -> Option<Completion> {
         signed: r >> 14 & 1 != 0,
     };
     let kind = if store { kind::STORE } else { kind::LOAD };
-    let shape = r >> 30 == 2 && r & 0x3fff_8000 == 0 && c.length != 0 && site.kind == kind && site.width == c.width;
+    let shape = r >> 30 == 2
+        && r & 0x3fff_8000 == 0
+        && c.length != 0
+        && site.kind == kind
+        && site.width == c.width;
     let operands = if store {
         r & 0x4fe0 == 0 && site.data_class == CLASS_GPR
     } else {
-        c.dest >= c.width && (!c.high || (c.dest == 1 && c.reg < 4)) && (!c.signed || c.dest > c.width)
+        c.dest >= c.width
+            && (!c.high || (c.dest == 1 && c.reg < 4))
+            && (!c.signed || c.dest > c.width)
     };
     (shape && site.rmw == RMW_NONE && operands).then_some(c)
 }
@@ -347,27 +353,58 @@ mod tests {
 
     #[test]
     fn completion_records() {
-        let site = |kind, width, g2| Site { kind, width, guest_offset2: g2, ..unsafe { core::mem::zeroed() } };
+        let site = |kind, width, g2| Site {
+            kind,
+            width,
+            guest_offset2: g2,
+            ..unsafe { core::mem::zeroed() }
+        };
         // fexc series23-m3's records: mov eax, [m]; mov ah, [m]; movsx rax, word [m]; mov [m], ch; mov qword [m], imm32.
-        let c = |length, store, reg, high, dest, width, signed| Completion { length, store, reg, high, dest, width, signed };
-        assert_eq!(completion(&site(kind::LOAD, 4, 0x8000_2803)), Some(c(3, false, 0, false, 4, 4, false)));
-        assert_eq!(completion(&site(kind::LOAD, 1, 0x8000_0202)), Some(c(2, false, 0, true, 1, 1, false)));
-        assert_eq!(completion(&site(kind::LOAD, 2, 0x8000_5c04)), Some(c(4, false, 0, false, 8, 2, true)));
-        assert_eq!(completion(&site(kind::STORE, 1, 0x8000_0012)), Some(c(2, true, 0, false, 0, 1, false)));
-        assert_eq!(completion(&site(kind::STORE, 8, 0x8000_3018)), Some(c(8, true, 0, false, 0, 8, false)));
+        let c = |length, store, reg, high, dest, width, signed| Completion {
+            length,
+            store,
+            reg,
+            high,
+            dest,
+            width,
+            signed,
+        };
+        assert_eq!(
+            completion(&site(kind::LOAD, 4, 0x8000_2803)),
+            Some(c(3, false, 0, false, 4, 4, false))
+        );
+        assert_eq!(
+            completion(&site(kind::LOAD, 1, 0x8000_0202)),
+            Some(c(2, false, 0, true, 1, 1, false))
+        );
+        assert_eq!(
+            completion(&site(kind::LOAD, 2, 0x8000_5c04)),
+            Some(c(4, false, 0, false, 8, 2, true))
+        );
+        assert_eq!(
+            completion(&site(kind::STORE, 1, 0x8000_0012)),
+            Some(c(2, true, 0, false, 0, 1, false))
+        );
+        assert_eq!(
+            completion(&site(kind::STORE, 8, 0x8000_3018)),
+            Some(c(8, true, 0, false, 0, 8, false))
+        );
         for bad in [
             site(kind::LOAD, 4, NONE32),
-            site(kind::LOAD, 2, 0x8000_2803),  // width disagrees with the site
+            site(kind::LOAD, 2, 0x8000_2803), // width disagrees with the site
             site(kind::STORE, 4, 0x8000_2803), // direction disagrees
-            site(kind::LOAD, 4, 0x8000_2800),  // length 0
-            site(kind::LOAD, 4, 0x0000_2803),  // no marker
-            site(kind::LOAD, 4, 0x8001_2803),  // stray bits
-            site(kind::LOAD, 1, 0x8000_02e2),  // AH..BH of register 7
-            site(kind::LOAD, 4, 0x8000_6803),  // sign-extend to its own width
-            site(kind::LOAD, 2, 0x8000_1002),  // a 1-byte destination for a 2-byte access
+            site(kind::LOAD, 4, 0x8000_2800), // length 0
+            site(kind::LOAD, 4, 0x0000_2803), // no marker
+            site(kind::LOAD, 4, 0x8001_2803), // stray bits
+            site(kind::LOAD, 1, 0x8000_02e2), // AH..BH of register 7
+            site(kind::LOAD, 4, 0x8000_6803), // sign-extend to its own width
+            site(kind::LOAD, 2, 0x8000_1002), // a 1-byte destination for a 2-byte access
             site(kind::STORE, 4, 0x8000_2833), // a store naming a register
             site(kind::ATOMIC, 4, 0x8000_2803),
-            Site { rmw: RMW_LOAD, ..site(kind::LOAD, 4, 0x8000_2803) },
+            Site {
+                rmw: RMW_LOAD,
+                ..site(kind::LOAD, 4, 0x8000_2803)
+            },
         ] {
             assert_eq!(completion(&bad), None, "{bad:?}");
         }

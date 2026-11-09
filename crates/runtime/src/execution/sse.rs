@@ -35,7 +35,13 @@ pub(super) fn bank(c: &mut Cpu, f: &NativeFrame) {
 /// I5c: the SIMD flag byte (FPSR order): the flags of the instructions checked for unmasked SIMD exceptions since the entry.
 fn checked() -> u64 {
     // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
-    unsafe { u64::from((FRAME_VA as *const u8).add(frame::SIMD_FLAGS as usize).read_volatile()) }
+    unsafe {
+        u64::from(
+            (FRAME_VA as *const u8)
+                .add(frame::SIMD_FLAGS as usize)
+                .read_volatile(),
+        )
+    }
 }
 
 /// I5c: an SSE/AVX instruction's check found an unmasked SIMD exception (its stub; SDM Vol.1 11.5.3, Vol.3 events 19 and 6):
@@ -43,7 +49,11 @@ fn checked() -> u64 {
 /// precedence leaves ([`simd_fault_flags`]), then #XM, or #UD without CR4.OSXMMEXCPT. The destination is unchanged.
 pub(super) fn exception(c: &mut Cpu, before: u64, raised: u64) -> Exception {
     c.mxcsr = before | mxcsr_flags(checked() | simd_fault_flags(raised, before), before);
-    if c.cr4 & CR4_OSXMMEXCPT != 0 { [19, 0, 0] } else { UD }
+    if c.cr4 & CR4_OSXMMEXCPT != 0 {
+        [19, 0, 0]
+    } else {
+        UD
+    }
 }
 
 /// #UD or #NM for an SSE instruction under `c`'s controls (#UD first: SDM Vol.2 2.5, the SIMD exception classes: CR0.EM,
@@ -89,4 +99,3 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     }
     Ok(())
 }
-

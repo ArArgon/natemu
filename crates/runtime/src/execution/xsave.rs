@@ -55,7 +55,9 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     if !fx && cr4 & CR4_OSXSAVE == 0 {
         return Err(UD);
     }
-    if matches!(i.kind, system::FXSAVE..=system::XRSTOR | system::XSAVEC) && cr0 & if fx { CR0_TS | CR0_EM } else { CR0_TS } != 0 {
+    if matches!(i.kind, system::FXSAVE..=system::XRSTOR | system::XSAVEC)
+        && cr0 & if fx { CR0_TS | CR0_EM } else { CR0_TS } != 0
+    {
         return Err(NM);
     }
     let rfbm = xcr0 & (rdx << 32 | rax & 0xffff_ffff);
@@ -98,7 +100,10 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 (true, HEADER, HEADER + if compact { 16 } else { 8 }),
                 (rfbm & 4 != 0, AVX, AREA),
             ];
-            let (lo, hi) = parts.iter().filter(|p| p.0).fold((AREA, 0), |(lo, hi), p| (lo.min(p.1), hi.max(p.2)));
+            let (lo, hi) = parts
+                .iter()
+                .filter(|p| p.0)
+                .fold((AREA, 0), |(lo, hi), p| (lo.min(p.1), hi.max(p.2)));
             // Every page the stores reach (both ends of [lo, hi) are stored, so each page in it is) walked for write first;
             // as `linear`, nothing is written unless all of it is guest RAM (M3: a device page stops first).
             let (start, n) = (va.wrapping_add(lo as u64), (hi - lo) as u64);
@@ -111,13 +116,27 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 img[HEADER + 8..HEADER + 16].copy_from_slice(&(COMPACTED | rfbm).to_le_bytes());
                 rfbm
             } else {
-                linear(s, va.wrapping_add(HEADER as u64), &mut img[HEADER..HEADER + 8], false, false, nc)?;
+                linear(
+                    s,
+                    va.wrapping_add(HEADER as u64),
+                    &mut img[HEADER..HEADER + 8],
+                    false,
+                    false,
+                    nc,
+                )?;
                 word(&img, HEADER) | rfbm
             };
             img[HEADER..HEADER + 8].copy_from_slice(&bv.to_le_bytes());
             for &(on, from, to) in &parts {
                 if on {
-                    linear(s, va.wrapping_add(from as u64), &mut img[from..to], true, false, nc)?;
+                    linear(
+                        s,
+                        va.wrapping_add(from as u64),
+                        &mut img[from..to],
+                        true,
+                        false,
+                        nc,
+                    )?;
                 }
             }
         }
@@ -128,15 +147,29 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             if !paging::canonical(va) || !paging::canonical(last) || last < va {
                 return Err(nc);
             }
-            linear(s, va.wrapping_add(HEADER as u64), &mut img[HEADER..AVX], false, false, nc)?;
-            let (bv, comp, reserved) = (word(&img, HEADER), word(&img, HEADER + 8), word(&img, HEADER + 16));
+            linear(
+                s,
+                va.wrapping_add(HEADER as u64),
+                &mut img[HEADER..AVX],
+                false,
+                false,
+                nc,
+            )?;
+            let (bv, comp, reserved) = (
+                word(&img, HEADER),
+                word(&img, HEADER + 8),
+                word(&img, HEADER + 16),
+            );
             let compact = comp & COMPACTED != 0;
             // Standard form (13.8.1): XSTATE_BV within XCR0, header bytes 23:8 zero (24..63 not checked). Compacted form
             // (13.8.2; #GP without XSAVEC): XCOMP_BV[62:0] within XCR0, XSTATE_BV within XCOMP_BV[62:0], bytes 63:16 zero.
             // XSTATE_BV[63] (a reserved bit; the SDM's "including bit 63" read literally lets it pass, since XCOMP_BV[63] is
             // set) is #GP(0), as on the reference AMD machine (gen_xsave.py's probe).
             if if compact {
-                !XSAVEC || comp & !COMPACTED & !xcr0 != 0 || bv & !(comp & !COMPACTED) != 0 || img[HEADER + 16..AVX].iter().any(|&b| b != 0)
+                !XSAVEC
+                    || comp & !COMPACTED & !xcr0 != 0
+                    || bv & !(comp & !COMPACTED) != 0
+                    || img[HEADER + 16..AVX].iter().any(|&b| b != 0)
             } else {
                 bv & !xcr0 != 0 || comp != 0 || reserved != 0
             } {
@@ -146,16 +179,54 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             // at 576 when XCOMP_BV has it. MXCSR is SSE state there: loaded with it, else 1F80H when SSE is initialized
             // (RFBM[2] plays no part); the standard form loads it for RFBM[1] or RFBM[2] whatever XSTATE_BV.
             let restore = rfbm & bv & if compact { comp } else { !0 };
-            let mx = if compact { restore & 2 != 0 } else { rfbm & 6 != 0 };
-            let lo = if restore & 1 != 0 { 0 } else if mx { 24 } else { LEGACY };
-            let hi = if restore & 2 != 0 { LEGACY } else if restore & 1 != 0 { 160 } else if mx { 32 } else { LEGACY };
+            let mx = if compact {
+                restore & 2 != 0
+            } else {
+                rfbm & 6 != 0
+            };
+            let lo = if restore & 1 != 0 {
+                0
+            } else if mx {
+                24
+            } else {
+                LEGACY
+            };
+            let hi = if restore & 2 != 0 {
+                LEGACY
+            } else if restore & 1 != 0 {
+                160
+            } else if mx {
+                32
+            } else {
+                LEGACY
+            };
             if lo < hi {
-                linear(s, va.wrapping_add(lo as u64), &mut img[lo..hi], false, false, nc)?;
+                linear(
+                    s,
+                    va.wrapping_add(lo as u64),
+                    &mut img[lo..hi],
+                    false,
+                    false,
+                    nc,
+                )?;
             }
             if restore & 4 != 0 {
-                linear(s, va.wrapping_add(AVX as u64), &mut img[AVX..AREA], false, false, nc)?;
+                linear(
+                    s,
+                    va.wrapping_add(AVX as u64),
+                    &mut img[AVX..AREA],
+                    false,
+                    false,
+                    nc,
+                )?;
             }
-            let mxcsr = if mx { Some(mxcsr(&img)?) } else if compact && rfbm & 2 != 0 { Some(MXCSR_RESET) } else { None };
+            let mxcsr = if mx {
+                Some(mxcsr(&img)?)
+            } else if compact && rfbm & 2 != 0 {
+                Some(MXCSR_RESET)
+            } else {
+                None
+            };
             if restore & 1 != 0 {
                 load_x87(s, &img);
             } else if rfbm & 1 != 0 {
@@ -172,7 +243,16 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 load_xmm(&mut s.cpu, (restore & 2 != 0).then_some(&img[..]));
             }
             if rfbm & 4 != 0 {
-                (0..32).for_each(|q| set_ymm_hi(q, if restore & 4 != 0 { word(&img, AVX + 8 * q) } else { 0 }));
+                (0..32).for_each(|q| {
+                    set_ymm_hi(
+                        q,
+                        if restore & 4 != 0 {
+                            word(&img, AVX + 8 * q)
+                        } else {
+                            0
+                        },
+                    )
+                });
             }
         }
         system::XGETBV => {
@@ -199,11 +279,19 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
 /// Quadword `q` (0..32) of YMM_Hi128 in the guest-state page ([`frame::AVX_HIGH`]), and its write.
 pub(super) fn ymm_hi(q: usize) -> u64 {
     // SAFETY: FRAME_VA maps the vCPU's frame page; AVX_HIGH + 256 lies inside it.
-    unsafe { (FRAME_VA as *const u64).byte_add(frame::AVX_HIGH as usize + 8 * (q & 31)).read_volatile() }
+    unsafe {
+        (FRAME_VA as *const u64)
+            .byte_add(frame::AVX_HIGH as usize + 8 * (q & 31))
+            .read_volatile()
+    }
 }
 pub(super) fn set_ymm_hi(q: usize, v: u64) {
     // SAFETY: as in ymm_hi.
-    unsafe { (FRAME_VA as *mut u64).byte_add(frame::AVX_HIGH as usize + 8 * (q & 31)).write_volatile(v) }
+    unsafe {
+        (FRAME_VA as *mut u64)
+            .byte_add(frame::AVX_HIGH as usize + 8 * (q & 31))
+            .write_volatile(v)
+    }
 }
 
 /// The legacy region's first 416 bytes for `c` and the x87 state in the page.
@@ -240,13 +328,21 @@ fn load_x87(s: &mut State, img: &[u8]) {
     for k in 0..8 {
         let at = 32 + 16 * k as usize;
         let mant = u64::from_le_bytes(img[at..at + 8].try_into().unwrap());
-        x87::set_mm((fsw >> 11) + k, from_f80(mant, u16::from_le_bytes([img[at + 8], img[at + 9]]), fcw >> 10 & 3));
+        x87::set_mm(
+            (fsw >> 11) + k,
+            from_f80(
+                mant,
+                u16::from_le_bytes([img[at + 8], img[at + 9]]),
+                fcw >> 10 & 3,
+            ),
+        );
     }
 }
 /// XMM0..15 from the image, or zero (their initial configuration).
 fn load_xmm(c: &mut Cpu, img: Option<&[u8]>) {
     for (r, x) in c.xmm.iter_mut().enumerate() {
-        let q = |at: usize| img.map_or(0, |b| u64::from_le_bytes(b[at..at + 8].try_into().unwrap()));
+        let q =
+            |at: usize| img.map_or(0, |b| u64::from_le_bytes(b[at..at + 8].try_into().unwrap()));
         *x = [q(160 + 16 * r), q(168 + 16 * r)];
     }
 }

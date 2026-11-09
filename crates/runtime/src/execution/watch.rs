@@ -40,24 +40,36 @@ pub(super) fn program(s: &mut State) {
         let rw = dr7_rw(c.dr[5], n);
         // A non-canonical range meets no x86 access (and a watchpoint there could only match the resident's private
         // window or the guest-state page): not programmed.
-        let (wvr, wcr) = if dr7_enabled(c.dr[5], n) && rw & 1 != 0 && paging::canonical(dr_range(&c.dr, n).0) {
-            if n as u64 >= watchpoints {
-                halt(s, stop::UNSUPPORTED_SYSTEM)
-            }
-            armed = true;
-            let (base, len) = dr_range(&c.dr, n);
-            let bas = ((1u64 << len) - 1) << (base & 7);
-            (base & !7, 1 | 2 << 1 | (if rw == 1 { 2 } else { 3 }) << 3 | bas << 5)
-        } else {
-            (0, 0)
-        };
+        let (wvr, wcr) =
+            if dr7_enabled(c.dr[5], n) && rw & 1 != 0 && paging::canonical(dr_range(&c.dr, n).0) {
+                if n as u64 >= watchpoints {
+                    halt(s, stop::UNSUPPORTED_SYSTEM)
+                }
+                armed = true;
+                let (base, len) = dr_range(&c.dr, n);
+                let bas = ((1u64 << len) - 1) << (base & 7);
+                (
+                    base & !7,
+                    1 | 2 << 1 | (if rw == 1 { 2 } else { 3 }) << 3 | bas << 5,
+                )
+            } else {
+                (0, 0)
+            };
         // SAFETY: debug registers the VM owns (the host turned their traps off); no memory effect.
         unsafe {
             match n {
-                0 => asm!("msr S2_0_C0_C0_7, xzr", "msr S2_0_C0_C0_6, {v}", "msr S2_0_C0_C0_7, {c}", v = in(reg) wvr, c = in(reg) wcr),
-                1 => asm!("msr S2_0_C0_C1_7, xzr", "msr S2_0_C0_C1_6, {v}", "msr S2_0_C0_C1_7, {c}", v = in(reg) wvr, c = in(reg) wcr),
-                2 => asm!("msr S2_0_C0_C2_7, xzr", "msr S2_0_C0_C2_6, {v}", "msr S2_0_C0_C2_7, {c}", v = in(reg) wvr, c = in(reg) wcr),
-                _ => asm!("msr S2_0_C0_C3_7, xzr", "msr S2_0_C0_C3_6, {v}", "msr S2_0_C0_C3_7, {c}", v = in(reg) wvr, c = in(reg) wcr),
+                0 => {
+                    asm!("msr S2_0_C0_C0_7, xzr", "msr S2_0_C0_C0_6, {v}", "msr S2_0_C0_C0_7, {c}", v = in(reg) wvr, c = in(reg) wcr)
+                }
+                1 => {
+                    asm!("msr S2_0_C0_C1_7, xzr", "msr S2_0_C0_C1_6, {v}", "msr S2_0_C0_C1_7, {c}", v = in(reg) wvr, c = in(reg) wcr)
+                }
+                2 => {
+                    asm!("msr S2_0_C0_C2_7, xzr", "msr S2_0_C0_C2_6, {v}", "msr S2_0_C0_C2_7, {c}", v = in(reg) wvr, c = in(reg) wcr)
+                }
+                _ => {
+                    asm!("msr S2_0_C0_C3_7, xzr", "msr S2_0_C0_C3_6, {v}", "msr S2_0_C0_C3_7, {c}", v = in(reg) wvr, c = in(reg) wcr)
+                }
             }
         }
     }
@@ -71,7 +83,10 @@ pub(super) fn program(s: &mut State) {
 /// Whether the access of `site` is a write for DR purposes (a store, push, exchange or atomic read-modify-write).
 fn writes(site: &Site) -> bool {
     use object::kind::*;
-    matches!(site.kind, STORE | STORE_PAIR | PUSH | PUSH_PAIR | SWAP | ATOMIC)
+    matches!(
+        site.kind,
+        STORE | STORE_PAIR | PUSH | PUSH_PAIR | SWAP | ATOMIC
+    )
 }
 
 /// A watchpoint exception at `site` of `b` (EC 0x34, from EL0): the access has not been made.
@@ -81,19 +96,40 @@ pub(super) fn hit(mut s: State, f: &NativeFrame, b: &Block, site: &Site, elr: u6
     if b.flags & cache::STEP == 0 {
         step_from(s, f, b, site)
     }
-    s.debug |= data_hits(&s.cpu.dr, site_address(site, f), u64::from(site.width), writes(site)) << debug::HITS;
+    s.debug |= data_hits(
+        &s.cpu.dr,
+        site_address(site, f),
+        u64::from(site.width),
+        writes(site),
+    ) << debug::HITS;
     unsafe { write_record(record(), &s) };
     // The one Arm access with watchpoints off: MDE clear, a software step of the next instruction from EL0, IRQs masked.
     // SAFETY: debug control of this PE; `resume` erets with the given SPSR.
-    unsafe { asm!("mrs {t}, mdscr_el1", "bic {t}, {t}, #{mde}", "orr {t}, {t}, #{ss}", "msr mdscr_el1, {t}", "isb", t = out(reg) _, mde = const MDSCR_MDE, ss = const MDSCR_SS) };
-    unsafe { resume(&s, &raw const (*shared()).captured, elr, spsr | SPSR_SS | SPSR_I) }
+    unsafe {
+        asm!("mrs {t}, mdscr_el1", "bic {t}, {t}, #{mde}", "orr {t}, {t}, #{ss}", "msr mdscr_el1, {t}", "isb", t = out(reg) _, mde = const MDSCR_MDE, ss = const MDSCR_SS)
+    };
+    unsafe {
+        resume(
+            &s,
+            &raw const (*shared()).captured,
+            elr,
+            spsr | SPSR_SS | SPSR_I,
+        )
+    }
 }
 
 /// The software step after a watched access completed (EC 0x32 from EL0): watchpoints on again, the step block goes on.
 pub(super) fn stepped(elr: u64, spsr: u64) -> ! {
     rearm();
     let s = unsafe { load() };
-    unsafe { resume(&s, &raw const (*shared()).captured, elr, spsr & !(SPSR_SS | SPSR_I)) }
+    unsafe {
+        resume(
+            &s,
+            &raw const (*shared()).captured,
+            elr,
+            spsr & !(SPSR_SS | SPSR_I),
+        )
+    }
 }
 
 /// At every other entry from generated code: a step still in flight (an abort or a split store came first: it was taken
@@ -112,7 +148,9 @@ pub(super) fn cancel(spsr: u64) -> u64 {
 }
 fn rearm() {
     // SAFETY: debug control of this PE (a step only runs while watchpoints are armed).
-    unsafe { asm!("mrs {t}, mdscr_el1", "bic {t}, {t}, #{ss}", "orr {t}, {t}, #{mde}", "msr mdscr_el1, {t}", "isb", t = out(reg) _, ss = const MDSCR_SS, mde = const MDSCR_MDE) };
+    unsafe {
+        asm!("mrs {t}, mdscr_el1", "bic {t}, {t}, #{ss}", "orr {t}, {t}, #{mde}", "msr mdscr_el1, {t}", "isb", t = out(reg) _, ss = const MDSCR_SS, mde = const MDSCR_MDE)
+    };
 }
 
 /// The resident's own explicit access of `width` bytes at linear `va` (made, or about to be made by a committing
@@ -129,8 +167,11 @@ pub(super) fn port(s: &mut State, port: u64, width: u64) {
     if s.cpu.dr[5] & DR7_ENABLES == 0 || s.cpu.cr4 & CR4_DE == 0 {
         return;
     }
-    s.debug |= (0..4).filter(|&n| dr7_enabled(s.cpu.dr[5], n) && dr7_rw(s.cpu.dr[5], n) == 2).fold(0, |m, n| {
-        let (base, len) = dr_range(&s.cpu.dr, n);
-        m | u64::from(base.wrapping_sub(port) < width || port.wrapping_sub(base) < len) << n
-    }) << debug::HITS;
+    s.debug |= (0..4)
+        .filter(|&n| dr7_enabled(s.cpu.dr[5], n) && dr7_rw(s.cpu.dr[5], n) == 2)
+        .fold(0, |m, n| {
+            let (base, len) = dr_range(&s.cpu.dr, n);
+            m | u64::from(base.wrapping_sub(port) < width || port.wrapping_sub(base) < len) << n
+        })
+        << debug::HITS;
 }

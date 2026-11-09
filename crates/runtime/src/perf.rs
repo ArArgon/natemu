@@ -52,8 +52,14 @@ pub fn wake(kind: usize, ticks: u64) {
     // SAFETY: reads the counter's frequency.
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack)) };
     let us = ticks * 1_000_000 / f.max(1);
-    let bin = (0..WAKE_BINS - 1).find(|&b| us < 1 << (2 * b)).unwrap_or(WAKE_BINS - 1);
-    (w.count[kind], w.ticks[kind], w.max[kind]) = (w.count[kind] + 1, w.ticks[kind] + ticks, w.max[kind].max(ticks));
+    let bin = (0..WAKE_BINS - 1)
+        .find(|&b| us < 1 << (2 * b))
+        .unwrap_or(WAKE_BINS - 1);
+    (w.count[kind], w.ticks[kind], w.max[kind]) = (
+        w.count[kind] + 1,
+        w.ticks[kind] + ticks,
+        w.max[kind].max(ticks),
+    );
     w.bins[kind][bin] += 1;
 }
 /// Whether the `perf` accounting is built in.

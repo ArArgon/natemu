@@ -30,7 +30,9 @@ impl Maintenance for Tlb {
     }
     fn invalidate_all(&mut self) {
         let (s, u) = (self.supervisor, self.supervisor | USER_ASID);
-        unsafe { asm!("dsb ishst", "tlbi aside1, {0}", "tlbi aside1, {1}", "dsb ish", "isb", in(reg) s, in(reg) u) }
+        unsafe {
+            asm!("dsb ishst", "tlbi aside1, {0}", "tlbi aside1, {1}", "dsb ish", "isb", in(reg) s, in(reg) u)
+        }
     }
 }
 
@@ -49,7 +51,10 @@ pub fn space(user: bool) -> Space<Tlb> {
         pool_pages: POOL_PAGES,
         upper: tcr & 1 << 23 == 0,
         user,
-        tlb: Tlb { asid: supervisor | if user { USER_ASID } else { 0 }, supervisor },
+        tlb: Tlb {
+            asid: supervisor | if user { USER_ASID } else { 0 },
+            supervisor,
+        },
     }
 }
 /// The space of an access at `cpl`: x86 grants supervisor rights at CPL 0-2, user rights at 3.
@@ -90,7 +95,14 @@ fn native(va: u64) -> Option<u64> {
 /// Shadow guest linear page `va` with guest-physical page `gpa` of `ram` in the space of `cpl` (whose rights the walk
 /// granted), read-only unless `writable` (the walk granted W and D is set); `global`: the walk's translation is global
 /// (its leaf's G with CR4.PGE), so the shadow may outlive a CR3 load ([`reset_cr3`]).
-pub fn install(cpl: u64, va: u64, ram: &GuestRam, gpa: u64, writable: bool, global: bool) -> Result<(), Error> {
+pub fn install(
+    cpl: u64,
+    va: u64,
+    ram: &GuestRam,
+    gpa: u64,
+    writable: bool,
+    global: bool,
+) -> Result<(), Error> {
     let page = ram.range(gpa & !4095, 4096).ok_or(Error::OutsideRam)?;
     let ipa = native(page as u64).ok_or(Error::OutsideRam)?;
     let mut space = space(user(cpl));

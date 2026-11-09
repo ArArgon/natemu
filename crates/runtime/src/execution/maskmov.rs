@@ -27,7 +27,10 @@ use super::*;
 
 fn ymm(c: &Cpu, r: usize) -> [u8; 32] {
     let mut v = [0; 32];
-    for (k, q) in [c.xmm[r][0], c.xmm[r][1], ymm_hi(2 * r), ymm_hi(2 * r + 1)].into_iter().enumerate() {
+    for (k, q) in [c.xmm[r][0], c.xmm[r][1], ymm_hi(2 * r), ymm_hi(2 * r + 1)]
+        .into_iter()
+        .enumerate()
+    {
         v[8 * k..8 * k + 8].copy_from_slice(&q.to_le_bytes());
     }
     v
@@ -40,13 +43,19 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     // The gating, as the host's gated cuts give it (checked again so the transaction stands alone): VEX (Table 2-21/2-24):
     // #UD without CR4.OSXSAVE or with XCR0[2:1] != 11b, then #NM with CR0.TS; SSE (MASKMOVDQU): #UD with CR0.EM or without
     // CR4.OSFXSR, then #NM with CR0.TS.
-    if if vex { !s.cpu.avx_enabled() } else { s.cpu.cr0 & CR0_EM != 0 || (!mmx && s.cpu.cr4 & CR4_OSFXSR == 0) } {
+    if if vex {
+        !s.cpu.avx_enabled()
+    } else {
+        s.cpu.cr0 & CR0_EM != 0 || (!mmx && s.cpu.cr4 & CR4_OSFXSR == 0)
+    } {
         return Err(UD);
     }
     if s.cpu.cr0 & CR0_TS != 0 {
         return Err([7, 0, 0]);
     }
-    if mmx { x87::pending(s)?; }
+    if mmx {
+        x87::pending(s)?;
+    }
     let ew = i.size as usize;
     let n = if mmx { 8 } else { (16 << (i.cr >> 4 & 1)) / ew };
     let mm = |r| {
@@ -54,15 +63,26 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         v[..8].copy_from_slice(&x87::mm(r).to_le_bytes());
         v
     };
-    let (data, mask) = if mmx { (mm(i.reg as u64), mm((i.cr & 7) as u64)) }
-        else { (ymm(&s.cpu, i.reg as usize), ymm(&s.cpu, (i.cr & 15) as usize)) };
+    let (data, mask) = if mmx {
+        (mm(i.reg as u64), mm((i.cr & 7) as u64))
+    } else {
+        (
+            ymm(&s.cpu, i.reg as usize),
+            ymm(&s.cpu, (i.cr & 15) as usize),
+        )
+    };
     let at = address(&s.cpu, &i);
     let nc = noncanonical(&i);
     let on = |j: usize| mask[ew * j + ew - 1] & 0x80 != 0;
     let element = |j: usize| at.wrapping_add((ew * j) as u64);
     // The checks: every masked-in element's walk (one 16-byte write for MASKMOVDQU), before any byte moves.
-    if mmx && alignment_check(&s.cpu) != 0 && at & 7 != 0
-        && paging::canonical(at) && paging::canonical(at.wrapping_add(7)) && at <= at.wrapping_add(7) {
+    if mmx
+        && alignment_check(&s.cpu) != 0
+        && at & 7 != 0
+        && paging::canonical(at)
+        && paging::canonical(at.wrapping_add(7))
+        && at <= at.wrapping_add(7)
+    {
         return Err([17, 0, 0]);
     }
     if ew == 1 {
@@ -87,7 +107,9 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         set_ymm_hi(2 * r, q(2));
         set_ymm_hi(2 * r + 1, q(3));
     }
-    if mmx { x87::enter_mmx(); }
+    if mmx {
+        x87::enter_mmx();
+    }
     commit(s, i, false);
     Ok(())
 }

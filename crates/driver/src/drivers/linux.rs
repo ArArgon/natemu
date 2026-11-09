@@ -64,7 +64,12 @@ pub(crate) struct Args {
     image: String,
     #[arg(long, value_name = "FILE")]
     initrd: Option<String>,
-    #[arg(long, value_name = "TEXT", default_value = "", allow_hyphen_values = true)]
+    #[arg(
+        long,
+        value_name = "TEXT",
+        default_value = "",
+        allow_hyphen_values = true
+    )]
     cmdline: String,
     /// Guest RAM, the map's low RAM end [default: the boot map's 2 GiB]
     #[arg(long, value_name = "BYTES", value_parser = number)]
@@ -124,29 +129,85 @@ pub(crate) struct Args {
 }
 
 pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
-    let Args { fexc, image, initrd, cmdline, ram, rsdp, vcpus, code_bytes, load_only, dump, stop_at, save, watchdog_ms, max_block, check_reuse, code_shape, speculation_barriers, rng, serial, serial_stdin, strict, lost, trace, compile_cache, compile_cache_mb, perf_log } = args;
+    let Args {
+        fexc,
+        image,
+        initrd,
+        cmdline,
+        ram,
+        rsdp,
+        vcpus,
+        code_bytes,
+        load_only,
+        dump,
+        stop_at,
+        save,
+        watchdog_ms,
+        max_block,
+        check_reuse,
+        code_shape,
+        speculation_barriers,
+        rng,
+        serial,
+        serial_stdin,
+        strict,
+        lost,
+        trace,
+        compile_cache,
+        compile_cache_mb,
+        perf_log,
+    } = args;
     if let Some(path) = perf_log {
         natemu::perf::enable(path)?;
         natemu::perf::mark("main");
     }
-    let (fexc, image, rsdp, vcpus) = (&fexc, &image, rsdp.unwrap_or(boot::ACPI_NVS.0), vcpus as usize);
-    let code_bytes = code_bytes.map_or(exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES, |b| b as usize);
-    let max_block = max_block.map(|n| u32::try_from(n).map_err(|_| "--max-block: too large")).transpose()?;
-    let saves = save.chunks(3).map(|s| Ok((number(&s[0])?, number(&s[1])?, s[2].clone()))).collect::<Result<Vec<_>>>()?;
+    let (fexc, image, rsdp, vcpus) = (
+        &fexc,
+        &image,
+        rsdp.unwrap_or(boot::ACPI_NVS.0),
+        vcpus as usize,
+    );
+    let code_bytes = code_bytes
+        .map_or(exec::cache::CODE_BYTES_MAX - exec::cache::HEAD_BYTES, |b| {
+            b as usize
+        });
+    let max_block = max_block
+        .map(|n| u32::try_from(n).map_err(|_| "--max-block: too large"))
+        .transpose()?;
+    let saves = save
+        .chunks(3)
+        .map(|s| Ok((number(&s[0])?, number(&s[1])?, s[2].clone())))
+        .collect::<Result<Vec<_>>>()?;
     let lost = lost.unwrap_or(crate::clock::LostTicks::DEFAULT);
     let image = memory::read_input(image, MAX_INPUT)?;
-    let initrd = initrd.map(|p| memory::read_input(&p, MAX_INPUT)).transpose()?;
+    let initrd = initrd
+        .map(|p| memory::read_input(&p, MAX_INPUT))
+        .transpose()?;
     if !(1..=exec::cache::MAX_VCPUS).contains(&vcpus) {
         return Err(format!("--vcpus {vcpus}: 1..={}", exec::cache::MAX_VCPUS));
     }
     let ram = ram.unwrap_or(Layout::DEFAULT.low_end);
-    if ram > exec::MAX_GUEST_RAM_BYTES as u64 { return Err("RAM exceeds the resident page-table layout capacity".into()); }
-    let layout = Layout { low_end: ram.min(exec::LOW_RAM_END), high: ram.saturating_sub(exec::LOW_RAM_END) };
+    if ram > exec::MAX_GUEST_RAM_BYTES as u64 {
+        return Err("RAM exceeds the resident page-table layout capacity".into());
+    }
+    let layout = Layout {
+        low_end: ram.min(exec::LOW_RAM_END),
+        high: ram.saturating_sub(exec::LOW_RAM_END),
+    };
     layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
     if load_only {
-        let manifest = if rng { vec![natemu::virtio::RNG_RESOURCE] } else { Vec::new() };
+        let manifest = if rng {
+            vec![natemu::virtio::RNG_RESOURCE]
+        } else {
+            Vec::new()
+        };
         let tables = boot::acpi::build_with_virtio(vcpus, rsdp, &manifest);
-        let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), acpi: Some(&tables) };
+        let inputs = Inputs {
+            image: &image,
+            cmdline: &cmdline,
+            initrd: initrd.as_deref(),
+            acpi: Some(&tables),
+        };
         // Zero-filled on demand: only the pages the loader writes are touched.
         let mut host = vec![0u64; exec::ram_end(ram) as usize / 8];
         // SAFETY: `host` backs [0, L) and outlives `guest`.
@@ -172,7 +233,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         watchdog: std::time::Duration::from_millis(watchdog_ms),
         max_block,
         stop_at,
-        compile_cache: crate::compile_cache::Config::new(compile_cache.as_deref().map(|p| p.as_os_str()), compile_cache_mb)?,
+        compile_cache: crate::compile_cache::Config::new(
+            compile_cache.as_deref().map(|p| p.as_os_str()),
+            compile_cache_mb,
+        )?,
         check_reuse,
         code_shape,
         speculation_barriers,
@@ -180,15 +244,24 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         ..natemu::linux::Boot::new(resident, fexc, image)
     };
     if let Some(path) = &serial {
-        boot.serial = Some(Box::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?));
+        boot.serial = Some(Box::new(
+            fs::File::create(path).map_err(|e| format!("{path}: {e}"))?,
+        ));
     }
     let trace = match &trace {
-        Some(path) => Some(std::io::BufWriter::new(fs::File::create(path).map_err(|e| format!("{path}: {e}"))?)),
+        Some(path) => Some(std::io::BufWriter::new(
+            fs::File::create(path).map_err(|e| format!("{path}: {e}"))?,
+        )),
         None => None,
     };
     let prepared = boot.prepare()?;
     natemu::perf::mark("prepared");
-    let (backing, loaded, board, devices) = (prepared.backing(), prepared.loaded(), prepared.board(), prepared.devices());
+    let (backing, loaded, board, devices) = (
+        prepared.backing(),
+        prepared.loaded(),
+        prepared.board(),
+        prepared.devices(),
+    );
     // SAFETY: `guest` is used only while `prepared` lives (this function).
     let guest = unsafe { prepared.guest() };
     if let Some(path) = &dump {
@@ -208,12 +281,28 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             scope.spawn(move || {
                 use std::io::Write as _;
                 let area = backing.vcpu(0);
-                let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::SeqCst);
+                let n =
+                    |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::SeqCst);
                 while tracing.load(std::sync::atomic::Ordering::SeqCst) {
-                    let t = execution::ticks_ns(crate::clock::now()) - execution::ticks_ns(area.epoch());
+                    let t = execution::ticks_ns(crate::clock::now())
+                        - execution::ticks_ns(area.epoch());
                     let (p, r, l) = (&board.pit, &board.rtc, execution::lapic(area));
-                    let _ = writeln!(file, "{t} pit {} {} {} {} {} {} rtc {} {} {} lapic {} {} {}", n(&p.rises), n(&p.fresh), n(&p.coalesced), n(&p.dropped),
-                        n(&p.missed), n(&p.reinjected), n(&r.rises), n(&r.missed), n(&r.reinjected), l.fired, l.missed, l.reinjected);
+                    let _ = writeln!(
+                        file,
+                        "{t} pit {} {} {} {} {} {} rtc {} {} {} lapic {} {} {}",
+                        n(&p.rises),
+                        n(&p.fresh),
+                        n(&p.coalesced),
+                        n(&p.dropped),
+                        n(&p.missed),
+                        n(&p.reinjected),
+                        n(&r.rises),
+                        n(&r.missed),
+                        n(&r.reinjected),
+                        l.fired,
+                        l.missed,
+                        l.reinjected
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
             });
@@ -224,7 +313,14 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     })?;
     let (stop, compiles) = outcome.each[0].as_ref().unwrap();
     let compiles = *compiles;
-    let each: Vec<(String, u64)> = outcome.each.iter().map(|o| o.as_ref().map_or(("none".into(), 0), |(s, c)| (stop_name(s), *c))).collect();
+    let each: Vec<(String, u64)> = outcome
+        .each
+        .iter()
+        .map(|o| {
+            o.as_ref()
+                .map_or(("none".into(), 0), |(s, c)| (stop_name(s), *c))
+        })
+        .collect();
     let vcpu_json: Vec<String> = each
         .iter()
         .enumerate()
@@ -242,7 +338,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         .collect();
     let first = outcome.ended_first;
     let first_json = match each.get(first) {
-        Some((stop, _)) => format!("{{\"vcpu\":{first},\"stop\":\"{}\"}}", stop.replace('"', "'")),
+        Some((stop, _)) => format!(
+            "{{\"vcpu\":{first},\"stop\":\"{}\"}}",
+            stop.replace('"', "'")
+        ),
         None => "null".into(),
     };
     for (gpa, length, path) in &saves {
@@ -256,21 +355,50 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let s: State = backing.vcpu(0).read_record(exec::STATE_OFFSET);
     let lapic_end = execution::lapic(backing.vcpu(0));
     // M1 pool use: the code cache and metadata arena filled since the last flush, and the shadow pool's resets.
-    let c: exec::cache::Control = backing.vcpu(0).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
+    let c: exec::cache::Control = backing
+        .vcpu(0)
+        .read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
     let (kind, reason) = match stop {
         Stop::Reached => ("reached".to_string(), String::new()),
-        Stop::Resident { stop: exec::stop::SHUTDOWN, .. } => ("shutdown".into(), format!("fault {:x?}", s.fault)),
+        Stop::Resident {
+            stop: exec::stop::SHUTDOWN,
+            ..
+        } => ("shutdown".into(), format!("fault {:x?}", s.fault)),
         Stop::Power(p) => (super::program::power_name(*p).into(), String::new()),
-        Stop::Resident { stop, status, detail } => {
+        Stop::Resident {
+            stop,
+            status,
+            detail,
+        } => {
             let m: exec::Mmio = backing.vcpu(0).read_record(exec::MMIO_OFFSET);
             // The access only where the host answered for it (a refusal before any request names none: just its status).
             let access = match m.status {
-                exec::mmio::UNASSIGNED | exec::mmio::DEVICE => format!(" access={:#x}/{}/{} {}", m.gpa, m.width, if m.write != 0 { "w" } else { "r" }, exec::mmio::name(m.status)),
+                exec::mmio::UNASSIGNED | exec::mmio::DEVICE => format!(
+                    " access={:#x}/{}/{} {}",
+                    m.gpa,
+                    m.width,
+                    if m.write != 0 { "w" } else { "r" },
+                    exec::mmio::name(m.status)
+                ),
                 status => format!(" mmio={}", exec::mmio::name(status)),
             };
-            ("resident".into(), format!("{} status={status} detail={detail} fault={:x?}{access}", exec::stop::name(*stop), s.fault))
+            (
+                "resident".into(),
+                format!(
+                    "{} status={status} detail={detail} fault={:x?}{access}",
+                    exec::stop::name(*stop),
+                    s.fault
+                ),
+            )
         }
-        other => (format!("{other:?}").split(['(', ' ', '{']).next().unwrap().to_lowercase(), format!("{other:?}")),
+        other => (
+            format!("{other:?}")
+                .split(['(', ' ', '{'])
+                .next()
+                .unwrap()
+                .to_lowercase(),
+            format!("{other:?}"),
+        ),
     };
     println!(
         "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"serial_error\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}},\"ended_first\":{},\"vcpus\":[{}]}}",
@@ -297,7 +425,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         execution::k1_stats(backing.vcpu(0)),
         devices.report(),
         prepared.serial_bytes(),
-        prepared.serial_error().map_or("null".into(), |e| format!("\"{}\"", e.replace('"', "'"))),
+        prepared
+            .serial_error()
+            .map_or("null".into(), |e| format!("\"{}\"", e.replace('"', "'"))),
         board.pit.json(),
         board.rtc.json(),
         lapic_end.fired,
@@ -313,7 +443,14 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
 /// A stop as the result names it: its kind, and for a resident stop its reason.
 fn stop_name(stop: &Stop) -> String {
     match stop {
-        Stop::Resident { stop, status, detail } => format!("resident {} status={status} detail={detail}", exec::stop::name(*stop)),
+        Stop::Resident {
+            stop,
+            status,
+            detail,
+        } => format!(
+            "resident {} status={status} detail={detail}",
+            exec::stop::name(*stop)
+        ),
         other => format!("{other:?}").chars().take(200).collect(),
     }
 }
@@ -324,7 +461,12 @@ fn write_dump(path: &str, guest: &GuestRam, loaded: &Loaded) -> Result<()> {
     for &(gpa, length) in &loaded.writes {
         let mut data = vec![0u8; length as usize];
         guest.copy_out(gpa, &mut data);
-        out.extend(gpa.to_le_bytes().into_iter().chain(length.to_le_bytes()).chain(data));
+        out.extend(
+            gpa.to_le_bytes()
+                .into_iter()
+                .chain(length.to_le_bytes())
+                .chain(data),
+        );
     }
     fs::write(path, out).map_err(|e| format!("{path}: {e}"))
 }
@@ -334,8 +476,14 @@ fn hex(v: u64) -> String {
 }
 /// The placement and the entry state, as an unclosed JSON object.
 fn placement(l: &Loaded, layout: &Layout) -> String {
-    let map: Vec<String> = l.map.iter().map(|e| format!("[{},{},{}]", hex(e.addr), hex(e.size), e.kind)).collect();
-    let initrd = l.initrd.map_or("null".into(), |(a, n)| format!("[{},{}]", hex(a), hex(n)));
+    let map: Vec<String> = l
+        .map
+        .iter()
+        .map(|e| format!("[{},{},{}]", hex(e.addr), hex(e.size), e.kind))
+        .collect();
+    let initrd = l
+        .initrd
+        .map_or("null".into(), |(a, n)| format!("[{},{}]", hex(a), hex(n)));
     let mut s = String::new();
     let _ = write!(
         s,

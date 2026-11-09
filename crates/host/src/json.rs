@@ -24,7 +24,10 @@ impl Value {
 }
 
 pub(crate) fn parse(text: &str) -> Result<Value, String> {
-    let mut p = Parser { b: text.as_bytes(), i: 0 };
+    let mut p = Parser {
+        b: text.as_bytes(),
+        i: 0,
+    };
     let v = p.value()?;
     p.space();
     if p.i != p.b.len() {
@@ -55,7 +58,11 @@ impl Parser<'_> {
     fn value(&mut self) -> Result<Value, String> {
         self.space();
         let rest = &self.b[self.i..];
-        for (word, v) in [("null", Value::Null), ("true", Value::Bool(true)), ("false", Value::Bool(false))] {
+        for (word, v) in [
+            ("null", Value::Null),
+            ("true", Value::Bool(true)),
+            ("false", Value::Bool(false)),
+        ] {
             if rest.starts_with(word.as_bytes()) {
                 self.i += word.len();
                 return Ok(v);
@@ -101,7 +108,10 @@ impl Parser<'_> {
                 Ok(Value::Object(members))
             }
             Some(c) if c.is_ascii_digit() || *c == b'-' => {
-                let n = rest.iter().take_while(|c| c.is_ascii_digit() || b"+-.eE".contains(c)).count();
+                let n = rest
+                    .iter()
+                    .take_while(|c| c.is_ascii_digit() || b"+-.eE".contains(c))
+                    .count();
                 self.i += n;
                 Ok(Value::Number(String::from_utf8_lossy(&rest[..n]).into()))
             }
@@ -115,12 +125,16 @@ impl Parser<'_> {
         self.i += 1;
         let mut out = Vec::new();
         loop {
-            let Some(&c) = self.b.get(self.i) else { return self.fail() };
+            let Some(&c) = self.b.get(self.i) else {
+                return self.fail();
+            };
             self.i += 1;
             match c {
                 b'"' => return String::from_utf8(out).map_err(|e| e.to_string()),
                 b'\\' => {
-                    let Some(&e) = self.b.get(self.i) else { return self.fail() };
+                    let Some(&e) = self.b.get(self.i) else {
+                        return self.fail();
+                    };
                     self.i += 1;
                     let ch = match e {
                         b'"' | b'\\' | b'/' => e as char,
@@ -130,7 +144,10 @@ impl Parser<'_> {
                         b'r' => '\r',
                         b't' => '\t',
                         b'u' => {
-                            let hex = self.b.get(self.i..self.i + 4).and_then(|h| std::str::from_utf8(h).ok());
+                            let hex = self
+                                .b
+                                .get(self.i..self.i + 4)
+                                .and_then(|h| std::str::from_utf8(h).ok());
                             let code = hex.and_then(|h| u32::from_str_radix(h, 16).ok());
                             let Some(code) = code else { return self.fail() };
                             self.i += 4;
@@ -152,10 +169,18 @@ mod tests {
     #[test]
     fn nested_values_escapes_and_errors() {
         let v = parse(r#" {"a": [1, -2.5e3, true, null], "b": {"c": "x\"A\n"}} "#).unwrap();
-        assert_eq!(v.get("b").and_then(|b| b.get("c")).and_then(Value::as_str), Some("x\"A\n"));
+        assert_eq!(
+            v.get("b").and_then(|b| b.get("c")).and_then(Value::as_str),
+            Some("x\"A\n")
+        );
         assert_eq!(
             v.get("a"),
-            Some(&Value::Array(vec![Value::Number("1".into()), Value::Number("-2.5e3".into()), Value::Bool(true), Value::Null]))
+            Some(&Value::Array(vec![
+                Value::Number("1".into()),
+                Value::Number("-2.5e3".into()),
+                Value::Bool(true),
+                Value::Null
+            ]))
         );
         for bad in ["", "{", "[1,]", "{\"a\" 1}", "\"abc", "{} x", "[1 2]"] {
             assert!(parse(bad).is_err(), "{bad:?}");

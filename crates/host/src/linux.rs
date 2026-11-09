@@ -100,23 +100,53 @@ impl Boot {
     pub fn prepare(self) -> Result<Prepared> {
         // PCID plan P1: the barriers' leaf SB needs FEAT_SB; refuse to turn them on without it (default off needs nothing).
         if self.speculation_barriers && !execution::host_feature("FEAT_SB") {
-            return Err("--speculation-barriers: this host lacks FEAT_SB (sysctl hw.optional.arm.FEAT_SB)".into());
+            return Err(
+                "--speculation-barriers: this host lacks FEAT_SB (sysctl hw.optional.arm.FEAT_SB)"
+                    .into(),
+            );
         }
-        let layout = Layout { low_end: self.ram.min(exec::LOW_RAM_END), high: self.ram.saturating_sub(exec::LOW_RAM_END) };
+        let layout = Layout {
+            low_end: self.ram.min(exec::LOW_RAM_END),
+            high: self.ram.saturating_sub(exec::LOW_RAM_END),
+        };
         layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
         require_vcpus(self.vcpus)?;
-        let backing = execution::prepare(&self.runtime.to_string_lossy(), self.code_bytes, self.vcpus, self.ram as usize)?;
+        let backing = execution::prepare(
+            &self.runtime.to_string_lossy(),
+            self.code_bytes,
+            self.vcpus,
+            self.ram as usize,
+        )?;
         let mut manifest = Vec::new();
-        if self.rng { manifest.push(crate::virtio::RNG_RESOURCE); }
-        if self.disk.is_some() { manifest.push(crate::virtio::BLOCK_RESOURCE); }
+        if self.rng {
+            manifest.push(crate::virtio::RNG_RESOURCE);
+        }
+        if self.disk.is_some() {
+            manifest.push(crate::virtio::BLOCK_RESOURCE);
+        }
         let tables = boot::acpi::build_with_virtio(self.vcpus, self.rsdp, &manifest);
-        let inputs = Inputs { image: &self.kernel, cmdline: &self.cmdline, initrd: self.initrd.as_deref(), acpi: Some(&tables) };
+        let inputs = Inputs {
+            image: &self.kernel,
+            cmdline: &self.cmdline,
+            initrd: self.initrd.as_deref(),
+            acpi: Some(&tables),
+        };
         let loaded = boot::load(&backing.ram, &layout, &inputs).map_err(|e| e.to_string())?;
         execution::guest_ram_written(&backing.memory);
         let lost = self.lost_ticks;
         for v in 0..self.vcpus {
-            execution::set_cpu(backing.vcpu(v), if v == 0 { loaded.cpu } else { loaded.ap }, self.speculation_barriers);
-            execution::set_lapic(backing.vcpu(v), natemu_abi::lapic::Lapic { reinject: u64::from(lost.lapic), ..natemu_abi::lapic::RESET });
+            execution::set_cpu(
+                backing.vcpu(v),
+                if v == 0 { loaded.cpu } else { loaded.ap },
+                self.speculation_barriers,
+            );
+            execution::set_lapic(
+                backing.vcpu(v),
+                natemu_abi::lapic::Lapic {
+                    reinject: u64::from(lost.lapic),
+                    ..natemu_abi::lapic::RESET
+                },
+            );
             if v > 0 {
                 let mut state: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
                 state.mailbox = tables.mailbox;
@@ -316,7 +346,12 @@ impl Prepared {
         self.irqs.attach(machine.doorbell());
         // COM1's host input: a detached thread (it blocks in its read), holding a busy guard while it may still feed (the
         // rule `irq.rs` sets for asynchronous sources; no Linux boot reads it today).
-        if let Some(input) = self.serial_input.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(input) = self
+            .serial_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let (uart, busy, cancel) = (self.uart.clone(), self.irqs.busy(), self.canceller());
             std::thread::spawn(move || {
                 uart::feed(&uart, input, || cancel.cancel());
@@ -350,13 +385,28 @@ impl Prepared {
             compiler.share(&answers);
             compiler.check_reuse = self.check_reuse;
             compiler.shape = self.code_shape;
-            let mut requests = execution::Requests { devices: Some(self.devices.clone()), ..Default::default() };
+            let mut requests = execution::Requests {
+                devices: Some(self.devices.clone()),
+                ..Default::default()
+            };
             let stop_at = if v == 0 { self.stop_at } else { None };
-            let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, self.watchdog, &mut requests, &stops, cancelled, &mut ());
+            let stop = execution::run(
+                cpu,
+                backing.vcpu(v),
+                &mut compiler,
+                stop_at,
+                self.watchdog,
+                &mut requests,
+                &stops,
+                cancelled,
+                &mut (),
+            );
             let end = crate::perf::now();
             // Close device admission before a participant disappears. Pending copies must be
             // canceled rather than waiting for an acknowledgement from the ended vCPU.
-            for device in &self.virtio { device.stop(); }
+            for device in &self.virtio {
+                device.stop();
+            }
             stops.end(v);
             // X4: one vCPU's end ends the machine's run; the first to end (not cancelled) is reported as the run's cause.
             if !matches!(stop, Ok(Stop::Cancelled)) {
@@ -369,15 +419,48 @@ impl Prepared {
                 let s: State = area.read_record(exec::STATE_OFFSET);
                 let state = format!(
                     "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}]}}",
-                    s.blocks, s.l2_hits, s.requests, s.retries, s.upgrades, s.evictions, s.linker, s.links, s.unlinks, s.invalidations, s.steps,
-                    s.shootdowns, s.systems, s.halts, s.interrupts, s.deliveries, s.stops, execution::shadow_resets(area), compiler.compiles,
-                    compiler.hits, compiler.disk_hits, compiler.relocated, compiler.relocation_refused, compiler.relocation_fallbacks,
-                    compiler.reuse_checks, compiler.hits_by_source, compiler.duplicates, compiler.lock_wait.0,
+                    s.blocks,
+                    s.l2_hits,
+                    s.requests,
+                    s.retries,
+                    s.upgrades,
+                    s.evictions,
+                    s.linker,
+                    s.links,
+                    s.unlinks,
+                    s.invalidations,
+                    s.steps,
+                    s.shootdowns,
+                    s.systems,
+                    s.halts,
+                    s.interrupts,
+                    s.deliveries,
+                    s.stops,
+                    execution::shadow_resets(area),
+                    compiler.compiles,
+                    compiler.hits,
+                    compiler.disk_hits,
+                    compiler.relocated,
+                    compiler.relocation_refused,
+                    compiler.relocation_fallbacks,
+                    compiler.reuse_checks,
+                    compiler.hits_by_source,
+                    compiler.duplicates,
+                    compiler.lock_wait.0,
                     compiler.lock_wait.1
                 );
-                match log.finish(end, fexc, &area.read_record(exec::perf::OFFSET), &area.read_record(exec::perf::WAKES_OFFSET), &execution::k1_stats(area), &state) {
+                match log.finish(
+                    end,
+                    fexc,
+                    &area.read_record(exec::perf::OFFSET),
+                    &area.read_record(exec::perf::WAKES_OFFSET),
+                    &execution::k1_stats(area),
+                    &state,
+                ) {
                     (0, 0) => {}
-                    (failed, dropped) => eprintln!("natemu: performance log of vCPU {v}: {failed} failed writes so far, {dropped} request lines past the cap"),
+                    (failed, dropped) => eprintln!(
+                        "natemu: performance log of vCPU {v}: {failed} failed writes so far, {dropped} request lines past the cap"
+                    ),
                 }
             }
             Ok((stop?, compiler.compiles))
@@ -386,13 +469,22 @@ impl Prepared {
         // now; zero without a `perf` resident): `snap NS` and `perf::BUCKETS` ns values per vCPU.
         let sampling = AtomicBool::new(crate::perf::on());
         let (supervision, io_result) = std::thread::scope(|scope| {
-            let io: Vec<_> = self.virtio.iter().map(|device| scope.spawn(|| {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                    device.run(backing, &machine, &stops, &self.cancel)
-                )).unwrap_or_else(|_| Err("virtio owner panicked".into()));
-                if result.is_err() { owners::cancel_owners(&self.cancel); }
-                result
-            })).collect();
+            let io: Vec<_> = self
+                .virtio
+                .iter()
+                .map(|device| {
+                    scope.spawn(|| {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            device.run(backing, &machine, &stops, &self.cancel)
+                        }))
+                        .unwrap_or_else(|_| Err("virtio owner panicked".into()));
+                        if result.is_err() {
+                            owners::cancel_owners(&self.cancel);
+                        }
+                        result
+                    })
+                })
+                .collect();
             if sampling.load(SeqCst) {
                 scope.spawn(|| {
                     use exec::perf as rp;
@@ -417,11 +509,17 @@ impl Prepared {
             }
             let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
             sampling.store(false, SeqCst);
-            for device in &self.virtio { device.stop(); }
+            for device in &self.virtio {
+                device.stop();
+            }
             let mut io_result = Ok(());
             for thread in io {
-                let result = thread.join().unwrap_or_else(|_| Err("virtio owner panicked".into()));
-                if io_result.is_ok() { io_result = result; }
+                let result = thread
+                    .join()
+                    .unwrap_or_else(|_| Err("virtio owner panicked".into()));
+                if io_result.is_ok() {
+                    io_result = result;
+                }
             }
             (supervision, io_result)
         });
@@ -436,8 +534,18 @@ impl Prepared {
         io_result?;
         // A resident built with its `perf` feature keeps its accounting on every entry whether or not anything reads it:
         // say so when the log is off (read after the run, never on its path).
-        if !crate::perf::on() && (0..vcpus).any(|v| backing.vcpu(v).read_record::<exec::perf::Perf>(exec::perf::OFFSET).magic == exec::perf::MAGIC) {
-            eprintln!("natemu: the resident was built with its `perf` feature but the performance log is off (NATEMU_PERF_LOG): its accounting slows every resident entry");
+        if !crate::perf::on()
+            && (0..vcpus).any(|v| {
+                backing
+                    .vcpu(v)
+                    .read_record::<exec::perf::Perf>(exec::perf::OFFSET)
+                    .magic
+                    == exec::perf::MAGIC
+            })
+        {
+            eprintln!(
+                "natemu: the resident was built with its `perf` feature but the performance log is off (NATEMU_PERF_LOG): its accounting slows every resident entry"
+            );
         }
         if let Some(e) = supervision.error {
             return Err(e);
@@ -445,7 +553,10 @@ impl Prepared {
         if supervision.outputs.first().is_none_or(Option::is_none) {
             return Err("vCPU without a result".into());
         }
-        Ok(Outcome { each: supervision.outputs, ended_first: ended_first.load(SeqCst) })
+        Ok(Outcome {
+            each: supervision.outputs,
+            ended_first: ended_first.load(SeqCst),
+        })
     }
     /// The run's end, before the VM is destroyed (under the GIC lock, `Machine::destroy`). R2 review: no source may ring
     /// this VM's doorbells once it is gone (they would reach the process's next VM): the chipset detaches them under its
@@ -489,7 +600,11 @@ impl Prepared {
     }
     /// The serial sink's write error, if one failed (it is dropped then: COM1's later output goes nowhere).
     pub fn serial_error(&self) -> Option<String> {
-        self.uart.lock().unwrap_or_else(|e| e.into_inner()).sink_error.clone()
+        self.uart
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sink_error
+            .clone()
     }
 }
 
@@ -508,8 +623,13 @@ mod tests {
     /// more). No VM: the doorbell is never rung (nothing routes IRQ 0 to a LAPIC).
     #[test]
     fn the_end_of_a_run_detaches_and_stops_the_timers() {
-        let resident = std::env::temp_dir().join(format!("natemu-linux-end-{}.elf", std::process::id()));
-        std::fs::write(&resident, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let resident =
+            std::env::temp_dir().join(format!("natemu-linux-end-{}.elf", std::process::id()));
+        std::fs::write(
+            &resident,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
         let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
         (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
         let prepared = boot.prepare();
@@ -535,23 +655,40 @@ mod tests {
     /// (IER bit 1) raises ISA IRQ 4, which the I/O APIC routes to vCPU 0 as vector 0x41.
     #[test]
     fn interrupts_reach_the_backing_after_prepare_moves_it() {
-        let resident = std::env::temp_dir().join(format!("natemu-linux-test-{}.elf", std::process::id()));
-        std::fs::write(&resident, crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)])).unwrap();
+        let resident =
+            std::env::temp_dir().join(format!("natemu-linux-test-{}.elf", std::process::id()));
+        std::fs::write(
+            &resident,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
         let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
         (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
         let prepared = boot.prepare();
         std::fs::remove_file(&resident).unwrap();
         let prepared = Box::new(prepared.unwrap());
         clobber_stack();
-        execution::set_lapic(prepared.backing().vcpu(0), natemu_abi::lapic::Lapic { svr: SVR_ENABLE | 0xff, ..RESET });
-        let (ioapic, _) = prepared.devices().find(boot::acpi::platform::IOAPIC_BASE.into()).unwrap();
+        execution::set_lapic(
+            prepared.backing().vcpu(0),
+            natemu_abi::lapic::Lapic {
+                svr: SVR_ENABLE | 0xff,
+                ..RESET
+            },
+        );
+        let (ioapic, _) = prepared
+            .devices()
+            .find(boot::acpi::platform::IOAPIC_BASE.into())
+            .unwrap();
         for (select, value) in [(0x18, 0x41), (0x19, 0)] {
             let mut d = ioapic.lock().unwrap();
             d.write(0, 0, 4, select);
             d.write(0, 0x10, 4, value);
         }
         assert!(!execution::pending(&prepared.backing().memory, 0, 0x41));
-        prepared.devices().port(0, boot::acpi::platform::COM1_PORT + 1, 1, Some(2)).unwrap();
+        prepared
+            .devices()
+            .port(0, boot::acpi::platform::COM1_PORT + 1, 1, Some(2))
+            .unwrap();
         assert!(execution::pending(&prepared.backing().memory, 0, 0x41));
     }
 }

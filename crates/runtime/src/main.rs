@@ -6,13 +6,13 @@ use core::{
     mem::{offset_of, size_of},
     ptr,
 };
-use natemu_abi::*;
 use natemu_abi::guest_memory::{GuestRam, GuestTables};
+use natemu_abi::*;
 use record::*;
 mod cache;
+mod execution;
 #[cfg(feature = "io-test-hooks")]
 mod io_test;
-mod execution;
 mod perf;
 mod record;
 mod tables;

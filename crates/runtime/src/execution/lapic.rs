@@ -39,8 +39,8 @@
 //! **Not built:** LINT0/LINT1 in fixed mode (no board source drives them so), thermal
 //! and performance-counter sources (none in the profile), INIT/start-up (real mode; X4 uses the mailbox), TSC-deadline
 //! (not advertised).
-use super::*;
 use super::segments::Exception;
+use super::*;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::clock;
 use natemu_abi::execution::cache::{EVENTS, Events, GLOBAL_VA};
@@ -91,7 +91,8 @@ fn base() -> u64 {
     msr_get(base_slot())
 }
 fn publish(s: &State) {
-    event_word(s.vcpu, core::mem::offset_of!(Events, apic)).store(apic::published(base(), lapic(), s.vcpu), SeqCst);
+    event_word(s.vcpu, core::mem::offset_of!(Events, apic))
+        .store(apic::published(base(), lapic(), s.vcpu), SeqCst);
 }
 /// V without a barrier (see [`poll`]).
 fn count() -> u64 {
@@ -119,7 +120,9 @@ fn cntv(at: Option<u64>) {
     // SAFETY: EL1 access to the vCPU's own virtual timer (CNTV_CVAL_EL0, CNTV_CTL_EL0: ENABLE, IMASK clear).
     unsafe {
         match at {
-            Some(v) => asm!("msr cntv_cval_el0, {v}", "mov {t}, #1", "msr cntv_ctl_el0, {t}", "isb", v = in(reg) v, t = out(reg) _),
+            Some(v) => {
+                asm!("msr cntv_cval_el0, {v}", "mov {t}, #1", "msr cntv_ctl_el0, {t}", "isb", v = in(reg) v, t = out(reg) _)
+            }
             None => asm!("msr cntv_ctl_el0, xzr", "isb"),
         }
     }
@@ -170,7 +173,15 @@ fn controller(s: &mut State, eoi: bool, value: u64) -> u64 {
     let bytes = size_of::<State>();
     unsafe {
         let saved = read_record(exchange);
-        write_record(exchange, &Mmio { write: u64::from(eoi), value, completed: saved.completed, ..Mmio::default() });
+        write_record(
+            exchange,
+            &Mmio {
+                write: u64::from(eoi),
+                value,
+                completed: saved.completed,
+                ..Mmio::default()
+            },
+        );
         (s.request, s.reply) = (REQUEST_IRQ, NONE);
         copy_record(record().cast(), (&raw const *s).cast(), bytes);
         let p = crate::perf::enter(crate::perf::HOST);
@@ -190,7 +201,8 @@ fn controller(s: &mut State, eoi: bool, value: u64) -> u64 {
 /// disabled (the PIC wired through, QEMU's `apic_accept_pic_intr`), or LVT LINT0 unmasked with delivery mode ExtINT.
 /// It ignores the priority rules (QEMU's `apic_get_interrupt` takes it before the IRR) and needs RFLAGS.IF.
 pub(super) fn extint(s: &State) -> bool {
-    event_word(s.vcpu, core::mem::offset_of!(Events, lint0)).load(SeqCst) != 0 && word_of(s.vcpu) & apic::EXTINT != 0
+    event_word(s.vcpu, core::mem::offset_of!(Events, lint0)).load(SeqCst) != 0
+        && word_of(s.vcpu) & apic::EXTINT != 0
 }
 /// L4a: takes the ExtINT: the PIC's vector (its INTA cycle, which may give the spurious IRQ 7 when a peer took it first).
 pub(super) fn take_extint(s: &mut State) -> u64 {
@@ -225,14 +237,26 @@ fn ticks(l: &Lapic) -> u64 {
     (clock::crystal(now(), l.frequency) - l.start) / apic::divisor(l.dcr)
 }
 fn current_count(l: &Lapic) -> u64 {
-    if l.spent != 0 { 0 } else { apic::current_count(l.initial, l.lvt[apic::TIMER] & apic::PERIODIC != 0, ticks(l)) }
+    if l.spent != 0 {
+        0
+    } else {
+        apic::current_count(
+            l.initial,
+            l.lvt[apic::TIMER] & apic::PERIODIC != 0,
+            ticks(l),
+        )
+    }
 }
 /// Takes the timer's expiries due by now and arms the virtual timer for the next one (after any timer register change,
 /// and from [`poll`]).
 fn timer(s: &mut State) {
     let l = lapic();
     let periodic = l.lvt[apic::TIMER] & apic::PERIODIC != 0;
-    let n = if l.spent != 0 { 0 } else { apic::expiries(l.initial, periodic, ticks(l)) };
+    let n = if l.spent != 0 {
+        0
+    } else {
+        apic::expiries(l.initial, periodic, ticks(l))
+    };
     if n > l.fired {
         // L5: expiries that passed while one was due merge into one (the IRR's rule); so does one whose vector is still
         // pending. Under reinject each is delivered later, one per acceptance ([`reinject`]).
@@ -359,13 +383,24 @@ pub(super) fn claims(gpa: u64) -> bool {
 /// `Some(Err)`: an access the APIC does not implement (11.4.1: registers are 32 bits wide at 16-byte-aligned offsets).
 /// With the APIC hardware disabled or in x2APIC mode the page is no APIC's: it answers as an unassigned page does (L3:
 /// a read all-ones at its width, a write ignored), any width.
-pub(super) fn mmio(s: &mut State, gpa: u64, width: u64, data: Option<u64>) -> Option<Result<u64, ()>> {
+pub(super) fn mmio(
+    s: &mut State,
+    gpa: u64,
+    width: u64,
+    data: Option<u64>,
+) -> Option<Result<u64, ()>> {
     let b = base();
     if !claims(gpa) {
         return None;
     }
     if b & (EN | EXTD) != EN {
-        return Some(Ok(if data.is_some() { 0 } else if width == 8 { u64::MAX } else { (1 << (8 * width)) - 1 }));
+        return Some(Ok(if data.is_some() {
+            0
+        } else if width == 8 {
+            u64::MAX
+        } else {
+            (1 << (8 * width)) - 1
+        }));
     }
     let offset = gpa & 0xfff;
     if width != 4 || offset & 0xf != 0 {
@@ -402,7 +437,10 @@ fn read(s: &State, reg: u64, x2apic: bool) -> Option<u64> {
         0xe if !x2apic => l.dfr,
         0xf => l.svr,
         0x10..=0x17 => bits32(&l.isr, reg - 0x10),
-        0x18..=0x1f => tmr_word(s.vcpu, (reg - 0x18) as usize / 2).load(SeqCst) >> (32 * (reg % 2)) & 0xffff_ffff,
+        0x18..=0x1f => {
+            tmr_word(s.vcpu, (reg - 0x18) as usize / 2).load(SeqCst) >> (32 * (reg % 2))
+                & 0xffff_ffff
+        }
         0x20..=0x27 => {
             let w = (reg - 0x20) as usize / 2;
             irr_word(s.vcpu, w).load(SeqCst) >> (32 * (reg % 2)) & 0xffff_ffff
@@ -469,7 +507,11 @@ fn write_common(s: &mut State, reg: u64, v: u64) -> bool {
                 timer(s); // expiries due under the old mode and mask first (a masked LVT drops them, 11.5.1)
             }
             let l = lapic();
-            let masked = if l.svr & apic::SVR_ENABLE != 0 { 0 } else { apic::MASKED };
+            let masked = if l.svr & apic::SVR_ENABLE != 0 {
+                0
+            } else {
+                apic::MASKED
+            };
             let new = v & apic::LVT_WRITABLE[i] | masked;
             if i == apic::TIMER && (new ^ l.lvt[i]) & apic::PERIODIC != 0 && l.spent == 0 {
                 // A mode change counts no expiry that passed under the old mode (a one-shot already past 0 is spent).
@@ -486,7 +528,8 @@ fn write_common(s: &mut State, reg: u64, v: u64) -> bool {
             }
         }
         0x38 => {
-            (l.initial, l.start, l.fired, l.spent) = (v & 0xffff_ffff, clock::crystal(now(), l.frequency), 0, 0);
+            (l.initial, l.start, l.fired, l.spent) =
+                (v & 0xffff_ffff, clock::crystal(now(), l.frequency), 0, 0);
             timer(s);
         }
         0x3e => {
@@ -497,8 +540,13 @@ fn write_common(s: &mut State, reg: u64, v: u64) -> bool {
             let dcr = v & apic::DCR_WRITABLE;
             if l.initial != 0 && l.spent == 0 {
                 let t = ticks(l);
-                let phase = if l.lvt[apic::TIMER] & apic::PERIODIC != 0 { t % l.initial } else { t };
-                l.start = clock::crystal(now(), l.frequency).saturating_sub(phase * apic::divisor(dcr));
+                let phase = if l.lvt[apic::TIMER] & apic::PERIODIC != 0 {
+                    t % l.initial
+                } else {
+                    t
+                };
+                l.start =
+                    clock::crystal(now(), l.frequency).saturating_sub(phase * apic::divisor(dcr));
                 l.fired = 0;
             }
             l.dcr = dcr;
@@ -570,7 +618,13 @@ pub(super) fn set_base(s: &mut State, new: u64) -> Result<(), Exception> {
         // clear, and that bit is cleared again when the APIC is enabled (nothing is accepted while disabled).
         publish(s);
         let l = lapic();
-        *l = Lapic { frequency: l.frequency, reinject: l.reinject, missed: l.missed, reinjected: l.reinjected, ..apic::RESET };
+        *l = Lapic {
+            frequency: l.frequency,
+            reinject: l.reinject,
+            missed: l.missed,
+            reinjected: l.reinjected,
+            ..apic::RESET
+        };
         (0..4).for_each(|w| {
             irr_word(s.vcpu, w).store(0, SeqCst);
             tmr_word(s.vcpu, w).store(0, SeqCst);
@@ -598,12 +652,19 @@ fn send(s: &mut State, icr: u64, x2apic: bool) {
         icr::SELF => 1 << me,
         icr::ALL => all,
         icr::OTHERS => all & !(1 << me),
-        _ => (0..s.vcpus).filter(|&t| apic::in_destination(word_of(t), t, dest, icr & icr::LOGICAL != 0, x2apic)).fold(0, |m, t| m | 1 << t),
+        _ => (0..s.vcpus)
+            .filter(|&t| apic::in_destination(word_of(t), t, dest, icr & icr::LOGICAL != 0, x2apic))
+            .fold(0, |m, t| m | 1 << t),
     };
     // Counted after the bit is set, before the doorbell (`Events::posts`: the host's rule for ending halted vCPUs).
     let ring = |t: u64| {
         if crate::perf::ON {
-            let _ = event_word(t, core::mem::offset_of!(Events, rung)).compare_exchange(0, now(), SeqCst, SeqCst);
+            let _ = event_word(t, core::mem::offset_of!(Events, rung)).compare_exchange(
+                0,
+                now(),
+                SeqCst,
+                SeqCst,
+            );
         }
         event_word(t, core::mem::offset_of!(Events, posts)).fetch_add(1, SeqCst);
         if t != me {
@@ -615,7 +676,8 @@ fn send(s: &mut State, icr: u64, x2apic: bool) {
             if vector < 16 {
                 return error(s, apic::SEND_ILLEGAL);
             }
-            let accepting = (0..s.vcpus).filter(|&t| targets >> t & 1 != 0 && word_of(t) & apic::SW_ENABLED != 0);
+            let accepting = (0..s.vcpus)
+                .filter(|&t| targets >> t & 1 != 0 && word_of(t) & apic::SW_ENABLED != 0);
             // Lowest priority: the lowest-numbered member of the set (the arbitration is model specific, 11.6.2.4).
             for t in accepting.take(if mode == icr::LOWEST { 1 } else { 64 }) {
                 accept_edge(t, vector);
@@ -623,7 +685,9 @@ fn send(s: &mut State, icr: u64, x2apic: bool) {
             }
         }
         icr::NMI => {
-            for t in (0..s.vcpus).filter(|&t| targets >> t & 1 != 0 && word_of(t) & apic::HW_ENABLED != 0) {
+            for t in (0..s.vcpus)
+                .filter(|&t| targets >> t & 1 != 0 && word_of(t) & apic::HW_ENABLED != 0)
+            {
                 event_word(t, core::mem::offset_of!(Events, nmi)).store(1, SeqCst);
                 ring(t);
             }

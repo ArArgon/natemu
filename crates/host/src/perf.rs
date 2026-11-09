@@ -33,7 +33,8 @@ pub fn thread_cpu() -> u64 {
 pub fn enable(path: impl Into<PathBuf>) -> Result<()> {
     let path = path.into();
     let file = File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    LOG.set((path, Mutex::new(file))).map_err(|_| "the performance log is already on".to_string())
+    LOG.set((path, Mutex::new(file)))
+        .map_err(|_| "the performance log is already on".to_string())
 }
 pub fn on() -> bool {
     LOG.get().is_some()
@@ -82,7 +83,19 @@ pub const IRQ: usize = 8;
 pub const ENTROPY: usize = 9;
 /// Writing the request's line (the log's own cost).
 pub const LOG_LINE: usize = 10;
-const HOST: [&str; 11] = ["signal", "run", "exit", "translate", "step", "device", "page", "port", "irq", "entropy", "log"];
+const HOST: [&str; 11] = [
+    "signal",
+    "run",
+    "exit",
+    "translate",
+    "step",
+    "device",
+    "page",
+    "port",
+    "irq",
+    "entropy",
+    "log",
+];
 /// Parts of a translation request: the guest bytes' copy, the in-memory cache's lookup, the persistent cache's get (the
 /// request body and its SHA-256 key included), fexc's round trip (its server's start included), the persistent put (a
 /// send to its writer thread), admission, a system instruction's decode, staging (the object and its link points), and
@@ -98,7 +111,10 @@ pub const DECODE: usize = 6;
 pub const STAGE: usize = 7;
 pub const KEEP: usize = 8;
 pub const RELOCATE: usize = 9;
-const PARTS: [&str; 10] = ["fetch", "lookup", "disk_get", "fexc", "disk_put", "admit", "decode", "stage", "keep", "relocate"];
+const PARTS: [&str; 10] = [
+    "fetch", "lookup", "disk_get", "fexc", "disk_put", "admit", "decode", "stage", "keep",
+    "relocate",
+];
 
 /// One vCPU's log while it runs (`Compiler::perf`).
 pub struct Recorder {
@@ -135,7 +151,9 @@ pub struct Recorder {
 impl Recorder {
     /// For vCPU `vcpu`, whose body started at `start` (now on the thread's clock).
     pub fn new(vcpu: usize, start: u64) -> Result<Option<Box<Self>>> {
-        let Some((path, _)) = LOG.get() else { return Ok(None) };
+        let Some((path, _)) = LOG.get() else {
+            return Ok(None);
+        };
         let path = PathBuf::from(format!("{}.v{vcpu}", path.display()));
         let file = File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let t = now();
@@ -186,7 +204,18 @@ impl Recorder {
     /// start (ns), 1 if a step request else 0, the admitted block's guest bytes (0: none), 1 if it ends in a call else 0,
     /// and its exit candidates `target:F` (F = 1 when on a page the request fetched), comma-separated, or `-`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn request(&mut self, cr3: u64, rip: u64, gpa: u64, reply: u64, began: u64, step: bool, generation: u64, context: u64, gpa2: u64) {
+    pub(crate) fn request(
+        &mut self,
+        cr3: u64,
+        rip: u64,
+        gpa: u64,
+        reply: u64,
+        began: u64,
+        step: bool,
+        generation: u64,
+        context: u64,
+        gpa2: u64,
+    ) {
         let total = now() - began;
         use natemu_abi::execution as exec;
         let result = match reply {
@@ -198,19 +227,48 @@ impl Recorder {
         };
         self.results[result] += 1;
         let s = self.sources;
-        let source = if s[2] > 0 { 2 } else if s[1] > 0 { 1 } else { 0 };
+        let source = if s[2] > 0 {
+            2
+        } else if s[1] > 0 {
+            1
+        } else {
+            0
+        };
         if s.iter().any(|&n| n > 0) {
             self.by_source[source] += 1;
         }
         let p = self.part;
         let candidates = match self.candidates.is_empty() {
             true => "-".to_string(),
-            false => self.candidates.iter().map(|&(t, on)| format!("{t:x}:{}", u8::from(on))).collect::<Vec<_>>().join(","),
+            false => self
+                .candidates
+                .iter()
+                .map(|&(t, on)| format!("{t:x}:{}", u8::from(on)))
+                .collect::<Vec<_>>()
+                .join(","),
         };
         let line = format!(
             "{} {cr3:x} {rip:x} {gpa:x} {} {} {} {} {} {:x} {} {} {} {} {} {} {} {} {} {total} {generation} {context:x} {} {gpa2:x} {began} {} {} {} {candidates}",
-            self.vcpu, ["B", "S", "N", "F", "P"][result], s[0], s[1], s[2], self.read.1, self.read.0, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8],
-            u8::from(self.template), u8::from(step), self.block.0, u8::from(self.block.1)
+            self.vcpu,
+            ["B", "S", "N", "F", "P"][result],
+            s[0],
+            s[1],
+            s[2],
+            self.read.1,
+            self.read.0,
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+            p[8],
+            u8::from(self.template),
+            u8::from(step),
+            self.block.0,
+            u8::from(self.block.1)
         );
         if self.written + line.len() as u64 + 1 > REQUEST_BYTES {
             self.dropped += 1;
@@ -222,35 +280,86 @@ impl Recorder {
         for (t, q) in self.parts.iter_mut().zip(p) {
             *t += q;
         }
-        (self.part, self.sources, self.read, self.template, self.halved, self.block) = ([0; PARTS.len()], [0; 3], (0, 0), false, false, (0, false));
+        (
+            self.part,
+            self.sources,
+            self.read,
+            self.template,
+            self.halved,
+            self.block,
+        ) = ([0; PARTS.len()], [0; 3], (0, 0), false, false, (0, false));
         self.candidates.clear();
     }
     /// The vCPU's line: `end` = its service loop's end; `fexc` = its server's (user, system) CPU ns and maximum resident
     /// bytes; `resident` = the resident's record and the K1 statistics (`execution::k1_stats`).
     /// Returns the log's failed writes so far (this line's included) and the request lines this vCPU dropped at the cap.
-    pub(crate) fn finish(mut self, end: u64, fexc: Option<(u64, u64, u64)>, resident: &natemu_abi::execution::perf::Perf, wakes: &natemu_abi::execution::perf::Wakes, k1: &str, state: &str) -> (u64, u64) {
+    pub(crate) fn finish(
+        mut self,
+        end: u64,
+        fexc: Option<(u64, u64, u64)>,
+        resident: &natemu_abi::execution::perf::Perf,
+        wakes: &natemu_abi::execution::perf::Wakes,
+        k1: &str,
+        state: &str,
+    ) -> (u64, u64) {
         if let Err(e) = self.requests.flush() {
             write_failed(&e);
         }
         let (cpu, done) = (thread_cpu() - self.cpu, now());
         let pairs = |names: &[&str], ns: &[u64], n: &[u64]| -> String {
-            names.iter().zip(ns).zip(n).map(|((k, t), c)| format!("\"{k}\":[{t},{c}]")).collect::<Vec<_>>().join(",")
+            names
+                .iter()
+                .zip(ns)
+                .zip(n)
+                .map(|((k, t), c)| format!("\"{k}\":[{t},{c}]"))
+                .collect::<Vec<_>>()
+                .join(",")
         };
-        let parts: Vec<String> = PARTS.iter().zip(self.parts).map(|(k, t)| format!("\"{k}\":{t}")).collect();
-        let fexc = fexc.map_or("null".into(), |(u, s, rss)| format!("{{\"user_ns\":{u},\"sys_ns\":{s},\"max_rss\":{rss}}}"));
+        let parts: Vec<String> = PARTS
+            .iter()
+            .zip(self.parts)
+            .map(|(k, t)| format!("\"{k}\":{t}"))
+            .collect();
+        let fexc = fexc.map_or("null".into(), |(u, s, rss)| {
+            format!("{{\"user_ns\":{u},\"sys_ns\":{s},\"max_rss\":{rss}}}")
+        });
         use natemu_abi::execution::perf as rp;
-        let ticks: Vec<u64> = resident.ticks.iter().map(|&t| crate::execution::ticks_ns(t)).collect();
+        let ticks: Vec<u64> = resident
+            .ticks
+            .iter()
+            .map(|&t| crate::execution::ticks_ns(t))
+            .collect();
         let buckets = pairs(&rp::NAMES, &ticks, &resident.count);
         // Perf chunk 14: halt wake-ups, [count, total ns, max ns, [bins]] by kind.
         let ns = crate::execution::ticks_ns;
         let wakes = (0..rp::WAKE_KINDS)
-            .map(|k| format!("\"{}\":[{},{},{},{:?}]", rp::WAKE_NAMES[k], wakes.count[k], ns(wakes.ticks[k]), ns(wakes.max[k]), wakes.bins[k]))
+            .map(|k| {
+                format!(
+                    "\"{}\":[{},{},{},{:?}]",
+                    rp::WAKE_NAMES[k],
+                    wakes.count[k],
+                    ns(wakes.ticks[k]),
+                    ns(wakes.max[k]),
+                    wakes.bins[k]
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         line(&format!(
             "vcpu {{\"vcpu\":{},\"start\":{},\"created\":{},\"last\":{},\"end\":{end},\"done\":{done},\"cpu_ns\":{cpu},\"host\":{{{}}},\"parts\":{{{}}},\"results\":{:?},\"sources\":{:?},\"fexc\":{fexc},\"resident\":{{\"magic\":{},\"since\":{},\"current\":{},\"buckets\":{{{buckets}}},\"wakes\":{{{wakes}}}}},\"k1\":{k1},\"state\":{state},\"log\":{{\"failed\":{},\"dropped\":{}}}}}",
-            self.vcpu, self.start, self.created, self.last, pairs(&HOST, &self.host, &self.exits), parts.join(","), self.results, self.by_source,
-            resident.magic == rp::MAGIC, crate::execution::ticks_ns(resident.since), resident.current, failed(), self.dropped
+            self.vcpu,
+            self.start,
+            self.created,
+            self.last,
+            pairs(&HOST, &self.host, &self.exits),
+            parts.join(","),
+            self.results,
+            self.by_source,
+            resident.magic == rp::MAGIC,
+            crate::execution::ticks_ns(resident.since),
+            resident.current,
+            failed(),
+            self.dropped
         ));
         (failed(), self.dropped)
     }

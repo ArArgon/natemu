@@ -42,12 +42,14 @@ pub(crate) const PACK_BYTES: usize = 4 << 20;
 pub(crate) const PACK_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 
 const K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be,
-    0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa,
-    0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85,
-    0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f,
-    0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
 /// SHA-256's compression of whole 64-byte `blocks` into `h`, portable.
@@ -60,12 +62,20 @@ fn compress_portable(h: &mut [u32; 8], blocks: &[u8]) {
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
         for i in 0..64 {
-            let t1 = hh.wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25)).wrapping_add((e & f) ^ (!e & g)).wrapping_add(K[i]).wrapping_add(w[i]);
-            let t2 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22)).wrapping_add((a & b) ^ (a & c) ^ (b & c));
+            let t1 = hh
+                .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+                .wrapping_add((e & f) ^ (!e & g))
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let t2 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+                .wrapping_add((a & b) ^ (a & c) ^ (b & c));
             (hh, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(t1), c, b, a, t1.wrapping_add(t2));
         }
         for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
@@ -82,12 +92,17 @@ unsafe fn compress_sha2(h: &mut [u32; 8], blocks: &[u8]) {
         let (mut abcd, mut efgh) = (vld1q_u32(h.as_ptr()), vld1q_u32(h.as_ptr().add(4)));
         for b in blocks.chunks_exact(64) {
             let (abcd0, efgh0) = (abcd, efgh);
-            let word = |i: usize| vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(b.as_ptr().add(16 * i))));
+            let word =
+                |i: usize| vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(b.as_ptr().add(16 * i))));
             let mut m = [word(0), word(1), word(2), word(3)];
             for i in 0..16 {
                 let wk = vaddq_u32(m[i % 4], vld1q_u32(K.as_ptr().add(4 * i)));
                 if i < 12 {
-                    m[i % 4] = vsha256su1q_u32(vsha256su0q_u32(m[i % 4], m[(i + 1) % 4]), m[(i + 2) % 4], m[(i + 3) % 4]);
+                    m[i % 4] = vsha256su1q_u32(
+                        vsha256su0q_u32(m[i % 4], m[(i + 1) % 4]),
+                        m[(i + 2) % 4],
+                        m[(i + 3) % 4],
+                    );
                 }
                 let a = abcd;
                 abcd = vsha256hq_u32(abcd, efgh, wk);
@@ -104,12 +119,19 @@ unsafe fn compress_sha2(h: &mut [u32; 8], blocks: &[u8]) {
 pub(crate) fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     static SHA2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let hw = *SHA2.get_or_init(|| std::arch::is_aarch64_feature_detected!("sha2"));
-    let compress: fn(&mut [u32; 8], &[u8]) = if hw { |h, b| unsafe { compress_sha2(h, b) } } else { compress_portable };
+    let compress: fn(&mut [u32; 8], &[u8]) = if hw {
+        |h, b| unsafe { compress_sha2(h, b) }
+    } else {
+        compress_portable
+    };
     sha256_with(parts, compress)
 }
 
 fn sha256_with(parts: &[&[u8]], compress: fn(&mut [u32; 8], &[u8])) -> [u8; 32] {
-    let mut h: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
     let (mut buf, mut len) = ([0u8; 128], 0u64);
     let mut used = 0;
     for p in parts {
@@ -182,7 +204,10 @@ pub struct DiskCache {
 
 /// The part of a pack's name that says which fexc build wrote it.
 fn tag(identity: &[u8; 32]) -> String {
-    format!("{:016x}", u64::from_be_bytes(identity[..8].try_into().unwrap()))
+    format!(
+        "{:016x}",
+        u64::from_be_bytes(identity[..8].try_into().unwrap())
+    )
 }
 
 fn key(identity: &[u8; 32], body: &[u8]) -> [u8; 32] {
@@ -195,16 +220,28 @@ impl DiskCache {
         let identity = sha256(&[&fs::read(fexc).map_err(|e| format!("{}: {e}", fexc.display()))?]);
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let (mut packs, tag) = (vec![], tag(&identity));
-        for e in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
+        for e in fs::read_dir(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .flatten()
+        {
             let (path, name) = (e.path(), e.file_name().to_string_lossy().into_owned());
-            if let Some(pid) = name.strip_suffix(".tmp").and_then(|n| n.split('-').next()).and_then(|p| p.parse::<i32>().ok()) {
+            if let Some(pid) = name
+                .strip_suffix(".tmp")
+                .and_then(|n| n.split('-').next())
+                .and_then(|p| p.parse::<i32>().ok())
+            {
                 if !alive(pid) {
                     let _ = fs::remove_file(&path); // a pack its writer never finished
                 }
             } else if name.ends_with(".pack") {
                 if let Ok(m) = e.metadata() {
                     let own = name.strip_prefix(&tag).is_some_and(|n| n.starts_with('-'));
-                    packs.push((own, m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), path));
+                    packs.push((
+                        own,
+                        m.modified().unwrap_or(std::time::UNIX_EPOCH),
+                        m.len(),
+                        path,
+                    ));
                 }
             }
         }
@@ -225,13 +262,24 @@ impl DiskCache {
                 bytes += size; // on disk and counted, but its keys are another build's: not read
                 continue;
             }
-            match File::open(&path).ok().and_then(|f| read_index(&f, size).map(|i| (f, i))) {
+            match File::open(&path)
+                .ok()
+                .and_then(|f| read_index(&f, size).map(|i| (f, i)))
+            {
                 Some((file, records)) => {
                     let pack = files.len();
                     files.push(file);
                     bytes += size;
                     for (key, offset, len, sum) in records {
-                        index.insert(key, Slot { pack, offset, len, sum });
+                        index.insert(
+                            key,
+                            Slot {
+                                pack,
+                                offset,
+                                len,
+                                sum,
+                            },
+                        );
                     }
                 }
                 None => {
@@ -239,23 +287,41 @@ impl DiskCache {
                 }
             }
         }
-        let mut w = Writer { dir: dir.into(), identity, cap, pack: Pack::default(), stored: HashSet::new(), bytes, written: 0 };
+        let mut w = Writer {
+            dir: dir.into(),
+            identity,
+            cap,
+            pack: Pack::default(),
+            stored: HashSet::new(),
+            bytes,
+            written: 0,
+        };
         let (tx, rx) = std::sync::mpsc::channel::<Entry>();
         let thread = std::thread::Builder::new()
             .name("compile-cache".into())
-            .spawn(move || loop {
-                match rx.recv_timeout(PACK_AGE) {
-                    Ok((body, payload)) => w.put(key(&w.identity, &body), &payload),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return w.write(),
-                }
-                if w.pack.since.is_some_and(|t| t.elapsed() >= PACK_AGE) {
-                    w.write();
+            .spawn(move || {
+                loop {
+                    match rx.recv_timeout(PACK_AGE) {
+                        Ok((body, payload)) => w.put(key(&w.identity, &body), &payload),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return w.write(),
+                    }
+                    if w.pack.since.is_some_and(|t| t.elapsed() >= PACK_AGE) {
+                        w.write();
+                    }
                 }
             })
             .map_err(|e| format!("compile cache writer: {e}"))?;
         let entries = index.len();
-        Ok(Self { identity, packs: files, index, writer: Mutex::new(Some(tx)), thread: Mutex::new(Some(thread)), bytes, entries })
+        Ok(Self {
+            identity,
+            packs: files,
+            index,
+            writer: Mutex::new(Some(tx)),
+            thread: Mutex::new(Some(thread)),
+            bytes,
+            entries,
+        })
     }
 
     /// The key of request `body`.
@@ -271,13 +337,20 @@ impl DiskCache {
     pub(crate) fn get(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
         let slot = self.index.get(key)?;
         let mut payload = vec![0; slot.len as usize];
-        self.packs[slot.pack].read_exact_at(&mut payload, slot.offset).ok()?;
+        self.packs[slot.pack]
+            .read_exact_at(&mut payload, slot.offset)
+            .ok()?;
         (sha256(&[key, &payload]) == slot.sum).then_some(payload)
     }
 
     /// Stores `payload` for request `body` (once per process), on the writer thread.
     pub(crate) fn put(&self, body: Vec<u8>, payload: Vec<u8>) {
-        if let Some(tx) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(tx) = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             let _ = tx.send((body, payload));
         }
     }
@@ -288,13 +361,16 @@ impl Writer {
         // The pending pack as it will be written (framing and index records included), so the total stays within the cap.
         let k = &self.pack;
         let pending = (HEAD.len() + k.data.len() + RECORD * k.index.len() + 16) as u64;
-        if self.bytes + pending + (payload.len() + RECORD + HEAD.len() + 16) as u64 > self.cap || !self.stored.insert(key) {
+        if self.bytes + pending + (payload.len() + RECORD + HEAD.len() + 16) as u64 > self.cap
+            || !self.stored.insert(key)
+        {
             return;
         }
         let k = &mut self.pack;
         let offset = (HEAD.len() + k.data.len()) as u64;
         k.data.extend_from_slice(payload);
-        k.index.push((key, offset, payload.len() as u32, sha256(&[&key, payload])));
+        k.index
+            .push((key, offset, payload.len() as u32, sha256(&[&key, payload])));
         k.since.get_or_insert_with(std::time::Instant::now);
         if k.data.len() >= PACK_BYTES {
             self.write();
@@ -318,11 +394,18 @@ impl Writer {
         }
         f.extend_from_slice(&(p.index.len() as u64).to_le_bytes());
         f.extend_from_slice(TAIL);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         let name = format!("{}-{nanos}-{}", std::process::id(), self.written);
         let tmp = self.dir.join(format!("{name}.tmp"));
-        let pack = self.dir.join(format!("{}-{name}.pack", tag(&self.identity)));
-        if fs::write(&tmp, &f).and_then(|_| fs::rename(&tmp, pack)).is_err() {
+        let pack = self
+            .dir
+            .join(format!("{}-{name}.pack", tag(&self.identity)));
+        if fs::write(&tmp, &f)
+            .and_then(|_| fs::rename(&tmp, pack))
+            .is_err()
+        {
             let _ = fs::remove_file(&tmp); // a full disk costs the entries, not the run
         }
         *p = Pack::default();
@@ -334,8 +417,18 @@ impl Writer {
 impl Drop for DiskCache {
     /// Ends the writer thread once it has written what is pending.
     fn drop(&mut self) {
-        drop(self.writer.get_mut().unwrap_or_else(|e| e.into_inner()).take());
-        if let Some(t) = self.thread.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+        drop(
+            self.writer
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
+        if let Some(t) = self
+            .thread
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = t.join();
         }
         crate::perf::mark("disk_written");
@@ -358,9 +451,22 @@ fn read_index(f: &File, size: u64) -> Option<Vec<([u8; 32], u64, u32, [u8; 32])>
     f.read_exact_at(&mut raw, start).ok()?;
     raw.chunks_exact(RECORD)
         .map(|r| {
-            let (offset, len) = (u64::from_le_bytes(r[32..40].try_into().unwrap()), u32::from_le_bytes(r[40..44].try_into().unwrap()));
-            (offset >= HEAD.len() as u64 && offset.checked_add(u64::from(len)).is_some_and(|end| end <= start))
-                .then(|| (r[..32].try_into().unwrap(), offset, len, r[44..].try_into().unwrap()))
+            let (offset, len) = (
+                u64::from_le_bytes(r[32..40].try_into().unwrap()),
+                u32::from_le_bytes(r[40..44].try_into().unwrap()),
+            );
+            (offset >= HEAD.len() as u64
+                && offset
+                    .checked_add(u64::from(len))
+                    .is_some_and(|end| end <= start))
+            .then(|| {
+                (
+                    r[..32].try_into().unwrap(),
+                    offset,
+                    len,
+                    r[44..].try_into().unwrap(),
+                )
+            })
         })
         .collect()
 }
@@ -386,9 +492,13 @@ impl Config {
         let dir = match dir {
             Some(v) if v == "off" => None,
             Some(v) => Some(PathBuf::from(v)),
-            None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches/natemu/fexc")),
+            None => std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("Library/Caches/natemu/fexc")),
         };
-        let cap = mb.unwrap_or(512).checked_mul(1 << 20).ok_or_else(|| format!("compile cache cap {} MiB: too large", mb.unwrap_or(0)))?;
+        let cap = mb
+            .unwrap_or(512)
+            .checked_mul(1 << 20)
+            .ok_or_else(|| format!("compile cache cap {} MiB: too large", mb.unwrap_or(0)))?;
         Ok(Self { dir, cap })
     }
 }
@@ -397,20 +507,31 @@ impl Config {
 /// `None` when `config` has no directory or it cannot be opened (the run goes on without it, with a warning). While one
 /// is open, a request for another fexc, directory or cap is an error (the open one would answer it).
 pub fn shared(fexc: &Path, config: &Config) -> Result<Option<Arc<DiskCache>>, String> {
-    static SHARED: Mutex<(Weak<DiskCache>, Option<(PathBuf, PathBuf, u64)>)> = Mutex::new((Weak::new(), None));
-    let Some(dir) = &config.dir else { return Ok(None) };
+    static SHARED: Mutex<(Weak<DiskCache>, Option<(PathBuf, PathBuf, u64)>)> =
+        Mutex::new((Weak::new(), None));
+    let Some(dir) = &config.dir else {
+        return Ok(None);
+    };
     let (wanted, cap) = ((fexc.to_path_buf(), dir.clone(), config.cap), config.cap);
     let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cache) = shared.0.upgrade() {
         return match &shared.1 {
             Some(open) if *open == wanted => Ok(Some(cache)),
-            open => Err(format!("compile cache {open:?} is open in this process; another one ({wanted:?}) cannot be")),
+            open => Err(format!(
+                "compile cache {open:?} is open in this process; another one ({wanted:?}) cannot be"
+            )),
         };
     }
     match DiskCache::open(dir, fexc, cap) {
         Ok(cache) => {
             crate::perf::mark("disk_open");
-            eprintln!("compile cache: {} ({} entries, {:.1} MiB, cap {} MiB)", dir.display(), cache.entries, cache.bytes as f64 / 1048576.0, cap >> 20);
+            eprintln!(
+                "compile cache: {} ({} entries, {:.1} MiB, cap {} MiB)",
+                dir.display(),
+                cache.entries,
+                cache.bytes as f64 / 1048576.0,
+                cap >> 20
+            );
             let cache = Arc::new(cache);
             *shared = (Arc::downgrade(&cache), Some(wanted));
             Ok(Some(cache))
@@ -429,12 +550,27 @@ mod tests {
     #[test]
     fn sha256_vectors() {
         let hex = |d: [u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(hex(sha256(&[])), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(hex(sha256(&[b"abc"])), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            hex(sha256(&[])),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(sha256(&[b"abc"])),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         let long = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
-        assert_eq!(hex(sha256(&[long])), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-        assert_eq!(sha256(&[&long[..3], &long[3..50], &long[50..]]), sha256(&[long])); // split anywhere
-        assert_eq!(hex(sha256(&[&[b'a'; 1000][..]; 1000])), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+        assert_eq!(
+            hex(sha256(&[long])),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            sha256(&[&long[..3], &long[3..50], &long[50..]]),
+            sha256(&[long])
+        ); // split anywhere
+        assert_eq!(
+            hex(sha256(&[&[b'a'; 1000][..]; 1000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     /// The Armv8 instructions and the portable code agree at every length to 600 bytes and across part boundaries.
@@ -443,12 +579,21 @@ mod tests {
         if !std::arch::is_aarch64_feature_detected!("sha2") {
             return;
         }
-        let data: Vec<u8> = (0..1200u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..1200u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         let hw: fn(&mut [u32; 8], &[u8]) = |h, b| unsafe { compress_sha2(h, b) };
         for n in 0..=600 {
-            assert_eq!(sha256_with(&[&data[..n]], hw), sha256_with(&[&data[..n]], compress_portable), "{n}");
+            assert_eq!(
+                sha256_with(&[&data[..n]], hw),
+                sha256_with(&[&data[..n]], compress_portable),
+                "{n}"
+            );
             let (a, b) = data[..n].split_at(n / 3);
-            assert_eq!(sha256_with(&[a, b, &data[600..600 + n % 97]], hw), sha256_with(&[a, b, &data[600..600 + n % 97]], compress_portable));
+            assert_eq!(
+                sha256_with(&[a, b, &data[600..600 + n % 97]], hw),
+                sha256_with(&[a, b, &data[600..600 + n % 97]], compress_portable)
+            );
         }
     }
 
@@ -464,7 +609,13 @@ mod tests {
         fs::write(&fexc, b"build 1").unwrap();
         fs::write(&other, b"build 2").unwrap();
         let store = dir.join("store");
-        let packs = || fs::read_dir(&store).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".pack")).count();
+        let packs = || {
+            fs::read_dir(&store)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".pack"))
+                .count()
+        };
         {
             let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
             assert!(c.is_empty());
@@ -478,14 +629,38 @@ mod tests {
         }
         assert_eq!(packs(), 2);
         let c = DiskCache::open(&store, &fexc, 1 << 30).unwrap();
-        let (k1, k2, k3) = (c.key(b"request 1"), c.key(b"request 2"), c.key(b"request 3"));
-        assert_eq!((c.get(&k1), c.get(&k2), c.get(&k3), c.entries), (Some(b"answer 1".to_vec()), Some(b"answer 2".to_vec()), None, 2));
+        let (k1, k2, k3) = (
+            c.key(b"request 1"),
+            c.key(b"request 2"),
+            c.key(b"request 3"),
+        );
+        assert_eq!(
+            (c.get(&k1), c.get(&k2), c.get(&k3), c.entries),
+            (
+                Some(b"answer 1".to_vec()),
+                Some(b"answer 2".to_vec()),
+                None,
+                2
+            )
+        );
         let o = DiskCache::open(&store, &other, 1 << 30).unwrap();
         assert_eq!(o.get(&o.key(b"request 1")), None);
-        let mut pack = fs::read_dir(&store).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "pack")).collect::<Vec<_>>();
-        pack.sort_by_key(|p| !fs::read(p).unwrap().starts_with(&[&HEAD[..], b"answer 1"].concat())); // request 1's first
+        let mut pack = fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "pack"))
+            .collect::<Vec<_>>();
+        pack.sort_by_key(|p| {
+            !fs::read(p)
+                .unwrap()
+                .starts_with(&[&HEAD[..], b"answer 1"].concat())
+        }); // request 1's first
         let (pack, second) = (pack[0].clone(), pack[1].clone());
-        let old = store.join(format!("k-{}", second.file_name().unwrap().to_string_lossy()));
+        let old = store.join(format!(
+            "k-{}",
+            second.file_name().unwrap().to_string_lossy()
+        ));
         fs::rename(&second, &old).unwrap();
         assert_eq!(DiskCache::open(&store, &fexc, 1 << 30).unwrap().entries, 1); // the old naming: another build's
         fs::rename(&old, &second).unwrap();
@@ -509,7 +684,10 @@ mod tests {
         }
         assert_eq!(packs(), 3);
         let c = DiskCache::open(&store, &fexc, 2 * PACK_BYTES as u64 + 8192).unwrap(); // over: down to 3/4 of it
-        assert_eq!([0u8, 1, 2].map(|i| c.get(&c.key(&[i])).is_some()), [false, false, true]);
+        assert_eq!(
+            [0u8, 1, 2].map(|i| c.get(&c.key(&[i])).is_some()),
+            [false, false, true]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -523,7 +701,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     fn dir_bytes(store: &Path) -> u64 {
-        fs::read_dir(store).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum()
+        fs::read_dir(store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
     }
 
     /// A cache left just under the cap (the writer refuses to pass it, and an open evicts only above it) gets room at the next open.

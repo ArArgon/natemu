@@ -74,7 +74,19 @@ const VARIABLE: [usize; 2 * VCNT] = {
 };
 /// The fixed-range MTRRs (SDM Vol.3 Table 14-9): FIX64K_00000, FIX16K_80000, FIX16K_A0000, FIX4K_C0000 ..= FIX4K_F8000.
 const FIXED: [usize; 11] = {
-    let mut out = [slot(0x250), slot(0x258), slot(0x259), 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut out = [
+        slot(0x250),
+        slot(0x258),
+        slot(0x259),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
     let mut k = 0;
     while k < 8 {
         out[3 + k] = slot(0x268 + k as u32);
@@ -82,7 +94,10 @@ const FIXED: [usize; 11] = {
     }
     out
 };
-const _: () = assert!(profile::MSRS[slot(MTRRCAP)].reset >> 8 & 1 != 0, "fixed ranges advertised");
+const _: () = assert!(
+    profile::MSRS[slot(MTRRCAP)].reset >> 8 & 1 != 0,
+    "fixed ranges advertised"
+);
 
 /// The MTRRs' memory type of guest-physical `gpa` (SDM Vol.3 14.11.4.1 "MTRR Precedences"): all UC while
 /// IA32_MTRR_DEF_TYPE.E is clear; below 1 MiB with FE set, the fixed range's field (14.11.2.2, Table 14-9); else the
@@ -122,7 +137,13 @@ pub fn mtrr_type(m: &Msrs, gpa: u64) -> u8 {
 }
 /// [lo, hi) as power-of-two sized, size-aligned blocks (what one variable pair describes), appended to `out` with type
 /// `t` from `n`; the count after, or `None` past [`VCNT`] pairs. `cpu_profile.py`'s `uc_pairs`.
-fn blocks(out: &mut [(u64, u64, u64); VCNT], mut n: usize, mut lo: u64, hi: u64, t: u64) -> Option<usize> {
+fn blocks(
+    out: &mut [(u64, u64, u64); VCNT],
+    mut n: usize,
+    mut lo: u64,
+    hi: u64,
+    t: u64,
+) -> Option<usize> {
     while lo < hi {
         let mut size = 1u64 << (63 - (hi - lo).leading_zeros());
         while lo % size != 0 {
@@ -141,7 +162,11 @@ fn blocks(out: &mut [(u64, u64, u64); VCNT], mut n: usize, mut lo: u64, hi: u64,
 /// the MTRRs and every other address below 4 GiB UC.
 pub fn firmware_mtrrs(m: &mut Msrs, ram: u64) {
     let mut pairs = [(0, 0, 0); VCNT];
-    let def = profile::MTRR_INITIAL.iter().find(|e| e.0 == MSR_MTRR_DEF_TYPE).unwrap().1;
+    let def = profile::MTRR_INITIAL
+        .iter()
+        .find(|e| e.0 == MSR_MTRR_DEF_TYPE)
+        .unwrap()
+        .1;
     let (def, n) = match blocks(&mut pairs, 0, ram, 1 << 32, UC as u64) {
         Some(n) => (def, n),
         None => {
@@ -165,7 +190,11 @@ pub fn firmware_mtrrs(m: &mut Msrs, ram: u64) {
     for (k, &(base, size, t)) in pairs.iter().enumerate() {
         let used = k < n;
         m[VARIABLE[2 * k]] = if used { base | t } else { 0 };
-        m[VARIABLE[2 * k + 1]] = if used { !(size - 1) & crate::paging::PA_MASK | 1 << 11 } else { 0 };
+        m[VARIABLE[2 * k + 1]] = if used {
+            !(size - 1) & crate::paging::PA_MASK | 1 << 11
+        } else {
+            0
+        };
     }
 }
 /// The effective memory type of an MTRR type and a PAT entry (SDM Vol.3 Table 14-7, normal caching: CR0.CD and NW clear;
@@ -193,7 +222,10 @@ pub fn effective_type(mtrr: u8, pat: u8) -> u8 {
 /// strong ordering), and a device page goes to its device whatever its type; the resident counts data shadows by this type
 /// (`cache::Control::memory_types`).
 pub fn memory_type(m: &Msrs, gpa: u64, pat: u8) -> u8 {
-    effective_type(mtrr_type(m, gpa), (m[const { slot(MSR_PAT) }] >> (8 * (pat & 7))) as u8 & 7)
+    effective_type(
+        mtrr_type(m, gpa),
+        (m[const { slot(MSR_PAT) }] >> (8 * (pat & 7))) as u8 & 7,
+    )
 }
 /// RDMSR is allowed. The x2APIC range's entry is not (`owned-by-LAPIC`): the resident's local APIC answers 0x800-0x8ff
 /// before the profile is consulted (X3).
@@ -231,7 +263,12 @@ pub fn misc_enable_after_write(value: u64) -> u64 {
 /// (November 5): the speculation-barrier switch is on AND the host reports FEAT_CSV3, so RDCL_NO is advertised only when
 /// the page-walk barriers that make it true are running (PCID plan P1).
 pub const fn arch_capabilities(rdcl_no: bool) -> u64 {
-    profile::MSRS[slot(MSR_ARCH_CAPABILITIES)].reset | if rdcl_no { profile::ARCH_CAPABILITIES_CSV3 } else { 0 }
+    profile::MSRS[slot(MSR_ARCH_CAPABILITIES)].reset
+        | if rdcl_no {
+            profile::ARCH_CAPABILITIES_CSV3
+        } else {
+            0
+        }
 }
 /// A vCPU's MSRs after reset (vCPU 0 is the BSP) with the virtual firmware's MTRR state applied.
 pub const fn reset_msrs(bsp: bool) -> Msrs {
@@ -239,7 +276,11 @@ pub const fn reset_msrs(bsp: bool) -> Msrs {
     let mut i = 0;
     while i < out.len() {
         let m = &profile::MSRS[i];
-        out[i] = if m.index == MSR_APIC_BASE && bsp { profile::APIC_BASE_BSP_RESET } else { m.reset };
+        out[i] = if m.index == MSR_APIC_BASE && bsp {
+            profile::APIC_BASE_BSP_RESET
+        } else {
+            m.reset
+        };
         let mut k = 0;
         while k < profile::MTRR_INITIAL.len() {
             if profile::MTRR_INITIAL[k].0 == m.index {
@@ -266,16 +307,26 @@ pub struct Dynamic {
 /// CPUID(EAX = `leaf`, ECX = `sub`) in 64-bit mode: [EAX, EBX, ECX, EDX]. Above the maximum, a basic or extended leaf
 /// returns the highest basic leaf's data; holes and subleaves past the last return zero.
 pub fn cpuid(leaf: u32, sub: u32, d: &Dynamic) -> [u32; 4] {
-    let max_basic = if d.misc_enable >> 22 & 1 != 0 { profile::MAX_BASIC_LEAF_LIMITED } else { profile::MAX_BASIC_LEAF };
+    let max_basic = if d.misc_enable >> 22 & 1 != 0 {
+        profile::MAX_BASIC_LEAF_LIMITED
+    } else {
+        profile::MAX_BASIC_LEAF
+    };
     let l = match leaf {
         profile::HYPERVISOR_LEAF => leaf,
         0x4000_0000..=0x4fff_ffff => max_basic, // OPEN in the profile: treated as out of range
         0x8000_0000.. if leaf <= profile::MAX_EXT_LEAF => leaf,
         _ => leaf.min(max_basic),
     };
-    let find = |s: u32| profile::CPUID.iter().find(|e| e.0 == l && e.1 == s).map(|e| e.2);
-    let Some([mut eax, mut ebx, mut ecx, mut edx]) =
-        find(profile::ANY).or_else(|| find(sub)).or_else(|| if l == 0xb && sub >= 2 { find(2) } else { None })
+    let find = |s: u32| {
+        profile::CPUID
+            .iter()
+            .find(|e| e.0 == l && e.1 == s)
+            .map(|e| e.2)
+    };
+    let Some([mut eax, mut ebx, mut ecx, mut edx]) = find(profile::ANY)
+        .or_else(|| find(sub))
+        .or_else(|| if l == 0xb && sub >= 2 { find(2) } else { None })
     else {
         return [0; 4];
     };
@@ -299,7 +350,9 @@ pub fn cpuid(leaf: u32, sub: u32, d: &Dynamic) -> [u32; 4] {
             }
         }
         // 0xD.1 EBX with XSAVEC and no XSAVES (EAX = 3): XSAVEC's area size for XCR0, the standard one (SDM Vol.1 13.2).
-        0xd if sub == 0 || (sub == 1 && eax & 2 != 0) => ebx = if d.xcr0 & 4 != 0 { 832 } else { 576 },
+        0xd if sub == 0 || (sub == 1 && eax & 2 != 0) => {
+            ebx = if d.xcr0 & 4 != 0 { 832 } else { 576 }
+        }
         0x8000_0001 => edx |= 1 << 11, // SYSCALL: 64-bit mode
         _ => {}
     }
@@ -314,7 +367,14 @@ mod tests {
     #[test]
     fn cpuid_matches_the_model() {
         for &(leaf, sub, vcpus, vcpu, cr4, en, misc_enable, xcr0, want) in v::CPUID.iter() {
-            let d = Dynamic { vcpus, vcpu, cr4, apic_base: if en { 0xfee0_0800 } else { 0xfee0_0000 }, misc_enable, xcr0 };
+            let d = Dynamic {
+                vcpus,
+                vcpu,
+                cr4,
+                apic_base: if en { 0xfee0_0800 } else { 0xfee0_0000 },
+                misc_enable,
+                xcr0,
+            };
             assert_eq!(cpuid(leaf, sub, &d), want, "leaf {leaf:#x}.{sub} {d:?}");
         }
     }
@@ -357,23 +417,52 @@ mod tests {
     fn memory_types_follow_the_mtrrs_and_the_pat() {
         let mut m = reset_msrs(true);
         let set = |m: &mut Msrs, index: u32, v: u64| {
-            assert!(write_ok(&profile::MSRS[slot(index)], v, 0x8000_0011, 0xd00), "{index:#x} <- {v:#x}");
+            assert!(
+                write_ok(&profile::MSRS[slot(index)], v, 0x8000_0011, 0xd00),
+                "{index:#x} <- {v:#x}"
+            );
             m[slot(index)] = v;
         };
         // The firmware state (`profile::MTRR_INITIAL`): fixed 0-0x9ffff WB, 0xa0000-0xfffff UC; 2-4 GiB UC; default WB.
         let t = |m: &Msrs, gpa| mtrr_type(m, gpa);
-        assert_eq!([0, 0x9_f000, 0xa_0000, 0xf_f000, 0x10_0000, 0x7fff_f000, 0x8000_0000, 0xffff_f000, 0x1_0000_0000].map(|g| t(&m, g)),
-                   [WB, WB, UC, UC, WB, WB, UC, UC, WB]);
+        assert_eq!(
+            [
+                0,
+                0x9_f000,
+                0xa_0000,
+                0xf_f000,
+                0x10_0000,
+                0x7fff_f000,
+                0x8000_0000,
+                0xffff_f000,
+                0x1_0000_0000
+            ]
+            .map(|g| t(&m, g)),
+            [WB, WB, UC, UC, WB, WB, UC, UC, WB]
+        );
         // The reset PAT (Table 14-12): WB WT UC- UC WB WT UC- UC; under WB the index selects WB WT UC UC (UC- -> UC).
-        assert_eq!(core::array::from_fn::<u8, 8, _>(|i| memory_type(&m, 0x10_0000, i as u8)), [WB, WT, UC, UC, WB, WT, UC, UC]);
+        assert_eq!(
+            core::array::from_fn::<u8, 8, _>(|i| memory_type(&m, 0x10_0000, i as u8)),
+            [WB, WT, UC, UC, WB, WT, UC, UC]
+        );
         // Linux's PAT (WB WC UC- UC WB WP UC- WT): under the UC range at 2 GiB, WC stays WC and the rest is UC.
         set(&mut m, MSR_PAT, 0x0407_0506_0007_0106);
-        assert_eq!(core::array::from_fn::<u8, 8, _>(|i| memory_type(&m, 0x10_0000, i as u8)), [WB, WC, UC, UC, WB, WP, UC, WT]);
-        assert_eq!(core::array::from_fn::<u8, 8, _>(|i| memory_type(&m, 0x8000_0000, i as u8)), [UC, WC, UC, UC, UC, UC, UC, UC]);
+        assert_eq!(
+            core::array::from_fn::<u8, 8, _>(|i| memory_type(&m, 0x10_0000, i as u8)),
+            [WB, WC, UC, UC, WB, WP, UC, WT]
+        );
+        assert_eq!(
+            core::array::from_fn::<u8, 8, _>(|i| memory_type(&m, 0x8000_0000, i as u8)),
+            [UC, WC, UC, UC, UC, UC, UC, UC]
+        );
         // Every fixed-range field: register k's byte j covers its own sub-range (Table 14-9).
-        let fixed = [(0x250, 0u64, 0x1_0000u64), (0x258, 0x8_0000, 0x4000), (0x259, 0xa_0000, 0x4000)]
-            .into_iter()
-            .chain((0..8).map(|k| (0x268 + k, 0xc_0000 + 0x8000 * k as u64, 0x1000)));
+        let fixed = [
+            (0x250, 0u64, 0x1_0000u64),
+            (0x258, 0x8_0000, 0x4000),
+            (0x259, 0xa_0000, 0x4000),
+        ]
+        .into_iter()
+        .chain((0..8).map(|k| (0x268 + k, 0xc_0000 + 0x8000 * k as u64, 0x1000)));
         for (index, start, size) in fixed {
             let types = [UC, WC, WT, WP, WB, WC, WT, UC];
             set(&mut m, index, u64::from_le_bytes(types));
@@ -400,18 +489,34 @@ mod tests {
         set(&mut m, 0x209, 0xff_ffff_f800);
         set(&mut m, 0x20a, 0x4000_3001); // range 5: 4 KiB at 1 GiB + 12 KiB, WC, not valid
         set(&mut m, 0x20b, 0xff_ffff_f000);
-        assert_eq!([0x4000_0000, 0x4000_1000, 0x4000_2000, 0x4000_3000, 0x4000_4000, 0x7fff_f000].map(|g| t(&m, g)),
-                   [WT, UC, WB, WB, WB, WB]);
+        assert_eq!(
+            [
+                0x4000_0000,
+                0x4000_1000,
+                0x4000_2000,
+                0x4000_3000,
+                0x4000_4000,
+                0x7fff_f000
+            ]
+            .map(|g| t(&m, g)),
+            [WT, UC, WB, WB, WB, WB]
+        );
         // A discontinuous mask (14.11.2.3): bit 30 only, so every address with bit 30 set matches: WC alone; WC with range
         // 1's WB is undefined (natemu: UC); with range 0's UC, UC; bit 30 clear, the default.
         set(&mut m, 0x20b, 0x00_4000_0800);
-        assert_eq!([0x1_4000_3000, 0x4000_3000, 0xc000_3000, 0x10_3000].map(|g| t(&m, g)), [WC, UC, UC, WB]);
+        assert_eq!(
+            [0x1_4000_3000, 0x4000_3000, 0xc000_3000, 0x10_3000].map(|g| t(&m, g)),
+            [WC, UC, UC, WB]
+        );
         // Default type: outside every range.
         set(&mut m, MSR_MTRR_DEF_TYPE, 0x800);
         assert_eq!(t(&m, 0x2_0000_0000), UC);
         // E clear: everything UC (the PAT cannot make it cacheable; WC stays WC, Table 14-7).
         set(&mut m, MSR_MTRR_DEF_TYPE, 0x406);
-        assert_eq!([0, 0x10_0000, 0x4000_0000].map(|g| memory_type(&m, g, 0)), [UC; 3]);
+        assert_eq!(
+            [0, 0x10_0000, 0x4000_0000].map(|g| memory_type(&m, g, 0)),
+            [UC; 3]
+        );
         assert_eq!(memory_type(&m, 0x10_0000, 1), WC);
     }
 
@@ -435,8 +540,16 @@ mod tests {
         }
         for bit in 0..64 {
             let b = 1u64 << bit;
-            assert_eq!(ok(MSR_MTRR_DEF_TYPE, 6 | b), matches!(bit, 1 | 2 | 10 | 11), "DEF_TYPE bit {bit}");
-            assert_eq!(ok(0x200, 6 | b), matches!(bit, 1 | 2 | 12..=39), "PHYSBASE bit {bit}");
+            assert_eq!(
+                ok(MSR_MTRR_DEF_TYPE, 6 | b),
+                matches!(bit, 1 | 2 | 10 | 11),
+                "DEF_TYPE bit {bit}"
+            );
+            assert_eq!(
+                ok(0x200, 6 | b),
+                matches!(bit, 1 | 2 | 12..=39),
+                "PHYSBASE bit {bit}"
+            );
             assert_eq!(ok(0x201, b), matches!(bit, 11..=39), "PHYSMASK bit {bit}");
         }
         assert_ne!(profile::MSRS[slot(MTRRCAP)].access, access::RW);
@@ -456,7 +569,11 @@ mod tests {
         }
         let mut m = reset_msrs(true);
         firmware_mtrrs(&mut m, 2 << 30);
-        assert_eq!(m, reset_msrs(true), "the profile's state is the one for its L = 2 GiB");
+        assert_eq!(
+            m,
+            reset_msrs(true),
+            "the profile's state is the one for its L = 2 GiB"
+        );
         let block = 2u64 << 20;
         for ram in (1..=1536).map(|k| k * block) {
             let mut m = reset_msrs(false);
@@ -468,14 +585,21 @@ mod tests {
                 assert_eq!(mtrr_type(&m, page), UC, "RAM {ram:#x}: {page:#x}");
             }
             // Every range is 2 MiB aligned, so each 2 MiB block has one type: its first and last page.
-            for start in [0x10_0000].into_iter().chain((block..1 << 32).step_by(block as usize)) {
+            for start in [0x10_0000]
+                .into_iter()
+                .chain((block..1 << 32).step_by(block as usize))
+            {
                 let want = if start < ram { WB } else { UC };
                 for gpa in [start, (start | (block - 1)) & !0xfff] {
                     assert_eq!(mtrr_type(&m, gpa), want, "RAM {ram:#x}: {gpa:#x}");
                 }
             }
             if [1 << 30, 2 << 30, 3 << 30].contains(&ram) {
-                assert_eq!([ram - 0x1000, ram, 0xfec0_0000, 0xfee0_0000, 0xffff_f000].map(|g| mtrr_type(&m, g)), [WB, UC, UC, UC, UC]);
+                assert_eq!(
+                    [ram - 0x1000, ram, 0xfec0_0000, 0xfee0_0000, 0xffff_f000]
+                        .map(|g| mtrr_type(&m, g)),
+                    [WB, UC, UC, UC, UC]
+                );
             }
         }
     }
@@ -486,14 +610,30 @@ mod tests {
     fn arch_capabilities_is_read_only_and_rdcl_no_follows_csv3() {
         let m = profile::MSRS[slot(MSR_ARCH_CAPABILITIES)];
         assert!(read_ok(&m));
-        for &v in v::VALUES.iter().chain(&[0, arch_capabilities(true), arch_capabilities(false)]) {
+        for &v in v::VALUES
+            .iter()
+            .chain(&[0, arch_capabilities(true), arch_capabilities(false)])
+        {
             assert!(!write_ok(&m, v, v::CR0, v::EFER), "{v:#x}");
         }
         assert_eq!(arch_capabilities(false) & 1, 0, "no RDCL_NO without CSV3");
         assert_eq!(arch_capabilities(true), arch_capabilities(false) | 1);
         // TAA_NO 8, IF_PSCHANGE_MC_NO 6, SBDR_SSDP_NO 13, FBSDP_NO 14, PSDP_NO 15, GDS_NO 26, RFDS_NO 27, ITS_NO 62.
-        assert_eq!(arch_capabilities(false), [6, 8, 13, 14, 15, 26, 27, 62].iter().map(|b| 1u64 << b).sum::<u64>());
-        let d = Dynamic { vcpus: 1, vcpu: 0, cr4: 0, apic_base: 0xfee0_0900, misc_enable: 0x1801, xcr0: 1 };
+        assert_eq!(
+            arch_capabilities(false),
+            [6, 8, 13, 14, 15, 26, 27, 62]
+                .iter()
+                .map(|b| 1u64 << b)
+                .sum::<u64>()
+        );
+        let d = Dynamic {
+            vcpus: 1,
+            vcpu: 0,
+            cr4: 0,
+            apic_base: 0xfee0_0900,
+            misc_enable: 0x1801,
+            xcr0: 1,
+        };
         let edx = cpuid(7, 0, &d)[3];
         assert_eq!((edx >> 29 & 1, edx >> 10 & 1), (1, 0));
     }
@@ -505,7 +645,10 @@ mod tests {
             let i = msr(index).unwrap();
             assert_eq!((ap[i], bsp[i]), (want_ap, want_bsp), "{index:#x}");
         }
-        assert_eq!(v::RESET.len(), profile::MSRS.iter().filter(|m| read_ok(m)).count());
+        assert_eq!(
+            v::RESET.len(),
+            profile::MSRS.iter().filter(|m| read_ok(m)).count()
+        );
         // CR4: the profile's mask (bits whose CPUID feature is advertised).
         assert_eq!(profile::CR4_VALID, 0x150fbc);
     }

@@ -23,12 +23,12 @@ pub mod owners;
 pub mod perf;
 mod pic;
 mod pit;
-mod relocation;
 pub mod pm;
+mod relocation;
 mod rtc;
 mod system;
 pub mod uart;
-pub mod vm;
 pub mod virtio;
+pub mod vm;
 
 pub type Result<T> = std::result::Result<T, String>;

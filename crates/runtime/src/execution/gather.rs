@@ -27,7 +27,10 @@ use super::*;
 /// YMM `r` as 32 little-endian bytes: XMM from the bank, the upper half from the guest-state page.
 fn ymm(c: &Cpu, r: usize) -> [u8; 32] {
     let mut v = [0; 32];
-    for (k, q) in [c.xmm[r][0], c.xmm[r][1], ymm_hi(2 * r), ymm_hi(2 * r + 1)].into_iter().enumerate() {
+    for (k, q) in [c.xmm[r][0], c.xmm[r][1], ymm_hi(2 * r), ymm_hi(2 * r + 1)]
+        .into_iter()
+        .enumerate()
+    {
         v[8 * k..8 * k + 8].copy_from_slice(&q.to_le_bytes());
     }
     v
@@ -54,7 +57,11 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     let (ew, iw) = (i.size as usize, if i.cr & 32 != 0 { 8 } else { 4 });
     let n = (16 << (i.cr >> 4 & 1)) / ew.max(iw);
     let (mut d, mut m, x) = (ymm(&s.cpu, dst), ymm(&s.cpu, mask), ymm(&s.cpu, index));
-    let base = if i.base == system::NO_REG { 0 } else { s.cpu.gpr[i.base as usize] };
+    let base = if i.base == system::NO_REG {
+        0
+    } else {
+        s.cpu.gpr[i.base as usize]
+    };
     let segment = match i.segment as usize {
         SREG_FS => s.cpu.fs_base,
         SREG_GS => s.cpu.gs_base,
@@ -70,9 +77,20 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 u64::from_le_bytes(x[at..at + 8].try_into().unwrap())
             };
             let ea = base.wrapping_add(ix << i.scale).wrapping_add(i.disp as u64);
-            let ea = if i.prefixes & system::ADDRESS32 != 0 { ea as u32 as u64 } else { ea };
+            let ea = if i.prefixes & system::ADDRESS32 != 0 {
+                ea as u32 as u64
+            } else {
+                ea
+            };
             let mut buf = [0; 8];
-            if let Err(e) = copy(s, ea.wrapping_add(segment), &mut buf[..ew], false, false, nc) {
+            if let Err(e) = copy(
+                s,
+                ea.wrapping_add(segment),
+                &mut buf[..ew],
+                false,
+                false,
+                nc,
+            ) {
                 (set_ymm(&mut s.cpu, dst, &d), set_ymm(&mut s.cpu, mask, &m));
                 let hits = s.debug >> debug::HITS & 0xf;
                 if hits == 0 {
@@ -89,7 +107,10 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         m[ew * j..ew * j + ew].fill(0);
     }
     d[ew * n..].fill(0);
-    (set_ymm(&mut s.cpu, dst, &d), set_ymm(&mut s.cpu, mask, &[0; 32]));
+    (
+        set_ymm(&mut s.cpu, dst, &d),
+        set_ymm(&mut s.cpu, mask, &[0; 32]),
+    );
     commit(s, i, false);
     Ok(())
 }

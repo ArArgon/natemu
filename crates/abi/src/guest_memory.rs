@@ -319,7 +319,6 @@ mod tests {
         assert_eq!(b.0[1536 + 256], 0x10_0067);
     }
 
-
     #[test]
     fn concurrent_entry_change_restarts_the_walk() {
         let mut b = tables();
@@ -450,18 +449,39 @@ mod tests {
             }
         }
         let mut b = tables();
-        let peer = Peer { code: [0x1000, 0x4000], events: [(0, 0); 8], n: 0 };
+        let peer = Peer {
+            code: [0x1000, 0x4000],
+            events: [(0, 0); 8],
+            n: 0,
+        };
         let mut t = GuestTables::observed(b.ram(), CodeWrites(peer));
-        assert_eq!(paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read, true).map(|r| r.gpa), Ok(0x10_0000));
+        assert_eq!(
+            paging::walk(&mut t, CONTROL, 0x10_0000, Access::Read, true).map(|r| r.gpa),
+            Ok(0x10_0000)
+        );
         let p = &t.observer.0;
-        let want = [(b'c', 0x1000), (b'r', 0x1000), (b'r', 0x2000), (b'r', 0x3000), (b'c', 0x4800), (b'r', 0x4800)];
+        let want = [
+            (b'c', 0x1000),
+            (b'r', 0x1000),
+            (b'r', 0x2000),
+            (b'r', 0x3000),
+            (b'c', 0x4800),
+            (b'r', 0x4800),
+        ];
         assert_eq!(&p.events[..p.n], &want);
-        assert_eq!((b.0[0], b.0[512], b.0[1024], b.0[1536 + 256]), (0x2027, 0x3027, 0x4027, 0x10_0027));
+        assert_eq!(
+            (b.0[0], b.0[512], b.0[1024], b.0[1536 + 256]),
+            (0x2027, 0x3027, 0x4027, 0x10_0027)
+        );
     }
 
     #[test]
     fn table_dependency_precedes_load_even_on_failed_and_repeated_reads() {
-        struct Mark { ram: GuestRam, seen: [u64; 4], n: usize }
+        struct Mark {
+            ram: GuestRam,
+            seen: [u64; 4],
+            n: usize,
+        }
         impl Observer for Mark {
             fn before_read(&mut self, gpa: u64) {
                 self.seen[self.n] = gpa;
@@ -472,7 +492,14 @@ mod tests {
         }
         let mut b = tables();
         let ram = b.ram();
-        let mut t = GuestTables::observed(ram, Mark { ram, seen: [0; 4], n: 0 });
+        let mut t = GuestTables::observed(
+            ram,
+            Mark {
+                ram,
+                seen: [0; 4],
+                n: 0,
+            },
+        );
         assert_eq!(t.read(0x1000), Some(1));
         assert_eq!(t.read(0x1000), Some(2));
         assert_eq!(t.read(0x8000), None);

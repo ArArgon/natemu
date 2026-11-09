@@ -59,7 +59,12 @@ pub(crate) struct Ioapic {
 }
 impl Ioapic {
     pub(crate) fn new() -> Self {
-        Self { id: 0, ioregsel: 0, irr: 0, redtbl: [MASKED; PINS] }
+        Self {
+            id: 0,
+            ioregsel: 0,
+            irr: 0,
+            redtbl: [MASKED; PINS],
+        }
     }
     /// `ioapic_service`: delivers every pending unmasked input (level: once until its EOI).
     fn service(&mut self, bus: &mut dyn Bus) {
@@ -80,7 +85,13 @@ impl Ioapic {
             }
             let mode = (entry >> 8 & 7) as u8;
             let vector = if mode == 7 { bus.inta() } else { entry as u8 };
-            let accepted = bus.send(Message { dest: (entry >> 56) as u8, logical: entry >> 11 & 1 != 0, mode, vector, level: entry & LEVEL != 0 });
+            let accepted = bus.send(Message {
+                dest: (entry >> 56) as u8,
+                logical: entry >> 11 & 1 != 0,
+                mode,
+                vector,
+                level: entry & LEVEL != 0,
+            });
             // 82093AA: Remote IRR "is set to 1 when local APIC(s) accept the level interrupt sent by the IOAPIC" (QEMU sets
             // it at sending; its LAPICs accept every message): with no taker the input stays pending, Remote IRR clear.
             if !accepted && entry & LEVEL != 0 {
@@ -139,7 +150,9 @@ impl Ioapic {
         })
     }
     fn index(&self, sel: u8) -> Option<usize> {
-        (0x10..0x10 + 2 * PINS as u8).contains(&sel).then(|| usize::from(sel - 0x10) >> 1)
+        (0x10..0x10 + 2 * PINS as u8)
+            .contains(&sel)
+            .then(|| usize::from(sel - 0x10) >> 1)
     }
     /// `ioapic_mem_write` (8 bytes refused).
     pub(crate) fn write(&mut self, offset: u64, size: u64, val: u64, bus: &mut dyn Bus) -> bool {
@@ -155,7 +168,11 @@ impl Ioapic {
                     if let Some(i) = self.index(sel) {
                         let ro = self.redtbl[i] & RO_BITS;
                         let e = &mut self.redtbl[i];
-                        *e = if sel & 1 != 0 { *e & 0xffff_ffff | val << 32 } else { *e & !0xffff_ffff | val };
+                        *e = if sel & 1 != 0 {
+                            *e & 0xffff_ffff | val << 32
+                        } else {
+                            *e & !0xffff_ffff | val
+                        };
                         *e = *e & !RO_BITS | ro;
                         if *e & LEVEL == 0 {
                             *e &= !REMOTE_IRR; // ioapic_fix_edge_remote_irr
@@ -198,16 +215,35 @@ mod tests {
     #[test]
     fn registers_edge_and_level() {
         let (mut a, mut b) = (Ioapic::new(), Log::default());
-        assert_eq!((read(&mut a, 1, &mut b), read(&mut a, 0x10, &mut b), read(&mut a, 0x11, &mut b)), (0x17_0020, MASKED, 0));
+        assert_eq!(
+            (
+                read(&mut a, 1, &mut b),
+                read(&mut a, 0x10, &mut b),
+                read(&mut a, 0x11, &mut b)
+            ),
+            (0x17_0020, MASKED, 0)
+        );
         a.write(0, 4, 0, &mut b);
         a.write(0x10, 4, 0xff00_0000, &mut b);
-        assert_eq!((read(&mut a, 0, &mut b), read(&mut a, 2, &mut b)), (0x0f00_0000, 0x0f00_0000));
+        assert_eq!(
+            (read(&mut a, 0, &mut b), read(&mut a, 2, &mut b)),
+            (0x0f00_0000, 0x0f00_0000)
+        );
         assert_eq!(a.read(0x100, 1), Some(2)); // folded every 100H; IOREGSEL at any width
         // Edge, physical 1: one delivery per rise; a rise while masked is lost.
         entry(&mut a, 4, 0x41, 1 << 24, &mut b);
         a.set_irq(4, true, &mut b);
         a.set_irq(4, false, &mut b);
-        assert_eq!(b.0, [Message { dest: 1, logical: false, mode: 0, vector: 0x41, level: false }]);
+        assert_eq!(
+            b.0,
+            [Message {
+                dest: 1,
+                logical: false,
+                mode: 0,
+                vector: 0x41,
+                level: false
+            }]
+        );
         entry(&mut a, 4, 0x41 | MASKED, 1 << 24, &mut b);
         a.set_irq(4, true, &mut b);
         entry(&mut a, 4, 0x41, 1 << 24, &mut b);
@@ -218,19 +254,46 @@ mod tests {
         a.set_irq(9, true, &mut b);
         assert_eq!(b.0.len(), 1); // masked: kept pending
         entry(&mut a, 9, LEVEL | 1 << 11 | 0x59, 3 << 24, &mut b);
-        assert_eq!((b.0.len(), read(&mut a, 0x22, &mut b) & REMOTE_IRR), (2, REMOTE_IRR));
+        assert_eq!(
+            (b.0.len(), read(&mut a, 0x22, &mut b) & REMOTE_IRR),
+            (2, REMOTE_IRR)
+        );
         entry(&mut a, 9, LEVEL | 1 << 11 | 0x59, 3 << 24, &mut b);
-        assert_eq!((b.0.len(), read(&mut a, 0x22, &mut b) & REMOTE_IRR), (2, REMOTE_IRR));
+        assert_eq!(
+            (b.0.len(), read(&mut a, 0x22, &mut b) & REMOTE_IRR),
+            (2, REMOTE_IRR)
+        );
         a.eoi_broadcast(0x59, &mut b);
-        assert_eq!((b.0.len(), read(&mut a, 0x22, &mut b) & REMOTE_IRR), (3, REMOTE_IRR));
+        assert_eq!(
+            (b.0.len(), read(&mut a, 0x22, &mut b) & REMOTE_IRR),
+            (3, REMOTE_IRR)
+        );
         a.set_irq(9, false, &mut b);
         a.write(0x40, 4, 0x59, &mut b); // the EOI register
         assert_eq!((b.0.len(), read(&mut a, 0x22, &mut b) & REMOTE_IRR), (3, 0));
-        assert_eq!(b.0[2], Message { dest: 3, logical: true, mode: 0, vector: 0x59, level: true });
+        assert_eq!(
+            b.0[2],
+            Message {
+                dest: 3,
+                logical: true,
+                mode: 0,
+                vector: 0x59,
+                level: true
+            }
+        );
         // ExtINT: the vector from the PIC.
         entry(&mut a, 0, 0x700, 0, &mut b);
         a.set_irq(0, true, &mut b);
-        assert_eq!(b.0[3], Message { dest: 0, logical: false, mode: 7, vector: 0x37, level: false });
+        assert_eq!(
+            b.0[3],
+            Message {
+                dest: 0,
+                logical: false,
+                mode: 7,
+                vector: 0x37,
+                level: false
+            }
+        );
         assert_eq!(a.read(0x10, 8), None);
         // A level message nobody accepted: Remote IRR stays clear, and an entry write sends it again.
         entry(&mut a, 10, LEVEL | 0x5a, 0, &mut b);

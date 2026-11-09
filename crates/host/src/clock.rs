@@ -35,7 +35,10 @@ pub(crate) fn frequency() -> u64 {
     let mut t = Timebase { numer: 0, denom: 0 };
     unsafe { mach_timebase_info(&mut t) };
     let (n, d) = (u64::from(t.numer.max(1)), u64::from(t.denom));
-    assert!(1_000_000_000 * d % n == 0, "mach timebase {n}/{d}: not a whole number of hertz");
+    assert!(
+        1_000_000_000 * d % n == 0,
+        "mach timebase {n}/{d}: not a whole number of hertz"
+    );
     1_000_000_000 * d / n
 }
 
@@ -62,7 +65,9 @@ impl<T: Timed + 'static> Halt for Inner<T> {
     fn halt(&self) {
         // Under the lock: the thread is either waiting (and is woken) or has not yet looked at `stop`.
         let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.stop.swap(true, SeqCst) { device.shutdown(); }
+        if !self.stop.swap(true, SeqCst) {
+            device.shutdown();
+        }
         drop(device);
         self.changed.notify_one();
     }
@@ -77,7 +82,11 @@ pub(crate) struct Timer<T: Timed + 'static> {
 }
 impl<T: Timed + 'static> Timer<T> {
     pub(crate) fn new(device: T, name: &str) -> Self {
-        let inner = Arc::new(Inner { device: Mutex::new(device), changed: Condvar::new(), stop: AtomicBool::new(false) });
+        let inner = Arc::new(Inner {
+            device: Mutex::new(device),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
         let me = inner.clone();
         let thread = std::thread::Builder::new()
             .name(name.into())
@@ -101,15 +110,22 @@ impl<T: Timed + 'static> Timer<T> {
                             me.device.lock().unwrap_or_else(|e| e.into_inner())
                         }
                         Some(at) => {
-                            let wait = std::time::Duration::from_nanos(crate::execution::ticks_ns(at - n));
-                            me.changed.wait_timeout(d, wait).unwrap_or_else(|e| e.into_inner()).0
+                            let wait =
+                                std::time::Duration::from_nanos(crate::execution::ticks_ns(at - n));
+                            me.changed
+                                .wait_timeout(d, wait)
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0
                         }
                         None => me.changed.wait(d).unwrap_or_else(|e| e.into_inner()),
                     };
                 }
             })
             .expect("timer thread");
-        Self { inner, thread: Some(thread) }
+        Self {
+            inner,
+            thread: Some(thread),
+        }
     }
     /// Its thread's off switch.
     pub(crate) fn halter(&self) -> Arc<dyn Halt> {
@@ -172,8 +188,20 @@ fn time_constraint() {
     }
     const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
     let us = |n: u64| natemu_abi::clock::scale(n, frequency(), 1_000_000) as u32;
-    let p = Policy { period: 0, computation: us(50), constraint: us(100), preemptible: 1 };
-    unsafe { thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, &p, 4) };
+    let p = Policy {
+        period: 0,
+        computation: us(50),
+        constraint: us(100),
+        preemptible: 1,
+    };
+    unsafe {
+        thread_policy_set(
+            pthread_mach_thread_np(pthread_self()),
+            THREAD_TIME_CONSTRAINT_POLICY,
+            &p,
+            4,
+        )
+    };
 }
 
 /// L5 (owner decision, October 30): the lost-tick policy of each periodic interrupt source, for periods that pass while
@@ -195,12 +223,18 @@ pub struct LostTicks {
     pub lapic: bool,
 }
 impl LostTicks {
-    pub const DEFAULT: Self = Self { pit: true, rtc: false, lapic: false };
+    pub const DEFAULT: Self = Self {
+        pit: true,
+        rtc: false,
+        lapic: false,
+    };
     /// `pit=reinject,rtc=discard,lapic=reinject` (any subset; the rest default).
     pub fn parse(text: &str) -> crate::Result<Self> {
         let mut p = Self::DEFAULT;
         for item in text.split(',') {
-            let (dev, policy) = item.split_once('=').ok_or(format!("lost-ticks {item}: DEVICE=reinject|discard"))?;
+            let (dev, policy) = item
+                .split_once('=')
+                .ok_or(format!("lost-ticks {item}: DEVICE=reinject|discard"))?;
             let reinject = match policy {
                 "reinject" => true,
                 "discard" => false,
@@ -232,7 +266,12 @@ impl TickStats {
         let l = |a: &std::sync::atomic::AtomicU64| a.load(SeqCst);
         format!(
             "{{\"rises\":{},\"fresh\":{},\"coalesced\":{},\"dropped\":{},\"missed\":{},\"reinjected\":{}}}",
-            l(&self.rises), l(&self.fresh), l(&self.coalesced), l(&self.dropped), l(&self.missed), l(&self.reinjected)
+            l(&self.rises),
+            l(&self.fresh),
+            l(&self.coalesced),
+            l(&self.dropped),
+            l(&self.missed),
+            l(&self.reinjected)
         )
     }
 }
@@ -253,7 +292,12 @@ impl Board {
 /// L4b: puts the board's timed devices on `devices`, wired into `irqs`: the PIT at ports 40H-43H and 61H, the RTC at
 /// 70H-71H, the UART at COM1, the ACPI PM block at B000H-B00BH and its reset register at B040H (`boot::acpi::platform`). Each runs on its
 /// own [`Timer`] thread, joined when `devices` drops.
-pub fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, lost: LostTicks, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Board> {
+pub fn install(
+    devices: &mut crate::devices::Devices,
+    irqs: &crate::irq::Irqs,
+    lost: LostTicks,
+    uart: &Arc<Mutex<crate::uart::Uart>>,
+) -> crate::Result<Board> {
     use crate::boot::acpi::platform as p;
     use crate::devices::{At, Shared};
     let f = frequency();
@@ -275,8 +319,16 @@ pub fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, l
     let pm: Shared = Arc::new(Mutex::new(pm));
     let at = |offset: u64| -> Shared { Arc::new(Mutex::new(At(pm.clone(), offset))) };
     devices.register_ports(p::PM1A_EVT.into(), p::PM1_EVT_LEN.into(), at(0))?;
-    devices.register_ports(p::PM1A_CNT.into(), p::PM1_CNT_LEN.into(), at(crate::pm::CNT))?;
+    devices.register_ports(
+        p::PM1A_CNT.into(),
+        p::PM1_CNT_LEN.into(),
+        at(crate::pm::CNT),
+    )?;
     devices.register_ports(p::PM_TMR.into(), p::PM_TMR_LEN.into(), at(crate::pm::TIMER))?;
     devices.register_ports(p::RESET_PORT.into(), 1, at(crate::pm::RESET_REG))?;
-    Ok(Board { pit: pit_stats, rtc: rtc_stats, timers })
+    Ok(Board {
+        pit: pit_stats,
+        rtc: rtc_stats,
+        timers,
+    })
 }

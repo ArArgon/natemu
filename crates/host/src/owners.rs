@@ -58,8 +58,9 @@ pub fn supervise<T: Send>(
             let owner = thread::Builder::new()
                 .name(format!("vcpu-{id}"))
                 .spawn_scoped(scope, move || -> Result<T> {
-                    let cpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(id)))
-                        .unwrap_or_else(|_| Err("owner panicked during setup".into()));
+                    let cpu =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(id)))
+                            .unwrap_or_else(|_| Err("owner panicked during setup".into()));
                     prepared
                         .send(cpu.as_ref().map(Vcpu::id).map_err(Clone::clone))
                         .map_err(|_| "setup receiver closed")?;
@@ -142,6 +143,10 @@ pub fn supervise<T: Send>(
                 }
             });
         }
-        Ok(Supervision { outputs, error, destroyed: destroyed_rx.into_iter().collect() })
+        Ok(Supervision {
+            outputs,
+            error,
+            destroyed: destroyed_rx.into_iter().collect(),
+        })
     })
 }
