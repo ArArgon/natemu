@@ -99,6 +99,8 @@ pub(crate) struct Args {
     code_shape: bool,
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
+    #[arg(long)]
+    rng: bool,
     #[arg(long, value_name = "FILE")]
     serial: Option<String>,
     #[arg(long, env = "NATEMU_SERIAL_STDIN", value_parser = clap::builder::BoolishValueParser::new())]
@@ -122,7 +124,7 @@ pub(crate) struct Args {
 }
 
 pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
-    let Args { fexc, image, initrd, cmdline, ram, rsdp, vcpus, code_bytes, load_only, dump, stop_at, save, watchdog_ms, max_block, check_reuse, code_shape, speculation_barriers, serial, serial_stdin, strict, lost, trace, compile_cache, compile_cache_mb, perf_log } = args;
+    let Args { fexc, image, initrd, cmdline, ram, rsdp, vcpus, code_bytes, load_only, dump, stop_at, save, watchdog_ms, max_block, check_reuse, code_shape, speculation_barriers, rng, serial, serial_stdin, strict, lost, trace, compile_cache, compile_cache_mb, perf_log } = args;
     if let Some(path) = perf_log {
         natemu::perf::enable(path)?;
         natemu::perf::mark("main");
@@ -142,7 +144,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let layout = Layout { low_end: ram.min(exec::LOW_RAM_END), high: ram.saturating_sub(exec::LOW_RAM_END) };
     layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
     if load_only {
-        let tables = boot::acpi::build(vcpus, rsdp);
+        let manifest = if rng { vec![natemu::virtio::RNG_RESOURCE] } else { Vec::new() };
+        let tables = boot::acpi::build_with_virtio(vcpus, rsdp, &manifest);
         let inputs = Inputs { image: &image, cmdline: &cmdline, initrd: initrd.as_deref(), acpi: Some(&tables) };
         // Zero-filled on demand: only the pages the loader writes are touched.
         let mut host = vec![0u64; exec::ram_end(ram) as usize / 8];
@@ -173,6 +176,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         check_reuse,
         code_shape,
         speculation_barriers,
+        rng,
         ..natemu::linux::Boot::new(resident, fexc, image)
     };
     if let Some(path) = &serial {

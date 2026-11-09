@@ -102,7 +102,7 @@
 //!     `unassigned`: the unassigned rule then answers, L3); `memory` items on that page preload
 //!     its bytes and are reported from it; the mutations below apply to it. The output gains `devices` (each test
 //!     device's per-vCPU reads and writes, order errors and access log) and per vCPU `mmio` (device accesses completed,
-//!     the last status: `done` or the refusal). Not in identity spaces.)
+//!     the last status: `done` or the refusal). In identity spaces, only identical ADDR/GPA with `unassigned` is allowed.)
 //!   | entry ADDR LEVEL set|clear BITS   (mutation: set or clear BITS in the paging-structure entry of ADDR's walk at
 //!     LEVEL, 4 = PML4E .. 1 = PTE, after setup; mutations apply in order, and the levels above must be present).
 //! Every entry is present and user; leaves of code pages are read-only and executable, the others writable and
@@ -128,6 +128,14 @@ use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use super::test_devices::TestDevice;
 use crate::devices::Devices;
+#[path = "program_net.rs"]
+mod program_net;
+#[path = "program_pending.rs"]
+mod program_pending;
+#[path = "program_quiet.rs"]
+mod program_quiet;
+#[path = "program_io_stress.rs"]
+mod program_io_stress;
 
 /// One address space's contents.
 #[derive(Default, Debug, PartialEq)]
@@ -448,8 +456,8 @@ fn build(b: &mut Builder, space: &Space, rip: u64, nxe: bool, devices: &BTreeMap
     if space.identity && !space.large.is_empty() {
         return Err("identity space with a large page".into());
     }
-    if space.identity && !space.mmio.is_empty() {
-        return Err("identity space with an mmio page".into());
+    if space.identity && space.mmio.iter().any(|&(va, gpa, test)| va != gpa || test) {
+        return Err("identity MMIO must map its own non-RAM GPA without a test device".into());
     }
     let mut flags = BTreeMap::new();
     let code_pages: Vec<u64> = bodies(space, rip).flat_map(|(at, code)| page_span(at, code.len())).collect();
@@ -769,6 +777,10 @@ struct ProgramHook {
     tamper: Option<Tamper>,
     tamper_device: Option<Tamper>,
     tampered: bool,
+    io_control: Option<Arc<natemu::virtio::testing::Control>>,
+    net_hold: Option<Arc<program_net::Hold>>,
+    io_participants: usize,
+    pending_compiler: Option<Arc<program_pending::Control>>,
 }
 impl execution::Hook for ProgramHook {
     fn at(&mut self, area: Area, rip: u64) -> Result<Option<execution::At>> {
@@ -799,6 +811,10 @@ impl execution::Hook for ProgramHook {
             forge_exit(object);
         }
     }
+    fn compiler_posted(&mut self, compiles: u64, rip: u64, server: u32) -> std::io::Result<()> {
+        if let Some(control) = &self.pending_compiler { control.posted(compiles, rip, server)?; }
+        Ok(())
+    }
     fn before_compile(&mut self, compiles: u64, server: u32) {
         unsafe extern "C" {
             fn kill(pid: i32, signal: i32) -> i32;
@@ -808,9 +824,21 @@ impl execution::Hook for ProgramHook {
         }
     }
     fn reply(&mut self, kind: execution::ReplyKind, area: Area, state: &mut State) {
+        if matches!(kind, execution::ReplyKind::Power) {
+            if let Some(hold) = &self.net_hold { hold.release(true); }
+            if let Some(control) = &self.io_control {
+                control.event("power-poll");
+                if self.io_participants > 1 && (0..self.io_participants).filter(|&v| v != area.vcpu())
+                    .all(|v| execution::idle(execution::park_state(area.memory(), v))) {
+                    control.event("peer-halted");
+                }
+            }
+            return;
+        }
         let tamper = match kind {
             execution::ReplyKind::Translation => &mut self.tamper,
             execution::ReplyKind::Device => &mut self.tamper_device,
+            execution::ReplyKind::Power => unreachable!(),
         };
         if tamper.is_some_and(|t| t(area, state)) {
             (*tamper, self.tampered) = (None, true);
@@ -923,6 +951,112 @@ pub(crate) struct Args {
     tamper: Option<String>,
     #[arg(long, value_name = "KIND", value_parser = ["word", "record"])]
     tamper_after: Option<String>,
+    /// A real block device in the program fixture, with an optional finite backend schedule
+    #[arg(long, requires = "io_script")]
+    io_disk: Option<String>,
+    #[arg(long, requires = "io_disk", value_parser = ["normal", "hold-reset", "hold-disable", "hold-power", "hold-power-halt", "power-sync-error", "read-error", "write-error", "cycle-reset", "cycle-disable"])]
+    io_script: Option<String>,
+    /// Production network frontend with an independent owned-packet loopback endpoint
+    #[arg(long, conflicts_with_all = ["io_disk", "io_windows"])]
+    io_net: bool,
+    /// Deliver one owned frame only after the real idle observer sees a quiet halted guest
+    #[arg(long, requires = "io_net")]
+    io_net_arrival: Option<String>,
+    /// Hold the first owned TX callback until a guest port write or committed power wait
+    #[arg(long, requires = "io_net", conflicts_with = "io_net_arrival", value_parser = ["guest", "power"])]
+    io_net_hold: Option<String>,
+    /// Hold consumption of two real compiler replies while production RAM windows run
+    #[arg(long, conflicts_with_all = ["io_disk", "io_windows", "io_net", "stall_compiler", "kill_compiler"])]
+    io_pending: bool,
+    /// HLT quiescence spans a table/code write and a later read-only epoch before IRQ wake
+    #[arg(long, conflicts_with_all = ["io_disk", "io_windows", "io_net", "io_pending", "kicked", "stall_compiler", "kill_compiler"])]
+    io_quiet: bool,
+    /// Repeated split-atomic/HLT/table-code currency fixture (test driver only)
+    #[arg(long, conflicts_with_all = ["io_disk", "io_windows", "io_net", "io_pending", "io_quiet", "kicked", "stall_compiler", "kill_compiler"])]
+    io_stress: bool,
+    #[arg(long, requires = "io_stress", default_value_t = 512)]
+    io_stress_cycles: u64,
+    #[arg(long, requires = "io_stress", default_value_t = 0x15a4e35u64)]
+    io_stress_seed: u64,
+    #[arg(long, requires = "io_stress")]
+    io_stress_forced: bool,
+    /// Live copy-window fixture's shared data GPA (test driver only; see run_io_windows.py)
+    #[arg(long, value_parser = number, requires = "io_window_code")]
+    io_windows: Option<u64>,
+    /// GPA of the fixture's shared `mov eax, imm32; ret` function
+    #[arg(long, value_parser = number, requires = "io_windows")]
+    io_window_code: Option<u64>,
+}
+
+/// Exercise the production coordinator from an independent owner while translated loops run.
+/// All addresses and the loop protocol belong to this opt-in fixture, never to production I/O.
+fn io_windows(
+    backing: &execution::Backing, machine: &Machine, stops: &execution::Stops,
+    started: &[AtomicBool], ended: &AtomicBool, base: u64, code: u64,
+) -> Result<String> {
+    use execution::io::Transfer::{Read, Write};
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let live = || -> Result<()> {
+        if ended.load(SeqCst) || (0..started.len()).any(|v| stops.ended(v)) {
+            Err("I/O fixture participant ended before completion".into())
+        } else if Instant::now() >= deadline {
+            Err("I/O fixture deadline".into())
+        } else { Ok(()) }
+    };
+    while !started.iter().all(|s| s.load(SeqCst)) {
+        live()?;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut windows = 0usize;
+    let mut copy = |transfers: &mut [execution::io::Transfer<'_>]| -> Result<()> {
+        live()?;
+        backing.copy_guest(machine, stops, Duration::from_secs(2), transfers)?;
+        windows += 1;
+        Ok(())
+    };
+    let word = |bytes: &[u8], offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let check = |bytes: &[u8]| -> Result<()> {
+        let atomic = word(bytes, 0x3c);
+        if !matches!(atomic, 0x5555_5555_5555_5555 | 0xaaaa_aaaa_aaaa_aaaa) {
+            return Err(format!("I/O fixture torn split-atomic snapshot: {atomic:#018x}"));
+        }
+        Ok(())
+    };
+    let mut bytes = [0u8; 0x240];
+    // First observe actual execution of the shared function on every participant, so patching
+    // it later exercises invalidation of translated code rather than a first compilation.
+    loop {
+        copy(&mut [Read { gpa: base, bytes: &mut bytes }])?;
+        check(&bytes)?;
+        if (0..started.len()).all(|v| word(&bytes, 0x100 + 8 * v) != 0 && word(&bytes, 0x200 + 8 * v) == 1) { break; }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let before: Vec<_> = (0..started.len()).map(|v| word(&bytes, 0x100 + 8 * v)).collect();
+    for _ in 0..64 {
+        std::thread::sleep(Duration::from_millis(1));
+        copy(&mut [Read { gpa: base, bytes: &mut bytes }])?;
+        check(&bytes)?;
+    }
+    let mut overlap = [0u8; 8];
+    copy(&mut [
+        Write { gpa: base + 0x300, bytes: &[1, 2, 3, 4, 5, 6, 7, 8] },
+        Write { gpa: base + 0x302, bytes: &[9, 10, 11, 12] },
+        Read { gpa: base + 0x300, bytes: &mut overlap },
+    ])?;
+    if overlap != [1, 2, 9, 10, 11, 12, 7, 8] { return Err("I/O fixture ordered overlap failed".into()); }
+    copy(&mut [Write { gpa: code + 1, bytes: &2u32.to_le_bytes() }])?;
+    loop {
+        std::thread::sleep(Duration::from_millis(1));
+        copy(&mut [Read { gpa: base, bytes: &mut bytes }])?;
+        check(&bytes)?;
+        if (0..started.len()).all(|v| word(&bytes, 0x200 + 8 * v) == 2) { break; }
+    }
+    let after: Vec<_> = (0..started.len()).map(|v| word(&bytes, 0x100 + 8 * v)).collect();
+    if before.iter().zip(&after).any(|(a, b)| b <= a) { return Err("I/O fixture no guest progress between snapshots".into()); }
+    // This is the last window: after release a participant may end immediately.
+    copy(&mut [Write { gpa: base, bytes: &[1] }])?;
+    Ok(format!("{{\"windows\":{windows},\"snapshots\":64,\"progress_before\":{before:?},\"progress_after\":{after:?},\"ordered_overlap\":true,\"code_observed\":2}}"))
 }
 
 pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
@@ -968,6 +1102,22 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     }
     let d = parse(&fs::read_to_string(description).map_err(|e| e.to_string())?)?;
     let n = d.cpus.len();
+    if args.io_pending && n != 2 { return Err("pending compiler fixture requires two vCPUs".into()); }
+    if args.io_quiet && n != 2 { return Err("quiet fixture requires two vCPUs".into()); }
+    if args.io_stress && (!(n == 2 || n == 4) || !(1..=512).contains(&args.io_stress_cycles) || args.io_stress_seed == 0 || (args.io_stress_forced && args.io_stress_cycles > 64)) {
+        return Err("stress requires N2/N4, nonzero seed, 1..512 normal or 1..64 forced cycles".into());
+    }
+    let pending_compiler = args.io_pending.then(program_pending::Control::new);
+    if args.io_disk.is_some() || args.io_net || args.io_pending || args.io_quiet || args.io_stress {
+        let total = d.cpus.iter().flat_map(|c| d.spaces[c.space].memory.iter())
+            .try_fold(0usize, |n, (_, bytes)| n.checked_add(bytes.len()));
+        if total.is_none_or(|n| n > 4 * 1024 * 1024) { return Err("I/O fixture post-VM snapshot exceeds 4 MiB".into()); }
+    }
+    if let Some(base) = args.io_windows {
+        if !(1..=4).contains(&n) || base.checked_add(0x308).is_none() || args.io_window_code.unwrap().checked_add(5).is_none() {
+            return Err("I/O fixture requires 1..4 vCPUs and nonoverflowing addresses".into());
+        }
+    }
     if kicked.iter().any(|&v| v >= n) {
         return Err(format!("--kick-vcpu: {n} vCPUs"));
     }
@@ -1010,16 +1160,39 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     }
     // L3: COM1, a 16550A at 3F8H (output reported as `uart`); the unassigned rule, or with `--strict-unassigned` stops.
     let uart = Arc::new(Mutex::new(crate::uart::Uart::new()));
-    registry.register_ports(crate::boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
     // L4a: the I/O APIC, the 8259 pair and their wires; the UART's IRQ4 into them.
     let irqs = crate::irq::install(&mut registry, backing.memory(), n, &uart)?;
     // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
-    let board = crate::clock::install(&mut registry, &irqs, lost)?;
+    let board = crate::clock::install(&mut registry, &irqs, lost, &uart)?;
     if let Some(port) = irq_source {
         let mut source = super::test_devices::TestSource::new(&irqs);
         source.veto = irq_veto;
         registry.register_ports(port as u32, 8, Arc::new(Mutex::new(source)))?;
     }
+    let io_control = args.io_script.as_deref().map(natemu::virtio::testing::Control::new).transpose()?;
+    let io_disk = if let Some(path) = &args.io_disk {
+        let resource = natemu::virtio::BLOCK_RESOURCE;
+        let disk = natemu::virtio::Virtio::block(irqs.clone(), resource.gsi as usize, Path::new(path))?;
+        disk.test_control(io_control.as_ref().unwrap().clone())?;
+        registry.register(resource.base.into(), 4096, disk.device())?;
+        registry.register_ports(0x600, 1, Arc::new(Mutex::new(super::test_devices::IoControl(io_control.as_ref().unwrap().clone()))))?;
+        Some(disk)
+    } else { None };
+    let (io_net, packet_port) = if args.io_net {
+        let resource = natemu::virtio::NET_RESOURCE;
+        let (net, port) = natemu::virtio::Virtio::network(irqs.clone(), resource.gsi as usize, [2, 0, 0, 0, 0, 1])?;
+        registry.register(resource.base.into(), 4096, net.device())?;
+        (Some(net), Some(port))
+    } else { (None, None) };
+    let packet_trace = Arc::new(program_net::Trace::default());
+    let net_hold = args.io_net_hold.as_ref().map(|kind|
+        Arc::new(program_net::Hold::new(kind == "power", packet_trace.clone())));
+    if let Some(hold) = &net_hold {
+        registry.register_ports(0x600, 1, Arc::new(Mutex::new(program_net::HoldPort(hold.clone()))))?;
+    }
+    let packet_arrival = args.io_net_arrival.as_ref().map(|path|
+        std::fs::read(path).map_err(|e| e.to_string()).and_then(program_net::Arrival::new)
+    ).transpose()?;
     registry.strict = strict;
     let registry = Arc::new(registry);
     // A space is built for the first vCPU using it (its rip places `code` bodies).
@@ -1122,6 +1295,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             tamper: None,
             tamper_device: None,
             tampered: false,
+            io_control: io_control.clone(),
+            net_hold: net_hold.clone(),
+            io_participants: n,
+            pending_compiler: if v == 0 { pending_compiler.clone() } else { None },
         };
         if v == target {
             (hook.forge_exit, hook.signal_at) = (forge, signal_at);
@@ -1139,6 +1316,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let body = |v: usize, cpu: &Vcpu, cancelled: &AtomicBool| -> Result<Ran> {
         started[v].store(true, SeqCst);
         let ran = run_vcpu(v, cpu, cancelled);
+        if let Some(control) = &pending_compiler { control.abort(); }
+        if let Some(disk) = &io_disk { disk.stop(); }
+        if let Some(net) = &io_net { net.stop(); }
         stops.end(v);
         let (stop, compiler, requests, hook) = ran?;
         if !finished(&stop) {
@@ -1161,7 +1341,52 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     // first posts an event (X2), chosen at random from the list.
     let kickers_left = std::sync::atomic::AtomicUsize::new(kicked.len());
     let all_ended = AtomicBool::new(false);
-    let (kicked, supervision) = std::thread::scope(|scope| {
+    let io_active = AtomicBool::new(args.io_windows.is_some() || args.io_pending || args.io_quiet || args.io_stress);
+    let cancelled = AtomicBool::new(false);
+    let (kicked, supervision, io_result, disk_result, network_result) = std::thread::scope(|scope| {
+        let network_worker = io_net.as_ref().map(|net| scope.spawn(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| net.run(&backing, &machine, &stops, &cancelled)))
+                .unwrap_or_else(|_| Err("network owner panicked".into()));
+            if result.is_err() { net.stop(); owners::cancel_owners(&cancelled); }
+            result
+        }));
+        let packet_worker = packet_port.map(|port| {
+            let (trace, cancelled, net) = (&packet_trace, &cancelled, io_net.as_ref().unwrap());
+            let arrival = packet_arrival.as_ref();
+            let hold = net_hold.as_deref();
+            scope.spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program_net::echo(port, trace, arrival, hold)))
+                    .unwrap_or_else(|_| Err("packet endpoint panicked".into()));
+                if result.is_err() { net.stop(); owners::cancel_owners(cancelled); }
+                result
+            })
+        });
+        let disk_worker = io_disk.as_ref().map(|disk| scope.spawn(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| disk.run(&backing, &machine, &stops, &cancelled)))
+                .unwrap_or_else(|_| Err("disk owner panicked".into()));
+            if result.is_err() { owners::cancel_owners(&cancelled); }
+            result
+        }));
+        let io_worker = args.io_windows.or(args.io_pending.then_some(program_pending::BASE)).or(args.io_quiet.then_some(program_quiet::BASE)).or(args.io_stress.then_some(program_io_stress::BASE)).map(|base| {
+            let (backing, machine, stops, started, all_ended, cancelled, io_active) =
+                (&backing, &machine, &stops, &started, &all_ended, &cancelled, &io_active);
+            let code = args.io_window_code;
+            let pending = pending_compiler.as_ref();
+            let quiet = args.io_quiet;
+            let stress = args.io_stress;
+            let (cycles, seed, forced) = (args.io_stress_cycles, args.io_stress_seed, args.io_stress_forced);
+            scope.spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    if let Some(control) = pending { program_pending::run(control, backing, machine, stops, started, all_ended) }
+                    else if quiet { program_quiet::run(backing, machine, stops, started, all_ended) }
+                    else if stress { program_io_stress::run(backing, machine, stops, started, all_ended, cycles, seed, forced) }
+                    else { io_windows(backing, machine, stops, started, all_ended, base, code.unwrap()) }
+                )).unwrap_or_else(|_| Err("I/O fixture owner panicked".into()));
+                if result.is_err() { owners::cancel_owners(cancelled); }
+                io_active.store(false, SeqCst);
+                result
+            })
+        });
         let kickers: Vec<_> = kicked
             .iter()
             .map(|&v| {
@@ -1224,9 +1449,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         // asynchronous host source (the kickers here; L4a's PIT, RTC, UART and device SPIs) must post through
         // `execution::post`, so the posts count sees it, and must keep the decision off while it may still post, as
         // `kickers_left` does.
-        let (stops, backing, machine, kickers_left, all_ended, irqs) = (&stops, &backing, &machine, &kickers_left, &all_ended, &irqs);
+        let (stops, backing, machine, kickers_left, all_ended, irqs, io_active) = (&stops, &backing, &machine, &kickers_left, &all_ended, &irqs, &io_active);
+        let (arrival, packet_trace) = (packet_arrival.as_ref(), &packet_trace);
         let idle = scope.spawn(move || -> Result<()> {
             let mut asked = vec![false; n];
+            let mut idle_since: Option<(std::time::Instant, Vec<[u64; 2]>)> = None;
             while !all_ended.load(SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 let read = || (0..n).map(|v| (!stops.ended(v)).then(|| execution::park_state(backing.memory(), v))).collect::<Vec<_>>();
@@ -1239,7 +1466,22 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 // runs). Checked before the reads instead, a guard taken between the check and the reads by a vCPU that
                 // then halted went unseen and its vCPU was ended (`run_l4a.py halt` with a 30 ms delay forced there: red
                 // 5/5; this order: green 5/5).
-                let vetoed = kickers_left.load(SeqCst) != 0 || irqs.live() != 0;
+                let live = irqs.live();
+                let other_sources = kickers_left.load(SeqCst) != 0 || io_active.load(SeqCst);
+                let vetoed = other_sources || live != 0;
+                if let Some(arrival) = arrival {
+                    // Only the production endpoint's lifetime guard may remain. This observer
+                    // does not veto termination, touch guest RAM, or ring a doorbell itself.
+                    if !other_sources && live == 1 && halted.len() == n
+                        && halted.iter().all(|&v| first[v] == second[v] && first[v].is_some_and(execution::idle)) {
+                        let states: Vec<_> = first.iter().map(|p| { let (word, posts) = p.unwrap(); [word, posts] }).collect();
+                        if idle_since.as_ref().is_none_or(|(_, previous)| *previous != states) {
+                            idle_since = Some((std::time::Instant::now(), states.clone()));
+                        }
+                        let (since, previous) = idle_since.as_ref().unwrap();
+                        if since.elapsed() >= std::time::Duration::from_millis(100) { arrival.release(since.elapsed(), previous, &states, packet_trace); }
+                    } else { idle_since = None; }
+                }
                 if !vetoed && !halted.is_empty() && halted.iter().all(|&v| first[v] == second[v] && first[v].is_some_and(execution::idle)) {
                     for &v in halted.iter().filter(|&&v| !std::mem::replace(&mut asked[v], true)) {
                         execution::end_when_halted(backing.memory(), v);
@@ -1249,8 +1491,16 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             }
             Ok(())
         });
-        let supervision = owners::supervise(n, &prepare, &body, &AtomicBool::new(false));
+        let supervision = owners::supervise(n, &prepare, &body, &cancelled);
         all_ended.store(true, SeqCst);
+        if let Some(control) = &pending_compiler { control.abort(); }
+        if let Some(net) = &io_net { net.stop(); }
+        let network_result = network_worker.map(|w| w.join().unwrap_or_else(|_| Err("network owner panicked".into()))).transpose();
+        let packet_result = packet_worker.map(|w| w.join().unwrap_or_else(|_| Err("packet endpoint panicked".into()))).transpose();
+        let network_result = network_result.and(packet_result);
+        if let Some(disk) = &io_disk { disk.stop(); }
+        let disk_result = disk_worker.map(|worker| worker.join().unwrap_or_else(|_| Err("disk owner panicked".into()))).transpose();
+        let io_result = io_worker.map(|worker| worker.join().unwrap_or_else(|_| Err("I/O fixture owner panicked".into()))).transpose();
         let idle = idle.join().unwrap_or(Err("idle watcher panicked".into()));
         for v in 0..n {
             stops.end(v); // a vCPU that never started
@@ -1259,7 +1509,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let kicked = kicked.and(idle);
         // Every vCPU and kicker has ended: a doorbell still pending is a kick no stop followed.
         let kicked = kicked.and_then(|()| (0..n).try_for_each(|v| stops.pending_at_end(&machine, v)));
-        (kicked, supervision)
+        (kicked, supervision, io_result, disk_result, network_result)
     });
     // Every vCPU is destroyed (or never created): the VM goes next (no device rings it after this), then the host reads
     // the backing.
@@ -1267,8 +1517,33 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     board.stop();
     let destroyed = machine.destroy();
     eprintln!("{}", teardown(n, supervision.as_ref().ok(), destroyed));
+    if let Some(control) = &io_control {
+        eprintln!("io-disk: {}", control.json());
+    }
+    if args.io_net { eprintln!("io-net: {}", packet_trace.json()); }
+    if let Some(control) = &pending_compiler { eprintln!("io-pending: {}", control.json()); }
+    if io_control.is_some() || args.io_net || args.io_pending || args.io_quiet || args.io_stress {
+        // All vCPUs have joined: report architectural progress even when final sync failed.
+        let states: Vec<_> = (0..n).map(|v| {
+            let cpu = backing.vcpu(v).read_record::<State>(exec::STATE_OFFSET).cpu;
+            format!("{{\"rip\":\"{:#x}\",\"gpr\":{:?}}}", cpu.rip, cpu.gpr)
+        }).collect();
+        eprintln!("io-state: [{}]", states.join(","));
+        let memories: Vec<_> = d.cpus.iter().map(|c| {
+            let table = spaces[c.space].as_ref().unwrap();
+            let entries: Vec<_> = d.spaces[c.space].memory.iter().map(|(address, data)| {
+                let bytes: String = table.copy_out(*address, data.len()).iter().map(|b| format!("{b:02x}")).collect();
+                format!("{{\"addr\":\"{address:#x}\",\"data\":\"{bytes}\"}}")
+            }).collect();
+            format!("[{}]", entries.join(","))
+        }).collect();
+        eprintln!("io-memory: [{}]", memories.join(","));
+    }
     let supervision = supervision?;
     hv(destroyed, "destroy VM")?;
+    disk_result?;
+    network_result?;
+    let io_result = io_result?;
     if let Some(e) = supervision.error {
         return Err(e);
     }
@@ -1299,6 +1574,12 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         format!("{{\"gpa\":\"{gpa:#x}\",\"reads\":{:?},\"writes\":{:?},\"order_errors\":{},\"log\":[{}]}}", &d.reads[..n], &d.writes[..n], d.order_errors, log.join(","))
     });
     let mut devices = if test_devices.is_empty() { String::new() } else { format!(",\"devices\":[{}]", devices.collect::<Vec<_>>().join(",")) };
+    if let Some(result) = io_result {
+        let name = if args.io_pending { "io_pending" } else if args.io_quiet { "io_quiet" } else if args.io_stress { "io_stress" } else { "io_windows" };
+        let _ = write!(devices, ",\"{name}\":{result}");
+    }
+    if let Some(control) = &io_control { let _ = write!(devices, ",\"io_disk\":{}", control.json()); }
+    if args.io_net { let _ = write!(devices, ",\"io_net\":{}", packet_trace.json()); }
     // L3: port and unassigned-page counts and the UART's output, once there are any.
     let counts = registry.report();
     let output = std::mem::take(&mut uart.lock().unwrap_or_else(|e| e.into_inner()).output);

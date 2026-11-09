@@ -8,9 +8,11 @@
 //! OUT2 there, as QEMU's PC does). Byte registers only: a wider access is split into byte accesses at consecutive offsets,
 //! lowest first (QEMU's `serial_io_ops` 952-963: `impl.max_access_size` 1). The modem lines are those of a backend without
 //! modem control (QEMU's `serial_update_msl` with a file or null backend sets `poll_msl` -1): MSR reads DCD|DSR|CTS
-//! with no deltas, and in loopback the MCR outputs (OUT2 -> DCD, OUT1 -> RI, RTS -> CTS, DTR -> DSR). Transmission is
-//! instantaneous, as in QEMU (THRE and TEMT are set again by the time the THR write completes); in loopback a
-//! transmitted byte is received. Output goes to [`Uart::output`] and the driver's sink; input from the host comes through
+//! with no deltas, and in loopback the MCR outputs (OUT2 -> DCD, OUT1 -> RI, RTS -> CTS, DTR -> DSR). External transmission accepts every THR write into bounded host staging, spilling full 16-byte batches
+//! synchronously. THRE/TEMT and THRI become ready 20 us after the last accepted byte; the existing timer service
+//! drains partial batches and publishes the ready edge even without guest accesses. This accelerated-console policy
+//! is neither physical baud timing nor a hardware TX FIFO/drop model, nor a scheduler fairness bound. Loopback
+//! remains instantaneous: a transmitted byte is received. Output goes to [`Uart::output`] and the driver's sink; input from the host comes through
 //! [`feed`] (`--serial-stdin`), as QEMU's character backend gives it (`serial_can_receive` 557-576: never more than the
 //! FIFO advertises, so host input never overruns; a guest's own loopback bytes can).
 //!
@@ -18,18 +20,20 @@
 //! is evaluated at each register access from the host's monotonic clock: its effect on IIR and the line is the timer's
 //! as seen by any access, but the line does not rise between accesses. **IRQ4** ([`Uart::irq`]): the UART drives its
 //! interrupt output (high while IIR names an interrupt), wired by L4a (`irq::install`) to ISA IRQ 4: PIC input 4 and I/O
-//! APIC pin 4. Today every change is made by a vCPU's own access (synchronous). The hook reports level changes only, and
+//! APIC pin 4. The hook reports level changes only, and
 //! the board treats an edge as a 0 -> 1 change (QEMU's edge-mode I/O APIC delivers on every raise, a raise while already
 //! high included: a departure recorded in `ioapic.rs`). Host input is asynchronous: [`feed`]'s thread receives bytes and
 //! runs the CTI on time under the UART's lock, so the line rises without an access, through the same hook (IRQ4 into
 //! `irq::Irqs::line`, whose delivery rings a halted vCPU). `linux::Prepared::run` holds an `Irqs::busy` guard while it
 //! runs, as `irq.rs` asks of asynchronous sources; nothing in a Linux boot reads it today (only the program driver
-//! ends halted vCPUs, by `Irqs::live`). ponytail: a CTI due after a guest's partial read, with no host input, still waits for
+//! ends halted vCPUs, by `Irqs::live`). Pending external TX holds its own busy guard through ready-IRQ publication.
+//! Board shutdown drains accepted output before the final error/count observation; a blocking sink can still block
+//! shutdown, as it could block a synchronous THR write. ponytail: a CTI due after a guest's partial read, with no host input, still waits for
 //! the next access (Linux's 8250 handler drains the FIFO, so it does not arise there).
 use crate::devices::Device;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const LCR_DLAB: u8 = 0x80;
@@ -62,7 +66,12 @@ const FCR_RFR: u8 = 0x02;
 const FCR_FE: u8 = 0x01;
 const FIFO: usize = 16;
 const BAUD_BASE: f32 = 115_200.0;
+/// Accelerated-console inactivity interval, not physical baud timing or a scheduler fairness bound.
+const TX_READY_US: u64 = 20;
+const TX_BATCH: usize = 16;
 
+/// Standalone instances require register accesses to service TX deadlines; production registration
+/// through `clock::install` adds asynchronous service and shutdown draining.
 pub struct Uart {
     divider: u16,
     rbr: u8,
@@ -75,6 +84,13 @@ pub struct Uart {
     scr: u8,
     fcr: u8,
     thr_ipending: bool,
+    /// Host output staging, NOT a hardware FIFO: full batches spill synchronously; no THR write is dropped.
+    tx: Vec<u8>,
+    tx_at: Option<u64>,
+    tx_delay: u64,
+    tx_stopped: bool,
+    tx_irqs: Option<crate::irq::Irqs>,
+    tx_busy: Option<crate::irq::Busy>,
     timeout_ipending: bool,
     recv: VecDeque<u8>,
     recv_itl: usize,
@@ -109,6 +125,12 @@ impl Uart {
             scr: 0,
             fcr: 0,
             thr_ipending: false,
+            tx: Vec::with_capacity(TX_BATCH),
+            tx_at: None,
+            tx_delay: natemu_abi::clock::scale(TX_READY_US, crate::clock::frequency(), 1_000_000),
+            tx_stopped: false,
+            tx_irqs: None,
+            tx_busy: None,
             timeout_ipending: false,
             recv: VecDeque::with_capacity(FIFO),
             recv_itl: 1,
@@ -201,32 +223,61 @@ impl Uart {
         self.update_irq();
     }
 
+    /// Emission alone does not publish empty status: synchronous spill must not regenerate per-byte IRQs.
+    fn flush_tx(&mut self) {
+        if self.tx.is_empty() { return; }
+        match &mut self.sink {
+            Some(sink) => {
+                if let Err(error) = sink.write_all(&self.tx).and_then(|_| sink.flush()) {
+                    if self.sink_error.is_none() { self.sink_error = Some(error.to_string()); }
+                    self.sink = None;
+                }
+            }
+            None if self.sink_error.is_none() => self.output.extend_from_slice(&self.tx),
+            None => {}
+        }
+        self.tx.clear();
+    }
+    fn finish_tx(&mut self) {
+        self.flush_tx();
+        self.tx_at = None;
+        self.lsr |= LSR_THRE | LSR_TEMT;
+        self.thr_ipending = true;
+        self.update_irq();
+        // A halted guest must not be declared finished between dropping busy and publishing its IRQ.
+        self.tx_busy = None;
+    }
+    fn fire_tx(&mut self, at: u64) {
+        if self.tx_at.is_some_and(|deadline| deadline <= at) { self.finish_tx(); }
+    }
+    fn shutdown(&mut self) {
+        if self.tx_stopped { return; }
+        self.tx_stopped = true;
+        // The board has detached at VM end. Do not invoke even a detached callback during final drain.
+        self.irq = None;
+        if self.tx_at.is_some() { self.finish_tx(); } else { self.flush_tx(); }
+    }
     fn transmit(&mut self, byte: u8, now: Instant) {
-        // The THR write (with a FIFO, through the transmit FIFO, which the instantaneous transmitter empties at once).
         self.thr_ipending = false;
         self.lsr &= !(LSR_THRE | LSR_TEMT);
         self.update_irq();
-        self.lsr |= LSR_THRE;
-        if !self.thr_ipending {
+        if self.mcr & MCR_LOOP != 0 {
+            // Keep the established instantaneous loopback/probe behavior.
+            self.lsr |= LSR_THRE;
             self.thr_ipending = true;
             self.update_irq();
-        }
-        if self.mcr & MCR_LOOP != 0 {
             self.receive(byte, now);
+            self.lsr |= LSR_TEMT;
         } else {
+            // THR acceptance commits the byte and count, independent of later sink failure/reset.
             self.sent += 1;
-            match &mut self.sink {
-                Some(sink) => {
-                    if let Err(e) = sink.write_all(&[byte]).and_then(|_| sink.flush()) {
-                        self.sink_error = Some(e.to_string());
-                        self.sink = None;
-                    }
-                }
-                None if self.sink_error.is_none() => self.output.push(byte),
-                None => {}
-            }
+            if self.tx_busy.is_none() { self.tx_busy = self.tx_irqs.as_ref().map(|i| i.busy()); }
+            self.tx.push(byte);
+            if self.tx.len() == TX_BATCH { self.flush_tx(); }
+            // Inactivity starts after any synchronous native spill, so even a slow sink cannot
+            // consume the entire ready delay before this OUT returns. No baud-rate wallclock cap.
+            self.tx_at = Some(crate::clock::now().saturating_add(self.tx_delay));
         }
-        self.lsr |= LSR_TEMT;
     }
 
     pub(crate) fn write_at(&mut self, offset: u64, value: u8, now: Instant) {
@@ -260,6 +311,9 @@ impl Uart {
                     self.recv.clear();
                 }
                 if value & FCR_XFR != 0 {
+                    // These bytes were already accepted by the old instantaneous sink. Reset
+                    // flushes their host staging; it cannot retract or silently discard them.
+                    if self.tx_at.is_some() { self.finish_tx(); }
                     self.lsr |= LSR_THRE;
                     self.thr_ipending = true;
                 }
@@ -276,7 +330,11 @@ impl Uart {
                 self.lcr = value;
                 self.update_parameters();
             }
-            4 => self.mcr = value & 0x1f,
+            4 => {
+                // An external byte remains external even if the guest enters loopback before it drains.
+                if (self.mcr ^ value) & MCR_LOOP != 0 && self.tx_at.is_some() { self.finish_tx(); }
+                self.mcr = value & 0x1f;
+            },
             7 => self.scr = value,
             _ => {} // LSR, MSR: read-only
         }
@@ -331,14 +389,41 @@ impl Uart {
 
 impl Device for Uart {
     fn read(&mut self, _vcpu: usize, offset: u64, size: u64) -> Option<u64> {
+        self.fire_tx(crate::clock::now());
         let now = Instant::now();
         Some((0..size).fold(0, |v, k| v | u64::from(self.read_at((offset + k) & 7, now)) << (8 * k)))
     }
     fn write(&mut self, _vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
+        if self.tx_stopped { return false; }
+        self.fire_tx(crate::clock::now());
         let now = Instant::now();
         (0..size).for_each(|k| self.write_at((offset + k) & 7, (value >> (8 * k)) as u8, now));
         true
     }
+}
+
+/// The existing timer owner services the same UART reached by IRQ wiring and host RX.
+/// Outer timer lock -> UART lock; RX never takes the outer timer lock.
+struct TimedUart(Arc<Mutex<Uart>>);
+impl Device for TimedUart {
+    fn read(&mut self, v: usize, o: u64, n: u64) -> Option<u64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).read(v, o, n)
+    }
+    fn write(&mut self, v: usize, o: u64, n: u64, x: u64) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(v, o, n, x)
+    }
+}
+impl crate::clock::Timed for TimedUart {
+    fn next(&self) -> Option<u64> { self.0.lock().unwrap_or_else(|e| e.into_inner()).tx_at }
+    fn fire(&mut self, at: u64) { self.0.lock().unwrap_or_else(|e| e.into_inner()).fire_tx(at); }
+    fn shutdown(&mut self) { self.0.lock().unwrap_or_else(|e| e.into_inner()).shutdown(); }
+}
+pub(crate) fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, uart: &Arc<Mutex<Uart>>) -> crate::Result<Arc<dyn crate::clock::Halt>> {
+    uart.lock().unwrap_or_else(|e| e.into_inner()).tx_irqs = Some(irqs.clone());
+    let timer = crate::clock::Timer::new(TimedUart(uart.clone()), "uart-tx");
+    let halt = timer.halter();
+    devices.register_ports(crate::boot::acpi::platform::COM1_PORT.into(), 8, Arc::new(Mutex::new(timer)))?;
+    Ok(halt)
 }
 
 /// Host input bytes [`feed`] holds for the UART (a reader's bytes past them are dropped while it is full).
@@ -463,6 +548,8 @@ mod tests {
         u.write_at(3, 0x03, t);
         assert_eq!(u.read_at(5, t) & 0x60, 0x60);
         u.write_at(0, b'A', t);
+        assert_eq!(u.read_at(5, t) & 0x60, 0);
+        u.fire_tx(u.tx_at.unwrap());
         assert_eq!(u.read_at(5, t), LSR_TEMT | LSR_THRE);
         assert_eq!(u.output, b"A");
     }
@@ -504,8 +591,194 @@ mod tests {
         let log = seen.clone();
         u.irq = Some(Box::new(move |level| log.lock().unwrap().push(level)));
         u.write_at(1, IER_THRI, Instant::now()); // THRE pending: the line rises
-        u.write_at(0, b'x', Instant::now()); // the THR write lowers it, the instantaneous transmit raises it again (an edge)
+        u.write_at(0, b'x', Instant::now()); // THR lowers the line; only delayed completion raises it.
+        assert_eq!(*seen.lock().unwrap(), [true, false]);
+        u.fire_tx(u.tx_at.unwrap());
         assert_eq!(*seen.lock().unwrap(), [true, false, true]);
+    }
+
+    #[test]
+    fn accepted_batches_wait_for_empty_publication() {
+        let t = Instant::now();
+        let mut u = Uart::new();
+        u.write_at(1, IER_THRI, t);
+        u.read_at(2, t);
+        for b in 0..35 { u.write_at(0, b, t); }
+        assert_eq!(u.sent, 35);
+        assert_eq!(u.output, (0..32).collect::<Vec<u8>>());
+        assert_eq!(u.tx, [32, 33, 34]);
+        assert!(!u.line);
+        assert_eq!(u.read_at(5, t) & 0x60, 0);
+        let at = u.tx_at.unwrap();
+        u.fire_tx(at - 1);
+        assert!(!u.line);
+        u.fire_tx(at);
+        assert_eq!(u.output, (0..35).collect::<Vec<u8>>());
+        assert_eq!(u.read_at(5, t) & 0x60, 0x60);
+        assert_eq!(u.read_at(2, t), IIR_THRI);
+        assert_eq!(u.read_at(2, t), IIR_NO_INT);
+    }
+
+    #[test]
+    fn resets_and_loopback_preserve_accepted_external_bytes() {
+        let t = Instant::now();
+        let mut u = Uart::new();
+        u.write_at(0, b'a', t);
+        u.write_at(2, FCR_FE, t); // mode change implies TX reset
+        assert_eq!(u.output, b"a");
+        assert!(u.tx_at.is_none());
+        u.write_at(0, b'b', t);
+        u.write_at(2, FCR_FE | FCR_XFR, t);
+        assert_eq!(u.output, b"ab");
+        u.write_at(0, b'c', t);
+        u.write_at(4, MCR_LOOP, t);
+        u.write_at(0, b'd', t);
+        assert_eq!(u.output, b"abc");
+        assert_eq!(u.read_at(0, t), b'd');
+        assert_eq!(u.sent, 3);
+        assert!(u.tx_at.is_none());
+    }
+
+    #[test]
+    fn partial_output_drains_on_shutdown_once_and_errors_survive() {
+        struct Fails(Arc<Mutex<usize>>);
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                *self.0.lock().unwrap() += 1;
+                Err(std::io::Error::other("first sink failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { panic!("write failed first") }
+        }
+        let calls = Arc::new(Mutex::new(0));
+        let mut u = Uart::new();
+        u.sink = Some(Box::new(Fails(calls.clone())));
+        u.write_at(0, b'x', Instant::now());
+        u.irq = Some(Box::new(|_| panic!("no callback during shutdown")));
+        u.shutdown();
+        u.shutdown();
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(u.sink_error.as_deref(), Some("first sink failure"));
+        assert_eq!(u.sent, 1);
+        assert!(u.output.is_empty());
+        assert!(!u.write(0, 0, 1, b'y'.into()));
+        assert!(u.tx_at.is_none());
+    }
+
+    #[test]
+    fn polling_services_due_and_flush_failure_is_retained() {
+        struct FlushFails;
+        impl Write for FlushFails {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { Ok(b.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Err(std::io::Error::other("flush failure")) }
+        }
+        let mut u = Uart::new();
+        u.sink = Some(Box::new(FlushFails));
+        u.write_at(0, b'x', Instant::now());
+        u.tx_at = Some(0); // deterministic due point, serviced by the normal polling path
+        assert_eq!(u.read(0, 5, 1), Some(0x60));
+        assert_eq!(u.sink_error.as_deref(), Some("flush failure"));
+        u.write_at(0, b'y', Instant::now());
+        u.shutdown();
+        assert_eq!(u.sent, 2);
+        assert_eq!(u.sink_error.as_deref(), Some("flush failure"));
+        assert!(u.output.is_empty());
+    }
+
+    #[test]
+    fn installed_uart_acquires_busy_and_fires_without_access() {
+        let memory = Arc::new(crate::memory::Memory::with_size(4096).unwrap());
+        let uart = Arc::new(Mutex::new(Uart::new()));
+        let mut devices = crate::devices::Devices::new(0);
+        let irqs = crate::irq::install(&mut devices, &memory, 0, &uart).unwrap();
+        let halt = install(&mut devices, &irqs, &uart).unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        {
+            let mut u = uart.lock().unwrap();
+            u.tx_delay = crate::clock::frequency() / 10;
+            u.write_at(1, IER_THRI, Instant::now());
+            u.read_at(2, Instant::now());
+            let active = irqs.clone();
+            u.irq = Some(Box::new(move |level| {
+                if level { send.send(active.live()).unwrap(); }
+            }));
+        }
+        assert_eq!(irqs.live(), 0);
+        devices.port(0, 0x3f8, 1, Some(b'x'.into())).unwrap();
+        assert_eq!(irqs.live(), 1); // the actual installed path vetoes all-HLT termination
+        assert_eq!(recv.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        let u = uart.lock().unwrap();
+        assert_eq!(u.output, b"x");
+        assert_eq!(irqs.live(), 0);
+        drop(u);
+        halt.halt();
+    }
+
+    #[test]
+    fn concurrent_halt_waits_for_the_owned_drain() {
+        struct Gated {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Write for Gated {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut u = Uart::new();
+        u.tx_delay = crate::clock::frequency() * 60;
+        u.sink = Some(Box::new(Gated { entered, release: released }));
+        let uart = Arc::new(Mutex::new(u));
+        let mut timer = crate::clock::Timer::new(TimedUart(uart.clone()), "uart-halt-test");
+        timer.write(0, 0, 1, b'x'.into());
+        let first = timer.halter();
+        let second = timer.halter();
+        let (done, completed) = std::sync::mpsc::channel();
+        let a = std::thread::spawn(move || first.halt());
+        entering.recv_timeout(Duration::from_secs(1)).unwrap();
+        let b = std::thread::spawn(move || { second.halt(); done.send(()).unwrap(); });
+        let premature = completed.recv_timeout(Duration::from_millis(20)).is_ok();
+        release.send(()).unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+        assert!(!premature, "a concurrent halt returned before the drain finished");
+        assert!(uart.lock().unwrap().tx.is_empty());
+    }
+
+    #[test]
+    fn timer_publishes_ready_without_port_access_and_halt_drains() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let busy = Arc::new(AtomicUsize::new(1));
+        let check = busy.clone();
+        let (send, recv) = std::sync::mpsc::channel();
+        let mut u = Uart::new();
+        u.write_at(1, IER_THRI, Instant::now());
+        u.read_at(2, Instant::now());
+        u.tx_busy = Some(crate::irq::Busy(busy.clone()));
+        u.irq = Some(Box::new(move |level| {
+            if level { assert_eq!(check.load(SeqCst), 1); send.send(()).unwrap(); }
+        }));
+        let uart = Arc::new(Mutex::new(u));
+        let mut timer = crate::clock::Timer::new(TimedUart(uart.clone()), "uart-test");
+        assert!(timer.write(0, 0, 1, b'x'.into()));
+        recv.recv_timeout(Duration::from_secs(1)).expect("timer completion without guest access");
+        {
+            let u = uart.lock().unwrap();
+            assert_eq!(u.output, b"x");
+            assert_eq!(busy.load(SeqCst), 0);
+        }
+        // Long deadline makes the second byte a shutdown drain, not a timed completion.
+        uart.lock().unwrap().tx_delay = crate::clock::frequency() * 60;
+        assert!(timer.write(0, 0, 1, b'y'.into()));
+        let h = timer.halter();
+        h.halt();
+        h.halt();
+        assert_eq!(uart.lock().unwrap().output, b"xy");
+        drop(timer); // joins; no post-halt callback
     }
 
     /// Host input on a thread: bytes below the trigger level raise the line by the CTI with no access; the escapes; no

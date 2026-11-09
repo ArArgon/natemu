@@ -10,6 +10,8 @@ use natemu_abi::*;
 use natemu_abi::guest_memory::{GuestRam, GuestTables};
 use record::*;
 mod cache;
+#[cfg(feature = "io-test-hooks")]
+mod io_test;
 mod execution;
 mod perf;
 mod record;

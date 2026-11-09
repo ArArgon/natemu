@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Relaxed, SeqCst}};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod io;
+#[cfg(feature = "io-test-hooks")]
+pub mod io_test;
+
 /// The execution mode's backing for `n` vCPUs. Block 0 holds vCPU 0's window, its lookup area, the global area, its
 /// metadata arena and its code area (the `exec`/`cache` offsets); block v (`v * stride` further) holds vCPU v's own
 /// window, lookup area, metadata arena and code area at the same offsets and leaves the global area's range unused
@@ -37,6 +41,8 @@ pub struct Backing {
     /// One CNTVCT sample (the host's `mach_absolute_time`: every vCPU's virtual counter has offset 0) taken when the VM
     /// was prepared: each vCPU's TSC starts from it, so all start near 0 and agree.
     epoch: u64,
+    /// Serializes finite guest-RAM copy windows; epochs are never reused.
+    io_epoch: Mutex<u64>,
 }
 impl Backing {
     /// The backing's mapping (shared: whoever holds a clone keeps it mapped).
@@ -47,6 +53,9 @@ impl Backing {
     ///
     /// # Safety
     /// The value (and every copy) must not be used after this backing is dropped: it addresses the backing's mapping.
+    /// During execution, raw host accesses must be excluded from `copy_guest` windows. Production source reads
+    /// occur only while their vCPU is serving a request, before it can acknowledge a window; boot writes precede
+    /// execution. Other running-VM access must use `copy_guest` instead.
     pub unsafe fn ram(&self) -> GuestRam {
         self.ram
     }
@@ -209,7 +218,7 @@ fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usiz
     }
     // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
-    Ok(Backing { memory: Arc::new(memory), n, stride, ram, epoch: unsafe { mach_absolute_time() } })
+    Ok(Backing { memory: Arc::new(memory), n, stride, ram, epoch: unsafe { mach_absolute_time() }, io_epoch: Mutex::new(0) })
 }
 /// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no).
 pub fn host_feature(name: &str) -> bool {
@@ -473,10 +482,15 @@ impl Stops {
     }
     /// Stops vCPU `v` of `machine` at its next block boundary; false (nothing rung) once its run [ended](Self::end).
     pub fn kick(&self, machine: &Machine, v: usize) -> Result<bool> {
-        let mut k = self.kicks.get(v).ok_or(format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
+        self.kick_if_needed(machine, v, true)
+    }
+    /// An admitted I/O participant still needs the terminal check, but no new doorbell.
+    fn kick_if_needed(&self, machine: &Machine, v: usize, needed: bool) -> Result<bool> {
+        let mut k = self.kicks.get(v).ok_or_else(|| format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
         if k.ended {
             return Ok(false);
         }
+        if !needed { return Ok(true); }
         let in_host = self.in_host[v].load(SeqCst);
         let at = unsafe { mach_absolute_time() };
         machine.ring(v)?;
@@ -841,11 +855,16 @@ impl Server {
     }
     /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`, an
     /// `UnexpectedEof` one when the server died first (its stdout closed; seen within [`Channel::SLICE_NS`]).
+    #[cfg(any(not(feature = "testing"), test))]
     fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<Reply> {
+        self.request_with_posted(body, deadline, || Ok(()))
+    }
+    fn request_with_posted(&mut self, body: &[u8], deadline: Instant, posted: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<Reply> {
         if self.stdin.is_none() {
             return Err(std::io::Error::other("fexc --serve: closed"));
         }
         self.channel.post(body)?;
+        posted()?;
         let stdout = &mut self.stdout;
         let mut reply = self.channel.reply(deadline, || Self::alive(stdout))?;
         let field = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
@@ -1650,7 +1669,14 @@ fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
         #[cfg(feature = "testing")]
         _hook.before_compile(self.compiles, server.child.id());
         let began = Instant::now();
-        let reply = match server.request(&body, began + self.deadline) {
+        #[cfg(feature = "testing")]
+        let response = {
+            let pid = server.child.id();
+            server.request_with_posted(&body, began + self.deadline, || _hook.compiler_posted(self.compiles, rip, pid))
+        };
+        #[cfg(not(feature = "testing"))]
+        let response = server.request(&body, began + self.deadline);
+        let reply = match response {
             Ok(reply) => reply,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 let _ = server.child.kill();
@@ -1786,6 +1812,8 @@ pub enum ReplyKind {
     Translation,
     /// A device access's reply (M3).
     Device,
+    /// First and subsequent power-drain polls, after architectural port completion.
+    Power,
 }
 /// A driver's view into one vCPU's [`run`], at its host exits only (never in the VM). Every method defaults to doing
 /// nothing; `()` is the hook of a run without one, and compiles to nothing. The test driver supplies its run-time defence
@@ -1812,6 +1840,10 @@ pub trait Hook {
     /// Before a request goes to the compile server (`server` is its process ID), after `compiles` requests reached it.
     #[cfg(feature = "testing")]
     fn before_compile(&mut self, _compiles: u64, _server: u32) {}
+    /// The real channel request was posted; its response has not been consumed. Does not imply
+    /// the compiler process is still computing. Test observers must remain finite and releasable.
+    #[cfg(feature = "testing")]
+    fn compiler_posted(&mut self, _compiles: u64, _rip: u64, _server: u32) -> std::io::Result<()> { Ok(()) }
     /// Each reply, written into `state` (and the block or decode in place) but not yet seen by the resident.
     #[cfg(feature = "testing")]
     fn reply(&mut self, _kind: ReplyKind, _area: Area, _state: &mut State) {}
@@ -1827,6 +1859,10 @@ pub struct Requests {
     pub rips: Option<std::collections::HashSet<u64>>,
     /// M3: the VM's device ranges (shared by every vCPU thread; see [`crate::devices`]).
     pub devices: Option<std::sync::Arc<crate::devices::Devices>>,
+    /// One accepted MMIO operation, retained on the host while the resident services RAM windows.
+    pub pending_device: Option<crate::devices::Pending>,
+    /// Deadline begins when this vCPU observes a power request; polls never block.
+    pub power_started: Option<std::time::Instant>,
     /// K2: system-instruction decodes answered ([`exec::REPLY_SYSTEM`], by kind; the test hooks not included), and
     /// entropy refills asked for ([`exec::REQUEST_ENTROPY`]).
     pub decodes: std::collections::BTreeMap<u32, u64>,
@@ -1974,13 +2010,22 @@ fn serve(
         let step = match state.request {
             exec::REQUEST_TRANSLATE => false,
             exec::REQUEST_STEP => true,
-            // M3: a device access, completed (or refused) once; never parked (a driver's hook sees the reply).
+            // An access is accepted once; a deferred reply resumes the resident's control-only wait.
             exec::REQUEST_DEVICE => {
                 // A peer failed after this exit: the device is not accessed (the vCPU ends with the access undone).
                 if cancelled.load(SeqCst) {
                     return Ok(Stop::Cancelled);
                 }
-                crate::devices::serve(area, &mut state, requests.devices.as_deref());
+                crate::devices::serve(area, &mut state, requests.devices.as_deref(), &mut requests.pending_device);
+                #[cfg(feature = "testing")]
+                hook.reply(ReplyKind::Device, area, &mut state);
+                area.write_record(exec::STATE_OFFSET, state);
+                lap(compiler, crate::perf::DEVICE);
+                continue;
+            }
+            exec::REQUEST_DEVICE_POLL => {
+                if cancelled.load(SeqCst) { return Ok(Stop::Cancelled); }
+                crate::devices::serve_poll(area, &mut state, &mut requests.pending_device);
                 #[cfg(feature = "testing")]
                 hook.reply(ReplyKind::Device, area, &mut state);
                 area.write_record(exec::STATE_OFFSET, state);
@@ -2003,13 +2048,26 @@ fn serve(
                     return Ok(Stop::Cancelled);
                 }
                 crate::devices::serve_port(area, &mut state, requests.devices.as_deref());
+                if let Some(devices) = requests.devices.as_deref().filter(|d| d.power() != 0) {
+                    devices.quiesce()?;
+                    requests.power_started.get_or_insert_with(std::time::Instant::now);
+                    state.reply = exec::REPLY_PORT_POWER;
+                }
                 area.write_record(exec::STATE_OFFSET, state);
                 lap(compiler, crate::perf::PORT);
-                // L4b: power off or reset ends the run here (the driver cancels the other vCPUs).
-                match requests.devices.as_deref().map_or(0, |d| d.power()) {
-                    0 => {}
-                    power => return Ok(Stop::Power(power)),
-                }
+                continue;
+            }
+            exec::REQUEST_POWER_POLL => {
+                #[cfg(feature = "testing")]
+                hook.reply(ReplyKind::Power, area, &mut state);
+                if cancelled.load(SeqCst) { return Ok(Stop::Cancelled); }
+                let start = requests.power_started.ok_or("power poll without completed power port access")?;
+                let devices = requests.devices.as_deref().ok_or("power poll without devices")?;
+                if devices.quiesce()? { return Ok(Stop::Power(devices.power())); }
+                if start.elapsed() > Duration::from_secs(30) { return Err("device shutdown drain timed out".into()); }
+                state.reply = exec::REPLY_POWER_POLL;
+                area.write_record(exec::STATE_OFFSET, state);
+                std::thread::yield_now();
                 continue;
             }
             // L4a: an EOI broadcast or an ExtINT's INTA cycle, at the interrupt controllers (never parked).
@@ -2832,6 +2890,27 @@ mod tests {
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn channel_posted_observer_leaves_reply_unconsumed_on_error() {
+        let path = fake_server("posted-observer", "struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<I', m, 68, 20)");
+        let mut server = Server::start(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut called = 0;
+        let error = server.request_with_posted(&[0; 4], deadline, || {
+            called += 1;
+            Err(std::io::Error::other("observer stopped"))
+        }).err().unwrap();
+        assert_eq!(error.to_string(), "observer stopped");
+        assert_eq!(called, 1);
+        // The observer ran after posting, and its failure did not consume or replace the response.
+        let stdout = &mut server.stdout;
+        let reply = server.channel.reply(deadline, || Server::alive(stdout)).unwrap();
+        assert_eq!(reply.len(), 20);
+        assert_eq!(u32::from_le_bytes(reply[..4].try_into().unwrap()), 1);
+        assert!(server.finish().is_some());
+        std::fs::remove_file(path).unwrap();
     }
 
     /// Perf chunk 21: the channel's reply is untrusted input. A length past the reply area or under the header, a header

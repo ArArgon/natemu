@@ -9,15 +9,17 @@
 //! access: [`serve`] answers [`exec::REQUEST_DEVICE`] with exactly one read or write, never decoding x86.
 //!
 //! **Concurrency contract (for X3, L3, L4).** Every vCPU thread calls [`serve`] on its own exits; a device is behind its
-//! own mutex, so its accesses are serialised in one total order, each vCPU's in its program order (an access is
-//! synchronous: the vCPU waits in the host until its handler returns). A handler runs on the accessing vCPU's thread with
+//! own mutex, so admission calls are serialised, each vCPU's in its program order. An access may complete immediately
+//! or return a host-only deferred token. A deferred operation retains its device ordering; polling never reissues it.
+//! Its resident releases shadow holdings and services RAM-window requests while waiting, and completes the decoded
+//! instruction once after the final reply. No device mutex is held across that wait. A handler runs on the accessing vCPU's thread with
 //! that vCPU stopped, gets its number (per-vCPU state such as a LAPIC is indexed by it) and must return promptly: it
 //! never waits for another vCPU or for external input (a UART buffers its receive side), since peers waiting for this
 //! vCPU (shootdowns) spin meanwhile and their watchdogs count the time. A handler may refuse an access it does not
 //! implement (`None`/`false`: e.g. a width a register does not take); the vCPU then stops `unsupported_mmio` (status
 //! `device`) at the instruction, so a refusal must leave the device unchanged. Memory ordering: the vCPU's earlier guest
 //! accesses are complete before its exit (`dsb sy`), the mutex orders the handler against other vCPUs' handlers, and the
-//! vCPU's later accesses start after the reply. The guest tables' A/D updates of the access are made before the device is
+//! vCPU's later accesses start after the final reply. The guest tables' A/D updates of the access are made before the device is
 //! asked, also when it is then refused (as on x86). Limits: the registry is fixed before the vCPUs run and lies above guest
 //! RAM (a relocatable range such as IA32_APIC_BASE's, or holes below the top of RAM, need M1's layout and a mutable
 //! registry); every access is a host exit, except those a resident device answers first (the resident's `mmio::local`
@@ -33,16 +35,55 @@ use std::sync::{Arc, Mutex};
 pub trait Device: Send {
     fn read(&mut self, vcpu: usize, offset: u64, size: u64) -> Option<u64>;
     fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool;
+    /// MMIO only: accept this access once, or refuse it without effects. A deferred access owns
+    /// its ordering/serialization until completion, including conflicting reads and control writes.
+    /// Return promptly without waiting for a peer, a RAM window or backend I/O. Ports keep the
+    /// synchronous read/write interface above.
+    fn access(&mut self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Access {
+        match value {
+            Some(value) => if self.write(vcpu, offset, size, value) { Access::Completed(0) } else { Access::Refused },
+            None => self.read(vcpu, offset, size).map_or(Access::Refused, Access::Completed),
+        }
+    }
+    /// Poll a previously accepted access without replaying it. Deferred must return the same token.
+    /// Refused here is a terminal failure, not a promise that the accepted operation had no effects.
+    /// A backend owns its in-flight buffers until completion/join even if the waiting vCPU stops.
+    fn poll(&mut self, _vcpu: usize, _token: u64) -> Access { Access::Refused }
+    /// Idempotently close new admission and poll accepted work/durability. Never wait here.
+    /// True means all accepted effects and callbacks have retired successfully.
+    fn quiesce(&mut self) -> crate::Result<bool> { Ok(true) }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Completed(u64),
+    Deferred(u64),
+    Refused,
 }
 pub type Shared = Arc<Mutex<dyn Device>>;
+/// Host-only accepted MMIO identity. Keeping the endpoint alive does not cancel or join its worker;
+/// VM lifecycle management must drain workers before freeing backend or guest backing resources.
+pub struct Pending {
+    device: Shared,
+    token: u64,
+    request: Mmio,
+    vcpu: usize,
+    rip: u64,
+}
 /// A view of `.0` whose offsets start at `.1` (one device registered on several ranges, each told apart by its offset).
 pub(crate) struct At(pub(crate) Shared, pub(crate) u64);
 impl Device for At {
+    fn quiesce(&mut self) -> crate::Result<bool> { self.0.lock().unwrap_or_else(|e| e.into_inner()).quiesce() }
     fn read(&mut self, vcpu: usize, offset: u64, size: u64) -> Option<u64> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).read(vcpu, self.1 + offset, size)
     }
     fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).write(vcpu, self.1 + offset, size, value)
+    }
+    fn access(&mut self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Access {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).access(vcpu, self.1 + offset, size, value)
+    }
+    fn poll(&mut self, vcpu: usize, token: u64) -> Access {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).poll(vcpu, token)
     }
 }
 
@@ -86,6 +127,17 @@ impl Devices {
     /// L4b: the power request made so far (0 none).
     pub(crate) fn power(&self) -> u8 {
         self.power.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Close admission everywhere, even if an earlier device is still draining.
+    pub(crate) fn quiesce(&self) -> crate::Result<bool> {
+        let mut done = true;
+        for (_, _, device) in self.ranges.iter() {
+            done &= device.lock().unwrap_or_else(|e| e.into_inner()).quiesce()?;
+        }
+        for (_, _, device) in &self.ports {
+            done &= device.lock().unwrap_or_else(|e| e.into_inner()).quiesce()?;
+        }
+        Ok(done)
     }
     /// L3: registers `device` on ports `[base, base + count)`, inside the 16-bit space and not overlapping another range.
     pub fn register_ports(&mut self, base: u32, count: u32, device: Shared) -> crate::Result<()> {
@@ -174,15 +226,19 @@ pub fn mask(bytes: u64) -> u64 {
 /// Serves vCPU `area.vcpu`'s device request ([`exec::REQUEST_DEVICE`]): one read or write of the device at the request's
 /// address, its value or refusal into the [`Mmio`] record, and the reply. A request the resident could not have made (a
 /// width other than 1, 2, 4, 8 or an access leaving its page) is a bad reply, never a device access.
-pub(crate) fn serve(area: Area, state: &mut State, devices: Option<&Devices>) {
-    let mut m: Mmio = area.read_record(MMIO_OFFSET);
+pub(crate) fn serve(area: Area, state: &mut State, devices: Option<&Devices>, pending: &mut Option<Pending>) {
+    let m = begin(area.vcpu, state.cpu.rip, area.read_record(MMIO_OFFSET), devices, pending);
+    area.write_record(MMIO_OFFSET, m);
+    state.reply = exec::REPLY_DEVICE;
+}
+fn begin(vcpu: usize, rip: u64, mut m: Mmio, devices: Option<&Devices>, pending: &mut Option<Pending>) -> Mmio {
     // A device access to guest RAM is a resident error, never answered (L3: not all-ones either).
     let well_formed = matches!(m.width, 1 | 2 | 4 | 8)
         && (m.gpa & 4095) + m.width <= 4096
         && m.write <= 1
         && devices.is_none_or(|d| d.not_ram(m.gpa & !4095, (m.gpa & !4095) + 4096));
     m.status = match devices.map(|d| (d, d.find(m.gpa))) {
-        _ if !well_formed => 0,
+        _ if !well_formed || pending.is_some() => 0,
         None => mmio::UNASSIGNED,
         // L3: the unassigned rule (or, strict, the refusal), counted either way.
         Some((d, None)) => {
@@ -196,16 +252,50 @@ pub(crate) fn serve(area: Area, state: &mut State, devices: Option<&Devices>) {
         }
         Some((_, Some((device, offset)))) => {
             let mut d = device.lock().unwrap_or_else(|e| e.into_inner());
-            let done = if m.write != 0 {
-                d.write(area.vcpu, offset, m.width, m.value & mask(m.width))
-            } else {
-                d.read(area.vcpu, offset, m.width).map(|v| m.value = v & mask(m.width)).is_some()
-            };
-            if done { mmio::DONE } else { mmio::DEVICE }
+            match d.access(vcpu, offset, m.width, (m.write != 0).then_some(m.value & mask(m.width))) {
+                Access::Completed(value) => {
+                    if m.write == 0 { m.value = value & mask(m.width); }
+                    mmio::DONE
+                }
+                Access::Deferred(token) => {
+                    *pending = Some(Pending { device: device.clone(), token, request: m, vcpu, rip });
+                    mmio::PENDING
+                }
+                Access::Refused => mmio::DEVICE,
+            }
         }
     };
+    m
+}
+
+/// Poll only the retained host identity. A malformed/replayed poll never calls a device. This
+/// handler returns promptly; the resident then rechecks the RAM-window request before polling again.
+pub(crate) fn serve_poll(area: Area, state: &mut State, pending: &mut Option<Pending>) {
+    let m = poll_request(area.vcpu, state.cpu.rip, area.read_record(MMIO_OFFSET), pending);
     area.write_record(MMIO_OFFSET, m);
-    state.reply = exec::REPLY_DEVICE;
+    state.reply = exec::REPLY_DEVICE_POLL;
+}
+fn poll_request(vcpu: usize, rip: u64, mut m: Mmio, pending: &mut Option<Pending>) -> Mmio {
+    m.status = 0;
+    if let Some(p) = pending.as_ref().filter(|p| {
+        p.vcpu == vcpu && p.rip == rip && p.request.gpa == m.gpa
+            && p.request.width == m.width && p.request.write == m.write && p.request.completed == m.completed
+            && (m.write == 0 || p.request.value == m.value)
+    }) {
+        let result = p.device.lock().unwrap_or_else(|e| e.into_inner()).poll(p.vcpu, p.token);
+        m = p.request;
+        m.status = match result {
+            Access::Completed(value) => {
+                if m.write == 0 { m.value = value & mask(m.width); }
+                mmio::DONE
+            }
+            Access::Deferred(token) if token == p.token => mmio::PENDING,
+            Access::Deferred(_) => 0,
+            Access::Refused => mmio::FAILED,
+        };
+        if m.status != mmio::PENDING { *pending = None; }
+    }
+    m
 }
 
 /// L3 (amendment): serves vCPU `area.vcpu`'s page request ([`exec::REQUEST_PAGE`]): a read touched the non-RAM page
@@ -264,5 +354,134 @@ mod capacity_tests {
             ((9 << 30) - 4096, 9 << 30, false),
             (9 << 30, (9 << 30) + 4096, true),
         ] { assert_eq!(d.not_ram(base, end), device, "{base:#x}..{end:#x}"); }
+    }
+}
+
+#[cfg(test)]
+mod deferred_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    const BASE: u64 = 0xf000_0000;
+    const RIP: u64 = 0x1000;
+    #[derive(Default)]
+    struct Mock {
+        accesses: Vec<(usize, u64, u64, Option<u64>)>,
+        polls: Vec<(usize, u64)>,
+        replies: VecDeque<Access>,
+    }
+    impl Device for Mock {
+        fn read(&mut self, _: usize, _: u64, _: u64) -> Option<u64> { panic!("deferred MMIO must use access") }
+        fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool { panic!("deferred MMIO must use access") }
+        fn access(&mut self, v: usize, o: u64, s: u64, x: Option<u64>) -> Access {
+            self.accesses.push((v, o, s, x));
+            Access::Deferred(42)
+        }
+        fn poll(&mut self, v: usize, token: u64) -> Access {
+            self.polls.push((v, token));
+            self.replies.pop_front().unwrap_or(Access::Deferred(42))
+        }
+    }
+    fn setup(replies: &[Access]) -> (Devices, Arc<Mutex<Mock>>, Mmio) {
+        let mut bus = Devices::new(64 << 20);
+        let device = Arc::new(Mutex::new(Mock { replies: replies.iter().copied().collect(), ..Default::default() }));
+        bus.register(BASE, 4096, device.clone()).unwrap();
+        (bus, device, Mmio { gpa: BASE + 4, width: 4, completed: 7, ..Mmio::default() })
+    }
+    #[test]
+    fn deferred_access_is_issued_once_and_load_result_is_masked() {
+        let (bus, device, m) = setup(&[Access::Deferred(42), Access::Completed(u64::MAX)]);
+        let mut pending = None;
+        let mut m = begin(2, RIP, m, Some(&bus), &mut pending);
+        assert_eq!(m.status, mmio::PENDING);
+        assert_eq!(m.value, 0, "host token must not be exposed as read data");
+        m = poll_request(2, RIP, m, &mut pending);
+        assert_eq!(m.status, mmio::PENDING);
+        m = poll_request(2, RIP, m, &mut pending);
+        assert_eq!((m.status, m.value, m.completed), (mmio::DONE, 0xffff_ffff, 7));
+        assert!(pending.is_none());
+        let d = device.lock().unwrap();
+        assert_eq!(d.accesses, [(2, 4, 4, None)]);
+        assert_eq!(d.polls, [(2, 42), (2, 42)]);
+    }
+    #[test]
+    fn changed_identity_and_duplicate_request_never_replay() {
+        let (bus, device, m) = setup(&[Access::Completed(5)]);
+        let mut pending = None;
+        let m = begin(2, RIP, m, Some(&bus), &mut pending);
+        assert_eq!(begin(2, RIP, m, Some(&bus), &mut pending).status, 0);
+        for changed in [Mmio { gpa: m.gpa + 4, ..m }, Mmio { width: 8, ..m }, Mmio { write: 1, ..m }, Mmio { completed: 8, ..m }] {
+            assert_eq!(poll_request(2, RIP, changed, &mut pending).status, 0);
+        }
+        assert_eq!(poll_request(3, RIP, m, &mut pending).status, 0);
+        assert_eq!(poll_request(2, RIP + 1, m, &mut pending).status, 0);
+        assert!(device.lock().unwrap().polls.is_empty());
+        assert_eq!(device.lock().unwrap().accesses.len(), 1);
+        assert_eq!(poll_request(2, RIP, m, &mut pending).status, mmio::DONE);
+    }
+    #[test]
+    fn unsolicited_and_replayed_polls_never_touch_device() {
+        let (bus, device, m) = setup(&[Access::Completed(1)]);
+        let mut pending = None;
+        assert_eq!(poll_request(0, RIP, m, &mut pending).status, 0);
+        let m = begin(0, RIP, m, Some(&bus), &mut pending);
+        let done = poll_request(0, RIP, m, &mut pending);
+        assert_eq!(done.status, mmio::DONE);
+        assert_eq!(poll_request(0, RIP, done, &mut pending).status, 0);
+        assert_eq!(device.lock().unwrap().polls.len(), 1);
+    }
+    #[test]
+    fn refused_poll_and_replaced_token_are_terminal_without_replay() {
+        for (reply, status) in [(Access::Refused, mmio::FAILED), (Access::Deferred(43), 0)] {
+            let (bus, device, m) = setup(&[reply]);
+            let mut pending = None;
+            let m = begin(0, RIP, m, Some(&bus), &mut pending);
+            assert_eq!(poll_request(0, RIP, m, &mut pending).status, status);
+            assert!(pending.is_none());
+            assert_eq!(device.lock().unwrap().accesses.len(), 1);
+        }
+    }
+    #[test]
+    fn range_view_forwards_offset_and_stable_poll_token() {
+        let (_, device, m) = setup(&[Access::Completed(9)]);
+        let mut bus = Devices::new(64 << 20);
+        bus.register(BASE, 4096, Arc::new(Mutex::new(At(device.clone(), 256)))).unwrap();
+        let mut pending = None;
+        let m = begin(0, RIP, m, Some(&bus), &mut pending);
+        assert_eq!(poll_request(0, RIP, m, &mut pending).value, 9);
+        let d = device.lock().unwrap();
+        assert_eq!(d.accesses, [(0, 260, 4, None)]);
+        assert_eq!(d.polls, [(0, 42)]);
+    }
+    #[test]
+    fn store_identity_is_retained_and_endpoint_outlives_registry() {
+        let (bus, device, mut m) = setup(&[Access::Completed(0)]);
+        (m.write, m.value) = (1, u64::MAX);
+        let weak = Arc::downgrade(&device);
+        let mut pending = None;
+        let m = begin(0, RIP, m, Some(&bus), &mut pending);
+        assert_eq!(device.lock().unwrap().accesses[0].3, Some(0xffff_ffff));
+        drop(device);
+        drop(bus);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(poll_request(0, RIP, Mmio { value: 0, ..m }, &mut pending).status, 0);
+        let m = poll_request(0, RIP, m, &mut pending);
+        assert_eq!((m.status, m.value), (mmio::DONE, u64::MAX));
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn legacy_default_access_and_port_contract_remain_synchronous() {
+        struct Legacy;
+        impl Device for Legacy {
+            fn read(&mut self, _: usize, _: u64, size: u64) -> Option<u64> { (size == 4).then_some(0x1234) }
+            fn write(&mut self, _: usize, _: u64, size: u64, _: u64) -> bool { size == 4 }
+        }
+        let mut d = Legacy;
+        assert_eq!(d.access(0, 0, 4, None), Access::Completed(0x1234));
+        assert_eq!(d.access(0, 0, 4, Some(1)), Access::Completed(0));
+        assert_eq!(d.access(0, 0, 8, None), Access::Refused);
+        let mut bus = Devices::new(64 << 20);
+        bus.register_ports(0x100, 8, Arc::new(Mutex::new(d))).unwrap();
+        assert_eq!(bus.port(0, 0x100, 4, None), Ok(0x1234));
+        assert_eq!(bus.port(0, 0x100, 4, Some(2)), Ok(0));
     }
 }

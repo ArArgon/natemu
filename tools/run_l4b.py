@@ -148,8 +148,23 @@ def cases():
         return check
     def unsupported(out):
         return [] if out['stop'] == 'resident' and 'unsupported_port' in out['reason'] else [f"{out['stop']} {out['reason']} (expected unsupported_port)"]
+    def committed_power(kind, asm, repeat=False):
+        # S5/reset complete the triggering instruction, or exactly one REP element, before drain.
+        length = len(ref.assemble(asm))
+        def check(out):
+            errors = stop(kind)(out)
+            expected = BASE + length - (3 if repeat else 0)  # F3 66 6F: REP OUTSW
+            if smp.num(out['rip']) != expected: errors.append(f"power RIP {out['rip']} != {expected:#x}")
+            if repeat:
+                for reg, want in [('rsi', 0x200002), ('rcx', 1)]:
+                    if smp.num(out['gpr'][smp.REGS.index(reg)]) != want: errors.append(f"power {reg} did not commit one element")
+            return errors
+        return check
+    s5 = ow(0xb004, 0x2001)
+    rep_s5 = 'mov esi, 0x200000\nmov word ptr [rsi], 0x2001\nmov ecx, 2\nmov edx, 0xb004\nrep outsw\n'
     return [
-        ('s5', ow(0xb004, 0x2001), stop('poweroff')),
+        ('s5', s5, committed_power('poweroff', s5)),
+        ('s5-rep-element', rep_s5, committed_power('poweroff', rep_s5, True)),
         ('s5-high-byte', ob(0xb005, 0x20), stop('poweroff')),
         ('reset', ob(0xb040, 6), stop('reset')),
         ('reset-other-values', ob(0xb040, 5) + ob(0xb040, 0) + ob(0xb040, 0xff) + 'mov edx, 0xb040\nxor eax, eax\nin al, dx\nmov rbx, rax\n', regs(rbx=0)),

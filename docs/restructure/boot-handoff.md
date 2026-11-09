@@ -73,7 +73,12 @@ build and sign `natemu-host` themselves.
 **Dependency policy** (owner, November 5): host binaries may use clap (derive, `default-features = false` with `std`,
 `derive`, `env`, `help`, `usage`, `error-context`, `suggestions`; exact version pinned in the workspace `Cargo.toml` and
 `Cargo.lock`), and only they: the `natemu` stub (`crates/cli`, package `natemu-cli`) and the `natemu-host` test driver
-(`crates/driver`). The library (`crates/host`, package `natemu`), the abi and the resident take no registry dependency.
+(`crates/driver`). **November 8 I/O amendment:** the owner authorized selective
+rust-vmm adoption. The library now consumes `virtio-queue` 0.18.0 and `vm-memory`
+0.18.0 from the `third_party/rust-vmm` submodule (the owner's fork, pinned), plus their locked dependencies;
+vm-memory's mmap feature is used for private descriptor snapshots, not guest RAM.
+See `crates/host/src/virtio/README.md` for the exact source identity and license
+inventory. The ABI and resident still take no registry dependency.
 The crates come from crates.io (not vendored, owner, November 5), every version pinned in `Cargo.lock` (`--locked`). A
 fresh machine needs the network once, `cargo +1.97.0 fetch --locked` (or the first build without `--offline`), before
 the `--offline` builds above work; after that the local cargo cache serves them. Adding a registry crate needs the

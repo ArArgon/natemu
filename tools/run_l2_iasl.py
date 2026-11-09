@@ -73,11 +73,11 @@ def problems_in(log):
             or re.search(r'Compilation complete\. [1-9]|[1-9]\d* Errors?|[1-9]\d* Warnings?', line)]
 
 
-def check_n(host, tool, work, n):
+def check_n(host, tool, work, n, rng=False, kernel=KERNEL):
     work.mkdir(parents=True, exist_ok=True)
     dump = work / 'loaded.dump'
-    subprocess.run([host, 'unused', 'boot-linux', 'unused', KERNEL, '--ram', '0x8000000', '--load-only', '--vcpus', str(n),
-                    '--dump', dump], capture_output=True, check=True)
+    subprocess.run([host, 'unused', 'boot-linux', 'unused', kernel, '--ram', '0x8000000', '--load-only', '--vcpus', str(n),
+                    '--dump', dump] + (['--rng'] if rng else []), capture_output=True, check=True)
     t = tables(dump.read_bytes())
     dump.unlink()
     v = []
@@ -100,6 +100,24 @@ def check_n(host, tool, work, n):
             diags = [d for d in diags if MV0 not in d]
         v += [f'{name}: {d.strip()}' for d in diags]
     # DSDT round trip: compile iasl's disassembly without optimisation, compare.
+    if rng:
+        # Some ACPICA builds retain resource templates as raw buffers when disassembling.
+        # Independently compile the required symbolic resources and compare the device AML.
+        (work / 'virtio.asl').write_text('''DefinitionBlock ("", "DSDT", 2, "NATEMU", "VIRTIO  ", 1) {
+            Device (V002) {
+                Name (_HID, "LNRO0005")
+                Name (_UID, 2)
+                Name (_CCA, One)
+                Name (_CRS, ResourceTemplate () {
+                    Memory32Fixed (ReadWrite, 0xF0002000, 0x1000)
+                    Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) {18}
+                })
+            }
+        }''')
+        rc, log = iasl([tool, '-oa', 'virtio.asl'], work)
+        expected = work / 'virtio.aml'
+        if rc or not expected.exists() or expected.read_bytes()[36:] not in t['dsdt'][36:]:
+            v.append(f'virtio-rng device differs from ACPICA-compiled resources (exit {rc}): {log[-500:]}')
     rc, log = iasl([tool, '-oa', '-p', 'dsdt-rt', 'dsdt.dsl'], work)
     rt = work / 'dsdt-rt.aml'
     if rc or not rt.exists():
@@ -136,12 +154,14 @@ def main():
     a.add_argument('--out', required=True, type=pathlib.Path)
     a.add_argument('--host', type=pathlib.Path)
     a.add_argument('--iasl', default=shutil.which('iasl') or '/opt/homebrew/bin/iasl')
+    a.add_argument('--rng', action='store_true', help='include and validate virtio-rng resources')
+    a.add_argument('--kernel', type=pathlib.Path, default=KERNEL)
     o = a.parse_args()
     host = o.host or build()
     o.out.mkdir(parents=True, exist_ok=True)
     report = {}
     for n in range(1, 5):
-        v = check_n(host, o.iasl, o.out / f'n{n}', n)
+        v = check_n(host, o.iasl, o.out / f'n{n}', n, o.rng, o.kernel)
         report[n] = v
         print(f'N={n}: {"pass" if not v else "FAIL"}')
         for x in v:

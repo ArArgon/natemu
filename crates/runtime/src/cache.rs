@@ -87,6 +87,15 @@ fn record(i: usize) -> *mut LinkRecord {
 fn global<T>(offset: usize) -> *mut T {
     (area::GLOBAL_VA + offset as u64) as *mut T
 }
+/// Monotonic physical-page dependency, published before a guest page-table load. The host sees
+/// all prior marks after the resident's I/O acknowledgement; no cache/shadow reset clears them.
+pub fn table_read(gpa: u64) {
+    let page = (gpa >> 12) as usize;
+    if page < natemu_abi::execution::MAX_GUEST_PAGES {
+        let word = unsafe { AtomicU64::from_ptr(global::<u64>(area::TABLE_PAGES).add(page / 64)) };
+        word.fetch_or(1 << (page % 64), SeqCst);
+    }
+}
 /// The word of the mask at global offset `at` (code or writable pages) holding `page`'s peer bits, and their shift.
 fn mask(at: usize, page: usize) -> (&'static AtomicU64, u32) {
     let (word, shift) = area::mask_location(page);

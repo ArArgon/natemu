@@ -23,7 +23,7 @@
 //! with the state at the instruction after the elements done.
 use super::segments::{self, Exception};
 use super::*;
-use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_PORT, REQUEST_PORT, mmio as status};
+use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_PORT, REPLY_PORT_POWER, REPLY_POWER_POLL, REQUEST_PORT, REQUEST_POWER_POLL, mmio as status};
 
 const GP0: Exception = [13, 0, 0];
 const AC0: Exception = [17, 0, 0];
@@ -63,9 +63,9 @@ fn local(_s: &mut State, _port: u64, _size: u64, _data: Option<u64>) -> Option<u
 }
 
 /// One access to `size` bytes from `port` (a write of `data`, or a read, whose value is returned).
-fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> u64 {
+fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> (u64, bool) {
     if let Some(v) = local(s, port, size, data) {
-        return v;
+        return (v, false);
     }
     let exchange = MMIO_VA as *mut Mmio;
     unsafe {
@@ -81,11 +81,11 @@ fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> u64 {
         *s = load();
         s.request = NONE;
         let m = read_record(exchange);
-        if s.reply != REPLY_PORT {
+        if !matches!(s.reply, REPLY_PORT | REPLY_PORT_POWER) {
             halt(s, stop::BAD_REPLY)
         }
         match m.status {
-            status::DONE => m.value & mask(size),
+            status::DONE => (m.value & mask(size), s.reply == REPLY_PORT_POWER),
             status::UNASSIGNED | status::DEVICE => halt(s, stop::UNSUPPORTED_PORT),
             _ => halt(s, stop::BAD_REPLY),
         }
@@ -100,14 +100,17 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         let port = if i.reg == system::NO_REG { u64::from(i.cr) } else { c.gpr[2] & 0xffff };
         permitted(s, port, size)?;
         super::watch::port(s, port, size);
+        let power;
         if i.kind == system::IN {
-            let v = access(s, port, size, None);
+            let (v, requested) = access(s, port, size, None);
+            power = requested;
             let rax = &mut s.cpu.gpr[0];
             *rax = if size == 4 { v } else { *rax & !mask(size) | v };
         } else {
-            access(s, port, size, Some(c.gpr[0] & mask(size)));
+            power = access(s, port, size, Some(c.gpr[0] & mask(size))).1;
         }
         commit(s, i, false);
+        if power { power_wait(s); }
         return Ok(());
     }
     let rep = i.prefixes & system::REP != 0;
@@ -128,6 +131,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     let va = offset.wrapping_add(base);
     let mut bytes = [0u8; 4];
     let element = &mut bytes[..size as usize];
+    let power;
     if i.kind == system::INS {
         // The destination's faults first, as an explicit write would raise them (linear's order: canonical, #AC, walk),
         // and a device page refused, all before the port is read.
@@ -139,7 +143,8 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         if !super::mmio::ram(gpa[0]) || ((last ^ va) >> 12 != 0 && !super::mmio::ram(gpa[1])) {
             super::mmio::system_access(s)
         }
-        let v = access(s, port, size, None);
+        let (v, requested) = access(s, port, size, None);
+        power = requested;
         element.copy_from_slice(&v.to_le_bytes()[..size as usize]);
         // Written through the translation just walked (as a TLB entry would serve it), with linear's code-write protocol.
         let (low, high) = element.split_at((4096 - (va & 4095)).min(size) as usize);
@@ -158,7 +163,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         super::watch::access(s, va, size, true);
     } else {
         segments::linear(s, va, element, false, false, GP0)?;
-        access(s, port, size, Some(u64::from(u32::from_le_bytes(bytes))));
+        power = access(s, port, size, Some(u64::from(u32::from_le_bytes(bytes)))).1;
     }
     super::watch::port(s, port, size);
     let step = if c.rflags & RFLAGS_DF != 0 { size.wrapping_neg() } else { size };
@@ -170,9 +175,27 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             // Between two elements: RIP stays at the instruction (its kept decode runs the next element); RF stays (S4).
             s.mid_string = 1;
             commit(s, System { length: 0, ..i }, false);
+            if power { power_wait(s); }
             return Ok(());
         }
     }
     commit(s, i, false);
+    if power { power_wait(s); }
     Ok(())
+}
+
+/// The port instruction (or one REP element) has committed; no guest continuation survives.
+fn power_wait(s: &mut State) -> ! {
+    reset_shadows(s);
+    loop {
+        io_checkpoint(s);
+        unsafe {
+            (s.request, s.reply) = (REQUEST_POWER_POLL, NONE);
+            write_record(record(), s);
+            asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+            *s = load();
+        }
+        s.request = NONE;
+        if s.reply != REPLY_POWER_POLL { halt(s, stop::BAD_REPLY); }
+    }
 }

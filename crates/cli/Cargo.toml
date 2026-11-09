@@ -4,8 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
-# The `natemu` boot stub, a package apart from the library so the library stays dependency-free (dependency policy:
-# docs/restructure/boot-handoff.md §1). Build it alone (`-p natemu-cli`): no `testing` feature.
+# The `natemu` boot stub, a package apart from the library so the library takes no clap dependency (dependency policy:
+# docs/restructure/boot-handoff.md §1; the library's one exception is the pinned rust-vmm submodule and its locked dependencies).
+# Build it alone (`-p natemu-cli`): no `testing` feature.
 [dependencies]
 natemu = { path = "../host" }
 clap.workspace = true

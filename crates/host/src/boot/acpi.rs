@@ -15,7 +15,8 @@
 //! Deliberately absent: `_CST` and P_BLK (processors are `Device (ACPI0007)` objects without them, and the FADT's
 //! P_LVL2/P_LVL3 latencies say C2/C3 are unsupported), so only C1 = HLT idle is reachable (plan §1a "Idle states");
 //! GPE blocks (QEMU's PIIX4 has GPE0 at 0xafe0; a zero block is legal and no hotplug or GPE source is wired); the
-//! virtio-MMIO devices of claim 69 (not in this phase). Deviations from QEMU's PC tables, each for a stated reason, are
+//! disabled virtio-MMIO devices. Enabled devices are supplied by the same launch manifest as the MMIO registry.
+//! Deviations from QEMU's PC tables, each for a stated reason, are
 //! listed at [`fadt`] and in the plan's "Built (L2)" note. The platform constants below are the one description
 //! L3/L4a/L4b/X3/X4 implement: if a device moves, change it here and the tables follow.
 
@@ -66,6 +67,14 @@ pub struct Tables {
     #[allow(dead_code)] // X4's responder watches it
     pub mailbox: u64,
     pub(crate) blobs: Vec<(u64, Vec<u8>)>,
+}
+
+/// One enabled modern virtio-MMIO device, shared by launch discovery and the MMIO registry.
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioMmio {
+    pub uid: u8,
+    pub base: u32,
+    pub gsi: u32,
 }
 
 const OEM_ID: &[u8; 6] = b"NATEMU";
@@ -214,7 +223,7 @@ mod aml {
 }
 
 /// The DSDT (5.2.11.1, revision 2: 64-bit integers): `\_S5`, COM1, the RTC and one processor device per vCPU.
-fn dsdt(vcpus: usize) -> Vec<u8> {
+fn dsdt(vcpus: usize, virtio: &[VirtioMmio]) -> Vec<u8> {
     use aml::*;
     // COM1's resources (6.4): IO (Decode16, 0x3f8, 0x3f8, 1, 8), IRQNoFlags () {4} (edge, active high), end tag.
     let [lo, hi] = COM1_PORT.to_le_bytes();
@@ -227,6 +236,19 @@ fn dsdt(vcpus: usize) -> Vec<u8> {
     let crs = [0x47, 0x01, lo, hi, lo, hi, 0x01, RTC_PORT_LEN, 0x22, irq[0], irq[1], 0x79, 0x00];
     let rtc = device(b"RTC_", &[name(b"_HID", eisa_id("PNP0B00")), name(b"_CRS", buffer(&crs))]);
     let mut sb = vec![com1, rtc];
+    for d in virtio {
+        // Memory32Fixed(ReadWrite, base, 4096), ExtendedInterrupt(ResourceConsumer,
+        // Level, ActiveHigh, Exclusive, GSI), EndTag. ACPI 6.5 6.4.3.4/6.4.3.6.
+        let mut crs = vec![0x86, 9, 0, 1];
+        crs.extend(d.base.to_le_bytes());
+        crs.extend(4096u32.to_le_bytes());
+        crs.extend([0x89, 6, 0, 1, 1]);
+        crs.extend(d.gsi.to_le_bytes());
+        crs.extend([0x79, 0]);
+        let seg: [u8; 4] = format!("V{:03X}", d.uid).into_bytes().try_into().unwrap();
+        sb.push(device(&seg, &[name(b"_HID", string("LNRO0005")), name(b"_UID", integer(d.uid.into())),
+            name(b"_CCA", integer(1)), name(b"_CRS", buffer(&crs))]));
+    }
     for v in 0..vcpus {
         let seg: [u8; 4] = format!("C{v:03X}").into_bytes().try_into().unwrap();
         sb.push(device(&seg, &[name(b"_HID", string("ACPI0007")), name(b"_UID", integer(v as u64))]));
@@ -262,13 +284,18 @@ fn madt(vcpus: usize, mailbox: u64) -> Vec<u8> {
 /// Builds the tables for `vcpus` processors with the RSDP at `base`, each next table 64-byte aligned after it, then
 /// the mailbox page. Addresses wrap rather than overflow; the loader refuses any blob outside the ACPI NVS range.
 pub fn build(vcpus: usize, base: u64) -> Tables {
+    build_with_virtio(vcpus, base, &[])
+}
+
+/// As [`build`], advertising exactly the enabled devices from the launch manifest.
+pub fn build_with_virtio(vcpus: usize, base: u64, virtio: &[VirtioMmio]) -> Tables {
     assert!((1..=254).contains(&vcpus), "xAPIC MADT entries hold APIC IDs below 255");
     let next = |at: u64, len: usize, align: u64| (at.wrapping_add(len as u64)).wrapping_add(align - 1) & !(align - 1);
     let (rsdp, xsdt) = (base, next(base, 36, 64));
     let fadt_at = next(xsdt, HEADER + 16, 64);
     let facs_at = next(fadt_at, 276, 64);
     let dsdt_at = next(facs_at, 64, 64);
-    let dsdt = dsdt(vcpus);
+    let dsdt = dsdt(vcpus, virtio);
     let madt_at = next(dsdt_at, dsdt.len(), 64);
     let madt_len = 44 + 8 * vcpus + 12 + 2 * 10 + 6 + 16;
     let mailbox = next(madt_at, madt_len, 4096);

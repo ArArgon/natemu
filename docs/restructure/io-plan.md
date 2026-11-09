@@ -1,0 +1,826 @@
+# Copy-first virtio integration plan
+
+November 8, 2026. Consolidated from the owner's I/O discussion after early
+performance/correctness work. **Implementation authorized November 8:** the owner
+provided the sibling rust-vmm checkout and asked to begin, including local edits
+there. Natemu uses `codex/virtio-io`; the rust-vmm patch now lives on the
+`natemu` branch of the owner's fork, pinned as the `third_party/rust-vmm` submodule. The owner
+selected persistent disk plus basic networking. Both are in this milestone.
+The [implementation plan](../implementation.md) owns overall build order;
+[INV-03-01](../research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
+owns current results and the next assignment. This is the concrete I6 plan.
+
+## Behavior and scope
+
+The target is an integrated device capability usable by ordinary guest software,
+not a collection of passing fixtures. Tests probe the implementation; they do not
+define special execution paths. No guest behavior, runtime fast path or
+correctness relaxation may depend on benchmark identities, fixed guest addresses,
+known expected outputs or fixture-only signals. Optimizations target general
+instruction/access patterns and checked conditions available to ordinary workloads.
+Existing workload tools and realistic combined guest work supply performance
+evidence; synthetic delayed/error cases supply fault coverage. Neither replaces
+the other. Keep less favorable workloads/results and all failed attempts visible.
+The [benchmark shortlist](io-benchmarks.md) proposes fio, iperf3, netperf and the
+existing zstd build, with controlled downloads and persistence checks. Its
+candidate matrix is research, not a newly authorized benchmark campaign.
+
+An unmodified stock Linux kernel discovers modern virtio-MMIO devices through
+ACPI LNRO0005, boots an installed ext4 root on an owned raw image, writes files,
+powers off cleanly, and reads those files after a fresh launch. Basic networking
+means one Ethernet interface, shared/NAT connectivity, DHCP, DNS, IPv4 TCP/UDP
+and an HTTPS/package-download check. Preserve serial, timers, APIC, ACPI poweroff,
+configured CPU/RAM capacity and high-RAM DMA. Bring up at N=1, then verify at
+N=2/4 and selected larger N within actual HVF admission.
+
+Networking is IO4, after the common completion path and disk. Its native-backend
+admission check starts earlier so entitlement/deployment trouble is discovered
+before the packet device is built. Virtio-rng is the small first real consumer.
+IPv6 and fuller ICMP coverage remain required follow-on work under
+[03-73](../research/investigations/INV-03-03.md#combined-required-device-choice-claim73);
+a successful IPv4 download does not establish the full network contract.
+
+Initial devices retain the accepted map: block at 0xf0000000/GSI16, net at
+0xf0001000/GSI17, rng at 0xf0002000/GSI18; modern MMIO, split rings, one block
+queue (maximum 128 entries), one RX/TX pair (maximum 256 entries each),
+eight-entry rng queue, MTU1500 and no network offloads.
+Generate discovery and device configuration from the same launch manifest.
+Keep the exact accepted device feature/command tables; indirect descriptors,
+packed rings, EVENT_IDX, multiqueue, hotplug and migration stay unoffered unless
+explicitly added with their complete handling. The common VERSION_1 feature is
+required. Block offers SIZE_MAX, SEG_MAX, BLK_SIZE and FLUSH (SIZE_MAX/SEG_MAX
+must be accepted); network offers MAC, MTU and STATUS; rng has no device-specific
+features. Use 512-byte block sectors, reject non-sector-multiple backing sizes,
+and retain the complete unoffered-option lists in 03-56/57 and 04-28. IO0 freezes
+these explicit masks in code; upstream defaults do not choose them.
+Bridging, port forwarding, qcow2, automatic reboot and zero-copy are
+outside this first implementation.
+
+## Discussion notes and decisions
+
+- Use rust-vmm selectively for virtio queue machinery. Broader onboarding remains
+  an assessment, not a migration. The [isolated evaluation](io0-rust-vmm-evaluation.md)
+  pinned `671e367124cf7717d832b21de86b62eccf33ac27`; virtio-queue 0.18.0,
+  virtio-device 0.1.0 and vm-memory 0.18.0 built on Darwin and 16 synthetic cases
+  were independently reproduced. This does not establish integrated correctness.
+- Consume vm-memory, not a reimplementation of it. Keep natemu's RAM allocator
+  and authority. An address/view trait supplies neither exclusion nor lifetime.
+  Host backing access bypasses guest virtual paging; DMA uses checked guest
+  physical ranges and does not synthesize guest PTE A/D updates.
+- Copy payloads into owned staging before outgoing backend work; incoming backend
+  work writes only owned staging. Direct host access during a short admitted copy
+  is compatible with this plan; retaining guest pointers across I/O is not.
+- TSO, volatile access and a host mutex do not establish whole-buffer atomicity or
+  make resident software atomics atomic to a nonparticipating host observer.
+  Naturally aligned native atomics differ from the crossing-16 fallback. See the
+  [instruction census](io-atomic-access-census.md) for exact forms and caveats.
+- Byte copies are valid for excluded/stable buffer transfers, but can weaken a
+  guest scalar instruction's required indivisibility. Segment m16 resident
+  helpers are a source-confirmed discrepancy candidate, with no reproduced tear
+  or normal-I/O overlap. The owner suggested deferral; this plan does not schedule
+  an ISA fix or claim formal acceptance of reduced x86 semantics. It is separate
+  from the copy-first I/O milestone. Current normal STMXCSR/VSTMXCSR stores are
+  FEX-generated; their legacy resident handlers are not evidence of normal use.
+- Keep queue metadata/control synchronization correct in all later experiments.
+  The discussed sequence is copy-first → optional experimental direct payload
+  access relaxing atomicity → coordinated direct payload access → optimization.
+  These later experiments are contingent on measured benefit and a new access
+  contract; they are not enabled by this plan.
+
+## Small interfaces and ownership
+
+| Module | Responsibility and interface |
+| --- | --- |
+| Existing MMIO device registry plus virtio transport | Checked register reads/writes, immutable negotiated profile, queue configuration, status and IRQ state. QueueNotify queues bounded work and returns promptly. |
+| Per-VM device owner | Serializes queue indices, request IDs, completion/reset disposition and interrupt status. Owns validated request metadata and buffers. Receives typed backend results; never lets callbacks write guest RAM. |
+| Resident memory coordinator plus trusted host leaf copier | One finite, exclusive snapshot/commit window per VM; exact spans, pause epoch, backing identity, direction and commit result. Owns guest-memory/coherence authority. |
+| Block/rng/packet backends | Consume or fill owned buffers and return typed IDs, lengths and outcomes. Know no guest pointers, live descriptors or guest interrupt authority. |
+
+Use the current Device/MMIO, GSI, loader and cancellation machinery, extending
+the immediate Device result for deferred lifecycle accesses as described below.
+"Owner" means serialized state ownership: ordinary register reads and ACK may
+use a brief shared register-state lock rather than synchronous worker RPC.
+Avoid a new
+async runtime or generic backend framework: the deterministic test backend and
+real backends are sufficient variation. Native callbacks enqueue results and
+return. Guest physical addresses stay u64 until checked conversion; validate
+addition/multiplication, holes and private-memory exclusions before native access.
+No Rust exclusive references cover concurrently accessible guest RAM.
+
+### Rust-vmm fit and transport repairs
+
+Reuse ring/descriptor definitions and checked traversal against owned metadata
+snapshots. Patch or extend traversal in one place to distinguish valid end from
+bad-next/cycle/truncation; do not maintain two independent parsers. Feature and
+direction/length checks remain the device's responsibility. Keep a small explicit
+natemu MMIO implementation unless fixing the upstream transport demonstrably
+requires less code. The evaluated transport cannot be used unchanged:
+
+- Validate full-width selectors, queue sizes, alignment, resources and status
+  transitions before narrowing or activation; enforce required VERSION_1 and
+  the selected block feature subset.
+- Implement QueueReady=0 stop/readback and full reset, QueueNotify scheduling,
+  notification suppression and IRQ ACK/level recomputation. Optional RING_RESET
+  is not a substitute for the required lifecycle.
+- Avoid live lazy descriptor iterators across asynchronous work. Avoid upstream
+  add_used's partial-failure/index-advance behavior on live guest RAM: prepare
+  bounded completion writes first, then publish owner indices exactly once after
+  a successful coordinated commit. Reuse primitives, not incompatible ownership.
+
+Pin the resolved production packages/features and license inventory in IO0;
+record the change to the existing host dependency policy then. The harness's mmap
+feature is not a requirement to replace production RAM with GuestMemoryMmap.
+
+**Fork assessment (November 8):** the recommended reuse route likely needs one
+small additive virtio-queue patch: checked chain traversal that distinguishes
+malformed termination from normal end, and rejects unnegotiated indirect tables
+before following them, plus a checked public snapshot/head entry point if needed
+(`DescriptorChain::new` is currently crate-private). Existing public descriptor accessors allow a local direct
+walker instead, so a fork is not architecturally required. Prefer extending the
+existing traversal implementation over duplicating it. The proposed fork target
+is the current rust-vmm/rust-vmm monorepo, with changes isolated to the selected
+crate and pinned by commit; vm-memory needs no currently identified patch.
+Natemu's memory/coherence coordinator, backend ownership and deferred MMIO/reset
+remain local code, not extensions to rust-vmm's role. See the
+[fork scope](io-rust-reuse.md#production-fork-assessment--november-8).
+
+## Copy-first request and completion protocol
+
+The selected baseline follows [04-26–29](../research/investigations/INV-03-04.md#qualified-handoff-bound-to-backend-and-source-ownership).
+It needs new pause/acknowledgement/release integration with today's runtime;
+`guest_ram_written` and a host-visible stopped PC are insufficient.
+
+1. **Reserve.** Before closing memory admission, reserve bounded request slots,
+   metadata scratch, payload storage, result capacity and invalidation bookkeeping.
+   Use VM/device/queue generations plus a request-slot incarnation. Backpressure
+   leaves work pending; it never creates unbounded allocations or drops a block
+   request as though it succeeded.
+2. **Capture metadata.** Freeze queue configuration/incarnation for the request.
+   At an acknowledged safe memory boundary, snapshot the
+   bounded direct descriptor table and available-ring state into owned scratch
+   using the queue configuration's checked ranges. No indirect chains initially.
+   Include every slot the captured available index can name, validate index
+   progress, and recheck incarnation before accepting work. Release the window,
+   then perform checked traversal on the snapshot; parsing cannot read uncaptured
+   guest memory. Reject indirect descriptors before following their addresses.
+   The accepted immutable description is authoritative for that request; never
+   follow guest mutations through a retained iterator. Reserve before consuming
+   next_avail, and consume an accepted head once under the device owner.
+   The owner may reuse this bounded metadata snapshot for its already-published
+   prefix until the captured available index is exhausted. This is prefetch, not
+   admission of further requests: each head still undergoes complete validation
+   and the one-active-request reset/S5 rules. Queue/device generation changes,
+   switching queues, Empty/Canceled/Invalid dispositions and prefix exhaustion
+   force a fresh capture. Geometry is immutable while ready/active; disable/reset
+   advances the identity. A completion aliasing later metadata does not rewrite
+   the owned captured interpretation. Payload is always captured afresh, and
+   completion suppression flags are read afresh in each commit. Newly published
+   heads are discovered at exhaustion without requiring another kick for block/TX.
+   This reuse is an inference from the exposed-entry ownership requirement in
+   [Virtio1.2 §3.3.1](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html),
+   not a claim that the specification prescribes a particular hostile alias outcome.
+3. **Prepare payload.** Validate the complete captured readable/writable SG stream
+   and capture readable bytes, including block/network request headers, into
+   owned storage under a separate admitted window. Decode command, sector and
+   header fields outside exclusion; support legal headers split or combined
+   across descriptors. Validate commands, capacities, arithmetic and status
+   destinations before any external effect. For IN/RX/rng,
+   backend data arrives into owned storage. Descriptor capture and payload capture
+   are distinct epochs: there is no claim that the entire request was sampled at
+   one instant. A conforming driver retains descriptor/payload ownership as
+   required; violations must remain bounded and cannot redirect native pointers.
+4. **Run backend.** Release RAM authority before disk/network/entropy calls.
+   Backend results retain their buffers and typed identity. A completion callback
+   cannot wait for a grant while holding a device/backend mutex.
+5. **Prepare completion.** Outside exclusion, compute ordered payload/status/used
+   writes and notification-state reads using captured queue/request identity.
+   Recheck incarnation and reserve the complete commit. Resolve/pin all applicable
+   guest backing spans before the first write; invalid destinations cause no
+   partial guest-memory commit. Invalid chains with no safely reportable status
+   fail the device under a defined transport policy; do not complete a valid prefix.
+6. **Commit and publish.** In one finite window, copy successful incoming bytes in
+   descriptor order, write device status, then used entry and used index with the
+   required ordering. Preserve ordered overlapping writes; deduplicate only the
+   invalidation union, not writes. Complete resident code/shadow/dependency work
+   before guest reentry or an actionable IRQ. Publish owner indices once and
+   retire the request only after all backend/copier/callback references end.
+
+Initially one maximum block data unit is 128KiB (32 data segments of at most
+4KiB), plus the 16-byte request header and bounded metadata/status/ring spans.
+Start with one block request, one rng request (256-byte payload maximum), and
+one TX plus one RX packet (2048-byte slot each) in flight, retaining queue-size
+bounded metadata. These preserve the selected simple network/rng resource
+profile and backpressure block work without narrowing its advertised request
+size. Do not fragment a block
+payload snapshot into unrelated epochs and call it one coherent unit. Start with
+one request per RAM window; add bounded packet/request batches after measuring
+pause time. Queue capacity is not permission to allocate a maximum payload for
+every possible descriptor without a configured global in-flight byte budget.
+IO0 must freeze numeric request/extent/byte limits for every device and queue.
+
+### What makes a RAM window safe
+
+The coordinator closes admission and obtains matching epoch acknowledgements
+or an ordered resident HLT-quiescence promise from every possible guest-memory
+observer/writer: translated execution, resident
+helpers/walkers, split-atomic service, source capture and publication, and other
+host memory access. Quiescence includes native barriers and a safe continuation;
+being in a host Device callback can still retain a live compiled-block return PC.
+Complete the owed ordinary MMIO operation/recovery before parking. For a deferred
+control operation, establish its explicit no-guest-memory pending state and
+retained continuation instead. Do not invalidate/reclaim code then resume through
+a stale continuation or replay an already accepted MMIO effect.
+
+Reuse precise checkpoints, management doorbells and resident invalidation where
+applicable, but do not reuse split_begin as an asynchronous I/O lock. Halting,
+host translation waits and resident service must all acknowledge or defer safely.
+The first implementation waits for existing host compilation/replies to finish
+and the resident to reach a safe checkpoint before acknowledging. No compiler
+result survives the granted window, including uncached step/system decodes.
+Allowing compilation to continue over immutable source during a grant is a later
+optimization requiring source-copy admission and stale-result rejection.
+Permanent control capacity permits drain/reset
+progress independently of guest IF, guest locks and backend completion queues.
+For block requests, the granted completion copies read avail.flags and avail.idx
+only after all payload/status/used writes. Owner retirement OR-preserves any
+QueueNotify arriving after admission and any same-generation captured successor,
+then uses the observed index to avoid a redundant empty scan. A false observed
+pending bit must never overwrite a later notification or revoke owned work.
+The normal ready/status/reset/quiesce gates still precede the next admission.
+Notification progress assumes conforming ownership of device-written queue state;
+arbitrary payload aliases to used.flags do not acquire a liveness guarantee.
+HLT and AP-mailbox wait loops drain management doorbells **before** checking the
+I/O request, then may sleep. Checking first can consume a newly arrived request's
+only wake and sleep without acknowledging it. A kick drained before the check has
+already published its request; a kick arriving after the drain remains pending
+to wake the wait. Keep the checkpoint before any subsequent guest-memory access.
+After publishing a window request and a native DSB SY, an exact current-epoch
+acknowledgement or a resident HLT-quiescence promise permits omitting that
+participant's doorbell. The resident completes outstanding guest accesses before
+publishing the promise, and clears it with an ordered barrier before checking
+requests on wake. This handshake ensures either the host observes withdrawal or
+the resident observes the request before accessing guest RAM. Still check every
+participant's terminal state under the stop mutex, and require every participant
+to be acknowledged or quiet before grant. A previous epoch's acknowledgement
+alone never permits skipping the wake or granting a new window.
+
+Only the HLT sleep publishes this promise. AP-mailbox waits continue taking
+ordinary acknowledgements because a DMA write can change their watched mailbox
+without a guest interrupt. A quiet CPU may skip multiple windows, so on wake it
+must drain code invalidations and compare the latest table-change epoch against
+its previously serviced epoch, including when a table write was followed by a
+read-only or canceled window. Quiet flags never synthesize acknowledgements.
+
+Only a bounded exact-span leaf copy and resident commit run while drained: no
+allocation, descriptor parsing, external syscall, arbitrary callback or compiler
+wait. Apply the qualified host compiler boundaries/DSB SY and resident
+acknowledge/resume barriers from 04-26; an upstream Release index store alone is
+not the cross-domain handoff. All payload, status and ring writes participate in
+code/source/shadow tracking, including writes to guest page-table backing. DMA
+is not a guest virtual store; do not walk guest VA permissions or invent A/D bits.
+
+Lock/progress rule: MMIO takes only its brief register-state lock, posts intent,
+then returns. The device owner requests a window without holding locks that a
+participant needs to acknowledge it. The copier cannot call the device or backend.
+Completion/reset/ACK are serialized by the owner, with interrupt level recomputed
+from current status. Serialize publication to the GSI too: computing a level
+under a lock then issuing unordered stale updates after unlock is insufficient.
+Keep lock order free of a chipset-to-device reverse acquisition. Never wait for
+the backend or all-vCPU drain under that lock.
+Register async work before a halted-idle decision so a pending completion keeps
+the VM alive and wakes the appropriate owner/vCPU without a lost notification.
+
+## Native backends and features
+
+**Recommended networking route: vmnet directly, in a separate per-VM packet
+worker, subject to the admission gate below.** Retain HVF and natemu's machine;
+Virtualization.framework device attachments require a VZ-owned VM and do not
+replace our queue/coherence work. The current accepted historical direction is
+adapted libslirp (03-73); choosing vmnet is a proposed backend revision, not an
+already validated production selection or silent fallback. Details and SDK
+sources are in the [native-backend assessment](io-native-backends.md).
+
+| Backend | First implementation | Measured extensions |
+| --- | --- | --- |
+| Raw disk | Supervisor opens one owned regular file; fixed capacity and stable ID. One ordered blocking lane uses native positioned I/O on owned buffers, asynchronously relative to vCPUs. Preserve IN/OUT/FLUSH/GET_ID and 04-28's complete error profile. | Buffer reuse first; vectored I/O or cache/read-ahead/preallocation policy only when justified. Parallel lanes need explicit flush ordering. |
+| vmnet shared/NAT | Native network services, dispatch notifications and scatter/gather over owned storage. Honor returned counts and limits. No virtio checksum/GSO features initially. | After the one-TX/one-RX baseline, explicitly increase bounded slot budgets and use native packet batches. Negotiate checksum/GSO and vmnet virtio-header mode together after header/size/fallback tests; increase RX/storage limits before enabling large TSO packets. |
+| Entropy | Native entropy acquisition into initialized owned storage outside the window; commit through the common path. | Bounded batching if useful; no fabricated successful bytes on acquisition error. |
+
+Native does not mean zero-copy or physical-NIC offload. Avoid redundant host
+buffer concatenation where iovecs suffice, but retain any copy needed for packet
+worker isolation. Plain-frame vmnet TX strips the validated virtio header; RX
+constructs the modern 12-byte virtio header even without merged receive buffers
+(RX num_buffers=1, TX num_buffers=0). Ignore fields/bits the selected spec says
+to ignore; do not reject valid packets merely for inactive checksum metadata.
+An iovec must never accidentally send
+that header as Ethernet payload. The initial network profile is 2048-byte guest
+frame slots/MTU1500; preserve 03-57's initial admission requirement that vmnet
+report MTU1500 and maximum packet size at most 2048, and supply receive buffers
+at least that reported size. A larger reported maximum needs a deliberate worker
+storage/profile amendment before admission, not an undersized receive call.
+Reject/drop oversize frames under a recorded bounded policy, not overrun guest
+slots. Do not enable native segmentation/checksum modes whose
+input/output metadata the guest path cannot interpret.
+
+For the later offload step, vmnet virtio-header mode and the checksum-offload
+configuration key are mutually exclusive, and receive capacity must account for
+the reported maximum packet size plus its 12-byte header. Support for that mode
+through the newer start_with_network interface remains unverified; select the
+start interface only after checking it. These are offload gates, not requirements
+for the plain-frame baseline.
+
+**Native admission gate (before IO4 external traffic):** establish an actually
+signed/entitled launch on the supported macOS version, sandbox/service access,
+creation/read/write/stop callbacks and packet buffer/count limits. Apple's
+[vm.networking entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.vm.networking)
+is restricted; adding a plist key does not establish entitlement availability.
+No automatic root escalation or broader worker rights. Record the revised role
+manifest: packet worker has only its configured vmnet interface and bounded
+owned packet channel, no guest RAM, disk FD or task-memory authority; trusted
+execution/device owner has no general network-service authority. Apple services
+replace the libslirp-specific DNS/ICMP socket construction only after their
+behavior/capabilities are checked. Configure intended services explicitly where
+supported; default IPv6 services do not establish accepted IPv6 coverage. If
+admission fails, report the blocker and revisit the documented backend choice.
+
+Disk durability is part of IO3, not a later optimization. Negotiated FLUSH allows
+writeback; a successful FLUSH follows earlier accepted writes and successful
+F_FULLFSYNC. If FLUSH is declined, each successful OUT waits for full-sync.
+Short positioned I/O advances only its completed prefix; zero progress or an
+error, including EINTR, reports IOERR without replaying the issued request. Failed staged IN
+copies no payload, reports IOERR and the selected conservative used length
+(04-27's len=0 rule); verify the actual target Linux driver's status consumption.
+Failed OUT may have changed the image: report failure, never promise rollback.
+No physical power-loss proof is claimed by successful full-sync tests.
+
+## Reset, shutdown and failure
+
+The original immediate `Device::read/write` interface cannot by itself express a
+control access waiting for retirement. The RNG continuation extends the host device-service result to
+distinguish completed, deferred and refused-with-no-effect. Ordinary register
+accesses/QueueNotify remain prompt. Queue-disable/full-reset may close admission
+and return a pending token to the host service loop, which releases every device
+lock and retains the access identity/result/recovery state until retirement.
+The affected vCPU stays in a progress-capable control wait; it must participate
+in coordinator drain without executing guest code or touching guest RAM. It
+must still service pause/shadow/source control, or enter a new resident safe-park
+state that discharges those holdings. Retaining code storage alone is insufficient:
+completion must finish the owed instruction once and dispatch at a safe boundary
+rather than resume a block tail made stale by DMA. IO0
+must map that pending state and its safe completion/reentry to actual resident
+recovery and source lifetime. The RNG continuation implements this safe wait;
+the host `in_host` flag is not an acknowledgement.
+
+Complete the deferred access exactly once. QueueReady readback returns the last
+written value and synchronizes stop; it is not a synthetic busy register that
+returns 1 after a completed write of 0. Serialize a conflicting read or
+reconfiguration behind the pending stop/reset; never allow it to reuse live
+resources. Full status reset returns the reset state only after its required
+retirement. [Virtio 1.2 MMIO register rules](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
+and the actual Linux driver's reset/deletion sequence are IO1 compatibility
+checks. Do not report refusal after having applied a control effect.
+
+Close queue/device admission, retain old incarnations and let already granted
+commits finish their recorded disposition. Ungranted old completions cannot write
+RAM or publish IRQs. Cancel their pending grant requests before waiting for
+retirement; reset cannot wait for a completion grant that its own suspended vCPU
+prevents. No RAM grant waits on a backend needed by reset. Generation mismatch
+suppresses stale publication, but does
+not cancel an in-flight syscall or release its buffer. Process backend results
+while draining; never block the sole owner required to retire them. QueueReady
+and device-status readback must reflect the required stop/reset semantics before
+resources are reused. Do not assume old callbacks are gone because a reset was
+requested.
+
+Route S5 through a new quiesce/drain phase before the current immediate
+cancellation/end path. Existing IRQ detachment and VM destruction are teardown
+plumbing, not an implemented device drain. S5 stops new work, drains accepted
+disk work, performs the required durability
+barrier, retires callbacks/IRQ offers, stops workers and only then releases RAM,
+FDs and VM state. vmnet_stop_interface returning success means its completion
+handler was scheduled, not that all callbacks/buffers are retired; wait for stop
+completion and drain application callback references. A stuck syscall/worker is
+contained failure, not successful drain. Management termination remains possible
+without freeing live storage or waiting indefinitely in an unkillable owner
+thread; IO0 must map the disk lane to the per-VM process lifetime/termination
+mechanism. Unexpected partial RAM-copy failure keeps admission closed and fails
+the VM; do not retry the whole commit or resume with guessed coherence state.
+
+## Runnable slices and acceptance
+
+| Slice | Result and decisive checks |
+| --- | --- |
+| IO0 — Freeze integration contract | Existing Rust fit harness is complete. Select checked traversal/local transport approach, exact feature masks and budgets; map every pause/commit participant and reset/termination path to current code; review versioned ABI fields. Run native network admission separately when implementation is authorized. Stop at a reviewed implementable contract with explicit platform blockers. |
+| IO1 — Deterministic asynchronous completion | Add bounded owner/coordinator and RAM windows with delayed/error backend. Prove no syscall holds a grant, no callback retains guest pointers, and the expected effect/IRQ occurs once at N=1/2/4. |
+| IO2 — Entropy and discovery | Reuse IO1 for rng; generate ACPI from device configuration; stock Linux discovers all enabled resources and reads entropy. Test short/error/reset and idle wakeup. |
+| IO3 — Persistent root disk | Native ordered lane, exact block profile, full-sync and shutdown drain. Boot an actual installed image with admitted kernel/initramfs drivers; filesystem workload, shutdown/relaunch, content hashes and injected short/error/flush failures. |
+| IO4 — Basic network | Integrate admitted vmnet worker and virtio-net RX/TX; MTU1500/no offloads. Verify DHCP, DNS, TCP/UDP/download, packet loss/backpressure, returned counts/errors, reset and callback retirement. Partial batch counts are additional checks when increasing the slot budget for batching. Network admission is a prerequisite, disk work need not wait for it. |
+| IO5 — Combined acceptance | SMP disk+network+CPU workload, high RAM, clean shutdown/relaunch and data verification. Independently review/reproduce bounded acceptance; retain applicable standing regressions and compare matched QEMU workloads. |
+
+IO1's meaningful adversarial matrix covers malformed/cyclic/unnegotiated chains,
+range overflow/holes, index wrap, queue reconfiguration/reset, duplicate and late
+results, absent RX buffers, completion-vs-ACK, completion-vs-halt, every pause
+participant, crossing-16 guest atomics concurrent with copies, code/PTE alias
+writes, outstanding old compiler replies and overlap among payload/status/rings.
+Check snapshots remain stable after release and no external result can choose a
+new GPA. Use deterministic scheduling/fault injection before real backend tests.
+Correctness acceptance is scoped to those cases, not universal ISA conformance.
+
+Record numeric run/time/storage limits before executing each slice. Measure
+throughput, latency distribution, host CPU, copied bytes, in-flight occupancy,
+RAM-window wait/pause time, kicks/refaults and wakeups from the first working path.
+Change one mechanism at a time; compare equal feature/durability profiles. No
+new network or disk workload was run for the planning revision. The implementation
+kickoff and its development checks are recorded below.
+
+### Implementation kickoff — November 8
+
+The first runnable increment establishes RAM snapshot/commit authority before
+connecting a device that can DMA. Resident acknowledgements occur at dispatch
+before block selection, HLT waits and AP startup waits. An active helper,
+page-table walk, split atomic or MMIO recovery completes before acknowledging;
+`in_host` is not authority. The initial protocol released shadow holdings before
+the acknowledgement barrier so waiting peers could finish. The current repair
+below retains mappings while parked and services peer shadow-drop requests until
+release. Read-only snapshots need no code flush; writes invalidate affected code
+and, for previously observed table pages, mapping currency before reentry.
+
+Source mapping also corrects an earlier concern: translated `mmio::device`
+already banks its instruction and returns through dispatch after completion.
+It does not resume a generated block tail. Deferred operations still need a
+control-only pending state and an owned completion/linear address; the current
+post-HVC `site_address` must not retain metadata across an invalidating pause.
+
+| Existing runtime path | Initial integration |
+| --- | --- |
+| `execution::find_from`, including precise doorbell stops | Check the pause before invalidation/event processing and before selecting a block. Decline `sys_fast` when a request is pending. |
+| `events::park` and `wait_mailbox` | Check before guest-memory work on each wait iteration; host doorbells wake the native wait. |
+| Shadow/source-mark waits, split-atomic service, `REQUEST_PAGE` recovery | Do not acknowledge with an operation or native continuation live. Finish it, servicing existing shadow requests, then reach the checkpoint. |
+| Host `fetched`/compiler/staged reply, including `REQUEST_STEP` | Complete the current host request and resident instruction before acknowledging. Loader accesses occur before execution. Future independent host RAM observers must use the coordinator. |
+| Translated `mmio::device` | Immediate completion already returns through dispatch. Deferred control participation was added in the RNG continuation below; no host callback may impersonate a resident acknowledgement. |
+
+The initial `Backing::copy_guest` accepts owned-buffer reads/writes, bounded to
+512 spans and 256 KiB total per window; it exposes no callback or guest pointer.
+The span budget includes a full 256-descriptor network chain plus completion
+and notification bookkeeping, rather than treating queue size as the whole
+commit's extent limit.
+Its caller is an independent owner and may hold no lock needed by vCPU service.
+All configured vCPUs must still be participating. A stopped/unstarted participant
+fails admission without copying. Range validation covers the entire batch before
+mutation; overlapping writes retain caller order. Serialization and monotonically
+increasing request/release epochs make canceled late acknowledgements harmless.
+The initial write path flushed each resident's entire code cache after release
+and before guest reentry; the host release is not a report that all flushes have
+already finished. That conservative baseline is retained in earlier evidence.
+Targeted invalidation preserves unrelated compiled objects. The first version
+rechecked global fetch mappings after every write; its retention/global executable
+remap checks passed primary and independent execution, as did high RAM and held
+compiler-response regressions. The current performance repair additionally tracks
+every physical page ever read as a guest page table, at every level and including
+failed walks and retries. Residents publish each mark before the entry load. The
+host checks these monotonic marks only after all participants are admitted and copy
+grant; only overlapping writes publish the separate table-change epoch requiring
+a global fetch-mapping invalidation. All writes still post physical code-page
+invalidations. The current protocol retains shadows while parked, preserving the full
+barrier before acknowledgement and the actual holding/writable bits. The parked
+loop services peer shadow-drop requests so an in-flight split atomic or code
+mark can finish before that peer acknowledges. After release, every window drains
+pending invalidations, including canceled and read-only windows. A table-change
+epoch still resets all shadows and fetch currency. Marks survive
+cache/CR3/vCPU/device resets and page reuse for the VM's entire lifetime; reuse
+can cause excess invalidations. A table first used after release is read from the
+new bytes. The bitmap adds about 1.094 MiB for the current 35 GiB physical span.
+Host release does not await every resident's post-release work; residents drain
+pending invalidations and the applicable table-change epoch before guest access
+or another acknowledgement. The [repair results](io-benchmarks.md#copy-first-performance-repair--november-8)
+include original fio pairs, targeted regressions and independent rebuild/replay;
+INV-03-01 owns their scope and remaining performance limitations.
+Paused residents still count against the existing native-run watchdog. Window
+admission deadlines must fit that watchdog; process supervision remains necessary
+for stalled native calls. The polling deadline does not bound host scheduling or
+the platform's doorbell call itself.
+
+The sibling queue patch adds `CheckedDescriptorChain`, sharing traversal with the
+legacy iterator and preserving its API. Its constructor accepts a captured
+table/head and an explicit indirect permission; malformed termination is a
+terminal error. Callers must consume and validate the whole result before any
+effect. The author run and independent fresh-target offline replay both pass
+56 existing tests, ten new external API cases and four doctests. Independent
+source review found no blocker. The retained queue manifest and replica live in
+`natemu-raw/io1-20261108-01/queue`. At the foundation boundary this was not yet a production dependency; the
+subsequent RNG integration below connects it to the owned snapshot consumer.
+
+Development bounds for this increment: queue package checks at most six
+invocations of 180 seconds each and 1 GiB retained; native window development
+checks at most 24 VM launches of 120 seconds each, plus host/resident builds,
+within 4 GiB retained. Retain sources, inputs, outputs and unsuccessful attempts
+under `natemu-raw/io1-20261108-01`. These are development/exploratory checks, not
+an architectural correctness or performance acceptance campaign. Stop this
+increment at a reviewed, runnable coordinated-copy path or a concrete blocking
+defect. IO1 as a whole still requires the asynchronous owner, lifecycle and IRQ
+matrix above; no disk/network capability is implied by this first increment.
+
+**Development result:** the initial native path runs at N=1/2/4 with 64 steady
+snapshots per case, while each vCPU executes cross-16/cross-cacheline locked
+operations. All snapshots match complete alternating values; every vCPU makes
+progress, sees a host patch to previously executed code and exits cleanly.
+Ordered overlapping transfers also pass. The retained `windows-01` source
+produces the host/resident binaries and passes the resident stack/gateway audit.
+Independent source review found no unresolved blocker, and a fresh offline
+host/resident rebuild repeated the N=4 case in `windows-replica-01`. Four live
+launches were used, without retries; this is scoped development evidence.
+Seven focused host tests cover batch rejection, ordered copies, exact participant
+acknowledgements, cancellation/late acknowledgements, consecutive windows,
+unwind/poison and resource bounds. These host simulations do not establish native
+timeout interleavings. Native HLT/AP, PTE-alias writes, high RAM and deferred
+MMIO/reset/IRQ are still untested in this increment. No disk, packet or entropy
+backend is connected, and no I/O performance claim follows.
+
+## RNG integration result — November 8
+
+The bounded owner, deferred lifecycle MMIO, cancelable copy permits and checked
+rust-vmm traversal over owned metadata snapshots are now connected to the real
+virtio-rng device and normal Boot/ACPI/CLI path. Retained-source Linux runs pass
+at N=1/2; a fresh-target N=4 rebuild/replay also passes. All discover the device,
+read four distinct nonzero 4096-byte payloads across platform unbind/rebind,
+observe GSI18 interrupts and power off cleanly. Host tests pass 154 with two
+ignored; resident stack/gateway and ACPICA resource/roundtrip checks pass.
+The [independent review](../research/reviews/INV-03-01-findings.md#virtio-rng-linux-integration--november-8-2026)
+records source/method checks and the replica author's independence limits.
+
+The IO2 bound is twelve 120-second VM launches and 4 GiB retained at
+`natemu-raw/io2-rng-20261108-01`; four launches are used, including a further
+N2 stock-driver regression after shared block transport and S5 integration.
+These are development results, not entropy-quality or performance evidence.
+Linux unbind/rebind does not cover the full adversarial reset/grant/IRQ matrix.
+That baseline used conservative whole-cache write invalidation. The subsequent
+targeted invalidation change posts written physical pages through existing code
+invalidation records, then drains them after release. The initial version globally
+invalidated fetch mappings after every write; the current table-dependency repair
+above restricts that step to previously observed table pages. This preserves
+unrelated compiled objects while still covering arbitrary DMA writes to page
+tables. Earlier finite remap/retention checks pass primary
+and independent execution. The original fio admission workload now completes;
+no causal speedup or comparative performance score is established.
+
+## Persistent disk and lifecycle results — November 8
+
+`--disk FILE` now exposes the accepted block profile through the shared transport
+and an owned native positioned-I/O lane. Stock Debian Linux boots an installed
+ext4 root, writes/overwrites/copies/renames/deletes known data, syncs and remounts
+read-only, and powers off after the final native full-sync and lane retirement.
+Fresh relaunches verify exact persisted content, unchanged whole-image bytes on
+the read-only boot, and clean offline e2fsck. N1/N2/N4 author pairs and an
+independent fresh N4 build/replay pass. The retained baseline uses eight of twelve
+Linux launches and four of eight power-port cases at
+`natemu-raw/io3-block-20261108-01` (about 770 MiB of 4 GiB). Host tests pass
+163 with two ignored. The port checks include committed scalar and REP-element
+state. This is sequential disk/RNG co-presence, not concurrent combined acceptance.
+
+Nine deterministic N1 lifecycle cases pass through the production owner and
+ordinary guest MMIO: active reset/disable, scalar/REP S5, final-sync failure,
+real positive read/write prefixes followed by injected EIO, malformed-chain
+recovery, and all 128 descriptors occupied by 64 FLUSH chains. Every case checks
+its full RAM/file oracle, architectural progress, event ordering and teardown.
+Independent fresh builds repeat reset, REP S5, sync failure and partial read.
+A further N2 case passes with accepted work released only after the initiating
+CPU's power poll and its peer's HLT park state; an independent fresh build and
+replay also pass, including both complete RAM images and clean two-CPU teardown.
+These test-only controls hold before the native call and inject errors before a
+subsequent syscall; they do not establish actual macOS failure atomicity.
+The lifecycle bound is sixteen 120-second launches and 1 GiB; all sixteen are
+used after the shared-transport N2 REP/HLT regression, at about 698 MiB in
+`natemu-raw/io3-lifecycle-20261108-01`.
+
+The extended IO1 cases also pass author and independent N2 runs: copied/executed
+addresses above 4 GiB, a PTE mapping change, HLT/interrupt progress, and AP mailbox
+wait/wakeup. IO1 uses twelve of 24 launches. The PTE case does not guarantee a hot
+alias at the final write, and the standalone HLT/AP cases do not identify a
+particular grant during waiting. Further IRQ/grant races, networking, combined
+workloads and matched performance checks remain open.
+
+The later pending-response check also passes primary and independent fresh N2
+runs: a real posted compiler request held before response consumption prevents
+copy grant, timeout has no effects, and release permits exact-epoch completion
+and guest progress/code-patch visibility. The permitted pre-instruction marker
+zero was observed in both runs. IO1 now uses fourteen of 24 launches. This closes
+that delayed-response timing check, not compiler-crash or all IRQ/grant races.
+
+**Next implementation:** finish the remaining scoped acceptance checks, basic
+networking and combined acceptance. Native vmnet admission failed in the current
+unprivileged launch; the deployment/backend decision is pending. Keep backends
+on owned buffers; no live guest-RAM adapter or zero-copy path is enabled. The
+owner's full disk/network objective remains unchanged; backend integration awaits
+the launch choice described in the native admission gate.
+
+### I/O safety stress — November 8
+
+Three repeatable runners extend the existing single-event cases. Their acceptance
+and execution accounting are owned by the active safety entry in INV-03-01;
+the raw campaign is `natemu-raw/io-safety-stress-20261108-01`.
+
+| Runner | Exercised behavior and failure oracle |
+| --- | --- |
+| `tools/run_io_stress.py` | N2/N4 seeded copy windows while guests perform crossing-16-byte LOCK NOT and LOCK INC, alternate active/HLT states, and consume changed global PTE mappings and compiled code. Every cycle checks known data/code, mixed and fully active snapshots, per-CPU progress, stable cumulative parity and an exact shared increment count; final RAM and epoch/ACK totals must agree. |
+| Same runner with `--forced` | Separately built scheduling hooks hold real request/quiet/withdrawal/ACK/grant boundaries. A real split peer posts late SHADOWS after another CPU's ACK. Cancellation is exercised both before and after grant, including announced canceled epochs following table/code writes. The oracle requires the reached schedule, effects, progress and zero hook timeouts. |
+| `tools/run_io_lifecycle_stress.py --case reset` or `disable` | 64 generations each, with the backend paused before its native positioned read until reset/disable is deferred. Check the canceled queue's whole payload/status/used entry, fresh queue data and IRQ acknowledgement before reusing buffers. N4 includes one genuinely halted peer and two active split-atomic peers; final complete RAM, disk and syscall/event traces must match. |
+| `tools/run_io_soak.py` | Stock Linux, fio 3.39 and verified stress-ng CPU/memory methods. Concurrent pure random reads from an immutable CRC file and CRC-tagged writes to a separate file; 60-second unloaded context, then 300 seconds under two CPU workers and a 256-MiB memory worker. Require sampled worker progress/overlap, full verification before overwrite and after load, hashes, S5, offline fsck and a fresh read-only restart with unchanged image. |
+
+Normal builds omit the `io-test-hooks` feature. Build forced driver and resident
+with that feature into a separate `--target-dir`; never use their elapsed time
+as production throughput. Test metadata occupies an existing private gap, without
+changing production offsets. Strong hook atomics prove the selected schedules,
+not the necessity or sufficiency of memory barriers under all executions.
+The normal resident's entire `.boot` and `.text` are byte-identical to the selected
+HLT performance candidate; changed read-only bytes encode source line numbers.
+
+Oracle sensitivity includes a seventh-generation corrupt completion rejected
+before the next generation can erase it, and an isolated resident mutant that
+suppresses CPU0's late-SHADOWS wait-loop service. The latter must reach the actual
+pending peer schedule and fail with an acknowledgement timeout, unchanged late
+service count, zero hook timeouts, released epoch and clean teardown. A generic
+timeout or arbitrary failed VM does not qualify as this negative control.
+
+Retained failures matter: the first two lifecycle attempts used invalid fixture
+MMIO forms (sign-extended absolute address, then unsupported direct CMP). The
+corrected fixture uses MOV through its MMIO base register and checks assembled
+forms. The first Linux soak completed its workloads and CRC sweeps, then reported
+an RCU stall during multi-megabyte UART log export. It remains failed. Lossless
+gzip/base64 export with bounded decoding, byte counts, SHA256 and pacing reduces
+evidence traffic; serial and decoded logs still reject kernel errors. This
+transport change does not establish that the bulk-serial stall is fixed.
+
+Primary and independent execution pass 2,560 normal cycles, 320 forced cycles,
+256 reset/disable generations and two full soak/restart pairs. All 24 launches
+remain accounted for, including three deliberate negatives and three unexpected
+failed attempts. See INV-03-01 and the benchmark record for exact provenance,
+counts, performance and the independent acceptance.
+
+These checks add finite race/lifecycle/load coverage. They do not establish
+universal race freedom, crash/power-loss durability, full distribution boot,
+guest reboot, native networking or zero-copy safety. Performance observations
+belong in [the benchmark record](io-benchmarks.md), separate from forced-schedule
+timings and failed-run observations.
+
+### Sustained console repair — November 8–9
+
+The load campaign reproduced the UART failure independently of disk I/O: a stock
+N4 Linux guest continuously writing 4.7 MB kept its serial IRQ CPU from running
+its heartbeat for about 26 seconds and emitted an RCU stall. Pacing the same
+bytes avoided the stall. The original model immediately reported THRE/TEMT and
+reasserted the transmit interrupt after every accepted byte, letting Linux's
+8250 handler keep transmitting without a useful not-ready interval.
+
+The repair retains the accelerated console's acceptance of every THR byte,
+including REP OUTS. It stages at most 16 output bytes and spills full batches
+synchronously. Each external byte clears transmit readiness; the existing
+timer service drains a partial batch and publishes readiness after an inactivity
+interval measured from the last byte, after any synchronous spill. This is an
+accelerated-console policy, not physical baud timing, FIFO overflow emulation,
+or a guarantee about host scheduling. Loopback remains instantaneous. Reset and
+loopback transitions flush already accepted external bytes, and shutdown drains
+them before the final output/error observation. The first sink error is retained;
+arbitrary blocking sinks can still block, as with the previous synchronous writes.
+
+`tools/run_serial_stress.py` checks exact wire bytes, kernel diagnostics, one
+pinned heartbeat per vCPU, and clean S5. The reviewed acceptance requires every
+heartbeat gap to be at most two seconds. Original and three-times-longer payloads
+test sustained progress. Focused register, REP OUTS, timer/interrupt and HLT
+fixtures supplement the stock Linux reproduction. Both the 50-us and 20-us
+candidates pass the original and triple payloads with exact bytes and heartbeat
+gaps at most 1.04 seconds. The 20-us delay is selected for this finite scope: about 30%
+higher serial throughput than 50 us in these single runs, with nearly unchanged
+host CPU. A fresh independent build repeats the triple payload in 89.42 seconds,
+with a maximum heartbeat gap of 1.04 seconds, and passes the CPU-loaded extension
+below. Neither delay is a general fairness
+bound. Exact results and limitations are in
+[the UART benchmark record](io-benchmarks.md#sustained-uart-reproduction-and-readiness-tuning--november-8).
+
+The fixture explicitly drains the Linux console with `tcsetattr(TCSADRAIN)`
+before forced poweroff. One earlier candidate run retained exact payload bytes
+and no stall but lost its final guest-queued marker at poweroff; it remains failed.
+The unchanged baseline still fails the stall check with the drain-aware fixture.
+The same final drain is included in the ordinary-disk and soak inputs for every
+engine, without changing fio jobs, verification, error rejection or time limits.
+
+The final combined build also passes the primary N4 triple-payload test with
+three verified 180-second stress-ng `int64` workers: 95.34 seconds for exact
+14,144,544-byte output, maximum heartbeat gap 1.15 seconds, and 92 consecutive
+actual-worker observations each spanning the complete drained output interval.
+The three workers report 327,450 / 326,976 / 324,750 verified operations, exit
+zero and trustworthy metrics. The first loaded attempt remains failed for two
+missing observer samples. A source-backed observer defect could abort a scan
+when an unrelated `/proc` path vanished; this is a plausible explanation, not
+confirmed as the cause of those historical gaps. Nonfatal per-path reads fix
+that defect while retaining the strict consecutive-sample oracle; synthetic
+checks accept unrelated disappearance and reject missing actual workers.
+[The fresh run and binary bindings](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/final-loaded-serial-02/manifest.json)
+and [observer-only fixture delta](/Users/liaozping/orca/natemu-raw/io-load-repair-20261108-01/serial-oracle-07/bindings.json)
+retain the exact method. Independent loaded replay passes in 101.52 seconds,
+with a maximum heartbeat gap of 1.15 seconds and 96 consecutive observations per
+worker. The original failure is not promoted to a pass. This is CPU-loaded serial
+coverage, not a claim about arbitrary memory pressure or scheduler fairness.
+
+The repair does not change guest-memory exclusion or enable direct DMA sharing.
+The normal disk matrix, primary and independent soak/restart pairs, and 512 fresh
+independent N4 native stress cycles also pass. The reverse-order baseline control
+puts loaded writes within baseline variation; unloaded writes remain lower in
+both candidate observations. No overall throughput gain is established;
+[the benchmark record](io-benchmarks.md) owns measured costs and rejected tuning.
+
+### Network frontend continuation
+
+The modern RX/TX frontend now uses per-queue generations and notification state;
+disabling one queue preserves the other's active operation, indices and IRQ.
+`PacketPort` exchanges only bounded owned Ethernet frames (no FCS, MTU1500,
+at most 1518 bytes including one VLAN tag). One owner alternates eligible queues.
+RX arrival schedules work even without another guest kick; empty RX buffers
+alone do not retain a busy guard. TX callback retirement precedes completion and
+reset. Backend failure cannot publish a successful power drain.
+
+The earlier short-RX failure proposal is corrected: a valid chain too small for
+the received frame drops that frame without consuming the chain or writing a
+prefix. The guest may supply smaller buffers for smaller packets; the spec's
+1526-byte recommendation is not mandatory. Invalid routes, directions or chain
+structure still fail the device. An incoming packet cannot turn a well-formed
+short chain into a malformed guest request.
+
+Four N1 retained guests pass headers, short-RX, queue lifecycle and malformed-chain
+recovery; an independent fresh build repeats headers and queue lifecycle. Exact
+whole RAM and packet oracles cover split/combined headers, unaligned buffers,
+64/1518-byte frames, used lengths, retained queue indices and clean teardown.
+The original IO4 baseline used six launches and passed 168 host tests with two
+ignored. The final two frontend slots pass headers/queue lifecycle with the
+targeted DMA invalidation and endpoint-lifetime guard; IO4 now uses eight of eight.
+The current host suite passes 172 tests with two ignored. A further N2 installed-root disk pair and REP/HLT
+shutdown regression pass with this shared-transport build. The echo endpoint
+does not establish external connectivity, native admission or ordinary CLI
+networking, nor force an active other-queue reset race or network IRQ delivery.
+
+A subsequent bounded HLT/IRQ check passes primary and independent fresh builds:
+with no TX/notification work queued, the actual endpoint guard keeps the halted
+guest alive until one owned packet arrives, producing a real GSI17/vector 0x40
+interrupt, correct ACK and RX bytes, then clean S5 and joining. An isolated
+missing-guard control produces early HALTED termination with no packet/IRQ/RAM
+effects. Its first checker-label failure and corrected fresh run are retained.
+This establishes finite resident-HLT arrival behavior and shutdown after RX.
+
+Two further N1 lifecycle cases pass primary and independent fresh builds under
+`natemu-raw/io4-active-20261108-01` (four of four launches). A held owned TX
+callback survives disabling idle RX, publishes once after release, and the same
+TX queue subsequently works with fresh RX. Separately, S5 commits while TX is
+held, then retires the callback and publishes its completion before successful
+shutdown. Both rejected RX echoes leave the original RX region unchanged. Exact
+full RAM, packet order/counts, architectural state and joined teardown match.
+The test driver adds only a bounded metadata barrier; production code is unchanged.
+These close the two named N1 schedules, not arbitrary SMP traffic, active
+same-queue reset or native callback/service lifetimes. No native network is
+connected by these fixtures; native admission/integration, stock-Linux networking
+and combined acceptance remain required.
+
+The independent fio preparation is now followed by accepted functional admission.
+The first unmodified fio run parsed all eleven profiles but timed out during the
+64 MiB verification workload; its failed image/logs are retained and no restart
+verification ran. Retained diagnostics show advancing writes and limited native
+stack/counter observations. After the reviewed targeted invalidation change,
+unchanged original write/relaunch pairs pass in primary and independent builds:
+64 MiB CRC checks, profile parsing, input hashes, clean S5/fsck, persisted file
+hashes and unchanged whole images on read-only restart. All seven campaign
+launches are accounted for. No I/O performance result is accepted yet.
+
+## Future direct-payload work
+
+Keep immutable request metadata, backend ownership and ordered completion as
+separate responsibilities; staging is the only implementation initially. If
+measurements justify it, retain the copied baseline and add a disabled experimental
+payload mode that relaxes atomicity only, retaining bounds, lifetime, reset and
+control-path correctness. It provides an optimistic comparison, not a correctness
+claim. A coordinated version needs its own eligible-page/access-lifetime protocol,
+including resident helpers, walkers, compiler reads and future aliases/promotions.
+A host mutex or existing two-page split lock is insufficient.
+
+Keep rings/control/status copied or otherwise under their checked protocol.
+Payload pages overlapping those structures or tracked code/tables are conservative
+staging candidates. Page permissions must be emulator shadow permissions, not
+edits to guest page tables. Revocation/acknowledgement/refill and contention costs
+must be measured against eliminated copies. Partial direct RX effects invalidate
+copy-first's no-payload-write-on-error rule; revise it explicitly. Once direct I/O
+starts, a timeout is neither permission to reuse its pages nor to retry via staging.
+
+## Review and evidence
+
+The earlier [scope/reuse review](../research/reviews/INV-03-01-findings.md#io-scope-and-rust-reuse-review--november-7-2026)
+and reproduced IO0 fit tests retain their original scope. This consolidated
+revision was independently reviewed by `/root/io_scope_review` for runtime,
+concurrency and lifecycle, and `/root/rust_io_research` for native backends and
+profile compatibility. Both accept the corrected plan direction within source
+evidence. The review added readable-header capture outside parsing, explicit
+queue/resource bounds, deferred control MMIO with safe continuation and ordered
+readback, S5 drain integration, ordered IRQ publication and native offload gates.
+Root checked the QueueReady requirement against the specification and rejected
+a proposed busy-value readback; the reviewer accepted the corrected deferred
+transaction design. The concrete ABI/checkpoint and RNG continuation are
+implemented and have the finite development evidence recorded above; full
+lifecycle coverage remains open. The initial unprivileged vmnet admission probe
+was denied, so a working native network backend is not established. A reviewed
+plan is not an implementation-correctness or performance result.

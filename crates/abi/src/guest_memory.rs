@@ -148,6 +148,8 @@ impl GuestRam {
 /// Optional instrumentation of page-table accesses a test driver may enable.
 /// Returning false refuses the access.
 pub trait Observer {
+    /// Runs before every attempted table load, including failed walks and retries.
+    fn before_read(&mut self, _gpa: u64) {}
     fn read(&mut self, _gpa: u64, _value: u64) -> bool {
         true
     }
@@ -161,6 +163,8 @@ impl Observer for () {}
 
 /// The global code-page mask as the walker's A/D writes must respect it (natemu's cross-vCPU code coherence).
 pub trait CodePages {
+    /// Record a page-table dependency before reading the entry, even on a subsequently failed walk.
+    fn table_read(&mut self, gpa: u64);
     /// Some vCPU holds translations from `gpa`'s page.
     fn translated(&mut self, gpa: u64) -> bool;
     /// `gpa`'s page, which holds translations, is about to be written: clears its code bits for every vCPU and posts
@@ -174,6 +178,9 @@ pub trait CodePages {
 /// every write is re-checked after it is made.
 pub struct CodeWrites<C>(pub C);
 impl<C: CodePages> Observer for CodeWrites<C> {
+    fn before_read(&mut self, gpa: u64) {
+        self.0.table_read(gpa);
+    }
     fn write(&mut self, gpa: u64, _: u64, _: u64) -> bool {
         if self.0.translated(gpa) {
             self.0.code_write(gpa);
@@ -222,6 +229,7 @@ impl<O: Observer> GuestTables<O> {
 }
 impl<O: Observer> paging::Tables for GuestTables<O> {
     fn read(&mut self, gpa: u64) -> Option<u64> {
+        self.observer.before_read(gpa);
         let value = self.ram.load64(gpa);
         self.observe(gpa, value)
     }
@@ -428,6 +436,7 @@ mod tests {
             n: usize,
         }
         impl CodePages for Peer {
+            fn table_read(&mut self, _: u64) {}
             fn translated(&mut self, gpa: u64) -> bool {
                 self.code.contains(&(gpa & !4095))
             }
@@ -448,5 +457,25 @@ mod tests {
         let want = [(b'c', 0x1000), (b'r', 0x1000), (b'r', 0x2000), (b'r', 0x3000), (b'c', 0x4800), (b'r', 0x4800)];
         assert_eq!(&p.events[..p.n], &want);
         assert_eq!((b.0[0], b.0[512], b.0[1024], b.0[1536 + 256]), (0x2027, 0x3027, 0x4027, 0x10_0027));
+    }
+
+    #[test]
+    fn table_dependency_precedes_load_even_on_failed_and_repeated_reads() {
+        struct Mark { ram: GuestRam, seen: [u64; 4], n: usize }
+        impl Observer for Mark {
+            fn before_read(&mut self, gpa: u64) {
+                self.seen[self.n] = gpa;
+                self.n += 1;
+                // Changing the entry here proves the callback precedes the actual load.
+                let _ = self.ram.write(gpa, self.n as u64);
+            }
+        }
+        let mut b = tables();
+        let ram = b.ram();
+        let mut t = GuestTables::observed(ram, Mark { ram, seen: [0; 4], n: 0 });
+        assert_eq!(t.read(0x1000), Some(1));
+        assert_eq!(t.read(0x1000), Some(2));
+        assert_eq!(t.read(0x8000), None);
+        assert_eq!(t.observer.seen[..3], [0x1000, 0x1000, 0x8000]);
     }
 }

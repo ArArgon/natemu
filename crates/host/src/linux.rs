@@ -63,6 +63,10 @@ pub struct Boot {
     /// host must have FEAT_SB (checked in [`Boot::prepare`]) and IA32_ARCH_CAPABILITIES advertises RDCL_NO when the host
     /// also has FEAT_CSV3, so a default command line then boots with PTI off. `--speculation-barriers` / `NATEMU_SPECULATION_BARRIERS`.
     pub speculation_barriers: bool,
+    /// Expose the modern virtio-MMIO entropy device (native entropy, copied completions).
+    pub rng: bool,
+    /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
+    pub disk: Option<PathBuf>,
 }
 
 impl Boot {
@@ -87,6 +91,8 @@ impl Boot {
             check_reuse: false,
             code_shape: false,
             speculation_barriers: false,
+            rng: false,
+            disk: None,
         }
     }
 
@@ -100,7 +106,10 @@ impl Boot {
         layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
         require_vcpus(self.vcpus)?;
         let backing = execution::prepare(&self.runtime.to_string_lossy(), self.code_bytes, self.vcpus, self.ram as usize)?;
-        let tables = boot::acpi::build(self.vcpus, self.rsdp);
+        let mut manifest = Vec::new();
+        if self.rng { manifest.push(crate::virtio::RNG_RESOURCE); }
+        if self.disk.is_some() { manifest.push(crate::virtio::BLOCK_RESOURCE); }
+        let tables = boot::acpi::build_with_virtio(self.vcpus, self.rsdp, &manifest);
         let inputs = Inputs { image: &self.kernel, cmdline: &self.cmdline, initrd: self.initrd.as_deref(), acpi: Some(&tables) };
         let loaded = boot::load(&backing.ram, &layout, &inputs).map_err(|e| e.to_string())?;
         execution::guest_ram_written(&backing.memory);
@@ -118,11 +127,23 @@ impl Boot {
         let uart = Arc::new(Mutex::new(uart::Uart::new()));
         uart.lock().unwrap().sink = self.serial;
         let mut devices = devices::Devices::new(self.ram);
-        devices.register_ports(boot::acpi::platform::COM1_PORT.into(), 8, uart.clone())?;
         // L4a: the I/O APIC, the 8259 pair and their wires.
         let irqs = crate::irq::install(&mut devices, &backing.memory, self.vcpus, &uart)?;
         // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
-        let board = clock::install(&mut devices, &irqs, lost)?;
+        let board = clock::install(&mut devices, &irqs, lost, &uart)?;
+        let mut virtio = Vec::new();
+        if self.rng {
+            let resource = crate::virtio::RNG_RESOURCE;
+            let rng = crate::virtio::Virtio::rng(irqs.clone(), resource.gsi as usize);
+            devices.register(resource.base.into(), 4096, rng.device())?;
+            virtio.push(rng);
+        }
+        if let Some(path) = &self.disk {
+            let resource = crate::virtio::BLOCK_RESOURCE;
+            let disk = crate::virtio::Virtio::block(irqs.clone(), resource.gsi as usize, path)?;
+            devices.register(resource.base.into(), 4096, disk.device())?;
+            virtio.push(disk);
+        }
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
@@ -131,6 +152,7 @@ impl Boot {
             devices: Arc::new(devices),
             irqs,
             board,
+            virtio,
             fexc: self.fexc,
             max_block: self.max_block,
             stop_at: self.stop_at,
@@ -158,6 +180,7 @@ pub struct Prepared {
     devices: Arc<devices::Devices>,
     irqs: crate::irq::Irqs,
     board: clock::Board,
+    virtio: Vec<Arc<crate::virtio::Virtio>>,
     fexc: PathBuf,
     max_block: Option<u32>,
     stop_at: Option<u64>,
@@ -331,6 +354,9 @@ impl Prepared {
             let stop_at = if v == 0 { self.stop_at } else { None };
             let stop = execution::run(cpu, backing.vcpu(v), &mut compiler, stop_at, self.watchdog, &mut requests, &stops, cancelled, &mut ());
             let end = crate::perf::now();
+            // Close device admission before a participant disappears. Pending copies must be
+            // canceled rather than waiting for an acknowledgement from the ended vCPU.
+            for device in &self.virtio { device.stop(); }
             stops.end(v);
             // X4: one vCPU's end ends the machine's run; the first to end (not cancelled) is reported as the run's cause.
             if !matches!(stop, Ok(Stop::Cancelled)) {
@@ -359,7 +385,14 @@ impl Prepared {
         // Perf chunk 14: with the log on, every 5 ms each vCPU's resident time so far by bucket (the current one counted to
         // now; zero without a `perf` resident): `snap NS` and `perf::BUCKETS` ns values per vCPU.
         let sampling = AtomicBool::new(crate::perf::on());
-        let supervision = std::thread::scope(|scope| {
+        let (supervision, io_result) = std::thread::scope(|scope| {
+            let io: Vec<_> = self.virtio.iter().map(|device| scope.spawn(|| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    device.run(backing, &machine, &stops, &self.cancel)
+                )).unwrap_or_else(|_| Err("virtio owner panicked".into()));
+                if result.is_err() { owners::cancel_owners(&self.cancel); }
+                result
+            })).collect();
             if sampling.load(SeqCst) {
                 scope.spawn(|| {
                     use exec::perf as rp;
@@ -384,7 +417,13 @@ impl Prepared {
             }
             let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
             sampling.store(false, SeqCst);
-            supervision
+            for device in &self.virtio { device.stop(); }
+            let mut io_result = Ok(());
+            for thread in io {
+                let result = thread.join().unwrap_or_else(|_| Err("virtio owner panicked".into()));
+                if io_result.is_ok() { io_result = result; }
+            }
+            (supervision, io_result)
         });
         if let Some(a) = answers.get() {
             crate::perf::line(&a.report());
@@ -394,6 +433,7 @@ impl Prepared {
         crate::perf::mark("destroyed");
         let supervision = supervision?;
         hv(destroyed, "destroy VM")?;
+        io_result?;
         // A resident built with its `perf` feature keeps its accounting on every entry whether or not anything reads it:
         // say so when the log is off (read after the run, never on its path).
         if !crate::perf::on() && (0..vcpus).any(|v| backing.vcpu(v).read_record::<exec::perf::Perf>(exec::perf::OFFSET).magic == exec::perf::MAGIC) {

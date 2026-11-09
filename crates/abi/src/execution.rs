@@ -247,7 +247,7 @@ pub mod cache {
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
     pub const LOOKUP_BYTES: usize = (HINTS + 4 * HINT_ENTRIES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + (1 << 30);
-    pub const GLOBAL_BYTES: usize = (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(BLOCK);
+    pub const GLOBAL_BYTES: usize = (TABLE_PAGES + TABLE_PAGE_BYTES).next_multiple_of(BLOCK);
     /// Mapping granule of the areas.
     pub const BLOCK: usize = 2 * MIB;
 
@@ -326,6 +326,11 @@ pub mod cache {
     }
     pub const WRITABLE_PAGES: usize = CODE_PAGES + MASK_BYTES;
     pub const RECORDS: usize = WRITABLE_PAGES + MASK_BYTES;
+    /// One bit per physical 4 KiB page ever read as a guest page table, at any level. Residents
+    /// publish before reading; the host inspects only inside a granted I/O window. Never cleared
+    /// during this VM's lifetime: page reuse may cause extra invalidations, never missed ones.
+    pub const TABLE_PAGES: usize = (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(8);
+    pub const TABLE_PAGE_BYTES: usize = super::MAX_GUEST_PAGES.div_ceil(64) * 8;
     pub const RESETS: usize = 0x3000;
     /// Split locks (no-stop change, November 6): the owner of the split lock (vCPU + 1; 0: free), then the two
     /// guest-physical page numbers + 1 it holds (0: none), then per vCPU a word that is 1 while it may hold a shadow
@@ -333,6 +338,51 @@ pub mod cache {
     pub const SPLIT: usize = RESETS + MAX_VCPUS * 8;
     /// Per-vCPU [`Events`] records (X2).
     pub const EVENTS: usize = (SPLIT + (3 + MAX_VCPUS) * 8).next_multiple_of(64);
+    /// Copy-first I/O rendezvous. Only the host coordinator publishes epochs; each resident acknowledges
+    /// at a banked instruction boundary after completing a full memory barrier. Parked residents
+    /// retain mappings but serve peer shadow-drop requests until release, then drain invalidations.
+    pub const IO_WINDOW: usize = (EVENTS + MAX_VCPUS * core::mem::size_of::<Events>()).next_multiple_of(64);
+    #[repr(C)]
+    pub struct IoWindow {
+        /// Monotonically increasing request (0 before the first window), serialized by the host.
+        pub request: u64,
+        /// All epochs through this one are released, including canceled requests that made no RAM access.
+        pub released: u64,
+        /// Most recent epoch that may have written RAM; published before release. Residents drain
+        /// physical-page invalidations before another acknowledgement or guest access.
+        pub written: u64,
+        /// Exact epoch at which each resident is quiescent. Host exit/accounting flags are not acknowledgements.
+        pub acknowledged: [u64; MAX_VCPUS],
+        /// Most recent write epoch overlapping TABLE_PAGES. Also invalidates global translation
+        /// currency before another acknowledgement or guest access; ordinary data writes do not.
+        pub tables_written: u64,
+        /// Resident-published HLT quiescence, after completing guest accesses. A withdrawing
+        /// resident clears this, orders the clear before checking request, and drains every
+        /// skipped epoch's invalidations before any guest access. Not a host-exit indicator.
+        pub quiescent: [u64; MAX_VCPUS],
+    }
+
+    /// Private scheduling-test metadata in an existing unused gap. No production offsets change.
+    pub mod io_test {
+        pub const BASE: usize = (super::IO_WINDOW + core::mem::size_of::<super::IoWindow>()).next_multiple_of(64);
+        pub const STRIDE: usize = 64;
+        pub const HOST: usize = super::MAX_VCPUS;
+        pub const ARM: usize = 0;
+        pub const REACHED: usize = 8;
+        pub const RELEASE: usize = 16;
+        pub const TIMEOUT: usize = 24;
+        pub const HITS: usize = 32;
+        pub const LATE_SHADOWS: usize = 40;
+        pub const READY: usize = 48;
+        pub const MAGIC: u64 = 0x696f746573743031;
+        pub const BEFORE_QUIET: u64 = 1;
+        pub const AFTER_WITHDRAW: u64 = 4;
+        pub const AFTER_ACK: u64 = 5;
+        pub const BEFORE_SPLIT: u64 = 6;
+        pub const BEFORE_GRANT: u64 = 8;
+        pub const AFTER_GRANT: u64 = 9;
+        const _: () = assert!(BASE + (HOST + 1) * STRIDE <= super::CODE_PAGES);
+    }
 
     /// Per-vCPU cache bookkeeping at [`CONTROL`]. The host sets `code_bytes` (the code area's size, head included) and
     /// `ram_bytes` (the VM's guest RAM, R) and `guest_state_va` at prepare; the resident owns the rest.
@@ -684,7 +734,9 @@ pub mod cache {
     const _: () = assert!(WRITABLE_SUMMARY + SUMMARY_BYTES <= LOOKUP_BYTES && SUMMARY_BYTES * 64 == MASK_BYTES);
     const _: () = assert!(MAX_VCPUS <= 64 && 64 % MASK_BITS == 0);
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= CODE_PAGES && CODE_PAGES % 8 == 0);
-    const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= GLOBAL_BYTES && MASK_BYTES % 8 == 0);
+    const _: () = assert!(IO_WINDOW + core::mem::size_of::<IoWindow>() <= CODE_PAGES && IO_WINDOW % 64 == 0);
+    const _: () = assert!(RECORDS + MAX_VCPUS * core::mem::size_of::<Record>() <= TABLE_PAGES && MASK_BYTES % 8 == 0);
+    const _: () = assert!(TABLE_PAGES % 8 == 0 && TABLE_PAGES + TABLE_PAGE_BYTES <= GLOBAL_BYTES);
     const _: () = assert!(RESETS + MAX_VCPUS * 8 <= SPLIT && SPLIT + (3 + MAX_VCPUS) * 8 <= EVENTS && EVENTS % 64 == 0);
     const _: () = assert!(EVENTS + MAX_VCPUS * core::mem::size_of::<Events>() <= GLOBAL_BYTES);
 }
@@ -1519,6 +1571,15 @@ pub const REPLY_PAGE: u64 = 0x33;
 /// LINT0, the 8259's vector returned in `value`. The host answers [`REPLY_IRQ`] with `status` [`mmio::DONE`].
 pub const REQUEST_IRQ: u64 = 0x34;
 pub const REPLY_IRQ: u64 = 0x34;
+/// Poll the host-owned operation accepted by the preceding device request. No token or second
+/// access is supplied by the resident. While pending, the resident can acknowledge RAM windows.
+pub const REQUEST_DEVICE_POLL: u64 = 0x35;
+pub const REPLY_DEVICE_POLL: u64 = 0x35;
+/// Port access completed; commit its architectural effects, then cooperate with device draining.
+pub const REPLY_PORT_POWER: u64 = 0x36;
+/// No guest continuation: the resident services copy windows between nonblocking drain polls.
+pub const REQUEST_POWER_POLL: u64 = 0x36;
+pub const REPLY_POWER_POLL: u64 = 0x36;
 
 /// A request's instruction fetch, walked by the resident (`State::fetch_fault`): why the walk of the last page it walked
 /// failed — kind, then the #PF address and error code for [`fetch::PAGE`].
@@ -2231,7 +2292,7 @@ pub struct Mmio {
     pub write: u64,
     /// A store's data (request); a load's value, in its low `width` bytes (reply).
     pub value: u64,
-    /// Reply: [`mmio::DONE`], or why the access is refused ([`mmio`]; also the resident's own refusals).
+    /// Reply: [`mmio::DONE`], [`mmio::PENDING`], or a failure/refusal ([`mmio`]).
     pub status: u64,
     /// Device accesses this vCPU completed (resident).
     pub completed: u64,
@@ -2256,6 +2317,11 @@ pub mod mmio {
     pub const SYSTEM: u64 = 8;
     /// [`super::REQUEST_PAGE`]'s reply for a page a device claims.
     pub const CLAIMED: u64 = 9;
+    /// Accepted once, completion deferred. The resident retains its decoded completion and polls;
+    /// it must not issue the access again. The host retains the endpoint, token and original identity.
+    pub const PENDING: u64 = 10;
+    /// An already accepted operation failed. It may have device effects and must never be replayed.
+    pub const FAILED: u64 = 11;
     pub fn name(status: u64) -> &'static str {
         match status {
             DONE => "done",
@@ -2267,6 +2333,8 @@ pub mod mmio {
             DEVICE => "device",
             SYSTEM => "system",
             CLAIMED => "claimed",
+            PENDING => "pending",
+            FAILED => "failed",
             _ => "none",
         }
     }
