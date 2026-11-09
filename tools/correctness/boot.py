@@ -7,7 +7,9 @@ CT-END, or at CAP seconds (env CT_CAP, default 3600). A foreign emulator process
 (`contended`). Exit 0 when CT-END was reached, 1 otherwise. Run it through vm.sh (the VM lock and the idle check)."""
 import json, os, re, signal, subprocess, sys, time
 
-RAW = '/Users/liaozping/orca/natemu-raw'
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from raw_root import RAW_ROOT
+RAW = str(RAW_ROOT)
 K = f'{RAW}/kernel-census-20261028-01/dl/linux'                     # Debian 6.12.107 bzImage (= the play kernel)
 QEMU = '/opt/homebrew/bin/qemu-system-x86_64'
 QCPU = 'Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce,+sha-ni,+adx,+clflushopt,+clwb,+smep,+umip'

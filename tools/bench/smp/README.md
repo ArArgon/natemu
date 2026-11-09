@@ -157,7 +157,7 @@ loads, `mfence` or `xchg` run; loaded values (bytes) go to a per-CPU result arra
 128-byte slots (distinct cache lines). The runner histograms per-iteration outcomes in the model's `outputs` order and labels each with
 `enumerate_outcomes(test).outcomes` ("observed outside model" would be a QEMU/model/program bug).
 
-## Results (`/Users/liaozping/orca/natemu-raw/qemu-smp-20261027-01/`)
+## Results (`natemu-raw/qemu-smp-20261027-01/`)
 
 Host Apple M4, macOS 26.6.2, QEMU 11.1.2 (binary SHA-256 in `*/manifest.json`), nasm 3.02. QEMU printed nothing on stderr in a spot check of handshake@4 (`thread=multi`).
 

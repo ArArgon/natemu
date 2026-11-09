@@ -76,7 +76,8 @@ import check_sites, scan_skips  # noqa: E402
 from check_sites import code_vs_sites  # noqa: E402
 import flags as F  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20/obj/fexc')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1])); from raw_root import RAW_ROOT  # noqa: E402
+FEXC = os.environ.get('FEXC', str(RAW_ROOT / 'fexc-native-20261026-01/series20/obj/fexc'))
 
 NZCV_WRITERS = {'adds', 'adcs', 'subs', 'sbcs', 'ands', 'bics', 'negs', 'ngcs', 'cmp', 'cmn', 'tst', 'ccmp', 'ccmn', 'fcmp',
                 'fcmpe', 'fccmp', 'fccmpe', 'setf8', 'setf16', 'rmif', 'cfinv', 'axflag', 'xaflag'}

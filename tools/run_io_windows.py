@@ -17,18 +17,11 @@ import subprocess
 import sys
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+from io_common import digest, stop_group, ROOT, VM_LOCK
 sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
 import ref  # noqa: E402
 
 BASE, CODE, FUNCTION, STACK = 0x200000, 0x100000, 0x110000, 0x300000
-
-
-def digest(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for block in iter(lambda: f.read(1024 * 1024), b''): h.update(block)
-    return h.hexdigest()
 
 
 def cache_preservation_errors(cpus, *, ordinary_writes=False):
@@ -67,17 +60,6 @@ again:
         lines += ['cpu', f'rip {CODE + v * 0x1000:#x}', 'gpr ' + ' '.join(hex(r) for r in regs),
                   'cpl 0', 'rflags 0x2', 'if 0']
     (work / 'program.txt').write_text('\n'.join(lines) + '\n')
-
-
-def stop_group(process):
-    try: os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError: return
-    try: process.wait(timeout=2)
-    except subprocess.TimeoutExpired: pass
-    # A compiler descendant can survive the main process; terminate the whole session.
-    try: os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError: pass
-    process.wait()
 
 
 def run_case(args, n):
@@ -136,7 +118,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for option in ('host', 'runtime', 'fexc', 'out'):
         parser.add_argument('--' + option, type=pathlib.Path, required=True)
-    parser.add_argument('--lock', type=pathlib.Path, default=pathlib.Path.home() / 'orca/natemu-raw/.vm.lock')
+    parser.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
     parser.add_argument('--cpus', type=int, nargs='+', choices=(1, 2, 4), default=[1, 2, 4])
     parser.add_argument('--preserve-code', action='store_true', help='also require unrelated compiled code to survive I/O writes')
     args = parser.parse_args()

@@ -17,6 +17,7 @@ import tempfile
 import time
 
 from run_io_windows import ROOT, digest, stop_group, ref
+from io_common import VM_LOCK
 BASE, CODE, FUNCTION, STACK = 0x200000, 0x100000, 0x110000, 0x300000
 TARGETS = (0x120000, 0x130000)
 
@@ -216,7 +217,7 @@ def main():
     prepare = sub.add_parser('prepare'); prepare.add_argument('--out', type=pathlib.Path, required=True)
     run = sub.add_parser('run')
     for key in ('host', 'runtime', 'fexc', 'out'): run.add_argument('--' + key, type=pathlib.Path, required=True)
-    run.add_argument('--lock', type=pathlib.Path, default=pathlib.Path.home() / 'orca/natemu-raw/.vm.lock')
+    run.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
     args = parser.parse_args()
     if args.action == 'self-check': self_check(); return 0
     args.out = args.out.resolve(); args.out.mkdir(parents=True, exist_ok=False); meta = fixture(args.out)

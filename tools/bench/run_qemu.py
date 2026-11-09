@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """QEMU TCG baseline for natemu: steady-state ns per guest instruction of the benchmarks in benchmarks.json.
 
-    python3 tools/bench/run_qemu.py --out /Users/liaozping/orca/natemu-raw/bench-qemu-20261027-01 [--reps 7] [--scale 1.0]
+    python3 tools/bench/run_qemu.py --out $NATEMU_RAW_ROOT/bench-qemu-20261027-01 [--reps 7] [--scale 1.0]
                                     [--bench int,mem64] [--mults 1,2,4] [--no-linux-user] [--no-system]
 
 System TCG (binding yardstick): the Homebrew qemu-system-x86_64 on this Mac boots stub.asm (long mode, 4 KiB identity paging, CPL3)
@@ -13,8 +13,9 @@ import argparse, datetime, hashlib, json, os, pathlib, platform, shutil, statist
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent / 'reference')); sys.path.insert(0, str(HERE.parent))
 import build_bench as bb
+from raw_root import RAW_ROOT
 QEMU_SYS = shutil.which('qemu-system-x86_64') or '/opt/homebrew/bin/qemu-system-x86_64'
-QEMU_USER = pathlib.Path('/Users/liaozping/orca/natemu-raw/reference-slice1-20261026-01/pin/qemu-x86_64-static')
+QEMU_USER = RAW_ROOT / 'reference-slice1-20261026-01/pin/qemu-x86_64-static'
 SYS_ARGS = ['-accel', 'tcg,thread=single', '-cpu', 'max', '-smp', '1', '-m', '64', '-machine', 'pc', '-nographic', '-nodefaults',
             '-monitor', 'none', '-serial', 'none', '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04', '-no-reboot']
 USER_FLAGS = ['-cpu', 'max']

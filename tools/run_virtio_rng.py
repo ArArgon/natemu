@@ -22,8 +22,8 @@ import stat
 import subprocess
 import tarfile
 import time
+from io_common import digest, stop_group, ROOT
 
-ROOT = Path(__file__).resolve().parent.parent
 KVER = '6.12.107+deb13-amd64'
 KERNEL_SHA = '2b2358b37674d2505350528875bb17afae2a36522a9e8a9417eaca65a7da0e08'
 MODULES = ('kernel/drivers/virtio/virtio_mmio.ko', 'kernel/drivers/char/hw_random/virtio-rng.ko')
@@ -106,10 +106,6 @@ sync
 poweroff -f
 fail poweroff-returned
 '''
-
-
-def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def cpio_files(data):
@@ -201,16 +197,6 @@ def judge(text, n):
     require(len(interrupts) == 1 and sum(map(int, interrupts[0].split())) > 0, 'no delivered virtio interrupt on GSI 18')
     require(not re.search(r'VIRTIO-RNG-FAIL|BUG:|Oops:|Kernel panic|Call Trace:', text), 'guest or kernel error')
     return errors
-
-
-def stop_group(process):
-    try: os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError: return
-    try: process.wait(timeout=2)
-    except subprocess.TimeoutExpired: pass
-    try: os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError: pass
-    process.wait()
 
 
 def self_check():

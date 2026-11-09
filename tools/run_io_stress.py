@@ -16,8 +16,8 @@ import tempfile
 import time
 import run_io_quiet as quiet
 import run_io_windows as windows
+from io_common import ROOT, VM_LOCK
 
-ROOT=Path(__file__).resolve().parent.parent
 BASE,CONTROL,FUNCTION=quiet.BASE,quiet.BASE+0x800,quiet.FUNCTION
 SENTINEL=0xcafe1234feed5678
 
@@ -202,7 +202,7 @@ def main():
     p.add_argument('--self-check',action='store_true');p.add_argument('--prepare-only',action='store_true');p.add_argument('--forced',action='store_true')
     p.add_argument('--cpus',type=int,choices=(2,4),default=2);p.add_argument('--cycles',type=int);p.add_argument('--seed',type=int,default=0x15a4e35)
     for name in ('host','runtime','fexc','out'):p.add_argument('--'+name,type=Path)
-    p.add_argument('--lock',type=Path,default=Path.home()/'orca/natemu-raw/.vm.lock')
+    p.add_argument('--lock',type=Path,default=VM_LOCK)
     a=p.parse_args()
     if a.self_check:self_check();return 0
     if a.cycles is None:a.cycles=64 if a.forced else 512

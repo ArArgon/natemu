@@ -21,7 +21,8 @@ sys.path.insert(0, str(HERE))
 import check_sites  # noqa: E402  (disassemble, object reader)
 import scan_skips  # noqa: E402
 
-FEXC = os.environ.get('FEXC', '/Users/liaozping/orca/natemu-raw/fexc-native-20261026-01/series20/obj/fexc')
+sys.path.insert(0, str(Path(__file__).resolve().parents[1])); from raw_root import RAW_ROOT  # noqa: E402
+FEXC = os.environ.get('FEXC', str(RAW_ROOT / 'fexc-native-20261026-01/series20/obj/fexc'))
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx

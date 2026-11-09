@@ -17,6 +17,8 @@ import sys
 import time
 
 import run_fio_admission as admission
+from io_common import VM_LOCK
+from raw_root import RAW_ROOT
 
 write_json, digest, checked = admission.write_json, admission.digest, admission.checked
 BYTES = 64 << 20
@@ -186,9 +188,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--backend', choices=['qemu', 'native'], required=True)
     for name in ['executable', 'inputs', 'out']: p.add_argument('--'+name, type=Path, required=True)
-    p.add_argument('--profiles', type=Path, default=Path('/Users/liaozping/orca/natemu-raw/io-benchmark-prep-20261108-01/profiles'))
+    p.add_argument('--profiles', type=Path, default=RAW_ROOT / 'io-benchmark-prep-20261108-01/profiles')
     p.add_argument('--binary-manifest', type=Path, help='required native build binary.json binding')
-    p.add_argument('--lock', type=Path, default=Path.home()/'orca/natemu-raw/.vm.lock')
+    p.add_argument('--lock', type=Path, default=VM_LOCK)
     args = p.parse_args()
     for name in ['inputs','out','profiles','lock']: setattr(args,name,getattr(args,name).resolve())
     return run(args)
