@@ -9,6 +9,8 @@
 //! of vCPU N ([`Recorder::request`]). Times are nanoseconds of `CLOCK_UPTIME_RAW`, which is `mach_absolute_time`: the
 //! guest's CNTVCT (every vCPU's virtual timer offset is 0) and the resident's ticks are on the same clock.
 use crate::Result;
+use crate::report::Members;
+use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -117,6 +119,46 @@ const PARTS: [&str; 10] = [
     "relocate",
 ];
 
+/// A vCPU's performance-log line ([`Perf::finish`]).
+#[derive(Serialize)]
+struct VcpuLine<'a, K, S> {
+    vcpu: usize,
+    start: u64,
+    created: u64,
+    last: u64,
+    end: u64,
+    done: u64,
+    cpu_ns: u64,
+    /// Host time by kind: [ns, exits].
+    host: Members<&'static str, [u64; 2]>,
+    parts: Members<&'static str, u64>,
+    results: [u64; 5],
+    sources: [u64; 3],
+    fexc: Option<Fexc>,
+    resident: Resident,
+    k1: &'a K,
+    state: &'a S,
+    log: Log,
+}
+#[derive(Serialize)]
+struct Fexc {
+    user_ns: u64,
+    sys_ns: u64,
+    max_rss: u64,
+}
+#[derive(Serialize)]
+struct Resident {
+    magic: bool,
+    since: u64,
+    current: u64,
+    buckets: Members<&'static str, [u64; 2]>,
+    wakes: Members<&'static str, (u64, u64, u64, [u64; natemu_abi::execution::perf::WAKE_BINS])>,
+}
+#[derive(Serialize)]
+struct Log {
+    failed: u64,
+    dropped: u64,
+}
 /// One vCPU's log while it runs (`Compiler::perf`).
 pub struct Recorder {
     vcpu: usize,
@@ -300,68 +342,190 @@ impl Recorder {
         fexc: Option<(u64, u64, u64)>,
         resident: &natemu_abi::execution::perf::Perf,
         wakes: &natemu_abi::execution::perf::Wakes,
-        k1: &str,
-        state: &str,
+        k1: &impl Serialize,
+        state: &impl Serialize,
     ) -> (u64, u64) {
         if let Err(e) = self.requests.flush() {
             write_failed(&e);
         }
         let (cpu, done) = (thread_cpu() - self.cpu, now());
-        let pairs = |names: &[&str], ns: &[u64], n: &[u64]| -> String {
-            names
-                .iter()
-                .zip(ns)
-                .zip(n)
-                .map(|((k, t), c)| format!("\"{k}\":[{t},{c}]"))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let parts: Vec<String> = PARTS
-            .iter()
-            .zip(self.parts)
-            .map(|(k, t)| format!("\"{k}\":{t}"))
-            .collect();
-        let fexc = fexc.map_or("null".into(), |(u, s, rss)| {
-            format!("{{\"user_ns\":{u},\"sys_ns\":{s},\"max_rss\":{rss}}}")
-        });
         use natemu_abi::execution::perf as rp;
-        let ticks: Vec<u64> = resident
-            .ticks
-            .iter()
-            .map(|&t| crate::execution::ticks_ns(t))
-            .collect();
-        let buckets = pairs(&rp::NAMES, &ticks, &resident.count);
-        // Perf chunk 14: halt wake-ups, [count, total ns, max ns, [bins]] by kind.
         let ns = crate::execution::ticks_ns;
-        let wakes = (0..rp::WAKE_KINDS)
-            .map(|k| {
-                format!(
-                    "\"{}\":[{},{},{},{:?}]",
-                    rp::WAKE_NAMES[k],
-                    wakes.count[k],
-                    ns(wakes.ticks[k]),
-                    ns(wakes.max[k]),
-                    wakes.bins[k]
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        line(&format!(
-            "vcpu {{\"vcpu\":{},\"start\":{},\"created\":{},\"last\":{},\"end\":{end},\"done\":{done},\"cpu_ns\":{cpu},\"host\":{{{}}},\"parts\":{{{}}},\"results\":{:?},\"sources\":{:?},\"fexc\":{fexc},\"resident\":{{\"magic\":{},\"since\":{},\"current\":{},\"buckets\":{{{buckets}}},\"wakes\":{{{wakes}}}}},\"k1\":{k1},\"state\":{state},\"log\":{{\"failed\":{},\"dropped\":{}}}}}",
-            self.vcpu,
-            self.start,
-            self.created,
-            self.last,
-            pairs(&HOST, &self.host, &self.exits),
-            parts.join(","),
-            self.results,
-            self.by_source,
-            resident.magic == rp::MAGIC,
-            crate::execution::ticks_ns(resident.since),
-            resident.current,
-            failed(),
-            self.dropped
-        ));
+        let pairs =
+            |names: &[&'static str], ns: &[u64], n: &[u64]| -> Members<&'static str, [u64; 2]> {
+                names
+                    .iter()
+                    .zip(ns)
+                    .zip(n)
+                    .map(|((&k, &t), &c)| (k, [t, c]))
+                    .collect()
+            };
+        let ticks: Vec<u64> = resident.ticks.iter().map(|&t| ns(t)).collect();
+        let report = VcpuLine {
+            vcpu: self.vcpu,
+            start: self.start,
+            created: self.created,
+            last: self.last,
+            end,
+            done,
+            cpu_ns: cpu,
+            host: pairs(&HOST, &self.host, &self.exits),
+            parts: PARTS.into_iter().zip(self.parts).collect(),
+            results: self.results,
+            sources: self.by_source,
+            fexc: fexc.map(|(user_ns, sys_ns, max_rss)| Fexc {
+                user_ns,
+                sys_ns,
+                max_rss,
+            }),
+            resident: Resident {
+                magic: resident.magic == rp::MAGIC,
+                since: ns(resident.since),
+                current: resident.current,
+                buckets: pairs(&rp::NAMES, &ticks, &resident.count),
+                // Perf chunk 14: halt wake-ups, [count, total ns, max ns, [bins]] by kind.
+                wakes: (0..rp::WAKE_KINDS)
+                    .map(|k| {
+                        let wake = (
+                            wakes.count[k],
+                            ns(wakes.ticks[k]),
+                            ns(wakes.max[k]),
+                            wakes.bins[k],
+                        );
+                        (rp::WAKE_NAMES[k], wake)
+                    })
+                    .collect(),
+            },
+            k1,
+            state,
+            log: Log {
+                failed: failed(),
+                dropped: self.dropped,
+            },
+        };
+        line(&format!("vcpu {}", serde_json::to_string(&report).unwrap()));
         (failed(), self.dropped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use natemu_abi::execution::perf as rp;
+
+    /// The vCPU line against the former formatter, over the same values (fexc present and absent).
+    #[test]
+    fn vcpu_line_matches_the_former_format() {
+        let mut n = 0;
+        let mut next = || {
+            n += 1_000_003u64;
+            n
+        };
+        let host: [u64; HOST.len()] = std::array::from_fn(|_| next());
+        let exits: [u64; HOST.len()] = std::array::from_fn(|_| next());
+        let parts: [u64; PARTS.len()] = std::array::from_fn(|_| next());
+        let ticks: [u64; rp::BUCKETS] = std::array::from_fn(|_| next());
+        let count: [u64; rp::BUCKETS] = std::array::from_fn(|_| next());
+        let wakes: [(u64, u64, u64, [u64; rp::WAKE_BINS]); rp::WAKE_KINDS] =
+            std::array::from_fn(|_| (next(), next(), next(), std::array::from_fn(|_| next())));
+        let k1 = serde_json::json!({"cr3_loads": 1, "systems": {"kinds": {"0x7": [1, 2]}}});
+        let state = serde_json::json!({"blocks": 2, "lock_wait": [3, 4]});
+        for fexc in [Some((next(), next(), next())), None] {
+            let (results, by_source) = ([next(), 0, next(), 1, 2], [next(), 3, 0]);
+            let (vcpu, start, created, last, end, done, cpu) =
+                (3, next(), next(), next(), next(), next(), next());
+            let (magic, since, current, failed, dropped) = (true, next(), 7, next(), next());
+            let pairs = |names: &[&'static str],
+                         ns: &[u64],
+                         n: &[u64]|
+             -> Members<&'static str, [u64; 2]> {
+                names
+                    .iter()
+                    .zip(ns)
+                    .zip(n)
+                    .map(|((&k, &t), &c)| (k, [t, c]))
+                    .collect()
+            };
+            let new = VcpuLine {
+                vcpu,
+                start,
+                created,
+                last,
+                end,
+                done,
+                cpu_ns: cpu,
+                host: pairs(&HOST, &host, &exits),
+                parts: PARTS.into_iter().zip(parts).collect(),
+                results,
+                sources: by_source,
+                fexc: fexc.map(|(user_ns, sys_ns, max_rss)| Fexc {
+                    user_ns,
+                    sys_ns,
+                    max_rss,
+                }),
+                resident: Resident {
+                    magic,
+                    since,
+                    current,
+                    buckets: pairs(&rp::NAMES, &ticks, &count),
+                    wakes: rp::WAKE_NAMES.into_iter().zip(wakes).collect(),
+                },
+                k1: &k1,
+                state: &state,
+                log: Log { failed, dropped },
+            };
+            // The former formatter.
+            let pairs = |names: &[&str], ns: &[u64], n: &[u64]| -> String {
+                names
+                    .iter()
+                    .zip(ns)
+                    .zip(n)
+                    .map(|((k, t), c)| format!("\"{k}\":[{t},{c}]"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let parts: Vec<String> = PARTS
+                .iter()
+                .zip(parts)
+                .map(|(k, t)| format!("\"{k}\":{t}"))
+                .collect();
+            let fexc = fexc.map_or("null".into(), |(u, s, rss)| {
+                format!("{{\"user_ns\":{u},\"sys_ns\":{s},\"max_rss\":{rss}}}")
+            });
+            let buckets = pairs(&rp::NAMES, &ticks, &count);
+            let wakes = (0..rp::WAKE_KINDS)
+                .map(|k| {
+                    format!(
+                        "\"{}\":[{},{},{},{:?}]",
+                        rp::WAKE_NAMES[k],
+                        wakes[k].0,
+                        wakes[k].1,
+                        wakes[k].2,
+                        wakes[k].3
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let (k1, state) = (k1.to_string(), state.to_string());
+            let old = format!(
+                "vcpu {{\"vcpu\":{},\"start\":{},\"created\":{},\"last\":{},\"end\":{end},\"done\":{done},\"cpu_ns\":{cpu},\"host\":{{{}}},\"parts\":{{{}}},\"results\":{:?},\"sources\":{:?},\"fexc\":{fexc},\"resident\":{{\"magic\":{},\"since\":{},\"current\":{},\"buckets\":{{{buckets}}},\"wakes\":{{{wakes}}}}},\"k1\":{k1},\"state\":{state},\"log\":{{\"failed\":{},\"dropped\":{}}}}}",
+                vcpu,
+                start,
+                created,
+                last,
+                pairs(&HOST, &host, &exits),
+                parts.join(","),
+                results,
+                by_source,
+                magic,
+                since,
+                current,
+                failed,
+                dropped
+            );
+            let old: serde_json::Value =
+                serde_json::from_str(old.strip_prefix("vcpu ").unwrap()).unwrap();
+            assert_eq!(old, serde_json::to_value(&new).unwrap());
+        }
     }
 }

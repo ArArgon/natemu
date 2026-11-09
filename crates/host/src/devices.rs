@@ -25,7 +25,9 @@
 //! registry); every access is a host exit, except those a resident device answers first (the resident's `mmio::local`
 //! hook, X3's per-vCPU LAPIC).
 use crate::execution::Area;
+use crate::report::Hex;
 use natemu_abi::execution::{self as exec, MMIO_OFFSET, Mmio, State, mmio};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -227,24 +229,11 @@ impl Devices {
         }
         Ok(if data.is_some() { 0 } else { value })
     }
-    /// L3: the run report's port and unassigned-page counts, as JSON members (`"ports":[..],"unassigned_pages":[..]`).
-    pub fn report(&self) -> String {
+    /// L3: the run report's port and unassigned-page counts.
+    pub fn report(&self) -> AccessCounts {
         let ports = self.port_counts.lock().unwrap_or_else(|e| e.into_inner());
-        let ports = ports.iter().map(|(&p, [r, w])| {
-            let unassigned = self.port_owner(u32::from(p)).is_none();
-            format!(
-                "{{\"port\":\"{p:#x}\",\"reads\":{r},\"writes\":{w},\"unassigned\":{unassigned}}}"
-            )
-        });
         let pages = self.page_counts.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = pages
-            .iter()
-            .map(|(&g, [r, w])| format!("{{\"page\":\"{g:#x}\",\"reads\":{r},\"writes\":{w}}}"));
-        format!(
-            "\"ports\":[{}],\"unassigned_pages\":[{}]",
-            ports.collect::<Vec<_>>().join(","),
-            pages.collect::<Vec<_>>().join(",")
-        )
+        AccessCounts::new(&ports, &pages, |p| self.port_owner(u32::from(p)).is_none())
     }
     /// Registers `device` at `[base, base + bytes)`: page-aligned, outside guest RAM (above it, or inside the legacy hole,
     /// `exec::LEGACY_HOLE`), below MAXPHYADDR (40 bits), not overlapping another range.
@@ -655,5 +644,85 @@ mod deferred_tests {
             .unwrap();
         assert_eq!(bus.port(0, 0x100, 4, None), Ok(0x1234));
         assert_eq!(bus.port(0, 0x100, 4, Some(2)), Ok(0));
+    }
+}
+
+/// The run report's port and unassigned-page counts (JSON members `"ports":[..],"unassigned_pages":[..]`).
+#[derive(Debug, Serialize)]
+pub struct AccessCounts {
+    pub ports: Vec<PortCount>,
+    pub unassigned_pages: Vec<PageCount>,
+}
+#[derive(Debug, Serialize)]
+pub struct PortCount {
+    port: Hex,
+    reads: u64,
+    writes: u64,
+    unassigned: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct PageCount {
+    page: Hex,
+    reads: u64,
+    writes: u64,
+}
+impl AccessCounts {
+    fn new(
+        ports: &BTreeMap<u16, [u64; 2]>,
+        pages: &BTreeMap<u64, [u64; 2]>,
+        unassigned: impl Fn(u16) -> bool,
+    ) -> Self {
+        Self {
+            ports: ports
+                .iter()
+                .map(|(&p, &[reads, writes])| PortCount {
+                    port: Hex(p.into()),
+                    reads,
+                    writes,
+                    unassigned: unassigned(p),
+                })
+                .collect(),
+            unassigned_pages: pages
+                .iter()
+                .map(|(&g, &[reads, writes])| PageCount {
+                    page: Hex(g),
+                    reads,
+                    writes,
+                })
+                .collect(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ports.is_empty() && self.unassigned_pages.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    #[test]
+    fn access_counts_match_the_former_format() {
+        let ports = BTreeMap::from([(0x20u16, [3, 1]), (0x3f8, [0, 9])]);
+        let pages = BTreeMap::from([(0xfee0_0000u64, [2, 0])]);
+        let unassigned = |p: u16| p == 0x20;
+        let old_ports = ports.iter().map(|(&p, [r, w])| {
+            let unassigned = unassigned(p);
+            format!(
+                "{{\"port\":\"{p:#x}\",\"reads\":{r},\"writes\":{w},\"unassigned\":{unassigned}}}"
+            )
+        });
+        let old_pages = pages
+            .iter()
+            .map(|(&g, [r, w])| format!("{{\"page\":\"{g:#x}\",\"reads\":{r},\"writes\":{w}}}"));
+        let old = format!(
+            "\"ports\":[{}],\"unassigned_pages\":[{}]",
+            old_ports.collect::<Vec<_>>().join(","),
+            old_pages.collect::<Vec<_>>().join(",")
+        );
+        let old: serde_json::Value = serde_json::from_str(&format!("{{{old}}}")).unwrap();
+        let new = AccessCounts::new(&ports, &pages, unassigned);
+        assert_eq!(old, serde_json::to_value(&new).unwrap());
+        assert!(!new.is_empty());
+        assert!(AccessCounts::new(&BTreeMap::new(), &BTreeMap::new(), unassigned).is_empty());
     }
 }

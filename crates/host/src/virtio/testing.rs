@@ -143,15 +143,25 @@ impl Control {
             ))
         }
     }
-    pub fn json(&self) -> String {
-        let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        format!(
-            "{{\"entered\":{},\"calls\":{},\"events\":{:?}}}",
-            self.entered(),
-            self.calls.load(SeqCst),
-            gate.1
-        )
+    /// The schedule's report: whether a call entered, the calls and the event trace.
+    pub fn report(&self) -> ControlReport {
+        ControlReport {
+            entered: self.entered(),
+            calls: self.calls.load(SeqCst),
+            events: self
+                .gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .1
+                .clone(),
+        }
     }
+}
+#[derive(serde::Serialize)]
+pub struct ControlReport {
+    entered: bool,
+    calls: usize,
+    events: Vec<String>,
 }
 pub(super) struct Controlled {
     pub native: Native,
@@ -213,5 +223,38 @@ impl Calls for Controlled {
             "sync-error"
         });
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_matches_the_former_format() {
+        let control = super::Control::new("normal").unwrap();
+        let error: std::io::Result<usize> = Err(std::io::Error::from_raw_os_error(5));
+        for name in [
+            "backend-held",
+            &format!("read-result:{error:?}"),
+            "q\"b\\c\u{1}",
+        ] {
+            control.event(name);
+        }
+        let new = serde_json::to_value(control.report()).unwrap();
+        // The former `{:?}` of the events wrote a control character as `\u{1}`, not JSON: compare without it.
+        let mut gate = control.gate.lock().unwrap();
+        gate.1.pop();
+        let old = format!(
+            "{{\"entered\":{},\"calls\":{},\"events\":{:?}}}",
+            control.entered(),
+            control.calls.load(super::SeqCst),
+            gate.1
+        );
+        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        let mut expected = old;
+        expected["events"]
+            .as_array_mut()
+            .unwrap()
+            .push("q\"b\\c\u{1}".into());
+        assert_eq!(new, expected);
     }
 }

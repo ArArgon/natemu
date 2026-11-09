@@ -257,7 +257,8 @@ mod tests {
         assert_eq!(d.port(0, 0xffff, 2, None), Ok(0xffff)); // wraps to port 0
         assert_eq!(t.lock().unwrap().reads[0], 3); // 0x101 once, 0x102 and 0x103 bytes
         assert!(
-            d.report()
+            serde_json::to_string(&d.report())
+                .unwrap()
                 .contains("{\"port\":\"0x200\",\"reads\":3,\"writes\":1,\"unassigned\":true}")
         );
         d.strict = true;

@@ -25,6 +25,7 @@ mod pic;
 mod pit;
 pub mod pm;
 mod relocation;
+pub mod report;
 mod rtc;
 mod system;
 pub mod uart;

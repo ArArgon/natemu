@@ -252,7 +252,7 @@ impl LostTicks {
 }
 /// A periodic source's rising edges and what became of them (the run report, `--clock-trace`): delivered into a clear
 /// IRR bit, merged into a pending one, taken by nobody, missed in all (merged, here or in an IRR), and reinjected.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, serde::Serialize)]
 pub struct TickStats {
     pub rises: std::sync::atomic::AtomicU64,
     pub fresh: std::sync::atomic::AtomicU64,
@@ -260,20 +260,6 @@ pub struct TickStats {
     pub dropped: std::sync::atomic::AtomicU64,
     pub missed: std::sync::atomic::AtomicU64,
     pub reinjected: std::sync::atomic::AtomicU64,
-}
-impl TickStats {
-    pub fn json(&self) -> String {
-        let l = |a: &std::sync::atomic::AtomicU64| a.load(SeqCst);
-        format!(
-            "{{\"rises\":{},\"fresh\":{},\"coalesced\":{},\"dropped\":{},\"missed\":{},\"reinjected\":{}}}",
-            l(&self.rises),
-            l(&self.fresh),
-            l(&self.coalesced),
-            l(&self.dropped),
-            l(&self.missed),
-            l(&self.reinjected)
-        )
-    }
 }
 /// The board's timed sources, for reports.
 pub struct Board {
@@ -331,4 +317,37 @@ pub fn install(
         rtc: rtc_stats,
         timers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tick_stats_json_matches_the_former_format() {
+        let t = super::TickStats::default();
+        for (n, a) in [
+            &t.rises,
+            &t.fresh,
+            &t.coalesced,
+            &t.dropped,
+            &t.missed,
+            &t.reinjected,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            a.store(n as u64 * 7 + 1, super::SeqCst);
+        }
+        let l = |a: &std::sync::atomic::AtomicU64| a.load(super::SeqCst);
+        let old = format!(
+            "{{\"rises\":{},\"fresh\":{},\"coalesced\":{},\"dropped\":{},\"missed\":{},\"reinjected\":{}}}",
+            l(&t.rises),
+            l(&t.fresh),
+            l(&t.coalesced),
+            l(&t.dropped),
+            l(&t.missed),
+            l(&t.reinjected)
+        );
+        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        assert_eq!(old, serde_json::to_value(&t).unwrap());
+    }
 }
