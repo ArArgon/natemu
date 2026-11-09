@@ -46,6 +46,8 @@ pub struct Backing {
     epoch: u64,
     /// Serializes finite guest-RAM copy windows; epochs are never reused.
     io_epoch: Mutex<u64>,
+    /// Granted windows, for the performance log ([`io::WindowCounts`]).
+    io_counts: io::WindowCounters,
 }
 impl Backing {
     /// The backing's mapping (shared: whoever holds a clone keeps it mapped).
@@ -295,6 +297,7 @@ fn prepare_at_alias(
         ram,
         epoch: unsafe { mach_absolute_time() },
         io_epoch: Mutex::new(0),
+        io_counts: io::WindowCounters::default(),
     })
 }
 /// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no).
@@ -1168,12 +1171,15 @@ impl Server {
             channel,
         })
     }
-    /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`, an
-    /// `UnexpectedEof` one when the server died first (its stdout closed; seen within [`Channel::SLICE_NS`]).
-    #[cfg(any(not(feature = "testing"), test))]
+    /// [`Self::request_with_posted`] with no observer.
+    #[cfg(test)]
     fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<Reply> {
         self.request_with_posted(body, deadline, || Ok(()))
     }
+    /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`, an
+    /// `UnexpectedEof` one when the server died first (its stdout closed; seen within [`Channel::SLICE_NS`]). `posted`
+    /// runs once the request is posted, before its reply is read (the test driver's [`Hook::compiler_posted`]); its error
+    /// is returned without consuming the reply.
     fn request_with_posted(
         &mut self,
         body: &[u8],
@@ -2326,14 +2332,12 @@ impl Compiler {
         _hook.before_compile(self.compiles, server.child.id());
         let began = Instant::now();
         #[cfg(feature = "testing")]
-        let response = {
-            let pid = server.child.id();
-            server.request_with_posted(&body, began + self.deadline, || {
-                _hook.compiler_posted(self.compiles, rip, pid)
-            })
-        };
-        #[cfg(not(feature = "testing"))]
-        let response = server.request(&body, began + self.deadline);
+        let pid = server.child.id();
+        let response = server.request_with_posted(&body, began + self.deadline, || {
+            #[cfg(feature = "testing")]
+            _hook.compiler_posted(self.compiles, rip, pid)?;
+            Ok(())
+        });
         let reply = match response {
             Ok(reply) => reply,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {

@@ -244,7 +244,7 @@ pub(super) fn run(
         let after = b.io_window_status();
         need(
             after.request == before.request
-                && after.written == before.written
+                && after.write_windows == before.write_windows
                 && after.tables_written == before.tables_written,
             "pre-cancel changed epochs",
         )?;

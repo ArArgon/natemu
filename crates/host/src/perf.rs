@@ -4,7 +4,8 @@
 //!
 //! FILE gets one line per process phase (`mark NAME NS`, [`mark`]) and one JSON line per vCPU at its end (`vcpu {..}`:
 //! host time by part and exit kind, the request parts, thread CPU time, its fexc server's CPU time from `wait4`, and the
-//! resident's buckets when the resident was built with its `perf` feature). FILE.vN gets one line per translation request
+//! resident's buckets when the resident was built with its `perf` feature), and one `io {..}` line after the run (the
+//! copy-first I/O windows granted, those that wrote guest RAM and those whose writes hit a page-table page). FILE.vN gets one line per translation request
 //! of vCPU N ([`Recorder::request`]). Times are nanoseconds of `CLOCK_UPTIME_RAW`, which is `mach_absolute_time`: the
 //! guest's CNTVCT (every vCPU's virtual timer offset is 0) and the resident's ticks are on the same clock.
 use crate::Result;

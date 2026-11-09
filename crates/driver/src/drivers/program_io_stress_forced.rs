@@ -22,7 +22,7 @@ fn pending(r: &Run<'_>, before: &WindowStatus, missing: usize) -> Result<WindowS
             && s.request_after == s.request
             && s.released == before.released
             && s.released_after < s.request
-            && s.written == before.written
+            && s.write_windows == before.write_windows
             && s.tables_written == before.tables_written
             && s.acknowledged[missing] < s.request,
         "forced pending epoch/ACK/effects observation failed",
@@ -37,11 +37,11 @@ fn clean(h: &Hooks<'_>, n: usize) -> Result<()> {
 }
 fn event(name: &str, s: &WindowStatus, pending: bool) -> String {
     let row = format!(
-        "{{\"stage\":\"{name}\",\"request\":{},\"released\":{},\"released_after\":{},\"written\":{},\"tables_written\":{},\"ack\":{:?},\"quiet\":{:?},\"copy_pending\":{pending}}}",
+        "{{\"stage\":\"{name}\",\"request\":{},\"released\":{},\"released_after\":{},\"write_windows\":{},\"tables_written\":{},\"ack\":{:?},\"quiet\":{:?},\"copy_pending\":{pending}}}",
         s.request,
         s.released,
         s.released_after,
-        s.written,
+        s.write_windows,
         s.tables_written,
         s.acknowledged,
         s.quiescent
@@ -313,7 +313,7 @@ pub(super) fn run(r: &mut Run<'_>) -> Result<String> {
             need(
                 obs.request == baseline.request + 1
                     && obs.released_after == baseline.released
-                    && obs.written == baseline.written,
+                    && obs.write_windows == baseline.write_windows,
                 "post-CAS hold already effected",
             )?;
             rows.push(event("cancel-lost-after-grant", &obs, true));
@@ -374,7 +374,7 @@ pub(super) fn cancel_epoch(r: &mut Run<'_>) -> Result<String> {
                 observed.request == before.request + 1
                     && observed.request_after == observed.request
                     && observed.released_after == before.released
-                    && observed.written == before.written
+                    && observed.write_windows == before.write_windows
                     && observed.tables_written == before.tables_written
                     && !worker.is_finished(),
                 "announced pre-CAS cancellation observation",
@@ -400,7 +400,7 @@ pub(super) fn cancel_epoch(r: &mut Run<'_>) -> Result<String> {
         after.request == before.request + 1
             && after.released == after.request
             && after.released_after == after.request
-            && after.written == before.written
+            && after.write_windows == before.write_windows
             && after.tables_written == before.tables_written,
         "announced cancellation changed effects or failed release",
     )?;

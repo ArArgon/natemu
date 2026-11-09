@@ -21,10 +21,10 @@ const NEW_PTE: u64 = 0x101_0000 | 0x103;
 
 fn status(s: &WindowStatus) -> String {
     format!(
-        "{{\"request\":{},\"released\":{},\"written\":{},\"acknowledged\":{:?},\"quiescent\":{:?},\"released_after\":{},\"request_after\":{}}}",
+        "{{\"request\":{},\"released\":{},\"write_windows\":{},\"acknowledged\":{:?},\"quiescent\":{:?},\"released_after\":{},\"request_after\":{}}}",
         s.request,
         s.released,
-        s.written,
+        s.write_windows,
         s.acknowledged,
         s.quiescent,
         s.released_after,
@@ -126,7 +126,9 @@ pub(super) fn run(
     ])?;
     let after_write = backing.io_window_status();
     unchanged_quiet(&after_write, &baseline)?;
-    if after_write.request != after_warm.request + 1 || after_write.written != after_write.request {
+    if after_write.request != after_warm.request + 1
+        || after_write.write_windows != after_warm.write_windows + 1
+    {
         return Err("quiet write epoch not published".into());
     }
     record(&mut events, "write", &after_write);
@@ -147,7 +149,9 @@ pub(super) fn run(
     }
     let after_read = backing.io_window_status();
     unchanged_quiet(&after_read, &baseline)?;
-    if after_read.request != after_write.request + 1 || after_read.written != after_write.written {
+    if after_read.request != after_write.request + 1
+        || after_read.write_windows != after_write.write_windows
+    {
         return Err("quiet read-only successor epoch mismatch".into());
     }
     record(&mut events, "read-after-write", &after_read);
@@ -170,7 +174,9 @@ pub(super) fn run(
     }
     let after_cancel = backing.io_window_status();
     unchanged_quiet(&after_cancel, &baseline)?;
-    if after_cancel.request != after_read.request || after_cancel.written != after_read.written {
+    if after_cancel.request != after_read.request
+        || after_cancel.write_windows != after_read.write_windows
+    {
         return Err("pre-canceled quiet request changed epoch".into());
     }
     record(&mut events, "canceled", &after_cancel);

@@ -126,8 +126,8 @@ def judge(report,c):
         need(len(io['announced_cancellations'])==cycles,'every forced cycle has announced cancellation')
         for item in io['announced_cancellations']:
             e=item['completed'];before=item['pending']
-            need(item['cancel_won'] and before['copy_pending'] and before['released']<before['request'] and before['released_after']<before['request'] and before['request']==e['request'] and before['written']==e['written'] and before['tables_written']==e['tables_written'],'announced cancellation pending/effect invariants')
-            need(e['stage']=='announced-canceled' and not e['copy_pending'] and e['released']==e['request']==e['released_after'] and e['tables_written']<=e['written']<e['request'],'canceled epoch release without write')
+            need(item['cancel_won'] and before['copy_pending'] and before['released']<before['request'] and before['released_after']<before['request'] and before['request']==e['request'] and before['write_windows']==e['write_windows'] and before['tables_written']==e['tables_written'],'announced cancellation pending/effect invariants')
+            need(e['stage']=='announced-canceled' and not e['copy_pending'] and e['released']==e['request']==e['released_after'] and e['tables_written']<e['request'],'canceled epoch release without write')
     else:need(io['forced_evidence'] is None and io['announced_cancellations']==[],'no forced hooks in normal stress')
     return errors
 
@@ -178,7 +178,7 @@ def self_check():
     fc=copy.deepcopy(c);fc['forced']=True
     fg=copy.deepcopy(good);fio=fg['io_stress'];fio['forced']=True;fio['instrumented']=True;fio['canceled_epochs']=2
     def event(name,ack=None,q=None):
-        return dict(stage=name,request=10,released=9,released_after=9,written=8,tables_written=8,ack=ack or [9,9],quiet=q or [0,1],copy_pending=True)
+        return dict(stage=name,request=10,released=9,released_after=9,write_windows=8,tables_written=8,ack=ack or [9,9],quiet=q or [0,1],copy_pending=True)
     events=[event('late-shadow-exact-ack',[10,9]),event('real-peer-shadows',[10,9]),
             dict(stage='late-shadow-served',late_before=0,late_after=1,resets_before=1,resets_after=2),
             event('request-before-quiet'),event('withdraw-before-request'),event('request-before-withdraw',q=[1,1]),
@@ -192,7 +192,7 @@ def self_check():
     for index,key,value in [(0,'ack',[9,9]),(1,'ack',[10,10]),(1,'copy_pending',False),(2,'late_after',0),(2,'resets_after',1),
                             (3,'released_after',10),(4,'quiet',[1,1]),(5,'quiet',[0,1]),(7,'ack',[9,9]),(9,'timeouts',[0,1,0]),(9,'hits',[0,1,2])]:
         bad=copy.deepcopy(fg);bad['io_stress']['forced_evidence'][index][key]=value;assert judge(bad,fc),(index,key)
-    for key,value in [('written',9),('tables_written',9),('released_after',9),('copy_pending',True)]:
+    for key,value in [('write_windows',9),('tables_written',9),('released_after',9),('copy_pending',True)]:
         bad=copy.deepcopy(fg);bad['io_stress']['announced_cancellations'][0]['completed'][key]=value;assert judge(bad,fc),key
     bad=copy.deepcopy(fg);bad['io_stress']['announced_cancellations'][0]['cancel_won']=False;assert judge(bad,fc)
     print('N2/N4 assembled; normal, forced-stage, parity, cancellation, progress and RAM negative controls passed; no build/VM')

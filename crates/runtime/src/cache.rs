@@ -100,11 +100,13 @@ fn global<T>(offset: usize) -> *mut T {
 }
 /// Monotonic physical-page dependency, published before a guest page-table load. The host sees
 /// all prior marks after the resident's I/O acknowledgement; no cache/shadow reset clears them.
+/// Already-marked pages cost one load (see [`area::mark_table_page`] for the ordering argument).
 pub fn table_read(gpa: u64) {
     let page = (gpa >> 12) as usize;
     if page < natemu_abi::execution::MAX_GUEST_PAGES {
+        // SAFETY: TABLE_PAGES covers MAX_GUEST_PAGES bits in the live global area; the word is aligned.
         let word = unsafe { AtomicU64::from_ptr(global::<u64>(area::TABLE_PAGES).add(page / 64)) };
-        word.fetch_or(1 << (page % 64), SeqCst);
+        area::mark_table_page(word, 1 << (page % 64));
     }
 }
 /// The word of the mask at global offset `at` (code or writable pages) holding `page`'s peer bits, and their shift.

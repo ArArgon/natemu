@@ -49,18 +49,25 @@ pub enum Transfer<'a> {
     Write { gpa: u64, bytes: &'a [u8] },
 }
 
-fn word(memory: &Memory, offset: usize) -> &AtomicU64 {
-    let p = memory
-        .0
-        .wrapping_add(cache::GLOBAL_OFFSET + cache::IO_WINDOW + offset)
-        .cast();
-    // SAFETY: this is an aligned word in the shared mapping, accessed atomically by both sides.
-    unsafe { AtomicU64::from_ptr(p) }
+/// The shared rendezvous word at `field` (an offset in [`IoWindow`]).
+fn word(memory: &Memory, field: usize) -> &AtomicU64 {
+    global_u64(memory, cache::IO_WINDOW + field)
+}
+fn acknowledged(memory: &Memory, v: usize) -> &AtomicU64 {
+    word(memory, offset_of!(IoWindow, acknowledged) + v * 8)
+}
+fn quiescent(memory: &Memory, v: usize) -> &AtomicU64 {
+    word(memory, offset_of!(IoWindow, quiescent) + v * 8)
 }
 
 fn acknowledged_or_halted(memory: &Memory, v: usize, epoch: u64) -> bool {
-    word(memory, offset_of!(IoWindow, acknowledged) + v * 8).load(SeqCst) == epoch
-        || word(memory, offset_of!(IoWindow, quiescent) + v * 8).load(SeqCst) == 1
+    acknowledged(memory, v).load(SeqCst) == epoch || quiescent(memory, v).load(SeqCst) == 1
+}
+
+/// Whether some resident has ever walked `page` as a page table ([`cache::TABLE_PAGES`]).
+fn table_page(memory: &Memory, page: u64) -> bool {
+    let index = page as usize / 64;
+    global_u64(memory, cache::TABLE_PAGES + index * 8).load(SeqCst) & (1 << (page % 64)) != 0
 }
 
 /// Called only inside a granted window, before any RAM mutation. All residents are parked:
@@ -69,10 +76,8 @@ fn acknowledged_or_halted(memory: &Memory, v: usize, epoch: u64) -> bool {
 fn invalidate_page(memory: &Memory, page: usize, n: usize) {
     let (index, shift) = cache::mask_location(page);
     let mask = global_u64(memory, cache::CODE_PAGES + index * 8);
-    let peers = cache::mask_peers(
-        mask.fetch_and(!(cache::CpuMask::MAX << shift), SeqCst),
-        shift,
-    );
+    let cleared = mask.fetch_and(!(cache::CpuMask::MAX << shift), SeqCst);
+    let peers = cache::mask_peers(cleared, shift);
     for v in (0..n).filter(|v| peers & (1 << v) != 0) {
         record_word(memory, v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
         let summary = cache::RECORDS
@@ -100,38 +105,121 @@ impl Drop for Release<'_> {
     }
 }
 
+/// Host-side window counts for the run's performance log. Page-table marks are never cleared,
+/// so as the guest recycles former page-table pages for data, more write windows overlap them
+/// and force every vCPU to drop its translations; `table_writes` against `writes` shows that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowCounts {
+    /// Windows that won their grant and copied at least one byte.
+    pub granted: u64,
+    /// Granted windows with at least one guest-RAM write.
+    pub writes: u64,
+    /// Granted windows whose writes overlapped a page ever walked as a page table.
+    pub table_writes: u64,
+}
+impl WindowCounts {
+    /// One `io {...}` JSON line for [`crate::perf::line`].
+    pub fn perf_line(&self) -> String {
+        format!(
+            "io {{\"windows\":{},\"write_windows\":{},\"table_windows\":{}}}",
+            self.granted, self.writes, self.table_writes
+        )
+    }
+}
+/// [`WindowCounts`] as the coordinator updates them. Only the window holder writes (under the
+/// epoch lock); readers never take that lock, so observing a pending window cannot block.
+#[derive(Default)]
+pub(crate) struct WindowCounters {
+    granted: AtomicU64,
+    writes: AtomicU64,
+    table_writes: AtomicU64,
+}
+
 /// Read-only test observation, not a transactionally consistent snapshot of the words.
 #[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct WindowStatus {
     pub request: u64,
     pub released: u64,
-    pub written: u64,
     pub tables_written: u64,
     pub acknowledged: Vec<u64>,
     pub quiescent: Vec<u64>,
+    /// Host count of granted windows that wrote guest RAM ([`WindowCounts::writes`]).
+    pub write_windows: u64,
     pub released_after: u64,
     pub request_after: u64,
+}
+
+/// One validated, nonempty transfer, resolved to host addresses before the window opens.
+struct Span {
+    gpa: u64,
+    guest: *mut u8,
+    host: *mut u8,
+    len: usize,
+    write: bool,
+}
+
+/// Validate the whole batch before any effect: bounded span count and bytes, every span wholly
+/// inside installed guest RAM. Zero-length transfers are dropped. The mapping lives as long as
+/// the Backing; guest page tables, permissions and A/D bits are not DMA routing.
+fn resolve(ram: &GuestRam, transfers: &mut [Transfer<'_>]) -> Result<Vec<Span>> {
+    if transfers.len() > MAX_SPANS {
+        return Err("I/O window has too many spans".into());
+    }
+    let mut spans = Vec::with_capacity(transfers.len());
+    let mut total = 0usize;
+    for transfer in transfers.iter_mut() {
+        let (gpa, len, host, write) = match transfer {
+            Transfer::Read { gpa, bytes } => (*gpa, bytes.len(), bytes.as_mut_ptr(), false),
+            Transfer::Write { gpa, bytes } => (*gpa, bytes.len(), bytes.as_ptr().cast_mut(), true),
+        };
+        if len == 0 {
+            continue;
+        }
+        total = total
+            .checked_add(len)
+            .filter(|&n| n <= MAX_BYTES)
+            .ok_or("I/O window exceeds byte bound")?;
+        let guest = ram
+            .range(gpa, len as u64)
+            .ok_or("I/O span is not wholly installed guest RAM")?;
+        spans.push(Span {
+            gpa,
+            guest,
+            host,
+            len,
+            write,
+        });
+    }
+    Ok(spans)
 }
 
 impl Backing {
     #[cfg(feature = "testing")]
     pub fn io_window_status(&self) -> WindowStatus {
+        let memory = &self.memory;
         WindowStatus {
-            request: word(&self.memory, offset_of!(IoWindow, request)).load(SeqCst),
-            released: word(&self.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            written: word(&self.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            tables_written: word(&self.memory, offset_of!(IoWindow, tables_written)).load(SeqCst),
+            request: word(memory, offset_of!(IoWindow, request)).load(SeqCst),
+            released: word(memory, offset_of!(IoWindow, released)).load(SeqCst),
+            tables_written: word(memory, offset_of!(IoWindow, tables_written)).load(SeqCst),
             acknowledged: (0..self.n)
-                .map(|v| {
-                    word(&self.memory, offset_of!(IoWindow, acknowledged) + v * 8).load(SeqCst)
-                })
+                .map(|v| acknowledged(memory, v).load(SeqCst))
                 .collect(),
             quiescent: (0..self.n)
-                .map(|v| word(&self.memory, offset_of!(IoWindow, quiescent) + v * 8).load(SeqCst))
+                .map(|v| quiescent(memory, v).load(SeqCst))
                 .collect(),
-            released_after: word(&self.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            request_after: word(&self.memory, offset_of!(IoWindow, request)).load(SeqCst),
+            write_windows: self.io_window_counts().writes,
+            released_after: word(memory, offset_of!(IoWindow, released)).load(SeqCst),
+            request_after: word(memory, offset_of!(IoWindow, request)).load(SeqCst),
+        }
+    }
+    /// Windows granted so far; a window in progress may or may not be counted yet.
+    pub fn io_window_counts(&self) -> WindowCounts {
+        let counters = &self.io_counts;
+        WindowCounts {
+            granted: counters.granted.load(Relaxed),
+            writes: counters.writes.load(Relaxed),
+            table_writes: counters.table_writes.load(Relaxed),
         }
     }
     /// Copy a bounded ordered batch after every configured vCPU reaches a resident safe boundary.
@@ -179,12 +267,16 @@ impl Backing {
             if acknowledged { Ok(true) } else { kick(v) }
         })
     }
+
+    /// The window protocol: validate, take the epoch lock, announce an epoch, wait for every
+    /// participant, grant, invalidate written pages, copy, release. `kick(v, acknowledged)` must
+    /// return false once vCPU `v` has ended; it rings `v` only when not yet acknowledged.
     fn copy_with_permit(
         &self,
         timeout: Duration,
         transfers: &mut [Transfer<'_>],
         permit: &CopyPermit,
-        mut kick: impl FnMut(usize, bool) -> Result<bool>,
+        kick: impl FnMut(usize, bool) -> Result<bool>,
     ) -> Result<()> {
         let _cancel = CancelPending(permit);
         if permit.state.load(SeqCst) != 0 {
@@ -193,35 +285,7 @@ impl Backing {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or("I/O window timeout overflow")?;
-        if transfers.len() > MAX_SPANS {
-            return Err("I/O window has too many spans".into());
-        }
-        // Resolve the ENTIRE batch before announcing a window or making a copy. The mapping lives
-        // as long as this Backing; guest page tables, permissions and A/D bits are not DMA routing.
-        let mut spans = Vec::with_capacity(transfers.len());
-        let mut total = 0usize;
-        let mut writes = false;
-        for transfer in transfers.iter_mut() {
-            let (gpa, len, host, write) = match transfer {
-                Transfer::Read { gpa, bytes } => (*gpa, bytes.len(), bytes.as_mut_ptr(), false),
-                Transfer::Write { gpa, bytes } => {
-                    (*gpa, bytes.len(), bytes.as_ptr().cast_mut(), true)
-                }
-            };
-            if len == 0 {
-                continue;
-            }
-            total = total
-                .checked_add(len)
-                .filter(|&n| n <= MAX_BYTES)
-                .ok_or("I/O window exceeds byte bound")?;
-            let guest = self
-                .ram
-                .range(gpa, len as u64)
-                .ok_or("I/O span is not wholly installed guest RAM")?;
-            spans.push((guest, host, len, write, gpa));
-            writes |= write;
-        }
+        let spans = resolve(&self.ram, transfers)?;
         if spans.is_empty() {
             return if permit.grant() {
                 Ok(())
@@ -229,21 +293,7 @@ impl Backing {
                 Err("I/O window canceled".into())
             };
         }
-        let mut sequence = loop {
-            if permit.canceled() {
-                return Err("I/O window canceled".into());
-            }
-            match self.io_epoch.try_lock() {
-                Ok(lock) => break lock,
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err("I/O window coordinator poisoned".into());
-                }
-                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::yield_now()
-                }
-                Err(_) => return Err("I/O window coordinator timed out".into()),
-            }
-        };
+        let mut sequence = self.lock_epoch(permit, deadline)?;
         let epoch = sequence
             .checked_add(1)
             .ok_or("I/O window epoch exhausted")?;
@@ -255,13 +305,79 @@ impl Backing {
         word(&self.memory, offset_of!(IoWindow, request)).store(epoch, SeqCst);
         // Pair with HLT withdrawal: either we see it leave, or it sees our request before RAM access.
         unsafe { std::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        self.admit(epoch, permit, deadline, kick)?;
+        #[cfg(feature = "io-test-hooks")]
+        super::io_test::point(&self.memory, cache::io_test::BEFORE_GRANT);
+        if !permit.grant() {
+            return Err("I/O window canceled or permit already consumed".into());
+        }
+        #[cfg(feature = "io-test-hooks")]
+        super::io_test::point(&self.memory, cache::io_test::AFTER_GRANT);
+        unsafe { std::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+        let counters = &self.io_counts;
+        counters.granted.fetch_add(1, Relaxed);
+        if spans.iter().any(|span| span.write) {
+            counters.writes.fetch_add(1, Relaxed);
+            if self.invalidate_written(&spans, epoch) {
+                counters.table_writes.fetch_add(1, Relaxed);
+            }
+        }
+        for span in &spans {
+            // SAFETY: the complete installed-RAM ranges were checked above; all residents have
+            // completed their accesses and are parked. Host buffers are borrowed for this call,
+            // cannot overlap guest backing in safe code, and have the checked lengths. Copies are
+            // ordered; no exclusive Rust reference is manufactured over guest memory.
+            unsafe {
+                if span.write {
+                    std::ptr::copy_nonoverlapping(span.host, span.guest, span.len);
+                } else {
+                    std::ptr::copy_nonoverlapping(span.guest, span.host, span.len);
+                }
+            }
+        }
+        drop(release);
+        Ok(())
+    }
+
+    /// Take the window sequence, polling so cancellation and the deadline still apply.
+    fn lock_epoch(
+        &self,
+        permit: &CopyPermit,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, u64>> {
+        loop {
+            if permit.canceled() {
+                return Err("I/O window canceled".into());
+            }
+            match self.io_epoch.try_lock() {
+                Ok(lock) => return Ok(lock),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("I/O window coordinator poisoned".into());
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                Err(_) => return Err("I/O window coordinator timed out".into()),
+            }
+        }
+    }
+
+    /// Ring every participant that has not yet acknowledged `epoch`, then wait until each has
+    /// acknowledged or is halted. A resident in HLT may stay asleep: its withdrawal checkpoints
+    /// before any guest access. An ended participant refuses the window.
+    fn admit(
+        &self,
+        epoch: u64,
+        permit: &CopyPermit,
+        deadline: Instant,
+        mut kick: impl FnMut(usize, bool) -> Result<bool>,
+    ) -> Result<()> {
         for v in 0..self.n {
             if permit.canceled() {
                 return Err("I/O window canceled".into());
             }
-            // A resident in HLT may stay asleep; withdrawal must checkpoint before guest access.
-            let acknowledged = acknowledged_or_halted(&self.memory, v, epoch);
-            if !kick(v, acknowledged)? {
+            let ready = acknowledged_or_halted(&self.memory, v, epoch);
+            if !kick(v, ready)? {
                 return Err(format!("I/O window vCPU {v} has ended"));
             }
         }
@@ -273,54 +389,31 @@ impl Backing {
                 return Err("I/O window acknowledgement timed out".into());
             }
             if (0..self.n).all(|v| acknowledged_or_halted(&self.memory, v, epoch)) {
-                break;
+                return Ok(());
             }
             std::thread::yield_now();
         }
-        #[cfg(feature = "io-test-hooks")]
-        super::io_test::point(&self.memory, cache::io_test::BEFORE_GRANT);
-        if !permit.grant() {
-            return Err("I/O window canceled or permit already consumed".into());
-        }
-        #[cfg(feature = "io-test-hooks")]
-        super::io_test::point(&self.memory, cache::io_test::AFTER_GRANT);
-        unsafe { std::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
-        if writes {
-            word(&self.memory, offset_of!(IoWindow, written)).store(epoch, SeqCst);
-            for &(_, _, len, write, gpa) in &spans {
-                if write {
-                    // Nonempty installed-RAM spans were checked for overflow above. At most
-                    // MAX_BYTES/4096 + 2*MAX_SPANS page visits, including repeated pages.
-                    for page in (gpa >> 12)..=((gpa + len as u64 - 1) >> 12) {
-                        // All residents are quiescent: table marks cannot grow until release.
-                        if global_u64(&self.memory, cache::TABLE_PAGES + page as usize / 64 * 8)
-                            .load(SeqCst)
-                            & (1 << (page % 64))
-                            != 0
-                        {
-                            word(&self.memory, offset_of!(IoWindow, tables_written))
-                                .store(epoch, SeqCst);
-                        }
-                        invalidate_page(&self.memory, page as usize, self.n);
-                    }
+    }
+
+    /// Post code invalidations for every page a write span touches and, if any of them was ever
+    /// walked as a page table, publish `epoch` as `tables_written`. Returns whether it did. All
+    /// residents are quiescent, so table marks cannot grow until release.
+    fn invalidate_written(&self, spans: &[Span], epoch: u64) -> bool {
+        let mut tables = false;
+        for span in spans.iter().filter(|span| span.write) {
+            // Nonempty installed-RAM spans were checked for overflow in `resolve`. At most
+            // MAX_BYTES/4096 + 2*MAX_SPANS page visits, including repeated pages.
+            let first = span.gpa >> 12;
+            let last = (span.gpa + span.len as u64 - 1) >> 12;
+            for page in first..=last {
+                if table_page(&self.memory, page) {
+                    word(&self.memory, offset_of!(IoWindow, tables_written)).store(epoch, SeqCst);
+                    tables = true;
                 }
+                invalidate_page(&self.memory, page as usize, self.n);
             }
         }
-        for &(guest, host, len, write, _) in &spans {
-            // SAFETY: the complete installed-RAM ranges were checked above; all residents have
-            // completed their accesses and are parked. Host buffers are borrowed for this call,
-            // cannot overlap guest backing in safe code, and have the checked lengths. Copies are
-            // ordered; no exclusive Rust reference is manufactured over guest memory.
-            unsafe {
-                if write {
-                    std::ptr::copy_nonoverlapping(host, guest, len);
-                } else {
-                    std::ptr::copy_nonoverlapping(guest, host, len);
-                }
-            }
-        }
-        drop(release);
-        Ok(())
+        tables
     }
 }
 
@@ -340,6 +433,7 @@ mod tests {
             ram,
             epoch: 0,
             io_epoch: Mutex::new(0),
+            io_counts: WindowCounters::default(),
         }
     }
     fn read(b: &Backing, at: usize, len: usize) -> Vec<u8> {
@@ -348,9 +442,12 @@ mod tests {
             std::slice::from_raw_parts(b.ram.range(at as u64, len as u64).unwrap(), len).to_vec()
         }
     }
+    fn load(b: &Backing, field: usize) -> u64 {
+        word(&b.memory, field).load(SeqCst)
+    }
     fn acknowledge(b: &Backing, v: usize) -> Result<bool> {
-        let epoch = word(&b.memory, offset_of!(IoWindow, request)).load(SeqCst);
-        word(&b.memory, offset_of!(IoWindow, acknowledged) + v * 8).store(epoch, SeqCst);
+        let epoch = load(b, offset_of!(IoWindow, request));
+        acknowledged(&b.memory, v).store(epoch, SeqCst);
         Ok(true)
     }
     const BUDGET: Duration = Duration::from_secs(1);
@@ -359,7 +456,7 @@ mod tests {
     fn halted_participants_admit_multiple_windows_without_advancing_acknowledgements() {
         let b = backing(2);
         for v in 0..2 {
-            word(&b.memory, offset_of!(IoWindow, quiescent) + v * 8).store(1, SeqCst);
+            quiescent(&b.memory, v).store(1, SeqCst);
         }
         global_u64(&b.memory, cache::TABLE_PAGES).store(1, SeqCst);
         let mut checked = 0;
@@ -397,26 +494,17 @@ mod tests {
             "terminal checks still run for every participant"
         );
         assert_eq!(bytes, [7]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            2
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, tables_written)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 2);
+        assert_eq!(load(&b, offset_of!(IoWindow, tables_written)), 1);
         for v in 0..2 {
-            assert_eq!(
-                word(&b.memory, offset_of!(IoWindow, acknowledged) + v * 8).load(SeqCst),
-                0
-            );
+            assert_eq!(acknowledged(&b.memory, v).load(SeqCst), 0);
         }
     }
 
     #[test]
     fn withdrawing_halt_requires_an_acknowledgement_before_grant() {
         let b = backing(2);
-        let quiet = word(&b.memory, offset_of!(IoWindow, quiescent) + 8);
+        let quiet = quiescent(&b.memory, 1);
         quiet.store(1, SeqCst);
         let (posted, receive) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
@@ -442,10 +530,7 @@ mod tests {
             });
             receive.recv_timeout(BUDGET).unwrap();
             assert_eq!(read(&b, 0, 1), [0]);
-            assert_eq!(
-                word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-                0
-            );
+            assert_eq!(load(&b, offset_of!(IoWindow, released)), 0);
             acknowledge(&b, 1).unwrap();
             writer.join().unwrap().unwrap();
         });
@@ -455,7 +540,7 @@ mod tests {
     #[test]
     fn halted_but_ended_participant_cannot_admit_a_copy() {
         let b = backing(1);
-        word(&b.memory, offset_of!(IoWindow, quiescent)).store(1, SeqCst);
+        quiescent(&b.memory, 0).store(1, SeqCst);
         let error = b
             .copy_with_permit(
                 BUDGET,
@@ -472,10 +557,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("has ended"));
         assert_eq!(read(&b, 0, 1), [0]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
     }
 
     #[test]
@@ -496,10 +578,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(read(&b, 4, 2), [0, 0]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, request)).load(SeqCst),
-            0
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, request)), 0);
         let mut overflow = [Transfer::Read {
             gpa: u64::MAX,
             bytes: &mut [0; 2],
@@ -538,14 +617,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result, [0, 1, 2, 8, 9]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
+        assert_eq!(b.io_window_counts().writes, 1);
         let mut snapshot = [0; 5];
         b.copy_with(
             BUDGET,
@@ -557,12 +630,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot, result);
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 2);
         assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            2
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
+            b.io_window_counts().writes,
             1,
             "read-only release does not request code flush"
         );
@@ -696,6 +766,16 @@ mod tests {
             4,
             "ordinary write must not advance table epoch"
         );
+        let counts = WindowCounts {
+            granted: 5,
+            writes: 4,
+            table_writes: 2,
+        };
+        assert_eq!(
+            b.io_window_counts(),
+            counts,
+            "only page-table overlaps count"
+        );
     }
 
     #[test]
@@ -718,14 +798,8 @@ mod tests {
         assert_eq!(read(&b, 0, 1), [0]);
         assert_eq!(global_u64(&b.memory, cache::CODE_PAGES).load(SeqCst), 1);
         assert_eq!(record_word(&b.memory, 0, None).load(SeqCst), 0);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            0
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, tables_written)).load(SeqCst),
-            0
-        );
+        assert_eq!(b.io_window_counts().writes, 0);
+        assert_eq!(load(&b, offset_of!(IoWindow, tables_written)), 0);
     }
 
     #[test]
@@ -744,14 +818,8 @@ mod tests {
             .is_err()
         );
         assert_eq!(read(&b, 0, 1), [0]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            0
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
+        assert_eq!(b.io_window_counts().writes, 0);
         acknowledge(&b, 1).unwrap(); // late arrival after cancellation
         assert!(
             b.copy_with(Duration::from_millis(1), &mut ops, |_| Ok(true))
@@ -762,17 +830,11 @@ mod tests {
             [0],
             "old acknowledgements cannot authorize new copies"
         );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            2
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 2);
         b.copy_with(BUDGET, &mut ops, |v| acknowledge(&b, v))
             .unwrap();
         assert_eq!(read(&b, 0, 1), [5]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            3
-        );
+        assert_eq!(b.io_window_counts().writes, 1);
         let mut snapshot = [0];
         b.copy_with(
             BUDGET,
@@ -784,14 +846,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot, [5]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            3
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            4
-        );
+        assert_eq!(b.io_window_counts().writes, 1);
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 4);
     }
 
     #[test]
@@ -849,14 +905,8 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(seen, [(0, false), (1, true)]);
         assert_eq!(read(&b, 0, 1), [0]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            0
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
+        assert_eq!(b.io_window_counts().writes, 0);
     }
 
     #[test]
@@ -874,18 +924,12 @@ mod tests {
             })
             .is_err()
         );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             b.copy_with(BUDGET, &mut ops, |_| panic!("injected kick panic"))
         }));
         assert!(panic.is_err());
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            2
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 2);
         assert_eq!(read(&b, 0, 1), [0]);
         assert!(
             b.copy_with(BUDGET, &mut ops, |_| panic!("poison must prevent new kick"))
@@ -909,10 +953,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(read(&b, 0, 1), [0]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
         let _owner = b.io_epoch.lock().unwrap();
         assert!(
             b.copy_with(Duration::from_millis(1), &mut ops, |_| panic!(
@@ -920,14 +961,8 @@ mod tests {
             ))
             .is_err()
         );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, request)).load(SeqCst),
-            1
-        );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, request)), 1);
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
         assert_eq!(read(&b, 0, 1), [0]);
     }
 
@@ -965,23 +1000,14 @@ mod tests {
                 )
             });
             receive.recv_timeout(BUDGET).unwrap();
-            assert_eq!(
-                word(&b.memory, offset_of!(IoWindow, request)).load(SeqCst),
-                2
-            );
+            assert_eq!(load(&b, offset_of!(IoWindow, request)), 2);
             assert_eq!(read(&b, 0, 1), [3]);
-            assert_eq!(
-                word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-                1
-            );
+            assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
             acknowledge(&b, 1).unwrap(); // peer finished its flush and entered the next checkpoint
             second.join().unwrap().unwrap();
         });
         assert_eq!(read(&b, 0, 1), [7]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            2
-        );
+        assert_eq!(b.io_window_counts().writes, 2);
     }
 
     #[test]
@@ -1021,10 +1047,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, request)).load(SeqCst),
-            0
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, request)), 0);
         assert_eq!(read(&b, 0, 1), [0]);
     }
 
@@ -1046,10 +1069,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, request)).load(SeqCst),
-            0
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, request)), 0);
         assert_eq!(read(&b, 0, 1), [0]);
     }
     #[test]
@@ -1073,10 +1093,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, released)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
         assert_eq!(read(&b, 0, 1), [0]);
     }
     #[test]
@@ -1102,10 +1119,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(read(&b, 0, 1), [0]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, written)).load(SeqCst),
-            0
-        );
+        assert_eq!(b.io_window_counts().writes, 0);
     }
     #[test]
     fn completed_grant_cannot_be_canceled_or_reused() {
@@ -1135,10 +1149,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(read(&b, 0, 1), [9]);
-        assert_eq!(
-            word(&b.memory, offset_of!(IoWindow, request)).load(SeqCst),
-            1
-        );
+        assert_eq!(load(&b, offset_of!(IoWindow, request)), 1);
     }
     #[test]
     fn timed_out_permit_cannot_be_reused() {
