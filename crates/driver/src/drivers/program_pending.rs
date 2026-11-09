@@ -7,6 +7,7 @@ use natemu::{
     },
     vm::Machine,
 };
+use serde_json::{Value, json};
 use std::{
     sync::{
         Arc, Condvar, Mutex,
@@ -24,7 +25,7 @@ struct State {
     posted: [bool; 2],
     released: [bool; 2],
     aborted: bool,
-    events: Vec<String>,
+    events: Vec<Value>,
 }
 pub(super) struct Control {
     state: Mutex<State>,
@@ -39,38 +40,36 @@ impl Control {
             start: Instant::now(),
         })
     }
-    fn record(&self, s: &mut State, event: &str, fields: &str) {
+    /// Appends `{"event": event, "ns": .., ..fields}` (the first 128 events).
+    fn record(&self, s: &mut State, event: &str, fields: Value) {
         if s.events.len() < 128 {
-            s.events.push(format!(
-                "{{\"event\":\"{event}\",\"ns\":{}{fields}}}",
-                self.start.elapsed().as_nanos()
-            ));
+            let mut entry = json!({"event": event, "ns": self.start.elapsed().as_nanos() as u64});
+            if let (Some(e), Value::Object(f)) = (entry.as_object_mut(), fields) {
+                e.extend(f);
+            }
+            s.events.push(entry);
         }
     }
-    fn event(&self, event: &str, fields: &str) {
+    fn event(&self, event: &str, fields: Value) {
         self.record(
             &mut self.state.lock().unwrap_or_else(|e| e.into_inner()),
             event,
             fields,
         );
     }
-    pub(super) fn json(&self) -> String {
+    pub(super) fn json(&self) -> Value {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        format!(
-            "{{\"posted\":{:?},\"events\":[{}]}}",
-            s.posted,
-            s.events.join(",")
-        )
+        json!({"posted": s.posted, "events": s.events})
     }
     fn arm(&self, stage: usize) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.armed = Some(stage);
-        self.record(&mut s, "armed", &format!(",\"stage\":{stage}"));
+        self.record(&mut s, "armed", json!({"stage": stage}));
     }
     fn release(&self, stage: usize) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.released[stage] = true;
-        self.record(&mut s, "released-consumer", &format!(",\"stage\":{stage}"));
+        self.record(&mut s, "released-consumer", json!({"stage": stage}));
         self.wake.notify_all();
     }
     pub(super) fn abort(&self) {
@@ -87,7 +86,7 @@ impl Control {
             self.record(
                 &mut s,
                 "posted-after-release",
-                &format!(",\"stage\":{stage},\"rip\":{rip},\"count\":{count},\"pid\":{pid}"),
+                json!({"stage": stage, "rip": rip, "count": count, "pid": pid}),
             );
             return Ok(());
         }
@@ -100,7 +99,7 @@ impl Control {
         self.record(
             &mut s,
             "posted-held",
-            &format!(",\"stage\":{stage},\"rip\":{rip},\"count\":{count},\"pid\":{pid}"),
+            json!({"stage": stage, "rip": rip, "count": count, "pid": pid}),
         );
         self.wake.notify_all();
         let (mut s, _) = self
@@ -115,7 +114,7 @@ impl Control {
                 "pending compiler observer aborted or timed out",
             ));
         }
-        self.record(&mut s, "resume-consumption", &format!(",\"stage\":{stage}"));
+        self.record(&mut s, "resume-consumption", json!({"stage": stage}));
         Ok(())
     }
     fn wait_posted(&self, stage: usize) -> Result<()> {
@@ -133,11 +132,15 @@ impl Control {
         }
     }
 }
-fn status(s: &WindowStatus) -> String {
-    format!(
-        "{{\"request\":{},\"released\":{},\"write_windows\":{},\"acknowledged\":{:?},\"released_after\":{},\"request_after\":{}}}",
-        s.request, s.released, s.write_windows, s.acknowledged, s.released_after, s.request_after
-    )
+fn status(s: &WindowStatus) -> Value {
+    json!({
+        "request": s.request,
+        "released": s.released,
+        "write_windows": s.write_windows,
+        "acknowledged": s.acknowledged,
+        "released_after": s.released_after,
+        "request_after": s.request_after,
+    })
 }
 struct Abort<'a>(&'a Control);
 impl Drop for Abort<'_> {
@@ -153,7 +156,7 @@ pub(super) fn run(
     stops: &Stops,
     started: &[AtomicBool],
     ended: &AtomicBool,
-) -> Result<String> {
+) -> Result<Value> {
     use Transfer::{Read, Write};
     let _abort = Abort(control);
     let start = Instant::now();
@@ -245,7 +248,15 @@ pub(super) fn run(
                     let s = backing.io_window_status();
                     let copy_pending = !worker.is_finished();
                     if pending(&s) && copy_pending {
-                        control.event("pending-window", &format!(",\"stage\":{stage},\"copy_pending\":{copy_pending},\"prior\":{},\"status\":{}", status(&prior), status(&s)));
+                        control.event(
+                            "pending-window",
+                            json!({
+                                "stage": stage,
+                                "copy_pending": copy_pending,
+                                "prior": status(&prior),
+                                "status": status(&s),
+                            }),
+                        );
                         return Ok(s);
                     }
                     std::thread::sleep(Duration::from_millis(1));
@@ -262,10 +273,7 @@ pub(super) fn run(
                 let copy_pending = !worker.is_finished();
                 control.event(
                     "held-recheck",
-                    &format!(
-                        ",\"stage\":{stage},\"copy_pending\":{copy_pending},\"status\":{}",
-                        status(&s)
-                    ),
+                    json!({"stage": stage, "copy_pending": copy_pending, "status": status(&s)}),
                 );
                 if !pending(&s)
                     || !copy_pending
@@ -282,7 +290,19 @@ pub(super) fn run(
                 .join()
                 .unwrap_or_else(|_| (Err("copy owner panicked".into()), 0));
             let finished = backing.io_window_status();
-            control.event("window-result", &format!(",\"stage\":{stage},\"ok\":{},\"marker\":{marker},\"ack_timeout\":{},\"status\":{}", result.is_ok(), result.as_ref().is_err_and(|e| e == "I/O window acknowledgement timed out"), status(&finished)));
+            let ack_timeout = result
+                .as_ref()
+                .is_err_and(|e| e == "I/O window acknowledgement timed out");
+            control.event(
+                "window-result",
+                json!({
+                    "stage": stage,
+                    "ok": result.is_ok(),
+                    "marker": marker,
+                    "ack_timeout": ack_timeout,
+                    "status": status(&finished),
+                }),
+            );
             if stage == 0 {
                 control.release(stage);
             }
@@ -322,7 +342,7 @@ pub(super) fn run(
             if sentinel != [0xa5] || function != 1u32.to_le_bytes() {
                 return Err("timeout safe-read oracle failed".into());
             }
-            control.event("timeout-safe-read", ",\"sentinel\":165,\"function\":1");
+            control.event("timeout-safe-read", json!({"sentinel": 165, "function": 1}));
             loop {
                 snapshot(&mut bytes)?;
                 if bytes[0x20] == 1 {
@@ -366,6 +386,109 @@ pub(super) fn run(
         gpa: BASE + 8,
         bytes: &[1],
     }])?;
-    control.event("complete", &format!(",\"snapshots\":64,\"before\":{before:?},\"after\":{after:?},\"code\":[2,2],\"markers\":[1,1]"));
+    control.event(
+        "complete",
+        json!({
+            "snapshots": 64,
+            "before": before,
+            "after": after,
+            "code": [2, 2],
+            "markers": [1, 1],
+        }),
+    );
     Ok(control.json())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The events, status and result against the former format strings, over the same values.
+    #[test]
+    fn json_matches_the_former_format() {
+        let w = WindowStatus {
+            request: 3,
+            released: 2,
+            tables_written: 9,
+            acknowledged: vec![3, 2],
+            quiescent: vec![0, 1],
+            write_windows: 1,
+            released_after: 2,
+            request_after: 3,
+        };
+        let old_status = format!(
+            "{{\"request\":{},\"released\":{},\"write_windows\":{},\"acknowledged\":{:?},\"released_after\":{},\"request_after\":{}}}",
+            w.request,
+            w.released,
+            w.write_windows,
+            w.acknowledged,
+            w.released_after,
+            w.request_after
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&old_status).unwrap(),
+            status(&w)
+        );
+        let control = Control::new();
+        let (stage, rip, count, pid, copy_pending, marker) =
+            (1usize, 0x120000u64, 4u64, 77u32, true, 2u64);
+        let (before, after) = ([1u64, 2], [3u64, 4]);
+        let s = status(&w);
+        let cases: Vec<(&str, String, Value)> = vec![
+            (
+                "armed",
+                format!(",\"stage\":{stage}"),
+                json!({"stage": stage}),
+            ),
+            (
+                "posted-held",
+                format!(",\"stage\":{stage},\"rip\":{rip},\"count\":{count},\"pid\":{pid}"),
+                json!({"stage": stage, "rip": rip, "count": count, "pid": pid}),
+            ),
+            (
+                "pending-window",
+                format!(
+                    ",\"stage\":{stage},\"copy_pending\":{copy_pending},\"prior\":{},\"status\":{}",
+                    old_status, old_status
+                ),
+                json!({"stage": stage, "copy_pending": copy_pending, "prior": s, "status": s}),
+            ),
+            (
+                "window-result",
+                format!(
+                    ",\"stage\":{stage},\"ok\":{},\"marker\":{marker},\"ack_timeout\":{},\"status\":{}",
+                    true, false, old_status
+                ),
+                json!({"stage": stage, "ok": true, "marker": marker, "ack_timeout": false, "status": s}),
+            ),
+            (
+                "timeout-safe-read",
+                ",\"sentinel\":165,\"function\":1".into(),
+                json!({"sentinel": 165, "function": 1}),
+            ),
+            (
+                "complete",
+                format!(
+                    ",\"snapshots\":64,\"before\":{before:?},\"after\":{after:?},\"code\":[2,2],\"markers\":[1,1]"
+                ),
+                json!({"snapshots": 64, "before": before, "after": after, "code": [2, 2], "markers": [1, 1]}),
+            ),
+        ];
+        let mut old_events = Vec::new();
+        for (event, old_fields, fields) in cases {
+            control.event(event, fields);
+            let ns = control.state.lock().unwrap().events.last().unwrap()["ns"].clone();
+            old_events.push(format!(
+                "{{\"event\":\"{event}\",\"ns\":{}{old_fields}}}",
+                ns
+            ));
+        }
+        control.state.lock().unwrap().posted = [true, false];
+        let old = format!(
+            "{{\"posted\":{:?},\"events\":[{}]}}",
+            [true, false],
+            old_events.join(",")
+        );
+        assert_eq!(serde_json::from_str::<Value>(&old).unwrap(), control.json());
+    }
 }

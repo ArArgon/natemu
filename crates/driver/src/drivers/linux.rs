@@ -40,9 +40,10 @@
 use super::super::*;
 use crate::boot::{self, Inputs, Layout, Loaded};
 use crate::execution::{self, Stop};
+use natemu::report::{Hex, hexes};
 use natemu_abi::execution::{self as exec, Cpu, State};
 use natemu_abi::guest_memory::GuestRam;
-use std::fmt::Write as _;
+use serde::Serialize;
 
 /// Largest image or initrd read (the protocol's 32-bit sizes).
 const MAX_INPUT: usize = 1 << 32;
@@ -217,7 +218,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             write_dump(path, &guest, &loaded)?;
         }
         let _ = (guest, &mut host); // `guest` is not used past here; `host` lives to the end of this block
-        println!("{}}}", placement(&loaded, &layout));
+        let placement = Placement::new(&loaded, &layout);
+        println!("{}", serde_json::to_string(&placement).unwrap());
         return Ok(());
     }
 
@@ -321,29 +323,46 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 .map_or(("none".into(), 0), |(s, c)| (stop_name(s), *c))
         })
         .collect();
-    let vcpu_json: Vec<String> = each
-        .iter()
+    let vcpus: Vec<VcpuReport> = each
+        .into_iter()
         .enumerate()
         .map(|(v, (stop, compiles))| {
             let s: State = backing.vcpu(v).read_record(exec::STATE_OFFSET);
-            let acked = if s.mailbox_acked == 0 { 0 } else { execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(backing.vcpu(v).epoch()) };
+            let acked = if s.mailbox_acked == 0 {
+                0
+            } else {
+                execution::ticks_ns(s.mailbox_acked) - execution::ticks_ns(backing.vcpu(v).epoch())
+            };
             // Perf chunk 10: its host requests and its blocks copied in the resident (refused by kind, checked).
-            let c: exec::cache::Control = backing.vcpu(v).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
-            format!(
-                "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"requests\":{},\"reuse\":[{},{:?},{}],\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"state\":{}}}",
-                stop.replace('"', "'"), hex(s.cpu.rip), s.blocks, s.requests, c.reuse_copies, c.reuse_refused, c.reuse_checks, s.halts, s.interrupts, hex(s.mailbox), s.mailbox_wakes,
-                execution::ticks_ns(s.mailbox_mark_ticks) / 1000, s.shootdowns, s.fault, cpu_json(&s.cpu)
-            )
+            let c: exec::cache::Control = backing
+                .vcpu(v)
+                .read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
+            VcpuReport {
+                stop,
+                rip: Hex(s.cpu.rip),
+                blocks: s.blocks,
+                compiles,
+                requests: s.requests,
+                reuse: (c.reuse_copies, c.reuse_refused, c.reuse_checks),
+                halts: s.halts,
+                interrupts: s.interrupts,
+                mailbox: (
+                    Hex(s.mailbox),
+                    s.mailbox_wakes,
+                    acked,
+                    execution::ticks_ns(s.mailbox_mark_ticks) / 1000,
+                ),
+                shootdowns: s.shootdowns,
+                fault: format!("{:x?}", s.fault),
+                state: CpuReport::new(&s.cpu),
+            }
         })
         .collect();
     let first = outcome.ended_first;
-    let first_json = match each.get(first) {
-        Some((stop, _)) => format!(
-            "{{\"vcpu\":{first},\"stop\":\"{}\"}}",
-            stop.replace('"', "'")
-        ),
-        None => "null".into(),
-    };
+    let ended_first = vcpus.get(first).map(|v| EndedFirst {
+        vcpu: first,
+        stop: v.stop.clone(),
+    });
     for (gpa, length, path) in &saves {
         let mut bytes = vec![0u8; *length as usize];
         if !guest.copy_out(*gpa, &mut bytes) {
@@ -400,44 +419,50 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             format!("{other:?}"),
         ),
     };
-    println!(
-        "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"serial_error\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}},\"ended_first\":{},\"vcpus\":[{}]}}",
-        placement(&loaded, &layout),
-        reason.replace('"', "'"),
-        cpu_json(&s.cpu),
-        s.blocks,
-        s.systems,
-        s.generation,
-        s.interrupts,
-        s.evictions,
-        s.retries,
-        execution::shadow_resets(backing.vcpu(0)),
-        c.code_used,
-        c.code_bytes,
-        c.meta_used,
-        c.blocks,
-        started.elapsed().as_secs_f64(),
-        s.requests,
-        s.invalidations,
-        s.steps,
-        s.links,
-        s.unlinks,
-        serde_json::to_string(&execution::k1_stats(backing.vcpu(0))).unwrap(),
-        serde_json::to_string(&devices.report())
-            .unwrap()
-            .trim_matches(|c| c == '{' || c == '}'),
-        prepared.serial_bytes(),
-        prepared
-            .serial_error()
-            .map_or("null".into(), |e| format!("\"{}\"", e.replace('"', "'"))),
-        serde_json::to_string(&*board.pit).unwrap(),
-        serde_json::to_string(&*board.rtc).unwrap(),
-        lapic_end.fired,
-        lapic_end.missed,
-        lapic_end.reinjected,
-        first_json,
-        vcpu_json.join(",")
-    );
+    let report = Report {
+        placement: Placement::new(&loaded, &layout),
+        stop: kind,
+        reason,
+        state: CpuReport::new(&s.cpu),
+        stats: Stats {
+            blocks: s.blocks,
+            compiles,
+            systems: s.systems,
+            flushes: s.generation,
+            interrupts: s.interrupts,
+            evictions: s.evictions,
+            retries: s.retries,
+            shadow_resets: execution::shadow_resets(backing.vcpu(0)),
+            cache: CacheUse {
+                code_used: c.code_used,
+                code_bytes: c.code_bytes,
+                meta_used: c.meta_used,
+                blocks: c.blocks,
+            },
+            seconds: three_decimals(started.elapsed().as_secs_f64()),
+            requests: s.requests,
+            invalidations: s.invalidations,
+            steps: s.steps,
+            links: s.links,
+            unlinks: s.unlinks,
+            k1: execution::k1_stats(backing.vcpu(0)),
+        },
+        devices: devices.report(),
+        serial_bytes: prepared.serial_bytes(),
+        serial_error: prepared.serial_error(),
+        ticks: Ticks {
+            pit: &board.pit,
+            rtc: &board.rtc,
+            lapic: LapicTicks {
+                fired: lapic_end.fired,
+                missed: lapic_end.missed,
+                reinjected: lapic_end.reinjected,
+            },
+        },
+        ended_first,
+        vcpus,
+    };
+    println!("{}", serde_json::to_string(&report).unwrap());
     natemu::perf::mark("exit");
     Ok(())
 }
@@ -473,54 +498,436 @@ fn write_dump(path: &str, guest: &GuestRam, loaded: &Loaded) -> Result<()> {
     fs::write(path, out).map_err(|e| format!("{path}: {e}"))
 }
 
-fn hex(v: u64) -> String {
-    format!("\"{v:#x}\"")
+/// `x` as written with three decimals (`{:.3}`), for the report's seconds.
+fn three_decimals(x: f64) -> f64 {
+    format!("{x:.3}").parse().unwrap()
 }
-/// The placement and the entry state, as an unclosed JSON object.
-fn placement(l: &Loaded, layout: &Layout) -> String {
-    let map: Vec<String> = l
-        .map
-        .iter()
-        .map(|e| format!("[{},{},{}]", hex(e.addr), hex(e.size), e.kind))
-        .collect();
-    let initrd = l
-        .initrd
-        .map_or("null".into(), |(a, n)| format!("[{},{}]", hex(a), hex(n)));
-    let mut s = String::new();
-    let _ = write!(
-        s,
-        "{{\"low_end\":{},\"kernel\":{},\"window\":{},\"zero_page\":{},\"cmdline\":{},\"initrd\":{initrd},\"version\":{},\"memory_map\":[{}],\"entry\":{}",
-        hex(layout.low_end),
-        hex(l.kernel),
-        hex(l.window),
-        hex(l.zero_page),
-        hex(l.cmdline),
-        hex(l.setup.version.into()),
-        map.join(","),
-        cpu_json(&l.cpu)
-    );
-    s
+/// The run's result line (standard output).
+#[derive(Serialize)]
+struct Report<'a> {
+    #[serde(flatten)]
+    placement: Placement,
+    stop: String,
+    reason: String,
+    state: CpuReport,
+    stats: Stats,
+    #[serde(flatten)]
+    devices: natemu::devices::AccessCounts,
+    serial_bytes: usize,
+    serial_error: Option<String>,
+    ticks: Ticks<'a>,
+    ended_first: Option<EndedFirst>,
+    vcpus: Vec<VcpuReport>,
 }
-fn cpu_json(c: &Cpu) -> String {
-    let gpr: Vec<String> = c.gpr.iter().map(|&v| hex(v)).collect();
-    let seg: Vec<String> = c.seg.iter().map(|s| hex(s.selector.into())).collect();
-    format!(
-        "{{\"gpr\":[{}],\"rip\":{},\"rflags\":{},\"cr0\":{},\"cr2\":{},\"cr3\":{},\"cr4\":{},\"efer\":{},\"cpl\":{},\"seg\":[{}],\"fs_base\":{},\"gs_base\":{},\"gdtr\":[{},{}],\"idtr\":[{},{}]}}",
-        gpr.join(","),
-        hex(c.rip),
-        hex(c.rflags),
-        hex(c.cr0),
-        hex(c.cr2),
-        hex(c.cr3),
-        hex(c.cr4),
-        hex(c.efer),
-        c.cpl,
-        seg.join(","),
-        hex(c.fs_base),
-        hex(c.gs_base),
-        hex(c.gdtr.base),
-        hex(c.gdtr.limit),
-        hex(c.idtr.base),
-        hex(c.idtr.limit)
-    )
+#[derive(Serialize)]
+struct Stats {
+    blocks: u64,
+    compiles: u64,
+    systems: u64,
+    flushes: u64,
+    interrupts: u64,
+    evictions: u64,
+    retries: u64,
+    shadow_resets: u64,
+    cache: CacheUse,
+    seconds: f64,
+    requests: u64,
+    invalidations: u64,
+    steps: u64,
+    links: u64,
+    unlinks: u64,
+    k1: execution::K1,
+}
+/// M1 pool use.
+#[derive(Serialize)]
+struct CacheUse {
+    code_used: u64,
+    code_bytes: u64,
+    meta_used: u64,
+    blocks: u64,
+}
+#[derive(Serialize)]
+struct Ticks<'a> {
+    pit: &'a natemu::clock::TickStats,
+    rtc: &'a natemu::clock::TickStats,
+    lapic: LapicTicks,
+}
+#[derive(Serialize)]
+struct LapicTicks {
+    fired: u64,
+    missed: u64,
+    reinjected: u64,
+}
+#[derive(Serialize)]
+struct EndedFirst {
+    vcpu: usize,
+    stop: String,
+}
+/// One vCPU's end: its stop, counters, mailbox `[address, wakes, acknowledged ns, mark us]` and state.
+#[derive(Serialize)]
+struct VcpuReport {
+    stop: String,
+    rip: Hex,
+    blocks: u64,
+    compiles: u64,
+    requests: u64,
+    reuse: (u64, [u64; 5], u64),
+    halts: u64,
+    interrupts: u64,
+    mailbox: (Hex, u64, u64, u64),
+    shootdowns: u64,
+    fault: String,
+    state: CpuReport,
+}
+/// The placement and the entry state.
+#[derive(Serialize)]
+struct Placement {
+    low_end: Hex,
+    kernel: Hex,
+    window: Hex,
+    zero_page: Hex,
+    cmdline: Hex,
+    initrd: Option<[Hex; 2]>,
+    version: Hex,
+    memory_map: Vec<(Hex, Hex, u32)>,
+    entry: CpuReport,
+}
+impl Placement {
+    fn new(l: &Loaded, layout: &Layout) -> Self {
+        Self {
+            low_end: Hex(layout.low_end),
+            kernel: Hex(l.kernel),
+            window: Hex(l.window),
+            zero_page: Hex(l.zero_page),
+            cmdline: Hex(l.cmdline),
+            initrd: l.initrd.map(|(a, n)| [Hex(a), Hex(n)]),
+            version: Hex(l.setup.version.into()),
+            memory_map: l
+                .map
+                .iter()
+                .map(|e| (Hex(e.addr), Hex(e.size), e.kind))
+                .collect(),
+            entry: CpuReport::new(&l.cpu),
+        }
+    }
+}
+#[derive(Serialize)]
+struct CpuReport {
+    gpr: Vec<Hex>,
+    rip: Hex,
+    rflags: Hex,
+    cr0: Hex,
+    cr2: Hex,
+    cr3: Hex,
+    cr4: Hex,
+    efer: Hex,
+    cpl: u64,
+    seg: Vec<Hex>,
+    fs_base: Hex,
+    gs_base: Hex,
+    gdtr: [Hex; 2],
+    idtr: [Hex; 2],
+}
+impl CpuReport {
+    fn new(c: &Cpu) -> Self {
+        Self {
+            gpr: hexes(&c.gpr),
+            rip: Hex(c.rip),
+            rflags: Hex(c.rflags),
+            cr0: Hex(c.cr0),
+            cr2: Hex(c.cr2),
+            cr3: Hex(c.cr3),
+            cr4: Hex(c.cr4),
+            efer: Hex(c.efer),
+            cpl: c.cpl,
+            seg: c.seg.iter().map(|s| Hex(s.selector.into())).collect(),
+            fs_base: Hex(c.fs_base),
+            gs_base: Hex(c.gs_base),
+            gdtr: [Hex(c.gdtr.base), Hex(c.gdtr.limit)],
+            idtr: [Hex(c.idtr.base), Hex(c.idtr.limit)],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    // The former formatters (`placement` over its values: a `Loaded` cannot be built here).
+    fn hex(v: u64) -> String {
+        format!("\"{v:#x}\"")
+    }
+    fn cpu_json(c: &Cpu) -> String {
+        let gpr: Vec<String> = c.gpr.iter().map(|&v| hex(v)).collect();
+        let seg: Vec<String> = c.seg.iter().map(|s| hex(s.selector.into())).collect();
+        format!(
+            "{{\"gpr\":[{}],\"rip\":{},\"rflags\":{},\"cr0\":{},\"cr2\":{},\"cr3\":{},\"cr4\":{},\"efer\":{},\"cpl\":{},\"seg\":[{}],\"fs_base\":{},\"gs_base\":{},\"gdtr\":[{},{}],\"idtr\":[{},{}]}}",
+            gpr.join(","),
+            hex(c.rip),
+            hex(c.rflags),
+            hex(c.cr0),
+            hex(c.cr2),
+            hex(c.cr3),
+            hex(c.cr4),
+            hex(c.efer),
+            c.cpl,
+            seg.join(","),
+            hex(c.fs_base),
+            hex(c.gs_base),
+            hex(c.gdtr.base),
+            hex(c.gdtr.limit),
+            hex(c.idtr.base),
+            hex(c.idtr.limit)
+        )
+    }
+    fn placement(
+        p: &Placement,
+        map: &[(u64, u64, u32)],
+        initrd: Option<(u64, u64)>,
+        entry: &Cpu,
+    ) -> String {
+        let h = |x: &Hex| hex(x.0);
+        let map: Vec<String> = map
+            .iter()
+            .map(|e| format!("[{},{},{}]", hex(e.0), hex(e.1), e.2))
+            .collect();
+        let initrd = initrd.map_or("null".into(), |(a, n)| format!("[{},{}]", hex(a), hex(n)));
+        format!(
+            "{{\"low_end\":{},\"kernel\":{},\"window\":{},\"zero_page\":{},\"cmdline\":{},\"initrd\":{initrd},\"version\":{},\"memory_map\":[{}],\"entry\":{}",
+            h(&p.low_end),
+            h(&p.kernel),
+            h(&p.window),
+            h(&p.zero_page),
+            h(&p.cmdline),
+            h(&p.version),
+            map.join(","),
+            cpu_json(entry)
+        )
+    }
+    fn parse(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
+    }
+    fn cpu(seed: u64) -> Cpu {
+        // SAFETY: `Cpu` is plain integers.
+        let mut c: Cpu = unsafe { std::mem::zeroed() };
+        c.gpr = std::array::from_fn(|i| seed << 8 | i as u64);
+        (c.rip, c.rflags, c.cr0, c.cr2, c.cr3, c.cr4, c.efer, c.cpl) =
+            (seed + 1, 2, 0x8000_0011, 0, 0x1000, 0x20, 0x500, 3);
+        (c.fs_base, c.gs_base, c.gdtr.base, c.gdtr.limit) = (u64::MAX, 7, 0x9000, 0xffff);
+        c.seg[1].selector = 0x10;
+        c
+    }
+    fn placement_new(
+        entry: &Cpu,
+        map: &[(u64, u64, u32)],
+        initrd: Option<(u64, u64)>,
+    ) -> Placement {
+        Placement {
+            low_end: Hex(0xc000_0000),
+            kernel: Hex(0x100_0000),
+            window: Hex(0x200_0000),
+            zero_page: Hex(0x7000),
+            cmdline: Hex(0x2_0000),
+            initrd: initrd.map(|(a, n)| [Hex(a), Hex(n)]),
+            version: Hex(0x20f),
+            memory_map: map.iter().map(|&(a, n, k)| (Hex(a), Hex(n), k)).collect(),
+            entry: CpuReport::new(entry),
+        }
+    }
+    fn vcpu_old(v: &VcpuReport, stop: &str, c: &Cpu, fault: [u64; 4]) -> String {
+        let acked = v.mailbox.2;
+        let compiles = v.compiles;
+        format!(
+            "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"requests\":{},\"reuse\":[{},{:?},{}],\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"state\":{}}}",
+            stop.replace('"', "'"),
+            hex(v.rip.0),
+            v.blocks,
+            v.requests,
+            v.reuse.0,
+            v.reuse.1,
+            v.reuse.2,
+            v.halts,
+            v.interrupts,
+            hex(v.mailbox.0.0),
+            v.mailbox.1,
+            v.mailbox.3,
+            v.shootdowns,
+            fault,
+            cpu_json(c)
+        )
+    }
+    fn vcpu_new(stop: &str, c: &Cpu, fault: [u64; 4]) -> VcpuReport {
+        VcpuReport {
+            stop: stop.into(),
+            rip: Hex(c.rip),
+            blocks: 11,
+            compiles: 12,
+            requests: 13,
+            reuse: (14, [1, 2, 3, 4, 5], 15),
+            halts: 16,
+            interrupts: 17,
+            mailbox: (Hex(0xfee0_0000), 18, 19, 20),
+            shootdowns: 21,
+            fault: format!("{fault:x?}"),
+            state: CpuReport::new(c),
+        }
+    }
+
+    #[test]
+    fn placement_and_cpu_match_the_former_format() {
+        let entry = cpu(1);
+        let map = [
+            (0, 0x9_fc00, 1),
+            (0x10_0000, 0xbff0_0000, 1),
+            (0xf_0000, 0x1_0000, 2),
+        ];
+        for initrd in [Some((0x800_0000, 0x12_3456)), None] {
+            let new = placement_new(&entry, &map, initrd);
+            let old = placement(&new, &map, initrd, &entry) + "}";
+            assert_eq!(parse(&old), serde_json::to_value(&new).unwrap());
+        }
+        assert_eq!(
+            parse(&cpu_json(&entry)),
+            serde_json::to_value(CpuReport::new(&entry)).unwrap()
+        );
+    }
+
+    #[test]
+    fn result_line_matches_the_former_format() {
+        let (state, entry) = (cpu(2), cpu(3));
+        let fault = [14, 0xdead_beef, 2, 0x40_1000];
+        let vcpus = vec![
+            vcpu_new("reached", &state, fault),
+            vcpu_new("resident halted status=1 detail=0", &entry, [0; 4]),
+        ];
+        let map = [(0, 0x9_fc00, 1)];
+        let pit = natemu::clock::TickStats::default();
+        pit.rises.store(5, std::sync::atomic::Ordering::SeqCst);
+        let rtc = natemu::clock::TickStats::default();
+        for (serial_error, ended_first, seconds) in [
+            (Some("broken pipe"), Some(1), 12.345_678),
+            (None, None, 0.0005),
+        ] {
+            let report = Report {
+                placement: placement_new(&entry, &map, None),
+                stop: "shutdown".into(),
+                reason: "fault [e, 0, 0, 1000]".into(),
+                state: CpuReport::new(&state),
+                stats: Stats {
+                    blocks: 1,
+                    compiles: 2,
+                    systems: 3,
+                    flushes: 4,
+                    interrupts: 5,
+                    evictions: 6,
+                    retries: 7,
+                    shadow_resets: 8,
+                    cache: CacheUse {
+                        code_used: 9,
+                        code_bytes: 10,
+                        meta_used: 11,
+                        blocks: 12,
+                    },
+                    seconds: three_decimals(seconds),
+                    requests: 13,
+                    invalidations: 14,
+                    steps: 15,
+                    links: 16,
+                    unlinks: 17,
+                    k1: execution::K1::default(),
+                },
+                devices: Default::default(),
+                serial_bytes: 18,
+                serial_error: serial_error.map(Into::into),
+                ticks: Ticks {
+                    pit: &pit,
+                    rtc: &rtc,
+                    lapic: LapicTicks {
+                        fired: 19,
+                        missed: 20,
+                        reinjected: 21,
+                    },
+                },
+                ended_first: ended_first.map(|v: usize| EndedFirst {
+                    vcpu: v,
+                    stop: vcpus[v].stop.clone(),
+                }),
+                vcpus: vec![
+                    vcpu_new("reached", &state, fault),
+                    vcpu_new("resident halted status=1 detail=0", &entry, [0; 4]),
+                ],
+            };
+            let (r, st, cache) = (&report, &report.stats, &report.stats.cache);
+            let compiles = st.compiles;
+            let kind = &r.stop;
+            let first_json = match ended_first {
+                Some(first) => format!(
+                    "{{\"vcpu\":{first},\"stop\":\"{}\"}}",
+                    vcpus[first].stop.replace('"', "'")
+                ),
+                None => "null".into(),
+            };
+            let vcpu_json = [
+                vcpu_old(&vcpus[0], "reached", &state, fault),
+                vcpu_old(
+                    &vcpus[1],
+                    "resident halted status=1 detail=0",
+                    &entry,
+                    [0; 4],
+                ),
+            ];
+            let old = format!(
+                "{},\"stop\":\"{kind}\",\"reason\":\"{}\",\"state\":{},\"stats\":{{\"blocks\":{},\"compiles\":{compiles},\"systems\":{},\"flushes\":{},\"interrupts\":{},\"evictions\":{},\"retries\":{},\"shadow_resets\":{},\"cache\":{{\"code_used\":{},\"code_bytes\":{},\"meta_used\":{},\"blocks\":{}}},\"seconds\":{:.3},\"requests\":{},\"invalidations\":{},\"steps\":{},\"links\":{},\"unlinks\":{},\"k1\":{}}},{},\"serial_bytes\":{},\"serial_error\":{},\"ticks\":{{\"pit\":{},\"rtc\":{},\"lapic\":{{\"fired\":{},\"missed\":{},\"reinjected\":{}}}}},\"ended_first\":{},\"vcpus\":[{}]}}",
+                placement(&r.placement, &map, None, &entry),
+                r.reason.replace('"', "'"),
+                cpu_json(&state),
+                st.blocks,
+                st.systems,
+                st.flushes,
+                st.interrupts,
+                st.evictions,
+                st.retries,
+                st.shadow_resets,
+                cache.code_used,
+                cache.code_bytes,
+                cache.meta_used,
+                cache.blocks,
+                seconds,
+                st.requests,
+                st.invalidations,
+                st.steps,
+                st.links,
+                st.unlinks,
+                serde_json::to_string(&st.k1).unwrap(),
+                "\"ports\":[],\"unassigned_pages\":[]",
+                r.serial_bytes,
+                serial_error.map_or("null".into(), |e| format!("\"{}\"", e.replace('"', "'"))),
+                serde_json::to_string(&pit).unwrap(),
+                serde_json::to_string(&rtc).unwrap(),
+                r.ticks.lapic.fired,
+                r.ticks.lapic.missed,
+                r.ticks.lapic.reinjected,
+                first_json,
+                vcpu_json.join(",")
+            );
+            assert_eq!(parse(&old), serde_json::to_value(&report).unwrap());
+        }
+    }
+
+    /// Free text (stop reasons, the serial error) is now escaped: it round-trips, where the former output replaced `"`
+    /// with `'` and left a backslash or control character to make the line invalid JSON.
+    #[test]
+    fn free_text_round_trips() {
+        let text = "Error { message: \"q\\b\u{1}\" }";
+        let v = vcpu_new(text, &cpu(0), [0; 4]);
+        assert_eq!(serde_json::to_value(&v).unwrap()["stop"], text);
+        let old = vcpu_old(&v, text, &cpu(0), [0; 4]);
+        assert!(serde_json::from_str::<Value>(&old).is_err());
+        let e = EndedFirst {
+            vcpu: 0,
+            stop: text.into(),
+        };
+        assert_eq!(serde_json::to_value(&e).unwrap()["stop"], text);
+    }
 }

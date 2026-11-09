@@ -648,7 +648,7 @@ mod deferred_tests {
 }
 
 /// The run report's port and unassigned-page counts (JSON members `"ports":[..],"unassigned_pages":[..]`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct AccessCounts {
     pub ports: Vec<PortCount>,
     pub unassigned_pages: Vec<PageCount>,

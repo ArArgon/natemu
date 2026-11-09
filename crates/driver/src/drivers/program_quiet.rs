@@ -7,6 +7,7 @@ use natemu::{
     },
     vm::Machine,
 };
+use serde_json::{Value, json};
 use std::{
     sync::atomic::{AtomicBool, Ordering::SeqCst},
     time::{Duration, Instant},
@@ -19,17 +20,16 @@ const A: u64 = 0x1122_3344_5566_7788;
 const MARKER: u64 = 0x7175_6965_7400_0000;
 const NEW_PTE: u64 = 0x101_0000 | 0x103;
 
-fn status(s: &WindowStatus) -> String {
-    format!(
-        "{{\"request\":{},\"released\":{},\"write_windows\":{},\"acknowledged\":{:?},\"quiescent\":{:?},\"released_after\":{},\"request_after\":{}}}",
-        s.request,
-        s.released,
-        s.write_windows,
-        s.acknowledged,
-        s.quiescent,
-        s.released_after,
-        s.request_after
-    )
+fn status(s: &WindowStatus) -> Value {
+    json!({
+        "request": s.request,
+        "released": s.released,
+        "write_windows": s.write_windows,
+        "acknowledged": s.acknowledged,
+        "quiescent": s.quiescent,
+        "released_after": s.released_after,
+        "request_after": s.request_after,
+    })
 }
 fn stable(s: &WindowStatus) -> bool {
     s.request == s.request_after
@@ -44,8 +44,8 @@ fn unchanged_quiet(s: &WindowStatus, baseline: &WindowStatus) -> Result<()> {
         Ok(())
     }
 }
-fn record(events: &mut Vec<String>, stage: &str, s: &WindowStatus) {
-    let row = format!("{{\"stage\":\"{stage}\",\"status\":{}}}", status(s));
+fn record(events: &mut Vec<Value>, stage: &str, s: &WindowStatus) {
+    let row = json!({"stage": stage, "status": status(s)});
     eprintln!("io-quiet-stage: {row}");
     events.push(row);
 }
@@ -56,7 +56,7 @@ pub(super) fn run(
     stops: &Stops,
     started: &[AtomicBool],
     ended: &AtomicBool,
-) -> Result<String> {
+) -> Result<Value> {
     use Transfer::{Read, Write};
     let began = Instant::now();
     let live = || -> Result<()> {
@@ -201,9 +201,58 @@ pub(super) fn run(
     if final_status.quiescent != [0, 0] {
         return Err("quiet promise remained after guest reentry/end".into());
     }
-    Ok(format!(
-        "{{\"windows\":3,\"cancel_prevented_grant\":true,\"warm\":{:?},\"events\":[{}]}}",
-        warm,
-        events.join(",")
-    ))
+    Ok(json!({
+        "windows": 3,
+        "cancel_prevented_grant": true,
+        "warm": &warm[..],
+        "events": events,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stage rows and the result against the former format strings, over the same values.
+    #[test]
+    fn json_matches_the_former_format() {
+        let s = WindowStatus {
+            request: 3,
+            released: 3,
+            tables_written: 0,
+            acknowledged: vec![2, 3],
+            quiescent: vec![1, 1],
+            write_windows: 1,
+            released_after: 3,
+            request_after: 3,
+        };
+        let old_status = format!(
+            "{{\"request\":{},\"released\":{},\"write_windows\":{},\"acknowledged\":{:?},\"quiescent\":{:?},\"released_after\":{},\"request_after\":{}}}",
+            s.request,
+            s.released,
+            s.write_windows,
+            s.acknowledged,
+            s.quiescent,
+            s.released_after,
+            s.request_after
+        );
+        let stage = "warm-read";
+        let old_row = format!("{{\"stage\":\"{stage}\",\"status\":{}}}", old_status);
+        let mut events = Vec::new();
+        record(&mut events, stage, &s);
+        let warm: [u8; 64] = std::array::from_fn(|i| i as u8 * 3);
+        let old = format!(
+            "{{\"windows\":3,\"cancel_prevented_grant\":true,\"warm\":{:?},\"events\":[{}]}}",
+            warm,
+            [old_row.clone(), old_row].join(",")
+        );
+        events.push(events[0].clone());
+        let new = json!({
+            "windows": 3,
+            "cancel_prevented_grant": true,
+            "warm": &warm[..],
+            "events": events,
+        });
+        assert_eq!(serde_json::from_str::<Value>(&old).unwrap(), new);
+    }
 }
