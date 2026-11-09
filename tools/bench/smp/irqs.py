@@ -68,6 +68,11 @@ def ier(v):
 # Triggers run with IF = 0 and the interrupt is taken in an STI window, after the instruction after STI: QEMU's TCG takes
 # an interrupt raised by an OUT or a store only at its next translation block, natemu at the next boundary.
 WINDOW = '    sti\n    nop\n    cli'
+# THRE rises some time after a THR write on real 8250s (about a bit time) and on natemu (its transmit readiness delay);
+# QEMU sets it at once. Wait for LSR THRE|TEMT with IF = 0 (registers and flags kept) so the rise is pending before the
+# window on every model, as tools/bench/smp/ports.py's wait_tx does.
+WAIT_TX = (f'    pushfq\n    push rax\n    push rdx\n1:\n    mov edx, {COM1 + 5:#x}\n    in al, dx\n    and al, 0x60\n'
+           '    cmp al, 0x60\n    jne 1b\n    pop rdx\n    pop rax\n    popfq')
 
 
 LINUX_PIC_INIT = [(0x21, 0xff), (0x20, 0x11), (0x21, 0x30), (0x21, 0x04), (0x21, 0x01), (0xa0, 0x11), (0xa1, 0x38), (0xa1, 0x02), (0xa1, 0x01)]
@@ -120,7 +125,7 @@ def edge_program(m='x2'):
     a THR write's low-then-high), a rise while masked lost (no delivery at the unmask), TMR clear in the handler."""
     t = [head(m), pic_init(), entry(LINE, 0x10000 | EDGE_V, 0), entry(LINE, EDGE_V, 0),
          '    mov r12, 1', ier(2), WINDOW, '    mov r12, 2', ier(0), ier(2), WINDOW,
-         '    mov r12, 3', out(COM1, ord('E')), WINDOW, ier(0),
+         '    mov r12, 3', out(COM1, ord('E')), WAIT_TX, WINDOW, ier(0),
          '    mov r12, 4', entry(LINE, 0x10000 | EDGE_V, 0), ier(2), entry(LINE, EDGE_V, 0), WINDOW,
          '    mov r12, 5', ier(0), ier(2), WINDOW, ier(0), io_rd(0x10 + 2 * LINE), store(0)]
     bodies = {EDGE_V: '\n'.join([rd(m, TMR + 2), f'    mov [{{data}} + 8], rax'])}
