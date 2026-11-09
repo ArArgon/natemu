@@ -3,3 +3,7 @@
 	url = https://github.com/ArArgon/natemu-fex.git
 	branch = natemu
 	shallow = true
+[submodule "third_party/rust-vmm"]
+	path = third_party/rust-vmm
+	url = git@github.com:ArArgon/natemu-rust-vmm.git
+	branch = natemu

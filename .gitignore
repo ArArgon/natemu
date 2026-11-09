@@ -22,3 +22,8 @@ scratch/
 
 # Rust workspace build output
 /target/
+
+# Local agent worktrees, merge backups and fio verify state
+/.claude/worktrees/
+*.orig
+*-verify.state
