@@ -3417,9 +3417,6 @@ mod tests {
         })
     }
 
-    /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
-    /// what fexc read (later bytes, consulted gating values), never confused with another half, offset or limit; the
-    /// answer kept for the requested RIP comes first.
     #[test]
     fn answers_report_matches_the_former_format() {
         let a = Answers::new(u64::MAX);
@@ -3444,6 +3441,9 @@ mod tests {
         assert_eq!(a.report(), old, "byte for byte");
     }
 
+    /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
+    /// what fexc read (later bytes, consulted gating values), never confused with another half, offset or limit; the
+    /// answer kept for the requested RIP comes first.
     #[test]
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);
