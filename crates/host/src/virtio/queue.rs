@@ -1,9 +1,16 @@
-//! Checked traversal of owned queue metadata; no parser can reach the VM's mapping.
+//! Split-ring queue registers and checked traversal of owned metadata copies; no parser can
+//! reach the VM's mapping.
 use super::Identity;
 use crate::Result;
+use natemu_abi::guest_memory::GuestRam;
 use virtio_queue::{CheckedDescriptorChain, desc::split::Descriptor};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
+/// VIRTQ_DESC_F_NEXT and VIRTQ_DESC_F_WRITE: the only descriptor flags with no feature to
+/// negotiate (indirect descriptors are not offered).
+const PLAIN_FLAGS: u16 = 1 | 2;
+
+/// One queue's registers and the device's progress through it.
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct Queue {
     pub size: u16,
@@ -15,6 +22,17 @@ pub(crate) struct Queue {
     pub next_used: u16,
 }
 impl Queue {
+    /// Bytes of the descriptor table, available ring and used ring (virtio 1.3 §2.7).
+    fn table_bytes(&self) -> u64 {
+        u64::from(self.size) * 16
+    }
+    fn avail_bytes(&self) -> u64 {
+        4 + u64::from(self.size) * 2
+    }
+    fn used_bytes(&self) -> u64 {
+        4 + u64::from(self.size) * 8
+    }
+    /// A power-of-two size within `max`, aligned rings, and no ring wrapping the address space.
     pub fn valid(&self, max: u16) -> bool {
         self.size != 0
             && self.size <= max
@@ -22,18 +40,20 @@ impl Queue {
             && self.desc % 16 == 0
             && self.avail % 2 == 0
             && self.used % 4 == 0
-            && self.desc.checked_add(u64::from(self.size) * 16).is_some()
-            && self
-                .avail
-                .checked_add(4 + u64::from(self.size) * 2)
-                .is_some()
-            && self
-                .used
-                .checked_add(4 + u64::from(self.size) * 8)
-                .is_some()
+            && self.desc.checked_add(self.table_bytes()).is_some()
+            && self.avail.checked_add(self.avail_bytes()).is_some()
+            && self.used.checked_add(self.used_bytes()).is_some()
+    }
+    /// Every ring lies wholly in installed guest RAM (checked only; nothing is dereferenced).
+    pub fn rings_in(&self, ram: &GuestRam) -> bool {
+        ram.range(self.used, self.used_bytes()).is_some()
+            && ram.range(self.desc, self.table_bytes()).is_some()
+            && ram.range(self.avail, self.avail_bytes()).is_some()
     }
 }
 
+/// Owned copies of a queue's descriptor table and available ring, and the incarnation they were
+/// captured in. Chains are parsed only from these copies.
 pub(crate) struct Snapshot {
     pub table: Vec<u8>,
     pub avail: Vec<u8>,
@@ -50,11 +70,14 @@ impl Snapshot {
                 .map_err(|e| format!("virtio metadata allocation: {e}"))?,
         })
     }
+    /// The captured available ring's index (the driver's next free slot).
+    fn avail_index(&self) -> u16 {
+        u16::from_le_bytes([self.avail[2], self.avail[3]])
+    }
     /// Published, not-yet-used entries belong to the device. Reuse only the captured prefix in
     /// this queue generation; exhaustion must resnapshot even without another guest notification.
     pub(super) fn reusable(&self, q: Queue, id: Identity) -> bool {
-        self.captured == Some(id)
-            && u16::from_le_bytes(self.avail[2..4].try_into().unwrap()) != q.next_avail
+        self.captured == Some(id) && self.avail_index() != q.next_avail
     }
     pub(super) fn captured(&mut self, id: Identity) {
         self.captured = Some(id);
@@ -64,8 +87,7 @@ impl Snapshot {
     }
     /// Return an entire validated direct chain or an error; never an accepted prefix.
     pub fn chain(&self, q: Queue) -> Result<Option<(u16, Vec<Descriptor>)>> {
-        let idx = u16::from_le_bytes(self.avail[2..4].try_into().unwrap());
-        let pending = idx.wrapping_sub(q.next_avail);
+        let pending = self.avail_index().wrapping_sub(q.next_avail);
         if pending > q.size {
             return Err("virtio available index exceeds queue capacity".into());
         }
@@ -73,7 +95,7 @@ impl Snapshot {
             return Ok(None);
         }
         let slot = 4 + usize::from(q.next_avail % q.size) * 2;
-        let head = u16::from_le_bytes(self.avail[slot..slot + 2].try_into().unwrap());
+        let head = u16::from_le_bytes([self.avail[slot], self.avail[slot + 1]]);
         self.memory
             .write_slice(&self.table[..usize::from(q.size) * 16], GuestAddress(0))
             .map_err(|e| e.to_string())?;
@@ -81,7 +103,7 @@ impl Snapshot {
             .map_err(|e| format!("virtio chain: {e}"))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| format!("virtio chain: {e}"))?;
-        if chain.iter().any(|d| d.flags() & !3 != 0) {
+        if chain.iter().any(|d| d.flags() & !PLAIN_FLAGS != 0) {
             return Err("virtio unnegotiated descriptor flags".into());
         }
         Ok(Some((head, chain)))

@@ -1,28 +1,51 @@
-//! One owned regular file, one ordered native lane, and modern block stream parsing.
+//! virtio-blk over one owned regular file: modern request parsing, and one ordered native lane
+//! (a thread) that performs the file calls outside every lock and copy window.
 use super::*;
 use std::{
-    fs::{File, OpenOptions},
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    fs::{File, OpenOptions, TryLockError},
+    os::unix::fs::{FileExt, MetadataExt},
     path::Path,
     sync::mpsc::{self, Receiver, SyncSender},
     thread::JoinHandle,
     time::Instant,
 };
-use virtio_queue::desc::split::Descriptor;
 
+/// Feature bits offered (virtio 1.3 §5.2.3).
+const F_SIZE_MAX: u64 = 1 << 1;
+const F_SEG_MAX: u64 = 1 << 2;
+const F_BLK_SIZE: u64 = 1 << 6;
+pub(super) const F_FLUSH: u64 = 1 << 9;
+pub(super) const FEATURES: u64 = VERSION_1 | F_SIZE_MAX | F_SEG_MAX | F_BLK_SIZE | F_FLUSH;
+/// The driver must honour the segment limits below.
+pub(super) const REQUIRED: u64 = VERSION_1 | F_SIZE_MAX | F_SEG_MAX;
+
+/// Request types (§5.2.6).
+const T_IN: u32 = 0;
+const T_OUT: u32 = 1;
+const T_FLUSH: u32 = 4;
+const T_GET_ID: u32 = 8;
+/// Request status values.
+const S_OK: u8 = 0;
+const S_IOERR: u8 = 1;
+const S_UNSUPP: u8 = 2;
+
+const SECTOR: u64 = 512;
+/// type, reserved, sector.
+const HEADER: usize = 16;
+const ID_BYTES: usize = 20;
+/// Advertised size_max and seg_max, and their product's bound on one request's data.
+const MAX_SEGMENT: usize = 4096;
+const MAX_SEGMENTS: usize = 32;
 pub(super) const MAX_DATA: usize = 128 * 1024;
-pub(super) const FEATURES: u64 = VERSION_1 | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 9);
-pub(super) const REQUIRED: u64 = VERSION_1 | (1 << 1) | (1 << 2);
-pub(super) const FLUSH: u64 = 1 << 9;
-const IOERR: u8 = 1;
-const UNSUPP: u8 = 2;
 
 pub(super) struct Disk {
     #[cfg(feature = "testing")]
     pub control: Mutex<Option<Arc<super::testing::Control>>>,
+    /// Taken by the lane when the owner starts.
     file: Mutex<Option<File>>,
     pub capacity: u64,
-    pub id: [u8; 20],
+    /// GET_ID's answer: the file's device and inode, in hex.
+    pub id: [u8; ID_BYTES],
 }
 impl Disk {
     pub fn open(path: &Path) -> Result<Self> {
@@ -32,19 +55,17 @@ impl Disk {
             .open(path)
             .map_err(|e| format!("disk {}: {e}", path.display()))?;
         let info = file.metadata().map_err(|e| e.to_string())?;
-        if !info.is_file()
-            || info.len() == 0
-            || info.len() % 512 != 0
-            || info.len() > i64::MAX as u64
-        {
+        let len = info.len();
+        if !info.is_file() || len == 0 || len % SECTOR != 0 || len > i64::MAX as u64 {
             return Err("disk must be a nonempty regular file with sector-aligned capacity".into());
         }
-        unsafe extern "C" {
-            fn flock(fd: i32, operation: i32) -> i32;
-        }
         // Advisory exclusion among cooperating launches; users must exclude other writers/truncators.
-        if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 {
-            return Err(format!("disk lock: {}", std::io::Error::last_os_error()));
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err("disk lock: held by another process".into());
+            }
+            Err(TryLockError::Error(e)) => return Err(format!("disk lock: {e}")),
         }
         let id = format!(
             "{:08x}{:012x}",
@@ -53,21 +74,22 @@ impl Disk {
         )
         .into_bytes()
         .try_into()
-        .unwrap();
+        .expect("8 + 12 hex digits");
         Ok(Self {
             #[cfg(feature = "testing")]
             control: Mutex::new(None),
             file: Mutex::new(Some(file)),
-            capacity: info.len(),
+            capacity: len,
             id,
         })
     }
+    /// Configuration space: capacity (sectors), size_max, seg_max, geometry (unused), blk_size.
     pub fn config(&self) -> [u8; 24] {
         let mut c = [0; 24];
-        c[..8].copy_from_slice(&(self.capacity / 512).to_le_bytes());
-        c[8..12].copy_from_slice(&4096u32.to_le_bytes());
-        c[12..16].copy_from_slice(&32u32.to_le_bytes());
-        c[20..24].copy_from_slice(&512u32.to_le_bytes());
+        c[..8].copy_from_slice(&(self.capacity / SECTOR).to_le_bytes());
+        c[8..12].copy_from_slice(&(MAX_SEGMENT as u32).to_le_bytes());
+        c[12..16].copy_from_slice(&(MAX_SEGMENTS as u32).to_le_bytes());
+        c[20..24].copy_from_slice(&(SECTOR as u32).to_le_bytes());
         c
     }
     pub fn start(&self) -> Result<Lane> {
@@ -90,15 +112,19 @@ impl Disk {
                 phase: 0,
             });
         }
-        Lane::start(file)
+        Lane::spawn(Native(file))
     }
 }
 
+/// One native operation for the lane.
 pub(super) enum Job {
+    /// Read this many bytes at this file offset.
     Read(u64, usize),
+    /// Write these bytes at this offset; `true` also syncs (no FLUSH negotiated: write-through).
     Write(u64, Vec<u8>, bool),
     Flush,
 }
+/// A job's result: the bytes read (empty for a write or on error) and the first error.
 pub(super) struct Done {
     pub data: Vec<u8>,
     pub error: Option<String>,
@@ -111,9 +137,6 @@ pub(super) struct Lane {
     thread: Option<JoinHandle<()>>,
 }
 impl Lane {
-    fn start(file: File) -> Result<Self> {
-        Self::spawn(Native(file))
-    }
     fn spawn(mut native: impl Calls + Send + 'static) -> Result<Self> {
         let (tx, work) = mpsc::sync_channel(1);
         let (result, rx) = mpsc::sync_channel(1);
@@ -142,6 +165,7 @@ impl Lane {
             .try_send(job)
             .map_err(|e| format!("disk lane submission: {e}"))
     }
+    /// Wait for the job's result. Cancellation or a 10 s timeout abandons the lane for good.
     pub fn wait(&mut self, canceled: impl Fn() -> bool) -> Result<Done> {
         let start = Instant::now();
         loop {
@@ -153,79 +177,51 @@ impl Lane {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if canceled() || start.elapsed() > Duration::from_secs(10) {
-                self.tx.take(); // eventual native completion cannot enqueue more work
+                // The eventual native completion cannot enqueue more work.
+                self.tx.take();
                 return Err("disk operation abandoned: VM worker must terminate; file may have partial effects".into());
             }
         }
     }
+    /// Close and join the lane. Called only with no outstanding operation.
     pub fn finish(mut self) -> Result<()> {
-        // Called only with no outstanding operation, after receiving the final sync result.
         self.tx.take();
         self.thread
             .take()
-            .unwrap()
+            .expect("joined once")
             .join()
             .map_err(|_| "disk lane panicked".into())
     }
 }
+
+/// The lane's native file calls; replaced by scripted calls in tests and test schedules.
 pub(super) trait Calls {
     fn read(&mut self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
     fn write(&mut self, bytes: &[u8], offset: u64) -> std::io::Result<usize>;
     fn sync(&mut self) -> std::io::Result<()>;
 }
+/// One positioned read or write per call (pread/pwrite: a short count is returned as is, EINTR
+/// is an error); sync is F_FULLFSYNC (`File::sync_all` on Apple platforms).
 pub(super) struct Native(File);
 impl Calls for Native {
     fn read(&mut self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        unsafe extern "C" {
-            fn pread(fd: i32, bytes: *mut u8, count: usize, offset: i64) -> isize;
-        }
-        let n = unsafe {
-            pread(
-                self.0.as_raw_fd(),
-                bytes.as_mut_ptr(),
-                bytes.len(),
-                offset as i64,
-            )
-        };
-        if n < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
-        }
+        self.0.read_at(bytes, offset)
     }
     fn write(&mut self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
-        unsafe extern "C" {
-            fn pwrite(fd: i32, bytes: *const u8, count: usize, offset: i64) -> isize;
-        }
-        let n = unsafe {
-            pwrite(
-                self.0.as_raw_fd(),
-                bytes.as_ptr(),
-                bytes.len(),
-                offset as i64,
-            )
-        };
-        if n < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
-        }
+        self.0.write_at(bytes, offset)
     }
     fn sync(&mut self) -> std::io::Result<()> {
-        unsafe extern "C" {
-            fn fcntl(fd: i32, command: i32, ...) -> i32;
-        }
-        if unsafe { fcntl(self.0.as_raw_fd(), 51) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        self.0.sync_all()
     }
 }
+
+/// Run one job to completion or its first error. A short transfer continues with only the
+/// unconfirmed suffix; an error (EINTR included) or zero progress is never retried, since its
+/// effect is uncertain. A stable write syncs after the last byte.
 fn execute(native: &mut impl Calls, job: Job) -> Done {
     let (offset, mut data, write, stable) = match job {
-        Job::Read(o, n) => (o, vec![0; n], false, false),
-        Job::Write(o, b, stable) => (o, b, true, stable),
+        Job::Read(offset, len) => (offset, vec![0; len], false, false),
+        Job::Write(offset, bytes, stable) => (offset, bytes, true, stable),
         Job::Flush => {
             return Done {
                 data: Vec::new(),
@@ -236,10 +232,11 @@ fn execute(native: &mut impl Calls, job: Job) -> Done {
     let mut done = 0;
     let mut error = None;
     while done < data.len() {
+        let at = offset + done as u64;
         let result = if write {
-            native.write(&data[done..], offset + done as u64)
+            native.write(&data[done..], at)
         } else {
-            native.read(&mut data[done..], offset + done as u64)
+            native.read(&mut data[done..], at)
         };
         match result {
             Ok(n) if n > 0 && n <= data.len() - done => done += n,
@@ -250,7 +247,7 @@ fn execute(native: &mut impl Calls, job: Job) -> Done {
             Err(e) => {
                 error = Some(e.to_string());
                 break;
-            } // including EINTR: never replay uncertain effects
+            }
         }
     }
     if error.is_none() && write && stable {
@@ -262,12 +259,14 @@ fn execute(native: &mut impl Calls, job: Job) -> Done {
     Done { data, error }
 }
 
+/// A guest-physical byte range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Extent {
     pub gpa: u64,
     pub len: usize,
 }
-/// Descriptor boundaries do not define header/status boundaries; slice the logical byte streams.
+/// The `len` bytes at `offset` of the byte stream `extents` describe. Descriptor boundaries do
+/// not define header/status boundaries, so requests are sliced from the logical streams.
 fn slice(extents: &[Extent], mut offset: usize, mut len: usize) -> Vec<Extent> {
     let mut result = Vec::new();
     for e in extents {
@@ -288,12 +287,17 @@ fn slice(extents: &[Extent], mut offset: usize, mut len: usize) -> Vec<Extent> {
 fn length(e: &[Extent]) -> usize {
     e.iter().map(|e| e.len).sum()
 }
+/// Within the advertised seg_max, size_max and total-data bounds.
 fn data_valid(e: &[Extent]) -> bool {
-    e.len() <= 32 && e.iter().all(|e| e.len <= 4096) && length(e) <= MAX_DATA
+    e.len() <= MAX_SEGMENTS && e.iter().all(|e| e.len <= MAX_SEGMENT) && length(e) <= MAX_DATA
 }
+
+/// A chain split into its device-readable stream (header, then OUT data) and device-writable
+/// stream (IN data, then the status byte at its very end).
 pub(super) struct Streams {
     pub readable: Vec<Extent>,
     pub writable: Vec<Extent>,
+    /// The status byte's address: the writable stream's last byte.
     pub status: u64,
 }
 impl Streams {
@@ -305,16 +309,17 @@ impl Streams {
                 return Err("block readable descriptor follows writable descriptor".into());
             }
             write |= d.is_write_only();
-            if d.len() != 0 {
-                let e = Extent {
-                    gpa: d.addr().0,
-                    len: d.len() as usize,
-                };
-                if write {
-                    writable.push(e);
-                } else {
-                    readable.push(e);
-                }
+            if d.len() == 0 {
+                continue;
+            }
+            let e = Extent {
+                gpa: d.addr().0,
+                len: d.len() as usize,
+            };
+            if write {
+                writable.push(e);
+            } else {
+                readable.push(e);
             }
         }
         let last = writable
@@ -330,59 +335,69 @@ impl Streams {
     pub fn readable_len(&self) -> usize {
         length(&self.readable)
     }
+    /// The writable stream's bytes before the status byte.
+    fn writable_data_len(&self) -> usize {
+        length(&self.writable) - 1
+    }
+    /// Decode the readable stream's bytes (header, then OUT data) against the disk's capacity
+    /// and the negotiated features. A malformed or out-of-range request is an IOERR status.
     pub fn decode(&self, bytes: &[u8], capacity: u64, features: u64) -> Command {
-        let bad = || Command::Status(IOERR);
-        if bytes.len() < 16 {
+        let bad = || Command::Status(S_IOERR);
+        if bytes.len() < HEADER {
             return bad();
         }
         let kind = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let sector = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let writable = length(&self.writable) - 1;
+        let header_only = bytes.len() == HEADER;
         match kind {
-            0 | 1 => {
-                let data = if kind == 0 {
-                    slice(&self.writable, 0, writable)
+            T_IN | T_OUT => {
+                let data = if kind == T_IN {
+                    slice(&self.writable, 0, self.writable_data_len())
                 } else {
-                    slice(&self.readable, 16, bytes.len() - 16)
+                    slice(&self.readable, HEADER, bytes.len() - HEADER)
                 };
                 let n = length(&data);
-                let Some(offset) = sector.checked_mul(512) else {
+                let Some(offset) = sector.checked_mul(SECTOR) else {
                     return bad();
                 };
+                let past_end = offset
+                    .checked_add(n as u64)
+                    .is_none_or(|end| end > capacity);
                 if !data_valid(&data)
-                    || n % 512 != 0
-                    || offset
-                        .checked_add(n as u64)
-                        .is_none_or(|end| end > capacity)
-                    || kind == 0 && bytes.len() != 16
+                    || n as u64 % SECTOR != 0
+                    || past_end
+                    || kind == T_IN && !header_only
                 {
                     return bad();
                 }
-                if kind == 0 {
+                if kind == T_IN {
                     Command::Read(offset, n)
                 } else {
-                    Command::Write(offset, bytes[16..].to_vec(), features & FLUSH == 0)
+                    // Without FLUSH negotiated the driver expects write-through.
+                    let stable = features & F_FLUSH == 0;
+                    Command::Write(offset, bytes[HEADER..].to_vec(), stable)
                 }
             }
-            4 if features & FLUSH != 0 => {
-                if bytes.len() == 16 {
+            T_FLUSH if features & F_FLUSH != 0 => {
+                if header_only {
                     Command::Flush
                 } else {
                     bad()
                 }
             }
-            8 => {
-                if bytes.len() == 16 && writable >= 20 {
+            T_GET_ID => {
+                if header_only && self.writable_data_len() >= ID_BYTES {
                     Command::Id
                 } else {
                     bad()
                 }
             }
-            _ => Command::Status(UNSUPP),
+            _ => Command::Status(S_UNSUPP),
         }
     }
     /// Writes are ordered: payload, tail status, then transport completion. Only the contiguous
     /// initialized prefix counts, even when a valid GET_ID buffer has a gap before status.
+    /// Returns the used length.
     pub fn completion<'a>(
         &self,
         data: &'a [u8],
@@ -401,119 +416,93 @@ impl Streams {
             gpa: self.status,
             bytes: status,
         });
-        (data.len() + usize::from(data.len() == length(&self.writable) - 1)) as u32
+        let status_follows_data = data.len() == self.writable_data_len();
+        (data.len() + usize::from(status_follows_data)) as u32
     }
 }
+/// A decoded request.
 pub(super) enum Command {
     Read(u64, usize),
     Write(u64, Vec<u8>, bool),
     Flush,
     Id,
+    /// Answer with this status and no data.
     Status(u8),
 }
 
 impl Virtio {
     pub(super) fn block_request(
         &self,
-        backing: &Backing,
-        machine: &Machine,
-        stops: &Stops,
-        q: Queue,
-        generation: Identity,
-        head: u16,
-        chain: &[Descriptor],
+        guest: Guest<'_>,
+        chain: &Chain<'_>,
         disk: &Disk,
         lane: &mut Lane,
         cancel: &AtomicBool,
     ) -> Result<Request> {
-        let streams = match Streams::new(chain) {
+        let streams = match Streams::new(chain.descriptors) {
             Ok(s) => s,
             Err(e) => return Ok(Request::Invalid(e)),
         };
-        let command = if streams.readable_len() > MAX_DATA + 16 {
-            Command::Status(IOERR)
+        let command = if streams.readable_len() > MAX_DATA + HEADER {
+            Command::Status(S_IOERR)
         } else {
             let mut bytes = vec![0; streams.readable_len()];
-            let mut tail = bytes.as_mut_slice();
-            let mut reads = Vec::with_capacity(streams.readable.len());
-            for e in &streams.readable {
-                let (part, rest) = tail.split_at_mut(e.len);
-                tail = rest;
-                reads.push(Transfer::Read {
-                    gpa: e.gpa,
-                    bytes: part,
-                });
-            }
-            if !self.copy(backing, machine, stops, generation, &mut reads)? {
+            let extents = streams.readable.iter().map(|e| (e.gpa, e.len));
+            if !self.copy(guest, chain.id, &mut gather(extents, &mut bytes))? {
                 return Ok(Request::Canceled);
             }
             streams.decode(&bytes, disk.capacity, self.lock().features)
         };
         let inbound = matches!(command, Command::Read(..));
-        let (data, status) = match command {
-            Command::Id => (disk.id.to_vec(), 0),
-            Command::Status(status) => (Vec::new(), status),
-            cmd => {
-                let job = match cmd {
-                    Command::Read(o, n) => Job::Read(o, n),
-                    Command::Write(o, bytes, stable) => Job::Write(o, bytes, stable),
-                    Command::Flush => Job::Flush,
-                    _ => unreachable!(),
-                };
-                {
-                    let s = self.lock();
-                    if !s.current(generation) {
-                        return Ok(Request::Canceled);
-                    }
-                    // Submission and reset admission are ordered, but no native call holds this lock.
-                    lane.submit(job)?;
-                }
-                let done = lane.wait(|| cancel.load(SeqCst) || self.lock().stopped)?;
-                if let Some(e) = done.error {
-                    eprintln!("virtio-block: {e}");
-                    (Vec::new(), IOERR)
-                } else {
-                    (done.data, 0)
-                }
+        let job = match command {
+            Command::Read(offset, len) => Job::Read(offset, len),
+            Command::Write(offset, bytes, stable) => Job::Write(offset, bytes, stable),
+            Command::Flush => Job::Flush,
+            Command::Id => {
+                return self.block_complete(guest, chain, &streams, &disk.id, S_OK, inbound);
+            }
+            Command::Status(status) => {
+                return self.block_complete(guest, chain, &streams, &[], status, inbound);
             }
         };
+        {
+            let s = self.lock();
+            if !s.current(chain.id) {
+                return Ok(Request::Canceled);
+            }
+            // Submission and reset admission are ordered, but no native call holds this lock.
+            lane.submit(job)?;
+        }
+        let done = lane.wait(|| cancel.load(SeqCst) || self.lock().stopped)?;
+        match done.error {
+            Some(e) => {
+                eprintln!("virtio-block: {e}");
+                self.block_complete(guest, chain, &streams, &[], S_IOERR, inbound)
+            }
+            None => self.block_complete(guest, chain, &streams, &done.data, S_OK, inbound),
+        }
+    }
+    /// Publish `data`, the status byte and the used element. A failed read reports no bytes.
+    fn block_complete(
+        &self,
+        guest: Guest<'_>,
+        chain: &Chain<'_>,
+        streams: &Streams,
+        data: &[u8],
+        status: u8,
+        inbound: bool,
+    ) -> Result<Request> {
         let status = [status];
         let mut writes = Vec::with_capacity(streams.writable.len() + 4);
-        let mut len = streams.completion(&data, &status, &mut writes);
-        if inbound && status[0] != 0 {
+        let mut len = streams.completion(data, &status, &mut writes);
+        if inbound && status[0] != S_OK {
             len = 0;
         }
-        let mut used = [0; 8];
-        used[..4].copy_from_slice(&u32::from(head).to_le_bytes());
-        used[4..].copy_from_slice(&len.to_le_bytes());
-        let index = q.next_used.wrapping_add(1).to_le_bytes();
-        let mut avail = [0; 4];
-        writes.push(Transfer::Write {
-            gpa: q.used + 4 + u64::from(q.next_used % q.size) * 8,
-            bytes: &used,
-        });
-        writes.push(Transfer::Write {
-            gpa: q.used + 2,
-            bytes: &index,
-        });
-        // Observe suppression and further work after publication, including aliased completion writes.
-        writes.push(Transfer::Read {
-            gpa: q.avail,
-            bytes: &mut avail,
-        });
-        if !self.copy(backing, machine, stops, generation, &mut writes)? {
-            return Ok(Request::Canceled);
-        }
-        #[cfg(feature = "testing")]
-        self.observe("commit");
-        let mut s = self.lock();
-        if s.current(generation) && u16::from_le_bytes(avail[..2].try_into().unwrap()) & 1 == 0 {
-            s.interrupt |= 1;
-            self.irq(&s);
-        }
-        Ok(Request::Committed {
-            pending: u16::from_le_bytes(avail[2..].try_into().unwrap())
-                != q.next_avail.wrapping_add(1),
+        Ok(match self.complete(guest, chain, len, writes)? {
+            Some(used) => Request::Committed {
+                pending: used.more_published(chain.queue),
+            },
+            None => Request::Canceled,
         })
     }
 }
@@ -701,7 +690,7 @@ mod tests {
         let mut writes = Vec::new();
         assert_eq!(s.completion(&id, &status, &mut writes), 20);
         let mut writes = Vec::new();
-        let status = [IOERR];
+        let status = [S_IOERR];
         assert_eq!(s.completion(&[], &status, &mut writes), 0);
         assert_eq!(writes.len(), 1);
         assert!(Streams::new(&[desc(0, 1, true), desc(0, 16, false)]).is_err());
@@ -712,22 +701,22 @@ mod tests {
         let s = Streams::new(&[desc(0, 16, false), desc(100, 8193, true)]).unwrap();
         assert!(matches!(
             s.decode(&header(0, 0), 65536, FEATURES),
-            Command::Status(IOERR)
+            Command::Status(S_IOERR)
         ));
         let s = Streams::new(&[desc(0, 16, false), desc(100, 513, true)]).unwrap();
         for sector in [8, u64::MAX] {
             assert!(matches!(
                 s.decode(&header(0, sector), 4096, FEATURES),
-                Command::Status(IOERR)
+                Command::Status(S_IOERR)
             ));
         }
         assert!(matches!(
-            s.decode(&header(4, 0), 4096, FEATURES & !FLUSH),
-            Command::Status(UNSUPP)
+            s.decode(&header(4, 0), 4096, FEATURES & !F_FLUSH),
+            Command::Status(S_UNSUPP)
         ));
         assert!(matches!(
             s.decode(&header(123, 0), 4096, FEATURES),
-            Command::Status(UNSUPP)
+            Command::Status(S_UNSUPP)
         ));
     }
 }

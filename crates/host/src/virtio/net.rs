@@ -1,22 +1,39 @@
-//! One RX/TX pair and bounded owned Ethernet packets. No backend holds guest addresses.
+//! virtio-net (fixture-only frontend): one RX/TX pair and bounded owned Ethernet packets. No
+//! backend holds guest addresses.
 use super::*;
 use std::sync::{
     Weak,
     mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::time::Instant;
-use virtio_queue::desc::split::Descriptor;
 
-pub(super) const FEATURES: u64 = VERSION_1 | (1 << 3) | (1 << 5) | (1 << 16); // MTU, MAC, STATUS
+/// Feature bits offered (virtio 1.3 §5.1.3): MTU, MAC and STATUS; no offloads.
+const F_MTU: u64 = 1 << 3;
+const F_MAC: u64 = 1 << 5;
+const F_STATUS: u64 = 1 << 16;
+pub(super) const FEATURES: u64 = VERSION_1 | F_MTU | F_MAC | F_STATUS;
+/// virtio_net_hdr for VERSION_1: flags, gso_type, hdr_len, gso_size, csum_start, csum_offset,
+/// num_buffers.
 const HEADER: usize = 12;
-const MAX_FRAME: usize = 1518; // Ethernet without FCS, including one VLAN tag, MTU1500.
+const NUM_BUFFERS: std::ops::Range<usize> = 10..12;
+/// VIRTIO_NET_HDR_F_NEEDS_CSUM | DATA_VALID | RSC_INFO: meaningful only with offloads.
+const OFFLOAD_FLAGS: u8 = 7;
+/// VIRTIO_NET_S_LINK_UP.
+const LINK_UP: u16 = 1;
+const MTU: u16 = 1500;
+/// An Ethernet header.
+const MIN_FRAME: usize = 14;
+/// Ethernet without FCS, including one VLAN tag, MTU1500.
+const MAX_FRAME: usize = 1518;
+
+/// One frame in owned storage.
 pub(super) struct Packet {
     bytes: [u8; 2048],
     len: usize,
 }
 impl Packet {
     fn new(bytes: &[u8]) -> Result<Self> {
-        if !(14..=MAX_FRAME).contains(&bytes.len()) {
+        if !(MIN_FRAME..=MAX_FRAME).contains(&bytes.len()) {
             return Err("network frame length outside MTU1500 profile".into());
         }
         let mut p = Self {
@@ -32,17 +49,23 @@ impl Packet {
 }
 pub(super) struct Network {
     mac: [u8; 6],
+    /// One TX packet handed to the [`PacketPort`].
     tx: SyncSender<Packet>,
+    /// The port's result for that packet.
     done: Mutex<Receiver<Result<()>>>,
 }
 impl Network {
+    /// Configuration space: mac, status, max_virtqueue_pairs (unused), mtu.
     pub fn config(&self) -> [u8; 12] {
         let mut bytes = [0; 12];
         bytes[..6].copy_from_slice(&self.mac);
-        bytes[6..8].copy_from_slice(&1u16.to_le_bytes()); // admitted backend link
-        bytes[10..12].copy_from_slice(&1500u16.to_le_bytes());
+        // The backend was admitted before the device was built, so the link is up.
+        bytes[6..8].copy_from_slice(&LINK_UP.to_le_bytes());
+        bytes[10..12].copy_from_slice(&MTU.to_le_bytes());
         bytes
     }
+    /// Wait for the port's result for the packet just sent. Reset waits for accepted sends;
+    /// cancellation or a 10 s timeout is process-fatal, not permission to replay.
     fn wait(&self, device: &Virtio, cancel: &AtomicBool) -> Result<()> {
         let start = Instant::now();
         let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
@@ -54,7 +77,6 @@ impl Network {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            // Reset waits for accepted sends. Cancellation/timeout is process-fatal, not permission to replay.
             let s = device.lock();
             if s.stopped || cancel.load(SeqCst) || start.elapsed() > Duration::from_secs(10) {
                 return Err("network transmit did not retire: VM worker must terminate".into());
@@ -88,13 +110,7 @@ impl PacketPort {
         };
         let mut s = device.lock();
         let id = s.identity(0);
-        if !s.current(id)
-            || s.quiescing
-            || !s.queues[0].ready
-            || s.status & (DRIVER_OK | NEEDS_RESET | 128) != DRIVER_OK
-            || s.active.is_some_and(|id| id.queue == 0)
-            || s.received.is_some()
-        {
+        if !s.current(id) || !s.accepting(0) || s.queue_active(0) || s.received.is_some() {
             return false;
         }
         s.received = Some((id, packet));
@@ -169,21 +185,18 @@ impl Virtio {
         };
         Ok((device, port))
     }
+    /// RX: deliver the reserved packet into the chain. TX: copy the frame out, hand it to the
+    /// backend and wait for its one result (never retried). Both then publish the used element.
     pub(super) fn net_request(
         &self,
-        backing: &Backing,
-        machine: &Machine,
-        stops: &Stops,
-        q: Queue,
-        id: Identity,
-        head: u16,
-        chain: &[Descriptor],
+        guest: Guest<'_>,
+        chain: &Chain<'_>,
         network: &Network,
         received: Option<Packet>,
         cancel: &AtomicBool,
     ) -> Result<Request> {
-        let rx = id.queue == 0;
-        let capacity = match capacity(chain, rx) {
+        let rx = self.profile.is_rx(chain.id.queue);
+        let capacity = match capacity(chain.descriptors, rx) {
             Ok(n) => n,
             Err(e) => return Ok(Request::Invalid(e)),
         };
@@ -195,90 +208,59 @@ impl Virtio {
             if capacity < len {
                 return Ok(Request::Empty);
             }
-            bytes[10..12].copy_from_slice(&1u16.to_le_bytes());
+            bytes[NUM_BUFFERS].copy_from_slice(&1u16.to_le_bytes());
             bytes[HEADER..len].copy_from_slice(packet.bytes());
             len
         } else {
-            if !(HEADER + 14..=bytes.len()).contains(&capacity) {
+            if !(HEADER + MIN_FRAME..=bytes.len()).contains(&capacity) {
                 return Ok(Request::Invalid("network TX length".into()));
             }
-            let mut tail = &mut bytes[..capacity];
-            let mut reads = Vec::with_capacity(chain.len());
-            for d in chain {
-                let (part, rest) = tail.split_at_mut(d.len() as usize);
-                tail = rest;
-                reads.push(Transfer::Read {
-                    gpa: d.addr().0,
-                    bytes: part,
-                });
-            }
-            if !self.copy(backing, machine, stops, id, &mut reads)? {
+            let frame = &mut bytes[..capacity];
+            let extents = chain
+                .descriptors
+                .iter()
+                .map(|d| (d.addr().0, d.len() as usize));
+            if !self.copy(guest, chain.id, &mut gather(extents, frame))? {
                 return Ok(Request::Canceled);
             }
             let packet = match transmit_packet(&bytes[..capacity]) {
                 Ok(p) => p,
                 Err(e) => return Ok(Request::Invalid(e)),
             };
-            let submitted = {
-                let s = self.lock();
-                if !s.current(id) {
-                    return Ok(Request::Canceled);
-                }
-                match network.tx.try_send(packet) {
-                    Ok(()) => true,
-                    Err(TrySendError::Full(_)) => false, // bounded packet loss, never a retained retry
-                    Err(TrySendError::Disconnected(_)) => {
-                        return Err("network transmit endpoint disconnected".into());
-                    }
-                }
-            };
-            if submitted {
-                network.wait(self, cancel)?;
+            match self.submit(network, chain.id, packet)? {
+                Some(true) => network.wait(self, cancel)?,
+                Some(false) => {}
+                None => return Ok(Request::Canceled),
             }
             0
         };
-        let mut writes = Vec::with_capacity(chain.len() + 3);
-        if rx {
-            let mut offset = 0;
-            for d in chain {
-                let count = (d.len() as usize).min(len - offset);
-                if count != 0 {
-                    writes.push(Transfer::Write {
-                        gpa: d.addr().0,
-                        bytes: &bytes[offset..offset + count],
-                    });
-                    offset += count;
-                }
+        let writes = if rx {
+            scatter(chain.descriptors, &bytes[..len])
+        } else {
+            Vec::with_capacity(3)
+        };
+        Ok(match self.complete(guest, chain, len as u32, writes)? {
+            Some(_) => Request::Committed { pending: true },
+            None => Request::Canceled,
+        })
+    }
+    /// Offer one TX packet to the backend while `id` is current: Some(true) if taken,
+    /// Some(false) if the one slot is full (bounded loss, never a retained retry), None if reset.
+    fn submit(&self, network: &Network, id: Identity, packet: Packet) -> Result<Option<bool>> {
+        let s = self.lock();
+        if !s.current(id) {
+            return Ok(None);
+        }
+        match network.tx.try_send(packet) {
+            Ok(()) => Ok(Some(true)),
+            Err(TrySendError::Full(_)) => Ok(Some(false)),
+            Err(TrySendError::Disconnected(_)) => {
+                Err("network transmit endpoint disconnected".into())
             }
         }
-        let mut used = [0; 8];
-        used[..4].copy_from_slice(&u32::from(head).to_le_bytes());
-        used[4..].copy_from_slice(&(len as u32).to_le_bytes());
-        let index = q.next_used.wrapping_add(1).to_le_bytes();
-        let mut flags = [0; 2];
-        writes.push(Transfer::Write {
-            gpa: q.used + 4 + u64::from(q.next_used % q.size) * 8,
-            bytes: &used,
-        });
-        writes.push(Transfer::Write {
-            gpa: q.used + 2,
-            bytes: &index,
-        });
-        writes.push(Transfer::Read {
-            gpa: q.avail,
-            bytes: &mut flags,
-        });
-        if !self.copy(backing, machine, stops, id, &mut writes)? {
-            return Ok(Request::Canceled);
-        }
-        let mut s = self.lock();
-        if s.current(id) && u16::from_le_bytes(flags) & 1 == 0 {
-            s.interrupt |= 1;
-            self.irq(&s);
-        }
-        Ok(Request::Committed { pending: true })
     }
 }
+
 fn capacity(chain: &[Descriptor], rx: bool) -> Result<usize> {
     if chain.iter().any(|d| d.is_write_only() != rx) {
         return Err("network chain direction".into());
@@ -293,7 +275,8 @@ fn transmit_packet(bytes: &[u8]) -> Result<Packet> {
         return Err("short network TX header".into());
     }
     // Unknown flag bits and inactive checksum/header hints are ignored (virtio 1.3 §5.1.6.2.2).
-    if bytes[0] & 7 != 0 || bytes[1] != 0 || bytes[10..12] != [0, 0] {
+    let (flags, gso_type) = (bytes[0], bytes[1]);
+    if flags & OFFLOAD_FLAGS != 0 || gso_type != 0 || bytes[NUM_BUFFERS] != [0, 0] {
         return Err("unnegotiated network TX offload/header".into());
     }
     Packet::new(&bytes[HEADER..])
@@ -310,22 +293,27 @@ mod tests {
             [2, 0, 0, 0, 0, 1],
         )
         .unwrap();
-        for (o, v) in [(0x70, 3), (0x24, 1), (0x20, 1), (0x70, 11)] {
+        for (o, v) in [
+            (reg::STATUS, 3),
+            (reg::DRIVER_FEATURES_SEL, 1),
+            (reg::DRIVER_FEATURES, 1),
+            (reg::STATUS, 11),
+        ] {
             write(&device, o, v);
         }
         for i in 0..2 {
             for (o, v) in [
-                (0x30, i),
-                (0x38, 256),
-                (0x80, 0x1000 + i * 0x4000),
-                (0x90, 0x2000 + i * 0x4000),
-                (0xa0, 0x3000 + i * 0x4000),
-                (0x44, 1),
+                (reg::QUEUE_SEL, i),
+                (reg::QUEUE_NUM, 256),
+                (reg::QUEUE_DESC_LOW, 0x1000 + i * 0x4000),
+                (reg::QUEUE_DRIVER_LOW, 0x2000 + i * 0x4000),
+                (reg::QUEUE_DEVICE_LOW, 0x3000 + i * 0x4000),
+                (reg::QUEUE_READY, 1),
             ] {
                 write(&device, o, v);
             }
         }
-        write(&device, 0x70, 15);
+        write(&device, reg::STATUS, 15);
         (device, port)
     }
     fn write(d: &Virtio, o: u64, v: u64) {
@@ -359,20 +347,20 @@ mod tests {
     #[test]
     fn notify_selects_written_queue_and_rx_arrival_needs_no_second_kick() {
         let (d, p) = device();
-        write(&d, 0x30, 0xffff_0000);
-        write(&d, 0x50, 1);
+        write(&d, reg::QUEUE_SEL, 0xffff_0000);
+        write(&d, reg::QUEUE_NOTIFY, 1);
         assert_eq!(d.lock().notified, [false, true]);
         d.lock().notified = [false; 2];
-        write(&d, 0x50, 0);
+        write(&d, reg::QUEUE_NOTIFY, 0);
         assert!(!d.lock().pending());
         assert!(p.receive(&frame()));
         assert_eq!(d.lock().notified, [true, false]);
         assert!(!p.receive(&frame())); // one RX slot
         let old = d.lock().received.as_ref().unwrap().0;
-        write(&d, 0x30, 0);
-        write(&d, 0x44, 0);
+        write(&d, reg::QUEUE_SEL, 0);
+        write(&d, reg::QUEUE_READY, 0);
         assert!(d.lock().received.is_none());
-        write(&d, 0x44, 1);
+        write(&d, reg::QUEUE_READY, 1);
         assert!(!d.current(old));
         assert!(p.receive(&frame()));
         assert_ne!(d.lock().received.as_ref().unwrap().0, old);
@@ -390,23 +378,26 @@ mod tests {
             s.interrupt = 1;
             s.notified[1] = true;
         }
-        write(&d, 0x30, 0);
-        write(&d, 0x44, 0);
+        write(&d, reg::QUEUE_SEL, 0);
+        write(&d, reg::QUEUE_READY, 0);
         assert!(d.current(id));
         {
             let s = d.lock();
             assert!(s.notified[1] && s.interrupt == 1 && s.queues[1].ready && !s.queues[0].ready);
         }
-        write(&d, 0x38, 128);
-        write(&d, 0x80, 0xa000);
+        write(&d, reg::QUEUE_NUM, 128);
+        write(&d, reg::QUEUE_DESC_LOW, 0xa000);
         assert_eq!(d.lock().queues[0].desc, 0xa000);
         // The active request and its permit remain owned by TX until TX itself is disabled.
         assert!(std::sync::Arc::ptr_eq(
             d.lock().permit.as_ref().unwrap(),
             &permit
         ));
-        write(&d, 0x30, 1);
-        assert!(matches!(d.access(0, 0x44, 4, Some(0)), Access::Deferred(_)));
+        write(&d, reg::QUEUE_SEL, 1);
+        assert!(matches!(
+            d.access(0, reg::QUEUE_READY, 4, Some(0)),
+            Access::Deferred(_)
+        ));
         assert!(!d.current(id));
         assert!(permit.cancel());
         {

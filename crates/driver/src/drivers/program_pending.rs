@@ -135,8 +135,8 @@ impl Control {
 }
 fn status(s: &WindowStatus) -> String {
     format!(
-        "{{\"request\":{},\"released\":{},\"written\":{},\"acknowledged\":{:?},\"released_after\":{},\"request_after\":{}}}",
-        s.request, s.released, s.written, s.acknowledged, s.released_after, s.request_after
+        "{{\"request\":{},\"released\":{},\"write_windows\":{},\"acknowledged\":{:?},\"released_after\":{},\"request_after\":{}}}",
+        s.request, s.released, s.write_windows, s.acknowledged, s.released_after, s.request_after
     )
 }
 struct Abort<'a>(&'a Control);
@@ -234,7 +234,7 @@ pub(super) fn run(
                     && s.request > prior.request
                     && s.released < s.request
                     && s.released_after < s.request
-                    && s.written == prior.written
+                    && s.write_windows == prior.write_windows
                     && s.acknowledged[0] != s.request
                     && s.acknowledged[1] == s.request
             };
@@ -300,7 +300,7 @@ pub(super) fn run(
             if !result
                 .as_ref()
                 .is_err_and(|e| e == "I/O window acknowledgement timed out")
-                || finished.written != prior.written
+                || finished.write_windows != prior.write_windows
                 || finished.acknowledged[0] == observed.request
                 || finished.acknowledged[1] != observed.request
             {
@@ -335,7 +335,7 @@ pub(super) fn run(
             // The pending doorbell may dispatch before this new block's first instruction.
             // Classify that clean boundary; require eventual execution after release below.
             if marker > 1
-                || finished.written != observed.request
+                || finished.write_windows != prior.write_windows + 1
                 || finished.acknowledged != [observed.request; 2]
             {
                 return Err(

@@ -526,6 +526,9 @@ impl Prepared {
         if let Some(a) = answers.get() {
             crate::perf::line(&a.report());
         }
+        if crate::perf::on() {
+            crate::perf::line(&backing.io_window_counts().perf_line());
+        }
         self.end();
         let destroyed = machine.destroy();
         crate::perf::mark("destroyed");

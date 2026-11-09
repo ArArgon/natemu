@@ -104,20 +104,20 @@ def judge(meta, report, states, memories, pending, stderr, exitcode, timeout):
         prior, status, final = held['prior'], held['status'], result['status']
         epoch = status['request']; epochs.append(epoch)
         require(epoch == status['request_after'] and epoch > prior['request'] and status['released'] < epoch and status['released_after'] < epoch and held['copy_pending']
-                and status['written'] == prior['written'] and len(status['acknowledged']) == 2
+                and status['write_windows'] == prior['write_windows'] and len(status['acknowledged']) == 2
                 and status['acknowledged'][0] != epoch and status['acknowledged'][1] == epoch, 'no positive held epoch/peer ack evidence')
         require(final['request'] == final['request_after'] == final['released'] == final['released_after'] == epoch, 'wrong final epoch/release')
         if stage == 0:
             require(pending_i < result_i < release_i and not result['ok'] and result['ack_timeout'], 'not an acknowledgement timeout under hold')
-            require(final['written'] == prior['written'] and final['acknowledged'][0] != epoch and final['acknowledged'][1] == epoch, 'timeout wrote or forged held acknowledgement')
+            require(final['write_windows'] == prior['write_windows'] and final['acknowledged'][0] != epoch and final['acknowledged'][1] == epoch, 'timeout wrote or forged held acknowledgement')
         else:
             require(resume_i < result_i and result['ok'] and not result['ack_timeout'] and result['marker'] in (0, 1), 'grant/marker disposition invalid')
-            require(final['written'] == epoch and final['acknowledged'] == [epoch, epoch], 'successful copy lacks exact acknowledgements')
+            require(final['write_windows'] == prior['write_windows'] + 1 and final['acknowledged'] == [epoch, epoch], 'successful copy lacks exact acknowledgements')
             recheck_i, recheck = one('held-recheck', stage)
             checked = recheck['status']
             require(pending_i < recheck_i < release_i and recheck['ns'] - held['ns'] >= 100_000_000, 'positive hold shorter than configured bound')
             require(checked['request'] == checked['request_after'] == epoch and checked['released'] < epoch
-                    and checked['released_after'] < epoch and checked['written'] == prior['written']
+                    and checked['released_after'] < epoch and checked['write_windows'] == prior['write_windows']
                     and checked['acknowledged'][0] != epoch and checked['acknowledged'][1] == epoch
                     and recheck['copy_pending'], 'second observation no longer proves held pending copy')
     require(epochs[1] > epochs[0] and posted[1]['count'] > posted[0]['count'] and posted[1]['pid'] == posted[0]['pid'], 'fresh second request/epoch missing')
@@ -155,7 +155,7 @@ def self_check():
     def add(name, **fields):
         nonlocal clock
         clock += 110_000_000; events.append({'event': name, 'ns': clock, **fields})
-    def status(epoch, release, written, acks): return {'request': epoch, 'request_after': epoch, 'released': release, 'released_after': release, 'written': written, 'acknowledged': acks}
+    def status(epoch, release, written, acks): return {'request': epoch, 'request_after': epoch, 'released': release, 'released_after': release, 'write_windows': written, 'acknowledged': acks}
     for stage in range(2):
         epoch = 2 + 4 * stage
         add('armed', stage=stage); add('posted-held', stage=stage, rip=TARGETS[stage], pid=100, count=10 + stage)
@@ -186,7 +186,7 @@ def self_check():
         elif mutation == 'peer': e[2]['status']['acknowledged'][1] = 0
         elif mutation == 'held': e[2]['status']['acknowledged'][0] = 2
         elif mutation == 'released': e[2]['status']['released'] = 2
-        elif mutation == 'written': e[3]['status']['written'] = 2
+        elif mutation == 'written': e[3]['status']['write_windows'] = 2
         elif mutation == 'ack-timeout': e[3]['ack_timeout'] = False
         elif mutation == 'early-marker': e[-2]['marker'] = 2
         elif mutation == 'final-marker': e[-1]['markers'] = [1, 0]
@@ -199,7 +199,7 @@ def self_check():
         elif mutation.startswith('recheck-'):
             recheck = next(event for event in e if event['event'] == 'held-recheck')
             if mutation == 'recheck-released': recheck['status']['released_after'] = 6
-            elif mutation == 'recheck-written': recheck['status']['written'] = 6
+            elif mutation == 'recheck-written': recheck['status']['write_windows'] = 6
             elif mutation == 'recheck-ack': recheck['status']['acknowledged'][0] = 6
             elif mutation == 'recheck-worker': recheck['copy_pending'] = False
             else: recheck['status']['request_after'] = 7

@@ -360,6 +360,21 @@ pub mod cache {
     pub const TABLE_PAGES: usize =
         (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(8);
     pub const TABLE_PAGE_BYTES: usize = super::MAX_GUEST_PAGES.div_ceil(64) * 8;
+    /// Sets `bit` in a [`TABLE_PAGES`] word, writing the shared word only when the bit is missing.
+    ///
+    /// Marks are never cleared, so a bit once seen set stays set and the common already-marked case
+    /// needs no store (a page-table read is a hot path and these lines are shared by every vCPU).
+    /// The load may be Relaxed: the host reads these words only inside a granted I/O window, after
+    /// every participant has acknowledged or halted, and each resident completes `dsb sy` and a
+    /// SeqCst store before that acknowledgement or halt. Any mark this vCPU observed was set by a
+    /// participant whose own acknowledgement orders it before the grant; a stale "missing" result
+    /// only costs a redundant `fetch_or`.
+    pub fn mark_table_page(word: &core::sync::atomic::AtomicU64, bit: u64) {
+        use core::sync::atomic::Ordering::{Relaxed, SeqCst};
+        if word.load(Relaxed) & bit == 0 {
+            word.fetch_or(bit, SeqCst);
+        }
+    }
     pub const RESETS: usize = 0x3000;
     /// Split locks (no-stop change, November 6): the owner of the split lock (vCPU + 1; 0: free), then the two
     /// guest-physical page numbers + 1 it holds (0: none), then per vCPU a word that is 1 while it may hold a shadow
@@ -377,10 +392,9 @@ pub mod cache {
         /// Monotonically increasing request (0 before the first window), serialized by the host.
         pub request: u64,
         /// All epochs through this one are released, including canceled requests that made no RAM access.
+        /// After every release a resident drains its posted physical-page invalidations before
+        /// another acknowledgement or guest access, whether or not the window wrote RAM.
         pub released: u64,
-        /// Most recent epoch that may have written RAM; published before release. Residents drain
-        /// physical-page invalidations before another acknowledgement or guest access.
-        pub written: u64,
         /// Exact epoch at which each resident is quiescent. Host exit/accounting flags are not acknowledgements.
         pub acknowledged: [u64; MAX_VCPUS],
         /// Most recent write epoch overlapping TABLE_PAGES. Also invalidates global translation
@@ -2781,6 +2795,19 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn table_page_marks_accumulate_and_are_never_cleared() {
+        use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let word = AtomicU64::new(0);
+        super::cache::mark_table_page(&word, 1 << 3);
+        super::cache::mark_table_page(&word, 1 << 3);
+        super::cache::mark_table_page(&word, 1 << 63);
+        assert_eq!(word.load(SeqCst), 1 << 3 | 1 << 63);
+        // A bit set by another vCPU is preserved when this one marks a different page.
+        word.fetch_or(1, SeqCst);
+        super::cache::mark_table_page(&word, 1 << 3);
+        assert_eq!(word.load(SeqCst), 1 | 1 << 3 | 1 << 63);
+    }
 
     /// A fence at the next page's first byte reaches a block crossing into that page only; one at the RIP always; one
     /// ending at the RIP, or past the bytes, never; and nothing wraps at the top of the address space.

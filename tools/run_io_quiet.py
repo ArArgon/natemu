@@ -112,7 +112,7 @@ def judge(report, config):
     for i, s in enumerate(states):
         epoch = base + min(i, 3)
         need(s['request'] == s['request_after'] == s['released'] == s['released_after'] == epoch, f'stage{i} completed epoch')
-        need(s['written'] == (first['written'] if i < 2 else base + 2), f'stage{i} write epoch retained across later read/cancel')
+        need(s['write_windows'] == first['write_windows'] + (i >= 2), f'stage{i}: exactly one write window, none from later read/cancel')
         need(s['quiescent'] == ([0, 0] if i == 5 else [1, 1]), f'stage{i} actual quiet flags')
         if i < 5: need(s['acknowledged'] == acks, f'stage{i} no synthesized or resident quiet ACK')
         else: need(s['acknowledged'] == [epoch, epoch], 'both resumed CPUs acknowledged final epoch')
@@ -126,7 +126,7 @@ def self_check():
         for v in range(2): word(warm, v * 32, A); word(warm, v * 32 + 8, 1); word(warm, v * 32 + 16, MARKER + v)
         stages = ['quiet', 'warm-read', 'write', 'read-after-write', 'canceled', 'ended']
         events = [{'stage': stage, 'status': {'request': min(i, 3), 'request_after': min(i, 3), 'released': min(i, 3), 'released_after': min(i, 3),
-                    'written': 0 if i < 2 else 2, 'acknowledged': [3, 3] if i == 5 else [0, 0], 'quiescent': [0, 0] if i == 5 else [1, 1]}} for i, stage in enumerate(stages)]
+                    'write_windows': 0 if i < 2 else 1, 'acknowledged': [3, 3] if i == 5 else [0, 0], 'quiescent': [0, 0] if i == 5 else [1, 1]}} for i, stage in enumerate(stages)]
         cpus = []
         for v in range(2):
             regs = [0] * 16
@@ -135,7 +135,7 @@ def self_check():
         good = {'cpus': cpus, 'io_quiet': {'windows': 3, 'cancel_prevented_grant': True, 'warm': list(warm), 'events': events}}
         assert not judge(good, config), judge(good, config)
         bad = copy.deepcopy(good); bad['io_quiet']['events'][-1]['status']['acknowledged'] = [0, 0]; assert judge(bad, config)
-        for field, value in [('acknowledged', [1, 0]), ('quiescent', [0, 1]), ('released_after', 0), ('written', 3)]:
+        for field, value in [('acknowledged', [1, 0]), ('quiescent', [0, 1]), ('released_after', 0), ('write_windows', 3)]:
             bad = copy.deepcopy(good); bad['io_quiet']['events'][3]['status'][field] = value; assert judge(bad, config)
         for r, value in ((14, B), (12, 2), (13, A), (11, 1), (10, 0)):
             bad = copy.deepcopy(good); bad['cpus'][0]['gpr'][r] = value; assert judge(bad, config)
