@@ -302,8 +302,9 @@ retains its exact original SDK requirement. The workspace contains `crates/host`
 `crates/driver` (the test driver `natemu-host`), `crates/runtime` and `crates/abi`.
 Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`. The host
 binaries use clap, and the host library uses rust-vmm's `virtio-queue` and
-`vm-memory` from the `third_party/rust-vmm` submodule; those crates' own locked
-dependencies come from crates.io. The ABI and resident take no registry
+`vm-memory` from the owner's fork ArArgon/natemu-rust-vmm, pinned by commit in
+`crates/host/Cargo.toml` and `Cargo.lock`; those crates' own locked dependencies
+come from crates.io. The ABI and resident take no registry
 dependency. The [boot handoff's dependency policy](restructure/boot-handoff.md#1-boot-commands)
 lists what is allowed. Assembly offsets come from the shared Rust layout.
 I2 used a versioned 128-byte little-endian register/worker packet, with Rust and
@@ -313,10 +314,9 @@ native `fexc --serve` child per vCPU and admits its code objects
 (`crates/abi/src/code_object.rs`, `crates/host/src/admission.rs`).
 
 Ordinary local checks/builds, from the repository root. On a fresh clone, first
-fetch both submodules (`third_party/FEX`, the owner's FEX fork, and
-`third_party/rust-vmm`, the owner's fork ArArgon/natemu-rust-vmm on branch
-`natemu`, each pinned to a recorded commit) and fill the local Cargo cache once
-with network access; the `--offline` commands then work without the network:
+fetch the FEX submodule (`third_party/FEX`, the owner's FEX fork, pinned) and
+fill the local Cargo cache once with network access (it also fetches the pinned
+rust-vmm fork); the `--offline` commands then work without the network:
 
 ```sh
 git submodule update --init

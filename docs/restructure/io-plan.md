@@ -4,7 +4,7 @@ November 8, 2026. Consolidated from the owner's I/O discussion after early
 performance/correctness work. **Implementation authorized November 8:** the owner
 provided the sibling rust-vmm checkout and asked to begin, including local edits
 there. Natemu uses `codex/virtio-io`; the rust-vmm patch now lives on the
-`natemu` branch of the owner's fork, pinned as the `third_party/rust-vmm` submodule. The owner
+`natemu` branch of the owner's fork, pinned by commit as a Cargo git dependency. The owner
 selected persistent disk plus basic networking. Both are in this milestone.
 The [implementation plan](../implementation.md) owns overall build order;
 [INV-03-01](../research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
