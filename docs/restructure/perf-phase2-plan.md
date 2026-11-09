@@ -207,7 +207,7 @@ fast paths, inline STI/STMXCSR, bulk STOS/CR2 handling, the CPL-3 disk cache, an
 | --- | --- | --- |
 | Avoid retaining exact duplicate completed compiler answers | Small; modest memory cleanup, not first speed priority | `Answers::insert` detects an already-held answer but still inserts it. The fresh exact census below finds about 3–8 MiB of redundant accounted storage in build; useful RIP/answer variants must remain. The older matching-answer counter did not establish exact duplicates. No saved compile or elapsed-time gain is established. |
 | Visit only set peer bits when posting code invalidations | Small; negligible measured budget in this set | `cache::post` filters all 64 indices. A set-bit loop could preserve target records and ordering, but the entire non-kick portion costs under 0.0002 seconds per measured launch, including work the change would keep. Do not prioritize this for speed. |
-| Adapt compiler-channel spinning when the host is oversubscribed | Small–moderate; first candidate for a controlled experiment | Sampled host spinning consumes about 1.8–2.6 CPU-seconds per build launch. This includes useful waiting and is not promised wall-time savings. Measure CPU and elapsed time together; retain the low-N fast path unless it improves. Server-side spinning remains unmeasured. |
+| Adapt compiler-channel spinning when the host is oversubscribed | Small–moderate; deprioritized after fixed-budget comparison | Keep 30 µs: 10 µs loses CPU and cold wall at N4; normal-CLI N10 saves CPU but slows cold wall. It fails the combined CPU/elapsed criterion. Adaptive selection and the separate server budget remain unmeasured; sampled spinning alone is not a savings estimate. |
 | Reduce sparse ownership-summary scanning | Moderate; low measured priority | Ownership clears and reverse-head resets together cost about 0.003 seconds at N4/2 GiB and 0.024–0.027 seconds at N10/8 GiB per launch, summed across CPUs. These whole-operation budgets include necessary updates. An extra index is not justified by a large measured saving here. |
 | Computed-exit target census, then a per-site cache | Moderate–large; strongest prior sampled lead | The dispatcher accounted for 16.5% of generated-code samples in build. Establish target stability and invalidation cost before designing the cache; sample share is not a speedup estimate. |
 | Prove aligned stack stores can skip crossing checks | Small–moderate | Prior estimate 1–3%; removing all checks was an inexact 3.7–6.7% ceiling, not an implementable gain. Preserve unaligned and page-crossing semantics. |
@@ -259,9 +259,106 @@ Two plain controls per configuration run in balanced alternating order. Instrume
 plain installer times were +0.278 and +0.118 seconds; other cold differences ranged
 from −0.369 to +0.447 seconds. Observer effects and run variation prevent using this
 census to explain the earlier 0.058-second boot signal or promise millisecond wall
-gains. **Next useful experiment:** vary the host spin budget at N4/N10 and measure
-both CPU consumption and elapsed time. The other three candidates are deprioritized
+gains. This motivated the host-spin-budget comparison below, measuring both CPU
+consumption and elapsed time at N4/N10.
+The other three candidates are deprioritized
 for speed on this workload set; none has been implemented by this sizing pass.
+
+### Host compiler-channel spin comparison (November 7)
+
+**Complete: keep the 30-µs host budget.** All 52 boots pass: 36 screening,
+eight independent test-enabled repetitions and eight normal-CLI controls. No
+failed, skipped, capped, contended or pending cells remain. Shorter fixed budgets
+do not satisfy the combined CPU/elapsed-time criterion. No production constant
+has changed. Sources come from merged main `062ca4d`; only host `Channel::SPIN`
+varies (30/10/3/0 µs), while FEX's 20-µs spin and the resident stay fixed.
+
+Three counterordered rounds cover build N4/2 GiB, build N10/8 GiB and installer
+N1. These are screening observations, not a fully position-balanced acceptance
+run. Cache is off; the profiler is disabled. Per-child wait4 measures user and
+system CPU including reaped compiler children, excluding the Python observer's
+process queries. Six author and six independent controls verify accounting,
+poll/wait, signal and timeout behavior. CPU covers boot, both build passes and
+shutdown; cold and warm wall times cover their own serial marker intervals.
+
+The first builds compile CLI and driver together, enabling the library's `testing`
+feature for both. All variants share this configuration; the comparison is
+controlled, but these CLI artifacts are not the normal CLI-only build. The
+independent reviewer identified this qualification before acceptance of normal-CLI
+applicability. Eight additional CLI-only ABBA boots at N4/N10 check it, bringing
+the executed plan to 52 boots, within the original 84-boot maximum. The initial
+44 results remain separately identified; they are not relabeled.
+
+Median absolute screen results for that test-enabled CLI configuration, in seconds:
+
+| Host spin | Build N4 cold / warm | Build N4 total CPU | Build N10 cold / warm | Build N10 total CPU | Installer N1 wall |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 30 µs (current setting) | 5.566 / 3.844 | 35.589 | 6.321 / 3.453 | 56.442 | 5.426 |
+| 10 µs | 5.787 / 3.916 | 36.291 | 6.392 / 3.609 | 57.159 | 5.485 |
+| 3 µs | 6.369 / 3.719 | 37.653 | 6.875 / 3.670 | 58.103 | 6.239 |
+| 0 µs | 6.560 / 3.708 | 38.039 | 6.990 / 3.597 | 58.395 | 6.574 |
+
+Within-round candidate-minus-main medians differ from subtracting the absolute
+medians. At 10 µs, build total CPU rises by 0.709 seconds (N4) and 0.559 seconds
+(N10), including system CPU increases of 0.499 and 0.418 seconds. Every paired
+build CPU comparison in the 36-boot screen is positive. Cold N4 rises by 0.271 seconds (range
+0.140–0.340), beyond serial read uncertainty in every pair. Cold N10 is mixed
+(−0.055 to +0.172 seconds), so its small median is not a consistent regression.
+Warm results are mixed across thresholds; the 3-µs N4 warm pass is consistently
+faster, but loses much more on its cold pass and total CPU.
+
+At 0 µs, paired median CPU increases are 2.450 seconds (N4) and 1.953 seconds
+(N10), with cold-wall increases of 0.994 and 0.469 seconds. Installer N1 rises
+0.990 seconds. Shorter spins reaching the kernel wait/wake path more often is
+consistent with the system-CPU increase; exact syscall counts and the server's
+spin contribution were not measured here.
+
+None meets the predeclared CPU-saving and elapsed-time screen criteria. Therefore
+the conditional 40-boot candidate confirmation is not triggered. Eight fresh
+independent ABBA build boots at N4/N10 compare independently rebuilt 30/10-µs
+binaries. All eight pass; signed binaries reproduce exactly. At N4, 10 µs raises
+total CPU from 35.223 to 35.962 seconds, cold wall from 5.4745 to 5.7825 seconds,
+and warm wall from 3.774 to 3.972 seconds. At N10, CPU rises from 56.987 to 57.602
+seconds; cold/warm wall differences are −0.010/−0.001 seconds, with both read-bound
+intervals spanning zero. System CPU rises 0.524/0.528 seconds at N4/N10. These
+independent results support keeping 30 µs in the tested build configuration.
+
+The normal CLI is built alone, with the absence of `testing` checked in its
+feature tree. Its signed 30-µs binary exactly matches the retained normal capacity
+CLI. All eight normal-CLI controls pass. ABBA means (two boots per setting), in
+seconds:
+
+| Configuration | Cold wall, 30 → 10 µs | Warm wall, 30 → 10 µs | Whole-launch CPU, 30 → 10 µs |
+| --- | ---: | ---: | ---: |
+| Build N4 / 2 GiB | 5.5300 → 5.8305 | 3.9105 → 3.9495 | 34.9856 → 36.1373 |
+| Build N10 / 8 GiB | 6.3310 → 6.6875 | 3.5150 → 3.6145 | 58.0403 → 56.5173 |
+
+**Observed tradeoff:** normal-CLI N10 saves 1.523 CPU-seconds at 10 µs, while its
+cold pass takes 0.357 seconds longer; N4 uses 1.152 more CPU-seconds and takes
+0.301 seconds longer cold. System CPU rises by 0.503/0.499 seconds respectively.
+The N10 total-CPU direction differs from the test-enabled runs. Build configuration
+and run variation were not isolated from each other, so neither is established
+as the cause of that difference. Do not generalize a CPU penalty to every setting.
+
+Cold delta read bounds are +0.2874..+0.3158 seconds at N4 and +0.3417..+0.3704
+at N10; warm bounds are +0.0264..+0.0509 and +0.0853..+0.1144 seconds. These
+bound serial observation uncertainty, not statistical confidence: there is one
+normal-CLI ABBA block per configuration. The combined criterion still rejects
+10 µs, and the independent findings review accepts keeping 30 µs within this
+tested M4 scope. It does not establish a globally optimal spin duration, reject
+every adaptive strategy, or establish syscall counts or server-spin costs.
+
+Retained artifacts: [method](../../../natemu-raw/compiler-spin-20261107-01/method.json),
+[screen summary](../../../natemu-raw/compiler-spin-20261107-01/screen/summary.json),
+[analysis with paired read bounds](../../../natemu-raw/compiler-spin-20261107-01/screen/analysis.json),
+the [normal-CLI audit](../../../natemu-raw/compiler-spin-20261107-01/independent/production-runs-review.json),
+the [final independent verdict](../../../natemu-raw/compiler-spin-20261107-01/independent/final-verdict.json),
+and [pre-execution review](../research/reviews/INV-03-01-pre-execution.md).
+An initial shared-target build was rejected because Cargo reused one variant for
+all four source trees; separate targets corrected it before any VM run. The
+reviewer's runner import correction also preceded all measurements. Both are
+retained in the evidence directory. These results do not explain the earlier
+capacity installer difference or settle changing FEX's separate spin budget.
 
 Implemented during capacity validation: split-lock acquisition now posts peer shadow-reset requests before waiting
 for acknowledgements. The 64-vCPU SMC/split-lock checks pass at both block sizes. Earlier sequential requests made
