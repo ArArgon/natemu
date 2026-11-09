@@ -56,8 +56,9 @@ owner's K1 and P3 decisions.
 
 ## 1. Boot commands
 
-**Build and sign** (from the repository root; Rust 1.97.0, offline, locked; on a fresh machine run `cargo +1.97.0 fetch
---locked` once first, the dependency policy below):
+**Build and sign** (from the repository root; Rust 1.97.0, offline, locked; on a fresh clone run
+`git submodule update --init` (FEX and rust-vmm forks) and then `cargo +1.97.0 fetch --locked` once first, the
+dependency policy below):
 
 ```sh
 cargo +1.97.0 build --offline --locked --release -p natemu-cli                # the stub alone: no `testing` feature

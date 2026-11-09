@@ -26,7 +26,7 @@
   source/build files, review template, SDK 26.4 `hv_vm_config.h`,
   `hv_vcpu_types.h`, `hv_vm.h`, `hv_gic.h`, `hv_gic_parameters.h`; direct Apple,
   Arm, Intel and upstream Linux references cited in the investigation.
-- Retained submission: `/Users/liaozping/orca/natemu-raw/q30-foundation-build-01`.
+- Retained submission: `natemu-raw/q30-foundation-build-01`.
   Reviewer verified all SHA256SUMS, all six retained/submitted source matches,
   `built` status, SDK 26.4, bounded Mach-O segments and build-only inputs.
   Reviewer independently ran `python3 experiments/track01/run.py --self-check`:
@@ -93,7 +93,7 @@ Ponytail skills were applied to primary-source inspection and minimal remedies.
 ### Return 1 — 2026-09-06
 
 Same independent reviewer inspected the differences between retained build-01
-and `/Users/liaozping/orca/natemu-raw/q30-foundation-build-02`, the current
+and `natemu-raw/q30-foundation-build-02`, the current
 investigation, and linked build-02 disassembly. All retained checksums and
 changed/current source matches verified; manifest remains `built`, with no VM
 execution. Runner and assembly vector source are unchanged.
@@ -641,7 +641,7 @@ coverage cannot become a PASS through aggregate group-completed bits. All
 accepted foundation mechanisms remain required, and full Q30 remains unresolved.
 
 Retained compile-only follow-up: independently verified all 57 SHA-256 entries
-in `/Users/liaozping/orca/natemu-raw/q30-paging-build-02`. All 13 retained source
+in `natemu-raw/q30-paging-build-02`. All 13 retained source
 files match the current workspace, including the budget helper and fixture
 model. The manifest is `built`, `build_only: true`; all 17 recorded commands
 passed and none invokes the VM host. This closes the current build-provenance
@@ -720,7 +720,7 @@ coverage hold is closed. The evidence remains finite fixture/control preparation
 not an observed VM result.
 
 Independently verified the exact inventory and all six checksums in
-`/Users/liaozping/orca/natemu-raw/q30-paging-oracle-01`; its three frozen checker
+`natemu-raw/q30-paging-oracle-01`; its three frozen checker
 sources match the reviewed workspace files. Retained self-check command,
 sixty-second bound, zero exit, empty stderr and PASS stdout are consistent with
 the preparation manifest and reviewed build-03 association.
@@ -755,7 +755,7 @@ remained. Neither control executes a VM. Sandbox ps EPERM is a retained setup
 failure, not a platform feasibility result.
 
 Verified the exact inventory and all four artifact hashes in
-`/Users/liaozping/orca/natemu-raw/q30-paging-supervisor-01`. Its source matches
+`natemu-raw/q30-paging-supervisor-01`. Its source matches
 the reviewed workspace and has SHA-256
 `2953d19e8ea4a85e45f2e0c2df1f6b543654b19225923fdff2aecba96c1e2bfd`.
 The retained command exited zero, stdout reports self-check PASS and stderr is

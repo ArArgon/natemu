@@ -122,7 +122,7 @@ binding, full dependency closure or machine-selection acceptance.
 
 Independently parsed the retained official Packages.xz and both udeb ar/tar
 archives under
-`/Users/liaozping/orca/natemu-raw/track03-source-audit-20260919/machine/`.
+`natemu-raw/track03-source-audit-20260919/machine/`.
 Computed whole-file SHA256 and sizes for scsi-modules and disk-detect; they match
 the index and claim 15/16 values. The scsi package is standard priority with
 Kernel-Version 6.12.107+deb13-amd64 and package version 6.12.107-1. Its actual

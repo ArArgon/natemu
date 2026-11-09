@@ -76,89 +76,19 @@ until I3 is complete. Unimplemented instructions and routes reject explicitly.
 Before executing a wider subset, add its semantic and recovery support; do not
 turn a valid guest instruction into silent success or an invented guest exception.
 
-**Active I6 device implementation (November 8):** follow the consolidated
-[copy-first virtio plan](restructure/io-plan.md): continue from coordinated
-asynchronous completion, entropy and persistent raw disk toward native networking
-and combined SMP acceptance. Reuse
-rust-vmm queue machinery selectively; keep backend I/O on owned buffers and
-guest RAM access in short resident-admitted windows. Evaluate native vmnet
-admission early, without adopting Virtualization.framework as machine owner.
-The owner authorized implementation and local changes to the sibling rust-vmm
-checkout on November 8. Coordinated RAM windows, checked queue traversal, entropy
-and persistent disk now have finite live guest results and independent replay.
-The common RX/TX frontend now has finite guest fixture results and independent
-replay. Fio tool admission now passes original write/relaunch pairs in primary
-and independent builds after targeted DMA invalidation checks. The subsequent
-[performance repair](restructure/io-benchmarks.md#copy-first-performance-repair--november-8)
-retains copy-first safety while avoiding unrelated mapping/shadow invalidation
-and redundant descriptor-prefix captures: original fio write/readback falls
-from 68.928 to 3.050–3.122 seconds, with independently repeated persistence and
-PTE/PDE checks. The subsequent [wake-up ordering fix](restructure/io-benchmarks.md#io-wake-up-ordering--november-8)
-drains doorbells before checking pending I/O in HLT/mailbox waits. Normal primary
-and fresh independent full workflows take 17.97/17.94 seconds, versus the previous
-65.55/70.56 seconds and a variable contemporaneous old replay of 104.24 seconds;
-write/CRC jobs take 1.619/1.662 seconds. Four forced old/fixed controls and nine
-final live regressions pass. The [next block-scan reduction](restructure/io-benchmarks.md#avoiding-redundant-block-scans--november-8)
-observes the available index during completion and preserves concurrent notifications
-and captured work. It removes about 23% of diagnostic windows and improves
-write/CRC jobs to 1.356/1.393 seconds in primary/reverse independent comparisons.
-Full-workflow and restart-read speedups are unestablished; all mixed results remain
-reported. Host tests, six forced controls and eight normal regressions pass.
-The [restart investigation](restructure/io-benchmarks.md#restart-variance-and-redundant-doorbells--november-8)
-retains exact-epoch doorbell elision with terminal checks preserved. Matched final
-restart jobs are 0.476/0.749 seconds versus 0.506/0.909 for the prior build;
-variation remains. Original full pairs take 17.03/17.40 seconds with independently
-repeated persistence. Baseline profiles associate slow reads with notify and IRQ
-acknowledgement work sharing one guest CPU; native reads stay near 19 ms. The
-next performance target is guest placement/coordination, not an established need
-for zero-copy. Host tests, four live regressions and independent rebuild/review
-pass. These finite results do not establish general QEMU parity.
-The broader ordinary-disk matrix is now measured: all 16 VM launches pass,
-including matched QEMU at N=1/2/4 and independent N4 repeats. Each pair boots a
-2 GiB ext4 root, exercises file operations and nine fio workloads over 1 GiB of
-checksummed files, shuts down cleanly and verifies persistence on fresh read-only
-relaunch. N4 four-job random reads reproduce a weakness: natemu 18.27/18.98 kIOPS
-versus QEMU 55.65/54.70 kIOPS; large 128 KiB transfers favor natemu. CPU use and
-latency also limit the result. The [full matrix](restructure/io-benchmarks.md#ordinary-disk-use-and-scaling-matrix--november-8)
-records cache/CRC/flush differences and untested ordinary-VM behaviors.
-The subsequent [HLT coordination repair](restructure/io-benchmarks.md#hlt-coordination-repair--november-8)
-lets sleeping residents remain quiescent through copy windows, with ordered
-withdrawal and skipped-epoch table/code invalidation before guest access. Fresh
-N4 Q16 reads improve from 9.23k to 36.62k/36.98k IOPS; four readers improve from
-18.44k to 46.32k/44.96k. Combined VM time falls from 193.76 to 113.07/114.73 seconds,
-and host CPU from 599.43 to 215.55/205.15 seconds. All seven full pairs pass
-filesystem/persistence checks. A fresh N1 comparison does not reproduce the
-suspected consistent write regression; write/flush variability and four-reader
-tails remain limitations. The repair retains copy-first exclusion, terminal and
-cancellation checks, AP wake behavior and durability. Zero-copy is not required
-for this improvement. Remaining performance work is write variability and
-four-reader fairness/tail latency.
-The [safety stress extension](restructure/io-plan.md#io-safety-stress--november-8)
-adds independently reproduced native scheduling, repeated reset/disable and
-combined Linux load coverage: 2,560 normal cycles, 320 forced cycles, 256
-lifecycle generations and two accepted five-minute fio/CPU/memory soaks with
-fresh read-only persistence. Host/ABI tests pass 254 with two ignored. Normal
-resident executable code remains identical to the performance candidate; test
-hooks are disabled in default binaries. Loaded N4 read/write rates reproduce at
-11.29–11.62k / 7.83–8.02k IOPS; the benchmark record retains unloaded context,
-tail latency and CPU costs. The subsequent
-[sustained-console repair](restructure/io-plan.md#sustained-console-repair--november-89)
-reproduces the earlier RCU stall and separates transmit acceptance from readiness.
-Bounded staging, a 20-us inactivity deadline and shutdown draining retain every
-accepted byte. Primary and fresh independent threefold unpaced transfers pass,
-including under three verified CPU workers, with heartbeat gaps at most 1.15 s.
-Host/ABI tests now pass 261 with two existing ignored tests. Independent normal
-soak/restart and 512 additional N4 native stress cycles also pass. A lazy error
-formatting change removes unused allocations; the owner-QoS experiment is rejected.
-No overall block-throughput gain is established. The reverse-order control puts
-loaded writes inside baseline variation; unloaded writes remain 2.1–7.3% below
-the two controls, without isolated causal attribution. Preserve that measured
-cost and investigate coordination frequency before treating copying as the
-bottleneck or changing the ownership model.
-A deployed
-network backend and combined disk/network acceptance remain. Unprivileged vmnet admission failed; its launch/backend
-decision remains pending and does not block the common frontend. No privileged
-fallback has been launched.
+**Active I6 device work (November 9):** follow the
+[copy-first virtio plan](restructure/io-plan.md). Reuse rust-vmm queue machinery
+selectively, keep backend I/O on owned buffers, and touch guest RAM only in
+short windows that every vCPU has acknowledged. Done, with independent replay:
+entropy, a persistent raw disk that survives clean shutdown and relaunch, the
+shared network frontend (tested with a test packet endpoint only), several
+performance repairs, safety stress coverage, and a repair of the serial console
+stall under sustained output. Remaining: a native network backend and combined
+disk/network acceptance. The network backend choice is still pending, because
+unprivileged vmnet admission failed and no privileged helper or libslirp
+fallback has been selected. Current status and the next assignment live in
+[INV-03-01](research/investigations/INV-03-01.md#current-io-state--november-9);
+measured numbers live in the [I/O benchmark record](restructure/io-benchmarks.md).
 
 The [ABI coverage matrix](research/specs/arm64-execution-abi.md#7-experiment-and-independent-oracle)
 is the minimum retained behavior target, reached incrementally. New producer and
@@ -367,18 +297,30 @@ python3 -B -m unittest discover -s tools -p 'test_check_setup.py'
 
 The host of record is M4/macOS26, with SDK26.4 in inherited evidence. New Rust
 builds must record/admit their actual SDK/toolchain; the frozen Track01 checker
-retains its exact original SDK requirement. The workspace now contains `crates/host` (the library `natemu`), `crates/cli` (its boot stub `natemu`, package `natemu-cli`), `crates/driver` (the test driver `natemu-host`), `crates/runtime` and `crates/abi`.
-Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`; Cargo
-has no registry dependencies. Assembly offsets come from the shared Rust layout.
+retains its exact original SDK requirement. The workspace contains `crates/host`
+(the library `natemu`), `crates/cli` (its boot stub `natemu`, package `natemu-cli`),
+`crates/driver` (the test driver `natemu-host`), `crates/runtime` and `crates/abi`.
+Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`. The host
+binaries use clap, and the host library uses rust-vmm's `virtio-queue` and
+`vm-memory` from the `third_party/rust-vmm` submodule; those crates' own locked
+dependencies come from crates.io. The ABI and resident take no registry
+dependency. The [boot handoff's dependency policy](restructure/boot-handoff.md#1-boot-commands)
+lists what is allowed. Assembly offsets come from the shared Rust layout.
 I2 used a versioned 128-byte little-endian register/worker packet, with Rust and
 Python validation, and FEX consumed its pinned compile-only input format through
 an out-of-process worker; that transport retired at S3i. The general path runs one
 native `fexc --serve` child per vCPU and admits its code objects
 (`crates/abi/src/code_object.rs`, `crates/host/src/admission.rs`).
 
-Ordinary local checks/builds, from the repository root:
+Ordinary local checks/builds, from the repository root. On a fresh clone, first
+fetch both submodules (`third_party/FEX`, the owner's FEX fork, and
+`third_party/rust-vmm`, the owner's fork ArArgon/natemu-rust-vmm on branch
+`natemu`, each pinned to a recorded commit) and fill the local Cargo cache once
+with network access; the `--offline` commands then work without the network:
 
 ```sh
+git submodule update --init
+cargo fetch --locked
 ./tools/with-env cargo test --offline --locked
 ./tools/with-env cargo build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
 python3 -B -m unittest discover -s tools -p 'test_*.py'

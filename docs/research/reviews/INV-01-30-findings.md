@@ -19,7 +19,7 @@ review context through diagnostic returns and corrections. Reviewed primary
 Inspected the separately authored checker, reviewed preparation, source freeze,
 commands, resource bounds, stopping rules and three replication results.
 
-All raw paths below are beneath `/Users/liaozping/orca/natemu-raw`:
+All raw paths below are beneath `natemu-raw`:
 
 | Evidence | vCPUs | Result |
 | --- | --- | --- |
@@ -273,7 +273,7 @@ shadow eviction, explicit x86 A/D updates and tracked-page recovery.
 
 ### Evidence and independent replication
 
-All paths are beneath `/Users/liaozping/orca/natemu-raw`. Every row is a fresh
+All paths are beneath `natemu-raw`. Every row is a fresh
 rebuild from `q30-paging-build-04/source`, with all earlier foundation mechanisms
 enabled. Each complete frozen oracle-02 check passed with no unsupported effects
 before the next VM started.

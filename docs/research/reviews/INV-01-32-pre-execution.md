@@ -33,7 +33,7 @@ budget establishes only room for declared successful execution paths.
 
 Inspected every `q31.c` case branch, delivery/IRET/access/fixture helper,
 repetition multiplicity and the relevant `q30.c` logging, role, pin and epoch
-paths against `/Users/liaozping/orca/natemu-raw/q31-faults-build-03/source`.
+paths against `natemu-raw/q31-faults-build-03/source`.
 The original Q30 component remains 1,924,051 records. The tighter Q31 tables
 sum to 846 accesses, 1,825 other events, 63 context transitions and 62
 invalidations per complete variant set per CPU. Multiplication by four CPUs
@@ -327,7 +327,7 @@ finite execution preparation. This closes the separate review window begun
 are closed. No extra VM or full raw acceptance run was executed by this
 reviewer; the reviewer authored no producer or oracle implementation.
 
-The concrete inputs under `/Users/liaozping/orca/natemu-raw` are:
+The concrete inputs under `natemu-raw` are:
 
 | Input | Independent retained verification |
 | --- | --- |
@@ -378,7 +378,7 @@ still require their own findings review before a Q32 scoped yes.
 ## Independent replication preparation acceptance
 
 2026-09-07 **07:00:59 UTC**, `/root/track01_understanding_check`: **accept**
-`/Users/liaozping/orca/natemu-raw/q32-interrupts-replica-prep-01` for the
+`natemu-raw/q32-interrupts-replica-prep-01` for the
 separately activated, already bounded two/four-CPU replication campaign.
 This new review began 07:00:08 UTC and ends here, within its ten-minute
 allowance. Primary runtime execution is owned by the parent; this verdict

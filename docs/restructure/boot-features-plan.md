@@ -1612,7 +1612,7 @@ another size or placement unchanged. `boot-linux` runs a VM of the map's L (defa
 L3 (Built (L3)), which gives its pages the unassigned rule.** Built and measured: RAM as two ranges ([0, 0xA0000) and [1 MiB,
 R)), the hole through the device path, never shadowed, a fetch from it not RAM, the driver placing around it and refusing
 identity pages in it, devices registrable there (patch kept at
-`/Users/liaozping/orca/natemu-raw/m1-legacy-hole-20261029.diff`).
+`natemu-raw/m1-legacy-hole-20261029.diff`).
 With the typed `unassigned` stop the L1 smoke test then stopped after 242 blocks: the decompressor's `get_rsdp_addr()`
 (`acpi_rsdp_addr` 0) searches the EBDA and 0xE0000-0xFFFFF for "RSD PTR" with plain loads; with L3's rule the search
 reads all-ones and completes (L2 now fills `acpi_rsdp_addr`, which skips it). Everything else the boot map reserves below 16 MiB is RAM and stays
