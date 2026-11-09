@@ -73,8 +73,9 @@ def constants(root=ROOT):
             for n in ('STACK_TOP', 'EXCEPTION_STACK_TOP')}
     abi = (root / 'crates/abi/src/execution.rs').read_text()
     host = (root / 'crates/host/src/execution.rs').read_text()
-    exc = re.search(r'own\(\(EXCEPTION_STACK_TOP - PRIVATE\) as usize - (0x[0-9a-f_]+), (0x[0-9a-f_]+)\)', host)
-    boot = re.search(r'own\(\(STACK_TOP - PRIVATE\) as usize - exec::STACK_BYTES, exec::STACK_BYTES\)', host)
+    # Whitespace-tolerant: rustfmt may split a call over several lines.
+    exc = re.search(r'own\(\s*\(EXCEPTION_STACK_TOP - PRIVATE\) as usize - (0x[0-9a-f_]+),\s*(0x[0-9a-f_]+),?\s*\)', host)
+    boot = re.search(r'own\(\s*\(STACK_TOP - PRIVATE\) as usize - exec::STACK_BYTES,\s*exec::STACK_BYTES,?\s*\)', host)
     stack = re.search(r'pub const STACK_BYTES: usize = (0x[0-9a-f_]+);', abi)
     if not (exc and boot and stack and exc[1] == exc[2]):
         raise SystemExit('stack reservations not found in the host/abi sources: update check_resident_stack.py')
