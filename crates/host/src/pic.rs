@@ -37,14 +37,20 @@ impl Chip {
         self.irr
     }
     fn new(master: bool) -> Self {
-        Self { master, elcr_mask: if master { 0xf8 } else { 0xde }, ..Self::default() }
+        Self {
+            master,
+            elcr_mask: if master { 0xf8 } else { 0xde },
+            ..Self::default()
+        }
     }
     /// `get_priority`: the highest priority in `mask` (0 highest, after rotation), 8 if none.
     fn priority(&self, mask: u8) -> u8 {
         if mask == 0 {
             return 8;
         }
-        (0..8).find(|p| mask & 1 << ((p + self.priority_add) & 7) != 0).unwrap()
+        (0..8)
+            .find(|p| mask & 1 << ((p + self.priority_add) & 7) != 0)
+            .unwrap()
     }
     /// `pic_get_irq`: the input the chip requests the CPU for, if any.
     fn get_irq(&self) -> Option<u8> {
@@ -96,8 +102,16 @@ impl Chip {
     }
     /// `pic_init_reset` (`pic_reset_common`): ICW1's reset; ELCR and LTIM are kept, the IRR keeps its level-triggered bits.
     fn init_reset(&mut self) {
-        let (elcr, elcr_mask, ltim, master, irr) = (self.elcr, self.elcr_mask, self.ltim, self.master, self.irr);
-        *self = Self { elcr, elcr_mask, ltim, master, irr: irr & elcr, ..Self::default() };
+        let (elcr, elcr_mask, ltim, master, irr) =
+            (self.elcr, self.elcr_mask, self.ltim, self.master, self.irr);
+        *self = Self {
+            elcr,
+            elcr_mask,
+            ltim,
+            master,
+            irr: irr & elcr,
+            ..Self::default()
+        };
     }
     fn write(&mut self, addr: u64, val: u8) {
         if addr == 0 {
@@ -146,7 +160,11 @@ impl Chip {
                 0 => self.imr = val,
                 1 => {
                     self.irq_base = val & 0xf8;
-                    self.init_state = if self.single_mode { if self.init4 { 3 } else { 0 } } else { 2 };
+                    self.init_state = if self.single_mode {
+                        if self.init4 { 3 } else { 0 }
+                    } else {
+                        2
+                    };
                 }
                 2 => self.init_state = if self.init4 { 3 } else { 0 },
                 _ => {
@@ -183,7 +201,9 @@ pub(crate) struct Pic {
 }
 impl Pic {
     pub(crate) fn new() -> Self {
-        Self { chips: [Chip::new(true), Chip::new(false)] }
+        Self {
+            chips: [Chip::new(true), Chip::new(false)],
+        }
     }
     /// The slave's output into the master's IR2 (QEMU's `pic_update_irq` on the slave, `qdev_connect_gpio_out`).
     fn cascade(&mut self) {
@@ -198,7 +218,11 @@ impl Pic {
     /// L4b: whether line `irq` (0..15) is masked: at its chip's IMR, or a slave line at the master's IRQ 2.
     pub(crate) fn masked(&self, irq: u8) -> bool {
         let m = |chip: usize, bit: u8| self.chips[chip].imr >> bit & 1 != 0;
-        if irq < 8 { m(0, irq) } else { m(1, irq - 8) || m(0, 2) }
+        if irq < 8 {
+            m(0, irq)
+        } else {
+            m(1, irq - 8) || m(0, 2)
+        }
     }
     /// The master's INT output (`pic_get_output`).
     pub(crate) fn output(&self) -> bool {
@@ -253,7 +277,17 @@ mod tests {
     use super::*;
     /// Linux's `init_8259A(0)` (arch/x86/kernel/i8259.c): vectors 30H/38H, cascade on IR2, normal EOI.
     fn linux_init(p: &mut Pic) {
-        for (chip, addr, v) in [(0, 1, 0xff), (0, 0, 0x11), (0, 1, 0x30), (0, 1, 0x04), (0, 1, 0x01), (1, 0, 0x11), (1, 1, 0x38), (1, 1, 0x02), (1, 1, 0x01)] {
+        for (chip, addr, v) in [
+            (0, 1, 0xff),
+            (0, 0, 0x11),
+            (0, 1, 0x30),
+            (0, 1, 0x04),
+            (0, 1, 0x01),
+            (1, 0, 0x11),
+            (1, 1, 0x38),
+            (1, 1, 0x02),
+            (1, 1, 0x01),
+        ] {
             p.access(chip, addr, false, Some(v));
         }
     }

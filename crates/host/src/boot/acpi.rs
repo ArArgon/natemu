@@ -137,7 +137,10 @@ fn fadt(facs: u64, dsdt: u64) -> Vec<u8> {
     // of PM1, which the PIIX4 model has), SLP_BUTTON (5: none), FIX_RTC clear (6: RTC_STS/RTC_EN in PM1),
     // USE_PLATFORM_CLOCK (15); TMR_VAL_EXT clear: a 24-bit PM timer. Deviations: RESET_REG_SUP (10) set, for claim
     // 69's reset register; RTC_S4 (7) clear, since S4 is not supported (claim 22).
-    at(112, &(1u32 | 1 << 2 | 1 << 5 | 1 << 10 | 1 << 15).to_le_bytes());
+    at(
+        112,
+        &(1u32 | 1 << 2 | 1 << 5 | 1 << 10 | 1 << 15).to_le_bytes(),
+    );
     at(116, &gas(8, 1, RESET_PORT));
     at(128, &[RESET_VALUE]);
     at(131, &[5]); // FADT minor version
@@ -202,7 +205,11 @@ mod aml {
         let b = id.as_bytes();
         let l = |c: u8| u16::from(c - b'@');
         let hex = u16::from_str_radix(&id[3..], 16).unwrap();
-        let v = [(l(b[0]) << 10 | l(b[1]) << 5 | l(b[2])).to_be_bytes(), hex.to_be_bytes()].concat();
+        let v = [
+            (l(b[0]) << 10 | l(b[1]) << 5 | l(b[2])).to_be_bytes(),
+            hex.to_be_bytes(),
+        ]
+        .concat();
         [&[0x0c][..], &v].concat()
     }
     pub(super) fn package(elements: &[u64]) -> Vec<u8> {
@@ -211,7 +218,10 @@ mod aml {
         package_op(&[0x12], &body)
     }
     pub(super) fn buffer(bytes: &[u8]) -> Vec<u8> {
-        package_op(&[0x11], &[integer(bytes.len() as u64), bytes.to_vec()].concat())
+        package_op(
+            &[0x11],
+            &[integer(bytes.len() as u64), bytes.to_vec()].concat(),
+        )
     }
     pub(super) fn device(seg: &[u8; 4], terms: &[Vec<u8>]) -> Vec<u8> {
         package_op(&[0x5b, 0x82], &[seg.to_vec(), terms.concat()].concat())
@@ -228,13 +238,42 @@ fn dsdt(vcpus: usize, virtio: &[VirtioMmio]) -> Vec<u8> {
     // COM1's resources (6.4): IO (Decode16, 0x3f8, 0x3f8, 1, 8), IRQNoFlags () {4} (edge, active high), end tag.
     let [lo, hi] = COM1_PORT.to_le_bytes();
     let irq = (1u16 << COM1_IRQ).to_le_bytes();
-    let crs = [0x47, 0x01, lo, hi, lo, hi, 0x01, 0x08, 0x22, irq[0], irq[1], 0x79, 0x00];
-    let com1 = device(b"COM1", &[name(b"_HID", eisa_id("PNP0501")), name(b"_UID", integer(1)), name(b"_CRS", buffer(&crs))]);
+    let crs = [
+        0x47, 0x01, lo, hi, lo, hi, 0x01, 0x08, 0x22, irq[0], irq[1], 0x79, 0x00,
+    ];
+    let com1 = device(
+        b"COM1",
+        &[
+            name(b"_HID", eisa_id("PNP0501")),
+            name(b"_UID", integer(1)),
+            name(b"_CRS", buffer(&crs)),
+        ],
+    );
     // RTC (QEMU's `Device (RTC)` under its ISA bridge): IO (Decode16, 0x70, 0x70, 1, 2), IRQNoFlags () {8}.
     let [lo, hi] = RTC_PORT.to_le_bytes();
     let irq = (1u16 << RTC_IRQ).to_le_bytes();
-    let crs = [0x47, 0x01, lo, hi, lo, hi, 0x01, RTC_PORT_LEN, 0x22, irq[0], irq[1], 0x79, 0x00];
-    let rtc = device(b"RTC_", &[name(b"_HID", eisa_id("PNP0B00")), name(b"_CRS", buffer(&crs))]);
+    let crs = [
+        0x47,
+        0x01,
+        lo,
+        hi,
+        lo,
+        hi,
+        0x01,
+        RTC_PORT_LEN,
+        0x22,
+        irq[0],
+        irq[1],
+        0x79,
+        0x00,
+    ];
+    let rtc = device(
+        b"RTC_",
+        &[
+            name(b"_HID", eisa_id("PNP0B00")),
+            name(b"_CRS", buffer(&crs)),
+        ],
+    );
     let mut sb = vec![com1, rtc];
     for d in virtio {
         // Memory32Fixed(ReadWrite, base, 4096), ExtendedInterrupt(ResourceConsumer,
@@ -246,14 +285,30 @@ fn dsdt(vcpus: usize, virtio: &[VirtioMmio]) -> Vec<u8> {
         crs.extend(d.gsi.to_le_bytes());
         crs.extend([0x79, 0]);
         let seg: [u8; 4] = format!("V{:03X}", d.uid).into_bytes().try_into().unwrap();
-        sb.push(device(&seg, &[name(b"_HID", string("LNRO0005")), name(b"_UID", integer(d.uid.into())),
-            name(b"_CCA", integer(1)), name(b"_CRS", buffer(&crs))]));
+        sb.push(device(
+            &seg,
+            &[
+                name(b"_HID", string("LNRO0005")),
+                name(b"_UID", integer(d.uid.into())),
+                name(b"_CCA", integer(1)),
+                name(b"_CRS", buffer(&crs)),
+            ],
+        ));
     }
     for v in 0..vcpus {
         let seg: [u8; 4] = format!("C{v:03X}").into_bytes().try_into().unwrap();
-        sb.push(device(&seg, &[name(b"_HID", string("ACPI0007")), name(b"_UID", integer(v as u64))]));
+        sb.push(device(
+            &seg,
+            &[
+                name(b"_HID", string("ACPI0007")),
+                name(b"_UID", integer(v as u64)),
+            ],
+        ));
     }
-    let s5 = name(b"_S5_", package(&[S5_SLP_TYP.into(), S5_SLP_TYP.into(), 0, 0]));
+    let s5 = name(
+        b"_S5_",
+        package(&[S5_SLP_TYP.into(), S5_SLP_TYP.into(), 0, 0]),
+    );
     table(b"DSDT", 2, &[s5, root_scope(b"_SB_", &sb)].concat())
 }
 
@@ -289,8 +344,13 @@ pub fn build(vcpus: usize, base: u64) -> Tables {
 
 /// As [`build`], advertising exactly the enabled devices from the launch manifest.
 pub fn build_with_virtio(vcpus: usize, base: u64, virtio: &[VirtioMmio]) -> Tables {
-    assert!((1..=254).contains(&vcpus), "xAPIC MADT entries hold APIC IDs below 255");
-    let next = |at: u64, len: usize, align: u64| (at.wrapping_add(len as u64)).wrapping_add(align - 1) & !(align - 1);
+    assert!(
+        (1..=254).contains(&vcpus),
+        "xAPIC MADT entries hold APIC IDs below 255"
+    );
+    let next = |at: u64, len: usize, align: u64| {
+        (at.wrapping_add(len as u64)).wrapping_add(align - 1) & !(align - 1)
+    };
     let (rsdp, xsdt) = (base, next(base, 36, 64));
     let fadt_at = next(xsdt, HEADER + 16, 64);
     let facs_at = next(fadt_at, 276, 64);
@@ -321,7 +381,11 @@ pub fn build_with_virtio(vcpus: usize, base: u64, virtio: &[VirtioMmio]) -> Tabl
         // The mailbox starts as Noop (all zero): written so the dump and the QEMU image carry it.
         (mailbox, vec![0u8; 4096]),
     ];
-    Tables { rsdp, mailbox, blobs }
+    Tables {
+        rsdp,
+        mailbox,
+        blobs,
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +401,11 @@ mod tests {
         u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
     }
     fn at(t: &Tables, gpa: u64) -> &[u8] {
-        &t.blobs.iter().find(|(a, _)| *a == gpa).expect("a table at the pointer").1
+        &t.blobs
+            .iter()
+            .find(|(a, _)| *a == gpa)
+            .expect("a table at the pointer")
+            .1
     }
     fn sum(b: &[u8]) -> u8 {
         b.iter().fold(0u8, |s, &x| s.wrapping_add(x))
@@ -349,10 +417,17 @@ mod tests {
         for n in 1..=4 {
             let t = build(n, ACPI_NVS.0);
             let r = at(&t, t.rsdp);
-            assert_eq!((&r[..8], r[15], u32_at(r, 16), u32_at(r, 20)), (&b"RSD PTR "[..], 2, 0, 36));
+            assert_eq!(
+                (&r[..8], r[15], u32_at(r, 16), u32_at(r, 20)),
+                (&b"RSD PTR "[..], 2, 0, 36)
+            );
             assert_eq!((sum(&r[..20]), sum(r)), (0, 0));
             for (gpa, b) in &t.blobs[1..6] {
-                let len = if &b[..4] == b"FACS" { 64 } else { u32_at(b, 4) as usize };
+                let len = if &b[..4] == b"FACS" {
+                    64
+                } else {
+                    u32_at(b, 4) as usize
+                };
                 assert_eq!(len, b.len(), "{gpa:#x}");
                 if &b[..4] != b"FACS" {
                     assert_eq!(sum(b), 0, "{}", String::from_utf8_lossy(&b[..4]));
@@ -364,11 +439,20 @@ mod tests {
             assert_eq!((&f[..4], f.len(), f[8], f[131]), (&b"FACP"[..], 276, 6, 5));
             assert_eq!((&m[..4], m[8]), (&b"APIC"[..], 6));
             assert_eq!(&at(&t, u32_at(f, 36).into())[..4], b"FACS");
-            assert_eq!(u64_at(f, 132), 0, "X_FIRMWARE_CTRL zero when FIRMWARE_CTRL is used");
+            assert_eq!(
+                u64_at(f, 132),
+                0,
+                "X_FIRMWARE_CTRL zero when FIRMWARE_CTRL is used"
+            );
             assert_eq!(u64::from(u32_at(f, 40)), u64_at(f, 140));
             assert_eq!(&at(&t, u64_at(f, 140))[..4], b"DSDT");
             assert_eq!(t.mailbox % 4096, 0);
-            assert!(t.blobs.windows(2).all(|w| w[0].0 + w[0].1.len() as u64 <= w[1].0), "disjoint, in order");
+            assert!(
+                t.blobs
+                    .windows(2)
+                    .all(|w| w[0].0 + w[0].1.len() as u64 <= w[1].0),
+                "disjoint, in order"
+            );
         }
     }
 
@@ -388,39 +472,89 @@ mod tests {
     #[test]
     fn cross_agreement() {
         let map = Layout::DEFAULT.e820().unwrap();
-        let kind = |a: u64, len: u64| map.iter().find(|e| e.addr <= a && a + len <= e.addr + e.size).map(|e| e.kind);
+        let kind = |a: u64, len: u64| {
+            map.iter()
+                .find(|e| e.addr <= a && a + len <= e.addr + e.size)
+                .map(|e| e.kind)
+        };
         for n in [1, 2, 3, 4, 10, 16, 17, 32, 64] {
             let t = build(n, ACPI_NVS.0);
             let x = at(&t, u64_at(at(&t, t.rsdp), 24));
             let (f, m) = (at(&t, u64_at(x, 36)), at(&t, u64_at(x, 44)));
             let e = madt_entries(m);
             // LAPIC address = IA32_APIC_BASE's reset base (X3); IDs = CPUID's initial and x2APIC IDs per vCPU.
-            assert_eq!(u64::from(u32_at(m, 36)), natemu_abi::cpu_profile::APIC_BASE_BSP_RESET & !0xfff);
-            let lapics: Vec<_> = e.iter().filter(|s| s[0] == 0).map(|s| (s[2], s[3], u32_at(s, 4))).collect();
+            assert_eq!(
+                u64::from(u32_at(m, 36)),
+                natemu_abi::cpu_profile::APIC_BASE_BSP_RESET & !0xfff
+            );
+            let lapics: Vec<_> = e
+                .iter()
+                .filter(|s| s[0] == 0)
+                .map(|s| (s[2], s[3], u32_at(s, 4)))
+                .collect();
             assert_eq!(lapics.len(), n);
             for (v, &(uid, id, flags)) in lapics.iter().enumerate() {
-                let d = Dynamic { vcpus: n as u64, vcpu: v as u64, cr4: 0, apic_base: 0xfee0_0800, misc_enable: 0, xcr0: 1 };
+                let d = Dynamic {
+                    vcpus: n as u64,
+                    vcpu: v as u64,
+                    cr4: 0,
+                    apic_base: 0xfee0_0800,
+                    misc_enable: 0,
+                    xcr0: 1,
+                };
                 assert_eq!(u32::from(id), cpuid(1, 0, &d)[1] >> 24);
                 assert_eq!(u32::from(id), cpuid(0xb, 0, &d)[3]);
-                assert_eq!(cpuid(1, 0, &d)[1] >> 16 & 0xff, n as u32, "logical processor count");
+                assert_eq!(
+                    cpuid(1, 0, &d)[1] >> 16 & 0xff,
+                    n as u32,
+                    "logical processor count"
+                );
                 assert_eq!((uid, flags), (v as u8, 1));
-                assert_ne!(cpuid(1, 0, &d)[2] & 1 << 21, 0, "x2APIC advertised; IDs < 255 use xAPIC entries");
+                assert_ne!(
+                    cpuid(1, 0, &d)[2] & 1 << 21,
+                    0,
+                    "x2APIC advertised; IDs < 255 use xAPIC entries"
+                );
             }
             // The DSDT's processors: one ACPI0007 device per MADT UID, in order.
             let d = at(&t, u64_at(f, 140));
             for v in 0..n {
-                let dev = [&b"\x08_HID\x0dACPI0007\x00\x08_UID"[..], &aml::integer(v as u64)].concat();
+                let dev = [
+                    &b"\x08_HID\x0dACPI0007\x00\x08_UID"[..],
+                    &aml::integer(v as u64),
+                ]
+                .concat();
                 assert!(d.windows(dev.len()).any(|w| w == dev), "processor {v}");
             }
             assert_eq!(d.windows(4).filter(|w| w == b"ACPI").count(), n);
             // IOAPIC, IRQ0 override, LINT1 NMI, mailbox.
             let io: Vec<_> = e.iter().filter(|s| s[0] == 1).collect();
-            assert_eq!((io.len(), io[0][2], u32_at(io[0], 4), u32_at(io[0], 8)), (1, IOAPIC_ID, IOAPIC_BASE, 0));
-            let iso: Vec<_> = e.iter().filter(|s| s[0] == 2).map(|s| (s[2], s[3], u32_at(s, 4), s[8])).collect();
-            assert_eq!(iso, [(0, 0, 2, 0), (0, 9, 9, 0x0d)], "IRQ0 -> GSI2 and the SCI, level/high");
-            assert_eq!(e.iter().filter(|s| s[0] == 4).map(|s| s.to_vec()).collect::<Vec<_>>(), [vec![4, 6, 0xff, 0, 0, 1]]);
+            assert_eq!(
+                (io.len(), io[0][2], u32_at(io[0], 4), u32_at(io[0], 8)),
+                (1, IOAPIC_ID, IOAPIC_BASE, 0)
+            );
+            let iso: Vec<_> = e
+                .iter()
+                .filter(|s| s[0] == 2)
+                .map(|s| (s[2], s[3], u32_at(s, 4), s[8]))
+                .collect();
+            assert_eq!(
+                iso,
+                [(0, 0, 2, 0), (0, 9, 9, 0x0d)],
+                "IRQ0 -> GSI2 and the SCI, level/high"
+            );
+            assert_eq!(
+                e.iter()
+                    .filter(|s| s[0] == 4)
+                    .map(|s| s.to_vec())
+                    .collect::<Vec<_>>(),
+                [vec![4, 6, 0xff, 0, 0, 1]]
+            );
             let wake: Vec<_> = e.iter().filter(|s| s[0] == 0x10).collect();
-            assert_eq!((wake.len(), wake[0].len(), u64_at(wake[0], 8)), (1, 16, t.mailbox));
+            assert_eq!(
+                (wake.len(), wake[0].len(), u64_at(wake[0], 8)),
+                (1, 16, t.mailbox)
+            );
             assert_eq!(&wake[0][2..8], &[0; 6], "mailbox version 0");
             // e820: every blob (tables and mailbox) in the ACPI NVS extent; the APICs in the reserved aperture.
             for (gpa, b) in &t.blobs {
@@ -430,12 +564,45 @@ mod tests {
             assert_eq!(kind(LAPIC_BASE.into(), 4096), Some(E820_RESERVED));
             assert_eq!(kind(IOAPIC_BASE.into(), 4096), Some(E820_RESERVED));
             // FADT <-> the device set.
-            assert_eq!((u16::from_le_bytes([f[46], f[47]]), u32_at(f, 56), u32_at(f, 64), u32_at(f, 76)), (9, 0xb000, 0xb004, 0xb008));
-            assert_eq!((u64_at(f, 152), u64_at(f, 176), u64_at(f, 212), u64_at(f, 120), f[128]), (0xb000, 0xb004, 0xb008, 0xb040, 6));
-            assert_eq!((u32_at(f, 48), u32_at(f, 80), u32_at(f, 84), f[92]), (0, 0, 0, 0), "no SMI command, no GPE blocks");
-            assert_eq!((u32_at(f, 112), f[44]), (0x80a5 & !(1 << 7) | 1 << 10, 1), "QEMU's flags less RTC_S4, plus RESET_REG_SUP");
-            let rtc = [&b"RTC_\x08_HID"[..], &aml::eisa_id("PNP0B00"), b"\x08_CRS\x11\x10\x0a\x0d\x47\x01\x70\x00\x70\x00\x01\x02\x22\x00\x01"].concat();
-            assert!(d.windows(rtc.len()).any(|w| w == rtc), "RTC: 0x70 length 2, IRQ 8");
+            assert_eq!(
+                (
+                    u16::from_le_bytes([f[46], f[47]]),
+                    u32_at(f, 56),
+                    u32_at(f, 64),
+                    u32_at(f, 76)
+                ),
+                (9, 0xb000, 0xb004, 0xb008)
+            );
+            assert_eq!(
+                (
+                    u64_at(f, 152),
+                    u64_at(f, 176),
+                    u64_at(f, 212),
+                    u64_at(f, 120),
+                    f[128]
+                ),
+                (0xb000, 0xb004, 0xb008, 0xb040, 6)
+            );
+            assert_eq!(
+                (u32_at(f, 48), u32_at(f, 80), u32_at(f, 84), f[92]),
+                (0, 0, 0, 0),
+                "no SMI command, no GPE blocks"
+            );
+            assert_eq!(
+                (u32_at(f, 112), f[44]),
+                (0x80a5 & !(1 << 7) | 1 << 10, 1),
+                "QEMU's flags less RTC_S4, plus RESET_REG_SUP"
+            );
+            let rtc = [
+                &b"RTC_\x08_HID"[..],
+                &aml::eisa_id("PNP0B00"),
+                b"\x08_CRS\x11\x10\x0a\x0d\x47\x01\x70\x00\x70\x00\x01\x02\x22\x00\x01",
+            ]
+            .concat();
+            assert!(
+                d.windows(rtc.len()).any(|w| w == rtc),
+                "RTC: 0x70 length 2, IRQ 8"
+            );
         }
     }
 
@@ -445,7 +612,10 @@ mod tests {
         assert_eq!(aml::eisa_id("PNP0501"), [0x0c, 0x41, 0xd0, 0x05, 0x01]);
         assert_eq!(aml::package(&[0, 0, 0, 0]), [0x12, 0x06, 0x04, 0, 0, 0, 0]);
         let long = aml::buffer(&[0u8; 100]);
-        assert_eq!(&long[..4], &[0x11, 0x40 | (100 + 2 + 2) & 0xf, (100 + 2 + 2) >> 4, 0x0a]);
+        assert_eq!(
+            &long[..4],
+            &[0x11, 0x40 | (100 + 2 + 2) & 0xf, (100 + 2 + 2) >> 4, 0x0a]
+        );
         assert_eq!(aml::integer(0x3f8), [0x0b, 0xf8, 0x03]);
     }
 }

@@ -24,7 +24,8 @@ const fn leaf_0x15() -> [u32; 4] {
 /// The core crystal clock (CPUID.15H:ECX).
 pub const CRYSTAL_HZ: u64 = leaf_0x15()[2] as u64;
 // TSC = crystal x EBX / EAX exactly (CPUID.15H: EAX denominator, EBX numerator).
-const _: () = assert!(cpu_profile::TSC_HZ * leaf_0x15()[0] as u64 == CRYSTAL_HZ * leaf_0x15()[1] as u64);
+const _: () =
+    assert!(cpu_profile::TSC_HZ * leaf_0x15()[0] as u64 == CRYSTAL_HZ * leaf_0x15()[1] as u64);
 
 /// floor(`count` x `hz` / `frequency`): the count of a clock at `hz` at V = `count` (V at `frequency`).
 pub const fn scale(count: u64, hz: u64, frequency: u64) -> u64 {
@@ -43,7 +44,11 @@ pub const fn count_at_crystal(edges: u64, frequency: u64) -> u64 {
 /// [`scale`] (`scale(v, hz, frequency) >= edges` iff `v >= count_at(edges, hz, frequency)`).
 pub const fn count_at(edges: u64, hz: u64, frequency: u64) -> u64 {
     let v = (edges as u128 * frequency as u128).div_ceil(hz as u128);
-    if v > u64::MAX as u128 { u64::MAX } else { v as u64 }
+    if v > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        v as u64
+    }
 }
 /// L4b: the 8254 PIT's input clock (QEMU's `PIT_FREQ`, Linux's `PIT_TICK_RATE`: 14.31818 MHz / 12, rounded).
 pub const PIT_HZ: u64 = 1_193_182;
@@ -59,7 +64,13 @@ mod tests {
     extern crate std;
     use super::*;
     /// The M4's CNTFRQ and other rates a host could report.
-    const RATES: [u64; 5] = [24_000_000, 19_200_000, 25_000_000, 1_000_000_000, 54_000_000];
+    const RATES: [u64; 5] = [
+        24_000_000,
+        19_200_000,
+        25_000_000,
+        1_000_000_000,
+        54_000_000,
+    ];
 
     /// Perf chunk 15: fexc patch 0032's inline RDTSC (a 24 MHz count): V = 3a + r with a = umulh(V, 0xAAAA..AB) >> 1,
     /// then 125a + 41r + (r >> 1), all modulo 2^64, is [`tsc`]'s floor(V x 1e9 / 24e6) for every V.
@@ -68,11 +79,19 @@ mod tests {
         let inline = |v: u64| {
             let a = ((u128::from(v) * 0xAAAA_AAAA_AAAA_AAAB) >> 64) as u64 >> 1;
             let r = v.wrapping_sub(a.wrapping_mul(3));
-            a.wrapping_mul(125).wrapping_add(r.wrapping_mul(41).wrapping_add(r >> 1))
+            a.wrapping_mul(125)
+                .wrapping_add(r.wrapping_mul(41).wrapping_add(r >> 1))
         };
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let edges = (0..10_000u64).chain((0..64).flat_map(|b| [1u64 << b, (1u64 << b) - 1, (1u64 << b) + 1])).chain([u64::MAX, u64::MAX - 1, u64::MAX - 2]);
-        for v in edges.chain((0..1_000_000).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x })) {
+        let edges = (0..10_000u64)
+            .chain((0..64).flat_map(|b| [1u64 << b, (1u64 << b) - 1, (1u64 << b) + 1]))
+            .chain([u64::MAX, u64::MAX - 1, u64::MAX - 2]);
+        for v in edges.chain((0..1_000_000).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        })) {
             assert_eq!(inline(v), tsc(v, 24_000_000), "{v:#x}");
         }
     }
@@ -87,7 +106,10 @@ mod tests {
             for edges in (0..5000).chain([u32::MAX as u64, 1 << 40, 123_456_789_012]) {
                 let v = count_at_crystal(edges, f);
                 assert!(crystal(v, f) >= edges, "{f} {edges}");
-                assert!(v == 0 || crystal(v - 1, f) < edges, "{f} {edges}: not the first V");
+                assert!(
+                    v == 0 || crystal(v - 1, f) < edges,
+                    "{f} {edges}: not the first V"
+                );
             }
             for v in (0..5000u64).chain([1 << 50, u64::MAX / 2]) {
                 let e = crystal(v, f);
@@ -97,7 +119,10 @@ mod tests {
             for hz in [PIT_HZ, PM_TIMER_HZ] {
                 for v in (0..3000u64).chain([1 << 44, 987_654_321_987]) {
                     let e = scale(v, hz, f);
-                    assert!(count_at(e, hz, f) <= v && count_at(e + 1, hz, f) > v, "{f} {hz} {v}");
+                    assert!(
+                        count_at(e, hz, f) <= v && count_at(e + 1, hz, f) > v,
+                        "{f} {hz} {v}"
+                    );
                 }
             }
         }

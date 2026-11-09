@@ -41,17 +41,29 @@ pub trait Device: Send {
     /// synchronous read/write interface above.
     fn access(&mut self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Access {
         match value {
-            Some(value) => if self.write(vcpu, offset, size, value) { Access::Completed(0) } else { Access::Refused },
-            None => self.read(vcpu, offset, size).map_or(Access::Refused, Access::Completed),
+            Some(value) => {
+                if self.write(vcpu, offset, size, value) {
+                    Access::Completed(0)
+                } else {
+                    Access::Refused
+                }
+            }
+            None => self
+                .read(vcpu, offset, size)
+                .map_or(Access::Refused, Access::Completed),
         }
     }
     /// Poll a previously accepted access without replaying it. Deferred must return the same token.
     /// Refused here is a terminal failure, not a promise that the accepted operation had no effects.
     /// A backend owns its in-flight buffers until completion/join even if the waiting vCPU stops.
-    fn poll(&mut self, _vcpu: usize, _token: u64) -> Access { Access::Refused }
+    fn poll(&mut self, _vcpu: usize, _token: u64) -> Access {
+        Access::Refused
+    }
     /// Idempotently close new admission and poll accepted work/durability. Never wait here.
     /// True means all accepted effects and callbacks have retired successfully.
-    fn quiesce(&mut self) -> crate::Result<bool> { Ok(true) }
+    fn quiesce(&mut self) -> crate::Result<bool> {
+        Ok(true)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -72,18 +84,32 @@ pub struct Pending {
 /// A view of `.0` whose offsets start at `.1` (one device registered on several ranges, each told apart by its offset).
 pub(crate) struct At(pub(crate) Shared, pub(crate) u64);
 impl Device for At {
-    fn quiesce(&mut self) -> crate::Result<bool> { self.0.lock().unwrap_or_else(|e| e.into_inner()).quiesce() }
+    fn quiesce(&mut self) -> crate::Result<bool> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).quiesce()
+    }
     fn read(&mut self, vcpu: usize, offset: u64, size: u64) -> Option<u64> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).read(vcpu, self.1 + offset, size)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read(vcpu, self.1 + offset, size)
     }
     fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(vcpu, self.1 + offset, size, value)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write(vcpu, self.1 + offset, size, value)
     }
     fn access(&mut self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Access {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).access(vcpu, self.1 + offset, size, value)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .access(vcpu, self.1 + offset, size, value)
     }
     fn poll(&mut self, vcpu: usize, token: u64) -> Access {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).poll(vcpu, token)
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poll(vcpu, token)
     }
 }
 
@@ -122,7 +148,16 @@ pub struct Devices {
 }
 impl Devices {
     pub fn new(ram_end: u64) -> Self {
-        Self { ranges: Vec::new(), ram_end, ports: Vec::new(), strict: false, port_counts: Mutex::default(), page_counts: Mutex::default(), irqs: None, power: Arc::default() }
+        Self {
+            ranges: Vec::new(),
+            ram_end,
+            ports: Vec::new(),
+            strict: false,
+            port_counts: Mutex::default(),
+            page_counts: Mutex::default(),
+            irqs: None,
+            power: Arc::default(),
+        }
     }
     /// L4b: the power request made so far (0 none).
     pub(crate) fn power(&self) -> u8 {
@@ -143,7 +178,9 @@ impl Devices {
     pub fn register_ports(&mut self, base: u32, count: u32, device: Shared) -> crate::Result<()> {
         let end = base + count;
         if count == 0 || end > 0x1_0000 || self.ports.iter().any(|&(b, e, _)| base < e && b < end) {
-            return Err(format!("port range {base:#x}+{count:#x}: inside 0..10000H, not overlapping another"));
+            return Err(format!(
+                "port range {base:#x}+{count:#x}: inside 0..10000H, not overlapping another"
+            ));
         }
         self.ports.push((base, end, device));
         Ok(())
@@ -158,7 +195,8 @@ impl Devices {
         {
             let mut counts = self.port_counts.lock().unwrap_or_else(|e| e.into_inner());
             for k in 0..size as u32 {
-                counts.entry(((first + k) & 0xffff) as u16).or_default()[usize::from(data.is_some())] += 1;
+                counts.entry(((first + k) & 0xffff) as u16).or_default()
+                    [usize::from(data.is_some())] += 1;
             }
         }
         let call = |d: &Shared, offset: u64, size: u64, data: Option<u64>| -> Result<u64, u64> {
@@ -169,7 +207,10 @@ impl Devices {
             }
             .ok_or(mmio::DEVICE)
         };
-        if let Some((b, _, d)) = self.port_owner(first).filter(|&&(_, e, _)| first + size as u32 <= e) {
+        if let Some((b, _, d)) = self
+            .port_owner(first)
+            .filter(|&&(_, e, _)| first + size as u32 <= e)
+        {
             return call(d, u64::from(first - b), size, data);
         }
         let bytes: Vec<u32> = (0..size as u32).map(|k| (first + k) & 0xffff).collect();
@@ -191,21 +232,37 @@ impl Devices {
         let ports = self.port_counts.lock().unwrap_or_else(|e| e.into_inner());
         let ports = ports.iter().map(|(&p, [r, w])| {
             let unassigned = self.port_owner(u32::from(p)).is_none();
-            format!("{{\"port\":\"{p:#x}\",\"reads\":{r},\"writes\":{w},\"unassigned\":{unassigned}}}")
+            format!(
+                "{{\"port\":\"{p:#x}\",\"reads\":{r},\"writes\":{w},\"unassigned\":{unassigned}}}"
+            )
         });
         let pages = self.page_counts.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = pages.iter().map(|(&g, [r, w])| format!("{{\"page\":\"{g:#x}\",\"reads\":{r},\"writes\":{w}}}"));
-        format!("\"ports\":[{}],\"unassigned_pages\":[{}]", ports.collect::<Vec<_>>().join(","), pages.collect::<Vec<_>>().join(","))
+        let pages = pages
+            .iter()
+            .map(|(&g, [r, w])| format!("{{\"page\":\"{g:#x}\",\"reads\":{r},\"writes\":{w}}}"));
+        format!(
+            "\"ports\":[{}],\"unassigned_pages\":[{}]",
+            ports.collect::<Vec<_>>().join(","),
+            pages.collect::<Vec<_>>().join(",")
+        )
     }
     /// Registers `device` at `[base, base + bytes)`: page-aligned, outside guest RAM (above it, or inside the legacy hole,
     /// `exec::LEGACY_HOLE`), below MAXPHYADDR (40 bits), not overlapping another range.
     pub fn register(&mut self, base: u64, bytes: u64, device: Shared) -> crate::Result<()> {
-        let end = base.checked_add(bytes).filter(|&e| bytes > 0 && e <= 1 << 40);
-        let Some(end) = end.filter(|&e| base % 4096 == 0 && bytes % 4096 == 0 && self.not_ram(base, e)) else {
-            return Err(format!("device range {base:#x}+{bytes:#x}: page-aligned, outside guest RAM, below 2^40"));
+        let end = base
+            .checked_add(bytes)
+            .filter(|&e| bytes > 0 && e <= 1 << 40);
+        let Some(end) =
+            end.filter(|&e| base % 4096 == 0 && bytes % 4096 == 0 && self.not_ram(base, e))
+        else {
+            return Err(format!(
+                "device range {base:#x}+{bytes:#x}: page-aligned, outside guest RAM, below 2^40"
+            ));
         };
         if self.ranges.iter().any(|&(b, e, _)| base < e && b < end) {
-            return Err(format!("device range {base:#x}+{bytes:#x} overlaps another"));
+            return Err(format!(
+                "device range {base:#x}+{bytes:#x} overlaps another"
+            ));
         }
         self.ranges.push((base, end, device));
         Ok(())
@@ -216,22 +273,46 @@ impl Devices {
             || base >= self.ram_end.min(exec::LOW_RAM_END) && end <= exec::HIGH_RAM_START
     }
     pub fn find(&self, gpa: u64) -> Option<(&Shared, u64)> {
-        self.ranges.iter().find(|&&(b, e, _)| (b..e).contains(&gpa)).map(|(b, _, d)| (d, gpa - b))
+        self.ranges
+            .iter()
+            .find(|&&(b, e, _)| (b..e).contains(&gpa))
+            .map(|(b, _, d)| (d, gpa - b))
     }
 }
 pub fn mask(bytes: u64) -> u64 {
-    if bytes >= 8 { u64::MAX } else { (1 << (8 * bytes)) - 1 }
+    if bytes >= 8 {
+        u64::MAX
+    } else {
+        (1 << (8 * bytes)) - 1
+    }
 }
 
 /// Serves vCPU `area.vcpu`'s device request ([`exec::REQUEST_DEVICE`]): one read or write of the device at the request's
 /// address, its value or refusal into the [`Mmio`] record, and the reply. A request the resident could not have made (a
 /// width other than 1, 2, 4, 8 or an access leaving its page) is a bad reply, never a device access.
-pub(crate) fn serve(area: Area, state: &mut State, devices: Option<&Devices>, pending: &mut Option<Pending>) {
-    let m = begin(area.vcpu, state.cpu.rip, area.read_record(MMIO_OFFSET), devices, pending);
+pub(crate) fn serve(
+    area: Area,
+    state: &mut State,
+    devices: Option<&Devices>,
+    pending: &mut Option<Pending>,
+) {
+    let m = begin(
+        area.vcpu,
+        state.cpu.rip,
+        area.read_record(MMIO_OFFSET),
+        devices,
+        pending,
+    );
     area.write_record(MMIO_OFFSET, m);
     state.reply = exec::REPLY_DEVICE;
 }
-fn begin(vcpu: usize, rip: u64, mut m: Mmio, devices: Option<&Devices>, pending: &mut Option<Pending>) -> Mmio {
+fn begin(
+    vcpu: usize,
+    rip: u64,
+    mut m: Mmio,
+    devices: Option<&Devices>,
+    pending: &mut Option<Pending>,
+) -> Mmio {
     // A device access to guest RAM is a resident error, never answered (L3: not all-ones either).
     let well_formed = matches!(m.width, 1 | 2 | 4 | 8)
         && (m.gpa & 4095) + m.width <= 4096
@@ -242,23 +323,44 @@ fn begin(vcpu: usize, rip: u64, mut m: Mmio, devices: Option<&Devices>, pending:
         None => mmio::UNASSIGNED,
         // L3: the unassigned rule (or, strict, the refusal), counted either way.
         Some((d, None)) => {
-            d.page_counts.lock().unwrap_or_else(|e| e.into_inner()).entry(m.gpa & !4095).or_default()[m.write as usize] += 1;
+            d.page_counts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(m.gpa & !4095)
+                .or_default()[m.write as usize] += 1;
             if d.strict {
                 m.status = mmio::UNASSIGNED;
             } else if m.write == 0 {
                 m.value = mask(m.width);
             }
-            if d.strict { mmio::UNASSIGNED } else { mmio::DONE }
+            if d.strict {
+                mmio::UNASSIGNED
+            } else {
+                mmio::DONE
+            }
         }
         Some((_, Some((device, offset)))) => {
             let mut d = device.lock().unwrap_or_else(|e| e.into_inner());
-            match d.access(vcpu, offset, m.width, (m.write != 0).then_some(m.value & mask(m.width))) {
+            match d.access(
+                vcpu,
+                offset,
+                m.width,
+                (m.write != 0).then_some(m.value & mask(m.width)),
+            ) {
                 Access::Completed(value) => {
-                    if m.write == 0 { m.value = value & mask(m.width); }
+                    if m.write == 0 {
+                        m.value = value & mask(m.width);
+                    }
                     mmio::DONE
                 }
                 Access::Deferred(token) => {
-                    *pending = Some(Pending { device: device.clone(), token, request: m, vcpu, rip });
+                    *pending = Some(Pending {
+                        device: device.clone(),
+                        token,
+                        request: m,
+                        vcpu,
+                        rip,
+                    });
                     mmio::PENDING
                 }
                 Access::Refused => mmio::DEVICE,
@@ -271,29 +373,46 @@ fn begin(vcpu: usize, rip: u64, mut m: Mmio, devices: Option<&Devices>, pending:
 /// Poll only the retained host identity. A malformed/replayed poll never calls a device. This
 /// handler returns promptly; the resident then rechecks the RAM-window request before polling again.
 pub(crate) fn serve_poll(area: Area, state: &mut State, pending: &mut Option<Pending>) {
-    let m = poll_request(area.vcpu, state.cpu.rip, area.read_record(MMIO_OFFSET), pending);
+    let m = poll_request(
+        area.vcpu,
+        state.cpu.rip,
+        area.read_record(MMIO_OFFSET),
+        pending,
+    );
     area.write_record(MMIO_OFFSET, m);
     state.reply = exec::REPLY_DEVICE_POLL;
 }
 fn poll_request(vcpu: usize, rip: u64, mut m: Mmio, pending: &mut Option<Pending>) -> Mmio {
     m.status = 0;
     if let Some(p) = pending.as_ref().filter(|p| {
-        p.vcpu == vcpu && p.rip == rip && p.request.gpa == m.gpa
-            && p.request.width == m.width && p.request.write == m.write && p.request.completed == m.completed
+        p.vcpu == vcpu
+            && p.rip == rip
+            && p.request.gpa == m.gpa
+            && p.request.width == m.width
+            && p.request.write == m.write
+            && p.request.completed == m.completed
             && (m.write == 0 || p.request.value == m.value)
     }) {
-        let result = p.device.lock().unwrap_or_else(|e| e.into_inner()).poll(p.vcpu, p.token);
+        let result = p
+            .device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poll(p.vcpu, p.token);
         m = p.request;
         m.status = match result {
             Access::Completed(value) => {
-                if m.write == 0 { m.value = value & mask(m.width); }
+                if m.write == 0 {
+                    m.value = value & mask(m.width);
+                }
                 mmio::DONE
             }
             Access::Deferred(token) if token == p.token => mmio::PENDING,
             Access::Deferred(_) => 0,
             Access::Refused => mmio::FAILED,
         };
-        if m.status != mmio::PENDING { *pending = None; }
+        if m.status != mmio::PENDING {
+            *pending = None;
+        }
     }
     m
 }
@@ -305,13 +424,23 @@ fn poll_request(vcpu: usize, rip: u64, mut m: Mmio, pending: &mut Option<Pending
 pub(crate) fn serve_page(area: Area, state: &mut State, devices: Option<&Devices>) {
     let mut m: Mmio = area.read_record(MMIO_OFFSET);
     m.status = match devices {
-        Some(d) if m.gpa % 4096 == 0 && m.gpa < 1 << 40 && d.not_ram(m.gpa, m.gpa + 4096) => match d.find(m.gpa) {
-            Some(_) => mmio::CLAIMED,
-            None => {
-                d.page_counts.lock().unwrap_or_else(|e| e.into_inner()).entry(m.gpa).or_default()[0] += 1;
-                if d.strict { mmio::UNASSIGNED } else { mmio::DONE }
+        Some(d) if m.gpa % 4096 == 0 && m.gpa < 1 << 40 && d.not_ram(m.gpa, m.gpa + 4096) => {
+            match d.find(m.gpa) {
+                Some(_) => mmio::CLAIMED,
+                None => {
+                    d.page_counts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(m.gpa)
+                        .or_default()[0] += 1;
+                    if d.strict {
+                        mmio::UNASSIGNED
+                    } else {
+                        mmio::DONE
+                    }
+                }
             }
-        },
+        }
         _ => 0,
     };
     area.write_record(MMIO_OFFSET, m);
@@ -327,7 +456,12 @@ pub(crate) fn serve_port(area: Area, state: &mut State, devices: Option<&Devices
     m.status = match devices {
         _ if !well_formed => 0,
         None => mmio::UNASSIGNED,
-        Some(d) => match d.port(area.vcpu, m.gpa as u16, m.width, (m.write != 0).then_some(m.value)) {
+        Some(d) => match d.port(
+            area.vcpu,
+            m.gpa as u16,
+            m.width,
+            (m.write != 0).then_some(m.value),
+        ) {
             Ok(v) => {
                 m.value = v;
                 mmio::DONE
@@ -353,7 +487,9 @@ mod capacity_tests {
             (4 << 30, (4 << 30) + 4096, false),
             ((9 << 30) - 4096, 9 << 30, false),
             (9 << 30, (9 << 30) + 4096, true),
-        ] { assert_eq!(d.not_ram(base, end), device, "{base:#x}..{end:#x}"); }
+        ] {
+            assert_eq!(d.not_ram(base, end), device, "{base:#x}..{end:#x}");
+        }
     }
 }
 
@@ -370,8 +506,12 @@ mod deferred_tests {
         replies: VecDeque<Access>,
     }
     impl Device for Mock {
-        fn read(&mut self, _: usize, _: u64, _: u64) -> Option<u64> { panic!("deferred MMIO must use access") }
-        fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool { panic!("deferred MMIO must use access") }
+        fn read(&mut self, _: usize, _: u64, _: u64) -> Option<u64> {
+            panic!("deferred MMIO must use access")
+        }
+        fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool {
+            panic!("deferred MMIO must use access")
+        }
         fn access(&mut self, v: usize, o: u64, s: u64, x: Option<u64>) -> Access {
             self.accesses.push((v, o, s, x));
             Access::Deferred(42)
@@ -383,9 +523,21 @@ mod deferred_tests {
     }
     fn setup(replies: &[Access]) -> (Devices, Arc<Mutex<Mock>>, Mmio) {
         let mut bus = Devices::new(64 << 20);
-        let device = Arc::new(Mutex::new(Mock { replies: replies.iter().copied().collect(), ..Default::default() }));
+        let device = Arc::new(Mutex::new(Mock {
+            replies: replies.iter().copied().collect(),
+            ..Default::default()
+        }));
         bus.register(BASE, 4096, device.clone()).unwrap();
-        (bus, device, Mmio { gpa: BASE + 4, width: 4, completed: 7, ..Mmio::default() })
+        (
+            bus,
+            device,
+            Mmio {
+                gpa: BASE + 4,
+                width: 4,
+                completed: 7,
+                ..Mmio::default()
+            },
+        )
     }
     #[test]
     fn deferred_access_is_issued_once_and_load_result_is_masked() {
@@ -397,7 +549,10 @@ mod deferred_tests {
         m = poll_request(2, RIP, m, &mut pending);
         assert_eq!(m.status, mmio::PENDING);
         m = poll_request(2, RIP, m, &mut pending);
-        assert_eq!((m.status, m.value, m.completed), (mmio::DONE, 0xffff_ffff, 7));
+        assert_eq!(
+            (m.status, m.value, m.completed),
+            (mmio::DONE, 0xffff_ffff, 7)
+        );
         assert!(pending.is_none());
         let d = device.lock().unwrap();
         assert_eq!(d.accesses, [(2, 4, 4, None)]);
@@ -409,7 +564,15 @@ mod deferred_tests {
         let mut pending = None;
         let m = begin(2, RIP, m, Some(&bus), &mut pending);
         assert_eq!(begin(2, RIP, m, Some(&bus), &mut pending).status, 0);
-        for changed in [Mmio { gpa: m.gpa + 4, ..m }, Mmio { width: 8, ..m }, Mmio { write: 1, ..m }, Mmio { completed: 8, ..m }] {
+        for changed in [
+            Mmio {
+                gpa: m.gpa + 4,
+                ..m
+            },
+            Mmio { width: 8, ..m },
+            Mmio { write: 1, ..m },
+            Mmio { completed: 8, ..m },
+        ] {
             assert_eq!(poll_request(2, RIP, changed, &mut pending).status, 0);
         }
         assert_eq!(poll_request(3, RIP, m, &mut pending).status, 0);
@@ -444,7 +607,8 @@ mod deferred_tests {
     fn range_view_forwards_offset_and_stable_poll_token() {
         let (_, device, m) = setup(&[Access::Completed(9)]);
         let mut bus = Devices::new(64 << 20);
-        bus.register(BASE, 4096, Arc::new(Mutex::new(At(device.clone(), 256)))).unwrap();
+        bus.register(BASE, 4096, Arc::new(Mutex::new(At(device.clone(), 256))))
+            .unwrap();
         let mut pending = None;
         let m = begin(0, RIP, m, Some(&bus), &mut pending);
         assert_eq!(poll_request(0, RIP, m, &mut pending).value, 9);
@@ -463,7 +627,10 @@ mod deferred_tests {
         drop(device);
         drop(bus);
         assert!(weak.upgrade().is_some());
-        assert_eq!(poll_request(0, RIP, Mmio { value: 0, ..m }, &mut pending).status, 0);
+        assert_eq!(
+            poll_request(0, RIP, Mmio { value: 0, ..m }, &mut pending).status,
+            0
+        );
         let m = poll_request(0, RIP, m, &mut pending);
         assert_eq!((m.status, m.value), (mmio::DONE, u64::MAX));
         assert!(weak.upgrade().is_none());
@@ -472,15 +639,20 @@ mod deferred_tests {
     fn legacy_default_access_and_port_contract_remain_synchronous() {
         struct Legacy;
         impl Device for Legacy {
-            fn read(&mut self, _: usize, _: u64, size: u64) -> Option<u64> { (size == 4).then_some(0x1234) }
-            fn write(&mut self, _: usize, _: u64, size: u64, _: u64) -> bool { size == 4 }
+            fn read(&mut self, _: usize, _: u64, size: u64) -> Option<u64> {
+                (size == 4).then_some(0x1234)
+            }
+            fn write(&mut self, _: usize, _: u64, size: u64, _: u64) -> bool {
+                size == 4
+            }
         }
         let mut d = Legacy;
         assert_eq!(d.access(0, 0, 4, None), Access::Completed(0x1234));
         assert_eq!(d.access(0, 0, 4, Some(1)), Access::Completed(0));
         assert_eq!(d.access(0, 0, 8, None), Access::Refused);
         let mut bus = Devices::new(64 << 20);
-        bus.register_ports(0x100, 8, Arc::new(Mutex::new(d))).unwrap();
+        bus.register_ports(0x100, 8, Arc::new(Mutex::new(d)))
+            .unwrap();
         assert_eq!(bus.port(0, 0x100, 4, None), Ok(0x1234));
         assert_eq!(bus.port(0, 0x100, 4, Some(2)), Ok(0));
     }

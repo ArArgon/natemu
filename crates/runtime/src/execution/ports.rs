@@ -23,7 +23,10 @@
 //! with the state at the instruction after the elements done.
 use super::segments::{self, Exception};
 use super::*;
-use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_PORT, REPLY_PORT_POWER, REPLY_POWER_POLL, REQUEST_PORT, REQUEST_POWER_POLL, mmio as status};
+use natemu_abi::execution::{
+    MMIO_VA, Mmio, REPLY_PORT, REPLY_PORT_POWER, REPLY_POWER_POLL, REQUEST_PORT,
+    REQUEST_POWER_POLL, mmio as status,
+};
 
 const GP0: Exception = [13, 0, 0];
 const AC0: Exception = [17, 0, 0];
@@ -70,7 +73,14 @@ fn access(s: &mut State, port: u64, size: u64, data: Option<u64>) -> (u64, bool)
     let exchange = MMIO_VA as *mut Mmio;
     unsafe {
         let completed = read_record(exchange).completed;
-        let request = Mmio { gpa: port, width: size, write: u64::from(data.is_some()), value: data.unwrap_or(0), completed, ..Mmio::default() };
+        let request = Mmio {
+            gpa: port,
+            width: size,
+            write: u64::from(data.is_some()),
+            value: data.unwrap_or(0),
+            completed,
+            ..Mmio::default()
+        };
         write_record(exchange, &request);
         (s.request, s.reply) = (REQUEST_PORT, NONE);
         write_record(record(), s);
@@ -97,7 +107,11 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     let c = s.cpu;
     let size = u64::from(i.size);
     if matches!(i.kind, system::IN | system::OUT) {
-        let port = if i.reg == system::NO_REG { u64::from(i.cr) } else { c.gpr[2] & 0xffff };
+        let port = if i.reg == system::NO_REG {
+            u64::from(i.cr)
+        } else {
+            c.gpr[2] & 0xffff
+        };
         permitted(s, port, size)?;
         super::watch::port(s, port, size);
         let power;
@@ -110,11 +124,17 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             power = access(s, port, size, Some(c.gpr[0] & mask(size))).1;
         }
         commit(s, i, false);
-        if power { power_wait(s); }
+        if power {
+            power_wait(s);
+        }
         return Ok(());
     }
     let rep = i.prefixes & system::REP != 0;
-    let wide = if i.prefixes & system::ADDRESS32 != 0 { 0xffff_ffff } else { u64::MAX };
+    let wide = if i.prefixes & system::ADDRESS32 != 0 {
+        0xffff_ffff
+    } else {
+        u64::MAX
+    };
     let port = c.gpr[2] & 0xffff;
     permitted(s, port, size)?;
     if rep && c.gpr[1] & wide == 0 {
@@ -136,7 +156,12 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         // The destination's faults first, as an explicit write would raise them (linear's order: canonical, #AC, walk),
         // and a device page refused, all before the port is read.
         let last = va.wrapping_add(size - 1);
-        if alignment_check(&s.cpu) != 0 && va & (size - 1) != 0 && paging::canonical(va) && paging::canonical(last) && last >= va {
+        if alignment_check(&s.cpu) != 0
+            && va & (size - 1) != 0
+            && paging::canonical(va)
+            && paging::canonical(last)
+            && last >= va
+        {
             return Err(AC0);
         }
         let gpa = segments::pages(s, va, size, true, false, GP0)?;
@@ -166,7 +191,11 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         power = access(s, port, size, Some(u64::from(u32::from_le_bytes(bytes)))).1;
     }
     super::watch::port(s, port, size);
-    let step = if c.rflags & RFLAGS_DF != 0 { size.wrapping_neg() } else { size };
+    let step = if c.rflags & RFLAGS_DF != 0 {
+        size.wrapping_neg()
+    } else {
+        size
+    };
     s.cpu.gpr[reg] = offset.wrapping_add(step) & wide;
     if rep {
         let count = (c.gpr[1] & wide) - 1;
@@ -175,12 +204,16 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             // Between two elements: RIP stays at the instruction (its kept decode runs the next element); RF stays (S4).
             s.mid_string = 1;
             commit(s, System { length: 0, ..i }, false);
-            if power { power_wait(s); }
+            if power {
+                power_wait(s);
+            }
             return Ok(());
         }
     }
     commit(s, i, false);
-    if power { power_wait(s); }
+    if power {
+        power_wait(s);
+    }
     Ok(())
 }
 
@@ -196,6 +229,8 @@ fn power_wait(s: &mut State) -> ! {
             *s = load();
         }
         s.request = NONE;
-        if s.reply != REPLY_POWER_POLL { halt(s, stop::BAD_REPLY); }
+        if s.reply != REPLY_POWER_POLL {
+            halt(s, stop::BAD_REPLY);
+        }
     }
 }

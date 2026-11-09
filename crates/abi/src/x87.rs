@@ -7,7 +7,11 @@ pub const INDEFINITE: u64 = 0xfff8_0000_0000_0000;
 
 /// A double widened to the 80-bit format (exact): (significand with its integer bit, sign and exponent).
 pub fn to_f80(d: u64) -> (u64, u16) {
-    let (sign, exp, frac) = ((d >> 63) as u16, (d >> 52 & 0x7ff) as u16, d & ((1 << 52) - 1));
+    let (sign, exp, frac) = (
+        (d >> 63) as u16,
+        (d >> 52 & 0x7ff) as u16,
+        d & ((1 << 52) - 1),
+    );
     let (mant, e) = match exp {
         0 if frac == 0 => (0, 0),
         0 => {
@@ -49,7 +53,11 @@ pub fn from_f80(mant: u64, se: u16, rc: u64) -> u64 {
     // Bits kept: 53 for a normal result; fewer below 2^-1022 (denormal); none at all below 2^-1075.
     let keep = if exp >= -1022 { 53 } else { 53 - (-1022 - exp) };
     let (kept, round, sticky) = if keep <= 0 {
-        (0, keep == 0 && m >> 63 != 0, if keep == 0 { m << 1 != 0 } else { true })
+        (
+            0,
+            keep == 0 && m >> 63 != 0,
+            if keep == 0 { m << 1 != 0 } else { true },
+        )
     } else {
         let drop = 64 - keep;
         (m >> drop, m >> (drop - 1) & 1 != 0, m << (65 - drop) != 0)
@@ -72,7 +80,12 @@ pub fn from_f80(mant: u64, se: u16, rc: u64) -> u64 {
                 2 => sign == 0,
                 _ => false,
             };
-            return sign | if to_inf { 0x7ff << 52 } else { 0x7fe << 52 | ((1 << 52) - 1) };
+            return sign
+                | if to_inf {
+                    0x7ff << 52
+                } else {
+                    0x7fe << 52 | ((1 << 52) - 1)
+                };
         }
         (biased as u64) << 52 | frac & ((1 << 52) - 1)
     } else {
@@ -80,7 +93,6 @@ pub fn from_f80(mant: u64, se: u16, rc: u64) -> u64 {
     };
     sign | bits
 }
-
 
 // I6b: the transcendental, remainder, scale and extract instructions (D9 F0..FF), run whole by the resident (`svc #X87`,
 // [`crate::execution::svc::X87`]) on doubles: FEX's reduced precision. Values come from the toolchain's libm (compiler_builtins:
@@ -164,9 +176,27 @@ fn nan2(a: u64, b: u64, fl: &mut u32) -> u64 {
     let pick = match (is_nan(a), is_nan(b)) {
         (true, false) => a,
         (false, true) => b,
-        _ if is_snan(a) != is_snan(b) => if is_snan(a) { b } else { a },
-        _ if a & FRAC != b & FRAC => if a & FRAC > b & FRAC { a } else { b },
-        _ => if a & SIGN == 0 { a } else { b },
+        _ if is_snan(a) != is_snan(b) => {
+            if is_snan(a) {
+                b
+            } else {
+                a
+            }
+        }
+        _ if a & FRAC != b & FRAC => {
+            if a & FRAC > b & FRAC {
+                a
+            } else {
+                b
+            }
+        }
+        _ => {
+            if a & SIGN == 0 {
+                a
+            } else {
+                b
+            }
+        }
     };
     pick | 1 << 51
 }
@@ -184,11 +214,19 @@ fn rounded(r: f64, exact: bool) -> u32 {
 /// The unbiased exponent of a finite nonzero double (a denormal's as normalized: the 80-bit value's exponent).
 fn expo(d: u64) -> i64 {
     let e = (d >> 52 & 0x7ff) as i64;
-    if e != 0 { e - 1023 } else { (63 - (d & FRAC).leading_zeros()) as i64 - 1074 }
+    if e != 0 {
+        e - 1023
+    } else {
+        (63 - (d & FRAC).leading_zeros()) as i64 - 1074
+    }
 }
 fn pow2(d: u64) -> bool {
     let e = d >> 52 & 0x7ff;
-    if e == 0 { (d & FRAC).count_ones() == 1 } else { d & FRAC == 0 }
+    if e == 0 {
+        (d & FRAC).count_ones() == 1
+    } else {
+        d & FRAC == 0
+    }
 }
 
 /// The helper instruction D9 `function` (F0..FF; FXAM's and the others' bytes are not helpers: `None`).
@@ -217,7 +255,12 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
                 }
             };
             if is_nan(x) || f(x).is_infinite() {
-                let n = if is_nan(x) { nan1(x, &mut e.flags) } else { e.flags |= IE; INDEFINITE };
+                let n = if is_nan(x) {
+                    nan1(x, &mut e.flags)
+                } else {
+                    e.flags |= IE;
+                    INDEFINITE
+                };
                 e.st0 = Some(n);
                 e.push = push.then_some(n);
             } else if f(x).abs() >= TWO63 {
@@ -276,18 +319,31 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
             let r = if function == 0xf3 {
                 let r = unsafe { atan2(yf, xf) };
                 let exact = (yf == 0.0 && x & SIGN == 0) || (yf.is_finite() && xf == f64::INFINITY);
-                e.flags |= if xf.is_finite() && yf.is_finite() { rounded(r, exact) } else if exact { 0 } else { PE };
+                e.flags |= if xf.is_finite() && yf.is_finite() {
+                    rounded(r, exact)
+                } else if exact {
+                    0
+                } else {
+                    PE
+                };
                 r
             } else {
                 // The logarithm: invalid for a negative argument; -infinity for a zero one (log2(+-0), log2(1 + -1)).
                 let (l, exact) = if function == 0xf1 {
-                    if xf == 0.0 { (f64::NEG_INFINITY, true) } else { (unsafe { log2(xf) }, pow2(x) || xf.is_infinite()) }
+                    if xf == 0.0 {
+                        (f64::NEG_INFINITY, true)
+                    } else {
+                        (unsafe { log2(xf) }, pow2(x) || xf.is_infinite())
+                    }
                 } else if xf == -1.0 {
                     (f64::NEG_INFINITY, true)
                 } else if xf == 0.0 {
                     (xf, true)
                 } else {
-                    (unsafe { log1p(xf) } * core::f64::consts::LOG2_E, xf.is_infinite())
+                    (
+                        unsafe { log1p(xf) } * core::f64::consts::LOG2_E,
+                        xf.is_infinite(),
+                    )
                 };
                 if l.is_nan() || (l == f64::NEG_INFINITY && yf == 0.0) {
                     e.flags |= IE;
@@ -300,7 +356,8 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
                     if r.is_nan() {
                         e.flags |= IE; // 0 * infinity
                     } else if yf.is_finite() && l.is_finite() {
-                        let exact = yf == 0.0 || (exact && r.is_finite() && unsafe { fma(yf, l, -r) } == 0.0);
+                        let exact = yf == 0.0
+                            || (exact && r.is_finite() && unsafe { fma(yf, l, -r) } == 0.0);
                         e.flags |= rounded(r, exact);
                     }
                     r
@@ -324,7 +381,10 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
                 // SDM FSCALE table: -inf scales a finite value to a zero, +inf a nonzero one to an infinity; inf * 2^-inf and
                 // 0 * 2^inf are invalid.
                 match (sf > 0.0, xf == 0.0, xf.is_infinite()) {
-                    (false, _, true) | (true, true, _) => { e.flags |= IE; INDEFINITE }
+                    (false, _, true) | (true, true, _) => {
+                        e.flags |= IE;
+                        INDEFINITE
+                    }
                     (false, _, false) => x & SIGN,
                     (true, false, _) => x & SIGN | POS_INF,
                 }
@@ -336,7 +396,8 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
                 let biased = i64::from(se & 0x7fff) + n;
                 let r = from_f80(mant, (se & 0x8000) | biased.clamp(1, 0x7ffe) as u16, o.rc);
                 let unbiased = biased - 16383;
-                let exact = (1..0x7fff).contains(&biased) && to_f80(r) == (mant, (se & 0x8000) | biased as u16);
+                let exact = (1..0x7fff).contains(&biased)
+                    && to_f80(r) == (mant, (se & 0x8000) | biased as u16);
                 e.flags |= match () {
                     _ if exact => 0,
                     _ if unbiased >= 1024 => OE | PE,
@@ -371,14 +432,23 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
             let r = if d < 64 {
                 let r = unsafe { fmod(ax, ay) };
                 // The quotient's low three bits: fmod(|x|, 8|y|) - fmod(|x|, |y|) = (q mod 8) |y|.
-                let r8 = if (8.0 * ay).is_finite() { unsafe { fmod(ax, 8.0 * ay) } } else { ax };
+                let r8 = if (8.0 * ay).is_finite() {
+                    unsafe { fmod(ax, 8.0 * ay) }
+                } else {
+                    ax
+                };
                 let mut q = ((r8 - r) / ay + 0.5) as u64 & 7;
                 let mut r = r;
                 if function == 0xf5 && (r > ay - r || (r == ay - r && q & 1 != 0)) {
                     r -= ay; // exact (Sterbenz)
                     q = (q + 1) & 7;
                 }
-                e.c = [Some(q & 4 != 0), Some(q & 1 != 0), Some(false), Some(q & 2 != 0)];
+                e.c = [
+                    Some(q & 4 != 0),
+                    Some(q & 1 != 0),
+                    Some(false),
+                    Some(q & 2 != 0),
+                ];
                 r
             } else {
                 // QEMU's (and AMD's) partial step: reduce by |y| * 2^(D - N), N = 32 + D mod 32, truncating, C0 C1 C3 cleared.
@@ -409,7 +479,11 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
                 }
                 v if v.is_infinite() => (POS_INF, x),
                 _ => {
-                    let m = if x >> 52 & 0x7ff != 0 { x & FRAC } else { (x & FRAC) << ((x & FRAC).leading_zeros() - 11) & FRAC };
+                    let m = if x >> 52 & 0x7ff != 0 {
+                        x & FRAC
+                    } else {
+                        (x & FRAC) << ((x & FRAC).leading_zeros() - 11) & FRAC
+                    };
                     (b(expo(x) as f64), x & SIGN | ONE | m)
                 }
             };
@@ -420,7 +494,6 @@ pub fn helper(function: u8, o: Operands) -> Option<Effect> {
     }
     Some(e)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -451,8 +524,20 @@ mod tests {
     }
     #[test]
     fn f80_conversions() {
-        for d in [0u64, 1 << 63, 1, 0x000f_ffff_ffff_ffff, 0x0010_0000_0000_0000, 0x3ff0_0000_0000_0000, 0xc009_21fb_5444_2d18,
-                  0x7fef_ffff_ffff_ffff, 0x7ff0_0000_0000_0000, 0xfff8_0000_0000_0000, 0x7ff4_0000_0000_0001, 0x8000_0000_0000_0003] {
+        for d in [
+            0u64,
+            1 << 63,
+            1,
+            0x000f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+            0x3ff0_0000_0000_0000,
+            0xc009_21fb_5444_2d18,
+            0x7fef_ffff_ffff_ffff,
+            0x7ff0_0000_0000_0000,
+            0xfff8_0000_0000_0000,
+            0x7ff4_0000_0000_0001,
+            0x8000_0000_0000_0003,
+        ] {
             let (m, se) = to_f80(d);
             for rc in 0..4 {
                 assert_eq!(from_f80(m, se, rc), d, "{d:#x} rc {rc}");
@@ -462,10 +547,24 @@ mod tests {
         assert_eq!(to_f80(1), (1 << 63, 15372 - 63)); // 2^-1074
         // 1 + 2^-63: nearest and down give 1.0, up gives 1 + 2^-52.
         let (m, se) = (1 << 63 | 1, 0x3fff);
-        assert_eq!([0, 1, 2, 3].map(|rc| from_f80(m, se, rc)), [0x3ff0_0000_0000_0000, 0x3ff0_0000_0000_0000, 0x3ff0_0000_0000_0001, 0x3ff0_0000_0000_0000]);
+        assert_eq!(
+            [0, 1, 2, 3].map(|rc| from_f80(m, se, rc)),
+            [
+                0x3ff0_0000_0000_0000,
+                0x3ff0_0000_0000_0000,
+                0x3ff0_0000_0000_0001,
+                0x3ff0_0000_0000_0000
+            ]
+        );
         // Ties to even: 1 + 2^-53 (halfway) rounds to 1.0; 1 + 3 * 2^-53 to 1 + 2^-51.
-        assert_eq!(from_f80(1 << 63 | 1 << 10, 0x3fff, 0), 0x3ff0_0000_0000_0000);
-        assert_eq!(from_f80(1 << 63 | 3 << 10, 0x3fff, 0), 0x3ff0_0000_0000_0002);
+        assert_eq!(
+            from_f80(1 << 63 | 1 << 10, 0x3fff, 0),
+            0x3ff0_0000_0000_0000
+        );
+        assert_eq!(
+            from_f80(1 << 63 | 3 << 10, 0x3fff, 0),
+            0x3ff0_0000_0000_0002
+        );
         // Overflow: 2^1024 is infinity to nearest, the largest double toward zero.
         assert_eq!(from_f80(1 << 63, 0x3fff + 1024, 0), 0x7ff0_0000_0000_0000);
         assert_eq!(from_f80(1 << 63, 0x3fff + 1024, 3), 0x7fef_ffff_ffff_ffff);
@@ -473,19 +572,30 @@ mod tests {
         // Underflow: 2^-1075 is a tie to 0 (even), 2^-1075 + tiny rounds to 2^-1074; 2^-2000 is 0, or 2^-1074 rounding up.
         assert_eq!(from_f80(1 << 63, 0x3fff - 1075, 0), 0);
         assert_eq!(from_f80(1 << 63 | 1, 0x3fff - 1075, 0), 1);
-        assert_eq!([0, 2].map(|rc| from_f80(1 << 63, 0x3fff - 2000, rc)), [0, 1]);
+        assert_eq!(
+            [0, 2].map(|rc| from_f80(1 << 63, 0x3fff - 2000, rc)),
+            [0, 1]
+        );
         // The largest denormal rounding up carries into the smallest normal.
         assert_eq!(from_f80(u64::MAX, 0x3fff - 1023, 0), 0x0010_0000_0000_0000);
         // Unsupported encodings and NaN payloads.
         assert_eq!(from_f80(0x4000_0000_0000_0000, 0x3fff, 0), INDEFINITE); // unnormal
         assert_eq!(from_f80(0x4000_0000_0000_0000, 0x7fff, 0), INDEFINITE); // pseudo-NaN
         assert_eq!(from_f80(0xc000_0000_0000_0000, 0xffff, 0), INDEFINITE); // the 80-bit indefinite
-        assert_eq!(from_f80(0x8000_0000_0000_0001, 0x7fff, 0), 0x7ff0_0000_0000_0001); // an SNaN stays one
+        assert_eq!(
+            from_f80(0x8000_0000_0000_0001, 0x7fff, 0),
+            0x7ff0_0000_0000_0001
+        ); // an SNaN stays one
         assert_eq!(from_f80(0x0000_0000_0000_0001, 0, 2), 1); // the smallest 80-bit denormal, rounded up
     }
 
     fn ops(st0: f64, st1: f64) -> Operands {
-        Operands { st0: Some(st0.to_bits()), st1: Some(st1.to_bits()), free: true, rc: 0 }
+        Operands {
+            st0: Some(st0.to_bits()),
+            st1: Some(st1.to_bits()),
+            free: true,
+            rc: 0,
+        }
     }
     fn c(c0: bool, c1: bool, c2: bool, c3: bool) -> [Option<bool>; 4] {
         [Some(c0), Some(c1), Some(c2), Some(c3)]
@@ -499,17 +609,48 @@ mod tests {
     fn helpers() {
         let h = |f: u8, o: Operands| helper(f, o).unwrap();
         // FSIN/FCOS: zeros exact, |x| >= 2^63 out of range (C2, nothing written), infinity invalid, an empty ST(0) underflows.
-        assert_eq!(h(0xfe, ops(-0.0, 0.0)), Effect { st0: Some((-0.0f64).to_bits()), c: [None, Some(false), Some(false), None], ..Default::default() });
+        assert_eq!(
+            h(0xfe, ops(-0.0, 0.0)),
+            Effect {
+                st0: Some((-0.0f64).to_bits()),
+                c: [None, Some(false), Some(false), None],
+                ..Default::default()
+            }
+        );
         assert_eq!(h(0xff, ops(0.0, 0.0)).st0, Some(ONE));
         for x in [TWO63, -TWO63, 1e300] {
-            assert_eq!(h(0xfe, ops(x, 0.0)), Effect { c: [None, Some(false), Some(true), None], ..Default::default() });
-            assert_eq!(h(0xf2, ops(x, 0.0)), Effect { c: [None, Some(false), Some(true), None], ..Default::default() }, "fptan: no push");
+            assert_eq!(
+                h(0xfe, ops(x, 0.0)),
+                Effect {
+                    c: [None, Some(false), Some(true), None],
+                    ..Default::default()
+                }
+            );
+            assert_eq!(
+                h(0xf2, ops(x, 0.0)),
+                Effect {
+                    c: [None, Some(false), Some(true), None],
+                    ..Default::default()
+                },
+                "fptan: no push"
+            );
         }
         assert!(h(0xfe, ops(TWO63 - 1024.0, 0.0)).c[2] == Some(false));
         let inf = h(0xff, ops(f64::INFINITY, 0.0));
         assert_eq!((inf.st0, inf.flags), (Some(INDEFINITE), IE));
-        let under = h(0xfe, Operands { st0: None, st1: None, free: true, rc: 0 });
-        assert_eq!((under.st0, under.flags, under.c[1]), (Some(INDEFINITE), IE | SF, Some(false)));
+        let under = h(
+            0xfe,
+            Operands {
+                st0: None,
+                st1: None,
+                free: true,
+                rc: 0,
+            },
+        );
+        assert_eq!(
+            (under.st0, under.flags, under.c[1]),
+            (Some(INDEFINITE), IE | SF, Some(false))
+        );
         let s = h(0xfe, ops(0.5, 0.0));
         assert!(ulps(f64::from_bits(s.st0.unwrap()), 0.479_425_538_604_203) <= 1 && s.flags == PE);
         // FPTAN pushes 1.0; FSINCOS pushes the cosine; a full stack (TOP - 1 not empty) overflows: both indefinite, C1 = 1.
@@ -517,16 +658,52 @@ mod tests {
         assert_eq!((t.push, t.flags), (Some(ONE), PE));
         let sc = h(0xfb, ops(1.0, 0.0));
         assert!(ulps(f64::from_bits(sc.push.unwrap()), 0.540_302_305_868_139_8) <= 1);
-        let full = h(0xfb, Operands { free: false, ..ops(1.0, 0.0) });
-        assert_eq!((full.st0, full.push, full.flags, full.c[1]), (Some(INDEFINITE), Some(INDEFINITE), IE | SF, Some(true)));
+        let full = h(
+            0xfb,
+            Operands {
+                free: false,
+                ..ops(1.0, 0.0)
+            },
+        );
+        assert_eq!(
+            (full.st0, full.push, full.flags, full.c[1]),
+            (Some(INDEFINITE), Some(INDEFINITE), IE | SF, Some(true))
+        );
         // FPREM: 7 / 2 -> 1, quotient 3 (C0 = 0, C3 = 1, C1 = 1); -7 -> -1; FPREM1 rounds to nearest even: 7 / 2 = 3.5 -> 4, -1.
-        assert_eq!(h(0xf8, ops(7.0, 2.0)), Effect { st0: Some(1f64.to_bits()), c: c(false, true, false, true), ..Default::default() });
+        assert_eq!(
+            h(0xf8, ops(7.0, 2.0)),
+            Effect {
+                st0: Some(1f64.to_bits()),
+                c: c(false, true, false, true),
+                ..Default::default()
+            }
+        );
         assert_eq!(h(0xf8, ops(-7.0, 2.0)).st0, Some((-1f64).to_bits()));
-        assert_eq!(h(0xf5, ops(7.0, 2.0)), Effect { st0: Some((-1f64).to_bits()), c: c(true, false, false, false), ..Default::default() });
-        assert_eq!(h(0xf5, ops(5.0, 2.0)), Effect { st0: Some(1f64.to_bits()), c: c(false, false, false, true), ..Default::default() });
+        assert_eq!(
+            h(0xf5, ops(7.0, 2.0)),
+            Effect {
+                st0: Some((-1f64).to_bits()),
+                c: c(true, false, false, false),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            h(0xf5, ops(5.0, 2.0)),
+            Effect {
+                st0: Some(1f64.to_bits()),
+                c: c(false, false, false, true),
+                ..Default::default()
+            }
+        );
         assert_eq!(h(0xf8, ops(6.0, -2.0)).st0, Some(0)); // +0, the dividend's sign
         assert_eq!(h(0xf8, ops(1.0, 0.0)).flags, IE);
-        assert_eq!(h(0xf8, ops(3.0, f64::INFINITY)), Effect { c: [Some(false); 4], ..Default::default() });
+        assert_eq!(
+            h(0xf8, ops(3.0, f64::INFINITY)),
+            Effect {
+                c: [Some(false); 4],
+                ..Default::default()
+            }
+        );
         // The partial remainder: 2^100 by 3 takes several steps (C2 = 1) and ends with 1 and the quotient's bits (q = 5 mod 8).
         let mut x = 2f64.powi(100);
         let mut steps = 0;
@@ -534,33 +711,105 @@ mod tests {
             let r = h(0xf8, ops(x, 3.0));
             x = f64::from_bits(r.st0.unwrap());
             steps += 1;
-            if r.c[2] == Some(false) { break r; }
+            if r.c[2] == Some(false) {
+                break r;
+            }
             assert_eq!(r.c, c(false, false, true, false));
         };
         assert!(steps > 1);
         assert_eq!((x, last.c), (1.0, c(true, true, false, false)));
         // FSCALE: truncates ST(1); rounds by RC; overflow and underflow at the double's thresholds.
         assert_eq!(h(0xfd, ops(1.5, 3.7)).st0, Some(12f64.to_bits()));
-        assert_eq!(h(0xfd, ops(1.0, 2000.0)), Effect { st0: Some(POS_INF), c: [None, Some(false), None, None], flags: OE | PE, ..Default::default() });
-        assert_eq!(h(0xfd, Operands { rc: 3, ..ops(1.0, 2000.0) }).st0, Some(f64::MAX.to_bits()));
-        assert_eq!(h(0xfd, ops(3.0, -1074.0)), Effect { st0: Some(3), c: [None, Some(false), None, None], ..Default::default() });
+        assert_eq!(
+            h(0xfd, ops(1.0, 2000.0)),
+            Effect {
+                st0: Some(POS_INF),
+                c: [None, Some(false), None, None],
+                flags: OE | PE,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            h(
+                0xfd,
+                Operands {
+                    rc: 3,
+                    ..ops(1.0, 2000.0)
+                }
+            )
+            .st0,
+            Some(f64::MAX.to_bits())
+        );
+        assert_eq!(
+            h(0xfd, ops(3.0, -1074.0)),
+            Effect {
+                st0: Some(3),
+                c: [None, Some(false), None, None],
+                ..Default::default()
+            }
+        );
         let tie = h(0xfd, ops(3.0, -1075.0));
         assert_eq!((tie.st0, tie.flags), (Some(2), UE | PE));
-        assert_eq!(h(0xfd, Operands { rc: 2, ..ops(1.0, -1100.0) }).st0, Some(1));
+        assert_eq!(
+            h(
+                0xfd,
+                Operands {
+                    rc: 2,
+                    ..ops(1.0, -1100.0)
+                }
+            )
+            .st0,
+            Some(1)
+        );
         assert_eq!(h(0xfd, ops(0.0, f64::INFINITY)).flags, IE);
         assert_eq!(h(0xfd, ops(-5.0, f64::NEG_INFINITY)).st0, Some(SIGN));
         // FXTRACT.
-        assert_eq!(h(0xf4, ops(12.0, 0.0)), Effect { st0: Some(3f64.to_bits()), push: Some(1.5f64.to_bits()), c: [None, Some(false), None, None], ..Default::default() });
-        assert_eq!(h(0xf4, ops(-0.0, 0.0)), Effect { st0: Some(NEG_INF), push: Some(SIGN), c: [None, Some(false), None, None], flags: ZE, ..Default::default() });
-        assert_eq!(h(0xf4, ops(-f64::from_bits(1), 0.0)).st0, Some((-1074f64).to_bits()));
-        assert_eq!(h(0xf4, ops(-f64::from_bits(3), 0.0)).push, Some((-1.5f64).to_bits()));
+        assert_eq!(
+            h(0xf4, ops(12.0, 0.0)),
+            Effect {
+                st0: Some(3f64.to_bits()),
+                push: Some(1.5f64.to_bits()),
+                c: [None, Some(false), None, None],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            h(0xf4, ops(-0.0, 0.0)),
+            Effect {
+                st0: Some(NEG_INF),
+                push: Some(SIGN),
+                c: [None, Some(false), None, None],
+                flags: ZE,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            h(0xf4, ops(-f64::from_bits(1), 0.0)).st0,
+            Some((-1074f64).to_bits())
+        );
+        assert_eq!(
+            h(0xf4, ops(-f64::from_bits(3), 0.0)).push,
+            Some((-1.5f64).to_bits())
+        );
         // FYL2X (ST(0) = x, ST(1) = y): exact for a power of two; zero is ZE; negative, 0 * log2(0) and inf * log2(1) invalid.
-        let pop = |st1: u64, flags: u32| Effect { st1: Some(st1), pop: true, c: [None, Some(false), None, None], flags, ..Default::default() };
+        let pop = |st1: u64, flags: u32| Effect {
+            st1: Some(st1),
+            pop: true,
+            c: [None, Some(false), None, None],
+            flags,
+            ..Default::default()
+        };
         assert_eq!(h(0xf1, ops(8.0, 3.0)), pop(9f64.to_bits(), 0));
         assert_eq!(h(0xf1, ops(0.0, 2.0)), pop(NEG_INF, ZE));
         assert_eq!(h(0xf1, ops(0.0, -2.0)), pop(POS_INF, ZE));
         assert_eq!(h(0xf1, ops(0.0, f64::NEG_INFINITY)), pop(POS_INF, 0));
-        for (x, y) in [(-1.0, 1.0), (1.0, f64::INFINITY), (0.0, 0.0), (f64::INFINITY, 0.0), (f64::NEG_INFINITY, 2.0)] {
+        for (x, y) in [
+            (-1.0, 1.0),
+            (1.0, f64::INFINITY),
+            (0.0, 0.0),
+            (f64::INFINITY, 0.0),
+            (f64::NEG_INFINITY, 2.0),
+        ] {
             assert_eq!(h(0xf1, ops(x, y)), pop(INDEFINITE, IE), "fyl2x {x} {y}");
         }
         assert_eq!(h(0xf1, ops(3.0, 0.0)), pop(0, 0));
@@ -571,19 +820,45 @@ mod tests {
         assert_eq!(h(0xf3, ops(2.0, -0.0)), pop(SIGN, 0));
         assert_eq!(h(0xf3, ops(-2.0, 0.0)).flags, PE); // +pi
         assert_eq!(h(0xf3, ops(f64::INFINITY, 5.0)), pop(0, 0));
-        let empty = h(0xf3, Operands { st1: None, ..ops(1.0, 1.0) });
+        let empty = h(
+            0xf3,
+            Operands {
+                st1: None,
+                ..ops(1.0, 1.0)
+            },
+        );
         assert_eq!(empty, pop(INDEFINITE, IE | SF));
         // F2XM1.
         assert_eq!(h(0xf0, ops(1.0, 0.0)).st0, Some(ONE));
         assert_eq!(h(0xf0, ops(-1.0, 0.0)).st0, Some((-0.5f64).to_bits()));
-        assert_eq!(h(0xf0, ops(f64::NEG_INFINITY, 0.0)).st0, Some((-1f64).to_bits()));
-        assert!(ulps(f64::from_bits(h(0xf0, ops(0.5, 0.0)).st0.unwrap()), 0.414_213_562_373_095_03) <= 1);
+        assert_eq!(
+            h(0xf0, ops(f64::NEG_INFINITY, 0.0)).st0,
+            Some((-1f64).to_bits())
+        );
+        assert!(
+            ulps(
+                f64::from_bits(h(0xf0, ops(0.5, 0.0)).st0.unwrap()),
+                0.414_213_562_373_095_03
+            ) <= 1
+        );
         // NaNs by the x87 rule: the larger significand, the QNaN over an SNaN, IE for an SNaN.
-        let (q1, q2, s1) = (0x7ff8_0000_0000_0001u64, 0xfff8_0000_0000_0002u64, 0x7ff0_0000_0000_0009u64);
-        assert_eq!(h(0xf1, ops(f64::from_bits(q1), f64::from_bits(q2))), pop(q2, 0));
-        assert_eq!(h(0xf1, ops(f64::from_bits(s1), f64::from_bits(q1))), pop(q1, IE));
-        assert_eq!(h(0xfe, ops(f64::from_bits(s1), 0.0)).st0, Some(s1 | 1 << 51));
+        let (q1, q2, s1) = (
+            0x7ff8_0000_0000_0001u64,
+            0xfff8_0000_0000_0002u64,
+            0x7ff0_0000_0000_0009u64,
+        );
+        assert_eq!(
+            h(0xf1, ops(f64::from_bits(q1), f64::from_bits(q2))),
+            pop(q2, 0)
+        );
+        assert_eq!(
+            h(0xf1, ops(f64::from_bits(s1), f64::from_bits(q1))),
+            pop(q1, IE)
+        );
+        assert_eq!(
+            h(0xfe, ops(f64::from_bits(s1), 0.0)).st0,
+            Some(s1 | 1 << 51)
+        );
         assert_eq!(helper(0xe5, ops(0.0, 0.0)), None);
     }
-
 }

@@ -14,19 +14,19 @@ pub const RAM_SIZE: usize = 0x10_0000;
 pub const SHARED_OFFSET: usize = 0x2_0000;
 pub const STACK_TOP: u64 = PRIVATE + 0x5_4000;
 pub const EXCEPTION_STACK_TOP: u64 = PRIVATE + 0x6_4000;
+pub mod clock;
+pub mod code_object;
+pub mod cpu;
+pub mod cpu_profile;
+pub mod execution;
 pub mod guest_memory;
+pub mod half;
+pub mod lapic;
 pub mod paging;
 pub mod resident;
 pub mod shadow;
-pub mod code_object;
-pub mod execution;
-pub mod cpu;
-pub mod cpu_profile;
-pub mod clock;
-pub mod lapic;
-pub mod x87;
-pub mod half;
 pub mod strings;
+pub mod x87;
 pub const SUCCESS: u64 = 1;
 pub const REJECTED: u64 = 2;
 pub const PANIC: u64 = 4;
@@ -71,4 +71,3 @@ pub struct Shared {
 
 const _: () = assert!(core::mem::size_of::<Shared>() <= 4096);
 const _: () = assert!(core::mem::size_of::<NativeFrame>() == 800);
-

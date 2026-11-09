@@ -25,7 +25,10 @@ pub enum Access {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
-    Page { address: u64, error: u64 },
+    Page {
+        address: u64,
+        error: u64,
+    },
     Noncanonical,
     Unsupported,
     /// The walk lost `WALK_ATTEMPTS` A/D races in a row: no translation this time; the access re-walks later.
@@ -255,14 +258,19 @@ fn walk_once<T: Tables, const B: bool>(
                 user,
                 executable,
                 dirty: value & DIRTY != 0 || access == Access::Write,
-                pat: ((if large { value >> 12 } else { value >> 7 } & 1) << 2 | value >> 3 & 3) as u8,
+                pat: ((if large { value >> 12 } else { value >> 7 } & 1) << 2 | value >> 3 & 3)
+                    as u8,
                 global: value & 256 != 0,
             });
         }
         // The mask (and its CSDB) come before the A-bit RMW below: that RMW reads this level's own slot (`at`, from the
         // previous level's already-masked base), and the mask gates the next level's read of `table`. `next` equals
         // `value & PA_MASK` on the architectural path (present, reserved and PS all checked above). Off: no barrier.
-        let next = if B { descend_base(value) } else { value & PA_MASK };
+        let next = if B {
+            descend_base(value)
+        } else {
+            value & PA_MASK
+        };
         if value & ACCESSED == 0 {
             applied(memory.write(at, value, value | ACCESSED))?;
         }
@@ -282,11 +290,27 @@ mod tests {
         let frame = 0x12_3000;
         assert_eq!(descend_base(frame | 0x7), frame); // present, writable, user: kept
         assert_eq!(descend_base(frame | 0x6), 0); // not present (bit 0 clear): masked
-        assert_eq!(descend_base(frame | 0x87), 0, "PS set (a 2 MiB leaf mispredicted as a descent): masked");
-        assert_eq!(descend_base(frame | 0x7 | 1 << 48), 0, "a reserved bit (48) set: masked");
-        assert_eq!(descend_base(frame | 0x7 | 1 << 40), 0, "a reserved bit (40) set: masked");
+        assert_eq!(
+            descend_base(frame | 0x87),
+            0,
+            "PS set (a 2 MiB leaf mispredicted as a descent): masked"
+        );
+        assert_eq!(
+            descend_base(frame | 0x7 | 1 << 48),
+            0,
+            "a reserved bit (48) set: masked"
+        );
+        assert_eq!(
+            descend_base(frame | 0x7 | 1 << 40),
+            0,
+            "a reserved bit (40) set: masked"
+        );
         assert_eq!(DESCEND_RESERVED & 1 << 7, 1 << 7, "PS is in the mask (B1)");
-        assert_eq!(DESCEND_RESERVED & 0x000f_ff00_0000_0000, 0x000f_ff00_0000_0000, "51:40 in the mask");
+        assert_eq!(
+            DESCEND_RESERVED & 0x000f_ff00_0000_0000,
+            0x000f_ff00_0000_0000,
+            "51:40 in the mask"
+        );
     }
     struct Ram([u64; 2048]);
     impl Tables for Ram {
@@ -326,7 +350,11 @@ mod tests {
         assert_eq!(r.gpa, 0x5000);
         assert!(!r.dirty);
         assert_eq!(m.0[1792], 0x5027);
-        assert!(walk(&mut m, c, 0x100000, Access::Write, true).unwrap().dirty);
+        assert!(
+            walk(&mut m, c, 0x100000, Access::Write, true)
+                .unwrap()
+                .dirty
+        );
         assert_eq!(m.0[1792], 0x5067);
     }
     #[test]
@@ -406,18 +434,35 @@ mod tests {
             if large {
                 m.0[1024] = 0x20_0000 | 0x87; // the PDE of 0x100000: a 2 MiB leaf at 0x200000
             }
-            let levels: &[usize] = if large { &[0, 512, 1024] } else { &[0, 512, 1024, 1792] };
-            let fault = Err(Fault::Page { address: 0x100000, error: 0x11 });
+            let levels: &[usize] = if large {
+                &[0, 512, 1024]
+            } else {
+                &[0, 512, 1024, 1792]
+            };
+            let fault = Err(Fault::Page {
+                address: 0x100000,
+                error: 0x11,
+            });
             for (smep, nxe) in [(0, 1), (1, 1), (1, 0)] {
                 (c.smep, c.nxe) = (smep, nxe);
-                assert_eq!(walk(&mut m, c, 0x100000, Access::Fetch, true).is_ok(), smep == 0, "large {large} smep {smep}");
+                assert_eq!(
+                    walk(&mut m, c, 0x100000, Access::Fetch, true).is_ok(),
+                    smep == 0,
+                    "large {large} smep {smep}"
+                );
                 if smep != 0 {
                     assert_eq!(walk(&mut m, c, 0x100000, Access::Fetch, true), fault);
                 }
-                assert!(walk(&mut m, c, 0x100000, Access::Read, true).is_ok() && walk(&mut m, c, 0x100000, Access::Write, true).is_ok());
+                assert!(
+                    walk(&mut m, c, 0x100000, Access::Read, true).is_ok()
+                        && walk(&mut m, c, 0x100000, Access::Write, true).is_ok()
+                );
                 for &at in levels {
                     m.0[at] &= !4;
-                    assert!(walk(&mut m, c, 0x100000, Access::Fetch, true).is_ok(), "large {large} U/S clear at {at}");
+                    assert!(
+                        walk(&mut m, c, 0x100000, Access::Fetch, true).is_ok(),
+                        "large {large} U/S clear at {at}"
+                    );
                     m.0[at] |= 4;
                 }
                 c.cpl = 3;

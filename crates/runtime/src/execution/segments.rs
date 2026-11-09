@@ -56,15 +56,26 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         system::LGDT..=system::LIDT => {
             let mut b = [0u8; 10];
             linear(s, address(&c, &i), &mut b, false, false, noncanonical(&i))?;
-            let table = Table { base: u64::from_le_bytes(b[2..].try_into().unwrap()), limit: u64::from(u16::from_le_bytes([b[0], b[1]])) };
+            let table = Table {
+                base: u64::from_le_bytes(b[2..].try_into().unwrap()),
+                limit: u64::from(u16::from_le_bytes([b[0], b[1]])),
+            };
             // The base must be canonical (AMD APM Vol.3 LGDT/LIDT; KVM checks it; the Intel SDM lists no such #GP).
             if !paging::canonical(table.base) {
                 return Err(GP0);
             }
-            *if i.kind == system::LGDT { &mut s.cpu.gdtr } else { &mut s.cpu.idtr } = table;
+            *if i.kind == system::LGDT {
+                &mut s.cpu.gdtr
+            } else {
+                &mut s.cpu.idtr
+            } = table;
         }
         system::SGDT..=system::SIDT => {
-            let t = if i.kind == system::SGDT { c.gdtr } else { c.idtr };
+            let t = if i.kind == system::SGDT {
+                c.gdtr
+            } else {
+                c.idtr
+            };
             let mut b = [0u8; 10];
             b[..2].copy_from_slice(&(t.limit as u16).to_le_bytes());
             b[2..].copy_from_slice(&t.base.to_le_bytes());
@@ -77,15 +88,33 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 _ => c.seg[i.cr as usize].selector,
             };
             if i.memory == 1 {
-                linear(s, address(&c, &i), &mut v.to_le_bytes(), true, false, noncanonical(&i))?;
+                linear(
+                    s,
+                    address(&c, &i),
+                    &mut v.to_le_bytes(),
+                    true,
+                    false,
+                    noncanonical(&i),
+                )?;
             } else {
                 let r = &mut s.cpu.gpr[i.reg as usize];
-                *r = if i.size == 2 { *r & !0xffff | u64::from(v) } else { u64::from(v) };
+                *r = if i.size == 2 {
+                    *r & !0xffff | u64::from(v)
+                } else {
+                    u64::from(v)
+                };
             }
         }
         system::LLDT => {
             let selector = selector_operand(s)?;
-            s.cpu.ldtr = if selector & 0xfffc == 0 { Segment { selector, ..Segment::NULL } } else { system_segment(s, selector, 2)?.1 };
+            s.cpu.ldtr = if selector & 0xfffc == 0 {
+                Segment {
+                    selector,
+                    ..Segment::NULL
+                }
+            } else {
+                system_segment(s, selector, 2)?.1
+            };
         }
         system::LTR => {
             let selector = selector_operand(s)?;
@@ -98,7 +127,10 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             if atomic_byte(s, va + 5, |b| (b & 15 == 9).then_some(b | 2))?.is_err() {
                 return Err(gp(selector));
             }
-            s.cpu.tr = Segment { attributes: tr.attributes | 2, ..tr };
+            s.cpu.tr = Segment {
+                attributes: tr.attributes | 2,
+                ..tr
+            };
         }
         system::MOV_TO_SREG => {
             let selector = selector_operand(s)?;
@@ -137,20 +169,32 @@ pub(super) fn address(c: &Cpu, i: &System) -> u64 {
         system::NO_REG => 0,
         r => c.gpr[r as usize],
     };
-    let index = if i.index == system::NO_REG { 0 } else { c.gpr[i.index as usize] << i.scale };
+    let index = if i.index == system::NO_REG {
+        0
+    } else {
+        c.gpr[i.index as usize] << i.scale
+    };
     let segment = match i.segment as usize {
         SREG_FS => c.fs_base,
         SREG_GS => c.gs_base,
         _ => 0,
     };
     let ea = base.wrapping_add(index).wrapping_add(i.disp as u64);
-    let ea = if i.prefixes & system::ADDRESS32 != 0 { ea as u32 as u64 } else { ea };
+    let ea = if i.prefixes & system::ADDRESS32 != 0 {
+        ea as u32 as u64
+    } else {
+        ea
+    };
     ea.wrapping_add(segment)
 }
 /// A non-canonical memory operand: #SS(0) for an SS-class reference (an RSP or RBP base with no FS/GS override: the
 /// host ignores CS/DS/ES/SS prefixes, owner decision of November 3), else #GP(0) (FS/GS, I7).
 pub(super) fn noncanonical(i: &System) -> Exception {
-    if i.segment == 0 && matches!(i.base, 4 | 5) { SS0 } else { GP0 }
+    if i.segment == 0 && matches!(i.base, 4 | 5) {
+        SS0
+    } else {
+        GP0
+    }
 }
 
 /// Copies between `buf` and linear `va` for the instruction at RIP: an explicit access at the CPL, or an implicit
@@ -159,7 +203,14 @@ pub(super) fn noncanonical(i: &System) -> Exception {
 /// a non-canonical range raises `noncanonical`. A write into a page holding translations invalidates them first
 /// ([`FetchWrites`]: no block of this vCPU runs during a transaction). Guest RAM of any memory type is accessed (M2: UC RAM
 /// in program order, [`pages`]); device pages stop `unsupported_mmio` (status `system`, M3).
-pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
+pub(super) fn linear(
+    s: &mut State,
+    va: u64,
+    buf: &mut [u8],
+    write: bool,
+    supervisor: bool,
+    noncanonical: Exception,
+) -> Result<(), Exception> {
     let n = buf.len() as u64;
     // X2: an explicit access at CPL 3 under alignment checking (SDM Vol.3 7.15, Table 7-7): #AC(0) after the canonical
     // check, before any walk, when misaligned for its data type: a word 2, a doubleword or a 48-bit far pointer or
@@ -183,7 +234,14 @@ pub(super) fn linear(s: &mut State, va: u64, buf: &mut [u8], write: bool, superv
 }
 /// [`linear`] without its alignment check: for the explicit accesses that never raise #AC (the gathers' elements, SDM
 /// Vol.2 2.5 exception class 12).
-pub(super) fn copy(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervisor: bool, noncanonical: Exception) -> Result<(), Exception> {
+pub(super) fn copy(
+    s: &mut State,
+    va: u64,
+    buf: &mut [u8],
+    write: bool,
+    supervisor: bool,
+    noncanonical: Exception,
+) -> Result<(), Exception> {
     let n = buf.len() as u64;
     let gpa = pages(s, va, n, write, supervisor, noncanonical)?;
     // S4: an explicit access meets data breakpoints; an implicit supervisor one (descriptor tables, TSS, IDT) never does.
@@ -221,27 +279,47 @@ pub(super) fn copy(s: &mut State, va: u64, buf: &mut [u8], write: bool, supervis
 /// are all it has). M2 (owner decision, November 2): when either page is UC RAM, or a UC access was made since the last
 /// boundary, every earlier access is made globally visible before the caller's access (a barrier here), and the next
 /// boundary makes a UC one so before any later one (`uncached_end`).
-pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: bool, noncanonical: Exception) -> Result<[u64; 2], Exception> {
+pub(super) fn pages(
+    s: &mut State,
+    va: u64,
+    n: u64,
+    write: bool,
+    supervisor: bool,
+    noncanonical: Exception,
+) -> Result<[u64; 2], Exception> {
     let last = va.wrapping_add(n - 1);
     if !paging::canonical(va) || !paging::canonical(last) || last < va {
         return Err(noncanonical);
     }
-    let Some(mut control) = s.cpu.control() else { halt(s, stop::UNSUPPORTED_MODE) };
+    let Some(mut control) = s.cpu.control() else {
+        halt(s, stop::UNSUPPORTED_MODE)
+    };
     if supervisor {
         control.cpl = 0;
     }
     let access = if write { Access::Write } else { Access::Read };
     let crosses = (last ^ va) >> 12 != 0;
     let mut gpa = [0u64; 2];
-    for (k, at) in [va, last & !4095].into_iter().enumerate().take(1 + usize::from(crosses)) {
+    for (k, at) in [va, last & !4095]
+        .into_iter()
+        .enumerate()
+        .take(1 + usize::from(crosses))
+    {
         gpa[k] = loop {
-            match paging::walk(&mut GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s))), control, at, access, cache::control().speculation_barriers != 0) {
+            match paging::walk(
+                &mut GuestTables::observed(guest_ram(), CodeWrites(FetchWrites(s))),
+                control,
+                at,
+                access,
+                cache::control().speculation_barriers != 0,
+            ) {
                 Ok(t) => {
                     let c = cache::control();
                     // A UC access made since the last boundary (an instruction run alone, or the resident's own) is
                     // globally visible before this one, whatever this one's type.
                     let owed = c.uncached_count != 0 || c.uncached_fence != 0;
-                    let uncached = super::mmio::ram(t.gpa) && cpu::memory_type(msrs(), t.gpa, t.pat) == cpu::memory_type::UC;
+                    let uncached = super::mmio::ram(t.gpa)
+                        && cpu::memory_type(msrs(), t.gpa, t.pat) == cpu::memory_type::UC;
                     if uncached {
                         (c.uncached_fence, c.uncached_resident) = (1, c.uncached_resident + 1);
                     }
@@ -264,16 +342,26 @@ pub(super) fn pages(s: &mut State, va: u64, n: u64, write: bool, supervisor: boo
 /// read-only page is #PF(3) at `va`): `update` maps the current value to the new one, or `None` to leave it (then
 /// `Ok(Err(current))`). The code-write protocol applies as for [`linear`]. Used for the accessed and busy bits, which
 /// hardware sets by a locked read-modify-write.
-fn atomic_byte(s: &mut State, va: u64, update: impl FnMut(u8) -> Option<u8>) -> Result<Result<u8, u8>, Exception> {
+fn atomic_byte(
+    s: &mut State,
+    va: u64,
+    update: impl FnMut(u8) -> Option<u8>,
+) -> Result<Result<u8, u8>, Exception> {
     let gpa = pages(s, va, 1, true, true, GP0)?[0];
-    let Some(p) = guest_ram().range(gpa, 1) else { super::mmio::system_access(s) };
+    let Some(p) = guest_ram().range(gpa, 1) else {
+        super::mmio::system_access(s)
+    };
     if cache::translated(gpa) {
         FetchWrites(s).code_write(gpa);
     }
     // SAFETY: `p` is a guest RAM byte in the resident's alias (Normal memory); peers and guest code access it too, so
     // only atomic accesses are made here.
     let byte = unsafe { &*(p as *const core::sync::atomic::AtomicU8) };
-    let done = byte.fetch_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, update);
+    let done = byte.fetch_update(
+        core::sync::atomic::Ordering::SeqCst,
+        core::sync::atomic::Ordering::SeqCst,
+        update,
+    );
     cache::rechecked(gpa);
     Ok(done)
 }
@@ -281,7 +369,11 @@ fn atomic_byte(s: &mut State, va: u64, update: impl FnMut(u8) -> Option<u8>) -> 
 /// The descriptor `selector` names (8 bytes, or 16 for a `wide` system descriptor) in the GDT, or for TI = 1 the LDT,
 /// and its linear address: #GP(selector) when it does not lie within the table's limit, when TI = 1 with a null LDTR,
 /// or when its address is not canonical.
-pub(super) fn descriptor(s: &mut State, selector: u16, wide: bool) -> Result<(u64, u128), Exception> {
+pub(super) fn descriptor(
+    s: &mut State,
+    selector: u16,
+    wide: bool,
+) -> Result<(u64, u128), Exception> {
     let (base, limit) = if selector & 4 != 0 {
         let l = s.cpu.ldtr;
         if l.attributes & ATTR_P == 0 {
@@ -297,7 +389,14 @@ pub(super) fn descriptor(s: &mut State, selector: u16, wide: bool) -> Result<(u6
     }
     let va = base.wrapping_add(index);
     let mut raw = [0u8; 16];
-    linear(s, va, &mut raw[..if wide { 16 } else { 8 }], false, true, gp(selector))?;
+    linear(
+        s,
+        va,
+        &mut raw[..if wide { 16 } else { 8 }],
+        false,
+        true,
+        gp(selector),
+    )?;
     Ok((va, u128::from_le_bytes(raw)))
 }
 /// Sets the accessed bit of the descriptor at `va` when `raw` has it clear (SDM Vol.3 3.4.5).
@@ -309,7 +408,12 @@ pub(super) fn accessed(s: &mut State, va: u64, raw: u64) -> Result<(), Exception
 }
 /// Descriptor fields: (S, type, DPL, P).
 pub(super) fn fields(raw: u64) -> (bool, u64, u64, bool) {
-    (raw >> 44 & 1 != 0, raw >> 40 & 15, raw >> 45 & 3, raw >> 47 & 1 != 0)
+    (
+        raw >> 44 & 1 != 0,
+        raw >> 40 & 15,
+        raw >> 45 & 3,
+        raw >> 47 & 1 != 0,
+    )
 }
 
 /// The 16-byte LDT (`kind` 2) or available 64-bit TSS (`kind` 9) descriptor of non-null `selector` for LLDT/LTR, and its
@@ -331,7 +435,13 @@ fn system_segment(s: &mut State, selector: u16, kind: u64) -> Result<(u64, Segme
     if (raw >> 104) & 0x1f != 0 || !paging::canonical(base) {
         return Err(gp(selector));
     }
-    Ok((va, Segment { base, ..Segment::loaded(selector, raw as u64) }))
+    Ok((
+        va,
+        Segment {
+            base,
+            ..Segment::loaded(selector, raw as u64)
+        },
+    ))
 }
 
 /// MOV/POP to ES, SS, DS, FS or GS in 64-bit mode (SDM Vol.2 MOV, "64-Bit Mode Exceptions"). SS: a null selector is
@@ -345,7 +455,10 @@ pub(super) fn load_data(s: &mut State, sreg: usize, selector: u16) -> Result<(),
         if sreg == SREG_SS && (cpl == 3 || rpl != cpl) {
             return Err(GP0);
         }
-        Segment { selector, ..Segment::NULL }
+        Segment {
+            selector,
+            ..Segment::NULL
+        }
     } else {
         let (va, raw) = descriptor(s, selector, false)?;
         let raw = raw as u64;
@@ -360,7 +473,8 @@ pub(super) fn load_data(s: &mut State, sreg: usize, selector: u16) -> Result<(),
             }
         } else {
             let conforming = code && kind & 4 != 0;
-            if !code_or_data || (code && kind & 2 == 0) || (!conforming && (rpl > dpl || cpl > dpl)) {
+            if !code_or_data || (code && kind & 2 == 0) || (!conforming && (rpl > dpl || cpl > dpl))
+            {
                 return Err(gp(selector));
             }
             if !present {
@@ -401,7 +515,11 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
     let conforming = kind & 4 != 0;
     if !code_or_data
         || kind & 8 == 0
-        || if conforming { dpl > cpl } else { u64::from(selector & 3) > cpl || dpl != cpl }
+        || if conforming {
+            dpl > cpl
+        } else {
+            u64::from(selector & 3) > cpl || dpl != cpl
+        }
         || raw >> 53 & 3 == 3
     {
         return Err(gp(selector));
@@ -414,7 +532,10 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
 /// Loads CS with `selector` (RPL as given) from `raw`, refusing a compatibility-mode segment: the record then holds
 /// that CS (the stop's cause) with RIP still at the instruction.
 fn load_cs(s: &mut State, selector: u16, raw: u64) {
-    s.cpu.seg[SREG_CS] = Segment { base: 0, ..Segment::loaded(selector, raw | 1 << 40) };
+    s.cpu.seg[SREG_CS] = Segment {
+        base: 0,
+        ..Segment::loaded(selector, raw | 1 << 40)
+    };
     if s.cpu.control().is_none() {
         halt(s, stop::UNSUPPORTED_MODE)
     }
@@ -427,7 +548,10 @@ fn refuse_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<
             return Err(gp(selector));
         }
         let mut refused = *s;
-        refused.cpu.seg[SREG_CS] = Segment { base: 0, ..Segment::loaded(selector, raw) };
+        refused.cpu.seg[SREG_CS] = Segment {
+            base: 0,
+            ..Segment::loaded(selector, raw)
+        };
         halt(&refused, stop::UNSUPPORTED_MODE)
     }
     Ok(())
@@ -440,7 +564,15 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
     let c = s.cpu;
     let w = i.size as usize;
     let mut pointer = [0u8; 10];
-    aligned_operand(s, address(&c, &i), &mut pointer[..w + 2], w, if w == 2 { 2 } else { 4 }, false, noncanonical(&i))?;
+    aligned_operand(
+        s,
+        address(&c, &i),
+        &mut pointer[..w + 2],
+        w,
+        if w == 2 { 2 } else { 4 },
+        false,
+        noncanonical(&i),
+    )?;
     let (mut offset, mut word) = ([0u8; 8], [0u8; 2]);
     offset[..w].copy_from_slice(&pointer[..w]);
     word.copy_from_slice(&pointer[w..w + 2]);
@@ -504,7 +636,11 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     let raw = raw as u64;
     let (code_or_data, kind, dpl, present) = fields(raw);
     let (cpl, rpl) = (c.cpl, u64::from(selector & 3));
-    if !code_or_data || kind & 8 == 0 || rpl < cpl || if kind & 4 != 0 { dpl > rpl } else { dpl != rpl } {
+    if !code_or_data
+        || kind & 8 == 0
+        || rpl < cpl
+        || if kind & 4 != 0 { dpl > rpl } else { dpl != rpl }
+    {
         return Err(gp(selector));
     }
     if !present {
@@ -517,7 +653,11 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     let outer = rpl > cpl;
     let mut stack = None;
     if iret || outer {
-        let [rsp, ss_selector, ..] = if iret { [words[3], words[4], 0, 0, 0] } else { pops(s, c.gpr[4].wrapping_add(2 * w + release), 2)? };
+        let [rsp, ss_selector, ..] = if iret {
+            [words[3], words[4], 0, 0, 0]
+        } else {
+            pops(s, c.gpr[4].wrapping_add(2 * w + release), 2)?
+        };
         let ss_selector = ss_selector as u16;
         let ss_segment = if ss_selector & 0xfffc == 0 {
             if rpl == 3 || u64::from(ss_selector & 3) != rpl {
@@ -528,7 +668,12 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
             let (ss_va, ss_raw) = descriptor(s, ss_selector, false)?;
             let ss_raw = ss_raw as u64;
             let (code_or_data, kind, dpl, present) = fields(ss_raw);
-            if u64::from(ss_selector & 3) != rpl || !code_or_data || kind & 8 != 0 || kind & 2 == 0 || dpl != rpl {
+            if u64::from(ss_selector & 3) != rpl
+                || !code_or_data
+                || kind & 8 != 0
+                || kind & 2 == 0
+                || dpl != rpl
+            {
                 return Err(gp(ss_selector));
             }
             if !present {
@@ -547,7 +692,13 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     }
     let mut rflags = c.rflags;
     if iret {
-        let mask = (IRET_ALWAYS | if cpl <= (c.rflags & RFLAGS_IOPL) >> 12 { RFLAGS_IF } else { 0 } | if cpl == 0 { IRET_CPL0 } else { 0 })
+        let mask = (IRET_ALWAYS
+            | if cpl <= (c.rflags & RFLAGS_IOPL) >> 12 {
+                RFLAGS_IF
+            } else {
+                0
+            }
+            | if cpl == 0 { IRET_CPL0 } else { 0 })
             & if w == 2 { 0xffff } else { u64::MAX };
         rflags = (c.rflags & !mask | words[2] & mask) & !RFLAGS_VM | 2;
         // RF comes from the frame (X1a) and lasts until the next instruction completes (`execution::completed`); it
@@ -562,8 +713,14 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     match stack {
         Some((rsp, ss_selector, segment)) => {
             s.cpu.seg[SREG_SS] = match segment {
-                Some((_, ss_raw)) => Segment { base: 0, ..Segment::loaded(ss_selector, ss_raw | 1 << 40) },
-                None => Segment { selector: ss_selector, ..Segment::NULL },
+                Some((_, ss_raw)) => Segment {
+                    base: 0,
+                    ..Segment::loaded(ss_selector, ss_raw | 1 << 40)
+                },
+                None => Segment {
+                    selector: ss_selector,
+                    ..Segment::NULL
+                },
             };
             s.cpu.gpr[4] = rsp.wrapping_add(if iret { 0 } else { release });
         }
@@ -583,49 +740,87 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
 }
 
 /// Far pointers and stack frames have alignment independent of the aggregate byte count (SDM Vol.3A Table 7-7).
-fn aligned_operand(s: &mut State, at: u64, bytes: &mut [u8], slot: usize, alignment: u64, write: bool, nc: Exception) -> Result<(), Exception> {
+fn aligned_operand(
+    s: &mut State,
+    at: u64,
+    bytes: &mut [u8],
+    slot: usize,
+    alignment: u64,
+    write: bool,
+    nc: Exception,
+) -> Result<(), Exception> {
     let last = at.wrapping_add(bytes.len() as u64 - 1);
-    if !paging::canonical(at) || !paging::canonical(last) || last < at { return Err(nc); }
-    if s.cpu.alignment_check() && at & (alignment - 1) != 0 { return Err([17, 0, 0]); }
+    if !paging::canonical(at) || !paging::canonical(last) || last < at {
+        return Err(nc);
+    }
+    if s.cpu.alignment_check() && at & (alignment - 1) != 0 {
+        return Err([17, 0, 0]);
+    }
     // Preflight the entire pointer/frame, then transfer its operand-sized slots (a pointer's last selector is2bytes).
     // Naturally aligned slots cannot tear; the frame as a whole need not be atomic. Pointer alignment and offset
     // width are distinct: m16:64 aligns4 but its offset is an8byte load.
     let gpa = pages(s, at, bytes.len() as u64, write, false, nc)?;
     let head = bytes.len().min((4096 - (at & 4095)) as usize);
-    if !mmio::ram(gpa[0]) || (head < bytes.len() && !mmio::ram(gpa[1])) { mmio::system_access(s); }
+    if !mmio::ram(gpa[0]) || (head < bytes.len() && !mmio::ram(gpa[1])) {
+        mmio::system_access(s);
+    }
     if write {
         for (pa, count) in [(gpa[0], head), (gpa[1], bytes.len() - head)] {
-            if count != 0 && cache::translated(pa) { FetchWrites(s).code_write(pa); }
+            if count != 0 && cache::translated(pa) {
+                FetchWrites(s).code_write(pa);
+            }
         }
         unsafe { asm!("dmb ish") };
     }
     for (k, word) in bytes.chunks_mut(slot).enumerate() {
         let offset = slot * k;
-        let pa = if offset < head { gpa[0] + offset as u64 } else { gpa[1] + (offset - head) as u64 };
+        let pa = if offset < head {
+            gpa[0] + offset as u64
+        } else {
+            gpa[1] + (offset - head) as u64
+        };
         if offset < head && offset + word.len() > head {
             // Only an unaligned slot can straddle a page; its pieces may tear, but permissions are settled.
             let (lo, hi) = word.split_at_mut(head - offset);
             for (p, part) in [(pa, lo), (gpa[1], hi)] {
-                let ok = if write { guest_ram().copy_in(p, part) } else { guest_ram().copy_out(p, part) };
-                if !ok { halt(s, stop::SHADOW); }
+                let ok = if write {
+                    guest_ram().copy_in(p, part)
+                } else {
+                    guest_ram().copy_out(p, part)
+                };
+                if !ok {
+                    halt(s, stop::SHADOW);
+                }
             }
         } else {
             let width = word.len();
-            let Some(p) = guest_ram().range(pa, width as u64) else { halt(s, stop::SHADOW) };
+            let Some(p) = guest_ram().range(pa, width as u64) else {
+                halt(s, stop::SHADOW)
+            };
             let mut value = [0u8; 8];
             // SAFETY: the slot lies in fully preflighted RAM pages held against split-lock exclusion.
             unsafe {
                 if write {
                     value[..width].copy_from_slice(word);
                     rotate::store(p, width as u64, u64::from_le_bytes(value));
-                } else { word.copy_from_slice(&rotate::load(p, width as u64).to_le_bytes()[..width]); }
+                } else {
+                    word.copy_from_slice(&rotate::load(p, width as u64).to_le_bytes()[..width]);
+                }
             }
         }
     }
-    unsafe { if write { asm!("dsb ish") } else { asm!("dmb ish") } };
+    unsafe {
+        if write {
+            asm!("dsb ish")
+        } else {
+            asm!("dmb ish")
+        }
+    };
     if write {
         cache::rechecked(gpa[0]);
-        if head < bytes.len() { cache::rechecked(gpa[1]); }
+        if head < bytes.len() {
+            cache::rechecked(gpa[1]);
+        }
     }
     watch::access(s, at, bytes.len() as u64, write);
     Ok(())
@@ -661,7 +856,10 @@ pub(super) fn inspect(s: &mut State, i: System) -> Result<(), Exception> {
     };
     let result = found.and_then(|raw| {
         let (code_or_data, kind, dpl, _) = fields(raw);
-        let (code, conforming) = (code_or_data && kind & 8 != 0, code_or_data && kind & 0xc == 0xc);
+        let (code, conforming) = (
+            code_or_data && kind & 8 != 0,
+            code_or_data && kind & 0xc == 0xc,
+        );
         let accepted = match i.kind {
             system::LAR => code_or_data || matches!(kind, 2 | 9 | 0xb | 0xc),
             system::LSL => code_or_data || matches!(kind, 2 | 9 | 0xb),
@@ -678,7 +876,11 @@ pub(super) fn inspect(s: &mut State, i: System) -> Result<(), Exception> {
     s.cpu.rflags = c.rflags & !ZF | if result.is_some() { ZF } else { 0 };
     if let (Some(v), system::LAR | system::LSL) = (result, i.kind) {
         let r = &mut s.cpu.gpr[i.cr as usize];
-        *r = if i.size == 2 { *r & !0xffff | v & 0xffff } else { v & if i.size == 4 { 0xffff_ffff } else { u64::MAX } };
+        *r = if i.size == 2 {
+            *r & !0xffff | v & 0xffff
+        } else {
+            v & if i.size == 4 { 0xffff_ffff } else { u64::MAX }
+        };
     }
     Ok(())
 }

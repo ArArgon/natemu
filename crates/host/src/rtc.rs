@@ -22,8 +22,8 @@
 use crate::clock::{self, Timed};
 use crate::devices::Device;
 use crate::irq::{Busy, Delivery, Irqs};
-use std::sync::atomic::Ordering::SeqCst;
 use natemu_abi::clock::{count_at, scale};
+use std::sync::atomic::Ordering::SeqCst;
 
 const SEC: u64 = 1_000_000_000;
 const A: usize = 10;
@@ -75,7 +75,13 @@ fn mktimegm(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i
         m += 12;
         y -= 1;
     }
-    86400 * (day + (153 * m - 457) / 5 + 365 * y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400) - 719469) + 3600 * hour + 60 * min + sec
+    86400
+        * (day + (153 * m - 457) / 5 + 365 * y + y.div_euclid(4) - y.div_euclid(100)
+            + y.div_euclid(400)
+            - 719469)
+        + 3600 * hour
+        + 60 * min
+        + sec
 }
 /// `gmtime`: (year, month 1..12, day, hour, min, sec, weekday 0 = Sunday).
 fn gmtime(t: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
@@ -90,7 +96,15 @@ fn gmtime(t: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day, s / 3600, s / 60 % 60, s % 60, (days + 4).rem_euclid(7))
+    (
+        year,
+        month,
+        day,
+        s / 3600,
+        s / 60 % 60,
+        s % 60,
+        (days + 4).rem_euclid(7),
+    )
 }
 
 impl Rtc {
@@ -114,7 +128,9 @@ impl Rtc {
             stats: Default::default(),
         };
         (r.cmos[A], r.cmos[B], r.cmos[C], r.cmos[D]) = (0x26, 0x02, 0, 0x80);
-        let host = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let host = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
         (r.base, r.last_update) = (host, r.ns());
         r.set_cmos(host);
         r.check_update_timer();
@@ -131,7 +147,11 @@ impl Rtc {
         t - self.last_update + self.offset
     }
     fn to_bcd(&self, a: i64) -> u8 {
-        if self.cmos[B] & DM != 0 { a as u8 } else { ((a / 10) << 4 | a % 10) as u8 }
+        if self.cmos[B] & DM != 0 {
+            a as u8
+        } else {
+            ((a / 10) << 4 | a % 10) as u8
+        }
     }
     fn from_bcd(&self, a: u8) -> i64 {
         match a {
@@ -166,7 +186,14 @@ impl Rtc {
             }
         }
         let year = self.from_bcd(self.cmos[9]) + self.from_bcd(self.cmos[CENTURY]) * 100;
-        mktimegm(year, self.from_bcd(self.cmos[8]), self.from_bcd(self.cmos[7]), hour, self.from_bcd(self.cmos[2]), self.from_bcd(self.cmos[0]))
+        mktimegm(
+            year,
+            self.from_bcd(self.cmos[8]),
+            self.from_bcd(self.cmos[7]),
+            hour,
+            self.from_bcd(self.cmos[2]),
+            self.from_bcd(self.cmos[0]),
+        )
     }
     fn set_time(&mut self, t: u64) {
         (self.base, self.last_update) = (self.get_time(), t);
@@ -184,7 +211,9 @@ impl Rtc {
     fn hour_of(&self, a: u8) -> i64 {
         match a {
             _ if a & 0xc0 == 0xc0 => -1,
-            _ if self.cmos[B] & H24 == 0 => self.from_bcd(a & 0x7f) % 12 + if a & 0x80 != 0 { 12 } else { 0 },
+            _ if self.cmos[B] & H24 == 0 => {
+                self.from_bcd(a & 0x7f) % 12 + if a & 0x80 != 0 { 12 } else { 0 }
+            }
             _ => self.from_bcd(a),
         }
     }
@@ -308,7 +337,9 @@ impl Rtc {
             return self.guard();
         }
         let lost = match self.next_periodic {
-            Some(next) if old_period != 0 && period_change => edge.saturating_sub(next.saturating_sub(old_period)),
+            Some(next) if old_period != 0 && period_change => {
+                edge.saturating_sub(next.saturating_sub(old_period))
+            }
             _ => 0,
         };
         self.next_periodic = Some(edge + self.period - lost.min(self.period));
@@ -322,7 +353,10 @@ impl Rtc {
         if !self.running() {
             return false;
         }
-        if self.next_update.is_some_and(|n| t >= n.saturating_sub(UIP_HOLD)) {
+        if self
+            .next_update
+            .is_some_and(|n| t >= n.saturating_sub(UIP_HOLD))
+        {
             self.cmos[A] |= UIP;
             return true;
         }
@@ -330,8 +364,13 @@ impl Rtc {
     }
     /// Holds the guard while a timer can raise IRQ 8.
     fn guard(&mut self) {
-        let fires = self.next_periodic.is_some() || self.next_update.is_some() && self.cmos[B] & (UIE | AIE) != 0;
-        self.busy = if fires { self.busy.take().or_else(|| Some(self.irqs.busy())) } else { None };
+        let fires = self.next_periodic.is_some()
+            || self.next_update.is_some() && self.cmos[B] & (UIE | AIE) != 0;
+        self.busy = if fires {
+            self.busy.take().or_else(|| Some(self.irqs.busy()))
+        } else {
+            None
+        };
     }
     fn write_data(&mut self, data: u8) {
         let i = usize::from(self.index);
@@ -448,34 +487,62 @@ impl Rtc {
 impl Device for Rtc {
     // Byte registers (QEMU's `max_access_size` 1): a wider access is its bytes, lowest first.
     fn read(&mut self, _vcpu: usize, offset: u64, size: u64) -> Option<u64> {
-        Some((0..size).fold(0, |v, k| v | u64::from(if (offset + k) & 1 == 0 { 0xff } else { self.read_data() }) << (8 * k)))
+        Some((0..size).fold(0, |v, k| {
+            v | u64::from(if (offset + k) & 1 == 0 {
+                0xff
+            } else {
+                self.read_data()
+            }) << (8 * k)
+        }))
     }
     fn write(&mut self, _vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
         for k in 0..size {
             let b = (value >> (8 * k)) as u8;
-            if (offset + k) & 1 == 0 { self.index = b & 0x7f } else { self.write_data(b) }
+            if (offset + k) & 1 == 0 {
+                self.index = b & 0x7f
+            } else {
+                self.write_data(b)
+            }
         }
         true
     }
 }
 impl Timed for Rtc {
     fn next(&self) -> Option<u64> {
-        let periodic = self.next_periodic.map(|e| count_at(e, RATE, self.frequency));
+        let periodic = self
+            .next_periodic
+            .map(|e| count_at(e, RATE, self.frequency));
         let update = self.next_update.map(|n| count_at(n, SEC, self.frequency));
         periodic.into_iter().chain(update).min()
     }
     fn fire(&mut self, at: u64) {
-        if let Some(edge) = self.next_periodic.filter(|&e| count_at(e, RATE, self.frequency) <= at) {
+        if let Some(edge) = self
+            .next_periodic
+            .filter(|&e| count_at(e, RATE, self.frequency) <= at)
+        {
             // `rtc_periodic_timer`; a period whose interrupt is still unread in C (IRQ 8 high), or merged in an IRR, is
             // missed: owed under reinject (QEMU's `slew`: `irq_coalesced`), else lost.
             self.periodic_update(edge, self.period, false);
             self.cmos[C] |= PF;
             if self.cmos[B] & PIE != 0 {
                 self.stats.rises.fetch_add(1, SeqCst);
-                let d = if self.cmos[C] & IRQF != 0 { Delivery::Coalesced } else { Delivery::None };
+                let d = if self.cmos[C] & IRQF != 0 {
+                    Delivery::Coalesced
+                } else {
+                    Delivery::None
+                };
                 self.cmos[C] |= IRQF;
-                let d = if d == Delivery::Coalesced { d } else { self.irqs.line(8, true) };
-                [&self.stats.fresh, &self.stats.coalesced, &self.stats.dropped][d as usize].fetch_add(1, SeqCst);
+                let d = if d == Delivery::Coalesced {
+                    d
+                } else {
+                    self.irqs.line(8, true)
+                };
+                [
+                    &self.stats.fresh,
+                    &self.stats.coalesced,
+                    &self.stats.dropped,
+                ][d as usize]
+                    .fetch_add(1, SeqCst);
                 match d {
                     Delivery::Coalesced => {
                         self.stats.missed.fetch_add(1, SeqCst);
@@ -486,7 +553,10 @@ impl Timed for Rtc {
                 }
             }
         }
-        if let Some(n) = self.next_update.filter(|&n| count_at(n, SEC, self.frequency) <= at) {
+        if let Some(n) = self
+            .next_update
+            .filter(|&n| count_at(n, SEC, self.frequency) <= at)
+        {
             self.update_timer(n.max(scale(at, SEC, self.frequency)));
         }
     }
@@ -497,7 +567,13 @@ mod tests {
     use super::*;
     #[test]
     fn calendar() {
-        for t in [0i64, 951_782_400, 1_761_782_399, 4_102_444_800, 1_709_208_000] {
+        for t in [
+            0i64,
+            951_782_400,
+            1_761_782_399,
+            4_102_444_800,
+            1_709_208_000,
+        ] {
             let (y, mo, d, h, mi, s, _) = gmtime(t);
             assert_eq!(mktimegm(y, mo, d, h, mi, s), t, "{t}");
         }

@@ -24,17 +24,29 @@
 //! shadow reset) and wakes only for an event it can take (an enabled interrupt or an unblocked NMI, model A10). While
 //! parked its record says so (`Events::halted`): the host's watchdog treats it as idle, and the host may end its run
 //! ([`Events::end`], [`stop::HALTED`]) when no source could wake it.
+use super::lapic;
 use super::segments::{Exception, linear};
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use super::lapic;
 use natemu_abi::execution::cache::Events;
 
 const IF: u64 = 1 << 9;
 const TF: u64 = 1 << 8;
 const IOPL: u64 = 3 << 12;
 /// The flags POPF may write (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID: not RF, VM, VIF, VIP; SDM Vol.2 POPF).
-const POPF_FLAGS: u64 = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | TF | IF | 1 << 10 | 1 << 11 | IOPL | 1 << 14 | 1 << 18 | 1 << 21;
+const POPF_FLAGS: u64 = 0x1
+    | 0x4
+    | 0x10
+    | 0x40
+    | 0x80
+    | TF
+    | IF
+    | 1 << 10
+    | 1 << 11
+    | IOPL
+    | 1 << 14
+    | 1 << 18
+    | 1 << 21;
 
 /// This vCPU's event record word at `field` (an offset in [`Events`]).
 fn word(s: &State, field: usize) -> &'static AtomicU64 {
@@ -86,7 +98,8 @@ pub(super) fn held(s: &State) -> bool {
     let w = |field: usize| word(s, field).load(core::sync::atomic::Ordering::Relaxed);
     let v = offset_of!(Events, vectors);
     let nmi = s.nmi_blocked == 0 && w(offset_of!(Events, nmi)) != 0;
-    nmi || (w(v) | w(v + 8) | w(v + 16) | w(v + 24) | w(offset_of!(Events, lint0)) != 0 && (lapic::extint(s) || lapic::deliverable(s).is_some()))
+    nmi || (w(v) | w(v + 8) | w(v + 16) | w(v + 24) | w(offset_of!(Events, lint0)) != 0
+        && (lapic::extint(s) || lapic::deliverable(s).is_some()))
 }
 
 /// Takes every event this boundary may take, delivering each (the handler's first instruction is a boundary too).
@@ -113,7 +126,13 @@ pub(super) fn take(s: &mut State) -> bool {
             }
         };
         let mid_string = s.mid_string != 0;
-        deliver(s, Event::External { vector: event, mid_string });
+        deliver(
+            s,
+            Event::External {
+                vector: event,
+                mid_string,
+            },
+        );
         // S4: a frame store that met a data breakpoint traps before anything else at the handler's first boundary
         // (the caller takes it first; a delivery ended any shadow, so nothing holds it).
         if s.debug & debug::TRAP != 0 {
@@ -157,7 +176,11 @@ fn popf(s: &mut State, i: System) -> Result<(), Exception> {
     let rsp = s.cpu.gpr[4];
     let mut b = [0u8; 8];
     linear(s, rsp, &mut b[..n], false, false, [12, 0, 0])?;
-    let mut mask = if n == 2 { POPF_FLAGS & 0xffff } else { POPF_FLAGS };
+    let mut mask = if n == 2 {
+        POPF_FLAGS & 0xffff
+    } else {
+        POPF_FLAGS
+    };
     if s.cpu.cpl > 0 {
         mask &= !IOPL;
         if s.cpu.cpl > s.cpu.rflags >> 12 & 3 {
@@ -187,14 +210,21 @@ pub(super) fn bit_test(s: &mut State, i: System) -> Result<(), Exception> {
             4 => r as i32 as i64,
             _ => r as i64,
         };
-        operand.disp = operand.disp.wrapping_add((offset >> (size * 8).trailing_zeros()).wrapping_mul(size as i64));
+        operand.disp = operand
+            .disp
+            .wrapping_add((offset >> (size * 8).trailing_zeros()).wrapping_mul(size as i64));
     }
     let unit = super::segments::address(&s.cpu, &operand);
     let last = unit.wrapping_add(size - 1);
     // S4: the complete operand-sized unit meets data breakpoints. The following native step now accesses that same
     // unit; duplicate hit bits are harmless and a fault suppresses the pending data-breakpoint trap.
     super::watch::access(s, unit, size, i.cr != 0);
-    if s.cpu.alignment_check() && unit & (size - 1) != 0 && paging::canonical(unit) && paging::canonical(last) && last > unit {
+    if s.cpu.alignment_check()
+        && unit & (size - 1) != 0
+        && paging::canonical(unit)
+        && paging::canonical(last)
+        && last > unit
+    {
         return Err([17, 0, 0]);
     }
     Ok(())
@@ -230,7 +260,10 @@ pub(super) fn park(s: &mut State) {
         }
         // X3: armed, its own LAPIC timer wakes it (the host does not end it then).
         let wakes = lapic::can_wake(s);
-        halted.store(if wakes { 2 } else { 1 } | seen << natemu_abi::execution::cache::HALTED_SEEN_SHIFT, SeqCst);
+        halted.store(
+            if wakes { 2 } else { 1 } | seen << natemu_abi::execution::cache::HALTED_SEEN_SHIFT,
+            SeqCst,
+        );
         if !wakes && word(s, core::mem::offset_of!(Events, end)).load(SeqCst) != 0 {
             // A peer's post may land between `next` and the load of `end`: look once more before ending.
             if next(s).is_some() {
@@ -295,15 +328,23 @@ fn doorbells(s: &mut State) {
 pub(super) fn wait_mailbox(s: &mut State) {
     let from = crate::perf::enter(crate::perf::MAILBOX);
     let gpa = s.mailbox;
-    let Some(p) = guest_ram().range(gpa, 16).filter(|_| gpa % 4096 == 0) else { halt(s, stop::UNSUPPORTED_MODE) };
-    let (halted, posts, end) = (word(s, core::mem::offset_of!(Events, halted)), word(s, core::mem::offset_of!(Events, posts)),
-        word(s, core::mem::offset_of!(Events, end)));
+    let Some(p) = guest_ram().range(gpa, 16).filter(|_| gpa % 4096 == 0) else {
+        halt(s, stop::UNSUPPORTED_MODE)
+    };
+    let (halted, posts, end) = (
+        word(s, core::mem::offset_of!(Events, halted)),
+        word(s, core::mem::offset_of!(Events, posts)),
+        word(s, core::mem::offset_of!(Events, end)),
+    );
     loop {
         doorbells(s);
         // As in HLT, never consume the only I/O wake after checking the window request.
         super::io_checkpoint(s);
         take_invalidations(s);
-        halted.store(1 | posts.load(SeqCst) << natemu_abi::execution::cache::HALTED_SEEN_SHIFT, SeqCst);
+        halted.store(
+            1 | posts.load(SeqCst) << natemu_abi::execution::cache::HALTED_SEEN_SHIFT,
+            SeqCst,
+        );
         let ending = end.load(SeqCst) != 0;
         // The re-mark's cost (the review's item): it may spin until a writer that holds a writable shadow of the page
         // resets its shadows (a writer in the host answers only when it next enters the VM), and each such writer
@@ -318,7 +359,8 @@ pub(super) fn wait_mailbox(s: &mut State) {
             // the vector again only after the acknowledgement, and `run_x4.py`'s probe of that window rarely lands in
             // it): the vector is read here, before the acknowledgement's store below (ACPI 6.5 5.2.12.19: the firmware
             // "must cache the content in the mailbox which might be used later before clear the command").
-            s.cpu.rip = unsafe { core::ptr::read_volatile(p.add(mailbox::VECTOR as usize).cast::<u64>()) };
+            s.cpu.rip =
+                unsafe { core::ptr::read_volatile(p.add(mailbox::VECTOR as usize).cast::<u64>()) };
             (s.mailbox, s.mailbox_acked) = (0, ticks());
             halted.store(0, SeqCst); // running before the OS can see the acknowledgement (the host's end rule)
             // The acknowledgement, a store through the alias with the code-write protocol (peers' marks: other waiting APs).

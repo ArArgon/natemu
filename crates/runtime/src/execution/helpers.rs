@@ -28,7 +28,13 @@ pub(super) unsafe fn string(f: &NativeFrame, elr: u64, spsr: u64) -> ! {
             s.native = [0, f.x[0], elr];
             halt(&s, stop::UNKNOWN_ABORT)
         }
-        let r = natemu_abi::strings::pcmpstr(u128::from_le_bytes(f.q[0]), u128::from_le_bytes(f.q[1]), f.x[0] as u32, f.x[1], f.x[2]);
+        let r = natemu_abi::strings::pcmpstr(
+            u128::from_le_bytes(f.q[0]),
+            u128::from_le_bytes(f.q[1]),
+            f.x[0] as u32,
+            f.x[1],
+            f.x[2],
+        );
         let resume = &raw mut (*shared()).captured;
         (*resume).x[0] = u64::from(r);
         self::resume(&s, resume, elr, spsr)

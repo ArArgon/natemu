@@ -31,10 +31,25 @@ const NT: u64 = 1 << 14;
 const RF: u64 = 1 << 16;
 const VM: u64 = 1 << 17;
 /// Vectors with an error code (§7.15): #DF #TS #NP #SS #GP #PF #AC #CP.
-const ERROR_CODE: u64 = 1 << 8 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 17 | 1 << 21;
+const ERROR_CODE: u64 =
+    1 << 8 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 17 | 1 << 21;
 /// Fault-class vectors (Table 7-1), whose frame holds RF = 1 (Vol.3 "RF"). #DB counts as a fault as an `Exception`: general
 /// detect (DR7.GD); its other sources (S4) are `Event::Debug`.
-const FAULTS: u64 = 1 | 1 << 1 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 16 | 1 << 17 | 1 << 19 | 1 << 20 | 1 << 21;
+const FAULTS: u64 = 1
+    | 1 << 1
+    | 1 << 5
+    | 1 << 6
+    | 1 << 7
+    | 1 << 10
+    | 1 << 11
+    | 1 << 12
+    | 1 << 13
+    | 1 << 14
+    | 1 << 16
+    | 1 << 17
+    | 1 << 19
+    | 1 << 20
+    | 1 << 21;
 /// Table 7-4 classes.
 const CONTRIBUTORY: u64 = 1 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 21;
 const PAGE: u64 = 1 << 14 | 1 << 20;
@@ -91,7 +106,8 @@ fn delivery(s: &mut State, mut event: Event) {
                 s.fault = [f[0], if f[0] == 14 { f[2] } else { 0 }, f[1], s.cpu.rip];
                 halt(s, stop::SHUTDOWN)
             }
-            (Class::Contributory, Class::Contributory) | (Class::Page, Class::Contributory | Class::Page) => Event::Exception([8, 0, 0]),
+            (Class::Contributory, Class::Contributory)
+            | (Class::Page, Class::Contributory | Class::Page) => Event::Exception([8, 0, 0]),
             _ => nested,
         };
     }
@@ -114,8 +130,18 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
         return Err(gp(gate_error));
     }
     let mut raw = [0u8; 16];
-    segments::linear(s, c.idtr.base.wrapping_add(vector * 16), &mut raw, false, true, gp(gate_error))?;
-    let (lo, hi) = (u64::from_le_bytes(raw[..8].try_into().unwrap()), u64::from_le_bytes(raw[8..].try_into().unwrap()));
+    segments::linear(
+        s,
+        c.idtr.base.wrapping_add(vector * 16),
+        &mut raw,
+        false,
+        true,
+        gp(gate_error),
+    )?;
+    let (lo, hi) = (
+        u64::from_le_bytes(raw[..8].try_into().unwrap()),
+        u64::from_le_bytes(raw[8..].try_into().unwrap()),
+    );
     let (gtype, dpl, present) = (lo >> 40 & 0x1f, lo >> 45 & 3, lo >> 47 & 1 != 0);
     let (selector, ist) = ((lo >> 16) as u16, lo >> 32 & 7);
     let offset = lo & 0xffff | (lo >> 48 & 0xffff) << 16 | (hi & 0xffff_ffff) << 32;
@@ -157,7 +183,11 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
     }
     // The stack: IST n, or RSPn of the new level when it changes (§7.14.4, §7.14.5), else the current one.
     let rsp = if ist != 0 || new_cpl != c.cpl {
-        let slot = if ist != 0 { 0x24 + 8 * (ist - 1) } else { 4 + 8 * new_cpl };
+        let slot = if ist != 0 {
+            0x24 + 8 * (ist - 1)
+        } else {
+            4 + 8 * new_cpl
+        };
         if slot + 7 > u64::from(c.tr.limit) {
             return Err([10, u64::from(c.tr.selector & 0xfffc) | ext, 0]);
         }
@@ -180,7 +210,13 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
     let top = rsp & !15;
     let rf = match event {
         Event::Software { .. } => 0,
-        Event::External { mid_string, .. } | Event::Debug { mid_string, .. } => if mid_string { RF } else { c.rflags & RF },
+        Event::External { mid_string, .. } | Event::Debug { mid_string, .. } => {
+            if mid_string {
+                RF
+            } else {
+                c.rflags & RF
+            }
+        }
         Event::Exception(_) if FAULTS >> vector & 1 != 0 => RF,
         Event::Exception(_) => c.rflags & RF,
     };
@@ -188,7 +224,14 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
         Event::Exception([v, e, _]) if ERROR_CODE >> v & 1 != 0 => Some(e),
         _ => None,
     };
-    let slots = [error.unwrap_or(0), c.rip.wrapping_add(length), u64::from(c.seg[SREG_CS].selector), c.rflags & !RF | rf, c.gpr[4], u64::from(c.seg[SREG_SS].selector)];
+    let slots = [
+        error.unwrap_or(0),
+        c.rip.wrapping_add(length),
+        u64::from(c.seg[SREG_CS].selector),
+        c.rflags & !RF | rf,
+        c.gpr[4],
+        u64::from(c.seg[SREG_SS].selector),
+    ];
     let slots = &slots[usize::from(error.is_none())..];
     let low = top.wrapping_sub(8 * slots.len() as u64);
     if !paging::canonical(top.wrapping_sub(8)) || !paging::canonical(low) || low > top {
@@ -199,14 +242,27 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
         frame[8 * k..8 * k + 8].copy_from_slice(&v.to_le_bytes());
     }
     // At the new CPL (A3): an implicit-supervisor-like walk at CPL 0, else explicit at CPL 3 (the CPL stays 3).
-    segments::linear(s, low, &mut frame[..8 * slots.len()], true, new_cpl == 0, [12, ext, 0])?;
+    segments::linear(
+        s,
+        low,
+        &mut frame[..8 * slots.len()],
+        true,
+        new_cpl == 0,
+        [12, ext, 0],
+    )?;
     super::watch::access(s, low, 8 * slots.len() as u64, true);
     segments::accessed(s, cs_va, cs_raw)?;
     s.cpu.gpr[4] = low;
     s.cpu.rip = offset;
-    s.cpu.seg[SREG_CS] = Segment { base: 0, ..Segment::loaded(selector & 0xfffc | new_cpl as u16, cs_raw | 1 << 40) };
+    s.cpu.seg[SREG_CS] = Segment {
+        base: 0,
+        ..Segment::loaded(selector & 0xfffc | new_cpl as u16, cs_raw | 1 << 40)
+    };
     if new_cpl != c.cpl {
-        s.cpu.seg[SREG_SS] = Segment { selector: new_cpl as u16, ..Segment::NULL }; // a null SS with RPL = new CPL
+        s.cpu.seg[SREG_SS] = Segment {
+            selector: new_cpl as u16,
+            ..Segment::NULL
+        }; // a null SS with RPL = new CPL
     }
     s.cpu.rflags &= !(TF | NT | RF | VM | if gtype == 0xe { IF } else { 0 }); // §7.12.1.3
     // Both interrupt shadows end, and the boundary is no longer between REP iterations (X2).

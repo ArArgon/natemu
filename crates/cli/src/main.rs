@@ -27,8 +27,11 @@ const MAX_INPUT: usize = 1 << 32;
 
 /// Boot a Linux bzImage (x86-64) under natemu.
 #[derive(Parser)]
-#[command(name = "natemu", after_help = "Exit status: 0 the guest powered off, 2 any other stop (reset, a typed stop, a watchdog, \
-    SIGINT/SIGTERM), 1 a host error. A flag wins over its environment variable.")]
+#[command(
+    name = "natemu",
+    after_help = "Exit status: 0 the guest powered off, 2 any other stop (reset, a typed stop, a watchdog, \
+    SIGINT/SIGTERM), 1 a host error. A flag wins over its environment variable."
+)]
 struct Cli {
     /// The resident runtime ELF [default: the one built beside this binary]
     #[arg(long, value_name = "FILE")]
@@ -98,7 +101,11 @@ fn size(text: &str) -> Result<u64, String> {
 fn built_runtime() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let profile = exe.parent()?;
-    let path = profile.parent()?.join("aarch64-unknown-none").join(profile.file_name()?).join("natemu-runtime");
+    let path = profile
+        .parent()?
+        .join("aarch64-unknown-none")
+        .join(profile.file_name()?)
+        .join("natemu-runtime");
     path.is_file().then_some(path)
 }
 
@@ -108,13 +115,19 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
         natemu::perf::enable(path)?;
         natemu::perf::mark("main");
     }
-    let runtime = cli.runtime.or_else(built_runtime).ok_or("--runtime FILE: no resident built beside this binary")?;
+    let runtime = cli
+        .runtime
+        .or_else(built_runtime)
+        .ok_or("--runtime FILE: no resident built beside this binary")?;
     for (what, path) in [("--runtime", &runtime), ("--fexc", &cli.fexc)] {
         std::fs::metadata(path).map_err(|e| format!("{what} {}: {e}", path.display()))?;
     }
     let read = |path: &PathBuf| natemu::memory::read_input(&path.to_string_lossy(), MAX_INPUT);
     let mut boot = Boot::new(runtime, cli.fexc, read(&cli.kernel)?);
-    boot.compile_cache = natemu::compile_cache::Config::new(cli.compile_cache.as_deref().map(|p| p.as_os_str()), cli.compile_cache_mb)?;
+    boot.compile_cache = natemu::compile_cache::Config::new(
+        cli.compile_cache.as_deref().map(|p| p.as_os_str()),
+        cli.compile_cache_mb,
+    )?;
     boot.speculation_barriers = cli.speculation_barriers;
     boot.rng = cli.rng;
     boot.disk = cli.disk;
@@ -123,7 +136,9 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     boot.ram = cli.ram.unwrap_or(boot.ram);
     boot.vcpus = cli.vcpus.unwrap_or(boot.vcpus);
     boot.serial = Some(match &cli.serial {
-        Some(path) => Box::new(std::fs::File::create(path).map_err(|e| format!("--serial {}: {e}", path.display()))?),
+        Some(path) => Box::new(
+            std::fs::File::create(path).map_err(|e| format!("--serial {}: {e}", path.display()))?,
+        ),
         None => Box::new(std::io::stdout()),
     });
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
@@ -137,7 +152,11 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     if let Some(e) = prepared.serial_error() {
         return Err(format!("serial output: {e}"));
     }
-    let first = if outcome.ended_first < outcome.each.len() { outcome.ended_first } else { 0 };
+    let first = if outcome.ended_first < outcome.each.len() {
+        outcome.ended_first
+    } else {
+        0
+    };
     Ok(outcome.each.swap_remove(first).unwrap().0)
 }
 
@@ -153,7 +172,11 @@ fn main() {
     match boot(cli) {
         Ok(stop) => {
             eprintln!("natemu: {stop:?}");
-            std::process::exit(if matches!(stop, Stop::Power(natemu::pm::POWEROFF)) { 0 } else { 2 });
+            std::process::exit(if matches!(stop, Stop::Power(natemu::pm::POWEROFF)) {
+                0
+            } else {
+                2
+            });
         }
         Err(error) => {
             eprintln!("natemu: {error}");
@@ -166,7 +189,13 @@ fn main() {
 mod tests {
     #[test]
     fn size() {
-        for (text, bytes) in [("2G", 2 << 30), ("2048M", 2 << 30), ("0x80000000", 2 << 30), ("4096", 4096), ("64k", 64 << 10)] {
+        for (text, bytes) in [
+            ("2G", 2 << 30),
+            ("2048M", 2 << 30),
+            ("0x80000000", 2 << 30),
+            ("4096", 4096),
+            ("64k", 64 << 10),
+        ] {
             assert_eq!(super::size(text), Ok(bytes), "{text}");
         }
         for text in ["", "G", "2T", "0x", "-1", "99999999999G"] {

@@ -106,7 +106,11 @@ fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
 }
 pub fn read_input(path: &str, max: usize) -> Result<Vec<u8>> {
-    if fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len() > max as u64 {
+    if fs::metadata(path)
+        .map_err(|e| format!("{path}: {e}"))?
+        .len()
+        > max as u64
+    {
         return Err(format!("{path}: oversized input"));
     }
     let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -228,7 +232,11 @@ const PRIVATE_LEAF: usize = 0x14000;
 const PRIVATE_L2: usize = 0x13000;
 /// Level-2 table of the private window's GiB `g` (`PRIVATE_L2`, then the guest-RAM alias's, M1).
 fn private_l2(g: usize) -> usize {
-    if g == 0 { PRIVATE_L2 } else { natemu_abi::execution::RAM_TABLES_OFFSET + (g - 1) * 4096 }
+    if g == 0 {
+        PRIVATE_L2
+    } else {
+        natemu_abi::execution::RAM_TABLES_OFFSET + (g - 1) * 4096
+    }
 }
 /// GiBs of the private window.
 const PRIVATE_GIBS: usize = (natemu_abi::execution::PRIVATE_BYTES >> 30) as usize;
@@ -248,8 +256,10 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
     word(shadow::USER_LOWER_ROOT + 256 * 8, table(0x12000));
     // Low alias exists only for MMU enable and is removed by startup.
     let identity = IPA + window as u64;
-    word(0x11000 + ((identity >> 30) as usize) * 8,
-        (identity & !((1 << 30) - 1)) | 1 | 1 << 10 | 1 << 11 | 3 << 8);
+    word(
+        0x11000 + ((identity >> 30) as usize) * 8,
+        (identity & !((1 << 30) - 1)) | 1 | 1 << 10 | 1 << 11 | 3 << 8,
+    );
     word(0x11000, table(0x15000));
     word(0x15000, table(shadow::LOWER_LEAF));
     for g in 0..PRIVATE_GIBS {
@@ -278,7 +288,10 @@ pub(crate) fn private_space(memory: &Memory, window: usize, spans: &[Span], uppe
         window,
         &[
             own(shadow::STATE_OFFSET, 4096),
-            own(shadow::USER_LOWER_ROOT, shadow::USER_UPPER_ROOT + 4096 - shadow::USER_LOWER_ROOT),
+            own(
+                shadow::USER_LOWER_ROOT,
+                shadow::USER_UPPER_ROOT + 4096 - shadow::USER_LOWER_ROOT,
+            ),
             own(shadow::POOL_OFFSET, shadow::POOL_PAGES * 4096),
         ],
     );
@@ -332,7 +345,10 @@ pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, v
     }
     word(l1 + index(1), table(l2));
     word(l2 + index(2), table(leaf));
-    word(leaf + index(3), (IPA + target as u64) | PAGE | EL0_DATA | PXN | UXN);
+    word(
+        leaf + index(3),
+        (IPA + target as u64) | PAGE | EL0_DATA | PXN | UXN,
+    );
 }
 
 /// The resident's boot and extended text in window `window`.
@@ -453,7 +469,15 @@ pub(crate) mod tests {
     #[test]
     fn guest_state_alias_is_one_el0_page_outside_the_window() {
         use natemu_abi::execution::{FRAME_OFFSET, GUEST_STATE_SLOT, cache::MAX_VCPUS};
-        for offset in [0, 4096, (1 << 21) - 4096, 1 << 21, (1 << 30) - 4096, 1 << 30, (1 << 39) - 4096] {
+        for offset in [
+            0,
+            4096,
+            (1 << 21) - 4096,
+            1 << 21,
+            (1 << 30) - 4096,
+            1 << 30,
+            (1 << 39) - 4096,
+        ] {
             let va = GUEST_STATE_SLOT.start + offset;
             let memory = Memory::with_size(MAX_VCPUS * RAM_SIZE).unwrap();
             for v in 0..MAX_VCPUS {
@@ -476,11 +500,18 @@ pub(crate) mod tests {
                 };
                 assert!((va >> 39 & 511) < 256);
                 for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT] {
-                    assert_eq!(walk(root, va), (IPA + (window + FRAME_OFFSET) as u64) | PAGE | EL0_DATA | PXN | UXN);
+                    assert_eq!(
+                        walk(root, va),
+                        (IPA + (window + FRAME_OFFSET) as u64) | PAGE | EL0_DATA | PXN | UXN
+                    );
                     assert_eq!([walk(root, va - 4096), walk(root, va + 4096)], [0, 0]);
                 }
                 for offset in (0..RAM_SIZE).step_by(4096) {
-                    assert_eq!(word(PRIVATE_LEAF + offset / 4096 * 8) & EL0_DATA, 0, "{offset:#x}");
+                    assert_eq!(
+                        word(PRIVATE_LEAF + offset / 4096 * 8) & EL0_DATA,
+                        0,
+                        "{offset:#x}"
+                    );
                 }
                 assert_eq!(word(PRIVATE_LEAF + 0x24000 / 4096 * 8), 0);
             }
@@ -491,23 +522,54 @@ pub(crate) mod tests {
     fn spans_above_two_mib_map_as_level_two_blocks() {
         let memory = Memory::new().unwrap();
         let mib = RAM_SIZE;
-        map_private(&memory, 0, &[Span::text(0x1000_0000, 4 * mib, 6 * mib), Span::data(0x2000_0000, 2 * mib, 6 * mib), Span::code(0x3000_0000, 2 * mib, 6 * mib)]);
-        let l2 = |offset: usize| u64::from_le_bytes(memory.read::<8>(PRIVATE_L2 + offset / (2 * mib) * 8));
-        assert_eq!(l2(0x1000_0000), (IPA + 6 * mib as u64) | BLOCK | READ_ONLY | UXN);
-        assert_eq!(l2(0x1020_0000), (IPA + 8 * mib as u64) | BLOCK | READ_ONLY | UXN);
+        map_private(
+            &memory,
+            0,
+            &[
+                Span::text(0x1000_0000, 4 * mib, 6 * mib),
+                Span::data(0x2000_0000, 2 * mib, 6 * mib),
+                Span::code(0x3000_0000, 2 * mib, 6 * mib),
+            ],
+        );
+        let l2 = |offset: usize| {
+            u64::from_le_bytes(memory.read::<8>(PRIVATE_L2 + offset / (2 * mib) * 8))
+        };
+        assert_eq!(
+            l2(0x1000_0000),
+            (IPA + 6 * mib as u64) | BLOCK | READ_ONLY | UXN
+        );
+        assert_eq!(
+            l2(0x1020_0000),
+            (IPA + 8 * mib as u64) | BLOCK | READ_ONLY | UXN
+        );
         assert_eq!(l2(0x2000_0000), (IPA + 6 * mib as u64) | BLOCK | PXN | UXN);
         // Generated code: EL1 read-only, EL0 execute-only (AP 10, UXN clear), never EL1-executable.
-        assert_eq!(l2(0x3000_0000), (IPA + 6 * mib as u64) | BLOCK | READ_ONLY | PXN);
+        assert_eq!(
+            l2(0x3000_0000),
+            (IPA + 6 * mib as u64) | BLOCK | READ_ONLY | PXN
+        );
         assert_eq!(l2(0x1040_0000), 0);
         // M1: the guest-RAM alias's GiBs (1 to 3 of the window) have level-2 tables of their own; a span crossing a GiB
         // continues in the next table, and the last 2 MiB of the window is mappable.
         let gib = 1 << 30;
-        map_private(&memory, 0, &[Span::data(gib + gib - 2 * mib, 4 * mib, 0), Span::data(4 * gib - 2 * mib, 2 * mib, 0)]);
-        let ram = |g: usize, offset: usize| u64::from_le_bytes(memory.read::<8>(private_l2(g) + offset / (2 * mib) * 8));
+        map_private(
+            &memory,
+            0,
+            &[
+                Span::data(gib + gib - 2 * mib, 4 * mib, 0),
+                Span::data(4 * gib - 2 * mib, 2 * mib, 0),
+            ],
+        );
+        let ram = |g: usize, offset: usize| {
+            u64::from_le_bytes(memory.read::<8>(private_l2(g) + offset / (2 * mib) * 8))
+        };
         assert_eq!(ram(1, gib - 2 * mib), IPA | BLOCK | PXN | UXN);
         assert_eq!(ram(2, 0), (IPA + 2 * mib as u64) | BLOCK | PXN | UXN);
         assert_eq!(ram(3, gib - 2 * mib), IPA | BLOCK | PXN | UXN);
-        assert_eq!((PRIVATE_GIBS, private_l2(1), private_l2(3)), (37, 0x25000, 0x27000));
+        assert_eq!(
+            (PRIVATE_GIBS, private_l2(1), private_l2(3)),
+            (37, 0x25000, 0x27000)
+        );
     }
 
     #[test]
@@ -519,7 +581,9 @@ pub(crate) mod tests {
             let index = (ipa >> 30) as usize;
             let word = |i| u64::from_le_bytes(memory.read::<8>(window + 0x11000 + 8 * i));
             assert_eq!(word(index) & 0x0000_ffff_c000_0000, ipa & !((1 << 30) - 1));
-            if index != 1 { assert_eq!(word(1), 0); }
+            if index != 1 {
+                assert_eq!(word(1), 0);
+            }
         }
     }
 
@@ -538,11 +602,20 @@ pub(crate) mod tests {
             u64::from_le_bytes(memory.read::<8>(window + 0x14000 + offset / 4096 * 8))
         };
         // The runtime reaches its tables, state and pool through own-window RW aliases.
-        for offset in [shadow::LOWER_ROOT, shadow::UPPER_LEAF, shadow::STATE_OFFSET, shadow::USER_LOWER_ROOT, shadow::USER_UPPER_ROOT]
-            .into_iter()
-            .chain((0..shadow::POOL_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
+        for offset in [
+            shadow::LOWER_ROOT,
+            shadow::UPPER_LEAF,
+            shadow::STATE_OFFSET,
+            shadow::USER_LOWER_ROOT,
+            shadow::USER_UPPER_ROOT,
+        ]
+        .into_iter()
+        .chain((0..shadow::POOL_PAGES).map(|i| shadow::POOL_OFFSET + i * 4096))
         {
-            assert_eq!(leaf(offset), (IPA + (window + offset) as u64) | PAGE | PXN | UXN);
+            assert_eq!(
+                leaf(offset),
+                (IPA + (window + offset) as u64) | PAGE | PXN | UXN
+            );
         }
         // Both spaces' TTBR0 roots reach the private region through the same table.
         for root in [shadow::LOWER_ROOT, shadow::USER_LOWER_ROOT] {
@@ -562,8 +635,14 @@ pub(crate) mod tests {
         }
         assert_eq!(space.used(), 0);
         let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(window + offset));
-        assert_eq!(word(shadow::LOWER_LEAF + 256 * 8), IPA | shadow::PAGE | shadow::NOT_GLOBAL);
-        assert_eq!(word(shadow::UPPER_LEAF + 256 * 8), IPA | shadow::PAGE | shadow::NOT_GLOBAL);
+        assert_eq!(
+            word(shadow::LOWER_LEAF + 256 * 8),
+            IPA | shadow::PAGE | shadow::NOT_GLOBAL
+        );
+        assert_eq!(
+            word(shadow::UPPER_LEAF + 256 * 8),
+            IPA | shadow::PAGE | shadow::NOT_GLOBAL
+        );
         space.map(0x7fff_0000_0000, IPA, false).unwrap();
         assert_eq!(space.used(), 3);
         // Without `upper` (TCR.EPD1 set) the upper half is refused; the lower

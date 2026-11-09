@@ -29,8 +29,8 @@
 use crate::clock::{self, Timed};
 use crate::devices::Device;
 use crate::irq::{Busy, Delivery, Irqs};
-use std::sync::atomic::Ordering::SeqCst;
 use natemu_abi::clock::{PIT_HZ, count_at, scale};
+use std::sync::atomic::Ordering::SeqCst;
 
 const MSB: u8 = 2;
 const WORD0: u8 = 3;
@@ -57,11 +57,20 @@ struct Channel {
 impl Channel {
     /// QEMU's `pit_reset_common` registers.
     fn reset(gate: bool) -> Self {
-        Self { count: 0x10000, mode: 3, gate, ..Default::default() }
+        Self {
+            count: 0x10000,
+            mode: 3,
+            gate,
+            ..Default::default()
+        }
     }
     /// The counting mode (6 and 7 are 2 and 3).
     fn mode(&self) -> u8 {
-        if self.mode >= 6 { self.mode - 4 } else { self.mode }
+        if self.mode >= 6 {
+            self.mode - 4
+        } else {
+            self.mode
+        }
     }
     /// Ticks since the load at PIT edge `edge`.
     fn d(&self, edge: u64) -> u64 {
@@ -152,7 +161,11 @@ pub(crate) struct Pit {
 pub(crate) const PORT_61: u64 = 0x21;
 impl Pit {
     pub(crate) fn new(irqs: &Irqs, frequency: u64, reinject: bool) -> Self {
-        let channels = [Channel::reset(true), Channel::reset(true), Channel::reset(false)];
+        let channels = [
+            Channel::reset(true),
+            Channel::reset(true),
+            Channel::reset(false),
+        ];
         Self {
             channels,
             frequency,
@@ -185,7 +198,11 @@ impl Pit {
     }
     fn guard(&mut self) {
         let armed = self.next.is_some() || self.retry.is_some();
-        self.busy = if armed { self.busy.take().or_else(|| Some(self.irqs.busy())) } else { None };
+        self.busy = if armed {
+            self.busy.take().or_else(|| Some(self.irqs.busy()))
+        } else {
+            None
+        };
     }
     /// `pit_irq_timer_update` for channel 0 at a count load or gate restart (PIT edge `edge`): OUT onto IRQ0, the next
     /// change scheduled; a load drops the backlog (KVM resets its pending count when the timer is reprogrammed).
@@ -218,7 +235,9 @@ impl Pit {
         if self.retry.is_some_and(|r| r <= now) {
             let level = c.line(now);
             let d = self.pulse(level);
-            self.stats.reinjected.fetch_add(u64::from(d == Delivery::Fresh), SeqCst);
+            self.stats
+                .reinjected
+                .fetch_add(u64::from(d == Delivery::Fresh), SeqCst);
             match d {
                 Delivery::Fresh => self.backlog -= 1,
                 Delivery::Coalesced => {}
@@ -239,7 +258,11 @@ impl Pit {
             return;
         }
         // Nothing took it (masked, no destination): nothing is owed (KVM's mask notifier drops the pending count).
-        self.backlog = if d == Delivery::None { 0 } else { self.backlog + missed };
+        self.backlog = if d == Delivery::None {
+            0
+        } else {
+            self.backlog + missed
+        };
         if self.backlog > 0 && self.retry.is_none() {
             self.retry = Some(now + (self.channels[0].count / 4).max(1));
         }
@@ -285,7 +308,8 @@ impl Pit {
                     }
                     let c = &mut self.channels[ch];
                     if val & 0x10 == 0 && !c.status_latched {
-                        c.status = u8::from(c.out(edge)) << 7 | c.rw_mode << 4 | c.mode << 1 | c.bcd;
+                        c.status =
+                            u8::from(c.out(edge)) << 7 | c.rw_mode << 4 | c.mode << 1 | c.bcd;
                         c.status_latched = true;
                     }
                 }
@@ -367,7 +391,10 @@ impl Pit {
             None => {
                 self.refresh ^= 1 << 4;
                 let c = &self.channels[2];
-                u8::from(c.gate) | u8::from(self.data_on) << 1 | self.refresh | u8::from(c.out(self.edge())) << 5
+                u8::from(c.gate)
+                    | u8::from(self.data_on) << 1
+                    | self.refresh
+                    | u8::from(c.out(self.edge())) << 5
             }
         }
     }
@@ -375,7 +402,13 @@ impl Pit {
 impl Device for Pit {
     // Byte registers (QEMU's `max_access_size` 1): a wider access is its bytes, lowest first.
     fn read(&mut self, _vcpu: usize, offset: u64, size: u64) -> Option<u64> {
-        let byte = |p: &mut Self, k: u64| if offset == PORT_61 { p.port61(None) } else { p.read_byte((offset + k) & 3) };
+        let byte = |p: &mut Self, k: u64| {
+            if offset == PORT_61 {
+                p.port61(None)
+            } else {
+                p.read_byte((offset + k) & 3)
+            }
+        };
         Some((0..size).fold(0, |v, k| v | u64::from(byte(self, k)) << (8 * k)))
     }
     fn write(&mut self, _vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
@@ -392,7 +425,11 @@ impl Device for Pit {
 }
 impl Timed for Pit {
     fn next(&self) -> Option<u64> {
-        self.next.into_iter().chain(self.retry).min().map(|e| count_at(e, PIT_HZ, self.frequency))
+        self.next
+            .into_iter()
+            .chain(self.retry)
+            .min()
+            .map(|e| count_at(e, PIT_HZ, self.frequency))
     }
     fn fire(&mut self, _at: u64) {
         self.catch_up(self.edge());
@@ -405,33 +442,90 @@ mod tests {
     /// QEMU's formulas (count, OUT) and IRQ0's level and changes, per mode, at a few points (load at edge 100).
     #[test]
     fn counts_out_and_changes() {
-        let c = |mode, count| Channel { mode, count, load: Some(100), ..Default::default() };
+        let c = |mode, count| Channel {
+            mode,
+            count,
+            load: Some(100),
+            ..Default::default()
+        };
         // The level from `next_change` must equal `line` everywhere: walk each mode's changes over 6 periods.
-        for ch in [c(0, 7), c(2, 10), c(2, 2), c(3, 10), c(3, 7), c(3, 2), c(4, 5), c(2, 1), c(3, 1)] {
+        for ch in [
+            c(0, 7),
+            c(2, 10),
+            c(2, 2),
+            c(3, 10),
+            c(3, 7),
+            c(3, 2),
+            c(4, 5),
+            c(2, 1),
+            c(3, 1),
+        ] {
             let (mut e, mut level) = (100, ch.line(100));
             while let Some(n) = ch.next_change(e).filter(|&n| n < 160) {
-                assert!(n > e && (e + 1..n).all(|k| ch.line(k) == level) && ch.line(n) != level, "mode {} count {} at {n}", ch.mode, ch.count);
+                assert!(
+                    n > e && (e + 1..n).all(|k| ch.line(k) == level) && ch.line(n) != level,
+                    "mode {} count {} at {n}",
+                    ch.mode,
+                    ch.count
+                );
                 (e, level) = (n, !level);
             }
-            assert!((e + 1..160).all(|k| ch.line(k) == level), "mode {} count {}: a change missed after {e}", ch.mode, ch.count);
+            assert!(
+                (e + 1..160).all(|k| ch.line(k) == level),
+                "mode {} count {}: a change missed after {e}",
+                ch.mode,
+                ch.count
+            );
         }
         let m2 = c(2, 10);
-        assert_eq!([100, 101, 109, 110, 111].map(|e| m2.count_at(e)), [10, 9, 1, 10, 9]);
-        assert_eq!([100, 110, 111, 120].map(|e| m2.out(e)), [false, true, false, true]);
+        assert_eq!(
+            [100, 101, 109, 110, 111].map(|e| m2.count_at(e)),
+            [10, 9, 1, 10, 9]
+        );
+        assert_eq!(
+            [100, 110, 111, 120].map(|e| m2.out(e)),
+            [false, true, false, true]
+        );
         // Rising edges every 10 ticks from d = 10; low at d = 19, 29, ...
-        assert_eq!([109, 110, 118, 119, 120].map(|e| m2.line(e)), [false, true, true, false, true]);
+        assert_eq!(
+            [109, 110, 118, 119, 120].map(|e| m2.line(e)),
+            [false, true, true, false, true]
+        );
         let m3 = c(3, 10);
         assert_eq!([100, 101, 104, 105].map(|e| m3.count_at(e)), [10, 8, 2, 10]);
-        assert_eq!([100, 104, 105, 109, 110].map(|e| m3.out(e)), [true, true, false, false, true]);
-        assert_eq!([100, 105, 110].map(|e| m3.next_change(e)), [Some(105), Some(110), Some(115)]);
+        assert_eq!(
+            [100, 104, 105, 109, 110].map(|e| m3.out(e)),
+            [true, true, false, false, true]
+        );
+        assert_eq!(
+            [100, 105, 110].map(|e| m3.next_change(e)),
+            [Some(105), Some(110), Some(115)]
+        );
         let m0 = c(0, 0x10000);
-        assert_eq!((m0.count_at(100), m0.count_at(101), m0.out(100 + 0xffff), m0.out(100 + 0x10000)), (0, 0xffff, false, true));
-        assert_eq!((m0.next_change(100), m0.next_change(100 + 0x10000)), (Some(100 + 0x10000), None));
+        assert_eq!(
+            (
+                m0.count_at(100),
+                m0.count_at(101),
+                m0.out(100 + 0xffff),
+                m0.out(100 + 0x10000)
+            ),
+            (0, 0xffff, false, true)
+        );
+        assert_eq!(
+            (m0.next_change(100), m0.next_change(100 + 0x10000)),
+            (Some(100 + 0x10000), None)
+        );
         let m4 = c(4, 5);
         assert_eq!([104, 105, 106].map(|e| m4.out(e)), [false, true, false]);
-        assert_eq!([100, 105, 106].map(|e| m4.next_change(e)), [Some(105), Some(106), None]);
+        assert_eq!(
+            [100, 105, 106].map(|e| m4.next_change(e)),
+            [Some(105), Some(106), None]
+        );
         // Never loaded: frozen, no change.
         let idle = Channel::reset(true);
-        assert_eq!((idle.count_at(5000) & 0xffff, idle.next_change(5000)), (0, None));
+        assert_eq!(
+            (idle.count_at(5000) & 0xffff, idle.next_change(5000)),
+            (0, None)
+        );
     }
 }

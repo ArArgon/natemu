@@ -13,10 +13,13 @@ use natemu_abi::guest_memory::GuestRam;
 use natemu_abi::paging::Fault;
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Relaxed, SeqCst}};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64,
+    Ordering::{Relaxed, SeqCst},
+};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,7 +65,14 @@ impl Backing {
     /// vCPU `v`'s view.
     pub fn vcpu(&self, v: usize) -> Area<'_> {
         assert!(v < self.n);
-        Area { memory: &self.memory, vcpu: v, vcpus: self.n, epoch: self.epoch, base: v * self.stride, ram: self.ram }
+        Area {
+            memory: &self.memory,
+            vcpu: v,
+            vcpus: self.n,
+            epoch: self.epoch,
+            base: v * self.stride,
+            ram: self.ram,
+        }
     }
 }
 /// One vCPU's own part of the backing: offsets are those of block 0 (`exec`/`cache`), relocated to its block.
@@ -108,7 +118,14 @@ impl<'a> Area<'a> {
     /// vCPU 0 of one, over the whole of `memory` as its block and its guest RAM (a driver's unit tests).
     pub fn over(memory: &'a Memory) -> Self {
         // SAFETY: `memory` is mapped for its length and outlives the area.
-        Area { memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram: unsafe { GuestRam::new(0, memory.1 as u64, memory.0 as u64) } }
+        Area {
+            memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram: unsafe { GuestRam::new(0, memory.1 as u64, memory.0 as u64) },
+        }
     }
 }
 #[cfg(not(feature = "testing"))]
@@ -139,7 +156,10 @@ pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) ->
 fn random_guest_state_alias(fill: impl FnOnce(&mut [u8; 8]) -> i32) -> Result<u64> {
     let mut bytes = [0; 8];
     if fill(&mut bytes) != 0 {
-        return Err(format!("guest-state alias entropy: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "guest-state alias entropy: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // Uniform among all 2^27 pages; no fallback to a fixed, time-derived or process-derived address.
     let mask = (exec::GUEST_STATE_SLOT.end - exec::GUEST_STATE_SLOT.start - 1) & !4095;
@@ -148,19 +168,39 @@ fn random_guest_state_alias(fill: impl FnOnce(&mut [u8; 8]) -> i32) -> Result<u6
 
 /// Deterministic alias selection for test drivers only, before any tables are populated. Production always uses entropy.
 #[cfg(feature = "testing")]
-pub fn prepare_with_guest_state_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize, va: u64) -> Result<Backing> {
+pub fn prepare_with_guest_state_alias(
+    resident: &str,
+    code_bytes: usize,
+    n: usize,
+    ram_bytes: usize,
+    va: u64,
+) -> Result<Backing> {
     prepare_at_alias(resident, code_bytes, n, ram_bytes, va)
 }
 
-fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize, va: u64) -> Result<Backing> {
+fn prepare_at_alias(
+    resident: &str,
+    code_bytes: usize,
+    n: usize,
+    ram_bytes: usize,
+    va: u64,
+) -> Result<Backing> {
     if !exec::guest_state_alias_valid(va) {
-        return Err(format!("guest-state alias {va:#x}: an aligned page inside the reserved slot is required"));
+        return Err(format!(
+            "guest-state alias {va:#x}: an aligned page inside the reserved slot is required"
+        ));
     }
     if !(1..=cache::MAX_VCPUS).contains(&n) {
-        return Err(format!("{n} vCPUs: the execution mode runs 1 to {}", cache::MAX_VCPUS));
+        return Err(format!(
+            "{n} vCPUs: the execution mode runs 1 to {}",
+            cache::MAX_VCPUS
+        ));
     }
     if ram_bytes == 0 || ram_bytes % cache::BLOCK != 0 || ram_bytes > exec::MAX_GUEST_RAM_BYTES {
-        return Err(format!("guest RAM of {ram_bytes:#x} bytes: a nonzero 2 MiB multiple up to {:#x}", exec::MAX_GUEST_RAM_BYTES));
+        return Err(format!(
+            "guest RAM of {ram_bytes:#x} bytes: a nonzero 2 MiB multiple up to {:#x}",
+            exec::MAX_GUEST_RAM_BYTES
+        ));
     }
     if !(cache::MAX_BLOCK_BYTES..=cache::CODE_BYTES_MAX - cache::HEAD_BYTES).contains(&code_bytes) {
         return Err(format!(
@@ -186,20 +226,50 @@ fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usiz
             own(SHARED_OFFSET, 4096),
             own(exec::STATE_OFFSET, 4096),
             own(exec::FRAME_OFFSET, exec::frame::BYTES),
-            own((STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES, exec::STACK_BYTES),
+            own(
+                (STACK_TOP - PRIVATE) as usize - exec::STACK_BYTES,
+                exec::STACK_BYTES,
+            ),
             own((EXCEPTION_STACK_TOP - PRIVATE) as usize - 0x8000, 0x8000),
             own(exec::STAGING_OFFSET, exec::STAGING_BYTES),
-            Span::data((exec::GUEST_RAM_VA - PRIVATE) as usize, ram_bytes.min(exec::LOW_RAM_END as usize), ram_offset),
+            Span::data(
+                (exec::GUEST_RAM_VA - PRIVATE) as usize,
+                ram_bytes.min(exec::LOW_RAM_END as usize),
+                ram_offset,
+            ),
             // Generated code runs at EL0 from the code area (EL0 execute-only); the resident writes it through its alias.
-            Span::code((cache::CODE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
-            Span::data((cache::CODE_WRITE_VA - PRIVATE) as usize, code_mapped, base + cache::CODE_OFFSET),
-            Span::data((cache::META_VA - PRIVATE) as usize, cache::META_BYTES, base + cache::META_OFFSET),
-            Span::data((cache::LOOKUP_VA - PRIVATE) as usize, cache::LOOKUP_BYTES, base + cache::LOOKUP_OFFSET),
-            Span::data((cache::GLOBAL_VA - PRIVATE) as usize, cache::GLOBAL_BYTES, cache::GLOBAL_OFFSET),
+            Span::code(
+                (cache::CODE_VA - PRIVATE) as usize,
+                code_mapped,
+                base + cache::CODE_OFFSET,
+            ),
+            Span::data(
+                (cache::CODE_WRITE_VA - PRIVATE) as usize,
+                code_mapped,
+                base + cache::CODE_OFFSET,
+            ),
+            Span::data(
+                (cache::META_VA - PRIVATE) as usize,
+                cache::META_BYTES,
+                base + cache::META_OFFSET,
+            ),
+            Span::data(
+                (cache::LOOKUP_VA - PRIVATE) as usize,
+                cache::LOOKUP_BYTES,
+                base + cache::LOOKUP_OFFSET,
+            ),
+            Span::data(
+                (cache::GLOBAL_VA - PRIVATE) as usize,
+                cache::GLOBAL_BYTES,
+                cache::GLOBAL_OFFSET,
+            ),
         ]);
         if ram_bytes as u64 > exec::LOW_RAM_END {
-            spans.push(Span::data((exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize,
-                ram_bytes - exec::LOW_RAM_END as usize, ram_offset + exec::HIGH_RAM_START as usize));
+            spans.push(Span::data(
+                (exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize,
+                ram_bytes - exec::LOW_RAM_END as usize,
+                ram_offset + exec::HIGH_RAM_START as usize,
+            ));
         }
         private_space(&memory, base, &spans, true);
         // The guest-state page's EL0 alias (x28 of generated code), backed by the frame page (G1).
@@ -218,17 +288,39 @@ fn prepare_at_alias(resident: &str, code_bytes: usize, n: usize, ram_bytes: usiz
     }
     // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
-    Ok(Backing { memory: Arc::new(memory), n, stride, ram, epoch: unsafe { mach_absolute_time() }, io_epoch: Mutex::new(0) })
+    Ok(Backing {
+        memory: Arc::new(memory),
+        n,
+        stride,
+        ram,
+        epoch: unsafe { mach_absolute_time() },
+        io_epoch: Mutex::new(0),
+    })
 }
 /// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no).
 pub fn host_feature(name: &str) -> bool {
     unsafe extern "C" {
-        fn sysctlbyname(name: *const std::ffi::c_char, old: *mut std::ffi::c_void, len: *mut usize, new: *mut std::ffi::c_void, newlen: usize) -> i32;
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            old: *mut std::ffi::c_void,
+            len: *mut usize,
+            new: *mut std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
     }
-    let key = std::ffi::CString::new(format!("hw.optional.arm.{name}")).expect("no NUL in a feature name");
+    let key = std::ffi::CString::new(format!("hw.optional.arm.{name}"))
+        .expect("no NUL in a feature name");
     let (mut value, mut len) = (0i32, size_of::<i32>());
     // SAFETY: `value` and `len` describe a writable 4-byte buffer; no new value is set.
-    let rc = unsafe { sysctlbyname(key.as_ptr(), (&raw mut value).cast(), &mut len, std::ptr::null_mut(), 0) };
+    let rc = unsafe {
+        sysctlbyname(
+            key.as_ptr(),
+            (&raw mut value).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
     rc == 0 && len == size_of::<i32>() && value == 1
 }
 /// Sets the vCPU's initial architectural state (before it first runs). `speculation_barriers` turns on the resident's
@@ -241,7 +333,8 @@ pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     // The TSC (L5, `natemu_abi::clock::tsc`) is the resident's CNTVCT scaled to TSC_HZ plus this offset: from the shared epoch.
     const _: () = assert!(natemu_abi::cpu_profile::TSC_HZ == 1_000_000_000); // ticks_ns scales like the resident
     let mut msrs = natemu_abi::cpu::reset_msrs(area.vcpu == 0);
-    msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] = ticks_ns(area.epoch).wrapping_neg();
+    msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_TSC).unwrap()] =
+        ticks_ns(area.epoch).wrapping_neg();
     // The virtual firmware's MTRRs cover the guest RAM this VM has (M1's run-time size, set at prepare).
     let mut control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     control.speculation_barriers = u64::from(speculation_barriers);
@@ -250,9 +343,16 @@ pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     // IA32_ARCH_CAPABILITIES: RDCL_NO only with the barriers on AND a host whose own loads do not pass faulting data on
     // (FEAT_CSV3). Off by default, so a default-command-line guest keeps PTI (owner decision, November 5).
     let rdcl_no = speculation_barriers && host_feature("FEAT_CSV3");
-    msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_ARCH_CAPABILITIES).unwrap()] = natemu_abi::cpu::arch_capabilities(rdcl_no);
+    msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_ARCH_CAPABILITIES).unwrap()] =
+        natemu_abi::cpu::arch_capabilities(rdcl_no);
     area.write_record(exec::MSRS_OFFSET, msrs);
-    area.write_record(exec::ENTROPY_OFFSET, exec::Entropy { taken: exec::ENTROPY_WORDS as u64, words: [0; exec::ENTROPY_WORDS] });
+    area.write_record(
+        exec::ENTROPY_OFFSET,
+        exec::Entropy {
+            taken: exec::ENTROPY_WORDS as u64,
+            words: [0; exec::ENTROPY_WORDS],
+        },
+    );
     refill_entropy(area);
     set_lapic(area, natemu_abi::lapic::RESET);
 }
@@ -260,9 +360,15 @@ pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
 /// IA32_APIC_BASE (before it first runs).
 pub fn set_lapic(area: Area, l: natemu_abi::lapic::Lapic) {
     area.write_record(exec::LAPIC_OFFSET, l);
-    let base = natemu_abi::cpu::reset_msrs(area.vcpu == 0)[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_APIC_BASE).unwrap()];
+    let base = natemu_abi::cpu::reset_msrs(area.vcpu == 0)
+        [natemu_abi::cpu::msr(natemu_abi::cpu::MSR_APIC_BASE).unwrap()];
     let word = natemu_abi::lapic::published(base, &l, area.vcpu as u64);
-    event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, apic)).store(word, SeqCst);
+    event_word(
+        area.memory,
+        area.vcpu,
+        std::mem::offset_of!(cache::Events, apic),
+    )
+    .store(word, SeqCst);
 }
 /// The vCPU's local APIC record (X3; the resident's once it runs).
 pub fn lapic(area: Area) -> natemu_abi::lapic::Lapic {
@@ -295,7 +401,11 @@ pub fn enter(cpu: &Vcpu, area: Area, doorbell: bool) -> Result<()> {
     // 8-bit ASIDs, never 0.
     const _: () = assert!(2 * cache::MAX_VCPUS + 1 <= 255);
     cpu.doorbell(area.vcpu, doorbell)?;
-    cpu.enter_resident_with_asid(area.base, natemu_abi::shadow::TCR_BOTH, 2 * area.vcpu as u8 + 2)
+    cpu.enter_resident_with_asid(
+        area.base,
+        natemu_abi::shadow::TCR_BOTH,
+        2 * area.vcpu as u8 + 2,
+    )
 }
 
 /// The global area word at `offset` (shared by all vCPUs; atomic access only).
@@ -307,11 +417,17 @@ fn global_u64(memory: &Memory, offset: usize) -> &AtomicU64 {
 /// vCPU `v`'s invalidation record: `pending`, or `stale` word `i`.
 fn record_word(memory: &Memory, v: usize, i: Option<usize>) -> &AtomicU64 {
     let record = cache::RECORDS + v * size_of::<cache::Record>();
-    global_u64(memory, record + i.map_or(0, |i| std::mem::offset_of!(cache::Record, stale) + 8 * i))
+    global_u64(
+        memory,
+        record + i.map_or(0, |i| std::mem::offset_of!(cache::Record, stale) + 8 * i),
+    )
 }
 /// vCPU `v`'s event record word at `field` (an offset in [`cache::Events`], X2).
 fn event_word(memory: &Memory, v: usize, field: usize) -> &AtomicU64 {
-    global_u64(memory, cache::EVENTS + v * size_of::<cache::Events>() + field)
+    global_u64(
+        memory,
+        cache::EVENTS + v * size_of::<cache::Events>() + field,
+    )
 }
 /// `post` value of an NMI (else an interrupt vector, 0..=255).
 pub const NMI: u64 = 256;
@@ -323,7 +439,11 @@ pub fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
     // X3: as from a peer's APIC: an NMI needs the target's APIC hardware enabled, an interrupt also software enabled
     // (SDM Vol.3 11.4.7.2); otherwise the message is not accepted.
     let apic = event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst);
-    let needs = if event == NMI { natemu_abi::lapic::HW_ENABLED } else { natemu_abi::lapic::SW_ENABLED };
+    let needs = if event == NMI {
+        natemu_abi::lapic::HW_ENABLED
+    } else {
+        natemu_abi::lapic::SW_ENABLED
+    };
     if apic & needs == 0 {
         return false;
     }
@@ -332,20 +452,35 @@ pub fn post(memory: &Memory, v: usize, event: u64, level: bool) -> bool {
         _ => {
             let w = 8 * (event as usize / 64 % 4);
             let tmr = event_word(memory, v, std::mem::offset_of!(cache::Events, tmr) + w);
-            if level { tmr.fetch_or(1 << (event % 64), SeqCst) } else { tmr.fetch_and(!(1 << (event % 64)), SeqCst) };
-            event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + w).fetch_or(1 << (event % 64), SeqCst);
+            if level {
+                tmr.fetch_or(1 << (event % 64), SeqCst)
+            } else {
+                tmr.fetch_and(!(1 << (event % 64)), SeqCst)
+            };
+            event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + w)
+                .fetch_or(1 << (event % 64), SeqCst);
         }
     }
     // Perf chunk 14: the post's time, for a `perf` resident's wake latency (kept only while 0: the first since it parked).
     if crate::perf::on() {
-        let _ = event_word(memory, v, std::mem::offset_of!(cache::Events, rung)).compare_exchange(0, unsafe { mach_absolute_time() }, SeqCst, SeqCst);
+        let _ = event_word(memory, v, std::mem::offset_of!(cache::Events, rung)).compare_exchange(
+            0,
+            unsafe { mach_absolute_time() },
+            SeqCst,
+            SeqCst,
+        );
     }
     event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).fetch_add(1, SeqCst);
     true
 }
 /// L4b: whether `vector` is still in vCPU `v`'s IRR (posted, not yet accepted into service).
 pub(crate) fn pending(memory: &Memory, v: usize, vector: u64) -> bool {
-    let w = event_word(memory, v, std::mem::offset_of!(cache::Events, vectors) + 8 * (vector as usize / 64 % 4)).load(SeqCst);
+    let w = event_word(
+        memory,
+        v,
+        std::mem::offset_of!(cache::Events, vectors) + 8 * (vector as usize / 64 % 4),
+    )
+    .load(SeqCst);
     w >> (vector % 64) & 1 != 0
 }
 /// L4a: vCPU `v`'s published APIC word (what senders match destinations against, `natemu_abi::lapic::published`).
@@ -355,7 +490,8 @@ pub(crate) fn published(memory: &Memory, v: usize) -> u64 {
 /// L4a: vCPU `v`'s LINT0 input level (the 8259's output). A rise at an APIC that passes ExtINTs to its core
 /// (`natemu_abi::lapic::EXTINT`) counts as a post: true, the caller rings it.
 pub(crate) fn set_lint0(memory: &Memory, v: usize, level: bool) -> bool {
-    event_word(memory, v, std::mem::offset_of!(cache::Events, lint0)).store(u64::from(level), SeqCst);
+    event_word(memory, v, std::mem::offset_of!(cache::Events, lint0))
+        .store(u64::from(level), SeqCst);
     let post = level && published(memory, v) & natemu_abi::lapic::EXTINT != 0;
     if post {
         event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).fetch_add(1, SeqCst);
@@ -365,12 +501,16 @@ pub(crate) fn set_lint0(memory: &Memory, v: usize, level: bool) -> bool {
 /// vCPU `v`'s park state (X3): its `halted` word and its `posts` count, read in that order.
 pub fn park_state(memory: &Memory, v: usize) -> (u64, u64) {
     let halted = event_word(memory, v, std::mem::offset_of!(cache::Events, halted)).load(SeqCst);
-    (halted, event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).load(SeqCst))
+    (
+        halted,
+        event_word(memory, v, std::mem::offset_of!(cache::Events, posts)).load(SeqCst),
+    )
 }
 /// A park state in which nothing but a new post can wake the vCPU: halted, its own timer unable to wake it, and every
 /// post seen.
 pub fn idle((halted, posts): (u64, u64)) -> bool {
-    halted & 0xff == 1 && halted >> cache::HALTED_SEEN_SHIFT == posts & (u64::MAX >> cache::HALTED_SEEN_SHIFT)
+    halted & 0xff == 1
+        && halted >> cache::HALTED_SEEN_SHIFT == posts & (u64::MAX >> cache::HALTED_SEEN_SHIFT)
 }
 /// Asks vCPU `v` to end its run when it is halted with no event it can take (`stop::HALTED`); the caller rings it.
 pub fn end_when_halted(memory: &Memory, v: usize) {
@@ -386,15 +526,51 @@ pub fn shadow_resets(area: Area) -> u64 {
 pub fn k1_stats(area: Area) -> String {
     let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
-    let types: Vec<String> = (0..8).filter(|&t| c.memory_types[t] != 0).map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t])).collect();
+    let types: Vec<String> = (0..8)
+        .filter(|&t| c.memory_types[t] != 0)
+        .map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t]))
+        .collect();
     // Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
-    let kinds: Vec<String> = (0..128).filter(|&k| c.system_counts[k] != 0).map(|k| format!("\"{k:#x}\":[{},{}]", c.system_counts[k], ticks_ns(c.system_ticks[k]) / 1000)).collect();
-    let declined: Vec<String> = natemu_abi::execution::perf::SYS_FAST_DECLINE_NAMES.iter().zip(c.sys_fast_declined).map(|(name, count)| format!("\"{name}\":{count}")).collect();
-    let from: Vec<String> = (0..32).filter(|&b| c.system_from[b] != 0).map(|b| format!("\"{}\":{}", natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"), c.system_from[b])).collect();
+    let kinds: Vec<String> = (0..128)
+        .filter(|&k| c.system_counts[k] != 0)
+        .map(|k| {
+            format!(
+                "\"{k:#x}\":[{},{}]",
+                c.system_counts[k],
+                ticks_ns(c.system_ticks[k]) / 1000
+            )
+        })
+        .collect();
+    let declined: Vec<String> = natemu_abi::execution::perf::SYS_FAST_DECLINE_NAMES
+        .iter()
+        .zip(c.sys_fast_declined)
+        .map(|(name, count)| format!("\"{name}\":{count}"))
+        .collect();
+    let from: Vec<String> = (0..32)
+        .filter(|&b| c.system_from[b] != 0)
+        .map(|b| {
+            format!(
+                "\"{}\":{}",
+                natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"),
+                c.system_from[b]
+            )
+        })
+        .collect();
     format!(
         "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}}}}",
-        c.cr3_loads, c.global_flushes, c.invlpgs, c.revalidated, c.remapped, c.capacity_flushes, c.killed, c.unvalidated,
-        ticks_ns(c.tlb_ticks) / 1000, ticks_ns(c.invlpg_ticks) / 1000, c.page_faults, ticks_ns(c.page_fault_ticks) / 1000, c.scanned,
+        c.cr3_loads,
+        c.global_flushes,
+        c.invlpgs,
+        c.revalidated,
+        c.remapped,
+        c.capacity_flushes,
+        c.killed,
+        c.unvalidated,
+        ticks_ns(c.tlb_ticks) / 1000,
+        ticks_ns(c.invlpg_ticks) / 1000,
+        c.page_faults,
+        ticks_ns(c.page_fault_ticks) / 1000,
+        c.scanned,
         types.join(","),
         c.uncached_steps,
         c.uncached_resident,
@@ -406,7 +582,11 @@ pub fn k1_stats(area: Area) -> String {
         c.code_used,
         c.meta_used,
         c.blocks,
-        [c.peak[0].max(c.code_used), c.peak[1].max(c.meta_used), c.peak[2].max(c.blocks)],
+        [
+            c.peak[0].max(c.code_used),
+            c.peak[1].max(c.meta_used),
+            c.peak[2].max(c.blocks)
+        ],
         c.code_bytes,
         cache::META_BYTES,
         cache::MAX_BLOCKS,
@@ -478,7 +658,10 @@ pub fn ticks_ns(ticks: u64) -> u64 {
 impl Stops {
     /// Kicks of `backing`'s vCPUs.
     pub fn new(backing: &Backing) -> Self {
-        Self { kicks: (0..backing.n).map(|_| Mutex::default()).collect(), in_host: (0..backing.n).map(|_| AtomicBool::new(true)).collect() }
+        Self {
+            kicks: (0..backing.n).map(|_| Mutex::default()).collect(),
+            in_host: (0..backing.n).map(|_| AtomicBool::new(true)).collect(),
+        }
     }
     /// Stops vCPU `v` of `machine` at its next block boundary; false (nothing rung) once its run [ended](Self::end).
     pub fn kick(&self, machine: &Machine, v: usize) -> Result<bool> {
@@ -486,11 +669,18 @@ impl Stops {
     }
     /// An admitted I/O participant still needs the terminal check, but no new doorbell.
     fn kick_if_needed(&self, machine: &Machine, v: usize, needed: bool) -> Result<bool> {
-        let mut k = self.kicks.get(v).ok_or_else(|| format!("kick of vCPU {v}: no such vCPU"))?.lock().unwrap();
+        let mut k = self
+            .kicks
+            .get(v)
+            .ok_or_else(|| format!("kick of vCPU {v}: no such vCPU"))?
+            .lock()
+            .unwrap();
         if k.ended {
             return Ok(false);
         }
-        if !needed { return Ok(true); }
+        if !needed {
+            return Ok(true);
+        }
         let in_host = self.in_host[v].load(SeqCst);
         let at = unsafe { mach_absolute_time() };
         machine.ring(v)?;
@@ -526,8 +716,15 @@ impl Stops {
         let mut k = self.kicks[area.vcpu].lock().unwrap();
         if let Some((at, in_host)) = k.rung.take() {
             // The resident writes its record field by field: the stop's time may land just after its count.
-            let ticks = || area.read_record::<u64>(exec::STATE_OFFSET + std::mem::offset_of!(State, stop_ticks));
-            let stop = (0..10_000).map(|_| ticks()).find(|&t| t >= at).unwrap_or(at);
+            let ticks = || {
+                area.read_record::<u64>(
+                    exec::STATE_OFFSET + std::mem::offset_of!(State, stop_ticks),
+                )
+            };
+            let stop = (0..10_000)
+                .map(|_| ticks())
+                .find(|&t| t >= at)
+                .unwrap_or(at);
             k.latency.push((ticks_ns(stop - at), in_host));
         }
     }
@@ -548,7 +745,8 @@ pub fn placed_blocks(area: Area) -> Vec<cache::Block> {
     let control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
     (0..control.blocks as usize)
         .map(|n| {
-            let meta = u32::from_le_bytes(area.read::<4>(cache::LOOKUP_OFFSET + cache::INDEX + 4 * n));
+            let meta =
+                u32::from_le_bytes(area.read::<4>(cache::LOOKUP_OFFSET + cache::INDEX + 4 * n));
             area.read_record(cache::META_OFFSET + meta as usize)
         })
         .collect()
@@ -568,7 +766,12 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let control: cache::Control = area.read_record(lookup(cache::CONTROL));
     let armed = &control.armed_words[..(control.armed as usize).min(control.armed_words.len())];
     let word = |offset: u64| match armed.iter().find(|w| u64::from(w[0]) == offset) {
-        Some(&[_, original]) if u32::from_le_bytes(area.read::<4>(cache::CODE_OFFSET + offset as usize)) == exec::STOP_WORD => original,
+        Some(&[_, original])
+            if u32::from_le_bytes(area.read::<4>(cache::CODE_OFFSET + offset as usize))
+                == exec::STOP_WORD =>
+        {
+            original
+        }
         _ => u32::from_le_bytes(area.read::<4>(cache::CODE_OFFSET + offset as usize)),
     };
     let blocks = placed_blocks(area);
@@ -579,7 +782,12 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             points += 1;
             let at = u64::from(b.code) + u64::from(p.offset);
             let w = word(at);
-            let bad = || format!("link point {:#x} of the block at {:#x}: word {w:#010x}", p.offset, b.rip);
+            let bad = || {
+                format!(
+                    "link point {:#x} of the block at {:#x}: word {w:#010x}",
+                    p.offset, b.rip
+                )
+            };
             if w == p.word {
                 continue;
             }
@@ -587,22 +795,43 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 return Err(bad());
             }
             let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
-            match blocks.iter().position(|t| t.flags & cache::SYSTEM == 0 && u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to) {
-                Some(t) if blocks[t].rip == p.target && blocks[t].context == b.context => linked.insert((b.number, p.offset), t),
+            match blocks.iter().position(|t| {
+                t.flags & cache::SYSTEM == 0
+                    && u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to
+            }) {
+                Some(t) if blocks[t].rip == p.target && blocks[t].context == b.context => {
+                    linked.insert((b.number, p.offset), t)
+                }
                 _ => return Err(bad()),
             };
         }
     }
-    let records: Vec<cache::LinkRecord> = (0..control.links as usize).map(|i| link_record(area, i)).collect();
+    let records: Vec<cache::LinkRecord> = (0..control.links as usize)
+        .map(|i| link_record(area, i))
+        .collect();
     // Each record also holds the point's admitted first word.
     let described = records.iter().all(|r| {
-        let Some(b) = blocks.get(r.source as usize) else { return false };
-        let point = b.links.iter().find(|p| p.offset == r.offset && p.offset != 0);
+        let Some(b) = blocks.get(r.source as usize) else {
+            return false;
+        };
+        let point = b
+            .links
+            .iter()
+            .find(|p| p.offset == r.offset && p.offset != 0);
         linked.get(&(r.source, r.offset)) == Some(&(r.target as usize))
-            && point.is_some_and(|p| p.word == r.original && blocks.get(r.target as usize).is_some_and(|t| t.rip == p.target))
+            && point.is_some_and(|p| {
+                p.word == r.original
+                    && blocks
+                        .get(r.target as usize)
+                        .is_some_and(|t| t.rip == p.target)
+            })
     });
     if !described || records.len() != linked.len() {
-        return Err(format!("{} link records for {} linked points", records.len(), linked.len()));
+        return Err(format!(
+            "{} link records for {} linked points",
+            records.len(),
+            linked.len()
+        ));
     }
     Ok((points, linked.len() as u64))
 }
@@ -647,11 +876,25 @@ unsafe extern "C" {
     fn shm_open(name: *const std::ffi::c_char, flags: i32, ...) -> i32;
     fn shm_unlink(name: *const std::ffi::c_char) -> i32;
     fn ftruncate(fd: i32, length: i64) -> i32;
-    fn mmap(address: *mut c_void, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+    fn mmap(
+        address: *mut c_void,
+        length: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: i64,
+    ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> i32;
     fn close(fd: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-    fn os_sync_wait_on_address_with_timeout(addr: *mut u8, value: u64, size: usize, flags: u32, clock: u32, timeout_ns: u64) -> i32;
+    fn os_sync_wait_on_address_with_timeout(
+        addr: *mut u8,
+        value: u64,
+        size: usize,
+        flags: u32,
+        clock: u32,
+        timeout_ns: u64,
+    ) -> i32;
     fn os_sync_wake_by_address_any(addr: *mut u8, size: usize, flags: u32) -> i32;
 }
 /// Perf chunk 21: a server's requests and replies, through a mapping it shares with the host (layout and protocol in
@@ -685,18 +928,43 @@ impl Channel {
         const O_RDWR: i32 = 2;
         const O_CREAT: i32 = 0x200;
         const O_EXCL: i32 = 0x800;
-        let name = std::ffi::CString::new(format!("/natemu.{}.{}", std::process::id(), COUNT.fetch_add(1, Relaxed))).unwrap();
+        let name = std::ffi::CString::new(format!(
+            "/natemu.{}.{}",
+            std::process::id(),
+            COUNT.fetch_add(1, Relaxed)
+        ))
+        .unwrap();
         const F_SETFD: i32 = 2;
         const FD_CLOEXEC: i32 = 1;
-        let fd = unsafe { shm_open(name.as_ptr(), O_RDWR | O_CREAT | O_EXCL, 0o600 as std::ffi::c_uint) };
+        let fd = unsafe {
+            shm_open(
+                name.as_ptr(),
+                O_RDWR | O_CREAT | O_EXCL,
+                0o600 as std::ffi::c_uint,
+            )
+        };
         if fd < 0 {
-            return Err(format!("fexc channel: shm_open: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "fexc channel: shm_open: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         unsafe { shm_unlink(name.as_ptr()) };
         const PROT_RW: i32 = 3;
         const MAP_SHARED: i32 = 1;
-        let base = match unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && ftruncate(fd, Self::BYTES as i64) == 0 } {
-            true => unsafe { mmap(std::ptr::null_mut(), Self::BYTES, PROT_RW, MAP_SHARED, fd, 0) as *mut u8 },
+        let base = match unsafe {
+            fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 && ftruncate(fd, Self::BYTES as i64) == 0
+        } {
+            true => unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    Self::BYTES,
+                    PROT_RW,
+                    MAP_SHARED,
+                    fd,
+                    0,
+                ) as *mut u8
+            },
             false => usize::MAX as *mut u8,
         };
         if base as usize == usize::MAX {
@@ -714,10 +982,20 @@ impl Channel {
     /// Posts a request payload: copied in, its length, then its number in the request word (waking a sleeping server).
     fn post(&mut self, body: &[u8]) -> std::io::Result<()> {
         if body.is_empty() || body.len() > Self::REQUEST_CAP {
-            return Err(std::io::Error::other(format!("a request of {} bytes does not fit the fexc channel", body.len())));
+            return Err(std::io::Error::other(format!(
+                "a request of {} bytes does not fit the fexc channel",
+                body.len()
+            )));
         }
         self.n = self.n.wrapping_add(1) & 0x7fff_ffff;
-        unsafe { channel_copy(self.base.add(Self::REQUEST), body.as_ptr() as *mut u8, body.len(), true) };
+        unsafe {
+            channel_copy(
+                self.base.add(Self::REQUEST),
+                body.as_ptr() as *mut u8,
+                body.len(),
+                true,
+            )
+        };
         self.word(4).store(body.len() as u32, Relaxed);
         self.publish();
         Ok(())
@@ -737,7 +1015,11 @@ impl Channel {
     }
     /// Waits for the reply to the last request (spin, then sleep in slices), checking `dead` after every sleep that ends without
     /// it and `deadline` throughout; then its payload, bounds-checked and copied out.
-    fn reply(&self, deadline: Instant, mut dead: impl FnMut() -> std::io::Result<()>) -> std::io::Result<Vec<u8>> {
+    fn reply(
+        &self,
+        deadline: Instant,
+        mut dead: impl FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<Vec<u8>> {
         const SHARED: u32 = 1;
         const MACH_ABSOLUTE_TIME: u32 = 32;
         // Retried, as os/os_sync_wait_on_address.h says (spurious wake-up, kernel memory, a failed copyin of a valid address).
@@ -764,7 +1046,16 @@ impl Channel {
                 continue;
             }
             let left = (deadline - now).as_nanos().min(Self::SLICE_NS as u128) as u64;
-            let ns = unsafe { os_sync_wait_on_address_with_timeout(self.base.add(64), (v | 1) as u64, 4, SHARED, MACH_ABSOLUTE_TIME, left.max(1)) };
+            let ns = unsafe {
+                os_sync_wait_on_address_with_timeout(
+                    self.base.add(64),
+                    (v | 1) as u64,
+                    4,
+                    SHARED,
+                    MACH_ABSOLUTE_TIME,
+                    left.max(1),
+                )
+            };
             if ns < 0 {
                 let e = std::io::Error::last_os_error();
                 if !matches!(e.raw_os_error(), Some(ETIMEDOUT | EINTR | ENOMEM | EFAULT)) {
@@ -777,11 +1068,15 @@ impl Channel {
         }
         let magic = self.word(72).load(Relaxed);
         if magic != Self::MAGIC {
-            return Err(std::io::Error::other(format!("malformed fexc reply: channel magic {magic:#x}")));
+            return Err(std::io::Error::other(format!(
+                "malformed fexc reply: channel magic {magic:#x}"
+            )));
         }
         let len = self.word(68).load(Relaxed) as usize;
         if !(20..=Self::REPLY_CAP).contains(&len) {
-            return Err(std::io::Error::other(format!("malformed fexc reply: length {len}")));
+            return Err(std::io::Error::other(format!(
+                "malformed fexc reply: length {len}"
+            )));
         }
         let mut reply = vec![0; len];
         unsafe { channel_copy(self.base.add(Self::REPLY), reply.as_mut_ptr(), len, false) };
@@ -796,10 +1091,18 @@ unsafe fn channel_copy(at: *mut u8, buf: *mut u8, len: usize, into: bool) {
         let words = len / 8;
         for i in 0..words {
             let (m, b) = ((at as *mut u64).add(i), buf.add(i * 8) as *mut u64);
-            if into { m.write_volatile(b.read_unaligned()) } else { b.write_unaligned(m.read_volatile()) }
+            if into {
+                m.write_volatile(b.read_unaligned())
+            } else {
+                b.write_unaligned(m.read_volatile())
+            }
         }
         for i in words * 8..len {
-            if into { at.add(i).write_volatile(*buf.add(i)) } else { *buf.add(i) = at.add(i).read_volatile() }
+            if into {
+                at.add(i).write_volatile(*buf.add(i))
+            } else {
+                *buf.add(i) = at.add(i).read_volatile()
+            }
         }
     }
 }
@@ -850,8 +1153,20 @@ impl Server {
             return Err(format!("fexc channel: {}", std::io::Error::last_os_error()));
         }
         let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
-        crate::perf::mark(&format!("server_start{}", std::thread::current().name().unwrap_or("").trim_start_matches("vcpu-")));
-        Ok(Self { child, stdin: Some(stdin), stdout, reaped: false, channel })
+        crate::perf::mark(&format!(
+            "server_start{}",
+            std::thread::current()
+                .name()
+                .unwrap_or("")
+                .trim_start_matches("vcpu-")
+        ));
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            reaped: false,
+            channel,
+        })
     }
     /// The server's reply to one request body; a `TimedOut` error when the whole reply has not arrived by `deadline`, an
     /// `UnexpectedEof` one when the server died first (its stdout closed; seen within [`Channel::SLICE_NS`]).
@@ -859,7 +1174,12 @@ impl Server {
     fn request(&mut self, body: &[u8], deadline: Instant) -> std::io::Result<Reply> {
         self.request_with_posted(body, deadline, || Ok(()))
     }
-    fn request_with_posted(&mut self, body: &[u8], deadline: Instant, posted: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<Reply> {
+    fn request_with_posted(
+        &mut self,
+        body: &[u8],
+        deadline: Instant,
+        posted: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<Reply> {
         if self.stdin.is_none() {
             return Err(std::io::Error::other("fexc --serve: closed"));
         }
@@ -871,10 +1191,17 @@ impl Server {
         if reply.len() < 20 || reply.len() != 20 + field(4) as usize + field(8) as usize {
             return Err(std::io::Error::other("malformed fexc reply"));
         }
-        let (code, json_len, extent, read) = (field(0) as i32, field(4) as usize, field(12), field(16));
+        let (code, json_len, extent, read) =
+            (field(0) as i32, field(4) as usize, field(12), field(16));
         let object = reply.split_off(20 + json_len);
         let json = reply.split_off(20);
-        Ok(Reply { code, json, object, extent, read })
+        Ok(Reply {
+            code,
+            json,
+            object,
+            extent,
+            read,
+        })
     }
     /// Whether the server still runs: its stdout carries nothing in channel mode, so readable means EOF (it died) or a
     /// protocol error.
@@ -889,7 +1216,11 @@ impl Server {
             fn poll(fds: *mut PollFd, count: u32, timeout_ms: i32) -> i32;
         }
         const POLLIN: i16 = 1;
-        let mut fd = PollFd { fd: std::os::fd::AsRawFd::as_raw_fd(stdout), events: POLLIN, revents: 0 };
+        let mut fd = PollFd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(stdout),
+            events: POLLIN,
+            revents: 0,
+        };
         if unsafe { poll(&mut fd, 1, 0) } <= 0 {
             return Ok(());
         }
@@ -904,7 +1235,9 @@ impl Server {
         let pid = self.child.id();
         for _ in 0..100 {
             match self.child.try_wait() {
-                Ok(Some(status)) => return format!("fexc --serve (pid {pid}) exited ({status}): {e}"),
+                Ok(Some(status)) => {
+                    return format!("fexc --serve (pid {pid}) exited ({status}): {e}");
+                }
                 Ok(None) => std::thread::sleep(Duration::from_millis(1)),
                 Err(_) => break,
             }
@@ -929,11 +1262,27 @@ impl Server {
         const WNOHANG: i32 = 1;
         self.channel.end();
         self.stdin = None;
-        let (pid, mut status, mut r) = (self.child.id() as i32, 0, Rusage { user: [0; 2], system: [0; 2], max_rss: 0, rest: [0; 13] });
+        let (pid, mut status, mut r) = (
+            self.child.id() as i32,
+            0,
+            Rusage {
+                user: [0; 2],
+                system: [0; 2],
+                max_rss: 0,
+                rest: [0; 13],
+            },
+        );
         // EOF ends it at once; one that does not end within a second is killed (its CPU time is still reported).
         let mut waited = 0;
         loop {
-            match unsafe { wait4(pid, &mut status, if waited < 1000 { WNOHANG } else { 0 }, &mut r) } {
+            match unsafe {
+                wait4(
+                    pid,
+                    &mut status,
+                    if waited < 1000 { WNOHANG } else { 0 },
+                    &mut r,
+                )
+            } {
                 0 => {
                     if waited == 1000 {
                         let _ = self.child.kill();
@@ -975,16 +1324,27 @@ impl Reply {
     /// As the persistent cache stores it (the JSON only for an answer without code: nothing else reads it).
     fn payload(&self) -> Vec<u8> {
         let json: &[u8] = if self.code == 0 { &[] } else { &self.json };
-        let mut p = [self.code as u32, self.extent, self.read, json.len() as u32].map(u32::to_le_bytes).concat();
+        let mut p = [self.code as u32, self.extent, self.read, json.len() as u32]
+            .map(u32::to_le_bytes)
+            .concat();
         p.extend_from_slice(json);
         p.extend_from_slice(&self.object);
         p
     }
     fn from_payload(p: &[u8]) -> Option<Self> {
-        let field = |i: usize| p.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let field = |i: usize| {
+            p.get(4 * i..4 * i + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
         let (code, extent, read, json_len) = (field(0)?, field(1)?, field(2)?, field(3)? as usize);
         let json = p.get(16..16 + json_len)?.to_vec();
-        Some(Self { code: code as i32, json, object: p[16 + json_len..].to_vec(), extent, read })
+        Some(Self {
+            code: code as i32,
+            json,
+            object: p[16 + json_len..].to_vec(),
+            extent,
+            read,
+        })
     }
 }
 
@@ -994,7 +1354,12 @@ impl Reply {
 #[derive(Clone, Debug, PartialEq)]
 enum Answer {
     Object(Vec<u8>),
-    Cut { reason: String, cut: Option<(u8, u8)>, gated: Option<bool>, ud: bool },
+    Cut {
+        reason: String,
+        cut: Option<(u8, u8)>,
+        gated: Option<bool>,
+        ud: bool,
+    },
 }
 impl Answer {
     fn new(reply: Reply, rip: u64) -> Result<Self> {
@@ -1002,18 +1367,29 @@ impl Answer {
             return Ok(Answer::Object(reply.object));
         }
         let json = crate::json::parse(&String::from_utf8_lossy(&reply.json))?;
-        let reason = end_reason(&json).ok_or("fexc report without guest.end.reason")?.to_string();
+        let reason = end_reason(&json)
+            .ok_or("fexc report without guest.end.reason")?
+            .to_string();
         let end = json.get("guest").and_then(|g| g.get("end"));
-        let gated = end.and_then(|e| e.get("cut_gated")).map(|v| v.as_str() == Some("mmx"));
+        let gated = end
+            .and_then(|e| e.get("cut_gated"))
+            .map(|v| v.as_str() == Some("mmx"));
         let ud = end.and_then(|e| e.get("cut_ud")).is_some();
-        Ok(Answer::Cut { reason, cut: system_cut(&json, rip), gated, ud })
+        Ok(Answer::Cut {
+            reason,
+            cut: system_cut(&json, rip),
+            gated,
+            ud,
+        })
     }
     /// This answer, kept for `from`, as fexc's answer at `to` (same half and page offset): an object relocated
     /// ([`crate::relocation`]), a no-code answer fexc decides from the bytes alone; `None` when it would not be fexc's.
     fn at(&self, from: u64, to: u64) -> Option<Self> {
         match self {
             Answer::Object(o) => crate::relocation::object(o, from, to).map(Answer::Object),
-            Answer::Cut { reason, .. } => (crate::relocation::same_place(from, to) && crate::relocation::no_code_reusable(reason)).then(|| self.clone()),
+            Answer::Cut { reason, .. } => (crate::relocation::same_place(from, to)
+                && crate::relocation::no_code_reusable(reason))
+            .then(|| self.clone()),
         }
     }
 }
@@ -1025,7 +1401,12 @@ const GATING: usize = 11;
 type Key = (u64, u64, u64);
 const LEAD: usize = 4;
 fn key(limit: Option<u32>, rip: u64, lead: &[u8]) -> Key {
-    (limit.map_or(1 << 32, u64::from), rip & (1 << 63 | 0xfff), lead.iter().fold(lead.len() as u64, |v, &b| v << 8 | u64::from(b)))
+    (
+        limit.map_or(1 << 32, u64::from),
+        rip & (1 << 63 | 0xfff),
+        lead.iter()
+            .fold(lead.len() as u64, |v, &b| v << 8 | u64::from(b)),
+    )
 }
 /// The memory cache's hash (perf chunk 7; SipHash's was about 25 ns a probe): Thorup's strongly universal multiply-shift for
 /// vectors of words ("High Speed Hashing for Integers and Strings", 2015, 3.4) under random keys per map. The guest chooses
@@ -1036,14 +1417,21 @@ struct Universal([u128; 4]);
 impl Default for Universal {
     fn default() -> Self {
         let s = std::collections::hash_map::RandomState::new();
-        let r = |i: u64| u128::from(std::hash::BuildHasher::hash_one(&s, 2 * i)) << 64 | u128::from(std::hash::BuildHasher::hash_one(&s, 2 * i + 1));
+        let r = |i: u64| {
+            u128::from(std::hash::BuildHasher::hash_one(&s, 2 * i)) << 64
+                | u128::from(std::hash::BuildHasher::hash_one(&s, 2 * i + 1))
+        };
         Self([r(0), r(1), r(2), r(3)])
     }
 }
 impl std::hash::BuildHasher for Universal {
     type Hasher = Words;
     fn build_hasher(&self) -> Words {
-        Words { keys: self.0, sum: self.0[3], i: 0 }
+        Words {
+            keys: self.0,
+            sum: self.0[3],
+            i: 0,
+        }
     }
 }
 /// The sum of key i times word i (mod 2^128) plus the last key; the hash is its top 64 bits, reversed (hashbrown indexes by
@@ -1058,7 +1446,9 @@ impl std::hash::Hasher for Words {
         unreachable!("the memory cache hashes its keys' words");
     }
     fn write_u64(&mut self, x: u64) {
-        self.sum = self.sum.wrapping_add(self.keys[self.i].wrapping_mul(u128::from(x)));
+        self.sum = self
+            .sum
+            .wrapping_add(self.keys[self.i].wrapping_mul(u128::from(x)));
         self.i += 1;
     }
     fn finish(&self) -> u64 {
@@ -1087,14 +1477,24 @@ struct Entry {
 impl Entry {
     /// Bytes it keeps (the memory cache's bound).
     fn size(&self) -> usize {
-        size_of::<Self>() + self.prefix.len() + if let Answer::Object(o) = &self.answer { o.len() } else { 0 }
+        size_of::<Self>()
+            + self.prefix.len()
+            + if let Answer::Object(o) = &self.answer {
+                o.len()
+            } else {
+                0
+            }
     }
     /// fexc gives the same answer for `bytes` under `gating`: it reads nothing that differs (tools/fexc/fexc.cpp, `Extent`
     /// and `FexcArg`).
     fn matches(&self, bytes: &[u8], gating: &[u64; GATING]) -> bool {
         self.read >> GATING == 0
             && (0..GATING).all(|i| self.read & 1 << i == 0 || self.gating[i] == gating[i])
-            && if self.whole { bytes == self.prefix } else { bytes.starts_with(&self.prefix) }
+            && if self.whole {
+                bytes == self.prefix
+            } else {
+                bytes.starts_with(&self.prefix)
+            }
     }
 }
 /// One shard of the kept answers in two generations ([`Shard::insert`]): `cache` the newer (`cached` entries), `old` the older.
@@ -1109,15 +1509,32 @@ impl Shard {
     /// The kept answer matching `bytes` at `rip` (generation, key, index), from either generation: one kept for `rip`
     /// itself in any bucket first, then one for another RIP. Keys hold the leading bytes the answer read (at most
     /// [`LEAD`]), so each length is tried; one pass, each bucket looked up once.
-    fn find(&self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<(bool, Key, usize)> {
+    fn find(
+        &self,
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        gating: &[u64; GATING],
+    ) -> Option<(bool, Key, usize)> {
         let mut other = None;
         for n in (0..=LEAD.min(bytes.len())).rev() {
             let key = key(limit, rip, &bytes[..n]);
             for newer in [true, false] {
-                let Some(v) = (if newer { &self.cache } else { &self.old }).get(&key) else { continue };
-                let mut matching = v.iter().enumerate().filter(|(_, e)| e.matches(bytes, gating));
-                let Some((first, _)) = matching.next() else { continue };
-                let own = if v[first].rip == rip { Some(first) } else { matching.find(|(_, e)| e.rip == rip).map(|(i, _)| i) };
+                let Some(v) = (if newer { &self.cache } else { &self.old }).get(&key) else {
+                    continue;
+                };
+                let mut matching = v
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.matches(bytes, gating));
+                let Some((first, _)) = matching.next() else {
+                    continue;
+                };
+                let own = if v[first].rip == rip {
+                    Some(first)
+                } else {
+                    matching.find(|(_, e)| e.rip == rip).map(|(i, _)| i)
+                };
                 match own {
                     Some(i) => return Some((newer, key, i)),
                     None => other = other.or(Some((newer, key, first))),
@@ -1131,7 +1548,11 @@ impl Shard {
     }
     /// The entry [`Shard::find`] gave; one in the older generation moves to the newer (with the generation it may drop,
     /// [`Shard::insert`]).
-    fn take(&mut self, (newer, key, i): (bool, Key, usize), limit: Option<u32>) -> (Arc<Entry>, Option<Cache>) {
+    fn take(
+        &mut self,
+        (newer, key, i): (bool, Key, usize),
+        limit: Option<u32>,
+    ) -> (Arc<Entry>, Option<Cache>) {
         if newer {
             return (self.cache[&key][i].clone(), None);
         }
@@ -1146,10 +1567,17 @@ impl Shard {
     fn insert(&mut self, limit: Option<u32>, entry: Arc<Entry>) -> Option<Cache> {
         let mut dropped = None;
         if self.cached >= GENERATION / SHARDS || self.cached_bytes >= GENERATION_BYTES / SHARDS {
-            dropped = Some(std::mem::replace(&mut self.old, std::mem::take(&mut self.cache)));
+            dropped = Some(std::mem::replace(
+                &mut self.old,
+                std::mem::take(&mut self.cache),
+            ));
             (self.cached, self.cached_bytes) = (0, 0);
         }
-        let key = key(limit, entry.rip, &entry.prefix[..LEAD.min(entry.prefix.len())]);
+        let key = key(
+            limit,
+            entry.rip,
+            &entry.prefix[..LEAD.min(entry.prefix.len())],
+        );
         self.cached_bytes += entry.size();
         self.cache.entry(key).or_default().push(entry);
         self.cached += 1;
@@ -1169,7 +1597,12 @@ pub struct Answers {
 }
 impl Answers {
     pub(crate) fn new(supported: u64) -> Arc<Self> {
-        Arc::new(Self { supported, pick: Universal::default(), shards: std::array::from_fn(|_| Mutex::default()), waits: Default::default() })
+        Arc::new(Self {
+            supported,
+            pick: Universal::default(),
+            shards: std::array::from_fn(|_| Mutex::default()),
+            waits: Default::default(),
+        })
     }
     /// The shard of `limit` and `rip`, locked, and the nanoseconds waited for it.
     fn lock(&self, limit: Option<u32>, rip: u64) -> (std::sync::MutexGuard<'_, Shard>, u64) {
@@ -1189,9 +1622,17 @@ impl Answers {
         }
     }
     /// The kept answer matching `bytes` at `rip` ([`Shard::find`]; an older one moves to the newer generation).
-    fn find(&self, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> (Option<Arc<Entry>>, u64) {
+    fn find(
+        &self,
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        gating: &[u64; GATING],
+    ) -> (Option<Arc<Entry>>, u64) {
         let (mut shard, waited) = self.lock(limit, rip);
-        let Some(f) = shard.find(bytes, rip, limit, gating) else { return (None, waited) };
+        let Some(f) = shard.find(bytes, rip, limit, gating) else {
+            return (None, waited);
+        };
         let (entry, dropped) = shard.take(f, limit);
         drop(shard);
         drop(dropped); // freed unlocked
@@ -1199,9 +1640,17 @@ impl Answers {
     }
     /// Keeps `entry`, made for `bytes` at `rip`; returns the owner of a matching answer the map held already (perf chunk 13:
     /// after a lookup that found none, one made meanwhile by another vCPU) and the nanoseconds waited.
-    fn insert(&self, limit: Option<u32>, entry: Arc<Entry>, bytes: &[u8], rip: u64) -> (Option<u8>, u64) {
+    fn insert(
+        &self,
+        limit: Option<u32>,
+        entry: Arc<Entry>,
+        bytes: &[u8],
+        rip: u64,
+    ) -> (Option<u8>, u64) {
         let (mut shard, waited) = self.lock(limit, rip);
-        let held = shard.find(bytes, rip, limit, &entry.gating).map(|f| shard.at(f).owner);
+        let held = shard
+            .find(bytes, rip, limit, &entry.gating)
+            .map(|f| shard.at(f).owner);
         let dropped = shard.insert(limit, entry);
         drop(shard);
         drop(dropped); // freed unlocked
@@ -1212,14 +1661,24 @@ impl Answers {
         self.shards.iter().fold((0, 0), |(b, n), s| {
             let s = s.lock().unwrap_or_else(|e| e.into_inner());
             let all = || s.cache.values().chain(s.old.values()).flatten();
-            (b + all().map(|e| e.size()).sum::<usize>(), n + all().count())
+            (
+                b + all().map(|e| e.size()).sum::<usize>(),
+                n + all().count(),
+            )
         })
     }
     /// The performance log's line for the run: each shard's lock waits, `[ns, count]`, and the bytes and answers kept.
     pub fn report(&self) -> String {
-        let w: Vec<String> = self.waits.iter().map(|[ns, n]| format!("[{},{}]", ns.load(Relaxed), n.load(Relaxed))).collect();
+        let w: Vec<String> = self
+            .waits
+            .iter()
+            .map(|[ns, n]| format!("[{},{}]", ns.load(Relaxed), n.load(Relaxed)))
+            .collect();
         let (bytes, answers) = self.kept();
-        format!("answers {{\"lock_waits\":[{}],\"kept_bytes\":{bytes},\"kept_answers\":{answers}}}", w.join(","))
+        format!(
+            "answers {{\"lock_waits\":[{}],\"kept_bytes\":{bytes},\"kept_answers\":{answers}}}",
+            w.join(",")
+        )
     }
 }
 /// What [`Compiler::compile`] gives the service loop.
@@ -1332,7 +1791,10 @@ pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
         0 => {}
         fpcr => args.extend(["--x87-fpcr".into(), format!("{fpcr:#x}")]),
     }
-    for (name, unmasked) in [("--simd-unmasked", exec::simd_unmasked(cpu.mxcsr)), ("--x87-unmasked", exec::x87_unmasked(cpu.fcw))] {
+    for (name, unmasked) in [
+        ("--simd-unmasked", exec::simd_unmasked(cpu.mxcsr)),
+        ("--x87-unmasked", exec::x87_unmasked(cpu.fcw)),
+    ] {
         if unmasked != 0 {
             args.extend([name.into(), format!("{unmasked:#x}")]);
         }
@@ -1356,7 +1818,11 @@ pub const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
 impl Compiler {
     /// Now, when the performance log records this vCPU (else 0, unread).
     fn stamp(&self) -> u64 {
-        if self.perf.is_some() { crate::perf::now() } else { 0 }
+        if self.perf.is_some() {
+            crate::perf::now()
+        } else {
+            0
+        }
     }
     /// Charges the time since `since` to the current request's part `k` ([`crate::perf::Recorder::add`]).
     fn charge(&mut self, k: usize, since: u64) {
@@ -1373,17 +1839,57 @@ impl Compiler {
         for (value, (name, reg)) in id.iter_mut().zip(admission::ID_REGISTERS) {
             *value = cpu.sys(reg).map_err(|e| format!("{name}: {e}"))?;
         }
-        Ok(Self::with_features(fexc, admission::supported_features(&id), max_instructions))
+        Ok(Self::with_features(
+            fexc,
+            admission::supported_features(&id),
+            max_instructions,
+        ))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
-        Self { fexc: fexc.into(), server: None, supported, max_instructions, answers: Answers::new(supported), vcpu: 0, disk: None, compiles: 0, hits: 0, disk_hits: 0,
-               hits_by_source: [0; cache::MAX_VCPUS], duplicates: 0, lock_wait: (0, 0),
-               relocated: 0, relocation_refused: 0, relocation_fallbacks: 0, reuse_checks: 0, check_reuse: false,
-               deadline: COMPILE_DEADLINE, slowest: Duration::ZERO, shape: false, sse_gated: false, avx_gated: false, alignment_gated: false, x87: vec![], cpl0: false, tsc: false, cpl3: false, bulk: false, perf: None, read: 0, halved: false }
+        Self {
+            fexc: fexc.into(),
+            server: None,
+            supported,
+            max_instructions,
+            answers: Answers::new(supported),
+            vcpu: 0,
+            disk: None,
+            compiles: 0,
+            hits: 0,
+            disk_hits: 0,
+            hits_by_source: [0; cache::MAX_VCPUS],
+            duplicates: 0,
+            lock_wait: (0, 0),
+            relocated: 0,
+            relocation_refused: 0,
+            relocation_fallbacks: 0,
+            reuse_checks: 0,
+            check_reuse: false,
+            deadline: COMPILE_DEADLINE,
+            slowest: Duration::ZERO,
+            shape: false,
+            sse_gated: false,
+            avx_gated: false,
+            alignment_gated: false,
+            x87: vec![],
+            cpl0: false,
+            tsc: false,
+            cpl3: false,
+            bulk: false,
+            perf: None,
+            read: 0,
+            halved: false,
+        }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
     /// `rip` the resident executes, or fexc's end reason when it produced no code.
-    fn compile(&mut self, bytes: &[u8], rip: u64, step: bool, hook: &mut impl Hook) -> Result<Code> {
+    fn compile(
+        &mut self,
+        bytes: &[u8],
+        rip: u64,
+        step: bool,
+        hook: &mut impl Hook,
+    ) -> Result<Code> {
         // I9 review: a block whose code is over `MAX_BLOCK_BYTES` (PDEP/PEXT, PCMPxSTRx and other long lowerings in numbers)
         // is translated again from the same RIP with half its instructions, until it fits; one instruction too large for a
         // block stops `code_too_large`. R2 review: the same for a block with a spill area (`spill_area`).
@@ -1410,15 +1916,37 @@ impl Compiler {
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
-            let v = self.x87.iter().position(|x| x == a).and_then(|i| self.x87.get(i + 1));
-            v.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0)
+            let v = self
+                .x87
+                .iter()
+                .position(|x| x == a)
+                .and_then(|i| self.x87.get(i + 1));
+            v.and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
         };
-        [self.sse_gated.into(), self.avx_gated.into(), self.alignment_gated.into(), flag("--x87-gated"), flag("--wait-gated"),
-         value("--x87-fpcr"), value("--simd-unmasked"), value("--x87-unmasked"), self.cpl0.into(), self.tsc.into(), self.bulk.into()]
+        [
+            self.sse_gated.into(),
+            self.avx_gated.into(),
+            self.alignment_gated.into(),
+            flag("--x87-gated"),
+            flag("--wait-gated"),
+            value("--x87-fpcr"),
+            value("--simd-unmasked"),
+            value("--x87-unmasked"),
+            self.cpl0.into(),
+            self.tsc.into(),
+            self.bulk.into(),
+        ]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
     /// than its n guest instructions ([`admission::retry`]).
-    fn compile_once(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
+    fn compile_once(
+        &mut self,
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        hook: &mut impl Hook,
+    ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let gating = self.gating();
         let t = self.stamp();
         let (found, waited) = self.answers.find(bytes, rip, limit, &gating);
@@ -1443,9 +1971,20 @@ impl Compiler {
             let compiles = self.compiles;
             let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
             let t = self.stamp();
-            let (whole, end) = (reply.extent as usize >= bytes.len(), bytes.len().min(reply.extent as usize));
+            let (whole, end) = (
+                reply.extent as usize >= bytes.len(),
+                bytes.len().min(reply.extent as usize),
+            );
             let (read, prefix) = (reply.read, bytes[..end].to_vec());
-            let entry = Arc::new(Entry { rip: at, owner: self.vcpu, read, gating, prefix, whole, answer: Answer::new(reply, at)? });
+            let entry = Arc::new(Entry {
+                rip: at,
+                owner: self.vcpu,
+                read,
+                gating,
+                prefix,
+                whole,
+                answer: Answer::new(reply, at)?,
+            });
             let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
             self.waited(waited);
             // Perf chunk 13: the lookup found nothing and another vCPU kept a matching answer while this one compiled.
@@ -1475,12 +2014,22 @@ impl Compiler {
         if shared.supported == self.supported {
             self.answers = shared.clone();
         } else {
-            eprintln!("natemu: vCPU {} presents other features than the run's first compiler: it keeps its own answers", self.vcpu);
+            eprintln!(
+                "natemu: vCPU {} presents other features than the run's first compiler: it keeps its own answers",
+                self.vcpu
+            );
         }
     }
     /// The kept answer `e`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it would not be fexc's
     /// at `rip`, or admission refused the relocated object; logged; the caller compiles).
-    fn reuse(&mut self, e: &Entry, bytes: &[u8], rip: u64, limit: Option<u32>, hook: &mut impl Hook) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
+    fn reuse(
+        &mut self,
+        e: &Entry,
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        hook: &mut impl Hook,
+    ) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
         let t = self.stamp();
         let (from, read) = (e.rip, (e.read, e.whole, e.prefix.len()));
         let code = if from == rip {
@@ -1499,23 +2048,48 @@ impl Compiler {
             match self.answered(&answer, bytes, rip, hook) {
                 Ok(code) => {
                     self.relocated += 1;
-                    self.charge(if matches!(code, Ok(Code::Block(_))) { crate::perf::ADMIT } else { crate::perf::DECODE }, t);
+                    self.charge(
+                        if matches!(code, Ok(Code::Block(_))) {
+                            crate::perf::ADMIT
+                        } else {
+                            crate::perf::DECODE
+                        },
+                        t,
+                    );
                     return Ok(Some(code));
                 }
                 Err(e) => {
                     self.relocation_fallbacks += 1;
-                    eprintln!("natemu: the answer relocated from {from:#x} to {rip:#x} was refused ({e}); compiled at {rip:#x}");
+                    eprintln!(
+                        "natemu: the answer relocated from {from:#x} to {rip:#x} was refused ({e}); compiled at {rip:#x}"
+                    );
                     return Ok(None);
                 }
             }
         };
-        self.charge(if matches!(code, Ok(Code::Block(_))) { crate::perf::ADMIT } else { crate::perf::DECODE }, t);
+        self.charge(
+            if matches!(code, Ok(Code::Block(_))) {
+                crate::perf::ADMIT
+            } else {
+                crate::perf::DECODE
+            },
+            t,
+        );
         Ok(Some(code))
     }
     /// The reuse check: fexc's own answer at `rip` (no cache) equals `answer`, relocated from `from`.
     /// `read`: the kept entry's arguments read, whether its extent reached the end of its bytes, and their length to it.
     #[allow(clippy::too_many_arguments)]
-    fn check(&mut self, answer: &Answer, read: (u32, bool, usize), bytes: &[u8], rip: u64, limit: Option<u32>, from: u64, hook: &mut impl Hook) -> Result<()> {
+    fn check(
+        &mut self,
+        answer: &Answer,
+        read: (u32, bool, usize),
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        from: u64,
+        hook: &mut impl Hook,
+    ) -> Result<()> {
         let (reply, _) = self.ask(bytes, rip, limit, false, hook)?;
         // Counted as checks, not as the run's compiles.
         self.compiles -= 1;
@@ -1523,21 +2097,40 @@ impl Compiler {
             r.sources[2] -= 1;
         }
         self.reuse_checks += 1;
-        let fresh = (reply.read, reply.extent as usize >= bytes.len(), bytes.len().min(reply.extent as usize));
+        let fresh = (
+            reply.read,
+            reply.extent as usize >= bytes.len(),
+            bytes.len().min(reply.extent as usize),
+        );
         if fresh != read || Answer::new(reply, rip)? != *answer {
-            return Err(format!("reuse check: the answer relocated from {from:#x} is not fexc's at {rip:#x}"));
+            return Err(format!(
+                "reuse check: the answer relocated from {from:#x} is not fexc's at {rip:#x}"
+            ));
         }
         Ok(())
     }
     /// [`Compiler::compile_once`]'s use of an answer: admitted, or decoded.
     #[cfg_attr(not(feature = "testing"), allow(unused_variables))]
-    fn answered(&self, answer: &Answer, bytes: &[u8], rip: u64, hook: &mut impl Hook) -> Result<std::result::Result<Code, (u32, &'static str)>> {
+    fn answered(
+        &self,
+        answer: &Answer,
+        bytes: &[u8],
+        rip: u64,
+        hook: &mut impl Hook,
+    ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         Ok(match answer {
             Answer::Object(object) => match admission::retry(object) {
                 Some(n) => Err(n),
                 None => {
                     #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
-                    let mut admitted = admission::admit(object, rip, bytes, self.supported, self.shape, self.cpl0)?;
+                    let mut admitted = admission::admit(
+                        object,
+                        rip,
+                        bytes,
+                        self.supported,
+                        self.shape,
+                        self.cpl0,
+                    )?;
                     // Perf chunk 26: a bulk REP STOS only where asked for (never a step: TF traps after each iteration).
                     if admitted.bulk && !self.bulk {
                         return Err(format!("object refused: a bulk REP STOS loop in a request without --bulk at {rip:#x}").into());
@@ -1547,20 +2140,43 @@ impl Compiler {
                     Ok(Code::Block(admitted))
                 }
             },
-            Answer::Cut { reason, cut, gated, ud } => {
+            Answer::Cut {
+                reason,
+                cut,
+                gated,
+                ud,
+            } => {
                 let decoded = |(map, opcode)| {
-                    crate::system::decode(bytes, map, opcode).or_else(|| crate::system::lock_ud(bytes)).or_else(|| crate::system::vex_ud(bytes))
+                    crate::system::decode(bytes, map, opcode)
+                        .or_else(|| crate::system::lock_ud(bytes))
+                        .or_else(|| crate::system::vex_ud(bytes))
                 };
                 // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
                 // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
                 // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone.
                 let gated_kind = |(map, op): (u8, u8), mmx: bool| {
                     let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
-                    let kind = if mmx { exec::system::MMX_GATED } else if x87 { exec::system::X87_GATED } else if map == 8 { exec::system::AVX_GATED } else { exec::system::SSE_GATED };
-                    Some(exec::System { kind, length: 1, ..exec::System::NONE })
+                    let kind = if mmx {
+                        exec::system::MMX_GATED
+                    } else if x87 {
+                        exec::system::X87_GATED
+                    } else if map == 8 {
+                        exec::system::AVX_GATED
+                    } else {
+                        exec::system::SSE_GATED
+                    };
+                    Some(exec::System {
+                        kind,
+                        length: 1,
+                        ..exec::System::NONE
+                    })
                 };
                 // I10: an encoding fexc found reserved or unadvertised: #UD whatever its operands (RIP stays at it).
-                let ud = ud.then_some(exec::System { kind: exec::system::UD, length: 1, ..exec::System::NONE });
+                let ud = ud.then_some(exec::System {
+                    kind: exec::system::UD,
+                    length: 1,
+                    ..exec::System::NONE
+                });
                 match ud.or_else(|| {
                     cut.and_then(|cut| match gated {
                         Some(mmx) => gated_kind(cut, *mmx),
@@ -1569,11 +2185,17 @@ impl Compiler {
                 }) {
                     Some(s) if reason == "system_instruction" => Ok(Code::System(s)),
                     // Longer than 15 bytes with all of its first 15 fetched: #GP(0) (a fetch fault was `partial_decode`).
-                    _ if reason == "instruction_too_long" => Ok(Code::System(exec::System { kind: exec::system::TOO_LONG, length: 1, ..exec::System::NONE })),
+                    _ if reason == "instruction_too_long" => Ok(Code::System(exec::System {
+                        kind: exec::system::TOO_LONG,
+                        length: 1,
+                        ..exec::System::NONE
+                    })),
                     // X1c: a form fexc refuses at this RIP that x86 defines as an exception: a direct branch to a non-canonical
                     // target (#GP(0) when taken), or an encoding #UD whatever its operands ([`crate::system::undefined`]).
                     _ if reason == "unsupported_form" && cut.is_some() => {
-                        match crate::system::branch(bytes, rip).or_else(|| crate::system::undefined(bytes)) {
+                        match crate::system::branch(bytes, rip)
+                            .or_else(|| crate::system::undefined(bytes))
+                        {
                             Some(s) => Ok(Code::System(s)),
                             None => Ok(Self::refused(reason, bytes, rip)),
                         }
@@ -1584,34 +2206,53 @@ impl Compiler {
         })
     }
     /// A no-code answer at `rip`: the fetch-limited ones (`partial_decode`, `end_of_input`: the caller fetches on or delivers the
-/// fetch fault) stay no code; every other one is an instruction natemu cannot run yet (a refused form, a system instruction
-/// the host does not decode, a decoder or dispatcher failure, a compiler limit at one instruction), which x86 would run or
-/// fault on: it is delivered as #UD at the instruction ([`exec::system::REFUSED`], the recorded deviation of the owner's rule
-/// of November 6: no instruction a guest program can execute stops the machine), never a machine stop. The first ones are
-/// logged on standard error.
-fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
-    if matches!(reason, "partial_decode" | "end_of_input") {
-        return Code::None(reason.into());
+    /// fetch fault) stay no code; every other one is an instruction natemu cannot run yet (a refused form, a system instruction
+    /// the host does not decode, a decoder or dispatcher failure, a compiler limit at one instruction), which x86 would run or
+    /// fault on: it is delivered as #UD at the instruction ([`exec::system::REFUSED`], the recorded deviation of the owner's rule
+    /// of November 6: no instruction a guest program can execute stops the machine), never a machine stop. The first ones are
+    /// logged on standard error.
+    fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
+        if matches!(reason, "partial_decode" | "end_of_input") {
+            return Code::None(reason.into());
+        }
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // ponytail: the first 32 per process; a per-form count would need a map behind a lock.
+        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let hex: String = bytes.iter().take(15).map(|b| format!("{b:02x}")).collect();
+            eprintln!(
+                "natemu: {reason} at {rip:#x} ({hex}): delivered as #UD (a form natemu does not run yet)"
+            );
+        }
+        Code::System(exec::System {
+            kind: exec::system::REFUSED,
+            length: 1,
+            ..exec::System::NONE
+        })
     }
-    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    // ponytail: the first 32 per process; a per-form count would need a map behind a lock.
-    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
-        let hex: String = bytes.iter().take(15).map(|b| format!("{b:02x}")).collect();
-        eprintln!("natemu: {reason} at {rip:#x} ({hex}): delivered as #UD (a form natemu does not run yet)");
-    }
-    Code::System(exec::System { kind: exec::system::REFUSED, length: 1, ..exec::System::NONE })
-}
-/// The request body for `bytes` at `rip` (protocol in tools/fexc/fexc.cpp).
+    /// The request body for `bytes` at `rip` (protocol in tools/fexc/fexc.cpp).
     fn body(&self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Vec<u8> {
         self.body_with(bytes, format!("{rip:#x}"), limit)
     }
     /// The persistent cache's key body (perf chunk 4): the request with the RIP replaced by its half and page offset, as the
     /// memory cache keys answers.
     fn disk_body(&self, bytes: &[u8], rip: u64, limit: Option<u32>) -> Vec<u8> {
-        self.body_with(bytes, format!("{}:{:#x}", if rip >> 63 != 0 { 'k' } else { 'u' }, rip & 0xfff), limit)
+        self.body_with(
+            bytes,
+            format!(
+                "{}:{:#x}",
+                if rip >> 63 != 0 { 'k' } else { 'u' },
+                rip & 0xfff
+            ),
+            limit,
+        )
     }
     fn body_with(&self, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
-        let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), rip];
+        let mut args = vec![
+            "--profile".to_string(),
+            "slice1".into(),
+            "--rip".into(),
+            rip,
+        ];
         if let Some(n) = limit {
             args.extend(["--max-insts".into(), n.to_string()]);
         }
@@ -1646,12 +2287,27 @@ fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
     /// fexc's reply to the request for `bytes` at `rip` and the RIP it was compiled at: from the persistent cache when `disk`
     /// (an answer for any RIP of that half and offset, stored with its RIP), else from the server (then stored); the
     /// persistent cache only at CPL 3 (`cpl3`).
-    fn ask(&mut self, bytes: &[u8], rip: u64, limit: Option<u32>, disk: bool, _hook: &mut impl Hook) -> Result<(Reply, u64)> {
+    fn ask(
+        &mut self,
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        disk: bool,
+        _hook: &mut impl Hook,
+    ) -> Result<(Reply, u64)> {
         let t = self.stamp();
         let cache = self.disk.clone().filter(|_| self.cpl3);
-        let key = cache.as_ref().filter(|d| disk && !d.is_empty()).map(|d| d.key(&self.disk_body(bytes, rip, limit)));
+        let key = cache
+            .as_ref()
+            .filter(|d| disk && !d.is_empty())
+            .map(|d| d.key(&self.disk_body(bytes, rip, limit)));
         let stored = key.and_then(|k| cache.as_ref().unwrap().get(&k));
-        let stored = stored.and_then(|p| Some((Reply::from_payload(p.get(8..)?)?, u64::from_le_bytes(p.get(..8)?.try_into().unwrap()))));
+        let stored = stored.and_then(|p| {
+            Some((
+                Reply::from_payload(p.get(8..)?)?,
+                u64::from_le_bytes(p.get(..8)?.try_into().unwrap()),
+            ))
+        });
         self.charge(crate::perf::DISK_GET, t);
         if let Some((reply, at)) = stored.filter(|(r, _)| r.code < 2) {
             self.disk_hits += 1;
@@ -1672,7 +2328,9 @@ fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
         #[cfg(feature = "testing")]
         let response = {
             let pid = server.child.id();
-            server.request_with_posted(&body, began + self.deadline, || _hook.compiler_posted(self.compiles, rip, pid))
+            server.request_with_posted(&body, began + self.deadline, || {
+                _hook.compiler_posted(self.compiles, rip, pid)
+            })
         };
         #[cfg(not(feature = "testing"))]
         let response = server.request(&body, began + self.deadline);
@@ -1680,7 +2338,11 @@ fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
             Ok(reply) => reply,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 let _ = server.child.kill();
-                return Err(format!("{}: no reply within {:?}, killed", server.failed(e), self.deadline));
+                return Err(format!(
+                    "{}: no reply within {:?}, killed",
+                    server.failed(e),
+                    self.deadline
+                ));
             }
             Err(e) => return Err(server.failed(e)),
         };
@@ -1691,11 +2353,17 @@ fn refused(reason: &str, bytes: &[u8], rip: u64) -> Code {
             r.sources[2] += 1;
         }
         if reply.code >= 2 {
-            return Err(format!("fexc failed at {rip:#x}: {}", String::from_utf8_lossy(&reply.json)));
+            return Err(format!(
+                "fexc failed at {rip:#x}: {}",
+                String::from_utf8_lossy(&reply.json)
+            ));
         }
         let t = self.stamp();
         if let Some(disk) = &cache {
-            disk.put(self.disk_body(bytes, rip, limit), [&rip.to_le_bytes()[..], &reply.payload()].concat());
+            disk.put(
+                self.disk_body(bytes, rip, limit),
+                [&rip.to_le_bytes()[..], &reply.payload()].concat(),
+            );
         }
         self.charge(crate::perf::DISK_PUT, t);
         Ok((reply, rip))
@@ -1735,7 +2403,11 @@ struct Fetched {
 }
 /// The bytes at `state.cpu.rip` up to the end of its page, continuing through the next page when the resident walked
 /// it, never past `limit` (when it lies ahead); or the vCPU's stop, when the walk of RIP's page failed.
-fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result::Result<Fetched, Stop>> {
+fn fetched(
+    area: Area,
+    state: &State,
+    limit: Option<u64>,
+) -> Result<std::result::Result<Fetched, Stop>> {
     let ram = area.ram;
     let rip = state.cpu.rip;
     let fault = exec::fetch::decode(state.fetch_fault);
@@ -1773,13 +2445,20 @@ fn fetched(area: Area, state: &State, limit: Option<u64>) -> Result<std::result:
         cut = second;
     }
     let walked = state.fetch[1] != u64::MAX || state.fetch_fault[0] != exec::fetch::NONE;
-    Ok(Ok(Fetched { bytes, more: next.is_some() && !walked, next_fault: fault, cut }))
+    Ok(Ok(Fetched {
+        bytes,
+        more: next.is_some() && !walked,
+        next_fault: fault,
+        cut,
+    }))
 }
 /// Appends guest RAM's `length` bytes at `gpa` to `out` (false: not all RAM), as `GuestRam::copy_out` reads them (volatile
 /// loads: other vCPUs may write them) but eight at a time where aligned (perf chunk 7: its byte loop and the zeroed buffer
 /// were about 0.4 us a request).
 fn copy_out(ram: &GuestRam, gpa: u64, length: u64, out: &mut Vec<u8>) -> bool {
-    let Some(p) = ram.range(gpa, length) else { return false };
+    let Some(p) = ram.range(gpa, length) else {
+        return false;
+    };
     let n = length as usize;
     let head = (p as usize).wrapping_neg() % 8;
     let words = n.saturating_sub(head) / 8;
@@ -1789,7 +2468,9 @@ fn copy_out(ram: &GuestRam, gpa: u64, length: u64, out: &mut Vec<u8>) -> bool {
         let byte = |i: usize| std::ptr::read_volatile(p.add(i));
         out.extend((0..head.min(n)).map(byte));
         for w in 0..words {
-            out.extend_from_slice(&std::ptr::read_volatile(p.add(head + 8 * w).cast::<u64>()).to_ne_bytes());
+            out.extend_from_slice(
+                &std::ptr::read_volatile(p.add(head + 8 * w).cast::<u64>()).to_ne_bytes(),
+            );
         }
         out.extend((head.min(n) + 8 * words..n).map(byte));
     }
@@ -1843,7 +2524,9 @@ pub trait Hook {
     /// The real channel request was posted; its response has not been consumed. Does not imply
     /// the compiler process is still computing. Test observers must remain finite and releasable.
     #[cfg(feature = "testing")]
-    fn compiler_posted(&mut self, _compiles: u64, _rip: u64, _server: u32) -> std::io::Result<()> { Ok(()) }
+    fn compiler_posted(&mut self, _compiles: u64, _rip: u64, _server: u32) -> std::io::Result<()> {
+        Ok(())
+    }
     /// Each reply, written into `state` (and the block or decode in place) but not yet seen by the resident.
     #[cfg(feature = "testing")]
     fn reply(&mut self, _kind: ReplyKind, _area: Area, _state: &mut State) {}
@@ -1897,10 +2580,19 @@ pub fn run(
     for (f, r) in fences.iter_mut().zip(&ranges) {
         *f = [r.start, r.end];
     }
-    let mode = if ranges.len() > fences.len() { cache::REUSE_OFF } else if compiler.check_reuse { cache::REUSE_CHECK } else { cache::REUSE_ON };
+    let mode = if ranges.len() > fences.len() {
+        cache::REUSE_OFF
+    } else if compiler.check_reuse {
+        cache::REUSE_CHECK
+    } else {
+        cache::REUSE_ON
+    };
     let control = cache::LOOKUP_OFFSET + cache::CONTROL;
     area.write_record(control + std::mem::offset_of!(cache::Control, reuse), mode);
-    area.write_record(control + std::mem::offset_of!(cache::Control, reuse_fences), fences);
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, reuse_fences),
+        fences,
+    );
     // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
     // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
     let entered = &AtomicU64::new(0);
@@ -1909,7 +2601,11 @@ pub fn run(
     // A halted vCPU (X2: parked in the VM by HLT) is idle, not stuck: the watchdog waits on; the driver decides when a
     // halted vCPU can never wake ([`end_when_halted`]). A scoped thread (R2 review): it borrows the words, and is joined
     // even when `serve` panics (unwinding drops `done` first, which ends it).
-    let halted: &AtomicU64 = event_word(area.memory, area.vcpu, std::mem::offset_of!(cache::Events, halted));
+    let halted: &AtomicU64 = event_word(
+        area.memory,
+        area.vcpu,
+        std::mem::offset_of!(cache::Events, halted),
+    );
     std::thread::scope(move |scope| {
         scope.spawn(move || {
             let limit = u64::try_from(watchdog.as_nanos()).unwrap_or(u64::MAX);
@@ -1934,12 +2630,16 @@ pub fn run(
                     due = now.saturating_add(again);
                     again
                 };
-                if ended.recv_timeout(Duration::from_nanos(wait)) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                if ended.recv_timeout(Duration::from_nanos(wait))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
                     break;
                 }
             }
         });
-        let stop = serve(cpu, area, compiler, stop_at, requests, stops, entered, cancelled, hook);
+        let stop = serve(
+            cpu, area, compiler, stop_at, requests, stops, entered, cancelled, hook,
+        );
         // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
         // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
         drop(done);
@@ -1983,9 +2683,16 @@ fn serve(
             vm::Exit::Cancelled if cancelled.load(SeqCst) => return Ok(Stop::Cancelled),
             vm::Exit::Cancelled => {
                 let asked = (0..cache::MAX_VCPUS)
-                    .filter(|&p| p != v && record_word(area.memory, p, None).load(SeqCst) & cache::SHADOWS != 0)
+                    .filter(|&p| {
+                        p != v
+                            && record_word(area.memory, p, None).load(SeqCst) & cache::SHADOWS != 0
+                    })
                     .fold(0, |m, p| m | 1 << p);
-                return Ok(Stop::Watchdog { pc: cpu.reg(PC)?, el0: cpu.reg(CPSR)? & 0x1f == 0, asked });
+                return Ok(Stop::Watchdog {
+                    pc: cpu.reg(PC)?,
+                    el0: cpu.reg(CPSR)? & 0x1f == 0,
+                    asked,
+                });
             }
         };
         match exit {
@@ -1998,7 +2705,11 @@ fn serve(
                 return match parked.take() {
                     Some(stop) if state.stop == exec::stop::PARKED => Ok(stop),
                     _ if state.stop == exec::stop::PARKED => Err("vCPU parked unasked".into()),
-                    _ => Ok(Stop::Resident { stop: state.stop, status: s.status, detail: s.detail }),
+                    _ => Ok(Stop::Resident {
+                        stop: state.stop,
+                        status: s.status,
+                        detail: s.detail,
+                    }),
                 };
             }
             exec::TRANSLATE_HVC if parked.is_none() => {}
@@ -2016,7 +2727,12 @@ fn serve(
                 if cancelled.load(SeqCst) {
                     return Ok(Stop::Cancelled);
                 }
-                crate::devices::serve(area, &mut state, requests.devices.as_deref(), &mut requests.pending_device);
+                crate::devices::serve(
+                    area,
+                    &mut state,
+                    requests.devices.as_deref(),
+                    &mut requests.pending_device,
+                );
                 #[cfg(feature = "testing")]
                 hook.reply(ReplyKind::Device, area, &mut state);
                 area.write_record(exec::STATE_OFFSET, state);
@@ -2024,7 +2740,9 @@ fn serve(
                 continue;
             }
             exec::REQUEST_DEVICE_POLL => {
-                if cancelled.load(SeqCst) { return Ok(Stop::Cancelled); }
+                if cancelled.load(SeqCst) {
+                    return Ok(Stop::Cancelled);
+                }
                 crate::devices::serve_poll(area, &mut state, &mut requests.pending_device);
                 #[cfg(feature = "testing")]
                 hook.reply(ReplyKind::Device, area, &mut state);
@@ -2042,7 +2760,7 @@ fn serve(
                 lap(compiler, crate::perf::PAGE);
                 continue;
             }
-                        // L3: a port access, made once on the port bus (never parked).
+            // L3: a port access, made once on the port bus (never parked).
             exec::REQUEST_PORT => {
                 if cancelled.load(SeqCst) {
                     return Ok(Stop::Cancelled);
@@ -2050,7 +2768,9 @@ fn serve(
                 crate::devices::serve_port(area, &mut state, requests.devices.as_deref());
                 if let Some(devices) = requests.devices.as_deref().filter(|d| d.power() != 0) {
                     devices.quiesce()?;
-                    requests.power_started.get_or_insert_with(std::time::Instant::now);
+                    requests
+                        .power_started
+                        .get_or_insert_with(std::time::Instant::now);
                     state.reply = exec::REPLY_PORT_POWER;
                 }
                 area.write_record(exec::STATE_OFFSET, state);
@@ -2060,11 +2780,22 @@ fn serve(
             exec::REQUEST_POWER_POLL => {
                 #[cfg(feature = "testing")]
                 hook.reply(ReplyKind::Power, area, &mut state);
-                if cancelled.load(SeqCst) { return Ok(Stop::Cancelled); }
-                let start = requests.power_started.ok_or("power poll without completed power port access")?;
-                let devices = requests.devices.as_deref().ok_or("power poll without devices")?;
-                if devices.quiesce()? { return Ok(Stop::Power(devices.power())); }
-                if start.elapsed() > Duration::from_secs(30) { return Err("device shutdown drain timed out".into()); }
+                if cancelled.load(SeqCst) {
+                    return Ok(Stop::Cancelled);
+                }
+                let start = requests
+                    .power_started
+                    .ok_or("power poll without completed power port access")?;
+                let devices = requests
+                    .devices
+                    .as_deref()
+                    .ok_or("power poll without devices")?;
+                if devices.quiesce()? {
+                    return Ok(Stop::Power(devices.power()));
+                }
+                if start.elapsed() > Duration::from_secs(30) {
+                    return Err("device shutdown drain timed out".into());
+                }
                 state.reply = exec::REPLY_POWER_POLL;
                 area.write_record(exec::STATE_OFFSET, state);
                 std::thread::yield_now();
@@ -2090,8 +2821,15 @@ fn serve(
             }
             _ => return Err("translation exit without a request".into()),
         };
-        let (began, cr3, rip, gpa, gpa2) = (compiler.stamp(), state.cpu.cr3, state.cpu.rip, state.fetch[0], state.fetch[1]);
-        state.reply = match translation(area, compiler, &mut state, step, stop_at, requests, hook)? {
+        let (began, cr3, rip, gpa, gpa2) = (
+            compiler.stamp(),
+            state.cpu.cr3,
+            state.cpu.rip,
+            state.fetch[0],
+            state.fetch[1],
+        );
+        state.reply = match translation(area, compiler, &mut state, step, stop_at, requests, hook)?
+        {
             Ok(reply) => reply,
             Err(stop) => {
                 parked = Some(stop);
@@ -2103,9 +2841,26 @@ fn serve(
             hook.reply(ReplyKind::Translation, area, &mut state);
         }
         area.write_record(exec::STATE_OFFSET, state);
-        lap(compiler, if step { crate::perf::STEP } else { crate::perf::TRANSLATE });
+        lap(
+            compiler,
+            if step {
+                crate::perf::STEP
+            } else {
+                crate::perf::TRANSLATE
+            },
+        );
         if let Some(r) = &mut compiler.perf {
-            r.request(cr3, rip, gpa, state.reply, began, step, state.generation, state.cpu.code_context(), gpa2);
+            r.request(
+                cr3,
+                rip,
+                gpa,
+                state.reply,
+                began,
+                step,
+                state.generation,
+                state.cpu.code_context(),
+                gpa2,
+            );
         }
         lap(compiler, crate::perf::LOG_LINE);
     }
@@ -2137,7 +2892,12 @@ fn translation(
         None => {}
     }
     // Blocks end at the stop RIP and at the hook's next RIP.
-    let hooks = hook.boundary(rip).into_iter().chain(stop_at).filter(|&l| l > rip).min();
+    let hooks = hook
+        .boundary(rip)
+        .into_iter()
+        .chain(stop_at)
+        .filter(|&l| l > rip)
+        .min();
     // S4: and before every armed instruction breakpoint, so each is the first instruction of a block (the resident checks
     // it there); one inside an instruction on this path is never reached and is passed over.
     let mut breakpoints: Vec<u64> = state.cpu.code_breakpoints().filter(|&b| b > rip).collect();
@@ -2146,10 +2906,17 @@ fn translation(
         let t = compiler.stamp();
         let fetched = fetched(area, state, limit)?;
         compiler.charge(crate::perf::FETCH, t);
-        let Fetched { bytes, more, next_fault, cut } = match fetched {
+        let Fetched {
+            bytes,
+            more,
+            next_fault,
+            cut,
+        } = match fetched {
             Ok(fetched) => fetched,
             // RIP's page faults: the resident delivers it (`state.fetch_fault`); nothing is compiled.
-            Err(Stop::FetchFault(Fault::Page { .. } | Fault::Noncanonical)) => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
+            Err(Stop::FetchFault(Fault::Page { .. } | Fault::Noncanonical)) => {
+                return Ok(Ok(exec::REPLY_FETCH_FAULT));
+            }
             Err(stop) => return Ok(Err(stop)),
         };
         compiler.sse_gated = sse_gated(&state.cpu);
@@ -2163,7 +2930,11 @@ fn translation(
         let code = compiler.compile(&bytes, rip, step, hook)?;
         match &code {
             // The instruction at RIP runs past a breakpoint the bytes were cut at.
-            Code::None(reason) if reason == "partial_decode" && limit != hooks && limit == Some(rip + bytes.len() as u64) => {
+            Code::None(reason)
+                if reason == "partial_decode"
+                    && limit != hooks
+                    && limit == Some(rip + bytes.len() as u64) =>
+            {
                 breakpoints.retain(|&b| Some(b) != limit)
             }
             _ => {
@@ -2171,17 +2942,29 @@ fn translation(
                 // instruction is answered as their run ([`exec::system::NOP_RUN`]): the resident commits it and runs the
                 // system instruction in the same entry. The bytes are those fexc translated, and so is the count.
                 let nop_run = match &code {
-                    Code::Block(b) if !step && b.end_reason == natemu_abi::code_object::end_reason::SYSTEM_INSTRUCTION && b.guest_bytes <= exec::system::MAX_NOP_RUN => {
-                        bytes.get(..b.guest_bytes as usize).and_then(crate::system::nops).is_some_and(|n| n == b.guest_insns).then_some(b.guest_bytes)
+                    Code::Block(b)
+                        if !step
+                            && b.end_reason
+                                == natemu_abi::code_object::end_reason::SYSTEM_INSTRUCTION
+                            && b.guest_bytes <= exec::system::MAX_NOP_RUN =>
+                    {
+                        bytes
+                            .get(..b.guest_bytes as usize)
+                            .and_then(crate::system::nops)
+                            .is_some_and(|n| n == b.guest_insns)
+                            .then_some(b.guest_bytes)
                     }
                     _ => None,
                 };
                 // Compile-ahead measurement (log on only): the block ends in a call (e8, or ff /2), so its end is a return site.
                 let call = match &code {
-                    Code::Block(b) if compiler.perf.is_some() => bytes.get(b.last as usize..b.guest_bytes as usize).is_some_and(|t| {
-                        let (o, _) = crate::system::opcode_at(t);
-                        matches!(t.get(o..), Some([0xe8, ..])) || matches!(t.get(o..), Some([0xff, m, ..]) if m >> 3 & 7 == 2)
-                    }),
+                    Code::Block(b) if compiler.perf.is_some() => bytes
+                        .get(b.last as usize..b.guest_bytes as usize)
+                        .is_some_and(|t| {
+                            let (o, _) = crate::system::opcode_at(t);
+                            matches!(t.get(o..), Some([0xe8, ..]))
+                                || matches!(t.get(o..), Some([0xff, m, ..]) if m >> 3 & 7 == 2)
+                        }),
                     _ => false,
                 };
                 break (code, more, next_fault, cut, bytes.len(), nop_run, call);
@@ -2198,7 +2981,11 @@ fn translation(
     }
     if let Some(length) = nop_run {
         *requests.decodes.entry(exec::system::NOP_RUN).or_default() += 1;
-        state.system = exec::System { kind: exec::system::NOP_RUN, length, ..exec::System::NONE };
+        state.system = exec::System {
+            kind: exec::system::NOP_RUN,
+            length,
+            ..exec::System::NONE
+        };
         return Ok(Ok(exec::REPLY_SYSTEM));
     }
     let block = match code {
@@ -2212,7 +2999,9 @@ fn translation(
         Code::None(reason) => {
             return Ok(Err(match next_fault {
                 // The instruction at RIP continues into a page whose fetch faults: delivered by the resident.
-                Some(Fault::Page { .. } | Fault::Noncanonical) if reason == "partial_decode" => return Ok(Ok(exec::REPLY_FETCH_FAULT)),
+                Some(Fault::Page { .. } | Fault::Noncanonical) if reason == "partial_decode" => {
+                    return Ok(Ok(exec::REPLY_FETCH_FAULT));
+                }
                 Some(fault) if reason == "partial_decode" => Stop::FetchFault(fault),
                 _ => Stop::NoCode(reason),
             }));
@@ -2220,22 +3009,37 @@ fn translation(
     };
     // A step reply is exactly one instruction (the resident refuses anything else too).
     if step && (block.guest_insns != 1 || block.guest_bytes > 15) {
-        return Err(format!("step at {rip:#x}: {} instructions, {} bytes", block.guest_insns, block.guest_bytes));
+        return Err(format!(
+            "step at {rip:#x}: {} instructions, {} bytes",
+            block.guest_insns, block.guest_bytes
+        ));
     }
     // Perf chunk 10, a template for reuse inside the resident (chunk 6's count): fexc's answer here is its answer for the
     // same bytes at any RIP of this half and page offset (the relocation proof) when it depended only on bytes of the
     // block's own pages before their end (so the frames say which), no limit cut them and no halving retry made it.
     let last = rip.wrapping_add(u64::from(block.guest_bytes).max(1) - 1) >> 12;
-    let template = !step && !cut && !compiler.halved && block.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
-        && compiler.read < bytes_len && rip.wrapping_add(compiler.read.max(1) as u64 - 1) >> 12 <= last;
+    let template = !step
+        && !cut
+        && !compiler.halved
+        && block.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
+        && compiler.read < bytes_len
+        && rip.wrapping_add(compiler.read.max(1) as u64 - 1) >> 12 <= last;
     if let Some(r) = &mut compiler.perf {
         r.template = template;
         // Compile-ahead measurement: the block's exits (its link targets and a call's return site), and whether each lies
         // on a page this request fetched (RIP's, or the next one when it was walked).
         let end = rip.wrapping_add(u64::from(block.guest_bytes));
-        let fetched = |t: u64| t >> 12 == rip >> 12 || (state.fetch[1] != u64::MAX && t >> 12 == (rip >> 12).wrapping_add(1));
+        let fetched = |t: u64| {
+            t >> 12 == rip >> 12
+                || (state.fetch[1] != u64::MAX && t >> 12 == (rip >> 12).wrapping_add(1))
+        };
         r.block = (block.guest_bytes, call);
-        for t in block.links.iter().map(|l| l.target).chain(call.then_some(end)) {
+        for t in block
+            .links
+            .iter()
+            .map(|l| l.target)
+            .chain(call.then_some(end))
+        {
             if !r.candidates.iter().any(|&(u, _)| u == t) {
                 r.candidates.push((t, fetched(t)));
             }
@@ -2254,7 +3058,12 @@ fn translation(
     state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
     state.dispatch_exit = block.dispatch_exit.map_or(0, u64::from);
-    state.rep_exits = block.links.iter().enumerate().filter(|(_, p)| Some(p.target) == block.rep_self).fold(0, |m, (k, _)| m | 1 << k);
+    state.rep_exits = block
+        .links
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| Some(p.target) == block.rep_self)
+        .fold(0, |m, (k, _)| m | 1 << k);
     state.sti_first = u64::from(block.sti_first);
     compiler.charge(crate::perf::STAGE, t);
     Ok(Ok(exec::REPLY_ADMITTED))
@@ -2266,15 +3075,44 @@ mod tests {
     #[test]
     fn frame_alias_entropy_selects_full_slot_and_fails_closed() {
         for word in [0, 4095, 4096, (1 << 21) - 1, 1 << 21, 1 << 30, u64::MAX] {
-            let va = random_guest_state_alias(|bytes| { *bytes = word.to_ne_bytes(); 0 }).unwrap();
+            let va = random_guest_state_alias(|bytes| {
+                *bytes = word.to_ne_bytes();
+                0
+            })
+            .unwrap();
             assert!(exec::guest_state_alias_valid(va));
-            assert_eq!(va, exec::GUEST_STATE_SLOT.start + (word & ((1 << 39) - 4096)));
+            assert_eq!(
+                va,
+                exec::GUEST_STATE_SLOT.start + (word & ((1 << 39) - 4096))
+            );
         }
-        assert_eq!(random_guest_state_alias(|bytes| { *bytes = u64::MAX.to_ne_bytes(); 0 }).unwrap(), exec::GUEST_STATE_SLOT.end - 4096);
-        assert!(random_guest_state_alias(|bytes| { *bytes = [0xff; 8]; -1 }).is_err());
+        assert_eq!(
+            random_guest_state_alias(|bytes| {
+                *bytes = u64::MAX.to_ne_bytes();
+                0
+            })
+            .unwrap(),
+            exec::GUEST_STATE_SLOT.end - 4096
+        );
+        assert!(
+            random_guest_state_alias(|bytes| {
+                *bytes = [0xff; 8];
+                -1
+            })
+            .is_err()
+        );
         // Reject invalid overrides before loading a resident or allocating memory.
-        for va in [0, exec::GUEST_STATE_SLOT.start + 1, exec::GUEST_STATE_SLOT.end] {
-            assert!(prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va).err().unwrap().starts_with("guest-state alias"));
+        for va in [
+            0,
+            exec::GUEST_STATE_SLOT.start + 1,
+            exec::GUEST_STATE_SLOT.end,
+        ] {
+            assert!(
+                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va)
+                    .err()
+                    .unwrap()
+                    .starts_with("guest-state alias")
+            );
         }
     }
 
@@ -2283,15 +3121,38 @@ mod tests {
         use natemu_abi::execution::{perf::SysFastDecline, system};
         let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
         let ram = unsafe { GuestRam::new(0, 0, memory.0 as u64) };
-        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram };
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
         let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
         let mut c: cache::Control = area.read_record(offset);
         // All old aliases, including the presently unused 0x7f, remain genuine kind slots.
-        for (n, kind) in [system::MASKMOV, system::ROTATE, system::DOUBLE_SHIFT16, 0x7f].into_iter().enumerate() {
+        for (n, kind) in [
+            system::MASKMOV,
+            system::ROTATE,
+            system::DOUBLE_SHIFT16,
+            0x7f,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             c.system_counts[kind as usize] = 10 + n as u64;
         }
         let counts = c.system_counts;
-        for (n, reason) in [SysFastDecline::NotCurrent, SysFastDecline::Boundary, SysFastDecline::Other, SysFastDecline::After].into_iter().enumerate() {
+        for (n, reason) in [
+            SysFastDecline::NotCurrent,
+            SysFastDecline::Boundary,
+            SysFastDecline::Other,
+            SysFastDecline::After,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             for _ in 0..=n {
                 // This is the same increment used by the perf resident's declined() path.
                 c.record_sys_fast_decline(reason);
@@ -2303,8 +3164,20 @@ mod tests {
         area.write_record(offset, c);
         let output = crate::json::parse(&k1_stats(area)).unwrap();
         let systems = output.get("systems").unwrap();
-        assert_eq!(systems.get("kinds"), Some(&crate::json::parse(r#"{"0x7c":[10,0],"0x7d":[11,0],"0x7e":[12,0],"0x7f":[13,0]}"#).unwrap()));
-        assert_eq!(systems.get("declined"), Some(&crate::json::parse(r#"{"not_current":1,"boundary":2,"other":3,"after":4}"#).unwrap()));
+        assert_eq!(
+            systems.get("kinds"),
+            Some(
+                &crate::json::parse(r#"{"0x7c":[10,0],"0x7d":[11,0],"0x7e":[12,0],"0x7f":[13,0]}"#)
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            systems.get("declined"),
+            Some(
+                &crate::json::parse(r#"{"not_current":1,"boundary":2,"other":3,"after":4}"#)
+                    .unwrap()
+            )
+        );
     }
 
     /// Changes every answer `c` keeps (no other reference is held between compiles).
@@ -2316,11 +3189,25 @@ mod tests {
             }
         }
     }
-    fn hit(a: &Answers, bytes: &[u8], rip: u64, limit: Option<u32>, gating: &[u64; GATING]) -> Option<Arc<Entry>> {
+    fn hit(
+        a: &Answers,
+        bytes: &[u8],
+        rip: u64,
+        limit: Option<u32>,
+        gating: &[u64; GATING],
+    ) -> Option<Arc<Entry>> {
         a.find(bytes, rip, limit, gating).0
     }
     fn entry(rip: u64, owner: u8, prefix: &[u8], read: u32, gating: [u64; GATING]) -> Arc<Entry> {
-        Arc::new(Entry { rip, owner, read, gating, prefix: prefix.into(), whole: false, answer: Answer::Object(prefix.into()) })
+        Arc::new(Entry {
+            rip,
+            owner,
+            read,
+            gating,
+            prefix: prefix.into(),
+            whole: false,
+            answer: Answer::Object(prefix.into()),
+        })
     }
 
     /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
@@ -2331,20 +3218,48 @@ mod tests {
         let a = Answers::new(u64::MAX);
         let g = [0; GATING];
         let sse = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        a.insert(None, entry(0x1100, 0, &[1, 2, 3, 4, 5], 0, g), &[1, 2, 3, 4, 5], 0x1100);
-        a.insert(None, entry(0x2100, 1, &[1, 2, 3, 4, 6], 0, g), &[1, 2, 3, 4, 6], 0x2100);
-        a.insert(None, entry(0x3100, 2, &[1, 2, 3, 4, 7], 1, sse), &[1, 2, 3, 4, 7], 0x3100); // read SSE gating 1
-        let owner = |bytes: &[u8], rip, limit, gating: &[u64; GATING]| hit(&a, bytes, rip, limit, gating).map(|e| (e.owner, e.rip));
-        assert_eq!(owner(&[1, 2, 3, 4, 5, 9], 0x9100, None, &g), Some((0, 0x1100)));
+        a.insert(
+            None,
+            entry(0x1100, 0, &[1, 2, 3, 4, 5], 0, g),
+            &[1, 2, 3, 4, 5],
+            0x1100,
+        );
+        a.insert(
+            None,
+            entry(0x2100, 1, &[1, 2, 3, 4, 6], 0, g),
+            &[1, 2, 3, 4, 6],
+            0x2100,
+        );
+        a.insert(
+            None,
+            entry(0x3100, 2, &[1, 2, 3, 4, 7], 1, sse),
+            &[1, 2, 3, 4, 7],
+            0x3100,
+        ); // read SSE gating 1
+        let owner = |bytes: &[u8], rip, limit, gating: &[u64; GATING]| {
+            hit(&a, bytes, rip, limit, gating).map(|e| (e.owner, e.rip))
+        };
+        assert_eq!(
+            owner(&[1, 2, 3, 4, 5, 9], 0x9100, None, &g),
+            Some((0, 0x1100))
+        );
         assert_eq!(owner(&[1, 2, 3, 4, 6], 0x9100, None, &g), Some((1, 0x2100)));
         assert_eq!(owner(&[1, 2, 3, 4, 7], 0x9100, None, &g), None); // other SSE gating
-        assert_eq!(owner(&[1, 2, 3, 4, 7], 0x9100, None, &sse), Some((2, 0x3100)));
+        assert_eq!(
+            owner(&[1, 2, 3, 4, 7], 0x9100, None, &sse),
+            Some((2, 0x3100))
+        );
         assert_eq!(owner(&[1, 2, 3, 4, 8], 0x9100, None, &g), None);
         assert_eq!(owner(&[1, 2, 3, 4, 5], 0x9200, None, &g), None); // another page offset
         assert_eq!(owner(&[1, 2, 3, 4, 5], 1 << 63 | 0x1100, None, &g), None); // the other half
         assert_eq!(owner(&[1, 2, 3, 4, 5], 0x1100, Some(1), &g), None); // another limit
         // A second answer for the same bytes kept for the requested RIP is preferred; a duplicate's insert names the holder.
-        let (held, _) = a.insert(None, entry(0x9100, 3, &[1, 2, 3, 4, 5], 0, g), &[1, 2, 3, 4, 5], 0x9100);
+        let (held, _) = a.insert(
+            None,
+            entry(0x9100, 3, &[1, 2, 3, 4, 5], 0, g),
+            &[1, 2, 3, 4, 5],
+            0x9100,
+        );
         assert_eq!(held, Some(0));
         assert_eq!(owner(&[1, 2, 3, 4, 5], 0x9100, None, &g), Some((3, 0x9100)));
         assert_eq!(owner(&[1, 2, 3, 4, 5], 0x5100, None, &g), Some((0, 0x1100)));
@@ -2356,15 +3271,28 @@ mod tests {
     fn an_answer_evicted_between_lookup_and_use_stays_whole() {
         let a = Answers::new(u64::MAX);
         let g = [0; GATING];
-        a.insert(None, entry(0x1100, 0, &[0xaa; 32], 0, g), &[0xaa; 32], 0x1100);
+        a.insert(
+            None,
+            entry(0x1100, 0, &[0xaa; 32], 0, g),
+            &[0xaa; 32],
+            0x1100,
+        );
         let held = hit(&a, &[0xaa; 32], 0x1100, None, &g).unwrap();
         // Same limit and page offset: the same shard; distinct bytes.
         for i in 0..2 * GENERATION / SHARDS + 1 {
             let b = (i as u64).to_le_bytes();
-            a.insert(None, entry(0x1100 + (i as u64 + 1) * 0x1000, 1, &b, 0, g), &b, 0x1100);
+            a.insert(
+                None,
+                entry(0x1100 + (i as u64 + 1) * 0x1000, 1, &b, 0, g),
+                &b,
+                0x1100,
+            );
         }
         assert!(hit(&a, &[0xaa; 32], 0x1100, None, &g).is_none());
-        assert_eq!((held.rip, held.prefix.as_slice(), Arc::strong_count(&held)), (0x1100, &[0xaa; 32][..], 1));
+        assert_eq!(
+            (held.rip, held.prefix.as_slice(), Arc::strong_count(&held)),
+            (0x1100, &[0xaa; 32][..], 1)
+        );
         assert!(matches!(&held.answer, Answer::Object(o) if o == &[0xaa; 32]));
     }
 
@@ -2393,43 +3321,68 @@ mod tests {
                         let (o, j) = ((t + 1) % 4, i.saturating_sub(8));
                         let ob = bytes(o, j);
                         if let Some(e) = hit(a, &ob, rip(t, j), None, &g) {
-                            assert!(e.matches(&ob, &g) && e.prefix == ob && e.owner == o as u8 && e.rip == rip(o, j));
+                            assert!(
+                                e.matches(&ob, &g)
+                                    && e.prefix == ob
+                                    && e.owner == o as u8
+                                    && e.rip == rip(o, j)
+                            );
                             cross.fetch_add(1, Relaxed);
                             held.get_or_insert(e);
                         }
                     }
                     let e = held.expect("no cross-thread hit");
-                    assert!(e.owner == ((t + 1) % 4) as u8 && matches!(&e.answer, Answer::Object(o) if *o == e.prefix));
+                    assert!(
+                        e.owner == ((t + 1) % 4) as u8
+                            && matches!(&e.answer, Answer::Object(o) if *o == e.prefix)
+                    );
                 });
             }
         });
         let (_, kept) = a.kept();
         // 4n = 12 bounds inserted into one shard: it flipped at least four times and keeps at most two generations.
-        assert!(cross.load(Relaxed) > 0 && kept <= 2 * bound && kept < 4 * n as usize, "{} {kept}", cross.load(Relaxed));
+        assert!(
+            cross.load(Relaxed) > 0 && kept <= 2 * bound && kept < 4 * n as usize,
+            "{} {kept}",
+            cross.load(Relaxed)
+        );
         let k = key(None, rip(0, 0), &[]);
         let one = std::hash::BuildHasher::hash_one(&a.pick, (k.0, k.1)) as usize % SHARDS;
         let s = a.shards[one].lock().unwrap();
         // Since its last flip the shard holds at least a generation's answers (hits only move them to the newer one).
-        assert!(!s.old.is_empty() && s.cached <= bound && kept >= bound, "{} {}", s.old.len(), s.cached);
+        assert!(
+            !s.old.is_empty() && s.cached <= bound && kept >= bound,
+            "{} {}",
+            s.old.len(),
+            s.cached
+        );
     }
 
     /// With `FEXC` set (perf chunk 13): two compilers sharing one map on two threads: the second's request at another RIP is
     /// the first's answer, relocated and admitted at its own RIP (checked against its own compile), counted by source.
     #[test]
     fn compilers_share_answers_across_threads() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let answers = std::sync::OnceLock::new();
         let user = include_bytes!("../tests/relocation/user.src");
         let run = |v: u8, rip: u64| {
             let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
             (c.vcpu, c.check_reuse) = (v, true);
             c.share(&answers);
-            let Code::Block(b) = c.compile(user, rip, false, &mut ()).unwrap() else { panic!("no block") };
+            let Code::Block(b) = c.compile(user, rip, false, &mut ()).unwrap() else {
+                panic!("no block")
+            };
             (b, c.compiles, c.relocated, c.reuse_checks, c.hits_by_source)
         };
         let (a, ..) = std::thread::scope(|s| s.spawn(|| run(0, 0x7f12_3456_7100)).join().unwrap());
-        let (b, compiles, relocated, checks, by) = std::thread::scope(|s| s.spawn(|| run(1, 0x7f12_3456_8100)).join().unwrap());
-        assert_eq!((a.guest_insns, b.guest_insns, compiles, relocated, checks), (4, 4, 0, 1, 1));
+        let (b, compiles, relocated, checks, by) =
+            std::thread::scope(|s| s.spawn(|| run(1, 0x7f12_3456_8100)).join().unwrap());
+        assert_eq!(
+            (a.guest_insns, b.guest_insns, compiles, relocated, checks),
+            (4, 4, 0, 1, 1)
+        );
         assert_eq!(by[0], 1);
         assert!(by[1..].iter().all(|&n| n == 0));
         assert_ne!(a.object, b.object);
@@ -2441,7 +3394,9 @@ mod tests {
     /// so the cached answers are given a spill area (header `spill_bytes`).
     #[test]
     fn spill_areas_retry_then_stop() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         let code = [0x48, 0x01, 0xd8, 0x48, 0x01, 0xd8, 0x48, 0x01, 0xd8, 0xc3]; // add rax, rbx x3; ret
         let spill = |c: &mut super::Compiler| {
@@ -2451,12 +3406,13 @@ mod tests {
                 }
             })
         };
-        let insns = |c: &mut super::Compiler| match c.compile(&code, 0x1000, false, &mut ()).unwrap() {
-            Code::Block(b) => Ok(b.guest_insns),
-            Code::None(reason) => Err(reason),
-            Code::System(s) if s.kind == exec::system::REFUSED => Err("refused".into()),
-            Code::System(_) => panic!("system"),
-        };
+        let insns =
+            |c: &mut super::Compiler| match c.compile(&code, 0x1000, false, &mut ()).unwrap() {
+                Code::Block(b) => Ok(b.guest_insns),
+                Code::None(reason) => Err(reason),
+                Code::System(s) if s.kind == exec::system::REFUSED => Err("refused".into()),
+                Code::System(_) => panic!("system"),
+            };
         assert_eq!(insns(&mut c), Ok(4));
         spill(&mut c);
         assert_eq!(insns(&mut c), Ok(2)); // translated again at 2
@@ -2468,10 +3424,15 @@ mod tests {
     /// With `FEXC` set: a repeated request is answered from the cache, a different RIP, bytes or block limit is compiled.
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         let code = [0x48, 0x01, 0xd8, 0xc3];
-        let object = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false, &mut ()).unwrap() {
+        let object = |c: &mut super::Compiler, code: &[u8], rip| match c
+            .compile(code, rip, false, &mut ())
+            .unwrap()
+        {
             Code::Block(b) => b.object,
             _ => panic!("no block"),
         };
@@ -2480,7 +3441,10 @@ mod tests {
         assert_eq!(object(&mut c, &code, 0x1000), first);
         assert_eq!((c.compiles, c.hits), (1, 1));
         // Perf chunk 4: the same bytes at another RIP of the half and page offset: the answer relocated (no moves here).
-        assert_eq!(object(&mut c, &code, 0x2000)[24..32], 0x2000u64.to_le_bytes());
+        assert_eq!(
+            object(&mut c, &code, 0x2000)[24..32],
+            0x2000u64.to_le_bytes()
+        );
         assert_eq!((c.compiles, c.hits, c.relocated), (1, 2, 1));
         object(&mut c, &[0x48, 0x29, 0xd8, 0xc3], 0x1000);
         c.max_instructions = Some(1);
@@ -2488,21 +3452,41 @@ mod tests {
         assert_eq!((c.compiles, c.hits), (3, 2));
         // A system instruction at the RIP is decoded (and cached with fexc's answer); one later in the block cuts it.
         let mov_cr3 = [0x0f, 0x22, 0xd8, 0x90];
-        let decoded = |c: &mut super::Compiler, rip| match c.compile(&mov_cr3, rip, false, &mut ()).unwrap() {
+        let decoded = |c: &mut super::Compiler, rip| match c
+            .compile(&mov_cr3, rip, false, &mut ())
+            .unwrap()
+        {
             Code::System(s) => Some(s),
             _ => None,
         };
         let s = decoded(&mut c, 0x3000).unwrap();
-        assert_eq!((s.kind, s.cr, s.reg, s.length), (exec::system::MOV_TO_CR, 3, 0, 3));
+        assert_eq!(
+            (s.kind, s.cr, s.reg, s.length),
+            (exec::system::MOV_TO_CR, 3, 0, 3)
+        );
         assert_eq!(decoded(&mut c, 0x3000), Some(s));
         assert_eq!((c.compiles, c.hits), (4, 3));
-        assert!(matches!(c.compile(&[0xf4], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::HLT)); // X2
+        assert!(
+            matches!(c.compile(&[0xf4], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::HLT)
+        ); // X2
         // SYSENTER is decoded since X1c (the resident delivers its fault); this test predates it (it expected no code).
-        assert!(matches!(c.compile(&[0x0f, 0x34], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::SYSENTER));
+        assert!(
+            matches!(c.compile(&[0x0f, 0x34], 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::SYSENTER)
+        );
         // Longer than 15 bytes (fexc series28): #GP(0) through the resident.
-        let long = [&[0x66; 4][..], &[0x4a, 0xc7, 0x84, 0x83, 0, 1, 0, 0, 0, 0, 0, 0]].concat();
-        assert!(matches!(c.compile(&long, 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::TOO_LONG));
-        assert!(matches!(c.compile(&[0x90, 0x0f, 0x22, 0xd8], 0x3000, false, &mut ()).unwrap(), Code::Block(_)));
+        let long = [
+            &[0x66; 4][..],
+            &[0x4a, 0xc7, 0x84, 0x83, 0, 1, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+        assert!(
+            matches!(c.compile(&long, 0x3000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::TOO_LONG)
+        );
+        assert!(matches!(
+            c.compile(&[0x90, 0x0f, 0x22, 0xd8], 0x3000, false, &mut ())
+                .unwrap(),
+            Code::Block(_)
+        ));
         // P3: an answer is kept by what fexc read. Bytes after the block's end (`ret`) and a gating argument its forms do not
         // consult leave the request the same; the bytes of a block that ran to the end of its input, or an SSE form under other
         // SSE gating, do not.
@@ -2518,7 +3502,9 @@ mod tests {
         object(&mut c, &[&code[..3], &[0x90]].concat(), 0x1000);
         assert_eq!((c.compiles, c.hits), (3, 2));
         let movaps = [0x0f, 0x28, 0xc1, 0xc3];
-        assert!(matches!(c.compile(&movaps, 0x2000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::SSE_GATED));
+        assert!(
+            matches!(c.compile(&movaps, 0x2000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::SSE_GATED)
+        );
         c.sse_gated = false;
         object(&mut c, &movaps, 0x2000);
         assert_eq!((c.compiles, c.hits), (5, 2));
@@ -2537,20 +3523,51 @@ mod tests {
     /// field's load in an object admitted as a CPL-3 request's.
     #[test]
     fn cpl0_translates_mov_from_cr2() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         (c.shape, c.cpl0) = (true, true);
-        let compile = |c: &mut super::Compiler, code: &[u8]| c.compile(code, 0x1000, false, &mut ()).unwrap();
-        for code in [&[0x0f, 0x20, 0xd0, 0xc3][..], &[0x41, 0x0f, 0x20, 0xd1, 0xc3], &[0x48, 0x0f, 0x20, 0xd0, 0xc3]] {
-            assert!(matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 2), "{code:02x?}");
+        let compile =
+            |c: &mut super::Compiler, code: &[u8]| c.compile(code, 0x1000, false, &mut ()).unwrap();
+        for code in [
+            &[0x0f, 0x20, 0xd0, 0xc3][..],
+            &[0x41, 0x0f, 0x20, 0xd1, 0xc3],
+            &[0x48, 0x0f, 0x20, 0xd0, 0xc3],
+        ] {
+            assert!(
+                matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 2),
+                "{code:02x?}"
+            );
         }
-        for code in [&[0x44, 0x0f, 0x20, 0xd0, 0xc3][..], &[0x0f, 0x20, 0xd8, 0xc3], &[0x66, 0x0f, 0x20, 0xd0, 0xc3]] {
-            assert!(matches!(compile(&mut c, code), Code::System(_)), "{code:02x?}");
+        for code in [
+            &[0x44, 0x0f, 0x20, 0xd0, 0xc3][..],
+            &[0x0f, 0x20, 0xd8, 0xc3],
+            &[0x66, 0x0f, 0x20, 0xd0, 0xc3],
+        ] {
+            assert!(
+                matches!(compile(&mut c, code), Code::System(_)),
+                "{code:02x?}"
+            );
         }
         let code = [0x0f, 0x20, 0xd0, 0xc3];
-        let Answer::Object(o) = c.answers.find(&code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        let Answer::Object(o) = c
+            .answers
+            .find(&code, 0x1000, None, &c.gating())
+            .0
+            .unwrap()
+            .answer
+            .clone()
+        else {
+            panic!()
+        };
         assert!(admission::admit(&o, 0x1000, &code, u64::MAX, true, true).is_ok());
-        assert!(admission::admit(&o, 0x1000, &code, u64::MAX, false, false).err().unwrap().contains("frame access"));
+        assert!(
+            admission::admit(&o, 0x1000, &code, u64::MAX, false, false)
+                .err()
+                .unwrap()
+                .contains("frame access")
+        );
         c.cpl0 = false;
         assert!(matches!(compile(&mut c, &code), Code::System(_)));
     }
@@ -2559,109 +3576,289 @@ mod tests {
     fn cpl0_translates_verw_inline() {
         // Perf P2: VERW m16 (a REX allowed) after another instruction of a CPL-0 request is translated, its exit to its own RIP a
         // link point; first in its block, the register form, with a legacy prefix, VERR, or at CPL 3 it is the resident's.
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         (c.shape, c.cpl0) = (true, true);
-        let compile = |c: &mut super::Compiler, code: &[u8]| c.compile(code, 0x1000, false, &mut ()).unwrap();
-        for code in [&[0x90, 0x0f, 0x00, 0x28, 0xc3][..], &[0x90, 0x41, 0x0f, 0x00, 0x29, 0xc3], &[0x90, 0x0f, 0x00, 0x2d, 0x10, 0, 0, 0, 0xc3],
-                     &[0x90, 0x42, 0x0f, 0x00, 0x2c, 0x8b, 0xc3], &[0x90, 0x48, 0x0f, 0x00, 0x6e, 0x08, 0xc3]] {
-            assert!(matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 3 && b.links.iter().any(|p| p.target == 0x1001)), "{code:02x?}");
+        let compile =
+            |c: &mut super::Compiler, code: &[u8]| c.compile(code, 0x1000, false, &mut ()).unwrap();
+        for code in [
+            &[0x90, 0x0f, 0x00, 0x28, 0xc3][..],
+            &[0x90, 0x41, 0x0f, 0x00, 0x29, 0xc3],
+            &[0x90, 0x0f, 0x00, 0x2d, 0x10, 0, 0, 0, 0xc3],
+            &[0x90, 0x42, 0x0f, 0x00, 0x2c, 0x8b, 0xc3],
+            &[0x90, 0x48, 0x0f, 0x00, 0x6e, 0x08, 0xc3],
+        ] {
+            assert!(
+                matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 3 && b.links.iter().any(|p| p.target == 0x1001)),
+                "{code:02x?}"
+            );
         }
-        for code in [&[0x90, 0x66, 0x0f, 0x00, 0xe8, 0xc3][..], &[0x90, 0x64, 0x0f, 0x00, 0x28, 0xc3], &[0x90, 0x67, 0x0f, 0x00, 0x28, 0xc3],
-                     &[0x90, 0xf3, 0x0f, 0x00, 0x28, 0xc3], &[0x90, 0x0f, 0x00, 0x20, 0xc3], &[0x90, 0x0f, 0x00, 0xe8, 0xc3], &[0x90, 0x41, 0x0f, 0x00, 0xe9, 0xc3]] {
-            assert!(matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 1), "{code:02x?}");
+        for code in [
+            &[0x90, 0x66, 0x0f, 0x00, 0xe8, 0xc3][..],
+            &[0x90, 0x64, 0x0f, 0x00, 0x28, 0xc3],
+            &[0x90, 0x67, 0x0f, 0x00, 0x28, 0xc3],
+            &[0x90, 0xf3, 0x0f, 0x00, 0x28, 0xc3],
+            &[0x90, 0x0f, 0x00, 0x20, 0xc3],
+            &[0x90, 0x0f, 0x00, 0xe8, 0xc3],
+            &[0x90, 0x41, 0x0f, 0x00, 0xe9, 0xc3],
+        ] {
+            assert!(
+                matches!(compile(&mut c, code), Code::Block(b) if b.guest_insns == 1),
+                "{code:02x?}"
+            );
         }
-        assert!(matches!(compile(&mut c, &[0x0f, 0x00, 0x28, 0xc3]), Code::System(_)));
+        assert!(matches!(
+            compile(&mut c, &[0x0f, 0x00, 0x28, 0xc3]),
+            Code::System(_)
+        ));
         let code = [0x90, 0x0f, 0x00, 0x28, 0xc3];
-        let Answer::Object(o) = c.answers.find(&code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        let Answer::Object(o) = c
+            .answers
+            .find(&code, 0x1000, None, &c.gating())
+            .0
+            .unwrap()
+            .answer
+            .clone()
+        else {
+            panic!()
+        };
         assert!(admission::admit(&o, 0x1000, &code, u64::MAX, true, true).is_ok());
-        assert!(admission::admit(&o, 0x1000, &code, u64::MAX, false, false).err().unwrap().contains("VERW"));
+        assert!(
+            admission::admit(&o, 0x1000, &code, u64::MAX, false, false)
+                .err()
+                .unwrap()
+                .contains("VERW")
+        );
         c.cpl0 = false;
         assert!(matches!(compile(&mut c, &code), Code::Block(b) if b.guest_insns == 1));
     }
 
     #[test]
     fn bulk_rep_stos_only_when_asked() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         c.shape = true;
-        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+        let block = |c: &mut super::Compiler, code: &[u8]| match c
+            .compile(code, 0x1000, false, &mut ())
+            .unwrap()
+        {
             Code::Block(b) => b,
             _ => panic!("{code:02x?}"),
         };
         let stos = [0xf3, 0x48, 0xab];
         c.bulk = true;
-        assert!(block(&mut c, &stos).bulk && block(&mut c, &[0x66, 0xf3, 0xab]).bulk && block(&mut c, &[0xf3, 0xaa]).bulk);
+        assert!(
+            block(&mut c, &stos).bulk
+                && block(&mut c, &[0x66, 0xf3, 0xab]).bulk
+                && block(&mut c, &[0xf3, 0xaa]).bulk
+        );
         // 0x67 (EDI/ECX), MOVS, and other code: no loop.
-        for code in [&[0x67, 0xf3, 0x48, 0xab][..], &[0xf3, 0x48, 0xa5], &[0x48, 0xab, 0xc3], &[0x90, 0xc3]] {
+        for code in [
+            &[0x67, 0xf3, 0x48, 0xab][..],
+            &[0xf3, 0x48, 0xa5],
+            &[0x48, 0xab, 0xc3],
+            &[0x90, 0xc3],
+        ] {
             assert!(!block(&mut c, code).bulk, "{code:02x?}");
         }
-        let Answer::Object(o) = c.answers.find(&stos, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+        let Answer::Object(o) = c
+            .answers
+            .find(&stos, 0x1000, None, &c.gating())
+            .0
+            .unwrap()
+            .answer
+            .clone()
+        else {
+            panic!()
+        };
         c.bulk = false;
         assert!(!block(&mut c, &stos).bulk);
-        let e = c.answered(&Answer::Object(o), &stos, 0x1000, &mut ()).err().unwrap();
+        let e = c
+            .answered(&Answer::Object(o), &stos, 0x1000, &mut ())
+            .err()
+            .unwrap();
         assert!(e.contains("--bulk"), "{e}");
     }
 
     #[test]
     fn cpl0_translates_cli_and_sti_inline() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         (c.shape, c.cpl0) = (true, true);
-        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+        let block = |c: &mut super::Compiler, code: &[u8]| match c
+            .compile(code, 0x1000, false, &mut ())
+            .unwrap()
+        {
             Code::Block(b) => Ok(b),
             Code::System(s) => Err(s.kind),
             Code::None(r) => panic!("{r}"),
         };
         let inline = block(&mut c, &[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3]).unwrap(); // nop; cli; sti; inc rax; ret
         assert_eq!(inline.guest_insns, 5);
-        assert!(inline.links.iter().any(|p| p.target == 0x1002), "the STI's exit to its own RIP");
+        assert!(
+            inline.links.iter().any(|p| p.target == 0x1002),
+            "the STI's exit to its own RIP"
+        );
         assert_eq!(block(&mut c, &[0xfa, 0xc3]).unwrap().guest_insns, 2); // CLI first
-        assert_eq!(block(&mut c, &[0x90, 0xfb, 0xfa, 0xc3]).unwrap().guest_insns, 4); // sti; cli
+        assert_eq!(
+            block(&mut c, &[0x90, 0xfb, 0xfa, 0xc3])
+                .unwrap()
+                .guest_insns,
+            4
+        ); // sti; cli
         // Perf chunk 25: STI first (sti; nop; ret): inline, the block marked, its exit to its own start a link point.
         let first = block(&mut c, &[0xfb, 0x90, 0xc3]).unwrap();
-        assert!(first.guest_insns == 3 && first.sti_first && first.links.iter().any(|p| p.target == 0x1000));
+        assert!(
+            first.guest_insns == 3
+                && first.sti_first
+                && first.links.iter().any(|p| p.target == 0x1000)
+        );
         assert!(!inline.sti_first && !block(&mut c, &[0xfa, 0xc3]).unwrap().sti_first);
         // Admission's PC table starts at guest offset 0: an object whose entries at offset 0 (the block entry and the STI)
         // name the NOP after the STI instead (which would leave the STI unseen and the block unmarked) is refused.
-        let Answer::Object(mut o) = c.answers.find(&[0xfb, 0x90, 0xc3], 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
-        let h: natemu_abi::code_object::Header = unsafe { o.as_ptr().cast::<natemu_abi::code_object::Header>().read_unaligned() };
-        assert!(admission::admit(&o, 0x1000, &[0xfb, 0x90, 0xc3], u64::MAX, true, true).is_ok_and(|a| a.sti_first));
+        let Answer::Object(mut o) = c
+            .answers
+            .find(&[0xfb, 0x90, 0xc3], 0x1000, None, &c.gating())
+            .0
+            .unwrap()
+            .answer
+            .clone()
+        else {
+            panic!()
+        };
+        let h: natemu_abi::code_object::Header = unsafe {
+            o.as_ptr()
+                .cast::<natemu_abi::code_object::Header>()
+                .read_unaligned()
+        };
+        assert!(
+            admission::admit(&o, 0x1000, &[0xfb, 0x90, 0xc3], u64::MAX, true, true)
+                .is_ok_and(|a| a.sti_first)
+        );
         for k in 0..h.pcs_count as usize {
-            let at = h.pcs_offset as usize + k * size_of::<natemu_abi::code_object::PcEntry>() + std::mem::offset_of!(natemu_abi::code_object::PcEntry, guest_offset);
+            let at = h.pcs_offset as usize
+                + k * size_of::<natemu_abi::code_object::PcEntry>()
+                + std::mem::offset_of!(natemu_abi::code_object::PcEntry, guest_offset);
             if o[at..at + 4] == [0; 4] {
                 o[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
             }
         }
-        assert!(admission::admit(&o, 0x1000, &[0xfb, 0x90, 0xc3], u64::MAX, true, true).err().unwrap().contains("PC table"));
-        for kept in [&[0x90, 0xfb, 0xf4][..], &[0x90, 0xfb, 0xf3, 0xaa], &[0x90, 0xfb, 0xf0, 0xf7, 0x18], &[0x90, 0x66, 0xfb, 0x90, 0xc3], &[0x90, 0xfb]] {
+        assert!(
+            admission::admit(&o, 0x1000, &[0xfb, 0x90, 0xc3], u64::MAX, true, true)
+                .err()
+                .unwrap()
+                .contains("PC table")
+        );
+        for kept in [
+            &[0x90, 0xfb, 0xf4][..],
+            &[0x90, 0xfb, 0xf3, 0xaa],
+            &[0x90, 0xfb, 0xf0, 0xf7, 0x18],
+            &[0x90, 0x66, 0xfb, 0x90, 0xc3],
+            &[0x90, 0xfb],
+        ] {
             assert_eq!(block(&mut c, kept).unwrap().guest_insns, 1, "{kept:02x?}"); // sti; hlt / rep stosb / lock neg / 66 sti / last
         }
         // First, but before a system instruction, a self-exit, or alone: still the resident's.
-        for kept in [&[0xfb, 0xf4][..], &[0xfb, 0xf3, 0xaa], &[0xfb, 0xf0, 0xf7, 0x18], &[0xfb]] {
-            assert_eq!(block(&mut c, kept).err(), Some(exec::system::STI), "{kept:02x?}");
+        for kept in [
+            &[0xfb, 0xf4][..],
+            &[0xfb, 0xf3, 0xaa],
+            &[0xfb, 0xf0, 0xf7, 0x18],
+            &[0xfb],
+        ] {
+            assert_eq!(
+                block(&mut c, kept).err(),
+                Some(exec::system::STI),
+                "{kept:02x?}"
+            );
         }
         // RDTSC with `--tsc` (CPL 0, a 24 MHz counter), first or not; with REX, or without the flag, the resident's.
         c.tsc = true;
         assert_eq!(block(&mut c, &[0x0f, 0x31, 0xc3]).unwrap().guest_insns, 2);
-        assert_eq!(block(&mut c, &[0x90, 0x0f, 0x31, 0xfb, 0x90, 0xc3]).unwrap().guest_insns, 5); // rdtsc; sti inline too
-        assert_eq!(block(&mut c, &[0x48, 0x0f, 0x31, 0xc3]).err(), Some(exec::system::RDTSC));
-        let Answer::Object(o) = c.answers.find(&[0x0f, 0x31, 0xc3], 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
-        assert!(admission::admit(&o, 0x1000, &[0x0f, 0x31, 0xc3], u64::MAX, true, false).err().unwrap().contains("RDTSC"));
+        assert_eq!(
+            block(&mut c, &[0x90, 0x0f, 0x31, 0xfb, 0x90, 0xc3])
+                .unwrap()
+                .guest_insns,
+            5
+        ); // rdtsc; sti inline too
+        assert_eq!(
+            block(&mut c, &[0x48, 0x0f, 0x31, 0xc3]).err(),
+            Some(exec::system::RDTSC)
+        );
+        let Answer::Object(o) = c
+            .answers
+            .find(&[0x0f, 0x31, 0xc3], 0x1000, None, &c.gating())
+            .0
+            .unwrap()
+            .answer
+            .clone()
+        else {
+            panic!()
+        };
+        assert!(
+            admission::admit(&o, 0x1000, &[0x0f, 0x31, 0xc3], u64::MAX, true, false)
+                .err()
+                .unwrap()
+                .contains("RDTSC")
+        );
         // A vCPU without FEAT_ECV (feature 22, `ecv`): fexc reads the count by `isb; mrs cntvct_el0`, admitted with the shape.
-        let mut d = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX & !(1 << 22), None);
+        let mut d = super::Compiler::with_features(
+            std::path::Path::new(&fexc),
+            u64::MAX & !(1 << 22),
+            None,
+        );
         (d.shape, d.cpl0, d.tsc) = (true, true, true);
         assert_eq!(block(&mut d, &[0x0f, 0x31, 0xc3]).unwrap().guest_insns, 2);
         c.tsc = false;
-        assert_eq!(block(&mut c, &[0x0f, 0x31, 0xc3]).err(), Some(exec::system::RDTSC));
+        assert_eq!(
+            block(&mut c, &[0x0f, 0x31, 0xc3]).err(),
+            Some(exec::system::RDTSC)
+        );
         c.cpl0 = false;
-        assert_eq!(block(&mut c, &[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3]).unwrap().guest_insns, 1);
+        assert_eq!(
+            block(&mut c, &[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3])
+                .unwrap()
+                .guest_insns,
+            1
+        );
         assert_eq!(block(&mut c, &[0xfa, 0xc3]).err(), Some(exec::system::CLI));
-        assert_eq!(block(&mut c, &[0xfb, 0x90, 0xc3]).err(), Some(exec::system::STI)); // a CPL-3 STI first: never the CPL-0 answer
-        let Answer::Object(o) = c.answers.find(&[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3], 0x1000, None, &{ let mut g = c.gating(); g[8] = 1; g[9] = 0; g }).0.unwrap().answer.clone() else { panic!() };
+        assert_eq!(
+            block(&mut c, &[0xfb, 0x90, 0xc3]).err(),
+            Some(exec::system::STI)
+        ); // a CPL-3 STI first: never the CPL-0 answer
+        let Answer::Object(o) = c
+            .answers
+            .find(
+                &[0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3],
+                0x1000,
+                None,
+                &{
+                    let mut g = c.gating();
+                    g[8] = 1;
+                    g[9] = 0;
+                    g
+                },
+            )
+            .0
+            .unwrap()
+            .answer
+            .clone()
+        else {
+            panic!()
+        };
         let source = [0x90, 0xfa, 0xfb, 0x48, 0xff, 0xc0, 0xc3];
         assert!(admission::admit(&o, 0x1000, &source, u64::MAX, true, true).is_ok());
-        assert!(admission::admit(&o, 0x1000, &source, u64::MAX, false, false).err().unwrap().contains("CLI/STI"));
+        assert!(
+            admission::admit(&o, 0x1000, &source, u64::MAX, false, false)
+                .err()
+                .unwrap()
+                .contains("CLI/STI")
+        );
     }
 
     /// With `FEXC` set (perf chunk 25): STMXCSR m32 and VSTMXCSR m32 are translated (their stores access sites; the MXCSR
@@ -2669,37 +3866,77 @@ mod tests {
     /// stay the resident's, and with a 66/F2/F3 prefix (not STMXCSR) fexc makes no code.
     #[test]
     fn stmxcsr_is_translated() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         c.shape = true;
-        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+        let block = |c: &mut super::Compiler, code: &[u8]| match c
+            .compile(code, 0x1000, false, &mut ())
+            .unwrap()
+        {
             Code::Block(b) => Ok(b),
             Code::System(s) => Err(s.kind),
             Code::None(r) => panic!("{r}"),
         };
         // stmxcsr [rax]; ret / stmxcsr fs:[rbx + 8*rcx + 0x40]; ret / addss xmm0, xmm1; stmxcsr [rsp - 4]; ret / vstmxcsr [rdi]; ret
-        for code in [&[0x0f, 0xae, 0x18, 0xc3][..], &[0x64, 0x0f, 0xae, 0x5c, 0xcb, 0x40, 0xc3], &[0xf3, 0x0f, 0x58, 0xc1, 0x0f, 0xae, 0x5c, 0x24, 0xfc, 0xc3],
-                     &[0xc5, 0xf8, 0xae, 0x1f, 0xc3]] {
+        for code in [
+            &[0x0f, 0xae, 0x18, 0xc3][..],
+            &[0x64, 0x0f, 0xae, 0x5c, 0xcb, 0x40, 0xc3],
+            &[0xf3, 0x0f, 0x58, 0xc1, 0x0f, 0xae, 0x5c, 0x24, 0xfc, 0xc3],
+            &[0xc5, 0xf8, 0xae, 0x1f, 0xc3],
+        ] {
             let b = block(&mut c, code).unwrap();
             assert!(b.guest_insns >= 2, "{code:02x?}");
-            let Answer::Object(o) = c.answers.find(code, 0x1000, None, &c.gating()).0.unwrap().answer.clone() else { panic!() };
+            let Answer::Object(o) = c
+                .answers
+                .find(code, 0x1000, None, &c.gating())
+                .0
+                .unwrap()
+                .answer
+                .clone()
+            else {
+                panic!()
+            };
             for cpl0 in [false, true] {
-                assert!(admission::admit(&o, 0x1000, code, u64::MAX, true, cpl0).is_ok(), "{code:02x?}");
+                assert!(
+                    admission::admit(&o, 0x1000, code, u64::MAX, true, cpl0).is_ok(),
+                    "{code:02x?}"
+                );
             }
         }
         // 66, F3 or F2 before 0f ae /3 m: not STMXCSR (no code: delivered as #UD, the no-stop change's REFUSED), whatever map
         // FEX files it under.
-        for code in [&[0x66, 0x0f, 0xae, 0x18, 0xc3][..], &[0xf3, 0x0f, 0xae, 0x18, 0xc3], &[0xf2, 0x0f, 0xae, 0x18, 0xc3]] {
-            assert!(matches!(c.compile(code, 0x1000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::REFUSED), "{code:02x?}");
+        for code in [
+            &[0x66, 0x0f, 0xae, 0x18, 0xc3][..],
+            &[0xf3, 0x0f, 0xae, 0x18, 0xc3],
+            &[0xf2, 0x0f, 0xae, 0x18, 0xc3],
+        ] {
+            assert!(
+                matches!(c.compile(code, 0x1000, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::REFUSED),
+                "{code:02x?}"
+            );
         }
-        assert_eq!(block(&mut c, &[0x0f, 0xae, 0x10, 0xc3]).err(), Some(exec::system::LDMXCSR));
-        assert_eq!(block(&mut c, &[0xc5, 0xf8, 0xae, 0x17, 0xc3]).err(), Some(exec::system::VLDMXCSR));
+        assert_eq!(
+            block(&mut c, &[0x0f, 0xae, 0x10, 0xc3]).err(),
+            Some(exec::system::LDMXCSR)
+        );
+        assert_eq!(
+            block(&mut c, &[0xc5, 0xf8, 0xae, 0x17, 0xc3]).err(),
+            Some(exec::system::VLDMXCSR)
+        );
         c.sse_gated = true;
-        assert_eq!(block(&mut c, &[0x0f, 0xae, 0x18, 0xc3]).err(), Some(exec::system::SSE_GATED));
+        assert_eq!(
+            block(&mut c, &[0x0f, 0xae, 0x18, 0xc3]).err(),
+            Some(exec::system::SSE_GATED)
+        );
         assert!(block(&mut c, &[0xc5, 0xf8, 0xae, 0x1f, 0xc3]).is_ok());
         c.sse_gated = false;
         c.avx_gated = true;
-        assert_eq!(block(&mut c, &[0xc5, 0xf8, 0xae, 0x1f, 0xc3]).err(), Some(exec::system::AVX_GATED));
+        assert_eq!(
+            block(&mut c, &[0xc5, 0xf8, 0xae, 0x1f, 0xc3]).err(),
+            Some(exec::system::AVX_GATED)
+        );
     }
 
     /// With `FEXC` set (perf chunk 17, fexc patch 0033): at CPL 0 the plain SWAPGS is translated inline, first or not, twice in
@@ -2708,45 +3945,106 @@ mod tests {
     /// field, outside a CPL-0 block.
     #[test]
     fn cpl0_translates_swapgs_inline() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         (c.shape, c.cpl0) = (true, true);
-        let block = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+        let block = |c: &mut super::Compiler, code: &[u8]| match c
+            .compile(code, 0x1000, false, &mut ())
+            .unwrap()
+        {
             Code::Block(b) => Ok(b),
             Code::System(s) => Err(s.kind),
             Code::None(r) => panic!("{r}"),
         };
         // endbr64; swapgs; mov rax, gs:[16]; swapgs; nop dword [rax]; ret (Linux's entry and exit shapes)
-        let linux = [0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x01, 0xf8, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x10, 0, 0, 0, 0x0f, 0x01, 0xf8, 0x0f, 0x1f, 0x00, 0xc3];
+        let linux = [
+            0xf3, 0x0f, 0x1e, 0xfa, 0x0f, 0x01, 0xf8, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x10, 0, 0, 0,
+            0x0f, 0x01, 0xf8, 0x0f, 0x1f, 0x00, 0xc3,
+        ];
         assert_eq!(block(&mut c, &linux).unwrap().guest_insns, 6);
-        assert_eq!(block(&mut c, &[0x0f, 0x01, 0xf8, 0xc3]).unwrap().guest_insns, 2); // first
-        assert_eq!(block(&mut c, &[0x90, 0xfb, 0x0f, 0x01, 0xf8, 0xc3]).unwrap().guest_insns, 4); // sti; swapgs: both inline
-        for kept in [&[0x48, 0x0f, 0x01, 0xf8, 0xc3][..], &[0xf0, 0x0f, 0x01, 0xf8, 0xc3], &[0x66, 0x0f, 0x01, 0xf8, 0xc3]] {
-            assert_eq!(block(&mut c, kept).err(), Some(exec::system::SWAPGS), "{kept:02x?}");
+        assert_eq!(
+            block(&mut c, &[0x0f, 0x01, 0xf8, 0xc3])
+                .unwrap()
+                .guest_insns,
+            2
+        ); // first
+        assert_eq!(
+            block(&mut c, &[0x90, 0xfb, 0x0f, 0x01, 0xf8, 0xc3])
+                .unwrap()
+                .guest_insns,
+            4
+        ); // sti; swapgs: both inline
+        for kept in [
+            &[0x48, 0x0f, 0x01, 0xf8, 0xc3][..],
+            &[0xf0, 0x0f, 0x01, 0xf8, 0xc3],
+            &[0x66, 0x0f, 0x01, 0xf8, 0xc3],
+        ] {
+            assert_eq!(
+                block(&mut c, kept).err(),
+                Some(exec::system::SWAPGS),
+                "{kept:02x?}"
+            );
         }
         c.cpl0 = false;
-        assert_eq!(block(&mut c, &[0x0f, 0x01, 0xf8, 0xc3]).err(), Some(exec::system::SWAPGS));
+        assert_eq!(
+            block(&mut c, &[0x0f, 0x01, 0xf8, 0xc3]).err(),
+            Some(exec::system::SWAPGS)
+        );
         assert_eq!(block(&mut c, &linux).unwrap().guest_insns, 1); // endbr64, cut before the SWAPGS
-        let Answer::Object(o) = c.answers.find(&linux, 0x1000, None, &{ let mut g = c.gating(); g[8] = 1; g }).0.unwrap().answer.clone() else { panic!() };
+        let Answer::Object(o) = c
+            .answers
+            .find(&linux, 0x1000, None, &{
+                let mut g = c.gating();
+                g[8] = 1;
+                g
+            })
+            .0
+            .unwrap()
+            .answer
+            .clone()
+        else {
+            panic!()
+        };
         assert!(admission::admit(&o, 0x1000, &linux, u64::MAX, true, true).is_ok());
-        assert!(admission::admit(&o, 0x1000, &linux, u64::MAX, false, false).err().unwrap().contains("SWAPGS"));
+        assert!(
+            admission::admit(&o, 0x1000, &linux, u64::MAX, false, false)
+                .err()
+                .unwrap()
+                .contains("SWAPGS")
+        );
     }
 
     /// With `FEXC` set (perf chunk 4): answers are reused at other RIPs of the same half and page offset, under the reuse
     /// check (each also compiled and compared); the relocator's refusals are compiled, the reverse canonical case included.
     #[test]
     fn answers_are_reused_across_addresses() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         c.check_reuse = true;
-        let block = |c: &mut super::Compiler, code: &[u8], rip| match c.compile(code, rip, false, &mut ()).unwrap() {
+        let block = |c: &mut super::Compiler, code: &[u8], rip| match c
+            .compile(code, rip, false, &mut ())
+            .unwrap()
+        {
             Code::Block(b) => b,
             _ => panic!("no block"),
         };
         let user = include_bytes!("../tests/relocation/user.src");
         let a = block(&mut c, user, 0x7f12_3456_7100);
         let b = block(&mut c, user, 0x7f12_3456_8100);
-        assert_eq!((a.guest_insns, b.guest_insns, c.compiles, c.relocated, c.reuse_checks), (4, 4, 1, 1, 1)); // the check's compile is not counted
+        assert_eq!(
+            (
+                a.guest_insns,
+                b.guest_insns,
+                c.compiles,
+                c.relocated,
+                c.reuse_checks
+            ),
+            (4, 4, 1, 1, 1)
+        ); // the check's compile is not counted
         assert_ne!(a.object, b.object); // other RIP values
         block(&mut c, user, 0x7f12_0000_0100); // move length: refused, compiled
         assert_eq!((c.compiles, c.relocated, c.relocation_refused), (2, 1, 1));
@@ -2758,7 +4056,9 @@ mod tests {
         // A system instruction (no code from fexc, decided from the bytes): reused, decoded at the new RIP.
         let mov_cr3 = [0x0f, 0x22, 0xd8, 0x90];
         for rip in [0x7f00_0000_3000, 0x7f00_1234_5000] {
-            assert!(matches!(c.compile(&mov_cr3, rip, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::MOV_TO_CR));
+            assert!(
+                matches!(c.compile(&mov_cr3, rip, false, &mut ()).unwrap(), Code::System(s) if s.kind == exec::system::MOV_TO_CR)
+            );
         }
         assert_eq!((c.compiles, c.relocated, c.reuse_checks), (5, 2, 2));
     }
@@ -2768,24 +4068,38 @@ mod tests {
     /// error; without it admission refuses the relocated object and the request is compiled (a counted fallback).
     #[test]
     fn reuse_check_catches_a_tampered_relocation() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let user = include_bytes!("../tests/relocation/user.src");
         for check in [true, false] {
             let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
             c.check_reuse = check;
-            assert!(matches!(c.compile(user, 0x7f12_3456_7100, false, &mut ()), Ok(Code::Block(_))));
+            assert!(matches!(
+                c.compile(user, 0x7f12_3456_7100, false, &mut ()),
+                Ok(Code::Block(_))
+            ));
             edit(&mut c, |e| {
                 if let Answer::Object(o) = &mut e.answer {
-                    let word = |o: &[u8], at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize;
+                    let word = |o: &[u8], at: usize| {
+                        u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize
+                    };
                     let (at, n) = (word(o, 80), word(o, 84));
-                    let literal = (0..n).map(|i| at + 16 * i).find(|&r| o[r + 4] == natemu_abi::code_object::RELOC_GUEST_RIP_LITERAL).unwrap();
+                    let literal = (0..n)
+                        .map(|i| at + 16 * i)
+                        .find(|&r| o[r + 4] == natemu_abi::code_object::RELOC_GUEST_RIP_LITERAL)
+                        .unwrap();
                     let v = u64::from_le_bytes(o[literal + 8..literal + 16].try_into().unwrap());
                     o[literal + 8..literal + 16].copy_from_slice(&(v + 0x10).to_le_bytes());
                 }
             });
             let r = c.compile(user, 0x7f12_3456_8100, false, &mut ());
             if check {
-                assert!(r.as_ref().is_err_and(|e| e.contains("reuse check")), "{:?}", r.err());
+                assert!(
+                    r.as_ref().is_err_and(|e| e.contains("reuse check")),
+                    "{:?}",
+                    r.err()
+                );
             } else {
                 assert!(matches!(r, Ok(Code::Block(_))));
                 assert_eq!((c.compiles, c.relocated, c.relocation_fallbacks), (2, 0, 1));
@@ -2798,12 +4112,25 @@ mod tests {
     /// never staged.
     #[test]
     fn persistent_cache_answers_and_forgeries_are_refused() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
-        let (fexc, dir) = (std::path::PathBuf::from(fexc), std::env::temp_dir().join(format!("natemu-pc-{}", std::process::id())));
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let (fexc, dir) = (
+            std::path::PathBuf::from(fexc),
+            std::env::temp_dir().join(format!("natemu-pc-{}", std::process::id())),
+        );
         let _ = std::fs::remove_dir_all(&dir);
-        let open = |d: &str| Some(std::sync::Arc::new(crate::compile_cache::DiskCache::open(&dir.join(d), &fexc, 1 << 30).unwrap()));
+        let open = |d: &str| {
+            Some(std::sync::Arc::new(
+                crate::compile_cache::DiskCache::open(&dir.join(d), &fexc, 1 << 30).unwrap(),
+            ))
+        };
         let code = [0x48, 0x01, 0xd8, 0xc3];
-        let new = |disk| super::Compiler { disk, cpl3: true, ..super::Compiler::with_features(&fexc, u64::MAX, None) };
+        let new = |disk| super::Compiler {
+            disk,
+            cpl3: true,
+            ..super::Compiler::with_features(&fexc, u64::MAX, None)
+        };
         let block = |c: &mut super::Compiler| match c.compile(&code, 0x5000, false, &mut ()) {
             Ok(Code::Block(b)) => Ok(b.object),
             Ok(_) => Err("no block".to_string()),
@@ -2814,16 +4141,25 @@ mod tests {
         let body = c.disk_body(&code, 0x5000, None);
         drop(c); // writes the pack
         let mut c = new(open("good"));
-        assert_eq!((block(&mut c).unwrap(), c.compiles, c.disk_hits), (first, 0, 1));
+        assert_eq!(
+            (block(&mut c).unwrap(), c.compiles, c.disk_hits),
+            (first, 0, 1)
+        );
         // Perf chunk 4: kept on disk with the RIP it was compiled at, used at another of its half and page offset.
         let mut moved = new(open("good"));
-        assert!(matches!(moved.compile(&code, 0x9000, false, &mut ()), Ok(Code::Block(b)) if b.object[24..32] == 0x9000u64.to_le_bytes()));
-        assert_eq!((moved.compiles, moved.disk_hits, moved.relocated), (0, 1, 1));
+        assert!(
+            matches!(moved.compile(&code, 0x9000, false, &mut ()), Ok(Code::Block(b)) if b.object[24..32] == 0x9000u64.to_le_bytes())
+        );
+        assert_eq!(
+            (moved.compiles, moved.disk_hits, moved.relocated),
+            (0, 1, 1)
+        );
         let disk = c.disk.clone().unwrap();
         let stored = disk.get(&disk.key(&body)).unwrap();
         assert_eq!(stored[..8], 0x5000u64.to_le_bytes()); // the RIP it was compiled at
         let mut reply = super::Reply::from_payload(&stored[8..]).unwrap();
-        let word = |o: &[u8], at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize;
+        let word =
+            |o: &[u8], at: usize| u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize;
         let at = word(&reply.object, 40) + word(&reply.object, 48);
         reply.object[at..at + 4].copy_from_slice(&0xd61f_0380u32.to_le_bytes()); // br x28
         let forged = open("forged").unwrap();
@@ -2839,13 +4175,22 @@ mod tests {
     /// fexc even when a CPL-3 request stored the same answer); a CPL-3 one is stored and answered from the cache.
     #[test]
     fn persistent_cache_serves_cpl3_requests_only() {
-        let empty = format!("struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<II', m, 68, 20, {})", Channel::MAGIC);
+        let empty = format!(
+            "struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<II', m, 68, 20, {})",
+            Channel::MAGIC
+        );
         let fexc = fake_server("cpl3", &empty);
         let dir = std::env::temp_dir().join(format!("natemu-cpl3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let ask = |cpl3| {
-            let disk = Some(std::sync::Arc::new(crate::compile_cache::DiskCache::open(&dir, &fexc, 1 << 30).unwrap()));
-            let mut c = super::Compiler { disk, cpl3, ..super::Compiler::with_features(&fexc, u64::MAX, None) };
+            let disk = Some(std::sync::Arc::new(
+                crate::compile_cache::DiskCache::open(&dir, &fexc, 1 << 30).unwrap(),
+            ));
+            let mut c = super::Compiler {
+                disk,
+                cpl3,
+                ..super::Compiler::with_features(&fexc, u64::MAX, None)
+            };
             c.ask(&[0x90], 0x1000, None, true, &mut ()).unwrap();
             (c.compiles, c.disk_hits) // dropped: the cache writes what it was given
         };
@@ -2860,10 +4205,16 @@ mod tests {
     /// started one has none.
     #[test]
     fn finishing_reaps_the_server_with_its_cpu_time() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
         assert_eq!(c.finish(), None);
-        assert!(matches!(c.compile(&[0x48, 0x01, 0xd8, 0xc3], 0x1000, false, &mut ()).unwrap(), Code::Block(_)));
+        assert!(matches!(
+            c.compile(&[0x48, 0x01, 0xd8, 0xc3], 0x1000, false, &mut ())
+                .unwrap(),
+            Code::Block(_)
+        ));
         let (user, system, rss) = c.finish().unwrap();
         assert!(user + system > 0 && rss > 0, "{user} {system} {rss}");
         assert!(c.server.as_ref().unwrap().reaped);
@@ -2874,7 +4225,8 @@ mod tests {
     /// request number) and request 2 and later with a well-formed empty reply. It exits once orphaned, so a test process that
     /// dies (a negative control's crash) leaves no stand-in behind.
     fn fake_server(name: &str, reply: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("natemu-fake-fexc-{name}-{}.py", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("natemu-fake-fexc-{name}-{}.py", std::process::id()));
         let script = format!(
             "#!/usr/bin/python3\nimport mmap, os, signal, struct, sys, time\nassert sys.argv[1:3] == ['--serve', '--channel'] and len(sys.argv) == 4, sys.argv\n\
              m = mmap.mmap(int(sys.argv[3]), {bytes})\nREP = {rep}\nassert struct.unpack_from('<I', m, 8)[0] == {magic}\n\
@@ -2885,28 +4237,41 @@ mod tests {
             bytes = Channel::BYTES,
             rep = Channel::REPLY,
             magic = Channel::MAGIC,
-            reply = reply.lines().map(|l| format!("        {l}\n")).collect::<String>()
+            reply = reply
+                .lines()
+                .map(|l| format!("        {l}\n"))
+                .collect::<String>()
         );
         std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         path
     }
 
     #[test]
     fn channel_posted_observer_leaves_reply_unconsumed_on_error() {
-        let path = fake_server("posted-observer", "struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<I', m, 68, 20)");
+        let path = fake_server(
+            "posted-observer",
+            "struct.pack_into('<IIIIII', m, REP, 1, 0, 0, 0, 0, 0); struct.pack_into('<I', m, 68, 20)",
+        );
         let mut server = Server::start(&path).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut called = 0;
-        let error = server.request_with_posted(&[0; 4], deadline, || {
-            called += 1;
-            Err(std::io::Error::other("observer stopped"))
-        }).err().unwrap();
+        let error = server
+            .request_with_posted(&[0; 4], deadline, || {
+                called += 1;
+                Err(std::io::Error::other("observer stopped"))
+            })
+            .err()
+            .unwrap();
         assert_eq!(error.to_string(), "observer stopped");
         assert_eq!(called, 1);
         // The observer ran after posting, and its failure did not consume or replace the response.
         let stdout = &mut server.stdout;
-        let reply = server.channel.reply(deadline, || Server::alive(stdout)).unwrap();
+        let reply = server
+            .channel
+            .reply(deadline, || Server::alive(stdout))
+            .unwrap();
         assert_eq!(reply.len(), 20);
         assert_eq!(u32::from_le_bytes(reply[..4].try_into().unwrap()), 1);
         assert!(server.finish().is_some());
@@ -2930,12 +4295,20 @@ mod tests {
         for (name, reply, want) in cases {
             let path = fake_server(name, &reply);
             let mut server = Server::start(&path).unwrap();
-            let e = server.request(b"\0\0\0\0", Instant::now() + Duration::from_secs(10)).err().unwrap();
+            let e = server
+                .request(b"\0\0\0\0", Instant::now() + Duration::from_secs(10))
+                .err()
+                .unwrap();
             assert!(e.to_string().contains(want), "{name}: {e}");
             if name != "stdout" {
-                let r = server.request(b"\0\0\0\0", Instant::now() + Duration::from_secs(10)).unwrap();
+                let r = server
+                    .request(b"\0\0\0\0", Instant::now() + Duration::from_secs(10))
+                    .unwrap();
                 assert_eq!((r.code, r.json.len(), r.object.len()), (1, 0, 0), "{name}");
-                assert!(server.finish().is_some(), "{name}: the empty request ends it");
+                assert!(
+                    server.finish().is_some(),
+                    "{name}: the empty request ends it"
+                );
             }
             std::fs::remove_file(path).unwrap();
         }
@@ -2947,10 +4320,20 @@ mod tests {
         let mut c = Channel::new().unwrap();
         assert_eq!(c.word(8).load(Relaxed), Channel::MAGIC);
         for len in [0, Channel::REQUEST_CAP + 1] {
-            assert!(c.post(&vec![7; len]).err().unwrap().to_string().contains("does not fit"), "{len}");
+            assert!(
+                c.post(&vec![7; len])
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("does not fit"),
+                "{len}"
+            );
         }
         c.post(&vec![7; Channel::REQUEST_CAP]).unwrap();
-        assert_eq!((c.word(0).load(Relaxed), c.word(4).load(Relaxed) as usize), (2, Channel::REQUEST_CAP));
+        assert_eq!(
+            (c.word(0).load(Relaxed), c.word(4).load(Relaxed) as usize),
+            (2, Channel::REQUEST_CAP)
+        );
     }
 
     /// Perf chunk 21: both wakes, with the real server. A server asleep (idle past its 20 us spin; its own sleeps end every
@@ -2959,7 +4342,9 @@ mod tests {
     /// A request of the whole request area reaches the server (an error reply: no arguments).
     #[test]
     fn channel_wakes_both_sides() {
-        let Some(fexc) = std::env::var_os("FEXC") else { return };
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
         let c = super::Compiler::with_features(Path::new(&fexc), u64::MAX, None);
         let body = c.body(&[0x48, 0x01, 0xd8, 0xc3], 0x1000, None);
         let deadline = || Instant::now() + Duration::from_secs(10);
@@ -2969,7 +4354,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
             let t = Instant::now();
             assert_eq!(server.request(&body, deadline()).unwrap().code, 0);
-            assert!(t.elapsed() < Duration::from_millis(10), "a sleeping server answered in {:?}", t.elapsed());
+            assert!(
+                t.elapsed() < Duration::from_millis(10),
+                "a sleeping server answered in {:?}",
+                t.elapsed()
+            );
         }
         let mut whole = vec![0; Channel::REQUEST_CAP];
         whole[..4].copy_from_slice(&0u32.to_le_bytes());
@@ -2984,7 +4373,10 @@ mod tests {
             })
             .collect();
         took.sort();
-        assert!(took[5] < Duration::from_micros(2500), "a sleeping host had its replies in {took:?}");
+        assert!(
+            took[5] < Duration::from_micros(2500),
+            "a sleeping host had its replies in {took:?}"
+        );
     }
 
     /// Perf chunk 21: a server that dies holding a request fails it promptly (stdout's EOF, seen within a slice), well
@@ -2994,7 +4386,10 @@ mod tests {
         let path = fake_server("killed", "os.kill(os.getpid(), signal.SIGKILL)");
         let mut server = Server::start(&path).unwrap();
         let t = Instant::now();
-        let e = server.request(b"\0\0\0\0", t + Duration::from_secs(30)).err().unwrap();
+        let e = server
+            .request(b"\0\0\0\0", t + Duration::from_secs(30))
+            .err()
+            .unwrap();
         assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof, "{e}");
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         assert!(server.failed(e).contains("signal: 9"));
@@ -3002,9 +4397,16 @@ mod tests {
         let path = fake_server("hung", "while os.getppid() != 1: time.sleep(0.05)");
         let mut server = Server::start(&path).unwrap();
         let t = Instant::now();
-        let e = server.request(b"\0\0\0\0", t + Duration::from_millis(300)).err().unwrap();
+        let e = server
+            .request(b"\0\0\0\0", t + Duration::from_millis(300))
+            .err()
+            .unwrap();
         assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
-        assert!((Duration::from_millis(300)..Duration::from_secs(2)).contains(&t.elapsed()), "{:?}", t.elapsed());
+        assert!(
+            (Duration::from_millis(300)..Duration::from_secs(2)).contains(&t.elapsed()),
+            "{:?}",
+            t.elapsed()
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3016,15 +4418,26 @@ mod tests {
     #[ignore]
     fn channel_replay_matches_the_pipe() {
         use std::io::Write;
-        let (Some(stream), Some(old), Some(new)) = (std::env::var_os("NATEMU_REPLAY"), std::env::var_os("NATEMU_REPLAY_OLD"), std::env::var_os("FEXC")) else {
+        let (Some(stream), Some(old), Some(new)) = (
+            std::env::var_os("NATEMU_REPLAY"),
+            std::env::var_os("NATEMU_REPLAY_OLD"),
+            std::env::var_os("FEXC"),
+        ) else {
             panic!("NATEMU_REPLAY, NATEMU_REPLAY_OLD and FEXC")
         };
         let extra = std::env::var("NATEMU_REPLAY_ARGS").unwrap_or_default();
         let extra: Vec<&str> = extra.split_whitespace().collect();
-        let mut pipe = Command::new(old).arg("--serve").args(&extra).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut pipe = Command::new(old)
+            .arg("--serve")
+            .args(&extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
         let (mut to, mut from) = (pipe.stdin.take().unwrap(), pipe.stdout.take().unwrap());
         let mut server = Server::spawn(Path::new(&new), &extra).unwrap();
-        let mut input = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(stream).unwrap());
+        let mut input =
+            std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(stream).unwrap());
         let (mut n, mut differ, mut word) = (0u64, 0u64, [0u8; 4]);
         while input.read_exact(&mut word).is_ok() {
             let mut body = vec![0; u32::from_le_bytes(word) as usize];
@@ -3034,13 +4447,30 @@ mod tests {
             from.read_exact(&mut word).unwrap();
             let mut want = vec![0; u32::from_le_bytes(word) as usize];
             from.read_exact(&mut want).unwrap();
-            let r = server.request(&body, Instant::now() + COMPILE_DEADLINE).unwrap();
-            let got: Vec<u8> = [r.code as u32, r.json.len() as u32, r.object.len() as u32, r.extent, r.read].iter().flat_map(|w| w.to_le_bytes()).chain(r.json).chain(r.object).collect();
+            let r = server
+                .request(&body, Instant::now() + COMPILE_DEADLINE)
+                .unwrap();
+            let got: Vec<u8> = [
+                r.code as u32,
+                r.json.len() as u32,
+                r.object.len() as u32,
+                r.extent,
+                r.read,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .chain(r.json)
+            .chain(r.object)
+            .collect();
             n += 1;
             if got != want {
                 differ += 1;
                 if differ <= 10 {
-                    eprintln!("request {n}: pipe {:02x?} channel {:02x?}", &want[..20.min(want.len())], &got[..20]);
+                    eprintln!(
+                        "request {n}: pipe {:02x?} channel {:02x?}",
+                        &want[..20.min(want.len())],
+                        &got[..20]
+                    );
                 }
             }
         }
@@ -3053,13 +4483,17 @@ mod tests {
     #[test]
     fn configured_capacity_limits() {
         for n in [0, cache::MAX_VCPUS + 1] {
-            let e = super::prepare("/nonexistent", cache::CODE_BYTES, n, 4 << 20).err().unwrap();
+            let e = super::prepare("/nonexistent", cache::CODE_BYTES, n, 4 << 20)
+                .err()
+                .unwrap();
             assert!(e.contains(&format!("{n} vCPUs")), "{e}");
         }
         assert_eq!(cache::MAX_VCPUS, 64);
         // M1: guest RAM is a nonzero 2 MiB multiple up to 3 GiB.
         for ram in [0, 3 << 20, exec::MAX_GUEST_RAM_BYTES + (2 << 20)] {
-            let e = super::prepare("/nonexistent", cache::CODE_BYTES, 1, ram).err().unwrap();
+            let e = super::prepare("/nonexistent", cache::CODE_BYTES, 1, ram)
+                .err()
+                .unwrap();
             assert!(e.contains("guest RAM"), "{e}");
         }
     }
@@ -3070,21 +4504,74 @@ mod tests {
     #[test]
     fn fetched_bytes_follow_the_resident_walk() {
         let memory = Memory::with_size(exec::BACKING_BYTES + (2 << 20)).unwrap();
-        let ram = unsafe { GuestRam::new(0, 2 << 20, memory.0 as u64 + exec::BACKING_BYTES as u64) };
+        let ram =
+            unsafe { GuestRam::new(0, 2 << 20, memory.0 as u64 + exec::BACKING_BYTES as u64) };
         assert!(ram.copy_in(0x5ff0, &[0xaa; 16]) && ram.copy_in(0x9000, &[0xbb; 16]));
-        let area = Area { memory: &memory, vcpu: 0, vcpus: 1, epoch: 0, base: 0, ram };
-        let mut s = State::new(0, Cpu { gpr: [0; 16], rip: 0x1ff0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0, dr: exec::DR_RESET, seg: exec::flat_segments(3), ldtr: exec::LDTR_RESET, tr: exec::TR_RESET, gdtr: exec::TABLE_RESET, idtr: exec::TABLE_RESET, mov_ss: 0, xmm: [[0; 2]; 16], mxcsr: exec::MXCSR_RESET, fcw: exec::FCW_INIT, xcr0: 1 });
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
+        let mut s = State::new(
+            0,
+            Cpu {
+                gpr: [0; 16],
+                rip: 0x1ff0,
+                rflags: 2,
+                cr0: 0,
+                cr3: 0,
+                cr4: 0,
+                efer: 0,
+                cpl: 3,
+                fs_base: 0,
+                gs_base: 0,
+                cr2: 0,
+                cr8: 0,
+                dr: exec::DR_RESET,
+                seg: exec::flat_segments(3),
+                ldtr: exec::LDTR_RESET,
+                tr: exec::TR_RESET,
+                gdtr: exec::TABLE_RESET,
+                idtr: exec::TABLE_RESET,
+                mov_ss: 0,
+                xmm: [[0; 2]; 16],
+                mxcsr: exec::MXCSR_RESET,
+                fcw: exec::FCW_INIT,
+                xcr0: 1,
+            },
+        );
         s.fetch = [0x5000, u64::MAX];
         let f = fetched(area, &s, None).unwrap().unwrap();
-        assert_eq!((f.bytes, f.more, f.next_fault), (vec![0xaa; 16], true, None));
+        assert_eq!(
+            (f.bytes, f.more, f.next_fault),
+            (vec![0xaa; 16], true, None)
+        );
         let f = fetched(area, &s, Some(0x1ff8)).unwrap().unwrap();
         assert_eq!((f.bytes.len(), f.more), (8, false));
-        s.fetch_fault = exec::fetch::encode(Fault::Page { address: 0x2000, error: 0x15 });
+        s.fetch_fault = exec::fetch::encode(Fault::Page {
+            address: 0x2000,
+            error: 0x15,
+        });
         let f = fetched(area, &s, None).unwrap().unwrap();
-        assert_eq!((f.more, f.next_fault), (false, Some(Fault::Page { address: 0x2000, error: 0x15 })));
+        assert_eq!(
+            (f.more, f.next_fault),
+            (
+                false,
+                Some(Fault::Page {
+                    address: 0x2000,
+                    error: 0x15
+                })
+            )
+        );
         (s.fetch, s.fetch_fault) = ([0x5000, 0x9000], [exec::fetch::NONE; 3]);
         let f = fetched(area, &s, Some(0x2004)).unwrap().unwrap();
-        assert_eq!((&f.bytes[14..], f.more), (&[0xaa, 0xaa, 0xbb, 0xbb, 0xbb, 0xbb][..], false));
+        assert_eq!(
+            (&f.bytes[14..], f.more),
+            (&[0xaa, 0xaa, 0xbb, 0xbb, 0xbb, 0xbb][..], false)
+        );
         // A limit exactly at the next page's first byte: nothing of that page, walked or not, and it is not asked for.
         let f = fetched(area, &s, Some(0x2000)).unwrap().unwrap();
         assert_eq!((f.bytes, f.more, f.cut), (vec![0xaa; 16], false, true));
@@ -3095,13 +4582,19 @@ mod tests {
         let f = fetched(area, &s, Some(0x2001)).unwrap().unwrap();
         assert_eq!((f.bytes.len(), f.more, f.cut), (16, true, false));
         (s.fetch, s.fetch_fault) = ([u64::MAX; 2], exec::fetch::encode(Fault::Noncanonical));
-        assert!(matches!(fetched(area, &s, None), Ok(Err(Stop::FetchFault(Fault::Noncanonical)))));
+        assert!(matches!(
+            fetched(area, &s, None),
+            Ok(Err(Stop::FetchFault(Fault::Noncanonical)))
+        ));
         // The word copy (perf chunk 7) equals the byte copy at every alignment and length around a word, and refuses past RAM.
         let pattern: Vec<u8> = (0..64).map(|i| i as u8 ^ 0x5a).collect();
         assert!(ram.copy_in(0x7000, &pattern));
         for (at, n) in (0..9).flat_map(|a| (0..26).map(move |n| (a, n))) {
             let (mut words, mut bytes) = (vec![1], vec![0; n]);
-            assert!(copy_out(&ram, 0x7000 + at, n as u64, &mut words) && ram.copy_out(0x7000 + at, &mut bytes));
+            assert!(
+                copy_out(&ram, 0x7000 + at, n as u64, &mut words)
+                    && ram.copy_out(0x7000 + at, &mut bytes)
+            );
             assert_eq!(words[1..], bytes[..]);
         }
         assert!(!copy_out(&ram, (2 << 20) - 4, 8, &mut vec![]));
@@ -3111,7 +4604,10 @@ mod tests {
     fn host_writes_to_guest_ram_flush_every_vcpu() {
         let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
         guest_ram_written(&memory);
-        assert!((0..cache::MAX_VCPUS).all(|v| record_word(&memory, v, None).load(SeqCst) & cache::FLUSH != 0));
+        assert!(
+            (0..cache::MAX_VCPUS)
+                .all(|v| record_word(&memory, v, None).load(SeqCst) & cache::FLUSH != 0)
+        );
     }
 
     #[test]
@@ -3122,6 +4618,9 @@ mod tests {
         assert_eq!(super::end_reason(&crate::json::parse("{}").unwrap()), None);
         let cut = r#"{"guest":{"end":{"rip":"0x10","reason":"system_instruction","detail":"x","cut_opcode_map":1,"cut_opcode":34}}}"#;
         let cut = crate::json::parse(cut).unwrap();
-        assert_eq!((super::system_cut(&cut, 0x10), super::system_cut(&cut, 0x11)), (Some((1, 0x22)), None));
+        assert_eq!(
+            (super::system_cut(&cut, 0x10), super::system_cut(&cut, 0x11)),
+            (Some((1, 0x22)), None)
+        );
     }
 }

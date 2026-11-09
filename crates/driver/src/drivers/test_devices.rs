@@ -29,7 +29,15 @@ impl TestDevice {
     pub(crate) const REFUSE: u64 = 0xff8;
     const LOG: usize = 4096;
     pub fn new() -> Self {
-        Self { bytes: [0; 4096], counter: 0, sequence: [0; MAX_VCPUS], reads: [0; MAX_VCPUS], writes: [0; MAX_VCPUS], order_errors: 0, log: vec![] }
+        Self {
+            bytes: [0; 4096],
+            counter: 0,
+            sequence: [0; MAX_VCPUS],
+            reads: [0; MAX_VCPUS],
+            writes: [0; MAX_VCPUS],
+            order_errors: 0,
+            log: vec![],
+        }
     }
     fn register(offset: u64, size: u64) -> Option<u64> {
         let reg = offset & !7;
@@ -54,7 +62,9 @@ impl Device for TestDevice {
                 (self.counter - 1) >> shift
             }
             Some(_) => self.sequence[vcpu] >> shift,
-            None => (0..size).rev().fold(0, |v, i| v << 8 | u64::from(self.bytes[(offset + i) as usize])),
+            None => (0..size).rev().fold(0, |v, i| {
+                v << 8 | u64::from(self.bytes[(offset + i) as usize])
+            }),
         } & mask(size);
         self.logged([vcpu as u64, offset, size, 0, value]);
         Some(value)
@@ -105,11 +115,17 @@ impl TestSource {
             let mut pending = Vec::new();
             loop {
                 // The earliest due job, or wait for one.
-                pending.sort_by_key(|j: &(std::time::Instant, usize, bool, Busy)| std::cmp::Reverse(j.0));
-                let timeout = pending.last().map(|j| j.0.saturating_duration_since(std::time::Instant::now()));
+                pending.sort_by_key(|j: &(std::time::Instant, usize, bool, Busy)| {
+                    std::cmp::Reverse(j.0)
+                });
+                let timeout = pending
+                    .last()
+                    .map(|j| j.0.saturating_duration_since(std::time::Instant::now()));
                 let next = match timeout {
                     Some(t) => queue.recv_timeout(t),
-                    None => queue.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+                    None => queue
+                        .recv()
+                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
                 };
                 match next {
                     Ok(job) => pending.push(job),
@@ -129,7 +145,13 @@ impl TestSource {
                 }
             }
         });
-        Self { jobs: Some(jobs), fired, worker: Some(worker), irqs: irqs.clone(), veto: true }
+        Self {
+            jobs: Some(jobs),
+            fired,
+            worker: Some(worker),
+            irqs: irqs.clone(),
+            veto: true,
+        }
     }
 }
 /// The test source's job for the NMI input.
@@ -144,15 +166,31 @@ impl Drop for TestSource {
 }
 impl Device for TestSource {
     fn read(&mut self, _vcpu: usize, offset: u64, _size: u64) -> Option<u64> {
-        Some(if offset == 0 { self.fired.load(SeqCst) as u64 } else { 0 })
+        Some(if offset == 0 {
+            self.fired.load(SeqCst) as u64
+        } else {
+            0
+        })
     }
     fn write(&mut self, _vcpu: usize, offset: u64, _size: u64, value: u64) -> bool {
-        let line = if value & 0x200 != 0 { NMI_LINE } else { (value & 0xff) as usize };
+        let line = if value & 0x200 != 0 {
+            NMI_LINE
+        } else {
+            (value & 0xff) as usize
+        };
         match offset {
             0 => {
-                let busy = if self.veto { self.irqs.busy() } else { Busy(Arc::new(AtomicUsize::new(1))) };
-                let due = std::time::Instant::now() + std::time::Duration::from_micros(value >> 16 & 0xffff);
-                let _ = self.jobs.as_ref().map(|j| j.send((due, line, value & 0x100 != 0, busy)));
+                let busy = if self.veto {
+                    self.irqs.busy()
+                } else {
+                    Busy(Arc::new(AtomicUsize::new(1)))
+                };
+                let due = std::time::Instant::now()
+                    + std::time::Duration::from_micros(value >> 16 & 0xffff);
+                let _ = self
+                    .jobs
+                    .as_ref()
+                    .map(|j| j.send((due, line, value & 0x100 != 0, busy)));
             }
             4 => {
                 self.irqs.line(line, false);
@@ -183,11 +221,17 @@ mod tests {
         assert_eq!(d.find(0xfeb0_0f00).map(|(_, o)| o), Some(0xf00));
         assert!(d.find(0xfeb0_1000).is_none());
         let mut t = TestDevice::new();
-        assert_eq!([0, 1, 2].map(|_| t.read(1, TestDevice::COUNTER, 4)), [Some(0), Some(1), Some(2)]);
+        assert_eq!(
+            [0, 1, 2].map(|_| t.read(1, TestDevice::COUNTER, 4)),
+            [Some(0), Some(1), Some(2)]
+        );
         assert!(t.write(2, TestDevice::SEQUENCE, 8, 0) && t.write(2, TestDevice::SEQUENCE, 8, 5));
         assert!(t.write(0, 0x10, 4, 0xdead_beef));
         assert_eq!((t.read(0, 0x11, 2), t.order_errors), (Some(0xadbe), 1));
-        assert_eq!((&t.reads[..4], &t.writes[..4]), (&[1, 3, 0, 0][..], &[1, 0, 2, 0][..]));
+        assert_eq!(
+            (&t.reads[..4], &t.writes[..4]),
+            (&[1, 3, 0, 0][..], &[1, 0, 2, 0][..])
+        );
         assert!(t.reads[4..].iter().chain(&t.writes[4..]).all(|&n| n == 0));
     }
 
@@ -201,13 +245,26 @@ mod tests {
         assert_eq!(d.port(0, 0x100, 4, Some(0x4433_2211)), Ok(0));
         assert_eq!(d.port(0, 0x101, 2, None), Ok(0x3322)); // inside the range: one call
         assert_eq!(d.port(0, 0x102, 4, None), Ok(0xffff_4433)); // ends outside: byte by byte, the rest all-ones
-        assert_eq!((d.port(0, 0x200, 1, None), d.port(0, 0x200, 2, None), d.port(0, 0x200, 4, None)), (Ok(0xff), Ok(0xffff), Ok(0xffff_ffff)));
+        assert_eq!(
+            (
+                d.port(0, 0x200, 1, None),
+                d.port(0, 0x200, 2, None),
+                d.port(0, 0x200, 4, None)
+            ),
+            (Ok(0xff), Ok(0xffff), Ok(0xffff_ffff))
+        );
         assert_eq!(d.port(0, 0x200, 4, Some(0)), Ok(0)); // ignored
         assert_eq!(d.port(0, 0xffff, 2, None), Ok(0xffff)); // wraps to port 0
         assert_eq!(t.lock().unwrap().reads[0], 3); // 0x101 once, 0x102 and 0x103 bytes
-        assert!(d.report().contains("{\"port\":\"0x200\",\"reads\":3,\"writes\":1,\"unassigned\":true}"));
+        assert!(
+            d.report()
+                .contains("{\"port\":\"0x200\",\"reads\":3,\"writes\":1,\"unassigned\":true}")
+        );
         d.strict = true;
-        assert_eq!((d.port(0, 0x200, 1, None), d.port(0, 0x103, 2, Some(0))), (Err(mmio::UNASSIGNED), Err(mmio::UNASSIGNED)));
+        assert_eq!(
+            (d.port(0, 0x200, 1, None), d.port(0, 0x103, 2, Some(0))),
+            (Err(mmio::UNASSIGNED), Err(mmio::UNASSIGNED))
+        );
         assert_eq!(d.port(0, 0x100, 1, None), Ok(0x11));
     }
 }
@@ -218,5 +275,7 @@ impl Device for IoControl {
     fn read(&mut self, _: usize, offset: u64, size: u64) -> Option<u64> {
         (offset == 0 && size == 1).then(|| u64::from(self.0.entered()))
     }
-    fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool { false }
+    fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool {
+        false
+    }
 }

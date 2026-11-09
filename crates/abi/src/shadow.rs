@@ -62,7 +62,8 @@ const TABLE: u64 = 3;
 const OUTPUT: u64 = 0x0000_ffff_ffff_f000;
 const _: () = assert!(POOL_OFFSET + POOL_PAGES * 4096 <= 2 * crate::RAM_SIZE);
 const _: () = assert!(crate::resident::TEXT_END <= POOL_OFFSET);
-const _: () = assert!(STATE_OFFSET < USER_LOWER_ROOT && USER_UPPER_ROOT + 4096 <= crate::SHARED_OFFSET);
+const _: () =
+    assert!(STATE_OFFSET < USER_LOWER_ROOT && USER_UPPER_ROOT + 4096 <= crate::SHARED_OFFSET);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -169,7 +170,9 @@ impl<M: Maintenance> Space<M> {
     fn halves(&self) -> impl Iterator<Item = (usize, core::ops::Range<usize>)> + use<M> {
         let upper = self.upper;
         ROOTS.into_iter().flat_map(move |[lower, high]| {
-            [(lower, 0..256), (high, 256..512)].into_iter().take(if upper { 2 } else { 1 })
+            [(lower, 0..256), (high, 256..512)]
+                .into_iter()
+                .take(if upper { 2 } else { 1 })
         })
     }
     fn pool(&self, offset: usize, pages: usize) -> bool {
@@ -179,9 +182,17 @@ impl<M: Maintenance> Space<M> {
     }
     /// Whether `offset` is an allocated pool table page (either end).
     fn allocated(&self, offset: usize) -> bool {
-        offset.checked_sub(POOL_OFFSET).map(|o| o / 4096).is_some_and(|page| {
-            page < self.count(BOTTOM) || (page < self.pool_pages && self.pool_pages.checked_sub(self.count(TOP)).is_some_and(|first| page >= first))
-        })
+        offset
+            .checked_sub(POOL_OFFSET)
+            .map(|o| o / 4096)
+            .is_some_and(|page| {
+                page < self.count(BOTTOM)
+                    || (page < self.pool_pages
+                        && self
+                            .pool_pages
+                            .checked_sub(self.count(TOP))
+                            .is_some_and(|first| page >= first))
+            })
     }
     /// The table a descriptor links to, `None` when invalid. Only shadow
     /// table pages qualify, so a corrupt link never reaches private pages.
@@ -234,7 +245,10 @@ impl<M: Maintenance> Space<M> {
             return Err(Error::Misaligned);
         }
         let own = target.wrapping_sub(self.ipa) as usize;
-        if PRIVATE_TABLES.contains(&own) || GUEST_STATE.iter().any(|r| r.contains(&own)) || self.pool(own, POOL_PAGES) {
+        if PRIVATE_TABLES.contains(&own)
+            || GUEST_STATE.iter().any(|r| r.contains(&own))
+            || self.pool(own, POOL_PAGES)
+        {
             return Err(Error::Private);
         }
         let (table, index) = self.leaf(va, true)?.ok_or(Error::Corrupt)?;
@@ -309,7 +323,11 @@ impl<M: Maintenance> Space<M> {
         }
         let [lower, _] = ROOTS[0];
         let [user_lower, user_upper] = ROOTS[1];
-        for (root, indices) in [(lower, 0..256), (user_lower, 0..256), (user_upper, 256..512)] {
+        for (root, indices) in [
+            (lower, 0..256),
+            (user_lower, 0..256),
+            (user_upper, 256..512),
+        ] {
             for index in indices {
                 self.set(root, index, 0);
             }
@@ -377,7 +395,10 @@ mod tests {
         s.tlb.0.clear();
         s.unmap_large(0x21_2345).unwrap();
         assert_eq!(s.tlb.0, vec![0x20_0000, 0x20_3000, 0x3f_f000]);
-        assert_eq!([0x20_0000, 0x20_3000, 0x3f_f000].map(|va| s.descriptor(va)), [0; 3]);
+        assert_eq!(
+            [0x20_0000, 0x20_3000, 0x3f_f000].map(|va| s.descriptor(va)),
+            [0; 3]
+        );
         assert_ne!(s.descriptor(0x40_0000), 0);
         // A region with no leaf table: nothing to do.
         s.unmap_large(0x80_0000).unwrap();
@@ -413,7 +434,10 @@ mod tests {
         // Lower: root[0] -> pool 0 -> pool 1 -> pool 2; upper (the kept half): root[256] -> the pool's last three pages.
         let table = |page: usize| (IPA + (POOL_OFFSET + page * 4096) as u64) | 3;
         assert_eq!(word(&m, UPPER_ROOT + 256 * 8), table(POOL_PAGES - 1));
-        assert_eq!(word(&m, POOL_OFFSET + (POOL_PAGES - 1) * 4096), table(POOL_PAGES - 2));
+        assert_eq!(
+            word(&m, POOL_OFFSET + (POOL_PAGES - 1) * 4096),
+            table(POOL_PAGES - 2)
+        );
         assert_eq!(word(&m, LOWER_ROOT), table(0));
         assert_eq!(word(&m, POOL_OFFSET), table(1));
         assert_eq!(word(&m, POOL_OFFSET + 4096), table(2));
@@ -438,8 +462,7 @@ mod tests {
         link(&mut m, UPPER_L2, UPPER_LEAF);
         let mut s = space(&mut m, 0);
         s.map(0x10_0000, 0x4007_0000, true).unwrap();
-        s.map(HIGH_BASE + 0x10_0000, 0x4007_0000, false)
-            .unwrap();
+        s.map(HIGH_BASE + 0x10_0000, 0x4007_0000, false).unwrap();
         assert_eq!(s.map(0x20_0000, 0x4007_0000, false), Err(Error::Capacity));
         drop(s);
         assert_eq!(word(&m, LOWER_LEAF + 256 * 8), 0x4007_0000 | LEAF);
@@ -518,14 +541,24 @@ mod tests {
         assert_eq!(s.used(), 9);
         // A space's own table pages, roots included, are never targets.
         for own in [USER_LOWER_ROOT, USER_UPPER_ROOT] {
-            assert_eq!(s.map(0x30_0000, IPA + own as u64, false), Err(Error::Private));
+            assert_eq!(
+                s.map(0x30_0000, IPA + own as u64, false),
+                Err(Error::Private)
+            );
         }
         s.unmap(0x10_0000).unwrap();
         assert_eq!(s.descriptor(0x10_0000), 0);
         s.user = true;
         assert_eq!(s.descriptor(0x10_0000), 0x4008_0000 | LEAF | READ_ONLY);
         s.reset();
-        assert_eq!((s.used(), s.descriptor(0x10_0000), s.descriptor(HIGH_BASE + 0x20_0000)), (0, 0, 0));
+        assert_eq!(
+            (
+                s.used(),
+                s.descriptor(0x10_0000),
+                s.descriptor(HIGH_BASE + 0x20_0000)
+            ),
+            (0, 0, 0)
+        );
         drop(s);
         // Both spaces' guest halves are unlinked; the private region index stays.
         m[USER_LOWER_ROOT / 8 + 256] = 7;
@@ -542,7 +575,11 @@ mod tests {
             assert!((256..512).all(|i| word(&m, upper + i * 8) == 0));
         }
         assert_eq!(word(&m, USER_LOWER_ROOT + 256 * 8), 7);
-        assert!(ROOTS.iter().all(|&[_, upper]| word(&m, upper + alias * 8) == 9));
+        assert!(
+            ROOTS
+                .iter()
+                .all(|&[_, upper]| word(&m, upper + alias * 8) == 9)
+        );
         // The host's pre-linked tables belong to the supervisor space: a user root linking one is corrupt.
         m[USER_LOWER_ROOT / 8] = (IPA + 0x11000) | 3;
         let mut s = space(&mut m, POOL_PAGES);
@@ -605,7 +642,15 @@ mod tests {
         let mut s = space(&mut m, POOL_PAGES);
         // G1: also the frame page and the guest-state alias's tables.
         let [l1, _, leaf] = crate::execution::GUEST_STATE_TABLES;
-        for own in [LOWER_ROOT, 0x14000, STATE_OFFSET, POOL_OFFSET + 31 * 4096, crate::execution::FRAME_OFFSET, l1, leaf] {
+        for own in [
+            LOWER_ROOT,
+            0x14000,
+            STATE_OFFSET,
+            POOL_OFFSET + 31 * 4096,
+            crate::execution::FRAME_OFFSET,
+            l1,
+            leaf,
+        ] {
             let target = IPA + own as u64;
             assert_eq!(s.map(0x20_0000, target, false), Err(Error::Private));
         }
@@ -624,7 +669,8 @@ mod tests {
         s.map_global(0x10_0000, 0x4008_0000, true).unwrap(); // global, but the lower half: not kept
         s.user = true;
         s.map(0x20_0000, 0x4009_0000, false).unwrap();
-        s.map_global(HIGH_BASE + 0x40_0000, 0x400a_0000, false).unwrap(); // the user space's upper half: not kept
+        s.map_global(HIGH_BASE + 0x40_0000, 0x400a_0000, false)
+            .unwrap(); // the user space's upper half: not kept
         s.user = false;
         assert_eq!(s.used(), 12);
         s.tlb.0.clear();
@@ -634,7 +680,10 @@ mod tests {
         assert_eq!(s.descriptor(kernel), 0x4007_0000 | LEAF);
         assert_eq!(s.descriptor(0x10_0000), 0);
         s.user = true;
-        assert_eq!((s.descriptor(0x20_0000), s.descriptor(HIGH_BASE + 0x40_0000)), (0, 0));
+        assert_eq!(
+            (s.descriptor(0x20_0000), s.descriptor(HIGH_BASE + 0x40_0000)),
+            (0, 0)
+        );
         // The bottom is reused; it never meets the kept tables.
         s.map(0x20_0000, 0x4009_0000, false).unwrap();
         s.user = false;
@@ -643,7 +692,10 @@ mod tests {
         // An INVLPG reaches a kept shadow.
         s.map_global(kernel + 0x1000, 0x4007_1000, false).unwrap();
         s.unmap_large(kernel).unwrap();
-        assert_eq!((s.descriptor(kernel), s.descriptor(kernel + 0x1000)), (0, 0));
+        assert_eq!(
+            (s.descriptor(kernel), s.descriptor(kernel + 0x1000)),
+            (0, 0)
+        );
         s.map_global(kernel, 0x4007_0000, true).unwrap();
         // A non-global shadow in the kept half: the next CR3 load resets everything, and the one after keeps again.
         s.map(HIGH_BASE + 0x80_0000, 0x400b_0000, false).unwrap();

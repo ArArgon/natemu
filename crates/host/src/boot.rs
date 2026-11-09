@@ -86,18 +86,35 @@ pub enum LoadError {
     BadAlignment(u32),
     BadInitSize,
     BadPrefAddress,
-    TruncatedImage { have: usize, need: u64 },
-    BadPayload { offset: u32, length: u32 },
+    TruncatedImage {
+        have: usize,
+        need: u64,
+    },
+    BadPayload {
+        offset: u32,
+        length: u32,
+    },
     /// The physical map's parameters (`Layout`) are outside what the map allows.
     BadLayout(String),
     /// A RAM or NVS extent of the map is not backed by the guest RAM given.
-    RamNotBacked { gpa: u64, bytes: u64 },
-    CmdlineTooLong { length: usize, limit: usize },
+    RamNotBacked {
+        gpa: u64,
+        bytes: u64,
+    },
+    CmdlineTooLong {
+        length: usize,
+        limit: usize,
+    },
     CmdlineNul,
     /// The kernel's reserved window `[runtime_start, runtime_start + max(init_size, loaded size))` lies in no RAM extent.
-    KernelDoesNotFit { start: u64, bytes: u64 },
+    KernelDoesNotFit {
+        start: u64,
+        bytes: u64,
+    },
     /// No page-aligned place for the initrd in low RAM below `initrd_addr_max` above the kernel's window.
-    InitrdDoesNotFit { bytes: u64 },
+    InitrdDoesNotFit {
+        bytes: u64,
+    },
     /// An ACPI blob (the RSDP, a table, the AP mailbox) at this address does not lie in the map's ACPI NVS range.
     BadTables(u64),
 }
@@ -197,13 +214,19 @@ pub(crate) fn parse(d: &[u8]) -> Result<Setup, LoadError> {
         return Err(Not64Bit(xloadflags));
     }
     // kernel_alignment: "Alignment unit required by the kernel (if relocatable_kernel is true.)"
-    let (relocatable, align) = (d[at::RELOCATABLE_KERNEL] != 0, u32_at(d, at::KERNEL_ALIGNMENT));
+    let (relocatable, align) = (
+        d[at::RELOCATABLE_KERNEL] != 0,
+        u32_at(d, at::KERNEL_ALIGNMENT),
+    );
     if relocatable && !align.is_power_of_two() {
         return Err(BadAlignment(align));
     }
     // init_size: the linear memory the kernel needs from its runtime start; pref_address: where a non-relocatable
     // kernel runs ("runtime_start = pref_address").
-    let (pref_address, init_size) = (u64_at(d, at::PREF_ADDRESS), u64::from(u32_at(d, at::INIT_SIZE)));
+    let (pref_address, init_size) = (
+        u64_at(d, at::PREF_ADDRESS),
+        u64::from(u32_at(d, at::INIT_SIZE)),
+    );
     if init_size == 0 {
         return Err(BadInitSize);
     }
@@ -218,7 +241,10 @@ pub(crate) fn parse(d: &[u8]) -> Result<Setup, LoadError> {
     };
     let (pm_offset, pm_size) = ((sects + 1) * 512, u64::from(u32_at(d, at::SYSSIZE)) * 16);
     if (d.len() as u64) < pm_offset as u64 + pm_size {
-        return Err(TruncatedImage { have: d.len(), need: pm_offset as u64 + pm_size });
+        return Err(TruncatedImage {
+            have: d.len(),
+            need: pm_offset as u64 + pm_size,
+        });
     }
     let (offset, length) = (u32_at(d, at::PAYLOAD_OFFSET), u32_at(d, at::PAYLOAD_LENGTH));
     if offset != 0 && u64::from(offset) + u64::from(length) > pm_size {
@@ -275,7 +301,10 @@ pub(crate) const SCRATCH_NVS: (u64, u64) = (0x80_0000, 0x100_0000);
 pub(crate) const AP_GDT: u64 = SCRATCH_NVS.0;
 impl Layout {
     /// The default boot map: L = 2 GiB, H = 0 (M69).
-    pub const DEFAULT: Layout = Layout { low_end: 2 * GIB, high: 0 };
+    pub const DEFAULT: Layout = Layout {
+        low_end: 2 * GIB,
+        high: 0,
+    };
     /// The E820 table (sorted, disjoint): RAM and NVS where they exist, reserved for the holes.
     pub fn e820(&self) -> Result<Vec<E820>, LoadError> {
         let l = self.low_end;
@@ -285,12 +314,19 @@ impl Layout {
             )));
         }
         if self.high % (2 * MIB) != 0 || self.high > (1 << 40) - 4 * GIB {
-            return Err(LoadError::BadLayout(format!("high RAM {:#x}: a 2 MiB multiple within 40-bit physical addresses", self.high)));
+            return Err(LoadError::BadLayout(format!(
+                "high RAM {:#x}: a 2 MiB multiple within 40-bit physical addresses",
+                self.high
+            )));
         }
-        let e = |addr: u64, end: u64, kind| E820 { addr, size: end - addr, kind };
+        let e = |addr: u64, end: u64, kind| E820 {
+            addr,
+            size: end - addr,
+            kind,
+        };
         let mut map = vec![
-            e(0, 0x1000, E820_RESERVED),          // reserved low page
-            e(0x1000, 0xa_0000, E820_RAM),        // conventional RAM (loader data, Linux's own trampoline later)
+            e(0, 0x1000, E820_RESERVED),              // reserved low page
+            e(0x1000, 0xa_0000, E820_RAM), // conventional RAM (loader data, Linux's own trampoline later)
             e(0xa_0000, 0x10_0000, E820_RESERVED), // legacy hole
             e(PAGE_TABLES, 0x20_0000, E820_RESERVED), // loader page tables
             e(0x20_0000, ACPI_NVS.0, E820_RESERVED), // normal-map hole (SMRAM banks)
@@ -344,16 +380,34 @@ const CR0_NE: u64 = 1 << 5;
 const PRESENT_WRITABLE: u64 = 3;
 const LARGE: u64 = 1 << 7;
 
-fn place(ram: &GuestRam, writes: &mut Vec<(u64, u64)>, gpa: u64, bytes: &[u8]) -> Result<(), LoadError> {
+fn place(
+    ram: &GuestRam,
+    writes: &mut Vec<(u64, u64)>,
+    gpa: u64,
+    bytes: &[u8],
+) -> Result<(), LoadError> {
     writes.push((gpa, bytes.len() as u64));
-    ram.copy_in(gpa, bytes).then_some(()).ok_or(LoadError::RamNotBacked { gpa, bytes: bytes.len() as u64 })
+    ram.copy_in(gpa, bytes)
+        .then_some(())
+        .ok_or(LoadError::RamNotBacked {
+            gpa,
+            bytes: bytes.len() as u64,
+        })
 }
 
 /// X4: the firmware's mailbox wake state on top of `base` (which supplies paging, CR3, the GDT and flat selectors): CPL 0,
 /// IF = 0 (RFLAGS 2), EFER.LME/LMA and the firmware's NXE (see `load`), no IDT, general registers 0, RIP 0 (the
 /// resident sets the vector). The loader's `Loaded::ap` and the test driver's `mailbox` sections both use it.
 pub fn ap_wake(base: Cpu) -> Cpu {
-    Cpu { gpr: [0; 16], rip: 0, rflags: 2, cpl: 0, efer: exec::EFER_LME | exec::EFER_LMA | exec::EFER_NXE, idtr: Table { base: 0, limit: 0 }, ..base }
+    Cpu {
+        gpr: [0; 16],
+        rip: 0,
+        rflags: 2,
+        cpl: 0,
+        efer: exec::EFER_LME | exec::EFER_LMA | exec::EFER_NXE,
+        idtr: Table { base: 0, limit: 0 },
+        ..base
+    }
 }
 
 /// M1: `ram` is one range from 0; high RAM (`Layout::high`) needs a multi-range RAM description here (`GuestRam::and`)
@@ -364,12 +418,18 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
     let s = parse(inputs.image)?;
     let map = layout.e820()?;
     for e in map.iter().filter(|e| e.kind != E820_RESERVED) {
-        ram.range(e.addr, e.size).ok_or(LoadError::RamNotBacked { gpa: e.addr, bytes: e.size })?;
+        ram.range(e.addr, e.size).ok_or(LoadError::RamNotBacked {
+            gpa: e.addr,
+            bytes: e.size,
+        })?;
     }
     // Command line: "at most cmdline_size characters" plus the NUL, inside the command buffer.
     let limit = (s.cmdline_size as usize).min(CMDLINE_BYTES as usize - 1);
     if inputs.cmdline.len() > limit {
-        return Err(LoadError::CmdlineTooLong { length: inputs.cmdline.len(), limit });
+        return Err(LoadError::CmdlineTooLong {
+            length: inputs.cmdline.len(),
+            limit,
+        });
     }
     if inputs.cmdline.contains('\0') {
         return Err(LoadError::CmdlineNul);
@@ -379,11 +439,24 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
     // init_size and the loaded protected-mode code.
     // The window must lie in ordinary low RAM [RAM_START, L): never over the loader's own data in conventional RAM, the
     // page tables or the NVS ranges, and inside the identity map (claim 69: no overlap with a live boot allocation).
-    let kernel = if s.relocatable { RAM_START.max(s.pref_address).checked_next_multiple_of(s.kernel_alignment) } else { Some(s.pref_address) };
+    let kernel = if s.relocatable {
+        RAM_START
+            .max(s.pref_address)
+            .checked_next_multiple_of(s.kernel_alignment)
+    } else {
+        Some(s.pref_address)
+    };
     let window = s.init_size.max(s.pm_size as u64);
-    let does_not_fit = LoadError::KernelDoesNotFit { start: kernel.unwrap_or(u64::MAX), bytes: window };
-    let kernel = kernel.filter(|&k| k >= RAM_START).ok_or(does_not_fit.clone())?;
-    let window_end = kernel.checked_add(window).filter(|&end| end <= layout.low_end);
+    let does_not_fit = LoadError::KernelDoesNotFit {
+        start: kernel.unwrap_or(u64::MAX),
+        bytes: window,
+    };
+    let kernel = kernel
+        .filter(|&k| k >= RAM_START)
+        .ok_or(does_not_fit.clone())?;
+    let window_end = kernel
+        .checked_add(window)
+        .filter(|&end| end <= layout.low_end);
     let window_end = window_end.ok_or(does_not_fit)?;
     // Initrd: page-aligned, as high as low RAM and initrd_addr_max ("the address of the highest safe byte") allow,
     // above the kernel's window.
@@ -392,20 +465,28 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
         Some(d) => {
             let bytes = d.len() as u64;
             let top = layout.low_end.min(s.initrd_addr_max.saturating_add(1));
-            let at = top.checked_sub(bytes).map(|a| a & !(PAGE - 1)).filter(|&a| a >= window_end);
+            let at = top
+                .checked_sub(bytes)
+                .map(|a| a & !(PAGE - 1))
+                .filter(|&a| a >= window_end);
             Some((at.ok_or(LoadError::InitrdDoesNotFit { bytes })?, bytes))
         }
     };
     // The RSDP, the tables it reaches and the AP mailbox lie in the map's ACPI NVS range (claim 69).
     let blobs = inputs.acpi.map_or(&[][..], |t| &t.blobs[..]);
-    if let Some((gpa, _)) = blobs.iter().find(|(a, b)| !(ACPI_NVS.0 <= *a && a.checked_add(b.len() as u64).is_some_and(|end| end <= ACPI_NVS.1))) {
+    if let Some((gpa, _)) = blobs.iter().find(|(a, b)| {
+        !(ACPI_NVS.0 <= *a
+            && a.checked_add(b.len() as u64)
+                .is_some_and(|end| end <= ACPI_NVS.1))
+    }) {
         return Err(LoadError::BadTables(*gpa));
     }
 
     // boot_params: zeroed, then the setup header from 0x1f1 to its end, then the loader's fields.
     let mut z = vec![0u8; PAGE as usize];
     z[at::SETUP_SECTS..s.header_end].copy_from_slice(&inputs.image[at::SETUP_SECTS..s.header_end]);
-    let put32 = |z: &mut Vec<u8>, o: usize, v: u64| z[o..o + 4].copy_from_slice(&(v as u32).to_le_bytes());
+    let put32 =
+        |z: &mut Vec<u8>, o: usize, v: u64| z[o..o + 4].copy_from_slice(&(v as u32).to_le_bytes());
     // Every setup-header field boot.rst types "write" is the loader's: none of the image's values passes through.
     // type_of_loader 0xFF with ext_loader_type/ext_loader_ver 0 (no assigned id); ramdisk_image/ramdisk_size and their
     // high halves (0: "Leave at zero if there is no initial ramdisk"); cmd_line_ptr and ext_cmd_line_ptr;
@@ -426,7 +507,8 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
     put32(&mut z, at::HARDWARE_SUBARCH, 0);
     z[at::HARDWARE_SUBARCH_DATA..at::HARDWARE_SUBARCH_DATA + 8].fill(0);
     z[at::SETUP_DATA..at::SETUP_DATA + 8].fill(0);
-    z[at::ACPI_RSDP_ADDR..at::ACPI_RSDP_ADDR + 8].copy_from_slice(&inputs.acpi.map_or(0, |t| t.rsdp).to_le_bytes());
+    z[at::ACPI_RSDP_ADDR..at::ACPI_RSDP_ADDR + 8]
+        .copy_from_slice(&inputs.acpi.map_or(0, |t| t.rsdp).to_le_bytes());
     z[at::E820_ENTRIES] = map.len() as u8;
     for (i, e) in map.iter().enumerate() {
         let o = at::E820_TABLE + 20 * i;
@@ -439,20 +521,55 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
     let mut cmd = inputs.cmdline.as_bytes().to_vec();
     cmd.push(0);
     place(ram, &mut w, CMDLINE, &cmd)?;
-    place(ram, &mut w, GDT, &GDT_ENTRIES.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>())?;
+    place(
+        ram,
+        &mut w,
+        GDT,
+        &GDT_ENTRIES
+            .iter()
+            .flat_map(|e| e.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )?;
     // X4: the APs' GDT, a copy in the NVS boot scratch (the loader's lies in conventional RAM, which Linux reuses).
-    place(ram, &mut w, AP_GDT, &GDT_ENTRIES.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>())?;
+    place(
+        ram,
+        &mut w,
+        AP_GDT,
+        &GDT_ENTRIES
+            .iter()
+            .flat_map(|e| e.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    )?;
     // Identity map of [0, L) with 2 MiB pages (it covers the window, boot_params, the command line, the GDT, the initrd
     // and the NVS ranges): PML4 -> PDPT -> one PD per GiB, supervisor read/write/execute, write-back.
     let (pml4, pdpt) = (PAGE_TABLES, PAGE_TABLES + PAGE);
     place(ram, &mut w, pml4, &(pdpt | PRESENT_WRITABLE).to_le_bytes())?;
     for g in 0..layout.low_end.div_ceil(GIB) {
         let pd = PAGE_TABLES + (2 + g) * PAGE;
-        place(ram, &mut w, pdpt + 8 * g, &(pd | PRESENT_WRITABLE).to_le_bytes())?;
-        let pdes = (0..512).map(|i| g * GIB + i * 2 * MIB).take_while(|&a| a < layout.low_end);
-        place(ram, &mut w, pd, &pdes.flat_map(|a| (a | PRESENT_WRITABLE | LARGE).to_le_bytes()).collect::<Vec<u8>>())?;
+        place(
+            ram,
+            &mut w,
+            pdpt + 8 * g,
+            &(pd | PRESENT_WRITABLE).to_le_bytes(),
+        )?;
+        let pdes = (0..512)
+            .map(|i| g * GIB + i * 2 * MIB)
+            .take_while(|&a| a < layout.low_end);
+        place(
+            ram,
+            &mut w,
+            pd,
+            &pdes
+                .flat_map(|a| (a | PRESENT_WRITABLE | LARGE).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )?;
     }
-    place(ram, &mut w, kernel, &inputs.image[s.pm_offset..s.pm_offset + s.pm_size])?;
+    place(
+        ram,
+        &mut w,
+        kernel,
+        &inputs.image[s.pm_offset..s.pm_offset + s.pm_size],
+    )?;
     if let (Some((a, _)), Some(d)) = (initrd, inputs.initrd) {
         place(ram, &mut w, a, d)?;
     }
@@ -482,7 +599,10 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
         seg: [data, code, data, data, Segment::NULL, Segment::NULL],
         ldtr: exec::LDTR_RESET,
         tr: exec::TR_RESET,
-        gdtr: Table { base: GDT, limit: (8 * GDT_ENTRIES.len() - 1) as u64 },
+        gdtr: Table {
+            base: GDT,
+            limit: (8 * GDT_ENTRIES.len() - 1) as u64,
+        },
         // No IDT (limit 0): an exception before the kernel loads its own escalates to a shutdown.
         idtr: Table { base: 0, limit: 0 },
         mov_ss: 0,
@@ -498,8 +618,26 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
     // the firmware's choice: EFER.NXE set (the profile has NX; UEFI firmware enables it, and under TDX, the mailbox's
     // origin, EFER.NXE is fixed at 1), which an OS may rely on before it writes EFER: Linux's 64-bit trampoline loads page
     // tables whose data pages are XD (reserved with NXE = 0) and pushes onto them.
-    let ap = ap_wake(Cpu { seg: [data, code, data, data, data, data], gdtr: Table { base: AP_GDT, limit: (8 * GDT_ENTRIES.len() - 1) as u64 }, ..cpu });
-    Ok(Loaded { setup: s, kernel, window, zero_page: ZERO_PAGE, cmdline: CMDLINE, initrd, map, cpu, ap, writes: w })
+    let ap = ap_wake(Cpu {
+        seg: [data, code, data, data, data, data],
+        gdtr: Table {
+            base: AP_GDT,
+            limit: (8 * GDT_ENTRIES.len() - 1) as u64,
+        },
+        ..cpu
+    });
+    Ok(Loaded {
+        setup: s,
+        kernel,
+        window,
+        zero_page: ZERO_PAGE,
+        cmdline: CMDLINE,
+        initrd,
+        map,
+        cpu,
+        ap,
+        writes: w,
+    })
 }
 
 #[cfg(test)]
@@ -518,8 +656,10 @@ pub(crate) mod tests {
         d[at::HEADER..at::HEADER + 4].copy_from_slice(b"HdrS");
         d[at::VERSION..at::VERSION + 2].copy_from_slice(&0x020fu16.to_le_bytes());
         d[at::LOADFLAGS] = LOADED_HIGH;
-        d[at::INITRD_ADDR_MAX..at::INITRD_ADDR_MAX + 4].copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
-        d[at::KERNEL_ALIGNMENT..at::KERNEL_ALIGNMENT + 4].copy_from_slice(&0x20_0000u32.to_le_bytes());
+        d[at::INITRD_ADDR_MAX..at::INITRD_ADDR_MAX + 4]
+            .copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
+        d[at::KERNEL_ALIGNMENT..at::KERNEL_ALIGNMENT + 4]
+            .copy_from_slice(&0x20_0000u32.to_le_bytes());
         d[at::RELOCATABLE_KERNEL] = 1;
         d[at::RELOCATABLE_KERNEL + 1] = 21;
         d[at::XLOADFLAGS..at::XLOADFLAGS + 2].copy_from_slice(&3u16.to_le_bytes());
@@ -533,14 +673,22 @@ pub(crate) mod tests {
         d[at..at + bytes.len()].copy_from_slice(bytes);
         d
     }
-    const SMALL: Layout = Layout { low_end: 64 * MIB, high: 0 };
+    const SMALL: Layout = Layout {
+        low_end: 64 * MIB,
+        high: 0,
+    };
     fn ram(bytes: u64) -> (Vec<u64>, GuestRam) {
         let mut v = vec![0u64; bytes as usize / 8];
         let r = unsafe { GuestRam::new(0, bytes, v.as_mut_ptr() as u64) };
         (v, r)
     }
     fn inputs<'a>(image: &'a [u8], cmdline: &'a str, initrd: Option<&'a [u8]>) -> Inputs<'a> {
-        Inputs { image, cmdline, initrd, acpi: None }
+        Inputs {
+            image,
+            cmdline,
+            initrd,
+            acpi: None,
+        }
     }
 
     /// One malformed image per header rejection, in `parse`'s order.
@@ -550,29 +698,87 @@ pub(crate) mod tests {
         let ok = image(0x1000);
         let cases: Vec<(Vec<u8>, LoadError)> = vec![
             (ok[..0x267].to_vec(), TruncatedHeader(0x267)),
-            (set(ok.clone(), at::BOOT_FLAG, &[0x55, 0xab]), BadBootFlag(0xab55)),
+            (
+                set(ok.clone(), at::BOOT_FLAG, &[0x55, 0xab]),
+                BadBootFlag(0xab55),
+            ),
             (set(ok.clone(), at::HEADER, b"HdrT"), BadMagic),
-            (set(ok.clone(), at::VERSION, &[0x0b, 0x02]), VersionTooOld(0x020b)),
+            (
+                set(ok.clone(), at::VERSION, &[0x0b, 0x02]),
+                VersionTooOld(0x020b),
+            ),
             (set(ok.clone(), at::JUMP, &[0xe9]), BadJump(0xe9)),
             (set(ok.clone(), at::JUMP + 1, &[0x65]), BadHeaderEnd(0x267)),
             (set(ok.clone(), at::JUMP + 1, &[0x8f]), BadHeaderEnd(0x291)),
             (set(ok.clone(), at::LOADFLAGS, &[0x20]), NotLoadedHigh(0x20)),
             (set(ok.clone(), at::XLOADFLAGS, &[2, 0]), Not64Bit(2)),
-            (set(ok.clone(), at::KERNEL_ALIGNMENT, &0x30_0000u32.to_le_bytes()), BadAlignment(0x30_0000)),
-            (set(ok.clone(), at::KERNEL_ALIGNMENT, &[0; 4]), BadAlignment(0)),
+            (
+                set(
+                    ok.clone(),
+                    at::KERNEL_ALIGNMENT,
+                    &0x30_0000u32.to_le_bytes(),
+                ),
+                BadAlignment(0x30_0000),
+            ),
+            (
+                set(ok.clone(), at::KERNEL_ALIGNMENT, &[0; 4]),
+                BadAlignment(0),
+            ),
             (set(ok.clone(), at::INIT_SIZE, &[0; 4]), BadInitSize),
-            (set(set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]), at::PREF_ADDRESS, &[0; 8]), BadPrefAddress),
-            (ok[..ok.len() - 1].to_vec(), TruncatedImage { have: ok.len() - 1, need: ok.len() as u64 }),
-            (set(ok.clone(), at::SYSSIZE, &u32::MAX.to_le_bytes()), TruncatedImage { have: ok.len(), need: 1024 + 16 * u32::MAX as u64 }),
-            (set(set(ok.clone(), at::PAYLOAD_OFFSET, &0xf00u32.to_le_bytes()), at::PAYLOAD_LENGTH, &0x101u32.to_le_bytes()), BadPayload { offset: 0xf00, length: 0x101 }),
+            (
+                set(
+                    set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]),
+                    at::PREF_ADDRESS,
+                    &[0; 8],
+                ),
+                BadPrefAddress,
+            ),
+            (
+                ok[..ok.len() - 1].to_vec(),
+                TruncatedImage {
+                    have: ok.len() - 1,
+                    need: ok.len() as u64,
+                },
+            ),
+            (
+                set(ok.clone(), at::SYSSIZE, &u32::MAX.to_le_bytes()),
+                TruncatedImage {
+                    have: ok.len(),
+                    need: 1024 + 16 * u32::MAX as u64,
+                },
+            ),
+            (
+                set(
+                    set(ok.clone(), at::PAYLOAD_OFFSET, &0xf00u32.to_le_bytes()),
+                    at::PAYLOAD_LENGTH,
+                    &0x101u32.to_le_bytes(),
+                ),
+                BadPayload {
+                    offset: 0xf00,
+                    length: 0x101,
+                },
+            ),
         ];
         for (d, want) in cases {
             assert_eq!(parse(&d), Err(want.clone()), "{}", want.code());
         }
         // A non-relocatable kernel's alignment is not checked; setup_sects 0 means 4.
-        assert!(parse(&set(set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]), at::KERNEL_ALIGNMENT, &[0; 4])).is_ok());
+        assert!(
+            parse(&set(
+                set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]),
+                at::KERNEL_ALIGNMENT,
+                &[0; 4]
+            ))
+            .is_ok()
+        );
         let four = set(ok.clone(), at::SETUP_SECTS, &[0]);
-        assert_eq!(parse(&four), Err(TruncatedImage { have: ok.len(), need: 5 * 512 + 0x1000 }));
+        assert_eq!(
+            parse(&four),
+            Err(TruncatedImage {
+                have: ok.len(),
+                need: 5 * 512 + 0x1000
+            })
+        );
     }
 
     /// Each loader-side rejection.
@@ -582,64 +788,227 @@ pub(crate) mod tests {
         let ok = image(0x1000);
         let (_v, r) = ram(SMALL.low_end);
         let bad = |layout: Layout, i: Inputs| load(&r, &layout, &i).unwrap_err();
-        assert_eq!(bad(Layout { low_end: RAM_START, high: 0 }, inputs(&ok, "", None)).code(), "BAD_LAYOUT");
-        assert_eq!(bad(Layout { low_end: 3 * GIB + 2 * MIB, high: 0 }, inputs(&ok, "", None)).code(), "BAD_LAYOUT");
-        assert_eq!(bad(Layout { low_end: 33 * MIB, high: 0 }, inputs(&ok, "", None)).code(), "BAD_LAYOUT");
-        assert_eq!(bad(Layout { low_end: 64 * MIB, high: MIB }, inputs(&ok, "", None)).code(), "BAD_LAYOUT");
-        assert_eq!(bad(Layout { low_end: 128 * MIB, high: 0 }, inputs(&ok, "", None)), RamNotBacked { gpa: RAM_START, bytes: 112 * MIB });
+        assert_eq!(
+            bad(
+                Layout {
+                    low_end: RAM_START,
+                    high: 0
+                },
+                inputs(&ok, "", None)
+            )
+            .code(),
+            "BAD_LAYOUT"
+        );
+        assert_eq!(
+            bad(
+                Layout {
+                    low_end: 3 * GIB + 2 * MIB,
+                    high: 0
+                },
+                inputs(&ok, "", None)
+            )
+            .code(),
+            "BAD_LAYOUT"
+        );
+        assert_eq!(
+            bad(
+                Layout {
+                    low_end: 33 * MIB,
+                    high: 0
+                },
+                inputs(&ok, "", None)
+            )
+            .code(),
+            "BAD_LAYOUT"
+        );
+        assert_eq!(
+            bad(
+                Layout {
+                    low_end: 64 * MIB,
+                    high: MIB
+                },
+                inputs(&ok, "", None)
+            )
+            .code(),
+            "BAD_LAYOUT"
+        );
+        assert_eq!(
+            bad(
+                Layout {
+                    low_end: 128 * MIB,
+                    high: 0
+                },
+                inputs(&ok, "", None)
+            ),
+            RamNotBacked {
+                gpa: RAM_START,
+                bytes: 112 * MIB
+            }
+        );
         let long = "x".repeat(2048);
-        assert_eq!(bad(SMALL, inputs(&ok, &long, None)), CmdlineTooLong { length: 2048, limit: 2047 });
+        assert_eq!(
+            bad(SMALL, inputs(&ok, &long, None)),
+            CmdlineTooLong {
+                length: 2048,
+                limit: 2047
+            }
+        );
         assert!(load(&r, &SMALL, &inputs(&ok, &long[..2047], None)).is_ok());
         assert_eq!(bad(SMALL, inputs(&ok, "a\0b", None)), CmdlineNul);
         // init_size 60 MiB from 16 MiB exceeds L = 64 MiB.
         let huge = set(ok.clone(), at::INIT_SIZE, &(60 * MIB as u32).to_le_bytes());
-        assert_eq!(bad(SMALL, inputs(&huge, "", None)), KernelDoesNotFit { start: RAM_START, bytes: 60 * MIB });
+        assert_eq!(
+            bad(SMALL, inputs(&huge, "", None)),
+            KernelDoesNotFit {
+                start: RAM_START,
+                bytes: 60 * MIB
+            }
+        );
         // A non-relocatable kernel runs at pref_address, here in the reserved low hole.
-        let fixed = set(set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]), at::PREF_ADDRESS, &0x10_0000u64.to_le_bytes());
-        assert_eq!(bad(SMALL, inputs(&fixed, "", None)), KernelDoesNotFit { start: 0x10_0000, bytes: 4 * MIB });
+        let fixed = set(
+            set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]),
+            at::PREF_ADDRESS,
+            &0x10_0000u64.to_le_bytes(),
+        );
+        assert_eq!(
+            bad(SMALL, inputs(&fixed, "", None)),
+            KernelDoesNotFit {
+                start: 0x10_0000,
+                bytes: 4 * MIB
+            }
+        );
         let rd = vec![1u8; 45 * MIB as usize];
-        assert_eq!(bad(SMALL, inputs(&ok, "", Some(&rd))), InitrdDoesNotFit { bytes: 45 * MIB });
+        assert_eq!(
+            bad(SMALL, inputs(&ok, "", Some(&rd))),
+            InitrdDoesNotFit { bytes: 45 * MIB }
+        );
         // initrd_addr_max 24 MiB - 1: below the kernel's window end (20 MiB) there is no room for 5 MiB.
-        let low = set(ok.clone(), at::INITRD_ADDR_MAX, &(24 * MIB as u32 - 1).to_le_bytes());
-        assert_eq!(bad(SMALL, inputs(&low, "", Some(&rd[..5 * MIB as usize]))), InitrdDoesNotFit { bytes: 5 * MIB });
+        let low = set(
+            ok.clone(),
+            at::INITRD_ADDR_MAX,
+            &(24 * MIB as u32 - 1).to_le_bytes(),
+        );
+        assert_eq!(
+            bad(SMALL, inputs(&low, "", Some(&rd[..5 * MIB as usize]))),
+            InitrdDoesNotFit { bytes: 5 * MIB }
+        );
         let t = acpi::build(1, 0x1000);
-        let i = Inputs { acpi: Some(&t), ..inputs(&ok, "", None) };
+        let i = Inputs {
+            acpi: Some(&t),
+            ..inputs(&ok, "", None)
+        };
         assert_eq!(bad(SMALL, i), BadTables(0x1000));
         let t = acpi::build(1, ACPI_NVS.1 - 35);
-        let i = Inputs { acpi: Some(&t), ..inputs(&ok, "", None) };
+        let i = Inputs {
+            acpi: Some(&t),
+            ..inputs(&ok, "", None)
+        };
         assert_eq!(bad(SMALL, i), BadTables(ACPI_NVS.1 - 35)); // crosses into the boot-service scratch
         let t = acpi::build(1, u64::MAX - 8);
-        let i = Inputs { acpi: Some(&t), ..inputs(&ok, "", None) };
+        let i = Inputs {
+            acpi: Some(&t),
+            ..inputs(&ok, "", None)
+        };
         assert_eq!(bad(SMALL, i), BadTables(u64::MAX - 8));
         // A non-relocatable kernel over the loader's own data (zero page, GDT) or in high RAM; an alignment overflow.
         for pref in [0x1_0000u64, GDT, 4 * GIB] {
-            let fixed = set(set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]), at::PREF_ADDRESS, &pref.to_le_bytes());
-            assert_eq!(bad(SMALL, inputs(&fixed, "", None)), KernelDoesNotFit { start: pref, bytes: 4 * MIB });
+            let fixed = set(
+                set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]),
+                at::PREF_ADDRESS,
+                &pref.to_le_bytes(),
+            );
+            assert_eq!(
+                bad(SMALL, inputs(&fixed, "", None)),
+                KernelDoesNotFit {
+                    start: pref,
+                    bytes: 4 * MIB
+                }
+            );
         }
-        let wrap = set(ok.clone(), at::PREF_ADDRESS, &(u64::MAX - 0xfff).to_le_bytes());
-        assert_eq!(bad(SMALL, inputs(&wrap, "", None)), KernelDoesNotFit { start: u64::MAX, bytes: 4 * MIB });
-        let wrap = set(set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]), at::PREF_ADDRESS, &(u64::MAX - 0xfff).to_le_bytes());
-        assert_eq!(bad(SMALL, inputs(&wrap, "", None)).code(), "KERNEL_DOES_NOT_FIT");
-        assert_eq!(bad(Layout { low_end: 64 * MIB, high: 1 << 40 }, inputs(&ok, "", None)).code(), "BAD_LAYOUT");
+        let wrap = set(
+            ok.clone(),
+            at::PREF_ADDRESS,
+            &(u64::MAX - 0xfff).to_le_bytes(),
+        );
+        assert_eq!(
+            bad(SMALL, inputs(&wrap, "", None)),
+            KernelDoesNotFit {
+                start: u64::MAX,
+                bytes: 4 * MIB
+            }
+        );
+        let wrap = set(
+            set(ok.clone(), at::RELOCATABLE_KERNEL, &[0]),
+            at::PREF_ADDRESS,
+            &(u64::MAX - 0xfff).to_le_bytes(),
+        );
+        assert_eq!(
+            bad(SMALL, inputs(&wrap, "", None)).code(),
+            "KERNEL_DOES_NOT_FIT"
+        );
+        assert_eq!(
+            bad(
+                Layout {
+                    low_end: 64 * MIB,
+                    high: 1 << 40
+                },
+                inputs(&ok, "", None)
+            )
+            .code(),
+            "BAD_LAYOUT"
+        );
     }
 
     #[test]
     fn layout_e820() {
         let map = Layout::DEFAULT.e820().unwrap();
-        assert!(map.windows(2).all(|w| w[0].addr + w[0].size == w[1].addr), "contiguous and sorted");
-        assert_eq!((map[0].addr, map.last().unwrap().addr + map.last().unwrap().size), (0, 4 * GIB));
-        let ram: u64 = map.iter().filter(|e| e.kind == E820_RAM).map(|e| e.size).sum();
+        assert!(
+            map.windows(2).all(|w| w[0].addr + w[0].size == w[1].addr),
+            "contiguous and sorted"
+        );
+        assert_eq!(
+            (
+                map[0].addr,
+                map.last().unwrap().addr + map.last().unwrap().size
+            ),
+            (0, 4 * GIB)
+        );
+        let ram: u64 = map
+            .iter()
+            .filter(|e| e.kind == E820_RAM)
+            .map(|e| e.size)
+            .sum();
         assert_eq!(ram, 0x9_f000 + 2 * GIB - RAM_START);
-        let high = Layout { low_end: GIB, high: 2 * GIB }.e820().unwrap();
+        let high = Layout {
+            low_end: GIB,
+            high: 2 * GIB,
+        }
+        .e820()
+        .unwrap();
         assert!(high.len() <= E820_MAX);
-        assert_eq!(*high.last().unwrap(), E820 { addr: 4 * GIB, size: 2 * GIB, kind: E820_RAM });
+        assert_eq!(
+            *high.last().unwrap(),
+            E820 {
+                addr: 4 * GIB,
+                size: 2 * GIB,
+                kind: E820_RAM
+            }
+        );
     }
 
     /// Image values in "write" fields never reach the zero page.
     #[test]
     fn write_fields_are_the_loaders() {
         let mut d = image(0x1000);
-        for (o, v) in [(at::RAMDISK_IMAGE, 0x200_0000u32), (at::RAMDISK_SIZE, 0x1000), (at::HEAP_END_PTR, 0x1234_5678), (at::HARDWARE_SUBARCH, 2), (at::SETUP_DATA, 0x12_3456), (at::SETUP_DATA + 4, 1), (at::HARDWARE_SUBARCH_DATA, 9)] {
+        for (o, v) in [
+            (at::RAMDISK_IMAGE, 0x200_0000u32),
+            (at::RAMDISK_SIZE, 0x1000),
+            (at::HEAP_END_PTR, 0x1234_5678),
+            (at::HARDWARE_SUBARCH, 2),
+            (at::SETUP_DATA, 0x12_3456),
+            (at::SETUP_DATA + 4, 1),
+            (at::HARDWARE_SUBARCH_DATA, 9),
+        ] {
             d[o..o + 4].copy_from_slice(&v.to_le_bytes());
         }
         d[at::LOADFLAGS] = 0xe1;
@@ -648,7 +1017,15 @@ pub(crate) mod tests {
         let mut z = vec![0u8; 4096];
         assert!(r.copy_out(ZERO_PAGE, &mut z));
         assert_eq!(z[at::LOADFLAGS], 1);
-        for o in [at::RAMDISK_IMAGE, at::RAMDISK_SIZE, at::HEAP_END_PTR, at::HARDWARE_SUBARCH, at::SETUP_DATA, at::SETUP_DATA + 4, at::HARDWARE_SUBARCH_DATA] {
+        for o in [
+            at::RAMDISK_IMAGE,
+            at::RAMDISK_SIZE,
+            at::HEAP_END_PTR,
+            at::HARDWARE_SUBARCH,
+            at::SETUP_DATA,
+            at::SETUP_DATA + 4,
+            at::HARDWARE_SUBARCH_DATA,
+        ] {
             assert_eq!(u32_at(&z, o), 0, "{o:#x}");
         }
     }
@@ -660,12 +1037,28 @@ pub(crate) mod tests {
         let (_v, r) = ram(SMALL.low_end);
         let rd = vec![7u8; 5000];
         let tables = acpi::build(2, ACPI_NVS.0);
-        let l = load(&r, &SMALL, &Inputs { image: &ok, cmdline: "mitigations=off nokaslr", initrd: Some(&rd), acpi: Some(&tables) }).unwrap();
+        let l = load(
+            &r,
+            &SMALL,
+            &Inputs {
+                image: &ok,
+                cmdline: "mitigations=off nokaslr",
+                initrd: Some(&rd),
+                acpi: Some(&tables),
+            },
+        )
+        .unwrap();
         assert_eq!((l.kernel, l.window), (RAM_START, 4 * MIB));
         assert_eq!(l.initrd, Some((SMALL.low_end - 2 * PAGE, 5000)));
         let mut z = vec![0u8; 4096];
         assert!(r.copy_out(ZERO_PAGE, &mut z));
-        let written = [at::TYPE_OF_LOADER..at::TYPE_OF_LOADER + 1, at::CODE32_START..at::RAMDISK_SIZE + 4, at::HEAP_END_PTR..at::CMD_LINE_PTR + 4, at::HARDWARE_SUBARCH..at::HARDWARE_SUBARCH_DATA + 8, at::SETUP_DATA..at::SETUP_DATA + 8];
+        let written = [
+            at::TYPE_OF_LOADER..at::TYPE_OF_LOADER + 1,
+            at::CODE32_START..at::RAMDISK_SIZE + 4,
+            at::HEAP_END_PTR..at::CMD_LINE_PTR + 4,
+            at::HARDWARE_SUBARCH..at::HARDWARE_SUBARCH_DATA + 8,
+            at::SETUP_DATA..at::SETUP_DATA + 8,
+        ];
         for o in (0x1f1..0x26c).filter(|o| !written.iter().any(|w| w.contains(o))) {
             assert_eq!(z[o], ok[o], "header byte {o:#x} copied");
         }
@@ -673,15 +1066,24 @@ pub(crate) mod tests {
         assert_eq!(z[0x1ef], 0, "sentinel");
         assert_eq!(u32_at(&z, at::CODE32_START), RAM_START as u32);
         assert_eq!(u32_at(&z, at::CMD_LINE_PTR), CMDLINE as u32);
-        assert_eq!((u32_at(&z, at::RAMDISK_IMAGE), u32_at(&z, at::RAMDISK_SIZE)), ((SMALL.low_end - 2 * PAGE) as u32, 5000));
+        assert_eq!(
+            (u32_at(&z, at::RAMDISK_IMAGE), u32_at(&z, at::RAMDISK_SIZE)),
+            ((SMALL.low_end - 2 * PAGE) as u32, 5000)
+        );
         assert_eq!(u64_at(&z, at::ACPI_RSDP_ADDR), ACPI_NVS.0);
         // Every table byte is in guest RAM and inside one of the loader's recorded writes.
         for (gpa, bytes) in &tables.blobs {
             assert!(r.matches(*gpa, bytes));
-            assert!(l.writes.iter().any(|&(a, n)| a <= *gpa && gpa + bytes.len() as u64 <= a + n), "{gpa:#x}");
+            assert!(
+                l.writes
+                    .iter()
+                    .any(|&(a, n)| a <= *gpa && gpa + bytes.len() as u64 <= a + n),
+                "{gpa:#x}"
+            );
         }
         assert_eq!(z[at::E820_ENTRIES] as usize, SMALL.e820().unwrap().len());
-        assert!(z[0x26c..].iter().enumerate().all(|(i, &b)| b == 0 || (at::E820_TABLE - 0x26c..at::E820_TABLE - 0x26c + 20 * 9).contains(&i)));
+        assert!(z[0x26c..].iter().enumerate().all(|(i, &b)| b == 0
+            || (at::E820_TABLE - 0x26c..at::E820_TABLE - 0x26c + 20 * 9).contains(&i)));
         let mut c = vec![0u8; 24];
         assert!(r.copy_out(CMDLINE, &mut c));
         assert_eq!(&c, b"mitigations=off nokaslr\0");
@@ -689,19 +1091,51 @@ pub(crate) mod tests {
         assert!(r.matches(SMALL.low_end - 2 * PAGE, &rd));
         // Identity map: PML4[0] -> PDPT[0] -> PD with 32 2 MiB leaves.
         assert_eq!(r.read::<u64>(PAGE_TABLES), Some(PAGE_TABLES + PAGE | 3));
-        assert_eq!(r.read::<u64>(PAGE_TABLES + PAGE), Some(PAGE_TABLES + 2 * PAGE | 3));
-        assert_eq!(r.read::<u64>(PAGE_TABLES + 2 * PAGE + 8 * 31), Some(62 * MIB | 0x83));
+        assert_eq!(
+            r.read::<u64>(PAGE_TABLES + PAGE),
+            Some(PAGE_TABLES + 2 * PAGE | 3)
+        );
+        assert_eq!(
+            r.read::<u64>(PAGE_TABLES + 2 * PAGE + 8 * 31),
+            Some(62 * MIB | 0x83)
+        );
         assert_eq!(r.read::<u64>(PAGE_TABLES + 2 * PAGE + 8 * 32), Some(0));
         let cpu = l.cpu;
-        assert_eq!((cpu.rip, cpu.gpr[6], cpu.rflags & 0x200, cpu.cpl), (RAM_START + 0x200, ZERO_PAGE, 0, 0));
-        assert_eq!((cpu.seg[exec::SREG_CS].selector, cpu.seg[exec::SREG_DS].selector, cpu.seg[exec::SREG_SS].selector), (0x10, 0x18, 0x18));
-        assert_eq!(cpu.seg[exec::SREG_CS].attributes & (exec::ATTR_L | exec::ATTR_D), exec::ATTR_L);
+        assert_eq!(
+            (cpu.rip, cpu.gpr[6], cpu.rflags & 0x200, cpu.cpl),
+            (RAM_START + 0x200, ZERO_PAGE, 0, 0)
+        );
+        assert_eq!(
+            (
+                cpu.seg[exec::SREG_CS].selector,
+                cpu.seg[exec::SREG_DS].selector,
+                cpu.seg[exec::SREG_SS].selector
+            ),
+            (0x10, 0x18, 0x18)
+        );
+        assert_eq!(
+            cpu.seg[exec::SREG_CS].attributes & (exec::ATTR_L | exec::ATTR_D),
+            exec::ATTR_L
+        );
         assert!(cpu.control().is_some(), "a mode the resident runs");
         // X4: the AP wake state (ACPI 6.5 Table 5.44): long mode, paging through the identity map, IF = 0, flat selectors
         // from the GDT in the NVS scratch (written there), NXE; no IDT.
         let ap = l.ap;
-        assert_eq!((ap.cr3, ap.cr0, ap.efer, ap.rflags, ap.gdtr.base, ap.idtr.limit), (PAGE_TABLES, cpu.cr0, 0xd00, 2, AP_GDT, 0));
-        assert_eq!(ap.seg.map(|s| s.selector), [0x18, 0x10, 0x18, 0x18, 0x18, 0x18]);
+        assert_eq!(
+            (
+                ap.cr3,
+                ap.cr0,
+                ap.efer,
+                ap.rflags,
+                ap.gdtr.base,
+                ap.idtr.limit
+            ),
+            (PAGE_TABLES, cpu.cr0, 0xd00, 2, AP_GDT, 0)
+        );
+        assert_eq!(
+            ap.seg.map(|s| s.selector),
+            [0x18, 0x10, 0x18, 0x18, 0x18, 0x18]
+        );
         assert_eq!(r.read::<u64>(AP_GDT + 16), Some(GDT_ENTRIES[2]));
         assert!(ap.control().is_some());
     }

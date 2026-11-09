@@ -24,20 +24,31 @@ pub fn pcmpstr(lhs: u128, rhs: u128, control: u32, rax: u64, rdx: u64) -> u32 {
         3 => int1 ^ ((1u32 << len2) - 1),
         _ => int1,
     };
-    let flags = u32::from(len1 < n) << 3 | u32::from(len2 < n) << 2 | u32::from(int2 != 0) << 1 | int2 & 1;
+    let flags =
+        u32::from(len1 < n) << 3 | u32::from(len2 < n) << 2 | u32::from(int2 != 0) << 1 | int2 & 1;
     int2 | flags << 28
 }
 
 /// The element count up to the first zero element (n if none).
 fn implicit(v: u128, words: bool) -> u32 {
     let n = if words { 8 } else { 16 };
-    (0..n).find(|&i| element(v, i, words as u32) == 0).unwrap_or(n)
+    (0..n)
+        .find(|&i| element(v, i, words as u32) == 0)
+        .unwrap_or(n)
 }
 /// |EAX| or |RAX| (REX.W), saturated to the element count.
 fn explicit(reg: u64, control: u32) -> u32 {
     let n: i64 = if control & 1 != 0 { 8 } else { 16 };
-    let v = if control & WIDE != 0 { reg as i64 } else { reg as i32 as i64 };
-    if v < -n || v > n { n as u32 } else { v.unsigned_abs() as u32 }
+    let v = if control & WIDE != 0 {
+        reg as i64
+    } else {
+        reg as i32 as i64
+    };
+    if v < -n || v > n {
+        n as u32
+    } else {
+        v.unsigned_abs() as u32
+    }
 }
 /// Element `i` by the data format (control 1:0: unsigned bytes, unsigned words, signed bytes, signed words).
 fn element(v: u128, i: u32, control: u32) -> i32 {
@@ -57,7 +68,9 @@ fn aggregate(lhs: u128, len1: u32, rhs: u128, len2: u32, control: u32, n: u32) -
         // Equal any: rhs[j] equals some valid lhs element.
         0 => (0..len2).for_each(|j| res |= u32::from((0..len1).any(|i| l(i) == r(j))) << j),
         // Ranges: rhs[j] inside some complete valid pair [lhs[2k], lhs[2k + 1]].
-        1 => (0..len2).for_each(|j| res |= u32::from((0..len1 / 2).any(|k| l(2 * k) <= r(j) && r(j) <= l(2 * k + 1))) << j),
+        1 => (0..len2).for_each(|j| {
+            res |= u32::from((0..len1 / 2).any(|k| l(2 * k) <= r(j) && r(j) <= l(2 * k + 1))) << j
+        }),
         // Equal each: both valid and equal, or both invalid.
         2 => (0..n).for_each(|i| {
             let (a, b) = (i < len1, i < len2);
@@ -65,7 +78,9 @@ fn aggregate(lhs: u128, len1: u32, rhs: u128, len2: u32, control: u32, n: u32) -
         }),
         // Equal ordered: the valid lhs prefix matches rhs from j on (an lhs element past rhs's end fails, one past the
         // vector's end is not compared).
-        _ => (0..n).for_each(|j| res |= u32::from((0..len1.min(n - j)).all(|i| i + j < len2 && l(i) == r(i + j))) << j),
+        _ => (0..n).for_each(|j| {
+            res |= u32::from((0..len1.min(n - j)).all(|i| i + j < len2 && l(i) == r(i + j))) << j
+        }),
     }
     res
 }
@@ -90,7 +105,11 @@ mod tests {
         let len = |v: u128, reg: Option<(u64, bool)>| -> u32 {
             match reg {
                 Some((r, w)) => {
-                    let x: i128 = if w { r as i64 as i128 } else { r as i32 as i128 };
+                    let x: i128 = if w {
+                        r as i64 as i128
+                    } else {
+                        r as i32 as i128
+                    };
                     x.unsigned_abs().min(n as u128) as u32
                 }
                 None => (0..n).position(|i| get(v, i) == 0).map_or(n, |p| p as u32),
@@ -108,7 +127,13 @@ mod tests {
                 2 if !vi || !vj => !vi && !vj,
                 3 if !vi => true,
                 3 if !vj => false,
-                1 => if i % 2 == 0 { get(lhs, i) <= get(rhs, j) } else { get(lhs, i) >= get(rhs, j) },
+                1 => {
+                    if i % 2 == 0 {
+                        get(lhs, i) <= get(rhs, j)
+                    } else {
+                        get(lhs, i) >= get(rhs, j)
+                    }
+                }
                 _ => get(lhs, i) == get(rhs, j),
             }
         };
@@ -116,7 +141,9 @@ mod tests {
         for j in 0..n {
             let bit = match agg {
                 0 => (0..n).any(|i| boolres(j, i)),
-                1 => (0..n).step_by(2).any(|i| boolres(j, i) && boolres(j, i + 1)),
+                1 => (0..n)
+                    .step_by(2)
+                    .any(|i| boolres(j, i) && boolres(j, i + 1)),
                 2 => boolres(j, j),
                 _ => (0..n - j).all(|i| boolres(i + j, i)),
             };
@@ -127,7 +154,13 @@ mod tests {
             let b = int1 >> i & 1 != 0;
             let v = match imm >> 4 & 3 {
                 1 => !b,
-                3 => if i < len2 { !b } else { b },
+                3 => {
+                    if i < len2 {
+                        !b
+                    } else {
+                        b
+                    }
+                }
                 _ => b,
             };
             int2 |= u32::from(v) << i;
@@ -148,11 +181,21 @@ mod tests {
         fn vector(&mut self, words: bool) -> u128 {
             let (n, w) = if words { (8, 16) } else { (16, 8) };
             let mut v = 0u128;
-            let zero_at = if self.next() % 3 == 0 { n } else { (self.next() % (n as u64 + 1)) as u32 };
+            let zero_at = if self.next() % 3 == 0 {
+                n
+            } else {
+                (self.next() % (n as u64 + 1)) as u32
+            };
             for i in 0..n {
                 let e: u128 = match self.next() % 8 {
                     0 if i != zero_at => self.next() as u128 & ((1 << w) - 1),
-                    1 => if words { 0x8000 | (self.next() & 0xff) as u128 } else { 0x80 | (self.next() & 7) as u128 },
+                    1 => {
+                        if words {
+                            0x8000 | (self.next() & 0xff) as u128
+                        } else {
+                            0x80 | (self.next() & 7) as u128
+                        }
+                    }
                     _ => 0x41 + (self.next() % 6) as u128,
                 };
                 v |= if i == zero_at { 0 } else { e.max(1) } << (w * i);
@@ -164,19 +207,50 @@ mod tests {
     #[test]
     fn port_matches_sdm_every_imm8() {
         let mut r = Rng(0x9e37_79b9_7f4a_7c15);
-        let lens = [0u64, 1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 100, -1i64 as u64, -3i64 as u64, -8i64 as u64, -16i64 as u64, -17i64 as u64,
-            0x8000_0000, 0xffff_ffff_0000_0003, 0x1_0000_0002, i64::MIN as u64];
+        let lens = [
+            0u64,
+            1,
+            2,
+            3,
+            5,
+            7,
+            8,
+            9,
+            15,
+            16,
+            17,
+            100,
+            -1i64 as u64,
+            -3i64 as u64,
+            -8i64 as u64,
+            -16i64 as u64,
+            -17i64 as u64,
+            0x8000_0000,
+            0xffff_ffff_0000_0003,
+            0x1_0000_0002,
+            i64::MIN as u64,
+        ];
         for imm in 0..256u32 {
             for _ in 0..200 {
                 let words = imm & 1 != 0;
                 let (a, b) = (r.vector(words), r.vector(words));
                 let ctl = imm & 0x7f; // bit 6 selects only the output form, FEX's IR's
-                assert_eq!(pcmpstr(a, b, ctl, 0, 0), sdm(a, b, ctl, None), "implicit imm {imm:#x} {a:#x} {b:#x}");
+                assert_eq!(
+                    pcmpstr(a, b, ctl, 0, 0),
+                    sdm(a, b, ctl, None),
+                    "implicit imm {imm:#x} {a:#x} {b:#x}"
+                );
                 for wide in [false, true] {
-                    let (rax, rdx) = (lens[(r.next() % lens.len() as u64) as usize], lens[(r.next() % lens.len() as u64) as usize]);
+                    let (rax, rdx) = (
+                        lens[(r.next() % lens.len() as u64) as usize],
+                        lens[(r.next() % lens.len() as u64) as usize],
+                    );
                     let c = ctl | EXPLICIT | if wide { WIDE } else { 0 };
-                    assert_eq!(pcmpstr(a, b, c, rax, rdx), sdm(a, b, ctl, Some((rax, rdx, wide))),
-                               "explicit imm {imm:#x} wide {wide} {a:#x} {b:#x} {rax:#x} {rdx:#x}");
+                    assert_eq!(
+                        pcmpstr(a, b, c, rax, rdx),
+                        sdm(a, b, ctl, Some((rax, rdx, wide))),
+                        "explicit imm {imm:#x} wide {wide} {a:#x} {b:#x} {rax:#x} {rdx:#x}"
+                    );
                 }
             }
         }
