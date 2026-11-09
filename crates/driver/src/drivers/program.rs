@@ -2147,7 +2147,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let destroyed = machine.destroy();
     eprintln!("{}", teardown(n, supervision.as_ref().ok(), destroyed));
     if let Some(control) = &io_control {
-        eprintln!("io-disk: {}", control.json());
+        eprintln!(
+            "io-disk: {}",
+            serde_json::to_string(&control.report()).unwrap()
+        );
     }
     if args.io_net {
         eprintln!("io-net: {}", packet_trace.json());
@@ -2254,13 +2257,18 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         let _ = write!(devices, ",\"{name}\":{result}");
     }
     if let Some(control) = &io_control {
-        let _ = write!(devices, ",\"io_disk\":{}", control.json());
+        let _ = write!(
+            devices,
+            ",\"io_disk\":{}",
+            serde_json::to_string(&control.report()).unwrap()
+        );
     }
     if args.io_net {
         let _ = write!(devices, ",\"io_net\":{}", packet_trace.json());
     }
     // L3: port and unassigned-page counts and the UART's output, once there are any.
-    let counts = registry.report();
+    let counts = serde_json::to_string(&registry.report()).unwrap();
+    let counts = &counts[1..counts.len() - 1];
     let output = std::mem::take(&mut uart.lock().unwrap_or_else(|e| e.into_inner()).output);
     if counts != "\"ports\":[],\"unassigned_pages\":[]" || !output.is_empty() {
         let hex: String = output.iter().map(|b| format!("{b:02x}")).collect();
@@ -2624,7 +2632,7 @@ fn report(
         ran.decodes.values().sum::<u64>(),
         decodes,
         ran.entropy,
-        execution::k1_stats(area),
+        serde_json::to_string(&execution::k1_stats(area)).unwrap(),
         list(&fault),
         list(&s.native),
         frame_intact(area),

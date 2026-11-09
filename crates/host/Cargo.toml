@@ -6,6 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 natemu-abi = { path = "../abi" }
+serde.workspace = true
+serde_json.workspace = true
 virtio-queue = { git = "https://github.com/ArArgon/natemu-rust-vmm", rev = "5ede8fee887e2a39b3f4efe8822c85158d412120" }
 vm-memory = { git = "https://github.com/ArArgon/natemu-rust-vmm", rev = "5ede8fee887e2a39b3f4efe8822c85158d412120", features = ["backend-mmap"] }
 

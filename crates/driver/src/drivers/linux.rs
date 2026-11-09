@@ -422,14 +422,16 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         s.steps,
         s.links,
         s.unlinks,
-        execution::k1_stats(backing.vcpu(0)),
-        devices.report(),
+        serde_json::to_string(&execution::k1_stats(backing.vcpu(0))).unwrap(),
+        serde_json::to_string(&devices.report())
+            .unwrap()
+            .trim_matches(|c| c == '{' || c == '}'),
         prepared.serial_bytes(),
         prepared
             .serial_error()
             .map_or("null".into(), |e| format!("\"{}\"", e.replace('"', "'"))),
-        board.pit.json(),
-        board.rtc.json(),
+        serde_json::to_string(&*board.pit).unwrap(),
+        serde_json::to_string(&*board.rtc).unwrap(),
         lapic_end.fired,
         lapic_end.missed,
         lapic_end.reinjected,

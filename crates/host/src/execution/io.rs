@@ -108,22 +108,22 @@ impl Drop for Release<'_> {
 /// Host-side window counts for the run's performance log. Page-table marks are never cleared,
 /// so as the guest recycles former page-table pages for data, more write windows overlap them
 /// and force every vCPU to drop its translations; `table_writes` against `writes` shows that.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct WindowCounts {
     /// Windows that won their grant and copied at least one byte.
+    #[serde(rename = "windows")]
     pub granted: u64,
     /// Granted windows with at least one guest-RAM write.
+    #[serde(rename = "write_windows")]
     pub writes: u64,
     /// Granted windows whose writes overlapped a page ever walked as a page table.
+    #[serde(rename = "table_windows")]
     pub table_writes: u64,
 }
 impl WindowCounts {
     /// One `io {...}` JSON line for [`crate::perf::line`].
     pub fn perf_line(&self) -> String {
-        format!(
-            "io {{\"windows\":{},\"write_windows\":{},\"table_windows\":{}}}",
-            self.granted, self.writes, self.table_writes
-        )
+        format!("io {}", serde_json::to_string(self).unwrap())
     }
 }
 /// [`WindowCounts`] as the coordinator updates them. Only the window holder writes (under the
@@ -775,6 +775,15 @@ mod tests {
             b.io_window_counts(),
             counts,
             "only page-table overlaps count"
+        );
+        let old = format!(
+            "io {{\"windows\":{},\"write_windows\":{},\"table_windows\":{}}}",
+            counts.granted, counts.writes, counts.table_writes
+        );
+        assert_eq!(
+            counts.perf_line(),
+            old,
+            "the perf line is unchanged byte for byte"
         );
     }
 

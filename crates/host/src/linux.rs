@@ -417,38 +417,36 @@ impl Prepared {
                 let fexc = compiler.finish();
                 let area = backing.vcpu(v);
                 let s: State = area.read_record(exec::STATE_OFFSET);
-                let state = format!(
-                    "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}]}}",
-                    s.blocks,
-                    s.l2_hits,
-                    s.requests,
-                    s.retries,
-                    s.upgrades,
-                    s.evictions,
-                    s.linker,
-                    s.links,
-                    s.unlinks,
-                    s.invalidations,
-                    s.steps,
-                    s.shootdowns,
-                    s.systems,
-                    s.halts,
-                    s.interrupts,
-                    s.deliveries,
-                    s.stops,
-                    execution::shadow_resets(area),
-                    compiler.compiles,
-                    compiler.hits,
-                    compiler.disk_hits,
-                    compiler.relocated,
-                    compiler.relocation_refused,
-                    compiler.relocation_fallbacks,
-                    compiler.reuse_checks,
-                    compiler.hits_by_source,
-                    compiler.duplicates,
-                    compiler.lock_wait.0,
-                    compiler.lock_wait.1
-                );
+                let state = VcpuState {
+                    blocks: s.blocks,
+                    l2_hits: s.l2_hits,
+                    requests: s.requests,
+                    retries: s.retries,
+                    upgrades: s.upgrades,
+                    evictions: s.evictions,
+                    linker: s.linker,
+                    links: s.links,
+                    unlinks: s.unlinks,
+                    invalidations: s.invalidations,
+                    steps: s.steps,
+                    shootdowns: s.shootdowns,
+                    systems: s.systems,
+                    halts: s.halts,
+                    interrupts: s.interrupts,
+                    deliveries: s.deliveries,
+                    stops: s.stops,
+                    shadow_resets: execution::shadow_resets(area),
+                    compiles: compiler.compiles,
+                    hits: compiler.hits,
+                    disk_hits: compiler.disk_hits,
+                    relocated: compiler.relocated,
+                    relocation_refused: compiler.relocation_refused,
+                    relocation_fallbacks: compiler.relocation_fallbacks,
+                    reuse_checks: compiler.reuse_checks,
+                    hits_by_source: compiler.hits_by_source.to_vec(),
+                    duplicates: compiler.duplicates,
+                    lock_wait: compiler.lock_wait.into(),
+                };
                 match log.finish(
                     end,
                     fexc,
@@ -693,5 +691,114 @@ mod tests {
             .port(0, boot::acpi::platform::COM1_PORT + 1, 1, Some(2))
             .unwrap();
         assert!(execution::pending(&prepared.backing().memory, 0, 0x41));
+    }
+}
+
+/// A vCPU's resident and compiler counters for its performance-log line (`state`).
+#[derive(serde::Serialize)]
+struct VcpuState {
+    blocks: u64,
+    l2_hits: u64,
+    requests: u64,
+    retries: u64,
+    upgrades: u64,
+    evictions: u64,
+    linker: u64,
+    links: u64,
+    unlinks: u64,
+    invalidations: u64,
+    steps: u64,
+    shootdowns: u64,
+    systems: u64,
+    halts: u64,
+    interrupts: u64,
+    deliveries: u64,
+    stops: u64,
+    shadow_resets: u64,
+    compiles: u64,
+    hits: u64,
+    disk_hits: u64,
+    relocated: u64,
+    relocation_refused: u64,
+    relocation_fallbacks: u64,
+    reuse_checks: u64,
+    hits_by_source: Vec<u64>,
+    duplicates: u64,
+    lock_wait: [u64; 2],
+}
+
+#[cfg(test)]
+mod report_tests {
+    #[test]
+    fn vcpu_state_matches_the_former_format() {
+        let mut n = 0;
+        let mut next = || {
+            n += 1_000_003u64;
+            n
+        };
+        let v = super::VcpuState {
+            blocks: next(),
+            l2_hits: next(),
+            requests: next(),
+            retries: next(),
+            upgrades: next(),
+            evictions: next(),
+            linker: next(),
+            links: next(),
+            unlinks: next(),
+            invalidations: next(),
+            steps: next(),
+            shootdowns: next(),
+            systems: next(),
+            halts: next(),
+            interrupts: next(),
+            deliveries: next(),
+            stops: next(),
+            shadow_resets: next(),
+            compiles: next(),
+            hits: next(),
+            disk_hits: next(),
+            relocated: next(),
+            relocation_refused: next(),
+            relocation_fallbacks: next(),
+            reuse_checks: next(),
+            hits_by_source: (0..64).map(|_| next()).collect(),
+            duplicates: next(),
+            lock_wait: [next(), next()],
+        };
+        let old = format!(
+            "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}]}}",
+            v.blocks,
+            v.l2_hits,
+            v.requests,
+            v.retries,
+            v.upgrades,
+            v.evictions,
+            v.linker,
+            v.links,
+            v.unlinks,
+            v.invalidations,
+            v.steps,
+            v.shootdowns,
+            v.systems,
+            v.halts,
+            v.interrupts,
+            v.deliveries,
+            v.stops,
+            v.shadow_resets,
+            v.compiles,
+            v.hits,
+            v.disk_hits,
+            v.relocated,
+            v.relocation_refused,
+            v.relocation_fallbacks,
+            v.reuse_checks,
+            v.hits_by_source,
+            v.duplicates,
+            v.lock_wait[0],
+            v.lock_wait[1]
+        );
+        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        assert_eq!(old, serde_json::to_value(&v).unwrap());
     }
 }

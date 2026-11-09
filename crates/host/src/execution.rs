@@ -8,6 +8,7 @@
 //! vCPU's doorbell, which stops it precisely at its next block boundary in the VM.
 use super::*;
 use crate::admission;
+use crate::report::Members;
 use natemu_abi::execution::{self as exec, Cpu, State, cache};
 use natemu_abi::guest_memory::GuestRam;
 use natemu_abi::paging::Fault;
@@ -523,88 +524,136 @@ pub fn end_when_halted(memory: &Memory, v: usize) {
 pub fn shadow_resets(area: Area) -> u64 {
     global_u64(area.memory, cache::RESETS + 8 * area.vcpu).load(SeqCst)
 }
-/// K1: vCPU `area.vcpu`'s TLB events and revalidations (`cache::Control`), as a JSON object; with M2's data shadows by
-/// memory type (`memory_types`: {"UC": n, ...}, the types with a non-zero count) and its UC accesses (`uncached`:
-/// instructions run alone for one, the resident's own).
-pub fn k1_stats(area: Area) -> String {
-    let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
-    const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
-    let types: Vec<String> = (0..8)
-        .filter(|&t| c.memory_types[t] != 0)
-        .map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t]))
-        .collect();
-    // Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
-    let kinds: Vec<String> = (0..128)
-        .filter(|&k| c.system_counts[k] != 0)
-        .map(|k| {
-            format!(
-                "\"{k:#x}\":[{},{}]",
-                c.system_counts[k],
-                ticks_ns(c.system_ticks[k]) / 1000
-            )
-        })
-        .collect();
-    let declined: Vec<String> = natemu_abi::execution::perf::SYS_FAST_DECLINE_NAMES
-        .iter()
-        .zip(c.sys_fast_declined)
-        .map(|(name, count)| format!("\"{name}\":{count}"))
-        .collect();
-    let from: Vec<String> = (0..32)
-        .filter(|&b| c.system_from[b] != 0)
-        .map(|b| {
-            format!(
-                "\"{}\":{}",
-                natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"),
-                c.system_from[b]
-            )
-        })
-        .collect();
-    format!(
-        "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}}}}",
-        c.cr3_loads,
-        c.global_flushes,
-        c.invlpgs,
-        c.revalidated,
-        c.remapped,
-        c.capacity_flushes,
-        c.killed,
-        c.unvalidated,
-        ticks_ns(c.tlb_ticks) / 1000,
-        ticks_ns(c.invlpg_ticks) / 1000,
-        c.page_faults,
-        ticks_ns(c.page_fault_ticks) / 1000,
-        c.scanned,
-        types.join(","),
-        c.uncached_steps,
-        c.uncached_resident,
-        c.l1_switches,
-        c.l1_clears,
-        c.flushes,
-        ticks_ns(c.flush_ticks) / 1000,
-        c.full,
-        c.code_used,
-        c.meta_used,
-        c.blocks,
-        [
-            c.peak[0].max(c.code_used),
-            c.peak[1].max(c.meta_used),
-            c.peak[2].max(c.blocks)
-        ],
-        c.code_bytes,
-        cache::META_BYTES,
-        cache::MAX_BLOCKS,
-        c.reclaims,
-        c.reclaimed,
-        c.reuse_copies,
-        c.reuse_refused,
-        c.reuse_checks,
-        c.slot_writes,
-        c.kept_resets,
-        kinds.join(","),
-        from.join(","),
-        c.system_chained,
-        declined.join(",")
-    )
+/// K1: vCPU `area.vcpu`'s TLB events and revalidations (`cache::Control`); with M2's data shadows by memory type
+/// (`memory_types`: {"UC": n, ...}, the types with a non-zero count) and its UC accesses (`uncached`: instructions run
+/// alone for one, the resident's own).
+pub fn k1_stats(area: Area) -> K1 {
+    K1::new(&area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL))
+}
+/// [`k1_stats`]: a vCPU's TLB, code-cache and system-instruction counters (times in us).
+#[derive(Debug, serde::Serialize)]
+pub struct K1 {
+    cr3_loads: u64,
+    global_flushes: u64,
+    invlpgs: u64,
+    revalidated: u64,
+    remapped: u64,
+    capacity_flushes: u64,
+    killed: u64,
+    unvalidated: u64,
+    tlb_us: u64,
+    invlpg_us: u64,
+    page_faults: u64,
+    page_fault_us: u64,
+    scanned: u64,
+    memory_types: Members<&'static str, u64>,
+    uncached: K1Uncached,
+    l1_switches: u64,
+    l1_clears: u64,
+    flushes: u64,
+    flush_us: u64,
+    full: [u64; 3],
+    used: [u64; 3],
+    peak: [u64; 3],
+    capacity: [u64; 3],
+    reclaims: [u64; 2],
+    reuse: K1Reuse,
+    slot_writes: u64,
+    kept_resets: u64,
+    systems: K1Systems,
+}
+#[derive(Debug, serde::Serialize)]
+struct K1Uncached {
+    steps: u64,
+    resident: u64,
+}
+#[derive(Debug, serde::Serialize)]
+struct K1Reuse {
+    copies: u64,
+    refused: [u64; 5],
+    checks: u64,
+}
+/// Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
+#[derive(Debug, serde::Serialize)]
+struct K1Systems {
+    kinds: Members<String, [u64; 2]>,
+    from: Members<&'static str, u64>,
+    chained: u64,
+    declined: Members<&'static str, u64>,
+}
+impl K1 {
+    fn new(c: &cache::Control) -> Self {
+        use natemu_abi::execution::perf::{NAMES as BUCKETS, SYS_FAST_DECLINE_NAMES};
+        const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
+        let us = |ticks| ticks_ns(ticks) / 1000;
+        Self {
+            cr3_loads: c.cr3_loads,
+            global_flushes: c.global_flushes,
+            invlpgs: c.invlpgs,
+            revalidated: c.revalidated,
+            remapped: c.remapped,
+            capacity_flushes: c.capacity_flushes,
+            killed: c.killed,
+            unvalidated: c.unvalidated,
+            tlb_us: us(c.tlb_ticks),
+            invlpg_us: us(c.invlpg_ticks),
+            page_faults: c.page_faults,
+            page_fault_us: us(c.page_fault_ticks),
+            scanned: c.scanned,
+            memory_types: (0..8)
+                .filter(|&t| c.memory_types[t] != 0)
+                .map(|t| (NAMES[t], c.memory_types[t]))
+                .collect(),
+            uncached: K1Uncached {
+                steps: c.uncached_steps,
+                resident: c.uncached_resident,
+            },
+            l1_switches: c.l1_switches,
+            l1_clears: c.l1_clears,
+            flushes: c.flushes,
+            flush_us: us(c.flush_ticks),
+            full: c.full,
+            used: [c.code_used, c.meta_used, c.blocks],
+            peak: [
+                c.peak[0].max(c.code_used),
+                c.peak[1].max(c.meta_used),
+                c.peak[2].max(c.blocks),
+            ],
+            capacity: [
+                c.code_bytes,
+                cache::META_BYTES as u64,
+                cache::MAX_BLOCKS as u64,
+            ],
+            reclaims: [c.reclaims, c.reclaimed],
+            reuse: K1Reuse {
+                copies: c.reuse_copies,
+                refused: c.reuse_refused,
+                checks: c.reuse_checks,
+            },
+            slot_writes: c.slot_writes,
+            kept_resets: c.kept_resets,
+            systems: K1Systems {
+                kinds: (0..128)
+                    .filter(|&k| c.system_counts[k] != 0)
+                    .map(|k| {
+                        (
+                            format!("{k:#x}"),
+                            [c.system_counts[k], us(c.system_ticks[k])],
+                        )
+                    })
+                    .collect(),
+                from: (0..32)
+                    .filter(|&b| c.system_from[b] != 0)
+                    .map(|b| (*BUCKETS.get(b).unwrap_or(&"?"), c.system_from[b]))
+                    .collect(),
+                chained: c.system_chained,
+                declined: SYS_FAST_DECLINE_NAMES
+                    .into_iter()
+                    .zip(c.sys_fast_declined)
+                    .collect(),
+            },
+        }
+    }
 }
 /// Guest RAM was written by the host (only while every vCPU is stopped): each vCPU drops its cached code before it
 /// next runs guest code.
@@ -1675,16 +1724,23 @@ impl Answers {
     }
     /// The performance log's line for the run: each shard's lock waits, `[ns, count]`, and the bytes and answers kept.
     pub fn report(&self) -> String {
-        let w: Vec<String> = self
-            .waits
-            .iter()
-            .map(|[ns, n]| format!("[{},{}]", ns.load(Relaxed), n.load(Relaxed)))
-            .collect();
-        let (bytes, answers) = self.kept();
-        format!(
-            "answers {{\"lock_waits\":[{}],\"kept_bytes\":{bytes},\"kept_answers\":{answers}}}",
-            w.join(",")
-        )
+        #[derive(serde::Serialize)]
+        struct Report {
+            lock_waits: Vec<[u64; 2]>,
+            kept_bytes: usize,
+            kept_answers: usize,
+        }
+        let (kept_bytes, kept_answers) = self.kept();
+        let report = Report {
+            lock_waits: self
+                .waits
+                .iter()
+                .map(|[ns, n]| [ns.load(Relaxed), n.load(Relaxed)])
+                .collect(),
+            kept_bytes,
+            kept_answers,
+        };
+        format!("answers {}", serde_json::to_string(&report).unwrap())
     }
 }
 /// What [`Compiler::compile`] gives the service loop.
@@ -3120,6 +3176,88 @@ mod tests {
         }
     }
 
+    /// The former K1 formatter, the reference for [`K1`]'s serialization.
+    fn old_k1_stats(area: Area) -> String {
+        let c: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+        const NAMES: [&str; 8] = ["UC", "WC", "2", "3", "WT", "WP", "WB", "UC-"];
+        let types: Vec<String> = (0..8)
+            .filter(|&t| c.memory_types[t] != 0)
+            .map(|t| format!("\"{}\":{}", NAMES[t], c.memory_types[t]))
+            .collect();
+        // Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
+        let kinds: Vec<String> = (0..128)
+            .filter(|&k| c.system_counts[k] != 0)
+            .map(|k| {
+                format!(
+                    "\"{k:#x}\":[{},{}]",
+                    c.system_counts[k],
+                    ticks_ns(c.system_ticks[k]) / 1000
+                )
+            })
+            .collect();
+        let declined: Vec<String> = natemu_abi::execution::perf::SYS_FAST_DECLINE_NAMES
+            .iter()
+            .zip(c.sys_fast_declined)
+            .map(|(name, count)| format!("\"{name}\":{count}"))
+            .collect();
+        let from: Vec<String> = (0..32)
+            .filter(|&b| c.system_from[b] != 0)
+            .map(|b| {
+                format!(
+                    "\"{}\":{}",
+                    natemu_abi::execution::perf::NAMES.get(b).unwrap_or(&"?"),
+                    c.system_from[b]
+                )
+            })
+            .collect();
+        format!(
+            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}}}}",
+            c.cr3_loads,
+            c.global_flushes,
+            c.invlpgs,
+            c.revalidated,
+            c.remapped,
+            c.capacity_flushes,
+            c.killed,
+            c.unvalidated,
+            ticks_ns(c.tlb_ticks) / 1000,
+            ticks_ns(c.invlpg_ticks) / 1000,
+            c.page_faults,
+            ticks_ns(c.page_fault_ticks) / 1000,
+            c.scanned,
+            types.join(","),
+            c.uncached_steps,
+            c.uncached_resident,
+            c.l1_switches,
+            c.l1_clears,
+            c.flushes,
+            ticks_ns(c.flush_ticks) / 1000,
+            c.full,
+            c.code_used,
+            c.meta_used,
+            c.blocks,
+            [
+                c.peak[0].max(c.code_used),
+                c.peak[1].max(c.meta_used),
+                c.peak[2].max(c.blocks)
+            ],
+            c.code_bytes,
+            cache::META_BYTES,
+            cache::MAX_BLOCKS,
+            c.reclaims,
+            c.reclaimed,
+            c.reuse_copies,
+            c.reuse_refused,
+            c.reuse_checks,
+            c.slot_writes,
+            c.kept_resets,
+            kinds.join(","),
+            from.join(","),
+            c.system_chained,
+            declined.join(",")
+        )
+    }
+
     #[test]
     fn sys_fast_declines_do_not_count_as_system_instructions() {
         use natemu_abi::execution::{perf::SysFastDecline, system};
@@ -3166,22 +3304,87 @@ mod tests {
         }
         assert_eq!(c.sys_fast_declined, [1, 2, 3, 4]);
         area.write_record(offset, c);
-        let output = crate::json::parse(&k1_stats(area)).unwrap();
-        let systems = output.get("systems").unwrap();
+        let output = serde_json::to_string(&k1_stats(area)).unwrap();
+        let systems = &serde_json::from_str::<serde_json::Value>(&output).unwrap()["systems"];
         assert_eq!(
-            systems.get("kinds"),
-            Some(
-                &crate::json::parse(r#"{"0x7c":[10,0],"0x7d":[11,0],"0x7e":[12,0],"0x7f":[13,0]}"#)
-                    .unwrap()
-            )
+            serde_json::to_string(&systems["kinds"]).unwrap(),
+            r#"{"0x7c":[10,0],"0x7d":[11,0],"0x7e":[12,0],"0x7f":[13,0]}"#
         );
-        assert_eq!(
-            systems.get("declined"),
-            Some(
-                &crate::json::parse(r#"{"not_current":1,"boundary":2,"other":3,"after":4}"#)
-                    .unwrap()
-            )
+        // In the names' order (serde_json's map would sort them).
+        assert!(
+            output.contains(r#""declined":{"not_current":1,"boundary":2,"other":3,"after":4}"#)
         );
+    }
+
+    #[test]
+    fn k1_matches_the_former_format() {
+        let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
+        let ram = unsafe { GuestRam::new(0, 0, memory.0 as u64) };
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
+        let empty: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
+        assert_eq!(empty, serde_json::to_value(k1_stats(area)).unwrap());
+        let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
+        let mut c: cache::Control = area.read_record(offset);
+        let mut n = 0;
+        let mut next = || {
+            n += 1_000_003;
+            n
+        };
+        for field in [
+            &mut c.cr3_loads,
+            &mut c.global_flushes,
+            &mut c.invlpgs,
+            &mut c.revalidated,
+            &mut c.remapped,
+            &mut c.capacity_flushes,
+            &mut c.killed,
+            &mut c.unvalidated,
+            &mut c.tlb_ticks,
+            &mut c.invlpg_ticks,
+            &mut c.page_faults,
+            &mut c.page_fault_ticks,
+            &mut c.scanned,
+            &mut c.uncached_steps,
+            &mut c.uncached_resident,
+            &mut c.l1_switches,
+            &mut c.l1_clears,
+            &mut c.flushes,
+            &mut c.flush_ticks,
+            &mut c.code_used,
+            &mut c.meta_used,
+            &mut c.blocks,
+            &mut c.code_bytes,
+            &mut c.reclaims,
+            &mut c.reclaimed,
+            &mut c.reuse_copies,
+            &mut c.reuse_checks,
+            &mut c.slot_writes,
+            &mut c.kept_resets,
+            &mut c.system_chained,
+        ] {
+            *field = next();
+        }
+        c.full = [1, 0, 1];
+        c.peak = [u64::MAX, 0, 7];
+        c.reuse_refused = [1, 2, 3, 4, 5];
+        c.sys_fast_declined = [9, 0, 8, 7];
+        (c.memory_types[0], c.memory_types[6], c.memory_types[7]) = (3, 4, 5);
+        (
+            c.system_counts[0x0f],
+            c.system_ticks[0x0f],
+            c.system_counts[0x7f],
+        ) = (6, 240_000, 1);
+        (c.system_from[0], c.system_from[5], c.system_from[31]) = (2, 3, 4);
+        area.write_record(offset, c);
+        let old: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
+        assert_eq!(old, serde_json::to_value(k1_stats(area)).unwrap());
     }
 
     /// Changes every answer `c` keeps (no other reference is held between compiles).
@@ -3217,6 +3420,30 @@ mod tests {
     /// Perf chunk 13: entries under one key (same limit, half, page offset and lead bytes) are told apart by the rest of
     /// what fexc read (later bytes, consulted gating values), never confused with another half, offset or limit; the
     /// answer kept for the requested RIP comes first.
+    #[test]
+    fn answers_report_matches_the_former_format() {
+        let a = Answers::new(u64::MAX);
+        a.insert(
+            None,
+            entry(0x1100, 0, &[1, 2, 3], 0, [0; GATING]),
+            &[1, 2, 3],
+            0x1100,
+        );
+        a.waits[1][0].store(12_345, Relaxed);
+        a.waits[1][1].store(6, Relaxed);
+        let w: Vec<String> = a
+            .waits
+            .iter()
+            .map(|[ns, n]| format!("[{},{}]", ns.load(Relaxed), n.load(Relaxed)))
+            .collect();
+        let (bytes, answers) = a.kept();
+        let old = format!(
+            "answers {{\"lock_waits\":[{}],\"kept_bytes\":{bytes},\"kept_answers\":{answers}}}",
+            w.join(",")
+        );
+        assert_eq!(a.report(), old, "byte for byte");
+    }
+
     #[test]
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);

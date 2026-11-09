@@ -11,3 +11,5 @@ io-test-hooks = ["natemu/io-test-hooks"]
 natemu = { path = "../host", features = ["testing"] }
 natemu-abi = { path = "../abi" }
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
