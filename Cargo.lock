@@ -172,10 +172,12 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 [[package]]
 name = "virtio-bindings"
 version = "0.2.7"
+source = "git+https://github.com/ArArgon/natemu-rust-vmm?rev=5ede8fee887e2a39b3f4efe8822c85158d412120#5ede8fee887e2a39b3f4efe8822c85158d412120"
 
 [[package]]
 name = "virtio-queue"
 version = "0.18.0"
+source = "git+https://github.com/ArArgon/natemu-rust-vmm?rev=5ede8fee887e2a39b3f4efe8822c85158d412120#5ede8fee887e2a39b3f4efe8822c85158d412120"
 dependencies = [
  "libc",
  "log",
@@ -187,6 +189,7 @@ dependencies = [
 [[package]]
 name = "vm-memory"
 version = "0.18.0"
+source = "git+https://github.com/ArArgon/natemu-rust-vmm?rev=5ede8fee887e2a39b3f4efe8822c85158d412120#5ede8fee887e2a39b3f4efe8822c85158d412120"
 dependencies = [
  "libc",
  "thiserror",
@@ -196,6 +199,7 @@ dependencies = [
 [[package]]
 name = "vmm-sys-util"
 version = "0.15.0"
+source = "git+https://github.com/ArArgon/natemu-rust-vmm?rev=5ede8fee887e2a39b3f4efe8822c85158d412120#5ede8fee887e2a39b3f4efe8822c85158d412120"
 dependencies = [
  "bitflags",
  "libc",

@@ -57,7 +57,7 @@ owner's K1 and P3 decisions.
 ## 1. Boot commands
 
 **Build and sign** (from the repository root; Rust 1.97.0, offline, locked; on a fresh clone run
-`git submodule update --init` (FEX and rust-vmm forks) and then `cargo +1.97.0 fetch --locked` once first, the
+`git submodule update --init` (the FEX fork) and then `cargo +1.97.0 fetch --locked` once first, the
 dependency policy below):
 
 ```sh
@@ -76,7 +76,7 @@ build and sign `natemu-host` themselves.
 `Cargo.lock`), and only they: the `natemu` stub (`crates/cli`, package `natemu-cli`) and the `natemu-host` test driver
 (`crates/driver`). **November 8 I/O amendment:** the owner authorized selective
 rust-vmm adoption. The library now consumes `virtio-queue` 0.18.0 and `vm-memory`
-0.18.0 from the `third_party/rust-vmm` submodule (the owner's fork, pinned), plus their locked dependencies;
+0.18.0 from the owner's fork ArArgon/natemu-rust-vmm (a Cargo git dependency pinned by commit), plus their locked dependencies;
 vm-memory's mmap feature is used for private descriptor snapshots, not guest RAM.
 See `crates/host/src/virtio/README.md` for the exact source identity and license
 inventory. The ABI and resident still take no registry dependency.

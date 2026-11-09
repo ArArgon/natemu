@@ -1,7 +1,6 @@
 [workspace]
 members = ["crates/abi", "crates/host", "crates/cli", "crates/driver", "crates/runtime"]
 default-members = ["crates/abi", "crates/host", "crates/cli", "crates/driver"]
-exclude = ["third_party"]
 resolver = "3"
 
 [workspace.package]
@@ -9,7 +8,7 @@ edition = "2024"
 rust-version = "1.97"
 
 # Host binaries use clap from crates.io, pinned in Cargo.lock. The host library also consumes the
-# rust-vmm queue/memory crates from the third_party/rust-vmm submodule and their locked dependencies (I/O plan).
+# rust-vmm queue/memory crates from the owner's fork (a git dependency pinned by commit) and their locked dependencies (I/O plan).
 # The resident and ABI remain free of registry dependencies.
 [workspace.dependencies]
 clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "suggestions"] }

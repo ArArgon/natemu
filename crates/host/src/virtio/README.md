@@ -1,5 +1,14 @@
 # Copy-first virtio owner
 
+Code map: `mod.rs` holds the MMIO transport (register offsets in `reg`, status
+bits in `status`), the shared lifecycle state, the owner loop and virtio-rng;
+`queue.rs` the queue registers and the checked parse of owned metadata copies;
+`block.rs` virtio-blk and its native disk lane; `net.rs` the network frontend
+and `PacketPort`; `testing.rs` the test driver's disk-call schedules. Every
+device ends a request through `Virtio::complete`, which publishes the used
+element and index and reads the available ring's flags and index back in the
+same window.
+
 The first production consumer is modern MMIO virtio-rng: VERSION_1 only, one
 8-entry direct split queue, one request in flight, at most 256 returned bytes.
 Larger valid writable chains receive a legal short completion. Indirect and
@@ -23,7 +32,8 @@ does not map natemu guest RAM. The complete chain is collected before any backen
 effect. Only GPA range validation uses natemu's mapping metadata, without
 reading, retaining, or dereferencing the returned pointer. Entropy goes into a
 256-byte owned array. A second window writes payload extents in descriptor order,
-then the used entry and used index, then reads notification suppression.
+then the used entry and used index, then reads the available ring's flags and
+index (notification suppression, and for block whether more work was published).
 Owner indices advance once after successful commit. Malformed requests fail the
 device with NEEDS_RESET and a configuration interrupt, without completing a
 valid prefix. A coordinator operational failure cancels the VM.
@@ -32,7 +42,10 @@ Inside a granted write window, the memory coordinator posts invalidations for
 written physical pages through the existing resident code-page records. After
 release each resident drains them before another acknowledgement or guest access.
 Writes to previously observed guest page-table pages also invalidate global fetch
-mappings. HLT-sleeping residents may remain quiescent across multiple windows;
+mappings. Those page-table marks are never cleared, so a guest that recycles
+former page-table pages as I/O buffers makes more windows flush every vCPU's
+translations; the performance log's `io` line (`--perf-log`) counts granted
+windows, write windows and table-write windows to show it. HLT-sleeping residents may remain quiescent across multiple windows;
 on wake they compare the latest table-change epoch with their previously serviced
 epoch, so a later read-only window cannot hide an earlier table write. The ordered
 HLT promise permits admission without waking that CPU; AP-mailbox waits still
@@ -41,12 +54,14 @@ the window; this change does not introduce zero-copy or relax exclusion.
 
 ## Dependency identity
 
-The crates come from the `third_party/rust-vmm` submodule: the owner's fork
-`ArArgon/natemu-rust-vmm`, branch `natemu`, pinned at
-`5ede8fee` ("virtio-queue: add checked descriptor-chain traversal"). That commit
-is upstream `671e367124cf7717d832b21de86b62eccf33ac27` plus the checked
-traversal patch and its tests. The submodule pin is the source identity;
-`git submodule update --init third_party/rust-vmm` fetches it.
+The crates come from the owner's fork `ArArgon/natemu-rust-vmm` (branch
+`natemu`) as a Cargo git dependency pinned at `5ede8fee` ("virtio-queue: add
+checked descriptor-chain traversal") in `crates/host/Cargo.toml`; `Cargo.lock`
+records the same commit and `cargo fetch` downloads it. That commit is upstream
+`671e367124cf7717d832b21de86b62eccf33ac27` plus the checked traversal patch and
+its tests. To work on the patch locally, override the source for one command
+(`cargo --config 'patch."https://github.com/ArArgon/natemu-rust-vmm".virtio-queue.path="../rust-vmm/vm-virtio/virtio-queue"' ...`,
+and the same for `vm-memory`) or in a git-ignored `.cargo/config.toml`.
 
 Selected upstream crates: virtio-queue 0.18.0 (Apache-2.0 AND BSD-3-Clause),
 vm-memory 0.18.0 with `backend-mmap` and default `rawfd` (Apache-2.0 OR
@@ -81,7 +96,9 @@ headers and combined data/status descriptors. Used length covers only the
 initialized writable prefix. A failed IN publishes no partial data and len=0.
 
 One native disk thread owns only the file and private buffers. It executes
-pread/pwrite and F_FULLFSYNC in order. Positive short calls advance their exact
+pread/pwrite (`FileExt::read_at`/`write_at`) and F_FULLFSYNC (`File::sync_all`,
+which uses F_FULLFSYNC on Apple platforms and retries it on EINTR) in order. The
+launch lock is `File::try_lock` (flock exclusive, nonblocking). Positive short calls advance their exact
 suffix; zero/error (including EINTR) reports IOERR without replay. Negotiated
 FLUSH permits writeback; otherwise each successful OUT includes full-sync.
 The stable ID derives from the opened file's device/inode and survives reset.
