@@ -11,16 +11,17 @@
 //! so the device sees each access exactly once. A peer rewriting the code meanwhile changes nothing here: the block ran
 //! the old instruction, and a block a rewrite killed is stepped from the new bytes before any site is served
 //! ([`aborted`]). Device pages are uncached (UC): the access is one operation in program order, every earlier access of
-//! this vCPU complete before it (`dsb sy` before the exit) and every later one after it (the exit is synchronous).
+//! this vCPU complete before it (`dsb sy` before the exit) and every later one after its final reply. A deferred access
+//! waits with owned completion data, releasing shadows and acknowledging host RAM windows; it never reissues the access.
 //! Refused, before any device effect, with the state at the instruction (`unsupported_mmio`, the reason in
 //! [`Mmio::status`]): atomic sites (LOCK forms, XCHG), pair/push/pop sites, accesses crossing a page with a device page on
 //! either side, sites without a completion record, pages no device claims, accesses a device refuses, and system
 //! instructions' and deliveries' own accesses to device pages ([`system_access`]).
 //!
 //! Cost: each device access ends its block (the resident dispatches at the next RIP, an L1/L2 lookup, not a re-entry of
-//! the rest of the block) and, unless [`local`] serves it, makes one host exit.
+//! the rest of the block) and, unless [`local`] serves it, makes one host exit plus polls if completion is deferred.
 use super::*;
-use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_DEVICE, REPLY_PAGE, REQUEST_DEVICE, REQUEST_PAGE, mmio as status};
+use natemu_abi::execution::{MMIO_VA, Mmio, REPLY_DEVICE, REPLY_DEVICE_POLL, REPLY_PAGE, REQUEST_DEVICE, REQUEST_DEVICE_POLL, REQUEST_PAGE, mmio as status};
 
 /// `gpa` is guest RAM (anything else is a device page).
 pub(super) fn ram(gpa: u64) -> bool {
@@ -121,6 +122,9 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     let mask = if width == 8 { u64::MAX } else { (1 << (8 * width)) - 1 };
     // A store's data: the site's transfer register as the translated instruction holds it (xzr: 0).
     let data = c.store.then(|| if site.data_reg[0] == 31 { 0 } else { f.x[site.data_reg[0] as usize] } & mask);
+    // A deferred reply can flush the cache while parked. Retain only owned completion data and
+    // the linear address, never a Site/Block reference into cache metadata across that wait.
+    let linear = site_address(site, f);
     bank_at(&mut s, f, b, site);
     let value = match local(&mut s, gpa, width, data) {
         Some(v) => v,
@@ -136,14 +140,33 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
             crate::perf::leave(p);
             s = load();
             s.request = NONE;
-            let m = read_record(exchange());
+            let mut m = read_record(exchange());
             if s.reply != REPLY_DEVICE {
                 halt(&s, stop::BAD_REPLY)
             }
-            match m.status {
-                status::DONE => m.value,
-                status::UNASSIGNED | status::DEVICE => halt(&s, stop::UNSUPPORTED_MMIO),
-                _ => halt(&s, stop::BAD_REPLY),
+            if m.status == status::PENDING {
+                // Unlike an ordinary host exit, this wait must release writable/atomic holdings
+                // before another vCPU or the I/O owner can make progress. No guest RAM is touched
+                // until the accepted access finishes and dispatch selects the next instruction.
+                reset_shadows(&mut s);
+            }
+            loop {
+                match m.status {
+                    status::DONE => break m.value,
+                    status::UNASSIGNED | status::DEVICE | status::FAILED => halt(&s, stop::UNSUPPORTED_MMIO),
+                    status::PENDING => {},
+                    _ => halt(&s, stop::BAD_REPLY),
+                }
+                io_checkpoint(&mut s);
+                (s.request, s.reply) = (REQUEST_DEVICE_POLL, NONE);
+                write_record(record(), &s);
+                let p = crate::perf::enter(crate::perf::HOST);
+                asm!("dsb sy", "hvc #{imm}", imm = const TRANSLATE_HVC);
+                crate::perf::leave(p);
+                s = load();
+                s.request = NONE;
+                if s.reply != REPLY_DEVICE_POLL { halt(&s, stop::BAD_REPLY) }
+                m = read_record(exchange());
             }
         },
     };
@@ -162,7 +185,7 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
     }
     (s.cpu.mov_ss, s.sti_shadow, s.mid_string) = (0, 0, 0);
     // S4: the device access meets data breakpoints as any (the linear address, x86's width).
-    super::watch::access(&mut s, site_address(site, f), width, c.store);
+    super::watch::access(&mut s, linear, width, c.store);
     completed(&mut s);
     s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(c.length));
     unsafe {

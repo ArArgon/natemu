@@ -10,6 +10,8 @@ natemu-abi = { path = "../abi" }
 # Performance phase, first chunk: the resident's time accounting (`src/perf.rs`); off by default (no code).
 [features]
 perf = []
+# Isolated scheduling fixtures; no calls or metadata accesses when disabled.
+io-test-hooks = []
 
 [[bin]]
 name = "natemu-runtime"

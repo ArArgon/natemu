@@ -17,6 +17,7 @@
 //! enforces it: every private page is EL1-only except the code area, which EL0 may only execute. Interrupts are doorbells (a host SPI, a
 //! peer's SGI): each stops the vCPU precisely at a block boundary ([`interrupted`]) and the resident drains there.
 use super::*;
+use core::sync::atomic::Ordering::SeqCst;
 use crate::cache::{self, Block};
 use natemu_abi::execution::perf::SysFastDecline;
 mod delivery;
@@ -114,6 +115,8 @@ pub unsafe fn start() -> ! {
         halt(&s, stop::UNSUPPORTED_MODE)
     }
     cache::reset();
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::ready(s.vcpu as usize);
     lapic::init();
     // The GIC CPU interface: system registers on, every priority unmasked, group 1 (the doorbells) enabled.
     unsafe {
@@ -159,6 +162,7 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
     #[cfg(not(feature = "perf"))]
     let _ = after_system;
     loop {
+        io_checkpoint(s);
         take_invalidations(s);
         // X3: the LAPIC timer's expiries due by now (its virtual-timer doorbell only stopped the vCPU).
         lapic::poll(s);
@@ -565,7 +569,7 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
         return declined(s, rip, SysFastDecline::NotCurrent);
     };
     let debugging = s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0;
-    if debugging || s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0 || cache::pending() || lapic::due() {
+    if debugging || s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0 || cache::pending() || io_pending(s) || lapic::due() {
         return declined(s, rip, SysFastDecline::Boundary);
     }
     let svc = elr.wrapping_sub(4);
@@ -948,6 +952,9 @@ fn walked(s: &State) -> u32 {
 /// The fetch walk's code-page writes (see [`fetch_walk`]).
 struct FetchWrites<'a>(&'a mut State);
 impl CodePages for FetchWrites<'_> {
+    fn table_read(&mut self, gpa: u64) {
+        cache::table_read(gpa)
+    }
     fn translated(&mut self, gpa: u64) -> bool {
         cache::translated(gpa)
     }
@@ -1071,6 +1078,78 @@ fn reset_shadows(s: &mut State) {
     tables::reset();
     cache::shadows_reset();
     s.shadow_generation += 1;
+}
+
+fn io_word(offset: usize) -> &'static core::sync::atomic::AtomicU64 {
+    use natemu_abi::execution::cache::{GLOBAL_VA, IO_WINDOW};
+    // SAFETY: the shared private mapping is live and each field is an aligned atomic word.
+    unsafe { core::sync::atomic::AtomicU64::from_ptr((GLOBAL_VA + (IO_WINDOW + offset) as u64) as *mut u64) }
+}
+fn io_pending(s: &State) -> bool {
+    use natemu_abi::execution::cache::IoWindow;
+    io_word(core::mem::offset_of!(IoWindow, request)).load(SeqCst)
+        > io_word(core::mem::offset_of!(IoWindow, acknowledged) + s.vcpu as usize * 8).load(SeqCst)
+}
+/// HLT's private-only wait. Its loop drains doorbells and checkpoints on return, before any
+/// guest access. AP mailbox, compiler and other waits do not publish this admission state.
+fn io_halt_wait(s: &State) {
+    use natemu_abi::execution::cache::IoWindow;
+    let quiet = io_word(core::mem::offset_of!(IoWindow, quiescent) + s.vcpu as usize * 8);
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::BEFORE_QUIET);
+    quiet.store(1, SeqCst);
+    lapic::wait(s);
+    quiet.store(0, SeqCst);
+    // A host that saw quiet=1 must have published its request before our next checkpoint.
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::AFTER_WITHDRAW);
+}
+/// A banked boundary with no guest access or generated-code continuation live. Never call from a
+/// split-atomic/shadow wait or with a selected Block to enter: release may invalidate every cached block.
+/// Compiler requests finish before reaching this point, including their step/system instruction, so
+/// host source copies and publication cannot overlap an acknowledged window.
+fn io_checkpoint(s: &mut State) {
+    use natemu_abi::execution::cache::IoWindow;
+    let request = io_word(core::mem::offset_of!(IoWindow, request));
+    let ack = io_word(core::mem::offset_of!(IoWindow, acknowledged) + s.vcpu as usize * 8);
+    loop {
+        let epoch = request.load(SeqCst);
+        let previous = ack.load(SeqCst);
+        if epoch <= previous {
+            return;
+        }
+        // Parking stops guest accesses, not mappings. Keep ordinary data shadows; physical DMA
+        // does not change their routes. Holding/writable bits stay accurate until a real reset.
+        unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+        ack.store(epoch, SeqCst);
+        #[cfg(feature = "io-test-hooks")]
+        crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::AFTER_ACK);
+        while io_word(core::mem::offset_of!(IoWindow, released)).load(SeqCst) < epoch {
+            // A peer may ask AFTER our acknowledgement while finishing a split atomic or code
+            // mark. It cannot acknowledge until we release its shadow dependency. This touches
+            // only resident mappings/metadata, never guest RAM, and is safe during the host copy.
+            if cache::take_shadows() {
+                reset_shadows(s);
+                #[cfg(feature = "io-test-hooks")]
+                crate::io_test::late_shadows(s.vcpu as usize);
+            }
+            core::hint::spin_loop();
+        }
+        unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+        // Include peer posts racing release and canceled/read-only windows, and older code
+        // invalidations whose marks were already cleared. Drain before even another acknowledgement.
+        take_invalidations(s);
+        if io_word(core::mem::offset_of!(IoWindow, tables_written)).load(SeqCst) > previous {
+            // Only previously observed table pages can underlie cached fetch currency. A table
+            // first used after release will be walked from the new bytes instead. HLT can skip
+            // several epochs, including a table write followed by read-only windows.
+            tlb(s, true);
+        }
+        // A new request may already be present. It needs a new acknowledgement, even when this
+        // vCPU did not execute a guest instruction between windows. Canceled late arrivals also pass here.
+    }
 }
 
 /// Enters `block` from the bank: GPRs and PF/AF in their static registers, NZCV with C = !CF, the guest-state page in
@@ -2183,6 +2262,9 @@ struct DataWrites<'a> {
     site: &'a Site,
 }
 impl CodePages for DataWrites<'_> {
+    fn table_read(&mut self, gpa: u64) {
+        cache::table_read(gpa)
+    }
     fn translated(&mut self, gpa: u64) -> bool {
         cache::translated(gpa)
     }
@@ -2712,6 +2794,8 @@ unsafe fn split_lock(mut s: State, f: &NativeFrame, b: &Block, site: &Site, addr
     let head = (4096 - (address & 4095)).min(width) as usize;
     let parts = [(gpa[0] | address & 4095, head), (gpa[1], width as usize - head)];
     let p = crate::perf::enter(crate::perf::SHOOTDOWN);
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::BEFORE_SPLIT);
     cache::split_begin(gpa, s.vcpus as usize, || {
         if cache::take_shadows() {
             reset_shadows(&mut s)

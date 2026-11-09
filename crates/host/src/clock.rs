@@ -1,5 +1,5 @@
 //! L5, the host's side of the clock service: V (the Arm virtual count, which every vCPU reads with offset 0, is the host's
-//! `mach_absolute_time`), its rate, and the timer threads of the asynchronous devices (L4b's PIT, RTC and PM timer).
+//! `mach_absolute_time`), its rate, and the timer threads of the asynchronous devices (PIT, RTC, PM and UART transmit readiness).
 //!
 //! **Time.** Every device clock is an exact rational function of V (`natemu_abi::clock::scale`, floors; its inverse
 //! `count_at` gives the V of an edge), as the resident's TSC and LAPIC timer are: no clock can drift from another. The
@@ -45,6 +45,8 @@ pub(crate) trait Timed: Device {
     fn next(&self) -> Option<u64>;
     /// Acts on the event due at V = `at` (now is at or after it: a device may take every event due by now at once).
     fn fire(&mut self, at: u64);
+    /// Final owned-output drain after the VM stops; default timed sources have no staged output.
+    fn shutdown(&mut self) {}
 }
 struct Inner<T> {
     device: Mutex<T>,
@@ -58,9 +60,10 @@ pub(crate) trait Halt: Send + Sync {
 }
 impl<T: Timed + 'static> Halt for Inner<T> {
     fn halt(&self) {
-        self.stop.store(true, SeqCst);
         // Under the lock: the thread is either waiting (and is woken) or has not yet looked at `stop`.
-        drop(self.device.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.stop.swap(true, SeqCst) { device.shutdown(); }
+        drop(device);
         self.changed.notify_one();
     }
 }
@@ -137,10 +140,10 @@ impl<T: Timed + 'static> Timer<T> {
 }
 impl<T: Timed + 'static> Device for Timer<T> {
     fn read(&mut self, vcpu: usize, offset: u64, size: u64) -> Option<u64> {
-        self.access(|d| d.read(vcpu, offset, size))
+        Timer::access(self, |d| d.read(vcpu, offset, size))
     }
     fn write(&mut self, vcpu: usize, offset: u64, size: u64, value: u64) -> bool {
-        self.access(|d| d.write(vcpu, offset, size, value))
+        Timer::access(self, |d| d.write(vcpu, offset, size, value))
     }
 }
 impl<T: Timed + 'static> Drop for Timer<T> {
@@ -237,7 +240,7 @@ impl TickStats {
 pub struct Board {
     pub pit: Arc<TickStats>,
     pub rtc: Arc<TickStats>,
-    /// The PIT's, RTC's and PM block's threads ([`Board::stop`]).
+    /// The PIT's, RTC's, PM block's and UART TX threads ([`Board::stop`]).
     timers: Vec<Arc<dyn Halt>>,
 }
 impl Board {
@@ -248,16 +251,16 @@ impl Board {
 }
 
 /// L4b: puts the board's timed devices on `devices`, wired into `irqs`: the PIT at ports 40H-43H and 61H, the RTC at
-/// 70H-71H, the ACPI PM block at B000H-B00BH and its reset register at B040H (`boot::acpi::platform`). Each runs on its
+/// 70H-71H, the UART at COM1, the ACPI PM block at B000H-B00BH and its reset register at B040H (`boot::acpi::platform`). Each runs on its
 /// own [`Timer`] thread, joined when `devices` drops.
-pub fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, lost: LostTicks) -> crate::Result<Board> {
+pub fn install(devices: &mut crate::devices::Devices, irqs: &crate::irq::Irqs, lost: LostTicks, uart: &Arc<Mutex<crate::uart::Uart>>) -> crate::Result<Board> {
     use crate::boot::acpi::platform as p;
     use crate::devices::{At, Shared};
     let f = frequency();
     let pit_device = crate::pit::Pit::new(irqs, f, lost.pit);
     let pit_stats = pit_device.stats.clone();
     let pit = Timer::new(pit_device, "pit");
-    let mut timers = vec![pit.halter()];
+    let mut timers = vec![pit.halter(), crate::uart::install(devices, irqs, uart)?];
     let pit: Shared = Arc::new(Mutex::new(pit));
     devices.register_ports(0x40, 4, pit.clone())?;
     devices.register_ports(0x61, 1, Arc::new(Mutex::new(At(pit, crate::pit::PORT_61))))?;

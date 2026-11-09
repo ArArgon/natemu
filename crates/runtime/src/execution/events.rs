@@ -218,6 +218,9 @@ pub(super) fn park(s: &mut State) {
     let (mut parked, mut woke, mut deadline) = (false, false, u64::MAX);
     loop {
         doorbells(s);
+        // Drain the wake before checking its work: the opposite order can consume an I/O
+        // kick after the checkpoint and then sleep with an unacknowledged window pending.
+        super::io_checkpoint(s);
         take_invalidations(s);
         // X3: the posts seen are counted before the look, so a post after it shows as unseen (senders count after the bit).
         let seen = posts.load(SeqCst);
@@ -241,7 +244,7 @@ pub(super) fn park(s: &mut State) {
         }
         // L5: `wfi`, woken on time for the timer's next expiry.
         deadline = lapic::deadline();
-        lapic::wait(s);
+        super::io_halt_wait(s);
         if crate::perf::ON && !woke {
             let r = rung.load(SeqCst);
             if r != 0 {
@@ -297,6 +300,8 @@ pub(super) fn wait_mailbox(s: &mut State) {
         word(s, core::mem::offset_of!(Events, end)));
     loop {
         doorbells(s);
+        // As in HLT, never consume the only I/O wake after checking the window request.
+        super::io_checkpoint(s);
         take_invalidations(s);
         halted.store(1 | posts.load(SeqCst) << natemu_abi::execution::cache::HALTED_SEEN_SHIFT, SeqCst);
         let ending = end.load(SeqCst) != 0;

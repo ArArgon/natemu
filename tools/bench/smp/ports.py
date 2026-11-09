@@ -86,6 +86,12 @@ def putc(t, ch):
     t += f'{loop}:\n    mov edx, {COM1 + 5:#x}\n    in al, dx\n    and al, 0x60\n    cmp al, 0x60\n    jne {loop}\n    mov edx, {COM1:#x}\n    mov al, {ord(ch)}\n    out dx, al'
 
 
+def wait_tx(t):
+    """Compare stable UART state on both models; preserve the instruction-form register/flag oracle."""
+    loop = t.label()
+    t += f'    pushfq\n    push rax\n    push rdx\n{loop}:\n    mov edx, {COM1 + 5:#x}\n    in al, dx\n    and al, 0x60\n    cmp al, 0x60\n    jne {loop}\n    pop rdx\n    pop rax\n    popfq'
+
+
 def uart_program():
     t = Text()
     normalize(t)
@@ -106,8 +112,11 @@ def uart_program():
         else: t += '    xor eax, eax\n    out 0x80, al'
     for ch in 'L3 8250\r\n':
         putc(t, ch)
-    # THRE interrupt bookkeeping: IER THRI with THRE set, IIR read clears it, a THR write sets it again.
-    t.wr(COM1 + 1, 1, 0x02); t.rd(COM1 + 2, 1); t.rd(COM1 + 2, 1); t.wr(COM1, 1, ord('!')); t.rd(COM1 + 2, 1); t.wr(COM1 + 1, 1, 0)
+    # THRE bookkeeping after empty: IIR clears it; a completed THR write makes it pending again.
+    wait_tx(t)
+    t.wr(COM1 + 1, 1, 0x02); t.rd(COM1 + 2, 1); t.rd(COM1 + 2, 1); t.wr(COM1, 1, ord('!'))
+    wait_tx(t)
+    t.rd(COM1 + 2, 1); t.wr(COM1 + 1, 1, 0)
     # Loopback with a 14-byte trigger at the slowest rate (a character takes ~5.7 s: no FIFO timeout during the test).
     t.wr(COM1 + 3, 1, 0x83); t.wr(COM1, 1, 0xff); t.wr(COM1 + 1, 1, 0xff); t.wr(COM1 + 3, 1, 0x03)
     t.wr(COM1 + 2, 1, 0xc1); t.wr(COM1 + 1, 1, 0x05); t.wr(COM1 + 4, 1, 0x1f)
@@ -172,6 +181,7 @@ def strings_program():
     rep('outsw', SRC + 4, port=COM1 + 6, prefix='')                # MSR (ignored), SCR
     t.rd(COM1 + 7, 1)
     rep('outsd', SRC + 8, rcx=2, port=COM1 + 4)                    # MCR, LSR, MSR, SCR twice
+    wait_tx(t)
     t.rd(COM1 + 4, 4)
     t.wr(COM1 + 4, 1, 0x08)
     # 0x67: ESI and ECX (upper halves ignored; the writes zero-extend).

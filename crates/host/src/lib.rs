@@ -29,5 +29,6 @@ mod rtc;
 mod system;
 pub mod uart;
 pub mod vm;
+pub mod virtio;
 
 pub type Result<T> = std::result::Result<T, String>;

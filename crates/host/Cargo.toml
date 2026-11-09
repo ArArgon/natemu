@@ -6,8 +6,12 @@ rust-version.workspace = true
 
 [dependencies]
 natemu-abi = { path = "../abi" }
+virtio-queue = { path = "../../third_party/rust-vmm/vm-virtio/virtio-queue" }
+vm-memory = { path = "../../third_party/rust-vmm/vm-memory", features = ["backend-mmap"] }
 
 [features]
 # Test drivers only (crates/driver): raw writes into a vCPU's records and code cache, and the hook's reply, object and
 # compile-server calls and arbitrary system replies. Build the `natemu` stub alone (`-p natemu-cli`) to leave it out.
 testing = []
+# Isolated native scheduling fixtures only; absent from normal CLI and normal stress.
+io-test-hooks = ["testing"]

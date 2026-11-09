@@ -60,6 +60,12 @@ struct Cli {
     /// The resident's page-walk speculation barriers (needs FEAT_SB)
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
+    /// Expose the virtio-MMIO entropy device
+    #[arg(long)]
+    rng: bool,
+    /// Writable raw disk image (exclusive use; successful S5 includes full-sync)
+    #[arg(long, value_name = "FILE")]
+    disk: Option<PathBuf>,
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
     #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
     compile_cache: Option<PathBuf>,
@@ -110,6 +116,8 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     let mut boot = Boot::new(runtime, cli.fexc, read(&cli.kernel)?);
     boot.compile_cache = natemu::compile_cache::Config::new(cli.compile_cache.as_deref().map(|p| p.as_os_str()), cli.compile_cache_mb)?;
     boot.speculation_barriers = cli.speculation_barriers;
+    boot.rng = cli.rng;
+    boot.disk = cli.disk;
     boot.initrd = cli.initrd.as_ref().map(read).transpose()?;
     boot.cmdline = cli.cmdline.unwrap_or_default();
     boot.ram = cli.ram.unwrap_or(boot.ram);

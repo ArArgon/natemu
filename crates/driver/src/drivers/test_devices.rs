@@ -211,3 +211,12 @@ mod tests {
         assert_eq!(d.port(0, 0x100, 1, None), Ok(0x11));
     }
 }
+
+/// Metadata-only fixture port: lets the guest wait for a native call to enter its test barrier.
+pub struct IoControl(pub Arc<natemu::virtio::testing::Control>);
+impl Device for IoControl {
+    fn read(&mut self, _: usize, offset: u64, size: u64) -> Option<u64> {
+        (offset == 0 && size == 1).then(|| u64::from(self.0.entered()))
+    }
+    fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool { false }
+}
