@@ -100,8 +100,9 @@ initialized writable prefix. A failed IN publishes no partial data and len=0.
 Block keeps up to min(queue size, 32) requests and 4 MiB of owned buffers in
 flight (IN buffers and the gathered header/OUT stream are reserved at admission;
 admission pauses at either bound). The owner admits every published head the
-bounds allow from one metadata snapshot, advancing the consumed index at
-admission, and gathers the new requests' headers and OUT payloads in as few
+bounds allow from one metadata snapshot (after a notification, a reused
+snapshot's exhaustion triggers one fresh capture in the same round), advancing
+the consumed index at admission, and gathers the new requests' headers and OUT payloads in as few
 windows as MAX_BYTES (1 MiB) and MAX_SPANS allow. Their disk calls go to a fixed
 pool of four worker threads sharing the file; each finished job rings the owner's
 one wake source (the bell that guest notifications, resets, power drain and stop
