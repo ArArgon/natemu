@@ -270,12 +270,12 @@ impl Calls for Controlled {
         self.control.event(&format!("write-result:{result:?}"));
         result
     }
-    fn sync(&self) -> std::io::Result<()> {
+    fn sync(&self, full: bool) -> std::io::Result<()> {
         self.control.event("sync-enter");
-        let result = if self.control.mode == Mode::PowerSyncError {
+        let result = if full && self.control.mode == Mode::PowerSyncError {
             Err(std::io::Error::from_raw_os_error(5))
         } else {
-            self.native.sync()
+            self.native.sync(full)
         };
         self.control.event(if result.is_ok() {
             "sync-ok"

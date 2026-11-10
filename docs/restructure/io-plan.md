@@ -333,8 +333,14 @@ the documented backend choice. Entitlement and role-manifest details are in the
 [admission section](io-native-backends.md#packet-contract-and-admission-gate-for-vmnet).
 
 Disk durability is part of IO3, not a later optimization. Negotiated FLUSH allows
-writeback; a successful FLUSH follows earlier completed writes and successful
-F_FULLFSYNC. If FLUSH is declined, each successful OUT waits for full-sync.
+writeback; a successful FLUSH follows earlier completed writes and a successful
+fsync(2). If FLUSH is declined, each successful OUT waits for fsync. The S5
+drain ends with F_FULLFSYNC, so a clean shutdown is fully durable. Owner
+decision (November 10), as QEMU: fsync rather than F_FULLFSYNC per guest flush
+(about 0.02 ms against 4 ms on the host; F_FULLFSYNC made fsync-heavy guests
+15-60x slower than QEMU). Trade-off: writes acknowledged to the guest survive a
+natemu crash but can be lost on a host power loss or macOS crash before the
+drive writes its cache.
 Short positioned I/O advances only its completed prefix; zero progress or an
 error, including EINTR, reports IOERR without replaying the issued request. Failed staged IN
 copies no payload, reports IOERR and the selected conservative used length
@@ -856,9 +862,9 @@ both pay.
    first request completes.
 
 **Flush.** Virtio 1.2 §5.2.6 requires a flush to cover writes that had *completed* before it.
-A completed write's `pwrite` has returned, and `F_FULLFSYNC` covers everything the file has
-written, so a FLUSH runs on any worker with no ordering against other requests, and later
-requests never wait for it. (Linux already waits for data completion before issuing its flush.)
+A completed write's `pwrite` has returned, and the sync (`fsync` since November 10, see the
+durability paragraph under IO3) covers everything the file has written, so a FLUSH runs on any
+worker with no ordering against other requests, and later requests never wait for it. (Linux already waits for data completion before issuing its flush.)
 Writes without negotiated FLUSH stay write-through.
 
 **Tests and acceptance.** Host tests for admission bounds, out-of-order completion and used
@@ -880,7 +886,8 @@ runs per vCPU count, as HEAD was:
 **Not in this step.** Cheaper windows themselves: about 94% of window time is waiting for running
 vCPUs to reach a checkpoint, so a later step should measure acknowledgement latency per vCPU
 and consider pausing only vCPUs that could touch the affected pages. Also out: network and
-entropy batching, a non-`F_FULLFSYNC` flush mode (an owner policy decision) and zero-copy.
+entropy batching and zero-copy. (The non-`F_FULLFSYNC` flush mode was later decided by the
+owner, November 10: guest flushes use fsync, power-off F_FULLFSYNC.)
 
 ## Windowless copies with targeted invalidation (proposed, November 9)
 

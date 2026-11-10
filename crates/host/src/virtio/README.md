@@ -139,12 +139,15 @@ metadata snapshot when it fits. A malformed chain fails the device; requests
 already admitted still complete visibly and nothing is admitted after.
 
 The workers own only the file, their jobs' buffers and a result board. They run
-pread/pwrite (`FileExt::read_at`/`write_at`) and F_FULLFSYNC (`File::sync_all`,
-which uses F_FULLFSYNC on Apple platforms and retries it on EINTR) in any order;
-a FLUSH covers every write completed before it (virtio 1.2 §5.2.6). The
+pread/pwrite (`FileExt::read_at`/`write_at`) and syncs in any order; a FLUSH
+covers every write completed before it (virtio 1.2 §5.2.6). A guest FLUSH (and
+write-through) is a plain fsync(2), as QEMU's: it survives a natemu crash, not a
+host power loss or macOS crash (owner decision, November 10). The power-off
+drain's final sync is F_FULLFSYNC (`File::sync_all`, which retries on EINTR, as
+the fsync call does). The
 launch lock is `File::try_lock` (flock exclusive, nonblocking). Positive short calls advance their exact
 suffix; zero/error (including EINTR) reports IOERR without replay. Negotiated
-FLUSH permits writeback; otherwise each successful OUT includes full-sync.
+FLUSH permits writeback; otherwise each successful OUT includes an fsync.
 The stable ID derives from the opened file's device/inode and survives reset.
 
 The power-triggering port instruction commits before the resident enters a
