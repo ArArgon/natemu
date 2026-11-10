@@ -1281,6 +1281,25 @@ block disk. Report these as ARM-native reference systems: architectural and
 deployment differences prevent interpreting the ratio as isolated natemu I/O
 overhead. No Apple VM/container benchmark was run for this suggestion.
 
+## Re-prepared inputs and fresh QEMU comparison — November 9
+
+Inputs re-prepared with the drained guest scripts (`natemu-raw/io-inputs-20261109-01/`; block in
+`block-drain-20261109-01/`). With HEAD (`natemu-raw/io-accept-20261109-01/`): entropy at one,
+two and four vCPUs, block at four vCPUs, the fio admission write/relaunch pair and the matrix
+pairs at two and four vCPUs for natemu and QEMU all pass, including fresh read-only persistence.
+Same-day matrix, natemu / QEMU:
+
+| Profile | 2 vCPUs | 4 vCPUs |
+| --- | ---: | ---: |
+| Random read 4 KiB Q1, kIOPS | 15.0 / 12.4 | 14.8 / 11.7 |
+| Random read 4 KiB Q16, kIOPS | 28.1 / 16.2 | 36.0 / 16.5 |
+| Four random readers Q16, kIOPS | 33.7 / 29.0 | 41.9 / 57.2 |
+| Mixed 70/30 4 KiB Q16, MiB/s | 131.1 / 116.7 | 129.3 / 118.7 |
+| Sequential read 128 KiB Q16, MiB/s | 2,494 / 157 | 2,718 / 159 |
+| Sequential write 128 KiB Q16, MiB/s | 672 / 140 | 722 / 146 |
+
+The four-reader case at four vCPUs remains natemu's one loss to QEMU (73%).
+
 ## Native and same-architecture virtualization references — November 9
 
 The matrix's fio jobs (same precondition, nine profiles, CRC verify-all, four 256 MiB files)
