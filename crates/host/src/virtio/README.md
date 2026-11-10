@@ -3,11 +3,12 @@
 Code map: `mod.rs` holds the MMIO transport (register offsets in `reg`, status
 bits in `status`), the shared lifecycle state, the owner loop and virtio-rng;
 `queue.rs` the queue registers and the checked parse of owned metadata copies;
-`block.rs` virtio-blk and its native disk lane; `net.rs` the network frontend
-and `PacketPort`; `testing.rs` the test driver's disk-call schedules. Every
-device ends a request through `Virtio::complete`, which publishes the used
-element and index and reads the available ring's flags and index back in the
-same window.
+`block.rs` virtio-blk, its disk workers and the block owner loop; `net.rs` the
+network frontend and `PacketPort`; `testing.rs` the test driver's disk-call
+schedules. Entropy and network end a request through `Virtio::complete`; block
+completes answered requests in batches. Either way a window publishes whole
+requests: payload and status, used elements, one used index, then a read of the
+available ring's flags and index.
 
 The first production consumer is modern MMIO virtio-rng: VERSION_1 only, one
 8-entry direct split queue, one request in flight, at most 256 returned bytes.
@@ -19,9 +20,10 @@ EVENT_IDX are not negotiated. Resource discovery and registry placement share
 IRQ detachment or VM destruction. Queue notification retains an IRQ busy guard
 until the owner drains available work. Ordinary register access, ACK, physical
 IRQ level and lifecycle state are serialized under one short state mutex.
-That mutex is never held during a RAM window or entropy syscall. Deferred reset
-closes admission, cancels each pending `CopyPermit`, and waits for granted copies
-and the active backend to retire. Conflicting MMIO accesses queue by token, with
+That mutex is never held during a RAM window or entropy syscall. The state
+records the incarnation of every request in flight. Deferred reset closes
+admission, cancels the owner's pending `CopyPermit`, and waits until no request
+of the old incarnation remains in flight and no window for it is open. Conflicting MMIO accesses queue by token, with
 at most one outstanding access per vCPU. Queue disable preserves configuration;
 full device reset clears it. Neither can reuse a live request's resources.
 
@@ -95,9 +97,24 @@ IN/OUT/FLUSH/GET_ID operate on complete logical byte streams, including split
 headers and combined data/status descriptors. Used length covers only the
 initialized writable prefix. A failed IN publishes no partial data and len=0.
 
-One native disk thread owns only the file and private buffers. It executes
+Block keeps up to min(queue size, 32) requests and 4 MiB of owned buffers in
+flight (IN buffers and the gathered header/OUT stream are reserved at admission;
+admission pauses at either bound). The owner admits every published head the
+bounds allow from one metadata snapshot, advancing the consumed index at
+admission, and gathers the new requests' headers and OUT payloads in as few
+windows as MAX_BYTES (1 MiB) and MAX_SPANS allow. Their disk calls go to a fixed
+pool of four worker threads sharing the file; each finished job rings the owner's
+one wake source (the bell that guest notifications, resets, power drain and stop
+also ring), so the owner never blocks on one job. Answered requests complete in
+answering order: each window takes the next used slots, writes one used index and
+reads the available ring's flags last; the last window also refreshes the
+metadata snapshot when it fits. A malformed chain fails the device; requests
+already admitted still complete visibly and nothing is admitted after.
+
+The workers own only the file, their jobs' buffers and a result board. They run
 pread/pwrite (`FileExt::read_at`/`write_at`) and F_FULLFSYNC (`File::sync_all`,
-which uses F_FULLFSYNC on Apple platforms and retries it on EINTR) in order. The
+which uses F_FULLFSYNC on Apple platforms and retries it on EINTR) in any order;
+a FLUSH covers every write completed before it (virtio 1.2 §5.2.6). The
 launch lock is `File::try_lock` (flock exclusive, nonblocking). Positive short calls advance their exact
 suffix; zero/error (including EINTR) reports IOERR without replay. Negotiated
 FLUSH permits writeback; otherwise each successful OUT includes full-sync.
@@ -105,13 +122,13 @@ The stable ID derives from the opened file's device/inode and survives reset.
 
 The power-triggering port instruction commits before the resident enters a
 nonreturning wait that services copy windows. Quiesce closes new admission and
-preserves the already active request, then performs a final full-sync on the
-same disk lane and joins it. Only successful retirement permits PowerOff.
+completes the requests already in flight, then performs a final full-sync on a
+worker and joins the workers. Only successful retirement permits PowerOff.
 
-A disk operation has a ten-second owner deadline; shutdown has a thirty-second
-poll deadline. A stalled native syscall is not forcibly canceled: its owned
-file/buffers remain alive in a detached lane, with no guest RAM, IRQ or Machine
-reference. The VM fails and the normal CLI exits its per-VM process. Library
+A native disk call has a ten-second deadline from when a worker starts it;
+shutdown has a thirty-second poll deadline. A stalled native syscall is not
+forcibly canceled: its owned file/buffers remain alive in detached workers (jobs
+still queued never run), with no guest RAM, IRQ or Machine reference. The VM fails and the normal CLI exits its per-VM process. Library
 embedders must treat this as worker-process fatal, terminate/restart the worker,
 and not repeatedly create VMs in that failed process. An advisory file lock can
 remain held until the syscall retires. No failed return promises rollback or
