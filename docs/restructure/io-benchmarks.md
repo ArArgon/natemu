@@ -1281,6 +1281,43 @@ block disk. Report these as ARM-native reference systems: architectural and
 deployment differences prevent interpreting the ratio as isolated natemu I/O
 overhead. No Apple VM/container benchmark was run for this suggestion.
 
+## Native and same-architecture virtualization references — November 9
+
+The matrix's fio jobs (same precondition, nine profiles, CRC verify-all, four 256 MiB files)
+were run on two ARM-native references at four CPUs, two runs each, under the VM lock:
+`natemu-raw/native-refs-20261109-01/`.
+
+- **VZ:** ARM64 Debian (pinned `ref.APPLE_IMAGE`) in Apple container 1.7.1, i.e.
+  Virtualization.framework, kernel 6.18.56, 2 GiB; data on the container's own ext4 root, a
+  virtio block disk (`/dev/vdb`), fio 3.39 (Debian), `io_uring`, `direct=1`.
+- **Native:** macOS 26.6.2 on APFS, Homebrew fio 3.43, `posixaio`, `direct=1` (`F_NOCACHE`).
+
+natemu is HEAD at four vCPUs (`natemu-raw/perf-head-20261109-01/`, two runs). Ranges:
+
+| Profile | natemu | VZ | native macOS |
+| --- | ---: | ---: | ---: |
+| Sequential read 4 KiB Q16, MiB/s | 124–137 | 1,094–1,109 | 794–856 |
+| Sequential read 128 KiB Q16, MiB/s | 1,991–2,381 | 7,218–7,259 | 2,865–3,310 |
+| Sequential write 128 KiB Q16, MiB/s | 1,073–1,433 | 3,117–3,529 | 4,170–4,358 |
+| Random read 4 KiB Q1, kIOPS | 14.5–14.9 | 33.2–33.8 | 11.0–13.6 |
+| Random read 4 KiB Q16, kIOPS | 34.3–36.4 | 241.2–241.4 | 100.1–131.5 |
+| Random read 4 KiB Q64, kIOPS | 30.2–34.9 | 258.1–258.5 | 100.6–134.3 |
+| Four random readers Q16, kIOPS | 42.3–47.3 | 407.7–409.5 | 138.2–170.8 |
+| Mixed 70/30 4 KiB Q16, MiB/s | 121–126 | 668–670 | 133–171 |
+| 64 writes with fsync, job seconds | 0.58–0.60 | 0.01 | 0.01 |
+
+Caveats. These are deployment references, not an isolated measure of natemu overhead:
+natemu also translates x86 code, and the references run ARM-native kernels. natemu and VZ both
+read a host file through the host page cache (natemu's `pread`, VZ's default disk caching), while
+native `direct=1` bypasses it, which is why VZ exceeds native on reads. The fsync rows are not
+comparable: natemu sends every flush through `F_FULLFSYNC`, macOS `fsync` and VZ's default
+flush do not reach stable storage the same way.
+
+Reading: natemu reaches about 40–45% of VZ at queue depth 1, 30% on large transfers, and only
+10–15% at queue depth 16 or with several readers, where VZ keeps many requests in flight and
+natemu serves one at a time while pausing every vCPU per window. The gap is in concurrency, not
+per-request latency (Q1 p99 is 0.07 ms against VZ's 0.03 ms).
+
 ## Recommendation
 
 Use **fio + iperf3 + the existing zstd build**, with **netperf TCP_RR** for the
