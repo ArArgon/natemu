@@ -741,6 +741,94 @@ checks, profile parsing, input hashes, clean S5/fsck, persisted file hashes and
 an unchanged image on read-only restart). No I/O performance result is accepted
 from this entry; see the [benchmark record](io-benchmarks.md).
 
+## Concurrent block requests and batched windows (proposed, November 9)
+
+**Status: proposed; needs owner sign-off before implementation.** It widens two bounds this
+plan set as starting points ("one block request in flight", "one request per RAM window"),
+which the plan said to revisit after measuring pause time. An independent review (November 9)
+found the first draft unready; this version addresses it. If accepted, the earlier texts that
+assume one active request (the protocol's reset/S5 rules, the backend table's "one ordered
+blocking lane" and the sizing paragraph) are amended in the same change.
+
+**Measured motivation.** At four vCPUs natemu reaches about 45% of Virtualization.framework at
+queue depth 1 but 10–15% at depth 16 or with four readers
+([references](io-benchmarks.md#native-and-same-architecture-virtualization-references--november-9)).
+Window counters on an 89–99 s fio write run (`natemu-raw/window-cost-20261109-01/`):
+
+| vCPUs | Windows | Window open, share of wall time | Mean window | Waiting for acknowledgements |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 4.96 M | 17% | 3.4 µs | 92% |
+| 2 | 5.40 M | 24% | 4.0 µs | 93% |
+| 4 | 5.29 M | 26% | 4.4 µs | 94% |
+
+Copying is about 6% of window time and epoch-lock waits are negligible (0.13 s in total). At
+about 35 k IOPS a request takes about 28 µs, of which its two or three windows take about 13 µs,
+and requests are served one at a time. So fewer windows per request and more requests per window
+both pay.
+
+**Stages** (each separately reviewed and measured; block only, entropy and network unchanged):
+
+1. **Next metadata in the completion window.** The completion window already reads the
+   available ring's flags and index after publishing; it also reads the available ring and
+   descriptor table (bounded, queue-sized) into the snapshot, so the next request needs no
+   separate metadata window. The snapshot takes the identity current at grant; a canceled or
+   ungranted completion window discards it; its extra bytes (about 4.5 KiB at 128 entries) count
+   against MAX_BYTES. Expected: about one window fewer per request at every depth.
+2. **Several requests in flight, opportunistic batched completion.**
+   - *State.* `active: Option<Identity>` becomes an in-flight set per queue incarnation. Reset,
+     disable and S5 retire when the old incarnation's in-flight count reaches zero; granted
+     completions still retire, ungranted ones are dropped (generation check, as today).
+   - *Ring bookkeeping.* `next_avail` advances at admission, under the owner. Used slots are
+     assigned at commit, in completion order; a batch of n writes its elements, then one
+     `used.idx = next_used + n`, then reads `avail.flags` last for interrupt suppression. The
+     "more published" test compares against the current consumed index, not the admitted copy.
+   - *Owner loop.* One wake source: workers, guest notifications, reset and power drain all
+     signal the owner's condition variable; the owner never blocks on one job. The 10 s
+     abandonment bound applies per backend call; any expiry is VM-fatal, as today.
+   - *Workers.* A fixed pool of P = 4 threads on the one shared file descriptor, taking owned
+     jobs. Bounds: K = min(queue size, 32) requests and B = 4 MiB of owned buffers in flight,
+     IN buffers reserved at admission; admission pauses at either bound. Host threads become
+     vCPUs + device owners + 4.
+   - *Batched completion.* When the owner wakes, every finished request completes together,
+     split into windows that fit MAX_BYTES (raised to 1 MiB) and MAX_SPANS (sized from K), each
+     window publishing whole requests. No artificial delay.
+   - *S5.* Stop admission, wait for the in-flight count to reach zero, run the final
+     `F_FULLFSYNC`, then join the workers.
+   - *Failure.* A malformed chain sets NEEDS_RESET for the device, as today. Requests already in
+     flight still complete visibly (their buffers stay owned until they retire); nothing is
+     admitted after the failure. This matches the current single-request behaviour and is
+     checked against Linux virtio_blk, which does not recover from NEEDS_RESET.
+3. **Batched capture**, only if the counters still show capture windows dominating: one
+   metadata snapshot admits up to K chains; their headers and OUT payloads are gathered in as
+   few windows as the byte and span bounds allow.
+
+**Flush.** Virtio 1.2 §5.2.6 requires a flush to cover writes that had *completed* before it.
+A completed write's `pwrite` has returned, and `F_FULLFSYNC` covers everything the file has
+written, so a FLUSH runs on any worker with no ordering against other requests, and later
+requests never wait for it. (Linux already waits for data completion before issuing its flush.)
+Writes without negotiated FLUSH stay write-through.
+
+**Tests and acceptance.** Host tests for admission bounds, out-of-order completion and used
+slots, batch splitting at the window bounds, partial failure, reset/disable/S5 with K requests
+in flight, and a flush that fails while writes are in flight. The forced-schedule controls are
+extended: hold the k-th disk call while others finish; cancel a completion window covering n
+requests; reset with requests in every state. Then the full standing suite; lifecycle, stress,
+soak and persistence runs; and the matrix at one, two and four vCPUs against natemu HEAD,
+QEMU and the VZ reference, with the window counters. Thresholds, against HEAD
+(`natemu-raw/io-accept-20261109-01/`, `perf-head-20261109-01/`), each measured over two matrix
+runs per vCPU count, as HEAD was:
+
+- *After stage 1:* windows per completed request at least 30% fewer; depth 1 at one, two and four
+  vCPUs no worse than HEAD's slower run; every correctness run passing.
+- *After stage 2:* random read depth 16 and four readers at four vCPUs at least 2x HEAD; window-open
+  time per completed request no higher than HEAD's (about 13 µs at four vCPUs); depth 1 as above;
+  serial heartbeat and timer stress results unchanged; every correctness run passing.
+
+**Not in this step.** Cheaper windows themselves: about 94% of window time is waiting for running
+vCPUs to reach a checkpoint, so a later step should measure acknowledgement latency per vCPU
+and consider pausing only vCPUs that could touch the affected pages. Also out: network and
+entropy batching, a non-`F_FULLFSYNC` flush mode (an owner policy decision) and zero-copy.
+
 ## Future direct-payload work
 
 Keep immutable request metadata, backend ownership and ordered completion as
