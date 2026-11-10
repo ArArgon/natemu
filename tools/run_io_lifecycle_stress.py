@@ -221,7 +221,7 @@ def main():
     if timeout or child.returncode:errors.append('process status/timeout')
     if 'teardown: vcpus 4 joined 4 destroyed 4 vm_destroy 0 children none' not in stderr.splitlines():errors.append('clean teardown')
     try:
-        report=json.loads((a.out/'stdout.log').read_text());states,trace,memory=life.final_records(stderr)
+        report=json.loads((a.out/'stdout.log').read_text());states,trace,memory,_counts=life.final_records(stderr)
         errors+=judge(meta,report,states,trace,memory,(a.out/'disk.raw').read_bytes(),(a.out/'expected-disk.raw').read_bytes(),(a.out/'expected-memory.bin').read_bytes())
     except (ValueError,KeyError,TypeError,IndexError) as e:errors.append('invalid report: '+str(e))
     timing={k:float(v) for k,v in re.findall(r'^(real|user|sys)\s+([0-9.]+)$',stderr,re.M)}

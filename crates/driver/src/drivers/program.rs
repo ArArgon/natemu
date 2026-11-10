@@ -2158,6 +2158,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             "io-disk: {}",
             serde_json::to_string(&control.report()).unwrap()
         );
+        // Windowless-copy evidence (posts, drain waits, fallbacks) for the lifecycle judge.
+        eprintln!(
+            "io-counts: {}",
+            serde_json::to_string(&backing.io_window_counts()).unwrap()
+        );
     }
     if args.io_net {
         eprintln!("io-net: {}", packet_trace.json());
