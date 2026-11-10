@@ -64,6 +64,7 @@ pub(super) fn system_access(s: &State) -> ! {
 /// retries the instruction, which then runs natively, any read form). `false`: a page is a device's (this vCPU's LAPIC page
 /// whatever its mode, or one the host's registry claims): the device path. Under the strict switch the read stops
 /// (`unassigned`). The host counts each page asked about as a read (a fill), also one then found next to a claimed page.
+/// A claimed page is asked about once while it stays in this vCPU's small table (`cache::Control::claimed_pages`).
 pub(super) fn ones(
     s: &mut State,
     f: &NativeFrame,
@@ -84,9 +85,18 @@ pub(super) fn ones(
     let fresh = [0, 1].map(|k| device[k].filter(|_| !ones(touched[k])));
     let mut claimed = false;
     for &gpa in fresh.iter().flatten() {
-        match unsafe { page(s, gpa & !4095) } {
+        let gpa = gpa & !4095;
+        if cache::control().claimed(gpa) {
+            claimed = true;
+            continue;
+        }
+        match unsafe { page(s, gpa) } {
             status::DONE => {}
-            status::CLAIMED => claimed = true,
+            status::CLAIMED => {
+                // The host's registry is frozen: remember the claim instead of asking again.
+                cache::control().remember_claim(gpa);
+                claimed = true;
+            }
             status::UNASSIGNED => refuse(*s, f, b, site, status::UNASSIGNED),
             _ => halt(s, stop::BAD_REPLY),
         }

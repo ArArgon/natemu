@@ -349,8 +349,13 @@ mod tests {
         let (d, p) = device();
         write(&d, reg::QUEUE_SEL, 0xffff_0000);
         write(&d, reg::QUEUE_NOTIFY, 1);
-        assert_eq!(d.lock().notified, [false, true]);
-        d.lock().notified = [false; 2];
+        {
+            // TX's open gate records a kick, which the owner takes under the lock.
+            let mut s = d.lock();
+            d.take_kicks(&mut s);
+            assert_eq!(s.notified, [false, true]);
+            s.notified = [false; 2];
+        }
         write(&d, reg::QUEUE_NOTIFY, 0);
         assert!(!d.lock().pending());
         assert!(p.receive(&frame()));

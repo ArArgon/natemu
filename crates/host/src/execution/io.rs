@@ -832,10 +832,28 @@ impl Backing {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn backing(n: usize) -> Backing {
+    /// A windowless copy on a fixture with no vCPU holding code (nothing to post or drain).
+    pub(crate) fn windowless(
+        b: &Backing,
+        transfers: &mut [Transfer<'_>],
+        publish: usize,
+    ) -> Result<()> {
+        let permit = CopyPermit::new();
+        b.windowless(
+            BUDGET,
+            BUDGET,
+            transfers,
+            publish,
+            &permit,
+            |_, _| Ok(true),
+            |_| {},
+        )
+    }
+    /// A fixture of `n` vCPUs and three pages of guest RAM at guest-physical 0.
+    pub(crate) fn backing(n: usize) -> Backing {
         let ram_at = cache::GLOBAL_OFFSET + cache::GLOBAL_BYTES;
         let memory = Arc::new(Memory::with_size(ram_at + 3 * 4096).unwrap());
         // SAFETY: this fixture owns a separate aligned RAM page after its protocol words.

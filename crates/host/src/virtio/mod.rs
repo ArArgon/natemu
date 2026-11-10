@@ -30,7 +30,7 @@ use std::{
     ops::Range,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
     },
     time::Duration,
 };
@@ -89,6 +89,14 @@ const VENDOR: u32 = 0x4e41_5445;
 const VERSION_1: u64 = 1 << 32;
 /// VIRTQ_AVAIL_F_NO_INTERRUPT in the available ring's flags.
 const AVAIL_NO_INTERRUPT: u16 = 1;
+/// VIRTQ_USED_F_NO_NOTIFY in the used ring's flags (virtio 1.2 §2.7.7: without EVENT_IDX, which no device here
+/// offers, a driver checks it before each notification).
+const USED_NO_NOTIFY: u16 = 1;
+/// A queue's notification gate ([`Virtio::gates`]): bit 0, a QueueNotify would take effect now and may skip the state
+/// lock; bit 1, pending work is dropped now (the queue is closed or being reset); the rest, an epoch advanced each time
+/// it starts dropping work.
+const GATE_OPEN: u64 = 1;
+const GATE_KILLED: u64 = 2;
 const RNG_MAX_QUEUE: u16 = 8;
 /// The most entropy one request returns (also getentropy's limit).
 const MAX_PAYLOAD: usize = 256;
@@ -246,6 +254,37 @@ impl State {
             && !self.waiting.iter().any(|w| w.vcpu == vcpu)
             && self.token != u64::MAX
     }
+    /// A notification of `queue` is dropped now, as every earlier one not yet admitted: the queue does not accept work,
+    /// the device stopped, or a reset of the queue is closing.
+    fn kills(&self, queue: usize) -> bool {
+        self.stopped
+            || !self.accepting(queue)
+            || self
+                .closing
+                .is_some_and(|r| r.affects(self.identity(queue)))
+    }
+}
+
+/// The device state held under its lock; dropping it republishes the notification gates from the state left behind.
+struct Locked<'a> {
+    guard: MutexGuard<'a, State>,
+    device: &'a Virtio,
+}
+impl std::ops::Deref for Locked<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.guard
+    }
+}
+impl std::ops::DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.guard
+    }
+}
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        self.device.publish_gates(&self.guard);
+    }
 }
 
 /// A production virtio device with up to two queues. Clones share one register/IRQ ordering
@@ -258,6 +297,11 @@ pub struct Virtio {
     irqs: Irqs,
     gsi: usize,
     running: AtomicBool,
+    /// Per queue: its notification gate (`GATE_*`), written only under the state lock as each holder releases it.
+    gates: [AtomicU64; 2],
+    /// Per queue: a QueueNotify taken without the state lock, as the open gate it saw (0: none). The owner moves it to
+    /// `notified` under the lock if the gate's epoch has not moved since; a nonzero kick holds one [`Irqs::busy`] count.
+    kicks: [AtomicU64; 2],
 }
 enum Profile {
     Entropy,
@@ -321,14 +365,14 @@ impl Bell {
         *self.rung.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.signal.notify_one();
     }
-    /// Wait for a ring (at most `timeout`) and consume it.
-    pub fn wait(&self, timeout: Duration) {
+    /// Wait for a ring (at most `timeout`) and consume it; false if none came.
+    pub fn wait(&self, timeout: Duration) -> bool {
         let rung = self.rung.lock().unwrap_or_else(|e| e.into_inner());
         let (mut rung, _) = self
             .signal
             .wait_timeout_while(rung, timeout, |r| !*r)
             .unwrap_or_else(|e| e.into_inner());
-        *rung = false;
+        std::mem::replace(&mut *rung, false)
     }
 }
 
@@ -605,6 +649,8 @@ impl Virtio {
             irqs,
             gsi,
             running: AtomicBool::new(false),
+            gates: Default::default(),
+            kicks: Default::default(),
         })
     }
     /// Install a finite native-call schedule before the test driver starts the VM.
@@ -631,8 +677,67 @@ impl Virtio {
     pub fn device(self: &Arc<Self>) -> devices::Shared {
         Arc::new(Mutex::new(Mmio(self.clone())))
     }
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> Locked<'_> {
+        Locked {
+            guard: self.state.lock().unwrap_or_else(|e| e.into_inner()),
+            device: self,
+        }
+    }
+    /// Republish each queue's gate from `s` (under its lock): open when a QueueNotify would be applied at once; a new
+    /// epoch when it starts dropping work, so a kick that saw an older gate is dropped as a notification before it was.
+    fn publish_gates(&self, s: &State) {
+        for (queue, gate) in self.gates.iter().enumerate() {
+            let killed =
+                queue >= self.profile.queue_count() || self.profile.is_rx(queue) || s.kills(queue);
+            let open = !killed && s.admission_open();
+            let old = gate.load(SeqCst);
+            let mut epoch = old >> 2;
+            if killed && old & GATE_KILLED == 0 {
+                epoch += 1;
+            }
+            let new = epoch << 2 | if killed { GATE_KILLED } else { 0 } | u64::from(open);
+            if new != old {
+                gate.store(new, SeqCst);
+            }
+        }
+    }
+    /// QueueNotify without the state lock, when the gate is open: record the kick and ring the owner. False: take the
+    /// locked path. The RX queue never opens (a packet arrival, not a kick, is its work).
+    fn kick(&self, queue: u64) -> bool {
+        let Some(q) = usize::try_from(queue).ok().filter(|&q| q < 2) else {
+            return false;
+        };
+        let gate = self.gates[q].load(SeqCst);
+        if gate & GATE_OPEN == 0 {
+            return false;
+        }
+        self.record_kick(q, gate);
+        true
+    }
+    /// The second half of [`Self::kick`], after it saw `gate` open (a reset may have overtaken it since).
+    fn record_kick(&self, q: usize, gate: u64) {
+        profile::notified();
+        // Keep the VM from ending as all-halted until the owner takes the kick; one count per recorded kick, taken
+        // before the kick is visible. The newest epoch wins (an older kick it replaces would be dropped anyway).
+        self.irqs.hold();
+        if self.kicks[q].fetch_max(gate, SeqCst) != 0 {
+            self.irqs.release();
+        }
+        self.wake.ring();
+    }
+    /// Move lock-free kicks into `notified` (under the lock), unless their queue dropped work since they were made.
+    fn take_kicks(&self, s: &mut State) {
+        for q in 0..2 {
+            let kick = self.kicks[q].swap(0, SeqCst);
+            if kick == 0 {
+                continue;
+            }
+            if kick >> 2 == self.gates[q].load(SeqCst) >> 2 && !s.kills(q) {
+                s.notified[q] = true;
+                self.busy(s);
+            }
+            self.irqs.release();
+        }
     }
     /// Drive the interrupt line from InterruptStatus (level-triggered).
     fn irq(&self, s: &State) {
@@ -648,6 +753,7 @@ impl Virtio {
     pub fn stop(&self) {
         let mut s = self.lock();
         s.stopped = true;
+        self.take_kicks(&mut s);
         s.notified = [false; 2];
         s.received = None;
         if let Some((_, p)) = &s.permit {
@@ -907,6 +1013,9 @@ impl Virtio {
         if size != 4 || offset % 4 != 0 || value.is_some_and(|v| v > u32::MAX.into()) {
             return Access::Refused;
         }
+        if offset == reg::QUEUE_NOTIFY && value.is_some_and(|q| self.kick(q)) {
+            return Access::Completed(0);
+        }
         let mut s = self.lock();
         // Reserve the waiting slot before applying a deferred lifecycle effect: a refusal must
         // leave the device unchanged.
@@ -1075,6 +1184,7 @@ impl Virtio {
         }
         let mut s = self.lock();
         s.stopped = !s.drained;
+        self.take_kicks(&mut s);
         s.in_flight.clear();
         s.permit = None;
         s.notified = [false; 2];
@@ -1091,6 +1201,7 @@ impl Virtio {
         if let Some(error) = &s.backend_error {
             return Err(format!("network shutdown: {error}"));
         }
+        self.take_kicks(&mut s);
         s.notified = [false; 2];
         s.busy = None;
         s.interrupt = 0;
@@ -1143,6 +1254,7 @@ impl Virtio {
     /// Take the next notified queue, round-robin, unless a reset or a deferred access must go
     /// first. The taken queue becomes active; RX takes the packet tagged with its incarnation.
     fn admit(&self, s: &mut State) -> Option<Work> {
+        self.take_kicks(s);
         if !s.admission_open() {
             return None;
         }
@@ -1324,6 +1436,19 @@ impl devices::Device for Mmio {
     fn poll(&mut self, v: usize, token: u64) -> Access {
         self.0.poll(v, token)
     }
+    fn direct(&self) -> Option<Arc<dyn devices::Direct>> {
+        Some(self.0.clone())
+    }
+}
+/// Register accesses serialise on the state lock (QueueNotify's open-gate case on atomics), so the registry skips the
+/// MMIO adapter's mutex.
+impl devices::Direct for Virtio {
+    fn access(&self, v: usize, o: u64, n: u64, value: Option<u64>) -> Access {
+        Virtio::access(self, v, o, n, value)
+    }
+    fn poll(&self, v: usize, token: u64) -> Access {
+        Virtio::poll(self, v, token)
+    }
 }
 
 #[cfg(test)]
@@ -1390,6 +1515,7 @@ mod tests {
                         }
                         let mut s = r.lock();
                         r.retire_request(&mut s, &snapshot, q, id, pending);
+                        r.take_kicks(&mut s);
                         assert_eq!(s.notified, [pending || notify || captured, true]);
                         assert_eq!(s.queues[0].next_avail, q.next_avail.wrapping_add(1));
                         assert_eq!(s.queues[0].next_used, 18);
@@ -1466,6 +1592,156 @@ mod tests {
         assert!(!s.in_flight.is_empty() && s.queues[0].ready && s.quiescing);
         assert!(!s.pending() && s.closing.is_none() && !s.drained && !s.stopped);
         assert_ne!(s.status, 0);
+    }
+    /// Negotiate, lay out and enable `queues` (eight entries each), then set DRIVER_OK.
+    fn live(r: &Virtio, queues: &[u64]) {
+        negotiated(r);
+        for &q in queues {
+            write(r, reg::QUEUE_SEL, q);
+            write(r, reg::QUEUE_NUM, 8);
+            write(r, reg::QUEUE_DESC_LOW, 0x1000 + q * 0x1000);
+            write(r, reg::QUEUE_DRIVER_LOW, 0x1800 + q * 0x1000);
+            write(r, reg::QUEUE_DEVICE_LOW, 0x1c00 + q * 0x1000);
+            write(r, reg::QUEUE_READY, 1);
+        }
+        write(r, reg::STATUS, 15);
+    }
+    fn net() -> Arc<Virtio> {
+        let r = device();
+        Virtio::network(
+            r.irqs.clone(),
+            NET_RESOURCE.gsi as usize,
+            [2, 0, 0, 0, 0, 1],
+        )
+        .unwrap()
+        .0
+    }
+    #[test]
+    fn open_gate_notify_skips_the_state_lock_and_keeps_the_vm_busy_until_admitted() {
+        let r = device();
+        live(&r, &[0]);
+        let base = r.irqs.live();
+        {
+            // A peer holds the state lock: the notify still completes, as a kick.
+            let _held = r.state.lock().unwrap();
+            assert_eq!(
+                r.access(0, reg::QUEUE_NOTIFY, 4, Some(0)),
+                Access::Completed(0)
+            );
+            assert_eq!(
+                r.access(1, reg::QUEUE_NOTIFY, 4, Some(0)),
+                Access::Completed(0)
+            );
+        }
+        assert_eq!(r.irqs.live(), base + 1, "one count per pending kick");
+        assert!(!r.lock().pending());
+        let mut s = r.lock();
+        assert!(matches!(r.admit(&mut s), Some(Work::Request { .. })));
+        assert_eq!(
+            r.irqs.live(),
+            base + 1,
+            "the busy guard took over the kick's count"
+        );
+        drop(s);
+        // Out-of-range queues take the locked path, which ignores them as before.
+        write(&r, reg::QUEUE_NOTIFY, 5);
+        assert_eq!(r.kicks.iter().map(|k| k.load(SeqCst)).sum::<u64>(), 0);
+    }
+    #[test]
+    fn closed_gates_take_the_locked_path() {
+        let r = device();
+        negotiated(&r);
+        // Before DRIVER_OK the notify is ignored under the lock.
+        write(&r, reg::QUEUE_NOTIFY, 0);
+        assert_eq!(r.kicks[0].load(SeqCst), 0);
+        assert!(!r.lock().pending());
+        // A disable deferred behind a request in flight: a later notify waits in the FIFO.
+        let r = device();
+        live(&r, &[0]);
+        {
+            let mut s = r.lock();
+            let id = s.identity(0);
+            s.in_flight.push(id);
+        }
+        assert!(matches!(
+            r.access(0, reg::QUEUE_READY, 4, Some(0)),
+            Access::Deferred(_)
+        ));
+        assert_eq!(r.gates[0].load(SeqCst) & GATE_OPEN, 0);
+        assert!(matches!(
+            r.access(1, reg::QUEUE_NOTIFY, 4, Some(0)),
+            Access::Deferred(_)
+        ));
+        assert_eq!(r.kicks[0].load(SeqCst), 0);
+        assert_eq!(r.lock().waiting.len(), 2);
+    }
+    #[test]
+    fn a_kick_racing_reset_disable_or_power_off_is_dropped_with_its_incarnation() {
+        for event in 0..4 {
+            let r = device();
+            live(&r, &[0]);
+            let base = r.irqs.live();
+            // The kicker saw the open gate, then the event overtook it before its kick was recorded.
+            let gate = r.gates[0].load(SeqCst);
+            assert_ne!(gate & GATE_OPEN, 0);
+            match event {
+                0 => write(&r, reg::STATUS, 0),
+                1 => write(&r, reg::QUEUE_READY, 0),
+                2 => assert!(!r.quiesce().unwrap()),
+                _ => r.stop(),
+            }
+            if event < 2 {
+                // The driver brings a new incarnation up before the owner looks.
+                if event == 0 {
+                    live(&r, &[0]);
+                } else {
+                    write(&r, reg::QUEUE_READY, 1);
+                }
+                assert_ne!(r.gates[0].load(SeqCst) & GATE_OPEN, 0);
+            }
+            r.record_kick(0, gate);
+            let mut s = r.lock();
+            r.take_kicks(&mut s);
+            assert!(!s.pending(), "event {event}: stale kick scheduled work");
+            r.settle(&mut s);
+            drop(s);
+            assert_eq!(r.irqs.live(), base, "event {event}: kick count released");
+        }
+    }
+    #[test]
+    fn a_kick_survives_a_closing_reset_of_another_queue_as_a_locked_notify_does() {
+        let r = net();
+        live(&r, &[0, 1]);
+        let gate = r.gates[1].load(SeqCst);
+        assert_ne!(gate & GATE_OPEN, 0, "TX opens");
+        assert_eq!(r.gates[0].load(SeqCst) & GATE_OPEN, 0, "RX never opens");
+        {
+            let mut s = r.lock();
+            let id = s.identity(0);
+            s.in_flight.push(id);
+        }
+        // RX disable waits for its request: TX's gate closes, but its epoch stays.
+        write(&r, reg::QUEUE_SEL, 0);
+        assert!(matches!(
+            r.access(0, reg::QUEUE_READY, 4, Some(0)),
+            Access::Deferred(_)
+        ));
+        assert_eq!(r.gates[1].load(SeqCst) >> 2, gate >> 2);
+        r.record_kick(1, gate);
+        let mut s = r.lock();
+        r.take_kicks(&mut s);
+        assert_eq!(s.notified, [false, true]);
+        // A device reset then drops it, as it drops a locked notify.
+        s.in_flight.clear();
+        r.retire_reset(&mut s);
+        drop(s);
+        r.record_kick(1, gate);
+        let mut s = r.lock();
+        let _ = r.reset(&mut s, Reset::Device);
+        drop(s);
+        let mut s = r.lock();
+        r.take_kicks(&mut s);
+        assert!(!s.pending());
     }
     #[test]
     fn full_selectors_and_feature_negotiation_do_not_truncate() {

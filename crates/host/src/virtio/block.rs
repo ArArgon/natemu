@@ -50,6 +50,12 @@ const MAX_BUFFERED: usize = 4 << 20;
 const CALL_LIMIT: Duration = Duration::from_secs(10);
 /// The power-off drain's final full sync, outside every in-flight slot.
 const FINAL_SYNC: usize = usize::MAX;
+/// How long the owner sleeps with kicks suppressed while requests are on disk before it clears the flag: heads the
+/// driver publishes meanwhile wait at most this long (or for the next completion, which reads the ring).
+const SUPPRESSED_WAIT: Duration = Duration::from_micros(50);
+/// The used ring's flags with and without VIRTQ_USED_F_NO_NOTIFY.
+const NO_NOTIFY: [u8; 2] = USED_NO_NOTIFY.to_le_bytes();
+const NOTIFY: [u8; 2] = [0; 2];
 
 pub(super) struct Disk {
     #[cfg(feature = "testing")]
@@ -655,6 +661,21 @@ fn start(streams: &Streams, bytes: Vec<u8>, disk: &Disk, features: u64) -> Start
     }
 }
 
+/// Clear `q`'s NO_NOTIFY, then (after the full barrier a copy puts between a write and a later read) read the
+/// available ring's flags and index into `avail`.
+fn clear_spans(q: Queue, avail: &mut [u8; 4]) -> [Transfer<'_>; 2] {
+    [
+        Transfer::Write {
+            gpa: q.used,
+            bytes: &NOTIFY,
+        },
+        Transfer::Read {
+            gpa: q.avail,
+            bytes: avail,
+        },
+    ]
+}
+
 impl Virtio {
     /// The block owner: admit every published request the bounds allow, gather their headers and
     /// OUT payloads, hand their disk calls to the workers, and complete answered requests in
@@ -668,6 +689,12 @@ impl Virtio {
         let mut snapshot = Snapshot::new(self.profile.queue_max())?;
         let mut pool = disk.start(self.wake.clone())?;
         let mut flight = Flight::default();
+        // Kick suppression: the incarnation whose used ring holds VIRTQ_USED_F_NO_NOTIFY. Set by an admission's
+        // gather, cleared before the owner idles: by the completion that empties the flight, or here. Each clear is
+        // followed by a full barrier and a read of the available index (Dekker with the driver's index store,
+        // barrier and flags read), and new heads are admitted instead of sleeping, so no kick is lost. A reset ends
+        // the incarnation: the driver zeroes the rings before enabling a queue again (virtio 1.2 §4.2.3.2).
+        let mut suppressed: Option<Identity> = None;
         loop {
             let (stopped, quiescing) = {
                 let s = self.lock();
@@ -687,14 +714,31 @@ impl Virtio {
             if pool.stalled() {
                 return Err(pool.abandon());
             }
-            if self.complete_answered(guest, disk, &mut flight, &mut snapshot)? {
+            if self.complete_answered(guest, disk, &mut flight, &mut snapshot, &mut suppressed)? {
                 continue;
             }
             if quiescing && flight.is_empty() {
                 return self.drain_disk(pool, cancel);
             }
-            if self.admit_block(guest, disk, &pool, &mut flight, &mut snapshot)? {
+            if self.admit_block(
+                guest,
+                disk,
+                &pool,
+                &mut flight,
+                &mut snapshot,
+                &mut suppressed,
+            )? {
                 continue;
+            }
+            if let Some(id) = suppressed {
+                // Requests on disk ring the bell as they finish; their completion reads the ring.
+                if !flight.is_empty() && self.wake.wait(SUPPRESSED_WAIT) {
+                    continue;
+                }
+                suppressed = None;
+                if self.unsuppress(guest, id)? {
+                    continue;
+                }
             }
             let waited = profile::start();
             self.wake.wait(Duration::from_millis(10));
@@ -724,9 +768,33 @@ impl Virtio {
         self.drain()
     }
 
+    /// Clear the used ring's NO_NOTIFY, then read the available index: true if heads wait (the queue is notified).
+    fn unsuppress(&self, guest: Guest<'_>, id: Identity) -> Result<bool> {
+        let q = self.lock().queues[id.queue];
+        let mut avail = [0; 4];
+        let mut spans = clear_spans(q, &mut avail);
+        // A reset overtaking the copy ends the incarnation; its rings are the driver's again.
+        if !self.copy(guest, id, &mut spans, None)? {
+            return Ok(false);
+        }
+        Ok(self.rearm(id, &avail))
+    }
+    /// After a clear of NO_NOTIFY and a read of the available ring's flags and index into `avail`: notify the queue
+    /// if the driver published heads not yet admitted. True if it did.
+    fn rearm(&self, id: Identity, avail: &[u8; 4]) -> bool {
+        let mut s = self.lock();
+        let more = u16::from_le_bytes([avail[2], avail[3]]) != s.queues[id.queue].next_avail;
+        let rearm = more && s.current(id) && s.accepting(id.queue);
+        if rearm {
+            s.notified[id.queue] = true;
+            self.busy(&mut s);
+        }
+        rearm
+    }
     /// Admit every published request the bounds allow from one metadata snapshot (captured now
     /// unless the last completion window refreshed it), gather their headers and OUT payloads,
-    /// and start their disk calls. True if any request was admitted.
+    /// and start their disk calls; the first gather window also suppresses kicks. True if any
+    /// request was admitted.
     fn admit_block(
         &self,
         guest: Guest<'_>,
@@ -734,9 +802,11 @@ impl Virtio {
         pool: &Pool,
         flight: &mut Flight,
         snapshot: &mut Snapshot,
+        suppressed: &mut Option<Identity>,
     ) -> Result<bool> {
         let (q, id, notified) = {
             let mut s = self.lock();
+            self.take_kicks(&mut s);
             let (q, id, notified) = (s.queues[0], s.identity(0), s.notified[0]);
             let work = notified || snapshot.reusable(q, id);
             let open = s.admission_open() && s.accepting(0) && !s.stopped;
@@ -810,7 +880,10 @@ impl Virtio {
         }
         profile::count(profile::ADMISSIONS);
         profile::add(profile::ADMITTED, admitted.len() as u64);
-        self.start_requests(guest, disk, pool, flight, id, admitted)?;
+        let flag = (*suppressed != Some(id)).then_some(q.used);
+        if self.start_requests(guest, disk, pool, flight, id, admitted, flag)? {
+            *suppressed = Some(id);
+        }
         profile::since(profile::ADMIT_NS, began);
         Ok(true)
     }
@@ -845,7 +918,9 @@ impl Virtio {
     /// Gather the admitted requests' readable streams (header, then OUT data) in as few windows
     /// as the window bounds allow, decode them and start their disk calls; a request answered
     /// without one is answered at once. A request whose gather window a reset overtook (and
-    /// every later one) retires unanswered.
+    /// every later one) retires unanswered. With `flag` (the used ring), the first window also
+    /// sets NO_NOTIFY there; true if it was granted.
+    #[allow(clippy::too_many_arguments)]
     fn start_requests(
         &self,
         guest: Guest<'_>,
@@ -854,12 +929,13 @@ impl Virtio {
         flight: &mut Flight,
         id: Identity,
         admitted: Vec<Admitted>,
-    ) -> Result<()> {
+        flag: Option<u64>,
+    ) -> Result<bool> {
         let mut readable: Vec<Vec<u8>> = admitted
             .iter()
             .map(|r| vec![0; r.streams.gathered_len()])
             .collect();
-        let gathered = self.gather_streams(guest, id, &admitted, &mut readable)?;
+        let (gathered, flagged) = self.gather_streams(guest, id, &admitted, &mut readable, flag)?;
         let features = self.lock().features;
         // Each gathered buffer moves into its decoded command (an OUT job keeps its payload).
         let starts: Vec<Start> = admitted[..gathered]
@@ -897,17 +973,19 @@ impl Virtio {
         }
         self.retire_reset(&mut s);
         self.settle(&mut s);
-        Ok(())
+        Ok(flagged)
     }
-    /// Read each request's gathered stream into `readable` in packed windows. Returns how many
-    /// leading requests were gathered: all, unless a reset overtook a window.
+    /// Read each request's gathered stream into `readable` in packed windows, the first one
+    /// also writing NO_NOTIFY to `flag` (the used ring's flags). Returns how many leading
+    /// requests were gathered (all, unless a reset overtook a window) and whether the flag was.
     fn gather_streams(
         &self,
         guest: Guest<'_>,
         id: Identity,
         admitted: &[Admitted],
         readable: &mut [Vec<u8>],
-    ) -> Result<usize> {
+        mut flag: Option<u64>,
+    ) -> Result<(usize, bool)> {
         let reads: Vec<Vec<Transfer<'_>>> = admitted
             .iter()
             .zip(readable.iter_mut())
@@ -918,16 +996,26 @@ impl Virtio {
             .collect();
         let costs: Vec<Cost> = reads.iter().map(|r| Cost::of(r)).collect();
         let mut reads = reads.into_iter();
-        let mut gathered = 0;
-        for window in pack(&costs, Cost::default()) {
+        let (mut gathered, mut flagged) = (0, false);
+        // Every window leaves room for the flag write.
+        let flag_cost = Cost { spans: 1, bytes: 2 };
+        for window in pack(&costs, flag_cost) {
             let mut spans: Vec<Transfer<'_>> =
                 reads.by_ref().take(window.len()).flatten().collect();
+            let flagging = flag.take();
+            if let Some(gpa) = flagging {
+                spans.push(Transfer::Write {
+                    gpa,
+                    bytes: &NO_NOTIFY,
+                });
+            }
             if !spans.is_empty() && !self.copy(guest, id, &mut spans, None)? {
                 break;
             }
+            flagged |= flagging.is_some();
             gathered = window.end;
         }
-        Ok(gathered)
+        Ok((gathered, flagged))
     }
     /// Complete every answered request, in answering order, in as few windows as the window
     /// bounds allow. Each window publishes whole requests: their data and status, their used
@@ -940,6 +1028,7 @@ impl Virtio {
         disk: &Disk,
         flight: &mut Flight,
         snapshot: &mut Snapshot,
+        suppressed: &mut Option<Identity>,
     ) -> Result<bool> {
         if flight.answered.is_empty() {
             return Ok(false);
@@ -968,8 +1057,8 @@ impl Virtio {
             .iter()
             .map(|(writes, _)| Cost::of(writes).plus(element))
             .collect();
-        // The used index and the available ring's flags and index.
-        let overhead = Cost { spans: 2, bytes: 6 };
+        // The used index, the available ring's flags and index, and room for clearing NO_NOTIFY.
+        let overhead = Cost { spans: 3, bytes: 8 };
         let windows = pack(&costs, overhead);
         let last = windows.len() - 1;
         let mut completions = completions.into_iter();
@@ -979,6 +1068,15 @@ impl Virtio {
             let (writes, lens): (Vec<_>, Vec<_>) = completions.by_ref().take(window.len()).unzip();
             let mut used = Used::new(q, heads.zip(lens));
             let mut transfers: Vec<Transfer<'_>> = writes.into_iter().flatten().collect();
+            // The completion emptying the flight clears NO_NOTIFY in its body: the publication's
+            // read of the available index follows a full barrier, and `retire_window` rearms.
+            if i == last && flight.is_empty() && *suppressed == Some(id) {
+                transfers.push(Transfer::Write {
+                    gpa: q.used,
+                    bytes: &NOTIFY,
+                });
+                *suppressed = None;
+            }
             let publish = used.publish(q, &mut transfers);
             let refresh = i == last
                 && Cost::of(&transfers)
@@ -1333,6 +1431,104 @@ mod tests {
     }
     fn ok(data: Vec<u8>) -> Done {
         Done { data, error: None }
+    }
+    /// The driver's side of a notification (Linux `virtqueue_kick_prepare` without EVENT_IDX): publish the available
+    /// index, full barrier, then read the used ring's flags. Races the device's `clear` against it many times: the
+    /// driver kicks (it saw the flag clear) or the device's read sees the new index; never neither.
+    fn race_clear(clear: impl Fn(&crate::execution::Backing, Queue, u16) -> u16 + Sync) {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicU16, Ordering::Relaxed, fence},
+        };
+        let b = crate::execution::io::tests::backing(1);
+        let q = Queue {
+            size: 8,
+            ready: true,
+            avail: 0x1000,
+            used: 0x2000,
+            ..Queue::default()
+        };
+        // SAFETY: two aligned ring fields of the fixture's RAM, accessed atomically by both sides.
+        let field =
+            |gpa: u64| unsafe { AtomicU16::from_ptr(b.ram.range(gpa, 2).unwrap() as *mut u16) };
+        let (flags, index) = (field(q.used), field(q.avail + 2));
+        let barrier = Barrier::new(2);
+        let rounds = 20_000u16;
+        std::thread::scope(|scope| {
+            let driver = scope.spawn(|| {
+                let mut kicks = Vec::with_capacity(rounds.into());
+                for i in 0..rounds {
+                    barrier.wait();
+                    // Vary where the publication lands inside the device's copy.
+                    for _ in 0..(u32::from(i) * 7919) % 2048 {
+                        std::hint::spin_loop();
+                    }
+                    index.store(i.wrapping_add(1), Relaxed);
+                    fence(SeqCst);
+                    kicks.push(flags.load(Relaxed) & USED_NO_NOTIFY == 0);
+                    barrier.wait();
+                }
+                kicks
+            });
+            let mut seen = Vec::with_capacity(rounds.into());
+            for i in 0..rounds {
+                flags.store(USED_NO_NOTIFY, Relaxed);
+                index.store(i, Relaxed);
+                barrier.wait();
+                seen.push(clear(&b, q, i) != i);
+                barrier.wait();
+            }
+            let kicks = driver.join().unwrap();
+            let lost = kicks
+                .iter()
+                .zip(&seen)
+                .filter(|(k, s)| !**k && !**s)
+                .count();
+            assert_eq!(lost, 0, "a head neither kicked nor seen");
+            assert!(kicks.iter().any(|k| !k), "the race never suppressed a kick");
+        });
+    }
+    #[test]
+    fn clearing_the_flag_before_idling_loses_no_kick() {
+        race_clear(|b, q, _| {
+            let mut avail = [0; 4];
+            let mut spans = clear_spans(q, &mut avail);
+            crate::execution::io::tests::windowless(b, &mut spans, 2).unwrap();
+            u16::from_le_bytes([avail[2], avail[3]])
+        });
+    }
+    #[test]
+    fn the_completion_emptying_the_flight_clears_the_flag_before_reading_the_ring() {
+        race_clear(|b, q, i| {
+            let q = Queue { next_avail: i, ..q };
+            let mut used = Used::new(q, [(0, 0)]);
+            // As `complete_answered` builds the window that empties the flight.
+            let mut transfers = vec![Transfer::Write {
+                gpa: q.used,
+                bytes: &NOTIFY,
+            }];
+            let publish = used.publish(q, &mut transfers);
+            crate::execution::io::tests::windowless(b, &mut transfers, publish).unwrap();
+            drop(transfers);
+            used.avail_index()
+        });
+    }
+    #[test]
+    fn a_reset_with_the_flag_set_leaves_its_incarnation_unwritten_and_unadmitted() {
+        let (r, id) = in_flight(0);
+        let more = [0, 0, 1, 0];
+        // While current, heads seen after a clear are admitted instead of sleeping.
+        assert!(r.rearm(id, &more));
+        r.lock().notified[0] = false;
+        // A reset ends the incarnation the flag was set in: no further admission for it, and `copy` refuses its
+        // writes. The driver zeroes the rings before enabling the queue again; the next admission sets the flag.
+        {
+            let mut s = r.lock();
+            let _ = r.reset(&mut s, Reset::Device);
+        }
+        assert!(!r.current(id));
+        assert!(!r.rearm(id, &more));
+        assert!(!r.lock().pending());
     }
     #[test]
     fn admission_stops_at_the_request_and_byte_bounds() {
