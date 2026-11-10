@@ -18,7 +18,9 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import subprocess
+import sys
 import tarfile
 import time
 
@@ -31,7 +33,8 @@ PAYLOAD_BYTES = 4 << 20
 MODULE_NAMES = ('virtio_mmio', 'virtio_blk', 'virtio-rng', 'crc32c_generic', 'crc16', 'mbcache', 'jbd2', 'ext4')
 APPLETS = ('sh', 'mount', 'umount', 'switch_root', 'nproc', 'uname', 'modprobe', 'cat', 'grep', 'awk',
            'basename', 'readlink', 'dd', 'wc', 'cmp', 'sha256sum', 'dmesg', 'sync', 'poweroff', 'sleep',
-           'mkdir', 'cp', 'mv', 'rm', 'stty')
+           'mkdir', 'cp', 'mv', 'rm', 'stty', 'taskset', 'chmod', 'touch')
+EXEC_ROUNDS, EXEC_WAVES, EXEC_PAGES = 8, 3, 64
 
 BOOT_INIT = r'''#!/bin/sh
 export PATH=/bin
@@ -63,8 +66,8 @@ drain_console() { console_mode=$(stty -F /dev/console -g) && stty -F /dev/consol
 fail() { echo "VIRTIO-BLOCK-FAIL $*"; dmesg; drain_console || true; poweroff -f; while :; do sleep 1; done; }
 exec </dev/console >/dev/console 2>&1
 mount -t tmpfs tmpfs /tmp || fail tmpfs
-phase= rng=0
-for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; io_rng=*) rng=${item#*=};; esac; done
+phase= rng=0 exec_mode=0
+for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; io_rng=*) rng=${item#*=};; io_exec=*) exec_mode=${item#*=};; esac; done
 echo "VIRTIO-BLOCK-BEGIN phase=$phase cpus=$(nproc) kernel=$(uname -r)"
 test "$(uname -r)" = '6.12.107+deb13-amd64' || fail kernel
 case "$phase" in write) mode=rw;; verify) mode=ro;; *) fail phase;; esac
@@ -114,6 +117,51 @@ if test "$rng" = 1; then
   hash=$(sha256sum /tmp/entropy); hash=${hash%% *}
   echo "VIRTIO-BLOCK-RNG bytes=1024 sha256=$hash"
 fi
+# io_exec=1: run disk-loaded code while every device is busy. Programs on the virtio disk run on
+# every CPU at once after the page cache is dropped (so their code pages come back through
+# completions into recycled frames), and are overwritten in place by the other program between
+# rounds; meanwhile two CPU burners, an RNG reader and a block copy/verify loop keep running.
+run_wave() {
+  want=$1 pids= c=0
+  echo 3 > /proc/sys/vm/drop_caches || fail drop-caches
+  while test $c -lt $cpus; do taskset -c $c /persist/prog > /tmp/exec.$c & pids="$pids $!"; c=$((c+1)); done
+  wait $pids || fail exec-status
+  c=0
+  while test $c -lt $cpus; do test "$(cat /tmp/exec.$c)" = "$want" || fail "exec-output-cpu$c-$(cat /tmp/exec.$c)"; c=$((c+1)); done
+}
+if test "$exec_mode" = 1; then
+  cpus=$(nproc)
+  if test "$phase" = write; then
+    burn() { while test ! -e /tmp/stop; do :; done; }
+    burn & loaders=$!
+    burn & loaders="$loaders $!"
+    ( n=0; while test ! -e /tmp/stop; do
+        dd if=/dev/hwrng of=/tmp/rng.bin bs=4096 count=4 iflag=fullblock 2>/dev/null || { echo read > /tmp/rng.fail; break; }
+        test "$(wc -c < /tmp/rng.bin)" -eq 16384 || { echo short > /tmp/rng.fail; break; }
+        n=$((n+1)); echo $n > /tmp/rng.count; done ) & loaders="$loaders $!"
+    ( n=0; while test ! -e /tmp/stop; do
+        cp /fixtures/payload.bin /persist/load.bin && sync && echo 3 > /proc/sys/vm/drop_caches &&
+          sha256sum -c /fixtures/load.sha256 > /dev/null || { echo copy > /tmp/block.fail; break; }
+        n=$((n+1)); echo $n > /tmp/block.count; done; rm -f /persist/load.bin ) & loaders="$loaders $!"
+    r=0
+    while test $r -lt 8; do
+      case $((r % 2)) in 0) v=a want=EXEC-A-OK;; *) v=b want=EXEC-B-OK;; esac
+      cp /fixtures/prog-$v /persist/prog || fail exec-copy
+      chmod 755 /persist/prog && sync || fail exec-sync
+      k=0
+      while test $k -lt 3; do run_wave $want; k=$((k+1)); done
+      r=$((r+1))
+    done
+    touch /tmp/stop; wait $loaders
+    test ! -e /tmp/rng.fail || fail "exec-load-rng-$(cat /tmp/rng.fail)"
+    test ! -e /tmp/block.fail || fail "exec-load-block-$(cat /tmp/block.fail)"
+    sync
+    echo "VIRTIO-BLOCK-EXEC phase=write rounds=$r waves=3 cpus=$cpus last=$want rng=$(cat /tmp/rng.count) block=$(cat /tmp/block.count)"
+  else
+    run_wave EXEC-B-OK
+    echo "VIRTIO-BLOCK-EXEC phase=verify cpus=$cpus last=EXEC-B-OK"
+  fi
+fi
 echo VIRTIO-BLOCK-INTERRUPTS-BEGIN
 cat /proc/interrupts
 echo VIRTIO-BLOCK-INTERRUPTS-END
@@ -130,6 +178,28 @@ drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
 '''
+
+
+def exec_program(variant):
+    """A static x86-64 ELF of EXEC_PAGES code pages: each page adds its own constant to RBX and
+    jumps to the next page; the last compares the sum and writes EXEC-<V>-OK (or -BAD) to stdout.
+    A stale page of the other variant (or of any old frame) changes the sum."""
+    sys.path.insert(0, str(ROOT / 'tools/reference'))
+    import ref
+    values = [int.from_bytes(hashlib.sha256(f'natemu-exec-{variant}-{i}'.encode()).digest()[:4], 'little') & 0x7fffffff for i in range(EXEC_PAGES)]
+    name = variant.upper()
+    asm = ['xor ebx, ebx']
+    for i, value in enumerate(values):
+        asm += [f'page{i}:', f'add rbx, {value:#x}']
+        if i + 1 < EXEC_PAGES: asm += [f'jmp page{i + 1}', '.p2align 12, 0xcc']
+    asm += [f'mov rax, {sum(values):#x}', 'cmp rbx, rax', 'jne bad', 'lea rsi, [rip + good]', 'mov edx, 10', 'jmp out',
+            'bad:', 'lea rsi, [rip + wrong]', 'mov edx, 11', 'out:', 'mov eax, 1', 'mov edi, 1', 'syscall',
+            'mov eax, 60', 'xor edi, edi', 'syscall', f'good: .ascii "EXEC-{name}-OK\\n"', f'wrong: .ascii "EXEC-{name}-BAD\\n"']
+    code = ref.assemble('\n'.join(asm))
+    base, offset = 0x400000, 0x1000
+    header = struct.pack('<4sBBBBB7xHHIQQQIHHHHHH', b'\x7fELF', 2, 1, 1, 0, 0, 2, 0x3e, 1, base + offset, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+    segment = struct.pack('<IIQQQQQQ', 1, 5, 0, base, base, offset + len(code), offset + len(code), 0x1000)
+    return (header + segment).ljust(offset, b'\0') + code
 
 
 def checked(command, log, env=None):
@@ -179,6 +249,9 @@ def prepare(args):
     (root / 'fixtures/patch.bin').write_bytes(patch)
     (root / 'fixtures/source.sha256').write_text(source_sha + '  /fixtures/payload.bin\n')
     (root / 'fixtures/expected.sha256').write_text(expected_sha + '  /persist/final.bin\n')
+    (root / 'fixtures/load.sha256').write_text(source_sha + '  /persist/load.bin\n')
+    for variant in 'ab':
+        (root / f'fixtures/prog-{variant}').write_bytes(exec_program(variant)); (root / f'fixtures/prog-{variant}').chmod(0o755)
     archive = subprocess.check_output(['ar', 'p', str(args.kernel_deb), 'data.tar.xz'], timeout=30)
     modules = {}
     with tarfile.open(fileobj=io.BytesIO(archive)) as package:
@@ -230,7 +303,7 @@ def prepare(args):
     print(json.dumps({k: manifest[k] for k in ('disk_bytes', 'source_sha256', 'persisted_sha256', 'outputs')}, indent=2))
 
 
-def judge(text, n, phase, expected_sha, rng):
+def judge(text, n, phase, expected_sha, rng, exec_mode=False):
     errors = []
     def require(ok, message):
         if not ok: errors.append(message)
@@ -248,6 +321,14 @@ def judge(text, n, phase, expected_sha, rng):
     if rng:
         hashes = re.findall(r'^VIRTIO-BLOCK-RNG bytes=1024 sha256=([a-f0-9]{64})$', text, re.M)
         require(len(hashes) == 1 and hashes[0] != hashlib.sha256(bytes(1024)).hexdigest(), 'combined RNG check failed')
+    if exec_mode:
+        if phase == 'write':
+            found = re.findall(r'^VIRTIO-BLOCK-EXEC phase=write rounds=(\d+) waves=(\d+) cpus=(\d+) last=(\S+) rng=(\d+) block=(\d+)$', text, re.M)
+            require(len(found) == 1 and found[0][:4] == (str(EXEC_ROUNDS), str(EXEC_WAVES), str(n), 'EXEC-B-OK')
+                    and int(found[0][4]) > 0 and int(found[0][5]) > 0, 'disk-loaded code, RNG or block load check failed')
+        else:
+            require(re.findall(r'^VIRTIO-BLOCK-EXEC phase=verify cpus=(\d+) last=(\S+)$', text, re.M) == [(str(n), 'EXEC-B-OK')],
+                    'persisted program did not run as the last written one')
     require(not re.search(r'VIRTIO-BLOCK-FAIL|BUG:|Oops:|Kernel panic|Call Trace:|EXT4-fs error|Buffer I/O error', text), 'guest/kernel/filesystem error')
     return errors
 
@@ -275,8 +356,10 @@ def run(args):
                            '--kernel', str((args.inputs / 'linux').resolve()), '--initrd', str((args.inputs / 'bootstrap.cpio').resolve()),
                            '--disk', str(image.resolve()), '--vcpus', str(n), '--ram', '2G', '--compile-cache', 'off',
                            '--serial', str((case / 'serial.log').resolve()), '--cmdline',
-                           f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng={int(args.rng)}']
+                           f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng={int(args.rng)}'
+                           + (' io_exec=1' if args.exec else '')]
                 if args.rng: command += ['--rng']
+                if args.exec: command += ['--perf-log', str((case / 'perf.log').resolve())]
                 write_json(case / 'command.json', command)
                 started, timeout = time.monotonic(), False
                 env = dict(os.environ); env.pop('NATEMU_PERF_LOG', None)
@@ -287,7 +370,13 @@ def run(args):
                     except BaseException: stop_group(process); raise
                 serial = case / 'serial.log'
                 text = serial.read_text(errors='replace').replace('\r', '') if serial.exists() else ''
-                errors = judge(text, n, phase, inputs['persisted_sha256'], args.rng)
+                errors = judge(text, n, phase, inputs['persisted_sha256'], args.rng, args.exec)
+                io_counts = None
+                if args.exec:
+                    perf = case / 'perf.log'
+                    lines = [l for l in perf.read_text(errors='replace').splitlines() if l.startswith('io ')] if perf.exists() else []
+                    if len(lines) == 1: io_counts = json.loads(lines[0][3:])
+                    else: errors.append('missing io perf line')
                 after = digest(image)
                 if timeout or process.returncode != 0: errors.append(f'host rc={process.returncode} timeout={timeout}')
                 if 'natemu: Power(1)' not in (case / 'stderr.log').read_text(errors='replace'): errors.append('normal poweroff missing')
@@ -296,7 +385,7 @@ def run(args):
                 try: checked([fsck, '-fn', image], case / 'fsck.log')
                 except RuntimeError as error: errors.append(f'offline e2fsck: {error}')
                 result = {'vcpus': n, 'phase': phase, 'seconds': time.monotonic() - started, 'returncode': process.returncode,
-                          'timeout': timeout, 'disk_before': before, 'disk_after': after, 'errors': errors, 'pass': not errors}
+                          'timeout': timeout, 'disk_before': before, 'disk_after': after, 'io_counts': io_counts, 'errors': errors, 'pass': not errors}
                 write_json(case / 'result.json', result); results.append(result); write_json(args.out / 'results.json', results)
                 print(json.dumps(result), flush=True)
                 if errors: return 1
@@ -319,6 +408,13 @@ def self_check():
                          (sha, 'c' * 64), ('16: 20 0', '16: 0 0'), ('ROOT-READONLY', 'missing'), ('PASS phase=', 'missing phase=')]:
             assert judge(text.replace(old, new), 2, phase, sha, True), old
         assert judge(text + 'EXT4-fs error synthetic\n', 2, phase, sha, True)
+        line = (f'VIRTIO-BLOCK-EXEC phase=write rounds={EXEC_ROUNDS} waves={EXEC_WAVES} cpus=2 last=EXEC-B-OK rng=3 block=2\n' if phase == 'write'
+                else 'VIRTIO-BLOCK-EXEC phase=verify cpus=2 last=EXEC-B-OK\n')
+        assert judge(text, 2, phase, sha, True, True) and not judge(text + line, 2, phase, sha, True, True)
+        bad = [('last=EXEC-B-OK', 'last=EXEC-A-OK'), ('cpus=2 last', 'cpus=1 last')]
+        if phase == 'write': bad += [('rng=3', 'rng=0'), ('block=2', 'block=0'), (f'rounds={EXEC_ROUNDS}', 'rounds=1')]
+        for old, new in bad: assert judge(text + line.replace(old, new), 2, phase, sha, True, True), old
+        assert judge(text + line + 'VIRTIO-BLOCK-FAIL exec-output-cpu1-EXEC-A-BAD\n', 2, phase, sha, True, True)
     for script in (BOOT_INIT, ROOT_INIT): subprocess.run(['sh', '-n'], input=script, text=True, check=True)
     import tempfile
     from unittest.mock import patch
@@ -331,7 +427,11 @@ def self_check():
         outcome = json.loads(log.with_suffix('.json').read_text())
         assert outcome['command'] == ['fsck-control'] and outcome['timeout'] and outcome['exit'] is None
         assert outcome['limit_seconds'] == 120 and '120-second deadline' in log.read_text()
-    print('Shell syntax, 16 negative parser controls and native-tool timeout retention passed; no VM launched.')
+    for variant in 'ab':
+        program = exec_program(variant)
+        assert program[:4] == b'\x7fELF' and len(program) > EXEC_PAGES * 4096 - 4096 and f'EXEC-{variant.upper()}-OK'.encode() in program
+    assert exec_program('a') != exec_program('b')
+    print('Shell syntax, 16 negative parser controls, exec judge controls and native-tool timeout retention passed; no VM launched.')
 
 
 def main():
@@ -341,13 +441,15 @@ def main():
     for name in ('rng-inputs', 'kernel-deb', 'e2fsprogs', 'out'): prep.add_argument('--' + name, type=Path, required=True)
     runner = sub.add_parser('run')
     for name in ('natemu', 'runtime', 'fexc', 'inputs', 'out', 'lock'): runner.add_argument('--' + name, type=Path, required=True)
-    runner.add_argument('--cpus', nargs='+', type=int, choices=(1, 2, 4), default=[1])
+    runner.add_argument('--cpus', nargs='+', type=int, choices=(1, 2, 4, 8, 16), default=[1])
     runner.add_argument('--rng', action='store_true')
+    runner.add_argument('--exec', action='store_true', help='also run disk-loaded programs on every CPU under RNG, block and CPU load (inputs from this prepare; needs --rng)')
     sub.add_parser('self-check')
     args = parser.parse_args()
     if args.command == 'prepare': return prepare(args)
     if args.command == 'self-check': return self_check()
     if len(args.cpus) != len(set(args.cpus)): parser.error('duplicate CPU cases')
+    if args.exec and not args.rng: parser.error('--exec needs --rng')
     return run(args)
 
 
