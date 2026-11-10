@@ -47,9 +47,8 @@ const WORKERS: usize = 4;
 const MAX_REQUESTS: usize = 32;
 const MAX_BUFFERED: usize = 4 << 20;
 /// A native call running longer abandons the workers, and the VM fails. The owner checks its workers' calls; a watchdog
-/// thread checks the owner's own (inline) call every `WATCH`.
-const CALL_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
-const WATCH: Duration = Duration::from_millis(CALL_LIMIT.as_millis() as u64 / 10);
+/// thread checks the owner's own (inline) call every tenth of the limit.
+const CALL_LIMIT: Duration = Duration::from_secs(10);
 /// Bounded spins before blocking, after recent activity: the owner's on its bell after it admitted or completed work,
 /// a worker's on the job queue after it finished a job. They trade host CPU for a condition-variable wake. Measured
 /// (io-benchmarks.md, "Shorter depth-1 path"): 5–10 µs gained nothing measurable at depth 1, depth 16 or four readers;
@@ -83,6 +82,9 @@ pub(super) struct Disk {
     /// Unit tests: native calls replaced by a script.
     #[cfg(test)]
     pub script: Mutex<Option<Arc<dyn Calls>>>,
+    /// Unit tests: a shorter call limit.
+    #[cfg(test)]
+    pub call_limit: Mutex<Option<Duration>>,
     /// Taken by the workers when the owner starts.
     file: Mutex<Option<File>>,
     pub capacity: u64,
@@ -122,6 +124,8 @@ impl Disk {
             control: Mutex::new(None),
             #[cfg(test)]
             script: Mutex::new(None),
+            #[cfg(test)]
+            call_limit: Mutex::new(None),
             file: Mutex::new(Some(file)),
             capacity: len,
             id,
@@ -138,6 +142,14 @@ impl Disk {
     }
     /// Start the workers on the file; each finished job rings `bell`.
     pub fn start(&self, bell: Arc<Bell>) -> Result<Pool> {
+        let pool = self.spawn(bell)?;
+        #[cfg(test)]
+        if let Some(limit) = *self.call_limit.lock().unwrap() {
+            board(&pool.board).limit = limit;
+        }
+        Ok(pool)
+    }
+    fn spawn(&self, bell: Arc<Bell>) -> Result<Pool> {
         let file = self
             .file
             .lock()
@@ -183,12 +195,24 @@ type Ticket = (usize, Job);
 /// finished results, in finishing order.
 #[derive(Default)]
 struct Board {
-    running: Vec<(usize, Instant)>,
+    /// Slot, start, call kind and file offset.
+    running: Vec<(usize, Instant, &'static str, u64)>,
     finished: Vec<(usize, Done)>,
     /// The owner gave up on the pool: queued jobs are dropped, never run.
     abandoned: bool,
     /// A call finished past the call limit (between two looks at `running`).
     overran: bool,
+    /// The call limit; zero: [`CALL_LIMIT`].
+    limit: Duration,
+}
+impl Board {
+    fn limit(&self) -> Duration {
+        if self.limit.is_zero() {
+            CALL_LIMIT
+        } else {
+            self.limit
+        }
+    }
 }
 fn board(board: &Mutex<Board>) -> MutexGuard<'_, Board> {
     board.lock().unwrap_or_else(|e| e.into_inner())
@@ -275,8 +299,21 @@ impl Drop for Pool {
     }
 }
 fn stalled(board: &Mutex<Board>) -> bool {
+    stalled_call(board).is_some()
+}
+/// The first call past the call limit, described for the VM-fatal message.
+fn stalled_call(board: &Mutex<Board>) -> Option<String> {
     let board = self::board(board);
-    board.overran || board.running.iter().any(|(_, t)| t.elapsed() > CALL_LIMIT)
+    let limit = board.limit();
+    match board.running.iter().find(|c| c.1.elapsed() > limit) {
+        Some((_, start, kind, offset)) => Some(format!(
+            "{kind} at file offset {offset:#x}, running for {:.1?}",
+            start.elapsed()
+        )),
+        None => board
+            .overran
+            .then(|| format!("a call that finished past the {limit:?} limit")),
+    }
 }
 /// One worker: run jobs until the pool closes or is abandoned. After a job it spins briefly for the next.
 fn work(calls: &dyn Calls, queue: &Mutex<Receiver<Ticket>>, shared: &Mutex<Board>, bell: &Bell) {
@@ -320,15 +357,20 @@ fn run(calls: &dyn Calls, shared: &Mutex<Board>, slot: usize, job: Job) -> bool 
             return false;
         }
         let start = Instant::now();
-        board.running.push((slot, start));
+        let (kind, offset) = match &job {
+            Job::Read(offset, _) => ("read", *offset),
+            Job::Write(offset, ..) => ("write", *offset),
+            Job::Flush => ("full sync", 0),
+        };
+        board.running.push((slot, start, kind, offset));
         start
     };
     let began = profile::taken_by_worker(slot);
     let done = execute(calls, job);
     profile::called(slot, began);
     let mut board = board(shared);
-    board.overran |= start.elapsed() > CALL_LIMIT;
-    board.running.retain(|(s, _)| *s != slot);
+    board.overran |= start.elapsed() > board.limit();
+    board.running.retain(|c| c.0 != slot);
     board.finished.push((slot, done));
     true
 }
@@ -775,19 +817,25 @@ impl Virtio {
     ) -> Result<()> {
         let pool = disk.start(self.wake.clone())?;
         let board = pool.board.clone();
+        let watch = self::board(&board).limit() / 10;
         let (done, signal) = (Mutex::new(false), Condvar::new());
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
                 while !*done {
-                    if stalled(&board) {
-                        // The owner abandons the pool once its call returns (or at once, for a worker's).
+                    if let Some(call) = stalled_call(&board) {
+                        // The owner abandons the pool once its call returns (or at once, for a worker's). Say why now:
+                        // an owner's own call cannot be detached, so the run ends only when that syscall returns.
+                        eprintln!(
+                            "virtio-block: VM fatal: native disk call past the call limit ({call}); the VM is canceled, \
+                             and an owner's inline call keeps the process until the syscall returns"
+                        );
                         crate::owners::cancel_owners(cancel);
                         self.wake.ring();
                         return;
                     }
                     done = signal
-                        .wait_timeout(done, WATCH)
+                        .wait_timeout(done, watch)
                         .unwrap_or_else(|e| e.into_inner())
                         .0;
                 }
@@ -2014,8 +2062,10 @@ mod owner_tests {
         fn call(&self) {
             let worker = std::thread::current().name() == Some("natemu-disk");
             self.by_worker.lock().unwrap().push(worker);
-            assert!(!self.panics.load(SeqCst), "injected disk panic");
             self.calls.fetch_add(1, SeqCst);
+            if self.panics.load(SeqCst) {
+                std::panic::panic_any("injected disk panic");
+            }
             let held = self.held.lock().unwrap();
             drop(self.released.wait_while(held, |h| *h).unwrap());
         }
@@ -2232,7 +2282,9 @@ mod owner_tests {
                 body(self);
                 self.disk.hold(false);
                 self.r.stop();
-                owner.join().unwrap()
+                owner
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
         }
         fn by_worker(&self) -> Vec<bool> {
@@ -2418,15 +2470,20 @@ mod owner_tests {
                 until("inline call", || rig.disk.calls() == 1);
             })
         }));
-        assert!(
-            ended.is_err(),
-            "the owner's panic propagates instead of hanging"
-        );
+        // The owner's own panic, not the body's timeout, propagates instead of hanging.
+        let panic = ended.expect_err("the owner's panic propagates");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"injected disk panic"));
+        assert_eq!(rig.by_worker(), [false]);
     }
 
     #[test]
     fn an_inline_call_past_the_call_limit_fails_the_vm() {
         let rig = Rig::new("overrun");
+        let limit = Duration::from_millis(500);
+        let Profile::Block(d) = &rig.r.profile else {
+            unreachable!()
+        };
+        *d.call_limit.lock().unwrap() = Some(limit);
         rig.disk.hold(true);
         let result = rig.run_owner(|rig| {
             rig.publish(rig.read_request(0));
@@ -2435,10 +2492,10 @@ mod owner_tests {
             // The watchdog cancels the VM while the owner is still in its call.
             let start = Instant::now();
             while !rig.cancel.load(SeqCst) {
-                assert!(start.elapsed() < CALL_LIMIT + 4 * WATCH, "no watchdog");
+                assert!(start.elapsed() < limit * 2, "no watchdog");
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(start.elapsed() + WATCH >= CALL_LIMIT / 2);
+            assert!(start.elapsed() >= limit / 2);
             assert_eq!(rig.used_index(), 0);
         });
         assert!(result.unwrap_err().contains("abandoned"));
