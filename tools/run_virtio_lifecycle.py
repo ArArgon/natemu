@@ -3,10 +3,11 @@
 
 Uses the testing driver's native-call schedule only; queue validation, copies,
 reset, IRQ and power drain are production paths. Run from a retained source build.
-Thirteen N=1 cases and one N=2 power/HLT case, no retries, at most 120 seconds per VM. Three
-cases force concurrent-request schedules: out-of-order completion, a canceled completion window
-covering four requests, and a reset with requests completed, running and queued. No throughput
-claims.
+Thirteen N=1 cases and two N=2 cases (power/HLT, and code-page: a block read overwrites a page
+both vCPUs executed, so the windowless copy must post both and wait for their drains before
+publishing), no retries, at most 120 seconds per VM. Three cases force concurrent-request
+schedules: out-of-order completion, a canceled completion window covering four requests, and a
+reset with requests completed, running and queued. No throughput claims.
 """
 import argparse
 import copy
@@ -29,13 +30,21 @@ BASE, CODE, STACK, MMIO = 0x400000, 0x100000, 0x300000, 0xf0000000
 SIZE, DISK_SIZE = 0x20000, 2 * 1024 * 1024
 CASES = ('reset', 'disable', 'power-scalar', 'power-rep', 'power-sync-error',
          'read-error', 'write-error', 'malformed', 'malformed-later', 'fullqueue', 'power-rep-halt',
-         'out-of-order', 'cancel-batch', 'reset-mixed')
+         'out-of-order', 'cancel-batch', 'reset-mixed', 'code-page')
 MODES = {'reset': 'hold-reset', 'disable': 'hold-disable', 'power-scalar': 'hold-power',
          'power-rep': 'hold-power', 'power-sync-error': 'power-sync-error', 'power-rep-halt': 'hold-power-halt',
          'out-of-order': 'out-of-order', 'cancel-batch': 'cancel-batch', 'reset-mixed': 'reset-mixed'}
 # The device reset's register readback (offset, saved at, value), shared by the reset cases.
 RESET_READBACK = ((0x60, 0xe000, 0), (0x70, 0xe004, 0), (0x44, 0xe008, 0))
 PEER_CODE, PEER_MARKER, PEER_R15 = 0x110000, 0x48414c5450454552, 0x5151
+# code-page: the executed page the block read overwrites, its old and new results, the disk
+# sector holding the new code, and the vCPUs' handshake words and results (in BASE RAM).
+TARGET, OLD, NEW, TARGET_SECTOR = 0x120000, 0x11111111, 0x22222222, 8
+GO1, ACK1, GO2, ACK2, RESULT1, RESULT2 = (BASE + 0xe200 + 4 * i for i in range(6))
+
+
+def target_code(value):
+    return ref.assemble(f'mov eax, {value:#x}\nret')
 
 
 def pattern(label, size):
@@ -83,15 +92,16 @@ def fixture(case, work):
         readreg(0x70); reg(15)
     def desc(q, i, addr, length, flags=0, next_=0):
         put(memory, q + i * 16, '<QIHH', addr, length, flags, next_)
-    def request(q, head, kind, sector=0, malformed=False):
-        header, status, data = q + 0x3000 + head * 32, q + 0x5000 + head, q + 0x6000 + head * 512
+    def request(q, head, kind, sector=0, malformed=False, data=None):
+        outside = data is not None
+        header, status, data = q + 0x3000 + head * 32, q + 0x5000 + head, data if outside else q + 0x6000 + head * 512
         put(memory, header, '<IIQ', kind, 0, sector)
         store(memory, status, b'\xa5')
         if kind == 4:
             desc(q, head, header, 16, 1, head + 1)
             desc(q, head + 1, status, 1, 2)
         else:
-            store(memory, data, payload if kind == 1 else b'\xa5' * 512)
+            if not outside: store(memory, data, payload if kind == 1 else b'\xa5' * 512)
             desc(q, head, header, 16, 1, head + 1)
             if malformed:
                 desc(q, head + 1, data, 256, 3, head + 2)
@@ -100,7 +110,7 @@ def fixture(case, work):
             else:
                 desc(q, head + 1, data, 512, 3 if kind == 0 else 1, head + 2)
                 desc(q, head + 2, status, 1, 2)
-        return {'head': head, 'status': status, 'data': data, 'kind': kind, 'sector': sector}
+        return {'head': head, 'status': status, 'data': data, 'kind': kind, 'sector': sector, 'outside': outside}
     def avail(q, heads):
         put(memory, q + 0x1002, '<H', len(heads))
         for i, head in enumerate(heads): put(memory, q + 0x1004 + 2 * i, '<H', head)
@@ -173,6 +183,25 @@ def fixture(case, work):
         avail(q + 0x10000, [0]); negotiate()
         configure(q + 0x10000); notify(); wait_used(q + 0x10000, 1); irq(q + 0x10000)
         completed.append((q + 0x10000, 0, fresh, 0, disk[2048:2560]))
+    elif case == 'code-page':
+        # Both vCPUs execute TARGET (each marks it as translated); the peer then spins. A block
+        # read overwrites TARGET with new code; both must run the new code after completion.
+        def call_target(): emit(f'mov rax, {TARGET:#x}\ncall rax')
+        def await_word(address):
+            label = f'await_{len(assembly)}'
+            emit(f'{label}:\ncmp dword ptr [{address:#x}], 1\njne {label}')
+        disk = bytearray(disk)
+        disk[512 * TARGET_SECTOR:512 * TARGET_SECTOR + 512] = target_code(NEW).ljust(512, b'\xcc')
+        disk = bytes(disk); expected_disk = bytearray(disk)
+        call_target(); reg(OLD)
+        emit(f'mov dword ptr [{GO1:#x}], 1'); await_word(ACK1)
+        read = request(q, 0, 0, TARGET_SECTOR, data=TARGET)
+        avail(q, [0]); notify(); wait_used(q, 1); irq(q)
+        expect(read['status'], 0, 'byte')
+        call_target(); reg(NEW)
+        emit(f'mov dword ptr [{GO2:#x}], 1'); await_word(ACK2)
+        expect(RESULT1, OLD); expect(RESULT2, NEW)
+        completed.append((q, 0, read, 0, disk[512 * TARGET_SECTOR:512 * TARGET_SECTOR + 512]))
     elif case == 'fullqueue':
         requests = [request(q, i, 4) for i in range(0, 128, 2)]
         avail(q, [r['head'] for r in requests]); notify(); wait_used(q, 64)
@@ -231,7 +260,7 @@ def fixture(case, work):
     expected = bytearray(memory)
     for target, index, req, status, data in completed + quiet:
         store(expected, req['status'], bytes([status]))
-        if data: store(expected, req['data'], data)
+        if data and not req['outside']: store(expected, req['data'], data)
         length = 0 if req['kind'] == 0 and status else len(data) + 1
         put(expected, target + 0x2004 + 8 * index, '<II', req['head'], length)
         put(expected, target + 0x2002, '<H', index + 1)
@@ -242,6 +271,9 @@ def fixture(case, work):
         put(expected, target + 0x1002, '<H', count)
         put(expected, target + 0x1004 + 2 * (count - 1), '<H', head)
     if case == 'disable': put(expected, BASE + 0xe004, '<I', 15)
+    if case == 'code-page':
+        for address, value in ((GO1, 1), (ACK1, 1), (GO2, 1), (ACK2, 1), (RESULT1, OLD), (RESULT2, NEW)):
+            put(expected, address, '<I', value)
     if case in ('malformed', 'malformed-later'):
         put(expected, BASE + 0xe014, '<I', 15 | 64)
         put(expected, BASE + 0xe00c, '<I', 3 if case == 'malformed-later' else 2)
@@ -250,14 +282,22 @@ def fixture(case, work):
              f'memory {BASE:#x} {memory.hex()}', f'region {STACK:#x} 0x1000']
     peer_rip = None
     work.mkdir(parents=True, exist_ok=True)
-    if case == 'power-rep-halt':
+    if case == 'code-page':
+        lines.append(f'body {TARGET:#x} {target_code(OLD).hex()}')
+    if case in ('power-rep-halt', 'code-page'):
         helper = f'mov r14, {PEER_MARKER:#x}\ncli\nhlt\nhelper_after:\nmov r15, 0xbad\nnop\n'
+        if case == 'code-page':
+            # Execute TARGET, report, spin (running, so its post must drain), run it again.
+            helper = (f'p1:\ncmp dword ptr [{GO1:#x}], 1\njne p1\nmov rax, {TARGET:#x}\ncall rax\n'
+                      f'mov dword ptr [{RESULT1:#x}], eax\nmov dword ptr [{ACK1:#x}], 1\n'
+                      f'p2:\ncmp dword ptr [{GO2:#x}], 1\njne p2\nmov rax, {TARGET:#x}\ncall rax\n'
+                      f'mov dword ptr [{RESULT2:#x}], eax\nmov dword ptr [{ACK2:#x}], 1\n') + helper
         peer_code, peer_labels = ref.assemble(helper, labels=True)
         peer_rip = PEER_CODE + peer_labels['helper_after']
         lines += [f'body {PEER_CODE:#x} {peer_code.hex()}', f'region {STACK + 0x1000:#x} 0x1000']
         (work / 'peer.asm').write_text('.intel_syntax noprefix\n' + helper)
     lines += ['cpu', f'rip {CODE:#x}', 'gpr ' + ' '.join(hex(v) for v in regs), 'cpl 0', 'rflags 0x2', 'if 0']
-    if case == 'power-rep-halt':
+    if peer_rip is not None:
         peer_regs = [0] * 16; peer_regs[4], peer_regs[15] = STACK + 0x1ff0, PEER_R15
         lines += ['cpu', f'rip {PEER_CODE:#x}', 'gpr ' + ' '.join(hex(v) for v in peer_regs), 'cpl 0', 'rflags 0x2', 'if 0']
     (work / 'program.asm').write_text('.intel_syntax noprefix\n' + asm + '\n')
@@ -291,7 +331,7 @@ def canonical(meta, memory):
     return memory[:offset] + b''.join(elements) + memory[offset + 8 * count:]
 
 
-def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expected_disk, expected_memory, post_memory):
+def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expected_disk, expected_memory, post_memory, counts=None):
     errors, case, n = [], meta['case'], meta['n']
     def require(ok, reason):
         if not ok: errors.append(reason)
@@ -322,7 +362,7 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         for v, item in enumerate(report['cpus']):
             memories = item['memory']
             require(len(memories) == 1 and ref.num(memories[0]['addr']) == BASE and same(memories[0]['data']), f'CPU {v} RAM differs from complete expected image')
-        if case == 'power-rep-halt':
+        if meta['peer_rip'] is not None:
             peer = report['cpus'][1]
             # Power drain releases the disk's busy guard after its final sync; the driver's halted rule may then end the
             # sleeping peer (nothing can wake it) before the power stop cancels it. Either ending is correct.
@@ -372,6 +412,14 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         # The reset retired only after every old request: all six old reads returned before the fresh one.
         fresh = events.index('read:2048:512') if 'read:2048:512' in events else 0
         require(events[:fresh].count('read-result:Ok(512)') == 6, 'reset retired before every old request')
+    elif case == 'code-page':
+        require(io['calls'] == 1 and events == [f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)', 'commit'], 'code-page read not completed exactly once')
+        # The completion went windowless, posted the page's holders and waited for their drains.
+        c = counts or {}
+        require(c.get('windowless_posted', 0) >= 1 and c.get('drain_waits', 0) >= 1, 'no windowless post and drain wait')
+        require(c.get('drain_expiries') == 0 and c.get('table_fallbacks') == 0 and c.get('windows') == 0, 'completion fell back to a window')
+        if not meta['sync_error'] and len(report.get('cpus', [])) == 2:
+            require(all(cpu['stats']['invalidations'] >= 1 for cpu in report['cpus']), 'a holder took no invalidation')
     elif case == 'malformed-later':
         require(io['calls'] == 1 and events.count('commit') == 1, 'malformed captured successor reached backend or publication')
         require(ordered(events, ['read:0:512', 'read-result:Ok(512)', 'commit']), 'valid captured prefix did not complete')
@@ -385,7 +433,7 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
 
 def final_records(stderr):
     result = []
-    for prefix in ('io-state: ', 'io-disk: ', 'io-memory: '):
+    for prefix in ('io-state: ', 'io-disk: ', 'io-memory: ', 'io-counts: '):
         records = [json.loads(line[len(prefix):]) for line in stderr.splitlines() if line.startswith(prefix)]
         if len(records) != 1:
             raise ValueError('missing or duplicate final state/trace/memory')
@@ -411,11 +459,11 @@ def run_case(args, case):
     try:
         stdout = (work / 'stdout.log').read_text()
         report = json.loads(stdout) if stdout.strip() else {}
-        state, trace, memory = final_records(stderr)
-        result['io_disk'] = trace
+        state, trace, memory, counts = final_records(stderr)
+        result['io_disk'], result['io_counts'] = trace, counts
         result['errors'] = verify(meta, report, state, trace, stderr, process.returncode, timed_out,
                                   (work / 'disk.raw').read_bytes(), (work / 'expected-disk.raw').read_bytes(),
-                                  (work / 'expected-memory.bin').read_bytes(), memory)
+                                  (work / 'expected-memory.bin').read_bytes(), memory, counts)
     except (ValueError, KeyError, TypeError, IndexError) as error: result['errors'] = [f'invalid report: {error}']
     result['pass'] = not result['errors']
     (work / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
@@ -436,6 +484,7 @@ def self_check():
         'out-of-order': ['backend-held', 'read:512:512', 'read-result:Ok(512)', 'commit', 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'commit'],
         'cancel-batch': [e for i in range(4) for e in (f'read:{512 * i}:512', 'read-result:Ok(512)')]
         + ['batch-held', 'reset-deferred', 'batch-released', 'read:2048:512', 'read-result:Ok(512)', 'commit'],
+        'code-page': [f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)', 'commit'],
         'reset-mixed': ['read:512:512', 'read-result:Ok(512)', 'commit', 'commit'] + ['backend-held'] * 4 + ['reset-deferred']
         + ['backend-released', 'read:0:512', 'read-result:Ok(512)'] * 4 + ['backend-held', 'backend-released', 'read:0:512', 'read-result:Ok(512)']
         + ['read:2048:512', 'read-result:Ok(512)', 'commit'],
@@ -452,9 +501,9 @@ def self_check():
         'reset-mixed': [lambda e: e[:4] + e[5:], late_old_read],
     }
     controls = 0
-    record_lines = ['io-state: []', 'io-disk: {}', 'io-memory: []']
-    assert final_records('\n'.join(record_lines)) == [[], {}, []]
-    for i in range(3):
+    record_lines = ['io-state: []', 'io-disk: {}', 'io-memory: []', 'io-counts: {}']
+    assert final_records('\n'.join(record_lines)) == [[], {}, [], {}]
+    for i in range(4):
         for invalid in (record_lines[:i] + record_lines[i + 1:], record_lines + [record_lines[i]]):
             try: final_records('\n'.join(invalid))
             except ValueError: controls += 1
@@ -473,16 +522,31 @@ def self_check():
             memory = (work / 'expected-memory.bin').read_bytes()
             disk = (work / 'expected-disk.raw').read_bytes()
             cpu = {**state[0], 'stop': 'poweroff' if meta['power'] else 'reached', 'memory': [{'addr': hex(BASE), 'data': memory.hex()}]}
+            if case == 'code-page': cpu['stats'] = {'invalidations': 1}
             cpus = [copy.deepcopy(cpu)]
-            if case == 'power-rep-halt':
+            if meta['peer_rip'] is not None:
                 peer_gpr = [0] * 16; peer_gpr[14], peer_gpr[15] = PEER_MARKER, PEER_R15
                 state.append({'rip': hex(meta['peer_rip']), 'gpr': peer_gpr})
-                cpus.append({**copy.deepcopy(state[1]), 'stop': 'cancelled', 'stats': {'halts': 1}, 'memory': copy.deepcopy(cpu['memory'])})
+                cpus.append({**copy.deepcopy(state[1]), 'stop': 'cancelled', 'stats': {'halts': 1, 'invalidations': 1}, 'memory': copy.deepcopy(cpu['memory'])})
             report = {} if meta['sync_error'] else {'cpus': cpus, 'io_disk': io}
             n = meta['n']
             stderr = f'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none\n' + ('disk shutdown full-sync: injected\n' if meta['sync_error'] else '')
-            args = [meta, report, state, io, stderr, 1 if meta['sync_error'] else 0, False, disk, disk, memory, [copy.deepcopy(cpu['memory']) for _ in range(n)]]
+            counts = {'windows': 0, 'windowless_posted': 1, 'drain_waits': 1, 'drain_expiries': 0, 'table_fallbacks': 0}
+            args = [meta, report, state, io, stderr, 1 if meta['sync_error'] else 0, False, disk, disk, memory, [copy.deepcopy(cpu['memory']) for _ in range(n)], counts]
             assert not verify(*args), (case, verify(*args))
+            if case == 'code-page':
+                # No post or drain wait, a fallback window, a holder without invalidation, or the
+                # peer having run the stale code must each fail.
+                for key, value in (('windowless_posted', 0), ('drain_waits', 0), ('drain_expiries', 1), ('windows', 1), ('table_fallbacks', 1)):
+                    bad = copy.deepcopy(args); bad[11][key] = value
+                    assert verify(*bad), key; controls += 1
+                for v in (0, 1):
+                    bad = copy.deepcopy(args); bad[1]['cpus'][v]['stats']['invalidations'] = 0
+                    assert verify(*bad); controls += 1
+                image = bytearray(memory); struct.pack_into('<I', image, RESULT2 - BASE, OLD)
+                for target in (lambda b: b[10][1][0], lambda b: b[1]['cpus'][1]['memory'][0]):
+                    bad = copy.deepcopy(args); target(bad)['data'] = image.hex()
+                    assert verify(*bad); controls += 1
             if case == 'fullqueue':
                 # Any completion order passes; a duplicated element (one flush lost) does not.
                 image = bytearray(memory)
@@ -509,7 +573,7 @@ def self_check():
             if not meta['sync_error']:
                 bad = copy.deepcopy(args); bad[1]['cpus'][0]['memory'][0]['data'] = ('00' if memory[0] else 'ff') + memory.hex()[2:]
                 assert verify(*bad); controls += 1
-            if case == 'power-rep-halt':
+            if meta['peer_rip'] is not None:
                 for index in (1, 2, 10):
                     for field in (('rip', 'r14', 'r15') if index in (1, 2) else ('memory',)):
                         bad = copy.deepcopy(args)
@@ -525,7 +589,8 @@ def self_check():
                     elif mutate == 'halts': bad[1]['cpus'][1]['stats']['halts'] = 0
                     elif mutate == 'reason': bad[1]['cpus'][1].update(stop='resident', reason='exception status=1 detail=0')
                     elif mutate == 'memory': bad[1]['cpus'][1]['memory'][0]['data'] = 'ff' + memory.hex()[2:]
-                    else: bad[3]['events'].remove('peer-halted')
+                    elif case == 'power-rep-halt': bad[3]['events'].remove('peer-halted')
+                    else: continue
                     assert verify(*bad); controls += 1
     print(f'PASS: assembled {len(CASES)} guests; {controls} negative oracle controls')
 
@@ -552,7 +617,7 @@ def main():
     manifest = {'purpose': 'deterministic lifecycle integration, not performance evidence', 'source_root': str(ROOT),
                 'source_sha256': {str(p.relative_to(ROOT)): digest(p) for p in sorted(sources)},
                 'artifacts': {key: {'path': str(getattr(args, key)), 'sha256': digest(getattr(args, key))} for key in ('host', 'runtime', 'fexc')},
-                'limits': {'vm_launches': len(args.cases), 'seconds_per_vm': 120, 'cpus_by_case': {case: 2 if case == 'power-rep-halt' else 1 for case in args.cases}},
+                'limits': {'vm_launches': len(args.cases), 'seconds_per_vm': 120, 'cpus_by_case': {case: 2 if case in ('power-rep-halt', 'code-page') else 1 for case in args.cases}},
                 'excluded': ['SMP reset and running power peers', 'real stalled OS syscall', 'performance', 'malicious concurrent descriptor mutation']}
     (args.out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     results = []
