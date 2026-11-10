@@ -197,6 +197,9 @@ struct State {
     /// One received packet waiting for an RX buffer, tagged with the RX queue's incarnation.
     received: Option<(Identity, net::Packet)>,
     backend_error: Option<String>,
+    /// Block: the incarnation whose used ring holds VIRTQ_USED_F_NO_NOTIFY (the owner's kick suppression). A reset
+    /// waits for the owner to clear it, so no incarnation ends with its driver's kicks suppressed.
+    suppressed: Option<Identity>,
 }
 
 impl State {
@@ -232,6 +235,7 @@ impl State {
     /// A request or the open copy window still belongs to an incarnation `reset` closes.
     fn holds(&self, reset: Reset) -> bool {
         self.in_flight.iter().any(|&id| reset.affects(id))
+            || self.suppressed.is_some_and(|id| reset.affects(id))
             || self
                 .permit
                 .as_ref()
@@ -723,6 +727,15 @@ impl Virtio {
         if self.kicks[q].fetch_max(gate, SeqCst) != 0 {
             self.irqs.release();
         }
+        // The queue dropped work since the gate was read (possibly after the owner's last look, e.g. at power-off):
+        // withdraw this now-stale kick unless another replaced it, so its count does not outlive the owner.
+        if self.gates[q].load(SeqCst) >> 2 != gate >> 2
+            && self.kicks[q]
+                .compare_exchange(gate, 0, SeqCst, SeqCst)
+                .is_ok()
+        {
+            self.irqs.release();
+        }
         self.wake.ring();
     }
     /// Move lock-free kicks into `notified` (under the lock), unless their queue dropped work since they were made.
@@ -1098,11 +1111,22 @@ impl Virtio {
         spans: &mut [Transfer<'_>],
         publish: Option<usize>,
     ) -> Result<bool> {
+        self.copy_while(guest, id, spans, publish, State::current)
+    }
+    /// [`Self::copy`] while `live(state, id)` holds instead of while `id` is current.
+    fn copy_while(
+        &self,
+        guest: Guest<'_>,
+        id: Identity,
+        spans: &mut [Transfer<'_>],
+        publish: Option<usize>,
+        live: fn(&State, Identity) -> bool,
+    ) -> Result<bool> {
         let publish = publish.unwrap_or(spans.len());
         let permit = Arc::new(CopyPermit::new());
         {
             let mut s = self.lock();
-            if !s.current(id) {
+            if !live(&s, id) {
                 return Ok(false);
             }
             s.permit = Some((id, permit.clone()));
@@ -1123,7 +1147,7 @@ impl Virtio {
         match copied {
             // Even a reset that lost the grant must retire this committed effect.
             Ok(()) => Ok(true),
-            Err(_) if !granted && !s.current(id) => Ok(false),
+            Err(_) if !granted && !live(&s, id) => Ok(false),
             // After its grant a failed copy may have written guest RAM without publishing it:
             // never a cancellation, always fatal to the VM (the owner's error cancels it).
             Err(e) => Err(e),
@@ -1700,6 +1724,13 @@ mod tests {
                 assert_ne!(r.gates[0].load(SeqCst) & GATE_OPEN, 0);
             }
             r.record_kick(0, gate);
+            // The kicker sees the moved epoch itself: no count waits for an owner that may be gone.
+            assert_eq!(r.kicks[0].load(SeqCst), 0, "event {event}: stale kick kept");
+            assert_eq!(
+                r.irqs.live(),
+                base,
+                "event {event}: stale kick held a count"
+            );
             let mut s = r.lock();
             r.take_kicks(&mut s);
             assert!(!s.pending(), "event {event}: stale kick scheduled work");
