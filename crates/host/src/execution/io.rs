@@ -56,6 +56,14 @@ pub enum Transfer<'a> {
     Read { gpa: u64, bytes: &'a mut [u8] },
     Write { gpa: u64, bytes: &'a [u8] },
 }
+/// What a windowless copy asks of a vCPU's doorbell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Peer {
+    /// Ring it (it stops at its next block boundary and drains).
+    Ring,
+    /// Only ask whether its run has ended.
+    Ask,
+}
 impl Transfer<'_> {
     fn is_empty(&self) -> bool {
         match self {
@@ -166,15 +174,19 @@ pub struct WindowCounts {
     /// Batches copied without a window ([`Backing::copy_guest_windowless`]), including those
     /// whose publication fell back to a window after a drain deadline.
     pub windowless: u64,
-    /// Windowless batches that posted a code invalidation to at least one vCPU.
+    /// Windowless batches that awaited at least one vCPU before publication (it held a written
+    /// page's translations, or still owed a drain of one).
     pub windowless_posted: u64,
-    /// (vCPU, page) posts made by the recheck after a windowless copy: marks taken during it.
+    /// (vCPU, page) posts made by the rechecks after the body and after publication: marks taken
+    /// during the copy. Those found after publication are not awaited, so they may come from a
+    /// batch not counted in `windowless_posted`.
     pub recheck_holders: u64,
     /// Waits for posted vCPUs to drain before publication: count, summed and longest time.
     pub drain_waits: u64,
     pub drain_us: u64,
     pub drain_max_us: u64,
-    /// Drain waits that reached their deadline: the publication then used a full window.
+    /// Drain waits that reached their deadline: the publication then used a full window (also
+    /// counted in `windows`; the batch stays counted in `windowless`).
     pub drain_expiries: u64,
     /// Windowless requests whose writes overlapped a page-table mark: the whole batch used a
     /// full window (also counted in `windows`).
@@ -254,6 +266,10 @@ fn resolve(ram: &GuestRam, transfers: &mut [Transfer<'_>]) -> Result<Vec<Span>> 
         let guest = ram
             .range(gpa, len as u64)
             .ok_or("I/O span is not wholly installed guest RAM")?;
+        // `copy_span` relies on guest-physical alignment being host alignment.
+        if (guest as u64).wrapping_sub(gpa) % 4096 != 0 {
+            return Err("I/O span's RAM alias is not page aligned".into());
+        }
         spans.push(Span {
             gpa,
             guest,
@@ -531,7 +547,10 @@ impl Backing {
     /// [`DRAIN_DEADLINE`] sends the publication through one. The permit is granted before any
     /// write, so a reset either cancels the batch before its first effect or waits for this
     /// call, as for a granted window. Takes no epoch lock, except in a fallback window. Callers
-    /// must hold no device/VM lock the vCPUs' service threads need.
+    /// must hold no device/VM lock the vCPUs' service threads need. An error after the grant
+    /// (a doorbell failure, or a fallback window that times out) may leave the body written
+    /// without publication: the caller must treat it as fatal to the VM, never as a cancellation
+    /// (check the permit: [`CopyPermit::cancel`] returns false once granted).
     pub fn copy_guest_windowless(
         &self,
         machine: &Machine,
@@ -547,7 +566,7 @@ impl Backing {
             transfers,
             publish,
             permit,
-            |v, acknowledged| stops.kick_if_needed(machine, v, !acknowledged),
+            |v, peer| stops.kick_if_needed(machine, v, peer == Peer::Ring),
             |_point| {
                 #[cfg(feature = "io-test-hooks")]
                 super::io_test::point(&self.memory, _point);
@@ -555,8 +574,8 @@ impl Backing {
         )
     }
 
-    /// The windowless protocol. `kick(v, false)` rings `v`, `kick(v, true)` only asks; both
-    /// return false once `v` has ended. `point` is called at the windowless test points.
+    /// The windowless protocol. `kick(v, Peer::Ring)` rings `v`, `kick(v, Peer::Ask)` only asks;
+    /// both return false once `v` has ended. `point` is called at the windowless test points.
     fn windowless(
         &self,
         timeout: Duration,
@@ -564,9 +583,13 @@ impl Backing {
         transfers: &mut [Transfer<'_>],
         publish: usize,
         permit: &CopyPermit,
-        mut kick: impl FnMut(usize, bool) -> Result<bool>,
+        mut kick: impl FnMut(usize, Peer) -> Result<bool>,
         mut point: impl FnMut(u64),
     ) -> Result<()> {
+        // The window protocol's `kick(v, acknowledged)`, for the fallbacks.
+        fn as_window(peer: bool) -> Peer {
+            if peer { Peer::Ask } else { Peer::Ring }
+        }
         let _cancel = CancelPending(permit);
         if permit.state.load(SeqCst) != 0 {
             return Err("I/O copy permit already consumed".into());
@@ -586,14 +609,14 @@ impl Backing {
         if pages.iter().any(|&page| table_page(&self.memory, page)) {
             // A page-table shadow is not tracked for guest stores: pause everyone, as before.
             counters.table_fallbacks.fetch_add(1, Relaxed);
-            return self.window(&spans, deadline, Some(permit), kick);
+            return self.window(&spans, deadline, Some(permit), |v, a| kick(v, as_window(a)));
         }
         if !permit.grant() {
             return Err("I/O copy canceled".into());
         }
         counters.windowless.fetch_add(1, Relaxed);
         let mut posted = Vec::new();
-        self.post_written(&pages, &mut posted, &mut kick)?;
+        self.post_written(&pages, &mut posted, &mut kick, true)?;
         point(cache::io_test::AFTER_PRECHECK);
         let (body, publication) = spans.split_at(body);
         // SAFETY (both copies): installed-RAM ranges were checked in `resolve`. vCPUs run: the
@@ -605,7 +628,7 @@ impl Backing {
         // after its mark was cleared) may have compiled torn bytes; it is posted like the rest.
         fence(SeqCst);
         let before = posted.len();
-        self.post_written(&written_pages(body), &mut posted, &mut kick)?;
+        self.post_written(&written_pages(body), &mut posted, &mut kick, false)?;
         counters
             .recheck_holders
             .fetch_add((posted.len() - before) as u64, Relaxed);
@@ -619,7 +642,7 @@ impl Backing {
                 return if publication.is_empty() {
                     Ok(())
                 } else {
-                    self.window(publication, deadline, None, kick)
+                    self.window(publication, deadline, None, |v, a| kick(v, as_window(a)))
                 };
             }
         }
@@ -631,7 +654,7 @@ impl Backing {
         // A mark of the used ring's page taken now executes a ring the device writes (a guest
         // race): post it, with no wait (the completion is already visible).
         let before = posted.len();
-        self.post_written(&written_pages(publication), &mut posted, &mut kick)?;
+        self.post_written(&written_pages(publication), &mut posted, &mut kick, false)?;
         counters
             .recheck_holders
             .fetch_add((posted.len() - before) as u64, Relaxed);
@@ -639,31 +662,43 @@ impl Backing {
     }
 
     /// Clears the code marks of every page in `pages`, posts each page to its holders, then
-    /// rings each newly posted vCPU once (posting before kicking, as the resident does).
-    /// Appends `(vCPU, page)` per post.
+    /// rings each posted vCPU once unless it is halted (posting before kicking, as the resident
+    /// does; a halted vCPU drains when it withdraws). Appends `(vCPU, page)` per vCPU to await.
+    /// `owed`: also await every vCPU that still owes a drain of the page from an earlier writer
+    /// (a resident's `written`, another batch or a window cleared the mark first, so this batch
+    /// finds none, but that holder may still run blocks of the old bytes).
     fn post_written(
         &self,
         pages: &[u64],
         posted: &mut Vec<(usize, usize)>,
-        kick: &mut impl FnMut(usize, bool) -> Result<bool>,
+        kick: &mut impl FnMut(usize, Peer) -> Result<bool>,
+        owed: bool,
     ) -> Result<()> {
         let mut ring: cache::CpuMask = 0;
         for &page in pages {
             let page = page as usize;
-            let peers = clear_marks(&self.memory, page);
+            let mut peers = clear_marks(&self.memory, page);
             if peers != 0 {
                 post_page(&self.memory, page, peers, self.n);
-                posted.extend(
-                    (0..self.n)
-                        .filter(|v| peers & (1 << v) != 0)
-                        .map(|v| (v, page)),
-                );
-                ring |= peers;
             }
+            if owed {
+                for v in (0..self.n).filter(|&v| stale(&self.memory, v, page)) {
+                    peers |= 1 << v;
+                }
+            }
+            posted.extend(
+                (0..self.n)
+                    .filter(|v| peers & (1 << v) != 0)
+                    .map(|v| (v, page)),
+            );
+            ring |= peers;
         }
         for v in (0..self.n).filter(|v| ring & (1 << v) != 0) {
-            // False once `v` has ended: it runs no guest code again, nothing to ring.
-            kick(v, false)?;
+            // The post preceded this SeqCst load (see `drained`). An ended vCPU (false) runs no
+            // guest code again: nothing to ring.
+            if quiescent(&self.memory, v).load(SeqCst) != 1 {
+                kick(v, Peer::Ring)?;
+            }
         }
         Ok(())
     }
@@ -674,19 +709,22 @@ impl Backing {
         &self,
         posted: &[(usize, usize)],
         until: Instant,
-        kick: &mut impl FnMut(usize, bool) -> Result<bool>,
+        kick: &mut impl FnMut(usize, Peer) -> Result<bool>,
     ) -> Result<bool> {
         let began = Instant::now();
         let mut waiting = posted.to_vec();
+        let mut pass = 0u32;
         let result = loop {
             let mut i = 0;
+            // Asking whether a vCPU ended takes its kick mutex: only every 64th pass.
+            let ask = pass % 64 == 63;
             while i < waiting.len() {
                 let (v, page) = waiting[i];
                 // The post preceded these SeqCst loads, so a vCPU seen halted sees the post when
                 // it withdraws (its quiescent store and drain load are SeqCst, after `dsb sy`).
                 let done = !stale(&self.memory, v, page)
                     || quiescent(&self.memory, v).load(SeqCst) == 1
-                    || !kick(v, true)?;
+                    || ask && !kick(v, Peer::Ask)?;
                 if done {
                     waiting.swap_remove(i);
                 } else {
@@ -699,7 +737,13 @@ impl Backing {
             if Instant::now() >= until {
                 break false;
             }
-            std::thread::yield_now();
+            // A running holder drains within microseconds of its doorbell: spin first.
+            if pass < 256 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+            pass = pass.wrapping_add(1);
         };
         let counters = &self.io_counts;
         let waited = ns(began.elapsed());
@@ -1634,8 +1678,8 @@ mod tests {
             },
         ]
     }
-    fn no_ring(_: usize, ready: bool) -> Result<bool> {
-        assert!(ready, "nothing to ring");
+    fn no_ring(_: usize, peer: Peer) -> Result<bool> {
+        assert_eq!(peer, Peer::Ask, "nothing to ring");
         Ok(true)
     }
 
@@ -1682,7 +1726,7 @@ mod tests {
                     1,
                     &CopyPermit::new(),
                     |v, ready| {
-                        if !ready {
+                        if ready == Peer::Ring {
                             kicked.send(v).unwrap();
                         }
                         Ok(true)
@@ -1728,6 +1772,54 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_owed_to_an_earlier_writer_is_awaited_and_halted_holders_are_not_rung() {
+        // An earlier writer cleared page 0's mark and posted it to vCPUs 1 and 2: this batch
+        // finds no mark, but vCPU 1 may still run blocks of the old bytes. vCPU 2 is halted.
+        let b = backing(3);
+        record_word(&b.memory, 1, Some(0)).store(1, SeqCst);
+        record_word(&b.memory, 2, Some(0)).store(1, SeqCst);
+        quiescent(&b.memory, 2).store(1, SeqCst);
+        let rung = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let copy = scope.spawn(|| {
+                let mut avail = [0; 4];
+                b.windowless(
+                    BUDGET,
+                    BUDGET,
+                    &mut completion(&[2], &mut avail),
+                    1,
+                    &CopyPermit::new(),
+                    |v, peer| {
+                        if peer == Peer::Ring {
+                            rung.lock().unwrap().push(v);
+                        }
+                        Ok(true)
+                    },
+                    |_| {},
+                )
+            });
+            while read(&b, 0x10, 1) != [2] {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                read(&b, 0x1002, 2),
+                [0, 0],
+                "published before the owed drain"
+            );
+            record_word(&b.memory, 1, Some(0)).store(0, SeqCst);
+            copy.join().unwrap().unwrap();
+        });
+        assert_eq!(read(&b, 0x1002, 2), [5, 0]);
+        assert_eq!(
+            *rung.lock().unwrap(),
+            [1],
+            "only the running owing vCPU is rung"
+        );
+        assert_eq!(b.io_window_counts().windowless_posted, 1);
+    }
+
+    #[test]
     fn marks_raced_during_the_copy_are_posted_and_drained() {
         // Body pages are rechecked before the drain wait; the used index's own page after it.
         for (at, page, awaited) in [
@@ -1746,7 +1838,7 @@ mod tests {
                 1,
                 &CopyPermit::new(),
                 |v, ready| {
-                    if !ready {
+                    if ready == Peer::Ring {
                         // The holder drains at its next block boundary.
                         kicks.push(v);
                         record_word(&b.memory, v, Some(0)).store(0, SeqCst);
@@ -1905,7 +1997,7 @@ mod tests {
             1,
             &CopyPermit::new(),
             |v, ready| {
-                if !ready && load(&b, offset_of!(IoWindow, request)) != 0 {
+                if ready == Peer::Ring && load(&b, offset_of!(IoWindow, request)) != 0 {
                     acknowledge(&b, v)?;
                 }
                 Ok(true) // vCPU 1 never drains its post

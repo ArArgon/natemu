@@ -1003,10 +1003,14 @@ impl Virtio {
         let mut s = self.lock();
         s.permit = None;
         self.retire_reset(&mut s);
+        // A consumed permit stays as it ended: false here means the copy won its grant.
+        let granted = !permit.cancel();
         match copied {
             // Even a reset that lost the grant must retire this committed effect.
             Ok(()) => Ok(true),
-            Err(_) if !s.current(id) => Ok(false),
+            Err(_) if !granted && !s.current(id) => Ok(false),
+            // After its grant a failed copy may have written guest RAM without publishing it:
+            // never a cancellation, always fatal to the VM (the owner's error cancels it).
             Err(e) => Err(e),
         }
     }

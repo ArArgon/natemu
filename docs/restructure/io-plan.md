@@ -951,7 +951,11 @@ publication through the window (the body is already in place). The metadata snap
 reads the available ring's flags and index, its entries, then the descriptor table, so the
 acquire after the index read covers what the driver published before it. The deadline-expiry
 count is also the drain-fallback count. Host test points: `AFTER_PRECHECK`, `BEFORE_RECHECK`,
-`BEFORE_PUBLISH`.
+`BEFORE_PUBLISH`. After review: the pre-copy check also awaits every vCPU that still owes a
+drain of a written page (its stale bit is set because an earlier writer cleared the mark
+first); halted vCPUs are not rung; an error after the grant is fatal to the VM, never a
+cancellation; the device-poll and power-off waits in the resident now drain on each poll; the
+lifecycle suite's `code-page` case shows a live post and drain before publication.
 
 **Alternative kept as plan B.** A hidden device vCPU running the same protocol in a resident,
 with guest vCPUs capped at host cores − 1, if host-side kicks or ordering prove inadequate.
