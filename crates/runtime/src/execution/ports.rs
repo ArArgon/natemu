@@ -222,6 +222,10 @@ fn power_wait(s: &mut State) -> ! {
     reset_shadows(s);
     loop {
         io_checkpoint(s);
+        // Drain posts from windowless I/O copies (the block device completes in-flight requests
+        // while power-off waits): no guest continuation survives, as for the drain in
+        // `io_checkpoint` after a release; the SeqCst post/swap pairing is the same as there.
+        take_invalidations(s);
         unsafe {
             (s.request, s.reply) = (REQUEST_POWER_POLL, NONE);
             write_record(record(), s);
