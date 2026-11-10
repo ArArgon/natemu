@@ -8,6 +8,12 @@ both vCPUs executed, so the windowless copy must post both and wait for their dr
 publishing), no retries, at most 120 seconds per VM. Three cases force concurrent-request
 schedules: out-of-order completion, a canceled completion window covering four requests, and a
 reset with requests completed, running and queued. No throughput claims.
+Windowless edge cases: table-page (N=1: a read into a page the guest walked as a page table, then
+unlinked; a table fallback window, then the relinked walk must reach the new frame); drain-expiry
+(N=2: the peer holder sits in a 300 ms port exit, so the 50 ms drain deadline expires and the
+publication goes through a window); publish-reset/-disable/-power (N=1, hooks build: the code-page
+completion is held just before publication until the lifecycle access defers behind it; it must
+publish once without an interrupt and retire, then the fresh generation or S5 proceeds).
 """
 import argparse
 import copy
@@ -30,10 +36,12 @@ BASE, CODE, STACK, MMIO = 0x400000, 0x100000, 0x300000, 0xf0000000
 SIZE, DISK_SIZE = 0x20000, 2 * 1024 * 1024
 CASES = ('reset', 'disable', 'power-scalar', 'power-rep', 'power-sync-error',
          'read-error', 'write-error', 'malformed', 'malformed-later', 'fullqueue', 'power-rep-halt',
-         'out-of-order', 'cancel-batch', 'reset-mixed', 'code-page')
+         'out-of-order', 'cancel-batch', 'reset-mixed', 'code-page',
+         'table-page', 'drain-expiry', 'publish-reset', 'publish-disable', 'publish-power')
 MODES = {'reset': 'hold-reset', 'disable': 'hold-disable', 'power-scalar': 'hold-power',
          'power-rep': 'hold-power', 'power-sync-error': 'power-sync-error', 'power-rep-halt': 'hold-power-halt',
-         'out-of-order': 'out-of-order', 'cancel-batch': 'cancel-batch', 'reset-mixed': 'reset-mixed'}
+         'out-of-order': 'out-of-order', 'cancel-batch': 'cancel-batch', 'reset-mixed': 'reset-mixed',
+         'publish-reset': 'hold-publish-reset', 'publish-disable': 'hold-publish-disable', 'publish-power': 'hold-publish-power'}
 # The device reset's register readback (offset, saved at, value), shared by the reset cases.
 RESET_READBACK = ((0x60, 0xe000, 0), (0x70, 0xe004, 0), (0x44, 0xe008, 0))
 PEER_CODE, PEER_MARKER, PEER_R15 = 0x110000, 0x48414c5450454552, 0x5151
@@ -41,6 +49,13 @@ PEER_CODE, PEER_MARKER, PEER_R15 = 0x110000, 0x48414c5450454552, 0x5151
 # sector holding the new code, and the vCPUs' handshake words and results (in BASE RAM).
 TARGET, OLD, NEW, TARGET_SECTOR = 0x120000, 0x11111111, 0x22222222, 8
 GO1, ACK1, GO2, ACK2, RESULT1, RESULT2 = (BASE + 0xe200 + 4 * i for i in range(6))
+# table-page: the guest's own tables (PML4, PDPT, PDs for 0-1 GiB and 3-4 GiB), the page PT_PAGE
+# walked as the page table of TABLE_VA, its old and new frames' markers, and the sector holding
+# PT_PAGE's new first entry.
+PT_PAGE, PML4, PDPT, PD0, PD3 = (BASE + 0x8000 + 0x1000 * i for i in range(5))
+FRAME_X, FRAME_Y, TABLE_VA, TABLE_SECTOR, MARK_X, MARK_Y = BASE + 0xd000, BASE + 0xf000, 0x800000, 16, 0x58581111, 0x59592222
+# Cases with a second vCPU, and the holder cases (the submitting vCPU or its peer executed the page).
+PEER_CASES, HOLDER_CASES = ('power-rep-halt', 'code-page', 'drain-expiry'), ('code-page', 'drain-expiry', 'publish-reset', 'publish-disable', 'publish-power')
 
 
 def target_code(value):
@@ -140,7 +155,7 @@ def fixture(case, work):
     q, completed, later_avail, quiet = BASE, [], [], []
     expected_disk = bytearray(disk)
     canceled = case in ('reset', 'disable', 'malformed')
-    power = case.startswith('power-')
+    power = case.startswith('power-') or case == 'publish-power'
     if case == 'malformed-later':
         first = request(q, 0, 0)
         second = request(q, 3, 0, 1, malformed=True)
@@ -183,9 +198,60 @@ def fixture(case, work):
         avail(q + 0x10000, [0]); negotiate()
         configure(q + 0x10000); notify(); wait_used(q + 0x10000, 1); irq(q + 0x10000)
         completed.append((q + 0x10000, 0, fresh, 0, disk[2048:2560]))
-    elif case == 'code-page':
+    elif case == 'table-page':
+        # The guest walks PT_PAGE as a page table, unlinks it (entry cleared, INVLPG), lets a block
+        # read overwrite it, relinks it: the completion must take a table fallback window and the
+        # walk after it must reach the new frame, not a stale translation of the old one.
+        # Accessed (and leaf Dirty) bits are preset, so the walker's A/D updates leave RAM exact.
+        def pte(table, index, value): put(memory, table + 8 * index, '<Q', value | 0x23 | (value & 0x80) >> 1)
+        pte(PML4, 0, PDPT); pte(PDPT, 0, PD0); pte(PDPT, 3, PD3)
+        for i in range(3): pte(PD0, i, i << 21 | 0x80)
+        pte(PD0, TABLE_VA >> 21, PT_PAGE); pte(PD3, MMIO >> 21 & 511, MMIO | 0x98)
+        pte(PT_PAGE, 0, FRAME_X | 0x40); put(memory, FRAME_X, '<I', MARK_X); put(memory, FRAME_Y, '<I', MARK_Y)
+        sector = (FRAME_Y | 0x63).to_bytes(8, 'little').ljust(512, b'\0')
+        disk = bytearray(disk); disk[512 * TABLE_SECTOR:512 * TABLE_SECTOR + 512] = sector
+        disk = bytes(disk); expected_disk = bytearray(disk)
+        entry = PD0 + 8 * (TABLE_VA >> 21)
+        emit(f'mov rax, {PML4:#x}\nmov cr3, rax\nmov eax, dword ptr [{TABLE_VA:#x}]'); reg(MARK_X)
+        emit(f'mov dword ptr [{RESULT1:#x}], eax\nmov qword ptr [{entry:#x}], 0\ninvlpg [{TABLE_VA:#x}]')
+        read = request(q, 0, 0, TABLE_SECTOR, data=PT_PAGE)
+        avail(q, [0]); notify(); wait_used(q, 1); irq(q)
+        expect(read['status'], 0, 'byte')
+        emit(f'mov rax, {PT_PAGE | 0x23:#x}\nmov qword ptr [{entry:#x}], rax\ninvlpg [{TABLE_VA:#x}]')
+        emit(f'mov eax, dword ptr [{TABLE_VA:#x}]'); reg(MARK_Y); emit(f'mov dword ptr [{RESULT2:#x}], eax')
+        completed.append((q, 0, read, 0, sector))
+    elif case.startswith('publish-'):
+        # The vCPU executed TARGET; a block read overwrites it and the driver holds the completion
+        # just before publication (body written, drains done) until the reset, queue disable or S5
+        # defers behind it. The granted completion must publish exactly once (no interrupt: the
+        # lifecycle closed its incarnation) and retire; the vCPU then runs only the new code.
+        kind = case.split('-')[1]
+        disk = bytearray(disk)
+        disk[512 * TARGET_SECTOR:512 * TARGET_SECTOR + 512] = target_code(NEW).ljust(512, b'\xcc')
+        disk = bytes(disk); expected_disk = bytearray(disk)
+        emit(f'mov rax, {TARGET:#x}\ncall rax'); reg(OLD)
+        read = request(q, 0, 0, TARGET_SECTOR, data=TARGET)
+        avail(q, [0]); notify(); hold()
+        if kind == 'power':
+            emit('xor r15d, r15d\nmov edx, 0xb004\nmov eax, 0x2000\npower_instruction:\nout dx, ax\npower_after:\nmov r15, 0xbad')
+            completed.append((q, 0, read, 0, disk[512 * TARGET_SECTOR:512 * TARGET_SECTOR + 512]))
+        else:
+            mmwrite(0x44 if kind == 'disable' else 0x70, 0)
+            for offset, saved, value in ((0x60, 0xe000, 0), (0x70, 0xe004, 15 if kind == 'disable' else 0), (0x44, 0xe008, 0)):
+                readreg(offset); emit(f'mov dword ptr [{q + saved:#x}], eax'); reg(value)
+            expect(q + 0x2002, 1, 'word'); expect(read['status'], 0, 'byte')
+            emit(f'mov rax, {TARGET:#x}\ncall rax'); reg(NEW)
+            quiet.append((q, 0, read, 0, disk[512 * TARGET_SECTOR:512 * TARGET_SECTOR + 512]))
+            fresh = request(q + 0x10000, 0, 0, 1)
+            avail(q + 0x10000, [0])
+            if kind != 'disable': negotiate()
+            configure(q + 0x10000); notify(); wait_used(q + 0x10000, 1); irq(q + 0x10000)
+            completed.append((q + 0x10000, 0, fresh, 0, disk[512:1024]))
+    elif case in ('code-page', 'drain-expiry'):
         # Both vCPUs execute TARGET (each marks it as translated); the peer then spins. A block
         # read overwrites TARGET with new code; both must run the new code after completion.
+        # drain-expiry: the peer is in a 300 ms port exit (601H) when the read completes, so its
+        # drain outlasts the 50 ms deadline and the publication must go through a window.
         def call_target(): emit(f'mov rax, {TARGET:#x}\ncall rax')
         def await_word(address):
             label = f'await_{len(assembly)}'
@@ -195,6 +261,8 @@ def fixture(case, work):
         disk = bytes(disk); expected_disk = bytearray(disk)
         call_target(); reg(OLD)
         emit(f'mov dword ptr [{GO1:#x}], 1'); await_word(ACK1)
+        # Let the peer reach its port exit (a few instructions after ACK1) before submitting.
+        if case == 'drain-expiry': emit('mov ecx, 0x1000000\ndelay:\ndec ecx\njnz delay')
         read = request(q, 0, 0, TARGET_SECTOR, data=TARGET)
         avail(q, [0]); notify(); wait_used(q, 1); irq(q)
         expect(read['status'], 0, 'byte')
@@ -270,10 +338,13 @@ def fixture(case, work):
     for target, count, head in later_avail:
         put(expected, target + 0x1002, '<H', count)
         put(expected, target + 0x1004 + 2 * (count - 1), '<H', head)
-    if case == 'disable': put(expected, BASE + 0xe004, '<I', 15)
-    if case == 'code-page':
+    if case in ('disable', 'publish-disable'): put(expected, BASE + 0xe004, '<I', 15)
+    if case in ('code-page', 'drain-expiry'):
         for address, value in ((GO1, 1), (ACK1, 1), (GO2, 1), (ACK2, 1), (RESULT1, OLD), (RESULT2, NEW)):
             put(expected, address, '<I', value)
+    if case == 'table-page':
+        store(expected, PT_PAGE, completed[0][4])
+        put(expected, RESULT1, '<I', MARK_X); put(expected, RESULT2, '<I', MARK_Y)
     if case in ('malformed', 'malformed-later'):
         put(expected, BASE + 0xe014, '<I', 15 | 64)
         put(expected, BASE + 0xe00c, '<I', 3 if case == 'malformed-later' else 2)
@@ -282,14 +353,15 @@ def fixture(case, work):
              f'memory {BASE:#x} {memory.hex()}', f'region {STACK:#x} 0x1000']
     peer_rip = None
     work.mkdir(parents=True, exist_ok=True)
-    if case == 'code-page':
+    if case in HOLDER_CASES:
         lines.append(f'body {TARGET:#x} {target_code(OLD).hex()}')
-    if case in ('power-rep-halt', 'code-page'):
+    if case in PEER_CASES:
         helper = f'mov r14, {PEER_MARKER:#x}\ncli\nhlt\nhelper_after:\nmov r15, 0xbad\nnop\n'
-        if case == 'code-page':
+        if case in ('code-page', 'drain-expiry'):
             # Execute TARGET, report, spin (running, so its post must drain), run it again.
+            slow = 'mov edx, 0x601\nin al, dx\n' if case == 'drain-expiry' else ''
             helper = (f'p1:\ncmp dword ptr [{GO1:#x}], 1\njne p1\nmov rax, {TARGET:#x}\ncall rax\n'
-                      f'mov dword ptr [{RESULT1:#x}], eax\nmov dword ptr [{ACK1:#x}], 1\n'
+                      f'mov dword ptr [{RESULT1:#x}], eax\nmov dword ptr [{ACK1:#x}], 1\n{slow}'
                       f'p2:\ncmp dword ptr [{GO2:#x}], 1\njne p2\nmov rax, {TARGET:#x}\ncall rax\n'
                       f'mov dword ptr [{RESULT2:#x}], eax\nmov dword ptr [{ACK2:#x}], 1\n') + helper
         peer_code, peer_labels = ref.assemble(helper, labels=True)
@@ -375,7 +447,23 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
     else:
         require('disk shutdown full-sync:' in stderr, 'wrong contained shutdown error')
         require(not report, 'failed full-sync reported normal power success')
-    if case in ('reset', 'disable'):
+    c = counts or {}
+    if case.startswith('publish-'):
+        kind = case.split('-')[1]
+        boundary = {'reset': 'reset-deferred', 'disable': 'disable-deferred', 'power': 'power-poll'}[kind]
+        hold = c.get('hold') or {}
+        require(hold.get('reached') is True and hold.get('released') is True and hold.get('hits') == 1 and hold.get('timeout') == 0,
+                'publication hook not reached, released or clean')
+        read = [f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)']
+        after = ['sync-enter', 'sync-ok'] if kind == 'power' else ['read:512:512', 'read-result:Ok(512)', 'commit']
+        require(ordered(events, ['backend-held', 'publish-armed', 'backend-released'] + read + [boundary, 'commit'] + after),
+                'held publication did not wait for the lifecycle access then publish')
+        require(events.count('commit') == (1 if kind == 'power' else 2) and io['calls'] == (1 if kind == 'power' else 2),
+                'held completion lost, duplicated or recovery missing')
+        require(c.get('windowless_posted', 0) >= 1 and c.get('drain_waits', 0) >= 1 and c.get('drain_expiries') == 0
+                and c.get('table_fallbacks') == 0, 'held completion did not post and drain its holder windowlessly')
+        if report.get('cpus'): require(report['cpus'][0]['stats']['invalidations'] >= 1, 'the holder took no invalidation')
+    elif case in ('reset', 'disable'):
         boundary = 'reset-deferred' if case == 'reset' else 'disable-deferred'
         require(ordered(events, ['backend-held', boundary, 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'read:512:512', 'read-result:Ok(512)', 'commit']), 'reset/disable schedule mismatch')
         require(events.count('commit') == 1 and io['calls'] == 2, 'canceled queue published or recovery missing')
@@ -412,12 +500,18 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         # The reset retired only after every old request: all six old reads returned before the fresh one.
         fresh = events.index('read:2048:512') if 'read:2048:512' in events else 0
         require(events[:fresh].count('read-result:Ok(512)') == 6, 'reset retired before every old request')
-    elif case == 'code-page':
+    elif case == 'table-page':
+        require(io['calls'] == 1 and events == [f'read:{512 * TABLE_SECTOR}:512', 'read-result:Ok(512)', 'commit'], 'table-page read not completed exactly once')
+        require(c.get('table_fallbacks', 0) >= 1 and c.get('windows', 0) >= 1, 'write to a walked table page took no fallback window')
+    elif case in ('code-page', 'drain-expiry'):
         require(io['calls'] == 1 and events == [f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)', 'commit'], 'code-page read not completed exactly once')
         # The completion went windowless, posted the page's holders and waited for their drains.
-        c = counts or {}
         require(c.get('windowless_posted', 0) >= 1 and c.get('drain_waits', 0) >= 1, 'no windowless post and drain wait')
-        require(c.get('drain_expiries') == 0 and c.get('table_fallbacks') == 0 and c.get('windows') == 0, 'completion fell back to a window')
+        if case == 'code-page':
+            require(c.get('drain_expiries') == 0 and c.get('table_fallbacks') == 0 and c.get('windows') == 0, 'completion fell back to a window')
+        else:
+            # The peer sat in a 300 ms host exit: the drain deadline expired and a window published.
+            require(c.get('drain_expiries', 0) >= 1 and c.get('windows', 0) >= 1 and c.get('table_fallbacks') == 0, 'drain deadline did not expire into a window')
         if not meta['sync_error'] and len(report.get('cpus', [])) == 2:
             require(all(cpu['stats']['invalidations'] >= 1 for cpu in report['cpus']), 'a holder took no invalidation')
     elif case == 'malformed-later':
@@ -460,6 +554,8 @@ def run_case(args, case):
         stdout = (work / 'stdout.log').read_text()
         report = json.loads(stdout) if stdout.strip() else {}
         state, trace, memory, counts = final_records(stderr)
+        holds = [json.loads(line[len('io-hold: '):]) for line in stderr.splitlines() if line.startswith('io-hold: ')]
+        if case.startswith('publish-'): counts['hold'] = holds[0] if len(holds) == 1 else None
         result['io_disk'], result['io_counts'] = trace, counts
         result['errors'] = verify(meta, report, state, trace, stderr, process.returncode, timed_out,
                                   (work / 'disk.raw').read_bytes(), (work / 'expected-disk.raw').read_bytes(),
@@ -485,6 +581,11 @@ def self_check():
         'cancel-batch': [e for i in range(4) for e in (f'read:{512 * i}:512', 'read-result:Ok(512)')]
         + ['batch-held', 'reset-deferred', 'batch-released', 'read:2048:512', 'read-result:Ok(512)', 'commit'],
         'code-page': [f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)', 'commit'],
+        'drain-expiry': [f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)', 'commit'],
+        'table-page': [f'read:{512 * TABLE_SECTOR}:512', 'read-result:Ok(512)', 'commit'],
+        **{f'publish-{kind}': ['backend-held', 'publish-armed', 'backend-released', f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)', boundary, 'commit']
+           + (['sync-enter', 'sync-ok', 'lane-joined'] if kind == 'power' else ['read:512:512', 'read-result:Ok(512)', 'commit'])
+           for kind, boundary in (('reset', 'reset-deferred'), ('disable', 'disable-deferred'), ('power', 'power-poll'))},
         'reset-mixed': ['read:512:512', 'read-result:Ok(512)', 'commit', 'commit'] + ['backend-held'] * 4 + ['reset-deferred']
         + ['backend-released', 'read:0:512', 'read-result:Ok(512)'] * 4 + ['backend-held', 'backend-released', 'read:0:512', 'read-result:Ok(512)']
         + ['read:2048:512', 'read-result:Ok(512)', 'commit'],
@@ -499,6 +600,9 @@ def self_check():
         'out-of-order': [lambda e: e[:3] + [e[4], e[3]] + e[5:]],  # released before the first commit
         'cancel-batch': [lambda e: e[:-1] + ['commit', 'commit']],
         'reset-mixed': [lambda e: e[:4] + e[5:], late_old_read],
+        # Published before the lifecycle access deferred, or a second publication.
+        **{f'publish-{kind}': [lambda e, b=boundary: [x for x in e if x != b] + [b], lambda e: e + ['commit']]
+           for kind, boundary in (('reset', 'reset-deferred'), ('disable', 'disable-deferred'), ('power', 'power-poll'))},
     }
     controls = 0
     record_lines = ['io-state: []', 'io-disk: {}', 'io-memory: []', 'io-counts: {}']
@@ -514,7 +618,8 @@ def self_check():
             meta = fixture(case, work)
             events = traces.get(case, ['backend-held', 'power-poll', 'backend-released', 'write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter'] + (['sync-error'] if meta['sync_error'] else ['sync-ok', 'lane-joined']))
             if case == 'power-rep-halt': events.insert(2, 'peer-halted')
-            calls = {'fullqueue': 0, 'reset': 2, 'disable': 2, 'read-error': 3, 'write-error': 3, 'out-of-order': 2, 'cancel-batch': 5, 'reset-mixed': 7}.get(case, 1)
+            calls = {'fullqueue': 0, 'reset': 2, 'disable': 2, 'read-error': 3, 'write-error': 3, 'out-of-order': 2, 'cancel-batch': 5, 'reset-mixed': 7,
+                     'publish-reset': 2, 'publish-disable': 2}.get(case, 1)
             io = {'entered': case != 'fullqueue', 'calls': calls, 'events': events}
             gpr = [0] * 16
             if case in ('power-rep', 'power-rep-halt'): gpr[1], gpr[6] = 1, BASE + 0xf002
@@ -522,7 +627,7 @@ def self_check():
             memory = (work / 'expected-memory.bin').read_bytes()
             disk = (work / 'expected-disk.raw').read_bytes()
             cpu = {**state[0], 'stop': 'poweroff' if meta['power'] else 'reached', 'memory': [{'addr': hex(BASE), 'data': memory.hex()}]}
-            if case == 'code-page': cpu['stats'] = {'invalidations': 1}
+            if case in HOLDER_CASES: cpu['stats'] = {'invalidations': 1}
             cpus = [copy.deepcopy(cpu)]
             if meta['peer_rip'] is not None:
                 peer_gpr = [0] * 16; peer_gpr[14], peer_gpr[15] = PEER_MARKER, PEER_R15
@@ -532,8 +637,32 @@ def self_check():
             n = meta['n']
             stderr = f'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none\n' + ('disk shutdown full-sync: injected\n' if meta['sync_error'] else '')
             counts = {'windows': 0, 'windowless_posted': 1, 'drain_waits': 1, 'drain_expiries': 0, 'table_fallbacks': 0}
+            if case == 'table-page': counts.update(windows=1, table_fallbacks=1)
+            if case == 'drain-expiry': counts.update(windows=1, drain_expiries=1)
+            if case.startswith('publish-'): counts['hold'] = {'reached': True, 'released': True, 'hits': 1, 'timeout': 0}
             args = [meta, report, state, io, stderr, 1 if meta['sync_error'] else 0, False, disk, disk, memory, [copy.deepcopy(cpu['memory']) for _ in range(n)], counts]
             assert not verify(*args), (case, verify(*args))
+            # New edge cases: each judged counter, hook record or result word must matter.
+            bad_counts = {'table-page': (('table_fallbacks', 0), ('windows', 0)),
+                          'drain-expiry': (('drain_expiries', 0), ('windows', 0), ('windowless_posted', 0), ('table_fallbacks', 1)),
+                          'publish-reset': (('drain_waits', 0), ('drain_expiries', 1), ('hold', None), ('hold', {'reached': True, 'released': False, 'hits': 1, 'timeout': 0}),
+                                            ('hold', {'reached': True, 'released': True, 'hits': 1, 'timeout': 1}))}
+            bad_counts['publish-disable'] = bad_counts['publish-power'] = bad_counts['publish-reset']
+            for key, value in bad_counts.get(case, ()):
+                bad = copy.deepcopy(args); bad[11][key] = value
+                assert verify(*bad), (case, key); controls += 1
+            if case in ('table-page', 'drain-expiry') or case.startswith('publish-'):
+                # A stale translation (old frame's marker) or stale code result in RAM must fail;
+                # publish cases: an old ring left unpublished (used index 0) must fail.
+                image = bytearray(memory)
+                if case == 'table-page': struct.pack_into('<I', image, RESULT2 - BASE, MARK_X)
+                elif case == 'drain-expiry': struct.pack_into('<I', image, RESULT2 - BASE, OLD)
+                else: struct.pack_into('<H', image, 0x2002, 0)
+                bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
+                assert verify(*bad), case; controls += 1
+            if case in HOLDER_CASES and case != 'code-page':
+                bad = copy.deepcopy(args); bad[1]['cpus'][-1]['stats']['invalidations'] = 0
+                assert verify(*bad), case; controls += 1
             if case == 'code-page':
                 # No post or drain wait, a fallback window, a holder without invalidation, or the
                 # peer having run the stale code must each fail.
@@ -617,7 +746,7 @@ def main():
     manifest = {'purpose': 'deterministic lifecycle integration, not performance evidence', 'source_root': str(ROOT),
                 'source_sha256': {str(p.relative_to(ROOT)): digest(p) for p in sorted(sources)},
                 'artifacts': {key: {'path': str(getattr(args, key)), 'sha256': digest(getattr(args, key))} for key in ('host', 'runtime', 'fexc')},
-                'limits': {'vm_launches': len(args.cases), 'seconds_per_vm': 120, 'cpus_by_case': {case: 2 if case in ('power-rep-halt', 'code-page') else 1 for case in args.cases}},
+                'limits': {'vm_launches': len(args.cases), 'seconds_per_vm': 120, 'cpus_by_case': {case: 2 if case in PEER_CASES else 1 for case in args.cases}},
                 'excluded': ['SMP reset and running power peers', 'real stalled OS syscall', 'performance', 'malicious concurrent descriptor mutation']}
     (args.out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     results = []

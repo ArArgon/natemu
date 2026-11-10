@@ -1171,7 +1171,7 @@ pub(crate) struct Args {
     /// A real block device in the program fixture, with an optional finite backend schedule
     #[arg(long, requires = "io_script")]
     io_disk: Option<String>,
-    #[arg(long, requires = "io_disk", value_parser = ["normal", "hold-reset", "hold-disable", "hold-power", "hold-power-halt", "power-sync-error", "read-error", "write-error", "cycle-reset", "cycle-disable", "out-of-order", "reset-mixed", "cancel-batch"])]
+    #[arg(long, requires = "io_disk", value_parser = ["normal", "hold-reset", "hold-disable", "hold-power", "hold-power-halt", "power-sync-error", "read-error", "write-error", "cycle-reset", "cycle-disable", "out-of-order", "reset-mixed", "cancel-batch", "hold-publish-reset", "hold-publish-disable", "hold-publish-power"])]
     io_script: Option<String>,
     /// Production network frontend with an independent owned-packet loopback endpoint
     #[arg(long, conflicts_with_all = ["io_disk", "io_windows"])]
@@ -1203,6 +1203,50 @@ pub(crate) struct Args {
     /// GPA of the fixture's shared `mov eax, imm32; ret` function
     #[arg(long, value_parser = number, requires = "io_windows")]
     io_window_code: Option<u64>,
+}
+
+/// `hold-publish-*`: once the backend schedule holds its first call, arm the host hook before a
+/// windowless copy's publication, let the call go, and hold that completion (its body written,
+/// its drains done) until the guest's lifecycle access records `release`. Port 600H reads
+/// `held` once the hook is reached. Writes one `io-hold:` line.
+#[cfg(feature = "io-test-hooks")]
+fn publish_hold(
+    backing: &execution::Backing,
+    control: &natemu::virtio::testing::Control,
+    held: &AtomicBool,
+    release: &str,
+    ended: &AtomicBool,
+) {
+    use natemu::execution::io_test::{BEFORE_PUBLISH, HITS, HOST, Hooks, REACHED, TIMEOUT};
+    use std::time::{Duration, Instant};
+    let h = Hooks::new(backing);
+    let began = Instant::now();
+    let wait = |done: &dyn Fn() -> bool| {
+        while !done() {
+            if ended.load(SeqCst) || began.elapsed() > Duration::from_secs(10) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        true
+    };
+    let row = if !wait(&|| control.seen("backend-held")) {
+        json!({"release": release, "error": "backend never held"})
+    } else {
+        match h.arm(HOST, BEFORE_PUBLISH) {
+            Err(e) => json!({"release": release, "error": e.to_string()}),
+            Ok(tag) => {
+                control.event("publish-armed");
+                let reached = wait(&|| h.get(HOST, REACHED) == tag);
+                held.store(reached, SeqCst);
+                let released = reached && wait(&|| control.seen(release));
+                h.release(HOST, tag);
+                json!({"release": release, "reached": reached, "released": released,
+                       "hits": h.get(HOST, HITS), "timeout": h.get(HOST, TIMEOUT)})
+            }
+        }
+    };
+    eprintln!("io-hold: {row}");
 }
 
 /// Exercise the production coordinator from an independent owner while translated loops run.
@@ -1543,8 +1587,30 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let io_control = args
         .io_script
         .as_deref()
-        .map(natemu::virtio::testing::Control::new)
+        .map(|s| {
+            // `hold-publish-*`: the backend schedule holds the first call until this driver's
+            // publication hook is armed (below); the suffix names the event that releases it.
+            natemu::virtio::testing::Control::new(if s.starts_with("hold-publish-") {
+                "hold-publish"
+            } else {
+                s
+            })
+        })
         .transpose()?;
+    let publish_release = args
+        .io_script
+        .as_deref()
+        .and_then(|s| s.strip_prefix("hold-publish-"))
+        .map(|kind| match kind {
+            "reset" => "reset-deferred",
+            "disable" => "disable-deferred",
+            _ => "power-poll",
+        });
+    #[cfg(not(feature = "io-test-hooks"))]
+    if publish_release.is_some() {
+        return Err("hold-publish schedules need an io-test-hooks build".into());
+    }
+    let publish_held = publish_release.map(|_| Arc::new(AtomicBool::new(false)));
     let io_disk = if let Some(path) = &args.io_disk {
         let resource = natemu::virtio::BLOCK_RESOURCE;
         let disk =
@@ -1553,9 +1619,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         registry.register(resource.base.into(), 4096, disk.device())?;
         registry.register_ports(
             0x600,
-            1,
+            2,
             Arc::new(Mutex::new(super::test_devices::IoControl(
                 io_control.as_ref().unwrap().clone(),
+                publish_held.clone(),
             ))),
         )?;
         Some(disk)
@@ -1883,6 +1950,16 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     result
                 })
             });
+            #[cfg(feature = "io-test-hooks")]
+            if let Some(release) = publish_release {
+                let (backing, control, held, ended) = (
+                    &backing,
+                    io_control.as_deref().unwrap(),
+                    publish_held.as_deref().unwrap(),
+                    &all_ended,
+                );
+                scope.spawn(move || publish_hold(backing, control, held, release, ended));
+            }
             let io_worker = args
                 .io_windows
                 .or(args.io_pending.then_some(program_pending::BASE))

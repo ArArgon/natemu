@@ -33,6 +33,9 @@ enum Mode {
     /// Hold the owner's first completion until `BATCH` requests are answered, then until a device
     /// reset is deferred behind them (the window covering them is then never granted).
     CancelBatch,
+    /// Hold the first disk call until the test driver armed its publication hook
+    /// (`publish-armed`), so that hook catches this request's completion.
+    HoldPublish,
 }
 /// The requests a CancelBatch completion covers.
 const BATCH: usize = 4;
@@ -52,6 +55,7 @@ impl Mode {
             "out-of-order" => Self::OutOfOrder,
             "reset-mixed" => Self::ResetMixed,
             "cancel-batch" => Self::CancelBatch,
+            "hold-publish" => Self::HoldPublish,
             _ => return None,
         })
     }
@@ -67,6 +71,7 @@ impl Mode {
             Self::HoldDisable | Self::CycleDisable => name == "disable-deferred",
             Self::HoldPower | Self::PowerSyncError => name == "power-poll",
             Self::OutOfOrder => name == "commit",
+            Self::HoldPublish => name == "publish-armed",
             _ => false,
         }
     }
@@ -184,6 +189,11 @@ impl Control {
         // A timeout is in the trace; the completion then proceeds.
         let _ = self.wait("batch");
         true
+    }
+    /// Whether event `name` was recorded.
+    pub fn seen(&self, name: &str) -> bool {
+        let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        gate.1.iter().any(|e| e == name)
     }
     /// The schedule's report: whether a call entered, the calls and the event trace.
     pub fn report(&self) -> ControlReport {

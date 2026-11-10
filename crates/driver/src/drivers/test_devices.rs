@@ -271,10 +271,26 @@ mod tests {
 }
 
 /// Metadata-only fixture port: lets the guest wait for a native call to enter its test barrier.
-pub struct IoControl(pub Arc<natemu::virtio::testing::Control>);
+/// Port 600H reads whether the schedule entered its backend call (or, with `held`, whether the
+/// driver's publication hook holds a completion); 601H answers 1 after 300 ms, a host exit long
+/// enough to outlast a windowless copy's drain deadline.
+pub struct IoControl(
+    pub Arc<natemu::virtio::testing::Control>,
+    pub Option<Arc<std::sync::atomic::AtomicBool>>,
+);
 impl Device for IoControl {
     fn read(&mut self, _: usize, offset: u64, size: u64) -> Option<u64> {
-        (offset == 0 && size == 1).then(|| u64::from(self.0.entered()))
+        match (offset, size) {
+            (0, 1) => Some(u64::from(match &self.1 {
+                Some(held) => held.load(SeqCst),
+                None => self.0.entered(),
+            })),
+            (1, 1) => {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Some(1)
+            }
+            _ => None,
+        }
     }
     fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool {
         false
