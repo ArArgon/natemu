@@ -12,9 +12,10 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
+from raw_root import RAW_ROOT  # noqa: E402
 from models import acpi_model as am  # noqa: E402
 
-KERNEL = ROOT.parent / 'natemu-raw/kernel-census-20261028-01/dl/linux'
+KERNEL = RAW_ROOT / 'kernel-census-20261028-01/dl/linux'
 HOST = ROOT / 'target/release/natemu-host'
 
 

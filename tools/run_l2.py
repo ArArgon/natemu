@@ -10,10 +10,11 @@ Prints one pass/fail line per N; exit status 1 on any failure."""
 import argparse, json, pathlib, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+from raw_root import RAW_ROOT  # noqa: E402
 sys.path.insert(0, str(ROOT / 'tools'))
 from models import acpi_model  # noqa: E402
 
-RAW = ROOT.parent / 'natemu-raw/kernel-census-20261028-01/dl'
+RAW = RAW_ROOT / 'kernel-census-20261028-01/dl'
 
 
 def main():
