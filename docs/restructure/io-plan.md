@@ -972,7 +972,14 @@ time with vCPUs paused below 2%, single-job depth 16 at least 2x HEAD, depth 1 n
 
 ## Fewer exits on the device path (proposed, November 10)
 
-**Status: accepted under the owner's November 9 delegation; reviewed with the code.** Motivated
+**Status: built and accepted (November 10).** Independent review found a blocking race (a guest
+reset during the owner's idle flag clear was treated as fatal), fixed with owner-loop tests that
+fail on the old code. Interleaved A/B on one image at four vCPUs: depth 16 89.8 → 132.2 kIOPS
+(exits per I/O 3.10 → 1.52), four readers 157 → 197 kIOPS, depth 1 unchanged; the page query is
+gone; kicks per I/O 0.14–0.20 under load (`natemu-raw/io-exits-20261110-01/ab/`, `profile/`).
+All targets met; standing suite 136/136, 20 lifecycle cases ×3 and every I/O runner pass.
+Item 4 (EOI broadcast) remains: removing it needs IOAPIC pin state in shared words with a
+barrier handshake; worth about one exit per I/O at depth 1. Motivated
 by the [per-request profile](io-benchmarks.md#per-request-profile-after-windowless-copies--november-10):
 five exits per request at depth 1 and about 3 at depth 16, about 2 µs each under load, and 12–14%
 of vCPU time waiting on device mutexes with four readers.
