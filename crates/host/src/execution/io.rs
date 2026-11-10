@@ -1,10 +1,12 @@
 //! Finite copy-first I/O access to guest RAM. Backends retain only their own buffers. A window
 //! waits for resident acknowledgements or HLT quiescence, copies prevalidated spans, and releases; it runs no
-//! parser, callback or backend operation while guest memory is exclusively accessible.
+//! parser, callback or backend operation while guest memory is exclusively accessible. Device
+//! copies are windowless ([`Backing::copy_guest_windowless`]): only vCPUs holding translations of
+//! written pages are posted, and only they are awaited before the completion is published.
 use super::*;
 use cache::IoWindow;
 use std::mem::offset_of;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering::Acquire, fence};
 
 /// Room for a batch of block requests of up to 128 KiB each; larger batches split.
 pub const MAX_BYTES: usize = 1024 * 1024;
@@ -12,6 +14,9 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 /// used element, and the window's ring bookkeeping (a queue's metadata snapshot, used index and
 /// available-ring read). Larger batches split.
 pub const MAX_SPANS: usize = 32 * 36 + 8;
+/// How long a windowless publication waits for posted vCPUs to drain before it falls back to a
+/// window. A running holder drains at its next block boundary after its doorbell (microseconds).
+pub const DRAIN_DEADLINE: Duration = Duration::from_millis(50);
 
 /// One-use admission decision shared by a device reset and its I/O owner. Cancellation and grant
 /// are one atomic choice: a canceled window cannot copy; a granted window must drain before reset.
@@ -51,6 +56,14 @@ pub enum Transfer<'a> {
     Read { gpa: u64, bytes: &'a mut [u8] },
     Write { gpa: u64, bytes: &'a [u8] },
 }
+impl Transfer<'_> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Read { bytes, .. } => bytes.is_empty(),
+            Self::Write { bytes, .. } => bytes.is_empty(),
+        }
+    }
+}
 
 /// The shared rendezvous word at `field` (an offset in [`IoWindow`]).
 fn word(memory: &Memory, field: usize) -> &AtomicU64 {
@@ -77,10 +90,27 @@ fn table_page(memory: &Memory, page: u64) -> bool {
 /// their code-page marks cannot grow until release. Mirror the resident's written/post protocol;
 /// an already-cleared mark may have an older pending invalidation, which these ORs preserve.
 fn invalidate_page(memory: &Memory, page: usize, n: usize) {
+    post_page(memory, page, clear_marks(memory, page), n);
+    // No kick: every participant is parked and drains before resuming guest access.
+}
+
+/// Clears every vCPU's code mark for `page` at once; returns the vCPUs that had one. The common
+/// unmarked case only loads the shared word.
+fn clear_marks(memory: &Memory, page: usize) -> cache::CpuMask {
     let (index, shift) = cache::mask_location(page);
     let mask = global_u64(memory, cache::CODE_PAGES + index * 8);
-    let cleared = mask.fetch_and(!(cache::CpuMask::MAX << shift), SeqCst);
-    let peers = cache::mask_peers(cleared, shift);
+    if cache::mask_peers(mask.load(SeqCst), shift) == 0 {
+        return 0;
+    }
+    cache::mask_peers(
+        mask.fetch_and(!(cache::CpuMask::MAX << shift), SeqCst),
+        shift,
+    )
+}
+
+/// Posts `page` to each vCPU in `peers` as the resident's `post` does: stale bit, then summary
+/// bit, then `PAGES` (its drain relies on that order). The caller kicks, if needed, afterwards.
+fn post_page(memory: &Memory, page: usize, peers: cache::CpuMask, n: usize) {
     for v in (0..n).filter(|v| peers & (1 << v) != 0) {
         record_word(memory, v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
         let summary = cache::RECORDS
@@ -90,7 +120,11 @@ fn invalidate_page(memory: &Memory, page: usize, n: usize) {
         global_u64(memory, summary).fetch_or(1 << (page / 64 % 64), SeqCst);
         record_word(memory, v, None).fetch_or(cache::PAGES, SeqCst);
     }
-    // No kick: every participant is parked and drains before resuming guest access.
+}
+
+/// Whether vCPU `v` still has `page`'s stale bit, i.e. has not drained it since it was posted.
+fn stale(memory: &Memory, v: usize, page: usize) -> bool {
+    record_word(memory, v, Some(page / 64)).load(SeqCst) & (1 << (page % 64)) != 0
 }
 
 /// Always releases an announced epoch, including a timeout, kick failure or unwind. No guest
@@ -129,6 +163,22 @@ pub struct WindowCounts {
     pub admit_us: u64,
     /// Summed microseconds granted windows waited for the epoch lock held by another device's window.
     pub lock_wait_us: u64,
+    /// Batches copied without a window ([`Backing::copy_guest_windowless`]), including those
+    /// whose publication fell back to a window after a drain deadline.
+    pub windowless: u64,
+    /// Windowless batches that posted a code invalidation to at least one vCPU.
+    pub windowless_posted: u64,
+    /// (vCPU, page) posts made by the recheck after a windowless copy: marks taken during it.
+    pub recheck_holders: u64,
+    /// Waits for posted vCPUs to drain before publication: count, summed and longest time.
+    pub drain_waits: u64,
+    pub drain_us: u64,
+    pub drain_max_us: u64,
+    /// Drain waits that reached their deadline: the publication then used a full window.
+    pub drain_expiries: u64,
+    /// Windowless requests whose writes overlapped a page-table mark: the whole batch used a
+    /// full window (also counted in `windows`).
+    pub table_fallbacks: u64,
 }
 impl WindowCounts {
     /// One `io {...}` JSON line for [`crate::perf::line`].
@@ -136,8 +186,8 @@ impl WindowCounts {
         format!("io {}", serde_json::to_string(self).unwrap())
     }
 }
-/// [`WindowCounts`] as the coordinator updates them. Only the window holder writes (under the
-/// epoch lock); readers never take that lock, so observing a pending window cannot block.
+/// [`WindowCounts`] as the copiers update them (atomic adds: windows under the epoch lock,
+/// windowless batches from any device owner); readers never take that lock.
 #[derive(Default)]
 pub(crate) struct WindowCounters {
     granted: AtomicU64,
@@ -146,6 +196,14 @@ pub(crate) struct WindowCounters {
     window_ns: AtomicU64,
     admit_ns: AtomicU64,
     lock_wait_ns: AtomicU64,
+    windowless: AtomicU64,
+    windowless_posted: AtomicU64,
+    recheck_holders: AtomicU64,
+    drain_waits: AtomicU64,
+    drain_ns: AtomicU64,
+    drain_max_ns: AtomicU64,
+    drain_expiries: AtomicU64,
+    table_fallbacks: AtomicU64,
 }
 
 /// Read-only test observation, not a transactionally consistent snapshot of the words.
@@ -207,6 +265,92 @@ fn resolve(ram: &GuestRam, transfers: &mut [Transfer<'_>]) -> Result<Vec<Span>> 
     Ok(spans)
 }
 
+fn ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Every page a write span touches, sorted, each once. Nonempty installed-RAM spans were checked
+/// for overflow in `resolve`.
+fn written_pages(spans: &[Span]) -> Vec<u64> {
+    let mut pages: Vec<u64> = spans
+        .iter()
+        .filter(|span| span.write)
+        .flat_map(|span| (span.gpa >> 12)..=((span.gpa + span.len as u64 - 1) >> 12))
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
+    pages
+}
+
+/// Copies one span. A span of up to 16 bytes (a ring index, flags, a status byte, a used
+/// element) moves in naturally aligned single-copy-atomic accesses, so a field the guest reads
+/// or writes concurrently is never torn; longer spans (payloads, metadata tables) use `memcpy`.
+///
+/// # Safety
+/// `span` was produced by `resolve` and its host buffer is still borrowed.
+unsafe fn copy_span(span: &Span) {
+    // Host buffers are borrowed for the call and cannot overlap guest backing in safe code; no
+    // exclusive Rust reference is manufactured over guest memory.
+    unsafe {
+        if span.len > 16 {
+            if span.write {
+                std::ptr::copy_nonoverlapping(span.host, span.guest, span.len);
+            } else {
+                std::ptr::copy_nonoverlapping(span.guest, span.host, span.len);
+            }
+            return;
+        }
+        let mut at = 0;
+        while at < span.len {
+            // The alias is page aligned, so guest-physical alignment is host alignment.
+            let gpa = span.gpa as usize + at;
+            let width = [8, 4, 2, 1]
+                .into_iter()
+                .find(|&w| gpa % w == 0 && span.len - at >= w)
+                .unwrap();
+            let (guest, host) = (span.guest.add(at), span.host.add(at));
+            macro_rules! moved {
+                ($atomic:ty, $int:ty) => {{
+                    let field = <$atomic>::from_ptr(guest.cast());
+                    if span.write {
+                        field.store(host.cast::<$int>().read_unaligned(), Relaxed)
+                    } else {
+                        host.cast::<$int>().write_unaligned(field.load(Relaxed))
+                    }
+                }};
+            }
+            match width {
+                8 => moved!(AtomicU64, u64),
+                4 => moved!(AtomicU32, u32),
+                2 => moved!(AtomicU16, u16),
+                _ => moved!(AtomicU8, u8),
+            }
+            at += width;
+        }
+    }
+}
+
+/// Copies `spans` in order. A read that follows a write is ordered after it by a full barrier
+/// (the used index before the available ring's flags, virtio's `virtio_mb` pairing); every read
+/// is followed by an acquire barrier, so a later span sees what the guest published before the
+/// index it read (the available index before its ring entries and descriptors).
+///
+/// # Safety
+/// As [`copy_span`], for each span.
+unsafe fn copy_spans(spans: &[Span]) {
+    let mut wrote = false;
+    for span in spans {
+        if !span.write && wrote {
+            fence(SeqCst);
+        }
+        unsafe { copy_span(span) };
+        wrote = span.write;
+        if !span.write {
+            fence(Acquire);
+        }
+    }
+}
+
 impl Backing {
     #[cfg(feature = "testing")]
     pub fn io_window_status(&self) -> WindowStatus {
@@ -236,6 +380,14 @@ impl Backing {
             window_us: counters.window_ns.load(Relaxed) / 1000,
             admit_us: counters.admit_ns.load(Relaxed) / 1000,
             lock_wait_us: counters.lock_wait_ns.load(Relaxed) / 1000,
+            windowless: counters.windowless.load(Relaxed),
+            windowless_posted: counters.windowless_posted.load(Relaxed),
+            recheck_holders: counters.recheck_holders.load(Relaxed),
+            drain_waits: counters.drain_waits.load(Relaxed),
+            drain_us: counters.drain_ns.load(Relaxed) / 1000,
+            drain_max_us: counters.drain_max_ns.load(Relaxed) / 1000,
+            drain_expiries: counters.drain_expiries.load(Relaxed),
+            table_fallbacks: counters.table_fallbacks.load(Relaxed),
         }
     }
     /// Copy a bounded ordered batch after every configured vCPU reaches a resident safe boundary.
@@ -309,6 +461,18 @@ impl Backing {
                 Err("I/O window canceled".into())
             };
         }
+        self.window(&spans, deadline, Some(permit), kick)
+    }
+
+    /// One window over resolved, nonempty `spans`. `permit` is granted after admission; `None`
+    /// means the caller already holds a granted permit (a windowless batch's fallback).
+    fn window(
+        &self,
+        spans: &[Span],
+        deadline: Instant,
+        permit: Option<&CopyPermit>,
+        kick: impl FnMut(usize, bool) -> Result<bool>,
+    ) -> Result<()> {
         let locking = Instant::now();
         let mut sequence = self.lock_epoch(permit, deadline)?;
         let announced = Instant::now();
@@ -327,7 +491,7 @@ impl Backing {
         let admitted = Instant::now();
         #[cfg(feature = "io-test-hooks")]
         super::io_test::point(&self.memory, cache::io_test::BEFORE_GRANT);
-        if !permit.grant() {
+        if permit.is_some_and(|p| !p.grant()) {
             return Err("I/O window canceled or permit already consumed".into());
         }
         #[cfg(feature = "io-test-hooks")]
@@ -337,25 +501,14 @@ impl Backing {
         counters.granted.fetch_add(1, Relaxed);
         if spans.iter().any(|span| span.write) {
             counters.writes.fetch_add(1, Relaxed);
-            if self.invalidate_written(&spans, epoch) {
+            if self.invalidate_written(spans, epoch) {
                 counters.table_writes.fetch_add(1, Relaxed);
             }
         }
-        for span in &spans {
-            // SAFETY: the complete installed-RAM ranges were checked above; all residents have
-            // completed their accesses and are parked. Host buffers are borrowed for this call,
-            // cannot overlap guest backing in safe code, and have the checked lengths. Copies are
-            // ordered; no exclusive Rust reference is manufactured over guest memory.
-            unsafe {
-                if span.write {
-                    std::ptr::copy_nonoverlapping(span.host, span.guest, span.len);
-                } else {
-                    std::ptr::copy_nonoverlapping(span.guest, span.host, span.len);
-                }
-            }
-        }
+        // SAFETY: the complete installed-RAM ranges were checked in `resolve`; all residents have
+        // completed their accesses and are parked.
+        unsafe { copy_spans(spans) };
         drop(release);
-        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         counters
             .window_ns
             .fetch_add(ns(announced.elapsed()), Relaxed);
@@ -368,14 +521,202 @@ impl Backing {
         Ok(())
     }
 
+    /// As [`Self::copy_guest_with_permit`], without pausing vCPUs in the usual case (the
+    /// "windowless copies" design in `docs/restructure/io-plan.md`). `transfers[..publish]` is the
+    /// body (payload, status, used elements, metadata reads); `transfers[publish..]` is the
+    /// publication (the used index, then reads of the available ring and any metadata refresh),
+    /// copied only after every vCPU posted a code invalidation for a written page has drained it,
+    /// is halted, or has ended. Read-only batches touch no marks. A write overlapping a
+    /// page-table mark sends the whole batch through a window instead; a drain that outlasts
+    /// [`DRAIN_DEADLINE`] sends the publication through one. The permit is granted before any
+    /// write, so a reset either cancels the batch before its first effect or waits for this
+    /// call, as for a granted window. Takes no epoch lock, except in a fallback window. Callers
+    /// must hold no device/VM lock the vCPUs' service threads need.
+    pub fn copy_guest_windowless(
+        &self,
+        machine: &Machine,
+        stops: &Stops,
+        timeout: Duration,
+        transfers: &mut [Transfer<'_>],
+        publish: usize,
+        permit: &CopyPermit,
+    ) -> Result<()> {
+        self.windowless(
+            timeout,
+            DRAIN_DEADLINE,
+            transfers,
+            publish,
+            permit,
+            |v, acknowledged| stops.kick_if_needed(machine, v, !acknowledged),
+            |_point| {
+                #[cfg(feature = "io-test-hooks")]
+                super::io_test::point(&self.memory, _point);
+            },
+        )
+    }
+
+    /// The windowless protocol. `kick(v, false)` rings `v`, `kick(v, true)` only asks; both
+    /// return false once `v` has ended. `point` is called at the windowless test points.
+    fn windowless(
+        &self,
+        timeout: Duration,
+        drain: Duration,
+        transfers: &mut [Transfer<'_>],
+        publish: usize,
+        permit: &CopyPermit,
+        mut kick: impl FnMut(usize, bool) -> Result<bool>,
+        mut point: impl FnMut(u64),
+    ) -> Result<()> {
+        let _cancel = CancelPending(permit);
+        if permit.state.load(SeqCst) != 0 {
+            return Err("I/O copy permit already consumed".into());
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or("I/O copy timeout overflow")?;
+        let body = transfers
+            .get(..publish)
+            .ok_or("I/O publication index out of range")?
+            .iter()
+            .filter(|t| !t.is_empty())
+            .count();
+        let spans = resolve(&self.ram, transfers)?;
+        let counters = &self.io_counts;
+        let pages = written_pages(&spans);
+        if pages.iter().any(|&page| table_page(&self.memory, page)) {
+            // A page-table shadow is not tracked for guest stores: pause everyone, as before.
+            counters.table_fallbacks.fetch_add(1, Relaxed);
+            return self.window(&spans, deadline, Some(permit), kick);
+        }
+        if !permit.grant() {
+            return Err("I/O copy canceled".into());
+        }
+        counters.windowless.fetch_add(1, Relaxed);
+        let mut posted = Vec::new();
+        self.post_written(&pages, &mut posted, &mut kick)?;
+        point(cache::io_test::AFTER_PRECHECK);
+        let (body, publication) = spans.split_at(body);
+        // SAFETY (both copies): installed-RAM ranges were checked in `resolve`. vCPUs run: the
+        // device owns every written buffer and the used slots it fills; ring fields are accessed
+        // whole (`copy_span`), and the barriers below order them as virtio requires.
+        unsafe { copy_spans(body) };
+        point(cache::io_test::BEFORE_RECHECK);
+        // As the resident's `rechecked`: a vCPU that marked a page after the check above (or
+        // after its mark was cleared) may have compiled torn bytes; it is posted like the rest.
+        fence(SeqCst);
+        let before = posted.len();
+        self.post_written(&written_pages(body), &mut posted, &mut kick)?;
+        counters
+            .recheck_holders
+            .fetch_add((posted.len() - before) as u64, Relaxed);
+        if !posted.is_empty() {
+            counters.windowless_posted.fetch_add(1, Relaxed);
+            let until = deadline.min(Instant::now() + drain);
+            if !self.drained(&posted, until, &mut kick)? {
+                counters.drain_expiries.fetch_add(1, Relaxed);
+                // Every body byte is in place; the window parks the holders still owing a
+                // drain, and they drain after release before any guest access.
+                return if publication.is_empty() {
+                    Ok(())
+                } else {
+                    self.window(publication, deadline, None, kick)
+                };
+            }
+        }
+        point(cache::io_test::BEFORE_PUBLISH);
+        // The body's stores are ordered before the used index by the full barrier after the body
+        // (`dmb ish`, which is also the index store's release).
+        unsafe { copy_spans(publication) };
+        fence(SeqCst);
+        // A mark of the used ring's page taken now executes a ring the device writes (a guest
+        // race): post it, with no wait (the completion is already visible).
+        let before = posted.len();
+        self.post_written(&written_pages(publication), &mut posted, &mut kick)?;
+        counters
+            .recheck_holders
+            .fetch_add((posted.len() - before) as u64, Relaxed);
+        Ok(())
+    }
+
+    /// Clears the code marks of every page in `pages`, posts each page to its holders, then
+    /// rings each newly posted vCPU once (posting before kicking, as the resident does).
+    /// Appends `(vCPU, page)` per post.
+    fn post_written(
+        &self,
+        pages: &[u64],
+        posted: &mut Vec<(usize, usize)>,
+        kick: &mut impl FnMut(usize, bool) -> Result<bool>,
+    ) -> Result<()> {
+        let mut ring: cache::CpuMask = 0;
+        for &page in pages {
+            let page = page as usize;
+            let peers = clear_marks(&self.memory, page);
+            if peers != 0 {
+                post_page(&self.memory, page, peers, self.n);
+                posted.extend(
+                    (0..self.n)
+                        .filter(|v| peers & (1 << v) != 0)
+                        .map(|v| (v, page)),
+                );
+                ring |= peers;
+            }
+        }
+        for v in (0..self.n).filter(|v| ring & (1 << v) != 0) {
+            // False once `v` has ended: it runs no guest code again, nothing to ring.
+            kick(v, false)?;
+        }
+        Ok(())
+    }
+
+    /// Wait until every posted vCPU has drained its post, is halted (it drains when it withdraws,
+    /// before guest access), or has ended. False at `until`.
+    fn drained(
+        &self,
+        posted: &[(usize, usize)],
+        until: Instant,
+        kick: &mut impl FnMut(usize, bool) -> Result<bool>,
+    ) -> Result<bool> {
+        let began = Instant::now();
+        let mut waiting = posted.to_vec();
+        let result = loop {
+            let mut i = 0;
+            while i < waiting.len() {
+                let (v, page) = waiting[i];
+                // The post preceded these SeqCst loads, so a vCPU seen halted sees the post when
+                // it withdraws (its quiescent store and drain load are SeqCst, after `dsb sy`).
+                let done = !stale(&self.memory, v, page)
+                    || quiescent(&self.memory, v).load(SeqCst) == 1
+                    || !kick(v, true)?;
+                if done {
+                    waiting.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            if waiting.is_empty() {
+                break true;
+            }
+            if Instant::now() >= until {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let counters = &self.io_counts;
+        let waited = ns(began.elapsed());
+        counters.drain_waits.fetch_add(1, Relaxed);
+        counters.drain_ns.fetch_add(waited, Relaxed);
+        counters.drain_max_ns.fetch_max(waited, Relaxed);
+        Ok(result)
+    }
+
     /// Take the window sequence, polling so cancellation and the deadline still apply.
     fn lock_epoch(
         &self,
-        permit: &CopyPermit,
+        permit: Option<&CopyPermit>,
         deadline: Instant,
     ) -> Result<std::sync::MutexGuard<'_, u64>> {
         loop {
-            if permit.canceled() {
+            if permit.is_some_and(CopyPermit::canceled) {
                 return Err("I/O window canceled".into());
             }
             match self.io_epoch.try_lock() {
@@ -397,12 +738,12 @@ impl Backing {
     fn admit(
         &self,
         epoch: u64,
-        permit: &CopyPermit,
+        permit: Option<&CopyPermit>,
         deadline: Instant,
         mut kick: impl FnMut(usize, bool) -> Result<bool>,
     ) -> Result<()> {
         for v in 0..self.n {
-            if permit.canceled() {
+            if permit.is_some_and(CopyPermit::canceled) {
                 return Err("I/O window canceled".into());
             }
             let ready = acknowledged_or_halted(&self.memory, v, epoch);
@@ -411,7 +752,7 @@ impl Backing {
             }
         }
         loop {
-            if permit.canceled() {
+            if permit.is_some_and(CopyPermit::canceled) {
                 return Err("I/O window canceled".into());
             }
             if Instant::now() >= deadline {
@@ -1269,5 +1610,377 @@ mod tests {
                 assert!(!permit.grant(), "a consumed permit can never grant again");
             });
         }
+    }
+
+    // Windowless copies. Page 0 holds a "payload", page 1 a "used ring": body writes page 0,
+    // the publication writes the used index at 0x1002 and reads the available ring at 0x2000.
+    const DRAIN: Duration = Duration::from_millis(5);
+    fn code_mark(b: &Backing, page: usize) -> &AtomicU64 {
+        global_u64(&b.memory, cache::CODE_PAGES + page * 8)
+    }
+    fn completion<'a>(payload: &'a [u8], avail: &'a mut [u8]) -> [Transfer<'a>; 3] {
+        [
+            Transfer::Write {
+                gpa: 0x10,
+                bytes: payload,
+            },
+            Transfer::Write {
+                gpa: 0x1002,
+                bytes: &[5, 0],
+            },
+            Transfer::Read {
+                gpa: 0x2000,
+                bytes: avail,
+            },
+        ]
+    }
+    fn no_ring(_: usize, ready: bool) -> Result<bool> {
+        assert!(ready, "nothing to ring");
+        Ok(true)
+    }
+
+    #[test]
+    fn usual_write_copies_without_window_marks_or_kicks() {
+        let b = backing(2);
+        // SAFETY: fixture RAM, in bounds and aligned, outside any copy.
+        unsafe { b.ram.range(0x2002, 2).unwrap().cast::<u16>().write(7) };
+        let mut avail = [0; 4];
+        b.windowless(
+            BUDGET,
+            DRAIN,
+            &mut completion(&[1, 2, 3], &mut avail),
+            1,
+            &CopyPermit::new(),
+            no_ring,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(read(&b, 0x10, 3), [1, 2, 3]);
+        assert_eq!(read(&b, 0x1002, 2), [5, 0]);
+        assert_eq!(avail, [0, 0, 7, 0]);
+        let counts = b.io_window_counts();
+        assert_eq!(
+            (counts.windowless, counts.granted, counts.drain_waits),
+            (1, 0, 0)
+        );
+        assert_eq!(load(&b, offset_of!(IoWindow, request)), 0, "no epoch");
+    }
+
+    #[test]
+    fn holders_of_written_pages_drain_before_publication() {
+        let b = backing(3);
+        code_mark(&b, 0).store(0b010, SeqCst);
+        code_mark(&b, 1).store(0b100, SeqCst);
+        let (kicked, receive) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let copy = scope.spawn(|| {
+                let mut avail = [0; 4];
+                b.windowless(
+                    BUDGET,
+                    BUDGET,
+                    &mut completion(&[9], &mut avail),
+                    1,
+                    &CopyPermit::new(),
+                    |v, ready| {
+                        if !ready {
+                            kicked.send(v).unwrap();
+                        }
+                        Ok(true)
+                    },
+                    |_| {},
+                )
+            });
+            let mut rung = [receive.recv().unwrap(), receive.recv().unwrap()];
+            rung.sort();
+            assert_eq!(rung, [1, 2], "both holders rung");
+            assert_eq!(
+                (code_mark(&b, 0).load(SeqCst), code_mark(&b, 1).load(SeqCst)),
+                (0, 0)
+            );
+            assert_eq!(record_word(&b.memory, 1, None).load(SeqCst), cache::PAGES);
+            while read(&b, 0x10, 1) != [9] {
+                std::thread::yield_now();
+            }
+            // vCPU 1 drains; vCPU 2 (holding the used ring's page) still owes its drain.
+            record_word(&b.memory, 1, Some(0)).fetch_and(!1, SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                read(&b, 0x1002, 2),
+                [0, 0],
+                "not published before every drain"
+            );
+            // vCPU 2 halts instead: it drains when it withdraws, before guest access.
+            quiescent(&b.memory, 2).store(1, SeqCst);
+            copy.join().unwrap().unwrap();
+        });
+        assert_eq!(read(&b, 0x1002, 2), [5, 0]);
+        assert!(stale(&b.memory, 2, 1), "a halted holder keeps its post");
+        let counts = b.io_window_counts();
+        assert_eq!(
+            (
+                counts.windowless_posted,
+                counts.drain_waits,
+                counts.drain_expiries
+            ),
+            (1, 1, 0)
+        );
+        assert!(counts.drain_max_us >= 20_000 && counts.drain_us >= counts.drain_max_us);
+    }
+
+    #[test]
+    fn marks_raced_during_the_copy_are_posted_and_drained() {
+        // Body pages are rechecked before the drain wait; the used index's own page after it.
+        for (at, page, awaited) in [
+            (cache::io_test::AFTER_PRECHECK, 0, true),
+            (cache::io_test::BEFORE_RECHECK, 0, true),
+            (cache::io_test::BEFORE_RECHECK, 1, false),
+            (cache::io_test::BEFORE_PUBLISH, 1, false),
+        ] {
+            let b = backing(2);
+            let mut kicks = Vec::new();
+            let mut avail = [0; 4];
+            b.windowless(
+                BUDGET,
+                BUDGET,
+                &mut completion(&[4], &mut avail),
+                1,
+                &CopyPermit::new(),
+                |v, ready| {
+                    if !ready {
+                        // The holder drains at its next block boundary.
+                        kicks.push(v);
+                        record_word(&b.memory, v, Some(0)).store(0, SeqCst);
+                    }
+                    Ok(true)
+                },
+                |point| {
+                    if point == at {
+                        code_mark(&b, page).store(1, SeqCst);
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(kicks, [0], "{at} {page}");
+            assert_eq!(code_mark(&b, page).load(SeqCst), 0);
+            assert_eq!(read(&b, 0x1002, 2), [5, 0]);
+            let counts = b.io_window_counts();
+            assert_eq!(counts.recheck_holders, 1);
+            // A mark of the used index's page found after publication is posted, not awaited.
+            assert_eq!(counts.drain_waits, u64::from(awaited));
+        }
+    }
+
+    #[test]
+    fn page_table_mark_sends_the_whole_batch_through_a_window() {
+        let b = backing(2);
+        global_u64(&b.memory, cache::TABLE_PAGES).store(0b10, SeqCst);
+        code_mark(&b, 0).store(1, SeqCst);
+        let mut avail = [0; 4];
+        b.windowless(
+            BUDGET,
+            DRAIN,
+            &mut completion(&[3], &mut avail),
+            1,
+            &CopyPermit::new(),
+            |v, _| acknowledge(&b, v),
+            |_| panic!("no windowless point"),
+        )
+        .unwrap();
+        assert_eq!(
+            (read(&b, 0x10, 1), read(&b, 0x1002, 2)),
+            (vec![3], vec![5, 0])
+        );
+        let counts = b.io_window_counts();
+        assert_eq!(
+            (
+                counts.table_fallbacks,
+                counts.windowless,
+                counts.granted,
+                counts.table_writes
+            ),
+            (1, 0, 1, 1)
+        );
+        assert_eq!(load(&b, offset_of!(IoWindow, tables_written)), 1);
+        assert_eq!(code_mark(&b, 0).load(SeqCst), 0);
+    }
+
+    #[test]
+    fn reads_only_batch_leaves_marks_and_kicks_alone() {
+        let b = backing(2);
+        code_mark(&b, 0).store(3, SeqCst);
+        global_u64(&b.memory, cache::TABLE_PAGES).store(1, SeqCst);
+        let mut bytes = [0; 32];
+        let mut reads = [Transfer::Read {
+            gpa: 0,
+            bytes: &mut bytes,
+        }];
+        b.windowless(
+            BUDGET,
+            DRAIN,
+            &mut reads,
+            1,
+            &CopyPermit::new(),
+            no_ring,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(code_mark(&b, 0).load(SeqCst), 3);
+        let counts = b.io_window_counts();
+        assert_eq!(
+            (counts.windowless, counts.table_fallbacks, counts.granted),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn reset_cancels_before_the_first_write_or_waits_for_the_copy() {
+        let b = backing(1);
+        code_mark(&b, 0).store(1, SeqCst);
+        let permit = CopyPermit::new();
+        assert!(permit.cancel());
+        let mut avail = [0; 4];
+        assert!(
+            b.windowless(
+                BUDGET,
+                DRAIN,
+                &mut completion(&[8], &mut avail),
+                1,
+                &permit,
+                |_, _| panic!("canceled batch must not kick"),
+                |_| panic!("canceled batch must not copy"),
+            )
+            .is_err()
+        );
+        assert_eq!(read(&b, 0x10, 1), [0]);
+        assert_eq!(
+            code_mark(&b, 0).load(SeqCst),
+            1,
+            "a canceled batch posts nothing"
+        );
+        assert_eq!(b.io_window_counts().windowless, 0);
+        // Once granted, a reset loses the race and must wait; the batch completes whole.
+        let permit = CopyPermit::new();
+        let mut canceled = None;
+        b.windowless(
+            BUDGET,
+            DRAIN,
+            &mut completion(&[8], &mut avail),
+            1,
+            &permit,
+            |_, _| Ok(false), // the holder has ended
+            |point| {
+                if point == cache::io_test::AFTER_PRECHECK {
+                    canceled = Some(permit.cancel());
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(canceled, Some(false));
+        assert_eq!(
+            (read(&b, 0x10, 1), read(&b, 0x1002, 2)),
+            (vec![8], vec![5, 0])
+        );
+        assert_eq!(
+            b.io_window_counts().drain_expiries,
+            0,
+            "an ended holder is not awaited"
+        );
+        assert!(
+            b.windowless(BUDGET, DRAIN, &mut [], 0, &permit, no_ring, |_| {})
+                .is_err(),
+            "a consumed permit cannot be reused"
+        );
+    }
+
+    #[test]
+    fn drain_deadline_publishes_through_a_window() {
+        let b = backing(2);
+        code_mark(&b, 0).store(0b10, SeqCst);
+        let mut avail = [0; 4];
+        let mut points = Vec::new();
+        b.windowless(
+            BUDGET,
+            DRAIN,
+            &mut completion(&[6], &mut avail),
+            1,
+            &CopyPermit::new(),
+            |v, ready| {
+                if !ready && load(&b, offset_of!(IoWindow, request)) != 0 {
+                    acknowledge(&b, v)?;
+                }
+                Ok(true) // vCPU 1 never drains its post
+            },
+            |point| points.push(point),
+        )
+        .unwrap();
+        assert_eq!(
+            points,
+            [
+                cache::io_test::AFTER_PRECHECK,
+                cache::io_test::BEFORE_RECHECK
+            ],
+            "the publication did not go windowless"
+        );
+        assert_eq!(
+            (read(&b, 0x10, 1), read(&b, 0x1002, 2)),
+            (vec![6], vec![5, 0])
+        );
+        assert_eq!(load(&b, offset_of!(IoWindow, released)), 1);
+        let counts = b.io_window_counts();
+        assert_eq!(
+            (
+                counts.drain_expiries,
+                counts.granted,
+                counts.writes,
+                counts.windowless
+            ),
+            (1, 1, 1, 1)
+        );
+        assert!(
+            stale(&b.memory, 1, 0),
+            "it drains after release, before guest access"
+        );
+        let line: serde_json::Value =
+            serde_json::from_str(counts.perf_line().strip_prefix("io ").unwrap()).unwrap();
+        for key in [
+            "windowless",
+            "windowless_posted",
+            "recheck_holders",
+            "drain_waits",
+            "drain_us",
+            "drain_max_us",
+            "drain_expiries",
+            "table_fallbacks",
+        ] {
+            assert!(line[key].is_u64(), "{key} in the perf line");
+        }
+    }
+
+    #[test]
+    fn small_spans_move_as_whole_aligned_fields() {
+        let b = backing(1);
+        let mut bytes = [0; 7];
+        let mut ops = [
+            Transfer::Write {
+                gpa: 0x101,
+                bytes: &[1, 2, 3, 4, 5, 6, 7],
+            },
+            Transfer::Read {
+                gpa: 0x101,
+                bytes: &mut bytes,
+            },
+        ];
+        b.windowless(
+            BUDGET,
+            DRAIN,
+            &mut ops,
+            2,
+            &CopyPermit::new(),
+            no_ring,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(read(&b, 0x100, 9), [0, 1, 2, 3, 4, 5, 6, 7, 0]);
     }
 }

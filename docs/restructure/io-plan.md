@@ -936,6 +936,23 @@ invalidation applies at the holder's next block boundary rather than before any 
 pre-completion wait keeps today's guarantee that the guest cannot observe completed data with stale
 code. Host stores are not TSO-ordered; virtio needs only the publication barriers above.
 
+*Build (November 9, branch `io-windowless`; awaiting review and measurements).* As designed,
+with these specifics. `Backing::copy_guest_windowless` takes the index where the publication
+(used index, then the available-ring read and any snapshot refresh) starts; every virtio copy
+uses it, and the test drivers' own `copy_guest` calls keep the window. The permit is granted
+after the table check and before the pre-copy posts; a table fallback grants inside its window
+as before. Payload and used elements are not separated by a barrier: the guest reads both only
+after the used index, which a full barrier precedes. The recheck after the body covers the
+body's pages; a mark of the used index's page found after publication is posted and rung but
+not awaited (executing the used ring is a guest race). Only the IoWindow `quiescent` word
+counts as halted: `Events::halted` stays set until after the HLT loop's last drain, and AP
+mailbox waits drain on each doorbell anyway. A drain-deadline fallback copies only the
+publication through the window (the body is already in place). The metadata snapshot now
+reads the available ring's flags and index, its entries, then the descriptor table, so the
+acquire after the index read covers what the driver published before it. The deadline-expiry
+count is also the drain-fallback count. Host test points: `AFTER_PRECHECK`, `BEFORE_RECHECK`,
+`BEFORE_PUBLISH`.
+
 **Alternative kept as plan B.** A hidden device vCPU running the same protocol in a resident,
 with guest vCPUs capped at host cores − 1, if host-side kicks or ordering prove inadequate.
 
