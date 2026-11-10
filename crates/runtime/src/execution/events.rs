@@ -274,6 +274,8 @@ pub(super) fn park(s: &mut State) {
         if !parked {
             parked = true;
             s.halts += 1; // it waits: an event it could take at once never parks it
+            // A sleeping resident publishes nothing else before the host may end it: keep its count current.
+            unsafe { write_record(&raw mut (*record()).halts, &s.halts) };
         }
         // L5: `wfi`, woken on time for the timer's next expiry.
         deadline = lapic::deadline();
