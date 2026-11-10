@@ -203,6 +203,13 @@ pub(super) fn device(mut s: State, f: &NativeFrame, b: &Block, site: &Site, gpa:
                     _ => halt(&s, stop::BAD_REPLY),
                 }
                 io_checkpoint(&mut s);
+                // A windowless I/O copy waits for this vCPU to drain the code pages it posted
+                // here (cache.rs `drain`). Safe here as in `io_checkpoint`'s own drain after a
+                // release: no guest access or block continuation is live until the access
+                // finishes, and dispatch drains again before entering any block. Ordering: the
+                // host posts with SeqCst before polling the stale bit; this drain's SeqCst
+                // swaps either take the post or leave it for the next poll.
+                take_invalidations(&mut s);
                 (s.request, s.reply) = (REQUEST_DEVICE_POLL, NONE);
                 write_record(record(), &s);
                 let p = crate::perf::enter(crate::perf::HOST);
