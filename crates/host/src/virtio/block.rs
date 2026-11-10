@@ -792,10 +792,13 @@ impl Virtio {
                         .0;
                 }
             });
-            let result = self.serve_block(guest, disk, cancel, pool);
+            // Even a panicking owner ends the watchdog (the scope joins it before the panic goes on).
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.serve_block(guest, disk, cancel, pool)
+            }));
             *done.lock().unwrap_or_else(|e| e.into_inner()) = true;
             signal.notify_one();
-            result
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         })
     }
     fn serve_block(
@@ -2000,6 +2003,8 @@ mod owner_tests {
         released: Condvar,
         calls: AtomicUsize,
         by_worker: Mutex<Vec<bool>>,
+        /// Every call panics.
+        panics: AtomicBool,
     }
     impl Held {
         fn hold(&self, on: bool) {
@@ -2009,6 +2014,7 @@ mod owner_tests {
         fn call(&self) {
             let worker = std::thread::current().name() == Some("natemu-disk");
             self.by_worker.lock().unwrap().push(worker);
+            assert!(!self.panics.load(SeqCst), "injected disk panic");
             self.calls.fetch_add(1, SeqCst);
             let held = self.held.lock().unwrap();
             drop(self.released.wait_while(held, |h| *h).unwrap());
@@ -2399,6 +2405,23 @@ mod owner_tests {
             let s = rig.r.lock();
             assert_eq!(s.generation + s.generations[0], 1);
         }
+    }
+
+    #[test]
+    fn an_owner_panicking_in_its_inline_call_ends_with_its_watchdog() {
+        let rig = Rig::new("panic");
+        rig.disk.panics.store(true, SeqCst);
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rig.run_owner(|rig| {
+                rig.publish(rig.read_request(0));
+                assert!(rig.kick());
+                until("inline call", || rig.disk.calls() == 1);
+            })
+        }));
+        assert!(
+            ended.is_err(),
+            "the owner's panic propagates instead of hanging"
+        );
     }
 
     #[test]
