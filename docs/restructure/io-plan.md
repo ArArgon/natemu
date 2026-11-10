@@ -1012,11 +1012,16 @@ depth 16 at most 2, depth 16 +20%, four readers +15%, depth 1 no worse.
 
 ## Shorter depth-1 path (proposed, November 10)
 
-**Status: built (November 10), awaiting independent review.** Items 1 and 3 are in; item 2 is
+**Status: built (November 10); independent review accepted it after two fixes (the watchdog now
+prints the VM-fatal reason; a test asserted the wrong panic).** Items 1 and 3 are in; item 2 is
 built and measured, and off by default (it did not pay within the host-CPU bound). Interleaved
 A/B on one image, four rounds, host page cache warm ([results](io-benchmarks.md#shorter-depth-1-path--november-10)):
-depth 1 at one vCPU 20.9 → 27.3 kIOPS (+31%), at four 15.5 → 17.5 (+13%, short of +15%); depth
-16 and four readers within run-to-run noise; host CPU per I/O at depth 1 falls 17–27%. The
+depth 1 at one vCPU 20.9 → 27.3 kIOPS (+31%; median +26%, one round an outlier), at four
+15.5 → 17.5 (+13%, short of +15%); depth 16 and four readers within run-to-run noise; host CPU per
+I/O at depth 1 falls 17–28%. **Trade-off:** a pool call that hangs past the 10 s limit is
+detached and the process exits; the owner's inline call cannot be, so a hung inline syscall keeps
+the process alive (the VM canceled, the reason printed) until the syscall returns. Accepted for
+reads and unsynced writes, the only calls made inline. The
 remaining depth-1 gap at four vCPUs is the second halted-vCPU wake per request: Linux 6.12 routes
 the IRQ with fixed delivery to one CPU and its scheduler then wakes fio's idle CPU by IPI;
 retargeting the IRQ would depart from the programmed routing, so it is not done. The

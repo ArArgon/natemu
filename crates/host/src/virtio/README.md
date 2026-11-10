@@ -156,9 +156,12 @@ A native disk call has a ten-second deadline from when it starts (an owner's
 inline call is watched by a scoped watchdog thread, which cancels the VM);
 shutdown has a thirty-second poll deadline. A stalled native syscall is not
 forcibly canceled: its owned file/buffers remain alive in detached workers (jobs
-still queued never run), with no guest RAM, IRQ or Machine reference. An owner's
-inline call cannot be detached: the VM is cancelled at the deadline, but its
-teardown (and the process exit) waits until that syscall returns. The VM fails and the normal CLI exits its per-VM process. Library
+still queued never run), with no guest RAM, IRQ or Machine reference; the VM
+fails and the normal CLI exits its per-VM process. An owner's inline call is
+different: it cannot be detached. At the deadline the watchdog prints the
+VM-fatal reason (call kind, file offset, elapsed time) and cancels the VM, but
+the owner thread, and with it the run's teardown and the process, stays until
+that syscall returns, however long that is. Library
 embedders must treat this as worker-process fatal, terminate/restart the worker,
 and not repeatedly create VMs in that failed process. An advisory file lock can
 remain held until the syscall retires. No failed return promises rollback or
