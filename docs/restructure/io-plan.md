@@ -882,6 +882,73 @@ vCPUs to reach a checkpoint, so a later step should measure acknowledgement late
 and consider pausing only vCPUs that could touch the affected pages. Also out: network and
 entropy batching, a non-`F_FULLFSYNC` flush mode (an owner policy decision) and zero-copy.
 
+## Windowless copies with targeted invalidation (proposed, November 9)
+
+**Status: accepted under the owner's November 9 delegation** ("optimize the usual cases and make
+exceptions for edge cases"; avoid unnecessary stalls), revised after an independent review the
+same day (two blocking gaps and four should-fixes, all addressed below).
+
+**Why.** After stages 1–2, about 94% of every window is spent waiting for vCPUs to acknowledge,
+and a single submitting job stays flat because windows pause its vCPU about a quarter of the time.
+
+**Observation (read-only verification, November 9).** Every resident coordination protocol is
+shared-memory atomics plus doorbells and does not depend on the writer being a vCPU. A resident's
+own alias stores, which never fault, already follow an explicit sequence: if the page is
+translated, `written` clears every vCPU's code mark for it and posts the stale page to each holder
+(record bit, summary, `PAGES`, doorbell); then the store; then `rechecked` catches a holder that
+marked the page in between. A translation in flight is rejected by `kept` when its source page has
+lost the vCPU's mark. Page-table shadows behave like a TLB and are not tracked for guest stores;
+`TABLE_PAGES` marks exist only for host writes and are never cleared.
+
+**Design.** A copy batch no longer pauses vCPUs, except as listed:
+
+| Target | Treatment |
+| --- | --- |
+| Reads of ring metadata and OUT payloads | No coordination. The device owns published chains and payloads; ring fields are aligned and the guest accesses them with single native loads/stores (verified for the selected FEX profile). An acquire barrier follows the `avail.idx` read. |
+| Writes to pages with no translation and no table mark (the usual case) | Check marks, copy with width-aware or 16-byte-chunk copies, then a full barrier (`dmb ish`), then recheck the code mark, exactly as the resident's own `rechecked`. A vCPU that marked the page and compiled from torn bytes during the copy is a guest race (it executes a buffer the device owns); the recheck clears and posts it like the next row, so the stale block cannot survive completion. |
+| Writes to pages with translations | Before the copy, clear the marks and post the page to each holder (stale bit, summary, `PAGES`), then kick it through its doorbell SPI (`Stops::kick_if_needed`), posting before kicking as `invalidate_page` does; after the copy, barrier and recheck as above. Before publishing the completion, wait until every vCPU posted by either step has cleared its stale bit for the page (its `drain`), is halted (HLT and mailbox waits drain before guest access), or has ended. Only those vCPUs, only this case. |
+| Writes to pages with a page-table mark | Checked before any write: the whole batch uses today's window (all vCPUs, `tables_written`). Rare: 13 of 5.6 M windows. A page becoming a table during a copy is a guest race. |
+| Guest atomics on a target page | No coordination. Split atomics keep no state outside guest RAM, so a guest atomic on a buffer it gave the device is a guest bug with no effect on natemu's own state. |
+
+Publication order per completion: payload and status stores, `dmb ish`, used elements, `dmb ish`,
+`used.idx` (release), a full barrier, then the `avail.flags`/`avail.idx` read for suppression and
+re-arm (the device-side half of Linux's `virtio_mb` pairing; today a window hides the need). The
+interrupt follows publication, as today.
+
+The drain wait holds no device or VM lock (as `copy_guest` requires), skips ended vCPUs, and has a
+deadline; expiry falls back to a full window for the completion rather than publishing early. A
+holder returning from an MMIO exit may run the rest of one block before its doorbell stops it, and
+admission keeps intra-block branches forward, so no linked loop runs without a boundary. Windowless
+batches do not take the window epoch lock, so they never wait behind a fallback window whose
+checkpoint their holders are parked in.
+
+**Kept from copy-first.** Backends touch only owned buffers; the device owner alone copies; whole
+batches are validated before any write; reset, disable and S5 still wait for in-flight work; the
+window path remains for the table-page fallback and for the test hooks that exercise it.
+
+The table-mark ordering argument (`mark_table_page`, which assumed host reads only inside a granted
+window) is rewritten for the pre-copy check: a mark the host misses belongs to a walk that started
+during the copy, which is a guest race.
+
+**Edge cases and risks.** Table marks are permanent, so recycled page-table pages force fallback
+windows; `table_windows` measures it (a clearing mechanism is a later step if it grows). The posted
+invalidation applies at the holder's next block boundary rather than before any guest access; the
+pre-completion wait keeps today's guarantee that the guest cannot observe completed data with stale
+code. Host stores are not TSO-ordered; virtio needs only the publication barriers above.
+
+**Alternative kept as plan B.** A hidden device vCPU running the same protocol in a resident,
+with guest vCPUs capped at host cores − 1, if host-side kicks or ordering prove inadequate.
+
+**Evidence required.** Host tests for each row, using new host test points (after the pre-copy
+check, between copy and recheck, before publication), including a mark raced during a copy and a
+holder that must drain before publication; the existing window hooks keep covering fallback
+windows. Counters: windowless batches, batches that posted, holders found by the recheck, drain
+waits (count, total and maximum time, deadline expiries) and fallback windows by cause. Then the
+full standing suite; lifecycle, stress, soak and
+persistence runs; window counters split into windowless batches and fallback windows; the matrix
+at one, two and four vCPUs against HEAD and the VZ reference. Targets at four vCPUs: share of wall
+time with vCPUs paused below 2%, single-job depth 16 at least 2x HEAD, depth 1 no worse.
+
 ## Future direct-payload work
 
 Keep immutable request metadata, backend ownership and ordered completion as
