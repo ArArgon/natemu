@@ -1012,7 +1012,15 @@ depth 16 at most 2, depth 16 +20%, four readers +15%, depth 1 no worse.
 
 ## Shorter depth-1 path (proposed, November 10)
 
-**Status: accepted under the owner's November 9 delegation; reviewed with the code.** The
+**Status: built (November 10), awaiting independent review.** Items 1 and 3 are in; item 2 is
+built and measured, and off by default (it did not pay within the host-CPU bound). Interleaved
+A/B on one image, four rounds, host page cache warm ([results](io-benchmarks.md#shorter-depth-1-path--november-10)):
+depth 1 at one vCPU 20.9 → 27.3 kIOPS (+31%), at four 15.5 → 17.5 (+13%, short of +15%); depth
+16 and four readers within run-to-run noise; host CPU per I/O at depth 1 falls 17–27%. The
+remaining depth-1 gap at four vCPUs is the second halted-vCPU wake per request: Linux 6.12 routes
+the IRQ with fixed delivery to one CPU and its scheduler then wakes fio's idle CPU by IPI;
+retargeting the IRQ would depart from the programmed routing, so it is not done. The
+original design follows. The
 [per-request profile](io-benchmarks.md#per-request-profile-after-windowless-copies--november-10)
 shows a depth-1 request spending about 31–33 µs from notify to the guest's ACK, of which about
 9–10 µs are three host thread hand-offs (notify → owner, owner → worker, worker → owner) and
