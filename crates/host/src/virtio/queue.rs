@@ -2,6 +2,7 @@
 //! reach the VM's mapping.
 use super::Identity;
 use crate::Result;
+use crate::execution::io::Transfer;
 use natemu_abi::guest_memory::GuestRam;
 use virtio_queue::{CheckedDescriptorChain, desc::split::Descriptor};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
@@ -78,6 +79,21 @@ impl Snapshot {
     /// this queue generation; exhaustion must resnapshot even without another guest notification.
     pub(super) fn reusable(&self, q: Queue, id: Identity) -> bool {
         self.captured == Some(id) && self.avail_index() != q.next_avail
+    }
+    /// Reads of `q`'s descriptor table and available ring into this snapshot, for one window.
+    pub(super) fn reads(&mut self, q: Queue) -> [Transfer<'_>; 2] {
+        let table_len = usize::from(q.size) * 16;
+        let avail_len = 4 + usize::from(q.size) * 2;
+        [
+            Transfer::Read {
+                gpa: q.desc,
+                bytes: &mut self.table[..table_len],
+            },
+            Transfer::Read {
+                gpa: q.avail,
+                bytes: &mut self.avail[..avail_len],
+            },
+        ]
     }
     pub(super) fn captured(&mut self, id: Identity) {
         self.captured = Some(id);

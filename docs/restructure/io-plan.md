@@ -798,6 +798,15 @@ both pay.
      flight still complete visibly (their buffers stay owned until they retire); nothing is
      admitted after the failure. This matches the current single-request behaviour and is
      checked against Linux virtio_blk, which does not recover from NEEDS_RESET.
+   *Stage 1 result (November 9, approved and built): gate missed.* Windows per completed I/O
+   fell from 2.99 / 2.96 / 2.84 to 2.81 / 2.74 / 2.65 at one, two and four vCPUs (6–9%), and
+   window time per I/O from 10.1 / 12.0 / 12.6 µs to 8.6 / 10.5 / 11.5 µs (9–15%), against the
+   30% gate (`natemu-raw/window-cost-stage1-20261109-01/`). Counting at four vCPUs: 60% of block
+   requests still needed a metadata window, because with one request in flight the guest has
+   usually not published its next request when the previous one completes. Stage 1 is kept as a
+   small, correct gain (block, lifecycle, fio admission and normal/forced stress pass); its
+   intended effect depends on overlapping requests, so stage 2 carries the windows-per-request
+   target as well.
 3. **Batched capture**, only if the counters still show capture windows dominating: one
    metadata snapshot admits up to K chains; their headers and OUT payloads are gathered in as
    few windows as the byte and span bounds allow.
@@ -820,7 +829,7 @@ runs per vCPU count, as HEAD was:
 
 - *After stage 1:* windows per completed request at least 30% fewer; depth 1 at one, two and four
   vCPUs no worse than HEAD's slower run; every correctness run passing.
-- *After stage 2:* random read depth 16 and four readers at four vCPUs at least 2x HEAD; window-open
+- *After stage 2:* windows per completed request at least 30% fewer than HEAD; random read depth 16 and four readers at four vCPUs at least 2x HEAD; window-open
   time per completed request no higher than HEAD's (about 13 µs at four vCPUs); depth 1 as above;
   serial heartbeat and timer stress results unchanged; every correctness run passing.
 
