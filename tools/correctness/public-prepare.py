@@ -10,7 +10,9 @@ import tarfile
 import re
 
 ROOT = Path(__file__).resolve().parents[2]
-RAW = ROOT.parent / 'natemu-raw'
+sys.path.insert(0, str(ROOT / 'tools'))
+from raw_root import RAW_ROOT  # noqa: E402
+RAW = RAW_ROOT
 WORK = RAW / 'public-cpu-ram-20261107-01'
 mode = sys.argv[1]
 out = WORK / mode

@@ -25,7 +25,8 @@ import subprocess
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-RAW = ROOT.parent / 'natemu-raw'
+from raw_root import RAW_ROOT  # noqa: E402
+RAW = RAW_ROOT
 KERNEL = RAW / 'kernel-census-20261028-01/dl/linux'
 INITRD = RAW / 'bench-20261105-03/out/bench.cpio'
 SOURCE = RAW / 'bench-20261105-03/src/stress-ng_0.19.02.orig.tar.xz'

@@ -24,7 +24,8 @@ Writes DIR/l2-iasl.json; exit 1 on any failure."""
 import argparse, json, pathlib, re, shutil, struct, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-KERNEL = ROOT.parent / 'natemu-raw/kernel-census-20261028-01/dl/linux'
+from raw_root import RAW_ROOT  # noqa: E402
+KERNEL = RAW_ROOT / 'kernel-census-20261028-01/dl/linux'
 ZERO_PAGE = 0x10000
 MV0 = 'ACPI table terminates in the middle of a data structure!'
 

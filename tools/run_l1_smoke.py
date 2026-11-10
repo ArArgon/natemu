@@ -26,7 +26,8 @@ import argparse, hashlib, json, os, pathlib, re, socket, struct, subprocess, sys
 os.environ.setdefault('NATEMU_COMPILE_CACHE', 'off')   # P3: hermetic; boot-linux keeps compiles across runs otherwise
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-RAW = ROOT.parent / 'natemu-raw/kernel-census-20261028-01'
+from raw_root import RAW_ROOT  # noqa: E402
+RAW = RAW_ROOT / 'kernel-census-20261028-01'
 QEMU = '/opt/homebrew/bin/qemu-system-x86_64'
 REGS = ['rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi'] + [f'r{i}' for i in range(8, 16)]
 ROM = 0xFFFF0000

@@ -18,10 +18,11 @@ Writes DIR/l1.json; exit status 1 on any failure. The VM smoke test is `tools/ru
 import argparse, json, pathlib, struct, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+from raw_root import RAW_ROOT  # noqa: E402
 sys.path.insert(0, str(ROOT / 'tools'))
 from models import bootproto as bp  # noqa: E402
 
-RAW = ROOT.parent / 'natemu-raw/kernel-census-20261028-01/dl'
+RAW = RAW_ROOT / 'kernel-census-20261028-01/dl'
 MIB = 1 << 20
 CMDLINE = 'mitigations=off nokaslr'
 
