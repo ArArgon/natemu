@@ -7,6 +7,7 @@
 //! destroying the VM.
 mod block;
 mod net;
+mod profile;
 mod queue;
 pub use net::PacketPort;
 #[cfg(feature = "testing")]
@@ -766,7 +767,10 @@ impl Virtio {
             reg::DEVICE_FEATURES => feature_word(self.profile.features(), s.device_sel),
             reg::QUEUE_NUM_MAX if valid_queue => self.profile.queue_max().into(),
             reg::QUEUE_READY => u32::from(valid_queue && s.queues[selected].ready),
-            reg::INTERRUPT_STATUS => s.interrupt,
+            reg::INTERRUPT_STATUS => {
+                profile::count(profile::STATUS_READS);
+                s.interrupt
+            }
             reg::STATUS => s.status,
             // Including ConfigGeneration: configuration never changes.
             _ => 0,
@@ -800,6 +804,7 @@ impl Virtio {
             reg::QUEUE_READY if valid_queue => return self.write_queue_ready(s, selected, value),
             reg::QUEUE_NOTIFY => self.notify(s, value as usize),
             reg::INTERRUPT_ACK => {
+                profile::acked();
                 s.interrupt &= !(value & (USED_BUFFER | CONFIG_CHANGE));
                 self.irq(s);
             }
@@ -858,6 +863,7 @@ impl Virtio {
             return;
         }
         s.notified[queue] = true;
+        profile::notified();
         self.busy(s);
         self.wake.ring();
     }
@@ -1039,6 +1045,7 @@ impl Virtio {
     /// it or a reset closed the incarnation (ACK, reset and level publication share the lock).
     fn interrupt(&self, s: &mut State, id: Identity, used: &Used) {
         if s.current(id) && used.interrupt_wanted() {
+            profile::raised(s.interrupt == 0);
             s.interrupt |= USED_BUFFER;
             self.irq(s);
         }
@@ -1094,7 +1101,9 @@ impl Virtio {
     /// Entropy and network serve one request at a time; block has its own owner loop.
     fn owner(&self, guest: Guest<'_>, cancel: &AtomicBool) -> Result<()> {
         if let Profile::Block(disk) = &self.profile {
-            return self.block_owner(guest, disk, cancel);
+            let result = self.block_owner(guest, disk, cancel);
+            profile::report();
+            return result;
         }
         let mut snapshot = Snapshot::new(self.profile.queue_max())?;
         loop {

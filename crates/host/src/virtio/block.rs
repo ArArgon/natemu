@@ -1,6 +1,7 @@
 //! virtio-blk over one owned regular file: modern request parsing, a fixed pool of native disk
 //! workers that make the file calls outside every lock and copy window, and the block owner,
 //! which keeps several requests in flight and batches their copy windows.
+use super::profile;
 use super::*;
 use std::{
     fs::{File, OpenOptions, TryLockError},
@@ -235,6 +236,7 @@ fn work(calls: &impl Calls, queue: &Mutex<Receiver<Ticket>>, shared: &Mutex<Boar
     loop {
         let ticket = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
         let Ok((slot, job)) = ticket else {
+            profile::add(profile::WORKER_CPU_NS, crate::perf::thread_cpu());
             return;
         };
         {
@@ -244,7 +246,9 @@ fn work(calls: &impl Calls, queue: &Mutex<Receiver<Ticket>>, shared: &Mutex<Boar
             }
             board.running.push((slot, Instant::now()));
         }
+        let began = profile::taken_by_worker(slot);
         let done = execute(calls, job);
+        profile::called(slot, began);
         {
             let mut board = board(shared);
             board.running.retain(|(s, _)| *s != slot);
@@ -677,6 +681,7 @@ impl Virtio {
                 };
             }
             for (slot, done) in pool.take() {
+                profile::result_taken(slot);
                 flight.answer(slot, done);
             }
             if pool.stalled() {
@@ -691,7 +696,10 @@ impl Virtio {
             if self.admit_block(guest, disk, &pool, &mut flight, &mut snapshot)? {
                 continue;
             }
+            let waited = profile::start();
             self.wake.wait(Duration::from_millis(10));
+            profile::count(profile::WAITS);
+            profile::since(profile::WAIT_NS, waited);
         }
     }
     /// Power-off drain once nothing is in flight: a final full sync on a worker (it covers every
@@ -738,6 +746,10 @@ impl Virtio {
             s.notified[0] = false;
             (q, id, notified)
         };
+        let began = profile::start();
+        if notified {
+            profile::consumed();
+        }
         let ram = &guest.backing.ram;
         let mut invalid = self.check_rings(q, ram).err();
         // A notification may announce heads published after a reused snapshot. With requests in
@@ -796,7 +808,10 @@ impl Virtio {
         if !self.commit_admission(id, next, admitted.len(), invalid, snapshot) {
             return Ok(false);
         }
+        profile::count(profile::ADMISSIONS);
+        profile::add(profile::ADMITTED, admitted.len() as u64);
         self.start_requests(guest, disk, pool, flight, id, admitted)?;
+        profile::since(profile::ADMIT_NS, began);
         Ok(true)
     }
     /// Make admission visible under the lock: consume the admitted heads and count them in
@@ -873,6 +888,7 @@ impl Virtio {
             };
             let slot = flight.insert(request);
             if let Some(job) = job {
+                profile::submitted(slot);
                 pool.submit(slot, job)?;
             }
         }
@@ -937,7 +953,10 @@ impl Virtio {
         }
         #[cfg(not(feature = "testing"))]
         let _ = disk;
+        let began = profile::start();
         let batch = flight.take_answered();
+        profile::count(profile::COMPLETIONS);
+        profile::add(profile::COMPLETED, batch.len() as u64);
         let id = batch[0].id;
         debug_assert!(
             batch.iter().all(|r| r.id == id),
@@ -977,6 +996,7 @@ impl Virtio {
             }
             self.retire_window(id, &used, granted, snapshot);
         }
+        profile::since(profile::COMPLETE_NS, began);
         Ok(true)
     }
     /// Retire one completion window's requests. A granted window advances the used index, may
