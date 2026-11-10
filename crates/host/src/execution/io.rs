@@ -119,6 +119,13 @@ pub struct WindowCounts {
     /// Granted windows whose writes overlapped a page ever walked as a page table.
     #[serde(rename = "table_windows")]
     pub table_writes: u64,
+    /// Summed microseconds from announcing granted windows to releasing them: an upper bound on
+    /// the time each running vCPU spent paused by them.
+    pub window_us: u64,
+    /// The part of `window_us` spent waiting for acknowledgements (kicks and resident checkpoints).
+    pub admit_us: u64,
+    /// Summed microseconds granted windows waited for the epoch lock held by another device's window.
+    pub lock_wait_us: u64,
 }
 impl WindowCounts {
     /// One `io {...}` JSON line for [`crate::perf::line`].
@@ -133,6 +140,9 @@ pub(crate) struct WindowCounters {
     granted: AtomicU64,
     writes: AtomicU64,
     table_writes: AtomicU64,
+    window_ns: AtomicU64,
+    admit_ns: AtomicU64,
+    lock_wait_ns: AtomicU64,
 }
 
 /// Read-only test observation, not a transactionally consistent snapshot of the words.
@@ -220,6 +230,9 @@ impl Backing {
             granted: counters.granted.load(Relaxed),
             writes: counters.writes.load(Relaxed),
             table_writes: counters.table_writes.load(Relaxed),
+            window_us: counters.window_ns.load(Relaxed) / 1000,
+            admit_us: counters.admit_ns.load(Relaxed) / 1000,
+            lock_wait_us: counters.lock_wait_ns.load(Relaxed) / 1000,
         }
     }
     /// Copy a bounded ordered batch after every configured vCPU reaches a resident safe boundary.
@@ -293,7 +306,9 @@ impl Backing {
                 Err("I/O window canceled".into())
             };
         }
+        let locking = Instant::now();
         let mut sequence = self.lock_epoch(permit, deadline)?;
+        let announced = Instant::now();
         let epoch = sequence
             .checked_add(1)
             .ok_or("I/O window epoch exhausted")?;
@@ -306,6 +321,7 @@ impl Backing {
         // Pair with HLT withdrawal: either we see it leave, or it sees our request before RAM access.
         unsafe { std::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
         self.admit(epoch, permit, deadline, kick)?;
+        let admitted = Instant::now();
         #[cfg(feature = "io-test-hooks")]
         super::io_test::point(&self.memory, cache::io_test::BEFORE_GRANT);
         if !permit.grant() {
@@ -336,6 +352,16 @@ impl Backing {
             }
         }
         drop(release);
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        counters
+            .window_ns
+            .fetch_add(ns(announced.elapsed()), Relaxed);
+        counters
+            .admit_ns
+            .fetch_add(ns(admitted - announced), Relaxed);
+        counters
+            .lock_wait_ns
+            .fetch_add(ns(announced - locking), Relaxed);
         Ok(())
     }
 
@@ -766,25 +792,28 @@ mod tests {
             4,
             "ordinary write must not advance table epoch"
         );
-        let counts = WindowCounts {
-            granted: 5,
-            writes: 4,
-            table_writes: 2,
-        };
+        let counts = b.io_window_counts();
         assert_eq!(
-            b.io_window_counts(),
-            counts,
+            (counts.granted, counts.writes, counts.table_writes),
+            (5, 4, 2),
             "only page-table overlaps count"
         );
-        let old = format!(
-            "io {{\"windows\":{},\"write_windows\":{},\"table_windows\":{}}}",
-            counts.granted, counts.writes, counts.table_writes
+        assert!(
+            counts.admit_us <= counts.window_us,
+            "admission is part of the window"
         );
-        assert_eq!(
-            counts.perf_line(),
-            old,
-            "the perf line is unchanged byte for byte"
-        );
+        let line: serde_json::Value =
+            serde_json::from_str(counts.perf_line().strip_prefix("io ").unwrap()).unwrap();
+        for key in [
+            "windows",
+            "write_windows",
+            "table_windows",
+            "window_us",
+            "admit_us",
+            "lock_wait_us",
+        ] {
+            assert!(line[key].is_u64(), "{key} in the perf line");
+        }
     }
 
     #[test]
