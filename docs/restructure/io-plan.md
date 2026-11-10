@@ -864,7 +864,8 @@ both pay.
 **Flush.** Virtio 1.2 §5.2.6 requires a flush to cover writes that had *completed* before it.
 A completed write's `pwrite` has returned, and the sync (`fsync` since November 10, see the
 durability paragraph under IO3) covers everything the file has written, so a FLUSH runs on any
-worker with no ordering against other requests, and later requests never wait for it. (Linux already waits for data completion before issuing its flush.)
+worker with no ordering against other requests, and later requests never wait for it. (Linux
+already waits for data completion before issuing its flush.)
 Writes without negotiated FLUSH stay write-through.
 
 **Tests and acceptance.** Host tests for admission bounds, out-of-order completion and used
