@@ -116,7 +116,7 @@ impl PacketPort {
         s.received = Some((id, packet));
         s.notified[0] = true;
         device.busy(&mut s);
-        device.wake.notify_one();
+        device.wake.ring();
         true
     }
     /// Attempt exactly one queued send outside every VM lock and RAM window. The callback owns
@@ -149,7 +149,7 @@ impl PacketPort {
             if !s.stopped && !s.drained && s.backend_error.is_none() {
                 s.backend_error = Some(error);
             }
-            device.wake.notify_all();
+            device.wake.ring();
         }
     }
 }
@@ -239,12 +239,10 @@ impl Virtio {
         } else {
             Vec::with_capacity(3)
         };
-        Ok(
-            match self.complete(guest, chain, len as u32, writes, None)? {
-                Some(_) => Request::Committed { pending: true },
-                None => Request::Canceled,
-            },
-        )
+        Ok(match self.complete(guest, chain, len as u32, writes)? {
+            true => Request::Committed { pending: true },
+            false => Request::Canceled,
+        })
     }
     /// Offer one TX packet to the backend while `id` is current: Some(true) if taken,
     /// Some(false) if the one slot is full (bounded loss, never a retained retry), None if reset.
@@ -375,8 +373,8 @@ mod tests {
         let id = d.lock().identity(1);
         {
             let mut s = d.lock();
-            s.active = Some(id);
-            s.permit = Some(permit.clone());
+            s.in_flight.push(id);
+            s.permit = Some((id, permit.clone()));
             s.interrupt = 1;
             s.notified[1] = true;
         }
@@ -392,7 +390,7 @@ mod tests {
         assert_eq!(d.lock().queues[0].desc, 0xa000);
         // The active request and its permit remain owned by TX until TX itself is disabled.
         assert!(std::sync::Arc::ptr_eq(
-            d.lock().permit.as_ref().unwrap(),
+            &d.lock().permit.as_ref().unwrap().1,
             &permit
         ));
         write(&d, reg::QUEUE_SEL, 1);
@@ -404,7 +402,7 @@ mod tests {
         assert!(permit.cancel());
         {
             let mut s = d.lock();
-            s.active = None;
+            s.in_flight.clear();
             s.permit = None;
             d.retire_reset(&mut s);
         }
@@ -447,18 +445,18 @@ mod tests {
         let (d, p) = device();
         p.fail("lost interface".into());
         assert!(!d.quiesce().unwrap());
-        assert!(d.drain(None, &AtomicBool::new(false)).is_err());
+        assert!(d.drain().is_err());
         assert!(!d.lock().drained);
         d.stop();
         let (d, p) = device();
         assert!(!d.quiesce().unwrap());
         p.fail("lost during drain".into());
-        assert!(d.drain(None, &AtomicBool::new(false)).is_err());
+        assert!(d.drain().is_err());
         assert!(!d.lock().drained);
         d.stop();
         let (d, p) = device();
         d.quiesce().unwrap();
-        d.drain(None, &AtomicBool::new(false)).unwrap();
+        d.drain().unwrap();
         assert!(p.closed());
         drop(p);
         assert!(d.lock().backend_error.is_none());
@@ -474,7 +472,7 @@ mod tests {
         assert!(d.lock().busy.is_none());
         assert_eq!(d.irqs.live(), 1);
         d.quiesce().unwrap();
-        d.drain(None, &AtomicBool::new(false)).unwrap();
+        d.drain().unwrap();
         assert!(p.closed());
         assert_eq!(d.irqs.live(), 1);
         drop(p);

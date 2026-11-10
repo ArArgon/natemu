@@ -1,6 +1,7 @@
 //! Test-driver-only backend schedules. Observations never contain guest pointers or alter replies.
 //! `calls` counts wrapper attempts, including injected errors without a syscall. The held barrier
-//! is before entering a native call. `commit` records RAM publication, before IRQ/index retirement.
+//! is before entering a native call. `commit` records one request's RAM publication, before
+//! IRQ/index retirement.
 use super::{
     block::{Calls, Native},
     *,
@@ -25,7 +26,16 @@ enum Mode {
     /// The first read (write) is short, the second fails with EIO.
     ReadError,
     WriteError,
+    /// Hold the first disk call at file offset 0 until another request has been published.
+    OutOfOrder,
+    /// Hold every disk call at file offset 0 until a device reset is deferred behind them.
+    ResetMixed,
+    /// Hold the owner's first completion until `BATCH` requests are answered, then until a device
+    /// reset is deferred behind them (the window covering them is then never granted).
+    CancelBatch,
 }
+/// The requests a CancelBatch completion covers.
+const BATCH: usize = 4;
 impl Mode {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -39,21 +49,24 @@ impl Mode {
             "power-sync-error" => Self::PowerSyncError,
             "read-error" => Self::ReadError,
             "write-error" => Self::WriteError,
+            "out-of-order" => Self::OutOfOrder,
+            "reset-mixed" => Self::ResetMixed,
+            "cancel-batch" => Self::CancelBatch,
             _ => return None,
         })
     }
     fn repeated(self) -> bool {
         matches!(self, Self::CycleReset | Self::CycleDisable)
     }
-    fn holds(self) -> bool {
-        !matches!(self, Self::Normal | Self::ReadError | Self::WriteError)
-    }
     /// Whether event `name` releases this schedule's hold.
     fn releases(self, name: &str) -> bool {
         match self {
-            Self::HoldReset | Self::CycleReset => name == "reset-deferred",
+            Self::HoldReset | Self::CycleReset | Self::ResetMixed | Self::CancelBatch => {
+                name == "reset-deferred"
+            }
             Self::HoldDisable | Self::CycleDisable => name == "disable-deferred",
             Self::HoldPower | Self::PowerSyncError => name == "power-poll",
+            Self::OutOfOrder => name == "commit",
             _ => false,
         }
     }
@@ -63,6 +76,8 @@ impl Mode {
 pub struct Control {
     mode: Mode,
     entered: AtomicBool,
+    /// The one held call (or completion) of a single-hold schedule was claimed.
+    claimed: AtomicBool,
     power: AtomicBool,
     peer: AtomicBool,
     calls: AtomicUsize,
@@ -76,6 +91,7 @@ impl Control {
         Ok(Arc::new(Self {
             mode,
             entered: AtomicBool::new(false),
+            claimed: AtomicBool::new(false),
             power: AtomicBool::new(false),
             peer: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
@@ -108,22 +124,34 @@ impl Control {
             self.wake.notify_all();
         }
     }
-    /// Before a native call: wait (at most 3 s) for this schedule's release event, if it holds.
-    fn hold(&self) -> std::io::Result<()> {
-        if self.mode.repeated() {
+    /// Whether this schedule holds a disk call at `offset`.
+    fn holds_call(&self, offset: u64) -> bool {
+        match self.mode {
+            Mode::Normal | Mode::ReadError | Mode::WriteError | Mode::CancelBatch => false,
             // Alternate held old-generation reads and ordinary fresh-generation recovery reads.
-            if self.calls.load(SeqCst) % 2 == 1 {
-                return Ok(());
+            Mode::CycleReset | Mode::CycleDisable => self.calls.load(SeqCst) % 2 == 0,
+            Mode::ResetMixed => offset == 0,
+            Mode::OutOfOrder => offset == 0 && !self.claimed.swap(true, SeqCst),
+            _ => !self.claimed.swap(true, SeqCst),
+        }
+    }
+    /// Before a native call: wait (at most 3 s) for this schedule's release event, if it holds.
+    fn hold(&self, offset: u64) -> std::io::Result<()> {
+        if !self.holds_call(offset) {
+            // A cycle's recovery call leaves `entered` to the held call's retirement.
+            if !self.mode.repeated() && self.mode != Mode::CancelBatch {
+                self.entered.store(true, SeqCst);
             }
+            return Ok(());
+        }
+        if self.mode.repeated() {
             self.gate.lock().unwrap_or_else(|e| e.into_inner()).0 = false;
-        } else if self.entered.load(SeqCst) {
-            return Ok(());
         }
-        if !self.mode.holds() {
-            self.entered.store(true, SeqCst);
-            return Ok(());
-        }
-        self.event("backend-held");
+        self.wait("backend")
+    }
+    /// Record `{what}-held`, publish `entered`, then wait (at most 3 s) for the release.
+    fn wait(&self, what: &str) -> std::io::Result<()> {
+        self.event(&format!("{what}-held"));
         self.entered.store(true, SeqCst);
         let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         let (gate, _) = self
@@ -133,7 +161,7 @@ impl Control {
         let released = gate.0;
         drop(gate);
         if released {
-            self.event("backend-released");
+            self.event(&format!("{what}-released"));
             Ok(())
         } else {
             self.event("barrier-timeout");
@@ -142,6 +170,20 @@ impl Control {
                 "test barrier not released",
             ))
         }
+    }
+    /// Before the owner completes `answered` requests: whether it may now. CancelBatch defers
+    /// until `BATCH` are answered, then holds that one completion until its release.
+    pub(super) fn completion_allowed(&self, answered: usize) -> bool {
+        if self.mode != Mode::CancelBatch || self.claimed.load(SeqCst) {
+            return true;
+        }
+        if answered < BATCH {
+            return false;
+        }
+        self.claimed.store(true, SeqCst);
+        // A timeout is in the trace; the completion then proceeds.
+        let _ = self.wait("batch");
+        true
     }
     /// The schedule's report: whether a call entered, the calls and the event trace.
     pub fn report(&self) -> ControlReport {
@@ -164,13 +206,21 @@ pub struct ControlReport {
     events: Vec<String>,
 }
 pub(super) struct Controlled {
-    pub native: Native,
-    pub control: Arc<Control>,
-    pub phase: usize,
+    native: Native,
+    control: Arc<Control>,
+    /// Calls of a ReadError/WriteError schedule so far.
+    phase: AtomicUsize,
 }
 impl Controlled {
-    fn begin(&mut self, write: bool, offset: u64, len: usize) -> std::io::Result<usize> {
-        self.control.hold()?;
+    pub fn new(native: Native, control: Arc<Control>) -> Self {
+        Self {
+            native,
+            control,
+            phase: AtomicUsize::new(0),
+        }
+    }
+    fn begin(&self, write: bool, offset: u64, len: usize) -> std::io::Result<usize> {
+        self.control.hold(offset)?;
         self.control.calls.fetch_add(1, SeqCst);
         self.control.event(&format!(
             "{}:{offset}:{len}",
@@ -182,20 +232,20 @@ impl Controlled {
             Mode::ReadError
         };
         if self.control.mode == scripted {
-            self.phase += 1;
-            if self.phase == 1 {
-                return Ok(len.min(256));
-            }
-            if self.phase == 2 {
-                self.control.event("injected-eio");
-                return Err(std::io::Error::from_raw_os_error(5));
+            match self.phase.fetch_add(1, SeqCst) + 1 {
+                1 => return Ok(len.min(256)),
+                2 => {
+                    self.control.event("injected-eio");
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+                _ => {}
             }
         }
         Ok(len)
     }
 }
 impl Calls for Controlled {
-    fn read(&mut self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
         let len = self.begin(false, offset, bytes.len())?;
         let result = self.native.read(&mut bytes[..len], offset);
         if self.control.mode.repeated() {
@@ -204,13 +254,13 @@ impl Calls for Controlled {
         self.control.event(&format!("read-result:{result:?}"));
         result
     }
-    fn write(&mut self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+    fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
         let len = self.begin(true, offset, bytes.len())?;
         let result = self.native.write(&bytes[..len], offset);
         self.control.event(&format!("write-result:{result:?}"));
         result
     }
-    fn sync(&mut self) -> std::io::Result<()> {
+    fn sync(&self) -> std::io::Result<()> {
         self.control.event("sync-enter");
         let result = if self.control.mode == Mode::PowerSyncError {
             Err(std::io::Error::from_raw_os_error(5))

@@ -1,6 +1,6 @@
-//! Modern virtio-MMIO devices (split rings, one active guest request at a time). Every guest buffer
-//! is copied into owned storage inside a short copy window ([`crate::execution::io`]); no backend
-//! call holds a window or a guest address.
+//! Modern virtio-MMIO devices (split rings; several block requests in flight, one entropy or
+//! network request). Every guest buffer is copied into owned storage inside a short copy window
+//! ([`crate::execution::io`]); no backend call holds a window or a guest address.
 //!
 //! Lifecycle: create the device before boot, run its owner ([`Virtio::run`]) on its own thread
 //! alongside the vCPU owners, call [`Virtio::stop`], and join the owner before detaching IRQs or
@@ -17,14 +17,16 @@ use crate::{
     devices::{self, Access},
     execution::{
         Backing, Stops,
-        io::{CopyPermit, Transfer},
+        io::{CopyPermit, MAX_BYTES, MAX_SPANS, Transfer},
     },
     irq::{Busy, Irqs},
     vm::Machine,
 };
+use natemu_abi::guest_memory::GuestRam;
 use queue::{Queue, Snapshot};
 use std::{
     collections::VecDeque,
+    ops::Range,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering::SeqCst},
@@ -161,20 +163,22 @@ struct State {
     generation: u64,
     /// Per-queue work flag: a guest notification, a packet arrival, or work left after a completion.
     notified: [bool; 2],
-    /// The request the owner is processing.
-    active: Option<Identity>,
+    /// The incarnation of every admitted request not yet retired (block: up to its in-flight
+    /// bound; entropy and network: at most one). A reset retires once none of its own remain.
+    in_flight: Vec<Identity>,
     /// Where the owner's round-robin scan of `notified` starts.
     cursor: usize,
     /// Power-off asked the device to drain; guest writes other than InterruptACK are ignored.
     quiescing: bool,
     /// The drain finished successfully.
     drained: bool,
-    /// An accepted reset waiting for the active request to retire.
+    /// An accepted reset waiting for its in-flight requests and open window to retire.
     closing: Option<Reset>,
     /// Admission closed for good (the VM is ending).
     stopped: bool,
-    /// The active request's copy permit; reset and stop cancel it.
-    permit: Option<Arc<CopyPermit>>,
+    /// The owner's pending or open copy window and the incarnation it copies for; reset and
+    /// stop cancel it.
+    permit: Option<(Identity, Arc<CopyPermit>)>,
     /// Deferred register accesses, answered in arrival order.
     waiting: VecDeque<Waiting>,
     /// The last deferred-access token issued.
@@ -212,9 +216,27 @@ impl State {
     fn accepting(&self, queue: usize) -> bool {
         !self.quiescing && self.queues[queue].ready && self.driver_ready()
     }
-    /// The owner is processing a request from `queue`.
+    /// The owner holds a request from `queue`.
     fn queue_active(&self, queue: usize) -> bool {
-        self.active.is_some_and(|id| id.queue == queue)
+        self.in_flight.iter().any(|id| id.queue == queue)
+    }
+    /// A request or the open copy window still belongs to an incarnation `reset` closes.
+    fn holds(&self, reset: Reset) -> bool {
+        self.in_flight.iter().any(|&id| reset.affects(id))
+            || self
+                .permit
+                .as_ref()
+                .is_some_and(|(id, _)| reset.affects(*id))
+    }
+    /// Forget one retired request of incarnation `id`.
+    fn retire(&mut self, id: Identity) {
+        let i = self.in_flight.iter().position(|x| *x == id);
+        self.in_flight
+            .swap_remove(i.expect("retired request was in flight"));
+    }
+    /// The owner may take new requests: no reset closing and no register access waiting.
+    fn admission_open(&self) -> bool {
+        self.closing.is_none() && self.waiting.is_empty()
     }
     /// Another access may wait: each vCPU has at most one outstanding access, the queue is
     /// bounded, and tokens never wrap.
@@ -231,7 +253,7 @@ impl State {
 pub struct Virtio {
     profile: Profile,
     state: Mutex<State>,
-    wake: Condvar,
+    wake: Arc<Bell>,
     irqs: Irqs,
     gsi: usize,
     running: AtomicBool,
@@ -286,6 +308,29 @@ impl Profile {
     }
 }
 
+/// The owner's one wake source: guest notifications, resets, power drain, stop and disk
+/// workers ring it. A ring between the owner's check and its wait is not lost.
+#[derive(Default)]
+pub(super) struct Bell {
+    rung: Mutex<bool>,
+    signal: Condvar,
+}
+impl Bell {
+    pub fn ring(&self) {
+        *self.rung.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.signal.notify_one();
+    }
+    /// Wait for a ring (at most `timeout`) and consume it.
+    pub fn wait(&self, timeout: Duration) {
+        let rung = self.rung.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut rung, _) = self
+            .signal
+            .wait_timeout_while(rung, timeout, |r| !*r)
+            .unwrap_or_else(|e| e.into_inner());
+        *rung = false;
+    }
+}
+
 /// What a request needs to open copy windows on the running VM.
 #[derive(Clone, Copy)]
 struct Guest<'a> {
@@ -302,48 +347,119 @@ struct Chain<'c> {
     descriptors: &'c [Descriptor],
 }
 
-/// A used-ring element and index for one chain, and room to read the available ring's flags
-/// and index back after publishing them.
-struct UsedEntry {
-    element: [u8; 8],
+/// The used-ring publication of completed chains: their elements in consecutive used slots
+/// from `next_used`, one used index after them all, and room to read the available ring's
+/// flags and index back after publishing them.
+struct Used {
+    elements: Vec<[u8; 8]>,
     index: [u8; 2],
     avail: [u8; 4],
 }
-impl UsedEntry {
-    fn new(chain: &Chain<'_>, len: u32) -> Self {
-        let mut element = [0; 8];
-        element[..4].copy_from_slice(&u32::from(chain.head).to_le_bytes());
-        element[4..].copy_from_slice(&len.to_le_bytes());
+impl Used {
+    /// `chains` are `(head, used length)` pairs in the order they take used slots.
+    fn new(q: Queue, chains: impl IntoIterator<Item = (u16, u32)>) -> Self {
+        let elements: Vec<[u8; 8]> = chains
+            .into_iter()
+            .map(|(head, len)| {
+                let mut element = [0; 8];
+                element[..4].copy_from_slice(&u32::from(head).to_le_bytes());
+                element[4..].copy_from_slice(&len.to_le_bytes());
+                element
+            })
+            .collect();
         Self {
-            element,
-            index: chain.queue.next_used.wrapping_add(1).to_le_bytes(),
+            index: q
+                .next_used
+                .wrapping_add(elements.len() as u16)
+                .to_le_bytes(),
+            elements,
             avail: [0; 4],
         }
     }
-    /// Append the element, then the used index, then a read of the available ring's flags and
+    /// The number of chains published.
+    fn count(&self) -> u16 {
+        self.elements.len() as u16
+    }
+    /// Append the elements, then the used index, then a read of the available ring's flags and
     /// index. Reading after publication sees suppression and newly published work even when a
     /// guest buffer aliases ring metadata.
     fn publish<'a>(&'a mut self, q: Queue, transfers: &mut Vec<Transfer<'a>>) {
-        transfers.push(Transfer::Write {
-            gpa: q.used + 4 + u64::from(q.next_used % q.size) * 8,
-            bytes: &self.element,
-        });
+        let Self {
+            elements,
+            index,
+            avail,
+        } = self;
+        for (i, element) in elements.iter().enumerate() {
+            let slot = q.next_used.wrapping_add(i as u16) % q.size;
+            transfers.push(Transfer::Write {
+                gpa: q.used + 4 + u64::from(slot) * 8,
+                bytes: element,
+            });
+        }
         transfers.push(Transfer::Write {
             gpa: q.used + 2,
-            bytes: &self.index,
+            bytes: index,
         });
         transfers.push(Transfer::Read {
             gpa: q.avail,
-            bytes: &mut self.avail,
+            bytes: avail,
         });
     }
     fn interrupt_wanted(&self) -> bool {
         u16::from_le_bytes([self.avail[0], self.avail[1]]) & AVAIL_NO_INTERRUPT == 0
     }
-    /// The driver published more chains than the one just completed.
-    fn more_published(&self, q: Queue) -> bool {
-        u16::from_le_bytes([self.avail[2], self.avail[3]]) != q.next_avail.wrapping_add(1)
+    /// The driver's available index, read after publication.
+    fn avail_index(&self) -> u16 {
+        u16::from_le_bytes([self.avail[2], self.avail[3]])
     }
+}
+
+/// One request's (or one window's fixed) share of a copy window's bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct Cost {
+    spans: usize,
+    bytes: usize,
+}
+impl Cost {
+    fn of(transfers: &[Transfer<'_>]) -> Self {
+        let bytes = transfers.iter().map(|t| match t {
+            Transfer::Read { bytes, .. } => bytes.len(),
+            Transfer::Write { bytes, .. } => bytes.len(),
+        });
+        Self {
+            spans: transfers.len(),
+            bytes: bytes.sum(),
+        }
+    }
+    fn plus(self, other: Self) -> Self {
+        Self {
+            spans: self.spans + other.spans,
+            bytes: self.bytes + other.bytes,
+        }
+    }
+    /// Within one window's span and byte bounds.
+    fn fits(self) -> bool {
+        self.spans <= MAX_SPANS && self.bytes <= MAX_BYTES
+    }
+}
+
+/// Split consecutive requests into as few copy windows as the window bounds allow, each window
+/// holding whole requests plus `overhead`. A request that does not fit alone still gets its own
+/// window (its copy then fails); callers bound each request well below the window bounds.
+fn pack(costs: &[Cost], overhead: Cost) -> Vec<Range<usize>> {
+    let mut windows = Vec::new();
+    let (mut start, mut total) = (0, overhead);
+    for (i, cost) in costs.iter().enumerate() {
+        if i > start && !total.plus(*cost).fits() {
+            windows.push(start..i);
+            (start, total) = (i, overhead);
+        }
+        total = total.plus(*cost);
+    }
+    if start < costs.len() {
+        windows.push(start..costs.len());
+    }
+    windows
 }
 
 /// Read guest extents back to back into `bytes`, which must be exactly their total length.
@@ -375,6 +491,13 @@ fn scatter<'a>(descriptors: &[Descriptor], bytes: &'a [u8]) -> Vec<Transfer<'a>>
         }
     }
     writes
+}
+
+/// Every nonempty descriptor lies wholly in guest RAM (checked only; nothing is dereferenced).
+fn descriptors_in(ram: &GuestRam, descriptors: &[Descriptor]) -> bool {
+    descriptors
+        .iter()
+        .all(|d| d.len() == 0 || ram.range(d.addr().0, d.len().into()).is_some())
 }
 
 /// Replace the low (`high` false) or high 32 bits of `word`.
@@ -474,7 +597,7 @@ impl Virtio {
         Arc::new(Self {
             profile,
             state: Mutex::new(State::default()),
-            wake: Condvar::new(),
+            wake: Arc::default(),
             irqs,
             gsi,
             running: AtomicBool::new(false),
@@ -523,10 +646,10 @@ impl Virtio {
         s.stopped = true;
         s.notified = [false; 2];
         s.received = None;
-        if let Some(p) = &s.permit {
+        if let Some((_, p)) = &s.permit {
             p.cancel();
         }
-        self.wake.notify_all();
+        self.wake.ring();
     }
     /// Close admission for power-off; true once the owner has drained.
     fn quiesce(&self) -> Result<bool> {
@@ -534,16 +657,16 @@ impl Virtio {
         s.quiescing = true;
         s.notified = [false; 2];
         s.received = None;
-        self.wake.notify_all();
+        self.wake.ring();
         Ok(s.drained)
     }
-    /// Complete a closing reset once no affected request is active: advance the incarnation and
-    /// clear what the reset clears.
+    /// Complete a closing reset once none of its requests or windows remain: advance the
+    /// incarnation and clear what the reset clears.
     fn retire_reset(&self, s: &mut State) {
         let Some(reset) = s.closing else {
             return;
         };
-        if s.active.is_some_and(|id| reset.affects(id)) {
+        if s.holds(reset) {
             return;
         }
         s.closing = None;
@@ -581,25 +704,29 @@ impl Virtio {
             }
         }
         self.irq(s);
-        if !s.pending() && s.active.is_none() {
+        self.settle(s);
+    }
+    /// Release the busy guard once no work is notified and nothing is in flight.
+    fn settle(&self, s: &mut State) {
+        if !s.pending() && s.in_flight.is_empty() {
             s.busy = None;
         }
     }
-    /// Accept a reset: cancel an affected request's ungranted copy and retire now if nothing is
-    /// active, otherwise defer the access until the owner retires the request.
+    /// Accept a reset: cancel an affected ungranted copy and retire now if nothing affected is in
+    /// flight, otherwise defer the access until the owner retires those requests.
     fn reset(&self, s: &mut State, reset: Reset) -> Access {
         s.closing = Some(reset);
         match reset {
             Reset::Device => s.notified = [false; 2],
             Reset::Queue(i) => s.notified[i] = false,
         }
-        if s.active.is_some_and(|id| reset.affects(id)) {
-            if let Some(p) = &s.permit {
+        if let Some((id, p)) = &s.permit {
+            if reset.affects(*id) {
                 p.cancel();
             }
         }
         self.retire_reset(s);
-        self.wake.notify_all();
+        self.wake.ring();
         if s.closing.is_some() {
             Access::Deferred(0)
         } else {
@@ -729,7 +856,7 @@ impl Virtio {
         }
         s.notified[queue] = true;
         self.busy(s);
-        self.wake.notify_one();
+        self.wake.ring();
     }
     /// Status: 0 resets the device; anything else must follow the initialization order.
     fn write_status(&self, s: &mut State, value: u32) -> Access {
@@ -835,7 +962,7 @@ impl Virtio {
             Access::Deferred(token)
         } else {
             s.waiting.pop_front();
-            self.wake.notify_one();
+            self.wake.ring();
             result
         }
     }
@@ -851,7 +978,7 @@ impl Virtio {
             if !s.current(id) {
                 return Ok(false);
             }
-            s.permit = Some(permit.clone());
+            s.permit = Some((id, permit.clone()));
         }
         let copied = guest.backing.copy_guest_with_permit(
             guest.machine,
@@ -862,6 +989,7 @@ impl Virtio {
         );
         let mut s = self.lock();
         s.permit = None;
+        self.retire_reset(&mut s);
         match copied {
             // Even a reset that lost the grant must retire this committed effect.
             Ok(()) => Ok(true),
@@ -870,41 +998,33 @@ impl Virtio {
         }
     }
     /// Copy `data` and the chain's used-ring publication in one window, then raise the used-buffer
-    /// interrupt unless the driver suppressed it or a reset closed the incarnation (ACK, reset and
-    /// level publication share the state lock). None when the window was canceled.
-    ///
-    /// With `refresh`, the same window then reads the queue's metadata into that snapshot, after
-    /// the publication, so the next request needs no metadata window of its own. It counts as
-    /// captured in the chain's incarnation only when the window was granted.
+    /// interrupt. False when the window was canceled.
     fn complete(
         &self,
         guest: Guest<'_>,
         chain: &Chain<'_>,
         len: u32,
         data: Vec<Transfer<'_>>,
-        mut refresh: Option<&mut Snapshot>,
-    ) -> Result<Option<UsedEntry>> {
-        let mut used = UsedEntry::new(chain, len);
+    ) -> Result<bool> {
+        let mut used = Used::new(chain.queue, [(chain.head, len)]);
         let mut transfers = data;
         used.publish(chain.queue, &mut transfers);
-        if let Some(snapshot) = refresh.as_deref_mut() {
-            transfers.extend(snapshot.reads(chain.queue));
-        }
         if !self.copy(guest, chain.id, &mut transfers)? {
-            return Ok(None);
+            return Ok(false);
         }
         drop(transfers);
-        if let Some(snapshot) = refresh {
-            snapshot.captured(chain.id);
-        }
         #[cfg(feature = "testing")]
         self.observe("commit");
-        let mut s = self.lock();
-        if s.current(chain.id) && used.interrupt_wanted() {
+        self.interrupt(&mut self.lock(), chain.id, &used);
+        Ok(true)
+    }
+    /// After a granted publication: raise the used-buffer interrupt unless the driver suppressed
+    /// it or a reset closed the incarnation (ACK, reset and level publication share the lock).
+    fn interrupt(&self, s: &mut State, id: Identity, used: &Used) {
+        if s.current(id) && used.interrupt_wanted() {
             s.interrupt |= USED_BUFFER;
-            self.irq(&s);
+            self.irq(s);
         }
-        Ok(Some(used))
     }
     /// Run once on an independent scoped host thread. Cancellation/stop closes admission; the
     /// method joins normal disk shutdown before returning. Fatal disk timeout/cancellation may
@@ -931,7 +1051,7 @@ impl Virtio {
         }
         let mut s = self.lock();
         s.stopped = !s.drained;
-        s.active = None;
+        s.in_flight.clear();
         s.permit = None;
         s.notified = [false; 2];
         s.busy = None;
@@ -939,19 +1059,10 @@ impl Virtio {
         self.irq(&s);
         result
     }
-    /// Power-off drain: a final full sync of the disk lane and its join, then a quiet device.
-    /// A network backend failure cannot become a successful power-off.
-    fn drain(&self, lane: Option<block::Lane>, cancel: &AtomicBool) -> Result<()> {
-        if let Some(mut disk) = lane {
-            disk.submit(block::Job::Flush)?;
-            let done = disk.wait(|| cancel.load(SeqCst) || self.lock().stopped)?;
-            if let Some(error) = done.error {
-                return Err(format!("disk shutdown full-sync: {error}"));
-            }
-            disk.finish()?;
-            #[cfg(feature = "testing")]
-            self.observe("lane-joined");
-        }
+    /// The end of a power-off drain, after the backend's own (block: the final full sync and the
+    /// workers' join): a quiet device. A network backend failure cannot become a successful
+    /// power-off.
+    fn drain(&self) -> Result<()> {
         let mut s = self.lock();
         if let Some(error) = &s.backend_error {
             return Err(format!("network shutdown: {error}"));
@@ -963,12 +1074,12 @@ impl Virtio {
         s.drained = true;
         Ok(())
     }
+    /// Entropy and network serve one request at a time; block has its own owner loop.
     fn owner(&self, guest: Guest<'_>, cancel: &AtomicBool) -> Result<()> {
+        if let Profile::Block(disk) = &self.profile {
+            return self.block_owner(guest, disk, cancel);
+        }
         let mut snapshot = Snapshot::new(self.profile.queue_max())?;
-        let mut lane = match &self.profile {
-            Profile::Entropy | Profile::Network(_) => None,
-            Profile::Block(disk) => Some(disk.start()?),
-        };
         loop {
             let (queue, id, received) = match self.next_work(cancel)? {
                 Work::Request {
@@ -976,17 +1087,17 @@ impl Virtio {
                     id,
                     received,
                 } => (queue, id, received),
-                Work::Stop => return lane.map_or(Ok(()), block::Lane::finish),
-                Work::Drain => return self.drain(lane, cancel),
+                Work::Stop => return Ok(()),
+                Work::Drain => return self.drain(),
             };
-            let result = self.request(guest, &mut snapshot, queue, id, &mut lane, received, cancel);
+            let result = self.request(guest, &mut snapshot, queue, id, received, cancel);
             self.finish_request(result, &mut snapshot, queue, id)?;
         }
     }
     /// Wait until there is work, a drain, or a stop.
     fn next_work(&self, cancel: &AtomicBool) -> Result<Work> {
-        let mut s = self.lock();
         loop {
+            let mut s = self.lock();
             if s.stopped || cancel.load(SeqCst) {
                 return Ok(Work::Stop);
             }
@@ -999,17 +1110,14 @@ impl Virtio {
             if let Some(work) = self.admit(&mut s) {
                 return Ok(work);
             }
-            s = self
-                .wake
-                .wait_timeout(s, Duration::from_millis(10))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
+            drop(s);
+            self.wake.wait(Duration::from_millis(10));
         }
     }
     /// Take the next notified queue, round-robin, unless a reset or a deferred access must go
     /// first. The taken queue becomes active; RX takes the packet tagged with its incarnation.
     fn admit(&self, s: &mut State) -> Option<Work> {
-        if s.closing.is_some() || !s.waiting.is_empty() {
+        if !s.admission_open() {
             return None;
         }
         let count = self.profile.queue_count();
@@ -1018,7 +1126,7 @@ impl Virtio {
             .find(|&i| s.notified[i])?;
         s.notified[i] = false;
         let id = s.identity(i);
-        s.active = Some(id);
+        s.in_flight.push(id);
         s.cursor = (i + 1) % count;
         let received = if i == 0 {
             s.received
@@ -1034,8 +1142,8 @@ impl Virtio {
             received,
         })
     }
-    /// Retire the active request: advance the ring indices or fail the device, then complete
-    /// a reset waiting for it.
+    /// Retire the one entropy or network request: advance the ring indices or fail the device,
+    /// then complete a reset waiting for it.
     fn finish_request(
         &self,
         result: Result<Request>,
@@ -1044,7 +1152,7 @@ impl Virtio {
         id: Identity,
     ) -> Result<()> {
         let mut s = self.lock();
-        s.active = None;
+        s.retire(id);
         match result? {
             Request::Committed { pending } => self.retire_request(&mut s, snapshot, q, id, pending),
             Request::Invalid(reason) => {
@@ -1057,9 +1165,7 @@ impl Virtio {
             Request::Empty | Request::Canceled => snapshot.discard(),
         }
         self.retire_reset(&mut s);
-        if !s.pending() {
-            s.busy = None;
-        }
+        self.settle(&mut s);
         Ok(())
     }
     fn retire_request(
@@ -1086,20 +1192,15 @@ impl Virtio {
         snapshot: &mut Snapshot,
         q: Queue,
         id: Identity,
-        lane: &mut Option<block::Lane>,
         received: Option<net::Packet>,
         cancel: &AtomicBool,
     ) -> Result<Request> {
         if self.profile.is_rx(id.queue) && received.is_none() {
             return Ok(Request::Empty);
         }
-        if !q.valid(self.profile.queue_max()) {
-            return Ok(Request::Invalid("invalid queue geometry".into()));
-        }
         let ram = &guest.backing.ram;
-        // Validation only: no raw pointer is dereferenced or retained by this device.
-        if !q.rings_in(ram) {
-            return Ok(Request::Invalid("queue metadata outside RAM".into()));
+        if let Err(reason) = self.check_rings(q, ram) {
+            return Ok(Request::Invalid(reason));
         }
         if !snapshot.reusable(q, id) && !self.capture(guest, snapshot, q, id)? {
             return Ok(Request::Canceled);
@@ -1112,9 +1213,7 @@ impl Virtio {
             Ok(None) => return Ok(Request::Empty),
             Err(e) => return Ok(Request::Invalid(e)),
         };
-        let outside_ram =
-            |d: &Descriptor| d.len() != 0 && ram.range(d.addr().0, d.len().into()).is_none();
-        if descriptors.iter().any(outside_ram) {
+        if !descriptors_in(ram, &descriptors) {
             return Ok(Request::Invalid("descriptor outside RAM".into()));
         }
         let chain = Chain {
@@ -1124,13 +1223,21 @@ impl Virtio {
             descriptors: &descriptors,
         };
         match &self.profile {
-            Profile::Block(disk) => {
-                let lane = lane.as_mut().expect("a block owner starts its lane");
-                self.block_request(guest, &chain, disk, lane, snapshot, cancel)
-            }
+            Profile::Block(_) => unreachable!("block requests run in the block owner"),
             Profile::Network(network) => self.net_request(guest, &chain, network, received, cancel),
             Profile::Entropy => self.entropy_request(guest, &chain),
         }
+    }
+    /// A well-formed queue whose rings lie in guest RAM (validation only: no raw pointer is
+    /// dereferenced or retained by this device).
+    fn check_rings(&self, q: Queue, ram: &GuestRam) -> Result<()> {
+        if !q.valid(self.profile.queue_max()) {
+            return Err("invalid queue geometry".into());
+        }
+        if !q.rings_in(ram) {
+            return Err("queue metadata outside RAM".into());
+        }
+        Ok(())
     }
     /// Copy the descriptor table and available ring into `snapshot`. False if canceled.
     fn capture(
@@ -1166,12 +1273,10 @@ impl Virtio {
             return Ok(Request::Invalid(format!("getentropy: {error}")));
         }
         let writes = scatter(chain.descriptors, payload);
-        Ok(
-            match self.complete(guest, chain, len as u32, writes, None)? {
-                Some(_) => Request::Committed { pending: true },
-                None => Request::Canceled,
-            },
-        )
+        Ok(match self.complete(guest, chain, len as u32, writes)? {
+            true => Request::Committed { pending: true },
+            false => Request::Canceled,
+        })
     }
 }
 
@@ -1321,7 +1426,8 @@ mod tests {
         negotiated(&r);
         {
             let mut s = r.lock();
-            s.active = Some(s.identity(0));
+            let id = s.identity(0);
+            s.in_flight.push(id);
             s.notified[0] = true;
             s.queues[0].ready = true;
             s.status |= status::DRIVER_OK;
@@ -1331,7 +1437,7 @@ mod tests {
         write(&r, reg::STATUS, 0);
         write(&r, reg::QUEUE_READY, 0);
         let s = r.lock();
-        assert!(s.active.is_some() && s.queues[0].ready && s.quiescing);
+        assert!(!s.in_flight.is_empty() && s.queues[0].ready && s.quiescing);
         assert!(!s.pending() && s.closing.is_none() && !s.drained && !s.stopped);
         assert_ne!(s.status, 0);
     }
@@ -1376,9 +1482,10 @@ mod tests {
         let permit = Arc::new(CopyPermit::new());
         {
             let mut s = r.lock();
-            s.active = Some(s.identity(0));
+            let id = s.identity(0);
+            s.in_flight.push(id);
             s.queues[0].ready = true;
-            s.permit = Some(permit.clone());
+            s.permit = Some((id, permit.clone()));
         }
         let token = match r.access(0, reg::STATUS, 4, Some(0)) {
             Access::Deferred(t) => t,
@@ -1392,7 +1499,7 @@ mod tests {
         assert!(matches!(r.poll(0, token), Access::Deferred(t) if t == token));
         {
             let mut s = r.lock();
-            s.active = None;
+            s.in_flight.clear();
             s.permit = None;
             r.retire_reset(&mut s);
         }
@@ -1401,6 +1508,44 @@ mod tests {
         assert!(matches!(r.poll(1, read_token), Access::Completed(0)));
         assert!(matches!(r.poll(0, token), Access::Refused)); // no replay
         assert_eq!(r.lock().generation, 1);
+    }
+    #[test]
+    fn batches_split_into_windows_of_whole_requests_at_the_byte_and_span_bounds() {
+        let cost = |spans, bytes| Cost { spans, bytes };
+        let overhead = cost(2, 6);
+        assert!(pack(&[], overhead).is_empty());
+        // 32 full-size reads: 128 KiB + status + element each; seven fit 1 MiB.
+        let read = cost(34, 128 * 1024 + 9);
+        let windows = pack(&[read; 32], overhead);
+        assert_eq!(windows.first(), Some(&(0..7)));
+        assert_eq!(windows.len(), 5);
+        assert_eq!(windows.last(), Some(&(28..32)));
+        // Many small requests split at the span bound instead.
+        let small = cost(100, 512);
+        let per_window = (MAX_SPANS - 2) / 100;
+        assert_eq!(pack(&[small; 40], overhead)[0], 0..per_window);
+        // Exactly at both bounds still fits one window; one more byte or span splits.
+        let exact = cost(MAX_SPANS - 2, MAX_BYTES - 6);
+        assert_eq!(pack(&[exact], overhead), [0..1]);
+        let halves = [cost(1, (MAX_BYTES - 6) / 2), cost(1, (MAX_BYTES - 6) / 2)];
+        assert_eq!(pack(&halves, overhead), [0..2]);
+        let over = [
+            cost(1, (MAX_BYTES - 6) / 2),
+            cost(1, (MAX_BYTES - 6) / 2 + 1),
+        ];
+        assert_eq!(pack(&over, overhead), [0..1, 1..2]);
+        let spans = [cost(MAX_SPANS - 3, 0), cost(2, 0)];
+        assert_eq!(pack(&spans, overhead), [0..1, 1..2]);
+        // Every window holds whole requests and stays within both bounds.
+        let mixed: Vec<Cost> = (0..64)
+            .map(|i| cost(1 + i % 35, (i % 9) * 32 * 1024 + 9))
+            .collect();
+        let windows = pack(&mixed, overhead);
+        assert_eq!(windows.iter().map(|w| w.len()).sum::<usize>(), 64);
+        for w in windows {
+            let total = mixed[w].iter().fold(overhead, |t, c| t.plus(*c));
+            assert!(total.fits());
+        }
     }
     #[test]
     fn queue_disable_readback_and_ack_share_serialized_state() {
