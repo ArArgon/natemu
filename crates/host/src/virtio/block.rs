@@ -221,6 +221,15 @@ impl Pool {
         Ok(())
     }
 }
+/// Any exit other than `finish` (an owner error included) abandons the pool: no queued job runs
+/// after its owner is gone.
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if !self.workers.is_empty() {
+            self.abandon();
+        }
+    }
+}
 /// One worker: run jobs until the pool closes or is abandoned.
 fn work(calls: &impl Calls, queue: &Mutex<Receiver<Ticket>>, shared: &Mutex<Board>, bell: &Bell) {
     loop {
@@ -403,7 +412,7 @@ impl Streams {
     }
     /// Decode the readable stream's bytes (header, then OUT data) against the disk's capacity
     /// and the negotiated features. A malformed or out-of-range request is an IOERR status.
-    pub fn decode(&self, bytes: &[u8], capacity: u64, features: u64) -> Command {
+    pub fn decode(&self, mut bytes: Vec<u8>, capacity: u64, features: u64) -> Command {
         let bad = || Command::Status(S_IOERR);
         if bytes.len() < HEADER {
             return bad();
@@ -437,7 +446,8 @@ impl Streams {
                 } else {
                     // Without FLUSH negotiated the driver expects write-through.
                     let stable = features & F_FLUSH == 0;
-                    Command::Write(offset, bytes[HEADER..].to_vec(), stable)
+                    bytes.drain(..HEADER);
+                    Command::Write(offset, bytes, stable)
                 }
             }
             T_FLUSH if features & F_FLUSH != 0 => {
@@ -621,6 +631,26 @@ enum Start {
     Answer(Reply),
 }
 
+/// Decode a gathered request into its disk call or immediate answer. `bytes` is its gathered
+/// readable stream; a stream too long to gather (empty `bytes`) is answered IOERR.
+fn start(streams: &Streams, bytes: Vec<u8>, disk: &Disk, features: u64) -> Start {
+    let command = if streams.gathered_len() == streams.readable_len() {
+        streams.decode(bytes, disk.capacity, features)
+    } else {
+        Command::Status(S_IOERR)
+    };
+    match command {
+        Command::Read(offset, len) => Start::Call(Job::Read(offset, len)),
+        Command::Write(offset, bytes, stable) => Start::Call(Job::Write(offset, bytes, stable)),
+        Command::Flush => Start::Call(Job::Flush),
+        Command::Id => Start::Answer(Reply {
+            data: disk.id.to_vec(),
+            status: [S_OK],
+        }),
+        Command::Status(status) => Start::Answer(Reply::without_data(status)),
+    }
+}
+
 impl Virtio {
     /// The block owner: admit every published request the bounds allow, gather their headers and
     /// OUT payloads, hand their disk calls to the workers, and complete answered requests in
@@ -697,19 +727,22 @@ impl Virtio {
         flight: &mut Flight,
         snapshot: &mut Snapshot,
     ) -> Result<bool> {
-        let (q, id) = {
+        let (q, id, notified) = {
             let mut s = self.lock();
-            let (q, id) = (s.queues[0], s.identity(0));
-            let work = s.notified[0] || snapshot.reusable(q, id);
+            let (q, id, notified) = (s.queues[0], s.identity(0), s.notified[0]);
+            let work = notified || snapshot.reusable(q, id);
             let open = s.admission_open() && s.accepting(0) && !s.stopped;
             if !work || !open || flight.len() >= request_limit(q.size) {
                 return Ok(false);
             }
             s.notified[0] = false;
-            (q, id)
+            (q, id, notified)
         };
         let ram = &guest.backing.ram;
         let mut invalid = self.check_rings(q, ram).err();
+        // A notification may announce heads published after a reused snapshot: once that
+        // snapshot is exhausted, capture once more in the same round.
+        let mut recapture = notified && snapshot.reusable(q, id);
         if invalid.is_none()
             && !snapshot.reusable(q, id)
             && !self.capture(guest, snapshot, q, id)?
@@ -723,6 +756,13 @@ impl Virtio {
         while invalid.is_none() && count < request_limit(q.size) {
             let (head, descriptors) = match snapshot.chain(next) {
                 Ok(Some(chain)) => chain,
+                Ok(None) if recapture => {
+                    recapture = false;
+                    if !self.capture(guest, snapshot, next, id)? {
+                        break;
+                    }
+                    continue;
+                }
                 Ok(None) => break,
                 Err(e) => {
                     invalid = Some(e);
@@ -745,6 +785,7 @@ impl Virtio {
                 head,
                 streams,
                 reserved: bytes,
+                // Set from the decoded command when the request starts.
                 inbound: false,
                 reply: None,
             });
@@ -796,7 +837,7 @@ impl Virtio {
         pool: &Pool,
         flight: &mut Flight,
         id: Identity,
-        mut admitted: Vec<Admitted>,
+        admitted: Vec<Admitted>,
     ) -> Result<()> {
         let mut readable: Vec<Vec<u8>> = admitted
             .iter()
@@ -804,29 +845,11 @@ impl Virtio {
             .collect();
         let gathered = self.gather_streams(guest, id, &admitted, &mut readable)?;
         let features = self.lock().features;
+        // Each gathered buffer moves into its decoded command (an OUT job keeps its payload).
         let starts: Vec<Start> = admitted[..gathered]
-            .iter_mut()
-            .zip(&readable)
-            .map(|(request, bytes)| {
-                let command = if request.streams.gathered_len() == request.streams.readable_len() {
-                    request.streams.decode(bytes, disk.capacity, features)
-                } else {
-                    Command::Status(S_IOERR)
-                };
-                request.inbound = matches!(command, Command::Read(..));
-                match command {
-                    Command::Read(offset, len) => Start::Call(Job::Read(offset, len)),
-                    Command::Write(offset, bytes, stable) => {
-                        Start::Call(Job::Write(offset, bytes, stable))
-                    }
-                    Command::Flush => Start::Call(Job::Flush),
-                    Command::Id => Start::Answer(Reply {
-                        data: disk.id.to_vec(),
-                        status: [S_OK],
-                    }),
-                    Command::Status(status) => Start::Answer(Reply::without_data(status)),
-                }
-            })
+            .iter()
+            .zip(readable)
+            .map(|(request, bytes)| start(&request.streams, bytes, disk, features))
             .collect();
         let mut s = self.lock();
         // Submission and reset admission are ordered, but no native call holds this lock.
@@ -838,7 +861,10 @@ impl Virtio {
                 continue;
             }
             let job = match start {
-                Start::Call(job) => Some(job),
+                Start::Call(job) => {
+                    request.inbound = matches!(job, Job::Read(..));
+                    Some(job)
+                }
                 Start::Answer(reply) => {
                     request.reply = Some(reply);
                     None
@@ -1082,6 +1108,91 @@ mod tests {
         release.send(()).unwrap();
         ended.recv_timeout(Duration::from_secs(1)).unwrap(); // no blocked completion send
         assert!(wait.try_recv().is_err()); // the job queued at abandonment never started
+    }
+    #[test]
+    fn a_pool_dropped_by_an_owner_error_runs_no_queued_job() {
+        /// Every read blocks until the gate opens; every call is counted.
+        #[derive(Default)]
+        struct Gated {
+            calls: AtomicUsize,
+            open: Mutex<bool>,
+            signal: Condvar,
+        }
+        impl Calls for Arc<Gated> {
+            fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
+                self.calls.fetch_add(1, SeqCst);
+                let open = self.open.lock().unwrap();
+                drop(self.signal.wait_while(open, |o| !*o).unwrap());
+                Ok(b.len())
+            }
+            fn write(&self, b: &[u8], _: u64) -> std::io::Result<usize> {
+                self.calls.fetch_add(1, SeqCst);
+                Ok(b.len())
+            }
+            fn sync(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let gated = Arc::new(Gated::default());
+        let pool = Pool::spawn(gated.clone(), Arc::default()).unwrap();
+        for slot in 0..WORKERS {
+            pool.submit(slot, Job::Read(0, 512)).unwrap();
+        }
+        let start = Instant::now();
+        while gated.calls.load(SeqCst) < WORKERS && start.elapsed() < Duration::from_secs(1) {
+            std::thread::yield_now();
+        }
+        // Every worker is busy, so this write stays queued.
+        pool.submit(WORKERS, Job::Write(0, vec![1; 512], false))
+            .unwrap();
+        drop(pool); // as an owner's `?` exit does, without abandon or finish
+        *gated.open.lock().unwrap() = true;
+        gated.signal.notify_all();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            gated.calls.load(SeqCst),
+            WORKERS,
+            "a queued write ran after the drop"
+        );
+    }
+    #[test]
+    fn decoded_out_payload_moves_into_its_job() {
+        let path = std::env::temp_dir().join(format!("natemu-block-test-{}", std::process::id()));
+        std::fs::write(&path, vec![0; 4096]).unwrap();
+        let disk = Disk::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let out = Streams::new(&[
+            desc(0, 16, false),
+            desc(100, 512, false),
+            desc(900, 1, true),
+        ]);
+        let mut bytes = header(1, 1);
+        bytes.extend(vec![0xa5; 512]);
+        let pointer = bytes.as_ptr();
+        match start(&out.unwrap(), bytes, &disk, FEATURES) {
+            Start::Call(Job::Write(512, data, false)) => {
+                assert_eq!(data, vec![0xa5; 512]);
+                assert_eq!(data.as_ptr(), pointer, "the gathered buffer was copied");
+            }
+            _ => panic!("OUT did not start a write"),
+        }
+        let read = Streams::new(&[desc(0, 16, false), desc(100, 513, true)]).unwrap();
+        assert!(matches!(
+            start(&read, header(0, 0), &disk, FEATURES),
+            Start::Call(Job::Read(0, 512))
+        ));
+        // A readable stream too long to gather is answered IOERR without decoding.
+        let long = Streams::new(&[
+            desc(0, (MAX_DATA + HEADER + 1) as u32, false),
+            desc(9, 1, true),
+        ]);
+        assert!(matches!(
+            start(&long.unwrap(), Vec::new(), &disk, FEATURES),
+            Start::Answer(Reply {
+                status: [S_IOERR],
+                ..
+            })
+        ));
     }
     #[test]
     fn quiesce_requires_successful_final_sync_and_worker_retirement() {
@@ -1425,14 +1536,14 @@ mod tests {
         .unwrap();
         let mut bytes = header(1, 2);
         bytes.extend(vec![0xa5; 512]);
-        match s.decode(&bytes, 4096, FEATURES) {
+        match s.decode(bytes, 4096, FEATURES) {
             Command::Write(1024, b, false) => assert_eq!(b, vec![0xa5; 512]),
             _ => panic!("OUT layout refused"),
         }
         let s = Streams::new(&[desc(100, 16, false), desc(900, 513, true)]).unwrap();
         assert_eq!(s.status, 1412);
         assert!(matches!(
-            s.decode(&header(0, 0), 4096, FEATURES),
+            s.decode(header(0, 0), 4096, FEATURES),
             Command::Read(0, 512)
         ));
         let bytes = vec![5; 512];
@@ -1445,7 +1556,7 @@ mod tests {
     fn status_tail_gaps_never_inflate_used_prefix_and_errors_write_no_data() {
         let s = Streams::new(&[desc(0, 16, false), desc(100, 32, true)]).unwrap();
         assert!(matches!(
-            s.decode(&header(8, 0), 4096, FEATURES),
+            s.decode(header(8, 0), 4096, FEATURES),
             Command::Id
         ));
         let id = [1; 20];
@@ -1463,22 +1574,22 @@ mod tests {
     fn block_limits_features_and_offsets_are_checked_before_native_effects() {
         let s = Streams::new(&[desc(0, 16, false), desc(100, 8193, true)]).unwrap();
         assert!(matches!(
-            s.decode(&header(0, 0), 65536, FEATURES),
+            s.decode(header(0, 0), 65536, FEATURES),
             Command::Status(S_IOERR)
         ));
         let s = Streams::new(&[desc(0, 16, false), desc(100, 513, true)]).unwrap();
         for sector in [8, u64::MAX] {
             assert!(matches!(
-                s.decode(&header(0, sector), 4096, FEATURES),
+                s.decode(header(0, sector), 4096, FEATURES),
                 Command::Status(S_IOERR)
             ));
         }
         assert!(matches!(
-            s.decode(&header(4, 0), 4096, FEATURES & !F_FLUSH),
+            s.decode(header(4, 0), 4096, FEATURES & !F_FLUSH),
             Command::Status(S_UNSUPP)
         ));
         assert!(matches!(
-            s.decode(&header(123, 0), 4096, FEATURES),
+            s.decode(header(123, 0), 4096, FEATURES),
             Command::Status(S_UNSUPP)
         ));
     }

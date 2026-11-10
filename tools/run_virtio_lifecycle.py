@@ -369,6 +369,9 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         require(events.count('backend-held') == 5 and events.count('read-result:Ok(512)') == 7, 'held sector-0 reads missing')
         require(ordered(events, ['commit', 'commit', 'reset-deferred', 'backend-released', 'read:2048:512', 'read-result:Ok(512)', 'commit']),
                 'mixed reset order mismatch')
+        # The reset retired only after every old request: all six old reads returned before the fresh one.
+        fresh = events.index('read:2048:512') if 'read:2048:512' in events else 0
+        require(events[:fresh].count('read-result:Ok(512)') == 6, 'reset retired before every old request')
     elif case == 'malformed-later':
         require(io['calls'] == 1 and events.count('commit') == 1, 'malformed captured successor reached backend or publication')
         require(ordered(events, ['read:0:512', 'read-result:Ok(512)', 'commit']), 'valid captured prefix did not complete')
@@ -438,10 +441,15 @@ def self_check():
         + ['read:2048:512', 'read-result:Ok(512)', 'commit'],
     }
     # Schedule corruptions each concurrent case must reject.
+    def late_old_read(e):
+        # One old read returns after the fresh read started: the reset did not wait for it.
+        e = list(e); fresh = e.index('read:2048:512')
+        e.pop(fresh - 1); e.insert(fresh, 'read-result:Ok(512)')
+        return e
     corrupt = {
-        'out-of-order': lambda e: e[:3] + [e[4], e[3]] + e[5:],  # released before the first commit
-        'cancel-batch': lambda e: e[:-1] + ['commit', 'commit'],
-        'reset-mixed': lambda e: e[:4] + e[5:],
+        'out-of-order': [lambda e: e[:3] + [e[4], e[3]] + e[5:]],  # released before the first commit
+        'cancel-batch': [lambda e: e[:-1] + ['commit', 'commit']],
+        'reset-mixed': [lambda e: e[:4] + e[5:], late_old_read],
     }
     controls = 0
     record_lines = ['io-state: []', 'io-disk: {}', 'io-memory: []']
@@ -484,8 +492,8 @@ def self_check():
                 image[0x2004:0x200c] = image[0x200c:0x2014]
                 bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
                 assert verify(*bad); controls += 1
-            if case in corrupt:
-                bad = copy.deepcopy(args); bad[3]['events'] = corrupt[case](bad[3]['events'])
+            for mutate in corrupt.get(case, []):
+                bad = copy.deepcopy(args); bad[3]['events'] = mutate(bad[3]['events'])
                 if not meta['sync_error']: bad[1]['io_disk'] = bad[3]
                 assert verify(*bad), case; controls += 1
             for index, mutate in ((2, lambda v: [dict(v[0], rip='0')] + v[1:]),
