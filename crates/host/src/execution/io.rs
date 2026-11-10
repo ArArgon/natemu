@@ -646,7 +646,10 @@ impl Backing {
                 };
             }
         }
-        point(cache::io_test::BEFORE_PUBLISH);
+        // Only a copy that publishes reaches the point (a lone flag clear has no publication).
+        if !publication.is_empty() {
+            point(cache::io_test::BEFORE_PUBLISH);
+        }
         // The body's stores are ordered before the used index by the full barrier after the body
         // (`dmb ish`, which is also the index store's release).
         unsafe { copy_spans(publication) };
