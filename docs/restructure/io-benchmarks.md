@@ -1249,6 +1249,16 @@ accepted post-repair candidates, "—" where none was recorded:
 Sequential 128 KiB writes scatter as widely as before (485–1,319 MiB/s). Nothing moved
 beyond recorded variation.
 
+**Final HEAD (after the serde_json change)**, `natemu-raw/perf-head-20261109-01/`: the soak and
+four matrix pairs (drained inputs) all pass, including fresh read-only verification. Soak
+rates at four vCPUs (read job / write job, kIOPS), against the November 8 candidate and
+baseline: unloaded 25.94 / 15.22 (26.53 / 14.98, 26.61 / 15.97); loaded with CPU and memory
+workers 11.53 / 8.43 (11.55 / 8.05, 11.37 / 8.74). Matrix, two runs each at two and four
+vCPUs: random read depth 1 14.9–15.0 and 14.5–14.9; depth 16 26.9 and 36.1 at two vCPUs (the
+first run is low; its repeat is not), 34.3–36.4 at four; four readers 33.6–34.0 and
+42.2–47.3; mixed 125–128 and 121–126 MiB/s; fsync 99–100 and 106–111 IOPS. All within the
+variation recorded above.
+
 **Window counters.** One 89-second four-vCPU write run (`--perf-log`) took 5,640,426
 windows, 1,963,553 of them writing guest RAM, and 13 whose writes touched a page that had
 held a page table. The never-cleared page-table marks are not yet a cost; long uptimes
