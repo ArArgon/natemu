@@ -384,9 +384,20 @@ impl Bell {
 #[derive(Clone, Copy)]
 struct Guest<'a> {
     backing: &'a Backing,
-    machine: &'a Machine,
-    stops: &'a Stops,
+    copier: Copier<'a>,
 }
+/// How a copy reaches guest RAM: the running VM's windowless copy, or (unit tests) a scripted one.
+#[derive(Clone, Copy)]
+enum Copier<'a> {
+    Vm {
+        machine: &'a Machine,
+        stops: &'a Stops,
+    },
+    #[cfg(test)]
+    Test(&'a TestCopy<'a>),
+}
+#[cfg(test)]
+type TestCopy<'a> = dyn Fn(&mut [Transfer<'_>], usize, &CopyPermit) -> Result<()> + Sync + 'a;
 
 /// One admitted descriptor chain: its queue's registers at admission, incarnation and head.
 struct Chain<'c> {
@@ -1131,14 +1142,18 @@ impl Virtio {
             }
             s.permit = Some((id, permit.clone()));
         }
-        let copied = guest.backing.copy_guest_windowless(
-            guest.machine,
-            guest.stops,
-            Duration::from_secs(2),
-            spans,
-            publish,
-            &permit,
-        );
+        let copied = match guest.copier {
+            Copier::Vm { machine, stops } => guest.backing.copy_guest_windowless(
+                machine,
+                stops,
+                Duration::from_secs(2),
+                spans,
+                publish,
+                &permit,
+            ),
+            #[cfg(test)]
+            Copier::Test(copy) => copy(spans, publish, &permit),
+        };
         let mut s = self.lock();
         s.permit = None;
         self.retire_reset(&mut s);
@@ -1147,7 +1162,9 @@ impl Virtio {
         match copied {
             // Even a reset that lost the grant must retire this committed effect.
             Ok(()) => Ok(true),
-            Err(_) if !granted && !live(&s, id) => Ok(false),
+            // A reset or stop took the permit first: a cancellation, even while `live` still holds
+            // (the clear of a suppression a closing reset waits for: the next pass retries it).
+            Err(_) if !granted && (!live(&s, id) || !s.current(id)) => Ok(false),
             // After its grant a failed copy may have written guest RAM without publishing it:
             // never a cancellation, always fatal to the VM (the owner's error cancels it).
             Err(e) => Err(e),
@@ -1199,8 +1216,7 @@ impl Virtio {
         }
         let guest = Guest {
             backing,
-            machine,
-            stops,
+            copier: Copier::Vm { machine, stops },
         };
         let result = self.owner(guest, cancel);
         if result.is_err() {

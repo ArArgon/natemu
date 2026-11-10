@@ -60,6 +60,9 @@ const NOTIFY: [u8; 2] = [0; 2];
 pub(super) struct Disk {
     #[cfg(feature = "testing")]
     pub control: Mutex<Option<Arc<super::testing::Control>>>,
+    /// Unit tests: native calls replaced by a script.
+    #[cfg(test)]
+    pub script: Mutex<Option<Arc<dyn Calls>>>,
     /// Taken by the workers when the owner starts.
     file: Mutex<Option<File>>,
     pub capacity: u64,
@@ -97,6 +100,8 @@ impl Disk {
         Ok(Self {
             #[cfg(feature = "testing")]
             control: Mutex::new(None),
+            #[cfg(test)]
+            script: Mutex::new(None),
             file: Mutex::new(Some(file)),
             capacity: len,
             id,
@@ -122,6 +127,10 @@ impl Disk {
         #[cfg(feature = "testing")]
         if let Some(control) = self.control() {
             return Pool::spawn(super::testing::Controlled::new(Native(file), control), bell);
+        }
+        #[cfg(test)]
+        if let Some(script) = self.script.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            return Pool::spawn(Scripted(script), bell);
         }
         Pool::spawn(Native(file), bell)
     }
@@ -283,6 +292,22 @@ impl Calls for Native {
     }
     fn sync(&self) -> std::io::Result<()> {
         self.0.sync_all()
+    }
+}
+
+/// Unit tests' scripted native calls.
+#[cfg(test)]
+struct Scripted(Arc<dyn Calls>);
+#[cfg(test)]
+impl Calls for Scripted {
+    fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.0.read(bytes, offset)
+    }
+    fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+        self.0.write(bytes, offset)
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        self.0.sync()
     }
 }
 
@@ -695,10 +720,10 @@ impl Virtio {
         // available index (Dekker with the driver's index store, barrier and flags read), and new heads are admitted
         // instead of sleeping, so no kick is lost.
         loop {
-            let (stopped, quiescing, closing) = {
+            let (stopped, quiescing, retiring) = {
                 let s = self.lock();
-                let closing = s.suppressed.filter(|&id| !s.current(id));
-                (s.stopped || cancel.load(SeqCst), s.quiescing, closing)
+                let retiring = s.suppressed.filter(|&id| !s.current(id));
+                (s.stopped || cancel.load(SeqCst), s.quiescing, retiring)
             };
             if stopped {
                 return if flight.on_disk() {
@@ -707,7 +732,8 @@ impl Virtio {
                     pool.finish()
                 };
             }
-            if let Some(id) = closing {
+            // A reset closing the suppressed incarnation waits for this clear.
+            if let Some(id) = retiring {
                 self.unsuppress(guest, id)?;
                 continue;
             }
@@ -1823,5 +1849,391 @@ mod tests {
             s.decode(header(123, 0), 4096, FEATURES),
             Command::Status(S_UNSUPP)
         ));
+    }
+}
+
+/// The block owner's kick-suppression states end to end: a real owner thread over a fixture's RAM, a scripted disk
+/// that can hold its calls, and a scripted copy that can make a guest register access (a reset or disable from another
+/// vCPU) inside a copy, before its grant.
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use crate::execution::io::tests as io;
+    use std::sync::{
+        Condvar,
+        atomic::{AtomicU16, AtomicUsize, fence},
+    };
+
+    const SIZE: u16 = 128;
+    const DESC: u64 = 0;
+    const AVAIL: u64 = 0x800;
+    const USED: u64 = 0x1000;
+    const HEADERS: u64 = 0x2000;
+    const STATUS: u64 = 0x2800;
+    const DATA: u64 = 0x3000;
+    /// One readable buffer of a header and 128 KiB, shared by every large request.
+    const BIG: u64 = 0x10000;
+    const RAM: usize = 0x40000;
+
+    /// Disk calls that wait while `held`; reads return 0x5a.
+    #[derive(Default)]
+    struct Held {
+        held: Mutex<bool>,
+        released: Condvar,
+        calls: AtomicUsize,
+    }
+    impl Held {
+        fn hold(&self, on: bool) {
+            *self.held.lock().unwrap() = on;
+            self.released.notify_all();
+        }
+        fn call(&self) {
+            self.calls.fetch_add(1, SeqCst);
+            let held = self.held.lock().unwrap();
+            drop(self.released.wait_while(held, |h| *h).unwrap());
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(SeqCst)
+        }
+    }
+    impl Calls for Held {
+        fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
+            self.call();
+            b.fill(0x5a);
+            Ok(b.len())
+        }
+        fn write(&self, b: &[u8], _: u64) -> std::io::Result<usize> {
+            self.call();
+            Ok(b.len())
+        }
+        fn sync(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    type Hook = Box<dyn FnMut(&Rig, &[Transfer<'_>]) + Send>;
+    struct Rig {
+        b: crate::execution::Backing,
+        r: Arc<Virtio>,
+        disk: Arc<Held>,
+        path: std::path::PathBuf,
+        /// Called with every copy's spans before the copy (and its grant).
+        hook: Mutex<Option<Hook>>,
+        /// A deferred lifecycle access the hook made: (vCPU, token).
+        deferred: Mutex<Option<(usize, u64)>>,
+        published: Mutex<u16>,
+    }
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+    fn until(what: &str, f: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !f() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "timed out: {what}"
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+    /// The spans clear NO_NOTIFY (`bytes` 0) or set it (1).
+    fn flag(spans: &[Transfer<'_>], value: u8) -> bool {
+        spans.iter().any(
+            |t| matches!(t, Transfer::Write { gpa: USED, bytes } if bytes.len() == 2 && bytes[0] == value),
+        )
+    }
+    impl Rig {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("natemu-owner-{}-{name}.raw", std::process::id()));
+            File::create(&path).unwrap().set_len(1 << 20).unwrap();
+            let irqs = super::super::tests::device().irqs.clone();
+            let r = Virtio::block(irqs, BLOCK_RESOURCE.gsi as usize, &path).unwrap();
+            let disk = Arc::new(Held::default());
+            let Profile::Block(d) = &r.profile else {
+                unreachable!()
+            };
+            *d.script.lock().unwrap() = Some(disk.clone());
+            let rig = Self {
+                b: io::backing_with(1, RAM),
+                r,
+                disk,
+                path,
+                hook: Mutex::new(None),
+                deferred: Mutex::new(None),
+                published: Mutex::new(0),
+            };
+            for (offset, value) in [
+                (reg::STATUS, 1),
+                (reg::STATUS, 3),
+                (reg::DRIVER_FEATURES_SEL, 0),
+                (reg::DRIVER_FEATURES, F_SIZE_MAX | F_SEG_MAX),
+                (reg::DRIVER_FEATURES_SEL, 1),
+                (reg::DRIVER_FEATURES, 1),
+                (reg::STATUS, 11),
+                (reg::QUEUE_SEL, 0),
+                (reg::QUEUE_NUM, SIZE.into()),
+                (reg::QUEUE_DESC_LOW, DESC),
+                (reg::QUEUE_DRIVER_LOW, AVAIL),
+                (reg::QUEUE_DEVICE_LOW, USED),
+                (reg::QUEUE_READY, 1),
+                (reg::STATUS, 15),
+            ] {
+                assert_eq!(
+                    rig.r.access(0, offset, 4, Some(value)),
+                    Access::Completed(0)
+                );
+            }
+            assert_eq!(rig.r.lock().status, 15);
+            rig
+        }
+        fn put(&self, gpa: u64, bytes: &[u8]) {
+            let at = self.b.ram.range(gpa, bytes.len() as u64).unwrap();
+            // SAFETY: fixture RAM in bounds; the owner only reads driver-owned bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
+        }
+        fn word(&self, gpa: u64) -> &AtomicU16 {
+            // SAFETY: an aligned ring field of fixture RAM, accessed atomically on both sides.
+            unsafe { AtomicU16::from_ptr(self.b.ram.range(gpa, 2).unwrap().cast()) }
+        }
+        fn flags(&self) -> u16 {
+            self.word(USED).load(SeqCst)
+        }
+        fn used_index(&self) -> u16 {
+            self.word(USED + 2).load(SeqCst)
+        }
+        fn desc(&self, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
+            let mut d = [0; 16];
+            d[..8].copy_from_slice(&addr.to_le_bytes());
+            d[8..12].copy_from_slice(&len.to_le_bytes());
+            d[12..14].copy_from_slice(&flags.to_le_bytes());
+            d[14..].copy_from_slice(&next.to_le_bytes());
+            self.put(DESC + u64::from(i) * 16, &d);
+        }
+        /// Lay out request `k`: a 512-byte read of sector `k` (descriptors 3k..3k+2).
+        fn read_request(&self, k: u16) -> u16 {
+            let header = HEADERS + u64::from(k) * 16;
+            let mut h = [0; 16];
+            h[..4].copy_from_slice(&T_IN.to_le_bytes());
+            h[8..].copy_from_slice(&u64::from(k).to_le_bytes());
+            self.put(header, &h);
+            let head = 3 * k;
+            self.desc(head, header, 16, 1, head + 1);
+            self.desc(head + 1, DATA + u64::from(k) * 512, 512, 3, head + 2);
+            self.desc(head + 2, STATUS + u64::from(k), 1, 2, 0);
+            head
+        }
+        /// Lay out request `k`: one readable buffer of a header and 128 KiB (a segment over size_max: gathered, then
+        /// answered IOERR without a disk call), then its status (descriptors 2k, 2k+1).
+        fn big_request(&self, k: u16) -> u16 {
+            let mut h = [0; 16];
+            h[..4].copy_from_slice(&T_OUT.to_le_bytes());
+            self.put(BIG, &h);
+            let head = 2 * k;
+            self.desc(head, BIG, (MAX_DATA + HEADER) as u32, 1, head + 1);
+            self.desc(head + 1, STATUS + u64::from(k), 1, 2, 0);
+            head
+        }
+        /// Publish `head` in the available ring (no notification).
+        fn publish(&self, head: u16) {
+            let mut idx = self.published.lock().unwrap();
+            self.put(AVAIL + 4 + u64::from(*idx % SIZE) * 2, &head.to_le_bytes());
+            *idx = idx.wrapping_add(1);
+            self.word(AVAIL + 2).store(*idx, SeqCst);
+        }
+        /// Linux's `virtqueue_kick_prepare` without EVENT_IDX: notify unless the device suppressed it.
+        fn kick(&self) -> bool {
+            fence(SeqCst);
+            let kick = self.flags() & USED_NO_NOTIFY == 0;
+            if kick {
+                assert_eq!(
+                    self.r.access(0, reg::QUEUE_NOTIFY, 4, Some(0)),
+                    Access::Completed(0)
+                );
+            }
+            kick
+        }
+        /// From the hook: a reset (`reg::STATUS`) or disable (`reg::QUEUE_READY`) by vCPU 1.
+        fn close(&self, register: u64) {
+            match self.r.access(1, register, 4, Some(0)) {
+                Access::Deferred(token) => *self.deferred.lock().unwrap() = Some((1, token)),
+                other => panic!("lifecycle access did not wait: {other:?}"),
+            }
+        }
+        /// The deferred lifecycle access completed.
+        fn retired(&self) -> bool {
+            let Some((v, token)) = *self.deferred.lock().unwrap() else {
+                return false;
+            };
+            self.r.poll(v, token) == Access::Completed(0)
+        }
+        fn on_copy(&self, hook: impl FnMut(&Rig, &[Transfer<'_>]) + Send + 'static) {
+            *self.hook.lock().unwrap() = Some(Box::new(hook));
+        }
+        /// Run the owner while `body` drives the guest; then release the disk, stop, and require a clean owner exit.
+        fn run(&self, body: impl FnOnce(&Rig)) {
+            let copy = |spans: &mut [Transfer<'_>], publish: usize, permit: &CopyPermit| {
+                if let Some(hook) = self.hook.lock().unwrap().as_mut() {
+                    hook(self, spans);
+                }
+                io::windowless_permit(&self.b, spans, publish, permit)
+            };
+            let guest = Guest {
+                backing: &self.b,
+                copier: Copier::Test(&copy),
+            };
+            let cancel = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let owner = scope.spawn(|| {
+                    let Profile::Block(disk) = &self.r.profile else {
+                        unreachable!()
+                    };
+                    self.r.block_owner(guest, disk, &cancel)
+                });
+                body(self);
+                self.disk.hold(false);
+                until("flight retired", || self.r.lock().in_flight.is_empty());
+                self.r.stop();
+                owner.join().unwrap().expect("block owner failed");
+            });
+        }
+    }
+
+    #[test]
+    fn a_reset_or_disable_racing_the_idle_clear_cancels_it_and_retires_after_the_retry() {
+        for register in [reg::STATUS, reg::QUEUE_READY] {
+            let rig = Rig::new(&format!("idle-{register}"));
+            rig.disk.hold(true);
+            let mut injected = false;
+            // The idle path's clear is a lone flag write and an available-ring read.
+            rig.on_copy(move |rig, spans| {
+                if !injected && spans.len() == 2 && flag(spans, 0) {
+                    injected = true;
+                    rig.close(register);
+                }
+            });
+            rig.run(|rig| {
+                rig.publish(rig.read_request(0));
+                assert!(rig.kick());
+                until("disk call", || rig.disk.calls() == 1);
+                // The canceled clear did not end the owner; its retry ran while the reset closed.
+                until("retrying clear", || {
+                    rig.deferred.lock().unwrap().is_some() && rig.flags() == 0
+                });
+                assert!(!rig.retired(), "the reset waits for the request on disk");
+                rig.disk.hold(false);
+                until("reset retired", || rig.retired());
+            });
+            let s = rig.r.lock();
+            let generation = if register == reg::STATUS {
+                s.generation
+            } else {
+                s.generations[0]
+            };
+            assert_eq!(generation, 1);
+            assert_eq!(
+                rig.used_index(),
+                0,
+                "the overtaken request was not published"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_overtaking_the_completion_clear_retires_after_the_retiring_clear() {
+        let rig = Rig::new("completion");
+        let mut injected = false;
+        rig.on_copy(move |rig, spans| {
+            if !injected && spans.len() > 2 && flag(spans, 0) {
+                injected = true;
+                rig.close(reg::STATUS);
+            }
+        });
+        rig.run(|rig| {
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("reset retired", || rig.retired());
+        });
+        assert_eq!(rig.disk.calls(), 1);
+        assert_eq!((rig.flags(), rig.used_index()), (0, 0));
+        assert_eq!(rig.r.lock().generation, 1);
+    }
+
+    #[test]
+    fn a_quiet_wait_with_a_request_on_disk_clears_the_flag_and_admits_unkicked_heads() {
+        let rig = Rig::new("quiet");
+        rig.disk.hold(true);
+        let mut published = false;
+        // Just before the idle clear the flag is still set: a head published now gets no kick, and only the clear's
+        // read of the available index can find it.
+        rig.on_copy(move |rig, spans| {
+            if !published && spans.len() == 2 && flag(spans, 0) {
+                published = true;
+                assert_eq!(rig.flags(), USED_NO_NOTIFY);
+                rig.publish(rig.read_request(1));
+            }
+        });
+        rig.run(|rig| {
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("unkicked head admitted", || rig.disk.calls() == 2);
+            rig.disk.hold(false);
+            until("both completed", || rig.used_index() == 2);
+            until("flag cleared", || rig.flags() == 0);
+        });
+        assert_eq!(rig.r.lock().generation, 0);
+        let mut data = [0; 2];
+        for k in 0..2 {
+            let at = rig.b.ram.range(STATUS + k, 1).unwrap();
+            // SAFETY: fixture RAM in bounds; the owner has stopped.
+            data[k as usize] = unsafe { *at };
+        }
+        assert_eq!(data, [S_OK; 2]);
+    }
+
+    #[test]
+    fn power_off_drains_with_the_flag_clear() {
+        let rig = Rig::new("power");
+        rig.disk.hold(true);
+        rig.run(|rig| {
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("disk call", || rig.disk.calls() == 1);
+            assert!(!rig.r.quiesce().unwrap());
+            rig.disk.hold(false);
+            until("drained", || rig.r.quiesce().unwrap());
+        });
+        assert_eq!((rig.flags(), rig.used_index()), (0, 1));
+    }
+
+    #[test]
+    fn a_reset_canceling_a_later_gather_window_waits_for_the_flag_set_in_the_first() {
+        let rig = Rig::new("gather");
+        let mut windows = 0;
+        // Gather windows read the large buffer; the first one also sets the flag.
+        rig.on_copy(move |rig, spans| {
+            let gather = spans
+                .iter()
+                .any(|t| matches!(t, Transfer::Read { gpa: BIG, .. }));
+            if gather {
+                windows += 1;
+                assert_eq!(flag(spans, 1), windows == 1);
+                if windows == 2 {
+                    rig.close(reg::STATUS);
+                }
+            }
+        });
+        rig.run(|rig| {
+            for k in 0..8 {
+                rig.publish(rig.big_request(k));
+            }
+            assert!(rig.kick());
+            until("reset retired", || rig.retired());
+        });
+        assert_eq!(rig.disk.calls(), 0);
+        assert_eq!((rig.flags(), rig.used_index()), (0, 0));
+        assert_eq!(rig.r.lock().generation, 1);
     }
 }
