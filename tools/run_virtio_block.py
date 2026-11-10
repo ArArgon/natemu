@@ -31,7 +31,7 @@ PAYLOAD_BYTES = 4 << 20
 MODULE_NAMES = ('virtio_mmio', 'virtio_blk', 'virtio-rng', 'crc32c_generic', 'crc16', 'mbcache', 'jbd2', 'ext4')
 APPLETS = ('sh', 'mount', 'umount', 'switch_root', 'nproc', 'uname', 'modprobe', 'cat', 'grep', 'awk',
            'basename', 'readlink', 'dd', 'wc', 'cmp', 'sha256sum', 'dmesg', 'sync', 'poweroff', 'sleep',
-           'mkdir', 'cp', 'mv', 'rm')
+           'mkdir', 'cp', 'mv', 'rm', 'stty')
 
 BOOT_INIT = r'''#!/bin/sh
 export PATH=/bin
@@ -58,7 +58,9 @@ fail switch-root-returned
 
 ROOT_INIT = r'''#!/bin/sh
 export PATH=/bin
-fail() { echo "VIRTIO-BLOCK-FAIL $*"; dmesg; poweroff -f; while :; do sleep 1; done; }
+# poweroff -f does not wait for queued console output; BusyBox stty restores attributes with TCSADRAIN.
+drain_console() { console_mode=$(stty -F /dev/console -g) && stty -F /dev/console "$console_mode"; }
+fail() { echo "VIRTIO-BLOCK-FAIL $*"; dmesg; drain_console || true; poweroff -f; while :; do sleep 1; done; }
 exec </dev/console >/dev/console 2>&1
 mount -t tmpfs tmpfs /tmp || fail tmpfs
 phase= rng=0
@@ -124,6 +126,7 @@ echo VIRTIO-BLOCK-DMESG-BEGIN
 dmesg
 echo VIRTIO-BLOCK-DMESG-END
 echo "VIRTIO-BLOCK-PASS phase=$phase"
+drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
 '''

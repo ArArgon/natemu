@@ -30,7 +30,9 @@ MODULES = ('kernel/drivers/virtio/virtio_mmio.ko', 'kernel/drivers/char/hw_rando
 
 INIT = r'''#!/bin/sh
 export PATH=/bin
-fail() { echo "VIRTIO-RNG-FAIL $*"; dmesg; poweroff -f; while :; do sleep 1; done; }
+# poweroff -f does not wait for queued console output; BusyBox stty restores attributes with TCSADRAIN.
+drain_console() { console_mode=$(/bin/busybox stty -F /dev/console -g) && /bin/busybox stty -F /dev/console "$console_mode"; }
+fail() { echo "VIRTIO-RNG-FAIL $*"; dmesg; drain_console || true; poweroff -f; while :; do sleep 1; done; }
 mount -t proc proc /proc || fail proc
 mount -t sysfs sysfs /sys || fail sysfs
 mount -t devtmpfs devtmpfs /dev || fail devtmpfs
@@ -103,6 +105,7 @@ dmesg
 echo VIRTIO-RNG-DMESG-END
 echo VIRTIO-RNG-PASS
 sync
+drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
 '''

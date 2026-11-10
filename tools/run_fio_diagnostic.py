@@ -66,6 +66,7 @@ mount -o remount,ro / || fail remount-ro
 phase_mark root-readonly
 sha256sum /bench/verify.bin
 phase_mark poweroff
+drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
 '''
