@@ -970,6 +970,39 @@ persistence runs; window counters split into windowless batches and fallback win
 at one, two and four vCPUs against HEAD and the VZ reference. Targets at four vCPUs: share of wall
 time with vCPUs paused below 2%, single-job depth 16 at least 2x HEAD, depth 1 no worse.
 
+## Fewer exits on the device path (proposed, November 10)
+
+**Status: accepted under the owner's November 9 delegation; reviewed with the code.** Motivated
+by the [per-request profile](io-benchmarks.md#per-request-profile-after-windowless-copies--november-10):
+five exits per request at depth 1 and about 3 at depth 16, about 2 µs each under load, and 12–14%
+of vCPU time waiting on device mutexes with four readers.
+
+1. **Kick suppression.** While the block owner is admitting or has requests in flight, it sets
+   `VIRTQ_USED_F_NO_NOTIFY` in `used.flags` (virtio 1.2 §2.7.7; Linux checks it in
+   `virtqueue_kick_prepare` without EVENT_IDX). Before the owner goes idle it clears the flag, issues
+   a full barrier and re-reads `avail.idx`; new heads are admitted instead of sleeping, so no kick
+   is lost. The flag store is an ordinary windowless write to the used ring's page. Entropy and
+   network keep notifying.
+2. **Cached device-page claims.** A read of a non-RAM page first asks the host whether a device
+   claims it (`REQUEST_PAGE`), every time. Claims are fixed once the VM starts (no hotplug, no
+   relocatable windows), so each resident caches claimed pages in a small table and skips the
+   query on a hit. The host asserts the registry is frozen before the first vCPU runs; an
+   unassigned page keeps today's behaviour (its all-ones mapping already avoids repeats).
+3. **QueueNotify without the device-state mutex.** The common case (queue ready, driver OK, no
+   reset or deferred access pending) becomes an atomic flag and a bell ring; anything else takes
+   today's locked path. The outer per-device mutex is not held while waiting for the virtio state
+   lock.
+4. **EOI broadcasts** for the level-triggered line are investigated, not changed, in this step:
+   removing that exit needs IOAPIC state outside the chipset lock.
+
+**Invariants kept.** Reset, disable and S5 ordering; the deferred-access FIFO; interrupt
+suppression semantics; strict-mode unassigned-page reporting.
+
+**Evidence.** Host tests (lost-kick race around flag clearing; reset with the flag set; notify
+fast/slow paths; page cache hit/miss and frozen-registry assertion); the standing suite; the I/O
+runners and edge cases; the profile and matrix rerun. Targets at four vCPUs: exits per I/O at
+depth 16 at most 2, depth 16 +20%, four readers +15%, depth 1 no worse.
+
 ## Future direct-payload work
 
 Keep immutable request metadata, backend ownership and ordered completion as
