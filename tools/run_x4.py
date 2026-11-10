@@ -315,6 +315,16 @@ def cmd_adversarial(a, report):
                     mem = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpus[0]['memory']}
                     slot = lambda i, o: int.from_bytes(mem[SLOT(0)][0x100 * i + o:0x100 * i + o + 8], 'little')
                     started = {i for i in range(1, n) if slot(i, 0x10)}
+                    # `nowait`'s violation leaves AP 1's command pending while the BSP writes AP 2's ID, then its
+                    # vector: AP 2 can read the command and its own ID before the new vector and start at AP 1's
+                    # (as firmware would). It then runs AP 1's body (slot 1) and fails however that code fails, while
+                    # AP 1 keeps waiting. Only the BSP's end and "nothing hangs" (driver exit 0) remain required.
+                    if want is None and started == {1} and cpus[1]['stop'] == 'resident' and 'halted' in cpus[1]['reason']:
+                        problems += [f"cpu0 stopped {cpus[0]['stop']} {cpus[0]['reason']}"] if cpus[0]['stop'] != 'reached' else []
+                        report.append({'name': tag, 'problems': problems, 'outcome': 'AP 2 took the pending wakeup'})
+                        failures += [f'{tag}: {p}' for p in problems]
+                        print(tag, 'ok (AP 2 took the pending wakeup)' if not problems else problems[:3], flush=True)
+                        continue
                     if not (started == want or want is None and started in ({2}, {1, 2})):
                         problems.append(f'started {sorted(started)}, want {want}')
                     problems += [f'cpu{i} ran {slot(i, 0x10)} times at {slot(i, 8):#x}' for i in started if slot(i, 0x10) != 1 or slot(i, 8) != V(i)]
