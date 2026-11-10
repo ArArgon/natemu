@@ -60,8 +60,11 @@ impl Backing {
     /// # Safety
     /// The value (and every copy) must not be used after this backing is dropped: it addresses the backing's mapping.
     /// During execution, raw host accesses must be excluded from `copy_guest` windows. Production source reads
-    /// occur only while their vCPU is serving a request, before it can acknowledge a window; boot writes precede
-    /// execution. Other running-VM access must use `copy_guest` instead.
+    /// occur only while their vCPU is serving a request, before it can acknowledge a window; they may overlap a
+    /// windowless device copy's writes, which the code-mark protocol covers (the vCPU marks the page before the
+    /// read, and the copy's recheck posts it, so a block compiled from torn bytes is dropped before the completion
+    /// is published). Boot writes precede execution. Other running-VM access must use `copy_guest` or
+    /// `copy_guest_windowless` instead.
     pub unsafe fn ram(&self) -> GuestRam {
         self.ram
     }

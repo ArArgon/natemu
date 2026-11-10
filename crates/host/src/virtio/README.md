@@ -63,14 +63,15 @@ reset cancels before it or waits for the call, as for a granted window), the
 written pages' code marks are cleared and posted to their holders, which are
 rung; the body (payload, status, used elements, metadata reads) is copied, a
 full barrier follows, and the marks are rechecked (a mark taken during the copy
-is posted too). The used index is written only after every posted vCPU has
+is posted too). The used index is written only after every posted vCPU (and every vCPU that
+still owes a drain of a written page from an earlier writer) has
 drained its post, is halted in HLT (it drains on withdrawal, before guest
 access) or has ended; after 50 ms the used index and the reads after it go
 through a window instead (`drain_expiries`). Then a full barrier, the available
 ring's flags and index, and any snapshot refresh. Fields of up to 16 bytes move
 as whole aligned accesses; each read is followed by an acquire barrier, and the
 snapshot reads the available index first, then its entries, then the descriptor
-table. Windowless batches take no epoch lock. The `io` perf line adds
+table. Windowless batches take no epoch lock. An error after the grant is fatal to the VM. The `io` perf line adds
 `windowless`, `windowless_posted`, `recheck_holders`, `drain_waits`,
 `drain_us`, `drain_max_us`, `drain_expiries` and `table_fallbacks`; `windows`
 now counts only fallback windows and the test drivers' own windows.
