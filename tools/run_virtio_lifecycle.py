@@ -269,7 +269,9 @@ def fixture(case, work):
             'power': power, 'sync_error': case == 'power-sync-error', 'expected_rip': CODE + (labels['power_instruction'] if case in ('power-rep', 'power-rep-halt') else labels['power_after']) if power else CODE + len(code),
             'disk_before_sha256': hashlib.sha256(disk).hexdigest(),
             'disk_after_sha256': hashlib.sha256(expected_disk).hexdigest(),
-            'memory_after_sha256': hashlib.sha256(expected).hexdigest()}
+            'memory_after_sha256': hashlib.sha256(expected).hexdigest(),
+            # Concurrent flushes finish in any order: their used elements are a permutation.
+            'unordered_used': [0x2004, 64] if case == 'fullqueue' else None}
     (work / 'oracle.json').write_text(json.dumps(meta, indent=2) + '\n')
     return meta
 
@@ -281,17 +283,27 @@ def ordered(events, sequence):
     return cursor == len(sequence)
 
 
+def canonical(meta, memory):
+    """The RAM image with an unordered used-element run sorted, so any completion order compares equal."""
+    if not meta.get('unordered_used'): return memory
+    offset, count = meta['unordered_used']
+    elements = sorted(memory[offset + 8 * i:offset + 8 * i + 8] for i in range(count))
+    return memory[:offset] + b''.join(elements) + memory[offset + 8 * count:]
+
+
 def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expected_disk, expected_memory, post_memory):
     errors, case, n = [], meta['case'], meta['n']
     def require(ok, reason):
         if not ok: errors.append(reason)
+    expected_memory = canonical(meta, expected_memory)
+    def same(data): return canonical(meta, bytes.fromhex(data)) == expected_memory
     require(not timed_out, 'VM timeout')
     require(returncode != 0 if meta['sync_error'] else returncode == 0, 'unexpected process status')
     require(f'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none' in stderr.splitlines(), 'unclean teardown')
     require(disk == expected_disk, 'disk differs from exact expected contents')
     require(len(post_memory) == n and all(len(memory) == 1
             and ref.num(memory[0]['addr']) == BASE
-            and bytes.fromhex(memory[0]['data']) == expected_memory for memory in post_memory),
+            and same(memory[0]['data']) for memory in post_memory),
             'post-VM RAM differs from complete expected image')
     events = io['events']
     require(io['entered'] == (case != 'fullqueue'), 'unexpected positioned-I/O entry state')
@@ -309,7 +321,7 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         require(ref.num(cpu['rip']) == meta['expected_rip'], 'report/state RIP mismatch')
         for v, item in enumerate(report['cpus']):
             memories = item['memory']
-            require(len(memories) == 1 and ref.num(memories[0]['addr']) == BASE and bytes.fromhex(memories[0]['data']) == expected_memory, f'CPU {v} RAM differs from complete expected image')
+            require(len(memories) == 1 and ref.num(memories[0]['addr']) == BASE and same(memories[0]['data']), f'CPU {v} RAM differs from complete expected image')
         if case == 'power-rep-halt':
             peer = report['cpus'][1]
             # Power drain releases the disk's busy guard after its final sync; the driver's halted rule may then end the
@@ -463,6 +475,15 @@ def self_check():
             stderr = f'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none\n' + ('disk shutdown full-sync: injected\n' if meta['sync_error'] else '')
             args = [meta, report, state, io, stderr, 1 if meta['sync_error'] else 0, False, disk, disk, memory, [copy.deepcopy(cpu['memory']) for _ in range(n)]]
             assert not verify(*args), (case, verify(*args))
+            if case == 'fullqueue':
+                # Any completion order passes; a duplicated element (one flush lost) does not.
+                image = bytearray(memory)
+                image[0x2004:0x200c], image[0x200c:0x2014] = memory[0x200c:0x2014], memory[0x2004:0x200c]
+                good = copy.deepcopy(args); good[10][0][0]['data'] = image.hex(); good[1]['cpus'][0]['memory'][0]['data'] = image.hex()
+                assert not verify(*good), verify(*good)
+                image[0x2004:0x200c] = image[0x200c:0x2014]
+                bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
+                assert verify(*bad); controls += 1
             if case in corrupt:
                 bad = copy.deepcopy(args); bad[3]['events'] = corrupt[case](bad[3]['events'])
                 if not meta['sync_error']: bad[1]['io_disk'] = bad[3]
