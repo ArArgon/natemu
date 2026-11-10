@@ -35,7 +35,9 @@ pub const OWNER_CPU_NS: usize = 18;
 pub const WORKER_CPU_NS: usize = 19;
 /// Submission to the owner taking the result (queue + call + take).
 pub const SUBMIT_TAKE_NS: usize = 20;
-const N: usize = 21;
+/// Lone requests whose call the owner made itself (no worker).
+pub const INLINE: usize = 21;
+const N: usize = 22;
 const NAMES: [&str; N] = [
     "notifies",
     "notify_ns",
@@ -58,6 +60,7 @@ const NAMES: [&str; N] = [
     "owner_cpu_ns",
     "worker_cpu_ns",
     "submit_take_ns",
+    "inline",
 ];
 static C: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 /// Per job slot: its submission and its end; the oldest unconsumed notification and interrupt raise.

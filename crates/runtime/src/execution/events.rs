@@ -387,13 +387,21 @@ pub(super) fn wait_mailbox(s: &mut State) {
 }
 
 /// Acknowledges and ends every pending doorbell (ICC_IAR1_EL1 until it reads a spurious INTID, ICC_EOIR1_EL1 each);
-/// how many there were.
+/// how many there were. ISR_EL1.I ends the loop first when no IRQ is signalled: under HVF's GIC each ICC access traps
+/// (about 1.2 us, measured: io-benchmarks.md "Shorter depth-1 path"), ISR_EL1 does not, so a wake by one doorbell
+/// costs two traps, not three. A doorbell ISR_EL1 misses stays pending: it ends the next `wfi` at once, or interrupts
+/// generated code (`interrupted`), so none is lost.
 fn acknowledge() -> u64 {
     let mut any = 0;
     loop {
-        let intid: u64;
+        let (isr, intid): (u64, u64);
+        // SAFETY: reads the pending-interrupt status.
+        unsafe { asm!("isb", "mrs {}, isr_el1", out(reg) isr) };
+        if isr & 1 << 7 == 0 {
+            return any;
+        }
         // SAFETY: GIC CPU interface system registers (enabled at start).
-        unsafe { asm!("isb", "mrs {i}, S3_0_C12_C12_0", i = out(reg) intid) };
+        unsafe { asm!("mrs {i}, S3_0_C12_C12_0", i = out(reg) intid) };
         if intid >= 1020 {
             return any;
         }

@@ -30,9 +30,12 @@ use std::{
     ops::Range,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
+        atomic::{
+            AtomicBool, AtomicU64,
+            Ordering::{Relaxed, SeqCst},
+        },
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use virtio_queue::desc::split::Descriptor;
 
@@ -358,25 +361,53 @@ impl Profile {
 }
 
 /// The owner's one wake source: guest notifications, resets, power drain, stop and disk
-/// workers ring it. A ring between the owner's check and its wait is not lost.
+/// workers ring it. A ring between the owner's check and its wait is not lost. One waiter.
 #[derive(Default)]
 pub(super) struct Bell {
-    rung: Mutex<bool>,
+    rung: AtomicBool,
+    /// The waiter is (about to be) blocked: a ring takes the lock and signals. Dekker with `rung` (both `SeqCst`): a
+    /// ringer that sees it clear stored `rung` before the waiter's check under the lock.
+    sleeping: AtomicBool,
+    lock: Mutex<()>,
     signal: Condvar,
 }
 impl Bell {
     pub fn ring(&self) {
-        *self.rung.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        self.signal.notify_one();
+        self.rung.store(true, SeqCst);
+        if self.sleeping.load(SeqCst) {
+            drop(self.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            self.signal.notify_one();
+        }
     }
     /// Wait for a ring (at most `timeout`) and consume it; false if none came.
     pub fn wait(&self, timeout: Duration) -> bool {
-        let rung = self.rung.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut rung, _) = self
+        self.wait_spinning(timeout, Duration::ZERO)
+    }
+    /// [`Self::wait`], first spinning up to `spin` (counted in `timeout`) without blocking.
+    pub fn wait_spinning(&self, timeout: Duration, spin: Duration) -> bool {
+        if self.rung.swap(false, SeqCst) {
+            return true;
+        }
+        if !spin.is_zero() {
+            let until = Instant::now() + spin;
+            while Instant::now() < until {
+                if self.rung.load(Relaxed) && self.rung.swap(false, SeqCst) {
+                    return true;
+                }
+                std::hint::spin_loop();
+            }
+        }
+        let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.sleeping.store(true, SeqCst);
+        let (guard, _) = self
             .signal
-            .wait_timeout_while(rung, timeout, |r| !*r)
+            .wait_timeout_while(guard, timeout.saturating_sub(spin), |_| {
+                !self.rung.load(SeqCst)
+            })
             .unwrap_or_else(|e| e.into_inner());
-        std::mem::replace(&mut *rung, false)
+        self.sleeping.store(false, SeqCst);
+        drop(guard);
+        self.rung.swap(false, SeqCst)
     }
 }
 
