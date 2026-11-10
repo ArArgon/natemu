@@ -1326,8 +1326,12 @@ in 80–90 s, about 0.003% of wall time. The windowless gates (paused share belo
 depth 16 at least 2x, depth 1 no worse) are met. The gap to Virtualization.framework narrows from
 10–15% to roughly 40–50% for concurrent reads.
 
-Open: sequential 128 KiB writes have been below the pre-stage-2 range in every run since stage 2
-(482–921 against 722–1,433 MiB/s). Background load: `fseventsd` near one core, load average 2–5.
+Sequential 128 KiB writes measured below the earlier pre-stage-2 range (482–921 against
+722–1,433 MiB/s), but this is not a code regression: rerun the same day, the pre-stage-2 build
+gives 507–817 and a one-worker variant of the current build 481–817 MiB/s
+(`natemu-raw/seqwrite-20261110-01/`). The job ends with an `F_FULLFSYNC`, so its rate tracks APFS
+flushing on a disk that has been 96–98% full since the earlier runs, under `fseventsd` load. The
+same reruns keep the read gains (four readers 46 k on the old build, about 200 k now).
 
 ## Native and same-architecture virtualization references — November 9
 
