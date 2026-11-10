@@ -239,10 +239,12 @@ impl Virtio {
         } else {
             Vec::with_capacity(3)
         };
-        Ok(match self.complete(guest, chain, len as u32, writes)? {
-            Some(_) => Request::Committed { pending: true },
-            None => Request::Canceled,
-        })
+        Ok(
+            match self.complete(guest, chain, len as u32, writes, None)? {
+                Some(_) => Request::Committed { pending: true },
+                None => Request::Canceled,
+            },
+        )
     }
     /// Offer one TX packet to the backend while `id` is current: Some(true) if taken,
     /// Some(false) if the one slot is full (bounded loss, never a retained retry), None if reset.

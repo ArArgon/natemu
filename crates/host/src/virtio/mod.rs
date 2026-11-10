@@ -872,20 +872,31 @@ impl Virtio {
     /// Copy `data` and the chain's used-ring publication in one window, then raise the used-buffer
     /// interrupt unless the driver suppressed it or a reset closed the incarnation (ACK, reset and
     /// level publication share the state lock). None when the window was canceled.
+    ///
+    /// With `refresh`, the same window then reads the queue's metadata into that snapshot, after
+    /// the publication, so the next request needs no metadata window of its own. It counts as
+    /// captured in the chain's incarnation only when the window was granted.
     fn complete(
         &self,
         guest: Guest<'_>,
         chain: &Chain<'_>,
         len: u32,
         data: Vec<Transfer<'_>>,
+        mut refresh: Option<&mut Snapshot>,
     ) -> Result<Option<UsedEntry>> {
         let mut used = UsedEntry::new(chain, len);
         let mut transfers = data;
         used.publish(chain.queue, &mut transfers);
+        if let Some(snapshot) = refresh.as_deref_mut() {
+            transfers.extend(snapshot.reads(chain.queue));
+        }
         if !self.copy(guest, chain.id, &mut transfers)? {
             return Ok(None);
         }
         drop(transfers);
+        if let Some(snapshot) = refresh {
+            snapshot.captured(chain.id);
+        }
         #[cfg(feature = "testing")]
         self.observe("commit");
         let mut s = self.lock();
@@ -1115,7 +1126,7 @@ impl Virtio {
         match &self.profile {
             Profile::Block(disk) => {
                 let lane = lane.as_mut().expect("a block owner starts its lane");
-                self.block_request(guest, &chain, disk, lane, cancel)
+                self.block_request(guest, &chain, disk, lane, snapshot, cancel)
             }
             Profile::Network(network) => self.net_request(guest, &chain, network, received, cancel),
             Profile::Entropy => self.entropy_request(guest, &chain),
@@ -1129,19 +1140,7 @@ impl Virtio {
         q: Queue,
         id: Identity,
     ) -> Result<bool> {
-        let table_len = usize::from(q.size) * 16;
-        let avail_len = 4 + usize::from(q.size) * 2;
-        let mut reads = [
-            Transfer::Read {
-                gpa: q.desc,
-                bytes: &mut snapshot.table[..table_len],
-            },
-            Transfer::Read {
-                gpa: q.avail,
-                bytes: &mut snapshot.avail[..avail_len],
-            },
-        ];
-        if !self.copy(guest, id, &mut reads)? {
+        if !self.copy(guest, id, &mut snapshot.reads(q))? {
             return Ok(false);
         }
         snapshot.captured(id);
@@ -1167,10 +1166,12 @@ impl Virtio {
             return Ok(Request::Invalid(format!("getentropy: {error}")));
         }
         let writes = scatter(chain.descriptors, payload);
-        Ok(match self.complete(guest, chain, len as u32, writes)? {
-            Some(_) => Request::Committed { pending: true },
-            None => Request::Canceled,
-        })
+        Ok(
+            match self.complete(guest, chain, len as u32, writes, None)? {
+                Some(_) => Request::Committed { pending: true },
+                None => Request::Canceled,
+            },
+        )
     }
 }
 

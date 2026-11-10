@@ -437,6 +437,7 @@ impl Virtio {
         chain: &Chain<'_>,
         disk: &Disk,
         lane: &mut Lane,
+        snapshot: &mut Snapshot,
         cancel: &AtomicBool,
     ) -> Result<Request> {
         let streams = match Streams::new(chain.descriptors) {
@@ -459,10 +460,11 @@ impl Virtio {
             Command::Write(offset, bytes, stable) => Job::Write(offset, bytes, stable),
             Command::Flush => Job::Flush,
             Command::Id => {
-                return self.block_complete(guest, chain, &streams, &disk.id, S_OK, inbound);
+                return self
+                    .block_complete(guest, chain, snapshot, &streams, &disk.id, S_OK, inbound);
             }
             Command::Status(status) => {
-                return self.block_complete(guest, chain, &streams, &[], status, inbound);
+                return self.block_complete(guest, chain, snapshot, &streams, &[], status, inbound);
             }
         };
         {
@@ -477,9 +479,11 @@ impl Virtio {
         match done.error {
             Some(e) => {
                 eprintln!("virtio-block: {e}");
-                self.block_complete(guest, chain, &streams, &[], S_IOERR, inbound)
+                self.block_complete(guest, chain, snapshot, &streams, &[], S_IOERR, inbound)
             }
-            None => self.block_complete(guest, chain, &streams, &done.data, S_OK, inbound),
+            None => {
+                self.block_complete(guest, chain, snapshot, &streams, &done.data, S_OK, inbound)
+            }
         }
     }
     /// Publish `data`, the status byte and the used element. A failed read reports no bytes.
@@ -487,6 +491,7 @@ impl Virtio {
         &self,
         guest: Guest<'_>,
         chain: &Chain<'_>,
+        snapshot: &mut Snapshot,
         streams: &Streams,
         data: &[u8],
         status: u8,
@@ -498,12 +503,14 @@ impl Virtio {
         if inbound && status[0] != S_OK {
             len = 0;
         }
-        Ok(match self.complete(guest, chain, len, writes)? {
-            Some(used) => Request::Committed {
-                pending: used.more_published(chain.queue),
+        Ok(
+            match self.complete(guest, chain, len, writes, Some(snapshot))? {
+                Some(used) => Request::Committed {
+                    pending: used.more_published(chain.queue),
+                },
+                None => Request::Canceled,
             },
-            None => Request::Canceled,
-        })
+        )
     }
 }
 
