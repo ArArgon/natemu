@@ -79,7 +79,10 @@ rust-vmm adoption. The library now consumes `virtio-queue` 0.18.0 and `vm-memory
 0.18.0 from the owner's fork ArArgon/natemu-rust-vmm (a Cargo git dependency pinned by commit), plus their locked dependencies;
 vm-memory's mmap feature is used for private descriptor snapshots, not guest RAM.
 See `crates/host/src/virtio/README.md` for the exact source identity and license
-inventory. The ABI and resident still take no registry dependency.
+inventory. **November 9 amendment:** the owner approved serde 1.0.229 (derive) and serde_json
+1.0.154 for the host library and test driver, to write their JSON reports with correct escaping;
+they add serde_core, serde_derive, itoa, memchr and zmij to `Cargo.lock`. The ABI and resident
+still take no registry dependency.
 The crates come from crates.io (not vendored, owner, November 5), every version pinned in `Cargo.lock` (`--locked`). A
 fresh machine needs the network once, `cargo +1.97.0 fetch --locked` (or the first build without `--offline`), before
 the `--offline` builds above work; after that the local cargo cache serves them. Adding a registry crate needs the

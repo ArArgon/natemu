@@ -301,7 +301,8 @@ retains its exact original SDK requirement. The workspace contains `crates/host`
 (the library `natemu`), `crates/cli` (its boot stub `natemu`, package `natemu-cli`),
 `crates/driver` (the test driver `natemu-host`), `crates/runtime` and `crates/abi`.
 Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`. The host
-binaries use clap, and the host library uses rust-vmm's `virtio-queue` and
+binaries use clap, the host library and test driver write JSON with serde_json, and the
+host library uses rust-vmm's `virtio-queue` and
 `vm-memory` from the owner's fork ArArgon/natemu-rust-vmm, pinned by commit in
 `crates/host/Cargo.toml` and `Cargo.lock`; those crates' own locked dependencies
 come from crates.io. The ABI and resident take no registry
