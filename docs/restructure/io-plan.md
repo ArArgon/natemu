@@ -1010,6 +1010,32 @@ fast/slow paths; page cache hit/miss and frozen-registry assertion); the standin
 runners and edge cases; the profile and matrix rerun. Targets at four vCPUs: exits per I/O at
 depth 16 at most 2, depth 16 +20%, four readers +15%, depth 1 no worse.
 
+## Shorter depth-1 path (proposed, November 10)
+
+**Status: accepted under the owner's November 9 delegation; reviewed with the code.** The
+[per-request profile](io-benchmarks.md#per-request-profile-after-windowless-copies--november-10)
+shows a depth-1 request spending about 31–33 µs from notify to the guest's ACK, of which about
+9–10 µs are three host thread hand-offs (notify → owner, owner → worker, worker → owner) and
+7–9 µs per halted-vCPU wake, with about two wakes per request at four vCPUs (the completion
+interrupt, then a guest function-call IPI to fio's vCPU).
+
+1. **Inline disk call for a lone request.** When admission leaves exactly one request in flight
+   and nothing else is queued, the owner makes the native call itself instead of handing it to a
+   worker; deeper queues keep the pool. Notifications that arrive meanwhile are kept (suppression
+   and the completion's ring re-read already cover them).
+2. **Bounded spin before sleeping.** The owner, and a worker with a just-finished job, spin
+   briefly on their wake source before blocking (bounded, e.g. tens of µs, only after recent
+   activity), trading some host CPU for the condition-variable wake. Measured against host CPU
+   per I/O.
+3. **Halted-vCPU wake.** Find and remove the 3–4 µs between an interrupt reaching a waiting vCPU
+   and its leaving the park; investigate (not change) whether completion interrupts can target
+   the submitting vCPU without departing from how the guest programmed IOAPIC routing.
+4. **EOI broadcast** stays as recorded under "Fewer exits"; a separate step if still worthwhile.
+
+**Targets** (interleaved A/B on one image, as for the exit work): depth 1 at one and four vCPUs
++15%, deeper queues and four readers no worse, host CPU per I/O at depth 1 no more than +20%.
+Every correctness run passing, including lifecycle reset/disable/S5 with a lone in-flight request.
+
 ## Future direct-payload work
 
 Keep immutable request metadata, backend ownership and ordered completion as
