@@ -1300,6 +1300,28 @@ Same-day matrix, natemu / QEMU:
 
 The four-reader case at four vCPUs remains natemu's one loss to QEMU (73%).
 
+## Per-request profile after windowless copies — November 10
+
+Raw data: `natemu-raw/io-profile-20261110-01/` (`table.txt`, `per_io.json`); 4 KiB random reads,
+18 s minus 3 s runs, normal and `perf` residents agreeing within 1–3%. Per I/O, in µs:
+
+| | D1, 1 vCPU | D1, 4 vCPUs | D16, 1 vCPU | D16, 4 vCPUs | 4 readers |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| kIOPS | 17.8 | 14.1 | 49.5 | 90.4 | 181 |
+| Wall per I/O | 51.5 | 64.9 | 20.1 | 11.5 | 5.0 |
+| Guest translated code | 15.9 | 17.9 | 7.7 | 7.1 | 7.5 |
+| Host exits | 7.7 | 7.5 | 4.9 | 6.2 | 4.4 |
+| Block dispatch | 8.2 | 9.5 | 3.0 | 2.6 | 2.2 |
+| Notify → owner admission | 5.5 | 4.3 | — | 4.2 | 4.0 |
+| Interrupt raised → guest ACK | 13.8 | 15.0 | — | 6.6 | 1.6 |
+
+Exits per I/O: 5.0 at depth 1 (QueueNotify, InterruptStatus read, a device-page check before the
+read, InterruptACK, the EOI broadcast for the level-triggered line), 3.05 at depth 16, 1.27 with
+four readers. Kicks are never suppressed. With four readers vCPU threads spend 12–14% waiting on
+the device mutexes. Ranked targets: fewer exits and less locking on the MMIO path; the depth-1
+wake chain (three thread hand-offs, a halted-vCPU wake at 7–9 µs, about two wakes per I/O at four
+vCPUs); then translated guest code and dispatch, which is not I/O-specific.
+
 ## Windowless copies — November 10
 
 HEAD `816a84d` (stages 1–2 plus windowless copies with targeted invalidation), two matrix runs
