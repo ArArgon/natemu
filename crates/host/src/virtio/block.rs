@@ -740,9 +740,10 @@ impl Virtio {
         };
         let ram = &guest.backing.ram;
         let mut invalid = self.check_rings(q, ram).err();
-        // A notification may announce heads published after a reused snapshot: once that
-        // snapshot is exhausted, capture once more in the same round.
-        let mut recapture = notified && snapshot.reusable(q, id);
+        // A notification may announce heads published after a reused snapshot. With requests in
+        // flight, their next completion window refreshes the snapshot and re-arms the queue, so a
+        // second capture would only cost a window; with none in flight, capture once more here.
+        let mut recapture = notified && snapshot.reusable(q, id) && flight.len() == 0;
         if invalid.is_none()
             && !snapshot.reusable(q, id)
             && !self.capture(guest, snapshot, q, id)?
