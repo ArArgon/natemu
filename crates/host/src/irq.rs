@@ -233,6 +233,13 @@ impl Irqs {
         self.live.fetch_add(1, SeqCst);
         Busy(self.live.clone())
     }
+    /// A [`Busy`] count handed across threads: `hold` takes it, `release` drops it.
+    pub fn hold(&self) {
+        self.live.fetch_add(1, SeqCst);
+    }
+    pub fn release(&self) {
+        self.live.fetch_sub(1, SeqCst);
+    }
     /// Sources that may still fire (held [`Busy`] guards): while nonzero, no halted vCPU may be ended.
     pub fn live(&self) -> usize {
         self.live.load(SeqCst)

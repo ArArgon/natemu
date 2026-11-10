@@ -9,7 +9,8 @@
 //! access: [`serve`] answers [`exec::REQUEST_DEVICE`] with exactly one read or write, never decoding x86.
 //!
 //! **Concurrency contract (for X3, L3, L4).** Every vCPU thread calls [`serve`] on its own exits; a device is behind its
-//! own mutex, so admission calls are serialised, each vCPU's in its program order. An access may complete immediately
+//! own mutex (or, a [`Direct`] device, its own lock), so admission calls are serialised, each vCPU's in its program
+//! order. An access may complete immediately
 //! or return a host-only deferred token. A deferred operation retains its device ordering; polling never reissues it.
 //! Its resident releases shadow holdings and services RAM-window requests while waiting, and completes the decoded
 //! instruction once after the final reply. No device mutex is held across that wait. A handler runs on the accessing vCPU's thread with
@@ -20,7 +21,8 @@
 //! `device`) at the instruction, so a refusal must leave the device unchanged. Memory ordering: the vCPU's earlier guest
 //! accesses are complete before its exit (`dsb sy`), the mutex orders the handler against other vCPUs' handlers, and the
 //! vCPU's later accesses start after the final reply. The guest tables' A/D updates of the access are made before the device is
-//! asked, also when it is then refused (as on x86). Limits: the registry is fixed before the vCPUs run and lies above guest
+//! asked, also when it is then refused (as on x86). Limits: the registry is fixed before the vCPUs run ([`Devices::freeze`];
+//! residents cache claimed pages on that basis) and lies above guest
 //! RAM (a relocatable range such as IA32_APIC_BASE's, or holes below the top of RAM, need M1's layout and a mutable
 //! registry); every access is a host exit, except those a resident device answers first (the resident's `mmio::local`
 //! hook, X3's per-vCPU LAPIC).
@@ -66,6 +68,17 @@ pub trait Device: Send {
     fn quiesce(&mut self) -> crate::Result<bool> {
         Ok(true)
     }
+    /// A handle the registry calls instead, without this device's mutex (asked once, at registration).
+    fn direct(&self) -> Option<Arc<dyn Direct>> {
+        None
+    }
+}
+/// MMIO accesses of a device that serialises them itself: [`serve`] and [`serve_poll`] call it without the outer
+/// mutex, so a vCPU never holds that mutex while waiting for the device's own lock. Same contract as [`Device::access`]
+/// and [`Device::poll`].
+pub trait Direct: Send + Sync {
+    fn access(&self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Access;
+    fn poll(&self, vcpu: usize, token: u64) -> Access;
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -78,6 +91,7 @@ pub type Shared = Arc<Mutex<dyn Device>>;
 /// VM lifecycle management must drain workers before freeing backend or guest backing resources.
 pub struct Pending {
     device: Shared,
+    direct: Option<Arc<dyn Direct>>,
     token: u64,
     request: Mmio,
     vcpu: usize,
@@ -132,7 +146,10 @@ impl Device for At {
 /// page; a write reaching [`serve`] is ignored and counted per access; under the strict switch both are refused (and
 /// counted). The report's page `reads` are therefore fills, its `writes` accesses.
 pub struct Devices {
-    ranges: Vec<(u64, u64, Shared)>,
+    ranges: Vec<(u64, u64, Shared, Option<Arc<dyn Direct>>)>,
+    /// Set once the registry is shared with the vCPUs ([`Devices::freeze`]): no range is added after it, so a resident
+    /// may remember a page answered [`mmio::CLAIMED`] for the rest of the run.
+    frozen: bool,
     /// Installed RAM size; the legacy and 3–4 GiB holes remain device space.
     ram_end: u64,
     /// L3: port ranges `[base, end)`.
@@ -152,6 +169,7 @@ impl Devices {
     pub fn new(ram_end: u64) -> Self {
         Self {
             ranges: Vec::new(),
+            frozen: false,
             ram_end,
             ports: Vec::new(),
             strict: false,
@@ -168,7 +186,7 @@ impl Devices {
     /// Close admission everywhere, even if an earlier device is still draining.
     pub(crate) fn quiesce(&self) -> crate::Result<bool> {
         let mut done = true;
-        for (_, _, device) in self.ranges.iter() {
+        for (_, _, device, _) in self.ranges.iter() {
             done &= device.lock().unwrap_or_else(|e| e.into_inner()).quiesce()?;
         }
         for (_, _, device) in &self.ports {
@@ -178,6 +196,7 @@ impl Devices {
     }
     /// L3: registers `device` on ports `[base, base + count)`, inside the 16-bit space and not overlapping another range.
     pub fn register_ports(&mut self, base: u32, count: u32, device: Shared) -> crate::Result<()> {
+        assert!(!self.frozen, "device registry frozen");
         let end = base + count;
         if count == 0 || end > 0x1_0000 || self.ports.iter().any(|&(b, e, _)| base < e && b < end) {
             return Err(format!(
@@ -238,6 +257,7 @@ impl Devices {
     /// Registers `device` at `[base, base + bytes)`: page-aligned, outside guest RAM (above it, or inside the legacy hole,
     /// `exec::LEGACY_HOLE`), below MAXPHYADDR (40 bits), not overlapping another range.
     pub fn register(&mut self, base: u64, bytes: u64, device: Shared) -> crate::Result<()> {
+        assert!(!self.frozen, "device registry frozen");
         let end = base
             .checked_add(bytes)
             .filter(|&e| bytes > 0 && e <= 1 << 40);
@@ -248,13 +268,19 @@ impl Devices {
                 "device range {base:#x}+{bytes:#x}: page-aligned, outside guest RAM, below 2^40"
             ));
         };
-        if self.ranges.iter().any(|&(b, e, _)| base < e && b < end) {
+        if self.ranges.iter().any(|&(b, e, ..)| base < e && b < end) {
             return Err(format!(
                 "device range {base:#x}+{bytes:#x} overlaps another"
             ));
         }
-        self.ranges.push((base, end, device));
+        let direct = device.lock().unwrap_or_else(|e| e.into_inner()).direct();
+        self.ranges.push((base, end, device, direct));
         Ok(())
+    }
+    /// The registry as the vCPUs share it, fixed from now on (no hotplug, no relocatable range).
+    pub fn freeze(mut self) -> Arc<Self> {
+        self.frozen = true;
+        Arc::new(self)
     }
     fn not_ram(&self, base: u64, end: u64) -> bool {
         base >= exec::ram_end(self.ram_end)
@@ -262,10 +288,13 @@ impl Devices {
             || base >= self.ram_end.min(exec::LOW_RAM_END) && end <= exec::HIGH_RAM_START
     }
     pub fn find(&self, gpa: u64) -> Option<(&Shared, u64)> {
+        self.entry(gpa).map(|(d, _, offset)| (d, offset))
+    }
+    fn entry(&self, gpa: u64) -> Option<(&Shared, &Option<Arc<dyn Direct>>, u64)> {
         self.ranges
             .iter()
-            .find(|&&(b, e, _)| (b..e).contains(&gpa))
-            .map(|(b, _, d)| (d, gpa - b))
+            .find(|&&(b, e, ..)| (b..e).contains(&gpa))
+            .map(|(b, _, d, direct)| (d, direct, gpa - b))
     }
 }
 pub fn mask(bytes: u64) -> u64 {
@@ -307,7 +336,7 @@ fn begin(
         && (m.gpa & 4095) + m.width <= 4096
         && m.write <= 1
         && devices.is_none_or(|d| d.not_ram(m.gpa & !4095, (m.gpa & !4095) + 4096));
-    m.status = match devices.map(|d| (d, d.find(m.gpa))) {
+    m.status = match devices.map(|d| (d, d.entry(m.gpa))) {
         _ if !well_formed || pending.is_some() => 0,
         None => mmio::UNASSIGNED,
         // L3: the unassigned rule (or, strict, the refusal), counted either way.
@@ -328,14 +357,16 @@ fn begin(
                 mmio::DONE
             }
         }
-        Some((_, Some((device, offset)))) => {
-            let mut d = device.lock().unwrap_or_else(|e| e.into_inner());
-            match d.access(
-                vcpu,
-                offset,
-                m.width,
-                (m.write != 0).then_some(m.value & mask(m.width)),
-            ) {
+        Some((_, Some((device, direct, offset)))) => {
+            let value = (m.write != 0).then_some(m.value & mask(m.width));
+            let access = match direct {
+                Some(d) => d.access(vcpu, offset, m.width, value),
+                None => device
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .access(vcpu, offset, m.width, value),
+            };
+            match access {
                 Access::Completed(value) => {
                     if m.write == 0 {
                         m.value = value & mask(m.width);
@@ -345,6 +376,7 @@ fn begin(
                 Access::Deferred(token) => {
                     *pending = Some(Pending {
                         device: device.clone(),
+                        direct: direct.clone(),
                         token,
                         request: m,
                         vcpu,
@@ -382,11 +414,14 @@ fn poll_request(vcpu: usize, rip: u64, mut m: Mmio, pending: &mut Option<Pending
             && p.request.completed == m.completed
             && (m.write == 0 || p.request.value == m.value)
     }) {
-        let result = p
-            .device
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .poll(p.vcpu, p.token);
+        let result = match &p.direct {
+            Some(d) => d.poll(p.vcpu, p.token),
+            None => p
+                .device
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poll(p.vcpu, p.token),
+        };
         m = p.request;
         m.status = match result {
             Access::Completed(value) => {
@@ -412,10 +447,21 @@ fn poll_request(vcpu: usize, rip: u64, mut m: Mmio, pending: &mut Option<Pending
 /// bad reply.
 pub(crate) fn serve_page(area: Area, state: &mut State, devices: Option<&Devices>) {
     let mut m: Mmio = area.read_record(MMIO_OFFSET);
-    m.status = match devices {
+    m.status = page_status(devices, m.gpa);
+    area.write_record(MMIO_OFFSET, m);
+    state.reply = exec::REPLY_PAGE;
+}
+fn page_status(devices: Option<&Devices>, gpa: u64) -> u64 {
+    let m = Mmio {
+        gpa,
+        ..Mmio::default()
+    };
+    match devices {
         Some(d) if m.gpa % 4096 == 0 && m.gpa < 1 << 40 && d.not_ram(m.gpa, m.gpa + 4096) => {
             match d.find(m.gpa) {
-                Some(_) => mmio::CLAIMED,
+                // The resident caches the claim for the run: only a frozen registry may make one.
+                Some(_) if d.frozen => mmio::CLAIMED,
+                Some(_) => 0,
                 None => {
                     d.page_counts
                         .lock()
@@ -431,9 +477,7 @@ pub(crate) fn serve_page(area: Area, state: &mut State, devices: Option<&Devices
             }
         }
         _ => 0,
-    };
-    area.write_record(MMIO_OFFSET, m);
-    state.reply = exec::REPLY_PAGE;
+    }
 }
 
 /// L3: serves vCPU `area.vcpu`'s port request ([`exec::REQUEST_PORT`]): one access on the port bus ([`Devices::port`]),
@@ -623,6 +667,75 @@ mod deferred_tests {
         let m = poll_request(0, RIP, m, &mut pending);
         assert_eq!((m.status, m.value), (mmio::DONE, u64::MAX));
         assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn claimed_pages_are_answered_only_by_a_frozen_registry() {
+        let (bus, ..) = setup(&[]);
+        // Before freezing, a claim could still change: no resident may cache it.
+        assert_eq!(page_status(Some(&bus), BASE), 0);
+        let bus = bus.freeze();
+        assert_eq!(page_status(Some(&bus), BASE), mmio::CLAIMED);
+        // Unassigned pages keep their per-fill counting and the strict refusal.
+        assert_eq!(page_status(Some(&bus), BASE + 4096), mmio::DONE);
+        assert_eq!(page_status(Some(&bus), BASE + 4096), mmio::DONE);
+        assert_eq!(bus.report().unassigned_pages[0].reads, 2);
+        let (mut strict, ..) = setup(&[]);
+        strict.strict = true;
+        assert_eq!(
+            page_status(Some(&strict.freeze()), BASE + 4096),
+            mmio::UNASSIGNED
+        );
+        assert_eq!(page_status(Some(&bus), BASE + 1), 0);
+    }
+    #[test]
+    #[should_panic(expected = "device registry frozen")]
+    fn a_frozen_registry_takes_no_range() {
+        let (bus, device, _) = setup(&[]);
+        let mut bus = Arc::try_unwrap(bus.freeze()).ok().unwrap();
+        bus.register(BASE + 4096, 4096, device).unwrap();
+    }
+    #[test]
+    fn direct_devices_are_served_without_their_mutex() {
+        struct Locked(Arc<Mock2>);
+        #[derive(Default)]
+        struct Mock2(Mutex<Vec<u64>>);
+        impl Direct for Mock2 {
+            fn access(&self, _: usize, o: u64, _: u64, _: Option<u64>) -> Access {
+                self.0.lock().unwrap().push(o);
+                Access::Deferred(5)
+            }
+            fn poll(&self, _: usize, t: u64) -> Access {
+                Access::Completed(t)
+            }
+        }
+        impl Device for Locked {
+            fn read(&mut self, _: usize, _: u64, _: u64) -> Option<u64> {
+                None
+            }
+            fn write(&mut self, _: usize, _: u64, _: u64, _: u64) -> bool {
+                false
+            }
+            fn direct(&self) -> Option<Arc<dyn Direct>> {
+                Some(self.0.clone())
+            }
+        }
+        let inner = Arc::new(Mock2::default());
+        let device: Shared = Arc::new(Mutex::new(Locked(inner.clone())));
+        let mut bus = Devices::new(64 << 20);
+        bus.register(BASE, 4096, device.clone()).unwrap();
+        // The outer mutex stays held by a peer: access and poll still complete.
+        let _held = device.lock().unwrap();
+        let mut pending = None;
+        let m = Mmio {
+            gpa: BASE + 8,
+            width: 4,
+            ..Mmio::default()
+        };
+        let m = begin(0, RIP, m, Some(&bus), &mut pending);
+        assert_eq!(m.status, mmio::PENDING);
+        let m = poll_request(0, RIP, m, &mut pending);
+        assert_eq!((m.status, m.value), (mmio::DONE, 5));
+        assert_eq!(*inner.0.lock().unwrap(), [8]);
     }
     #[test]
     fn legacy_default_access_and_port_contract_remain_synchronous() {

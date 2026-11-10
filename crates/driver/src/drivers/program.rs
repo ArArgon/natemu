@@ -1665,7 +1665,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         })
         .transpose()?;
     registry.strict = strict;
-    let registry = Arc::new(registry);
+    let registry = registry.freeze();
     // A space is built for the first vCPU using it (its rip places `code` bodies).
     let mut spaces: Vec<Option<Tables>> = d.spaces.iter().map(|_| None).collect();
     let mut ends = Vec::new();

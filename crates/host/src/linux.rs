@@ -179,7 +179,7 @@ impl Boot {
             backing,
             loaded,
             uart,
-            devices: Arc::new(devices),
+            devices: devices.freeze(),
             irqs,
             board,
             virtio,

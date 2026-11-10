@@ -600,12 +600,44 @@ pub mod cache {
         /// Host-selected EL0 frame alias; immutable for this VM's lifetime, preserved across cache/shadow resets.
         /// Every vCPU uses this VA, mapped to its own frame. Appended to preserve earlier field offsets.
         pub guest_state_va: u64,
+        /// Device-page claims ([`super::mmio::CLAIMED`] answers to `REQUEST_PAGE`) this vCPU remembers, so a read of a
+        /// claimed page asks the host once, not at every access (0: empty; page 0 is always RAM). The host's registry is
+        /// frozen before any vCPU runs, so a claim never ends. Replaced round-robin (`claimed_next`). Appended.
+        pub claimed_pages: [u64; CLAIMED_PAGES],
+        pub claimed_next: u64,
     }
+    pub const CLAIMED_PAGES: usize = 8;
     impl Control {
         #[inline(always)]
         pub fn record_sys_fast_decline(&mut self, reason: super::perf::SysFastDecline) {
             self.sys_fast_declined[reason as usize] += 1;
         }
+        /// The device page `page` is in [`Control::claimed_pages`].
+        pub fn claimed(&self, page: u64) -> bool {
+            page != 0 && self.claimed_pages.contains(&page)
+        }
+        /// Remember a claimed device page, replacing the oldest entry.
+        pub fn remember_claim(&mut self, page: u64) {
+            self.claimed_pages[self.claimed_next as usize % CLAIMED_PAGES] = page;
+            self.claimed_next = self.claimed_next.wrapping_add(1);
+        }
+    }
+    #[cfg(test)]
+    #[test]
+    fn claimed_pages_hit_miss_and_replace_round_robin() {
+        // SAFETY: Control is plain integers (the host zeroes it at prepare).
+        let mut c: Control = unsafe { core::mem::zeroed() };
+        assert!(
+            !c.claimed(0xf000_0000) && !c.claimed(0),
+            "empty table misses, page 0 never claimed"
+        );
+        c.remember_claim(0xf000_0000);
+        assert!(c.claimed(0xf000_0000) && !c.claimed(0xf000_1000));
+        for k in 1..=CLAIMED_PAGES as u64 {
+            c.remember_claim(0xf000_0000 + k * 4096);
+        }
+        assert!(!c.claimed(0xf000_0000), "the oldest is replaced");
+        assert!((1..=CLAIMED_PAGES as u64).all(|k| c.claimed(0xf000_0000 + k * 4096)));
     }
     pub const LARGE_REGIONS: usize = 64;
     pub const PC_HINTS: usize = 2048;
