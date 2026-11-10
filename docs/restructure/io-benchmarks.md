@@ -1300,6 +1300,35 @@ Same-day matrix, natemu / QEMU:
 
 The four-reader case at four vCPUs remains natemu's one loss to QEMU (73%).
 
+## Windowless copies — November 10
+
+HEAD `816a84d` (stages 1–2 plus windowless copies with targeted invalidation), two matrix runs
+per vCPU count, window counters and the soak (`natemu-raw/bench-windowless-20261110-01/`). All
+phases pass, including fresh read-only verification.
+
+| Profile, four vCPUs | Before stages 1–2 | Windowless | VZ reference |
+| --- | ---: | ---: | ---: |
+| Random read 4 KiB Q1, kIOPS | 14.5–14.9 | 15.4–19.3 | 33.2–33.8 |
+| Random read 4 KiB Q16, kIOPS | 34.3–36.4 | 86.3–97.8 | 241.2–241.4 |
+| Random read 4 KiB Q64, kIOPS | 30.2–36.2 | 63.5–96.6 | 258.1–258.5 |
+| Four random readers Q16, kIOPS | 41.9–47.3 | 176.5–209.5 | 407.7–409.5 |
+| Four readers, worst p99, ms | 6.3–10.7 | 0.9–1.4 | |
+| Mixed 70/30 4 KiB Q16, MiB/s | 120.8–129.3 | 159.3–306.1 | 667.5–669.6 |
+| Sequential read 128 KiB Q16, MiB/s | 1,991–2,718 | 2,936–4,533 | 7,218–7,259 |
+| Sequential write 128 KiB Q16, MiB/s | 722–1,433 | 482–921 | 3,117–3,529 |
+
+At one vCPU: depth 1 19.9–20.2, depth 16 49.9–50.2, four readers 47.4–47.5 kIOPS. At two:
+depth 16 52.0–55.9, four readers 91.3–96.6. Soak at four vCPUs, read/write kIOPS: unloaded
+87.26 / 60.97, loaded 49.67 / 27.59 (before: 25.94 / 15.22 and 11.53 / 8.43).
+
+Windows per run fall from about 5 M to 7–12, all page-table fallbacks; total window time 1.5–2.4 ms
+in 80–90 s, about 0.003% of wall time. The windowless gates (paused share below 2%, single-job
+depth 16 at least 2x, depth 1 no worse) are met. The gap to Virtualization.framework narrows from
+10–15% to roughly 40–50% for concurrent reads.
+
+Open: sequential 128 KiB writes have been below the pre-stage-2 range in every run since stage 2
+(482–921 against 722–1,433 MiB/s). Background load: `fseventsd` near one core, load average 2–5.
+
 ## Native and same-architecture virtualization references — November 9
 
 The matrix's fio jobs (same precondition, nine profiles, CRC verify-all, four 256 MiB files)
