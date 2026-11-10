@@ -1421,20 +1421,15 @@ impl Answer {
         if reply.code == 0 {
             return Ok(Answer::Object(reply.object));
         }
-        let json = crate::json::parse(&String::from_utf8_lossy(&reply.json))?;
-        let reason = end_reason(&json)
-            .ok_or("fexc report without guest.end.reason")?
-            .to_string();
-        let end = json.get("guest").and_then(|g| g.get("end"));
-        let gated = end
-            .and_then(|e| e.get("cut_gated"))
-            .map(|v| v.as_str() == Some("mmx"));
-        let ud = end.and_then(|e| e.get("cut_ud")).is_some();
+        let end = serde_json::from_slice::<FexcReport>(&reply.json)
+            .map_err(|e| format!("fexc report without guest.end.reason: {e}"))?
+            .guest
+            .end;
         Ok(Answer::Cut {
-            reason,
-            cut: system_cut(&json, rip),
-            gated,
-            ud,
+            cut: end.system_cut(rip),
+            gated: end.cut_gated.map(|v| v.as_str() == Some("mmx")),
+            ud: end.cut_ud.is_some(),
+            reason: end.reason,
         })
     }
     /// This answer, kept for `from`, as fexc's answer at `to` (same half and page offset): an object relocated
@@ -2436,19 +2431,43 @@ fn hash(bytes: &[u8]) -> u64 {
     bytes.hash(&mut h);
     h.finish()
 }
-/// `guest.end.reason` of fexc's report.
-fn end_reason(json: &crate::json::Value) -> Option<&str> {
-    json.get("guest")?.get("end")?.get("reason")?.as_str()
+/// The part of fexc's no-code report natemu reads: `guest.end`. Other fields are ignored.
+#[derive(serde::Deserialize)]
+struct FexcReport {
+    guest: FexcGuest,
 }
-/// The opcode map and opcode of the instruction fexc cut the block before, if that is the first one (at `rip`).
-fn system_cut(json: &crate::json::Value, rip: u64) -> Option<(u8, u8)> {
-    let end = json.get("guest")?.get("end")?;
-    let number = |key: &str| match end.get(key)? {
-        crate::json::Value::Number(n) => n.parse().ok(),
-        _ => None,
-    };
-    let at = u64::from_str_radix(end.get("rip")?.as_str()?.strip_prefix("0x")?, 16).ok()?;
-    (at == rip).then_some((number("cut_opcode_map")?, number("cut_opcode")?))
+#[derive(serde::Deserialize)]
+struct FexcGuest {
+    end: FexcEnd,
+}
+#[derive(serde::Deserialize)]
+struct FexcEnd {
+    reason: String,
+    // Kept loose: an odd value only means "no system cut", never a failed answer.
+    #[serde(default)]
+    rip: serde_json::Value,
+    #[serde(default)]
+    cut_opcode_map: serde_json::Value,
+    #[serde(default)]
+    cut_opcode: serde_json::Value,
+    /// Present (whatever its value, `null` included) or absent.
+    #[serde(default, deserialize_with = "present")]
+    cut_gated: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present")]
+    cut_ud: Option<serde_json::Value>,
+}
+fn present<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    serde::Deserialize::deserialize(d).map(Some)
+}
+impl FexcEnd {
+    /// The opcode map and opcode of the instruction fexc cut the block before, if that is the first one (at `rip`).
+    fn system_cut(&self, rip: u64) -> Option<(u8, u8)> {
+        let byte = |v: &serde_json::Value| u8::try_from(v.as_u64()?).ok();
+        let at = u64::from_str_radix(self.rip.as_str()?.strip_prefix("0x")?, 16).ok()?;
+        (at == rip).then_some((byte(&self.cut_opcode_map)?, byte(&self.cut_opcode)?))
+    }
 }
 
 /// The guest bytes at a RIP, copied from the guest-physical pages the resident walked for the request.
@@ -4842,16 +4861,28 @@ mod tests {
     }
 
     #[test]
-    fn end_reason_is_read_from_fexc_json() {
-        let json = r#"{"guest":{"detail":{"reason":"no"},"end":{"rip":"0x10","reason":"system_instruction","detail":"hlt"}}}"#;
-        let json = crate::json::parse(json).unwrap();
-        assert_eq!(super::end_reason(&json), Some("system_instruction"));
-        assert_eq!(super::end_reason(&crate::json::parse("{}").unwrap()), None);
-        let cut = r#"{"guest":{"end":{"rip":"0x10","reason":"system_instruction","detail":"x","cut_opcode_map":1,"cut_opcode":34}}}"#;
-        let cut = crate::json::parse(cut).unwrap();
+    fn fexc_report_is_read_from_json() {
+        let end = |json: &str| serde_json::from_str::<super::FexcReport>(json).map(|r| r.guest.end);
+        let plain = end(r#"{"guest":{"detail":{"reason":"no"},"end":{"rip":"0x10","reason":"system_instruction","detail":"hlt"}}}"#).unwrap();
+        assert_eq!(plain.reason, "system_instruction");
+        assert!(
+            plain.cut_gated.is_none() && plain.cut_ud.is_none() && plain.system_cut(0x10).is_none()
+        );
+        assert!(end("{}").is_err() && end(r#"{"guest":{"end":{}}}"#).is_err());
+        let cut = end(r#"{"guest":{"end":{"rip":"0x10","reason":"system_instruction","detail":"x","cut_opcode_map":1,"cut_opcode":34}}}"#).unwrap();
         assert_eq!(
-            (super::system_cut(&cut, 0x10), super::system_cut(&cut, 0x11)),
+            (cut.system_cut(0x10), cut.system_cut(0x11)),
             (Some((1, 0x22)), None)
         );
+        // As before: a present key counts even when null; an odd opcode only drops the cut.
+        let odd = end(r#"{"guest":{"end":{"rip":"0x10","reason":"r","cut_ud":null,"cut_gated":null,"cut_opcode_map":1,"cut_opcode":300}}}"#).unwrap();
+        assert!(
+            odd.cut_ud.is_some()
+                && odd
+                    .cut_gated
+                    .as_ref()
+                    .is_some_and(|v| v.as_str() != Some("mmx"))
+        );
+        assert_eq!(odd.system_cut(0x10), None);
     }
 }

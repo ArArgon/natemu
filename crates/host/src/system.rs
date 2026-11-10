@@ -1085,12 +1085,12 @@ mod x1c_tests {
     /// source, says its CPUID bit is clear: a profile change cannot leave a false #UD behind (or a missed one).
     #[test]
     fn undefined_follows_the_profile() {
-        use crate::json::{Value, parse};
+        use serde_json::Value;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tools/models/cpu_profile.json"
         );
-        let profile = parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let profile: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let Some(Value::Array(leaves)) = profile.get("cpuid") else {
             panic!("no cpuid table")
         };

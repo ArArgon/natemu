@@ -16,7 +16,6 @@ pub mod devices;
 pub mod execution;
 mod ioapic;
 pub mod irq;
-mod json;
 pub mod linux;
 pub mod memory;
 pub mod owners;
