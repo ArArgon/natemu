@@ -1196,6 +1196,64 @@ are preserved. The incomplete capped diagnostic remains failed and is not promot
 audit. QEMU, the independent candidate and the reverse-order control subsequently pass oracle02
 directly.
 
+## Refactor replay and console drain — November 9
+
+After the code was made idiomatic (same window protocol), the page-table mark became a
+check before the atomic write, the unread window field was removed and window counters
+were added, every November 8 I/O run was replayed with the new binaries from its saved
+command. Raw results: `natemu-raw/io-replay-20261109-01/` and
+`natemu-raw/uart-debug-20261109/`.
+
+**Correctness.** Entropy at one, two and four vCPUs; block at one and two; ten of
+eleven lifecycle cases; the network fixture; windows and window cases; quiet;
+pending-compiler; normal four-vCPU and forced two-vCPU stress; reset and disable
+lifecycle stress; the loaded serial stress (186.04 s against 186.20 s recorded); and the
+fio admission write/relaunch pair all pass.
+
+Three failures were traced, none to the refactor (each also fails at the
+November 8 I/O commit):
+
+- Block at four vCPUs and two matrix phases lost the end of their console output. Every
+  failing run powered off while the guest's tty still held a few hundred bytes: the
+  serial port's transmit-ready interrupt was raised and not yet serviced at power-off,
+  and every byte the guest wrote reached the log. The block, entropy and fio guests
+  powered off without draining the console, and the November 8 matrix inputs were
+  prepared before the matrix guest gained its drain. The earlier instant-transmit
+  serial model emptied the tty fast enough to hide this; a real 115200-baud port would
+  lose the same output. With a TCSADRAIN drain: block 12 of 12 phases, matrix 8 of 8
+  (two and four vCPUs), and the guest's kernel log shows the drain returning 0 after
+  the remaining bytes were transmitted. One earlier instrumented run lost about 200
+  bytes despite a drain on its failure path; it did not recur in ten later runs and is
+  not explained.
+- The lifecycle case "power-off with a halted peer" expected the peer to end
+  cancelled with a nonzero halt count. Power drain now releases the disk's busy guard
+  after its final sync, so the driver's halted rule may end the sleeping peer first,
+  and a peer sleeping in its resident publishes no stats record before it ends. The
+  old binary showed the same outcome about one time in eight. The judge now accepts
+  either ending and still requires the peer-halted event, the RIP after HLT and the
+  markers; six of six runs and all eleven cases pass.
+
+**Benchmarks** (natemu only, two runs each; the QEMU side was not rerun). November 8 figure /
+new runs. The one- and two-vCPU November 8 figures come from the matrix before the
+halted-vCPU repair (that repair is why the two-vCPU reads rose); the four-vCPU figures are the
+accepted post-repair candidates, "—" where none was recorded:
+
+| Profile | N1 | N2 | N4 |
+| --- | --- | --- | --- |
+| random read 4 KiB, depth 1 (kIOPS) | 20.2 / 20.1, 19.9 | 12.3 / 15.0, 14.8 | — / 14.6, 14.6 |
+| random read 4 KiB, depth 16 (kIOPS) | 27.2 / 28.4, 26.5 | 22.8 / 36.6, 35.7 | 36.6 / 35.0, 35.2 |
+| four readers, depth 16 (kIOPS) | 27.0 / 26.3, 25.2 | 33.4 / 33.5, 33.5 | 46.3 / 44.1, 45.9 |
+| mixed 70/30 (MiB/s) | 100 / 96, 94 | 126 / 127, 122 | — / 122.7, 107.8 |
+| fsync (IOPS) | 106 / 109, 95 | 100 / 103, 98 | 102 / 121, 101 |
+
+Sequential 128 KiB writes scatter as widely as before (485–1,319 MiB/s). Nothing moved
+beyond recorded variation.
+
+**Window counters.** One 89-second four-vCPU write run (`--perf-log`) took 5,640,426
+windows, 1,963,553 of them writing guest RAM, and 13 whose writes touched a page that had
+held a page table. The never-cleared page-table marks are not yet a cost; long uptimes
+remain unmeasured.
+
 ## Additional native VM references — November 8 suggestion
 
 The owner suggested ARM Linux under Apple's Virtualization.framework and
