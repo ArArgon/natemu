@@ -46,8 +46,28 @@ const WORKERS: usize = 4;
 /// `MAX_BUFFERED` bytes of owned buffers. Admission pauses at either bound.
 const MAX_REQUESTS: usize = 32;
 const MAX_BUFFERED: usize = 4 << 20;
-/// A native call running longer abandons the workers, and the VM fails.
-const CALL_LIMIT: Duration = Duration::from_secs(10);
+/// A native call running longer abandons the workers, and the VM fails. The owner checks its workers' calls; a watchdog
+/// thread checks the owner's own (inline) call every `WATCH`.
+const CALL_LIMIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
+const WATCH: Duration = Duration::from_millis(CALL_LIMIT.as_millis() as u64 / 10);
+/// Bounded spins before blocking, after recent activity: the owner's on its bell after it admitted or completed work,
+/// a worker's on the job queue after it finished a job. They trade host CPU for a condition-variable wake. Measured
+/// (io-benchmarks.md, "Shorter depth-1 path"): 5–10 µs gained nothing measurable at depth 1, depth 16 or four readers;
+/// 25 µs caught the next depth-1 kick but cost about 45% more host CPU per I/O, past the 20% bound; so both are off.
+/// `NATEMU_IO_SPIN_US=OWNER,WORKER` sets them (calibration on other hosts).
+const OWNER_SPIN_US: u64 = 0;
+const WORKER_SPIN_US: u64 = 0;
+fn spins() -> (Duration, Duration) {
+    static SPINS: std::sync::OnceLock<(Duration, Duration)> = std::sync::OnceLock::new();
+    *SPINS.get_or_init(|| {
+        let us = std::env::var("NATEMU_IO_SPIN_US").ok().and_then(|v| {
+            let (o, w) = v.split_once(',')?;
+            Some((o.trim().parse().ok()?, w.trim().parse().ok()?))
+        });
+        let (o, w) = us.unwrap_or((OWNER_SPIN_US, WORKER_SPIN_US));
+        (Duration::from_micros(o), Duration::from_micros(w))
+    })
+}
 /// The power-off drain's final full sync, outside every in-flight slot.
 const FINAL_SYNC: usize = usize::MAX;
 /// How long the owner sleeps with kicks suppressed while requests are on disk before it clears the flag: heads the
@@ -167,6 +187,8 @@ struct Board {
     finished: Vec<(usize, Done)>,
     /// The owner gave up on the pool: queued jobs are dropped, never run.
     abandoned: bool,
+    /// A call finished past the call limit (between two looks at `running`).
+    overran: bool,
 }
 fn board(board: &Mutex<Board>) -> MutexGuard<'_, Board> {
     board.lock().unwrap_or_else(|e| e.into_inner())
@@ -180,10 +202,12 @@ pub(super) struct Pool {
     jobs: Option<SyncSender<Ticket>>,
     board: Arc<Mutex<Board>>,
     workers: Vec<JoinHandle<()>>,
+    /// The owner's inline calls.
+    calls: Arc<dyn Calls>,
 }
 impl Pool {
     fn spawn(calls: impl Calls + 'static, bell: Arc<Bell>) -> Result<Self> {
-        let calls = Arc::new(calls);
+        let calls: Arc<dyn Calls> = Arc::new(calls);
         // Every in-flight request and the final sync can be queued at once.
         let (jobs, queue) = mpsc::sync_channel::<Ticket>(MAX_REQUESTS + 1);
         let queue = Arc::new(Mutex::new(queue));
@@ -202,6 +226,7 @@ impl Pool {
             jobs: Some(jobs),
             board: shared,
             workers,
+            calls,
         })
     }
     pub fn submit(&self, slot: usize, job: Job) -> Result<()> {
@@ -215,10 +240,13 @@ impl Pool {
     pub fn take(&self) -> Vec<(usize, Done)> {
         std::mem::take(&mut board(&self.board).finished)
     }
+    /// Run one job on the calling thread (the owner's lone request), as a worker would, without ringing the bell.
+    pub fn inline(&self, slot: usize, job: Job) {
+        run(&*self.calls, &self.board, slot, job);
+    }
     /// Some native call has run longer than the call limit.
     pub fn stalled(&self) -> bool {
-        let board = board(&self.board);
-        board.running.iter().any(|(_, t)| t.elapsed() > CALL_LIMIT)
+        stalled(&self.board)
     }
     /// Give up on every outstanding call for good: queued jobs never run, running calls keep
     /// only owned storage until they retire. Returns the VM-fatal error.
@@ -246,31 +274,63 @@ impl Drop for Pool {
         }
     }
 }
-/// One worker: run jobs until the pool closes or is abandoned.
-fn work(calls: &impl Calls, queue: &Mutex<Receiver<Ticket>>, shared: &Mutex<Board>, bell: &Bell) {
+fn stalled(board: &Mutex<Board>) -> bool {
+    let board = self::board(board);
+    board.overran || board.running.iter().any(|(_, t)| t.elapsed() > CALL_LIMIT)
+}
+/// One worker: run jobs until the pool closes or is abandoned. After a job it spins briefly for the next.
+fn work(calls: &dyn Calls, queue: &Mutex<Receiver<Ticket>>, shared: &Mutex<Board>, bell: &Bell) {
+    let mut spin = Duration::ZERO;
     loop {
-        let ticket = queue.lock().unwrap_or_else(|e| e.into_inner()).recv();
+        let ticket = receive(&queue.lock().unwrap_or_else(|e| e.into_inner()), spin);
         let Ok((slot, job)) = ticket else {
             profile::add(profile::WORKER_CPU_NS, crate::perf::thread_cpu());
             return;
         };
-        {
-            let mut board = board(shared);
-            if board.abandoned {
-                return;
-            }
-            board.running.push((slot, Instant::now()));
-        }
-        let began = profile::taken_by_worker(slot);
-        let done = execute(calls, job);
-        profile::called(slot, began);
-        {
-            let mut board = board(shared);
-            board.running.retain(|(s, _)| *s != slot);
-            board.finished.push((slot, done));
+        if !run(calls, shared, slot, job) {
+            return;
         }
         bell.ring();
+        spin = spins().1;
     }
+}
+/// The next job, spinning up to `spin` before blocking.
+fn receive(
+    queue: &Receiver<Ticket>,
+    spin: Duration,
+) -> std::result::Result<Ticket, mpsc::RecvError> {
+    if !spin.is_zero() {
+        let until = Instant::now() + spin;
+        loop {
+            match queue.try_recv() {
+                Ok(ticket) => return Ok(ticket),
+                Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+                Err(mpsc::TryRecvError::Empty) if Instant::now() >= until => break,
+                Err(mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+            }
+        }
+    }
+    queue.recv()
+}
+/// Run one job and post its result, unless the pool was abandoned (false: nothing ran).
+fn run(calls: &dyn Calls, shared: &Mutex<Board>, slot: usize, job: Job) -> bool {
+    let start = {
+        let mut board = board(shared);
+        if board.abandoned {
+            return false;
+        }
+        let start = Instant::now();
+        board.running.push((slot, start));
+        start
+    };
+    let began = profile::taken_by_worker(slot);
+    let done = execute(calls, job);
+    profile::called(slot, began);
+    let mut board = board(shared);
+    board.overran |= start.elapsed() > CALL_LIMIT;
+    board.running.retain(|(s, _)| *s != slot);
+    board.finished.push((slot, done));
+    true
 }
 
 /// The workers' native file calls; replaced by scripted calls in tests and test schedules.
@@ -314,7 +374,7 @@ impl Calls for Scripted {
 /// Run one job to completion or its first error. A short transfer continues with only the
 /// unconfirmed suffix; an error (EINTR included) or zero progress is never retried, since its
 /// effect is uncertain. A stable write syncs after the last byte.
-fn execute(native: &impl Calls, job: Job) -> Done {
+fn execute(native: &(impl Calls + ?Sized), job: Job) -> Done {
     let (offset, mut data, write, stable) = match job {
         Job::Read(offset, len) => (offset, vec![0; len], false, false),
         Job::Write(offset, bytes, stable) => (offset, bytes, true, stable),
@@ -704,16 +764,51 @@ fn clear_spans(q: Queue, avail: &mut [u8; 4]) -> [Transfer<'_>; 2] {
 impl Virtio {
     /// The block owner: admit every published request the bounds allow, gather their headers and
     /// OUT payloads, hand their disk calls to the workers, and complete answered requests in
-    /// batches. It never blocks on one job: finished jobs ring its bell.
+    /// batches. Finished jobs ring its bell. It blocks on one job only when it makes a lone
+    /// request's call itself (`start_requests`); a watchdog fails the VM if that call passes the
+    /// call limit, as the owner does for a worker's.
     pub(super) fn block_owner(
         &self,
         guest: Guest<'_>,
         disk: &Disk,
         cancel: &AtomicBool,
     ) -> Result<()> {
+        let pool = disk.start(self.wake.clone())?;
+        let board = pool.board.clone();
+        let (done, signal) = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
+                while !*done {
+                    if stalled(&board) {
+                        // The owner abandons the pool once its call returns (or at once, for a worker's).
+                        crate::owners::cancel_owners(cancel);
+                        self.wake.ring();
+                        return;
+                    }
+                    done = signal
+                        .wait_timeout(done, WATCH)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+            });
+            let result = self.serve_block(guest, disk, cancel, pool);
+            *done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            signal.notify_one();
+            result
+        })
+    }
+    fn serve_block(
+        &self,
+        guest: Guest<'_>,
+        disk: &Disk,
+        cancel: &AtomicBool,
+        mut pool: Pool,
+    ) -> Result<()> {
         let mut snapshot = Snapshot::new(self.profile.queue_max())?;
-        let mut pool = disk.start(self.wake.clone())?;
         let mut flight = Flight::default();
+        // The last pass did work: the next wait spins first.
+        let mut active = false;
         // Kick suppression (`State::suppressed`): an admission's gather sets VIRTQ_USED_F_NO_NOTIFY; the owner
         // clears it before it idles (in the completion that empties the flight, or here), before a power-off drain,
         // and before a reset of its incarnation retires. Each clear is followed by a full barrier and a read of the
@@ -745,6 +840,7 @@ impl Virtio {
                 return Err(pool.abandon());
             }
             if self.complete_answered(guest, disk, &mut flight, &mut snapshot)? {
+                active = true;
                 continue;
             }
             let suppressed = self.lock().suppressed;
@@ -755,11 +851,17 @@ impl Virtio {
                 return self.drain_disk(pool, cancel);
             }
             if self.admit_block(guest, disk, &pool, &mut flight, &mut snapshot)? {
+                active = true;
                 continue;
             }
+            let spin = if std::mem::take(&mut active) {
+                spins().0
+            } else {
+                Duration::ZERO
+            };
             if let Some(id) = suppressed {
                 // Requests on disk ring the bell as they finish; their completion reads the ring.
-                if !flight.is_empty() && self.wake.wait(SUPPRESSED_WAIT) {
+                if !flight.is_empty() && self.wake.wait_spinning(SUPPRESSED_WAIT, spin) {
                     continue;
                 }
                 if self.unsuppress(guest, id)? {
@@ -767,7 +869,7 @@ impl Virtio {
                 }
             }
             let waited = profile::start();
-            self.wake.wait(Duration::from_millis(10));
+            self.wake.wait_spinning(Duration::from_millis(10), spin);
             profile::count(profile::WAITS);
             profile::since(profile::WAIT_NS, waited);
         }
@@ -977,6 +1079,7 @@ impl Virtio {
         }
         // Submission and reset admission are ordered, but no native call holds this lock.
         let live = s.current(id);
+        let mut jobs = Vec::new();
         let mut requests = admitted.into_iter();
         for (start, mut request) in starts.into_iter().zip(requests.by_ref()) {
             if !live {
@@ -996,6 +1099,16 @@ impl Virtio {
             let slot = flight.insert(request);
             if let Some(job) = job {
                 profile::submitted(slot);
+                jobs.push((slot, job));
+            }
+        }
+        // A lone request in flight with a short call (no sync) makes it here, outside the lock: no
+        // hand-off to a worker and back. Kicks stay suppressed meanwhile; the completion re-reads
+        // the ring. Like a worker's call, it runs even if a reset arrives before it starts.
+        let lone =
+            flight.len() == 1 && matches!(jobs[..], [(_, Job::Read(..) | Job::Write(_, _, false))]);
+        if !lone {
+            for (slot, job) in jobs.drain(..) {
                 pool.submit(slot, job)?;
             }
         }
@@ -1004,6 +1117,11 @@ impl Virtio {
         }
         self.retire_reset(&mut s);
         self.settle(&mut s);
+        drop(s);
+        if let Some((slot, job)) = jobs.pop() {
+            profile::count(profile::INLINE);
+            pool.inline(slot, job);
+        }
         Ok(())
     }
     /// Read each request's gathered stream into `readable` in packed windows, the first one
@@ -1875,12 +1993,13 @@ mod owner_tests {
     const BIG: u64 = 0x10000;
     const RAM: usize = 0x40000;
 
-    /// Disk calls that wait while `held`; reads return 0x5a.
+    /// Disk calls that wait while `held`; reads return 0x5a. Each call records whether a disk worker made it.
     #[derive(Default)]
     struct Held {
         held: Mutex<bool>,
         released: Condvar,
         calls: AtomicUsize,
+        by_worker: Mutex<Vec<bool>>,
     }
     impl Held {
         fn hold(&self, on: bool) {
@@ -1888,6 +2007,8 @@ mod owner_tests {
             self.released.notify_all();
         }
         fn call(&self) {
+            let worker = std::thread::current().name() == Some("natemu-disk");
+            self.by_worker.lock().unwrap().push(worker);
             self.calls.fetch_add(1, SeqCst);
             let held = self.held.lock().unwrap();
             drop(self.released.wait_while(held, |h| *h).unwrap());
@@ -1922,6 +2043,7 @@ mod owner_tests {
         /// A deferred lifecycle access the hook made: (vCPU, token).
         deferred: Mutex<Option<(usize, u64)>>,
         published: Mutex<u16>,
+        cancel: AtomicBool,
     }
     impl Drop for Rig {
         fn drop(&mut self) {
@@ -1964,6 +2086,7 @@ mod owner_tests {
                 hook: Mutex::new(None),
                 deferred: Mutex::new(None),
                 published: Mutex::new(0),
+                cancel: AtomicBool::new(false),
             };
             for (offset, value) in [
                 (reg::STATUS, 1),
@@ -2074,6 +2197,15 @@ mod owner_tests {
         }
         /// Run the owner while `body` drives the guest; then release the disk, stop, and require a clean owner exit.
         fn run(&self, body: impl FnOnce(&Rig)) {
+            self.run_owner(|rig| {
+                body(rig);
+                rig.disk.hold(false);
+                until("flight retired", || rig.r.lock().in_flight.is_empty());
+            })
+            .expect("block owner failed");
+        }
+        /// Run the owner while `body` drives the guest; then release the disk and stop: the owner's result.
+        fn run_owner(&self, body: impl FnOnce(&Rig)) -> Result<()> {
             let copy = |spans: &mut [Transfer<'_>], publish: usize, permit: &CopyPermit| {
                 if let Some(hook) = self.hook.lock().unwrap().as_mut() {
                     hook(self, spans);
@@ -2084,20 +2216,21 @@ mod owner_tests {
                 backing: &self.b,
                 copier: Copier::Test(&copy),
             };
-            let cancel = AtomicBool::new(false);
             std::thread::scope(|scope| {
                 let owner = scope.spawn(|| {
                     let Profile::Block(disk) = &self.r.profile else {
                         unreachable!()
                     };
-                    self.r.block_owner(guest, disk, &cancel)
+                    self.r.block_owner(guest, disk, &self.cancel)
                 });
                 body(self);
                 self.disk.hold(false);
-                until("flight retired", || self.r.lock().in_flight.is_empty());
                 self.r.stop();
-                owner.join().unwrap().expect("block owner failed");
-            });
+                owner.join().unwrap()
+            })
+        }
+        fn by_worker(&self) -> Vec<bool> {
+            self.disk.by_worker.lock().unwrap().clone()
         }
     }
 
@@ -2115,9 +2248,11 @@ mod owner_tests {
                 }
             });
             rig.run(|rig| {
+                // Two requests: on the workers, so the owner idles (a lone one would be called inline).
                 rig.publish(rig.read_request(0));
+                rig.publish(rig.read_request(1));
                 assert!(rig.kick());
-                until("disk call", || rig.disk.calls() == 1);
+                until("disk calls", || rig.disk.calls() == 2);
                 // The canceled clear did not end the owner; its retry ran while the reset closed.
                 until("retrying clear", || {
                     rig.deferred.lock().unwrap().is_some() && rig.flags() == 0
@@ -2176,21 +2311,23 @@ mod owner_tests {
             }
         });
         rig.run(|rig| {
+            // Two requests on the workers (a lone one would be called inline, and the owner would not idle).
             rig.publish(rig.read_request(0));
+            rig.publish(rig.read_request(2));
             assert!(rig.kick());
-            until("unkicked head admitted", || rig.disk.calls() == 2);
+            until("unkicked head admitted", || rig.disk.calls() == 3);
             rig.disk.hold(false);
-            until("both completed", || rig.used_index() == 2);
+            until("all completed", || rig.used_index() == 3);
             until("flag cleared", || rig.flags() == 0);
         });
         assert_eq!(rig.r.lock().generation, 0);
-        let mut data = [0; 2];
-        for k in 0..2 {
+        let mut data = [0; 3];
+        for k in 0..3 {
             let at = rig.b.ram.range(STATUS + k, 1).unwrap();
             // SAFETY: fixture RAM in bounds; the owner has stopped.
             data[k as usize] = unsafe { *at };
         }
-        assert_eq!(data, [S_OK; 2]);
+        assert_eq!(data, [S_OK; 3]);
     }
 
     #[test]
@@ -2206,6 +2343,124 @@ mod owner_tests {
             until("drained", || rig.r.quiesce().unwrap());
         });
         assert_eq!((rig.flags(), rig.used_index()), (0, 1));
+        // The lone request's call was the owner's (the final sync is no read or write).
+        assert_eq!(rig.by_worker(), [false]);
+    }
+
+    #[test]
+    fn a_lone_request_is_called_inline_and_more_arriving_meanwhile_go_to_the_pool() {
+        let rig = Rig::new("inline");
+        rig.disk.hold(true);
+        rig.run(|rig| {
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("inline call", || rig.disk.calls() == 1);
+            // The owner is in the call: two more heads, unkicked (suppressed), wait for its completion's ring read.
+            rig.publish(rig.read_request(1));
+            rig.publish(rig.read_request(2));
+            assert!(!rig.kick(), "kicks stay suppressed during the inline call");
+            rig.disk.hold(false);
+            until("two on the workers", || rig.used_index() == 3);
+            // Nothing in flight again: a lone request is the owner's call once more.
+            until("idle", || rig.flags() == 0);
+            rig.publish(rig.read_request(3));
+            assert!(rig.kick());
+            until("inline again", || rig.used_index() == 4);
+        });
+        assert_eq!(rig.by_worker(), [false, true, true, false]);
+    }
+
+    #[test]
+    fn a_reset_or_disable_during_an_inline_call_waits_for_it_and_later_accesses_complete() {
+        for register in [reg::STATUS, reg::QUEUE_READY] {
+            let rig = Rig::new(&format!("inline-{register}"));
+            rig.disk.hold(true);
+            rig.run(|rig| {
+                rig.publish(rig.read_request(0));
+                assert!(rig.kick());
+                until("inline call", || rig.disk.calls() == 1);
+                rig.close(register);
+                // A register read by another vCPU waits behind the reset, as during a worker's call.
+                let Access::Deferred(read) = rig.r.access(2, reg::STATUS, 4, None) else {
+                    panic!("an access behind a closing reset did not wait");
+                };
+                std::thread::sleep(Duration::from_millis(20));
+                assert!(!rig.retired(), "the reset waits for the call");
+                assert!(matches!(rig.r.poll(2, read), Access::Deferred(_)));
+                rig.disk.hold(false);
+                until("reset retired", || rig.retired());
+                let status = if register == reg::STATUS { 0 } else { 15 };
+                until("read completed", || {
+                    rig.r.poll(2, read) == Access::Completed(status)
+                });
+            });
+            assert_eq!(rig.by_worker(), [false]);
+            assert_eq!((rig.flags(), rig.used_index()), (0, 0));
+            let s = rig.r.lock();
+            assert_eq!(s.generation + s.generations[0], 1);
+        }
+    }
+
+    #[test]
+    fn an_inline_call_past_the_call_limit_fails_the_vm() {
+        let rig = Rig::new("overrun");
+        rig.disk.hold(true);
+        let result = rig.run_owner(|rig| {
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("inline call", || rig.disk.calls() == 1);
+            // The watchdog cancels the VM while the owner is still in its call.
+            let start = Instant::now();
+            while !rig.cancel.load(SeqCst) {
+                assert!(start.elapsed() < CALL_LIMIT + 4 * WATCH, "no watchdog");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(start.elapsed() + WATCH >= CALL_LIMIT / 2);
+            assert_eq!(rig.used_index(), 0);
+        });
+        assert!(result.unwrap_err().contains("abandoned"));
+        assert_eq!(rig.used_index(), 0, "the overrun call is not published");
+    }
+
+    #[test]
+    fn spins_are_bounded_and_a_ring_is_never_lost() {
+        let bell = Bell::default();
+        let start = Instant::now();
+        assert!(!bell.wait_spinning(Duration::from_millis(20), Duration::from_millis(5)));
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(20) && waited < Duration::from_secs(1));
+        // A ring during the spin, during the sleep, and racing the switch from one to the other.
+        let bell = &bell;
+        std::thread::scope(|scope| {
+            for i in 0..2000u32 {
+                let ringer = scope.spawn(move || {
+                    for _ in 0..(i * 7919) % 4096 {
+                        std::hint::spin_loop();
+                    }
+                    bell.ring();
+                });
+                let spin = Duration::from_micros(u64::from(i % 3) * 2);
+                assert!(
+                    bell.wait_spinning(Duration::from_secs(2), spin),
+                    "ring {i} lost"
+                );
+                ringer.join().unwrap();
+            }
+        });
+        // A worker's spin ends at its bound, then it blocks until a job (or the pool's close).
+        let (jobs, queue) = mpsc::sync_channel::<Ticket>(1);
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(30));
+                jobs.send((7, Job::Flush)).unwrap();
+            });
+            let (slot, _) = receive(&queue, Duration::from_millis(5)).unwrap();
+            assert_eq!(slot, 7);
+        });
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        drop(jobs);
+        assert!(receive(&queue, Duration::from_millis(1)).is_err());
     }
 
     #[test]
