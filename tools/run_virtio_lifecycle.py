@@ -273,7 +273,12 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
             require(len(memories) == 1 and ref.num(memories[0]['addr']) == BASE and bytes.fromhex(memories[0]['data']) == expected_memory, f'CPU {v} RAM differs from complete expected image')
         if case == 'power-rep-halt':
             peer = report['cpus'][1]
-            require(peer['stop'] == 'cancelled' and peer['stats']['halts'] > 0, 'peer did not halt then cancel')
+            # Power drain releases the disk's busy guard after its final sync; the driver's halted rule may then end the
+            # sleeping peer (nothing can wake it) before the power stop cancels it. Either ending is correct. A peer
+            # sleeping in its resident publishes no stats record before the host ends it, so `halts` can read 0; the
+            # `peer-halted` event below, the RIP after HLT and the markers prove it halted and never ran past it.
+            ended = peer['stop'] == 'cancelled' or peer['stop'] == 'resident' and peer['reason'].startswith('halted ')
+            require(ended, 'peer did not halt then end')
             for record in (state[1], peer):
                 require(ref.num(record['rip']) == meta['peer_rip'], 'peer advanced beyond HLT')
                 require(ref.num(record['gpr'][14]) == PEER_MARKER and ref.num(record['gpr'][15]) == PEER_R15, 'peer marker/progress mismatch')
@@ -417,10 +422,10 @@ def self_check():
                             if field == 'rip': peer['rip'] = '0'
                             else: peer['gpr'][int(field[1:])] = 0
                         assert verify(*bad); controls += 1
-                for mutate in ('stop', 'halts', 'trace', 'memory'):
+                for mutate in ('stop', 'reason', 'trace', 'memory'):
                     bad = copy.deepcopy(args)
                     if mutate == 'stop': bad[1]['cpus'][1]['stop'] = 'reached'
-                    elif mutate == 'halts': bad[1]['cpus'][1]['stats']['halts'] = 0
+                    elif mutate == 'reason': bad[1]['cpus'][1].update(stop='resident', reason='exception status=1 detail=0')
                     elif mutate == 'memory': bad[1]['cpus'][1]['memory'][0]['data'] = 'ff' + memory.hex()[2:]
                     else: bad[3]['events'].remove('peer-halted')
                     assert verify(*bad); controls += 1

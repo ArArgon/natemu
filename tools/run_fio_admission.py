@@ -46,7 +46,9 @@ export_logs() {
     echo "FIO-ADMISSION-LOG-END $name"
   done
 }
-fail() { echo "FIO-ADMISSION-FAIL $*"; export_logs; dmesg; poweroff -f; while :; do sleep 1; done; }
+# poweroff -f does not wait for queued console output; BusyBox stty restores attributes with TCSADRAIN.
+drain_console() { console_mode=$(/bin/busybox stty -F /dev/console -g) && /bin/busybox stty -F /dev/console "$console_mode"; }
+fail() { echo "FIO-ADMISSION-FAIL $*"; export_logs; dmesg; drain_console || true; poweroff -f; while :; do sleep 1; done; }
 mount -t tmpfs tmpfs /tmp || fail tmpfs
 mkdir /tmp/fio || fail log-directory
 phase=
@@ -91,6 +93,7 @@ export_logs
 cat /proc/interrupts
 dmesg
 echo "FIO-ADMISSION-PASS phase=$phase"
+drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
 '''
