@@ -80,18 +80,25 @@ impl Snapshot {
     pub(super) fn reusable(&self, q: Queue, id: Identity) -> bool {
         self.captured == Some(id) && self.avail_index() != q.next_avail
     }
-    /// Reads of `q`'s descriptor table and available ring into this snapshot, for one window.
-    pub(super) fn reads(&mut self, q: Queue) -> [Transfer<'_>; 2] {
+    /// Reads of `q`'s available ring and descriptor table into this snapshot, for one batch:
+    /// the ring's flags and index first (whole fields), then its entries, then the table. A
+    /// windowless copy orders each read after the previous one (acquire), so every entry and
+    /// descriptor the driver published before the index read is current.
+    pub(super) fn reads(&mut self, q: Queue) -> [Transfer<'_>; 3] {
         let table_len = usize::from(q.size) * 16;
-        let avail_len = 4 + usize::from(q.size) * 2;
+        let (header, ring) = self.avail[..4 + usize::from(q.size) * 2].split_at_mut(4);
         [
+            Transfer::Read {
+                gpa: q.avail,
+                bytes: header,
+            },
+            Transfer::Read {
+                gpa: q.avail + 4,
+                bytes: ring,
+            },
             Transfer::Read {
                 gpa: q.desc,
                 bytes: &mut self.table[..table_len],
-            },
-            Transfer::Read {
-                gpa: q.avail,
-                bytes: &mut self.avail[..avail_len],
             },
         ]
     }

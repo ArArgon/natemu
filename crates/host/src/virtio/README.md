@@ -6,7 +6,7 @@ bits in `status`), the shared lifecycle state, the owner loop and virtio-rng;
 `block.rs` virtio-blk, its disk workers and the block owner loop; `net.rs` the
 network frontend and `PacketPort`; `testing.rs` the test driver's disk-call
 schedules. Entropy and network end a request through `Virtio::complete`; block
-completes answered requests in batches. Either way a window publishes whole
+completes answered requests in batches. Either way a copy batch publishes whole
 requests: payload and status, used elements, one used index, then a read of the
 available ring's flags and index.
 
@@ -53,6 +53,27 @@ epoch, so a later read-only window cannot hide an earlier table write. The order
 HLT promise permits admission without waking that CPU; AP-mailbox waits still
 acknowledge each request. Unaffected compiled objects survive. Native backend calls still use owned buffers outside
 the window; this change does not introduce zero-copy or relax exclusion.
+
+Devices now copy through `Backing::copy_guest_windowless` (November 9 design
+"Windowless copies with targeted invalidation" in `docs/restructure/io-plan.md`):
+no vCPU pauses in the usual case. The batch is validated whole; if any written
+page carries a page-table mark the whole batch takes the window above
+(`table_fallbacks`). Otherwise the permit is granted before the first write (a
+reset cancels before it or waits for the call, as for a granted window), the
+written pages' code marks are cleared and posted to their holders, which are
+rung; the body (payload, status, used elements, metadata reads) is copied, a
+full barrier follows, and the marks are rechecked (a mark taken during the copy
+is posted too). The used index is written only after every posted vCPU has
+drained its post, is halted in HLT (it drains on withdrawal, before guest
+access) or has ended; after 50 ms the used index and the reads after it go
+through a window instead (`drain_expiries`). Then a full barrier, the available
+ring's flags and index, and any snapshot refresh. Fields of up to 16 bytes move
+as whole aligned accesses; each read is followed by an acquire barrier, and the
+snapshot reads the available index first, then its entries, then the descriptor
+table. Windowless batches take no epoch lock. The `io` perf line adds
+`windowless`, `windowless_posted`, `recheck_holders`, `drain_waits`,
+`drain_us`, `drain_max_us`, `drain_expiries` and `table_fallbacks`; `windows`
+now counts only fallback windows and the test drivers' own windows.
 
 ## Dependency identity
 

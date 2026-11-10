@@ -31,6 +31,9 @@ impl<'a> Hooks<'a> {
                     | BEFORE_SPLIT
                     | BEFORE_GRANT
                     | AFTER_GRANT
+                    | AFTER_PRECHECK
+                    | BEFORE_RECHECK
+                    | BEFORE_PUBLISH
             )
         {
             return Err("invalid I/O test hook".into());

@@ -355,8 +355,9 @@ pub mod cache {
     pub const WRITABLE_PAGES: usize = CODE_PAGES + MASK_BYTES;
     pub const RECORDS: usize = WRITABLE_PAGES + MASK_BYTES;
     /// One bit per physical 4 KiB page ever read as a guest page table, at any level. Residents
-    /// publish before reading; the host inspects only inside a granted I/O window. Never cleared
-    /// during this VM's lifetime: page reuse may cause extra invalidations, never missed ones.
+    /// publish before reading; the host inspects them before a windowless I/O copy writes (and
+    /// inside a fallback window). Never cleared during this VM's lifetime: page reuse may cause
+    /// extra invalidations, never missed ones.
     pub const TABLE_PAGES: usize =
         (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(8);
     pub const TABLE_PAGE_BYTES: usize = super::MAX_GUEST_PAGES.div_ceil(64) * 8;
@@ -364,11 +365,14 @@ pub mod cache {
     ///
     /// Marks are never cleared, so a bit once seen set stays set and the common already-marked case
     /// needs no store (a page-table read is a hot path and these lines are shared by every vCPU).
-    /// The load may be Relaxed: the host reads these words only inside a granted I/O window, after
-    /// every participant has acknowledged or halted, and each resident completes `dsb sy` and a
-    /// SeqCst store before that acknowledgement or halt. Any mark this vCPU observed was set by a
-    /// participant whose own acknowledgement orders it before the grant; a stale "missing" result
-    /// only costs a redundant `fetch_or`.
+    /// The load may be Relaxed. The host reads these words with SeqCst loads before a windowless
+    /// copy's first write; a write to a marked page then falls back to a full window. A mark set
+    /// (by any vCPU) before that check is visible to it: the setter's `fetch_or` is SeqCst and the
+    /// walk that needed it read the page after it. A mark the check misses belongs to a walk that
+    /// began during the copy, reading a buffer the guest gave the device: a guest race, as a
+    /// page-table write racing the copy would be. Inside a fallback window every participant has
+    /// acknowledged or halted after `dsb sy` and a SeqCst store, so marks cannot grow until
+    /// release. A stale "missing" result only costs a redundant `fetch_or`.
     pub fn mark_table_page(word: &core::sync::atomic::AtomicU64, bit: u64) {
         use core::sync::atomic::Ordering::{Relaxed, SeqCst};
         if word.load(Relaxed) & bit == 0 {
@@ -426,6 +430,11 @@ pub mod cache {
         pub const BEFORE_SPLIT: u64 = 6;
         pub const BEFORE_GRANT: u64 = 8;
         pub const AFTER_GRANT: u64 = 9;
+        /// Host windowless copy: after the pre-copy mark check, between the copy and its
+        /// recheck, and before publication (after the drain wait).
+        pub const AFTER_PRECHECK: u64 = 10;
+        pub const BEFORE_RECHECK: u64 = 11;
+        pub const BEFORE_PUBLISH: u64 = 12;
         const _: () = assert!(BASE + (HOST + 1) * STRIDE <= super::CODE_PAGES);
     }
 

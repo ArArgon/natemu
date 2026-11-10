@@ -382,8 +382,9 @@ impl Used {
     }
     /// Append the elements, then the used index, then a read of the available ring's flags and
     /// index. Reading after publication sees suppression and newly published work even when a
-    /// guest buffer aliases ring metadata.
-    fn publish<'a>(&'a mut self, q: Queue, transfers: &mut Vec<Transfer<'a>>) {
+    /// guest buffer aliases ring metadata. Returns the used index's position in `transfers`: the
+    /// start of the publication a windowless copy holds back until posted vCPUs have drained.
+    fn publish<'a>(&'a mut self, q: Queue, transfers: &mut Vec<Transfer<'a>>) -> usize {
         let Self {
             elements,
             index,
@@ -396,6 +397,7 @@ impl Used {
                 bytes: element,
             });
         }
+        let publish = transfers.len();
         transfers.push(Transfer::Write {
             gpa: q.used + 2,
             bytes: index,
@@ -404,6 +406,7 @@ impl Used {
             gpa: q.avail,
             bytes: avail,
         });
+        publish
     }
     fn interrupt_wanted(&self) -> bool {
         u16::from_le_bytes([self.avail[0], self.avail[1]]) & AVAIL_NO_INTERRUPT == 0
@@ -969,9 +972,18 @@ impl Virtio {
     fn current(&self, id: Identity) -> bool {
         self.lock().current(id)
     }
-    /// Copy `spans` in one window while `id` is current. False when a reset or stop overtook the
-    /// request before its grant; a granted copy always counts, even if a reset arrived meanwhile.
-    fn copy(&self, guest: Guest<'_>, id: Identity, spans: &mut [Transfer<'_>]) -> Result<bool> {
+    /// Copy `spans` while `id` is current, windowless unless a fallback needs a window;
+    /// `spans[publish..]` is the used-ring publication, if any. False when a
+    /// reset or stop overtook the request before its grant; a granted copy always counts, even
+    /// if a reset arrived meanwhile.
+    fn copy(
+        &self,
+        guest: Guest<'_>,
+        id: Identity,
+        spans: &mut [Transfer<'_>],
+        publish: Option<usize>,
+    ) -> Result<bool> {
+        let publish = publish.unwrap_or(spans.len());
         let permit = Arc::new(CopyPermit::new());
         {
             let mut s = self.lock();
@@ -980,11 +992,12 @@ impl Virtio {
             }
             s.permit = Some((id, permit.clone()));
         }
-        let copied = guest.backing.copy_guest_with_permit(
+        let copied = guest.backing.copy_guest_windowless(
             guest.machine,
             guest.stops,
             Duration::from_secs(2),
             spans,
+            publish,
             &permit,
         );
         let mut s = self.lock();
@@ -997,8 +1010,8 @@ impl Virtio {
             Err(e) => Err(e),
         }
     }
-    /// Copy `data` and the chain's used-ring publication in one window, then raise the used-buffer
-    /// interrupt. False when the window was canceled.
+    /// Copy `data` and the chain's used-ring publication in one batch, then raise the used-buffer
+    /// interrupt. False when the batch was canceled.
     fn complete(
         &self,
         guest: Guest<'_>,
@@ -1008,8 +1021,8 @@ impl Virtio {
     ) -> Result<bool> {
         let mut used = Used::new(chain.queue, [(chain.head, len)]);
         let mut transfers = data;
-        used.publish(chain.queue, &mut transfers);
-        if !self.copy(guest, chain.id, &mut transfers)? {
+        let publish = used.publish(chain.queue, &mut transfers);
+        if !self.copy(guest, chain.id, &mut transfers, Some(publish))? {
             return Ok(false);
         }
         drop(transfers);
@@ -1247,7 +1260,7 @@ impl Virtio {
         q: Queue,
         id: Identity,
     ) -> Result<bool> {
-        if !self.copy(guest, id, &mut snapshot.reads(q))? {
+        if !self.copy(guest, id, &mut snapshot.reads(q), None)? {
             return Ok(false);
         }
         snapshot.captured(id);

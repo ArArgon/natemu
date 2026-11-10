@@ -220,7 +220,7 @@ impl Virtio {
                 .descriptors
                 .iter()
                 .map(|d| (d.addr().0, d.len() as usize));
-            if !self.copy(guest, chain.id, &mut gather(extents, frame))? {
+            if !self.copy(guest, chain.id, &mut gather(extents, frame), None)? {
                 return Ok(Request::Canceled);
             }
             let packet = match transmit_packet(&bytes[..capacity]) {

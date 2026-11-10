@@ -906,7 +906,7 @@ impl Virtio {
         for window in pack(&costs, Cost::default()) {
             let mut spans: Vec<Transfer<'_>> =
                 reads.by_ref().take(window.len()).flatten().collect();
-            if !spans.is_empty() && !self.copy(guest, id, &mut spans)? {
+            if !spans.is_empty() && !self.copy(guest, id, &mut spans, None)? {
                 break;
             }
             gathered = window.end;
@@ -960,7 +960,7 @@ impl Virtio {
             let (writes, lens): (Vec<_>, Vec<_>) = completions.by_ref().take(window.len()).unzip();
             let mut used = Used::new(q, heads.zip(lens));
             let mut transfers: Vec<Transfer<'_>> = writes.into_iter().flatten().collect();
-            used.publish(q, &mut transfers);
+            let publish = used.publish(q, &mut transfers);
             let refresh = i == last
                 && Cost::of(&transfers)
                     .plus(Cost::of(&snapshot.reads(q)))
@@ -968,7 +968,7 @@ impl Virtio {
             if refresh {
                 transfers.extend(snapshot.reads(q));
             }
-            let granted = self.copy(guest, id, &mut transfers)?;
+            let granted = self.copy(guest, id, &mut transfers, Some(publish))?;
             drop(transfers);
             match (granted, refresh) {
                 (true, true) => snapshot.captured(id),
