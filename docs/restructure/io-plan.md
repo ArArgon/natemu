@@ -168,9 +168,11 @@ and a host-visible stopped PC are insufficient.
    follow guest mutations through a retained iterator. Reserve before consuming
    next_avail, and consume an accepted head once under the device owner.
    The owner may reuse this bounded metadata snapshot for its already-published
-   prefix until the captured available index is exhausted. This is prefetch, not
-   admission of further requests: each head still undergoes complete validation
-   and the one-active-request reset/S5 rules. Queue/device generation changes,
+   prefix until the captured available index is exhausted. Entropy and network take
+   one head from it at a time; block admits every head its in-flight bounds allow
+   from one snapshot ([stage 2](#concurrent-block-requests-and-batched-windows-proposed-november-9)).
+   Each head still undergoes complete validation, and reset/S5 wait for every
+   admitted request of the old incarnation. Queue/device generation changes,
    switching queues, Empty/Canceled/Invalid dispositions and prefix exhaustion
    force a fresh capture. Geometry is immutable while ready/active; disable/reset
    advances the identity. A completion aliasing later metadata does not rewrite
@@ -215,7 +217,10 @@ profile and backpressure block work without narrowing its advertised request
 size. Do not fragment a block
 payload snapshot into unrelated epochs and call it one coherent unit. Start with
 one request per RAM window; add bounded packet/request batches after measuring
-pause time. Queue capacity is not permission to allocate a maximum payload for
+pause time. *Amended November 9 (stage 2):* block now keeps up to min(queue size,
+32) requests and 4 MiB of owned buffers in flight, and a window carries whole
+requests up to 1 MiB and 1160 spans; each request's payload is still captured in
+one window. Entropy and network keep the starting bounds. Queue capacity is not permission to allocate a maximum payload for
 every possible descriptor without a configured global in-flight byte budget.
 IO0 must freeze numeric request/extent/byte limits for every device and queue.
 
@@ -306,7 +311,7 @@ plan-level decisions.
 
 | Backend | First implementation | Measured extensions |
 | --- | --- | --- |
-| Raw disk | Supervisor opens one owned regular file; fixed capacity and stable ID. One ordered blocking lane uses native positioned I/O on owned buffers, asynchronously relative to vCPUs. Preserve IN/OUT/FLUSH/GET_ID and 04-28's complete error profile. | Buffer reuse first; vectored I/O or cache/read-ahead/preallocation policy only when justified. Parallel lanes need explicit flush ordering. |
+| Raw disk | Supervisor opens one owned regular file; fixed capacity and stable ID. A fixed pool of four workers on the shared descriptor uses native positioned I/O on owned buffers, asynchronously relative to vCPUs and in any order (stage 2; first built as one ordered lane). Preserve IN/OUT/FLUSH/GET_ID and 04-28's complete error profile. | Buffer reuse first; vectored I/O or cache/read-ahead/preallocation policy only when justified. A flush needs no ordering against other requests (it covers completed writes, §5.2.6). |
 | vmnet shared/NAT | Native network services, dispatch notifications and scatter/gather over owned storage. Honor returned counts and limits. No virtio checksum/GSO features initially. | After the one-TX/one-RX baseline, explicitly increase bounded slot budgets and use native packet batches. Negotiate checksum/GSO and vmnet virtio-header mode together after header/size/fallback tests; increase RX/storage limits before enabling large TSO packets. |
 | Entropy | Native entropy acquisition into initialized owned storage outside the window; commit through the common path. | Bounded batching if useful; no fabricated successful bytes on acquisition error. |
 
@@ -328,7 +333,7 @@ the documented backend choice. Entitlement and role-manifest details are in the
 [admission section](io-native-backends.md#packet-contract-and-admission-gate-for-vmnet).
 
 Disk durability is part of IO3, not a later optimization. Negotiated FLUSH allows
-writeback; a successful FLUSH follows earlier accepted writes and successful
+writeback; a successful FLUSH follows earlier completed writes and successful
 F_FULLFSYNC. If FLUSH is declined, each successful OUT waits for full-sync.
 Short positioned I/O advances only its completed prefix; zero progress or an
 error, including EINTR, reports IOERR without replaying the issued request. Failed staged IN
@@ -384,7 +389,7 @@ handler was scheduled, not that all callbacks/buffers are retired; wait for stop
 completion and drain application callback references. A stuck syscall/worker is
 contained failure, not successful drain. Management termination remains possible
 without freeing live storage or waiting indefinitely in an unkillable owner
-thread; IO0 must map the disk lane to the per-VM process lifetime/termination
+thread; IO0 must map the disk workers to the per-VM process lifetime/termination
 mechanism. Unexpected partial RAM-copy failure keeps admission closed and fails
 the VM; do not retry the whole commit or resume with guessed coherence state.
 
@@ -743,7 +748,7 @@ from this entry; see the [benchmark record](io-benchmarks.md).
 
 ## Concurrent block requests and batched windows (proposed, November 9)
 
-**Status: proposed; needs owner sign-off before implementation.** It widens two bounds this
+**Status: approved; stages 1 and 2 built (stage 2 result below).** It widens two bounds this
 plan set as starting points ("one block request in flight", "one request per RAM window"),
 which the plan said to revisit after measuring pause time. An independent review (November 9)
 found the first draft unready; this version addresses it. If accepted, the earlier texts that
@@ -809,7 +814,28 @@ both pay.
    target as well.
 3. **Batched capture**, only if the counters still show capture windows dominating: one
    metadata snapshot admits up to K chains; their headers and OUT payloads are gathered in as
-   few windows as the byte and span bounds allow.
+   few windows as the byte and span bounds allow. *Built as part of stage 2* (the owner asked
+   for admission of every published head from one snapshot in the same change).
+
+   *Stage 2 build (November 9, branch `io-concurrency-stage2`; awaiting review and the
+   main session's measurements).* As designed, with these specifics: the block device has its
+   own owner loop (entropy and network keep the one-request loop, sharing the in-flight set,
+   reset and window code); the owner's wake source is a sticky bell that guest notifications,
+   resets, power drain, stop and disk workers ring; the 10 s limit is measured per native call
+   from the moment a worker starts it; a job queued at abandonment never runs; IN buffers and
+   the gathered header/OUT stream are reserved at admission (a request whose readable stream
+   exceeds any valid request is answered IOERR unread and reserves nothing for it); the
+   metadata refresh rides on the last completion window when it fits. A granted completion
+   window counts each request as one `commit` in the test trace. Window bounds: MAX_BYTES
+   1 MiB, MAX_SPANS 1160 (32 requests of 32 data segments plus header, status and used
+   element, and the window's ring bookkeeping); a single request always fits, larger batches
+   split. Forced schedules added: `out-of-order` (the sector-0 read is held until another
+   request is published), `cancel-batch` (the completion of four answered requests is held
+   until a device reset defers behind them, so its window is never granted) and `reset-mixed`
+   (a reset defers behind completed, running and queued requests). The lifecycle guests now
+   wait for every expected interrupt bit, because a concurrent completion may raise its bit
+   after another's; `malformed-later` now fails the device at admission, before the valid
+   first request completes.
 
 **Flush.** Virtio 1.2 §5.2.6 requires a flush to cover writes that had *completed* before it.
 A completed write's `pwrite` has returned, and `F_FULLFSYNC` covers everything the file has

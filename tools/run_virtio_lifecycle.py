@@ -3,7 +3,10 @@
 
 Uses the testing driver's native-call schedule only; queue validation, copies,
 reset, IRQ and power drain are production paths. Run from a retained source build.
-Nine N=1 cases and one N=2 power/HLT case, no retries, at most 120 seconds per VM. No throughput claims.
+Thirteen N=1 cases and one N=2 power/HLT case, no retries, at most 120 seconds per VM. Three
+cases force concurrent-request schedules: out-of-order completion, a canceled completion window
+covering four requests, and a reset with requests completed, running and queued. No throughput
+claims.
 """
 import argparse
 import copy
@@ -25,9 +28,13 @@ from io_common import VM_LOCK
 BASE, CODE, STACK, MMIO = 0x400000, 0x100000, 0x300000, 0xf0000000
 SIZE, DISK_SIZE = 0x20000, 2 * 1024 * 1024
 CASES = ('reset', 'disable', 'power-scalar', 'power-rep', 'power-sync-error',
-         'read-error', 'write-error', 'malformed', 'malformed-later', 'fullqueue', 'power-rep-halt')
+         'read-error', 'write-error', 'malformed', 'malformed-later', 'fullqueue', 'power-rep-halt',
+         'out-of-order', 'cancel-batch', 'reset-mixed')
 MODES = {'reset': 'hold-reset', 'disable': 'hold-disable', 'power-scalar': 'hold-power',
-         'power-rep': 'hold-power', 'power-sync-error': 'power-sync-error', 'power-rep-halt': 'hold-power-halt'}
+         'power-rep': 'hold-power', 'power-sync-error': 'power-sync-error', 'power-rep-halt': 'hold-power-halt',
+         'out-of-order': 'out-of-order', 'cancel-batch': 'cancel-batch', 'reset-mixed': 'reset-mixed'}
+# The device reset's register readback (offset, saved at, value), shared by the reset cases.
+RESET_READBACK = ((0x60, 0xe000, 0), (0x70, 0xe004, 0), (0x44, 0xe008, 0))
 PEER_CODE, PEER_MARKER, PEER_R15 = 0x110000, 0x48414c5450454552, 0x5151
 
 
@@ -101,9 +108,10 @@ def fixture(case, work):
         label = f'used_{q:x}_{n}'
         emit(f'{label}:\ncmp word ptr [{q + 0x2002:#x}], {n}\njne {label}')
     def irq(q, bit=1):
+        # Wait for every bit: a concurrent completion may raise its own after another's.
         label = f'irq_{len(assembly)}'
         emit(f'{label}:'); readreg(0x60)
-        emit(f'test eax, {bit}\njz {label}\nmov dword ptr [{q + 0xe00c:#x}], eax')
+        emit(f'mov ecx, eax\nand ecx, {bit}\ncmp ecx, {bit}\njne {label}\nmov dword ptr [{q + 0xe00c:#x}], eax')
         reg(bit); mmwrite(0x64, bit); readreg(0x60); reg(0)
         emit(f'mov dword ptr [{q + 0xe010:#x}], eax')
     def hold():
@@ -119,7 +127,7 @@ def fixture(case, work):
     readreg(4); reg(2)
     readreg(8); reg(2)
     negotiate(); configure(BASE)
-    q, completed, later_avail = BASE, [], []
+    q, completed, later_avail, quiet = BASE, [], [], []
     expected_disk = bytearray(disk)
     canceled = case in ('reset', 'disable', 'malformed')
     power = case.startswith('power-')
@@ -136,6 +144,35 @@ def fixture(case, work):
         expect(q + 0x2002, 1, 'word'); expect(first['status'], 0, 'byte'); expect(second['status'], 0xa5, 'byte')
         mmwrite(0x70, 0)
         completed.append((q, 0, first, 0, disk[:512]))
+    elif case == 'out-of-order':
+        # The sector-0 read is held until the sector-1 read has been published, so used slots
+        # follow completion order, not admission order.
+        first, second = request(q, 0, 0, 0), request(q, 3, 0, 1)
+        avail(q, [0, 3]); notify(); wait_used(q, 2)
+        mmwrite(0x44, 0); readreg(0x44); reg(0); irq(q)
+        completed += [(q, 0, second, 0, disk[512:1024]), (q, 1, first, 0, disk[:512])]
+    elif case in ('cancel-batch', 'reset-mixed'):
+        if case == 'cancel-batch':
+            # Four reads finish; the completion covering them is held until the reset defers
+            # behind them, so that window is never granted.
+            old, published = [request(q, 3 * i, 0, i) for i in range(4)], 0
+        else:
+            # A read and an unsupported request complete (the immediate answer first); five
+            # sector-0 reads are then held on the four workers or queued when the reset defers.
+            old = [request(q, 0, 0, 1), request(q, 3, 123)] + [request(q, 6 + 3 * i, 0, 0) for i in range(5)]
+            published = 2
+            quiet += [(q, 0, old[1], 2, b''), (q, 1, old[0], 0, disk[512:1024])]
+        avail(q, [r['head'] for r in old]); notify()
+        if published: wait_used(q, published)
+        hold(); mmwrite(0x70, 0)
+        for offset, saved, value in RESET_READBACK:
+            readreg(offset); emit(f'mov dword ptr [{q + saved:#x}], eax'); reg(value)
+        expect(q + 0x2002, published, 'word')
+        for r in old[published:]: expect(r['status'], 0xa5, 'byte')
+        fresh = request(q + 0x10000, 0, 0, 4)
+        avail(q + 0x10000, [0]); negotiate()
+        configure(q + 0x10000); notify(); wait_used(q + 0x10000, 1); irq(q + 0x10000)
+        completed.append((q + 0x10000, 0, fresh, 0, disk[2048:2560]))
     elif case == 'fullqueue':
         requests = [request(q, i, 4) for i in range(0, 128, 2)]
         avail(q, [r['head'] for r in requests]); notify(); wait_used(q, 64)
@@ -192,12 +229,14 @@ def fixture(case, work):
     asm = '\n'.join(assembly)
     code, labels = ref.assemble(asm, labels=True)
     expected = bytearray(memory)
-    for target, index, req, status, data in completed:
+    for target, index, req, status, data in completed + quiet:
         store(expected, req['status'], bytes([status]))
         if data: store(expected, req['data'], data)
         length = 0 if req['kind'] == 0 and status else len(data) + 1
         put(expected, target + 0x2004 + 8 * index, '<II', req['head'], length)
         put(expected, target + 0x2002, '<H', index + 1)
+    # Completions the guest acknowledged by interrupt (not those a reset overtook).
+    for target, *_ in completed:
         if not power: put(expected, target + 0xe00c, '<I', 1)
     for target, count, head in later_avail:
         put(expected, target + 0x1002, '<H', count)
@@ -303,6 +342,21 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         require(io['calls'] == 3 and events.count('injected-eio') == 1, 'wrong partial I/O attempt count')
         require(events.count('commit') == (3 if case == 'write-error' else 2), 'wrong completion count')
         if case == 'write-error': require(ordered(events, ['sync-enter', 'sync-ok', 'commit']), 'partial write not flushed')
+    elif case == 'out-of-order':
+        require(io['calls'] == 2 and events.count('commit') == 2 and events.count('backend-held') == 1, 'wrong call or completion count')
+        require(ordered(events, ['read:512:512', 'read-result:Ok(512)', 'commit', 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'commit']),
+                'held read did not complete after the later one')
+    elif case == 'cancel-batch':
+        require(io['calls'] == 5 and events.count('commit') == 1 and events.count('read-result:Ok(512)') == 5, 'canceled batch published or recovery missing')
+        held = events.index('batch-held') if 'batch-held' in events else -1
+        require(all(f'read:{512 * i}:512' in events[:held] for i in range(4)) and events[:held].count('read-result:Ok(512)') == 4,
+                'batch held before its four reads finished')
+        require(ordered(events, ['batch-held', 'reset-deferred', 'batch-released', 'read:2048:512', 'read-result:Ok(512)', 'commit']), 'canceled batch order mismatch')
+    elif case == 'reset-mixed':
+        require(io['calls'] == 7 and events.count('commit') == 3 and events.count('read:0:512') == 5, 'wrong call or completion count')
+        require(events.count('backend-held') == 5 and events.count('read-result:Ok(512)') == 7, 'held sector-0 reads missing')
+        require(ordered(events, ['commit', 'commit', 'reset-deferred', 'backend-released', 'read:2048:512', 'read-result:Ok(512)', 'commit']),
+                'mixed reset order mismatch')
     elif case == 'malformed-later':
         require(io['calls'] == 1 and events.count('commit') == 1, 'malformed captured successor reached backend or publication')
         require(ordered(events, ['read:0:512', 'read-result:Ok(512)', 'commit']), 'valid captured prefix did not complete')
@@ -364,6 +418,18 @@ def self_check():
         'malformed': ['read:512:512', 'read-result:Ok(512)', 'commit'],
         'malformed-later': ['read:0:512', 'read-result:Ok(512)', 'commit'],
         'fullqueue': ['sync-enter', 'sync-ok', 'commit'] * 64,
+        'out-of-order': ['backend-held', 'read:512:512', 'read-result:Ok(512)', 'commit', 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'commit'],
+        'cancel-batch': [e for i in range(4) for e in (f'read:{512 * i}:512', 'read-result:Ok(512)')]
+        + ['batch-held', 'reset-deferred', 'batch-released', 'read:2048:512', 'read-result:Ok(512)', 'commit'],
+        'reset-mixed': ['read:512:512', 'read-result:Ok(512)', 'commit', 'commit'] + ['backend-held'] * 4 + ['reset-deferred']
+        + ['backend-released', 'read:0:512', 'read-result:Ok(512)'] * 4 + ['backend-held', 'backend-released', 'read:0:512', 'read-result:Ok(512)']
+        + ['read:2048:512', 'read-result:Ok(512)', 'commit'],
+    }
+    # Schedule corruptions each concurrent case must reject.
+    corrupt = {
+        'out-of-order': lambda e: e[:3] + [e[4], e[3]] + e[5:],  # released before the first commit
+        'cancel-batch': lambda e: e[:-1] + ['commit', 'commit'],
+        'reset-mixed': lambda e: e[:4] + e[5:],
     }
     controls = 0
     record_lines = ['io-state: []', 'io-disk: {}', 'io-memory: []']
@@ -379,7 +445,7 @@ def self_check():
             meta = fixture(case, work)
             events = traces.get(case, ['backend-held', 'power-poll', 'backend-released', 'write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter'] + (['sync-error'] if meta['sync_error'] else ['sync-ok', 'lane-joined']))
             if case == 'power-rep-halt': events.insert(2, 'peer-halted')
-            calls = 0 if case == 'fullqueue' else 2 if case in ('reset', 'disable') else 3 if case in ('read-error', 'write-error') else 1
+            calls = {'fullqueue': 0, 'reset': 2, 'disable': 2, 'read-error': 3, 'write-error': 3, 'out-of-order': 2, 'cancel-batch': 5, 'reset-mixed': 7}.get(case, 1)
             io = {'entered': case != 'fullqueue', 'calls': calls, 'events': events}
             gpr = [0] * 16
             if case in ('power-rep', 'power-rep-halt'): gpr[1], gpr[6] = 1, BASE + 0xf002
@@ -397,6 +463,10 @@ def self_check():
             stderr = f'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none\n' + ('disk shutdown full-sync: injected\n' if meta['sync_error'] else '')
             args = [meta, report, state, io, stderr, 1 if meta['sync_error'] else 0, False, disk, disk, memory, [copy.deepcopy(cpu['memory']) for _ in range(n)]]
             assert not verify(*args), (case, verify(*args))
+            if case in corrupt:
+                bad = copy.deepcopy(args); bad[3]['events'] = corrupt[case](bad[3]['events'])
+                if not meta['sync_error']: bad[1]['io_disk'] = bad[3]
+                assert verify(*bad), case; controls += 1
             for index, mutate in ((2, lambda v: [dict(v[0], rip='0')] + v[1:]),
                                   (3, lambda v: dict(v, events=v['events'] + ['barrier-timeout'])),
                                   (3, lambda v: dict(v, events=v['events'] + ['trace-overflow'])),
