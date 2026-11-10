@@ -128,7 +128,11 @@ the consumed index at admission, and gathers the new requests' headers and OUT p
 windows as MAX_BYTES (1 MiB) and MAX_SPANS allow. Their disk calls go to a fixed
 pool of four worker threads sharing the file; each finished job rings the owner's
 one wake source (the bell that guest notifications, resets, power drain and stop
-also ring), so the owner never blocks on one job. Answered requests complete in
+also ring). The one exception: a lone request in flight whose call is a read or a
+write without sync is called by the owner itself, outside the lock, saving two
+thread hand-offs; kicks stay suppressed meanwhile and the completion re-reads the
+ring. A reset, disable or power-off arriving then waits for that call as it would
+for a worker's. Answered requests complete in
 answering order: each window takes the next used slots, writes one used index and
 reads the available ring's flags last; the last window also refreshes the
 metadata snapshot when it fits. A malformed chain fails the device; requests
@@ -148,10 +152,13 @@ nonreturning wait that services copy windows. Quiesce closes new admission and
 completes the requests already in flight, then performs a final full-sync on a
 worker and joins the workers. Only successful retirement permits PowerOff.
 
-A native disk call has a ten-second deadline from when a worker starts it;
+A native disk call has a ten-second deadline from when it starts (an owner's
+inline call is watched by a scoped watchdog thread, which cancels the VM);
 shutdown has a thirty-second poll deadline. A stalled native syscall is not
 forcibly canceled: its owned file/buffers remain alive in detached workers (jobs
-still queued never run), with no guest RAM, IRQ or Machine reference. The VM fails and the normal CLI exits its per-VM process. Library
+still queued never run), with no guest RAM, IRQ or Machine reference. An owner's
+inline call cannot be detached: the VM is cancelled at the deadline, but its
+teardown (and the process exit) waits until that syscall returns. The VM fails and the normal CLI exits its per-VM process. Library
 embedders must treat this as worker-process fatal, terminate/restart the worker,
 and not repeatedly create VMs in that failed process. An advisory file lock can
 remain held until the syscall retires. No failed return promises rollback or

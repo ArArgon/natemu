@@ -1300,6 +1300,41 @@ Same-day matrix, natemu / QEMU:
 
 The four-reader case at four vCPUs remains natemu's one loss to QEMU (73%).
 
+## Shorter depth-1 path — November 10
+
+Raw data: `natemu-raw/io-depth1-20261110-01/` (`ab/table.txt`, `sweep*/`, `perfab/`, `profile/`).
+Old = `62cea5c`, new = the [plan's items 1–3](io-plan.md#shorter-depth-1-path-proposed-november-10).
+4 KiB random reads, 18 s minus 3 s runs, interleaved old/new on one prepared image, normal
+resident, four rounds. Each run's image clone is read once first (`WARM=1`): with the host disk
+98% full and `fseventsd` busy, cold native calls ranged 12–170 µs between runs, which swamped
+the host path being measured. kIOPS per round, and host CPU per I/O (µs, process user + sys):
+
+| | Old | New | Change | CPU/IO old → new |
+| --- | --- | --- | ---: | ---: |
+| D1, 1 vCPU | 21.2 21.2 20.2 21.0 | 30.3 26.5 26.5 26.0 | +31% | 59 → 43 |
+| D1, 4 vCPUs | 15.4 15.4 15.7 15.4 | 17.3 17.8 17.5 17.1 | +13% | 81 → 68 |
+| D16, 4 vCPUs | 56 127 82 118 | 93 111 105 96 | +6% (noise) | 26 → 24 |
+| 4 readers | 240 246 234 238 | 233 238 224 246 | −2% (noise) | 19 → 19 |
+
+At depth 1 the owner's inline call removes the two hand-offs (queue + take 4.6 → 0.2 µs).
+Single-job depth 16 is mostly lone requests at the device too (0.92–0.95 inline per I/O); old
+alternates between two regimes (56–127 k), new stays at 93–111 k. Four readers use the pool.
+
+**Spins** (`sweep-warm*`, `NATEMU_IO_SPIN_US`): 5 and 10 µs gained nothing measurable at depth 1,
+depth 16 or four readers; 25 µs caught the next depth-1 kick (notify → admission 5 → 2.4 µs,
++8% at one vCPU, none at four) for 45–50% more host CPU per I/O. Both default to 0.
+
+**Halted-vCPU wake** (`profile/exp.sh`, an instrumented `perf` resident): of the 3.7–4.0 µs from
+a halted vCPU's `wfi` return to its leaving the park, 3.4–4.2 µs was the doorbell acknowledgement:
+three GIC CPU-interface accesses (IAR, EOIR, IAR reading spurious), each trapping under HVF's GIC.
+Ending the loop on ISR_EL1 instead of the spurious IAR read cuts wake → park end from 4.0 to 2.9 µs
+at four vCPUs (`perfab/`). The rest is the two necessary traps. About two wakes per I/O remain at
+four vCPUs: the guest (Linux 6.12, flat logical APIC mode) programs the IOAPIC entry with fixed
+delivery to one CPU, and its scheduler then wakes fio's idle CPU with a function-call IPI
+(0.9 per I/O). Fixed delivery leaves the chipset no choice of target, and lowest-priority mode,
+which would, is not used, so completions are not retargeted. At one vCPU the vCPU no longer
+halts during a request.
+
 ## Per-request profile after windowless copies — November 10
 
 Raw data: `natemu-raw/io-profile-20261110-01/` (`table.txt`, `per_io.json`); 4 KiB random reads,
