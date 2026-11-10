@@ -6,9 +6,12 @@ use cache::IoWindow;
 use std::mem::offset_of;
 use std::sync::atomic::AtomicU8;
 
-pub const MAX_BYTES: usize = 256 * 1024;
-/// A full 256-entry queue plus payload/status/used-ring bookkeeping in the same window.
-pub const MAX_SPANS: usize = 512;
+/// Room for a batch of block requests of up to 128 KiB each; larger batches split.
+pub const MAX_BYTES: usize = 1024 * 1024;
+/// Room for a batch of 32 block requests, each of up to 32 data segments plus header, status and
+/// used element, and the window's ring bookkeeping (a queue's metadata snapshot, used index and
+/// available-ring read). Larger batches split.
+pub const MAX_SPANS: usize = 32 * 36 + 8;
 
 /// One-use admission decision shared by a device reset and its I/O owner. Cancellation and grant
 /// are one atomic choice: a canceled window cannot copy; a granted window must drain before reset.
