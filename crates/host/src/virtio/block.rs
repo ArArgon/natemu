@@ -1,11 +1,17 @@
 //! virtio-blk over one owned regular file: modern request parsing, a fixed pool of native disk
 //! workers that make the file calls outside every lock and copy window, and the block owner,
 //! which keeps several requests in flight and batches their copy windows.
+//!
+//! Durability, as QEMU: a guest FLUSH (or a write-through OUT) is fsync(2), which survives a natemu crash but not
+//! a host power loss or macOS crash; the power-off drain ends with F_FULLFSYNC, so a clean shutdown is fully durable.
 use super::profile;
 use super::*;
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    os::unix::fs::{FileExt, MetadataExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileExt, MetadataExt},
+    },
     path::Path,
     sync::mpsc::{self, Receiver, SyncSender},
     thread::JoinHandle,
@@ -181,7 +187,8 @@ pub(super) enum Job {
     Read(u64, usize),
     /// Write these bytes at this offset; `true` also syncs (no FLUSH negotiated: write-through).
     Write(u64, Vec<u8>, bool),
-    Flush,
+    /// Sync the file; `true`: a full sync (the power-off drain's), else a plain one (a guest FLUSH's).
+    Flush(bool),
 }
 /// A job's result: the bytes read (empty for a write or on error) and the first error.
 pub(super) struct Done {
@@ -360,7 +367,8 @@ fn run(calls: &dyn Calls, shared: &Mutex<Board>, slot: usize, job: Job) -> bool 
         let (kind, offset) = match &job {
             Job::Read(offset, _) => ("read", *offset),
             Job::Write(offset, ..) => ("write", *offset),
-            Job::Flush => ("full sync", 0),
+            Job::Flush(true) => ("full sync", 0),
+            Job::Flush(false) => ("sync", 0),
         };
         board.running.push((slot, start, kind, offset));
         start
@@ -380,10 +388,13 @@ fn run(calls: &dyn Calls, shared: &Mutex<Board>, slot: usize, job: Job) -> bool 
 pub(super) trait Calls: Send + Sync {
     fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
     fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize>;
-    fn sync(&self) -> std::io::Result<()>;
+    /// `full`: to stable storage (F_FULLFSYNC); otherwise to the host OS (fsync).
+    fn sync(&self, full: bool) -> std::io::Result<()>;
 }
 /// One positioned read or write per call (pread/pwrite: a short count is returned as is, EINTR
-/// is an error); sync is F_FULLFSYNC (`File::sync_all` on Apple platforms).
+/// is an error). A full sync is F_FULLFSYNC (`File::sync_all` on Apple platforms); a plain one is
+/// fsync(2), as QEMU's guest flush: it survives a natemu crash but not a host power loss or macOS
+/// crash (std's `sync_data` is F_FULLFSYNC on Apple platforms too, so fsync is called directly).
 pub(super) struct Native(File);
 impl Calls for Native {
     fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
@@ -392,8 +403,23 @@ impl Calls for Native {
     fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
         self.0.write_at(bytes, offset)
     }
-    fn sync(&self) -> std::io::Result<()> {
-        self.0.sync_all()
+    fn sync(&self, full: bool) -> std::io::Result<()> {
+        if full {
+            return self.0.sync_all();
+        }
+        unsafe extern "C" {
+            fn fsync(fd: i32) -> i32;
+        }
+        // As `sync_all`, retry on EINTR.
+        loop {
+            if unsafe { fsync(self.0.as_raw_fd()) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
     }
 }
 
@@ -408,8 +434,8 @@ impl Calls for Scripted {
     fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
         self.0.write(bytes, offset)
     }
-    fn sync(&self) -> std::io::Result<()> {
-        self.0.sync()
+    fn sync(&self, full: bool) -> std::io::Result<()> {
+        self.0.sync(full)
     }
 }
 
@@ -420,10 +446,10 @@ fn execute(native: &(impl Calls + ?Sized), job: Job) -> Done {
     let (offset, mut data, write, stable) = match job {
         Job::Read(offset, len) => (offset, vec![0; len], false, false),
         Job::Write(offset, bytes, stable) => (offset, bytes, true, stable),
-        Job::Flush => {
+        Job::Flush(full) => {
             return Done {
                 data: Vec::new(),
-                error: native.sync().err().map(|e| e.to_string()),
+                error: native.sync(full).err().map(|e| e.to_string()),
             };
         }
     };
@@ -449,7 +475,7 @@ fn execute(native: &(impl Calls + ?Sized), job: Job) -> Done {
         }
     }
     if error.is_none() && write && stable {
-        error = native.sync().err().map(|e| e.to_string());
+        error = native.sync(false).err().map(|e| e.to_string());
     }
     if write || error.is_some() {
         data.clear();
@@ -779,7 +805,7 @@ fn start(streams: &Streams, bytes: Vec<u8>, disk: &Disk, features: u64) -> Start
     match command {
         Command::Read(offset, len) => Start::Call(Job::Read(offset, len)),
         Command::Write(offset, bytes, stable) => Start::Call(Job::Write(offset, bytes, stable)),
-        Command::Flush => Start::Call(Job::Flush),
+        Command::Flush => Start::Call(Job::Flush(false)),
         Command::Id => Start::Answer(Reply {
             data: disk.id.to_vec(),
             status: [S_OK],
@@ -928,7 +954,7 @@ impl Virtio {
     /// Power-off drain once nothing is in flight: a final full sync on a worker (it covers every
     /// completed write), the workers' join, then a quiet device.
     pub(super) fn drain_disk(&self, mut pool: Pool, cancel: &AtomicBool) -> Result<()> {
-        pool.submit(FINAL_SYNC, Job::Flush)?;
+        pool.submit(FINAL_SYNC, Job::Flush(true))?;
         let done = loop {
             if let Some((_, done)) = pool.take().pop() {
                 break done;
@@ -1339,15 +1365,16 @@ mod tests {
     struct Script {
         returns: Mutex<VecDeque<std::io::Result<usize>>>,
         calls: Mutex<Vec<(u64, usize)>>,
-        syncs: AtomicUsize,
+        /// Each sync's `full`.
+        syncs: Mutex<Vec<bool>>,
         fail_sync: bool,
     }
     impl Script {
         fn calls(&self) -> Vec<(u64, usize)> {
             self.calls.lock().unwrap().clone()
         }
-        fn syncs(&self) -> usize {
-            self.syncs.load(SeqCst)
+        fn syncs(&self) -> Vec<bool> {
+            self.syncs.lock().unwrap().clone()
         }
     }
     impl Calls for Script {
@@ -1359,8 +1386,8 @@ mod tests {
             self.calls.lock().unwrap().push((o, b.len()));
             self.returns.lock().unwrap().pop_front().unwrap()
         }
-        fn sync(&self) -> std::io::Result<()> {
-            self.syncs.fetch_add(1, SeqCst);
+        fn sync(&self, full: bool) -> std::io::Result<()> {
+            self.syncs.lock().unwrap().push(full);
             if self.fail_sync {
                 Err(std::io::Error::other("sync failed"))
             } else {
@@ -1372,7 +1399,7 @@ mod tests {
         Script {
             returns: Mutex::new(returns.into()),
             calls: Mutex::default(),
-            syncs: AtomicUsize::new(0),
+            syncs: Mutex::default(),
             fail_sync: false,
         }
     }
@@ -1408,7 +1435,7 @@ mod tests {
             fn write(&self, _: &[u8], _: u64) -> std::io::Result<usize> {
                 unreachable!()
             }
-            fn sync(&self) -> std::io::Result<()> {
+            fn sync(&self, _: bool) -> std::io::Result<()> {
                 Ok(())
             }
         }
@@ -1451,7 +1478,7 @@ mod tests {
                 self.calls.fetch_add(1, SeqCst);
                 Ok(b.len())
             }
-            fn sync(&self) -> std::io::Result<()> {
+            fn sync(&self, _: bool) -> std::io::Result<()> {
                 Ok(())
             }
         }
@@ -1503,6 +1530,12 @@ mod tests {
             start(&read, header(0, 0), &disk, FEATURES),
             Start::Call(Job::Read(0, 512))
         ));
+        // A guest FLUSH is a plain sync, not the power-off drain's full one.
+        let flush = Streams::new(&[desc(0, 16, false), desc(900, 1, true)]).unwrap();
+        assert!(matches!(
+            start(&flush, header(4, 0), &disk, FEATURES),
+            Start::Call(Job::Flush(false))
+        ));
         // A readable stream too long to gather is answered IOERR without decoding.
         let long = Streams::new(&[
             desc(0, (MAX_DATA + HEADER + 1) as u32, false),
@@ -1522,11 +1555,14 @@ mod tests {
             let device = super::super::tests::device();
             let mut native = script(vec![]);
             native.fail_sync = failed;
-            let pool = Pool::spawn(native, device.wake.clone()).unwrap();
+            let native = Arc::new(native);
+            let pool = Pool::spawn(Scripted(native.clone()), device.wake.clone()).unwrap();
             assert!(!device.quiesce().unwrap());
             let canceled = AtomicBool::new(false);
             assert_eq!(device.drain_disk(pool, &canceled).is_err(), failed);
             assert_eq!(device.lock().drained, !failed);
+            // Power-off takes the one full sync.
+            assert_eq!(native.syncs(), [true]);
         }
     }
     #[test]
@@ -1549,7 +1585,7 @@ mod tests {
                 assert!(*flushed, "the flush waited for writes in flight");
                 Ok(b.len())
             }
-            fn sync(&self) -> std::io::Result<()> {
+            fn sync(&self, _: bool) -> std::io::Result<()> {
                 *self.flushed.lock().unwrap() = true;
                 self.signal.notify_all();
                 Err(std::io::Error::from_raw_os_error(5))
@@ -1564,7 +1600,7 @@ mod tests {
         pool.submit(0, Job::Write(0, vec![1; 512], false)).unwrap();
         pool.submit(1, Job::Write(512, vec![2; 512], false))
             .unwrap();
-        pool.submit(2, Job::Flush).unwrap();
+        pool.submit(2, Job::Flush(false)).unwrap();
         // The writes ran only once the flush had failed (their calls assert it).
         let done = results(&pool, &bell, 3);
         for (slot, done) in done {
@@ -1579,7 +1615,8 @@ mod tests {
         assert!(done.error.is_none());
         assert!(done.data.is_empty());
         assert_eq!(native.calls(), [(512, 8), (514, 6), (517, 3)]);
-        assert_eq!(native.syncs(), 1);
+        // Write-through is a plain sync.
+        assert_eq!(native.syncs(), [false]);
     }
     #[test]
     fn zero_eintr_eio_and_overcount_never_retry_or_publish_partial_reads() {
@@ -1606,16 +1643,16 @@ mod tests {
                 .is_some()
         );
         assert_eq!(native.calls().len(), 1);
-        assert_eq!(native.syncs(), 1);
-        assert!(execute(&native, Job::Flush).error.is_some());
-        assert_eq!(native.syncs(), 2);
+        assert_eq!(native.syncs(), [false]);
+        assert!(execute(&native, Job::Flush(false)).error.is_some());
+        assert_eq!(native.syncs(), [false, false]);
         let native = script(vec![Ok(8)]);
         assert!(
             execute(&native, Job::Write(0, vec![0; 8], false))
                 .error
                 .is_none()
         );
-        assert_eq!(native.syncs(), 0);
+        assert!(native.syncs().is_empty());
     }
     /// An IN request reading `sectors` sectors (one 512-byte descriptor each), with head `head`.
     fn read_request(id: Identity, head: u16, sectors: usize) -> Admitted {
@@ -2083,7 +2120,7 @@ mod owner_tests {
             self.call();
             Ok(b.len())
         }
-        fn sync(&self) -> std::io::Result<()> {
+        fn sync(&self, _: bool) -> std::io::Result<()> {
             Ok(())
         }
     }
@@ -2533,7 +2570,7 @@ mod owner_tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 std::thread::sleep(Duration::from_millis(30));
-                jobs.send((7, Job::Flush)).unwrap();
+                jobs.send((7, Job::Flush(false))).unwrap();
             });
             let (slot, _) = receive(&queue, Duration::from_millis(5)).unwrap();
             assert_eq!(slot, 7);
