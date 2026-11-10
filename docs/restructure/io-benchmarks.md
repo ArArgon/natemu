@@ -1311,13 +1311,13 @@ the host path being measured. kIOPS per round, and host CPU per I/O (µs, proces
 
 | | Old | New | Change | CPU/IO old → new |
 | --- | --- | --- | ---: | ---: |
-| D1, 1 vCPU | 21.2 21.2 20.2 21.0 | 30.3 26.5 26.5 26.0 | +31% | 59 → 43 |
+| D1, 1 vCPU | 21.2 21.2 20.2 21.0 | 30.3 26.5 26.5 26.0 | +31% (median +26%) | 59 → 43 (−28%) |
 | D1, 4 vCPUs | 15.4 15.4 15.7 15.4 | 17.3 17.8 17.5 17.1 | +13% | 81 → 68 |
 | D16, 4 vCPUs | 56 127 82 118 | 93 111 105 96 | +6% (noise) | 26 → 24 |
 | 4 readers | 240 246 234 238 | 233 238 224 246 | −2% (noise) | 19 → 19 |
 
 At depth 1 the owner's inline call removes the two hand-offs (queue + take 4.6 → 0.2 µs).
-Single-job depth 16 is mostly lone requests at the device too (0.92–0.95 inline per I/O); old
+Single-job depth 16 is mostly lone requests at the device too (0.92–0.97 inline per I/O); old
 alternates between two regimes (56–127 k), new stays at 93–111 k. Four readers use the pool.
 
 **Spins** (`sweep-warm*`, `NATEMU_IO_SPIN_US`): 5 and 10 µs gained nothing measurable at depth 1,
@@ -1332,8 +1332,16 @@ at four vCPUs (`perfab/`). The rest is the two necessary traps. About two wakes 
 four vCPUs: the guest (Linux 6.12, flat logical APIC mode) programs the IOAPIC entry with fixed
 delivery to one CPU, and its scheduler then wakes fio's idle CPU with a function-call IPI
 (0.9 per I/O). Fixed delivery leaves the chipset no choice of target, and lowest-priority mode,
-which would, is not used, so completions are not retargeted. At one vCPU the vCPU no longer
-halts during a request.
+which would, is not used, so completions are not retargeted. At one vCPU the vCPU rarely halts
+during a request any more (0–0.25 halts per I/O, from 0.8–1.0).
+
+Correctness on the final build (`96faf03`, after review; `natemu-raw/io-depth1-20261110-01/final/`):
+host and Python unit tests pass; lifecycle with hooks 20/20; lifecycle stress reset and disable,
+block at 1, 2 and 4 vCPUs with `--rng` (6/6), stress normal N4 and forced N2 pass. Standing suite
+135/136: `k2-stifirst` `kicks-jmp` took 79 NMI kicks against a floor of 100 under the suite's
+parallel load, and passed three standalone reruns (175–179). It drives a running vCPU, not the
+block device or the halted-vCPU wake, and the same suite passed 136/136 at `0cc1308` and `8dc215c`.
+Earlier rounds (lifecycle ×2, the I/O runners, net, rng) are in `live-0cc1308/` and `live-8dc215c/`.
 
 ## Per-request profile after windowless copies — November 10
 
