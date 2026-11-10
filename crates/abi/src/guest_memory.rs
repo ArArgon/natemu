@@ -117,14 +117,28 @@ impl GuestRam {
         unsafe { asm!("dsb ish") };
         Some(result)
     }
-    /// Store `bytes` at `gpa` byte by byte (no single-copy atomicity), then complete.
+    /// Store `bytes` at `gpa`, then complete. A naturally aligned 2-, 4- or 8-byte range is one single-copy-atomic
+    /// store of that width (x86's aligned scalar guarantee, SDM Vol.3 9.1.1); any other range is stored byte by byte
+    /// (no single-copy atomicity).
     #[must_use]
     pub fn copy_in(&self, gpa: u64, bytes: &[u8]) -> bool {
         let Some(p) = self.range(gpa, bytes.len() as u64) else {
             return false;
         };
+        // SAFETY: in bounds (`range`); an aligned guest address is an aligned pointer (`new`).
         unsafe {
-            copy_volatile(p, bytes.as_ptr(), bytes.len());
+            match (bytes.len(), gpa & (bytes.len() as u64).wrapping_sub(1) == 0) {
+                (2, true) => {
+                    ptr::write_volatile(p.cast(), u16::from_ne_bytes([bytes[0], bytes[1]]))
+                }
+                (4, true) => {
+                    ptr::write_volatile(p.cast(), u32::from_ne_bytes(bytes.try_into().unwrap()))
+                }
+                (8, true) => {
+                    ptr::write_volatile(p.cast(), u64::from_ne_bytes(bytes.try_into().unwrap()))
+                }
+                _ => copy_volatile(p, bytes.as_ptr(), bytes.len()),
+            }
             asm!("dsb ish");
         }
         true
@@ -135,12 +149,27 @@ impl GuestRam {
             (bytes.iter().enumerate()).all(|(i, &b)| unsafe { ptr::read_volatile(p.add(i)) } == b)
         })
     }
-    /// Copy `out.len()` bytes starting at `gpa`; false leaves `out` unchanged.
+    /// Copy `out.len()` bytes starting at `gpa`; false leaves `out` unchanged. A naturally aligned 2-, 4- or 8-byte
+    /// range is one single-copy-atomic load of that width, as for [`Self::copy_in`].
     pub fn copy_out(&self, gpa: u64, out: &mut [u8]) -> bool {
         let Some(p) = self.range(gpa, out.len() as u64) else {
             return false;
         };
-        unsafe { copy_volatile(out.as_mut_ptr(), p, out.len()) };
+        // SAFETY: as for `copy_in`.
+        unsafe {
+            match (out.len(), gpa & (out.len() as u64).wrapping_sub(1) == 0) {
+                (2, true) => {
+                    out.copy_from_slice(&ptr::read_volatile(p.cast::<u16>()).to_ne_bytes())
+                }
+                (4, true) => {
+                    out.copy_from_slice(&ptr::read_volatile(p.cast::<u32>()).to_ne_bytes())
+                }
+                (8, true) => {
+                    out.copy_from_slice(&ptr::read_volatile(p.cast::<u64>()).to_ne_bytes())
+                }
+                _ => copy_volatile(out.as_mut_ptr(), p, out.len()),
+            }
+        }
         true
     }
 }
@@ -294,6 +323,42 @@ mod tests {
         assert!(!ram.copy_out(0x4fff, &mut [0; 2]));
         assert!(ram.matches(0x1000, &[3, 0]) && !ram.matches(0x1000, &[3, 1]));
         assert!(!ram.matches(0x4fff, &[0, 0]));
+    }
+
+    /// A naturally aligned 2/4/8-byte copy is one access: a concurrent reader never sees a mix of two stores' bytes
+    /// (a byte loop tears within a few iterations). Misaligned copies stay byte copies and still round-trip.
+    #[test]
+    fn aligned_word_copies_do_not_tear() {
+        extern crate std;
+        use core::sync::atomic::AtomicBool;
+        let mut b = tables();
+        let ram = b.ram();
+        for n in [2usize, 4, 8] {
+            let gpa = 0x2000 + 8;
+            let stop = AtomicBool::new(false);
+            assert!(ram.write::<u64>(gpa, 0));
+            std::thread::scope(|t| {
+                t.spawn(|| {
+                    for k in 0..200_000u32 {
+                        assert!(ram.copy_in(gpa, &[if k & 1 == 0 { 0 } else { 0xff }; 8][..n]));
+                    }
+                    stop.store(true, SeqCst);
+                });
+                let mut out = [0u8; 8];
+                while !stop.load(SeqCst) {
+                    assert!(ram.copy_out(gpa, &mut out[..n]));
+                    assert!(out[..n].iter().all(|&x| x == out[0]), "torn {n}-byte copy");
+                }
+            });
+        }
+        for at in 0x2000..0x2010 {
+            for n in 1..=9 {
+                let v: std::vec::Vec<u8> = (0..n as u8).map(|i| i ^ at as u8).collect();
+                let mut out = [0u8; 9];
+                assert!(ram.copy_in(at, &v) && ram.copy_out(at, &mut out[..n]));
+                assert_eq!(out[..n], v[..]);
+            }
+        }
     }
 
     #[test]
