@@ -812,6 +812,24 @@ both pay.
    small, correct gain (block, lifecycle, fio admission and normal/forced stress pass); its
    intended effect depends on overlapping requests, so stage 2 carries the windows-per-request
    target as well.
+   *Stage 2 result (November 9): improvement, gates not met.* All correctness runs pass
+   (host tests, 14 lifecycle cases, lifecycle stress, block, fio admission, normal and forced
+   stress, soak and matrix persistence). At four vCPUs, against HEAD: four concurrent readers
+   rise from 42–47 to 69–88 kIOPS (1.5–2x) with worst-job p99 falling from 6–11 to about 4–6 ms;
+   the soak under CPU/memory load rose from 11.5/8.4 to 19.7/11.0 kIOPS read/write in the first
+   measurement; a single depth-16 job stays at 34–39 kIOPS (about 1.0–1.1x); depth 1 is 2–5%
+   lower (14.1–14.7 against 14.5–14.9). Windows per completed I/O fall from 2.84 to 2.19–2.21
+   (22%). Gates missed: depth-16 2x, windows 30%, depth 1. Measurements are noisy: `fseventsd`
+   held one host core near 100% during the later runs (load average 5–9), and repeated runs of
+   one build differ by up to 20% (`natemu-raw/bench-stage2-20261109-01/`, `bench-stage2b-…`,
+   `stage2-recapture-20261109-01/`). The review's recapture-after-notification fix added about
+   13% more windows per I/O with no measured gain, so it now applies only when nothing is in
+   flight (with requests in flight, their completion refresh re-arms the queue).
+
+   Reading: concurrency helps when several guest jobs submit at once; a single submitting
+   job is limited by its own vCPU, which windows pause for about a quarter of the time, and each
+   window is 94% acknowledgement wait. Stage 3 (batched capture) cannot change that; the larger
+   lever is cheaper windows.
 3. **Batched capture**, only if the counters still show capture windows dominating: one
    metadata snapshot admits up to K chains; their headers and OUT payloads are gathered in as
    few windows as the byte and span bounds allow. *Built as part of stage 2* (the owner asked
