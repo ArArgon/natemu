@@ -1505,6 +1505,23 @@ mod tests {
         );
     }
     #[test]
+    fn native_plain_and_full_syncs_succeed_on_a_file() {
+        let path = std::env::temp_dir().join(format!("natemu-sync-test-{}", std::process::id()));
+        let native = Native(
+            File::options()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(native.write(&[0xa5; 512], 0).unwrap(), 512);
+        native.sync(false).unwrap();
+        native.sync(true).unwrap();
+    }
+    #[test]
     fn decoded_out_payload_moves_into_its_job() {
         let path = std::env::temp_dir().join(format!("natemu-block-test-{}", std::process::id()));
         std::fs::write(&path, vec![0; 4096]).unwrap();
