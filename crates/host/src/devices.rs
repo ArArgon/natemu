@@ -461,7 +461,7 @@ fn page_status(devices: Option<&Devices>, gpa: u64) -> u64 {
             match d.find(m.gpa) {
                 // The resident caches the claim for the run: only a frozen registry may make one.
                 Some(_) if d.frozen => mmio::CLAIMED,
-                Some(_) => 0,
+                Some(_) => panic!("device registry not frozen"),
                 None => {
                     d.page_counts
                         .lock()
@@ -671,8 +671,7 @@ mod deferred_tests {
     #[test]
     fn claimed_pages_are_answered_only_by_a_frozen_registry() {
         let (bus, ..) = setup(&[]);
-        // Before freezing, a claim could still change: no resident may cache it.
-        assert_eq!(page_status(Some(&bus), BASE), 0);
+        // Before freezing a claim could still change, so no resident may cache it: see the next test.
         let bus = bus.freeze();
         assert_eq!(page_status(Some(&bus), BASE), mmio::CLAIMED);
         // Unassigned pages keep their per-fill counting and the strict refusal.
@@ -686,6 +685,12 @@ mod deferred_tests {
             mmio::UNASSIGNED
         );
         assert_eq!(page_status(Some(&bus), BASE + 1), 0);
+    }
+    #[test]
+    #[should_panic(expected = "device registry not frozen")]
+    fn an_unfrozen_registry_never_answers_a_claim() {
+        let (bus, ..) = setup(&[]);
+        page_status(Some(&bus), BASE);
     }
     #[test]
     #[should_panic(expected = "device registry frozen")]

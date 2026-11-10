@@ -841,23 +841,35 @@ pub(crate) mod tests {
         transfers: &mut [Transfer<'_>],
         publish: usize,
     ) -> Result<()> {
-        let permit = CopyPermit::new();
+        windowless_permit(b, transfers, publish, &CopyPermit::new())
+    }
+    /// As [`windowless`], under the caller's permit (a device reset may cancel it).
+    pub(crate) fn windowless_permit(
+        b: &Backing,
+        transfers: &mut [Transfer<'_>],
+        publish: usize,
+        permit: &CopyPermit,
+    ) -> Result<()> {
         b.windowless(
             BUDGET,
             BUDGET,
             transfers,
             publish,
-            &permit,
+            permit,
             |_, _| Ok(true),
             |_| {},
         )
     }
     /// A fixture of `n` vCPUs and three pages of guest RAM at guest-physical 0.
     pub(crate) fn backing(n: usize) -> Backing {
+        backing_with(n, 3 * 4096)
+    }
+    /// A fixture of `n` vCPUs and `bytes` (a page multiple) of guest RAM at guest-physical 0.
+    pub(crate) fn backing_with(n: usize, bytes: usize) -> Backing {
         let ram_at = cache::GLOBAL_OFFSET + cache::GLOBAL_BYTES;
-        let memory = Arc::new(Memory::with_size(ram_at + 3 * 4096).unwrap());
-        // SAFETY: this fixture owns a separate aligned RAM page after its protocol words.
-        let ram = unsafe { GuestRam::new(0, 3 * 4096, memory.0.add(ram_at) as u64) };
+        let memory = Arc::new(Memory::with_size(ram_at + bytes).unwrap());
+        // SAFETY: this fixture owns a separate aligned RAM range after its protocol words.
+        let ram = unsafe { GuestRam::new(0, bytes as u64, memory.0.add(ram_at) as u64) };
         Backing {
             memory,
             n,
