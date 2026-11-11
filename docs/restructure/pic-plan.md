@@ -1,7 +1,10 @@
 # Position-independent translations: design study
 
-Status: design and evidence only, November 10, 2026, on `codex/virtio-io` at 6ac050e; revised the same day after an
-independent review (its blocking findings 1-4 accepted and fixed in sections 3 and 4). Nothing is built. Owner sign-off is
+Status: design and evidence only, November 10, 2026, on `codex/virtio-io` at 6ac050e; revised the same day after two independent reviews (all blocking findings accepted; fixed in sections 3 and 4) and
+the owner's inline-cache suggestion (adopted, section 3). Owner principle for the design: the common cases are fast;
+rare cases (a frame at two linear pages, links from shared code into absolute or global code, odd slot states) take the
+simplest correct slow path (the dispatcher, or no sharing for that block) rather than new bookkeeping; Stage 1 counts
+each case so the fast paths are chosen on evidence. Nothing is built. Owner sign-off is
 needed before any implementation. Inputs: the CPython profile (`natemu-raw/cpython-profile-20261110-01/`: `summary.md`;
 `runs/full-off-1` and `runs/full-norand-off-1`, the `vcpu` lines of `perf-trim.log`), the capacity experiment
 (`natemu-raw/capacity-20261110-01/`, runs `fullA`/`fullB`, `slice*`), [perf-plan.md](perf-plan.md) chunks 3, 4, 8 and 10
@@ -20,7 +23,7 @@ only a small instance record instead of a copy of about 425 bytes of code and me
 executable in the guest image fits the rewrite (all span less than 16 MiB; `cc1` and `python3.13` are fixed-address
 executables that ASLR does not move). Estimated result: 70-85% of the cost of guest ASLR removed (full build about 200-225 s
 against 294 s now and 186 s with ASLR off); the capacity experiment, already measured, takes 294 s to 261 s by itself and
-is compatible. The design needs per-frame alias tracking for links, a per-translation instance chain for invalidation, and
+is compatible. The design needs an address check on cross-page links (through the target's L1 entry), a per-translation instance chain for invalidation, and
 an explicit trust model for the base slot (sections 3-4). Proceed in four stages, each with its own gate (section 6).
 
 ## 1. What ASLR costs now
@@ -83,7 +86,7 @@ Instruction cost per address constant: today 2-4 words (3 for a 47-bit user addr
 load from the guest-state page in place of the first word. A RIP-relative access then has a load-then-add chain of about 6
 cycles where the move chain had about 3 (an estimate; Stage 2 measures it). Per block entry: two more instructions (`and`
 to the page, `str`). Per cross-page linked exit: the address computation now executes (2-3 instructions) where the link
-skipped it. No register is reserved: FEX has only 7 allocatable general registers here (x18, x20-x24, x30; x25 holds the
+skipped it, plus the address check (section 3). No register is reserved: FEX has only 7 allocatable general registers here (x18, x20-x24, x30; x25 holds the
 saved flags, x26/x27 PF/AF, x28 the state), so taking one would spill; the base lives in the guest-state page, like the
 frame slots natemu already added there (`KERNEL_GS_BASE`, `VERW_GDT_BASE`). Caches, L1 and code are per vCPU, and each vCPU
 has its own guest-state page, so one slot per vCPU suffices. Estimated tax: 1-3% of guest time, about 1-2 s per vCPU of
@@ -111,32 +114,55 @@ one address space, a local link S→T and a cross-page link from T made at P1, a
 local link and T's P1 link then enters the wrong code if P2's neighbour maps another frame (a breakpoint's copy-on-write
 page, for example).
 
-**Rule: cross-page links only from frames with a single linear page in the epoch.** For each frame holding
-position-independent translations, the resident keeps the linear page and TLB epoch it was last made current at (an
-instance made or revalidated, an L1 entry filled). When an instance at a second linear page of the same frame becomes
-current in the same epoch, every cross-page link out of every translation of that frame (found by the frame's page chain,
-as `invalidate` finds blocks) is undone and the frame is marked aliased for the epoch, so none is made until the epoch
-moves. Why this closes the gaps: every entry into code of frame F at linear page P in epoch E starts from an instance of
-(F, P) made current in E (an L1 entry not current is emptied at a CR3 load, `tlb`; a cross-page link enters only a target
-current when linked; a local link stays on F's pages), and that is exactly where the resident checks.
+**Rule: a cross-page link checks the target address it computes (an inline jump cache; owner's suggestion, adopted
+November 10).** The exit keeps its move, so x0 holds this instance's target address; the link compares x0 with the
+address the target was linked at and takes the miss path when they differ. In the alias case above, T entered at P2
+computes an address other than the one its link was made for, misses, and reaches the resident, which finds the right
+code. No per-frame alias tracking is needed, and the first revision's rule and its bookkeeping are deleted.
+
+Where the compare lives. The first draft rejected a per-link compare because the exit has no room for it (the move and
+the `svc` only); that still rules out an inline compare, so the check is out of line, and the cheapest out-of-line check
+already exists: **the target address's L1 entry** (`movz/movk x2, #address`; `sub x2, x2, x0`; `cbnz` to the miss; `b`
+to the entry). A cross-page link patches the exit's `svc` word to `b` straight into the L1 entry for the target address in
+the source context's table: a computed exit minus the dispatcher's four instructions and its indirect `br`.
+- Sound: L1 entries are kept exact for the current epoch already (emptied when their block stops being current at CR3
+  loads, `tlb`; at INVLPG and kills, `cut_one`; refilled by lookups), so an L1 hit is as correct as a dispatcher hit, for
+  any instance of the source. The one extra condition is that the table still holds the source's context: when a table
+  loses its context (a global TLB flush, a reset, a table given to another context; tens a run: 43-62 global flushes per vCPU in the profile), the links into it are
+  undone. Links stay within one context (`link` refuses others), and L1 tables and code are per vCPU.
+- No thrash: a miss goes to the dispatcher's miss (`missed`, which completes the exit as the linker does), never back to
+  the linker, so nothing re-patches; two instances alternating cost one resident lookup each when they collide in L1,
+  as computed exits do today.
+- Less bookkeeping than today's cross-page links: no pruning at CR3 loads, TLB flushes or INVLPG of the target (the L1
+  entry tracks it); a record is kept only to restore the word (source death, table loss, flush).
+- Cost per cross-page transition: today 1 instruction (the move is skipped); with the check, the move (3) plus `b`, the
+  entry's move (3-4), `sub`, `cbnz`, `b`: about 10, against about 4 for an unchecked link. The owner's literal form (a
+  per-link stub: `ldr x2, [lit]; cmp; b.ne; b`) is about 3 fewer, but needs 32 bytes of code area per link (the area that
+  now fills first) and its own maintenance; it uses x2, not x16, which holds a guest register (`SRA`). Its 8-byte literal
+  would be 8-aligned in 16-byte stubs, so alignment checking is no issue. Stage 1 counts cross-page transitions; if they
+  are hot enough for 3 instructions to matter, the stub form is the fallback.
 
 Link classes, with the word each patches:
 
-- **Local** (today's `local` rule, and the target starts on the source's start page; a target starting on the source's
-  second page is cross-page for the base): holds for every instance by construction. The move's first word becomes `b` to
-  the target's body past its two entry instructions; the base is unchanged. Survives CR3 loads and TLB flushes as local
-  links do today; goes when the translation dies.
-- **Cross-page, position-independent target**: the move into x0 stays (it executes); the `svc #LINK` becomes `b` to the
-  target's full entry, which records the new base from x0. Pruned at CR3 loads and TLB flushes as today's non-local links
-  are, at an INVLPG of the target instance, and by the alias rule above.
-- **From an absolute block into a position-independent target**: the same form as cross-page (the `svc` word, full
+- **Local, shared to shared only** (today's `local` rule, both translations position-independent, and the target starts
+  on the source's start page; a target starting on the source's second page is not local for the base): holds for every
+  instance by construction. The move's first word becomes `b` to the target's body past its two entry instructions; the
+  base is unchanged. Survives CR3 loads and TLB flushes as local links do today; goes when either translation dies.
+- **Checked, every other link out of a shared translation** (cross-page, or into an absolute or global target, even on
+  the same page and frame): the move into x0 stays (it executes); the `svc #LINK` becomes `b` to the target address's L1
+  entry. A shared source to an absolute target cannot be local (re-review blocker A, checked: `local` and the
+  CR3-surviving segments in `link` and `prune`, `cache.rs`): in process A, S at P1 links locally to absolute T valid only
+  at P1; after a CR3 load process B maps F at P2, and S at P2 would branch into T running with P1's addresses. Through
+  the L1 entry, S at P2 computes P2's address and finds the block current there.
+- **From an absolute block into a position-independent target**: the same checked form (the `svc` word, through the L1
   entry): the first-word form would leave x0 and the slot stale.
 - **Absolute to absolute**: unchanged.
 - **STI-first self exit**: stays unlinked; the identity test in the linker compares translation and instance, not only
   the address.
 
 `link_point` (abi), `unlinked`, `link`, `arm`/`disarm` and the restore check (`links_restored`) learn which word a link
-record names; a link record keeps its form. A precise stop arms both forms' words.
+record names; a link record keeps its form. A precise stop arms both forms' words (a checked link's `svc` word holds
+its `b`, and every path out of the block passes it).
 
 **Invalidation reaches every instance** (review finding 2, checked: `cut_one` empties only the L1 entry at
 `b.rip & L1_MASK`, and an L1 hit bypasses lookup). A translation keeps a chain of its instances; killing it (a code write,
@@ -147,7 +173,8 @@ instance.
 
 Other events: CR3 loads and TLB flushes act on instance currency as they act on blocks now; a full flush is needed only
 when translations fill the metadata arena. Instances are not made while an instruction breakpoint is armed (today's
-template refusal).
+template refusal). A revalidation whose fetch walk finds a global mapping for a shared translation's instance (lookup
+copies GLOBAL and LARGE from the walk, `cache.rs`) drops that instance; the address then gets an absolute block.
 
 ## 4. Entry, the base slot, and where the work lands
 
@@ -157,7 +184,10 @@ entry (`and x0, x0, #~0xfff`; `str x0, [x28, #page_base]`; body), used by L1 ent
 with x0 = the address; and the body entry, used by local links and by the resident's own `enter`, which writes the slot
 itself and enters past the two words (the frame check stays as it is). Code that today compares the stop address with the
 first word (`interrupted`: `elr == b.entry()` and `at_once(s, b.rip)`; `shadow_entry`) treats both entry words and the
-body entry as "the first word", and takes the instance address.
+body entry as "the first word", and takes the address from the right place for each: at the `and`, x0 (the full address;
+the slot still holds the previous base); at the `str`, x0 (the page base) plus the block's page offset; at the body entry,
+the slot plus the page offset (x0 is stale after a local link). Every address so taken is checked as below. The only
+writers of the slot are the entry's own `str` and `enter` (a test).
 
 **Body placement.** The block becomes: header word, `and`, `str`, a `nop` (full entry at offset 4), then FEX's body, which
 so moves 16 bytes. A 4-byte move would misalign FEX's 8-byte literal slots, which fault under alignment checking (with
@@ -168,15 +198,24 @@ the computed exit and the relocations shift together.
 accesses, a documented deviation in `abi/execution.rs`, the same class as the IF byte). The slot is guest-writable state.
 Rules:
 - Position-independent translations only for CPL-3 contexts and non-global mappings (so CR3 loads always end their
-  instances' currency, which section 3's alias rule relies on); kernel code is absolute and never reads the slot.
-- The resident never trusts the slot alone. It finds the running translation from the host PC (`block_at`), reads the
-  slot, and accepts it only if it is page-aligned, canonical, has the translation's half, and names a current instance of
-  that translation in the current context; the linker also requires x0 minus the slot to equal a link point's offset.
+  instances' currency); kernel code is absolute and never reads the slot.
+- The resident never trusts the slot alone. It finds the running translation T from the host PC (`block_at`), reads the
+  slot, and accepts it only if it is page-aligned, canonical, has T's half, and a lookup of slot plus T's page offset in
+  the current context resolves to T: T's instance there, or one made on the spot after the usual fetch walk confirms the
+  page maps T's frames (the ordinary miss path, no new bookkeeping). Requiring an existing instance would reject
+  legitimate runs (re-review blocker B: a local link enters T where T has no instance yet; checked against the linker's
+  source test, `execution.rs`); the lookup makes that instance, so T's exits link afterwards. The linker also requires
+  x0 minus the slot to equal a link point's offset.
+- Stage 2 (one block per address) does not read the slot at all: the resident uses the block's own address and counts a
+  slot that disagrees (a debug count, never a halt).
 - A slot that fails is the guest's own corruption of its own state: it never halts the VM (no `BAD_LINK` from it), never
   reaches another address space, and is handled as a jump by that process to the address it names: the resident does not
   link, and enters through lookup and the normal fetch walk at the current CPL (a user address mapped by the process, or
   a page fault in it). A fault RIP derived from a forged slot affects only that process's own exception frame.
-- Test: a CPL-3 program that stores into the slot (like the IF-byte test) and survives with only its own state changed.
+- A forged slot giving a non-canonical or kernel-half address reaches lookup as that process's #GP or #PF, never an
+  assertion or `BAD_LINK`.
+- Test: a CPL-3 program that stores into the slot (like the IF-byte test), including non-canonical and kernel-half
+  values, and survives with only its own state changed.
 
 **natemu, not FEX.** The rewrite needs only what the resident already keeps for each template (each guest-address
 relocation's offset and register, the word count by decoding, the link points), is about the size of `relocate_code` and
@@ -204,7 +243,7 @@ only instances and cross-page links. Its place in the private window is to be la
 | Reference-count copies by address space | Not feasible. The resident never sees an address space die: Linux frees page tables with no architectural event, CR3 values are reused, and without PCID nothing names an address space; it learns only lazily that a mapping moved (74 k "remapped" lookups per vCPU). Recency (`Block::checked`) is observable, lifetime is not | None to build |
 | Deduplicate identical copies | Copies at different addresses differ in their constants by construction; copies at one address are already one block. Deduplication is what position independence does | Same as this plan |
 | Denser records | Halving records halves flushes at most, like the capacity option | Medium, every record user |
-| **Position-independent translations (this plan)** | See the estimate below | Larger: instances, alias rule, entry and trust rules, check mode |
+| **Position-independent translations (this plan)** | See the estimate below | Larger: instances, checked cross-page links, entry and trust rules, check mode |
 
 **Estimate for this plan.** Two ways, giving a range. (a) By the capacity calibration: requests should fall to about the
 ASLR-off level (1.0 M; translations alone flush once or twice), 5.3 M fewer per vCPU; at 13 µs of wall each, about 70 s:
@@ -224,21 +263,28 @@ loop (`run.py NAME 4 churn`), the same two with ASLR off (no regression from the
 must not move). Baselines are measured again on the build each stage starts from (with the capacity change if merged).
 
 1. **Counting, no behaviour change.** Per run: templates eligible for the rewrite and why others are not; links made by
-   class (local, cross-page, into global code) and linked transitions where countable; frames entered at a second linear
-   page in one epoch; requests that a translation seen earlier in the run would have served (the bound on the host
-   saving); host-cache drops followed by a recompile of the same answer. Gate: eligible templates cover at least 90% of
+   class (same-page, cross-page, from would-be-shared code into absolute or global code) and linked transitions by class
+   (they price the cross-page check); frames seen at two linear pages in one address space and epoch; requests that a
+   translation seen earlier in the run would have served (the bound on the host saving); host-cache drops followed by a
+   recompile of the same answer. Stage 3 adds the cross-page check's hit rate and the counts of every slow path taken
+   (check misses, slot lookups, blocks left unshared). Gate: eligible templates cover at least 90% of
    copies on the slice and the exec loop; otherwise revisit section 2's reach.
 2. **The rewrite and entry, one instance per block.** Eligible templates are placed rewritten; copies keep being made, now
    by plain copying of rewritten code. This proves the new code and measures the tax alone. Gate: unit tests of the
    rewrite's proof (each refusal red under its mutation, as for `relocate_code`); a stop on each entry word and the body
-   entry; a run with x86 AC on; the CPL-3 slot-store test; tail literal unread (test); suites green; check-mode installer
-   and slice with zero mismatches; ASLR-off slice within 2% of before.
+   entry, checking the RIP each reports; the link forms of section 3 (arm and disarm on the `svc`-word form,
+   `links_restored` with both forms, absolute-to-shared links, a precise stop at a linked `svc` word with the RIP from
+   x0); slot writers only the two named; a run with x86 AC on; the CPL-3 slot-store test; tail literal unread (test);
+   suites green; check-mode installer and slice with zero mismatches; ASLR-off slice within 2% of before.
 3. **Instances.** L2 and L1 owners name instances; instances name shared translations; per-instance currency, linear
-   chains and canonical checks; the instance chain and its use in every kill path; the alias rule; copies stop for
+   chains and canonical checks; the instance chain and its use in every kill path; checked cross-page links; copies stop for
    eligible blocks. New K1 cases, each red under its mutation: one frame at two linear pages of one address space,
    entered at the second page through an L1 entry and through a local link, with a cross-page link from the first; the
    same address in a forked child; INVLPG of one instance; a code write and an I/O drain while a second instance has a
-   live L1 entry; a link from an absolute block into a position-independent target on the same page; instance eviction
+   live L1 entry; a link from an absolute block into a position-independent target on the same page; a shared block on
+   the same page and frame as an absolute one, run in a second process at another address (the shared-to-absolute
+   case); a fault and a linked exit in a block reached only by a local link (slot accepted through the source's
+   instance); a global TLB flush with checked links live; a global mapping found for a shared instance; instance eviction
    with live L1 entries. Gate: those, suites green, slice at most 35 s and exec loop at most 2.5 ms, then one full build.
 4. **Instance-area eviction and tuning.** Sizing from Stage 3's counts. Gate: full build three rounds, capacity flushes at
    most 3 per vCPU, host requests within 1.5x of ASLR off.
@@ -247,8 +293,8 @@ Stop rules: if Stage 1 shows eligibility under 90%, or Stage 2's tax exceeds 3% 
 
 ## 7. Risks
 
-- **Shared links**: the alias rule must be applied wherever an instance becomes current; the two-mapping K1 cases and the
-  check mode are its tests.
+- **Shared links**: cross-page links rely on L1 entries being exact for the epoch and on undoing links into a table that
+  loses its context; the two-mapping K1 cases, a global flush with checked links live, and the check mode are its tests.
 - **Invalidation completeness**: every kill and eviction path must walk the instance chain.
 - **The base slot is guest-writable**: contained by section 4's rules; the resident must also never clobber it while a
   block can resume mid-way (fault retry).
