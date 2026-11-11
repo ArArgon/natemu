@@ -635,6 +635,10 @@ pub mod cache {
         /// PIC study forge tests ([`PIC_TEST_FORGE`] and its variants): entries made with a forged slot so far; only the
         /// run's first [`PIC_FORGES`] are (the programs then run clean, their values exact again).
         pub pic_forged: u64,
+        /// PIC study: under the check ([`REUSE_CHECK`]) local links are still made when set (the program driver's
+        /// code-shape runs, whose programs check their values: the K1 programs are local links' tests); unset (the
+        /// `--check-reuse` boots), none is made: code reached only through one would never be compared at its address.
+        pub pic_check_local: u64,
     }
     pub const PIC_TEST_AND: u64 = 1;
     pub const PIC_TEST_STR: u64 = 2;
@@ -767,9 +771,10 @@ pub mod cache {
     /// [`PIC_LEAD`] bytes past a 64-byte boundary, the full entry's `and` in the word before `code` and its `str` in the
     /// code header's word ([`Block::full_entry`]); its link points' first words are the rewritten moves' `ldr x0`.
     pub const PIC: u32 = 512;
-    /// PIC study stage 3: a user template whose code has a position-independent form ([`crate::pic::eligible`]), not
-    /// global: it is shared ([`TRANSLATION`]) once a second address needs it, and kept absolute until then.
-    pub const ELIGIBLE: u32 = 1024;
+    /// PIC study stage 3: a template found, the first time a second address needed its code, to have no
+    /// position-independent form ([`crate::pic::eligible`]) or a global mapping: never shared, copied instead (copies
+    /// keep the bit).
+    pub const UNSHAREABLE: u32 = 1024;
     /// PIC study stage 3: a shared translation: code and record of a [`PIC`] template, run at every address an
     /// [`INSTANCE`] names; never in L2 or on the linear chains (only its instances are current anywhere), on its frames'
     /// chains (a write kills it with its instances); the hint table names it.

@@ -17,11 +17,11 @@ use core::mem::align_of;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::code_object::{Header, Reloc, Site};
 pub use natemu_abi::execution::cache::{
-    ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, ELIGIBLE, FLUSH, GLOBAL,
-    HEAD_BYTES, INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_ALL, PIC_LEAD,
+    ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES,
+    INBOUND, INSTANCE, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_ALL, PIC_LEAD,
     PIC_TEST_AND, PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_FORGE_HALF, PIC_TEST_FORGE_NONCANONICAL,
     PIC_TEST_STR, PIC_TEST_SVC, PIC_USER, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP,
-    STI_FIRST, SYSTEM, TRANSLATION,
+    STI_FIRST, SYSTEM, TRANSLATION, UNSHAREABLE,
 };
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
 use natemu_abi::execution::{
@@ -630,6 +630,7 @@ pub fn lookup(
                 if walked & LARGE != 0 {
                     mark_large(&b);
                 }
+                #[cfg(feature = "pic-count")]
                 if user(b.context) {
                     frame_met(block(n));
                 }
@@ -793,9 +794,12 @@ pub fn place(
             }
             table.add(j).write(r);
         }
-        let admitted =
-            core::slice::from_raw_parts(object.add(h.code_offset as usize), h.code_size as usize);
-        placed_pic(placed, admitted);
+        // PIC study counts (`pic-count` builds only).
+        #[cfg(feature = "pic-count")]
+        placed_pic(
+            placed,
+            core::slice::from_raw_parts(object.add(h.code_offset as usize), h.code_size as usize),
+        );
         synchronize_code(
             area::CODE_WRITE_VA + code,
             area::CODE_VA + code,
@@ -813,9 +817,9 @@ fn counted(k: usize) {
 fn user(context: u64) -> bool {
     context & 3 == 3
 }
-/// PIC study, a block placed from the host's answer (`admitted`, its code as admitted): counted by what sharing could do
-/// with it; a template with a position-independent form, not global, is [`ELIGIBLE`] (stage 3: it stays absolute until a
-/// second address needs its code, [`share`]). Its first frame and linear page are noted ([`frame_met`]).
+/// PIC study (`pic-count` builds), a block placed from the host's answer (`admitted`, its code as admitted): counted by
+/// what sharing could do with it. Its first frame and linear page are noted ([`frame_met`]).
+#[cfg(feature = "pic-count")]
 fn placed_pic(b: &Block, admitted: &[u8]) {
     let u = user(b.context);
     if u {
@@ -836,9 +840,6 @@ fn placed_pic(b: &Block, admitted: &[u8]) {
             .unwrap_or(count::ELIGIBLE)
     };
     counted(if u { k } else { count::KERNEL_TEMPLATES });
-    if k == count::ELIGIBLE {
-        unsafe { (*block_ptr(b.number as usize)).flags |= ELIGIBLE };
-    }
 }
 /// PIC study stage 3: whether templates of `context` are shared ([`Control::pic`]: user code, or every privilege level).
 pub fn shares(context: u64) -> bool {
@@ -848,8 +849,9 @@ pub fn shares(context: u64) -> bool {
         _ => false,
     }
 }
-/// PIC study stage 3, the lazy rewrite: the shared translation of the [`ELIGIBLE`] template `t` (absolute, live), made when
-/// a second address first needs its code: `t`'s code copied [`PIC_LEAD`] bytes past the fill point's boundary with its link
+/// PIC study stage 3, the lazy rewrite: the shared translation of the template `t` (absolute, live, not [`UNSHAREABLE`]),
+/// made when a second address first needs its code (a template with no position-independent form, or a global mapping, is
+/// marked [`UNSHAREABLE`] then, and `None`): `t`'s code copied [`PIC_LEAD`] bytes past the fill point's boundary with its link
 /// points restored (first and `svc` words) and its computed exit relocated, rewritten ([`pic::rewrite`]), the full
 /// entry's words before it, under the check its literal slots poisoned ([`poison`]), then the static proof against `t`'s
 /// admitted code ([`pic::proved`]; `t`'s words with its link points restored). Filed as a [`TRANSLATION`] with `t`'s
@@ -888,6 +890,11 @@ pub fn share(t: &Block) -> Option<&'static Block> {
         );
         for &(o, w) in admitted.iter().filter(|(o, _)| *o != u64::MAX) {
             at[o as usize..o as usize + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        // (Its first need decides: no position-independent form, or a global mapping, and it is never asked again.)
+        if t.flags & GLOBAL != 0 || pic::eligible(at, relocs(t), &t.links, t.rip).is_err() {
+            (*block_ptr(t.number as usize)).flags |= UNSHAREABLE;
+            return None;
         }
         if pic::rewrite(at, relocs(t), &mut links, t.rip).is_err() {
             counted(count::UNPROVED);
@@ -986,11 +993,12 @@ pub fn instance(
         reserved: 0,
     };
     let placed = unsafe { file(record, core::ptr::null(), 0, 0) };
-    if let Some(p) = placed {
+    if placed.is_some() {
         counted(count::INSTANCES);
-        if user(p.context) {
-            frame_met(p);
-        }
+    }
+    #[cfg(feature = "pic-count")]
+    if let Some(p) = placed.filter(|p| user(p.context)) {
+        frame_met(p);
     }
     Ok(placed)
 }
@@ -1047,8 +1055,9 @@ fn poison(b: &Block, code: &mut [u8]) {
 }
 /// [`poison`]'s value.
 pub const POISON: u64 = 0x8000_dead_beef_0000;
-/// PIC study: a user block's first frame met at its first linear page in this TLB epoch (one address space): counted
+/// PIC study (`pic-count` builds): a user block's first frame met at its first linear page in this TLB epoch (one address space): counted
 /// ([`count::ALIASES`]) when the frame was last met at another linear page in the same epoch ([`area::PIC_FRAMES`]).
+#[cfg(feature = "pic-count")]
 pub fn frame_met(b: &Block) {
     let c = control();
     let frame = b.source_gpa[0] >> 12;
@@ -1137,17 +1146,20 @@ pub fn copy(
         code: code as u32,
         number: 0,
         flags: walked & (GLOBAL | LARGE)
-            | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | ELIGIBLE),
+            | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | UNSHAREABLE),
         links,
         ..*b
     };
     let tail = size_of::<Site>() * b.sites_count as usize + 4 * relocs(b).len();
     let placed = unsafe { file(record, sites(b).as_ptr().cast(), tail, 0) };
-    if let Some(p) = placed {
+    if placed.is_some() {
         c.code_used = code_end;
+    }
+    #[cfg(feature = "pic-count")]
+    if let Some(p) = placed {
         if user(p.context) {
             counted(count::COPIES);
-            if p.flags & ELIGIBLE != 0 {
+            if p.flags & UNSHAREABLE == 0 {
                 counted(count::COPIES_COVERED);
             }
             frame_met(p);
@@ -1497,7 +1509,6 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     // indexed by the address's low 16 bits and instances of one translation differ in bits 12-15, so it reaches only the
     // linking instance's entry (the plan's first form: every other instance missed into the resident, 727 M lookups
     // against 53 M on the slice). Absolute to absolute as before.
-    let code = code_of(target);
     let shared = source.flags & PIC != 0;
     let same_frames = |code: &Block, source: &Block| {
         code.source_gpa[0] == source.source_gpa[0]
@@ -1505,12 +1516,28 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     };
     // (Under the check none: a local link runs its target's translation at the source's address with no instance there,
     // which the check would never compare; the slot's probe finds or makes one. Review of stage 3, finding 4c.)
-    let local_shared = shared
-        && c.reuse != REUSE_CHECK
+    let local_ok = shared
+        && (c.reuse != REUSE_CHECK || c.pic_check_local != 0)
         && c.pic_test != natemu_abi::execution::cache::PIC_TEST_NOLOCAL
-        && target.flags & INSTANCE != 0
-        && target.rip >> 12 == at >> 12
-        && same_frames(code, source);
+        && target.rip >> 12 == at >> 12;
+    // From shared code into an absolute template on its own page and frames (most links out of shared code: its
+    // neighbours there have not needed a second address yet): the target is shared now (or its translation found) and
+    // the link made local, so it never depends on an L1 entry. A template with no position-independent form stays
+    // absolute (the link is checked).
+    let now = (local_ok
+        && target.flags & (INSTANCE | PIC | SYSTEM | STEP | DEAD | GLOBAL | UNSHAREABLE) == 0
+        && target.flags & RELOCATABLE != 0
+        && same_frames(target, source)
+        && shares(target.context))
+    .then(|| {
+        template(target.rip, target.source_gpa[0], target.context)
+            .filter(|t| t.flags & TRANSLATION != 0 && t.source_gpa == target.source_gpa)
+            .or_else(|| share(target))
+    })
+    .flatten();
+    let code = now.unwrap_or_else(|| code_of(target));
+    let local_shared =
+        local_ok && (target.flags & INSTANCE != 0 || now.is_some()) && same_frames(code, source);
     let checked = !local_shared && (shared || target.flags & INSTANCE != 0);
     // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
     // word would not see the REP boundary, which the resident finds by the link point's offset.)
@@ -1564,8 +1591,10 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     } else {
         (CR3, INBOUND)
     };
+    // PIC study (`pic-count` builds only): the link's class, and the link enters the target through a counting stub
+    // ([`stub`]).
+    #[cfg(feature = "pic-count")]
     let class = pic::class(shared, at, code.flags & PIC != 0, target.rip);
-    // PIC study (`pic-count` builds only): the link enters the target through a counting stub ([`stub`]).
     #[cfg(feature = "pic-count")]
     let to = if points().any(|p| unlinked(source, p)) {
         stub(entry, class)
@@ -1593,13 +1622,26 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
         }
         linked += 1;
     }
+    if linked != 0 && checked {
+        counted(count::CHECKED_LINKS);
+    }
+    // (Every build: the forms' counts the tests need, local and absolute into shared.)
+    #[cfg(not(feature = "pic-count"))]
+    if linked != 0 && (local_shared || checked && !shared) {
+        counted(
+            count::LINKS
+                + if local_shared {
+                    pic::Class::SamePage
+                } else {
+                    pic::Class::AbsoluteToShared
+                } as usize,
+        );
+    }
+    // (Study, `pic-count` builds: links by class, and a shared source's into an absolute block on its own page and
+    // frame, which sharing the target at link time would make local.)
+    #[cfg(feature = "pic-count")]
     if linked != 0 {
         counted(count::LINKS + class as usize);
-        if checked {
-            counted(count::CHECKED_LINKS);
-        }
-        // (Study: a shared source's link into an absolute block on its own page and frame, which sharing the target at
-        // link time would make local.)
         if shared
             && code.flags & PIC == 0
             && target.rip >> 12 == at >> 12

@@ -681,44 +681,27 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     else {
         return declined(s, rip, SysFastDecline::NotCurrent);
     };
-    // PIC study stage 2: from a position-independent block x0 was built from the page-base slot; only an exit whose link
-    // point's target (the block's own address) is x0 takes the fast path (the linker takes the target otherwise).
-    let pic_mismatch = cache::block_at(elr.wrapping_sub(4)).is_some_and(|b| {
-        b.flags & cache::PIC != 0
-            && link_point_of(b, elr.wrapping_sub(4))
-                .and_then(|at| b.links.iter().find(|p| u64::from(p.offset) == at))
-                .is_none_or(|p| {
-                    p.target
-                        .wrapping_sub(b.rip)
-                        .wrapping_add(cache::running_rip(b))
-                        != rip
-                })
-    });
-    if pic_mismatch {
+    // The block that ran the exit and the exit's own link point (the one its `svc` follows), found once: its target (for
+    // shared code its translation's, moved to the address it runs for, as in `linker`) must be x0.
+    let svc = elr.wrapping_sub(4);
+    let Some(ran) = cache::block_at(svc) else {
+        return declined(s, rip, SysFastDecline::Boundary);
+    };
+    let here = cache::running_rip(ran);
+    let Some(point) = link_point_of(ran, svc)
+        .and_then(|at| ran.links.iter().find(|p| u64::from(p.offset) == at))
+        .filter(|p| p.target.wrapping_sub(ran.rip).wrapping_add(here) == rip)
+    else {
         return declined(s, rip, SysFastDecline::Other);
-    }
+    };
     let debugging = s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0;
     if debugging
         || s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0
         || cache::pending()
         || io_pending(s)
         || lapic::due()
-    {
-        return declined(s, rip, SysFastDecline::Boundary);
-    }
-    let svc = elr.wrapping_sub(4);
-    let Some(ran) = cache::block_at(svc) else {
-        return declined(s, rip, SysFastDecline::Boundary);
-    };
-    let ordinary = ran.flags & (cache::STEP | cache::DEAD) == 0
-        && !link_point_of(ran, svc).is_some_and(|o| ran.rep_exit(o));
-    // (Shared code's link targets are its translation's, moved to the address it runs for, as in `linker`.)
-    let here = cache::running_rip(ran);
-    if !ordinary
-        || !ran
-            .links
-            .iter()
-            .any(|p| p.offset != 0 && p.target.wrapping_sub(ran.rip).wrapping_add(here) == rip)
+        || ran.flags & (cache::STEP | cache::DEAD) != 0
+        || ran.rep_exit(u64::from(point.offset))
     {
         return declined(s, rip, SysFastDecline::Boundary);
     }
@@ -969,7 +952,7 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
                 None
             } else if b.flags & cache::TRANSLATION != 0 {
                 Some(b)
-            } else if b.flags & cache::ELIGIBLE != 0
+            } else if b.flags & cache::UNSHAREABLE == 0
                 && walk & cache::GLOBAL == 0
                 && cache::shares(b.context)
             {
