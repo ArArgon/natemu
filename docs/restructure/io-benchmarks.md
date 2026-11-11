@@ -1464,6 +1464,26 @@ selected profile exposes the required controls; pin its profile independently of
 the harness version and disable automatic profile drift. It is optional for this
 small matrix, not a reason to accept opaque defaults or install a large suite.
 
+## Run-to-run bimodality: fio on the interrupt's vCPU — November 11
+
+Many fio rows ran at one of two speeds, in the same boot as well as between boots (4 vCPUs,
+`natemu-raw/io-noise-20261111-01/`). Cause: Linux routes the single virtio IRQ (IO-APIC line 16) to
+one vCPU (CPU 3 in every run) and the scheduler sometimes puts the fio thread on that same vCPU.
+Then random 4 KiB reads at depth 16 ran at about 45k instead of about 97k IOPS and 128 KiB
+sequential reads at about 25k instead of 36k. Thread QoS of the block threads made no difference
+(60 runs with and without). The guest honours writes to `/proc/irq/N/smp_affinity`.
+
+Rule from now on (`tools/run_io_matrix.py` guest): with two or more vCPUs the IRQ is pinned to CPU 0
+and every fio job runs on CPUs 1..n-1 (`taskset`); at two vCPUs the four jobs of
+`rand-read-4k-4jobs-q16` share CPU 1; at one vCPU nothing is pinned. The log carries an
+`IO-MATRIX-PIN` line and the judge requires it. Pinned, nine rand-read-q16 phases ran 87.5-95k
+and nine seq-read-128k phases 35.4-37.0k IOPS. Inputs: `natemu-raw/io-inputs-20261111-02/`.
+
+Every earlier free-placement table here (including the November 9-10 matrix, PIC and window
+comparisons) contains this noise: a low fio row may be placement, not a regression. A third mode
+is not explained by pinning: seq-read-128k occasionally collapses to about 8-9k IOPS (about 1 GiB/s;
+seen once in the first pinned matrix at four vCPUs); open.
+
 ## Bounded initial matrix (historical)
 
 Historical (November 8 planning; superseded by the measured sections above).
