@@ -549,10 +549,13 @@ pub mod cache {
         pub peak: [u64; 3],
         /// Perf chunk 8: the link records' segments. `[0, links_cr3)` are links from another page into non-global targets
         /// (a CR3 load looks at them), `[links_cr3, links_tlb)` from another page into [`GLOBAL`] targets (every other
-        /// TLB event looks at both), `[links_tlb, links)` local links: each linear page of the target is a page of the source
-        /// translated from the same guest-physical page (only a death or a flush looks at them).
+        /// TLB event looks at both), `[links_tlb, links_local)` local links: each linear page of the target is a page of the
+        /// source translated from the same guest-physical page (only a death or a flush looks at them); PIC study stage 3:
+        /// `[links_local, links)` checked links ([`CHECKED`]), an exit's `svc` word branching to its context's dispatcher
+        /// slot: only a death of their source and a flush look at them.
         pub links_cr3: u64,
         pub links_tlb: u64,
+        pub links_local: u64,
         /// The linear 2 MiB regions (bit r % 1024) a live [`LARGE`] block's guest bytes may lie in (as `regions`).
         pub large_regions: [u64; 16],
         /// The last request's fetch walks: byte i holds page i's leaf's [`GLOBAL`] (its G bit) and [`LARGE`].
@@ -626,14 +629,28 @@ pub mod cache {
         /// own doorbell rung (a stop at that word); [`PIC_TEST_SVC`] arms only the `svc`-word links of any block (a stop there);
         /// [`PIC_TEST_FORGE`] writes another page's base in the slot (the guest's corruption of its own state). 0: none.
         pub pic_test: u64,
+        /// PIC study (`pic-count` resident builds only): per 16 bytes of the dispatcher (its slots and the miss), the
+        /// code-area offset of the stub counting computed exits into it (0: none yet), taken from the code area's top.
+        pub computed_stubs: [u32; DISPATCH_BYTES / 16],
+        /// PIC study forge tests ([`PIC_TEST_FORGE`] and its variants): entries made with a forged slot so far; only the
+        /// run's first [`PIC_FORGES`] are (the programs then run clean, their values exact again).
+        pub pic_forged: u64,
     }
     pub const PIC_TEST_AND: u64 = 1;
     pub const PIC_TEST_STR: u64 = 2;
     pub const PIC_TEST_BODY: u64 = 3;
     pub const PIC_TEST_SVC: u64 = 4;
     pub const PIC_TEST_FORGE: u64 = 5;
+    pub const PIC_FORGES: u64 = 4;
+    /// As [`PIC_TEST_FORGE`], the slot's bit 47 flipped (a non-canonical base).
+    pub const PIC_TEST_FORGE_NONCANONICAL: u64 = 6;
+    /// As [`PIC_TEST_FORGE`], bits 47-63 flipped (a base in the other half).
+    pub const PIC_TEST_FORGE_HALF: u64 = 7;
     /// [`Control::armed_words`]: two words per link point and the computed exit.
     pub const ARMED: usize = 2 * super::MAX_LINK_POINTS + 1;
+    /// PIC study stage 3: a checked link's record ([`LinkRecord::target`]): its `svc` word branches to its source context's
+    /// dispatcher slot (an L1 probe at the address the exit built).
+    pub const CHECKED: u32 = 1 << 31;
     /// [`Control::pic`].
     pub const PIC_OFF: u64 = 0;
     pub const PIC_USER: u64 = 1;
@@ -711,6 +728,9 @@ pub mod cache {
         pub rep_exits: u32,
         /// Its literal exits as admitted (`offset` 0 = unused).
         pub links: [super::LinkPoint; super::MAX_LINK_POINTS],
+        /// PIC study stage 3: an [`INSTANCE`]'s translation (its block number), whose code it runs; 0 otherwise.
+        pub shared: u32,
+        pub reserved: u32,
     }
     /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
     /// again; its space is reclaimed at the next flush.
@@ -740,11 +760,22 @@ pub mod cache {
     /// copies): where its slow path would exit to its own start the resident runs the STI itself, and that exit (a link
     /// from the block to itself) is never linked.
     pub const STI_FIRST: u32 = 256;
-    /// PIC study: the block is position-independent ([`crate::pic`], stage 2): a template rewritten at its placement, or a
-    /// copy of one. Its code is placed [`PIC_LEAD`] bytes past a 64-byte boundary, the full entry's `and` in the word
-    /// before `code` and its `str` in the code header's word ([`Block::full_entry`]); its link points' first words are
-    /// the rewritten moves' `ldr x0`, so a link into it from elsewhere patches the `svc` word after the move.
+    /// PIC study: the block's code is position-independent ([`crate::pic`]): a shared translation (stage 3: a template
+    /// rewritten the first time its code was needed at a second address, [`TRANSLATION`]). Its code is placed
+    /// [`PIC_LEAD`] bytes past a 64-byte boundary, the full entry's `and` in the word before `code` and its `str` in the
+    /// code header's word ([`Block::full_entry`]); its link points' first words are the rewritten moves' `ldr x0`.
     pub const PIC: u32 = 512;
+    /// PIC study stage 3: a user template whose code has a position-independent form ([`crate::pic::eligible`]), not
+    /// global: it is shared ([`TRANSLATION`]) once a second address needs it, and kept absolute until then.
+    pub const ELIGIBLE: u32 = 1024;
+    /// PIC study stage 3: a shared translation: code and record of a [`PIC`] template, run at every address an
+    /// [`INSTANCE`] names; never in L2 or on the linear chains (only its instances are current anywhere), on its frames'
+    /// chains (a write kills it with its instances); the hint table names it.
+    pub const TRANSLATION: u32 = 2048;
+    /// PIC study stage 3: an instance: a translation's ([`Block::shared`]) use at its own address and context, with its own
+    /// currency, L1 and L2 entries, linear and frame chains and link-point targets; no code (`code` the fill point,
+    /// `code_size` 0, as a [`SYSTEM`] record), no sites (its translation's).
+    pub const INSTANCE: u32 = 4096;
     /// Bytes before a position-independent block's `code`: three words left zero (`udf`) and the `and`, keeping FEX's
     /// code 16-byte aligned as placed blocks are (its literal slots; x86 AC runs generated code with SCTLR_EL1.A): the
     /// design's 16-byte shift of FEX's body.

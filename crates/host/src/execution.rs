@@ -537,9 +537,15 @@ pub fn k1_stats(area: Area) -> K1 {
 }
 /// PIC study: a `pic-count` resident's linked transitions by class (same page, cross-page, position-independent into
 /// absolute, absolute into position-independent), counted in four guest-state fields no generated code uses (the
-/// resident's `cache::stub`); zero from other residents.
-fn pic_transitions(area: Area) -> [u64; 4] {
-    [0x0, 0x8, 0x10, 0xb0].map(|at| u64::from_le_bytes(area.read::<8>(exec::FRAME_OFFSET + at)))
+/// resident's `cache::stub`), then its computed exits (32 bits, wrapping: FEX's flag bytes 28-31, `cache::computed`); zero
+/// from other residents.
+fn pic_transitions(area: Area) -> [u64; 5] {
+    let mut t = [0x0, 0x8, 0x10, 0xb0, 0]
+        .map(|at| u64::from_le_bytes(area.read::<8>(exec::FRAME_OFFSET + at)));
+    t[4] = u64::from(u32::from_le_bytes(
+        area.read::<4>(exec::FRAME_OFFSET + exec::frame::FLAGS as usize + 28),
+    ));
+    t
 }
 /// [`k1_stats`]: a vCPU's TLB, code-cache and system-instruction counters (times in us).
 #[derive(Debug, Default, serde::Serialize)]
@@ -574,7 +580,7 @@ pub struct K1 {
     systems: K1Systems,
     /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).
     pic: [u64; natemu_abi::pic::count::COUNTS],
-    pic_transitions: [u64; 4],
+    pic_transitions: [u64; 5],
 }
 #[derive(Debug, Default, serde::Serialize)]
 struct K1Uncached {
@@ -667,7 +673,7 @@ impl K1 {
                     .collect(),
             },
             pic: c.pic_counts,
-            pic_transitions: [0; 4],
+            pic_transitions: [0; 5],
         }
     }
 }
@@ -845,7 +851,13 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let blocks = placed_blocks(area);
     let mut linked = HashMap::new();
     let mut points = 0;
-    for b in &blocks {
+    // PIC study stage 3: an instance's link points are its translation's (which holds the words); the dispatcher slots.
+    let slots = (cache::DISPATCH + cache::DISPATCH_SLOT_BYTES) as u64
+        ..(cache::DISPATCH + cache::DISPATCH_BYTES) as u64;
+    for b in blocks
+        .iter()
+        .filter(|b| b.flags & (cache::INSTANCE | cache::SYSTEM) == 0)
+    {
         for p in b.links.iter().filter(|p| p.offset != 0) {
             points += 1;
             let at = u64::from(b.code) + u64::from(p.offset);
@@ -856,43 +868,48 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     p.offset, b.rip
                 )
             };
-            // PIC study stage 2: a point may be linked in the `svc` word after its move, to a position-independent
-            // target's full entry; its first word is then as admitted.
-            let (at, w, full) = if w == p.word {
+            let branch = |at: u64, w: u32| {
+                (w & 0xfc00_0000 == 0x1400_0000)
+                    .then(|| at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64))
+            };
+            if w == p.word {
+                // Its `svc` word: as admitted, or a checked link's `b`.
                 let svc = u64::from(b.code)
                     + natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p);
-                match word(svc) {
-                    natemu_abi::pic::SVC_LINK => continue,
-                    w => (svc, w, true),
+                let w = word(svc);
+                if w == natemu_abi::pic::SVC_LINK {
+                    continue;
                 }
-            } else {
-                (at, w, false)
-            };
-            if w & 0xfc00_0000 != 0x1400_0000 {
-                return Err(bad());
+                // A checked link: `b` to a dispatcher slot.
+                let slot =
+                    |to: u64| slots.contains(&to) && to % cache::DISPATCH_SLOT_BYTES as u64 == 0;
+                if !branch(svc, w).is_some_and(slot) {
+                    return Err(bad());
+                }
+                linked.insert((b.number, (svc - u64::from(b.code)) as u32), cache::CHECKED);
+                continue;
             }
-            let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
-            // The form is the design's: into a position-independent target, the `svc` word, unless the source is
-            // position-independent and starts on the target's page (then the first word, the base being the same).
+            // Its first word: `b` to a block's body. From absolute code, an absolute block keyed (target, context); from
+            // shared code, a shared translation of the frame it starts on, at the target's page offset (local).
             let pic = |t: &cache::Block| t.flags & cache::PIC != 0;
-            let form =
-                |t: &cache::Block| full == (pic(t) && !(pic(b) && b.rip >> 12 == t.rip >> 12));
-            match blocks.iter().position(|t| {
-                t.flags & cache::SYSTEM == 0
-                    && to
-                        == if full {
-                            t.full_entry() - cache::CODE_VA
-                        } else {
-                            u64::from(t.code) + u64::from(exec::ENTRY_OFFSET)
-                        }
+            let fits = |t: &cache::Block| {
+                t.context == b.context
+                    && if pic(b) {
+                        pic(t)
+                            && t.source_gpa[0] == b.source_gpa[0]
+                            && p.target >> 12 == b.rip >> 12
+                            && t.rip & 0xfff == p.target & 0xfff
+                    } else {
+                        !pic(t) && t.rip == p.target
+                    }
+            };
+            match branch(at, w).and_then(|to| {
+                blocks.iter().position(|t| {
+                    t.flags & (cache::SYSTEM | cache::INSTANCE) == 0
+                        && u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to
+                })
             }) {
-                Some(t)
-                    if blocks[t].rip == p.target
-                        && blocks[t].context == b.context
-                        && form(&blocks[t]) =>
-                {
-                    linked.insert((b.number, (at - u64::from(b.code)) as u32), t)
-                }
+                Some(t) if fits(&blocks[t]) => linked.insert((b.number, p.offset), t as u32),
                 _ => return Err(bad()),
             };
         }
@@ -900,29 +917,31 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let records: Vec<cache::LinkRecord> = (0..control.links as usize)
         .map(|i| link_record(area, i))
         .collect();
-    // Each record also holds the point's admitted first word.
+    // Each record also holds the patched word as admitted: the point's first word, or (checked) `svc #LINK`.
     let described = records.iter().all(|r| {
         let Some(b) = blocks.get(r.source as usize) else {
             return false;
         };
-        // (PIC study stage 2: or the `svc` word after its move, `svc #LINK` as admitted.)
+        let checked = r.target & cache::CHECKED != 0;
         let svc = |p: &exec::LinkPoint| {
             natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p) == u64::from(r.offset)
         };
-        let point = b
-            .links
-            .iter()
-            .find(|p| p.offset != 0 && (p.offset == r.offset || svc(p)));
-        linked.get(&(r.source, r.offset)) == Some(&(r.target as usize))
-            && point.is_some_and(|p| {
-                (if p.offset == r.offset {
-                    p.word
+        let point = b.links.iter().find(|p| {
+            p.offset != 0
+                && if checked {
+                    svc(p)
                 } else {
-                    natemu_abi::pic::SVC_LINK
-                }) == r.original
-                    && blocks
-                        .get(r.target as usize)
-                        .is_some_and(|t| t.rip == p.target)
+                    p.offset == r.offset
+                }
+        });
+        linked.get(&(r.source, r.offset)) == Some(&r.target)
+            && point.is_some_and(|p| {
+                r.original
+                    == if checked {
+                        natemu_abi::pic::SVC_LINK
+                    } else {
+                        p.word
+                    }
             })
     });
     if !described || records.len() != linked.len() {
@@ -2781,9 +2800,11 @@ pub fn run(
         Ok("body") => cache::PIC_TEST_BODY,
         Ok("svc") => cache::PIC_TEST_SVC,
         Ok("forge") => cache::PIC_TEST_FORGE,
+        Ok("forge-noncanonical") => cache::PIC_TEST_FORGE_NONCANONICAL,
+        Ok("forge-half") => cache::PIC_TEST_FORGE_HALF,
         Ok(other) => {
             return Err(format!(
-                "NATEMU_PIC_TEST={other}: and, str, body, svc or forge"
+                "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical or forge-half"
             ));
         }
     };
@@ -2908,7 +2929,14 @@ fn serve(
                     Some(stop) if state.stop == exec::stop::PARKED => Ok(stop),
                     _ if state.stop == exec::stop::PARKED => Err("vCPU parked unasked".into()),
                     _ => Ok(Stop::Resident {
-                        stop: state.stop,
+                        // (The halt's record on stderr: not every driver's report carries it.)
+                        stop: {
+                            eprintln!(
+                                "natemu: resident stop {} native {:x?}",
+                                state.stop, state.native
+                            );
+                            state.stop
+                        },
                         status: s.status,
                         detail: s.detail,
                     }),
