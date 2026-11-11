@@ -431,6 +431,25 @@ Residual costs (November 11, after the final benchmark round):
   every run (not noise: the five runs do not overlap); hackbench and locks at 4 vCPUs and the git group within noise. The
   remaining ASLR-off and 1-vCPU I/O costs are not located yet.
 
+Final results (November 11, the combined final run on 8b694d1, the crash tripwire on): the standing suite 137/137.
+Benchmarks, 3 runs each, against A = 87e4d6c (A rerun interleaved for the I/O matrix, the multi-core set and the boots,
+which drifted more than 3% from the previous A; the earlier A reused for workloads, microbenchmarks and CPython):
+
+- CPython: slice -4.5% (35.7 -> 34.1 s), exec loop -53% (14.3 -> 6.7 s), ASLR-off slice +1.7% (32.9 -> 33.5 s), full
+  build 203.9 s against 257-260 s (A) and 186 s (ASLR off).
+- I/O matrix at 1 vCPU: within -3..+2% but mixed -5.6% (fsync +13%); at 4 vCPUs bimodal as before (q64 random read
+  -9.7%, 4-job random read +7.2%). Workloads: total -1.6% (tar, grep and rm -7%, git +2.4%). Soak: unloaded 189 k IOPS
+  (p99 774 us against 444-473 us), loaded 85.5 k (A 86.3-92.3 k).
+- Multi-core: build n1 -4.7%, n4 +2.7%; zstd, hackbench, locks within 3.4%. Boots: with the installer -1..-7%, without
+  +0..+1.4%. Microbenchmarks (CPL 0, rewritten code): within +2.5%.
+- No guest crash in any serial log of this run (and no tripwire entry outside the suite's own fault tests).
+
+Accepted known cost: user code at many addresses runs shared, and measured 6-11% slower on the 1-vCPU I/O matrix's random
+reads in the re-measure round (within noise in the final run, but for mixed -5.6%). The hot-loop tax of the
+position-independent form is at most 2% (3.9% for `lea`-dense code); of the ~2.4 us per I/O lost, about 0.6 us is the
+dispatcher misses of slot-form links (L1 conflicts: more distinct addresses compete for L1 entries) and about 1 us is not
+explained. Follow-up: the L1 conflict misses (associativity, or an index hashing more address bits).
+
 Not done in stage 3: a separate instance area and its eviction (stage 4), and the plan's I/O drain case. The windowless
 I/O code-page drain kills through the same frame chains as a code write posted by another vCPU, which K1 `pic-xwrite`
 covers at two or more vCPUs on the resident's side (the drain itself is not run); a case for the I/O suite remains: a
