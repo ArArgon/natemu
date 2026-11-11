@@ -1804,6 +1804,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         compiler.shape = code_shape;
         // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
         compiler.check_reuse = code_shape || check_reuse;
+        // (Local links stay under the code-shape check: the programs' values test them; `--check-reuse` alone makes none.)
+        compiler.pic_check_local = code_shape;
         // PIC study: the test programs run at CPL 0 too; every privilege level's templates are shared when a second address
         // needs them, so the suites run shared code (`NATEMU_PIC` overrides).
         compiler.pic = cache::PIC_ALL;

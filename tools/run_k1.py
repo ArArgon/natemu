@@ -111,6 +111,9 @@ link inside it) and, at 0x800, X (`jmp` to Y); frame RT a trampoline page (`jmp`
   was not through it): values, no halt.
 - `pic-again`: `pic-two` twice, its values from the second run, #GP and #PF resuming at the call's return (`run_pic.py`'s
   forge modes: forged only in the first entries, whose faults the handler skips; the second run exact).
+- `pic-cross`: a block crossing into a second page (`reuse-cross`'s: `lea rdx, [rel]` then `mov eax, imm32` whose
+  immediate ends on the next page) placed at RV1, shared at RV3; RV3's second page remapped to RLC (0x200) with INVLPG of
+  that page only, then unmapped (INVLPG) and mapped back to RL2 (INVLPG): each run reads the second page's current frame.
 - `pic-user`: `pic-two` with `NATEMU_PIC=user`: CPL-0 code is never shared (SHARES 0), the same values.
 Instance eviction has no case: instances are freed with the arena at a flush (stage 3), which the flush tests cover.
 Perf chunk 11 (natemu only):
@@ -371,13 +374,13 @@ RE = P.asm('rep movsb\nmov ebx, 13\njmp r13')
 XFLAGS = P.SYS_D(0) + 0x7800     # `pic-xwrite`: per CPU a ready word, then (+ 0x40) a written word
 JMP = lambda at, to: b'\xe9' + (to - at - 5).to_bytes(4, 'little', signed=True)
 PIC = ('pic-two', 'pic-fork', 'pic-invlpg', 'pic-write', 'pic-abs', 'pic-pge', 'pic-gmap', 'pic-ctx', 'pic-twosrc', 'pic-cow',
-       'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again')
+       'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again', 'pic-cross')
 # Least instances, checked links and local (same-page shared) links per CPU.
 PIC_MIN = {'pic-two': (2, 1, 1), 'pic-fork': (1, 0, 1), 'pic-invlpg': (1, 0, 1), 'pic-write': (1, 0, 1), 'pic-abs': (2, 1, 1),
            'pic-pge': (2, 1, 1), 'pic-gmap': (1, 0, 1), 'pic-ctx': (1, 1, 1), 'pic-twosrc': (3, 1, 1),
            'pic-cow': (1, 0, 1), 'pic-twoframe': (2, 1, 1), 'pic-xm': (2, 2, 0), 'pic-flush': (6, 2, 2), 'pic-write2': (1, 0, 1),
            'pic-pfault': (1, 0, 1), 'pic-xwrite': (1, 0, 1), 'pic-user': (0, 0, 0),
-           'pic-rep': (1, 0, 0), 'pic-repexit': (2, 0, 1), 'pic-again': (2, 1, 1)}
+           'pic-rep': (1, 0, 0), 'pic-repexit': (2, 0, 1), 'pic-again': (2, 1, 1), 'pic-cross': (1, 0, 0)}
 # Further `pic` counters per CPU: (counter, least, most): `pic-gmap` refuses the global instance (INSTANCE_REFUSED),
 # `pic-user` shares nothing (SHARES).
 PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)]}
@@ -485,6 +488,12 @@ def pic_bodies(i, n=1):
     out['pic-repexit'] = (call('n0', f'{RV5 + REO + 2:#x}') + rep('n1', RV1 + REO, 0) + rep('n2', RV3 + REO, 0) + rep('n3', RV3 + REO, 0)
                           + rep('n4', RV5 + REO, 1) + save(('r8', 'rbx'), ('r9', 'rcx'), ('r10', 'rdi')) + rep('n5', RV5 + REO, 1)
                           + save(('r12', 'rdi')))
+    inv = lambda va: f'    mov rax, {va:#x}\n    invlpg [rax]\n'
+    leaf0 = lambda va: f'    xor eax, eax\n    mov [{high_leaf(i, 0, va):#x}], rax\n'
+    out['pic-cross'] = (call('k0', f'{RV1 + RX:#x}') + save(('r8', 'rax')) + calls('k1', RV3 + RX) + save(('r9', 'rax'), ('r10', 'rdx'))
+                        + put_a(RV3 + 0x1000, d + RLC) + inv(RV3 + 0x1000) + calls('k2', RV3 + RX, 2) + save(('r12', 'rax'), ('r14', 'rdx'))
+                        + leaf0(RV3 + 0x1000) + inv(RV3 + 0x1000) + put_a(RV3 + 0x1000, d + RL2) + inv(RV3 + 0x1000)
+                        + calls('k3', RV3 + RX, 2) + save(('r15', 'rax')) + call('k4', f'{RV1 + RX:#x}') + save(('rbx', 'rax')))
     out['pic-user'] = out['pic-two']
     return out
 
@@ -540,6 +549,8 @@ def reuse_tables(name, i):
     """Per table (A, B): the linear page -> frame offset of the reuse programs' aliases."""
     if name == 'reuse-cross':
         return {RV1: RL, RV1 + 0x1000: RL2, RV2: RL, RV2 + 0x1000: RL2}, {RV2: RL, RV2 + 0x1000: RLC}
+    if name == 'pic-cross':
+        return {RV1: RL, RV1 + 0x1000: RL2, RV3: RL, RV3 + 0x1000: RL2}, {}
     if name == 'pic-fork':
         return {RV1: RL, RV3: RL}, {RV1: RL}
     if name in ('pic-two', 'pic-pge', 'pic-write2', 'pic-user', 'pic-again'):
@@ -563,7 +574,7 @@ def reuse_memory(name, i):
         tables += [entry(base + 8 * (HIGH >> 39 & 511), (base + 0x5000) | 0x27), entry(base + 0x5000 + 8 * (HIGH >> 30 & 511), (base + 0x6000) | 0x27),
                    entry(base + 0x6000 + 8 * (HIGH >> 21 & 511), (base + 0x7000) | 0x27)]
         tables += [entry(high_leaf(i, k, va), (d + f) | P.LEAF) for va, f in aliases.items()]
-    if name == 'reuse-cross':
+    if name in ('reuse-cross', 'pic-cross'):
         first = bytearray(0x1000)
         first[RX:] = P.asm('lea rdx, [rel $+7]') + b'\xb8\x00'
         return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': TAIL(1).hex()},
@@ -615,6 +626,8 @@ def reuse_either(name):
             'pic-rep': {'r8': {0}, 'r9': {d + DST + 0x40}, 'r10': {9}, 'r12': {d + DST + 0x40}},
             'pic-repexit': {'r8': {13}, 'r9': {0}, 'r10': {d + 0x7d01}, 'r12': {d + 0x7d01}},
             'pic-again': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
+            'pic-cross': {'r8': {0x100}, 'r9': {0x100}, 'r10': {RV3 + 0xffe}, 'r12': {0x200}, 'r14': {RV3 + 0xffe}, 'r15': {0x100},
+                          'rbx': {0x100}},
             'pic-user': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
         }[name]
     return judge

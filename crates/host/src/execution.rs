@@ -1897,6 +1897,8 @@ pub struct Compiler {
     /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
     /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|all` overrides it.
     pub pic: u64,
+    /// PIC study: [`cache::Control::pic_check_local`] (the program driver's code-shape runs: local links under the check).
+    pub pic_check_local: bool,
     /// How long one request may wait for the server's whole reply (the first one includes the server's start); then the
     /// server is killed and the run fails with a host error ([`COMPILE_DEADLINE`] by default).
     pub deadline: Duration,
@@ -2031,6 +2033,7 @@ impl Compiler {
             reuse_checks: 0,
             check_reuse: false,
             pic: cache::PIC_USER,
+            pic_check_local: false,
             deadline: COMPILE_DEADLINE,
             slowest: Duration::ZERO,
             shape: false,
@@ -2792,6 +2795,10 @@ pub fn run(
         Err(_) => compiler.pic,
     };
     area.write_record(control + std::mem::offset_of!(cache::Control, pic), pic);
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, pic_check_local),
+        u64::from(compiler.pic_check_local),
+    );
     // PIC study stage 2 tests (`cache::Control::pic_test`).
     let test = match std::env::var("NATEMU_PIC_TEST").as_deref() {
         Err(_) | Ok("") => 0,
