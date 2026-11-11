@@ -334,6 +334,31 @@ paging cells), `tools/run_slice2_vm.py` (control flow), `tools/run_slice2_faults
 ASM suite) and `tools/run_slice3_vm.py` (N vCPUs: corpora, smp, limits, kicks, system, coherence, sharedpt, litmus,
 contain). Each takes `--fexc FEXC --out DIR` and runs under `./tools/with-env`.
 
+**Running the suite** (`tools/run_suite.py`; its docstring has the options). The full suite is what must pass before a push
+or merge; `--quick` (one small member of every runner family, about ten minutes, the same pass rules) is the development loop
+and never replaces it. Speed levers, all keeping every case: long runners are split (`--shard I/N` of faults, loop faults,
+probes and k1: the independent cases dealt round-robin, the union is the unsplit run; corpora per vCPU count); a step far from
+its `est` is listed at the end of a run (update the table in `steps()`; a new step starts last until it has one); steps in
+`E_OK` (single-VM runners checked against QEMU, no timing bound) also run on the efficiency cores under `taskpolicy -c
+background` (`-e N`, about 4x slower per step, started only while they can finish before the queue drains); everything
+with a wall-clock, watchdog, kicker or run-timeout bound, and every multi-vCPU step, stays on the performance cores, and
+`ser` steps run alone. QEMU reference results are cached per program (`NATEMU_RAW_ROOT/ref-cache.sqlite`, keyed by program,
+pinned QEMU hash and the `tools/reference` sources; `NATEMU_REF_CACHE=off` forces fresh references, e.g. for a final gate).
+
+**The VM lock.** `NATEMU_RAW_ROOT/.vm.lock` is taken with BSD `flock(2)` and nothing else: Python `fcntl.flock`, the suite and
+the I/O runners, `/usr/bin/lockf -k` (macOS `lockf` is flock-based and has no shared mode) and `tools/vmlock.py` all exclude
+each other (`tools/test_vm_lock.py`). Never use `fcntl.lockf` or `F_SETLK` on it: on macOS record locks and flock do not
+exclude each other. Shared (suite `pre`/`par` phases, `vmlock.py shared CMD`): correctness-only VM runs, many at once.
+Exclusive (`lockf -k`, `vmlock.py exclusive CMD`, the suite's `ser` steps, benchmarks): timing-sensitive runs, alone. Any
+ad-hoc VM run outside the suite takes the lock too (`python3 tools/vmlock.py shared CMD`); one that does not can spoil another
+agent's timing run, and its own timings are unreliable.
+
+**Benchmark baselines.** `tools/bench/canary.py record NAME --exe-dir BASEDIR --attach RESULTS...` stores a baseline build's
+full results with a few-minute drift canary (boot, CPython slice, micro benchmarks); `canary.py check NAME [--tol 0.05]`
+reruns the canary on that build: exit 0 means the machine behaves as at recording time (reuse the stored baseline, measure only
+the candidate), exit 3 means re-measure the baseline and `record` again. Records live in `NATEMU_RAW_ROOT/bench-baselines/`.
+Paired A/B (baseline and candidate interleaved so drift cancels) is not implemented yet.
+
 **Retired (S3i, October 28, 2026):** every specialized I1–I4/I4-V path. The runtime/abi regression families, their host
 drivers and the resident compiler-service gateway are deleted, as are `run_i1.py`, `run_i4v.py`, `run_i4v_qemu.py`, their
 checkers, workers, producers, tests and fixtures; the independent models moved to `tools/models/`. The sections

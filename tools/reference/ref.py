@@ -12,7 +12,7 @@ GPR order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15.  All integers may be JSON nu
 "0x.." strings; this tool writes hex strings.  Every memory region is captured at the end.
 Execution is the code bytes followed by fallthrough into a capture sequence.  See README.md.
 """
-import argparse, hashlib, json, os, pathlib, re, struct, subprocess, sys, tempfile, uuid
+import argparse, hashlib, json, os, pathlib, re, sqlite3, struct, subprocess, sys, tempfile, uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 import flags
@@ -405,15 +405,39 @@ def check_flow(p, log, stop=None):
     return sorted({t for _, _, t in path}), anns, ixs
 
 
+def _cache():
+    """The reference-result cache (sqlite, NATEMU_RAW_ROOT/ref-cache.sqlite; NATEMU_REF_CACHE=off disables it), or None. A result
+    is QEMU's deterministic answer for one program, so it is stored under a hash of the program, the pinned QEMU binary, the
+    backend and this directory's sources (a change to how results are read or checked misses); a program run again, as faults and
+    faults-1 or the three loop-fault sizes do, skips the container. Only runs with the original annotation check are cached."""
+    root = os.environ.get('NATEMU_RAW_ROOT')
+    if os.environ.get('NATEMU_REF_CACHE') == 'off' or not root or check_annotations.__name__ != 'check_annotations': return None
+    db = sqlite3.connect(pathlib.Path(root) / 'ref-cache.sqlite', timeout=120)
+    db.execute('create table if not exists r (k text primary key, v text)')
+    return db
+
+
+def _key(program, digest, backend):
+    code = hashlib.sha256(b''.join(f.read_bytes() for f in sorted(HERE.glob('*.py')))).hexdigest()
+    return hashlib.sha256(json.dumps([program, digest, backend, code, FORMAT], sort_keys=True, default=str).encode()).hexdigest()
+
+
 def run_programs(programs, workdir, qemu):
     """Run all programs in one pinned-image container; return (results, provenance)."""
     workdir = pathlib.Path(workdir).resolve(); qemu = pathlib.Path(qemu).resolve()
     digest = hashlib.sha256(qemu.read_bytes()).hexdigest()
     require(digest == PINS['qemu-x86_64-static'], 'QEMU binary does not match the pinned hash')
     progs = [norm(p) for p in programs]
+    backend = os.environ.get('NATEMU_REFERENCE_BACKEND', 'docker')
+    db, hits = _cache(), {}
+    keys = [_key(p, digest, backend) for p in programs] if db else []
+    for i, k in enumerate(keys):
+        row = db.execute('select v from r where k = ?', (k,)).fetchone()
+        if row: hits[i] = json.loads(row[0])
     (workdir / 'jobs').mkdir(parents=True, exist_ok=True)
     (workdir / 'container_entry.py').write_bytes((HERE / 'container_entry.py').read_bytes())
     for i, p in enumerate(progs):
+        if i in hits: continue
         d = workdir / 'jobs' / f'p{i:04d}'; d.mkdir(exist_ok=True); (d / 'prog.elf').write_bytes(build_elf(p)[0]); (d / 'prog.elf').chmod(0o755)
         for marker, on in (('flow', p['flow']), ('faults', p['faults'] is not None)):
             if on: (d / marker).write_text('1')
@@ -422,9 +446,9 @@ def run_programs(programs, workdir, qemu):
         elif (d / 'cpu').exists(): (d / 'cpu').unlink()
     token = uuid.uuid4().hex; name = 'natemu-ref-' + token; cidfile = workdir / 'container-id'
     if cidfile.exists(): cidfile.unlink()
-    backend = os.environ.get('NATEMU_REFERENCE_BACKEND', 'docker')
     require(backend in ('docker', 'apple'), 'NATEMU_REFERENCE_BACKEND must be docker or apple')
-    if backend == 'apple':
+    if len(hits) == len(progs): pass     # every result cached: no container
+    elif backend == 'apple':
         # The reference executable is unchanged and hash-checked above. The base
         # image needs only sh/coreutils, avoiding a second Python/package build.
         (workdir / 'container_entry.sh').write_text('''#!/bin/sh
@@ -459,6 +483,7 @@ done
         run_docker_reference(workdir, qemu, name, token, cidfile)
     results = []
     for i, (src, p) in enumerate(zip(programs, progs)):
+        if i in hits: results.append(hits[i]); continue
         d = workdir / 'jobs' / f'p{i:04d}'
         require((d / 'rc').read_text().strip() == '0', f'QEMU exit status {(d / "rc").read_text().strip()} for program {i}')
         final, fault = parse_output(p, (d / 'qemu.stdout').read_bytes())
@@ -473,11 +498,13 @@ done
                        | ({'cpu': p['cpu']} if p['cpu'] != 'qemu64' else {})
                        | ({'executed_insns': len(executed)} if p['flow'] else {})
                        | ({'fault': fault, 'path_ix': path_ix} if fault else {}))
+        if db and json.loads(json.dumps(results[-1])) == results[-1]: db.execute('insert or replace into r values (?, ?)', (keys[i], json.dumps(results[-1])))
+    if db: db.commit(); db.close()
     prov = {'format': FORMAT, 'image': APPLE_IMAGE if backend == 'apple' else IMAGE, 'container_backend': backend,
             'qemu_sha256': digest, 'qemu_package': 'qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64',
             'qemu_argv': [('/reference/' + qemu.name) if backend == 'apple' else '/qemu', '-cpu', 'qemu64', '-d', 'in_asm', '-D', 'qemu.log', 'prog.elf'],
             'rflags_fixed_bits': hx(flags.FIXED)}
-    if backend == 'apple': prov['container_kernel'] = (workdir / 'container.kernel').read_text().strip()
+    if backend == 'apple' and (workdir / 'container.kernel').exists(): prov['container_kernel'] = (workdir / 'container.kernel').read_text().strip()
     return results, prov
 
 

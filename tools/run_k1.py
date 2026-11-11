@@ -136,7 +136,7 @@ import argparse, json, os, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import run_slice1_vm as vm, run_slice3_vm as s3, smp, programs as P  # noqa: E402
+import run_slice1_vm as vm, run_slice3_vm as s3, smp, shard, programs as P  # noqa: E402
 
 F1, F2 = 0x1000, 0x2000
 CODE = lambda k: P.asm(f'mov eax, {k}\njmp r13') + b'\x90' * 8
@@ -871,7 +871,7 @@ def run(a, prog, extra, host=None, runtime=None, tag=''):
     # area's capacity is tested on absolute code (each address its own blocks and links).
     mode = PIC_ENV.get(prog['name'][3:].split('@')[0])
     env = dict(os.environ, NATEMU_PIC=mode) if mode else None
-    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=300, env=env)
+    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
     for v, c in enumerate(out['cpus'] if out else []):
         end = s3.body_end(prog, smp.num(prog['cpus'][v]['rip']))
@@ -892,13 +892,17 @@ def main():
     ap.add_argument('--base-host', type=pathlib.Path)
     ap.add_argument('--base-runtime', type=pathlib.Path)
     ap.add_argument('--programs', type=lambda s: s.split(','), help='only these programs (and no counts)')
+    shard.add(ap)
+    ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
     stub = smp.build_stub(a.out / 'qemu-build')
     report, failures = [], []
+    cases = [(n, name, adv) for adv, names in ((0, bodies(a.k)), (1, adv_setup(0))) for n in a.cpus for name in names if not a.programs or name in a.programs]
+    mine = set(shard.take(cases, a.shard))   # (CPU count, program) cases are independent; the counts below run on shard 1
     for n in a.cpus:
-        for name in [x for x in bodies(a.k) if not a.programs or x in a.programs]:
+        for name in [x for x in bodies(a.k) if (n, x, 0) in mine]:
             prog = program(name, n, a.k)
             want = None
             if name not in EITHER:
@@ -955,7 +959,7 @@ def main():
                 print(json.dumps(entry), flush=True)
                 failures += [f"{prog['name']}{' (max-block 1)' if extra else ''}: {p}" for p in problems]
     for n in a.cpus:
-        for name in [x for x in adv_setup(0) if not a.programs or x in a.programs]:
+        for name in [x for x in adv_setup(0) if (n, x, 1) in mine]:
             prog = adv_program(name, n)
             want = None
             if name not in ADV_EITHER:
@@ -978,7 +982,7 @@ def main():
                 failures += [f"{prog['name']}{' (max-block 1)' if extra else ''}: {p}" for p in problems]
     # Counts: translation requests and compiles must not grow with the rounds.
     counts = {}
-    if a.programs: a.host = a.base_host = None
+    if a.programs or a.shard[0] != 1: a.host = a.base_host = None
     for label, host, runtime in (('k1', a.host, a.runtime), ('base', a.base_host, a.base_runtime)):
         if not host: continue
         for k in (a.k, 2 * a.k):
@@ -988,7 +992,7 @@ def main():
             if label == 'k1': failures += [f'counts k={k}: {p}' for p in problems]
     print('counts', json.dumps(counts), flush=True)
     k1 = [counts.get(f'k1-{k}') for k in (a.k, 2 * a.k)]
-    if not a.programs and (not all(k1) or k1[0]['requests'] != k1[1]['requests'] or k1[0]['compiles'] != k1[1]['compiles']):
+    if not a.programs and a.shard[0] == 1 and (not all(k1) or k1[0]['requests'] != k1[1]['requests'] or k1[0]['compiles'] != k1[1]['compiles']):
         failures.append(f'counts: requests or compiles grow with the rounds: {k1}')
     (a.out / 'k1.json').write_text(json.dumps({'report': report, 'counts': counts, 'failures': failures}, indent=1) + '\n')
     for f in failures: print('FAIL', f)

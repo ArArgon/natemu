@@ -84,7 +84,7 @@ import argparse, json, pathlib, re, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice1 as gen, gen_i1, run_slice1_vm as vm, delivery_check  # noqa: E402
+import ref, gen_slice1 as gen, gen_i1, run_slice1_vm as vm, delivery_check, shard  # noqa: E402
 
 M64, PAGE = 2**64 - 1, 4096
 SIZES = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8, 'xmmword': 16}
@@ -1046,12 +1046,14 @@ def main():
     ap.add_argument('--no-window', action='store_true', help='leave out the E3 window and straddle probes')
     ap.add_argument('--only', help='run only the cases whose name contains this')
     ap.add_argument('--no-paging', action='store_true', help='only the slice-1 page mutations and probes')
+    shard.add(ap)
     a = ap.parse_args()
     host, runtime = vm.build()
     programs = [p for f in a.programs for p in json.loads(f.read_text())['programs']]
     a.out.mkdir(parents=True, exist_ok=True)
     cases = expectations(programs, [] if a.no_probes else probes(not a.no_window), a.out / 'ref', paging=not a.no_paging)
     if a.only: cases = [c for c in cases if a.only in c[0]]
+    cases = shard.take(cases, a.shard)
     at_access = {} if a.no_paging else access_cells(cases)
     counts, results = {'match': 0, 'unsupported': 0, 'fail': 0}, []
     for n, case in enumerate(cases):

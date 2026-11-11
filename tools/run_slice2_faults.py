@@ -24,7 +24,7 @@ import argparse, json, os, pathlib, shutil, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice2 as gen, run_slice1_vm as vm, run_slice1_faults as F, delivery_check  # noqa: E402
+import ref, gen_slice2 as gen, run_slice1_vm as vm, run_slice1_faults as F, delivery_check, shard  # noqa: E402
 
 PAGE = 4096
 PAGES = [gen.DATA, gen.DATA + PAGE, gen.STACK, gen.STACK + PAGE]
@@ -147,11 +147,12 @@ def main():
     ap.add_argument('--count', type=int, default=64)
     ap.add_argument('--sizes', nargs='+', default=['default', '1', '2'])
     ap.add_argument('--programs', type=pathlib.Path, nargs='*', help='program files to use instead of the generated corpus and strides')
+    shard.add(ap)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     programs = [p for f in a.programs for p in json.loads(f.read_text())['programs']] if a.programs else \
         gen.corpus(a.seed, a.count) + gen.stride_corpus(a.seed)
-    plan = cases(programs)
+    plan = shard.take(cases(programs), a.shard)
     jobs = [dict(p, name=name, faults={'protect': [{'addr': pg, 'mode': mode} for mode, pg in muts]}) for name, p, muts in plan]
     results, signal_diffs = reference(jobs, a.out / 'ref')
     faulted = sum(1 for r in results if r.get('fault'))
