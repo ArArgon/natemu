@@ -3,14 +3,21 @@
 pass/fail rule (exit status 0; `i8b`: exactly the 7 known QEMU two-NaN departures), in parallel where timing cannot
 change a result.
 
-    python3 tools/run_suite.py [--fexc FEXC] [--out DIR] [-j N] [--only A,B] [--skip A,B] [--list]
+    python3 tools/run_suite.py [--fexc FEXC] [--out DIR] [-j N] [-e N] [--only A,B] [--skip A,B] [--quick] [--list]
 
+The FULL suite (no --quick) is what must pass before a push or merge; `--quick` (about ten minutes) is the development
+loop: one small, representative step of every runner family (QUICK below), the same pass/fail rules.
 Phases: (1) `pre`, one at a time: the cargo builds and tests, every binary the runners build and sign (the release
 host, the `natemu` stub, the resident) and the load-only l1/l2 runners (they run cargo themselves); later steps get
 NATEMU_PREBUILT=1, so no runner runs cargo while another runs those binaries (see run_slice1_vm.build); (2) `par`, N
-steps at once (default: the performance cores), a step with its own internal parallelism counting as that many; large
-runners are split where they already select a part (k1 and r1b per vCPU count, loop faults per block size, i5b per
-group, k2, x3 and m2 per group), each part with its own `--out` directory and TMPDIR; (3) `ser`, one at a
+steps at once (default: the performance cores), a step with its own internal parallelism counting as that many, plus up
+to E (default: the efficiency cores) steps from E_OK on the efficiency cores: `taskpolicy -c background` clamps the whole
+process tree there (about 4x slower per step, so a step starts there only if it would end before the performance cores
+drain the queue); large runners are split where they already select a part (k1 and r1b per vCPU count, loop faults per
+block size, i5b per group, k2, x3 and m2 per group, corpora per vCPU count) or take `--shard I/N` (faults, loop faults,
+probes, k1: the independent cases dealt out round-robin; steps `name@I`), each part with its own `--out` directory and
+TMPDIR; a step whose time ends far from its `est` is reported at the end (update `est`; a new step has no estimate and
+would otherwise start last); (3) `ser`, one at a
 time, alone: the steps whose judgement depends on wall time or on vCPUs running truly concurrently (see SERIAL_WHY);
 a failed one is rerun once alone and both results recorded (the rerun's decides).
 Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock and each serial step an exclusive one
@@ -18,7 +25,7 @@ Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock
 NATEMU_RAM and other environment variables pass through to every step (the 4 MiB suite: NATEMU_RAM=0x400000).
 Writes DIR/results.txt (step, phase, result, exit code, seconds, log; one line per step as it ends) and DIR/logs/;
 a passing step's output and temporary directories are deleted, a failing step's kept. Exit status 1 on any failure.
---only/--skip take comma-separated step names or fnmatch patterns (`k1-*`); `release` always runs."""
+--only/--skip take comma-separated step names or fnmatch patterns (`k1-*`, `faults@*`); `release` always runs."""
 import argparse, dataclasses, datetime, fcntl, fnmatch, json, os, pathlib, re, shutil, signal, subprocess, sys, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -43,6 +50,28 @@ SERIAL_WHY = {
 }
 
 
+# Steps that may run on the efficiency cores (`taskpolicy -c background`): single-VM runners that compare final state with
+# QEMU and have no wall-clock bound, no watchdog expected to fire, no vCPUs racing each other and no run timeout a 4x slower
+# core could exceed. Everything else (multi-vCPU, watchdog, kicker, timing, the 300 s run limits of k1) stays on the
+# performance cores. Measured November 10 (docs/implementation.md "Faster suite runs").
+E_OK = ('fix*', 'seed*', 'i7*', 'i8*', 'i9*', 'i10*', 'i6*', 'i5c*', 'adx*', 'xsave*', 'rex*', 'br66*', 'sha*', 'flow', 'icebp',
+        'faults*', 'loopfaults-*', 'instruction-gaps*', 'cpu-forms', 'frame-*', 'maskmovq*', 'i5b-*', 'vector-ac', 'pytests')
+SHARDS = {'faults': 5, 'i7-faults': 2, 'loopfaults': 3, 'probes': 2, 'k1': {1: 1, 2: 2, 3: 3, 4: 1}}   # parts of about 100 s
+PROBES_EST, CORPORA_EST = 900, {2: 160, 3: 135, 4: 200}
+# Seconds of the long indivisible steps in the November 10 runs (-j 4 -e 6, machine busy): the k1 link-full case (one run, 220-385 s)
+# and the two probe chains; they start first. Everything else comes from the arguments above.
+EST = {'k1-c1': 220, 'k1-c2@2': 320, 'k1-c3@3': 385, 'probes@1': 290, 'probes@2': 600, 'system': 175, 'i5b-faults': 120,
+       'instruction-gaps': 75, 'instruction-gaps-1': 75, 'cpu-forms': 75}
+E_SLOW = 3.0      # a step's time on the efficiency cores over its `est` (measured with the machine busy: 2.4; i8-faults alone: 3.6-4.1)
+# --quick: one small member of every runner family (the sharded ones: their first shard).
+QUICK = ('build', 'cargo-test', 'cargo-test-fexc', 'runtime', 'l1', 'l2', 'l2-iasl', 'release', 'stack', 'barriers', 'pytests',
+         'split-wait-model', 'icebp', 'frame-alias', 'frame-randomization', 'vector-ac', 'cpu-forms', 'maskmovq', 'fix', 'seed', 'i8',
+         'i8b', 'i9', 'i10', 'i7-cpl0', 'xsave', 'i6-faults', 'i10-faults', 'i5c', 'i6b-cases', 'flow', 'asm', 'faults@1', 'i7-faults@1',
+         'loopfaults-default@1', 'probes@1', 'corpora-c2', 'smp', 'limits', 'litmus', 'events', 'privilege', 'delivery', 'm3',
+         'k1-c1', 'k1-c2@1', 'k2-cost', 'k2-gather', 'nostop-*', 'x3-qemu', 'x3-cases', 'x4', 'm1', 'm2', 'l3', 'l4a', 's4', 'x1', 'r1a', 'r1b-c2',
+         'i5b-images', 'l4b', 'contain', 'boot-smoke', 'kicks')
+
+
 @dataclasses.dataclass
 class Step:
     name: str
@@ -51,6 +80,7 @@ class Step:
     est: int = 5          # seconds in the parallel phase (November 5, -j 4): it starts the longest first
     w: int = 1            # processes the step runs at once (its own --parallel/--jobs)
     judge: object = None  # judge(out dir) -> (ok, note) when the step exits 1
+    core: str = 'P'       # P, or E: started on the efficiency cores (only E_OK steps, only by the scheduler)
 
 
 def i8b_judge(out):
@@ -66,6 +96,8 @@ def steps(F, O):
         S.append(Step(name, [str(x) for x in argv], phase or ('ser' if name in SERIAL_WHY else 'par'), est, w, judge))
     def vm(name, script, *args, **kw): add(name, ['python3', f'tools/{script}', *args, '--fexc', F, '--out', O / 'out' / name], **kw)
     def s3(name, *args, **kw): vm(name, 'run_slice3_vm.py', *args, **kw)
+    def shards(n, name, script, *args, est, **kw):    # n steps `name@I`, each one `--shard I/N` of the runner (tools/shard.py)
+        for i in range(1, n + 1): vm(f'{name}@{i}', script, *args, '--shard', f'{i}/{n}', est=-(-est // n), **kw)
     add('build', cargo + ['build', '--offline', '--locked'], 'pre')
     add('cargo-test', cargo + ['test', '--offline', '--locked'], 'pre')
     add('cargo-test-fexc', ['env', f'FEXC={F}'] + cargo + ['test', '--offline', '--locked'], 'pre')
@@ -98,18 +130,18 @@ def steps(F, O):
         vm('fix' + sfx, 'run_slice1_vm.py', *blk)
         for c in corpora: vm(c + sfx, 'run_slice1_vm.py', *blk, *pair(c), judge=i8b_judge if c == 'i8b' else None)
         vm('i7-cpl0' + sfx, 'run_slice1_vm.py', '--cpl', '0', *blk, *pair('i7'))
-        vm('faults' + sfx, 'run_slice1_faults.py', *blk, est=340)
-        vm('i7-faults' + sfx, 'run_slice1_faults.py', '--no-probes', *blk, pair('i7')[0], est=200)
-        for r, est in (('run_i6_faults.py', 7), ('run_i8_faults.py', 72), ('run_i9_faults.py', 38), ('run_i10_faults.py', 16), ('run_i5c.py', 10)):
+        shards(SHARDS['faults'], 'faults' + sfx, 'run_slice1_faults.py', *blk, est=650)
+        shards(SHARDS['i7-faults'], 'i7-faults' + sfx, 'run_slice1_faults.py', '--no-probes', *blk, pair('i7')[0], est=380)
+        for r, est in (('run_i6_faults.py', 10), ('run_i8_faults.py', 55), ('run_i9_faults.py', 38), ('run_i10_faults.py', 20), ('run_i5c.py', 8)):
             vm(r[4:-3].replace('_', '-') + sfx, r, *blk, est=est)
         vm('i6b' + sfx, 'run_i6b.py', 'corpus', *blk, RAW / 'i6b-corpus-20261030-01/programs.json', RAW / 'i6b-corpus-20261030-01/expected.json')
         vm('i6b-cases' + sfx, 'run_i6b.py', 'cases', *blk)
     vm('flow', 'run_slice2_vm.py', '--programs', RAW / 's2d/corpus/programs.json', '--expected', RAW / 's2d/corpus/expected.json')
-    for size in ('default', '1', '2'): vm(f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=90)
-    vm('probes', 'run_slice2_probes.py', est=115)
+    for size in ('default', '1', '2'): shards(SHARDS['loopfaults'], f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=150)
+    shards(SHARDS['probes'], 'probes', 'run_slice2_probes.py', est=PROBES_EST)
     vm('asm', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', est=15, w=4)
     vm('asm-1', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', '--max-block', '1', est=15, w=4)
-    s3('corpora', 'corpora', '--parallel', '4', est=290, w=4)    # per --cpus shards each redo its QEMU references: slower
+    for n in (2, 3, 4): s3(f'corpora-c{n}', 'corpora', '--cpus', n, '--parallel', 2, est=CORPORA_EST[n], w=2)    # each part redoes the QEMU references
     s3('smp', 'smp', '--parallel', '2', w=2)
     s3('limits', 'limits')
     s3('kicks', 'kicks', '--kicks', '1000', '--cpus', '1', '2', '4')
@@ -129,7 +161,9 @@ def steps(F, O):
         vm(f'nostop-{g}', 'run_nostop.py', '--only', g)
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
-    for n, est in ((1, 150), (2, 280), (3, 320), (4, 200)): vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, est=est)
+    for n, est in ((1, 80), (2, 215), (3, 275), (4, 155)):
+        if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, *(() if n == 4 else ('--timeout', 900)), est=est)     # c4 serial: its runs time out at 300 s under load
+        else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 900, est=est)
     vm('pic', 'run_pic.py', '--cpus', 1, 2, est=900)   # PIC study stage 2: stops at each entry word, svc-word links, a forged slot
     vm('m1', 'run_m1.py')
     vm('l3', 'run_l3.py')
@@ -146,8 +180,9 @@ def steps(F, O):
     for n in (2, 3, 4): vm(f'r1b-c{n}', 'run_r1.py', 'r1b', '--cpus', n, est=25)
     # Fixed-address GP probes must name an unmapped page; DR watchpoints must name the actual frame.
     distant = {'faults', 'faults-1', 'events', 'privilege', 'k2-swapgs', 'k2-cr2', 'k2-stifirst', 'k2-verw'}
+    for step in S: step.est = EST.get(step.name, step.est)
     for step in S:
-        alias = '0xffff407abcde0000' if step.name in distant else '0xffff400000001000' if step.name == 's4' else None
+        alias = '0xffff407abcde0000' if step.name.split('@')[0] in distant else '0xffff400000001000' if step.name == 's4' else None
         if alias is not None:
             step.argv = ['env', f'NATEMU_TEST_GUEST_STATE_ALIAS={alias}', *step.argv]
     return S
@@ -156,7 +191,7 @@ def steps(F, O):
 class Suite:
     def __init__(self, a):
         self.a, self.O, self.lock, self.procs, self.failed = a, a.out, threading.Lock(), set(), []
-        self.finished = set()
+        self.finished, self.times = set(), {}
         for d in ('logs', 'out', 'tmp'): (a.out / d).mkdir(parents=True, exist_ok=True)
         self.results = open(a.out / 'results.txt', 'a', buffering=1)
         self.vmlock = os.open(RAW / '.vm.lock', os.O_RDWR | os.O_CREAT, 0o644)
@@ -173,7 +208,8 @@ class Suite:
         env = dict(os.environ, NATEMU_RAW_ROOT=str(RAW), TMPDIR=f'{tmp}/', **({} if s.phase == 'pre' else {'NATEMU_PREBUILT': '1'}))
         t = time.monotonic()
         with open(log, 'w') as f:
-            p = subprocess.Popen(s.argv, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+            argv = ['taskpolicy', '-c', 'background', *s.argv] if s.core == 'E' else s.argv
+            p = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
             with self.lock: self.procs.add(p)
             rc = p.wait()
             with self.lock: self.procs.discard(p)
@@ -183,7 +219,8 @@ class Suite:
 
     def record(self, s, r, rerun=None):
         ok, rc, dt, log, note = rerun or r
-        line = f"{s.name:<18} {s.phase:<4} {'PASS' if ok else 'FAIL'} rc={rc} {dt:.0f}s {log.relative_to(self.O)}"
+        line = f"{s.name:<18} {s.phase + ('/E' if s.core == 'E' else ''):<4} {'PASS' if ok else 'FAIL'} rc={rc} {dt:.0f}s {log.relative_to(self.O)}"
+        self.times[s.name] = dt
         if rerun: line = f"{s.name:<18} {s.phase:<4} {'PASS' if ok else 'FAIL'} first: rc={r[1]} {r[2]:.0f}s {r[3].relative_to(self.O)}; rerun: rc={rc} {dt:.0f}s {log.relative_to(self.O)}"
         line += f' ({note})' if note else ''
         with self.lock:
@@ -194,20 +231,33 @@ class Suite:
             for d in ('out', 'tmp'): shutil.rmtree(self.O / d / s.name, ignore_errors=True)
         return ok
 
-    def parallel(self, todo, j):
-        free, cv, threads = j, threading.Condition(), []
+    def parallel(self, todo, j, e=0):
+        free, efree, cv, threads = j, e, threading.Condition(), []
         todo = sorted(todo, key=lambda s: -s.est)    # longest first; a step that does not fit waits, the next may start
         def go(s, w):
-            nonlocal free
+            nonlocal free, efree
             try: self.record(s, self.run(s))
             finally:
-                with cv: free += w; cv.notify_all()
+                with cv:
+                    if s.core == 'E': efree += 1
+                    else: free += w
+                    cv.notify_all()
+        def pick():
+            nonlocal free, efree
+            s = next((s for s in todo if min(s.w, j) <= free), None)        # the performance cores: the longest that fits
+            if s is not None:
+                free -= min(s.w, j); return s, min(s.w, j)
+            # An efficiency core takes the longest E_OK step that would end before the performance cores drain the queue.
+            horizon = sum(t.est * min(t.w, j) for t in todo) / max(j, 1)
+            s = next((s for s in todo if efree and s.w == 1 and s.est * E_SLOW <= horizon and any(fnmatch.fnmatchcase(s.name, q) for q in E_OK)), None)
+            if s is not None: efree -= 1; s.core = 'E'
+            return s, 1
         with cv:
             while todo:
-                s = next((s for s in todo if min(s.w, j) <= free), None)
+                s, w = pick()
                 if s is None: cv.wait(); continue
-                todo.remove(s); free -= min(s.w, j)
-                threads.append(threading.Thread(target=go, args=(s, min(s.w, j)), daemon=True)); threads[-1].start()
+                todo.remove(s)
+                threads.append(threading.Thread(target=go, args=(s, w), daemon=True)); threads[-1].start()
         for t in threads: t.join()
 
     def serial(self, s):
@@ -236,23 +286,27 @@ def idle():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    eff = subprocess.run(['sysctl', '-n', 'hw.perflevel1.physicalcpu'], capture_output=True, text=True).stdout.strip()
     ap.add_argument('--fexc', type=pathlib.Path, default=FEXC)
     ap.add_argument('--out', type=pathlib.Path, default=RAW / f"suite-{datetime.datetime.now():%Y%m%d-%H%M%S}")
     perf = subprocess.run(['sysctl', '-n', 'hw.perflevel0.physicalcpu'], capture_output=True, text=True).stdout.strip()
     ap.add_argument('-j', type=int, default=int(perf) if perf.isdigit() else os.cpu_count())
     ap.add_argument('--only', type=lambda s: s.split(','))
+    ap.add_argument('-e', type=int, default=int(eff) if eff.isdigit() else 0, help='steps at once on the efficiency cores (E_OK steps; 0: none)')
     ap.add_argument('--skip', type=lambda s: s.split(','), default=[])
+    ap.add_argument('--quick', action='store_true', help='one small step of every runner family (about ten minutes); the full suite is still required before a push')
     ap.add_argument('--list', action='store_true')
     a = ap.parse_args()
     a.fexc, a.out = a.fexc.resolve(), a.out.resolve()
     match = lambda n, pats: any(fnmatch.fnmatchcase(n, p) for p in pats)
-    todo = [s for s in steps(a.fexc, a.out) if s.name == 'release' or ((a.only is None or match(s.name, a.only)) and not match(s.name, a.skip))]
+    todo = [s for s in steps(a.fexc, a.out) if s.name == 'release' or ((a.only is None or match(s.name, a.only)) and not match(s.name, a.skip)
+                                                                       and (not a.quick or match(s.name, QUICK)))]
     if a.list:
         for s in todo: print(f"{s.name:<18} {s.phase:<4} {'x' + str(s.w) if s.w > 1 else '  '} {SERIAL_WHY.get(s.name, '')}")
         return
     if not a.fexc.is_file(): sys.exit(f'no compiler at {a.fexc}')
     suite, t0 = Suite(a), time.monotonic()
-    suite.results.write(f'# {datetime.datetime.now():%Y-%m-%d %H:%M:%S} fexc {a.fexc} -j {a.j}\n')
+    suite.results.write(f'# {datetime.datetime.now():%Y-%m-%d %H:%M:%S} fexc {a.fexc} -j {a.j} -e {a.e}' + (' --quick' if a.quick else '') + '\n')
     phase_s = {}
     try:
         suite.flock(fcntl.LOCK_SH)
@@ -260,7 +314,7 @@ def main():
         for s in [s for s in todo if s.phase == 'pre']:
             if not suite.record(s, suite.run(s)) and s.name in ('build', 'runtime', 'release'): sys.exit(f'{s.name} failed: see {a.out}/logs')
         phase_s['pre'] = time.monotonic() - t; t = time.monotonic()
-        suite.parallel([s for s in todo if s.phase == 'par'], a.j)
+        suite.parallel([s for s in todo if s.phase == 'par'], a.j, a.e)
         phase_s['par'] = time.monotonic() - t
         fcntl.flock(suite.vmlock, fcntl.LOCK_UN); t = time.monotonic()
         for s in [s for s in todo if s.phase == 'ser']: suite.serial(s)
@@ -273,6 +327,10 @@ def main():
         print('Missing results: ' + ', '.join(missing), flush=True)
     summary = f"# wall {time.monotonic() - t0:.0f}s ({', '.join(f'{k} {v:.0f}s' for k, v in phase_s.items())}); " \
               f"{len(todo) - len(suite.failed)}/{len(todo)} passed" + (f"; FAILED: {' '.join(suite.failed)}" if suite.failed else '')
+    by = {s.name: s for s in todo}      # a step far over its estimate (an E step: over est * E_SLOW) would start too late: report it
+    drift = [f'{n} {t:.0f}s (est {by[n].est})' for n, t in sorted(suite.times.items(), key=lambda x: -x[1])
+             if t > 60 and t > 2 * by[n].est * (E_SLOW if by[n].core == 'E' else 1) and n != 'k1-c4'][:12]
+    if drift: summary += '\n# est far off (update the steps): ' + ', '.join(drift)
     suite.results.write(summary + '\n'); print(summary)
     sys.exit(1 if suite.failed else 0)
 

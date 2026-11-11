@@ -27,7 +27,7 @@ import argparse, json, pathlib, random, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice1 as gen, run_slice1_vm as vm  # noqa: E402
+import ref, gen_slice1 as gen, run_slice1_vm as vm, shard  # noqa: E402
 
 CODE, DATA, STACK = 0x100000, 0x200000, 0x300000
 
@@ -247,6 +247,7 @@ def main():
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--qemu', type=pathlib.Path)
+    shard.add(ap)
     a = ap.parse_args()
     host, runtime = vm.build()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -264,7 +265,7 @@ def main():
         r = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + args + vm.CODE_SHAPE, capture_output=True, text=True)
         return (json.loads(r.stdout) if r.returncode == 0 else None), r.stderr.strip()[-300:]
 
-    for name, args, flushes in RUNS:
+    for name, args, flushes in shard.take(RUNS, a.shard):
         program, _, end = built[name]
         state, err = run(name, program, args)
         entry = {'name': name, 'args': args, 'stderr': err}
@@ -290,7 +291,7 @@ def main():
     # matches; a straight-line program of 33,000 blocks reaches its end although its host work (one compile per block)
     # far exceeds the watchdog, which bounds guest time between host exits only.
     for (count, trips), args, flushes in [((600, 3), ['1', '--code-cache', '32768'], True), ((600, 3), ['2', '--code-cache', '32768'], True),
-                                         ((33000, None), ['1', '--watchdog-ms', '2000'], False)]:
+                                         ((33000, None), ['1', '--watchdog-ms', '2000'], False)][a.shard[0] - 1::a.shard[1]]:
         program, result, end = add_chain(count, trips)
         state, err = run(program['name'], program, args)
         diffs = [f'host error: {err}'] if state is None else ref.compare(result, [ref.num(v) for v in state['gpr']],
@@ -311,7 +312,7 @@ def main():
     # 958,000). Each at least three times over the two trips. Equal bytes, so the host reuses one compile per page
     # offset: the case is about placement. Both flush when full and still match.
     code_max = str(128 * 2**20 - (0x11000 + 4 * 65536 * 32))    # CODE_BYTES_MAX - HEAD_BYTES (perf chunk 19: 64 Ki L1 entries)
-    for count, block, load, full in ((1_200_000, '1', None, 0), (3_600_000, '3', 0x1000_0000, 1)):
+    for count, block, load, full in shard.take([(1_200_000, '1', None, 0), (3_600_000, '3', 0x1000_0000, 1)], a.shard):
         program, result, end = add_chain(count, 2, step=0, load=load)
         args = [block, '--code-cache', code_max, '--watchdog-ms', '60000']
         state, err = run(program['name'], program, args)
@@ -331,19 +332,20 @@ def main():
         print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and {k: state['stats'][k] for k in ('requests', 'distinct', 'flushes')}} "
               f"{state and state['stats']['k1']['full']} {'; '.join(diffs)[:300]}")
 
-    # A code cache smaller than the largest block is refused at setup.
-    program, _, _ = add_chain(1, None)
-    state, err = run('tiny-cache', program, ['--code-cache', '1'])
-    ok = state is None and 'must hold the largest block' in err
-    failures += not ok
-    out.append({'name': 'tiny-cache', 'stderr': err})
-    print(f"tiny-cache --code-cache 1: {'match' if ok else 'fail'} {err}")
+    if shard.last(a.shard):   # the one-off checks
+        # A code cache smaller than the largest block is refused at setup.
+        program, _, _ = add_chain(1, None)
+        state, err = run('tiny-cache', program, ['--code-cache', '1'])
+        ok = state is None and 'must hold the largest block' in err
+        failures += not ok
+        out.append({'name': 'tiny-cache', 'stderr': err})
+        print(f"tiny-cache --code-cache 1: {'match' if ok else 'fail'} {err}")
 
     # Linking (S2c): once a hot loop's edges are linked it runs without entering the resident, so N and 2N iterations
     # (N = 10^6) make the same number of resident entries (`blocks`) and linker entries. Dispatcher hits are not counted
     # (generated code writes no emulator data), so the loop's blocks must have no computed exit (`dispatch_exits` 0): with
     # equal resident and linker entries at N and 2N, every edge the loop repeats is then a direct branch.
-    for args in ([], ['1'], ['2']):
+    for args in shard.take([[], ['1'], ['2']], a.shard):
         counts = []
         for trips in (10**6, 2 * 10**6):
             program, result, end = add_chain(3, trips)
@@ -364,49 +366,50 @@ def main():
         out.append({'name': 'hot-loop-entries', 'args': args, 'counts': counts})
         print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, linker entries, linked) at N, 2N: {counts}")
 
-    # A literal exit whose RIP is none of its block's link targets (admission refuses this; the driver forges it after
-    # admission) is refused at the reply, before the block is placed: its move must build its link point's target.
-    program, _, _ = built['split-body']
-    state, err = run('forged-exit', program, ['--forge-exit'])
-    ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('bad_reply') and state['stats']['links'] == 0
-    failures += not ok
-    out.append({'name': 'forged-exit', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
-    print(f"forged-exit: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
-
-    # Run-time tampering (driver options): what admission and the resident never produce must be caught. A host-supplied
-    # link point outside its block is refused at placement; a corrupted linked branch or link record
-    # (corrupted just before a flush) halts the unlink, and the host's self-check refuses the same corruption after a run.
-    flush_args = ['1', '--code-cache', '32768']
-    program = add_chain(600, 3)[0]
-    state, err = run('tamper-offset', program, flush_args + ['--tamper', 'offset'])
-    ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_reply')
-    failures += not ok
-    out.append({'name': 'tamper-offset', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
-    print(f"tamper offset: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
-    for kind in ('word', 'record'):
-        state, err = run(f'tamper-{kind}', program, flush_args + ['--tamper', kind])
-        ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_link')
+    if shard.last(a.shard):   # the one-off checks
+        # A literal exit whose RIP is none of its block's link targets (admission refuses this; the driver forges it after
+        # admission) is refused at the reply, before the block is placed: its move must build its link point's target.
+        program, _, _ = built['split-body']
+        state, err = run('forged-exit', program, ['--forge-exit'])
+        ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('bad_reply') and state['stats']['links'] == 0
         failures += not ok
-        out.append({'name': f'tamper-{kind}', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
-        print(f"tamper {kind} before a flush: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
-        small, _, _ = add_chain(3, 40)
-        state, err = run(f'tamper-after-{kind}', small, ['--tamper-after', kind])
-        ok = state is not None and state['tampered'] and state['stop'] == 'reached' and state['links_check'] != 'ok'
-        failures += not ok
-        out.append({'name': f'tamper-after-{kind}', 'links_check': state and state['links_check'], 'stderr': err})
-        print(f"tamper {kind} after the run: {'match' if ok else 'fail'} host self-check: {state and state['links_check']} {err}")
-    state, err = run('untampered', add_chain(3, 40)[0], [])
-    ok = state is not None and state['links_check'] == 'ok' and not state['tampered']
-    failures += not ok
-    print(f"untampered: {'match' if ok else 'fail'} {state and state['links_check']}")
+        out.append({'name': 'forged-exit', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+        print(f"forged-exit: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
 
-    # The watchdog stops a loop that never ends (no host exit after its first block; linked, it never leaves the code).
-    spin = {'name': 'spin', 'code': ref.assemble('1: inc rax\njmp 1b').hex(), 'rip': CODE, 'gpr': gprs(), 'rflags': 0, 'memory': []}
-    state, err = run('spin', spin, ['--watchdog-ms', '300'])
-    ok = state is not None and state['stop'] == 'watchdog' and state['stats']['linked'] == 1
-    failures += not ok
-    out.append({'name': 'spin', 'stop': state and state['stop'], 'stats': state and state['stats'], 'stderr': err})
-    print(f"spin --watchdog-ms 300: {'match' if ok else 'fail'} {state and state['stop']} {state and state['stats']}")
+        # Run-time tampering (driver options): what admission and the resident never produce must be caught. A host-supplied
+        # link point outside its block is refused at placement; a corrupted linked branch or link record
+        # (corrupted just before a flush) halts the unlink, and the host's self-check refuses the same corruption after a run.
+        flush_args = ['1', '--code-cache', '32768']
+        program = add_chain(600, 3)[0]
+        state, err = run('tamper-offset', program, flush_args + ['--tamper', 'offset'])
+        ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_reply')
+        failures += not ok
+        out.append({'name': 'tamper-offset', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+        print(f"tamper offset: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
+        for kind in ('word', 'record'):
+            state, err = run(f'tamper-{kind}', program, flush_args + ['--tamper', kind])
+            ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_link')
+            failures += not ok
+            out.append({'name': f'tamper-{kind}', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+            print(f"tamper {kind} before a flush: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
+            small, _, _ = add_chain(3, 40)
+            state, err = run(f'tamper-after-{kind}', small, ['--tamper-after', kind])
+            ok = state is not None and state['tampered'] and state['stop'] == 'reached' and state['links_check'] != 'ok'
+            failures += not ok
+            out.append({'name': f'tamper-after-{kind}', 'links_check': state and state['links_check'], 'stderr': err})
+            print(f"tamper {kind} after the run: {'match' if ok else 'fail'} host self-check: {state and state['links_check']} {err}")
+        state, err = run('untampered', add_chain(3, 40)[0], [])
+        ok = state is not None and state['links_check'] == 'ok' and not state['tampered']
+        failures += not ok
+        print(f"untampered: {'match' if ok else 'fail'} {state and state['links_check']}")
+
+        # The watchdog stops a loop that never ends (no host exit after its first block; linked, it never leaves the code).
+        spin = {'name': 'spin', 'code': ref.assemble('1: inc rax\njmp 1b').hex(), 'rip': CODE, 'gpr': gprs(), 'rflags': 0, 'memory': []}
+        state, err = run('spin', spin, ['--watchdog-ms', '300'])
+        ok = state is not None and state['stop'] == 'watchdog' and state['stats']['linked'] == 1
+        failures += not ok
+        out.append({'name': 'spin', 'stop': state and state['stop'], 'stats': state and state['stats'], 'stderr': err})
+        print(f"spin --watchdog-ms 300: {'match' if ok else 'fail'} {state and state['stop']} {state and state['stats']}")
 
     # Self-modifying code (S2e). Each program runs in the VM with its code pages writable (regions over the code holding
     # the same bytes, not compared: `writable_code`) and under pinned QEMU as is (its code is writable there): QEMU translates the
@@ -419,7 +422,7 @@ def main():
         smc_results, _ = ref.run_programs([r for _, r, _ in smc], a.out / 'ref-smc', qemu)
     finally:
         ref.check_annotations = saved
-    for (program, reference, expected_gpr), result in zip(smc, smc_results):
+    for (program, reference, expected_gpr), result in shard.take(list(zip(smc, smc_results)), a.shard):
         end = ref.num(program['rip']) + len(program['code']) // 2
         for args in ([], ['1'], ['2']):
             cover = writable_code(program)
