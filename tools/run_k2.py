@@ -77,6 +77,9 @@ COSTS = {
     # a direct one (fexc may run through it in one block); against `nop`, the price of an L1-hit transition.
     'jmp_computed': ('lea rax, [rip + 2f]\njmp rax\n2:', {}),
     'jmp_direct': ('jmp 2f\n2:', {}),
+    # (fexc folds the RIP-relative target above into a direct jump: R9 = 0, unknown to it, makes the target computed.)
+    'jmp_r9': ('lea rax, [rip + 2f]\nadd rax, r9\njmp rax\n2:', {9: 0}),
+    'add_r9': ('lea rax, [rip + 2f]\nadd rax, r9\n2:', {9: 0}),
     # Reference: one resident round trip with no system instruction: a 128/64 division with RDX != 0 (fexc's helper,
     # `svc #DIV_U`; with RDX = 0 it divides inline).
     'div': ('mov edx, 1\nmov eax, 7\ndiv r9', {9: 2}),
