@@ -447,8 +447,12 @@ which drifted more than 3% from the previous A; the earlier A reused for workloa
 Accepted known cost: user code at many addresses runs shared, and measured 6-11% slower on the 1-vCPU I/O matrix's random
 reads in the re-measure round (within noise in the final run, but for mixed -5.6%). The hot-loop tax of the
 position-independent form is at most 2% (3.9% for `lea`-dense code); of the ~2.4 us per I/O lost, about 0.6 us is the
-dispatcher misses of slot-form links (L1 conflicts: more distinct addresses compete for L1 entries) and about 1 us is not
-explained. Follow-up: the L1 conflict misses (associativity, or an index hashing more address bits).
+dispatcher misses of slot-form links (the same L1 conflicts and post-CR3 empties as before, now costly because ~85
+transitions per I/O go through L1 instead of direct links) and about 1.8 us is in guest-side execution, not explained.
+A re-hashed index or 2-way L1 would cost more per probe than it saves (independent review, November 11). Follow-up: a
+perf-build pair of fio at 1 vCPU (PIC on/off) to split guest from resident time, and a count of misses by emptied slot
+vs conflict, before any change. The crash seen once (main-menu, 1 in ~280 B boots) stays open; the tripwire records any
+recurrence.
 
 Not done in stage 3: a separate instance area and its eviction (stage 4), and the plan's I/O drain case. The windowless
 I/O code-page drain kills through the same frame chains as a code write posted by another vCPU, which K1 `pic-xwrite`
