@@ -88,10 +88,19 @@ fn acknowledged_or_halted(memory: &Memory, v: usize, epoch: u64) -> bool {
     acknowledged(memory, v).load(SeqCst) == epoch || quiescent(memory, v).load(SeqCst) == 1
 }
 
-/// Whether some resident has ever walked `page` as a page table ([`cache::TABLE_PAGES`]).
-fn table_page(memory: &Memory, page: u64) -> bool {
+/// `page`'s [`cache::TABLE_PAGES`] word and bit.
+fn table_bit(memory: &Memory, page: u64) -> (&AtomicU64, u64) {
     let index = page as usize / 64;
-    global_u64(memory, cache::TABLE_PAGES + index * 8).load(SeqCst) & (1 << (page % 64)) != 0
+    (
+        global_u64(memory, cache::TABLE_PAGES + index * 8),
+        1 << (page % 64),
+    )
+}
+/// Whether some resident has walked `page` as a page table since its last table-write window
+/// ([`cache::TABLE_PAGES`]).
+fn table_page(memory: &Memory, page: u64) -> bool {
+    let (word, bit) = table_bit(memory, page);
+    word.load(SeqCst) & bit != 0
 }
 
 /// Called only inside a granted window, before any RAM mutation. All residents are parked:
@@ -150,9 +159,9 @@ impl Drop for Release<'_> {
     }
 }
 
-/// Host-side window counts for the run's performance log. Page-table marks are never cleared,
-/// so as the guest recycles former page-table pages for data, more write windows overlap them
-/// and force every vCPU to drop its translations; `table_writes` against `writes` shows that.
+/// Host-side window counts for the run's performance log. A write overlapping a page-table mark
+/// forces every vCPU to drop its translations and clears the mark; `table_writes` against
+/// `writes` shows how often.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct WindowCounts {
     /// Windows that won their grant and copied at least one byte.
@@ -812,9 +821,14 @@ impl Backing {
         }
     }
 
-    /// Post code invalidations for every page a write span touches and, if any of them was ever
-    /// walked as a page table, publish `epoch` as `tables_written`. Returns whether it did. All
-    /// residents are quiescent, so table marks cannot grow until release.
+    /// Post code invalidations for every page a write span touches and, if any of them is marked
+    /// as walked as a page table, publish `epoch` as `tables_written` and clear those marks.
+    /// Returns whether it did. All residents are quiescent, so table marks cannot grow until
+    /// release. Clearing is safe: `tables_written` makes every resident drop all its shadows and
+    /// fetch currency before its next guest access (a halted one on withdrawal), so nothing
+    /// derived from the old bytes survives, and a later walk of the page marks it again before
+    /// reading it. A page the guest recycled from a page table into an I/O buffer then costs one
+    /// window, not one per write.
     fn invalidate_written(&self, spans: &[Span], epoch: u64) -> bool {
         let mut tables = false;
         for span in spans.iter().filter(|span| span.write) {
@@ -823,8 +837,10 @@ impl Backing {
             let first = span.gpa >> 12;
             let last = (span.gpa + span.len as u64 - 1) >> 12;
             for page in first..=last {
-                if table_page(&self.memory, page) {
+                let (marks, bit) = table_bit(&self.memory, page);
+                if marks.load(SeqCst) & bit != 0 {
                     word(&self.memory, offset_of!(IoWindow, tables_written)).store(epoch, SeqCst);
+                    marks.fetch_and(!bit, SeqCst);
                     tables = true;
                 }
                 invalidate_page(&self.memory, page as usize, self.n);
@@ -1143,7 +1159,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn table_write_epoch_requires_overlap_and_marks_survive_page_reuse() {
+    fn table_write_epoch_requires_overlap_and_clears_the_marks_it_flushes() {
         let b = backing(2);
         let table_marks = global_u64(&b.memory, cache::TABLE_PAGES);
         let table_epoch = word(&b.memory, offset_of!(IoWindow, tables_written));
@@ -1173,6 +1189,20 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(table_epoch.load(SeqCst), 2);
+        assert_eq!(table_marks.load(SeqCst), 0, "the flushed page's mark goes");
+        // The page now holds data (a recycled page table): writing it again is ordinary.
+        b.copy_with(
+            BUDGET,
+            &mut [Transfer::Write {
+                gpa: 4096,
+                bytes: &[4],
+            }],
+            |v| acknowledge(&b, v),
+        )
+        .unwrap();
+        assert_eq!(table_epoch.load(SeqCst), 2);
+        // A later walk marks it again (the resident publishes before reading).
+        table_marks.fetch_or(2, SeqCst);
         let mut snapshot = [0];
         b.copy_with(
             BUDGET,
@@ -1193,12 +1223,8 @@ pub(crate) mod tests {
             |v| acknowledge(&b, v),
         )
         .unwrap();
-        assert_eq!(table_epoch.load(SeqCst), 4);
-        assert_eq!(
-            table_marks.load(SeqCst),
-            2,
-            "never forget earlier table use"
-        );
+        assert_eq!(table_epoch.load(SeqCst), 5);
+        assert_eq!(table_marks.load(SeqCst), 0);
         b.copy_with(
             BUDGET,
             &mut [Transfer::Write {
@@ -1210,13 +1236,13 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             table_epoch.load(SeqCst),
-            4,
+            5,
             "ordinary write must not advance table epoch"
         );
         let counts = b.io_window_counts();
         assert_eq!(
             (counts.granted, counts.writes, counts.table_writes),
-            (5, 4, 2),
+            (6, 5, 2),
             "only page-table overlaps count"
         );
         assert!(
@@ -1927,6 +1953,34 @@ pub(crate) mod tests {
         );
         assert_eq!(load(&b, offset_of!(IoWindow, tables_written)), 1);
         assert_eq!(code_mark(&b, 0).load(SeqCst), 0);
+        // The window flushed every translation from the page, so its mark went with them: the
+        // next batch into the same buffer (a recycled page table) is windowless (io-collapse,
+        // November 11: one window per write cut fio's sequential reads to a quarter).
+        assert_eq!(global_u64(&b.memory, cache::TABLE_PAGES).load(SeqCst), 0);
+        b.windowless(
+            BUDGET,
+            DRAIN,
+            &mut completion(&[4], &mut avail),
+            1,
+            &CopyPermit::new(),
+            |v, _| acknowledge(&b, v),
+            |_| {},
+        )
+        .unwrap();
+        // (vCPU 0 never drains the first window's post here, so the publication's drain expires
+        // into a window: one that writes no marked page.)
+        let counts = b.io_window_counts();
+        assert_eq!(
+            (
+                counts.table_fallbacks,
+                counts.windowless,
+                counts.table_writes,
+                counts.drain_expiries,
+                counts.granted
+            ),
+            (1, 1, 1, 1, 2)
+        );
+        assert_eq!(load(&b, offset_of!(IoWindow, tables_written)), 1);
     }
 
     #[test]

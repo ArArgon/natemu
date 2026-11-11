@@ -363,19 +363,21 @@ pub mod cache {
     }
     pub const WRITABLE_PAGES: usize = CODE_PAGES + MASK_BYTES;
     pub const RECORDS: usize = WRITABLE_PAGES + MASK_BYTES;
-    /// One bit per physical 4 KiB page ever read as a guest page table, at any level. Residents
+    /// One bit per physical 4 KiB page read as a guest page table, at any level. Residents
     /// publish before reading; the host inspects them before a windowless I/O copy writes (and
-    /// inside a fallback window). Never cleared during this VM's lifetime: page reuse may cause
-    /// extra invalidations, never missed ones.
+    /// inside a fallback window). Only the host clears a bit: inside a window that writes the page,
+    /// with every resident parked or HLT-quiescent, as it publishes `tables_written` (every resident then drops all
+    /// fetch currency and shadows before guest access, and the next walk marks the page again).
     pub const TABLE_PAGES: usize =
         (RECORDS + MAX_VCPUS * core::mem::size_of::<Record>()).next_multiple_of(8);
     pub const TABLE_PAGE_BYTES: usize = super::MAX_GUEST_PAGES.div_ceil(64) * 8;
     /// Sets `bit` in a [`TABLE_PAGES`] word, writing the shared word only when the bit is missing.
     ///
-    /// Marks are never cleared, so a bit once seen set stays set and the common already-marked case
-    /// needs no store (a page-table read is a hot path and these lines are shared by every vCPU).
-    /// The load may be Relaxed. The host reads these words with SeqCst loads before a windowless
-    /// copy's first write; a write to a marked page then falls back to a full window. A mark set
+    /// Residents never clear marks and the host clears one only while every resident is parked or
+    /// HLT-quiescent (its release orders the clear before their next walk), so a bit a running
+    /// resident sees set stays set and the common already-marked case needs no store (a page-table
+    /// read is a hot path and these lines are shared by every vCPU). The load may be Relaxed. The
+    /// host reads these words with SeqCst loads before a windowless copy's first write; a write to a marked page then falls back to a full window. A mark set
     /// (by any vCPU) before that check is visible to it: the setter's `fetch_or` is SeqCst and the
     /// walk that needed it read the page after it. A mark the check misses belongs to a walk that
     /// began during the copy, reading a buffer the guest gave the device: a guest race, as a
@@ -2945,7 +2947,7 @@ pub mod perf {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn table_page_marks_accumulate_and_are_never_cleared() {
+    fn table_page_marks_accumulate() {
         use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
         let word = AtomicU64::new(0);
         super::cache::mark_table_page(&word, 1 << 3);

@@ -44,10 +44,13 @@ Inside a granted write window, the memory coordinator posts invalidations for
 written physical pages through the existing resident code-page records. After
 release each resident drains them before another acknowledgement or guest access.
 Writes to previously observed guest page-table pages also invalidate global fetch
-mappings. Those page-table marks are never cleared, so a guest that recycles
-former page-table pages as I/O buffers makes more windows flush every vCPU's
-translations; the performance log's `io` line (`--perf-log`) counts granted
-windows, write windows and table-write windows to show it. HLT-sleeping residents may remain quiescent across multiple windows;
+mappings. That window clears the written pages' page-table marks (every vCPU
+drops all its translations before guest access; a later walk marks the page
+again), so a former page-table page recycled as an I/O buffer costs one window,
+not one per write (before November 11 marks were never cleared, and a fio buffer
+on such a page sent every write through a window: sequential reads fell to a
+quarter or less). The performance log's `io` line (`--perf-log`) counts granted
+windows, write windows and table-write windows. HLT-sleeping residents may remain quiescent across multiple windows;
 on wake they compare the latest table-change epoch with their previously serviced
 epoch, so a later read-only window cannot hide an earlier table write. The ordered
 HLT promise permits admission without waking that CPU; AP-mailbox waits still

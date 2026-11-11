@@ -466,8 +466,8 @@ conservative baseline is retained in earlier evidence. Targeted invalidation pre
 compiled objects. The first version rechecked global fetch mappings after every write; its
 retention/global executable remap checks passed primary and independent execution, as did high
 RAM and held compiler-response regressions. The current performance repair additionally tracks
-every physical page ever read as a guest page table, at every level and including failed walks
-and retries. Residents publish each mark before the entry load. The host checks these monotonic
+every physical page read as a guest page table, at every level and including failed walks
+and retries. Residents publish each mark before the entry load. The host checks these
 marks only after all participants are admitted and copy grant; only overlapping writes publish
 the separate table-change epoch requiring a global fetch-mapping invalidation. All writes still
 post physical code-page invalidations. The current protocol retains shadows while parked,
@@ -475,8 +475,12 @@ preserving the full barrier before acknowledgement and the actual holding/writab
 parked loop services peer shadow-drop requests so an in-flight split atomic or code mark can
 finish before that peer acknowledges. After release, every window drains pending invalidations,
 including canceled and read-only windows. A table-change epoch still resets all shadows and
-fetch currency. Marks survive cache/CR3/vCPU/device resets and page reuse for the VM's entire
-lifetime; reuse can cause excess invalidations. A table first used after release is read from
+fetch currency. Marks survive cache/CR3/vCPU/device resets; a table-change window clears the
+marks of the pages it writes (November 11: never clearing them sent every write
+into a recycled former page table through a window, collapsing fio reads). Zero-copy note: a direct host read
+into a marked page cannot be windowed for its whole duration, so such requests would take the copy path; the
+alternative, matching real DMA (no window for table pages, relying on the guest's TLB flushes), first needs an
+audit that no resident cache outlives x86's invalidation rules. A table first used after release is read from
 the new bytes. The bitmap adds about 1.094 MiB for the current 35 GiB physical span. Host
 release does not await every resident's post-release work; residents drain pending invalidations
 and the applicable table-change epoch before guest access or another acknowledgement. The
@@ -906,7 +910,7 @@ translated, `written` clears every vCPU's code mark for it and posts the stale p
 (record bit, summary, `PAGES`, doorbell); then the store; then `rechecked` catches a holder that
 marked the page in between. A translation in flight is rejected by `kept` when its source page has
 lost the vCPU's mark. Page-table shadows behave like a TLB and are not tracked for guest stores;
-`TABLE_PAGES` marks exist only for host writes and are never cleared.
+`TABLE_PAGES` marks exist only for host writes; only a table-change window clears them.
 
 **Design.** A copy batch no longer pauses vCPUs, except as listed:
 
