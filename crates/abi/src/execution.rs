@@ -267,8 +267,8 @@ pub mod cache {
     /// (the VA room up to [`LOOKUP_VA`]). The `build` benchmark filled the 64 MiB arena five times at N = 1 with about
     /// 243 Ki blocks, every one live (none dead, nine in ten not current: other processes' code, asked for again after
     /// each flush); the arena and the index now fill together at about 490 Ki blocks (about 270 bytes of record each).
-    pub const META_VA: u64 = PRIVATE + 0x3000_0000;
-    pub const META_BYTES: usize = 128 * MIB;
+    pub const META_VA: u64 = PRIVATE + 0x2800_0000;
+    pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
     pub const LOOKUP_BYTES: usize = (HINTS + 4 * HINT_ENTRIES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + (1 << 30);
@@ -295,7 +295,7 @@ pub mod cache {
     pub const L1_LISTED: u32 = 1 << 31;
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
     pub const L2: usize = (L1_LISTS + 4 * L1_ENTRIES * L1_TABLES).next_multiple_of(0x1_0000);
-    pub const L2_ENTRIES: usize = 1 << 20;
+    pub const L2_ENTRIES: usize = 1 << 21;
     /// Block index: metadata offsets of the blocks in placement (= code address) order.
     pub const INDEX: usize = L2 + 16 * L2_ENTRIES;
     /// At most half of L2, so probes stay short.
