@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Ordinary installed-root disk use and bounded fio matrix, identical guests on natemu/QEMU.
 
+The guest pins its single virtio IRQ to CPU 0 and runs every fio job on CPUs 1..n-1 (with 2 vCPUs all jobs, including
+the four of rand-read-4k-4jobs-q16, share CPU 1; with 1 vCPU nothing is pinned): left free, Linux sometimes put fio on the
+IRQ's vCPU and rates fell by half (docs/restructure/io-benchmarks.md).
 prepare/self-check never run a VM. run owns one fresh main/read-only-restart pair,
 600/120 seconds, no retry. Whole-system measurements, not isolated SSD numbers.
 """
@@ -90,6 +93,14 @@ rootinfo=$(awk '$2 == "/" {print $1, $3, $4}' /proc/mounts)
 case "$rootinfo" in "/dev/vda ext4 $mode,"*) ;; *) fail "root=$rootinfo";; esac
 echo "IO-MATRIX-ROOT $rootinfo"
 mark mounted-root
+fiopin=
+irq=$(awk '/virtio/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
+test -n "$irq" || fail virtio-irq
+if test "$(nproc)" -gt 1; then
+  fiopin="/bin/busybox taskset -c 1-$(($(nproc) - 1))"
+  echo 1 > /proc/irq/$irq/smp_affinity || fail irq-affinity
+fi
+echo "IO-MATRIX-PIN irq=$irq irq_affinity=$(cat /proc/irq/$irq/smp_affinity_list) fio=${fiopin:-none}"
 test "$(cat /sys/block/vda/size)" = 4194304 || fail capacity
 test "$(cat /sys/block/vda/queue/logical_block_size)" = 512 || fail sector
 test "$(basename "$(readlink -f /sys/block/vda/device/driver)")" = virtio_blk || fail driver
@@ -107,7 +118,7 @@ done
 run_job() {
   name=$1
   mark "job-$name-begin"
-  /usr/bin/fio "/fio/profiles/$name.fio" --output-format=json --output="/tmp/matrix/$name.json" >"/tmp/matrix/$name.stdout" 2>"/tmp/matrix/$name.stderr"
+  $fiopin /usr/bin/fio "/fio/profiles/$name.fio" --output-format=json --output="/tmp/matrix/$name.json" >"/tmp/matrix/$name.stdout" 2>"/tmp/matrix/$name.stderr"
   rc=$?; echo "IO-MATRIX-EXIT $name $rc"; test "$rc" = 0 || fail "$name"
   mark "job-$name-end"
 }
@@ -242,6 +253,8 @@ def judge(text, phase, cpus):
     mode = 'rw' if phase == 'write' else 'ro'
     need(len(re.findall(r'^IO-MATRIX-ROOT /dev/vda ext4 ' + mode + r',.*$', text, re.M)) == 1, 'installed root mode')
     need(text.count('\nIO-MATRIX-DEVICE driver=virtio_blk sectors=4194304 logical=512\n') == 1, 'disk geometry/driver')
+    pin = 'irq_affinity=0 fio=' + ('/bin/busybox taskset -c 1-%d' % (cpus - 1) if cpus > 1 else 'none')
+    need(re.findall(r'^IO-MATRIX-PIN irq=\d+ (.*)$', text, re.M) == [pin], 'IRQ/fio pinning')
     need(re.findall(r'^IO-MATRIX-PARSE (\S+) (\d+)$', text, re.M) == [(n, '0') for n in sorted(PROFILES)], 'all profiles parsed exactly once')
     executed = PROFILES if phase == 'write' else ('verify-all',)
     need(re.findall(r'^IO-MATRIX-EXIT (\S+) (\d+)$', text, re.M) == [('version', '0')] + [(n, '0') for n in executed], 'fio execution order/status')
@@ -398,6 +411,7 @@ def sample_serial(phase, cpus):
     mode = 'rw' if phase == 'write' else 'ro'
     lines = [f'IO-MATRIX-BEGIN phase={phase} cpus={cpus} kernel={block.KVER}',
              f'IO-MATRIX-ROOT /dev/vda ext4 {mode},relatime',
+             'IO-MATRIX-PIN irq=16 ' + ('irq_affinity=0 fio=/bin/busybox taskset -c 1-%d' % (cpus - 1) if cpus > 1 else 'irq_affinity=0 fio=none'),
              'IO-MATRIX-DEVICE driver=virtio_blk sectors=4194304 logical=512',
              'IO-MATRIX-MARK name=mounted-root uptime=1.00', 'IO-MATRIX-EXIT version 0']
     lines += [f'IO-MATRIX-PARSE {n} 0' for n in sorted(PROFILES)]
