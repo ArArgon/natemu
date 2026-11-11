@@ -4,8 +4,8 @@ Status: design and evidence only, November 10, 2026, on `codex/virtio-io` at 6ac
 the owner's inline-cache suggestion (adopted, section 3). Owner principle for the design: the common cases are fast;
 rare cases (a frame at two linear pages, links from shared code into absolute or global code, odd slot states) take the
 simplest correct slow path (the dispatcher, or no sharing for that block) rather than new bookkeeping; Stage 1 counts
-each case so the fast paths are chosen on evidence. Nothing is built. Owner sign-off is
-needed before any implementation. Inputs: the CPython profile (`natemu-raw/cpython-profile-20261110-01/`: `summary.md`;
+each case so the fast paths are chosen on evidence. Built (November 10-11, branch `pic`): stages 1-3, with the design
+changes section 8 records (a lazy rewrite, and the checked links' forms); stage 4 is not started. Inputs: the CPython profile (`natemu-raw/cpython-profile-20261110-01/`: `summary.md`;
 `runs/full-off-1` and `runs/full-norand-off-1`, the `vcpu` lines of `perf-trim.log`), the capacity experiment
 (`natemu-raw/capacity-20261110-01/`, runs `fullA`/`fullB`, `slice*`), [perf-plan.md](perf-plan.md) chunks 3, 4, 8 and 10
 (the relocation proof, host reuse, local links, reuse inside the resident), `crates/runtime/src/cache.rs`,
@@ -316,6 +316,122 @@ Stop rules: if Stage 1 shows eligibility under 90%, or Stage 2's tax exceeds 3% 
 - **Two code forms coexist** (absolute and position-independent); every resident path that reads a block address must
   say which it uses. Section 2's inventory is the checklist.
 - **Memory**: the instance area adds backing per vCPU.
+
+## 8. Built: stages 1-3 (November 10-11, branch `pic`)
+
+Raw data: `natemu-raw/pic-20261110-02/` (`runs/`, `picsumm.py`; S1 = stage 1, S1c and S3c = the `pic-count` measurement
+builds, whose links enter their targets through counting stubs). Code: `crates/abi/src/pic.rs` (the forms, rewrite, static
+proof), `crates/runtime/src/cache.rs` (`share`, `instance`, `link`), `crates/runtime/src/execution.rs` (`reused`, `linker`,
+`accepted`, the entries and stops); tests in `pic.rs`, `crates/host/src/relocation.rs`, `tools/run_k1.py` (the `pic-*`
+programs), `tools/run_pic.py` (the suite's `pic` step), `tools/test_pic_slot.py`.
+
+**Stage 1** (counting, the eager rule; 4 vCPUs, ASLR on). Every copy was of an eligible template (slice 1.52 M, exec loop
+5.32 M, full build 36.6 M: 100%); the gate passes. Templates eligible: 60% on the slice, 91% on the exec loop, 66% on the
+full build, the rest out of reach: fixed-address code (cc1, python3.13) that never moves. Linked transitions on the full
+build: same page 94 G, cross-page 2.1 G, shared into absolute 23 G, absolute into shared 27 G: the eager rule would rewrite
+eligible blocks of fixed-address programs and make links between their absolute and rewritten blocks (about 50 G
+transitions a build). Frames met at two linear pages in one epoch: 6. The host compiled 2.68 M of its 3.44 M answers
+again after dropping them (a larger host generation would remove most).
+
+**Stage 2** (rewrite and entry, one block per address) as section 4, with: FEX's code at 16 bytes past the block's
+64-byte boundary (three zero words and the `and`; the `str` takes FEX's code header word), the slot in FEX's `rip`
+field (CPUState 0x18), a 32-bit (below 4 GiB) move refused as perf chunk 10 refuses it, and the check mode skipping only
+copies whose host answer chose other move lengths (counted). Ordinary guest stores to the slot fault (#GP, the alias is
+non-canonical: `run_frame_alias.py`'s `pic-slot-*` cases), so the slot is not guest-writable in practice; section 4's
+rules still hold for a forged slot (`run_pic.py` `forge`).
+
+**Lazy rewrite** (owner, November 11, replacing the eager placement of stage 2). Templates stay absolute; an eligible
+template is rewritten into a shared translation the first time reuse would copy it (a second address needs its code),
+proved against its admitted code, and named by the hint table from then on; the absolute block stays valid at its own
+address. Fixed-address code (cc1, static binaries, the kernel) never pays.
+
+**Stage 3.** Instances are records in the metadata arena (not their own area: they go at a full flush, which stage 4 can
+change if flush counts demand) with no code: their translation's, their own currency, L1 and L2 entries, linear and frame
+chains (a write to the frame kills translation and instances together) and moved link-point targets. Links:
+
+Two link forms (owner, November 11: the fewest forms; the plan's section 3 had three, and a per-link L1 entry for absolute
+sources was tried and dropped):
+
+- local: shared to shared, the target starting on the source's start frame and page: the first word, `b` to the target
+  translation's body (right for every instance: the page base is the same).
+- dispatcher slot: every other link involving shared code (cross-page, shared into absolute or global, absolute into
+  shared): the move stays, the `svc` word branches to the source context's dispatcher slot, which probes L1 at the entry of
+  the address the exit built. A slot serves one context until a flush and misses while its context has no table, so these
+  links need no undo but at their source's death and a flush. Section 3's single L1 entry for the target address does not
+  work for a shared source: L1 is indexed by the address's low 16 bits and the instances of one translation differ in bits
+  12-15, so the branch reaches only the linking instance's entry and every other live instance misses into the resident
+  (measured with that form: 727 M resident lookups on the slice against 53 M without sharing, 509 M of them for an instance
+  whose own L1 entry was filled; the slice took 68-77 s against 36 s).
+
+No slot acceptance (section 4's lookup before linking from shared code): faults and stops take the address from the slot,
+and linking needs no instance. A local link is chosen from the translations' frames (the target's translation starts on
+the source's frame and page), so it is right at every address the source runs for, whatever the slot named; every other
+link goes through the dispatcher's L1 probe of the address the exit built, current for this vCPU and context as any
+dispatcher hit. A slot naming another page therefore makes that process compute its own addresses wrong (its own state) and
+links nothing that is wrong for another instance. (A first version accepted the slot by a lookup, which also had to accept
+the absolute block of the same frames where an older process had placed one: without it, shared code entered there by a
+local link never linked, 6 M refused linker entries on the slice. Both are deleted.)
+
+Linked transitions with the lazy rule (S3c; per form): full build (c) 12.1 G, (b) 3.55 G (1.15 G cross-page, 2.40 G
+into absolute), (a) 0.71 G; slice (c) 2.11 G, (b) 0.72 G (0.20 G cross-page, 0.53 G into absolute), (a) 0.15 G; exec loop
+(c) 56 M, (b) 10 M, (a) 1.1 M. Absolute into shared falls from 27 G (full build) and 6.9 G (slice) under the eager rule
+to 0.71 G and 0.15 G. Full build: 1.0 M translations shared, 16.0 M instances, 1.37 M checked links, 5-6 capacity
+flushes per vCPU (16.5 with the bigger cache before). Slice: 82 k translations shared, 1.02 M instances, 102 k checked links. Sanity runs
+(one each, uncontended, not a benchmark): exec loop 7.3 s guest against 14.6 s (stage 1); slice 35.3 s (a counting build)
+against 36.4 s; full build 214 s against 264 s.
+
+Review of stage 3 (independent, November 11), fixed with a test each:
+
+- A shared translation's local links reach any block starting on its start page (and that block may run into the next
+  page) at whatever address it runs for, with no request there: a host hook or the stop RIP on such a page was skipped.
+  No instance or share is made where a hook or the stop RIP lies on RIP's page or the next (`run_pic.py`'s `fence`
+  case: red before, green after; elsewhere sharing goes on).
+- A REP string's self-exit is never linked through the dispatcher slot (a stop at that `svc` word would not see the REP
+  boundary, which the resident finds by link-point offset); K1 `pic-rep`.
+- Under the check: no local links (code reached only through one is never compared at that address), and where fexc
+  chose other move lengths at the instance's address the moves' values are compared in order (`pic::moves_agree`)
+  instead of only counting the mismatch.
+- The one guest-RIP literal allowed in a shared template is the block tail's `RIP` (FEX's `JITCodeTail`, at the offset
+  the code header word holds, 8 bytes in).
+- The SYSCALL/SYSRET fast path now takes shared code (it compared the translation's link targets with the instance's
+  address); `block_at` passes over any number of records with no code (instances, kept records).
+- Moot after the two-form simplification: the linker's liveness re-check and the check of instances made by slot
+  acceptance (acceptance is deleted).
+
+- Found by the reruns, not the review: a shared source's link point may already be linked in the other form (made at
+  another address, where the target was or was not an instance on the source's frame); the linker took that for a word
+  the cache did not put there and halted (`BAD_LINK`, about one slice in three through the `natemu` command, none in
+  five through `boot-linux`). Both forms are right everywhere, so such a point now stays as it is; six slices passed after.
+
+Two-form counts (S3d, a counting build, one run each, November 11): slice local 2.07 G, dispatcher slot 1.03 G (0.21 G
+cross-page, 0.67 G into absolute, 0.16 G absolute into shared), computed exits 4.49 G; exec loop local 56 M, dispatcher
+slot 11.2 M (6.7 M, 3.4 M, 1.0 M), computed exits 185 M. Of the links from shared code into absolute code, 90% (slice
+22.1 k of 24.5 k) and 97% (exec loop 754 of 781) go to a block on the source's own page and frames: sharing that target
+when the link is made would make them local. Dispatcher misses into the resident by need: slice 20.9 M with the block
+current (an L1 conflict or a table given away), 7.4 M to revalidate, 1.0 M new; exec loop 0.42 M, 1.7 M, 1.5 M. Sanity
+(uncontended, one each): slice 35.3 s, exec loop 7.2 s.
+
+Not done in stage 3: a separate instance area and its eviction (stage 4), and the plan's I/O drain case. The windowless
+I/O code-page drain kills through the same frame chains as a code write posted by another vCPU, which K1 `pic-xwrite`
+covers at two or more vCPUs on the resident's side (the drain itself is not run); a case for the I/O suite remains: a
+virtio write over a page whose shared translation is live in two address spaces.
+
+The check mode runs no local link (it makes none: code reached only through one would never be compared at that
+address), so the K1 programs' exact values are local links' only coverage. Where fexc chose other move lengths it
+compares only the moves' values (`CHECK_SHAPE`, counted).
+
+Review round 2 (November 11):
+
+- The BAD_LINK's cause, found from the halt record of a build without the tolerance: a block starting with REP MOVSB
+  exits through the REP's self-exit with RCX = 0 after its pass; `rep_exited` moves the RIP past the REP, and the linker
+  then linked the points naming the block found there (the other point), which the exit had not taken. For shared code
+  that point could be linked in the other form from another address. The linker now links nothing for such an exit,
+  and the tolerance is deleted (six slices through `natemu` passed after; K1 `pic-repexit` runs the shape but did not
+  reach the path before the fix either).
+- `block_at` takes two binary searches (the last record at or below the PC, and at or below PC + 4) instead of scanning
+  past records with no code; `copy` restores the template's `svc` words as `share` does.
+- The host keeps at most four hook ranges as fences: with more it turns reuse in the resident off (nothing is copied or
+  shared); the CPL-3 cases (`run_pic.py` `user`) use one CR3 switch routine for that reason.
 
 ## Open questions for the owner
 
