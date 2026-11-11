@@ -597,7 +597,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
                 halt(&s, stop::BAD_LINK)
             }
         };
-        let (generation, rip) = (s.generation, s.cpu.rip);
+        let generation = s.generation;
         // A target killed as it was placed is neither linked to nor entered: its instruction is stepped.
         let Some(target) = find(&mut s) else {
             if source.is_some() {
@@ -610,8 +610,9 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             Some(source) if s.generation != generation || source.flags & cache::DEAD != 0 => {
                 s.stale_links += 1
             }
-            // The exit's target was a system instruction: the block found follows it, nothing to link.
-            Some(_) if target.rip != rip => {}
+            // The exit's target was a system instruction: the block found follows it, nothing to link. (Against the exit's
+            // own target, whatever moved the RIP before `find`.)
+            Some(_) if target.rip != exit => {}
             // An instruction run alone to end a shadow (X2): never linked to.
             Some(_) if target.flags & cache::STEP != 0 => {}
             // S4: nor a block at an armed instruction breakpoint.
