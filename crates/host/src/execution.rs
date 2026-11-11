@@ -531,7 +531,28 @@ pub fn shadow_resets(area: Area) -> u64 {
 /// (`memory_types`: {"UC": n, ...}, the types with a non-zero count) and its UC accesses (`uncached`: instructions run
 /// alone for one, the resident's own).
 pub fn k1_stats(area: Area) -> K1 {
-    let mut k = K1::new(&area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL));
+    let control: cache::Control = area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL);
+    // The crash tripwire (`cache::Control::trip`): user-mode faults that look like a crash, on stderr.
+    if control.trip_count != 0 {
+        let n = control.trip_count;
+        eprintln!(
+            "natemu: vCPU {} user faults like a crash: {n} (the last {} below)",
+            area.vcpu,
+            n.min(cache::TRIP_ENTRIES as u64)
+        );
+        for k in n.saturating_sub(cache::TRIP_ENTRIES as u64)..n {
+            let [rip, v, cr2, flags, code_rip, slot, cr3, targets] =
+                control.trip[k as usize % cache::TRIP_ENTRIES];
+            eprintln!(
+                "natemu:   rip {rip:#x} vector {} error {:#x} cr2 {cr2:#x} block flags {:#x} translation {} code rip {code_rip:#x} slot {slot:#x} cr3 {cr3:#x} link targets (low 16 bits) {targets:#x}",
+                v & 0xff,
+                v >> 8,
+                flags & 0xffff_ffff,
+                flags >> 32
+            );
+        }
+    }
+    let mut k = K1::new(&control);
     k.pic_transitions = pic_transitions(area);
     k
 }
