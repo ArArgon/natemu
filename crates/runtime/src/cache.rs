@@ -101,8 +101,9 @@ fn record(i: usize) -> *mut LinkRecord {
 fn global<T>(offset: usize) -> *mut T {
     (area::GLOBAL_VA + offset as u64) as *mut T
 }
-/// Monotonic physical-page dependency, published before a guest page-table load. The host sees
-/// all prior marks after the resident's I/O acknowledgement; no cache/shadow reset clears them.
+/// Physical-page dependency, published before a guest page-table load. The host sees all prior
+/// marks after the resident's I/O acknowledgement; no cache/shadow reset clears them, only a
+/// host window that writes the page (every resident then flushes all translations).
 /// Already-marked pages cost one load (see [`area::mark_table_page`] for the ordering argument).
 pub fn table_read(gpa: u64) {
     let page = (gpa >> 12) as usize;
