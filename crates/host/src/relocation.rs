@@ -272,6 +272,68 @@ mod tests {
         assert_eq!(links, want);
     }
 
+    /// PIC study stage 2 on fexc's objects: the block admitted at one fixture RIP, rewritten position-independent, is
+    /// proved against its admitted code; copied to the other RIP (its link points linked first, as the resident's may be)
+    /// it is proved against the object admission gives there; the proof fails against the wrong RIP's object.
+    #[test]
+    fn position_independent_rewrite_of_fexcs_objects() {
+        use natemu_abi::pic;
+        let admitted = |o: &[u8], rip: u64| {
+            let a = crate::admission::admit(o, rip, USER, u64::MAX, true, false).unwrap();
+            let h: Header = read(&a.object, 0).unwrap();
+            a.object[h.code_offset as usize..][..h.code_size as usize].to_vec()
+        };
+        for (from, to) in [(USER_A, USER_B), (USER_B, USER_A)] {
+            let (linked, relocs, mut links, bytes) = placed(from.0, from.1, USER);
+            let original = admitted(from.0, from.1);
+            let mut code = original.clone();
+            for p in links.iter().filter(|p| p.offset != 0) {
+                assert_eq!(
+                    &linked[p.offset as usize..][..4],
+                    0x1400_0040u32.to_le_bytes()
+                );
+                let at = p.offset as usize;
+                code[at..at + 4].copy_from_slice(&p.word.to_le_bytes());
+            }
+            assert_eq!(pic::eligible(&code, &relocs, &links, from.1), Ok(()));
+            assert_eq!(pic::rewrite(&mut code, &relocs, &mut links, from.1), Ok(()));
+            assert!(pic::proved(&original, &code, &relocs, &links, from.1, 0));
+            assert!(
+                links
+                    .iter()
+                    .any(|p| p.offset != 0 && p.word == pic::load_base(0))
+            );
+            // Every move rewritten: no word of an absolute guest-RIP move of x0 or another register is left.
+            assert_ne!(code, original);
+            // Copied: a link point linked in its first word and another in its `svc` word, both restored.
+            let mut copy = code.clone();
+            for (i, p) in links.iter().filter(|p| p.offset != 0).enumerate() {
+                let at = if i % 2 == 0 {
+                    p.offset as u64
+                } else {
+                    pic::svc_slot(
+                        |o| u32::from_le_bytes(copy[o as usize..][..4].try_into().unwrap()),
+                        p,
+                    )
+                };
+                copy[at as usize..][..4].copy_from_slice(&0x1400_0040u32.to_le_bytes());
+            }
+            let mut moved = links;
+            assert_eq!(
+                pic::relocate(&mut copy, &mut moved, from.1, to.1, bytes),
+                Ok(())
+            );
+            assert_eq!(copy, code, "the copy's code is the template's");
+            let there = admitted(to.0, to.1);
+            assert!(pic::proved(&there, &copy, &relocs, &moved, to.1, 0));
+            assert!(
+                !pic::proved(&there, &copy, &relocs, &links, to.1, 0),
+                "the template's link targets"
+            );
+            assert!(!pic::proved(&original, &copy, &relocs, &moved, to.1, 0));
+        }
+    }
+
     /// Each refusal of the re-check, and the shared move rule's.
     #[test]
     fn resident_copy_refusals() {

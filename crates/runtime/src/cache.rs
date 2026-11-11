@@ -18,8 +18,9 @@ use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::code_object::{Header, Reloc, Site};
 pub use natemu_abi::execution::cache::{
     ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES,
-    INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_ALL, PIC_LEAD, PIC_USER, RELOCATABLE,
-    REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, STI_FIRST, SYSTEM,
+    INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_ALL, PIC_LEAD, PIC_TEST_AND,
+    PIC_TEST_BODY, PIC_TEST_FORGE, PIC_TEST_STR, PIC_TEST_SVC, PIC_USER, RELOCATABLE, REUSE_CHECK,
+    REUSE_OFF, SHADOWS, STEP, STI_FIRST, SYSTEM,
 };
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
 use natemu_abi::execution::{
@@ -825,7 +826,7 @@ fn placed_pic(b: &Block, admitted: &[u8], candidate: bool) {
     let k = if b.flags & GLOBAL != 0 {
         count::GLOBAL
     } else {
-        pic::eligible(admitted, relocs(b), b.rip)
+        pic::eligible(admitted, relocs(b), &b.links, b.rip)
             .err()
             .unwrap_or(count::ELIGIBLE)
     };
@@ -835,7 +836,7 @@ fn placed_pic(b: &Block, admitted: &[u8], candidate: bool) {
     }
 }
 /// PIC study stage 2: rewrites the template `b` (placed [`PIC_LEAD`] bytes past its boundary, before its code is
-/// synchronized) into its position-independent form ([`pic::rewrite`]): the zero word and the full entry's `and` before
+/// synchronized) into its position-independent form ([`pic::rewrite`]): the zero words and the full entry's `and` before
 /// `code`, its link points' words; under the check its literal slots poisoned ([`poison`]); then the static proof against
 /// `admitted` ([`pic::proved`]). [`PIC`] only if proved; otherwise the admitted code is put back (`b` stays absolute) and
 /// counted ([`count::UNPROVED`]: a resident fault; the check halts on it).
@@ -846,7 +847,7 @@ fn rewritten(b: &Block, admitted: &[u8]) {
     if pic::rewrite(code, relocs(b), &mut links, b.rip).is_err() {
         return counted(count::UNPROVED);
     }
-    unsafe { ((at - 8) as *mut [u32; 2]).write_volatile([0, pic::AND_PAGE]) };
+    unsafe { ((at - 16) as *mut [u32; 4]).write_volatile([0, 0, 0, pic::AND_PAGE]) };
     poison(b, code);
     if !pic::proved(admitted, code, relocs(b), &links, b.rip, b.dispatch_exit) {
         code.copy_from_slice(admitted);
@@ -1204,6 +1205,14 @@ fn relocate(code: u64, dispatch_exit: u64, to: u64) {
 /// branches inside a block go forward and none enters a link point after its first word (admission). False (nothing
 /// patched) when a stop is armed already: every resident entry disarms first, so a second arm is a resident bug.
 pub fn arm(b: &Block) -> bool {
+    arm_words(b, true)
+}
+/// PIC study stage 2 test ([`area::PIC_TEST_SVC`]): [`arm`]'s words of `b` but only the `svc` words of its links there;
+/// false if none (nothing armed).
+pub fn arm_svc(b: &Block) -> bool {
+    arm_words(b, false) && control().armed != 0
+}
+fn arm_words(b: &Block, all: bool) -> bool {
     let c = control();
     if c.armed != 0 {
         return false;
@@ -1213,14 +1222,15 @@ pub fn arm(b: &Block) -> bool {
     let base = u64::from(b.code);
     let svc = |p: &LinkPoint| {
         let at = svc_slot(b, p);
-        (b.flags & PIC != 0 && word(base + at) != pic::SVC_LINK).then_some(at as u32)
+        (word(base + at) != pic::SVC_LINK).then_some(at as u32)
     };
     let points = b.links.iter().filter(|p| p.offset != 0);
     let exits = points
         .clone()
         .map(|p| p.offset)
+        .filter(|_| all)
         .chain(points.filter_map(svc))
-        .chain((b.dispatch_exit != 0).then_some(b.dispatch_exit));
+        .chain((all && b.dispatch_exit != 0).then_some(b.dispatch_exit));
     for offset in exits {
         let at = u64::from(b.code) + u64::from(offset);
         c.armed_words[c.armed as usize] = [at as u32, word(at)];
@@ -1267,14 +1277,13 @@ fn synchronize_words(c: &Control) {
         asm!("dsb ish", "isb");
     }
 }
-/// The link point's words are its admitted form: the first word of its RIP move, and (a [`PIC`] block) the `svc #LINK`
-/// after it.
+/// The link point's words are its admitted form: the first word of its RIP move, and the `svc #LINK` after it (PIC study
+/// stage 2: a link into a [`PIC`] block may patch that word instead, [`link`]).
 fn unlinked(b: &Block, p: &LinkPoint) -> bool {
     let base = u64::from(b.code);
-    word(base + u64::from(p.offset)) == p.word
-        && (b.flags & PIC == 0 || word(base + svc_slot(b, p)) == pic::SVC_LINK)
+    word(base + u64::from(p.offset)) == p.word && word(base + svc_slot(b, p)) == pic::SVC_LINK
 }
-/// PIC study stage 2: the native offset in [`PIC`] block `b` of link point `p`'s `svc` word ([`pic::svc_slot`]).
+/// PIC study stage 2: the native offset in block `b` of link point `p`'s `svc` word ([`pic::svc_slot`]).
 pub fn svc_slot(b: &Block, p: &LinkPoint) -> u64 {
     pic::svc_slot(|o| word(u64::from(b.code) + o), p)
 }

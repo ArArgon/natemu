@@ -621,7 +621,17 @@ pub mod cache {
         /// ([`PIC_OFF`], [`PIC_USER`]: CPL-3 code only, the design's rule; [`PIC_ALL`]: every privilege level, a test mode
         /// that runs the suites' CPL-0 programs through the rewritten code too). Appended.
         pub pic: u64,
+        /// PIC study stage 2 tests (the host's `NATEMU_PIC_TEST`), on every second entry of a position-independent block
+        /// from the resident: [`PIC_TEST_AND`], [`PIC_TEST_STR`], [`PIC_TEST_BODY`] enter it at that word with the vCPU's
+        /// own doorbell rung (a stop at that word); [`PIC_TEST_SVC`] arms only the `svc`-word links of any block (a stop there);
+        /// [`PIC_TEST_FORGE`] writes another page's base in the slot (the guest's corruption of its own state). 0: none.
+        pub pic_test: u64,
     }
+    pub const PIC_TEST_AND: u64 = 1;
+    pub const PIC_TEST_STR: u64 = 2;
+    pub const PIC_TEST_BODY: u64 = 3;
+    pub const PIC_TEST_SVC: u64 = 4;
+    pub const PIC_TEST_FORGE: u64 = 5;
     /// [`Control::armed_words`]: two words per link point and the computed exit.
     pub const ARMED: usize = 2 * super::MAX_LINK_POINTS + 1;
     /// [`Control::pic`].
@@ -735,9 +745,10 @@ pub mod cache {
     /// before `code` and its `str` in the code header's word ([`Block::full_entry`]); its link points' first words are
     /// the rewritten moves' `ldr x0`, so a link into it from elsewhere patches the `svc` word after the move.
     pub const PIC: u32 = 512;
-    /// Bytes before a position-independent block's `code`: a word left zero (`udf`) and the `and`, keeping FEX's code
-    /// 8-byte aligned (its literal slots; x86 AC runs generated code with SCTLR_EL1.A).
-    pub const PIC_LEAD: u32 = 8;
+    /// Bytes before a position-independent block's `code`: three words left zero (`udf`) and the `and`, keeping FEX's
+    /// code 16-byte aligned as placed blocks are (its literal slots; x86 AC runs generated code with SCTLR_EL1.A): the
+    /// design's 16-byte shift of FEX's body.
+    pub const PIC_LEAD: u32 = 16;
     pub const RELOCS_SHIFT: u32 = 16;
     pub const MAX_RELOCS: u32 = 0xff;
     impl Block {
