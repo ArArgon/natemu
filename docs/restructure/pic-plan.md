@@ -164,6 +164,16 @@ Link classes, with the word each patches:
 record names; a link record keeps its form. A precise stop arms both forms' words (a checked link's `svc` word holds
 its `b`, and every path out of the block passes it).
 
+**Checked-link records** name a (table, entry), not a target block, so they cannot live in today's segments as they are
+(`prune` tests the target's currency, `unlink` compares the word with a branch to the target's entry; `cache.rs`). They
+get their own segment, which `prune` skips for target currency; their `unlink` checks the word against a branch to the
+L1 entry's address; they are found per table (a table that loses its context undoes only its own); and `cut_one` includes
+that segment in its scope when the source dies.
+
+**Stop addresses at exits.** `arm` patches each link point's first word, so a stop usually lands before the address move:
+the RIP is then the accepted slot plus the link point's offset (section 4's slot rule). A stop at a checked link's `svc`
+word (the move already ran) takes the RIP from x0.
+
 **Invalidation reaches every instance** (review finding 2, checked: `cut_one` empties only the L1 entry at
 `b.rip & L1_MASK`, and an L1 hit bypasses lookup). A translation keeps a chain of its instances; killing it (a code write,
 `invalidate`; the windowless I/O code-page drain; `discard`) cuts each instance's L1 entry in every table and its L2 slot,
@@ -206,6 +216,10 @@ Rules:
   legitimate runs (re-review blocker B: a local link enters T where T has no instance yet; checked against the linker's
   source test, `execution.rs`); the lookup makes that instance, so T's exits link afterwards. The linker also requires
   x0 minus the slot to equal a link point's offset.
+- That lookup may walk page tables, write an A bit and kill blocks, the running T included (`lookup` warns of this,
+  `cache.rs`). So a fault or exit reads everything it needs from T (site, link point, offsets) and computes the RIP
+  before the lookup; if T died or the generation moved during it, the event is still handled with that RIP, nothing is
+  linked and no instance is kept, and it is counted, as the linker's stale links are.
 - Stage 2 (one block per address) does not read the slot at all: the resident uses the block's own address and counts a
   slot that disagrees (a debug count, never a halt).
 - A slot that fails is the guest's own corruption of its own state: it never halts the VM (no `BAD_LINK` from it), never
@@ -267,7 +281,8 @@ must not move). Baselines are measured again on the build each stage starts from
    (they price the cross-page check); frames seen at two linear pages in one address space and epoch; requests that a
    translation seen earlier in the run would have served (the bound on the host saving); host-cache drops followed by a
    recompile of the same answer. Stage 3 adds the cross-page check's hit rate and the counts of every slow path taken
-   (check misses, slot lookups, blocks left unshared). Gate: eligible templates cover at least 90% of
+   (check misses, which reach `missed` and so skip the linker's `sys_fast` path: speed only; slot lookups and stale ones;
+   blocks left unshared). Gate: eligible templates cover at least 90% of
    copies on the slice and the exec loop; otherwise revisit section 2's reach.
 2. **The rewrite and entry, one instance per block.** Eligible templates are placed rewritten; copies keep being made, now
    by plain copying of rewritten code. This proves the new code and measures the tax alone. Gate: unit tests of the
