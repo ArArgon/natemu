@@ -1507,6 +1507,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     // which the check would never compare; the slot's probe finds or makes one. Review of stage 3, finding 4c.)
     let local_shared = shared
         && c.reuse != REUSE_CHECK
+        && c.pic_test != natemu_abi::execution::cache::PIC_TEST_NOLOCAL
         && target.flags & INSTANCE != 0
         && target.rip >> 12 == at >> 12
         && same_frames(code, source);
