@@ -73,6 +73,10 @@ COSTS = {
     'wrmsr': ('mov ecx, 0xc0000102\nxor eax, eax\nxor edx, edx\nwrmsr', {}),
     'fld_fstp_m80': ('fld tbyte ptr [rbx]\nfstp tbyte ptr [rbx]', {3: DATA}),
     'nop': ('nop', {}),
+    # PIC study: a computed jump to a fixed target (the next instruction: an L1 hit every iteration after the first) and
+    # a direct one (fexc may run through it in one block); against `nop`, the price of an L1-hit transition.
+    'jmp_computed': ('lea rax, [rip + 2f]\njmp rax\n2:', {}),
+    'jmp_direct': ('jmp 2f\n2:', {}),
     # Reference: one resident round trip with no system instruction: a 128/64 division with RDX != 0 (fexc's helper,
     # `svc #DIV_U`; with RDX = 0 it divides inline).
     'div': ('mov edx, 1\nmov eax, 7\ndiv r9', {9: 2}),

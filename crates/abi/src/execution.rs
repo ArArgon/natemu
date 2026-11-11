@@ -642,6 +642,8 @@ pub mod cache {
     pub const PIC_TEST_SVC: u64 = 4;
     pub const PIC_TEST_FORGE: u64 = 5;
     pub const PIC_FORGES: u64 = 4;
+    /// A diagnosis mode: no local link is made (every link with shared code goes through the dispatcher slot).
+    pub const PIC_TEST_NOLOCAL: u64 = 8;
     /// As [`PIC_TEST_FORGE`], the slot's bit 47 flipped (a non-canonical base).
     pub const PIC_TEST_FORGE_NONCANONICAL: u64 = 6;
     /// As [`PIC_TEST_FORGE`], bits 47-63 flipped (a base in the other half).

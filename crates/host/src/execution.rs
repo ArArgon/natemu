@@ -2802,6 +2802,7 @@ pub fn run(
         Ok("forge") => cache::PIC_TEST_FORGE,
         Ok("forge-noncanonical") => cache::PIC_TEST_FORGE_NONCANONICAL,
         Ok("forge-half") => cache::PIC_TEST_FORGE_HALF,
+        Ok("nolocal") => cache::PIC_TEST_NOLOCAL,
         Ok(other) => {
             return Err(format!(
                 "NATEMU_PIC_TEST={other}: and, str, body, svc, forge, forge-noncanonical or forge-half"
