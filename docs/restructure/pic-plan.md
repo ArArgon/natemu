@@ -411,6 +411,26 @@ when the link is made would make them local. Dispatcher misses into the resident
 current (an L1 conflict or a table given away), 7.4 M to revalidate, 1.0 M new; exec loop 0.42 M, 1.7 M, 1.5 M. Sanity
 (uncontended, one each): slice 35.3 s, exec loop 7.2 s.
 
+Residual costs (November 11, after the final benchmark round):
+
+- Links from shared code into an absolute neighbour on its own page and frames (most links out of shared code: 84-91% of
+  shared-into-absolute links by the counting build) are made local by sharing that neighbour when the link is made (or
+  finding its translation); before, each such transition probed L1 at the target's address through the dispatcher slot,
+  and L1 conflicts missed into the resident (ASLR-off slice, counting build: 21.3 M misses finding the block current
+  against 17.8 M with PIC off; after, 18.7 M, and shared-into-absolute transitions 545 M -> 63 M).
+- Eligibility is decided at a template's first need (`UNSHAREABLE` marks failures); the study's counts (placed_pic,
+  frame_met, link classes) are in `pic-count` builds only; `sys_fast` searches its block once.
+- The check mode's no-local-link rule had applied to the program driver's code-shape runs too, so from the review fix on
+  the K1 programs made no local link (their "local" count was the same-page class, which slot-form links also have):
+  those runs now keep local links (`Control::pic_check_local`), and the K1 minimum counts real ones.
+- K1 `pic-cross`: an instance of a page-crossing block, its second page remapped (INVLPG of that page only), unmapped
+  and mapped back: passes (the INVLPG reaches the instance through its linear chains; revalidation compares both pages'
+  frames).
+- After (5 interleaved rounds, A = 87e4d6c, C = 83da7ae): ASLR-off slice still +3.0% (32.9 -> 33.9 s), slice -4.5%,
+  exec loop -54%, full build -20% (257.2 -> 205.1 s); the I/O matrix at 1 vCPU is lower by 7-11% on random reads in
+  every run (not noise: the five runs do not overlap); hackbench and locks at 4 vCPUs and the git group within noise. The
+  remaining ASLR-off and 1-vCPU I/O costs are not located yet.
+
 Not done in stage 3: a separate instance area and its eviction (stage 4), and the plan's I/O drain case. The windowless
 I/O code-page drain kills through the same frame chains as a code write posted by another vCPU, which K1 `pic-xwrite`
 covers at two or more vCPUs on the resident's side (the drain itself is not run); a case for the I/O suite remains: a
