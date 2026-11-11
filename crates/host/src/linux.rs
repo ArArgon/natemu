@@ -446,6 +446,7 @@ impl Prepared {
                     hits_by_source: compiler.hits_by_source.to_vec(),
                     duplicates: compiler.duplicates,
                     lock_wait: compiler.lock_wait.into(),
+                    recompiled: compiler.recompiled,
                 };
                 match log.finish(
                     end,
@@ -725,6 +726,7 @@ struct VcpuState {
     hits_by_source: Vec<u64>,
     duplicates: u64,
     lock_wait: [u64; 2],
+    recompiled: [u64; 2],
 }
 
 #[cfg(test)]
@@ -765,9 +767,10 @@ mod report_tests {
             hits_by_source: (0..64).map(|_| next()).collect(),
             duplicates: next(),
             lock_wait: [next(), next()],
+            recompiled: [next(), next()],
         };
         let old = format!(
-            "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}]}}",
+            "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}],\"recompiled\":[{},{}]}}",
             v.blocks,
             v.l2_hits,
             v.requests,
@@ -796,7 +799,9 @@ mod report_tests {
             v.hits_by_source,
             v.duplicates,
             v.lock_wait[0],
-            v.lock_wait[1]
+            v.lock_wait[1],
+            v.recompiled[0],
+            v.recompiled[1]
         );
         let old: serde_json::Value = serde_json::from_str(&old).unwrap();
         assert_eq!(old, serde_json::to_value(&v).unwrap());

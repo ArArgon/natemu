@@ -531,7 +531,15 @@ pub fn shadow_resets(area: Area) -> u64 {
 /// (`memory_types`: {"UC": n, ...}, the types with a non-zero count) and its UC accesses (`uncached`: instructions run
 /// alone for one, the resident's own).
 pub fn k1_stats(area: Area) -> K1 {
-    K1::new(&area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL))
+    let mut k = K1::new(&area.read_record(cache::LOOKUP_OFFSET + cache::CONTROL));
+    k.pic_transitions = pic_transitions(area);
+    k
+}
+/// PIC study: a `pic-count` resident's linked transitions by class (same page, cross-page, position-independent into
+/// absolute, absolute into position-independent), counted in four guest-state fields no generated code uses (the
+/// resident's `cache::stub`); zero from other residents.
+fn pic_transitions(area: Area) -> [u64; 4] {
+    [0x0, 0x8, 0x10, 0xb0].map(|at| u64::from_le_bytes(area.read::<8>(exec::FRAME_OFFSET + at)))
 }
 /// [`k1_stats`]: a vCPU's TLB, code-cache and system-instruction counters (times in us).
 #[derive(Debug, Default, serde::Serialize)]
@@ -564,6 +572,9 @@ pub struct K1 {
     slot_writes: u64,
     kept_resets: u64,
     systems: K1Systems,
+    /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).
+    pic: [u64; natemu_abi::pic::count::COUNTS],
+    pic_transitions: [u64; 4],
 }
 #[derive(Debug, Default, serde::Serialize)]
 struct K1Uncached {
@@ -655,6 +666,8 @@ impl K1 {
                     .zip(c.sys_fast_declined)
                     .collect(),
             },
+            pic: c.pic_counts,
+            pic_transitions: [0; 4],
         }
     }
 }
@@ -843,19 +856,35 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     p.offset, b.rip
                 )
             };
-            if w == p.word {
+            // PIC study stage 2: a position-independent block's point may be linked in the `svc` word after its move, to
+            // the target's full entry; its first word is then as admitted (rewritten).
+            let (at, w, full) = if w == p.word && b.flags & cache::PIC != 0 {
+                let svc = u64::from(b.code)
+                    + natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p);
+                match word(svc) {
+                    natemu_abi::pic::SVC_LINK => continue,
+                    w => (svc, w, true),
+                }
+            } else if w == p.word {
                 continue;
-            }
+            } else {
+                (at, w, false)
+            };
             if w & 0xfc00_0000 != 0x1400_0000 {
                 return Err(bad());
             }
             let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
             match blocks.iter().position(|t| {
                 t.flags & cache::SYSTEM == 0
-                    && u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to
+                    && to
+                        == if full {
+                            (t.full_entry() - cache::CODE_VA) * u64::from(t.flags & cache::PIC != 0)
+                        } else {
+                            u64::from(t.code) + u64::from(exec::ENTRY_OFFSET)
+                        }
             }) {
                 Some(t) if blocks[t].rip == p.target && blocks[t].context == b.context => {
-                    linked.insert((b.number, p.offset), t)
+                    linked.insert((b.number, (at - u64::from(b.code)) as u32), t)
                 }
                 _ => return Err(bad()),
             };
@@ -869,13 +898,23 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         let Some(b) = blocks.get(r.source as usize) else {
             return false;
         };
+        // (PIC study stage 2: or the `svc` word after its move, `svc #LINK` as admitted.)
+        let svc = |p: &exec::LinkPoint| {
+            b.flags & cache::PIC != 0
+                && natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p)
+                    == u64::from(r.offset)
+        };
         let point = b
             .links
             .iter()
-            .find(|p| p.offset == r.offset && p.offset != 0);
+            .find(|p| p.offset != 0 && (p.offset == r.offset || svc(p)));
         linked.get(&(r.source, r.offset)) == Some(&(r.target as usize))
             && point.is_some_and(|p| {
-                p.word == r.original
+                (if p.offset == r.offset {
+                    p.word
+                } else {
+                    natemu_abi::pic::SVC_LINK
+                }) == r.original
                     && blocks
                         .get(r.target as usize)
                         .is_some_and(|t| t.rip == p.target)
@@ -1528,6 +1567,19 @@ struct Entry {
     answer: Answer,
 }
 impl Entry {
+    /// PIC study: what makes it the same answer (its key with `limit`, gating values read, bytes read), hashed: a later
+    /// compile with this fingerprint is one of an answer the map dropped.
+    fn fingerprint(&self, limit: Option<u32>) -> u64 {
+        let k = key(limit, self.rip, &self.prefix[..LEAD.min(self.prefix.len())]);
+        let read: Vec<u64> = (0..GATING)
+            .filter(|&i| self.read & 1 << i != 0)
+            .map(|i| self.gating[i])
+            .collect();
+        std::hash::BuildHasher::hash_one(
+            &std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(),
+            (k, self.read, read, &self.prefix, self.whole),
+        )
+    }
     /// Bytes it keeps (the memory cache's bound).
     fn size(&self) -> usize {
         size_of::<Self>()
@@ -1647,6 +1699,9 @@ pub struct Answers {
     shards: [Mutex<Shard>; SHARDS],
     /// Per shard: nanoseconds waited for its lock and the waits (a lock taken at the first try is not timed).
     waits: [[AtomicU64; 2]; SHARDS],
+    /// PIC study: the fingerprints ([`Entry::fingerprint`]) of the answers dropped with a generation, with their owners, until
+    /// compiled again ([`Answers::recompiled`]).
+    dropped: Mutex<HashMap<u64, u8>>,
 }
 impl Answers {
     pub(crate) fn new(supported: u64) -> Arc<Self> {
@@ -1655,6 +1710,7 @@ impl Answers {
             pick: Universal::default(),
             shards: std::array::from_fn(|_| Mutex::default()),
             waits: Default::default(),
+            dropped: Mutex::default(),
         })
     }
     /// The shard of `limit` and `rip`, locked, and the nanoseconds waited for it.
@@ -1688,7 +1744,7 @@ impl Answers {
         };
         let (entry, dropped) = shard.take(f, limit);
         drop(shard);
-        drop(dropped); // freed unlocked
+        self.forget(dropped); // freed unlocked
         (Some(entry), waited)
     }
     /// Keeps `entry`, made for `bytes` at `rip`; returns the owner of a matching answer the map held already (perf chunk 13:
@@ -1706,8 +1762,27 @@ impl Answers {
             .map(|f| shard.at(f).owner);
         let dropped = shard.insert(limit, entry);
         drop(shard);
-        drop(dropped); // freed unlocked
+        self.forget(dropped); // freed unlocked
         (held, waited)
+    }
+    /// Notes the fingerprints of a dropped generation's answers, then frees them.
+    fn forget(&self, dropped: Option<Cache>) {
+        let Some(d) = dropped else { return };
+        let mut set = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, v) in &d {
+            let limit = (k.0 != 1 << 32).then_some(k.0 as u32);
+            for e in v {
+                set.insert(e.fingerprint(limit), e.owner);
+            }
+        }
+    }
+    /// PIC study: `entry`, just compiled, is an answer the map dropped: the owner of the dropped one.
+    fn recompiled(&self, limit: Option<u32>, entry: &Entry) -> Option<u8> {
+        let mut set = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        if set.is_empty() {
+            return None;
+        }
+        set.remove(&entry.fingerprint(limit))
     }
     /// Bytes and entries kept.
     fn kept(&self) -> (usize, usize) {
@@ -1783,6 +1858,8 @@ pub struct Compiler {
     pub hits_by_source: [u64; cache::MAX_VCPUS],
     pub duplicates: u64,
     pub lock_wait: (u64, u64),
+    /// PIC study: compiles of an answer the memory cache had dropped, and of them of this vCPU's own.
+    pub recompiled: [u64; 2],
     /// Answers kept for another RIP and used at this one (perf chunk 4: [`crate::relocation`]); answers that could not be
     /// (compiled instead); relocated objects admission refused (compiled instead, logged; none expected); fresh compiles
     /// made by the reuse check.
@@ -1793,6 +1870,9 @@ pub struct Compiler {
     /// Debug check (the program driver's `--code-shape` or `--check-reuse`, `boot-linux --check-reuse`): every answer used at
     /// another RIP than its own is also compiled there, and the two must be equal (else a host error).
     pub check_reuse: bool,
+    /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
+    /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|all` overrides it.
+    pub pic: u64,
     /// How long one request may wait for the server's whole reply (the first one includes the server's start); then the
     /// server is killed and the run fails with a host error ([`COMPILE_DEADLINE`] by default).
     pub deadline: Duration,
@@ -1919,12 +1999,14 @@ impl Compiler {
             disk_hits: 0,
             hits_by_source: [0; cache::MAX_VCPUS],
             duplicates: 0,
+            recompiled: [0; 2],
             lock_wait: (0, 0),
             relocated: 0,
             relocation_refused: 0,
             relocation_fallbacks: 0,
             reuse_checks: 0,
             check_reuse: false,
+            pic: cache::PIC_USER,
             deadline: COMPILE_DEADLINE,
             slowest: Duration::ZERO,
             shape: false,
@@ -2050,6 +2132,13 @@ impl Compiler {
             // Perf chunk 13: the lookup found nothing and another vCPU kept a matching answer while this one compiled.
             if disk && self.compiles > compiles && held.is_some_and(|o| o != self.vcpu) {
                 self.duplicates += 1;
+            }
+            // PIC study: fexc compiled again an answer the map had dropped (by this vCPU's own: `.1`).
+            if self.compiles > compiles {
+                if let Some(owner) = self.answers.recompiled(limit, &entry) {
+                    self.recompiled[0] += 1;
+                    self.recompiled[1] += u64::from(owner == self.vcpu);
+                }
             }
             self.read = end;
             self.charge(crate::perf::KEEP, t);
@@ -2671,6 +2760,14 @@ pub fn run(
     };
     let control = cache::LOOKUP_OFFSET + cache::CONTROL;
     area.write_record(control + std::mem::offset_of!(cache::Control, reuse), mode);
+    let pic = match std::env::var("NATEMU_PIC").as_deref() {
+        Ok("off") => cache::PIC_OFF,
+        Ok("user") => cache::PIC_USER,
+        Ok("all") => cache::PIC_ALL,
+        Ok(other) => return Err(format!("NATEMU_PIC={other}: off, user or all")),
+        Err(_) => compiler.pic,
+    };
+    area.write_record(control + std::mem::offset_of!(cache::Control, pic), pic);
     area.write_record(
         control + std::mem::offset_of!(cache::Control, reuse_fences),
         fences,
@@ -3233,7 +3330,7 @@ mod tests {
             })
             .collect();
         format!(
-            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}}}}",
+            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}},\"pic\":{:?},\"pic_transitions\":{:?}}}",
             c.cr3_loads,
             c.global_flushes,
             c.invlpgs,
@@ -3276,7 +3373,9 @@ mod tests {
             kinds.join(","),
             from.join(","),
             c.system_chained,
-            declined.join(",")
+            declined.join(","),
+            c.pic_counts,
+            pic_transitions(area)
         )
     }
 
