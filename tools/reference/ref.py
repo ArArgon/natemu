@@ -412,7 +412,8 @@ def _cache():
     faults-1 or the three loop-fault sizes do, skips the container. Only runs with the original annotation check are cached."""
     root = os.environ.get('NATEMU_RAW_ROOT')
     if os.environ.get('NATEMU_REF_CACHE') == 'off' or not root or check_annotations.__name__ != 'check_annotations': return None
-    db = sqlite3.connect(pathlib.Path(root) / 'ref-cache.sqlite', timeout=120)
+    db = sqlite3.connect(pathlib.Path(root) / 'ref-cache.sqlite', timeout=300)
+    db.execute('pragma journal_mode=wal')
     db.execute('create table if not exists r (k text primary key, v text)')
     return db
 
@@ -429,7 +430,7 @@ def run_programs(programs, workdir, qemu):
     require(digest == PINS['qemu-x86_64-static'], 'QEMU binary does not match the pinned hash')
     progs = [norm(p) for p in programs]
     backend = os.environ.get('NATEMU_REFERENCE_BACKEND', 'docker')
-    db, hits = _cache(), {}
+    db, hits, new = _cache(), {}, []
     keys = [_key(p, digest, backend) for p in programs] if db else []
     for i, k in enumerate(keys):
         row = db.execute('select v from r where k = ?', (k,)).fetchone()
@@ -498,13 +499,16 @@ done
                        | ({'cpu': p['cpu']} if p['cpu'] != 'qemu64' else {})
                        | ({'executed_insns': len(executed)} if p['flow'] else {})
                        | ({'fault': fault, 'path_ix': path_ix} if fault else {}))
-        if db and json.loads(json.dumps(results[-1])) == results[-1]: db.execute('insert or replace into r values (?, ?)', (keys[i], json.dumps(results[-1])))
-    if db: db.commit(); db.close()
+        if db and json.loads(json.dumps(results[-1])) == results[-1]: new.append((keys[i], json.dumps(results[-1])))
+    if db:      # one short write transaction after the parse loop, so parallel steps rarely meet 'database is locked'
+        db.executemany('insert or replace into r values (?, ?)', new); db.commit(); db.close()
     prov = {'format': FORMAT, 'image': APPLE_IMAGE if backend == 'apple' else IMAGE, 'container_backend': backend,
             'qemu_sha256': digest, 'qemu_package': 'qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 arm64',
             'qemu_argv': [('/reference/' + qemu.name) if backend == 'apple' else '/qemu', '-cpu', 'qemu64', '-d', 'in_asm', '-D', 'qemu.log', 'prog.elf'],
             'rflags_fixed_bits': hx(flags.FIXED)}
+    prov['cache_hits'] = len(hits)      # results served from the reference cache (not run in this call's container)
     if backend == 'apple' and (workdir / 'container.kernel').exists(): prov['container_kernel'] = (workdir / 'container.kernel').read_text().strip()
+    elif backend == 'apple': prov['container_kernel'] = 'cached (all results from the reference cache)'
     return results, prov
 
 
