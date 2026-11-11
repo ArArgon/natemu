@@ -2779,6 +2779,10 @@ fn guest_fault(
     [vector, cr2, error]: [u64; 3],
 ) -> ! {
     bank_at(&mut s, f, b, site);
+    // The crash tripwire: a user-mode fault in generated code that looks like a crash, noted with its block.
+    if s.cpu.cpl == 3 && (vector == 6 || vector == 13 || (vector == 14 && cr2 < 0x1_0000)) {
+        cache::trip(b, s.cpu.rip, vector | error << 8, cr2, s.cpu.cr3);
+    }
     deliver(&mut s, Event::Exception([vector, error, cr2]));
     unsafe { dispatch(&mut s) }
 }

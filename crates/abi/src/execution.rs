@@ -639,6 +639,12 @@ pub mod cache {
         /// code-shape runs, whose programs check their values: the K1 programs are local links' tests); unset (the
         /// `--check-reuse` boots), none is made: code reached only through one would never be compared at its address.
         pub pic_check_local: u64,
+        /// Crash tripwire: the last [`TRIP_ENTRIES`] user-mode faults in generated code that look like a crash (#UD, #GP, a #PF below 64
+        /// KiB) as delivered (`cache::trip`): RIP, vector | error << 8, CR2, the block found current at RIP (its
+        /// flags | translation << 32, its code's RIP), the page-base slot, CR3, and its link points' targets' low 16 bits
+        /// (four, packed); `trip_count` counts them all. The host prints them at the vCPU's end.
+        pub trip: [[u64; 8]; TRIP_ENTRIES],
+        pub trip_count: u64,
     }
     pub const PIC_TEST_AND: u64 = 1;
     pub const PIC_TEST_STR: u64 = 2;
@@ -646,6 +652,8 @@ pub mod cache {
     pub const PIC_TEST_SVC: u64 = 4;
     pub const PIC_TEST_FORGE: u64 = 5;
     pub const PIC_FORGES: u64 = 4;
+    /// [`Control::trip`]'s entries.
+    pub const TRIP_ENTRIES: usize = 8;
     /// A diagnosis mode: no local link is made (every link with shared code goes through the dispatcher slot).
     pub const PIC_TEST_NOLOCAL: u64 = 8;
     /// As [`PIC_TEST_FORGE`], the slot's bit 47 flipped (a non-canonical base).

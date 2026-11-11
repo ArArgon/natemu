@@ -1053,6 +1053,25 @@ fn poison(b: &Block, code: &mut [u8]) {
         code[at..at + 8].copy_from_slice(&POISON.to_le_bytes());
     }
 }
+/// The crash tripwire ([`Control::trip`]): one user-mode fault at `rip` in block `b` (the code that ran: a shared
+/// translation's when shared).
+pub fn trip(b: &Block, rip: u64, vector: u64, cr2: u64, cr3: u64) {
+    let c = control();
+    let targets = b
+        .links
+        .iter()
+        .enumerate()
+        .fold(0, |t, (k, p)| t | (p.target & 0xffff) << (16 * k));
+    let (flags, code_rip) = (u64::from(b.flags) | u64::from(b.shared) << 32, b.rip);
+    let slot = unsafe {
+        (natemu_abi::execution::FRAME_VA as *const u64)
+            .byte_add(natemu_abi::execution::frame::PAGE_BASE as usize)
+            .read_volatile()
+    };
+    c.trip[c.trip_count as usize % c.trip.len()] =
+        [rip, vector, cr2, flags, code_rip, slot, cr3, targets];
+    c.trip_count += 1;
+}
 /// [`poison`]'s value.
 pub const POISON: u64 = 0x8000_dead_beef_0000;
 /// PIC study (`pic-count` builds): a user block's first frame met at its first linear page in this TLB epoch (one address space): counted
