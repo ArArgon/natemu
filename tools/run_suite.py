@@ -130,6 +130,7 @@ def steps(F, O):
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
     for n, est in ((1, 150), (2, 280), (3, 320), (4, 200)): vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, est=est)
+    vm('pic', 'run_pic.py', '--cpus', 1, 2, est=900)   # PIC study stage 2: stops at each entry word, svc-word links, a forged slot
     vm('m1', 'run_m1.py')
     vm('l3', 'run_l3.py')
     vm('l4a', 'run_l4a.py', '--only', 'qemu,xapic,halt,lint1')

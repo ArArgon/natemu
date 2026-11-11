@@ -354,6 +354,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 ),
                 shootdowns: s.shootdowns,
                 fault: format!("{:x?}", s.fault),
+                native: s.native.map(Hex),
                 state: CpuReport::new(&s.cpu),
             }
         })
@@ -577,6 +578,8 @@ struct VcpuReport {
     mailbox: (Hex, u64, u64, u64),
     shootdowns: u64,
     fault: String,
+    /// The resident's detail of its stop (`State::native`: e.g. a reuse mismatch's RIP, code offset and failed checks).
+    native: [Hex; 3],
     state: CpuReport,
 }
 /// The placement and the entry state.
@@ -739,7 +742,7 @@ mod tests {
         let acked = v.mailbox.2;
         let compiles = v.compiles;
         format!(
-            "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"requests\":{},\"reuse\":[{},{:?},{}],\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"state\":{}}}",
+            "{{\"stop\":\"{}\",\"rip\":{},\"blocks\":{},\"compiles\":{compiles},\"requests\":{},\"reuse\":[{},{:?},{}],\"halts\":{},\"interrupts\":{},\"mailbox\":[{},{},{acked},{}],\"shootdowns\":{},\"fault\":\"{:x?}\",\"native\":[{},{},{}],\"state\":{}}}",
             stop.replace('"', "'"),
             hex(v.rip.0),
             v.blocks,
@@ -754,6 +757,9 @@ mod tests {
             v.mailbox.3,
             v.shootdowns,
             fault,
+            hex(v.native[0].0),
+            hex(v.native[1].0),
+            hex(v.native[2].0),
             cpu_json(c)
         )
     }
@@ -770,6 +776,7 @@ mod tests {
             mailbox: (Hex(0xfee0_0000), 18, 19, 20),
             shootdowns: 21,
             fault: format!("{fault:x?}"),
+            native: [Hex(1), Hex(0x22), Hex(0x333)],
             state: CpuReport::new(c),
         }
     }

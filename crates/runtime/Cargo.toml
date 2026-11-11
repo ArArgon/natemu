@@ -12,7 +12,8 @@ natemu-abi = { path = "../abi" }
 perf = []
 # Isolated scheduling fixtures; no calls or metadata accesses when disabled.
 io-test-hooks = []
-# PIC study stage 1: links enter their targets through counting stubs (`cache::stub`), for linked transitions by class.
+# PIC study stage 1, measurement builds only: links enter their targets through counting stubs (`cache::stub`), for linked
+# transitions by class. The stubs use guest-state fields and links the program driver's checks refuse: no suite runs them.
 pic-count = []
 
 [[bin]]

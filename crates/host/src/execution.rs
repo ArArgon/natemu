@@ -856,17 +856,15 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     p.offset, b.rip
                 )
             };
-            // PIC study stage 2: a position-independent block's point may be linked in the `svc` word after its move, to
-            // the target's full entry; its first word is then as admitted (rewritten).
-            let (at, w, full) = if w == p.word && b.flags & cache::PIC != 0 {
+            // PIC study stage 2: a point may be linked in the `svc` word after its move, to a position-independent
+            // target's full entry; its first word is then as admitted.
+            let (at, w, full) = if w == p.word {
                 let svc = u64::from(b.code)
                     + natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p);
                 match word(svc) {
                     natemu_abi::pic::SVC_LINK => continue,
                     w => (svc, w, true),
                 }
-            } else if w == p.word {
-                continue;
             } else {
                 (at, w, false)
             };
@@ -874,16 +872,25 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 return Err(bad());
             }
             let to = at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64);
+            // The form is the design's: into a position-independent target, the `svc` word, unless the source is
+            // position-independent and starts on the target's page (then the first word, the base being the same).
+            let pic = |t: &cache::Block| t.flags & cache::PIC != 0;
+            let form =
+                |t: &cache::Block| full == (pic(t) && !(pic(b) && b.rip >> 12 == t.rip >> 12));
             match blocks.iter().position(|t| {
                 t.flags & cache::SYSTEM == 0
                     && to
                         == if full {
-                            (t.full_entry() - cache::CODE_VA) * u64::from(t.flags & cache::PIC != 0)
+                            t.full_entry() - cache::CODE_VA
                         } else {
                             u64::from(t.code) + u64::from(exec::ENTRY_OFFSET)
                         }
             }) {
-                Some(t) if blocks[t].rip == p.target && blocks[t].context == b.context => {
+                Some(t)
+                    if blocks[t].rip == p.target
+                        && blocks[t].context == b.context
+                        && form(&blocks[t]) =>
+                {
                     linked.insert((b.number, (at - u64::from(b.code)) as u32), t)
                 }
                 _ => return Err(bad()),
@@ -900,9 +907,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         };
         // (PIC study stage 2: or the `svc` word after its move, `svc #LINK` as admitted.)
         let svc = |p: &exec::LinkPoint| {
-            b.flags & cache::PIC != 0
-                && natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p)
-                    == u64::from(r.offset)
+            natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p) == u64::from(r.offset)
         };
         let point = b
             .links
@@ -2768,6 +2773,24 @@ pub fn run(
         Err(_) => compiler.pic,
     };
     area.write_record(control + std::mem::offset_of!(cache::Control, pic), pic);
+    // PIC study stage 2 tests (`cache::Control::pic_test`).
+    let test = match std::env::var("NATEMU_PIC_TEST").as_deref() {
+        Err(_) | Ok("") => 0,
+        Ok("and") => cache::PIC_TEST_AND,
+        Ok("str") => cache::PIC_TEST_STR,
+        Ok("body") => cache::PIC_TEST_BODY,
+        Ok("svc") => cache::PIC_TEST_SVC,
+        Ok("forge") => cache::PIC_TEST_FORGE,
+        Ok(other) => {
+            return Err(format!(
+                "NATEMU_PIC_TEST={other}: and, str, body, svc or forge"
+            ));
+        }
+    };
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, pic_test),
+        test,
+    );
     area.write_record(
         control + std::mem::offset_of!(cache::Control, reuse_fences),
         fences,

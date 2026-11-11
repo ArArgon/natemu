@@ -32,8 +32,6 @@ pub mod refusal {
     /// A move that is not one (not a move, outside the code, out of order or overlapping, a reserved register) or a link
     /// point no rewritten move of x0 starts.
     pub const MOVE: usize = super::count::MOVE;
-    /// The block's page is within [`super::REACH`] of a canonical edge (a copy only: its values might not be canonical).
-    pub const PLACE: usize = super::count::PLACE;
 }
 
 /// Counters (`Control::pic_counts`; PIC study stage 1, kept by the stages after it). User (CPL 3) blocks unless named.
@@ -42,7 +40,7 @@ pub mod count {
     pub const HOST: usize = 0;
     pub const NOT_TEMPLATE: usize = 1;
     /// User templates rewritten (stage 1: that would be); refused for a global mapping, a one-word move, a move out of
-    /// reach, a malformed move, a page near a canonical edge.
+    /// reach, a malformed move (`PLACE`: unused; copies refused near a canonical edge are perf chunk 10's `PLACE` kind).
     pub const ELIGIBLE: usize = 2;
     pub const GLOBAL: usize = 3;
     pub const ONE_WORD: usize = 4;
@@ -69,6 +67,10 @@ pub mod count {
     /// relocation list there: fexc chose other move lengths, which position-independent code does not depend on).
     pub const UNPROVED: usize = 19;
     pub const CHECK_SHAPE: usize = 20;
+    /// Stage 2: stops at a position-independent block's `and`, `str` and body entry (three counters from
+    /// `ENTRY_STOPS`), and at an armed `svc` word of a link point linked there.
+    pub const ENTRY_STOPS: usize = 21;
+    pub const SVC_STOPS: usize = 24;
     pub const COUNTS: usize = 32;
 }
 
@@ -141,6 +143,11 @@ pub fn reaches(base: u64) -> bool {
 fn word(code: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(code[at..at + 4].try_into().unwrap())
 }
+/// The word at `at`, 0 (`udf`) past the code: what [`svc_slot`] and [`link_point`] read, so that they stop there.
+fn word_in(code: &[u8], at: u64) -> u32 {
+    code.get(at as usize..(at as usize).saturating_add(4))
+        .map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()))
+}
 /// The move of `reg` at `at` in `code` (as admitted, at page `base`): its word count and its [`form`]. `Err`: the
 /// [`refusal`].
 fn one(code: &[u8], at: usize, reg: u32, base: u64) -> Result<(usize, [u32; 4]), usize> {
@@ -152,7 +159,9 @@ fn one(code: &[u8], at: usize, reg: u32, base: u64) -> Result<(usize, [u32; 4]),
     for (k, w) in words[..n].iter_mut().enumerate() {
         *w = word(code, at + 4 * k);
     }
-    let Some((n, v)) = move_value(&words[..n], reg) else {
+    // A 32-bit form (a value below 4 GiB) is refused, as perf chunk 10's rule refuses it: FEX would wrap such a value at 4
+    // GiB, the form at another base would not.
+    let Some((n, v)) = move_value(&words[..n], reg).filter(|_| words[0] >> 31 == 1) else {
         return Err(refusal::MOVE);
     };
     if n == 1 {
@@ -162,10 +171,10 @@ fn one(code: &[u8], at: usize, reg: u32, base: u64) -> Result<(usize, [u32; 4]),
         .map(|f| (n, f))
         .ok_or(refusal::REACH)
 }
-/// Whether the template `code` (admitted for `rip`; `relocs` packed, [`RELOC_MOVE`]) has a rewrite: each relocation in
-/// order, none starting inside the one before (as perf chunk 10's re-check), each move with a [`form`]. `Err`: the
-/// [`refusal`]; nothing is written.
-pub fn eligible(code: &[u8], relocs: &[u32], rip: u64) -> Result<(), usize> {
+/// Whether the template `code` (admitted for `rip`; `relocs` packed, [`RELOC_MOVE`]; its link points `links`) has a
+/// rewrite: each relocation in order, none starting inside the one before (as perf chunk 10's re-check), each move with a
+/// [`form`], every link point at a move of x0. `Err`: the [`refusal`]; nothing is written.
+pub fn eligible(code: &[u8], relocs: &[u32], links: &[LinkPoint], rip: u64) -> Result<(), usize> {
     let mut free = 0;
     for &r in relocs {
         let at = (r >> 6) as usize * 4;
@@ -182,6 +191,14 @@ pub fn eligible(code: &[u8], relocs: &[u32], rip: u64) -> Result<(), usize> {
         };
         free = at + 4 * n;
     }
+    let at_move = |o: u32| {
+        relocs
+            .iter()
+            .any(|&r| r & RELOC_MOVE != 0 && r & 31 == 0 && (r >> 6) * 4 == o)
+    };
+    if links.iter().any(|p| p.offset != 0 && !at_move(p.offset)) {
+        return Err(refusal::MOVE);
+    }
     Ok(())
 }
 /// Rewrites the template `code` (as admitted for `rip`, copied where it is placed; `relocs` packed and in order) into its
@@ -194,15 +211,7 @@ pub fn rewrite(
     links: &mut [LinkPoint; MAX_LINK_POINTS],
     rip: u64,
 ) -> Result<(), usize> {
-    eligible(code, relocs, rip)?;
-    let at_move = |o: u32| {
-        relocs
-            .iter()
-            .any(|&r| r & RELOC_MOVE != 0 && r & 31 == 0 && (r >> 6) * 4 == o)
-    };
-    if links.iter().any(|p| p.offset != 0 && !at_move(p.offset)) {
-        return Err(refusal::MOVE);
-    }
+    eligible(code, relocs, links, rip)?;
     for &r in relocs.iter().filter(|&&r| r & RELOC_MOVE != 0) {
         let at = (r >> 6) as usize * 4;
         let (n, f) = one(code, at, r & 31, rip & !0xfff)?;
@@ -288,7 +297,7 @@ pub fn proved(
             for (k, w) in words[..avail].iter_mut().enumerate() {
                 *w = word(original, at + 4 * k);
             }
-            let Some((n, v)) = move_value(&words[..avail], reg) else {
+            let Some((n, v)) = move_value(&words[..avail], reg).filter(|&(n, _)| n <= 4) else {
                 return false;
             };
             let mut new = [0; 4];
@@ -309,12 +318,13 @@ pub fn proved(
         && links
             .iter()
             .filter(|p| p.offset != 0)
-            .all(|p| link_point(|at| word(code, at as usize), len as u32, p, base))
+            .all(|p| link_point(|at| word_in(code, at), len as u32, p, base))
 }
 /// Perf chunk 10's copy for position-independent code: `code`, a rewritten block placed for `from` (link points `links`,
 /// maybe linked), copied for `to` (same half and page offset): its link points restored (first word, `svc` word) and
 /// their targets moved by `to - from`. Nothing else changes, so it is refused only where a [`form`]'s value might not be
-/// canonical ([`reaches`]) or the copy's place differs.
+/// canonical ([`reaches`]) or the copy's place differs. `Err`: perf chunk 10's kind ([`crate::execution::refusal`]: `PLACE`, or
+/// `LINK` for a link point that is not one).
 pub fn relocate(
     code: &mut [u8],
     links: &mut [LinkPoint; MAX_LINK_POINTS],
@@ -326,26 +336,24 @@ pub fn relocate(
         || !reaches(to & !0xfff)
         || !to.checked_add(guest_bytes.into()).is_some_and(canonical)
     {
-        return Err(refusal::PLACE);
+        return Err(crate::execution::refusal::PLACE);
     }
     let d = to.wrapping_sub(from);
     let size = code.len();
     for p in links.iter_mut().filter(|p| p.offset != 0) {
         let at = p.offset as usize;
         if at % 4 != 0 || at + 4 > size || p.word != load_base(0) {
-            return Err(refusal::MOVE);
+            return Err(crate::execution::refusal::LINK);
         }
         code[at..at + 4].copy_from_slice(&p.word.to_le_bytes());
-        let svc = svc_slot(|o| word(code, o as usize), p) as usize;
+        let svc = svc_slot(|o| word_in(code, o), p) as usize;
         if svc + 4 > size {
-            return Err(refusal::MOVE);
+            return Err(crate::execution::refusal::LINK);
         }
         code[svc..svc + 4].copy_from_slice(&SVC_LINK.to_le_bytes());
         p.target = p.target.wrapping_add(d);
-        if !canonical(p.target)
-            || !link_point(|o| word(code, o as usize), size as u32, p, to & !0xfff)
-        {
-            return Err(refusal::MOVE);
+        if !canonical(p.target) || !link_point(|o| word_in(code, o), size as u32, p, to & !0xfff) {
+            return Err(crate::execution::refusal::LINK);
         }
     }
     Ok(())
@@ -433,7 +441,7 @@ mod tests {
             word: m0[0],
             target: rip + 0x2000,
         };
-        assert_eq!(eligible(&original, &relocs, rip), Ok(()));
+        assert_eq!(eligible(&original, &relocs, &links, rip), Ok(()));
         let mut code = original.clone();
         assert_eq!(rewrite(&mut code, &relocs, &mut links, rip), Ok(()));
         assert_eq!(links[0].word, load_base(0));
@@ -488,11 +496,11 @@ mod tests {
         let mut l = links;
         assert_eq!(
             relocate(&mut code.clone(), &mut l, rip, 0x7fff_ffff_0100, 0x40),
-            Err(refusal::PLACE)
+            Err(crate::execution::refusal::PLACE)
         );
         assert_eq!(
             relocate(&mut code.clone(), &mut l, rip, to + 8, 0x40),
-            Err(refusal::PLACE)
+            Err(crate::execution::refusal::PLACE)
         );
         // Refusals of the rewrite: a one-word move, a move out of reach, a link point at no move.
         let one: Vec<u8> = [0u32, 0x9280_0005, NOP]
@@ -500,7 +508,7 @@ mod tests {
             .flat_map(|w| w.to_le_bytes())
             .collect();
         assert_eq!(
-            eligible(&one, &[1 << 6 | RELOC_MOVE | 5], rip),
+            eligible(&one, &[1 << 6 | RELOC_MOVE | 5], &[], rip),
             Err(refusal::ONE_WORD)
         );
         let (far, nf) = load_constant(rip + REACH, 5);
@@ -510,8 +518,20 @@ mod tests {
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
         assert_eq!(
-            eligible(&far, &[1 << 6 | RELOC_MOVE | 5], rip),
+            eligible(&far, &[1 << 6 | RELOC_MOVE | 5], &[], rip),
             Err(refusal::REACH)
+        );
+        // A 32-bit form (a value below 4 GiB, near a 4 GiB base), as perf chunk 10 refuses it.
+        let (low, nl) = load_constant(0x1234_5678, 5);
+        assert_eq!((nl, low[0] >> 31), (2, 0));
+        let low: Vec<u8> = [0]
+            .iter()
+            .chain(&low[..nl])
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+        assert_eq!(
+            eligible(&low, &[1 << 6 | RELOC_MOVE | 5], &[], 0x1234_0100),
+            Err(refusal::MOVE)
         );
         let mut l = links;
         l[0].offset = 16;

@@ -52,6 +52,11 @@ def cases():
     for name, insn in forms:
         add(name, insn, {7: FRAME + 0x800})
     add('cmpxchg16b-ds', 'lock cmpxchg16b [rdi]', {7: FRAME + 0x800})
+    # PIC study: the position-independent page base (FEX's `rip` field, natemu_abi frame::PAGE_BASE) is no more reachable
+    # than the rest of the page, whatever the value stored (the program driver runs every template rewritten).
+    for name, value in [('user', 0x7f1234567000), ('noncanonical', 0x800000000000), ('kernel-half', 0xffffffff80000000)]:
+        add('pic-slot-store-' + name, 'mov qword ptr [rdi], rax', {7: FRAME + 0x18, 0: value})
+    add('pic-slot-load', 'mov rax, qword ptr [rdi]', {7: FRAME + 0x18})
     add('cmpxchg16b-ss', 'lock cmpxchg16b [rsp]', {4: FRAME + 0x800}, fault=12)
     add('cmpxchg16b-misaligned-ss', 'lock cmpxchg16b [rsp]', {4: FRAME + 0x801})
     # Effective-address formation, including bases which are not themselves final linear addresses.
