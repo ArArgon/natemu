@@ -44,18 +44,19 @@ SERIAL_WHY = {
     'm2-litmus-cost': 'the WB store-buffering control must show the non-SC outcome (vCPUs truly concurrent); cost in ns',
     'l4a-stress': 'failed twice in the parallel phase, never alone: a vCPU stopped by the guest watchdog (random 0-255 us '
                   'delays between line changes)',
-    'k1-c4': 'each run killed after 300 s: link-full at 4 vCPUs, block size 1, exceeded it in the parallel phase at -j 6',
+    'k1-c4': 'each run killed after 300 s: link-full at 4 vCPUs, block size 1, exceeded it in the parallel phase at -j 6 (par k1 steps now take one slot per vCPU and a 450 s kill: oversubscribed P cores were the cause)',
     'boot-smoke': 'Ctrl-C must end the stub within 5 s; boots under a 120 s timeout',
     'vector-split-smp': 'three vCPUs exercise split-lock ownership and vector completion concurrently',
 }
 
 
 # Steps that may run on the efficiency cores (`taskpolicy -c background`): single-VM runners that compare final state with
-# QEMU and have no wall-clock bound, no watchdog expected to fire, no vCPUs racing each other and no run timeout a 4x slower
-# core could exceed. Everything else (multi-vCPU, watchdog, kicker, timing, the 300 s run limits of k1) stays on the
+# QEMU and have no wall-clock bound the step itself asserts, no watchdog expected to fire and no vCPUs racing each other (their
+# runner timeouts, where any, are far above the 2.4-4x slowdown). Kept on P: pytests (test_vm_lock sleeps, test_check_setup's 50 ms
+# deadline) and i5b (QEMU runs killed at 30/60 s). Everything else (multi-vCPU, watchdog, kicker, timing, the 300 s run limits of k1) stays on the
 # performance cores. Measured November 10 (docs/implementation.md "Faster suite runs").
-E_OK = ('fix*', 'seed*', 'i7*', 'i8*', 'i9*', 'i10*', 'i6*', 'i5c*', 'adx*', 'xsave*', 'rex*', 'br66*', 'sha*', 'flow', 'icebp',
-        'faults*', 'loopfaults-*', 'instruction-gaps*', 'cpu-forms', 'frame-*', 'maskmovq*', 'i5b-*', 'vector-ac', 'pytests')
+E_OK = ('fix*', 'seed*', 'i7*', 'i8*', 'i9*', 'i10*', 'i6*', 'i5c*', 'adx*', 'xsave*', 'rex*', 'br66*', 'sha', 'sha-1', 'flow', 'icebp',
+        'faults*', 'loopfaults-*', 'instruction-gaps*', 'cpu-forms', 'frame-*', 'maskmovq*', 'vector-ac')
 SHARDS = {'faults': 5, 'i7-faults': 2, 'loopfaults': 3, 'probes': 2, 'k1': {1: 1, 2: 2, 3: 3, 4: 1}}   # parts of about 100 s
 PROBES_EST, CORPORA_EST = 900, {2: 160, 3: 135, 4: 200}
 # Seconds of the long indivisible steps in the November 10 runs (-j 4 -e 6, machine busy): the k1 link-full case (one run, 220-385 s)
@@ -69,7 +70,7 @@ QUICK = ('build', 'cargo-test', 'cargo-test-fexc', 'runtime', 'l1', 'l2', 'l2-ia
          'i8b', 'i9', 'i10', 'i7-cpl0', 'xsave', 'i6-faults', 'i10-faults', 'i5c', 'i6b-cases', 'flow', 'asm', 'faults@1', 'i7-faults@1',
          'loopfaults-default@1', 'probes@1', 'corpora-c2', 'smp', 'limits', 'litmus', 'events', 'privilege', 'delivery', 'm3',
          'k1-c1', 'k1-c2@1', 'k2-cost', 'k2-gather', 'nostop-*', 'x3-qemu', 'x3-cases', 'x4', 'm1', 'm2', 'l3', 'l4a', 's4', 'x1', 'r1a', 'r1b-c2',
-         'i5b-images', 'l4b', 'contain', 'boot-smoke', 'kicks')
+         'i5b-images', 'instruction-gaps', 'vector-split-smp', 'i8-faults', 'i9-faults', 'i6b', 'system', 'coherence', 'sharedpt', 'fix-1', 'i6-faults-1', 'l4b', 'contain', 'boot-smoke', 'kicks')
 
 
 @dataclasses.dataclass
@@ -162,8 +163,8 @@ def steps(F, O):
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
     for n, est in ((1, 80), (2, 215), (3, 275), (4, 155)):
-        if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, *(() if n == 4 else ('--timeout', 900)), est=est)     # c4 serial: its runs time out at 300 s under load
-        else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 900, est=est)
+        if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, *(() if n == 4 else ('--timeout', 450)), est=est, w=n)     # c4 serial: its runs time out at 300 s under load
+        else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 450, est=est, w=n)
     vm('pic', 'run_pic.py', '--cpus', 1, 2, est=900)   # PIC study stage 2: stops at each entry word, svc-word links, a forged slot
     vm('m1', 'run_m1.py')
     vm('l3', 'run_l3.py')
