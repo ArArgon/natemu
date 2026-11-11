@@ -1804,6 +1804,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         compiler.shape = code_shape;
         // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
         compiler.check_reuse = code_shape || check_reuse;
+        // PIC study stage 2: the test programs run at CPL 0 too; every privilege level's templates are placed
+        // position-independent, so the suites run the rewritten code (`NATEMU_PIC` overrides).
+        compiler.pic = cache::PIC_ALL;
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
         let mut requests = execution::Requests {
             devices: Some(registry.clone()),
@@ -2992,13 +2995,14 @@ fn kick_report(area: Area, stops: &execution::Stops) -> Kicks {
 
 /// Checks that frame padding remains zero outside the admitted guest-state fields. Selected-alias deviation probes
 /// intentionally write that padding and must report false. Trusted frame-relative accesses include YMM_Hi128 (I8),
-/// KERNEL_GS_BASE (CPL-0 SWAPGS), CR2 (CPL-0 MOV CR2), and the GDT base/limit (CPL-0 VERW); ordinary guest accesses
+/// KERNEL_GS_BASE (CPL-0 SWAPGS), the PIC page base (written at every position-independent entry), CR2 (CPL-0 MOV CR2), and the GDT base/limit (CPL-0 VERW); ordinary guest accesses
 /// to the selected alias are not constrained by those instruction-specific admission rules.
 fn frame_intact(area: Area) -> bool {
     let frame: [u8; exec::frame::BYTES] = area.read_record(exec::FRAME_OFFSET);
     let field = |at: u32| at as usize..at as usize + 8;
     let admitted = |i: usize| {
         field(exec::frame::KERNEL_GS_BASE).contains(&i)
+            || field(exec::frame::PAGE_BASE).contains(&i)
             || field(exec::frame::CR2).contains(&i)
             || field(exec::frame::VERW_GDT_BASE).contains(&i)
             || field(exec::frame::VERW_GDT_LIMIT).contains(&i)

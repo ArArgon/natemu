@@ -24,6 +24,7 @@ pub mod guest_memory;
 pub mod half;
 pub mod lapic;
 pub mod paging;
+pub mod pic;
 pub mod resident;
 pub mod shadow;
 pub mod strings;

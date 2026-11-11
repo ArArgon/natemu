@@ -275,7 +275,7 @@ pub mod cache {
     pub const META_VA: u64 = PRIVATE + 0x2800_0000;
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = (HINTS + 4 * HINT_ENTRIES).next_multiple_of(BLOCK);
+    pub const LOOKUP_BYTES: usize = (PIC_FRAMES + 16 * PIC_FRAME_ENTRIES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + (1 << 30);
     pub const GLOBAL_BYTES: usize = (TABLE_PAGES + TABLE_PAGE_BYTES).next_multiple_of(BLOCK);
     /// Mapping granule of the areas.
@@ -334,6 +334,10 @@ pub mod cache {
     /// candidate: it is checked against the block's record on use, so nothing ever clears the table.
     pub const HINTS: usize = LINEAR_HEADS + 4 * LINEAR_BUCKETS;
     pub const HINT_ENTRIES: usize = 1 << 18;
+    /// PIC study stage 1 (counting, `crate::pic::count`): the linear page each frame was last met at as a user block's first
+    /// source page, by a hash of the frame ([`PIC_FRAME_ENTRIES`] of {frame page + 1 (u32), epoch's low 32 bits, linear page}).
+    pub const PIC_FRAMES: usize = HINTS + 4 * HINT_ENTRIES;
+    pub const PIC_FRAME_ENTRIES: usize = 1 << 16;
 
     /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident): one
     /// shadow-reset counter (u64) per vCPU and the per-vCPU [`Events`] in its first 64 KiB; then the per-page structures,
@@ -463,9 +467,10 @@ pub mod cache {
         /// Link records in use.
         pub links: u64,
         /// The armed stop ([`super::STOP_WORD`]): `armed` words of the interrupted block, each (code-area offset, its
-        /// word before the patch), restored at the next resident entry.
+        /// word before the patch), restored at the next resident entry (PIC study: a link point's first word and, linked
+        /// in its `svc` word, that word too).
         pub armed: u64,
-        pub armed_words: [[u32; 2]; super::MAX_LINK_POINTS + 1],
+        pub armed_words: [[u32; 2]; ARMED],
         /// Doorbells: IRQs acknowledged (spurious ones excluded), of which SGIs, and the CNTVCT ticks spent in their
         /// acknowledge and end (`ICC_IAR1_EL1` read to `ICC_EOIR1_EL1` write); SGIs sent to peers and the ticks of
         /// their `ICC_SGI1R_EL1` writes.
@@ -610,7 +615,19 @@ pub mod cache {
         /// frozen before any vCPU runs, so a claim never ends. Replaced round-robin (`claimed_next`). Appended.
         pub claimed_pages: [u64; CLAIMED_PAGES],
         pub claimed_next: u64,
+        /// PIC study counters ([`crate::pic::count`]). Appended.
+        pub pic_counts: [u64; crate::pic::count::COUNTS],
+        /// PIC study stage 2, set by the host before the vCPU runs: which templates are placed position-independent
+        /// ([`PIC_OFF`], [`PIC_USER`]: CPL-3 code only, the design's rule; [`PIC_ALL`]: every privilege level, a test mode
+        /// that runs the suites' CPL-0 programs through the rewritten code too). Appended.
+        pub pic: u64,
     }
+    /// [`Control::armed_words`]: two words per link point and the computed exit.
+    pub const ARMED: usize = 2 * super::MAX_LINK_POINTS + 1;
+    /// [`Control::pic`].
+    pub const PIC_OFF: u64 = 0;
+    pub const PIC_USER: u64 = 1;
+    pub const PIC_ALL: u64 = 2;
     pub const CLAIMED_PAGES: usize = 8;
     impl Control {
         #[inline(always)]
@@ -713,6 +730,14 @@ pub mod cache {
     /// copies): where its slow path would exit to its own start the resident runs the STI itself, and that exit (a link
     /// from the block to itself) is never linked.
     pub const STI_FIRST: u32 = 256;
+    /// PIC study: the block is position-independent ([`crate::pic`], stage 2): a template rewritten at its placement, or a
+    /// copy of one. Its code is placed [`PIC_LEAD`] bytes past a 64-byte boundary, the full entry's `and` in the word
+    /// before `code` and its `str` in the code header's word ([`Block::full_entry`]); its link points' first words are
+    /// the rewritten moves' `ldr x0`, so a link into it from elsewhere patches the `svc` word after the move.
+    pub const PIC: u32 = 512;
+    /// Bytes before a position-independent block's `code`: a word left zero (`udf`) and the `and`, keeping FEX's code
+    /// 8-byte aligned (its literal slots; x86 AC runs generated code with SCTLR_EL1.A).
+    pub const PIC_LEAD: u32 = 8;
     pub const RELOCS_SHIFT: u32 = 16;
     pub const MAX_RELOCS: u32 = 0xff;
     impl Block {
@@ -720,8 +745,23 @@ pub mod cache {
         pub fn code_va(&self) -> u64 {
             CODE_VA + u64::from(self.code)
         }
+        /// Its body entry: after the code header (a [`PIC`] block: after its full entry's two words, the page base
+        /// already in the guest-state page).
         pub fn entry(&self) -> u64 {
             self.code_va() + u64::from(super::ENTRY_OFFSET)
+        }
+        /// Where an entry with x0 = its RIP enters (an L1 entry, an `svc`-word link): a [`PIC`] block's `and x0, x0,
+        /// #!0xfff` (then `str x0, [x28, #PAGE_BASE]`, then the body); otherwise [`Block::entry`].
+        pub fn full_entry(&self) -> u64 {
+            if self.flags & PIC != 0 {
+                self.code_va() - 4
+            } else {
+                self.entry()
+            }
+        }
+        /// The code-area offset of its first word ([`Block::full_entry`]'s, for a [`PIC`] block).
+        pub fn start(&self) -> u32 {
+            self.code - if self.flags & PIC != 0 { 4 } else { 0 }
         }
         /// Link point `offset` (a native offset in the block, 0 = none) is the self-exit of the REP string instruction
         /// that ends the block (X2, [`Block::rep_exits`]).
@@ -829,7 +869,8 @@ pub mod cache {
         WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS
             && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS
             && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= HINTS
-            && HINTS + 4 * HINT_ENTRIES <= LOOKUP_BYTES
+            && HINTS + 4 * HINT_ENTRIES <= PIC_FRAMES
+            && PIC_FRAMES + 16 * PIC_FRAME_ENTRIES <= LOOKUP_BYTES
     );
     // The dispatcher's form: its `and` takes the mask as a logical immediate, its `adrp` names a table by its page, and
     // each entry's `b` to the miss reaches ±128 MiB.
@@ -925,6 +966,11 @@ pub mod frame {
     /// only in a CPL-0 block, with the code shape only inside a VERW).
     pub const VERW_GDT_BASE: u32 = 0x4a0;
     pub const VERW_GDT_LIMIT: u32 = 0x4a8;
+    /// PIC study: the page base of the position-independent block running (`crate::pic`), 8 bytes in FEX's `rip` (no
+    /// generated code uses it: admission refuses x28 accesses outside the guest-state fields). Written by such a block's
+    /// full entry and by the resident's entry into one; read by its rewritten guest-RIP moves. Guest-writable, as the rest
+    /// of the page: the resident never trusts it.
+    pub const PAGE_BASE: u32 = 0x18;
     /// Perf chunk 25: MXCSR at the block's entry (the bank's: its controls and the exception flags banked so far), 4 bytes in
     /// FEX's `CPUState::mxcsr` (no generated code but STMXCSR's reads it), written by the resident at every entry and never read
     /// back. A translated STMXCSR/VSTMXCSR stores it with the flags FPSR and [`SIMD_FLAGS`] gathered since, as the bank would.
@@ -3183,6 +3229,13 @@ mod tests {
         assert_eq!(frame::CR2, frame::KERNEL_GS_BASE + 8);
         assert!(
             (frame::CR2..frame::CR2 + 8).all(
+                |b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)
+            )
+        );
+        // PIC study: the page base in FEX's `rip` (CPUState 0x18: header, deferred-signal count, PF/AF), in neither list.
+        assert_eq!(frame::PAGE_BASE, frame::KERNEL_GS_BASE - 8 * 17);
+        assert!(
+            (frame::PAGE_BASE..frame::PAGE_BASE + 8).all(
                 |b| !inside(&frame::GUEST_STATE, b) && !inside(&frame::GUEST_STATE_WRITABLE, b)
             )
         );

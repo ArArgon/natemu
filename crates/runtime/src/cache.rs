@@ -17,18 +17,19 @@ use core::mem::align_of;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use natemu_abi::code_object::{Header, Reloc, Site};
 pub use natemu_abi::execution::cache::{
-    Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES, INBOUND,
-    LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, RELOCATABLE, REUSE_CHECK, REUSE_OFF, SHADOWS, STEP,
-    STI_FIRST, SYSTEM,
+    ARMED, Block, CODE_VA, DEAD, DISPATCH, DISPATCH_MISS, DISPATCH_VA, FLUSH, GLOBAL, HEAD_BYTES,
+    INBOUND, LARGE, LOCAL_INBOUND, MAX_VCPUS, PAGES, PIC, PIC_ALL, PIC_LEAD, PIC_USER, RELOCATABLE,
+    REUSE_CHECK, REUSE_OFF, SHADOWS, STEP, STI_FIRST, SYSTEM,
 };
 use natemu_abi::execution::cache::{MAX_RELOCS, RELOCS_SHIFT};
 use natemu_abi::execution::{
-    ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
+    LinkPoint, MAX_LINK_POINTS, STATE_VA, STOP_WORD, State, System,
     cache::{
         self as area, Control, CpuMask, LinkRecord, MASK_PAGES_PER_WORD, Record, SLOT, SLOT_BYTES,
         SLOT_VA, SLOT_WRITE_VA,
     },
 };
+use natemu_abi::pic::{self, count};
 /// L1's code (the dispatcher's head ends there).
 pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 
@@ -525,7 +526,7 @@ pub fn fill_l1(rip: u64, block: &Block) {
     }
     unsafe { l1_owner(t, i).write(listed | (block.number + 1)) };
     let at = l1_entry(t, i);
-    let words = l1_words(at, rip, block.entry() - area::CODE_VA);
+    let words = l1_words(at, rip, block.full_entry() - area::CODE_VA);
     // Already there (a resident entry that ends at the same block again, e.g. after a system instruction): no code change.
     if (0..words.len()).all(|k| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() } == words[k]) {
         return;
@@ -613,6 +614,9 @@ pub fn lookup(
                 };
                 if walked & LARGE != 0 {
                     mark_large(&b);
+                }
+                if user(b.context) {
+                    frame_met(block(n));
                 }
                 return Some(block(n));
             }
@@ -719,7 +723,18 @@ pub fn place(
     } else {
         0
     };
-    let code = c.code_used.next_multiple_of(CODE_ALIGN);
+    // PIC study stage 2: a template of [`Control::pic`]'s privilege, not global, may be placed position-independent: its
+    // code goes [`PIC_LEAD`] bytes past the boundary, room for the full entry ([`placed_pic`] rewrites it, or it stays
+    // absolute there).
+    let candidate = relocatable
+        && walked & GLOBAL == 0
+        && match c.pic {
+            PIC_USER => user(context),
+            PIC_ALL => true,
+            _ => false,
+        };
+    let start = c.code_used.next_multiple_of(CODE_ALIGN);
+    let code = start + if candidate { u64::from(PIC_LEAD) } else { 0 };
     let code_end = code + u64::from(h.code_size);
     if code_end > c.code_bytes {
         c.full[0] += 1;
@@ -756,11 +771,6 @@ pub fn place(
             h.code_size as usize,
         );
         relocate(code, dispatch_exit, dispatcher_for(context));
-        synchronize_code(
-            area::CODE_WRITE_VA + code,
-            area::CODE_VA + code,
-            h.code_size as usize,
-        );
         let placed = file(
             record,
             object.add(h.sites_offset as usize),
@@ -777,9 +787,110 @@ pub fn place(
             }
             table.add(j).write(r);
         }
+        let admitted =
+            core::slice::from_raw_parts(object.add(h.code_offset as usize), h.code_size as usize);
+        placed_pic(placed, admitted, candidate);
+        synchronize_code(
+            area::CODE_WRITE_VA + start,
+            area::CODE_VA + start,
+            (code_end - start) as usize,
+        );
         c.code_used = code_end;
         Some(placed)
     }
+}
+/// PIC study counter `k` ([`count`]).
+fn counted(k: usize) {
+    control().pic_counts[k] += 1;
+}
+/// A user (CPL 3) context ([`natemu_abi::execution::Cpu::code_context`]'s CPL bits).
+fn user(context: u64) -> bool {
+    context & 3 == 3
+}
+/// PIC study, a block placed from the host's answer (`admitted`, its code as admitted): counted by what sharing could do
+/// with it, a user template with a position-independent form, not global, as eligible; then, a `candidate` of
+/// [`place`]'s with that form, rewritten ([`rewritten`]). Its first frame and linear page are noted ([`frame_met`]).
+fn placed_pic(b: &Block, admitted: &[u8], candidate: bool) {
+    let u = user(b.context);
+    if u {
+        counted(count::HOST);
+        frame_met(b);
+    }
+    if b.flags & RELOCATABLE == 0 {
+        if u {
+            counted(count::NOT_TEMPLATE);
+        }
+        return;
+    }
+    let k = if b.flags & GLOBAL != 0 {
+        count::GLOBAL
+    } else {
+        pic::eligible(admitted, relocs(b), b.rip)
+            .err()
+            .unwrap_or(count::ELIGIBLE)
+    };
+    counted(if u { k } else { count::KERNEL_TEMPLATES });
+    if k == count::ELIGIBLE && candidate {
+        rewritten(b, admitted);
+    }
+}
+/// PIC study stage 2: rewrites the template `b` (placed [`PIC_LEAD`] bytes past its boundary, before its code is
+/// synchronized) into its position-independent form ([`pic::rewrite`]): the zero word and the full entry's `and` before
+/// `code`, its link points' words; under the check its literal slots poisoned ([`poison`]); then the static proof against
+/// `admitted` ([`pic::proved`]). [`PIC`] only if proved; otherwise the admitted code is put back (`b` stays absolute) and
+/// counted ([`count::UNPROVED`]: a resident fault; the check halts on it).
+fn rewritten(b: &Block, admitted: &[u8]) {
+    let at = area::CODE_WRITE_VA + u64::from(b.code);
+    let code = unsafe { core::slice::from_raw_parts_mut(at as *mut u8, b.code_size as usize) };
+    let mut links = b.links;
+    if pic::rewrite(code, relocs(b), &mut links, b.rip).is_err() {
+        return counted(count::UNPROVED);
+    }
+    unsafe { ((at - 8) as *mut [u32; 2]).write_volatile([0, pic::AND_PAGE]) };
+    poison(b, code);
+    if !pic::proved(admitted, code, relocs(b), &links, b.rip, b.dispatch_exit) {
+        code.copy_from_slice(admitted);
+        relocate(
+            u64::from(b.code),
+            u64::from(b.dispatch_exit),
+            dispatcher_for(b.context),
+        );
+        return counted(count::UNPROVED);
+    }
+    let r = unsafe { &mut *block_ptr(b.number as usize) };
+    (r.links, r.flags) = (links, r.flags | PIC);
+}
+/// PIC study stage 2, under the check ([`REUSE_CHECK`]): a position-independent block's literal slots (the tail's RIP,
+/// left as the template's in its copies) hold a non-canonical value, so code that read one would be caught by the
+/// suites (the tail-literal test: none does).
+fn poison(b: &Block, code: &mut [u8]) {
+    if control().reuse != REUSE_CHECK {
+        return;
+    }
+    for &r in relocs(b)
+        .iter()
+        .filter(|&&r| r & natemu_abi::execution::RELOC_MOVE == 0)
+    {
+        let at = (r >> 6) as usize * 4;
+        code[at..at + 8].copy_from_slice(&POISON.to_le_bytes());
+    }
+}
+/// [`poison`]'s value.
+pub const POISON: u64 = 0x8000_dead_beef_0000;
+/// PIC study: a user block's first frame met at its first linear page in this TLB epoch (one address space): counted
+/// ([`count::ALIASES`]) when the frame was last met at another linear page in the same epoch ([`area::PIC_FRAMES`]).
+pub fn frame_met(b: &Block) {
+    let c = control();
+    let frame = b.source_gpa[0] >> 12;
+    let i = (frame.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        >> (64 - area::PIC_FRAME_ENTRIES.trailing_zeros())) as usize;
+    let at = lookup_area::<[u64; 2]>(area::PIC_FRAMES).wrapping_add(i);
+    let now = [(frame + 1) | (c.epoch & 0xffff_ffff) << 32, b.rip >> 12];
+    let [key, page] = unsafe { at.read() };
+    if key == now[0] && page != now[1] {
+        counted(count::ALIASES);
+    }
+    unsafe { at.write(now) };
 }
 /// Perf chunk 10: the template the hint table holds for guest-physical page `gpa` (its frame), `rip`'s half and page
 /// offset and `context`, if its record still says so: live, [`RELOCATABLE`] (never a step or system record), from that
@@ -813,7 +924,11 @@ pub fn copy(
     walked: u32,
 ) -> Result<Option<&'static Block>, usize> {
     let c = control();
-    let code = c.code_used.next_multiple_of(CODE_ALIGN);
+    // PIC study stage 2: a position-independent template is copied as it is, its lead words too (its link points
+    // restored and moved, [`pic::relocate`]).
+    let lead = if b.flags & PIC != 0 { PIC_LEAD } else { 0 };
+    let start = c.code_used.next_multiple_of(CODE_ALIGN);
+    let code = start + u64::from(lead);
     let code_end = code + u64::from(b.code_size);
     if code_end > c.code_bytes {
         c.full[0] += 1;
@@ -822,20 +937,32 @@ pub fn copy(
     let mut links = b.links;
     unsafe {
         copy_record(
-            (area::CODE_WRITE_VA + code) as *mut u8,
-            (area::CODE_WRITE_VA + u64::from(b.code)) as *const u8,
-            b.code_size as usize,
+            (area::CODE_WRITE_VA + start) as *mut u8,
+            (area::CODE_WRITE_VA + u64::from(b.code - lead)) as *const u8,
+            (b.code_size + lead) as usize,
         );
         let at = core::slice::from_raw_parts_mut(
             (area::CODE_WRITE_VA + code) as *mut u8,
             b.code_size as usize,
         );
-        natemu_abi::execution::relocate_code(at, relocs(b), &mut links, b.rip, rip, b.guest_bytes)?;
+        if lead != 0 {
+            pic::relocate(at, &mut links, b.rip, rip, b.guest_bytes)?;
+            poison(b, at);
+        } else {
+            natemu_abi::execution::relocate_code(
+                at,
+                relocs(b),
+                &mut links,
+                b.rip,
+                rip,
+                b.guest_bytes,
+            )?;
+        }
         relocate(code, u64::from(b.dispatch_exit), dispatcher_for(b.context));
         synchronize_code(
-            area::CODE_WRITE_VA + code,
-            area::CODE_VA + code,
-            b.code_size as usize,
+            area::CODE_WRITE_VA + start,
+            area::CODE_VA + start,
+            (code_end - start) as usize,
         );
     }
     let record = Block {
@@ -847,14 +974,23 @@ pub fn copy(
         code: code as u32,
         number: 0,
         flags: walked & (GLOBAL | LARGE)
-            | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST),
+            | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | PIC),
         links,
         ..*b
     };
     let tail = size_of::<Site>() * b.sites_count as usize + 4 * relocs(b).len();
     let placed = unsafe { file(record, sites(b).as_ptr().cast(), tail, 0) };
-    if placed.is_some() {
+    if let Some(p) = placed {
         c.code_used = code_end;
+        if user(p.context) {
+            counted(count::COPIES);
+            if p.flags & PIC != 0 {
+                counted(count::COPIES_COVERED);
+            }
+            frame_met(p);
+        } else {
+            counted(count::KERNEL_COPIES);
+        }
     }
     Ok(placed)
 }
@@ -1072,8 +1208,19 @@ pub fn arm(b: &Block) -> bool {
     if c.armed != 0 {
         return false;
     }
-    let points = b.links.iter().filter(|p| p.offset != 0).map(|p| p.offset);
-    let exits = points.chain((b.dispatch_exit != 0).then_some(b.dispatch_exit));
+    // PIC study stage 2: a link point linked in its `svc` word ([`link`]) is left there too, by code interrupted after the
+    // point's first word: that word is armed as well.
+    let base = u64::from(b.code);
+    let svc = |p: &LinkPoint| {
+        let at = svc_slot(b, p);
+        (b.flags & PIC != 0 && word(base + at) != pic::SVC_LINK).then_some(at as u32)
+    };
+    let points = b.links.iter().filter(|p| p.offset != 0);
+    let exits = points
+        .clone()
+        .map(|p| p.offset)
+        .chain(points.filter_map(svc))
+        .chain((b.dispatch_exit != 0).then_some(b.dispatch_exit));
     for offset in exits {
         let at = u64::from(b.code) + u64::from(offset);
         c.armed_words[c.armed as usize] = [at as u32, word(at)];
@@ -1086,10 +1233,10 @@ pub fn arm(b: &Block) -> bool {
 /// Restores the words [`arm`] patched (each must still hold [`STOP_WORD`]) and empties the record: at every resident
 /// entry from generated code, before anything reads or rewrites code. Returns the restored code-area offsets (the
 /// first `n`), or `None` (nothing restored) when the record is malformed.
-pub fn disarm() -> Option<([u32; MAX_LINK_POINTS + 1], usize)> {
+pub fn disarm() -> Option<([u32; ARMED], usize)> {
     let c = control();
     let n = c.armed as usize;
-    let mut at = [0; MAX_LINK_POINTS + 1];
+    let mut at = [0; ARMED];
     if n == 0 {
         return Some((at, 0));
     }
@@ -1120,9 +1267,16 @@ fn synchronize_words(c: &Control) {
         asm!("dsb ish", "isb");
     }
 }
-/// The link point's word is its admitted form (the first word of its RIP move).
+/// The link point's words are its admitted form: the first word of its RIP move, and (a [`PIC`] block) the `svc #LINK`
+/// after it.
 fn unlinked(b: &Block, p: &LinkPoint) -> bool {
-    word(u64::from(b.code) + u64::from(p.offset)) == p.word
+    let base = u64::from(b.code);
+    word(base + u64::from(p.offset)) == p.word
+        && (b.flags & PIC == 0 || word(base + svc_slot(b, p)) == pic::SVC_LINK)
+}
+/// PIC study stage 2: the native offset in [`PIC`] block `b` of link point `p`'s `svc` word ([`pic::svc_slot`]).
+pub fn svc_slot(b: &Block, p: &LinkPoint) -> u64 {
+    pic::svc_slot(|o| word(u64::from(b.code) + o), p)
 }
 
 pub enum Link {
@@ -1146,10 +1300,27 @@ pub fn link(source: &Block, target: &Block) -> Link {
     if source.context != target.context || points().next().is_none() {
         return Link::Bad;
     }
-    let entry = u64::from(target.code) + u64::from(ENTRY_OFFSET);
+    // PIC study stage 2: into a [`PIC`] target from an absolute source or another start page, the `svc` word after the
+    // exit's move becomes `b` to the target's full entry (x0, the target's address, sets the page base there); every other
+    // link patches the move's first word to `b` the body entry, as before (from a PIC source on the same page the base
+    // already in the guest-state page is the target's).
+    let svc_form = target.flags & PIC != 0
+        && !(source.flags & PIC != 0 && source.rip >> 12 == target.rip >> 12);
+    let entry = if svc_form {
+        target.full_entry()
+    } else {
+        target.entry()
+    } - area::CODE_VA;
+    let word_at = |p: &LinkPoint| {
+        u64::from(source.code)
+            + if svc_form {
+                svc_slot(source, p)
+            } else {
+                u64::from(p.offset)
+            }
+    };
     for p in points() {
-        let at = u64::from(source.code) + u64::from(p.offset);
-        if !unlinked(source, p) && word(at) != branch(at, entry) {
+        if !unlinked(source, p) && !links_to(word_at(p), entry) {
             return Link::Bad;
         }
     }
@@ -1177,15 +1348,30 @@ pub fn link(source: &Block, target: &Block) -> Link {
     } else {
         (CR3, INBOUND)
     };
+    let class = pic::class(
+        source.flags & PIC != 0,
+        source.rip,
+        target.flags & PIC != 0,
+        target.rip,
+    );
+    // PIC study (`pic-count` builds only): the link enters the target through a counting stub ([`stub`]).
+    #[cfg(feature = "pic-count")]
+    let to = if points().any(|p| unlinked(source, p)) {
+        stub(entry, class)
+    } else {
+        entry
+    };
+    #[cfg(not(feature = "pic-count"))]
+    let to = entry;
     let mut linked = 0;
     for p in points().filter(|p| unlinked(source, p)) {
-        let at = u64::from(source.code) + u64::from(p.offset);
+        let at = word_at(p);
         let original = word(at);
-        rewrite(at, branch(at, entry));
+        rewrite(at, branch(at, to));
         insert(
             LinkRecord {
                 source: source.number,
-                offset: p.offset,
+                offset: (at - u64::from(source.code)) as u32,
                 original,
                 target: target.number,
             },
@@ -1194,7 +1380,90 @@ pub fn link(source: &Block, target: &Block) -> Link {
         unsafe { (*block_ptr(target.number as usize)).flags |= inbound };
         linked += 1;
     }
+    if linked != 0 {
+        counted(count::LINKS + class as usize);
+    }
     Link::Linked(linked)
+}
+/// The destination of the `b` at code-area offset `at`.
+#[cfg(feature = "pic-count")]
+fn branch_to(at: u64) -> u64 {
+    at.wrapping_add((((word(at) << 6) as i32 >> 6) as i64 * 4) as u64)
+}
+/// The word at `at` is a link into `entry`: `b` to it, or (`pic-count` builds) to a counting stub ending in one.
+fn links_to(at: u64, entry: u64) -> bool {
+    if word(at) == branch(at, entry) {
+        return true;
+    }
+    #[cfg(feature = "pic-count")]
+    {
+        let s = branch_to(at);
+        if word(at) & 0xfc00_0000 == 0x1400_0000
+            && s + 16 <= control().code_used
+            && s >= area::HEAD_BYTES as u64
+            && word(s) & 0xffc0_03ff == 0xf940_0381
+            && word(s + 12) == branch(s + 12, entry)
+        {
+            return true;
+        }
+    }
+    false
+}
+/// PIC study (`pic-count` builds): the live block a counting stub holding native address `pc` enters ([`stub`]): `pc`
+/// in no block, the stub's first word a counter load and its last a `b` to a live block's entry.
+#[cfg(feature = "pic-count")]
+pub fn stub_target(pc: u64) -> Option<&'static Block> {
+    if block_at(pc).is_some() {
+        return None;
+    }
+    let s = pc.checked_sub(area::CODE_VA)? & !15;
+    if s < area::HEAD_BYTES as u64
+        || s + 16 > control().code_used
+        || word(s) & 0xffc0_03ff != 0xf940_0381
+    {
+        return None;
+    }
+    let to = branch_to(s + 12);
+    let b = block_at(area::CODE_VA + to)?;
+    (b.flags & DEAD == 0 && [b.entry(), b.full_entry()].contains(&(area::CODE_VA + to)))
+        .then_some(b)
+}
+/// PIC study (`pic-count` builds): a stub at the code area's fill point counting the transitions of class `class` (but
+/// [`pic::Class::Absolute`]) in a guest-state field no generated code uses (FEX's header, deferred-signal count, PF/AF
+/// pair and call-return stack pointer; read by the host after the run), then entering `entry`: `ldr x1, [x28, #c]; add x1,
+/// x1, #1; str x1, [x28, #c]; b entry` (x1 is dead at every exit: no static register, and the dispatcher writes it). The
+/// code area holds it until the next flush; full: `entry` itself.
+#[cfg(feature = "pic-count")]
+fn stub(entry: u64, class: pic::Class) -> u64 {
+    let c = control();
+    let field = match class {
+        pic::Class::Absolute => return entry,
+        pic::Class::SamePage => 0x0u32,
+        pic::Class::CrossPage => 0x8,
+        pic::Class::SharedToAbsolute => 0x10,
+        pic::Class::AbsoluteToShared => 0xb0,
+    };
+    let at = c.code_used.next_multiple_of(16);
+    if at + 16 > c.code_bytes {
+        return entry;
+    }
+    let imm = field / 8 << 10 | 28 << 5 | 1;
+    let words = [
+        0xf940_0000 | imm,
+        0x9100_0421,
+        0xf900_0000 | imm,
+        branch(at + 12, entry),
+    ];
+    unsafe {
+        copy_record(
+            (area::CODE_WRITE_VA + at) as *mut u8,
+            words.as_ptr().cast(),
+            16,
+        )
+    };
+    synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 16);
+    c.code_used = at + 16;
+    at
 }
 /// Perf chunk 8: a link from `source` into `target` is local when every linear page of `target` is a page of `source`
 /// translated from the same guest-physical page. It may then stay while `target` is not current: `source` runs only
@@ -1255,11 +1524,16 @@ pub fn unlink_all() -> Option<u64> {
     Some(n)
 }
 /// Restores the original word of the link point `r` describes, if it holds the branch `r` says.
+/// (PIC study stage 2: a record of an `svc`-word link, its original word `svc #LINK`, names the target's full entry.)
 fn unlink(r: LinkRecord) -> Option<()> {
     let (source, target) = (block(r.source as usize), block(r.target as usize));
     let at = u64::from(source.code) + u64::from(r.offset);
-    let entry = u64::from(target.code) + u64::from(ENTRY_OFFSET);
-    (word(at) == branch(at, entry)).then(|| rewrite(at, r.original))
+    let entry = if r.original == pic::SVC_LINK {
+        target.full_entry()
+    } else {
+        target.entry()
+    } - area::CODE_VA;
+    links_to(at, entry).then(|| rewrite(at, r.original))
 }
 
 /// This vCPU is about to write `gpa`'s page, which holds translations: clears every vCPU's code bit of the page at
@@ -1541,7 +1815,7 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
     let offset = pc.checked_sub(area::CODE_VA)?;
     let count = control().blocks as usize;
     let holds = |b: &Block| {
-        u64::from(b.code) <= offset && offset < u64::from(b.code) + u64::from(b.code_size)
+        u64::from(b.start()) <= offset && offset < u64::from(b.code) + u64::from(b.code_size)
     };
     // Perf chunk 12: the block found at this word last ([`Control::pc_hints`]).
     let hint = (offset >> 2) as usize % area::PC_HINTS;
@@ -1549,21 +1823,22 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
     if n < count && holds(block(n)) {
         return Some(block(n));
     }
-    // The last block starting at or below `offset` (placement order is address order).
+    // The last block whose code starts at or below `offset` + 4 (placement order is address order; a [`PIC`] block's
+    // first word is 4 bytes before its code), or the one before it.
     let (mut lo, mut hi) = (0, count);
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if u64::from(block(mid).code) <= offset {
+        if u64::from(block(mid).code) <= offset + 4 {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-    let n = lo.checked_sub(1)?;
+    let n = [lo.checked_sub(1), lo.checked_sub(2)]
+        .into_iter()
+        .flatten()
+        .find(|&n| holds(block(n)))?;
     let b = block(n);
-    if !holds(b) {
-        return None;
-    }
     control().pc_hints[hint] = n as u32;
     Some(b)
 }
