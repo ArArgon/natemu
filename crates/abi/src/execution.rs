@@ -267,6 +267,11 @@ pub mod cache {
     /// (the VA room up to [`LOOKUP_VA`]). The `build` benchmark filled the 64 MiB arena five times at N = 1 with about
     /// 243 Ki blocks, every one live (none dead, nine in ten not current: other processes' code, asked for again after
     /// each flush); the arena and the index now fill together at about 490 Ki blocks (about 270 bytes of record each).
+    /// November 10: a CPython build with guest ASLR relocates millions of blocks and filled the 128 MiB arena about 30
+    /// times per vCPU, each fill wiping the cache. META_VA moved down to just above the code write alias
+    /// (`CODE_WRITE_VA + CODE_BYTES_MAX`) for 256 MiB, and `L2_ENTRIES` doubled so [`MAX_BLOCKS`] is 1 Mi. Wipes 122 -> 62,
+    /// full build 294.5 -> 260.7 s, 88-command slice 40.3 -> 35.9 s (4 vCPUs). The code area (128 MiB, branch range) is now
+    /// the limit: it fills first, with the arena at about 83% and the blocks at about 78%.
     pub const META_VA: u64 = PRIVATE + 0x2800_0000;
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
