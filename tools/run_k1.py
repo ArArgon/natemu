@@ -70,6 +70,49 @@ Perf chunk 10 (reuse inside the resident, natemu only; aliases above 4 GiB, valu
 - `reuse-remap`: B's alias remapped to another frame with INVLPG: its own bytes, not a copy of the first frame's block.
 - `reuse-cross`: a block crossing into a second page is copied where both frames are the template's, not where the second
   differs (a refusal counted).
+PIC study stage 3 (shared translations, natemu only; the program driver shares every privilege level's templates, so these
+CPL-0 programs run shared code; values asserted, and the least instances, checked and local links): frame RL holds Y
+(`mov ebx, k; lea rax, [rel $$]; jmp .b; .b: call .n; .n: pop rsi; jmp r13`: rax = the alias, rsi = alias + YN, a local
+link inside it) and, at 0x800, X (`jmp` to Y); frame RT a trampoline page (`jmp` RV3 at 0, `jmp` RV1 at 0x100):
+- `pic-two`: RL at RV1 and RV3 of one address space: Y placed at RV1, shared at RV3 (an instance, its local link), entered
+  at RV3 through an L1 entry and through a checked link from RT, then at RV1 again through RT and through L1.
+- `pic-fork`: Y shared, its instance at RV1; the same address RV1 in table B (a forked child's): the instance found again.
+- `pic-invlpg`: instances at RV1 and RV3; RV3 remapped to RL2 (`mov ebx, 2`) with INVLPG: RV3 runs RL2's code, RV1 RL's.
+- `pic-write`: RL rewritten (`mov ebx, 3`) while both instances have live L1 entries: both run the new bytes.
+- `pic-abs`: X absolute at RV1 linked into Y's instance there (an absolute block into shared code on its own page: checked);
+  in table B at RV2, X shared too (a second process at another address): its link into Y is local.
+- `pic-pge`: checked links live through two global TLB flushes (CR4.PGE off and on): every call runs its own code.
+- `pic-gmap`: CR4.PGE on, RV3's PTE made global with INVLPG: the walk finds a global mapping for Y's instance, which goes;
+  RV3 then runs an absolute block (the same values).
+- `pic-ctx`: X (absolute) checked-linked into Y's instance under one MXCSR context, then four other contexts take every
+  L1 table (the first one's given to another context: its dispatcher slot misses meanwhile), back under the first: X runs
+  Y (values).
+- `pic-twosrc`: the trampoline page at RVT and RVT2 (shared: two live instances of the source at different pages), each
+  jumping to its own alias of Y (RV3, RV5): the one checked link (a dispatcher probe at each instance's x0) reaches each.
+- `pic-cow`: Y shared in table A (RV1, RV3); table B maps RV1 to RL2 (a fork whose child wrote the page): B's RV1 runs
+  RL2's code, A's both RL's after.
+- `pic-twoframe`: as `pic-twosrc`, RV5 mapping RL2: the one checked link reaches RV3's instance and RV5's other frame.
+- `pic-xm`: Z (`divss` by zero) shared, reached by an absolute block's and a shared trampoline's checked links under
+  MXCSR A (masked); four other contexts take the L1 tables, one (0x1d80) unmasking ZE: there the same links raise #XM
+  (the handler counts), back under A they run Z.
+- `pic-flush`: `pic-twosrc`, a flush (a new instruction breakpoint, DR7), `pic-twosrc` again: the same values.
+- `pic-write2`: RT linked into Y while Y is absolute at RV1, Y then shared through RV3 (the absolute block stays), RL
+  rewritten: both the link's target and RV3 run the new bytes.
+- `pic-pfault`: W (on RL) local-links to a block that page-faults (a zeroed PTE): the handler sees the alias's fault RIP
+  and CR2, at RV3 (shared) and RV1.
+- `pic-xwrite`: Y's instances live with L1 entries; CPU (i + 1) % N rewrites CPU i's RL (CPU i's own at N = 1) and the
+  CPUs hand over (CPUID after): both aliases run the new bytes.
+- `pic-rep` (review of stage 3, finding 2): R (on RL) copies 64 bytes with REP MOVSB to the CPU's own page (DST), placed
+  at RV1 and shared at RV3: every run completes the string (RCX 0, RDI past it), under `run_pic.py`'s stops too.
+- `pic-repexit` (the BAD_LINK the slices hit): RE (on RL) starts with REP MOVSB, its points the REP's self-exit and
+  the block after it (N, `mov ebx, 13; jmp r13`). N placed at RV5 first (absolute there); RE at RV1, then at RV3 with
+  RCX = 0 (shared: the point to N linked locally, N an instance there); then at RV5 with RCX = 1: the self-exit
+  finishes the string and goes on to N, absolute at RV5, which the linker must not link the point to N for (the exit
+  was not through it): values, no halt.
+- `pic-again`: `pic-two` twice, its values from the second run, #GP and #PF resuming at the call's return (`run_pic.py`'s
+  forge modes: forged only in the first entries, whose faults the handler skips; the second run exact).
+- `pic-user`: `pic-two` with `NATEMU_PIC=user`: CPL-0 code is never shared (SHARES 0), the same values.
+Instance eviction has no case: instances are freed with the arena at a flush (stage 3), which the flush tests cover.
 Perf chunk 11 (natemu only):
 - `link-full`: more links than the record area holds (a chain of 286,720 link points through 70 pages above 4 GiB),
   three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
@@ -84,7 +127,7 @@ Perf chunk 12 (natemu only):
   takes a number and no code): every call runs (r8 = 12).
 
 Writes DIR/k1.json; exit status 1 on any failure."""
-import argparse, json, pathlib, sys
+import argparse, json, os, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
@@ -181,7 +224,7 @@ def bodies(k, i=0, n=1):
                      + ''.join(ctx_call(5 + j, d, j + 2) for j in range(3)) + '    dec ecx\n    jnz .l\n'
                      + ctx_call(8, d, 0) + ctx_kept(i) + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
         **links_bodies(k, i, n),
-        **reuse_bodies(i),
+        **reuse_bodies(i, n),
         'link-full': full_body(i, n),
         # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
         # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
@@ -310,9 +353,39 @@ HIGH = 0x7f12_3440_0000
 RV1, RV2, RV3 = HIGH + 0xb000, HIGH + 0xd000, HIGH + 0xf000
 RX = 0xff7                       # `reuse-cross`: `lea rdx, [rel 0]` at RX, then `mov eax, imm32` across the page end
 LIB = lambda k: P.asm(f'mov ebx, {k}\nlea rax, [rel $$]\ncall .n\n.n:\npop rsi\njmp r13')   # rsi = alias + 17
+# PIC study stage 3 (module docstring): Y (rsi = alias + YN), X at XO, the trampoline page at RVT.
+Y = lambda k: P.asm(f'mov ebx, {k}\nlea rax, [rel $$]\njmp .b\n.b:\ncall .n\n.n:\npop rsi\njmp r13')
+YN = len(Y(1)) - len(P.asm('pop rsi\njmp r13'))
+XO, RT, RVT = 0x800, 0xe000, HIGH + 0x11000
+RVT2, RV5 = RVT + 0x4000, RV3 + 0x4000
+# Z (`pic-xm`) at ZO, X2 (`jmp` Z) at X2O, W (`pic-pfault`) at WO of RL; RT + 0x200 `jmp` Z at RV1; PF_VA's PTE zero.
+ZO, X2O, WO, PF_VA = 0x400, 0xc00, 0x600, HIGH + 0x1ff000
+Z = P.asm('movaps xmm2, xmm0\ndivss xmm2, xmm1\nmov ebx, 5\nlea rax, [rel $$]\njmp r13')
+W_HEAD = f'mov ebx, 7\nlea rax, [rel $$]\njmp .b\n.b:\nmov ecx, 1\nmov rdx, {PF_VA:#x}\n'
+W = P.asm(W_HEAD + 'mov rdx, [rdx]\njmp r13')
+W_FAULT = WO + len(P.asm(W_HEAD))
+REPO, DST = 0x700, 0x7c00         # `pic-rep`: R at REPO of RL, its destination at d + DST
+R = lambda d: P.asm(f'mov ecx, 0x40\nlea rsi, [rel $$]\nmov rdi, {d + DST:#x}\nrep movsb\nmov ebx, 9\njmp r13')
+REO = 0xb00                       # `pic-repexit`: RE at REO of RL, its destination at d + 0x7d00
+RE = P.asm('rep movsb\nmov ebx, 13\njmp r13')
+XFLAGS = P.SYS_D(0) + 0x7800     # `pic-xwrite`: per CPU a ready word, then (+ 0x40) a written word
+JMP = lambda at, to: b'\xe9' + (to - at - 5).to_bytes(4, 'little', signed=True)
+PIC = ('pic-two', 'pic-fork', 'pic-invlpg', 'pic-write', 'pic-abs', 'pic-pge', 'pic-gmap', 'pic-ctx', 'pic-twosrc', 'pic-cow',
+       'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again')
+# Least instances, checked links and local (same-page shared) links per CPU.
+PIC_MIN = {'pic-two': (2, 1, 1), 'pic-fork': (1, 0, 1), 'pic-invlpg': (1, 0, 1), 'pic-write': (1, 0, 1), 'pic-abs': (2, 1, 1),
+           'pic-pge': (2, 1, 1), 'pic-gmap': (1, 0, 1), 'pic-ctx': (1, 1, 1), 'pic-twosrc': (3, 1, 1),
+           'pic-cow': (1, 0, 1), 'pic-twoframe': (2, 1, 1), 'pic-xm': (2, 2, 0), 'pic-flush': (6, 2, 2), 'pic-write2': (1, 0, 1),
+           'pic-pfault': (1, 0, 1), 'pic-xwrite': (1, 0, 1), 'pic-user': (0, 0, 0),
+           'pic-rep': (1, 0, 0), 'pic-repexit': (2, 0, 1), 'pic-again': (2, 1, 1)}
+# Further `pic` counters per CPU: (counter, least, most): `pic-gmap` refuses the global instance (INSTANCE_REFUSED),
+# `pic-user` shares nothing (SHARES).
+PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)]}
+# The resident's NATEMU_PIC per program (else the program driver's `all`).
+PIC_ENV = {'link-full': 'off', 'pic-user': 'user'}
 
 
-def reuse_bodies(i):
+def reuse_bodies(i, n=1):
     d = P.SYS_D(i)
     put_b = lambda va, frame: f'    mov rax, {frame | P.LEAF:#x}\n    mov [{high_leaf(i, 1, va):#x}], rax\n'
     cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
@@ -335,7 +408,85 @@ def reuse_bodies(i):
         'reuse-cross': (call('x0', f'{RV1 + RX:#x}') + save(('r8', 'rax'), ('r9', 'rdx')) + call('x1', f'{RV2 + RX:#x}')
                         + save(('r10', 'rax'), ('r12', 'rdx')) + cr3('tb') + call('x2', f'{RV2 + RX:#x}') + save(('r14', 'rax'), ('r15', 'rdx'))
                         + cr3('ta')),
+        **pic_bodies(i, n),
     }
+
+
+def pic_bodies(i, n=1):
+    """PIC study stage 3's programs (module docstring)."""
+    d, j = P.SYS_D(i), (i + 1) % n
+    put_a = lambda va, frame, g=0: f'    mov rax, {frame | P.LEAF | g:#x}\n    mov [{high_leaf(i, 0, va):#x}], rax\n'
+    cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
+    save = lambda *regs: ''.join(f'    mov {r}, {s}\n' for r, s in regs)
+    pge = lambda on: f'    mov rax, cr4\n    {"bts" if on else "btr"} rax, 7\n    mov cr4, rax\n'
+    calls = lambda tag, to, k=3: ''.join(call(f'{tag}{r}', f'{to:#x}') for r in range(k))
+    mx = lambda m: f'    ldmxcsr [{d + RT + 0x800 + 4 * m:#x}]\n'
+    two = lambda t: (call(f'{t}0', f'{RV1:#x}') + calls(f'{t}1', RV3) + save(('r8', 'rax'), ('r9', 'rsi')) + calls(f'{t}2', RVT)
+                     + save(('r10', 'rax')) + calls(f'{t}3', RVT + 0x100) + save(('r12', 'rax'), ('r14', 'rsi')) + calls(f'{t}4', RV1)
+                     + save(('r15', 'rbx')))
+    twosrc = lambda t, ra, rb: (call(f'{t}0', f'{RV3:#x}') + call(f'{t}1', f'{RV1:#x}') + call(f'{t}2', f'{RVT:#x}')
+                                + ''.join(call(f'{t}3{r}', f'{RVT:#x}') + save((ra, 'rax')) + call(f'{t}4{r}', f'{RVT2:#x}') + save((rb, 'rax'))
+                                          for r in range(3)))
+    out = {
+        'pic-two': two('t'),
+        # (#GP and #PF resume at the call's return label: a forged slot's addresses fault.)
+        'pic-again': (again_idt(d) + two('a') + two('t') + '    jmp .end\n.h13:\n.h14:\n    add rsp, 8\n    mov [rsp], r13\n    iretq\n'
+                      '.end:\n'),
+        'pic-fork': (call('f0', f'{RV3:#x}') + calls('f1', RV1) + save(('r8', 'rax')) + cr3('tb') + calls('f2', RV1)
+                     + save(('r9', 'rax'), ('r10', 'rsi')) + cr3('ta')),
+        'pic-invlpg': (call('i0', f'{RV1:#x}') + calls('i1', RV3) + save(('r8', 'rbx')) + put_a(RV3, d + RL2)
+                       + f'    mov rax, {RV3:#x}\n    invlpg [rax]\n' + calls('i2', RV3) + save(('r9', 'rbx'), ('r12', 'rax'))
+                       + calls('i3', RV1) + save(('r10', 'rbx'))),
+        'pic-write': (call('w0', f'{RV1:#x}') + calls('w1', RV3) + calls('w2', RV1) + save(('r8', 'rbx'))
+                      + f'    mov byte [{d + RL + 1:#x}], 3\n' + calls('w3', RV3) + save(('r9', 'rbx')) + calls('w4', RV1)
+                      + save(('r10', 'rbx'))),
+        'pic-abs': (call('a0', f'{RV3:#x}') + call('a1', f'{RV1:#x}') + calls('a2', RV1 + XO) + save(('r8', 'rax'), ('r9', 'rsi'))
+                    + cr3('tb') + calls('a3', RV2 + XO) + save(('r10', 'rax'), ('r12', 'rsi')) + cr3('ta')),
+        'pic-pge': (call('p0', f'{RV1:#x}') + calls('p1', RV3) + calls('p2', RVT) + pge(False) + pge(True) + calls('p3', RVT)
+                    + save(('r8', 'rax'), ('r9', 'rsi')) + pge(False) + calls('p4', RVT + 0x100) + save(('r10', 'rax'))),
+        'pic-gmap': (pge(True) + call('g0', f'{RV1:#x}') + calls('g1', RV3) + save(('r8', 'rax')) + put_a(RV3, d + RL, 0x100)
+                     + f'    mov rax, {RV3:#x}\n    invlpg [rax]\n' + calls('g2', RV3) + save(('r9', 'rax'), ('r10', 'rsi'))
+                     + pge(False)),
+        'pic-ctx': ('    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n' + mx(0) + call('c0', f'{RV3:#x}') + call('c1', f'{RV1:#x}')
+                    + calls('c2', RV1 + XO) + ''.join(mx(m) + call(f'c3{m}', f'{RV1:#x}') for m in range(1, 5)) + mx(0)
+                    + calls('c4', RV1 + XO) + save(('r8', 'rax'), ('r9', 'rsi'))),
+        'pic-twosrc': (call('s0', f'{RV3:#x}') + call('s1', f'{RV1:#x}') + call('s2', f'{RVT:#x}')
+                       + ''.join(call(f's3{r}', f'{RVT:#x}') + save(('r8', 'rax')) + call(f's4{r}', f'{RVT2:#x}') + save(('r9', 'rax'))
+                                 for r in range(3))),
+        'pic-cow': (call('o0', f'{RV1:#x}') + calls('o1', RV3) + cr3('tb') + calls('o2', RV1) + save(('r8', 'rbx'), ('r9', 'rax'))
+                    + cr3('ta') + call('o3', f'{RV1:#x}') + save(('r10', 'rbx')) + call('o4', f'{RV3:#x}') + save(('r12', 'rbx'))),
+        'pic-twoframe': (call('s0', f'{RV3:#x}') + call('s1', f'{RV1:#x}') + call('s2', f'{RVT:#x}')
+                         + ''.join(call(f's3{r}', f'{RVT:#x}') + save(('r8', 'rax'), ('r10', 'rbx')) + call(f's4{r}', f'{RVT2:#x}')
+                                   + save(('r9', 'rax'), ('r12', 'rbx')) for r in range(3))),
+        'pic-xm': ('    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n' + ctx_idt(d) + '    xor r14d, r14d\n    xor r15d, r15d\n'
+                   '    mov eax, 0x3f800000\n    movd xmm0, eax\n    xorps xmm1, xmm1\n' + mx(0) + call('z0', f'{RV3 + ZO:#x}')
+                   + call('z1', f'{RV1 + ZO:#x}') + calls('z2', RV1 + X2O) + call('z3', f'{RVT + 0x200:#x}') + calls('z4', RVT2 + 0x200)
+                   + calls('z5', RVT + 0x200, 2) + save(('r8', 'rbx')) + ''.join(mx(m) + call(f'z6{m}', f'{RV1 + ZO:#x}') for m in range(1, 5))
+                   + mx(3) + '    xor ebx, ebx\n' + call('z7', f'{RV1 + X2O:#x}') + call('z8', f'{RVT2 + 0x200:#x}') + call('z9', f'{RVT + 0x200:#x}')
+                   + save(('r9', 'r15'), ('r10', 'rbx')) + mx(0) + call('za', f'{RV1 + X2O:#x}') + save(('r12', 'rbx'))
+                   + call('zb', f'{RVT2 + 0x200:#x}') + save(('rdi', 'rax')) + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
+        'pic-flush': (twosrc('s', 'r10', 'r12') + f'    mov rax, {d + 0x7f00:#x}\n    mov dr0, rax\n    mov eax, 1\n    mov dr7, rax\n'
+                      '    xor eax, eax\n    mov dr7, rax\n' + twosrc('u', 'r8', 'r9')),
+        'pic-write2': (calls('v0', RVT + 0x100, 2) + call('v1', f'{RV3:#x}') + call('v2', f'{RVT + 0x100:#x}') + save(('r8', 'rbx'))
+                       + f'    mov byte [{d + RL + 1:#x}], 3\n' + call('v3', f'{RVT + 0x100:#x}') + save(('r9', 'rbx'))
+                       + call('v4', f'{RV3:#x}') + save(('r10', 'rbx'))),
+        'pic-pfault': (adv_idt(d) + call('q0', f'{RV1 + WO:#x}') + calls('q1', RV3 + WO) + save(('r8', 'rdi'), ('r9', 'r15'), ('r10', 'r14'))
+                       + calls('q2', RV1 + WO, 2) + save(('r12', 'rdi')) + '    jmp .end\n'
+                       + '.h:\n    pop r14\n    mov r15, cr2\n    mov rdi, [rsp]\n    mov [rsp], r13\n    iretq\n.end:\n'),
+        'pic-xwrite': (call('x0', f'{RV1:#x}') + calls('x1', RV3) + calls('x2', RV1, 2) + save(('r8', 'rbx'))
+                       + f'    mov qword [{XFLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{XFLAGS + 8 * j:#x}], 1\n    jne .h1\n'
+                       f'    mov byte [{P.SYS_D(j) + RL + 1:#x}], 3\n    mov qword [{XFLAGS + 0x40 + 8 * j:#x}], 1\n'
+                       f'.h2:\n    pause\n    cmp qword [{XFLAGS + 0x40 + 8 * i:#x}], 1\n    jne .h2\n    xor eax, eax\n    cpuid\n'
+                       + calls('x3', RV3) + save(('r9', 'rbx')) + calls('x4', RV1, 2) + save(('r10', 'rbx'))),
+    }
+    out['pic-rep'] = (call('e0', f'{RV1 + REPO:#x}') + calls('e1', RV3 + REPO) + save(('r8', 'rcx'), ('r9', 'rdi'), ('r10', 'rbx'))
+                      + calls('e2', RV1 + REPO, 2) + save(('r12', 'rdi')))
+    rep = lambda tag, va, n: (f'    mov ecx, {n}\n    mov rsi, {RV1:#x}\n    mov rdi, {d + 0x7d00:#x}\n' + call(tag, f'{va:#x}'))
+    out['pic-repexit'] = (call('n0', f'{RV5 + REO + 2:#x}') + rep('n1', RV1 + REO, 0) + rep('n2', RV3 + REO, 0) + rep('n3', RV3 + REO, 0)
+                          + rep('n4', RV5 + REO, 1) + save(('r8', 'rbx'), ('r9', 'rcx'), ('r10', 'rdi')) + rep('n5', RV5 + REO, 1)
+                          + save(('r12', 'rdi')))
+    out['pic-user'] = out['pic-two']
+    return out
 
 
 # Perf chunk 11 (`link-full`, natemu only): more links than the record area holds. FM linear pages from HIGH (table A)
@@ -389,6 +540,16 @@ def reuse_tables(name, i):
     """Per table (A, B): the linear page -> frame offset of the reuse programs' aliases."""
     if name == 'reuse-cross':
         return {RV1: RL, RV1 + 0x1000: RL2, RV2: RL, RV2 + 0x1000: RL2}, {RV2: RL, RV2 + 0x1000: RLC}
+    if name == 'pic-fork':
+        return {RV1: RL, RV3: RL}, {RV1: RL}
+    if name in ('pic-two', 'pic-pge', 'pic-write2', 'pic-user', 'pic-again'):
+        return {RV1: RL, RV3: RL, RVT: RT}, {}
+    if name in ('pic-twosrc', 'pic-flush', 'pic-xm', 'pic-repexit'):
+        return {RV1: RL, RV3: RL, RV5: RL, RVT: RT, RVT2: RT}, {}
+    if name == 'pic-twoframe':
+        return {RV1: RL, RV3: RL, RV5: RL2, RVT: RT, RVT2: RT}, {}
+    if name == 'pic-cow':
+        return {RV1: RL, RV3: RL}, {RV1: RL2}
     return {RV1: RL, RV3: RL}, {RV2: RL}
 
 
@@ -407,6 +568,21 @@ def reuse_memory(name, i):
         first[RX:] = P.asm('lea rdx, [rel $+7]') + b'\xb8\x00'
         return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': TAIL(1).hex()},
                          {'addr': f'0x{d + RLC:x}', 'data': TAIL(2).hex()}]
+    if name in PIC:
+        page = bytearray(0x1000)
+        page[:len(Y(1))] = Y(1)
+        page[XO:XO + 5] = JMP(XO, 0)
+        page[ZO:ZO + len(Z)], page[X2O:X2O + 5], page[WO:WO + len(W)] = Z, JMP(X2O, ZO), W
+        page[REPO:REPO + len(R(d))] = R(d)
+        page[REO:REO + len(RE)] = RE
+        tramp = bytearray(0x1000)
+        tramp[:5], tramp[0x100:0x105], tramp[0x200:0x205] = JMP(RVT, RV3), JMP(RVT + 0x100, RV1), JMP(RVT + 0x200, RV1 + ZO)
+        tramp[0x800:0x800 + 4 * len(CTX_MXCSR)] = b''.join(m.to_bytes(4, 'little') for m in CTX_MXCSR)
+        extra = [entry(high_leaf(i, 0, PF_VA), 0)] if name == 'pic-pfault' else []
+        extra += [dict(P.zero(d + IDT, 0x1000), capture=False)] if name in ('pic-pfault', 'pic-xm', 'pic-again') else []
+        extra += [dict(P.zero(XFLAGS, 0x100), capture=False)] if name == 'pic-xwrite' and i == 0 else []
+        return tables + extra + [{'addr': f'0x{d + RL:x}', 'data': page.hex()}, {'addr': f'0x{d + RL2:x}', 'data': Y(2).hex()},
+                                 {'addr': f'0x{d + RT:x}', 'data': tramp.hex()}]
     return tables + [{'addr': f'0x{d + RL:x}', 'data': LIB(1).hex()}, {'addr': f'0x{d + RL2:x}', 'data': LIB(2).hex()}]
 
 
@@ -420,21 +596,46 @@ def reuse_either(name):
             'reuse-write': {'r8': {1}, 'r9': {1}, 'r10': {2}, 'r12': {RV3}, 'r14': {2}},
             'reuse-remap': {'r8': {1}, 'r9': {1}, 'r10': {2}, 'r12': {RV2}},
             'reuse-cross': {'r8': {0x100}, 'r9': {RV1 + 0xffe}, 'r10': {0x100}, 'r12': {RV2 + 0xffe}, 'r14': {0x200}, 'r15': {RV2 + 0xffe}},
+            'pic-two': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
+            'pic-fork': {'r8': {RV1}, 'r9': {RV1}, 'r10': {RV1 + YN}},
+            'pic-invlpg': {'r8': {1}, 'r9': {2}, 'r12': {RV3}, 'r10': {1}},
+            'pic-write': {'r8': {1}, 'r9': {3}, 'r10': {3}},
+            'pic-abs': {'r8': {RV1}, 'r9': {RV1 + YN}, 'r10': {RV2}, 'r12': {RV2 + YN}},
+            'pic-pge': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV1}},
+            'pic-gmap': {'r8': {RV3}, 'r9': {RV3}, 'r10': {RV3 + YN}},
+            'pic-ctx': {'r8': {RV1}, 'r9': {RV1 + YN}},
+            'pic-twosrc': {'r8': {RV3}, 'r9': {RV5}},
+            'pic-cow': {'r8': {2}, 'r9': {RV1}, 'r10': {1}, 'r12': {1}},
+            'pic-twoframe': {'r8': {RV3}, 'r9': {RV5}, 'r10': {1}, 'r12': {2}},
+            'pic-xm': {'r8': {5}, 'r9': {4}, 'r10': {0}, 'r12': {5}, 'rdi': {RV3 + ZO}},
+            'pic-flush': {'r8': {RV3}, 'r9': {RV5}, 'r10': {RV3}, 'r12': {RV5}},
+            'pic-write2': {'r8': {1}, 'r9': {3}, 'r10': {3}},
+            'pic-pfault': {'r8': {RV3 + W_FAULT}, 'r9': {PF_VA}, 'r10': {0}, 'r12': {RV1 + W_FAULT}},
+            'pic-xwrite': {'r8': {1}, 'r9': {3}, 'r10': {3}},
+            'pic-rep': {'r8': {0}, 'r9': {d + DST + 0x40}, 'r10': {9}, 'r12': {d + DST + 0x40}},
+            'pic-repexit': {'r8': {13}, 'r9': {0}, 'r10': {d + 0x7d01}, 'r12': {d + 0x7d01}},
+            'pic-again': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
+            'pic-user': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
         }[name]
     return judge
-REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1)}
+REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC}}
 
 IDT = 0x3000
 CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
 CTX_MXCSR = (0x1f80, 0x0f80, 0x1780, 0x1d80, 0x1e80)
 
 
-def ctx_idt(d):
+def again_idt(d):
+    """`pic-again`: an IDT at d + IDT with #GP (13, handler .h13) and #PF (14, .h14)."""
+    return ctx_idt(d, (13, 14))
+
+
+def ctx_idt(d, vectors=(7, 19)):
     """`contexts`: an IDT at d + IDT with #NM (7, handler .h7) and #XM (19, .h19)."""
     gate = lambda v: (f'    lea rax, [rel .h{v}]\n    mov [{d + IDT + 16 * v:#x}], ax\n    mov word [{d + IDT + 16 * v + 2:#x}], 8\n'
                       f'    mov word [{d + IDT + 16 * v + 4:#x}], 0x8e00\n    shr rax, 16\n    mov [{d + IDT + 16 * v + 6:#x}], ax\n'
                       f'    shr rax, 16\n    mov [{d + IDT + 16 * v + 8:#x}], eax\n')
-    return (gate(7) + gate(19) + f'    mov word [{d + IDT + 0x800:#x}], 0xfff\n    mov rax, {d + IDT:#x}\n    mov [{d + IDT + 0x802:#x}], rax\n'
+    return (''.join(gate(v) for v in vectors) + f'    mov word [{d + IDT + 0x800:#x}], 0xfff\n    mov rax, {d + IDT:#x}\n    mov [{d + IDT + 0x802:#x}], rax\n'
             f'    lidt [{d + IDT + 0x800:#x}]\n')
 
 
@@ -645,8 +846,13 @@ def adv_program(name, n):
 
 def run(a, prog, extra, host=None, runtime=None, tag=''):
     work = a.out / 'work' / f"{prog['name']}{tag}{'-1' if extra else ''}"
-    options = FULL_CODE if prog['name'].startswith('k1-link-full@') else []
-    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=300)
+    full = prog['name'].startswith('k1-link-full@')
+    options = FULL_CODE if full else []
+    # PIC study stage 3: link-full's one frame at FM addresses would be one shared translation linked once; the record
+    # area's capacity is tested on absolute code (each address its own blocks and links).
+    mode = PIC_ENV.get(prog['name'][3:].split('@')[0])
+    env = dict(os.environ, NATEMU_PIC=mode) if mode else None
+    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=300, env=env)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
     for v, c in enumerate(out['cpus'] if out else []):
         end = s3.body_end(prog, smp.num(prog['cpus'][v]['rip']))
@@ -684,6 +890,8 @@ def main():
                     continue
             for extra in ([], [1]):
                 out, problems = run(a, prog, extra)
+                if name in ('pic-ctx', 'pic-xm'):  # (as `contexts`: once per context)
+                    problems = [p for p in problems if 'host requests' not in p]
                 if name == 'contexts':  # its blocks are translated once per context, not once per RIP (the check's count)
                     problems = [p for p in problems if 'host requests' not in p]
                     # The L1 tables of the A/C alternation are kept and switched between, not cleared at every change.
@@ -698,6 +906,17 @@ def main():
                     reuse = c['stats']['k1']['reuse']
                     if reuse['copies'] < REUSE[name][0] or reuse['refused'][0] < REUSE[name][1]:
                         problems.append(f"cpu{v} reuse {reuse}, at least {REUSE[name]} (copies, refused[0])")
+                # PIC study stage 3: the least instances, checked links and local shared links (natemu_abi::pic::count).
+                for v, c in enumerate(out['cpus'] if out and name in PIC else []):
+                    pic = c['stats']['k1']['pic']
+                    got = (pic[26], pic[28], pic[10])
+                    if any(g < w for g, w in zip(got, PIC_MIN[name])):
+                        problems.append(f'cpu{v} (instances, checked links, local links) {got}, at least {PIC_MIN[name]}')
+                    for k, least, most in PIC_COUNT.get(name, []):
+                        if pic[k] < least or most is not None and pic[k] > most:
+                            problems.append(f'cpu{v} pic counter {k} = {pic[k]}, want {least}..{most}')
+                    if name == 'pic-flush' and c['stats']['flushes'] < 2:
+                        problems.append(f"cpu{v} flushes {c['stats']['flushes']}, want the driver's and the program's")
                 # Perf chunk 11: the record area filled (more links made than it holds, no flush but the driver's first)
                 # and each fill cost at most two passes over it, each followed by at least a quarter of the area's links.
                 for v, c in enumerate(out['cpus'] if out and name == 'link-full' else []):

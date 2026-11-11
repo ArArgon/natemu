@@ -89,8 +89,14 @@ fn staged() -> Header {
 
 /// Stops this vCPU; the host reads `reason` and the record. The host may never resume it, so it first drops every
 /// shadow and writable bit unasked (as if serving `SHADOWS`): no peer ever waits on a vCPU that has stopped.
+#[track_caller]
 fn halt(s: &State, reason: u64) -> ! {
     let mut s = *s; // the one copy, in this frame (callers pass a reference: the resident stack bound)
+    // (A link record or word that is not the cache's names nothing of its own: the halting line, for the report.)
+    // (Its sites write [0, 0, ELR] or nothing: the line goes in the first word, a stale record's being no use.)
+    if reason == stop::BAD_LINK {
+        s.native[0] = u64::from(core::panic::Location::caller().line());
+    }
     served(&mut s);
     reset_shadows(&mut s);
     s.stop = reason;
@@ -559,32 +565,32 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
         s.linker += 1;
         // The block that ran the `svc` (one search: nothing below changes the cache before `find`).
         let ran = cache::block_at(elr.wrapping_sub(4));
-        // PIC study stage 2: a position-independent block's x0 was built from the guest-writable page base; the RIP is
-        // its link point's target (the block's own address), a disagreeing x0 only counted.
-        if let Some(p) = ran.filter(|b| b.flags & cache::PIC != 0).and_then(|b| {
-            let at = link_point_of(b, elr.wrapping_sub(4))?;
-            b.links.iter().find(|p| u64::from(p.offset) == at)
-        }) {
-            if p.target != s.cpu.rip {
-                slot_mismatch();
+        // PIC study stage 3: shared code runs for the address its page-base slot names ([`cache::running_rip`]); its link
+        // points' targets are its translation's, moved there (x0, built from the same slot, is the same).
+        let here = ran.map_or(0, |b| cache::running_rip(b));
+        let moved = |b: &Block, p: &LinkPoint| p.target.wrapping_sub(b.rip).wrapping_add(here);
+        if let Some(b) = ran.filter(|b| b.flags & cache::PIC != 0) {
+            let at = link_point_of(b, elr.wrapping_sub(4));
+            if let Some(p) = b.links.iter().find(|p| at == Some(u64::from(p.offset))) {
+                s.cpu.rip = moved(b, p);
             }
-            s.cpu.rip = p.target;
         }
         // A REP string's self-exit (X2): the boundary is between two of its iterations.
+        let exit = s.cpu.rip;
         if let Some(b) =
             ran.filter(|b| link_point_of(b, elr.wrapping_sub(4)).is_some_and(|o| b.rep_exit(o)))
         {
             rep_exited(&mut s, b);
         }
         completed(&mut s);
-        // The RIP must be one of the block's link targets (its `svc #LINK` follows that target's move).
-        let target = |b: &Block| {
-            b.links
-                .iter()
-                .any(|p| p.offset != 0 && p.target == s.cpu.rip)
-        };
+        // The exit's RIP must be one of the block's link targets (its `svc #LINK` follows that target's move).
+        let target = |b: &Block| b.links.iter().any(|p| p.offset != 0 && moved(b, p) == exit);
         let source = match ran {
             Some(b) if b.flags & cache::STEP != 0 && target(b) => None,
+            // A REP self-exit that finished its string (RCX = 0) goes on past the instruction: the block found there is
+            // no target of the exit's point, and linking the points that name it would patch links the exit did not
+            // take (for shared code, maybe in another form: the BAD_LINK the slices hit).
+            Some(b) if b.flags & cache::DEAD == 0 && target(b) && s.cpu.rip != exit => None,
             Some(b) if b.flags & cache::DEAD == 0 && target(b) => Some(b),
             _ => {
                 s.native = [0, 0, elr];
@@ -614,11 +620,10 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             // RIP (the STI's exit to its own start must reach `find`, which runs it when an event is held: linked, it would
             // re-enter the block in a loop; one live block per RIP and context makes this the block itself).
             Some(source)
-                if target.flags & source.flags & cache::STI_FIRST != 0
-                    && target.rip == source.rip => {}
+                if target.flags & source.flags & cache::STI_FIRST != 0 && target.rip == here => {}
             Some(source) => match {
                 let p = crate::perf::enter(crate::perf::PATCH);
-                let linked = cache::link(source, target);
+                let linked = cache::link(source, target, here);
                 crate::perf::leave(p);
                 linked
             } {
@@ -681,7 +686,12 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
         b.flags & cache::PIC != 0
             && link_point_of(b, elr.wrapping_sub(4))
                 .and_then(|at| b.links.iter().find(|p| u64::from(p.offset) == at))
-                .is_none_or(|p| p.target != rip)
+                .is_none_or(|p| {
+                    p.target
+                        .wrapping_sub(b.rip)
+                        .wrapping_add(cache::running_rip(b))
+                        != rip
+                })
     });
     if pic_mismatch {
         return declined(s, rip, SysFastDecline::Other);
@@ -701,7 +711,14 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     };
     let ordinary = ran.flags & (cache::STEP | cache::DEAD) == 0
         && !link_point_of(ran, svc).is_some_and(|o| ran.rep_exit(o));
-    if !ordinary || !ran.links.iter().any(|p| p.offset != 0 && p.target == rip) {
+    // (Shared code's link targets are its translation's, moved to the address it runs for, as in `linker`.)
+    let here = cache::running_rip(ran);
+    if !ordinary
+        || !ran
+            .links
+            .iter()
+            .any(|p| p.offset != 0 && p.target.wrapping_sub(ran.rip).wrapping_add(here) == rip)
+    {
         return declined(s, rip, SysFastDecline::Boundary);
     }
     bank(&mut s.cpu, frame, frame.nzcv, true);
@@ -937,7 +954,33 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             Some(0)
         } else {
             s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
-            match cache::copy(b, rip, s.source_gpa, walked(s)) {
+            // PIC study stage 3: a shared translation's instance; an eligible absolute template is shared first, the first
+            // time a second address needs its code (the lazy rewrite: fixed-address code never pays); others are copied.
+            let walk = walked(s);
+            // None where the stop RIP or a host fence lies on RIP's page or the next (review of stage 3, finding 1): the
+            // fence check above sees only this block's bytes, while its translation's local links (made at another
+            // address) reach any block starting on its start page, which may run into the next, with no request at this
+            // address. (A translation is then not copied either: `copy` refuses it.)
+            let page_fenced = |f| natemu_abi::execution::reuse_fenced(rip & !4095, true, f);
+            let limited = c.reuse_fences.iter().any(|&f| page_fenced(f))
+                || page_fenced([s.stop_at, s.stop_at.wrapping_add(1)]);
+            let shared = if limited {
+                None
+            } else if b.flags & cache::TRANSLATION != 0 {
+                Some(b)
+            } else if b.flags & cache::ELIGIBLE != 0
+                && walk & cache::GLOBAL == 0
+                && cache::shares(b.context)
+            {
+                cache::share(b)
+            } else {
+                None
+            };
+            let made = match shared {
+                Some(t) => cache::instance(t, rip, s.source_gpa, walk),
+                None => cache::copy(b, rip, s.source_gpa, walk),
+            };
+            match made {
                 Ok(placed) => {
                     crate::perf::leave(p);
                     if placed.is_some() {
@@ -976,19 +1019,21 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
         crate::perf::leave(p);
         return false;
     }
+    // PIC study stage 3: an instance's code, sites, relocations and computed exit are its translation's.
+    let t = cache::code_of(copy);
     let same = match reply {
         Reply::Block(h) => {
             let code = |k: u64| unsafe {
-                ((natemu_abi::execution::cache::CODE_WRITE_VA + u64::from(copy.code) + 4 * k)
+                ((natemu_abi::execution::cache::CODE_WRITE_VA + u64::from(t.code) + 4 * k)
                     as *const u32)
                     .read_volatile()
             };
             let staged = |k: u64| staged_word(&h, 4 * k);
-            let sites = cache::sites(copy);
+            let sites = cache::sites(t);
             // The computed exit's word is `b` to its context's dispatcher slot from the copy's place (perf chunk 12).
-            let at = u64::from(copy.code) + u64::from(copy.dispatch_exit);
-            let dispatch = copy.dispatch_exit == 0
-                || code(u64::from(copy.dispatch_exit) / 4)
+            let at = u64::from(t.code) + u64::from(t.dispatch_exit);
+            let dispatch = t.dispatch_exit == 0
+                || code(u64::from(t.dispatch_exit) / 4)
                     == 0x1400_0000
                         | (cache::dispatcher_for(copy.context).wrapping_sub(at) >> 2) as u32
                             & 0x03ff_ffff;
@@ -1002,7 +1047,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             let packed = (0..h.relocs_count).filter_map(|i| {
                 natemu_abi::execution::pack_reloc(&reloc(i), h.code_size).flatten()
             });
-            let relocs = cache::relocs(copy);
+            let relocs = cache::relocs(t);
             let inherited = s.relocatable == 1
                 && packed.clone().count() == relocs.len()
                 && packed.clone().all(|r| relocs.binary_search(&r).is_ok());
@@ -1012,8 +1057,8 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                     h.sites_count as usize,
                 )
             };
-            let pic = copy.flags & cache::PIC != 0;
-            // PIC study stage 2: a position-independent copy is the host's answer at its RIP rewritten ([`natemu_abi::pic::
+            let pic = t.flags & cache::PIC != 0;
+            // PIC study: a shared translation's instance (its code) is the host's answer at its RIP rewritten ([`natemu_abi::pic::
             // proved`] of the copy against it: literal slots, the tail's RIP, not compared; the full entry's `and` before
             // it) when fexc chose the same move lengths there. Where it chose others (a move of another length shifts what
             // follows: the code size, site, exit, `svc` and relocation offsets; alignment padding may hide it from the code
@@ -1024,13 +1069,13 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             let same_shape = || {
                 let staged_at = |o: u64| staged_word(&h, o);
                 let copy_at = |o: u64| code(o / 4);
-                h.code_size == copy.code_size
+                h.code_size == t.code_size
                     && inherited
                     && sites.iter().zip(staged_sites).all(|(a, b)| {
                         (a.native_offset, a.insn_native_offset)
                             == (b.native_offset, b.insn_native_offset)
                     })
-                    && s.dispatch_exit == u64::from(copy.dispatch_exit)
+                    && s.dispatch_exit == u64::from(t.dispatch_exit)
                     && s.link_points.iter().zip(&copy.links).all(|(a, b)| {
                         a.offset == b.offset
                             && (a.offset == 0
@@ -1041,7 +1086,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             let invariant = || {
                 s.relocatable == 1
                     && packed.clone().count() == relocs.len()
-                    && (h.sites_count, h.guest_bytes) == (copy.sites_count, copy.guest_bytes)
+                    && (h.sites_count, h.guest_bytes) == (t.sites_count, copy.guest_bytes)
                     && sites.iter().zip(staged_sites).all(|(a, b)| {
                         (a.guest_offset, a.kind, a.width) == (b.guest_offset, b.kind, b.width)
                     })
@@ -1053,43 +1098,50 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                         == (
                             u64::from(copy.rep_exits),
                             copy.source_gpa,
-                            copy.dispatch_exit == 0,
+                            t.dispatch_exit == 0,
                         )
                     && (s.sti_first != 0) == (copy.flags & cache::STI_FIRST != 0)
             };
-            if pic && !same_shape() && invariant() {
+            // (Review of stage 3, finding 4a: then the moves' values are compared, in order.)
+            if pic
+                && !same_shape()
+                && invariant()
+                && natemu_abi::pic::moves_agree(
+                    |o| staged_word(&h, o as u64),
+                    h.code_size as usize,
+                    packed.clone(),
+                    |o| cache::unlinked_word(t, o),
+                    t.code_size as usize,
+                    relocs,
+                    copy.rip,
+                )
+            {
                 cache::control().pic_counts[natemu_abi::pic::count::CHECK_SHAPE] += 1;
                 crate::perf::leave(p);
                 return true;
             }
             let code_same = if pic {
-                let at = natemu_abi::execution::cache::CODE_WRITE_VA + u64::from(copy.code);
-                let (copied, admitted) = unsafe {
-                    (
-                        core::slice::from_raw_parts(at as *const u8, copy.code_size as usize),
-                        core::slice::from_raw_parts(
-                            (STAGING_VA + u64::from(h.code_offset)) as *const u8,
-                            h.code_size as usize,
-                        ),
-                    )
-                };
+                // (The translation's code as its link points were admitted: links may have patched it since.)
+                let at = natemu_abi::execution::cache::CODE_WRITE_VA + u64::from(t.code);
                 let and = unsafe { ((at - 4) as *const u32).read_volatile() };
                 and == natemu_abi::pic::AND_PAGE
+                    && h.code_size == t.code_size
                     && natemu_abi::pic::proved(
-                        admitted,
-                        copied,
+                        |o| staged_word(&h, o as u64),
+                        |o| cache::unlinked_word(t, o),
+                        t.code_size as usize,
                         relocs,
                         &copy.links,
                         copy.rip,
-                        copy.dispatch_exit,
+                        t.dispatch_exit,
                     )
             } else {
                 (0..u64::from(h.code_size) / 4).all(|k| {
-                    (copy.dispatch_exit != 0 && 4 * k == u64::from(copy.dispatch_exit))
+                    (t.dispatch_exit != 0 && 4 * k == u64::from(t.dispatch_exit))
                         || code(k) == staged(k)
                 })
             };
-            // (A position-independent copy's link points hold the rewritten moves' first word.)
+            // (A shared translation's link points hold the rewritten moves' first word.)
             let links_same = s.link_points.iter().zip(&copy.links).all(|(a, b)| {
                 (a.offset, a.target) == (b.offset, b.target)
                     && (a.word == b.word || pic && b.word == natemu_abi::pic::load_base(0))
@@ -1097,13 +1149,13 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             // Each failed condition's bit, for the halt's record.
             [
                 (h.code_size, h.sites_count, h.guest_bytes)
-                    == (copy.code_size, copy.sites_count, copy.guest_bytes),
+                    == (t.code_size, t.sites_count, copy.guest_bytes),
                 code_same,
                 sites == staged_sites,
                 links_same,
                 (s.dispatch_exit, s.rep_exits, s.source_gpa)
                     == (
-                        u64::from(copy.dispatch_exit),
+                        u64::from(t.dispatch_exit),
                         u64::from(copy.rep_exits),
                         copy.source_gpa,
                     ),
@@ -1119,7 +1171,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
     };
     crate::perf::leave(p);
     if same != 0 {
-        s.native = [copy.rip, u64::from(copy.code), same];
+        s.native = [copy.rip, u64::from(t.code), same];
         halt(s, stop::REUSE_MISMATCH)
     }
     true
@@ -1450,7 +1502,11 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     // Every later resident entry follows a completed instruction but a stop at this block's first word, which arms
     // instead ([`interrupted`]): the shadow ends here, exactly.
     let shadowed = s.cpu.mov_ss != 0 || s.sti_shadow != 0;
-    s.shadow_entry = if shadowed { block.entry() } else { 0 };
+    s.shadow_entry = if shadowed {
+        cache::code_of(block).entry()
+    } else {
+        0
+    };
     (s.cpu.mov_ss, s.sti_shadow) = (0, 0);
     for (at, value) in frame::flag_bytes(s.cpu.rflags) {
         // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; `at` lies inside it.
@@ -1556,18 +1612,38 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     f.x[SRA[16] as usize] = pf;
     f.x[SRA[17] as usize] = af;
     f.x[28] = cache::control().guest_state_va;
-    // PIC study stage 2: a position-independent block is entered at its body: its page base is written here, the slot's
-    // only writer but the block's own full entry (`pic::STORE_BASE`).
-    let mut pc = block.entry();
-    if block.flags & cache::PIC != 0 {
+    // PIC study: a shared translation's instance is entered at its translation's body: its page base is written here, the
+    // slot's only writer but the code's own full entry (`pic::STORE_BASE`).
+    let code = cache::code_of(block);
+    let mut pc = code.entry();
+    if code.flags & cache::PIC != 0 {
         let test = match cache::control().pic_test {
             t if s.blocks % 2 == 0 => t,
             _ => 0,
         };
-        let forged = if test == cache::PIC_TEST_FORGE {
-            0x1000
-        } else {
-            0
+        // (Forged in the run's first entries only: the programs then run clean, their values exact again.)
+        let forges = &mut cache::control().pic_forged;
+        let test = match test {
+            cache::PIC_TEST_FORGE
+            | cache::PIC_TEST_FORGE_NONCANONICAL
+            | cache::PIC_TEST_FORGE_HALF
+                if *forges >= natemu_abi::execution::cache::PIC_FORGES =>
+            {
+                0
+            }
+            cache::PIC_TEST_FORGE
+            | cache::PIC_TEST_FORGE_NONCANONICAL
+            | cache::PIC_TEST_FORGE_HALF => {
+                *forges += 1;
+                test
+            }
+            t => t,
+        };
+        let forged = match test {
+            cache::PIC_TEST_FORGE => 0x1000,
+            cache::PIC_TEST_FORGE_NONCANONICAL => 1 << 47,
+            cache::PIC_TEST_FORGE_HALF => 0xffff_8000_0000_0000,
+            _ => 0,
         };
         unsafe {
             (FRAME_VA as *mut u64)
@@ -1577,8 +1653,8 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
         // The tests' entries ([`cache::Control::pic_test`]): x0 as an L1 entry or the full entry's `and` leaves it (the
         // next resident entry zeroes it again, [`returned`]).
         match test {
-            cache::PIC_TEST_AND => (f.x[0], pc) = (block.rip, block.full_entry()),
-            cache::PIC_TEST_STR => (f.x[0], pc) = (block.rip & !0xfff, block.code_va()),
+            cache::PIC_TEST_AND => (f.x[0], pc) = (block.rip, code.full_entry()),
+            cache::PIC_TEST_STR => (f.x[0], pc) = (block.rip & !0xfff, code.code_va()),
             _ => {}
         }
         if matches!(
@@ -1589,9 +1665,7 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
         }
     }
     // (And the `svc`-word links of any block, absolute ones' into position-independent targets included.)
-    if cache::control().pic_test == cache::PIC_TEST_SVC
-        && s.blocks % 2 == 0
-        && cache::arm_svc(block)
+    if cache::control().pic_test == cache::PIC_TEST_SVC && s.blocks % 2 == 0 && cache::arm_svc(code)
     {
         s.stop_wanted = 1;
     }
@@ -1691,6 +1765,19 @@ unsafe fn missed(frame: &NativeFrame) -> ! {
     bank(&mut s.cpu, frame, frame.nzcv, true);
     completed(&mut s);
     s.cpu.rip = frame.x[0];
+    // PIC study (`pic-count` builds only): the miss by what it needs (no walk: as the dispatcher would have found it).
+    #[cfg(feature = "pic-count")]
+    {
+        let context = s.cpu.code_context();
+        let k = if cache::current_at(s.cpu.rip, context).is_some() {
+            natemu_abi::pic::count::MISS_CURRENT
+        } else if cache::kept_at(s.cpu.rip, context).is_some() {
+            natemu_abi::pic::count::MISS_REVALIDATE
+        } else {
+            natemu_abi::pic::count::MISS_NEW
+        };
+        cache::control().pic_counts[k] += 1;
+    }
     unsafe { dispatch(&mut s) }
 }
 /// Halts with `native` in the record.
@@ -1815,7 +1902,8 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     // PIC study (`pic-count` builds): in a link's counting stub, the exit's state: the vCPU stops at the target's start.
     #[cfg(feature = "pic-count")]
     if let Some(b) = cache::stub_target(elr) {
-        let mut s = at_once(s, b.rip);
+        let rip = b.map_or(frame.x[0], cache::running_rip);
+        let mut s = at_once(s, rip);
         completed(&mut s);
         s.stops_entry += 1;
         unsafe { dispatch(&mut s) }
@@ -1832,29 +1920,25 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     // PIC study stage 2: a position-independent block's full entry (its `and`, x0 = its RIP; its `str`, x0 = its page
     // base) is its first word too, and at its body entry the page base is in the guest-state page: the RIP is the
     // block's own, a disagreeing x0 or slot only counted.
+    // PIC study: a shared translation's full entry (its `and`, x0 = the address; its `str`, x0 = the page base) is its first
+    // word too, and at its body entry the page base is in the slot: the stop is at the address entered.
+    let mut entered = b.rip;
     if b.flags & cache::PIC != 0 && [b.full_entry(), b.code_va(), b.entry()].contains(&elr) {
-        let slot = unsafe {
-            (FRAME_VA as *const u64)
-                .byte_add(frame::PAGE_BASE as usize)
-                .read_volatile()
-        };
-        let seen = match elr {
-            e if e == b.full_entry() => frame.x[0],
-            e if e == b.code_va() => frame.x[0] | b.rip & 0xfff,
-            _ => slot | b.rip & 0xfff,
-        };
-        if seen != b.rip {
-            slot_mismatch();
-        }
         let word = [b.full_entry(), b.code_va(), b.entry()]
             .iter()
-            .position(|&e| e == elr);
-        cache::control().pic_counts[natemu_abi::pic::count::ENTRY_STOPS + word.unwrap_or(2)] += 1;
+            .position(|&e| e == elr)
+            .unwrap_or(2);
+        entered = match word {
+            0 => frame.x[0],
+            1 => frame.x[0] & !0xfff | b.rip & 0xfff,
+            _ => cache::running_rip(b),
+        };
+        cache::control().pic_counts[natemu_abi::pic::count::ENTRY_STOPS + word] += 1;
     }
     if (elr == b.entry() || (b.flags & cache::PIC != 0 && elr < b.entry() && elr >= b.full_entry()))
         && (b.flags & cache::STEP != 0 || (!b.starts_with_rep() && s.shadow_entry != elr))
     {
-        let mut s = at_once(s, b.rip);
+        let mut s = at_once(s, entered);
         s.stops_entry += 1;
         // The step block is entered again (see [`stopped`]).
         if b.flags & cache::STEP != 0 {
@@ -1886,11 +1970,6 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
         )
     }
 }
-/// PIC study stage 2: the page base slot disagreed with the block's own address where the resident saw both (never acted
-/// on: the resident uses the block's address).
-fn slot_mismatch() {
-    cache::control().pic_counts[natemu_abi::pic::count::SLOT_MISMATCH] += 1;
-}
 /// x86 alignment checking is on (SDM Vol.3 7.15 #AC: CR0.AM, RFLAGS.AC and CPL 3), as a flag for the gates: generated
 /// code then runs with SCTLR_EL1.A, so a misaligned data access at any site takes an alignment fault before any
 /// translation ([`access_aborted`] makes it #AC(0)); the resident's own explicit accesses at CPL 3 check it in
@@ -1918,24 +1997,26 @@ unsafe fn stopped(
         .filter(|_| armed[..n].iter().any(|&o| u64::from(o) == at))
         .and_then(|b| {
             let offset = at - u64::from(b.code);
-            // (PIC study stage 2: or the armed `svc` word of a link point linked there, x0 built: its target, a
-            // disagreeing x0 counted.)
-            let svc = |p: &&LinkPoint| {
-                cache::svc_slot(b, p) == offset && {
-                    if frame.x[0] != p.target {
-                        slot_mismatch();
-                    }
-                    cache::control().pic_counts[natemu_abi::pic::count::SVC_STOPS] += 1;
-                    true
-                }
-            };
-            match b
+            // (PIC study: at a link point's first word, its target moved to the address the code runs for; at the armed
+            // `svc` word of one linked there (checked), the move ran: x0.)
+            let first = b
                 .links
                 .iter()
-                .filter(|p| p.offset != 0)
-                .find(|p| u64::from(p.offset) == offset || svc(p))
-            {
-                Some(p) => Some(p.target),
+                .find(|p| p.offset != 0 && u64::from(p.offset) == offset);
+            let svc = b
+                .links
+                .iter()
+                .any(|p| p.offset != 0 && cache::svc_slot(b, p) == offset);
+            if svc {
+                cache::control().pic_counts[natemu_abi::pic::count::SVC_STOPS] += 1;
+            }
+            match first {
+                Some(p) => Some(
+                    p.target
+                        .wrapping_sub(b.rip)
+                        .wrapping_add(cache::running_rip(b)),
+                ),
+                None if svc => Some(frame.x[0]),
                 None => (b.dispatch_exit != 0 && offset == u64::from(b.dispatch_exit))
                     .then_some(frame.x[0]),
             }
@@ -2684,7 +2765,7 @@ const RFLAGS_TF: u64 = 1 << 8;
 /// boundary x86 has there (the REP ends `b`; a REP with RCX = 0 changes nothing).
 fn rep_exited(s: &mut State, b: &Block) {
     if s.cpu.gpr[1] == 0 {
-        s.cpu.rip = b.rip.wrapping_add(u64::from(b.guest_bytes));
+        s.cpu.rip = cache::running_rip(b).wrapping_add(u64::from(b.guest_bytes));
     } else {
         s.mid_string = 1;
     }
@@ -2724,7 +2805,7 @@ fn bank_at(s: &mut State, f: &NativeFrame, b: &Block, site: &Site) {
         _ => f.nzcv,
     };
     bank(&mut s.cpu, f, nzcv, site.cf_inverted != 0);
-    s.cpu.rip = b.rip.wrapping_add(site.guest_offset as u64);
+    s.cpu.rip = cache::running_rip(b).wrapping_add(site.guest_offset as u64);
 }
 
 /// Self-modifying code: the instruction at `site` of `b` writes `gpa`'s page (a store, a split store or its walk's

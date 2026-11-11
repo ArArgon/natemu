@@ -142,14 +142,14 @@ sys.path.insert(0, str(ROOT / 'tools' / 'bench' / 'smp'))
 import ref, run_slice1_vm as vm, run_slice1_faults as faults, smp, model_smp, programs  # noqa: E402
 
 
-def driver(host, runtime, fexc, text, work, extra=(), timeout=None):
+def driver(host, runtime, fexc, text, work, extra=(), timeout=None, env=None):
     """Runs one description; (returncode, stdout JSON or None, stderr). A run still going after `timeout` seconds is
-    killed: returncode 'timeout'."""
+    killed: returncode 'timeout'. `env`: the driver's environment (default: this one's)."""
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     try:
         run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *vm.frame_alias_args(), *CODE_SHAPE, *map(str, extra)],
-                             capture_output=True, text=True, timeout=timeout)
+                             capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
         err = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
         return 'timeout', None, f'killed after {timeout} s; stderr: {err[-1800:]}'

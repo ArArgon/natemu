@@ -1804,8 +1804,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         compiler.shape = code_shape;
         // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
         compiler.check_reuse = code_shape || check_reuse;
-        // PIC study stage 2: the test programs run at CPL 0 too; every privilege level's templates are placed
-        // position-independent, so the suites run the rewritten code (`NATEMU_PIC` overrides).
+        // PIC study: the test programs run at CPL 0 too; every privilege level's templates are shared when a second address
+        // needs them, so the suites run shared code (`NATEMU_PIC` overrides).
         compiler.pic = cache::PIC_ALL;
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
         let mut requests = execution::Requests {

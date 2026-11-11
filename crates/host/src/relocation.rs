@@ -284,7 +284,7 @@ mod tests {
             a.object[h.code_offset as usize..][..h.code_size as usize].to_vec()
         };
         for (from, to) in [(USER_A, USER_B), (USER_B, USER_A)] {
-            let (linked, relocs, mut links, bytes) = placed(from.0, from.1, USER);
+            let (linked, relocs, mut links, _) = placed(from.0, from.1, USER);
             let original = admitted(from.0, from.1);
             let mut code = original.clone();
             for p in links.iter().filter(|p| p.offset != 0) {
@@ -297,7 +297,15 @@ mod tests {
             }
             assert_eq!(pic::eligible(&code, &relocs, &links, from.1), Ok(()));
             assert_eq!(pic::rewrite(&mut code, &relocs, &mut links, from.1), Ok(()));
-            assert!(pic::proved(&original, &code, &relocs, &links, from.1, 0));
+            assert!(pic::proved(
+                w(&original),
+                w(&code),
+                code.len(),
+                &relocs,
+                &links,
+                from.1,
+                0
+            ));
             assert!(
                 links
                     .iter()
@@ -305,32 +313,38 @@ mod tests {
             );
             // Every move rewritten: no word of an absolute guest-RIP move of x0 or another register is left.
             assert_ne!(code, original);
-            // Copied: a link point linked in its first word and another in its `svc` word, both restored.
-            let mut copy = code.clone();
-            for (i, p) in links.iter().filter(|p| p.offset != 0).enumerate() {
-                let at = if i % 2 == 0 {
-                    p.offset as u64
-                } else {
-                    pic::svc_slot(
-                        |o| u32::from_le_bytes(copy[o as usize..][..4].try_into().unwrap()),
-                        p,
-                    )
-                };
-                copy[at as usize..][..4].copy_from_slice(&0x1400_0040u32.to_le_bytes());
+            // The same code at the other RIP (an instance's: link targets moved there) is the object admitted there
+            // rewritten; not with the template's targets, and not against the template's object.
+            let there = admitted(to.0, to.1);
+            fn w(o: &[u8]) -> impl Fn(usize) -> u32 + '_ {
+                move |at| u32::from_le_bytes(o[at..at + 4].try_into().unwrap())
             }
             let mut moved = links;
-            assert_eq!(
-                pic::relocate(&mut copy, &mut moved, from.1, to.1, bytes),
-                Ok(())
-            );
-            assert_eq!(copy, code, "the copy's code is the template's");
-            let there = admitted(to.0, to.1);
-            assert!(pic::proved(&there, &copy, &relocs, &moved, to.1, 0));
+            for p in moved.iter_mut().filter(|p| p.offset != 0) {
+                p.target = p.target.wrapping_add(to.1.wrapping_sub(from.1));
+            }
+            assert!(pic::proved(
+                w(&there),
+                w(&code),
+                code.len(),
+                &relocs,
+                &moved,
+                to.1,
+                0
+            ));
             assert!(
-                !pic::proved(&there, &copy, &relocs, &links, to.1, 0),
+                !pic::proved(w(&there), w(&code), code.len(), &relocs, &links, to.1, 0),
                 "the template's link targets"
             );
-            assert!(!pic::proved(&original, &copy, &relocs, &moved, to.1, 0));
+            assert!(!pic::proved(
+                w(&original),
+                w(&code),
+                code.len(),
+                &relocs,
+                &moved,
+                to.1,
+                0
+            ));
         }
     }
 
