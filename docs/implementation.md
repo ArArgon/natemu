@@ -82,10 +82,9 @@ short windows that every vCPU has acknowledged. Done, with independent replay:
 entropy, a persistent raw disk that survives clean shutdown and relaunch, the
 shared network frontend (tested with a test packet endpoint only), several
 performance repairs, safety stress coverage, and a repair of the serial console
-stall under sustained output. Remaining: a native network backend and combined
-disk/network acceptance. The network backend choice is still pending, because
-unprivileged vmnet admission failed and no privileged helper or libslirp
-fallback has been selected. Current status and the next assignment live in
+stall under sustained output. Since November 12 the network has a backend: user-mode NAT on libslirp
+(`--net`; vmnet still needs root). Remaining: network stress/edge cases and combined
+disk/network acceptance. Current status and the next assignment live in
 [INV-03-01](research/investigations/INV-03-01.md#current-io-state--november-9);
 measured numbers live in the [I/O benchmark record](restructure/io-benchmarks.md).
 

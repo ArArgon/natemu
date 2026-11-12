@@ -69,6 +69,9 @@ struct Cli {
     /// Writable raw disk image (exclusive use; successful S5 includes full-sync)
     #[arg(long, value_name = "FILE")]
     disk: Option<PathBuf>,
+    /// Expose a virtio-MMIO network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
+    #[arg(long)]
+    net: bool,
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
     #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
     compile_cache: Option<PathBuf>,
@@ -131,6 +134,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     boot.speculation_barriers = cli.speculation_barriers;
     boot.rng = cli.rng;
     boot.disk = cli.disk;
+    boot.net = cli.net;
     boot.initrd = cli.initrd.as_ref().map(read).transpose()?;
     boot.cmdline = cli.cmdline.unwrap_or_default();
     boot.ram = cli.ram.unwrap_or(boot.ram);

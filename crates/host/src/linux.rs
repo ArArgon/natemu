@@ -67,6 +67,8 @@ pub struct Boot {
     pub rng: bool,
     /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
     pub disk: Option<PathBuf>,
+    /// Expose the virtio-MMIO network device on user-mode NAT ([`crate::virtio::Slirp`]).
+    pub net: bool,
 }
 
 impl Boot {
@@ -93,6 +95,7 @@ impl Boot {
             speculation_barriers: false,
             rng: false,
             disk: None,
+            net: false,
         }
     }
 
@@ -123,6 +126,9 @@ impl Boot {
         }
         if self.disk.is_some() {
             manifest.push(crate::virtio::BLOCK_RESOURCE);
+        }
+        if self.net {
+            manifest.push(crate::virtio::NET_RESOURCE);
         }
         let tables = boot::acpi::build_with_virtio(self.vcpus, self.rsdp, &manifest);
         let inputs = Inputs {
@@ -174,6 +180,16 @@ impl Boot {
             devices.register(resource.base.into(), 4096, disk.device())?;
             virtio.push(disk);
         }
+        let mut net = None;
+        if self.net {
+            let resource = crate::virtio::NET_RESOURCE;
+            let mac = crate::virtio::Slirp::MAC;
+            let (device, port) =
+                crate::virtio::Virtio::network(irqs.clone(), resource.gsi as usize, mac)?;
+            net = Some(crate::virtio::Slirp::new(port)?);
+            devices.register(resource.base.into(), 4096, device.device())?;
+            virtio.push(device);
+        }
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
             backing,
@@ -183,6 +199,7 @@ impl Boot {
             irqs,
             board,
             virtio,
+            net: Mutex::new(net),
             fexc: self.fexc,
             max_block: self.max_block,
             stop_at: self.stop_at,
@@ -211,6 +228,8 @@ pub struct Prepared {
     irqs: crate::irq::Irqs,
     board: clock::Board,
     virtio: Vec<Arc<crate::virtio::Virtio>>,
+    /// The network backend, taken by the run.
+    net: Mutex<Option<crate::virtio::Slirp>>,
     fexc: PathBuf,
     max_block: Option<u32>,
     stop_at: Option<u64>,
@@ -484,6 +503,18 @@ impl Prepared {
                     })
                 })
                 .collect();
+            // The network backend ends once the device stops or drains.
+            let net = self.net.lock().unwrap().take().map(|backend| {
+                scope.spawn(|| {
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| backend.run()))
+                            .unwrap_or_else(|_| Err("network backend panicked".into()));
+                    if result.is_err() {
+                        owners::cancel_owners(&self.cancel);
+                    }
+                    result
+                })
+            });
             if sampling.load(SeqCst) {
                 scope.spawn(|| {
                     use exec::perf as rp;
@@ -512,7 +543,7 @@ impl Prepared {
                 device.stop();
             }
             let mut io_result = Ok(());
-            for thread in io {
+            for thread in io.into_iter().chain(net) {
                 let result = thread
                     .join()
                     .unwrap_or_else(|_| Err("virtio owner panicked".into()));

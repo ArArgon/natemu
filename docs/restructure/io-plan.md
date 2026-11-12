@@ -757,9 +757,21 @@ The test driver adds only a bounded metadata barrier; production code is unchang
 the two named schedules, not arbitrary SMP traffic, active same-queue reset or native
 callback/service lifetimes.
 
-Open: no native network is connected by these fixtures. The native network
-backend (vmnet admission decision pending, libslirp the alternative) and the
-combined disk/network acceptance remain required.
+**Backend (November 12).** A re-check of vmnet on macOS 26's new network API admitted a
+non-root interface with Apple's virtualization entitlement but delivered no traffic
+(no DHCP or ARP reply, no host bridge); socket_vmnet still runs that API as root
+(`natemu-raw/io-vmnet26-admission-20261112-01`). The owner chose libslirp with
+hand-written bindings. The `--net` option and backend
+([README](../../crates/host/src/virtio/README.md#network-backend---net)) pass DHCP,
+DNS, gateway ping, byte-exact HTTP, iperf3 TCP/UDP, HTTPS, a driver reset under a
+receive stream and SIGINT under traffic at 1/2/4 vCPUs, with independent review
+and replication (`natemu-raw/net-slirp-20261112-01`, `natemu-raw/net-replica-20261112-01`;
+throughput is recorded, not yet benchmarked: about 775 Mbit/s guest-to-host and 1.3 Gbit/s
+host-to-guest). This is the first scope of the network contract above, not all of it:
+IPv6 and ICMPv6, the mixed-family resolver correction (03-03 claim 59), the contained
+broker process (claim 70) and port forwarding remain follow-on work. Next: stress and
+edge cases (soak, many connections, overload, lifecycle), then combined disk/network
+acceptance and a benchmark round against QEMU user networking and VZ NAT.
 
 The independent fio preparation is followed by accepted functional admission.
 The first unmodified fio run parsed all eleven profiles but timed out during the

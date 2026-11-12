@@ -1,8 +1,8 @@
-//! virtio-net (fixture-only frontend): one RX/TX pair and bounded owned Ethernet packets. No
-//! backend holds guest addresses.
+//! virtio-net: one RX/TX pair and bounded owned Ethernet packets. No backend holds guest
+//! addresses; the native backend is [`super::slirp`].
 use super::*;
 use std::sync::{
-    Weak,
+    OnceLock, Weak,
     mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::time::Instant;
@@ -53,6 +53,8 @@ pub(super) struct Network {
     tx: SyncSender<Packet>,
     /// The port's result for that packet.
     done: Mutex<Receiver<Result<()>>>,
+    /// The backend's doorbell ([`PacketPort::on_ready`]).
+    ready: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 impl Network {
     /// Configuration space: mac, status, max_virtqueue_pairs (unused), mtu.
@@ -137,6 +139,16 @@ impl PacketPort {
         }
         Ok(true)
     }
+    /// `ready` runs (under the device lock: it must only signal) when a TX packet is queued, the RX
+    /// slot frees after a receive, and at stop or drain, so a backend can wait for those instead of
+    /// polling. Set once.
+    pub fn on_ready(&self, ready: impl Fn() + Send + Sync + 'static) {
+        if let Some(device) = self.device.upgrade() {
+            if let Profile::Network(network) = &device.profile {
+                let _ = network.ready.set(Box::new(ready));
+            }
+        }
+    }
     pub fn closed(&self) -> bool {
         self.device.upgrade().is_none_or(|device| {
             let s = device.lock();
@@ -175,6 +187,7 @@ impl Virtio {
                 mac,
                 tx: send,
                 done: Mutex::new(result),
+                ready: OnceLock::new(),
             }),
         );
         let port = PacketPort {
@@ -244,6 +257,14 @@ impl Virtio {
             false => Request::Canceled,
         })
     }
+    /// Ring the network backend's doorbell, if any.
+    pub(super) fn backend_ready(&self) {
+        if let Profile::Network(network) = &self.profile {
+            if let Some(ready) = network.ready.get() {
+                ready();
+            }
+        }
+    }
     /// Offer one TX packet to the backend while `id` is current: Some(true) if taken,
     /// Some(false) if the one slot is full (bounded loss, never a retained retry), None if reset.
     fn submit(&self, network: &Network, id: Identity, packet: Packet) -> Result<Option<bool>> {
@@ -252,7 +273,10 @@ impl Virtio {
             return Ok(None);
         }
         match network.tx.try_send(packet) {
-            Ok(()) => Ok(Some(true)),
+            Ok(()) => {
+                self.backend_ready();
+                Ok(Some(true))
+            }
             Err(TrySendError::Full(_)) => Ok(Some(false)),
             Err(TrySendError::Disconnected(_)) => {
                 Err("network transmit endpoint disconnected".into())
@@ -444,6 +468,36 @@ mod tests {
         );
         assert_eq!(calls, 1);
         d.stop();
+    }
+    #[test]
+    fn doorbell_rings_for_queued_tx_freed_rx_slot_drain_and_stop() {
+        let (d, p) = device();
+        let rings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = rings.clone();
+        p.on_ready(move || {
+            r.fetch_add(1, SeqCst);
+        });
+        let Profile::Network(n) = &d.profile else {
+            unreachable!()
+        };
+        let tx = d.lock().identity(1);
+        let packet = || Packet::new(&frame()).unwrap();
+        assert_eq!(d.submit(n, tx, packet()).unwrap(), Some(true));
+        assert_eq!(rings.load(SeqCst), 1, "a queued TX packet");
+        assert_eq!(d.submit(n, tx, packet()).unwrap(), Some(false));
+        assert_eq!(rings.load(SeqCst), 1, "a dropped one rings nothing");
+        let rx = d.lock().identity(0);
+        let q = d.lock().queues[0];
+        d.lock().in_flight.push(rx);
+        d.finish_request(Ok(Request::Empty), &mut Snapshot::new(256), q, rx)
+            .unwrap();
+        assert_eq!(rings.load(SeqCst), 2, "the RX slot is free again");
+        d.quiesce().unwrap();
+        d.drain().unwrap();
+        assert_eq!(rings.load(SeqCst), 3, "drained");
+        d.stop();
+        assert_eq!(rings.load(SeqCst), 4, "stopped");
+        assert!(p.closed());
     }
     #[test]
     fn terminal_backend_failure_cannot_become_successful_poweroff() {
