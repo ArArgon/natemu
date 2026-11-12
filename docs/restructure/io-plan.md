@@ -346,6 +346,13 @@ error, including EINTR, reports IOERR without replaying the issued request. Fail
 copies no payload, reports IOERR and the selected conservative used length
 (04-27's len=0 rule); verify the actual target Linux driver's status consumption.
 Failed OUT may have changed the image: report failure, never promise rollback.
+A FLUSH after a failed OUT (a synchronous pwrite error, already reported IOERR)
+still succeeds: nothing completed is left unsynced (a flush covers completed
+writes). A failed host sync is sticky for the launch (decision November 11, as
+QEMU's file-posix `page_cache_inconsistent`): after any fsync or F_FULLFSYNC
+error, every later FLUSH, write-through OUT and the S5 final sync fail without a
+call, since the host may have dropped dirty pages of writes already reported
+complete. A device reset does not clear it; only a new launch does.
 No physical power-loss proof is claimed by successful full-sync tests.
 
 ## Reset, shutdown and failure

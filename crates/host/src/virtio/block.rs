@@ -238,7 +238,10 @@ pub(super) struct Pool {
 }
 impl Pool {
     fn spawn(calls: impl Calls + 'static, bell: Arc<Bell>) -> Result<Self> {
-        let calls: Arc<dyn Calls> = Arc::new(calls);
+        let calls: Arc<dyn Calls> = Arc::new(Sticky {
+            calls,
+            failed: AtomicBool::new(false),
+        });
         // Every in-flight request and the final sync can be queued at once.
         let (jobs, queue) = mpsc::sync_channel::<Ticket>(MAX_REQUESTS + 1);
         let queue = Arc::new(Mutex::new(queue));
@@ -390,6 +393,37 @@ pub(super) trait Calls: Send + Sync {
     fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize>;
     /// `full`: to stable storage (F_FULLFSYNC); otherwise to the host OS (fsync).
     fn sync(&self, full: bool) -> std::io::Result<()>;
+}
+/// Host sync failures are sticky for the launch: after any failed sync (a guest FLUSH, a write-through OUT's
+/// sync or the power-off full sync), every later sync fails without a call. The host may have dropped dirty
+/// pages of writes already reported complete, so a later success would claim durability it cannot give. As
+/// QEMU's block/file-posix.c `handle_aiocb_flush` (pinned c1c18d1e): a failed fdatasync sets
+/// `page_cache_inconsistent` and "make[s] bdrv_flush() fail permanently". The pool, and so this flag, lives
+/// for the whole launch: a device reset does not clear it (the host data loss persists); a new launch does.
+/// A failed read or write does not set it (that request already reported IOERR; nothing completed is unsynced).
+struct Sticky<C> {
+    calls: C,
+    failed: AtomicBool,
+}
+impl<C: Calls> Calls for Sticky<C> {
+    fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.calls.read(bytes, offset)
+    }
+    fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+        self.calls.write(bytes, offset)
+    }
+    fn sync(&self, full: bool) -> std::io::Result<()> {
+        if self.failed.load(SeqCst) {
+            return Err(std::io::Error::other(
+                "an earlier host sync of this disk failed",
+            ));
+        }
+        let result = self.calls.sync(full);
+        if result.is_err() {
+            self.failed.store(true, SeqCst);
+        }
+        result
+    }
 }
 /// One positioned read or write per call (pread/pwrite: a short count is returned as is, EINTR
 /// is an error). A full sync is F_FULLFSYNC (`File::sync_all` on Apple platforms); a plain one is
@@ -1402,6 +1436,67 @@ mod tests {
             syncs: Mutex::default(),
             fail_sync: false,
         }
+    }
+    #[test]
+    fn a_failed_host_sync_fails_every_later_sync_but_a_failed_write_does_not() {
+        /// The first `n` syncs fail; a write at offset 0 fails.
+        struct Fails(AtomicUsize, Mutex<Vec<bool>>);
+        impl Calls for Fails {
+            fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+            fn write(&self, b: &[u8], o: u64) -> std::io::Result<usize> {
+                if o == 0 {
+                    return Err(std::io::Error::from_raw_os_error(28));
+                }
+                Ok(b.len())
+            }
+            fn sync(&self, full: bool) -> std::io::Result<()> {
+                self.1.lock().unwrap().push(full);
+                match self.0.fetch_sub(1, SeqCst) {
+                    0 => {
+                        self.0.store(0, SeqCst);
+                        Ok(())
+                    }
+                    _ => Err(std::io::Error::from_raw_os_error(5)),
+                }
+            }
+        }
+        let sticky = |n| Sticky {
+            calls: Fails(AtomicUsize::new(n), Mutex::default()),
+            failed: AtomicBool::new(false),
+        };
+        // A failed write is reported once; the FLUSH after it covers no lost completed write: OK.
+        let s = sticky(0);
+        assert!(
+            execute(&s, Job::Write(0, vec![1; 512], false))
+                .error
+                .is_some()
+        );
+        assert!(execute(&s, Job::Flush(false)).error.is_none());
+        // One failed sync: every later FLUSH, write-through OUT and the power-off full sync fail, with no call.
+        let s = sticky(1);
+        assert!(
+            execute(&s, Job::Write(512, vec![1; 512], false))
+                .error
+                .is_none()
+        );
+        assert!(execute(&s, Job::Flush(false)).error.is_some());
+        assert!(execute(&s, Job::Flush(false)).error.is_some());
+        assert!(
+            execute(&s, Job::Write(512, vec![1; 512], true))
+                .error
+                .is_some()
+        );
+        assert!(execute(&s, Job::Flush(true)).error.is_some());
+        assert_eq!(*s.calls.1.lock().unwrap(), [false]);
+        // Reads and plain writes still work.
+        assert!(execute(&s, Job::Read(512, 512)).error.is_none());
+        assert!(
+            execute(&s, Job::Write(512, vec![1; 512], false))
+                .error
+                .is_none()
+        );
     }
     /// Wait (at most 2 s) until `pool` has finished `n` more jobs.
     fn results(pool: &Pool, bell: &Bell, n: usize) -> Vec<(usize, Done)> {

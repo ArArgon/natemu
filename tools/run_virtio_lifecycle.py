@@ -303,13 +303,13 @@ def fixture(case, work):
         completed.append((q, 5, reread, 0, bytes(expected_disk[1024:2048])))
         readreg(0x70); reg(15)
     elif case == 'flush-error':
-        # A write, then a FLUSH whose fsync fails (IOERR), then a FLUSH whose fsync succeeds (OK: the sync error is not
-        # sticky), then a read of the written sector.
+        # A write, then a FLUSH whose fsync fails (IOERR), then a second FLUSH: still IOERR, with no host call (a host
+        # sync failure is sticky for the launch: block.rs `Sticky`), then a read of the written sector (reads still work).
         write = request(q, 0, 1, 8)
         avail(q, [0]); notify(); wait_used(q, 1); irq(q)
         expected_disk[4096:4608] = payload
         completed.append((q, 0, write, 0, b''))
-        for index, head, status in ((1, 3, 1), (2, 5, 0)):
+        for index, head, status in ((1, 3, 1), (2, 5, 1)):
             flush = request(q, head, 4)
             submit_next(q, head, index + 1); later_avail.append((q, index + 1, head))
             expect(flush['status'], status, 'byte')
@@ -533,8 +533,8 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         require(ordered(events, ['injected-eio', 'sync-enter', 'sync-ok', 'read:1024:1024', 'read-result:Ok(1024)', 'commit']), 'flush or re-read after the failure missing')
     elif case == 'flush-error':
         require(io['calls'] == 2 and events.count('commit') == 4, 'wrong call or completion count')
-        require(ordered(events, ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'sync-enter', 'sync-ok',
-                                 'commit', 'read:4096:512', 'read-result:Ok(512)', 'commit']), 'flush failure order mismatch')
+        require(events == ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'commit',
+                           'read:4096:512', 'read-result:Ok(512)', 'commit'], 'flush failure not sticky, or order mismatch')
     elif case == 'out-of-order':
         require(io['calls'] == 2 and events.count('commit') == 2 and events.count('backend-held') == 1, 'wrong call or completion count')
         require(ordered(events, ['read:512:512', 'read-result:Ok(512)', 'commit', 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'commit']),
@@ -628,7 +628,7 @@ def self_check():
         'read-error': ['read:0:512', 'read-result:Ok(256)', 'read:256:256', 'injected-eio', 'commit', 'read:512:512', 'read-result:Ok(512)', 'commit'],
         'write-error': ['write:4096:512', 'write-result:Ok(256)', 'write:4352:256', 'injected-eio', 'commit', 'read:4096:512', 'read-result:Ok(512)', 'commit', 'sync-enter', 'sync-ok', 'commit'],
         'malformed': ['read:512:512', 'read-result:Ok(512)', 'commit'],
-        'flush-error': ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'sync-enter', 'sync-ok', 'commit',
+        'flush-error': ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'commit',
                         'read:4096:512', 'read-result:Ok(512)', 'commit'],
         'malformed-later': ['read:0:512', 'read-result:Ok(512)', 'commit'],
         'fullqueue': ['sync-enter', 'sync-ok', 'commit'] * 64,
@@ -659,7 +659,9 @@ def self_check():
         'out-of-order': [lambda e: e[:3] + [e[4], e[3]] + e[5:]],  # released before the first commit
         'cancel-batch': [lambda e: e[:-1] + ['commit', 'commit']],
         # No injected failure, or no flush between the failure and the re-read.
-        'flush-error': [lambda e: [x.replace('sync-error', 'sync-ok') for x in e]],
+        # The first sync succeeded, or the second FLUSH made a host call (the failure was not sticky).
+        'flush-error': [lambda e: [x.replace('sync-error', 'sync-ok') for x in e],
+                        lambda e: e[:6] + ['sync-enter', 'sync-ok'] + e[6:]],
         **{case: [lambda e: [x for x in e if x != 'injected-eio'], lambda e: [x for x in e if not x.startswith('sync-')]] for case in BATCH_ERROR_CASES},
         'reset-mixed': [lambda e: e[:4] + e[5:], late_old_read],
         # Published before the lifecycle access deferred, or a second publication.
@@ -739,10 +741,11 @@ def self_check():
                     bad = copy.deepcopy(args); target(bad)['data'] = image.hex()
                     assert verify(*bad); controls += 1
             if case == 'flush-error':
-                # The failed FLUSH reported OK must fail.
-                image = bytearray(memory); image[0x5003] = 0
-                bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
-                assert verify(*bad); controls += 1
+                # Either FLUSH reported OK (the second: a non-sticky failure) must fail.
+                for status in (0x5003, 0x5005):
+                    image = bytearray(memory); image[status] = 0
+                    bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
+                    assert verify(*bad); controls += 1
             if case in BATCH_ERROR_CASES:
                 # The batch's used elements may come in any order; the failed request's short prefix
                 # published as data, or its status reported OK, must fail.

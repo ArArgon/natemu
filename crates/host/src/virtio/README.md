@@ -151,6 +151,10 @@ the fsync call does). The
 launch lock is `File::try_lock` (flock exclusive, nonblocking). Positive short calls advance their exact
 suffix; zero/error (including EINTR) reports IOERR without replay. Negotiated
 FLUSH permits writeback; otherwise each successful OUT includes an fsync.
+A failed read or write does not affect later FLUSHes. A failed host sync is
+sticky (`Sticky` in `block.rs`, as QEMU's file-posix): every later FLUSH,
+write-through OUT and the power-off full sync then fail without a call, for the
+rest of the launch; a device reset does not clear it.
 The stable ID derives from the opened file's device/inode and survives reset.
 
 The power-triggering port instruction commits before the resident enters a

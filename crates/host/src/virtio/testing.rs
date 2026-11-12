@@ -29,7 +29,8 @@ enum Mode {
     /// Among concurrent requests: the first call at file offset `BATCH_OFFSET` (read or write) is
     /// short (256 bytes), its continuation fails with EIO; every other call is normal.
     BatchError,
-    /// The first plain sync (a guest FLUSH or write-through) fails with EIO; later ones are native.
+    /// The first plain sync (a guest FLUSH or write-through) fails with EIO; the pool then fails every later sync
+    /// without a call (block.rs `Sticky`).
     FlushError,
     /// Hold the first disk call at file offset 0 until another request has been published.
     OutOfOrder,
