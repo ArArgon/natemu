@@ -37,11 +37,13 @@ SIZE, DISK_SIZE = 0x20000, 2 * 1024 * 1024
 CASES = ('reset', 'disable', 'power-scalar', 'power-rep', 'power-sync-error',
          'read-error', 'write-error', 'malformed', 'malformed-later', 'fullqueue', 'power-rep-halt',
          'out-of-order', 'cancel-batch', 'reset-mixed', 'code-page',
-         'table-page', 'drain-expiry', 'publish-reset', 'publish-disable', 'publish-power')
+         'table-page', 'drain-expiry', 'publish-reset', 'publish-disable', 'publish-power',
+         'batch-read-error', 'batch-write-error', 'flush-error')
+BATCH_ERROR_CASES = ('batch-read-error', 'batch-write-error')
 MODES = {'reset': 'hold-reset', 'disable': 'hold-disable', 'power-scalar': 'hold-power',
          'power-rep': 'hold-power', 'power-sync-error': 'power-sync-error', 'power-rep-halt': 'hold-power-halt',
          'out-of-order': 'out-of-order', 'cancel-batch': 'cancel-batch', 'reset-mixed': 'reset-mixed',
-         'publish-reset': 'hold-publish-reset', 'publish-disable': 'hold-publish-disable', 'publish-power': 'hold-publish-power'}
+         'flush-error': 'flush-error', 'publish-reset': 'hold-publish-reset', 'publish-disable': 'hold-publish-disable', 'publish-power': 'hold-publish-power'}
 # The device reset's register readback (offset, saved at, value), shared by the reset cases.
 RESET_READBACK = ((0x60, 0xe000, 0), (0x70, 0xe004, 0), (0x44, 0xe008, 0))
 PEER_CODE, PEER_MARKER, PEER_R15 = 0x110000, 0x48414c5450454552, 0x5151
@@ -80,6 +82,7 @@ def fixture(case, work):
     memory = bytearray(SIZE)
     disk = pattern(b'natemu-lifecycle-disk-v1', DISK_SIZE)
     payload = pattern(b'natemu-lifecycle-out-v1', 512)
+    split_payload = pattern(b'natemu-lifecycle-split-v1', 1024)
     assembly, check = [], 0
 
     def emit(text): assembly.append(text)
@@ -107,7 +110,7 @@ def fixture(case, work):
         readreg(0x70); reg(15)
     def desc(q, i, addr, length, flags=0, next_=0):
         put(memory, q + i * 16, '<QIHH', addr, length, flags, next_)
-    def request(q, head, kind, sector=0, malformed=False, data=None):
+    def request(q, head, kind, sector=0, malformed=False, data=None, segments=1):
         outside = data is not None
         header, status, data = q + 0x3000 + head * 32, q + 0x5000 + head, data if outside else q + 0x6000 + head * 512
         put(memory, header, '<IIQ', kind, 0, sector)
@@ -116,15 +119,16 @@ def fixture(case, work):
             desc(q, head, header, 16, 1, head + 1)
             desc(q, head + 1, status, 1, 2)
         else:
-            if not outside: store(memory, data, payload if kind == 1 else b'\xa5' * 512)
+            if not outside: store(memory, data, (payload if segments == 1 else split_payload) if kind == 1 else b'\xa5' * 512 * segments)
             desc(q, head, header, 16, 1, head + 1)
             if malformed:
                 desc(q, head + 1, data, 256, 3, head + 2)
                 desc(q, head + 2, 0x4000000 - 128, 256, 3, head + 3)
                 desc(q, head + 3, status, 1, 2)
             else:
-                desc(q, head + 1, data, 512, 3 if kind == 0 else 1, head + 2)
-                desc(q, head + 2, status, 1, 2)
+                # `segments` 512-byte data descriptors: one logical stream, one native call.
+                for i in range(segments): desc(q, head + 1 + i, data + 512 * i, 512, 3 if kind == 0 else 1, head + 2 + i)
+                desc(q, head + 1 + segments, status, 1, 2)
         return {'head': head, 'status': status, 'data': data, 'kind': kind, 'sector': sector, 'outside': outside}
     def avail(q, heads):
         put(memory, q + 0x1002, '<H', len(heads))
@@ -276,6 +280,44 @@ def fixture(case, work):
         # Close after RAM publication so a final IRQ cannot race the acknowledgement.
         mmwrite(0x44, 0); readreg(0x44); reg(0); irq(q)
         completed += [(q, i, r, 0, b'') for i, r in enumerate(requests)]
+    elif case in BATCH_ERROR_CASES:
+        # Four requests published together go to the worker pool. The two-segment request at
+        # sector 2 is one 1024-byte call: short (256 bytes), then its continuation fails. Only it
+        # reports IOERR: a failed IN leaves its whole buffer untouched (used length 0), a failed OUT
+        # keeps its landed 256-byte prefix (no rollback; used length 1). The other three complete in
+        # any order; a later FLUSH and a re-read of sectors 2-3 succeed.
+        write = case == 'batch-write-error'
+        split = request(q, 4, 1 if write else 0, 2, segments=2)
+        others = [request(q, 0, 0, 0), request(q, 8, 1, 8), request(q, 12, 0, 10)]
+        avail(q, [0, 4, 8, 12]); notify(); wait_used(q, 4); irq(q)
+        for r in (split, *others): expect(r['status'], 1 if r is split else 0, 'byte')
+        if write: expected_disk[1024:1280] = split_payload[:256]
+        expected_disk[4096:4608] = payload
+        completed += [(q, 0, split, 1, b''), (q, 1, others[0], 0, disk[:512]), (q, 2, others[1], 0, b''),
+                      (q, 3, others[2], 0, disk[5120:5632])]
+        flush = request(q, 16, 4)
+        submit_next(q, 16, 5); later_avail.append((q, 5, 16))
+        completed.append((q, 4, flush, 0, b''))
+        reread = request(q, 20, 0, 2, segments=2)
+        submit_next(q, 20, 6); later_avail.append((q, 6, 20))
+        completed.append((q, 5, reread, 0, bytes(expected_disk[1024:2048])))
+        readreg(0x70); reg(15)
+    elif case == 'flush-error':
+        # A write, then a FLUSH whose fsync fails (IOERR), then a FLUSH whose fsync succeeds (OK: the sync error is not
+        # sticky), then a read of the written sector.
+        write = request(q, 0, 1, 8)
+        avail(q, [0]); notify(); wait_used(q, 1); irq(q)
+        expected_disk[4096:4608] = payload
+        completed.append((q, 0, write, 0, b''))
+        for index, head, status in ((1, 3, 1), (2, 5, 0)):
+            flush = request(q, head, 4)
+            submit_next(q, head, index + 1); later_avail.append((q, index + 1, head))
+            expect(flush['status'], status, 'byte')
+            completed.append((q, index, flush, status, b''))
+        reread = request(q, 7, 0, 8)
+        submit_next(q, 7, 4); later_avail.append((q, 4, 7))
+        completed.append((q, 3, reread, 0, payload))
+        readreg(0x70); reg(15)
     else:
         kind = 1 if power or case == 'write-error' else 0
         first = request(q, 0, kind, 8 if kind == 1 else 0, case == 'malformed')
@@ -377,13 +419,13 @@ def fixture(case, work):
     (work / 'disk.raw').write_bytes(disk)
     (work / 'expected-disk.raw').write_bytes(expected_disk)
     (work / 'expected-memory.bin').write_bytes(expected)
-    meta = {'case': case, 'n': 2 if peer_rip is not None else 1, 'peer_rip': peer_rip, 'mode': MODES.get(case, case if case in ('read-error', 'write-error') else 'normal'),
+    meta = {'case': case, 'n': 2 if peer_rip is not None else 1, 'peer_rip': peer_rip, 'mode': MODES.get(case, case if case in ('read-error', 'write-error') else 'batch-error' if case in BATCH_ERROR_CASES else 'normal'),
             'power': power, 'sync_error': case == 'power-sync-error', 'expected_rip': CODE + (labels['power_instruction'] if case in ('power-rep', 'power-rep-halt') else labels['power_after']) if power else CODE + len(code),
             'disk_before_sha256': hashlib.sha256(disk).hexdigest(),
             'disk_after_sha256': hashlib.sha256(expected_disk).hexdigest(),
             'memory_after_sha256': hashlib.sha256(expected).hexdigest(),
             # Concurrent flushes finish in any order: their used elements are a permutation.
-            'unordered_used': [0x2004, 64] if case == 'fullqueue' else None}
+            'unordered_used': [0x2004, 64] if case == 'fullqueue' else [0x2004, 4] if case in BATCH_ERROR_CASES else None}
     (work / 'oracle.json').write_text(json.dumps(meta, indent=2) + '\n')
     return meta
 
@@ -482,6 +524,17 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         require(io['calls'] == 3 and events.count('injected-eio') == 1, 'wrong partial I/O attempt count')
         require(events.count('commit') == (3 if case == 'write-error' else 2), 'wrong completion count')
         if case == 'write-error': require(ordered(events, ['sync-enter', 'sync-ok', 'commit']), 'partial write not flushed')
+    elif case in BATCH_ERROR_CASES:
+        verb = 'write' if case == 'batch-write-error' else 'read'
+        require(io['calls'] == 6 and events.count('injected-eio') == 1 and events.count('commit') == 6, 'wrong call, failure or completion count')
+        require(ordered(events, [f'{verb}:1024:1024', f'{verb}-result:Ok(256)', f'{verb}:1280:768', 'injected-eio']), 'split request not short then failed')
+        require(all(e in events for e in ('read:0:512', 'read-result:Ok(512)', 'write:4096:512', 'write-result:Ok(512)', 'read:5120:512')),
+                'a batch neighbour did not run')
+        require(ordered(events, ['injected-eio', 'sync-enter', 'sync-ok', 'read:1024:1024', 'read-result:Ok(1024)', 'commit']), 'flush or re-read after the failure missing')
+    elif case == 'flush-error':
+        require(io['calls'] == 2 and events.count('commit') == 4, 'wrong call or completion count')
+        require(ordered(events, ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'sync-enter', 'sync-ok',
+                                 'commit', 'read:4096:512', 'read-result:Ok(512)', 'commit']), 'flush failure order mismatch')
     elif case == 'out-of-order':
         require(io['calls'] == 2 and events.count('commit') == 2 and events.count('backend-held') == 1, 'wrong call or completion count')
         require(ordered(events, ['read:512:512', 'read-result:Ok(512)', 'commit', 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'commit']),
@@ -575,6 +628,8 @@ def self_check():
         'read-error': ['read:0:512', 'read-result:Ok(256)', 'read:256:256', 'injected-eio', 'commit', 'read:512:512', 'read-result:Ok(512)', 'commit'],
         'write-error': ['write:4096:512', 'write-result:Ok(256)', 'write:4352:256', 'injected-eio', 'commit', 'read:4096:512', 'read-result:Ok(512)', 'commit', 'sync-enter', 'sync-ok', 'commit'],
         'malformed': ['read:512:512', 'read-result:Ok(512)', 'commit'],
+        'flush-error': ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'sync-enter', 'sync-ok', 'commit',
+                        'read:4096:512', 'read-result:Ok(512)', 'commit'],
         'malformed-later': ['read:0:512', 'read-result:Ok(512)', 'commit'],
         'fullqueue': ['sync-enter', 'sync-ok', 'commit'] * 64,
         'out-of-order': ['backend-held', 'read:512:512', 'read-result:Ok(512)', 'commit', 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'commit'],
@@ -586,6 +641,10 @@ def self_check():
         **{f'publish-{kind}': ['backend-held', 'publish-armed', 'backend-released', f'read:{512 * TARGET_SECTOR}:512', 'read-result:Ok(512)', boundary, 'commit']
            + (['sync-enter', 'sync-ok', 'lane-joined'] if kind == 'power' else ['read:512:512', 'read-result:Ok(512)', 'commit'])
            for kind, boundary in (('reset', 'reset-deferred'), ('disable', 'disable-deferred'), ('power', 'power-poll'))},
+        **{case: ['read:0:512', f'{verb}:1024:1024', 'write:4096:512', 'read:5120:512', 'read-result:Ok(512)', f'{verb}-result:Ok(256)',
+                  f'{verb}:1280:768', 'injected-eio', 'write-result:Ok(512)', 'read-result:Ok(512)', 'commit', 'commit', 'commit', 'commit',
+                  'sync-enter', 'sync-ok', 'commit', 'read:1024:1024', 'read-result:Ok(1024)', 'commit']
+           for case, verb in (('batch-read-error', 'read'), ('batch-write-error', 'write'))},
         'reset-mixed': ['read:512:512', 'read-result:Ok(512)', 'commit', 'commit'] + ['backend-held'] * 4 + ['reset-deferred']
         + ['backend-released', 'read:0:512', 'read-result:Ok(512)'] * 4 + ['backend-held', 'backend-released', 'read:0:512', 'read-result:Ok(512)']
         + ['read:2048:512', 'read-result:Ok(512)', 'commit'],
@@ -599,6 +658,9 @@ def self_check():
     corrupt = {
         'out-of-order': [lambda e: e[:3] + [e[4], e[3]] + e[5:]],  # released before the first commit
         'cancel-batch': [lambda e: e[:-1] + ['commit', 'commit']],
+        # No injected failure, or no flush between the failure and the re-read.
+        'flush-error': [lambda e: [x.replace('sync-error', 'sync-ok') for x in e]],
+        **{case: [lambda e: [x for x in e if x != 'injected-eio'], lambda e: [x for x in e if not x.startswith('sync-')]] for case in BATCH_ERROR_CASES},
         'reset-mixed': [lambda e: e[:4] + e[5:], late_old_read],
         # Published before the lifecycle access deferred, or a second publication.
         **{f'publish-{kind}': [lambda e, b=boundary: [x for x in e if x != b] + [b], lambda e: e + ['commit']]
@@ -618,7 +680,7 @@ def self_check():
             meta = fixture(case, work)
             events = traces.get(case, ['backend-held', 'power-poll', 'backend-released', 'write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter'] + (['sync-error'] if meta['sync_error'] else ['sync-ok', 'lane-joined']))
             if case == 'power-rep-halt': events.insert(2, 'peer-halted')
-            calls = {'fullqueue': 0, 'reset': 2, 'disable': 2, 'read-error': 3, 'write-error': 3, 'out-of-order': 2, 'cancel-batch': 5, 'reset-mixed': 7,
+            calls = {'fullqueue': 0, 'reset': 2, 'disable': 2, 'read-error': 3, 'write-error': 3, 'out-of-order': 2, 'cancel-batch': 5, 'reset-mixed': 7, 'batch-read-error': 6, 'batch-write-error': 6, 'flush-error': 2,
                      'publish-reset': 2, 'publish-disable': 2}.get(case, 1)
             io = {'entered': case != 'fullqueue', 'calls': calls, 'events': events}
             gpr = [0] * 16
@@ -676,6 +738,29 @@ def self_check():
                 for target in (lambda b: b[10][1][0], lambda b: b[1]['cpus'][1]['memory'][0]):
                     bad = copy.deepcopy(args); target(bad)['data'] = image.hex()
                     assert verify(*bad); controls += 1
+            if case == 'flush-error':
+                # The failed FLUSH reported OK must fail.
+                image = bytearray(memory); image[0x5003] = 0
+                bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
+                assert verify(*bad); controls += 1
+            if case in BATCH_ERROR_CASES:
+                # The batch's used elements may come in any order; the failed request's short prefix
+                # published as data, or its status reported OK, must fail.
+                image = bytearray(memory)
+                image[0x2004:0x200c], image[0x2014:0x201c] = memory[0x2014:0x201c], memory[0x2004:0x200c]
+                good = copy.deepcopy(args); good[10][0][0]['data'] = image.hex(); good[1]['cpus'][0]['memory'][0]['data'] = image.hex()
+                assert not verify(*good), verify(*good)
+                for offset, data in ((0x6800, (work / 'disk.raw').read_bytes()[1024:1280]), (0x5004, b'\0')):
+                    if case == 'batch-write-error' and offset == 0x6800: continue
+                    image = bytearray(memory); image[offset:offset + len(data)] = data
+                    bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
+                    assert verify(*bad), (case, offset); controls += 1
+                # A disk without the neighbouring write, or (OUT) without the failed write's landed prefix.
+                original = (work / 'disk.raw').read_bytes()
+                for bad_disk in (disk[:4096] + original[4096:4608] + disk[4608:], disk[:1024] + original[1024:1280] + disk[1280:]):
+                    if bad_disk == disk: continue
+                    bad = copy.deepcopy(args); bad[7] = bad_disk
+                    assert verify(*bad), case; controls += 1
             if case == 'fullqueue':
                 # Any completion order passes; a duplicated element (one flush lost) does not.
                 image = bytearray(memory)
@@ -751,7 +836,7 @@ def main():
     (args.out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     results = []
     with args.lock.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_SH)   # correctness only: parallel runs share the VM lock (tools/vmlock.py)
         for case in args.cases:
             result = run_case(args, case); results.append(result)
             (args.out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
