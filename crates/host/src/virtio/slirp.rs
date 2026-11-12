@@ -113,9 +113,17 @@ struct PollFd {
 const EVENTS: [(c_int, i16); 5] = [(1, 0x1), (2, 0x4), (4, 0x2), (8, 0x8), (16, 0x10)];
 
 /// Frames slirp emitted that the guest has not taken yet; past this, new ones drop (slirp allows it).
-const RX_QUEUE: usize = 256;
+/// The device takes one RX frame per TX packet under a full guest upload, so the ACKs for that upload
+/// queue here with the downloads' data: 8 streams each way peaked at 718 frames. Drops are costly:
+/// slirp's TCP recovers from a lost segment by timeout, and at 256 the downloads collapsed to ~2 Mbit/s
+/// (November 12 stress). 4096 frames is at most ~6 MiB.
+const RX_QUEUE: usize = 4096;
 /// Upper bound on one wait: a refused frame is retried at least this often (ms).
 const RETRY_MS: u32 = 100;
+/// Guest TX packets fed to slirp per pass: a continuous TX stream must not starve RX delivery
+/// (its own ACKs) or slirp's sockets. Each queued TX packet has rung the doorbell, so the next
+/// poll returns at once.
+const TX_BATCH: usize = 64;
 
 struct Timer {
     id: u32,
@@ -129,6 +137,8 @@ struct Context {
     rx: VecDeque<Vec<u8>>,
     timers: Vec<*mut Timer>,
     epoch: Instant,
+    /// Frames slirp emitted while `rx` was full.
+    dropped: u64,
     /// The doorbell's write end.
     ring: UnixStream,
 }
@@ -144,6 +154,8 @@ unsafe extern "C" fn send_packet(buf: *const c_void, len: usize, opaque: Opaque)
     let c = unsafe { context(opaque) };
     if c.rx.len() < RX_QUEUE {
         c.rx.push_back(unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) }.to_vec());
+    } else {
+        c.dropped += 1;
     }
     len as isize
 }
@@ -245,6 +257,7 @@ impl Slirp {
             rx: VecDeque::new(),
             timers: Vec::new(),
             epoch: Instant::now(),
+            dropped: 0,
             ring,
         }));
         let config = Config {
@@ -296,10 +309,15 @@ impl Slirp {
     pub fn run(mut self) -> Result<()> {
         while !self.port.closed() {
             let stack = self.stack;
-            while self.port.transmit(|frame| {
-                unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
-                Ok(())
-            })? {}
+            for _ in 0..TX_BATCH {
+                let sent = self.port.transmit(|frame| {
+                    unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
+                    Ok(())
+                })?;
+                if !sent {
+                    break;
+                }
+            }
             self.deliver();
             self.wait();
             self.fire_timers();
@@ -311,6 +329,13 @@ impl Slirp {
             unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
             Ok(())
         }) {}
+        if crate::perf::on() {
+            let dropped = unsafe { &*self.context }.dropped;
+            crate::perf::line(&format!(
+                "net {{\"backend_dropped\":{dropped},\"guest_lost\":{}}}",
+                self.port.lost()
+            ));
+        }
         Ok(())
     }
 

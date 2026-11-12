@@ -1426,7 +1426,12 @@ impl Virtio {
         }
         let (head, descriptors) = match snapshot.chain(q) {
             Ok(Some(c)) => c,
-            Ok(None) => return Ok(Request::Empty),
+            Ok(None) => {
+                if let (Profile::Network(network), Some(_)) = (&self.profile, &received) {
+                    network.lost.fetch_add(1, SeqCst); // no RX buffer posted: the frame is lost
+                }
+                return Ok(Request::Empty);
+            }
             Err(e) => return Ok(Request::Invalid(e)),
         };
         if !descriptors_in(ram, &descriptors) {
