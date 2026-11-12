@@ -1,5 +1,10 @@
 # rust-vmm reuse for I/O
 
+> **November 12, 2026: dropped.** At the owner's request natemu no longer depends on rust-vmm.
+> Its only remaining use, checked descriptor-chain traversal over an owned metadata copy, is
+> natemu's own walk in `crates/host/src/virtio/queue.rs` (same or stricter checks). The record
+> below is historical.
+
 November 7-8, 2026. One record for whether and how natemu reuses rust-vmm code
 for its copy-first virtio I/O. It merges the earlier source-only survey with the
 owner-authorized isolated evaluation. Results and the recommendation come first,

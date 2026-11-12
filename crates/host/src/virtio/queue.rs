@@ -4,12 +4,56 @@ use super::Identity;
 use crate::Result;
 use crate::execution::io::Transfer;
 use natemu_abi::guest_memory::GuestRam;
-use virtio_queue::{CheckedDescriptorChain, desc::split::Descriptor};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 /// VIRTQ_DESC_F_NEXT and VIRTQ_DESC_F_WRITE: the only descriptor flags with no feature to
 /// negotiate (indirect descriptors are not offered).
-const PLAIN_FLAGS: u16 = 1 | 2;
+const NEXT: u16 = 1;
+const WRITE: u16 = 2;
+const PLAIN_FLAGS: u16 = NEXT | WRITE;
+
+/// One split-ring descriptor (virtio 1.3 §2.7.5), decoded from an owned table copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Descriptor {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+impl Descriptor {
+    pub fn new(addr: u64, len: u32, flags: u16, next: u16) -> Self {
+        Self {
+            addr,
+            len,
+            flags,
+            next,
+        }
+    }
+    /// Descriptor `index` of a little-endian table copy.
+    fn read(table: &[u8], index: u16) -> Self {
+        let d = &table[usize::from(index) * 16..][..16];
+        Self::new(
+            u64::from_le_bytes(d[..8].try_into().unwrap()),
+            u32::from_le_bytes(d[8..12].try_into().unwrap()),
+            u16::from_le_bytes(d[12..14].try_into().unwrap()),
+            u16::from_le_bytes(d[14..].try_into().unwrap()),
+        )
+    }
+    pub fn addr(&self) -> u64 {
+        self.addr
+    }
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+    pub fn flags(&self) -> u16 {
+        self.flags
+    }
+    pub fn is_write_only(&self) -> bool {
+        self.flags & WRITE != 0
+    }
+    pub fn has_next(&self) -> bool {
+        self.flags & NEXT != 0
+    }
+}
 
 /// One queue's registers and the device's progress through it.
 #[derive(Clone, Copy, Default, Debug)]
@@ -58,18 +102,15 @@ impl Queue {
 pub(crate) struct Snapshot {
     pub table: Vec<u8>,
     pub avail: Vec<u8>,
-    memory: GuestMemoryMmap,
     captured: Option<Identity>,
 }
 impl Snapshot {
-    pub fn new(max: u16) -> Result<Self> {
-        Ok(Self {
+    pub fn new(max: u16) -> Self {
+        Self {
             table: vec![0; max as usize * 16],
             avail: vec![0; 4 + max as usize * 2],
             captured: None,
-            memory: GuestMemoryMmap::from_ranges(&[(GuestAddress(0), max as usize * 16)])
-                .map_err(|e| format!("virtio metadata allocation: {e}"))?,
-        })
+        }
     }
     /// The captured available ring's index (the driver's next free slot).
     fn avail_index(&self) -> u16 {
@@ -119,15 +160,28 @@ impl Snapshot {
         }
         let slot = 4 + usize::from(q.next_avail % q.size) * 2;
         let head = u16::from_le_bytes([self.avail[slot], self.avail[slot + 1]]);
-        self.memory
-            .write_slice(&self.table[..usize::from(q.size) * 16], GuestAddress(0))
-            .map_err(|e| e.to_string())?;
-        let chain = CheckedDescriptorChain::new(&self.memory, GuestAddress(0), q.size, head, false)
-            .map_err(|e| format!("virtio chain: {e}"))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| format!("virtio chain: {e}"))?;
-        if chain.iter().any(|d| d.flags() & !PLAIN_FLAGS != 0) {
-            return Err("virtio unnegotiated descriptor flags".into());
+        // The whole chain or an error: every index in the table, at most `size` descriptors (no
+        // loop), only negotiated flags (no indirect), and a total length that fits in u32.
+        let (mut chain, mut index, mut total) = (Vec::new(), head, 0u32);
+        loop {
+            if index >= q.size {
+                return Err("virtio chain: descriptor index out of range".into());
+            }
+            if chain.len() == usize::from(q.size) {
+                return Err("virtio chain: longer than the queue (a loop)".into());
+            }
+            let d = Descriptor::read(&self.table, index);
+            if d.flags() & !PLAIN_FLAGS != 0 {
+                return Err("virtio unnegotiated descriptor flags".into());
+            }
+            total = total
+                .checked_add(d.len())
+                .ok_or("virtio chain: total length overflows")?;
+            chain.push(d);
+            if !d.has_next() {
+                break;
+            }
+            index = d.next;
         }
         Ok(Some((head, chain)))
     }
@@ -145,7 +199,7 @@ mod tests {
     }
     #[test]
     fn malformed_suffix_and_indirect_never_become_partial_requests() {
-        let mut s = Snapshot::new(8).unwrap();
+        let mut s = Snapshot::new(8);
         let q = Queue {
             size: 8,
             ..Default::default()
@@ -161,8 +215,51 @@ mod tests {
         assert_eq!(s.chain(q).unwrap().unwrap().1.len(), 1);
     }
     #[test]
+    fn loops_bad_heads_and_overlong_totals_are_refused() {
+        let mut s = Snapshot::new(8);
+        let q = Queue {
+            size: 8,
+            ..Default::default()
+        };
+        let refused = |s: &Snapshot, why: &str| {
+            let e = s.chain(q).unwrap_err().to_string();
+            assert!(e.contains(why), "{e:?} lacks {why:?}");
+        };
+        s.avail[2] = 1;
+        // A two-descriptor loop: refused once the walk exceeds the queue size.
+        put(&mut s, 0, 0x1000, 4, 1, 1);
+        put(&mut s, 1, 0x2000, 4, 1, 0);
+        refused(&s, "loop");
+        // A head outside the queue.
+        s.avail[4] = 8;
+        refused(&s, "out of range");
+        // Lengths summing past u32.
+        s.avail[4] = 0;
+        put(&mut s, 0, 0x1000, u32::MAX, 1, 1);
+        put(&mut s, 1, 0x2000, 1, 2, 0);
+        refused(&s, "overflows");
+        // An unknown, non-indirect flag bit.
+        put(&mut s, 0, 0x1000, 4, 8, 0);
+        refused(&s, "unnegotiated");
+        // A full-length legal chain (8 descriptors) is accepted, readable then writable.
+        for i in 0..8u16 {
+            let last = i == 7;
+            put(
+                &mut s,
+                i as usize,
+                0x1000 * (u64::from(i) + 1),
+                4,
+                if last { 2 } else { 1 },
+                i + 1,
+            );
+        }
+        let (head, chain) = s.chain(q).unwrap().unwrap();
+        assert_eq!((head, chain.len()), (0, 8));
+        assert!(chain[7].is_write_only() && !chain[0].is_write_only());
+    }
+    #[test]
     fn index_wrap_and_capacity_are_checked_before_head() {
-        let mut s = Snapshot::new(8).unwrap();
+        let mut s = Snapshot::new(8);
         let q = Queue {
             size: 8,
             next_avail: u16::MAX,
@@ -176,7 +273,7 @@ mod tests {
 
     #[test]
     fn captured_prefix_survives_live_alias_writes_but_exhaustion_requires_new_capture() {
-        let mut s = Snapshot::new(8).unwrap();
+        let mut s = Snapshot::new(8);
         let id = Identity {
             queue: 0,
             device: 1,
@@ -191,14 +288,14 @@ mod tests {
         put(&mut s, 0, 0x1000, 4, 2, 0);
         put(&mut s, 1, 0x2000, 4, 2, 0);
         s.captured(id);
-        assert_eq!(s.chain(q).unwrap().unwrap().1[0].addr().0, 0x1000);
+        assert_eq!(s.chain(q).unwrap().unwrap().1[0].addr(), 0x1000);
         // A completion or hostile writer can alias live queue RAM. It does not change this
         // already-owned metadata snapshot, and does not constitute admission of the next request.
         let mut live_table = s.table.clone();
         live_table[16..24].copy_from_slice(&0x3000u64.to_le_bytes());
         q.next_avail = 1;
         assert!(s.reusable(q, id));
-        assert_eq!(s.chain(q).unwrap().unwrap().1[0].addr().0, 0x2000);
+        assert_eq!(s.chain(q).unwrap().unwrap().1[0].addr(), 0x2000);
         q.next_avail = 2;
         assert!(!s.reusable(q, id));
         // Legal reuse and a new publication appear on the next capture, with no new kick required.
@@ -206,7 +303,7 @@ mod tests {
         s.avail[2] = 3;
         s.avail[8] = 1;
         s.captured(id);
-        assert_eq!(s.chain(q).unwrap().unwrap().1[0].addr().0, 0x3000);
+        assert_eq!(s.chain(q).unwrap().unwrap().1[0].addr(), 0x3000);
         for changed in [
             Identity { queue: 1, ..id },
             Identity { device: 2, ..id },
@@ -223,7 +320,7 @@ mod tests {
 
     #[test]
     fn malformed_later_head_is_not_admitted_by_capture() {
-        let mut s = Snapshot::new(8).unwrap();
+        let mut s = Snapshot::new(8);
         let id = Identity {
             queue: 0,
             device: 1,

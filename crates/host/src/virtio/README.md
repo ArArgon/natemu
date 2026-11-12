@@ -28,9 +28,10 @@ at most one outstanding access per vCPU. Queue disable preserves configuration;
 full device reset clears it. Neither can reuse a live request's resources.
 
 The owner copies the entire bounded descriptor table and available ring in one
-window. Parsing occurs afterwards against a private `GuestMemoryMmap`, using
-rust-vmm's checked traversal; this allocation contains only owned metadata and
-does not map natemu guest RAM. The complete chain is collected before any backend
+window. Parsing occurs afterwards on that owned copy, with natemu's own checked
+walk (`queue.rs`: every index in range, at most queue-size descriptors, only the
+NEXT and WRITE flags, total length within u32); it never reads natemu guest RAM.
+The complete chain is collected before any backend
 effect. Only GPA range validation uses natemu's mapping metadata, without
 reading, retaining, or dereferencing the returned pointer. Entropy goes into a
 256-byte owned array. A second window writes payload extents in descriptor order,
@@ -81,24 +82,11 @@ now counts only fallback windows and the test drivers' own windows.
 
 ## Dependency identity
 
-The crates come from the owner's fork `ArArgon/natemu-rust-vmm` (branch
-`natemu`) as a Cargo git dependency pinned at `5ede8fee` ("virtio-queue: add
-checked descriptor-chain traversal") in `crates/host/Cargo.toml`; `Cargo.lock`
-records the same commit and `cargo fetch` downloads it. That commit is upstream
-`671e367124cf7717d832b21de86b62eccf33ac27` plus the checked traversal patch and
-its tests. To work on the patch locally, override the source for one command
-(`cargo --config 'patch."https://github.com/ArArgon/natemu-rust-vmm".virtio-queue.path="../rust-vmm/vm-virtio/virtio-queue"' ...`,
-and the same for `vm-memory`) or in a git-ignored `.cargo/config.toml`.
-
-Selected upstream crates: virtio-queue 0.18.0 (Apache-2.0 AND BSD-3-Clause),
-vm-memory 0.18.0 with `backend-mmap` and default `rawfd` (Apache-2.0 OR
-BSD-3-Clause), virtio-bindings 0.2.7 (BSD-3-Clause OR Apache-2.0), and
-vmm-sys-util 0.15.0 (BSD-3-Clause). The host library now has registry dependencies
-through these crates; resident and ABI remain dependency-free. Exact registry
-versions/checksums are in the workspace Cargo.lock. Darwin's new direct
-transitive packages include libc, log, bitflags and thiserror (MIT OR Apache-2.0),
-with thiserror's proc-macro dependency tree shared with the existing host CLI.
-Windows-only winapi entries are lockfile resolution, not Darwin runtime code.
+The virtio code has no registry dependency of its own. It used rust-vmm's
+`virtio-queue` and `vm-memory` (from the owner's fork) until November 12, only for
+checked descriptor-chain traversal over an owned copy; that walk is now natemu's
+(`queue.rs`), with the same or stricter checks, tested in `queue.rs`, and the fork is no longer a
+dependency.
 
 ## Verification limits
 
