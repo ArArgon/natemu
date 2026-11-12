@@ -1171,7 +1171,7 @@ pub(crate) struct Args {
     /// A real block device in the program fixture, with an optional finite backend schedule
     #[arg(long, requires = "io_script")]
     io_disk: Option<String>,
-    #[arg(long, requires = "io_disk", value_parser = ["normal", "hold-reset", "hold-disable", "hold-power", "hold-power-halt", "power-sync-error", "read-error", "write-error", "cycle-reset", "cycle-disable", "out-of-order", "reset-mixed", "cancel-batch", "hold-publish-reset", "hold-publish-disable", "hold-publish-power"])]
+    #[arg(long, requires = "io_disk", value_parser = ["normal", "hold-reset", "hold-disable", "hold-power", "hold-power-halt", "power-sync-error", "read-error", "write-error", "batch-error", "flush-error", "cycle-reset", "cycle-disable", "out-of-order", "reset-mixed", "cancel-batch", "hold-publish-reset", "hold-publish-disable", "hold-publish-power"])]
     io_script: Option<String>,
     /// Production network frontend with an independent owned-packet loopback endpoint
     #[arg(long, conflicts_with_all = ["io_disk", "io_windows"])]

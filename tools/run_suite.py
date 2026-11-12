@@ -70,7 +70,7 @@ QUICK = ('build', 'cargo-test', 'cargo-test-fexc', 'runtime', 'l1', 'l2', 'l2-ia
          'i8b', 'i9', 'i10', 'i7-cpl0', 'xsave', 'i6-faults', 'i10-faults', 'i5c', 'i6b-cases', 'flow', 'asm', 'faults@1', 'i7-faults@1',
          'loopfaults-default@1', 'probes@1', 'corpora-c2', 'smp', 'limits', 'litmus', 'events', 'privilege', 'delivery', 'm3',
          'k1-c1', 'k1-c2@1', 'pic-ac-fence-user', 'k2-cost', 'k2-gather', 'nostop-*', 'x3-qemu', 'x3-cases', 'x4', 'm1', 'm2', 'l3', 'l4a', 's4', 'x1', 'r1a', 'r1b-c2',
-         'i5b-images', 'instruction-gaps', 'vector-split-smp', 'i8-faults', 'i9-faults', 'i6b', 'system', 'coherence', 'sharedpt', 'fix-1', 'i6-faults-1', 'l4b', 'contain', 'boot-smoke', 'kicks')
+         'i5b-images', 'instruction-gaps', 'vector-split-smp', 'i8-faults', 'i9-faults', 'i6b', 'system', 'coherence', 'sharedpt', 'fix-1', 'i6-faults-1', 'l4b', 'contain', 'boot-smoke', 'kicks', 'virtio-lifecycle', 'io-coverage')
 
 
 @dataclasses.dataclass
@@ -182,6 +182,14 @@ def steps(F, O):
     vm('x1', 'run_x1.py', est=8)
     vm('r1a', 'run_r1.py', 'r1a')
     vm('boot-smoke', 'run_boot_smoke.py', est=13)
+    # Block device: the deterministic lifecycle and backend-failure cases through guest MMIO (the publish-* cases need an
+    # io-test-hooks build), and stock Linux on partitioned disks, guest reboot, full guest and host disks.
+    target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))
+    import run_virtio_lifecycle
+    add('virtio-lifecycle', ['python3', 'tools/run_virtio_lifecycle.py', 'run', '--host', target / 'release/natemu-host',
+                             '--runtime', target / 'aarch64-unknown-none/release/natemu-runtime', '--fexc', F, '--out', O / 'out' / 'virtio-lifecycle',
+                             '--cases', *(c for c in run_virtio_lifecycle.CASES if not c.startswith('publish-'))], est=5)
+    vm('io-coverage', 'run_io_coverage.py', est=75)
     for n in (2, 3, 4): vm(f'r1b-c{n}', 'run_r1.py', 'r1b', '--cpus', n, est=25)
     # Fixed-address GP probes must name an unmapped page; DR watchpoints must name the actual frame.
     distant = {'faults', 'faults-1', 'events', 'privilege', 'k2-swapgs', 'k2-cr2', 'k2-stifirst', 'k2-verw'}

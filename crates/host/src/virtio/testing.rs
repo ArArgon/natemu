@@ -26,6 +26,11 @@ enum Mode {
     /// The first read (write) is short, the second fails with EIO.
     ReadError,
     WriteError,
+    /// Among concurrent requests: the first call at file offset `BATCH_OFFSET` (read or write) is
+    /// short (256 bytes), its continuation fails with EIO; every other call is normal.
+    BatchError,
+    /// The first plain sync (a guest FLUSH or write-through) fails with EIO; later ones are native.
+    FlushError,
     /// Hold the first disk call at file offset 0 until another request has been published.
     OutOfOrder,
     /// Hold every disk call at file offset 0 until a device reset is deferred behind them.
@@ -39,6 +44,8 @@ enum Mode {
 }
 /// The requests a CancelBatch completion covers.
 const BATCH: usize = 4;
+/// The file offset of BatchError's failing request.
+const BATCH_OFFSET: u64 = 1024;
 impl Mode {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -52,6 +59,8 @@ impl Mode {
             "power-sync-error" => Self::PowerSyncError,
             "read-error" => Self::ReadError,
             "write-error" => Self::WriteError,
+            "batch-error" => Self::BatchError,
+            "flush-error" => Self::FlushError,
             "out-of-order" => Self::OutOfOrder,
             "reset-mixed" => Self::ResetMixed,
             "cancel-batch" => Self::CancelBatch,
@@ -132,7 +141,12 @@ impl Control {
     /// Whether this schedule holds a disk call at `offset`.
     fn holds_call(&self, offset: u64) -> bool {
         match self.mode {
-            Mode::Normal | Mode::ReadError | Mode::WriteError | Mode::CancelBatch => false,
+            Mode::Normal
+            | Mode::ReadError
+            | Mode::WriteError
+            | Mode::BatchError
+            | Mode::FlushError
+            | Mode::CancelBatch => false,
             // Alternate held old-generation reads and ordinary fresh-generation recovery reads.
             Mode::CycleReset | Mode::CycleDisable => self.calls.load(SeqCst) % 2 == 0,
             Mode::ResetMixed => offset == 0,
@@ -218,7 +232,7 @@ pub struct ControlReport {
 pub(super) struct Controlled {
     native: Native,
     control: Arc<Control>,
-    /// Calls of a ReadError/WriteError schedule so far.
+    /// Calls of a ReadError/WriteError schedule so far (BatchError: 1 after its short call, 2 after its EIO).
     phase: AtomicUsize,
 }
 impl Controlled {
@@ -241,6 +255,26 @@ impl Controlled {
         } else {
             Mode::ReadError
         };
+        if self.control.mode == Mode::BatchError {
+            // Phase 1 once the short first call was made: only its continuation fails.
+            let next = match offset {
+                BATCH_OFFSET => 1,
+                o if o == BATCH_OFFSET + 256 => 2,
+                _ => 0,
+            };
+            if next != 0
+                && self
+                    .phase
+                    .compare_exchange(next - 1, next, SeqCst, SeqCst)
+                    .is_ok()
+            {
+                if next == 1 {
+                    return Ok(len.min(256));
+                }
+                self.control.event("injected-eio");
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+        }
         if self.control.mode == scripted {
             match self.phase.fetch_add(1, SeqCst) + 1 {
                 1 => return Ok(len.min(256)),
@@ -272,7 +306,11 @@ impl Calls for Controlled {
     }
     fn sync(&self, full: bool) -> std::io::Result<()> {
         self.control.event("sync-enter");
-        let result = if full && self.control.mode == Mode::PowerSyncError {
+        let result = if full && self.control.mode == Mode::PowerSyncError
+            || !full
+                && self.control.mode == Mode::FlushError
+                && !self.control.claimed.swap(true, SeqCst)
+        {
             Err(std::io::Error::from_raw_os_error(5))
         } else {
             self.native.sync(full)
