@@ -78,8 +78,10 @@ build and sign `natemu-host` themselves.
 rust-vmm adoption. The library now consumes `virtio-queue` 0.18.0 and `vm-memory`
 0.18.0 from the owner's fork ArArgon/natemu-rust-vmm (a Cargo git dependency pinned by commit), plus their locked dependencies;
 vm-memory's mmap feature is used for private descriptor snapshots, not guest RAM.
-See `crates/host/src/virtio/README.md` for the exact source identity and license
-inventory. **November 9 amendment:** the owner approved serde 1.0.229 (derive) and serde_json
+**November 12 amendment:** at the owner's request rust-vmm was dropped again: the only use
+left was checked descriptor-chain traversal over an owned copy, now natemu's own walk
+(`crates/host/src/virtio/queue.rs`); `virtio-queue`, `vm-memory` and their locked
+dependencies are gone from `Cargo.lock`. **November 9 amendment:** the owner approved serde 1.0.229 (derive) and serde_json
 1.0.154 for the host library and test driver, to write their JSON reports with correct escaping;
 they add serde_core, serde_derive, itoa, memchr and zmij to `Cargo.lock`. The ABI and resident
 still take no registry dependency.

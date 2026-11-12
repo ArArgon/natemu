@@ -582,7 +582,7 @@ impl Streams {
                 continue;
             }
             let e = Extent {
-                gpa: d.addr().0,
+                gpa: d.addr(),
                 len: d.len() as usize,
             };
             if write {
@@ -929,7 +929,7 @@ impl Virtio {
         cancel: &AtomicBool,
         mut pool: Pool,
     ) -> Result<()> {
-        let mut snapshot = Snapshot::new(self.profile.queue_max())?;
+        let mut snapshot = Snapshot::new(self.profile.queue_max());
         let mut flight = Flight::default();
         // The last pass did work: the next wait spins first.
         let mut active = false;
@@ -2085,7 +2085,7 @@ mod tests {
         for more in [false, true] {
             let (device, id) = in_flight(3);
             let q = device.lock().queues[0];
-            let snapshot = Snapshot::new(8).unwrap();
+            let snapshot = Snapshot::new(8);
             device.retire_window(id, &published(q, 2, 3 + u16::from(more)), true, &snapshot);
             let s = device.lock();
             assert_eq!((s.queues[0].next_used, s.queues[0].next_avail), (2, 3));
@@ -2103,7 +2103,7 @@ mod tests {
                 Access::Deferred(_)
             ));
             let q = device.lock().queues[0];
-            let snapshot = Snapshot::new(8).unwrap();
+            let snapshot = Snapshot::new(8);
             // A granted window retires its requests even after the reset arrived; an ungranted
             // one (the reset overtook it) drops them unpublished. Neither raises an interrupt.
             device.retire_window(id, &published(q, 3, 8), true, &snapshot);
@@ -2124,7 +2124,7 @@ mod tests {
         let (device, id) = in_flight(4);
         assert!(!device.quiesce().unwrap());
         let q = device.lock().queues[0];
-        let snapshot = Snapshot::new(8).unwrap();
+        let snapshot = Snapshot::new(8);
         device.retire_window(id, &published(q, 4, 4), true, &snapshot);
         let s = device.lock();
         // Power-off still publishes accepted work, then admits nothing more.
@@ -2134,7 +2134,7 @@ mod tests {
     #[test]
     fn a_malformed_head_fails_the_device_after_admitting_the_heads_before_it() {
         let (device, id) = in_flight(0);
-        let mut snapshot = Snapshot::new(8).unwrap();
+        let mut snapshot = Snapshot::new(8);
         snapshot.captured(id);
         let next = Queue {
             next_avail: 2,

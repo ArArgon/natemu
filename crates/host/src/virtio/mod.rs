@@ -24,7 +24,7 @@ use crate::{
     vm::Machine,
 };
 use natemu_abi::guest_memory::GuestRam;
-use queue::{Queue, Snapshot};
+use queue::{Descriptor, Queue, Snapshot};
 use std::{
     collections::VecDeque,
     ops::Range,
@@ -37,7 +37,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use virtio_queue::desc::split::Descriptor;
 
 /// Modern virtio-MMIO register offsets (virtio 1.3 §4.2.2).
 mod reg {
@@ -578,7 +577,7 @@ fn scatter<'a>(descriptors: &[Descriptor], bytes: &'a [u8]) -> Vec<Transfer<'a>>
         let count = (d.len() as usize).min(bytes.len() - offset);
         if count != 0 {
             writes.push(Transfer::Write {
-                gpa: d.addr().0,
+                gpa: d.addr(),
                 bytes: &bytes[offset..offset + count],
             });
             offset += count;
@@ -591,7 +590,7 @@ fn scatter<'a>(descriptors: &[Descriptor], bytes: &'a [u8]) -> Vec<Transfer<'a>>
 fn descriptors_in(ram: &GuestRam, descriptors: &[Descriptor]) -> bool {
     descriptors
         .iter()
-        .all(|d| d.len() == 0 || ram.range(d.addr().0, d.len().into()).is_some())
+        .all(|d| d.len() == 0 || ram.range(d.addr(), d.len().into()).is_some())
 }
 
 /// Replace the low (`high` false) or high 32 bits of `word`.
@@ -1287,7 +1286,7 @@ impl Virtio {
             profile::report();
             return result;
         }
-        let mut snapshot = Snapshot::new(self.profile.queue_max())?;
+        let mut snapshot = Snapshot::new(self.profile.queue_max());
         loop {
             let (queue, id, received) = match self.next_work(cancel)? {
                 Work::Request {
@@ -1573,7 +1572,7 @@ mod tests {
                             s.notified[1] = true;
                             s.identity(0)
                         };
-                        let mut snapshot = Snapshot::new(8).unwrap();
+                        let mut snapshot = Snapshot::new(8);
                         snapshot.avail[2..4].copy_from_slice(
                             &q.next_avail
                                 .wrapping_add(1 + u16::from(captured))
@@ -1608,7 +1607,7 @@ mod tests {
             s.status = status::DRIVER_OK;
             s.queues[0] = q;
             let id = s.identity(0);
-            let mut snapshot = Snapshot::new(8).unwrap();
+            let mut snapshot = Snapshot::new(8);
             snapshot.avail[2] = 2;
             snapshot.captured(id);
             match gate {
@@ -1634,7 +1633,7 @@ mod tests {
         s.status = status::DRIVER_OK;
         s.queues[0] = q;
         let id = s.identity(0);
-        let mut snapshot = Snapshot::new(8).unwrap();
+        let mut snapshot = Snapshot::new(8);
         snapshot.avail[2] = 2;
         snapshot.captured(Identity {
             device: id.device + 1,

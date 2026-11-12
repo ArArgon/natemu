@@ -3,8 +3,9 @@
 November 8, 2026. Consolidated from the owner's I/O discussion after early
 performance/correctness work. **Implementation authorized November 8:** the owner
 provided the sibling rust-vmm checkout and asked to begin, including local edits
-there. Natemu uses `codex/virtio-io`; the rust-vmm patch now lives on the
-`natemu` branch of the owner's fork, pinned by commit as a Cargo git dependency. The owner
+there. Natemu uses `codex/virtio-io`; the rust-vmm patch lived on the
+`natemu` branch of the owner's fork as a pinned Cargo git dependency until November 12, when
+natemu's own checked walk replaced it (owner request). The owner
 selected persistent disk plus basic networking. Both are in this milestone.
 The [implementation plan](../implementation.md) owns overall build order;
 [INV-03-01](../research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
@@ -63,7 +64,8 @@ fault (Linux `reboot=t`) ends it with the resident stop SHUTDOWN, without a drai
 
 ## Discussion notes and decisions
 
-- Use rust-vmm selectively for virtio queue machinery. Broader onboarding remains
+- (Superseded November 12: rust-vmm dropped; natemu walks descriptor chains itself.)
+  Use rust-vmm selectively for virtio queue machinery. Broader onboarding remains
   an assessment, not a migration. The [isolated evaluation](rust-vmm-reuse.md)
   pinned `671e367124cf7717d832b21de86b62eccf33ac27`; virtio-queue 0.18.0,
   virtio-device 0.1.0 and vm-memory 0.18.0 built on Darwin and 16 synthetic cases
@@ -113,6 +115,8 @@ addition/multiplication, holes and private-memory exclusions before native acces
 No Rust exclusive references cover concurrently accessible guest RAM.
 
 ### Rust-vmm fit and transport repairs
+
+(Historical: since November 12 the checked traversal is natemu's own, `virtio/queue.rs`.)
 
 Reuse ring/descriptor definitions and checked traversal against owned metadata
 snapshots. Patch or extend traversal in one place to distinguish valid end from

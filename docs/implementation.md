@@ -77,8 +77,7 @@ Before executing a wider subset, add its semantic and recovery support; do not
 turn a valid guest instruction into silent success or an invented guest exception.
 
 **Active I6 device work (November 9):** follow the
-[copy-first virtio plan](restructure/io-plan.md). Reuse rust-vmm queue machinery
-selectively, keep backend I/O on owned buffers, and touch guest RAM only in
+[copy-first virtio plan](restructure/io-plan.md). Keep backend I/O on owned buffers, and touch guest RAM only in
 short windows that every vCPU has acknowledged. Done, with independent replay:
 entropy, a persistent raw disk that survives clean shutdown and relaunch, the
 shared network frontend (tested with a test packet endpoint only), several
@@ -301,11 +300,9 @@ retains its exact original SDK requirement. The workspace contains `crates/host`
 (the library `natemu`), `crates/cli` (its boot stub `natemu`, package `natemu-cli`),
 `crates/driver` (the test driver `natemu-host`), `crates/runtime` and `crates/abi`.
 Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`. The host
-binaries use clap, the host library and test driver write JSON with serde_json, and the
-host library uses rust-vmm's `virtio-queue` and
-`vm-memory` from the owner's fork ArArgon/natemu-rust-vmm, pinned by commit in
-`crates/host/Cargo.toml` and `Cargo.lock`; those crates' own locked dependencies
-come from crates.io. The ABI and resident take no registry
+binaries use clap, and the host library and test driver write JSON with serde_json
+(pinned in `Cargo.lock`); virtio descriptor chains are walked by natemu's own code
+(rust-vmm was dropped on November 12). The ABI and resident take no registry
 dependency. The [boot handoff's dependency policy](restructure/boot-handoff.md#1-boot-commands)
 lists what is allowed. Assembly offsets come from the shared Rust layout.
 I2 used a versioned 128-byte little-endian register/worker packet, with Rust and
@@ -316,8 +313,7 @@ native `fexc --serve` child per vCPU and admits its code objects
 
 Ordinary local checks/builds, from the repository root. On a fresh clone, first
 fetch the FEX submodule (`third_party/FEX`, the owner's FEX fork, pinned) and
-fill the local Cargo cache once with network access (it also fetches the pinned
-rust-vmm fork); the `--offline` commands then work without the network:
+fill the local Cargo cache once with network access; the `--offline` commands then work without the network:
 
 ```sh
 git submodule update --init

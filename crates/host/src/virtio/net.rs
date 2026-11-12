@@ -219,7 +219,7 @@ impl Virtio {
             let extents = chain
                 .descriptors
                 .iter()
-                .map(|d| (d.addr().0, d.len() as usize));
+                .map(|d| (d.addr(), d.len() as usize));
             if !self.copy(guest, chain.id, &mut gather(extents, frame), None)? {
                 return Ok(Request::Canceled);
             }

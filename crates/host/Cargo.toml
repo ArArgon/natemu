@@ -8,8 +8,6 @@ rust-version.workspace = true
 natemu-abi = { path = "../abi" }
 serde.workspace = true
 serde_json.workspace = true
-virtio-queue = { git = "https://github.com/ArArgon/natemu-rust-vmm", rev = "5ede8fee887e2a39b3f4efe8822c85158d412120" }
-vm-memory = { git = "https://github.com/ArArgon/natemu-rust-vmm", rev = "5ede8fee887e2a39b3f4efe8822c85158d412120", features = ["backend-mmap"] }
 
 [features]
 # Test drivers only (crates/driver): raw writes into a vCPU's records and code cache, and the hook's reply, object and
