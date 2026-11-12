@@ -69,7 +69,7 @@ QUICK = ('build', 'cargo-test', 'cargo-test-fexc', 'runtime', 'l1', 'l2', 'l2-ia
          'split-wait-model', 'icebp', 'frame-alias', 'frame-randomization', 'vector-ac', 'cpu-forms', 'maskmovq', 'fix', 'seed', 'i8',
          'i8b', 'i9', 'i10', 'i7-cpl0', 'xsave', 'i6-faults', 'i10-faults', 'i5c', 'i6b-cases', 'flow', 'asm', 'faults@1', 'i7-faults@1',
          'loopfaults-default@1', 'probes@1', 'corpora-c2', 'smp', 'limits', 'litmus', 'events', 'privilege', 'delivery', 'm3',
-         'k1-c1', 'k1-c2@1', 'k2-cost', 'k2-gather', 'nostop-*', 'x3-qemu', 'x3-cases', 'x4', 'm1', 'm2', 'l3', 'l4a', 's4', 'x1', 'r1a', 'r1b-c2',
+         'k1-c1', 'k1-c2@1', 'pic-ac-fence-user', 'k2-cost', 'k2-gather', 'nostop-*', 'x3-qemu', 'x3-cases', 'x4', 'm1', 'm2', 'l3', 'l4a', 's4', 'x1', 'r1a', 'r1b-c2',
          'i5b-images', 'instruction-gaps', 'vector-split-smp', 'i8-faults', 'i9-faults', 'i6b', 'system', 'coherence', 'sharedpt', 'fix-1', 'i6-faults-1', 'l4b', 'contain', 'boot-smoke', 'kicks')
 
 
@@ -165,7 +165,11 @@ def steps(F, O):
     for n, est in ((1, 80), (2, 215), (3, 275), (4, 155)):
         if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, *(() if n == 4 else ('--timeout', 450)), est=est, w=n)     # c4 serial: its runs time out at 300 s under load
         else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 450, est=est, w=n)
-    vm('pic', 'run_pic.py', '--cpus', 1, 2, est=900)   # PIC study stage 2: stops at each entry word, svc-word links, a forged slot
+    # PIC study stage 2: stops at each entry word, svc-word links, a forged slot. One step per mode (each runs the K1 programs at
+    # 1 and 2 vCPUs, about 1780 s in all in the November 10 serial-chain run, 137-step suite 13: its longest step); the three
+    # no-K1 modes together.
+    for mode in ('and', 'str', 'body', 'svc', 'forge', 'forge-noncanonical', 'forge-half'): vm(f'pic-{mode}', 'run_pic.py', '--cpus', 1, 2, '--modes', mode, est=225, w=2)
+    vm('pic-ac-fence-user', 'run_pic.py', '--modes', 'ac,fence,user', est=60)
     vm('m1', 'run_m1.py')
     vm('l3', 'run_l3.py')
     vm('l4a', 'run_l4a.py', '--only', 'qemu,xapic,halt,lint1')
