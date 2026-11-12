@@ -30,7 +30,7 @@ enum Mode {
     /// short (256 bytes), its continuation fails with EIO; every other call is normal.
     BatchError,
     /// The first plain sync (a guest FLUSH or write-through) fails with EIO; the pool then fails every later sync
-    /// without a call (block.rs `Sticky`).
+    /// without a call (block.rs `Sticky`). It shares `claimed` (single-hold schedules' flag): it holds no call.
     FlushError,
     /// Hold the first disk call at file offset 0 until another request has been published.
     OutOfOrder,

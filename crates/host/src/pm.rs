@@ -21,6 +21,10 @@
 //! Another SLP_TYP with SLP_EN (no S1-S4 here: the DSDT has only `_S5`) is refused: the vCPU stops `unsupported_port`
 //! at the instruction, the register unchanged. **Reset register** (4.8.3.6): writing `RESET_VALUE` (6) ends the run
 //! with the typed stop `reset`; other values do nothing; it reads 0. (QEMU's PIIX4 has none; this is the FADT's.)
+//! **Keyboard-controller reset** (port 64H, owner decision November 11): there is no 8042 (the FADT says so), but
+//! writing its pulse-reset command FEH there ends the run the same way, so every guest reboot method that reaches a
+//! device ends with `reset` after the disk drain; other writes do nothing; it reads 0 (both buffers empty, so a
+//! guest's wait for the input buffer ends at once). A guest reboot ends the run: natemu does not reboot.
 //!
 //! Widths: every register is reached by bytes, a wider access being its bytes (QEMU decodes PM1 at 16 and the timer at
 //! 32 bits, which are the widths ACPI uses).
@@ -44,6 +48,10 @@ pub const RESET: u8 = 2;
 pub(crate) const CNT: u64 = 4;
 pub(crate) const TIMER: u64 = 8;
 pub(crate) const RESET_REG: u64 = 0x40;
+/// Not in the PM block: port 64H's offset in this device, and the 8042 command that pulses the reset line.
+pub(crate) const KBD_REG: u64 = 0x80;
+pub(crate) const KBD_PORT: u16 = 0x64;
+const KBD_RESET: u8 = 0xfe;
 
 pub(crate) struct Pm {
     sts: u16,
@@ -111,6 +119,7 @@ fn block(offset: u64) -> Option<(u64, u64)> {
         4..6 => Some((CNT, 2)),
         8..12 => Some((TIMER, 4)),
         RESET_REG => Some((RESET_REG, 1)),
+        KBD_REG => Some((KBD_REG, 1)),
         _ => None,
     }
 }
@@ -152,6 +161,11 @@ impl Device for Pm {
             }
             RESET_REG => {
                 if value as u8 == crate::boot::acpi::platform::RESET_VALUE {
+                    self.power.store(RESET, SeqCst);
+                }
+            }
+            KBD_REG => {
+                if value as u8 == KBD_RESET {
                     self.power.store(RESET, SeqCst);
                 }
             }

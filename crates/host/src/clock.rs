@@ -312,6 +312,7 @@ pub fn install(
     )?;
     devices.register_ports(p::PM_TMR.into(), p::PM_TMR_LEN.into(), at(crate::pm::TIMER))?;
     devices.register_ports(p::RESET_PORT.into(), 1, at(crate::pm::RESET_REG))?;
+    devices.register_ports(crate::pm::KBD_PORT.into(), 1, at(crate::pm::KBD_REG))?;
     Ok(Board {
         pit: pit_stats,
         rtc: rtc_stats,

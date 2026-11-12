@@ -55,7 +55,11 @@ features. Use 512-byte block sectors, reject non-sector-multiple backing sizes,
 and retain the complete unoffered-option lists in 03-56/57 and 04-28. IO0 freezes
 these explicit masks in code; upstream defaults do not choose them.
 Bridging, port forwarding, qcow2, automatic reboot and zero-copy are
-outside this first implementation.
+outside this first implementation. Guest reboot is defined behaviour, not
+supported: it ends the run (November 11). The FADT reset register and the
+keyboard controller's reset pulse (FEH to port 64H) end it with the stop
+`Power(2)` (exit 2) after the same disk drain and final full sync as S5; a triple
+fault (Linux `reboot=t`) ends it with the resident stop SHUTDOWN, without a drain.
 
 ## Discussion notes and decisions
 

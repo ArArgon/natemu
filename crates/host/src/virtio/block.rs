@@ -238,10 +238,7 @@ pub(super) struct Pool {
 }
 impl Pool {
     fn spawn(calls: impl Calls + 'static, bell: Arc<Bell>) -> Result<Self> {
-        let calls: Arc<dyn Calls> = Arc::new(Sticky {
-            calls,
-            failed: AtomicBool::new(false),
-        });
+        let calls: Arc<dyn Calls> = Arc::new(Sticky::new(calls));
         // Every in-flight request and the final sync can be queued at once.
         let (jobs, queue) = mpsc::sync_channel::<Ticket>(MAX_REQUESTS + 1);
         let queue = Arc::new(Mutex::new(queue));
@@ -401,10 +398,24 @@ pub(super) trait Calls: Send + Sync {
 /// `page_cache_inconsistent` and "make[s] bdrv_flush() fail permanently". The pool, and so this flag, lives
 /// for the whole launch: a device reset does not clear it (the host data loss persists); a new launch does.
 /// A failed read or write does not set it (that request already reported IOERR; nothing completed is unsynced).
+/// Syncs are serialised (check, call and record under one lock), as QEMU serialises a device's flushes
+/// (`bdrv_co_flush`'s `active_flush_req`/`flush_queue`): otherwise a sync racing a failing one could pass the
+/// check, and the host, which reports a writeback error to one caller, could return success to it.
 struct Sticky<C> {
     calls: C,
-    failed: AtomicBool,
+    /// Whether a sync failed, and whether a refusal was logged (once per launch).
+    failed: Mutex<(bool, bool)>,
 }
+impl<C> Sticky<C> {
+    fn new(calls: C) -> Self {
+        Self {
+            calls,
+            failed: Mutex::new((false, false)),
+        }
+    }
+}
+/// A sync refused after an earlier failure (logged once, not per request).
+const STICKY: &str = "an earlier host sync of this disk failed";
 impl<C: Calls> Calls for Sticky<C> {
     fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
         self.calls.read(bytes, offset)
@@ -413,15 +424,15 @@ impl<C: Calls> Calls for Sticky<C> {
         self.calls.write(bytes, offset)
     }
     fn sync(&self, full: bool) -> std::io::Result<()> {
-        if self.failed.load(SeqCst) {
-            return Err(std::io::Error::other(
-                "an earlier host sync of this disk failed",
-            ));
+        let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
+        if failed.0 {
+            if !std::mem::replace(&mut failed.1, true) {
+                eprintln!("virtio-block: {STICKY}: every later sync of this launch fails");
+            }
+            return Err(std::io::Error::other(STICKY));
         }
         let result = self.calls.sync(full);
-        if result.is_err() {
-            self.failed.store(true, SeqCst);
-        }
+        failed.0 = result.is_err();
         result
     }
 }
@@ -797,7 +808,9 @@ impl Flight {
             .expect("a finished job's request is in flight");
         let status = match done.error {
             Some(e) => {
-                eprintln!("virtio-block: {e}");
+                if e != STICKY {
+                    eprintln!("virtio-block: {e}");
+                }
                 S_IOERR
             }
             None => S_OK,
@@ -1462,10 +1475,7 @@ mod tests {
                 }
             }
         }
-        let sticky = |n| Sticky {
-            calls: Fails(AtomicUsize::new(n), Mutex::default()),
-            failed: AtomicBool::new(false),
-        };
+        let sticky = |n| Sticky::new(Fails(AtomicUsize::new(n), Mutex::default()));
         // A failed write is reported once; the FLUSH after it covers no lost completed write: OK.
         let s = sticky(0);
         assert!(
@@ -1497,6 +1507,60 @@ mod tests {
                 .error
                 .is_none()
         );
+    }
+    #[test]
+    fn a_sync_racing_a_failing_one_also_fails() {
+        /// The first sync waits (at most 300 ms) for a second to enter the host, then fails; a second would succeed.
+        struct Racing(Mutex<usize>, Condvar);
+        impl Calls for Racing {
+            fn read(&self, _: &mut [u8], _: u64) -> std::io::Result<usize> {
+                unreachable!()
+            }
+            fn write(&self, _: &[u8], _: u64) -> std::io::Result<usize> {
+                unreachable!()
+            }
+            fn sync(&self, _: bool) -> std::io::Result<()> {
+                let mut entered = self.0.lock().unwrap();
+                *entered += 1;
+                if *entered > 1 {
+                    self.1.notify_all();
+                    return Ok(());
+                }
+                let _ = self
+                    .1
+                    .wait_timeout_while(entered, Duration::from_millis(300), |n| *n < 2)
+                    .unwrap();
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+        }
+        let s = Arc::new(Sticky::new(Racing(Mutex::new(0), Condvar::new())));
+        let first = {
+            let s = s.clone();
+            std::thread::spawn(move || s.sync(false))
+        };
+        while *s.calls.0.lock().unwrap() == 0 {
+            std::thread::yield_now();
+        }
+        // The first is inside its host call: the second must wait for it, then fail without a call.
+        assert!(s.sync(false).is_err());
+        assert!(first.join().unwrap().is_err());
+        assert_eq!(*s.calls.0.lock().unwrap(), 1);
+    }
+    #[test]
+    fn the_pool_applies_the_sticky_rule() {
+        let mut native = script(vec![]);
+        native.fail_sync = true;
+        let native = Arc::new(native);
+        let bell = Arc::new(Bell::default());
+        let pool = Pool::spawn(Scripted(native.clone()), bell.clone()).unwrap();
+        for slot in 0..3 {
+            pool.submit(slot, Job::Flush(slot == 2)).unwrap();
+            let done = results(&pool, &bell, 1);
+            assert!(done[0].1.error.is_some(), "slot {slot}");
+        }
+        // Only the first reached the host.
+        assert_eq!(native.syncs(), [false]);
+        pool.finish().unwrap();
     }
     /// Wait (at most 2 s) until `pool` has finished `n` more jobs.
     fn results(pool: &Pool, bell: &Bell, n: usize) -> Vec<(usize, Done)> {
