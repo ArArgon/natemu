@@ -9,7 +9,9 @@ mod block;
 mod net;
 mod profile;
 mod queue;
+mod slirp;
 pub use net::PacketPort;
+pub use slirp::Slirp;
 #[cfg(feature = "testing")]
 pub mod testing;
 use crate::{
@@ -814,6 +816,7 @@ impl Virtio {
             p.cancel();
         }
         self.wake.ring();
+        self.backend_ready();
     }
     /// Close admission for power-off; true once the owner has drained.
     fn quiesce(&self) -> Result<bool> {
@@ -1277,6 +1280,7 @@ impl Virtio {
         s.interrupt = 0;
         self.irq(&s);
         s.drained = true;
+        self.backend_ready();
         Ok(())
     }
     /// Entropy and network serve one request at a time; block has its own owner loop.
@@ -1374,6 +1378,10 @@ impl Virtio {
         }
         self.retire_reset(&mut s);
         self.settle(&mut s);
+        if self.profile.is_rx(id.queue) {
+            // The RX slot is free and the queue idle again: the backend may deliver its next frame.
+            self.backend_ready();
+        }
         Ok(())
     }
     fn retire_request(

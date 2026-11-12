@@ -173,9 +173,36 @@ successful durable drain.
 `Virtio::network` constructs a modern RX/TX device and an owned-packet `PacketPort`.
 Its caller must admit the actual backend before boot, service the port on an
 independent backend owner, then stop/join native callbacks under its supervisor.
-No backend launch or privilege acquisition occurs here. The normal Boot/CLI
-network option awaits the deployment decision; this constructor also supports
-the direct-guest frontend fixture.
+No backend launch or privilege acquisition occurs here. `PacketPort::on_ready`
+gives the backend a doorbell, rung (under the device lock, so it must only signal)
+when a TX packet is queued, when an RX request finishes and the slot is free again,
+and at drain and stop.
+
+## Network backend (`--net`)
+
+`slirp.rs` is user-mode NAT on libslirp (owner, November 12; QEMU's `-netdev user`),
+through hand-written bindings for libslirp 4.9 (config version 6, layout checked by a
+unit test), linked from Homebrew by `crates/host/build.rs`. No root, entitlement or
+host interface. The guest sees 10.0.2.0/24: gateway 10.0.2.2, DNS 10.0.2.3 (forwarded
+to the host's resolvers), DHCP lease 10.0.2.15, MAC 52:54:00:12:34:56. IPv4 only, and
+the guest cannot reach the host's loopback (as with VZ NAT); reach host services on
+the host's LAN address. No port forwarding.
+
+`Slirp::new` starts the stack before boot (a failure refuses the launch). One thread
+(`Slirp::run`, in `Prepared::run`'s scope, joined after the devices stop) owns it:
+it feeds queued guest TX frames to `slirp_input`, hands slirp's output frames to the
+guest in order through `PacketPort::receive` (up to 256 waiting; a refused frame waits
+for the next doorbell or at most 100 ms), and `poll(2)`s slirp's sockets plus the
+doorbell. It ends when the device stops or drains, after giving any accepted TX packet
+its result. Slirp's state survives device resets, as in QEMU.
+
+Checked by `tools/run_net_linux.py` (suite step `net-linux`): stock Debian Linux at
+1/2/4 vCPUs gets its lease, pings the gateway, downloads a host file byte-exact over
+HTTP, runs iperf3 TCP both ways and UDP, survives a driver unbind/rebind under a
+receive stream, and exits promptly on SIGINT under traffic; with the internet, DNS
+and a CA-verified HTTPS download. Not yet covered: IPv6/ICMPv6, port forwarding,
+a separate contained process, long soaks, many connections, overload and combined
+disk+network load.
 
 Queues 0/1 have a maximum of 256 direct descriptors. VERSION_1 is required;
 MAC, MTU and STATUS are offered, with MTU1500 and no offloads. Frames exclude
