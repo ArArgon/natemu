@@ -38,12 +38,18 @@ CASES = ('reset', 'disable', 'power-scalar', 'power-rep', 'power-sync-error',
          'read-error', 'write-error', 'malformed', 'malformed-later', 'fullqueue', 'power-rep-halt',
          'out-of-order', 'cancel-batch', 'reset-mixed', 'code-page',
          'table-page', 'drain-expiry', 'publish-reset', 'publish-disable', 'publish-power',
-         'batch-read-error', 'batch-write-error', 'flush-error')
+         'batch-read-error', 'batch-write-error', 'flush-error', 'flush-error-power', 'sync-error-writethrough')
+# Cases whose judgement depends on scheduling (a 3 s schedule barrier, the 50 ms drain deadline, a fixed guest delay against
+# a 300 ms port exit): they take the VM lock exclusively, the rest shared.
+TIMED = ('reset', 'disable', 'power-scalar', 'power-rep', 'power-sync-error', 'power-rep-halt', 'out-of-order', 'cancel-batch',
+         'reset-mixed', 'code-page', 'drain-expiry', 'publish-reset', 'publish-disable', 'publish-power')
+# Cases using the flush-error schedule (the first plain sync fails; block.rs `Sticky` fails every later one).
+FLUSH_ERROR_CASES = ('flush-error', 'flush-error-power', 'sync-error-writethrough')
 BATCH_ERROR_CASES = ('batch-read-error', 'batch-write-error')
 MODES = {'reset': 'hold-reset', 'disable': 'hold-disable', 'power-scalar': 'hold-power',
          'power-rep': 'hold-power', 'power-sync-error': 'power-sync-error', 'power-rep-halt': 'hold-power-halt',
          'out-of-order': 'out-of-order', 'cancel-batch': 'cancel-batch', 'reset-mixed': 'reset-mixed',
-         'flush-error': 'flush-error', 'publish-reset': 'hold-publish-reset', 'publish-disable': 'hold-publish-disable', 'publish-power': 'hold-publish-power'}
+         **{c: 'flush-error' for c in FLUSH_ERROR_CASES}, 'publish-reset': 'hold-publish-reset', 'publish-disable': 'hold-publish-disable', 'publish-power': 'hold-publish-power'}
 # The device reset's register readback (offset, saved at, value), shared by the reset cases.
 RESET_READBACK = ((0x60, 0xe000, 0), (0x70, 0xe004, 0), (0x44, 0xe008, 0))
 PEER_CODE, PEER_MARKER, PEER_R15 = 0x110000, 0x48414c5450454552, 0x5151
@@ -86,6 +92,8 @@ def fixture(case, work):
     assembly, check = [], 0
 
     def emit(text): assembly.append(text)
+    # SIZE_MAX, SEG_MAX and FLUSH; write-through without FLUSH.
+    driver_features = 0x6 if case == 'sync-error-writethrough' else 0x206
     def expect(operand, value, width='dword'):
         nonlocal check
         check += 1
@@ -98,7 +106,7 @@ def fixture(case, work):
     def readreg(offset): emit(f'mov eax, dword ptr [r12 + {offset:#x}]')
     def negotiate():
         for offset, value in ((0x70, 0), (0x70, 1), (0x70, 3), (0x24, 0),
-                              (0x20, 0x206), (0x24, 1), (0x20, 1), (0x70, 11)):
+                              (0x20, driver_features), (0x24, 1), (0x20, 1), (0x70, 11)):
             mmwrite(offset, value)
         readreg(0x70); reg(11)
     def configure(q):
@@ -159,7 +167,7 @@ def fixture(case, work):
     q, completed, later_avail, quiet = BASE, [], [], []
     expected_disk = bytearray(disk)
     canceled = case in ('reset', 'disable', 'malformed')
-    power = case.startswith('power-') or case == 'publish-power'
+    power = case.startswith('power-') or case in ('publish-power', 'flush-error-power')
     if case == 'malformed-later':
         first = request(q, 0, 0)
         second = request(q, 3, 0, 1, malformed=True)
@@ -318,6 +326,30 @@ def fixture(case, work):
         submit_next(q, 7, 4); later_avail.append((q, 4, 7))
         completed.append((q, 3, reread, 0, payload))
         readreg(0x70); reg(15)
+    elif case == 'flush-error-power':
+        # A write, a FLUSH whose fsync fails (IOERR), then S5: the final full sync fails without a call (sticky), so
+        # power-off fails with the contained shutdown error. No IRQ acknowledgement (as the other power cases).
+        write, flush = request(q, 0, 1, 8), request(q, 3, 4)
+        avail(q, [0]); notify(); wait_used(q, 1)
+        emit(f'mov word ptr [{q + 0x1006:#x}], 3\nmov word ptr [{q + 0x1002:#x}], 2'); notify(); wait_used(q, 2)
+        later_avail.append((q, 2, 3))
+        expect(write['status'], 0, 'byte'); expect(flush['status'], 1, 'byte')
+        expected_disk[4096:4608] = payload
+        completed += [(q, 0, write, 0, b''), (q, 1, flush, 1, b'')]
+        emit('xor r15d, r15d\nmov edx, 0xb004\nmov eax, 0x2000\npower_instruction:\nout dx, ax\npower_after:\nmov r15, 0xbad')
+    elif case == 'sync-error-writethrough':
+        # FLUSH not negotiated: each OUT syncs. The first OUT's sync fails (IOERR, its data landed: no rollback); the
+        # second OUT lands too but its sync is refused without a call (IOERR); a read still works.
+        first = request(q, 0, 1, 8)
+        avail(q, [0]); notify(); wait_used(q, 1); irq(q)
+        second = request(q, 3, 1, 8)
+        submit_next(q, 3, 2); later_avail.append((q, 2, 3))
+        reread = request(q, 6, 0, 8)
+        submit_next(q, 6, 3); later_avail.append((q, 3, 6))
+        expect(first['status'], 1, 'byte'); expect(second['status'], 1, 'byte')
+        expected_disk[4096:4608] = payload
+        completed += [(q, 0, first, 1, b''), (q, 1, second, 1, b''), (q, 2, reread, 0, payload)]
+        readreg(0x70); reg(15)
     else:
         kind = 1 if power or case == 'write-error' else 0
         first = request(q, 0, kind, 8 if kind == 1 else 0, case == 'malformed')
@@ -420,7 +452,7 @@ def fixture(case, work):
     (work / 'expected-disk.raw').write_bytes(expected_disk)
     (work / 'expected-memory.bin').write_bytes(expected)
     meta = {'case': case, 'n': 2 if peer_rip is not None else 1, 'peer_rip': peer_rip, 'mode': MODES.get(case, case if case in ('read-error', 'write-error') else 'batch-error' if case in BATCH_ERROR_CASES else 'normal'),
-            'power': power, 'sync_error': case == 'power-sync-error', 'expected_rip': CODE + (labels['power_instruction'] if case in ('power-rep', 'power-rep-halt') else labels['power_after']) if power else CODE + len(code),
+            'power': power, 'sync_error': case in ('power-sync-error', 'flush-error-power'), 'expected_rip': CODE + (labels['power_instruction'] if case in ('power-rep', 'power-rep-halt') else labels['power_after']) if power else CODE + len(code),
             'disk_before_sha256': hashlib.sha256(disk).hexdigest(),
             'disk_after_sha256': hashlib.sha256(expected_disk).hexdigest(),
             'memory_after_sha256': hashlib.sha256(expected).hexdigest(),
@@ -509,6 +541,14 @@ def verify(meta, report, state, io, stderr, returncode, timed_out, disk, expecte
         boundary = 'reset-deferred' if case == 'reset' else 'disable-deferred'
         require(ordered(events, ['backend-held', boundary, 'backend-released', 'read:0:512', 'read-result:Ok(512)', 'read:512:512', 'read-result:Ok(512)', 'commit']), 'reset/disable schedule mismatch')
         require(events.count('commit') == 1 and io['calls'] == 2, 'canceled queue published or recovery missing')
+    elif case == 'flush-error-power':
+        require(io['calls'] == 1 and events.count('sync-enter') == 1 and events.count('commit') == 2, 'final sync reached the host or a completion lost')
+        require(ordered(events, ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit']), 'flush failure order mismatch')
+        require('lane-joined' not in events and 'an earlier host sync of this disk failed' in stderr, 'S5 succeeded or failed for another reason')
+    elif case == 'sync-error-writethrough':
+        require(events == ['write:4096:512', 'write-result:Ok(512)', 'sync-enter', 'sync-error', 'commit', 'write:4096:512', 'write-result:Ok(512)',
+                           'commit', 'read:4096:512', 'read-result:Ok(512)', 'commit'] and io['calls'] == 3,
+                'write-through sync failure not sticky, or order mismatch')
     elif meta['power']:
         end = 'sync-error' if meta['sync_error'] else 'sync-ok'
         sequence = ['backend-held', 'power-poll', 'backend-released', 'write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', end]
@@ -628,6 +668,9 @@ def self_check():
         'read-error': ['read:0:512', 'read-result:Ok(256)', 'read:256:256', 'injected-eio', 'commit', 'read:512:512', 'read-result:Ok(512)', 'commit'],
         'write-error': ['write:4096:512', 'write-result:Ok(256)', 'write:4352:256', 'injected-eio', 'commit', 'read:4096:512', 'read-result:Ok(512)', 'commit', 'sync-enter', 'sync-ok', 'commit'],
         'malformed': ['read:512:512', 'read-result:Ok(512)', 'commit'],
+        'flush-error-power': ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'power-poll'],
+        'sync-error-writethrough': ['write:4096:512', 'write-result:Ok(512)', 'sync-enter', 'sync-error', 'commit', 'write:4096:512', 'write-result:Ok(512)',
+                                    'commit', 'read:4096:512', 'read-result:Ok(512)', 'commit'],
         'flush-error': ['write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter', 'sync-error', 'commit', 'commit',
                         'read:4096:512', 'read-result:Ok(512)', 'commit'],
         'malformed-later': ['read:0:512', 'read-result:Ok(512)', 'commit'],
@@ -660,6 +703,9 @@ def self_check():
         'cancel-batch': [lambda e: e[:-1] + ['commit', 'commit']],
         # No injected failure, or no flush between the failure and the re-read.
         # The first sync succeeded, or the second FLUSH made a host call (the failure was not sticky).
+        # The final sync reached the host and succeeded; the second write-through sync reached the host.
+        'flush-error-power': [lambda e: e + ['sync-enter', 'sync-ok', 'lane-joined']],
+        'sync-error-writethrough': [lambda e: e[:7] + ['sync-enter', 'sync-ok'] + e[7:]],
         'flush-error': [lambda e: [x.replace('sync-error', 'sync-ok') for x in e],
                         lambda e: e[:6] + ['sync-enter', 'sync-ok'] + e[6:]],
         **{case: [lambda e: [x for x in e if x != 'injected-eio'], lambda e: [x for x in e if not x.startswith('sync-')]] for case in BATCH_ERROR_CASES},
@@ -682,7 +728,7 @@ def self_check():
             meta = fixture(case, work)
             events = traces.get(case, ['backend-held', 'power-poll', 'backend-released', 'write:4096:512', 'write-result:Ok(512)', 'commit', 'sync-enter'] + (['sync-error'] if meta['sync_error'] else ['sync-ok', 'lane-joined']))
             if case == 'power-rep-halt': events.insert(2, 'peer-halted')
-            calls = {'fullqueue': 0, 'reset': 2, 'disable': 2, 'read-error': 3, 'write-error': 3, 'out-of-order': 2, 'cancel-batch': 5, 'reset-mixed': 7, 'batch-read-error': 6, 'batch-write-error': 6, 'flush-error': 2,
+            calls = {'fullqueue': 0, 'reset': 2, 'disable': 2, 'read-error': 3, 'write-error': 3, 'out-of-order': 2, 'cancel-batch': 5, 'reset-mixed': 7, 'batch-read-error': 6, 'batch-write-error': 6, 'flush-error': 2, 'sync-error-writethrough': 3,
                      'publish-reset': 2, 'publish-disable': 2}.get(case, 1)
             io = {'entered': case != 'fullqueue', 'calls': calls, 'events': events}
             gpr = [0] * 16
@@ -699,7 +745,9 @@ def self_check():
                 cpus.append({**copy.deepcopy(state[1]), 'stop': 'cancelled', 'stats': {'halts': 1, 'invalidations': 1}, 'memory': copy.deepcopy(cpu['memory'])})
             report = {} if meta['sync_error'] else {'cpus': cpus, 'io_disk': io}
             n = meta['n']
-            stderr = f'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none\n' + ('disk shutdown full-sync: injected\n' if meta['sync_error'] else '')
+            stderr = f'teardown: vcpus {n} joined {n} destroyed {n} vm_destroy 0 children none\n' + (
+                ('disk shutdown full-sync: an earlier host sync of this disk failed\n' if case == 'flush-error-power' else 'disk shutdown full-sync: injected\n')
+                if meta['sync_error'] else '')
             counts = {'windows': 0, 'windowless_posted': 1, 'drain_waits': 1, 'drain_expiries': 0, 'table_fallbacks': 0}
             if case == 'table-page': counts.update(windows=1, table_fallbacks=1)
             if case == 'drain-expiry': counts.update(windows=1, drain_expiries=1)
@@ -739,6 +787,14 @@ def self_check():
                 image = bytearray(memory); struct.pack_into('<I', image, RESULT2 - BASE, OLD)
                 for target in (lambda b: b[10][1][0], lambda b: b[1]['cpus'][1]['memory'][0]):
                     bad = copy.deepcopy(args); target(bad)['data'] = image.hex()
+                    assert verify(*bad); controls += 1
+            if case in ('flush-error-power', 'sync-error-writethrough'):
+                # A failed request reported OK, or (power) S5 failing for another reason, must fail.
+                image = bytearray(memory); image[0x5003 if case == 'flush-error-power' else 0x5000] = 0
+                bad = copy.deepcopy(args); bad[10][0][0]['data'] = image.hex()
+                assert verify(*bad), case; controls += 1
+                if case == 'flush-error-power':
+                    bad = copy.deepcopy(args); bad[4] = bad[4].replace('an earlier host sync of this disk failed', 'injected')
                     assert verify(*bad); controls += 1
             if case == 'flush-error':
                 # Either FLUSH reported OK (the second: a non-sticky failure) must fail.
@@ -820,6 +876,7 @@ def main():
     run = sub.add_parser('run')
     for key in ('host', 'runtime', 'fexc', 'out'): run.add_argument('--' + key, type=pathlib.Path, required=True)
     run.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
+    run.add_argument('--no-lock', action='store_true', help='the caller holds the VM lock (tools/run_suite.py)')
     run.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
     args = parser.parse_args()
     if args.action == 'self-check': self_check(); return 0
@@ -839,7 +896,8 @@ def main():
     (args.out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     results = []
     with args.lock.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)   # correctness only: parallel runs share the VM lock (tools/vmlock.py)
+        # Correctness-only cases share the VM lock (tools/vmlock.py); scheduling-sensitive ones (TIMED) take it alone.
+        if not args.no_lock: fcntl.flock(lock, fcntl.LOCK_EX if set(args.cases) & set(TIMED) else fcntl.LOCK_SH)
         for case in args.cases:
             result = run_case(args, case); results.append(result)
             (args.out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')

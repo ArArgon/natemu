@@ -19,19 +19,20 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
   reboot-acpi    `reboot -f` with the ext4 mounted after sync (Linux's default reboot writes the FADT reset register).
                  natemu: the run ends with the stop `Power(2)` (exit 2) after the same disk drain and final full sync
                  as S5 (crates/host/src/pm.rs; REQUEST_POWER_POLL in crates/host/src/execution.rs).
-  reboot-kbd     the same with reboot=k: the 64H pulses reach no device (the FADT declares no 8042); after its EFI
-                 attempt Linux's BIOS fallback switches to real mode, which natemu does not run: the resident stop
-                 UNSUPPORTED_MODE (1), exit 2, about 5 s in (the keyboard waits). No disk drain.
+  reboot-kbd     the same with reboot=k: the keyboard controller's reset pulse (FEH to port 64H; there is no 8042,
+                 but that write is decoded, crates/host/src/pm.rs) ends the run the same way: Power(2), drain, sync.
   reboot-triple  the same with reboot=t: Linux loads an empty IDT and faults: the resident stop SHUTDOWN (16), exit 2.
-                 natemu does not reboot a guest (docs/restructure/io-plan.md: automatic reboot is out of scope); the
-                 defined behaviour checked here is the typed stop, no hang, and a relaunch that replays the journal
-                 and finds the synced file, fsck clean afterwards.
+                 A guest reboot ends the run: natemu does not reboot (docs/restructure/io-plan.md); the defined
+                 behaviour checked here is the typed stop, no hang, and a relaunch that replays the journal and finds
+                 the synced file, fsck clean afterwards.
   fs-full        ext4 filled to ENOSPC by dd: dd fails with ENOSPC, a further small write fails, sync succeeds, the
                  file system has no error, space returns after rm; fsck clean; relaunch reads the data.
   host-full      the image lives on a 32 MiB APFS disk image (hdiutil, no sudo): p1 ext4 is written first, then
                  O_DIRECT writes to the raw p2 exhaust the host volume (pwrite ENOSPC): the guest's dd gets EIO, the
                  kernel logs `I/O error, dev vda`, a FLUSH afterwards and later reads of p1 succeed, S5 succeeds and a
-                 relaunch reads p1.
+                 relaunch reads p1. (Had the full volume failed an fsync instead, every later FLUSH and S5 would fail,
+                 correctly: a host sync failure is sticky, crates/host/src/virtio/block.rs. APFS reports ENOSPC at
+                 pwrite, so they succeed.)
   host-limit     RLIMIT_FSIZE on the natemu process (SIGXFSZ ignored) makes every host pwrite ending past LIMIT fail
                  with EFBIG, deterministically: a 64 KiB O_DIRECT write (one 16-segment request) straddling LIMIT gets a
                  2048-byte short write then EFBIG (IOERR), two of four concurrent writers above LIMIT fail while the two
@@ -79,7 +80,7 @@ IMAGE = {'gpt': 'gpt.raw', 'mbr': 'mbr.raw', 'reboot-acpi': 'data.raw', 'reboot-
 EXTRA = {'reboot-kbd': ' reboot=k', 'reboot-triple': ' reboot=t'}
 # The write launch's expected host stop (stderr's last `natemu: ...` line) and exit status; every verify launch: S5.
 POWEROFF = ('natemu: Power(1)', 0)
-STOP = {'reboot-acpi': ('natemu: Power(2)', 2), 'reboot-kbd': ('natemu: Resident { stop: 1, status: 1, detail: 1 }', 2),
+STOP = {'reboot-acpi': ('natemu: Power(2)', 2), 'reboot-kbd': ('natemu: Power(2)', 2),
         'reboot-triple': ('natemu: Resident { stop: 16, status: 1, detail: 16 }', 2)}
 # natemu's stderr line for each failed host call (block.rs), by write launch; none anywhere else.
 BACKEND_ERRORS = {'host-full': 'virtio-block: No space left on device (os error 28)', 'host-limit': 'virtio-block: File too large (os error 27)'}

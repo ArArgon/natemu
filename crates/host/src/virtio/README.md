@@ -154,7 +154,10 @@ FLUSH permits writeback; otherwise each successful OUT includes an fsync.
 A failed read or write does not affect later FLUSHes. A failed host sync is
 sticky (`Sticky` in `block.rs`, as QEMU's file-posix): every later FLUSH,
 write-through OUT and the power-off full sync then fail without a call, for the
-rest of the launch; a device reset does not clear it.
+rest of the launch; a device reset does not clear it. Syncs are serialised (as
+QEMU's per-device flushes), so one racing a failing sync fails too; the refusal
+is logged once. A guest reboot (reset register, or FEH to port 64H) ends the run
+with `Power(2)` after the same drain and final sync as S5.
 The stable ID derives from the opened file's device/inode and survives reset.
 
 The power-triggering port instruction commits before the resident enters a

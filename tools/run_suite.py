@@ -47,6 +47,8 @@ SERIAL_WHY = {
     'k1-c4': 'each run killed after 300 s: link-full at 4 vCPUs, block size 1, exceeded it in the parallel phase at -j 6 (par k1 steps now take one slot per vCPU and a 450 s kill: oversubscribed P cores were the cause)',
     'boot-smoke': 'Ctrl-C must end the stub within 5 s; boots under a 120 s timeout',
     'vector-split-smp': 'three vCPUs exercise split-lock ownership and vector completion concurrently',
+    'virtio-lifecycle-timed': 'held-call schedules released or timed out at 3 s, the 50 ms windowless drain deadline (code-page: none '
+                              'may expire), a fixed guest delay against a 300 ms port exit (drain-expiry)',
 }
 
 
@@ -70,7 +72,7 @@ QUICK = ('build', 'cargo-test', 'cargo-test-fexc', 'runtime', 'l1', 'l2', 'l2-ia
          'i8b', 'i9', 'i10', 'i7-cpl0', 'xsave', 'i6-faults', 'i10-faults', 'i5c', 'i6b-cases', 'flow', 'asm', 'faults@1', 'i7-faults@1',
          'loopfaults-default@1', 'probes@1', 'corpora-c2', 'smp', 'limits', 'litmus', 'events', 'privilege', 'delivery', 'm3',
          'k1-c1', 'k1-c2@1', 'pic-ac-fence-user', 'k2-cost', 'k2-gather', 'nostop-*', 'x3-qemu', 'x3-cases', 'x4', 'm1', 'm2', 'l3', 'l4a', 's4', 'x1', 'r1a', 'r1b-c2',
-         'i5b-images', 'instruction-gaps', 'vector-split-smp', 'i8-faults', 'i9-faults', 'i6b', 'system', 'coherence', 'sharedpt', 'fix-1', 'i6-faults-1', 'l4b', 'contain', 'boot-smoke', 'kicks', 'virtio-lifecycle', 'io-coverage')
+         'i5b-images', 'instruction-gaps', 'vector-split-smp', 'i8-faults', 'i9-faults', 'i6b', 'system', 'coherence', 'sharedpt', 'fix-1', 'i6-faults-1', 'l4b', 'contain', 'boot-smoke', 'kicks', 'virtio-lifecycle', 'virtio-lifecycle-timed', 'io-coverage')
 
 
 @dataclasses.dataclass
@@ -185,11 +187,12 @@ def steps(F, O):
     # Block device: the deterministic lifecycle and backend-failure cases through guest MMIO (the publish-* cases need an
     # io-test-hooks build), and stock Linux on partitioned disks, guest reboot, full guest and host disks.
     target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target'))
-    import run_virtio_lifecycle
-    add('virtio-lifecycle', ['python3', 'tools/run_virtio_lifecycle.py', 'run', '--host', target / 'release/natemu-host',
-                             '--runtime', target / 'aarch64-unknown-none/release/natemu-runtime', '--fexc', F, '--out', O / 'out' / 'virtio-lifecycle',
-                             '--cases', *(c for c in run_virtio_lifecycle.CASES if not c.startswith('publish-'))], est=5)
-    vm('io-coverage', 'run_io_coverage.py', est=75)
+    import run_virtio_lifecycle as lc
+    for name, timed in (('virtio-lifecycle', False), ('virtio-lifecycle-timed', True)):
+        add(name, ['python3', 'tools/run_virtio_lifecycle.py', 'run', '--host', target / 'release/natemu-host', '--no-lock',
+                   '--runtime', target / 'aarch64-unknown-none/release/natemu-runtime', '--fexc', F, '--out', O / 'out' / name,
+                   '--cases', *(c for c in lc.CASES if not c.startswith('publish-') and (c in lc.TIMED) == timed)], est=5)
+    vm('io-coverage', 'run_io_coverage.py', est=90)
     for n in (2, 3, 4): vm(f'r1b-c{n}', 'run_r1.py', 'r1b', '--cpus', n, est=25)
     # Fixed-address GP probes must name an unmapped page; DR watchpoints must name the actual frame.
     distant = {'faults', 'faults-1', 'events', 'privilege', 'k2-swapgs', 'k2-cr2', 'k2-stifirst', 'k2-verw'}
