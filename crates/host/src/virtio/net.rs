@@ -55,6 +55,8 @@ pub(super) struct Network {
     done: Mutex<Receiver<Result<()>>>,
     /// The backend's doorbell ([`PacketPort::on_ready`]).
     ready: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Received frames dropped for want of a guest buffer ([`PacketPort::lost`]).
+    pub(super) lost: AtomicU64,
 }
 impl Network {
     /// Configuration space: mac, status, max_virtqueue_pairs (unused), mtu.
@@ -149,6 +151,15 @@ impl PacketPort {
             }
         }
     }
+    /// Received frames the device dropped because the guest had no (large enough) RX buffer.
+    pub fn lost(&self) -> u64 {
+        self.device
+            .upgrade()
+            .map_or(0, |device| match &device.profile {
+                Profile::Network(network) => network.lost.load(SeqCst),
+                _ => 0,
+            })
+    }
     pub fn closed(&self) -> bool {
         self.device.upgrade().is_none_or(|device| {
             let s = device.lock();
@@ -188,6 +199,7 @@ impl Virtio {
                 tx: send,
                 done: Mutex::new(result),
                 ready: OnceLock::new(),
+                lost: AtomicU64::new(0),
             }),
         );
         let port = PacketPort {
@@ -219,6 +231,7 @@ impl Virtio {
             let len = HEADER + packet.len;
             // Valid short buffers may receive smaller frames; a larger external packet is just lost.
             if capacity < len {
+                network.lost.fetch_add(1, SeqCst);
                 return Ok(Request::Empty);
             }
             bytes[NUM_BUFFERS].copy_from_slice(&1u16.to_le_bytes());

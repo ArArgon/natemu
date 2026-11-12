@@ -769,9 +769,23 @@ and replication (`natemu-raw/net-slirp-20261112-01`, `natemu-raw/net-replica-202
 throughput is recorded, not yet benchmarked: about 775 Mbit/s guest-to-host and 1.3 Gbit/s
 host-to-guest). This is the first scope of the network contract above, not all of it:
 IPv6 and ICMPv6, the mixed-family resolver correction (03-03 claim 59), the contained
-broker process (claim 70) and port forwarding remain follow-on work. Next: stress and
-edge cases (soak, many connections, overload, lifecycle), then combined disk/network
-acceptance and a benchmark round against QEMU user networking and VZ NAT.
+broker process (claim 70) and port forwarding remain follow-on work.
+
+**Stress and edge cases (November 12).** Guest reboot, a never-loaded driver and three
+resets under traffic pass at 1/2/4 vCPUs. The stress case first **failed**: with 8 streams
+each way, downloads collapsed to ~2 Mbit/s. The device takes one RX frame per TX packet
+under a full upload, so the upload's ACKs filled the backend's 256-frame queue, dropped
+download segments, and slirp's TCP recovers from loss only by timeout. A per-pass TX cap
+did not help (rejected hypothesis, as was guest bufferbloat: fq_codel is the default and
+loaded RTT is ~3 ms). Queue depth peaked at 718 frames, so the cap is now 4096: 60 s
+of 8 streams each way hold ~480/370 Mbit/s with no backend drop, 500 short connections
+all succeed (an earlier shortfall was the test's curl configuration, not natemu), UDP
+floods both ways leave the network working. Remaining gaps are in the
+[README](../../crates/host/src/virtio/README.md#network-backend---net) (many-stream
+retransmits inside slirp, 4-5 ms idle RTT, synchronous TX, no hold on an empty RX ring).
+Evidence: `natemu-raw/net-slirp-20261112-01` (runner-07, diag-01). Next: combined
+disk/network acceptance, then a benchmark round against QEMU user networking and VZ NAT
+(VZ, native ARM: 5-60 Gbit/s on the same bidirectional test).
 
 The independent fio preparation is followed by accepted functional admission.
 The first unmodified fio run parsed all eleven profiles but timed out during the

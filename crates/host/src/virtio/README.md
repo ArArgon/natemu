@@ -191,18 +191,33 @@ the host's LAN address. No port forwarding.
 `Slirp::new` starts the stack before boot (a failure refuses the launch). One thread
 (`Slirp::run`, in `Prepared::run`'s scope, joined after the devices stop) owns it:
 it feeds queued guest TX frames to `slirp_input`, hands slirp's output frames to the
-guest in order through `PacketPort::receive` (up to 256 waiting; a refused frame waits
-for the next doorbell or at most 100 ms), and `poll(2)`s slirp's sockets plus the
-doorbell. It ends when the device stops or drains, after giving any accepted TX packet
+guest in order through `PacketPort::receive` (up to 4096 waiting, then new ones drop;
+a refused frame waits for the next doorbell or at most 100 ms), and `poll(2)`s slirp's
+sockets plus the doorbell. It feeds at most 64 TX packets per pass. The queue is deep
+on purpose: under a full guest upload the device takes one RX frame per TX packet, so
+the upload's ACKs queue with any download's data (8 streams each way peaked at 718),
+and slirp's TCP recovers from a dropped segment only by timeout. With `--perf-log` the
+backend writes `net {"backend_dropped":N,"guest_lost":M}` at exit (frames dropped at
+that cap, and frames the device dropped because the guest had no RX buffer). It ends when the device stops or drains, after giving any accepted TX packet
 its result. Slirp's state survives device resets, as in QEMU.
 
 Checked by `tools/run_net_linux.py` (suite step `net-linux`): stock Debian Linux at
 1/2/4 vCPUs gets its lease, pings the gateway, downloads a host file byte-exact over
 HTTP, runs iperf3 TCP both ways and UDP, survives a driver unbind/rebind under a
-receive stream, and exits promptly on SIGINT under traffic; with the internet, DNS
-and a CA-verified HTTPS download. Not yet covered: IPv6/ICMPv6, port forwarding,
-a separate contained process, long soaks, many connections, overload and combined
-disk+network load.
+receive stream (three times), ends cleanly at guest reboot, powers off with the
+driver never loaded, and exits promptly on SIGINT under traffic; with the internet, DNS
+and a CA-verified HTTPS download. `--cases stress` (not in the suite): 60 s of 8 streams
+each way, 100 parallel streams, 500 short connections 64 at a time, UDP floods both
+ways, then the network still works. Not yet covered: IPv6/ICMPv6, port forwarding,
+a separate contained process, combined disk+network load.
+
+Known gaps (November 12 stress): with 32-100 parallel guest uploads slirp's TCP (Reno,
+no SACK) loses segments internally: 2-4% fast retransmits and 15-23% less throughput
+than 8 streams; nothing is dropped on natemu's side. Idle ping to the gateway averages
+4-5 ms. Every TX packet is a synchronous round trip to the backend thread and the
+device alternates one RX frame per TX packet (TX ~700 Mbit/s, RX ~1.35 Gbit/s alone,
+about 480/370 together). A frame arriving while the guest has no RX buffer is dropped
+rather than held.
 
 Queues 0/1 have a maximum of 256 direct descriptors. VERSION_1 is required;
 MAC, MTU and STATUS are offered, with MTU1500 and no offloads. Frames exclude
