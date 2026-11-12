@@ -13,6 +13,8 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::Instant;
 
 #[repr(C)]
@@ -232,6 +234,10 @@ pub struct Slirp {
     context: *mut Context,
     port: PacketPort,
     bell: UnixStream,
+    /// Set while the loop may sleep in `poll`: only then does the device write the doorbell (a
+    /// syscall it makes under its state lock). Armed before the loop's last look at the device's
+    /// state (which takes that lock), so a change the device makes after that look sees it armed.
+    armed: Arc<AtomicBool>,
     fds: Vec<PollFd>,
 }
 // The stack and its context are used by one thread at a time: the creator, then `run`'s.
@@ -250,8 +256,12 @@ impl Slirp {
         let ring2 = ring
             .try_clone()
             .map_err(|e| format!("network doorbell: {e}"))?;
+        let armed = Arc::new(AtomicBool::new(false));
+        let armed2 = armed.clone();
         port.on_ready(move || {
-            let _ = (&ring2).write(&[1]);
+            if armed2.swap(false, SeqCst) {
+                let _ = (&ring2).write(&[1]);
+            }
         });
         let context = Box::into_raw(Box::new(Context {
             rx: VecDeque::new(),
@@ -297,6 +307,7 @@ impl Slirp {
             context,
             port,
             bell,
+            armed,
             fds: Vec::new(),
         };
         if stack.is_null() {
@@ -308,18 +319,13 @@ impl Slirp {
     /// Serve until the device stops or drains. An error is terminal for the VM.
     pub fn run(mut self) -> Result<()> {
         while !self.port.closed() {
-            let stack = self.stack;
-            for _ in 0..TX_BATCH {
-                let sent = self.port.transmit(|frame| {
-                    unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
-                    Ok(())
-                })?;
-                if !sent {
-                    break;
-                }
-            }
-            self.deliver();
-            self.wait();
+            self.service()?;
+            // Arm, then look once more: work that arrived before arming is found here, work after
+            // it rings the doorbell.
+            self.armed.store(true, SeqCst);
+            let busy = self.service()? || self.port.closed();
+            self.wait(busy);
+            self.armed.store(false, SeqCst);
             self.fire_timers();
             self.deliver();
         }
@@ -339,23 +345,48 @@ impl Slirp {
         Ok(())
     }
 
-    /// Hand queued frames to the guest in order until one is refused (slot busy or queue not ready).
-    fn deliver(&mut self) {
+    /// Feed up to [`TX_BATCH`] guest TX packets to slirp, then deliver; true if anything moved.
+    fn service(&mut self) -> Result<bool> {
+        let stack = self.stack;
+        let mut moved = false;
+        for _ in 0..TX_BATCH {
+            let sent = self.port.transmit(|frame| {
+                unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
+                Ok(())
+            })?;
+            if !sent {
+                break;
+            }
+            moved = true;
+        }
+        Ok(self.deliver() || moved)
+    }
+
+    /// Hand queued frames to the guest in order until one is refused (slot busy or queue not
+    /// ready); true if any was taken.
+    fn deliver(&mut self) -> bool {
         let c = unsafe { &mut *self.context };
+        let mut moved = false;
         while let Some(frame) = c.rx.front() {
             // Slirp frames lack the FCS; an out-of-profile one could never be taken.
             if (14..=1518).contains(&frame.len()) && !self.port.receive(frame) {
-                return;
+                break;
             }
             c.rx.pop_front();
+            moved = true;
         }
+        moved
     }
 
-    /// Poll slirp's sockets and the doorbell until something happens or the next deadline, then let
-    /// slirp act on what is ready.
-    fn wait(&mut self) {
+    /// Poll slirp's sockets and the doorbell until something happens or the next deadline (at once
+    /// if `busy`), then let slirp act on what is ready.
+    fn wait(&mut self, busy: bool) {
         let c = unsafe { &*self.context };
-        let mut timeout = if c.rx.is_empty() { 1000 } else { RETRY_MS };
+        let mut timeout = match () {
+            _ if busy => 0,
+            _ if c.rx.is_empty() => 1000,
+            _ => RETRY_MS,
+        };
         let now_ms = c.now_ns() / 1_000_000;
         for &t in &c.timers {
             if let Some(expire) = unsafe { (*t).expire } {
