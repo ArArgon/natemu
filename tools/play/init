@@ -12,6 +12,22 @@ mount -t tmpfs run /run
 chmod 1777 /tmp
 echo 4 > /proc/sys/kernel/printk
 hostname natemu-play
+ip link set lo up
+# virtio devices (natemu --net/--disk/--rng; QEMU virtio-*-device on virtio-mmio): load the drivers, use what appears.
+modprobe -q virtio_mmio && for m in virtio_net virtio_blk virtio_rng ext4; do modprobe -q $m; done
+if [ -e /sys/class/net/eth0 ]; then
+    ip link set eth0 up
+    # A lease within ~6 s, else udhcpc keeps trying in the background (it stays to renew either way).
+    udhcpc -i eth0 -b -t 3 -T 2 -s /etc/udhcpc/default.script >/dev/null 2>&1
+    echo "network: eth0 $(ip -4 -o addr show eth0 | awk '{print $4}')"
+fi
+if [ -b /dev/vda ]; then
+    if blkid /dev/vda 2>/dev/null | grep -q 'TYPE="ext4"' && mount /dev/vda /mnt/disk; then
+        echo "disk: /dev/vda on /mnt/disk"
+    else
+        echo "disk: /dev/vda (not mounted; a new disk: mkfs.ext4 /dev/vda && mount /dev/vda /mnt/disk)"
+    fi
+fi
 tty=ttyS0
 for a in $(cat /proc/cmdline); do case $a in console=*) tty=${a#console=}; tty=${tty%%,*};; esac; done
 [ -c /dev/$tty ] || tty=console
