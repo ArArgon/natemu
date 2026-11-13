@@ -8,7 +8,10 @@ use std::sync::{
 };
 use std::time::Instant;
 
-/// Feature bits offered (virtio 1.3 §5.1.3): MTU, MAC and STATUS, and EVENT_IDX; no offloads.
+/// Feature bits offered (virtio 1.3 §5.1.3): MTU, MAC and STATUS, and EVENT_IDX; checksum
+/// offloads as the backend's [`Offloads`] allow. No segmentation offloads yet.
+const F_CSUM: u64 = 1;
+const F_GUEST_CSUM: u64 = 1 << 1;
 const F_MTU: u64 = 1 << 3;
 const F_MAC: u64 = 1 << 5;
 const F_STATUS: u64 = 1 << 16;
@@ -19,6 +22,10 @@ const HEADER: usize = 12;
 const NUM_BUFFERS: std::ops::Range<usize> = 10..12;
 /// VIRTIO_NET_HDR_F_NEEDS_CSUM | DATA_VALID | RSC_INFO: meaningful only with offloads.
 const OFFLOAD_FLAGS: u8 = 7;
+const NEEDS_CSUM: u8 = 1;
+const DATA_VALID: u8 = 2;
+const CSUM_START: std::ops::Range<usize> = 6..8;
+const CSUM_OFFSET: std::ops::Range<usize> = 8..10;
 /// VIRTIO_NET_S_LINK_UP.
 const LINK_UP: u16 = 1;
 const MTU: u16 = 1500;
@@ -27,9 +34,22 @@ const MIN_FRAME: usize = 14;
 /// Ethernet without FCS, including one VLAN tag, MTU1500.
 const MAX_FRAME: usize = 1518;
 
+/// What the backend can take, for the device to offer the guest only that (virtio 1.3 §5.1.6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Offloads {
+    /// TX: the guest may leave a TCP/UDP checksum partial (NEEDS_CSUM); [`PacketPort::transmit`]
+    /// completes it before the backend sees the frame (CSUM).
+    pub tx_checksum: bool,
+    /// RX: every frame the backend delivers carries valid checksums (it built them itself), so the
+    /// device marks them DATA_VALID and the guest skips verifying them (GUEST_CSUM).
+    pub rx_checksum_valid: bool,
+}
+
 /// One frame in owned storage (moved between queues without copying).
 pub(super) struct Packet {
     bytes: Vec<u8>,
+    /// TX: a partial checksum to complete, (csum_start, csum_offset) in the frame.
+    csum: Option<(usize, usize)>,
 }
 impl Packet {
     #[cfg(test)]
@@ -40,7 +60,7 @@ impl Packet {
         if !(MIN_FRAME..=MAX_FRAME).contains(&bytes.len()) {
             return Err("network frame length outside MTU1500 profile".into());
         }
-        Ok(Self { bytes })
+        Ok(Self { bytes, csum: None })
     }
     fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -72,6 +92,7 @@ const TX_QUEUE: usize = 256;
 pub(super) const RX_SLOTS: usize = 64;
 pub(super) struct Network {
     mac: [u8; 6],
+    offloads: Offloads,
     /// TX packets handed to the [`PacketPort`], in order.
     tx: SyncSender<Packet>,
     buffers: Buffers,
@@ -81,6 +102,16 @@ pub(super) struct Network {
     pub(super) lost: AtomicU64,
 }
 impl Network {
+    pub fn features(&self) -> u64 {
+        let mut features = FEATURES;
+        if self.offloads.tx_checksum {
+            features |= F_CSUM;
+        }
+        if self.offloads.rx_checksum_valid {
+            features |= F_GUEST_CSUM;
+        }
+        features
+    }
     /// Configuration space: mac, status, max_virtqueue_pairs (unused), mtu.
     pub fn config(&self) -> [u8; 12] {
         let mut bytes = [0; 12];
@@ -132,7 +163,13 @@ impl PacketPort {
                 frames.push_front(frame);
                 break;
             }
-            s.received.push_back((id, Packet { bytes: frame }));
+            s.received.push_back((
+                id,
+                Packet {
+                    bytes: frame,
+                    csum: None,
+                },
+            ));
             taken = true;
         }
         // An RX request in flight re-notifies itself while frames wait (`finish_request`).
@@ -147,10 +184,13 @@ impl PacketPort {
     /// guest already saw it complete (like a NIC that fetched it): return success for a transient
     /// drop, error for terminal loss (it fails the device). Never retried.
     pub fn transmit(&self, send: impl FnOnce(&[u8]) -> Result<()>) -> Result<bool> {
-        let packet = match self.tx.try_recv() {
+        let mut packet = match self.tx.try_recv() {
             Ok(packet) => packet,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(false),
         };
+        if let Some((start, offset)) = packet.csum {
+            finish_checksum(&mut packet.bytes, start, offset);
+        }
         let result = send(packet.bytes());
         self.buffers.give(packet.bytes);
         if let Err(error) = result {
@@ -207,7 +247,12 @@ impl Drop for PacketPort {
 impl Virtio {
     /// Construct after backend admission and before VM boot; the returned port must be serviced
     /// concurrently with `run`. This does not start a network or obtain privileged access.
-    pub fn network(irqs: Irqs, gsi: usize, mac: [u8; 6]) -> Result<(Arc<Self>, PacketPort)> {
+    pub fn network(
+        irqs: Irqs,
+        gsi: usize,
+        mac: [u8; 6],
+        offloads: Offloads,
+    ) -> Result<(Arc<Self>, PacketPort)> {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err("network MAC must be nonzero unicast".into());
         }
@@ -218,6 +263,7 @@ impl Virtio {
             gsi,
             Profile::Network(Network {
                 mac,
+                offloads,
                 tx: send,
                 buffers: buffers.clone(),
                 ready: OnceLock::new(),
@@ -256,6 +302,9 @@ impl Virtio {
                 network.lost.fetch_add(1, SeqCst);
                 return Ok(Request::Empty);
             }
+            if network.offloads.rx_checksum_valid && self.accepted(F_GUEST_CSUM) {
+                bytes[0] = DATA_VALID;
+            }
             bytes[NUM_BUFFERS].copy_from_slice(&1u16.to_le_bytes());
             bytes[HEADER..len].copy_from_slice(packet.bytes());
             network.buffers.give(packet.bytes);
@@ -272,7 +321,8 @@ impl Virtio {
             if !self.copy(guest, chain.id, &mut gather(extents, frame), None)? {
                 return Ok(Request::Canceled);
             }
-            let packet = match transmit_packet(&bytes[..capacity], &network.buffers) {
+            let csum = self.accepted(F_CSUM);
+            let packet = match transmit_packet(&bytes[..capacity], &network.buffers, csum) {
                 Ok(p) => p,
                 Err(e) => return Ok(Request::Invalid(e)),
             };
@@ -356,16 +406,56 @@ fn capacity(chain: &[Descriptor], rx: bool) -> Result<usize> {
             .ok_or("network chain length overflow".into())
     })
 }
-fn transmit_packet(bytes: &[u8], buffers: &Buffers) -> Result<Packet> {
+/// `csum`: the driver accepted CSUM, so NEEDS_CSUM is allowed and makes csum_start/offset active.
+fn transmit_packet(bytes: &[u8], buffers: &Buffers, csum: bool) -> Result<Packet> {
     if bytes.len() < HEADER {
         return Err("short network TX header".into());
     }
     // Unknown flag bits and inactive checksum/header hints are ignored (virtio 1.3 §5.1.6.2.2).
     let (flags, gso_type) = (bytes[0], bytes[1]);
-    if flags & OFFLOAD_FLAGS != 0 || gso_type != 0 || bytes[NUM_BUFFERS] != [0, 0] {
+    let offload = flags & OFFLOAD_FLAGS & !(if csum { NEEDS_CSUM } else { 0 });
+    if offload != 0 || gso_type != 0 || bytes[NUM_BUFFERS] != [0, 0] {
         return Err("unnegotiated network TX offload/header".into());
     }
-    Packet::owned(buffers.take(&bytes[HEADER..]))
+    let mut packet = Packet::owned(buffers.take(&bytes[HEADER..]))?;
+    if flags & NEEDS_CSUM != 0 {
+        let field = |r: std::ops::Range<usize>| {
+            usize::from(u16::from_le_bytes([bytes[r.start], bytes[r.start + 1]]))
+        };
+        let (start, offset) = (field(CSUM_START), field(CSUM_OFFSET));
+        // The 16-bit field must lie inside the frame, after the checksummed range starts.
+        if start
+            .checked_add(offset)
+            .and_then(|e| e.checked_add(2))
+            .is_none_or(|e| e > packet.bytes.len())
+        {
+            return Err("network TX checksum outside the frame".into());
+        }
+        packet.csum = Some((start, offset));
+    }
+    Ok(packet)
+}
+
+/// Complete a partial checksum (NEEDS_CSUM, virtio 1.3 §5.1.6.2): the field at `start + offset`
+/// holds the pseudo-header sum; the ones' complement of the folded sum of `frame[start..]` replaces
+/// it, 0 written as 0xffff (as Linux's skb_checksum_help). The caller checked the bounds.
+pub(super) fn finish_checksum(frame: &mut [u8], start: usize, offset: usize) {
+    let data = &frame[start..];
+    let mut sum: u64 = data
+        .chunks_exact(2)
+        .map(|w| u64::from(u16::from_be_bytes([w[0], w[1]])))
+        .sum();
+    if data.len() % 2 == 1 {
+        sum += u64::from(data[data.len() - 1]) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let checksum = match !(sum as u16) {
+        0 => 0xffff,
+        c => c,
+    };
+    frame[start + offset..start + offset + 2].copy_from_slice(&checksum.to_be_bytes());
 }
 
 #[cfg(test)]
@@ -377,6 +467,7 @@ mod tests {
             rng.irqs.clone(),
             NET_RESOURCE.gsi as usize,
             [2, 0, 0, 0, 0, 1],
+            Offloads::default(),
         )
         .unwrap();
         for (o, v) in [
@@ -408,6 +499,132 @@ mod tests {
     fn frame() -> Vec<u8> {
         (0..64).collect()
     }
+    /// The plain RFC 1071 checksum of `bytes` (independent of `finish_checksum`).
+    fn rfc1071(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for (i, b) in bytes.iter().enumerate() {
+            sum += u32::from(*b) << if i % 2 == 0 { 8 } else { 0 };
+        }
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+    /// An Ethernet/IPv4/TCP frame with `payload`, its TCP checksum field holding the folded
+    /// pseudo-header sum as a Linux guest leaves it (CHECKSUM_PARTIAL); returns it and the full
+    /// checksum the field should end up with.
+    fn partial_tcp(payload: &[u8]) -> (Vec<u8>, u16) {
+        let (src, dst) = ([10, 0, 2, 15], [192, 168, 12, 100]);
+        let tcp_len = 20 + payload.len();
+        let mut f = vec![0u8; 14];
+        f[12] = 8;
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 6, 0, 0];
+        ip[2..4].copy_from_slice(&((20 + tcp_len) as u16).to_be_bytes());
+        ip.extend(src);
+        ip.extend(dst);
+        f.extend(&ip);
+        let mut tcp = vec![0u8; 20];
+        tcp[..4].copy_from_slice(&[0x9c, 0x40, 0x14, 0x51]);
+        tcp[12] = 0x50;
+        tcp[13] = 0x18;
+        tcp.extend(payload);
+        let mut pseudo = [src, dst].concat();
+        pseudo.extend([0, 6]);
+        pseudo.extend((tcp_len as u16).to_be_bytes());
+        let full = rfc1071(&[pseudo.clone(), tcp.clone()].concat());
+        // The guest's partial field: the uncomplemented folded pseudo-header sum.
+        tcp[16..18].copy_from_slice(&(!rfc1071(&pseudo)).to_be_bytes());
+        f.extend(tcp);
+        (f, full)
+    }
+    #[test]
+    fn partial_checksums_complete_to_the_full_tcp_checksum() {
+        for payload in [&b""[..], b"x", b"natemu", &[0xffu8; 1459][..]] {
+            let (mut f, full) = partial_tcp(payload);
+            finish_checksum(&mut f, 34, 16);
+            let got = u16::from_be_bytes([f[50], f[51]]);
+            assert_eq!(
+                got,
+                if full == 0 { 0xffff } else { full },
+                "{} bytes",
+                payload.len()
+            );
+            // A receiver's verification sums the segment and pseudo-header to all ones.
+            let mut pseudo = f[26..34].to_vec();
+            pseudo.extend([0, 6]);
+            pseudo.extend(((f.len() - 34) as u16).to_be_bytes());
+            assert!(matches!(
+                rfc1071(&[pseudo, f[34..].to_vec()].concat()),
+                0 | 0xffff
+            ));
+        }
+        // A sum that completes to 0 is written as 0xffff.
+        let mut zero = vec![0u8; 4];
+        zero[0] = 0xff;
+        zero[1] = 0xff;
+        finish_checksum(&mut zero, 0, 2);
+        assert_eq!(zero[2..], [0xff, 0xff]);
+    }
+    #[test]
+    fn needs_csum_is_accepted_only_when_negotiated_and_inside_the_frame() {
+        let (frame, _) = partial_tcp(b"payload");
+        let header = |start: u16, offset: u16| {
+            let mut h = vec![0u8; HEADER];
+            h[0] = NEEDS_CSUM;
+            h[CSUM_START].copy_from_slice(&start.to_le_bytes());
+            h[CSUM_OFFSET].copy_from_slice(&offset.to_le_bytes());
+            [h, frame.clone()].concat()
+        };
+        let b = Buffers::default();
+        assert!(
+            transmit_packet(&header(34, 16), &b, false).is_err(),
+            "CSUM not accepted"
+        );
+        assert_eq!(
+            transmit_packet(&header(34, 16), &b, true).unwrap().csum,
+            Some((34, 16))
+        );
+        let last = frame.len() as u16 - 2;
+        assert!(transmit_packet(&header(0, last), &b, true).is_ok());
+        assert!(transmit_packet(&header(0, last + 1), &b, true).is_err());
+        assert!(transmit_packet(&header(u16::MAX, u16::MAX), &b, true).is_err());
+        let mut gso = header(34, 16);
+        gso[1] = 1; // GSO_TCPV4 is not offered
+        assert!(transmit_packet(&gso, &b, true).is_err());
+        let mut valid = header(34, 16);
+        valid[0] |= DATA_VALID; // RX-only
+        assert!(transmit_packet(&valid, &b, true).is_err());
+    }
+    #[test]
+    fn offered_features_follow_the_backend() {
+        let rng = super::super::tests::device();
+        for (offloads, extra) in [
+            (Offloads::default(), 0),
+            (
+                Offloads {
+                    tx_checksum: true,
+                    rx_checksum_valid: false,
+                },
+                F_CSUM,
+            ),
+            (
+                Offloads {
+                    tx_checksum: true,
+                    rx_checksum_valid: true,
+                },
+                F_CSUM | F_GUEST_CSUM,
+            ),
+        ] {
+            let (d, _p) = Virtio::network(
+                rng.irqs.clone(),
+                NET_RESOURCE.gsi as usize,
+                [2, 0, 0, 0, 0, 1],
+                offloads,
+            )
+            .unwrap();
+            assert_eq!(d.profile.features(), FEATURES | extra);
+        }
+    }
     #[test]
     fn packet_contract_ignores_inactive_fields_and_unknown_flags() {
         let mut bytes = vec![0; HEADER];
@@ -415,7 +632,7 @@ mod tests {
         bytes[0] = 0xf8;
         bytes[2..10].fill(0xff);
         assert_eq!(
-            transmit_packet(&bytes, &Buffers::default())
+            transmit_packet(&bytes, &Buffers::default(), false)
                 .unwrap()
                 .bytes(),
             frame()
@@ -423,7 +640,7 @@ mod tests {
         for at in [0, 1, 10, 11] {
             let mut bad = bytes.clone();
             bad[at] = 1;
-            assert!(transmit_packet(&bad, &Buffers::default()).is_err());
+            assert!(transmit_packet(&bad, &Buffers::default(), false).is_err());
         }
         assert!(Packet::new(&[0; 13]).is_err());
         assert!(Packet::new(&[0; MAX_FRAME + 1]).is_err());

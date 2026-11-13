@@ -211,7 +211,8 @@ ways, then the network still works. Not yet covered: IPv6/ICMPv6, port forwardin
 a separate contained process, combined disk+network load.
 
 Throughput (November 12, 2 vCPUs, iperf3 to the host, `natemu-raw/net-slirp-20261112-01/vmm-compare-01`):
-upload ~3.3 Gbit/s, download ~5.75 Gbit/s, 8 streams each way ~3.1/2.0 Gbit/s; QEMU 11.1
+upload ~3.5 Gbit/s, download ~5.7 Gbit/s, 8 streams each way ~3.4/2.75 Gbit/s (checksum
+offloads on: upload +10%, 8 streams each way +10%/+30%, download unchanged); QEMU 11.1
 x86 TCG with the same libslirp: ~0.77/1.7/0.55/0.48 Gbit/s. Before the pipelined TX
 queue, held RX frames, EVENT_IDX and interrupt holding: 0.81/1.37/0.46/0.44 (the
 guest was idle 93% of an upload, waiting on one synchronous packet at a time).
@@ -223,12 +224,18 @@ dropped at the backend's 4096-frame queue. Every RX frame and TX packet is still
 own request (one capture, copy and publication each).
 
 Queues 0/1 have a maximum of 256 direct descriptors. VERSION_1 is required;
-MAC, MTU, STATUS and EVENT_IDX are offered, with MTU1500 and no offloads. Frames exclude
+MAC, MTU, STATUS and EVENT_IDX are offered, with MTU1500, plus the checksum offloads the
+backend declares (`Offloads`): CSUM when `PacketPort::transmit` may complete a TX checksum
+the guest left partial (NEEDS_CSUM: csum_start/offset must lie inside the frame, else the
+device fails), GUEST_CSUM when every backend frame already has valid checksums (the device
+then marks RX frames DATA_VALID). No segmentation offloads are offered yet: a backend must
+take large frames first. Frames exclude
 FCS and are at most 1518 bytes including one VLAN tag. Up to 256 queued TX packets and
 64 held RX frames bound storage; headers are the modern 12-byte form even without merged
 buffers. Descriptor boundaries may split headers or payloads. RX writes one
 chain with num_buffers=1; TX used length is zero. Unknown TX flag bits and inactive
-checksum/header hints are ignored; unnegotiated offload requests fail the device.
+checksum/header hints are ignored; unnegotiated offload requests (NEEDS_CSUM without CSUM,
+any GSO type, DATA_VALID on TX) fail the device.
 
 Queue-only disable cancels only the matching operation and preserves other-queue
 indices, notifications and shared pending IRQs. Full reset invalidates both queue

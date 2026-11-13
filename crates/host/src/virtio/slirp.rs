@@ -248,6 +248,12 @@ unsafe impl Send for Slirp {}
 impl Slirp {
     /// The guest MAC the device should offer (QEMU's default).
     pub const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    /// Slirp builds every frame it emits, checksums included, in software, and takes frames whose
+    /// partial checksum the port completed.
+    pub const OFFLOADS: super::Offloads = super::Offloads {
+        tx_checksum: true,
+        rx_checksum_valid: true,
+    };
 
     pub fn new(port: PacketPort) -> Result<Self> {
         let (bell, ring) = UnixStream::pair().map_err(|e| format!("network doorbell: {e}"))?;
