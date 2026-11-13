@@ -65,7 +65,7 @@ depmod -b "$R" "$KVER"
 echo "modules:$have"
 rm -rf "$B/kernel"   # the build host's /tmp may be small
 cd "$R"
-mkdir -p proc sys dev tmp run root etc var/tmp var/log mnt/disk usr/local/sbin etc/udhcpc
+mkdir -p proc sys dev tmp run root etc var/tmp var/log mnt/disk etc/udhcpc
 chmod 1777 tmp var/tmp; chmod 700 root
 # Drop what a RAM-only play system does not read.
 rm -rf usr/share/doc usr/share/man usr/share/info usr/share/locale usr/share/lintian usr/share/bug usr/share/menu var/lib/apt
@@ -94,10 +94,18 @@ bound|renew)
 esac
 EOS
 chmod 755 etc/udhcpc/default.script
-# poweroff/reboot (first in PATH): flush and unmount the virtio disk first; -f alone would drop its unwritten data.
-for c in poweroff reboot; do
-    printf '#!/bin/sh\nsync\numount /mnt/disk 2>/dev/null\nexec busybox %s -f\n' $c > usr/local/sbin/$c; chmod 755 usr/local/sbin/$c
-done
+# busybox init's shutdown action (poweroff/reboot, Ctrl-Alt-Del): flush the virtio disk and unmount it, or at least
+# remount it read-only if something still holds it. init then stops the remaining processes and syncs again.
+mkdir -p etc/init.d
+cat > etc/init.d/rcK <<'EOS'
+#!/bin/sh
+sync
+if grep -q ' /mnt/disk ' /proc/mounts; then
+    umount /mnt/disk 2>/dev/null || mount -o remount,ro /mnt/disk 2>/dev/null
+fi
+sync
+EOS
+chmod 755 etc/init.d/rcK
 echo natemu-play > etc/hostname
 printf '127.0.0.1 localhost\n127.0.1.1 natemu-play\n' > etc/hosts
 printf '/bin/bash\n/bin/sh\n/bin/dash\n' > etc/shells
@@ -122,7 +130,7 @@ cat > etc/motd <<'EOP'
   bash, coreutils, procps, util-linux, iproute2, less, vi, python3, gcc, make, file, htop, curl, e2fsprogs.
   Network (natemu --net): eth0 by DHCP.  Disk (natemu --disk FILE): /dev/vda, mounted on /mnt/disk if ext4
   (a new one: mkfs.ext4 /dev/vda && mount /dev/vda /mnt/disk).
-  Leave with: poweroff      Restart with: reboot      (both sync and unmount /mnt/disk first)
+  Leave with: poweroff      Restart with: reboot      (both unmount /mnt/disk first; exit restarts the shell)
 
 EOP
 # Busybox applets for names no real tool owns (poweroff, reboot, halt, ...).
