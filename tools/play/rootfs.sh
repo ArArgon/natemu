@@ -22,13 +22,25 @@ touch apt/status
 echo "deb [signed-by=$B/kr/usr/share/keyrings/debian-archive-keyring.pgp] https://snapshot.debian.org/archive/debian/$SNAP/ trixie main" > apt/sources.list
 export APT_CONFIG=$B/apt/apt.conf
 apt-get update -qq
-# Requested packages (the closure is whatever they Depend on). busybox-static supplies poweroff/reboot/halt (-f) and
-# fallback applets; nano is not included (vim-tiny is the editor).
+# Requested packages (the closure is whatever they Depend on). busybox-static supplies poweroff/reboot/halt (-f), the
+# DHCP client (udhcpc) and fallback applets; nano is not included (vim-tiny is the editor). kmod loads the virtio
+# drivers, curl and ca-certificates use the network, e2fsprogs formats and checks a virtio disk.
 PKGS="bash dash coreutils procps util-linux iproute2 less vim-tiny python3-minimal gcc libc6-dev binutils make file htop
-      busybox-static grep sed findutils tar gzip diffutils hostname mawk ncurses-base ncurses-bin base-files base-passwd"
+      busybox-static grep sed findutils tar gzip diffutils hostname mawk ncurses-base ncurses-bin base-files base-passwd
+      kmod curl ca-certificates e2fsprogs"
 apt-get -y -qq -d install --no-install-recommends $PKGS
 ( cd apt/cache/archives && for d in *.deb; do echo "$(dpkg-deb -f "$d" Package)=$(dpkg-deb -f "$d" Version)"; done | sort > "$B/out/packages.txt"
   sha256sum *.deb > "$B/out/debs.sha256" )
+# Kernel modules for the virtio devices (natemu --net/--disk/--rng; QEMU virtio-*-device): from the same signed Debian
+# kernel package build.sh takes bzImage from (KDEB_SHA, its SHA-256): the drivers below and what they depend on.
+KVER=6.12.107+deb13-amd64; KPKG=linux-image-$KVER
+rm -rf kernel
+apt-get -qq download "$KPKG=6.12.107-1"
+[ -z "${KDEB_SHA:-}" ] || echo "$KDEB_SHA  $(ls ${KPKG}_*.deb)" | sha256sum -c --quiet -
+dpkg-deb --fsys-tarfile ${KPKG}_*.deb | (mkdir kernel && tar -x -C kernel ./usr/lib/modules); rm ${KPKG}_*.deb
+KM=$B/kernel/usr/lib/modules/$KVER
+# crc32c_generic: ext4's soft dependency (it asks for "crc32c" at mount; modinfo's depends omits soft ones).
+MODULES="virtio_mmio virtio_net virtio_blk virtio_rng ext4 crc32c_generic"
 
 rm -rf "$R"; mkdir -p "$R"
 for d in apt/cache/archives/*.deb; do dpkg -x "$d" "$R"; done
@@ -37,8 +49,23 @@ for l in bin sbin lib lib64; do
     if [ -d "$R/$l" ] && [ ! -L "$R/$l" ]; then mkdir -p "$R/usr/$l"; cp -a "$R/$l/." "$R/usr/$l/"; rm -rf "$R/$l"; fi
     ln -sfn usr/$l "$R/$l"
 done
+# The drivers' dependency closure, then depmod (the build host's, on DIR/rootfs) for kmod's modprobe.
+want=$MODULES; have=""
+while set -- $want; [ $# -gt 0 ]; do
+    m=$1; shift; want="$*"
+    case " $have " in *" $m "*) continue;; esac
+    f=$(find "$KM/kernel" \( -name "$m.ko*" -o -name "${m//_/-}.ko*" \) | head -1)
+    [ -n "$f" ] || { echo "module $m missing from $KPKG" >&2; exit 1; }
+    have="$have $m"; rel=${f#$KM/}
+    mkdir -p "$R/usr/lib/modules/$KVER/$(dirname "$rel")"; cp "$f" "$R/usr/lib/modules/$KVER/$rel"
+    want="$want $(modinfo -F depends "$f" | tr ',' ' ')"
+done
+cp "$KM"/modules.order "$KM"/modules.builtin "$KM"/modules.builtin.modinfo "$R/usr/lib/modules/$KVER/"
+depmod -b "$R" "$KVER"
+echo "modules:$have"
+rm -rf "$B/kernel"   # the build host's /tmp may be small
 cd "$R"
-mkdir -p proc sys dev tmp run root etc var/tmp var/log mnt
+mkdir -p proc sys dev tmp run root etc var/tmp var/log mnt/disk usr/local/sbin etc/udhcpc
 chmod 1777 tmp var/tmp; chmod 700 root
 # Drop what a RAM-only play system does not read.
 rm -rf usr/share/doc usr/share/man usr/share/info usr/share/locale usr/share/lintian usr/share/bug usr/share/menu var/lib/apt
@@ -51,6 +78,26 @@ ln -sf dash usr/bin/sh
 cp usr/share/base-passwd/passwd.master etc/passwd; cp usr/share/base-passwd/group.master etc/group
 sed -i 's/^root:[^:]*:/root::/' etc/passwd 2>/dev/null; sed -i 's/^root:x:/root::/' etc/passwd
 printf 'root::19000:0:99999:7:::\n' > etc/shadow; chmod 640 etc/shadow
+# What ca-certificates' maintainer script would do: the bundle curl reads.
+mkdir -p etc/ssl/certs; cat usr/share/ca-certificates/*/*.crt > etc/ssl/certs/ca-certificates.crt
+# busybox udhcpc's lease script (init runs `udhcpc -s` with it): address, default route, resolv.conf.
+cat > etc/udhcpc/default.script <<'EOS'
+#!/bin/sh
+case "$1" in
+deconfig) ip -4 addr flush dev "$interface"; ip link set "$interface" up ;;
+bound|renew)
+    ip -4 addr flush dev "$interface"; ip addr add "$ip/${mask:-24}" dev "$interface"
+    for r in $router; do ip route replace default via "$r" dev "$interface"; break; done
+    : > /etc/resolv.conf
+    [ -n "$domain" ] && echo "search $domain" >> /etc/resolv.conf
+    for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done ;;
+esac
+EOS
+chmod 755 etc/udhcpc/default.script
+# poweroff/reboot (first in PATH): flush and unmount the virtio disk first; -f alone would drop its unwritten data.
+for c in poweroff reboot; do
+    printf '#!/bin/sh\nsync\numount /mnt/disk 2>/dev/null\nexec busybox %s -f\n' $c > usr/local/sbin/$c; chmod 755 usr/local/sbin/$c
+done
 echo natemu-play > etc/hostname
 printf '127.0.0.1 localhost\n127.0.1.1 natemu-play\n' > etc/hosts
 printf '/bin/bash\n/bin/sh\n/bin/dash\n' > etc/shells
@@ -71,9 +118,11 @@ EOP
 echo 'set enable-bracketed-paste off' > root/.inputrc
 cat > etc/motd <<'EOP'
 
-  natemu play: Debian trixie, running entirely from RAM (changes are lost at power off).
-  bash, coreutils, procps, util-linux, iproute2, less, vi, python3, gcc, make, file, htop.
-  Leave with: poweroff -f      Restart with: reboot -f
+  natemu play: Debian trixie, running from RAM (changes outside /mnt/disk are lost at power off).
+  bash, coreutils, procps, util-linux, iproute2, less, vi, python3, gcc, make, file, htop, curl, e2fsprogs.
+  Network (natemu --net): eth0 by DHCP.  Disk (natemu --disk FILE): /dev/vda, mounted on /mnt/disk if ext4
+  (a new one: mkfs.ext4 /dev/vda && mount /dev/vda /mnt/disk).
+  Leave with: poweroff      Restart with: reboot      (both sync and unmount /mnt/disk first)
 
 EOP
 # Busybox applets for names no real tool owns (poweroff, reboot, halt, ...).

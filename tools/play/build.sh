@@ -25,12 +25,11 @@ if [ "$(sha "$OUT/bzImage" 2>/dev/null)" != "$BZ_SHA" ]; then
 fi
 
 # 2. Root filesystem, built on HOST.
-W=$(ssh "$HOST" 'mktemp -d')
+W=$(ssh "$HOST" 'mktemp -d'); trap 'rm -rf "$tmp"; ssh "$HOST" "rm -rf $W"' EXIT
 tar -C "$here" -c rootfs.sh init mkcpio.py | ssh "$HOST" "tar -x -C $W"
-ssh "$HOST" "cd $W && bash rootfs.sh $W/b" > "$tmp/build.log" 2>&1 || { tail -30 "$tmp/build.log" >&2; exit 1; }
+ssh "$HOST" "cd $W && KDEB_SHA=$DEB_SHA bash rootfs.sh $W/b" > "$tmp/build.log" 2>&1 || { tail -30 "$tmp/build.log" >&2; exit 1; }
 scp -q "$HOST:$W/b/out/play.cpio.zst" "$HOST:$W/b/out/packages.txt" "$OUT/"
-ssh "$HOST" "rm -rf $W"
-tail -3 "$tmp/build.log"
+tail -4 "$tmp/build.log"
 
 # 3. Checksums.
 (cd "$OUT" && shasum -a 256 bzImage play.cpio.zst packages.txt > SHA256SUMS && cat SHA256SUMS)
