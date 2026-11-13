@@ -184,8 +184,12 @@ impl Boot {
         if self.net {
             let resource = crate::virtio::NET_RESOURCE;
             let mac = crate::virtio::Slirp::MAC;
-            let (device, port) =
-                crate::virtio::Virtio::network(irqs.clone(), resource.gsi as usize, mac)?;
+            let (device, port) = crate::virtio::Virtio::network(
+                irqs.clone(),
+                resource.gsi as usize,
+                mac,
+                crate::virtio::Slirp::OFFLOADS,
+            )?;
             net = Some(crate::virtio::Slirp::new(port)?);
             devices.register(resource.base.into(), 4096, device.device())?;
             virtio.push(device);

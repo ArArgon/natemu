@@ -10,7 +10,7 @@ mod net;
 mod profile;
 mod queue;
 mod slirp;
-pub use net::PacketPort;
+pub use net::{Offloads, PacketPort};
 pub use slirp::Slirp;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -324,8 +324,9 @@ pub struct Virtio {
     /// Per queue: a QueueNotify taken without the state lock, as the open gate it saw (0: none). The owner moves it to
     /// `notified` under the lock if the gate's epoch has not moved since; a nonzero kick holds one [`Irqs::busy`] count.
     kicks: [AtomicU64; 2],
-    /// The driver accepted EVENT_IDX (set at FEATURES_OK, cleared by reset): read lock-free at completion.
-    event_idx: AtomicBool,
+    /// The features the driver accepted, once FEATURES_OK holds (0 otherwise, and after a reset):
+    /// read lock-free by the owner (EVENT_IDX, network checksum offloads).
+    accepted: AtomicU64,
 }
 enum Profile {
     Entropy,
@@ -358,7 +359,7 @@ impl Profile {
         match self {
             Self::Entropy => VERSION_1,
             Self::Block(_) => block::FEATURES,
-            Self::Network(_) => net::FEATURES,
+            Self::Network(network) => network.features(),
         }
     }
     fn required(&self) -> u64 {
@@ -759,7 +760,7 @@ impl Virtio {
             running: AtomicBool::new(false),
             gates: Default::default(),
             kicks: Default::default(),
-            event_idx: AtomicBool::new(false),
+            accepted: AtomicU64::new(0),
         })
     }
     /// Install a finite native-call schedule before the test driver starts the VM.
@@ -916,7 +917,7 @@ impl Virtio {
                 s.rx_starved = false;
                 s.status = 0;
                 s.features = 0;
-                self.event_idx.store(false, SeqCst);
+                self.accepted.store(0, SeqCst);
                 s.owed = 0;
                 s.owed_at = None;
                 s.device_sel = 0;
@@ -1125,10 +1126,12 @@ impl Virtio {
         if value & status::FEATURES_OK != 0 && !self.profile.accepts(s.features) {
             s.status &= !status::FEATURES_OK;
         }
-        self.event_idx.store(
-            s.status & status::FEATURES_OK != 0 && s.features & EVENT_IDX != 0,
-            SeqCst,
-        );
+        let accepted = if s.status & status::FEATURES_OK != 0 {
+            s.features
+        } else {
+            0
+        };
+        self.accepted.store(accepted, SeqCst);
         if value & status::FAILED != 0 {
             s.notified = [false; 2];
         }
@@ -1298,7 +1301,7 @@ impl Virtio {
         data: Vec<Transfer<'_>>,
     ) -> Result<Option<bool>> {
         let mut used = Used::new(chain.queue, [(chain.head, len)]);
-        if self.event_idx.load(SeqCst) {
+        if self.accepted(EVENT_IDX) {
             // TX: notify when the buffer after this one is added (later ones are found by the
             // available index read after publication). RX never waits for a notification (packet
             // arrival drives it; a starved request asks separately), so ask for none.
@@ -1334,6 +1337,10 @@ impl Virtio {
             }
             self.raise(s);
         }
+    }
+    /// Whether the driver accepted `feature`.
+    fn accepted(&self, feature: u64) -> bool {
+        self.accepted.load(SeqCst) & feature != 0
     }
     fn raise(&self, s: &mut State) {
         s.owed = 0;
@@ -1566,7 +1573,7 @@ impl Virtio {
                 // Keep the frame and ask for a notification when a buffer is added: with EVENT_IDX
                 // by avail_event (the RX completions otherwise ask for none), then look again.
                 let mut posted = false;
-                if self.event_idx.load(SeqCst) {
+                if self.accepted(EVENT_IDX) {
                     let (event, mut index) = (q.next_avail.to_le_bytes(), [0; 2]);
                     let mut transfers = vec![
                         Transfer::Write {
@@ -1849,6 +1856,7 @@ mod tests {
             r.irqs.clone(),
             NET_RESOURCE.gsi as usize,
             [2, 0, 0, 0, 0, 1],
+            Offloads::default(),
         )
         .unwrap()
         .0

@@ -11,7 +11,7 @@ the signed Debian curl/iperf3 closure staged on November 8 (natemu-raw/io-networ
 run starts an HTTP server (a 64 MiB random file) and an iperf3 server on the host's LAN address: the guest cannot
 reach the host's loopback, by design (so the host needs a LAN address). Every case brings eth0 up with DHCP and must get 10.0.2.15, router 10.0.2.2 and
 DNS 10.0.2.3, then:
-  basic    ping the gateway; the host file over HTTP, byte-exact (sha256); iperf3 TCP both ways and UDP at 50 Mbit/s
+  basic    the driver negotiated checksum offloads both ways and EVENT_IDX; ping the gateway; the host file over HTTP, byte-exact (sha256); iperf3 TCP both ways and UDP at 50 Mbit/s
            (loss under 1%); with the internet (default; --offline skips): DNS for deb.debian.org and an HTTPS download
            of Debian's trixie Release file (curl, CA-verified TLS).
   rebind   three times: with HTTP downloads looping (at least 1 MiB received first), unbind and rebind the virtio_net
@@ -76,6 +76,7 @@ fetch() { echo "NET-FETCH $1 $(curl -sS --max-time 60 http://$H:8000/blob | sha2
 dhcp
 case $C in
 basic)
+  echo "NET-FEATURES $(cat /sys/class/net/eth0/device/features)"
   ping -c 3 -W 2 10.0.2.2 >/dev/null && echo NET-PING-GATEWAY-OK
   fetch first
   curl -sS --max-time 60 -o /dev/null -w 'NET-SPEED http %{size_download} %{speed_download}\n' http://$H:8000/blob
@@ -188,6 +189,10 @@ def judge(case, text, stderr, code, elapsed, blob_sha, internet):
     require(code == 0 and stops == ['Power(1)'], f'exit {code}, stops {stops}')
     require(lines('NET-END') == [''], 'missing NET-END')
     if case == 'basic':
+        features = lines('NET-FEATURES')
+        # Bit n is character n: CSUM (0) and GUEST_CSUM (1) offloads, EVENT_IDX (29), VERSION_1 (32).
+        require(len(features) == 1 and len(features[0]) >= 33 and all(features[0][b] == '1' for b in (0, 1, 29, 32)),
+                f'negotiated features {features}')
         require(lines('NET-FETCH') == [f'first {blob_sha}'], 'HTTP file not byte-exact')
         require(lines('NET-PING-GATEWAY-OK') == [''], 'gateway ping')
         speeds = lines('NET-SPEED')
@@ -288,8 +293,9 @@ def run(args):
 def self_check():
     sha = 'ab' * 32
     lease = 'NET-DHCP ip=10.0.2.15 mask=24 router=10.0.2.2 dns=10.0.2.3\n'
+    FEAT = '1101010000000000100000000000010010000000000000000000000000000000'
     good = {
-        'basic': (f'NET-BEGIN case=basic cpus=2 kernel={KVER}\n{lease}NET-PING-GATEWAY-OK\nNET-FETCH first {sha}\n'
+        'basic': (f'NET-BEGIN case=basic cpus=2 kernel={KVER}\n{lease}NET-FEATURES {FEAT}\nNET-PING-GATEWAY-OK\nNET-FETCH first {sha}\n'
                   'NET-SPEED http 67108864 160000000\nNET-SPEED tcp-tx [  5] 0.00-5.01 sec 459 MBytes 768 Mbits/sec 0 sender\n'
                   'NET-SPEED tcp-rx [  5] 0.00-5.01 sec 794 MBytes 1331 Mbits/sec 0 sender\n'
                   'NET-UDP [  5] 0.00-3.00 sec 71.6 MBytes 200 Mbits/sec 0.019 ms 0/51388 (0%) receiver\n'
@@ -315,7 +321,8 @@ def self_check():
         assert judge(case, text, err, code, t, sha, True) == [], (case, judge(case, text, err, code, t, sha, True))
     mutations = [('basic', 'ip=10.0.2.15', 'ip=10.0.2.16'), ('basic', f'first {sha}', 'first ' + 'cd' * 32),
                  ('basic', '(0%)', '(5%)'), ('basic', 'NET-HTTPS-OK\n', ''), ('basic', 'NET-DNS-OK\n', ''),
-                 ('basic', 'NET-PING-GATEWAY-OK\n', ''), ('basic', 'NET-END\n', ''), ('basic', 'Mbits/sec 0 sender', 'error'),
+                 ('basic', 'NET-PING-GATEWAY-OK\n', ''), ('basic', 'NET-FEATURES 11', 'NET-FEATURES 01'),
+                 ('basic', 'NET-FEATURES 11', 'NET-FEATURES 10'), ('basic', 'NET-END\n', ''), ('basic', 'Mbits/sec 0 sender', 'error'),
                  ('rebind', 'NET-ETH0-GONE\n', ''), ('rebind', f'rebound {sha}', 'rebound ' + 'cd' * 32),
                  ('rebind', 'NET-REBOUND virtio0\n', ''), ('rebind', 'RESET 123456789', 'RESET 4096'),
                  ('reboot', f'first {sha}', 'first ' + 'cd' * 32), ('nodriver', 'NET-NO-ETH0 0', 'NET-NO-ETH0 1'),
