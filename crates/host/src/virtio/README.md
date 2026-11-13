@@ -211,7 +211,7 @@ ways, then the network still works. Not yet covered: IPv6/ICMPv6, port forwardin
 a separate contained process, combined disk+network load.
 
 Throughput (November 12, 2 vCPUs, iperf3 to the host, `natemu-raw/net-slirp-20261112-01/vmm-compare-01`):
-upload ~3.2 Gbit/s, download ~5.3 Gbit/s, 8 streams each way ~3.0/2.0 Gbit/s; QEMU 11.1
+upload ~3.3 Gbit/s, download ~5.75 Gbit/s, 8 streams each way ~3.1/2.0 Gbit/s; QEMU 11.1
 x86 TCG with the same libslirp: ~0.77/1.7/0.55/0.48 Gbit/s. Before the pipelined TX
 queue, held RX frames, EVENT_IDX and interrupt holding: 0.81/1.37/0.46/0.44 (the
 guest was idle 93% of an upload, waiting on one synchronous packet at a time).
@@ -245,9 +245,15 @@ and the owner looks again when the available index it reads after each completio
 
 Interrupts: with EVENT_IDX one is due when the used index passes the driver's
 used_event (read after the used index, behind a full barrier). The owner holds a due
-interrupt while it keeps working, raising it when it goes idle, after 8 due
-completions or 20 µs, or when RX starves (the driver refills only after seeing its
-completions).
+interrupt while it keeps working, raising it when it goes idle, after 32 due
+completions or 100 µs, or when RX starves (the driver refills only after seeing its
+completions). With faster RX delivery, 8/20 µs left the guest more interrupts per packet
+and cost 8 streams each way ~8%; 32/100 µs recovered it.
+
+The backend hands every queued frame it can over under one lock
+(`PacketPort::receive_from`). Frames live in heap buffers
+that move between the queues without copying and return to a shared pool
+(`PacketPort::buffers`), so neither thread allocates per packet.
 A separate endpoint-lifetime busy guard keeps an idle VM alive while the backend
 can deliver future packets; it retires when that endpoint is dropped after shutdown.
 A valid chain too short for an incoming frame also drops it without consuming

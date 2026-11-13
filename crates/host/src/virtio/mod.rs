@@ -95,8 +95,8 @@ const VERSION_1: u64 = 1 << 32;
 /// flags below. Offered by the network device only.
 const EVENT_IDX: u64 = 1 << 29;
 /// Network: at most this many completions, or this long, share one held-back interrupt.
-const COALESCE: u32 = 8;
-const COALESCE_TIME: Duration = Duration::from_micros(20);
+const COALESCE: u32 = 32;
+const COALESCE_TIME: Duration = Duration::from_micros(100);
 /// VIRTQ_AVAIL_F_NO_INTERRUPT in the available ring's flags.
 const AVAIL_NO_INTERRUPT: u16 = 1;
 /// VIRTQ_USED_F_NO_NOTIFY in the used ring's flags (virtio 1.2 §2.7.7: without EVENT_IDX a driver checks it
@@ -1512,7 +1512,7 @@ impl Virtio {
         self.retire_reset(&mut s);
         self.settle(&mut s);
         if self.profile.is_rx(id.queue) {
-            // The RX slot is free and the queue idle again: the backend may deliver its next frame.
+            // A slot is free: the backend may deliver more (it is woken only while it sleeps).
             self.backend_ready();
         }
         Ok(())
