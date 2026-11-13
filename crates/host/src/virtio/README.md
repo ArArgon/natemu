@@ -239,9 +239,9 @@ no buffer puts its frame back and holds every frame until the driver notifies RX
 with EVENT_IDX it writes avail_event to ask for that notification and reads the
 available index again (Dekker with the driver's index store and avail_event read);
 a notification that arrives during that request is remembered, so the hold cannot
-outlive it. RX completions otherwise ask for no notification (avail_event half a ring
-ahead): RX buffers alone are not work. TX asks for one at the next unconsumed buffer;
-the owner rechecks the ring after every TX completion anyway.
+outlive it. RX completions otherwise ask for no notification (avail_event half the index space
+ahead): RX buffers alone are not work. TX asks for one at the next unconsumed buffer,
+and the owner looks again when the available index it reads after each completion shows more.
 
 Interrupts: with EVENT_IDX one is due when the used index passes the driver's
 used_event (read after the used index, behind a full barrier). The owner holds a due

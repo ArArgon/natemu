@@ -323,18 +323,20 @@ impl Slirp {
             // Arm, then look once more: work that arrived before arming is found here, work after
             // it rings the doorbell.
             self.armed.store(true, SeqCst);
-            let busy = self.service()? || self.port.closed();
+            let closed = self.port.closed(); // takes the device lock before the TX and RX looks
+            let busy = self.service()? || closed;
             self.wait(busy);
             self.armed.store(false, SeqCst);
             self.fire_timers();
             self.deliver();
         }
-        // A packet accepted just before the stop still gets its one result (the owner waits for it).
+        // Packets the guest saw complete before the stop or drain are still sent, once, in order;
+        // a terminal failure here still fails the run.
         let stack = self.stack;
-        while let Ok(true) = self.port.transmit(|frame| {
+        while self.port.transmit(|frame| {
             unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
             Ok(())
-        }) {}
+        })? {}
         if crate::perf::on() {
             let dropped = unsafe { &*self.context }.dropped;
             crate::perf::line(&format!(
