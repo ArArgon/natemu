@@ -851,15 +851,8 @@ impl Virtio {
                 continue;
             }
             if kick >> 2 == self.gates[q].load(SeqCst) >> 2 && !s.kills(q) {
-                if self.profile.is_rx(q) {
-                    // RX buffers alone are not work: only frames held for want of one are.
-                    s.rx_starved = false;
-                    s.rx_kicked = true;
-                    if s.received.is_empty() {
-                        self.irqs.release();
-                        continue;
-                    }
-                }
+                // RX's gate never opens (`publish_gates`): its notifications take `notify`.
+                debug_assert!(!self.profile.is_rx(q));
                 s.notified[q] = true;
                 self.busy(s);
             }
@@ -924,6 +917,8 @@ impl Virtio {
                 s.status = 0;
                 s.features = 0;
                 self.event_idx.store(false, SeqCst);
+                s.owed = 0;
+                s.owed_at = None;
                 s.device_sel = 0;
                 s.driver_sel = 0;
                 s.queue_sel = 0;
@@ -1089,6 +1084,9 @@ impl Virtio {
             self.fail(s);
         } else {
             s.queues[queue].ready = true;
+            if self.profile.is_rx(queue) {
+                self.backend_ready(); // frames the backend holds may be taken now
+            }
         }
         Access::Completed(0)
     }
@@ -1120,6 +1118,9 @@ impl Virtio {
             return Access::Completed(0);
         }
         s.status = value;
+        if value & status::DRIVER_OK != 0 {
+            self.backend_ready();
+        }
         // FEATURES_OK does not stick over an unacceptable feature set; the driver reads it back.
         if value & status::FEATURES_OK != 0 && !self.profile.accepts(s.features) {
             s.status &= !status::FEATURES_OK;
@@ -1295,12 +1296,12 @@ impl Virtio {
         chain: &Chain<'_>,
         len: u32,
         data: Vec<Transfer<'_>>,
-    ) -> Result<bool> {
+    ) -> Result<Option<bool>> {
         let mut used = Used::new(chain.queue, [(chain.head, len)]);
         if self.event_idx.load(SeqCst) {
-            // TX: notify when the buffer after this one is added (the owner rechecks the ring after
-            // every TX completion, so later additions need no notification). RX never waits for a
-            // notification (packet arrival drives it), so ask for none in the next half ring.
+            // TX: notify when the buffer after this one is added (later ones are found by the
+            // available index read after publication). RX never waits for a notification (packet
+            // arrival drives it; a starved request asks separately), so ask for none.
             let next = chain.queue.next_avail.wrapping_add(1);
             let rx = self.profile.is_rx(chain.id.queue);
             used = used.with_events(if rx { next.wrapping_add(0x7fff) } else { next });
@@ -1308,13 +1309,17 @@ impl Virtio {
         let mut transfers = data;
         let publish = used.publish(chain.queue, &mut transfers);
         if !self.copy(guest, chain.id, &mut transfers, Some(publish))? {
-            return Ok(false);
+            return Ok(None);
         }
         drop(transfers);
         #[cfg(feature = "testing")]
         self.observe("commit");
         self.interrupt(&mut self.lock(), chain.id, &used);
-        Ok(true)
+        // More heads already wait (read after publication, behind the full barrier): the owner looks
+        // again. A head added after that read is notified (avail_event or no suppression at all).
+        Ok(Some(
+            used.avail_index() != chain.queue.next_avail.wrapping_add(1),
+        ))
     }
     /// After a granted publication: raise the used-buffer interrupt unless the driver suppressed
     /// it or a reset closed the incarnation (ACK, reset and level publication share the lock).
@@ -1644,8 +1649,8 @@ impl Virtio {
         }
         let writes = scatter(chain.descriptors, payload);
         Ok(match self.complete(guest, chain, len as u32, writes)? {
-            true => Request::Committed { pending: true },
-            false => Request::Canceled,
+            Some(pending) => Request::Committed { pending },
+            None => Request::Canceled,
         })
     }
 }

@@ -57,7 +57,7 @@ pub(super) struct Network {
     tx: SyncSender<Packet>,
     /// The backend's doorbell ([`PacketPort::on_ready`]).
     ready: OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// Received frames dropped for want of a guest buffer ([`PacketPort::lost`]).
+    /// Received frames dropped because the guest's buffer was too small ([`PacketPort::lost`]).
     pub(super) lost: AtomicU64,
 }
 impl Network {
@@ -83,8 +83,8 @@ pub struct PacketPort {
 }
 impl PacketPort {
     /// False (the frame is not taken) if it is out of profile, the RX queue is unavailable or
-    /// [`RX_SLOTS`] frames already wait. Arrival schedules RX; no second guest notification is
-    /// required. Only plain Ethernet bytes, excluding FCS.
+    /// [`RX_SLOTS`] frames already wait. Arrival schedules RX unless RX is starved (then the
+    /// driver's next RX notification does). Only plain Ethernet bytes, excluding FCS.
     pub fn receive(&self, bytes: &[u8]) -> bool {
         let Ok(packet) = Packet::new(bytes) else {
             return false;
@@ -130,7 +130,7 @@ impl PacketPort {
             }
         }
     }
-    /// Received frames the device dropped because the guest had no (large enough) RX buffer.
+    /// Received frames the device dropped because the guest's RX buffer was too small.
     pub fn lost(&self) -> u64 {
         self.device
             .upgrade()
@@ -240,8 +240,11 @@ impl Virtio {
             Vec::with_capacity(3)
         };
         Ok(match self.complete(guest, chain, len as u32, writes)? {
-            true => Request::Committed { pending: true },
-            false => Request::Canceled,
+            // Look at the ring again even when the index read after publication showed nothing
+            // new: one capture costs less than the driver notifications it saves (November 12:
+            // the exact check measured ~5% slower, 3.0/4.97 vs 3.3/5.3 Gbit/s up/down).
+            Some(_) => Request::Committed { pending: true },
+            None => Request::Canceled,
         })
     }
     /// Ring the network backend's doorbell, if any.
@@ -265,7 +268,7 @@ impl Virtio {
         let start = Instant::now();
         loop {
             {
-                let s = self.lock();
+                let mut s = self.lock();
                 if !s.current(id) || s.stopped || cancel.load(SeqCst) {
                     return Ok(false);
                 }
@@ -277,7 +280,13 @@ impl Virtio {
                         self.backend_ready();
                         return Ok(true);
                     }
-                    Err(TrySendError::Full(p)) => packet = p,
+                    Err(TrySendError::Full(p)) => {
+                        packet = p;
+                        // Completions already published must not wait for the backend.
+                        if s.owed > 0 {
+                            self.raise(&mut s);
+                        }
+                    }
                     Err(TrySendError::Disconnected(_)) => {
                         return Err("network transmit endpoint disconnected".into());
                     }
