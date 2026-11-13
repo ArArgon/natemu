@@ -136,7 +136,7 @@ struct Timer {
 /// What slirp's callbacks touch, through their opaque pointer; the loop touches it only between
 /// slirp calls.
 struct Context {
-    rx: VecDeque<Vec<u8>>,
+    rx: VecDeque<super::net::Frame>,
     buffers: super::net::Buffers,
     timers: Vec<*mut Timer>,
     epoch: Instant,
@@ -157,7 +157,14 @@ unsafe extern "C" fn send_packet(buf: *const c_void, len: usize, opaque: Opaque)
     let c = unsafe { context(opaque) };
     if c.rx.len() < RX_QUEUE {
         let frame = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) };
-        c.rx.push_back(c.buffers.take(frame));
+        // Slirp built the frame, checksums included.
+        c.rx.push_back(super::net::Frame {
+            bytes: c.buffers.take(frame),
+            meta: super::net::RxMeta {
+                checksum: super::net::RxChecksum::Valid,
+                gso: None,
+            },
+        });
     } else {
         c.dropped += 1;
     }
@@ -252,7 +259,9 @@ impl Slirp {
     /// partial checksum the port completed.
     pub const OFFLOADS: super::Offloads = super::Offloads {
         tx_checksum: true,
-        rx_checksum_valid: true,
+        rx_checksum: true,
+        tx_segmentation: false,
+        rx_segmentation: false,
     };
 
     pub fn new(port: PacketPort) -> Result<Self> {
@@ -342,7 +351,7 @@ impl Slirp {
         // Packets the guest saw complete before the stop or drain are still sent, once, in order;
         // a terminal failure here still fails the run.
         let stack = self.stack;
-        while self.port.transmit(|frame| {
+        while self.port.transmit(|frame, _| {
             unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
             Ok(())
         })? {}
@@ -361,7 +370,7 @@ impl Slirp {
         let stack = self.stack;
         let mut moved = false;
         for _ in 0..TX_BATCH {
-            let sent = self.port.transmit(|frame| {
+            let sent = self.port.transmit(|frame, _| {
                 unsafe { slirp_input(stack, frame.as_ptr(), frame.len() as c_int) };
                 Ok(())
             })?;

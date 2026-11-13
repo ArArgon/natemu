@@ -139,7 +139,7 @@ pub(super) fn echo(
                 return Err("fixture arrival was dropped".into());
             }
         }
-        let sent = port.transmit(|bytes| {
+        let sent = port.transmit(|bytes, _| {
             frames += 1;
             if frames > 64 {
                 return Err("packet fixture exceeded 64 frames".into());

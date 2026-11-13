@@ -224,14 +224,23 @@ dropped at the backend's 4096-frame queue. Every RX frame and TX packet is still
 own request (one capture, copy and publication each).
 
 Queues 0/1 have a maximum of 256 direct descriptors. VERSION_1 is required;
-MAC, MTU, STATUS and EVENT_IDX are offered, with MTU1500, plus the checksum offloads the
-backend declares (`Offloads`): CSUM when `PacketPort::transmit` may complete a TX checksum
-the guest left partial (NEEDS_CSUM: csum_start/offset must lie inside the frame, else the
-device fails), GUEST_CSUM when every backend frame already has valid checksums (the device
-then marks RX frames DATA_VALID). No segmentation offloads are offered yet: a backend must
-take large frames first. Frames exclude
-FCS and are at most 1518 bytes including one VLAN tag. Up to 256 queued TX packets and
-64 held RX frames bound storage; headers are the modern 12-byte form even without merged
+MAC, MTU, STATUS and EVENT_IDX are offered, with MTU1500, plus the offloads the backend
+declares (`Offloads`), with the spec's dependencies enforced at FEATURES_OK:
+- `tx_checksum` (CSUM): a TX frame may leave its TCP/UDP checksum partial (NEEDS_CSUM,
+  csum_start/offset inside the frame, else the device fails).
+- `rx_checksum` (GUEST_CSUM): each backend frame states its checksum (`RxMeta`): valid
+  (DATA_VALID, the guest skips verifying) or partial (NEEDS_CSUM).
+- `tx_segmentation` (HOST_TSO4/6, needs CSUM): TCP frames up to 64 KiB + 18 with gso_type,
+  gso_size (nonzero) and NEEDS_CSUM; the backend gets each frame's `TxMeta` untouched.
+  A backend without it gets finished frames (`PacketPort::transmit` completes the checksum).
+- `rx_segmentation` (GUEST_TSO4/6 and MRG_RXBUF, needs GUEST_CSUM): backend frames up to
+  64 KiB with their segmentation; with MRG_RXBUF one frame spreads over as many chains as it
+  needs (num_buffers counts them, one used element each); too few posted holds it, like an
+  empty ring. A large frame the guest did not accept is dropped (`lost`).
+libslirp declares the checksum offloads only; segmentation awaits a backend that takes
+large frames (vmnet's TSO and virtio-header modes). Frames exclude
+FCS and are at most 1518 bytes including one VLAN tag (64 KiB + 18 with segmentation). Up to
+256 queued TX packets and 64 held RX frames bound storage; headers are the modern 12-byte form even without merged
 buffers. Descriptor boundaries may split headers or payloads. RX writes one
 chain with num_buffers=1; TX used length is zero. Unknown TX flag bits and inactive
 checksum/header hints are ignored; unnegotiated offload requests (NEEDS_CSUM without CSUM,

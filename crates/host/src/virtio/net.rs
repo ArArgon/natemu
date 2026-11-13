@@ -8,24 +8,35 @@ use std::sync::{
 };
 use std::time::Instant;
 
-/// Feature bits offered (virtio 1.3 §5.1.3): MTU, MAC and STATUS, and EVENT_IDX; checksum
-/// offloads as the backend's [`Offloads`] allow. No segmentation offloads yet.
+/// Feature bits offered (virtio 1.3 §5.1.3): MTU, MAC and STATUS, and EVENT_IDX; checksum and
+/// segmentation offloads as the backend's [`Offloads`] allow.
 const F_CSUM: u64 = 1;
 const F_GUEST_CSUM: u64 = 1 << 1;
 const F_MTU: u64 = 1 << 3;
 const F_MAC: u64 = 1 << 5;
+const F_GUEST_TSO4: u64 = 1 << 7;
+const F_GUEST_TSO6: u64 = 1 << 8;
+const F_HOST_TSO4: u64 = 1 << 11;
+const F_HOST_TSO6: u64 = 1 << 12;
+const F_MRG_RXBUF: u64 = 1 << 15;
 const F_STATUS: u64 = 1 << 16;
 pub(super) const FEATURES: u64 = VERSION_1 | EVENT_IDX | F_MTU | F_MAC | F_STATUS;
 /// virtio_net_hdr for VERSION_1: flags, gso_type, hdr_len, gso_size, csum_start, csum_offset,
 /// num_buffers.
 const HEADER: usize = 12;
+const HDR_LEN: std::ops::Range<usize> = 2..4;
+const GSO_SIZE: std::ops::Range<usize> = 4..6;
+const CSUM_START: std::ops::Range<usize> = 6..8;
+const CSUM_OFFSET: std::ops::Range<usize> = 8..10;
 const NUM_BUFFERS: std::ops::Range<usize> = 10..12;
 /// VIRTIO_NET_HDR_F_NEEDS_CSUM | DATA_VALID | RSC_INFO: meaningful only with offloads.
 const OFFLOAD_FLAGS: u8 = 7;
 const NEEDS_CSUM: u8 = 1;
 const DATA_VALID: u8 = 2;
-const CSUM_START: std::ops::Range<usize> = 6..8;
-const CSUM_OFFSET: std::ops::Range<usize> = 8..10;
+/// gso_type values (ECN and UDP segmentation are not offered).
+const GSO_NONE: u8 = 0;
+const GSO_TCPV4: u8 = 1;
+const GSO_TCPV6: u8 = 4;
 /// VIRTIO_NET_S_LINK_UP.
 const LINK_UP: u16 = 1;
 const MTU: u16 = 1500;
@@ -33,37 +44,109 @@ const MTU: u16 = 1500;
 const MIN_FRAME: usize = 14;
 /// Ethernet without FCS, including one VLAN tag, MTU1500.
 const MAX_FRAME: usize = 1518;
+/// A segmentation-offload frame: Linux's 64 KiB GSO limit plus Ethernet and one VLAN tag.
+const MAX_LARGE_FRAME: usize = 65536 + 18;
 
 /// What the backend can take, for the device to offer the guest only that (virtio 1.3 §5.1.6).
+/// A backend without `tx_segmentation` gets finished frames ([`PacketPort::transmit`] completes
+/// a partial checksum first); one with it gets each frame's [`TxMeta`] untouched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Offloads {
-    /// TX: the guest may leave a TCP/UDP checksum partial (NEEDS_CSUM); [`PacketPort::transmit`]
-    /// completes it before the backend sees the frame (CSUM).
+    /// TX: the guest may leave a TCP/UDP checksum partial (CSUM).
     pub tx_checksum: bool,
-    /// RX: every frame the backend delivers carries valid checksums (it built them itself), so the
-    /// device marks them DATA_VALID and the guest skips verifying them (GUEST_CSUM).
-    pub rx_checksum_valid: bool,
+    /// RX: the backend states each frame's checksum ([`RxMeta::checksum`]): valid (DATA_VALID,
+    /// the guest skips verifying) or partial (GUEST_CSUM).
+    pub rx_checksum: bool,
+    /// TX: TCP frames up to 64 KiB with their segmentation in [`TxMeta`] (HOST_TSO4/6; needs
+    /// `tx_checksum`).
+    pub tx_segmentation: bool,
+    /// RX: TCP frames up to 64 KiB with their segmentation in [`RxMeta`], spread over several
+    /// guest buffers if need be (GUEST_TSO4/6, MRG_RXBUF; needs `rx_checksum`).
+    pub rx_segmentation: bool,
+}
+impl Offloads {
+    pub(super) fn features(self) -> u64 {
+        let mut features = FEATURES;
+        if self.tx_checksum {
+            features |= F_CSUM;
+            if self.tx_segmentation {
+                features |= F_HOST_TSO4 | F_HOST_TSO6;
+            }
+        }
+        if self.rx_checksum {
+            features |= F_GUEST_CSUM;
+            if self.rx_segmentation {
+                features |= F_GUEST_TSO4 | F_GUEST_TSO6 | F_MRG_RXBUF;
+            }
+        }
+        features
+    }
+}
+/// The driver accepted no offload without the one it depends on (virtio 1.3 §5.1.3.1).
+pub(super) fn dependencies_met(accepted: u64) -> bool {
+    (accepted & (F_HOST_TSO4 | F_HOST_TSO6) == 0 || accepted & F_CSUM != 0)
+        && (accepted & (F_GUEST_TSO4 | F_GUEST_TSO6) == 0 || accepted & F_GUEST_CSUM != 0)
 }
 
-/// One frame in owned storage (moved between queues without copying).
+/// TCP segmentation offload of one frame: the protocol, the payload bytes per segment (MSS) and
+/// the driver's header-length hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gso {
+    pub ipv6: bool,
+    pub size: u16,
+    pub header: u16,
+}
+/// What a TX frame still needs from a segmentation-capable backend: a partial checksum
+/// (csum_start, csum_offset) and its segmentation. Empty for the other backends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxMeta {
+    pub checksum: Option<(u16, u16)>,
+    pub gso: Option<Gso>,
+}
+/// An RX frame's checksum as its backend states it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RxChecksum {
+    /// The guest verifies it.
+    #[default]
+    Unknown,
+    /// Every checksum is correct (DATA_VALID).
+    Valid,
+    /// The TCP/UDP checksum is partial, as on TX (NEEDS_CSUM).
+    Partial { start: u16, offset: u16 },
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RxMeta {
+    pub checksum: RxChecksum,
+    pub gso: Option<Gso>,
+}
+/// One frame a backend delivers ([`PacketPort::receive_from`]).
+pub struct Frame {
+    pub bytes: Vec<u8>,
+    pub meta: RxMeta,
+}
+
+/// One frame in owned storage (moved between queues without copying): `bytes[at..]`.
 pub(super) struct Packet {
     bytes: Vec<u8>,
-    /// TX: a partial checksum to complete, (csum_start, csum_offset) in the frame.
-    csum: Option<(usize, usize)>,
+    at: usize,
+    tx: TxMeta,
+    rx: RxMeta,
 }
 impl Packet {
     #[cfg(test)]
     fn new(bytes: &[u8]) -> Result<Self> {
-        Self::owned(bytes.to_vec())
-    }
-    fn owned(bytes: Vec<u8>) -> Result<Self> {
         if !(MIN_FRAME..=MAX_FRAME).contains(&bytes.len()) {
             return Err("network frame length outside MTU1500 profile".into());
         }
-        Ok(Self { bytes, csum: None })
+        Ok(Self {
+            bytes: bytes.to_vec(),
+            at: 0,
+            tx: TxMeta::default(),
+            rx: RxMeta::default(),
+        })
     }
     fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[self.at..]
     }
 }
 /// Frame buffers the device and its backend pass back and forth, so neither allocates per packet
@@ -73,19 +156,37 @@ pub struct Buffers(Arc<Mutex<Vec<Vec<u8>>>>);
 impl Buffers {
     /// A buffer holding a copy of `bytes`.
     pub fn take(&self, bytes: &[u8]) -> Vec<u8> {
-        let spare = self.0.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(MAX_FRAME));
-        buffer.clear();
+        let mut buffer = self.spare(bytes.len());
         buffer.extend_from_slice(bytes);
         buffer
     }
+    /// A buffer of `len` zero bytes.
+    fn zeroed(&self, len: usize) -> Vec<u8> {
+        let mut buffer = self.spare(len);
+        buffer.resize(len, 0);
+        buffer
+    }
+    fn spare(&self, len: usize) -> Vec<u8> {
+        let spare = (len <= POOLED)
+            .then(|| self.0.lock().unwrap_or_else(|e| e.into_inner()).pop())
+            .flatten();
+        let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(len.max(MAX_FRAME)));
+        buffer.clear();
+        buffer
+    }
+    /// Only MTU-sized buffers are kept (a segmentation frame is 40 times rarer, and big).
     pub fn give(&self, buffer: Vec<u8>) {
+        if buffer.capacity() > POOLED {
+            return;
+        }
         let mut spare = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < 1024 {
             spare.push(buffer);
         }
     }
 }
+/// The largest buffer [`Buffers`] keeps: a header and an MTU frame, rounded up.
+const POOLED: usize = 2048;
 /// TX packets the device may queue for the backend; a full queue holds the device's TX.
 const TX_QUEUE: usize = 256;
 /// Received frames the device holds for the guest (the backend keeps the rest).
@@ -98,19 +199,13 @@ pub(super) struct Network {
     buffers: Buffers,
     /// The backend's doorbell ([`PacketPort::on_ready`]).
     ready: OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// Received frames dropped because the guest's buffer was too small ([`PacketPort::lost`]).
+    /// Received frames dropped: the guest's buffer was too small, or the frame needed an offload
+    /// the guest did not accept ([`PacketPort::lost`]).
     pub(super) lost: AtomicU64,
 }
 impl Network {
     pub fn features(&self) -> u64 {
-        let mut features = FEATURES;
-        if self.offloads.tx_checksum {
-            features |= F_CSUM;
-        }
-        if self.offloads.rx_checksum_valid {
-            features |= F_GUEST_CSUM;
-        }
-        features
+        self.offloads.features()
     }
     /// Configuration space: mac, status, max_virtqueue_pairs (unused), mtu.
     pub fn config(&self) -> [u8; 12] {
@@ -130,6 +225,7 @@ pub struct PacketPort {
     device: Weak<Virtio>,
     tx: Receiver<Packet>,
     buffers: Buffers,
+    offloads: Offloads,
     // An idle backend can still deliver a future packet; all-HLT is not VM completion.
     _arrival: Busy,
 }
@@ -141,36 +237,42 @@ impl PacketPort {
         if !(MIN_FRAME..=MAX_FRAME).contains(&bytes.len()) {
             return false;
         }
-        let mut one = VecDeque::from([bytes.to_vec()]);
+        let mut one = VecDeque::from([Frame {
+            bytes: bytes.to_vec(),
+            meta: RxMeta::default(),
+        }]);
         self.receive_from(&mut one);
         one.is_empty()
     }
     /// [`Self::receive`] for each frame from the front of `frames`, under one lock: taken frames
-    /// leave `frames`, and so do out-of-profile ones (dropped); the rest stay. True if any left.
-    pub fn receive_from(&self, frames: &mut VecDeque<Vec<u8>>) -> bool {
+    /// leave `frames`, and so do ones the guest cannot take (dropped, [`Self::lost`]); the rest
+    /// stay. True if any left.
+    pub fn receive_from(&self, frames: &mut VecDeque<Frame>) -> bool {
         let Some(device) = self.device.upgrade() else {
             return false;
         };
+        let Profile::Network(network) = &device.profile else {
+            return false;
+        };
+        let accepted = device.accepted.load(SeqCst);
         let mut s = device.lock();
         let id = s.identity(0);
         let before = frames.len();
         let mut taken = false;
-        while let Some(frame) = frames.pop_front() {
-            if !(MIN_FRAME..=MAX_FRAME).contains(&frame.len()) {
-                continue;
-            }
+        while !frames.is_empty() {
             if !s.current(id) || !s.accepting(0) || s.received.len() >= RX_SLOTS {
-                frames.push_front(frame);
                 break;
             }
-            s.received.push_back((
-                id,
-                Packet {
-                    bytes: frame,
-                    csum: None,
-                },
-            ));
-            taken = true;
+            let frame = frames.pop_front().expect("nonempty");
+            match received_packet(frame, accepted, self.offloads) {
+                Some(packet) => {
+                    s.received.push_back((id, packet));
+                    taken = true;
+                }
+                None => {
+                    network.lost.fetch_add(1, SeqCst);
+                }
+            }
         }
         // An RX request in flight re-notifies itself while frames wait (`finish_request`).
         if taken && !s.notified[0] && !s.queue_active(0) && !s.rx_starved {
@@ -183,15 +285,19 @@ impl PacketPort {
     /// Send the oldest queued TX packet, outside every VM lock and RAM window; false if none. The
     /// guest already saw it complete (like a NIC that fetched it): return success for a transient
     /// drop, error for terminal loss (it fails the device). Never retried.
-    pub fn transmit(&self, send: impl FnOnce(&[u8]) -> Result<()>) -> Result<bool> {
+    /// A backend without `tx_segmentation` gets the frame finished and an empty [`TxMeta`].
+    pub fn transmit(&self, send: impl FnOnce(&[u8], &TxMeta) -> Result<()>) -> Result<bool> {
         let mut packet = match self.tx.try_recv() {
             Ok(packet) => packet,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(false),
         };
-        if let Some((start, offset)) = packet.csum {
-            finish_checksum(&mut packet.bytes, start, offset);
+        if !self.offloads.tx_segmentation {
+            if let Some((start, offset)) = packet.tx.checksum.take() {
+                let at = packet.at;
+                finish_checksum(&mut packet.bytes[at..], start.into(), offset.into());
+            }
         }
-        let result = send(packet.bytes());
+        let result = send(packet.bytes(), &packet.tx);
         self.buffers.give(packet.bytes);
         if let Err(error) = result {
             self.fail(error.clone());
@@ -274,73 +380,129 @@ impl Virtio {
             device: Arc::downgrade(&device),
             tx,
             buffers,
+            offloads,
             _arrival: device.irqs.busy(),
         };
         Ok((device, port))
     }
-    /// RX: deliver the reserved packet into the chain. TX: copy the frame out and queue it for the
-    /// backend (waiting only while that queue is full). Both then publish the used element.
+    /// RX: deliver the reserved frame into the chain (with MRG_RXBUF, into as many chains as it
+    /// needs). TX: copy the frame out and queue it for the backend (waiting only while that queue
+    /// is full). Both then publish the used elements.
     pub(super) fn net_request(
         &self,
         guest: Guest<'_>,
         chain: &Chain<'_>,
+        snapshot: &Snapshot,
         network: &Network,
         received: Option<Packet>,
         cancel: &AtomicBool,
     ) -> Result<Request> {
-        let rx = self.profile.is_rx(chain.id.queue);
-        let capacity = match capacity(chain.descriptors, rx) {
+        if self.profile.is_rx(chain.id.queue) {
+            let packet = received.expect("RX admission reserves a frame");
+            return self.net_receive(guest, chain, snapshot, network, packet);
+        }
+        let capacity = match capacity(chain.descriptors, false) {
             Ok(n) => n,
             Err(e) => return Ok(Request::Invalid(e)),
         };
-        let mut bytes = [0u8; HEADER + MAX_FRAME];
-        let len = if rx {
-            let packet = received.expect("RX admission reserves a frame");
-            let len = HEADER + packet.bytes.len();
-            // Valid short buffers may receive smaller frames; a larger external packet is just lost.
-            if capacity < len {
-                network.lost.fetch_add(1, SeqCst);
-                return Ok(Request::Empty);
-            }
-            if network.offloads.rx_checksum_valid && self.accepted(F_GUEST_CSUM) {
-                bytes[0] = DATA_VALID;
-            }
-            bytes[NUM_BUFFERS].copy_from_slice(&1u16.to_le_bytes());
-            bytes[HEADER..len].copy_from_slice(packet.bytes());
-            network.buffers.give(packet.bytes);
-            len
+        let limit = if self.accepted(F_HOST_TSO4 | F_HOST_TSO6) {
+            MAX_LARGE_FRAME
         } else {
-            if !(HEADER + MIN_FRAME..=bytes.len()).contains(&capacity) {
-                return Ok(Request::Invalid("network TX length".into()));
-            }
-            let frame = &mut bytes[..capacity];
-            let extents = chain
-                .descriptors
-                .iter()
-                .map(|d| (d.addr(), d.len() as usize));
-            if !self.copy(guest, chain.id, &mut gather(extents, frame), None)? {
-                return Ok(Request::Canceled);
-            }
-            let csum = self.accepted(F_CSUM);
-            let packet = match transmit_packet(&bytes[..capacity], &network.buffers, csum) {
-                Ok(p) => p,
+            MAX_FRAME
+        };
+        if !(HEADER + MIN_FRAME..=HEADER + limit).contains(&capacity) {
+            return Ok(Request::Invalid("network TX length".into()));
+        }
+        let mut bytes = network.buffers.zeroed(capacity);
+        let extents = chain
+            .descriptors
+            .iter()
+            .map(|d| (d.addr(), d.len() as usize));
+        if !self.copy(guest, chain.id, &mut gather(extents, &mut bytes), None)? {
+            return Ok(Request::Canceled);
+        }
+        let packet = match transmit_packet(bytes, self.accepted.load(SeqCst)) {
+            Ok(p) => p,
+            Err(e) => return Ok(Request::Invalid(e)),
+        };
+        if !self.submit(network, chain.id, packet, cancel)? {
+            return Ok(Request::Canceled);
+        }
+        Ok(
+            match self.complete(guest, chain, 0, Vec::with_capacity(3))? {
+                // Look at the ring again even when the index read after publication showed nothing
+                // new: one capture costs less than the driver notifications it saves (November 12:
+                // the exact check measured ~5% slower, 3.0/4.97 vs 3.3/5.3 Gbit/s up/down).
+                Some(_) => Request::Committed {
+                    pending: true,
+                    count: 1,
+                },
+                None => Request::Canceled,
+            },
+        )
+    }
+    /// One received frame: its header in the first buffer, then the frame, across `chain` and, with
+    /// MRG_RXBUF, the chains after it until they hold it (num_buffers counts them). If the driver
+    /// has not posted enough yet the frame is held ([`Request::Starved`]); a frame too big for a
+    /// lone chain without MRG_RXBUF is lost.
+    fn net_receive(
+        &self,
+        guest: Guest<'_>,
+        chain: &Chain<'_>,
+        snapshot: &Snapshot,
+        network: &Network,
+        packet: Packet,
+    ) -> Result<Request> {
+        let q = chain.queue;
+        let need = HEADER + packet.bytes().len();
+        let mut room = match capacity(chain.descriptors, true) {
+            Ok(n) => n,
+            Err(e) => return Ok(Request::Invalid(e)),
+        };
+        // Chains after the first (MRG_RXBUF); none allocated for a frame that fits one.
+        let mut more: Vec<(u16, Vec<Descriptor>)> = Vec::new();
+        while room < need && self.accepted(F_MRG_RXBUF) {
+            let next = Queue {
+                next_avail: q.next_avail.wrapping_add(1 + more.len() as u16),
+                ..q
+            };
+            let (head, descriptors) = match snapshot.chain(next) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return Ok(
+                        match self.ask_for_buffer(guest, q, chain.id, next.next_avail)? {
+                            Some(posted) => Request::Starved { packet, posted },
+                            None => Request::Canceled,
+                        },
+                    );
+                }
                 Err(e) => return Ok(Request::Invalid(e)),
             };
-            if !self.submit(network, chain.id, packet, cancel)? {
-                return Ok(Request::Canceled);
+            if !descriptors_in(&guest.backing.ram, &descriptors) {
+                return Ok(Request::Invalid("descriptor outside RAM".into()));
             }
-            0
-        };
-        let writes = if rx {
-            scatter(chain.descriptors, &bytes[..len])
-        } else {
-            Vec::with_capacity(3)
-        };
-        Ok(match self.complete(guest, chain, len as u32, writes)? {
-            // Look at the ring again even when the index read after publication showed nothing
-            // new: one capture costs less than the driver notifications it saves (November 12:
-            // the exact check measured ~5% slower, 3.0/4.97 vs 3.3/5.3 Gbit/s up/down).
-            Some(_) => Request::Committed { pending: true },
+            room += match capacity(&descriptors, true) {
+                Ok(n) => n,
+                Err(e) => return Ok(Request::Invalid(e)),
+            };
+            more.push((head, descriptors));
+        }
+        // Valid short buffers may receive smaller frames; a larger one is just lost.
+        if room < need {
+            network.lost.fetch_add(1, SeqCst);
+            return Ok(Request::Empty);
+        }
+        let header = rx_header(&packet.rx, 1 + more.len() as u16);
+        let chains = std::iter::once((chain.head, chain.descriptors))
+            .chain(more.iter().map(|(head, d)| (*head, d.as_slice())));
+        let (writes, used) = scatter_chains(chains, 1 + more.len(), [&header, packet.bytes()]);
+        let published = self.complete_chains(guest, chain.id, q, &used, writes)?;
+        network.buffers.give(packet.bytes);
+        Ok(match published {
+            Some(_) => Request::Committed {
+                pending: true,
+                count: used.len() as u16,
+            },
             None => Request::Canceled,
         })
     }
@@ -406,34 +568,164 @@ fn capacity(chain: &[Descriptor], rx: bool) -> Result<usize> {
             .ok_or("network chain length overflow".into())
     })
 }
-/// `csum`: the driver accepted CSUM, so NEEDS_CSUM is allowed and makes csum_start/offset active.
-fn transmit_packet(bytes: &[u8], buffers: &Buffers, csum: bool) -> Result<Packet> {
+/// A TX buffer (header, then frame) as a packet, under the features the driver `accepted`:
+/// NEEDS_CSUM only with CSUM, its csum_start/offset field inside the frame; TCP segmentation
+/// only with the matching HOST_TSO, NEEDS_CSUM and a nonzero gso_size, and then up to 64 KiB.
+fn transmit_packet(bytes: Vec<u8>, accepted: u64) -> Result<Packet> {
     if bytes.len() < HEADER {
         return Err("short network TX header".into());
     }
+    let field =
+        |r: std::ops::Range<usize>| u16::from_le_bytes([bytes[r.start], bytes[r.start + 1]]);
     // Unknown flag bits and inactive checksum/header hints are ignored (virtio 1.3 §5.1.6.2.2).
     let (flags, gso_type) = (bytes[0], bytes[1]);
-    let offload = flags & OFFLOAD_FLAGS & !(if csum { NEEDS_CSUM } else { 0 });
-    if offload != 0 || gso_type != 0 || bytes[NUM_BUFFERS] != [0, 0] {
+    let allowed = if accepted & F_CSUM != 0 {
+        NEEDS_CSUM
+    } else {
+        0
+    };
+    if flags & OFFLOAD_FLAGS & !allowed != 0 || bytes[NUM_BUFFERS] != [0, 0] {
         return Err("unnegotiated network TX offload/header".into());
     }
-    let mut packet = Packet::owned(buffers.take(&bytes[HEADER..]))?;
-    if flags & NEEDS_CSUM != 0 {
-        let field = |r: std::ops::Range<usize>| {
-            usize::from(u16::from_le_bytes([bytes[r.start], bytes[r.start + 1]]))
-        };
-        let (start, offset) = (field(CSUM_START), field(CSUM_OFFSET));
-        // The 16-bit field must lie inside the frame, after the checksummed range starts.
-        if start
-            .checked_add(offset)
-            .and_then(|e| e.checked_add(2))
-            .is_none_or(|e| e > packet.bytes.len())
-        {
-            return Err("network TX checksum outside the frame".into());
+    let gso = match gso_type {
+        GSO_NONE => None,
+        GSO_TCPV4 | GSO_TCPV6 => {
+            let ipv6 = gso_type == GSO_TCPV6;
+            let feature = if ipv6 { F_HOST_TSO6 } else { F_HOST_TSO4 };
+            let size = field(GSO_SIZE);
+            // Each segment's checksum is computed from the partial one.
+            if accepted & feature == 0 || flags & NEEDS_CSUM == 0 || size == 0 {
+                return Err("invalid network TX segmentation".into());
+            }
+            Some(Gso {
+                ipv6,
+                size,
+                header: field(HDR_LEN),
+            })
         }
-        packet.csum = Some((start, offset));
+        _ => return Err("unnegotiated network TX offload/header".into()),
+    };
+    let checksum = (flags & NEEDS_CSUM != 0).then(|| (field(CSUM_START), field(CSUM_OFFSET)));
+    let len = bytes.len() - HEADER;
+    let limit = if gso.is_some() {
+        MAX_LARGE_FRAME
+    } else {
+        MAX_FRAME
+    };
+    if !(MIN_FRAME..=limit).contains(&len) {
+        return Err("network frame length outside its profile".into());
     }
-    Ok(packet)
+    // The 16-bit field must lie inside the frame, after the checksummed range starts.
+    if checksum.is_some_and(|(start, offset)| usize::from(start) + usize::from(offset) + 2 > len) {
+        return Err("network TX checksum outside the frame".into());
+    }
+    Ok(Packet {
+        bytes,
+        at: HEADER,
+        tx: TxMeta { checksum, gso },
+        rx: RxMeta::default(),
+    })
+}
+
+/// A backend frame as the guest may take it, or None (dropped): an MTU frame, or up to 64 KiB with
+/// segmentation the backend offered and the guest accepted; a partial checksum inside the frame.
+/// Without GUEST_CSUM a partial checksum is completed here and a valid one is not reported.
+fn received_packet(frame: Frame, accepted: u64, offloads: Offloads) -> Option<Packet> {
+    let Frame {
+        mut bytes,
+        mut meta,
+    } = frame;
+    let limit = match meta.gso {
+        None => MAX_FRAME,
+        Some(g) => {
+            let feature = if g.ipv6 { F_GUEST_TSO6 } else { F_GUEST_TSO4 };
+            if !offloads.rx_segmentation || accepted & feature == 0 || g.size == 0 {
+                return None;
+            }
+            MAX_LARGE_FRAME
+        }
+    };
+    if !(MIN_FRAME..=limit).contains(&bytes.len()) {
+        return None;
+    }
+    let reported = offloads.rx_checksum && accepted & F_GUEST_CSUM != 0;
+    match meta.checksum {
+        RxChecksum::Partial { start, offset } => {
+            let (start, offset) = (usize::from(start), usize::from(offset));
+            if start + offset + 2 > bytes.len() {
+                return None;
+            }
+            if !reported {
+                finish_checksum(&mut bytes, start, offset);
+                meta.checksum = RxChecksum::Unknown;
+            }
+        }
+        RxChecksum::Valid if !reported => meta.checksum = RxChecksum::Unknown,
+        _ => {}
+    }
+    Some(Packet {
+        bytes,
+        at: 0,
+        tx: TxMeta::default(),
+        rx: meta,
+    })
+}
+
+/// The virtio_net_hdr of a received frame spread over `buffers` chains.
+fn rx_header(meta: &RxMeta, buffers: u16) -> [u8; HEADER] {
+    let mut h = [0u8; HEADER];
+    match meta.checksum {
+        RxChecksum::Unknown => {}
+        RxChecksum::Valid => h[0] = DATA_VALID,
+        RxChecksum::Partial { start, offset } => {
+            h[0] = NEEDS_CSUM;
+            h[CSUM_START].copy_from_slice(&start.to_le_bytes());
+            h[CSUM_OFFSET].copy_from_slice(&offset.to_le_bytes());
+        }
+    }
+    if let Some(g) = meta.gso {
+        h[1] = if g.ipv6 { GSO_TCPV6 } else { GSO_TCPV4 };
+        h[HDR_LEN].copy_from_slice(&g.header.to_le_bytes());
+        h[GSO_SIZE].copy_from_slice(&g.size.to_le_bytes());
+    }
+    h[NUM_BUFFERS].copy_from_slice(&buffers.to_le_bytes());
+    h
+}
+
+/// Write `parts` in order across the chains' buffers: the writes, and each chain's used element
+/// (head, bytes written).
+fn scatter_chains<'a, 'd>(
+    chains: impl Iterator<Item = (u16, &'d [Descriptor])>,
+    count: usize,
+    parts: [&'a [u8]; 2],
+) -> (Vec<Transfer<'a>>, Vec<(u16, u32)>) {
+    // The buffers' writes, then the publication's four transfers (used elements, used index,
+    // available ring, used_event) without growing.
+    let mut writes = Vec::with_capacity(8);
+    let mut used = Vec::with_capacity(count);
+    let (mut part, mut at) = (0, 0);
+    for (head, descriptors) in chains {
+        let mut len = 0u32;
+        for d in descriptors {
+            let (mut gpa, mut room) = (d.addr(), d.len() as usize);
+            while room > 0 && part < parts.len() {
+                let rest: &'a [u8] = &parts[part][at..];
+                let n = room.min(rest.len());
+                if n > 0 {
+                    writes.push(Transfer::Write {
+                        gpa,
+                        bytes: &rest[..n],
+                    });
+                }
+                (gpa, room, at, len) = (gpa + n as u64, room - n, at + n, len + n as u32);
+                if at == parts[part].len() {
+                    (part, at) = (part + 1, 0);
+                }
+            }
+        }
+        used.push((head, len));
+    }
+    (writes, used)
 }
 
 /// Complete a partial checksum (NEEDS_CSUM, virtio 1.3 §5.1.6.2): the field at `start + offset`
@@ -575,25 +867,27 @@ mod tests {
             h[CSUM_OFFSET].copy_from_slice(&offset.to_le_bytes());
             [h, frame.clone()].concat()
         };
-        let b = Buffers::default();
         assert!(
-            transmit_packet(&header(34, 16), &b, false).is_err(),
+            transmit_packet(header(34, 16).to_vec(), 0).is_err(),
             "CSUM not accepted"
         );
         assert_eq!(
-            transmit_packet(&header(34, 16), &b, true).unwrap().csum,
+            transmit_packet(header(34, 16).to_vec(), F_CSUM)
+                .unwrap()
+                .tx
+                .checksum,
             Some((34, 16))
         );
         let last = frame.len() as u16 - 2;
-        assert!(transmit_packet(&header(0, last), &b, true).is_ok());
-        assert!(transmit_packet(&header(0, last + 1), &b, true).is_err());
-        assert!(transmit_packet(&header(u16::MAX, u16::MAX), &b, true).is_err());
+        assert!(transmit_packet(header(0, last).to_vec(), F_CSUM).is_ok());
+        assert!(transmit_packet(header(0, last + 1).to_vec(), F_CSUM).is_err());
+        assert!(transmit_packet(header(u16::MAX, u16::MAX).to_vec(), F_CSUM).is_err());
         let mut gso = header(34, 16);
         gso[1] = 1; // GSO_TCPV4 is not offered
-        assert!(transmit_packet(&gso, &b, true).is_err());
+        assert!(transmit_packet(gso.to_vec(), F_CSUM).is_err());
         let mut valid = header(34, 16);
         valid[0] |= DATA_VALID; // RX-only
-        assert!(transmit_packet(&valid, &b, true).is_err());
+        assert!(transmit_packet(valid.to_vec(), F_CSUM).is_err());
     }
     #[test]
     fn offered_features_follow_the_backend() {
@@ -603,14 +897,16 @@ mod tests {
             (
                 Offloads {
                     tx_checksum: true,
-                    rx_checksum_valid: false,
+                    rx_checksum: false,
+                    ..Offloads::default()
                 },
                 F_CSUM,
             ),
             (
                 Offloads {
                     tx_checksum: true,
-                    rx_checksum_valid: true,
+                    rx_checksum: true,
+                    ..Offloads::default()
                 },
                 F_CSUM | F_GUEST_CSUM,
             ),
@@ -631,16 +927,11 @@ mod tests {
         bytes.extend(frame());
         bytes[0] = 0xf8;
         bytes[2..10].fill(0xff);
-        assert_eq!(
-            transmit_packet(&bytes, &Buffers::default(), false)
-                .unwrap()
-                .bytes(),
-            frame()
-        );
+        assert_eq!(transmit_packet(bytes.to_vec(), 0).unwrap().bytes(), frame());
         for at in [0, 1, 10, 11] {
             let mut bad = bytes.clone();
             bad[at] = 1;
-            assert!(transmit_packet(&bad, &Buffers::default(), false).is_err());
+            assert!(transmit_packet(bad.to_vec(), 0).is_err());
         }
         assert!(Packet::new(&[0; 13]).is_err());
         assert!(Packet::new(&[0; MAX_FRAME + 1]).is_err());
@@ -745,7 +1036,7 @@ mod tests {
         ));
         let mut seen = Vec::new();
         while p
-            .transmit(|bytes| {
+            .transmit(|bytes, _| {
                 seen.push(bytes[0]);
                 Ok(())
             })
@@ -778,7 +1069,7 @@ mod tests {
             )
             .unwrap()
         );
-        assert!(p.transmit(|_| Err("lost interface".into())).is_err());
+        assert!(p.transmit(|_, _| Err("lost interface".into())).is_err());
         assert!(d.lock().backend_error.is_some());
         d.stop();
     }
@@ -919,5 +1210,339 @@ mod tests {
         assert_eq!(d.irqs.live(), 1);
         drop(p);
         assert_eq!(d.irqs.live(), 0);
+    }
+
+    /// A whole guest: RX/TX rings and buffers in fixture RAM, the device's owner on a thread.
+    mod rig {
+        use super::*;
+        use crate::execution::io::tests as io;
+        use std::sync::atomic::AtomicU16;
+        const RAM: usize = 0x80000;
+        const SIZE: u16 = 32;
+        /// Per queue: descriptor table, available ring, used ring.
+        const RINGS: [[u64; 3]; 2] = [[0x0, 0x1000, 0x2000], [0x4000, 0x5000, 0x6000]];
+        const RX_BUFFERS: u64 = 0x8000;
+        const RX_BUFFER: u32 = 1536;
+        const TX_BUFFERS: u64 = 0x40000;
+        const ALL: u64 = VERSION_1
+            | F_MAC
+            | F_MTU
+            | F_STATUS
+            | F_CSUM
+            | F_GUEST_CSUM
+            | F_HOST_TSO4
+            | F_HOST_TSO6
+            | F_GUEST_TSO4
+            | F_GUEST_TSO6
+            | F_MRG_RXBUF;
+        const OFFLOADS: Offloads = Offloads {
+            tx_checksum: true,
+            rx_checksum: true,
+            tx_segmentation: true,
+            rx_segmentation: true,
+        };
+        struct Rig {
+            b: crate::execution::Backing,
+            d: Arc<Virtio>,
+            p: PacketPort,
+            /// Per queue: the next descriptor and available index the driver uses.
+            next: Mutex<[(u16, u16); 2]>,
+        }
+        fn until(what: &str, f: impl Fn() -> bool) {
+            let start = Instant::now();
+            while !f() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "timed out: {what}"
+                );
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+        impl Rig {
+            /// Negotiate `features` (FEATURES_OK must hold if `ok`), lay out both queues.
+            fn new(features: u64) -> Option<Self> {
+                let irqs = super::super::super::tests::device().irqs.clone();
+                let (d, p) = Virtio::network(
+                    irqs,
+                    NET_RESOURCE.gsi as usize,
+                    [2, 0, 0, 0, 0, 1],
+                    OFFLOADS,
+                )
+                .unwrap();
+                let w = |o, v| assert!(matches!(d.access(0, o, 4, Some(v)), Access::Completed(0)));
+                w(reg::STATUS, 1);
+                w(reg::STATUS, 3);
+                for sel in 0..2u64 {
+                    w(reg::DRIVER_FEATURES_SEL, sel);
+                    w(reg::DRIVER_FEATURES, (features >> (32 * sel)) & 0xffff_ffff);
+                }
+                w(reg::STATUS, 11);
+                if d.lock().status & status::FEATURES_OK == 0 {
+                    return None;
+                }
+                for (q, [desc, avail, used]) in RINGS.iter().enumerate() {
+                    for (o, v) in [
+                        (reg::QUEUE_SEL, q as u64),
+                        (reg::QUEUE_NUM, SIZE.into()),
+                        (reg::QUEUE_DESC_LOW, *desc),
+                        (reg::QUEUE_DRIVER_LOW, *avail),
+                        (reg::QUEUE_DEVICE_LOW, *used),
+                        (reg::QUEUE_READY, 1),
+                    ] {
+                        w(o, v);
+                    }
+                }
+                w(reg::STATUS, 15);
+                Some(Self {
+                    b: io::backing_with(1, RAM),
+                    d,
+                    p,
+                    next: Mutex::new([(0, 0); 2]),
+                })
+            }
+            fn put(&self, gpa: u64, bytes: &[u8]) {
+                let at = self.b.ram.range(gpa, bytes.len() as u64).unwrap();
+                // SAFETY: fixture RAM in bounds; the device writes only buffers it was given.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
+            }
+            fn get(&self, gpa: u64, len: usize) -> Vec<u8> {
+                let at = self.b.ram.range(gpa, len as u64).unwrap();
+                // SAFETY: as `put`; read after the used index says the device is done.
+                unsafe { std::slice::from_raw_parts(at, len) }.to_vec()
+            }
+            fn word(&self, gpa: u64) -> &AtomicU16 {
+                // SAFETY: an aligned ring field of fixture RAM, accessed atomically on both sides.
+                unsafe { AtomicU16::from_ptr(self.b.ram.range(gpa, 2).unwrap().cast()) }
+            }
+            /// Post a chain of `(gpa, len)` buffers on `q` (device-writable on RX); its head.
+            fn post(&self, q: usize, buffers: &[(u64, u32)]) -> u16 {
+                let mut next = self.next.lock().unwrap();
+                let (first, index) = next[q];
+                for (i, &(gpa, len)) in buffers.iter().enumerate() {
+                    let n = first + i as u16;
+                    let more = i + 1 < buffers.len();
+                    let flags = u16::from(more) | if q == 0 { 2 } else { 0 };
+                    let mut d = [0; 16];
+                    d[..8].copy_from_slice(&gpa.to_le_bytes());
+                    d[8..12].copy_from_slice(&len.to_le_bytes());
+                    d[12..14].copy_from_slice(&flags.to_le_bytes());
+                    d[14..].copy_from_slice(&((n + 1) % SIZE).to_le_bytes());
+                    self.put(RINGS[q][0] + u64::from(n % SIZE) * 16, &d);
+                }
+                self.put(
+                    RINGS[q][1] + 4 + u64::from(index % SIZE) * 2,
+                    &first.to_le_bytes(),
+                );
+                self.word(RINGS[q][1] + 2)
+                    .store(index.wrapping_add(1), SeqCst);
+                next[q] = ((first + buffers.len() as u16) % SIZE, index.wrapping_add(1));
+                first
+            }
+            /// One RX buffer `i` (its own chain).
+            fn post_rx(&self, i: u64) {
+                self.post(0, &[(RX_BUFFERS + i * 0x800, RX_BUFFER)]);
+            }
+            fn kick(&self, q: u64) {
+                assert!(matches!(
+                    self.d.access(0, reg::QUEUE_NOTIFY, 4, Some(q)),
+                    Access::Completed(0)
+                ));
+            }
+            fn used(&self, q: usize) -> u16 {
+                self.word(RINGS[q][2] + 2).load(SeqCst)
+            }
+            /// Used element `slot` of `q`: (head, length).
+            fn element(&self, q: usize, slot: u16) -> (u32, u32) {
+                let e = self.get(RINGS[q][2] + 4 + u64::from(slot % SIZE) * 8, 8);
+                (
+                    u32::from_le_bytes(e[..4].try_into().unwrap()),
+                    u32::from_le_bytes(e[4..].try_into().unwrap()),
+                )
+            }
+            /// Run the owner while `body` drives the guest; then stop it.
+            fn run(&self, body: impl FnOnce(&Self)) {
+                let b = &self.b;
+                let copy =
+                    move |spans: &mut [Transfer<'_>], publish: usize, permit: &CopyPermit| {
+                        io::windowless_permit(b, spans, publish, permit)
+                    };
+                let guest = Guest {
+                    backing: &self.b,
+                    copier: Copier::Test(&copy),
+                };
+                let cancel = AtomicBool::new(false);
+                // Stops the owner even when `body` panics, so a failed check fails rather than hangs.
+                struct Stop<'a>(&'a Virtio);
+                impl Drop for Stop<'_> {
+                    fn drop(&mut self) {
+                        self.0.stop();
+                    }
+                }
+                std::thread::scope(|scope| {
+                    let (d, cancel) = (&self.d, &cancel);
+                    let owner = scope.spawn(move || d.owner(guest, cancel));
+                    {
+                        let _stop = Stop(&self.d);
+                        body(self);
+                    }
+                    owner.join().unwrap().expect("network owner failed");
+                });
+            }
+        }
+        fn pattern(len: usize, seed: u8) -> Vec<u8> {
+            (0..len)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        }
+        const TSO: Gso = Gso {
+            ipv6: false,
+            size: 1448,
+            header: 54,
+        };
+
+        #[test]
+        fn a_segmentation_frame_reaches_the_backend_whole_with_its_metadata() {
+            let rig = Rig::new(ALL).unwrap();
+            let frame = pattern(60_000, 7);
+            let mut header = [0u8; HEADER];
+            header[0] = NEEDS_CSUM;
+            header[1] = GSO_TCPV4;
+            header[HDR_LEN].copy_from_slice(&54u16.to_le_bytes());
+            header[GSO_SIZE].copy_from_slice(&1448u16.to_le_bytes());
+            header[CSUM_START].copy_from_slice(&34u16.to_le_bytes());
+            header[CSUM_OFFSET].copy_from_slice(&16u16.to_le_bytes());
+            // The header alone, then the frame split over two buffers (as Linux's scatter-gather).
+            rig.put(TX_BUFFERS, &header);
+            rig.put(TX_BUFFERS + 0x100, &frame[..20_000]);
+            rig.put(TX_BUFFERS + 0x8000, &frame[20_000..]);
+            rig.run(|rig| {
+                rig.post(
+                    1,
+                    &[
+                        (TX_BUFFERS, HEADER as u32),
+                        (TX_BUFFERS + 0x100, 20_000),
+                        (TX_BUFFERS + 0x8000, 40_000),
+                    ],
+                );
+                rig.kick(1);
+                until("TX used", || rig.used(1) == 1);
+                assert_eq!(rig.element(1, 0), (0, 0));
+                let mut got = None;
+                assert!(
+                    rig.p
+                        .transmit(|bytes, meta| {
+                            got = Some((bytes.to_vec(), *meta));
+                            Ok(())
+                        })
+                        .unwrap()
+                );
+                let (bytes, meta) = got.unwrap();
+                assert!(
+                    bytes == frame,
+                    "the frame, untouched (no checksum completed)"
+                );
+                assert_eq!(
+                    meta,
+                    TxMeta {
+                        checksum: Some((34, 16)),
+                        gso: Some(TSO),
+                    }
+                );
+            });
+        }
+        #[test]
+        fn a_large_frame_spreads_over_mergeable_buffers_and_waits_for_more() {
+            let rig = Rig::new(ALL).unwrap();
+            let meta = RxMeta {
+                checksum: RxChecksum::Partial {
+                    start: 34,
+                    offset: 16,
+                },
+                gso: Some(TSO),
+            };
+            let deliver = |rig: &Rig, seed: u8| {
+                let mut one = VecDeque::from([Frame {
+                    bytes: pattern(6000, seed),
+                    meta,
+                }]);
+                assert!(rig.p.receive_from(&mut one));
+            };
+            // Read back frame `n` from used slots `first..first + 4`.
+            let check = |rig: &Rig, first: u16, seed: u8| {
+                let lens: Vec<_> = (first..first + 4).map(|s| rig.element(0, s)).collect();
+                let heads: Vec<_> = lens.iter().map(|e| e.0).collect();
+                assert_eq!(
+                    lens.iter().map(|e| e.1).collect::<Vec<_>>(),
+                    [1536, 1536, 1536, 6012 - 3 * 1536]
+                );
+                let mut bytes = Vec::new();
+                for (h, (_, len)) in heads.iter().zip(&lens) {
+                    bytes.extend(rig.get(RX_BUFFERS + u64::from(*h) * 0x800, *len as usize));
+                }
+                let mut header = [0u8; HEADER];
+                header.copy_from_slice(&bytes[..HEADER]);
+                // NEEDS_CSUM, GSO_TCPV4, hdr_len 54, gso_size 1448, csum 34/16, num_buffers 4.
+                assert_eq!(header, [1, 1, 54, 0, 0xa8, 0x05, 34, 0, 16, 0, 4, 0]);
+                assert!(bytes[HEADER..] == pattern(6000, seed)[..]);
+            };
+            rig.run(|rig| {
+                for i in 0..5 {
+                    rig.post_rx(i);
+                }
+                deliver(rig, 1);
+                until("four buffers used", || rig.used(0) == 4);
+                check(rig, 0, 1);
+                // One buffer left, four needed: the frame waits for the driver's next buffers.
+                deliver(rig, 2);
+                std::thread::sleep(Duration::from_millis(50));
+                assert_eq!(rig.used(0), 4, "nothing partial is published");
+                assert!(rig.d.lock().rx_starved);
+                for i in 5..8 {
+                    rig.post_rx(i);
+                }
+                rig.kick(0);
+                until("the held frame", || rig.used(0) == 8);
+                check(rig, 4, 2);
+                assert_eq!(rig.p.lost(), 0);
+            });
+        }
+        #[test]
+        fn a_large_frame_the_guest_did_not_accept_is_dropped() {
+            let rig = Rig::new(ALL & !(F_GUEST_TSO4 | F_GUEST_TSO6 | F_MRG_RXBUF)).unwrap();
+            rig.run(|rig| {
+                rig.post_rx(0);
+                let mut frames = VecDeque::from([
+                    Frame {
+                        bytes: pattern(6000, 3),
+                        meta: RxMeta {
+                            checksum: RxChecksum::Valid,
+                            gso: Some(TSO),
+                        },
+                    },
+                    Frame {
+                        bytes: pattern(100, 4),
+                        meta: RxMeta {
+                            checksum: RxChecksum::Valid,
+                            gso: None,
+                        },
+                    },
+                ]);
+                assert!(rig.p.receive_from(&mut frames));
+                assert!(frames.is_empty());
+                until("the small frame", || rig.used(0) == 1);
+                assert_eq!(rig.element(0, 0), (0, (HEADER + 100) as u32));
+                assert_eq!(rig.p.lost(), 1, "the large one");
+                assert_eq!(rig.get(RX_BUFFERS, 1)[0], DATA_VALID);
+            });
+        }
+        #[test]
+        fn segmentation_is_not_accepted_without_its_checksum_offload() {
+            assert!(Rig::new(ALL & !F_CSUM).is_none(), "HOST_TSO needs CSUM");
+            assert!(
+                Rig::new(ALL & !F_GUEST_CSUM).is_none(),
+                "GUEST_TSO needs GUEST_CSUM"
+            );
+            assert!(Rig::new(ALL & !(F_CSUM | F_HOST_TSO4 | F_HOST_TSO6)).is_some());
+        }
     }
 }
