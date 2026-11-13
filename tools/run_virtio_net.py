@@ -152,12 +152,14 @@ def fixture(case, work):
     elif case in ('active-other-queue', 'active-power'):
         first_rx, first_tx = make_pair(rx, tx, 12, split=True)
         avail(rx, [0]); avail(tx, [0]); write(0x50, 1)
-        # The port reports only entry to the owned TX callback, after its RAM read.
+        # The port reports only entry to the owned TX callback, after its RAM read. Since November 12 a TX packet
+        # completes once queued for the backend: its used element appears while the backend's send is still held
+        # (the old contract published it only after the send; waiting here would then never end).
         emit('mov edx, 0x600\nwait_tx_held:\nin al, dx\ntest al, al\njz wait_tx_held')
-        checkmem(tx + 0x2002, 0); checkmem(rx + 0x2002, 0)
+        wait(tx, 1); checkmem(rx + 0x2002, 0)
         packets.append(first_tx['packet'].hex()); completions.append((first_tx, 0, b''))
         if case == 'active-other-queue':
-            disable(0); preserve(tx, 1, 0); checkmem(rx + 0x2002, 0)
+            disable(0); preserve(tx, 1, 1); checkmem(rx + 0x2002, 0)
             # Reaching this release proves disabling idle RX did not wait for held TX.
             emit('mov edx, 0x600\nmov al, 1\nout dx, al'); wait(tx, 1)
             rx2 = BASE + 0x20000
