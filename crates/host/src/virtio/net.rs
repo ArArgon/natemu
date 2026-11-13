@@ -1,6 +1,7 @@
 //! virtio-net: one RX/TX pair and bounded owned Ethernet packets. No backend holds guest
 //! addresses; the native backend is [`super::slirp`].
 use super::*;
+use std::collections::VecDeque;
 use std::sync::{
     OnceLock, Weak,
     mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -26,25 +27,43 @@ const MIN_FRAME: usize = 14;
 /// Ethernet without FCS, including one VLAN tag, MTU1500.
 const MAX_FRAME: usize = 1518;
 
-/// One frame in owned storage.
+/// One frame in owned storage (moved between queues without copying).
 pub(super) struct Packet {
-    bytes: [u8; 2048],
-    len: usize,
+    bytes: Vec<u8>,
 }
 impl Packet {
+    #[cfg(test)]
     fn new(bytes: &[u8]) -> Result<Self> {
+        Self::owned(bytes.to_vec())
+    }
+    fn owned(bytes: Vec<u8>) -> Result<Self> {
         if !(MIN_FRAME..=MAX_FRAME).contains(&bytes.len()) {
             return Err("network frame length outside MTU1500 profile".into());
         }
-        let mut p = Self {
-            bytes: [0; 2048],
-            len: bytes.len(),
-        };
-        p.bytes[..p.len].copy_from_slice(bytes);
-        Ok(p)
+        Ok(Self { bytes })
     }
     fn bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
+        &self.bytes
+    }
+}
+/// Frame buffers the device and its backend pass back and forth, so neither allocates per packet
+/// (allocating on one thread and freeing on the other cost ~8-10% of a bidirectional stream).
+#[derive(Clone, Default)]
+pub struct Buffers(Arc<Mutex<Vec<Vec<u8>>>>);
+impl Buffers {
+    /// A buffer holding a copy of `bytes`.
+    pub fn take(&self, bytes: &[u8]) -> Vec<u8> {
+        let spare = self.0.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(MAX_FRAME));
+        buffer.clear();
+        buffer.extend_from_slice(bytes);
+        buffer
+    }
+    pub fn give(&self, buffer: Vec<u8>) {
+        let mut spare = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < 1024 {
+            spare.push(buffer);
+        }
     }
 }
 /// TX packets the device may queue for the backend; a full queue holds the device's TX.
@@ -55,6 +74,7 @@ pub(super) struct Network {
     mac: [u8; 6],
     /// TX packets handed to the [`PacketPort`], in order.
     tx: SyncSender<Packet>,
+    buffers: Buffers,
     /// The backend's doorbell ([`PacketPort::on_ready`]).
     ready: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Received frames dropped because the guest's buffer was too small ([`PacketPort::lost`]).
@@ -78,6 +98,7 @@ impl Network {
 pub struct PacketPort {
     device: Weak<Virtio>,
     tx: Receiver<Packet>,
+    buffers: Buffers,
     // An idle backend can still deliver a future packet; all-HLT is not VM completion.
     _arrival: Busy,
 }
@@ -86,25 +107,41 @@ impl PacketPort {
     /// [`RX_SLOTS`] frames already wait. Arrival schedules RX unless RX is starved (then the
     /// driver's next RX notification does). Only plain Ethernet bytes, excluding FCS.
     pub fn receive(&self, bytes: &[u8]) -> bool {
-        let Ok(packet) = Packet::new(bytes) else {
+        if !(MIN_FRAME..=MAX_FRAME).contains(&bytes.len()) {
             return false;
-        };
+        }
+        let mut one = VecDeque::from([bytes.to_vec()]);
+        self.receive_from(&mut one);
+        one.is_empty()
+    }
+    /// [`Self::receive`] for each frame from the front of `frames`, under one lock: taken frames
+    /// leave `frames`, and so do out-of-profile ones (dropped); the rest stay. True if any left.
+    pub fn receive_from(&self, frames: &mut VecDeque<Vec<u8>>) -> bool {
         let Some(device) = self.device.upgrade() else {
             return false;
         };
         let mut s = device.lock();
         let id = s.identity(0);
-        if !s.current(id) || !s.accepting(0) || s.received.len() >= RX_SLOTS {
-            return false;
+        let before = frames.len();
+        let mut taken = false;
+        while let Some(frame) = frames.pop_front() {
+            if !(MIN_FRAME..=MAX_FRAME).contains(&frame.len()) {
+                continue;
+            }
+            if !s.current(id) || !s.accepting(0) || s.received.len() >= RX_SLOTS {
+                frames.push_front(frame);
+                break;
+            }
+            s.received.push_back((id, Packet { bytes: frame }));
+            taken = true;
         }
-        s.received.push_back((id, packet));
         // An RX request in flight re-notifies itself while frames wait (`finish_request`).
-        if !s.notified[0] && !s.queue_active(0) && !s.rx_starved {
+        if taken && !s.notified[0] && !s.queue_active(0) && !s.rx_starved {
             s.notified[0] = true;
             device.busy(&mut s);
             device.wake.ring();
         }
-        true
+        frames.len() < before
     }
     /// Send the oldest queued TX packet, outside every VM lock and RAM window; false if none. The
     /// guest already saw it complete (like a NIC that fetched it): return success for a transient
@@ -114,11 +151,17 @@ impl PacketPort {
             Ok(packet) => packet,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(false),
         };
-        if let Err(error) = send(packet.bytes()) {
+        let result = send(packet.bytes());
+        self.buffers.give(packet.bytes);
+        if let Err(error) = result {
             self.fail(error.clone());
             return Err(error);
         }
         Ok(true)
+    }
+    /// The buffer pool frames given to [`Self::receive_from`] should come from.
+    pub fn buffers(&self) -> Buffers {
+        self.buffers.clone()
     }
     /// `ready` runs (under the device lock: it must only signal) when a TX packet is queued, the RX
     /// slot frees after a receive, and at stop or drain, so a backend can wait for those instead of
@@ -169,12 +212,14 @@ impl Virtio {
             return Err("network MAC must be nonzero unicast".into());
         }
         let (send, tx) = mpsc::sync_channel(TX_QUEUE);
+        let buffers = Buffers::default();
         let device = Self::new(
             irqs,
             gsi,
             Profile::Network(Network {
                 mac,
                 tx: send,
+                buffers: buffers.clone(),
                 ready: OnceLock::new(),
                 lost: AtomicU64::new(0),
             }),
@@ -182,6 +227,7 @@ impl Virtio {
         let port = PacketPort {
             device: Arc::downgrade(&device),
             tx,
+            buffers,
             _arrival: device.irqs.busy(),
         };
         Ok((device, port))
@@ -204,7 +250,7 @@ impl Virtio {
         let mut bytes = [0u8; HEADER + MAX_FRAME];
         let len = if rx {
             let packet = received.expect("RX admission reserves a frame");
-            let len = HEADER + packet.len;
+            let len = HEADER + packet.bytes.len();
             // Valid short buffers may receive smaller frames; a larger external packet is just lost.
             if capacity < len {
                 network.lost.fetch_add(1, SeqCst);
@@ -212,6 +258,7 @@ impl Virtio {
             }
             bytes[NUM_BUFFERS].copy_from_slice(&1u16.to_le_bytes());
             bytes[HEADER..len].copy_from_slice(packet.bytes());
+            network.buffers.give(packet.bytes);
             len
         } else {
             if !(HEADER + MIN_FRAME..=bytes.len()).contains(&capacity) {
@@ -225,7 +272,7 @@ impl Virtio {
             if !self.copy(guest, chain.id, &mut gather(extents, frame), None)? {
                 return Ok(Request::Canceled);
             }
-            let packet = match transmit_packet(&bytes[..capacity]) {
+            let packet = match transmit_packet(&bytes[..capacity], &network.buffers) {
                 Ok(p) => p,
                 Err(e) => return Ok(Request::Invalid(e)),
             };
@@ -309,7 +356,7 @@ fn capacity(chain: &[Descriptor], rx: bool) -> Result<usize> {
             .ok_or("network chain length overflow".into())
     })
 }
-fn transmit_packet(bytes: &[u8]) -> Result<Packet> {
+fn transmit_packet(bytes: &[u8], buffers: &Buffers) -> Result<Packet> {
     if bytes.len() < HEADER {
         return Err("short network TX header".into());
     }
@@ -318,7 +365,7 @@ fn transmit_packet(bytes: &[u8]) -> Result<Packet> {
     if flags & OFFLOAD_FLAGS != 0 || gso_type != 0 || bytes[NUM_BUFFERS] != [0, 0] {
         return Err("unnegotiated network TX offload/header".into());
     }
-    Packet::new(&bytes[HEADER..])
+    Packet::owned(buffers.take(&bytes[HEADER..]))
 }
 
 #[cfg(test)]
@@ -367,15 +414,23 @@ mod tests {
         bytes.extend(frame());
         bytes[0] = 0xf8;
         bytes[2..10].fill(0xff);
-        assert_eq!(transmit_packet(&bytes).unwrap().bytes(), frame());
+        assert_eq!(
+            transmit_packet(&bytes, &Buffers::default())
+                .unwrap()
+                .bytes(),
+            frame()
+        );
         for at in [0, 1, 10, 11] {
             let mut bad = bytes.clone();
             bad[at] = 1;
-            assert!(transmit_packet(&bad).is_err());
+            assert!(transmit_packet(&bad, &Buffers::default()).is_err());
         }
         assert!(Packet::new(&[0; 13]).is_err());
         assert!(Packet::new(&[0; MAX_FRAME + 1]).is_err());
-        assert_eq!(Packet::new(&[0; MAX_FRAME]).unwrap().len, MAX_FRAME);
+        assert_eq!(
+            Packet::new(&[0; MAX_FRAME]).unwrap().bytes().len(),
+            MAX_FRAME
+        );
         let split = [
             Descriptor::new(0x1000, 2, 0, 0),
             Descriptor::new(0x2000, 74, 0, 0),

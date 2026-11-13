@@ -137,6 +137,7 @@ struct Timer {
 /// slirp calls.
 struct Context {
     rx: VecDeque<Vec<u8>>,
+    buffers: super::net::Buffers,
     timers: Vec<*mut Timer>,
     epoch: Instant,
     /// Frames slirp emitted while `rx` was full.
@@ -155,7 +156,8 @@ unsafe fn context<'a>(opaque: Opaque) -> &'a mut Context {
 unsafe extern "C" fn send_packet(buf: *const c_void, len: usize, opaque: Opaque) -> isize {
     let c = unsafe { context(opaque) };
     if c.rx.len() < RX_QUEUE {
-        c.rx.push_back(unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) }.to_vec());
+        let frame = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) };
+        c.rx.push_back(c.buffers.take(frame));
     } else {
         c.dropped += 1;
     }
@@ -265,6 +267,7 @@ impl Slirp {
         });
         let context = Box::into_raw(Box::new(Context {
             rx: VecDeque::new(),
+            buffers: port.buffers(),
             timers: Vec::new(),
             epoch: Instant::now(),
             dropped: 0,
@@ -367,17 +370,9 @@ impl Slirp {
     /// Hand queued frames to the guest in order until one is refused (slot busy or queue not
     /// ready); true if any was taken.
     fn deliver(&mut self) -> bool {
+        // Slirp frames lack the FCS; an out-of-profile one is dropped there.
         let c = unsafe { &mut *self.context };
-        let mut moved = false;
-        while let Some(frame) = c.rx.front() {
-            // Slirp frames lack the FCS; an out-of-profile one could never be taken.
-            if (14..=1518).contains(&frame.len()) && !self.port.receive(frame) {
-                break;
-            }
-            c.rx.pop_front();
-            moved = true;
-        }
-        moved
+        !c.rx.is_empty() && self.port.receive_from(&mut c.rx)
     }
 
     /// Poll slirp's sockets and the doorbell until something happens or the next deadline (at once
