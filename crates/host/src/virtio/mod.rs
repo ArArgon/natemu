@@ -10,7 +10,7 @@ mod net;
 mod profile;
 mod queue;
 mod slirp;
-pub use net::{Offloads, PacketPort};
+pub use net::{Frame, Gso, Offloads, PacketPort, RxChecksum, RxMeta, TxMeta};
 pub use slirp::Slirp;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -370,7 +370,9 @@ impl Profile {
     }
     /// The driver accepted only offered features and every required one.
     fn accepts(&self, features: u64) -> bool {
-        features & !self.features() == 0 && features & self.required() == self.required()
+        features & !self.features() == 0
+            && features & self.required() == self.required()
+            && (!matches!(self, Self::Network(_)) || net::dependencies_met(features))
     }
     /// The network RX queue: its buffers alone are not work; a packet arrival is.
     fn is_rx(&self, queue: usize) -> bool {
@@ -721,8 +723,9 @@ enum Request {
     Empty,
     /// A reset or stop overtook the request before it published anything.
     Canceled,
-    /// The used ring was published. `pending` asks the owner to look at the queue again.
-    Committed { pending: bool },
+    /// `count` used elements were published (several for one mergeable RX frame). `pending` asks
+    /// the owner to look at the queue again.
+    Committed { pending: bool, count: u16 },
     /// RX: no buffer was posted. The frame goes back to the front of the queue; `posted` if a
     /// buffer appeared after the device asked to be notified of one.
     Starved { packet: net::Packet, posted: bool },
@@ -1300,29 +1303,71 @@ impl Virtio {
         len: u32,
         data: Vec<Transfer<'_>>,
     ) -> Result<Option<bool>> {
-        let mut used = Used::new(chain.queue, [(chain.head, len)]);
+        self.complete_chains(guest, chain.id, chain.queue, &[(chain.head, len)], data)
+    }
+    /// Publish `chains` (head, used length) in the next used slots after `data`, then raise the
+    /// interrupt if due. None if a reset or stop came first; else whether the available index read
+    /// after publication shows more heads.
+    fn complete_chains(
+        &self,
+        guest: Guest<'_>,
+        id: Identity,
+        q: Queue,
+        chains: &[(u16, u32)],
+        data: Vec<Transfer<'_>>,
+    ) -> Result<Option<bool>> {
+        let mut used = Used::new(q, chains.iter().copied());
+        let next = q.next_avail.wrapping_add(chains.len() as u16);
         if self.accepted(EVENT_IDX) {
-            // TX: notify when the buffer after this one is added (later ones are found by the
+            // TX: notify when the buffer after these is added (later ones are found by the
             // available index read after publication). RX never waits for a notification (packet
             // arrival drives it; a starved request asks separately), so ask for none.
-            let next = chain.queue.next_avail.wrapping_add(1);
-            let rx = self.profile.is_rx(chain.id.queue);
+            let rx = self.profile.is_rx(id.queue);
             used = used.with_events(if rx { next.wrapping_add(0x7fff) } else { next });
         }
         let mut transfers = data;
-        let publish = used.publish(chain.queue, &mut transfers);
-        if !self.copy(guest, chain.id, &mut transfers, Some(publish))? {
+        let publish = used.publish(q, &mut transfers);
+        if !self.copy(guest, id, &mut transfers, Some(publish))? {
             return Ok(None);
         }
         drop(transfers);
         #[cfg(feature = "testing")]
         self.observe("commit");
-        self.interrupt(&mut self.lock(), chain.id, &used);
+        self.interrupt(&mut self.lock(), id, &used);
         // More heads already wait (read after publication, behind the full barrier): the owner looks
         // again. A head added after that read is notified (avail_event or no suppression at all).
-        Ok(Some(
-            used.avail_index() != chain.queue.next_avail.wrapping_add(1),
-        ))
+        Ok(Some(used.avail_index() != next))
+    }
+    /// RX found no buffer at available index `at`: ask the driver to notify when it adds one (with
+    /// EVENT_IDX by avail_event; without it the driver always notifies, the network device never
+    /// suppressing), then read the available index again (Dekker with the driver's index store and
+    /// avail_event read). None if a reset or stop came first; else whether a buffer appeared.
+    fn ask_for_buffer(
+        &self,
+        guest: Guest<'_>,
+        q: Queue,
+        id: Identity,
+        at: u16,
+    ) -> Result<Option<bool>> {
+        if !self.accepted(EVENT_IDX) {
+            return Ok(Some(false));
+        }
+        let (event, mut index) = (at.to_le_bytes(), [0; 2]);
+        let mut transfers = vec![
+            Transfer::Write {
+                gpa: q.used + 4 + u64::from(q.size) * 8,
+                bytes: &event,
+            },
+            Transfer::Read {
+                gpa: q.avail + 2,
+                bytes: &mut index,
+            },
+        ];
+        if !self.copy(guest, id, &mut transfers, None)? {
+            return Ok(None);
+        }
+        drop(transfers);
+        Ok(Some(u16::from_le_bytes(index) != at))
     }
     /// After a granted publication: raise the used-buffer interrupt unless the driver suppressed
     /// it or a reset closed the incarnation (ACK, reset and level publication share the lock).
@@ -1490,7 +1535,9 @@ impl Virtio {
         let mut s = self.lock();
         s.retire(id);
         match result? {
-            Request::Committed { pending } => self.retire_request(&mut s, snapshot, q, id, pending),
+            Request::Committed { pending, count } => {
+                self.retire_request(&mut s, snapshot, q, id, pending, count)
+            }
             Request::Invalid(reason) => {
                 snapshot.discard();
                 eprintln!("virtio: {reason}");
@@ -1531,10 +1578,11 @@ impl Virtio {
         q: Queue,
         id: Identity,
         pending: bool,
+        count: u16,
     ) {
         // A granted completion retires once even if reset arrived; reset clears its old queue afterward.
-        s.queues[id.queue].next_avail = q.next_avail.wrapping_add(1);
-        s.queues[id.queue].next_used = q.next_used.wrapping_add(1);
+        s.queues[id.queue].next_avail = q.next_avail.wrapping_add(count);
+        s.queues[id.queue].next_used = q.next_used.wrapping_add(count);
         if !self.profile.is_rx(id.queue) && s.current(id) && s.accepting(id.queue) {
             // Keep both notifications arriving after admission and already-owned heads even if
             // completion writes aliased the live available index. This does not admit another request.
@@ -1570,28 +1618,10 @@ impl Virtio {
                 let Some(packet) = received else {
                     return Ok(Request::Empty);
                 };
-                // Keep the frame and ask for a notification when a buffer is added: with EVENT_IDX
-                // by avail_event (the RX completions otherwise ask for none), then look again.
-                let mut posted = false;
-                if self.accepted(EVENT_IDX) {
-                    let (event, mut index) = (q.next_avail.to_le_bytes(), [0; 2]);
-                    let mut transfers = vec![
-                        Transfer::Write {
-                            gpa: q.used + 4 + u64::from(q.size) * 8,
-                            bytes: &event,
-                        },
-                        Transfer::Read {
-                            gpa: q.avail + 2,
-                            bytes: &mut index,
-                        },
-                    ];
-                    if !self.copy(guest, id, &mut transfers, None)? {
-                        return Ok(Request::Canceled);
-                    }
-                    drop(transfers);
-                    posted = u16::from_le_bytes(index) != q.next_avail;
-                }
-                return Ok(Request::Starved { packet, posted });
+                return Ok(match self.ask_for_buffer(guest, q, id, q.next_avail)? {
+                    Some(posted) => Request::Starved { packet, posted },
+                    None => Request::Canceled,
+                });
             }
             Err(e) => return Ok(Request::Invalid(e)),
         };
@@ -1606,7 +1636,9 @@ impl Virtio {
         };
         match &self.profile {
             Profile::Block(_) => unreachable!("block requests run in the block owner"),
-            Profile::Network(network) => self.net_request(guest, &chain, network, received, cancel),
+            Profile::Network(network) => {
+                self.net_request(guest, &chain, snapshot, network, received, cancel)
+            }
             Profile::Entropy => self.entropy_request(guest, &chain),
         }
     }
@@ -1656,7 +1688,7 @@ impl Virtio {
         }
         let writes = scatter(chain.descriptors, payload);
         Ok(match self.complete(guest, chain, len as u32, writes)? {
-            Some(pending) => Request::Committed { pending },
+            Some(pending) => Request::Committed { pending, count: 1 },
             None => Request::Canceled,
         })
     }
@@ -1758,7 +1790,7 @@ mod tests {
                             write(&r, reg::QUEUE_NOTIFY, 0);
                         }
                         let mut s = r.lock();
-                        r.retire_request(&mut s, &snapshot, q, id, pending);
+                        r.retire_request(&mut s, &snapshot, q, id, pending, 1);
                         r.take_kicks(&mut s);
                         assert_eq!(s.notified, [pending || notify || captured, true]);
                         assert_eq!(s.queues[0].next_avail, q.next_avail.wrapping_add(1));
@@ -1793,7 +1825,7 @@ mod tests {
                 5 => s.status |= status::NEEDS_RESET,
                 _ => s.generation += 1,
             }
-            r.retire_request(&mut s, &snapshot, q, id, true);
+            r.retire_request(&mut s, &snapshot, q, id, true, 1);
             assert!(!s.notified[0]);
             assert_eq!((s.queues[0].next_avail, s.queues[0].next_used), (1, 1));
         }
@@ -1813,7 +1845,7 @@ mod tests {
             device: id.device + 1,
             ..id
         });
-        r.retire_request(&mut s, &snapshot, q, id, false);
+        r.retire_request(&mut s, &snapshot, q, id, false, 1);
         assert!(!s.notified[0]);
     }
     #[test]
