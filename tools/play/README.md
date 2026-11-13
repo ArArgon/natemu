@@ -11,8 +11,8 @@ virtio_blk, virtio-rng and ext4 modules (and their dependencies), and `/init` lo
   10.0.2.3); `curl https://...` works. The host's loopback is not reachable from the guest: use its LAN address.
 - disk (natemu `--disk FILE`): `/dev/vda`, mounted on `/mnt/disk` if it holds ext4. A new disk: make the file on the
   Mac (`mkfile -n 1g disk.raw`), then in the guest `mkfs.ext4 /dev/vda && mount /dev/vda /mnt/disk`; it is mounted at
-  the next boot. `poweroff` and `reboot` (wrappers in /usr/local/sbin) sync and unmount it first; a bare
-  `busybox poweroff -f` would lose data the guest had not written yet.
+  the next boot. `poweroff` and `reboot` sync and unmount it first (busybox init's shutdown action,
+  `/etc/init.d/rcK`); `poweroff -f` skips that and can lose data the guest had not written yet.
 - entropy (natemu `--rng`): virtio-rng.
 
 ## Build
@@ -53,11 +53,12 @@ The stub's command line is named since November 5 (clap). Scripts kept as eviden
 positional form, `natemu RUNTIME FEXC BZIMAGE [OPTIONS]`, which the stub no longer accepts: run them against a stub built
 before that change, or rewrite the first three arguments as `--runtime`, `--fexc` and `--kernel`.
 
-You get a root shell on ttyS0 (no login, hostname natemu-play). Leave with `poweroff`; typing `exit` restarts the
-shell. QEMU check: `qemu-system-x86_64 -nodefaults -machine pc,hpet=off,i8042=off,vmport=off -accel tcg,thread=multi
+You get a root shell on ttyS0 (no login, hostname natemu-play). PID 1 is busybox init (`/etc/inittab`, written by
+`/init` for the console): it restarts the shell when you type `exit`, reaps orphaned processes, and on `poweroff` or
+`reboot` runs `/etc/init.d/rcK` before stopping everything. QEMU check: `qemu-system-x86_64 -nodefaults -machine pc,hpet=off,i8042=off,vmport=off -accel tcg,thread=multi
 -cpu <model> -m 2048 -smp 2 -kernel OUTDIR/bzImage -initrd OUTDIR/play.cpio.zst -append 'console=ttyS0 mitigations=off
 nokaslr' -display none -serial stdio`; add `-netdev user,id=n -device virtio-net-pci,netdev=n` and
 `-drive file=disk.raw,format=raw,if=virtio` for the network and disk (virtio-pci is built into the kernel).
 
-Files: `build.sh` (runs on the Mac), `rootfs.sh` (runs on HOST), `init`, `mkcpio.py` (deterministic newc cpio, adds
+Files: `build.sh` (runs on the Mac), `rootfs.sh` (runs on HOST), `init` (setup, then `exec busybox init`), `mkcpio.py` (deterministic newc cpio, adds
 `/dev/console`).
