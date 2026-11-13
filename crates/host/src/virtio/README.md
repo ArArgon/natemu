@@ -175,8 +175,7 @@ Its caller must admit the actual backend before boot, service the port on an
 independent backend owner, then stop/join native callbacks under its supervisor.
 No backend launch or privilege acquisition occurs here. `PacketPort::on_ready`
 gives the backend a doorbell, rung (under the device lock, so it must only signal)
-when a TX packet is queued, when an RX request finishes and the slot is free again,
-and at drain and stop.
+when a TX packet is queued, when an RX request finishes, and at drain and stop.
 
 ## Network backend (`--net`)
 
@@ -211,18 +210,22 @@ each way, 100 parallel streams, 500 short connections 64 at a time, UDP floods b
 ways, then the network still works. Not yet covered: IPv6/ICMPv6, port forwarding,
 a separate contained process, combined disk+network load.
 
-Known gaps (November 12 stress): with 32-100 parallel guest uploads slirp's TCP (Reno,
-no SACK) loses segments internally: 2-4% fast retransmits and 15-23% less throughput
-than 8 streams; nothing is dropped on natemu's side. Idle ping to the gateway averages
-4-5 ms. Every TX packet is a synchronous round trip to the backend thread and the
-device alternates one RX frame per TX packet (TX ~700 Mbit/s, RX ~1.35 Gbit/s alone,
-about 480/370 together). A frame arriving while the guest has no RX buffer is dropped
-rather than held.
+Throughput (November 12, 2 vCPUs, iperf3 to the host, `natemu-raw/net-slirp-20261112-01/vmm-compare-01`):
+upload ~3.2 Gbit/s, download ~5.3 Gbit/s, 8 streams each way ~3.0/2.0 Gbit/s; QEMU 11.1
+x86 TCG with the same libslirp: ~0.77/1.7/0.55/0.48 Gbit/s. Before the pipelined TX
+queue, held RX frames, EVENT_IDX and interrupt holding: 0.81/1.37/0.46/0.44 (the
+guest was idle 93% of an upload, waiting on one synchronous packet at a time).
+
+Known gaps: with 32-100 parallel guest uploads slirp's TCP (Reno, no SACK) loses
+segments internally (measured before the pipelining: 2-4% fast retransmits). Idle ping
+to the gateway averages 4-5 ms. A UDP flood toward the guest beyond what it takes is
+dropped at the backend's 4096-frame queue. Every RX frame and TX packet is still its
+own request (one capture, copy and publication each).
 
 Queues 0/1 have a maximum of 256 direct descriptors. VERSION_1 is required;
-MAC, MTU and STATUS are offered, with MTU1500 and no offloads. Frames exclude
-FCS and are at most 1518 bytes including one VLAN tag. One accepted TX and one
-RX packet bound storage; headers are the modern 12-byte form even without merged
+MAC, MTU, STATUS and EVENT_IDX are offered, with MTU1500 and no offloads. Frames exclude
+FCS and are at most 1518 bytes including one VLAN tag. Up to 256 queued TX packets and
+64 held RX frames bound storage; headers are the modern 12-byte form even without merged
 buffers. Descriptor boundaries may split headers or payloads. RX writes one
 chain with num_buffers=1; TX used length is zero. Unknown TX flag bits and inactive
 checksum/header hints are ignored; unnegotiated offload requests fail the device.
@@ -230,16 +233,31 @@ checksum/header hints are ignored; unnegotiated offload requests fail the device
 Queue-only disable cancels only the matching operation and preserves other-queue
 indices, notifications and shared pending IRQs. Full reset invalidates both queue
 identities. The single owner alternates eligible queues; RX arrival drives its
-scan without needing a new guest kick. A full or inactive RX slot drops the frame.
+scan without needing a new guest kick. With 64 frames held or the RX queue inactive,
+`PacketPort::receive` refuses (the backend keeps the frame). An RX request that finds
+no buffer puts its frame back and holds every frame until the driver notifies RX:
+with EVENT_IDX it writes avail_event to ask for that notification and reads the
+available index again (Dekker with the driver's index store and avail_event read);
+a notification that arrives during that request is remembered, so the hold cannot
+outlive it. RX completions otherwise ask for no notification (avail_event half a ring
+ahead): RX buffers alone are not work. TX asks for one at the next unconsumed buffer;
+the owner rechecks the ring after every TX completion anyway.
+
+Interrupts: with EVENT_IDX one is due when the used index passes the driver's
+used_event (read after the used index, behind a full barrier). The owner holds a due
+interrupt while it keeps working, raising it when it goes idle, after 8 due
+completions or 20 µs, or when RX starves (the driver refills only after seeing its
+completions).
 A separate endpoint-lifetime busy guard keeps an idle VM alive while the backend
 can deliver future packets; it retires when that endpoint is dropped after shutdown.
 A valid chain too short for an incoming frame also drops it without consuming
 the head. All routes and directions are checked before any packet effect.
 
-TX enqueue and reset admission share the short state lock. A full endpoint drops
-that packet; a submitted send is attempted once and its callback result retires
-before used publication or reset. Transient loss is an ordinary backend success;
-terminal loss cancels the VM. A ten-second timeout may leave an owned-only backend
-callback alive and is process-fatal, not permission to replay. PacketPort closure
+TX enqueue and reset admission share the short state lock. A TX packet completes to
+the guest once queued for the backend, like a NIC that has fetched it: the device does
+not wait for the send, and a reset does not recall queued packets (the backend sends
+them in order, once). A full queue holds the device's TX until there is room (outside
+the lock; 10 s of that is process-fatal). Transient loss is an ordinary backend
+success; terminal loss fails the device and cancels the VM. PacketPort closure
 is terminal until the device is stopped/drained. Backend failure and successful
 drain publication share the state lock so S5 cannot hide an earlier failure.

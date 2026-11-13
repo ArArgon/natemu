@@ -71,11 +71,12 @@ impl Queue {
     fn table_bytes(&self) -> u64 {
         u64::from(self.size) * 16
     }
+    /// Including used_event/avail_event (virtio 1.2 §2.7: the full ring sizes, with or without EVENT_IDX).
     fn avail_bytes(&self) -> u64 {
-        4 + u64::from(self.size) * 2
+        6 + u64::from(self.size) * 2
     }
     fn used_bytes(&self) -> u64 {
-        4 + u64::from(self.size) * 8
+        6 + u64::from(self.size) * 8
     }
     /// A power-of-two size within `max`, aligned rings, and no ring wrapping the address space.
     pub fn valid(&self, max: u16) -> bool {

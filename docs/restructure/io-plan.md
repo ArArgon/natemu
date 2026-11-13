@@ -783,9 +783,21 @@ all succeed (an earlier shortfall was the test's curl configuration, not natemu)
 floods both ways leave the network working. Remaining gaps are in the
 [README](../../crates/host/src/virtio/README.md#network-backend---net) (many-stream
 retransmits inside slirp, 4-5 ms idle RTT, synchronous TX, no hold on an empty RX ring).
-Evidence: `natemu-raw/net-slirp-20261112-01` (runner-07, diag-01). Next: combined
-disk/network acceptance, then a benchmark round against QEMU user networking and VZ NAT
-(VZ, native ARM: 5-60 Gbit/s on the same bidirectional test).
+Evidence: `natemu-raw/net-slirp-20261112-01` (runner-07, diag-01).
+
+**Network performance (November 12).** Owner: "it does not beat QEMU", look for inefficiencies. Measured first
+against QEMU 11.1 x86 TCG with the same libslirp and VZ (`vmm-compare-01/README.md`):
+natemu 0.81/1.37 Gbit/s up/down, QEMU 0.77/1.74, VZ (native ARM) 32/71. Rejected
+leads: host-side offloads (QEMU negotiates none with slirp either), the doorbell
+syscall under the device lock (kept, small), interrupt holding alone (exits −54%,
+throughput unchanged). The guest was idle 93% of an upload: the device ran one packet
+at a time with a synchronous backend round trip. Pipelining TX (complete at enqueue,
+256-packet queue), up to 64 held RX frames, EVENT_IDX and interrupt holding give
+3.2/5.3 Gbit/s and 3.0/2.0 with 8 streams each way. Holding RX frames when the ring is
+empty first **hung** bidirectional runs (3 of 4): a notification arriving during the
+starved request was overwritten; fixed and unit-tested, 15 bidirectional runs since
+plus the full net-linux set and stress at 1/2/4 vCPUs pass. Next: combined
+disk/network acceptance.
 
 The independent fio preparation is followed by accepted functional admission.
 The first unmodified fio run parsed all eleven profiles but timed out during the

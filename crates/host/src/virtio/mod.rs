@@ -91,10 +91,16 @@ const MMIO_VERSION: u32 = 2;
 const VENDOR: u32 = 0x4e41_5445;
 /// VIRTIO_F_VERSION_1, required of every driver.
 const VERSION_1: u64 = 1 << 32;
+/// VIRTIO_F_EVENT_IDX (virtio 1.2 §2.7.10): the used_event/avail_event fields after each ring replace the
+/// flags below. Offered by the network device only.
+const EVENT_IDX: u64 = 1 << 29;
+/// Network: at most this many completions, or this long, share one held-back interrupt.
+const COALESCE: u32 = 8;
+const COALESCE_TIME: Duration = Duration::from_micros(20);
 /// VIRTQ_AVAIL_F_NO_INTERRUPT in the available ring's flags.
 const AVAIL_NO_INTERRUPT: u16 = 1;
-/// VIRTQ_USED_F_NO_NOTIFY in the used ring's flags (virtio 1.2 §2.7.7: without EVENT_IDX, which no device here
-/// offers, a driver checks it before each notification).
+/// VIRTQ_USED_F_NO_NOTIFY in the used ring's flags (virtio 1.2 §2.7.7: without EVENT_IDX a driver checks it
+/// before each notification).
 const USED_NO_NOTIFY: u16 = 1;
 /// A queue's notification gate ([`Virtio::gates`]): bit 0, a QueueNotify would take effect now and may skip the state
 /// lock; bit 1, pending work is dropped now (the queue is closed or being reset); the rest, an epoch advanced each time
@@ -159,6 +165,10 @@ struct Waiting {
 
 #[derive(Default)]
 struct State {
+    /// Network: used-buffer interrupts held back while the owner keeps working, and since when
+    /// (raised when it goes idle, after [`COALESCE`] of them or [`COALESCE_TIME`], or when RX starves).
+    owed: u32,
+    owed_at: Option<Instant>,
     /// The Status register.
     status: u32,
     /// DeviceFeaturesSel and DriverFeaturesSel.
@@ -199,7 +209,11 @@ struct State {
     /// Keeps the VM from ending as all-halted while work is pending.
     busy: Option<Busy>,
     /// One received packet waiting for an RX buffer, tagged with the RX queue's incarnation.
-    received: Option<(Identity, net::Packet)>,
+    received: VecDeque<(Identity, net::Packet)>,
+    /// RX found no buffer: hold the received frames until the driver notifies RX.
+    rx_starved: bool,
+    /// The driver notified RX since the current RX request was admitted: that request cannot starve.
+    rx_kicked: bool,
     backend_error: Option<String>,
     /// Block: the incarnation whose used ring holds VIRTQ_USED_F_NO_NOTIFY (the owner's kick suppression). A reset
     /// waits for the owner to clear it, so no incarnation ends with its driver's kicks suppressed.
@@ -310,6 +324,8 @@ pub struct Virtio {
     /// Per queue: a QueueNotify taken without the state lock, as the open gate it saw (0: none). The owner moves it to
     /// `notified` under the lock if the gate's epoch has not moved since; a nonzero kick holds one [`Irqs::busy`] count.
     kicks: [AtomicU64; 2],
+    /// The driver accepted EVENT_IDX (set at FEATURES_OK, cleared by reset): read lock-free at completion.
+    event_idx: AtomicBool,
 }
 enum Profile {
     Entropy,
@@ -446,6 +462,10 @@ struct Used {
     elements: Vec<[u8; 8]>,
     index: [u8; 2],
     avail: [u8; 4],
+    /// The used index before these elements.
+    old: u16,
+    /// With EVENT_IDX: the avail_event to write, and the driver's used_event read back.
+    event: Option<([u8; 2], [u8; 2])>,
 }
 impl Used {
     /// `chains` are `(head, used length)` pairs in the order they take used slots.
@@ -466,7 +486,15 @@ impl Used {
                 .to_le_bytes(),
             elements,
             avail: [0; 4],
+            old: q.next_used,
+            event: None,
         }
+    }
+    /// EVENT_IDX: also write `avail_event` (the available index whose addition the driver must
+    /// notify) and read the driver's used_event back for [`Used::interrupt_wanted`].
+    fn with_events(mut self, avail_event: u16) -> Self {
+        self.event = Some((avail_event.to_le_bytes(), [0; 2]));
+        self
     }
     /// The number of chains published.
     fn count(&self) -> u16 {
@@ -481,12 +509,25 @@ impl Used {
             elements,
             index,
             avail,
+            event,
+            ..
         } = self;
         for (i, element) in elements.iter().enumerate() {
             let slot = q.next_used.wrapping_add(i as u16) % q.size;
             transfers.push(Transfer::Write {
                 gpa: q.used + 4 + u64::from(slot) * 8,
                 bytes: element,
+            });
+        }
+        let size = u64::from(q.size);
+        let (avail_event, used_event) = match event {
+            Some((write, read)) => (Some(&*write), Some(read)),
+            None => (None, None),
+        };
+        if let Some(avail_event) = avail_event {
+            transfers.push(Transfer::Write {
+                gpa: q.used + 4 + size * 8,
+                bytes: avail_event,
             });
         }
         let publish = transfers.len();
@@ -498,10 +539,27 @@ impl Used {
             gpa: q.avail,
             bytes: avail,
         });
+        if let Some(used_event) = used_event {
+            transfers.push(Transfer::Read {
+                gpa: q.avail + 4 + size * 2,
+                bytes: used_event,
+            });
+        }
         publish
     }
+    /// Without EVENT_IDX the driver's NO_INTERRUPT flag; with it, whether these elements moved the
+    /// used index past used_event (vring_need_event, virtio 1.2 §2.7.10).
     fn interrupt_wanted(&self) -> bool {
-        u16::from_le_bytes([self.avail[0], self.avail[1]]) & AVAIL_NO_INTERRUPT == 0
+        match self.event {
+            Some((_, used_event)) => {
+                let (new, event) = (
+                    u16::from_le_bytes(self.index),
+                    u16::from_le_bytes(used_event),
+                );
+                new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(self.old)
+            }
+            None => u16::from_le_bytes([self.avail[0], self.avail[1]]) & AVAIL_NO_INTERRUPT == 0,
+        }
     }
     /// The driver's available index, read after publication.
     fn avail_index(&self) -> u16 {
@@ -664,6 +722,9 @@ enum Request {
     Canceled,
     /// The used ring was published. `pending` asks the owner to look at the queue again.
     Committed { pending: bool },
+    /// RX: no buffer was posted. The frame goes back to the front of the queue; `posted` if a
+    /// buffer appeared after the device asked to be notified of one.
+    Starved { packet: net::Packet, posted: bool },
     /// The driver broke the protocol; the device asks for a reset.
     Invalid(String),
 }
@@ -698,6 +759,7 @@ impl Virtio {
             running: AtomicBool::new(false),
             gates: Default::default(),
             kicks: Default::default(),
+            event_idx: AtomicBool::new(false),
         })
     }
     /// Install a finite native-call schedule before the test driver starts the VM.
@@ -789,6 +851,15 @@ impl Virtio {
                 continue;
             }
             if kick >> 2 == self.gates[q].load(SeqCst) >> 2 && !s.kills(q) {
+                if self.profile.is_rx(q) {
+                    // RX buffers alone are not work: only frames held for want of one are.
+                    s.rx_starved = false;
+                    s.rx_kicked = true;
+                    if s.received.is_empty() {
+                        self.irqs.release();
+                        continue;
+                    }
+                }
                 s.notified[q] = true;
                 self.busy(s);
             }
@@ -811,7 +882,8 @@ impl Virtio {
         s.stopped = true;
         self.take_kicks(&mut s);
         s.notified = [false; 2];
-        s.received = None;
+        s.received.clear();
+        s.rx_starved = false;
         if let Some((_, p)) = &s.permit {
             p.cancel();
         }
@@ -823,7 +895,8 @@ impl Virtio {
         let mut s = self.lock();
         s.quiescing = true;
         s.notified = [false; 2];
-        s.received = None;
+        s.received.clear();
+        s.rx_starved = false;
         self.wake.ring();
         Ok(s.drained)
     }
@@ -846,9 +919,11 @@ impl Virtio {
                 s.queues = [Queue::default(); 2];
                 s.notified = [false; 2];
                 s.cursor = 0;
-                s.received = None;
+                s.received.clear();
+                s.rx_starved = false;
                 s.status = 0;
                 s.features = 0;
+                self.event_idx.store(false, SeqCst);
                 s.device_sel = 0;
                 s.driver_sel = 0;
                 s.queue_sel = 0;
@@ -866,7 +941,8 @@ impl Virtio {
                 };
                 s.notified[i] = false;
                 if i == 0 {
-                    s.received = None;
+                    s.received.clear();
+                    s.rx_starved = false;
                 }
             }
         }
@@ -1022,7 +1098,11 @@ impl Virtio {
         if queue >= self.profile.queue_count() || !s.accepting(queue) {
             return;
         }
-        if self.profile.is_rx(queue) && s.received.is_none() {
+        if self.profile.is_rx(queue) {
+            s.rx_starved = false;
+            s.rx_kicked = true;
+        }
+        if self.profile.is_rx(queue) && s.received.is_empty() {
             return;
         }
         s.notified[queue] = true;
@@ -1044,6 +1124,10 @@ impl Virtio {
         if value & status::FEATURES_OK != 0 && !self.profile.accepts(s.features) {
             s.status &= !status::FEATURES_OK;
         }
+        self.event_idx.store(
+            s.status & status::FEATURES_OK != 0 && s.features & EVENT_IDX != 0,
+            SeqCst,
+        );
         if value & status::FAILED != 0 {
             s.notified = [false; 2];
         }
@@ -1213,6 +1297,14 @@ impl Virtio {
         data: Vec<Transfer<'_>>,
     ) -> Result<bool> {
         let mut used = Used::new(chain.queue, [(chain.head, len)]);
+        if self.event_idx.load(SeqCst) {
+            // TX: notify when the buffer after this one is added (the owner rechecks the ring after
+            // every TX completion, so later additions need no notification). RX never waits for a
+            // notification (packet arrival drives it), so ask for none in the next half ring.
+            let next = chain.queue.next_avail.wrapping_add(1);
+            let rx = self.profile.is_rx(chain.id.queue);
+            used = used.with_events(if rx { next.wrapping_add(0x7fff) } else { next });
+        }
         let mut transfers = data;
         let publish = used.publish(chain.queue, &mut transfers);
         if !self.copy(guest, chain.id, &mut transfers, Some(publish))? {
@@ -1228,10 +1320,22 @@ impl Virtio {
     /// it or a reset closed the incarnation (ACK, reset and level publication share the lock).
     fn interrupt(&self, s: &mut State, id: Identity, used: &Used) {
         if s.current(id) && used.interrupt_wanted() {
-            profile::raised(s.interrupt == 0);
-            s.interrupt |= USED_BUFFER;
-            self.irq(s);
+            if matches!(self.profile, Profile::Network(_)) {
+                let since = *s.owed_at.get_or_insert_with(Instant::now);
+                s.owed += 1;
+                if s.owed < COALESCE && since.elapsed() < COALESCE_TIME {
+                    return;
+                }
+            }
+            self.raise(s);
         }
+    }
+    fn raise(&self, s: &mut State) {
+        s.owed = 0;
+        s.owed_at = None;
+        profile::raised(s.interrupt == 0);
+        s.interrupt |= USED_BUFFER;
+        self.irq(s);
     }
     /// Run once on an independent scoped host thread. Cancellation/stop closes admission; the
     /// method joins normal disk shutdown before returning. Fatal disk timeout/cancellation may
@@ -1318,8 +1422,14 @@ impl Virtio {
             if s.quiescing {
                 return Ok(Work::Drain);
             }
+            if s.owed_at.is_some_and(|t| t.elapsed() >= COALESCE_TIME) {
+                self.raise(&mut s);
+            }
             if let Some(work) = self.admit(&mut s) {
                 return Ok(work);
+            }
+            if s.owed > 0 {
+                self.raise(&mut s);
             }
             drop(s);
             self.wake.wait(Duration::from_millis(10));
@@ -1340,11 +1450,13 @@ impl Virtio {
         let id = s.identity(i);
         s.in_flight.push(id);
         s.cursor = (i + 1) % count;
+        if self.profile.is_rx(i) {
+            s.rx_kicked = false;
+        }
         let received = if i == 0 {
-            s.received
-                .take()
-                .filter(|(tag, _)| *tag == id)
-                .map(|(_, packet)| packet)
+            // Frames of an older incarnation are dropped.
+            std::iter::from_fn(|| s.received.pop_front())
+                .find_map(|(tag, packet)| (tag == id).then_some(packet))
         } else {
             None
         };
@@ -1375,6 +1487,22 @@ impl Virtio {
                 }
             }
             Request::Empty | Request::Canceled => snapshot.discard(),
+            Request::Starved { packet, posted } => {
+                snapshot.discard();
+                if s.current(id) {
+                    s.received.push_front((id, packet));
+                    // A notification during this request may already announce the buffer.
+                    s.rx_starved = !posted && !s.rx_kicked;
+                    // The driver refills after it has seen the completions.
+                    if s.owed > 0 {
+                        self.raise(&mut s);
+                    }
+                }
+            }
+        }
+        if self.profile.is_rx(id.queue) && !s.received.is_empty() && s.accepting(0) && !s.rx_starved
+        {
+            s.notified[0] = true;
         }
         self.retire_reset(&mut s);
         self.settle(&mut s);
@@ -1427,10 +1555,31 @@ impl Virtio {
         let (head, descriptors) = match snapshot.chain(q) {
             Ok(Some(c)) => c,
             Ok(None) => {
-                if let (Profile::Network(network), Some(_)) = (&self.profile, &received) {
-                    network.lost.fetch_add(1, SeqCst); // no RX buffer posted: the frame is lost
+                let Some(packet) = received else {
+                    return Ok(Request::Empty);
+                };
+                // Keep the frame and ask for a notification when a buffer is added: with EVENT_IDX
+                // by avail_event (the RX completions otherwise ask for none), then look again.
+                let mut posted = false;
+                if self.event_idx.load(SeqCst) {
+                    let (event, mut index) = (q.next_avail.to_le_bytes(), [0; 2]);
+                    let mut transfers = vec![
+                        Transfer::Write {
+                            gpa: q.used + 4 + u64::from(q.size) * 8,
+                            bytes: &event,
+                        },
+                        Transfer::Read {
+                            gpa: q.avail + 2,
+                            bytes: &mut index,
+                        },
+                    ];
+                    if !self.copy(guest, id, &mut transfers, None)? {
+                        return Ok(Request::Canceled);
+                    }
+                    drop(transfers);
+                    posted = u16::from_le_bytes(index) != q.next_avail;
                 }
-                return Ok(Request::Empty);
+                return Ok(Request::Starved { packet, posted });
             }
             Err(e) => return Ok(Request::Invalid(e)),
         };

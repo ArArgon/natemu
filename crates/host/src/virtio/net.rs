@@ -7,11 +7,11 @@ use std::sync::{
 };
 use std::time::Instant;
 
-/// Feature bits offered (virtio 1.3 §5.1.3): MTU, MAC and STATUS; no offloads.
+/// Feature bits offered (virtio 1.3 §5.1.3): MTU, MAC and STATUS, and EVENT_IDX; no offloads.
 const F_MTU: u64 = 1 << 3;
 const F_MAC: u64 = 1 << 5;
 const F_STATUS: u64 = 1 << 16;
-pub(super) const FEATURES: u64 = VERSION_1 | F_MTU | F_MAC | F_STATUS;
+pub(super) const FEATURES: u64 = VERSION_1 | EVENT_IDX | F_MTU | F_MAC | F_STATUS;
 /// virtio_net_hdr for VERSION_1: flags, gso_type, hdr_len, gso_size, csum_start, csum_offset,
 /// num_buffers.
 const HEADER: usize = 12;
@@ -47,12 +47,14 @@ impl Packet {
         &self.bytes[..self.len]
     }
 }
+/// TX packets the device may queue for the backend; a full queue holds the device's TX.
+const TX_QUEUE: usize = 256;
+/// Received frames the device holds for the guest (the backend keeps the rest).
+pub(super) const RX_SLOTS: usize = 64;
 pub(super) struct Network {
     mac: [u8; 6],
-    /// One TX packet handed to the [`PacketPort`].
+    /// TX packets handed to the [`PacketPort`], in order.
     tx: SyncSender<Packet>,
-    /// The port's result for that packet.
-    done: Mutex<Receiver<Result<()>>>,
     /// The backend's doorbell ([`PacketPort::on_ready`]).
     ready: OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Received frames dropped for want of a guest buffer ([`PacketPort::lost`]).
@@ -68,28 +70,6 @@ impl Network {
         bytes[10..12].copy_from_slice(&MTU.to_le_bytes());
         bytes
     }
-    /// Wait for the port's result for the packet just sent. Reset waits for accepted sends;
-    /// cancellation or a 10 s timeout is process-fatal, not permission to replay.
-    fn wait(&self, device: &Virtio, cancel: &AtomicBool) -> Result<()> {
-        let start = Instant::now();
-        let done = self.done.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            match done.recv_timeout(Duration::from_millis(10)) {
-                Ok(result) => return result,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("network backend disconnected during transmit".into());
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            let s = device.lock();
-            if s.stopped || cancel.load(SeqCst) || start.elapsed() > Duration::from_secs(10) {
-                return Err("network transmit did not retire: VM worker must terminate".into());
-            }
-            if let Some(error) = &s.backend_error {
-                return Err(error.clone());
-            }
-        }
-    }
 }
 
 /// Owned-packet endpoint for an independently admitted backend. Service TX until `closed`, then
@@ -98,13 +78,13 @@ impl Network {
 pub struct PacketPort {
     device: Weak<Virtio>,
     tx: Receiver<Packet>,
-    done: SyncSender<Result<()>>,
     // An idle backend can still deliver a future packet; all-HLT is not VM completion.
     _arrival: Busy,
 }
 impl PacketPort {
-    /// An out-of-profile frame, full RX slot or unavailable queue drops this frame. Arrival schedules RX;
-    /// no second guest notification is required. Only plain Ethernet bytes, excluding FCS.
+    /// False (the frame is not taken) if it is out of profile, the RX queue is unavailable or
+    /// [`RX_SLOTS`] frames already wait. Arrival schedules RX; no second guest notification is
+    /// required. Only plain Ethernet bytes, excluding FCS.
     pub fn receive(&self, bytes: &[u8]) -> bool {
         let Ok(packet) = Packet::new(bytes) else {
             return false;
@@ -114,28 +94,27 @@ impl PacketPort {
         };
         let mut s = device.lock();
         let id = s.identity(0);
-        if !s.current(id) || !s.accepting(0) || s.queue_active(0) || s.received.is_some() {
+        if !s.current(id) || !s.accepting(0) || s.received.len() >= RX_SLOTS {
             return false;
         }
-        s.received = Some((id, packet));
-        s.notified[0] = true;
-        device.busy(&mut s);
-        device.wake.ring();
+        s.received.push_back((id, packet));
+        // An RX request in flight re-notifies itself while frames wait (`finish_request`).
+        if !s.notified[0] && !s.queue_active(0) && !s.rx_starved {
+            s.notified[0] = true;
+            device.busy(&mut s);
+            device.wake.ring();
+        }
         true
     }
-    /// Attempt exactly one queued send outside every VM lock and RAM window. The callback owns
-    /// no guest references. Return success for a transient packet drop, error for terminal loss.
-    /// No ambiguous send is retried. A reset waits until this callback's result is received.
+    /// Send the oldest queued TX packet, outside every VM lock and RAM window; false if none. The
+    /// guest already saw it complete (like a NIC that fetched it): return success for a transient
+    /// drop, error for terminal loss (it fails the device). Never retried.
     pub fn transmit(&self, send: impl FnOnce(&[u8]) -> Result<()>) -> Result<bool> {
         let packet = match self.tx.try_recv() {
             Ok(packet) => packet,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(false),
         };
-        let result = send(packet.bytes());
-        self.done
-            .try_send(result.clone())
-            .map_err(|_| "network transmit result disconnected or already occupied".to_string())?;
-        if let Err(error) = result {
+        if let Err(error) = send(packet.bytes()) {
             self.fail(error.clone());
             return Err(error);
         }
@@ -189,15 +168,13 @@ impl Virtio {
         if mac == [0; 6] || mac[0] & 1 != 0 {
             return Err("network MAC must be nonzero unicast".into());
         }
-        let (send, tx) = mpsc::sync_channel(1);
-        let (done, result) = mpsc::sync_channel(1);
+        let (send, tx) = mpsc::sync_channel(TX_QUEUE);
         let device = Self::new(
             irqs,
             gsi,
             Profile::Network(Network {
                 mac,
                 tx: send,
-                done: Mutex::new(result),
                 ready: OnceLock::new(),
                 lost: AtomicU64::new(0),
             }),
@@ -205,13 +182,12 @@ impl Virtio {
         let port = PacketPort {
             device: Arc::downgrade(&device),
             tx,
-            done,
             _arrival: device.irqs.busy(),
         };
         Ok((device, port))
     }
-    /// RX: deliver the reserved packet into the chain. TX: copy the frame out, hand it to the
-    /// backend and wait for its one result (never retried). Both then publish the used element.
+    /// RX: deliver the reserved packet into the chain. TX: copy the frame out and queue it for the
+    /// backend (waiting only while that queue is full). Both then publish the used element.
     pub(super) fn net_request(
         &self,
         guest: Guest<'_>,
@@ -253,10 +229,8 @@ impl Virtio {
                 Ok(p) => p,
                 Err(e) => return Ok(Request::Invalid(e)),
             };
-            match self.submit(network, chain.id, packet)? {
-                Some(true) => network.wait(self, cancel)?,
-                Some(false) => {}
-                None => return Ok(Request::Canceled),
+            if !self.submit(network, chain.id, packet, cancel)? {
+                return Ok(Request::Canceled);
             }
             0
         };
@@ -278,22 +252,41 @@ impl Virtio {
             }
         }
     }
-    /// Offer one TX packet to the backend while `id` is current: Some(true) if taken,
-    /// Some(false) if the one slot is full (bounded loss, never a retained retry), None if reset.
-    fn submit(&self, network: &Network, id: Identity, packet: Packet) -> Result<Option<bool>> {
-        let s = self.lock();
-        if !s.current(id) {
-            return Ok(None);
-        }
-        match network.tx.try_send(packet) {
-            Ok(()) => {
-                self.backend_ready();
-                Ok(Some(true))
+    /// Queue one TX packet for the backend while `id` is current: true once queued, false if a
+    /// reset or stop came first. A full queue waits for the backend (outside the lock); 10 s of
+    /// that is process-fatal.
+    fn submit(
+        &self,
+        network: &Network,
+        id: Identity,
+        mut packet: Packet,
+        cancel: &AtomicBool,
+    ) -> Result<bool> {
+        let start = Instant::now();
+        loop {
+            {
+                let s = self.lock();
+                if !s.current(id) || s.stopped || cancel.load(SeqCst) {
+                    return Ok(false);
+                }
+                if let Some(error) = &s.backend_error {
+                    return Err(error.clone());
+                }
+                match network.tx.try_send(packet) {
+                    Ok(()) => {
+                        self.backend_ready();
+                        return Ok(true);
+                    }
+                    Err(TrySendError::Full(p)) => packet = p,
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Err("network transmit endpoint disconnected".into());
+                    }
+                }
             }
-            Err(TrySendError::Full(_)) => Ok(Some(false)),
-            Err(TrySendError::Disconnected(_)) => {
-                Err("network transmit endpoint disconnected".into())
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err("network transmit queue stalled: VM worker must terminate".into());
             }
+            std::thread::sleep(Duration::from_micros(50));
         }
     }
 }
@@ -397,15 +390,18 @@ mod tests {
         assert!(!d.lock().pending());
         assert!(p.receive(&frame()));
         assert_eq!(d.lock().notified, [true, false]);
-        assert!(!p.receive(&frame())); // one RX slot
-        let old = d.lock().received.as_ref().unwrap().0;
+        for _ in 1..RX_SLOTS {
+            assert!(p.receive(&frame()));
+        }
+        assert!(!p.receive(&frame()), "RX_SLOTS frames wait at most");
+        let old = d.lock().received.front().unwrap().0;
         write(&d, reg::QUEUE_SEL, 0);
         write(&d, reg::QUEUE_READY, 0);
-        assert!(d.lock().received.is_none());
+        assert!(d.lock().received.is_empty());
         write(&d, reg::QUEUE_READY, 1);
         assert!(!d.current(old));
         assert!(p.receive(&frame()));
-        assert_ne!(d.lock().received.as_ref().unwrap().0, old);
+        assert_ne!(d.lock().received.front().unwrap().0, old);
         d.stop();
     }
     #[test]
@@ -452,34 +448,121 @@ mod tests {
         d.stop();
     }
     #[test]
-    fn transmit_handoff_is_bounded_and_callback_result_retires_once() {
+    fn transmit_queue_is_bounded_ordered_and_a_send_error_fails_the_device() {
         let (d, p) = device();
         let Profile::Network(n) = &d.profile else {
             unreachable!()
         };
-        assert!(n.tx.try_send(Packet::new(&frame()).unwrap()).is_ok());
+        for i in 0..TX_QUEUE {
+            let mut bytes = frame();
+            bytes[0] = i as u8;
+            assert!(n.tx.try_send(Packet::new(&bytes).unwrap()).is_ok());
+        }
         assert!(matches!(
             n.tx.try_send(Packet::new(&frame()).unwrap()),
             Err(TrySendError::Full(_))
         ));
-        let mut calls = 0;
-        assert!(
-            p.transmit(|bytes| {
-                calls += 1;
-                assert_eq!(bytes, frame());
+        let mut seen = Vec::new();
+        while p
+            .transmit(|bytes| {
+                seen.push(bytes[0]);
                 Ok(())
             })
             .unwrap()
+        {}
+        assert_eq!(
+            seen,
+            (0..TX_QUEUE).map(|i| i as u8).collect::<Vec<_>>(),
+            "each once, in order"
         );
-        n.wait(&d, &AtomicBool::new(false)).unwrap();
+        // A full queue makes the submitter wait; a stop releases it without queueing.
+        let tx = d.lock().identity(1);
+        for _ in 0..TX_QUEUE {
+            assert!(
+                d.submit(
+                    n,
+                    tx,
+                    Packet::new(&frame()).unwrap(),
+                    &AtomicBool::new(false)
+                )
+                .unwrap()
+            );
+        }
         assert!(
-            !p.transmit(|_| {
-                calls += 1;
-                Ok(())
-            })
+            !d.submit(
+                n,
+                tx,
+                Packet::new(&frame()).unwrap(),
+                &AtomicBool::new(true)
+            )
             .unwrap()
         );
-        assert_eq!(calls, 1);
+        assert!(p.transmit(|_| Err("lost interface".into())).is_err());
+        assert!(d.lock().backend_error.is_some());
+        d.stop();
+    }
+    #[test]
+    fn event_idx_interrupts_only_when_the_used_index_passes_used_event() {
+        let q = Queue {
+            next_used: 10,
+            ..Queue::default()
+        };
+        let wanted = |used_event: u16, count: u16| {
+            let mut used = Used::new(q, (0..count).map(|h| (h, 0))).with_events(0);
+            used.event.as_mut().unwrap().1 = used_event.to_le_bytes();
+            used.interrupt_wanted()
+        };
+        assert!(wanted(10, 1), "the driver waits for slot 10");
+        assert!(!wanted(11, 1), "not yet");
+        assert!(wanted(12, 3), "slots 10..13 cross 12");
+        assert!(!wanted(9, 1), "already passed: the driver is polling");
+        let wrap = Queue {
+            next_used: 0xffff,
+            ..Queue::default()
+        };
+        let mut used = Used::new(wrap, [(0, 0), (1, 0)]).with_events(0);
+        used.event.as_mut().unwrap().1 = 0u16.to_le_bytes();
+        assert!(used.interrupt_wanted(), "across the index wrap");
+    }
+    #[test]
+    fn a_notification_during_a_starved_rx_request_is_not_lost() {
+        let (d, p) = device();
+        assert!(p.receive(&frame()));
+        let q = d.lock().queues[0];
+        let starve = |kick: bool| {
+            let Some(Work::Request { id, received, .. }) = d.admit(&mut d.lock()) else {
+                panic!("RX admitted")
+            };
+            if kick {
+                write(&d, reg::QUEUE_NOTIFY, 0); // the driver adds a buffer meanwhile
+            }
+            let packet = received.unwrap();
+            d.finish_request(
+                Ok(Request::Starved {
+                    packet,
+                    posted: false,
+                }),
+                &mut Snapshot::new(256),
+                q,
+                id,
+            )
+            .unwrap();
+        };
+        starve(true);
+        {
+            let s = d.lock();
+            assert!(!s.rx_starved && s.notified[0], "retried at once");
+            assert_eq!(s.received.len(), 1, "the frame is kept");
+        }
+        starve(false);
+        assert!(
+            d.lock().rx_starved && !d.lock().notified[0],
+            "held until notified"
+        );
+        assert!(p.receive(&frame()));
+        assert!(!d.lock().notified[0], "arrivals wait too");
+        write(&d, reg::QUEUE_NOTIFY, 0);
+        assert!(!d.lock().rx_starved && d.lock().notified[0]);
         d.stop();
     }
     #[test]
@@ -495,10 +578,16 @@ mod tests {
         };
         let tx = d.lock().identity(1);
         let packet = || Packet::new(&frame()).unwrap();
-        assert_eq!(d.submit(n, tx, packet()).unwrap(), Some(true));
+        let go = AtomicBool::new(false);
+        assert!(d.submit(n, tx, packet(), &go).unwrap());
         assert_eq!(rings.load(SeqCst), 1, "a queued TX packet");
-        assert_eq!(d.submit(n, tx, packet()).unwrap(), Some(false));
-        assert_eq!(rings.load(SeqCst), 1, "a dropped one rings nothing");
+        d.lock().generations[1] += 1;
+        assert!(!d.submit(n, tx, packet(), &go).unwrap());
+        assert_eq!(
+            rings.load(SeqCst),
+            1,
+            "a reset one is not queued and rings nothing"
+        );
         let rx = d.lock().identity(0);
         let q = d.lock().queues[0];
         d.lock().in_flight.push(rx);
