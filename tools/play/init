@@ -2,12 +2,12 @@
 # play initramfs /init: mount the pseudo filesystems, set the hostname, bring up the virtio devices, then hand PID 1 to
 # busybox init (/etc/inittab, written here for the console): it keeps a login bash on the serial console (restarted if
 # it exits), reaps orphans, and runs /etc/init.d/rcK (sync, unmount the disk) on poweroff/reboot.
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C TERM=vt100
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 TERM=xterm-256color
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mkdir -p /dev/pts /dev/shm
-mount -t devpts devpts /dev/pts
+mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666
 mount -t tmpfs tmp /tmp
 mount -t tmpfs run /run
 chmod 1777 /tmp
@@ -30,7 +30,10 @@ if [ -b /dev/vda ]; then
     fi
 fi
 tty=ttyS0
-for a in $(cat /proc/cmdline); do case $a in console=*) tty=${a#console=}; tty=${tty%%,*};; esac; done
+# console= picks the shell's tty; term= overrides TERM (the kernel's own default for init is "linux").
+for a in $(cat /proc/cmdline); do
+    case $a in console=*) tty=${a#console=}; tty=${tty%%,*};; term=*) TERM=${a#term=};; esac
+done
 [ -c /dev/$tty ] || tty=console
 cat > /etc/inittab <<EOF
 $tty::respawn:-/bin/bash

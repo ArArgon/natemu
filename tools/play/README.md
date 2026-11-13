@@ -2,7 +2,7 @@
 
 A minimal Debian 13 (trixie) initramfs for using the emulated machine interactively over the serial console: bash with
 job control, coreutils, procps, util-linux, iproute2, less, vi (vim-tiny), python3, gcc and libc6-dev, make, binutils,
-file, htop, curl (with CA certificates), e2fsprogs, kmod, busybox. 297 MB unpacked, 80 MB compressed (zstd), needs about
+file, htop, curl (with CA certificates), e2fsprogs, kmod, tmux, script (bsdutils), busybox. 297 MB unpacked, 80 MB compressed (zstd), needs about
 1 GiB of guest RAM unpacked; boot with `-m 2048`. Kernel: Debian 6.12.107-1 (the one natemu boots).
 
 It runs from RAM; virtio devices are optional. The image carries the kernel's own virtio_mmio, virtio_net,
@@ -46,8 +46,9 @@ target/release/natemu --fexc "$FEXC" --kernel $P/bzImage --initrd $P/play.cpio.z
 (`target/aarch64-unknown-none/release/natemu-runtime`). `target/release/natemu --help` lists every option.
 `--serial-stdin` makes the terminal the guest's console (raw mode; Ctrl-C goes to the guest; Ctrl-A x quits natemu,
 Ctrl-A Ctrl-A sends Ctrl-A). The first boot compiles everything (a few seconds); later boots reuse the compile cache
-(`--compile-cache off` disables it). Terminal size is not passed on: run `stty rows R cols C` for full-screen
-programs.
+(`--compile-cache off` disables it). TERM is `xterm-256color` (`term=NAME` on the kernel command line overrides it).
+A serial line carries no window size, so the login shell asks the terminal for it (a cursor-position query) and sets
+it; run `resize` after resizing the window. `tmux` gives more shells, on pseudo-terminals, over the one console.
 
 The stub's command line is named since November 5 (clap). Scripts kept as evidence in natemu-raw use the older
 positional form, `natemu RUNTIME FEXC BZIMAGE [OPTIONS]`, which the stub no longer accepts: run them against a stub built

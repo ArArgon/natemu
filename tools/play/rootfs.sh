@@ -24,10 +24,11 @@ export APT_CONFIG=$B/apt/apt.conf
 apt-get update -qq
 # Requested packages (the closure is whatever they Depend on). busybox-static supplies poweroff/reboot/halt (-f), the
 # DHCP client (udhcpc) and fallback applets; nano is not included (vim-tiny is the editor). kmod loads the virtio
-# drivers, curl and ca-certificates use the network, e2fsprogs formats and checks a virtio disk.
+# drivers, curl and ca-certificates use the network, e2fsprogs formats and checks a virtio disk; tmux and script
+# (bsdutils) give pseudo-terminals; libc-bin carries the C.UTF-8 locale tmux needs.
 PKGS="bash dash coreutils procps util-linux iproute2 less vim-tiny python3-minimal gcc libc6-dev binutils make file htop
       busybox-static grep sed findutils tar gzip diffutils hostname mawk ncurses-base ncurses-bin base-files base-passwd
-      kmod curl ca-certificates e2fsprogs"
+      kmod curl ca-certificates e2fsprogs tmux bsdutils libc-bin"
 apt-get -y -qq -d install --no-install-recommends $PKGS
 ( cd apt/cache/archives && for d in *.deb; do echo "$(dpkg-deb -f "$d" Package)=$(dpkg-deb -f "$d" Version)"; done | sort > "$B/out/packages.txt"
   sha256sum *.deb > "$B/out/debs.sha256" )
@@ -112,10 +113,26 @@ printf '/bin/bash\n/bin/sh\n/bin/dash\n' > etc/shells
 printf 'NAME="Debian GNU/Linux"\nVERSION_ID="13"\nID=debian\nPRETTY_NAME="Debian GNU/Linux 13 (trixie), natemu play initramfs"\n' > etc/os-release
 cat > etc/profile <<'EOP'
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root LANG=C TERM=${TERM:-vt100}
+export HOME=/root LANG=C.UTF-8 TERM=${TERM:-xterm-256color}
 PS1='\u@\h:\w\$ '
 alias ls='ls --color=auto' ll='ls -l'
+# A serial console carries no window size: ask the terminal (move the cursor far down-right, read back its position;
+# the host terminal answers through natemu's --serial-stdin). Run `resize` again after resizing the window.
+resize() {
+    [ -t 0 ] && [ -z "$TMUX" ] || return 0
+    local saved r c
+    saved=$(stty -g)
+    stty raw -echo
+    printf '\0337\033[999;999H\033[6n\0338' > /dev/tty
+    IFS='[;' read -r -s -t 1 -d R _ r c < /dev/tty
+    stty "$saved"
+    [ "${r:-0}" -gt 0 ] 2>/dev/null && [ "${c:-0}" -gt 0 ] && stty rows "$r" cols "$c"
+}
+case $(tty) in /dev/ttyS*|/dev/console) resize;; esac
 EOP
+# tmux: several shells on pseudo-terminals over the one serial console (it needs the UTF-8 locale: C.UTF-8, glibc's).
+[ -d usr/lib/locale/C.utf8 ] || { echo "C.UTF-8 locale missing" >&2; exit 1; }
+printf 'set -g default-terminal tmux-256color\nset -g escape-time 10\n' > etc/tmux.conf
 cat > root/.bash_profile <<'EOP'
 . /etc/profile
 . ~/.bashrc
@@ -130,6 +147,7 @@ cat > etc/motd <<'EOP'
   bash, coreutils, procps, util-linux, iproute2, less, vi, python3, gcc, make, file, htop, curl, e2fsprogs.
   Network (natemu --net): eth0 by DHCP.  Disk (natemu --disk FILE): /dev/vda, mounted on /mnt/disk if ext4
   (a new one: mkfs.ext4 /dev/vda && mount /dev/vda /mnt/disk).
+  More shells: tmux.  After resizing the terminal window: resize.
   Leave with: poweroff      Restart with: reboot      (both unmount /mnt/disk first; exit restarts the shell)
 
 EOP
