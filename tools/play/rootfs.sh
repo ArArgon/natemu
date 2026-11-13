@@ -25,10 +25,11 @@ apt-get update -qq
 # Requested packages (the closure is whatever they Depend on). busybox-static supplies poweroff/reboot/halt (-f), the
 # DHCP client (udhcpc) and fallback applets; nano is not included (vim-tiny is the editor). kmod loads the virtio
 # drivers, curl and ca-certificates use the network, e2fsprogs formats and checks a virtio disk; tmux and script
-# (bsdutils) give pseudo-terminals; libc-bin carries the C.UTF-8 locale tmux needs.
+# (bsdutils) give pseudo-terminals; libc-bin carries the C.UTF-8 locale tmux needs; mount is util-linux's (busybox's
+# probes every filesystem type on a mounted disk, one kernel "Can't open blockdev" each).
 PKGS="bash dash coreutils procps util-linux iproute2 less vim-tiny python3-minimal gcc libc6-dev binutils make file htop
       busybox-static grep sed findutils tar gzip diffutils hostname mawk ncurses-base ncurses-bin base-files base-passwd
-      kmod curl ca-certificates e2fsprogs tmux bsdutils libc-bin"
+      kmod curl ca-certificates e2fsprogs tmux bsdutils libc-bin mount"
 apt-get -y -qq -d install --no-install-recommends $PKGS
 ( cd apt/cache/archives && for d in *.deb; do echo "$(dpkg-deb -f "$d" Package)=$(dpkg-deb -f "$d" Version)"; done | sort > "$B/out/packages.txt"
   sha256sum *.deb > "$B/out/debs.sha256" )
@@ -101,9 +102,10 @@ mkdir -p etc/init.d
 cat > etc/init.d/rcK <<'EOS'
 #!/bin/sh
 sync
-if grep -q ' /mnt/disk ' /proc/mounts; then
-    umount /mnt/disk 2>/dev/null || mount -o remount,ro /mnt/disk 2>/dev/null
-fi
+# Every mount of it (mounting a mounted disk again stacks a second one), or read-only if busy.
+while grep -q ' /mnt/disk ' /proc/mounts; do
+    umount /mnt/disk 2>/dev/null || { mount -o remount,ro /mnt/disk 2>/dev/null; break; }
+done
 sync
 EOS
 chmod 755 etc/init.d/rcK
