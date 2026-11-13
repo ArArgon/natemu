@@ -1631,10 +1631,12 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     };
     let (io_net, packet_port) = if args.io_net {
         let resource = natemu::virtio::NET_RESOURCE;
+        // The frontend fixtures' echo endpoint takes plain frames: no offloads.
         let (net, port) = natemu::virtio::Virtio::network(
             irqs.clone(),
             resource.gsi as usize,
             [2, 0, 0, 0, 0, 1],
+            natemu::virtio::Offloads::default(),
         )?;
         registry.register(resource.base.into(), 4096, net.device())?;
         (Some(net), Some(port))
