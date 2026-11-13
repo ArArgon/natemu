@@ -219,7 +219,14 @@ guest was idle 93% of an upload, waiting on one synchronous packet at a time).
 
 Known gaps: with 32-100 parallel guest uploads slirp's TCP (Reno, no SACK) loses
 segments internally (measured before the pipelining: 2-4% fast retransmits). Idle ping
-to the gateway averages 4-5 ms. A UDP flood toward the guest beyond what it takes is
+to the gateway averages 1.1 ms at 1 s intervals, 2.1 ms at 0.2 s (1 vCPU; outliers to
+5-20 ms), 0.19 ms with the guest busy; QEMU x86 TCG with libslirp on the same image
+1.8/2.6 ms, a native VZ guest 0.5 ms (the platform's idle-wake floor). About half is
+host: the kick, the owner thread, the backend thread and back are three thread wakes on
+cold cores (~130 us each to wake, every step 2-3x slower than on a warm core; the
+user-interactive QoS class for both threads made no difference); the other half is the
+guest's own send/receive path. Fusing the owner and backend hops is the lever if idle
+latency matters (natemu-raw/ping-20261113-01). A UDP flood toward the guest beyond what it takes is
 dropped at the backend's 4096-frame queue. Every RX frame and TX packet is still its
 own request (one capture, copy and publication each).
 
