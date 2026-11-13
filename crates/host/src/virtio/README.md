@@ -237,14 +237,19 @@ declares (`Offloads`), with the spec's dependencies enforced at FEATURES_OK:
   64 KiB with their segmentation; with MRG_RXBUF one frame spreads over as many chains as it
   needs (num_buffers counts them, one used element each); too few posted holds it, like an
   empty ring. A large frame the guest did not accept is dropped (`lost`).
-libslirp declares the checksum offloads only; segmentation awaits a backend that takes
-large frames (vmnet's TSO and virtio-header modes). Frames exclude
+A received segmentation frame must carry a partial checksum (§5.1.6.4.1), and one larger than
+every posted slot together is dropped rather than held. libslirp declares the checksum
+offloads only; segmentation awaits a backend that takes large frames (vmnet's TSO and
+virtio-header modes). Before one lands: it cannot yet learn which segmentation the guest
+accepted (frames it may not take are dropped), guest gso_size and hdr_len are untrusted,
+and ECN is not offered (no CWR frames). With segmentation, storage is bounded by 256 queued
+TX and 64 held RX frames of up to 64 KiB (~21 MiB). Frames exclude
 FCS and are at most 1518 bytes including one VLAN tag (64 KiB + 18 with segmentation). Up to
 256 queued TX packets and 64 held RX frames bound storage; headers are the modern 12-byte form even without merged
 buffers. Descriptor boundaries may split headers or payloads. RX writes one
-chain with num_buffers=1; TX used length is zero. Unknown TX flag bits and inactive
+chain with num_buffers=1 (more with MRG_RXBUF); TX used length is zero; TX num_buffers is ignored (Linux leaves it stale without MRG_RXBUF). Unknown TX flag bits and inactive
 checksum/header hints are ignored; unnegotiated offload requests (NEEDS_CSUM without CSUM,
-any GSO type, DATA_VALID on TX) fail the device.
+GSO without its HOST_TSO, NEEDS_CSUM or a nonzero gso_size, ECN or UDP GSO, DATA_VALID on TX) fail the device.
 
 Queue-only disable cancels only the matching operation and preserves other-queue
 indices, notifications and shared pending IRQs. Full reset invalidates both queue

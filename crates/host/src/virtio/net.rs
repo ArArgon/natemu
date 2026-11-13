@@ -89,7 +89,9 @@ pub(super) fn dependencies_met(accepted: u64) -> bool {
 }
 
 /// TCP segmentation offload of one frame: the protocol, the payload bytes per segment (MSS) and
-/// the driver's header-length hint.
+/// the driver's header-length hint. From a guest (TX) both are untrusted: `size` is only nonzero
+/// and `header` only a hint (virtio 1.3 §5.1.6.2.2); a backend must bound its work by them.
+/// No ECN: GUEST_ECN/HOST_ECN are not offered, so a backend must not deliver CWR frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gso {
     pub ipv6: bool,
@@ -170,7 +172,7 @@ impl Buffers {
         let spare = (len <= POOLED)
             .then(|| self.0.lock().unwrap_or_else(|e| e.into_inner()).pop())
             .flatten();
-        let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(len.max(MAX_FRAME)));
+        let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(len.max(POOLED)));
         buffer.clear();
         buffer
     }
@@ -254,8 +256,9 @@ impl PacketPort {
         let Profile::Network(network) = &device.profile else {
             return false;
         };
-        let accepted = device.accepted.load(SeqCst);
         let mut s = device.lock();
+        // Under the lock: a reset and renegotiation cannot slip between the check and the tag.
+        let accepted = device.accepted.load(SeqCst);
         let id = s.identity(0);
         let before = frames.len();
         let mut taken = false;
@@ -468,6 +471,11 @@ impl Virtio {
             };
             let (head, descriptors) = match snapshot.chain(next) {
                 Ok(Some(c)) => c,
+                // Every slot holds one of these chains and the frame still does not fit: it never will.
+                Ok(None) if 1 + more.len() >= usize::from(q.size) => {
+                    network.lost.fetch_add(1, SeqCst);
+                    return Ok(Request::Empty);
+                }
                 Ok(None) => {
                     return Ok(
                         match self.ask_for_buffer(guest, q, chain.id, next.next_avail)? {
@@ -496,6 +504,10 @@ impl Virtio {
         let chains = std::iter::once((chain.head, chain.descriptors))
             .chain(more.iter().map(|(head, d)| (*head, d.as_slice())));
         let (writes, used) = scatter_chains(chains, 1 + more.len(), [&header, packet.bytes()]);
+        // Tiny buffers could need more spans than one copy takes: a driver fault, not the VM's.
+        if writes.len() + 4 > MAX_SPANS {
+            return Ok(Request::Invalid("network RX buffers too fragmented".into()));
+        }
         let published = self.complete_chains(guest, chain.id, q, &used, writes)?;
         network.buffers.give(packet.bytes);
         Ok(match published {
@@ -584,7 +596,8 @@ fn transmit_packet(bytes: Vec<u8>, accepted: u64) -> Result<Packet> {
     } else {
         0
     };
-    if flags & OFFLOAD_FLAGS & !allowed != 0 || bytes[NUM_BUFFERS] != [0, 0] {
+    // num_buffers is ignored: Linux zeroes it only with MRG_RXBUF (stale headroom otherwise).
+    if flags & OFFLOAD_FLAGS & !allowed != 0 {
         return Err("unnegotiated network TX offload/header".into());
     }
     let gso = match gso_type {
@@ -639,7 +652,9 @@ fn received_packet(frame: Frame, accepted: u64, offloads: Offloads) -> Option<Pa
         None => MAX_FRAME,
         Some(g) => {
             let feature = if g.ipv6 { F_GUEST_TSO6 } else { F_GUEST_TSO4 };
-            if !offloads.rx_segmentation || accepted & feature == 0 || g.size == 0 {
+            // A segmentation frame carries NEEDS_CSUM (virtio 1.3 §5.1.6.4.1).
+            let partial = matches!(meta.checksum, RxChecksum::Partial { .. });
+            if !offloads.rx_segmentation || accepted & feature == 0 || g.size == 0 || !partial {
                 return None;
             }
             MAX_LARGE_FRAME
@@ -890,6 +905,70 @@ mod tests {
         assert!(transmit_packet(valid.to_vec(), F_CSUM).is_err());
     }
     #[test]
+    fn segmentation_headers_are_checked_against_what_was_accepted() {
+        let (frame, _) = partial_tcp(b"x");
+        let tx = |flags: u8, gso: u8, size: u16, len: usize, accepted: u64| {
+            let mut h = vec![0u8; HEADER];
+            h[0] = flags;
+            h[1] = gso;
+            h[GSO_SIZE].copy_from_slice(&size.to_le_bytes());
+            h[CSUM_START].copy_from_slice(&34u16.to_le_bytes());
+            h[CSUM_OFFSET].copy_from_slice(&16u16.to_le_bytes());
+            let mut f = frame.clone();
+            f.resize(len, 0);
+            transmit_packet([h, f].concat(), accepted)
+        };
+        let tso4 = F_CSUM | F_HOST_TSO4;
+        assert!(tx(NEEDS_CSUM, GSO_TCPV4, 1448, 9000, tso4).is_ok());
+        assert!(tx(0, GSO_TCPV4, 1448, 9000, tso4).is_err(), "no NEEDS_CSUM");
+        assert!(
+            tx(NEEDS_CSUM, GSO_TCPV4, 0, 9000, tso4).is_err(),
+            "gso_size 0"
+        );
+        assert!(
+            tx(NEEDS_CSUM, GSO_TCPV6, 1448, 9000, tso4).is_err(),
+            "TSO6 not accepted"
+        );
+        assert!(
+            tx(NEEDS_CSUM, GSO_TCPV4 | 0x80, 1448, 9000, tso4).is_err(),
+            "ECN"
+        );
+        assert!(tx(NEEDS_CSUM, 3, 1448, 9000, tso4).is_err(), "UDP");
+        assert!(
+            tx(NEEDS_CSUM, 0, 0, MAX_FRAME + 1, tso4).is_err(),
+            "big without GSO"
+        );
+        assert!(tx(NEEDS_CSUM, GSO_TCPV4, 1448, MAX_LARGE_FRAME, tso4).is_ok());
+        assert!(tx(NEEDS_CSUM, GSO_TCPV4, 1448, MAX_LARGE_FRAME + 1, tso4).is_err());
+    }
+    #[test]
+    fn a_received_segmentation_frame_needs_a_partial_checksum() {
+        let all = Offloads {
+            tx_checksum: true,
+            rx_checksum: true,
+            tx_segmentation: true,
+            rx_segmentation: true,
+        };
+        let accepted = F_GUEST_CSUM | F_GUEST_TSO4 | F_MRG_RXBUF;
+        let gso = Some(Gso {
+            ipv6: false,
+            size: 1448,
+            header: 54,
+        });
+        let frame = |checksum| Frame {
+            bytes: vec![0; 9000],
+            meta: RxMeta { checksum, gso },
+        };
+        let partial = RxChecksum::Partial {
+            start: 34,
+            offset: 16,
+        };
+        assert!(received_packet(frame(partial), accepted, all).is_some());
+        assert!(received_packet(frame(RxChecksum::Valid), accepted, all).is_none());
+        assert!(received_packet(frame(RxChecksum::Unknown), accepted, all).is_none());
+        assert!(received_packet(frame(partial), accepted & !F_GUEST_TSO4, all).is_none());
+    }
+    #[test]
     fn offered_features_follow_the_backend() {
         let rng = super::super::tests::device();
         for (offloads, extra) in [
@@ -928,11 +1007,15 @@ mod tests {
         bytes[0] = 0xf8;
         bytes[2..10].fill(0xff);
         assert_eq!(transmit_packet(bytes.to_vec(), 0).unwrap().bytes(), frame());
-        for at in [0, 1, 10, 11] {
+        for at in [0, 1] {
             let mut bad = bytes.clone();
             bad[at] = 1;
             assert!(transmit_packet(bad.to_vec(), 0).is_err());
         }
+        // num_buffers on TX is stale headroom unless MRG_RXBUF: ignored.
+        let mut stale = bytes.clone();
+        stale[10..12].copy_from_slice(&[0x5a, 0xa5]);
+        assert!(transmit_packet(stale, 0).is_ok());
         assert!(Packet::new(&[0; 13]).is_err());
         assert!(Packet::new(&[0; MAX_FRAME + 1]).is_err());
         assert_eq!(
@@ -1261,12 +1344,15 @@ mod tests {
         impl Rig {
             /// Negotiate `features` (FEATURES_OK must hold if `ok`), lay out both queues.
             fn new(features: u64) -> Option<Self> {
+                Self::with(features, OFFLOADS)
+            }
+            fn with(features: u64, offloads: Offloads) -> Option<Self> {
                 let irqs = super::super::super::tests::device().irqs.clone();
                 let (d, p) = Virtio::network(
                     irqs,
                     NET_RESOURCE.gsi as usize,
                     [2, 0, 0, 0, 0, 1],
-                    OFFLOADS,
+                    offloads,
                 )
                 .unwrap();
                 let w = |o, v| assert!(matches!(d.access(0, o, 4, Some(v)), Access::Completed(0)));
@@ -1515,7 +1601,10 @@ mod tests {
                     Frame {
                         bytes: pattern(6000, 3),
                         meta: RxMeta {
-                            checksum: RxChecksum::Valid,
+                            checksum: RxChecksum::Partial {
+                                start: 34,
+                                offset: 16,
+                            },
                             gso: Some(TSO),
                         },
                     },
@@ -1533,6 +1622,102 @@ mod tests {
                 assert_eq!(rig.element(0, 0), (0, (HEADER + 100) as u32));
                 assert_eq!(rig.p.lost(), 1, "the large one");
                 assert_eq!(rig.get(RX_BUFFERS, 1)[0], DATA_VALID);
+            });
+        }
+        #[test]
+        fn with_event_idx_a_short_ring_asks_for_the_first_missing_buffer() {
+            let rig = Rig::new(ALL | EVENT_IDX).unwrap();
+            let avail_event = RINGS[0][2] + 4 + u64::from(SIZE) * 8;
+            rig.run(|rig| {
+                rig.post_rx(0);
+                let mut one = VecDeque::from([Frame {
+                    bytes: pattern(6000, 5),
+                    meta: RxMeta {
+                        checksum: RxChecksum::Partial {
+                            start: 34,
+                            offset: 16,
+                        },
+                        gso: Some(TSO),
+                    },
+                }]);
+                assert!(rig.p.receive_from(&mut one));
+                until("starved", || rig.d.lock().rx_starved);
+                assert_eq!(
+                    rig.word(avail_event).load(SeqCst),
+                    1,
+                    "notify when slot 1 is added"
+                );
+                assert_eq!(rig.used(0), 0);
+                for i in 1..4 {
+                    rig.post_rx(i);
+                }
+                rig.kick(0);
+                until("four buffers used", || rig.used(0) == 4);
+                assert_eq!(rig.p.lost(), 0);
+            });
+        }
+        #[test]
+        fn a_frame_larger_than_the_whole_ring_is_dropped_not_held() {
+            let rig = Rig::new(ALL).unwrap();
+            rig.run(|rig| {
+                for i in 0..u64::from(SIZE) {
+                    rig.post_rx(i);
+                }
+                // 32 buffers of 1536 hold 49152 bytes: 60000 never fit.
+                let mut frames = VecDeque::from([
+                    Frame {
+                        bytes: pattern(60_000, 6),
+                        meta: RxMeta {
+                            checksum: RxChecksum::Partial {
+                                start: 34,
+                                offset: 16,
+                            },
+                            gso: Some(TSO),
+                        },
+                    },
+                    Frame {
+                        bytes: pattern(100, 7),
+                        meta: RxMeta::default(),
+                    },
+                ]);
+                assert!(rig.p.receive_from(&mut frames));
+                until("the small frame", || rig.used(0) == 1);
+                assert_eq!(rig.p.lost(), 1);
+                assert!(!rig.d.lock().rx_starved);
+            });
+        }
+        #[test]
+        fn a_plain_backend_gets_the_checksum_completed() {
+            let offloads = Offloads {
+                tx_checksum: true,
+                rx_checksum: true,
+                ..Offloads::default()
+            };
+            let rig = Rig::with(VERSION_1 | F_CSUM | F_GUEST_CSUM, offloads).unwrap();
+            let (frame, full) = super::partial_tcp(b"natemu payload");
+            let mut header = [0u8; HEADER];
+            header[0] = NEEDS_CSUM;
+            header[CSUM_START].copy_from_slice(&34u16.to_le_bytes());
+            header[CSUM_OFFSET].copy_from_slice(&16u16.to_le_bytes());
+            rig.put(TX_BUFFERS, &[&header[..], &frame].concat());
+            rig.run(|rig| {
+                rig.post(1, &[(TX_BUFFERS, (HEADER + frame.len()) as u32)]);
+                rig.kick(1);
+                until("TX used", || rig.used(1) == 1);
+                let mut seen = None;
+                assert!(
+                    rig.p
+                        .transmit(|bytes, meta| {
+                            seen = Some((u16::from_be_bytes([bytes[50], bytes[51]]), *meta));
+                            Ok(())
+                        })
+                        .unwrap()
+                );
+                assert_eq!(
+                    seen,
+                    Some((full, TxMeta::default())),
+                    "finished, no metadata"
+                );
             });
         }
         #[test]
