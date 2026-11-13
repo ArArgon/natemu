@@ -385,6 +385,9 @@ def run(args):
             write_json(case / 'result.json', result); results.append(result); write_json(args.out / 'results.json', results)
             print(json.dumps({'phase': phase, 'passed': not errors, 'seconds': result['seconds'], 'errors': errors}), flush=True)
             if errors: return 1
+        # Both phases passed and the image's hashes and fsck are recorded: the ~1.3 GB per-run copy
+        # is no longer evidence (a failing run keeps it for diagnosis).
+        image.unlink()
     return 0
 
 
