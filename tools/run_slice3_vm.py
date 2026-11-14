@@ -140,6 +140,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
 sys.path.insert(0, str(ROOT / 'tools' / 'bench' / 'smp'))
 import ref, run_slice1_vm as vm, run_slice1_faults as faults, smp, model_smp, programs  # noqa: E402
+import qemucache  # noqa: E402
+qemucache.install(smp)      # reference runs of an unchanged image are served from disk (tools/qemucache.py); k1 and pic import this too
 
 
 def driver(host, runtime, fexc, text, work, extra=(), timeout=None, env=None):
@@ -1427,7 +1429,7 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
             print(f"{name}: {'ok' if all(r['ok'] for r in entry['runs']) else 'FAIL'} (deviation: {want_fault})", flush=True)
             report.append(entry)
             continue
-        want, rc = qemu(prog, name, timeout=30 if name in QEMU_DIFFERS else 120)
+        want, rc = qemu(prog, name, timeout=30 if name in QEMU_DIFFERS else 120, hang_ok=name in QEMU_DIFFERS)
         if want is None and not (model and name in QEMU_DIFFERS): failures.append(f'{name}: QEMU run failed ({rc})'); continue
         # A listed case QEMU does not finish (it takes another path) is judged by segment_model alone.
         want = want or {'cpus': [{'fault': f'QEMU: {rc}'}], 'memory': []}
@@ -1494,8 +1496,8 @@ def cmd_system(a, host, runtime):
     stub = smp.build_stub(a.out / 'qemu-build')
     report, failures, gaps = [], [], []
 
-    def qemu(prog, label, timeout=120):
-        rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=timeout)
+    def qemu(prog, label, timeout=120, hang_ok=False):      # hang_ok: a timeout is an expected answer (remembered)
+        rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=timeout, hang_ok=hang_ok)
         return (smp.parse_dump(prog, dump) if rc == 1 else None), rc
     for prog in programs:
         name, fault_at = prog['name'], prog['params'].get('fault_at')
@@ -1518,7 +1520,7 @@ def cmd_system(a, host, runtime):
             vector = sfm.fault(code, want['cpus'][0]['gpr'], c.get('cpl', 3), ctl['cr0'], ctl['cr4'], ctl['efer'], ctl['dr7'])
             if vector is None: failures.append(f'{name}: the model expects no fault'); continue
             want['cpus'][0]['fault'] = (*vector, at, 0)
-            full, rc = qemu(prog, name, timeout=10)
+            full, rc = qemu(prog, name, timeout=10, hang_ok=True)
             entry['qemu'] = 'hang' if rc == 'timeout' else (full and full['cpus'][0]['fault'] and list(full['cpus'][0]['fault'])) or 'no fault'
             # Where QEMU does raise an exception, it is the model's.
             if isinstance(entry['qemu'], list) and tuple(entry['qemu']) != want['cpus'][0]['fault']:
