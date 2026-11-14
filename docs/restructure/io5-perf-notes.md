@@ -372,6 +372,11 @@ Rules learned in this round:
     specifies a resident timer sampler (no PMU under HVF) as the first step next window. Candidates are listed, not
     recommended; any translator (FEX) change is the owner's call.
 
+39. **Pre-merge suite: 171/171** (`natemu-raw/premerge-suite-20261114-01`, head `4b19f44` — all code merged; later commits
+    are docs only; both caches off, Apple-container reference backend because OrbStack was down; 26 min wall). With K1
+    594/594 default and link-check and the interleaved rounds (decisions 27, 37), `perf-real-workload` is ready to merge
+    into main on the owner's word (main has not moved since dcffe4b: a fast-forward, no conflicts).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
