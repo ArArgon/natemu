@@ -119,10 +119,11 @@ link inside it) and, at 0x800, X (`jmp` to Y); frame RT a trampoline page (`jmp`
 - `pic-user`: `pic-two` with `NATEMU_PIC=user`: CPL-0 code is never shared (SHARES 0), the same values.
 Instance eviction has no case: instances are freed with the arena at a flush (stage 3), which the flush tests cover.
 Perf chunk 11 (natemu only):
-- `link-full`: more links than the record area holds (a chain of 573,440 link points through 140 pages above 4 GiB),
-  three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
+- `link-full`: more links than the record area holds. By default a test capacity of 16 Ki records (NATEMU_LINK_CAP: a
+  chain of 20,480 link points through 5 pages above 4 GiB); `--full-links`: the production 512 Ki (a chain of 573,440 link
+  points through 140 pages above 4 GiB), about 30 of the K1 run's 35 minutes. Three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
   reload; back with INVLPG: every pass counts exactly, the area filled without a flush, and each fill cost at most two
-  passes over it (`reclaims` at most 1 + 4 links / MAX_LINKS).
+  passes over it (`reclaims` at most 1 + 4 links / capacity).
 - `counts`: `cr3-switch` at K and 2K rounds on 1 vCPU: the resident's translation requests and the host's compiles must
   not grow with the rounds (K1: a CR3 load keeps translations); with `--base-host/--base-runtime` the same counts for
   another build (before K1) are reported beside them.
@@ -512,8 +513,26 @@ def pic_bodies(i, n=1):
 # dropped and remade; the record area fills in every pass, and each fill costs at most two passes over it (`reclaims`
 # bounded by the links made).
 MAX_LINKS = 512 * 1024                    # natemu_abi::execution::cache::MAX_LINKS
-FM = MAX_LINKS // 4096 + 12              # 140 at 512 Ki (76 at 256 Ki): 2 * 2048 * FM records > MAX_LINKS
-FW, FH = FM - 10, FM // 2        # FW late in the chain: its links are live when it is written (a fill keeps the chain's tail)
+# `link-full` overflows a test-only capacity by default (the host's NATEMU_LINK_CAP -> `cache::Control::link_cap`): the
+# same linker paths (full area, local prune, unlink-all, reclaim bookkeeping), at a chain 28 times shorter. `--full-links`
+# runs the production size (cap MAX_LINKS, no env). Each of the FM pages holds 4096 link points. At MAX_LINKS FM = cap/4096
+# + 12: the first fill leaves a 12-page tail and FW lies in it, so its links are live when it is written. At a small cap
+# FM = cap/4096 + 1 (5 at 16 Ki: the chain is 1.25 x the cap, 1.09 x at full size). A link-by-link model of the linker's
+# fill (clear everything when links + 4 > cap; three passes) that tolerates 0-60 further links from other blocks leaves
+# pages FM-3 .. FM-1 live at the end of a phase, so FW = FM-2 is live then, as at full size (FM-10 is not, at a small cap).
+LINK_CAP = 16 * 1024
+FM = FW = FH = CAP = 0
+
+
+def set_link_cap(cap):
+    """Sizes the `link-full` chain for a record capacity `cap` (a multiple of 4096, MAX_LINKS or at least 8 Ki)."""
+    global CAP, FM, FW, FH
+    assert cap == MAX_LINKS or (cap % 4096 == 0 and 8 * 1024 <= cap < MAX_LINKS), cap
+    CAP = cap
+    assert 2 * 2048 * (cap // 4096 + 1) > cap
+    FM = cap // 4096 + (12 if cap == MAX_LINKS else 1)   # 140 at 512 Ki (76 at 256 Ki): 2 * 2048 * FM records > cap
+    FW, FH = (FM - 10 if cap == MAX_LINKS else FM - 2), FM // 2   # FW late in the chain: a fill keeps the chain's tail
+set_link_cap(LINK_CAP)
 FC, FWC, FC2, FE = 0x9000, 0xa000, 0xb000, 0xc000
 FULL_CODE = ['--code-cache', str(96 << 20)]  # 2 * 2048 * FM + blocks of FEX code: more than the default 16 MiB
 
@@ -872,6 +891,8 @@ def run(a, prog, extra, host=None, runtime=None, tag=''):
     # area's capacity is tested on absolute code (each address its own blocks and links).
     mode = PIC_ENV.get(prog['name'][3:].split('@')[0])
     env = dict(os.environ, NATEMU_PIC=mode) if mode else None
+    if full and CAP < MAX_LINKS:   # (the host's NATEMU_LINK_CAP: unset = production capacity)
+        env = dict(env or os.environ, NATEMU_LINK_CAP=str(CAP))
     rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
     for v, c in enumerate(out['cpus'] if out else []):
@@ -894,8 +915,10 @@ def main():
     ap.add_argument('--base-runtime', type=pathlib.Path)
     ap.add_argument('--programs', type=lambda s: s.split(','), help='only these programs (and no counts)')
     shard.add(ap)
+    ap.add_argument('--full-links', action='store_true', help=f'link-full at the production link capacity ({MAX_LINKS} records: ~6 min at 1 vCPU, ~20 at 4) instead of the test capacity {LINK_CAP} (the end-of-round suite runs this once)')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
     a = ap.parse_args()
+    set_link_cap(MAX_LINKS if a.full_links else LINK_CAP)
     a.out.mkdir(parents=True, exist_ok=True)
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
     stub = smp.build_stub(a.out / 'qemu-build')
@@ -945,8 +968,8 @@ def main():
                 # and each fill cost at most two passes over it, each followed by at least a quarter of the area's links.
                 for v, c in enumerate(out['cpus'] if out and name == 'link-full' else []):
                     count, links, flushes = c['stats']['k1']['reclaims'][0], c['stats']['links'], c['stats']['flushes']
-                    if not (links > MAX_LINKS and count >= 1 and count <= 1 + 4 * links // MAX_LINKS and flushes == 1):
-                        problems.append(f'cpu{v} links {links}, full {count} times (at most {1 + 4 * links // MAX_LINKS}), flushes {flushes}')
+                    if not (links > CAP and count >= 1 and count <= 1 + 4 * links // CAP and flushes == 1):
+                        problems.append(f'cpu{v} links {links}, full {count} times (at most {1 + 4 * links // CAP}; capacity {CAP}), flushes {flushes}')
                 seen = {}
                 if out and name in EITHER:
                     for v, c in enumerate(out['cpus']):

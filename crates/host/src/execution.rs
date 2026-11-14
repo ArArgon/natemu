@@ -2870,6 +2870,21 @@ pub struct Requests {
     pub entropy: u64,
 }
 
+/// `NATEMU_LINK_CAP`: the link record area's capacity ([`cache::Control::link_cap`]), a test hook for K1's `link-full`.
+/// Unset: 0 (the resident then uses [`cache::MAX_LINKS`]); otherwise a number within
+/// [`cache::MIN_LINK_CAP`]..=[`cache::MAX_LINKS`] (an environment variable is input: nothing else reaches the resident).
+fn link_cap_from(var: Option<&str>) -> Result<u64> {
+    let Some(v) = var else { return Ok(0) };
+    match v.parse::<usize>() {
+        Ok(n) if (cache::MIN_LINK_CAP..=cache::MAX_LINKS).contains(&n) => Ok(n as u64),
+        _ => Err(format!(
+            "NATEMU_LINK_CAP={v}: {} to {}",
+            cache::MIN_LINK_CAP,
+            cache::MAX_LINKS
+        )),
+    }
+}
+
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
 /// which execution stops at a block boundary (blocks are fetched up to it, and
 /// never cached at it, so reaching it is a miss). A vCPU that stays in the guest
@@ -2944,6 +2959,9 @@ pub fn run(
         control + std::mem::offset_of!(cache::Control, reuse_fences),
         fences,
     );
+    // K1 `link-full`: a smaller link record area (`NATEMU_LINK_CAP`; unset: the full `cache::MAX_LINKS`).
+    let cap = link_cap_from(std::env::var("NATEMU_LINK_CAP").ok().as_deref())?;
+    area.write_record(control + std::mem::offset_of!(cache::Control, link_cap), cap);
     // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
     // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
     let entered = &AtomicU64::new(0);
@@ -3430,6 +3448,18 @@ fn translation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn link_cap_env_is_validated() {
+        assert_eq!(link_cap_from(None), Ok(0));
+        assert_eq!(link_cap_from(Some("16384")), Ok(16384));
+        assert_eq!(
+            link_cap_from(Some(&cache::MAX_LINKS.to_string())),
+            Ok(cache::MAX_LINKS as u64)
+        );
+        for bad in ["", "0", "-1", "x", "4095", "524289", "99999999999999999999"] {
+            assert!(link_cap_from(Some(bad)).is_err(), "{bad}");
+        }
+    }
     #[test]
     fn frame_alias_entropy_selects_full_slot_and_fails_closed() {
         for word in [0, 4095, 4096, (1 << 21) - 1, 1 << 21, 1 << 30, u64::MAX] {

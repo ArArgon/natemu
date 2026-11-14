@@ -312,6 +312,25 @@ pub mod cache {
     /// reclaimed about 100 times per vCPU, undoing 71 M links, at 256 Ki).
     pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
     pub const MAX_LINKS: usize = 512 * 1024;
+    /// Least test-only link capacity ([`Control::link_cap`]): a full area must free at least a quarter of itself again.
+    pub const MIN_LINK_CAP: usize = 4096;
+    /// The record area's effective capacity: [`Control::link_cap`] if set (by the host's `NATEMU_LINK_CAP`, K1's `link-full`
+    /// only) and within [`MIN_LINK_CAP`]..=[`MAX_LINKS`], else [`MAX_LINKS`] (0: unset; the host rejects the rest).
+    pub const fn link_cap(field: u64) -> usize {
+        if field >= MIN_LINK_CAP as u64 && field <= MAX_LINKS as u64 {
+            field as usize
+        } else {
+            MAX_LINKS
+        }
+    }
+    /// The linker finds the area full when a block's links (at most [`super::MAX_LINK_POINTS`]) no longer fit in `cap`.
+    pub const fn links_full(links: usize, cap: usize) -> bool {
+        links + super::MAX_LINK_POINTS > cap
+    }
+    /// After the local links go, every link goes too when more than this many remain (less than a quarter of `cap` free).
+    pub const fn reclaim_floor(cap: usize) -> usize {
+        cap - cap / 4
+    }
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
     pub const STEP_RECORD: usize = LINKS + core::mem::size_of::<LinkRecord>() * MAX_LINKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;
@@ -650,6 +669,9 @@ pub mod cache {
         pub trip_count: u64,
         /// Dispatch study counters (`perf` resident builds only; [`L1_EVICTED`] and the rest). Appended.
         pub l1_counts: [u64; L1_COUNTS],
+        /// K1 `link-full` only (the host's `NATEMU_LINK_CAP`, set before the vCPU runs): the link record area's capacity
+        /// ([`link_cap`]); 0: [`MAX_LINKS`]. Appended.
+        pub link_cap: u64,
     }
     /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
     pub const L1_EVICTED: usize = 0;
@@ -2974,6 +2996,24 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+    /// The record area's capacity is [`cache::MAX_LINKS`] unless a value in range is set; a full area is found at the cap
+    /// (not before a block's links stop fitting), and what remains after the local links are undone is judged against it.
+    #[test]
+    fn link_cap_defaults_to_max_and_bounds_the_overflow() {
+        use super::cache::{MAX_LINKS, MIN_LINK_CAP, link_cap, links_full, reclaim_floor};
+        assert_eq!(link_cap(0), MAX_LINKS);
+        assert_eq!(link_cap(MAX_LINKS as u64), MAX_LINKS);
+        assert_eq!(link_cap(MIN_LINK_CAP as u64), MIN_LINK_CAP);
+        assert_eq!(link_cap(16 * 1024), 16 * 1024);
+        assert_eq!(link_cap(MIN_LINK_CAP as u64 - 1), MAX_LINKS);
+        assert_eq!(link_cap(MAX_LINKS as u64 + 1), MAX_LINKS);
+        let cap = link_cap(16 * 1024);
+        assert!(!links_full(cap - super::MAX_LINK_POINTS, cap));
+        assert!(links_full(cap - super::MAX_LINK_POINTS + 1, cap));
+        assert_eq!(reclaim_floor(cap), 12 * 1024);
+        assert!(!links_full(0, MIN_LINK_CAP));
+    }
+
     #[test]
     fn table_page_marks_accumulate() {
         use core::sync::atomic::{AtomicU64, Ordering::SeqCst};

@@ -164,10 +164,13 @@ def steps(F, O):
         vm(f'nostop-{g}', 'run_nostop.py', '--only', g)
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
-    # link-full overflows the link-record area (MAX_LINKS, 512 Ki since chunk 1b): about 5 min at 1 vCPU, 20 at 4 (one run).
+    # link-full overflows a test link capacity (16 Ki records, NATEMU_LINK_CAP) in these runs: seconds. The production size
+    # (MAX_LINKS, 512 Ki since chunk 1b: about 6 min at 1 vCPU, 20 at 4) runs once, below, at 1 vCPU. The `est` here
+    # predate the small capacity (about 30 of K1's 35 minutes was link-full): recalibrate after the first suite run.
     for n, est in ((1, 300), (2, 500), (3, 700), (4, 1300)):
         if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 1500, est=est, w=n)
         else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 1500, est=est, w=n)
+    vm('k1-full-links', 'run_k1.py', '--cpus', 1, '--programs', 'link-full', '--full-links', '--timeout', 1500, est=400)   # the production capacity, once
     # PIC study stage 2: stops at each entry word, svc-word links, a forged slot. One step per mode (each runs the K1 programs at
     # 1 and 2 vCPUs, about 1780 s in all in the November 10 serial-chain run, 137-step suite 13: its longest step); the three
     # no-K1 modes together.

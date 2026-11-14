@@ -1646,7 +1646,8 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
             return Link::Bad;
         }
     }
-    if c.links as usize + MAX_LINK_POINTS > area::MAX_LINKS {
+    let cap = area::link_cap(c.link_cap);
+    if area::links_full(c.links as usize, cap) {
         // Full (perf chunk 11): any link may go, its point then enters the linker again. Local links outlive their
         // targets' currency, so those into blocks not current go first (chunk 8); if that leaves less than a quarter
         // free, every link goes. Each such pass is followed by at least a quarter of the area's links: amortised O(1)
@@ -1655,7 +1656,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
         let Some(mut n) = prune(LOCAL, true) else {
             return Link::Bad;
         };
-        if control().links as usize > area::MAX_LINKS - area::MAX_LINKS / 4 {
+        if control().links as usize > area::reclaim_floor(cap) {
             let Some(all) = unlink_all() else {
                 return Link::Bad;
             };
