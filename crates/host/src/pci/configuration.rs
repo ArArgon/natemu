@@ -6,6 +6,7 @@
 //
 // Adapted from cloud-hypervisor pci/src/configuration.rs at f84dae558c8b9518e9d9bf8c0f1b64cd4dc8e546: without
 // snapshot/migration, with a local PciBarType, BarReprogrammingParams (from pci/src/device.rs) and command().
+// Divergence from upstream's behaviour: a 1-byte write to Message Control's high byte (cap+3) reaches MsixConfig.
 // Upstream items natemu does not use are kept so the file stays comparable; hence the allow below.
 #![allow(dead_code)]
 
@@ -948,6 +949,13 @@ impl PciConfiguration {
                     .lock()
                     .unwrap()
                     .set_msg_ctl((u32::from_le_bytes(data) >> 16) as u16);
+            } else if msix_cap_reg_idx == reg_idx && offset == 3 && data.len() == 1 {
+                // natemu: a byte write to the high byte of Message Control (Enable and Function Mask live there;
+                // the low byte is read-only). Upstream ignores byte writes.
+                msix_config
+                    .lock()
+                    .unwrap()
+                    .set_msg_ctl(u16::from(data[0]) << 8);
             }
         }
 
@@ -1663,5 +1671,66 @@ mod tests {
         cfg.write_config_register(COMMAND_REG, 0, &0x0000u16.to_le_bytes());
         assert_eq!(cfg.command(), 0);
         assert_eq!(cfg.get_bar_addr(0), 0xe002_0000);
+    }
+
+    /// A configuration with an MSI-X capability; returns it, the MSI-X state and the capability offset.
+    fn msix_config_space() -> (PciConfiguration, Arc<Mutex<MsixConfig>>, usize) {
+        use super::super::msix::MsixCap;
+        let msix = Arc::new(Mutex::new(
+            MsixConfig::new(4, Arc::new(|_, _| {}), 0).unwrap(),
+        ));
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            1,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            None,
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+            Some(msix.clone()),
+        );
+        let off = cfg
+            .add_capability(&MsixCap::new(0, 4, 0x4000, 0, 0x5000))
+            .unwrap();
+        (cfg, msix, off)
+    }
+
+    fn state(msix: &Arc<Mutex<MsixConfig>>) -> (bool, bool) {
+        let m = msix.lock().unwrap();
+        (m.enabled(), m.masked())
+    }
+
+    #[test]
+    fn message_control_word_write_reaches_msix() {
+        let (mut cfg, msix, off) = msix_config_space();
+        let reg = off / 4;
+        cfg.write_config_register(reg, 2, &0x8000u16.to_le_bytes());
+        assert_eq!(state(&msix), (true, false));
+        cfg.write_config_register(reg, 2, &0xc000u16.to_le_bytes());
+        assert_eq!(state(&msix), (true, true));
+        cfg.write_config_register(reg, 2, &0u16.to_le_bytes());
+        assert_eq!(state(&msix), (false, false));
+    }
+
+    #[test]
+    fn message_control_dword_write_reaches_msix() {
+        let (mut cfg, msix, off) = msix_config_space();
+        cfg.write_config_register(off / 4, 0, &0x8000_0000u32.to_le_bytes());
+        assert_eq!(state(&msix), (true, false));
+        cfg.write_config_register(off / 4, 0, &0xc000_0000u32.to_le_bytes());
+        assert_eq!(state(&msix), (true, true));
+    }
+
+    #[test]
+    fn message_control_byte_write_at_cap_plus_3_reaches_msix() {
+        let (mut cfg, msix, off) = msix_config_space();
+        cfg.write_config_register(off / 4, 3, &[0x80]);
+        assert_eq!(state(&msix), (true, false));
+        cfg.write_config_register(off / 4, 3, &[0xc0]);
+        assert_eq!(state(&msix), (true, true));
+        cfg.write_config_register(off / 4, 3, &[0x00]);
+        assert_eq!(state(&msix), (false, false));
     }
 }

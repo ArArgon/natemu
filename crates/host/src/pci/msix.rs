@@ -4,7 +4,9 @@
 //
 // Adapted from cloud-hypervisor pci/src/msix.rs at f84dae558c8b9518e9d9bf8c0f1b64cd4dc8e546: interrupts go out through
 // a `Deliver` callback instead of an interrupt source group, no snapshot/migration, trigger() added (from
-// virtio-devices/src/transport/pci_device.rs). Upstream items natemu does not use are kept, hence the allow below.
+// virtio-devices/src/transport/pci_device.rs). Divergences from upstream's behaviour: MsixCap::new leaves Enable
+// clear (PCI 3.0 6.8.2.3); set_msg_ctl delivers pending vectors when MSI-X becomes enabled and unmasked, not when
+// the function mask clears (PCI 3.0 6.8.2.3, 6.8.2.9). Upstream items natemu does not use are kept, hence the allow below.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -102,16 +104,16 @@ impl MsixConfig {
     }
 
     pub fn set_msg_ctl(&mut self, reg: u16) {
-        let old_masked = self.masked;
+        let was_active = self.enabled && !self.masked;
 
         self.masked = ((reg >> FUNCTION_MASK_BIT) & 1u16) == 1u16;
         self.enabled = ((reg >> MSIX_ENABLE_BIT) & 1u16) == 1u16;
 
-        // If the Function Mask bit was set, and has just been cleared, it's
-        // important to go through the entire PBA to check if there was any
-        // pending MSI-X message to inject, given that the vector is not
-        // masked.
-        if old_masked && !self.masked {
+        // natemu: keyed on MSI-X becoming enabled and unmasked (upstream: on the function mask clearing), so that
+        // nothing is sent while MSI-X is disabled and enabling with the mask clear releases pending vectors
+        // (PCI 3.0 6.8.2.3, 6.8.2.9). When that happens it is important to go through the entire PBA to check if
+        // there was any pending MSI-X message to inject, given that the vector is not masked.
+        if !was_active && self.enabled && !self.masked {
             for (index, entry) in self.table_entries.clone().iter().enumerate() {
                 if !entry.masked() && self.get_pba_bit(index as u16) == 1 {
                     self.inject_msix_and_clear_pba(index);
@@ -422,8 +424,8 @@ impl MsixCap {
     ) -> Self {
         assert!(table_size < MAX_MSIX_VECTORS_PER_DEVICE);
 
-        // Set the table size and enable MSI-X.
-        let msg_ctl: u16 = 0x8000u16 + table_size - 1;
+        // Set the table size. natemu: Enable and Function Mask reset to 0 (PCI 3.0 6.8.2.3); upstream sets Enable.
+        let msg_ctl: u16 = table_size - 1;
 
         MsixCap {
             msg_ctl,
@@ -635,5 +637,45 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), vec![(0xfee0_3000, 0x60)]);
         config.trigger(0);
         assert_eq!(sent.lock().unwrap()[1], (0xfee0_3000, 0x60));
+    }
+
+    #[test]
+    fn fresh_msix_cap_has_enable_and_function_mask_clear() {
+        // PCI 3.0 6.8.2.3: both bits reset to 0; the size field is N - 1.
+        let msg_ctl = MsixCap::new(0, 5, 0x4000, 0, 0x5000).msg_ctl;
+        assert_eq!(msg_ctl & (MSIX_ENABLE_MASK | FUNCTION_MASK_MASK), 0);
+        assert_eq!(msg_ctl & 0x7ff, 4);
+    }
+
+    #[test]
+    fn disabling_while_masked_then_unmasking_delivers_nothing_and_keeps_pending() {
+        // PCI 3.0 6.8.2.9: no message while MSI-X is disabled.
+        let (mut config, sent) = recording(1);
+        write_entry(&mut config, 0, 0xfee0_0000, 0x40, 0);
+        config.set_msg_ctl(ENABLE_MASKED);
+        config.trigger(0);
+        config.set_msg_ctl(FUNCTION_MASK_MASK);
+        config.set_msg_ctl(0);
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(config.get_pba_bit(0), 1);
+    }
+
+    #[test]
+    fn enabling_with_function_mask_clear_delivers_pending_once() {
+        let (mut config, sent) = recording(2);
+        write_entry(&mut config, 0, 0xfee0_0000, 0x40, 0);
+        write_entry(&mut config, 1, 0xfee0_1000, 0x41, 1);
+        config.set_msg_ctl(ENABLE_MASKED);
+        config.trigger(0);
+        config.trigger(1);
+        // Disable with the function mask clear, then enable again with it still clear.
+        config.set_msg_ctl(0);
+        assert!(sent.lock().unwrap().is_empty());
+        config.set_msg_ctl(ENABLE);
+        // Vector 0 is delivered; vector 1 has its own mask bit and stays pending.
+        assert_eq!(*sent.lock().unwrap(), vec![(0xfee0_0000, 0x40)]);
+        assert_eq!((config.get_pba_bit(0), config.get_pba_bit(1)), (0, 1));
+        config.set_msg_ctl(ENABLE);
+        assert_eq!(sent.lock().unwrap().len(), 1);
     }
 }
