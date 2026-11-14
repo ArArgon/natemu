@@ -315,7 +315,7 @@ review before the gate).**
   with a CR3 restore, so each program's last state is checked.
 - K1 miss counts come from the perf bucket's entry count (`dispatch_misses` in the K1 stats, 0 from a resident without
   `perf`): differences of runs at K and 2K rounds, or of a program against its variant, so setup and glue misses cancel. The
-  variants `l1-triple-t0`, `l1-triple-t3`, `l1-global-x`, `l1-dup-x` are measured only. `l1-dup` and `l1-pic` are natemu only
+  variants `l1-triple-t0` (the A, B tail run before the triples, so its return labels are cold in both), `l1-triple-t3`, `l1-global-x` and `l1-dup-x` (B called where A is, so the same return labels miss) are measured only: a CR3 reload empties every non-global return label's entry, so a variant must keep the same calls, not drop one. `l1-dup` and `l1-pic` are natemu only
   (CPUID leaves differ from QEMU's; PIC values as `reuse-alias`). The CPUID at B - 2 is never in L1: it misses every round
   (cancelled by the `-x` variant).
 - Mutants M1-M11 as patches in `natemu-raw/l1-two-way-mutants-20261114/` (`M5abi` is M5's model form).

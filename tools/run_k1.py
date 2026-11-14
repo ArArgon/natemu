@@ -140,17 +140,19 @@ difference of two runs of one program, from a `perf` resident: `--perf-runtime`,
 beside them:
 - `l1-pair`: K rounds A, B then K rounds A, D: values; no dispatcher miss per round after the first (the pair fits).
 - `l1-triple`: K rounds A, B, C, then A, B once after C: exactly 3 misses per round (fill-order replacement); that tail
-  costs exactly 2 misses (A replaces the older of the set's two, B the other) and a longer tail adds none; the variants
-  `l1-triple-t0` (no tail) and `l1-triple-t3` (three tails) are only measured, never listed. `l1-triple-d`: A, B, D in
+  costs exactly 2 misses more than the same tail before the triples (A replaces the older of the set's two, B the other;
+  the tail's own return labels are cold either way) and a longer tail adds none; the variants `l1-triple-t0` (the tail
+  first) and `l1-triple-t3` (three tails) are only measured, never listed. `l1-triple-d`: A, B, D in
   turn: 3 misses a round, and `L1_NEW_CONFLICT` counts them (replacements whose victim differs in bit 15).
 - `l1-pair-invlpg`: A in way 0, B in way 1; B's page remapped and INVLPG: the new frame's bytes; then A's, the roles swapped.
 - `l1-pair-cr3`: A, B warm under table A; CR3 to table B, where B maps other bytes: B's own; back under A: A's.
 - `l1-pair-write`: B's frame rewritten through its data alias, then A's (way 0); then C replaces A in way 0 (the set's
   next-victim bit now names way 1) and C's frame is rewritten: the new bytes each time.
 - `l1-global` (+ `l1-global-x`, only measured): B (not global) fills way 0, A (G set, PGE) way 1; each round a CR3 reload
-  empties way 0 and A runs again before B: no miss for A (the program against the one without A's call: no difference).
+  empties way 0 and A runs again before B: no miss for A (the program against the one calling B twice: no difference).
 - `l1-dup` (natemu only; + `l1-dup-x`): each round CR3 reload, A, B (way 1), then a CPUID at B - 2 whose next RIP is B: the
-  resident fills L1 for B while B is in way 1 (a CPUID is never in L1: one miss a round of its own), then A: no miss for it.
+  resident fills L1 for B while B is in way 1 (a CPUID is never in L1: one miss a round of its own), then A: no miss for it
+  (against B called again).
 - `l1-pic` (natemu only): two instances of one shared translation at aliases in one L1 set, each with its own page base.
 Writes DIR/k1.json; exit status 1 on any failure."""
 import argparse, json, os, pathlib, subprocess, sys
@@ -238,21 +240,25 @@ def l1_bodies(k, i, n):
     rewrite = lambda frame, v: f'    mov rax, {int.from_bytes(CODE(v)[:8], "little"):#x}\n    mov [{frame:#x}], rax\n'
     def tail(m):
         return rounds(m, add(A, 'r12') + add(B, 'r14'), 'edx') if m else ''
-    def triple_with_tail(m):
-        return rounds(k, add(A, 'r8') + add(B, 'r9') + add(C, 'r10')) + tail(m)
+    def triple_with_tail(m, first=False):
+        # (`first`: the tail's code runs before the triples instead, so its own return labels are cold in both variants.)
+        return (tail(m) if first else '') + rounds(k, add(A, 'r8') + add(B, 'r9') + add(C, 'r10')) + ('' if first else tail(m))
     def glob(with_a):
-        # B (not global) into way 0, A (global) into way 1; each round a CR3 reload empties way 0, then A (optional), then B.
+        # B (not global) into way 0, A (global) into way 1; each round a CR3 reload empties way 0 (and every return label's
+        # entry: each call costs its label a miss), then A, then B. The variant calls B twice instead of A then B: the same
+        # labels, and the same misses if A hits.
         return (pge(True) + c(B, 'r9') + c(A, 'r8')
-                + rounds(k, cr3('ta') + (add(A, 'r10') if with_a else '') + add(B, 'r12')))
+                + rounds(k, cr3('ta') + (add(A, 'r10') if with_a else add(B, 'r10')) + add(B, 'r12')))
     def dup(with_a):
         # (CPUID clobbers ecx: the counter is r14d.) Each round A (way 0), B (way 1), then the CPUID at B - 2 enters B through
-        # the resident, which fills its L1 entry again while B is in way 1; A runs again: it must still be in L1.
-        return rounds(k, cr3('ta') + add(A, 'r8') + add(B, 'r9') + add(B - 2, 'r10') + (add(A, 'r12') if with_a else ''), 'r14d')
+        # the resident, which fills its L1 entry again while B is in way 1; A runs again: it must still be in L1 (the variant
+        # calls B again: a hit as well, with the same return label).
+        return rounds(k, cr3('ta') + add(A, 'r8') + add(B, 'r9') + add(B - 2, 'r10') + add(A if with_a else B, 'r12'), 'r14d')
     pic = lambda: rounds(k, c(RV1) + '    mov r8, rax\n    mov r9, rsi\n' + c(RV6) + '    mov r10, rax\n    mov r12, rsi\n')
     return {
         'l1-pair': rounds(k, add(A, 'r8') + add(B, 'r9')) + rounds(k, add(A, 'r10') + add(D, 'r12')),
         'l1-triple': triple_with_tail(1),
-        'l1-triple-t0': triple_with_tail(0),
+        'l1-triple-t0': triple_with_tail(1, first=True),
         'l1-triple-t3': triple_with_tail(3),
         'l1-triple-d': rounds(k, add(A, 'r8') + add(B, 'r9') + add(D, 'r10')),
         # A in way 0, B in way 1: B remapped (INVLPG) and run; A run; then A remapped (the way-0 block) and run, B again.
@@ -853,7 +859,7 @@ EITHER = {
     # CPUID leaves differ from QEMU's: natemu only. Per round (K rounds): A once (and again at the end unless -x), B, and the
     # CPUID's way into B (eax = 2 from B's own code).
     'l1-dup': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {k}},
-    'l1-dup-x': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}},
+    'l1-dup-x': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {2 * k}},
     'link-full': {'r8': {3}, 'r9': {6}, 'r10': {12}, 'r12': {6}},
     'hint-reset': {'r8': {12}},
 }
@@ -1047,14 +1053,14 @@ def l1_counts(a, n, name, report):
         expect(f'misses over {k} more rounds (want 0: the pair fits)', diff(name, 2 * k, name, k), lambda g: g == 0)
     if name == 'l1-triple':
         expect(f'misses over {k} more rounds of A, B, C (want {3 * k}: three a round)', diff(name, 2 * k, name, k), lambda g: g == 3 * k)
-        expect('misses of the tail A, B after C (want 2)', diff(name, k, 'l1-triple-t0', k), lambda g: g == 2)
+        expect('misses of the tail A, B after C against the same tail before the triples (want 2)', diff(name, k, 'l1-triple-t0', k), lambda g: g == 2)
         expect('misses of two more tails (want 0)', diff('l1-triple-t3', k, name, k), lambda g: g == 0)
         expect('L1_NEW_CONFLICT over more rounds (want 0: A, B, C agree in bit 15)', diff(name, 2 * k, name, k, 1), lambda g: g == 0)
     if name == 'l1-triple-d':
         expect(f'misses over {k} more rounds of A, B, D (want {3 * k})', diff(name, 2 * k, name, k), lambda g: g == 3 * k)
         expect('L1_NEW_CONFLICT over more rounds (want some: D differs in bit 15)', diff(name, 2 * k, name, k, 1), lambda g: g > 0)
     if name in ('l1-global', 'l1-dup'):
-        expect('misses of the extra A call a round (want 0)', diff(name, k, name + '-x', k), lambda g: g == 0)
+        expect('misses of the call of A a round against a call of B (want 0: A hits)', diff(name, k, name + '-x', k), lambda g: g == 0)
     report.append({'name': f'k1-{name}@{n}', 'max_block': None, 'stats': None, 'counts': {f'{p}/{r}': v for (p, r), v in seen.items()}, 'problems': failures})
     print(json.dumps(report[-1]), flush=True)
     return [f'counts {f}' for f in failures]
