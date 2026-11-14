@@ -494,6 +494,19 @@ pub(crate) fn pending(memory: &Memory, v: usize, vector: u64) -> bool {
 pub(crate) fn published(memory: &Memory, v: usize) -> u64 {
     event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).load(SeqCst)
 }
+/// Test seam: stores vCPU `v`'s published APIC word, and reads a vector's TMR bit.
+#[cfg(test)]
+pub(crate) fn set_published(memory: &Memory, v: usize, word: u64) {
+    event_word(memory, v, std::mem::offset_of!(cache::Events, apic)).store(word, SeqCst);
+}
+#[cfg(test)]
+pub(crate) fn tmr(memory: &Memory, v: usize, vector: u64) -> bool {
+    let w = 8 * (vector as usize / 64 % 4);
+    event_word(memory, v, std::mem::offset_of!(cache::Events, tmr) + w).load(SeqCst)
+        >> (vector % 64)
+        & 1
+        != 0
+}
 /// L4a: vCPU `v`'s LINT0 input level (the 8259's output). A rise at an APIC that passes ExtINTs to its core
 /// (`natemu_abi::lapic::EXTINT`) counts as a post: true, the caller rings it.
 pub(crate) fn set_lint0(memory: &Memory, v: usize, level: bool) -> bool {
