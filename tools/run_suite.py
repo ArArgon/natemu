@@ -65,7 +65,7 @@ PROBES_EST, CORPORA_EST = 530, {2: 90, 3: 80, 4: 80}
 # and the two probe chains (November 11: 363 and 166 s); they start first. Everything else comes from the arguments above.
 # November 14 estimates (not measured: the clang and QEMU reference caches, and the prefix baselines run once, came after the
 # November 11 run; times below are what the removed work suggests, to be replaced by the first run's): system 160 -> 50 once the
-# QEMU cache is warm (a cold run costs the old 160 s), i5b-faults 111 -> 75, cpu-forms 206 s on an efficiency core -> 60 on a performance one.
+# QEMU cache is warm (the first two runs cost about the old 160 s: a hang is stored after two timeouts), i5b-faults 111 -> 75, cpu-forms 206 s on an efficiency core -> 60 on a performance one.
 EST = {'k1-c1': 220, 'k1-c2@2': 320, 'k1-c3@3': 385, 'probes@1': 360, 'probes@2': 170, 'system': 50, 'i5b-faults': 75,
        'instruction-gaps': 50, 'instruction-gaps-1': 50, 'cpu-forms': 60, 'frame-alias': 15, 'frame-alias-1': 15, 'vector-ac': 20,
        'contain': 70}

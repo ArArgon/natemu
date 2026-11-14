@@ -341,8 +341,8 @@ with a wall-clock, watchdog, kicker or run-timeout bound, and every multi-vCPU s
 pinned QEMU hash and the `tools/reference` sources; `NATEMU_REF_CACHE=off` forces fresh references, e.g. for a final gate). Two more caches live
 beside it: `asm-cache.sqlite` (`tools/asmcache.py`: clang's bytes per assembly text; the fault runners assemble thousands of
 one-line programs and every shard repeated it; `NATEMU_ASM_CACHE=off`) and `qemu-cache.sqlite` (`tools/qemucache.py`: QEMU
-system-mode reference runs of K1, slice 3 and i5b by image, arguments and QEMU binary; finished runs only, a hang only where
-the runner expects one; `NATEMU_QEMU_CACHE=off` for a final gate). The first run after a change to an image or a runner fills
+system-mode reference runs of K1, slice 3 and i5b by image, arguments and QEMU binary; finished runs only; a hang only for the cases listed in `QEMU_HANGS`, after two fresh timeouts (the 8 hanging
+system guests cost their 10 s on the first two runs); `NATEMU_QEMU_CACHE=off` for a final gate). The first run after a change to an image or a runner fills
 them, so its times are the old ones. Runners that run a prefix-only baseline per case (`instruction-gaps`, `frame-alias`) run
 each distinct baseline once.
 
