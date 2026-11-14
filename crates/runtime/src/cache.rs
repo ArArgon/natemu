@@ -2681,7 +2681,7 @@ fn prune_tlb(scope: usize) -> Option<u64> {
                 w += 1;
             } else {
                 // (Link records of these segments are never checked: the word is the source's code plus the offset.)
-                invalidate_pou(ctr, area::CODE_VA + u64::from(block(r.source as usize).code) + u64::from(r.offset));
+                invalidate_pou(ctr, area::CODE_VA + u64::from(block(r.source as usize).code) + u64::from(r.offset()));
                 list_del(i as usize);
                 out_del(i as usize);
                 undone += 1;
@@ -2728,7 +2728,7 @@ fn suspend(scope: usize) -> Option<u64> {
     for i in from..to {
         let r = unsafe { record(i as usize).read() };
         // (Link records of these segments are never checked: the word is the source's code plus the offset.)
-        invalidate_pou(ctr, area::CODE_VA + u64::from(block(r.source as usize).code) + u64::from(r.offset));
+        invalidate_pou(ctr, area::CODE_VA + u64::from(block(r.source as usize).code) + u64::from(r.offset()));
     }
     unsafe { asm!("dsb ish", "isb") };
     c.links_susp = to;
@@ -2786,9 +2786,9 @@ fn relink(n: usize) {
             continue; // a live record of the block (the list holds them all)
         }
         let source = block(r.source as usize);
-        let word_at = u64::from(source.code) + u64::from(r.offset);
+        let word_at = u64::from(source.code) + u64::from(r.offset());
         if source.flags & DEAD != 0
-            || !source.links.iter().any(|p| p.offset != 0 && p.offset == r.offset && unlinked(source, p))
+            || !Some(&source.links[r.point()]).is_some_and(|p| p.offset != 0 && p.offset == r.offset() && unlinked(source, p))
         {
             remove(i, SUSP, &mut at);
             control().relink_dropped += 1;

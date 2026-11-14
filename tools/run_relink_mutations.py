@@ -22,17 +22,17 @@ NEW = 'cr3-relink,relink-smc,relink-dead-source,relink-stale,relink-held,relink-
 # name: ([(file, old, new)], programs that must go red, link-check resident?)
 MUTATIONS = {
     # ---- the plan's table
-    'no-unlinked-guard': ([(CACHE, 'p.offset != 0 && p.offset == r.offset && unlinked(source, p))', 'p.offset != 0 && p.offset == r.offset)')], 'relink-stale', False),
-    'dead-source-kept-and-relinked': ([(CACHE, '        if source.flags & DEAD != 0\n            || !source.links', '        if !source.links'),
-                              (CACHE, '        // restored when it was suspended.)\n        if i >= control().links_susp {\n            unlink(r)?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut at);',
-                               '        // restored when it was suspended.)\n        if i >= control().links_susp {\n            unlink(r)?;\n            undone += 1;\n            remove(i, segment_of(i), &mut at);\n        }')],
+    'no-unlinked-guard': ([(CACHE, 'p.offset != 0 && p.offset == r.offset() && unlinked(source, p))', 'p.offset != 0 && p.offset == r.offset())')], 'relink-stale', False),
+    'dead-source-kept-and-relinked': ([(CACHE, '        if source.flags & DEAD != 0\n            || !Some(&source.links', '        if !Some(&source.links'),
+                              (CACHE, '        // was suspended.)\n        if i >= control().links_susp {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut 0);',
+                               '        // was suspended.)\n        if i >= control().links_susp {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n            remove(i, segment_of(i), &mut 0);\n        }')],
                              'relink-dead-source', True),
     'kill-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if (all || i < control().links_tlb) && i >= control().links_susp {\n            // (A suspended record')],
                              'relink-smc', True),
     'invlpg-cut-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if all || (i < control().links_tlb && i >= control().links_susp) {\n            // (A suspended record')],
                                     'relink-invlpg,remap-link,cross-link', True),
     'unlink-all-unlinks-suspended': ([(CACHE, '        if i as u64 >= c.links_susp {\n            unlink(r)?;', '        if true {\n            unlink(r)?;')], 'cr3-relink', False),
-    'outbound-unlinks-suspended': ([(CACHE, '        // restored when it was suspended.)\n        if i >= control().links_susp {\n            unlink(r)?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut at);', '        // restored when it was suspended.)\n        if true {\n            unlink(r)?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut at);')], 'relink-dead-source', False),
+    'outbound-unlinks-suspended': ([(CACHE, '        // was suspended.)\n        if i >= control().links_susp {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut 0);', '        // was suspended.)\n        if true {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut 0);')], 'relink-dead-source', False),
     'inbound-unlinks-suspended': ([(CACHE, '            if i >= control().links_susp {\n                unlink(r)?;\n                undone += 1;', '            if true {\n                unlink(r)?;\n                undone += 1;')], 'relink-smc', False),
     'drop-suspended-keeps-outbound': ([(CACHE, '        list_del(i as usize);\n        out_del(i as usize);\n    }\n    let old = ends(c)', '        list_del(i as usize);\n    }\n    let old = ends(c)')], 'relink-reclaim', True),
     'relinked-always-cr3': ([(CACHE, 'resume(i, r, global, &mut at);', 'resume(i, r, false, &mut at);')], 'relink-global', False),

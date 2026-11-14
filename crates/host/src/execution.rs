@@ -1288,14 +1288,14 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         // same RIP).
         if (i as u64) < control.links_susp {
             let source = &blocks[r.source as usize];
-            let point = source.links.iter().find(|p| p.offset != 0 && p.offset == r.offset);
+            let point = source.links.iter().find(|p| p.offset != 0 && p.offset == r.offset());
             let admitted = point.is_some_and(|p| {
                 r.original == p.word
                     && word(u64::from(source.code) + u64::from(p.offset)) == p.word
                     && word(u64::from(source.code) + natemu_abi::pic::svc_slot(|o| word(u64::from(source.code) + o), p))
                         == natemu_abi::pic::SVC_LINK
             });
-            let held = linked.contains_key(&(r.source, r.offset));
+            let held = linked.contains_key(&(r.source, r.offset()));
             let mut why = None;
             if source.flags & cache::DEAD != 0 || t.flags & cache::DEAD != 0 {
                 why = Some("a dead end");
