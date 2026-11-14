@@ -22,8 +22,8 @@ NEW = 'relink-rot0,relink-rot1,relink-rot2,relink-rot3,cr3-relink,relink-smc,rel
 # name: ([(file, old, new)], programs that must go red, link-check resident?)
 MUTATIONS = {
     # ---- the plan's table
-    'no-unlinked-guard': ([(CACHE, 'p.offset != 0 && p.offset == r.offset() && unlinked(source, p))', 'p.offset != 0 && p.offset == r.offset())')], 'relink-stale', False),
-    'dead-source-relinked': ([(CACHE, '        if source.flags & DEAD != 0\n            || !Some(&source.links', '        if !Some(&source.links')], 'relink-dead-source', False),
+    'no-unlinked-guard': ([(CACHE, '        if source.flags & DEAD != 0 || !unlinked(source, point) {', '        if source.flags & DEAD != 0 {')], 'relink-stale', False),
+    'dead-source-relinked': ([(CACHE, '        if source.flags & DEAD != 0 || !unlinked(source, point) {', '        if !unlinked(source, point) {')], 'relink-dead-source', False),
     'kill-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if (all || i < control().links_tlb) && i >= control().links_susp {\n            // (A suspended record')],
                              'relink-smc', True),
     'invlpg-cut-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if all || (i < control().links_tlb && i >= control().links_susp) {\n            // (A suspended record')],
@@ -31,15 +31,15 @@ MUTATIONS = {
     'unlink-all-unlinks-suspended': ([(CACHE, '        if i as u64 >= c.links_susp {\n            unlink(r)?;', '        if true {\n            unlink(r)?;')], 'cr3-relink', False),
     'inbound-unlinks-suspended': ([(CACHE, '            if i >= control().links_susp {\n                unlink(r)?;\n                undone += 1;', '            if true {\n                unlink(r)?;\n                undone += 1;')], 'relink-smc', False),
     # (A suspended record is named by no outbound slot: `suspend` clears the slot, so a reclaim, a relink's drop or a dead source never meets one.)
-    'suspend-keeps-out-slot': ([(CACHE, '        out_del(i as usize);\n        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);', '        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);')], 'relink-reclaim,relink-dead-source,cr3-relink', True),
+    'suspend-keeps-out-slot': ([(CACHE, '        out_del(i as usize);\n        // (`link-check`: the epoch moved', '        // (`link-check`: the epoch moved')], 'relink-reclaim,relink-dead-source,cr3-relink', True),
     'relinked-always-cr3': ([(CACHE, 'resume(i, r, global, &mut at);', 'resume(i, r, false, &mut at);')], 'relink-global', False),
     'relink-before-flags': ([(CACHE, '                // Relink plan: the links the last TLB event suspended into it are patched again (after the walk: it may\n', '                // MUTATION\n'),
                              (CACHE, '            if let Some(walked) = walked.filter(|_| block(n).flags & DEAD == 0) {\n                c.revalidated += 1;',
                               '            if let Some(walked) = walked.filter(|_| block(n).flags & DEAD == 0) {\n                if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);\n                }\n                c.revalidated += 1;'),
                              (CACHE, '                #[cfg(not(feature = "pic-count"))]\n                if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);\n                }\n', '')],
                             'relink-global', False),
-    'suspend-leaves-links-patched': ([(CACHE, '        out_del(i as usize);\n        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);',
-                                       '        out_del(i as usize);\n        clean_pou(ctr, area::CODE_WRITE_VA + u64::from(block(r.source as usize).code));')],
+    'suspend-leaves-links-patched': ([(CACHE, '        }\n        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);',
+                                       '        }\n        clean_pou(ctr, area::CODE_WRITE_VA + u64::from(block(r.source as usize).code));')],
                                      'cr3-link,cr3-relink', False),
     'relink-disabled': ([(CACHE, 'if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);', 'if false && block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);')], 'cr3-relink', False),
     'relink-skips-cursor-fix': ([(CACHE, '        if *follow == last as u32 + 1 {\n            *follow = i as u32 + 1;\n        }', ''),
