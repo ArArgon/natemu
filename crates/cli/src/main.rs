@@ -3,7 +3,7 @@
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
 //!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--compile-cache DIR|off] [--compile-cache-mb N]
-//!       [--perf-log FILE]
+//!       [--perf-log FILE] [--rng] [--disk FILE] [--net] [--virtio-transport SPEC]
 //!
 //! Named arguments (clap; `natemu --help`). The last five fall back to `NATEMU_SERIAL_STDIN`,
 //! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
@@ -63,13 +63,13 @@ struct Cli {
     /// The resident's page-walk speculation barriers (needs FEAT_SB)
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
-    /// Expose the virtio-MMIO entropy device
+    /// Expose the virtio entropy device
     #[arg(long)]
     rng: bool,
     /// Writable raw disk image (exclusive use; successful S5 includes full-sync)
     #[arg(long, value_name = "FILE")]
     disk: Option<PathBuf>,
-    /// Expose a virtio-MMIO network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
+    /// Expose a virtio network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
     #[arg(long)]
     net: bool,
     /// How virtio devices attach: `mmio` or `pci` for all, or (experimental) per device, e.g. `disk=pci,net=mmio,rng=mmio`
@@ -143,7 +143,7 @@ impl log::Log for PciLog {
     }
     fn log(&self, r: &log::Record) {
         const MAX: usize = 16;
-        if !self.enabled(r.metadata()) {
+        if !self.enabled(r.metadata()) || !r.target().starts_with("natemu::pci") {
             return;
         }
         match self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {

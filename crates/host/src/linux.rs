@@ -92,11 +92,11 @@ pub struct Boot {
     /// host must have FEAT_SB (checked in [`Boot::prepare`]) and IA32_ARCH_CAPABILITIES advertises RDCL_NO when the host
     /// also has FEAT_CSV3, so a default command line then boots with PTI off. `--speculation-barriers` / `NATEMU_SPECULATION_BARRIERS`.
     pub speculation_barriers: bool,
-    /// Expose the modern virtio-MMIO entropy device (native entropy, copied completions).
+    /// Expose the modern virtio entropy device (native entropy, copied completions).
     pub rng: bool,
     /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
     pub disk: Option<PathBuf>,
-    /// Expose the virtio-MMIO network device on user-mode NAT ([`crate::virtio::Slirp`]).
+    /// Expose the virtio network device on user-mode NAT ([`crate::virtio::Slirp`]).
     pub net: bool,
     /// Per device, virtio-MMIO (default) or virtio-PCI.
     pub transports: Transports,
