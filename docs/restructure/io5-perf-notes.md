@@ -254,6 +254,13 @@ Rules learned in this round:
     peer code invalidation, reinject backlog, IF inside the miss). Possible follow-up: let `Mapped::Unknown` continue
     the L2 search instead of ending it (fewer declines when processes map different code at one address).
 
+27. **Round result, three interleaved timing rounds** (`natemu-raw/round-20261114-01`, order rotated, timing only, no
+    contention; base `b772652` = this round's start with decisions 2-7, head = all of decisions 16-26 merged). Medians:
+    configure 72.9 -> 69.8 s (pool off, -4.3%) -> 67.5 s (pool on, -7.4%); make 136.5 -> 129.3 (-5.3%) -> 127.0 (-7.0%).
+    Pool on vs off -3.3% / -1.8% (every make pool-on run faster than every pool-off run). The two-way L1's guest-time
+    question (decision 22) is settled: no wall cost. The fast-miss merge (6089ca6) is in head. Pool -> default on (owner
+    approval after the gate). Remaining: full suite (caches off), benchmark suite, IO5 full boot.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
@@ -270,5 +277,6 @@ dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3
 | natemu after group R1 (decision 16) | 73.0 s | 137.0 s (single run) |
 | natemu after two-way L1 (decision 22) | 72.7 s | 132.1 s (single run) |
 | ... with the shared pool on (decision 25) | 68.6 s | 130.9 s (single run) |
+| round start vs head, timing-only medians of 3 (decision 27) | 72.9 -> 67.5 s | 136.5 -> 127.0 s |
 | QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
 | native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |
