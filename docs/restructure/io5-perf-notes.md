@@ -154,6 +154,20 @@ Rules learned in this round:
     CTR_EL0: no measurable gain (patch unchanged: the clean was nearly free on this chip); kept as correct and free.
     make's miss bucket varies 287-315 ns per miss across five recent runs (noise band for single-run judgements).
 
+17. **Plans for the census's top items, reviewed (Fable authors, independent reviewers).**
+    Page-level currency (`page-currency-plan`): design sound for x86 (every walk input keyed or flushes; staleness is
+    what a TLB may show, SDM 4.10.4), but fixes needed (a 2 MiB record could serve a non-RAM page; one K1 program goes
+    red and check mode disagrees by design; three mutations survive). Its own gain is ~1-2%; its value is letting the
+    fast miss path serve the 54% of configure misses that revalidate, so it is sequenced right before that path and
+    folded into it if its count misses. The fast-miss plan is being written by the same author.
+    Flush policy (`flush-policy-plan`): two halves evicted oldest-first does not protect hot blocks (a block in
+    continuous use is lost once per C placements, as today), and the design had two correctness defects (survivor
+    translations off their page chains run stale code after a write; no `shadow_generation` bump -> false
+    NO_PROGRESS). Revised to a counting chunk that decides between slim instance records + a bigger index (cheap,
+    no eviction machinery), flush with hot blocks carried forward, and halves with carry-over, by net modelled gain
+    including the eviction's own cost and the pool's overlap. Instances are 66-69% of block numbers on configure,
+    37-45% on make.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
