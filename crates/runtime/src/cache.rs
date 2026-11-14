@@ -2778,6 +2778,10 @@ fn relink(n: usize) {
         let i = u64::from(at) - 1;
         let r = unsafe { record(i as usize).read() };
         at = r.next_in;
+        if r.target != n as u32 {
+            // (A cursor a record move left stale would walk another block's list: halt rather than patch its sources.)
+            crate::execution::halt_native([n as u64, i, u64::from(r.target)], natemu_abi::execution::stop::BAD_LINK)
+        }
         if i >= control().links_susp {
             continue; // a live record of the block (the list holds them all)
         }

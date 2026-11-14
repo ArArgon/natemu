@@ -1360,9 +1360,11 @@ EXPECT_FAULT_AT = {'fa-ro': (FARO, 7)}
 # site into V's block is non-local (V's page is not the site's), so a CR3 load suspends it and the next revalidation of V's block
 # relinks it. Each program ends in a guest #PF (a load from a page no table maps) before the body's restore, so its last state
 # (records still suspended, or live) is what the host's link check sees; `cr3-relink` ends normally after a flush.
-RELINK_PROGRAMS = ('cr3-relink', 'relink-smc', 'relink-dead-source', 'relink-stale', 'relink-held', 'relink-global', 'relink-many', 'relink-reclaim')
+RELINK_PROGRAMS = ('cr3-relink', 'relink-smc', 'relink-dead-source', 'relink-stale', 'relink-held', 'relink-global', 'relink-many', 'relink-reclaim', 'relink-invlpg', 'relink-global-many')
 RJ1, RJ2, RW, RG1, RS = 0x9000, 0xa000, 0xb000, 0xc000, 0x100   # site pages, W (global target), G1's page; S on V's page
-RM = 16                                                         # `relink-many`'s sites: RM / 2 on each of RJ1's and RJ2's pages
+RZ, RZS = 0xd000, 0xe000                                      # `relink-global-many`: Z (non-global, `mov eax, 7`) and its two sites
+RNS, RSEP = 6, 2                                              # `relink-many`: local jump sites S, one after every RSEP sites
+RM = 15                                                         # `relink-many`'s sites: RM / 2 on each of RJ1's and RJ2's pages
 RSITE = lambda d, k: d + (RJ1 if k % 2 == 0 else RJ2) + 0x100 * (k // 2)
 # `relink-reclaim` (test link capacity 4096, as `link-full`'s smaller one): RR sites, 8 bytes apart from d + RJ1 (`jmp V`), in A and in B:
 # more links than fit while the first space's are suspended, so a reclaim drops suspended records (and their outbound entries).
@@ -1380,6 +1382,11 @@ def relink_bodies(k, i, n):
     run = lambda at, reg: call(f'q{next(tag)}', f'{at:#x}') + f'    add {reg}, rax\n'
     set_ = lambda at, reg: call(f'q{next(tag)}', f'{at:#x}') + f'    mov {reg}, rax\n'
     both = lambda reg: run(d + RJ1, reg) + run(d + RJ2, reg)
+    # RM sites, with RNS S (local jumps on V's page) between them in A only: their records are the first walk's live records in the middle of V's
+    # inbound list, and some are first of the local segment when the cursor is on them (a cursor on such a record must survive the move of the
+    # record before it: a record move that shifts the first record of a later segment would leave it stale).
+    sites_and_s = lambda reg, s_reg: ''.join(run(RSITE(d, j), reg) + (run(d + RS + 0x40 * (j // RSEP), s_reg) if s_reg and j % RSEP == RSEP - 1 and j // RSEP < RNS else '')
+                                             for j in range(RM))
     rr_loop = lambda reg: (f'    mov rbx, {d + RJ1:#x}\n    mov ecx, {RR}\n.r{reg}:\n    lea r13, [rel .e{reg}]\n    jmp rbx\n.e{reg}:\n    add {reg}, rax\n'
                            '    add rbx, 8\n    dec ecx\n    jnz .r' + reg + '\n')
     rounds = lambda body: f'    mov ecx, {k}\n.l:\n' + body + '    dec ecx\n    jnz .l\n'
@@ -1408,11 +1415,20 @@ def relink_bodies(k, i, n):
         # name no record the reclaim dropped; the sites run again (new blocks) in B.
         'relink-reclaim': (cr3(0) + rr_loop('r8') + cr3(1) + rr_loop('r9')
                            + ''.join(f'    mov byte [{d + RJ1 + 0x1000 * q + 7:#x}], 0x90\n' for q in range(RR * 8 // 0x1000 + 1)) + rr_loop('r10') + RELINK_END),
-        # `cr3-relink` with RM sites into V, while the TLB segment (G1 -> W, W global) and the local one (S -> V, S on V's page) hold
-        # records that must not move. Each round: A (S, the sites), B (S, the sites), G1.
+        # An INVLPG of V while B is loaded cuts A's block, which has suspended records: they go with it (no record below the TLB segment stays
+        # on a block's list after a cut); back in A the sites link again.
+        'relink-invlpg': (cr3(0) + both('r8') + cr3(1) + f'    mov rax, {d:#x}\n    invlpg [rax]\n' + both('r9') + cr3(0) + set_(d + RJ1, 'r10')
+                          + set_(d + RJ2, 'r12') + cr3(1) + RELINK_END),
+        # V global (G in table A, PGE on), RM sites into it, and two sites into Z (not global). Each round PGE off and on (two global flushes
+        # suspend every record), then Z's sites (Z revalidated: its records are live in the CR3 segment), then V's: the walk moves V's
+        # suspended records into the TLB segment with the CR3 segment non-empty (the second boundary swap moves a CR3 record).
+        'relink-global-many': (pge(True) + rounds(pge(False) + pge(True) + run(d + RZS, 'r9') + run(d + RZS + 0x100, 'r9')
+                                                  + ''.join(run(RSITE(d, j), 'r8') for j in range(RM))) + RELINK_END),
+        # `cr3-relink` with RM sites into V, while the TLB segment (G1 -> W, W global) and the local one (S -> V, S on V's page, its
+        # record in the middle of V's inbound list, first of the local segment) hold records that must not move. Each round: A (half
+        # the sites, S, the rest), B (the same), G1.
         'relink-many': (pge(True) + set_(d + RG1, 'r11') + '    xor r10d, r10d\n'
-                        + rounds(cr3(0) + run(d + RS, 'r12') + ''.join(run(RSITE(d, j), 'r8') for j in range(RM))
-                                 + cr3(1) + run(d + RS, 'r14') + ''.join(run(RSITE(d, j), 'r9') for j in range(RM)) + run(d + RG1, 'r10'))
+                        + rounds(cr3(0) + sites_and_s('r8', 'r12') + cr3(1) + sites_and_s('r9', None) + run(d + RG1, 'r10'))
                         + RELINK_END),
     }
 
@@ -1427,16 +1443,21 @@ def relink_memory(name, i):
     out = [mem(d + RJ1, first), mem(d + RJ2, to_v(d + RJ2))]
     if name == 'relink-reclaim':
         out = [mem(d + RJ1, b''.join(JMP(d + RJ1 + 8 * j, d) + b'\x90\x90\x90' for j in range(RR)))]
+    if name == 'relink-global-many':
+        out = [mem(RSITE(d, j), to_v(RSITE(d, j))) for j in range(RM)]
+        out += [mem(d + RZ, CODE(7))] + [mem(d + RZS + 0x100 * q, JMP(d + RZS + 0x100 * q, d + RZ)) for q in range(2)]
     if name == 'relink-many':
         out = [mem(RSITE(d, j), to_v(RSITE(d, j))) for j in range(RM)]
         # S on V's page in both frames (a local link into V's block); W (global) and G1 (`jmp W`, not global).
-        out += [mem(d + f + RS, JMP(d + RS, d)) for f in (F1, F2)]
+        out += [mem(d + F1 + RS + 0x40 * q, JMP(d + RS + 0x40 * q, d)) for q in range(RNS)]
         out += [mem(d + RW, CODE(9)), mem(d + RG1, JMP(d + RG1, d + RW))]
     return out
 
 
 def relink_tables(name, i):
     d = P.SYS_D(i)
+    if name == 'relink-global-many':
+        return {d: (d + F1) | P.LEAF | G}, {}
     if name != 'relink-many':
         return {}, {}
     g = (d + RW) | P.LEAF | G
@@ -1451,8 +1472,10 @@ RELINK_VALUES = {
     'relink-stale': {'r8': {1}, 'r9': {2}, 'r10': {2}, 'r12': {1, 2}},
     'relink-held': {'r8': {1}, 'r9': {2}, 'r10': {2}},
     'relink-global': {'r8': {1}, 'r9': {1}, 'r10': {1}},
+    'relink-invlpg': {'r8': {2}, 'r9': {4}, 'r10': {1}, 'r12': {1}},
+    'relink-global-many': lambda i, k: {'r8': {RM * k}, 'r9': {14 * k}},
     'relink-reclaim': {'r8': {RR}, 'r9': {2 * RR}, 'r10': {2 * RR}},
-    'relink-many': lambda i, k: {'r8': {RM * k}, 'r9': {2 * RM * k}, 'r10': {9 * k}, 'r12': {k}, 'r14': {2 * k}},
+    'relink-many': lambda i, k: {'r8': {RM * k}, 'r9': {2 * RM * k}, 'r10': {9 * k}, 'r12': {RNS * k}},
 }
 # Least counts of k1.relink fields: relinked, relink_dropped, suspended, links_susp (the suspended segment's length at the end).
 RELINK_LEAST = {
@@ -1462,8 +1485,10 @@ RELINK_LEAST = {
     'relink-stale': {'relinked': 1, 'relink_dropped': 1},
     'relink-held': {'relinked': 1, 'links_susp': 1},
     'relink-global': {'relinked': 1, 'suspended': 1},
-    'relink-many': {'relinked': RM, 'links_susp': 1},
+    'relink-many': {'relinked': lambda k: 2 * RM * (k - 1), 'links_susp': 1},   # (every site of every round but the first)
     'relink-reclaim': {'suspended': RR},
+    'relink-invlpg': {'suspended': 2},
+    'relink-global-many': {'relinked': lambda k: (RM + 2) * (k - 1)},
 }
 EXPECT_STOP.update({n: ('guest_fault', '') for n in RELINK_PROGRAMS if n != 'cr3-relink'})
 EXPECT_FAULT.update({n: 14 for n in RELINK_PROGRAMS if n != 'cr3-relink'})
@@ -1801,7 +1826,7 @@ def diff_counts(a, n, name, report):
 # Relink plan: per extra round, the linker entries and the links relinked (k1.relink), as differences of runs at K and 2K rounds.
 # (A round: the two CR3 loads' exits and one trap per space, the first site's: it revalidates V's block and relinks the other sites'
 # records; without relink every site traps: `cr3-relink` 6 entries a round, `relink-many` 2 + 2 RM.)
-RELINK_COUNTS = {'cr3-relink': (4, 4), 'relink-many': (4, 2 * RM)}
+RELINK_COUNTS = {'cr3-relink': (4, 4), 'relink-many': (4, 2 * RM), 'relink-global-many': (5, RM + 2)}
 
 
 def relink_counts(a, n, name, report):
@@ -2039,7 +2064,8 @@ def main():
                 # Relink plan: the counters each program must show (k1.relink).
                 for v, c in enumerate(out['cpus'] if out and name in RELINK_LEAST else []):
                     got = c['stats']['k1'].get('relink', {})
-                    problems += [f'cpu{v} relink {f} = {got.get(f, 0)}, want at least {m}' for f, m in RELINK_LEAST[name].items() if got.get(f, 0) < m]
+                    least = {f: m(a.k) if callable(m) else m for f, m in RELINK_LEAST[name].items()}
+                    problems += [f'cpu{v} relink {f} = {got.get(f, 0)}, want at least {m}' for f, m in least.items() if got.get(f, 0) < m]
                     if name == 'relink-reclaim' and c['stats']['k1']['reclaims'][0] < 1:
                         problems.append(f"cpu{v} no reclaim at capacity {RR_CAP}")
                 stats = out and [{k: c['stats'].get(k) for k in ('requests', 'compiles', 'flushes', 'shadow_resets', 'links', 'unlinks', 'k1')} for c in out['cpus']]

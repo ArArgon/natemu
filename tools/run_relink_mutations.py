@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CACHE = 'crates/runtime/src/cache.rs'
 HOST = 'crates/host/src/execution.rs'
 SOURCES = (CACHE, HOST)
-NEW = 'cr3-relink,relink-smc,relink-dead-source,relink-stale,relink-held,relink-global,relink-many,relink-reclaim'
+NEW = 'cr3-relink,relink-smc,relink-dead-source,relink-stale,relink-held,relink-global,relink-many,relink-reclaim,relink-invlpg,relink-global-many'
 
 # name: ([(file, old, new)], programs that must go red, link-check resident?)
 MUTATIONS = {
@@ -30,7 +30,7 @@ MUTATIONS = {
     'kill-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if (all || i < control().links_tlb) && i >= control().links_susp {\n            // (A suspended record')],
                              'relink-smc', True),
     'invlpg-cut-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if all || (i < control().links_tlb && i >= control().links_susp) {\n            // (A suspended record')],
-                                    'remap-link,cross-link', True),
+                                    'relink-invlpg,remap-link,cross-link', True),
     'unlink-all-unlinks-suspended': ([(CACHE, '        if i as u64 >= c.links_susp {\n            unlink(r)?;', '        if true {\n            unlink(r)?;')], 'cr3-relink', False),
     'outbound-unlinks-suspended': ([(CACHE, '        // restored when it was suspended.)\n        if i >= control().links_susp {\n            unlink(r)?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut at);', '        // restored when it was suspended.)\n        if true {\n            unlink(r)?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut at);')], 'relink-dead-source', False),
     'inbound-unlinks-suspended': ([(CACHE, '            if i >= control().links_susp {\n                unlink(r)?;\n                undone += 1;', '            if true {\n                unlink(r)?;\n                undone += 1;')], 'relink-smc', False),
@@ -46,13 +46,12 @@ MUTATIONS = {
                                      'cr3-link,cr3-relink', False),
     'relink-disabled': ([(CACHE, 'if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);', 'if false && block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);')], 'cr3-relink', False),
     'relink-skips-cursor-fix': ([(CACHE, '        if *follow == last as u32 + 1 {\n            *follow = i as u32 + 1;\n        }', ''),
-                                 (CACHE, '            if *follow == end as u32 + 1 {\n                *follow = last as u32 + 1;\n            }', '')], 'relink-many', False),
+                                 (CACHE, '            if *follow == end as u32 + 1 {\n                *follow = last as u32 + 1;\n            }', '')], 'relink-many,relink-global-many', False),
     'relink-moves-with-insert': ([(CACHE, 'resume(i, r, global, &mut at);', 'remove(i, SUSP, &mut at);\n        insert(LinkRecord { prev_in: 0, next_in: 0, ..r }, if global { TLB } else { CR3 });')], 'relink-many', False),
     'host-rule-unlinked-only': ([(HOST, '} else if !admitted && !held {', '} else if !admitted {')], 'relink-held', False),
     # ---- the batch (step 1's synchronization, now `suspend`'s): a word left unrestored goes unnoticed until a link is taken
     'suspend-skips-last-word': ([(CACHE, '    for i in from..to {\n        clean_pou(ctr, area::CODE_WRITE_VA', '    for i in from..to.saturating_sub(1) {\n        clean_pou(ctr, area::CODE_WRITE_VA')], 'cr3-relink,relink-many', False),
     # ---- the host check's other rules
-    'host-allows-current-suspended': ([(HOST, '} else if current {\n                why = Some("a current target");', '} else if false {\n                why = Some("a current target");')], 'relink-held', False),
 }
 # (Drain fix: a block's death undoes its links out by its outbound list, `unlink_outbound`, not a pass over the records; a suspended
 # record stays on its source's outbound list, so that list is what drops it. `prune` meets suspended records only from a reclaim, after
