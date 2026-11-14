@@ -538,6 +538,17 @@ fn decoder_refuses_each_bound() {
         assert!(decode(&x).is_err(), "{a:#x} {b:#x}");
     }
     assert!(decode(&buffer[..n - 64]).is_err() && decode(&[]).is_err());
+    // More relocations than a block records, all in order and inside the code, in a header whose length is right.
+    let mut many = o.clone();
+    many.code = vec![0; 4 * (MAX_RELOCS as usize + 8)];
+    many.links = [LinkPoint::NONE; MAX_LINK_POINTS];
+    many.rep_exits = 0;
+    many.dispatch_exit = 0;
+    many.relocs = (0..=MAX_RELOCS).map(|w| w << 6).collect();
+    assert!(matches!(
+        many.seal().parts().encode(64, &mut buffer),
+        Err(Refusal::Malformed("counts"))
+    ));
 }
 
 /// Review finding B1: a slot left over from an earlier lap names a position whose place now lies inside a newer entry,
