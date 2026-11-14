@@ -396,6 +396,8 @@ def profile(args):
                     fsck = subprocess.run([E2 / 'e2fsck', '-fn', f'{disk}?offset={ROOT_OFFSET}'], capture_output=True, text=True)
                     (args.out / 'fsck-trim.log').write_text(fsck.stdout + fsck.stderr); ok &= fsck.returncode == 0
                 disk.unlink(); shutil.rmtree(cache, ignore_errors=True)
+                if not args.keep_request_logs:   # ~0.4 GiB per vCPU per step; the summary (`vcpu {...}` lines) stays in perf-STEP.log
+                    for raw in args.out.glob(f'perf-{step}.log.v[0-9]*'): raw.unlink()
                 for line in (args.out / f'markers-{step}.tsv').read_text().splitlines():
                     t, text = line.split('\t'); m = text.split()
                     if m[1] == 'step':
@@ -441,6 +443,7 @@ def main():
     f.add_argument('--lock', type=Path, default=VM_LOCK)
     f.add_argument('--no-perf-log', dest='perf_log', action='store_false', help='timing only (no timing log, no request logs)')
     f.add_argument('--backend', choices=('natemu', 'qemu'), default='natemu', help='qemu: the same steps under QEMU (no timing log)')
+    f.add_argument('--keep-request-logs', action='store_true', help='keep the per-vCPU request logs (perf-STEP.log.vN, ~0.4 GiB each; tools/io5_breakdown.py needs them); deleted after each step by default')
     f.set_defaults(perf_log=True)
     args = a.parse_args()
     if args.cmd == 'prepare': prepare(args.inputs); return 0
