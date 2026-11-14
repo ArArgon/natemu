@@ -1661,6 +1661,41 @@ struct Entry {
     /// Option (d): what admission made of `answer` at `rip`, set by the first use there ([`Compiler::answered`]).
     kept: std::sync::OnceLock<Box<Kept>>,
 }
+/// Why an object answer was admitted again, or not ([`Compiler::admissions`]; the performance log's `state.admissions`). A hit
+/// that cannot reuse its kept form gets the first of `CPL0`, `BULK`, `SHAPE`, `SHORT_PREFIX` that applies.
+pub(crate) mod why {
+    /// The kept form was reused: no admission.
+    pub const SKIPPED: usize = 0;
+    /// The first use of an answer fexc just compiled, one the persistent cache gave, and one fexc compiled again after the
+    /// memory cache dropped it.
+    pub const FRESH: usize = 1;
+    pub const DISK: usize = 2;
+    pub const RECOMPILED: usize = 3;
+    /// A hit whose answer keeps no form yet (no admission of it at its own RIP, or only at another RIP's first use).
+    pub const NO_KEPT: usize = 4;
+    pub const CPL0: usize = 5;
+    pub const BULK: usize = 6;
+    pub const SHAPE: usize = 7;
+    pub const SHORT_PREFIX: usize = 8;
+    /// The kept form could not be moved to another RIP (a relocation that does not pack, too many, `relocate_code`'s
+    /// refusal, or its code differing from the moved answer's).
+    pub const MOVE_REFUSED: usize = 9;
+    /// An object the host translates again with fewer instructions ([`crate::admission::retry`]): never admitted.
+    pub const RETRY: usize = 10;
+    pub const NAMES: [&str; 11] = [
+        "skipped",
+        "fresh",
+        "disk",
+        "recompiled",
+        "no_kept",
+        "cpl0",
+        "bulk",
+        "shape",
+        "short_prefix",
+        "move_refused",
+        "retry",
+    ];
+}
 /// An answer's admitted form (its record without the object, which [`crate::relocation::resolved`] gives back) and the
 /// CPL-0, bulk and code-shape values admission ran under: it is reused only where they are the request's. The feature
 /// bits (`supported`) are not compared: they are fixed per [`Compiler`], and [`Compiler::share`] joins only maps made for
@@ -1975,6 +2010,9 @@ pub struct Compiler {
     pub relocation_refused: u64,
     pub relocation_fallbacks: u64,
     pub reuse_checks: u64,
+    /// Every object answer [`Compiler::answered`] handled, by [`why`] (their sum is the total; all but `SKIPPED` ran
+    /// admission, or were refused before it as a retry).
+    pub admissions: [std::cell::Cell<u64>; why::NAMES.len()],
     /// Debug check (the program driver's `--code-shape` or `--check-reuse`, `boot-linux --check-reuse`): every answer used at
     /// another RIP than its own is also compiled there, and the two must be equal (else a host error).
     pub check_reuse: bool,
@@ -2118,6 +2156,7 @@ impl Compiler {
             relocated: 0,
             relocation_refused: 0,
             relocation_fallbacks: 0,
+            admissions: Default::default(),
             reuse_checks: 0,
             check_reuse: false,
             pic: cache::PIC_USER,
@@ -2210,7 +2249,7 @@ impl Compiler {
         self.waited(waited);
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
-            if let Some(code) = self.reuse(e, bytes, rip, limit, hook)? {
+            if let Some(code) = self.reuse(e, bytes, rip, limit, hook, None)? {
                 self.hits += 1;
                 self.hits_by_source[usize::from(e.owner)] += 1;
                 self.read = e.prefix.len();
@@ -2225,8 +2264,9 @@ impl Compiler {
         // case (it is keyed as memory is, so it would hold the same answer).
         let mut disk = found.is_none();
         loop {
-            let compiles = self.compiles;
+            let (compiles, disk_hits) = (self.compiles, self.disk_hits);
             let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
+            let disk_hit = self.disk_hits > disk_hits;
             let t = self.stamp();
             let (whole, end) = (
                 reply.extent as usize >= bytes.len(),
@@ -2250,10 +2290,12 @@ impl Compiler {
                 self.duplicates += 1;
             }
             // PIC study: fexc compiled again an answer the map had dropped (by this vCPU's own: `.1`).
+            let mut recompiled = false;
             if self.compiles > compiles {
                 if let Some(owner) = self.answers.recompiled(limit, &entry) {
                     self.recompiled[0] += 1;
                     self.recompiled[1] += u64::from(owner == self.vcpu);
+                    recompiled = true;
                 }
             }
             self.read = end;
@@ -2261,7 +2303,14 @@ impl Compiler {
             if let Some(r) = &mut self.perf {
                 r.read = (hash(&entry.prefix), entry.prefix.len() as u32);
             }
-            match self.reuse(&entry, bytes, rip, limit, hook)? {
+            let origin = if disk_hit {
+                why::DISK
+            } else if recompiled {
+                why::RECOMPILED
+            } else {
+                why::FRESH
+            };
+            match self.reuse(&entry, bytes, rip, limit, hook, Some(origin))? {
                 Some(code) => return Ok(code),
                 None => disk = false, // a disk answer for another RIP that is not fexc's here
             }
@@ -2286,7 +2335,8 @@ impl Compiler {
         }
     }
     /// The kept answer `e`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it would not be fexc's
-    /// at `rip`, or admission refused the relocated object; logged; the caller compiles).
+    /// at `rip`, or admission refused the relocated object; logged; the caller compiles). `origin`: a [`why`] when this is
+    /// the answer's first use, by the request that made it.
     fn reuse(
         &mut self,
         e: &Entry,
@@ -2294,11 +2344,12 @@ impl Compiler {
         rip: u64,
         limit: Option<u32>,
         hook: &mut impl Hook,
+        origin: Option<usize>,
     ) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
         let t = self.stamp();
         let (from, read) = (e.rip, (e.read, e.whole, e.prefix.len()));
         let code = if from == rip {
-            self.answered(&e.answer, bytes, rip, hook, Some(e))?
+            self.answered(&e.answer, bytes, rip, hook, Some(e), origin)?
         } else {
             let Some(answer) = e.answer.at(from, rip) else {
                 self.relocation_refused += 1;
@@ -2310,7 +2361,7 @@ impl Compiler {
                 self.check(&answer, read, bytes, rip, limit, from, hook)?;
             }
             let t = self.stamp();
-            match self.answered(&answer, bytes, rip, hook, Some(e)) {
+            match self.answered(&answer, bytes, rip, hook, Some(e), origin) {
                 Ok(code) => {
                     self.relocated += 1;
                     self.charge(
@@ -2378,16 +2429,24 @@ impl Compiler {
     }
     /// Option (d): the block `e`'s kept form gives for `object` (its answer, moved to `rip`), without admission: only where
     /// the request's CPL 0, bulk and code-shape values are those admission ran under, the answer's bytes cover the block's
-    /// ([`crate::relocation::kept`] for the rest). `None`: admit it.
-    fn skip(&self, e: &Entry, object: &[u8], rip: u64) -> Option<admission::Admitted> {
-        let (k, Answer::Object(from)) = (e.kept.get()?, &e.answer) else {
-            return None;
+    /// ([`crate::relocation::kept`] for the rest). `Err`: admit it, for that [`why`].
+    fn skip(&self, e: &Entry, object: &[u8], rip: u64) -> std::result::Result<admission::Admitted, usize> {
+        let (Some(k), Answer::Object(from)) = (e.kept.get(), &e.answer) else {
+            return Err(why::NO_KEPT);
         };
-        (k.cpl0 == self.cpl0
-            && k.bulk == self.bulk
-            && k.shape == self.shape
-            && e.prefix.len() >= k.form.guest_bytes as usize)
-            .then(|| crate::relocation::kept(&k.form, from, e.rip, object, rip))?
+        if k.cpl0 != self.cpl0 {
+            return Err(why::CPL0);
+        }
+        if k.bulk != self.bulk {
+            return Err(why::BULK);
+        }
+        if k.shape != self.shape {
+            return Err(why::SHAPE);
+        }
+        if e.prefix.len() < k.form.guest_bytes as usize {
+            return Err(why::SHORT_PREFIX);
+        }
+        crate::relocation::kept(&k.form, from, e.rip, object, rip).ok_or(why::MOVE_REFUSED)
     }
     /// [`Compiler::compile_once`]'s use of an answer (`kept`: the entry it is, moved to `rip` or not): admitted, or decoded.
     #[cfg_attr(not(feature = "testing"), allow(unused_variables))]
@@ -2398,13 +2457,22 @@ impl Compiler {
         rip: u64,
         hook: &mut impl Hook,
         kept: Option<&Entry>,
+        origin: Option<usize>,
     ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         Ok(match answer {
             Answer::Object(object) => match admission::retry(object) {
-                Some(n) => Err(n),
+                Some(n) => {
+                    self.admissions[why::RETRY].set(self.admissions[why::RETRY].get() + 1);
+                    Err(n)
+                }
                 None => {
-                    #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
-                    let skipped = kept.and_then(|e| self.skip(e, object, rip));
+                    // The reason this answer is admitted again: its first use's `origin`, else what the kept form lacks.
+                    let skipped = kept
+                        .map_or(Err(why::NO_KEPT), |e| self.skip(e, object, rip))
+                        .map_err(|r| origin.unwrap_or(r));
+                    let n = &self.admissions[skipped.as_ref().map_or_else(|&r| r, |_| why::SKIPPED)];
+                    n.set(n.get() + 1);
+                    let skipped = skipped.ok();
                     #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
                     let mut admitted = match skipped {
                         Some(a) if !self.check_reuse => a,
@@ -3776,7 +3844,7 @@ mod tests {
             }
         }
         fn block(c: &Compiler, answer: &Answer, e: &Entry, rip: u64) -> Result<admission::Admitted> {
-            match c.answered(answer, USER, rip, &mut (), Some(e))? {
+            match c.answered(answer, USER, rip, &mut (), Some(e), None)? {
                 Ok(Code::Block(b)) => Ok(b),
                 _ => panic!("not a block"),
             }
@@ -3882,7 +3950,7 @@ mod tests {
             c.compile(USER, A.1, false, &mut ()).unwrap();
             let honest = c.answers.find(USER, A.1, None, &c.gating()).0.unwrap();
             assert!(honest.kept.get().is_some());
-            assert!(matches!(c.reuse(&honest, USER, B.1, None, &mut ()), Ok(Some(_))));
+            assert!(matches!(c.reuse(&honest, USER, B.1, None, &mut (), None), Ok(Some(_))));
             let k = honest.kept.get().unwrap();
             let form = admission::Admitted { guest_insns: k.form.guest_insns + 1, ..k.form.clone() };
             let f = Entry {
@@ -3896,7 +3964,46 @@ mod tests {
                 kept: Default::default(),
             };
             f.kept.set(Box::new(Kept { cpl0: k.cpl0, bulk: k.bulk, shape: k.shape, form })).ok().unwrap();
-            assert!(c.reuse(&f, USER, B.1, None, &mut ()).is_err());
+            assert!(c.reuse(&f, USER, B.1, None, &mut (), None).is_err());
+        }
+
+        /// Every object answer is counted under one reason, and the reasons sum to the answers handled.
+        #[test]
+        fn admissions_are_counted_by_reason_and_sum_to_the_object_answers() {
+            let mut c = compiler();
+            let mut calls = 0;
+            let mut run = |c: &Compiler, e: &Entry, answer: &Answer, rip, origin| {
+                calls += 1;
+                let _ = c.answered(answer, USER, rip, &mut (), Some(e), origin);
+            };
+            let e = kept_entry(USER.len());
+            run(&c, &e, &e.answer, A.1, Some(why::FRESH));
+            run(&c, &e, &e.answer, A.1, None); // reused
+            let flips: [fn(&mut Compiler); 3] = [|c| c.cpl0 = true, |c| c.bulk = true, |c| c.shape = false];
+            for flip in flips {
+                let (cpl0, bulk, shape) = (c.cpl0, c.bulk, c.shape);
+                flip(&mut c);
+                run(&c, &e, &e.answer, A.1, None);
+                (c.cpl0, c.bulk, c.shape) = (cpl0, bulk, shape);
+            }
+            let short = kept_entry(1);
+            run(&c, &short, &short.answer, A.1, Some(why::DISK));
+            run(&c, &short, &short.answer, A.1, None);
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            run(&c, &e, &moved, B.1, None); // reused, moved
+            run(&c, &e, &Answer::Object(B.0.to_vec()), B.1 + 8, None); // not movable
+            let fresh = kept_entry(USER.len());
+            run(&c, &fresh, &fresh.answer, A.1, None);
+            let again = kept_entry(USER.len());
+            run(&c, &again, &again.answer, A.1, Some(why::RECOMPILED));
+            let mut spill = A.0.to_vec();
+            let at = std::mem::offset_of!(natemu_abi::code_object::Header, spill_bytes);
+            spill[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+            let retry = Entry { answer: Answer::Object(spill), ..kept_entry(USER.len()) };
+            run(&c, &retry, &retry.answer, A.1, None);
+            let counts: Vec<u64> = c.admissions.iter().map(|n| n.get()).collect();
+            assert_eq!(counts, [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "{:?}", why::NAMES);
+            assert_eq!(counts.iter().sum::<u64>(), calls);
         }
 
         #[test]
@@ -4462,7 +4569,7 @@ mod tests {
         c.bulk = false;
         assert!(!block(&mut c, &stos).bulk);
         let e = c
-            .answered(&Answer::Object(o), &stos, 0x1000, &mut (), None)
+            .answered(&Answer::Object(o), &stos, 0x1000, &mut (), None, None)
             .err()
             .unwrap();
         assert!(e.contains("--bulk"), "{e}");

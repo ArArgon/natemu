@@ -470,6 +470,11 @@ impl Prepared {
                     duplicates: compiler.duplicates,
                     lock_wait: compiler.lock_wait.into(),
                     recompiled: compiler.recompiled,
+                    admissions: crate::execution::why::NAMES
+                        .into_iter()
+                        .zip(&compiler.admissions)
+                        .map(|(k, n)| (k, n.get()))
+                        .collect(),
                 };
                 match log.finish(
                     end,
@@ -762,6 +767,8 @@ struct VcpuState {
     duplicates: u64,
     lock_wait: [u64; 2],
     recompiled: [u64; 2],
+    /// Object answers by why they were admitted again or not ([`execution::why`]; their sum is every object answer).
+    admissions: crate::report::Members<&'static str, u64>,
 }
 
 #[cfg(test)]
@@ -803,6 +810,7 @@ mod report_tests {
             duplicates: next(),
             lock_wait: [next(), next()],
             recompiled: [next(), next()],
+            admissions: [("skipped", 1), ("fresh", 2)].into_iter().collect(),
         };
         let old = format!(
             "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}],\"recompiled\":[{},{}]}}",
@@ -838,7 +846,8 @@ mod report_tests {
             v.recompiled[0],
             v.recompiled[1]
         );
-        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        let mut old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        old["admissions"] = serde_json::json!({"skipped": 1, "fresh": 2});
         assert_eq!(old, serde_json::to_value(&v).unwrap());
     }
 }
