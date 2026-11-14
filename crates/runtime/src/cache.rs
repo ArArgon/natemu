@@ -698,7 +698,7 @@ pub fn tlb(global: bool) -> Option<u64> {
         }
     }
     // A CR3 load leaves global blocks current: only the links into non-global ones are looked at.
-    prune(if global { TLB } else { CR3 }, false)
+    prune_tlb(if global { TLB } else { CR3 })
 }
 
 /// Places the admitted object at `object` (header `h`) for (`h.guest_rip`, `context`) with its guest-physical
@@ -2263,6 +2263,49 @@ fn prune(scope: usize, strict: bool) -> Option<u64> {
         unlinked += 1;
         remove(i, k, &mut 0);
     }
+}
+/// [`prune`] for a TLB event (`scope` [`CR3`] or [`TLB`], not strict): the same links undone, but the records are
+/// compacted in one pass: the survivors of the scanned segments slide down over the dropped ones' places, then each later
+/// segment's tail fills the gap, so a record moves at most once (`remove` moves up to one per later segment for every
+/// record it drops, and a CR3 load drops nearly every record of its segment).
+fn prune_tlb(scope: usize) -> Option<u64> {
+    let c = control();
+    let old = ends(c).map(|e| *e);
+    let (mut w, mut undone) = (0, 0);
+    let mut new = [0; 4];
+    for k in 0..=scope {
+        for i in if k == 0 { 0 } else { old[k - 1] }..old[k] {
+            let r = unsafe { record(i as usize).read() };
+            let target = block(r.target as usize);
+            if target.flags & DEAD == 0 && block(r.source as usize).flags & DEAD == 0 && current(target) {
+                if w != i {
+                    unsafe { record(w as usize).write(r) };
+                    list_moved(i, w);
+                }
+                w += 1;
+            } else {
+                unlink(r)?;
+                list_del(i as usize);
+                undone += 1;
+            }
+        }
+        new[k] = w;
+    }
+    let gap = old[scope] - w;
+    for j in scope + 1..4 {
+        let (start, end) = (old[j - 1], old[j]);
+        let m = gap.min(end - start);
+        for t in 0..m {
+            let (from, to) = (end - m + t, start - gap + t);
+            unsafe { record(to as usize).write(record(from as usize).read()) };
+            list_moved(from, to);
+        }
+        new[j] = old[j] - gap;
+    }
+    for (e, n) in ends(c).into_iter().zip(new) {
+        *e = n;
+    }
+    Some(undone)
 }
 /// Self-check: every link point of every placed block holds its admitted word (after [`unlink_all`]).
 pub fn links_restored() -> bool {

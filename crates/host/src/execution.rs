@@ -986,6 +986,29 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             (prev, at, on_lists) = (at, r.next_in, on_lists + 1);
         }
     }
+    // The premise of the lists' use at INVLPG and #PF: every non-local record (segments before `links_tlb`) enters a block
+    // that is current now (the resident's `current`) with INBOUND set; every local one, a block with LOCAL_INBOUND.
+    for (i, r) in records.iter().enumerate() {
+        if r.target & cache::CHECKED != 0 {
+            continue;
+        }
+        let Some(t) = blocks.get(r.target as usize) else {
+            return Err(format!("record {i} names block {}", r.target));
+        };
+        let local = i as u64 >= control.links_tlb;
+        let current = t.checked == control.epoch
+            || (t.flags & cache::GLOBAL != 0 && t.checked >= control.global_epoch);
+        if local && t.flags & cache::LOCAL_INBOUND == 0
+            || !local && !(current && t.flags & cache::INBOUND != 0)
+        {
+            return Err(format!(
+                "record {i} ({}) into the block at {:#x}: current {current}, flags {:#x}",
+                if local { "local" } else { "non-local" },
+                t.rip,
+                t.flags
+            ));
+        }
+    }
     let unchecked = records.iter().filter(|r| r.target & cache::CHECKED == 0).count();
     if on_lists != unchecked {
         return Err(format!(
