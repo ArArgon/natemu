@@ -313,6 +313,14 @@ Rules learned in this round:
     12.58 -> 15.26 on make: make busy +1.6%, step 128 -> 131 s; configure busy -2.4%. Not merged; switching to the
     reviewer's layout (four fixed out slots per block, one per link point, 24-B records, one slot update per move).
 
+33. **Drain fix merged (fixed out slots)** (`f418330` and its parents; re-review: accept; K1 500/500 default and
+    link-check; 7 mutations red; gate `natemu-raw/drain-gate-20261114-02`, 2 interleaved perf profiles each). Each block
+    keeps one out slot per link point (the record index), records stay 24 B, a record move updates one slot, and the
+    packed point index lives above bit 28 of `offset_point` (renamed so raw readers fail to compile). Configure irq
+    0.77 -> 0.15 s; patch 139 -> 147 ns / 174 -> 182 ns per event; busy and wall within spread (configure busy 104.6 ->
+    103.4, make 535.9 -> 534.3 excluding one outlier head run at 579 with 12 flushes). Merged as a design fix (owner rule:
+    wasteful designs are fixed even when the gain is small): milliseconds of scanning to kill ~3 blocks are gone.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
