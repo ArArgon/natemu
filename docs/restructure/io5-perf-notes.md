@@ -148,6 +148,11 @@ Rules learned in this round:
     lookups on make, +10.7 vCPU-s) with guest time +14: the same pattern as the census build and absent from host-only
     builds. **Rule: study counters get their own feature, never `perf`** — the perf build is the measuring instrument.
     Counters move to `dispatch-study`; the group is profiled again before judging make.
+    **Second profile (`group-r1-profile-2`, counters off): kept.** `lookup` back to 35 ns (the counters' dependent
+    cold loads on every miss polluted the caches). Busy configure 120.7 -> 112.6 vCPU-s (-6.7%), step 77.1 -> 73.0 s;
+    make 576.8 -> 564.7 (-2.1%), step 139.0 -> 137.0 s. Host -3.6 / -7.5 (admission skipped). Code synchronization by
+    CTR_EL0: no measurable gain (patch unchanged: the clean was nearly free on this chip); kept as correct and free.
+    make's miss bucket varies 287-315 ns per miss across five recent runs (noise band for single-run judgements).
 
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
@@ -162,5 +167,6 @@ dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3
 | --- | --- | --- |
 | natemu, start of round (main) | 89.5-92.6 s | 177.9 s |
 | natemu after decisions 2-7 | 76.7 s | 139.0 s (single run) |
+| natemu after group R1 (decision 16) | 73.0 s | 137.0 s (single run) |
 | QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
 | native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |
