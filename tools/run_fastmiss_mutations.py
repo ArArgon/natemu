@@ -61,7 +61,7 @@ MUTATIONS = {
     'do-remove-keeps-slot': ([(CACHE, '    list_del(i as usize);\n    out_del(i as usize);', '    list_del(i as usize);')], 'kill-out,local-write,remap-link,cr3-link'),
     'do-prune-tlb-keeps-slot': ([(CACHE, '                list_del(i as usize);\n                out_del(i as usize);', '                list_del(i as usize);')], 'cr3-link,remap-link,cr3-switch'),
     'do-unlink-all-keeps-slots': ([(CACHE, '        unsafe { *out_slot(&r) = 0 };\n', '')], 'link-full'),
-    'do-copy-keeps-slots': ([(CACHE, '        inbound: 0,\n        out: [0; MAX_LINK_POINTS],\n        ..*b\n', '        inbound: 0,\n        ..*b\n')], 'reuse-alias,reuse-write,reuse-remap,reuse-cross,pic-two,pic-fork,pic-xwrite,pic-again,pic-cross,pic-now,l1-pic,miss-pic'),
+    'do-copy-keeps-slots': ([(CACHE, '        inbound: 0,\n        out: [0; MAX_LINK_POINTS],\n        ..*b\n', '        inbound: 0,\n        ..*b\n')], 'pic-user')   # (the only program whose CPL-0 code is copied, not shared),
 }
 
 
