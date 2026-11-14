@@ -3,7 +3,7 @@
 lines are recorded, not judged. Each VM gets 180 s; the VM lock is held shared.
 
     python3 tools/run_net_linux.py prepare --out DIR
-    python3 tools/run_net_linux.py run --fexc FEXC --out DIR [--prepared DIR] [--cases C ...] [--vcpus N ...] [--offline]
+    python3 tools/run_net_linux.py run --fexc FEXC --out DIR [--prepared DIR] [--cases C ...] [--vcpus N ...] [--offline] [--transport mmio|pci]
     python3 tools/run_net_linux.py self-check
 
 prepare (run does it into OUT/prepared without --prepared): the Debian 6.12.107 kernel and its unchanged virtio_mmio/virtio_net/net_failover/failover modules, BusyBox and
@@ -42,7 +42,7 @@ import sys
 import tarfile
 import time
 
-from io_common import ROOT, VM_LOCK, digest, stop_group, write_json
+from io_common import PCI_PROBE, ROOT, VM_LOCK, digest, pci_errors, stop_group, write_json
 from raw_root import RAW_ROOT
 from run_virtio_rng import KVER
 
@@ -51,7 +51,7 @@ BLOCK_INPUTS = RAW_ROOT / 'io3-block-20261108-01/inputs-01'
 TOOLS_ROOTFS = RAW_ROOT / 'io-network-tools-20261108-01/rootfs'
 MODULES = {'virtio_mmio': [], 'failover': [], 'net_failover': ['failover'], 'virtio_net': ['net_failover', 'failover']}
 APPLETS = ('sh', 'mount', 'modprobe', 'cat', 'grep', 'sed', 'awk', 'ip', 'udhcpc', 'nslookup', 'ping', 'sha256sum', 'ls',
-           'sleep', 'kill', 'poweroff', 'reboot', 'nproc', 'echo', 'wc', 'head', 'seq')
+           'sleep', 'kill', 'poweroff', 'reboot', 'nproc', 'echo', 'wc', 'head', 'seq', 'dmesg')
 CASES = ('basic', 'rebind', 'cancel', 'reboot', 'nodriver')
 EXTRA_CASES = ('stress',)
 BLOB = 64 << 20
@@ -67,6 +67,7 @@ export PATH=/bin:/usr/bin:/usr/sbin
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
 arg() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline; }
 C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)
+@PCI_PROBE@maybe_probe() { if [ "$(arg net_pci)" = 1 ]; then pci_probe; fi; }
 echo "NET-BEGIN case=$C cpus=$(nproc) kernel=$(cat /proc/sys/kernel/osrelease)"
 modprobe virtio_mmio; ip link set lo up
 if [ $C = nodriver ]; then echo "NET-NO-ETH0 $(ls /sys/class/net | grep -c eth0)"; echo NET-END; poweroff -f; fi
@@ -99,7 +100,7 @@ rebind)
   done
   fetch rebound;;
 reboot)
-  fetch first; echo NET-END; reboot -f;;
+  fetch first; maybe_probe; echo NET-END; reboot -f;;
 stress)
   iperf3 -c $H -t 60 -P 8 --bidir -f m 2>&1 | grep -E 'SUM.*(TX|RX)-C.* (sender|receiver)|error' | sed 's/^/NET-STRESS bidir /'
   iperf3 -c $H -t 5 -P 100 -f m 2>&1 | grep -E 'SUM.* (sender|receiver)|error' | sed 's/^/NET-STRESS p100 /'
@@ -111,9 +112,10 @@ stress)
 cancel)
   echo NET-CANCEL-READY; iperf3 -c $H -t 60 -R >/dev/null 2>&1;;
 esac
+maybe_probe
 echo NET-END
 poweroff -f
-'''
+'''.replace('@PCI_PROBE@', PCI_PROBE.replace('@P@', 'NET'))
 
 
 def prepare(out):
@@ -163,7 +165,8 @@ def lan_address():
         return s.getsockname()[0]
 
 
-def judge(case, text, stderr, code, elapsed, blob_sha, internet):
+def judge(case, text, stderr, code, elapsed, blob_sha, internet, pci=None):
+    """PCI: the vCPU count when the run used --transport pci (adds the PCI probe checks), else None."""
     reasons = []
     def require(ok, reason):
         if not ok: reasons.append(reason)
@@ -185,9 +188,11 @@ def judge(case, text, stderr, code, elapsed, blob_sha, internet):
     if case == 'reboot':
         require(code == 2 and stops == ['Power(2)'], f'reboot: exit {code}, stops {stops}')
         require(lines('NET-FETCH') == [f'first {blob_sha}'] and lines('NET-END') == [''], 'reboot: fetch or end')
+        if pci: reasons += pci_errors(text, 'NET', pci, ('net',))
         return reasons
     require(code == 0 and stops == ['Power(1)'], f'exit {code}, stops {stops}')
     require(lines('NET-END') == [''], 'missing NET-END')
+    if pci and case != 'cancel': reasons += pci_errors(text, 'NET', pci, ('net',))
     if case == 'basic':
         features = lines('NET-FEATURES')
         # Bit n is character n: CSUM (0) and GUEST_CSUM (1) offloads, EVENT_IDX (29), VERSION_1 (32).
@@ -224,10 +229,11 @@ def judge(case, text, stderr, code, elapsed, blob_sha, internet):
 
 def launch(args, case, vcpus, host, blob_sha, work):
     cmdline = (f'console=ttyS0 mitigations=off nokaslr net_case={case} net_host={host} net_sha={blob_sha} '
-               f'net_internet={0 if args.offline else 1}')
+               f'net_internet={0 if args.offline else 1}' + (' net_pci=1' if args.transport == 'pci' else ''))
     command = [str(args.natemu), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.prepared / 'linux'),
                '--initrd', str(args.prepared / 'initramfs.cpio'), '--net', '--vcpus', str(vcpus), '--ram', '1G',
                '--compile-cache', 'off', '--serial', str(work / 'serial.log'), '--cmdline', cmdline]
+    if args.transport == 'pci': command += ['--virtio-transport', 'pci']
     if case == 'stress': command[1:1] = ['--perf-log', str(work / 'perf.log')]
     limit = 400 if case == 'stress' else 180
     write_json(work / 'command.json', {'command': command})
@@ -274,7 +280,8 @@ def run(args):
                     code, timeout, elapsed = launch(args, case, vcpus, host, blob_sha, work)
                     text = (work / 'serial.log').read_text(errors='replace')
                     stderr = (work / 'stderr.log').read_text(errors='replace')
-                    reasons = ['timeout'] if timeout else judge(case, text, stderr, code, elapsed, blob_sha, not args.offline)
+                    reasons = ['timeout'] if timeout else judge(case, text, stderr, code, elapsed, blob_sha, not args.offline,
+                                                                 vcpus if args.transport == 'pci' else None)
                     speeds = re.findall(r'^NET-(?:SPEED|STRESS|UDP) (.*)$', text, re.M)
                     perf = work / 'perf.log'
                     drops = re.findall(r'^net (\{.*\})$', perf.read_text(errors='replace'), re.M) if perf.exists() else []
@@ -285,7 +292,7 @@ def run(args):
                           + (f" drops {results[-1]['drops']}" if results[-1]['drops'] else ''), flush=True)
     finally:
         for s in servers: s.terminate(); s.wait()
-    write_json(args.out / 'results.json', {'host': host, 'offline': args.offline, 'prepared': str(args.prepared),
+    write_json(args.out / 'results.json', {'host': host, 'offline': args.offline, 'transport': args.transport, 'prepared': str(args.prepared),
                                             'natemu': {str(args.natemu): digest(args.natemu)}, 'results': results})
     return 0 if all(r['pass'] for r in results) else 1
 
@@ -344,6 +351,16 @@ def self_check():
     text, err, code, t = good['cancel']
     assert judge('cancel', text, err, code, 12.0, sha, True)
     assert judge('cancel', text, 'natemu: Power(1)\n', 0, t, sha, True)
+    text, err, code, t = good['basic']
+    probe = ('NET-PCI-BEGIN\nNET-PCI-DEV 0000:00:00.0 0x8086 0x1237 0x060000\nNET-PCI-DEV 0000:00:02.0 0x1af4 0x1041 0x020000\n'
+             'NET-PCI-IRQ  24:          0          0  PCI-MSIX-0000:00:02.0   0-edge      virtio0-config\n'
+             'NET-PCI-IRQ  25:          2          0  PCI-MSIX-0000:00:02.0   1-edge      virtio0-input.0\n'
+             'NET-PCI-DMESG [    1.9] virtio-pci 0000:00:02.0: enabling device (0000 -> 0002)\nNET-PCI-END\n')
+    assert judge('basic', text.replace('NET-END\n', probe + 'NET-END\n'), err, code, t, sha, True, 2) == []
+    assert judge('basic', text, err, code, t, sha, True, 2)                                    # no probe
+    for old, new in (('0x1041', '0x1042'), ('  2          0  PCI', '  0          0  PCI'), ('IRQ  25:          2', 'IRQ  25:          x'),
+                     ('virtio-pci', "can't claim BAR 0: virtio-pci")):
+        assert judge('basic', text.replace('NET-END\n', probe.replace(old, new) + 'NET-END\n'), err, code, t, sha, True, 2), old
     print('self-check: ok')
     return 0
 
@@ -363,6 +380,7 @@ def main():
     r.add_argument('--host', help='the host address the guest connects to [default: the default route\'s]')
     r.add_argument('--offline', action='store_true', help='skip the DNS and HTTPS checks that need the internet')
     r.add_argument('--lock', type=Path, default=VM_LOCK)
+    r.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport (--virtio-transport); pci adds a guest probe and its checks')
     sub.add_parser('self-check')
     args = parser.parse_args()
     if args.command == 'prepare': print(json.dumps(prepare(args.out)['outputs'], indent=2)); return 0
