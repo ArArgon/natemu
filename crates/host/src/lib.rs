@@ -19,6 +19,7 @@ pub mod irq;
 pub mod linux;
 pub mod memory;
 pub mod owners;
+pub mod pci;
 pub mod perf;
 mod pic;
 mod pit;
