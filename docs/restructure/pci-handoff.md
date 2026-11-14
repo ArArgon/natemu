@@ -57,6 +57,15 @@ both transports, a `run.sh`, and four runs marked NOT A RESULT because the machi
 
 ## Remaining work
 
+**Status, November 14 (branch `halt-poll`, on `pci`; an M2 Max without the M4's `natemu-raw`):** items 2 to 4 are
+done in substance, with a session harness instead of the pinned runners
+([io-benchmarks.md](io-benchmarks.md), "PCI transport with multiqueue, interrupt hold and a 256-entry ring"):
+PCI against MMIO for disk and network, and the records. The branch also adds, for the disk over PCI, one request
+queue per vCPU, an interrupt hold and a 256-entry ring, and halt polling for both transports; every matrix row and
+every iperf3 measure is at or above the `pci` tip. Still open: item 1 (the full suite needs the M4's inputs; the
+quick suite here passes 51 steps, the rest fail identically on the `pci` tip or for missing inputs), the same
+benchmarks in the pinned form on the M4, and item 5.
+
 1. **Full suite, once**: `python3 tools/run_suite.py --out DIR` on the branch tip; expect the known `io-coverage`
    `host-full` failure only (and the same in `io-coverage-pci`).
 2. **Disk benchmark, PCI against MMIO on one binary** (existing matrix runner; QEMU and VZ numbers are reused from

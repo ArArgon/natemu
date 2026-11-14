@@ -324,6 +324,17 @@ gets INTx: the GSI is asserted while the ISR is nonzero, at two exits per interr
 configuration space, then MSI-X, then the chipset; no configuration access takes the
 state lock, and Bus Master, BAR0's base and the ISR are published in atomics.
 
+Disk over PCI (branch `halt-poll`, November 14): one request queue per vCPU up to 8
+(VIRTIO_BLK_F_MQ, a vector each; `NATEMU_BLK_QUEUES`), queue size 256, and the
+interrupt hold: a completion whose MSI-X message names one vCPU that is running is
+not interrupted for at once; the owner keeps the queue's kicks suppressed, reads the
+ring itself and raises the interrupt at the vCPU's halt, 8 completions, 30 us without
+a request or 200 us (`block.rs` `Hold`, `NATEMU_BLK_HOLD`). MMIO has neither.
+Measured on an M2 Max, PCI against MMIO on one binary (io-benchmarks.md, "PCI
+transport with multiqueue..."): 4 KiB depth 16 at 1 vCPU 27-31k to 75-78k IOPS, at 4
+vCPUs 64-72k to 86-97k; depth 1 at 4 vCPUs 13.7k to 23k; 128 KiB at 4 vCPUs 5-11%
+behind; network level.
+
 Stated leniencies and deviations:
 (a) the whole PCI window is one claimed range: a read of a window address no BAR
 decodes costs a host exit each time instead of mapping the shared all-ones page, and
