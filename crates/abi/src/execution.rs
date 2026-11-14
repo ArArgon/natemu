@@ -1619,6 +1619,25 @@ pub fn relocate_code(
         }
         code[at..at + 4].copy_from_slice(&p.word.to_le_bytes());
     }
+    // Distance 0 (the same RIP, as for a kernel's code or a fixed-address program run by a peer): nothing is rewritten, the code
+    // is the block admission accepted at this very RIP (the host admits every object at the RIP it is for, and a template is
+    // only ever published or copied as admitted), so the move re-encoding, which proves that the rewritten words are what fexc
+    // would emit at a NEW RIP, has nothing to prove (and refuses the 32-bit forms of code below 4 GiB, and any form FEX's
+    // constant loader would pick differently, though no word changes); the offset-order rule guards a word being moved twice
+    // (+ 2d), moot at d = 0. What does not depend on moving is still checked: the place (above) and every link point as an
+    // exit of the code as admitted ([`link_point`]).
+    if d == 0 {
+        let size = size as u32;
+        return if links
+            .iter()
+            .filter(|p| p.offset != 0)
+            .all(|p| link_point(|at| word(code, at as usize), size, p))
+        {
+            Ok(())
+        } else {
+            Err(refusal::LINK)
+        };
+    }
     let mut moved = [false; MAX_LINK_POINTS];
     // Each relocation is rewritten once, in place: they must be in offset order, none starting inside the words or slot
     // of the one before (admission does not refuse a duplicated or overlapping record; one moved twice would be + 2d).

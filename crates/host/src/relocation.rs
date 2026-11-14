@@ -275,6 +275,61 @@ mod tests {
         }
     }
 
+    /// With `FEXC` set: a block below 4 GiB, where fexc's guest-RIP moves (the link point's target) are the 32-bit form, is
+    /// accepted by the re-check at the SAME RIP (nothing moves: the template pool serves such entries as they were admitted) and
+    /// refused at another (relocation of that form is refused, `refusal::MOVE`); a block above 4 GiB is accepted at both, and
+    /// the same-RIP result is the admitted code and link points exactly.
+    #[test]
+    fn the_same_rip_needs_no_move_re_encoding() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        // inc rax; jmp $+0x10 (one literal exit: a link point whose target is a RIP move)
+        let source = [0x48, 0xff, 0xc0, 0xeb, 0x10];
+        let compile = |rip: u64| {
+            let dir = std::env::temp_dir().join(format!("natemu-same-{}-{rip:x}", std::process::id()));
+            let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
+            let st = std::process::Command::new(&fexc)
+                .args(["--hex", &hex, "--rip", &format!("{rip:#x}"), "--profile", "slice1", "--object"])
+                .arg(&dir)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success());
+            let o = std::fs::read(&dir).unwrap();
+            std::fs::remove_file(&dir).unwrap();
+            o
+        };
+        for (low, a, b) in [(true, 0x40_1000u64, 0x50_2000u64), (false, 0x7f12_3440_1000, 0x7f12_3450_2000)] {
+            let o = compile(a);
+            let (code0, relocs, links0, bytes) = placed_at(&o, a, &source, false);
+            assert!(relocs.iter().any(|r| r & RELOC_MOVE != 0) && links0[0].offset != 0);
+            // The same RIP: accepted, code and link points as admitted (the placeholder `placed_at` put in the link point
+            // is restored).
+            let (mut code, mut links) = (code0.clone(), links0);
+            assert_eq!(relocate_code(&mut code, &relocs, &mut links, a, a, bytes), Ok(()), "{a:#x} to itself");
+            let admitted = crate::admission::admit(&o, a, &source, u64::MAX, true, false).unwrap();
+            let h: Header = read(&admitted.object, 0).unwrap();
+            assert_eq!(code, admitted.object[h.code_offset as usize..][..h.code_size as usize]);
+            assert_eq!(links[0], admitted.links[0]);
+            // A link point that is no exit of the code is still refused at distance 0.
+            let mut bad = links0;
+            bad[0].target ^= 1 << 20;
+            let mut code = code0.clone();
+            assert_eq!(relocate_code(&mut code, &relocs, &mut bad, a, a, bytes), Err(refusal::LINK));
+            // Another RIP: the 32-bit form below 4 GiB is refused (a word count or form fexc may not choose there), the
+            // 64-bit form relocated.
+            let mut code = code0.clone();
+            let mut links = links0;
+            let moved = relocate_code(&mut code, &relocs, &mut links, a, b, bytes);
+            if low {
+                assert_eq!(moved, Err(refusal::MOVE));
+            } else {
+                assert_eq!(moved, Ok(()));
+            }
+        }
+    }
+
     /// With `FEXC` set (perf chunk 15 review): a CPL-0 block whose STI exits to its own RIP (and a RIP-relative LEA and, perf
     /// chunk 17, an inline SWAPGS) is fexc's object at another RIP once relocated, by the host's relocator and by the resident's
     /// re-check (link points included: the STI's exit goes to the STI at the new RIP), and is admitted there as a CPL-0 block.
