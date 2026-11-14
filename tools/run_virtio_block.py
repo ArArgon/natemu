@@ -359,9 +359,9 @@ def run(args):
     for name, sha in inputs['outputs'].items(): assert digest(args.inputs / name) == sha, name
     fsck = Path(inputs['tools']['e2fsck']['path'])
     assert digest(fsck) == inputs['tools']['e2fsck']['sha256'], 'e2fsck binary changed'
+    pci = args.transport == 'pci'
     write_json(args.out / 'manifest.json', {'inputs': inputs, 'cpus': args.cpus, 'rng': args.rng, **({'transport': 'pci'} if pci else {}), 'seconds_per_vm': 120,
                'artifacts': {str(p.resolve()): digest(p) for p in (args.natemu, args.runtime, args.fexc, Path(__file__))}, 'source_root': str(ROOT)})
-    pci = args.transport == 'pci'
     if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise SystemExit('--transport pci needs inputs from prepare --transport pci')
     results = []
     with args.lock.open('a') as lock:
