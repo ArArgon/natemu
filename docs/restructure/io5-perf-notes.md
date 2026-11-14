@@ -291,6 +291,16 @@ Rules learned in this round:
     increase) is not met: 8 MiB per vCPU buys nothing measurable, so 2^15 stays. Lesson: benchmark attributions below
     ~5% need >= 5 interleaved runs per build on this machine.
 
+31. **Peer-kick cost attributed** (study build `kick-study`, profile `natemu-raw/kick-study-profile-1`, analysis.txt).
+    Configure: 13,347 peer kicks, 1.38 s; 95% are plain guest IPIs at ~3 us; the cost is a tail of 282 episodes (2.1%)
+    over 512 us that hold 96.8% of the time, all in `drain` (taking posted invalidations): kicks for another vCPU's
+    write to a code page (`code_post`: 530 at ~2.0 ms mean, plus 52 merged with an IPI at ~5.4 ms) — 97% of the source's
+    time. Make: 13,731 kicks, 1.07 s, same shape. Host doorbells cost ~31 us mostly in `tlb` (I/O checkpoint), timers
+    ~4-6 us. So item 9 of the review is not interrupt delivery: it is a slow invalidation drain after code-page writes
+    (milliseconds per post with only ~2.6 blocks killed on average — something in the drain scales with more than the
+    blocks it kills). Next: find what the drain walks (likely a scan proportional to cache contents) and make it
+    proportional to the page's own blocks; worth ~1.3 / 1.0 vCPU-s on configure / make plus the woken vCPU's stall.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
