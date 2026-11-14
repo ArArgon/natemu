@@ -60,11 +60,15 @@ SERIAL_WHY = {
 E_OK = ('fix*', 'seed*', 'i7*', 'i8*', 'i9*', 'i10*', 'i6*', 'i5c*', 'adx*', 'xsave*', 'rex*', 'br66*', 'sha', 'sha-1', 'flow', 'icebp',
         'faults*', 'loopfaults-*', 'instruction-gaps*', 'cpu-forms', 'frame-*', 'maskmovq*', 'vector-ac')
 SHARDS = {'faults': 5, 'i7-faults': 2, 'loopfaults': 3, 'probes': 2, 'k1': {1: 1, 2: 2, 3: 3, 4: 1}}   # parts of about 100 s
-PROBES_EST, CORPORA_EST = 900, {2: 160, 3: 135, 4: 200}
-# Seconds of the long indivisible steps in the November 10 runs (-j 4 -e 6, machine busy): the k1 link-full case (one run, 220-385 s)
-# and the two probe chains; they start first. Everything else comes from the arguments above.
-EST = {'k1-c1': 220, 'k1-c2@2': 320, 'k1-c3@3': 385, 'probes@1': 290, 'probes@2': 600, 'system': 175, 'i5b-faults': 120,
-       'instruction-gaps': 75, 'instruction-gaps-1': 75, 'cpu-forms': 75}
+PROBES_EST, CORPORA_EST = 530, {2: 90, 3: 80, 4: 80}
+# Seconds of the long indivisible steps in the November 10-11 runs (-j 4 -e 6, machine busy): the k1 link-full case (one run, 160-385 s)
+# and the two probe chains (November 11: 363 and 166 s); they start first. Everything else comes from the arguments above.
+# November 14 estimates (not measured: the clang and QEMU reference caches, and the prefix baselines run once, came after the
+# November 11 run; times below are what the removed work suggests, to be replaced by the first run's): system 160 -> 50 once the
+# QEMU cache is warm (a cold run costs the old 160 s), i5b-faults 111 -> 75, cpu-forms 206 s on an efficiency core -> 60 on a performance one.
+EST = {'k1-c1': 220, 'k1-c2@2': 320, 'k1-c3@3': 385, 'probes@1': 360, 'probes@2': 170, 'system': 50, 'i5b-faults': 75,
+       'instruction-gaps': 50, 'instruction-gaps-1': 50, 'cpu-forms': 60, 'frame-alias': 15, 'frame-alias-1': 15, 'vector-ac': 20,
+       'contain': 70}
 E_SLOW = 3.0      # a step's time on the efficiency cores over its `est` (measured with the machine busy: 2.4; i8-faults alone: 3.6-4.1)
 # --quick: one small member of every runner family (the sharded ones: their first shard).
 QUICK = ('build', 'cargo-test', 'cargo-test-fexc', 'runtime', 'l1', 'l2', 'l2-iasl', 'release', 'stack', 'barriers', 'pytests',
@@ -133,14 +137,14 @@ def steps(F, O):
         vm('fix' + sfx, 'run_slice1_vm.py', *blk)
         for c in corpora: vm(c + sfx, 'run_slice1_vm.py', *blk, *pair(c), judge=i8b_judge if c == 'i8b' else None)
         vm('i7-cpl0' + sfx, 'run_slice1_vm.py', '--cpl', '0', *blk, *pair('i7'))
-        shards(SHARDS['faults'], 'faults' + sfx, 'run_slice1_faults.py', *blk, est=650)
-        shards(SHARDS['i7-faults'], 'i7-faults' + sfx, 'run_slice1_faults.py', '--no-probes', *blk, pair('i7')[0], est=380)
-        for r, est in (('run_i6_faults.py', 10), ('run_i8_faults.py', 55), ('run_i9_faults.py', 38), ('run_i10_faults.py', 20), ('run_i5c.py', 8)):
+        shards(SHARDS['faults'], 'faults' + sfx, 'run_slice1_faults.py', *blk, est=300)
+        shards(SHARDS['i7-faults'], 'i7-faults' + sfx, 'run_slice1_faults.py', '--no-probes', *blk, pair('i7')[0], est=260)
+        for r, est in (('run_i6_faults.py', 10), ('run_i8_faults.py', 45), ('run_i9_faults.py', 38), ('run_i10_faults.py', 20), ('run_i5c.py', 8)):
             vm(r[4:-3].replace('_', '-') + sfx, r, *blk, est=est)
         vm('i6b' + sfx, 'run_i6b.py', 'corpus', *blk, RAW / 'i6b-corpus-20261030-01/programs.json', RAW / 'i6b-corpus-20261030-01/expected.json')
         vm('i6b-cases' + sfx, 'run_i6b.py', 'cases', *blk)
     vm('flow', 'run_slice2_vm.py', '--programs', RAW / 's2d/corpus/programs.json', '--expected', RAW / 's2d/corpus/expected.json')
-    for size in ('default', '1', '2'): shards(SHARDS['loopfaults'], f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=150)
+    for size in ('default', '1', '2'): shards(SHARDS['loopfaults'], f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=120)
     shards(SHARDS['probes'], 'probes', 'run_slice2_probes.py', est=PROBES_EST)
     vm('asm', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', est=15, w=4)
     vm('asm-1', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', '--max-block', '1', est=15, w=4)
