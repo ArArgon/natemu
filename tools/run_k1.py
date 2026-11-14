@@ -1092,6 +1092,7 @@ STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac')
 CHUNK_PAGE = ('page-cross', 'page-global', 'page-user', 'page-user-invlpg', 'page-mark', 'page-size-check', 'page-counts')
 CHUNK_MISS = ('miss-counts', 'miss-system', 'miss-step', 'miss-dr7', 'miss-ac')
 PCX = 0x8000                       # `page-cross`: P1's third frame
+MIDT = 0xe000                     # the #DB programs' IDT page (QEMU-compared, so clear of every other page)
 SIDT, LOGP = 0x7010, 0x7e00        # `page-user`: the logging IDT saved here; the #DB handlers' log of RIPs
 PCN = 100                          # `page-counts`' most blocks (2 K at the default 50 rounds), 0x20 apart on V
 LOG_END = lambda d: d + LOGP + 8 * 5
@@ -1114,10 +1115,10 @@ def chunk_bodies(k, i, n):
     A, B, C = pg['A'], pg['B'], pg['C']
     add = lambda tag, va, reg: c(tag, va) + f'    add {reg}, rax\n'
     # Vector 1's gate (#DB) at the handler `.hdb`; the log of RIPs at d + LOGP (rdi).
-    db_idt = (f'    lea rax, [rel .hdb]\n    mov [{d + IDT + 0x10:#x}], ax\n    mov word [{d + IDT + 0x12:#x}], 8\n'
-              f'    mov word [{d + IDT + 0x14:#x}], 0x8e00\n    shr rax, 16\n    mov [{d + IDT + 0x16:#x}], ax\n    shr rax, 16\n'
-              f'    mov [{d + IDT + 0x18:#x}], eax\n    mov word [{d + IDT + 0x800:#x}], 0xfff\n    mov rax, {d + IDT:#x}\n'
-              f'    mov [{d + IDT + 0x802:#x}], rax\n    lidt [{d + IDT + 0x800:#x}]\n    mov rdi, {d + LOGP:#x}\n')
+    db_idt = (f'    lea rax, [rel .hdb]\n    mov [{d + MIDT + 0x10:#x}], ax\n    mov word [{d + MIDT + 0x12:#x}], 8\n'
+              f'    mov word [{d + MIDT + 0x14:#x}], 0x8e00\n    shr rax, 16\n    mov [{d + MIDT + 0x16:#x}], ax\n    shr rax, 16\n'
+              f'    mov [{d + MIDT + 0x18:#x}], eax\n    mov word [{d + MIDT + 0x800:#x}], 0xfff\n    mov rax, {d + MIDT:#x}\n'
+              f'    mov [{d + MIDT + 0x802:#x}], rax\n    lidt [{d + MIDT + 0x800:#x}]\n    mov rdi, {d + LOGP:#x}\n')
     hdb = lambda tail: ('    jmp .end\n.hdb:\n    push rbx\n    mov rbx, [rsp+8]\n    mov [rdi], rbx\n    add rdi, 8\n' + tail
                         + '    pop rbx\n    iretq\n.end:\n')
     sidt = lambda op: f'    {op} [{d + SIDT:#x}]\n'
@@ -1186,8 +1187,10 @@ def chunk_memory(name, i, n):
     if name in STUB_PROGRAMS:
         out += [mem(d + STUB['enter'], b'\x90', capture=False), mem(d + STUB['user'], b'\xff\xe3', capture=False), mem(d + STUB['exit'], b'\x90', capture=False),
                 mem(d + STUB['back'], b'\x41\xff\xe4', capture=False), mem(d + STUB['S'], CODE(0x21), capture=False), mem(d + STUB['S'] + PY, CODE(0x22), capture=False)]
-    if name in ('page-user', 'page-user-invlpg', 'miss-step', 'miss-dr7'):
+    if name in ('page-user', 'page-user-invlpg'):
         out += [dict(P.zero(d + IDT, 0x1000), capture=False)]
+    if name in ('miss-step', 'miss-dr7'):
+        out += [dict(P.zero(d + MIDT, 0x1000), capture=False)]
     if name in ('miss-step', 'miss-dr7'):
         out += [P.zero(d + LOGP, 0x40)]
     if name == 'miss-ac':
@@ -1211,7 +1214,7 @@ def chunk_tables(name, i):
 # Natemu-only values (QEMU cannot switch CPL, and the record's answers are natemu's): the registers each program ends with.
 CHUNK_VALUES = {
     'page-global': {'r8': {1}, 'r9': {0x11}, 'r10': {0x12}, 'r12': {0x21}, 'r14': {0x22}},
-    'page-user': {'r8': {1}, 'r9': {0}, 'r10': {0x21}, 'r14': {0x11}},
+    'page-user': lambda i, k: {'r8': {1}, 'r9': {P.SYS_D(i) + PY}, 'r10': {0x21}, 'r14': {0x11}},   # (r9: the faulted call leaves its target in rax)
     'page-user-invlpg': {'r8': {1}, 'r9': {0x12}, 'r10': {0x21}, 'rdi': {1}},
     'page-mark': {'r8': {1}, 'r9': {0x11}, 'r10': {0x41}},
     'page-size-check': {'r8': {1}, 'r9': {0x11}},
@@ -1584,8 +1587,8 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
         # The page record's counters (k1.page) and the fast miss path's (k1.fast_miss), absent while zero.
         k1 = c['stats']['k1']
         pg, fm = k1.get('page', {}), k1.get('fast_miss', {})
-        if short in PAGE_FORCED_COUNTS and pg.get('disagree', 0) != PAGE_FORCED_COUNTS[short]:
-            problems.append(f"cpu{v} page record disagreed {pg.get('disagree', 0)} times, want {PAGE_FORCED_COUNTS[short]}")
+        if short in PAGE_FORCED_COUNTS and (pg.get('disagree', 0) < PAGE_FORCED_COUNTS[short] if extra else pg.get('disagree', 0) != PAGE_FORCED_COUNTS[short]):
+            problems.append(f"cpu{v} page record disagreed {pg.get('disagree', 0)} times, want {'at least ' if extra else ''}{PAGE_FORCED_COUNTS[short]}")
         if pmode == 'on' and not extra:
             problems += [f'cpu{v} page {f} = {pg.get(f, 0)}, want at least {m}' for f, m in PAGE_ON_COUNTS.get(short, {}).items() if pg.get(f, 0) < m]
         if not extra and os.environ.get('NATEMU_MISS_FAST') != 'off' and not os.environ.get('NATEMU_PIC_TEST'):
