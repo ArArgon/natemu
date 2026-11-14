@@ -496,11 +496,11 @@ def main():
             for block in blocks:
                 name=f'{c["name"]}-cpl{cpl}-block{block}'
                 prefix_text=description(c,cpl,True)
-                if (prefix_text,block) not in baselines: baselines[prefix_text,block]=execute(a,prefix_text,a.out/name/'prefix',block)
-                before,r0=baselines[prefix_text,block]
+                if (prefix_text,block) not in baselines: baselines[prefix_text,block]=(*execute(a,prefix_text,a.out/name/'prefix',block),name)
+                before,r0,baseline_from=baselines[prefix_text,block]      # baseline_from: the case whose prefix/ directory holds this run
                 got,rc=execute(a,description(c,cpl),a.out/name/'probe',block)
                 errors=[f'prefix/probe error {r0}/{rc}'] if not before or before['stop']!='reached' or not got else judge(c,cpl,before,got)
-                rows.append(dict(name=name,errors=errors,oracle_basis=c.get('oracle_basis','documented instruction contract')));print(name,'FAIL' if errors else 'PASS',errors,flush=True)
+                rows.append(dict(name=name,errors=errors,oracle_basis=c.get('oracle_basis','documented instruction contract'),baseline_from=baseline_from));print(name,'FAIL' if errors else 'PASS',errors,flush=True)
                 (a.out/'results.json').write_text(json.dumps(rows,indent=2)+'\n')
     print(f'{len(rows)} executions, {sum(bool(r["errors"]) for r in rows)} failed',flush=True)
     return int(not rows or any(r['errors'] for r in rows))

@@ -249,12 +249,12 @@ def main():
             text, at, end = description(c, cpl)
             prefix_text = description(c, cpl, True)[0]
             if prefix_text not in baselines:
-                baselines[prefix_text] = execute(a, prefix_text, a.out / name / 'prefix')
-            before, rc0 = baselines[prefix_text]
+                baselines[prefix_text] = (*execute(a, prefix_text, a.out / name / 'prefix'), name)
+            before, rc0, baseline_from = baselines[prefix_text]      # baseline_from: the case whose prefix/ directory holds this run
             got, rc = execute(a, text, a.out / name / 'probe')
             errors = ([f'prefix failed: {rc0}'] if not before or before['stop'] != 'reached' else
                       [f'probe failed: {rc}'] if not got else judge(c, before, got, at, end))
-            rows.append(dict(name=name, max_block=a.max_block, errors=errors))
+            rows.append(dict(name=name, max_block=a.max_block, errors=errors, baseline_from=baseline_from))
             print(name, 'FAIL' if errors else 'PASS', errors, flush=True)
     (a.out / 'results.json').write_text(json.dumps(rows, indent=2) + '\n')
     print(f'{len(rows)} cases, {sum(bool(r["errors"]) for r in rows)} failed', flush=True)
