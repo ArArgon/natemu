@@ -1262,6 +1262,32 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             "{on_lists} records on inbound lists, {unchecked} unchecked links"
         ));
     }
+    // A dead block has no link into or out of it (its death undid them): no record names one.
+    let dead = |n: u32| blocks.get(n as usize).is_some_and(|b| b.flags & cache::DEAD != 0);
+    if let Some(i) = records
+        .iter()
+        .position(|r| dead(r.source) || r.target & cache::CHECKED == 0 && dead(r.target))
+    {
+        return Err(format!("record {i} names a dead block"));
+    }
+    // The outbound lists: each block's chain holds exactly the records naming it as source (checked ones too), each once.
+    let mut on_outbound = 0;
+    for (n, b) in blocks.iter().enumerate() {
+        let mut at = b.outbound;
+        while at != 0 {
+            let r = records
+                .get(at as usize - 1)
+                .filter(|r| r.source as usize == n && on_outbound <= records.len())
+                .ok_or_else(|| format!("block {n}'s outbound list is broken at record {}", at - 1))?;
+            (at, on_outbound) = (r.next_out, on_outbound + 1);
+        }
+    }
+    if on_outbound != records.len() {
+        return Err(format!(
+            "{on_outbound} records on outbound lists, {} links",
+            records.len()
+        ));
+    }
     Ok((points, linked.len() as u64))
 }
 

@@ -616,7 +616,9 @@ pub mod cache {
         /// K1: CNTVCT ticks spent in TLB flushes (`cache::tlb`) and INVLPGs (shadows and blocks).
         pub tlb_ticks: u64,
         pub invlpg_ticks: u64,
-        /// K1: #PFs delivered (each invalidates its page's blocks) and their ticks; blocks visited on linear chains.
+        /// K1: #PFs delivered (each invalidates its page's blocks) and their ticks; blocks visited on linear chains and
+        /// link records visited by `cache::prune`'s passes (a block's death never makes one: it undoes its links out by its
+        /// outbound list).
         pub page_faults: u64,
         pub page_fault_ticks: u64,
         pub scanned: u64,
@@ -1006,6 +1008,10 @@ pub mod cache {
         /// Head of its inbound list: the record (index + 1; 0: none) of the newest link into it, from the records'
         /// `next_in` chain ([`LinkRecord`]). Checked links are on no list.
         pub inbound: u32,
+        /// Head of its outbound list: the record (index + 1; 0: none) of a link out of it (one per linked point, at most
+        /// [`super::MAX_LINK_POINTS`]), from the records' `next_out` chain ([`LinkRecord`]). Checked links are on it too.
+        /// Killing the block undoes its links out by this list, with no scan of the records.
+        pub outbound: u32,
     }
     /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
     /// again; its space is reclaimed at the next flush.
@@ -1110,6 +1116,10 @@ pub mod cache {
         /// (`cache::insert`, `remove`), which fix the neighbours.
         pub prev_in: u32,
         pub next_in: u32,
+        /// The outbound list of `source` (every record, checked or not; at most [`super::MAX_LINK_POINTS`] long): the next
+        /// record's index + 1 (0: the end; the head is [`Block::outbound`]). Singly linked: a list is walked from its
+        /// head to find a record's predecessor, as records move.
+        pub next_out: u32,
     }
     /// Invalidation requests to one vCPU, drained at each of its resident entries. Producers only set bits (atomic
     /// OR), the page's `stale` bit, then its word's `summary` bit, before `pending`; the consumer swaps `pending` to 0, then

@@ -868,6 +868,7 @@ pub fn place(
         links,
         shared: 0,
         inbound: 0,
+        outbound: 0,
     };
     unsafe {
         // Copied above the fill point first: nothing refers to it until the record is filed.
@@ -1033,6 +1034,7 @@ pub fn share(t: &Block) -> Option<&'static Block> {
         links,
         shared: 0,
         inbound: 0,
+        outbound: 0,
         ..*t
     };
     let tail = size_of::<Site>() * t.sites_count as usize + 4 * relocs(t).len();
@@ -1091,6 +1093,7 @@ pub fn instance(
         links,
         shared: t.number,
         inbound: 0,
+        outbound: 0,
     };
     let placed = unsafe { file(record, core::ptr::null(), 0, 0) };
     if placed.is_some() {
@@ -1268,6 +1271,7 @@ pub fn copy(
             | b.flags & (RELOCATABLE | MAX_RELOCS << RELOCS_SHIFT | STI_FIRST | UNSHAREABLE),
         links,
         inbound: 0,
+        outbound: 0,
         ..*b
     };
     let tail = size_of::<Site>() * b.sites_count as usize + 4 * relocs(b).len();
@@ -1353,6 +1357,7 @@ pub fn copy_pooled(
         links,
         shared: 0,
         inbound: 0,
+        outbound: 0,
     };
     let tables = e.tables();
     let placed = unsafe { file(record, tables.as_ptr(), tables.len(), 0) };
@@ -1393,6 +1398,7 @@ pub fn place_system(
         links,
         shared: 0,
         inbound: 0,
+        outbound: 0,
     };
     unsafe { file(record, (i as *const System).cast(), size_of::<System>(), 0) }
 }
@@ -1519,6 +1525,7 @@ pub fn place_step(
         links,
         shared: 0,
         inbound: 0,
+        outbound: 0,
     };
     unsafe {
         let at = lookup_area::<Block>(area::STEP_RECORD);
@@ -1848,6 +1855,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
                 target: if checked { area::CHECKED } else { code.number },
                 prev_in: 0,
                 next_in: 0,
+                next_out: 0,
             },
             segment,
         );
@@ -2087,11 +2095,47 @@ fn list_del(i: usize) {
         }
     }
 }
+fn outbound_head(n: u32) -> *mut u32 {
+    unsafe { &raw mut (*block_ptr(n as usize)).outbound }
+}
+/// The place (the source's head, or a record's `next_out`) that names record `named` (index + 1) on `source`'s outbound
+/// list. A list is at most [`MAX_LINK_POINTS`] long: the walk is bounded (a longer one is a broken list: `None`).
+fn out_cell(source: u32, named: u32) -> Option<*mut u32> {
+    let mut cell = outbound_head(source);
+    for _ in 0..=MAX_LINK_POINTS {
+        match unsafe { *cell } {
+            v if v == named => return Some(cell),
+            0 => return None,
+            v => cell = unsafe { &raw mut (*record(v as usize - 1)).next_out },
+        }
+    }
+    None
+}
+/// Puts record `i` (already in place) at the front of its source's outbound list.
+fn out_add(i: usize) {
+    unsafe {
+        let r = record(i);
+        let h = outbound_head((*r).source);
+        ((*r).next_out, *h) = (*h, i as u32 + 1);
+    }
+}
+/// Takes record `i` out of its source's outbound list.
+fn out_del(i: usize) {
+    let r = unsafe { record(i).read() };
+    if let Some(cell) = out_cell(r.source, i as u32 + 1) {
+        unsafe { *cell = r.next_out };
+    }
+}
 /// The record now at `to` was at `from` (another record's old place): its neighbours (or its target's head) name it
-/// again. A record that does not move (`from == to`: a removed or stale one) is left alone.
+/// again, and so does its source's outbound list. A record that does not move (`from == to`: a removed or stale one) is
+/// left alone.
 fn list_moved(from: u64, to: u64) {
     if from == to {
         return;
+    }
+    let source = unsafe { record(to as usize).read() }.source;
+    if let Some(cell) = out_cell(source, from as u32 + 1) {
+        unsafe { *cell = to as u32 + 1 };
     }
     unsafe {
         let r = record(to as usize).read();
@@ -2125,6 +2169,7 @@ fn insert(r: LinkRecord, k: usize) {
         hole = first;
     }
     unsafe { record(hole as usize).write(r) };
+    out_add(hole as usize);
     if listed(&r) {
         list_add(hole as usize);
     }
@@ -2136,6 +2181,7 @@ fn insert(r: LinkRecord, k: usize) {
 /// slot so freed. `follow` (a record's index + 1, or 0) is kept pointing at its record if that moves.
 fn remove(i: u64, k: usize, follow: &mut u32) {
     list_del(i as usize);
+    out_del(i as usize);
     let ends = ends(control());
     let mut hole = i;
     for e in ends.into_iter().skip(k) {
@@ -2167,6 +2213,21 @@ fn unlink_inbound(n: usize, all: bool) -> Option<u64> {
     }
     Some(undone)
 }
+/// Undoes the links out of block `n` (dead) by its outbound list and drops their records. Returns the links undone; `None`
+/// if a record does not describe its word.
+fn unlink_outbound(n: usize) -> Option<u64> {
+    let mut undone = 0;
+    let mut at = block(n).outbound;
+    while at != 0 {
+        let i = at as u64 - 1;
+        let r = unsafe { record(i as usize).read() };
+        at = r.next_out;
+        unlink(r)?;
+        undone += 1;
+        remove(i, segment_of(i), &mut at);
+    }
+    Some(undone)
+}
 /// Restores every linked point's original word and drops every record (the invalidation of all blocks at a flush).
 /// `None` if a record does not describe its word (it is not left as is).
 pub fn unlink_all() -> Option<u64> {
@@ -2177,6 +2238,7 @@ pub fn unlink_all() -> Option<u64> {
         if listed(&r) {
             unsafe { *inbound_head(r.target) = 0 };
         }
+        unsafe { *outbound_head(r.source) = 0 };
     }
     let n = c.links;
     (c.links, c.links_cr3, c.links_tlb, c.links_local) = (0, 0, 0, 0);
@@ -2404,19 +2466,39 @@ fn l2_remove(n: usize) {
 /// those ([`prune`]). Dead blocks leave L2 (as
 /// [`lookup`] skips them). Returns the links undone; `None` if a record does not describe its word.
 fn cut(doomed: impl Iterator<Item = usize>, dead: bool) -> Option<u64> {
-    let (mut outbound, mut undone) = (false, 0);
+    let mut undone = 0;
     for n in doomed {
-        if let Some(k) = cut_one(n, dead) {
-            outbound |= k == CHECKED;
+        if cut_one(n, dead).is_some() {
             undone += unlink_inbound(n, dead)?;
+        }
+        // A dead block's own links out, from its outbound list (cost: its own links, not the area's records).
+        if dead && block(n).outbound != 0 {
+            undone += unlink_outbound(n)?;
         }
         #[cfg(feature = "link-check")]
         if dead {
             check_inbound(n, true);
         }
     }
-    // A dead block's own links out (there is no outbound index): one pass, as before.
-    Some(undone + if outbound { prune(CHECKED, false)? } else { 0 })
+    #[cfg(feature = "link-check")]
+    if dead {
+        check_no_dead_links();
+    }
+    Some(undone)
+}
+/// `link-check` builds, after a cut that killed blocks: no record names a dead block as its source or target (what the
+/// outbound lists must do as the full pass over the records they replaced did). Halts `stop::LINK_CHECK` otherwise.
+#[cfg(feature = "link-check")]
+#[track_caller]
+fn check_no_dead_links() {
+    let line = u64::from(core::panic::Location::caller().line());
+    for i in 0..control().links as usize {
+        let r = unsafe { record(i).read() };
+        let dead = |n: u32| block(n as usize).flags & DEAD != 0;
+        if dead(r.source) || r.target & area::CHECKED == 0 && dead(r.target) {
+            crate::execution::halt_native([line, i as u64, u64::from(r.source)], natemu_abi::execution::stop::LINK_CHECK)
+        }
+    }
 }
 /// `link-check` builds: block `n`'s inbound list, after a cut (`dead`: after its death), holds no record before
 /// [`Control::links_tlb`] (a dead block's: none at all). Halts `stop::LINK_CHECK` otherwise (or if the list does not
@@ -2438,22 +2520,16 @@ fn check_inbound(n: usize, dead: bool) {
     crate::execution::halt_native([line, u64::from(at), n as u64], natemu_abi::execution::stop::LINK_CHECK)
 }
 /// [`cut`]'s work on block `n` but the link records: `Some` if its inbound list may hold links to undo (links from other
-/// pages may enter it, or it is dead and local links may), `Some(`[`CHECKED`]`)` if it is dead and links may leave it.
-fn cut_one(n: usize, dead: bool) -> Option<usize> {
+/// pages may enter it, or it is dead and local links may); `None` also when it was dead already.
+fn cut_one(n: usize, dead: bool) -> Option<()> {
     let c = control();
     let b = *block(n);
     if b.flags & DEAD != 0 || (!dead && b.checked == 0) {
         return None;
     }
-    let scope = if b.flags & INSTANCE != 0 {
-        None // (records name translations, never instances)
-    } else if dead && b.links.iter().any(|p| p.offset != 0) {
-        Some(CHECKED)
-    } else if b.flags & INBOUND != 0 || dead && b.flags & LOCAL_INBOUND != 0 {
-        Some(TLB)
-    } else {
-        None
-    };
+    let scope = (b.flags & INSTANCE == 0 // (records name translations, never instances)
+        && (b.flags & INBOUND != 0 || dead && b.flags & LOCAL_INBOUND != 0))
+        .then_some(());
     unsafe { (*block_ptr(n)).flags &= !INBOUND };
     if dead {
         unsafe { (*block_ptr(n)).flags |= DEAD };
@@ -2491,6 +2567,7 @@ fn prune(scope: usize, strict: bool) -> Option<u64> {
             return Some(unlinked);
         }
         let r = unsafe { record(i as usize).read() };
+        c.scanned += 1;
         let alive = block(r.source as usize).flags & DEAD == 0;
         let kept = if k == CHECKED {
             alive
@@ -2529,6 +2606,7 @@ fn prune_tlb(scope: usize) -> Option<u64> {
             } else {
                 unlink(r)?;
                 list_del(i as usize);
+                out_del(i as usize);
                 undone += 1;
             }
         }

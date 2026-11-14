@@ -62,6 +62,10 @@ Perf chunk 8 (links kept across TLB events):
 - `local-write`: V global (PGE), three linked calls R -> S -> T from one jump site R (S and T on V's page); INVLPG of V
   (S -> T stays, local; R -> S goes); three calls; a CR3 reload (R -> S stays: S global); CPU (i + 1) % N rewrites T's
   immediate (CPU i's own at N = 1) and the CPUs hand over (CPUID after): three calls from R must run the new bytes.
+- `kill-out` (drain fix): S on V's page (`mov esi, 1; jmp T`) links to T on another page (three linked calls from one jump
+  site); CPU (i + 1) % N rewrites S's immediate (CPU i's own at N = 1): S dies with a live link out to T, which stays;
+  three calls run S's new bytes (rsi = 3) and T again. The dead block's link record goes with it (the host's check: no
+  record names a dead block; the `link-check` resident's too), and with no pass over the link records (`k1.scanned` = 0).
 - the independent review's adversarial programs (`adv_setup`: NX, SMEP and U/S changes, code remapping its own page,
   one frame at two linear addresses rewritten, global/non-global crossings, a fetch #PF then remap), against QEMU but
   `pf-fetch` (either outcome by the TLB rules).
@@ -404,8 +408,8 @@ def links_bodies(k, i, n):
     loop = lambda tag, reg: f'    mov ecx, 3\n.{tag}:\n    call .sub\n    add {reg}, rax\n    dec ecx\n    jnz .{tag}\n'
     pde = lambda frame, j=0, present=1: f'    mov rax, {frame | 0x80 | P.LEAF & ~(1 - present):#x}\n    mov [{P.SYS_T(i, 0) + 0x2000 + 8 * ((LP >> 21) + j):#x}], rax\n'
     j = (i + 1) % n
-    hand = (f'    mov qword [{FLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{FLAGS + 8 * j:#x}], 1\n    jne .h1\n'
-            f'    mov byte [{P.SYS_D(j) + F1 + LW + 0x41:#x}], 3\n    mov qword [{FLAGS + 0x40 + 8 * j:#x}], 1\n'
+    hand = lambda at: (f'    mov qword [{FLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{FLAGS + 8 * j:#x}], 1\n    jne .h1\n'
+            f'    mov byte [{P.SYS_D(j) + F1 + at:#x}], 3\n    mov qword [{FLAGS + 0x40 + 8 * j:#x}], 1\n'
             f'.h2:\n    pause\n    cmp qword [{FLAGS + 0x40 + 8 * i:#x}], 1\n    jne .h2\n    xor eax, eax\n    cpuid\n'
             '    xor ebx, ebx\n    xor ecx, ecx\n    xor edx, edx\n')
     return {
@@ -444,7 +448,13 @@ def links_bodies(k, i, n):
                       + '    mov r9, rax\n' + put(d, d + F1) + cr3 + call('a2', f'{d + LS:#x}') + '    mov r10, rax\n'),
         # One jump site (`.sub`) in every phase, so a link kept into a dead block would be taken.
         'local-write': (pge(True) + '    jmp .over\n.sub:\n' + to(LW).format(tag='s') + '    ret\n.over:\n' + loop('w0', 'r8') + inv(d)
-                        + loop('w1', 'r9') + cr3 + hand + loop('w2', 'r10')),
+                        + loop('w1', 'r9') + cr3 + hand(LW + 0x41) + loop('w2', 'r10')),
+        # Drain fix: S (V + LW: `mov esi, 1; jmp T`) on V's page links to T on another page (three calls from one jump site);
+        # the peer (the CPU's own at N = 1) rewrites S's immediate: S dies with a link out to T, which stays. The calls after
+        # run S's new bytes and T again (r8 = r9 = 3, r11 = 1, r12 = 3). The block's death undoes its link out by its
+        # outbound list, with no pass over the link records (`k1.scanned` stays 0, `NO_SWEEP`) and leaves no record of it.
+        'kill-out': ('    jmp .over\n.sub:\n' + to(LW).format(tag='s') + '    ret\n.over:\n' + loop('o0', 'r8') + '    mov r11, rsi\n'
+                     + hand(LW + 1) + loop('o1', 'r9') + '    mov r12, rsi\n'),
     }
 
 G = 0x100
@@ -456,7 +466,8 @@ LA, LM = LP + (1 << 31), (64, 65)  # perf chunk 19: `large-alias`'s second regio
                                    # from LP (64: Control::large_list's length)
 LS = 0x100                       # `local-gpa`: S at V + LS (`test r14, r14; jnz T; jmp r13`), T at V + LS + 0x40
 LW = 0x200                       # `local-write`: S at V + LW (`jmp T`), T at V + LW + 0x40 (`mov eax, 1; jmp r13`)
-FLAGS = P.SYS_D(0) + 0xe000      # `local-write`: per CPU a ready word, then (+ 0x40) a written word
+FLAGS = P.SYS_D(0) + 0xe000      # `local-write`, `kill-out`: per CPU a ready word, then (+ 0x40) a written word
+NO_SWEEP = ('kill-out',)         # programs that kill blocks and must make no pass over the link records (`k1.scanned` = 0)
 
 
 def links_memory(name, i, n):
@@ -493,6 +504,9 @@ def links_memory(name, i, n):
     if name == 'local-write':
         s = P.asm('jmp $$+0x40\ntimes 0x40-($-$$) nop\nmov eax, 1\njmp r13')
         return [{'addr': f'0x{d + F1 + LW:x}', 'data': s.hex()}] + ([dict(P.zero(FLAGS, 0x100), capture=False)] if i == 0 else [])
+    if name == 'kill-out':
+        return ([{'addr': f'0x{d + F1 + LW:x}', 'data': P.asm(f'mov esi, 1\njmp $$+{NP - LW:#x}').hex()}, code(d + NP, 'mov eax, 1\njmp r13')]
+                + ([dict(P.zero(FLAGS, 0x100), capture=False)] if i == 0 else []))
     return []
 
 # Perf chunk 10 (reuse inside the resident, natemu only): per CPU, frames RL (and RL2, RLC) and linear aliases RV1 and RV3
@@ -1768,6 +1782,10 @@ def main():
                     reuse = c['stats']['k1']['reuse']
                     if reuse['copies'] < REUSE[name][0] or reuse['refused'][0] < REUSE[name][1]:
                         problems.append(f"cpu{v} reuse {reuse}, at least {REUSE[name]} (copies, refused[0])")
+                # A block's death undoes its links out by its outbound list: no pass over the records (the pass's records count as scanned).
+                for v, c in enumerate(out['cpus'] if out and name in NO_SWEEP else []):
+                    if c['stats']['k1']['scanned']:
+                        problems.append(f"cpu{v} scanned {c['stats']['k1']['scanned']} records or blocks, want none (no pass over the link records)")
                 # Cross-vCPU reuse: the blocks copied from the pool, and the refusals by reason, per CPU.
                 for v, c in enumerate(out['cpus'] if out and name in POOL else []):
                     pool = c['stats']['k1']['pool']
