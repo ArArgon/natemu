@@ -270,6 +270,17 @@ Rules learned in this round:
     705 -> 564 s (-20%), configure 88.7 -> 67.9 s, make 492.3 -> 349.4 s (-29%), vs QEMU 901 s: natemu 0.63x QEMU (0.78x
     before this round). Benchmark suite (3 rounds) running: `natemu-raw/bench-round-20261114-01`.
 
+29. **Benchmark suite: wide gains, two regressions traced** (`natemu-raw/bench-round-20261114-01`, 3 rounds, 66 boots,
+    none contended or uncounted; vs the November 5 natemu round and the recorded QEMU numbers). Cold medians: build
+    -14.6% (N=1) / -14.5% (N=4), 7zip -3.4% / -6.6%, luajit-interp -2.0% / -6.2%, avx -3.3% / -2.5%, most others -1-4%;
+    regressions hackbench N=1 +3.2% and locks N=4 +9.0%. Attribution (bench-attr-20261114-01..03, 2-3 runs each): both
+    come from this round — vs the round's start hackbench 11.63 -> 12.35 s, locks 7.39 -> 7.91 s; turning off the pool,
+    fast miss and page record leaves them (12.14 / 7.80); bisecting at the two-way L1 merge: hackbench 11.66 -> 12.12
+    (+4%), locks 7.47 -> 7.60 (+1.7%). So the two-way L1 at 2^15 sets costs process-heavy workloads (likely the 15-bit
+    index's new conflicts, 17.8 M on make; decision 22), and locks has a further ~3% from an always-on change merged
+    after it (not yet found). Label: a trade-off, not a waste — the same L1 halves make's misses. Fix candidate: 2-way at
+    2^16 sets (no new conflicts, +8 MiB of code area per vCPU) — owner decision.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
