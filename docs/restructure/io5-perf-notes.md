@@ -204,6 +204,16 @@ Rules learned in this round:
     vCPU from a code area already at 88% on make. Order (fast-miss plan section 7): 2-way L1, then page record + fast
     miss path together.
 
+22. **Two-way L1 kept** (branch `l1-two-way`; plan reviewed twice, code reviewed; K1 304/304 default and link-check;
+    all 11 mutations red; profile `natemu-raw/l1-two-way-profile-1`, one uncontended run vs
+    `admission-reasons-profile-1`). Make: dispatcher misses 130.9 -> 65.7 M (gate >= 54 M), miss+enter+lookup
+    -23.9 vCPU-s, guest +5.9 (at the "quarter of the saving" guard; make's guest varies ~354-358 between clean runs —
+    judged in the group's interleaved rounds), busy 565.7 -> 549.3 (-2.9%), step 137.6 -> 132.1 s (-4.0%).
+    Configure: misses 31.7 -> 27.2 M, busy -2.0. Way-1 hit cost below resolution in the K2 rows (predicted and
+    randomized). The 15-bit set index created 17.8 M new conflicts on make (as reviewed); 2-way at 2^16 sets would
+    remove them (~5 vCPU-s more, +8 MiB code area per vCPU) — a possible follow-up. Net gain below the plan's
+    "up to 34-39": the 0.5 us per-miss figure was optimistic and the misses left are the costlier ones.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
@@ -218,5 +228,6 @@ dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3
 | natemu, start of round (main) | 89.5-92.6 s | 177.9 s |
 | natemu after decisions 2-7 | 76.7 s | 139.0 s (single run) |
 | natemu after group R1 (decision 16) | 73.0 s | 137.0 s (single run) |
+| natemu after two-way L1 (decision 22) | 72.7 s | 132.1 s (single run) |
 | QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
 | native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |
