@@ -74,7 +74,7 @@ struct Cli {
     page_currency: u64,
     /// Fault-around plan chunk 1: a demand read installs the shadow writable when the guest entry has D set and grants the write (on, the
     /// default), or read-only as before (off); for A/B measurement
-    #[arg(long, env = "NATEMU_WRITABLE_ON_READ", value_name = "on|off", default_value = "on", value_parser = natemu::execution::parse_writable_on_read)]
+    #[arg(long, env = "NATEMU_WRITABLE_ON_READ", value_name = "on|off", default_value = "on", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_writable_on_read)]
     writable_on_read: bool,
     /// Expose the virtio-MMIO entropy device
     #[arg(long)]
