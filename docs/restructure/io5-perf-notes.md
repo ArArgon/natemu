@@ -45,6 +45,11 @@ Rules learned in this round:
 - **QEMU runs once per workload/version** and its numbers are reused (owner).
 - **Timed runs are batched** (owner, November 14: contention is severe): implementers stop at Tiers 0-1; one Tier 2
   profile covers a group of changes built together; measurement builds get one profile run, repeated only if invalid.
+- **One scheduler: only the main session launches VM runs** (owner, November 14: first-come locking let long, low-value
+  runs delay the ones that steer work). Agents build, unit-test and hand over commands. Order: measurements that steer
+  the next step, then one K1 on the combined build of ready changes, then its profile, then reference timings (VZ).
+  Long K1 cases run once per group, not per change; never run a VM at background priority (`taskpolicy -c background`
+  is for builds only: a K1 under it took over 25 minutes on one case).
 - **Untimed work in parallel:** reviews start when a commit exists, K1 overlaps with other untimed work under the lock's
   shared use, implementers work in separate worktrees on different files; only timed gates serialise.
 - **Every resident change:** an independent reviewer (separate from the author), tests that a deliberate mutation turns
