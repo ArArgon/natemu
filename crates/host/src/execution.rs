@@ -1929,6 +1929,8 @@ pub struct Compiler {
     fexc: PathBuf,
     server: Option<Server>,
     supported: u64,
+    /// The request body's `--feature NAME=0` arguments for `supported`, NUL-terminated (formatted once: `body_with`).
+    feature_args: Vec<u8>,
     /// Block size limit in guest instructions (fexc's own limit when `None`).
     max_instructions: Option<u32>,
     /// Kept answers: its own, or the run's ([`Compiler::share`]).
@@ -2082,6 +2084,10 @@ impl Compiler {
             fexc: fexc.into(),
             server: None,
             supported,
+            feature_args: admission::feature_overrides(supported)
+                .iter()
+                .flat_map(|f| b"--feature\0".iter().copied().chain(f.bytes()).chain([0]))
+                .collect(),
             max_instructions,
             answers: Answers::new(supported),
             vcpu: 0,
@@ -2488,42 +2494,44 @@ impl Compiler {
             limit,
         )
     }
+    /// The request body: its NUL-terminated arguments' length (u32), the arguments, then `bytes`. Built for every compile
+    /// and every persistent-cache key, so written straight into one buffer (the feature arguments formatted once); the bytes
+    /// are the persistent cache's key, unchanged (`body_bytes_are_unchanged`).
     fn body_with(&self, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
-        let mut args = vec![
-            "--profile".to_string(),
-            "slice1".into(),
-            "--rip".into(),
-            rip,
-        ];
+        let mut body = Vec::with_capacity(4 + 96 + self.feature_args.len() + bytes.len());
+        body.extend([0; 4]);
+        let arg = |body: &mut Vec<u8>, a: &[u8]| {
+            body.extend_from_slice(a);
+            body.push(0);
+        };
+        for a in [&b"--profile"[..], b"slice1", b"--rip", rip.as_bytes()] {
+            arg(&mut body, a);
+        }
         if let Some(n) = limit {
-            args.extend(["--max-insts".into(), n.to_string()]);
+            arg(&mut body, b"--max-insts");
+            arg(&mut body, n.to_string().as_bytes());
         }
-        for feature in admission::feature_overrides(self.supported) {
-            args.extend(["--feature".into(), feature]);
+        body.extend_from_slice(&self.feature_args);
+        for (on, a) in [
+            (self.sse_gated, &b"--sse-gated"[..]),
+            (self.avx_gated, b"--avx-gated"),
+            (self.alignment_gated, b"--alignment-gated"),
+        ] {
+            if on {
+                arg(&mut body, a);
+            }
         }
-        if self.sse_gated {
-            args.push("--sse-gated".into());
+        for a in &self.x87 {
+            arg(&mut body, a.as_bytes());
         }
-        if self.avx_gated {
-            args.push("--avx-gated".into());
+        for (on, a) in [(self.cpl0, &b"--cpl0"[..]), (self.tsc, b"--tsc"), (self.bulk, b"--bulk")] {
+            if on {
+                arg(&mut body, a);
+            }
         }
-        if self.alignment_gated {
-            args.push("--alignment-gated".into());
-        }
-        args.extend(self.x87.iter().cloned());
-        if self.cpl0 {
-            args.push("--cpl0".into());
-        }
-        if self.tsc {
-            args.push("--tsc".into());
-        }
-        if self.bulk {
-            args.push("--bulk".into());
-        }
-        let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
-        let mut body = (args.len() as u32).to_le_bytes().to_vec();
-        body.extend(args);
-        body.extend(bytes);
+        let n = (body.len() - 4) as u32;
+        body[..4].copy_from_slice(&n.to_le_bytes());
+        body.extend_from_slice(bytes);
         body
     }
     /// fexc's reply to the request for `bytes` at `rip` and the RIP it was compiled at: from the persistent cache when `disk`
@@ -3899,6 +3907,48 @@ mod tests {
     }
 
     /// With `FEXC` set: a repeated request is answered from the cache, a different RIP, bytes or block limit is compiled.
+    /// The request body (and so every persistent-cache key) is byte for byte what the per-argument `String` version built.
+    #[test]
+    fn body_bytes_are_unchanged() {
+        fn reference(c: &Compiler, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
+            let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), rip];
+            if let Some(n) = limit {
+                args.extend(["--max-insts".into(), n.to_string()]);
+            }
+            for feature in admission::feature_overrides(c.supported) {
+                args.extend(["--feature".into(), feature]);
+            }
+            for (on, a) in [(c.sse_gated, "--sse-gated"), (c.avx_gated, "--avx-gated"), (c.alignment_gated, "--alignment-gated")] {
+                if on {
+                    args.push(a.into());
+                }
+            }
+            args.extend(c.x87.iter().cloned());
+            for (on, a) in [(c.cpl0, "--cpl0"), (c.tsc, "--tsc"), (c.bulk, "--bulk")] {
+                if on {
+                    args.push(a.into());
+                }
+            }
+            let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
+            let mut body = (args.len() as u32).to_le_bytes().to_vec();
+            body.extend(args);
+            body.extend(bytes);
+            body
+        }
+        for supported in [0, u64::MAX, 0b1011] {
+            let mut c = Compiler::with_features(Path::new("/nonexistent"), supported, None);
+            for flags in 0..64u32 {
+                (c.sse_gated, c.avx_gated, c.alignment_gated) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+                (c.cpl0, c.tsc, c.bulk) = (flags & 8 != 0, flags & 16 != 0, flags & 32 != 0);
+                c.x87 = if flags % 3 == 0 { vec![] } else { vec!["--x87".into(), "mode".into()] };
+                for limit in [None, Some(1), Some(64)] {
+                    let bytes = [0x90, 0xc3, flags as u8];
+                    assert_eq!(c.body_with(&bytes, "0x1234".into(), limit), reference(&c, &bytes, "0x1234".into(), limit));
+                    assert_eq!(c.disk_body(&bytes, 0xffff_8000_0000_1234, limit), reference(&c, &bytes, "k:0x234".into(), limit));
+                }
+            }
+        }
+    }
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {
         let Some(fexc) = std::env::var_os("FEXC") else {
