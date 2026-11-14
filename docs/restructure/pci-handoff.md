@@ -38,8 +38,21 @@ New dependencies: `thiserror` =2.0.21, `log` =0.4.35 (kept so the adapted files 
   acknowledges, 2,476 device exits; PCI 0, 0, 0 and 1,772 (kicks and setup only).
 - Reviews: every task by an independent reviewer; one whole-branch review ("ready after fixes", fixed and re-reviewed).
 
-Not yet evidenced: any performance number; the full suite on this branch; the fixed runners' PCI mode on VMs after
-their last commit (4eec359; the suite's two PCI steps cover it); a guest other than Linux.
+Not yet evidenced:
+
+- any performance number, and the plan's two performance-flavoured gates: the exit count on a depth-16 fio run (it was
+  taken on the boot-and-disk workload instead) and "depth-1 I/O at 1 vCPU at the MMIO rate or better" (a quick `dd`
+  comparison was inconclusive);
+- the full suite on this branch;
+- the runners' PCI mode on VMs after their last two commits (4eec359 and the fix after it). The suite's steps
+  `net-linux-pci` and `io-coverage-pci` cover the network and coverage runners only. `run_virtio_block.py` and
+  `run_io_matrix.py` are not suite steps and must be run by hand in both modes: 4eec359 broke `run_virtio_block.py run`
+  (a variable used before assignment, in both modes); the fix is verified only as far as reaching the VM lock;
+- a guest other than Linux.
+
+Raw evidence, outside the repository (this machine's `natemu-raw/`): `pci-smoke-20261113-01/` (the hand boots and the
+exit-count logs), `pci-accept-20261113-01/` (the acceptance gates), `pci-bench-20261113-01/` (prepared matrix inputs for
+both transports, a `run.sh`, and four runs marked NOT A RESULT because the machine was shared: do not quote them).
 
 ## Remaining work
 
@@ -50,13 +63,14 @@ their last commit (4eec359; the suite's two PCI steps cover it); a guest other t
 
    ```sh
    # A = a new raw-results directory; B = the built, signed natemu; R = the resident runtime; F = fexc
-   # (docs/restructure/boot-handoff.md has the build, signing and fexc steps).
-   python3 - <<'EOF'   # A/build.json: the runner requires a manifest of the binaries by SHA-256
+   # (docs/restructure/boot-handoff.md has the build, signing and fexc steps). Export all four.
+   export A B R F
+   python3 - <<'EOF'   # A/build.json: the runner requires a manifest of the binaries by SHA-256, keyed by resolved path
    import hashlib, json, os, pathlib
    a = pathlib.Path(os.environ['A'])
-   paths = [os.environ[k] for k in ('B', 'R', 'F')]
+   paths = [pathlib.Path(os.environ[k]).resolve() for k in ('B', 'R', 'F')]
    (a / 'build.json').write_text(json.dumps({'purpose': 'I/O matrix A/B, virtio PCI vs MMIO',
-       'artifacts': {p: hashlib.sha256(open(p, 'rb').read()).hexdigest() for p in paths}}))
+       'artifacts': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}}))
    EOF
    for t in mmio pci; do   # fresh inputs per transport: the guest init lives in the image
      python3 tools/run_io_matrix.py prepare --fio-prep FIO_PREP --block-inputs BLOCK_INPUTS --out $A/matrix-$t --transport $t
@@ -86,10 +100,18 @@ their last commit (4eec359; the suite's two PCI steps cover it); a guest other t
    [io-benchmarks.md](io-benchmarks.md); update the virtio backlog table in
    `docs/research/investigations/INV-03-01.md` (the "Interrupt path: 3 exits per interrupt" row: exits gone under PCI,
    interrupt count unchanged; the "virtio-pci + MSI-X" row: built, single queue, no multiqueue).
+   Also, only once `tools/run_io5.py` has reached `main` (it is on `perf-real-workload`): its `EXPECTED` list of
+   guest log lines has two PCI complaints that are MMIO-mode only.
 5. **Owner decisions**: the default transport (still `mmio`); the merge; licence housekeeping (the repository has no
    licence file; adapted files keep upstream's headers).
 
 ## Things to know when picking this up
+
+- On a fresh machine the builds are `--offline --locked`: fetch the crates once with the network
+  (`cargo +1.97.0 fetch --locked`), which now includes `thiserror`, `thiserror-impl` and `log`.
+- `natemu-raw/` is not in the repository. Besides the fio preparation and block inputs, the runners' prepared guest
+  inputs (kernel, initramfs pieces, the network method's README) live there: copy the directory or regenerate with each
+  runner's `prepare`.
 
 - In a git worktree the tools' default raw-results root resolves to the wrong directory: export
   `NATEMU_RAW_ROOT=<the real natemu-raw>` for every runner and for `tools/with-env`.

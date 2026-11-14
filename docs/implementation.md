@@ -301,7 +301,9 @@ retains its exact original SDK requirement. The workspace contains `crates/host`
 Rust 1.97.0 and the bare-metal target are pinned in `rust-toolchain.toml`. The host
 binaries use clap, and the host library and test driver write JSON with serde_json
 (pinned in `Cargo.lock`); virtio descriptor chains are walked by natemu's own code
-(rust-vmm was dropped on November 12). The ABI and resident take no registry
+(rust-vmm was dropped on November 12). On branch `pci` the host library also uses
+thiserror and log, and the `natemu` stub log, for the PCI code adapted from
+cloud-hypervisor (November 13 amendment). The ABI and resident take no registry
 dependency. The [boot handoff's dependency policy](restructure/boot-handoff.md#1-boot-commands)
 lists what is allowed. Assembly offsets come from the shared Rust layout.
 I2 used a versioned 128-byte little-endian register/worker packet, with Rust and

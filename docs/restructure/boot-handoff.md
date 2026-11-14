@@ -87,6 +87,11 @@ they add serde_core, serde_derive, itoa, memchr and zmij to `Cargo.lock`. The AB
 still take no registry dependency. **November 12 amendment:** the owner chose libslirp with hand-written bindings as
 the network backend (no crate): the host library links Homebrew's `libslirp` (`brew install libslirp`; 4.9.6, which
 pulls in glib) through `crates/host/build.rs`, so every host build and run needs it installed.
+**November 13 amendment (branch `pci`):** for the PCI transport the owner allowed new dependencies where judicious; the
+two files adapted from cloud-hypervisor keep upstream's error and logging crates so they stay comparable with upstream:
+thiserror 2.0.21 (with thiserror-impl 2.0.21) in the host library, and log 0.4.35 in the host library and the `natemu`
+stub, which installs the stderr logger. Both were already in this machine's cargo cache (fetched November 8); their
+release dates were not rechecked against the two-week rule.
 The crates come from crates.io (not vendored, owner, November 5), every version pinned in `Cargo.lock` (`--locked`). A
 fresh machine needs the network once, `cargo +1.97.0 fetch --locked` (or the first build without `--offline`), before
 the `--offline` builds above work; after that the local cargo cache serves them. Adding a registry crate needs the

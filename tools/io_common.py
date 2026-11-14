@@ -56,7 +56,7 @@ PCI_PROBE = r'''pci_probe() {
 def patch(text, edits):
     """TEXT with each (old, new) applied once; the PCI variants of the guest scripts are made this way so the default text stays as it was."""
     for old, new in edits:
-        assert text.count(old) == 1, old
+        if text.count(old) != 1: raise ValueError(f'patch: {text.count(old)} matches of {old!r}')   # not an assert: -O must not skip it
         text = text.replace(old, new)
     return text
 

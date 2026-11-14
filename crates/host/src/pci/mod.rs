@@ -39,6 +39,7 @@ pub trait Function: Send + Sync {
     fn bar_len(&self) -> u64;
     /// An access inside BAR0; `offset` from its base. Tokens must be below 2^56.
     fn bar_access(&self, vcpu: usize, offset: u64, size: u64, value: Option<u64>) -> Access;
+    /// Polls an access `bar_access` deferred, by the token it returned (as `Direct::poll`).
     fn bar_poll(&self, vcpu: usize, token: u64) -> Access;
     /// As `Device::quiesce`.
     fn quiesce(&self) -> crate::Result<bool>;
