@@ -334,6 +334,9 @@ make-net|make-disk|make-rng)   # the build beside one of the run's loops, until 
   span loop "n=0; while :; do $LOOP || exit 1; n=\$((n+1)); [ -e /tmp/make.done ] && break; done; echo rounds=\$n"
   wait; say loop $(tail -1 $L/loop.log);;
 pytest) span pytest "cd /build/Python-3.13.18 && ./python -m test -j\$(nproc) @PYTESTS@";;
+trim)   # host blocks freed (profile.json's allocated); every other file still reads back right from disk; fsck after
+  span trim 'du -sh /data && rm -rf /data/gen && sync && fstrim -v /'
+  span verify 'echo 3 > /proc/sys/vm/drop_caches && grep -v "  /data/gen/" /root/io5/manifest > /root/io5p/kept && sha256sum -c --quiet /root/io5p/kept && wc -l < /root/io5p/kept';;
 timerfd)   # the barriers run's one failure, alone then beside 4 busy loops: count failures of 30 runs each
   T='cd /build/Python-3.13.18 && f=0; for i in $(seq 30); do ./python -m test test_os -m test_timerfd_ns_TFD_TIMER_ABSTIME >> /root/io5p/timerfd-all.log 2>&1 || f=$((f+1)); done; echo failures=$f'
   span timerfd-idle "$T"; say timerfd-idle $(tail -1 $L/timerfd-idle.log)
@@ -351,7 +354,7 @@ def profile(args):
     host = lan_address()
     server = subprocess.Popen([sys.executable, '-m', 'http.server', '-b', host, '8000'], cwd=serve,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    windows, ok = {}, True
+    windows, ok, allocated = {}, True, {}
     try:
         time.sleep(1); assert server.poll() is None, 'http server'
         with open(args.lock, 'a') as lock:
@@ -362,6 +365,10 @@ def profile(args):
                 code, timed_out, seconds = launch(command(args, disk, cache, step), args.out, step, host, args.limit)
                 logs = args.out / f'guest-{step}'; logs.mkdir()   # the guest's step logs, before the clone goes
                 subprocess.run([E2 / 'debugfs', '-R', f'rdump /root/io5p {logs}', f'{disk}?offset={ROOT_OFFSET}'], capture_output=True)
+                allocated[step] = disk.stat().st_blocks * 512
+                if step == 'trim':
+                    fsck = subprocess.run([E2 / 'e2fsck', '-fn', f'{disk}?offset={ROOT_OFFSET}'], capture_output=True, text=True)
+                    (args.out / 'fsck-trim.log').write_text(fsck.stdout + fsck.stderr); ok &= fsck.returncode == 0
                 disk.unlink(); shutil.rmtree(cache, ignore_errors=True)
                 for line in (args.out / f'markers-{step}.tsv').read_text().splitlines():
                     t, text = line.split('\t'); m = text.split()
@@ -375,6 +382,7 @@ def profile(args):
     write_json(args.out / 'windows.json', windows)
     write_json(args.out / 'profile.json', {'steps': args.steps, 'snapshot': str(args.snapshot), 'runtime': str(args.runtime),
                                            'mitigations_off': args.mitigations_off, 'ok': ok,
+                                           'allocated': allocated, 'snapshot_allocated': args.snapshot.stat().st_blocks * 512,
                                            'command': [str(c) for c in command(args, 'DISK', 'CACHE', 'STEP')]})
     print('OK' if ok else 'FAILED', args.out)
     return 0 if ok else 1
@@ -397,7 +405,7 @@ def main():
     f = sub.add_parser('profile', help='one step per boot from a snapshot disk, with the timing log')
     f.add_argument('--snapshot', type=Path, required=True); f.add_argument('--inputs', type=Path, required=True)
     f.add_argument('--out', type=Path, required=True); f.add_argument('--steps', nargs='+', required=True,
-                   choices=('boot', 'configure', 'make', 'make-net', 'make-disk', 'make-rng', 'pytest', 'timerfd'))
+                   choices=('boot', 'configure', 'make', 'make-net', 'make-disk', 'make-rng', 'pytest', 'timerfd', 'trim'))
     f.add_argument('--runtime', type=Path, help='the resident (a `perf` build for 5 ms bucket snapshots)')
     f.add_argument('--natemu', type=Path, help='the natemu binary (default: target/release/natemu)')
     f.add_argument('--fexc', type=Path, default=FEXC); f.add_argument('--vcpus', type=int, default=4)

@@ -323,6 +323,9 @@ impl Calls for Controlled {
         });
         result
     }
+    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.native.punch(offset, len)
+    }
 }
 
 #[cfg(test)]
