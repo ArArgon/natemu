@@ -386,6 +386,7 @@ def bodies(k, i=0, n=1):
         **page_bodies(i),
         **pool_bodies(i, n),
         **chunk_bodies(k, i, n),
+        **relink_bodies(k, i, n),
         'link-full': full_body(i, n),
         # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
         # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
@@ -1331,7 +1332,7 @@ CHUNK_VALUES = {
 PAGE_VALUES_ON = {'page-check-keep': {'r8': {1}, 'r9': {0x11}, 'r10': {0x21}}}
 # The page-currency mode a program always runs under (`--page-currency`): `local-gpa` asserts a link rule the record, legally, would answer
 # differently; the two check programs count differences. PAGE_FORCED_COUNTS: the disagreements they must show (k1.page.disagree).
-PAGE_FORCED = {'local-gpa': 'off', 'page-check-keep': 'check', 'page-size-check': 'check'}
+PAGE_FORCED = {'local-gpa': 'off', 'relink-stale': 'off', 'page-check-keep': 'check', 'page-size-check': 'check'}
 PAGE_FORCED_COUNTS = {'page-check-keep': 2, 'page-size-check': 1}
 # Under the default mode: least walks / hits / split_2m (k1.page) a program must show.
 PAGE_ON_COUNTS = {'page-share': {'hits': 2}, 'page-global': {'hits': 1}, 'page-large-edge': {'split_2m': 1}, 'page-cross': {'hits': 1},
@@ -1353,6 +1354,105 @@ FAST_NONE = ('miss-step', 'miss-dr7', 'miss-system')
 EXPECT_FAULT = {'page-user': 14, 'miss-ac': 17, 'fa-ro': 14}
 # ... and, where the program says, the faulting address (fault[1], an offset from the CPU's d) and the error code (fault[2]).
 EXPECT_FAULT_AT = {'fa-ro': (FARO, 7)}
+# ---- Relink on revalidation (docs/restructure/relink-plan.md section 5; natemu only) ------------------------------------------
+# V (d) maps F1 (`mov eax, 1; jmp r13`) in table A and F2 (`mov eax, 2`) in B. Jump sites are blocks of one `jmp V` each on pages
+# above the other programs' (d + 0x9000, 0xa000 ...; the default pages 0x5000, 0x6000 and 0x8000 hold TAIL code): every link from a
+# site into V's block is non-local (V's page is not the site's), so a CR3 load suspends it and the next revalidation of V's block
+# relinks it. Each program ends in a guest #PF (a load from a page no table maps) before the body's restore, so its last state
+# (records still suspended, or live) is what the host's link check sees; `cr3-relink` ends normally after a flush.
+RELINK_PROGRAMS = ('cr3-relink', 'relink-smc', 'relink-dead-source', 'relink-stale', 'relink-held', 'relink-global', 'relink-many')
+RJ1, RJ2, RW, RG1, RS = 0x9000, 0xa000, 0xb000, 0xc000, 0x100   # site pages, W (global target), G1's page; S on V's page
+RM = 16                                                         # `relink-many`'s sites: RM / 2 on each of RJ1's and RJ2's pages
+RSITE = lambda d, k: d + (RJ1 if k % 2 == 0 else RJ2) + 0x100 * (k // 2)
+RFAULT = 0x7fff0000                                              # no table maps it: the end's #PF
+RELINK_END = f'    mov rax, [{RFAULT:#x}]\n'
+
+
+def relink_bodies(k, i, n):
+    d = P.SYS_D(i)
+    cr3 = lambda t: f'    mov rax, {P.SYS_T(i, t):#x}\n    mov cr3, rax\n'
+    put = lambda frame, bits=P.LEAF: f'    mov rax, {frame | bits:#x}\n    mov [{P.sys_leaf(i, 0, d):#x}], rax\n'
+    pge = lambda on: f'    mov rax, cr4\n    {"bts" if on else "btr"} rax, 7\n    mov cr4, rax\n'
+    tag = iter(range(10_000))
+    run = lambda at, reg: call(f'q{next(tag)}', f'{at:#x}') + f'    add {reg}, rax\n'
+    set_ = lambda at, reg: call(f'q{next(tag)}', f'{at:#x}') + f'    mov {reg}, rax\n'
+    both = lambda reg: run(d + RJ1, reg) + run(d + RJ2, reg)
+    rounds = lambda body: f'    mov ecx, {k}\n.l:\n' + body + '    dec ecx\n    jnz .l\n'
+    upto_y2 = cr3(0) + set_(d + RJ1, 'r8') + cr3(1) + set_(d + RJ1, 'r9') + cr3(0) + put(d + F2) + set_(d + RJ1, 'r10')
+    return {
+        # K rounds of A (both sites), B (both sites): the first site's trap in each space revalidates V's block and relinks the other's
+        # record, so a round costs two linker entries, not four; then a flush (DR7) with records suspended.
+        'cr3-relink': rounds(cr3(0) + both('r8') + cr3(1) + both('r9')) + flush_text(d),
+        # F1 (A's V) written while B is loaded: its block dies with its suspended records; back in A both sites run the new bytes.
+        'relink-smc': (cr3(0) + both('r8') + cr3(1) + both('r9') + f'    mov byte [{d + F1 + 1:#x}], 3\n' + cr3(0) + set_(d + RJ1, 'r10')
+                       + set_(d + RJ2, 'r12') + cr3(1) + RELINK_END),
+        # J1's page rewritten (`mov ebp, 2`) while B is loaded: its block, with its records, dies; in A J2 reaches V's block (relink) and
+        # J1's new block runs; the program ends in B with records suspended.
+        'relink-dead-source': (cr3(0) + both('r8') + cr3(1) + both('r9') + f'    mov byte [{d + RJ1 + 1:#x}], 2\n' + cr3(0) + set_(d + RJ2, 'r10')
+                               + set_(d + RJ1, 'r12') + cr3(1) + RELINK_END),
+        # J linked into Y1 (A, F1), then Y2 (B, F2); back in A V's PTE is F2 with no INVLPG: J runs Y2 (relinked); the PTE back to F1 with no INVLPG,
+        # and a new site K reaches V: Y1 is revalidated while J -> Y2 is live: J's suspended record for Y1 must be dropped, not patched over it.
+        'relink-stale': upto_y2 + put(d + F1) + set_(d + RJ2, 'r12') + RELINK_END,
+        # The same up to J -> Y2: the end state holds J's suspended record for Y1 and the live one for Y2 (one word).
+        'relink-held': upto_y2 + RELINK_END,
+        # PGE off: J -> Y (non-global); V's PTE gets G and PGE goes on (a global flush: the link suspended); J again: Y is revalidated global, its
+        # record relinked into the TLB segment; a CR3 reload keeps it (a global block stays current).
+        'relink-global': (cr3(0) + set_(d + RJ1, 'r8') + put(d + F1, P.LEAF | G) + pge(True) + set_(d + RJ1, 'r9') + cr3(0) + set_(d + RJ1, 'r10') + RELINK_END),
+        # `cr3-relink` with RM sites into V, while the TLB segment (G1 -> W, W global) and the local one (S -> V, S on V's page) hold
+        # records that must not move. Each round: A (S, the sites), B (S, the sites), G1.
+        'relink-many': (pge(True) + set_(d + RG1, 'r11') + '    xor r10d, r10d\n'
+                        + rounds(cr3(0) + run(d + RS, 'r12') + ''.join(run(RSITE(d, j), 'r8') for j in range(RM))
+                                 + cr3(1) + run(d + RS, 'r14') + ''.join(run(RSITE(d, j), 'r9') for j in range(RM)) + run(d + RG1, 'r10'))
+                        + RELINK_END),
+    }
+
+
+def relink_memory(name, i):
+    if name not in RELINK_PROGRAMS:
+        return []
+    d = P.SYS_D(i)
+    mem = lambda at, data: {'addr': f'0x{at:x}', 'data': data.hex(), 'capture': False}
+    to_v = lambda at: JMP(at, d)
+    first = bytes.fromhex('bd01000000') + JMP(d + RJ1 + 5, d) if name == 'relink-dead-source' else to_v(d + RJ1)
+    out = [mem(d + RJ1, first), mem(d + RJ2, to_v(d + RJ2))]
+    if name == 'relink-many':
+        out = [mem(RSITE(d, j), to_v(RSITE(d, j))) for j in range(RM)]
+        # S on V's page in both frames (a local link into V's block); W (global) and G1 (`jmp W`, not global).
+        out += [mem(d + f + RS, JMP(d + RS, d)) for f in (F1, F2)]
+        out += [mem(d + RW, CODE(9)), mem(d + RG1, JMP(d + RG1, d + RW))]
+    return out
+
+
+def relink_tables(name, i):
+    d = P.SYS_D(i)
+    if name != 'relink-many':
+        return {}, {}
+    g = (d + RW) | P.LEAF | G
+    return {d + RW: g}, {d + RW: g}
+
+
+# Per program: (register, allowed values) per CPU, and the resident counters (k1.relink) it must show (least).
+RELINK_VALUES = {
+    'cr3-relink': lambda i, k: {'r8': {2 * k}, 'r9': {4 * k}},
+    'relink-smc': {'r8': {2}, 'r9': {4}, 'r10': {3}, 'r12': {3}},
+    'relink-dead-source': {'r8': {2}, 'r9': {4}, 'r10': {1}, 'r12': {1}, 'rbp': {2}},
+    'relink-stale': {'r8': {1}, 'r9': {2}, 'r10': {2}, 'r12': {1, 2}},
+    'relink-held': {'r8': {1}, 'r9': {2}, 'r10': {2}},
+    'relink-global': {'r8': {1}, 'r9': {1}, 'r10': {1}},
+    'relink-many': lambda i, k: {'r8': {RM * k}, 'r9': {2 * RM * k}, 'r10': {9 * k}, 'r12': {k}, 'r14': {2 * k}},
+}
+# Least counts of k1.relink fields: relinked, relink_dropped, suspended, links_susp (the suspended segment's length at the end).
+RELINK_LEAST = {
+    'cr3-relink': {'relinked': 4, 'suspended': 4},
+    'relink-smc': {'suspended': 4},
+    'relink-dead-source': {'suspended': 4, 'relinked': 1, 'links_susp': 1},
+    'relink-stale': {'relinked': 1, 'relink_dropped': 1},
+    'relink-held': {'relinked': 1, 'links_susp': 1},
+    'relink-global': {'relinked': 1, 'suspended': 1},
+    'relink-many': {'relinked': RM, 'links_susp': 1},
+}
+EXPECT_STOP.update({n: ('guest_fault', '') for n in RELINK_PROGRAMS if n != 'cr3-relink'})
+EXPECT_FAULT.update({n: 14 for n in RELINK_PROGRAMS if n != 'cr3-relink'})
 # Natemu-only programs: (register, allowed values) per CPU; a function of the CPU for `walk`. In `global` the architecture
 # allows either frame for r9 and r10 (a kept global entry, or a miss); natemu keeps the block found global (K1), so 1.
 EITHER = {
@@ -1383,6 +1483,7 @@ EITHER = {
     'hint-reset': {'r8': {12}},
     **{n: PAGE_VALUES_ON.get(n, PAGE_VALUES[n]) for n in PAGE_PROGRAMS},
     **{n: CHUNK_VALUES[n] for n in CHUNK_VALUES},
+    **RELINK_VALUES,
 }
 
 
@@ -1397,7 +1498,8 @@ def program(name, n, k):
             a[0x200000] = (d + XA) | P.LEAF
         b = {d: (d + F2) | P.LEAF}
         ca, cb = chunk_tables(name, i)
-        a, b = {**a, **ca}, {**b, **cb}
+        ra, rb = relink_tables(name, i)
+        a, b = {**a, **ca, **ra}, {**b, **cb, **rb}
         out['bodies'].append(P.body(P.SYS_CODE(i), P.sys_text(i, bodies(k, i, n)[name])))
         out['cpus'].append(dict(P.cpu(i, P.SYS_CODE(i)), cpl=0, **({'switches': [(d + STUB['enter'], 3), (d + STUB['exit'], 0)]} if name in STUB_PROGRAMS else {}),
                                                        **({'posts': [(d + PN, EVENT)], 'quiet': True} if name == 'miss-event' else {})))
@@ -1430,7 +1532,7 @@ def program(name, n, k):
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
             {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name in ('l1-pic', 'miss-pic') else [])
-            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL or name in CHUNK_MISS else []) + chunk_memory(name, i, n)
+            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL or name in CHUNK_MISS else []) + chunk_memory(name, i, n) + relink_memory(name, i)
             + (page_memory(name, i) if name in PAGE_PROGRAMS else []))
     return out
 
@@ -1682,6 +1784,28 @@ def diff_counts(a, n, name, report):
     return failures
 
 
+# Relink plan: per extra round, the linker entries and the links relinked (k1.relink), as differences of runs at K and 2K rounds.
+# (A round: the two CR3 loads' exits and one trap per space, the first site's: it revalidates V's block and relinks the other sites'
+# records; without relink every site traps: `cr3-relink` 6 entries a round, `relink-many` 2 + 2 RM.)
+RELINK_COUNTS = {'cr3-relink': (4, 4), 'relink-many': (4, 2 * RM)}
+
+
+def relink_counts(a, n, name, report):
+    k, got, failures = a.k, {}, []
+    for rounds in (k, 2 * k):
+        out, problems = run(a, program(name, n, rounds), [], None, None, f'-r{rounds}')
+        failures += [f'{name}@{n} k={rounds}: {p}' for p in problems]
+        got[rounds] = [(c['stats']['linker'], c['stats']['k1'].get('relink', {}).get('relinked', 0)) for c in out['cpus']] if out else []
+    want = tuple(k * x for x in RELINK_COUNTS[name])
+    for v, (x, y) in enumerate(zip(got[k], got[2 * k])):
+        more = (y[0] - x[0], y[1] - x[1])
+        if more != want:
+            failures.append(f'{name}@{n} cpu{v}: {k} more rounds added (linker entries, relinked) {more}, want {want}')
+    report.append({'name': f'k1-{name}@{n}-relink-counts', 'max_block': None, 'stats': got, 'problems': failures})
+    print(json.dumps(report[-1]), flush=True)
+    return failures
+
+
 def page_mode_run(a, n, name, mode, want, report):
     """`name` under another page-currency mode: it must end where it does and show `want` disagreements."""
     prog = adv_program(name, n) if name in adv_setup(0) else program(name, n, a.k)
@@ -1895,6 +2019,10 @@ def main():
                         got = {r: smp.num(c['gpr'][P.REGS.index(r)]) for r in allowed}
                         seen[v] = got
                         problems += [f'cpu{v} {r} = {got[r]:#x}, allowed {[hex(x) for x in sorted(ok)]}' for r, ok in allowed.items() if got[r] not in ok]
+                # Relink plan: the counters each program must show (k1.relink).
+                for v, c in enumerate(out['cpus'] if out and name in RELINK_LEAST else []):
+                    got = c['stats']['k1'].get('relink', {})
+                    problems += [f'cpu{v} relink {f} = {got.get(f, 0)}, want at least {m}' for f, m in RELINK_LEAST[name].items() if got.get(f, 0) < m]
                 stats = out and [{k: c['stats'].get(k) for k in ('requests', 'compiles', 'flushes', 'shadow_resets', 'links', 'unlinks', 'k1')} for c in out['cpus']]
                 entry = {'name': prog['name'], 'max_block': extra[0] if extra else None, 'check': check, 'problems': problems, 'seen': seen, 'stats': stats}
                 report.append(entry)
@@ -1912,6 +2040,8 @@ def main():
     for n in a.cpus:
         for name in [x for x in ('page-counts', 'miss-counts') if (n, x, 0) in mine and not os.environ.get('NATEMU_PIC_TEST')]:
             failures += diff_counts(a, n, name, report)
+        for name in [x for x in RELINK_COUNTS if (n, x, 0) in mine and not os.environ.get('NATEMU_PIC_TEST')]:
+            failures += relink_counts(a, n, name, report)
         for name, mode, want in [m for m in PAGE_MODE_RUNS if (n, m[0], int(m[0] in adv_setup(0))) in mine]:
             failures += page_mode_run(a, n, name, mode, want, report)
     for n in a.cpus:
