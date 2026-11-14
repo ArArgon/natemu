@@ -1192,17 +1192,18 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         };
         let checked = r.target & cache::CHECKED != 0;
         let svc = |p: &exec::LinkPoint| {
-            natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p) == u64::from(r.offset)
+            natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p) == u64::from(r.offset())
         };
-        let point = b.links.iter().find(|p| {
+        // (The point its record names: `Block::links[r.point()]`.)
+        let point = b.links.get(r.point()).filter(|p| {
             p.offset != 0
                 && if checked {
                     svc(p)
                 } else {
-                    p.offset == r.offset
+                    p.offset == r.offset()
                 }
         });
-        linked.get(&(r.source, r.offset)) == Some(&r.target)
+        linked.get(&(r.source, r.offset())) == Some(&r.target)
             && point.is_some_and(|p| {
                 r.original
                     == if checked {
@@ -1270,23 +1271,20 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     {
         return Err(format!("record {i} names a dead block"));
     }
-    // The outbound lists: each block's chain holds exactly the records naming it as source (checked ones too), each once.
-    let mut on_outbound = 0;
+    // The outbound slots: each block's slot k names a record of its point k (checked ones too) or none, and every record is
+    // named by its source's slot.
+    let mut named = 0;
     for (n, b) in blocks.iter().enumerate() {
-        let mut at = b.outbound;
-        while at != 0 {
-            let r = records
-                .get(at as usize - 1)
-                .filter(|r| r.source as usize == n && on_outbound <= records.len())
-                .ok_or_else(|| format!("block {n}'s outbound list is broken at record {}", at - 1))?;
-            (at, on_outbound) = (r.next_out, on_outbound + 1);
+        for (k, &slot) in b.out.iter().enumerate().filter(|&(_, &s)| s != 0) {
+            records
+                .get(slot as usize - 1)
+                .filter(|r| r.source as usize == n && r.point() == k)
+                .ok_or_else(|| format!("block {n}'s outbound slot {k} is broken at record {}", slot - 1))?;
+            named += 1;
         }
     }
-    if on_outbound != records.len() {
-        return Err(format!(
-            "{on_outbound} records on outbound lists, {} links",
-            records.len()
-        ));
+    if named != records.len() {
+        return Err(format!("{named} records in outbound slots, {} links", records.len()));
     }
     Ok((points, linked.len() as u64))
 }

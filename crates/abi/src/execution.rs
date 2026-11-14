@@ -1008,10 +1008,10 @@ pub mod cache {
         /// Head of its inbound list: the record (index + 1; 0: none) of the newest link into it, from the records'
         /// `next_in` chain ([`LinkRecord`]). Checked links are on no list.
         pub inbound: u32,
-        /// Head of its outbound list: the record (index + 1; 0: none) of a link out of it (one per linked point, at most
-        /// [`super::MAX_LINK_POINTS`]), from the records' `next_out` chain ([`LinkRecord`]). Checked links are on it too.
-        /// Killing the block undoes its links out by this list, with no scan of the records.
-        pub outbound: u32,
+        /// Per link point (the index in `links`): the record (index + 1; 0: none) of the link out of that point, checked or
+        /// not. A record names its point ([`LinkRecord::point`]), so a record that moves updates exactly one slot. Killing
+        /// the block undoes its links out by these, with no scan of the records.
+        pub out: [u32; super::MAX_LINK_POINTS],
     }
     /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
     /// again; its space is reclaimed at the next flush.
@@ -1108,6 +1108,8 @@ pub mod cache {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct LinkRecord {
         pub source: u32,
+        /// The native offset of the patched word in `source`'s code, in the low [`POINT_SHIFT`] bits; above them the index
+        /// of its link point in [`Block::links`] ([`LinkRecord::offset`], [`LinkRecord::point`], [`LinkRecord::pack`]).
         pub offset: u32,
         pub original: u32,
         pub target: u32,
@@ -1116,11 +1118,25 @@ pub mod cache {
         /// (`cache::insert`, `remove`), which fix the neighbours.
         pub prev_in: u32,
         pub next_in: u32,
-        /// The outbound list of `source` (every record, checked or not; at most [`super::MAX_LINK_POINTS`] long): the next
-        /// record's index + 1 (0: the end; the head is [`Block::outbound`]). Singly linked: a list is walked from its
-        /// head to find a record's predecessor, as records move.
-        pub next_out: u32,
     }
+    /// [`LinkRecord::offset`]'s bits above the native offset hold the link point's index.
+    pub const POINT_SHIFT: u32 = 28;
+    impl LinkRecord {
+        /// The native offset of the patched word in `source`'s code.
+        pub const fn offset(&self) -> u32 {
+            self.offset & ((1 << POINT_SHIFT) - 1)
+        }
+        /// The index of the link point (`Block::links`, `Block::out`) the record is of.
+        pub const fn point(&self) -> usize {
+            (self.offset >> POINT_SHIFT) as usize
+        }
+        /// A record's `offset` field for native offset `at` of link point `point`.
+        pub const fn pack(at: u32, point: usize) -> u32 {
+            at | (point as u32) << POINT_SHIFT
+        }
+    }
+    const _: () = assert!(super::MAX_LINK_POINTS <= 1 << (32 - POINT_SHIFT));
+    const _: () = assert!(core::mem::size_of::<LinkRecord>() == 24);
     /// Invalidation requests to one vCPU, drained at each of its resident entries. Producers only set bits (atomic
     /// OR), the page's `stale` bit, then its word's `summary` bit, before `pending`; the consumer swaps `pending` to 0, then
     /// each `summary` word and the `stale` words it names, so no entry is lost, nothing overflows and a drain visits only
@@ -3266,6 +3282,18 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+    /// A link record's `offset` carries its link point's index above the native offset, for every point of a block.
+    #[test]
+    fn a_link_record_names_its_point() {
+        use super::cache::{LinkRecord, POINT_SHIFT};
+        for k in 0..super::MAX_LINK_POINTS {
+            for at in [0, 4, 0x1234, (1 << POINT_SHIFT) - 4] {
+                let r = LinkRecord { source: 1, offset: LinkRecord::pack(at, k), original: 2, target: 3, prev_in: 0, next_in: 0 };
+                assert_eq!((r.offset(), r.point()), (at, k));
+            }
+        }
+        assert_eq!(core::mem::size_of::<LinkRecord>(), 24);
+    }
     /// The record area's capacity is [`cache::MAX_LINKS`] unless a value in range is set; a full area is found at the cap
     /// (not before a block's links stop fitting), and what remains after the local links are undone is judged against it.
     #[test]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Deliberate mutations of the page record and the fast miss path (page-currency plan section 8, fast-miss plan section 5) and of the
-outbound link lists (`do-*`, the drain fix): each is applied
+outbound link slots (`do-*`, the drain fix): each is applied
 to the resident's (or the abi's pure-function) sources, built into its own target directory and run against the K1 programs that must
 turn red, then reverted (restored in a `finally`, checked clean at the end).
 
@@ -54,11 +54,14 @@ MUTATIONS = {
     'pr-m12-check-compares-frames-only': ([(REC, 'if walked == Ok((page, flags)) {', 'if walked.map(|w| w.0) == Ok(page) {')], 'page-size-check'),
     'pr-m13-large-without-ram-rule': ([(REC, 'if large && !ps::recordable(&guest_ram(), ps::base(gpa, true), true) {', 'if false {')], 'page-large-edge'),
     'pr-m14-check-overwrites-record': ([(REC, '    cache::control().page_disagree += 1;', '    cache::control().page_disagree += 1;\n    if let Ok((g, f)) = walked {\n        record(s, va, g, f);\n    }')], 'page-check-keep'),
-    # ---- the outbound lists (drain fix: a block's death undoes its links out by its list, not by a pass over every record)
-    'do-death-skips-outbound': ([(CACHE, '        if dead && block(n).outbound != 0 {\n            undone += unlink_outbound(n)?;\n        }', '')], 'kill-out'),
+    # ---- the outbound slots (drain fix: a block's death undoes its links out by its slots, not by a pass over every record)
+    'do-death-skips-outbound': ([(CACHE, '        if dead && block(n).out != [0; MAX_LINK_POINTS] {\n            undone += unlink_outbound(n)?;\n        }', '')], 'kill-out'),
     'do-death-passes-over-records': ([(CACHE, 'undone += unlink_outbound(n)?;', 'undone += prune(CHECKED, false)?;')], 'kill-out'),
-    'do-move-leaves-list': ([(CACHE, '    if let Some(cell) = out_cell(source, from as u32 + 1) {\n        unsafe { *cell = to as u32 + 1 };\n    }\n', '')], 'kill-out,local-write,remap-link,cr3-link'),
-    'do-remove-keeps-listed': ([(CACHE, '    list_del(i as usize);\n    out_del(i as usize);', '    list_del(i as usize);')], 'kill-out,local-write,remap-link,cr3-link'),
+    'do-move-leaves-slot': ([(CACHE, '    unsafe { *slot = to as u32 + 1 };\n', '')], 'kill-out,local-write,remap-link,cr3-link'),
+    'do-remove-keeps-slot': ([(CACHE, '    list_del(i as usize);\n    out_del(i as usize);', '    list_del(i as usize);')], 'kill-out,local-write,remap-link,cr3-link'),
+    'do-prune-tlb-keeps-slot': ([(CACHE, '                list_del(i as usize);\n                out_del(i as usize);', '                list_del(i as usize);')], 'cr3-link,remap-link,cr3-switch'),
+    'do-unlink-all-keeps-slots': ([(CACHE, '        unsafe { *out_slot(&r) = 0 };\n', '')], 'link-full'),
+    'do-copy-keeps-slots': ([(CACHE, '        inbound: 0,\n        out: [0; MAX_LINK_POINTS],\n        ..*b\n', '        inbound: 0,\n        ..*b\n')], 'reuse-alias,reuse-write,reuse-remap,reuse-cross'),
 }
 
 

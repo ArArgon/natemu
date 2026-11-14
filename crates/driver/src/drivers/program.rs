@@ -783,7 +783,7 @@ fn corrupt(area: Area, kind: Corrupt) -> bool {
     let Some((b, r)) = first_link(area) else {
         return false;
     };
-    let at = cache::CODE_OFFSET + b.code as usize + r.offset as usize;
+    let at = cache::CODE_OFFSET + b.code as usize + r.offset() as usize;
     match kind {
         Corrupt::Word => area.copy(at, &0x1400_0001u32.to_le_bytes()), // b .+4
         Corrupt::Record => {
