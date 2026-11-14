@@ -141,6 +141,14 @@ Rules learned in this round:
     Ranking by measured share: page-level currency (configure) and flush policy (both) first, then L1 conflicts
     (make), relink step 2, fault-around, kick attribution.
 
+16. **Group R1 (code synchronization by CTR_EL0, skip re-admission, link-full cap): first profile
+    (`natemu-raw/group-r1-profile-1`, one uncontended run).** K1 256/256 in ~26 s (link-full at the 16 Ki cap).
+    Host bucket down 3.9 (configure) / 6.2 (make) vCPU-s, as the admission count predicted; configure step 77.1 ->
+    73.5 s. But the perf build carried the dispatch study counters, and `lookup` doubled (36 -> 76 ns over 273 M
+    lookups on make, +10.7 vCPU-s) with guest time +14: the same pattern as the census build and absent from host-only
+    builds. **Rule: study counters get their own feature, never `perf`** — the perf build is the measuring instrument.
+    Counters move to `dispatch-study`; the group is profiled again before judging make.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
