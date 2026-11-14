@@ -40,6 +40,8 @@ Rules learned in this round:
 - **Small gains are real but invisible in single runs** (wall spread 1-2.5 s): a change is kept when its buckets show
   the work removed; wall time is judged per group (owner, November 13).
 - **QEMU runs once per workload/version** and its numbers are reused (owner).
+- **Timed runs are batched** (owner, November 14: contention is severe): implementers stop at Tiers 0-1; one Tier 2
+  profile covers a group of changes built together; measurement builds get one profile run, repeated only if invalid.
 - **Untimed work in parallel:** reviews start when a commit exists, K1 overlaps with other untimed work under the lock's
   shared use, implementers work in separate worktrees on different files; only timed gates serialise.
 - **Every resident change:** an independent reviewer (separate from the author), tests that a deliberate mutation turns
