@@ -82,8 +82,10 @@ def run_one(name, a):
                 return 'pattern not found or not unique (the source changed: update this table): ' + path
             (ROOT / path).write_text(text.replace(old, new, 1))
         target = ROOT / 'target' / 'mut'
-        r = sh(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'],
-               env=dict(os.environ, CARGO_TARGET_DIR=str(target)))
+        # (The `do-*` mutations run under the `link-check` resident: a dead block's record left behind has no effect a program sees,
+        # and the end of every K1 program, a CR3 load, drops it; the check at the cut sees it.)
+        r = sh(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none',
+                *(['--features', 'link-check'] if name.startswith('do-') else [])], env=dict(os.environ, CARGO_TARGET_DIR=str(target)))
         if r.returncode != 0:
             return 'build failed: ' + r.stderr[-400:]
         out = a.out / name
