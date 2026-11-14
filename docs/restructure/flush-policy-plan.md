@@ -86,20 +86,46 @@ array as a tail (like the sites) for blocks that have one. Then double `MAX_BLOC
 (+32 MiB of L2 and +4 MiB of index per vCPU in the lookup window; its room must be checked against `LOOKUP_BYTES`). With
 the index no longer first, the records fill at (*estimate*) configure 268 MB / (213 - 0.68 x 64 = 169 bytes) = 1.59 Mi
 blocks per cycle (x 1.5), make 268 / (236 - 0.43 x 64 = 208) = 1.29 Mi (x 1.25; code reaches 130 of 134 MB, so the code
-area is next). Refetches scale with flushes for the cold-returning blocks and stay one per cycle for the hot set:
-about **-30% on configure, -17 to -20% on make** (the reviewer's figures agree). No eviction machinery, no new
-correctness surface beyond the record accessor; the host's `check_links` and the driver's readers follow the accessor.
-Memory: L2 is hashed, so +32 MiB of resident memory per vCPU; the arena's RSS is unchanged.
+area is next). On configure too the code area is the next limit almost immediately: at 1.59 Mi blocks the code is at
+about 115-120 MB of 134 (85-90%; the reviewer puts it near 95%), so (a) cannot be stretched past about x 1.5-1.7 by
+any record saving, and chunk 0's replay uses the real per-block code sizes to find which pool fills first. Refetches
+scale with flushes for the cold-returning blocks and stay one per cycle for the hot set: about **-30% on configure,
+-17 to -20% on make** (the reviewer's figures agree), and like every replay of a policy that keeps more, this one is
+optimistic (hits (a) would have missed are not in today's trace). No eviction machinery; the new correctness surface is
+the record accessor and its readers: `Block::rep_exit` and `sites`/`relocs` (the sites' offset moves once `links` is a
+tail; order the tail as links, sites, relocations), the resident's `REUSE_CHECK` comparison (`checked` in `execution.rs`,
+which compares a copy's record with the host's answer), the linker (`svc_slot`, `link`), `instance`, `share`,
+`links_restored`, the host's `check_links` and the driver's `first_link`. Memory: L2 is hashed, so +32 MiB of resident
+memory per vCPU; the arena's RSS is unchanged.
 
-**(b) Flush, but carry the hot blocks forward.** At a capacity flush, after `unlink_all` and `links_restored`, copy the hot
-live blocks down to the bottom of the pools with new numbers before `reset`'s clearing: code bytes moved (in increasing
-number order each destination is at or below its source; `memmove`), the computed exit re-relocated to its context's slot
-(as `copy` does), the record re-filed by the ordinary `file` (new number, sites and relocations copied, L2, both chains,
-regions and the hint for a `RELOCATABLE` block written by `file` itself), translations first and instances after them
-with `shared` rewritten through a small old-to-new number map. Everything not carried is dropped as today. Hot means
-`checked >= epoch_mark`, the epoch when the fill passed the mark chunk 0 chooses (the last quarter of the cycle as the
-default), live, not `PIC`-shared unless an instance of it is carried; capped at a quarter of the capacity so an all-hot
-pathology still makes progress. The hot set then survives every flush; cold-returning blocks are as today.
+**(b) Flush, but carry the hot blocks forward.** At a capacity flush the hot live blocks are copied down to the bottom of
+the pools with new numbers; everything else is dropped as today. Order inside `flush`:
+
+1. `unlink_all` and `links_restored` (as today): no link exists, every link point holds its admitted word.
+2. Collect the carried set (in increasing number order) and the set of its source pages. Hot means `checked >= epoch_mark`,
+   the epoch when the fill passed the mark chunk 0 chooses (the last quarter of the cycle as the default), live, with
+   code or a `SYSTEM` record; a `PIC`-shared translation only if an instance of it is carried (one pass over the instances
+   first); capped at a quarter of the capacity so an all-hot pathology still makes progress.
+3. `reset`'s clearing: fill points, L1 tables and their contexts, dispatcher slots, L2, chain heads, linear heads, regions,
+   and the code-page bits, with one change: the clear spares the carried pages (per mask word, clear this vCPU's bits minus
+   those pages' bits, one atomic each), so there is no window in which a peer's write to a carried page would not post.
+4. **Reserve a dispatcher slot per carried context** before any exit is relocated: after a reset only the current context
+   has a slot, so carried blocks of other contexts (hot kernel blocks when the flush happens in user context) would
+   otherwise exit to the miss path for the whole cycle. For each distinct context among the carried blocks:
+   `slot_contexts[k] = context`, `write_slot(k, None)` (a `b` to the miss until a table binds); `bind_slot` later finds the
+   slot by context.
+5. Carry, in increasing number order: the code bytes moved to the new fill point (each destination is at or below its
+   source because the order is increasing and only a subset is kept; `copy_record` copies forward, ascending, so an
+   overlapping move is sound in that order), the computed exit relocated through `dispatcher_for(context)` after the
+   reset (it names the slot reserved in step 4), the code synchronized at its new address, then the record re-filed by the
+   ordinary `file` (new number; sites and relocations copied; L2, both chains, regions and the hint of a `RELOCATABLE`
+   block written by `file` itself). Translations first, then instances with `shared` rewritten through a small old-to-new
+   number map. A carried translation keeps the PIC layout `share` made: the 16 lead bytes it wrote at `code - 16` move
+   with it (the full entry is at `code - 4`), the new code sits `PIC_LEAD` past a 64-byte boundary as `share` places it,
+   and the synchronization covers lead and code.
+6. `flushes += 1`, both generations bumped (as `flush` does today), `epoch_mark` reset for the new cycle.
+
+The hot set then survives every flush; cold-returning blocks are as today.
 
 **(c) Two halves plus carry-over.** The first draft's halves (fill the pools as two halves, evict the older one whole,
 rebuild the survivors' structures) with (b)'s carry-over at each eviction. Keeps the cold-returning blocks of the newer
@@ -138,20 +164,28 @@ refetch, roughly half of every figure; the "with the pool" columns are the ones 
 
 **Chunk 0, counting and replay (scratch in `natemu-raw/io5-bins/`, not committed; one profile of configure and make,
 scheduled by the main session).**
-- Host trace: every translation request as `(vCPU, answer fingerprint, the vCPU's `Control::blocks` and `generation` at
-  the request, hit-or-compile)`, about 20 bytes x 1.7 M per vCPU, beside the timing log (the host maps the lookup area;
-  the fill point is one load). Instances and shares between two requests show as the gap in the fill point.
+- Host trace: every translation request as `(vCPU, answer fingerprint, the answer's first frame, RIP, context and
+  relocatable flag, hit-or-compile, and the vCPU's `Control::blocks`, `code_used`, `meta_used`, instances counter
+  (`pic[INSTANCES]`) and `generation` at the request)`, about 48 bytes x 1.7 M per vCPU, beside the timing log (the host
+  maps the lookup area; each field is one load). All three fill points are needed so the replay knows when the records or
+  the code would fill under another record size or index, and the instances counter so (a)'s replay can recharge
+  instances at 96 bytes; instances and shares between two requests also show as the gaps.
 - Resident, at each capacity flush: for every live block with `checked` at or above each of four marks (the epochs when the
   fill passed 1/2, 3/4, 7/8 and 15/16 of capacity), its identity (first frame, RIP, context) and flags, written to a
   scratch page the host drains with the trace; plus the counts per mark and the live instances per mark. This is what
-  carry-over would have kept at each window; the refetch trace is matched against it by identity (the fingerprint of a
-  host answer is a function of frame bytes, RIP half and offset and context, so the match is by frame, RIP and context).
+  carry-over would have kept at each window. The refetch trace is matched against it by two keys: an absolute block by
+  (first frame, RIP, context); a `RELOCATABLE` template or a translation by the **hint key** (first frame, RIP's page
+  offset and address half, context), because a carried template serves a later request at another RIP of the same frame
+  through the hint table (`template`), and those are configure's dominant shared-library refetches: matching them by
+  full RIP would undercount h.
 - Readouts: (1) a histogram of refetch delay since the flush, in placements (halves can only remove delay above about
   C/2: that is g); (2) for each window, the share of refetches whose block was in the window's set at the flush (h) and the
-  set's size and bytes (the carry cost); (3) the replay of (a): the same trace with instances charged 96 bytes and the
-  index at 2 Mi, flushing when the records or code fill (validated by first reproducing today's 1.155 M / 2.83 M within a
-  few percent); (4) spurious posts: pages posted to a vCPU whose chain was empty (for the code-page-bit rule). The halves
-  replay is **optimistic**: cut instances and lost hints add requests the trace does not hold; state that beside its number.
+  set's size and bytes (the carry cost); (3) the replay of (a): the same trace with instances charged 96 bytes, the index
+  at 2 Mi, and the code and record fill points advanced by the traced per-request deltas, flushing when the first pool
+  fills (validated by first reproducing today's 1.155 M / 2.83 M within a few percent); (4) spurious posts: pages posted
+  to a vCPU whose chain was empty (for the code-page-bit rule). Both the halves replay and (a)'s are **optimistic**: a
+  policy that keeps more would have hit in-VM on requests the trace does not hold (the halves also cut instances and lose
+  hints); state that beside each number.
 - **Decision rule:** net modelled gain per candidate with the pool's per-refetch cost, the event cost of section 4 and
   the measured h, g and set sizes; **prefer (a) if it is within about 70% of the best**; otherwise (b), or (c) only if
   g's contribution exceeds its extra eviction cost by a clear margin on make. If no candidate nets at least 1% of busy on
@@ -189,8 +223,13 @@ permanent: it is the gate's reading), per-vCPU `peak`/`used`/`capacity` in the p
   Mutations, each red: L2 left as it was (not zeroed: `carry-write`, the dropped page); translations left off their
   source chains (`carry-translation`); L1 not cleared (`carry-write`: the stale entry enters old code); `links_restored`
   checking only the carried range (`carry-link` under `link-check`); `shared` not remapped (`carry-instance`); the
-  code-page clear not sparing carried pages (`carry-peer`); `shadow_generation` not bumped (red on the suite's retry
-  cases, or a new case retrying at a reused PC); carry writing the record before relocating the exit (`carry-hot`).
+  code-page clear not sparing carried pages (`carry-peer`); `shadow_generation` not bumped (red on `carry-retry`: two
+  guest blocks of the same native shape, each storing to a page not yet shadowed at the same native offset; the first,
+  placed at native PC E, is retried at F after its abort; the number cap then forces a flush with nothing carried, so the
+  second block is placed at the same E and its store is retried at the same F: the no-progress check sees the same
+  (PC, shadow generation) twice and halts `NO_PROGRESS` without the bump; values against QEMU with it); slots not
+  reserved for carried contexts (`carry-hot` in a kernel/user mix: the host answers the hot block once but the `miss`
+  count for its exit stays high, asserted); carry writing the record before relocating the exit (`carry-hot`).
   Tier 2 gate: refetches down by h within 10 points; `host` down by at least 70% of (b)'s low estimate; `carry_us`
   under 0.4 s per vCPU per step; `miss` and `link` not up by more than half the gain.
 - *(c)*: (b)'s list plus the halves of the first draft with the review's fixes (section 7): every non-dead survivor back on
@@ -246,6 +285,18 @@ Accepted in full. What changed:
   past the translation's number before re-running; the "L2 not rebuilt" mutation is "L2 left as it was"; mutations for
   L1 not cleared, translations off source chains, `links_restored` over one range; every case at the suites'
   `--code-cache 32768` with the number cap, seconds each.
+
+**Second round (re-review of `2afdb72`; B1 and B2 closed, accepted with remaining issues, all taken):**
+- Chunk 0 trace now carries `code_used`, `meta_used` and the instances counter per request, so the replay can tell which
+  pool fills and recharge instances at 96 bytes; h matches relocatable templates and translations by the hint key, not
+  the full RIP; (a)'s replay is marked optimistic like the halves'.
+- (b) states the order inside `flush` (unlink, collect, reset with the sparing clear, reserve slots, carry with exits
+  relocated through `dispatcher_for` after the reset, bump both generations), the forward direction of `copy_record` the
+  in-place move relies on, the dispatcher-slot reservation per carried context, and the PIC layout a carried translation
+  keeps (16 lead bytes, full entry at `code - 4`, `PIC_LEAD` past a 64-byte boundary, synchronization of both).
+- (a) lists its readers to convert and notes that on configure the code area is at 85-90% at 1.59 Mi blocks, so it is the
+  next limit almost immediately and (a) cannot be stretched further.
+- The `shadow_generation` mutation has a concrete red case (`carry-retry`).
 
 ## Questions for the owner
 
