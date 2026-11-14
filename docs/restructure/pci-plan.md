@@ -3,7 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Status: proposed, November 13, 2026, on `main` at dcffe4b. Not built. Owner direction (November 13): keep virtio-MMIO
+Status: built November 13, 2026, on branch `pci` (from `main` at dcffe4b): Tasks 1-7 done and reviewed; Task 8's
+benchmark round, full suite and records follow. Where the build departed from this text it is marked "As built". Owner direction (November 13): keep virtio-MMIO
 as it is; PCI lives alongside it; build on existing code rather than write from scratch; Windows is a later
 consideration that must not be blocked. Owner corrections to the first draft (same day): new dependencies are allowed
 when judicious; the product is an OS-agnostic emulator with Debian as the first guest only, so guest-visible behaviour
@@ -130,7 +131,9 @@ byte (read clears). Every read-write field reads back what was written (virtio 1
 selectors, the selected driver-feature half, queue_select and the three queue addresses are served from state, since
 the MMIO registers they map to are write-only. An 8-byte access to a 64-bit field is split into its two halves
 (4.1.3.1 permits either), and 8-byte accesses to the MSI-X table and PBA are passed through (PCI 3.0 6.8.2). A write
-to the device-specific configuration is ignored, not refused. queue_enable = 1 with no size written uses the queue
+to the device-specific configuration is ignored, not refused. As built, two more leniencies: a queue-layout write
+while the queue is enabled is ignored (the MMIO front end refuses it, which would stop the vCPU), and with Bus Master
+clear the device still processes requests and holds its interrupts pending until Bus Master is set. queue_enable = 1 with no size written uses the queue
 maximum; a queue_enable write of 0, which a driver must not make, is treated as the MMIO queue reset. A device reset sets both kinds of
 vector to 0xFFFF. A notify write at 0x3000 + 4q takes the existing lock-free `kick(q)` path first.
 
@@ -151,7 +154,7 @@ non-virtio PCI devices; interrupt hold-back and EVENT_IDX for the disk device.
 | `crates/host/src/irq.rs` | `Irqs::msi` |
 | `crates/host/src/boot/acpi.rs`, `boot.rs` | `PCI0` device, the E820 hole |
 | `crates/host/src/linux.rs`, `crates/cli/src/main.rs`, `crates/driver/src/drivers/linux.rs` | the launch option, the stderr logger, the `Layout` literal |
-| `tools/run_net_linux.py`, `tools/run_virtio_block.py`, `tools/run_io_coverage.py`, `tools/run_io_matrix.py`, `tools/play/init` | `--transport pci` variants |
+| `tools/run_net_linux.py`, `tools/run_virtio_block.py`, `tools/run_io_coverage.py`, `tools/run_io_matrix.py`, `tools/io_common.py` | `--transport pci` variants; the shared guest probe and judge |
 
 ---
 
@@ -182,8 +185,9 @@ modify `crates/host/src/lib.rs`.
   control reaches the table, upstream lines 1063-1083); `read_reg`; `write_config_register(&mut self, reg_idx, offset,
   data) -> Vec<BarReprogrammingParams>`; `add_pci_bar`; `add_capability(&mut self, &dyn PciCapability) ->
   Result<usize>`; `get_bar_addr(&self, bar_num: usize) -> u64`; plus one addition, `command(&self) -> u16`.
-  BAR routing (Task 4) reads the live BAR register through `get_bar_addr` and the command register; it does not rely
-  on the reprogramming list, which upstream only produces while memory decoding is on.
+  BAR routing (Task 4) reads the live BAR register and the command register; it does not rely on the reprogramming
+  list, which upstream only produces while memory decoding is on. As built: the base is taken from the register
+  itself (`read_reg(4)`), because upstream's `get_bar_addr` returns a cache that byte and word writes do not update.
 
 - [ ] Add `thiserror` and `log` to the workspace and `crates/host`. Copy upstream `pci/src/configuration.rs` at the
   pinned commit. The complete list of changes: remove snapshot/migration (`vm-migration`, the `state` argument and
@@ -259,8 +263,8 @@ modify `crates/host/src/lib.rs`.
 **Interfaces:**
 - Consumes: Tasks 1-4; `Virtio::access`, `Virtio::poll`, `Virtio::kick`, `Virtio::config_access`.
 - Produces: `impl Virtio { pub fn pci(self: &Arc<Self>, slot: u8) -> Arc<dyn pci::Function> }` (for `Bus::add`; its
-  BAR0 is programmed to `pci::platform::bar(slot)`; calling it switches this device's interrupts to MSI-X for good,
-  and its GSI line is never driven).
+  BAR0 is programmed to `pci::platform::bar(slot)`; calling it switches this device to the PCI transport for good:
+  MSI-X once the driver enables it, and until then its GSI as the legacy INTx line).
 
 - [ ] Tests, in `virtio/pci.rs`, driving BAR0 and config space as Linux's `vp_modern_probe` and `vp_find_vqs` do
   (helper: `negotiated_over_pci(&rig)`): `capabilities_are_the_four_virtio_structures_and_msix_within_bar0`;
@@ -283,7 +287,8 @@ modify `crates/host/src/lib.rs`.
 - [ ] Run and see them fail.
 - [ ] Implement: the private registers and `vectors: [u16; 3]` in `State`; `raise` takes the queue (or "config") and
   branches on the transport; the hold-back remembers owing queues; `virtio/pci.rs` holds the layout constants,
-  capability bytes and the BAR0 dispatch. `irq()` is a no-op for a PCI device.
+  capability bytes and the BAR0 dispatch. `irq()` drives the INTx line from the ISR while MSI-X is disabled and
+  keeps it low otherwise.
 - [ ] `cargo test -p natemu virtio::` (all existing MMIO tests unchanged and passing); commit.
 
 ### Task 6: machine description and launch option
@@ -315,7 +320,8 @@ modify `crates/host/src/lib.rs`.
 ### Task 7: guest acceptance
 
 **Files:** modify `tools/run_net_linux.py`, `tools/run_virtio_block.py`, `tools/run_io_coverage.py`,
-`tools/run_suite.py`, `tools/play/init` (virtio-pci is built into the Debian kernel: no new module).
+`tools/run_suite.py`, `tools/io_common.py` (virtio-pci is built into the Debian kernel: no new module; the play image
+needed no change).
 
 - [ ] Add `--transport {mmio,pci}` to the four runners (passed through as `--virtio-transport`). `run_io_matrix.py`
   pins "the first virtio interrupt" to CPU 0, which under PCI is the config vector, and queue vectors of the disk are
