@@ -1114,6 +1114,42 @@ interrupt, then a guest function-call IPI to fio's vCPU).
 +15%, deeper queues and four readers no worse, host CPU per I/O at depth 1 no more than +20%.
 Every correctness run passing, including lifecycle reset/disable/S5 with a lone in-flight request.
 
+## Combined acceptance (IO5) — November 13
+
+`tools/run_io5.py` boots the stock Debian 13 cloud image (nocloud amd64 20260914-2601: systemd, its own Debian 6.12.107-1
+kernel, identical to the one natemu has booted since October, and its own initramfs, all unchanged) on a 16 GiB clone,
+4 vCPUs, 8 GiB, with `--disk --net --rng`. First boot: apt from a pinned snapshot (20260915T000000Z), online partition
+and ext4 grow, CPython 3.13.18 configure, then `make -j4` while a loop downloads linux-6.12.tar.xz from kernel.org
+(SHA-256 checked) and a loop writes 2 GiB of random data, drops caches and re-reads it against its sums; CPython tests;
+a manifest of every file. Second boot: the manifest checks (same bytes as fingerprinted on the first boot's console),
+the built python imports its C modules, HTTPS works. Each boot must end in a real power-off with a clean offline
+e2fsck and superblock, and only explained kernel error lines (PCI absent, MCE absent, Linux's own MADT mailbox write).
+
+| Run (all PASS unless noted) | First boot | Notes |
+| --- | --- | --- |
+| natemu, stock (PTI on) | 1,656 s | first runner version; review fixes after it |
+| natemu, `mitigations=off` | 705 s | matched pair below |
+| QEMU 11.1.2 TCG, `mitigations=off` | 901 s | like-for-like CPU, one disk queue |
+| natemu, stock + `--speculation-barriers` (no PTI) | 703 s | FAIL: one CPython timing test (below) |
+
+Matched steps natemu / QEMU (`mitigations=off`, cold compile cache): apt-install 14.9 / 25.3 s, configure 88.7 / 95.9,
+make with the loops 492 / 652 (not like-for-like: natemu's loops moved 1.3x the network and 2x the disk data meanwhile),
+tests 65.2 / 76.1, whole first boot 705 / 901 (0.78x). Page-table isolation costs natemu 3-9x per step (no PCID); the
+barrier switch recovers it on the stock command line. The failing test (`test_timerfd_ns_TFD_TIMER_ABSTIME`, 1 ms
+tolerance) fails on a code path's first execution (a compile stall, 1.3 ms; 1 in 30 idle, at run 1) and under four
+busy loops (one scheduler tick); recorded as a known limitation. Evidence: `natemu-raw/io5-*-20261113-*`; the runner
+was independently reviewed (three PASS-could-lie holes and a non-overlapping load, all fixed before the matched runs).
+Independent replication of the final runs remains (end of the perf iteration).
+
+**Profile (one step per boot from a shared snapshot, `run_io5.py profile`, `tools/io5_breakdown.py`).** `make -j4` alone
+181 s; beside a pure CPU loop 342 s, so the combined slowdown was mostly the loops' own guest CPU. In the build 51% of vCPU
+time is guest code; the rest: link/patch 13%, compiles 10% (78% of them repeats: the answer cache cycled), misses 5%.
+Configure is serial: 35 s guest against ~62 s resident, mostly shadow refills (42 M, ~520 ns each; the user shadows are
+reset at every CR3 load) and link-record scans (`prune`: 35 us per #PF that cuts a block, 82 us per CR3 load). 80-87% of
+CR3 loads return to one of the vCPU's last 8 roots. Done: the answer cache holds a build's working set (compiles -65%,
+make -6.7%, `41edbb5`); DISCARD/WRITE_ZEROES free image blocks (`69db2ed`; the IO5 image had grown to 15 GiB for 3 GiB of
+data). Planned, under review: [root retention](root-retention-plan.md) (state kept per recently used CR3 root).
+
 ## Future direct-payload work
 
 Keep immutable request metadata, backend ownership and ordered completion as
