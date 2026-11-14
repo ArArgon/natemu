@@ -110,6 +110,7 @@ pub struct Publisher {
 }
 impl Publisher {
     /// The writer of the pool at backing offset `offset` of `memory` (whose span is zero), switched on.
+    #[cfg(test)]
     pub(crate) fn new(memory: Arc<Memory>, offset: usize) -> Self {
         Self::with_layout(memory, offset, pool::PRODUCTION)
     }
@@ -149,6 +150,10 @@ impl Publisher {
     #[cfg(test)]
     pub(crate) fn pool(&self) -> Pool {
         self.pool
+    }
+    /// The span's layout (the resident is told it: [`natemu_abi::execution::cache::Control::pool_layout`]).
+    pub(crate) fn layout(&self) -> Layout {
+        self.pool.layout()
     }
     pub fn is_off(&self) -> bool {
         self.off.load(Relaxed)

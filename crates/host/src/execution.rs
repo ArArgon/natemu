@@ -148,6 +148,34 @@ impl Area<'_> {
     }
 }
 
+/// The template pool's layout: production's, or (the K1 `pool-wrap` test hook) `NATEMU_POOL_RING_KB` of ring and
+/// `NATEMU_POOL_INDEX_SLOTS` index slots (both set, a ring a multiple of 64 bytes and at least 4 KiB, slots a power of two of
+/// at least 8; the control granule stays 2 MiB).
+fn pool_layout_from_env() -> Result<natemu_abi::pool::Layout> {
+    let var = |name: &str| match std::env::var(name) {
+        Ok(v) => v
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("{name}={v}: a number")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name}: {e}")),
+    };
+    let (ring, slots) = (var("NATEMU_POOL_RING_KB")?, var("NATEMU_POOL_INDEX_SLOTS")?);
+    let Some((ring, slots)) = ring.zip(slots) else {
+        return Ok(natemu_abi::pool::PRODUCTION);
+    };
+    let layout = natemu_abi::pool::Layout {
+        index_slots: slots,
+        ring_bytes: ring.saturating_mul(1024),
+        control_bytes: natemu_abi::pool::PRODUCTION.control_bytes,
+    };
+    if !layout.valid() || layout.ring_bytes < 4096 {
+        return Err("NATEMU_POOL_RING_KB / NATEMU_POOL_INDEX_SLOTS: a ring of 4 KiB or more and a power of two of 8 or more slots".into());
+    }
+    eprintln!("natemu: the template pool's ring is {ring} KiB, its index {slots} slots (test hook)");
+    Ok(layout)
+}
+
 /// Backing for the execution mode with `n` vCPUs (1..=`cache::MAX_VCPUS`) and `ram_bytes` of guest RAM (a 2 MiB
 /// multiple, at most `exec::MAX_GUEST_RAM_BYTES`): the resident loaded into each vCPU's window, each vCPU's private
 /// address space and shared record in place; guest RAM is zero. Each vCPU's code cache holds `code_bytes` of generated
@@ -196,8 +224,9 @@ pub fn prepare_with_guest_state_alias(
     n: usize,
     ram_bytes: usize,
     va: u64,
+    pool: bool,
 ) -> Result<Backing> {
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, false)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool)
 }
 
 fn prepare_at_alias(
@@ -236,7 +265,12 @@ fn prepare_at_alias(
     let stride = exec::BACKING_BYTES + code_mapped;
     // The pool's span follows the last block and precedes guest RAM, so RAM stays the backing's last bytes (N7).
     let pool_offset = n * stride;
-    let pool_bytes = if pool { cache::POOL_BYTES } else { 0 };
+    let pool_layout = if pool {
+        pool_layout_from_env()?
+    } else {
+        natemu_abi::pool::PRODUCTION
+    };
+    let pool_bytes = if pool { pool_layout.mapped_bytes() } else { 0 };
     let ram_offset = pool_offset + pool_bytes;
     let ram_span = exec::ram_end(ram_bytes as u64) as usize;
     let memory = Memory::with_size(ram_offset + ram_span)?;
@@ -293,7 +327,7 @@ fn prepare_at_alias(
         if pool {
             spans.push(Span::read_only(
                 (cache::POOL_VA - PRIVATE) as usize,
-                cache::POOL_BYTES,
+                pool_bytes,
                 pool_offset,
             ));
         }
@@ -323,7 +357,13 @@ fn prepare_at_alias(
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
     let memory = Arc::new(memory);
     // Zero memory, nothing reading yet: the publisher makes the pool empty and on.
-    let pool = pool.then(|| Arc::new(crate::publisher::Publisher::new(memory.clone(), pool_offset)));
+    let pool = pool.then(|| {
+        Arc::new(crate::publisher::Publisher::with_layout(
+            memory.clone(),
+            pool_offset,
+            pool_layout,
+        ))
+    });
     Ok(Backing {
         memory,
         n,
@@ -631,6 +671,7 @@ pub struct K1 {
     capacity: [u64; 3],
     reclaims: [u64; 2],
     reuse: K1Reuse,
+    pool: K1Pool,
     slot_writes: u64,
     kept_resets: u64,
     /// Dispatch study (`natemu_abi::execution::cache::L1_EVICTED` and the rest; `dispatch-study` resident builds only).
@@ -727,6 +768,26 @@ struct K1Reuse {
     refused: [u64; 5],
     checks: u64,
 }
+/// The template pool's counters (cross-vCPU reuse plan chunk 3): lookups, blocks copied, refusals by
+/// [`cache::pool_refusal`].
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct K1Pool {
+    pub probes: u64,
+    pub hits: u64,
+    pub refused: Members<&'static str, u64>,
+}
+impl K1Pool {
+    pub(crate) fn new(c: &cache::Control) -> Self {
+        Self {
+            probes: c.pool_probes,
+            hits: c.pool_hits,
+            refused: cache::pool_refusal::NAMES
+                .into_iter()
+                .zip(c.pool_refused)
+                .collect(),
+        }
+    }
+}
 /// Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
 #[derive(Debug, Default, serde::Serialize)]
 struct K1Systems {
@@ -784,6 +845,7 @@ impl K1 {
                 refused: c.reuse_refused,
                 checks: c.reuse_checks,
             },
+            pool: K1Pool::new(c),
             slot_writes: c.slot_writes,
             kept_resets: c.kept_resets,
             l1_counts: c.l1_counts,
@@ -2496,6 +2558,11 @@ impl Compiler {
             )
         })
     }
+    /// Publishes into (and, with `Control::pool`, reads) `backing`'s template pool, if it has one; call before [`Compiler::share`]
+    /// (a compiler whose features differ then switches the pool off).
+    pub fn attach_pool(&mut self, backing: &Backing) {
+        self.pool = backing.pool.clone();
+    }
     /// The template pool: a non-step block request under `context` with this compiler's gating values (a vCPU tells the
     /// pool each pair once). A context whose requests differ in them turns the pool off ([`crate::publisher::Publisher::note`]);
     /// under the check mode that is a host error.
@@ -3235,6 +3302,27 @@ pub fn run(
         SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_CAP={v}: link record area capacity reduced (test hook)"));
     }
     area.write_record(control + std::mem::offset_of!(cache::Control, link_cap), cap);
+    // The template pool (chunk 3): the resident looks in it (mapped read-only at `cache::POOL_VA` by `prepare_with_pool`) unless
+    // `NATEMU_POOL_LOOKUP=off` (publication without lookup, the A/B of the pool's cost).
+    if let Some(pool) = &compiler.pool {
+        let layout = pool.layout();
+        let on = !matches!(
+            std::env::var("NATEMU_POOL_LOOKUP").as_deref(),
+            Ok("off" | "0")
+        );
+        area.write_record(
+            control + std::mem::offset_of!(cache::Control, pool),
+            if on { cache::POOL_ON } else { cache::POOL_OFF },
+        );
+        area.write_record(
+            control + std::mem::offset_of!(cache::Control, pool_layout),
+            [
+                layout.index_slots as u64,
+                layout.ring_bytes as u64,
+                layout.control_bytes as u64,
+            ],
+        );
+    }
     // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
     // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
     let entered = &AtomicU64::new(0);
@@ -3935,7 +4023,9 @@ mod tests {
             ram,
         };
         let empty: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
-        assert_eq!(empty, serde_json::to_value(k1_stats(area)).unwrap());
+        let mut now = serde_json::to_value(k1_stats(area)).unwrap();
+        now.as_object_mut().unwrap().remove("pool");
+        assert_eq!(empty, now);
         let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
         let mut c: cache::Control = area.read_record(offset);
         let mut n = 0;
@@ -3990,7 +4080,10 @@ mod tests {
         (c.system_from[0], c.system_from[5], c.system_from[31]) = (2, 3, 4);
         area.write_record(offset, c);
         let old: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
-        assert_eq!(old, serde_json::to_value(k1_stats(area)).unwrap());
+        let mut new = serde_json::to_value(k1_stats(area)).unwrap();
+        // (The pool's counters are newer than the reference formatter.)
+        assert_eq!(new.as_object_mut().unwrap().remove("pool").unwrap()["probes"], 0);
+        assert_eq!(old, new);
     }
 
     /// Page-currency chunk 0: the study's counters appear in the K1 stats only when a `page-study` resident wrote some (so every

@@ -96,6 +96,10 @@ impl Layout {
     pub const fn span_bytes(&self) -> usize {
         self.ring_offset() + self.ring_bytes
     }
+    /// The span rounded up to the mapping granule (2 MiB blocks): what the backing holds and the windows map.
+    pub const fn mapped_bytes(&self) -> usize {
+        self.span_bytes().next_multiple_of(2 << 20)
+    }
     pub const fn valid(&self) -> bool {
         self.index_slots.is_power_of_two()
             && self.index_slots >= 8
@@ -263,9 +267,14 @@ pub struct Entry<'a> {
     pub code: &'a [u8],
     sites: &'a [u8],
     relocs: &'a [u8],
+    tables: &'a [u8],
     pub prefix: &'a [u8],
 }
 impl Entry<'_> {
+    /// The sites and then the packed relocations, contiguous as a placed block keeps them after its record.
+    pub fn tables(&self) -> &[u8] {
+        self.tables
+    }
     pub fn sites_count(&self) -> usize {
         self.sites.len() / SITE_BYTES
     }
@@ -368,6 +377,7 @@ pub fn decode(bytes: &[u8]) -> Result<Entry<'_>, Refusal> {
         code: &bytes[code_at..sites_at],
         sites: &bytes[sites_at..relocs_at],
         relocs: &bytes[relocs_at..prefix_at],
+        tables: &bytes[sites_at..prefix_at],
         prefix: &bytes[prefix_at..end],
     })
 }

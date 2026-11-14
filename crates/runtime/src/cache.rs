@@ -1276,6 +1276,78 @@ pub fn copy(
     }
     Ok(placed)
 }
+/// Cross-vCPU reuse (chunk 3): places a block for `rip` under `context` from pool entry `e` (published by the host: its code as
+/// admitted, at `e.rip` of the same half and page offset; `source_gpa` and `walked` as for [`copy`]), its code copied above the
+/// fill point and rewritten for `rip` by the same re-check as [`copy`] ([`natemu_abi::execution::relocate_code`]), its
+/// computed exit relocated to `context`'s dispatcher slot, then filed as the ordinary template a host-placed one is ([`place`]):
+/// its sites and sorted relocations after it, [`RELOCATABLE`] (the pool holds templates only). `Ok(None)` when full (as
+/// [`place`]); `Err(kind)`: the re-check refused (nothing filed).
+pub fn copy_pooled(
+    e: &natemu_abi::pool::Entry,
+    rip: u64,
+    context: u64,
+    source_gpa: [u64; 2],
+    walked: u32,
+) -> Result<Option<&'static Block>, usize> {
+    let c = control();
+    let code_size = e.code.len() as u64;
+    let code = c.code_used.next_multiple_of(CODE_ALIGN);
+    let code_end = code + code_size;
+    if code_end > c.code_bytes {
+        c.full[0] += 1;
+        return Ok(None);
+    }
+    let count = e.relocs_count();
+    // (decode bounds the count by `MAX_RELOCS`.)
+    let mut relocs = [0u32; MAX_RELOCS as usize];
+    for (i, r) in relocs[..count].iter_mut().enumerate() {
+        *r = e.reloc(i);
+    }
+    let mut links = e.links;
+    unsafe {
+        copy_record(
+            (area::CODE_WRITE_VA + code) as *mut u8,
+            e.code.as_ptr(),
+            e.code.len(),
+        );
+        let at = core::slice::from_raw_parts_mut((area::CODE_WRITE_VA + code) as *mut u8, e.code.len());
+        natemu_abi::execution::relocate_code(at, &relocs[..count], &mut links, e.rip, rip, e.guest_bytes)?;
+        relocate(code, u64::from(e.dispatch_exit), dispatcher_for(context));
+        synchronize_code(
+            area::CODE_WRITE_VA + code,
+            area::CODE_VA + code,
+            e.code.len(),
+        );
+    }
+    let record = Block {
+        rip,
+        context,
+        checked: c.epoch,
+        source_gpa,
+        next: [0; 2],
+        lnext: [0; 2],
+        code: code as u32,
+        code_size: e.code.len() as u32,
+        sites_count: e.sites_count() as u32,
+        guest_bytes: e.guest_bytes,
+        number: 0,
+        flags: walked & (GLOBAL | LARGE)
+            | RELOCATABLE
+            | (count as u32) << RELOCS_SHIFT
+            | if e.sti_first { STI_FIRST } else { 0 },
+        dispatch_exit: e.dispatch_exit,
+        rep_exits: e.rep_exits,
+        links,
+        shared: 0,
+        inbound: 0,
+    };
+    let tables = e.tables();
+    let placed = unsafe { file(record, tables.as_ptr(), tables.len(), 0) };
+    if placed.is_some() {
+        c.code_used = code_end;
+    }
+    Ok(placed)
+}
 /// K2: enters the host's decode `i` of the system instruction at `rip` (`guest_bytes` long, from `source_gpa`; `walked` as
 /// for [`place`]) in the cache for `context` as a [`SYSTEM`] record (no code); `None` when the metadata arena or the
 /// block index is full.

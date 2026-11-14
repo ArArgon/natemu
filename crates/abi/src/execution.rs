@@ -756,6 +756,53 @@ pub mod cache {
         pub ctr_el0: u64,
         /// Page-currency chunk 0 (`page-study` resident builds only, zero otherwise; [`crate::page_study::Counts`]). Appended.
         pub page_study: crate::page_study::Counts,
+        /// Template pool (cross-vCPU reuse plan, chunk 3), set by the host before the vCPU runs: [`POOL_OFF`] or [`POOL_ON`]
+        /// (the resident asks the pool, mapped at [`POOL_VA`], after its own hint table found no template and before it asks
+        /// the host), and the span's [`crate::pool::Layout`] (index slots, ring bytes, control granule). Appended.
+        pub pool: u64,
+        pub pool_layout: [u64; 3],
+        /// Pool lookups made (a block request the vCPU's own hint table could not serve), blocks copied from an entry, and
+        /// refusals by [`pool_refusal`] (an entry found and refused, or none found).
+        pub pool_probes: u64,
+        pub pool_hits: u64,
+        pub pool_refused: [u64; pool_refusal::COUNT],
+    }
+    /// [`Control::pool`].
+    pub const POOL_OFF: u64 = 0;
+    pub const POOL_ON: u64 = 1;
+    /// Why a pool lookup served nothing ([`Control::pool_refused`]); each candidate entry counts once, a lookup that found no
+    /// slot counts [`NO_SLOT`](pool_refusal::NO_SLOT) once.
+    pub mod pool_refusal {
+        /// No slot of any lead length had the key's tag.
+        pub const NO_SLOT: usize = 0;
+        /// An entry whose key is not the request's (a tag collision, or another context, half or page offset).
+        pub const KEY: usize = 1;
+        /// An entry whose prefix is not the guest's bytes now (or whose second page's walk failed).
+        pub const BYTES: usize = 2;
+        /// The entry was overwritten (below the ring's tail after the copy).
+        pub const OVERWRITTEN: usize = 3;
+        /// An instruction breakpoint is armed or the stop RIP or a host fence lies in the bytes the host would fetch.
+        pub const FENCED: usize = 4;
+        /// The re-check refused: the entry's link points, computed exit or relocations ([`super::super::relocate_code`]).
+        pub const RECHECK: usize = 5;
+        /// The copy decodes to no entry, or its header repeats another position, or its second page is not the block's.
+        pub const MALFORMED: usize = 6;
+        /// The pool's switch was off (the host's gating tripwire).
+        pub const OFF: usize = 7;
+        /// A write to the pages was posted meanwhile (the generation moved).
+        pub const STALE: usize = 8;
+        pub const COUNT: usize = 9;
+        pub const NAMES: [&str; COUNT] = [
+            "no_slot",
+            "key",
+            "bytes",
+            "overwritten",
+            "fenced",
+            "recheck",
+            "malformed",
+            "off",
+            "stale",
+        ];
     }
     /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
     pub const L1_EVICTED: usize = 0;
@@ -2891,7 +2938,9 @@ pub struct Entropy {
     pub taken: u64,
     pub words: [u64; ENTROPY_WORDS],
 }
-pub const ENTROPY_WORDS: usize = 32;
+/// (30 since chunk 3 of the cross-vCPU reuse plan: the state page had no room for the perf bucket `pool`; the host tops the
+/// pool up at every exit, so 30 words cover any burst of RDRANDs the 32 did.)
+pub const ENTROPY_WORDS: usize = 30;
 pub const ENTROPY_OFFSET: usize = STATE_OFFSET + 0xc00;
 pub const ENTROPY_VA: u64 = PRIVATE + ENTROPY_OFFSET as u64;
 const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= STATE_OFFSET + 4096);
@@ -2958,7 +3007,7 @@ pub mod mmio {
         }
     }
 }
-pub const MMIO_OFFSET: usize = STATE_OFFSET + 0xe00;
+pub const MMIO_OFFSET: usize = STATE_OFFSET + 0xde8;
 pub const MMIO_VA: u64 = PRIVATE + MMIO_OFFSET as u64;
 const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= MMIO_OFFSET);
 const _: () = assert!(MMIO_OFFSET + core::mem::size_of::<Mmio>() <= STATE_OFFSET + 4096);
@@ -2993,8 +3042,8 @@ pub mod perf {
         pub count: [u64; BUCKETS],
     }
     pub const MAGIC: u64 = 0x7065_7266_0001;
-    pub const BUCKETS: usize = 26;
-    pub const OFFSET: usize = super::STATE_OFFSET + 0xe40;
+    pub const BUCKETS: usize = 27;
+    pub const OFFSET: usize = super::STATE_OFFSET + 0xe18;
     pub const VA: u64 = crate::PRIVATE + OFFSET as u64;
     const _: () = assert!(super::MMIO_OFFSET + size_of::<super::Mmio>() <= OFFSET);
     const _: () = assert!(OFFSET + size_of::<Perf>() <= super::STATE_OFFSET + 4096);
@@ -3041,6 +3090,9 @@ pub mod perf {
     /// Perf chunk 10: reuse inside the resident (a template's checks, its copy and the re-check; the second page's walk is
     /// `fetch`, the host's answer under the check `host`).
     pub const REUSE: u64 = 25;
+    /// Cross-vCPU reuse (chunk 3): a lookup in the template pool (probes, copy of an entry, its checks and its placement; the
+    /// second page's walk is `fetch`).
+    pub const POOL: u64 = 26;
     /// Perf chunk 14: a `perf` resident's halt wake-ups (`events::park`), each kind's count, summed and largest CNTVCT ticks
     /// and a histogram by microseconds (bins `< 1, < 4, < 16, < 64, < 256, < 1024, >= 1024`). Kinds: [`POST_WAKE`] a post
     /// (IPI or host interrupt, from `Events::rung`) to the first return from the wait after it; [`POST_RUN`] the same post to
@@ -3060,7 +3112,7 @@ pub mod perf {
     pub const POST_RUN: usize = 1;
     pub const TIMER_RUN: usize = 2;
     pub const WAKE_NAMES: [&str; WAKE_KINDS] = ["post_wake", "post_run", "timer_run"];
-    pub const WAKES_OFFSET: usize = super::STATE_OFFSET + 0xd08;
+    pub const WAKES_OFFSET: usize = super::STATE_OFFSET + 0xcf8;
     pub const WAKES_VA: u64 = crate::PRIVATE + WAKES_OFFSET as u64;
     const _: () = assert!(super::ENTROPY_OFFSET + size_of::<super::Entropy>() <= WAKES_OFFSET);
     const _: () = assert!(WAKES_OFFSET + size_of::<Wakes>() <= super::MMIO_OFFSET);
@@ -3091,6 +3143,7 @@ pub mod perf {
         "l1",
         "enter_copy",
         "reuse",
+        "pool",
     ];
 }
 

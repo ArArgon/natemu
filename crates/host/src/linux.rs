@@ -482,6 +482,9 @@ impl Prepared {
                         .zip(&compiler.admissions)
                         .map(|(k, n)| (k, n.get()))
                         .collect(),
+                    pool: execution::K1Pool::new(
+                        &area.read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL),
+                    ),
                 };
                 match log.finish(
                     end,
@@ -779,6 +782,8 @@ struct VcpuState {
     recompiled: [u64; 2],
     /// Object answers by why they were admitted again or not ([`execution::why`]; their sum is every object answer).
     admissions: crate::report::Members<&'static str, u64>,
+    /// The template pool's lookups, copies and refusals (cross-vCPU reuse plan chunk 3; zero without a pool).
+    pool: execution::K1Pool,
 }
 
 #[cfg(test)]
@@ -821,6 +826,7 @@ mod report_tests {
             lock_wait: [next(), next()],
             recompiled: [next(), next()],
             admissions: [("skipped", 1), ("fresh", 2)].into_iter().collect(),
+            pool: Default::default(),
         };
         let old = format!(
             "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}],\"recompiled\":[{},{}]}}",
@@ -858,6 +864,7 @@ mod report_tests {
         );
         let mut old: serde_json::Value = serde_json::from_str(&old).unwrap();
         old["admissions"] = serde_json::json!({"skipped": 1, "fresh": 2});
+        old["pool"] = serde_json::json!({"probes": 0, "hits": 0, "refused": {}});
         assert_eq!(old, serde_json::to_value(&v).unwrap());
     }
 }

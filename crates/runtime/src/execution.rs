@@ -984,14 +984,199 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             cache::control().reuse_refused[k] += 1;
         }
         // The host is asked as if no template had been looked at: the next page only if it asks for it.
-        if s.fetch_fault[0] != fetch::NONE && s.fetch[0] != u64::MAX {
-            s.fetch_fault = [fetch::NONE; 3];
-        }
-        s.fetch[1] = u64::MAX;
-        cache::control().fetched &= 0xff;
+        unwalk(s);
         crate::perf::leave(p);
     }
+    // Cross-vCPU reuse (chunk 3): no template of this vCPU served it; the host's pool may hold the block another vCPU (or this
+    // one before a flush) had compiled for the same bytes.
+    if let Some(placed) = unsafe { pooled(s, context) } {
+        return Err(placed);
+    }
     Ok(unsafe { ask(s, REQUEST_TRANSLATE) })
+}
+/// The next page's walk undone, so the host is asked as if no template or pool entry had been looked at: it asks for the
+/// next page itself if it needs it.
+fn unwalk(s: &mut State) {
+    if s.fetch_fault[0] != fetch::NONE && s.fetch[0] != u64::MAX {
+        s.fetch_fault = [fetch::NONE; 3];
+    }
+    s.fetch[1] = u64::MAX;
+    cache::control().fetched &= 0xff;
+}
+/// Cross-vCPU reuse (cross-vCPU reuse plan, section 3, [`natemu_abi::pool`]): after [`reused`] found no template of this vCPU
+/// (RIP's page walked and marked), the pool is probed by the key of the guest's own bytes (context, RIP's half and page offset,
+/// up to four lead bytes, longest first; each probe's positions come from an acquire load of the slot in this lookup, never a
+/// remembered one). An entry is accepted only if every check passes on its private copy in the staging area (EL1-only window
+/// memory, unused between requests): the pool's own (a whole entry the host wrote at that position, not overwritten during
+/// the copy; the module's ordering argument), the full key (a slot's tag has 24 bits), the fences, the prefix against the
+/// guest's bytes as marked, no write posted meanwhile, the link points and computed exit as admitted (what [`ask`] checks of a
+/// reply; the sites' contents are the host's admission, as for a reply) and the re-check of [`cache::copy_pooled`]. The
+/// block is then an ordinary template of this vCPU. `Some(Some)`: placed; `Some(None)`: the code area or metadata is full
+/// (the caller flushes); `None`: ask the host (the walk of the next page undone). The pool's switch is a tripwire the host
+/// pulls when its own premise fails, read at each lookup; a lookup already under way is not stopped by it, so it is no barrier:
+/// every accepted entry was published by the host's own admission regardless.
+unsafe fn pooled(s: &mut State, context: u64) -> Option<Option<&'static Block>> {
+    let c = cache::control();
+    if c.pool == natemu_abi::execution::cache::POOL_OFF || c.reuse == cache::REUSE_OFF || s.fetch[0] == u64::MAX {
+        return None;
+    }
+    if s.cpu.dr[5] & DR7_ENABLES != 0 {
+        c.pool_refused[natemu_abi::execution::cache::pool_refusal::FENCED] += 1;
+        return None;
+    }
+    let p = crate::perf::enter(crate::perf::POOL);
+    let placed = unsafe { pool_lookup(s, context) };
+    crate::perf::leave(p);
+    placed
+}
+unsafe fn pool_lookup(s: &mut State, context: u64) -> Option<Option<&'static Block>> {
+    use natemu_abi::execution::cache::pool_refusal as why;
+    use natemu_abi::pool::{Key, LEAD, Layout, Pool};
+    let c = cache::control();
+    let rip = s.cpu.rip;
+    let [index_slots, ring_bytes, control_bytes] = c.pool_layout;
+    // SAFETY: the host mapped the span read-only at POOL_VA for this layout before the vCPU ran (`Control::pool` says so).
+    let pool = unsafe {
+        Pool::new(
+            natemu_abi::execution::cache::POOL_VA as *mut u8,
+            Layout {
+                index_slots: index_slots as usize,
+                ring_bytes: ring_bytes as usize,
+                control_bytes: control_bytes as usize,
+            },
+        )
+    };
+    if !pool.enabled() {
+        c.pool_refused[why::OFF] += 1;
+        return None;
+    }
+    c.pool_probes += 1;
+    // The lead bytes the key holds, from RIP's page as walked (a block that starts less than four bytes before the page's end
+    // is keyed by more bytes than this page holds: not found here, the host is asked).
+    let page_off = (rip & 4095) as usize;
+    let avail = (4096 - page_off).min(LEAD);
+    let mut lead = [0u8; LEAD];
+    if !guest_ram().copy_out(s.fetch[0] | page_off as u64, &mut lead[..avail]) {
+        return None;
+    }
+    let generation = s.generation;
+    // SAFETY: the staging area is this vCPU's own window memory, written only by the host's replies to its requests.
+    let staging = unsafe { core::slice::from_raw_parts_mut(STAGING_VA as *mut u8, STAGING_BYTES) };
+    let (mut found, mut placed) = (false, None);
+    'lengths: for len in (1..=avail).rev() {
+        let key = Key::new(context, rip, &lead, len);
+        for position in pool.probe(&key) {
+            if position == 0 {
+                continue;
+            }
+            found = true;
+            match unsafe { pooled_entry(s, &pool, position, &key, context, generation, staging) } {
+                Ok(block) => {
+                    placed = Some(block);
+                    break 'lengths;
+                }
+                Err(reason) => {
+                    c.pool_refused[reason] += 1;
+                    // What fails every entry alike ends the lookup.
+                    if reason == why::FENCED || reason == why::STALE {
+                        break 'lengths;
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        c.pool_refused[why::NO_SLOT] += 1;
+    }
+    match placed {
+        Some(Some(_)) => c.pool_hits += 1,
+        Some(None) => {}
+        None => unwalk(s),
+    }
+    placed
+}
+/// [`pooled`]'s checks of the entry published at `position`; `Err`: the [`natemu_abi::execution::cache::pool_refusal`] that refused it.
+unsafe fn pooled_entry(
+    s: &mut State,
+    pool: &natemu_abi::pool::Pool,
+    position: u64,
+    key: &natemu_abi::pool::Key,
+    context: u64,
+    generation: u64,
+    staging: &mut [u8],
+) -> Result<Option<&'static Block>, usize> {
+    use natemu_abi::execution::cache::pool_refusal as why;
+    use natemu_abi::pool::Refusal;
+    let c = cache::control();
+    let rip = s.cpu.rip;
+    let e = match pool.fetch(position, staging) {
+        Ok(e) => e,
+        Err(Refusal::Overwritten) => return Err(why::OVERWRITTEN),
+        Err(_) => return Err(why::MALFORMED),
+    };
+    // The key in full: the slot's tag is 24 bits of a hash, the lead bytes four.
+    if e.context != context || (e.rip ^ rip) & (1 << 63 | 0xfff) != 0 || e.key() != *key {
+        return Err(why::KEY);
+    }
+    let page_off = (rip & 4095) as usize;
+    let crosses = page_off + e.guest_bytes as usize > 4096;
+    // Templates read only bytes of the block's own pages; the prefix is at most two pages from RIP.
+    if (page_off + e.prefix.len() > 4096) != crosses || page_off + e.prefix.len() > 8192 {
+        return Err(why::MALFORMED);
+    }
+    let fenced = |fence| natemu_abi::execution::reuse_fenced(rip, crosses, fence);
+    if c.reuse_fences.iter().any(|&f| fenced(f)) || fenced([s.stop_at, s.stop_at.wrapping_add(1)]) {
+        return Err(why::FENCED);
+    }
+    // A prefix that runs into the next page: walked and marked as a request would, once for the lookup.
+    if crosses && s.fetch[1] == u64::MAX {
+        if s.fetch_fault[0] != fetch::NONE {
+            return Err(why::BYTES);
+        }
+        fetch_page(s, (rip & !4095).wrapping_add(4096), 1, true);
+        if s.fetch[1] == u64::MAX {
+            return Err(why::BYTES);
+        }
+    }
+    // The guest's bytes now (pages marked: a write from here on is posted to this vCPU) are the entry's prefix.
+    let ram = guest_ram();
+    let first = e.prefix.len().min(4096 - page_off);
+    if !same_bytes(&ram, s.fetch[0] | page_off as u64, &e.prefix[..first])
+        || (crosses && !same_bytes(&ram, s.fetch[1], &e.prefix[first..]))
+    {
+        return Err(why::BYTES);
+    }
+    take_invalidations(s);
+    if s.generation != generation {
+        return Err(why::STALE);
+    }
+    // What `ask` checks of a reply: each link point an exit of the code as admitted, the computed exit's placeholder.
+    let code = e.code;
+    let word = |at: u64| {
+        code.get(at as usize..at as usize + 4)
+            .map_or(0, |w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+    };
+    if e.links
+        .iter()
+        .any(|p| p.offset != 0 && !natemu_abi::execution::link_point(word, code.len() as u32, p))
+        || (e.dispatch_exit != 0 && word(u64::from(e.dispatch_exit)) != DISPATCH_PLACEHOLDER)
+    {
+        return Err(why::RECHECK);
+    }
+    s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
+    let walk = walked(s);
+    cache::copy_pooled(&e, rip, context, s.source_gpa, walk).map_err(|_| why::RECHECK)
+}
+/// Whether guest RAM at `gpa` holds `expect`.
+fn same_bytes(ram: &GuestRam, gpa: u64, expect: &[u8]) -> bool {
+    let Some(p) = ram.range(gpa, expect.len() as u64) else {
+        return false;
+    };
+    // SAFETY: `range` gives `expect.len()` bytes of the alias (volatile: other vCPUs may write them).
+    expect
+        .iter()
+        .enumerate()
+        .all(|(i, &b)| unsafe { p.add(i).read_volatile() } == b)
 }
 /// Perf chunk 10, the check of reuse inside the resident ([`cache::REUSE_CHECK`]): the host is asked for the block at the
 /// copy's RIP (through the walks the copy was made from) and its answer must be the copy: the same code (the computed exit's
