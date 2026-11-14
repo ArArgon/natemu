@@ -24,7 +24,7 @@
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
 use clap::Parser;
 use natemu::execution::Stop;
-use natemu::linux::Boot;
+use natemu::linux::{Boot, Transport, Transports};
 use std::path::PathBuf;
 
 /// Largest image or initrd read (the boot protocol's 32-bit sizes).
@@ -102,6 +102,10 @@ struct Cli {
     /// answer reused at another RIP is also compiled by the host and must be equal (a mismatch stops the run); as boot-linux's
     #[arg(long, env = "NATEMU_CHECK_REUSE", value_parser = clap::builder::BoolishValueParser::new())]
     check_reuse: bool,
+    /// How virtio devices attach: `mmio` or `pci` for all, or (experimental) per device, e.g. `disk=pci,net=mmio,rng=mmio`
+    /// (keys disk, net, rng; unnamed devices take mmio)
+    #[arg(long, value_name = "SPEC", value_parser = transports, default_value = "mmio")]
+    virtio_transport: Transports,
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
     #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
     compile_cache: Option<PathBuf>,
@@ -136,6 +140,57 @@ fn size(text: &str) -> Result<u64, String> {
     }
     .map_err(|_| bad())?;
     n.checked_mul(1 << shift).ok_or_else(bad)
+}
+
+/// `mmio`, `pci`, or `key=value,...` with keys disk, net, rng and values mmio or pci (unnamed keys: mmio).
+fn transports(text: &str) -> Result<Transports, String> {
+    let value = |v: &str| match v {
+        "mmio" => Ok(Transport::Mmio),
+        "pci" => Ok(Transport::Pci),
+        _ => Err(format!("bad transport {v:?}: mmio or pci")),
+    };
+    if !text.contains('=') {
+        return value(text).map(Transports::all);
+    }
+    let mut t = Transports::default();
+    let mut seen = Vec::new();
+    for part in text.split(',') {
+        let (key, v) = part
+            .split_once('=')
+            .ok_or_else(|| format!("bad transport {part:?}: expected key=value"))?;
+        let slot = match key {
+            "disk" => &mut t.disk,
+            "net" => &mut t.net,
+            "rng" => &mut t.rng,
+            _ => return Err(format!("unknown device {key:?}: disk, net or rng")),
+        };
+        if seen.contains(&key) {
+            return Err(format!("device {key:?} named twice"));
+        }
+        seen.push(key);
+        *slot = value(v)?;
+    }
+    Ok(t)
+}
+
+/// Warnings from the PCI layer (`log` calls), a guest can provoke them: 16 lines, then one notice.
+struct PciLog(std::sync::atomic::AtomicUsize);
+impl log::Log for PciLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn
+    }
+    fn log(&self, r: &log::Record) {
+        const MAX: usize = 16;
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        match self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+            n if n < MAX => eprintln!("natemu: pci: {}", r.args()),
+            n if n == MAX => eprintln!("natemu: pci: further messages suppressed"),
+            _ => {}
+        }
+    }
+    fn flush(&self) {}
 }
 
 /// The resident beside this binary, if built: `<target>/aarch64-unknown-none/<profile>/natemu-runtime`.
@@ -177,6 +232,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     boot.net = cli.net;
     boot.pool = cli.pool;
     boot.check_reuse = cli.check_reuse;
+    boot.transports = cli.virtio_transport;
     boot.initrd = cli.initrd.as_ref().map(read).transpose()?;
     boot.cmdline = cli.cmdline.unwrap_or_default();
     boot.ram = cli.ram.unwrap_or(boot.ram);
@@ -215,6 +271,8 @@ fn main() {
             std::process::exit(1); // a refused command line is a host error, not a stop (2)
         }
     };
+    static LOG: PciLog = PciLog(std::sync::atomic::AtomicUsize::new(0));
+    let _ = log::set_logger(&LOG).map(|()| log::set_max_level(log::LevelFilter::Warn));
     match boot(cli) {
         Ok(stop) => {
             eprintln!("natemu: {stop:?}");
@@ -273,6 +331,33 @@ mod tests {
         }
         unsafe { std::env::remove_var("NATEMU_POOL") };
     }
+    #[test]
+    fn transport_spec() {
+        use natemu::linux::{Transport::*, Transports};
+        let t = |s| super::transports(s);
+        assert_eq!(t("mmio"), Ok(Transports::all(Mmio)));
+        assert_eq!(t("pci"), Ok(Transports::all(Pci)));
+        assert_eq!(
+            t("disk=pci,net=mmio"),
+            Ok(Transports {
+                disk: Pci,
+                net: Mmio,
+                rng: Mmio
+            })
+        );
+        for bad in [
+            "",
+            "tcp",
+            "disk=tcp",
+            "gpu=pci",
+            "disk=pci,disk=mmio",
+            "disk=pci,net",
+            "disk=pci,",
+        ] {
+            assert!(t(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn size() {
         for (text, bytes) in [

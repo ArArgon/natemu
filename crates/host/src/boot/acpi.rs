@@ -58,6 +58,7 @@ pub mod platform {
     pub(crate) const RTC_IRQ: u8 = 8;
     pub(crate) const RTC_CENTURY: u8 = 0x32;
 }
+use crate::pci::platform::WINDOW;
 use platform::*;
 
 /// The built tables: the RSDP's address, the AP wakeup mailbox page (X4), and every blob at its guest-physical address.
@@ -217,6 +218,13 @@ mod aml {
         body.extend(elements.iter().flat_map(|&e| integer(e)));
         package_op(&[0x12], &body)
     }
+    /// A package of arbitrary (already encoded) elements.
+    pub(super) fn package_of(elements: &[Vec<u8>]) -> Vec<u8> {
+        package_op(
+            &[0x12],
+            &[&[elements.len() as u8][..], &elements.concat()].concat(),
+        )
+    }
     pub(super) fn buffer(bytes: &[u8]) -> Vec<u8> {
         package_op(
             &[0x11],
@@ -232,8 +240,49 @@ mod aml {
     }
 }
 
+/// `\_SB.PCI0` (ACPI 6.5 6.1.5, 6.2.13; PCI Firmware 3.x 4.1): the root bridge of the one bus, with its resources and
+/// the interrupt routing of `pci`, each function's (slot, GSI).
+fn pci0(pci: &[(u8, u32)]) -> Vec<u8> {
+    use aml::*;
+    // WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode, 0, 0, 0, 0, 1): 6.4.3.5.3, type 2, flags 0x0c (bit 0 clear: producer).
+    let bus = [
+        0x88, 0x0d, 0x00, 0x02, 0x0c, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+    ];
+    // IO (Decode16, 0xCF8, 0xCF8, 1, 8): 6.4.2.5.
+    let io = [0x47, 0x01, 0xf8, 0x0c, 0xf8, 0x0c, 0x01, 0x08];
+    // DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable, ReadWrite, 0, 0xE0000000,
+    // 0xEFFFFFFF, 0, 0x10000000): 6.4.3.5.2, type 0, general flags 0x0c, type-specific flags 0x01.
+    let mut mem = vec![0x87, 0x17, 0x00, 0x00, 0x0c, 0x01];
+    for v in [0, WINDOW.0, WINDOW.1 - 1, 0, WINDOW.1 - WINDOW.0] {
+        mem.extend(v.to_le_bytes());
+    }
+    let crs = [&bus[..], &io, &mem, &[0x79, 0x00]].concat();
+    // Package (4) { (slot << 16) | 0xFFFF (any function), 0 (INTA#), 0 (hardwired source), GSI } per function (6.2.13).
+    let prt = package_of(
+        &pci.iter()
+            .map(|&(slot, gsi)| {
+                package_of(&[
+                    integer(u64::from(slot) << 16 | 0xffff),
+                    integer(0),
+                    integer(0),
+                    integer(gsi.into()),
+                ])
+            })
+            .collect::<Vec<_>>(),
+    );
+    device(
+        b"PCI0",
+        &[
+            name(b"_HID", eisa_id("PNP0A03")),
+            name(b"_UID", integer(0)),
+            name(b"_CRS", buffer(&crs)),
+            name(b"_PRT", prt),
+        ],
+    )
+}
+
 /// The DSDT (5.2.11.1, revision 2: 64-bit integers): `\_S5`, COM1, the RTC and one processor device per vCPU.
-fn dsdt(vcpus: usize, virtio: &[VirtioMmio]) -> Vec<u8> {
+fn dsdt(vcpus: usize, virtio: &[VirtioMmio], pci: &[(u8, u32)]) -> Vec<u8> {
     use aml::*;
     // COM1's resources (6.4): IO (Decode16, 0x3f8, 0x3f8, 1, 8), IRQNoFlags () {4} (edge, active high), end tag.
     let [lo, hi] = COM1_PORT.to_le_bytes();
@@ -275,6 +324,9 @@ fn dsdt(vcpus: usize, virtio: &[VirtioMmio]) -> Vec<u8> {
         ],
     );
     let mut sb = vec![com1, rtc];
+    if !pci.is_empty() {
+        sb.push(pci0(pci));
+    }
     for d in virtio {
         // Memory32Fixed(ReadWrite, base, 4096), ExtendedInterrupt(ResourceConsumer,
         // Level, ActiveHigh, Exclusive, GSI), EndTag. ACPI 6.5 6.4.3.4/6.4.3.6.
@@ -344,6 +396,17 @@ pub fn build(vcpus: usize, base: u64) -> Tables {
 
 /// As [`build`], advertising exactly the enabled devices from the launch manifest.
 pub fn build_with_virtio(vcpus: usize, base: u64, virtio: &[VirtioMmio]) -> Tables {
+    build_with_devices(vcpus, base, virtio, &[])
+}
+
+/// As [`build_with_virtio`], plus the PCI functions as (slot, GSI): `\_SB.PCI0` with a `_PRT` entry for each (none
+/// when `pci` is empty). A device is listed once: as a virtio-MMIO device or as a function.
+pub fn build_with_devices(
+    vcpus: usize,
+    base: u64,
+    virtio: &[VirtioMmio],
+    pci: &[(u8, u32)],
+) -> Tables {
     assert!(
         (1..=254).contains(&vcpus),
         "xAPIC MADT entries hold APIC IDs below 255"
@@ -355,7 +418,7 @@ pub fn build_with_virtio(vcpus: usize, base: u64, virtio: &[VirtioMmio]) -> Tabl
     let fadt_at = next(xsdt, HEADER + 16, 64);
     let facs_at = next(fadt_at, 276, 64);
     let dsdt_at = next(facs_at, 64, 64);
-    let dsdt = dsdt(vcpus, virtio);
+    let dsdt = dsdt(vcpus, virtio, pci);
     let madt_at = next(dsdt_at, dsdt.len(), 64);
     let madt_len = 44 + 8 * vcpus + 12 + 2 * 10 + 6 + 16;
     let mailbox = next(madt_at, madt_len, 4096);
@@ -606,6 +669,99 @@ mod tests {
         }
     }
 
+    /// `\_SB.PCI0`'s `_CRS` (the ASL is in `pci0`), as the descriptor bytes.
+    const PCI0_CRS: [u8; 52] = [
+        // WordBusNumber: producer, min/max fixed, bus 0..0, length 1
+        0x88, 0x0d, 0x00, 0x02, 0x0c, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, //
+        // IO (Decode16, 0xCF8, 0xCF8, 1, 8)
+        0x47, 0x01, 0xf8, 0x0c, 0xf8, 0x0c, 0x01, 0x08, //
+        // DWordMemory: producer, min/max fixed, non-cacheable, read-write, 0xE0000000..0xEFFFFFFF, length 0x10000000
+        0x87, 0x17, 0x00, 0x00, 0x0c, 0x01, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0xe0, 0xff, 0xff, 0xff,
+        0xef, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0x10, //
+        0x79, 0x00,
+    ];
+    fn dsdt_of(t: &Tables) -> &[u8] {
+        t.blobs
+            .iter()
+            .map(|(_, b)| &b[..])
+            .find(|b| &b[..4] == b"DSDT")
+            .unwrap()
+    }
+    fn has(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+    fn count(hay: &[u8], needle: &[u8]) -> usize {
+        hay.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+    /// One `_PRT` entry: Package (4) { (slot << 16) | 0xFFFF, 0, 0, gsi }.
+    fn prt_entry(slot: u8, gsi: u8) -> Vec<u8> {
+        let a = (u32::from(slot) << 16 | 0xffff).to_le_bytes();
+        [&[0x12, 0x0b, 0x04, 0x0c][..], &a, &[0, 0, 0x0a, gsi]].concat()
+    }
+
+    #[test]
+    fn pci_dsdt_has_pci0_and_no_virtio_mmio_devices() {
+        use crate::virtio::{BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE};
+        let none = build_with_virtio(1, ACPI_NVS.0, &[]);
+        assert!(!has(dsdt_of(&none), b"PCI0"), "no PCI0 without functions");
+        let pci = [(1, 16), (2, 17), (3, 18)];
+        let t = build_with_devices(1, ACPI_NVS.0, &[], &pci);
+        let d = dsdt_of(&t);
+        assert_eq!(sum(d), 0);
+        assert_eq!(u32_at(d, 4) as usize, d.len());
+        assert_eq!(count(d, b"PCI0"), 1);
+        assert!(has(
+            d,
+            &[&b"\x08_HID"[..], &aml::eisa_id("PNP0A03")].concat()
+        ));
+        assert!(
+            has(d, &[&b"\x08_CRS\x11\x37\x0a\x34"[..], &PCI0_CRS].concat()),
+            "_CRS"
+        );
+        assert!(!has(d, b"LNRO0005"), "no virtio-MMIO device");
+        for r in [BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE] {
+            assert!(!has(d, &r.base.to_le_bytes()));
+        }
+        // FADT is the same with and without PCI.
+        let fadt = |t: &Tables| {
+            t.blobs
+                .iter()
+                .find(|(_, b)| &b[..4] == b"FACP")
+                .unwrap()
+                .1
+                .clone()
+        };
+        assert_eq!(fadt(&t), fadt(&none));
+    }
+
+    #[test]
+    fn pci_prt_routes_each_slot_to_its_gsi() {
+        let pci = [(1, 16), (2, 17), (3, 18)];
+        let t = build_with_devices(2, ACPI_NVS.0, &[], &pci);
+        let entries: Vec<u8> = pci
+            .iter()
+            .flat_map(|&(s, g)| prt_entry(s, g as u8))
+            .collect();
+        let prt = aml::package_op(&[0x12], &[&[3u8][..], &entries].concat());
+        assert!(has(dsdt_of(&t), &[&b"\x08_PRT"[..], &prt].concat()));
+        // One slot: one entry, the slot in the address's high word, INTA# (0), hardwired source (0), the GSI.
+        let t = build_with_devices(1, ACPI_NVS.0, &[], &[(2, 17)]);
+        assert!(has(dsdt_of(&t), &prt_entry(2, 17)));
+        assert_eq!(count(dsdt_of(&t), &[0x12, 0x0b, 0x04]), 1);
+    }
+
+    #[test]
+    fn mixed_tables_list_each_device_once() {
+        use crate::virtio::NET_RESOURCE;
+        let t = build_with_devices(1, ACPI_NVS.0, &[NET_RESOURCE], &[(1, 16)]);
+        let d = dsdt_of(&t);
+        assert_eq!(count(d, b"LNRO0005"), 1, "the network device on MMIO");
+        assert!(has(d, &NET_RESOURCE.base.to_le_bytes()));
+        assert_eq!(count(d, &[0x12, 0x0b, 0x04]), 1, "the disk once, in _PRT");
+        assert!(has(d, &prt_entry(1, 16)));
+        assert!(!has(d, &prt_entry(2, 17)));
+    }
+
     /// FNV-1a 64 (fixed, so the digests below are stable across runs and toolchains).
     fn fnv(parts: impl IntoIterator<Item = u8>) -> u64 {
         parts.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
@@ -642,6 +798,7 @@ mod tests {
         got.push(map(Layout {
             low_end: 1 << 30,
             high: 2 << 30,
+            pci: false,
         }));
         assert_eq!(got, DIGESTS);
     }
