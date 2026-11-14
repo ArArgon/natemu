@@ -332,6 +332,12 @@ costs, with hit rate `hit_W / (hit_W + installs)` >= 25%; chunk 1's own gate `re
 the user space alone, and supervisor would-be bits on frames later marked under 1% of marks before the supervisor space
 joins. Picks W (and whether 2 MiB leaves get a wider one) and settles 3.6 and 3.7's second condition.
 
+**Counting rules as built (chunk 0, tightened at its review):** a `mark` counts a would-be shootdown only for a frame whose
+would-be bit names a vCPU whose *real* writable bit is clear (a real bit would have shot it down anyway); the masks are
+cleared per `reset_cr3`'s actual result, i.e. everything when the list overflowed (`NOT_ALL_GLOBAL`) or TTBR1 is off, else
+all but the kept half's global covers; `read_d1` and `covered_writable` count only what chunk 1 and the fill would really
+make writable: the user space, WB or WC memory, frames not `translated` at the time (3.3 item 6, 3.7).
+
 **Chunk 1: writable on read (S: one rule and the read-side protocol of 3.3 item 6 in `translate`, user space first,
 counters, independent review).** Tier 0: unit test of the rule table (D, R/W, WP, CPL, kind, translated -> writable, bit).
 Tier 1: K1 programs `fa-ad` (the D half), `fa-ro`, `fa-wt`, `fa-read-code` below, `local-write`, `dormant-write`, the
@@ -361,9 +367,9 @@ HA off faults, so the AF = 0 form is never used without HA confirmed on).
   - `fa-ad` (QEMU): one leaf table, one 16-page window of present user pages: indices 0-7 A = 1 (odd ones D = 1), indices
     8-15 present with A = 0 (odd ones D = 1). Read page 0 (fills 1-7; a mutant ignoring A fills 8-15 too). Read every PTE
     back: A/D exactly QEMU's. Write page 2 (A = 1, D = 0: read-only prefetched): its D now set, once; a second write
-    leaves the PTE equal. Read page 9 (A = 0: a demand access, A set by both), **then read page 11** (A = 0: under the
-    mutant a prefetched shadow serves it and its A stays 0 where QEMU sets it): read back all 16 PTEs again. Write page 3
-    (D = 1: writable prefetched): PTE unchanged.
+    leaves the PTE equal. Read page 9 then page 11 (both A = 0: demand accesses that set A under natemu and QEMU alike;
+    under the mutant both were prefetched at page 0's read, so either read leaves A = 0 where QEMU sets it): read back all
+    16 PTEs again. Write page 3 (D = 1: writable prefetched): PTE unchanged.
   - `fa-invlpg` (QEMU): read X (fills N -> F1); N's PTE -> F2; INVLPG N; load from N returns F2's byte. Then N -> F1 again
     with a CR3 reload instead: F1's byte.
   - `fa-reserved` (QEMU): N beside X with a reserved bit (bit 51) set, A = 1: read X (N skipped: `skipped.reserved` = 1); a
@@ -372,12 +378,15 @@ HA off faults, so the AF = 0 form is never used without HA confirmed on).
     X (N skipped: not present); a load from N: #PF error code 0 (not present).
   - `fa-wt` (natemu only): N beside X with PWT set (PAT entry 1 = WT), RW = 1, A = 1, D = 1: read X (N filled read-only:
     `skipped.not_writable_type` = 1); a load from N runs natively; a store to N runs alone (`uncached_steps` = 1, one
-    stepped instruction). Second phase for chunk 1: read N first (D = 1 but WT: read-only), then store: `uncached_steps`
-    = 2 in total.
-  - `fa-read-code` (QEMU; chunk 1): N user RW = 1, D = 1, A = 1 holding `mov eax, 1; ret`; call N (placed, the frame marked);
-    read N as data (D = 1: chunk 1 would make it writable, but the frame is translated: read-only, no bit, no
-    `code_written`): `invalidations` and `steps` unchanged by the read; then store `mov eax, 2` into N and call N: 2
-    (the SMC result equals QEMU's). Mutation M13 below.
+    stepped instruction). Second phase for chunk 1: **INVLPG N first** (phase 1 left N shadowed by the fill, and the step
+    block may have shadowed it too, so without the INVLPG the read would not abort and chunk 1's rule would never run),
+    then read N (a demand install: D = 1 but WT, so read-only), then store: `uncached_steps` = 2 in total.
+  - `fa-read-code` (QEMU; chunk 1; **run with `--fault-around off`**, so that no earlier data access in N's window, the
+    stack or X among them, prefetches N writable before the call and leaves the read nothing to abort on): N user RW = 1,
+    D = 1, A = 1 holding `mov eax, 1; ret`; call N (placed, the frame marked); read N as data (a demand install: D = 1, so
+    chunk 1 would make it writable, but the frame is translated: read-only, no bit, no `code_written`): `invalidations`
+    and `steps` unchanged by the read; then store `mov eax, 2` into N and call N: 2 (the SMC result equals QEMU's).
+    Mutation M13 below.
   - `fa-stale` (natemu only, as `no-invlpg`): read X (fills N); N's PTE -> F2 with no invalidation; a load from N may return
     either; INVLPG N: F2's. QEMU returns F2 at once (it cached nothing for N): the "either" set holds both.
   - `fa-kept` (natemu only): upper-half supervisor mapping (0xffff8...; the runner gains an upper-half table helper if
@@ -387,9 +396,12 @@ HA off faults, so the AF = 0 form is never used without HA confirmed on).
     neighbours checks the same.
   - `fa-mmio` (QEMU): a leaf table where index 1 maps the LAPIC page (0xfee00000) and index 0 a RAM page. Read index 0;
     read the LAPIC ID register through index 1: the APIC ID (QEMU agrees); `fault_around.skipped.not_ram` = 1.
-  - `fa-ro` (QEMU): N beside X with R/W = 0, **A = 1 and D = 1** (so a mutant ignoring R/W installs it writable), WP = 1:
-    read X, write N: #PF error code 3 (present, write) to a handler that records CR2 and the code; WP = 0 at CPL 0: the
-    write succeeds (QEMU agrees).
+  - `fa-ro` (QEMU, `adv_setup` style): N beside X with R/W = 0, **A = 1 and D = 1**, both user pages. **At CPL 3** (where
+    fills may be writable, so a mutant ignoring R/W installs N writable): read X, write N: #PF error code 7 (present,
+    write, user) to a handler that records CR2 and the code. At CPL 0 with WP = 1 the same program takes error code 3 and
+    with WP = 0 the write succeeds (QEMU agrees), but these halves do not test M8: supervisor fills are read-only (3.6), so
+    the mutant installs N read-only and the fault comes anyway; the WP half becomes a test only if 3.6's restriction is
+    lifted, and the program is then rerun with it in mind.
   - `fa-user` (natemu only, `adv_setup` style, one epoch via `SET_CPL`): at CPL 3 read X whose neighbour S is a supervisor
     page (U/S = 0 at the leaf): S is not filled in the user space; a CPL 3 read of S faults with error code 5. Then at
     CPL 0 read S (fills its neighbours, among them user page U, in the supervisor space, read-only) and write one of them:
@@ -420,19 +432,19 @@ HA off faults, so the AF = 0 form is never used without HA confirmed on).
 
 | Mutation | Caught by |
 | --- | --- |
-| M1 fill ignores A (installs A = 0 neighbours) | `fa-ad` (page 11 read back with A = 0 where QEMU has 1) |
+| M1 fill ignores A (installs A = 0 neighbours) | `fa-ad` (page 9 or 11 read back with A = 0 where QEMU has 1) |
 | M2 fill installs writable with D = 0, or ignores WT/WP | `fa-ad` (page 2's D never set), `fa-large` (PDE D); `fa-wt` (the store runs natively: `uncached_steps` 0) |
 | M3 fill lists nothing and installs kept-half non-global neighbours (or `map_global` for them) | `fa-kept` (F1's byte after CR3 B, or a full reset counted) |
 | M4 fill skips the RAM test (maps the entry's address as IPA) | `fa-mmio` (a RAM-looking read instead of the APIC ID, or `stop::SHADOW`) |
 | M5 fill sets no writable bit | `fa-smc` (a) (the stale block returns 1) |
 | M6 fill skips `translated` | `fa-smc` (b) (the store never traps; 1) |
 | M7 fill ignores U/S at CPL 3 | `fa-user` (the CPL 3 read of S succeeds) |
-| M8 fill ignores R/W (or WP) | `fa-ro` (N has A = 1, D = 1: the mutant installs it writable and the write succeeds) |
+| M8 fill ignores R/W (or WP) | `fa-ro` at CPL 3 (N has A = 1, D = 1 in the user space: the mutant installs it writable and the write succeeds instead of #PF 7); the WP half is untestable while supervisor fills are read-only |
 | M9 fill disabled (or `--fault-around off` ignored) | `fa-counts` (`retries` 32) |
 | M10 fill replaces a valid slot without break-before-make, or publishes nothing | abi unit test (`fill` on a valid slot: refused); `fa-counts` under the resident checkers (a TLB that may hold the old entry: `page-mark`-style second write) |
-| M11 chunk 1's rule ignores the memory type | `fa-wt` second phase (N read first, then stored: the store runs natively, `uncached_steps` 1 instead of 2) |
+| M11 chunk 1's rule ignores the memory type | `fa-wt` second phase (INVLPG N, N read first, then stored: the store runs natively, `uncached_steps` 1 instead of 2) |
 | M12 `Translation.parent_*` taken from the leaf instead of the parents | abi unit test (a non-user PDE over a user PTE) and `fa-user` |
-| M13 chunk 1's read takes the write path's order (bit, then `code_written` on a translated frame) | `fa-read-code` (`invalidations` or `steps` move at the read; or, with the bit set and no kill, the later store's SMC result differs) |
+| M13 chunk 1's read takes the write path's order (bit, then `code_written` on a translated frame) | `fa-read-code` under `--fault-around off` (`invalidations` or `steps` move at the read; or, with the bit set and no kill, the later store's SMC result differs) |
 | M14 fill ignores the present bit or the reserved bits | `fa-none` (the load succeeds instead of #PF 0), `fa-reserved` (instead of #PF 9) |
 | M15 fill installs in both spaces, or in the wrong one | `fa-user` (the CPL 3 read of the supervisor neighbour succeeds after the CPL 0 fill) |
 | M16 study masks not cleared at INVLPG/#PF/reset, or not keyed by space | chunk 0 unit tests of the mask model (a cover removed by `invlpg-page`'s pattern no longer hits; a CPL 0 cover does not serve a CPL 3 access) |
@@ -473,3 +485,4 @@ HA off faults, so the AF = 0 form is never used without HA confirmed on).
 | 6: K1 additions | Added: `fa-reserved` (#PF 9), `fa-none` (P = 0 with A, D and a frame: #PF 0), the CPL 3 read of a supervisor neighbour after a CPL 0 fill in `fa-user` (M15), the must-stay-green list at the shipped default W, `fa-counts` as reads on a 64 KiB-aligned run; mutations M14-M16 |
 | 7: FEAT_HAFDBS: TCR_EL1.HA covers the resident's own descriptors and breaks `Space::install`'s `old == new` test | Noted in chunk 2: optional, confirm on the M4 first (HVF exposure, the AF-masked compare); the study model stands in otherwise |
 | Pre-existing: a WRMSR to IA32_PAT is not a flush (`is_mtrr`, `cpu.rs:30`) | Noted in section 8 as a correctness-pass gap, not this plan's |
+| Re-check of `8ee56ae` (accepted; test-plan defects): `fa-ro` missed M8 (supervisor fills are read-only, so the mutant installs N read-only and the #PF comes anyway); `fa-wt` phase 2 missed M11 (N already shadowed by phase 1, so the read never aborts); `fa-read-code` may miss M13 (an earlier data access in N's window prefetches N writable before the call); `fa-ad`'s "A set by both" wrong under the mutant (page 9 was prefetched at page 0's read) | Fixed: `fa-ro`'s R/W half runs at CPL 3 expecting error code 7, the WP half stated untestable until supervisor fills become writable; `fa-wt` phase 2 begins with INVLPG N; `fa-read-code` runs under `--fault-around off`; `fa-ad`'s text corrected (the mutant is caught at page 9 or 11); the chunk-0 counting rules tightened at its review are recorded (shootdowns only for would-be bits whose real bit is clear; masks cleared per `reset_cr3`'s actual result including overflow; `read_d1` and `covered_writable` limited to the user space, WB/WC, frames not translated) |
