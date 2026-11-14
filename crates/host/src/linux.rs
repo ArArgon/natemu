@@ -57,6 +57,8 @@ pub struct Boot {
     pub compile_cache: compile_cache::Config,
     /// Debug: every answer used at another RIP than its own is compiled there too and must equal it (`Compiler::check_reuse`).
     pub check_reuse: bool,
+    /// Page-currency plan chunk 1: `Compiler::page_currency` (default on; `--page-currency` / `NATEMU_PAGE_CURRENCY`).
+    pub page_currency: u64,
     /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
     pub code_shape: bool,
     /// PCID plan P1 (owner, November 5): turn on the resident's page-walk speculation barriers. Off by default; on, the
@@ -95,6 +97,7 @@ impl Boot {
             stop_at: None,
             compile_cache: compile_cache::Config::OFF,
             check_reuse: false,
+            page_currency: exec::cache::PAGES_ON,
             code_shape: false,
             speculation_barriers: false,
             rng: false,
@@ -216,6 +219,7 @@ impl Boot {
             watchdog: self.watchdog,
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
+            page_currency: self.page_currency,
             code_shape: self.code_shape,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
@@ -246,6 +250,7 @@ pub struct Prepared {
     watchdog: Duration,
     compile_cache: compile_cache::Config,
     check_reuse: bool,
+    page_currency: u64,
     code_shape: bool,
     /// [`Prepared::run`] has started: the backing is used.
     ran: AtomicBool,
@@ -414,6 +419,7 @@ impl Prepared {
             compiler.pool = backing.pool.clone();
             compiler.share(&answers);
             compiler.check_reuse = self.check_reuse;
+            compiler.page_currency = self.page_currency;
             compiler.shape = self.code_shape;
             let mut requests = execution::Requests {
                 devices: Some(self.devices.clone()),

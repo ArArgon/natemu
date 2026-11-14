@@ -28,6 +28,7 @@ mod helpers;
 mod lapic;
 mod maskmov;
 mod mmio;
+pub(crate) mod page_record;
 #[cfg(feature = "page-study")]
 pub(crate) mod page_study;
 mod ports;
@@ -1460,13 +1461,13 @@ fn revalidated(s: &mut State, b: &Block) -> Option<u32> {
     page_study::block_end(b, flags);
     Some(flags)
 }
-/// The fetch translation of `va` for `who` ([`natemu_abi::page_study::REVAL`], `PLACE`): a fetch walk. With the `page-study`
-/// feature (page-currency plan, chunk 0) the walk is still made but the record of earlier walks is probed first and its
-/// answer compared and counted ([`page_study`]); without it this is `fetch_walk`.
+/// The fetch translation of `va` for `who` ([`natemu_abi::page_study::REVAL`], `PLACE`): a fetch walk, or the page record's answer
+/// where it holds one ([`page_record`], `Control::pages`). A `page-study` build (page-currency chunk 0) is the shadow instead:
+/// the walk is always made and returned, the record probed before it and its answer compared and counted ([`page_study`]).
 #[cfg(not(feature = "page-study"))]
 #[inline(always)]
 fn page_translation(s: &mut State, va: u64, _who: usize) -> Result<(u64, u32), [u64; 3]> {
-    fetch_walk(s, va)
+    page_record::translation(s, va)
 }
 #[cfg(feature = "page-study")]
 fn page_translation(s: &mut State, va: u64, who: usize) -> Result<(u64, u32), [u64; 3]> {

@@ -3,7 +3,7 @@
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
 //!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
-//!       [--perf-log FILE]
+//!       [--perf-log FILE] [--page-currency on|off|check]
 //!
 //! Named arguments (clap; `natemu --help`). Seven fall back to `NATEMU_SERIAL_STDIN`,
 //! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
@@ -15,7 +15,9 @@
 //! exits 130 at once), 1 on a host error (a failed serial write and a refused command line included; `--help` exits 0).
 //! `--perf-log FILE` turns on the library's timing log (`natemu::perf`). `--serial-stdin` (off by default) feeds standard
 //! input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode, Ctrl-C to the guest, Ctrl-A x cancels the run.
-//! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
+//! `--page-currency` (default on; `NATEMU_PAGE_CURRENCY`): a per-vCPU record of fetch-walk results answers the resident's fetch
+//! translations as a TLB entry does (page-currency plan); `off` walks every one, `check` answers from the record and walks too,
+//! counting any difference. `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
 use clap::Parser;
 use natemu::execution::Stop;
@@ -63,6 +65,10 @@ struct Cli {
     /// The resident's page-walk speculation barriers (needs FEAT_SB)
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
+    /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
+    /// does (off), or it answers and the walk is made too, a difference counted (check)
+    #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check", default_value = "on", value_parser = parse_page_currency)]
+    page_currency: u64,
     /// Expose the virtio-MMIO entropy device
     #[arg(long)]
     rng: bool,
@@ -89,6 +95,14 @@ struct Cli {
     /// Write the timing log (natemu::perf) to FILE
     #[arg(long, value_name = "FILE", env = "NATEMU_PERF_LOG")]
     perf_log: Option<PathBuf>,
+}
+
+/// `--page-currency`: on, off or check (the library also knows `check-halt`, a test mode that stops the run at a difference).
+fn parse_page_currency(text: &str) -> Result<u64, String> {
+    if text == "check-halt" {
+        return Err("--page-currency check-halt: on, off or check".into());
+    }
+    natemu::execution::parse_page_currency(text)
 }
 
 /// Bytes, 0x hex, or decimal with a K/M/G (binary) suffix.
@@ -140,6 +154,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
         cli.compile_cache_mb,
     )?;
     boot.speculation_barriers = cli.speculation_barriers;
+    boot.page_currency = cli.page_currency;
     boot.rng = cli.rng;
     boot.disk = cli.disk;
     boot.net = cli.net;

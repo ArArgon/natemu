@@ -690,6 +690,23 @@ pub struct K1 {
     /// Page-currency chunk 0 (`page-study` resident builds only: absent when every counter is zero).
     #[serde(skip_serializing_if = "K1PageStudy::is_empty")]
     page_study: K1PageStudy,
+    /// Page-currency plan chunk 1 (the page record, `Control::pages`): absent while every counter is zero.
+    #[serde(skip_serializing_if = "K1Page::is_empty")]
+    page: K1Page,
+}
+/// `Control::pages` and its counters: fetch walks made, record hits, check-mode differences, 2 MiB leaves not recorded.
+#[derive(Debug, Default, serde::Serialize)]
+struct K1Page {
+    mode: u64,
+    walks: u64,
+    hits: u64,
+    disagree: u64,
+    split_2m: u64,
+}
+impl K1Page {
+    fn is_empty(&self) -> bool {
+        self.walks | self.hits | self.disagree | self.split_2m == 0
+    }
 }
 /// Page-currency plan chunk 0 (`natemu_abi::page_study::Counts`): fetch walks by caller (`[revalidation, placement]`) with the
 /// record's would-be answers, its disagreements with the walk, and the walk and probe times in ns (`walk_ns[caller][hit]`: the
@@ -895,6 +912,13 @@ impl K1 {
             pic: c.pic_counts,
             pic_transitions: [0; 5],
             page_study: K1PageStudy::new(&c.page_study),
+            page: K1Page {
+                mode: c.pages,
+                walks: c.page_walks,
+                hits: c.page_hits,
+                disagree: c.page_disagree,
+                split_2m: c.page_split_2m,
+            },
         }
     }
 }
@@ -2216,6 +2240,9 @@ pub struct Compiler {
     /// Debug check (the program driver's `--code-shape` or `--check-reuse`, `boot-linux --check-reuse`): every answer used at
     /// another RIP than its own is also compiled there, and the two must be equal (else a host error).
     pub check_reuse: bool,
+    /// Page-currency plan chunk 1: the resident's [`cache::Control::pages`] ([`cache::PAGES_ON`] by default; `--page-currency
+    /// on|off|check|check-halt`, [`parse_page_currency`]).
+    pub page_currency: u64,
     /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
     /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|all` overrides it.
     pub pic: u64,
@@ -2364,6 +2391,7 @@ impl Compiler {
             admissions: Default::default(),
             reuse_checks: 0,
             check_reuse: false,
+            page_currency: cache::PAGES_ON,
             pic: cache::PIC_USER,
             pic_check_local: false,
             deadline: COMPILE_DEADLINE,
@@ -3241,6 +3269,18 @@ fn link_cap_from(var: Option<&str>) -> Result<u64> {
     }
 }
 
+/// `--page-currency`'s value ([`cache::Control::pages`]): `on` (the page record answers fetch walks), `off` (every one is a walk),
+/// `check` (the record answers and the walk is made too: a difference is counted) or `check-halt` (and stops the run).
+pub fn parse_page_currency(text: &str) -> std::result::Result<u64, String> {
+    match text {
+        "off" => Ok(cache::PAGES_OFF),
+        "on" => Ok(cache::PAGES_ON),
+        "check" => Ok(cache::PAGES_CHECK),
+        "check-halt" => Ok(cache::PAGES_CHECK_HALT),
+        other => Err(format!("--page-currency {other}: on, off, check or check-halt")),
+    }
+}
+
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
 /// which execution stops at a block boundary (blocks are fetched up to it, and
 /// never cached at it, so reaching it is a miss). A vCPU that stays in the guest
@@ -3278,6 +3318,10 @@ pub fn run(
     };
     let control = cache::LOOKUP_OFFSET + cache::CONTROL;
     area.write_record(control + std::mem::offset_of!(cache::Control, reuse), mode);
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, pages),
+        compiler.page_currency,
+    );
     let pic = match std::env::var("NATEMU_PIC").as_deref() {
         Ok("off") => cache::PIC_OFF,
         Ok("user") => cache::PIC_USER,

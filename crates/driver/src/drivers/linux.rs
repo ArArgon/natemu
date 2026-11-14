@@ -103,6 +103,10 @@ pub(crate) struct Args {
     check_reuse: bool,
     #[arg(long)]
     code_shape: bool,
+    /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
+    /// does (off), or it answers and the walk is made too, a difference counted (check; check-halt stops at one)
+    #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check|check-halt", default_value = "on", value_parser = natemu::execution::parse_page_currency)]
+    page_currency: u64,
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
     #[arg(long)]
@@ -150,6 +154,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         max_block,
         check_reuse,
         code_shape,
+        page_currency,
         speculation_barriers,
         rng,
         pool,
@@ -245,6 +250,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         )?,
         check_reuse,
         code_shape,
+        page_currency,
         speculation_barriers,
         rng,
         pool,

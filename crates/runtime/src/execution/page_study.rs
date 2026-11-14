@@ -7,15 +7,7 @@
 use super::*;
 use natemu_abi::page_study::{self as ps, Counts, Record};
 
-fn table() -> &'static mut [Record] {
-    // SAFETY: the record is this vCPU's, in its lookup area; only this vCPU's resident reads or writes it.
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            cache::lookup_area::<Record>(natemu_abi::execution::cache::PAGE_STAMPS),
-            ps::ENTRIES,
-        )
-    }
-}
+use super::page_record::table;
 fn counts() -> &'static mut Counts {
     &mut cache::control().page_study
 }
@@ -62,9 +54,8 @@ pub fn block_end(b: &Block, flags: u32) {
     }
 }
 
-/// INVLPG or a #PF at `address` ([`cache::invlpg`]): its page's and its 2 MiB region's records, both classes, are cleared.
-pub fn invalidated(address: u64) {
-    let cleared = ps::invalidate(table(), address);
+/// INVLPG or a #PF cleared `cleared` records ([`super::page_record::invalidated`]).
+pub fn cleared(cleared: u64) {
     if cleared != 0 {
         let k = counts();
         k.clear_events += 1;

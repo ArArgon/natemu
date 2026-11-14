@@ -1116,6 +1116,10 @@ pub(crate) struct Args {
     /// `NATEMU_POOL_RING_KB` and `NATEMU_POOL_INDEX_SLOTS`: a small pool).
     #[arg(long, env = "NATEMU_POOL", value_parser = clap::builder::BoolishValueParser::new())]
     pool: bool,
+    /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
+    /// does (off), or it answers and the walk is made too, a difference counted (check; check-halt stops at one)
+    #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check|check-halt", default_value = "on", value_parser = natemu::execution::parse_page_currency)]
+    page_currency: u64,
     #[arg(long = "strict-unassigned")]
     strict: bool,
     /// A test device's page (repeatable)
@@ -1389,6 +1393,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         code_shape,
         check_reuse,
         pool,
+        page_currency,
         strict,
         device_at,
         irq_source,
@@ -1815,6 +1820,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         compiler.shape = code_shape;
         // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
         compiler.check_reuse = code_shape || check_reuse;
+        compiler.page_currency = page_currency;
         // (Local links stay under the code-shape check: the programs' values test them; `--check-reuse` alone makes none.)
         compiler.pic_check_local = code_shape;
         // PIC study: the test programs run at CPL 0 too; every privilege level's templates are shared when a second address

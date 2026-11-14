@@ -771,6 +771,19 @@ pub mod cache {
         /// user (CPL 3) or kernel context: index `reason * 4 + same * 2 + user`.
         pub pool_candidates: u64,
         pub pool_recheck: [u64; pool_recheck::COUNT * 4],
+        /// Page-currency plan chunk 1, set by the host before the vCPU runs (`--page-currency`): [`PAGES_OFF`] (every fetch walk
+        /// is a walk), [`PAGES_ON`] (the per-vCPU record of fetch-walk results answers them, [`crate::page_study`]),
+        /// [`PAGES_CHECK`] (the record answers and the walk is made too, a difference counted) or [`PAGES_CHECK_HALT`] (and halts
+        /// [`super::stop::PAGE_CHECK`]). Appended.
+        pub pages: u64,
+        /// Plain counters of the page record (all modes; `walks` only where the record did not answer): fetch walks made for a
+        /// revalidation or a placement, record hits (a block revalidated from the record counts one per page), check-mode
+        /// differences between the record's answer and the walk's, and 2 MiB leaves not recorded (not inside one RAM region).
+        /// Appended.
+        pub page_walks: u64,
+        pub page_hits: u64,
+        pub page_disagree: u64,
+        pub page_split_2m: u64,
     }
     /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
     pub mod pool_recheck {
@@ -828,6 +841,11 @@ pub mod cache {
             "stale",
         ];
     }
+    /// [`Control::pages`].
+    pub const PAGES_OFF: u64 = 0;
+    pub const PAGES_ON: u64 = 1;
+    pub const PAGES_CHECK: u64 = 2;
+    pub const PAGES_CHECK_HALT: u64 = 3;
     /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
     pub const L1_EVICTED: usize = 0;
     /// `fill_l1` entered nothing because the table's context is not the block's.
@@ -2702,6 +2720,9 @@ pub mod stop {
     /// cut, a non-local record; after a block's death, any. `State::native` holds the halting line, the record's index
     /// (+ 1) and the block's number.
     pub const LINK_CHECK: u64 = 65;
+    /// (Page-currency plan chunk 1, `--page-currency check-halt`.) A fetch translation answered by the page record differs from a
+    /// walk's (`State::native` holds the linear address, the record's page and the walk's, `u64::MAX` for a fault).
+    pub const PAGE_CHECK: u64 = 66;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -2725,6 +2746,7 @@ pub mod stop {
             UNSUPPORTED_PORT => "unsupported_port",
             REUSE_MISMATCH => "reuse_mismatch",
             LINK_CHECK => "link_check",
+            PAGE_CHECK => "page_check",
             _ => "none",
         }
     }
