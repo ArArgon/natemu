@@ -598,6 +598,8 @@ pub struct K1 {
     reuse: K1Reuse,
     slot_writes: u64,
     kept_resets: u64,
+    /// Dispatch study (`natemu_abi::execution::cache::L1_EVICTED` and the rest; `perf` resident builds only).
+    l1_counts: [u64; natemu_abi::execution::cache::L1_COUNTS],
     systems: K1Systems,
     /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).
     pic: [u64; natemu_abi::pic::count::COUNTS],
@@ -673,6 +675,7 @@ impl K1 {
             },
             slot_writes: c.slot_writes,
             kept_resets: c.kept_resets,
+            l1_counts: c.l1_counts,
             systems: K1Systems {
                 kinds: (0..128)
                     .filter(|&k| c.system_counts[k] != 0)
@@ -3463,7 +3466,7 @@ mod tests {
             })
             .collect();
         format!(
-            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}},\"pic\":{:?},\"pic_transitions\":{:?}}}",
+            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"l1_counts\":{:?},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}},\"pic\":{:?},\"pic_transitions\":{:?}}}",
             c.cr3_loads,
             c.global_flushes,
             c.invlpgs,
@@ -3503,6 +3506,7 @@ mod tests {
             c.reuse_checks,
             c.slot_writes,
             c.kept_resets,
+            c.l1_counts,
             kinds.join(","),
             from.join(","),
             c.system_chained,

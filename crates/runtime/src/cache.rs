@@ -521,9 +521,20 @@ pub fn fill_l1(rip: u64, block: &Block) {
     // (PIC study test [`PIC_TEST_SVC`]: none, so every computed exit and checked link enters the resident, which then
     // enters blocks armed after their links are made.)
     if control().l1_contexts[t] != block.context || control().pic_test == PIC_TEST_SVC {
+        #[cfg(feature = "perf")]
+        {
+            control().l1_counts[area::L1_SKIPPED] += 1;
+        }
         return;
     }
     let i = (rip & area::L1_MASK) as usize;
+    #[cfg(feature = "perf")]
+    {
+        let owner = l1_block(t, i);
+        if owner != 0 && owner != block.number + 1 {
+            control().l1_counts[area::L1_EVICTED] += 1;
+        }
+    }
     let mut listed = unsafe { l1_owner(t, i).read() } & area::L1_LISTED;
     if listed == 0 && block.flags & GLOBAL == 0 {
         let c = control();
@@ -549,6 +560,25 @@ pub fn fill_l1(rip: u64, block: &Block) {
         area::CODE_VA + at,
         area::L1_ENTRY_BYTES,
     );
+}
+
+/// Dispatch study (`perf` builds): counts a dispatcher miss for `rip` in code `context` by what the current L1 table's entry
+/// at its index holds ([`area::MISS_EMPTY`] and the rest).
+#[cfg(feature = "perf")]
+pub fn count_miss(rip: u64, context: u64) {
+    let c = control();
+    let t = c.l1_table as usize;
+    let i = (rip & area::L1_MASK) as usize;
+    let owner = l1_block(t, i);
+    c.l1_counts[if c.l1_contexts[t] != context {
+        area::MISS_CONTEXT
+    } else if owner == 0 {
+        area::MISS_EMPTY
+    } else if block(owner as usize - 1).rip == rip {
+        area::MISS_SAME
+    } else {
+        area::MISS_OTHER
+    }] += 1;
 }
 
 /// K1: `b`'s source mapping may be used now, as a TLB entry ([`Control::epoch`]).

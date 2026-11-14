@@ -648,7 +648,22 @@ pub mod cache {
         /// (four, packed); `trip_count` counts them all. The host prints them at the vCPU's end.
         pub trip: [[u64; 8]; TRIP_ENTRIES],
         pub trip_count: u64,
+        /// Dispatch study counters (`perf` resident builds only; [`L1_EVICTED`] and the rest). Appended.
+        pub l1_counts: [u64; L1_COUNTS],
     }
+    /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
+    pub const L1_EVICTED: usize = 0;
+    /// `fill_l1` entered nothing because the table's context is not the block's.
+    pub const L1_SKIPPED: usize = 1;
+    /// Dispatcher misses by the L1 entry at the RIP's index in the current table: empty,
+    pub const MISS_EMPTY: usize = 2;
+    /// holding another block's entry,
+    pub const MISS_OTHER: usize = 3;
+    /// holding an entry for this RIP (should not happen),
+    pub const MISS_SAME: usize = 4;
+    /// or the table serves another code context than the guest's (its entry says nothing).
+    pub const MISS_CONTEXT: usize = 5;
+    pub const L1_COUNTS: usize = 6;
     pub const PIC_TEST_AND: u64 = 1;
     pub const PIC_TEST_STR: u64 = 2;
     pub const PIC_TEST_BODY: u64 = 3;
