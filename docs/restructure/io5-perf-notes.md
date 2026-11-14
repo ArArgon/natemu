@@ -103,6 +103,14 @@ Rules learned in this round:
     relink), H (pool, flush policy), F (page currency, fault-around, delivery/irq), G (codegen, gated). Estimates if
     groups R, H, F land (overlaps discounted): configure 76.7 -> ~50-58 s, make 139 -> ~112-120 s.
 
+14. **Pool counting gate passed; (d) first, then the pool, on by default after its gate** (counting build `022439d`,
+    branch `pool-count`, measurement only). At 256 MiB the simulated pool serves 2.63 M configure requests (78%; gate
+    1.8 M) and 5.08 M on make (81%); modelled gain configure 5.0-6.3 vCPU-s (4.3-5.4%), make 12.2-14.7 (2.1-2.6%).
+    512 MiB adds almost nothing; configure never wraps 256. Option (d) qualifies on 2.75 M configure hits (2.74 s of
+    measured admission, 2.3%) and 5.14 M on make (5.7 s, 1.0%). The two overlap. Most served requests are the same
+    code at the same RIP on another vCPU (kernel code, forked children). Order: (d) first (host only, small), then
+    pool chunks 2-4; owner chose default-on for the pool once chunk 4's gate passes, with a switch to turn it off.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
