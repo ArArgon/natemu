@@ -2250,8 +2250,12 @@ fn unlink_outbound(n: usize) -> Option<u64> {
         let Some(i) = (block(n).out[k] as u64).checked_sub(1) else {
             continue;
         };
-        unlink(unsafe { record(i as usize).read() })?;
-        undone += 1;
+        // (Relink plan: a suspended record keeps its source's slot, so a dead source drops it too; its word was restored when it
+        // was suspended.)
+        if i >= control().links_susp {
+            unlink(unsafe { record(i as usize).read() })?;
+            undone += 1;
+        }
         remove(i, segment_of(i), &mut 0);
     }
     Some(undone)
@@ -2741,6 +2745,7 @@ fn drop_suspended() -> u64 {
     let n = c.links_susp;
     for i in 0..n {
         list_del(i as usize);
+        out_del(i as usize);
     }
     let old = ends(c).map(|e| *e);
     let mut new = [0; 5];
@@ -2809,6 +2814,7 @@ fn relink(n: usize) {
 #[cfg(not(feature = "pic-count"))]
 fn resume(i: u64, r: LinkRecord, global: bool, follow: &mut u32) {
     list_del(i as usize);
+    out_del(i as usize);
     let c = control();
     let last = c.links_susp - 1;
     if last != i {
@@ -2840,6 +2846,7 @@ fn resume(i: u64, r: LinkRecord, global: bool, follow: &mut u32) {
         })
     };
     list_add(slot as usize);
+    out_add(slot as usize);
 }
 /// Self-check: every link point of every placed block holds its admitted word (after [`unlink_all`]).
 pub fn links_restored() -> bool {
