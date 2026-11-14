@@ -688,6 +688,12 @@ def unsupported_cases():
 # the case runs and its mismatch is printed as GAP, not counted as a failure. A listed case that starts to pass is a failure,
 # so the entry must be deleted when the resident is fixed. Empty since S1.
 SYSTEM_GAPS = {}
+# The cases whose expected QEMU answer is a timeout (QEMU never finishes the guest): their hang may be remembered by tools/qemucache.py
+# (after two fresh timeouts); no other timeout is ever stored. The eight system programs whose full runs the November 11 run's log
+# shows as `QEMU full run: hang`, and seg-iret-null-ss-rpl@1 (QEMU_DIFFERS below says so).
+QEMU_HANGS = {'sysfault-cr4-reserved-15@1', 'sysfault-cr4-reserved-32@1', 'sysfault-cr4-smap@1', 'sysfault-cr4-vmxe@1',
+              'sysfault-cr4-smxe@1', 'sysfault-cr0-pg-clear@1', 'sysfault-cr3-reserved-63@1', 'sysfault-cr3-reserved-40@1',
+              'seg-iret-null-ss-rpl@1'}
 # Fault cases where pinned QEMU raises another exception than the SDM and the profile (system_fault_model) give: the
 # model judges; QEMU's answer is recorded, not compared.
 QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimplemented); with no counters (CPUID.0AH = 0) every ECX is an invalid counter: #GP(0)',
@@ -1429,7 +1435,7 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
             print(f"{name}: {'ok' if all(r['ok'] for r in entry['runs']) else 'FAIL'} (deviation: {want_fault})", flush=True)
             report.append(entry)
             continue
-        want, rc = qemu(prog, name, timeout=30 if name in QEMU_DIFFERS else 120, hang_ok=name in QEMU_DIFFERS)
+        want, rc = qemu(prog, name, timeout=30 if name in QEMU_DIFFERS else 120, hang_ok=name in QEMU_HANGS and not prog['params'].get('sdm_bytes'))      # (a served hang has no memory to read)
         if want is None and not (model and name in QEMU_DIFFERS): failures.append(f'{name}: QEMU run failed ({rc})'); continue
         # A listed case QEMU does not finish (it takes another path) is judged by segment_model alone.
         want = want or {'cpus': [{'fault': f'QEMU: {rc}'}], 'memory': []}
@@ -1496,7 +1502,7 @@ def cmd_system(a, host, runtime):
     stub = smp.build_stub(a.out / 'qemu-build')
     report, failures, gaps = [], [], []
 
-    def qemu(prog, label, timeout=120, hang_ok=False):      # hang_ok: a timeout is an expected answer (remembered)
+    def qemu(prog, label, timeout=120, hang_ok=False):      # hang_ok: a timeout is this case's expected answer
         rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=timeout, hang_ok=hang_ok)
         return (smp.parse_dump(prog, dump) if rc == 1 else None), rc
     for prog in programs:
@@ -1520,7 +1526,7 @@ def cmd_system(a, host, runtime):
             vector = sfm.fault(code, want['cpus'][0]['gpr'], c.get('cpl', 3), ctl['cr0'], ctl['cr4'], ctl['efer'], ctl['dr7'])
             if vector is None: failures.append(f'{name}: the model expects no fault'); continue
             want['cpus'][0]['fault'] = (*vector, at, 0)
-            full, rc = qemu(prog, name, timeout=10, hang_ok=True)
+            full, rc = qemu(prog, name, timeout=10, hang_ok=name in QEMU_HANGS)
             entry['qemu'] = 'hang' if rc == 'timeout' else (full and full['cpus'][0]['fault'] and list(full['cpus'][0]['fault'])) or 'no fault'
             # Where QEMU does raise an exception, it is the model's.
             if isinstance(entry['qemu'], list) and tuple(entry['qemu']) != want['cpus'][0]['fault']:

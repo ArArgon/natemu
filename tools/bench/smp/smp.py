@@ -85,12 +85,16 @@ def qemu_args(n, mode, dbg, img, cpu='max', extra=()):
             '-debugcon', f'file:{dbg}', '-kernel', str(img), *extra]
 
 
-def run_image(prog, img, work, mode='multi', timeout=120, extra=()):
-    """`extra`: more QEMU arguments (L3: `-serial file:PATH` gives the machine COM1 at 3F8H, in place of `-serial none`)."""
+def default_cpu(prog): return SYSTEM_CPU if prog.get('system') else 'max'
+
+
+def run_image(prog, img, work, mode='multi', timeout=120, extra=(), cpu=None):
+    """`extra`: more QEMU arguments (L3: `-serial file:PATH` gives the machine COM1 at 3F8H, in place of `-serial none`);
+    `cpu`: a QEMU CPU model other than `default_cpu(prog)` (tools/run_i5b.py)."""
     work.mkdir(parents=True, exist_ok=True); p, dbg = work / 'image.bin', work / 'dbg.out'
     p.write_bytes(img); dbg.unlink(missing_ok=True); t0 = time.perf_counter()
     try:
-        cpu = SYSTEM_CPU if prog.get('system') else 'max'
+        cpu = cpu or default_cpu(prog)
         r = subprocess.run(qemu_args(prog['ncpu'], mode, dbg, p, cpu, extra), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
         rc, err = r.returncode, r.stderr.decode(errors='replace')[-300:]
     except subprocess.TimeoutExpired:
