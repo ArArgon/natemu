@@ -81,6 +81,8 @@ pub struct Publisher {
     /// Keeps the span mapped.
     _memory: Arc<Memory>,
     off: AtomicBool,
+    /// The span as a reader sees it (the tail, without the lock).
+    pool: Pool,
     state: Mutex<State>,
     counts: Counts,
 }
@@ -103,6 +105,7 @@ impl Publisher {
         Self {
             _memory: memory,
             off: AtomicBool::new(false),
+            pool: writer.pool(),
             state: Mutex::new(State {
                 writer,
                 scratch: vec![0; pool::MAX_ENTRY_BYTES],
@@ -118,7 +121,7 @@ impl Publisher {
     /// The pool as a reader sees it (tests; the resident maps the same span).
     #[cfg(test)]
     pub(crate) fn pool(&self) -> Pool {
-        self.state().writer.pool()
+        self.pool
     }
     pub fn is_off(&self) -> bool {
         self.off.load(Relaxed)
@@ -170,6 +173,12 @@ impl Publisher {
     fn publish_once(&self, once: &AtomicU64, t: &Template) -> Published {
         if self.is_off() {
             return Published::Skipped(Why::Off);
+        }
+        // Still in the ring: published at a position not below the tail (the usual case of a hit: no lock, no encoding). Checked
+        // again under the lock, where another vCPU's publication of the same answer may have happened meanwhile.
+        let before = once.load(Relaxed);
+        if before != 0 && before >= self.pool.tail() {
+            return Published::Already;
         }
         let o = &t.block.object;
         let Some(h) = crate::relocation::read::<Header>(o, 0) else {
@@ -573,5 +582,21 @@ mod tests {
         let ns = started.elapsed().as_nanos() as f64 / (n - last) as f64;
         let bytes = p.counts.bytes.load(Relaxed) / n as u64;
         eprintln!("answers {last}..{n}: {ns:.0} ns each; {bytes} bytes per entry");
+        // A template request whose answer is in the ring already (most of them: a hit).
+        let t = Template {
+            rip: 0x7fff_0000_1000,
+            context: 0,
+            prefix: &prefix,
+            block: &b,
+            rep_exits: 0,
+        };
+        let cell = AtomicU64::new(0);
+        assert!(matches!(p.publish(&cell, &t), Published::Done(_)));
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            assert_eq!(p.publish(&cell, &t), Published::Already);
+        }
+        let ns = started.elapsed().as_nanos() as f64 / n as f64;
+        eprintln!("already published: {ns:.0} ns each");
     }
 }
