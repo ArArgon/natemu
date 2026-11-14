@@ -21,14 +21,19 @@ SOURCES = (RES, REC, ABI)
 MUTATIONS = {
     # ---- the fast miss path
     'fm-record-ignores-frame': ([(REC, '    if differ {\n        Mapped::No', '    if false {\n        Mapped::No')], 'cr3-switch,remap-cr3,remap-invlpg,page-share,page-cross'),
-    'fm-unknown-is-yes': ([(RES, 'Mapped::Unknown => {\n            unknown = true;\n            Mapped::Unknown\n        }', 'Mapped::Unknown => Mapped::Yes(0)')], 'page-share,page-cross,cross'),
+    'fm-unknown-is-yes': ([(RES, 'Mapped::Unknown => {\n            unknown = true;\n            Mapped::Unknown\n        }', 'Mapped::Unknown => {\n            unknown = true;\n            Mapped::Yes(0)\n        }')], 'page-share,page-cross,cross'),
     'fm-entry-not-full-entry': ([(RES, 'cache::code_of(target).full_entry(),\n            BLOCK_SPSR | frame.nzcv', 'cache::code_of(target).entry(),\n            BLOCK_SPSR | frame.nzcv')], 'miss-pic'),
     'fm-ignores-tf-debug': ([(RES, 'if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0 {', 'if s.cpu.dr[5] & DR7_ENABLES != 0 {')], 'miss-step'),
     'fm-ignores-dr7': ([(RES, 'if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0 {', 'if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 {')], 'miss-dr7'),
     'fm-skips-fill-l1': ([(RES, 'c.fast_taken += 1;\n    cache::fill_l1(rip, target);', 'c.fast_taken += 1;')], 'miss-counts'),
-    'fm-resumes-without-alignment-check': ([(RES, 'BLOCK_SPSR | frame.nzcv,\n            alignment_check(&s.cpu),', 'BLOCK_SPSR | frame.nzcv,\n            false,')], 'miss-ac'),
+    'fm-resumes-without-alignment-check': ([(RES, 'BLOCK_SPSR | frame.nzcv,\n            alignment_check(&s.cpu),', 'BLOCK_SPSR | frame.nzcv,\n            0,')], 'miss-ac'),
     'fm-takes-system-target': ([(RES, 'if target.flags & cache::SYSTEM != 0 {\n        return decline_fast(fast_decline::SYSTEM);\n    }', '')], 'miss-system'),
-    # ---- the page record (the plan's M1-M14; M9's and M10's programs need the CPL switch)
+    # ---- checks whose programs are other runners' (`slice3:MODE` = tools/run_slice3_vm.py MODE; `m2:ONLY` = tools/run_m2.py --only ONLY)
+    'fm-ignores-boundary-state': ([(RES, 'if s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0 {', 'if s.plain_step | s.stop_wanted != 0 {')], 'slice3:events'),
+    'fm-ignores-events': ([(RES, 'if !events::none(s) {\n        return decline_fast(fast_decline::EVENT);', 'if false {\n        return decline_fast(fast_decline::EVENT);')], 'miss-event'),
+    'fm-reads-if-from-record': ([(RES, '    if s.cpu.cpl == 0 {\n        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.', '    if false {\n        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.')], 'miss-event'),
+    'fm-ignores-uncached': ([(RES, 'if c.uncached_count | c.uncached_fence != 0 {', 'if false {')], 'm2:types'),
+    # ---- the page record (the plan's M1-M14; M9 is the key without the privilege class: see the table of what is not covered)
     'pr-m1-hit-ignores-frame': ([(RES, '.filter(|&(at, _)| at == gpa)?', '.filter(|&(at, _)| at == gpa || true)?')], 'page-share,page-cross,cr3-switch'),
     'pr-m2-epoch-ignored': ([(ABI, '(r.epoch == epoch || (r.frame', '(true || (r.frame')], 'page-share,remap-cr3,cr3-switch,page-cross'),
     'pr-m3-table-disabled': ([(ABI, '        if hits(r, k, epoch, global_epoch, pge) {\n            let (page, flags) = answer', '        if false && hits(r, k, epoch, global_epoch, pge) {\n            let (page, flags) = answer')], 'page-counts'),
@@ -37,9 +42,10 @@ MUTATIONS = {
     'pr-m6-crossing-on-one-page': ([(REC, 'let Some((page, f)) = probe(s, (b.rip & !4095).wrapping_add(4096 * k as u64)) else {\n                return Mapped::Unknown;\n            };', 'let Some((page, f)) = probe(s, (b.rip & !4095).wrapping_add(4096 * k as u64)) else {\n                continue;\n            };')], 'page-cross,cross'),
     'pr-m7-global-across-global-flush': ([(ABI, 'r.epoch >= global_epoch', 'r.epoch >= 1')], 'page-global'),
     'pr-m8-pge-ignored': ([(ABI, '(r.frame & GLOBAL != 0 && pge && r.epoch', '(r.frame & GLOBAL != 0 && r.epoch')], 'page-global,place-global'),
+    'pr-m9-key-without-privilege-class': ([(ABI, '(large as u64) << 1 | user as u64', '(large as u64) << 1 | 0')], 'page-user'),
     'pr-m10-invlpg-clears-one-class': ([(ABI, 'for user in [false, true] {\n            let k = key(va, large, user);\n            let r = &mut table[index(k)];\n            if r.epoch != 0', 'for user in [false] {\n            let k = key(va, large, user);\n            let r = &mut table[index(k)];\n            if r.epoch != 0')], 'page-user-invlpg'),
     'pr-m11-hit-skips-mark': ([(RES, '    let p = crate::perf::enter(crate::perf::FETCH);\n    match page_translation(s, va, natemu_abi::page_study::PLACE) {', '    let p = crate::perf::enter(crate::perf::FETCH);\n    let hits_before = cache::control().page_hits;\n    match page_translation(s, va, natemu_abi::page_study::PLACE) {'),
-                               (RES, '            if block {\n                mark(s, gpa);', '            if block && cache::control().page_hits == hits_before {\n                mark(s, gpa);')], 'page-mark'),
+                               (RES, '            if block {\n                mark(s, gpa);', '            if block && cache::control().page_hits == hits_before {\n                mark(s, gpa);')], 'page-mark'),   # survives: `kept` discards a block placed from an unmarked page and the step runs fresh bytes (outcome-equal, perf only)
     'pr-m12-check-compares-frames-only': ([(REC, 'if walked == Ok((page, flags)) {', 'if walked.map(|w| w.0) == Ok(page) {')], 'page-size-check'),
     'pr-m13-large-without-ram-rule': ([(REC, 'if large && !ps::recordable(&guest_ram(), ps::base(gpa, true), true) {', 'if false {')], 'page-large-edge'),
     'pr-m14-check-overwrites-record': ([(REC, '    cache::control().page_disagree += 1;', '    cache::control().page_disagree += 1;\n    if let Ok((g, f)) = walked {\n        record(s, va, g, f);\n    }')], 'page-check-keep'),
@@ -57,8 +63,8 @@ def run_one(name, a):
         for path, old, new in edits:
             text = (ROOT / path).read_text()
             saved.setdefault(path, text)
-            if old not in text:
-                return 'pattern not found (the source changed: update this table): ' + path
+            if text.count(old) != 1:
+                return 'pattern not found or not unique (the source changed: update this table): ' + path
             (ROOT / path).write_text(text.replace(old, new, 1))
         target = ROOT / 'target' / 'mut'
         r = sh(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'],
@@ -66,6 +72,14 @@ def run_one(name, a):
         if r.returncode != 0:
             return 'build failed: ' + r.stderr[-400:]
         out = a.out / name
+        if programs.startswith(('slice3:', 'm2:')):
+            runner, _, arg = programs.partition(':')
+            runtime = str(target / 'aarch64-unknown-none/release/natemu-runtime')
+            cmd = ([sys.executable, 'tools/run_slice3_vm.py', '--fexc', str(a.fexc), '--out', str(out), arg] if runner == 'slice3' else
+                   [sys.executable, 'tools/run_m2.py', '--fexc', str(a.fexc), '--out', str(out), '--only', arg, '--host', str(a.host), '--runtime', runtime])
+            r = sh(cmd, env=dict(os.environ, CARGO_TARGET_DIR=str(target)))
+            (a.out / f'{name}.log').write_text(r.stdout[-6000:] + r.stderr[-2000:])
+            return 'red' if r.returncode != 0 else 'GREEN'
         r = sh([sys.executable, 'tools/run_k1.py', '--fexc', str(a.fexc), '--out', str(out), '--cpus', '1', '--programs', programs,
                 '--host', str(a.host), '--runtime', str(target / 'aarch64-unknown-none/release/natemu-runtime')])
         (a.out / f'{name}.log').write_text(r.stdout[-6000:] + r.stderr[-2000:])

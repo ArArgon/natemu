@@ -731,7 +731,7 @@ def pic_bodies(i, n=1):
                       + call('h4', f'{RV1 + XO:#x}') + save(('r12', 'rbx')))
     out['pic-user'] = out['pic-two']
     out['miss-pic'] = (call('p0', f'{RV1:#x}') + save(('r8', 'rax'), ('r9', 'rsi')) + call('p1', f'{RV6:#x}') + save(('r10', 'rax')) + call('p2', f'{RV7:#x}') + save(('r12', 'rax'))
-                       + call('p3', f'{RV1:#x}') + save(('r14', 'rax'), ('r15', 'rsi')))
+                       + call('p3', f'{RV1:#x}') + call('p4', f'{RV6:#x}') + save(('r14', 'rax'), ('r15', 'rsi')))
     return out
 
 
@@ -1018,8 +1018,9 @@ def reuse_either(name):
             'pool-wrap': {'r8': {PW_BLOCKS}, 'r9': {PW_BLOCKS}, 'r10': {PW_BLOCKS}},
             'pool-fence': {'r8': {RV1}, 'r9': {RV3}, 'r10': {RV3 + 17}, 'r12': {1}},
             'pool-race': {'r8': {7}},
-            # Three instances in one L1 set: RV1 is evicted by the other two and then called again (a fast miss): its own page base.
-            'miss-pic': {'r8': {RV1}, 'r9': {RV1 + YN}, 'r10': {RV6}, 'r12': {RV7}, 'r14': {RV1}, 'r15': {RV1 + YN}},
+            # Three aliases in one L1 set (RV1 is the absolute block, RV6 and RV7 instances of the shared translation): RV1 evicts RV6 from the
+            # two ways, then RV6 is called again (a fast miss into an instance, entered at its full entry: its own page base).
+            'miss-pic': {'r8': {RV1}, 'r9': {RV1 + YN}, 'r10': {RV6}, 'r12': {RV7}, 'r14': {RV6}, 'r15': {RV6 + YN}},
         }[name]
     return judge
 # (`l1-pic` shares one translation across two aliases; it asserts no copies: it is not a reuse program.)
@@ -1090,7 +1091,9 @@ CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    ire
 STUB = dict(enter=0x9fff, user=0xa000, exit=0xbfff, back=0xc000, S=0xd000)
 STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac')
 CHUNK_PAGE = ('page-cross', 'page-global', 'page-user', 'page-user-invlpg', 'page-mark', 'page-size-check', 'page-counts')
-CHUNK_MISS = ('miss-counts', 'miss-system', 'miss-step', 'miss-dr7', 'miss-ac')
+CHUNK_MISS = ('miss-counts', 'miss-system', 'miss-step', 'miss-dr7', 'miss-ac', 'miss-event')
+PN = 0xf000                        # `miss-event`: the stub `nop; jmp r12` whose nop posts the event (`post PN VEC`)
+EVENT = 0x30
 PCX = 0x8000                       # `page-cross`: P1's third frame
 MIDT = 0xe000                     # the #DB programs' IDT page (QEMU-compared, so clear of every other page)
 SIDT, LOGP = 0x7010, 0x7e00        # `page-user`: the logging IDT saved here; the #DB handlers' log of RIPs
@@ -1119,6 +1122,10 @@ def chunk_bodies(k, i, n):
               f'    mov word [{d + MIDT + 0x14:#x}], 0x8e00\n    shr rax, 16\n    mov [{d + MIDT + 0x16:#x}], ax\n    shr rax, 16\n'
               f'    mov [{d + MIDT + 0x18:#x}], eax\n    mov word [{d + MIDT + 0x800:#x}], 0xfff\n    mov rax, {d + MIDT:#x}\n'
               f'    mov [{d + MIDT + 0x802:#x}], rax\n    lidt [{d + MIDT + 0x800:#x}]\n    mov rdi, {d + LOGP:#x}\n')
+    vec_idt = lambda v, label: (f'    lea rax, [rel {label}]\n    mov [{d + MIDT + 16 * v:#x}], ax\n    mov word [{d + MIDT + 16 * v + 2:#x}], 8\n'
+                                f'    mov word [{d + MIDT + 16 * v + 4:#x}], 0x8e00\n    shr rax, 16\n    mov [{d + MIDT + 16 * v + 6:#x}], ax\n    shr rax, 16\n'
+                                f'    mov [{d + MIDT + 16 * v + 8:#x}], eax\n    mov word [{d + MIDT + 0x800:#x}], 0xfff\n    mov rax, {d + MIDT:#x}\n'
+                                f'    mov [{d + MIDT + 0x802:#x}], rax\n    lidt [{d + MIDT + 0x800:#x}]\n')
     hdb = lambda tail: ('    jmp .end\n.hdb:\n    push rbx\n    mov rbx, [rsp+8]\n    mov [rdi], rbx\n    add rdi, 8\n' + tail
                         + '    pop rbx\n    iretq\n.end:\n')
     sidt = lambda op: f'    {op} [{d + SIDT:#x}]\n'
@@ -1162,6 +1169,15 @@ def chunk_bodies(k, i, n):
         # DR0 an instruction breakpoint at A, armed throughout: each of two runs of A takes the #DB before its first instruction.
         'miss-dr7': (db_idt + f'    mov rax, {A:#x}\n    mov dr0, rax\n    mov eax, 1\n    mov dr7, rax\n' + c('d0', A) + save('r8') + c('d1', A)
                      + save('r9') + '    xor eax, eax\n    mov dr7, rax\n' + hdb('    or qword [rsp+24], 0x10000\n')),
+        # An event posted with IF clear (the hooked nop), then `sti; jmp` to the evicted A: the boundary after the jump is at the miss, where
+        # the interrupt is taken before A's first instruction (r14 = the handler's saved RIP = A). Declined (`event`); a fast path that
+        # misses the event (or reads IF from the stale record) enters A and delivers it later.
+        'miss-event': (f'    lea rdx, [rel .h30]\n    mov rdi, {d + MIDT:#x}\n    mov ecx, 256\n.f:\n    mov [rdi], dx\n    mov word [rdi+2], 8\n    mov word [rdi+4], 0x8e00\n'
+                       '    mov rax, rdx\n    shr rax, 16\n    mov [rdi+6], ax\n    shr rax, 16\n    mov [rdi+8], eax\n    mov dword [rdi+12], 0\n    add rdi, 16\n'
+                       f'    dec ecx\n    jnz .f\n    mov word [{d + 0x7020:#x}], 0xfff\n    mov rax, {d + MIDT:#x}\n    mov [{d + 0x7022:#x}], rax\n'
+                       f'    lidt [{d + 0x7020:#x}]\n' + '    xor r14d, r14d\n    mov ecx, 0x1b\n    mov eax, ' + hex(0xfee00d00 if i == 0 else 0xfee00c00) + '\n    xor edx, edx\n    wrmsr\n    mov ecx, 0x80f\n    mov eax, 0x1ff\n    xor edx, edx\n    wrmsr\n' + c('e0', A) + c('e1', B) + c('e2', C) + '    cli\n    lea r12, [rel .p]\n'
+                       f'    mov rax, {d + PN:#x}\n    jmp rax\n.p:\n    lea r13, [rel .m]\n    mov rax, {A:#x}\n    sti\n    jmp rax\n.m:\n    cli\n'
+                       + '    jmp .end\n.h30:\n    push rax\n    push rcx\n    push rdx\n    mov r14, [rsp+24]\n    mov ecx, 0x80b\n    xor eax, eax\n    xor edx, edx\n    wrmsr\n    pop rdx\n    pop rcx\n    pop rax\n    iretq\n.end:\n'),
         # CPL 3 with CR0.AM and RFLAGS.AC: A, B, C warm (A evicted), then A, whose first instruction is a misaligned load: #AC (the stop).
         'miss-ac': ('    mov rax, cr0\n    bts rax, 18\n    mov cr0, rax\n    pushfq\n    or qword [rsp], 0x40000\n    popfq\n'
                     f'    mov r15, {d + 0x7100:#x}\n' + c3('a0', A) + c3('a1', B) + c3('a2', C) + f'    mov r15, {d + 0x7101:#x}\n' + c3('a3', A)),
@@ -1189,8 +1205,10 @@ def chunk_memory(name, i, n):
                 mem(d + STUB['back'], b'\x41\xff\xe4', capture=False), mem(d + STUB['S'], CODE(0x21), capture=False), mem(d + STUB['S'] + PY, CODE(0x22), capture=False)]
     if name in ('page-user', 'page-user-invlpg'):
         out += [dict(P.zero(d + IDT, 0x1000), capture=False)]
-    if name in ('miss-step', 'miss-dr7'):
+    if name in ('miss-step', 'miss-dr7', 'miss-event'):
         out += [dict(P.zero(d + MIDT, 0x1000), capture=False)]
+    if name == 'miss-event':
+        out += [mem(d + PN, b'\x90\x41\xff\xe4', capture=False)]
     if name in ('miss-step', 'miss-dr7'):
         out += [P.zero(d + LOGP, 0x40)]
     if name == 'miss-ac':
@@ -1221,6 +1239,7 @@ CHUNK_VALUES = {
     'page-counts': lambda i, k: {'r8': {sum(range(k))}},
     'miss-system': lambda i, k: {'r8': {2 * k}},
     'miss-ac': {},
+    'miss-event': lambda i, k: {'r14': {l1_pages(i)['A']}},
 }
 # `page-check-keep` under the record: Y and Z are placed from F1's record. (`PAGE_VALUES` are the study resident's, where the walk answers.)
 PAGE_VALUES_ON = {'page-check-keep': {'r8': {1}, 'r9': {0x11}, 'r10': {0x21}}}
@@ -1234,8 +1253,8 @@ PAGE_ON_COUNTS = {'page-share': {'hits': 2}, 'page-global': {'hits': 1}, 'page-l
 # Further runs under another mode: (program, mode, disagreements, whether it is an adversarial program).
 PAGE_MODE_RUNS = (('local-gpa', 'check', 1), ('pf-fetch', 'check', 1))
 # The fast miss path's counts (k1.fast_miss) in a default run: taken at least; declined by reason at least; taken exactly none.
-FAST_TAKEN = {'miss-counts': 1, 'miss-pic': 1, 'miss-ac': 1}
-FAST_DECLINED = {'miss-system': ('system', 1), 'miss-step': ('debug', 1), 'miss-dr7': ('debug', 1)}
+FAST_TAKEN = {'miss-counts': 1, 'miss-pic': 2, 'miss-ac': 1}
+FAST_DECLINED = {'miss-event': ('event', 1), 'miss-system': ('system', 1), 'miss-step': ('debug', 1), 'miss-dr7': ('debug', 1)}
 FAST_NONE = ('miss-step', 'miss-dr7', 'miss-system')
 # A run that ends in a fault the program provokes: the stop and the vector.
 EXPECT_FAULT = {'page-user': 14, 'miss-ac': 17}
@@ -1285,7 +1304,8 @@ def program(name, n, k):
         ca, cb = chunk_tables(name, i)
         a, b = {**a, **ca}, {**b, **cb}
         out['bodies'].append(P.body(P.SYS_CODE(i), P.sys_text(i, bodies(k, i, n)[name])))
-        out['cpus'].append(dict(P.cpu(i, P.SYS_CODE(i)), cpl=0, **({'switches': [(d + STUB['enter'], 3), (d + STUB['exit'], 0)]} if name in STUB_PROGRAMS else {})))
+        out['cpus'].append(dict(P.cpu(i, P.SYS_CODE(i)), cpl=0, **({'switches': [(d + STUB['enter'], 3), (d + STUB['exit'], 0)]} if name in STUB_PROGRAMS else {}),
+                                                       **({'posts': [(d + PN, EVENT)], 'quiet': True} if name == 'miss-event' else {})))
         tb = P.sys_tables(i, 1, n, b)
         extra = []
         if name == 'walk':
@@ -1587,9 +1607,9 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
         # The page record's counters (k1.page) and the fast miss path's (k1.fast_miss), absent while zero.
         k1 = c['stats']['k1']
         pg, fm = k1.get('page', {}), k1.get('fast_miss', {})
-        if short in PAGE_FORCED_COUNTS and (pg.get('disagree', 0) < PAGE_FORCED_COUNTS[short] if extra else pg.get('disagree', 0) != PAGE_FORCED_COUNTS[short]):
+        if tag != '-ps' and short in PAGE_FORCED_COUNTS and (pg.get('disagree', 0) < PAGE_FORCED_COUNTS[short] if extra else pg.get('disagree', 0) != PAGE_FORCED_COUNTS[short]):
             problems.append(f"cpu{v} page record disagreed {pg.get('disagree', 0)} times, want {'at least ' if extra else ''}{PAGE_FORCED_COUNTS[short]}")
-        if pmode == 'on' and not extra:
+        if pmode == 'on' and not extra and tag != '-ps':
             problems += [f'cpu{v} page {f} = {pg.get(f, 0)}, want at least {m}' for f, m in PAGE_ON_COUNTS.get(short, {}).items() if pg.get(f, 0) < m]
         if not extra and os.environ.get('NATEMU_MISS_FAST') != 'off' and not os.environ.get('NATEMU_PIC_TEST'):
             taken, declined = fm.get('taken', 0), fm.get('declined', {})

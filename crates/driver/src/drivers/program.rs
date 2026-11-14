@@ -326,6 +326,11 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("post", [a, v]) if (16..256).contains(&number(v)?) => {
                 state(&mut cpu, line)?.posts.push((number(a)?, number(v)?))
             }
+            // Fast-miss tests: `qpost` posts without ringing the doorbell (a ring taken at the `eret` would hide a path that skipped
+            // its event check; the quiet bit is `QUIET`).
+            ("qpost", [a, v]) if (16..256).contains(&number(v)?) => {
+                state(&mut cpu, line)?.posts.push((number(a)?, number(v)? | QUIET))
+            }
             ("nmi", [a]) => state(&mut cpu, line)?
                 .posts
                 .push((number(a)?, execution::NMI)),
@@ -934,6 +939,8 @@ const SIGSTOP: i32 = 17;
 /// A reply tamper: called with the vCPU stopped, the reply (`State::reply`) and its block or decode in place but not yet
 /// seen by the resident, until it returns true (it corrupted something, possibly the reply kind).
 type Tamper = fn(Area, &mut State) -> bool;
+/// A `qpost` item's marker on its event (no doorbell ring).
+const QUIET: u64 = 1 << 32;
 /// [`Stop::Hooked`]'s code for the logging IDT.
 const LOGGED: u32 = 0;
 /// The driver's [`execution::Hook`] for one vCPU: its program's hooks and, on the tampered vCPU, the run-time defence
@@ -975,9 +982,12 @@ impl execution::Hook for ProgramHook {
                 ..exec::System::NONE
             })));
         }
-        if let Some(&event) = self.posts.get(&rip) {
+        if let Some(&posted) = self.posts.get(&rip) {
+            let event = posted & !QUIET;
             let _ = execution::post(area.memory(), area.vcpu(), event, false);
-            self.doorbell.ring(area.vcpu())?;
+            if posted & QUIET == 0 {
+                self.doorbell.ring(area.vcpu())?;
+            }
             return Ok(Some(execution::At::System(exec::System {
                 kind: exec::system::EVENT_HOOK,
                 length: 1,

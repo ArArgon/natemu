@@ -285,6 +285,7 @@ def smp_description(prog):
                   'gpr ' + ' '.join(f'{smp.num(v):#x}' for v in c['gpr'])] + (['sse 1'] if prog.get('sse') else [])
         # (natemu only: the one-byte `nop` at ADDR runs as a CPL change to CPL, `ProgramHook`'s `switches`)
         lines += [f'switch {smp.num(at):#x} {cpl}' for at, cpl in c.get('switches', [])]
+        lines += [f"{'qpost' if c.get('quiet') else 'post'} {smp.num(at):#x} {vec}" for at, vec in c.get('posts', [])]
     return '\n'.join(lines) + '\n'
 
 
