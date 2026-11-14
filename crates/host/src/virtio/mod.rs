@@ -942,6 +942,9 @@ impl Virtio {
                 s.owed_at = None;
                 s.owing = 0;
                 s.vectors = Default::default();
+                if let Some(pci) = self.pci.get() {
+                    pci.clear_pending();
+                }
                 s.device_sel = 0;
                 s.driver_sel = 0;
                 s.queue_sel = 0;

@@ -134,8 +134,9 @@ pub(super) struct Transport {
     isr: AtomicU32,
     /// BAR0's base while memory decoding is on, else [`NO_BAR`]; stored under the configuration lock.
     bar: AtomicU64,
-    /// The command register's Bus Master bit, stored under the configuration lock; MSI-X's gate (`set_gate`), so a
-    /// message is sent or released only while it is set without the configuration lock on the delivery path.
+    /// The command register's Bus Master bit, stored under the configuration lock; MSI-X's gate (`set_gate`): a
+    /// message is sent or released only while it is set, else held pending, without the configuration lock on the
+    /// delivery path. The device itself keeps processing requests (QEMU blocks DMA instead).
     bus_master: Arc<AtomicBool>,
     irqs: Irqs,
     gsi: usize,
@@ -157,9 +158,9 @@ impl Transport {
         self.irqs.line(self.gsi, level);
     }
     /// Under the state lock: interrupts for the queues in `queues` (bit n: queue n) and, with `config`, a
-    /// configuration change. MSI-X sends each distinct vector once, or marks it pending while masked; nothing without
-    /// bus mastering (PCI 3.0 6.2.2: a function then issues no memory write, and an MSI is one; the gate), for
-    /// [`NO_VECTOR`], or with MSI-X disabled (`MsixConfig::trigger`). Takes only the MSI-X lock.
+    /// configuration change. MSI-X sends each distinct vector once, or marks it pending while masked or without bus
+    /// mastering (PCI 3.0 6.2.2: a function then issues no memory write, and an MSI is one; sent once Bus Master is
+    /// set); nothing for [`NO_VECTOR`] or with MSI-X disabled (`MsixConfig::trigger`). Takes only the MSI-X lock.
     pub(super) fn trigger(&self, vectors: &Vectors, queues: u8, config: bool) {
         let mut msix = lock(&self.msix);
         let mut sent = [NO_VECTOR; 3];
@@ -172,6 +173,11 @@ impl Transport {
             }
             sent[i] = v;
         }
+    }
+    /// Under the state lock, at a device reset: pending vectors belong to the closed incarnation (QEMU:
+    /// `msix_unuse_all_vectors`); the table and MSI-X Enable are PCI state and stay.
+    pub(super) fn clear_pending(&self) {
+        lock(&self.msix).clear_pending();
     }
 }
 
@@ -409,7 +415,10 @@ impl bus::Function for PciFunction {
         let _ = config.write_config_register(reg_idx, offset, data);
         let bar = match config.command() & MEMORY {
             0 => NO_BAR,
-            _ => config.get_bar_addr(0),
+            // The live register, as hardware decodes it after any write width (the cached `get_bar_addr` follows
+            // only dword writes); bits below the size are ignored, and a size probe's 0xFFFF_8000 lies outside the
+            // window, so the BAR then decodes nothing (PCI 3.0 6.2.5.1).
+            _ => u64::from(config.read_reg(4) & !(BAR_LEN as u32 - 1)),
         };
         t.bar.store(bar, SeqCst);
         let master = config.command() & BUS_MASTER != 0;
@@ -772,7 +781,9 @@ mod tests {
             }
             complete(&rig.d, 0);
             assert!(rig.sent().is_empty(), "case {case}");
-            assert_eq!(pba(&rig), 0, "case {case}: nothing pending");
+            // Without bus mastering the vector waits pending (sent once Bus Master is set); the others leave none.
+            let pending = if case == 2 { 2 } else { 0 };
+            assert_eq!(pba(&rig), pending, "case {case}");
         }
     }
     #[test]
@@ -817,6 +828,22 @@ mod tests {
         // MSI-X itself is PCI state: still enabled, the table kept.
         assert_eq!(rig.read(TABLE + 16, 8), message(1).0);
         assert!(lock(&rig.d.pci.get().unwrap().msix).enabled());
+        // A vector pending under a mask, or without bus mastering, is the closed incarnation's: a reset drops it.
+        for gated in [false, true] {
+            let rig = rng(true);
+            if gated {
+                rig.command(MEMORY);
+            } else {
+                rig.msix(true, true);
+            }
+            complete(&rig.d, 0);
+            assert_eq!(pba(&rig), 2);
+            rig.write(0x14, 1, 0);
+            assert_eq!(pba(&rig), 0, "gated {gated}");
+            rig.msix(true, false);
+            rig.command(MEMORY | BUS_MASTER);
+            assert!(rig.sent().is_empty(), "gated {gated}");
+        }
     }
     #[test]
     fn network_hold_back_delivers_each_owing_queue_once() {
@@ -1190,6 +1217,86 @@ mod tests {
         rig.command(MEMORY);
         rig.command(MEMORY | BUS_MASTER);
         assert_eq!(rig.sent().len(), 1);
+        // A completion while bus mastering is off is not lost: it waits pending and goes out when it is set.
+        rig.command(MEMORY);
+        complete(&rig.d, 0);
+        assert_eq!((rig.sent().len(), pba(&rig)), (1, 2));
+        rig.command(MEMORY | BUS_MASTER);
+        assert_eq!(rig.sent(), [message(1), message(1)]);
+        assert_eq!(pba(&rig), 0);
+    }
+    /// BAR0 on a real bus window: (offset in the window, size) reads through the registry's handle.
+    fn window(rig: &Driver) -> (crate::devices::Devices, impl Fn(u64, u64) -> u64) {
+        let mut devices = crate::devices::Devices::new(1 << 30);
+        let mut b = bus::Bus::new();
+        b.add(1, rig.f.clone()).unwrap();
+        b.install(&mut devices).unwrap();
+        let base = u64::from(bus::platform::WINDOW.0);
+        let direct = devices
+            .find(base)
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .direct()
+            .unwrap();
+        let read = move |addr: u64, size: u64| match direct.access(0, addr - base, size, None) {
+            Access::Completed(v) => v,
+            other => panic!("window read {addr:#x}: {other:?}"),
+        };
+        (devices, read)
+    }
+    #[test]
+    fn bar0_moves_with_any_write_width_and_decodes_only_where_it_is() {
+        let rig = attach(device());
+        let (_devices, read) = window(&rig);
+        let num_queues = 0x12;
+        // Decoding off: the launch address reads as unclaimed.
+        assert_eq!(read(0xe001_0000 + num_queues, 2), 0xffff);
+        rig.command(MEMORY);
+        assert_eq!(read(0xe001_0000 + num_queues, 2), 1);
+        let moves: [(u64, &[(usize, &[u8])]); 3] = [
+            (0xe002_0000, &[(0x10, &0xe002_0000u32.to_le_bytes())]),
+            (0xe003_0000, &[(0x10, &[0, 0]), (0x12, &[0x03, 0xe0])]),
+            (
+                0xe004_8000,
+                &[
+                    (0x10, &[0]),
+                    (0x11, &[0x80]),
+                    (0x12, &[0x04]),
+                    (0x13, &[0xe0]),
+                ],
+            ),
+        ];
+        let mut old = 0xe001_0000;
+        for (base, writes) in moves {
+            for &(offset, bytes) in writes {
+                rig.cfg_write(offset, bytes);
+            }
+            assert_eq!(rig.f.bar(), Some(base));
+            assert_eq!(rig.cfg(0x10), base as u32);
+            assert_eq!(read(base + num_queues, 2), 1, "{base:#x}");
+            assert_eq!(read(old + num_queues, 2), 0xffff, "{old:#x} after the move");
+            old = base;
+        }
+        rig.command(0);
+        assert_eq!(rig.f.bar(), None);
+        assert_eq!(read(old + num_queues, 2), 0xffff);
+    }
+    #[test]
+    fn bar0_size_probe_reads_the_mask_and_decodes_nothing_meanwhile() {
+        for decoding in [false, true] {
+            let rig = attach(device());
+            let (_devices, read) = window(&rig);
+            rig.command(if decoding { MEMORY } else { 0 });
+            rig.cfg_write(0x10, &u32::MAX.to_le_bytes());
+            assert_eq!(rig.cfg(0x10), 0xffff_8000, "32 KiB, 32-bit memory");
+            assert_eq!(read(0xe001_0000 + 0x12, 2), 0xffff, "decoding {decoding}");
+            rig.cfg_write(0x10, &0xe001_0000u32.to_le_bytes());
+            assert_eq!(rig.cfg(0x10), 0xe001_0000);
+            rig.command(MEMORY);
+            assert_eq!(read(0xe001_0000 + 0x12, 2), 1, "decoding {decoding}");
+        }
     }
     /// The line-ordering argument under contention: completions and ISR reads on one thread, MSI-X Enable and
     /// Interrupt Disable toggles through configuration writes on another; afterwards the line is at the level of the
@@ -1209,7 +1316,7 @@ mod tests {
                 });
                 scope.spawn(|| {
                     for i in 0..500u32 {
-                        rig.msix(i % 2 == 0, false);
+                        rig.msix(i % 2 == round % 2, false);
                         let disable = if (i + round) % 5 == 0 {
                             INTX_DISABLE
                         } else {
