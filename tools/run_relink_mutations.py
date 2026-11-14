@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CACHE = 'crates/runtime/src/cache.rs'
 HOST = 'crates/host/src/execution.rs'
 SOURCES = (CACHE, HOST)
-NEW = 'cr3-relink,relink-smc,relink-dead-source,relink-stale,relink-held,relink-global,relink-many,relink-reclaim,relink-invlpg,relink-global-many'
+NEW = 'relink-rot0,relink-rot1,relink-rot2,relink-rot3,cr3-relink,relink-smc,relink-dead-source,relink-stale,relink-held,relink-global,relink-many,relink-reclaim,relink-invlpg,relink-global-many'
 
 # name: ([(file, old, new)], programs that must go red, link-check resident?)
 MUTATIONS = {
@@ -44,7 +44,7 @@ MUTATIONS = {
     'relink-disabled': ([(CACHE, 'if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);', 'if false && block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);')], 'cr3-relink', False),
     'relink-skips-cursor-fix': ([(CACHE, '        if *follow == last as u32 + 1 {\n            *follow = i as u32 + 1;\n        }', ''),
                                  (CACHE, '            if *follow == end as u32 + 1 {\n                *follow = last as u32 + 1;\n            }', '')], 'relink-many,relink-global-many', False),
-    'relink-moves-with-insert': ([(CACHE, 'resume(i, r, global, &mut at);', 'remove(i, SUSP, &mut at);\n        insert(LinkRecord { prev_in: 0, next_in: 0, ..r }, if global { TLB } else { CR3 });')], 'relink-many', False),
+    'relink-moves-with-insert': ([(CACHE, 'resume(i, r, global, &mut at);', 'remove(i, SUSP, &mut at);\n        insert(LinkRecord { prev_in: 0, next_in: 0, ..r }, if global { TLB } else { CR3 });')], 'relink-many,relink-rot0,relink-rot1,relink-rot2,relink-rot3', False),
     'host-rule-unlinked-only': ([(HOST, '} else if !admitted && !held {', '} else if !admitted {')], 'relink-held', False),
     # ---- the batch (step 1's synchronization, now `suspend`'s): a word left unrestored goes unnoticed until a link is taken
     'suspend-skips-last-word': ([(CACHE, '    for i in from..to {\n        let r = unsafe { record(i as usize).read() };\n        // (A suspended record is named', '    for i in from..to.saturating_sub(1) {\n        let r = unsafe { record(i as usize).read() };\n        // (A suspended record is named')], 'cr3-relink,relink-many', False),

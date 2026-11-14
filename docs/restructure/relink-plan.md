@@ -267,3 +267,12 @@ differences and findings:
 - Reclaim: `drop_suspended` first; `prune(LOCAL, true)` and `unlink_all` only while more than 3/4 remains.
 - `link()` counts `relinked` beside links made in `link-full`'s reclaim bound (`run_k1.py`).
 - The relink walk halts `BAD_LINK` if a stop is armed (a tripwire: no resident path that arms returns into `lookup`).
+- `drop_suspended`'s records count toward `reclaimed` (with those `prune` and `unlink_all` undo); `link-full`'s bound counts relinks
+  as links made.
+- Review additions: `relink` halts BAD_LINK if the record's point does not carry the block's RIP or the record's offset; under
+  `link-check` `suspend` halts if a record's target is current, `unlink_outbound` halts if a slot names a suspended record, and
+  `check_out_slots` audits every block's out slots and every live record's naming at both ends of each TLB event. The host check finds
+  the point by `r.point()` and checks the pairing (RIP, context, absolute source, non-instance target).
+- `relink-moves-with-insert` is red with `relink-rot0..3`: the cursor goes stale only when V is non-global, V's local record is the
+  last of the local segment and follows a suspended record on V's list, with a non-empty TLB segment; each one-shot insert rotates the
+  local segment, so the four programs sweep its position (a defect `relink-many`, with S first of the local segment, cannot show).

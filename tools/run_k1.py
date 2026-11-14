@@ -1360,7 +1360,13 @@ EXPECT_FAULT_AT = {'fa-ro': (FARO, 7)}
 # site into V's block is non-local (V's page is not the site's), so a CR3 load suspends it and the next revalidation of V's block
 # relinks it. Each program ends in a guest #PF (a load from a page no table maps) before the body's restore, so its last state
 # (records still suspended, or live) is what the host's link check sees; `cr3-relink` ends normally after a flush.
-RELINK_PROGRAMS = ('cr3-relink', 'relink-smc', 'relink-dead-source', 'relink-stale', 'relink-held', 'relink-global', 'relink-many', 'relink-reclaim', 'relink-invlpg', 'relink-global-many')
+# `relink-rot0` ... `relink-rot3` (the local segment's rotation): `relink-many` with one local site S, after RROT one-shot links from other pages
+# into a non-global block Z, each of which rotates the local segment by one (an insert moves its first record to its end). Round 2's walk then
+# meets S, with a suspended record before it on V's list, as the first, the last ... record of the local segment in turn. S at the local
+# segment's last place is where a record move that goes through `remove` then `insert` leaves the cursor on a slot another target's record
+# takes (the TLB segment is not empty: G1 -> W).
+RELINK_ROT = ('relink-rot0', 'relink-rot1', 'relink-rot2', 'relink-rot3')
+RELINK_PROGRAMS = ('cr3-relink', 'relink-smc', 'relink-dead-source', 'relink-stale', 'relink-held', 'relink-global', 'relink-many', 'relink-reclaim', 'relink-invlpg', 'relink-global-many', *RELINK_ROT)
 RJ1, RJ2, RW, RG1, RS = 0x9000, 0xa000, 0xb000, 0xc000, 0x100   # site pages, W (global target), G1's page; S on V's page
 RZ, RZS = 0xd000, 0xe000                                      # `relink-global-many`: Z (non-global, `mov eax, 7`) and its two sites
 RNS, RSEP = 6, 2                                              # `relink-many`: local jump sites S, one after every RSEP sites
@@ -1385,8 +1391,13 @@ def relink_bodies(k, i, n):
     # RM sites, with RNS S (local jumps on V's page) between them in A only: their records are the first walk's live records in the middle of V's
     # inbound list, and some are first of the local segment when the cursor is on them (a cursor on such a record must survive the move of the
     # record before it: a record move that shifts the first record of a later segment would leave it stale).
-    sites_and_s = lambda reg, s_reg: ''.join(run(RSITE(d, j), reg) + (run(d + RS + 0x40 * (j // RSEP), s_reg) if s_reg and j % RSEP == RSEP - 1 and j // RSEP < RNS else '')
-                                             for j in range(RM))
+    sites_and_s = lambda reg, s_reg, ns=RNS, sep=RSEP: ''.join(
+        run(RSITE(d, j), reg) + (run(d + RS + 0x40 * (j // sep), s_reg) if s_reg and j % sep == sep - 1 and j // sep < ns else '') for j in range(RM))
+    # `relink-rotF`: round 1, F one-shot links into Z from other pages (in B: Z is the same frame in both spaces), then the rounds 2 .. K.
+    def rot(f):
+        a_round = lambda: cr3(0) + sites_and_s('r8', 'r12', 1, 8) + cr3(1) + sites_and_s('r9', None) + run(d + RG1, 'r10')   # (fresh call labels each time)
+        return (pge(True) + set_(d + RG1, 'r11') + '    xor r10d, r10d\n' + a_round() + ''.join(run(d + RZS + 0x100 * q, 'rsi') for q in range(f))
+                + f'    mov ecx, {k - 1}\n.l:\n' + a_round() + '    dec ecx\n    jnz .l\n' + RELINK_END)
     rr_loop = lambda reg: (f'    mov rbx, {d + RJ1:#x}\n    mov ecx, {RR}\n.r{reg}:\n    lea r13, [rel .e{reg}]\n    jmp rbx\n.e{reg}:\n    add {reg}, rax\n'
                            '    add rbx, 8\n    dec ecx\n    jnz .r' + reg + '\n')
     rounds = lambda body: f'    mov ecx, {k}\n.l:\n' + body + '    dec ecx\n    jnz .l\n'
@@ -1430,6 +1441,7 @@ def relink_bodies(k, i, n):
         'relink-many': (pge(True) + set_(d + RG1, 'r11') + '    xor r10d, r10d\n'
                         + rounds(cr3(0) + sites_and_s('r8', 'r12') + cr3(1) + sites_and_s('r9', None) + run(d + RG1, 'r10'))
                         + RELINK_END),
+        **{f'relink-rot{f}': rot(f) for f in range(len(RELINK_ROT))},
     }
 
 
@@ -1446,11 +1458,13 @@ def relink_memory(name, i):
     if name == 'relink-global-many':
         out = [mem(RSITE(d, j), to_v(RSITE(d, j))) for j in range(RM)]
         out += [mem(d + RZ, CODE(7))] + [mem(d + RZS + 0x100 * q, JMP(d + RZS + 0x100 * q, d + RZ)) for q in range(2)]
-    if name == 'relink-many':
+    if name == 'relink-many' or name in RELINK_ROT:
         out = [mem(RSITE(d, j), to_v(RSITE(d, j))) for j in range(RM)]
         # S on V's page in both frames (a local link into V's block); W (global) and G1 (`jmp W`, not global).
-        out += [mem(d + F1 + RS + 0x40 * q, JMP(d + RS + 0x40 * q, d)) for q in range(RNS)]
+        out += [mem(d + F1 + RS + 0x40 * q, JMP(d + RS + 0x40 * q, d)) for q in range(RNS if name == 'relink-many' else 1)]
         out += [mem(d + RW, CODE(9)), mem(d + RG1, JMP(d + RG1, d + RW))]
+    if name in RELINK_ROT:
+        out += [mem(d + RZ, CODE(7))] + [mem(d + RZS + 0x100 * q, JMP(d + RZS + 0x100 * q, d + RZ)) for q in range(len(RELINK_ROT))]
     return out
 
 
@@ -1458,7 +1472,7 @@ def relink_tables(name, i):
     d = P.SYS_D(i)
     if name == 'relink-global-many':
         return {d: (d + F1) | P.LEAF | G}, {}
-    if name != 'relink-many':
+    if name != 'relink-many' and name not in RELINK_ROT:
         return {}, {}
     g = (d + RW) | P.LEAF | G
     return {d + RW: g}, {d + RW: g}
@@ -1476,6 +1490,7 @@ RELINK_VALUES = {
     'relink-global-many': lambda i, k: {'r8': {RM * k}, 'r9': {14 * k}},
     'relink-reclaim': {'r8': {RR}, 'r9': {2 * RR}, 'r10': {2 * RR}},
     'relink-many': lambda i, k: {'r8': {RM * k}, 'r9': {2 * RM * k}, 'r10': {9 * k}, 'r12': {RNS * k}},
+    **{f'relink-rot{f}': (lambda i, k, f=f: {'r8': {RM * k}, 'r9': {2 * RM * k}, 'r10': {9 * k}, 'r12': {k}, 'rsi': {7 * f}}) for f in range(len(RELINK_ROT))},
 }
 # Least counts of k1.relink fields: relinked, relink_dropped, suspended, links_susp (the suspended segment's length at the end).
 RELINK_LEAST = {
@@ -1485,7 +1500,8 @@ RELINK_LEAST = {
     'relink-stale': {'relinked': 1, 'relink_dropped': 1},
     'relink-held': {'relinked': 1, 'links_susp': 1},
     'relink-global': {'relinked': 1, 'suspended': 1},
-    'relink-many': {'relinked': lambda k: 2 * RM * (k - 1), 'links_susp': 1},   # (every site of every round but the first)
+    'relink-many': {'relinked': lambda k: 2 * RM * (k - 1), 'links_susp': 1},
+    **{n: {'relinked': lambda k: 2 * RM * (k - 1), 'links_susp': 1} for n in RELINK_ROT},   # (every site of every round but the first)
     'relink-reclaim': {'suspended': RR},
     'relink-invlpg': {'suspended': 2},
     'relink-global-many': {'relinked': lambda k: (RM + 2) * (k - 1)},
