@@ -672,6 +672,8 @@ pub mod cache {
         /// K1 `link-full` only (the host's `NATEMU_LINK_CAP`, set before the vCPU runs): the link record area's capacity
         /// ([`link_cap`]); 0: [`MAX_LINKS`]. Appended.
         pub link_cap: u64,
+        /// CTR_EL0, read once by the resident at start-up (`cache::read_ctr_el0`) for code synchronization. Appended.
+        pub ctr_el0: u64,
     }
     /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
     pub const L1_EVICTED: usize = 0;

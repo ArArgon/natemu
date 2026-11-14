@@ -106,6 +106,7 @@ fn halt(s: &State, reason: u64) -> ! {
 
 pub unsafe fn start() -> ! {
     crate::perf::start();
+    cache::read_ctr_el0();
     // The entry frame's fields `enter` never writes are zero ([`enter`]).
     unsafe { (*shared()).initial = NativeFrame::ZERO };
     let mut s = unsafe { load() };
