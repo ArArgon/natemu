@@ -208,8 +208,8 @@ def launch(cmd, work, phase, host, limit):
                     pending += data; *lines, pending = pending.split(b'\n')
                     for line in lines:
                         if b'IO5 ' in line:   # a terminal escape can precede the first marker after the command line
-                            text = line[line.index(b'IO5 '):].decode(errors='replace').strip()
-                            stamps.write(f'{time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)}\t{text}\n'); stamps.flush()
+                            marker = line[line.index(b'IO5 '):].decode(errors='replace').strip()
+                            stamps.write(f'{time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)}\t{marker}\n'); stamps.flush()
             buf = b''; os.write(master, text.encode())
         while p.poll() is None and time.time() < deadline:
             if select.select([master], [], [], 1)[0]:
