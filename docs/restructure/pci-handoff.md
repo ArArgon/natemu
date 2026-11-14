@@ -44,10 +44,11 @@ Not yet evidenced:
   taken on the boot-and-disk workload instead) and "depth-1 I/O at 1 vCPU at the MMIO rate or better" (a quick `dd`
   comparison was inconclusive);
 - the full suite on this branch;
-- the runners' PCI mode on VMs after their last two commits (4eec359 and the fix after it). The suite's steps
-  `net-linux-pci` and `io-coverage-pci` cover the network and coverage runners only. `run_virtio_block.py` and
-  `run_io_matrix.py` are not suite steps and must be run by hand in both modes: 4eec359 broke `run_virtio_block.py run`
-  (a variable used before assignment, in both modes); the fix is verified only as far as reaching the VM lock;
+- the network, coverage and matrix runners' PCI mode on VMs after their last two commits (4eec359 and the fix after
+  it). The suite's steps `net-linux-pci` and `io-coverage-pci` cover the network and coverage runners;
+  `run_io_matrix.py` is exercised by the benchmark below. `run_virtio_block.py` is not a suite step: 4eec359 broke its
+  `run` (a variable used before assignment, in both modes); after the fix it passes write and verify at 2 vCPUs in
+  PCI and in MMIO mode (`pci-accept-20261113-01/final-block-{pci,mmio}-n2`), 1 and 4 vCPUs not rerun;
 - a guest other than Linux.
 
 Raw evidence, outside the repository (this machine's `natemu-raw/`): `pci-smoke-20261113-01/` (the hand boots and the
