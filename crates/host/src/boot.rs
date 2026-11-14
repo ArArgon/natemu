@@ -12,6 +12,7 @@
 //! size of high RAM `H` above 4 GiB ([`Layout`]); M1 grows guest RAM, L2 places the ACPI tables in the NVS range and
 //! passes the tables built by [`acpi`] ([`Inputs::acpi`]), X4 uses the NVS boot-service scratch. The independent judge of the result is
 //! `tools/models/bootproto.py` (`tools/run_l1.py`).
+use crate::pci::platform::WINDOW;
 use natemu_abi::execution::{self as exec, Cpu, Segment, Table};
 use natemu_abi::guest_memory::GuestRam;
 use std::fmt;
@@ -282,6 +283,9 @@ pub struct E820 {
 pub struct Layout {
     pub low_end: u64,
     pub high: u64,
+    /// Some device is on the PCI bus: the bus's memory window ([`crate::pci::platform::WINDOW`]) is then absent from
+    /// the map instead of reserved in it (on a PC the window is the hole below 4 GiB, not a reserved range).
+    pub pci: bool,
 }
 /// Start of ordinary low RAM: the kernel's window lies above it (M69 "K >= 16 MiB").
 pub(crate) const RAM_START: u64 = 16 * MIB;
@@ -304,6 +308,7 @@ impl Layout {
     pub const DEFAULT: Layout = Layout {
         low_end: 2 * GIB,
         high: 0,
+        pci: false,
     };
     /// The E820 table (sorted, disjoint): RAM and NVS where they exist, reserved for the holes.
     pub fn e820(&self) -> Result<Vec<E820>, LoadError> {
@@ -333,8 +338,20 @@ impl Layout {
             e(ACPI_NVS.0, ACPI_NVS.1, E820_NVS),
             e(SCRATCH_NVS.0, SCRATCH_NVS.1, E820_NVS),
             e(RAM_START, l, E820_RAM),
-            e(l, 4 * GIB, E820_RESERVED), // non-RAM aperture (IOAPIC, LAPIC, virtio windows)
         ];
+        // The non-RAM aperture (IOAPIC, LAPIC, virtio windows); with PCI it is split around the bus's window.
+        if self.pci {
+            let (w0, w1) = (u64::from(WINDOW.0), u64::from(WINDOW.1));
+            if l >= w0 {
+                return Err(LoadError::BadLayout(format!(
+                    "low RAM end {l:#x} reaches the PCI window at {w0:#x}"
+                )));
+            }
+            map.push(e(l, w0, E820_RESERVED));
+            map.push(e(w1, 4 * GIB, E820_RESERVED));
+        } else {
+            map.push(e(l, 4 * GIB, E820_RESERVED));
+        }
         if self.high > 0 {
             map.push(e(4 * GIB, 4 * GIB + self.high, E820_RAM));
         }
@@ -676,6 +693,7 @@ pub(crate) mod tests {
     const SMALL: Layout = Layout {
         low_end: 64 * MIB,
         high: 0,
+        pci: false,
     };
     fn ram(bytes: u64) -> (Vec<u64>, GuestRam) {
         let mut v = vec![0u64; bytes as usize / 8];
@@ -792,7 +810,8 @@ pub(crate) mod tests {
             bad(
                 Layout {
                     low_end: RAM_START,
-                    high: 0
+                    high: 0,
+                    pci: false,
                 },
                 inputs(&ok, "", None)
             )
@@ -803,7 +822,8 @@ pub(crate) mod tests {
             bad(
                 Layout {
                     low_end: 3 * GIB + 2 * MIB,
-                    high: 0
+                    high: 0,
+                    pci: false,
                 },
                 inputs(&ok, "", None)
             )
@@ -814,7 +834,8 @@ pub(crate) mod tests {
             bad(
                 Layout {
                     low_end: 33 * MIB,
-                    high: 0
+                    high: 0,
+                    pci: false,
                 },
                 inputs(&ok, "", None)
             )
@@ -825,7 +846,8 @@ pub(crate) mod tests {
             bad(
                 Layout {
                     low_end: 64 * MIB,
-                    high: MIB
+                    high: MIB,
+                    pci: false,
                 },
                 inputs(&ok, "", None)
             )
@@ -836,7 +858,8 @@ pub(crate) mod tests {
             bad(
                 Layout {
                     low_end: 128 * MIB,
-                    high: 0
+                    high: 0,
+                    pci: false,
                 },
                 inputs(&ok, "", None)
             ),
@@ -950,7 +973,8 @@ pub(crate) mod tests {
             bad(
                 Layout {
                     low_end: 64 * MIB,
-                    high: 1 << 40
+                    high: 1 << 40,
+                    pci: false,
                 },
                 inputs(&ok, "", None)
             )
@@ -982,6 +1006,7 @@ pub(crate) mod tests {
         let high = Layout {
             low_end: GIB,
             high: 2 * GIB,
+            pci: false,
         }
         .e820()
         .unwrap();
@@ -994,6 +1019,64 @@ pub(crate) mod tests {
                 kind: E820_RAM
             }
         );
+    }
+
+    /// With PCI the reserved aperture is split around the bus window, which is listed nowhere; nothing else changes.
+    #[test]
+    fn pci_map_leaves_the_window_unlisted_and_stays_sorted() {
+        let (w0, w1) = (u64::from(WINDOW.0), u64::from(WINDOW.1));
+        for (low_end, high) in [(2 * GIB, 0), (3 * GIB, 0), (GIB, 2 * GIB)] {
+            let plain = Layout {
+                low_end,
+                high,
+                pci: false,
+            }
+            .e820()
+            .unwrap();
+            let map = Layout {
+                low_end,
+                high,
+                pci: true,
+            }
+            .e820()
+            .unwrap();
+            assert!(
+                map.windows(2).all(|w| w[0].addr + w[0].size <= w[1].addr),
+                "sorted and disjoint"
+            );
+            assert!(
+                map.iter().all(|e| e.addr + e.size <= w0 || e.addr >= w1),
+                "the window is unlisted"
+            );
+            let ends = |m: &[E820]| m.iter().find(|e| e.addr == low_end).copied().unwrap();
+            assert_eq!(
+                (ends(&map).size, ends(&map).kind),
+                (w0 - low_end, E820_RESERVED)
+            );
+            assert_eq!(
+                map.iter().find(|e| e.addr == w1).copied().unwrap(),
+                E820 {
+                    addr: w1,
+                    size: 4 * GIB - w1,
+                    kind: E820_RESERVED
+                }
+            );
+            // Everything but the aperture's split is as without PCI.
+            let rest = |m: &[E820]| {
+                m.iter()
+                    .filter(|e| e.addr < low_end || e.addr >= 4 * GIB)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(rest(&map), rest(&plain));
+        }
+        // A low RAM end reaching the window is refused, not overlapped.
+        let bad = Layout {
+            low_end: u64::from(WINDOW.0),
+            high: 0,
+            pci: true,
+        };
+        assert!(bad.e820().is_err());
     }
 
     /// Image values in "write" fields never reach the zero page.
