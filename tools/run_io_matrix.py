@@ -6,7 +6,7 @@ the four of rand-read-4k-4jobs-q16, share CPU 1; with 1 vCPU nothing is pinned):
 IRQ's vCPU and rates fell by half (docs/restructure/io-benchmarks.md).
 With --transport pci (natemu only) the disk's queue vectors are kernel-managed and refuse affinity writes, so nothing is
 pinned: the guest reads the queue vector's effective_affinity_list, records that CPU as the interrupt vCPU and keeps fio
-off it (prepare a fresh --inputs with this version; the guest script lives in the image).
+off it (the guest script lives in the image: use inputs from `prepare --transport pci`).
 prepare/self-check never run a VM. run owns one fresh main/read-only-restart pair,
 600/120 seconds, no retry. Whole-system measurements, not isolated SSD numbers.
 """
@@ -25,7 +25,7 @@ import time
 
 import run_fio_admission as admission
 import run_fio_baselines as baselines
-from io_common import PCI_PROBE, pci_errors
+from io_common import PCI_PROBE, patch, pci_errors, pci_self_test
 
 block = admission.block
 digest, write_json, checked = admission.digest, admission.write_json, admission.checked
@@ -87,10 +87,10 @@ export_logs() {
 drain_console() { console_mode=$(/bin/busybox stty -F /dev/console -g) && /bin/busybox stty -F /dev/console "$console_mode"; }
 fail() { echo "IO-MATRIX-FAIL $*"; export_logs; dmesg; drain_console || true; poweroff -f; while :; do sleep 1; done; }
 mark() { read up rest < /proc/uptime; echo "IO-MATRIX-MARK name=$1 uptime=$up"; }
-@PCI_PROBE@mount -t tmpfs tmpfs /tmp || fail tmpfs
+mount -t tmpfs tmpfs /tmp || fail tmpfs
 mkdir /tmp/matrix || fail logs
-phase= transport=mmio
-for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; io_transport=*) transport=${item#*=};; esac; done
+phase=
+for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; esac; done
 case "$phase" in write) mode=rw;; verify) mode=ro;; *) fail phase;; esac
 echo "IO-MATRIX-BEGIN phase=$phase cpus=$(nproc) kernel=$(uname -r)"
 rootinfo=$(awk '$2 == "/" {print $1, $3, $4}' /proc/mounts)
@@ -98,26 +98,13 @@ case "$rootinfo" in "/dev/vda ext4 $mode,"*) ;; *) fail "root=$rootinfo";; esac
 echo "IO-MATRIX-ROOT $rootinfo"
 mark mounted-root
 fiopin=
-if test "$transport" = pci; then
-  # The first queue vector of the disk (virtio-blk names it virtioN-req.0); the kernel chose its CPU, read it back.
-  irq=$(awk '/PCI-MSIX.*virtio[0-9]+-req/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
-  test -n "$irq" || fail virtio-irq
-  if test "$(nproc)" -gt 1; then
-    eff=$(cat /proc/irq/$irq/effective_affinity_list) || fail irq-effective-affinity
-    list= c=0
-    while test $c -lt $(nproc); do test $c = "$eff" || list="$list,$c"; c=$((c+1)); done
-    fiopin="/bin/busybox taskset -c ${list#,}"
-  fi
-  pci_probe
-else
-  irq=$(awk '/virtio/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
-  test -n "$irq" || fail virtio-irq
-  if test "$(nproc)" -gt 1; then
-    fiopin="/bin/busybox taskset -c 1-$(($(nproc) - 1))"
-    echo 1 > /proc/irq/$irq/smp_affinity || fail irq-affinity
-  fi
+irq=$(awk '/virtio/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
+test -n "$irq" || fail virtio-irq
+if test "$(nproc)" -gt 1; then
+  fiopin="/bin/busybox taskset -c 1-$(($(nproc) - 1))"
+  echo 1 > /proc/irq/$irq/smp_affinity || fail irq-affinity
 fi
-echo "IO-MATRIX-PIN irq=$irq irq_affinity=$(if test "$transport" = pci; then cat /proc/irq/$irq/effective_affinity_list; else cat /proc/irq/$irq/smp_affinity_list; fi) fio=${fiopin:-none}"
+echo "IO-MATRIX-PIN irq=$irq irq_affinity=$(cat /proc/irq/$irq/smp_affinity_list) fio=${fiopin:-none}"
 test "$(cat /sys/block/vda/size)" = 4194304 || fail capacity
 test "$(cat /sys/block/vda/queue/logical_block_size)" = 512 || fail sector
 test "$(basename "$(readlink -f /sys/block/vda/device/driver)")" = virtio_blk || fail driver
@@ -178,7 +165,33 @@ echo "IO-MATRIX-PASS phase=$phase"
 drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
-'''.replace('@WORKLOADS@', ' '.join(WORKLOADS)).replace('@PCI_PROBE@', PCI_PROBE.replace('@P@', 'IO-MATRIX'))
+'''.replace('@WORKLOADS@', ' '.join(WORKLOADS))
+OLD_PIN = r'''irq=$(awk '/virtio/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
+test -n "$irq" || fail virtio-irq
+if test "$(nproc)" -gt 1; then
+  fiopin="/bin/busybox taskset -c 1-$(($(nproc) - 1))"
+  echo 1 > /proc/irq/$irq/smp_affinity || fail irq-affinity
+fi
+echo "IO-MATRIX-PIN irq=$irq irq_affinity=$(cat /proc/irq/$irq/smp_affinity_list) fio=${fiopin:-none}"
+'''
+NEW_PIN = r'''# The disk's first queue vector (virtio-blk names it virtioN-req.0): its queue vectors are kernel-managed and refuse affinity
+# writes, so read the CPU the kernel chose and keep fio on every other CPU.
+irq=$(awk '/PCI-MSIX.*virtio[0-9]+-req/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
+test -n "$irq" || fail virtio-irq
+if test "$(nproc)" -gt 1; then
+  eff=$(cat /proc/irq/$irq/effective_affinity_list) || fail irq-effective-affinity
+  list= c=0
+  while test $c -lt $(nproc); do test $c = "$eff" || list="$list,$c"; c=$((c+1)); done
+  fiopin="/bin/busybox taskset -c ${list#,}"
+fi
+pci_probe
+echo "IO-MATRIX-PIN irq=$irq irq_affinity=$(cat /proc/irq/$irq/effective_affinity_list) fio=${fiopin:-none}"
+'''
+# --transport pci: see the module docstring. INIT, the default, is unchanged.
+INIT_PCI = patch(INIT, [
+    ('mark() { read up rest < /proc/uptime; echo "IO-MATRIX-MARK name=$1 uptime=$up"; }\n',
+     'mark() { read up rest < /proc/uptime; echo "IO-MATRIX-MARK name=$1 uptime=$up"; }\n' + PCI_PROBE.replace('@P@', 'IO-MATRIX')),
+    (OLD_PIN, NEW_PIN)])
 
 
 def prepare(args):
@@ -188,7 +201,7 @@ def prepare(args):
     shutil.copytree(args.block_inputs / 'rootfs', root, symlinks=True)
     shutil.copytree(args.fio_prep / 'rootfs', root, symlinks=True, dirs_exist_ok=True)
     if digest(root / 'bin/busybox') != pin['rootfs']['bin/busybox']['sha256']: raise ValueError('BusyBox overwritten')
-    (root / 'sbin/init').write_text(INIT); (root / 'sbin/init').chmod(0o755)
+    (root / 'sbin/init').write_text(INIT_PCI if args.transport == 'pci' else INIT); (root / 'sbin/init').chmod(0o755)
     (root / 'bench').mkdir(); (root / 'fio/profiles').mkdir(parents=True)
     for name in PROFILES: (root / 'fio/profiles' / (name + '.fio')).write_text(profile_text(name))
     elf = json.loads((args.fio_prep / 'elf-closure.json').read_text())
@@ -367,13 +380,13 @@ def run(args):
         if not version.startswith('QEMU emulator version 11.1.2'): raise ValueError('QEMU version differs')
     pci = args.transport == 'pci'
     if pci and args.backend != 'natemu': raise ValueError('--transport pci is a natemu option')
-    if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise ValueError('--transport pci needs inputs prepared by this version')
+    if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise ValueError('--transport pci needs inputs from prepare --transport pci')
     args.out.mkdir(parents=True, exist_ok=False)
-    write_json(args.out / 'manifest.json', {'backend': args.backend, 'cpus': args.cpus, 'transport': args.transport, 'artifacts': artifacts,
+    write_json(args.out / 'manifest.json', {'backend': args.backend, 'cpus': args.cpus, **({'transport': 'pci'} if pci else {}), 'artifacts': artifacts,
         'input_manifest': {'path': str(args.inputs / 'inputs.json'), 'sha256': digest(args.inputs / 'inputs.json')},
         'oracle_sources': {str(p.resolve()): digest(p) for p in SOURCES},
         'bounds': {'vm_launches': 2, 'main_seconds': 600, 'verify_seconds': 120, 'log_bytes_per_vm': 32 << 20},
-        'differences': ['natemu MMIO/one native active request; QEMU PCI/threads backend', 'natemu F_FULLFSYNC versus QEMU fsync',
+        'differences': ['natemu ' + ('PCI MSI-X' if pci else 'MMIO') + '/one native active request; QEMU PCI/threads backend', 'natemu F_FULLFSYNC versus QEMU fsync',
                         'CRC32C on reads and writes: checksum-verified whole-system workload rates, not raw device rates',
                         'same guest files, fio jobs and ext4; no host cache purge; whole-system results, not pure disk scores']})
     results, persisted = [], None
@@ -384,7 +397,7 @@ def run(args):
         if digest(image) != pin['outputs']['root.raw']: raise ValueError('clone differs')
         for phase in ('write', 'verify'):
             case = args.out / phase; case.mkdir(); before = digest(image)
-            cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng=0' + (' io_transport=pci' if pci else '')
+            cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng=0'
             if args.backend == 'natemu':
                 command = [str(binary), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.inputs / 'linux'),
                     '--initrd', str(args.inputs / 'bootstrap.cpio'), '--disk', str(image), '--vcpus', str(args.cpus), '--ram', '2G',
@@ -481,7 +494,8 @@ def self_check():
                 bad = copy.deepcopy(good); bad['jobs'][0]['sync']['total_ios'] = value; assert fio_result(bad, profile); count += 1
                 bad = copy.deepcopy(good); bad['jobs'][0]['sync']['lat_ns']['N'] = value; assert fio_result(bad, profile); count += 1
     with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / 'init'; p.write_text(INIT); subprocess.run(['/bin/sh', '-n', str(p)], check=True)
+        p = Path(d) / 'init'; pci_self_test()
+        for script in (INIT, INIT_PCI): p.write_text(script); subprocess.run(['/bin/sh', '-n', str(p)], check=True)
     for phase in ('write', 'verify'):
         for cpus in (1, 2, 4):
             text = sample_serial(phase, cpus)
@@ -511,6 +525,7 @@ def main():
     sub.add_parser('self-check')
     a = sub.add_parser('prepare')
     for n in ('fio-prep', 'block-inputs', 'out'): a.add_argument('--' + n, type=Path, required=True)
+    a.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='pci: an image whose init has the PCI probe (required by run --transport pci)')
     a = sub.add_parser('run'); a.add_argument('--backend', choices=('natemu', 'qemu'), required=True)
     a.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='natemu virtio transport (--virtio-transport)')
     a.add_argument('--cpus', type=int, choices=(1, 2, 4), required=True)

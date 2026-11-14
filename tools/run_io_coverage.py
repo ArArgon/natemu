@@ -61,7 +61,7 @@ import zlib
 
 from io_common import ROOT, VM_LOCK, digest, stop_group, write_json
 from raw_root import RAW_ROOT
-from io_common import PCI_PROBE, pci_errors
+from io_common import PCI_PROBE, patch, pci_errors, pci_self_test
 from run_virtio_block import checked
 from run_virtio_rng import KVER
 
@@ -98,8 +98,8 @@ fail() { echo "COV-FAIL $*"; dmesg | tail -n 60; drain_console; poweroff -f; whi
 mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount -t devtmpfs devtmpfs /dev || poweroff -f
 exec </dev/console >/dev/console 2>&1
 mount -t tmpfs tmpfs /tmp || fail tmpfs
-@PCI_PROBE@case= phase= transport=mmio
-for item in $(cat /proc/cmdline); do case "$item" in cov_case=*) case=${item#*=};; cov_phase=*) phase=${item#*=};; cov_transport=*) transport=${item#*=};; esac; done
+case= phase=
+for item in $(cat /proc/cmdline); do case "$item" in cov_case=*) case=${item#*=};; cov_phase=*) phase=${item#*=};; esac; done
 echo "COV-BEGIN case=$case phase=$phase cpus=$(nproc) kernel=$(uname -r)"
 for module in virtio_mmio virtio_blk crc32c_generic ext4; do modprobe "$module" || fail "module-$module"; done
 wait_dev() { n=0; while test ! -b "$1" && test $n -lt 100; do sleep 0.1; n=$((n+1)); done; test -b "$1" || fail "no-$1"; }
@@ -142,7 +142,6 @@ reboot-*)
     mount -t ext4 /dev/vda /m1 || fail mount
     cp /fixtures/a.bin /m1/a.bin && sync || fail write
     echo "COV-DATA a=$(sha /m1/a.bin)"
-    if test "$transport" = pci; then pci_probe; fi
     echo COV-REBOOT
     drain_console
     reboot -f
@@ -205,7 +204,6 @@ host-limit)
   echo "COV-READ a=$(rsha 65536 0 16) b2=$(rsha 65536 32 16) b3=$(rsha 65536 48 16) prefix=$(rsha 2048 16384 1) tail=$(rsha 2048 16385 31) above=$(rsha 65536 600 16)";;
 *) fail case;;
 esac
-if test "$transport" = pci; then pci_probe; fi
 echo "COV-ERRORS ioerr_logs=$(ioerrs) fs_errors=$(dmesg | grep -c 'EXT4-fs error')"
 echo COV-DMESG-BEGIN
 dmesg
@@ -214,7 +212,12 @@ echo "COV-PASS case=$case phase=$phase"
 drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
-'''.replace('@PCI_PROBE@', PCI_PROBE.replace('@P@', 'COV'))
+'''
+# --transport pci: the PCI probe before the error summary (and before the deliberate reboot). INIT, the default, is unchanged.
+INIT_PCI = patch(INIT, [
+    ('case= phase=\n', PCI_PROBE.replace('@P@', 'COV') + 'case= phase=\n'),
+    ('    echo COV-REBOOT\n', '    pci_probe\n    echo COV-REBOOT\n'),
+    ('echo "COV-ERRORS ioerr_logs', 'pci_probe\necho "COV-ERRORS ioerr_logs')])
 
 
 def pattern(label, size):
@@ -283,7 +286,7 @@ def sparse_copy(src, dst):
             if block.count(0) != len(block): os.pwrite(o.fileno(), block, at)
 
 
-def prepare(out, inputs):
+def prepare(out, inputs, transport='mmio'):
     """Kernel, initramfs and the base images in OUT; returns the manifest."""
     out.mkdir(parents=True)
     manifest = json.loads((inputs / 'inputs.json').read_text())
@@ -297,7 +300,7 @@ def prepare(out, inputs):
     for d in ('m1', 'm2', 'fixtures'): (tree / d).mkdir()
     a, b, p = fixtures()
     (tree / 'fixtures/a.bin').write_bytes(a); (tree / 'fixtures/b.bin').write_bytes(b)
-    (tree / 'init').write_text(INIT); (tree / 'init').chmod(0o755)
+    (tree / 'init').write_text(INIT_PCI if transport == 'pci' else INIT); (tree / 'init').chmod(0o755)
     spec = importlib.util.spec_from_file_location('mkcpio', ROOT / 'tools/play/mkcpio.py')
     mkcpio = importlib.util.module_from_spec(spec); spec.loader.exec_module(mkcpio)
     mkcpio.main(str(tree), str(out / 'initramfs.cpio'))
@@ -434,8 +437,7 @@ def launch(args, case, phase, image, work, limit):
     command = [str(args.natemu), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.prepared / 'linux'),
                '--initrd', str(args.prepared / 'initramfs.cpio'), '--disk', str(image), '--vcpus', '2', '--ram', '1G',
                '--compile-cache', 'off', '--serial', str(work / 'serial.log'), '--cmdline',
-               f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case={case} cov_phase={phase}' + EXTRA.get(case, '')
-               + (' cov_transport=pci' if args.transport == 'pci' else '')]
+               f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case={case} cov_phase={phase}' + EXTRA.get(case, '')]
     if args.transport == 'pci': command += ['--virtio-transport', 'pci']
     write_json(work / 'command.json', {'command': command, 'rlimit_fsize': limit})
     def limited():
@@ -512,7 +514,7 @@ def run(args):
         from run_boot_smoke import build
         args.natemu, args.runtime = build()
     args.fexc = Path(args.fexc).resolve(strict=True)
-    inputs = prepare(args.out / 'prepared', args.inputs)
+    inputs = prepare(args.out / 'prepared', args.inputs, args.transport)
     args.prepared, args.e2fsck = args.out / 'prepared', Path(inputs['e2fsck'])
     write_json(args.out / 'manifest.json', {'cases': args.cases, 'seconds_per_vm': 120, 'source_root': str(ROOT),
                'artifacts': {str(p): digest(p) for p in (args.natemu, args.runtime, args.fexc, Path(__file__))}, 'inputs': inputs})
@@ -599,8 +601,9 @@ def self_check():
     host = {'rc': 0, 'timeout': False, 'stop': POWEROFF[0], 'changed': False, 'fsck': [0] * len(ext4_offsets('gpt')), 'table': True, 'exact': None, 'backend_errors': []}
     assert not judge('gpt', 'verify', good, host, expect, True), judge('gpt', 'verify', good, host, expect, True)
     assert judge('gpt', 'verify', text('gpt', 'verify'), host, expect, True)
-    for old, new in (('0x1042', '0x1041'), ('161', '0'), ('COV-PCI-END', 'COV-PCI-DMESG pci: Cannot find an available gap\nCOV-PCI-END')):
-        assert judge('gpt', 'verify', good.replace(old, new), host, expect, True), old
+    for old, new in (('0x1042', '0x1041'), ('161', '0'),
+                     ('COV-PCI-END', "COV-PCI-DMESG pci 0000:00:01.0: BAR 0 [mem 0xe0010000-0xe0017fff]: can't claim; no compatible bridge window\nCOV-PCI-END")):
+        assert judge('gpt', 'verify', good.replace(old, new), host, expect, True), old; controls += 1
     # The live controls' outcomes: a host-full guest whose write did not fail, a host-limit guest with no limit.
     good = text('host-full', 'write').replace('dd_rc=1 eio=1', 'dd_rc=0 eio=0').replace('ioerr_logs=4', 'ioerr_logs=0')
     host = {'rc': 0, 'timeout': False, 'stop': POWEROFF[0], 'changed': True, 'fsck': [0], 'table': True, 'exact': None, 'backend_errors': []}
@@ -619,7 +622,8 @@ def self_check():
         assert struct.unpack_from('<I', data, SECTOR + 88)[0] == zlib.crc32(data[2 * SECTOR:2 * SECTOR + 128 * 128])
         assert data[-33 * SECTOR:-SECTOR] == data[2 * SECTOR:34 * SECTOR] and data[510:512] == b'\x55\xaa' and data[450] == 0xee
         copy = Path(tmp) / 'c.raw'; sparse_copy(path, copy); assert copy.read_bytes() == data
-    subprocess.run(['sh', '-n'], input=INIT, text=True, check=True)
+    pci_self_test()
+    for script in (INIT, INIT_PCI): subprocess.run(['sh', '-n'], input=script, text=True, check=True)
     print(f'PASS: {len(CASES)} cases x 2 launches judged; {controls} negative judge controls; GPT/limit-oracle/sparse-copy checks; shell syntax. No VM.')
 
 

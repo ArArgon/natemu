@@ -25,7 +25,7 @@ import tarfile
 import time
 
 from run_virtio_rng import KVER, KERNEL_SHA, ROOT, stop_group
-from io_common import PCI_PROBE, digest, pci_errors, write_json
+from io_common import PCI_PROBE, digest, patch, pci_errors, pci_self_test, write_json
 
 KERNEL_DEB_SHA = '7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e99'
 DISK_BYTES = 512 << 20
@@ -66,8 +66,8 @@ drain_console() { console_mode=$(stty -F /dev/console -g) && stty -F /dev/consol
 fail() { echo "VIRTIO-BLOCK-FAIL $*"; dmesg; drain_console || true; poweroff -f; while :; do sleep 1; done; }
 exec </dev/console >/dev/console 2>&1
 mount -t tmpfs tmpfs /tmp || fail tmpfs
-@PCI_PROBE@phase= rng=0 exec_mode=0 transport=mmio
-for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; io_rng=*) rng=${item#*=};; io_exec=*) exec_mode=${item#*=};; io_transport=*) transport=${item#*=};; esac; done
+phase= rng=0 exec_mode=0
+for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; io_rng=*) rng=${item#*=};; io_exec=*) exec_mode=${item#*=};; esac; done
 echo "VIRTIO-BLOCK-BEGIN phase=$phase cpus=$(nproc) kernel=$(uname -r)"
 test "$(uname -r)" = '6.12.107+deb13-amd64' || fail kernel
 case "$phase" in write) mode=rw;; verify) mode=ro;; *) fail phase;; esac
@@ -79,7 +79,6 @@ test "$(cat /sys/block/vda/queue/logical_block_size)" = 512 || fail sector
 test "$(basename "$(readlink -f /sys/block/vda/device/driver)")" = virtio_blk || fail driver
 test "$(cat /sys/block/vda/device/device)" = 0x0002 || fail device-id
 echo VIRTIO-BLOCK-DEVICE driver=virtio_blk sectors=1048576 logical=512
-if test "$transport" = mmio; then
 acpi=
 for d in /sys/bus/acpi/devices/LNRO0005:*; do
   test -e "$d/uid" || continue
@@ -91,7 +90,6 @@ done
 test -n "$acpi" || fail acpi-block
 grep -E 'f0000000-f0000fff' /proc/iomem || fail mmio-resource
 echo VIRTIO-BLOCK-ACPI hid=LNRO0005 uid=0 base=f0000000 end=f0000fff
-fi
 sha256sum -c /fixtures/source.sha256 || fail source-hash
 if test "$phase" = write; then
   test ! -e /persist/receipt || fail reused-write-image
@@ -164,7 +162,6 @@ if test "$exec_mode" = 1; then
     echo "VIRTIO-BLOCK-EXEC phase=verify cpus=$cpus last=EXEC-B-OK"
   fi
 fi
-if test "$transport" = pci; then pci_probe; fi
 echo VIRTIO-BLOCK-INTERRUPTS-BEGIN
 cat /proc/interrupts
 echo VIRTIO-BLOCK-INTERRUPTS-END
@@ -180,7 +177,25 @@ echo "VIRTIO-BLOCK-PASS phase=$phase"
 drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
-'''.replace('@PCI_PROBE@', PCI_PROBE.replace('@P@', 'VIRTIO-BLOCK'))
+'''
+ACPI_CHECK = r'''acpi=
+for d in /sys/bus/acpi/devices/LNRO0005:*; do
+  test -e "$d/uid" || continue
+  test "$(cat "$d/uid")" = 0 || continue
+  test "$(cat "$d/hid")" = LNRO0005 || fail acpi-hid
+  test -z "$acpi" || fail multiple-block-resources
+  acpi=$d
+done
+test -n "$acpi" || fail acpi-block
+grep -E 'f0000000-f0000fff' /proc/iomem || fail mmio-resource
+echo VIRTIO-BLOCK-ACPI hid=LNRO0005 uid=0 base=f0000000 end=f0000fff
+'''
+# --transport pci: no ACPI block resource (the disk is a PCI function: the probe replaces that check), and the PCI probe before the
+# interrupt listing. ROOT_INIT, the default, is unchanged.
+ROOT_INIT_PCI = patch(ROOT_INIT, [
+    ('phase= rng=0 exec_mode=0\n', PCI_PROBE.replace('@P@', 'VIRTIO-BLOCK') + 'phase= rng=0 exec_mode=0\n'),
+    (ACPI_CHECK, ''),
+    ('echo VIRTIO-BLOCK-INTERRUPTS-BEGIN\n', 'pci_probe\necho VIRTIO-BLOCK-INTERRUPTS-BEGIN\n')])
 
 
 def exec_program(variant):
@@ -231,6 +246,7 @@ def install_busybox(root, binary):
 
 
 def prepare(args):
+    pci = args.transport == 'pci'
     args.out.mkdir(parents=True, exist_ok=False)
     rng = json.loads((args.rng_inputs / 'inputs.json').read_text())
     for name in ('linux', 'rootfs/bin/busybox'):
@@ -242,7 +258,7 @@ def prepare(args):
     for tree in (root, boot): install_busybox(tree, args.rng_inputs / 'rootfs/bin/busybox')
     (boot / 'newroot').mkdir()
     (boot / 'init').write_text(BOOT_INIT); (boot / 'init').chmod(0o755)
-    (root / 'sbin/init').write_text(ROOT_INIT); (root / 'sbin/init').chmod(0o755)
+    (root / 'sbin/init').write_text(ROOT_INIT_PCI if pci else ROOT_INIT); (root / 'sbin/init').chmod(0o755)
     for name in ('fixtures', 'persist'): (root / name).mkdir()
     payload = b''.join(hashlib.sha256(b'natemu-block-file-v1' + i.to_bytes(8, 'little')).digest() for i in range(PAYLOAD_BYTES // 32))
     patch = b''.join(hashlib.sha256(b'natemu-block-patch-v1' + i.to_bytes(8, 'little')).digest() for i in range(8192 // 32))
@@ -343,10 +359,10 @@ def run(args):
     for name, sha in inputs['outputs'].items(): assert digest(args.inputs / name) == sha, name
     fsck = Path(inputs['tools']['e2fsck']['path'])
     assert digest(fsck) == inputs['tools']['e2fsck']['sha256'], 'e2fsck binary changed'
-    write_json(args.out / 'manifest.json', {'inputs': inputs, 'cpus': args.cpus, 'rng': args.rng, 'transport': args.transport, 'seconds_per_vm': 120,
+    write_json(args.out / 'manifest.json', {'inputs': inputs, 'cpus': args.cpus, 'rng': args.rng, **({'transport': 'pci'} if pci else {}), 'seconds_per_vm': 120,
                'artifacts': {str(p.resolve()): digest(p) for p in (args.natemu, args.runtime, args.fexc, Path(__file__))}, 'source_root': str(ROOT)})
     pci = args.transport == 'pci'
-    if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise SystemExit('--transport pci needs inputs prepared by this version')
+    if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise SystemExit('--transport pci needs inputs from prepare --transport pci')
     results = []
     with args.lock.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -363,7 +379,7 @@ def run(args):
                            '--disk', str(image.resolve()), '--vcpus', str(n), '--ram', '2G', '--compile-cache', 'off',
                            '--serial', str((case / 'serial.log').resolve()), '--cmdline',
                            f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng={int(args.rng)}'
-                           + (' io_exec=1' if args.exec else '') + (' io_transport=pci' if pci else '')]
+                           + (' io_exec=1' if args.exec else '')]
                 if pci: command += ['--virtio-transport', 'pci']
                 if args.rng: command += ['--rng']
                 if args.exec: command += ['--perf-log', str((case / 'perf.log').resolve())]
@@ -432,7 +448,8 @@ def self_check():
     for old, new in (('0x1042', '0x1041'), ('161', '0'), ('9          0  PCI', '0          0  PCI'), ('PCI-END', 'PCI-X')):
         assert judge(base + pci_text.replace(old, new), 2, 'verify', sha, True, pci=True), old
     assert judge(base + pci_text.replace('VIRTIO-BLOCK-PCI-END', 'VIRTIO-BLOCK-PCI-DMESG Cannot find an available gap\nVIRTIO-BLOCK-PCI-END'), 2, 'verify', sha, True, pci=True)
-    for script in (BOOT_INIT, ROOT_INIT): subprocess.run(['sh', '-n'], input=script, text=True, check=True)
+    pci_self_test()
+    for script in (BOOT_INIT, ROOT_INIT, ROOT_INIT_PCI): subprocess.run(['sh', '-n'], input=script, text=True, check=True)
     import tempfile
     from unittest.mock import patch
     with tempfile.TemporaryDirectory() as temporary:
@@ -456,11 +473,12 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     prep = sub.add_parser('prepare')
     for name in ('rng-inputs', 'kernel-deb', 'e2fsprogs', 'out'): prep.add_argument('--' + name, type=Path, required=True)
+    prep.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='pci: an image whose init has the PCI probe (required by run --transport pci)')
     runner = sub.add_parser('run')
     for name in ('natemu', 'runtime', 'fexc', 'inputs', 'out', 'lock'): runner.add_argument('--' + name, type=Path, required=True)
     runner.add_argument('--cpus', nargs='+', type=int, choices=(1, 2, 4, 8, 16), default=[1])
     runner.add_argument('--rng', action='store_true')
-    runner.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport; pci needs inputs from this version of prepare')
+    runner.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport; pci needs inputs from prepare --transport pci')
     runner.add_argument('--exec', action='store_true', help='also run disk-loaded programs on every CPU under RNG, block and CPU load (inputs from this prepare; needs --rng)')
     sub.add_parser('self-check')
     args = parser.parse_args()

@@ -2,7 +2,7 @@
 """Stock-Linux networking through the normal CLI (`--net`, user-mode NAT on libslirp). Correctness only; the throughput
 lines are recorded, not judged. Each VM gets 180 s; the VM lock is held shared.
 
-    python3 tools/run_net_linux.py prepare --out DIR
+    python3 tools/run_net_linux.py prepare --out DIR [--transport mmio|pci]
     python3 tools/run_net_linux.py run --fexc FEXC --out DIR [--prepared DIR] [--cases C ...] [--vcpus N ...] [--offline] [--transport mmio|pci]
     python3 tools/run_net_linux.py self-check
 
@@ -42,7 +42,7 @@ import sys
 import tarfile
 import time
 
-from io_common import PCI_PROBE, ROOT, VM_LOCK, digest, pci_errors, stop_group, write_json
+from io_common import PCI_PROBE, ROOT, VM_LOCK, digest, patch, pci_errors, pci_self_test, stop_group, write_json
 from raw_root import RAW_ROOT
 from run_virtio_rng import KVER
 
@@ -51,7 +51,7 @@ BLOCK_INPUTS = RAW_ROOT / 'io3-block-20261108-01/inputs-01'
 TOOLS_ROOTFS = RAW_ROOT / 'io-network-tools-20261108-01/rootfs'
 MODULES = {'virtio_mmio': [], 'failover': [], 'net_failover': ['failover'], 'virtio_net': ['net_failover', 'failover']}
 APPLETS = ('sh', 'mount', 'modprobe', 'cat', 'grep', 'sed', 'awk', 'ip', 'udhcpc', 'nslookup', 'ping', 'sha256sum', 'ls',
-           'sleep', 'kill', 'poweroff', 'reboot', 'nproc', 'echo', 'wc', 'head', 'seq', 'dmesg')
+           'sleep', 'kill', 'poweroff', 'reboot', 'nproc', 'echo', 'wc', 'head', 'seq')
 CASES = ('basic', 'rebind', 'cancel', 'reboot', 'nodriver')
 EXTRA_CASES = ('stress',)
 BLOB = 64 << 20
@@ -67,8 +67,6 @@ export PATH=/bin:/usr/bin:/usr/sbin
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
 arg() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline; }
 C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)
-@PCI_PROBE@# poweroff -f drops queued console output: let the probe's long dmesg drain first.
-maybe_probe() { if [ "$(arg net_pci)" = 1 ]; then pci_probe; sleep 3; fi; }
 echo "NET-BEGIN case=$C cpus=$(nproc) kernel=$(cat /proc/sys/kernel/osrelease)"
 modprobe virtio_mmio; ip link set lo up
 if [ $C = nodriver ]; then echo "NET-NO-ETH0 $(ls /sys/class/net | grep -c eth0)"; echo NET-END; poweroff -f; fi
@@ -101,7 +99,7 @@ rebind)
   done
   fetch rebound;;
 reboot)
-  fetch first; maybe_probe; echo NET-END; reboot -f;;
+  fetch first; echo NET-END; reboot -f;;
 stress)
   iperf3 -c $H -t 60 -P 8 --bidir -f m 2>&1 | grep -E 'SUM.*(TX|RX)-C.* (sender|receiver)|error' | sed 's/^/NET-STRESS bidir /'
   iperf3 -c $H -t 5 -P 100 -f m 2>&1 | grep -E 'SUM.* (sender|receiver)|error' | sed 's/^/NET-STRESS p100 /'
@@ -113,19 +111,28 @@ stress)
 cancel)
   echo NET-CANCEL-READY; iperf3 -c $H -t 60 -R >/dev/null 2>&1;;
 esac
-maybe_probe
 echo NET-END
 poweroff -f
-'''.replace('@PCI_PROBE@', PCI_PROBE.replace('@P@', 'NET'))
+'''
+# --transport pci: the guest prints the PCI probe before NET-END and drains the console (stty TCSADRAIN, as the other runners do)
+# before poweroff -f / reboot -f, which would drop queued output. The default INIT above is unchanged.
+INIT_PCI = patch(INIT, [
+    ('C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)\n',
+     'C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)\n' + PCI_PROBE.replace('@P@', 'NET')
+     + 'drain_console() { m=$(stty -F /dev/console -g) && stty -F /dev/console "$m"; }\n'),
+    ('  fetch first; echo NET-END; reboot -f;;', '  fetch first; pci_probe; echo NET-END; drain_console; reboot -f;;'),
+    ('esac\necho NET-END\npoweroff -f\n', 'esac\npci_probe\necho NET-END\ndrain_console\npoweroff -f\n')])
+APPLETS_PCI = APPLETS + ('dmesg', 'stty')
 
 
-def prepare(out):
+def prepare(out, transport='mmio'):
+    pci = transport == 'pci'
     out.mkdir(parents=True)
     tree = out / 'initramfs'
     shutil.copytree(TOOLS_ROOTFS, tree, symlinks=True)     # Debian layout: lib -> usr/lib
     (tree / 'bin').mkdir()
     shutil.copy2(BLOCK_INPUTS / 'bootstrap/bin/busybox', tree / 'bin/busybox')
-    for name in APPLETS: (tree / 'bin' / name).symlink_to('busybox')
+    for name in APPLETS_PCI if pci else APPLETS: (tree / 'bin' / name).symlink_to('busybox')
     for d in ('proc', 'sys', 'dev', 'tmp'): (tree / d).mkdir(exist_ok=True)
     modules, archive = {}, subprocess.check_output(['ar', 'p', str(KERNEL_DEB), 'data.tar.xz'], timeout=60)
     with tarfile.open(fileobj=io.BytesIO(archive)) as package:
@@ -142,7 +149,7 @@ def prepare(out):
     # BusyBox modprobe wants every transitive dependency on the module's line.
     (tree / 'usr/lib/modules' / KVER / 'modules.dep').write_text(
         ''.join(modules[m]['path'] + ':' + ''.join(' ' + modules[d]['path'] for d in deps) + '\n' for m, deps in MODULES.items()))
-    for path, text in (('etc/dhcp.sh', DHCP_SCRIPT), ('init', INIT)):
+    for path, text in (('etc/dhcp.sh', DHCP_SCRIPT), ('init', INIT_PCI if pci else INIT)):
         (tree / path).write_text(text); (tree / path).chmod(0o755)
     spec = importlib.util.spec_from_file_location('mkcpio', ROOT / 'tools/play/mkcpio.py')
     mkcpio = importlib.util.module_from_spec(spec); spec.loader.exec_module(mkcpio)
@@ -230,7 +237,7 @@ def judge(case, text, stderr, code, elapsed, blob_sha, internet, pci=None):
 
 def launch(args, case, vcpus, host, blob_sha, work):
     cmdline = (f'console=ttyS0 mitigations=off nokaslr net_case={case} net_host={host} net_sha={blob_sha} '
-               f'net_internet={0 if args.offline else 1}' + (' net_pci=1' if args.transport == 'pci' else ''))
+               f'net_internet={0 if args.offline else 1}')
     command = [str(args.natemu), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.prepared / 'linux'),
                '--initrd', str(args.prepared / 'initramfs.cpio'), '--net', '--vcpus', str(vcpus), '--ram', '1G',
                '--compile-cache', 'off', '--serial', str(work / 'serial.log'), '--cmdline', cmdline]
@@ -256,7 +263,7 @@ def launch(args, case, vcpus, host, blob_sha, work):
 def run(args):
     args.out.mkdir(parents=True)
     if args.prepared is None:
-        args.prepared = args.out / 'prepared'; prepare(args.prepared)
+        args.prepared = args.out / 'prepared'; prepare(args.prepared, args.transport)
     manifest = json.loads((args.prepared / 'manifest.json').read_text())
     for name, sha in manifest['outputs'].items(): assert digest(args.prepared / name) == sha, name
     blob_sha, host = digest(args.prepared / 'serve/blob'), args.host or lan_address()
@@ -293,7 +300,7 @@ def run(args):
                           + (f" drops {results[-1]['drops']}" if results[-1]['drops'] else ''), flush=True)
     finally:
         for s in servers: s.terminate(); s.wait()
-    write_json(args.out / 'results.json', {'host': host, 'offline': args.offline, 'transport': args.transport, 'prepared': str(args.prepared),
+    write_json(args.out / 'results.json', {'host': host, 'offline': args.offline, **({'transport': 'pci'} if args.transport == 'pci' else {}), 'prepared': str(args.prepared),
                                             'natemu': {str(args.natemu): digest(args.natemu)}, 'results': results})
     return 0 if all(r['pass'] for r in results) else 1
 
@@ -359,8 +366,9 @@ def self_check():
              'NET-PCI-DMESG [    1.9] virtio-pci 0000:00:02.0: enabling device (0000 -> 0002)\nNET-PCI-END\n')
     assert judge('basic', text.replace('NET-END\n', probe + 'NET-END\n'), err, code, t, sha, True, 2) == []
     assert judge('basic', text, err, code, t, sha, True, 2)                                    # no probe
+    pci_self_test()
     for old, new in (('0x1041', '0x1042'), ('  2          0  PCI', '  0          0  PCI'), ('IRQ  25:          2', 'IRQ  25:          x'),
-                     ('virtio-pci', "can't claim BAR 0: virtio-pci")):
+                     ('virtio-pci', "can't claim; no compatible bridge window: virtio-pci")):
         assert judge('basic', text.replace('NET-END\n', probe.replace(old, new) + 'NET-END\n'), err, code, t, sha, True, 2), old
     print('self-check: ok')
     return 0
@@ -369,7 +377,8 @@ def self_check():
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('prepare').add_argument('--out', type=Path, required=True)
+    pp = sub.add_parser('prepare'); pp.add_argument('--out', type=Path, required=True)
+    pp.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='pci: the init with the PCI probe (what run --transport pci needs)')
     r = sub.add_parser('run')
     r.add_argument('--prepared', type=Path, help='a prepare output [default: prepare into OUT/prepared]')
     r.add_argument('--fexc', type=Path, required=True)
@@ -384,7 +393,7 @@ def main():
     r.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport (--virtio-transport); pci adds a guest probe and its checks')
     sub.add_parser('self-check')
     args = parser.parse_args()
-    if args.command == 'prepare': print(json.dumps(prepare(args.out)['outputs'], indent=2)); return 0
+    if args.command == 'prepare': print(json.dumps(prepare(args.out, args.transport)['outputs'], indent=2)); return 0
     if args.command == 'run': return run(args)
     return self_check()
 
