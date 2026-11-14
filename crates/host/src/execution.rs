@@ -611,6 +611,79 @@ pub struct K1 {
     /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).
     pic: [u64; natemu_abi::pic::count::COUNTS],
     pic_transitions: [u64; 5],
+    /// Page-currency chunk 0 (`page-study` resident builds only: absent when every counter is zero).
+    #[serde(skip_serializing_if = "K1PageStudy::is_empty")]
+    page_study: K1PageStudy,
+}
+/// Page-currency plan chunk 0 (`natemu_abi::page_study::Counts`): fetch walks by caller (`[revalidation, placement]`) with the
+/// record's would-be answers, its disagreements with the walk, and the walk and probe times in ns (`walk_ns[caller][hit]`: the
+/// walks the record would not / would have answered). `class_*[caller]` are `[global, large, user]`; `blocks*` are
+/// `[all, global, large, user, crossing]`.
+#[derive(Debug, Default, serde::Serialize)]
+struct K1PageStudy {
+    calls: [u64; 2],
+    hit_4k: [u64; 2],
+    hit_2m: [u64; 2],
+    class_calls: [[u64; 3]; 2],
+    class_hits: [[u64; 3]; 2],
+    faulted: [u64; 2],
+    not_ram: [u64; 2],
+    disagree: [u64; 2],
+    disagree_frame: u64,
+    disagree_flags: u64,
+    disagree_fault: u64,
+    records: u64,
+    evictions: u64,
+    split_2m: u64,
+    clear_events: u64,
+    cleared: u64,
+    live_max: u64,
+    probe_ns: u64,
+    walk_ns: [[u64; 2]; 2],
+    walk_count: [[u64; 2]; 2],
+    blocks: [u64; natemu_abi::page_study::B_CLASSES],
+    blocks_hit: [u64; natemu_abi::page_study::B_CLASSES],
+    /// The cost of two counter reads in a row, in ns per pair (x1000: the counter ticks at 24 MHz).
+    tick_pair_milli_ns: u64,
+}
+impl K1PageStudy {
+    /// Written by a `page-study` resident only (its start-up measures the counter, so `tick_pairs` is nonzero then).
+    fn is_empty(&self) -> bool {
+        self.calls == [0; 2] && self.tick_pair_milli_ns == 0
+    }
+    fn new(c: &natemu_abi::page_study::Counts) -> Self {
+        let pair = if c.tick_pairs == 0 {
+            0
+        } else {
+            // (ticks_ns of the whole sum, so the 24 MHz quantum averages out over the pairs.)
+            ticks_ns(c.tick_pair_ticks) * 1000 / c.tick_pairs
+        };
+        Self {
+            calls: c.calls,
+            hit_4k: c.hit_4k,
+            hit_2m: c.hit_2m,
+            class_calls: c.class_calls,
+            class_hits: c.class_hits,
+            faulted: c.faulted,
+            not_ram: c.not_ram,
+            disagree: c.disagree,
+            disagree_frame: c.disagree_frame,
+            disagree_flags: c.disagree_flags,
+            disagree_fault: c.disagree_fault,
+            records: c.records,
+            evictions: c.evictions,
+            split_2m: c.split_2m,
+            clear_events: c.clear_events,
+            cleared: c.cleared,
+            live_max: c.live_max,
+            probe_ns: ticks_ns(c.probe_ticks),
+            walk_ns: c.walk_ticks.map(|w| w.map(ticks_ns)),
+            walk_count: c.walk_count,
+            blocks: c.blocks,
+            blocks_hit: c.blocks_hit,
+            tick_pair_milli_ns: pair.max(u64::from(c.tick_pairs != 0)),
+        }
+    }
 }
 #[derive(Debug, Default, serde::Serialize)]
 struct K1Uncached {
@@ -706,6 +779,7 @@ impl K1 {
             },
             pic: c.pic_counts,
             pic_transitions: [0; 5],
+            page_study: K1PageStudy::new(&c.page_study),
         }
     }
 }
@@ -3806,6 +3880,45 @@ mod tests {
         area.write_record(offset, c);
         let old: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
         assert_eq!(old, serde_json::to_value(k1_stats(area)).unwrap());
+    }
+
+    /// Page-currency chunk 0: the study's counters appear in the K1 stats only when a `page-study` resident wrote some (so every
+    /// other build's stats keep their form), by caller, in the order `natemu_abi::page_study::Counts` documents.
+    #[test]
+    fn k1_reports_the_page_study_counters_only_when_written() {
+        use natemu_abi::page_study::{B_ALL, B_GLOBAL, C_USER, PLACE, REVAL};
+        let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
+        let ram = unsafe { GuestRam::new(0, 0, memory.0 as u64) };
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
+        assert!(
+            serde_json::to_value(k1_stats(area)).unwrap().get("page_study").is_none(),
+            "a plain resident writes none"
+        );
+        let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
+        let mut c: cache::Control = area.read_record(offset);
+        c.page_study.calls = [7, 3];
+        c.page_study.hit_4k[REVAL] = 5;
+        c.page_study.class_hits[PLACE][C_USER] = 2;
+        c.page_study.disagree_frame = 1;
+        c.page_study.blocks[B_ALL] = 4;
+        c.page_study.blocks_hit[B_GLOBAL] = 1;
+        c.page_study.walk_count[PLACE][1] = 9;
+        area.write_record(offset, c);
+        let k = serde_json::to_value(k1_stats(area)).unwrap();
+        let p = &k["page_study"];
+        assert_eq!((p["calls"][0].as_u64(), p["calls"][1].as_u64()), (Some(7), Some(3)));
+        assert_eq!(p["hit_4k"][0].as_u64(), Some(5));
+        assert_eq!(p["class_hits"][1][2].as_u64(), Some(2));
+        assert_eq!(p["disagree_frame"].as_u64(), Some(1));
+        assert_eq!((p["blocks"][0].as_u64(), p["blocks_hit"][1].as_u64()), (Some(4), Some(1)));
+        assert_eq!(p["walk_count"][1][1].as_u64(), Some(9));
     }
 
     /// Changes every answer `c` keeps (no other reference is held between compiles).

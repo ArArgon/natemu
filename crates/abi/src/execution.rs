@@ -281,7 +281,7 @@ pub mod cache {
     pub const META_VA: u64 = PRIVATE + 0x2800_0000;
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = (PIC_FRAMES + 16 * PIC_FRAME_ENTRIES).next_multiple_of(BLOCK);
+    pub const LOOKUP_BYTES: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + (1 << 30);
     pub const GLOBAL_BYTES: usize = (TABLE_PAGES + TABLE_PAGE_BYTES).next_multiple_of(BLOCK);
     /// Mapping granule of the areas.
@@ -430,6 +430,9 @@ pub mod cache {
     /// source page, by a hash of the frame ([`PIC_FRAME_ENTRIES`] of {frame page + 1 (u32), epoch's low 32 bits, linear page}).
     pub const PIC_FRAMES: usize = HINTS + 4 * HINT_ENTRIES;
     pub const PIC_FRAME_ENTRIES: usize = 1 << 16;
+    /// Page-currency plan: the vCPU's record of fetch-walk results ([`crate::page_study::ENTRIES`] records of 32 bytes, 256
+    /// KiB), after the PIC study's frames. Written by a `page-study` resident only (chunk 0); untouched, so unbacked, otherwise.
+    pub const PAGE_STAMPS: usize = PIC_FRAMES + 16 * PIC_FRAME_ENTRIES;
 
     /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident): one
     /// shadow-reset counter (u64) per vCPU and the per-vCPU [`Events`] in its first 64 KiB; then the per-page structures,
@@ -746,6 +749,8 @@ pub mod cache {
         pub link_cap: u64,
         /// CTR_EL0, read once by the resident at start-up (`cache::read_ctr_el0`) for code synchronization. Appended.
         pub ctr_el0: u64,
+        /// Page-currency chunk 0 (`page-study` resident builds only, zero otherwise; [`crate::page_study::Counts`]). Appended.
+        pub page_study: crate::page_study::Counts,
     }
     /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
     pub const L1_EVICTED: usize = 0;
@@ -1052,7 +1057,9 @@ pub mod cache {
             && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS
             && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= HINTS
             && HINTS + 4 * HINT_ENTRIES <= PIC_FRAMES
-            && PIC_FRAMES + 16 * PIC_FRAME_ENTRIES <= LOOKUP_BYTES
+            && PIC_FRAMES + 16 * PIC_FRAME_ENTRIES <= PAGE_STAMPS
+            && PAGE_STAMPS % 64 == 0
+            && PAGE_STAMPS + crate::page_study::BYTES <= LOOKUP_BYTES
     );
     // The dispatcher's form: its `and` takes the mask as a logical immediate, its `adrp` names a table by its page, and
     // each entry's `b` to the miss reaches ±128 MiB.

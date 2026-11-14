@@ -28,6 +28,8 @@ mod helpers;
 mod lapic;
 mod maskmov;
 mod mmio;
+#[cfg(feature = "page-study")]
+pub(crate) mod page_study;
 mod ports;
 mod rotate;
 mod segments;
@@ -106,6 +108,8 @@ fn halt(s: &State, reason: u64) -> ! {
 
 pub unsafe fn start() -> ! {
     crate::perf::start();
+    #[cfg(feature = "page-study")]
+    page_study::init();
     cache::read_ctr_el0();
     // The entry frame's fields `enter` never writes are zero ([`enter`]).
     unsafe { (*shared()).initial = NativeFrame::ZERO };
@@ -1173,7 +1177,7 @@ fn link_point(h: &Header, p: &LinkPoint) -> bool {
 /// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]).
 fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     let p = crate::perf::enter(crate::perf::FETCH);
-    match fetch_walk(s, va) {
+    match page_translation(s, va, natemu_abi::page_study::PLACE) {
         Ok((gpa, flags)) => {
             cache::control().fetched |= u64::from(flags) << (8 * i);
             s.fetch[i] = gpa;
@@ -1225,16 +1229,37 @@ fn mapped(s: &mut State, b: &Block) -> Option<u32> {
     current
 }
 fn revalidated(s: &mut State, b: &Block) -> Option<u32> {
+    #[cfg(feature = "page-study")]
+    page_study::block_begin();
     let mut flags = [cache::GLOBAL; 2];
     for (k, &gpa) in b.source_gpa.iter().enumerate() {
         if gpa != u64::MAX {
-            flags[k] = fetch_walk(s, (b.rip & !4095).wrapping_add(4096 * k as u64))
-                .ok()
-                .filter(|&(at, _)| at == gpa)?
-                .1;
+            flags[k] = page_translation(
+                s,
+                (b.rip & !4095).wrapping_add(4096 * k as u64),
+                natemu_abi::page_study::REVAL,
+            )
+            .ok()
+            .filter(|&(at, _)| at == gpa)?
+            .1;
         }
     }
-    Some(leaves(s, flags))
+    let flags = leaves(s, flags);
+    #[cfg(feature = "page-study")]
+    page_study::block_end(b, flags);
+    Some(flags)
+}
+/// The fetch translation of `va` for `who` ([`natemu_abi::page_study::REVAL`], `PLACE`): a fetch walk. With the `page-study`
+/// feature (page-currency plan, chunk 0) the walk is still made but the record of earlier walks is probed first and its
+/// answer compared and counted ([`page_study`]); without it this is `fetch_walk`.
+#[cfg(not(feature = "page-study"))]
+#[inline(always)]
+fn page_translation(s: &mut State, va: u64, _who: usize) -> Result<(u64, u32), [u64; 3]> {
+    fetch_walk(s, va)
+}
+#[cfg(feature = "page-study")]
+fn page_translation(s: &mut State, va: u64, who: usize) -> Result<(u64, u32), [u64; 3]> {
+    page_study::translate(s, va, who)
 }
 /// A translation's flags from its source pages' leaves (`GLOBAL`, `LARGE` each; an unused page `GLOBAL` alone): global
 /// when every leaf is and CR4.PGE is set (SDM Vol.3 4.10.2.4), large when any leaf is.

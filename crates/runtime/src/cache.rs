@@ -72,7 +72,7 @@ pub fn relocs(b: &Block) -> &'static [u32] {
 }
 const _: () = assert!(size_of::<Site>() % 4 == 0);
 
-fn lookup_area<T>(offset: usize) -> *mut T {
+pub(crate) fn lookup_area<T>(offset: usize) -> *mut T {
     (area::LOOKUP_VA + offset as u64) as *mut T
 }
 pub fn control() -> &'static mut Control {
@@ -2245,6 +2245,9 @@ fn large_held(c: &Control, r: u64) -> bool {
 /// one ([`Control::regions`]; for large blocks [`large_held`]), then on the linear map's chains of the pages
 /// ([`area::LINEAR_HEADS`]).
 pub fn invlpg(address: u64) -> Option<u64> {
+    // Page study: the record of fetch-walk results loses the entries of the page and of its 2 MiB region, both classes.
+    #[cfg(feature = "page-study")]
+    crate::execution::page_study::invalidated(address);
     let c = control();
     let r = address >> 21;
     let held = |regions: &[u64; 16]| {

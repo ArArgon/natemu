@@ -13,6 +13,11 @@ perf = []
 # Dispatch study, measurement builds only: counts L1 evictions, skipped fills and misses by the L1 entry they found
 # (`Control::l1_counts`). Kept out of plain `perf`: the extra loads and stores in the lookup and miss paths showed in the gates.
 dispatch-study = ["perf"]
+# Page-currency plan chunk 0 (docs/restructure/page-currency-plan.md section 8), measurement builds only: a per-vCPU record of
+# fetch-walk results (`natemu_abi::page_study`) probed in shadow mode at every fetch walk (the walk is still made, the record's
+# answer compared with it, a miss recorded), with counters and walk timings (`Control::page_study`). Never part of `perf`: its
+# loads and timestamps would show in the gates (decision 16).
+page-study = ["perf"]
 # Isolated scheduling fixtures; no calls or metadata accesses when disabled.
 io-test-hooks = []
 # PIC study stage 1, measurement builds only: links enter their targets through counting stubs (`cache::stub`), for linked

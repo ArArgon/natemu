@@ -23,6 +23,7 @@ pub mod execution;
 pub mod guest_memory;
 pub mod half;
 pub mod lapic;
+pub mod page_study;
 pub mod paging;
 pub mod pic;
 pub mod resident;
