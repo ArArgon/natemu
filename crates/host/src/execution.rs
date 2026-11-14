@@ -598,7 +598,7 @@ pub struct K1 {
     reuse: K1Reuse,
     slot_writes: u64,
     kept_resets: u64,
-    /// Dispatch study (`natemu_abi::execution::cache::L1_EVICTED` and the rest; `perf` resident builds only).
+    /// Dispatch study (`natemu_abi::execution::cache::L1_EVICTED` and the rest; `dispatch-study` resident builds only).
     l1_counts: [u64; natemu_abi::execution::cache::L1_COUNTS],
     systems: K1Systems,
     /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).

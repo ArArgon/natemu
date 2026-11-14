@@ -667,7 +667,7 @@ pub mod cache {
         /// (four, packed); `trip_count` counts them all. The host prints them at the vCPU's end.
         pub trip: [[u64; 8]; TRIP_ENTRIES],
         pub trip_count: u64,
-        /// Dispatch study counters (`perf` resident builds only; [`L1_EVICTED`] and the rest). Appended.
+        /// Dispatch study counters (`dispatch-study` resident builds only, zero otherwise; [`L1_EVICTED`] and the rest). Appended.
         pub l1_counts: [u64; L1_COUNTS],
         /// K1 `link-full` only (the host's `NATEMU_LINK_CAP`, set before the vCPU runs): the link record area's capacity
         /// ([`link_cap`]); 0: [`MAX_LINKS`]. Appended.

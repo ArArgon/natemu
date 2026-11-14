@@ -1750,7 +1750,7 @@ unsafe fn missed(frame: &NativeFrame) -> ! {
     bank(&mut s.cpu, frame, frame.nzcv, true);
     completed(&mut s);
     s.cpu.rip = frame.x[0];
-    #[cfg(feature = "perf")]
+    #[cfg(feature = "dispatch-study")]
     cache::count_miss(s.cpu.rip, s.cpu.code_context());
     // PIC study (`pic-count` builds only): the miss by what it needs (no walk: as the dispatcher would have found it).
     #[cfg(feature = "pic-count")]

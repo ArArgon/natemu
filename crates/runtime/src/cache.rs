@@ -521,14 +521,14 @@ pub fn fill_l1(rip: u64, block: &Block) {
     // (PIC study test [`PIC_TEST_SVC`]: none, so every computed exit and checked link enters the resident, which then
     // enters blocks armed after their links are made.)
     if control().l1_contexts[t] != block.context || control().pic_test == PIC_TEST_SVC {
-        #[cfg(feature = "perf")]
+        #[cfg(feature = "dispatch-study")]
         {
             control().l1_counts[area::L1_SKIPPED] += 1;
         }
         return;
     }
     let i = (rip & area::L1_MASK) as usize;
-    #[cfg(feature = "perf")]
+    #[cfg(feature = "dispatch-study")]
     {
         let owner = l1_block(t, i);
         if owner != 0 && owner != block.number + 1 {
@@ -562,9 +562,10 @@ pub fn fill_l1(rip: u64, block: &Block) {
     );
 }
 
-/// Dispatch study (`perf` builds): counts a dispatcher miss for `rip` in code `context` by what the current L1 table's entry
-/// at its index holds ([`area::MISS_EMPTY`] and the rest).
-#[cfg(feature = "perf")]
+/// Dispatch study (`dispatch-study` builds only: its loads and stores cost measurable time in the `perf` gate builds):
+/// counts a dispatcher miss for `rip` in code `context` by what the current L1 table's entry at its index holds
+/// ([`area::MISS_EMPTY`] and the rest).
+#[cfg(feature = "dispatch-study")]
 pub fn count_miss(rip: u64, context: u64) {
     let c = control();
     let t = c.l1_table as usize;
