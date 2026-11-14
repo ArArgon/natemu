@@ -244,6 +244,24 @@ impl Irqs {
     pub fn live(&self) -> usize {
         self.live.load(SeqCst)
     }
+    /// A message-signalled interrupt (SDM Vol.3 11.11.1, 11.11.2): `address` bits 31:20 are 0xFEE, the destination ID is
+    /// bits 19:12, the redirection hint bit 3 (with fixed delivery it makes the message lowest-priority) and the
+    /// destination mode bit 2 (set: logical); `data` bits 7:0 are the vector and bits 10:8 the delivery mode. The trigger
+    /// mode (data bit 15) is ignored: always edge, so the TMR bit is clear and the EOI stays inside the LAPIC. Whether some
+    /// LAPIC accepted it; an address outside the window posts nothing.
+    pub fn msi(&self, address: u64, data: u32) -> bool {
+        if address >> 20 != 0xfee {
+            return false;
+        }
+        let mode = (data >> 8 & 7) as u8;
+        self.lock().lapics.send(Message {
+            dest: (address >> 12) as u8,
+            logical: address & 4 != 0,
+            mode: if address & 8 != 0 && mode == 0 { 1 } else { mode },
+            vector: data as u8,
+            level: false,
+        })
+    }
     /// A pulse on the board's NMI input, wired to every LAPIC's LINT1 (the MADT's Local APIC NMI): an NMI to each APIC
     /// whose LVT LINT1 is unmasked in NMI mode (`lapic::LINT1_NMI`; fixed or ExtINT LINT1 delivery is not wired). No
     /// source drives it on this board yet (no NMI button or watchdog).
@@ -437,5 +455,89 @@ mod tests {
         );
         c.line(24, true); // no such line
         assert_eq!(c.lines, 0x11);
+    }
+
+    /// A board of `words.len()` vCPUs whose published APIC words are `words`.
+    fn board(words: &[u64]) -> Lapics {
+        let memory = Arc::new(Memory::with_size(exec::BACKING_BYTES).unwrap());
+        for (v, &w) in words.iter().enumerate() {
+            execution::set_published(&memory, v, w);
+        }
+        Lapics {
+            memory,
+            vcpus: words.len(),
+            doorbell: None,
+            lint0: false,
+            messages: Default::default(),
+            fresh: Default::default(),
+            coalesced: Default::default(),
+        }
+    }
+    fn irqs(lapics: Lapics) -> Irqs {
+        Irqs {
+            chipset: Arc::new(Mutex::new(Chipset {
+                ioapic: Ioapic::new(),
+                pic: Pic::new(),
+                lines: 0,
+                lapics,
+            })),
+            live: Arc::default(),
+        }
+    }
+    const ON: u64 = lapic::HW_ENABLED | lapic::SW_ENABLED;
+    /// xAPIC flat-model word with LDR byte `ldr`.
+    fn xapic(ldr: u64) -> u64 {
+        ON | 0xf << 32 | ldr << 24
+    }
+    fn pending(i: &Irqs, v: usize, vector: u64) -> bool {
+        execution::pending(i.lock().lapics.memory(), v, vector)
+    }
+
+    /// A fixed physical MSI reaches only its destination, as an edge (TMR clear).
+    #[test]
+    fn msi_fixed_physical_reaches_only_its_destination() {
+        for words in [[xapic(0), xapic(0)], [ON | lapic::X2APIC; 2]] {
+            let i = irqs(board(&words));
+            // The TMR of the vector starts set: an edge message must clear it.
+            execution::post(i.lock().lapics.memory(), 1, 0x41, true);
+            assert!(i.msi(0xFEE0_1000, 0x41));
+            assert!(pending(&i, 1, 0x41) && !pending(&i, 0, 0x41));
+            assert!(!execution::tmr(i.lock().lapics.memory(), 1, 0x41));
+        }
+    }
+
+    /// Logical destination mode (address bit 2) selects by the LDR; the redirection hint (bit 3) picks one member.
+    #[test]
+    fn msi_logical_destination_follows_the_ldr() {
+        let i = irqs(board(&[xapic(0x01), xapic(0x02)]));
+        assert!(i.msi(0xFEE0_2004, 0x50)); // flat, destination bit 1
+        assert!(pending(&i, 1, 0x50) && !pending(&i, 0, 0x50));
+        assert!(i.msi(0xFEE0_F004, 0x51)); // both members
+        assert!(pending(&i, 0, 0x51) && pending(&i, 1, 0x51));
+        assert!(i.msi(0xFEE0_F00C, 0x52)); // redirection hint: lowest-numbered member only
+        assert!(pending(&i, 0, 0x52) && !pending(&i, 1, 0x52));
+        // x2APIC logical: cluster 0, bit n of the destination's low half.
+        let x = ON | lapic::X2APIC;
+        let i = irqs(board(&[x | lapic::x2apic_ldr(0), x | lapic::x2apic_ldr(1)]));
+        assert!(i.msi(0xFEE0_2004, 0x53));
+        assert!(pending(&i, 1, 0x53) && !pending(&i, 0, 0x53));
+    }
+
+    /// Vectors 0..15 are illegal for a fixed interrupt (SDM 11.5.3): dropped.
+    #[test]
+    fn msi_vector_below_16_is_dropped() {
+        let i = irqs(board(&[xapic(0), xapic(0)]));
+        assert!(!i.msi(0xFEE0_1000, 0x0f));
+        assert!(!pending(&i, 1, 0x0f));
+    }
+
+    /// Only 0xFEExxxxx is the MSI window (SDM 11.11.1): anything else posts nothing.
+    #[test]
+    fn msi_outside_fee_is_dropped() {
+        let i = irqs(board(&[xapic(0), xapic(0)]));
+        assert!(!i.msi(0xFEC0_0000, 0x41));
+        assert!(!i.msi(0x1_FEE0_1000, 0x41));
+        assert!(!pending(&i, 0, 0x41) && !pending(&i, 1, 0x41));
+        assert_eq!(i.lock().lapics.messages.get(), 0);
     }
 }
