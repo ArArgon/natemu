@@ -26,6 +26,7 @@ pub mod lapic;
 pub mod page_study;
 pub mod paging;
 pub mod pic;
+pub mod pool;
 pub mod resident;
 pub mod shadow;
 pub mod strings;
