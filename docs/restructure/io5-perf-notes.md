@@ -377,6 +377,17 @@ Rules learned in this round:
     594/594 default and link-check and the interleaved rounds (decisions 27, 37), `perf-real-workload` is ready to merge
     into main on the owner's word (main has not moved since dcffe4b: a fast-forward, no conflicts).
 
+40. **Final comparison on the merge head** (`4c89205`; measurement only). Bench suite
+    (`natemu-raw/bench-round-20261114-02`, 66 boots, 0 contended, cold medians of 3, vs the Nov 5 natemu round): at
+    1 vCPU build -17.5%, luajit -12.0%, avx -3.8%, the rest within -3%..+0.3%; at 4 vCPUs build -14.4%, luajit -10.0%,
+    hackbench -7.6%, 7zip -5.9%, luajit-interp -5.8%, avx -5.6%, the rest within -2%..+0.4%, except locks +7.3% (cold;
+    the morning round's +9.0% had the same cause unexamined, the Nov 5 round used an older fexc and harness, and 4-vCPU
+    locks is lock-handoff bound, so this is an open question, not an attributed regression). Against QEMU 11.1.2 TCG
+    natemu takes 0.02x-0.73x the time on every benchmark. The second batch (decisions 32-36) added luajit -8%/-8% and
+    build -3% at 1 vCPU over the morning round (`bench-round-20261114-01`, head `0312884`). IO5 full boot
+    (`io5-natemu-mo-20261114-02`, mitigations off, PASS): use phase 522.2 s, against 563.6 s before the second batch,
+    705.4 s on main and 901.1 s on QEMU (0.58x); configure 62.8 s, make+download+generate 347.6 s (they overlap).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
@@ -395,5 +406,6 @@ dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3
 | ... with the shared pool on (decision 25) | 68.6 s | 130.9 s (single run) |
 | round start vs head, timing-only medians of 3 (decision 27) | 72.9 -> 67.5 s | 136.5 -> 127.0 s |
 | second batch, timing-only medians of 3 (decision 37) | 67.6 -> 63.2 s | 126.9 -> 122.5 s |
+| IO5 full boot use phase (decision 40): main 705.4 s, before batch 2 563.6 s, head 522.2 s, QEMU 901.1 s | | |
 | QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
 | native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |
