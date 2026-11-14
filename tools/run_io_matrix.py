@@ -4,6 +4,9 @@
 The guest pins its single virtio IRQ to CPU 0 and runs every fio job on CPUs 1..n-1 (with 2 vCPUs all jobs, including
 the four of rand-read-4k-4jobs-q16, share CPU 1; with 1 vCPU nothing is pinned): left free, Linux sometimes put fio on the
 IRQ's vCPU and rates fell by half (docs/restructure/io-benchmarks.md).
+With --transport pci (natemu only) the disk's queue vectors are kernel-managed and refuse affinity writes, so nothing is
+pinned: the guest reads the queue vector's effective_affinity_list, records that CPU as the interrupt vCPU and keeps fio
+off it (prepare a fresh --inputs with this version; the guest script lives in the image).
 prepare/self-check never run a VM. run owns one fresh main/read-only-restart pair,
 600/120 seconds, no retry. Whole-system measurements, not isolated SSD numbers.
 """
@@ -22,6 +25,7 @@ import time
 
 import run_fio_admission as admission
 import run_fio_baselines as baselines
+from io_common import PCI_PROBE, pci_errors
 
 block = admission.block
 digest, write_json, checked = admission.digest, admission.write_json, admission.checked
@@ -83,10 +87,10 @@ export_logs() {
 drain_console() { console_mode=$(/bin/busybox stty -F /dev/console -g) && /bin/busybox stty -F /dev/console "$console_mode"; }
 fail() { echo "IO-MATRIX-FAIL $*"; export_logs; dmesg; drain_console || true; poweroff -f; while :; do sleep 1; done; }
 mark() { read up rest < /proc/uptime; echo "IO-MATRIX-MARK name=$1 uptime=$up"; }
-mount -t tmpfs tmpfs /tmp || fail tmpfs
+@PCI_PROBE@mount -t tmpfs tmpfs /tmp || fail tmpfs
 mkdir /tmp/matrix || fail logs
-phase=
-for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; esac; done
+phase= transport=mmio
+for item in $(cat /proc/cmdline); do case "$item" in io_phase=*) phase=${item#*=};; io_transport=*) transport=${item#*=};; esac; done
 case "$phase" in write) mode=rw;; verify) mode=ro;; *) fail phase;; esac
 echo "IO-MATRIX-BEGIN phase=$phase cpus=$(nproc) kernel=$(uname -r)"
 rootinfo=$(awk '$2 == "/" {print $1, $3, $4}' /proc/mounts)
@@ -94,13 +98,26 @@ case "$rootinfo" in "/dev/vda ext4 $mode,"*) ;; *) fail "root=$rootinfo";; esac
 echo "IO-MATRIX-ROOT $rootinfo"
 mark mounted-root
 fiopin=
-irq=$(awk '/virtio/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
-test -n "$irq" || fail virtio-irq
-if test "$(nproc)" -gt 1; then
-  fiopin="/bin/busybox taskset -c 1-$(($(nproc) - 1))"
-  echo 1 > /proc/irq/$irq/smp_affinity || fail irq-affinity
+if test "$transport" = pci; then
+  # The first queue vector of the disk (virtio-blk names it virtioN-req.0); the kernel chose its CPU, read it back.
+  irq=$(awk '/PCI-MSIX.*virtio[0-9]+-req/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
+  test -n "$irq" || fail virtio-irq
+  if test "$(nproc)" -gt 1; then
+    eff=$(cat /proc/irq/$irq/effective_affinity_list) || fail irq-effective-affinity
+    list= c=0
+    while test $c -lt $(nproc); do test $c = "$eff" || list="$list,$c"; c=$((c+1)); done
+    fiopin="/bin/busybox taskset -c ${list#,}"
+  fi
+  pci_probe
+else
+  irq=$(awk '/virtio/ {sub(":", "", $1); print $1; exit}' /proc/interrupts)
+  test -n "$irq" || fail virtio-irq
+  if test "$(nproc)" -gt 1; then
+    fiopin="/bin/busybox taskset -c 1-$(($(nproc) - 1))"
+    echo 1 > /proc/irq/$irq/smp_affinity || fail irq-affinity
+  fi
 fi
-echo "IO-MATRIX-PIN irq=$irq irq_affinity=$(cat /proc/irq/$irq/smp_affinity_list) fio=${fiopin:-none}"
+echo "IO-MATRIX-PIN irq=$irq irq_affinity=$(if test "$transport" = pci; then cat /proc/irq/$irq/effective_affinity_list; else cat /proc/irq/$irq/smp_affinity_list; fi) fio=${fiopin:-none}"
 test "$(cat /sys/block/vda/size)" = 4194304 || fail capacity
 test "$(cat /sys/block/vda/queue/logical_block_size)" = 512 || fail sector
 test "$(basename "$(readlink -f /sys/block/vda/device/driver)")" = virtio_blk || fail driver
@@ -161,7 +178,7 @@ echo "IO-MATRIX-PASS phase=$phase"
 drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
-'''.replace('@WORKLOADS@', ' '.join(WORKLOADS))
+'''.replace('@WORKLOADS@', ' '.join(WORKLOADS)).replace('@PCI_PROBE@', PCI_PROBE.replace('@P@', 'IO-MATRIX'))
 
 
 def prepare(args):
@@ -245,7 +262,7 @@ def fio_result(data, profile):
     return errors
 
 
-def judge(text, phase, cpus):
+def judge(text, phase, cpus, pci=False):
     errors = []
     def need(ok, why):
         if not ok: errors.append(why)
@@ -253,8 +270,16 @@ def judge(text, phase, cpus):
     mode = 'rw' if phase == 'write' else 'ro'
     need(len(re.findall(r'^IO-MATRIX-ROOT /dev/vda ext4 ' + mode + r',.*$', text, re.M)) == 1, 'installed root mode')
     need(text.count('\nIO-MATRIX-DEVICE driver=virtio_blk sectors=4194304 logical=512\n') == 1, 'disk geometry/driver')
-    pin = 'irq_affinity=0 fio=' + ('/bin/busybox taskset -c 1-%d' % (cpus - 1) if cpus > 1 else 'none')
-    need(re.findall(r'^IO-MATRIX-PIN irq=\d+ (.*)$', text, re.M) == [pin], 'IRQ/fio pinning')
+    pins = re.findall(r'^IO-MATRIX-PIN irq=\d+ (.*)$', text, re.M)
+    if pci:
+        # The queue vector's CPU is the kernel's choice; fio must run on exactly the other CPUs.
+        found = re.fullmatch(r'irq_affinity=(\d+) fio=(?:none|/bin/busybox taskset -c ([\d,]+))', pins[0]) if len(pins) == 1 else None
+        irq_cpu = int(found.group(1)) if found else -1
+        others = ','.join(str(c) for c in range(cpus) if c != irq_cpu)
+        need(found is not None and 0 <= irq_cpu < cpus and (found.group(2) == others if cpus > 1 else found.group(2) is None),
+             'interrupt vCPU / fio pinning')
+        for e in pci_errors(text, 'IO-MATRIX', cpus, ('block',)): need(False, e)
+    else: need(pins == ['irq_affinity=0 fio=' + ('/bin/busybox taskset -c 1-%d' % (cpus - 1) if cpus > 1 else 'none')], 'IRQ/fio pinning')
     need(re.findall(r'^IO-MATRIX-PARSE (\S+) (\d+)$', text, re.M) == [(n, '0') for n in sorted(PROFILES)], 'all profiles parsed exactly once')
     executed = PROFILES if phase == 'write' else ('verify-all',)
     need(re.findall(r'^IO-MATRIX-EXIT (\S+) (\d+)$', text, re.M) == [('version', '0')] + [(n, '0') for n in executed], 'fio execution order/status')
@@ -340,8 +365,11 @@ def run(args):
     else:
         version = subprocess.check_output([str(binary), '--version'], text=True, timeout=10)
         if not version.startswith('QEMU emulator version 11.1.2'): raise ValueError('QEMU version differs')
+    pci = args.transport == 'pci'
+    if pci and args.backend != 'natemu': raise ValueError('--transport pci is a natemu option')
+    if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise ValueError('--transport pci needs inputs prepared by this version')
     args.out.mkdir(parents=True, exist_ok=False)
-    write_json(args.out / 'manifest.json', {'backend': args.backend, 'cpus': args.cpus, 'artifacts': artifacts,
+    write_json(args.out / 'manifest.json', {'backend': args.backend, 'cpus': args.cpus, 'transport': args.transport, 'artifacts': artifacts,
         'input_manifest': {'path': str(args.inputs / 'inputs.json'), 'sha256': digest(args.inputs / 'inputs.json')},
         'oracle_sources': {str(p.resolve()): digest(p) for p in SOURCES},
         'bounds': {'vm_launches': 2, 'main_seconds': 600, 'verify_seconds': 120, 'log_bytes_per_vm': 32 << 20},
@@ -356,11 +384,11 @@ def run(args):
         if digest(image) != pin['outputs']['root.raw']: raise ValueError('clone differs')
         for phase in ('write', 'verify'):
             case = args.out / phase; case.mkdir(); before = digest(image)
-            cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng=0'
+            cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng=0' + (' io_transport=pci' if pci else '')
             if args.backend == 'natemu':
                 command = [str(binary), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.inputs / 'linux'),
                     '--initrd', str(args.inputs / 'bootstrap.cpio'), '--disk', str(image), '--vcpus', str(args.cpus), '--ram', '2G',
-                    '--compile-cache', 'off', '--serial', str(case / 'serial.log'), '--cmdline', cmdline]
+                    '--compile-cache', 'off', '--serial', str(case / 'serial.log'), '--cmdline', cmdline] + (['--virtio-transport', 'pci'] if pci else [])
             else:
                 command = [str(binary), '-machine', 'pc-i440fx-11.1', '-accel', 'tcg,thread=multi', '-cpu', 'max', '-smp', str(args.cpus),
                     '-m', '2048', '-nodefaults', '-display', 'none', '-monitor', 'none', '-no-reboot', '-serial', 'file:' + str(case / 'serial.log'),
@@ -368,7 +396,7 @@ def run(args):
                     '-drive', f'file={image},format=raw,if=none,id=disk,cache=writeback,aio=threads', '-device', baselines.DEVICE]
             result = execute(command, case, 600 if phase == 'write' else 120)
             serial = case / 'serial.log'; text = serial.read_text(errors='replace').replace('\r', '') if serial.exists() else ''
-            errors, logs, data, hashes = judge(text, phase, args.cpus)
+            errors, logs, data, hashes = judge(text, phase, args.cpus, pci)
             exported = case / 'fio'; exported.mkdir()
             for name, content in logs.items(): (exported / name).write_text(content)
             if result['returncode'] != 0 or result['timeout'] or result['log_limit']: errors.append('process failure/timeout/log limit')
@@ -404,7 +432,7 @@ def sample(profile):
     return result
 
 
-def sample_serial(phase, cpus):
+def sample_serial(phase, cpus, pci=False):
     executed = PROFILES if phase == 'write' else ('verify-all',)
     logs = {'version.txt': 'fio-3.39\n', 'version.stderr': ''}
     logs.update({f'parse-{n}.{s}': '' for n in PROFILES for s in ('stdout', 'stderr')})
@@ -412,9 +440,13 @@ def sample_serial(phase, cpus):
         logs.update({n + '.json': json.dumps(sample(n)), n + '.stdout': '', n + '.stderr': ''})
     if phase == 'write': logs['fs.log'] = 'fixture dd output\n'
     mode = 'rw' if phase == 'write' else 'ro'
+    pin = 'irq_affinity=0 fio=/bin/busybox taskset -c 1-%d' % (cpus - 1) if cpus > 1 else 'irq_affinity=0 fio=none'
+    if pci: pin = 'irq_affinity=%d fio=/bin/busybox taskset -c %s' % (cpus - 1, ','.join(map(str, range(cpus - 1)))) if cpus > 1 else pin
+    probe = ['IO-MATRIX-PCI-BEGIN', 'IO-MATRIX-PCI-DEV 0000:00:00.0 0x8086 0x1237 0x060000', 'IO-MATRIX-PCI-DEV 0000:00:01.0 0x1af4 0x1042 0x010000',
+             'IO-MATRIX-PCI-IRQ  28:  ' + '  '.join(['5'] * cpus) + '  PCI-MSIX-0000:00:01.0   1-edge      virtio0-req.0', 'IO-MATRIX-PCI-END'] if pci else []
     lines = [f'IO-MATRIX-BEGIN phase={phase} cpus={cpus} kernel={block.KVER}',
-             f'IO-MATRIX-ROOT /dev/vda ext4 {mode},relatime',
-             'IO-MATRIX-PIN irq=16 ' + ('irq_affinity=0 fio=/bin/busybox taskset -c 1-%d' % (cpus - 1) if cpus > 1 else 'irq_affinity=0 fio=none'),
+             f'IO-MATRIX-ROOT /dev/vda ext4 {mode},relatime'] + probe + [
+             'IO-MATRIX-PIN irq=16 ' + pin,
              'IO-MATRIX-DEVICE driver=virtio_blk sectors=4194304 logical=512',
              'IO-MATRIX-MARK name=mounted-root uptime=1.00', 'IO-MATRIX-EXIT version 0']
     lines += [f'IO-MATRIX-PARSE {n} 0' for n in sorted(PROFILES)]
@@ -464,6 +496,13 @@ def self_check():
             assert judge(text + 'IO-MATRIX-LOG-BEGIN version.txt\nfio-3.39\nIO-MATRIX-LOG-END version.txt\n', phase, cpus)[0]; count += 1
             assert judge(text + 'IO-MATRIX-DATA file=0 bytes=268435456 sha256=' + '0' * 64 + '\n', phase, cpus)[0]; count += 1
             assert judge(text.replace('fio-3.39\n', 'fio-3.39\nfio: end_fsync failed for file /bench/data-0.bin\n', 1), phase, cpus)[0]; count += 1
+    for cpus in (1, 2, 4):
+        text = sample_serial('write', cpus, True)
+        assert not judge(text, 'write', cpus, True)[0], judge(text, 'write', cpus, True)[0]
+        assert judge(sample_serial('write', cpus), 'write', cpus, True)[0]; count += 1       # MMIO sample lacks the probe
+        if cpus > 1:
+            assert judge(text.replace('irq_affinity=%d' % (cpus - 1), 'irq_affinity=0', 1), 'write', cpus, True)[0]; count += 1  # fio on the IRQ vCPU
+        assert judge(text.replace('PCI-MSIX', 'IO-APIC'), 'write', cpus, True)[0]; count += 1
     print(f'{count} negative controls, six valid serial cases and guest shell syntax pass; no VM/fio execution')
 
 
@@ -473,6 +512,7 @@ def main():
     a = sub.add_parser('prepare')
     for n in ('fio-prep', 'block-inputs', 'out'): a.add_argument('--' + n, type=Path, required=True)
     a = sub.add_parser('run'); a.add_argument('--backend', choices=('natemu', 'qemu'), required=True)
+    a.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='natemu virtio transport (--virtio-transport)')
     a.add_argument('--cpus', type=int, choices=(1, 2, 4), required=True)
     for n in ('executable', 'inputs', 'out', 'lock'): a.add_argument('--' + n, type=Path, required=True)
     for n in ('runtime', 'fexc', 'build-manifest'): a.add_argument('--' + n, type=Path)
