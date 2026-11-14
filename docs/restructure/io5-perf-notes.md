@@ -125,6 +125,22 @@ Rules learned in this round:
     code at the same RIP on another vCPU (kernel code, forked children). Order: (d) first (host only, small), then
     pool chunks 2-4; owner chose default-on for the pool once chunk 4's gate passes, with a switch to turn it off.
 
+15. **Census (architecture review's counters; scratch `72722d3`, branch `census-scratch`, profile
+    `natemu-raw/census-profile-1`, uncontended).** Busy 119.8 / 603.2 vCPU-s (configure / make). Dispatcher misses:
+    L1 entry held another block 17.7% / **66.3%**, needed revalidation **54.4%** / 29.0%, needed translation 27.8% /
+    4.6%, L1 empty ~0. Distinct page-epochs are only **11.2% / 8.6%** of revalidations (upper bound). **37% / 52%** of
+    host hits are answers a flush threw away (11 and 10 of the 15 and 14 flushes are capacity flushes). Aborts per
+    table page per epoch 26 / 101; the guest's A bit is already set in 98-99.96% of shadow installs. Links whose target
+    was already current (`linked_current`): 8.4 M / 27.3 M, ~5 / ~16-18 vCPU-s (4.2% / ~3%). Interrupts: a peer
+    vCPU's kick costs 125 us on configure (93% of the irq bucket; 26 us on make); timer 4-6 us.
+    Stop rules: all continue. (2) bigger/associative L1 — continue for make (conflicts, not hash quality: decision 9's
+    fold changed the index, not capacity); (4) relink step 2 — above its 1% gate; (6) page-level currency — one
+    revalidation per page-epoch would remove ~89-91% of revalidations; (7) flush policy — continue; (8) fault-around —
+    continue, installing only neighbours whose A bit is already set adds no A-bit side effect. (9) the kick cost is
+    unattributed: likely invalidation/shadow-reset/flush work charged to `irq`; needs a bucket before any fix.
+    Ranking by measured share: page-level currency (configure) and flush policy (both) first, then L1 conflicts
+    (make), relink step 2, fault-around, kick attribution.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
