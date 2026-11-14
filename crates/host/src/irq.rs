@@ -260,7 +260,11 @@ impl Irqs {
         self.lock().lapics.send(Message {
             dest: (address >> 12) as u8,
             logical: address & 4 != 0,
-            mode: if address & 8 != 0 && mode == 0 { 1 } else { mode },
+            mode: if address & 8 != 0 && mode == 0 {
+                1
+            } else {
+                mode
+            },
             vector: data as u8,
             level: false,
         })
