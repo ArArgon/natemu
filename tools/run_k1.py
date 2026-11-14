@@ -738,7 +738,7 @@ def pic_bodies(i, n=1):
 # Page-currency chunk 0 (module docstring): X, Y, Z at V + 0, 0x100, 0x200 (every frame holds `mov eax, k; jmp r13` at each: F1's
 # 1, 0x11, 0x21, F2's 2, 0x12, 0x22). `page-large-edge`: linear 2 MiB page LP over guest-physical 0, X at gpa 0x30000, Y in the legacy hole.
 PAGE_PROGRAMS = ('page-share', 'page-check-keep', 'page-large-edge')
-PX, PY, PZ = 0, 0x100, 0x200
+PGX, PY, PZ = 0, 0x100, 0x200
 PEDGE_X, PEDGE_Y = 0x30000, 0xa1000
 
 
@@ -754,16 +754,16 @@ def page_bodies(i):
     return {
         'page-share': (adv_idt(d) + '    xor edi, edi\n'
                        # (a) three epochs: A, B, A
-                       + call('a0', at(PX)) + save('r8') + call('a1', at(PY)) + save('r9')
-                       + cr3('tb') + call('b0', at(PX)) + save('r10') + call('b1', at(PY)) + save('r12')
-                       + cr3('ta') + call('c0', at(PX)) + save('r14') + call('c1', at(PY)) + save('r15')
+                       + call('a0', at(PGX)) + save('r8') + call('a1', at(PY)) + save('r9')
+                       + cr3('tb') + call('b0', at(PGX)) + save('r10') + call('b1', at(PY)) + save('r12')
+                       + cr3('ta') + call('c0', at(PGX)) + save('r14') + call('c1', at(PY)) + save('r15')
                        # (b) a fresh epoch of A: X, then Y on the page X recorded; V -> F2 and INVLPG V: Y runs F2's bytes
-                       + cr3('ta') + call('d0', at(PX)) + call('d1', at(PY)) + put(d + F2) + inv + call('d2', at(PY)) + save('rbx')
+                       + cr3('ta') + call('d0', at(PGX)) + call('d1', at(PY)) + put(d + F2) + inv + call('d2', at(PY)) + save('rbx')
                        # (c) V not present, a load faults, the handler maps F1 again with no INVLPG: Y runs F1's bytes
                        + cr3('ta') + call('e0', at(PY)) + put(d + F1, P.LEAF & ~1) + f'    mov rsi, [{d:#x}]\n' + call('e1', at(PY)) + save('rbp')
                        + '    jmp .end\n.h:\n' + put(d + F1) + '    inc rdi\n    add rsp, 8\n    iretq\n.end:\n'),
         # X recorded under F1, V -> F2 with no INVLPG, Y and Z placed on V (new blocks, so each walks V).
-        'page-check-keep': call('k0', at(PX)) + save('r8') + put(d + F2) + call('k1', at(PY)) + save('r9') + call('k2', at(PZ)) + save('r10'),
+        'page-check-keep': call('k0', at(PGX)) + save('r8') + put(d + F2) + call('k1', at(PY)) + save('r9') + call('k2', at(PZ)) + save('r10'),
         # The 2 MiB leaf over gpa 0 (the legacy hole inside it), X below the hole runs, Y in the hole is not RAM.
         'page-large-edge': (f'    mov rax, {0x80 | P.LEAF:#x}\n    mov [{pde:#x}], rax\n'
                             + call('x0', f'{LP + PEDGE_X:#x}') + save('r8') + call('x1', f'{LP + PEDGE_Y:#x}') + save('r9')),
@@ -1141,16 +1141,16 @@ def chunk_bodies(k, i, n):
                         + pge(False) + cr3('ta') + c('g3', d + PZ) + save('r12') + cr3('tb') + c('g4', d + PZ) + save('r14')),
         # SMEP on throughout, one epoch. X on V runs at CPL 3 (user record); at CPL 0 a fetch of V + PY must #PF (r14 = 0x11); Z on S runs at
         # CPL 0 (supervisor record); then the logging IDT is back and a CPL-3 fetch of S must #PF: the run stops (`guest_fault`).
-        'page-user': (sidt('sidt') + adv_idt(d) + cr4('bts', 20) + c3('u0', d + PX) + save('r8') + '    xor eax, eax\n' + c('u1', d + PY)
+        'page-user': (sidt('sidt') + adv_idt(d) + cr4('bts', 20) + c3('u0', d + PGX) + save('r8') + '    xor eax, eax\n' + c('u1', d + PY)
                       + save('r9') + c('u2', d + STUB['S']) + save('r10') + '    jmp .skip\n' + TO_R13 + '.skip:\n' + sidt('lidt')
                       + c3('u3', d + STUB['S'] + PY)),
         # CPL 3: X on V runs; at CPL 0 V -> F2 and INVLPG: Y on V runs F2's bytes at CPL 3. Then V not present, a supervisor load faults, the
         # handler maps F1 again (no INVLPG): Z on V runs F1's bytes at CPL 3 (the #PF cleared the user record).
-        'page-user-invlpg': (adv_idt(d) + '    xor edi, edi\n' + c3('i0', d + PX) + save('r8') + put(d + F2) + inv(d) + c3('i1', d + PY) + save('r9')
+        'page-user-invlpg': (adv_idt(d) + '    xor edi, edi\n' + c3('i0', d + PGX) + save('r8') + put(d + F2) + inv(d) + c3('i1', d + PY) + save('r9')
                              + put(d + F1, P.LEAF & ~1) + f'    mov rsi, [{d:#x}]\n' + c3('i2', d + PZ) + save('r10') + '    jmp .end\n.h:\n'
                              + put(d + F1) + '    inc rdi\n    add rsp, 8\n    iretq\n.end:\n'),
         # One epoch: X on V runs (the frame marked); the frame written (X dies); Y placed on V (from the record: the mark again); written again.
-        'page-mark': (c('m0', d + PX) + save('r8') + f'    mov byte [{d + F1 + 1:#x}], 0x31\n' + c('m1', d + PY) + save('r9')
+        'page-mark': (c('m0', d + PGX) + save('r8') + f'    mov byte [{d + F1 + 1:#x}], 0x31\n' + c('m1', d + PY) + save('r9')
                       + f'    mov byte [{d + F1 + PY + 1:#x}], 0x41\n' + c('m2', d + PY) + save('r10')),
         # Under `--page-currency check`: LP a 2 MiB page, X runs (2 MiB record); the PDE replaced by a page table of 4 KiB pages of the same
         # frames with no INVLPG; Y placed on LP: the record (a large leaf) and the walk (a 4 KiB leaf) differ in flags: one disagreement.
@@ -1430,7 +1430,9 @@ def adv_setup(i):
     return p
 
 # natemu-only: allowed (r8, r9, r10, r14) tuples per CPU (a fetch #PF may or may not be taken: QEMU's TLB holds V)
-ADV_EITHER = {'pf-fetch': {(1, 1, 1, 0), (1, 2, 2, 1)}}
+# `mixed-g1` (page record, SDM Vol.3 4.10.4.1): S1 is global, so its translation survives the CR3 load to B, where it is mapped elsewhere:
+# the block crossing from S0 into S1 may run the old frame (0x100, from the global record) or the new one (0x200, QEMU's).
+ADV_EITHER = {'pf-fetch': {(1, 1, 1, 0), (1, 2, 2, 1)}, 'mixed-g1': {(0x100, 0x100, 0x100, 0), (0x100, 0x100, 0x200, 0)}}
 
 
 def adv_program(name, n):
