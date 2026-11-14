@@ -32,7 +32,10 @@ Rules learned in this round:
   and two natemu runs. Every VM launch holds `natemu-raw/.vm.lock` (`run_k1.py` takes none: wrap it in `lockf`);
   `run_io5.py` records any other VM overlapping a run (`contended`). Untimed runs (K1, suites) take the lock SHARED
   (`tools/vm_lock.py --shared CMD`) so they run beside each other and only wait for timed runs; exclusive `lockf` on
-  untimed K1 runs serialised three agents and a timing behind each other for over half an hour. Builds during timed runs go to the efficiency
+  untimed K1 runs serialised three agents and a timing behind each other for over half an hour. Never combine the
+  lock with a "wait until no natemu process" loop: a queued runner's own command line (`--natemu .../natemu`) matches
+  such a pattern, and the lock holder then waits forever on a process waiting for its lock (a 40-minute deadlock).
+  The lock alone guarantees exclusivity, since every VM runner takes it. Builds during timed runs go to the efficiency
   cores (`taskpolicy -c background`). Agents in git worktrees must export `NATEMU_RAW_ROOT`.
 - **Small gains are real but invisible in single runs** (wall spread 1-2.5 s): a change is kept when its buckets show
   the work removed; wall time is judged per group (owner, November 13).
