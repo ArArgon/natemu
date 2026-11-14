@@ -512,7 +512,7 @@ def pic_bodies(i, n=1):
 # dropped and remade; the record area fills in every pass, and each fill costs at most two passes over it (`reclaims`
 # bounded by the links made).
 MAX_LINKS = 512 * 1024                    # natemu_abi::execution::cache::MAX_LINKS
-FM = 2 * MAX_LINKS // 4096 + 12          # 140 at 512 Ki (70 at 256 Ki: the chain must hold more than MAX_LINKS)
+FM = MAX_LINKS // 4096 + 12              # 140 at 512 Ki (76 at 256 Ki): 2 * 2048 * FM records > MAX_LINKS
 FW, FH = FM - 10, FM // 2        # FW late in the chain: its links are live when it is written (a fill keeps the chain's tail)
 FC, FWC, FC2, FE = 0x9000, 0xa000, 0xb000, 0xc000
 FULL_CODE = ['--code-cache', str(96 << 20)]  # 2 * 2048 * FM + blocks of FEX code: more than the default 16 MiB

@@ -2132,8 +2132,11 @@ pub fn invlpg(address: u64) -> Option<u64> {
         if cut_one(n, false).is_some() {
             undone = undone.zip(unlink_inbound(n, false)).map(|(a, b)| a + b);
         }
+        // (Only while every record so far described its word: a broken one halts with its own stop, `BAD_LINK`.)
         #[cfg(feature = "link-check")]
-        check_inbound(n, false);
+        if undone.is_some() {
+            check_inbound(n, false);
+        }
     };
     if held(&c.regions) {
         on_linear_page(address >> 12, &mut cut);
@@ -2207,6 +2210,7 @@ fn cut(doomed: impl Iterator<Item = usize>, dead: bool) -> Option<u64> {
 /// [`Control::links_tlb`] (a dead block's: none at all). Halts `stop::LINK_CHECK` otherwise (or if the list does not
 /// end within [`area::MAX_LINKS`] steps).
 #[cfg(feature = "link-check")]
+#[track_caller]
 fn check_inbound(n: usize, dead: bool) {
     let mut at = block(n).inbound;
     for _ in 0..=area::MAX_LINKS {
