@@ -11,7 +11,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools/reference')]
-import ref
+import ref, asmcache
+asmcache.install(ref)      # clang runs once per distinct text (tools/asmcache.py)
 
 CODE, DATA = 0x100000, 0x200000
 INITIAL = 0x816243248566a788
