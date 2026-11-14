@@ -1481,7 +1481,7 @@ RELINK_VALUES = {
 RELINK_LEAST = {
     'cr3-relink': {'relinked': 4, 'suspended': 4},
     'relink-smc': {'suspended': 4},
-    'relink-dead-source': {'suspended': 4, 'relinked': 1, 'links_susp': 1},
+    'relink-dead-source': {'suspended': 4, 'relinked': 1, 'relink_dropped': 1, 'links_susp': 1},   # (the dead J1's suspended record goes at J2's relink)
     'relink-stale': {'relinked': 1, 'relink_dropped': 1},
     'relink-held': {'relinked': 1, 'links_susp': 1},
     'relink-global': {'relinked': 1, 'suspended': 1},

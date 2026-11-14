@@ -2158,10 +2158,11 @@ fn list_moved(from: u64, to: u64) {
     if from == to {
         return;
     }
+    // (Relink plan: a suspended record is named by no slot: its point's slot is empty or names a live record, which is another one.)
     let slot = out_slot(unsafe { &*record(to as usize) });
-    #[cfg(feature = "link-check")]
-    out_check(slot, from as u32 + 1);
-    unsafe { *slot = to as u32 + 1 };
+    if unsafe { *slot } == from as u32 + 1 {
+        unsafe { *slot = to as u32 + 1 };
+    }
     unsafe {
         let r = record(to as usize).read();
         if !listed(&r) {
@@ -2206,7 +2207,9 @@ fn insert(r: LinkRecord, k: usize) {
 /// slot so freed. `follow` (a record's index + 1, or 0) is kept pointing at its record if that moves.
 fn remove(i: u64, k: usize, follow: &mut u32) {
     list_del(i as usize);
-    out_del(i as usize);
+    if k != SUSP {
+        out_del(i as usize);
+    }
     let ends = ends(control());
     let mut hole = i;
     for e in ends.into_iter().skip(k) {
@@ -2250,8 +2253,7 @@ fn unlink_outbound(n: usize) -> Option<u64> {
         let Some(i) = (block(n).out[k] as u64).checked_sub(1) else {
             continue;
         };
-        // (Relink plan: a suspended record keeps its source's slot, so a dead source drops it too; its word was restored when it
-        // was suspended.)
+        // (Relink plan: no suspended record is named by a slot; the guard keeps one from being unlinked twice if it ever were.)
         if i >= control().links_susp {
             unlink(unsafe { record(i as usize).read() })?;
             undone += 1;
@@ -2544,12 +2546,15 @@ fn check_no_dead_links() {
     for i in 0..c.links as usize {
         let r = unsafe { record(i).read() };
         let dead = |n: u32| block(n as usize).flags & DEAD != 0;
-        let bad = dead(r.source)
+        // (Relink plan: a suspended record's target is not current, and its source may be dead: its death leaves the record, named by
+        // no outbound slot, for the target's next relink or a reclaim to drop.)
+        let susp = (i as u64) < c.links_susp;
+        let bad = dead(r.source) && !susp
             || r.target & area::CHECKED == 0
                 && (dead(r.target)
                     || (i as u64) < c.links_tlb && {
                         let t = block(r.target as usize);
-                        !current(t) || t.flags & INBOUND == 0
+                        (!susp && !current(t)) || t.flags & INBOUND == 0
                     });
         if bad {
             crate::execution::halt_native([line, i as u64, u64::from(r.source)], natemu_abi::execution::stop::LINK_CHECK)
@@ -2722,7 +2727,10 @@ fn suspend(scope: usize) -> Option<u64> {
     let ctr = c.ctr_el0;
     let (from, to) = (c.links_susp, *ends(c)[scope]);
     for i in from..to {
-        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(unsafe { record(i as usize).read() })?);
+        let r = unsafe { record(i as usize).read() };
+        // (A suspended record is named by no outbound slot: its source's point may be linked to another block meanwhile.)
+        out_del(i as usize);
+        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);
     }
     clean_barrier(ctr);
     for i in from..to {
@@ -2745,7 +2753,6 @@ fn drop_suspended() -> u64 {
     let n = c.links_susp;
     for i in 0..n {
         list_del(i as usize);
-        out_del(i as usize);
     }
     let old = ends(c).map(|e| *e);
     let mut new = [0; 5];
@@ -2818,7 +2825,6 @@ fn relink(n: usize) {
 #[cfg(not(feature = "pic-count"))]
 fn resume(i: u64, r: LinkRecord, global: bool, follow: &mut u32) {
     list_del(i as usize);
-    out_del(i as usize);
     let c = control();
     let last = c.links_susp - 1;
     if last != i {

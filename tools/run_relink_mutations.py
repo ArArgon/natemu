@@ -23,18 +23,15 @@ NEW = 'cr3-relink,relink-smc,relink-dead-source,relink-stale,relink-held,relink-
 MUTATIONS = {
     # ---- the plan's table
     'no-unlinked-guard': ([(CACHE, 'p.offset != 0 && p.offset == r.offset() && unlinked(source, p))', 'p.offset != 0 && p.offset == r.offset())')], 'relink-stale', False),
-    'dead-source-kept-and-relinked': ([(CACHE, '        if source.flags & DEAD != 0\n            || !Some(&source.links', '        if !Some(&source.links'),
-                              (CACHE, '        // was suspended.)\n        if i >= control().links_susp {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut 0);',
-                               '        // was suspended.)\n        if i >= control().links_susp {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n            remove(i, segment_of(i), &mut 0);\n        }')],
-                             'relink-dead-source', True),
+    'dead-source-relinked': ([(CACHE, '        if source.flags & DEAD != 0\n            || !Some(&source.links', '        if !Some(&source.links')], 'relink-dead-source', False),
     'kill-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if (all || i < control().links_tlb) && i >= control().links_susp {\n            // (A suspended record')],
                              'relink-smc', True),
     'invlpg-cut-keeps-suspended': ([(CACHE, '        if all || i < control().links_tlb {\n            // (A suspended record', '        if all || (i < control().links_tlb && i >= control().links_susp) {\n            // (A suspended record')],
                                     'relink-invlpg,remap-link,cross-link', True),
     'unlink-all-unlinks-suspended': ([(CACHE, '        if i as u64 >= c.links_susp {\n            unlink(r)?;', '        if true {\n            unlink(r)?;')], 'cr3-relink', False),
-    'outbound-unlinks-suspended': ([(CACHE, '        // was suspended.)\n        if i >= control().links_susp {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut 0);', '        // was suspended.)\n        if true {\n            unlink(unsafe { record(i as usize).read() })?;\n            undone += 1;\n        }\n        remove(i, segment_of(i), &mut 0);')], 'relink-dead-source', False),
     'inbound-unlinks-suspended': ([(CACHE, '            if i >= control().links_susp {\n                unlink(r)?;\n                undone += 1;', '            if true {\n                unlink(r)?;\n                undone += 1;')], 'relink-smc', False),
-    'drop-suspended-keeps-outbound': ([(CACHE, '        list_del(i as usize);\n        out_del(i as usize);\n    }\n    let old = ends(c)', '        list_del(i as usize);\n    }\n    let old = ends(c)')], 'relink-reclaim', True),
+    # (A suspended record is named by no outbound slot: `suspend` clears the slot, so a reclaim, a relink's drop or a dead source never meets one.)
+    'suspend-keeps-out-slot': ([(CACHE, '        out_del(i as usize);\n        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);', '        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);')], 'relink-reclaim,relink-dead-source,cr3-relink', True),
     'relinked-always-cr3': ([(CACHE, 'resume(i, r, global, &mut at);', 'resume(i, r, false, &mut at);')], 'relink-global', False),
     'relink-before-flags': ([(CACHE, '                // Relink plan: the links the last TLB event suspended into it are patched again (after the walk: it may\n', '                // MUTATION\n'),
                              (CACHE, '            if let Some(walked) = walked.filter(|_| block(n).flags & DEAD == 0) {\n                c.revalidated += 1;',
@@ -53,9 +50,9 @@ MUTATIONS = {
     'suspend-skips-last-word': ([(CACHE, '    for i in from..to {\n        clean_pou(ctr, area::CODE_WRITE_VA', '    for i in from..to.saturating_sub(1) {\n        clean_pou(ctr, area::CODE_WRITE_VA')], 'cr3-relink,relink-many', False),
     # ---- the host check's other rules
 }
-# (Drain fix: a block's death undoes its links out by its outbound list, `unlink_outbound`, not a pass over the records; a suspended
-# record stays on its source's outbound list, so that list is what drops it. `prune` meets suspended records only from a reclaim, after
-# `drop_suspended`.)
+# (Drain fix: a block's death undoes its links out by its outbound slots, `unlink_outbound`. A suspended record is named by no slot (its
+# point may hold another link), so a dead source's suspended records are dropped by the target's next relink, a reclaim or the target's
+# death.)
 # Mutations that cannot be caught by K1, with the argument (reported as `not testable`, never run).
 NOT_TESTABLE = {
     'suspend-skips-barrier': 'the batch\'s `dsb`/`isb` and the cache maintenance order the new words before the next fetch; on this core (CTR_EL0 IDC and DIC set, or the clean nearly free) a missing barrier shows in no run',

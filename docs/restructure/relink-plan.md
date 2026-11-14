@@ -250,10 +250,13 @@ differences and findings:
   restores the words of `[links_susp, scope)` in the same two-pass batch (clean and barrier, then invalidate) and moves no record.
   `synchronize_words` (arm and disarm) and relink's batch go through one `synchronize_offsets`; the CTR_EL0 shortcuts stay in
   `clean_pou`, `clean_barrier` and `invalidate_pou` (and `synchronize_code`).
-- **Drain fix (`drain-fix`, outbound lists).** A suspended record stays on its source's outbound list, so a dead source's
-  `unlink_outbound` drops it (it skips the word's restore for a suspended record: `i < links_susp`); this replaces the plan's
-  "`prune(CHECKED, false)` drops suspended records with a dead source". `resume` keeps the outbound list right (`out_del` before the
-  slot is reused, `out_add` at the final slot; `list_moved` fixes the moved neighbour's cell), `drop_suspended` calls `out_del`.
+- **Drain fix (fixed outbound slots, one per link point).** A point has one slot but may have several records (a live one and
+  suspended ones into other blocks: `cr3-link` alternates two targets through one site), so a suspended record is named by **no**
+  slot: `suspend` clears the slot (`out_del`), `resume` sets it again (`out_add`), `list_moved` updates a slot only when it names
+  the moved record, `remove(.., SUSP, ..)` and `drop_suspended` clear none, and the host check and `link-check` name only live records
+  in slots. A dead source's live records go by its slots as before; its suspended records stay until the target's next relink
+  drops them (source dead), a reclaim or the target's death; the host check and `link-check` allow a dead source for a suspended
+  record (a dead target never). This replaces the plan's "`prune(CHECKED, false)` drops suspended records with a dead source".
 - **`cr3-link`'s end state does not hold a shared word.** The body's restore is a CR3 load and a CR4 write, so at every program's
   end all non-local records are suspended and the word is unlinked. The held-word state (J -> Y2 live, J -> Y1 suspended, one word)
   is reached by `relink-held`, which ends in a #PF before the restore; every new program ends so (`cr3-relink` after its flush).

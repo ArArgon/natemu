@@ -1281,7 +1281,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         let local = i as u64 >= control.links_tlb;
         let current = t.checked == control.epoch
             || (t.flags & cache::GLOBAL != 0 && t.checked >= control.global_epoch);
-        // A suspended record (relink plan): a live source and target, the target not current (the epoch moved at the event that
+        // A suspended record (relink plan): a live target (its source may be dead), the target not current (the epoch moved at the event that
         // suspended it, and the target is revalidated only by a lookup, which relinks or drops its records), INBOUND set (a cut
         // must find the list), the point it names present with its admitted word, and that word unlinked, or held by exactly one
         // live record of the same point (the point was linked elsewhere meanwhile: the linker's link into another block of the
@@ -1297,8 +1297,8 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             });
             let held = linked.contains_key(&(r.source, r.offset()));
             let mut why = None;
-            if source.flags & cache::DEAD != 0 || t.flags & cache::DEAD != 0 {
-                why = Some("a dead end");
+            if t.flags & cache::DEAD != 0 {
+                why = Some("a dead target");
             } else if current {
                 why = Some("a current target");
             } else if t.flags & cache::INBOUND == 0 {
@@ -1341,26 +1341,27 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     }
     // A dead block has no link into or out of it (its death undid them): no record names one.
     let dead = |n: u32| blocks.get(n as usize).is_some_and(|b| b.flags & cache::DEAD != 0);
-    if let Some(i) = records
-        .iter()
-        .position(|r| dead(r.source) || r.target & cache::CHECKED == 0 && dead(r.target))
-    {
+    // (Relink plan: but a suspended record's source may be dead: the record is named by no outbound slot, and the target's next
+    // relink or a reclaim drops it.)
+    if let Some(i) = records.iter().enumerate().position(|(i, r)| {
+        dead(r.source) && i as u64 >= control.links_susp || r.target & cache::CHECKED == 0 && dead(r.target)
+    }) {
         return Err(format!("record {i} names a dead block"));
     }
-    // The outbound slots: each block's slot k names a record of its point k (checked ones too) or none, and every record is
-    // named by its source's slot.
+    // The outbound slots: each block's slot k names a live record of its point k (checked ones too) or none, and every live record
+    // is named by its source's slot (a suspended one by none: the point may hold another link).
     let mut named = 0;
     for (n, b) in blocks.iter().enumerate() {
         for (k, &slot) in b.out.iter().enumerate().filter(|&(_, &s)| s != 0) {
             records
                 .get(slot as usize - 1)
-                .filter(|r| r.source as usize == n && r.point() == k)
+                .filter(|r| r.source as usize == n && r.point() == k && slot as u64 > control.links_susp)
                 .ok_or_else(|| format!("block {n}'s outbound slot {k} is broken at record {}", slot - 1))?;
             named += 1;
         }
     }
-    if named != records.len() {
-        return Err(format!("{named} records in outbound slots, {} links", records.len()));
+    if named != live.len() {
+        return Err(format!("{named} records in outbound slots, {} live links", live.len()));
     }
     Ok((points, linked.len() as u64))
 }
