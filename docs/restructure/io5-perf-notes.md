@@ -168,6 +168,12 @@ Rules learned in this round:
     including the eviction's own cost and the pool's overlap. Instances are 66-69% of block numbers on configure,
     37-45% on make.
 
+18. **Admission is done** (host counter `f7becee`, profile `natemu-raw/admission-reasons-profile-1`). Every cache hit
+    now reuses its kept form: configure 2.80 M of 3.40 M object answers skip admission (82%), make 4.98 M of 6.18 M
+    (81%). What is still admitted is first compiles (0.60 M / 1.13 M) plus 0.07 M recompiles of dropped answers on make;
+    privilege, bulk, shape, prefix and relocation refusals are ~0. A kept form per context would gain nothing; the
+    remaining cost (~1 s of configure) is the check on first compiles, which must stay (containment).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
