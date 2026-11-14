@@ -2193,6 +2193,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 Ok(())
             });
             let supervision = owners::supervise(n, &prepare, &body, &cancelled);
+            if let Some(report) = backing.pool_report() {
+                eprintln!("{report}");
+            }
             all_ended.store(true, SeqCst);
             if let Some(control) = &pending_compiler {
                 control.abort();

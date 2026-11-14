@@ -539,6 +539,7 @@ PIC_ENV = {'link-full': 'off', 'pic-user': 'user'}
 # Cross-vCPU reuse programs (module docstring). RLD: a frame of RL's bytes; PW, PWE: `pool-wrap`'s chain page and its end page.
 POOL = ('pool-peer', 'pool-frame', 'pool-smc', 'pool-ctx', 'pool-cross', 'pool-wrap', 'pool-fence')
 RLD, PW, PWE = 0xd000, 0xd000, 0xe000
+PX = 0xffa                       # `pool-cross`: `mov rax, imm64` at PX of RL, its immediate's last four bytes on RL2's (or RLC's) first
 PW_BLOCKS = 1024                  # `inc ebx; jz $+2` (four bytes, two instructions, one block) per entry of the chain page
 POOL_ENV = {'pool-wrap': {'NATEMU_POOL_RING_KB': '64', 'NATEMU_POOL_INDEX_SLOTS': '4096'}}
 # Per CPU: the least blocks copied from the pool, and the least refusals by reason (resident `pool_refusal` names).
@@ -578,11 +579,12 @@ def pool_bodies(i, n=1):
                      + save(('r8', 'rbx')) + flush + mx(3) + '    xor ebx, ebx\n' + call('z1', f'{RV3 + ZO:#x}')
                      + save(('r9', 'r15'), ('r10', 'rbx')) + mx(0) + call('z2', f'{RV3 + ZO:#x}') + save(('r12', 'rbx'))
                      + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
-        # (As `reuse-cross`.) RV1's crossing block, flush, RV2 in table A (the second frame the same): from the pool; RV2 in
-        # table B (its second frame RLC): refused for its bytes, compiled.
-        'pool-cross': (call('x0', f'{RV1 + RX:#x}') + save(('r8', 'rax'), ('r9', 'rdx')) + flush + call('x1', f'{RV2 + RX:#x}')
-                       + save(('r10', 'rax'), ('r12', 'rdx')) + cr3('tb') + call('x2', f'{RV2 + RX:#x}') + save(('r14', 'rax'), ('r15', 'rdx'))
-                       + cr3('ta')),
+        # A block crossing into a second page (`mov rax, imm64` at PX: its last four immediate bytes and the `jmp r13` on the next
+        # page; it starts more than four bytes before the page's end, so its key's lead bytes are on the first page). RV1's
+        # block, flush, RV2 in table A (the second frame the same): from the pool; RV2 in table B (its second frame RLC):
+        # refused for its bytes, compiled.
+        'pool-cross': (call('x0', f'{RV1 + PX:#x}') + save(('r8', 'rax')) + flush + call('x1', f'{RV2 + PX:#x}')
+                       + save(('r10', 'rax')) + cr3('tb') + call('x2', f'{RV2 + PX:#x}') + save(('r14', 'rax')) + cr3('ta')),
         # A chain of PW_BLOCKS blocks run three times with a flush between: a tiny ring wraps (a pool of 64 KiB against some
         # 300 KiB of entries), every CPU running the same bytes meanwhile.
         'pool-wrap': ('    jmp .over\n.run:\n    xor ebx, ebx\n    lea r13, [rel .back]\n' + f'    mov rax, {HIGH:#x}\n    jmp rax\n.back:\n    ret\n.over:\n'
@@ -919,7 +921,13 @@ def reuse_memory(name, i):
         tables += [dict(P.zero(PFLAGS, 0x100), capture=False)]
     if name == 'pool-frame':
         tables += [{'addr': f'0x{d + RLD:x}', 'data': LIB(1).hex()}]
-    if name in ('reuse-cross', 'pic-cross', 'pool-cross'):
+    if name == 'pool-cross':
+        first = bytearray(0x1000)
+        first[PX:] = b'\x48\xb8\x00\x00\x00\x00'
+        tail = lambda k: bytes([k, 0, 0, 0]) + P.asm('jmp r13')
+        return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': tail(1).hex()},
+                         {'addr': f'0x{d + RLC:x}', 'data': tail(2).hex()}]
+    if name in ('reuse-cross', 'pic-cross'):
         first = bytearray(0x1000)
         first[RX:] = P.asm('lea rdx, [rel $+7]') + b'\xb8\x00'
         return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': TAIL(1).hex()},
@@ -981,7 +989,7 @@ def reuse_either(name):
             'pool-frame': {'r8': {RV1}, 'r10': {RV3}, 'r12': {RV3 + 17}},
             'pool-smc': {'r8': {1}, 'r9': {1}, 'r10': {3}, 'r12': {0x1000003}},
             'pool-ctx': {'r8': {5}, 'r9': {1}, 'r10': {0}, 'r12': {5}},
-            'pool-cross': {'r8': {0x100}, 'r9': {RV1 + 0xffe}, 'r10': {0x100}, 'r12': {RV2 + 0xffe}, 'r14': {0x200}, 'r15': {RV2 + 0xffe}},
+            'pool-cross': {'r8': {1 << 32}, 'r10': {1 << 32}, 'r14': {2 << 32}},
             'pool-wrap': {'r8': {PW_BLOCKS}, 'r9': {PW_BLOCKS}, 'r10': {PW_BLOCKS}},
             'pool-fence': {'r8': {RV1}, 'r9': {RV3}, 'r10': {RV3 + 17}, 'r12': {1}},
         }[name]
@@ -1413,7 +1421,9 @@ def main():
                     pool = c['stats']['k1']['pool']
                     if pool['hits'] < POOL_HITS[name]:
                         problems.append(f"cpu{v} pool {pool}, at least {POOL_HITS[name]} blocks copied")
-                    if name in POOL_REFUSED and pool['refused'][POOL_REFUSED[name][0]] < POOL_REFUSED[name][1]:
+                    # (A refusal for bytes is certain only at one CPU: a peer compiling the same other bytes publishes the entry.)
+                    exact = name not in ('pool-smc', 'pool-cross') or len(out['cpus']) == 1
+                    if name in POOL_REFUSED and exact and pool['refused'][POOL_REFUSED[name][0]] < POOL_REFUSED[name][1]:
                         problems.append(f"cpu{v} pool {pool}, at least {POOL_REFUSED[name][1]} refusals for {POOL_REFUSED[name][0]}")
                 # PIC study stage 3: the least instances, checked links and local shared links (natemu_abi::pic::count).
                 for v, c in enumerate(out['cpus'] if out and name in PIC else []):

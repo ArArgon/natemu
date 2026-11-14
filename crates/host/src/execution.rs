@@ -55,6 +55,10 @@ pub struct Backing {
     pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
 }
 impl Backing {
+    /// The template pool's publication counters as the performance log's `pool {...}` line (`None`: no pool).
+    pub fn pool_report(&self) -> Option<String> {
+        self.pool.as_ref().map(|p| p.report())
+    }
     /// The backing's mapping (shared: whoever holds a clone keeps it mapped).
     pub fn memory(&self) -> &Arc<Memory> {
         &self.memory
@@ -2669,7 +2673,10 @@ impl Compiler {
             reply.extent as usize >= bytes.len(),
             bytes.len().min(reply.extent as usize),
         );
-        if fresh != read || Answer::new(reply, rip)? != *answer {
+        // (Bytes cut exactly at the answer's extent, by a breakpoint or a hook's limit, make fexc's extent reach their end: `whole`
+        // then differs from the kept answer's, which only matters when more bytes follow; the answer itself is compared.)
+        let same_extent = fresh.0 == read.0 && fresh.2 == read.2 && (fresh.1 == read.1 || bytes.len() == read.2);
+        if !same_extent || Answer::new(reply, rip)? != *answer {
             return Err(format!(
                 "reuse check: the answer relocated from {from:#x} is not fexc's at {rip:#x}"
             ));
