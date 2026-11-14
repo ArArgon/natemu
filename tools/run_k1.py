@@ -1091,7 +1091,24 @@ CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    ire
 STUB = dict(enter=0x9fff, user=0xa000, exit=0xbfff, back=0xc000, S=0xd000)
 STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac')
 CHUNK_PAGE = ('page-cross', 'page-global', 'page-user', 'page-user-invlpg', 'page-mark', 'page-size-check', 'page-counts')
-CHUNK_MISS = ('miss-counts', 'miss-system', 'miss-step', 'miss-dr7', 'miss-ac', 'miss-event')
+CHUNK_MISS = ('miss-counts', 'miss-system', 'miss-step', 'miss-dr7', 'miss-ac', 'miss-event', 'miss-uc', 'miss-boundary',
+              'hold-io', 'hold-pending', 'hold-event', 'hold-lapic')
+# Hold cases (the fast-miss plan's hook cases; an io-test-hooks host and resident, 1 vCPU, default block size): the guest stores 1 at
+# SIG when its warm-up is done and spins on ACK; the driver (`--miss-hold`) arms the fast path's hold point, stores 1 at ACK, and at
+# the point (the evicted A's miss, the checks not yet made) acts: `io` publishes an I/O window request, `pending` rewrites A's byte
+# and posts its page (no doorbell), `event` posts an interrupt (no doorbell), `wait` lets the guest's LAPIC timer expire. Each case
+# asserts the per-reason decline counter, so a skipped check shows even where the full path would recover.
+HOLD = ('hold-io', 'hold-pending', 'hold-event', 'hold-lapic')
+SIG_ACK = lambda i: (P.SYS_D(i) + 0x7040, P.SYS_D(i) + 0x7048)
+UCP = 0xa000                       # `miss-uc`: the UC data page (PWT | PCD: PAT entry 3), holding A's address; UCX: `jmp [rax]`
+UCX, UCX2 = 0xb000, 0xc000      # (UCX2: `mov rbx, [rax]; jmp r13`, an ordinary block's UC access after the fast misses: stepped again)
+
+
+def hold_spec(name, i):
+    sig, ack = SIG_ACK(i)
+    base = f'{sig:x},{ack:x}'
+    return {'hold-io': f'io,{base}', 'hold-pending': f'pending,{base},{l1_pages(i)["FA"] + 1:x},31', 'hold-event': f'event,{base},30',
+            'hold-lapic': f'wait,{base}'}[name]
 PN = 0xf000                        # `miss-event`: the stub `nop; jmp r12` whose nop posts the event (`post PN VEC`)
 EVENT = 0x30
 PCX = 0x8000                       # `page-cross`: P1's third frame
@@ -1128,6 +1145,16 @@ def chunk_bodies(k, i, n):
                                 f'    mov [{d + MIDT + 0x802:#x}], rax\n    lidt [{d + MIDT + 0x800:#x}]\n')
     hdb = lambda tail: ('    jmp .end\n.hdb:\n    push rbx\n    mov rbx, [rsp+8]\n    mov [rdi], rbx\n    add rdi, 8\n' + tail
                         + '    pop rbx\n    iretq\n.end:\n')
+    sig, ack = SIG_ACK(i)
+    hold_zero = f'    mov qword [{sig:#x}], 0\n    mov qword [{ack:#x}], 0\n'
+    hold_signal = f'    mov qword [{sig:#x}], 1\n.w:\n    cmp qword [{ack:#x}], 1\n    jne .w\n'
+    hold_jump = f'    lea r13, [rel .m]\n    mov rax, {A:#x}\n    sti\n    jmp rax\n.m:\n    cli\n    jmp .end\n' + HOLD_HANDLER + '.end:\n'
+    hold_apic = ('    lea rdx, [rel .h30]\n' + f'    mov rdi, {d + MIDT:#x}\n' + '    mov ecx, 256\n.f:\n    mov [rdi], dx\n    mov word [rdi+2], 8\n'
+                 '    mov word [rdi+4], 0x8e00\n    mov rax, rdx\n    shr rax, 16\n    mov [rdi+6], ax\n    shr rax, 16\n    mov [rdi+8], eax\n'
+                 '    mov dword [rdi+12], 0\n    add rdi, 16\n    dec ecx\n    jnz .f\n'
+                 f'    mov word [{d + 0x7020:#x}], 0xfff\n    mov rax, {d + MIDT:#x}\n    mov [{d + 0x7022:#x}], rax\n    lidt [{d + 0x7020:#x}]\n'
+                 '    xor r14d, r14d\n    mov ecx, 0x1b\n    mov eax, ' + hex(0xfee00d00 if i == 0 else 0xfee00c00) + '\n    xor edx, edx\n    wrmsr\n'
+                 '    mov ecx, 0x80f\n    mov eax, 0x1ff\n    xor edx, edx\n    wrmsr\n')
     sidt = lambda op: f'    {op} [{d + SIDT:#x}]\n'
     return {
         # W (d + 0x3ffe: `mov eax, imm32`, its last three bytes on d + 0x4000) in A and B: A maps P1 as is and P2 to XA (imm 0x100), B
@@ -1178,10 +1205,30 @@ def chunk_bodies(k, i, n):
                        f'    lidt [{d + 0x7020:#x}]\n' + '    xor r14d, r14d\n    mov ecx, 0x1b\n    mov eax, ' + hex(0xfee00d00 if i == 0 else 0xfee00c00) + '\n    xor edx, edx\n    wrmsr\n    mov ecx, 0x80f\n    mov eax, 0x1ff\n    xor edx, edx\n    wrmsr\n' + c('e0', A) + c('e1', B) + c('e2', C) + '    cli\n    lea r12, [rel .p]\n'
                        f'    mov rax, {d + PN:#x}\n    jmp rax\n.p:\n    lea r13, [rel .m]\n    mov rax, {A:#x}\n    sti\n    jmp rax\n.m:\n    cli\n'
                        + '    jmp .end\n.h30:\n    push rax\n    push rcx\n    push rdx\n    mov r14, [rsp+24]\n    mov ecx, 0x80b\n    xor eax, eax\n    xor edx, edx\n    wrmsr\n    pop rdx\n    pop rcx\n    pop rax\n    iretq\n.end:\n'),
+        'hold-io': hold_zero + c('h0', A) + c('h1', B) + c('h2', C) + hold_signal + c('h3', A) + save('r8'),
+        'hold-pending': hold_zero + c('h0', A) + c('h1', B) + c('h2', C) + hold_signal + c('h3', A) + save('r8'),
+        # IF clear and the record's IF 0 (a fresh block after CLI is entered by the resident), then an inline STI (the page's IF 1) and the
+        # jump to the evicted A: the event posted at the point is taken before A's first instruction (r14 = the handler's frame RIP).
+        'hold-event': hold_apic + hold_zero + c('h0', A) + c('h1', B) + c('h2', C) + '    cli\n' + c('h3', pg['D']) + hold_signal + hold_jump,
+        'hold-lapic': (hold_apic + hold_zero + c('h0', A) + c('h1', B) + c('h2', C) + '    cli\n' + c('h3', pg['D'])
+                       + '    mov ecx, 0x83e\n    mov eax, 0xb\n    xor edx, edx\n    wrmsr\n    mov ecx, 0x832\n    mov eax, 0x31\n    wrmsr\n'
+                       '    mov ecx, 0x838\n    mov eax, 480000\n    wrmsr\n' + hold_signal + hold_jump),
+        # `jmp [rax]` through a UC page (PWT | PCD) runs as a step, whose computed exit is the miss at the evicted A with the UC shadow
+        # still mapped (declined: `uncached`; a fast path that took it would skip `uncached_end`'s barrier).
+        'miss-uc': (c('u0', A) + c('u1', B) + c('u2', C) + f'    lea r13, [rel .uc]\n    mov rax, {d + UCP:#x}\n    mov rdx, {d + UCX:#x}\n    jmp rdx\n.uc:\n    mov r8, rax\n'
+                    + c('u3', B) + c('u4', C) + f'    lea r13, [rel .uc2]\n    mov rax, {d + UCP:#x}\n    mov rdx, {d + UCX:#x}\n    jmp rdx\n.uc2:\n    mov r9, rax\n'
+                    + f'    lea r13, [rel .uc3]\n    mov rax, {d + UCP:#x}\n    mov rdx, {d + UCX2:#x}\n    jmp rdx\n.uc3:\n'),
+        # MOV SS then STI, each immediately before the computed exit into the evicted A.
+        'miss-boundary': (c('b0', A) + c('b1', B) + c('b2', C) + f'    lea r13, [rel .b3]\n    mov rax, {A:#x}\n    mov bx, ss\n    mov ss, bx\n    jmp rax\n.b3:\n    mov r8, rax\n'
+                          + c('b4', B) + c('b5', C) + f'    lea r13, [rel .b6]\n    mov rax, {A:#x}\n    sti\n    jmp rax\n.b6:\n    cli\n    mov r9, rax\n'),
         # CPL 3 with CR0.AM and RFLAGS.AC: A, B, C warm (A evicted), then A, whose first instruction is a misaligned load: #AC (the stop).
         'miss-ac': ('    mov rax, cr0\n    bts rax, 18\n    mov cr0, rax\n    pushfq\n    or qword [rsp], 0x40000\n    popfq\n'
                     f'    mov r15, {d + 0x7100:#x}\n' + c3('a0', A) + c3('a1', B) + c3('a2', C) + f'    mov r15, {d + 0x7101:#x}\n' + c3('a3', A)),
     }
+
+
+HOLD_HANDLER = ('.h30:\n    push rax\n    push rcx\n    push rdx\n    mov r14, [rsp+24]\n    mov ecx, 0x80b\n    xor eax, eax\n    xor edx, edx\n    wrmsr\n'
+                '    pop rdx\n    pop rcx\n    pop rax\n    iretq\n')
 
 
 def chunk_memory(name, i, n):
@@ -1205,12 +1252,14 @@ def chunk_memory(name, i, n):
                 mem(d + STUB['back'], b'\x41\xff\xe4', capture=False), mem(d + STUB['S'], CODE(0x21), capture=False), mem(d + STUB['S'] + PY, CODE(0x22), capture=False)]
     if name in ('page-user', 'page-user-invlpg'):
         out += [dict(P.zero(d + IDT, 0x1000), capture=False)]
-    if name in ('miss-step', 'miss-dr7', 'miss-event'):
+    if name in ('miss-step', 'miss-dr7', 'miss-event', 'hold-event', 'hold-lapic'):
         out += [dict(P.zero(d + MIDT, 0x1000), capture=False)]
     if name == 'miss-event':
         out += [mem(d + PN, b'\x90\x41\xff\xe4', capture=False)]
     if name in ('miss-step', 'miss-dr7'):
         out += [P.zero(d + LOGP, 0x40)]
+    if name == 'miss-uc':
+        out += [mem(d + UCX, b'\xff\x20', capture=False), mem(d + UCX2, b'\x48\x8b\x18\x41\xff\xe5', capture=False), mem(d + UCP, l1_pages(i)['A'].to_bytes(8, 'little'), capture=False)]
     if name == 'miss-ac':
         out += [mem(l1_pages(i)['FA'], P.asm('mov eax, [r15]\nmov eax, 1\njmp r13'), capture=False)]
     return out
@@ -1224,6 +1273,8 @@ def chunk_tables(name, i):
         a[d] = b[d] = (d + F1) | P.LEAF | G
     if name == 'page-cross':
         b[d + 0x3000], b[d + 0x4000] = (d + PCX) | P.LEAF, (d + XA) | P.LEAF
+    if name == 'miss-uc':
+        a[d + UCP] = ((d + UCP) | P.LEAF) | 0x18
     if name in STUB_PROGRAMS:
         a.update({d + x: ((d + x) | P.LEAF) & ~US for x in (0x9000, STUB['back'], STUB['S'])})
     return a, b
@@ -1239,6 +1290,11 @@ CHUNK_VALUES = {
     'page-counts': lambda i, k: {'r8': {sum(range(k))}},
     'miss-system': lambda i, k: {'r8': {2 * k}},
     'miss-ac': {},
+    'hold-io': {'r8': {1}},
+    'hold-pending': {'r8': {0x31}},
+    'hold-event': lambda i, k: {'r14': {l1_pages(i)['A']}},
+    'hold-lapic': lambda i, k: {'r14': {l1_pages(i)['A']}},
+    'miss-uc': {'r8': {1}, 'r9': {1}},
     'miss-event': lambda i, k: {'r14': {l1_pages(i)['A']}},
 }
 # `page-check-keep` under the record: Y and Z are placed from F1's record. (`PAGE_VALUES` are the study resident's, where the walk answers.)
@@ -1254,7 +1310,11 @@ PAGE_ON_COUNTS = {'page-share': {'hits': 2}, 'page-global': {'hits': 1}, 'page-l
 PAGE_MODE_RUNS = (('local-gpa', 'check', 1), ('pf-fetch', 'check', 1), ('self-invlpg', 'check', 1), ('self-pge', 'check', 3), ('mixed-g1', 'check', 1))
 # The fast miss path's counts (k1.fast_miss) in a default run: taken at least; declined by reason at least; taken exactly none.
 FAST_TAKEN = {'miss-counts': 1, 'miss-pic': 2, 'miss-ac': 1}
-FAST_DECLINED = {'miss-event': ('event', 1), 'miss-system': ('system', 1), 'miss-step': ('debug', 1), 'miss-dr7': ('debug', 1)}
+FAST_DECLINED = {'hold-io': ('io', 1), 'hold-pending': ('pending', 1), 'hold-event': ('event', 1), 'hold-lapic': ('lapic', 1), 'miss-uc': ('uncached', 1), 'miss-event': ('event', 1), 'miss-system': ('system', 1), 'miss-step': ('debug', 1), 'miss-dr7': ('debug', 1)}
+# Stats a program must show at least (default block size): `page-mark`'s placements from the record mark the frame again (the mark resets this vCPU's
+# writable shadow: 3 resets; without the mark `kept` discards each block placed from the record and steps it: fewer resets, more requests).
+STAT_LEAST = {'page-mark': {'shadow_resets': 3}}
+UC_STEPS = {'miss-uc': 3}   # k1.uncached.steps: the two stepped `jmp [rax]` and the ordinary block's access after them
 FAST_NONE = ('miss-step', 'miss-dr7', 'miss-system')
 # A run that ends in a fault the program provokes: the stop and the vector.
 EXPECT_FAULT = {'page-user': 14, 'miss-ac': 17}
@@ -1468,6 +1528,23 @@ def perf_runtime(a):
     return out
 
 
+def hooks_build(a):
+    """The io-test-hooks host and resident (`--hooks-host`/`--hooks-runtime`, else built here into target/hooks): the hold cases' (the host is
+    signed like `run_slice1_vm.build`'s)."""
+    if a.hooks_host and a.hooks_runtime:
+        return a.hooks_host, a.hooks_runtime
+    target = ROOT / 'target' / 'hooks'
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target))
+    cargo = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
+    host, runtime = target / 'release/natemu-host', target / 'aarch64-unknown-none/release/natemu-runtime'
+    if not (os.environ.get('NATEMU_PREBUILT') == '1' and host.exists() and runtime.exists()):
+        subprocess.run(cargo + ['-p', 'natemu-host', '--features', 'io-test-hooks'], cwd=ROOT, env=env, check=True)
+        subprocess.run(cargo + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none', '--features', 'io-test-hooks'], cwd=ROOT, env=env, check=True)
+        subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', ROOT / 'crates/host/entitlements.plist', host], check=True)
+    a.hooks_host, a.hooks_runtime = host, runtime
+    return host, runtime
+
+
 def study_runtime(a):
     """The resident with its `page-study` feature (the page-currency record's counters), built into its own target directory."""
     if a.page_runtime:
@@ -1592,6 +1669,9 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
     short = prog['name'].split('@')[0].split('-', 1)[1]
     pmode = page_mode or PAGE_FORCED.get(short) or a.page_currency
     options = options + ['--page-currency', pmode]
+    if short in HOLD:
+        host, runtime = hooks_build(a)
+        options = options + ['--miss-hold', hold_spec(short, 0)]
     rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env,
                              shape=check)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
@@ -1617,6 +1697,9 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
             taken, declined = fm.get('taken', 0), fm.get('declined', {})
             if taken < FAST_TAKEN.get(short, 0):
                 problems.append(f'cpu{v} fast miss path took {taken}, want at least {FAST_TAKEN[short]}')
+            problems += [f"cpu{v} {f} = {c['stats'].get(f)}, want at least {m}" for f, m in STAT_LEAST.get(short, {}).items() if (c['stats'].get(f) or 0) < m]
+            if short in UC_STEPS and k1['uncached']['steps'] != UC_STEPS[short]:
+                problems.append(f"cpu{v} UC steps {k1['uncached']['steps']}, want {UC_STEPS[short]}")
             if short in FAST_NONE and taken:
                 problems.append(f'cpu{v} fast miss path took {taken}, want none')
             if short in FAST_DECLINED and declined.get(FAST_DECLINED[short][0], 0) < FAST_DECLINED[short][1]:
@@ -1644,6 +1727,8 @@ def main():
     shard.add(ap)
     ap.add_argument('--full-links', action='store_true', help=f'link-full at the production link capacity ({MAX_LINKS} records: ~6 min at 1 vCPU, ~20 at 4) instead of the test capacity {LINK_CAP} (the end-of-round suite runs this once)')
     ap.add_argument('--page-currency', default='on', choices=('on', 'off', 'check', 'check-halt'), help='the page record mode of every run (local-gpa and the check programs keep their own)')
+    ap.add_argument('--hooks-host', type=pathlib.Path, help='an io-test-hooks host for the hold cases (default: built into target/hooks)')
+    ap.add_argument('--hooks-runtime', type=pathlib.Path, help='its resident')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
     a = ap.parse_args()
     set_link_cap(MAX_LINKS if a.full_links else LINK_CAP)
@@ -1652,7 +1737,7 @@ def main():
     stub = smp.build_stub(a.out / 'qemu-build')
     report, failures = [], []
     listed = [x for x in bodies(a.k) if x not in L1_VARIANTS]
-    cases = [(n, name, adv) for adv, names in ((0, listed), (1, adv_setup(0))) for n in a.cpus for name in names if not a.programs or name in a.programs]
+    cases = [(n, name, adv) for adv, names in ((0, listed), (1, adv_setup(0))) for n in a.cpus for name in names if (not a.programs or name in a.programs) and not (name in HOLD and n != 1)]
     mine = set(shard.take(cases, a.shard))   # (CPU count, program) cases are independent; the counts below run on shard 1
     for n in a.cpus:
         for name in [x for x in bodies(a.k) if (n, x, 0) in mine]:
@@ -1745,7 +1830,7 @@ def main():
                 if want is None:
                     failures.append(f"{prog['name']}: QEMU run failed ({rc}) {err[-200:]}")
                     continue
-            for extra in ([], [1]):
+            for extra in ([[]] if name in HOLD else [[], [1]]):
                 out, problems = run(a, prog, extra)
                 if out and want:
                     problems += s3.smp.compare(prog, s3.vm_state(prog, out), want)

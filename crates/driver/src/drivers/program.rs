@@ -1192,6 +1192,12 @@ pub(crate) struct Args {
     io_disk: Option<String>,
     #[arg(long, requires = "io_disk", value_parser = ["normal", "hold-reset", "hold-disable", "hold-power", "hold-power-halt", "power-sync-error", "read-error", "write-error", "batch-error", "flush-error", "cycle-reset", "cycle-disable", "out-of-order", "reset-mixed", "cancel-batch", "hold-publish-reset", "hold-publish-disable", "hold-publish-power"])]
     io_script: Option<String>,
+    /// Fast-miss tests (io-test-hooks build): `KIND,SIG,ACK[,ARG...]`. When the guest stores 1 at guest-physical SIG the driver arms the
+    /// fast miss path's hold point on vCPU 0 and stores 1 at ACK (the guest spins on it); at the point KIND acts and releases: `io`
+    /// publishes an I/O window request (a read of SIG), `pending,GPA,HEXBYTES` rewrites guest bytes and posts their page (no
+    /// doorbell), `event[,VECTOR]` posts an interrupt (no doorbell; default vector 0x30). `wait` holds 300 ms.
+    #[arg(long)]
+    miss_hold: Option<String>,
     /// Production network frontend with an independent owned-packet loopback endpoint
     #[arg(long, conflicts_with_all = ["io_disk", "io_windows"])]
     io_net: bool,
@@ -1222,6 +1228,75 @@ pub(crate) struct Args {
     /// GPA of the fixture's shared `mov eax, imm32; ret` function
     #[arg(long, value_parser = number, requires = "io_windows")]
     io_window_code: Option<u64>,
+}
+
+/// `--miss-hold` (see the option): the controller of the fast miss path's hold point. Writes one `miss-hold:` line.
+#[cfg(feature = "io-test-hooks")]
+fn miss_hold(
+    backing: &execution::Backing,
+    machine: &Machine,
+    stops: &execution::Stops,
+    spec: &str,
+    ended: &AtomicBool,
+) {
+    use natemu::execution::io::Transfer::Read;
+    use natemu::execution::io_test::{HITS, Hooks, MISS_FAST_CHECK, REACHED, TIMEOUT};
+    use std::time::{Duration, Instant};
+    let h = Hooks::new(backing);
+    let began = Instant::now();
+    let wait = |done: &dyn Fn() -> bool| {
+        while !done() {
+            if ended.load(SeqCst) || began.elapsed() > Duration::from_secs(20) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        true
+    };
+    let parts: Vec<&str> = spec.split(',').collect();
+    let num = |i: usize| parts.get(i).and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok());
+    let row = (|| -> Result<Value> {
+        let (kind, sig, ack) = (parts[0], num(1).ok_or("miss-hold: SIG")?, num(2).ok_or("miss-hold: ACK")?);
+        if !wait(&|| h.guest_u64(sig) == Some(1)) {
+            return Err("miss-hold: the guest never signalled".into());
+        }
+        let tag = h.arm(0, MISS_FAST_CHECK)?;
+        h.set_guest_u64(ack, 1);
+        if !wait(&|| h.get(0, REACHED) == tag) {
+            h.release(0, tag);
+            return Err("miss-hold: the point was not reached".into());
+        }
+        let acted = match kind {
+            "io" => {
+                let mut buf = [0u8; 8];
+                std::thread::scope(|s| {
+                    let copy = s.spawn(|| {
+                        backing.copy_guest(machine, stops, Duration::from_secs(8), &mut [Read { gpa: sig, bytes: &mut buf }])
+                    });
+                    // (The request is published within microseconds; the vCPU is held until it is.)
+                    std::thread::sleep(Duration::from_millis(200));
+                    h.release(0, tag);
+                    copy.join().map_err(|_| "miss-hold: copy panicked")?.map(|_| true)
+                })?
+            }
+            "pending" => {
+                let bytes: Vec<u8> = (0..parts[4].len() / 2)
+                    .map(|i| u8::from_str_radix(&parts[4][2 * i..2 * i + 2], 16).unwrap())
+                    .collect();
+                h.rewrite_quiet(num(3).ok_or("miss-hold: GPA")?, &bytes)
+            }
+            "event" => h.post_quiet(0, num(3).unwrap_or(0x30)),
+            "wait" => {
+                // (A LAPIC timer the guest armed expires while the vCPU is held.)
+                std::thread::sleep(Duration::from_millis(300));
+                true
+            }
+            other => return Err(format!("miss-hold: unknown kind {other}").into()),
+        };
+        h.release(0, tag);
+        Ok(json!({"kind": kind, "acted": acted, "hits": h.get(0, HITS), "timeout": h.get(0, TIMEOUT)}))
+    })();
+    eprintln!("miss-hold: {}", row.unwrap_or_else(|e| json!({"error": e.to_string()})));
 }
 
 /// `hold-publish-*`: once the backend schedule holds its first call, arm the host hook before a
@@ -1634,6 +1709,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     if publish_release.is_some() {
         return Err("hold-publish schedules need an io-test-hooks build".into());
     }
+    #[cfg(not(feature = "io-test-hooks"))]
+    if args.miss_hold.is_some() {
+        return Err("--miss-hold needs an io-test-hooks build".into());
+    }
     let publish_held = publish_release.map(|_| Arc::new(AtomicBool::new(false)));
     let io_disk = if let Some(path) = &args.io_disk {
         let resource = natemu::virtio::BLOCK_RESOURCE;
@@ -1986,6 +2065,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     result
                 })
             });
+            #[cfg(feature = "io-test-hooks")]
+            if let Some(spec) = args.miss_hold.as_deref() {
+                let (backing, machine, stops, ended) = (&backing, &machine, &stops, &all_ended);
+                scope.spawn(move || miss_hold(backing, machine, stops, spec, ended));
+            }
             #[cfg(feature = "io-test-hooks")]
             if let Some(release) = publish_release {
                 let (backing, control, held, ended) = (

@@ -277,14 +277,14 @@ hits now taken by the fast path (`miss_fast` counts).
 | ignores TF or `debug` | `miss-step` first part, `run_s4.py` |
 | ignores DR7 | `miss-step` second part |
 | skips `fill_l1` | `miss-counts` (the second jump misses again) |
-| skips `io_pending` | hook case (a): counter 0, window crossed |
-| skips `cache::pending` | hook case (b): counter 0, old bytes |
-| skips `events::none`, or reads IF from the record instead of the page at CPL 0 | hook case (c): counter 0, late delivery |
+| skips `io_pending` | hook case (a), K1 `hold-io` (`--miss-hold io`): declined `io` 0 |
+| skips `cache::pending` | hook case (b), `hold-pending`: declined `pending` 0, old bytes |
+| skips `events::none`, or reads IF from the record instead of the page at CPL 0 | hook case (c), `hold-event`: counter 0, late delivery; `lapic::due` (the backlog half has no IRQ): `hold-lapic` |
 | resumes without SCTLR_EL1.A | `miss-ac` |
 | PSTATE from the gate's SPSR instead of `BLOCK_SPSR | nzcv` | equivalent today (the gate's SPSR from EL0 is always `0x340 | NZCV`: SS cannot be set because DR7 declines); kept as a by-construction rule, no test can catch it |
 | takes a `SYSTEM` target as a block | `miss-system` (halt or wrong values) |
-| ignores `uncached_count` | the M2 UC programs (`run_slice3_vm.py`'s uncached cases) |
-| ignores `mov_ss`/`sti_shadow`/`mid_string` | the X2 shadow and REP tests (`events`, K1 `string` cases) |
+| ignores `uncached_count` | `miss-uc`: `jmp [rax]` through a UC page is a step whose computed exit is the miss at the evicted target with the UC shadow still mapped (decline `uncached`; the step count of a later ordinary-block UC access). The M2 UC programs (`run_m2.py types`) cannot catch it: no stepped instruction there ends in a computed exit |
+| ignores `mov_ss`/`sti_shadow`/`mid_string` | equivalent by construction: `enter` clears all three, `system`, `delivery` and the other resident exits clear them too, so they are 0 at every dispatcher miss; the check stays as a guard. `miss-boundary` (MOV SS, STI before the computed exit) shows the sequences are right; the mutant stays green |
 | chunk 2: `Unknown` treated as `Yes` | `page-share` (a), `page-cross` |
 | a `State` copy on the fast path's frame | the stack-bound checker |
 
@@ -362,3 +362,12 @@ cannot spare the memory for 18 bits; a count decides, not a guess.
 | `STI_FIRST` targets, feature builds, the decline counter, `lapic::due`'s backlog | Stated (2.1): entered as an L1 hit; `pic-count` and `dispatch-study` decline before the probe; plain increments; the backlog is a decline |
 | Gain: declines cost about 45-50 ns each; make's 315 ns may include drain work | Costed (3): chunk 1 is neutral or a small loss on configure (gated on no regression), 13-19 vCPU-s net on make; configure gains only with chunk 2; the per-taken-miss saving is measured before the 0.18-0.25 us is trusted; the repeated-probe fix kept in reserve |
 | Decision asked: fast miss vs a bigger or 2-way L1 for make's conflict misses, and the order | Section 7: count first (shadow owner tables at 17/18 bits and 2-way), build the L1 fix the count picks and measure it alone, then the page record with the fast miss path's chunks 1 + 2 as one change with a recomputed make gate |
+
+## 9. Hold cases as built (November 14, 2026)
+
+The program driver's `--miss-hold KIND,SIG,ACK[,ARG..]` (an io-test-hooks host and resident; `tools/run_k1.py`'s `hold-io`, `hold-pending`,
+`hold-event`, `hold-lapic`, 1 vCPU, default block size): the guest warms A, B, C (A evicted), stores 1 at SIG and spins on ACK; the driver arms
+`MISS_FAST_CHECK` on vCPU 0 and stores 1 at ACK; at the point (the checks not yet made) it publishes an I/O window request (`io`), rewrites A's
+byte and posts its page (`pending`), posts an interrupt (`event`: record IF 0, page IF 1 after an inline `sti`), or holds 300 ms so the guest's
+LAPIC timer expires (`wait`). Posts ring no doorbell. Each case asserts its per-reason decline counter. `tools/run_fastmiss_mutations.py` runs
+the table of mutations (the hold mutations build a hooks resident into `target/mut-hooks`).
