@@ -338,7 +338,9 @@ needed no change).
 - [ ] Gate C (the point of the work): with the perf log on, a depth-16 fio run shows, on the vCPU that takes the
   disk's queue vector, zero EOI-broadcast exits (the per-vCPU count the November 11 gap tooling already reads) and
   device exits equal to that vCPU's own queue notifications only. The status-read and acknowledge counters are zero
-  by construction and prove nothing.
+  by construction and prove nothing. As built: the counts were taken on the play image's boot-and-disk workload at
+  2 vCPUs instead (MMIO 409 EOI exits; PCI 0); the depth-16 fio form is still open, as is Gate D's depth-1 comparison
+  (inconclusive). See [pci-handoff.md](pci-handoff.md).
 - [ ] Gate D (edge cases in the guest): `echo 2 > /proc/irq/N/smp_affinity` for a network queue vector during a
   transfer (the disk's vectors are managed and refuse the write), traffic continues and the count moves to that CPU; boot with `pci=nomsi`: the devices come up on the legacy line (`IO-APIC ... fasteoi` lines 16-18 in
   `/proc/interrupts`) and a short disk and network check passes; one experimental mixed launch (disk on PCI, network
