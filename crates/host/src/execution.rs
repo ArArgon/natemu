@@ -696,6 +696,21 @@ pub struct K1 {
     page: K1Page,
     #[serde(skip_serializing_if = "K1FastMiss::is_empty")]
     fast_miss: K1FastMiss,
+    /// Relink plan (docs/restructure/relink-plan.md): absent while every counter is zero.
+    #[serde(skip_serializing_if = "K1Relink::is_empty")]
+    relink: K1Relink,
+}
+/// The relink plan's counters: linker entries that linked a target found current as it was (`linked_current`, and those entries'
+/// `link` bucket time, `perf` residents only).
+#[derive(Debug, Default, serde::Serialize)]
+struct K1Relink {
+    linked_current: u64,
+    linked_current_us: u64,
+}
+impl K1Relink {
+    fn is_empty(&self) -> bool {
+        self.linked_current | self.linked_current_us == 0
+    }
 }
 /// `Control::pages` and its counters: fetch walks made, record hits, check-mode differences, 2 MiB leaves not recorded.
 #[derive(Debug, Default, serde::Serialize)]
@@ -941,6 +956,10 @@ impl K1 {
                     .zip(c.fast_declined)
                     .filter(|&(_, n)| n != 0)
                     .collect(),
+            },
+            relink: K1Relink {
+                linked_current: c.linked_current,
+                linked_current_us: us(c.linked_current_ticks),
             },
         }
     }

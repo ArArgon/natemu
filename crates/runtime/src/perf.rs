@@ -43,6 +43,24 @@ pub fn leave(from: u64) {
     charge(from);
 }
 
+/// Relink plan, step 1: the `link` bucket's ticks charged so far, the mark [`link_since`] measures from (0 without `perf`).
+#[cfg(feature = "perf")]
+#[inline(always)]
+pub fn link_mark() -> u64 {
+    record().ticks[LINK as usize]
+}
+/// The `link` bucket's ticks since [`link_mark`] returned `mark`, the open interval included (the entry in progress, current
+/// bucket `link`; 0 without `perf`).
+#[cfg(feature = "perf")]
+pub fn link_since(mark: u64) -> u64 {
+    let t: u64;
+    // SAFETY: as in `charge`.
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack)) };
+    let p = record();
+    p.ticks[LINK as usize] + if p.current == LINK { t.wrapping_sub(p.since) } else { 0 }
+        - mark
+}
+
 /// Perf chunk 14: one halt wake-up of `kind` ([`Wakes`]) that took `ticks`.
 #[cfg(feature = "perf")]
 pub fn wake(kind: usize, ticks: u64) {
@@ -65,6 +83,16 @@ pub fn wake(kind: usize, ticks: u64) {
 /// Whether the `perf` accounting is built in.
 pub const ON: bool = cfg!(feature = "perf");
 
+#[cfg(not(feature = "perf"))]
+#[inline(always)]
+pub fn link_mark() -> u64 {
+    0
+}
+#[cfg(not(feature = "perf"))]
+#[inline(always)]
+pub fn link_since(_: u64) -> u64 {
+    0
+}
 #[cfg(not(feature = "perf"))]
 #[inline(always)]
 pub fn wake(_: usize, _: u64) {}

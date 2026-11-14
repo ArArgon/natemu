@@ -1696,13 +1696,20 @@ pub fn disarm() -> Option<([u32; ARMED], usize)> {
 }
 /// The armed record's words become visible to instruction fetch (one barrier pair for all of them).
 fn synchronize_words(c: &Control) {
-    let ctr = c.ctr_el0;
-    for &[o, _] in &c.armed_words[..c.armed as usize] {
-        clean_pou(ctr, area::CODE_WRITE_VA + u64::from(o));
+    synchronize_offsets(c.armed_words[..c.armed as usize].iter().map(|&[o, _]| u64::from(o)));
+}
+/// Words written through the writable alias at code-area `offsets` (in any order; the iterator is walked twice) become visible
+/// to instruction fetch: every line cleaned, one barrier, every line invalidated, a barrier and `isb`. The one place a batch of
+/// word writes is synchronized (arming and disarming a stop, relinking); the CTR_EL0 shortcuts are [`clean_pou`],
+/// [`clean_barrier`] and [`invalidate_pou`].
+fn synchronize_offsets(offsets: impl Iterator<Item = u64> + Clone) {
+    let ctr = control().ctr_el0;
+    for o in offsets.clone() {
+        clean_pou(ctr, area::CODE_WRITE_VA + o);
     }
     clean_barrier(ctr);
-    for &[o, _] in &c.armed_words[..c.armed as usize] {
-        invalidate_pou(ctr, area::CODE_VA + u64::from(o));
+    for o in offsets {
+        invalidate_pou(ctr, area::CODE_VA + o);
     }
     unsafe { asm!("dsb ish", "isb") };
 }
@@ -2240,20 +2247,31 @@ pub fn unlink_all() -> Option<u64> {
     (c.links, c.links_cr3, c.links_tlb, c.links_local) = (0, 0, 0, 0);
     Some(n)
 }
-/// Restores the original word of the link point `r` describes, if it holds the branch `r` says.
-/// (PIC study stage 2: a record of an `svc`-word link, its original word `svc #LINK`, names the target's full entry.)
+/// Restores the original word of the link point `r` describes, if it holds the branch `r` says, and makes it visible.
 fn unlink(r: LinkRecord) -> Option<()> {
+    let at = unlink_word(r)?;
+    synchronize_offsets(core::iter::once(at));
+    Some(())
+}
+/// [`unlink`]'s write alone: the word is restored but not yet visible to instruction fetch (the caller synchronizes the
+/// code-area offset returned, [`synchronize_offsets`]). `None` (nothing written) when the word is not the branch `r` says.
+/// (PIC study stage 2: a record of an `svc`-word link, its original word `svc #LINK`, names the target's full entry.)
+fn unlink_word(r: LinkRecord) -> Option<u64> {
     let source = block(r.source as usize);
     let at = u64::from(source.code) + u64::from(r.offset());
+    let restore = |at: u64| {
+        unsafe { ((area::CODE_WRITE_VA + at) as *mut u32).write_volatile(r.original) };
+        at
+    };
     // (A checked link's word is `b` to a dispatcher slot, [`area::CHECKED`].)
     if r.target & area::CHECKED != 0 {
         let slots = (area::DISPATCH + area::DISPATCH_SLOT_BYTES) as u64
             ..(area::DISPATCH + area::DISPATCH_BYTES) as u64;
         let into = word(at) & 0xfc00_0000 == 0x1400_0000 && slots.contains(&destination(at));
-        return (into && r.original == pic::SVC_LINK).then(|| rewrite(at, r.original));
+        return (into && r.original == pic::SVC_LINK).then(|| restore(at));
     }
     let entry = block(r.target as usize).entry() - area::CODE_VA;
-    links_to(at, entry).then(|| rewrite(at, r.original))
+    links_to(at, entry).then(|| restore(at))
 }
 
 /// This vCPU is about to write `gpa`'s page, which holds translations: clears every vCPU's code bit of the page at
@@ -2590,27 +2608,42 @@ fn prune(scope: usize, strict: bool) -> Option<u64> {
         remove(i, k, &mut 0);
     }
 }
-/// [`prune`] for a TLB event (`scope` [`CR3`] or [`TLB`], not strict): the same links undone, but the records are
+/// [`prune`] for a TLB event (`scope` [`CR3`] or [`TLB`], not strict): the same links undone, in one batch, and the records
 /// compacted in one pass: the survivors of the scanned segments slide down over the dropped ones' places, then each later
 /// segment's tail fills the gap, so a record moves at most once (`remove` moves up to one per later segment for every
-/// record it drops, and a CR3 load drops nearly every record of its segment).
+/// record it drops, and a CR3 load drops nearly every record of its segment). The words' code synchronization is one
+/// batch: the first pass restores every undone word and cleans its line, moving no record; one barrier; the second
+/// invalidates each line as the records are compacted (a slot is written only after it was read), then the final barrier,
+/// before the gap fill.
 fn prune_tlb(scope: usize) -> Option<u64> {
     let c = control();
+    let ctr = c.ctr_el0;
     let old = ends(c).map(|e| *e);
+    let kept = |r: &LinkRecord| {
+        let target = block(r.target as usize);
+        target.flags & DEAD == 0 && block(r.source as usize).flags & DEAD == 0 && current(target)
+    };
+    for i in 0..old[scope] {
+        let r = unsafe { record(i as usize).read() };
+        if !kept(&r) {
+            clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);
+        }
+    }
+    clean_barrier(ctr);
     let (mut w, mut undone) = (0, 0);
     let mut new = [0; 4];
     for k in 0..=scope {
         for i in if k == 0 { 0 } else { old[k - 1] }..old[k] {
             let r = unsafe { record(i as usize).read() };
-            let target = block(r.target as usize);
-            if target.flags & DEAD == 0 && block(r.source as usize).flags & DEAD == 0 && current(target) {
+            if kept(&r) {
                 if w != i {
                     unsafe { record(w as usize).write(r) };
                     list_moved(i, w);
                 }
                 w += 1;
             } else {
-                unlink(r)?;
+                // (Link records of these segments are never checked: the word is the source's code plus the offset.)
+                invalidate_pou(ctr, area::CODE_VA + u64::from(block(r.source as usize).code) + u64::from(r.offset));
                 list_del(i as usize);
                 out_del(i as usize);
                 undone += 1;
@@ -2618,6 +2651,7 @@ fn prune_tlb(scope: usize) -> Option<u64> {
         }
         new[k] = w;
     }
+    unsafe { asm!("dsb ish", "isb") };
     let gap = old[scope] - w;
     for j in scope + 1..4 {
         let (start, end) = (old[j - 1], old[j]);

@@ -605,6 +605,12 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             }
         };
         let generation = s.generation;
+        // Relink plan, step 1: whether `find` found the target current as it was (it revalidated and placed nothing).
+        let (revalidated, blocks) = {
+            let c = cache::control();
+            (c.revalidated, c.blocks)
+        };
+        let link_mark = crate::perf::link_mark();
         // A target killed as it was placed is neither linked to nor entered: its instruction is stepped.
         let Some(target) = find(&mut s) else {
             if source.is_some() {
@@ -635,7 +641,14 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
                 crate::perf::leave(p);
                 linked
             } {
-                cache::Link::Linked(n) => s.links += n,
+                cache::Link::Linked(n) => {
+                    s.links += n;
+                    let c = cache::control();
+                    if n != 0 && c.revalidated == revalidated && c.blocks == blocks {
+                        c.linked_current += 1;
+                        c.linked_current_ticks += crate::perf::link_since(link_mark);
+                    }
+                }
                 cache::Link::Bad => halt(&s, stop::BAD_LINK),
             },
             None => {}

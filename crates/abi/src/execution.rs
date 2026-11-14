@@ -800,6 +800,12 @@ pub mod cache {
         /// nonzero turns off installing a shadow writable at a demand read (a read installs read-only, as before the chunk).
         /// Appended.
         pub writable_on_read_off: u64,
+        /// Relink plan, step 1 (docs/restructure/relink-plan.md): linker entries that made a link into a target the search found
+        /// current as it was (it neither revalidated nor placed a block): the upper bound on the traps relink-on-revalidation can
+        /// save (first links are in it). `linked_current_ticks`: those entries' `link` bucket ticks (written by `perf` residents
+        /// only). Plain counters in every build. Appended.
+        pub linked_current: u64,
+        pub linked_current_ticks: u64,
     }
     /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
     pub mod pool_recheck {
