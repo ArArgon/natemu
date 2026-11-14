@@ -2,11 +2,11 @@
 //! cache on by default ([`natemu::compile_cache::Config::new`]).
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
-//!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool] [--compile-cache DIR|off] [--compile-cache-mb N]
+//!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
 //!       [--perf-log FILE]
 //!
-//! Named arguments (clap; `natemu --help`). Six fall back to `NATEMU_SERIAL_STDIN`,
-//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
+//! Named arguments (clap; `natemu --help`). Seven fall back to `NATEMU_SERIAL_STDIN`,
+//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
 //! over its variable; a switch's variable takes 1/0, true/false, yes/no, on/off). `--runtime` defaults to the resident built beside this binary
 //! (`<target>/aarch64-unknown-none/<profile>/natemu-runtime` for `<target>/<profile>/natemu`) when that file exists.
 //! `--ram` takes bytes, 0x hex, or a K/M/G suffix (binary units: 2G = 2048M = 0x80000000). COM1's output goes to
@@ -72,9 +72,14 @@ struct Cli {
     /// Expose a virtio-MMIO network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
     #[arg(long)]
     net: bool,
-    /// Publish admitted templates into the shared pool (a read-only 274 MiB span; the resident does not read it yet)
+    /// The shared template pool (a read-only 274 MiB span): the host publishes admitted templates into it and each resident
+    /// looks in it before asking the host (`NATEMU_POOL_LOOKUP=off`: publication only)
     #[arg(long, env = "NATEMU_POOL", value_parser = clap::builder::BoolishValueParser::new())]
     pool: bool,
+    /// Debug: every block the resident copies instead of asking the host (a template of its own, or a pool entry) and every
+    /// answer reused at another RIP is also compiled by the host and must be equal (a mismatch stops the run); as boot-linux's
+    #[arg(long, env = "NATEMU_CHECK_REUSE", value_parser = clap::builder::BoolishValueParser::new())]
+    check_reuse: bool,
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
     #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
     compile_cache: Option<PathBuf>,
@@ -139,6 +144,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     boot.disk = cli.disk;
     boot.net = cli.net;
     boot.pool = cli.pool;
+    boot.check_reuse = cli.check_reuse;
     boot.initrd = cli.initrd.as_ref().map(read).transpose()?;
     boot.cmdline = cli.cmdline.unwrap_or_default();
     boot.ram = cli.ram.unwrap_or(boot.ram);
@@ -195,6 +201,30 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// `--check-reuse` and `NATEMU_CHECK_REUSE` (a flag wins, a switch's variable takes 1/0, true/false, on/off) reach
+    /// `Boot::check_reuse`'s switch; off by default.
+    #[test]
+    fn check_reuse_option() {
+        use clap::Parser;
+        let base = ["natemu", "--fexc", "f", "--kernel", "k"];
+        let parse = |extra: &[&str]| {
+            super::Cli::try_parse_from(base.iter().chain(extra))
+                .unwrap()
+                .check_reuse
+        };
+        assert!(!parse(&[]));
+        assert!(parse(&["--check-reuse"]));
+        assert!(!parse(&["--pool"]));
+        // The variable, set for this test only (no other test reads it).
+        for (value, want) in [("1", true), ("true", true), ("on", true), ("0", false), ("off", false)] {
+            // SAFETY: this is the only test touching the process environment, and it runs no threads of its own.
+            unsafe { std::env::set_var("NATEMU_CHECK_REUSE", value) };
+            assert_eq!(parse(&[]), want, "{value}");
+        }
+        unsafe { std::env::set_var("NATEMU_CHECK_REUSE", "sometimes") };
+        assert!(super::Cli::try_parse_from(base).is_err());
+        unsafe { std::env::remove_var("NATEMU_CHECK_REUSE") };
+    }
     #[test]
     fn size() {
         for (text, bytes) in [
