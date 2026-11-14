@@ -1251,7 +1251,7 @@ PAGE_FORCED_COUNTS = {'page-check-keep': 2, 'page-size-check': 1}
 PAGE_ON_COUNTS = {'page-share': {'hits': 2}, 'page-global': {'hits': 1}, 'page-large-edge': {'split_2m': 1}, 'page-cross': {'hits': 1},
                   'page-mark': {'hits': 1}}
 # Further runs under another mode: (program, mode, disagreements, whether it is an adversarial program).
-PAGE_MODE_RUNS = (('local-gpa', 'check', 1), ('pf-fetch', 'check', 1))
+PAGE_MODE_RUNS = (('local-gpa', 'check', 1), ('pf-fetch', 'check', 1), ('self-invlpg', 'check', 1), ('self-pge', 'check', 3), ('mixed-g1', 'check', 1))
 # The fast miss path's counts (k1.fast_miss) in a default run: taken at least; declined by reason at least; taken exactly none.
 FAST_TAKEN = {'miss-counts': 1, 'miss-pic': 2, 'miss-ac': 1}
 FAST_DECLINED = {'miss-event': ('event', 1), 'miss-system': ('system', 1), 'miss-step': ('debug', 1), 'miss-dr7': ('debug', 1)}
