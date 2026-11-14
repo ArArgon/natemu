@@ -30,7 +30,9 @@ this file is the index of decisions and the test/benchmark discipline used to mo
 Rules learned in this round:
 - **Timed runs need the 4 performance cores to themselves.** One unlocked K1 run silently contaminated a QEMU timing
   and two natemu runs. Every VM launch holds `natemu-raw/.vm.lock` (`run_k1.py` takes none: wrap it in `lockf`);
-  `run_io5.py` records any other VM overlapping a run (`contended`). Builds during timed runs go to the efficiency
+  `run_io5.py` records any other VM overlapping a run (`contended`). Untimed runs (K1, suites) take the lock SHARED
+  (`tools/vm_lock.py --shared CMD`) so they run beside each other and only wait for timed runs; exclusive `lockf` on
+  untimed K1 runs serialised three agents and a timing behind each other for over half an hour. Builds during timed runs go to the efficiency
   cores (`taskpolicy -c background`). Agents in git worktrees must export `NATEMU_RAW_ROOT`.
 - **Small gains are real but invisible in single runs** (wall spread 1-2.5 s): a change is kept when its buckets show
   the work removed; wall time is judged per group (owner, November 13).
