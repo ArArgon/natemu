@@ -16,7 +16,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools/reference'))
-import ref
+import ref, asmcache
+asmcache.install(ref)      # clang runs once per distinct text (tools/asmcache.py)
 
 CODE, DATA, HIGH = 0x100000, 0x200000, 0xffff800000200000
 MASK, FLAGS = (1 << 64) - 1, 0xad7
@@ -489,11 +490,14 @@ def main():
     blocks=[a.max_block] if a.max_block is not None else [None,1]
     plan=[f'{c["name"]}-cpl{p}-block{b}' for c in selected for p in c.get('cpls',(0,3)) for b in blocks]
     (a.out/'plan.json').write_text(json.dumps(plan,indent=2)+'\n')
+    baselines={}      # (prefix-only description, block) -> its run: cases sharing a prefix state (395 of 980 distinct) run it once
     for c in selected:
         for cpl in c.get('cpls',(0,3)):
             for block in blocks:
                 name=f'{c["name"]}-cpl{cpl}-block{block}'
-                before,r0=execute(a,description(c,cpl,True),a.out/name/'prefix',block)
+                prefix_text=description(c,cpl,True)
+                if (prefix_text,block) not in baselines: baselines[prefix_text,block]=execute(a,prefix_text,a.out/name/'prefix',block)
+                before,r0=baselines[prefix_text,block]
                 got,rc=execute(a,description(c,cpl),a.out/name/'probe',block)
                 errors=[f'prefix/probe error {r0}/{rc}'] if not before or before['stop']!='reached' or not got else judge(c,cpl,before,got)
                 rows.append(dict(name=name,errors=errors,oracle_basis=c.get('oracle_basis','documented instruction contract')));print(name,'FAIL' if errors else 'PASS',errors,flush=True)
