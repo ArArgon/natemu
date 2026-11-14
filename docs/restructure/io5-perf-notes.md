@@ -351,6 +351,13 @@ Rules learned in this round:
     Note for bisecting: the relink step-1/step-2 commits before `22a9cb3` don't compile alone (the drain fix's
     `offset_point` rename is converted there).
 
+37. **Second batch confirmed by interleaved rounds** (`natemu-raw/round-20261114-02`, 3 rounds, timing only, no
+    contention; base `c4b783c` = before the drain fix, writable-on-read and relink; head `550d598`). Medians:
+    configure 67.6 -> 63.2 s (-6.5%), make 126.9 -> 122.5 s (-3.5%); every head run faster than every base run on both
+    steps. Cumulative vs main (`dcffe4b`, profiles): configure ~91 -> ~63 s (about -30%), make 177.9 -> ~122.5 s (about
+    -31%). This ends the architecture review's gated roadmap (groups R, H, F); next by share is guest code (group G,
+    sampler first).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
@@ -368,5 +375,6 @@ dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3
 | natemu after two-way L1 (decision 22) | 72.7 s | 132.1 s (single run) |
 | ... with the shared pool on (decision 25) | 68.6 s | 130.9 s (single run) |
 | round start vs head, timing-only medians of 3 (decision 27) | 72.9 -> 67.5 s | 136.5 -> 127.0 s |
+| second batch, timing-only medians of 3 (decision 37) | 67.6 -> 63.2 s | 126.9 -> 122.5 s |
 | QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
 | native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |
