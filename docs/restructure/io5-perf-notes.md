@@ -35,7 +35,10 @@ Rules learned in this round:
   untimed K1 runs serialised three agents and a timing behind each other for over half an hour. Never combine the
   lock with a "wait until no natemu process" loop: a queued runner's own command line (`--natemu .../natemu`) matches
   such a pattern, and the lock holder then waits forever on a process waiting for its lock (a 40-minute deadlock).
-  The lock alone guarantees exclusivity, since every VM runner takes it. Builds during timed runs go to the efficiency
+  The lock alone guarantees exclusivity, since every VM runner takes it. Shared holders can starve a queued exclusive
+  run (macOS `flock` admits new shared requests past a waiting exclusive one), so don't start new shared runs while a
+  timed run is queued. A shared request once sat 36 minutes in `flock` while later ones were granted (apparently a lost
+  wakeup after killed holders): a wrapper silent for minutes while others run is stuck; kill and rerun it. Builds during timed runs go to the efficiency
   cores (`taskpolicy -c background`). Agents in git worktrees must export `NATEMU_RAW_ROOT`.
 - **Small gains are real but invisible in single runs** (wall spread 1-2.5 s): a change is kept when its buckets show
   the work removed; wall time is judged per group (owner, November 13).
