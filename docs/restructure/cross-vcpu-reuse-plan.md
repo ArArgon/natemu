@@ -288,3 +288,17 @@ empty), the first lap's tail saturates at 0, and the gating assertion covers onl
 
 1. Approve option (b): a host-filled pool, about 272 MiB of shared backing and address space below guest RAM?
 2. Default on after chunk 4's gate, or behind a flag until the next benchmark round?
+
+## As built (November 14)
+
+Chunks 1-4 done; the pool is on by default. The CLI and `boot-linux` (`Boot::pool`) default to on (`--pool=false` or
+`NATEMU_POOL=0` off, `NATEMU_POOL_LOOKUP=off` publication only); the program driver stays opt-in (`run-program --pool`).
+Gate (interleaved rounds on the merged head, `natemu-raw/round-20261114-01`): configure -3.3%, make -1.8% wall, every make
+pool-on run faster than every pool-off run. Pool size: 2 MiB control granule, 16 MiB index, 256 MiB ring (274 MiB of address
+space, backed as touched); make wraps the ring about twice (0.57 M lookups found an overwritten entry; republished by the host).
+The placement re-check skips the move re-encoding at the same RIP (it refused 32-bit RIP-move forms and made 99.5% of make's
+re-check refusals, 3.5 M, for nothing). Tests: the abi pool (round trip, decoder bounds, forged header, ring-end bounds,
+writer/reader threads), the publisher through the request path, eight K1 programs (`pool-peer`, `pool-frame`, `pool-smc`,
+`pool-ctx`, `pool-cross`, `pool-wrap`, `pool-fence`, `pool-race`) and `tools/run_pool_mutations.py`. Not covered by K1: host-hook and
+stop-RIP fences on the pool path (shared `reuse_fenced`, unit-tested), CPL 3 (the IO5 workload with `NATEMU_CHECK_REUSE=1` is
+the check), removing a fence of the ordering protocol (argued in `natemu_abi::pool`'s doc).

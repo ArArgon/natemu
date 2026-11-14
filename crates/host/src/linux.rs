@@ -71,9 +71,10 @@ pub struct Boot {
     pub disk: Option<PathBuf>,
     /// Expose the virtio-MMIO network device on user-mode NAT ([`crate::virtio::Slirp`]).
     pub net: bool,
-    /// The shared template pool (cross-vCPU reuse plan, chunk 2): back a read-only span of about 274 MiB before guest RAM,
-    /// map it into every vCPU and publish admitted templates into it. The resident does not read it yet, so this only costs
-    /// the publication. Off by default. `--pool` / `NATEMU_POOL`.
+    /// The shared template pool (cross-vCPU reuse plan): back a read-only span of about 274 MiB of address space before guest
+    /// RAM (pages are backed as touched), map it into every vCPU, publish admitted templates into it and let each resident look
+    /// in it before asking the host. On by default (the gate passed, November 14: configure -3.3%, make -1.8% wall);
+    /// `--pool=false` / `NATEMU_POOL=0` turn it off.
     pub pool: bool,
 }
 
@@ -103,7 +104,7 @@ impl Boot {
             rng: false,
             disk: None,
             net: false,
-            pool: false,
+            pool: true,
         }
     }
 

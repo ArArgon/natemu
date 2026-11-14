@@ -111,8 +111,16 @@ pub(crate) struct Args {
     speculation_barriers: bool,
     #[arg(long)]
     rng: bool,
-    /// Publish admitted templates into the shared pool (cross-vCPU reuse plan chunk 2; the resident does not read it yet)
-    #[arg(long, env = "NATEMU_POOL", value_parser = clap::builder::BoolishValueParser::new())]
+    /// The shared template pool (cross-vCPU reuse plan): on by default; `--pool=false` or `NATEMU_POOL=0` turns it off
+    #[arg(
+        long,
+        env = "NATEMU_POOL",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = true,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
     pool: bool,
     #[arg(long, value_name = "FILE")]
     serial: Option<String>,

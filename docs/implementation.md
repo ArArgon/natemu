@@ -346,6 +346,13 @@ system guests cost their 10 s on the first two runs); `NATEMU_QEMU_CACHE=off` fo
 them, so its times are the old ones. Runners that run a prefix-only baseline per case (`instruction-gaps`, `frame-alias`) run
 each distinct baseline once.
 
+**The shared template pool.** On by default in `natemu` and `boot-linux` (`Boot::pool`): the host publishes admitted template
+translations into a 274 MiB read-only span below guest RAM (address space; pages are backed as touched, the ring about 256 MiB at
+most) and each vCPU's resident looks in it, by content, before asking the host; design, checks and measurements in
+`docs/restructure/cross-vcpu-reuse-plan.md`. `--pool=false` or `NATEMU_POOL=0` turns it off; `NATEMU_POOL_LOOKUP=off` keeps
+publication only; `--check-reuse` (`NATEMU_CHECK_REUSE=1`) also asks the host for every copy and compares. The program driver
+(K1) stays opt-in (`run-program --pool`).
+
 **The VM lock.** `NATEMU_RAW_ROOT/.vm.lock` is taken with BSD `flock(2)` and nothing else: Python `fcntl.flock`, the suite and
 the I/O runners, `/usr/bin/lockf -k` (macOS `lockf` is flock-based and has no shared mode) and `tools/vmlock.py` all exclude
 each other (`tools/test_vm_lock.py`). Never use `fcntl.lockf` or `F_SETLK` on it: on macOS record locks and flock do not
