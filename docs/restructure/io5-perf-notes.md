@@ -343,6 +343,14 @@ Rules learned in this round:
     Merges after the review's test fix (the surviving insert-move mutation is a real latent defect: a stale cursor in one
     layout trips the BAD_LINK tripwire; relink-many must reach that layout) and guards.
 
+36. **Relink merged** (cherry-picked onto the head with writable-on-read; review fixes in: relink-rot0..3 turn the
+    insert-move mutation red, pairing guard before every relink, link-check audits of out slots and suspension, host
+    check by point and pairing). Merged tree: unit tests pass (the timing test channel_wakes_both_sides flakes only under
+    background priority and passes at normal priority), resident checkers ok, K1 594/594 default and link-check.
+    Measured (decision 35): configure ~-4.4% wall / -3.5% busy, make ~-4.4% / -4.1%; 80 M links relinked on make.
+    Note for bisecting: the relink step-1/step-2 commits before `22a9cb3` don't compile alone (the drain fix's
+    `offset_point` rename is converted there).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
