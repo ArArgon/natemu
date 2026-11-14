@@ -174,6 +174,17 @@ Rules learned in this round:
     privilege, bulk, shape, prefix and relocation refusals are ~0. A kept form per context would gain nothing; the
     remaining cost (~1 s of configure) is the check on first compiles, which must stay (containment).
 
+19. **Correctness tests made fast** (owner: fast unless justified). K1's `link-full` overflows a test cap of 16 Ki
+    links (full size once per suite, `k1-full-links`): K1 at 1 and 4 vCPUs went from ~35 min to ~26 s. Suite: the
+    fault runners spawned clang ~3,800 times per shard (54 of 63 s) — now a clang result cache; QEMU system-mode
+    references are cached by binary, firmware, image and arguments, and a timeout is stored only for the nine cases
+    known to hang and only after two fresh timeouts; identical prefix baselines run once. Reviewed twice. Verified
+    (`natemu-raw/fast-tests-1..3`, 17 steps, third run warm): every step's case counts equal November 11's, the same
+    8 expected QEMU hangs; e.g. faults@1 348 -> 59 s, system 160 -> 21, cpu-forms 206 -> 52, i7-faults@1 296 -> 91,
+    k1-c1 160 -> 11 (November 11 ran inside the full suite, so only the large ratios are meaningful). Final gates run
+    with `NATEMU_QEMU_CACHE=off NATEMU_ASM_CACHE=off`. Remaining cost: ~40k VM launches per suite (a multi-program
+    launch mode would cut it; measure a launch first).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
