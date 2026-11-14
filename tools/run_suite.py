@@ -174,6 +174,7 @@ def steps(F, O):
     # PIC study stage 2: stops at each entry word, svc-word links, a forged slot. One step per mode (each runs the K1 programs at
     # 1 and 2 vCPUs, about 1780 s in all in the November 10 serial-chain run, 137-step suite 13: its longest step); the three
     # no-K1 modes together.
+    # (These runs also run link-full, at the small capacity now: their `est` too predate it, recalibrate with the K1 ones.)
     for mode in ('and', 'str', 'body', 'svc', 'forge', 'forge-noncanonical', 'forge-half'): vm(f'pic-{mode}', 'run_pic.py', '--cpus', 1, 2, '--modes', mode, est=225, w=2)
     vm('pic-ac-fence-user', 'run_pic.py', '--modes', 'ac,fence,user', est=60)
     vm('m1', 'run_m1.py')

@@ -584,7 +584,7 @@ pub mod cache {
         pub fetched: u64,
         /// Perf chunk 8: the link records found full, so the local links into blocks not current were undone (as every link
         /// into them was before chunk 8), and how many; since perf chunk 11 every link is undone too when that leaves less
-        /// than a quarter of [`MAX_LINKS`] free (counted with them).
+        /// than a quarter of the capacity ([`MAX_LINKS`], or `link_cap`) free (counted with them).
         pub reclaims: u64,
         pub reclaimed: u64,
         /// Perf chunk 10, reuse inside the resident, set by the host before the vCPU runs: [`REUSE_OFF`], [`REUSE_ON`] or

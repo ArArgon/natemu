@@ -525,9 +525,9 @@ FM = FW = FH = CAP = 0
 
 
 def set_link_cap(cap):
-    """Sizes the `link-full` chain for a record capacity `cap` (a multiple of 4096, MAX_LINKS or at least 8 Ki)."""
+    """Sizes the `link-full` chain for a record capacity `cap` (MAX_LINKS, or a multiple of 4096 of at least 16 Ki: FM >= 5; at 8 or 12 Ki FW == FH == FM // 2 and the r10 remap breaks the geometry)."""
     global CAP, FM, FW, FH
-    assert cap == MAX_LINKS or (cap % 4096 == 0 and 8 * 1024 <= cap < MAX_LINKS), cap
+    assert cap == MAX_LINKS or (cap % 4096 == 0 and 16 * 1024 <= cap < MAX_LINKS), cap
     CAP = cap
     assert 2 * 2048 * (cap // 4096 + 1) > cap
     FM = cap // 4096 + (12 if cap == MAX_LINKS else 1)   # 140 at 512 Ki (76 at 256 Ki): 2 * 2048 * FM records > cap
@@ -890,9 +890,10 @@ def run(a, prog, extra, host=None, runtime=None, tag=''):
     # PIC study stage 3: link-full's one frame at FM addresses would be one shared translation linked once; the record
     # area's capacity is tested on absolute code (each address its own blocks and links).
     mode = PIC_ENV.get(prog['name'][3:].split('@')[0])
-    env = dict(os.environ, NATEMU_PIC=mode) if mode else None
+    env = dict(os.environ, **({'NATEMU_PIC': mode} if mode else {}))
+    env.pop('NATEMU_LINK_CAP', None)   # (an inherited export must not shrink the full size, or any other program)
     if full and CAP < MAX_LINKS:   # (the host's NATEMU_LINK_CAP: unset = production capacity)
-        env = dict(env or os.environ, NATEMU_LINK_CAP=str(CAP))
+        env['NATEMU_LINK_CAP'] = str(CAP)
     rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
     for v, c in enumerate(out['cpus'] if out else []):

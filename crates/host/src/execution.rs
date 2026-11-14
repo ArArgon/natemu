@@ -2965,7 +2965,16 @@ pub fn run(
         fences,
     );
     // K1 `link-full`: a smaller link record area (`NATEMU_LINK_CAP`; unset: the full `cache::MAX_LINKS`).
-    let cap = link_cap_from(std::env::var("NATEMU_LINK_CAP").ok().as_deref())?;
+    let var = match std::env::var("NATEMU_LINK_CAP") {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("NATEMU_LINK_CAP: {e}")),
+    };
+    let cap = link_cap_from(var.as_deref())?;
+    if let Some(v) = &var {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_CAP={v}: link record area capacity reduced (test hook)"));
+    }
     area.write_record(control + std::mem::offset_of!(cache::Control, link_cap), cap);
     // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
     // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
