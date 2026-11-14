@@ -308,9 +308,10 @@ pub mod cache {
     /// Link records ([`LinkRecord`]), one per patched link point; a full area drops links (`cache::link`). Perf chunk 11:
     /// one per block of the index (64 Ki before): the `build` benchmark's metadata arena fills (about 238 Ki blocks) before
     /// it does, while 64 Ki filled with links into current kernel blocks. Perf chunk 23: kept at 256 Ki when the index
-    /// doubled (`build` N = 1 then fills it twice a run, each fill amortised as above).
+    /// doubled (`build` N = 1 then fills it twice a run, each fill amortised as above). Chunk 1b: 512 Ki (a CPython `make -j4`
+    /// reclaimed about 100 times per vCPU, undoing 71 M links, at 256 Ki).
     pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
-    pub const MAX_LINKS: usize = 256 * 1024;
+    pub const MAX_LINKS: usize = 512 * 1024;
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
     pub const STEP_RECORD: usize = LINKS + core::mem::size_of::<LinkRecord>() * MAX_LINKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;

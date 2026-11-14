@@ -119,7 +119,7 @@ link inside it) and, at 0x800, X (`jmp` to Y); frame RT a trampoline page (`jmp`
 - `pic-user`: `pic-two` with `NATEMU_PIC=user`: CPL-0 code is never shared (SHARES 0), the same values.
 Instance eviction has no case: instances are freed with the arena at a flush (stage 3), which the flush tests cover.
 Perf chunk 11 (natemu only):
-- `link-full`: more links than the record area holds (a chain of 286,720 link points through 70 pages above 4 GiB),
+- `link-full`: more links than the record area holds (a chain of 573,440 link points through 140 pages above 4 GiB),
   three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
   reload; back with INVLPG: every pass counts exactly, the area filled without a flush, and each fill cost at most two
   passes over it (`reclaims` at most 1 + 4 links / MAX_LINKS).
@@ -511,9 +511,10 @@ def pic_bodies(i, n=1):
 # 0x400 and 0x404) with a CR3 reload; (r12) back to FC with INVLPG. Each pass runs every link point through links kept,
 # dropped and remade; the record area fills in every pass, and each fill costs at most two passes over it (`reclaims`
 # bounded by the links made).
-FM, FW, FH = 70, 60, 35          # FW late in the chain: its links are live when it is written (a fill keeps the chain's tail)
+MAX_LINKS = 512 * 1024                    # natemu_abi::execution::cache::MAX_LINKS
+FM = 2 * MAX_LINKS // 4096 + 12          # 140 at 512 Ki (70 at 256 Ki: the chain must hold more than MAX_LINKS)
+FW, FH = FM - 10, FM // 2        # FW late in the chain: its links are live when it is written (a fill keeps the chain's tail)
 FC, FWC, FC2, FE = 0x9000, 0xa000, 0xb000, 0xc000
-MAX_LINKS = 256 * 1024                    # natemu_abi::execution::cache::MAX_LINKS
 FULL_CODE = ['--code-cache', str(96 << 20)]  # 2 * 2048 * FM + blocks of FEX code: more than the default 16 MiB
 
 
