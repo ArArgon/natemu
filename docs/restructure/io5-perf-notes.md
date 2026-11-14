@@ -1,0 +1,421 @@
+# IO5 performance round: decisions and reasoning
+
+Living notes for the CPU/memory performance round that followed IO5 combined acceptance (November 13, 2026, branch
+`perf-real-workload`). Each entry says what was decided, why, and the evidence. Plans with their own reviews are linked;
+this file is the index of decisions and the test/benchmark discipline used to move fast.
+
+## Workload and method
+
+- **Workload:** the stock Debian 13 cloud image (`tools/run_io5.py`), profiled one step per boot from a shared snapshot
+  (`natemu-raw/io5-snapshot-20261113-01`: packages installed, root grown, CPython 3.13.18 configured and built), 4 vCPUs,
+  4 GiB, `mitigations=off`, cold compile cache. Two steps carry the round: `configure` (serial, fork/exec heavy:
+  thousands of short sed/sh/gcc/cc1 processes) and `make -j4` (parallel compiles).
+- **Why these two:** they bracket the real-use spectrum the acceptance run exposed: process churn (configure) and
+  sustained parallel CPU (make). Benchmarks from the earlier performance phase used `nokaslr` and small programs; IO5
+  showed costs those never exercised (address-space switches, kernel non-global mappings, link capacity).
+- **Breakdown:** the `perf` resident's buckets (exclusive: each tick charged to one bucket) per step window
+  (`tools/io5_breakdown.py`, `analyze24.py`), host-side parts per translation request, and scratch counters when a
+  question needs one (kept in `natemu-raw/io5-bins/*.diff`, never committed).
+
+## Test and benchmark tiers (how we move fast without losing rigour)
+
+| Tier | What | Time | When |
+| --- | --- | --- | --- |
+| 0 | host unit tests (`cargo test -p natemu -p natemu-abi`), resident checkers (barriers, stack), mutation of the new check | 1-3 min | every change |
+| 1 | `run_k1.py --cpus 1 4` (CR3/INVLPG/links/PIC vs QEMU) under the VM lock; `link-check` resident for link changes | 15-25 min | every resident change |
+| 2 | one `run_io5.py profile --steps configure make` judged on **bucket vCPU-seconds** against the last baseline | ~5 min | each chunk's gate |
+| 3 | three interleaved rounds (order rotated) of base vs a **group** of changes, wall times, contention recorded | ~45 min | per group of 3-5 changes |
+| 4 | full standing suite (`run_suite.py`), benchmark suite (3 rounds), IO5 full boots natemu + QEMU at 8 GiB, independent replication | 3-4 h | end of round |
+
+Rules learned in this round:
+- **Timed runs need the 4 performance cores to themselves.** One unlocked K1 run silently contaminated a QEMU timing
+  and two natemu runs. Every VM launch holds `natemu-raw/.vm.lock` (`run_k1.py` takes none: wrap it in `lockf`);
+  `run_io5.py` records any other VM overlapping a run (`contended`). Untimed runs (K1, suites) take the lock SHARED
+  (`tools/vm_lock.py --shared CMD`) so they run beside each other and only wait for timed runs; exclusive `lockf` on
+  untimed K1 runs serialised three agents and a timing behind each other for over half an hour. Never combine the
+  lock with a "wait until no natemu process" loop: a queued runner's own command line (`--natemu .../natemu`) matches
+  such a pattern, and the lock holder then waits forever on a process waiting for its lock (a 40-minute deadlock).
+  The lock alone guarantees exclusivity, since every VM runner takes it. Shared holders can starve a queued exclusive
+  run (macOS `flock` admits new shared requests past a waiting exclusive one), so don't start new shared runs while a
+  timed run is queued. A shared request once sat 36 minutes in `flock` while later ones were granted (apparently a lost
+  wakeup after killed holders): a wrapper silent for minutes while others run is stuck; kill and rerun it. Builds during timed runs go to the efficiency
+  cores (`taskpolicy -c background`). Agents in git worktrees must export `NATEMU_RAW_ROOT`.
+- **Small gains are real but invisible in single runs** (wall spread 1-2.5 s): a change is kept when its buckets show
+  the work removed; wall time is judged per group (owner, November 13).
+- **QEMU runs once per workload/version** and its numbers are reused (owner).
+- **Timed runs are batched** (owner, November 14: contention is severe): implementers stop at Tiers 0-1; one Tier 2
+  profile covers a group of changes built together; measurement builds get one profile run, repeated only if invalid.
+- **One scheduler: only the main session launches VM runs** (owner, November 14: first-come locking let long, low-value
+  runs delay the ones that steer work). Agents build, unit-test and hand over commands. Order: measurements that steer
+  the next step, then one K1 on the combined build of ready changes, then its profile, then reference timings (VZ).
+  Long K1 cases run once per group, not per change; never run a VM at background priority (`taskpolicy -c background`
+  is for builds only: a K1 under it took over 25 minutes on one case).
+- **One integration branch** (owner, November 14): each change is built in its own worktree and branch; once admitted
+  (review, K1, measured gate) it merges into `perf-real-workload`, which is pushed regularly; finished worktrees are
+  removed (branches kept).
+- **Correctness tests are fast unless justified** (owner, November 14). K1's `link-full` grew to ~30 of K1's 35 minutes
+  when link capacity became 512 Ki; it gets a test-only capacity cap (same overflow paths), full size only at the end of
+  a round. The suite's slow steps (faults shards, probes, pic-*, i7-faults, instruction-gaps, cpu-forms: 190-363 s
+  each) are being cut the same way; anything that would drop a check goes to the owner instead.
+- **Untimed work in parallel:** reviews start when a commit exists, K1 overlaps with other untimed work under the lock's
+  shared use, implementers work in separate worktrees on different files; only timed gates serialise.
+- **Every resident change:** an independent reviewer (separate from the author), tests that a deliberate mutation turns
+  red, and the chunk's measured gate.
+
+## Decisions (chronological)
+
+1. **Fair comparison is `mitigations=off` on both** (natemu and QEMU), not stock: QEMU TCG cannot advertise
+   RDCL_NO, so stock compares different guest kernel work. Stock + speculation barriers is the user-facing comparison
+   (natemu gets PTI off honestly); both are reported.
+2. **Answer cache sized for a build's working set** (`41edbb5`): two generations of 1 Mi answers / 512 MiB. Evidence:
+   78% of make's compiles were repeats of answers dropped by generation flips. make -6.7%, compiles -65%; costs about
+   0.7 GB host memory (owner accepted).
+3. **DISCARD/WRITE_ZEROES** (`69db2ed`): the image grew to 15 GiB holding 3 GiB; verified by fstrim, checksums and fsck.
+4. **Kept-half list** (`45f0172`, retention plan chunk 0b): Linux maps part of its direct map non-global, so 58-68% of
+   CR3 loads dropped every kernel shadow. A CR3 load now removes only the listed non-global shadows. configure -15%.
+   The guest's own G bit was checked (natemu reads it correctly); the cause is the guest, the waste was natemu's.
+5. **Inbound link lists** (`bf8f9a8`, `a624ef4`, chunk 1): undo a cut block's links through its own list instead of a
+   scan of every record (35-82 us per event). Small wall gain (configure -1.9%, make -1.1% over 3 rounds); also enables
+   1b and any relinking scheme.
+6. **Link capacity 512 Ki** (`7d314e9`, chunk 1b): reclaims ~100 -> 1 per vCPU; make busy 669 -> 577 vCPU-s, step
+   161 -> 139 s (single run; to confirm in the group round). `link-check` feature (`0281518`) catches a cut leaving a
+   non-local inbound link at the moment it happens.
+7. **Request body built once** (`0a814e4`): byte-identical keys (tested), fewer allocations per compile.
+8. **Root retention (slots) NOT built** (chunks 2-4 of [root-retention-plan](root-retention-plan.md)): chunk 0's
+   model gave make 6.5-43.9 vCPU-s and configure -0.7-5.7 s against gates of 20 and 8: only about 31% of
+   revalidations would be saved, because short-lived processes (most of configure's and make's work) are new
+   address spaces each time and shared library code is revalidated per process. The comparison machinery was proven
+   exact (0 stale in 106 M). Revisit for long-lived, switch-heavy workloads (hackbench/locks model pending).
+9. **Rejected after measurement:** XOR-folded L1 index (misses -6%, no wall gain in clean interleaved runs: misses are
+   capacity/emptying, not hash quality); tag check on every linked jump (5-30% of guest time estimated); write-trapping
+   guest page tables (225-405 us per load); entry-patch invalidation (O(blocks) per switch with slots); kernel code in
+   the persistent cache (KASLR; measured November 5).
+10. **Cross-vCPU reuse** ([cross-vcpu-reuse-plan](cross-vcpu-reuse-plan.md), accepted after two review rounds): 81% of
+    configure's host cache hits are answers another vCPU compiled. A host-published, content-keyed in-VM pool (seqlock
+    ring; positions in the index; containment rests on the position check) and option (d) (skip re-admission on hits
+    when CPL-0, bulk and relocation match). Counting chunk running; the pool's 272 MiB and default-on are the owner's
+    call after the count.
+11. **Dispatcher and linking are not near-optimal** (Fable review): a current-block miss pays ~60% avoidable state copying
+    and barriers; a link pays three full synchronizations; others use a call, not a trap, for misses and QEMU chains
+    only within a page. In progress: IDC-gated code synchronization and L1 counters; next: a fast miss path (like
+    `sys_fast`) and relink-on-revalidation (design under way).
+
+12. **Relink on revalidation is gated by a counter** ([relink-plan](relink-plan.md), under review): re-patching a
+    target's suspended inbound links when it is revalidated is exact (the word equals what the linker would write;
+    `lookup` is the single point where a block becomes current again), but it can only save linker traps whose target
+    is already current, and the first trap per target per epoch is the one that revalidates it. So step 1 batches the
+    code synchronization of TLB-event unlinks (est. ~8 vCPU-s on make, unmeasured) and adds `linked_current`; the
+    suspension segment is built only if `linked_current` x 0.6 us exceeds 1% of make's busy time.
+
+13. **Architecture review adopted as the roadmap** ([architecture-review-20261113](architecture-review-20261113.md),
+    Fable): guest code runs only 0.42 us (configure) / 1.17 us (make) between exceptions, and on configure the handlers
+    cost more than the code. Root causes: (A) currency, links and shadows are per address space and rebuilt per block
+    for every new process (configure 41% / make 27% of busy) — so make a new address space cheap rather than keep old
+    ones (why slots lost); (B) every event is a full-banking exception with full synchronizations (resident-only fixes);
+    (C) host round trips for cache hits and whole-area flushes when the block index fills; (D) guest code: FEX's
+    straight-line output is near native, the build gap is structure (glue: computed exits, svc exits) — no codegen track
+    until the sampler says so; (E) faults/interrupts (an interrupt costs 62 us on configure vs 12 on make: measure).
+    Plan: one scratch build with four counters (miss cause, revalidations per page-epoch, flush-attributable hits, aborts
+    per table page + A-bit) and two profile runs; then measurement groups R (resident: sync, fast miss, fast link,
+    relink), H (pool, flush policy), F (page currency, fault-around, delivery/irq), G (codegen, gated). Estimates if
+    groups R, H, F land (overlaps discounted): configure 76.7 -> ~50-58 s, make 139 -> ~112-120 s.
+
+14. **Pool counting gate passed; (d) first, then the pool, on by default after its gate** (counting build `022439d`,
+    branch `pool-count`, measurement only). At 256 MiB the simulated pool serves 2.63 M configure requests (78%; gate
+    1.8 M) and 5.08 M on make (81%); modelled gain configure 5.0-6.3 vCPU-s (4.3-5.4%), make 12.2-14.7 (2.1-2.6%).
+    512 MiB adds almost nothing; configure never wraps 256. Option (d) qualifies on 2.75 M configure hits (2.74 s of
+    measured admission, 2.3%) and 5.14 M on make (5.7 s, 1.0%). The two overlap. Most served requests are the same
+    code at the same RIP on another vCPU (kernel code, forked children). Order: (d) first (host only, small), then
+    pool chunks 2-4; owner chose default-on for the pool once chunk 4's gate passes, with a switch to turn it off.
+
+15. **Census (architecture review's counters; scratch `72722d3`, branch `census-scratch`, profile
+    `natemu-raw/census-profile-1`, uncontended).** Busy 119.8 / 603.2 vCPU-s (configure / make). Dispatcher misses:
+    L1 entry held another block 17.7% / **66.3%**, needed revalidation **54.4%** / 29.0%, needed translation 27.8% /
+    4.6%, L1 empty ~0. Distinct page-epochs are only **11.2% / 8.6%** of revalidations (upper bound). **37% / 52%** of
+    host hits are answers a flush threw away (11 and 10 of the 15 and 14 flushes are capacity flushes). Aborts per
+    table page per epoch 26 / 101; the guest's A bit is already set in 98-99.96% of shadow installs. Links whose target
+    was already current (`linked_current`): 8.4 M / 27.3 M, ~5 / ~16-18 vCPU-s (4.2% / ~3%). Interrupts: a peer
+    vCPU's kick costs 125 us on configure (93% of the irq bucket; 26 us on make); timer 4-6 us.
+    Stop rules: all continue. (2) bigger/associative L1 — continue for make (conflicts, not hash quality: decision 9's
+    fold changed the index, not capacity); (4) relink step 2 — above its 1% gate; (6) page-level currency — one
+    revalidation per page-epoch would remove ~89-91% of revalidations; (7) flush policy — continue; (8) fault-around —
+    continue, installing only neighbours whose A bit is already set adds no A-bit side effect. (9) the kick cost is
+    unattributed: likely invalidation/shadow-reset/flush work charged to `irq`; needs a bucket before any fix.
+    Ranking by measured share: page-level currency (configure) and flush policy (both) first, then L1 conflicts
+    (make), relink step 2, fault-around, kick attribution.
+
+16. **Group R1 (code synchronization by CTR_EL0, skip re-admission, link-full cap): first profile
+    (`natemu-raw/group-r1-profile-1`, one uncontended run).** K1 256/256 in ~26 s (link-full at the 16 Ki cap).
+    Host bucket down 3.9 (configure) / 6.2 (make) vCPU-s, as the admission count predicted; configure step 77.1 ->
+    73.5 s. But the perf build carried the dispatch study counters, and `lookup` doubled (36 -> 76 ns over 273 M
+    lookups on make, +10.7 vCPU-s) with guest time +14: the same pattern as the census build and absent from host-only
+    builds. **Rule: study counters get their own feature, never `perf`** — the perf build is the measuring instrument.
+    Counters move to `dispatch-study`; the group is profiled again before judging make.
+    **Second profile (`group-r1-profile-2`, counters off): kept.** `lookup` back to 35 ns (the counters' dependent
+    cold loads on every miss polluted the caches). Busy configure 120.7 -> 112.6 vCPU-s (-6.7%), step 77.1 -> 73.0 s;
+    make 576.8 -> 564.7 (-2.1%), step 139.0 -> 137.0 s. Host -3.6 / -7.5 (admission skipped). Code synchronization by
+    CTR_EL0: no measurable gain (patch unchanged: the clean was nearly free on this chip); kept as correct and free.
+    make's miss bucket varies 287-315 ns per miss across five recent runs (noise band for single-run judgements).
+
+17. **Plans for the census's top items, reviewed (Fable authors, independent reviewers).**
+    Page-level currency (`page-currency-plan`): design sound for x86 (every walk input keyed or flushes; staleness is
+    what a TLB may show, SDM 4.10.4), but fixes needed (a 2 MiB record could serve a non-RAM page; one K1 program goes
+    red and check mode disagrees by design; three mutations survive). Its own gain is ~1-2%; its value is letting the
+    fast miss path serve the 54% of configure misses that revalidate, so it is sequenced right before that path and
+    folded into it if its count misses. The fast-miss plan is being written by the same author.
+    Flush policy (`flush-policy-plan`): two halves evicted oldest-first does not protect hot blocks (a block in
+    continuous use is lost once per C placements, as today), and the design had two correctness defects (survivor
+    translations off their page chains run stale code after a write; no `shadow_generation` bump -> false
+    NO_PROGRESS). Revised to a counting chunk that decides between slim instance records + a bigger index (cheap,
+    no eviction machinery), flush with hot blocks carried forward, and halves with carry-over, by net modelled gain
+    including the eviction's own cost and the pool's overlap. Instances are 66-69% of block numbers on configure,
+    37-45% on make.
+
+18. **Admission is done** (host counter `f7becee`, profile `natemu-raw/admission-reasons-profile-1`). Every cache hit
+    now reuses its kept form: configure 2.80 M of 3.40 M object answers skip admission (82%), make 4.98 M of 6.18 M
+    (81%). What is still admitted is first compiles (0.60 M / 1.13 M) plus 0.07 M recompiles of dropped answers on make;
+    privilege, bulk, shape, prefix and relocation refusals are ~0. A kept form per context would gain nothing; the
+    remaining cost (~1 s of configure) is the check on first compiles, which must stay (containment).
+
+19. **Correctness tests made fast** (owner: fast unless justified). K1's `link-full` overflows a test cap of 16 Ki
+    links (full size once per suite, `k1-full-links`): K1 at 1 and 4 vCPUs went from ~35 min to ~26 s. Suite: the
+    fault runners spawned clang ~3,800 times per shard (54 of 63 s) — now a clang result cache; QEMU system-mode
+    references are cached by binary, firmware, image and arguments, and a timeout is stored only for the nine cases
+    known to hang and only after two fresh timeouts; identical prefix baselines run once. Reviewed twice. Verified
+    (`natemu-raw/fast-tests-1..3`, 17 steps, third run warm): every step's case counts equal November 11's, the same
+    8 expected QEMU hangs; e.g. faults@1 348 -> 59 s, system 160 -> 21, cpu-forms 206 -> 52, i7-faults@1 296 -> 91,
+    k1-c1 160 -> 11 (November 11 ran inside the full suite, so only the large ratios are meaningful). Final gates run
+    with `NATEMU_QEMU_CACHE=off NATEMU_ASM_CACHE=off`. Remaining cost: ~40k VM launches per suite (a multi-program
+    launch mode would cut it; measure a launch first).
+
+20. **Flush policy stopped after its count** (chunk 0, branch `flush-count`, profile `natemu-raw/flush-count-profile-1`,
+    `replay.txt`). The replay reproduced the census refetches (configure 1.199 M vs 1.155 M, +3.8%; make 2.757 M vs
+    2.830 M, -2.6%). Refetches come right after a flush (40% / 20% within the first C/16 placements; only 12% / 7.6%
+    later than C/2): the hot set is relearned at once, so carrying blocks forward costs about what it saves — (b)
+    carry-over nets +0.1 / +1.5 vCPU-s, (c) halves + carry-over -0.4 / +0.9. Only (a) slim instance records + a 2 Mi
+    index clears the floor at today's refetch price: +1.8 (1.6%) / +3.9 (0.7%), optimistic. The shared pool cuts the
+    host part of a refetch from ~2.0 to ~0.75 us, which puts (a) below the 1% floor, so the pool goes first and (a) is
+    re-evaluated after it (same replay, pool cost). Trace files pruned; replay.txt kept.
+
+21. **Two-way L1 first** (count build `l1-count`, profile `natemu-raw/l1-study-profile-1`; counts only, its timings are
+    perturbed). Current-target conflict misses reproduced the census (configure 5.51 M vs ~5.7 M; make 88.6 M vs
+    87.5 M); capacity flushes unchanged. Share of make's conflict misses removed (x ~0.5 us each): direct-mapped 2^17
+    0.53 (23.5 vCPU-s), 2^18 0.76 (33.5), 2-way 2^16 sets 0.92 (40.8, exact, 2x memory), 2-way 2^15 sets <= 0.88
+    (<= 38.8, upper bound, today's memory); configure 1.4-2.5 vCPU-s. Conflicts are pairs, not chains (0.4% of current
+    blocks share an index with 8+), so a second way catches what doubling cannot. Chosen: 2-way at today's memory
+    (~6.5-7% of make busy, the largest single item this round); the 2x variant gains ~2 vCPU-s more but takes 8 MiB per
+    vCPU from a code area already at 88% on make. Order (fast-miss plan section 7): 2-way L1, then page record + fast
+    miss path together.
+
+22. **Two-way L1 kept** (branch `l1-two-way`; plan reviewed twice, code reviewed; K1 304/304 default and link-check;
+    all 11 mutations red; profile `natemu-raw/l1-two-way-profile-1`, one uncontended run vs
+    `admission-reasons-profile-1`). Make: dispatcher misses 130.9 -> 65.7 M (gate >= 54 M), miss+enter+lookup
+    -23.9 vCPU-s, guest +5.9 (at the "quarter of the saving" guard; make's guest varies ~354-358 between clean runs —
+    judged in the group's interleaved rounds), busy 565.7 -> 549.3 (-2.9%), step 137.6 -> 132.1 s (-4.0%).
+    Configure: misses 31.7 -> 27.2 M, busy -2.0. Way-1 hit cost below resolution in the K2 rows (predicted and
+    randomized). The 15-bit set index created 17.8 M new conflicts on make (as reviewed); 2-way at 2^16 sets would
+    remove them (~5 vCPU-s more, +8 MiB code area per vCPU) — a possible follow-up. Net gain below the plan's
+    "up to 34-39": the 0.5 us per-miss figure was optimistic and the misses left are the costlier ones.
+
+23. **Shared pool built; configure gate passed, make blocked by a re-check flaw** (branch `pool-rebased` 40df405 on
+    the two-way L1; chunks 2-3 reviewed for security twice; pool programs 128/128, full K1 368/368 default and
+    link-check, mutations red; `--check-reuse` boots (busybox, 1 and 4 vCPUs, 23.8 k pool hits) and IO5 configure
+    under check with no mismatch). Pool off vs on, same build (`natemu-raw/pool-{off,on}-profile-1`): configure busy
+    114.8 -> 110.1 (-4.1%, gate -3%), host requests 3.38 -> 1.67 M; make flat (547.7 -> 548.0): of 6.37 M probes, 3.55 M
+    found byte-matching entries the placement re-check refused (each after a ~0.5 us copy, then the host serves it
+    anyway), 0.57 M were overwritten (the 256 MiB ring wraps on make). Not default-on until the re-check refusals are
+    understood (the host's own relocation accepts these requests, so the pool path is stricter or publishes a
+    different form).
+
+24. **Page record's count passes** (chunk 0, branch `page-count`, profile `natemu-raw/page-count-profile-1`, counts
+    only). A per-vCPU record of fetch-walk results would answer 90.7% / 94.4% of revalidation walks and 90.2% / 93.2%
+    of placement walks (configure / make); 91.3% / 94.5% of revalidated blocks would need no walk at all; 0
+    disagreements in 33.2 M / 62.8 M would-be hits. Would-hit walks cost 105-133 ns, probes ~10 ns. Modelled net 3.0
+    (2.7%) / 7.1 (1.3%) vCPU-s (gate 1.5 / 3.5). Built next together with the fast miss path (plan order), since the
+    record is what lets a revalidating miss stay on the fast path.
+
+25. **Shared pool passes its gate** after one fix (`5211757`): 99.5% of placement re-check refusals were the move check
+    refusing entries placed at the very RIP they were admitted for (the 32-bit RIP-move form below 4 GiB, and forms the
+    constant loader encodes differently) — the host's own path never relocates a same-RIP hit, so the pool was
+    stricter than the host. At distance 0 nothing is rewritten, so only the link points are re-verified (security
+    review: accept; the code is exactly as admitted at that RIP on every caller). Pool off vs on, same build
+    (`natemu-raw/pool-fix-{off,on}-profile-1`): configure busy 113.0 -> 106.2 (-6.0%), step 72.2 -> 68.6 s; make
+    547.3 -> 538.8 (-1.6%), step 133.4 -> 130.9 s; re-check refusals 0.85 M / 3.57 M -> 5 k / 8 k; cost per served block
+    0.76 / 0.89 us (gate <= 1.0); IO5 configure under `--check-reuse` with the pool: no mismatch. Merged off by default;
+    default-on (owner-approved after the gate) once the group's interleaved rounds confirm it. Backing is 274 MiB
+    (a 2 MiB control granule). The ring wraps on make (0.59 M overwritten, ~0.2% of busy): not worth a bigger window now.
+    Disk: profiles now delete raw request logs after each step (`ba6d4c4`) after ENOSPC stopped all work twice.
+
+26. **Page record + fast miss path: measured, merge pending tests** (branch `fast-miss`; plans reviewed twice; code
+    review: accept, no code defect). Both on vs both off, same build (`natemu-raw/fm-{off,on}-profile-1`): configure
+    busy 114.1 -> 111.3 (-2.5%), make 552.7 -> 540.2 (-2.3%), make step 133.9 -> 130.8 s. The record answers 33.1 M /
+    61.5 M fetch walks (3.5 M / 3.8 M still walked): revalidation 2.94 -> 0.23 / 8.06 -> 0.54 vCPU-s. The fast path takes
+    16.6 M of configure's ~27 M misses (8.9 M decline with no current block, 1.08 M on `Unknown`) and 58.3 M of make's
+    65.8 M; its own cost shows as miss +2.1. Below the plans' estimates (make 21-29) but real. Blocking before merge
+    (review): the uncached check is the only guard on a new route (step-block exits now reach the fast path; a skipped
+    `uncached_end` would leave a UC shadow mapped) and needs a red-under-mutation test; plus the hook cases (I/O window,
+    peer code invalidation, reinject backlog, IF inside the miss). Possible follow-up: let `Mapped::Unknown` continue
+    the L2 search instead of ending it (fewer declines when processes map different code at one address).
+
+27. **Round result, three interleaved timing rounds** (`natemu-raw/round-20261114-01`, order rotated, timing only, no
+    contention; base `b772652` = this round's start with decisions 2-7, head = all of decisions 16-26 merged). Medians:
+    configure 72.9 -> 69.8 s (pool off, -4.3%) -> 67.5 s (pool on, -7.4%); make 136.5 -> 129.3 (-5.3%) -> 127.0 (-7.0%).
+    Pool on vs off -3.3% / -1.8% (every make pool-on run faster than every pool-off run). The two-way L1's guest-time
+    question (decision 22) is settled: no wall cost. The fast-miss merge (6089ca6) is in head. Pool -> default on (owner
+    approval after the gate). Remaining: full suite (caches off), benchmark suite, IO5 full boot.
+
+28. **Round end: suite and IO5 full boot.** Full suite with both caches off (`natemu-raw/round-suite-20261114-01`,
+    21 min wall vs 36 on November 11): 166/171; probes@1/@2 failed only because OrbStack was down (Docker reference)
+    and pass with `NATEMU_REFERENCE_BACKEND=apple` (`round-suite-20261114-02`); k2-rdrand's expectation followed the
+    pool's ENTROPY_WORDS 32 -> 30 (`0312884`, passes); io-coverage host-full is the known environmental failure;
+    net-linux could not bind port 8000 (leftover http and iperf3 servers from the PCI acceptance run, pids 27567/27568; stopped with the owner's approval) and then passed (`round-suite-20261114-03`).
+    IO5 full boot, mitigations off, natemu head with the pool on (`io5-natemu-mo-20261114-01`): PASS; use phase
+    705 -> 564 s (-20%), configure 88.7 -> 67.9 s, make 492.3 -> 349.4 s (-29%), vs QEMU 901 s: natemu 0.63x QEMU (0.78x
+    before this round). Benchmark suite (3 rounds) running: `natemu-raw/bench-round-20261114-01`.
+
+29. **Benchmark suite: wide gains, two regressions traced** (`natemu-raw/bench-round-20261114-01`, 3 rounds, 66 boots,
+    none contended or uncounted; vs the November 5 natemu round and the recorded QEMU numbers). Cold medians: build
+    -14.6% (N=1) / -14.5% (N=4), 7zip -3.4% / -6.6%, luajit-interp -2.0% / -6.2%, avx -3.3% / -2.5%, most others -1-4%;
+    regressions hackbench N=1 +3.2% and locks N=4 +9.0%. Attribution (bench-attr-20261114-01..03, 2-3 runs each): both
+    come from this round — vs the round's start hackbench 11.63 -> 12.35 s, locks 7.39 -> 7.91 s; turning off the pool,
+    fast miss and page record leaves them (12.14 / 7.80); bisecting at the two-way L1 merge: hackbench 11.66 -> 12.12
+    (+4%), locks 7.47 -> 7.60 (+1.7%). So the two-way L1 at 2^15 sets costs process-heavy workloads (likely the 15-bit
+    index's new conflicts, 17.8 M on make; decision 22), and locks has a further ~3% from an always-on change merged
+    after it (not yet found). Label: a trade-off, not a waste — the same L1 halves make's misses. Fix candidate: 2-way at
+    2^16 sets (no new conflicts, +8 MiB of code area per vCPU) — owner decision.
+
+30. **2-way L1 at 2^16 sets built and not merged; the hackbench/locks "regression" is mostly noise** (branch
+    `l1-two-way-16`, reviewed: accept; K1 496/496, all mutations red; gate `natemu-raw/l1-16-gate-20261114-01`, pool on in
+    both, uncontended). 2^16 vs 2^15: make misses 65.7 -> 51.3 M (as counted), but make 126.85 -> 126.1 s and configure
+    66.75 -> 67.75 s (both within spread), configure capacity flushes 10-11 -> 12, hackbench N=1 11.62 -> 12.02 s, locks
+    N=4 7.57 -> 7.62 s. Correction to decision 29: the same 2^15 head binary measured hackbench 12.35 s earlier today and
+    11.62 s here (round start 11.63), so 2-3 runs per build cannot separate a few-percent change on these benchmarks;
+    the two-way L1 is not shown to regress them. The owner's condition for 2^16 (recover hackbench/locks, no flush
+    increase) is not met: 8 MiB per vCPU buys nothing measurable, so 2^15 stays. Lesson: benchmark attributions below
+    ~5% need >= 5 interleaved runs per build on this machine.
+
+31. **Peer-kick cost attributed** (study build `kick-study`, profile `natemu-raw/kick-study-profile-1`, analysis.txt).
+    Configure: 13,347 peer kicks, 1.38 s; 95% are plain guest IPIs at ~3 us; the cost is a tail of 282 episodes (2.1%)
+    over 512 us that hold 96.8% of the time, all in `drain` (taking posted invalidations): kicks for another vCPU's
+    write to a code page (`code_post`: 530 at ~2.0 ms mean, plus 52 merged with an IPI at ~5.4 ms) — 97% of the source's
+    time. Make: 13,731 kicks, 1.07 s, same shape. Host doorbells cost ~31 us mostly in `tlb` (I/O checkpoint), timers
+    ~4-6 us. So item 9 of the review is not interrupt delivery: it is a slow invalidation drain after code-page writes
+    (milliseconds per post with only ~2.6 blocks killed on average — something in the drain scales with more than the
+    blocks it kills). Next: find what the drain walks (likely a scan proportional to cache contents) and make it
+    proportional to the page's own blocks; worth ~1.3 / 1.0 vCPU-s on configure / make plus the woken vCPU's stall.
+
+32. **Drain fix, first layout: drain fixed, net loss on make** (branch `drain-fix`; review: accept, no defect; K1
+    500/500 default and link-check; gate `natemu-raw/drain-gate-20261114-01`, 2 interleaved perf profiles each). Cause of
+    decision 31: `cut()` ran `prune(CHECKED)`, a pass over every link record (up to 512 Ki), whenever a dead block had any
+    outbound link, once per invalidate. Fix: a per-source outbound list so a kill undoes only the dead block's own links.
+    Result: configure irq 1.82 -> 0.15 s (44 -> 3.7 us per event), make irq 2.33 -> 0.81; but the list's upkeep on every
+    record move (a `next_out` chain walked per move, 28-B records straddling lines) raised patch 8.35 -> 10.67 and tlb
+    12.58 -> 15.26 on make: make busy +1.6%, step 128 -> 131 s; configure busy -2.4%. Not merged; switching to the
+    reviewer's layout (four fixed out slots per block, one per link point, 24-B records, one slot update per move).
+
+33. **Drain fix merged (fixed out slots)** (`f418330` and its parents; re-review: accept; K1 500/500 default and
+    link-check; 7 mutations red; gate `natemu-raw/drain-gate-20261114-02`, 2 interleaved perf profiles each). Each block
+    keeps one out slot per link point (the record index), records stay 24 B, a record move updates one slot, and the
+    packed point index lives above bit 28 of `offset_point` (renamed so raw readers fail to compile). Configure irq
+    0.77 -> 0.15 s; patch 139 -> 147 ns / 174 -> 182 ns per event; busy and wall within spread (configure busy 104.6 ->
+    103.4, make 535.9 -> 534.3 excluding one outlier head run at 579 with 12 flushes). Merged as a design fix (owner rule:
+    wasteful designs are fixed even when the gain is small): milliseconds of scanning to kill ~3 blocks are gone.
+
+34. **Fault-around: the fill stops, the writable-on-read rule goes ahead** (plan `fault-around-plan.md`, reviewed twice;
+    chunk 0 study on branch `fault-count`, profile `natemu-raw/fault-count-profile-1`, analysis.txt; counts only). Fill
+    (prefetching neighbour shadows): best window W=8 nets +0.90 (configure, hit 39-45%) / +3.53 vCPU-s (make, hit
+    48-53%) against gates 1.5 / 4.0 — fail; with the measured removal cost per extra entry (177 / 423 ns, unmap_large)
+    no window is positive at all. Not built. Chunk 1 (install writable on a read when D=1, the write is granted, WB/WC,
+    frame not translated): 1.17 M (configure) / 4.56 M (make) upgrade aborts follow such reads (99.8%); saves ~0.88 s /
+    ~3.42 vCPU-s — passes; its would-be writable bits on frames later marked as code are 0.0% of marks in both spaces,
+    so it applies to user and supervisor. Being built (branch `fault-chunk1`).
+
+35. **Writable on read merged; relink measured** (both reviewed: accept with fixes).
+    Writable on read (fault-around chunk 1, `fault-chunk1` -> cherry-picked; includes the reviewer's split-lock fix:
+    after a split-lock wait reset this vCPU's shadows the writable bit is set again and `translated` rechecked). Gate,
+    same build switch on vs off (`natemu-raw/wor-gate-20261114-01`, 2 interleaved each): upgrade aborts 1.95 M -> 1.4 k
+    (configure) / 6.03 M -> 1.4 k (make); abort+shadow -1.2 / -4.8 vCPU-s; busy -1.7% / -1.1%; step 70.2 -> 68.9 s /
+    129.2 -> 128.0 s; shootdowns, invalidations, steps, shadow resets unchanged.
+    Relink (steps 1-2, branch `relink`; gate `natemu-raw/relink-gate-20261114-01`, 2 interleaved each, one outlier head
+    run excluded — the second head run was slow in both recent gates): configure 69.9 -> 65.9/67.9 s, busy -3.5%;
+    make 129.9 -> 123.6/124.7 s, busy 531.7 -> 509.9 (-4.1%); link+patch+tlb+relink 64.3 -> 46.1 vCPU-s on make; linker
+    entries 73.1 -> 43.0 M; 84 M suspended, 80 M relinked, ~1.9 k dropped. Above the plan's estimate (up to 16 vCPU-s).
+    Merges after the review's test fix (the surviving insert-move mutation is a real latent defect: a stale cursor in one
+    layout trips the BAD_LINK tripwire; relink-many must reach that layout) and guards.
+
+36. **Relink merged** (cherry-picked onto the head with writable-on-read; review fixes in: relink-rot0..3 turn the
+    insert-move mutation red, pairing guard before every relink, link-check audits of out slots and suspension, host
+    check by point and pairing). Merged tree: unit tests pass (the timing test channel_wakes_both_sides flakes only under
+    background priority and passes at normal priority), resident checkers ok, K1 594/594 default and link-check.
+    Measured (decision 35): configure ~-4.4% wall / -3.5% busy, make ~-4.4% / -4.1%; 80 M links relinked on make.
+    Note for bisecting: the relink step-1/step-2 commits before `22a9cb3` don't compile alone (the drain fix's
+    `offset_point` rename is converted there).
+
+37. **Second batch confirmed by interleaved rounds** (`natemu-raw/round-20261114-02`, 3 rounds, timing only, no
+    contention; base `c4b783c` = before the drain fix, writable-on-read and relink; head `550d598`). Medians:
+    configure 67.6 -> 63.2 s (-6.5%), make 126.9 -> 122.5 s (-3.5%); every head run faster than every base run on both
+    steps. Cumulative vs main (`dcffe4b`, profiles): configure ~91 -> ~63 s (about -30%), make 177.9 -> ~122.5 s (about
+    -31%). This ends the architecture review's gated roadmap (groups R, H, F); next by share is guest code (group G,
+    sampler first).
+
+38. **Guest-code deep review (findings only; owner: no fixing at the end of the weekly window)**
+    ([guest-code-review-20261114](guest-code-review-20261114.md), Fable; fexc run directly on cc1/libc/dash/kernel and
+    bench bytes; no VM). Guest time is ~37% of configure's busy time and ~68% of make's, ~4.7x / ~3.3-3.8x native.
+    FEX's own instruction selection is not the gap (2.2-2.3 Arm words per x86 instruction); natemu's code is
+    2.9-3.2 linked (~1.3-1.4x), the extra being exactness/containment glue: split-store checks (~6-9% of guest time,
+    measured ceiling), load-then-move, per-RMW `mrs nzcv`, and the computed-exit sequence through the shared dispatcher
+    (15 words, an indirect branch whose target varies by RIP; 15-16.5% of build's EL0 samples measured, inferred 10-17%
+    of make's guest). Other items: possible cold predictor/cache state after each return from EL1 (unmeasured,
+    configure 10-25%?), REP MOVS one element per pass (bulk only for STOS), flags materialisation (3-6%), glibc AVX2
+    string functions (vpmovmskb 24 words), code footprint ~17 B per x86 instruction. Not costs: memory ordering,
+    address guard, alignment checks. All configure/make shares are inferred — neither step has been sampled; the review
+    specifies a resident timer sampler (no PMU under HVF) as the first step next window. Candidates are listed, not
+    recommended; any translator (FEX) change is the owner's call.
+
+39. **Pre-merge suite: 171/171** (`natemu-raw/premerge-suite-20261114-01`, head `4b19f44` — all code merged; later commits
+    are docs only; both caches off, Apple-container reference backend because OrbStack was down; 26 min wall). With K1
+    594/594 default and link-check and the interleaved rounds (decisions 27, 37), `perf-real-workload` is ready to merge
+    into main on the owner's word (main has not moved since dcffe4b: a fast-forward, no conflicts).
+
+40. **Final comparison on the merge head** (`4c89205`; measurement only). Bench suite
+    (`natemu-raw/bench-round-20261114-02`, 66 boots, 0 contended, cold medians of 3, vs the Nov 5 natemu round): at
+    1 vCPU build -17.5%, luajit -12.0%, avx -3.8%, the rest within -3%..+0.3%; at 4 vCPUs build -14.4%, luajit -10.0%,
+    hackbench -7.6%, 7zip -5.9%, luajit-interp -5.8%, avx -5.6%, the rest within -2%..+0.4%, except locks +7.3% (cold;
+    the morning round's +9.0% had the same cause unexamined, the Nov 5 round used an older fexc and harness, and 4-vCPU
+    locks is lock-handoff bound, so this is an open question, not an attributed regression). Against QEMU 11.1.2 TCG
+    natemu takes 0.02x-0.73x the time on every benchmark. The second batch (decisions 32-36) added luajit -8%/-8% and
+    build -3% at 1 vCPU over the morning round (`bench-round-20261114-01`, head `0312884`). IO5 full boot
+    (`io5-natemu-mo-20261114-02`, mitigations off, PASS): use phase 522.2 s, against 563.6 s before the second batch,
+    705.4 s on main and 901.1 s on QEMU (0.58x); configure 62.8 s, make+download+generate 347.6 s (they overlap).
+
+41. **locks at 4 vCPUs: expected contention, not a regression** (owner's reading, supported by the data). Interleaved,
+    5 runs each (`natemu-raw/locks-ab-20261114-01`): Nov 5 build (own fexc) 7.30 s, head 7.98 s, head with the pool off
+    7.99 s; the fexc update alone was -1.6% in its own A/B. Checkpoints of this round (`locks-bisect-20261114-01`, head's
+    fexc and harness, medians of 5): main 7.13, after the link lists 7.18, before the two-way L1 7.37, after it 7.69,
+    pool/fast miss/page record 8.26, drain fix + writable-on-read 7.77, head 7.99 s — spreads of 0.4-0.8 s overlap, so a
+    drift, not one change. 1 vCPU is unchanged (3.90 s). The N=4 / N=1 ratio went 0.65 (Nov 4, slow single-thread path:
+    threads seldom met at the lock) -> 1.85 (Nov 5) -> 1.98 (head); native 1.99, QEMU 2.49. glibc's mutex is unfair, so
+    a slower path between lock operations or a slower wake lets the holder retake it uncontended; as natemu's paths get
+    cheaper the benchmark shows native-like contention. hackbench N=4 -7.6% in the same round fits. No action.
+
+## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
+
+Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
+3.5, other 1.6, VM exit+entry 4.4, placement 0.8); linking + patching 10.4%; faults (abort, shadow, delivery) 10.5%;
+dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3 loads 3.4%; system/interrupt/helpers
+5%; boot CPU start-up 2.8%. No single overhead above 8.3%: progress is a sum of medium fixes, measured in groups.
+
+## Reference points (same snapshot steps, cold, 4 vCPUs)
+
+| | configure | make -j4 |
+| --- | --- | --- |
+| natemu, start of round (main) | 89.5-92.6 s | 177.9 s |
+| natemu after decisions 2-7 | 76.7 s | 139.0 s (single run) |
+| natemu after group R1 (decision 16) | 73.0 s | 137.0 s (single run) |
+| natemu after two-way L1 (decision 22) | 72.7 s | 132.1 s (single run) |
+| ... with the shared pool on (decision 25) | 68.6 s | 130.9 s (single run) |
+| round start vs head, timing-only medians of 3 (decision 27) | 72.9 -> 67.5 s | 136.5 -> 127.0 s |
+| second batch, timing-only medians of 3 (decision 37) | 67.6 -> 63.2 s | 126.9 -> 122.5 s |
+| IO5 full boot use phase (decision 40): main 705.4 s, before batch 2 563.6 s, head 522.2 s, QEMU 901.1 s | | |
+| QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
+| native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |

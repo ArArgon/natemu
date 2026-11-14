@@ -2,11 +2,11 @@
 //! cache on by default ([`natemu::compile_cache::Config::new`]).
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
-//!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--compile-cache DIR|off] [--compile-cache-mb N]
-//!       [--perf-log FILE]
+//!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool[=false]] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
+//!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off]
 //!
-//! Named arguments (clap; `natemu --help`). The last five fall back to `NATEMU_SERIAL_STDIN`,
-//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
+//! Named arguments (clap; `natemu --help`). Seven fall back to `NATEMU_SERIAL_STDIN`,
+//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
 //! over its variable; a switch's variable takes 1/0, true/false, yes/no, on/off). `--runtime` defaults to the resident built beside this binary
 //! (`<target>/aarch64-unknown-none/<profile>/natemu-runtime` for `<target>/<profile>/natemu`) when that file exists.
 //! `--ram` takes bytes, 0x hex, or a K/M/G suffix (binary units: 2G = 2048M = 0x80000000). COM1's output goes to
@@ -15,6 +15,11 @@
 //! exits 130 at once), 1 on a host error (a failed serial write and a refused command line included; `--help` exits 0).
 //! `--perf-log FILE` turns on the library's timing log (`natemu::perf`). `--serial-stdin` (off by default) feeds standard
 //! input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode, Ctrl-C to the guest, Ctrl-A x cancels the run.
+//! `--page-currency` (default on; `NATEMU_PAGE_CURRENCY`): a per-vCPU record of fetch-walk results answers the resident's fetch
+//! translations as a TLB entry does (page-currency plan); `off` walks every one, `check` answers from the record and walks too,
+//! counting any difference. `--writable-on-read` (default on; `NATEMU_WRITABLE_ON_READ`): a demand read installs the shadow writable when the
+//! guest entry has D set and grants the write, so a later write needs no second abort (fault-around plan chunk 1); `off` is the old behaviour. `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` to turn it off): the shared template pool, in
+//! which the host publishes admitted templates and each resident looks before asking the host (cross-vCPU reuse plan).
 //! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
 use clap::Parser;
@@ -63,6 +68,14 @@ struct Cli {
     /// The resident's page-walk speculation barriers (needs FEAT_SB)
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
+    /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
+    /// does (off), or it answers and the walk is made too, a difference counted (check)
+    #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check", default_value = "on", value_parser = parse_page_currency)]
+    page_currency: u64,
+    /// Fault-around plan chunk 1: a demand read installs the shadow writable when the guest entry has D set and grants the write (on, the
+    /// default), or read-only as before (off); for A/B measurement
+    #[arg(long, env = "NATEMU_WRITABLE_ON_READ", value_name = "on|off", default_value = "on", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_writable_on_read)]
+    writable_on_read: bool,
     /// Expose the virtio-MMIO entropy device
     #[arg(long)]
     rng: bool,
@@ -72,6 +85,23 @@ struct Cli {
     /// Expose a virtio-MMIO network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
     #[arg(long)]
     net: bool,
+    /// The shared template pool (a read-only 274 MiB span of address space, backed as touched): the host publishes admitted
+    /// templates into it and each resident looks in it before asking the host. On by default; `--pool=false` or `NATEMU_POOL=0`
+    /// turns it off (`NATEMU_POOL_LOOKUP=off`: publication only)
+    #[arg(
+        long,
+        env = "NATEMU_POOL",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = true,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pool: bool,
+    /// Debug: every block the resident copies instead of asking the host (a template of its own, or a pool entry) and every
+    /// answer reused at another RIP is also compiled by the host and must be equal (a mismatch stops the run); as boot-linux's
+    #[arg(long, env = "NATEMU_CHECK_REUSE", value_parser = clap::builder::BoolishValueParser::new())]
+    check_reuse: bool,
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
     #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
     compile_cache: Option<PathBuf>,
@@ -81,6 +111,14 @@ struct Cli {
     /// Write the timing log (natemu::perf) to FILE
     #[arg(long, value_name = "FILE", env = "NATEMU_PERF_LOG")]
     perf_log: Option<PathBuf>,
+}
+
+/// `--page-currency`: on, off or check (the library also knows `check-halt`, a test mode that stops the run at a difference).
+fn parse_page_currency(text: &str) -> Result<u64, String> {
+    if text == "check-halt" {
+        return Err("--page-currency check-halt: on, off or check".into());
+    }
+    natemu::execution::parse_page_currency(text)
 }
 
 /// Bytes, 0x hex, or decimal with a K/M/G (binary) suffix.
@@ -132,9 +170,13 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
         cli.compile_cache_mb,
     )?;
     boot.speculation_barriers = cli.speculation_barriers;
+    boot.page_currency = cli.page_currency;
+    boot.writable_on_read = cli.writable_on_read;
     boot.rng = cli.rng;
     boot.disk = cli.disk;
     boot.net = cli.net;
+    boot.pool = cli.pool;
+    boot.check_reuse = cli.check_reuse;
     boot.initrd = cli.initrd.as_ref().map(read).transpose()?;
     boot.cmdline = cli.cmdline.unwrap_or_default();
     boot.ram = cli.ram.unwrap_or(boot.ram);
@@ -191,6 +233,46 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// `--check-reuse` and `NATEMU_CHECK_REUSE` (a flag wins, a switch's variable takes 1/0, true/false, on/off) reach
+    /// `Boot::check_reuse`'s switch; off by default.
+    #[test]
+    fn check_reuse_option() {
+        use clap::Parser;
+        let base = ["natemu", "--fexc", "f", "--kernel", "k"];
+        let parse = |extra: &[&str]| {
+            super::Cli::try_parse_from(base.iter().chain(extra))
+                .unwrap()
+                .check_reuse
+        };
+        assert!(!parse(&[]));
+        assert!(parse(&["--check-reuse"]));
+        assert!(!parse(&["--pool"]));
+        // The pool: on by default, `--pool` on, `--pool=false` off, `NATEMU_POOL` 1/0 either way (a flag wins).
+        let pool = |extra: &[&str]| {
+            super::Cli::try_parse_from(base.iter().chain(extra))
+                .unwrap()
+                .pool
+        };
+        assert!(pool(&[]) && pool(&["--pool"]) && pool(&["--pool=true"]) && !pool(&["--pool=false"]));
+        assert!(super::Cli::try_parse_from(base.iter().chain(&["--pool", "false"])).is_err());
+        // The variable, set for this test only (no other test reads it).
+        for (value, want) in [("1", true), ("true", true), ("on", true), ("0", false), ("off", false)] {
+            // SAFETY: this is the only test touching the process environment, and it runs no threads of its own.
+            unsafe { std::env::set_var("NATEMU_CHECK_REUSE", value) };
+            assert_eq!(parse(&[]), want, "{value}");
+        }
+        unsafe { std::env::set_var("NATEMU_CHECK_REUSE", "sometimes") };
+        assert!(super::Cli::try_parse_from(base).is_err());
+        unsafe { std::env::remove_var("NATEMU_CHECK_REUSE") };
+        for (value, want) in [("0", false), ("off", false), ("false", false), ("1", true), ("on", true)] {
+            // SAFETY: as above.
+            unsafe { std::env::set_var("NATEMU_POOL", value) };
+            assert_eq!(pool(&[]), want, "NATEMU_POOL={value}");
+            assert!(pool(&["--pool"]), "a flag wins over NATEMU_POOL={value}");
+            assert!(!pool(&["--pool=false"]));
+        }
+        unsafe { std::env::remove_var("NATEMU_POOL") };
+    }
     #[test]
     fn size() {
         for (text, bytes) in [

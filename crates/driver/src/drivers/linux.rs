@@ -103,10 +103,25 @@ pub(crate) struct Args {
     check_reuse: bool,
     #[arg(long)]
     code_shape: bool,
+    /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
+    /// does (off), or it answers and the walk is made too, a difference counted (check; check-halt stops at one)
+    #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check|check-halt", default_value = "on", value_parser = natemu::execution::parse_page_currency)]
+    page_currency: u64,
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
     #[arg(long)]
     rng: bool,
+    /// The shared template pool (cross-vCPU reuse plan): on by default; `--pool=false` or `NATEMU_POOL=0` turns it off
+    #[arg(
+        long,
+        env = "NATEMU_POOL",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = true,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pool: bool,
     #[arg(long, value_name = "FILE")]
     serial: Option<String>,
     #[arg(long, env = "NATEMU_SERIAL_STDIN", value_parser = clap::builder::BoolishValueParser::new())]
@@ -147,8 +162,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         max_block,
         check_reuse,
         code_shape,
+        page_currency,
         speculation_barriers,
         rng,
+        pool,
         serial,
         serial_stdin,
         strict,
@@ -241,8 +258,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         )?,
         check_reuse,
         code_shape,
+        page_currency,
         speculation_barriers,
         rng,
+        pool,
         ..natemu::linux::Boot::new(resident, fexc, image)
     };
     if let Some(path) = &serial {

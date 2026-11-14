@@ -18,10 +18,11 @@
 //! Perf chunk 14: a CR3 load without PCID keeps global translations (SDM Vol.3
 //! 4.10.4.1), and so do the shadows ([`Space::reset_cr3`]): the supervisor
 //! space's upper half (the "kept half", where a 64-bit kernel's global pages
-//! live) survives a CR3 load while every shadow in it came from a global
-//! translation ([`Space::map_global`]); any other shadow there makes the next
-//! CR3 load a full reset. Its tables come from the top of the pool, every other
-//! table from the bottom, so a CR3 load returns the bottom part alone.
+//! live) survives a CR3 load but for its shadows of non-global translations,
+//! which the load removes alone (listed since the last reset, up to
+//! `LIST_MAX`; more make the load a full reset, IO5). Its tables come from the
+//! top of the pool, every other table from the bottom, so a CR3 load returns
+//! the bottom part alone.
 pub const HIGH_BASE: u64 = 0xffff_8000_0000_0000;
 pub const WINDOW_BYTES: u64 = 0x20_0000;
 pub const LOWER_ROOT: usize = 0x10000;
@@ -36,11 +37,18 @@ pub const USER_UPPER_ROOT: usize = 0x1d000;
 /// `[lower, upper]` roots of the supervisor (index 0) and user (index 1) spaces.
 pub const ROOTS: [[usize; 2]; 2] = [[LOWER_ROOT, UPPER_ROOT], [USER_LOWER_ROOT, USER_UPPER_ROOT]];
 /// Pool allocation counts in their own private page: word 0 the bottom of the pool, word 1 the top (the kept half's
-/// tables); word 2 nonzero once the kept half holds a shadow of a non-global translation.
+/// tables); word 2 nonzero once the kept half held a shadow of a non-global translation the list could not take;
+/// word 3 the count and words 4.. the linear pages of the kept half's non-global shadows since the last reset.
 pub const STATE_OFFSET: usize = 0x1b000;
 const BOTTOM: usize = 0;
 const TOP: usize = 1;
 const NOT_ALL_GLOBAL: usize = 2;
+const LISTED: usize = 3;
+const LIST: usize = 4;
+/// IO5 (November 13): Linux maps some of its direct map non-global (4 KiB, G clear, with CR4.PGE): under configure 80-97 k
+/// such shadows a vCPU, a few per CR3 load, made 58-68% of the loads reset the kept half whole. Listed, a load removes
+/// only them (what the load must drop); past this many it resets everything, as before.
+const LIST_MAX: usize = 64;
 /// Intermediate/leaf table pages allocated on demand; never freed except by `reset` (a full pool resets: the vCPU's
 /// `evictions`). M1: 288 pages, to the end of the window's 2 MiB (the execution mode's block owns it; the leaf maps it),
 /// so the shadows of a kernel's working set (one leaf table per 2 MiB of linear addresses) span up to ~560 MiB.
@@ -252,9 +260,17 @@ impl<M: Maintenance> Space<M> {
             return Err(Error::Private);
         }
         let (table, index) = self.leaf(va, true)?.ok_or(Error::Corrupt)?;
-        // Before the entry: a CR3 load that sees the entry sees the word too (one CPU, program order).
-        if !global && self.kept(va) {
-            self.set(STATE_OFFSET, NOT_ALL_GLOBAL, 1);
+        // Before the entry: a CR3 load that sees the entry sees the list too (one CPU, program order).
+        if !global && self.kept(va) && self.get(STATE_OFFSET, NOT_ALL_GLOBAL) == 0 {
+            let n = self.get(STATE_OFFSET, LISTED) as usize;
+            if !(0..n).any(|i| self.get(STATE_OFFSET, LIST + i) == va) {
+                if n < LIST_MAX {
+                    self.set(STATE_OFFSET, LIST + n, va);
+                    self.set(STATE_OFFSET, LISTED, n as u64 + 1);
+                } else {
+                    self.set(STATE_OFFSET, NOT_ALL_GLOBAL, 1);
+                }
+            }
         }
         let new = target | PAGE | NOT_GLOBAL | if writable { 0 } else { READ_ONLY };
         let old = self.get(table, index);
@@ -309,7 +325,7 @@ impl<M: Maintenance> Space<M> {
                 self.set(root, index, 0);
             }
         }
-        for word in [BOTTOM, TOP, NOT_ALL_GLOBAL] {
+        for word in [BOTTOM, TOP, NOT_ALL_GLOBAL, LISTED] {
             self.set(STATE_OFFSET, word, 0);
         }
         self.tlb.invalidate_all();
@@ -321,6 +337,18 @@ impl<M: Maintenance> Space<M> {
             self.reset();
             return true;
         }
+        // The kept half's non-global shadows go (the invalidation below covers them); its global ones stay.
+        for i in 0..self.get(STATE_OFFSET, LISTED) as usize {
+            match self.leaf(self.get(STATE_OFFSET, LIST + i), false) {
+                Ok(Some((table, index))) => self.set(table, index, 0),
+                Ok(None) => {}
+                Err(_) => {
+                    self.reset();
+                    return true;
+                }
+            }
+        }
+        self.set(STATE_OFFSET, LISTED, 0);
         let [lower, _] = ROOTS[0];
         let [user_lower, user_upper] = ROOTS[1];
         for (root, indices) in [
@@ -697,8 +725,20 @@ mod tests {
             (0, 0)
         );
         s.map_global(kernel, 0x4007_0000, true).unwrap();
-        // A non-global shadow in the kept half: the next CR3 load resets everything, and the one after keeps again.
+        // Non-global shadows in the kept half: the next CR3 load removes them alone (listed; one listed twice).
         s.map(HIGH_BASE + 0x80_0000, 0x400b_0000, false).unwrap();
+        s.map(HIGH_BASE + 0x80_1000, 0x400b_1000, false).unwrap();
+        s.map(HIGH_BASE + 0x80_0000, 0x400b_0000, true).unwrap();
+        assert!(!s.reset_cr3());
+        assert_eq!(
+            (s.descriptor(HIGH_BASE + 0x80_0000), s.descriptor(HIGH_BASE + 0x80_1000)),
+            (0, 0)
+        );
+        assert_eq!(s.descriptor(kernel), 0x4007_0000 | LEAF);
+        // More than the list holds: the next CR3 load resets everything, and the one after keeps again.
+        for i in 0..=LIST_MAX as u64 {
+            s.map(HIGH_BASE + 0x100_0000 + 4096 * i, 0x400c_0000, false).unwrap();
+        }
         assert!(s.reset_cr3());
         assert_eq!((s.used(), s.descriptor(kernel)), (0, 0));
         s.map_global(kernel, 0x4007_0000, false).unwrap();
@@ -708,14 +748,43 @@ mod tests {
         assert_eq!(s.used(), 3);
         s.reset();
         assert_eq!((s.used(), s.descriptor(kernel)), (0, 0));
-        // A full reset clears the mark too.
-        s.map(HIGH_BASE + 0x80_0000, 0x400b_0000, false).unwrap();
+        // A full reset clears the overflow mark too.
+        for i in 0..=LIST_MAX as u64 {
+            s.map(HIGH_BASE + 0x100_0000 + 4096 * i, 0x400c_0000, false).unwrap();
+        }
         s.reset();
         s.map_global(kernel, 0x4007_0000, false).unwrap();
         assert!(!s.reset_cr3());
         // Without the upper half there is nothing to keep: a full reset.
         s.upper = false;
         assert!(s.reset_cr3());
+    }
+    /// IO5: the kept half's non-global shadows are listed whatever path made them (a global one made non-global in place,
+    /// with the same frame and rights), exactly `LIST_MAX` fit, and both kinds of reset empty the list.
+    #[test]
+    fn cr3_reset_removes_listed_non_global_shadows() {
+        let mut m = window();
+        let mut s = space(&mut m, POOL_PAGES);
+        let (kernel, va) = (HIGH_BASE + 0x10_0000, HIGH_BASE + 0x20_0000);
+        s.map_global(kernel, 0x4007_0000, true).unwrap();
+        s.map_global(va, 0x4008_0000, true).unwrap();
+        s.map(va, 0x4008_0000, true).unwrap(); // the same descriptor: listed all the same
+        assert!(!s.reset_cr3());
+        assert_eq!((s.descriptor(va), s.descriptor(kernel)), (0, 0x4007_0000 | LEAF));
+        let fill = |s: &mut Space<Log>, base: u64, n: u64| {
+            for i in 0..n {
+                s.map(base + 4096 * i, 0x400c_0000, false).unwrap();
+            }
+        };
+        fill(&mut s, HIGH_BASE + 0x100_0000, LIST_MAX as u64);
+        assert!(!s.reset_cr3()); // exactly full: still removed one by one
+        fill(&mut s, HIGH_BASE + 0x200_0000, 1);
+        assert!(!s.reset_cr3()); // the count went back to zero
+        fill(&mut s, HIGH_BASE + 0x100_0000, LIST_MAX as u64);
+        s.reset();
+        fill(&mut s, HIGH_BASE + 0x200_0000, 1);
+        assert!(!s.reset_cr3()); // a full reset empties the list too
+        assert_eq!(s.descriptor(kernel), 0);
     }
     /// Perf chunk 14: the two ends of the pool share its capacity, and a link into the gap between them is corrupt.
     #[test]

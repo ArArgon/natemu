@@ -34,6 +34,7 @@ impl<'a> Hooks<'a> {
                     | AFTER_PRECHECK
                     | BEFORE_RECHECK
                     | BEFORE_PUBLISH
+                    | MISS_FAST_CHECK
             )
         {
             return Err("invalid I/O test hook".into());
@@ -55,6 +56,35 @@ impl<'a> Hooks<'a> {
     }
     pub fn release(&self, v: usize, tag: u64) {
         word(&self.backing.memory, v, RELEASE).fetch_max(tag, SeqCst);
+    }
+    /// Fast-miss tests: posts `event` to vCPU `v` without ringing its doorbell (a ring taken at the `eret` would hide a fast path
+    /// that skipped its event check).
+    pub fn post_quiet(&self, v: usize, event: u64) -> bool {
+        super::post(&self.backing.memory, v, event, false)
+    }
+    /// Fast-miss tests: writes `bytes` at guest-physical `gpa`, then posts each page it touches to the vCPUs holding translations of
+    /// it with no doorbell (as a peer's store or a device's windowless copy posts, minus the kick).
+    pub fn rewrite_quiet(&self, gpa: u64, bytes: &[u8]) -> bool {
+        let Some(at) = self.backing.ram.range(gpa, bytes.len() as u64) else {
+            return false;
+        };
+        // SAFETY: `range` checked the span lies in installed RAM; the vCPU is held at a test point and no peer runs.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len()) };
+        std::sync::atomic::fence(SeqCst);
+        for page in (gpa >> 12)..=((gpa + bytes.len() as u64 - 1) >> 12) {
+            let peers = super::io::clear_marks(&self.backing.memory, page as usize);
+            if peers != 0 {
+                super::io::post_page(&self.backing.memory, page as usize, peers, self.backing.n);
+            }
+        }
+        true
+    }
+    /// A guest-physical doubleword (the test programs' signal and acknowledgement words).
+    pub fn guest_u64(&self, gpa: u64) -> Option<u64> {
+        self.backing.ram.read::<u64>(gpa)
+    }
+    pub fn set_guest_u64(&self, gpa: u64, value: u64) -> bool {
+        self.backing.ram.write::<u64>(gpa, value)
     }
     pub fn shadows(&self, v: usize) -> bool {
         record_word(&self.backing.memory, v, None).load(SeqCst) & cache::SHADOWS != 0

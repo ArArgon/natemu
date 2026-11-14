@@ -227,6 +227,27 @@ pub fn memory_type(m: &Msrs, gpa: u64, pat: u8) -> u8 {
         (m[const { slot(MSR_PAT) }] >> (8 * (pat & 7))) as u8 & 7,
     )
 }
+/// Fault-around plan chunk 1 (3.3 item 6, 3.7): whether a demand READ installs its shadow writable. Yes when the walk grants the write
+/// (`walk_writable`: every level's R/W, and WP and CPL as the write rule of the walk has them), the leaf's D is already set (a TLB entry
+/// filled by a read carries the entry's permissions, and a write through one with D = 1 changes nothing, SDM Vol.3 4.8), the page is
+/// WB or WC memory (never UC, WT or WP: writes there run alone), and no vCPU holds translations from the frame. The read-side
+/// protocol: `translated` first; if it holds, read-only and NO writable bit (nothing is written here, so `code_written` is never
+/// called for a read); else `mark_writable` (the writable bit, before the marks are read again, as `mark` expects), then `translated`
+/// again: a peer that marked the frame in between leaves the shadow read-only (the bit stays set, which is conservative).
+pub fn writable_on_read(
+    enabled: bool,
+    walk_writable: bool,
+    dirty: bool,
+    kind: u8,
+    mut translated: impl FnMut() -> bool,
+    mut mark_writable: impl FnMut(),
+) -> bool {
+    if !(enabled && walk_writable && dirty && matches!(kind, WB | WC)) || translated() {
+        return false;
+    }
+    mark_writable();
+    !translated()
+}
 /// RDMSR is allowed. The x2APIC range's entry is not (`owned-by-LAPIC`): the resident's local APIC answers 0x800-0x8ff
 /// before the profile is consulted (X3).
 pub fn read_ok(m: &Msr) -> bool {
@@ -638,6 +659,53 @@ mod tests {
         assert_eq!((edx >> 29 & 1, edx >> 10 & 1), (1, 0));
     }
 
+    /// Fault-around plan chunk 1: the rule table of `writable_on_read` (switch, walk grant, D, memory type, translated) and the order of
+    /// the protocol: `translated` first; a translated frame gets no writable bit and nothing more is asked; otherwise the bit is set,
+    /// then `translated` is read again (a peer's mark in between leaves the shadow read-only, the bit set).
+    #[test]
+    fn writable_on_read_rule_table_and_protocol() {
+        for enabled in [false, true] {
+            for granted in [false, true] {
+                for dirty in [false, true] {
+                    for kind in [UC, WC, WT, WP, WB, UC_MINUS] {
+                        // `first`, `second`: what `translated` answers at its first and its second call.
+                        for (first, second) in [(false, false), (true, false), (false, true)] {
+                            let (log, n) = (core::cell::Cell::new(["", "", ""]), core::cell::Cell::new(0));
+                            let push = |what| {
+                                let mut l = log.get();
+                                l[n.get()] = what;
+                                log.set(l);
+                                n.set(n.get() + 1);
+                            };
+                            let mut calls = 0;
+                            let got = writable_on_read(
+                                enabled,
+                                granted,
+                                dirty,
+                                kind,
+                                &mut || {
+                                    calls += 1;
+                                    push("translated");
+                                    [first, second][calls.min(2) - 1]
+                                },
+                                &mut || push("bit"),
+                            );
+                            let log = log.get();
+                            let log = &log[..n.get()];
+                            let applies = enabled && granted && dirty && matches!(kind, WB | WC);
+                            let want: &[&str] = match (applies, first) {
+                                (false, _) => &[],
+                                (true, true) => &["translated"],
+                                (true, false) => &["translated", "bit", "translated"],
+                            };
+                            assert_eq!(log, want, "{enabled} {granted} {dirty} {kind} {first} {second}");
+                            assert_eq!(got, applies && !first && !second, "{enabled} {granted} {dirty} {kind} {first} {second}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn reset_matches_the_model() {
         let (ap, bsp) = (reset_msrs(false), reset_msrs(true));

@@ -23,7 +23,10 @@ const F_SIZE_MAX: u64 = 1 << 1;
 const F_SEG_MAX: u64 = 1 << 2;
 const F_BLK_SIZE: u64 = 1 << 6;
 pub(super) const F_FLUSH: u64 = 1 << 9;
-pub(super) const FEATURES: u64 = VERSION_1 | F_SIZE_MAX | F_SEG_MAX | F_BLK_SIZE | F_FLUSH;
+const F_DISCARD: u64 = 1 << 13;
+const F_WRITE_ZEROES: u64 = 1 << 14;
+pub(super) const FEATURES: u64 =
+    VERSION_1 | F_SIZE_MAX | F_SEG_MAX | F_BLK_SIZE | F_FLUSH | F_DISCARD | F_WRITE_ZEROES;
 /// The driver must honour the segment limits below.
 pub(super) const REQUIRED: u64 = VERSION_1 | F_SIZE_MAX | F_SEG_MAX;
 
@@ -32,6 +35,8 @@ const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
 const T_GET_ID: u32 = 8;
+const T_DISCARD: u32 = 11;
+const T_WRITE_ZEROES: u32 = 13;
 /// Request status values.
 const S_OK: u8 = 0;
 const S_IOERR: u8 = 1;
@@ -45,6 +50,15 @@ const ID_BYTES: usize = 20;
 const MAX_SEGMENT: usize = 4096;
 const MAX_SEGMENTS: usize = 32;
 pub(super) const MAX_DATA: usize = 128 * 1024;
+/// DISCARD and WRITE_ZEROES (§5.2.6.2): at most this many 16-byte segments a request (sector, sectors, flags), each at
+/// most this many sectors, aligned by the driver to the host file's 4 KiB block (`discard_sector_alignment`), so a
+/// discard frees whole blocks of the image (`F_PUNCHHOLE`: APFS keeps the file sparse; without it a guest's deletes
+/// never give host space back).
+const MAX_RANGES: usize = 32;
+const MAX_RANGE_SECTORS: u32 = 1 << 22;
+const HOLE: u64 = 4096;
+/// WRITE_ZEROES may unmap (the write_zeroes_may_unmap field): a hole reads as zeros.
+const F_UNMAP: u32 = 1;
 
 /// Disk worker threads, sharing the one file descriptor.
 const WORKERS: usize = 4;
@@ -137,13 +151,21 @@ impl Disk {
             id,
         })
     }
-    /// Configuration space: capacity (sectors), size_max, seg_max, geometry (unused), blk_size.
-    pub fn config(&self) -> [u8; 24] {
-        let mut c = [0; 24];
+    /// Configuration space: capacity (sectors), size_max, seg_max, geometry (unused), blk_size, topology, writeback
+    /// and num_queues (unused: not offered), then the discard and write-zeroes limits (virtio 1.3 §5.2.4).
+    pub fn config(&self) -> [u8; 60] {
+        let mut c = [0; 60];
         c[..8].copy_from_slice(&(self.capacity / SECTOR).to_le_bytes());
         c[8..12].copy_from_slice(&(MAX_SEGMENT as u32).to_le_bytes());
         c[12..16].copy_from_slice(&(MAX_SEGMENTS as u32).to_le_bytes());
         c[20..24].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+        let ranges = (MAX_RANGES as u32).to_le_bytes();
+        c[36..40].copy_from_slice(&MAX_RANGE_SECTORS.to_le_bytes());
+        c[40..44].copy_from_slice(&ranges);
+        c[44..48].copy_from_slice(&((HOLE / SECTOR) as u32).to_le_bytes());
+        c[48..52].copy_from_slice(&MAX_RANGE_SECTORS.to_le_bytes());
+        c[52..56].copy_from_slice(&ranges);
+        c[56] = 1;
         c
     }
     /// Start the workers on the file; each finished job rings `bell`.
@@ -189,6 +211,8 @@ pub(super) enum Job {
     Write(u64, Vec<u8>, bool),
     /// Sync the file; `true`: a full sync (the power-off drain's), else a plain one (a guest FLUSH's).
     Flush(bool),
+    /// DISCARD (`false`) or WRITE_ZEROES (`true`) these (offset, length) byte ranges ([`punch`]).
+    Punch(Vec<(u64, u64)>, bool),
 }
 /// A job's result: the bytes read (empty for a write or on error) and the first error.
 pub(super) struct Done {
@@ -369,6 +393,8 @@ fn run(calls: &dyn Calls, shared: &Mutex<Board>, slot: usize, job: Job) -> bool 
             Job::Write(offset, ..) => ("write", *offset),
             Job::Flush(true) => ("full sync", 0),
             Job::Flush(false) => ("sync", 0),
+            Job::Punch(ranges, false) => ("discard", ranges[0].0),
+            Job::Punch(ranges, true) => ("write zeroes", ranges[0].0),
         };
         board.running.push((slot, start, kind, offset));
         start
@@ -390,6 +416,10 @@ pub(super) trait Calls: Send + Sync {
     fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize>;
     /// `full`: to stable storage (F_FULLFSYNC); otherwise to the host OS (fsync).
     fn sync(&self, full: bool) -> std::io::Result<()>;
+    /// Deallocate whole host blocks (`F_PUNCHHOLE`): they then read as zeros.
+    fn punch(&self, _offset: u64, _len: u64) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 /// Host sync failures are sticky for the launch: after any failed sync (a guest FLUSH, a write-through OUT's
 /// sync or the power-off full sync), every later sync fails without a call. The host may have dropped dirty
@@ -435,6 +465,9 @@ impl<C: Calls> Calls for Sticky<C> {
         failed.0 = result.is_err();
         result
     }
+    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.calls.punch(offset, len)
+    }
 }
 /// One positioned read or write per call (pread/pwrite: a short count is returned as is, EINTR
 /// is an error). A full sync is F_FULLFSYNC (`File::sync_all` on Apple platforms); a plain one is
@@ -466,6 +499,35 @@ impl Calls for Native {
             }
         }
     }
+    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        /// `struct fpunchhole` of <sys/fcntl.h>.
+        #[repr(C)]
+        struct Hole {
+            flags: u32,
+            reserved: u32,
+            offset: i64,
+            length: i64,
+        }
+        const F_PUNCHHOLE: i32 = 99;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        let hole = Hole {
+            flags: 0,
+            reserved: 0,
+            offset: offset as i64,
+            length: len as i64,
+        };
+        loop {
+            if unsafe { fcntl(self.0.as_raw_fd(), F_PUNCHHOLE, &hole as *const Hole) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
 }
 
 /// Unit tests' scripted native calls.
@@ -482,6 +544,9 @@ impl Calls for Scripted {
     fn sync(&self, full: bool) -> std::io::Result<()> {
         self.0.sync(full)
     }
+    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.0.punch(offset, len)
+    }
 }
 
 /// Run one job to completion or its first error. A short transfer continues with only the
@@ -495,6 +560,16 @@ fn execute(native: &(impl Calls + ?Sized), job: Job) -> Done {
             return Done {
                 data: Vec::new(),
                 error: native.sync(full).err().map(|e| e.to_string()),
+            };
+        }
+        Job::Punch(ranges, zero) => {
+            let error = ranges
+                .into_iter()
+                .find_map(|(offset, len)| punch(native, offset, len, zero).err())
+                .map(|e| e.to_string());
+            return Done {
+                data: Vec::new(),
+                error,
             };
         }
     };
@@ -526,6 +601,43 @@ fn execute(native: &(impl Calls + ?Sized), job: Job) -> Done {
         data.clear();
     }
     Done { data, error }
+}
+
+/// DISCARD (`zero` false): the range's whole host blocks become holes; partial blocks stay as they are, and a file
+/// system without holes is no error (a discard is a hint). WRITE_ZEROES: the whole blocks become holes and the partial
+/// ones at the ends are written with zeros; without holes the whole range is written with zeros.
+/// ponytail: a zeroed range without host holes is one synchronous write of up to 2 GiB, inside the call limit only on
+/// a fast disk; split it into jobs if a host file system without holes matters.
+fn punch(native: &(impl Calls + ?Sized), offset: u64, len: u64, zero: bool) -> std::io::Result<()> {
+    let end = offset + len;
+    let (first, last) = (offset.next_multiple_of(HOLE), end / HOLE * HOLE);
+    let holed = first < last
+        && match native.punch(first, last - first) {
+            Ok(()) => true,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported) || e.raw_os_error() == Some(45) => false,
+            Err(e) => return Err(e),
+        };
+    if !zero {
+        return Ok(());
+    }
+    if holed {
+        zeros(native, offset, first)?;
+        zeros(native, last, end)
+    } else {
+        zeros(native, offset, end)
+    }
+}
+/// Writes zeros over [`from`, `to`).
+fn zeros(native: &(impl Calls + ?Sized), mut from: u64, to: u64) -> std::io::Result<()> {
+    const CHUNK: [u8; 1 << 16] = [0; 1 << 16];
+    while from < to {
+        let n = (to - from).min(CHUNK.len() as u64) as usize;
+        match native.write(&CHUNK[..n], from)? {
+            0 => return Err(std::io::Error::other("native disk call made zero progress")),
+            w => from += w.min(n) as u64,
+        }
+    }
+    Ok(())
 }
 
 /// A guest-physical byte range.
@@ -665,6 +777,37 @@ impl Streams {
                     bad()
                 }
             }
+            T_DISCARD | T_WRITE_ZEROES
+                if features & if kind == T_DISCARD { F_DISCARD } else { F_WRITE_ZEROES } != 0 =>
+            {
+                let body = &bytes[HEADER..];
+                if body.is_empty()
+                    || body.len() % 16 != 0
+                    || body.len() / 16 > MAX_RANGES
+                    || self.writable_data_len() != 0
+                {
+                    return bad();
+                }
+                let allowed = if kind == T_WRITE_ZEROES { F_UNMAP } else { 0 };
+                let mut ranges = Vec::with_capacity(body.len() / 16);
+                for s in body.chunks(16) {
+                    let sector = u64::from_le_bytes(s[..8].try_into().unwrap());
+                    let sectors = u32::from_le_bytes(s[8..12].try_into().unwrap());
+                    let flags = u32::from_le_bytes(s[12..16].try_into().unwrap());
+                    if flags & !allowed != 0 {
+                        return Command::Status(S_UNSUPP);
+                    }
+                    let offset = sector.checked_mul(SECTOR);
+                    let len = u64::from(sectors) * SECTOR;
+                    match offset.and_then(|o| o.checked_add(len)) {
+                        Some(end) if sectors != 0 && sectors <= MAX_RANGE_SECTORS && end <= capacity => {
+                            ranges.push((end - len, len))
+                        }
+                        _ => return bad(),
+                    }
+                }
+                Command::Punch(ranges, kind == T_WRITE_ZEROES)
+            }
             T_GET_ID => {
                 if header_only && self.writable_data_len() >= ID_BYTES {
                     Command::Id
@@ -705,6 +848,8 @@ pub(super) enum Command {
     Read(u64, usize),
     Write(u64, Vec<u8>, bool),
     Flush,
+    /// DISCARD or WRITE_ZEROES (`true`) of these byte ranges.
+    Punch(Vec<(u64, u64)>, bool),
     Id,
     /// Answer with this status and no data.
     Status(u8),
@@ -853,6 +998,7 @@ fn start(streams: &Streams, bytes: Vec<u8>, disk: &Disk, features: u64) -> Start
         Command::Read(offset, len) => Start::Call(Job::Read(offset, len)),
         Command::Write(offset, bytes, stable) => Start::Call(Job::Write(offset, bytes, stable)),
         Command::Flush => Start::Call(Job::Flush(false)),
+        Command::Punch(ranges, zero) => Start::Call(Job::Punch(ranges, zero)),
         Command::Id => Start::Answer(Reply {
             data: disk.id.to_vec(),
             status: [S_OK],
@@ -1679,6 +1825,69 @@ mod tests {
         assert_eq!(native.write(&[0xa5; 512], 0).unwrap(), 512);
         native.sync(false).unwrap();
         native.sync(true).unwrap();
+    }
+    #[test]
+    fn discard_and_write_zeroes_decode_their_segments() {
+        let path = std::env::temp_dir().join(format!("natemu-discard-decode-{}", std::process::id()));
+        std::fs::write(&path, vec![0; 1 << 20]).unwrap();
+        let disk = Disk::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let segment = |sector: u64, sectors: u32, flags: u32| {
+            [sector.to_le_bytes().as_slice(), &sectors.to_le_bytes(), &flags.to_le_bytes()].concat()
+        };
+        let request = |kind: u32, segments: &[Vec<u8>]| {
+            let mut bytes = header(kind, 0);
+            segments.iter().for_each(|s| bytes.extend(s));
+            let streams = Streams::new(&[desc(0, bytes.len() as u32, false), desc(900, 1, true)]).unwrap();
+            (streams, bytes)
+        };
+        let (s, b) = request(T_DISCARD, &[segment(8, 8, 0), segment(2040, 8, 0)]);
+        assert!(matches!(start(&s, b, &disk, FEATURES), Start::Call(Job::Punch(r, false)) if r == [(4096, 4096), (2040 * 512, 4096)]));
+        let (s, b) = request(T_WRITE_ZEROES, &[segment(1, 3, F_UNMAP)]);
+        assert!(matches!(start(&s, b, &disk, FEATURES), Start::Call(Job::Punch(r, true)) if r == [(512, 1536)]));
+        let status = |s: &Streams, b: Vec<u8>, features| match start(s, b, &disk, features) {
+            Start::Answer(reply) => reply.status[0],
+            _ => panic!("started a call"),
+        };
+        // UNMAP is WRITE_ZEROES's only flag; a range past the end, an empty one or an IN buffer is malformed; not
+        // negotiated, the type is unsupported.
+        let (s, b) = request(T_DISCARD, &[segment(8, 8, F_UNMAP)]);
+        assert_eq!(status(&s, b, FEATURES), S_UNSUPP);
+        let (s, b) = request(T_DISCARD, &[segment(2040, 16, 0)]);
+        assert_eq!(status(&s, b, FEATURES), S_IOERR);
+        let (s, b) = request(T_WRITE_ZEROES, &[segment(8, 0, 0)]);
+        assert_eq!(status(&s, b, FEATURES), S_IOERR);
+        let (s, b) = request(T_DISCARD, &[]);
+        assert_eq!(status(&s, b, FEATURES), S_IOERR);
+        let (s, b) = request(T_DISCARD, &[segment(8, 8, 0)]);
+        assert_eq!(status(&s, b, FEATURES & !F_DISCARD), S_UNSUPP);
+        let mut b = header(T_DISCARD, 0);
+        b.extend(segment(8, 8, 0));
+        let s = Streams::new(&[desc(0, b.len() as u32, false), desc(500, 512, true), desc(900, 1, true)]).unwrap();
+        assert_eq!(status(&s, b, FEATURES), S_IOERR);
+    }
+    #[test]
+    fn punched_ranges_read_as_zeros_and_free_whole_blocks() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("natemu-punch-test-{}", std::process::id()));
+        let file = File::options().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+        let native = Native(file.try_clone().unwrap());
+        assert_eq!(native.write(&[0xa5; 1 << 16], 0).unwrap(), 1 << 16);
+        native.sync(false).unwrap();
+        let blocks = || file.metadata().unwrap().blocks();
+        let before = blocks();
+        // WRITE_ZEROES over unaligned ends: zeros exactly there, the whole blocks inside become holes.
+        assert!(execute(&native, Job::Punch(vec![(1000, 20000)], true)).error.is_none());
+        // DISCARD: whole blocks only; the partial block at its start keeps its bytes.
+        assert!(execute(&native, Job::Punch(vec![(40000, 16384)], false)).error.is_none());
+        native.sync(false).unwrap();
+        let mut data = vec![0; 1 << 16];
+        assert_eq!(native.read(&mut data, 0).unwrap(), 1 << 16);
+        std::fs::remove_file(&path).unwrap();
+        let zero = |r: std::ops::Range<usize>| data[r].iter().all(|&b| b == 0);
+        let kept = |r: std::ops::Range<usize>| data[r].iter().all(|&b| b == 0xa5);
+        assert!(kept(0..1000) && zero(1000..21000) && kept(21000..40960) && zero(40960..53248) && kept(53248..65536));
+        assert!(blocks() < before, "no host blocks freed: {} -> {}", before, blocks());
     }
     #[test]
     fn decoded_out_payload_moves_into_its_job() {

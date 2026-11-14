@@ -158,6 +158,11 @@ irq_gate:
     bl finish
     b .
 
+// Resumes EL0 from the frame at x0 (x1 = ELR, x2 = SPSR, x3 = alignment checking). The frame is read from, never written to,
+// and it may be the gate's own frame on the exception stack (`miss_fast`, which serves a dispatcher miss from the frame the
+// gate saved; `resume` and `enter` use `Shared::captured` and `Shared::initial`). The stack layout is therefore a contract:
+// SP is reset to the exception stack's top below, above the frame, and NOTHING between that reset and the `eret` may push or
+// call (a push would silently overwrite the frame's `sp` and `nzcv` fields, which are loaded after it: no fault would say so).
 .global resume_exception
 resume_exception:
     // x3 != 0: generated code runs under x86 alignment checking (X2, #AC): every misaligned data access at EL0 takes an
@@ -239,7 +244,8 @@ enter_allocated:
 // The dispatcher, copied by the resident into the code area (`cache::DISPATCH`) so that computed exits reach it with
 // one `b`; it runs from there, never here. Data-free; its `adrp` is only the form: the resident writes the copy's own
 // (`cache::fill_head`, to L1 table 0; each dispatcher slot's names its table). x0 = the next guest RIP, guest state in
-// the static registers. It branches to the RIP's L1 entry, code the resident writes (`cache::L1_CODE`): a hit enters
+// the static registers. It branches to the RIP's L1 set (64 bytes: two ways of 32, `cache::L1_SET_BYTES`), code the
+// resident writes (`cache::L1_CODE`): way 0 compares and enters, else falls to way 1, which does the same: a hit enters
 // the cached block, a miss comes back to the `svc #MISS` here (`cache::DISPATCH_MISS`, the last word), which enters
 // the resident. Uses only x0-x2 (FEX's temporaries at a block boundary) and keeps NZCV: no flag-setting instruction.
 .global dispatch_template
@@ -247,7 +253,7 @@ enter_allocated:
 dispatch_template:
     and x1, x0, #{l1_mask}
     adrp x2, .
-    add x2, x2, x1, lsl #5
+    add x2, x2, x1, lsl #6
     br x2
     svc #{svc_miss}
 dispatch_template_end:

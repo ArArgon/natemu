@@ -326,6 +326,11 @@ fn items(lines: &[&str], space: &mut Space, mut cpu: Option<&mut Section>) -> Re
             ("post", [a, v]) if (16..256).contains(&number(v)?) => {
                 state(&mut cpu, line)?.posts.push((number(a)?, number(v)?))
             }
+            // Fast-miss tests: `qpost` posts without ringing the doorbell (a ring taken at the `eret` would hide a path that skipped
+            // its event check; the quiet bit is `QUIET`).
+            ("qpost", [a, v]) if (16..256).contains(&number(v)?) => {
+                state(&mut cpu, line)?.posts.push((number(a)?, number(v)? | QUIET))
+            }
             ("nmi", [a]) => state(&mut cpu, line)?
                 .posts
                 .push((number(a)?, execution::NMI)),
@@ -778,7 +783,7 @@ fn corrupt(area: Area, kind: Corrupt) -> bool {
     let Some((b, r)) = first_link(area) else {
         return false;
     };
-    let at = cache::CODE_OFFSET + b.code as usize + r.offset as usize;
+    let at = cache::CODE_OFFSET + b.code as usize + r.offset() as usize;
     match kind {
         Corrupt::Word => area.copy(at, &0x1400_0001u32.to_le_bytes()), // b .+4
         Corrupt::Record => {
@@ -934,6 +939,8 @@ const SIGSTOP: i32 = 17;
 /// A reply tamper: called with the vCPU stopped, the reply (`State::reply`) and its block or decode in place but not yet
 /// seen by the resident, until it returns true (it corrupted something, possibly the reply kind).
 type Tamper = fn(Area, &mut State) -> bool;
+/// A `qpost` item's marker on its event (no doorbell ring).
+const QUIET: u64 = 1 << 32;
 /// [`Stop::Hooked`]'s code for the logging IDT.
 const LOGGED: u32 = 0;
 /// The driver's [`execution::Hook`] for one vCPU: its program's hooks and, on the tampered vCPU, the run-time defence
@@ -975,9 +982,12 @@ impl execution::Hook for ProgramHook {
                 ..exec::System::NONE
             })));
         }
-        if let Some(&event) = self.posts.get(&rip) {
+        if let Some(&posted) = self.posts.get(&rip) {
+            let event = posted & !QUIET;
             let _ = execution::post(area.memory(), area.vcpu(), event, false);
-            self.doorbell.ring(area.vcpu())?;
+            if posted & QUIET == 0 {
+                self.doorbell.ring(area.vcpu())?;
+            }
             return Ok(Some(execution::At::System(exec::System {
                 kind: exec::system::EVENT_HOOK,
                 length: 1,
@@ -1111,6 +1121,15 @@ pub(crate) struct Args {
     code_shape: bool,
     #[arg(long)]
     check_reuse: bool,
+    /// Cross-vCPU reuse (the template pool, chunk 3 of its plan): one answer map for every vCPU, the host publishes admitted
+    /// templates into the pool and each resident looks in it before asking (`NATEMU_POOL_LOOKUP=off`: publication only;
+    /// `NATEMU_POOL_RING_KB` and `NATEMU_POOL_INDEX_SLOTS`: a small pool).
+    #[arg(long, env = "NATEMU_POOL", value_parser = clap::builder::BoolishValueParser::new())]
+    pool: bool,
+    /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
+    /// does (off), or it answers and the walk is made too, a difference counted (check; check-halt stops at one)
+    #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check|check-halt", default_value = "on", value_parser = natemu::execution::parse_page_currency)]
+    page_currency: u64,
     #[arg(long = "strict-unassigned")]
     strict: bool,
     /// A test device's page (repeatable)
@@ -1173,6 +1192,12 @@ pub(crate) struct Args {
     io_disk: Option<String>,
     #[arg(long, requires = "io_disk", value_parser = ["normal", "hold-reset", "hold-disable", "hold-power", "hold-power-halt", "power-sync-error", "read-error", "write-error", "batch-error", "flush-error", "cycle-reset", "cycle-disable", "out-of-order", "reset-mixed", "cancel-batch", "hold-publish-reset", "hold-publish-disable", "hold-publish-power"])]
     io_script: Option<String>,
+    /// Fast-miss tests (io-test-hooks build): `KIND,SIG,ACK[,ARG...]`. When the guest stores 1 at guest-physical SIG the driver arms the
+    /// fast miss path's hold point on vCPU 0 and stores 1 at ACK (the guest spins on it); at the point KIND acts and releases: `io`
+    /// publishes an I/O window request (a read of SIG), `pending,GPA,HEXBYTES` rewrites guest bytes and posts their page (no
+    /// doorbell), `event[,VECTOR]` posts an interrupt (no doorbell; default vector 0x30). `wait` holds 300 ms.
+    #[arg(long)]
+    miss_hold: Option<String>,
     /// Production network frontend with an independent owned-packet loopback endpoint
     #[arg(long, conflicts_with_all = ["io_disk", "io_windows"])]
     io_net: bool,
@@ -1203,6 +1228,75 @@ pub(crate) struct Args {
     /// GPA of the fixture's shared `mov eax, imm32; ret` function
     #[arg(long, value_parser = number, requires = "io_windows")]
     io_window_code: Option<u64>,
+}
+
+/// `--miss-hold` (see the option): the controller of the fast miss path's hold point. Writes one `miss-hold:` line.
+#[cfg(feature = "io-test-hooks")]
+fn miss_hold(
+    backing: &execution::Backing,
+    machine: &Machine,
+    stops: &execution::Stops,
+    spec: &str,
+    ended: &AtomicBool,
+) {
+    use natemu::execution::io::Transfer::Read;
+    use natemu::execution::io_test::{HITS, Hooks, MISS_FAST_CHECK, REACHED, TIMEOUT};
+    use std::time::{Duration, Instant};
+    let h = Hooks::new(backing);
+    let began = Instant::now();
+    let wait = |done: &dyn Fn() -> bool| {
+        while !done() {
+            if ended.load(SeqCst) || began.elapsed() > Duration::from_secs(20) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        true
+    };
+    let parts: Vec<&str> = spec.split(',').collect();
+    let num = |i: usize| parts.get(i).and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok());
+    let row = (|| -> Result<Value> {
+        let (kind, sig, ack) = (parts[0], num(1).ok_or("miss-hold: SIG")?, num(2).ok_or("miss-hold: ACK")?);
+        if !wait(&|| h.guest_u64(sig) == Some(1)) {
+            return Err("miss-hold: the guest never signalled".into());
+        }
+        let tag = h.arm(0, MISS_FAST_CHECK)?;
+        h.set_guest_u64(ack, 1);
+        if !wait(&|| h.get(0, REACHED) == tag) {
+            h.release(0, tag);
+            return Err("miss-hold: the point was not reached".into());
+        }
+        let acted = match kind {
+            "io" => {
+                let mut buf = [0u8; 8];
+                std::thread::scope(|s| {
+                    let copy = s.spawn(|| {
+                        backing.copy_guest(machine, stops, Duration::from_secs(8), &mut [Read { gpa: sig, bytes: &mut buf }])
+                    });
+                    // (The request is published within microseconds; the vCPU is held until it is.)
+                    std::thread::sleep(Duration::from_millis(200));
+                    h.release(0, tag);
+                    copy.join().map_err(|_| "miss-hold: copy panicked")?.map(|_| true)
+                })?
+            }
+            "pending" => {
+                let bytes: Vec<u8> = (0..parts[4].len() / 2)
+                    .map(|i| u8::from_str_radix(&parts[4][2 * i..2 * i + 2], 16).unwrap())
+                    .collect();
+                h.rewrite_quiet(num(3).ok_or("miss-hold: GPA")?, &bytes)
+            }
+            "event" => h.post_quiet(0, num(3).unwrap_or(0x30)),
+            "wait" => {
+                // (A LAPIC timer the guest armed expires while the vCPU is held.)
+                std::thread::sleep(Duration::from_millis(300));
+                true
+            }
+            other => return Err(format!("miss-hold: unknown kind {other}").into()),
+        };
+        h.release(0, tag);
+        Ok(json!({"kind": kind, "acted": acted, "hits": h.get(0, HITS), "timeout": h.get(0, TIMEOUT)}))
+    })();
+    eprintln!("miss-hold: {}", row.unwrap_or_else(|e| json!({"error": e.to_string()})));
 }
 
 /// `hold-publish-*`: once the backend schedule holds its first call, arm the host hook before a
@@ -1383,6 +1477,8 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         max_instructions,
         code_shape,
         check_reuse,
+        pool,
+        page_currency,
         strict,
         device_at,
         irq_source,
@@ -1527,9 +1623,12 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             n,
             ram_bytes as usize,
             va,
+            pool,
         )?,
-        None => execution::prepare(resident, code_bytes, n, ram_bytes as usize)?,
+        None => execution::prepare_with_pool(resident, code_bytes, n, ram_bytes as usize, pool)?,
     };
+    // One answer map for the vCPUs under the pool (its entries are the answers other vCPUs compiled).
+    let answers = std::sync::OnceLock::new();
     // SAFETY: the builder and the tables it makes are dropped before `backing` (this function owns both).
     let mut builder = Builder {
         ram: unsafe { backing.ram() },
@@ -1609,6 +1708,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     #[cfg(not(feature = "io-test-hooks"))]
     if publish_release.is_some() {
         return Err("hold-publish schedules need an io-test-hooks build".into());
+    }
+    #[cfg(not(feature = "io-test-hooks"))]
+    if args.miss_hold.is_some() {
+        return Err("--miss-hold needs an io-test-hooks build".into());
     }
     let publish_held = publish_release.map(|_| Arc::new(AtomicBool::new(false)));
     let io_disk = if let Some(path) = &args.io_disk {
@@ -1806,11 +1909,16 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         compiler.shape = code_shape;
         // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
         compiler.check_reuse = code_shape || check_reuse;
+        compiler.page_currency = page_currency;
         // (Local links stay under the code-shape check: the programs' values test them; `--check-reuse` alone makes none.)
         compiler.pic_check_local = code_shape;
         // PIC study: the test programs run at CPL 0 too; every privilege level's templates are shared when a second address
         // needs them, so the suites run shared code (`NATEMU_PIC` overrides).
         compiler.pic = cache::PIC_ALL;
+        if pool {
+            compiler.attach_pool(&backing);
+            compiler.share(&answers);
+        }
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
         let mut requests = execution::Requests {
             devices: Some(registry.clone()),
@@ -1957,6 +2065,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     result
                 })
             });
+            #[cfg(feature = "io-test-hooks")]
+            if let Some(spec) = args.miss_hold.as_deref() {
+                let (backing, machine, stops, ended) = (&backing, &machine, &stops, &all_ended);
+                scope.spawn(move || miss_hold(backing, machine, stops, spec, ended));
+            }
             #[cfg(feature = "io-test-hooks")]
             if let Some(release) = publish_release {
                 let (backing, control, held, ended) = (
@@ -2180,6 +2293,9 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 Ok(())
             });
             let supervision = owners::supervise(n, &prepare, &body, &cancelled);
+            if let Some(report) = backing.pool_report() {
+                eprintln!("{report}");
+            }
             all_ended.store(true, SeqCst);
             if let Some(control) = &pending_compiler {
                 control.abort();

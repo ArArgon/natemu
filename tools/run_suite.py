@@ -60,11 +60,15 @@ SERIAL_WHY = {
 E_OK = ('fix*', 'seed*', 'i7*', 'i8*', 'i9*', 'i10*', 'i6*', 'i5c*', 'adx*', 'xsave*', 'rex*', 'br66*', 'sha', 'sha-1', 'flow', 'icebp',
         'faults*', 'loopfaults-*', 'instruction-gaps*', 'cpu-forms', 'frame-*', 'maskmovq*', 'vector-ac')
 SHARDS = {'faults': 5, 'i7-faults': 2, 'loopfaults': 3, 'probes': 2, 'k1': {1: 1, 2: 2, 3: 3, 4: 1}}   # parts of about 100 s
-PROBES_EST, CORPORA_EST = 900, {2: 160, 3: 135, 4: 200}
-# Seconds of the long indivisible steps in the November 10 runs (-j 4 -e 6, machine busy): the k1 link-full case (one run, 220-385 s)
-# and the two probe chains; they start first. Everything else comes from the arguments above.
-EST = {'k1-c1': 220, 'k1-c2@2': 320, 'k1-c3@3': 385, 'probes@1': 290, 'probes@2': 600, 'system': 175, 'i5b-faults': 120,
-       'instruction-gaps': 75, 'instruction-gaps-1': 75, 'cpu-forms': 75}
+PROBES_EST, CORPORA_EST = 530, {2: 90, 3: 80, 4: 80}
+# Seconds of the long indivisible steps in the November 10-11 runs (-j 4 -e 6, machine busy): the k1 link-full case (one run, 160-385 s)
+# and the two probe chains (November 11: 363 and 166 s); they start first. Everything else comes from the arguments above.
+# November 14 estimates (not measured: the clang and QEMU reference caches, and the prefix baselines run once, came after the
+# November 11 run; times below are what the removed work suggests, to be replaced by the first run's): system 160 -> 50 once the
+# QEMU cache is warm (the first two runs cost about the old 160 s: a hang is stored after two timeouts), i5b-faults 111 -> 75, cpu-forms 206 s on an efficiency core -> 60 on a performance one.
+EST = {'k1-c1': 220, 'k1-c2@2': 320, 'k1-c3@3': 385, 'probes@1': 360, 'probes@2': 170, 'system': 50, 'i5b-faults': 75,
+       'instruction-gaps': 50, 'instruction-gaps-1': 50, 'cpu-forms': 60, 'frame-alias': 15, 'frame-alias-1': 15, 'vector-ac': 20,
+       'contain': 70}
 E_SLOW = 3.0      # a step's time on the efficiency cores over its `est` (measured with the machine busy: 2.4; i8-faults alone: 3.6-4.1)
 # --quick: one small member of every runner family (the sharded ones: their first shard).
 QUICK = ('build', 'cargo-test', 'cargo-test-fexc', 'runtime', 'l1', 'l2', 'l2-iasl', 'release', 'stack', 'barriers', 'pytests',
@@ -133,14 +137,14 @@ def steps(F, O):
         vm('fix' + sfx, 'run_slice1_vm.py', *blk)
         for c in corpora: vm(c + sfx, 'run_slice1_vm.py', *blk, *pair(c), judge=i8b_judge if c == 'i8b' else None)
         vm('i7-cpl0' + sfx, 'run_slice1_vm.py', '--cpl', '0', *blk, *pair('i7'))
-        shards(SHARDS['faults'], 'faults' + sfx, 'run_slice1_faults.py', *blk, est=650)
-        shards(SHARDS['i7-faults'], 'i7-faults' + sfx, 'run_slice1_faults.py', '--no-probes', *blk, pair('i7')[0], est=380)
-        for r, est in (('run_i6_faults.py', 10), ('run_i8_faults.py', 55), ('run_i9_faults.py', 38), ('run_i10_faults.py', 20), ('run_i5c.py', 8)):
+        shards(SHARDS['faults'], 'faults' + sfx, 'run_slice1_faults.py', *blk, est=300)
+        shards(SHARDS['i7-faults'], 'i7-faults' + sfx, 'run_slice1_faults.py', '--no-probes', *blk, pair('i7')[0], est=260)
+        for r, est in (('run_i6_faults.py', 10), ('run_i8_faults.py', 45), ('run_i9_faults.py', 38), ('run_i10_faults.py', 20), ('run_i5c.py', 8)):
             vm(r[4:-3].replace('_', '-') + sfx, r, *blk, est=est)
         vm('i6b' + sfx, 'run_i6b.py', 'corpus', *blk, RAW / 'i6b-corpus-20261030-01/programs.json', RAW / 'i6b-corpus-20261030-01/expected.json')
         vm('i6b-cases' + sfx, 'run_i6b.py', 'cases', *blk)
     vm('flow', 'run_slice2_vm.py', '--programs', RAW / 's2d/corpus/programs.json', '--expected', RAW / 's2d/corpus/expected.json')
-    for size in ('default', '1', '2'): shards(SHARDS['loopfaults'], f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=150)
+    for size in ('default', '1', '2'): shards(SHARDS['loopfaults'], f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=120)
     shards(SHARDS['probes'], 'probes', 'run_slice2_probes.py', est=PROBES_EST)
     vm('asm', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', est=15, w=4)
     vm('asm-1', 'fexc/upstream_tests/run_asm.py', '--jobs', '4', '--max-block', '1', est=15, w=4)
@@ -164,12 +168,17 @@ def steps(F, O):
         vm(f'nostop-{g}', 'run_nostop.py', '--only', g)
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
-    for n, est in ((1, 80), (2, 215), (3, 275), (4, 155)):
-        if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, *(() if n == 4 else ('--timeout', 450)), est=est, w=n)     # c4 serial: its runs time out at 300 s under load
-        else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 450, est=est, w=n)
+    # link-full overflows a test link capacity (16 Ki records, NATEMU_LINK_CAP) in these runs: seconds. The production size
+    # (MAX_LINKS, 512 Ki since chunk 1b: about 6 min at 1 vCPU, 20 at 4) runs once, below, at 1 vCPU. The `est` here
+    # predate the small capacity (about 30 of K1's 35 minutes was link-full): recalibrate after the first suite run.
+    for n, est in ((1, 300), (2, 500), (3, 700), (4, 1300)):
+        if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 1500, est=est, w=n)
+        else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 1500, est=est, w=n)
+    vm('k1-full-links', 'run_k1.py', '--cpus', 1, '--programs', 'link-full', '--full-links', '--timeout', 1500, est=400)   # the production capacity, once
     # PIC study stage 2: stops at each entry word, svc-word links, a forged slot. One step per mode (each runs the K1 programs at
     # 1 and 2 vCPUs, about 1780 s in all in the November 10 serial-chain run, 137-step suite 13: its longest step); the three
     # no-K1 modes together.
+    # (These runs also run link-full, at the small capacity now: their `est` too predate it, recalibrate with the K1 ones.)
     for mode in ('and', 'str', 'body', 'svc', 'forge', 'forge-noncanonical', 'forge-half'): vm(f'pic-{mode}', 'run_pic.py', '--cpus', 1, 2, '--modes', mode, est=225, w=2)
     vm('pic-ac-fence-user', 'run_pic.py', '--modes', 'ac,fence,user', est=60)
     vm('m1', 'run_m1.py')

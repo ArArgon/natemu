@@ -32,7 +32,9 @@ pub mod io_test;
 /// metadata arena and its code area (the `exec`/`cache` offsets); block v (`v * stride` further) holds vCPU v's own
 /// window, lookup area, metadata arena and code area at the same offsets and leaves the global area's range unused
 /// (never mapped, so never backed): every vCPU maps block 0's. Guest RAM (M1: `ram_bytes`, chosen at prepare) follows
-/// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed.
+/// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed. With the template pool
+/// ([`prepare_with_pool`]) its span (`cache::POOL_BYTES`) lies between the last block and guest RAM (RAM stays the backing's
+/// last bytes), every vCPU maps it read-only at `cache::POOL_VA`.
 pub struct Backing {
     /// Shared (not borrowed) by whatever outlives a move of the Backing: the chipset's LAPIC view ([`crate::irq`]) and the
     /// VM ([`Machine`]). Not public: replacing it would leave `ram` pointing into a mapping that is gone.
@@ -49,8 +51,14 @@ pub struct Backing {
     io_epoch: Mutex<u64>,
     /// Granted windows, for the performance log ([`io::WindowCounts`]).
     io_counts: io::WindowCounters,
+    /// The template pool's writer, shared by the run's compilers ([`Compiler::pool`]); `None`: no pool in this backing.
+    pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
 }
 impl Backing {
+    /// The template pool's publication counters as the performance log's `pool {...}` line (`None`: no pool).
+    pub fn pool_report(&self) -> Option<String> {
+        self.pool.as_ref().map(|p| p.report())
+    }
     /// The backing's mapping (shared: whoever holds a clone keeps it mapped).
     pub fn memory(&self) -> &Arc<Memory> {
         &self.memory
@@ -144,11 +152,51 @@ impl Area<'_> {
     }
 }
 
+/// The template pool's layout: production's, or (the K1 `pool-wrap` test hook) `NATEMU_POOL_RING_KB` of ring and
+/// `NATEMU_POOL_INDEX_SLOTS` index slots (both set, a ring a multiple of 64 bytes and at least 4 KiB, slots a power of two of
+/// at least 8; the control granule stays 2 MiB).
+fn pool_layout_from_env() -> Result<natemu_abi::pool::Layout> {
+    let var = |name: &str| match std::env::var(name) {
+        Ok(v) => v
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("{name}={v}: a number")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name}: {e}")),
+    };
+    let (ring, slots) = (var("NATEMU_POOL_RING_KB")?, var("NATEMU_POOL_INDEX_SLOTS")?);
+    let Some((ring, slots)) = ring.zip(slots) else {
+        return Ok(natemu_abi::pool::PRODUCTION);
+    };
+    let layout = natemu_abi::pool::Layout {
+        index_slots: slots,
+        ring_bytes: ring.saturating_mul(1024),
+        control_bytes: natemu_abi::pool::PRODUCTION.control_bytes,
+    };
+    if !layout.valid() || layout.ring_bytes < 4096 || layout.mapped_bytes() > cache::POOL_BYTES {
+        return Err("NATEMU_POOL_RING_KB / NATEMU_POOL_INDEX_SLOTS: a ring of 4 KiB or more and a power of two of 8 or more slots, the whole within the pool's address range".into());
+    }
+    eprintln!("natemu: the template pool's ring is {ring} KiB, its index {slots} slots (test hook)");
+    Ok(layout)
+}
+
 /// Backing for the execution mode with `n` vCPUs (1..=`cache::MAX_VCPUS`) and `ram_bytes` of guest RAM (a 2 MiB
 /// multiple, at most `exec::MAX_GUEST_RAM_BYTES`): the resident loaded into each vCPU's window, each vCPU's private
 /// address space and shared record in place; guest RAM is zero. Each vCPU's code cache holds `code_bytes` of generated
 /// code (at most `cache::CODE_BYTES_MAX`).
 pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) -> Result<Backing> {
+    prepare_with_pool(resident, code_bytes, n, ram_bytes, false)
+}
+/// [`prepare`], with the shared template pool ([`natemu_abi::pool`]) when `pool` is set: its span is backed before guest RAM
+/// and mapped read-only into every vCPU's window, and the host publishes admitted templates into it (the resident does not
+/// read it yet).
+pub fn prepare_with_pool(
+    resident: &str,
+    code_bytes: usize,
+    n: usize,
+    ram_bytes: usize,
+    pool: bool,
+) -> Result<Backing> {
     unsafe extern "C" {
         fn getentropy(buf: *mut u8, len: usize) -> i32;
     }
@@ -156,7 +204,7 @@ pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) ->
         // SAFETY: the buffer is writable and 8 bytes, below getentropy's 256-byte limit.
         unsafe { getentropy(bytes.as_mut_ptr(), bytes.len()) }
     })?;
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool)
 }
 
 fn random_guest_state_alias(fill: impl FnOnce(&mut [u8; 8]) -> i32) -> Result<u64> {
@@ -180,8 +228,9 @@ pub fn prepare_with_guest_state_alias(
     n: usize,
     ram_bytes: usize,
     va: u64,
+    pool: bool,
 ) -> Result<Backing> {
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool)
 }
 
 fn prepare_at_alias(
@@ -190,6 +239,7 @@ fn prepare_at_alias(
     n: usize,
     ram_bytes: usize,
     va: u64,
+    pool: bool,
 ) -> Result<Backing> {
     if !exec::guest_state_alias_valid(va) {
         return Err(format!(
@@ -217,7 +267,15 @@ fn prepare_at_alias(
     }
     let code_mapped = (cache::HEAD_BYTES + code_bytes).next_multiple_of(cache::BLOCK);
     let stride = exec::BACKING_BYTES + code_mapped;
-    let ram_offset = n * stride;
+    // The pool's span follows the last block and precedes guest RAM, so RAM stays the backing's last bytes (N7).
+    let pool_offset = n * stride;
+    let pool_layout = if pool {
+        pool_layout_from_env()?
+    } else {
+        natemu_abi::pool::PRODUCTION
+    };
+    let pool_bytes = if pool { pool_layout.mapped_bytes() } else { 0 };
+    let ram_offset = pool_offset + pool_bytes;
     let ram_span = exec::ram_end(ram_bytes as u64) as usize;
     let memory = Memory::with_size(ram_offset + ram_span)?;
     load_resident(&memory, resident)?;
@@ -270,6 +328,13 @@ fn prepare_at_alias(
                 cache::GLOBAL_OFFSET,
             ),
         ]);
+        if pool {
+            spans.push(Span::read_only(
+                (cache::POOL_VA - PRIVATE) as usize,
+                pool_bytes,
+                pool_offset,
+            ));
+        }
         if ram_bytes as u64 > exec::LOW_RAM_END {
             spans.push(Span::data(
                 (exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize,
@@ -294,14 +359,24 @@ fn prepare_at_alias(
     }
     // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
+    let memory = Arc::new(memory);
+    // Zero memory, nothing reading yet: the publisher makes the pool empty and on.
+    let pool = pool.then(|| {
+        Arc::new(crate::publisher::Publisher::with_layout(
+            memory.clone(),
+            pool_offset,
+            pool_layout,
+        ))
+    });
     Ok(Backing {
-        memory: Arc::new(memory),
+        memory,
         n,
         stride,
         ram,
         epoch: unsafe { mach_absolute_time() },
         io_epoch: Mutex::new(0),
         io_counts: io::WindowCounters::default(),
+        pool,
     })
 }
 /// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no).
@@ -553,6 +628,10 @@ pub fn k1_stats(area: Area) -> K1 {
         }
     }
     let mut k = K1::new(&control);
+    let perf: exec::perf::Perf = area.read_record(exec::perf::OFFSET);
+    if perf.magic == exec::perf::MAGIC {
+        k.dispatch_misses = perf.count[exec::perf::MISS as usize];
+    }
     k.pic_transitions = pic_transitions(area);
     k
 }
@@ -596,12 +675,143 @@ pub struct K1 {
     capacity: [u64; 3],
     reclaims: [u64; 2],
     reuse: K1Reuse,
+    pool: K1Pool,
     slot_writes: u64,
     kept_resets: u64,
+    /// Dispatch study (`natemu_abi::execution::cache::L1_EVICTED` and the rest; `dispatch-study` resident builds only).
+    l1_counts: [u64; natemu_abi::execution::cache::L1_COUNTS],
+    /// Dispatcher misses entered (the `perf` bucket `miss`'s entry count; 0 from a resident built without `perf`). K1's
+    /// L1 programs take it as the difference between two runs of one program at different round counts.
+    dispatch_misses: u64,
     systems: K1Systems,
     /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).
     pic: [u64; natemu_abi::pic::count::COUNTS],
     pic_transitions: [u64; 5],
+    /// Page-currency chunk 0 (`page-study` resident builds only: absent when every counter is zero).
+    #[serde(skip_serializing_if = "K1PageStudy::is_empty")]
+    page_study: K1PageStudy,
+    /// Page-currency plan chunk 1 (the page record, `Control::pages`) and the fast miss path (fast-miss plan): absent while every
+    /// counter is zero.
+    #[serde(skip_serializing_if = "K1Page::is_empty")]
+    page: K1Page,
+    #[serde(skip_serializing_if = "K1FastMiss::is_empty")]
+    fast_miss: K1FastMiss,
+    /// Relink plan (docs/restructure/relink-plan.md): absent while every counter is zero.
+    #[serde(skip_serializing_if = "K1Relink::is_empty")]
+    relink: K1Relink,
+}
+/// The relink plan's counters: linker entries that linked a target found current as it was (`linked_current`, and those entries'
+/// `link` bucket time, `perf` residents only).
+#[derive(Debug, Default, serde::Serialize)]
+struct K1Relink {
+    linked_current: u64,
+    linked_current_us: u64,
+    /// Records suspended at TLB events, relinked at revalidations, and dropped by a relink; the suspended segment's length now.
+    suspended: u64,
+    relinked: u64,
+    relink_dropped: u64,
+    links_susp: u64,
+}
+impl K1Relink {
+    fn is_empty(&self) -> bool {
+        self.linked_current | self.linked_current_us | self.suspended | self.relinked | self.relink_dropped | self.links_susp == 0
+    }
+}
+/// `Control::pages` and its counters: fetch walks made, record hits, check-mode differences, 2 MiB leaves not recorded.
+#[derive(Debug, Default, serde::Serialize)]
+struct K1Page {
+    mode: u64,
+    walks: u64,
+    hits: u64,
+    disagree: u64,
+    split_2m: u64,
+}
+impl K1Page {
+    fn is_empty(&self) -> bool {
+        self.walks | self.hits | self.disagree | self.split_2m == 0
+    }
+}
+/// The fast miss path: misses it served from the exit's frame, and the ones it declined by reason
+/// (`natemu_abi::execution::cache::fast_decline`).
+#[derive(Debug, Default, serde::Serialize)]
+struct K1FastMiss {
+    taken: u64,
+    declined: Members<&'static str, u64>,
+}
+impl K1FastMiss {
+    fn is_empty(&self) -> bool {
+        self.taken == 0 && self.declined.0.is_empty()
+    }
+}
+/// Page-currency plan chunk 0 (`natemu_abi::page_study::Counts`): fetch walks by caller (`[revalidation, placement]`) with the
+/// record's would-be answers, its disagreements with the walk, and the walk and probe times in ns (`walk_ns[caller][hit]`: the
+/// walks the record would not / would have answered). `class_*[caller]` are `[global, large, user]`; `blocks*` are
+/// `[all, global, large, user, crossing]`.
+#[derive(Debug, Default, serde::Serialize)]
+struct K1PageStudy {
+    calls: [u64; 2],
+    hit_4k: [u64; 2],
+    hit_2m: [u64; 2],
+    class_calls: [[u64; 3]; 2],
+    class_hits: [[u64; 3]; 2],
+    faulted: [u64; 2],
+    not_ram: [u64; 2],
+    disagree: [u64; 2],
+    disagree_frame: u64,
+    disagree_flags: u64,
+    disagree_fault: u64,
+    records: u64,
+    evictions: u64,
+    split_2m: u64,
+    clear_events: u64,
+    cleared: u64,
+    live_max: u64,
+    probe_ns: u64,
+    walk_ns: [[u64; 2]; 2],
+    walk_count: [[u64; 2]; 2],
+    blocks: [u64; natemu_abi::page_study::B_CLASSES],
+    blocks_hit: [u64; natemu_abi::page_study::B_CLASSES],
+    /// The cost of two counter reads in a row, in ns per pair (x1000: the counter ticks at 24 MHz).
+    tick_pair_milli_ns: u64,
+}
+impl K1PageStudy {
+    /// Written by a `page-study` resident only (its start-up measures the counter, so `tick_pairs` is nonzero then).
+    fn is_empty(&self) -> bool {
+        self.calls == [0; 2] && self.tick_pair_milli_ns == 0
+    }
+    fn new(c: &natemu_abi::page_study::Counts) -> Self {
+        let pair = if c.tick_pairs == 0 {
+            0
+        } else {
+            // (ticks_ns of the whole sum, so the 24 MHz quantum averages out over the pairs.)
+            ticks_ns(c.tick_pair_ticks) * 1000 / c.tick_pairs
+        };
+        Self {
+            calls: c.calls,
+            hit_4k: c.hit_4k,
+            hit_2m: c.hit_2m,
+            class_calls: c.class_calls,
+            class_hits: c.class_hits,
+            faulted: c.faulted,
+            not_ram: c.not_ram,
+            disagree: c.disagree,
+            disagree_frame: c.disagree_frame,
+            disagree_flags: c.disagree_flags,
+            disagree_fault: c.disagree_fault,
+            records: c.records,
+            evictions: c.evictions,
+            split_2m: c.split_2m,
+            clear_events: c.clear_events,
+            cleared: c.cleared,
+            live_max: c.live_max,
+            probe_ns: ticks_ns(c.probe_ticks),
+            walk_ns: c.walk_ticks.map(|w| w.map(ticks_ns)),
+            walk_count: c.walk_count,
+            blocks: c.blocks,
+            blocks_hit: c.blocks_hit,
+            tick_pair_milli_ns: pair.max(u64::from(c.tick_pairs != 0)),
+        }
+    }
 }
 #[derive(Debug, Default, serde::Serialize)]
 struct K1Uncached {
@@ -613,6 +823,44 @@ struct K1Reuse {
     copies: u64,
     refused: [u64; 5],
     checks: u64,
+}
+/// The template pool's counters (cross-vCPU reuse plan chunk 3): lookups, blocks copied, refusals by
+/// [`cache::pool_refusal`].
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct K1Pool {
+    pub probes: u64,
+    pub hits: u64,
+    pub candidates: u64,
+    pub refused: Members<&'static str, u64>,
+    /// The re-check refusals by reason, `same|other` (the RIP the entry was published at) and `user|kernel` (the context's CPL).
+    pub recheck: Members<String, u64>,
+}
+impl K1Pool {
+    pub(crate) fn new(c: &cache::Control) -> Self {
+        Self {
+            probes: c.pool_probes,
+            hits: c.pool_hits,
+            candidates: c.pool_candidates,
+            recheck: (0..cache::pool_recheck::COUNT * 4)
+                .filter(|&i| c.pool_recheck[i] != 0)
+                .map(|i| {
+                    (
+                        format!(
+                            "{}.{}.{}",
+                            cache::pool_recheck::NAMES[i / 4],
+                            if i & 2 != 0 { "same" } else { "other" },
+                            if i & 1 != 0 { "user" } else { "kernel" }
+                        ),
+                        c.pool_recheck[i],
+                    )
+                })
+                .collect(),
+            refused: cache::pool_refusal::NAMES
+                .into_iter()
+                .zip(c.pool_refused)
+                .collect(),
+        }
+    }
 }
 /// Perf chunk 12: system instructions by kind ([count, transaction us]) and by the resident bucket that reached them.
 #[derive(Debug, Default, serde::Serialize)]
@@ -671,8 +919,11 @@ impl K1 {
                 refused: c.reuse_refused,
                 checks: c.reuse_checks,
             },
+            pool: K1Pool::new(c),
             slot_writes: c.slot_writes,
             kept_resets: c.kept_resets,
+            l1_counts: c.l1_counts,
+            dispatch_misses: 0,
             systems: K1Systems {
                 kinds: (0..128)
                     .filter(|&k| c.system_counts[k] != 0)
@@ -695,6 +946,30 @@ impl K1 {
             },
             pic: c.pic_counts,
             pic_transitions: [0; 5],
+            page_study: K1PageStudy::new(&c.page_study),
+            page: K1Page {
+                mode: c.pages,
+                walks: c.page_walks,
+                hits: c.page_hits,
+                disagree: c.page_disagree,
+                split_2m: c.page_split_2m,
+            },
+            fast_miss: K1FastMiss {
+                taken: c.fast_taken,
+                declined: cache::fast_decline::NAMES
+                    .into_iter()
+                    .zip(c.fast_declined)
+                    .filter(|&(_, n)| n != 0)
+                    .collect(),
+            },
+            relink: K1Relink {
+                linked_current: c.linked_current,
+                linked_current_us: us(c.linked_current_ticks),
+                suspended: c.suspended,
+                relinked: c.relinked,
+                relink_dropped: c.relink_dropped,
+                links_susp: c.links_susp,
+            },
         }
     }
 }
@@ -938,24 +1213,32 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let records: Vec<cache::LinkRecord> = (0..control.links as usize)
         .map(|i| link_record(area, i))
         .collect();
+    // Relink plan: the segments in order (suspended, CR3, TLB, local, checked); the suspended records (their words restored at a
+    // TLB event) are not linked points: only the live ones are described by the words below.
+    let ends = [control.links_susp, control.links_cr3, control.links_tlb, control.links_local, control.links];
+    if ends.windows(2).any(|w| w[0] > w[1]) {
+        return Err(format!("link segment ends {ends:?} are not in order"));
+    }
+    let live = &records[control.links_susp as usize..];
     // Each record also holds the patched word as admitted: the point's first word, or (checked) `svc #LINK`.
-    let described = records.iter().all(|r| {
+    let described = live.iter().all(|r| {
         let Some(b) = blocks.get(r.source as usize) else {
             return false;
         };
         let checked = r.target & cache::CHECKED != 0;
         let svc = |p: &exec::LinkPoint| {
-            natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p) == u64::from(r.offset)
+            natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p) == u64::from(r.offset())
         };
-        let point = b.links.iter().find(|p| {
+        // (The point its record names: `Block::links[r.point()]`.)
+        let point = b.links.get(r.point()).filter(|p| {
             p.offset != 0
                 && if checked {
                     svc(p)
                 } else {
-                    p.offset == r.offset
+                    p.offset == r.offset()
                 }
         });
-        linked.get(&(r.source, r.offset)) == Some(&r.target)
+        linked.get(&(r.source, r.offset())) == Some(&r.target)
             && point.is_some_and(|p| {
                 r.original
                     == if checked {
@@ -965,12 +1248,133 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     }
             })
     });
-    if !described || records.len() != linked.len() {
+    if !described || live.len() != linked.len() {
         return Err(format!(
-            "{} link records for {} linked points",
-            records.len(),
+            "{} live link records for {} linked points",
+            live.len(),
             linked.len()
         ));
+    }
+    // The inbound lists: each block's chain holds exactly the records naming it (checked ones on none), doubly linked.
+    let mut on_lists = 0;
+    for (n, b) in blocks.iter().enumerate() {
+        let (mut at, mut prev) = (b.inbound, 0);
+        while at != 0 {
+            let r = records
+                .get(at as usize - 1)
+                .filter(|r| {
+                    r.target as usize == n && r.prev_in == prev && on_lists <= records.len()
+                })
+                .ok_or_else(|| format!("block {n}'s inbound list is broken at record {}", at - 1))?;
+            (prev, at, on_lists) = (at, r.next_in, on_lists + 1);
+        }
+    }
+    // The premise of the lists' use at INVLPG and #PF: every non-local record (segments before `links_tlb`) enters a block
+    // that is current now (the resident's `current`) with INBOUND set; every local one, a block with LOCAL_INBOUND.
+    for (i, r) in records.iter().enumerate() {
+        if r.target & cache::CHECKED != 0 {
+            continue;
+        }
+        let Some(t) = blocks.get(r.target as usize) else {
+            return Err(format!("record {i} names block {}", r.target));
+        };
+        let local = i as u64 >= control.links_tlb;
+        let current = t.checked == control.epoch
+            || (t.flags & cache::GLOBAL != 0 && t.checked >= control.global_epoch);
+        // A suspended record (relink plan): a live target (its source may be dead), the target not current (the epoch moved at the event that
+        // suspended it, and the target is revalidated only by a lookup, which relinks or drops its records), INBOUND set (a cut
+        // must find the list), the point it names present with its admitted word, and that word unlinked, or held by exactly one
+        // live record of the same point (the point was linked elsewhere meanwhile: the linker's link into another block of the
+        // same RIP).
+        if (i as u64) < control.links_susp {
+            let Some(source) = blocks.get(r.source as usize) else {
+                return Err(format!("suspended record {i} names block {} as its source", r.source));
+            };
+            // The point the record names (by its index, as the resident's relink reads it), and its pairing with the target as `link`
+            // required it: the point's offset is the record's, its target the block's RIP, both in one context, an absolute source
+            // and a target that is not an instance (shared and instance links are checked or local: never suspended).
+            let point = source.links.get(r.point()).filter(|p| p.offset != 0 && p.offset == r.offset());
+            let admitted = point.is_some_and(|p| {
+                r.original == p.word
+                    && word(u64::from(source.code) + u64::from(p.offset)) == p.word
+                    && word(u64::from(source.code) + natemu_abi::pic::svc_slot(|o| word(u64::from(source.code) + o), p))
+                        == natemu_abi::pic::SVC_LINK
+            });
+            let paired = point.is_some_and(|p| {
+                p.target == t.rip
+                    && source.context == t.context
+                    && source.flags & (cache::PIC | cache::INSTANCE | cache::SYSTEM | cache::STEP) == 0
+                    && t.flags & (cache::INSTANCE | cache::SYSTEM | cache::STEP) == 0
+            });
+            let held = linked.contains_key(&(r.source, r.offset()));
+            let mut why = None;
+            if t.flags & cache::DEAD != 0 {
+                why = Some("a dead target");
+            } else if current {
+                why = Some("a current target");
+            } else if t.flags & cache::INBOUND == 0 {
+                why = Some("no INBOUND on the target");
+            } else if point.is_none() || r.original != point.map_or(0, |p| p.word) {
+                why = Some("no such link point, or another original word");
+            } else if !paired {
+                why = Some("a source and target that `link` would not pair (RIP, context, shared or instance)");
+            } else if !admitted && !held {
+                why = Some("a word that is neither unlinked nor held by a live record");
+            }
+            if let Some(why) = why {
+                return Err(format!("suspended record {i} into the block at {:#x}: {why}", t.rip));
+            }
+            continue;
+        }
+        // The live CR3 segment's targets are not global, the TLB segment's are.
+        if !local && ((i as u64) < control.links_cr3) == (t.flags & cache::GLOBAL != 0) {
+            return Err(format!(
+                "record {i} ({}) into the block at {:#x}, flags {:#x}",
+                if (i as u64) < control.links_cr3 { "CR3 segment" } else { "TLB segment" },
+                t.rip,
+                t.flags
+            ));
+        }
+        if local && t.flags & cache::LOCAL_INBOUND == 0
+            || !local && !(current && t.flags & cache::INBOUND != 0)
+        {
+            return Err(format!(
+                "record {i} ({}) into the block at {:#x}: current {current}, flags {:#x}",
+                if local { "local" } else { "non-local" },
+                t.rip,
+                t.flags
+            ));
+        }
+    }
+    let unchecked = records.iter().filter(|r| r.target & cache::CHECKED == 0).count();
+    if on_lists != unchecked {
+        return Err(format!(
+            "{on_lists} records on inbound lists, {unchecked} unchecked links"
+        ));
+    }
+    // A dead block has no link into or out of it (its death undid them): no record names one.
+    let dead = |n: u32| blocks.get(n as usize).is_some_and(|b| b.flags & cache::DEAD != 0);
+    // (Relink plan: but a suspended record's source may be dead: the record is named by no outbound slot, and the target's next
+    // relink or a reclaim drops it.)
+    if let Some(i) = records.iter().enumerate().position(|(i, r)| {
+        dead(r.source) && i as u64 >= control.links_susp || r.target & cache::CHECKED == 0 && dead(r.target)
+    }) {
+        return Err(format!("record {i} names a dead block"));
+    }
+    // The outbound slots: each block's slot k names a live record of its point k (checked ones too) or none, and every live record
+    // is named by its source's slot (a suspended one by none: the point may hold another link).
+    let mut named = 0;
+    for (n, b) in blocks.iter().enumerate() {
+        for (k, &slot) in b.out.iter().enumerate().filter(|&(_, &s)| s != 0) {
+            records
+                .get(slot as usize - 1)
+                .filter(|r| r.source as usize == n && r.point() == k && slot as u64 > control.links_susp)
+                .ok_or_else(|| format!("block {n}'s outbound slot {k} is broken at record {}", slot - 1))?;
+            named += 1;
+        }
+    }
+    if named != live.len() {
+        return Err(format!("{named} records in outbound slots, {} live links", live.len()));
     }
     Ok((points, linked.len() as u64))
 }
@@ -1531,7 +1935,7 @@ impl Answer {
     }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-const GATING: usize = 11;
+pub(crate) const GATING: usize = 11;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -1592,10 +1996,12 @@ impl std::hash::Hasher for Words {
         ((self.sum >> 64) as u64).reverse_bits()
     }
 }
-/// Answers per generation of the memory cache ([`Shard::insert`]), over all its shards: the installer boot keeps about 130 k.
-const GENERATION: usize = 1 << 18;
-/// And bytes per generation (about 80 MB for the installer's answers).
-const GENERATION_BYTES: usize = 128 << 20;
+/// Answers per generation of the memory cache ([`Shard::insert`]), over all its shards. Sized for a parallel build's working
+/// set (IO5, November 13: a CPython `make -j4` asks for about 660 k distinct blocks; with 2 x 256 k the generations cycled and
+/// fexc compiled 1.8 M answers again for other vCPUs); the installer boot keeps about 130 k.
+const GENERATION: usize = 1 << 20;
+/// And bytes per generation (answers average about 650 bytes: the build's set is about 450 MB).
+const GENERATION_BYTES: usize = 512 << 20;
 /// The memory cache's shards (perf chunk 13), each locked alone and bounded at a sixteenth of the generation bounds.
 const SHARDS: usize = 16;
 /// A kept answer and what it was compiled from: its RIP, the gating values (those with a bit in `read` matter) and the guest
@@ -1610,6 +2016,56 @@ struct Entry {
     prefix: Vec<u8>,
     whole: bool,
     answer: Answer,
+    /// Option (d): what admission made of `answer` at `rip`, set by the first use there ([`Compiler::answered`]).
+    kept: std::sync::OnceLock<Box<Kept>>,
+    /// The template pool: the position this answer was last published at (0: never), so it is published once and again only
+    /// when that position has fallen below the ring's tail ([`crate::publisher::Publisher::publish`]).
+    published: AtomicU64,
+}
+/// Why an object answer was admitted again, or not ([`Compiler::admissions`]; the performance log's `state.admissions`). A hit
+/// that cannot reuse its kept form gets the first of `CPL0`, `BULK`, `SHAPE`, `SHORT_PREFIX` that applies.
+pub(crate) mod why {
+    /// The kept form was reused: no admission.
+    pub const SKIPPED: usize = 0;
+    /// The first use of an answer fexc just compiled, one the persistent cache gave, and one fexc compiled again after the
+    /// memory cache dropped it.
+    pub const FRESH: usize = 1;
+    pub const DISK: usize = 2;
+    pub const RECOMPILED: usize = 3;
+    /// A hit whose answer keeps no form yet (no admission of it at its own RIP, or only at another RIP's first use).
+    pub const NO_KEPT: usize = 4;
+    pub const CPL0: usize = 5;
+    pub const BULK: usize = 6;
+    pub const SHAPE: usize = 7;
+    pub const SHORT_PREFIX: usize = 8;
+    /// The kept form could not be moved to another RIP (a relocation that does not pack, too many, `relocate_code`'s
+    /// refusal, or its code differing from the moved answer's).
+    pub const MOVE_REFUSED: usize = 9;
+    /// An object the host translates again with fewer instructions ([`crate::admission::retry`]): never admitted.
+    pub const RETRY: usize = 10;
+    pub const NAMES: [&str; 11] = [
+        "skipped",
+        "fresh",
+        "disk",
+        "recompiled",
+        "no_kept",
+        "cpl0",
+        "bulk",
+        "shape",
+        "short_prefix",
+        "move_refused",
+        "retry",
+    ];
+}
+/// An answer's admitted form (its record without the object, which [`crate::relocation::resolved`] gives back) and the
+/// CPL-0, bulk and code-shape values admission ran under: it is reused only where they are the request's. The feature
+/// bits (`supported`) are not compared: they are fixed per [`Compiler`], and [`Compiler::share`] joins only maps made for
+/// equal ones.
+struct Kept {
+    cpl0: bool,
+    bulk: bool,
+    shape: bool,
+    form: admission::Admitted,
 }
 impl Entry {
     /// PIC study: what makes it the same answer (its key with `limit`, gating values read, bytes read), hashed: a later
@@ -1630,7 +2086,8 @@ impl Entry {
         size_of::<Self>()
             + self.prefix.len()
             + if let Answer::Object(o) = &self.answer {
-                o.len()
+                // And its kept form ([`Kept`], its link points at most): set after the answer is, but counted with it.
+                o.len() + size_of::<Kept>() + exec::MAX_LINK_POINTS * size_of::<exec::LinkPoint>()
             } else {
                 0
             }
@@ -1712,7 +2169,7 @@ impl Shard {
     }
     /// Keeps `entry` in the newer generation; when that holds a [`SHARDS`]th of [`GENERATION`] answers or of
     /// [`GENERATION_BYTES`] it becomes the older one (the older is dropped): every answer used or made in the shard's last
-    /// generation is kept, at most twice the bound (2 x 128 MiB over the shards). Returns the dropped generation, for the
+    /// generation is kept, at most twice the bound (2 x 512 MiB over the shards). Returns the dropped generation, for the
     /// caller to free after unlocking the shard (up to 16 k answers).
     fn insert(&mut self, limit: Option<u32>, entry: Arc<Entry>) -> Option<Cache> {
         let mut dropped = None;
@@ -1884,6 +2341,8 @@ pub struct Compiler {
     fexc: PathBuf,
     server: Option<Server>,
     supported: u64,
+    /// The request body's `--feature NAME=0` arguments for `supported`, NUL-terminated (formatted once: `body_with`).
+    feature_args: Vec<u8>,
     /// Block size limit in guest instructions (fexc's own limit when `None`).
     max_instructions: Option<u32>,
     /// Kept answers: its own, or the run's ([`Compiler::share`]).
@@ -1912,9 +2371,18 @@ pub struct Compiler {
     pub relocation_refused: u64,
     pub relocation_fallbacks: u64,
     pub reuse_checks: u64,
+    /// Every object answer [`Compiler::answered`] handled, by [`why`] (their sum is the total; all but `SKIPPED` ran
+    /// admission, or were refused before it as a retry).
+    pub admissions: [std::cell::Cell<u64>; why::NAMES.len()],
     /// Debug check (the program driver's `--code-shape` or `--check-reuse`, `boot-linux --check-reuse`): every answer used at
     /// another RIP than its own is also compiled there, and the two must be equal (else a host error).
     pub check_reuse: bool,
+    /// Page-currency plan chunk 1: the resident's [`cache::Control::pages`] ([`cache::PAGES_ON`] by default; `--page-currency
+    /// on|off|check|check-halt`, [`parse_page_currency`]).
+    pub page_currency: u64,
+    /// Fault-around plan chunk 1: [`cache::Control::writable_on_read_off`] (a demand read installs the shadow writable when the leaf has D
+    /// set and grants the write; on by default; `--writable-on-read on|off`, [`parse_writable_on_read`]; `NATEMU_WRITABLE_ON_READ` overrides it).
+    pub writable_on_read: bool,
     /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
     /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|all` overrides it.
     pub pic: u64,
@@ -1961,6 +2429,11 @@ pub struct Compiler {
     /// halving retry made it ([`Compiler::compile`]); the template rule of reuse inside the resident (perf chunk 10).
     read: usize,
     halved: bool,
+    /// The template pool's writer (the run's; [`Backing::pool`]) and, with it set, the answer the last request used and the
+    /// (context, gating values) pairs this vCPU already told it about ([`Compiler::note_gating`]).
+    pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
+    last: Option<Arc<Entry>>,
+    noted: Vec<(u64, [u64; GATING])>,
 }
 /// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
 /// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]); and
@@ -2037,6 +2510,10 @@ impl Compiler {
             fexc: fexc.into(),
             server: None,
             supported,
+            feature_args: admission::feature_overrides(supported)
+                .iter()
+                .flat_map(|f| b"--feature\0".iter().copied().chain(f.bytes()).chain([0]))
+                .collect(),
             max_instructions,
             answers: Answers::new(supported),
             vcpu: 0,
@@ -2051,8 +2528,11 @@ impl Compiler {
             relocated: 0,
             relocation_refused: 0,
             relocation_fallbacks: 0,
+            admissions: Default::default(),
             reuse_checks: 0,
             check_reuse: false,
+            page_currency: cache::PAGES_ON,
+            writable_on_read: true,
             pic: cache::PIC_USER,
             pic_check_local: false,
             deadline: COMPILE_DEADLINE,
@@ -2069,6 +2549,9 @@ impl Compiler {
             perf: None,
             read: 0,
             halved: false,
+            pool: None,
+            last: None,
+            noted: Vec::new(),
         }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
@@ -2085,6 +2568,7 @@ impl Compiler {
         // block stops `code_too_large`. R2 review: the same for a block with a spill area (`spill_area`).
         let mut limit = if step { Some(1) } else { self.max_instructions };
         self.halved = false;
+        self.last = None;
         loop {
             match self.compile_once(bytes, rip, limit, hook)? {
                 Ok(code) => return Ok(code),
@@ -2143,7 +2627,10 @@ impl Compiler {
         self.waited(waited);
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
-            if let Some(code) = self.reuse(e, bytes, rip, limit, hook)? {
+            if let Some(code) = self.reuse(e, bytes, rip, limit, hook, None)? {
+                if self.pool.is_some() {
+                    self.last = Some(e.clone());
+                }
                 self.hits += 1;
                 self.hits_by_source[usize::from(e.owner)] += 1;
                 self.read = e.prefix.len();
@@ -2158,8 +2645,9 @@ impl Compiler {
         // case (it is keyed as memory is, so it would hold the same answer).
         let mut disk = found.is_none();
         loop {
-            let compiles = self.compiles;
+            let (compiles, disk_hits) = (self.compiles, self.disk_hits);
             let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
+            let disk_hit = self.disk_hits > disk_hits;
             let t = self.stamp();
             let (whole, end) = (
                 reply.extent as usize >= bytes.len(),
@@ -2174,6 +2662,8 @@ impl Compiler {
                 prefix,
                 whole,
                 answer: Answer::new(reply, at)?,
+                kept: Default::default(),
+                published: AtomicU64::new(0),
             });
             let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
             self.waited(waited);
@@ -2182,10 +2672,12 @@ impl Compiler {
                 self.duplicates += 1;
             }
             // PIC study: fexc compiled again an answer the map had dropped (by this vCPU's own: `.1`).
+            let mut recompiled = false;
             if self.compiles > compiles {
                 if let Some(owner) = self.answers.recompiled(limit, &entry) {
                     self.recompiled[0] += 1;
                     self.recompiled[1] += u64::from(owner == self.vcpu);
+                    recompiled = true;
                 }
             }
             self.read = end;
@@ -2193,8 +2685,20 @@ impl Compiler {
             if let Some(r) = &mut self.perf {
                 r.read = (hash(&entry.prefix), entry.prefix.len() as u32);
             }
-            match self.reuse(&entry, bytes, rip, limit, hook)? {
-                Some(code) => return Ok(code),
+            let origin = if disk_hit {
+                why::DISK
+            } else if recompiled {
+                why::RECOMPILED
+            } else {
+                why::FRESH
+            };
+            match self.reuse(&entry, bytes, rip, limit, hook, Some(origin))? {
+                Some(code) => {
+                    if self.pool.is_some() {
+                        self.last = Some(entry);
+                    }
+                    return Ok(code);
+                }
                 None => disk = false, // a disk answer for another RIP that is not fexc's here
             }
         }
@@ -2215,10 +2719,64 @@ impl Compiler {
                 "natemu: vCPU {} presents other features than the run's first compiler: it keeps its own answers",
                 self.vcpu
             );
+            // The pool is keyed without features: with a vCPU that differs it is off for the run.
+            if let Some(pool) = self.pool.take() {
+                pool.disable(crate::publisher::off::FEATURES);
+            }
         }
     }
+    /// The template pool: the answer the last request used, published as the admitted `block` at `rip` under `context` when
+    /// the host found it a `template` (once per answer, [`crate::publisher::Publisher::publish`]; `rep_exits`: the reply's).
+    fn publish(
+        &mut self,
+        template: bool,
+        context: u64,
+        rip: u64,
+        block: &admission::Admitted,
+        rep_exits: u64,
+    ) -> Option<crate::publisher::Published> {
+        let (pool, entry) = (self.pool.as_ref()?, self.last.take()?);
+        template.then(|| {
+            pool.publish(
+                &entry.published,
+                &crate::publisher::Template {
+                    rip,
+                    context,
+                    prefix: &entry.prefix,
+                    block,
+                    rep_exits,
+                },
+            )
+        })
+    }
+    /// Publishes into (and, with `Control::pool`, reads) `backing`'s template pool, if it has one; call before [`Compiler::share`]
+    /// (a compiler whose features differ then switches the pool off).
+    pub fn attach_pool(&mut self, backing: &Backing) {
+        self.pool = backing.pool.clone();
+    }
+    /// The template pool: a non-step block request under `context` with this compiler's gating values (a vCPU tells the
+    /// pool each pair once). A context whose requests differ in them turns the pool off ([`crate::publisher::Publisher::note`]);
+    /// under the check mode that is a host error.
+    fn note_gating(&mut self, context: u64) -> Result<()> {
+        let Some(pool) = &self.pool else { return Ok(()) };
+        let gating = self.gating();
+        if self.noted.contains(&(context, gating)) {
+            return Ok(());
+        }
+        if !pool.note(context, &gating) && self.check_reuse {
+            return Err(format!(
+                "pool: gating values {gating:?} under context {context:#x} differ from an earlier request's"
+            ));
+        }
+        if self.noted.len() == 8 {
+            self.noted.remove(0);
+        }
+        self.noted.push((context, gating));
+        Ok(())
+    }
     /// The kept answer `e`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it would not be fexc's
-    /// at `rip`, or admission refused the relocated object; logged; the caller compiles).
+    /// at `rip`, or admission refused the relocated object; logged; the caller compiles). `origin`: a [`why`] when this is
+    /// the answer's first use, by the request that made it.
     fn reuse(
         &mut self,
         e: &Entry,
@@ -2226,11 +2784,12 @@ impl Compiler {
         rip: u64,
         limit: Option<u32>,
         hook: &mut impl Hook,
+        origin: Option<usize>,
     ) -> Result<Option<std::result::Result<Code, (u32, &'static str)>>> {
         let t = self.stamp();
         let (from, read) = (e.rip, (e.read, e.whole, e.prefix.len()));
         let code = if from == rip {
-            self.answered(&e.answer, bytes, rip, hook)?
+            self.answered(&e.answer, bytes, rip, hook, Some(e), origin)?
         } else {
             let Some(answer) = e.answer.at(from, rip) else {
                 self.relocation_refused += 1;
@@ -2242,7 +2801,7 @@ impl Compiler {
                 self.check(&answer, read, bytes, rip, limit, from, hook)?;
             }
             let t = self.stamp();
-            match self.answered(&answer, bytes, rip, hook) {
+            match self.answered(&answer, bytes, rip, hook, Some(e), origin) {
                 Ok(code) => {
                     self.relocated += 1;
                     self.charge(
@@ -2255,6 +2814,8 @@ impl Compiler {
                     );
                     return Ok(Some(code));
                 }
+                // The reuse check: a refusal or a kept form that is not admission's is an error, not a fallback.
+                Err(e) if self.check_reuse => return Err(e),
                 Err(e) => {
                     self.relocation_fallbacks += 1;
                     eprintln!(
@@ -2299,14 +2860,38 @@ impl Compiler {
             reply.extent as usize >= bytes.len(),
             bytes.len().min(reply.extent as usize),
         );
-        if fresh != read || Answer::new(reply, rip)? != *answer {
+        // (Bytes cut exactly at the answer's extent, by a breakpoint or a hook's limit, make fexc's extent reach their end: `whole`
+        // then differs from the kept answer's, which only matters when more bytes follow; the answer itself is compared.)
+        let same_extent = fresh.0 == read.0 && fresh.2 == read.2 && (fresh.1 == read.1 || bytes.len() == read.2);
+        if !same_extent || Answer::new(reply, rip)? != *answer {
             return Err(format!(
                 "reuse check: the answer relocated from {from:#x} is not fexc's at {rip:#x}"
             ));
         }
         Ok(())
     }
-    /// [`Compiler::compile_once`]'s use of an answer: admitted, or decoded.
+    /// Option (d): the block `e`'s kept form gives for `object` (its answer, moved to `rip`), without admission: only where
+    /// the request's CPL 0, bulk and code-shape values are those admission ran under, the answer's bytes cover the block's
+    /// ([`crate::relocation::kept`] for the rest). `Err`: admit it, for that [`why`].
+    fn skip(&self, e: &Entry, object: &[u8], rip: u64) -> std::result::Result<admission::Admitted, usize> {
+        let (Some(k), Answer::Object(from)) = (e.kept.get(), &e.answer) else {
+            return Err(why::NO_KEPT);
+        };
+        if k.cpl0 != self.cpl0 {
+            return Err(why::CPL0);
+        }
+        if k.bulk != self.bulk {
+            return Err(why::BULK);
+        }
+        if k.shape != self.shape {
+            return Err(why::SHAPE);
+        }
+        if e.prefix.len() < k.form.guest_bytes as usize {
+            return Err(why::SHORT_PREFIX);
+        }
+        crate::relocation::kept(&k.form, from, e.rip, object, rip).ok_or(why::MOVE_REFUSED)
+    }
+    /// [`Compiler::compile_once`]'s use of an answer (`kept`: the entry it is, moved to `rip` or not): admitted, or decoded.
     #[cfg_attr(not(feature = "testing"), allow(unused_variables))]
     fn answered(
         &self,
@@ -2314,24 +2899,52 @@ impl Compiler {
         bytes: &[u8],
         rip: u64,
         hook: &mut impl Hook,
+        kept: Option<&Entry>,
+        origin: Option<usize>,
     ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         Ok(match answer {
             Answer::Object(object) => match admission::retry(object) {
-                Some(n) => Err(n),
+                Some(n) => {
+                    self.admissions[why::RETRY].set(self.admissions[why::RETRY].get() + 1);
+                    Err(n)
+                }
                 None => {
+                    // The reason this answer is admitted again: its first use's `origin`, else what the kept form lacks.
+                    let skipped = kept
+                        .map_or(Err(why::NO_KEPT), |e| self.skip(e, object, rip))
+                        .map_err(|r| origin.unwrap_or(r));
+                    let n = &self.admissions[skipped.as_ref().map_or_else(|&r| r, |_| why::SKIPPED)];
+                    n.set(n.get() + 1);
+                    let skipped = skipped.ok();
                     #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
-                    let mut admitted = admission::admit(
-                        object,
-                        rip,
-                        bytes,
-                        self.supported,
-                        self.shape,
-                        self.cpl0,
-                    )?;
-                    // Perf chunk 26: a bulk REP STOS only where asked for (never a step: TF traps after each iteration).
-                    if admitted.bulk && !self.bulk {
-                        return Err(format!("object refused: a bulk REP STOS loop in a request without --bulk at {rip:#x}").into());
-                    }
+                    let mut admitted = match skipped {
+                        Some(a) if !self.check_reuse => a,
+                        skipped => {
+                            let a = admission::admit(
+                                object,
+                                rip,
+                                bytes,
+                                self.supported,
+                                self.shape,
+                                self.cpl0,
+                            )?;
+                            // The reuse check: the kept form is admission's.
+                            if skipped.is_some_and(|s| s != a) {
+                                return Err(format!("reuse check: the kept admitted form at {rip:#x} is not admission's").into());
+                            }
+                            // Perf chunk 26: a bulk REP STOS only where asked for (never a step: TF traps after each iteration).
+                            if a.bulk && !self.bulk {
+                                return Err(format!("object refused: a bulk REP STOS loop in a request without --bulk at {rip:#x}").into());
+                            }
+                            // Option (d): kept for the next hit, from the admission at the answer's own RIP.
+                            if let Some(e) = kept.filter(|e| e.rip == rip) {
+                                let form = admission::Admitted { object: Vec::new(), ..a.clone() };
+                                let (cpl0, bulk, shape) = (self.cpl0, self.bulk, self.shape);
+                                let _ = e.kept.set(Box::new(Kept { cpl0, bulk, shape, form }));
+                            }
+                            a
+                        }
+                    };
                     #[cfg(feature = "testing")]
                     hook.admitted(&mut admitted.object);
                     Ok(Code::Block(admitted))
@@ -2443,42 +3056,44 @@ impl Compiler {
             limit,
         )
     }
+    /// The request body: its NUL-terminated arguments' length (u32), the arguments, then `bytes`. Built for every compile
+    /// and every persistent-cache key, so written straight into one buffer (the feature arguments formatted once); the bytes
+    /// are the persistent cache's key, unchanged (`body_bytes_are_unchanged`).
     fn body_with(&self, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
-        let mut args = vec![
-            "--profile".to_string(),
-            "slice1".into(),
-            "--rip".into(),
-            rip,
-        ];
+        let mut body = Vec::with_capacity(4 + 96 + self.feature_args.len() + bytes.len());
+        body.extend([0; 4]);
+        let arg = |body: &mut Vec<u8>, a: &[u8]| {
+            body.extend_from_slice(a);
+            body.push(0);
+        };
+        for a in [&b"--profile"[..], b"slice1", b"--rip", rip.as_bytes()] {
+            arg(&mut body, a);
+        }
         if let Some(n) = limit {
-            args.extend(["--max-insts".into(), n.to_string()]);
+            arg(&mut body, b"--max-insts");
+            arg(&mut body, n.to_string().as_bytes());
         }
-        for feature in admission::feature_overrides(self.supported) {
-            args.extend(["--feature".into(), feature]);
+        body.extend_from_slice(&self.feature_args);
+        for (on, a) in [
+            (self.sse_gated, &b"--sse-gated"[..]),
+            (self.avx_gated, b"--avx-gated"),
+            (self.alignment_gated, b"--alignment-gated"),
+        ] {
+            if on {
+                arg(&mut body, a);
+            }
         }
-        if self.sse_gated {
-            args.push("--sse-gated".into());
+        for a in &self.x87 {
+            arg(&mut body, a.as_bytes());
         }
-        if self.avx_gated {
-            args.push("--avx-gated".into());
+        for (on, a) in [(self.cpl0, &b"--cpl0"[..]), (self.tsc, b"--tsc"), (self.bulk, b"--bulk")] {
+            if on {
+                arg(&mut body, a);
+            }
         }
-        if self.alignment_gated {
-            args.push("--alignment-gated".into());
-        }
-        args.extend(self.x87.iter().cloned());
-        if self.cpl0 {
-            args.push("--cpl0".into());
-        }
-        if self.tsc {
-            args.push("--tsc".into());
-        }
-        if self.bulk {
-            args.push("--bulk".into());
-        }
-        let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
-        let mut body = (args.len() as u32).to_le_bytes().to_vec();
-        body.extend(args);
-        body.extend(bytes);
+        let n = (body.len() - 4) as u32;
+        body[..4].copy_from_slice(&n.to_le_bytes());
+        body.extend_from_slice(bytes);
         body
     }
     /// fexc's reply to the request for `bytes` at `rip` and the RIP it was compiled at: from the persistent cache when `disk`
@@ -2563,6 +3178,15 @@ impl Compiler {
         self.charge(crate::perf::DISK_PUT, t);
         Ok((reply, rip))
     }
+}
+/// The reply's `rep_exits`: bit i set when link point i is the self-exit of the REP string instruction that ends the block.
+fn rep_exit_mask(block: &admission::Admitted) -> u64 {
+    block
+        .links
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| Some(p.target) == block.rep_self)
+        .fold(0, |m, (k, _)| m | 1 << k)
 }
 /// The performance log's hash of the guest bytes an answer read.
 fn hash(bytes: &[u8]) -> u64 {
@@ -2771,6 +3395,43 @@ pub struct Requests {
     pub entropy: u64,
 }
 
+/// `NATEMU_LINK_CAP`: the link record area's capacity ([`cache::Control::link_cap`]), a test hook for K1's `link-full`.
+/// Unset: 0 (the resident then uses [`cache::MAX_LINKS`]); otherwise a number within
+/// [`cache::MIN_LINK_CAP`]..=[`cache::MAX_LINKS`] (an environment variable is input: nothing else reaches the resident).
+fn link_cap_from(var: Option<&str>) -> Result<u64> {
+    let Some(v) = var else { return Ok(0) };
+    match v.parse::<usize>() {
+        Ok(n) if (cache::MIN_LINK_CAP..=cache::MAX_LINKS).contains(&n) => Ok(n as u64),
+        _ => Err(format!(
+            "NATEMU_LINK_CAP={v}: {} to {}",
+            cache::MIN_LINK_CAP,
+            cache::MAX_LINKS
+        )),
+    }
+}
+
+/// `--page-currency`'s value ([`cache::Control::pages`]): `on` (the page record answers fetch walks), `off` (every one is a walk),
+/// `check` (the record answers and the walk is made too: a difference is counted) or `check-halt` (and stops the run).
+pub fn parse_page_currency(text: &str) -> std::result::Result<u64, String> {
+    match text {
+        "off" => Ok(cache::PAGES_OFF),
+        "on" => Ok(cache::PAGES_ON),
+        "check" => Ok(cache::PAGES_CHECK),
+        "check-halt" => Ok(cache::PAGES_CHECK_HALT),
+        other => Err(format!("--page-currency {other}: on, off, check or check-halt")),
+    }
+}
+
+/// `--writable-on-read`'s (and `NATEMU_WRITABLE_ON_READ`'s) value: whether a demand read installs the shadow writable (chunk 1 of the
+/// fault-around plan) or read-only (before it).
+pub fn parse_writable_on_read(text: &str) -> std::result::Result<bool, String> {
+    match text {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("--writable-on-read {other}: on or off")),
+    }
+}
+
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
 /// which execution stops at a block boundary (blocks are fetched up to it, and
 /// never cached at it, so reaching it is a miss). A vCPU that stays in the guest
@@ -2808,6 +3469,24 @@ pub fn run(
     };
     let control = cache::LOOKUP_OFFSET + cache::CONTROL;
     area.write_record(control + std::mem::offset_of!(cache::Control, reuse), mode);
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, pages),
+        compiler.page_currency,
+    );
+    // A/B measurement only: NATEMU_MISS_FAST=off keeps the resident's fast miss path from being tried.
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, miss_fast_off),
+        u64::from(std::env::var("NATEMU_MISS_FAST").as_deref() == Ok("off")),
+    );
+    // Fault-around plan chunk 1 (A/B measurement): the flag's value, overridden by NATEMU_WRITABLE_ON_READ=on|off (every driver reads it).
+    let writable = match std::env::var("NATEMU_WRITABLE_ON_READ") {
+        Ok(v) => parse_writable_on_read(&v)?,
+        Err(_) => compiler.writable_on_read,
+    };
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, writable_on_read_off),
+        u64::from(!writable),
+    );
     let pic = match std::env::var("NATEMU_PIC").as_deref() {
         Ok("off") => cache::PIC_OFF,
         Ok("user") => cache::PIC_USER,
@@ -2845,6 +3524,39 @@ pub fn run(
         control + std::mem::offset_of!(cache::Control, reuse_fences),
         fences,
     );
+    // K1 `link-full`: a smaller link record area (`NATEMU_LINK_CAP`; unset: the full `cache::MAX_LINKS`).
+    let var = match std::env::var("NATEMU_LINK_CAP") {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("NATEMU_LINK_CAP: {e}")),
+    };
+    let cap = link_cap_from(var.as_deref())?;
+    if let Some(v) = &var {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("natemu: NATEMU_LINK_CAP={v}: link record area capacity reduced (test hook)"));
+    }
+    area.write_record(control + std::mem::offset_of!(cache::Control, link_cap), cap);
+    // The template pool (chunk 3): the resident looks in it (mapped read-only at `cache::POOL_VA` by `prepare_with_pool`) unless
+    // `NATEMU_POOL_LOOKUP=off` (publication without lookup, the A/B of the pool's cost).
+    if let Some(pool) = &compiler.pool {
+        let layout = pool.layout();
+        let on = !matches!(
+            std::env::var("NATEMU_POOL_LOOKUP").as_deref(),
+            Ok("off" | "0")
+        );
+        area.write_record(
+            control + std::mem::offset_of!(cache::Control, pool),
+            if on { cache::POOL_ON } else { cache::POOL_OFF },
+        );
+        area.write_record(
+            control + std::mem::offset_of!(cache::Control, pool_layout),
+            [
+                layout.index_slots as u64,
+                layout.ring_bytes as u64,
+                layout.control_bytes as u64,
+            ],
+        );
+    }
     // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
     // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
     let entered = &AtomicU64::new(0);
@@ -3186,6 +3898,9 @@ fn translation(
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
         compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
+        if !step {
+            compiler.note_gating(state.cpu.code_context())?;
+        }
         let code = compiler.compile(&bytes, rip, step, hook)?;
         match &code {
             // The instruction at RIP runs past a breakpoint the bytes were cut at.
@@ -3317,20 +4032,31 @@ fn translation(
     state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
     state.dispatch_exit = block.dispatch_exit.map_or(0, u64::from);
-    state.rep_exits = block
-        .links
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| Some(p.target) == block.rep_self)
-        .fold(0, |m, (k, _)| m | 1 << k);
+    state.rep_exits = rep_exit_mask(&block);
     state.sti_first = u64::from(block.sti_first);
     compiler.charge(crate::perf::STAGE, t);
+    // The template pool (cross-vCPU reuse plan, chunk 2): a template is published after its admission, once per answer; the
+    // resident does not read the pool yet.
+    compiler.publish(template, state.cpu.code_context(), rip, &block, state.rep_exits);
     Ok(Ok(exec::REPLY_ADMITTED))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publisher::Published;
+    #[test]
+    fn link_cap_env_is_validated() {
+        assert_eq!(link_cap_from(None), Ok(0));
+        assert_eq!(link_cap_from(Some("16384")), Ok(16384));
+        assert_eq!(
+            link_cap_from(Some(&cache::MAX_LINKS.to_string())),
+            Ok(cache::MAX_LINKS as u64)
+        );
+        for bad in ["", "0", "-1", "x", "4095", "524289", "99999999999999999999"] {
+            assert!(link_cap_from(Some(bad)).is_err(), "{bad}");
+        }
+    }
     #[test]
     fn frame_alias_entropy_selects_full_slot_and_fails_closed() {
         for word in [0, 4095, 4096, (1 << 21) - 1, 1 << 21, 1 << 30, u64::MAX] {
@@ -3367,7 +4093,7 @@ mod tests {
             exec::GUEST_STATE_SLOT.end,
         ] {
             assert!(
-                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va)
+                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va, false)
                     .err()
                     .unwrap()
                     .starts_with("guest-state alias")
@@ -3410,7 +4136,7 @@ mod tests {
             })
             .collect();
         format!(
-            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}},\"pic\":{:?},\"pic_transitions\":{:?}}}",
+            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"l1_counts\":{:?},\"dispatch_misses\":0,\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}},\"pic\":{:?},\"pic_transitions\":{:?}}}",
             c.cr3_loads,
             c.global_flushes,
             c.invlpgs,
@@ -3450,6 +4176,7 @@ mod tests {
             c.reuse_checks,
             c.slot_writes,
             c.kept_resets,
+            c.l1_counts,
             kinds.join(","),
             from.join(","),
             c.system_chained,
@@ -3530,7 +4257,9 @@ mod tests {
             ram,
         };
         let empty: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
-        assert_eq!(empty, serde_json::to_value(k1_stats(area)).unwrap());
+        let mut now = serde_json::to_value(k1_stats(area)).unwrap();
+        now.as_object_mut().unwrap().remove("pool");
+        assert_eq!(empty, now);
         let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
         let mut c: cache::Control = area.read_record(offset);
         let mut n = 0;
@@ -3585,7 +4314,49 @@ mod tests {
         (c.system_from[0], c.system_from[5], c.system_from[31]) = (2, 3, 4);
         area.write_record(offset, c);
         let old: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
-        assert_eq!(old, serde_json::to_value(k1_stats(area)).unwrap());
+        let mut new = serde_json::to_value(k1_stats(area)).unwrap();
+        // (The pool's counters are newer than the reference formatter.)
+        assert_eq!(new.as_object_mut().unwrap().remove("pool").unwrap()["probes"], 0);
+        assert_eq!(old, new);
+    }
+
+    /// Page-currency chunk 0: the study's counters appear in the K1 stats only when a `page-study` resident wrote some (so every
+    /// other build's stats keep their form), by caller, in the order `natemu_abi::page_study::Counts` documents.
+    #[test]
+    fn k1_reports_the_page_study_counters_only_when_written() {
+        use natemu_abi::page_study::{B_ALL, B_GLOBAL, C_USER, PLACE, REVAL};
+        let memory = Memory::with_size(exec::BACKING_BYTES).unwrap();
+        let ram = unsafe { GuestRam::new(0, 0, memory.0 as u64) };
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
+        assert!(
+            serde_json::to_value(k1_stats(area)).unwrap().get("page_study").is_none(),
+            "a plain resident writes none"
+        );
+        let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
+        let mut c: cache::Control = area.read_record(offset);
+        c.page_study.calls = [7, 3];
+        c.page_study.hit_4k[REVAL] = 5;
+        c.page_study.class_hits[PLACE][C_USER] = 2;
+        c.page_study.disagree_frame = 1;
+        c.page_study.blocks[B_ALL] = 4;
+        c.page_study.blocks_hit[B_GLOBAL] = 1;
+        c.page_study.walk_count[PLACE][1] = 9;
+        area.write_record(offset, c);
+        let k = serde_json::to_value(k1_stats(area)).unwrap();
+        let p = &k["page_study"];
+        assert_eq!((p["calls"][0].as_u64(), p["calls"][1].as_u64()), (Some(7), Some(3)));
+        assert_eq!(p["hit_4k"][0].as_u64(), Some(5));
+        assert_eq!(p["class_hits"][1][2].as_u64(), Some(2));
+        assert_eq!(p["disagree_frame"].as_u64(), Some(1));
+        assert_eq!((p["blocks"][0].as_u64(), p["blocks_hit"][1].as_u64()), (Some(4), Some(1)));
+        assert_eq!(p["walk_count"][1][1].as_u64(), Some(9));
     }
 
     /// Changes every answer `c` keeps (no other reference is held between compiles).
@@ -3606,6 +4377,212 @@ mod tests {
     ) -> Option<Arc<Entry>> {
         a.find(bytes, rip, limit, gating).0
     }
+    /// Option (d): an answer's kept admitted form is reused, without admission, only where it is admission's decision.
+    /// `supported = 0` makes admission refuse every object, so an `Ok` after it is a reuse (the control: it refuses).
+    mod kept_form {
+        use super::*;
+        const USER: &[u8] = include_bytes!("../tests/relocation/user.src");
+        const A: (&[u8], u64) = (include_bytes!("../tests/relocation/user-7f1234567100.obj"), 0x7f12_3456_7100);
+        const B: (&[u8], u64) = (include_bytes!("../tests/relocation/user-7f1234568100.obj"), 0x7f12_3456_8100);
+
+        fn compiler() -> Compiler {
+            let mut c = Compiler::with_features(Path::new("/nonexistent"), u64::MAX, None);
+            c.shape = true;
+            c
+        }
+        fn kept_entry(prefix: usize) -> Entry {
+            Entry {
+                rip: A.1,
+                owner: 0,
+                read: 0,
+                gating: [0; GATING],
+                prefix: USER[..prefix].into(),
+                whole: false,
+                answer: Answer::Object(A.0.to_vec()),
+                kept: Default::default(),
+                published: AtomicU64::new(0),
+            }
+        }
+        fn block(c: &Compiler, answer: &Answer, e: &Entry, rip: u64) -> Result<admission::Admitted> {
+            match c.answered(answer, USER, rip, &mut (), Some(e), None)? {
+                Ok(Code::Block(b)) => Ok(b),
+                _ => panic!("not a block"),
+            }
+        }
+        fn fresh(c: &Compiler, object: &[u8], rip: u64) -> admission::Admitted {
+            admission::admit(object, rip, USER, u64::MAX, c.shape, c.cpl0).unwrap()
+        }
+
+        #[test]
+        fn same_rip_hit_reuses_the_kept_form() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            let first = block(&c, &e.answer, &e, A.1).unwrap();
+            assert!(e.kept.get().is_some());
+            assert_eq!(first, fresh(&c, A.0, A.1));
+            c.supported = 0;
+            assert!(admission::admit(A.0, A.1, USER, 0, true, false).is_err(), "control");
+            assert_eq!(block(&c, &e.answer, &e, A.1).unwrap(), first);
+        }
+
+        #[test]
+        fn other_cpl0_bulk_shape_or_a_short_prefix_admit() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            block(&c, &e.answer, &e, A.1).unwrap();
+            let short = kept_entry(1);
+            block(&c, &short.answer, &short, A.1).unwrap();
+            assert!((short.prefix.len() as u32) < short.kept.get().unwrap().form.guest_bytes);
+            c.supported = 0;
+            assert!(block(&c, &short.answer, &short, A.1).is_err(), "short prefix");
+            // The boundary: a prefix of exactly the block's guest bytes reuses, one byte less does not.
+            let g = e.kept.get().unwrap().form.guest_bytes as usize;
+            let (exact, less) = (kept_entry(g), kept_entry(g - 1));
+            for x in [&exact, &less] {
+                c.supported = u64::MAX;
+                block(&c, &x.answer, x, A.1).unwrap();
+            }
+            c.supported = 0;
+            assert!(block(&c, &exact.answer, &exact, A.1).is_ok(), "prefix == guest bytes");
+            assert!(block(&c, &less.answer, &less, A.1).is_err(), "prefix < guest bytes");
+            let flips: [fn(&mut Compiler); 3] = [|c| c.cpl0 = true, |c| c.bulk = true, |c| c.shape = false];
+            for flip in flips {
+                let mut d = compiler();
+                d.supported = 0;
+                flip(&mut d);
+                assert!(block(&d, &e.answer, &e, A.1).is_err());
+            }
+            assert!(block(&c, &e.answer, &e, A.1).is_ok(), "control");
+        }
+
+        /// An entry whose kept form is wrong (one more guest instruction than admission gives).
+        fn forged(c: &Compiler) -> Entry {
+            let e = kept_entry(USER.len());
+            block(c, &e.answer, &e, A.1).unwrap();
+            let k = e.kept.get().unwrap();
+            let form = admission::Admitted { guest_insns: k.form.guest_insns + 1, ..k.form.clone() };
+            let f = kept_entry(USER.len());
+            f.kept.set(Box::new(Kept { cpl0: k.cpl0, bulk: k.bulk, shape: k.shape, form })).ok().unwrap();
+            f
+        }
+
+        /// A form kept from another RIP's admission is never used: only the answer's own RIP keeps one.
+        #[test]
+        fn only_the_answers_own_rip_keeps_a_form() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            block(&c, &moved, &e, B.1).unwrap();
+            assert!(e.kept.get().is_none());
+            c.supported = 0;
+            assert!(block(&c, &e.answer, &e, A.1).is_err());
+        }
+
+        /// Under the reuse check a kept form that is not admission's is an error, at its RIP and at another.
+        #[test]
+        fn reuse_check_catches_a_forged_kept_form() {
+            let mut c = compiler();
+            let e = forged(&c);
+            // Used without the check, the forged form is what comes out (the control: the check is what catches it).
+            c.supported = 0;
+            assert_ne!(block(&c, &e.answer, &e, A.1).unwrap(), fresh(&c, A.0, A.1));
+            c.supported = u64::MAX;
+            c.check_reuse = true;
+            assert!(block(&c, &e.answer, &e, A.1).is_err());
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            assert!(block(&c, &moved, &e, B.1).is_err());
+            // The honest form passes the check.
+            let honest = kept_entry(USER.len());
+            block(&c, &honest.answer, &honest, A.1).unwrap();
+            assert!(block(&c, &honest.answer, &honest, A.1).is_ok());
+        }
+
+        /// The same through `reuse`, whose other-RIP arm would take the error for a relocation fallback (needs fexc, as the
+        /// reuse check asks it for its own answer).
+        #[test]
+        fn reuse_at_another_rip_under_the_check_is_an_error() {
+            let Some(fexc) = std::env::var_os("FEXC") else {
+                return;
+            };
+            let mut c = Compiler::with_features(Path::new(&fexc), u64::MAX, None);
+            c.shape = true;
+            c.check_reuse = true;
+            c.compile(USER, A.1, false, &mut ()).unwrap();
+            let honest = c.answers.find(USER, A.1, None, &c.gating()).0.unwrap();
+            assert!(honest.kept.get().is_some());
+            assert!(matches!(c.reuse(&honest, USER, B.1, None, &mut (), None), Ok(Some(_))));
+            let k = honest.kept.get().unwrap();
+            let form = admission::Admitted { guest_insns: k.form.guest_insns + 1, ..k.form.clone() };
+            let f = Entry {
+                rip: honest.rip,
+                owner: 0,
+                read: honest.read,
+                gating: honest.gating,
+                prefix: honest.prefix.clone(),
+                whole: honest.whole,
+                answer: honest.answer.clone(),
+                kept: Default::default(),
+                published: AtomicU64::new(0),
+            };
+            f.kept.set(Box::new(Kept { cpl0: k.cpl0, bulk: k.bulk, shape: k.shape, form })).ok().unwrap();
+            assert!(c.reuse(&f, USER, B.1, None, &mut (), None).is_err());
+        }
+
+        /// Every object answer is counted under one reason, and the reasons sum to the answers handled.
+        #[test]
+        fn admissions_are_counted_by_reason_and_sum_to_the_object_answers() {
+            let mut c = compiler();
+            let mut calls = 0;
+            let mut run = |c: &Compiler, e: &Entry, answer: &Answer, rip, origin| {
+                calls += 1;
+                let _ = c.answered(answer, USER, rip, &mut (), Some(e), origin);
+            };
+            let e = kept_entry(USER.len());
+            run(&c, &e, &e.answer, A.1, Some(why::FRESH));
+            run(&c, &e, &e.answer, A.1, None); // reused
+            let flips: [fn(&mut Compiler); 3] = [|c| c.cpl0 = true, |c| c.bulk = true, |c| c.shape = false];
+            for flip in flips {
+                let (cpl0, bulk, shape) = (c.cpl0, c.bulk, c.shape);
+                flip(&mut c);
+                run(&c, &e, &e.answer, A.1, None);
+                (c.cpl0, c.bulk, c.shape) = (cpl0, bulk, shape);
+            }
+            let short = kept_entry(1);
+            run(&c, &short, &short.answer, A.1, Some(why::DISK));
+            run(&c, &short, &short.answer, A.1, None);
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            run(&c, &e, &moved, B.1, None); // reused, moved
+            run(&c, &e, &Answer::Object(B.0.to_vec()), B.1 + 8, None); // not movable
+            let fresh = kept_entry(USER.len());
+            run(&c, &fresh, &fresh.answer, A.1, None);
+            let again = kept_entry(USER.len());
+            run(&c, &again, &again.answer, A.1, Some(why::RECOMPILED));
+            let mut spill = A.0.to_vec();
+            let at = std::mem::offset_of!(natemu_abi::code_object::Header, spill_bytes);
+            spill[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+            let retry = Entry { answer: Answer::Object(spill), ..kept_entry(USER.len()) };
+            run(&c, &retry, &retry.answer, A.1, None);
+            let counts: Vec<u64> = c.admissions.iter().map(|n| n.get()).collect();
+            assert_eq!(counts, [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "{:?}", why::NAMES);
+            assert_eq!(counts.iter().sum::<u64>(), calls);
+        }
+
+        #[test]
+        fn another_rip_goes_through_relocations_check() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            block(&c, &e.answer, &e, A.1).unwrap();
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            let want = fresh(&c, B.0, B.1);
+            c.supported = 0;
+            assert_eq!(block(&c, &moved, &e, B.1).unwrap(), want);
+            // relocate_code refuses another page offset: admitted (and refused here, as admission is).
+            let off = Answer::Object(B.0.to_vec());
+            assert!(block(&c, &off, &e, B.1 + 8).is_err());
+        }
+    }
+
+
     fn entry(rip: u64, owner: u8, prefix: &[u8], read: u32, gating: [u64; GATING]) -> Arc<Entry> {
         Arc::new(Entry {
             rip,
@@ -3615,6 +4592,8 @@ mod tests {
             prefix: prefix.into(),
             whole: false,
             answer: Answer::Object(prefix.into()),
+            kept: Default::default(),
+                published: AtomicU64::new(0),
         })
     }
 
@@ -3854,6 +4833,48 @@ mod tests {
     }
 
     /// With `FEXC` set: a repeated request is answered from the cache, a different RIP, bytes or block limit is compiled.
+    /// The request body (and so every persistent-cache key) is byte for byte what the per-argument `String` version built.
+    #[test]
+    fn body_bytes_are_unchanged() {
+        fn reference(c: &Compiler, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
+            let mut args = vec!["--profile".to_string(), "slice1".into(), "--rip".into(), rip];
+            if let Some(n) = limit {
+                args.extend(["--max-insts".into(), n.to_string()]);
+            }
+            for feature in admission::feature_overrides(c.supported) {
+                args.extend(["--feature".into(), feature]);
+            }
+            for (on, a) in [(c.sse_gated, "--sse-gated"), (c.avx_gated, "--avx-gated"), (c.alignment_gated, "--alignment-gated")] {
+                if on {
+                    args.push(a.into());
+                }
+            }
+            args.extend(c.x87.iter().cloned());
+            for (on, a) in [(c.cpl0, "--cpl0"), (c.tsc, "--tsc"), (c.bulk, "--bulk")] {
+                if on {
+                    args.push(a.into());
+                }
+            }
+            let args: Vec<u8> = args.iter().flat_map(|a| a.bytes().chain([0])).collect();
+            let mut body = (args.len() as u32).to_le_bytes().to_vec();
+            body.extend(args);
+            body.extend(bytes);
+            body
+        }
+        for supported in [0, u64::MAX, 0b1011] {
+            let mut c = Compiler::with_features(Path::new("/nonexistent"), supported, None);
+            for flags in 0..64u32 {
+                (c.sse_gated, c.avx_gated, c.alignment_gated) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+                (c.cpl0, c.tsc, c.bulk) = (flags & 8 != 0, flags & 16 != 0, flags & 32 != 0);
+                c.x87 = if flags % 3 == 0 { vec![] } else { vec!["--x87".into(), "mode".into()] };
+                for limit in [None, Some(1), Some(64)] {
+                    let bytes = [0x90, 0xc3, flags as u8];
+                    assert_eq!(c.body_with(&bytes, "0x1234".into(), limit), reference(&c, &bytes, "0x1234".into(), limit));
+                    assert_eq!(c.disk_body(&bytes, 0xffff_8000_0000_1234, limit), reference(&c, &bytes, "k:0x234".into(), limit));
+                }
+            }
+        }
+    }
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {
         let Some(fexc) = std::env::var_os("FEXC") else {
@@ -4110,7 +5131,7 @@ mod tests {
         c.bulk = false;
         assert!(!block(&mut c, &stos).bulk);
         let e = c
-            .answered(&Answer::Object(o), &stos, 0x1000, &mut ())
+            .answered(&Answer::Object(o), &stos, 0x1000, &mut (), None, None)
             .err()
             .unwrap();
         assert!(e.contains("--bulk"), "{e}");
@@ -4512,6 +5533,8 @@ mod tests {
                 Ok(Code::Block(_))
             ));
             edit(&mut c, |e| {
+                // The edited answer is no longer the one its kept form (option (d)) was admitted from.
+                e.kept = Default::default();
                 if let Answer::Object(o) = &mut e.answer {
                     let word = |o: &[u8], at: usize| {
                         u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize
@@ -4927,6 +5950,431 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(e.contains("guest RAM"), "{e}");
+        }
+    }
+
+    /// The template pool's backing (cross-vCPU reuse plan, N7): its span follows the last vCPU's block and precedes guest RAM
+    /// (RAM stays the backing's last bytes, shifted by exactly the span), every vCPU maps it at `cache::POOL_VA` read-only and
+    /// never executable, and the pool starts empty and on. Without a pool nothing changes: RAM follows the last block and
+    /// the pool's address range is unmapped.
+    #[test]
+    fn the_pool_is_backed_before_guest_ram_and_mapped_read_only() {
+        let path =
+            std::env::temp_dir().join(format!("natemu-pool-backing-{}.elf", std::process::id()));
+        std::fs::write(
+            &path,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
+        let resident = path.to_str().unwrap();
+        let ram = 4usize << 20;
+        let entry = (cache::POOL_VA - PRIVATE) as usize % (1 << 30) / cache::BLOCK * 8;
+        for pool in [false, true] {
+            let b = prepare_with_pool(resident, cache::CODE_BYTES, 2, ram, pool).unwrap();
+            let span = if pool { cache::POOL_BYTES } else { 0 };
+            let (pool_offset, ram_offset) = (2 * b.stride, 2 * b.stride + span);
+            assert_eq!(b.memory.1, ram_offset + exec::ram_end(ram as u64) as usize);
+            // Guest RAM's alias starts at the end of the span, whatever is before it.
+            assert_eq!(
+                b.ram.range(0, 8).unwrap() as usize,
+                b.memory.0 as usize + ram_offset
+            );
+            assert_eq!(b.pool.is_some(), pool);
+            for v in 0..2 {
+                let window = v * b.stride;
+                let descriptor = |table: usize, index: usize| {
+                    u64::from_le_bytes(b.memory.read::<8>(window + table + index * 8))
+                };
+                // The pool's block descriptors (the first, a middle one, the last), in the window's second GiB.
+                let blocks = cache::POOL_BYTES / cache::BLOCK;
+                for k in [0, blocks / 2, blocks - 1] {
+                    let d = descriptor(exec::RAM_TABLES_OFFSET, entry / 8 + k);
+                    if !pool {
+                        assert_eq!(d, 0);
+                        continue;
+                    }
+                    assert_eq!(d & 3, 1, "a block descriptor");
+                    assert_eq!(
+                        d & 0x0000_ffff_ffe0_0000,
+                        crate::IPA + (pool_offset + k * cache::BLOCK) as u64
+                    );
+                    assert_eq!(d >> 53 & 3, 3, "never executable (PXN, UXN)");
+                    assert_eq!(d >> 6 & 3, 2, "AP: EL1 read-only, no EL0 access");
+                }
+                // Guest RAM's first block, in the third GiB, targets the shifted offset.
+                assert_eq!(
+                    descriptor(exec::RAM_TABLES_OFFSET + 4096, 0) & 0x0000_ffff_ffe0_0000,
+                    crate::IPA + ram_offset as u64
+                );
+            }
+            if let Some(p) = &b.pool {
+                let pool = p.pool();
+                assert!(pool.enabled() && pool.tail() == 0);
+                // The writer's span is the one the windows map: its first word is the switch, in the pool's first block.
+                assert_eq!(
+                    b.memory.read::<8>(pool_offset),
+                    1u64.to_le_bytes(),
+                    "the switch"
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Compiles with the real fexc (`FEXC`): the answer a vCPU compiles is published once, whichever vCPU's request used
+    /// it; the pool holds the block's code at the RIP it was admitted at with the bytes it read.
+    #[test]
+    fn answers_are_published_once_whichever_vcpu_uses_them() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let layout = natemu_abi::pool::PRODUCTION;
+        let memory = Arc::new(Memory::with_size(layout.span_bytes()).unwrap());
+        let publisher = Arc::new(crate::publisher::Publisher::new(memory, 0));
+        let answers = std::sync::OnceLock::new();
+        let compiler = |vcpu| {
+            let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            c.vcpu = vcpu;
+            c.pool = Some(publisher.clone());
+            c.share(&answers);
+            c
+        };
+        let (mut c0, mut c1) = (compiler(0), compiler(1));
+        let mut bytes = vec![0x48, 0x01, 0xd8, 0xc3];
+        bytes.resize(64, 0x90);
+        let context = 7;
+        let mut block = |c: &mut Compiler, rip| {
+            c.note_gating(context).unwrap();
+            let Code::Block(b) = c.compile(&bytes, rip, false, &mut ()).unwrap() else {
+                panic!()
+            };
+            let mask = rep_exit_mask(&b);
+            (c.publish(true, context, rip, &b, mask), b)
+        };
+        let (first, b0) = block(&mut c0, 0x40_1000);
+        let Some(Published::Done(at)) = first else {
+            panic!("{first:?}")
+        };
+        // Another vCPU's request, at another RIP of the half and page offset, is a hit of that answer: already published.
+        let (second, b1) = block(&mut c1, 0x50_1000);
+        assert_eq!(second, Some(Published::Already));
+        assert_eq!((c1.hits, c1.compiles, c0.compiles), (1, 0, 1));
+        // A request the host did not find a template (the answer is in hand, `last` set): not published, and `last` is spent.
+        let Code::Block(again) = c0.compile(&bytes, 0x40_1000, false, &mut ()).unwrap() else {
+            panic!()
+        };
+        assert!(c0.last.is_some());
+        assert_eq!(c0.publish(false, context, 0x40_1000, &again, 0), None);
+        assert!(c0.last.is_none());
+        // The same hit as a template: the answer is in the ring already (and published nowhere twice).
+        let Code::Block(again) = c0.compile(&bytes, 0x40_1000, false, &mut ()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            c0.publish(true, context, 0x40_1000, &again, 0),
+            Some(Published::Already)
+        );
+        let pool = publisher.pool();
+        let mut staging = vec![0; natemu_abi::pool::MAX_ENTRY_BYTES];
+        let e = pool.fetch(at, &mut staging).unwrap();
+        assert_eq!((e.rip, e.context, e.guest_bytes), (0x40_1000, context, b0.guest_bytes));
+        let h: natemu_abi::code_object::Header =
+            crate::relocation::read(&b0.object, 0).unwrap();
+        assert_eq!(
+            e.code,
+            &b0.object[h.code_offset as usize..][..h.code_size as usize]
+        );
+        assert!(e.prefix.len() >= 4 && e.prefix.len() < bytes.len() && e.prefix == &bytes[..e.prefix.len()]);
+        let key = natemu_abi::pool::Key::new(context, 0x7000_1000, &bytes, natemu_abi::pool::LEAD);
+        assert!(pool.probe(&key).contains(&at));
+        // Published by the admitted block at `rip`, whichever vCPU: the other RIP's block has other literals but the same size.
+        assert_eq!(b1.object.len(), b0.object.len());
+        // Gating: another vCPU's requests of the same context with other values turn the pool off (a host error under the check).
+        c1.sse_gated = true;
+        c1.check_reuse = true;
+        assert!(c1.note_gating(context).is_err());
+        assert!(publisher.is_off() && !pool.enabled());
+        let (third, _) = {
+            c1.check_reuse = false;
+            block(&mut c0, 0x60_1000)
+        };
+        assert_eq!(third, Some(Published::Skipped(crate::publisher::Why::Off)));
+    }
+
+    /// A CPL-3 CPU at `rip` as the fetch tests use.
+    fn test_cpu(rip: u64) -> Cpu {
+        Cpu {
+            gpr: [0; 16],
+            rip,
+            rflags: 2,
+            cr0: 0,
+            cr3: 0,
+            cr4: 0,
+            efer: 0,
+            cpl: 3,
+            fs_base: 0,
+            gs_base: 0,
+            cr2: 0,
+            cr8: 0,
+            dr: exec::DR_RESET,
+            seg: exec::flat_segments(3),
+            ldtr: exec::LDTR_RESET,
+            tr: exec::TR_RESET,
+            gdtr: exec::TABLE_RESET,
+            idtr: exec::TABLE_RESET,
+            mov_ss: 0,
+            xmm: [[0; 2]; 16],
+            mxcsr: exec::MXCSR_RESET,
+            fcw: exec::FCW_INIT,
+            xcr0: 1,
+        }
+    }
+
+    /// The template pool through the request path (`translation`, with the real fexc, `FEXC`): a template request is
+    /// published after its block is staged and its context's gating values are noted; a step, a block cut at a limit and a block
+    /// whose answer read to the end of the bytes are not published (a step is not even noted); a context whose gating
+    /// differs turns the pool off, or is a host error under the check mode.
+    #[test]
+    fn translation_publishes_templates_only_and_notes_gating() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let memory = Memory::with_size(exec::BACKING_BYTES + (2 << 20)).unwrap();
+        let ram =
+            unsafe { GuestRam::new(0, 2 << 20, memory.0 as u64 + exec::BACKING_BYTES as u64) };
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
+        let mut code = vec![0x48, 0x01, 0xd8, 0xc3];
+        code.resize(64, 0x90);
+        assert!(ram.copy_in(0x5000, &code) && ram.copy_in(0x5ffc, &code[..4]));
+        let fresh = || {
+            let layout = natemu_abi::pool::Layout {
+                index_slots: 64,
+                ring_bytes: 1 << 20,
+                control_bytes: 128,
+            };
+            let m = Arc::new(Memory::with_size(layout.span_bytes()).unwrap());
+            let p = Arc::new(crate::publisher::Publisher::with_layout(m, 0, layout));
+            let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            c.pool = Some(p.clone());
+            (c, p)
+        };
+        let published = |p: &crate::publisher::Publisher| {
+            let r: serde_json::Value =
+                serde_json::from_str(p.report().strip_prefix("pool ").unwrap()).unwrap();
+            r["published"].as_u64().unwrap()
+        };
+        let request = |c: &mut Compiler, rip: u64, step: bool, stop_at: Option<u64>| {
+            let mut s = State::new(0, test_cpu(rip));
+            s.fetch = [0x5000, u64::MAX];
+            let reply = translation(area, c, &mut s, step, stop_at, &mut Requests::default(), &mut ());
+            (reply.unwrap().unwrap(), s.cpu.code_context())
+        };
+        // A template: published, its context noted.
+        let (mut c, p) = fresh();
+        let (reply, context) = request(&mut c, 0x40_1000, false, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!(published(&p), 1);
+        assert!(p.gating_of(context).is_some(), "a block request notes its context's gating");
+        // A step request (its gating values are another vector's) is neither noted nor published.
+        let (mut c, p) = fresh();
+        let (reply, context) = request(&mut c, 0x40_1000, true, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!((published(&p), p.gating_of(context)), (0, None));
+        // A block cut at a limit (the stop RIP inside its bytes) is no template; the request is still noted.
+        let (mut c, p) = fresh();
+        let (reply, context) = request(&mut c, 0x40_1000, false, Some(0x40_1008));
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!(published(&p), 0);
+        assert!(p.gating_of(context).is_some());
+        // The answer read to the end of the bytes the walk gave (the block ends at its page's end, the next not walked).
+        let (mut c, p) = fresh();
+        let (reply, _) = request(&mut c, 0x40_1ffc, false, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!(published(&p), 0);
+        // The same request, the first template again: a hit published once (by whichever request reaches it first).
+        let (mut c, p) = fresh();
+        request(&mut c, 0x40_1000, false, None);
+        request(&mut c, 0x50_1000, false, None);
+        assert_eq!((published(&p), c.hits), (1, 1));
+        // Another vector under a context the pool knows: off (the reply is still the block); a host error under the check.
+        let (mut c, p) = fresh();
+        let (_, context) = request(&mut c, 0x40_1000, false, None);
+        assert!(p.note(context, &[1; GATING]) == false && p.is_off());
+        let (mut c, p) = fresh();
+        let context = test_context();
+        assert!(p.note(context, &[1; GATING]));
+        c.check_reuse = true;
+        let mut s = State::new(0, test_cpu(0x40_1000));
+        s.fetch = [0x5000, u64::MAX];
+        let e = translation(area, &mut c, &mut s, false, None, &mut Requests::default(), &mut ())
+            .err()
+            .unwrap();
+        assert!(e.contains("pool: gating values"), "{e}");
+        c.check_reuse = false;
+        c.noted.clear();
+        let (reply, _) = request(&mut c, 0x40_1000, false, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert!(p.is_off());
+        assert_eq!(published(&p), 0);
+    }
+    fn test_context() -> u64 {
+        test_cpu(0).code_context()
+    }
+
+    /// The pool's backing with guest RAM above the PC hole: the high alias is mapped at the shifted offset too, and the span
+    /// is before all RAM (only touched pages are ever backed).
+    #[test]
+    fn high_guest_ram_follows_the_pool_too() {
+        let path =
+            std::env::temp_dir().join(format!("natemu-pool-high-{}.elf", std::process::id()));
+        std::fs::write(
+            &path,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
+        let ram = exec::LOW_RAM_END as usize + (2 << 20);
+        for pool in [false, true] {
+            let b = prepare_with_pool(path.to_str().unwrap(), cache::CODE_BYTES, 1, ram, pool)
+                .unwrap();
+            let span = if pool { cache::POOL_BYTES } else { 0 };
+            let ram_offset = b.stride + span;
+            assert_eq!(b.memory.1, ram_offset + exec::ram_end(ram as u64) as usize);
+            // The high alias's first block: the third GiB table is RAM's low part, the high part starts 4 GiB up.
+            let high = (exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize;
+            let d = u64::from_le_bytes(b.memory.read::<8>(
+                exec::RAM_TABLES_OFFSET + ((high >> 30) - 1) * 4096 + (high % (1 << 30)) / cache::BLOCK * 8,
+            ));
+            assert_eq!(
+                d & 0x0000_ffff_ffe0_0000,
+                crate::IPA + (ram_offset + exec::HIGH_RAM_START as usize) as u64
+            );
+            // And the host's own view: a page written through `ram` above the hole lands there.
+            assert!(b.ram.copy_in(exec::HIGH_RAM_START, &[0x5a; 8]));
+            assert_eq!(
+                b.memory.read::<8>(ram_offset + exec::HIGH_RAM_START as usize),
+                [0x5a; 8]
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Diagnostic (not a gate): how often the resident's placement re-check ([`natemu_abi::execution::relocate_code`]) refuses a
+    /// pool entry, by reason and by how far the RIP moves, over the blocks of a real x86-64 program. Needs `FEXC` and `SURVEY_ELF`
+    /// (a static x86-64 ELF, e.g. busybox); `SURVEY_BLOCKS` blocks (default 20000):
+    /// `FEXC=... SURVEY_ELF=... cargo test -p natemu --release pool_relocation_survey -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn pool_relocation_survey() {
+        use natemu_abi::execution::{LinkPoint, MAX_LINK_POINTS, link_point, pack_reloc, refusal, relocate_code};
+        let (Some(fexc), Some(elf)) = (std::env::var_os("FEXC"), std::env::var_os("SURVEY_ELF")) else {
+            return;
+        };
+        let data = std::fs::read(elf).unwrap();
+        let u = |at: usize, n: usize| u64::from_le_bytes({
+            let mut b = [0; 8];
+            b[..n].copy_from_slice(&data[at..at + n]);
+            b
+        });
+        // The executable PT_LOAD.
+        let (phoff, phnum) = (u(32, 8) as usize, u(56, 2) as usize);
+        let (mut text, mut vaddr) = (&data[..0], 0u64);
+        for i in 0..phnum {
+            let h = phoff + 56 * i;
+            if u(h, 4) == 1 && u(h + 4, 4) & 1 != 0 {
+                let (off, va, sz) = (u(h + 8, 8) as usize, u(h + 16, 8), u(h + 32, 8) as usize);
+                if sz > text.len() {
+                    (text, vaddr) = (&data[off..off + sz], va);
+                }
+            }
+        }
+        let blocks: usize = std::env::var("SURVEY_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+        let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.cpl3 = true;
+        // Moves: [same RIP, +1 page, a library-like base, a PIE-like base]; per refusal kind and the reply checks.
+        let moves = |from: u64| [from, from + 0x1000, 0x7f12_3440_0000 + (from & 0xf_ffff), 0x5555_5555_4000 + (from & 0xfff) + (from & 0xf_f000)];
+        let names = ["same", "+1 page", "lib base", "PIE base"];
+        let mut refused = [[0u64; 6]; 4]; // by `refusal::*` (1 place, 2 literal, 3 move, 4 link); [5] the total
+        let (mut seen, mut templates, mut reply_bad, mut no_move_link) = (0u64, 0u64, 0u64, 0u64);
+        // (The program's text is compiled at a high base, as a PIE or a library runs: below 4 GiB FEX's RIP moves are the 32-bit
+        // form, which relocation refuses.)
+        let base = std::env::var("SURVEY_BASE").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0x7f12_3440_0000);
+        let (vaddr, end) = (base, base + text.len() as u64);
+        let mut rip = vaddr;
+        while seen < blocks as u64 && rip + 16 < end {
+            let at = (rip - vaddr) as usize;
+            let bytes = &text[at..text.len().min(at + 8192)];
+            let code = match c.compile(bytes, rip, false, &mut ()) {
+                Ok(Code::Block(b)) => b,
+                Ok(Code::System(s)) => {
+                    rip += u64::from(s.length.max(1));
+                    continue;
+                }
+                _ => {
+                    rip += 1;
+                    continue;
+                }
+            };
+            seen += 1;
+            let next = rip + u64::from(code.guest_bytes);
+            let last = rip.wrapping_add(u64::from(code.guest_bytes).max(1) - 1) >> 12;
+            let template = !c.halved
+                && code.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
+                && c.read < bytes.len()
+                && rip.wrapping_add(c.read.max(1) as u64 - 1) >> 12 <= last;
+            if template {
+                templates += 1;
+                let o = &code.object;
+                let h: natemu_abi::code_object::Header = crate::relocation::read(o, 0).unwrap();
+                let code_bytes = &o[h.code_offset as usize..][..h.code_size as usize];
+                let mut relocs = vec![];
+                let mut packable = h.relocs_count <= cache::MAX_RELOCS;
+                for i in 0..h.relocs_count as usize {
+                    let r: natemu_abi::code_object::Reloc = crate::relocation::read(o, h.relocs_offset as usize + 16 * i).unwrap();
+                    match pack_reloc(&r, h.code_size) {
+                        Some(p) => relocs.extend(p),
+                        None => packable = false,
+                    }
+                }
+                relocs.sort();
+                let mut links0 = [LinkPoint::NONE; MAX_LINK_POINTS];
+                links0[..code.links.len()].copy_from_slice(&code.links);
+                let word = |at: u64| u32::from_le_bytes(code_bytes[at as usize..at as usize + 4].try_into().unwrap());
+                // The resident's reply checks on the entry as published.
+                if code.links.iter().any(|p| !link_point(word, h.code_size, p))
+                    || code.dispatch_exit.is_some_and(|d| word(u64::from(d)) != natemu_abi::execution::DISPATCH_PLACEHOLDER)
+                {
+                    reply_bad += 1;
+                }
+                // Every link point has a move relocation at its offset (relocate_code requires it).
+                if code.links.iter().any(|p| !relocs.iter().any(|&r| r & natemu_abi::execution::RELOC_MOVE != 0 && (r >> 6) * 4 == p.offset)) {
+                    no_move_link += 1;
+                }
+                if packable {
+                    for (m, to) in moves(rip).into_iter().enumerate() {
+                        let mut code2 = code_bytes.to_vec();
+                        let mut links = links0;
+                        refused[m][5] += 1;
+                        if let Err(k) = relocate_code(&mut code2, &relocs, &mut links, rip, to, code.guest_bytes) {
+                            refused[m][k.min(4)] += 1;
+                        }
+                    }
+                }
+            }
+            rip = next.max(rip + 1);
+        }
+        eprintln!("{seen} blocks, {templates} templates, {reply_bad} fail the reply checks as published, {no_move_link} with a link point lacking a move relocation");
+        for (m, r) in refused.iter().enumerate() {
+            eprintln!(
+                "{:9}: of {} relocated: place {} literal {} move {} link {}",
+                names[m], r[5], r[refusal::PLACE], r[refusal::LITERAL], r[refusal::MOVE], r[refusal::LINK]
+            );
         }
     }
 

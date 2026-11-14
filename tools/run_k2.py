@@ -10,8 +10,15 @@
   run: after K2 a loop's decode exits do not grow with N. Perf chunk 17: `syscall`, one SYSCALL -> kernel -> SYSRET round trip
   from a CPL-3 loop, the kernel side shaped as Linux's (`endbr64; swapgs; ...; swapgs; 7-byte NOP; sysretq`). Perf P2:
   `verw` and `verw_null` (VERW m16 of a writable data selector, inline, and of the null one, the resident's), and
-  `syscall_verw` (the round trip with Linux's VERW before SYSRETQ in place of the NOP).
-- `rdrand`: 4,000 RDRANDs in a loop (the pool holds 32): all succeed, about one entropy refill exit per 32, values differ.
+  `syscall_verw` (the round trip with Linux's VERW before SYSRETQ in place of the NOP). The two-way L1 plan (chunk 1): the
+  way-1 hit's price, as a difference of two rows each. `l1way1` / `l1way1-ctl`: a loop of computed jumps loop -> P -> Q ->
+  loop, P and Q in one L1 set (Q in way 1: one way-1 hit per iteration) against Q in another set; `l1way1-rand` /
+  `l1way1-rand-ctl`: 128 sets each holding a pair, visited in a pseudo-random order from one dispatcher site (the way-0
+  or way-1 outcome unpredictable), against the same walk over 256 sets of one block. The report's `l1way` gives the
+  differences in ns per iteration against the plan's gate (predicted under 3 ns, unpredictable under 6 ns): a judgement
+  for the main session, not a failure here. The 6 ns is per iteration of the walk, not per way-1 hit: only about half the
+  visits are way-1 hits, and the way-0 entries of shared sets also branch unpredictably (way 0 or way 1).
+- `rdrand`: 4,000 RDRANDs in a loop (the pool holds ENTROPY_WORDS = 30): all succeed, about one entropy refill exit per 30, values differ.
 - `xmc`: cross-modifying code at a system instruction, by the x86 protocol (deterministic: see `xmc`): vCPU 1 rewrites
   one byte of X (CLI <-> NOP, CLI <-> STI, SWAPGS <-> RDTSCP, FLD m80 <-> FILD m32, CLI -> INT3) paced by vCPU 0's
   progress, then raises a flag; vCPU 0, after CPUID, must execute the new instruction (observed) every time; INT3 must be
@@ -94,6 +101,41 @@ COSTS = {
     'verw_null': ('mov word ptr [rbx], 0\nverw word ptr [rbx]', {3: DATA + 16}),
     'syscall_verw': (None, {}),
 }
+
+
+# The two-way L1 plan, chunk 1: the price of a way-1 hit. L1 sets are RIP bits 14:0, so P and P + 0x8000 share a set (two
+# ways) and P + 0x4000 does not. Each row is a function (run time: it assembles) of (body of the loop's block, registers,
+# extra program lines): the block ends in a computed jump, and `back` (the loop's `dec r8; jnz`) follows it in the code.
+L1_P, L1_S = 0x120800, 128    # first block (set 0x800); sets in the walk
+
+
+def l1way1(shared):
+    """loop -> P -> Q -> back, three computed jumps (dispatcher transits) per iteration; Q is in P's set (way 1) or not."""
+    q = L1_P + (0x8000 if shared else 0x4000)
+    body = f'mov rax, {L1_P:#x}\njmp rax'
+    back = CODE + len(ref.assemble(body))
+    blocks = {L1_P: f'mov rax, {q:#x}\njmp rax', q: f'mov rax, {back:#x}\njmp rax'}
+    return body, {}, ''.join(f'body {at:#x} {ref.assemble(text).hex()}\n' for at, text in blocks.items())
+
+
+def l1way1_rand(shared):
+    """One dispatcher site (`jmp rax`) visiting 2 * L1_S blocks in a fixed pseudo-random order from a table: pairs (block s
+    and its partner in the same set) or, as the control, all in sets of their own (the partner 0x4000 on)."""
+    import random
+    table = DATA + 0x2000
+    ats = [L1_P + 64 * k + (0x8000 if shared else 0x4000) * half for k in range(L1_S) for half in (0, 1)]
+    random.Random(1).shuffle(ats)
+    body = f'mov rax, [rsi + rcx*8]\nadd ecx, 1\nand ecx, {len(ats) - 1}\njmp rax'
+    back = CODE + len(ref.assemble(body))
+    block = ref.assemble('jmp r9').hex()
+    extra = f'memory {table:#x} {b"".join(a.to_bytes(8, "little") for a in ats).hex()}\n' + ''.join(f'body {at:#x} {block}\n' for at in ats)
+    return body, {6: table, 1: 0, 9: back}, extra
+
+
+for _name, _shared in (('l1way1', True), ('l1way1-ctl', False)):
+    COSTS[_name] = (lambda shared=_shared: l1way1(shared), None)
+for _name, _shared in (('l1way1-rand', True), ('l1way1-rand-ctl', False)):
+    COSTS[_name] = (lambda shared=_shared: l1way1_rand(shared), None)
 USER_GS, KERNEL_GS, KERNEL_RIP = 0x2a0000, 0x2b0000, 0x200000
 # The noncanonical guest-state alias: guest accesses must #GP; generated frame-relative accesses remain internal.
 # The suite selects a distant alias for these fixed-address GP controls. The actual selected-page
@@ -157,12 +199,14 @@ def cost(a, report):
     failures, rows = [], {}
     for name, (body, regs) in COSTS.items():
         if a.cost_rows and name not in a.cost_rows: continue
+        extra = ''
+        if callable(body): body, regs, extra = body()
         code = ref.assemble(f'1: {body}\ndec r8\njnz 1b') if body else None
         times, stats = {a.n: [], 2 * a.n: []}, {}
         for rep in range(a.reps + 1):
             for n in (a.n, 2 * a.n):
                 text = (f'rip {CODE:#x}\nrflags 0x2\n{gprs({8: n, **regs})}\ncode {code.hex()}\ncpl 0\nif 0\n'
-                        f'memory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n') if body else syscall_program('1: syscall\ndec r8\njnz 1b', LINUX_KERNEL_VERW if name == 'syscall_verw' else LINUX_KERNEL, {8: n})
+                        f'memory {DATA:#x} {F80_ONE.hex()}\nregion 0x3e0000 0x10000\n{extra}') if body else syscall_program('1: syscall\ndec r8\njnz 1b', LINUX_KERNEL_VERW if name == 'syscall_verw' else LINUX_KERNEL, {8: n})
                 dt, out, err = driver(a, text, a.out / 'cost' / f'{name}-{n}')
                 if out is None or out['stop'] != 'reached' or int(out['gpr'][8], 0) != 0:
                     failures.append(f"cost {name} n={n}: {err if out is None else (out['stop'], out['reason'])}")
@@ -176,7 +220,19 @@ def cost(a, report):
         rows[name] = {'us_per_iteration': statistics.median(slopes) if slopes else None, 'all': slopes, 'stats': stats}
         print(f"{name:14} {rows[name]['us_per_iteration'] or 0:9.4f} us/iter  {stats}", flush=True)
     report['cost'] = {'n': a.n, 'reps': a.reps, 'rows': rows, 'failures': failures}
+    # The two-way L1's way-1 hit: each row against its control, ns per iteration (the plan's gates: 3 predicted, 6 not).
+    delta = {}
+    for row, gate in (('l1way1', 3), ('l1way1-rand', 6)):
+        us, ctl = (rows.get(r, {}).get('us_per_iteration') for r in (row, row + '-ctl'))
+        if us is not None and ctl is not None:
+            delta[row] = {'ns_per_iteration': round(1000 * (us - ctl), 2), 'gate_ns': gate, 'within_gate': 1000 * (us - ctl) < gate, 'per': 'iteration (l1way1-rand: about half the visits are way-1 hits)' if row.endswith('rand') else 'iteration (one way-1 hit)'}
+    if delta:
+        report['cost']['l1way'] = delta
+        print('l1way', json.dumps(delta), flush=True)
     return failures
+
+
+ENTROPY_WORDS = 30   # natemu_abi ENTROPY_WORDS (30 since the pool's state-page fields; was 32)
 
 
 def rdrand(a, report):
@@ -189,7 +245,7 @@ def rdrand(a, report):
     else:
         g = [int(v, 0) for v in out['gpr']]
         st = out['stats']
-        if out['stop'] != 'reached' or g[10] != n or g[11] == 0 or not (n // 32 - 2 <= st['entropy_exits'] <= n // 32 + 2) or st['decode_exits'] > 2:
+        if out['stop'] != 'reached' or g[10] != n or g[11] == 0 or not (n // ENTROPY_WORDS - 2 <= st['entropy_exits'] <= n // ENTROPY_WORDS + 2) or st['decode_exits'] > 2:
             failures.append(f"rdrand: stop {out['stop']} {out['reason']} successes {g[10]} of {n}, or {g[11]:#x}, stats {st['entropy_exits']} entropy, {st['decode_exits']} decodes")
         report['rdrand'] = {'n': n, 'successes': g[10], 'entropy_exits': st['entropy_exits'], 'decode_exits': st['decode_exits']}
         print(report['rdrand'], flush=True)

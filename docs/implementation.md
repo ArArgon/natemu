@@ -338,7 +338,20 @@ its `est` is listed at the end of a run (update the table in `steps()`; a new st
 background` (`-e N`, about 4x slower per step, started only while they can finish before the queue drains); everything
 with a wall-clock, watchdog, kicker or run-timeout bound, and every multi-vCPU step, stays on the performance cores, and
 `ser` steps run alone. QEMU reference results are cached per program (`NATEMU_RAW_ROOT/ref-cache.sqlite`, keyed by program,
-pinned QEMU hash and the `tools/reference` sources; `NATEMU_REF_CACHE=off` forces fresh references, e.g. for a final gate).
+pinned QEMU hash and the `tools/reference` sources; `NATEMU_REF_CACHE=off` forces fresh references, e.g. for a final gate). Two more caches live
+beside it: `asm-cache.sqlite` (`tools/asmcache.py`: clang's bytes per assembly text; the fault runners assemble thousands of
+one-line programs and every shard repeated it; `NATEMU_ASM_CACHE=off`) and `qemu-cache.sqlite` (`tools/qemucache.py`: QEMU
+system-mode reference runs of K1, slice 3 and i5b by image, arguments and QEMU binary; finished runs only; a hang only for the cases listed in `QEMU_HANGS`, after two fresh timeouts (the 8 hanging
+system guests cost their 10 s on the first two runs); `NATEMU_QEMU_CACHE=off` for a final gate). The first run after a change to an image or a runner fills
+them, so its times are the old ones. Runners that run a prefix-only baseline per case (`instruction-gaps`, `frame-alias`) run
+each distinct baseline once.
+
+**The shared template pool.** On by default in `natemu` and `boot-linux` (`Boot::pool`): the host publishes admitted template
+translations into a 274 MiB read-only span below guest RAM (address space; pages are backed as touched, the ring about 256 MiB at
+most) and each vCPU's resident looks in it, by content, before asking the host; design, checks and measurements in
+`docs/restructure/cross-vcpu-reuse-plan.md`. `--pool=false` or `NATEMU_POOL=0` turns it off; `NATEMU_POOL_LOOKUP=off` keeps
+publication only; `--check-reuse` (`NATEMU_CHECK_REUSE=1`) also asks the host for every copy and compares. The program driver
+(K1) stays opt-in (`run-program --pool`).
 
 **The VM lock.** `NATEMU_RAW_ROOT/.vm.lock` is taken with BSD `flock(2)` and nothing else: Python `fcntl.flock`, the suite and
 the I/O runners, `/usr/bin/lockf -k` (macOS `lockf` is flock-based and has no shared mode) and `tools/vmlock.py` all exclude

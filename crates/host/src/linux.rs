@@ -57,6 +57,10 @@ pub struct Boot {
     pub compile_cache: compile_cache::Config,
     /// Debug: every answer used at another RIP than its own is compiled there too and must equal it (`Compiler::check_reuse`).
     pub check_reuse: bool,
+    /// Page-currency plan chunk 1: `Compiler::page_currency` (default on; `--page-currency` / `NATEMU_PAGE_CURRENCY`).
+    pub page_currency: u64,
+    /// Fault-around plan chunk 1: `Compiler::writable_on_read` (default on; `--writable-on-read` / `NATEMU_WRITABLE_ON_READ`).
+    pub writable_on_read: bool,
     /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
     pub code_shape: bool,
     /// PCID plan P1 (owner, November 5): turn on the resident's page-walk speculation barriers. Off by default; on, the
@@ -69,6 +73,11 @@ pub struct Boot {
     pub disk: Option<PathBuf>,
     /// Expose the virtio-MMIO network device on user-mode NAT ([`crate::virtio::Slirp`]).
     pub net: bool,
+    /// The shared template pool (cross-vCPU reuse plan): back a read-only span of about 274 MiB of address space before guest
+    /// RAM (pages are backed as touched), map it into every vCPU, publish admitted templates into it and let each resident look
+    /// in it before asking the host. On by default (the gate passed, November 14: configure -3.3%, make -1.8% wall);
+    /// `--pool=false` / `NATEMU_POOL=0` turn it off.
+    pub pool: bool,
 }
 
 impl Boot {
@@ -91,11 +100,14 @@ impl Boot {
             stop_at: None,
             compile_cache: compile_cache::Config::OFF,
             check_reuse: false,
+            page_currency: exec::cache::PAGES_ON,
+            writable_on_read: true,
             code_shape: false,
             speculation_barriers: false,
             rng: false,
             disk: None,
             net: false,
+            pool: true,
         }
     }
 
@@ -114,11 +126,12 @@ impl Boot {
         };
         layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
         require_vcpus(self.vcpus)?;
-        let backing = execution::prepare(
+        let backing = execution::prepare_with_pool(
             &self.runtime.to_string_lossy(),
             self.code_bytes,
             self.vcpus,
             self.ram as usize,
+            self.pool,
         )?;
         let mut manifest = Vec::new();
         if self.rng {
@@ -210,6 +223,8 @@ impl Boot {
             watchdog: self.watchdog,
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
+            page_currency: self.page_currency,
+            writable_on_read: self.writable_on_read,
             code_shape: self.code_shape,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
@@ -240,6 +255,8 @@ pub struct Prepared {
     watchdog: Duration,
     compile_cache: compile_cache::Config,
     check_reuse: bool,
+    page_currency: u64,
+    writable_on_read: bool,
     code_shape: bool,
     /// [`Prepared::run`] has started: the backing is used.
     ran: AtomicBool,
@@ -405,8 +422,11 @@ impl Prepared {
             compiler.disk = compile_cache::shared(&self.fexc, &self.compile_cache)?; // P3: the persistent compile cache
             compiler.perf = crate::perf::Recorder::new(v, start)?;
             compiler.vcpu = v as u8;
+            compiler.pool = backing.pool.clone();
             compiler.share(&answers);
             compiler.check_reuse = self.check_reuse;
+            compiler.page_currency = self.page_currency;
+            compiler.writable_on_read = self.writable_on_read;
             compiler.shape = self.code_shape;
             let mut requests = execution::Requests {
                 devices: Some(self.devices.clone()),
@@ -470,6 +490,14 @@ impl Prepared {
                     duplicates: compiler.duplicates,
                     lock_wait: compiler.lock_wait.into(),
                     recompiled: compiler.recompiled,
+                    admissions: crate::execution::why::NAMES
+                        .into_iter()
+                        .zip(&compiler.admissions)
+                        .map(|(k, n)| (k, n.get()))
+                        .collect(),
+                    pool: execution::K1Pool::new(
+                        &area.read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL),
+                    ),
                 };
                 match log.finish(
                     end,
@@ -559,6 +587,9 @@ impl Prepared {
         });
         if let Some(a) = answers.get() {
             crate::perf::line(&a.report());
+        }
+        if let Some(p) = &backing.pool {
+            crate::perf::line(&p.report());
         }
         if crate::perf::on() {
             crate::perf::line(&backing.io_window_counts().perf_line());
@@ -762,6 +793,10 @@ struct VcpuState {
     duplicates: u64,
     lock_wait: [u64; 2],
     recompiled: [u64; 2],
+    /// Object answers by why they were admitted again or not ([`execution::why`]; their sum is every object answer).
+    admissions: crate::report::Members<&'static str, u64>,
+    /// The template pool's lookups, copies and refusals (cross-vCPU reuse plan chunk 3; zero without a pool).
+    pool: execution::K1Pool,
 }
 
 #[cfg(test)]
@@ -803,6 +838,8 @@ mod report_tests {
             duplicates: next(),
             lock_wait: [next(), next()],
             recompiled: [next(), next()],
+            admissions: [("skipped", 1), ("fresh", 2)].into_iter().collect(),
+            pool: Default::default(),
         };
         let old = format!(
             "{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"invalidations\":{},\"steps\":{},\"shootdowns\":{},\"systems\":{},\"halts\":{},\"interrupts\":{},\"deliveries\":{},\"stops\":{},\"shadow_resets\":{},\"compiles\":{},\"hits\":{},\"disk_hits\":{},\"relocated\":{},\"relocation_refused\":{},\"relocation_fallbacks\":{},\"reuse_checks\":{},\"hits_by_source\":{:?},\"duplicates\":{},\"lock_wait\":[{},{}],\"recompiled\":[{},{}]}}",
@@ -838,7 +875,9 @@ mod report_tests {
             v.recompiled[0],
             v.recompiled[1]
         );
-        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        let mut old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        old["admissions"] = serde_json::json!({"skipped": 1, "fresh": 2});
+        old["pool"] = serde_json::json!({"probes": 0, "hits": 0, "candidates": 0, "refused": {}, "recheck": {}});
         assert_eq!(old, serde_json::to_value(&v).unwrap());
     }
 }

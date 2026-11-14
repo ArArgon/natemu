@@ -113,7 +113,7 @@ fn invalidate_page(memory: &Memory, page: usize, n: usize) {
 
 /// Clears every vCPU's code mark for `page` at once; returns the vCPUs that had one. The common
 /// unmarked case only loads the shared word.
-fn clear_marks(memory: &Memory, page: usize) -> cache::CpuMask {
+pub(super) fn clear_marks(memory: &Memory, page: usize) -> cache::CpuMask {
     let (index, shift) = cache::mask_location(page);
     let mask = global_u64(memory, cache::CODE_PAGES + index * 8);
     if cache::mask_peers(mask.load(SeqCst), shift) == 0 {
@@ -127,7 +127,7 @@ fn clear_marks(memory: &Memory, page: usize) -> cache::CpuMask {
 
 /// Posts `page` to each vCPU in `peers` as the resident's `post` does: stale bit, then summary
 /// bit, then `PAGES` (its drain relies on that order). The caller kicks, if needed, afterwards.
-fn post_page(memory: &Memory, page: usize, peers: cache::CpuMask, n: usize) {
+pub(super) fn post_page(memory: &Memory, page: usize, peers: cache::CpuMask, n: usize) {
     for v in (0..n).filter(|v| peers & (1 << v) != 0) {
         record_word(memory, v, Some(page / 64)).fetch_or(1 << (page % 64), SeqCst);
         let summary = cache::RECORDS
@@ -897,6 +897,7 @@ pub(crate) mod tests {
             epoch: 0,
             io_epoch: Mutex::new(0),
             io_counts: WindowCounters::default(),
+            pool: None,
         }
     }
     fn read(b: &Backing, at: usize, len: usize) -> Vec<u8> {

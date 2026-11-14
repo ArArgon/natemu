@@ -379,6 +379,29 @@ mod tests {
             })
         );
     }
+    /// Fault-around plan chunk 1: a READ walk hands over what the install rule needs: `writable` is exactly the grant of a write walk (every
+    /// level's R/W, or WP = 0 at CPL 0) and `dirty` is the leaf's D as it was (a read sets only A). Every combination of the four levels'
+    /// R/W, the leaf's D, WP and CPL against a write walk of the same tables.
+    #[test]
+    fn read_walk_reports_the_write_grant_and_d() {
+        for bits in 0u32..128 {
+            let rw = |k: u32| bits >> k & 1 != 0;
+            let (mut m, mut c) = setup();
+            for (slot, k) in [(0, 0), (512, 1), (1024, 2), (1792, 3)] {
+                m.0[slot] = (m.0[slot] & !2) | u64::from(rw(k)) << 1;
+            }
+            m.0[1792] = (m.0[1792] & !0x40) | u64::from(rw(4)) << 6;
+            (c.wp, c.cpl) = (u64::from(rw(5)), if rw(6) { 3 } else { 0 });
+            let all = rw(0) && rw(1) && rw(2) && rw(3);
+            let grant = all || (c.cpl == 0 && c.wp == 0);
+            let leaf = m.0[1792];
+            let read = walk(&mut m, c, 0x100000, Access::Read, true).unwrap();
+            assert_eq!(read.writable, grant, "{bits:#b}");
+            assert_eq!(read.dirty, rw(4), "{bits:#b}");
+            assert_eq!(m.0[1792], leaf | 0x20, "a read sets A and nothing else: {bits:#b}");
+            assert_eq!(walk(&mut m, c, 0x100000, Access::Write, true).is_ok(), grant, "{bits:#b}");
+        }
+    }
     #[test]
     fn reserved_nx_smep_and_nonpresent() {
         let (mut m, mut c) = setup();

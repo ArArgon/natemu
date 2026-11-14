@@ -242,17 +242,23 @@ pub mod cache {
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
     pub const DISPATCH_SLOT_BYTES: usize = 32;
     pub const DISPATCH_SLOTS: usize = DISPATCH_BYTES / DISPATCH_SLOT_BYTES;
-    /// L1 as code: [`L1_TABLES`] tables of direct-mapped entries of [`L1_ENTRY_BYTES`] indexed by `rip & L1_MASK` (FEX
-    /// `L1Pointer/L1Mask`), so the dispatcher reads no data. A filled entry is `movz/movk x2, #rip` (4 words); `sub x2, x2,
-    /// x0`; `cbnz x2, +8`; `b entry`; `b miss`; an empty one starts with `b miss`. Only the resident writes them. Each
-    /// table holds entries of one code context ([`Control::l1_contexts`]); the dispatcher's `adrp` names the current one
-    /// (perf chunk 5: a CPL change switches tables instead of clearing one). Perf chunk 19: [`L1_BITS`] RIP bits index a
-    /// table (12 before: most misses were two hot RIPs at the same page offset).
+    /// L1 as code: [`L1_TABLES`] tables of two-way sets (FEX `L1Pointer/L1Mask`), so the dispatcher reads no data. A set is
+    /// [`L1_WAYS`] entries of [`L1_ENTRY_BYTES`], indexed by `rip & L1_SET_MASK` ([`L1_SET_BITS`] RIP bits; the L1 two-way
+    /// plan: the same 2 MiB per table as 2^16 direct-mapped entries). A filled entry is `movz/movk x2, #rip` (4 words);
+    /// `sub x2, x2, x0`; `cbnz x2, +8` (way 0: `+12`, to way 1); `b entry`; `b miss` (way 0: `b way 1`); an empty way 1
+    /// starts with `b miss`, an empty way 0 with `b way 1`. Only the resident writes them. Each table holds entries of one
+    /// code context ([`Control::l1_contexts`]); the dispatcher's `adrp` names the current one (perf chunk 5: a CPL change
+    /// switches tables instead of clearing one). Perf chunk 19: 16 RIP bits indexed a direct-mapped table (12 before: most
+    /// misses were two hot RIPs at the same page offset); now 15 index a set of two.
     pub const L1_CODE: usize = DISPATCH + DISPATCH_BYTES;
-    pub const L1_BITS: u32 = 16;
-    pub const L1_ENTRIES: usize = 1 << L1_BITS;
-    pub const L1_MASK: u64 = L1_ENTRIES as u64 - 1;
+    pub const L1_SET_BITS: u32 = 15;
+    pub const L1_WAYS: usize = 2;
+    pub const L1_SETS: usize = 1 << L1_SET_BITS;
+    pub const L1_SET_MASK: u64 = L1_SETS as u64 - 1;
+    /// Slots (entries) per table: slot `2 * set + way`; the owner and list arrays are indexed by slot.
+    pub const L1_ENTRIES: usize = L1_SETS * L1_WAYS;
     pub const L1_ENTRY_BYTES: usize = 32;
+    pub const L1_SET_BYTES: usize = L1_WAYS * L1_ENTRY_BYTES;
     pub const L1_TABLES: usize = 4;
     pub const L1_TABLE_BYTES: usize = L1_ENTRIES * L1_ENTRY_BYTES;
     /// [`Control::l1_contexts`]: a table that holds no context's entries (it is cleared before it takes one).
@@ -275,9 +281,14 @@ pub mod cache {
     pub const META_VA: u64 = PRIVATE + 0x2800_0000;
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = (PIC_FRAMES + 16 * PIC_FRAME_ENTRIES).next_multiple_of(BLOCK);
+    pub const LOOKUP_BYTES: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + (1 << 30);
     pub const GLOBAL_BYTES: usize = (TABLE_PAGES + TABLE_PAGE_BYTES).next_multiple_of(BLOCK);
+    /// The template pool ([`crate::pool`], cross-vCPU reuse plan chunk 2): one span shared by all vCPUs like the global
+    /// area, written by the host only and mapped EL1 read-only, in the window's room between the global area and the
+    /// guest-RAM alias. In the backing it follows the last vCPU's block and precedes guest RAM (the host's `prepare`).
+    pub const POOL_VA: u64 = PRIVATE + 0x6000_0000;
+    pub const POOL_BYTES: usize = crate::pool::PRODUCTION.span_bytes();
     /// Mapping granule of the areas.
     pub const BLOCK: usize = 2 * MIB;
 
@@ -298,6 +309,72 @@ pub mod cache {
     /// once). A CR3 load leaves every global block current, so these are the only entries it may have to empty.
     pub const L1_LISTS: usize = L1_OWNERS + 4 * L1_ENTRIES * L1_TABLES;
     pub const L1_LISTED: u32 = 1 << 31;
+    /// Kept in way 0's owner word only: the set's next victim is way 1 (fill-order replacement; a hint for performance,
+    /// never a condition of correctness). Every raw read of an owner word masks [`L1_FLAGS`].
+    pub const L1_NEXT: u32 = 1 << 30;
+    pub const L1_FLAGS: u32 = L1_LISTED | L1_NEXT;
+    /// The slots of the set `rip` indexes: (way 0, way 1).
+    pub const fn l1_slots_of(rip: u64) -> (usize, usize) {
+        let set = (rip & L1_SET_MASK) as usize;
+        (set * L1_WAYS, set * L1_WAYS + 1)
+    }
+    /// An L1 entry's `b` from `from` to `to` (code-area offsets).
+    const fn l1_branch(from: u64, to: u64) -> u32 {
+        0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
+    }
+    /// The words of slot `slot`'s entry at code-area offset `at` for `rip`, entering `entry`: `movz/movk x2, #rip; sub x2,
+    /// x2, x0; cbnz x2, next; b entry; b next` where way 1's `next` is the dispatcher's miss (`miss`: a `b`, as the tables
+    /// lie beyond `cbnz`'s +-1 MiB) and way 0's is way 1, the entry 32 bytes on (so `cbnz` is `+12`, and word 7 is a landing
+    /// never reached).
+    pub const fn l1_words(slot: usize, at: u64, rip: u64, entry: u64, miss: u64) -> [u32; 8] {
+        const fn half(rip: u64, k: u32) -> u32 {
+            ((rip >> (16 * k)) & 0xffff) as u32
+        }
+        let way0 = slot % L1_WAYS == 0;
+        [
+            0xd280_0002 | half(rip, 0) << 5,
+            0xf2a0_0002 | half(rip, 1) << 5,
+            0xf2c0_0002 | half(rip, 2) << 5,
+            0xf2e0_0002 | half(rip, 3) << 5,
+            0xcb00_0042,
+            0xb500_0002 | (if way0 { 3 } else { 2 }) << 5,
+            l1_branch(at + 24, entry),
+            if way0 {
+                l1_branch(at + 28, at + L1_ENTRY_BYTES as u64)
+            } else {
+                l1_branch(at + 28, miss)
+            },
+        ]
+    }
+    /// The first word of an empty slot: way 0 chains to way 1, way 1 branches to the dispatcher's miss.
+    pub const fn l1_empty_word(slot: usize, at: u64, miss: u64) -> u32 {
+        l1_branch(at, if slot % L1_WAYS == 0 { at + L1_ENTRY_BYTES as u64 } else { miss })
+    }
+    /// RIP bit 15 of a filled entry from its first word, `movz x2, #rip[15:0]` (imm16 in bits 20:5).
+    pub const fn l1_word_rip15(first: u32) -> bool {
+        first >> 20 & 1 != 0
+    }
+    /// What [`l1_fill`] decided: the way to write, whether the block is there already (no write but the code check), and
+    /// whether the set's [`L1_NEXT`] flips.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct L1Fill {
+        pub way: usize,
+        pub there: bool,
+        pub victim: bool,
+    }
+    /// Fill of the set whose ways' raw owner words are `o0`, `o1` (flags included) with the block whose owner number is
+    /// `block` (number + 1, never 0): a way already holding it (so no block is in both ways); else an empty way 0, an
+    /// empty way 1; else the victim way 1 if way 0's word has [`L1_NEXT`], else way 0, and `victim`: the bit flips.
+    pub const fn l1_fill(o0: u32, o1: u32, block: u32) -> L1Fill {
+        let (b0, b1) = (o0 & !L1_FLAGS, o1 & !L1_FLAGS);
+        if b0 == block || b1 == block {
+            L1Fill { way: (b0 != block) as usize, there: true, victim: false }
+        } else if b0 == 0 || b1 == 0 {
+            L1Fill { way: (b0 != 0) as usize, there: false, victim: false }
+        } else {
+            L1Fill { way: (o0 & L1_NEXT != 0) as usize, there: false, victim: true }
+        }
+    }
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
     pub const L2: usize = (L1_LISTS + 4 * L1_ENTRIES * L1_TABLES).next_multiple_of(0x1_0000);
     pub const L2_ENTRIES: usize = 1 << 21;
@@ -308,11 +385,31 @@ pub mod cache {
     /// Link records ([`LinkRecord`]), one per patched link point; a full area drops links (`cache::link`). Perf chunk 11:
     /// one per block of the index (64 Ki before): the `build` benchmark's metadata arena fills (about 238 Ki blocks) before
     /// it does, while 64 Ki filled with links into current kernel blocks. Perf chunk 23: kept at 256 Ki when the index
-    /// doubled (`build` N = 1 then fills it twice a run, each fill amortised as above).
+    /// doubled (`build` N = 1 then fills it twice a run, each fill amortised as above). Chunk 1b: 512 Ki (a CPython `make -j4`
+    /// reclaimed about 100 times per vCPU, undoing 71 M links, at 256 Ki).
     pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
-    pub const MAX_LINKS: usize = 256 * 1024;
+    pub const MAX_LINKS: usize = 512 * 1024;
+    /// Least test-only link capacity ([`Control::link_cap`]): a full area must free at least a quarter of itself again.
+    pub const MIN_LINK_CAP: usize = 4096;
+    /// The record area's effective capacity: [`Control::link_cap`] if set (by the host's `NATEMU_LINK_CAP`, K1's `link-full`
+    /// only) and within [`MIN_LINK_CAP`]..=[`MAX_LINKS`], else [`MAX_LINKS`] (0: unset; the host rejects the rest).
+    pub const fn link_cap(field: u64) -> usize {
+        if field >= MIN_LINK_CAP as u64 && field <= MAX_LINKS as u64 {
+            field as usize
+        } else {
+            MAX_LINKS
+        }
+    }
+    /// The linker finds the area full when a block's links (at most [`super::MAX_LINK_POINTS`]) no longer fit in `cap`.
+    pub const fn links_full(links: usize, cap: usize) -> bool {
+        links + super::MAX_LINK_POINTS > cap
+    }
+    /// After the local links go, every link goes too when more than this many remain (less than a quarter of `cap` free).
+    pub const fn reclaim_floor(cap: usize) -> usize {
+        cap - cap / 4
+    }
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
-    pub const STEP_RECORD: usize = LINKS + 16 * MAX_LINKS;
+    pub const STEP_RECORD: usize = LINKS + core::mem::size_of::<LinkRecord>() * MAX_LINKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;
     /// M1: this vCPU's summaries of the code-page and writable mask words it set bits in (bit i % 64 of u64 i / 64: word
     /// i of the mask may hold its bits), so clearing its bits visits only those words, not all of guest RAM's (only the
@@ -338,6 +435,9 @@ pub mod cache {
     /// source page, by a hash of the frame ([`PIC_FRAME_ENTRIES`] of {frame page + 1 (u32), epoch's low 32 bits, linear page}).
     pub const PIC_FRAMES: usize = HINTS + 4 * HINT_ENTRIES;
     pub const PIC_FRAME_ENTRIES: usize = 1 << 16;
+    /// Page-currency plan: the vCPU's record of fetch-walk results ([`crate::page_study::ENTRIES`] records of 32 bytes, 256
+    /// KiB), after the PIC study's frames. Written by a `page-study` resident only (chunk 0); untouched, so unbacked, otherwise.
+    pub const PAGE_STAMPS: usize = PIC_FRAMES + 16 * PIC_FRAME_ENTRIES;
 
     /// Global area layout, shared by all vCPUs and updated only by atomic read-modify-writes (host and resident): one
     /// shadow-reset counter (u64) per vCPU and the per-vCPU [`Events`] in its first 64 KiB; then the per-page structures,
@@ -446,6 +546,9 @@ pub mod cache {
         pub const AFTER_PRECHECK: u64 = 10;
         pub const BEFORE_RECHECK: u64 = 11;
         pub const BEFORE_PUBLISH: u64 = 12;
+        /// The fast miss path's entry (fast-miss plan section 5): before its checks, with the target and the state record as the
+        /// miss left them.
+        pub const MISS_FAST_CHECK: u64 = 13;
         const _: () = assert!(BASE + (HOST + 1) * STRIDE <= super::CODE_PAGES);
     }
 
@@ -513,7 +616,9 @@ pub mod cache {
         /// K1: CNTVCT ticks spent in TLB flushes (`cache::tlb`) and INVLPGs (shadows and blocks).
         pub tlb_ticks: u64,
         pub invlpg_ticks: u64,
-        /// K1: #PFs delivered (each invalidates its page's blocks) and their ticks; blocks visited on linear chains.
+        /// K1: #PFs delivered (each invalidates its page's blocks) and their ticks; blocks visited on linear chains and
+        /// link records visited by `cache::prune`'s passes (a block's death never makes one: it undoes its links out by its
+        /// outbound list).
         pub page_faults: u64,
         pub page_fault_ticks: u64,
         pub scanned: u64,
@@ -549,7 +654,7 @@ pub mod cache {
         pub flush_ticks: u64,
         pub full: [u64; 3],
         pub peak: [u64; 3],
-        /// Perf chunk 8: the link records' segments. `[0, links_cr3)` are links from another page into non-global targets
+        /// Perf chunk 8: the link records' segments (relink plan: after the suspended ones, `links_susp`, below). `[links_susp, links_cr3)` are links from another page into non-global targets
         /// (a CR3 load looks at them), `[links_cr3, links_tlb)` from another page into [`GLOBAL`] targets (every other
         /// TLB event looks at both), `[links_tlb, links_local)` local links: each linear page of the target is a page of the
         /// source translated from the same guest-physical page (only a death or a flush looks at them); PIC study stage 3:
@@ -564,7 +669,7 @@ pub mod cache {
         pub fetched: u64,
         /// Perf chunk 8: the link records found full, so the local links into blocks not current were undone (as every link
         /// into them was before chunk 8), and how many; since perf chunk 11 every link is undone too when that leaves less
-        /// than a quarter of [`MAX_LINKS`] free (counted with them).
+        /// than a quarter of the capacity ([`MAX_LINKS`], or `link_cap`) free (counted with them).
         pub reclaims: u64,
         pub reclaimed: u64,
         /// Perf chunk 10, reuse inside the resident, set by the host before the vCPU runs: [`REUSE_OFF`], [`REUSE_ON`] or
@@ -647,7 +752,181 @@ pub mod cache {
         /// (four, packed); `trip_count` counts them all. The host prints them at the vCPU's end.
         pub trip: [[u64; 8]; TRIP_ENTRIES],
         pub trip_count: u64,
+        /// Dispatch study counters (`dispatch-study` resident builds only, zero otherwise; [`L1_EVICTED`] and the rest). Appended.
+        pub l1_counts: [u64; L1_COUNTS],
+        /// K1 `link-full` only (the host's `NATEMU_LINK_CAP`, set before the vCPU runs): the link record area's capacity
+        /// ([`link_cap`]); 0: [`MAX_LINKS`]. Appended.
+        pub link_cap: u64,
+        /// CTR_EL0, read once by the resident at start-up (`cache::read_ctr_el0`) for code synchronization. Appended.
+        pub ctr_el0: u64,
+        /// Page-currency chunk 0 (`page-study` resident builds only, zero otherwise; [`crate::page_study::Counts`]). Appended.
+        pub page_study: crate::page_study::Counts,
+        /// Template pool (cross-vCPU reuse plan, chunk 3), set by the host before the vCPU runs: [`POOL_OFF`] or [`POOL_ON`]
+        /// (the resident asks the pool, mapped at [`POOL_VA`], after its own hint table found no template and before it asks
+        /// the host), and the span's [`crate::pool::Layout`] (index slots, ring bytes, control granule). Appended.
+        pub pool: u64,
+        pub pool_layout: [u64; 3],
+        /// Pool lookups made (a block request the vCPU's own hint table could not serve), blocks copied from an entry, and
+        /// refusals by [`pool_refusal`] (an entry found and refused, or none found).
+        pub pool_probes: u64,
+        pub pool_hits: u64,
+        pub pool_refused: [u64; pool_refusal::COUNT],
+        /// Pool candidates examined (entries copied and checked; a lookup may examine several), and the refusals for
+        /// [`pool_refusal::RECHECK`] by [`pool_recheck`] reason, at the same RIP the entry was published at or another, for
+        /// user (CPL 3) or kernel context: index `reason * 4 + same * 2 + user`.
+        pub pool_candidates: u64,
+        pub pool_recheck: [u64; pool_recheck::COUNT * 4],
+        /// Page-currency plan chunk 1, set by the host before the vCPU runs (`--page-currency`): [`PAGES_OFF`] (every fetch walk
+        /// is a walk), [`PAGES_ON`] (the per-vCPU record of fetch-walk results answers them, [`crate::page_study`]),
+        /// [`PAGES_CHECK`] (the record answers and the walk is made too, a difference counted) or [`PAGES_CHECK_HALT`] (and halts
+        /// [`super::stop::PAGE_CHECK`]). Appended.
+        pub pages: u64,
+        /// Plain counters of the page record (all modes; `walks` only where the record did not answer): fetch walks made for a
+        /// revalidation or a placement, record hits (a block revalidated from the record counts one per page), check-mode
+        /// differences between the record's answer and the walk's, and 2 MiB leaves not recorded (not inside one RAM region).
+        /// Appended.
+        pub page_walks: u64,
+        pub page_hits: u64,
+        pub page_disagree: u64,
+        pub page_split_2m: u64,
+        /// Fast miss path (fast-miss plan chunks 1-2): dispatcher misses served from the exit's frame (`fast_taken`),
+        /// and the ones it declined, by reason ([`fast_decline`]). Plain increments, in every build. Appended.
+        pub fast_taken: u64,
+        pub fast_declined: [u64; fast_decline::COUNT],
+        /// Set by the host from `NATEMU_MISS_FAST=off` (for A/B measurement only; zero, the default, is on): the fast miss path is
+        /// never tried (nothing counted). Appended.
+        pub miss_fast_off: u64,
+        /// Fault-around plan chunk 1, set by the host (`--writable-on-read`, `NATEMU_WRITABLE_ON_READ`; zero, the default, is on):
+        /// nonzero turns off installing a shadow writable at a demand read (a read installs read-only, as before the chunk).
+        /// Appended.
+        pub writable_on_read_off: u64,
+        /// Relink plan, step 1 (docs/restructure/relink-plan.md): linker entries that made a link into a target the search found
+        /// current as it was (it neither revalidated nor placed a block): the upper bound on the traps relink-on-revalidation can
+        /// save (first links are in it). `linked_current_ticks`: those entries' `link` bucket ticks (written by `perf` residents
+        /// only). Plain counters in every build. Appended.
+        pub linked_current: u64,
+        pub linked_current_ticks: u64,
+        /// Relink plan, step 2: the suspension segment's end. The link records are five segments in this order:
+        /// `[0, links_susp)` suspended (a CR3 load or global flush restored the word and kept the record, on its target's inbound
+        /// list: relinked when a revalidation makes the target current again), then `[links_susp, links_cr3)`, `[links_cr3,
+        /// links_tlb)`, `[links_tlb, links_local)` and `[links_local, links)` as the fields above say. Appended.
+        pub links_susp: u64,
+        /// Records suspended (restored at a TLB event, kept), relinked (patched again at a revalidation) and dropped by a
+        /// relink (source dead, or its word no longer in its admitted form). Plain counters in every build. Appended.
+        pub suspended: u64,
+        pub relinked: u64,
+        pub relink_dropped: u64,
     }
+    /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
+    pub mod pool_recheck {
+        /// The entry's link point is not an exit of its code as admitted ([`super::super::link_point`]).
+        pub const LINK_POINT: usize = 0;
+        /// The computed exit's word is not the dispatcher placeholder.
+        pub const PLACEHOLDER: usize = 1;
+        /// [`super::super::relocate_code`]: another half or page offset, or a non-canonical RIP or block end.
+        pub const PLACE: usize = 2;
+        /// A literal slot outside the code or a non-canonical new value.
+        pub const LITERAL: usize = 3;
+        /// A guest-RIP move relocate_move refuses (its form, value or word count) or outside the code.
+        pub const MOVE: usize = 4;
+        /// A link point no move rewrote, or one that is no link point after.
+        pub const LINK: usize = 5;
+        pub const COUNT: usize = 6;
+        pub const NAMES: [&str; COUNT] = ["link_point", "placeholder", "place", "literal", "move", "link"];
+    }
+    /// [`Control::pool`].
+    pub const POOL_OFF: u64 = 0;
+    pub const POOL_ON: u64 = 1;
+    /// Why a pool lookup served nothing ([`Control::pool_refused`]); each candidate entry counts once, a lookup that found no
+    /// slot counts [`NO_SLOT`](pool_refusal::NO_SLOT) once.
+    pub mod pool_refusal {
+        /// No slot of any lead length had the key's tag.
+        pub const NO_SLOT: usize = 0;
+        /// An entry whose key is not the request's (a tag collision, or another context, half or page offset).
+        pub const KEY: usize = 1;
+        /// An entry whose prefix is not the guest's bytes now (or whose second page's walk failed).
+        pub const BYTES: usize = 2;
+        /// The entry was overwritten (below the ring's tail after the copy).
+        pub const OVERWRITTEN: usize = 3;
+        /// An instruction breakpoint is armed or the stop RIP or a host fence lies in the bytes the host would fetch.
+        pub const FENCED: usize = 4;
+        /// The re-check refused: the entry's link points, computed exit or relocations ([`super::super::relocate_code`]).
+        pub const RECHECK: usize = 5;
+        /// The copy decodes to no entry, or its header repeats another position, or its second page is not the block's.
+        pub const MALFORMED: usize = 6;
+        /// The pool's switch was off (the host's gating tripwire).
+        pub const OFF: usize = 7;
+        /// The cache was flushed meanwhile (pending invalidations taken at the lookup moved the generation). A write to the
+        /// pages posted after their mark is not this: it is caught after the placement by `kept`'s check that the mark is
+        /// still set.
+        pub const STALE: usize = 8;
+        pub const COUNT: usize = 9;
+        pub const NAMES: [&str; COUNT] = [
+            "no_slot",
+            "key",
+            "bytes",
+            "overwritten",
+            "fenced",
+            "recheck",
+            "malformed",
+            "off",
+            "stale",
+        ];
+    }
+    /// [`Control::pages`].
+    pub const PAGES_OFF: u64 = 0;
+    pub const PAGES_ON: u64 = 1;
+    pub const PAGES_CHECK: u64 = 2;
+    pub const PAGES_CHECK_HALT: u64 = 3;
+    /// Why the fast miss path declined a dispatcher miss ([`Control::fast_declined`]'s indices; the resident then serves it
+    /// as it always did).
+    pub mod fast_decline {
+        /// A debug trap, TF or an armed breakpoint (DR7) is in play.
+        pub const DEBUG: usize = 0;
+        /// A MOV SS / STI shadow, a REP boundary, a plain step or a wanted stop (a boundary that owes work).
+        pub const BOUNDARY: usize = 1;
+        /// Posted invalidations, a flush or shadows request (`cache::pending` in the resident).
+        pub const PENDING: usize = 2;
+        /// An I/O window request this vCPU has not acknowledged.
+        pub const IO: usize = 3;
+        /// A LAPIC expiry due or a reinjection backlog.
+        pub const LAPIC: usize = 4;
+        /// An event this boundary may take.
+        pub const EVENT: usize = 5;
+        /// An uncached (UC) shadow awaiting its end-of-instruction barrier.
+        pub const UNCACHED: usize = 6;
+        /// A test mode (`pic_test`) or a study build that counts every miss.
+        pub const STUDY: usize = 7;
+        /// No block for the target (it needs a translation), or none current whose page records say it is mapped.
+        pub const NO_BLOCK: usize = 8;
+        /// A block of the target not current whose pages the page record does not all hold (a walk is owed).
+        pub const UNKNOWN: usize = 9;
+        /// The target is a kept system-instruction decode (the full path executes it).
+        pub const SYSTEM: usize = 10;
+        /// The target is the single-instruction step block.
+        pub const STEP: usize = 11;
+        pub const COUNT: usize = 12;
+        pub const NAMES: [&str; COUNT] = [
+            "debug", "boundary", "pending", "io", "lapic", "event", "uncached", "study", "no_block", "unknown", "system", "step",
+        ];
+    }
+    /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
+    pub const L1_EVICTED: usize = 0;
+    /// `fill_l1` entered nothing because the table's context is not the block's.
+    pub const L1_SKIPPED: usize = 1;
+    /// Dispatcher misses by the two ways of the RIP's set in the current table: one of them an entry for this RIP (should
+    /// not happen; [`MISS_SAME`]), else a way empty ([`MISS_EMPTY`]), else both holding other blocks' entries
+    /// ([`MISS_OTHER`]: the set's conflict),
+    pub const MISS_EMPTY: usize = 2;
+    pub const MISS_OTHER: usize = 3;
+    pub const MISS_SAME: usize = 4;
+    /// or the table serves another code context than the guest's (its entry says nothing).
+    pub const MISS_CONTEXT: usize = 5;
+    /// (`perf` builds and above: one increment per replacement.) `fill_l1` replaced a way whose RIP differs from the filled
+    /// RIP in bit 15 alone among bits 15:0: a conflict the 16-bit direct-mapped index did not have, found in the set's
+    /// 15-bit index. Read from the victim's first word (`movz x2, #rip[15:0]`), a line the fill writes anyway.
+    pub const L1_NEW_CONFLICT: usize = 6;
+    pub const L1_COUNTS: usize = 7;
     pub const PIC_TEST_AND: u64 = 1;
     pub const PIC_TEST_STR: u64 = 2;
     pub const PIC_TEST_BODY: u64 = 3;
@@ -746,7 +1025,13 @@ pub mod cache {
         pub links: [super::LinkPoint; super::MAX_LINK_POINTS],
         /// PIC study stage 3: an [`INSTANCE`]'s translation (its block number), whose code it runs; 0 otherwise.
         pub shared: u32,
-        pub reserved: u32,
+        /// Head of its inbound list: the record (index + 1; 0: none) of the newest link into it, from the records'
+        /// `next_in` chain ([`LinkRecord`]). Checked links are on no list.
+        pub inbound: u32,
+        /// Per link point (the index in `links`): the record (index + 1; 0: none) of the link out of that point, checked or
+        /// not. A record names its point ([`LinkRecord::point`]), so a record that moves updates exactly one slot. Killing
+        /// the block undoes its links out by these, with no scan of the records.
+        pub out: [u32; super::MAX_LINK_POINTS],
     }
     /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
     /// again; its space is reclaimed at the next flush.
@@ -843,10 +1128,38 @@ pub mod cache {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct LinkRecord {
         pub source: u32,
-        pub offset: u32,
+        /// The native offset of the patched word in `source`'s code, in the low [`POINT_SHIFT`] bits; above them the index
+        /// of its link point in [`Block::links`]. Read it only through [`LinkRecord::offset`] and [`LinkRecord::point`], build
+        /// it with [`LinkRecord::pack`] (the raw field is not the offset).
+        pub offset_point: u32,
         pub original: u32,
         pub target: u32,
+        /// The inbound list of `target` (not for a checked link, [`CHECKED`]): the neighbours' record indices + 1 (0: the
+        /// list's end; `prev_in` 0: this record is the head, [`Block::inbound`]). Records move within the area
+        /// (`cache::insert`, `remove`), which fix the neighbours.
+        pub prev_in: u32,
+        pub next_in: u32,
     }
+    /// [`LinkRecord::offset`]'s bits above the native offset hold the link point's index.
+    pub const POINT_SHIFT: u32 = 28;
+    impl LinkRecord {
+        /// The native offset of the patched word in `source`'s code.
+        pub const fn offset(&self) -> u32 {
+            self.offset_point & ((1 << POINT_SHIFT) - 1)
+        }
+        /// The index of the link point (`Block::links`, `Block::out`) the record is of.
+        pub const fn point(&self) -> usize {
+            (self.offset_point >> POINT_SHIFT) as usize
+        }
+        /// A record's `offset_point` field for native offset `at` of link point `point`.
+        pub const fn pack(at: u32, point: usize) -> u32 {
+            at | (point as u32) << POINT_SHIFT
+        }
+    }
+    const _: () = assert!(super::MAX_LINK_POINTS <= 1 << (32 - POINT_SHIFT));
+    const _: () = assert!(core::mem::size_of::<LinkRecord>() == 24);
+    // (A native offset is within its block: no more than MAX_BLOCK_BYTES.)
+    const _: () = assert!(MAX_BLOCK_BYTES < 1 << POINT_SHIFT);
     /// Invalidation requests to one vCPU, drained at each of its resident entries. Producers only set bits (atomic
     /// OR), the page's `stale` bit, then its word's `summary` bit, before `pending`; the consumer swaps `pending` to 0, then
     /// each `summary` word and the `stale` words it names, so no entry is lost, nothing overflows and a drain visits only
@@ -906,13 +1219,16 @@ pub mod cache {
         crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= LOOKUP_OFFSET
             && LOOKUP_OFFSET % BLOCK == 0
     );
-    // Every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned, below the guest RAM alias (its own GiBs).
+    // Every per-vCPU area lies in PRIVATE..PRIVATE + 1 GiB; the shared global area and pool above it. All are 2 MiB
+    // aligned and below the guest RAM alias (its own GiBs).
     const _: () = assert!(crate::execution::GUEST_RAM_VA == PRIVATE + (2 << 30));
     const _: () = assert!(CODE_VA + CODE_BYTES_MAX as u64 <= CODE_WRITE_VA);
     const _: () = assert!(CODE_WRITE_VA + CODE_BYTES_MAX as u64 <= META_VA);
     const _: () = assert!(META_VA + META_BYTES as u64 <= LOOKUP_VA);
     const _: () = assert!(LOOKUP_VA + LOOKUP_BYTES as u64 <= GLOBAL_VA);
-    const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= super::GUEST_RAM_VA);
+    const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= POOL_VA);
+    const _: () = assert!(POOL_VA + POOL_BYTES as u64 <= super::GUEST_RAM_VA);
+    const _: () = assert!(POOL_VA % BLOCK as u64 == 0 && POOL_BYTES % BLOCK == 0);
     const _: () = assert!(HEAD_BYTES + CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
     const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
     const _: () =
@@ -923,17 +1239,26 @@ pub mod cache {
             && L1_LISTS + 4 * L1_ENTRIES * L1_TABLES <= L2
             && L2 + L2_ENTRIES * 16 <= INDEX
     );
-    const _: () = assert!(MAX_BLOCKS < L1_LISTED as usize);
+    const _: () = assert!(MAX_BLOCKS < L1_NEXT as usize);
     const _: () = assert!(
         WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS
             && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS
             && LINEAR_HEADS + 4 * LINEAR_BUCKETS <= HINTS
             && HINTS + 4 * HINT_ENTRIES <= PIC_FRAMES
-            && PIC_FRAMES + 16 * PIC_FRAME_ENTRIES <= LOOKUP_BYTES
+            && PIC_FRAMES + 16 * PIC_FRAME_ENTRIES <= PAGE_STAMPS
+            && PAGE_STAMPS % 64 == 0
+            && PAGE_STAMPS + crate::page_study::BYTES <= LOOKUP_BYTES
     );
     // The dispatcher's form: its `and` takes the mask as a logical immediate, its `adrp` names a table by its page, and
     // each entry's `b` to the miss reaches ±128 MiB.
-    const _: () = assert!(L1_MASK == (1 << L1_BITS) - 1 && L1_BITS <= 16 && L1_ENTRY_BYTES == 32);
+    const _: () = assert!(
+        L1_SET_MASK == (1 << L1_SET_BITS) - 1
+            && L1_WAYS == 2
+            && L1_ENTRIES == L1_SETS * L1_WAYS
+            && L1_SET_BITS <= 15
+            && L1_ENTRY_BYTES == 32
+            && L1_SET_BYTES == 64
+    );
     const _: () =
         assert!(L1_CODE % 4096 == 0 && L1_TABLE_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
@@ -1402,6 +1727,25 @@ pub fn relocate_code(
             return Err(refusal::LINK);
         }
         code[at..at + 4].copy_from_slice(&p.word.to_le_bytes());
+    }
+    // Distance 0 (the same RIP, as for a kernel's code or a fixed-address program run by a peer): nothing is rewritten, the code
+    // is the block admission accepted at this very RIP (the host admits every object at the RIP it is for, and a template is
+    // only ever published or copied as admitted), so the move re-encoding, which proves that the rewritten words are what fexc
+    // would emit at a NEW RIP, has nothing to prove (and refuses the 32-bit forms of code below 4 GiB, and any form FEX's
+    // constant loader would pick differently, though no word changes); the offset-order rule guards a word being moved twice
+    // (+ 2d), moot at d = 0. What does not depend on moving is still checked: the place (above) and every link point as an
+    // exit of the code as admitted ([`link_point`]).
+    if d == 0 {
+        let size = size as u32;
+        return if links
+            .iter()
+            .filter(|p| p.offset != 0)
+            .all(|p| link_point(|at| word(code, at as usize), size, p))
+        {
+            Ok(())
+        } else {
+            Err(refusal::LINK)
+        };
     }
     let mut moved = [false; MAX_LINK_POINTS];
     // Each relocation is rewritten once, in place: they must be in offset order, none starting inside the words or slot
@@ -2463,6 +2807,13 @@ pub mod stop {
     /// (Perf chunk 10, numbered apart.) Under the host's check of reuse inside the resident ([`super::cache::REUSE_CHECK`]),
     /// a block copied from a template is not the host's answer at its RIP (code, sites, link points, exits or pages).
     pub const REUSE_MISMATCH: u64 = 64;
+    /// (Chunk 1b, `link-check` resident builds only.) A block's inbound list holds a record it must not: after an INVLPG
+    /// cut, a non-local record; after a block's death, any. `State::native` holds the halting line, the record's index
+    /// (+ 1) and the block's number.
+    pub const LINK_CHECK: u64 = 65;
+    /// (Page-currency plan chunk 1, `--page-currency check-halt`.) A fetch translation answered by the page record differs from a
+    /// walk's (`State::native` holds the linear address, the record's page and the walk's, `u64::MAX` for a fault).
+    pub const PAGE_CHECK: u64 = 66;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -2485,6 +2836,8 @@ pub mod stop {
             UNSUPPORTED_MMIO => "unsupported_mmio",
             UNSUPPORTED_PORT => "unsupported_port",
             REUSE_MISMATCH => "reuse_mismatch",
+            LINK_CHECK => "link_check",
+            PAGE_CHECK => "page_check",
             _ => "none",
         }
     }
@@ -2741,7 +3094,9 @@ pub struct Entropy {
     pub taken: u64,
     pub words: [u64; ENTROPY_WORDS],
 }
-pub const ENTROPY_WORDS: usize = 32;
+/// (30 since chunk 3 of the cross-vCPU reuse plan: the state page had no room for the perf bucket `pool`; the host tops the
+/// pool up at every exit, so 30 words cover any burst of RDRANDs the 32 did.)
+pub const ENTROPY_WORDS: usize = 30;
 pub const ENTROPY_OFFSET: usize = STATE_OFFSET + 0xc00;
 pub const ENTROPY_VA: u64 = PRIVATE + ENTROPY_OFFSET as u64;
 const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= STATE_OFFSET + 4096);
@@ -2808,7 +3163,7 @@ pub mod mmio {
         }
     }
 }
-pub const MMIO_OFFSET: usize = STATE_OFFSET + 0xe00;
+pub const MMIO_OFFSET: usize = STATE_OFFSET + 0xde8;
 pub const MMIO_VA: u64 = PRIVATE + MMIO_OFFSET as u64;
 const _: () = assert!(ENTROPY_OFFSET + core::mem::size_of::<Entropy>() <= MMIO_OFFSET);
 const _: () = assert!(MMIO_OFFSET + core::mem::size_of::<Mmio>() <= STATE_OFFSET + 4096);
@@ -2843,8 +3198,8 @@ pub mod perf {
         pub count: [u64; BUCKETS],
     }
     pub const MAGIC: u64 = 0x7065_7266_0001;
-    pub const BUCKETS: usize = 26;
-    pub const OFFSET: usize = super::STATE_OFFSET + 0xe40;
+    pub const BUCKETS: usize = 28;
+    pub const OFFSET: usize = super::STATE_OFFSET + 0xe18;
     pub const VA: u64 = crate::PRIVATE + OFFSET as u64;
     const _: () = assert!(super::MMIO_OFFSET + size_of::<super::Mmio>() <= OFFSET);
     const _: () = assert!(OFFSET + size_of::<Perf>() <= super::STATE_OFFSET + 4096);
@@ -2891,6 +3246,12 @@ pub mod perf {
     /// Perf chunk 10: reuse inside the resident (a template's checks, its copy and the re-check; the second page's walk is
     /// `fetch`, the host's answer under the check `host`).
     pub const REUSE: u64 = 25;
+    /// Cross-vCPU reuse (chunk 3): a lookup in the template pool (probes, copy of an entry, its checks and its placement; the
+    /// second page's walk is `fetch`).
+    pub const POOL: u64 = 26;
+    /// Relink plan, step 2: re-patching a target's suspended inbound links when a revalidation makes it current (`cache::relink`;
+    /// inside `lookup`'s time, charged alone).
+    pub const RELINK: u64 = 27;
     /// Perf chunk 14: a `perf` resident's halt wake-ups (`events::park`), each kind's count, summed and largest CNTVCT ticks
     /// and a histogram by microseconds (bins `< 1, < 4, < 16, < 64, < 256, < 1024, >= 1024`). Kinds: [`POST_WAKE`] a post
     /// (IPI or host interrupt, from `Events::rung`) to the first return from the wait after it; [`POST_RUN`] the same post to
@@ -2910,7 +3271,7 @@ pub mod perf {
     pub const POST_RUN: usize = 1;
     pub const TIMER_RUN: usize = 2;
     pub const WAKE_NAMES: [&str; WAKE_KINDS] = ["post_wake", "post_run", "timer_run"];
-    pub const WAKES_OFFSET: usize = super::STATE_OFFSET + 0xd08;
+    pub const WAKES_OFFSET: usize = super::STATE_OFFSET + 0xcf8;
     pub const WAKES_VA: u64 = crate::PRIVATE + WAKES_OFFSET as u64;
     const _: () = assert!(super::ENTROPY_OFFSET + size_of::<super::Entropy>() <= WAKES_OFFSET);
     const _: () = assert!(WAKES_OFFSET + size_of::<Wakes>() <= super::MMIO_OFFSET);
@@ -2941,11 +3302,171 @@ pub mod perf {
         "l1",
         "enter_copy",
         "reuse",
+        "pool",
+        "relink",
     ];
 }
 
 #[cfg(test)]
 mod tests {
+    /// A link record's `offset` carries its link point's index above the native offset, for every point of a block.
+    #[test]
+    fn a_link_record_names_its_point() {
+        use super::cache::{LinkRecord, POINT_SHIFT};
+        for k in 0..super::MAX_LINK_POINTS {
+            for at in [0, 4, 0x1234, (1 << POINT_SHIFT) - 4] {
+                let r = LinkRecord { source: 1, offset_point: LinkRecord::pack(at, k), original: 2, target: 3, prev_in: 0, next_in: 0 };
+                assert_eq!((r.offset(), r.point()), (at, k));
+            }
+        }
+        assert_eq!(core::mem::size_of::<LinkRecord>(), 24);
+    }
+    /// The record area's capacity is [`cache::MAX_LINKS`] unless a value in range is set; a full area is found at the cap
+    /// (not before a block's links stop fitting), and what remains after the local links are undone is judged against it.
+    #[test]
+    fn link_cap_defaults_to_max_and_bounds_the_overflow() {
+        use super::cache::{MAX_LINKS, MIN_LINK_CAP, link_cap, links_full, reclaim_floor};
+        assert_eq!(link_cap(0), MAX_LINKS);
+        assert_eq!(link_cap(MAX_LINKS as u64), MAX_LINKS);
+        assert_eq!(link_cap(MIN_LINK_CAP as u64), MIN_LINK_CAP);
+        assert_eq!(link_cap(16 * 1024), 16 * 1024);
+        assert_eq!(link_cap(MIN_LINK_CAP as u64 - 1), MAX_LINKS);
+        assert_eq!(link_cap(MAX_LINKS as u64 + 1), MAX_LINKS);
+        let cap = link_cap(16 * 1024);
+        assert!(!links_full(cap - super::MAX_LINK_POINTS, cap));
+        assert!(links_full(cap - super::MAX_LINK_POINTS + 1, cap));
+        assert_eq!(reclaim_floor(cap), 12 * 1024);
+        assert!(!links_full(0, MIN_LINK_CAP));
+    }
+
+    /// The two-way L1 (l1-two-way plan): slot, set and way arithmetic, the memory the tables take, the entry words (way
+    /// 0's `cbnz` lands on way 1, way 1's on its own word 7), the empty words, and the owner flags.
+    #[test]
+    fn l1_two_way_layout_and_words() {
+        use super::cache::*;
+        assert_eq!((L1_SETS, L1_WAYS, L1_ENTRIES), (1 << 15, 2, 1 << 16));
+        assert_eq!(L1_TABLE_BYTES, 2 << 20, "the same memory as 2^16 direct-mapped entries");
+        assert_eq!(L1_SET_BYTES, 64);
+        // The set is RIP bits 14:0, whatever the others; slots are 2 * set + way.
+        for rip in [0, 0x1234, 0x7fff, 0x8000, 0xdead_beef_cafe, u64::MAX] {
+            let (w0, w1) = l1_slots_of(rip);
+            assert_eq!((w0, w1), (2 * (rip as usize & 0x7fff), 2 * (rip as usize & 0x7fff) + 1));
+        }
+        assert_eq!(l1_slots_of(0x1_0000), l1_slots_of(0x2_0000));
+        assert_eq!(l1_slots_of(0x1_0000), l1_slots_of(0x1_8000), "V and V + 32 KiB share a set");
+        assert_ne!(l1_slots_of(0x1_0000), l1_slots_of(0x1_4000));
+        // The flags and the block number do not overlap.
+        assert_eq!(L1_FLAGS, L1_LISTED | L1_NEXT);
+        assert!((MAX_BLOCKS as u32 + 1) & L1_FLAGS == 0);
+        // Words: `movz/movk` x4 (rip), `sub`, `cbnz`, `b entry`, then the last.
+        let (at0, miss, entry) = (0x4_0000u64, 0x1010u64, 0x9_0000u64);
+        let rip = 0x7f12_3456_9abc_8def_u64;
+        let way0 = l1_words(0, at0, rip, entry, miss);
+        let way1 = l1_words(1, at0 + 32, rip, entry, miss);
+        let imm = |w: u32| (w >> 5) & 0xffff;
+        for w in [way0, way1] {
+            assert_eq!([0, 1, 2, 3].map(|k| imm(w[k]) as u64), [0x8def, 0x9abc, 0x3456, 0x7f12]);
+            assert_eq!(w[4], 0xcb00_0042, "sub x2, x2, x0");
+        }
+        // The `cbnz x2, +imm19 words`: way 0's goes to the set's second way (+12 from the cbnz at word 5: 32 - 20), way 1's to
+        // its own word 7 (+8).
+        let target = |w: u32, from: u64| from.wrapping_add(((((((w >> 5) & 0x7_ffff) << 13) as i32 >> 13) as i64) * 4) as u64);
+        assert_eq!(way0[5] & 0xff00_001f, 0xb500_0002);
+        assert_eq!(target(way0[5], at0 + 20), at0 + 32);
+        assert_eq!(target(way1[5], at0 + 32 + 20), at0 + 32 + 28);
+        let b = |w: u32, from: u64| from.wrapping_add(((((((w & 0x03ff_ffff) << 6) as i32 >> 6) as i64) * 4) as u64));
+        assert_eq!(way0[6] >> 26, 0b000101);
+        assert_eq!(b(way0[6], at0 + 24), entry);
+        assert_eq!(b(way1[6], at0 + 32 + 24), entry);
+        assert_eq!(b(way0[7], at0 + 28), at0 + 32, "way 0's landing is way 1");
+        assert_eq!(b(way1[7], at0 + 32 + 28), miss, "way 1's is the dispatcher's miss");
+        // Empty words: way 0 to way 1, way 1 to the miss.
+        assert_eq!(b(l1_empty_word(0, at0, miss), at0), at0 + 32);
+        assert_eq!(b(l1_empty_word(1, at0 + 32, miss), at0 + 32), miss);
+        assert_eq!(b(l1_empty_word(2 * 77, at0, miss), at0), at0 + 32);
+        assert_eq!(b(l1_empty_word(2 * 77 + 1, at0, miss), at0), miss);
+        // The victim's RIP bit 15 is in its first word.
+        for rip in [0u64, 0x8000, 0x7fff, 0xffff, 0x1_0000, 0x1_8000] {
+            assert_eq!(l1_word_rip15(l1_words(0, 0, rip, 0, 0)[0]), rip & 0x8000 != 0, "{rip:#x}");
+        }
+    }
+
+    /// `l1_fill` modelled as the resident drives it (owner words with the flags, the set's next-victim bit in way 0's
+    /// word): the empty way first, fill order after, a block never in both ways, the flags kept.
+    #[test]
+    fn l1_fill_order_replacement() {
+        use super::cache::*;
+        struct Set([u32; 2]);
+        impl Set {
+            /// A fill of `block` (number + 1); the misses it costs (1 unless it was there).
+            fn fill(&mut self, block: u32) -> bool {
+                let f = l1_fill(self.0[0], self.0[1], block);
+                let flip = if f.victim { L1_NEXT } else { 0 };
+                let listed = self.0[f.way] & L1_LISTED;
+                if f.way == 0 {
+                    self.0[0] = listed | (self.0[0] & L1_NEXT ^ flip) | block;
+                } else {
+                    self.0[1] = listed | block;
+                    self.0[0] ^= flip;
+                }
+                !f.there
+            }
+            /// A dispatcher visit: a hit (one of the ways has it) or a miss that fills.
+            fn visit(&mut self, block: u32) -> bool {
+                let hit = self.0.iter().any(|&o| o & !L1_FLAGS == block);
+                if !hit { self.fill(block) } else { false }
+            }
+            fn holds(&self) -> [u32; 2] {
+                self.0.map(|o| o & !L1_FLAGS)
+            }
+        }
+        let (a, b, c) = (1, 2, 3);
+        // The pair fits: A and B take the two ways, then every visit hits.
+        let mut s = Set([0, 0]);
+        assert!(s.visit(a) && s.visit(b));
+        assert_eq!(s.holds(), [a, b]);
+        assert_eq!((0..10).filter(|_| s.visit(a) | s.visit(b)).count(), 0);
+        // A triple in turn: fill order replacement misses on every visit (3 a round), whichever round.
+        let mut s = Set([0, 0]);
+        for round in 0..6 {
+            assert_eq!([a, b, c].map(|x| s.visit(x)), [true; 3], "round {round}");
+        }
+        // After the triple, A then B (as `l1-triple`): the set holds the last two (the older of them is the next
+        // victim): A misses and replaces the older, B misses and replaces the other, then no more, whatever the
+        // parity of the rounds before.
+        for rounds in 1..=6 {
+            let mut s = Set([0, 0]);
+            for _ in 0..rounds {
+                let _ = [a, b, c].map(|x| s.visit(x));
+            }
+            let first: usize = [a, b].iter().filter(|&&x| s.visit(x)).count();
+            let later: usize = (0..5).map(|_| [a, b].iter().filter(|&&x| s.visit(x)).count()).sum();
+            assert_eq!((first, later), (2, 0), "after {rounds} rounds");
+        }
+        // The resident's re-entry at a block that is in way 1 while the bit names way 0 (`l1-dup`): nothing changes.
+        let mut s = Set([0, 0]);
+        s.visit(a);
+        s.visit(b);
+        assert_eq!(s.0, [a, b], "empty ways fill without flipping: the bit names way 0");
+        let before = s.0;
+        assert!(!s.fill(b), "already there");
+        assert_eq!(s.0, before);
+        assert!(!s.fill(a));
+        assert_eq!(s.0, before);
+        assert_eq!(l1_fill(before[0], before[1], b), L1Fill { way: 1, there: true, victim: false });
+        // Flags are kept: a listed way and the bit.
+        let mut s = Set([a | L1_LISTED, b | L1_LISTED]);
+        s.fill(c);
+        assert_eq!(s.0, [c | L1_LISTED | L1_NEXT, b | L1_LISTED], "way 0 replaced: the bit now names way 1");
+        s.fill(a);
+        assert_eq!(s.0, [c | L1_LISTED, a | L1_LISTED], "way 1 replaced: the bit flipped back");
+        // An emptied way 0 is the first choice; the bit is untouched.
+        let f = l1_fill(L1_NEXT | L1_LISTED, b, c);
+        assert_eq!(f, L1Fill { way: 0, there: false, victim: false });
+        // M4's input: a raw owner with the bit set is still the block (the masks).
+        assert_eq!(l1_fill(c | L1_NEXT, b, c), L1Fill { way: 0, there: true, victim: false });
+    }
+
     #[test]
     fn table_page_marks_accumulate() {
         use core::sync::atomic::{AtomicU64, Ordering::SeqCst};

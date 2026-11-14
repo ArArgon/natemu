@@ -17,8 +17,9 @@
 //! enforces it: every private page is EL1-only except the code area, which EL0 may only execute. Interrupts are doorbells (a host SPI, a
 //! peer's SGI): each stops the vCPU precisely at a block boundary ([`interrupted`]) and the resident drains there.
 use super::*;
-use crate::cache::{self, Block};
+use crate::cache::{self, Block, Mapped};
 use core::sync::atomic::Ordering::SeqCst;
+use natemu_abi::execution::cache::fast_decline;
 use natemu_abi::execution::perf::SysFastDecline;
 mod delivery;
 mod events;
@@ -28,6 +29,9 @@ mod helpers;
 mod lapic;
 mod maskmov;
 mod mmio;
+pub(crate) mod page_record;
+#[cfg(feature = "page-study")]
+pub(crate) mod page_study;
 mod ports;
 mod rotate;
 mod segments;
@@ -106,6 +110,9 @@ fn halt(s: &State, reason: u64) -> ! {
 
 pub unsafe fn start() -> ! {
     crate::perf::start();
+    #[cfg(feature = "page-study")]
+    page_study::init();
+    cache::read_ctr_el0();
     // The entry frame's fields `enter` never writes are zero ([`enter`]).
     unsafe { (*shared()).initial = NativeFrame::ZERO };
     let mut s = unsafe { load() };
@@ -598,6 +605,12 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
             }
         };
         let generation = s.generation;
+        // Relink plan, step 1: whether `find` found the target current as it was (it revalidated and placed nothing).
+        let (revalidated, blocks) = {
+            let c = cache::control();
+            (c.revalidated, c.blocks)
+        };
+        let link_mark = crate::perf::link_mark();
         // A target killed as it was placed is neither linked to nor entered: its instruction is stepped.
         let Some(target) = find(&mut s) else {
             if source.is_some() {
@@ -628,7 +641,14 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
                 crate::perf::leave(p);
                 linked
             } {
-                cache::Link::Linked(n) => s.links += n,
+                cache::Link::Linked(n) => {
+                    s.links += n;
+                    let c = cache::control();
+                    if n != 0 && c.revalidated == revalidated && c.blocks == blocks {
+                        c.linked_current += 1;
+                        c.linked_current_ticks += crate::perf::link_since(link_mark);
+                    }
+                }
                 cache::Link::Bad => halt(&s, stop::BAD_LINK),
             },
             None => {}
@@ -750,6 +770,124 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
         cache::control().system_from[SYS_FAST] += 1;
     }
     unsafe { enter(s, target) }
+}
+/// Fast miss path (docs/restructure/fast-miss-plan.md): a dispatcher miss into a block that is current (or whose source pages the
+/// page record says are mapped as the block's, [`page_record::revalidated_from_record`]) is served from the exit's frame, as
+/// [`sys_fast`] serves a system call: no bank, no `find`, no state record written back, no new frame. Nothing in the guest's state
+/// changes between the exit and the entry (no instruction runs), so the gate's frame already is the entry frame an L1 hit would
+/// have entered with: x0 = the RIP, the static registers, the PF/AF registers, the Q registers, FPCR/FPSR and NZCV as the
+/// exit left them, and the frame page's live bytes (DF, IF, the GS bases, the SIMD and x87 pending flags) are the page's own.
+///
+/// **The state record is authoritative only at a full entry, after [`bank`]; while generated code runs, the registers and the
+/// frame page are** (the precedent is the L1 hit and the patched link). After a fast miss the record and the frame page are what
+/// an L1 hit from the last full entry leaves them, plus RF cleared and `shadow_entry` 0. Every full entry banks before it reads
+/// guest state and computes its RIP from the frame or the faulting site, never from the record, so a stale record is
+/// never read for guest state (the readers reachable without a bank: `fp_exception`'s MXCSR/FPSR pairing, `bank_at`, `halt`'s
+/// diagnostics and the resident-owned controls, none reads stale guest state).
+///
+/// Taken only where `find` would find nothing to do at this boundary: no debug trap, TF or armed breakpoint, no shadow, REP
+/// boundary, plain step or wanted stop, no posted invalidation, I/O window, LAPIC expiry or backlog, no takeable event and no UC
+/// shadow owing its barrier, and the target a live, current (or record-revalidated) block that is neither a system-instruction
+/// decode nor the step block. Else it returns having written nothing but counters (and what `find` does again to the same
+/// effect: the L1 table's selection, a block's revalidation), and [`missed`] runs as it always did. Each decline is counted by
+/// reason (`Control::fast_declined`), a plain increment. Reads only resident memory (the record, `Control`, the L2 table, block
+/// records, the L1 code through its write alias, the page record): no guest memory, no `hvc`, no walk.
+///
+/// In place like `sys_fast`: `s` is the record itself, no `State` copy on this frame (the nested-entry stack bound).
+#[inline(never)]
+unsafe fn miss_fast(frame: &NativeFrame) {
+    // SAFETY: the record is this vCPU's (EL1-only); see [`sys_fast`].
+    let s = unsafe { &mut *record() };
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::MISS_FAST_CHECK);
+    let c = cache::control();
+    if c.miss_fast_off != 0 {
+        return;
+    }
+    if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0 {
+        return decline_fast(fast_decline::DEBUG);
+    }
+    // (The step block's computed exit comes here on purpose, X2: after a stepped instruction `plain_step` or `debug::STEP` is
+    // set, and an event a shadow held is seen by the event check: the contract is kept by these checks together.)
+    if s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0 {
+        return decline_fast(fast_decline::BOUNDARY);
+    }
+    if cache::pending() {
+        return decline_fast(fast_decline::PENDING);
+    }
+    if io_pending(s) {
+        return decline_fast(fast_decline::IO);
+    }
+    if lapic::due() {
+        return decline_fast(fast_decline::LAPIC);
+    }
+    // The live IF at CPL 0 is the frame page's byte (what `bank` reads); `events::none` reads the record's, stale since the last
+    // full entry (and rewritten by the next bank).
+    if s.cpu.cpl == 0 {
+        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.
+        let live = unsafe { (FRAME_VA as *const u8).add(frame::IF as usize).read_volatile() } != 0;
+        s.cpu.rflags = s.cpu.rflags & !RFLAGS_IF | if live { RFLAGS_IF } else { 0 };
+    }
+    if !events::none(s) {
+        return decline_fast(fast_decline::EVENT);
+    }
+    if c.uncached_count | c.uncached_fence != 0 {
+        return decline_fast(fast_decline::UNCACHED);
+    }
+    // The tests' and studies' builds count (or perturb) every miss by what it needs: they take the full path.
+    if c.pic_test != 0 || cfg!(any(feature = "pic-count", feature = "dispatch-study")) {
+        return decline_fast(fast_decline::STUDY);
+    }
+    // The target (generated code changes none of the code context's inputs, as `sys_fast`'s contract states).
+    let rip = frame.x[0];
+    let context = s.cpu.code_context();
+    cache::select_l1(context);
+    let (remapped, mut unknown) = (c.remapped, false);
+    let p = crate::perf::enter(crate::perf::LOOKUP);
+    let found = cache::lookup(rip, context, |b| match page_record::revalidated_from_record(s, b) {
+        Mapped::Unknown => {
+            unknown = true;
+            Mapped::Unknown
+        }
+        mapped => mapped,
+    });
+    crate::perf::leave(p);
+    let Some(target) = found else {
+        // (A `No` the search passed over is counted again by the full path's walk.)
+        c.remapped = remapped;
+        return decline_fast(if unknown { fast_decline::UNKNOWN } else { fast_decline::NO_BLOCK });
+    };
+    if target.flags & cache::SYSTEM != 0 {
+        return decline_fast(fast_decline::SYSTEM);
+    }
+    if target.flags & cache::STEP != 0 {
+        return decline_fast(fast_decline::STEP);
+    }
+    // Commit: all writes are resident-side. `completed`'s effect (`stepped` is a no-op with `debug` 0); what `enter` writes with
+    // no shadow; the counts `find` and `enter` make; the L1 refill (the point of the path: with its code synchronization).
+    s.cpu.rflags &= !RFLAGS_RF;
+    s.shadow_entry = 0;
+    s.blocks += 1;
+    s.l2_hits += 1;
+    c.fast_taken += 1;
+    cache::fill_l1(rip, target);
+    tables::select(s.cpu.cpl);
+    crate::perf::enter(crate::perf::GUEST);
+    // SAFETY: the target is a live block; the frame is the gate's, intact (see `resume_exception`'s layout contract). PSTATE as
+    // `enter` builds it, from the NZCV the gate stored. A PIC target's `full_entry` writes the page base itself.
+    unsafe {
+        resume_exception(
+            frame,
+            cache::code_of(target).full_entry(),
+            BLOCK_SPSR | frame.nzcv,
+            alignment_check(&s.cpu),
+        )
+    }
+}
+/// One more decline of [`miss_fast`] for `reason` (`fast_decline`): a plain increment.
+#[inline(always)]
+fn decline_fast(reason: usize) {
+    cache::control().fast_declined[reason] += 1;
 }
 /// Perf chunk 22, `perf` resident: [`Control::system_from`]'s slot (past the buckets) counting the system calls'
 /// SYSCALLs and SYSRETs [`sys_fast`] ran to the end (the host reports it as `"?"`).
@@ -979,14 +1117,225 @@ unsafe fn reused(s: &mut State, context: u64) -> Result<Reply, Option<&'static B
             cache::control().reuse_refused[k] += 1;
         }
         // The host is asked as if no template had been looked at: the next page only if it asks for it.
-        if s.fetch_fault[0] != fetch::NONE && s.fetch[0] != u64::MAX {
-            s.fetch_fault = [fetch::NONE; 3];
-        }
-        s.fetch[1] = u64::MAX;
-        cache::control().fetched &= 0xff;
+        unwalk(s);
         crate::perf::leave(p);
     }
+    // Cross-vCPU reuse (chunk 3): no template of this vCPU served it; the host's pool may hold the block another vCPU (or this
+    // one before a flush) had compiled for the same bytes.
+    if let Some(placed) = unsafe { pooled(s, context) } {
+        return Err(placed);
+    }
     Ok(unsafe { ask(s, REQUEST_TRANSLATE) })
+}
+/// The next page's walk undone, so the host is asked as if no template or pool entry had been looked at: it asks for the
+/// next page itself if it needs it.
+fn unwalk(s: &mut State) {
+    if s.fetch_fault[0] != fetch::NONE && s.fetch[0] != u64::MAX {
+        s.fetch_fault = [fetch::NONE; 3];
+    }
+    s.fetch[1] = u64::MAX;
+    cache::control().fetched &= 0xff;
+}
+/// Cross-vCPU reuse (cross-vCPU reuse plan, section 3, [`natemu_abi::pool`]): after [`reused`] found no template of this vCPU
+/// (RIP's page walked and marked), the pool is probed by the key of the guest's own bytes (context, RIP's half and page offset,
+/// up to four lead bytes, longest first; each probe's positions come from an acquire load of the slot in this lookup, never a
+/// remembered one). An entry is accepted only if every check passes on its private copy in the staging area (EL1-only window
+/// memory, unused between requests): the pool's own (a whole entry the host wrote at that position, not overwritten during
+/// the copy; the module's ordering argument), the full key (a slot's tag has 24 bits), the fences, the prefix against the
+/// guest's bytes as marked, no flush meanwhile, the link points and computed exit as admitted (what [`ask`] checks of a
+/// reply; the sites' contents are the host's admission, as for a reply) and the re-check of [`cache::copy_pooled`]. The
+/// block is then an ordinary template of this vCPU, and `kept` (the caller) is what catches a write that raced the lookup: the
+/// pages were marked before their bytes were compared (the mark is a SeqCst fetch_or, `dmb ish` before the compare), so a
+/// write after the mark clears it and posts to this vCPU; `kept` takes the posted invalidations and discards the block if
+/// any source page's mark is gone (the generation, which only a flush moves, is not what says so). `Some(Some)`: placed; `Some(None)`: the code area or metadata is full
+/// (the caller flushes); `None`: ask the host (the walk of the next page undone). The pool's switch is a tripwire the host
+/// pulls when its own premise fails, read at each lookup; a lookup already under way is not stopped by it, so it is no barrier:
+/// every accepted entry was published by the host's own admission regardless.
+unsafe fn pooled(s: &mut State, context: u64) -> Option<Option<&'static Block>> {
+    let c = cache::control();
+    if c.pool == natemu_abi::execution::cache::POOL_OFF || c.reuse == cache::REUSE_OFF || s.fetch[0] == u64::MAX {
+        return None;
+    }
+    if s.cpu.dr[5] & DR7_ENABLES != 0 {
+        c.pool_refused[natemu_abi::execution::cache::pool_refusal::FENCED] += 1;
+        return None;
+    }
+    let p = crate::perf::enter(crate::perf::POOL);
+    let placed = unsafe { pool_lookup(s, context) };
+    crate::perf::leave(p);
+    placed
+}
+unsafe fn pool_lookup(s: &mut State, context: u64) -> Option<Option<&'static Block>> {
+    use natemu_abi::execution::cache::pool_refusal as why;
+    use natemu_abi::pool::{Key, LEAD, Layout, Pool};
+    let c = cache::control();
+    let rip = s.cpu.rip;
+    let [index_slots, ring_bytes, control_bytes] = c.pool_layout;
+    // SAFETY: the host mapped the span read-only at POOL_VA for this layout before the vCPU ran (`Control::pool` says so).
+    let pool = unsafe {
+        Pool::new(
+            natemu_abi::execution::cache::POOL_VA as *mut u8,
+            Layout {
+                index_slots: index_slots as usize,
+                ring_bytes: ring_bytes as usize,
+                control_bytes: control_bytes as usize,
+            },
+        )
+    };
+    if !pool.enabled() {
+        c.pool_refused[why::OFF] += 1;
+        return None;
+    }
+    c.pool_probes += 1;
+    // The lead bytes the key holds, from RIP's page as walked (a block that starts less than four bytes before the page's end
+    // is keyed by more bytes than this page holds: not found here, the host is asked).
+    let page_off = (rip & 4095) as usize;
+    let avail = (4096 - page_off).min(LEAD);
+    let mut lead = [0u8; LEAD];
+    if !guest_ram().copy_out(s.fetch[0] | page_off as u64, &mut lead[..avail]) {
+        return None;
+    }
+    let generation = s.generation;
+    // SAFETY: the staging area is this vCPU's own window memory, written only by the host's replies to its requests.
+    let staging = unsafe { core::slice::from_raw_parts_mut(STAGING_VA as *mut u8, STAGING_BYTES) };
+    let (mut found, mut placed) = (false, None);
+    'lengths: for len in (1..=avail).rev() {
+        let key = Key::new(context, rip, &lead, len);
+        for position in pool.probe(&key) {
+            if position == 0 {
+                continue;
+            }
+            found = true;
+            match unsafe { pooled_entry(s, &pool, position, &key, context, generation, staging) } {
+                Ok(block) => {
+                    placed = Some(block);
+                    break 'lengths;
+                }
+                Err(reason) => {
+                    c.pool_refused[reason] += 1;
+                    // The next candidate walks the second page afresh if it crosses: nothing of this one's walk stays (a fault
+                    // left in `fetch_fault`, a page marked for no block) for a candidate that does not.
+                    unwalk(s);
+                    // A flush fails every entry alike and ends the lookup (a fence is judged by each entry's own length).
+                    if reason == why::STALE {
+                        break 'lengths;
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        c.pool_refused[why::NO_SLOT] += 1;
+    }
+    match placed {
+        Some(Some(_)) => c.pool_hits += 1,
+        Some(None) => {}
+        None => unwalk(s),
+    }
+    placed
+}
+/// [`pooled`]'s checks of the entry published at `position`; `Err`: the [`natemu_abi::execution::cache::pool_refusal`] that refused it.
+unsafe fn pooled_entry(
+    s: &mut State,
+    pool: &natemu_abi::pool::Pool,
+    position: u64,
+    key: &natemu_abi::pool::Key,
+    context: u64,
+    generation: u64,
+    staging: &mut [u8],
+) -> Result<Option<&'static Block>, usize> {
+    use natemu_abi::execution::cache::pool_refusal as why;
+    use natemu_abi::pool::Refusal;
+    let c = cache::control();
+    let rip = s.cpu.rip;
+    c.pool_candidates += 1;
+    let e = match pool.fetch(position, staging) {
+        Ok(e) => e,
+        Err(Refusal::Overwritten) => return Err(why::OVERWRITTEN),
+        Err(_) => return Err(why::MALFORMED),
+    };
+    // The key in full: the slot's tag is 24 bits of a hash, the lead bytes four.
+    if e.context != context || (e.rip ^ rip) & (1 << 63 | 0xfff) != 0 || e.key() != *key {
+        return Err(why::KEY);
+    }
+    let page_off = (rip & 4095) as usize;
+    let crosses = page_off + e.guest_bytes as usize > 4096;
+    // Templates read only bytes of the block's own pages; the prefix is at most two pages from RIP.
+    if (page_off + e.prefix.len() > 4096) != crosses || page_off + e.prefix.len() > 8192 {
+        return Err(why::MALFORMED);
+    }
+    let fenced = |fence| natemu_abi::execution::reuse_fenced(rip, crosses, fence);
+    if c.reuse_fences.iter().any(|&f| fenced(f)) || fenced([s.stop_at, s.stop_at.wrapping_add(1)]) {
+        return Err(why::FENCED);
+    }
+    // A prefix that runs into the next page: walked and marked as a request would, once for the lookup.
+    if crosses && s.fetch[1] == u64::MAX {
+        if s.fetch_fault[0] != fetch::NONE {
+            return Err(why::BYTES);
+        }
+        fetch_page(s, (rip & !4095).wrapping_add(4096), 1, true);
+        if s.fetch[1] == u64::MAX {
+            return Err(why::BYTES);
+        }
+    }
+    // The guest's bytes now (pages marked: a write from here on is posted to this vCPU) are the entry's prefix. The mark is
+    // a SeqCst atomic and the compare's loads follow it in program order on the same vCPU; the barrier makes that order
+    // explicit for the loads from guest RAM (the host path has `dsb sy` before its `hvc`).
+    unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
+    let ram = guest_ram();
+    let first = e.prefix.len().min(4096 - page_off);
+    if !same_bytes(&ram, s.fetch[0] | page_off as u64, &e.prefix[..first])
+        || (crosses && !same_bytes(&ram, s.fetch[1], &e.prefix[first..]))
+    {
+        return Err(why::BYTES);
+    }
+    take_invalidations(s);
+    if s.generation != generation {
+        return Err(why::STALE);
+    }
+    // What `ask` checks of a reply: each link point an exit of the code as admitted, the computed exit's placeholder.
+    let code = e.code;
+    let word = |at: u64| {
+        code.get(at as usize..at as usize + 4)
+            .map_or(0, |w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+    };
+    // The refusal's reason, with whether the entry was published at this RIP and whether the context is CPL 3.
+    let mut recheck = |reason: usize| {
+        c.pool_recheck[reason * 4 + 2 * usize::from(e.rip == rip) + usize::from(context & 3 == 3)] += 1;
+        why::RECHECK
+    };
+    use natemu_abi::execution::cache::pool_recheck as how;
+    if e.links
+        .iter()
+        .any(|p| p.offset != 0 && !natemu_abi::execution::link_point(word, code.len() as u32, p))
+    {
+        return Err(recheck(how::LINK_POINT));
+    }
+    if e.dispatch_exit != 0 && word(u64::from(e.dispatch_exit)) != DISPATCH_PLACEHOLDER {
+        return Err(recheck(how::PLACEHOLDER));
+    }
+    s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
+    let walk = walked(s);
+    cache::copy_pooled(&e, rip, context, s.source_gpa, walk).map_err(|kind| {
+        use natemu_abi::execution::refusal;
+        recheck(match kind {
+            refusal::LITERAL => how::LITERAL,
+            refusal::MOVE => how::MOVE,
+            refusal::LINK => how::LINK,
+            _ => how::PLACE,
+        })
+    })
+}
+/// Whether guest RAM at `gpa` holds `expect`.
+fn same_bytes(ram: &GuestRam, gpa: u64, expect: &[u8]) -> bool {
+    let Some(p) = ram.range(gpa, expect.len() as u64) else {
+        return false;
+    };
+    // SAFETY: `range` gives `expect.len()` bytes of the alias (volatile: other vCPUs may write them).
+    expect
+        .iter()
+        .enumerate()
+        .all(|(i, &b)| unsafe { p.add(i).read_volatile() } == b)
 }
 /// Perf chunk 10, the check of reuse inside the resident ([`cache::REUSE_CHECK`]): the host is asked for the block at the
 /// copy's RIP (through the walks the copy was made from) and its answer must be the copy: the same code (the computed exit's
@@ -1172,7 +1521,7 @@ fn link_point(h: &Header, p: &LinkPoint) -> bool {
 /// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]).
 fn fetch_page(s: &mut State, va: u64, i: usize, block: bool) {
     let p = crate::perf::enter(crate::perf::FETCH);
-    match fetch_walk(s, va) {
+    match page_translation(s, va, natemu_abi::page_study::PLACE) {
         Ok((gpa, flags)) => {
             cache::control().fetched |= u64::from(flags) << (8 * i);
             s.fetch[i] = gpa;
@@ -1217,23 +1566,44 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
 /// K1: whether `b`'s source pages are where its linear pages are fetched from now (a fetch walk of each, as the CPU's
 /// after a TLB miss: A bits set, any fault meaning no): `Some(flags)` ([`leaves`]). The walk's A writes may invalidate
 /// `b` ([`cache::lookup`] looks again).
-fn mapped(s: &mut State, b: &Block) -> Option<u32> {
+fn mapped(s: &mut State, b: &Block) -> Mapped {
     let p = crate::perf::enter(crate::perf::REVALIDATE);
     let current = revalidated(s, b);
     crate::perf::leave(p);
-    current
+    current.map_or(Mapped::No, Mapped::Yes)
 }
 fn revalidated(s: &mut State, b: &Block) -> Option<u32> {
+    #[cfg(feature = "page-study")]
+    page_study::block_begin();
     let mut flags = [cache::GLOBAL; 2];
     for (k, &gpa) in b.source_gpa.iter().enumerate() {
         if gpa != u64::MAX {
-            flags[k] = fetch_walk(s, (b.rip & !4095).wrapping_add(4096 * k as u64))
-                .ok()
-                .filter(|&(at, _)| at == gpa)?
-                .1;
+            flags[k] = page_translation(
+                s,
+                (b.rip & !4095).wrapping_add(4096 * k as u64),
+                natemu_abi::page_study::REVAL,
+            )
+            .ok()
+            .filter(|&(at, _)| at == gpa)?
+            .1;
         }
     }
-    Some(leaves(s, flags))
+    let flags = leaves(s, flags);
+    #[cfg(feature = "page-study")]
+    page_study::block_end(b, flags);
+    Some(flags)
+}
+/// The fetch translation of `va` for `who` ([`natemu_abi::page_study::REVAL`], `PLACE`): a fetch walk, or the page record's answer
+/// where it holds one ([`page_record`], `Control::pages`). A `page-study` build (page-currency chunk 0) is the shadow instead:
+/// the walk is always made and returned, the record probed before it and its answer compared and counted ([`page_study`]).
+#[cfg(not(feature = "page-study"))]
+#[inline(always)]
+fn page_translation(s: &mut State, va: u64, _who: usize) -> Result<(u64, u32), [u64; 3]> {
+    page_record::translation(s, va)
+}
+#[cfg(feature = "page-study")]
+fn page_translation(s: &mut State, va: u64, who: usize) -> Result<(u64, u32), [u64; 3]> {
+    page_study::translate(s, va, who)
 }
 /// A translation's flags from its source pages' leaves (`GLOBAL`, `LARGE` each; an unused page `GLOBAL` alone): global
 /// when every leaf is and CR4.PGE is set (SDM Vol.3 4.10.2.4), large when any leaf is.
@@ -1337,8 +1707,8 @@ fn flush(s: &mut State) {
 }
 /// K1: a TLB flush (a CR3 load; `global`: a paging control change or an MTRR write, global entries too): every shadow
 /// goes (the data TLB) and blocks no longer current leave L1 and their links ([`cache::tlb`]); no translation is dropped.
-/// Perf chunk 14: a CR3 load keeps the supervisor space's upper-half shadows when every one of them shadows a global
-/// translation (as the TLB keeps global entries, SDM Vol.3 4.10.4.1; [`tables::reset_cr3`]). This vCPU's writable bits
+/// Perf chunk 14: a CR3 load keeps the supervisor space's upper-half shadows of global translations (as the TLB keeps
+/// global entries, SDM Vol.3 4.10.4.1; [`tables::reset_cr3`]: the non-global ones there go, listed). This vCPU's writable bits
 /// then stay as they were (a superset of its writable shadows; a peer's mark may ask it for a full reset it did not need)
 /// and its reset counter does not move (a peer waiting for its writable shadows to go waits for a full reset).
 fn tlb(s: &mut State, global: bool) {
@@ -1725,7 +2095,10 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
                 sys_fast(frame, elr);
                 linker(frame, elr)
             }
-            svc::MISS if elr == miss => missed(frame),
+            svc::MISS if elr == miss => {
+                miss_fast(frame);
+                missed(frame)
+            }
             imm @ (svc::DIV_U | svc::DIV_S) => division(imm == svc::DIV_S, frame, elr, spsr),
             svc::X87 => helpers::x87(frame, elr, spsr),
             svc::STRING => helpers::string(frame, elr, spsr),
@@ -1749,6 +2122,8 @@ unsafe fn missed(frame: &NativeFrame) -> ! {
     bank(&mut s.cpu, frame, frame.nzcv, true);
     completed(&mut s);
     s.cpu.rip = frame.x[0];
+    #[cfg(feature = "dispatch-study")]
+    cache::count_miss(s.cpu.rip, s.cpu.code_context());
     // PIC study (`pic-count` builds only): the miss by what it needs (no walk: as the dispatcher would have found it).
     #[cfg(feature = "pic-count")]
     {
@@ -1766,7 +2141,7 @@ unsafe fn missed(frame: &NativeFrame) -> ! {
 }
 /// Halts with `native` in the record.
 #[inline(never)]
-fn halt_native(native: [u64; 3], reason: u64) -> ! {
+pub(crate) fn halt_native(native: [u64; 3], reason: u64) -> ! {
     let mut s = unsafe { load() };
     s.native = native;
     halt(&s, reason)
@@ -2990,9 +3365,18 @@ fn translate(
                     && matches!(kind, cpu::memory_type::WT | cpu::memory_type::WP));
             let shadow = !uncached || b.flags & cache::STEP != 0;
             let writable = access == Access::Write && t.writable && t.dirty;
-            // As a mark is set before the writable bits are read ([`mark`]), the writable bit is set before the marks
-            // are read: a vCPU marking the page then either shoots this shadow down or is seen here, and the write
-            // takes the code-write path. (Unshadowed, a write is made by the step block or [`split`] after this check.)
+            // Fault-around plan chunk 1 (3.7): a demand READ installs the shadow writable too when the leaf has D = 1 and the walk
+            // grants the write, on WB or WC memory, and no vCPU holds translations from the frame, by the read-side protocol of
+            // [`cpu::writable_on_read`] (not this path's: nothing is written here, so [`code_written`] is never called for a read).
+            let on_read = access == Access::Read
+                && cpu::writable_on_read(
+                    cache::control().writable_on_read_off == 0,
+                    t.writable,
+                    t.dirty,
+                    kind,
+                    || cache::translated(t.gpa),
+                    || cache::shadowed_writable(t.gpa),
+                );
             if writable {
                 if shadow {
                     cache::shadowed_writable(t.gpa);
@@ -3006,6 +3390,7 @@ fn translate(
             }
             cache::control().memory_types[kind as usize] += 1;
             let old = tables::descriptor(s.cpu.cpl, va);
+            let writable = writable || on_read;
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
                 s.upgrades += 1;
             }
@@ -3720,7 +4105,17 @@ fn install_ones(s: &mut State, va: u64) {
 /// set again and the marks read again, and a page marked meanwhile is shadowed read-only (the access faults again and
 /// takes the code-write path).
 fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
+    // Waiting for a peer's split lock serves its shadow-drop request, which resets this vCPU's shadows and clears its writable
+    // bits, this page's included: then the bit is set again and the marks read again, as after the eviction below (else a
+    // writable shadow without a bit lets a code write through it go unnoticed by a peer's later `mark`).
+    let generation = s.shadow_generation;
     split_wait(s, &[gpa]);
+    let writable = writable && {
+        generation == s.shadow_generation || {
+            cache::shadowed_writable(gpa);
+            !cache::translated(gpa)
+        }
+    };
     match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {

@@ -181,6 +181,9 @@ pub(crate) enum Rights {
     Text,
     Code,
     Data,
+    /// Data the resident reads and never writes or executes (the template pool, [`natemu_abi::pool`]): EL1 read-only, no
+    /// EL0 access, never executable.
+    ReadOnly,
 }
 /// AP 10 (EL1 read-only, no EL0 access), AP 01 (EL1 and EL0 read/write), PXN and UXN.
 const READ_ONLY: u64 = 1 << 7;
@@ -219,6 +222,14 @@ impl Span {
             bytes,
             target,
             rights: Rights::Data,
+        }
+    }
+    pub(crate) const fn read_only(offset: usize, bytes: usize, target: usize) -> Self {
+        Self {
+            offset,
+            bytes,
+            target,
+            rights: Rights::ReadOnly,
         }
     }
 }
@@ -306,6 +317,7 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
             Rights::Text => READ_ONLY | UXN,
             Rights::Code => READ_ONLY | PXN,
             Rights::Data => PXN | UXN,
+            Rights::ReadOnly => READ_ONLY | PXN | UXN,
         };
         if span.offset >= BLOCK_BYTES {
             assert!((span.offset | span.bytes | span.target) % BLOCK_BYTES == 0);
@@ -462,6 +474,29 @@ pub(crate) mod tests {
                 assert_eq!(pte & (PXN | UXN | 3 << 6), PXN | UXN);
             }
         }
+    }
+
+    /// The template pool's span is mapped in 2 MiB blocks, EL1 read-only, never executable, no EL0 access: no store of the
+    /// resident reaches it (it faults), whatever a defect in a reader.
+    #[test]
+    fn pool_span_is_mapped_read_only_and_never_executable() {
+        use natemu_abi::execution::cache::{BLOCK, POOL_BYTES, POOL_VA};
+        let memory = Memory::new().unwrap();
+        let (offset, target) = ((POOL_VA - PRIVATE) as usize, 0x4000_0000);
+        private_space(&memory, 0, &[Span::read_only(offset, POOL_BYTES, target)], false);
+        let l2 = private_l2(offset >> 30);
+        for block in (0..POOL_BYTES).step_by(BLOCK) {
+            let at = offset + block;
+            let pte = u64::from_le_bytes(memory.read::<8>(l2 + (at % (1 << 30)) / BLOCK * 8));
+            assert_eq!(pte, (IPA + (target + block) as u64) | self::BLOCK | READ_ONLY | PXN | UXN);
+            assert_eq!(pte & EL0_DATA, 0);
+        }
+        // The blocks around it are not the pool's.
+        let before = u64::from_le_bytes(memory.read::<8>(l2 + (offset % (1 << 30)) / BLOCK * 8 - 8));
+        let after = u64::from_le_bytes(
+            memory.read::<8>(l2 + ((offset + POOL_BYTES) % (1 << 30)) / BLOCK * 8),
+        );
+        assert_eq!((before, after), (0, 0));
     }
 
     /// G1: the guest-state alias is one EL0 read/write page in both spaces' upper roots, at an upper-root entry below 256
