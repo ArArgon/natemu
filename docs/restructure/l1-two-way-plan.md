@@ -1,6 +1,6 @@
 # Two-way L1: a second entry per set at today's memory
 
-Status: design, not built (November 14, 2026), branch `perf-real-workload`; [io5-perf-notes](io5-perf-notes.md) decision
+Status: chunk 1 built (November 14, 2026) on branch `l1-two-way` (section 11); design on `perf-real-workload`; [io5-perf-notes](io5-perf-notes.md) decision
 21, after the L1 count (`natemu-raw/l1-study-profile-1`, `tools/l1_study_an.py` on branch `l1-count`). Builds before the
 [page-currency](page-currency-plan.md) and [fast-miss](fast-miss-plan.md) plans (fast-miss plan section 7). Line
 numbers are those of `f9a85bb`.
@@ -300,3 +300,22 @@ review before the gate).**
 | `cut_one` loops over both slots keyed on the owner; every raw owner read masks or preserves `L1_NEXT`; the abi assertion at `:983` and `main.rs:33`'s `l1_mask`; fill step 3 is a hint, not a condition | Fixed (3.3, 3.4) |
 | Way-1 hit may mispredict (~4 ns); the cost row measures the predicted case; one profile cannot judge the guest guard | Fixed (5, 8): an unpredictable `l1way1-rand` row; the guard judged over three interleaved rounds |
 | Blocking: M1 passed (`l1-pair` never empties way 0); M8 passed; M9 produces duplicate list entries, not a stale slot; M4 lacked its sequence; `l1-triple`'s "after C" explanation; the fast-miss prelude note | Fixed: M1 -> `l1-global` (B non-global into way 0, A global into way 1, CR3 reload, A hits with 0 misses); M8 -> new `l1-dup` (a resident re-entry at B while B is in way 1 and the bit names way 0); M9 -> the list checker; M4's sequence stated and its CR3-pass halt noted; `l1-triple`: B's way was the older, exactly 2 misses in that round; the prelude note names V + 32 KiB |
+
+## 11. Chunk 1 as built (branch `l1-two-way`)
+
+- **Probe**: the dispatcher is `and x1, x0, #0x7fff; adrp; add x2, x2, x1, lsl #6; br x2` (4 instructions, `fill_head` checks the
+  `and` and `add` words, not only the `adrp`). Way-0 hit 4 + 7 = 11; way-1 hit 4 + 6 + 7 = 17; way 0 empty and way-1 hit
+  4 + 1 + 7 = 12; miss with both ways filled 4 + 6 + 7 = 17, then the `svc`; miss with way 0 empty 4 + 1 + 7 = 12.
+- The words, the empty words, the choice of way (`l1_fill`) and the slot arithmetic are pure functions in the abi
+  (`cache::l1_words`, `l1_empty_word`, `l1_fill`, `l1_slots_of`, `l1_word_rip15`), unit-tested there; the resident calls them.
+  The CR3 pass keeps `L1_NEXT` when a slot leaves the list.
+- `L1_NEW_CONFLICT` is counted in `perf` builds (one increment per replacement), from bit 20 of the victim's first word
+  (`movz x2, #rip[15:0]`), not through its block; `L1_EVICTED` and `count_miss` stay under `dispatch-study`.
+- The list checker (`link-check`) runs at the start and the end of every TLB flush (CR3 load or global flush); K1 programs end
+  with a CR3 restore, so each program's last state is checked.
+- K1 miss counts come from the perf bucket's entry count (`dispatch_misses` in the K1 stats, 0 from a resident without
+  `perf`): differences of runs at K and 2K rounds, or of a program against its variant, so setup and glue misses cancel. The
+  variants `l1-triple-t0`, `l1-triple-t3`, `l1-global-x`, `l1-dup-x` are measured only. `l1-dup` and `l1-pic` are natemu only
+  (CPUID leaves differ from QEMU's; PIC values as `reuse-alias`). The CPUID at B - 2 is never in L1: it misses every round
+  (cancelled by the `-x` variant).
+- Mutants M1-M11 as patches in `natemu-raw/l1-two-way-mutants-20261114/` (`M5abi` is M5's model form).
