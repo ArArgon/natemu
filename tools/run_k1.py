@@ -154,6 +154,20 @@ beside them:
   resident fills L1 for B while B is in way 1 (a CPUID is never in L1: one miss a round of its own), then A: no miss for it
   (against B called again).
 - `l1-pic` (natemu only): two instances of one shared translation at aliases in one L1 set, each with its own page base.
+Page-currency chunk 0 (docs/restructure/page-currency-plan.md section 8; the record only observes, so every value is today's): a
+`page-study` resident (`--page-runtime`, built here when not given) probes a per-vCPU record of fetch-walk results at every
+fetch walk, makes the walk all the same and counts the disagreements. Run under it, EVERY program must show zero disagreements
+(`PAGE_DISAGREE` lists the ones with expected counts: a PTE changed with no invalidation is a legal difference), and the
+programs below also assert their own counters (`PAGE_COUNTS`):
+- `page-share`: X and Y on one page V (A: V -> F1, B: V -> F2, other bytes). (a) A: X, Y; B: X, Y; A: X, Y: each space's bytes
+  every time (r8 r9 / r10 r12 / r14 r15); (b) in a fresh epoch of A, X then Y (Y found on the recorded page), V's PTE -> F2 and
+  INVLPG V: Y runs F2's bytes (rbx); (c) V made not present, a load faults, the handler maps F1 with no INVLPG: Y runs F1's bytes
+  (rbp; rdi counts the #PF). Zero disagreements: an INVLPG or a #PF that left its record, or a record that outlived its epoch,
+  would show. The record answers Y's revalidations on the recorded page (`hit_4k[0]` >= 2).
+- `page-check-keep` (natemu only): X on V recorded (F1); V's PTE -> F2 with no invalidation; Y and then Z placed on V: both
+  walks find F2 where the record says F1: `disagree` is exactly 2, and (the record only observes) they run F2's bytes.
+- `page-large-edge` (natemu only): a 2 MiB leaf at guest-physical 0 covers the legacy hole (0xa0000-0xfffff): X (below it) runs;
+  the fetch of Y (inside it) ends the run in the typed stop `no_code fetch_not_ram`. The record must not take the leaf (`split_2m`).
 Writes DIR/k1.json; exit status 1 on any failure."""
 import argparse, json, os, pathlib, subprocess, sys
 
@@ -342,6 +356,7 @@ def bodies(k, i=0, n=1):
         **links_bodies(k, i, n),
         **reuse_bodies(i, n),
         **l1_bodies(k, i, n),
+        **page_bodies(i),
         'link-full': full_body(i, n),
         # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
         # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
@@ -618,6 +633,98 @@ def pic_bodies(i, n=1):
     return out
 
 
+# Page-currency chunk 0 (module docstring): X, Y, Z at V + 0, 0x100, 0x200 (every frame holds `mov eax, k; jmp r13` at each: F1's
+# 1, 0x11, 0x21, F2's 2, 0x12, 0x22). `page-large-edge`: linear 2 MiB page LP over guest-physical 0, X at gpa 0x30000, Y in the legacy hole.
+PAGE_PROGRAMS = ('page-share', 'page-check-keep', 'page-large-edge')
+PX, PY, PZ = 0, 0x100, 0x200
+PEDGE_X, PEDGE_Y = 0x30000, 0xa1000
+
+
+def page_bodies(i):
+    d = P.SYS_D(i)
+    leaf = P.sys_leaf(i, 0, d)
+    put = lambda frame, bits=P.LEAF: f'    mov rax, {frame | bits:#x}\n    mov [{leaf:#x}], rax\n'
+    cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
+    inv = '    mov rax, {V:#x}\n    invlpg [rax]\n'
+    at = lambda off: f'{{V:#x}}+{off:#x}'
+    save = lambda reg: f'    mov {reg}, rax\n'
+    pde = P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21)
+    return {
+        'page-share': (adv_idt(d) + '    xor edi, edi\n'
+                       # (a) three epochs: A, B, A
+                       + call('a0', at(PX)) + save('r8') + call('a1', at(PY)) + save('r9')
+                       + cr3('tb') + call('b0', at(PX)) + save('r10') + call('b1', at(PY)) + save('r12')
+                       + cr3('ta') + call('c0', at(PX)) + save('r14') + call('c1', at(PY)) + save('r15')
+                       # (b) a fresh epoch of A: X, then Y on the page X recorded; V -> F2 and INVLPG V: Y runs F2's bytes
+                       + cr3('ta') + call('d0', at(PX)) + call('d1', at(PY)) + put(d + F2) + inv + call('d2', at(PY)) + save('rbx')
+                       # (c) V not present, a load faults, the handler maps F1 again with no INVLPG: Y runs F1's bytes
+                       + cr3('ta') + call('e0', at(PY)) + put(d + F1, P.LEAF & ~1) + f'    mov rsi, [{d:#x}]\n' + call('e1', at(PY)) + save('rbp')
+                       + '    jmp .end\n.h:\n' + put(d + F1) + '    inc rdi\n    add rsp, 8\n    iretq\n.end:\n'),
+        # X recorded under F1, V -> F2 with no INVLPG, Y and Z placed on V (new blocks, so each walks V).
+        'page-check-keep': call('k0', at(PX)) + save('r8') + put(d + F2) + call('k1', at(PY)) + save('r9') + call('k2', at(PZ)) + save('r10'),
+        # The 2 MiB leaf over gpa 0 (the legacy hole inside it), X below the hole runs, Y in the hole is not RAM.
+        'page-large-edge': (f'    mov rax, {0x80 | P.LEAF:#x}\n    mov [{pde:#x}], rax\n'
+                            + call('x0', f'{LP + PEDGE_X:#x}') + save('r8') + call('x1', f'{LP + PEDGE_Y:#x}') + save('r9')),
+    }
+
+
+def page_memory(name, i):
+    """The code of `page_bodies`' programs beyond what `program` gives every CPU (the frames' code at 0 is there already)."""
+    d = P.SYS_D(i)
+    code = lambda at, k: {'addr': f'0x{at:x}', 'data': CODE(k).hex(), 'capture': False}
+    if name == 'page-large-edge':
+        return [code(PEDGE_X, 1)] if i == 0 else []
+    out = [code(d + F1 + PY, 0x11), code(d + F2 + PY, 0x12), code(d + F1 + PZ, 0x21), code(d + F2 + PZ, 0x22)]
+    return out + ([dict(P.zero(d + IDT, 0x1000), capture=False)] if name == 'page-share' else [])
+
+
+# The registers (natemu only: after a #PF QEMU keeps V's TLB entry, so its Y in phase (c) runs F2's bytes: `pf-remap`'s reason).
+PAGE_VALUES = {
+    'page-share': {'r8': {1}, 'r9': {0x11}, 'r10': {2}, 'r12': {0x12}, 'r14': {1}, 'r15': {0x11}, 'rbx': {0x12}, 'rbp': {0x11}, 'rdi': {1}},
+    'page-check-keep': {'r8': {1}, 'r9': {0x12}, 'r10': {0x22}},
+    'page-large-edge': {'r8': {1}, 'r9': {0}},
+}
+# Page-currency counters under a `page-study` resident. PAGE_DISAGREE: disagreements per vCPU (default 0) between the record's answer
+# and the walk's (a legal difference only where a PTE changed with no invalidation: the record is a TLB entry); PAGE_COUNTS: further
+# bounds, (low, high) of a counter given as 'field' or 'field[i]' (a Counts array's entry).
+# (default, with `--max-block 1`: each instruction its own block, so a placement walks once per instruction.) Why not more of the
+# programs that edit a PTE with no invalidation: `no-invlpg`, `global` and `place-global` run an already current block (or one
+# kept by G) and `invlpg-page` a kept link: no fetch walk happens while the record is stale, so none can disagree.
+#   `local-gpa`: T, a new block, is placed (walked) after V -> F2 with no INVLPG: the record says F1, the walk F2 (a frame).
+#   `pf-fetch`: the PTE made not present, a block placed at V + 0x10: the record answers, the walk faults (a TLB entry outlives it).
+#   `self-invlpg`, `self-pge`: code writes its own page's PTE and then runs system instructions (INVLPG; CR4 writes) on that same page,
+#   each fetched (placed or revalidated) while the PTE is changed and the old translation not yet dropped: one frame disagreement per
+#   such fetch (a TLB entry keeps serving until the INVLPG or the flush). `mixed-g1`: a global page mapped to other frames in A and B
+#   is served from the global record across the CR3 load (SDM 4.10.4.1), the walk finds B's frame.
+PAGE_DISAGREE = {'page-check-keep': (2, None), 'local-gpa': (1, 2), 'pf-fetch': (1, 1), 'self-invlpg': (2, 2), 'self-pge': (6, 6), 'mixed-g1': (3, 3)}
+PAGE_COUNTS = {
+    'page-share': {'hit_4k[0]': (2, None), 'records': (4, None)},
+    'page-check-keep': {'disagree_frame': (2, 2), 'disagree_flags': (0, 0), 'disagree_fault': (0, 0)},
+    'local-gpa': {'disagree_frame': (1, 1), 'disagree_fault': (0, 0)},
+    'pf-fetch': {'disagree_fault': (1, 1), 'disagree_frame': (0, 0)},
+    'page-large-edge': {'split_2m': (1, None), 'hit_2m[0]': (0, 0), 'hit_2m[1]': (0, 0), 'not_ram[1]': (1, None)},
+}
+# The programs also run under the study resident for their counters (`page_counts`), beside the standard runs.
+PAGE_RUNS = ('no-invlpg', 'pf-fetch', 'place-global', 'invlpg-page', 'global', 'local-gpa', 'invlpg-large', 'pf-large', 'large-reval', 'self-invlpg', 'self-pge', 'mixed-g1') + PAGE_PROGRAMS
+# A typed stop instead of the body's end: (stop, a word of its reason).
+EXPECT_STOP = {'page-large-edge': ('no_code', 'fetch_not_ram')}
+
+
+def page_study_problems(name, ps, block1=False):
+    """The page-currency counters of one vCPU against what `name` expects (module docstring)."""
+    problems = []
+    want = PAGE_DISAGREE.get(name, (0, 0))[block1]
+    if want is not None and sum(ps['disagree']) != want:
+        problems.append(f"page record disagreed with the walk {ps['disagree']} times (frame {ps['disagree_frame']}, flags {ps['disagree_flags']}, "
+                        f"walk faulted {ps['disagree_fault']}), want {want}")
+    for field, (low, high) in ({} if block1 else PAGE_COUNTS.get(name, {})).items():
+        base, _, index = field.rstrip(']').partition('[')
+        got = ps[base][int(index)] if index else ps[base]
+        if got < low or high is not None and got > high:
+            problems.append(f'page counter {field} = {got}, want {low}..{high if high is not None else ""}')
+    return problems
+
+
 # Perf chunk 11 (`link-full`, natemu only): more links than the record area holds. FM linear pages from HIGH (table A)
 # map frame FC of 2048 `jz $+2` (two link points each, both to the next RIP: 2 * 2048 * FM records > MAX_LINKS; the
 # pages but one are copies of the first's blocks), page FW its copy FWC, then page FE (`inc ebx; jmp r13`). A pass adds
@@ -862,6 +969,7 @@ EITHER = {
     'l1-dup-x': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {2 * k}},
     'link-full': {'r8': {3}, 'r9': {6}, 'r10': {12}, 'r12': {6}},
     'hint-reset': {'r8': {12}},
+    **{n: PAGE_VALUES[n] for n in PAGE_PROGRAMS},
 }
 
 
@@ -906,7 +1014,8 @@ def program(name, n, k):
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
             {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name == 'l1-pic' else [])
-            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL else []))
+            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL else [])
+            + (page_memory(name, i) if name in PAGE_PROGRAMS else []))
     return out
 
 
@@ -1036,6 +1145,39 @@ def perf_runtime(a):
     return out
 
 
+def study_runtime(a):
+    """The resident with its `page-study` feature (the page-currency record's counters), built into its own target directory."""
+    if a.page_runtime:
+        return a.page_runtime
+    target = ROOT / 'target' / 'study'
+    out = target / 'aarch64-unknown-none/release/natemu-runtime'
+    sources = [f for d in ('crates/runtime', 'crates/abi') for f in (ROOT / d).rglob('*') if f.is_file()] + [ROOT / 'Cargo.lock', ROOT / '.cargo/config.toml']
+    fresh = out.exists() and out.stat().st_mtime >= max(f.stat().st_mtime for f in sources if f.exists())
+    if not (os.environ.get('NATEMU_PREBUILT') == '1' and fresh):
+        subprocess.run(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none',
+                        '--features', 'page-study'], cwd=ROOT, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True)
+    a.page_runtime = out
+    return out
+
+
+def page_counts(a, n, name, report):
+    """`name` under the `page-study` resident: its page-currency counters (`page_study_problems`, run for every program under
+    that resident) and, for the page programs, their values. Returns the failures."""
+    adv = name in adv_setup(0)
+    prog = adv_program(name, n) if adv else program(name, n, a.k)
+    out, problems = run(a, prog, [], None, study_runtime(a), '-ps')
+    if out and name in PAGE_VALUES:
+        for v, c in enumerate(out['cpus']):
+            got = {r: smp.num(c['gpr'][P.REGS.index(r)]) for r in PAGE_VALUES[name]}
+            problems += [f'cpu{v} {r} = {got[r]:#x}, want {sorted(hex(x) for x in ok)}' for r, ok in PAGE_VALUES[name].items() if got[r] not in ok]
+    ps = [c['stats']['k1'].get('page_study') for c in out['cpus']] if out else []
+    if out and not all(ps):
+        problems.append('no page_study counters (is the resident built with `page-study`?)')
+    report.append({'name': f'k1-{name}@{n}-page', 'max_block': None, 'stats': ps, 'problems': problems})
+    print(json.dumps(report[-1]), flush=True)
+    return [f'page {name}@{n}: {p}' for p in problems]
+
+
 def l1_counts(a, n, name, report):
     """`name`'s dispatcher misses on each vCPU, as differences of runs of the program (and its variants) at K and 2K rounds:
     the setup, the tails and the glue misses cancel. Returns the failures."""
@@ -1083,11 +1225,20 @@ def run(a, prog, extra, host=None, runtime=None, tag=''):
         env['NATEMU_LINK_CAP'] = str(CAP)
     rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
+    short = prog['name'].split('@')[0].split('-', 1)[1]
+    stop = EXPECT_STOP.get(short)
     for v, c in enumerate(out['cpus'] if out else []):
         end = s3.body_end(prog, smp.num(prog['cpus'][v]['rip']))
-        if c['stop'] != 'reached' or smp.num(c['rip']) != end:
+        if stop:
+            if c['stop'] != stop[0] or stop[1] not in c['reason']:
+                problems.append(f"cpu{v} stopped {c['stop']} {c['reason']}, want {stop}")
+        elif c['stop'] != 'reached' or smp.num(c['rip']) != end:
             problems.append(f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']} (end {end:#x})")
         problems += [f'cpu{v} ' + p for p in s3.per_vcpu_checks(c)]
+        # Page-currency chunk 0: under a `page-study` resident every program's disagreements are counted (module docstring).
+        ps = c['stats']['k1'].get('page_study')
+        if ps:
+            problems += [f'cpu{v} {p}' for p in page_study_problems(short, ps, bool(extra))]
     return out, problems
 
 
@@ -1103,6 +1254,7 @@ def main():
     ap.add_argument('--base-runtime', type=pathlib.Path)
     ap.add_argument('--programs', type=lambda s: s.split(','), help='only these programs (and no counts)')
     ap.add_argument('--perf-runtime', type=pathlib.Path, help="a resident built with `--features perf` for the two-way L1 programs' dispatcher-miss counts (default: built into target/perf here)")
+    ap.add_argument('--page-runtime', type=pathlib.Path, help="a resident built with `--features page-study` for the page-currency counters (default: built into target/study here)")
     shard.add(ap)
     ap.add_argument('--full-links', action='store_true', help=f'link-full at the production link capacity ({MAX_LINKS} records: ~6 min at 1 vCPU, ~20 at 4) instead of the test capacity {LINK_CAP} (the end-of-round suite runs this once)')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
@@ -1177,6 +1329,10 @@ def main():
     for n in a.cpus:
         for name in [x for x in COUNT_CHECKS if (n, x, 0) in mine and not os.environ.get('NATEMU_PIC_TEST')]:
             failures += l1_counts(a, n, name, report)
+    # The page-currency record's counters (one run each, under the `page-study` resident; none under a PIC test mode: it fills no record).
+    for n in a.cpus:
+        for name in [x for x in PAGE_RUNS if (n, x, int(x in adv_setup(0))) in mine and not os.environ.get('NATEMU_PIC_TEST')]:
+            failures += page_counts(a, n, name, report)
     for n in a.cpus:
         for name in [x for x in adv_setup(0) if (n, x, 1) in mine]:
             prog = adv_program(name, n)

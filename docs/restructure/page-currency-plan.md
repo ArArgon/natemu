@@ -270,6 +270,31 @@ un-invalidated PTE edits; Linux at N = 1) and at most 10 per million hits at fou
 is not dropped but folded into item 2 (see the sequencing note), since item 2 needs a walk-free revalidation whatever
 this item's own saving; the counters stay in `io5-bins`.
 
+**Chunk 0 as built (November 14, branch `page-count`; the profile and its gate are the main session's).** Resident feature
+`page-study` (implies `perf`, is not `perf`; no host feature: the record lies in the lookup area's slack, `area::PAGE_STAMPS`,
+`LOOKUP_BYTES` is unchanged). `natemu_abi::page_study` holds the record and its rules as pure functions (key, hit rule, RAM rule,
+four-key invalidation, eviction test; unit-tested); `runtime/src/execution/page_study.rs` is the shadow probe
+(`page_translation(s, va, REVAL | PLACE)` replaces `fetch_walk` at the two call sites, `revalidated` and `fetch_page`; without the
+feature it is `fetch_walk`, inlined, so the default and perf builds are unchanged: per-function instruction streams equal, only
+rodata offsets differ). The walk is always made and returned; a miss records the walk's answer, a hit that disagrees records
+nothing (the record stays the entry under test). `cache::invlpg` clears both classes and sizes (INVLPG and every #PF). Counters,
+per vCPU in `k1.page_study` of the K1 stats and the perf log: walks, would-hits (4 KiB / 2 MiB) and their classes (global leaf,
+2 MiB leaf, user) by caller; disagreements by caller and kind (frame, flags, walk faulted); records, evictions of a live record,
+split 2 MiB leaves, INVLPG/#PF clears, most records made in one epoch; revalidated blocks by class and how many had every page
+answered by the record; CNTVCT sums of the probe and of the walk alone for would-hit and would-miss walks by caller (the placement's
+`mark` stays outside, so `fetch` bucket minus the placement walks is the rest of the bucket); the cost of two counter reads.
+Timestamps are plain `mrs cntvct_el0` (no `isb`), so a single sample is skewed but a mean over many walks is not. Placement
+includes the single-instruction step block's walk (`fetch_page` with `block = false`). `tools/page_study_an.py PROFILE_DIR`
+prints the gate model. K1: every program run under a `page-study` resident asserts zero disagreements except the ones with
+expected counts (`PAGE_DISAGREE`, in `run_k1.py`). Only `local-gpa` (1: T placed after V -> F2 with no INVLPG), `pf-fetch` (1: the
+record answers a PTE made not present), `page-check-keep` (2), and three adversarial programs whose code edits its own page's PTE
+before the INVLPG or flush on that same page (`self-invlpg` 2, `self-pge` 6, `mixed-g1` 3: a global page served across a CR3 load)
+disagree; `no-invlpg`, `place-global`, `invlpg-page` and `global`, which the plan listed, show 0, because no fetch walk happens
+while their record is stale (a current block, or a kept link, runs). Mutations M2 (epoch ignored), M4 (INVLPG leaves 4 KiB records),
+M5 (INVLPG leaves 2 MiB records) and M7 (a global record kept across a global flush) each turn K1 red (`page-share`, `page-share`,
+`invlpg-large` and `pf-large`, `global`). `page-share` is natemu-only here, not QEMU-compared as section 8 planned: its phase (c) is `pf-remap`'s
+case, where QEMU keeps the stale entry after a #PF (not run against QEMU; the plan's QEMU label should follow `pf-remap`).
+
 **Chunk 1: build (S-M: about 150-250 lines; abi area constant and key helpers, `page_translation`, four clears in
 `invlpg`, counters, the host flag, the runner's per-program host flags and expected-count form; independent review
 before the gate).**
