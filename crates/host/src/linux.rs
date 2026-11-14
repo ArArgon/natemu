@@ -23,6 +23,35 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+/// How a virtio device is attached to the guest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Transport {
+    #[default]
+    Mmio,
+    Pci,
+}
+/// The transport of each virtio device (naming one that is not enabled does nothing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Transports {
+    pub disk: Transport,
+    pub net: Transport,
+    pub rng: Transport,
+}
+impl Transports {
+    pub const fn all(t: Transport) -> Self {
+        Self {
+            disk: t,
+            net: t,
+            rng: t,
+        }
+    }
+}
+/// PCI slots of the virtio functions (00:01.0 block, 00:02.0 network, 00:03.0 entropy); the GSIs are the MMIO
+/// resources' (`BLOCK_RESOURCE.gsi` and so on), which the functions keep as their INTx lines.
+const BLOCK_SLOT: u8 = 1;
+const NET_SLOT: u8 = 2;
+const RNG_SLOT: u8 = 3;
+
 /// What to boot and how.
 pub struct Boot {
     /// The resident (the built `natemu-runtime` ELF) and the fexc binary.
@@ -69,6 +98,8 @@ pub struct Boot {
     pub disk: Option<PathBuf>,
     /// Expose the virtio-MMIO network device on user-mode NAT ([`crate::virtio::Slirp`]).
     pub net: bool,
+    /// Per device, virtio-MMIO (default) or virtio-PCI.
+    pub transports: Transports,
 }
 
 impl Boot {
@@ -96,6 +127,7 @@ impl Boot {
             rng: false,
             disk: None,
             net: false,
+            transports: Transports::all(Transport::Mmio),
         }
     }
 
@@ -108,9 +140,15 @@ impl Boot {
                     .into(),
             );
         }
+        let t = self.transports;
+        let on_pci = |enabled: bool, t: Transport| enabled && t == Transport::Pci;
+        let pci_rng = on_pci(self.rng, t.rng);
+        let pci_disk = on_pci(self.disk.is_some(), t.disk);
+        let pci_net = on_pci(self.net, t.net);
         let layout = Layout {
             low_end: self.ram.min(exec::LOW_RAM_END),
             high: self.ram.saturating_sub(exec::LOW_RAM_END),
+            pci: pci_rng || pci_disk || pci_net,
         };
         layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
         require_vcpus(self.vcpus)?;
@@ -120,17 +158,26 @@ impl Boot {
             self.vcpus,
             self.ram as usize,
         )?;
-        let mut manifest = Vec::new();
-        if self.rng {
-            manifest.push(crate::virtio::RNG_RESOURCE);
+        // ACPI lists each enabled device once: virtio-MMIO devices in the manifest, PCI functions as (slot, GSI).
+        let (mut manifest, mut functions) = (Vec::new(), Vec::new());
+        for (enabled, pci, resource, slot) in [
+            (self.rng, pci_rng, crate::virtio::RNG_RESOURCE, RNG_SLOT),
+            (
+                self.disk.is_some(),
+                pci_disk,
+                crate::virtio::BLOCK_RESOURCE,
+                BLOCK_SLOT,
+            ),
+            (self.net, pci_net, crate::virtio::NET_RESOURCE, NET_SLOT),
+        ] {
+            if pci {
+                functions.push((slot, resource.gsi));
+            } else if enabled {
+                manifest.push(resource);
+            }
         }
-        if self.disk.is_some() {
-            manifest.push(crate::virtio::BLOCK_RESOURCE);
-        }
-        if self.net {
-            manifest.push(crate::virtio::NET_RESOURCE);
-        }
-        let tables = boot::acpi::build_with_virtio(self.vcpus, self.rsdp, &manifest);
+        functions.sort_unstable();
+        let tables = boot::acpi::build_with_devices(self.vcpus, self.rsdp, &manifest, &functions);
         let inputs = Inputs {
             image: &self.kernel,
             cmdline: &self.cmdline,
@@ -168,16 +215,25 @@ impl Boot {
         // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
         let board = clock::install(&mut devices, &irqs, lost, &uart)?;
         let mut virtio = Vec::new();
+        let mut bus = crate::pci::Bus::new();
         if self.rng {
             let resource = crate::virtio::RNG_RESOURCE;
             let rng = crate::virtio::Virtio::rng(irqs.clone(), resource.gsi as usize);
-            devices.register(resource.base.into(), 4096, rng.device())?;
+            if pci_rng {
+                bus.add(RNG_SLOT, rng.pci(RNG_SLOT))?;
+            } else {
+                devices.register(resource.base.into(), 4096, rng.device())?;
+            }
             virtio.push(rng);
         }
         if let Some(path) = &self.disk {
             let resource = crate::virtio::BLOCK_RESOURCE;
             let disk = crate::virtio::Virtio::block(irqs.clone(), resource.gsi as usize, path)?;
-            devices.register(resource.base.into(), 4096, disk.device())?;
+            if pci_disk {
+                bus.add(BLOCK_SLOT, disk.pci(BLOCK_SLOT))?;
+            } else {
+                devices.register(resource.base.into(), 4096, disk.device())?;
+            }
             virtio.push(disk);
         }
         let mut net = None;
@@ -191,8 +247,15 @@ impl Boot {
                 crate::virtio::Slirp::OFFLOADS,
             )?;
             net = Some(crate::virtio::Slirp::new(port)?);
-            devices.register(resource.base.into(), 4096, device.device())?;
+            if pci_net {
+                bus.add(NET_SLOT, device.pci(NET_SLOT))?;
+            } else {
+                devices.register(resource.base.into(), 4096, device.device())?;
+            }
             virtio.push(device);
+        }
+        if layout.pci {
+            bus.install(&mut devices)?;
         }
         devices.strict = self.strict_unassigned;
         Ok(Prepared {
@@ -685,6 +748,30 @@ mod tests {
         let at_end = rises();
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(rises(), at_end);
+    }
+
+    /// An entropy device on PCI installs the bus (the memory window and the ports at 0xCF8) and leaves the MMIO
+    /// register page unregistered; on MMIO, as before, there is no window.
+    #[test]
+    fn a_pci_device_installs_the_bus_and_an_mmio_one_does_not() {
+        let resident =
+            std::env::temp_dir().join(format!("natemu-linux-pci-{}.elf", std::process::id()));
+        std::fs::write(
+            &resident,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
+        for (transport, pci) in [(Transport::Pci, true), (Transport::Mmio, false)] {
+            let mut boot = Boot::new(&resident, "fexc", boot::tests::image(0x1000));
+            (boot.ram, boot.code_bytes) = (64 << 20, exec::cache::MAX_BLOCK_BYTES);
+            boot.rng = true;
+            boot.transports.rng = transport;
+            let prepared = boot.prepare().unwrap();
+            let found = |gpa: u64| prepared.devices().find(gpa).is_some();
+            assert_eq!(found(crate::pci::platform::WINDOW.0.into()), pci);
+            assert_eq!(found(crate::virtio::RNG_RESOURCE.base.into()), !pci);
+        }
+        std::fs::remove_file(&resident).unwrap();
     }
 
     /// R2's blocker: the chipset must post into the guest memory of the `Prepared` it ends up in, after `prepare`

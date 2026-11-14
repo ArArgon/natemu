@@ -91,6 +91,7 @@ name = "natemu-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "log",
  "natemu",
 ]
 

@@ -194,6 +194,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
     let layout = Layout {
         low_end: ram.min(exec::LOW_RAM_END),
         high: ram.saturating_sub(exec::LOW_RAM_END),
+        pci: false,
     };
     layout.e820().map_err(|e| e.to_string())?; // before allocating L bytes
     if load_only {
