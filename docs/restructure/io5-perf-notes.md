@@ -50,6 +50,9 @@ Rules learned in this round:
   the next step, then one K1 on the combined build of ready changes, then its profile, then reference timings (VZ).
   Long K1 cases run once per group, not per change; never run a VM at background priority (`taskpolicy -c background`
   is for builds only: a K1 under it took over 25 minutes on one case).
+- **One integration branch** (owner, November 14): each change is built in its own worktree and branch; once admitted
+  (review, K1, measured gate) it merges into `perf-real-workload`, which is pushed regularly; finished worktrees are
+  removed (branches kept).
 - **Correctness tests are fast unless justified** (owner, November 14). K1's `link-full` grew to ~30 of K1's 35 minutes
   when link capacity became 512 Ki; it gets a test-only capacity cap (same overflow paths), full size only at the end of
   a round. The suite's slow steps (faults shards, probes, pic-*, i7-faults, instruction-gaps, cpu-forms: 190-363 s
