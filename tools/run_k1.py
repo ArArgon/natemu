@@ -190,6 +190,11 @@ programs below also assert their own counters (`PAGE_COUNTS`):
   walks find F2 where the record says F1: `disagree` is exactly 2, and (the record only observes) they run F2's bytes.
 - `page-large-edge` (natemu only): a 2 MiB leaf at guest-physical 0 covers the legacy hole (0xa0000-0xfffff): X (below it) runs;
   the fetch of Y (inside it) ends the run in the typed stop `no_code fetch_not_ram`. The record must not take the leaf (`split_2m`).
+Fault-around plan chunk 1 (writable on a read when D = 1, docs/restructure/fault-around-plan.md 3.7; `fa_setup`, `fa-ro`): `fa-read-code`,
+`fa-read-code-r`, `fa-read-smc` (a read of a page holding translations, or one translated right after), `fa-ad0` (D = 0 read then written), `fa-rw`
+(D = 1: no upgrade abort), `fa-ro-wp` (R/W = 0 at CPL 0 with WP 1 and 0), `fa-wt` (a WT page is read-only at a read), all QEMU-compared at CPL 0 with
+natemu's counters asserted (`STAT_EXACT`, `UC_STEPS`); `fa-ro` (natemu only, CPL 3: R/W = 0 read then written: #PF 7). With
+NATEMU_WRITABLE_ON_READ=off the exact counts are skipped and the switch itself is checked (an upgrade abort must appear).
 Writes DIR/k1.json; exit status 1 on any failure."""
 import argparse, json, os, pathlib, subprocess, sys
 
@@ -823,7 +828,7 @@ PAGE_COUNTS = {
 # The programs also run under the study resident for their counters (`page_counts`), beside the standard runs.
 PAGE_RUNS = ('no-invlpg', 'pf-fetch', 'place-global', 'invlpg-page', 'global', 'local-gpa', 'invlpg-large', 'pf-large', 'large-reval', 'self-invlpg', 'self-pge', 'mixed-g1') + PAGE_PROGRAMS
 # A typed stop instead of the body's end: (stop, a word of its reason).
-EXPECT_STOP = {'page-large-edge': ('no_code', 'fetch_not_ram'), 'page-user': ('guest_fault', ''), 'miss-ac': ('guest_fault', '')}
+EXPECT_STOP = {'page-large-edge': ('no_code', 'fetch_not_ram'), 'page-user': ('guest_fault', ''), 'miss-ac': ('guest_fault', ''), 'fa-ro': ('guest_fault', '')}
 
 
 def page_study_problems(name, ps, block1=False):
@@ -1103,7 +1108,11 @@ CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    ire
 # `jmp rbx`); EXIT (user) ends in the nop to CPL 0 and is followed by BACK (supervisor: `jmp r12`); S is a supervisor code page. A
 # CPL-3 call sets r12 = the return label, rbx = the target and r13 = EXIT's nop (the code ends `jmp r13`).
 STUB = dict(enter=0x9fff, user=0xa000, exit=0xbfff, back=0xc000, S=0xd000)
-STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac')
+STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac', 'fa-ro')
+# `fa-ro` (fault-around plan chunk 1, natemu only: QEMU cannot switch CPL): at CPL 3 (the user code on FAUC) a page NRW (R/W = 1, D = 1) read and
+# written (the read installs it writable: no upgrade abort), then NRO (R/W = 0, A = 1, D = 1) read and written: #PF error 7 (present, write,
+# user) at CR2 = NRO, the run's stop. A rule that ignored R/W would install NRO writable at the read and the write would succeed.
+FAUC, FARW, FARO = 0xe000, 0xf000, 0x6000
 CHUNK_PAGE = ('page-cross', 'page-global', 'page-user', 'page-user-invlpg', 'page-mark', 'page-size-check', 'page-counts')
 CHUNK_MISS = ('miss-counts', 'miss-system', 'miss-step', 'miss-dr7', 'miss-ac', 'miss-event', 'miss-uc', 'miss-boundary',
               'hold-io', 'hold-pending', 'hold-event', 'hold-lapic')
@@ -1236,6 +1245,7 @@ def chunk_bodies(k, i, n):
         'miss-boundary': (c('b0', A) + c('b1', B) + c('b2', C) + f'    lea r13, [rel .b3]\n    mov rax, {A:#x}\n    mov bx, ss\n    mov ss, bx\n    jmp rax\n.b3:\n    mov r8, rax\n'
                           + c('b4', B) + c('b5', C) + f'    lea r13, [rel .b6]\n    mov rax, {A:#x}\n    sti\n    jmp rax\n.b6:\n    cli\n    mov r9, rax\n'),
         # CPL 3 with CR0.AM and RFLAGS.AC: A, B, C warm (A evicted), then A, whose first instruction is a misaligned load: #AC (the stop).
+        'fa-ro': c3('r0', d + FAUC),
         'miss-ac': ('    mov rax, cr0\n    bts rax, 18\n    mov cr0, rax\n    pushfq\n    or qword [rsp], 0x40000\n    popfq\n'
                     f'    mov r15, {d + 0x7100:#x}\n' + c3('a0', A) + c3('a1', B) + c3('a2', C) + f'    mov r15, {d + 0x7101:#x}\n' + c3('a3', A)),
     }
@@ -1276,6 +1286,9 @@ def chunk_memory(name, i, n):
         out += [mem(d + UCX, b'\xff\x20', capture=False), mem(d + UCX2, b'\x48\x8b\x18\x41\xff\xe5', capture=False), mem(d + UCP, l1_pages(i)['A'].to_bytes(8, 'little'), capture=False)]
     if name == 'miss-ac':
         out += [mem(l1_pages(i)['FA'], P.asm('mov eax, [r15]\nmov eax, 1\njmp r13'), capture=False)]
+    if name == 'fa-ro':
+        out += [mem(d + FAUC, P.asm(f'mov rbx, {d + FARW:#x}\nmov rax, [rbx]\nmov [rbx], rax\nmov rbx, {d + FARO:#x}\nmov rax, [rbx]\nmov [rbx], rax\njmp r13'),
+                    capture=False), dict(P.zero(d + FARW, 0x1000), capture=False), dict(P.zero(d + FARO, 0x1000), capture=False)]
     return out
 
 
@@ -1291,6 +1304,8 @@ def chunk_tables(name, i):
         a[d + UCP] = ((d + UCP) | P.LEAF) | 0x18
     if name in STUB_PROGRAMS:
         a.update({d + x: ((d + x) | P.LEAF) & ~US for x in (0x9000, STUB['back'], STUB['S'])})
+    if name == 'fa-ro':
+        a[d + FARO] = ((d + FARO) | P.LEAF) & ~2
     return a, b
 
 
@@ -1304,6 +1319,7 @@ CHUNK_VALUES = {
     'page-counts': lambda i, k: {'r8': {sum(range(k))}},
     'miss-system': lambda i, k: {'r8': {2 * k}},
     'miss-ac': {},
+    'fa-ro': {},
     'hold-io': {'r8': {1}},
     'hold-pending': {'r8': {0x31}},
     'hold-event': lambda i, k: {'r14': {l1_pages(i)['A']}},
@@ -1328,10 +1344,15 @@ FAST_DECLINED = {'hold-io': ('io', 1), 'hold-pending': ('pending', 1), 'hold-eve
 # Stats a program must show at least (default block size): `page-mark`'s placements from the record mark the frame again (the mark resets this vCPU's
 # writable shadow: 3 resets; without the mark `kept` discards each block placed from the record and steps it: fewer resets, more requests).
 STAT_LEAST = {'page-mark': {'shadow_resets': 3}}
-UC_STEPS = {'miss-uc': 3}   # k1.uncached.steps: the two stepped `jmp [rax]` and the ordinary block's access after them
+# Stats a program must show exactly (default block size; `fa_setup`): a read of a D = 1 page installs it writable (no upgrade abort),
+# of a D = 0 page it does not (one), and a read of a page holding translations takes no code-write path.
+STAT_EXACT = {'fa-read-code-r': {'invalidations': 0, 'steps': 0}, 'fa-rw': {'upgrades': 0}, 'fa-ad0': {'upgrades': 1}, 'fa-ro': {'upgrades': 0}}
+UC_STEPS = {'miss-uc': 3, 'fa-wt': 1}   # k1.uncached.steps: the two stepped `jmp [rax]` and the ordinary block's access after them
 FAST_NONE = ('miss-step', 'miss-dr7', 'miss-system')
 # A run that ends in a fault the program provokes: the stop and the vector.
-EXPECT_FAULT = {'page-user': 14, 'miss-ac': 17}
+EXPECT_FAULT = {'page-user': 14, 'miss-ac': 17, 'fa-ro': 14}
+# ... and, where the program says, the faulting address (fault[1], an offset from the CPU's d) and the error code (fault[2]).
+EXPECT_FAULT_AT = {'fa-ro': (FARO, 7)}
 # Natemu-only programs: (register, allowed values) per CPU; a function of the CPU for `walk`. In `global` the architecture
 # allows either frame for r9 and r10 (a kept global entry, or a miss); natemu keeps the block found global (K1), so 1.
 EITHER = {
@@ -1501,6 +1522,52 @@ def adv_setup(i):
     p['pf-fetch'] = (adv_idt(d) + adv_call(0, V) + '    mov r8, rax\n' + put(V, F1 | P.LEAF & ~1) + adv_call(1, V + 0x10) + '    mov r9, rax\n'
                      + adv_call(2, V) + '    mov r10, rax\n' + end + resume + '.end:\n',
                      {V: F1 | P.LEAF}, {}, [code_mem(F1, CODE(1) * 2), code_mem(F2, CODE(2) * 2)])
+    p.update(fa_setup(i))
+    return p
+
+
+def fa_setup(i):
+    """Fault-around plan chunk 1 (writable on a read when D = 1; docs/restructure/fault-around-plan.md 3.7, section 7), CPL 0, compared with QEMU
+    (the natemu counters they assert are in `STAT_EXACT` and `UC_STEPS`). N (linear d + 0x8000) maps the frame G1 or itself:
+    - `fa-read-code`: N (D = 1, holding `mov eax, 1; jmp r13`) called (the frame marked), read as data (the frame holds translations: read-only,
+      no writable bit, no `code_written`), a store changes the code to `mov eax, 2`, called again: 2 (QEMU's). `fa-read-code-r` stops after the
+      read: the read takes no code-write path (`invalidations` and `steps` 0).
+    - `fa-read-smc`: the other order. N read first (not yet translated: writable, the bit set), called (the mark resets this vCPU's shadows),
+      stored into, called: 2. A read that set no bit would leave the writable shadow and call 1.
+    - `fa-ad0`: N with A = D = 0 read (the walk sets A only, PTE read back), then written (a second abort: the walk sets D once; read back),
+      written again (PTE unchanged): a writable read install ignoring D would leave D clear. One upgrade abort (`upgrades` 1).
+    - `fa-rw`: a D = 1 page read, written, read back; and a page-crossing read and store over two D = 1 pages: no upgrade abort (`upgrades` 0).
+    - `fa-ro-wp`: R (R/W = 0, A = 1, D = 1): with CR0.WP = 1 a read then a write: #PF error 3 (r8) at CR2 = R (r9); WP = 0: the read installs
+      writable and the write succeeds; WP = 1 again: #PF 3 (r10). A rule that ignored R/W or WP lets the first write through.
+    - `fa-wt`: N PWT (PAT entry 1 = WT), D = 1: INVLPG N, a read (read-only: not WB or WC), a store (runs alone: `uncached_steps` 1), a read back.
+      A rule that ignored the memory type lets the store run natively (0)."""
+    d = P.SYS_D(i)
+    N, G1, M = d + 0x8000, d + 0x9000, d + 0xa000
+    la = lambda va: P.sys_leaf(i, 0, va)
+    inv = lambda va: f'    mov rax, {va:#x}\n    invlpg [rax]\n'
+    mem = lambda at, size=0x1000: dict(P.zero(at, size))
+    n1, code1 = {N: G1 | P.LEAF}, [{'addr': f'0x{G1:x}', 'data': CODE(1).hex()}]
+    read_n = f'    mov r10, [{N:#x}]\n'
+    smc = f'    mov byte [{N + 1:#x}], 2\n'
+    probe = lambda tag, insn: f'    lea r13, [rel .t{tag}]\n    {insn}\n.t{tag}:\n'
+    p = {}
+    p['fa-read-code-r'] = (adv_call(0, N) + '    mov r8, rax\n' + read_n + adv_call(1, N) + '    mov r9, rax\n', n1, {}, code1)
+    p['fa-read-code'] = (adv_call(0, N) + '    mov r8, rax\n' + read_n + smc + adv_call(1, N) + '    mov r9, rax\n', n1, {}, code1)
+    p['fa-read-smc'] = (read_n + adv_call(0, N) + '    mov r8, rax\n' + smc + adv_call(1, N) + '    mov r9, rax\n', n1, {}, code1)
+    p['fa-ad0'] = (f'    mov rbx, [{N:#x}]\n    mov r8, [{la(N):#x}]\n    mov qword [{N + 8:#x}], 0x55\n    mov r9, [{la(N):#x}]\n'
+                   f'    mov qword [{N + 16:#x}], 0x66\n    mov r10, [{la(N):#x}]\n    mov r12, [{N + 8:#x}]\n',
+                   {N: (G1 | P.LEAF) & ~0x60}, {}, [mem(G1)])
+    p['fa-rw'] = (f'    mov rbx, [{N:#x}]\n    mov qword [{N + 8:#x}], 0x1122\n    mov r8, [{N + 8:#x}]\n    mov rax, [{N + 0xffc:#x}]\n    mov r9, rax\n'
+                  f'    mov rax, 0x0123456789abcdef\n    mov [{N + 0xffc:#x}], rax\n    mov r10, [{N + 0xffc:#x}]\n    mov r12, [{N + 0x1000:#x}]\n'
+                  f'    mov rbx, [{M:#x}]\n    mov [{M:#x}], rbx\n',
+                  {}, {}, [mem(N, 0x3000)])
+    wp = lambda on: f'    mov rax, cr0\n    {"bts" if on else "btr"} rax, 16\n    mov cr0, rax\n'
+    p['fa-ro-wp'] = (adv_idt(d) + f'    mov rbx, [{N:#x}]\n' + probe(0, f'mov qword [{N + 8:#x}], 0x77') + '    mov r8, r14\n    mov r9, r15\n'
+                     + '    xor r14d, r14d\n' + wp(False) + f'    mov rbx, [{N:#x}]\n' + probe(1, f'mov qword [{N + 8:#x}], 0x77') + wp(True)
+                     + probe(2, f'mov qword [{N + 16:#x}], 0x88') + '    mov r10, r14\n    jmp .end\n' + TO_R13 + '.end:\n',
+                     {N: (N | P.LEAF) & ~2}, {}, [mem(N)])
+    p['fa-wt'] = (inv(N) + f'    mov rbx, [{N:#x}]\n    mov qword [{N + 8:#x}], 0x1234\n    mov r8, [{N + 8:#x}]\n    mov r9, rbx\n',
+                  {N: (G1 | P.LEAF) | 8}, {}, [mem(G1)])
     return p
 
 # natemu-only: allowed (r8, r9, r10, r14) tuples per CPU (a fetch #PF may or may not be taken: QEMU's TLB holds V)
@@ -1699,6 +1766,11 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
             problems.append(f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']} (end {end:#x})")
         if stop and short in EXPECT_FAULT and c['stop'] == stop[0] and smp.num(c['fault'][0]) != EXPECT_FAULT[short]:
             problems.append(f"cpu{v} fault {c['fault']}, want vector {EXPECT_FAULT[short]}")
+        if stop and short in EXPECT_FAULT_AT and c['stop'] == stop[0]:
+            at, error = EXPECT_FAULT_AT[short]
+            got = (smp.num(c['fault'][1]), smp.num(c['fault'][2]))
+            if got != (P.SYS_D(v) + at, error):
+                problems.append(f"cpu{v} fault (CR2, error code) {tuple(hex(x) for x in got)}, want {(hex(P.SYS_D(v) + at), error)}")
         problems += [f'cpu{v} ' + p for p in s3.per_vcpu_checks(c)]
         # The page record's counters (k1.page) and the fast miss path's (k1.fast_miss), absent while zero.
         k1 = c['stats']['k1']
@@ -1707,6 +1779,10 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
             problems.append(f"cpu{v} page record disagreed {pg.get('disagree', 0)} times, want {'at least ' if extra else ''}{PAGE_FORCED_COUNTS[short]}")
         if pmode == 'on' and not extra and tag != '-ps':
             problems += [f'cpu{v} page {f} = {pg.get(f, 0)}, want at least {m}' for f, m in PAGE_ON_COUNTS.get(short, {}).items() if pg.get(f, 0) < m]
+        if not extra and os.environ.get('NATEMU_WRITABLE_ON_READ') != 'off':
+            problems += [f"cpu{v} {f} = {c['stats'].get(f)}, want exactly {m}" for f, m in STAT_EXACT.get(short, {}).items() if c['stats'].get(f) != m]
+        elif not extra and short in ('fa-rw', 'fa-ro') and not c['stats'].get('upgrades'):
+            problems.append('cpu%d no upgrade abort with NATEMU_WRITABLE_ON_READ=off (the switch is ignored)' % v)
         if not extra and os.environ.get('NATEMU_MISS_FAST') != 'off' and not os.environ.get('NATEMU_PIC_TEST'):
             taken, declined = fm.get('taken', 0), fm.get('declined', {})
             if taken < FAST_TAKEN.get(short, 0):
