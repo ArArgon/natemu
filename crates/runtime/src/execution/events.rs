@@ -246,6 +246,7 @@ pub(super) fn park(s: &mut State) {
         rung.store(0, SeqCst);
     }
     let (mut parked, mut woke, mut deadline) = (false, false, u64::MAX);
+    let mut polled = None;
     loop {
         doorbells(s);
         // Drain the wake before checking its work: the opposite order can consume an I/O
@@ -279,7 +280,13 @@ pub(super) fn park(s: &mut State) {
         }
         // L5: `wfi`, woken on time for the timer's next expiry.
         deadline = lapic::deadline();
-        super::io_halt_wait(s);
+        // Halt polling: the first wait of this halt spins for its wake before it sleeps; the later ones (after the
+        // timer's early wakes, or a doorbell that brought nothing to take) only sleep.
+        if polled.is_none() {
+            polled = Some((lapic::now(), super::io_halt_wait(s, s.halt_poll)));
+        } else {
+            super::io_halt_wait(s, 0);
+        }
         if crate::perf::ON && !woke {
             let r = rung.load(SeqCst);
             if r != 0 {
@@ -295,6 +302,10 @@ pub(super) fn park(s: &mut State) {
         } else if deadline <= t {
             crate::perf::wake(crate::perf::TIMER_RUN, t - deadline);
         }
+    }
+    // The next halt's poll window, from how long this one lasted. In the state record: it lasts across resident entries.
+    if let Some((since, caught)) = polled {
+        s.halt_poll = lapic::poll_next(s, s.halt_poll, caught, lapic::now().saturating_sub(since));
     }
     halted.store(0, SeqCst);
     crate::perf::leave(p);

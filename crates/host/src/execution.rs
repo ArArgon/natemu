@@ -405,12 +405,24 @@ pub fn host_feature(name: &str) -> bool {
     };
     rc == 0 && len == size_of::<i32>() && value == 1
 }
+/// The longest halt-poll window ([`State::halt_poll_max_us`]): `NATEMU_HALT_POLL_US` (calibration on other hosts; 0
+/// turns polling off; capped at 1 ms), else the default.
+fn halt_poll_max_us() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NATEMU_HALT_POLL_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(exec::HALT_POLL_MAX_US, |us| us.min(1000))
+    })
+}
 /// Sets the vCPU's initial architectural state (before it first runs). `speculation_barriers` turns on the resident's
 /// page-walk barriers (PCID plan P1) and, together with the host's FEAT_CSV3, is the sole condition for advertising
 /// RDCL_NO: a guest never sees "not susceptible to Meltdown" without the barriers that make it true.
 pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     let mut state = State::new(area.vcpu as u64, cpu);
     state.vcpus = area.vcpus as u64;
+    state.halt_poll_max_us = halt_poll_max_us();
     area.write_record(exec::STATE_OFFSET, state);
     // The TSC (L5, `natemu_abi::clock::tsc`) is the resident's CNTVCT scaled to TSC_HZ plus this offset: from the shared epoch.
     const _: () = assert!(natemu_abi::cpu_profile::TSC_HZ == 1_000_000_000); // ticks_ns scales like the resident

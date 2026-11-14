@@ -326,20 +326,65 @@ fn irr_pending(v: u64, vector: u64) -> bool {
 /// was not due; `park` does not count them). Measured cost: the vCPU's core is busy about 2 % at a 250 Hz periodic
 /// timer and 5.4 % at 1 kHz (the review's `hltcpu` probe); lateness 4-7 us typically, with a tail of 90-388 us when the
 /// final short wait or the spin is preempted.
-pub(super) fn wait(s: &State) {
-    let (d, f, n) = (lapic().deadline, lapic().frequency, now());
+/// Halt polling ([`State::halt_poll`]) comes first, on a halt's first wait only (`window`, 0 on its later ones): up to
+/// `window` ticks the vCPU spins for a pending interrupt before any of that. Whether the wait ended inside the window.
+pub(super) fn wait(s: &State, window: u64) -> bool {
+    let (d, f, t0) = (lapic().deadline, lapic().frequency, now());
+    let timer = d != u64::MAX && d > t0 && can_wake(s);
+    let window = window.min(clock::scale(s.halt_poll_max_us, f, 1_000_000));
+    if window != 0 {
+        // Never past the timer's expiry: the wait for it below is exact, this spin need not be.
+        let end = if timer {
+            d.min(t0.saturating_add(window))
+        } else {
+            t0.saturating_add(window)
+        };
+        while now() < end {
+            if pending() {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        if timer && end == d {
+            return true;
+        }
+    }
+    sleep(d, f, timer);
+    false
+}
+/// The poll window of this vCPU's next halt, after one that polled `window` ticks on its first wait, `caught` its wake
+/// there or not, and lasted `halted` ticks in all (its timer's early wakes included): the whole halt is judged,
+/// whatever ended it, so a vCPU that only wakes for its periodic timer stops polling after a few ticks.
+pub(super) fn poll_next(s: &State, window: u64, caught: bool, halted: u64) -> u64 {
+    let f = lapic().frequency;
+    natemu_abi::execution::halt_poll::next(
+        window,
+        if caught { 0 } else { halted.max(1) },
+        clock::scale(POLL_MIN_US, f, 1_000_000),
+        clock::scale(s.halt_poll_max_us, f, 1_000_000),
+    )
+}
+/// The shortest halt-poll window above none ([`State::halt_poll`]).
+const POLL_MIN_US: u64 = 10;
+/// An interrupt is signalled to this vCPU (ISR_EL1.I; masked at EL1, it would end a `wfi`).
+fn pending() -> bool {
+    let isr: u64;
+    // SAFETY: reads the pending-interrupt status.
+    unsafe { asm!("mrs {}, isr_el1", out(reg) isr) };
+    isr & 1 << 7 != 0
+}
+/// [`wait`] without the poll.
+fn sleep(d: u64, f: u64, timer: bool) {
+    let n = now();
     // With nothing its timer can deliver (masked, IF = 0, a class not above the PPR) the timer cannot end the halt:
     // a plain wait, no early wakes, no spin.
-    if d == u64::MAX || d <= n || !can_wake(s) {
+    if !timer || d <= n {
         // SAFETY: waits for an interrupt (masked at EL1: it only wakes the PE); no memory effect.
         return unsafe { asm!("dsb sy", "wfi") };
     }
     if d - n <= clock::scale(SPIN_US, f, 1_000_000) {
         while now() < d {
-            let isr: u64;
-            // SAFETY: reads the pending-interrupt status.
-            unsafe { asm!("mrs {}, isr_el1", out(reg) isr) };
-            if isr & 1 << 7 != 0 {
+            if pending() {
                 return;
             }
             core::hint::spin_loop();

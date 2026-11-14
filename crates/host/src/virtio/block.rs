@@ -71,21 +71,62 @@ const MAX_BUFFERED: usize = 4 << 20;
 const CALL_LIMIT: Duration = Duration::from_secs(10);
 /// Bounded spins before blocking, after recent activity: the owner's on its bell after it admitted or completed work,
 /// a worker's on the job queue after it finished a job. They trade host CPU for a condition-variable wake. Measured
-/// (io-benchmarks.md, "Shorter depth-1 path"): 5–10 µs gained nothing measurable at depth 1, depth 16 or four readers;
-/// 25 µs caught the next depth-1 kick but cost about 45% more host CPU per I/O, past the 20% bound; so both are off.
-/// `NATEMU_IO_SPIN_US=OWNER,WORKER` sets them (calibration on other hosts).
-const OWNER_SPIN_US: u64 = 0;
+/// (io-benchmarks.md, "Shorter depth-1 path"): fixed owner spins of 5–10 µs gained nothing measurable at depth 1,
+/// depth 16 or four readers; 25 µs caught the next depth-1 kick but cost about 45% more host CPU per I/O, past the
+/// 20% bound. So both are off by default. The owner's can be made adaptive: its window then follows what its waits
+/// show, by the rule of the vCPU's halt polling (`natemu_abi::execution::halt_poll::next`), from [`OWNER_SPIN_MIN`] up
+/// to `NATEMU_IO_SPIN_MAX_US` (at most 1 ms; default [`OWNER_SPIN_MAX`], none): it opens while kicks keep arriving
+/// just after the owner went to sleep and closes when the device goes idle. Measured with the vCPU's halt polling
+/// (`natemu_abi::execution::HALT_POLL_MAX_US`, which has the figures): both at 50 us or more nearly double depth-1
+/// reads for 35-45% more host CPU per I/O, past the bound; the adaptive spin alone gains about 10% for 60% more.
+/// `NATEMU_IO_SPIN_US=OWNER,WORKER` fixes both spins instead (calibration on other hosts).
 const WORKER_SPIN_US: u64 = 0;
-fn spins() -> (Duration, Duration) {
-    static SPINS: std::sync::OnceLock<(Duration, Duration)> = std::sync::OnceLock::new();
+const OWNER_SPIN_MIN: Duration = Duration::from_micros(10);
+const OWNER_SPIN_MAX: Duration = Duration::ZERO;
+fn owner_spin_max() -> Duration {
+    static MAX: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let us = std::env::var("NATEMU_IO_SPIN_MAX_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        us.map_or(OWNER_SPIN_MAX, |us| Duration::from_micros(us.min(1000)))
+    })
+}
+/// The owner's fixed spin (`None`: adaptive) and the worker's.
+fn spins() -> (Option<Duration>, Duration) {
+    static SPINS: std::sync::OnceLock<(Option<Duration>, Duration)> = std::sync::OnceLock::new();
     *SPINS.get_or_init(|| {
-        let us = std::env::var("NATEMU_IO_SPIN_US").ok().and_then(|v| {
+        let us: Option<(u64, u64)> = std::env::var("NATEMU_IO_SPIN_US").ok().and_then(|v| {
             let (o, w) = v.split_once(',')?;
             Some((o.trim().parse().ok()?, w.trim().parse().ok()?))
         });
-        let (o, w) = us.unwrap_or((OWNER_SPIN_US, WORKER_SPIN_US));
-        (Duration::from_micros(o), Duration::from_micros(w))
+        match us {
+            Some((o, w)) => (Some(Duration::from_micros(o)), Duration::from_micros(w)),
+            None => (None, Duration::from_micros(WORKER_SPIN_US)),
+        }
     })
+}
+/// The owner's next adaptive spin after a wait that began with `spin`, took `took` and found the bell rung or not.
+fn owner_spin(
+    window: Duration,
+    spin: Duration,
+    took: Duration,
+    rung: bool,
+    max: Duration,
+) -> Duration {
+    // A bell already rung when the wait began (no sleep at all) shows nothing either way.
+    let caught = rung && took <= spin.max(Duration::from_micros(1));
+    let waited = if caught {
+        0
+    } else {
+        (took.as_nanos() as u64).max(1)
+    };
+    Duration::from_nanos(natemu_abi::execution::halt_poll::next(
+        window.as_nanos() as u64,
+        waited,
+        OWNER_SPIN_MIN.as_nanos() as u64,
+        max.as_nanos() as u64,
+    ))
 }
 /// The power-off drain's final full sync, outside every in-flight slot.
 const FINAL_SYNC: usize = usize::MAX;
@@ -1079,6 +1120,8 @@ impl Virtio {
         let mut flight = Flight::default();
         // The last pass did work: the next wait spins first.
         let mut active = false;
+        // The adaptive spin's window ([`owner_spin`]).
+        let (fixed, mut window) = (spins().0, Duration::ZERO);
         // Kick suppression (`State::suppressed`): an admission's gather sets VIRTQ_USED_F_NO_NOTIFY; the owner
         // clears it before it idles (in the completion that empties the flight, or here), before a power-off drain,
         // and before a reset of its incarnation retires. Each clear is followed by a full barrier and a read of the
@@ -1125,13 +1168,18 @@ impl Virtio {
                 continue;
             }
             let spin = if std::mem::take(&mut active) {
-                spins().0
+                fixed.unwrap_or(window)
             } else {
                 Duration::ZERO
             };
             if let Some(id) = suppressed {
                 // Requests on disk ring the bell as they finish; their completion reads the ring.
-                if !flight.is_empty() && self.wake.wait_spinning(SUPPRESSED_WAIT, spin) {
+                // (Only a fixed spin here: the adaptive window follows kicks, not the disk's latency.)
+                if !flight.is_empty()
+                    && self
+                        .wake
+                        .wait_spinning(SUPPRESSED_WAIT, fixed.unwrap_or_default())
+                {
                     continue;
                 }
                 if self.unsuppress(guest, id)? {
@@ -1139,7 +1187,9 @@ impl Virtio {
                 }
             }
             let waited = profile::start();
-            self.wake.wait_spinning(Duration::from_millis(10), spin);
+            let began = Instant::now();
+            let rung = self.wake.wait_spinning(Duration::from_millis(10), spin);
+            window = owner_spin(window, spin, began.elapsed(), rung, owner_spin_max());
             profile::count(profile::WAITS);
             profile::since(profile::WAIT_NS, waited);
         }
@@ -1553,6 +1603,31 @@ impl Virtio {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_spin_follows_the_waits() {
+        let (us, max) = (Duration::from_micros, Duration::from_micros(100));
+        // A kick just after the owner slept opens the window; a kick caught inside the spin keeps it; a timeout or a
+        // long sleep halves it, and it closes below the minimum.
+        assert_eq!(owner_spin(us(0), us(0), us(30), true, max), OWNER_SPIN_MIN);
+        assert_eq!(owner_spin(us(40), us(40), us(100), true, max), us(80));
+        assert_eq!(owner_spin(us(80), us(80), us(100), true, max), max);
+        assert_eq!(owner_spin(us(40), us(40), us(15), true, max), us(40));
+        assert_eq!(
+            owner_spin(us(40), us(40), Duration::from_millis(10), false, max),
+            us(20)
+        );
+        assert_eq!(owner_spin(us(40), us(40), us(401), true, max), us(20));
+        assert_eq!(owner_spin(us(10), us(10), us(500), true, max), us(0));
+        // Without a spin, a kick soon after the owner slept opens the window as well; a bell already rung when the
+        // wait began changes nothing.
+        assert_eq!(owner_spin(us(40), us(0), us(30), true, max), us(80));
+        assert_eq!(owner_spin(us(40), us(0), us(0), true, max), us(40));
+        // The default cap is none: the window never opens.
+        assert_eq!(
+            owner_spin(us(0), us(0), us(30), true, OWNER_SPIN_MAX),
+            us(0)
+        );
+    }
     use super::*;
     use std::sync::atomic::AtomicUsize;
     struct Script {
