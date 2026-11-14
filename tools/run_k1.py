@@ -1025,7 +1025,11 @@ def perf_runtime(a):
         return a.perf_runtime
     target = ROOT / 'target' / 'perf'
     out = target / 'aarch64-unknown-none/release/natemu-runtime'
-    if not (os.environ.get('NATEMU_PREBUILT') == '1' and out.exists()):
+    # (A prebuilt one is reused only if it is newer than every source the resident is made from: a stale one would count another
+    # build's misses.)
+    sources = [f for d in ('crates/runtime', 'crates/abi') for f in (ROOT / d).rglob('*') if f.is_file()] + [ROOT / 'Cargo.lock', ROOT / '.cargo/config.toml']
+    fresh = out.exists() and out.stat().st_mtime >= max(f.stat().st_mtime for f in sources if f.exists())
+    if not (os.environ.get('NATEMU_PREBUILT') == '1' and fresh):
         subprocess.run(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none',
                         '--features', 'perf'], cwd=ROOT, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True)
     a.perf_runtime = out

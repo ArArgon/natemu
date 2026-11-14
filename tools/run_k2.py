@@ -16,7 +16,8 @@
   `l1way1-rand-ctl`: 128 sets each holding a pair, visited in a pseudo-random order from one dispatcher site (the way-0
   or way-1 outcome unpredictable), against the same walk over 256 sets of one block. The report's `l1way` gives the
   differences in ns per iteration against the plan's gate (predicted under 3 ns, unpredictable under 6 ns): a judgement
-  for the main session, not a failure here.
+  for the main session, not a failure here. The 6 ns is per iteration of the walk, not per way-1 hit: only about half the
+  visits are way-1 hits, and the way-0 entries of shared sets also branch unpredictably (way 0 or way 1).
 - `rdrand`: 4,000 RDRANDs in a loop (the pool holds 32): all succeed, about one entropy refill exit per 32, values differ.
 - `xmc`: cross-modifying code at a system instruction, by the x86 protocol (deterministic: see `xmc`): vCPU 1 rewrites
   one byte of X (CLI <-> NOP, CLI <-> STI, SWAPGS <-> RDTSCP, FLD m80 <-> FILD m32, CLI -> INT3) paced by vCPU 0's
@@ -224,7 +225,7 @@ def cost(a, report):
     for row, gate in (('l1way1', 3), ('l1way1-rand', 6)):
         us, ctl = (rows.get(r, {}).get('us_per_iteration') for r in (row, row + '-ctl'))
         if us is not None and ctl is not None:
-            delta[row] = {'ns_per_iteration': round(1000 * (us - ctl), 2), 'gate_ns': gate, 'within_gate': 1000 * (us - ctl) < gate}
+            delta[row] = {'ns_per_iteration': round(1000 * (us - ctl), 2), 'gate_ns': gate, 'within_gate': 1000 * (us - ctl) < gate, 'per': 'iteration (l1way1-rand: about half the visits are way-1 hits)' if row.endswith('rand') else 'iteration (one way-1 hit)'}
     if delta:
         report['cost']['l1way'] = delta
         print('l1way', json.dumps(delta), flush=True)

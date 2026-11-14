@@ -319,3 +319,8 @@ review before the gate).**
   (CPUID leaves differ from QEMU's; PIC values as `reuse-alias`). The CPUID at B - 2 is never in L1: it misses every round
   (cancelled by the `-x` variant).
 - Mutants M1-M11 as patches in `natemu-raw/l1-two-way-mutants-20261114/` (`M5abi` is M5's model form).
+- The `l1way1-rand` gate (6 ns) is per iteration of the walk, not per way-1 hit: about half the visits are way-1 hits and the
+  way-0 entries of shared sets also branch unpredictably. `run_k1.py` reuses a prebuilt perf resident only if it is newer than
+  the resident's and the abi's sources.
+- Mutation proof (scratch checkout at `acfc5b5`, `natemu-raw/l1-two-way-mut-run/`): the unmutated build is green on the
+  programs below and every mutant M1-M11 goes red on its programs.
