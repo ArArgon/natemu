@@ -388,6 +388,16 @@ Rules learned in this round:
     (`io5-natemu-mo-20261114-02`, mitigations off, PASS): use phase 522.2 s, against 563.6 s before the second batch,
     705.4 s on main and 901.1 s on QEMU (0.58x); configure 62.8 s, make+download+generate 347.6 s (they overlap).
 
+41. **locks at 4 vCPUs: expected contention, not a regression** (owner's reading, supported by the data). Interleaved,
+    5 runs each (`natemu-raw/locks-ab-20261114-01`): Nov 5 build (own fexc) 7.30 s, head 7.98 s, head with the pool off
+    7.99 s; the fexc update alone was -1.6% in its own A/B. Checkpoints of this round (`locks-bisect-20261114-01`, head's
+    fexc and harness, medians of 5): main 7.13, after the link lists 7.18, before the two-way L1 7.37, after it 7.69,
+    pool/fast miss/page record 8.26, drain fix + writable-on-read 7.77, head 7.99 s — spreads of 0.4-0.8 s overlap, so a
+    drift, not one change. 1 vCPU is unchanged (3.90 s). The N=4 / N=1 ratio went 0.65 (Nov 4, slow single-thread path:
+    threads seldom met at the lock) -> 1.85 (Nov 5) -> 1.98 (head); native 1.99, QEMU 2.49. glibc's mutex is unfair, so
+    a slower path between lock operations or a slower wake lets the holder retake it uncontended; as natemu's paths get
+    cheaper the benchmark shows native-like contention. hackbench N=4 -7.6% in the same round fits. No action.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
