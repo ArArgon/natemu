@@ -25,6 +25,8 @@ const F_BLK_SIZE: u64 = 1 << 6;
 pub(super) const F_FLUSH: u64 = 1 << 9;
 const F_DISCARD: u64 = 1 << 13;
 const F_WRITE_ZEROES: u64 = 1 << 14;
+/// VIRTIO_BLK_F_MQ (virtio 1.2 5.2.3): the device has `num_queues` request queues (5.2.4); offered with more than one.
+const F_MQ: u64 = 1 << 12;
 pub(super) const FEATURES: u64 =
     VERSION_1 | F_SIZE_MAX | F_SEG_MAX | F_BLK_SIZE | F_FLUSH | F_DISCARD | F_WRITE_ZEROES;
 /// The driver must honour the segment limits below.
@@ -148,6 +150,8 @@ pub(super) struct Disk {
     pub call_limit: Mutex<Option<Duration>>,
     /// Taken by the workers when the owner starts.
     file: Mutex<Option<File>>,
+    /// The request queues ([`Virtio::block_queues`]; 1 unless set before the device is set up).
+    queues: std::sync::atomic::AtomicUsize,
     pub capacity: u64,
     /// GET_ID's answer: the file's device and inode, in hex.
     pub id: [u8; ID_BYTES],
@@ -188,18 +192,33 @@ impl Disk {
             #[cfg(test)]
             call_limit: Mutex::new(None),
             file: Mutex::new(Some(file)),
+            queues: std::sync::atomic::AtomicUsize::new(1),
             capacity: len,
             id,
         })
     }
+    pub fn queues(&self) -> usize {
+        self.queues.load(SeqCst)
+    }
+    pub fn set_queues(&self, count: usize) {
+        self.queues.store(count, SeqCst);
+    }
+    /// The features offered: [`FEATURES`], and VIRTIO_BLK_F_MQ with more than one request queue.
+    pub fn features(&self) -> u64 {
+        FEATURES | if self.queues() > 1 { F_MQ } else { 0 }
+    }
     /// Configuration space: capacity (sectors), size_max, seg_max, geometry (unused), blk_size, topology, writeback
-    /// and num_queues (unused: not offered), then the discard and write-zeroes limits (virtio 1.3 §5.2.4).
+    /// (unused: not offered), num_queues at offset 34 (with more than one request queue; 0 otherwise, VIRTIO_BLK_F_MQ
+    /// then not offered), then the discard and write-zeroes limits (virtio 1.3 §5.2.4).
     pub fn config(&self) -> [u8; 60] {
         let mut c = [0; 60];
         c[..8].copy_from_slice(&(self.capacity / SECTOR).to_le_bytes());
         c[8..12].copy_from_slice(&(MAX_SEGMENT as u32).to_le_bytes());
         c[12..16].copy_from_slice(&(MAX_SEGMENTS as u32).to_le_bytes());
         c[20..24].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+        if self.queues() > 1 {
+            c[34..36].copy_from_slice(&(self.queues() as u16).to_le_bytes());
+        }
         let ranges = (MAX_RANGES as u32).to_le_bytes();
         c[36..40].copy_from_slice(&MAX_RANGE_SECTORS.to_le_bytes());
         c[40..44].copy_from_slice(&ranges);
@@ -966,6 +985,10 @@ impl Flight {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Some request of `queue` is in flight.
+    fn holds(&self, queue: usize) -> bool {
+        self.slots.iter().flatten().any(|r| r.id.queue == queue)
+    }
     /// Some request still waits for its disk call.
     fn on_disk(&self) -> bool {
         self.slots.iter().flatten().any(|r| r.reply.is_none())
@@ -1116,21 +1139,30 @@ impl Virtio {
         cancel: &AtomicBool,
         mut pool: Pool,
     ) -> Result<()> {
-        let mut snapshot = Snapshot::new(self.profile.queue_max());
+        // One metadata snapshot per request queue, and the queue the next admission pass starts at (`admit_block`).
+        let mut snapshots: Vec<Snapshot> = (0..self.profile.queue_count())
+            .map(|_| Snapshot::new(self.profile.queue_max()))
+            .collect();
+        let mut first = 0;
         let mut flight = Flight::default();
         // The last pass did work: the next wait spins first.
         let mut active = false;
         // The adaptive spin's window ([`owner_spin`]).
         let (fixed, mut window) = (spins().0, Duration::ZERO);
-        // Kick suppression (`State::suppressed`): an admission's gather sets VIRTQ_USED_F_NO_NOTIFY; the owner
-        // clears it before it idles (in the completion that empties the flight, or here), before a power-off drain,
+        // Kick suppression (`State::suppressed`, per queue): an admission's gather sets VIRTQ_USED_F_NO_NOTIFY; the owner
+        // clears it before it idles (in the completion that leaves none of its queue's requests in flight, or here), before a power-off drain,
         // and before a reset of its incarnation retires. Each clear is followed by a full barrier and a read of the
         // available index (Dekker with the driver's index store, barrier and flags read), and new heads are admitted
         // instead of sleeping, so no kick is lost.
         loop {
             let (stopped, quiescing, retiring) = {
                 let s = self.lock();
-                let retiring = s.suppressed.filter(|&id| !s.current(id));
+                let retiring = s
+                    .suppressed
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .find(|&id| !s.current(id));
                 (s.stopped || cancel.load(SeqCst), s.quiescing, retiring)
             };
             if stopped {
@@ -1152,18 +1184,19 @@ impl Virtio {
             if pool.stalled() {
                 return Err(pool.abandon());
             }
-            if self.complete_answered(guest, disk, &mut flight, &mut snapshot)? {
+            if self.complete_answered(guest, disk, &mut flight, &mut snapshots)? {
                 active = true;
                 continue;
             }
-            let suppressed = self.lock().suppressed;
+            let suppressed: Vec<Identity> =
+                self.lock().suppressed.iter().flatten().copied().collect();
             if quiescing && flight.is_empty() {
-                if let Some(id) = suppressed {
+                for &id in &suppressed {
                     self.unsuppress(guest, id)?;
                 }
                 return self.drain_disk(pool, cancel);
             }
-            if self.admit_block(guest, disk, &pool, &mut flight, &mut snapshot)? {
+            if self.admit_block(guest, disk, &pool, &mut flight, &mut snapshots, &mut first)? {
                 active = true;
                 continue;
             }
@@ -1172,7 +1205,7 @@ impl Virtio {
             } else {
                 Duration::ZERO
             };
-            if let Some(id) = suppressed {
+            if !suppressed.is_empty() {
                 // Requests on disk ring the bell as they finish; their completion reads the ring.
                 // (Only a fixed spin here: the adaptive window follows kicks, not the disk's latency.)
                 if !flight.is_empty()
@@ -1182,7 +1215,11 @@ impl Virtio {
                 {
                     continue;
                 }
-                if self.unsuppress(guest, id)? {
+                let mut rearmed = false;
+                for &id in &suppressed {
+                    rearmed |= self.unsuppress(guest, id)?;
+                }
+                if rearmed {
                     continue;
                 }
             }
@@ -1233,7 +1270,7 @@ impl Virtio {
     /// admitted. True if it did.
     fn unsuppressed(&self, id: Identity, avail: &[u8; 4]) -> bool {
         let mut s = self.lock();
-        s.suppressed = None;
+        s.suppressed[id.queue] = None;
         let more = u16::from_le_bytes([avail[2], avail[3]]) != s.queues[id.queue].next_avail;
         let rearm = more && s.current(id) && s.accepting(id.queue);
         if rearm {
@@ -1244,9 +1281,9 @@ impl Virtio {
         self.settle(&mut s);
         rearm
     }
-    /// Admit every published request the bounds allow from one metadata snapshot (captured now
-    /// unless the last completion window refreshed it), gather their headers and OUT payloads,
-    /// and start their disk calls; the first gather window also suppresses kicks. True if any
+    /// [`Self::admit_queue`] for every request queue, starting at `first`. A pass that admitted moves `first` to the
+    /// queue after the last one that did: a queue admits all the shared bounds allow, so the others must come before
+    /// it when slots next free up, or a queue that always has heads waiting would take every one of them. True if any
     /// request was admitted.
     fn admit_block(
         &self,
@@ -1254,19 +1291,45 @@ impl Virtio {
         disk: &Disk,
         pool: &Pool,
         flight: &mut Flight,
+        snapshots: &mut [Snapshot],
+        first: &mut usize,
+    ) -> Result<bool> {
+        let (count, mut last) = (snapshots.len(), None);
+        for i in 0..count {
+            let queue = (*first + i) % count;
+            if self.admit_queue(guest, disk, pool, flight, queue, &mut snapshots[queue])? {
+                last = Some(queue);
+            }
+        }
+        if let Some(queue) = last {
+            *first = (queue + 1) % count;
+        }
+        Ok(last.is_some())
+    }
+    /// Admit every published request of `queue` the bounds allow from one metadata snapshot (captured now
+    /// unless the last completion window refreshed it), gather their headers and OUT payloads,
+    /// and start their disk calls; the first gather window also suppresses the queue's kicks. True if any
+    /// request was admitted.
+    fn admit_queue(
+        &self,
+        guest: Guest<'_>,
+        disk: &Disk,
+        pool: &Pool,
+        flight: &mut Flight,
+        queue: usize,
         snapshot: &mut Snapshot,
     ) -> Result<bool> {
         let (q, id, notified, flag) = {
             let mut s = self.lock();
             self.take_kicks(&mut s);
-            let (q, id, notified) = (s.queues[0], s.identity(0), s.notified[0]);
-            let flag = s.suppressed.is_none().then_some(q.used);
+            let (q, id, notified) = (s.queues[queue], s.identity(queue), s.notified[queue]);
+            let flag = s.suppressed[queue].is_none().then_some(q.used);
             let work = notified || snapshot.reusable(q, id);
-            let open = s.admission_open() && s.accepting(0) && !s.stopped;
+            let open = s.admission_open() && s.accepting(queue) && !s.stopped;
             if !work || !open || flight.len() >= request_limit(q.size) {
                 return Ok(false);
             }
-            s.notified[0] = false;
+            s.notified[queue] = false;
             (q, id, notified, flag)
         };
         let began = profile::start();
@@ -1395,7 +1458,7 @@ impl Virtio {
             .collect();
         let mut s = self.lock();
         if flagged {
-            s.suppressed = Some(id);
+            s.suppressed[id.queue] = Some(id);
         }
         // Submission and reset admission are ordered, but no native call holds this lock.
         let live = s.current(id);
@@ -1425,8 +1488,13 @@ impl Virtio {
         // A lone request in flight with a short call (no sync) makes it here, outside the lock: no
         // hand-off to a worker and back. Kicks stay suppressed meanwhile; the completion re-reads
         // the ring. Like a worker's call, it runs even if a reset arrives before it starts.
-        let lone =
-            flight.len() == 1 && matches!(jobs[..], [(_, Job::Read(..) | Job::Write(_, _, false))]);
+        // Not while another queue has been notified: its requests would wait behind this call instead of joining it
+        // on the workers.
+        let others = (0..self.profile.queue_count())
+            .any(|q| q != id.queue && (s.notified[q] || self.kicks[q].load(SeqCst) != 0));
+        let lone = !others
+            && flight.len() == 1
+            && matches!(jobs[..], [(_, Job::Read(..) | Job::Write(_, _, false))]);
         if !lone {
             for (slot, job) in jobs.drain(..) {
                 pool.submit(slot, job)?;
@@ -1496,7 +1564,7 @@ impl Virtio {
         guest: Guest<'_>,
         disk: &Disk,
         flight: &mut Flight,
-        snapshot: &mut Snapshot,
+        snapshots: &mut [Snapshot],
     ) -> Result<bool> {
         if flight.answered.is_empty() {
             return Ok(false);
@@ -1511,14 +1579,40 @@ impl Virtio {
         #[cfg(not(feature = "testing"))]
         let _ = disk;
         let began = profile::start();
-        let batch = flight.take_answered();
+        let answered = flight.take_answered();
         profile::count(profile::COMPLETIONS);
-        profile::add(profile::COMPLETED, batch.len() as u64);
-        let id = batch[0].id;
+        profile::add(profile::COMPLETED, answered.len() as u64);
+        // Each queue's requests complete on its own rings: one batch per incarnation (one per queue in flight),
+        // in answering order within it.
+        let mut batches: Vec<Vec<Admitted>> = Vec::new();
+        for request in answered {
+            match batches.iter_mut().find(|b| b[0].id == request.id) {
+                Some(batch) => batch.push(request),
+                None => batches.push(vec![request]),
+            }
+        }
         debug_assert!(
-            batch.iter().all(|r| r.id == id),
-            "one incarnation in flight"
+            (0..batches.len()).all(|i| batches[i + 1..]
+                .iter()
+                .all(|b| b[0].id.queue != batches[i][0].id.queue)),
+            "one incarnation of a queue in flight"
         );
+        for batch in batches {
+            let queue = batch[0].id.queue;
+            self.complete_batch(guest, flight, &mut snapshots[queue], batch)?;
+        }
+        profile::since(profile::COMPLETE_NS, began);
+        Ok(true)
+    }
+    /// [`Self::complete_answered`] for the answered requests of one incarnation.
+    fn complete_batch(
+        &self,
+        guest: Guest<'_>,
+        flight: &Flight,
+        snapshot: &mut Snapshot,
+        batch: Vec<Admitted>,
+    ) -> Result<()> {
+        let id = batch[0].id;
         let completions: Vec<_> = batch.iter().map(Admitted::completion).collect();
         let element = Cost { spans: 1, bytes: 8 };
         let costs: Vec<Cost> = completions
@@ -1536,9 +1630,11 @@ impl Virtio {
             let (writes, lens): (Vec<_>, Vec<_>) = completions.by_ref().take(window.len()).unzip();
             let mut used = Used::new(q, heads.zip(lens));
             let mut transfers: Vec<Transfer<'_>> = writes.into_iter().flatten().collect();
-            // The completion emptying the flight clears NO_NOTIFY in its body: the publication's
+            // The completion leaving none of the queue's requests in flight clears NO_NOTIFY in its body: the publication's
             // read of the available index follows a full barrier, and `retire_window` rearms.
-            let clear = i == last && flight.is_empty() && self.lock().suppressed == Some(id);
+            let clear = i == last
+                && !flight.holds(id.queue)
+                && self.lock().suppressed[id.queue] == Some(id);
             if clear {
                 transfers.push(Transfer::Write {
                     gpa: q.used,
@@ -1557,7 +1653,7 @@ impl Virtio {
             drop(transfers);
             // Before the window's requests retire: a reset of `id` waits for whichever clear comes.
             if granted && clear {
-                self.lock().suppressed = None;
+                self.lock().suppressed[id.queue] = None;
             }
             match (granted, refresh) {
                 (true, true) => snapshot.captured(id),
@@ -1566,8 +1662,7 @@ impl Virtio {
             }
             self.retire_window(id, &used, granted, snapshot);
         }
-        profile::since(profile::COMPLETE_NS, began);
-        Ok(true)
+        Ok(())
     }
     /// Retire one completion window's requests. A granted window advances the used index, may
     /// interrupt, and rearms the queue if the driver published more than has been admitted (or
@@ -1628,6 +1723,7 @@ mod tests {
             us(0)
         );
     }
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
     struct Script {
@@ -2218,12 +2314,12 @@ mod tests {
         let more = [0, 0, 1, 0];
         // While current, heads seen after a clear are admitted instead of sleeping.
         let (r, id) = in_flight(0);
-        r.lock().suppressed = Some(id);
+        r.lock().suppressed[0] = Some(id);
         assert!(r.unsuppressed(id, &more));
-        assert!(r.lock().suppressed.is_none());
+        assert!(r.lock().suppressed[0].is_none());
         for reset in [reg::STATUS, reg::QUEUE_READY] {
             let (r, id) = in_flight(0);
-            r.lock().suppressed = Some(id);
+            r.lock().suppressed[0] = Some(id);
             // Nothing is in flight, but the ring still holds the flag: the reset (or disable) defers.
             let Access::Deferred(token) = r.access(0, reset, 4, Some(0)) else {
                 panic!("reset with the flag set did not wait");
@@ -2540,6 +2636,8 @@ pub(in crate::virtio) mod owner_tests {
     /// One readable buffer of a header and 128 KiB, shared by every large request.
     const BIG: u64 = 0x10000;
     const RAM: usize = 0x40000;
+    /// The second request queue's rings (`Rig::with_queues`): `DESC`, `AVAIL` and `USED` from here.
+    const Q1: u64 = 0x38000;
 
     /// Disk calls that wait while `held`; reads return 0x5a. Each call records whether a disk worker made it.
     #[derive(Default)]
@@ -2621,6 +2719,11 @@ pub(in crate::virtio) mod owner_tests {
     }
     impl Rig {
         pub(in crate::virtio) fn new(name: &str) -> Self {
+            Self::with_queues(name, 1)
+        }
+        /// With two request queues the second's rings are at `Q1`, and the driver accepts VIRTIO_BLK_F_MQ.
+        fn with_queues(name: &str, queues: usize) -> Self {
+            assert!((1..=2).contains(&queues));
             let path = std::env::temp_dir()
                 .join(format!("natemu-owner-{}-{name}.raw", std::process::id()));
             File::create(&path).unwrap().set_len(1 << 20).unwrap();
@@ -2631,6 +2734,7 @@ pub(in crate::virtio) mod owner_tests {
                 unreachable!()
             };
             *d.script.lock().unwrap() = Some(disk.clone());
+            r.block_queues(queues).unwrap();
             let rig = Self {
                 b: io::backing_with(1, RAM),
                 r,
@@ -2645,7 +2749,10 @@ pub(in crate::virtio) mod owner_tests {
                 (reg::STATUS, 1),
                 (reg::STATUS, 3),
                 (reg::DRIVER_FEATURES_SEL, 0),
-                (reg::DRIVER_FEATURES, F_SIZE_MAX | F_SEG_MAX),
+                (
+                    reg::DRIVER_FEATURES,
+                    F_SIZE_MAX | F_SEG_MAX | if queues > 1 { F_MQ } else { 0 },
+                ),
                 (reg::DRIVER_FEATURES_SEL, 1),
                 (reg::DRIVER_FEATURES, 1),
                 (reg::STATUS, 11),
@@ -2655,8 +2762,22 @@ pub(in crate::virtio) mod owner_tests {
                 (reg::QUEUE_DRIVER_LOW, AVAIL),
                 (reg::QUEUE_DEVICE_LOW, USED),
                 (reg::QUEUE_READY, 1),
-                (reg::STATUS, 15),
-            ] {
+            ]
+            .into_iter()
+            .chain(
+                [
+                    (reg::QUEUE_SEL, 1),
+                    (reg::QUEUE_NUM, SIZE.into()),
+                    (reg::QUEUE_DESC_LOW, Q1 + DESC),
+                    (reg::QUEUE_DRIVER_LOW, Q1 + AVAIL),
+                    (reg::QUEUE_DEVICE_LOW, Q1 + USED),
+                    (reg::QUEUE_READY, 1),
+                ]
+                .into_iter()
+                .filter(|_| queues > 1),
+            )
+            .chain([(reg::STATUS, 15)])
+            {
                 assert_eq!(
                     rig.r.access(0, offset, 4, Some(value)),
                     Access::Completed(0)
@@ -2900,6 +3021,124 @@ pub(in crate::virtio) mod owner_tests {
         assert_eq!((rig.flags(), rig.used_index()), (0, 1));
         // The lone request's call was the owner's (the final sync is no read or write).
         assert_eq!(rig.by_worker(), [false]);
+    }
+
+    #[test]
+    fn two_request_queues_are_admitted_and_completed_each_on_its_own_rings() {
+        let rig = Rig::with_queues("two-queues", 2);
+        assert_eq!(rig.r.profile.queue_count(), 2);
+        assert_ne!(rig.r.lock().features & F_MQ, 0);
+        // Queue 1's request `k`: the same buffers as `read_request(k)`, its descriptors in queue 1's own table.
+        let second = |k: u16| {
+            let head = rig.read_request(k);
+            for i in head..head + 3 {
+                let at = rig.b.ram.range(DESC + u64::from(i) * 16, 16).unwrap();
+                let mut d = [0; 16];
+                // SAFETY: fixture RAM in bounds, written by this thread just above.
+                unsafe { std::ptr::copy_nonoverlapping(at, d.as_mut_ptr(), 16) };
+                rig.put(Q1 + DESC + u64::from(i) * 16, &d);
+            }
+            head
+        };
+        let (flags1, used1) = (
+            || rig.word(Q1 + USED).load(SeqCst),
+            || rig.word(Q1 + USED + 2).load(SeqCst),
+        );
+        rig.disk.hold(true);
+        rig.run(|rig| {
+            // Two requests on queue 0 go to the workers. (Its kick suppression comes and goes while they are on disk:
+            // the quiet-wait clear.) Queue 1's flag is its own and was never set.
+            rig.publish(rig.read_request(0));
+            rig.publish(rig.read_request(1));
+            assert!(rig.kick());
+            until("queue 0 on disk", || rig.disk.calls() == 2);
+            assert_eq!(flags1(), 0, "queue 1's driver still kicks");
+            // Queue 1's request is admitted beside them, from its own ring, on its own kick.
+            rig.put(Q1 + AVAIL + 4, &second(2).to_le_bytes());
+            rig.word(Q1 + AVAIL + 2).store(1, SeqCst);
+            assert_eq!(
+                rig.r.access(0, reg::QUEUE_NOTIFY, 4, Some(1)),
+                Access::Completed(0)
+            );
+            until("queue 1 on disk", || rig.disk.calls() == 3);
+            assert_eq!((rig.used_index(), used1()), (0, 0));
+            {
+                let s = rig.r.lock();
+                assert_eq!(s.in_flight.iter().filter(|id| id.queue == 1).count(), 1);
+                assert_eq!(s.in_flight.iter().filter(|id| id.queue == 0).count(), 2);
+            }
+            rig.disk.hold(false);
+            // Each completes in its own used ring, and each queue's flag clears once none of its requests is left.
+            until("both queues completed", || {
+                (rig.used_index(), used1()) == (2, 1)
+            });
+            until("both flags clear", || rig.flags() == 0 && flags1() == 0);
+            let element = |used: u64, slot: u64| {
+                let at = rig.b.ram.range(used + 4 + slot * 8, 8).unwrap();
+                let mut e = [0; 8];
+                // SAFETY: fixture RAM in bounds; the owner published these elements before the index read above.
+                unsafe { std::ptr::copy_nonoverlapping(at, e.as_mut_ptr(), 8) };
+                (
+                    u32::from_le_bytes(e[..4].try_into().unwrap()),
+                    u32::from_le_bytes(e[4..].try_into().unwrap()),
+                )
+            };
+            let mut zero: Vec<_> = (0..2).map(|i| element(USED, i)).collect();
+            zero.sort();
+            assert_eq!(
+                zero,
+                [(0, 513), (3, 513)],
+                "queue 0: heads 0 and 3, 512 bytes and a status each"
+            );
+            assert_eq!(element(Q1 + USED, 0), (6, 513), "queue 1: head 6");
+            // (The owner updates its state after the copy that updated the rings.)
+            until("state settled", || {
+                let s = rig.r.lock();
+                s.suppressed.iter().all(Option::is_none)
+                    && (s.queues[0].next_used, s.queues[1].next_used) == (2, 1)
+                    && s.in_flight.is_empty()
+            });
+        });
+        assert_eq!(rig.disk.calls(), 3);
+    }
+    #[test]
+    fn a_disable_of_one_request_queue_leaves_the_other_running() {
+        let rig = Rig::with_queues("two-queues-disable", 2);
+        rig.run(|rig| {
+            // Queue 1 is disabled (a queue reset) with nothing in flight: it retires at once.
+            for (register, value) in [(reg::QUEUE_SEL, 1), (reg::QUEUE_READY, 0)] {
+                assert_eq!(
+                    rig.r.access(0, register, 4, Some(value)),
+                    Access::Completed(0)
+                );
+            }
+            assert!(!rig.r.lock().queues[1].ready);
+            // Queue 0 still serves.
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("queue 0 completed", || rig.used_index() == 1);
+            // A head published on the disabled queue and its kick are dropped: nothing is admitted from it, while
+            // queue 0 goes on.
+            let head = rig.read_request(5);
+            for i in head..head + 3 {
+                let at = rig.b.ram.range(DESC + u64::from(i) * 16, 16).unwrap();
+                let mut d = [0; 16];
+                // SAFETY: fixture RAM in bounds, written by this thread just above.
+                unsafe { std::ptr::copy_nonoverlapping(at, d.as_mut_ptr(), 16) };
+                rig.put(Q1 + DESC + u64::from(i) * 16, &d);
+            }
+            rig.put(Q1 + AVAIL + 4, &head.to_le_bytes());
+            rig.word(Q1 + AVAIL + 2).store(1, SeqCst);
+            assert_eq!(
+                rig.r.access(0, reg::QUEUE_NOTIFY, 4, Some(1)),
+                Access::Completed(0)
+            );
+            rig.publish(rig.read_request(1));
+            assert!(rig.kick());
+            until("queue 0 again", || rig.used_index() == 2);
+            assert!(rig.r.lock().in_flight.iter().all(|id| id.queue == 0));
+            assert_eq!(rig.word(Q1 + USED + 2).load(SeqCst), 0);
+        });
     }
 
     #[test]

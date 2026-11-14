@@ -112,6 +112,9 @@ const USED_NO_NOTIFY: u16 = 1;
 const GATE_OPEN: u64 = 1;
 const GATE_KILLED: u64 = 2;
 const RNG_MAX_QUEUE: u16 = 8;
+/// The most queues a device has: the disk's request queues over PCI (one per vCPU, up to this many: `block::F_MQ`);
+/// the network device has its receive and transmit queues, the others one.
+pub const MAX_QUEUES: usize = 8;
 /// The most entropy one request returns (also getentropy's limit).
 const MAX_PAYLOAD: usize = 256;
 
@@ -185,15 +188,15 @@ struct State {
     /// The driver's accepted features.
     features: u64,
     queue_sel: u32,
-    queues: [Queue; 2],
+    queues: [Queue; MAX_QUEUES],
     /// Per-queue incarnation, advanced by a queue reset.
-    generations: [u64; 2],
+    generations: [u64; MAX_QUEUES],
     /// The InterruptStatus register.
     interrupt: u32,
     /// Device incarnation, advanced by a device reset.
     generation: u64,
     /// Per-queue work flag: a guest notification, a packet arrival, or work left after a completion.
-    notified: [bool; 2],
+    notified: [bool; MAX_QUEUES],
     /// The incarnation of every admitted request not yet retired (block: up to its in-flight
     /// bound; entropy and network: at most one). A reset retires once none of its own remain.
     in_flight: Vec<Identity>,
@@ -223,9 +226,9 @@ struct State {
     /// The driver notified RX since the current RX request was admitted: that request cannot starve.
     rx_kicked: bool,
     backend_error: Option<String>,
-    /// Block: the incarnation whose used ring holds VIRTQ_USED_F_NO_NOTIFY (the owner's kick suppression). A reset
-    /// waits for the owner to clear it, so no incarnation ends with its driver's kicks suppressed.
-    suppressed: Option<Identity>,
+    /// Block, per queue: the incarnation whose used ring holds VIRTQ_USED_F_NO_NOTIFY (the owner's kick suppression).
+    /// A reset waits for the owner to clear it, so no incarnation ends with its driver's kicks suppressed.
+    suppressed: [Option<Identity>; MAX_QUEUES],
 }
 
 impl State {
@@ -261,7 +264,11 @@ impl State {
     /// A request or the open copy window still belongs to an incarnation `reset` closes.
     fn holds(&self, reset: Reset) -> bool {
         self.in_flight.iter().any(|&id| reset.affects(id))
-            || self.suppressed.is_some_and(|id| reset.affects(id))
+            || self
+                .suppressed
+                .iter()
+                .flatten()
+                .any(|&id| reset.affects(id))
             || self
                 .permit
                 .as_ref()
@@ -317,7 +324,7 @@ impl Drop for Locked<'_> {
     }
 }
 
-/// A production virtio device with up to two queues. Clones share one register/IRQ ordering
+/// A production virtio device with up to [`MAX_QUEUES`] queues. Clones share one register/IRQ ordering
 /// domain; exactly one independent owner calls `run`. The MMIO adapter retains no guest-memory
 /// authority.
 pub struct Virtio {
@@ -328,10 +335,10 @@ pub struct Virtio {
     gsi: usize,
     running: AtomicBool,
     /// Per queue: its notification gate (`GATE_*`), written only under the state lock as each holder releases it.
-    gates: [AtomicU64; 2],
+    gates: [AtomicU64; MAX_QUEUES],
     /// Per queue: a QueueNotify taken without the state lock, as the open gate it saw (0: none). The owner moves it to
     /// `notified` under the lock if the gate's epoch has not moved since; a nonzero kick holds one [`Irqs::busy`] count.
-    kicks: [AtomicU64; 2],
+    kicks: [AtomicU64; MAX_QUEUES],
     /// The features the driver accepted, once FEATURES_OK holds (0 otherwise, and after a reset):
     /// read lock-free by the owner (EVENT_IDX, network checksum offloads).
     accepted: AtomicU64,
@@ -352,10 +359,10 @@ impl Profile {
         }
     }
     fn queue_count(&self) -> usize {
-        if matches!(self, Self::Network(_)) {
-            2
-        } else {
-            1
+        match self {
+            Self::Network(_) => 2,
+            Self::Block(disk) => disk.queues(),
+            Self::Entropy => 1,
         }
     }
     fn queue_max(&self) -> u16 {
@@ -368,7 +375,7 @@ impl Profile {
     fn features(&self) -> u64 {
         match self {
             Self::Entropy => VERSION_1,
-            Self::Block(_) => block::FEATURES,
+            Self::Block(disk) => disk.features(),
             Self::Network(network) => network.features(),
         }
     }
@@ -762,6 +769,22 @@ impl Virtio {
         let disk = block::Disk::open(path)?;
         Ok(Self::new(irqs, gsi, Profile::Block(disk)))
     }
+    /// Before the device is made a PCI function or runs: give the disk `count` request queues (1..=[`MAX_QUEUES`];
+    /// more than one offers VIRTIO_BLK_F_MQ, so a driver can complete each request on the CPU that sent it). The launch
+    /// code does this for a PCI disk only (under MMIO every queue shares one interrupt line, so nothing is gained).
+    pub fn block_queues(&self, count: usize) -> Result<()> {
+        let Profile::Block(disk) = &self.profile else {
+            return Err("request queues are the disk's".into());
+        };
+        if self.running.load(SeqCst) || self.pci.get().is_some() {
+            return Err("disk queue count set after the device was set up".into());
+        }
+        if !(1..=MAX_QUEUES).contains(&count) {
+            return Err(format!("disk queue count {count} outside 1..={MAX_QUEUES}"));
+        }
+        disk.set_queues(count);
+        Ok(())
+    }
     fn new(irqs: Irqs, gsi: usize, profile: Profile) -> Arc<Self> {
         assert!((16..24).contains(&gsi));
         Arc::new(Self {
@@ -810,9 +833,14 @@ impl Virtio {
     /// Republish each queue's gate from `s` (under its lock): open when a QueueNotify would be applied at once; a new
     /// epoch when it starts dropping work, so a kick that saw an older gate is dropped as a notification before it was.
     fn publish_gates(&self, s: &State) {
-        for (queue, gate) in self.gates.iter().enumerate() {
-            let killed =
-                queue >= self.profile.queue_count() || self.profile.is_rx(queue) || s.kills(queue);
+        // (Gates past the device's queues stay 0: never open, so a notification of one takes the locked path.)
+        for (queue, gate) in self
+            .gates
+            .iter()
+            .enumerate()
+            .take(self.profile.queue_count())
+        {
+            let killed = self.profile.is_rx(queue) || s.kills(queue);
             let open = !killed && s.admission_open();
             let old = gate.load(SeqCst);
             let mut epoch = old >> 2;
@@ -828,7 +856,7 @@ impl Virtio {
     /// QueueNotify without the state lock, when the gate is open: record the kick and ring the owner. False: take the
     /// locked path. The RX queue never opens (a packet arrival, not a kick, is its work).
     fn kick(&self, queue: u64) -> bool {
-        let Some(q) = usize::try_from(queue).ok().filter(|&q| q < 2) else {
+        let Some(q) = usize::try_from(queue).ok().filter(|&q| q < MAX_QUEUES) else {
             return false;
         };
         let gate = self.gates[q].load(SeqCst);
@@ -860,7 +888,7 @@ impl Virtio {
     }
     /// Move lock-free kicks into `notified` (under the lock), unless their queue dropped work since they were made.
     fn take_kicks(&self, s: &mut State) {
-        for q in 0..2 {
+        for q in 0..self.profile.queue_count() {
             let kick = self.kicks[q].swap(0, SeqCst);
             if kick == 0 {
                 continue;
@@ -895,7 +923,7 @@ impl Virtio {
         let mut s = self.lock();
         s.stopped = true;
         self.take_kicks(&mut s);
-        s.notified = [false; 2];
+        s.notified = [false; MAX_QUEUES];
         s.received.clear();
         s.rx_starved = false;
         if let Some((_, p)) = &s.permit {
@@ -908,7 +936,7 @@ impl Virtio {
     fn quiesce(&self) -> Result<bool> {
         let mut s = self.lock();
         s.quiescing = true;
-        s.notified = [false; 2];
+        s.notified = [false; MAX_QUEUES];
         s.received.clear();
         s.rx_starved = false;
         self.wake.ring();
@@ -930,8 +958,8 @@ impl Virtio {
                     .generation
                     .checked_add(1)
                     .expect("virtio generation exhausted");
-                s.queues = [Queue::default(); 2];
-                s.notified = [false; 2];
+                s.queues = [Queue::default(); MAX_QUEUES];
+                s.notified = [false; MAX_QUEUES];
                 s.cursor = 0;
                 s.received.clear();
                 s.rx_starved = false;
@@ -982,7 +1010,7 @@ impl Virtio {
     fn reset(&self, s: &mut State, reset: Reset) -> Access {
         s.closing = Some(reset);
         match reset {
-            Reset::Device => s.notified = [false; 2],
+            Reset::Device => s.notified = [false; MAX_QUEUES],
             Reset::Queue(i) => s.notified[i] = false,
         }
         if let Some((id, p)) = &s.permit {
@@ -1002,7 +1030,7 @@ impl Virtio {
     /// configuration change.
     fn fail(&self, s: &mut State) {
         s.status |= status::NEEDS_RESET;
-        s.notified = [false; 2];
+        s.notified = [false; MAX_QUEUES];
         let live = s.status & status::DRIVER_OK != 0;
         if live {
             s.interrupt |= CONFIG_CHANGE;
@@ -1173,7 +1201,7 @@ impl Virtio {
         };
         self.accepted.store(accepted, SeqCst);
         if value & status::FAILED != 0 {
-            s.notified = [false; 2];
+            s.notified = [false; MAX_QUEUES];
         }
         Access::Completed(0)
     }
@@ -1472,7 +1500,7 @@ impl Virtio {
         self.take_kicks(&mut s);
         s.in_flight.clear();
         s.permit = None;
-        s.notified = [false; 2];
+        s.notified = [false; MAX_QUEUES];
         s.busy = None;
         s.interrupt = 0;
         self.irq(&s);
@@ -1487,7 +1515,7 @@ impl Virtio {
             return Err(format!("network shutdown: {error}"));
         }
         self.take_kicks(&mut s);
-        s.notified = [false; 2];
+        s.notified = [false; MAX_QUEUES];
         s.busy = None;
         s.interrupt = 0;
         self.irq(&s);
@@ -1843,7 +1871,7 @@ mod tests {
                         let mut s = r.lock();
                         r.retire_request(&mut s, &snapshot, q, id, pending, 1);
                         r.take_kicks(&mut s);
-                        assert_eq!(s.notified, [pending || notify || captured, true]);
+                        assert_eq!(s.notified[..2], [pending || notify || captured, true]);
                         assert_eq!(s.queues[0].next_avail, q.next_avail.wrapping_add(1));
                         assert_eq!(s.queues[0].next_used, 18);
                     }
@@ -2065,7 +2093,7 @@ mod tests {
         r.record_kick(1, gate);
         let mut s = r.lock();
         r.take_kicks(&mut s);
-        assert_eq!(s.notified, [false, true]);
+        assert_eq!(s.notified[..2], [false, true]);
         // A device reset then drops it, as it drops a locked notify.
         s.in_flight.clear();
         r.retire_reset(&mut s);

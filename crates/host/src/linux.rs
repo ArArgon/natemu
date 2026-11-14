@@ -23,6 +23,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+/// The disk's request queues over PCI: one per vCPU, at most `virtio::MAX_QUEUES`; `NATEMU_BLK_QUEUES` overrides it
+/// (calibration and comparison; 1 is the single queue of the MMIO transport). Measured on an M2 Max (November 14,
+/// 2026, 2 vCPUs, against one queue): depth-1 4 KiB direct reads 75-77 -> 111 MB/s for 74 -> 46 us of host CPU per
+/// request (a request no longer wakes a second vCPU), four fio readers at depth 16 +37%; but one fio job at depth 16
+/// now submits and completes on one vCPU: mixed 4 KiB 54-56k -> 33-37k IOPS, sequential 128 KiB writes about -17%.
+fn disk_queues(vcpus: usize) -> usize {
+    let max = crate::virtio::MAX_QUEUES;
+    let asked = std::env::var("NATEMU_BLK_QUEUES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    asked.unwrap_or(vcpus).clamp(1, max)
+}
+
 /// How a virtio device is attached to the guest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Transport {
@@ -243,6 +256,8 @@ impl Boot {
             let resource = crate::virtio::BLOCK_RESOURCE;
             let disk = crate::virtio::Virtio::block(irqs.clone(), resource.gsi as usize, path)?;
             if pci_disk {
+                // One request queue per vCPU: the guest then takes each completion on the vCPU that sent the request.
+                disk.block_queues(disk_queues(self.vcpus))?;
                 bus.add(BLOCK_SLOT, disk.pci(BLOCK_SLOT))?;
             } else {
                 devices.register(resource.base.into(), 4096, disk.device())?;
