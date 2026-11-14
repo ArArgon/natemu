@@ -297,3 +297,51 @@ the lock; 10 s of that is process-fatal). Transient loss is an ordinary backend
 success; terminal loss fails the device and cancels the VM. PacketPort closure
 is terminal until the device is stopped/drained. Backend failure and successful
 drain publication share the state lock so S5 cannot hide an earlier failure.
+
+## PCI transport
+
+`--virtio-transport pci` attaches every virtio device as a PCI function instead of
+a virtio-MMIO device; `mmio` (the default) keeps today's launch byte for byte. A
+per-device form, e.g. `disk=pci,net=mmio,rng=mmio`, is experimental. The device
+code is the same either way: `pci.rs` is a second front end on the same state lock,
+register path, deferral and owner (`crates/host/src/pci/` holds the bus).
+
+What the guest sees (the full table, with each value's basis, is in
+`docs/restructure/pci-plan.md`): configuration mechanism #1 on ports 0xCF8-0xCFF, an
+i440FX host bridge at 00:00.0, disk at 00:01.0, network at 00:02.0, entropy at
+00:03.0 (vendor 0x1AF4, device 0x1040 + virtio ID). BAR0 is 32 KiB of 32-bit memory
+at 0xE000_0000 + 0x1_0000 x slot: common configuration 0x0000, ISR 0x1000, device
+configuration 0x2000, notification 0x3000 (multiplier 4), MSI-X table 0x4000 and PBA
+0x5000. Capabilities: MSI-X (one vector per queue plus one for configuration), then
+the four virtio structures. The DSDT's `\_SB.PCI0` declares the window
+0xE000_0000-0xEFFF_FFFF and routes each slot's INTA# to the device's MMIO-era GSI
+through `_PRT`; the E820 map leaves the window out.
+
+Interrupts: with MSI-X each queue's completion sends its vector straight to the
+LAPICs, an edge with no exit on the guest's side. A guest that does not enable MSI-X
+gets INTx: the GSI is asserted while the ISR is nonzero, at two exits per interrupt
+(the ISR read and the level EOI). Lock order: virtio state, then the function's
+configuration space, then MSI-X, then the chipset; no configuration access takes the
+state lock, and Bus Master, BAR0's base and the ISR are published in atomics.
+
+Stated leniencies and deviations:
+(a) the whole PCI window is one claimed range: a read of a window address no BAR
+decodes costs a host exit each time instead of mapping the shared all-ones page, and
+the strict unassigned-access switch does not stop there; (b) unimplemented BAR0
+offsets and widths read 0 and ignore writes; (c) reads of the MSI-X table or PBA
+region past their entries return all-ones; (d) under PCI a queue-layout write while
+the queue is enabled is ignored, not refused; (e) under MSI-X the ISR bit stays set
+(the driver never reads it), so disabling MSI-X without a reset asserts INTx at once,
+and the `raised` profile counter is skewed; (f) with Bus Master clear the device still
+processes requests and holds its interrupts pending until Bus Master is set (QEMU
+blocks DMA instead); (g) MSI messages are always delivered edge-triggered, ExtINT as
+fixed, the redirection hint as lowest priority; (h) the command register accepts
+writes to reserved bits and I/O Space (upstream's behaviour); (i) a BAR moved outside
+the window does not decode; (j) no ECAM/MCFG, no PCIe, no hotplug, 32-bit BAR only.
+
+Evidence: acceptance in `natemu-raw/pci-accept-20261113-01` (network 15/15 at 1/2/4
+vCPUs, block 6/6, I/O coverage over PCI passing apart from the host-full case, which
+fails identically on MMIO). Exit counts in `natemu-raw/pci-smoke-20261113-01`, the
+same boot-and-disk workload at 2 vCPUs: MMIO 409 EOI exits, 409 status reads, 409
+acknowledges and 2,476 device exits; PCI 0, 0, 0 and 1,772. A benchmark round is
+still to come.
