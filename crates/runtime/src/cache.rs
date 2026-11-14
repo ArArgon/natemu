@@ -668,6 +668,7 @@ pub fn tlb(global: bool) -> Option<u64> {
         // listed entries (filled with a non-global block) are looked at. Each one emptied is cleaned to the point of
         // unification; after one barrier its instructions are invalidated as the list is compacted (an entry still
         // filled stays listed, the rest leave it).
+        let ctr = ctr_el0();
         for t in 0..area::L1_TABLES {
             let listed = c.l1_listed[t] as usize;
             if c.l1_contexts[t] == area::NO_CONTEXT || listed == 0 {
@@ -678,10 +679,10 @@ pub fn tlb(global: bool) -> Option<u64> {
                 let owner = l1_block(t, i);
                 if owner != 0 && !current(block(owner as usize - 1)) {
                     empty_l1(t, i);
-                    unsafe { asm!("dc cvau, {0}", in(reg) area::CODE_WRITE_VA + l1_entry(t, i)) };
+                    clean_pou(ctr, area::CODE_WRITE_VA + l1_entry(t, i));
                 }
             }
-            unsafe { asm!("dsb ish") };
+            clean_barrier(ctr);
             let mut kept = 0;
             for k in 0..listed {
                 let i = unsafe { l1_list(t, k).read() } as usize;
@@ -690,7 +691,7 @@ pub fn tlb(global: bool) -> Option<u64> {
                     kept += 1;
                 } else {
                     unsafe { l1_owner(t, i).write(0) };
-                    unsafe { asm!("ic ivau, {0}", in(reg) area::CODE_VA + l1_entry(t, i)) };
+                    invalidate_pou(ctr, area::CODE_VA + l1_entry(t, i));
                 }
             }
             unsafe { asm!("dsb ish", "isb") };
@@ -1367,22 +1368,51 @@ pub fn place_step(
 
 /// `bytes` of code written at `write` (a writable alias) become visible to instruction fetch at `exec` (its executable alias).
 fn synchronize_code(write: u64, exec: u64, bytes: usize) {
+    let ctr = ctr_el0();
+    let (dline, iline) = (4u64 << ((ctr >> 16) & 15), 4u64 << (ctr & 15));
+    let mut at = 0;
+    while ctr & CTR_IDC == 0 && at < bytes as u64 + (write & (dline - 1)) {
+        clean_pou(ctr, (write & !(dline - 1)) + at);
+        at += dline;
+    }
+    clean_barrier(ctr);
+    at = 0;
+    while ctr & CTR_DIC == 0 && at < bytes as u64 + (exec & (iline - 1)) {
+        invalidate_pou(ctr, (exec & !(iline - 1)) + at);
+        at += iline;
+    }
+    unsafe { asm!("dsb ish", "isb") };
+}
+/// CTR_EL0 (Arm ARM D19.2.30): IDC (bit 28) = 1 means a data cache clean to the point of unification is not required for
+/// instruction-to-data coherence, so `dc cvau` is skipped and a store-ordering barrier suffices (as Linux's
+/// `caches_clean_inval_pou`); DIC (bit 29) = 1 means `ic ivau` is not required either (only `dsb ish; isb`).
+fn ctr_el0() -> u64 {
+    let ctr: u64;
+    unsafe { asm!("mrs {0}, ctr_el0", out(reg) ctr) };
+    ctr
+}
+const CTR_IDC: u64 = 1 << 28;
+const CTR_DIC: u64 = 1 << 29;
+/// Cleans the line at `a` to the point of unification, unless `ctr` says that is not needed (IDC).
+fn clean_pou(ctr: u64, a: u64) {
+    if ctr & CTR_IDC == 0 {
+        unsafe { asm!("dc cvau, {0}", in(reg) a) };
+    }
+}
+/// The barrier after the cleans: with IDC only the code stores must be ordered before the invalidates.
+fn clean_barrier(ctr: u64) {
     unsafe {
-        let ctr: u64;
-        asm!("mrs {0}, ctr_el0", out(reg) ctr);
-        let (dline, iline) = (4u64 << ((ctr >> 16) & 15), 4u64 << (ctr & 15));
-        let mut at = 0;
-        while at < bytes as u64 + (write & (dline - 1)) {
-            asm!("dc cvau, {0}", in(reg) (write & !(dline - 1)) + at);
-            at += dline;
+        if ctr & CTR_IDC == 0 {
+            asm!("dsb ish");
+        } else {
+            asm!("dsb ishst");
         }
-        asm!("dsb ish");
-        at = 0;
-        while at < bytes as u64 + (exec & (iline - 1)) {
-            asm!("ic ivau, {0}", in(reg) (exec & !(iline - 1)) + at);
-            at += iline;
-        }
-        asm!("dsb ish", "isb");
+    }
+}
+/// Invalidates the instruction line at `a` to the point of unification, unless `ctr` says that is not needed (DIC).
+fn invalidate_pou(ctr: u64, a: u64) {
+    if ctr & CTR_DIC == 0 {
+        unsafe { asm!("ic ivau, {0}", in(reg) a) };
     }
 }
 
@@ -1479,16 +1509,15 @@ pub fn disarm() -> Option<([u32; ARMED], usize)> {
 }
 /// The armed record's words become visible to instruction fetch (one barrier pair for all of them).
 fn synchronize_words(c: &Control) {
-    unsafe {
-        for &[o, _] in &c.armed_words[..c.armed as usize] {
-            asm!("dc cvau, {0}", in(reg) area::CODE_WRITE_VA + u64::from(o));
-        }
-        asm!("dsb ish");
-        for &[o, _] in &c.armed_words[..c.armed as usize] {
-            asm!("ic ivau, {0}", in(reg) area::CODE_VA + u64::from(o));
-        }
-        asm!("dsb ish", "isb");
+    let ctr = ctr_el0();
+    for &[o, _] in &c.armed_words[..c.armed as usize] {
+        clean_pou(ctr, area::CODE_WRITE_VA + u64::from(o));
     }
+    clean_barrier(ctr);
+    for &[o, _] in &c.armed_words[..c.armed as usize] {
+        invalidate_pou(ctr, area::CODE_VA + u64::from(o));
+    }
+    unsafe { asm!("dsb ish", "isb") };
 }
 /// The link point's words are its admitted form: the first word of its RIP move, and the `svc #LINK` after it (PIC study
 /// stage 2: a link into a [`PIC`] block may patch that word instead, [`link`]).
