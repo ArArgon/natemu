@@ -113,3 +113,31 @@ fn checked(s: &mut State, va: u64, (page, flags): (u64, u32)) {
         halt(s, stop::PAGE_CHECK)
     }
 }
+
+/// A block's revalidation from the record alone ([`cache::lookup`] on the fast miss path): the answer a walk of each source
+/// page would give where every page is recorded ([`Mapped::Yes`] when each page is the block's own, [`Mapped::No`] when a
+/// recorded frame differs), else [`Mapped::Unknown`]: some page has no record, so a walk is owed, which may fault or write an A
+/// bit and is the full path's. Off and in the check modes (which owe the walk) it knows nothing, nor does a `page-study` build
+/// (its record is the shadow it measures).
+pub(super) fn revalidated_from_record(s: &State, b: &Block) -> Mapped {
+    if cfg!(feature = "page-study") || cache::control().pages != PAGES_ON {
+        return Mapped::Unknown;
+    }
+    let mut flags = [cache::GLOBAL; 2];
+    let mut differ = false;
+    let mut hits = 0;
+    for (k, &gpa) in b.source_gpa.iter().enumerate() {
+        if gpa != u64::MAX {
+            let Some((page, f)) = probe(s, (b.rip & !4095).wrapping_add(4096 * k as u64)) else {
+                return Mapped::Unknown;
+            };
+            (flags[k], differ, hits) = (f, differ || page != gpa, hits + 1);
+        }
+    }
+    cache::control().page_hits += hits;
+    if differ {
+        Mapped::No
+    } else {
+        Mapped::Yes(leaves(s, flags))
+    }
+}

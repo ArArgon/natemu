@@ -546,6 +546,9 @@ pub mod cache {
         pub const AFTER_PRECHECK: u64 = 10;
         pub const BEFORE_RECHECK: u64 = 11;
         pub const BEFORE_PUBLISH: u64 = 12;
+        /// The fast miss path's entry (fast-miss plan section 5): before its checks, with the target and the state record as the
+        /// miss left them.
+        pub const MISS_FAST_CHECK: u64 = 13;
         const _: () = assert!(BASE + (HOST + 1) * STRIDE <= super::CODE_PAGES);
     }
 
@@ -784,6 +787,13 @@ pub mod cache {
         pub page_hits: u64,
         pub page_disagree: u64,
         pub page_split_2m: u64,
+        /// Fast miss path (fast-miss plan chunks 1-2): dispatcher misses served from the exit's frame (`fast_taken`),
+        /// and the ones it declined, by reason ([`fast_decline`]). Plain increments, in every build. Appended.
+        pub fast_taken: u64,
+        pub fast_declined: [u64; fast_decline::COUNT],
+        /// Set by the host from `NATEMU_MISS_FAST=off` (for A/B measurement only; zero, the default, is on): the fast miss path is
+        /// never tried (nothing counted). Appended.
+        pub miss_fast_off: u64,
     }
     /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
     pub mod pool_recheck {
@@ -846,6 +856,38 @@ pub mod cache {
     pub const PAGES_ON: u64 = 1;
     pub const PAGES_CHECK: u64 = 2;
     pub const PAGES_CHECK_HALT: u64 = 3;
+    /// Why the fast miss path declined a dispatcher miss ([`Control::fast_declined`]'s indices; the resident then serves it
+    /// as it always did).
+    pub mod fast_decline {
+        /// A debug trap, TF or an armed breakpoint (DR7) is in play.
+        pub const DEBUG: usize = 0;
+        /// A MOV SS / STI shadow, a REP boundary, a plain step or a wanted stop (a boundary that owes work).
+        pub const BOUNDARY: usize = 1;
+        /// Posted invalidations, a flush or shadows request (`cache::pending` in the resident).
+        pub const PENDING: usize = 2;
+        /// An I/O window request this vCPU has not acknowledged.
+        pub const IO: usize = 3;
+        /// A LAPIC expiry due or a reinjection backlog.
+        pub const LAPIC: usize = 4;
+        /// An event this boundary may take.
+        pub const EVENT: usize = 5;
+        /// An uncached (UC) shadow awaiting its end-of-instruction barrier.
+        pub const UNCACHED: usize = 6;
+        /// A test mode (`pic_test`) or a study build that counts every miss.
+        pub const STUDY: usize = 7;
+        /// No block for the target (it needs a translation), or none current whose page records say it is mapped.
+        pub const NO_BLOCK: usize = 8;
+        /// A block of the target not current whose pages the page record does not all hold (a walk is owed).
+        pub const UNKNOWN: usize = 9;
+        /// The target is a kept system-instruction decode (the full path executes it).
+        pub const SYSTEM: usize = 10;
+        /// The target is the single-instruction step block.
+        pub const STEP: usize = 11;
+        pub const COUNT: usize = 12;
+        pub const NAMES: [&str; COUNT] = [
+            "debug", "boundary", "pending", "io", "lapic", "event", "uncached", "study", "no_block", "unknown", "system", "step",
+        ];
+    }
     /// [`Control::l1_counts`]: `fill_l1` entered a block over an entry owned by another block (eviction).
     pub const L1_EVICTED: usize = 0;
     /// `fill_l1` entered nothing because the table's context is not the block's.

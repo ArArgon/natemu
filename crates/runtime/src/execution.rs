@@ -17,8 +17,9 @@
 //! enforces it: every private page is EL1-only except the code area, which EL0 may only execute. Interrupts are doorbells (a host SPI, a
 //! peer's SGI): each stops the vCPU precisely at a block boundary ([`interrupted`]) and the resident drains there.
 use super::*;
-use crate::cache::{self, Block};
+use crate::cache::{self, Block, Mapped};
 use core::sync::atomic::Ordering::SeqCst;
+use natemu_abi::execution::cache::fast_decline;
 use natemu_abi::execution::perf::SysFastDecline;
 mod delivery;
 mod events;
@@ -757,6 +758,124 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     }
     unsafe { enter(s, target) }
 }
+/// Fast miss path (docs/restructure/fast-miss-plan.md): a dispatcher miss into a block that is current (or whose source pages the
+/// page record says are mapped as the block's, [`page_record::revalidated_from_record`]) is served from the exit's frame, as
+/// [`sys_fast`] serves a system call: no bank, no `find`, no state record written back, no new frame. Nothing in the guest's state
+/// changes between the exit and the entry (no instruction runs), so the gate's frame already is the entry frame an L1 hit would
+/// have entered with: x0 = the RIP, the static registers, the PF/AF registers, the Q registers, FPCR/FPSR and NZCV as the
+/// exit left them, and the frame page's live bytes (DF, IF, the GS bases, the SIMD and x87 pending flags) are the page's own.
+///
+/// **The state record is authoritative only at a full entry, after [`bank`]; while generated code runs, the registers and the
+/// frame page are** (the precedent is the L1 hit and the patched link). After a fast miss the record and the frame page are what
+/// an L1 hit from the last full entry leaves them, plus RF cleared and `shadow_entry` 0. Every full entry banks before it reads
+/// guest state and computes its RIP from the frame or the faulting site, never from the record, so a stale record is
+/// never read for guest state (the readers reachable without a bank: `fp_exception`'s MXCSR/FPSR pairing, `bank_at`, `halt`'s
+/// diagnostics and the resident-owned controls, none reads stale guest state).
+///
+/// Taken only where `find` would find nothing to do at this boundary: no debug trap, TF or armed breakpoint, no shadow, REP
+/// boundary, plain step or wanted stop, no posted invalidation, I/O window, LAPIC expiry or backlog, no takeable event and no UC
+/// shadow owing its barrier, and the target a live, current (or record-revalidated) block that is neither a system-instruction
+/// decode nor the step block. Else it returns having written nothing but counters (and what `find` does again to the same
+/// effect: the L1 table's selection, a block's revalidation), and [`missed`] runs as it always did. Each decline is counted by
+/// reason (`Control::fast_declined`), a plain increment. Reads only resident memory (the record, `Control`, the L2 table, block
+/// records, the L1 code through its write alias, the page record): no guest memory, no `hvc`, no walk.
+///
+/// In place like `sys_fast`: `s` is the record itself, no `State` copy on this frame (the nested-entry stack bound).
+#[inline(never)]
+unsafe fn miss_fast(frame: &NativeFrame) {
+    // SAFETY: the record is this vCPU's (EL1-only); see [`sys_fast`].
+    let s = unsafe { &mut *record() };
+    #[cfg(feature = "io-test-hooks")]
+    crate::io_test::point(s.vcpu as usize, natemu_abi::execution::cache::io_test::MISS_FAST_CHECK);
+    let c = cache::control();
+    if c.miss_fast_off != 0 {
+        return;
+    }
+    if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || s.cpu.dr[5] & DR7_ENABLES != 0 {
+        return decline_fast(fast_decline::DEBUG);
+    }
+    // (The step block's computed exit comes here on purpose, X2: after a stepped instruction `plain_step` or `debug::STEP` is
+    // set, and an event a shadow held is seen by the event check: the contract is kept by these checks together.)
+    if s.cpu.mov_ss | s.sti_shadow | s.mid_string | s.plain_step | s.stop_wanted != 0 {
+        return decline_fast(fast_decline::BOUNDARY);
+    }
+    if cache::pending() {
+        return decline_fast(fast_decline::PENDING);
+    }
+    if io_pending(s) {
+        return decline_fast(fast_decline::IO);
+    }
+    if lapic::due() {
+        return decline_fast(fast_decline::LAPIC);
+    }
+    // The live IF at CPL 0 is the frame page's byte (what `bank` reads); `events::none` reads the record's, stale since the last
+    // full entry (and rewritten by the next bank).
+    if s.cpu.cpl == 0 {
+        // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.
+        let live = unsafe { (FRAME_VA as *const u8).add(frame::IF as usize).read_volatile() } != 0;
+        s.cpu.rflags = s.cpu.rflags & !RFLAGS_IF | if live { RFLAGS_IF } else { 0 };
+    }
+    if !events::none(s) {
+        return decline_fast(fast_decline::EVENT);
+    }
+    if c.uncached_count | c.uncached_fence != 0 {
+        return decline_fast(fast_decline::UNCACHED);
+    }
+    // The tests' and studies' builds count (or perturb) every miss by what it needs: they take the full path.
+    if c.pic_test != 0 || cfg!(any(feature = "pic-count", feature = "dispatch-study")) {
+        return decline_fast(fast_decline::STUDY);
+    }
+    // The target (generated code changes none of the code context's inputs, as `sys_fast`'s contract states).
+    let rip = frame.x[0];
+    let context = s.cpu.code_context();
+    cache::select_l1(context);
+    let (remapped, mut unknown) = (c.remapped, false);
+    let p = crate::perf::enter(crate::perf::LOOKUP);
+    let found = cache::lookup(rip, context, |b| match page_record::revalidated_from_record(s, b) {
+        Mapped::Unknown => {
+            unknown = true;
+            Mapped::Unknown
+        }
+        mapped => mapped,
+    });
+    crate::perf::leave(p);
+    let Some(target) = found else {
+        // (A `No` the search passed over is counted again by the full path's walk.)
+        c.remapped = remapped;
+        return decline_fast(if unknown { fast_decline::UNKNOWN } else { fast_decline::NO_BLOCK });
+    };
+    if target.flags & cache::SYSTEM != 0 {
+        return decline_fast(fast_decline::SYSTEM);
+    }
+    if target.flags & cache::STEP != 0 {
+        return decline_fast(fast_decline::STEP);
+    }
+    // Commit: all writes are resident-side. `completed`'s effect (`stepped` is a no-op with `debug` 0); what `enter` writes with
+    // no shadow; the counts `find` and `enter` make; the L1 refill (the point of the path: with its code synchronization).
+    s.cpu.rflags &= !RFLAGS_RF;
+    s.shadow_entry = 0;
+    s.blocks += 1;
+    s.l2_hits += 1;
+    c.fast_taken += 1;
+    cache::fill_l1(rip, target);
+    tables::select(s.cpu.cpl);
+    crate::perf::enter(crate::perf::GUEST);
+    // SAFETY: the target is a live block; the frame is the gate's, intact (see `resume_exception`'s layout contract). PSTATE as
+    // `enter` builds it, from the NZCV the gate stored. A PIC target's `full_entry` writes the page base itself.
+    unsafe {
+        resume_exception(
+            frame,
+            cache::code_of(target).full_entry(),
+            BLOCK_SPSR | frame.nzcv,
+            alignment_check(&s.cpu),
+        )
+    }
+}
+/// One more decline of [`miss_fast`] for `reason` (`fast_decline`): a plain increment.
+#[inline(always)]
+fn decline_fast(reason: usize) {
+    cache::control().fast_declined[reason] += 1;
+}
 /// Perf chunk 22, `perf` resident: [`Control::system_from`]'s slot (past the buckets) counting the system calls'
 /// SYSCALLs and SYSRETs [`sys_fast`] ran to the end (the host reports it as `"?"`).
 #[cfg(feature = "perf")]
@@ -1434,11 +1553,11 @@ fn fetch_walk(s: &mut State, va: u64) -> Result<(u64, u32), [u64; 3]> {
 /// K1: whether `b`'s source pages are where its linear pages are fetched from now (a fetch walk of each, as the CPU's
 /// after a TLB miss: A bits set, any fault meaning no): `Some(flags)` ([`leaves`]). The walk's A writes may invalidate
 /// `b` ([`cache::lookup`] looks again).
-fn mapped(s: &mut State, b: &Block) -> Option<u32> {
+fn mapped(s: &mut State, b: &Block) -> Mapped {
     let p = crate::perf::enter(crate::perf::REVALIDATE);
     let current = revalidated(s, b);
     crate::perf::leave(p);
-    current
+    current.map_or(Mapped::No, Mapped::Yes)
 }
 fn revalidated(s: &mut State, b: &Block) -> Option<u32> {
     #[cfg(feature = "page-study")]
@@ -1963,7 +2082,10 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
                 sys_fast(frame, elr);
                 linker(frame, elr)
             }
-            svc::MISS if elr == miss => missed(frame),
+            svc::MISS if elr == miss => {
+                miss_fast(frame);
+                missed(frame)
+            }
             imm @ (svc::DIV_U | svc::DIV_S) => division(imm == svc::DIV_S, frame, elr, spsr),
             svc::X87 => helpers::x87(frame, elr, spsr),
             svc::STRING => helpers::string(frame, elr, spsr),

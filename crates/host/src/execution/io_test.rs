@@ -34,6 +34,7 @@ impl<'a> Hooks<'a> {
                     | AFTER_PRECHECK
                     | BEFORE_RECHECK
                     | BEFORE_PUBLISH
+                    | MISS_FAST_CHECK
             )
         {
             return Err("invalid I/O test hook".into());

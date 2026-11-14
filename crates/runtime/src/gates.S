@@ -158,6 +158,11 @@ irq_gate:
     bl finish
     b .
 
+// Resumes EL0 from the frame at x0 (x1 = ELR, x2 = SPSR, x3 = alignment checking). The frame is read from, never written to,
+// and it may be the gate's own frame on the exception stack (`miss_fast`, which serves a dispatcher miss from the frame the
+// gate saved; `resume` and `enter` use `Shared::captured` and `Shared::initial`). The stack layout is therefore a contract:
+// SP is reset to the exception stack's top below, above the frame, and NOTHING between that reset and the `eret` may push or
+// call (a push would silently overwrite the frame's `sp` and `nzcv` fields, which are loaded after it: no fault would say so).
 .global resume_exception
 resume_exception:
     // x3 != 0: generated code runs under x86 alignment checking (X2, #AC): every misaligned data access at EL0 takes an

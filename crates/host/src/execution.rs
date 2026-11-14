@@ -690,9 +690,12 @@ pub struct K1 {
     /// Page-currency chunk 0 (`page-study` resident builds only: absent when every counter is zero).
     #[serde(skip_serializing_if = "K1PageStudy::is_empty")]
     page_study: K1PageStudy,
-    /// Page-currency plan chunk 1 (the page record, `Control::pages`): absent while every counter is zero.
+    /// Page-currency plan chunk 1 (the page record, `Control::pages`) and the fast miss path (fast-miss plan): absent while every
+    /// counter is zero.
     #[serde(skip_serializing_if = "K1Page::is_empty")]
     page: K1Page,
+    #[serde(skip_serializing_if = "K1FastMiss::is_empty")]
+    fast_miss: K1FastMiss,
 }
 /// `Control::pages` and its counters: fetch walks made, record hits, check-mode differences, 2 MiB leaves not recorded.
 #[derive(Debug, Default, serde::Serialize)]
@@ -706,6 +709,18 @@ struct K1Page {
 impl K1Page {
     fn is_empty(&self) -> bool {
         self.walks | self.hits | self.disagree | self.split_2m == 0
+    }
+}
+/// The fast miss path: misses it served from the exit's frame, and the ones it declined by reason
+/// (`natemu_abi::execution::cache::fast_decline`).
+#[derive(Debug, Default, serde::Serialize)]
+struct K1FastMiss {
+    taken: u64,
+    declined: Members<&'static str, u64>,
+}
+impl K1FastMiss {
+    fn is_empty(&self) -> bool {
+        self.taken == 0 && self.declined.0.is_empty()
     }
 }
 /// Page-currency plan chunk 0 (`natemu_abi::page_study::Counts`): fetch walks by caller (`[revalidation, placement]`) with the
@@ -918,6 +933,14 @@ impl K1 {
                 hits: c.page_hits,
                 disagree: c.page_disagree,
                 split_2m: c.page_split_2m,
+            },
+            fast_miss: K1FastMiss {
+                taken: c.fast_taken,
+                declined: cache::fast_decline::NAMES
+                    .into_iter()
+                    .zip(c.fast_declined)
+                    .filter(|&(_, n)| n != 0)
+                    .collect(),
             },
         }
     }
@@ -3321,6 +3344,11 @@ pub fn run(
     area.write_record(
         control + std::mem::offset_of!(cache::Control, pages),
         compiler.page_currency,
+    );
+    // A/B measurement only: NATEMU_MISS_FAST=off keeps the resident's fast miss path from being tried.
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, miss_fast_off),
+        u64::from(std::env::var("NATEMU_MISS_FAST").as_deref() == Ok("off")),
     );
     let pic = match std::env::var("NATEMU_PIC").as_deref() {
         Ok("off") => cache::PIC_OFF,

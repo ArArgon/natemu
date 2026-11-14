@@ -625,14 +625,23 @@ fn cached_at(rip: u64, context: u64, current_only: bool) -> Option<&'static Bloc
         i = (i + 1) & (area::L2_ENTRIES - 1);
     }
 }
+/// What a revalidation says of a block ([`lookup`]'s `mapped`): its source pages are where its RIP is fetched from now
+/// (`Yes`: the flags, [`GLOBAL`] and [`LARGE`] as the translations found them), they are not (`No`), or the answer is not
+/// known without a fetch walk (`Unknown`: the page record of the fast miss path lacks a page; only that path says it).
+pub enum Mapped {
+    Yes(u32),
+    No,
+    Unknown,
+}
 /// The block cached for (`rip`, `context`) whose source pages are where `rip` is fetched from now: a current one, or one
-/// `mapped` finds so (it walks the fetch of each source page's linear page: `Some(flags)` when each maps to the block's
+/// `mapped` finds so (it walks the fetch of each source page's linear page: `Yes(flags)` when each maps to the block's
 /// page, [`GLOBAL`] and [`LARGE`] as the walk found them; the walk may write an A bit, so the block is looked at again).
-/// Blocks of other address spaces at the same RIP stay for when their mapping returns.
+/// Blocks of other address spaces at the same RIP stay for when their mapping returns. `Unknown` ends the search with
+/// `None` (the caller owes the walk).
 pub fn lookup(
     rip: u64,
     context: u64,
-    mut mapped: impl FnMut(&Block) -> Option<u32>,
+    mut mapped: impl FnMut(&Block) -> Mapped,
 ) -> Option<&'static Block> {
     let mut i = hash(rip, context);
     loop {
@@ -647,7 +656,11 @@ pub fn lookup(
             if current(&b) {
                 return Some(block(n));
             }
-            let walked = mapped(&b);
+            let walked = match mapped(&b) {
+                Mapped::Unknown => return None,
+                Mapped::Yes(flags) => Some(flags),
+                Mapped::No => None,
+            };
             let c = control();
             // PIC study stage 3: shared code is for non-global mappings only: an instance whose walk finds a global one
             // goes (its address then gets an absolute block).
