@@ -304,6 +304,15 @@ Rules learned in this round:
     blocks it kills). Next: find what the drain walks (likely a scan proportional to cache contents) and make it
     proportional to the page's own blocks; worth ~1.3 / 1.0 vCPU-s on configure / make plus the woken vCPU's stall.
 
+32. **Drain fix, first layout: drain fixed, net loss on make** (branch `drain-fix`; review: accept, no defect; K1
+    500/500 default and link-check; gate `natemu-raw/drain-gate-20261114-01`, 2 interleaved perf profiles each). Cause of
+    decision 31: `cut()` ran `prune(CHECKED)`, a pass over every link record (up to 512 Ki), whenever a dead block had any
+    outbound link, once per invalidate. Fix: a per-source outbound list so a kill undoes only the dead block's own links.
+    Result: configure irq 1.82 -> 0.15 s (44 -> 3.7 us per event), make irq 2.33 -> 0.81; but the list's upkeep on every
+    record move (a `next_out` chain walked per move, 28-B records straddling lines) raised patch 8.35 -> 10.67 and tlb
+    12.58 -> 15.26 on make: make busy +1.6%, step 128 -> 131 s; configure busy -2.4%. Not merged; switching to the
+    reviewer's layout (four fixed out slots per block, one per link point, 24-B records, one slot update per move).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
