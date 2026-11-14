@@ -330,6 +330,19 @@ Rules learned in this round:
     ~3.42 vCPU-s — passes; its would-be writable bits on frames later marked as code are 0.0% of marks in both spaces,
     so it applies to user and supervisor. Being built (branch `fault-chunk1`).
 
+35. **Writable on read merged; relink measured** (both reviewed: accept with fixes).
+    Writable on read (fault-around chunk 1, `fault-chunk1` -> cherry-picked; includes the reviewer's split-lock fix:
+    after a split-lock wait reset this vCPU's shadows the writable bit is set again and `translated` rechecked). Gate,
+    same build switch on vs off (`natemu-raw/wor-gate-20261114-01`, 2 interleaved each): upgrade aborts 1.95 M -> 1.4 k
+    (configure) / 6.03 M -> 1.4 k (make); abort+shadow -1.2 / -4.8 vCPU-s; busy -1.7% / -1.1%; step 70.2 -> 68.9 s /
+    129.2 -> 128.0 s; shootdowns, invalidations, steps, shadow resets unchanged.
+    Relink (steps 1-2, branch `relink`; gate `natemu-raw/relink-gate-20261114-01`, 2 interleaved each, one outlier head
+    run excluded — the second head run was slow in both recent gates): configure 69.9 -> 65.9/67.9 s, busy -3.5%;
+    make 129.9 -> 123.6/124.7 s, busy 531.7 -> 509.9 (-4.1%); link+patch+tlb+relink 64.3 -> 46.1 vCPU-s on make; linker
+    entries 73.1 -> 43.0 M; 84 M suspended, 80 M relinked, ~1.9 k dropped. Above the plan's estimate (up to 16 vCPU-s).
+    Merges after the review's test fix (the surviving insert-move mutation is a real latent defect: a stale cursor in one
+    layout trips the BAD_LINK tripwire; relink-many must reach that layout) and guards.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
