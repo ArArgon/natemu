@@ -1109,8 +1109,9 @@ pub mod cache {
     pub struct LinkRecord {
         pub source: u32,
         /// The native offset of the patched word in `source`'s code, in the low [`POINT_SHIFT`] bits; above them the index
-        /// of its link point in [`Block::links`] ([`LinkRecord::offset`], [`LinkRecord::point`], [`LinkRecord::pack`]).
-        pub offset: u32,
+        /// of its link point in [`Block::links`]. Read it only through [`LinkRecord::offset`] and [`LinkRecord::point`], build
+        /// it with [`LinkRecord::pack`] (the raw field is not the offset).
+        pub offset_point: u32,
         pub original: u32,
         pub target: u32,
         /// The inbound list of `target` (not for a checked link, [`CHECKED`]): the neighbours' record indices + 1 (0: the
@@ -1124,19 +1125,21 @@ pub mod cache {
     impl LinkRecord {
         /// The native offset of the patched word in `source`'s code.
         pub const fn offset(&self) -> u32 {
-            self.offset & ((1 << POINT_SHIFT) - 1)
+            self.offset_point & ((1 << POINT_SHIFT) - 1)
         }
         /// The index of the link point (`Block::links`, `Block::out`) the record is of.
         pub const fn point(&self) -> usize {
-            (self.offset >> POINT_SHIFT) as usize
+            (self.offset_point >> POINT_SHIFT) as usize
         }
-        /// A record's `offset` field for native offset `at` of link point `point`.
+        /// A record's `offset_point` field for native offset `at` of link point `point`.
         pub const fn pack(at: u32, point: usize) -> u32 {
             at | (point as u32) << POINT_SHIFT
         }
     }
     const _: () = assert!(super::MAX_LINK_POINTS <= 1 << (32 - POINT_SHIFT));
     const _: () = assert!(core::mem::size_of::<LinkRecord>() == 24);
+    // (A native offset is within its block: no more than MAX_BLOCK_BYTES.)
+    const _: () = assert!(MAX_BLOCK_BYTES < 1 << POINT_SHIFT);
     /// Invalidation requests to one vCPU, drained at each of its resident entries. Producers only set bits (atomic
     /// OR), the page's `stale` bit, then its word's `summary` bit, before `pending`; the consumer swaps `pending` to 0, then
     /// each `summary` word and the `stale` words it names, so no entry is lost, nothing overflows and a drain visits only
@@ -3288,7 +3291,7 @@ mod tests {
         use super::cache::{LinkRecord, POINT_SHIFT};
         for k in 0..super::MAX_LINK_POINTS {
             for at in [0, 4, 0x1234, (1 << POINT_SHIFT) - 4] {
-                let r = LinkRecord { source: 1, offset: LinkRecord::pack(at, k), original: 2, target: 3, prev_in: 0, next_in: 0 };
+                let r = LinkRecord { source: 1, offset_point: LinkRecord::pack(at, k), original: 2, target: 3, prev_in: 0, next_in: 0 };
                 assert_eq!((r.offset(), r.point()), (at, k));
             }
         }

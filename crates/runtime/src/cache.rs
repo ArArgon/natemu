@@ -1849,7 +1849,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
         insert(
             LinkRecord {
                 source: source.number,
-                offset: LinkRecord::pack((at - u64::from(source.code)) as u32, k),
+                offset_point: LinkRecord::pack((at - u64::from(source.code)) as u32, k),
                 original,
                 target: if checked { area::CHECKED } else { code.number },
                 prev_in: 0,
@@ -2123,8 +2123,8 @@ fn out_del(i: usize) {
     unsafe { *slot = 0 };
 }
 /// The record now at `to` was at `from` (another record's old place): its neighbours (or its target's head) name it
-/// again, and so does its source's outbound slot (the one write that keeps [`Block::out`] right). A record that does not move (`from == to`: a removed or stale one) is
-/// left alone.
+/// again, and so does its source's outbound slot (the one write that keeps [`Block::out`] right). A record that does not
+/// move (`from == to`: a removed or stale one) is left alone.
 fn list_moved(from: u64, to: u64) {
     if from == to {
         return;
