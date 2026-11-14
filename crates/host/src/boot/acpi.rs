@@ -760,6 +760,11 @@ mod tests {
         assert_eq!(count(d, &[0x12, 0x0b, 0x04]), 1, "the disk once, in _PRT");
         assert!(has(d, &prt_entry(1, 16)));
         assert!(!has(d, &prt_entry(2, 17)));
+        // The PCI device's base and GSI do not appear as an MMIO device: its GSI (16) is not in the one
+        // ExtendedInterrupt descriptor (the network device's 17).
+        assert!(!has(d, &crate::virtio::BLOCK_RESOURCE.base.to_le_bytes()));
+        assert!(has(d, &[0x89, 6, 0, 1, 1, 17, 0, 0, 0]));
+        assert!(!has(d, &[0x89, 6, 0, 1, 1, 16, 0, 0, 0]));
     }
 
     /// FNV-1a 64 (fixed, so the digests below are stable across runs and toolchains).

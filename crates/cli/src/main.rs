@@ -3,7 +3,7 @@
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
 //!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool[=false]] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
-//!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off]
+//!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off] [--rng] [--disk FILE] [--net] [--virtio-transport SPEC]
 //!
 //! Named arguments (clap; `natemu --help`). Seven fall back to `NATEMU_SERIAL_STDIN`,
 //! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
@@ -76,13 +76,13 @@ struct Cli {
     /// default), or read-only as before (off); for A/B measurement
     #[arg(long, env = "NATEMU_WRITABLE_ON_READ", value_name = "on|off", default_value = "on", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_writable_on_read)]
     writable_on_read: bool,
-    /// Expose the virtio-MMIO entropy device
+    /// Expose the virtio entropy device
     #[arg(long)]
     rng: bool,
     /// Writable raw disk image (exclusive use; successful S5 includes full-sync)
     #[arg(long, value_name = "FILE")]
     disk: Option<PathBuf>,
-    /// Expose a virtio-MMIO network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
+    /// Expose a virtio network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
     #[arg(long)]
     net: bool,
     /// The shared template pool (a read-only 274 MiB span of address space, backed as touched): the host publishes admitted
@@ -181,7 +181,7 @@ impl log::Log for PciLog {
     }
     fn log(&self, r: &log::Record) {
         const MAX: usize = 16;
-        if !self.enabled(r.metadata()) {
+        if !self.enabled(r.metadata()) || !r.target().starts_with("natemu::pci") {
             return;
         }
         match self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
