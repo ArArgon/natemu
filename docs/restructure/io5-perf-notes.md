@@ -155,4 +155,4 @@ dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3
 | natemu, start of round (main) | 89.5-92.6 s | 177.9 s |
 | natemu after decisions 2-7 | 76.7 s | 139.0 s (single run) |
 | QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
-| native (Apple VZ, arm64) | pending | pending |
+| native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |
