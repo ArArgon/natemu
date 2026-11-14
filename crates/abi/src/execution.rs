@@ -242,17 +242,23 @@ pub mod cache {
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
     pub const DISPATCH_SLOT_BYTES: usize = 32;
     pub const DISPATCH_SLOTS: usize = DISPATCH_BYTES / DISPATCH_SLOT_BYTES;
-    /// L1 as code: [`L1_TABLES`] tables of direct-mapped entries of [`L1_ENTRY_BYTES`] indexed by `rip & L1_MASK` (FEX
-    /// `L1Pointer/L1Mask`), so the dispatcher reads no data. A filled entry is `movz/movk x2, #rip` (4 words); `sub x2, x2,
-    /// x0`; `cbnz x2, +8`; `b entry`; `b miss`; an empty one starts with `b miss`. Only the resident writes them. Each
-    /// table holds entries of one code context ([`Control::l1_contexts`]); the dispatcher's `adrp` names the current one
-    /// (perf chunk 5: a CPL change switches tables instead of clearing one). Perf chunk 19: [`L1_BITS`] RIP bits index a
-    /// table (12 before: most misses were two hot RIPs at the same page offset).
+    /// L1 as code: [`L1_TABLES`] tables of two-way sets (FEX `L1Pointer/L1Mask`), so the dispatcher reads no data. A set is
+    /// [`L1_WAYS`] entries of [`L1_ENTRY_BYTES`], indexed by `rip & L1_SET_MASK` ([`L1_SET_BITS`] RIP bits; the L1 two-way
+    /// plan: the same 2 MiB per table as 2^16 direct-mapped entries). A filled entry is `movz/movk x2, #rip` (4 words);
+    /// `sub x2, x2, x0`; `cbnz x2, +8` (way 0: `+12`, to way 1); `b entry`; `b miss` (way 0: `b way 1`); an empty way 1
+    /// starts with `b miss`, an empty way 0 with `b way 1`. Only the resident writes them. Each table holds entries of one
+    /// code context ([`Control::l1_contexts`]); the dispatcher's `adrp` names the current one (perf chunk 5: a CPL change
+    /// switches tables instead of clearing one). Perf chunk 19: 16 RIP bits indexed a direct-mapped table (12 before: most
+    /// misses were two hot RIPs at the same page offset); now 15 index a set of two.
     pub const L1_CODE: usize = DISPATCH + DISPATCH_BYTES;
-    pub const L1_BITS: u32 = 16;
-    pub const L1_ENTRIES: usize = 1 << L1_BITS;
-    pub const L1_MASK: u64 = L1_ENTRIES as u64 - 1;
+    pub const L1_SET_BITS: u32 = 15;
+    pub const L1_WAYS: usize = 2;
+    pub const L1_SETS: usize = 1 << L1_SET_BITS;
+    pub const L1_SET_MASK: u64 = L1_SETS as u64 - 1;
+    /// Slots (entries) per table: slot `2 * set + way`; the owner and list arrays are indexed by slot.
+    pub const L1_ENTRIES: usize = L1_SETS * L1_WAYS;
     pub const L1_ENTRY_BYTES: usize = 32;
+    pub const L1_SET_BYTES: usize = L1_WAYS * L1_ENTRY_BYTES;
     pub const L1_TABLES: usize = 4;
     pub const L1_TABLE_BYTES: usize = L1_ENTRIES * L1_ENTRY_BYTES;
     /// [`Control::l1_contexts`]: a table that holds no context's entries (it is cleared before it takes one).
@@ -298,6 +304,72 @@ pub mod cache {
     /// once). A CR3 load leaves every global block current, so these are the only entries it may have to empty.
     pub const L1_LISTS: usize = L1_OWNERS + 4 * L1_ENTRIES * L1_TABLES;
     pub const L1_LISTED: u32 = 1 << 31;
+    /// Kept in way 0's owner word only: the set's next victim is way 1 (fill-order replacement; a hint for performance,
+    /// never a condition of correctness). Every raw read of an owner word masks [`L1_FLAGS`].
+    pub const L1_NEXT: u32 = 1 << 30;
+    pub const L1_FLAGS: u32 = L1_LISTED | L1_NEXT;
+    /// The slots of the set `rip` indexes: (way 0, way 1).
+    pub const fn l1_slots_of(rip: u64) -> (usize, usize) {
+        let set = (rip & L1_SET_MASK) as usize;
+        (set * L1_WAYS, set * L1_WAYS + 1)
+    }
+    /// An L1 entry's `b` from `from` to `to` (code-area offsets).
+    const fn l1_branch(from: u64, to: u64) -> u32 {
+        0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
+    }
+    /// The words of slot `slot`'s entry at code-area offset `at` for `rip`, entering `entry`: `movz/movk x2, #rip; sub x2,
+    /// x2, x0; cbnz x2, next; b entry; b next` where way 1's `next` is the dispatcher's miss (`miss`: a `b`, as the tables
+    /// lie beyond `cbnz`'s +-1 MiB) and way 0's is way 1, the entry 32 bytes on (so `cbnz` is `+12`, and word 7 is a landing
+    /// never reached).
+    pub const fn l1_words(slot: usize, at: u64, rip: u64, entry: u64, miss: u64) -> [u32; 8] {
+        const fn half(rip: u64, k: u32) -> u32 {
+            ((rip >> (16 * k)) & 0xffff) as u32
+        }
+        let way0 = slot % L1_WAYS == 0;
+        [
+            0xd280_0002 | half(rip, 0) << 5,
+            0xf2a0_0002 | half(rip, 1) << 5,
+            0xf2c0_0002 | half(rip, 2) << 5,
+            0xf2e0_0002 | half(rip, 3) << 5,
+            0xcb00_0042,
+            0xb500_0002 | (if way0 { 3 } else { 2 }) << 5,
+            l1_branch(at + 24, entry),
+            if way0 {
+                l1_branch(at + 28, at + L1_ENTRY_BYTES as u64)
+            } else {
+                l1_branch(at + 28, miss)
+            },
+        ]
+    }
+    /// The first word of an empty slot: way 0 chains to way 1, way 1 branches to the dispatcher's miss.
+    pub const fn l1_empty_word(slot: usize, at: u64, miss: u64) -> u32 {
+        l1_branch(at, if slot % L1_WAYS == 0 { at + L1_ENTRY_BYTES as u64 } else { miss })
+    }
+    /// RIP bit 15 of a filled entry from its first word, `movz x2, #rip[15:0]` (imm16 in bits 20:5).
+    pub const fn l1_word_rip15(first: u32) -> bool {
+        first >> 20 & 1 != 0
+    }
+    /// What [`l1_fill`] decided: the way to write, whether the block is there already (no write but the code check), and
+    /// whether the set's [`L1_NEXT`] flips.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct L1Fill {
+        pub way: usize,
+        pub there: bool,
+        pub victim: bool,
+    }
+    /// Fill of the set whose ways' raw owner words are `o0`, `o1` (flags included) with the block whose owner number is
+    /// `block` (number + 1, never 0): a way already holding it (so no block is in both ways); else an empty way 0, an
+    /// empty way 1; else the victim way 1 if way 0's word has [`L1_NEXT`], else way 0, and `victim`: the bit flips.
+    pub const fn l1_fill(o0: u32, o1: u32, block: u32) -> L1Fill {
+        let (b0, b1) = (o0 & !L1_FLAGS, o1 & !L1_FLAGS);
+        if b0 == block || b1 == block {
+            L1Fill { way: (b0 != block) as usize, there: true, victim: false }
+        } else if b0 == 0 || b1 == 0 {
+            L1Fill { way: (b0 != 0) as usize, there: false, victim: false }
+        } else {
+            L1Fill { way: (o0 & L1_NEXT != 0) as usize, there: false, victim: true }
+        }
+    }
     /// L2: open-addressed {guest RIP, block number + 1} table keyed by (RIP, context).
     pub const L2: usize = (L1_LISTS + 4 * L1_ENTRIES * L1_TABLES).next_multiple_of(0x1_0000);
     pub const L2_ENTRIES: usize = 1 << 21;
@@ -679,15 +751,19 @@ pub mod cache {
     pub const L1_EVICTED: usize = 0;
     /// `fill_l1` entered nothing because the table's context is not the block's.
     pub const L1_SKIPPED: usize = 1;
-    /// Dispatcher misses by the L1 entry at the RIP's index in the current table: empty,
+    /// Dispatcher misses by the two ways of the RIP's set in the current table: one of them an entry for this RIP (should
+    /// not happen; [`MISS_SAME`]), else a way empty ([`MISS_EMPTY`]), else both holding other blocks' entries
+    /// ([`MISS_OTHER`]: the set's conflict),
     pub const MISS_EMPTY: usize = 2;
-    /// holding another block's entry,
     pub const MISS_OTHER: usize = 3;
-    /// holding an entry for this RIP (should not happen),
     pub const MISS_SAME: usize = 4;
     /// or the table serves another code context than the guest's (its entry says nothing).
     pub const MISS_CONTEXT: usize = 5;
-    pub const L1_COUNTS: usize = 6;
+    /// (`perf` builds and above: one increment per replacement.) `fill_l1` replaced a way whose RIP differs from the filled
+    /// RIP in bit 15 alone among bits 15:0: a conflict the 16-bit direct-mapped index did not have, found in the set's
+    /// 15-bit index. Read from the victim's first word (`movz x2, #rip[15:0]`), a line the fill writes anyway.
+    pub const L1_NEW_CONFLICT: usize = 6;
+    pub const L1_COUNTS: usize = 7;
     pub const PIC_TEST_AND: u64 = 1;
     pub const PIC_TEST_STR: u64 = 2;
     pub const PIC_TEST_BODY: u64 = 3;
@@ -970,7 +1046,7 @@ pub mod cache {
             && L1_LISTS + 4 * L1_ENTRIES * L1_TABLES <= L2
             && L2 + L2_ENTRIES * 16 <= INDEX
     );
-    const _: () = assert!(MAX_BLOCKS < L1_LISTED as usize);
+    const _: () = assert!(MAX_BLOCKS < L1_NEXT as usize);
     const _: () = assert!(
         WRITABLE_SUMMARY + SUMMARY_BYTES <= PAGE_BLOCKS
             && PAGE_BLOCKS + 4 * super::MAX_GUEST_PAGES <= LINEAR_HEADS
@@ -980,7 +1056,14 @@ pub mod cache {
     );
     // The dispatcher's form: its `and` takes the mask as a logical immediate, its `adrp` names a table by its page, and
     // each entry's `b` to the miss reaches ±128 MiB.
-    const _: () = assert!(L1_MASK == (1 << L1_BITS) - 1 && L1_BITS <= 16 && L1_ENTRY_BYTES == 32);
+    const _: () = assert!(
+        L1_SET_MASK == (1 << L1_SET_BITS) - 1
+            && L1_WAYS == 2
+            && L1_ENTRIES == L1_SETS * L1_WAYS
+            && L1_SET_BITS <= 15
+            && L1_ENTRY_BYTES == 32
+            && L1_SET_BYTES == 64
+    );
     const _: () =
         assert!(L1_CODE % 4096 == 0 && L1_TABLE_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
@@ -3014,6 +3097,134 @@ mod tests {
         assert!(links_full(cap - super::MAX_LINK_POINTS + 1, cap));
         assert_eq!(reclaim_floor(cap), 12 * 1024);
         assert!(!links_full(0, MIN_LINK_CAP));
+    }
+
+    /// The two-way L1 (l1-two-way plan): slot, set and way arithmetic, the memory the tables take, the entry words (way
+    /// 0's `cbnz` lands on way 1, way 1's on its own word 7), the empty words, and the owner flags.
+    #[test]
+    fn l1_two_way_layout_and_words() {
+        use super::cache::*;
+        assert_eq!((L1_SETS, L1_WAYS, L1_ENTRIES), (1 << 15, 2, 1 << 16));
+        assert_eq!(L1_TABLE_BYTES, 2 << 20, "the same memory as 2^16 direct-mapped entries");
+        assert_eq!(L1_SET_BYTES, 64);
+        // The set is RIP bits 14:0, whatever the others; slots are 2 * set + way.
+        for rip in [0, 0x1234, 0x7fff, 0x8000, 0xdead_beef_cafe, u64::MAX] {
+            let (w0, w1) = l1_slots_of(rip);
+            assert_eq!((w0, w1), (2 * (rip as usize & 0x7fff), 2 * (rip as usize & 0x7fff) + 1));
+        }
+        assert_eq!(l1_slots_of(0x1_0000), l1_slots_of(0x2_0000));
+        assert_eq!(l1_slots_of(0x1_0000), l1_slots_of(0x1_8000), "V and V + 32 KiB share a set");
+        assert_ne!(l1_slots_of(0x1_0000), l1_slots_of(0x1_4000));
+        // The flags and the block number do not overlap.
+        assert_eq!(L1_FLAGS, L1_LISTED | L1_NEXT);
+        assert!((MAX_BLOCKS as u32 + 1) & L1_FLAGS == 0);
+        // Words: `movz/movk` x4 (rip), `sub`, `cbnz`, `b entry`, then the last.
+        let (at0, miss, entry) = (0x4_0000u64, 0x1010u64, 0x9_0000u64);
+        let rip = 0x7f12_3456_9abc_8def_u64;
+        let way0 = l1_words(0, at0, rip, entry, miss);
+        let way1 = l1_words(1, at0 + 32, rip, entry, miss);
+        let imm = |w: u32| (w >> 5) & 0xffff;
+        for w in [way0, way1] {
+            assert_eq!([0, 1, 2, 3].map(|k| imm(w[k]) as u64), [0x8def, 0x9abc, 0x3456, 0x7f12]);
+            assert_eq!(w[4], 0xcb00_0042, "sub x2, x2, x0");
+        }
+        // The `cbnz x2, +imm19 words`: way 0's goes to the set's second way (+12 from the cbnz at word 5: 32 - 20), way 1's to
+        // its own word 7 (+8).
+        let target = |w: u32, from: u64| from.wrapping_add(((((((w >> 5) & 0x7_ffff) << 13) as i32 >> 13) as i64) * 4) as u64);
+        assert_eq!(way0[5] & 0xff00_001f, 0xb500_0002);
+        assert_eq!(target(way0[5], at0 + 20), at0 + 32);
+        assert_eq!(target(way1[5], at0 + 32 + 20), at0 + 32 + 28);
+        let b = |w: u32, from: u64| from.wrapping_add(((((((w & 0x03ff_ffff) << 6) as i32 >> 6) as i64) * 4) as u64));
+        assert_eq!(way0[6] >> 26, 0b000101);
+        assert_eq!(b(way0[6], at0 + 24), entry);
+        assert_eq!(b(way1[6], at0 + 32 + 24), entry);
+        assert_eq!(b(way0[7], at0 + 28), at0 + 32, "way 0's landing is way 1");
+        assert_eq!(b(way1[7], at0 + 32 + 28), miss, "way 1's is the dispatcher's miss");
+        // Empty words: way 0 to way 1, way 1 to the miss.
+        assert_eq!(b(l1_empty_word(0, at0, miss), at0), at0 + 32);
+        assert_eq!(b(l1_empty_word(1, at0 + 32, miss), at0 + 32), miss);
+        assert_eq!(b(l1_empty_word(2 * 77, at0, miss), at0), at0 + 32);
+        assert_eq!(b(l1_empty_word(2 * 77 + 1, at0, miss), at0), miss);
+        // The victim's RIP bit 15 is in its first word.
+        for rip in [0u64, 0x8000, 0x7fff, 0xffff, 0x1_0000, 0x1_8000] {
+            assert_eq!(l1_word_rip15(l1_words(0, 0, rip, 0, 0)[0]), rip & 0x8000 != 0, "{rip:#x}");
+        }
+    }
+
+    /// `l1_fill` modelled as the resident drives it (owner words with the flags, the set's next-victim bit in way 0's
+    /// word): the empty way first, fill order after, a block never in both ways, the flags kept.
+    #[test]
+    fn l1_fill_order_replacement() {
+        use super::cache::*;
+        struct Set([u32; 2]);
+        impl Set {
+            /// A fill of `block` (number + 1); the misses it costs (1 unless it was there).
+            fn fill(&mut self, block: u32) -> bool {
+                let f = l1_fill(self.0[0], self.0[1], block);
+                let flip = if f.victim { L1_NEXT } else { 0 };
+                let listed = self.0[f.way] & L1_LISTED;
+                if f.way == 0 {
+                    self.0[0] = listed | (self.0[0] & L1_NEXT ^ flip) | block;
+                } else {
+                    self.0[1] = listed | block;
+                    self.0[0] ^= flip;
+                }
+                !f.there
+            }
+            /// A dispatcher visit: a hit (one of the ways has it) or a miss that fills.
+            fn visit(&mut self, block: u32) -> bool {
+                let hit = self.0.iter().any(|&o| o & !L1_FLAGS == block);
+                if !hit { self.fill(block) } else { false }
+            }
+            fn holds(&self) -> [u32; 2] {
+                self.0.map(|o| o & !L1_FLAGS)
+            }
+        }
+        let (a, b, c) = (1, 2, 3);
+        // The pair fits: A and B take the two ways, then every visit hits.
+        let mut s = Set([0, 0]);
+        assert!(s.visit(a) && s.visit(b));
+        assert_eq!(s.holds(), [a, b]);
+        assert_eq!((0..10).filter(|_| s.visit(a) | s.visit(b)).count(), 0);
+        // A triple in turn: fill order replacement misses on every visit (3 a round), whichever round.
+        let mut s = Set([0, 0]);
+        for round in 0..6 {
+            assert_eq!([a, b, c].map(|x| s.visit(x)), [true; 3], "round {round}");
+        }
+        // After the triple, A then B (as `l1-triple`): the set holds the last two (the older of them is the next
+        // victim): A misses and replaces the older, B misses and replaces the other, then no more, whatever the
+        // parity of the rounds before.
+        for rounds in 1..=6 {
+            let mut s = Set([0, 0]);
+            for _ in 0..rounds {
+                let _ = [a, b, c].map(|x| s.visit(x));
+            }
+            let first: usize = [a, b].iter().filter(|&&x| s.visit(x)).count();
+            let later: usize = (0..5).map(|_| [a, b].iter().filter(|&&x| s.visit(x)).count()).sum();
+            assert_eq!((first, later), (2, 0), "after {rounds} rounds");
+        }
+        // The resident's re-entry at a block that is in way 1 while the bit names way 0 (`l1-dup`): nothing changes.
+        let mut s = Set([0, 0]);
+        s.visit(a);
+        s.visit(b);
+        assert_eq!(s.0, [a, b], "empty ways fill without flipping: the bit names way 0");
+        let before = s.0;
+        assert!(!s.fill(b), "already there");
+        assert_eq!(s.0, before);
+        assert!(!s.fill(a));
+        assert_eq!(s.0, before);
+        assert_eq!(l1_fill(before[0], before[1], b), L1Fill { way: 1, there: true, victim: false });
+        // Flags are kept: a listed way and the bit.
+        let mut s = Set([a | L1_LISTED, b | L1_LISTED]);
+        s.fill(c);
+        assert_eq!(s.0, [c | L1_LISTED | L1_NEXT, b | L1_LISTED], "way 0 replaced: the bit now names way 1");
+        s.fill(a);
+        assert_eq!(s.0, [c | L1_LISTED, a | L1_LISTED], "way 1 replaced: the bit flipped back");
+        // An emptied way 0 is the first choice; the bit is untouched.
+        let f = l1_fill(L1_NEXT | L1_LISTED, b, c);
+        assert_eq!(f, L1Fill { way: 0, there: false, victim: false });
+        // M4's input: a raw owner with the bit set is still the block (the masks).
+        assert_eq!(l1_fill(c | L1_NEXT, b, c), L1Fill { way: 0, there: true, victim: false });
     }
 
     #[test]

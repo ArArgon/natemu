@@ -294,45 +294,31 @@ fn on_linear_page(page: u64, mut f: impl FnMut(usize)) {
 fn head(page: usize) -> *mut u32 {
     lookup_area::<u32>(area::PAGE_BLOCKS).wrapping_add(page)
 }
-/// Code-area offset of entry `i` of L1 table `t`.
+/// Code-area offset of slot `i` (`2 * set + way`) of L1 table `t`: way 0 at the set's start, way 1 32 bytes on.
 fn l1_entry(t: usize, i: usize) -> u64 {
     (area::L1_CODE + t * area::L1_TABLE_BYTES + i * area::L1_ENTRY_BYTES) as u64
 }
-/// The L1 entry at `at` for `rip`, entering code-area offset `entry`: `movz/movk x2, #rip; sub x2, x2, x0; cbnz x2,
-/// +8; b entry; b miss` (the dispatcher's miss; perf chunk 19: a `b`, as the tables lie beyond `cbnz`'s ±1 MiB).
-fn l1_words(at: u64, rip: u64, entry: u64) -> [u32; 8] {
-    let half = |k: u32| ((rip >> (16 * k)) & 0xffff) as u32;
-    [
-        0xd280_0002 | half(0) << 5,
-        0xf2a0_0002 | half(1) << 5,
-        0xf2c0_0002 | half(2) << 5,
-        0xf2e0_0002 | half(3) << 5,
-        0xcb00_0042,
-        0xb500_0002 | 2 << 5,
-        branch(at + 24, entry),
-        branch(at + 28, area::DISPATCH_MISS as u64),
-    ]
-}
-/// Entry `i` of L1 table `t`'s owner: the block it enters, number + 1 (0: empty), and [`area::L1_LISTED`].
+/// Slot `i` of L1 table `t`'s owner: the block it enters, number + 1 (0: empty), and the flags [`area::L1_FLAGS`]
+/// ([`area::L1_LISTED`]; [`area::L1_NEXT`] in way 0's word only): every raw read of it masks or keeps them.
 fn l1_owner(t: usize, i: usize) -> *mut u32 {
     lookup_area::<u32>(area::L1_OWNERS).wrapping_add(t * area::L1_ENTRIES + i)
 }
-/// The block entry `i` of L1 table `t` enters, number + 1 (0: empty).
+/// The block slot `i` of L1 table `t` enters, number + 1 (0: empty).
 fn l1_block(t: usize, i: usize) -> u32 {
-    unsafe { l1_owner(t, i).read() & !area::L1_LISTED }
+    unsafe { l1_owner(t, i).read() & !area::L1_FLAGS }
 }
 /// Slot `k` of L1 table `t`'s list ([`area::L1_LISTS`]).
 fn l1_list(t: usize, k: usize) -> *mut u32 {
     lookup_area::<u32>(area::L1_LISTS).wrapping_add(t * area::L1_ENTRIES + k)
 }
-/// Empties entry `i` of L1 table `t` (its first word branches to the dispatcher's miss; it stays on its table's list
-/// if it was); the caller synchronizes the code.
+/// Empties slot `i` of L1 table `t` (its first word branches on: way 0 to way 1, way 1 to the dispatcher's miss; it
+/// stays on its table's list if it was, and keeps the set's next-victim bit); the caller synchronizes the code.
 fn empty_l1(t: usize, i: usize) {
-    unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_LISTED) };
+    unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_FLAGS) };
     let at = l1_entry(t, i);
     unsafe {
         ((area::CODE_WRITE_VA + at) as *mut u32)
-            .write_volatile(branch(at, area::DISPATCH_MISS as u64))
+            .write_volatile(area::l1_empty_word(i, at, area::DISPATCH_MISS as u64))
     };
 }
 /// Empties every entry of L1 table `t` and its list.
@@ -373,7 +359,10 @@ pub fn fill_head(dispatcher: &[u8]) -> bool {
             dispatcher.len(),
         )
     };
-    let form = word(slot_at(0) + 4) & 0x9f00_001f == 0x9000_0002;
+    // The dispatcher's form: `and x1, x0, #L1_SET_MASK`, an `adrp x2`, `add x2, x2, x1, lsl #6` (the set size).
+    let form = word(slot_at(0)) == 0x9240_0001 | (area::L1_SET_BITS - 1) << 10
+        && word(slot_at(0) + 4) & 0x9f00_001f == 0x9000_0002
+        && word(slot_at(0) + 8) == 0x8b01_0042 | area::L1_SET_BYTES.trailing_zeros() << 10;
     unsafe {
         ((area::CODE_WRITE_VA + slot_at(0) + 4) as *mut u32)
             .write_volatile(dispatch_adr(slot_at(0) + 4, 0))
@@ -527,23 +516,41 @@ pub fn fill_l1(rip: u64, block: &Block) {
         }
         return;
     }
-    let i = (rip & area::L1_MASK) as usize;
+    let (w0, w1) = area::l1_slots_of(rip);
+    let (o0, o1) = unsafe { (l1_owner(t, w0).read(), l1_owner(t, w1).read()) };
+    let want = block.number + 1;
+    // The way: one holding the block already (so it is never in both), else an empty one, else the victim by the set's
+    // fill order. Which one is a hint for performance; the written slot's owner precedes its words, as ever.
+    let f = area::l1_fill(o0, o1, want);
+    let i = [w0, w1][f.way];
+    let at = l1_entry(t, i);
     #[cfg(feature = "dispatch-study")]
-    {
-        let owner = l1_block(t, i);
-        if owner != 0 && owner != block.number + 1 {
-            control().l1_counts[area::L1_EVICTED] += 1;
-        }
+    if f.victim {
+        control().l1_counts[area::L1_EVICTED] += 1;
     }
-    let mut listed = unsafe { l1_owner(t, i).read() } & area::L1_LISTED;
+    // A conflict the 16-bit direct-mapped index did not have: the victim's RIP differs from this one in bit 15 alone, read
+    // from its first word (`movz x2, #rip[15:0]`: a line written below anyway), not through its block.
+    #[cfg(feature = "perf")]
+    if f.victim && area::l1_word_rip15(word(at)) != (rip >> 15 & 1 != 0) {
+        control().l1_counts[area::L1_NEW_CONFLICT] += 1;
+    }
+    let flip = if f.victim { area::L1_NEXT } else { 0 };
+    let mut listed = [o0, o1][f.way] & area::L1_LISTED;
     if listed == 0 && block.flags & GLOBAL == 0 {
         let c = control();
         unsafe { l1_list(t, c.l1_listed[t] as usize).write(i as u32) };
         (c.l1_listed[t], listed) = (c.l1_listed[t] + 1, area::L1_LISTED);
     }
-    unsafe { l1_owner(t, i).write(listed | (block.number + 1)) };
-    let at = l1_entry(t, i);
-    let words = l1_words(at, rip, code_of(block).full_entry() - area::CODE_VA);
+    // Way 0's word carries the set's next-victim bit (flipped by a replacement); way 1's replacement leaves way 0's code.
+    if f.way == 0 {
+        unsafe { l1_owner(t, w0).write(listed | (o0 & area::L1_NEXT ^ flip) | want) };
+    } else {
+        unsafe { l1_owner(t, w1).write(listed | want) };
+        if f.victim {
+            unsafe { l1_owner(t, w0).write(o0 ^ area::L1_NEXT) };
+        }
+    }
+    let words = area::l1_words(i, at, rip, code_of(block).full_entry() - area::CODE_VA, area::DISPATCH_MISS as u64);
     // Already there (a resident entry that ends at the same block again, e.g. after a system instruction): no code change.
     if (0..words.len()).all(|k| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() } == words[k]) {
         return;
@@ -569,14 +576,14 @@ pub fn fill_l1(rip: u64, block: &Block) {
 pub fn count_miss(rip: u64, context: u64) {
     let c = control();
     let t = c.l1_table as usize;
-    let i = (rip & area::L1_MASK) as usize;
-    let owner = l1_block(t, i);
+    let (w0, w1) = area::l1_slots_of(rip);
+    let owners = [l1_block(t, w0), l1_block(t, w1)];
     c.l1_counts[if c.l1_contexts[t] != context {
         area::MISS_CONTEXT
-    } else if owner == 0 {
-        area::MISS_EMPTY
-    } else if block(owner as usize - 1).rip == rip {
+    } else if owners.iter().any(|&o| o != 0 && block(o as usize - 1).rip == rip) {
         area::MISS_SAME
+    } else if owners.contains(&0) {
+        area::MISS_EMPTY
     } else {
         area::MISS_OTHER
     }] += 1;
@@ -677,6 +684,8 @@ pub fn lookup(
 /// no longer current goes but local ones (the blocks stay, found again by [`lookup`] after a fetch walk). Returns the
 /// links undone; `None` if a record does not describe its word (as [`unlink_all`]).
 pub fn tlb(global: bool) -> Option<u64> {
+    #[cfg(feature = "link-check")]
+    check_l1_lists();
     let c = control();
     c.epoch += 1;
     if global {
@@ -721,7 +730,7 @@ pub fn tlb(global: bool) -> Option<u64> {
                     unsafe { l1_list(t, kept).write(i as u32) };
                     kept += 1;
                 } else {
-                    unsafe { l1_owner(t, i).write(0) };
+                    unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_NEXT) };
                     invalidate_pou(ctr, area::CODE_VA + l1_entry(t, i));
                 }
             }
@@ -729,8 +738,52 @@ pub fn tlb(global: bool) -> Option<u64> {
             c.l1_listed[t] = kept as u64;
         }
     }
+    #[cfg(feature = "link-check")]
+    check_l1_lists();
     // A CR3 load leaves global blocks current: only the links into non-global ones are looked at.
     prune_tlb(if global { TLB } else { CR3 })
+}
+/// `link-check` builds, at the start and the end of every TLB flush (a CR3 load compacts the lists, which restores the
+/// invariant a missed kill broke, so the start is the check that sees it): each table's list is at most the slots long,
+/// names each slot at most once, and an owner word has [`area::L1_LISTED`] set exactly when its slot is on the list.
+/// Halts `stop::LINK_CHECK` with the line, the table and the slot otherwise.
+#[cfg(feature = "link-check")]
+#[track_caller]
+fn check_l1_lists() {
+    let c = control();
+    let line = u64::from(core::panic::Location::caller().line());
+    for t in 0..area::L1_TABLES {
+        let listed = c.l1_listed[t] as usize;
+        let mut bad = (listed > area::L1_ENTRIES).then_some(0);
+        // Each listed slot's bit is taken off as it is met: a clear one is met twice (or never was set).
+        for k in 0..listed.min(area::L1_ENTRIES) {
+            let i = unsafe { l1_list(t, k).read() } as usize;
+            if i >= area::L1_ENTRIES {
+                bad = Some(i);
+                continue;
+            }
+            let o = unsafe { l1_owner(t, i).read() };
+            if o & area::L1_LISTED == 0 {
+                bad = Some(i);
+            }
+            unsafe { l1_owner(t, i).write(o & !area::L1_LISTED) };
+        }
+        // What is left set is on no list.
+        for i in 0..area::L1_ENTRIES {
+            if unsafe { l1_owner(t, i).read() } & area::L1_LISTED != 0 {
+                bad = Some(i);
+            }
+        }
+        for k in 0..listed.min(area::L1_ENTRIES) {
+            let i = unsafe { l1_list(t, k).read() } as usize;
+            if i < area::L1_ENTRIES {
+                unsafe { l1_owner(t, i).write(l1_owner(t, i).read() | area::L1_LISTED) };
+            }
+        }
+        if let Some(i) = bad {
+            crate::execution::halt_native([line, t as u64, i as u64], natemu_abi::execution::stop::LINK_CHECK)
+        }
+    }
 }
 
 /// Places the admitted object at `object` (header `h`) for (`h.guest_rip`, `context`) with its guest-physical
@@ -2323,12 +2376,15 @@ fn cut_one(n: usize, dead: bool) -> Option<usize> {
         unsafe { (*block_ptr(n)).checked = 0 };
         c.unvalidated += 1;
     }
-    let i = (b.rip & area::L1_MASK) as usize;
+    // Both slots of the block's set, each keyed on its owner (a block is in at most one, but a duplicate would go too).
+    let (w0, w1) = area::l1_slots_of(b.rip);
     for t in 0..area::L1_TABLES {
-        if l1_block(t, i) == b.number + 1 {
-            empty_l1(t, i);
-            let at = l1_entry(t, i);
-            synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
+        for i in [w0, w1] {
+            if l1_block(t, i) == b.number + 1 {
+                empty_l1(t, i);
+                let at = l1_entry(t, i);
+                synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
+            }
         }
     }
     scope

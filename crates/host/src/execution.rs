@@ -553,6 +553,10 @@ pub fn k1_stats(area: Area) -> K1 {
         }
     }
     let mut k = K1::new(&control);
+    let perf: exec::perf::Perf = area.read_record(exec::perf::OFFSET);
+    if perf.magic == exec::perf::MAGIC {
+        k.dispatch_misses = perf.count[exec::perf::MISS as usize];
+    }
     k.pic_transitions = pic_transitions(area);
     k
 }
@@ -600,6 +604,9 @@ pub struct K1 {
     kept_resets: u64,
     /// Dispatch study (`natemu_abi::execution::cache::L1_EVICTED` and the rest; `dispatch-study` resident builds only).
     l1_counts: [u64; natemu_abi::execution::cache::L1_COUNTS],
+    /// Dispatcher misses entered (the `perf` bucket `miss`'s entry count; 0 from a resident built without `perf`). K1's
+    /// L1 programs take it as the difference between two runs of one program at different round counts.
+    dispatch_misses: u64,
     systems: K1Systems,
     /// PIC study counters (`natemu_abi::pic::count`) and linked transitions by class ([`pic_transitions`]).
     pic: [u64; natemu_abi::pic::count::COUNTS],
@@ -676,6 +683,7 @@ impl K1 {
             slot_writes: c.slot_writes,
             kept_resets: c.kept_resets,
             l1_counts: c.l1_counts,
+            dispatch_misses: 0,
             systems: K1Systems {
                 kinds: (0..128)
                     .filter(|&k| c.system_counts[k] != 0)
@@ -3621,7 +3629,7 @@ mod tests {
             })
             .collect();
         format!(
-            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"l1_counts\":{:?},\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}},\"pic\":{:?},\"pic_transitions\":{:?}}}",
+            "{{\"cr3_loads\":{},\"global_flushes\":{},\"invlpgs\":{},\"revalidated\":{},\"remapped\":{},\"capacity_flushes\":{},\"killed\":{},\"unvalidated\":{},\"tlb_us\":{},\"invlpg_us\":{},\"page_faults\":{},\"page_fault_us\":{},\"scanned\":{},\"memory_types\":{{{}}},\"uncached\":{{\"steps\":{},\"resident\":{}}},\"l1_switches\":{},\"l1_clears\":{},\"flushes\":{},\"flush_us\":{},\"full\":{:?},\"used\":[{},{},{}],\"peak\":{:?},\"capacity\":[{},{},{}],\"reclaims\":[{},{}],\"reuse\":{{\"copies\":{},\"refused\":{:?},\"checks\":{}}},\"slot_writes\":{},\"kept_resets\":{},\"l1_counts\":{:?},\"dispatch_misses\":0,\"systems\":{{\"kinds\":{{{}}},\"from\":{{{}}},\"chained\":{},\"declined\":{{{}}}}},\"pic\":{:?},\"pic_transitions\":{:?}}}",
             c.cr3_loads,
             c.global_flushes,
             c.invlpgs,
