@@ -67,7 +67,8 @@ export PATH=/bin:/usr/bin:/usr/sbin
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
 arg() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline; }
 C=$(arg net_case); H=$(arg net_host); S=$(arg net_sha)
-@PCI_PROBE@maybe_probe() { if [ "$(arg net_pci)" = 1 ]; then pci_probe; fi; }
+@PCI_PROBE@# poweroff -f drops queued console output: let the probe's long dmesg drain first.
+maybe_probe() { if [ "$(arg net_pci)" = 1 ]; then pci_probe; sleep 3; fi; }
 echo "NET-BEGIN case=$C cpus=$(nproc) kernel=$(cat /proc/sys/kernel/osrelease)"
 modprobe virtio_mmio; ip link set lo up
 if [ $C = nodriver ]; then echo "NET-NO-ETH0 $(ls /sys/class/net | grep -c eth0)"; echo NET-END; poweroff -f; fi
