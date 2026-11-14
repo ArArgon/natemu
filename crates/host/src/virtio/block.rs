@@ -105,6 +105,118 @@ fn owner_spin_max() -> Duration {
         us.map_or(OWNER_SPIN_MAX, |us| Duration::from_micros(us.min(1000)))
     })
 }
+/// Holding a completion's interrupt back while the vCPU it goes to is running (PCI with MSI-X; `Virtio::target_running`).
+/// A guest that submits faster than it sleeps (one thread at depth 16) otherwise pays, per request, an exit for its kick
+/// and an interrupt that stops a running block: about 13 of 28 us on the M2 Max. While an interrupt is held the queue's
+/// kicks stay suppressed and the owner reads the ring itself, so further requests cost neither; the interrupt is raised
+/// once the vCPU halts (it then wakes for it as it would have), or `count` completions of a queue are held, or no request has come
+/// for `idle`, or `max` after the first held completion. A vCPU that is halted when its request completes is
+/// interrupted at once, as before. The count keeps a thread at a depth above it from ever running out of completions:
+/// holding until the vCPU halts made each of two threads on a vCPU block every 16 requests, and each switch between
+/// them (a CR3 load) resets the vCPU's shadow tables (four jobs at depth 16 on two vCPUs: 117k to 69k IOPS).
+/// The bounds are checked between the owner's passes: a request it runs itself (a lone one, `Pool::inline`) delays a
+/// held interrupt by that disk call. Holds that gather too little are backed off ([`Holds`]). `NATEMU_BLK_HOLD=IDLE_US,MAX_US,COUNT` sets the bounds
+/// (a 0: never hold). M2 Max, 2 vCPUs, fio at 4 KiB: one job at depth 16 about 40k to 100k IOPS (host CPU per request
+/// 32 to 16 us), mixed 39k to 80k, four jobs 117k to about 135k; depth 1 and 128 KiB requests unchanged.
+#[derive(Clone, Copy)]
+struct Hold {
+    idle: Duration,
+    max: Duration,
+    count: usize,
+}
+const HOLD: Hold = Hold {
+    idle: Duration::from_micros(30),
+    max: Duration::from_micros(200),
+    count: 8,
+};
+fn hold() -> Option<Hold> {
+    // Unit tests end holds themselves (the count, or the target's halt): the clocks never do.
+    #[cfg(test)]
+    return Some(Hold {
+        idle: Duration::from_secs(60),
+        max: Duration::from_secs(120),
+        count: 3,
+    });
+    #[cfg(not(test))]
+    {
+        static HELD: std::sync::OnceLock<Option<Hold>> = std::sync::OnceLock::new();
+        *HELD.get_or_init(|| {
+            let set = std::env::var("NATEMU_BLK_HOLD").ok().and_then(|v| {
+                let mut parts = v.split(',').map(|p| p.trim().parse::<u64>().ok());
+                Some((parts.next()??, parts.next()??, parts.next()??))
+            });
+            let hold = set.map_or(HOLD, |(idle, max, count)| Hold {
+                idle: Duration::from_micros(idle.min(1000)),
+                max: Duration::from_micros(max.min(10_000)),
+                count: count.min(1024) as usize,
+            });
+            (!hold.idle.is_zero() && !hold.max.is_zero() && hold.count != 0).then_some(hold)
+        })
+    }
+}
+/// The owner's account of held interrupts ([`Hold`]): when the first held completion was published, how many each
+/// queue holds, and each queue's back-off.
+/// A hold that ends covering fewer of a queue's completions than half of [`Hold::count`] gained too little for its
+/// delay (a thread at depth 1, whose vCPU was on its way to HLT; 128 KiB requests, which the guest submits more slowly
+/// than `idle`: most holds then ended idle after two or three), so that queue's next completions are not held: 1,
+/// then 2, up to [`HOLD_SKIP`] of them, until a hold covers enough again.
+struct Holds {
+    first: Option<Instant>,
+    count: Vec<usize>,
+    skip: Vec<u32>,
+    backoff: Vec<u32>,
+}
+const HOLD_SKIP: u32 = 64;
+impl Holds {
+    fn new(queues: usize) -> Self {
+        Self {
+            first: None,
+            count: vec![0; queues],
+            skip: vec![0; queues],
+            backoff: vec![0; queues],
+        }
+    }
+    /// Whether `queue`'s next completion may be held (one skipped otherwise).
+    fn wants(&mut self, queue: usize) -> bool {
+        let skipped = self.skip[queue] != 0;
+        self.skip[queue] = self.skip[queue].saturating_sub(1);
+        !skipped
+    }
+    fn held(&mut self, queue: usize, completions: usize) {
+        self.first.get_or_insert_with(Instant::now);
+        self.count[queue] += completions;
+    }
+    fn total(&self) -> usize {
+        self.count.iter().sum()
+    }
+    /// The queues holding at least `count` completions.
+    fn full(&self, count: usize) -> u8 {
+        (0..self.count.len())
+            .filter(|&q| self.count[q] >= count)
+            .fold(0, |mask, q| mask | 1 << q)
+    }
+    /// The held interrupts of `queues` were raised: score each one's hold (`enough` completions keep it holding).
+    fn settle(&mut self, queues: u8, enough: usize) {
+        for q in (0..self.count.len()).filter(|q| queues >> q & 1 != 0) {
+            match std::mem::take(&mut self.count[q]) {
+                0 => {}
+                n if n < enough => {
+                    self.backoff[q] = (self.backoff[q] * 2).clamp(1, HOLD_SKIP);
+                    self.skip[q] = self.backoff[q];
+                }
+                _ => self.backoff[q] = 0,
+            }
+        }
+        if self.total() == 0 {
+            self.first = None;
+        }
+    }
+    /// Nothing is owed any more (the driver wanted no interrupt, or a reset or another raise took it): no score.
+    fn clear(&mut self) {
+        self.count.fill(0);
+        self.first = None;
+    }
+}
 /// The owner's fixed spin (`None`: adaptive) and the worker's.
 fn spins() -> (Option<Duration>, Duration) {
     static SPINS: std::sync::OnceLock<(Option<Duration>, Duration)> = std::sync::OnceLock::new();
@@ -1160,6 +1272,11 @@ impl Virtio {
         let mut active = false;
         // The adaptive spin's window ([`owner_spin`]).
         let (fixed, mut window) = (spins().0, Duration::ZERO);
+        // Held interrupts ([`Hold`]), and the last pass that did work.
+        let (mut holds, mut worked) = (Holds::new(snapshots.len()), Instant::now());
+        // The queues whose interrupt was raised at the hold's count: their rings are still read here, as while held,
+        // until the hold would have ended otherwise (the thread that filled it is likely to go on).
+        let mut linger = 0u8;
         // Kick suppression (`State::suppressed`, per queue): an admission's gather sets VIRTQ_USED_F_NO_NOTIFY; the owner
         // clears it before it idles (in the completion that leaves none of its queue's requests in flight, or here), before a power-off drain,
         // and before a reset of its incarnation retires. Each clear is followed by a full barrier and a read of the
@@ -1195,13 +1312,29 @@ impl Virtio {
             if pool.stalled() {
                 return Err(pool.abandon());
             }
-            if self.complete_answered(guest, disk, &mut flight, &mut snapshots)? {
+            let completed =
+                self.complete_answered(guest, disk, &mut flight, &mut snapshots, &mut holds)?;
+            if completed != 0 {
                 active = true;
+                worked = Instant::now();
+                let owing = self.lock().owing;
+                if owing == 0 {
+                    holds.clear();
+                } else if let Some(hold) = hold() {
+                    // Each queue's interrupt at its own count: the others' stay held.
+                    let full = holds.full(hold.count) & owing;
+                    if full != 0 {
+                        linger |= full;
+                        self.release(full);
+                        holds.settle(full, hold.count.div_ceil(2));
+                    }
+                }
                 continue;
             }
             let suppressed: Vec<Identity> =
                 self.lock().suppressed.iter().flatten().copied().collect();
             if quiescing && flight.is_empty() {
+                self.release(u8::MAX);
                 for &id in &suppressed {
                     self.unsuppress(guest, id)?;
                 }
@@ -1209,7 +1342,42 @@ impl Virtio {
             }
             if self.admit_block(guest, disk, &pool, &mut flight, &mut snapshots, &mut first)? {
                 active = true;
+                worked = Instant::now();
                 continue;
+            }
+            // An interrupt held back: read the suppressed queues' rings again until the hold ends, then raise it and
+            // go on to idle as usual (the clear of NO_NOTIFY below, with its read of the ring).
+            let owing = self.lock().owing;
+            match hold() {
+                Some(hold) if owing | linger != 0 => {
+                    let first = holds.first.unwrap_or(worked);
+                    let over = worked.elapsed() >= hold.idle
+                        || owing != 0 && first.elapsed() >= hold.max
+                        || (0..snapshots.len()).any(|q| {
+                            (owing | linger) >> q & 1 != 0 && !self.target_running(guest, q)
+                        });
+                    if !over {
+                        let mut s = self.lock();
+                        for id in &suppressed {
+                            if s.current(*id) && s.accepting(id.queue) {
+                                s.notified[id.queue] = true;
+                                self.busy(&mut s);
+                            }
+                        }
+                        drop(s);
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    if owing != 0 {
+                        self.release(u8::MAX);
+                        holds.settle(u8::MAX, hold.count.div_ceil(2));
+                    }
+                    linger = 0;
+                }
+                _ => {
+                    holds.clear();
+                    linger = 0;
+                }
             }
             let spin = if std::mem::take(&mut active) {
                 fixed.unwrap_or(window)
@@ -1241,6 +1409,17 @@ impl Virtio {
             profile::count(profile::WAITS);
             profile::since(profile::WAIT_NS, waited);
         }
+    }
+    /// Raise the interrupts a hold left owed by `queues`, if any; the busy guard goes with the last (`settle`).
+    fn release(&self, queues: u8) {
+        let mut s = self.lock();
+        let rest = s.owing & !queues;
+        s.owing &= queues;
+        if s.owing != 0 {
+            self.raise(&mut s);
+        }
+        s.owing = rest;
+        self.settle(&mut s);
     }
     /// Power-off drain once nothing is in flight: a final full sync on a worker (it covers every
     /// completed write), the workers' join, then a quiet device.
@@ -1569,28 +1748,30 @@ impl Virtio {
     /// bounds allow. Each window publishes whole requests: their data and status, their used
     /// elements in the next used slots, one used index, then reads the available ring's flags
     /// and index; the last also reads the queue's metadata as the next admission's snapshot when
-    /// it fits. True if any request was answered.
+    /// it fits. The number of requests completed.
     fn complete_answered(
         &self,
         guest: Guest<'_>,
         disk: &Disk,
         flight: &mut Flight,
         snapshots: &mut [Snapshot],
-    ) -> Result<bool> {
+        holds: &mut Holds,
+    ) -> Result<usize> {
         if flight.answered.is_empty() {
-            return Ok(false);
+            return Ok(0);
         }
         #[cfg(feature = "testing")]
         if disk
             .control()
             .is_some_and(|c| !c.completion_allowed(flight.answered.len()))
         {
-            return Ok(false);
+            return Ok(0);
         }
         #[cfg(not(feature = "testing"))]
         let _ = disk;
         let began = profile::start();
         let answered = flight.take_answered();
+        let count = answered.len();
         profile::count(profile::COMPLETIONS);
         profile::add(profile::COMPLETED, answered.len() as u64);
         // Each queue's requests complete on its own rings: one batch per incarnation (one per queue in flight),
@@ -1610,10 +1791,10 @@ impl Virtio {
         );
         for batch in batches {
             let queue = batch[0].id.queue;
-            self.complete_batch(guest, flight, &mut snapshots[queue], batch)?;
+            self.complete_batch(guest, flight, &mut snapshots[queue], batch, holds)?;
         }
         profile::since(profile::COMPLETE_NS, began);
-        Ok(true)
+        Ok(count)
     }
     /// [`Self::complete_answered`] for the answered requests of one incarnation.
     fn complete_batch(
@@ -1622,8 +1803,15 @@ impl Virtio {
         flight: &Flight,
         snapshot: &mut Snapshot,
         batch: Vec<Admitted>,
+        holds: &mut Holds,
     ) -> Result<()> {
         let id = batch[0].id;
+        // Decided once for the batch: its interrupt is held, and so its queue's kicks stay suppressed ([`Hold`]).
+        let hold =
+            hold().is_some() && self.target_running(guest, id.queue) && holds.wants(id.queue);
+        if hold {
+            holds.held(id.queue, batch.len());
+        }
         let completions: Vec<_> = batch.iter().map(Admitted::completion).collect();
         let element = Cost { spans: 1, bytes: 8 };
         let costs: Vec<Cost> = completions
@@ -1644,6 +1832,7 @@ impl Virtio {
             // The completion leaving none of the queue's requests in flight clears NO_NOTIFY in its body: the publication's
             // read of the available index follows a full barrier, and `retire_window` rearms.
             let clear = i == last
+                && !hold
                 && !flight.holds(id.queue)
                 && self.lock().suppressed[id.queue] == Some(id);
             if clear {
@@ -1671,7 +1860,7 @@ impl Virtio {
                 (false, _) => snapshot.discard(),
                 (true, false) => {}
             }
-            self.retire_window(id, &used, granted, snapshot);
+            self.retire_window(id, &used, granted, snapshot, hold);
         }
         Ok(())
     }
@@ -1679,7 +1868,14 @@ impl Virtio {
     /// interrupt, and rearms the queue if the driver published more than has been admitted (or
     /// the snapshot holds unadmitted heads); an ungranted one (a reset overtook it) only drops
     /// them.
-    fn retire_window(&self, id: Identity, used: &Used, granted: bool, snapshot: &Snapshot) {
+    fn retire_window(
+        &self,
+        id: Identity,
+        used: &Used,
+        granted: bool,
+        snapshot: &Snapshot,
+        hold: bool,
+    ) {
         #[cfg(feature = "testing")]
         if granted {
             for _ in 0..used.count() {
@@ -1691,7 +1887,7 @@ impl Virtio {
             let queue = &mut s.queues[id.queue];
             queue.next_used = queue.next_used.wrapping_add(used.count());
             let q = *queue;
-            self.interrupt(&mut s, id, used);
+            self.interrupt(&mut s, id, used, hold);
             if s.current(id) && s.accepting(id.queue) {
                 // Keep both notifications arriving after admission and already-captured heads,
                 // even if completion writes aliased the live available index.
@@ -2498,7 +2694,13 @@ mod tests {
             let (device, id) = in_flight(3);
             let q = device.lock().queues[0];
             let snapshot = Snapshot::new(8);
-            device.retire_window(id, &published(q, 2, 3 + u16::from(more)), true, &snapshot);
+            device.retire_window(
+                id,
+                &published(q, 2, 3 + u16::from(more)),
+                true,
+                &snapshot,
+                false,
+            );
             let s = device.lock();
             assert_eq!((s.queues[0].next_used, s.queues[0].next_avail), (2, 3));
             assert_eq!(s.in_flight.len(), 1);
@@ -2518,14 +2720,14 @@ mod tests {
             let snapshot = Snapshot::new(8);
             // A granted window retires its requests even after the reset arrived; an ungranted
             // one (the reset overtook it) drops them unpublished. Neither raises an interrupt.
-            device.retire_window(id, &published(q, 3, 8), true, &snapshot);
-            device.retire_window(id, &published(q, 4, 8), false, &snapshot);
+            device.retire_window(id, &published(q, 3, 8), true, &snapshot, false);
+            device.retire_window(id, &published(q, 4, 8), false, &snapshot, false);
             {
                 let s = device.lock();
                 assert!(s.closing.is_some() && s.in_flight.len() == 1);
                 assert_eq!((s.queues[0].next_used, s.interrupt), (3, 0));
             }
-            device.retire_window(id, &published(q, 1, 8), false, &snapshot);
+            device.retire_window(id, &published(q, 1, 8), false, &snapshot, false);
             let s = device.lock();
             assert!(s.closing.is_none() && s.in_flight.is_empty() && !s.queues[0].ready);
             assert_eq!(
@@ -2537,7 +2739,7 @@ mod tests {
         assert!(!device.quiesce().unwrap());
         let q = device.lock().queues[0];
         let snapshot = Snapshot::new(8);
-        device.retire_window(id, &published(q, 4, 4), true, &snapshot);
+        device.retire_window(id, &published(q, 4, 4), true, &snapshot, false);
         let s = device.lock();
         // Power-off still publishes accepted work, then admits nothing more.
         assert_eq!((s.queues[0].next_used, s.interrupt), (4, USED_BUFFER));
@@ -3055,6 +3257,96 @@ pub(in crate::virtio) mod owner_tests {
         assert_eq!(rig.by_worker(), [false]);
     }
 
+    #[test]
+    fn holds_back_off_while_they_gather_too_little() {
+        let mut h = Holds::new(2);
+        // Queue 0 gathers one completion per hold: 1, 2, 4 ... completions pass unheld between tries.
+        for skipped in [1, 2, 4, 8, 16, 32, 64, 64] {
+            assert!(h.wants(0));
+            h.held(0, 1);
+            assert_eq!((h.total(), h.first.is_some()), (1, true));
+            h.settle(1, 2);
+            assert_eq!((h.total(), h.first), (0, None));
+            assert_eq!((0..skipped).filter(|_| h.wants(0)).count(), 0);
+            // Queue 1 is scored alone.
+            assert!(h.wants(1));
+        }
+        // A hold that gathers enough ends the back-off; one that was not owed scores nothing.
+        assert!(h.wants(0));
+        h.held(0, 1);
+        h.held(0, 1);
+        h.held(1, 1);
+        assert_eq!((h.full(2), h.full(1), h.full(3)), (1, 3, 0));
+        // Queue 0's interrupt alone is raised: queue 1's hold goes on from the same start.
+        h.settle(1, 2);
+        assert!(h.wants(0) && h.first.is_some() && h.total() == 1);
+        h.held(0, 1);
+        h.clear();
+        assert!(h.wants(0) && h.wants(1), "nothing scored");
+        h.held(0, 1);
+        h.settle(u8::MAX, 2);
+        assert!(!h.wants(0) && h.wants(0), "back to one skipped");
+    }
+    /// The interrupt of a request completed while its target vCPU runs is held: kicks stay suppressed, the owner
+    /// reads the ring itself, and the interrupt comes with the count bound or when the target halts.
+    #[test]
+    fn an_interrupt_is_held_while_its_target_runs() {
+        let rig = Rig::new("hold");
+        let interrupt = || rig.r.lock().interrupt;
+        let ack = || {
+            assert_eq!(
+                rig.r
+                    .access(0, reg::INTERRUPT_ACK, 4, Some(u64::from(USED_BUFFER))),
+                Access::Completed(0)
+            );
+        };
+        rig.run(|rig| {
+            rig.r.target_runs.store(1, SeqCst);
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("first completed", || rig.used_index() == 1);
+            // Held: nothing raised, the kicks still suppressed although nothing is in flight.
+            until("first retired", || rig.r.lock().in_flight.is_empty());
+            assert_eq!((interrupt(), rig.r.lock().owing), (0, 1));
+            assert_eq!(rig.flags(), USED_NO_NOTIFY);
+            // The next request needs no kick: the owner reads the ring while it holds.
+            rig.publish(rig.read_request(1));
+            assert!(!rig.kick());
+            until("second completed", || rig.used_index() == 2);
+            until("second retired", || rig.r.lock().in_flight.is_empty());
+            assert_eq!((interrupt(), rig.r.lock().owing), (0, 1));
+            assert!(
+                rig.r.lock().busy.is_some(),
+                "an owed interrupt keeps the device busy"
+            );
+            // The third reaches the count: one interrupt for the three.
+            rig.publish(rig.read_request(2));
+            assert!(!rig.kick());
+            until("raised at the count", || interrupt() == USED_BUFFER);
+            assert_eq!((rig.used_index(), rig.r.lock().owing), (3, 0));
+            ack();
+            // A held interrupt is raised once its target halts, and the queue then idles as usual: kicks again.
+            rig.publish(rig.read_request(3));
+            assert!(!rig.kick());
+            until("fourth completed", || rig.used_index() == 4);
+            until("fourth retired", || rig.r.lock().in_flight.is_empty());
+            assert_eq!((interrupt(), rig.r.lock().owing), (0, 1));
+            rig.r.target_runs.store(0, SeqCst);
+            until("raised at the halt", || interrupt() == USED_BUFFER);
+            until("kicks again", || rig.flags() == 0);
+            ack();
+            // That hold gathered one completion: the next is not held, though the target runs.
+            rig.r.target_runs.store(1, SeqCst);
+            rig.publish(rig.read_request(4));
+            assert!(rig.kick());
+            until("raised at once", || interrupt() == USED_BUFFER);
+            until("idle", || {
+                let s = rig.r.lock();
+                rig.flags() == 0 && s.in_flight.is_empty() && s.busy.is_none()
+            });
+        });
+        assert_eq!(rig.disk.calls(), 5);
+    }
     #[test]
     fn two_request_queues_are_admitted_and_completed_each_on_its_own_rings() {
         let rig = Rig::with_queues("two-queues", 2);

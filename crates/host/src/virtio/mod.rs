@@ -334,6 +334,9 @@ pub struct Virtio {
     irqs: Irqs,
     gsi: usize,
     running: AtomicBool,
+    /// Unit tests: bit q set makes queue q's interrupt target count as running (`target_running`).
+    #[cfg(test)]
+    target_runs: std::sync::atomic::AtomicU8,
     /// Per queue: its notification gate (`GATE_*`), written only under the state lock as each holder releases it.
     gates: [AtomicU64; MAX_QUEUES],
     /// Per queue: a QueueNotify taken without the state lock, as the open gate it saw (0: none). The owner moves it to
@@ -794,6 +797,8 @@ impl Virtio {
             irqs,
             gsi,
             running: AtomicBool::new(false),
+            #[cfg(test)]
+            target_runs: Default::default(),
             gates: Default::default(),
             kicks: Default::default(),
             accepted: AtomicU64::new(0),
@@ -999,9 +1004,11 @@ impl Virtio {
         self.irq(s);
         self.settle(s);
     }
-    /// Release the busy guard once no work is notified and nothing is in flight.
+    /// Release the busy guard once no work is notified, nothing is in flight and the block owner holds no interrupt
+    /// back (`block::Hold`: the guard vetoes the all-halted end while this device may still post).
     fn settle(&self, s: &mut State) {
-        if !s.pending() && s.in_flight.is_empty() {
+        let held = s.owing != 0 && matches!(self.profile, Profile::Block(_));
+        if !s.pending() && s.in_flight.is_empty() && !held {
             s.busy = None;
         }
     }
@@ -1406,7 +1413,7 @@ impl Virtio {
         drop(transfers);
         #[cfg(feature = "testing")]
         self.observe("commit");
-        self.interrupt(&mut self.lock(), id, &used);
+        self.interrupt(&mut self.lock(), id, &used, false);
         // More heads already wait (read after publication, behind the full barrier): the owner looks
         // again. A head added after that read is notified (avail_event or no suppression at all).
         Ok(Some(used.avail_index() != next))
@@ -1442,11 +1449,30 @@ impl Virtio {
         drop(transfers);
         Ok(Some(u16::from_le_bytes(index) != at))
     }
+    /// Whether `queue`'s interrupt would now reach one vCPU that is running (PCI with MSI-X on the running VM only):
+    /// false whenever that cannot be told. A hint: the vCPU may halt at any moment.
+    fn target_running(&self, guest: Guest<'_>, queue: usize) -> bool {
+        #[cfg(test)]
+        if matches!(guest.copier, Copier::Test(_)) {
+            return self.target_runs.load(SeqCst) >> queue & 1 != 0;
+        }
+        let (Copier::Vm { .. }, Some(pci)) = (guest.copier, self.pci.get()) else {
+            return false;
+        };
+        let vectors = self.lock().vectors;
+        pci.destination(&vectors, queue)
+            .is_some_and(|v| !guest.backing.halted(v))
+    }
     /// After a granted publication: raise the used-buffer interrupt unless the driver suppressed
     /// it or a reset closed the incarnation (ACK, reset and level publication share the lock).
-    fn interrupt(&self, s: &mut State, id: Identity, used: &Used) {
+    /// `hold`: leave it owed for the caller to raise.
+    fn interrupt(&self, s: &mut State, id: Identity, used: &Used, hold: bool) {
         if s.current(id) && used.interrupt_wanted() {
             s.owing |= 1 << id.queue;
+            // The block owner raises it when its hold ends (`block::Hold`).
+            if hold {
+                return;
+            }
             if matches!(self.profile, Profile::Network(_)) {
                 let since = *s.owed_at.get_or_insert_with(Instant::now);
                 s.owed += 1;

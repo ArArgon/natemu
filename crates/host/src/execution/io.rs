@@ -547,6 +547,12 @@ impl Backing {
         Ok(())
     }
 
+    /// vCPU `v` is parked in a HLT (or does not exist): its quiescent word, set before its `wfi` and withdrawn when
+    /// it wakes. A vCPU that has not started or has ended reads as running. A hint for device threads: it can change
+    /// at any moment.
+    pub fn halted(&self, v: usize) -> bool {
+        v >= self.n || quiescent(&self.memory, v).load(SeqCst) == 1
+    }
     /// As [`Self::copy_guest_with_permit`], without pausing vCPUs in the usual case (the
     /// "windowless copies" design in `docs/restructure/io-plan.md`). `transfers[..publish]` is the
     /// body (payload, status, used elements, metadata reads); `transfers[publish..]` is the
