@@ -164,9 +164,10 @@ def steps(F, O):
         vm(f'nostop-{g}', 'run_nostop.py', '--only', g)
     for g in ('qemu', 'ipi', 'timers', 'stress', 'halt', 'cases'): vm(f'x3-{g}', 'run_x3.py', '--only', g)
     vm('x4', 'run_x4.py')
-    for n, est in ((1, 80), (2, 215), (3, 275), (4, 155)):
-        if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, *(() if n == 4 else ('--timeout', 450)), est=est, w=n)     # c4 serial: its runs time out at 300 s under load
-        else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 450, est=est, w=n)
+    # link-full overflows the link-record area (MAX_LINKS, 512 Ki since chunk 1b): about 5 min at 1 vCPU, 20 at 4 (one run).
+    for n, est in ((1, 300), (2, 500), (3, 700), (4, 1300)):
+        if n == 4 or SHARDS['k1'][n] == 1: vm(f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 1500, est=est, w=n)
+        else: shards(SHARDS['k1'][n], f'k1-c{n}', 'run_k1.py', '--cpus', n, '--timeout', 1500, est=est, w=n)
     # PIC study stage 2: stops at each entry word, svc-word links, a forged slot. One step per mode (each runs the K1 programs at
     # 1 and 2 vCPUs, about 1780 s in all in the November 10 serial-chain run, 137-step suite 13: its longest step); the three
     # no-K1 modes together.
