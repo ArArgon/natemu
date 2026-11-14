@@ -606,6 +606,56 @@ mod tests {
         }
     }
 
+    /// FNV-1a 64 (fixed, so the digests below are stable across runs and toolchains).
+    fn fnv(parts: impl IntoIterator<Item = u8>) -> u64 {
+        parts.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+    /// The default launch is unchanged: digests of every blob (address and bytes) `build_with_virtio` returns, and of
+    /// the E820 maps, recorded on the tree before the PCI work (dcffe4b's tables).
+    #[test]
+    fn default_tables_and_map_are_unchanged() {
+        use crate::virtio::{BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE};
+        let manifests: [&[VirtioMmio]; 3] = [
+            &[],
+            &[RNG_RESOURCE],
+            &[BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE],
+        ];
+        let mut got = Vec::new();
+        for vcpus in [1, 4] {
+            for m in manifests {
+                let t = build_with_virtio(vcpus, ACPI_NVS.0, m);
+                got.push(fnv(t.blobs.iter().flat_map(|(a, b)| {
+                    a.to_le_bytes().into_iter().chain(b.iter().copied())
+                })));
+            }
+        }
+        let map = |l: Layout| {
+            fnv(l.e820().unwrap().iter().flat_map(|e| {
+                [e.addr, e.size, e.kind.into()]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
+            }))
+        };
+        got.push(map(Layout::DEFAULT));
+        got.push(map(Layout {
+            low_end: 1 << 30,
+            high: 2 << 30,
+        }));
+        assert_eq!(got, DIGESTS);
+    }
+    const DIGESTS: [u64; 8] = [
+        18415784877665836832,
+        3444692196014619991,
+        799404990717031835,
+        150797512702890517,
+        17257018383566105557,
+        14874300501981569566,
+        11904427970829829364,
+        10577683458271288932,
+    ];
+
     /// AML encodings with known iasl outputs.
     #[test]
     fn aml_encodings() {
