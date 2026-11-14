@@ -2982,6 +2982,54 @@ pub struct State {
     /// With a block reply (perf chunk 25): 1 when the block's first instruction is a translated STI (admission proves it
     /// from the guest bytes); the resident keeps it in the block ([`cache::STI_FIRST`]).
     pub sti_first: u64,
+    /// Halt polling: before a halted vCPU sleeps in `wfi` it spins for a short window, looking for a pending interrupt,
+    /// so that a wake that is about to come (a disk completion at queue depth 1) does not pay for waking a blocked
+    /// vCPU thread. The longest window in microseconds, set by the host before the vCPU first runs (0: never poll;
+    /// [`HALT_POLL_MAX_US`] unless `NATEMU_HALT_POLL_US` says otherwise), and the current window in CNTVCT ticks, the
+    /// resident's own ([`halt_poll::next`]).
+    pub halt_poll_max_us: u64,
+    pub halt_poll: u64,
+}
+/// The default of [`State::halt_poll_max_us`]. Measured on an M2 Max (November 14, 2026; depth-1 4 KiB direct reads over
+/// virtio-PCI, host CPU per request in brackets). At 2 vCPUs, without polling: 68-70 MB/s (68-70 us). 15 us: 74-85 MB/s
+/// (63-75 us, four runs); 25 us: 89 MB/s (96-98 us); 40 us: 97 MB/s (85 us); 100 us with the disk owner's spin at 100 us: 124-129
+/// MB/s (93-99 us). Above 15 us both vCPUs (the reader's and the interrupt's) spin through every request, about a
+/// core each, which is past the 20% bound on host CPU per I/O (`virtio::block`); so the default is the largest cap
+/// inside it. At 1 vCPU 25 us costs nothing (100 -> 108 MB/s, 48 -> 46 us). The larger gain at 2 or more vCPUs is not
+/// polling's to give: the same read pinned to the vCPU that takes the disk's interrupt runs at 104-110 MB/s.
+pub const HALT_POLL_MAX_US: u64 = 15;
+/// How a poll window follows what the waits show (after KVM's halt polling, `virt/kvm/kvm_main.c` `kvm_vcpu_halt`):
+/// a wait that ends inside the window leaves it; one that had to sleep but lasted no more than [`halt_poll::IDLE`]
+/// times the longest window is a wake that was about to come, so the window doubles (from `min`, up to `max`); a
+/// longer one means the vCPU is idle, and the window halves, to 0 below `min`. An idle vCPU therefore stops polling
+/// after a few halts (the whole halt is timed, whatever ends it: a periodic timer's ticks close the window too). The
+/// idle bound is wider than the longest window because a wait that slept includes the cost of waking a blocked
+/// thread: measured against the window itself, a short cap never opens (25 us: no gain at all).
+/// The disk device's owner thread uses the same rule for its spin (`virtio::block`).
+pub mod halt_poll {
+    /// A wait longer than this many longest windows shows an idle vCPU.
+    pub const IDLE: u64 = 2;
+    /// The window after a wait that took `waited` (0 when it ended inside `window`), all in one unit.
+    pub const fn next(window: u64, waited: u64, min: u64, max: u64) -> u64 {
+        if max == 0 {
+            0
+        } else if waited == 0 {
+            if window > max { max } else { window }
+        } else if waited <= max.saturating_mul(IDLE) {
+            let w = window.saturating_mul(2);
+            if w < min {
+                if min > max { max } else { min }
+            } else if w > max {
+                max
+            } else {
+                w
+            }
+        } else if window / 2 < min {
+            0
+        } else {
+            window / 2
+        }
+    }
 }
 /// S4: [`State::debug`]'s fields.
 pub mod debug {
@@ -3067,6 +3115,8 @@ impl State {
             debug: 0,
             relocatable: 0,
             sti_first: 0,
+            halt_poll_max_us: HALT_POLL_MAX_US,
+            halt_poll: 0,
         }
     }
 }
@@ -3465,6 +3515,33 @@ mod tests {
         assert_eq!(f, L1Fill { way: 0, there: false, victim: false });
         // M4's input: a raw owner with the bit set is still the block (the masks).
         assert_eq!(l1_fill(c | L1_NEXT, b, c), L1Fill { way: 0, there: true, victim: false });
+    }
+
+    #[test]
+    fn halt_poll_window_opens_on_short_sleeps_and_closes_on_long_ones() {
+        use super::halt_poll::next;
+        let (min, max) = (10, 100);
+        // A sleep the longest window would have caught opens the window at the minimum, then doubles it to the cap.
+        let mut w = 0;
+        for expected in [10, 20, 40, 80, 100, 100] {
+            w = next(w, 40, min, max);
+            assert_eq!(w, expected);
+        }
+        // A wait that ended inside the window leaves it (and an oversized one is brought under the cap).
+        assert_eq!(next(40, 0, min, max), 40);
+        assert_eq!(next(400, 0, min, max), 100);
+        // A sleep within two caps still counts as a wake about to come; longer ones halve the window, to nothing
+        // below the minimum: an idle vCPU stops polling.
+        assert_eq!(next(50, 200, min, max), 100);
+        for expected in [50, 25, 12, 0, 0] {
+            w = next(w, 201, min, max);
+            assert_eq!(w, expected);
+        }
+        // Off stays off, whatever the waits; a minimum above the cap never exceeds the cap.
+        assert_eq!(next(0, 1, min, 0), 0);
+        assert_eq!(next(50, 0, min, 0), 0);
+        assert_eq!(next(0, 1, 30, 20), 20);
+        assert_eq!(next(u64::MAX, 1, min, max), 100);
     }
 
     #[test]

@@ -1769,9 +1769,9 @@ fn io_pending(s: &State) -> bool {
     io_word(core::mem::offset_of!(IoWindow, request)).load(SeqCst)
         > io_word(core::mem::offset_of!(IoWindow, acknowledged) + s.vcpu as usize * 8).load(SeqCst)
 }
-/// HLT's private-only wait. Its loop drains doorbells and checkpoints on return, before any
+/// HLT's private-only wait (`window`, its result: [`lapic::wait`]'s). Its loop drains doorbells and checkpoints on return, before any
 /// guest access. AP mailbox, compiler and other waits do not publish this admission state.
-fn io_halt_wait(s: &State) {
+fn io_halt_wait(s: &State, window: u64) -> bool {
     use natemu_abi::execution::cache::IoWindow;
     let quiet = io_word(core::mem::offset_of!(IoWindow, quiescent) + s.vcpu as usize * 8);
     unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
@@ -1781,7 +1781,7 @@ fn io_halt_wait(s: &State) {
         natemu_abi::execution::cache::io_test::BEFORE_QUIET,
     );
     quiet.store(1, SeqCst);
-    lapic::wait(s);
+    let caught = lapic::wait(s, window);
     quiet.store(0, SeqCst);
     // A host that saw quiet=1 must have published its request before our next checkpoint.
     unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
@@ -1790,6 +1790,7 @@ fn io_halt_wait(s: &State) {
         s.vcpu as usize,
         natemu_abi::execution::cache::io_test::AFTER_WITHDRAW,
     );
+    caught
 }
 /// A banked boundary with no guest access or generated-code continuation live. Never call from a
 /// split-atomic/shadow wait or with a selected Block to enter: release may invalidate every cached block.
