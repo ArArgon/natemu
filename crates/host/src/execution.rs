@@ -778,13 +778,31 @@ struct K1Reuse {
 pub(crate) struct K1Pool {
     pub probes: u64,
     pub hits: u64,
+    pub candidates: u64,
     pub refused: Members<&'static str, u64>,
+    /// The re-check refusals by reason, `same|other` (the RIP the entry was published at) and `user|kernel` (the context's CPL).
+    pub recheck: Members<String, u64>,
 }
 impl K1Pool {
     pub(crate) fn new(c: &cache::Control) -> Self {
         Self {
             probes: c.pool_probes,
             hits: c.pool_hits,
+            candidates: c.pool_candidates,
+            recheck: (0..cache::pool_recheck::COUNT * 4)
+                .filter(|&i| c.pool_recheck[i] != 0)
+                .map(|i| {
+                    (
+                        format!(
+                            "{}.{}.{}",
+                            cache::pool_recheck::NAMES[i / 4],
+                            if i & 2 != 0 { "same" } else { "other" },
+                            if i & 1 != 0 { "user" } else { "kernel" }
+                        ),
+                        c.pool_recheck[i],
+                    )
+                })
+                .collect(),
             refused: cache::pool_refusal::NAMES
                 .into_iter()
                 .zip(c.pool_refused)
@@ -6036,6 +6054,119 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Diagnostic (not a gate): how often the resident's placement re-check ([`natemu_abi::execution::relocate_code`]) refuses a
+    /// pool entry, by reason and by how far the RIP moves, over the blocks of a real x86-64 program. Needs `FEXC` and `SURVEY_ELF`
+    /// (a static x86-64 ELF, e.g. busybox); `SURVEY_BLOCKS` blocks (default 20000):
+    /// `FEXC=... SURVEY_ELF=... cargo test -p natemu --release pool_relocation_survey -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn pool_relocation_survey() {
+        use natemu_abi::execution::{LinkPoint, MAX_LINK_POINTS, link_point, pack_reloc, refusal, relocate_code};
+        let (Some(fexc), Some(elf)) = (std::env::var_os("FEXC"), std::env::var_os("SURVEY_ELF")) else {
+            return;
+        };
+        let data = std::fs::read(elf).unwrap();
+        let u = |at: usize, n: usize| u64::from_le_bytes({
+            let mut b = [0; 8];
+            b[..n].copy_from_slice(&data[at..at + n]);
+            b
+        });
+        // The executable PT_LOAD.
+        let (phoff, phnum) = (u(32, 8) as usize, u(56, 2) as usize);
+        let (mut text, mut vaddr) = (&data[..0], 0u64);
+        for i in 0..phnum {
+            let h = phoff + 56 * i;
+            if u(h, 4) == 1 && u(h + 4, 4) & 1 != 0 {
+                let (off, va, sz) = (u(h + 8, 8) as usize, u(h + 16, 8), u(h + 32, 8) as usize);
+                if sz > text.len() {
+                    (text, vaddr) = (&data[off..off + sz], va);
+                }
+            }
+        }
+        let blocks: usize = std::env::var("SURVEY_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+        let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.cpl3 = true;
+        // Moves: [same RIP, +1 page, a library-like base, a PIE-like base]; per refusal kind and the reply checks.
+        let moves = |from: u64| [from, from + 0x1000, 0x7f12_3440_0000 + (from & 0xf_ffff), 0x5555_5555_4000 + (from & 0xfff) + (from & 0xf_f000)];
+        let names = ["same", "+1 page", "lib base", "PIE base"];
+        let mut refused = [[0u64; 6]; 4]; // by `refusal::*` (1 place, 2 literal, 3 move, 4 link); [5] the total
+        let (mut seen, mut templates, mut reply_bad, mut no_move_link) = (0u64, 0u64, 0u64, 0u64);
+        // (The program's text is compiled at a high base, as a PIE or a library runs: below 4 GiB FEX's RIP moves are the 32-bit
+        // form, which relocation refuses.)
+        let base = std::env::var("SURVEY_BASE").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()).unwrap_or(0x7f12_3440_0000);
+        let (vaddr, end) = (base, base + text.len() as u64);
+        let mut rip = vaddr;
+        while seen < blocks as u64 && rip + 16 < end {
+            let at = (rip - vaddr) as usize;
+            let bytes = &text[at..text.len().min(at + 8192)];
+            let code = match c.compile(bytes, rip, false, &mut ()) {
+                Ok(Code::Block(b)) => b,
+                Ok(Code::System(s)) => {
+                    rip += u64::from(s.length.max(1));
+                    continue;
+                }
+                _ => {
+                    rip += 1;
+                    continue;
+                }
+            };
+            seen += 1;
+            let next = rip + u64::from(code.guest_bytes);
+            let last = rip.wrapping_add(u64::from(code.guest_bytes).max(1) - 1) >> 12;
+            let template = !c.halved
+                && code.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
+                && c.read < bytes.len()
+                && rip.wrapping_add(c.read.max(1) as u64 - 1) >> 12 <= last;
+            if template {
+                templates += 1;
+                let o = &code.object;
+                let h: natemu_abi::code_object::Header = crate::relocation::read(o, 0).unwrap();
+                let code_bytes = &o[h.code_offset as usize..][..h.code_size as usize];
+                let mut relocs = vec![];
+                let mut packable = h.relocs_count <= cache::MAX_RELOCS;
+                for i in 0..h.relocs_count as usize {
+                    let r: natemu_abi::code_object::Reloc = crate::relocation::read(o, h.relocs_offset as usize + 16 * i).unwrap();
+                    match pack_reloc(&r, h.code_size) {
+                        Some(p) => relocs.extend(p),
+                        None => packable = false,
+                    }
+                }
+                relocs.sort();
+                let mut links0 = [LinkPoint::NONE; MAX_LINK_POINTS];
+                links0[..code.links.len()].copy_from_slice(&code.links);
+                let word = |at: u64| u32::from_le_bytes(code_bytes[at as usize..at as usize + 4].try_into().unwrap());
+                // The resident's reply checks on the entry as published.
+                if code.links.iter().any(|p| !link_point(word, h.code_size, p))
+                    || code.dispatch_exit.is_some_and(|d| word(u64::from(d)) != natemu_abi::execution::DISPATCH_PLACEHOLDER)
+                {
+                    reply_bad += 1;
+                }
+                // Every link point has a move relocation at its offset (relocate_code requires it).
+                if code.links.iter().any(|p| !relocs.iter().any(|&r| r & natemu_abi::execution::RELOC_MOVE != 0 && (r >> 6) * 4 == p.offset)) {
+                    no_move_link += 1;
+                }
+                if packable {
+                    for (m, to) in moves(rip).into_iter().enumerate() {
+                        let mut code2 = code_bytes.to_vec();
+                        let mut links = links0;
+                        refused[m][5] += 1;
+                        if let Err(k) = relocate_code(&mut code2, &relocs, &mut links, rip, to, code.guest_bytes) {
+                            refused[m][k.min(4)] += 1;
+                        }
+                    }
+                }
+            }
+            rip = next.max(rip + 1);
+        }
+        eprintln!("{seen} blocks, {templates} templates, {reply_bad} fail the reply checks as published, {no_move_link} with a link point lacking a move relocation");
+        for (m, r) in refused.iter().enumerate() {
+            eprintln!(
+                "{:9}: of {} relocated: place {} literal {} move {} link {}",
+                names[m], r[5], r[refusal::PLACE], r[refusal::LITERAL], r[refusal::MOVE], r[refusal::LINK]
+            );
+        }
     }
 
     /// The bytes come only from the pages the resident walked: RIP's page to its end (more may follow until the next

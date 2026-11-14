@@ -864,7 +864,7 @@ mod report_tests {
         );
         let mut old: serde_json::Value = serde_json::from_str(&old).unwrap();
         old["admissions"] = serde_json::json!({"skipped": 1, "fresh": 2});
-        old["pool"] = serde_json::json!({"probes": 0, "hits": 0, "refused": {}});
+        old["pool"] = serde_json::json!({"probes": 0, "hits": 0, "candidates": 0, "refused": {}, "recheck": {}});
         assert_eq!(old, serde_json::to_value(&v).unwrap());
     }
 }

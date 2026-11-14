@@ -766,6 +766,28 @@ pub mod cache {
         pub pool_probes: u64,
         pub pool_hits: u64,
         pub pool_refused: [u64; pool_refusal::COUNT],
+        /// Pool candidates examined (entries copied and checked; a lookup may examine several), and the refusals for
+        /// [`pool_refusal::RECHECK`] by [`pool_recheck`] reason, at the same RIP the entry was published at or another, for
+        /// user (CPL 3) or kernel context: index `reason * 4 + same * 2 + user`.
+        pub pool_candidates: u64,
+        pub pool_recheck: [u64; pool_recheck::COUNT * 4],
+    }
+    /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
+    pub mod pool_recheck {
+        /// The entry's link point is not an exit of its code as admitted ([`super::super::link_point`]).
+        pub const LINK_POINT: usize = 0;
+        /// The computed exit's word is not the dispatcher placeholder.
+        pub const PLACEHOLDER: usize = 1;
+        /// [`super::super::relocate_code`]: another half or page offset, or a non-canonical RIP or block end.
+        pub const PLACE: usize = 2;
+        /// A literal slot outside the code or a non-canonical new value.
+        pub const LITERAL: usize = 3;
+        /// A guest-RIP move relocate_move refuses (its form, value or word count) or outside the code.
+        pub const MOVE: usize = 4;
+        /// A link point no move rewrote, or one that is no link point after.
+        pub const LINK: usize = 5;
+        pub const COUNT: usize = 6;
+        pub const NAMES: [&str; COUNT] = ["link_point", "placeholder", "place", "literal", "move", "link"];
     }
     /// [`Control::pool`].
     pub const POOL_OFF: u64 = 0;

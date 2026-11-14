@@ -1115,6 +1115,7 @@ unsafe fn pooled_entry(
     use natemu_abi::pool::Refusal;
     let c = cache::control();
     let rip = s.cpu.rip;
+    c.pool_candidates += 1;
     let e = match pool.fetch(position, staging) {
         Ok(e) => e,
         Err(Refusal::Overwritten) => return Err(why::OVERWRITTEN),
@@ -1165,16 +1166,32 @@ unsafe fn pooled_entry(
         code.get(at as usize..at as usize + 4)
             .map_or(0, |w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
     };
+    // The refusal's reason, with whether the entry was published at this RIP and whether the context is CPL 3.
+    let mut recheck = |reason: usize| {
+        c.pool_recheck[reason * 4 + 2 * usize::from(e.rip == rip) + usize::from(context & 3 == 3)] += 1;
+        why::RECHECK
+    };
+    use natemu_abi::execution::cache::pool_recheck as how;
     if e.links
         .iter()
         .any(|p| p.offset != 0 && !natemu_abi::execution::link_point(word, code.len() as u32, p))
-        || (e.dispatch_exit != 0 && word(u64::from(e.dispatch_exit)) != DISPATCH_PLACEHOLDER)
     {
-        return Err(why::RECHECK);
+        return Err(recheck(how::LINK_POINT));
+    }
+    if e.dispatch_exit != 0 && word(u64::from(e.dispatch_exit)) != DISPATCH_PLACEHOLDER {
+        return Err(recheck(how::PLACEHOLDER));
     }
     s.source_gpa = [s.fetch[0], if crosses { s.fetch[1] } else { u64::MAX }];
     let walk = walked(s);
-    cache::copy_pooled(&e, rip, context, s.source_gpa, walk).map_err(|_| why::RECHECK)
+    cache::copy_pooled(&e, rip, context, s.source_gpa, walk).map_err(|kind| {
+        use natemu_abi::execution::refusal;
+        recheck(match kind {
+            refusal::LITERAL => how::LITERAL,
+            refusal::MOVE => how::MOVE,
+            refusal::LINK => how::LINK,
+            _ => how::PLACE,
+        })
+    })
 }
 /// Whether guest RAM at `gpa` holds `expect`.
 fn same_bytes(ram: &GuestRam, gpa: u64, expect: &[u8]) -> bool {
