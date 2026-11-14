@@ -972,6 +972,26 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             linked.len()
         ));
     }
+    // The inbound lists: each block's chain holds exactly the records naming it (checked ones on none), doubly linked.
+    let mut on_lists = 0;
+    for (n, b) in blocks.iter().enumerate() {
+        let (mut at, mut prev) = (b.inbound, 0);
+        while at != 0 {
+            let r = records
+                .get(at as usize - 1)
+                .filter(|r| {
+                    r.target as usize == n && r.prev_in == prev && on_lists <= records.len()
+                })
+                .ok_or_else(|| format!("block {n}'s inbound list is broken at record {}", at - 1))?;
+            (prev, at, on_lists) = (at, r.next_in, on_lists + 1);
+        }
+    }
+    let unchecked = records.iter().filter(|r| r.target & cache::CHECKED == 0).count();
+    if on_lists != unchecked {
+        return Err(format!(
+            "{on_lists} records on inbound lists, {unchecked} unchecked links"
+        ));
+    }
     Ok((points, linked.len() as u64))
 }
 

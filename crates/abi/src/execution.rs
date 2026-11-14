@@ -312,7 +312,7 @@ pub mod cache {
     pub const LINKS: usize = INDEX + 4 * MAX_BLOCKS;
     pub const MAX_LINKS: usize = 256 * 1024;
     /// The single-step block's record (its code is in the slot, `SLOT_VA`) and its access sites after it.
-    pub const STEP_RECORD: usize = LINKS + 16 * MAX_LINKS;
+    pub const STEP_RECORD: usize = LINKS + core::mem::size_of::<LinkRecord>() * MAX_LINKS;
     pub const STEP_RECORD_BYTES: usize = 0x3_c000;
     /// M1: this vCPU's summaries of the code-page and writable mask words it set bits in (bit i % 64 of u64 i / 64: word
     /// i of the mask may hold its bits), so clearing its bits visits only those words, not all of guest RAM's (only the
@@ -746,7 +746,9 @@ pub mod cache {
         pub links: [super::LinkPoint; super::MAX_LINK_POINTS],
         /// PIC study stage 3: an [`INSTANCE`]'s translation (its block number), whose code it runs; 0 otherwise.
         pub shared: u32,
-        pub reserved: u32,
+        /// Head of its inbound list: the record (index + 1; 0: none) of the newest link into it, from the records'
+        /// `next_in` chain ([`LinkRecord`]). Checked links are on no list.
+        pub inbound: u32,
     }
     /// `Block::flags`: invalidated (a source page was written): out of L1 and L2, no link into or out of it, never run
     /// again; its space is reclaimed at the next flush.
@@ -846,6 +848,11 @@ pub mod cache {
         pub offset: u32,
         pub original: u32,
         pub target: u32,
+        /// The inbound list of `target` (not for a checked link, [`CHECKED`]): the neighbours' record indices + 1 (0: the
+        /// list's end; `prev_in` 0: this record is the head, [`Block::inbound`]). Records move within the area
+        /// (`cache::insert`, `remove`), which fix the neighbours.
+        pub prev_in: u32,
+        pub next_in: u32,
     }
     /// Invalidation requests to one vCPU, drained at each of its resident entries. Producers only set bits (atomic
     /// OR), the page's `stale` bit, then its word's `summary` bit, before `pending`; the consumer swaps `pending` to 0, then
