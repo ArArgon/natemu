@@ -376,6 +376,7 @@ def bodies(k, i=0, n=1):
         **l1_bodies(k, i, n),
         **page_bodies(i),
         **pool_bodies(i, n),
+        **chunk_bodies(k, i, n),
         'link-full': full_body(i, n),
         # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
         # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
@@ -502,6 +503,7 @@ RL, RL2, RLC = 0x9000, 0xa000, 0xc000
 # HIGH each table maps through three more table pages of its own (its PML4 entry, PDPT and PD at +0x5000, +0x6000, +0x7000).
 HIGH = 0x7f12_3440_0000
 RV1, RV2, RV3 = HIGH + 0xb000, HIGH + 0xd000, HIGH + 0xf000
+RV7 = RV1 + 0x10000              # `miss-pic`: a third alias of the set
 RV6 = RV1 + 0x8000                # `l1-pic`: RV1's partner in the two-way L1 (the same RIP bits 14:0, bit 15 differs)
 RX = 0xff7                       # `reuse-cross`: `lea rdx, [rel 0]` at RX, then `mov eax, imm32` across the page end
 LIB = lambda k: P.asm(f'mov ebx, {k}\nlea rax, [rel $$]\ncall .n\n.n:\npop rsi\njmp r13')   # rsi = alias + 17
@@ -524,14 +526,14 @@ XFLAGS = P.SYS_D(0) + 0x7800     # `pic-xwrite`: per CPU a ready word, then (+ 0
 JMP = lambda at, to: b'\xe9' + (to - at - 5).to_bytes(4, 'little', signed=True)
 PIC = ('pic-two', 'pic-fork', 'pic-invlpg', 'pic-write', 'pic-abs', 'pic-pge', 'pic-gmap', 'pic-ctx', 'pic-twosrc', 'pic-cow',
        'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again', 'pic-cross', 'pic-now',
-       'l1-pic')
+       'l1-pic', 'miss-pic')
 # Least instances, checked links and local (same-page shared) links per CPU.
 PIC_MIN = {'pic-two': (2, 1, 1), 'pic-fork': (1, 0, 1), 'pic-invlpg': (1, 0, 1), 'pic-write': (1, 0, 1), 'pic-abs': (2, 1, 1),
            'pic-pge': (2, 1, 1), 'pic-gmap': (1, 0, 1), 'pic-ctx': (1, 1, 1), 'pic-twosrc': (3, 1, 1),
            'pic-cow': (1, 0, 1), 'pic-twoframe': (2, 1, 1), 'pic-xm': (2, 2, 0), 'pic-flush': (6, 2, 2), 'pic-write2': (1, 0, 1),
            'pic-pfault': (1, 0, 1), 'pic-xwrite': (1, 0, 1), 'pic-user': (0, 0, 0),
            'pic-rep': (1, 0, 0), 'pic-repexit': (2, 0, 1), 'pic-again': (2, 1, 1), 'pic-cross': (1, 0, 0), 'pic-now': (1, 0, 1),
-           'l1-pic': (1, 0, 1)}
+           'l1-pic': (1, 0, 1), 'miss-pic': (1, 0, 1)}
 # Further `pic` counters per CPU: (counter, least, most): `pic-gmap` refuses the global instance (INSTANCE_REFUSED),
 # `pic-user` shares nothing (SHARES).
 PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)]}
@@ -728,6 +730,8 @@ def pic_bodies(i, n=1):
                       + f'    mov byte [{d + RL + 1:#x}], 3\n' + call('h3', f'{RV3 + XO:#x}') + save(('r10', 'rbx'))
                       + call('h4', f'{RV1 + XO:#x}') + save(('r12', 'rbx')))
     out['pic-user'] = out['pic-two']
+    out['miss-pic'] = (call('p0', f'{RV1:#x}') + save(('r8', 'rax'), ('r9', 'rsi')) + call('p1', f'{RV6:#x}') + save(('r10', 'rax')) + call('p2', f'{RV7:#x}') + save(('r12', 'rax'))
+                       + call('p3', f'{RV1:#x}') + save(('r14', 'rax'), ('r15', 'rsi')))
     return out
 
 
@@ -805,7 +809,7 @@ PAGE_COUNTS = {
 # The programs also run under the study resident for their counters (`page_counts`), beside the standard runs.
 PAGE_RUNS = ('no-invlpg', 'pf-fetch', 'place-global', 'invlpg-page', 'global', 'local-gpa', 'invlpg-large', 'pf-large', 'large-reval', 'self-invlpg', 'self-pge', 'mixed-g1') + PAGE_PROGRAMS
 # A typed stop instead of the body's end: (stop, a word of its reason).
-EXPECT_STOP = {'page-large-edge': ('no_code', 'fetch_not_ram')}
+EXPECT_STOP = {'page-large-edge': ('no_code', 'fetch_not_ram'), 'page-user': ('guest_fault', ''), 'miss-ac': ('guest_fault', '')}
 
 
 def page_study_problems(name, ps, block1=False):
@@ -905,6 +909,8 @@ def reuse_tables(name, i):
         return {RV1: RL, RV3: RL}, {RV1: RL}
     if name == 'l1-pic':
         return {RV1: RL, RV6: RL}, {}
+    if name == 'miss-pic':
+        return {RV1: RL, RV6: RL, RV7: RL}, {}
     if name in ('pic-two', 'pic-pge', 'pic-write2', 'pic-user', 'pic-again'):
         return {RV1: RL, RV3: RL, RVT: RT}, {}
     if name in ('pic-twosrc', 'pic-flush', 'pic-xm', 'pic-repexit'):
@@ -1012,10 +1018,12 @@ def reuse_either(name):
             'pool-wrap': {'r8': {PW_BLOCKS}, 'r9': {PW_BLOCKS}, 'r10': {PW_BLOCKS}},
             'pool-fence': {'r8': {RV1}, 'r9': {RV3}, 'r10': {RV3 + 17}, 'r12': {1}},
             'pool-race': {'r8': {7}},
+            # Three instances in one L1 set: RV1 is evicted by the other two and then called again (a fast miss): its own page base.
+            'miss-pic': {'r8': {RV1}, 'r9': {RV1 + YN}, 'r10': {RV6}, 'r12': {RV7}, 'r14': {RV1}, 'r15': {RV1 + YN}},
         }[name]
     return judge
 # (`l1-pic` shares one translation across two aliases; it asserts no copies: it is not a reuse program.)
-REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC if n != 'l1-pic'}}
+REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC if n not in ('l1-pic', 'miss-pic')}}
 
 IDT = 0x3000
 CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
@@ -1073,6 +1081,161 @@ CQ1, CQ2, CQ3 = 0x1f1000, 0x1d1000, 0x1b1000  # `contexts`: Q1, Q2 and Q3 in LP 
 
 # #NM and #XM: counted, and the call returns (r13) with RAX 0 (its `mov eax, 1` not run).
 CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n.h19:\n    inc r15\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n'
+# ---- Page-currency chunk 1 (the page record answering fetch walks) and the fast miss path (their plans, sections 8 and 5) -------
+# Natemu-only programs, except `page-cross`, `miss-counts`, `miss-step` and `miss-dr7`. CPL switches by the driver's hooked nop
+# (`switch ADDR CPL`): a one-byte nop at the last byte of a page changes CPL, and the next instruction, on the following page, is
+# fetched at the new one. So CPU i's stub pages (d + ...): ENTER (supervisor) ends in the nop to CPL 3 and is followed by USER (user:
+# `jmp rbx`); EXIT (user) ends in the nop to CPL 0 and is followed by BACK (supervisor: `jmp r12`); S is a supervisor code page. A
+# CPL-3 call sets r12 = the return label, rbx = the target and r13 = EXIT's nop (the code ends `jmp r13`).
+STUB = dict(enter=0x9fff, user=0xa000, exit=0xbfff, back=0xc000, S=0xd000)
+STUB_PROGRAMS = ('page-user', 'page-user-invlpg', 'miss-ac')
+CHUNK_PAGE = ('page-cross', 'page-global', 'page-user', 'page-user-invlpg', 'page-mark', 'page-size-check', 'page-counts')
+CHUNK_MISS = ('miss-counts', 'miss-system', 'miss-step', 'miss-dr7', 'miss-ac')
+PCX = 0x8000                       # `page-cross`: P1's third frame
+SIDT, LOGP = 0x7010, 0x7e00        # `page-user`: the logging IDT saved here; the #DB handlers' log of RIPs
+PCN = 100                          # `page-counts`' most blocks (2 K at the default 50 rounds), 0x20 apart on V
+LOG_END = lambda d: d + LOGP + 8 * 5
+
+
+def chunk_bodies(k, i, n):
+    d = P.SYS_D(i)
+    leaf = lambda va, t=0: P.sys_leaf(i, t, va)
+    put = lambda frame, bits=P.LEAF, t=0: f'    mov rax, {frame | bits:#x}\n    mov [{leaf(d, t):#x}], rax\n'
+    cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
+    inv = lambda va: f'    mov rax, {va:#x}\n    invlpg [rax]\n'
+    pge = lambda on: f'    mov rax, cr4\n    {"bts" if on else "btr"} rax, 7\n    mov cr4, rax\n'
+    cr4 = lambda op, bit: f'    mov rax, cr4\n    {op} rax, {bit}\n    mov cr4, rax\n'
+    save = lambda reg: f'    mov {reg}, rax\n'
+    c = lambda tag, va: call(tag, f'{va:#x}')
+    c3 = lambda tag, va: (f'    lea r12, [rel .k{tag}]\n    mov rbx, {va:#x}\n    mov r13, {d + STUB["exit"]:#x}\n'
+                          f'    mov rax, {d + STUB["enter"]:#x}\n    jmp rax\n.k{tag}:\n')
+    pde = lambda value: f'    mov rax, {value:#x}\n    mov [{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):#x}], rax\n'
+    pg = l1_pages(i)
+    A, B, C = pg['A'], pg['B'], pg['C']
+    add = lambda tag, va, reg: c(tag, va) + f'    add {reg}, rax\n'
+    # Vector 1's gate (#DB) at the handler `.hdb`; the log of RIPs at d + LOGP (rdi).
+    db_idt = (f'    lea rax, [rel .hdb]\n    mov [{d + IDT + 0x10:#x}], ax\n    mov word [{d + IDT + 0x12:#x}], 8\n'
+              f'    mov word [{d + IDT + 0x14:#x}], 0x8e00\n    shr rax, 16\n    mov [{d + IDT + 0x16:#x}], ax\n    shr rax, 16\n'
+              f'    mov [{d + IDT + 0x18:#x}], eax\n    mov word [{d + IDT + 0x800:#x}], 0xfff\n    mov rax, {d + IDT:#x}\n'
+              f'    mov [{d + IDT + 0x802:#x}], rax\n    lidt [{d + IDT + 0x800:#x}]\n    mov rdi, {d + LOGP:#x}\n')
+    hdb = lambda tail: ('    jmp .end\n.hdb:\n    push rbx\n    mov rbx, [rsp+8]\n    mov [rdi], rbx\n    add rdi, 8\n' + tail
+                        + '    pop rbx\n    iretq\n.end:\n')
+    sidt = lambda op: f'    {op} [{d + SIDT:#x}]\n'
+    return {
+        # W (d + 0x3ffe: `mov eax, imm32`, its last three bytes on d + 0x4000) in A and B: A maps P1 as is and P2 to XA (imm 0x100), B
+        # maps P1 to PCX (its byte 0xffe is 7) and P2 to XA too. B: X on P2 (recorded), then W: P1 is not recorded and differs.
+        'page-cross': (c('x0', d + 0x3ffe) + save('r8') + cr3('tb') + c('x1', d + 0x4100) + save('r9') + c('x2', d + 0x3ffe) + save('r10')
+                       + cr3('ta') + c('x3', d + 0x3ffe) + save('r12')),
+        # PGE on, V global and one frame in A and B: Y found on the global record across the CR3 load; V -> F2 in B with no INVLPG and a
+        # global flush: Y runs F2's bytes. PGE off, V with G set: A: Z; B (V -> F2): Z runs F2's bytes.
+        'page-global': (pge(True) + cr3('ta') + c('g0', d) + save('r8') + cr3('tb') + c('g1', d + PY) + save('r9')
+                        + put(d + F2, P.LEAF | G, 1) + pge(False) + pge(True) + c('g2', d + PY) + save('r10')
+                        + pge(False) + cr3('ta') + c('g3', d + PZ) + save('r12') + cr3('tb') + c('g4', d + PZ) + save('r14')),
+        # SMEP on throughout, one epoch. X on V runs at CPL 3 (user record); at CPL 0 a fetch of V + PY must #PF (r14 = 0x11); Z on S runs at
+        # CPL 0 (supervisor record); then the logging IDT is back and a CPL-3 fetch of S must #PF: the run stops (`guest_fault`).
+        'page-user': (sidt('sidt') + adv_idt(d) + cr4('bts', 20) + c3('u0', d + PX) + save('r8') + '    xor eax, eax\n' + c('u1', d + PY)
+                      + save('r9') + c('u2', d + STUB['S']) + save('r10') + '    jmp .skip\n' + TO_R13 + '.skip:\n' + sidt('lidt')
+                      + c3('u3', d + STUB['S'] + PY)),
+        # CPL 3: X on V runs; at CPL 0 V -> F2 and INVLPG: Y on V runs F2's bytes at CPL 3. Then V not present, a supervisor load faults, the
+        # handler maps F1 again (no INVLPG): Z on V runs F1's bytes at CPL 3 (the #PF cleared the user record).
+        'page-user-invlpg': (adv_idt(d) + '    xor edi, edi\n' + c3('i0', d + PX) + save('r8') + put(d + F2) + inv(d) + c3('i1', d + PY) + save('r9')
+                             + put(d + F1, P.LEAF & ~1) + f'    mov rsi, [{d:#x}]\n' + c3('i2', d + PZ) + save('r10') + '    jmp .end\n.h:\n'
+                             + put(d + F1) + '    inc rdi\n    add rsp, 8\n    iretq\n.end:\n'),
+        # One epoch: X on V runs (the frame marked); the frame written (X dies); Y placed on V (from the record: the mark again); written again.
+        'page-mark': (c('m0', d + PX) + save('r8') + f'    mov byte [{d + F1 + 1:#x}], 0x31\n' + c('m1', d + PY) + save('r9')
+                      + f'    mov byte [{d + F1 + PY + 1:#x}], 0x41\n' + c('m2', d + PY) + save('r10')),
+        # Under `--page-currency check`: LP a 2 MiB page, X runs (2 MiB record); the PDE replaced by a page table of 4 KiB pages of the same
+        # frames with no INVLPG; Y placed on LP: the record (a large leaf) and the walk (a 4 KiB leaf) differ in flags: one disagreement.
+        'page-size-check': (c('s0', LP + LX) + save('r8') + pde((P.SYS_T(i, 0) + 0x6000) | 0x27) + c('s1', LP + LX + 0x100) + save('r9')),
+        # K blocks on V in a fresh epoch, 0x20 apart: one walk and K - 1 record hits (run at K and 2K rounds: the counts' difference).
+        'page-counts': (cr3('tb') + f'    xor r8d, r8d\n    xor ecx, ecx\n.l:\n    mov rax, {d:#x}\n    mov rdx, rcx\n    shl rdx, 5\n    add rax, rdx\n'
+                        f'    lea r13, [rel .cl]\n    jmp rax\n.cl:\n    add r8, rax\n    inc ecx\n    cmp ecx, {k}\n    jb .l\n' + cr3('ta')),
+        # The fast miss path: K rounds of A, B, C (one L1 set of three RIPs: each call misses into a current block).
+        'miss-counts': f'    mov ecx, {k}\n.r:\n' + add('a', A, 'r8') + add('b', B, 'r9') + add('c', C, 'r10') + '    dec ecx\n    jnz .r\n',
+        # A CPUID decode (kept, never in L1) reached by a computed jump each round: always a miss, always declined (`system`).
+        'miss-system': f'    mov r14d, {k}\n.r:\n    xor eax, eax\n' + add('s', B - 2, 'r8') + '    dec r14d\n    jnz .r\n',
+        # TF set by POPF after the warm-up: the stepped jump to the evicted A traps at A, after A's first instruction and at the return label.
+        'miss-step': (db_idt + c('w0', A) + c('w1', B) + c('w2', C) + '    pushfq\n    or qword [rsp], 0x100\n    popfq\n    lea r13, [rel .m1]\n'
+                      f'    mov rax, {A:#x}\n    jmp rax\n.m1:\n'
+                      + hdb(f'    cmp rdi, {LOG_END(d):#x}\n    jb .k\n    and qword [rsp+24], -0x101\n.k:\n')),
+        # DR0 an instruction breakpoint at A, armed throughout: each of two runs of A takes the #DB before its first instruction.
+        'miss-dr7': (db_idt + f'    mov rax, {A:#x}\n    mov dr0, rax\n    mov eax, 1\n    mov dr7, rax\n' + c('d0', A) + save('r8') + c('d1', A)
+                     + save('r9') + '    xor eax, eax\n    mov dr7, rax\n' + hdb('    or qword [rsp+24], 0x10000\n')),
+        # CPL 3 with CR0.AM and RFLAGS.AC: A, B, C warm (A evicted), then A, whose first instruction is a misaligned load: #AC (the stop).
+        'miss-ac': ('    mov rax, cr0\n    bts rax, 18\n    mov cr0, rax\n    pushfq\n    or qword [rsp], 0x40000\n    popfq\n'
+                    f'    mov r15, {d + 0x7100:#x}\n' + c3('a0', A) + c3('a1', B) + c3('a2', C) + f'    mov r15, {d + 0x7101:#x}\n' + c3('a3', A)),
+    }
+
+
+def chunk_memory(name, i, n):
+    """The pages the chunk-1 programs add for CPU i (beyond `program`'s and `l1_memory`'s)."""
+    d = P.SYS_D(i)
+    mem = lambda at, data, **kw: dict({'addr': f'0x{at:x}', 'data': data.hex()}, **kw)
+    code = lambda at, k: mem(at, CODE(k), capture=False)
+    out = []
+    if name in ('page-global', 'page-user', 'page-user-invlpg', 'page-mark'):
+        out += [code(d + F1 + PY, 0x11), code(d + F2 + PY, 0x12), code(d + F1 + PZ, 0x21), code(d + F2 + PZ, 0x22)]
+    if name == 'page-cross':
+        out += [mem(d + PCX + 0xffe, b'\xb8\x07', capture=False), code(d + XA + 0x100, 0x11)]
+    if name == 'page-size-check':
+        t = P.SYS_T(i, 0)
+        out += links_memory('invlpg-large', i, n) + ([code(LF1 + LX + 0x100, 0x11)] if i == 0 else [])
+        out += [mem(t + 0x6000, b''.join(((LF1 + (o << 12)) | P.LEAF).to_bytes(8, 'little') for o in range(512)), capture=False)]
+    if name == 'page-counts':
+        out += [mem(d + F2 + 0x20 * j, P.asm(f'mov eax, {j}\njmp r13'), capture=False) for j in range(PCN)]
+    if name in STUB_PROGRAMS:
+        out += [mem(d + STUB['enter'], b'\x90', capture=False), mem(d + STUB['user'], b'\xff\xe3', capture=False), mem(d + STUB['exit'], b'\x90', capture=False),
+                mem(d + STUB['back'], b'\x41\xff\xe4', capture=False), mem(d + STUB['S'], CODE(0x21), capture=False), mem(d + STUB['S'] + PY, CODE(0x22), capture=False)]
+    if name in ('page-user', 'page-user-invlpg', 'miss-step', 'miss-dr7'):
+        out += [dict(P.zero(d + IDT, 0x1000), capture=False)]
+    if name in ('miss-step', 'miss-dr7'):
+        out += [P.zero(d + LOGP, 0x40)]
+    if name == 'miss-ac':
+        out += [mem(l1_pages(i)['FA'], P.asm('mov eax, [r15]\nmov eax, 1\njmp r13'), capture=False)]
+    return out
+
+
+def chunk_tables(name, i):
+    """(table A overrides, table B overrides) of the chunk-1 programs for CPU i."""
+    d = P.SYS_D(i)
+    a, b = {}, {}
+    if name == 'page-global':
+        a[d] = b[d] = (d + F1) | P.LEAF | G
+    if name == 'page-cross':
+        b[d + 0x3000], b[d + 0x4000] = (d + PCX) | P.LEAF, (d + XA) | P.LEAF
+    if name in STUB_PROGRAMS:
+        a.update({d + x: ((d + x) | P.LEAF) & ~US for x in (0x9000, STUB['back'], STUB['S'])})
+    return a, b
+
+
+# Natemu-only values (QEMU cannot switch CPL, and the record's answers are natemu's): the registers each program ends with.
+CHUNK_VALUES = {
+    'page-global': {'r8': {1}, 'r9': {0x11}, 'r10': {0x12}, 'r12': {0x21}, 'r14': {0x22}},
+    'page-user': {'r8': {1}, 'r9': {0}, 'r10': {0x21}, 'r14': {0x11}},
+    'page-user-invlpg': {'r8': {1}, 'r9': {0x12}, 'r10': {0x21}, 'rdi': {1}},
+    'page-mark': {'r8': {1}, 'r9': {0x11}, 'r10': {0x41}},
+    'page-size-check': {'r8': {1}, 'r9': {0x11}},
+    'page-counts': lambda i, k: {'r8': {sum(range(k))}},
+    'miss-system': lambda i, k: {'r8': {2 * k}},
+    'miss-ac': {},
+}
+# `page-check-keep` under the record: Y and Z are placed from F1's record. (`PAGE_VALUES` are the study resident's, where the walk answers.)
+PAGE_VALUES_ON = {'page-check-keep': {'r8': {1}, 'r9': {0x11}, 'r10': {0x21}}}
+# The page-currency mode a program always runs under (`--page-currency`): `local-gpa` asserts a link rule the record, legally, would answer
+# differently; the two check programs count differences. PAGE_FORCED_COUNTS: the disagreements they must show (k1.page.disagree).
+PAGE_FORCED = {'local-gpa': 'off', 'page-check-keep': 'check', 'page-size-check': 'check'}
+PAGE_FORCED_COUNTS = {'page-check-keep': 2, 'page-size-check': 1}
+# Under the default mode: least walks / hits / split_2m (k1.page) a program must show.
+PAGE_ON_COUNTS = {'page-share': {'hits': 2}, 'page-global': {'hits': 1}, 'page-large-edge': {'split_2m': 1}, 'page-cross': {'hits': 1},
+                  'page-mark': {'hits': 1}}
+# Further runs under another mode: (program, mode, disagreements, whether it is an adversarial program).
+PAGE_MODE_RUNS = (('local-gpa', 'check', 1), ('pf-fetch', 'check', 1))
+# The fast miss path's counts (k1.fast_miss) in a default run: taken at least; declined by reason at least; taken exactly none.
+FAST_TAKEN = {'miss-counts': 1, 'miss-pic': 1, 'miss-ac': 1}
+FAST_DECLINED = {'miss-system': ('system', 1), 'miss-step': ('debug', 1), 'miss-dr7': ('debug', 1)}
+FAST_NONE = ('miss-step', 'miss-dr7', 'miss-system')
+# A run that ends in a fault the program provokes: the stop and the vector.
+EXPECT_FAULT = {'page-user': 14, 'miss-ac': 17}
 # Natemu-only programs: (register, allowed values) per CPU; a function of the CPU for `walk`. In `global` the architecture
 # allows either frame for r9 and r10 (a kept global entry, or a miss); natemu keeps the block found global (K1), so 1.
 EITHER = {
@@ -1094,14 +1257,15 @@ EITHER = {
     'large-alias': {'r10': {1}, 'r8': {1}, 'r9': {2}},
     'large-reval': {'r8': {1}, 'r10': {1}, 'r9': {2}},
     **{f'large-{m}': {'r8': {m}, 'r9': {2}} for m in LM},
-    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic', *POOL)},
+    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic', 'miss-pic', *POOL)},
     # CPUID leaves differ from QEMU's: natemu only. Per round (K rounds): A once (and again at the end unless -x), B, and the
     # CPUID's way into B (eax = 2 from B's own code).
     'l1-dup': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {k}},
     'l1-dup-x': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {2 * k}},
     'link-full': {'r8': {3}, 'r9': {6}, 'r10': {12}, 'r12': {6}},
     'hint-reset': {'r8': {12}},
-    **{n: PAGE_VALUES[n] for n in PAGE_PROGRAMS},
+    **{n: PAGE_VALUES_ON.get(n, PAGE_VALUES[n]) for n in PAGE_PROGRAMS},
+    **{n: CHUNK_VALUES[n] for n in CHUNK_VALUES},
 }
 
 
@@ -1109,14 +1273,16 @@ def program(name, n, k):
     out = {'format': 'natemu-smp-v1', 'name': f'k1-{name}@{n}', 'ncpu': n, 'system': True, 'bodies': [], 'cpus': [], 'memory': [], 'params': {}}
     for i in range(n):
         d = P.SYS_D(i)
-        a = {d: (d + F1) | P.LEAF | (0x100 if name in ('global', 'place-global', 'local-write') else 0), d + 0x4000: (d + XA) | P.LEAF}
+        a = {d: (d + F1) | P.LEAF | (0x100 if name in ('global', 'place-global', 'local-write', 'page-global') else 0), d + 0x4000: (d + XA) | P.LEAF}
         if name == 'place-global':
             a[d + 0x3000] = (d + 0x3000) | P.LEAF | G
         if name == 'straddle':
             a[0x200000] = (d + XA) | P.LEAF
         b = {d: (d + F2) | P.LEAF}
+        ca, cb = chunk_tables(name, i)
+        a, b = {**a, **ca}, {**b, **cb}
         out['bodies'].append(P.body(P.SYS_CODE(i), P.sys_text(i, bodies(k, i, n)[name])))
-        out['cpus'].append(dict(P.cpu(i, P.SYS_CODE(i)), cpl=0))
+        out['cpus'].append(dict(P.cpu(i, P.SYS_CODE(i)), cpl=0, **({'switches': [(d + STUB['enter'], 3), (d + STUB['exit'], 0)]} if name in STUB_PROGRAMS else {})))
         tb = P.sys_tables(i, 1, n, b)
         extra = []
         if name == 'walk':
@@ -1145,8 +1311,8 @@ def program(name, n, k):
                       for f, at, k in ((LF1, CQ1, 1), (LF1, CQ2, 0x10), (LF2, CQ2, 0x20), (LF1, CQ3, 0x300), (LF2, CQ3, 0x400))] if i == 0 else []
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name == 'l1-pic' else [])
-            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL else [])
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name in ('l1-pic', 'miss-pic') else [])
+            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL or name in CHUNK_MISS else []) + chunk_memory(name, i, n)
             + (page_memory(name, i) if name in PAGE_PROGRAMS else []))
     return out
 
@@ -1310,6 +1476,42 @@ def page_counts(a, n, name, report):
     return [f'page {name}@{n}: {p}' for p in problems]
 
 
+def diff_counts(a, n, name, report):
+    """`page-counts` and `miss-counts` at K and 2K rounds: what the extra K rounds add (a difference: the setup cancels)."""
+    k, got, failures = a.k, {}, []
+    assert 2 * k <= PCN
+    for rounds in (k, 2 * k):
+        out, problems = run(a, program(name, n, rounds), [], None, None, f'-d{rounds}')
+        failures += [f'{name}@{n} k={rounds}: {p}' for p in problems]
+        got[rounds] = [c['stats']['k1'] for c in out['cpus']] if out else []
+    for v, (x, y) in enumerate(zip(got[k], got[2 * k])):
+        page = lambda f: y.get('page', {}).get(f, 0) - x.get('page', {}).get(f, 0)
+        fast, dec = y.get('fast_miss', {}), x.get('fast_miss', {})
+        if name == 'page-counts' and (page('hits'), page('walks')) != (k, 0):
+            failures.append(f'{name}@{n} cpu{v}: {k} more blocks added (hits, walks) {(page("hits"), page("walks"))}, want {(k, 0)}')
+        if name == 'miss-counts':
+            more = fast.get('taken', 0) - dec.get('taken', 0)
+            declined = sum(fast.get('declined', {}).values()) - sum(dec.get('declined', {}).values())
+            if (more, declined) != (3 * k, 0):
+                failures.append(f'{name}@{n} cpu{v}: {k} more rounds added (taken, declined) {(more, declined)}, want {(3 * k, 0)}')
+    report.append({'name': f'k1-{name}@{n}-diff', 'max_block': None, 'stats': None, 'problems': failures})
+    print(json.dumps(report[-1]), flush=True)
+    return failures
+
+
+def page_mode_run(a, n, name, mode, want, report):
+    """`name` under another page-currency mode: it must end where it does and show `want` disagreements."""
+    prog = adv_program(name, n) if name in adv_setup(0) else program(name, n, a.k)
+    out, problems = run(a, prog, [], None, None, f'-{mode}', page_mode=mode)
+    for v, c in enumerate(out['cpus'] if out else []):
+        got = c['stats']['k1'].get('page', {}).get('disagree', 0)
+        if got != want:
+            problems.append(f'cpu{v} page record disagreed {got} times under {mode}, want {want}')
+    report.append({'name': f'k1-{name}@{n}-{mode}', 'max_block': None, 'stats': None, 'problems': problems})
+    print(json.dumps(report[-1]), flush=True)
+    return [f'page {name}@{n} {mode}: {p}' for p in problems]
+
+
 def l1_counts(a, n, name, report):
     """`name`'s dispatcher misses on each vCPU, as differences of runs of the program (and its variants) at K and 2K rounds:
     the setup, the tails and the glue misses cancel. Returns the failures."""
@@ -1344,7 +1546,7 @@ def l1_counts(a, n, name, report):
     return [f'counts {f}' for f in failures]
 
 
-def run(a, prog, extra, host=None, runtime=None, tag='', check=True):
+def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=None):
     pooled = prog['name'][3:].split('@')[0] in POOL
     work = a.out / 'work' / f"{prog['name']}{tag}{'-1' if extra else ''}{'' if check else '-nocheck'}"
     full = prog['name'].startswith('k1-link-full@')
@@ -1362,10 +1564,12 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True):
         env.update(POOL_ENV.get(prog['name'][3:].split('@')[0], {}))
     if full and CAP < MAX_LINKS:   # (the host's NATEMU_LINK_CAP: unset = production capacity)
         env['NATEMU_LINK_CAP'] = str(CAP)
+    short = prog['name'].split('@')[0].split('-', 1)[1]
+    pmode = page_mode or PAGE_FORCED.get(short) or a.page_currency
+    options = options + ['--page-currency', pmode]
     rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env,
                              shape=check)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
-    short = prog['name'].split('@')[0].split('-', 1)[1]
     stop = EXPECT_STOP.get(short)
     for v, c in enumerate(out['cpus'] if out else []):
         end = s3.body_end(prog, smp.num(prog['cpus'][v]['rip']))
@@ -1374,7 +1578,24 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True):
                 problems.append(f"cpu{v} stopped {c['stop']} {c['reason']}, want {stop}")
         elif c['stop'] != 'reached' or smp.num(c['rip']) != end:
             problems.append(f"cpu{v} stopped {c['stop']} {c['reason']} at {c['rip']} (end {end:#x})")
+        if stop and short in EXPECT_FAULT and c['stop'] == stop[0] and smp.num(c['fault'][0]) != EXPECT_FAULT[short]:
+            problems.append(f"cpu{v} fault {c['fault']}, want vector {EXPECT_FAULT[short]}")
         problems += [f'cpu{v} ' + p for p in s3.per_vcpu_checks(c)]
+        # The page record's counters (k1.page) and the fast miss path's (k1.fast_miss), absent while zero.
+        k1 = c['stats']['k1']
+        pg, fm = k1.get('page', {}), k1.get('fast_miss', {})
+        if short in PAGE_FORCED_COUNTS and pg.get('disagree', 0) != PAGE_FORCED_COUNTS[short]:
+            problems.append(f"cpu{v} page record disagreed {pg.get('disagree', 0)} times, want {PAGE_FORCED_COUNTS[short]}")
+        if pmode == 'on' and not extra:
+            problems += [f'cpu{v} page {f} = {pg.get(f, 0)}, want at least {m}' for f, m in PAGE_ON_COUNTS.get(short, {}).items() if pg.get(f, 0) < m]
+        if not extra and os.environ.get('NATEMU_MISS_FAST') != 'off' and not os.environ.get('NATEMU_PIC_TEST'):
+            taken, declined = fm.get('taken', 0), fm.get('declined', {})
+            if taken < FAST_TAKEN.get(short, 0):
+                problems.append(f'cpu{v} fast miss path took {taken}, want at least {FAST_TAKEN[short]}')
+            if short in FAST_NONE and taken:
+                problems.append(f'cpu{v} fast miss path took {taken}, want none')
+            if short in FAST_DECLINED and declined.get(FAST_DECLINED[short][0], 0) < FAST_DECLINED[short][1]:
+                problems.append(f'cpu{v} fast miss declines {declined}, want {FAST_DECLINED[short]}')
         # Page-currency chunk 0: under a `page-study` resident every program's disagreements are counted (module docstring).
         ps = c['stats']['k1'].get('page_study')
         if ps:
@@ -1397,6 +1618,7 @@ def main():
     ap.add_argument('--page-runtime', type=pathlib.Path, help="a resident built with `--features page-study` for the page-currency counters (default: built into target/study here)")
     shard.add(ap)
     ap.add_argument('--full-links', action='store_true', help=f'link-full at the production link capacity ({MAX_LINKS} records: ~6 min at 1 vCPU, ~20 at 4) instead of the test capacity {LINK_CAP} (the end-of-round suite runs this once)')
+    ap.add_argument('--page-currency', default='on', choices=('on', 'off', 'check', 'check-halt'), help='the page record mode of every run (local-gpa and the check programs keep their own)')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
     a = ap.parse_args()
     set_link_cap(MAX_LINKS if a.full_links else LINK_CAP)
@@ -1483,6 +1705,11 @@ def main():
     for n in a.cpus:
         for name in [x for x in PAGE_RUNS if (n, x, int(x in adv_setup(0))) in mine and not os.environ.get('NATEMU_PIC_TEST')]:
             failures += page_counts(a, n, name, report)
+    for n in a.cpus:
+        for name in [x for x in ('page-counts', 'miss-counts') if (n, x, 0) in mine and not os.environ.get('NATEMU_PIC_TEST')]:
+            failures += diff_counts(a, n, name, report)
+        for name, mode, want in [m for m in PAGE_MODE_RUNS if (n, m[0], int(m[0] in adv_setup(0))) in mine]:
+            failures += page_mode_run(a, n, name, mode, want, report)
     for n in a.cpus:
         for name in [x for x in adv_setup(0) if (n, x, 1) in mine]:
             prog = adv_program(name, n)

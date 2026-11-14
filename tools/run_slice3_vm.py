@@ -283,6 +283,8 @@ def smp_description(prog):
     for c in prog['cpus']:
         lines += ['cpu', f"rip {smp.num(c['rip']):#x}", f"rflags {smp.num(c['rflags']):#x}", f"cpl {c.get('cpl', 3)}",
                   'gpr ' + ' '.join(f'{smp.num(v):#x}' for v in c['gpr'])] + (['sse 1'] if prog.get('sse') else [])
+        # (natemu only: the one-byte `nop` at ADDR runs as a CPL change to CPL, `ProgramHook`'s `switches`)
+        lines += [f'switch {smp.num(at):#x} {cpl}' for at, cpl in c.get('switches', [])]
     return '\n'.join(lines) + '\n'
 
 
