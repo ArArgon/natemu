@@ -415,14 +415,14 @@ def main():
     # the same bytes, not compared: `writable_code`) and under pinned QEMU as is (its code is writable there): QEMU translates the
     # rewritten bytes, so ref.py's check that it translated exactly the supplied bytes cannot hold and is skipped for
     # these programs. Their last flag writers define all six arithmetic flags (or none is written), so all are compared.
-    smc = smc_programs()
+    smc = shard.take(smc_programs(), a.shard)      # (QEMU runs only this shard's programs: these references are not cached)
     saved = ref.check_annotations
     ref.check_annotations = lambda p, log: []
     try:
         smc_results, _ = ref.run_programs([r for _, r, _ in smc], a.out / 'ref-smc', qemu)
     finally:
         ref.check_annotations = saved
-    for (program, reference, expected_gpr), result in shard.take(list(zip(smc, smc_results)), a.shard):
+    for (program, reference, expected_gpr), result in zip(smc, smc_results):
         end = ref.num(program['rip']) + len(program['code']) // 2
         for args in ([], ['1'], ['2']):
             cover = writable_code(program)
