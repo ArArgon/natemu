@@ -147,6 +147,18 @@ say df $(df -B1M --output=used / | tail -1) uptime=$(cut -d' ' -f1 /proc/uptime)
 def sh(*cmd, **kw): return subprocess.run([str(c) for c in cmd], check=True, **kw)
 
 
+def others():
+    """Other VMs running now (natemu, its test driver, QEMU) that are not this run's own: a timed run they overlap is
+    contended (recorded; its times are not comparable)."""
+    out = subprocess.run(['ps', '-axo', 'pid=,ppid=,command='], capture_output=True, text=True).stdout
+    mine = {os.getpid()}
+    rows = [l.split(None, 2) for l in out.splitlines() if len(l.split(None, 2)) == 3]
+    for _ in range(3):                                      # this runner's descendants
+        mine |= {int(p) for p, pp, _ in rows if int(pp) in mine}
+    return [c[:120] for p, _, c in rows if int(p) not in mine
+            and re.search(r'(/natemu|/natemu-host|qemu-system-x86_64)$', c.split()[0])]
+
+
 def serve_files(directory):
     """An HTTP server for `directory` on the host's LAN address and a free port (other runners use 8000): the server and
     the guest's "address:port"."""
@@ -296,10 +308,12 @@ def run(args):
             fcntl.flock(lock, fcntl.LOCK_EX)
             for phase, limit in (('use', args.limit), ('verify', 1800)):
                 print(f'{phase}: launching', flush=True)
+                before = others()
                 code, timed_out, seconds = launch(command(args, disk, args.out / 'compile-cache', phase), args.out, phase, host, limit)
+                contended = before + others()
                 r = judge(args.out, phase, code, timed_out)
                 r['problems'] += offline(disk, args.out, phase)
-                r.update(exit=code, seconds=seconds); result['phases'][phase] = r
+                r.update(exit=code, seconds=seconds, contended=contended); result['phases'][phase] = r
                 print(f'{phase}: exit {code} in {seconds}s, problems {r["problems"]}', flush=True)
                 if code != 0 or timed_out: break
     finally:
@@ -362,7 +376,7 @@ def profile(args):
     serve = args.out / 'serve'; serve.mkdir()
     (serve / 'io5.sh').write_text(PROFILE.replace('@PYTESTS@', PYTESTS).replace('@KSHA@', LINUX_SHA))
     server, host = serve_files(serve)
-    windows, ok, allocated = {}, True, {}
+    windows, ok, allocated, contended = {}, True, {}, {}
     try:
         time.sleep(1); assert server.poll() is None, 'http server'
         with open(args.lock, 'a') as lock:
@@ -370,7 +384,11 @@ def profile(args):
             for step in args.steps:
                 disk = args.out / f'disk-{step}.raw'; sh('cp', '-c', args.snapshot, disk); disk.chmod(0o644)   # the snapshot is read-only
                 cache = args.out / f'compile-cache-{step}'          # cold: a new cache per boot
+                before = others()
                 code, timed_out, seconds = launch(command(args, disk, cache, step), args.out, step, host, args.limit)
+                if before or others():
+                    contended[step] = before + others()
+                    print(f'  {step}: CONTENDED by {contended[step]}', flush=True)
                 logs = args.out / f'guest-{step}'; logs.mkdir()   # the guest's step logs, before the clone goes
                 subprocess.run([E2 / 'debugfs', '-R', f'rdump /root/io5p {logs}', f'{disk}?offset={ROOT_OFFSET}'], capture_output=True)
                 allocated[step] = disk.stat().st_blocks * 512
@@ -391,6 +409,7 @@ def profile(args):
     write_json(args.out / 'profile.json', {'steps': args.steps, 'snapshot': str(args.snapshot), 'runtime': str(args.runtime),
                                            'mitigations_off': args.mitigations_off, 'ok': ok,
                                            'allocated': allocated, 'snapshot_allocated': args.snapshot.stat().st_blocks * 512,
+                                           'contended': contended,
                                            'command': [str(c) for c in command(args, 'DISK', 'CACHE', 'STEP')]})
     print('OK' if ok else 'FAILED', args.out)
     return 0 if ok else 1
@@ -421,7 +440,8 @@ def main():
     f.add_argument('--mitigations-off', action='store_true'); f.add_argument('--speculation-barriers', action='store_true')
     f.add_argument('--lock', type=Path, default=VM_LOCK)
     f.add_argument('--no-perf-log', dest='perf_log', action='store_false', help='timing only (no timing log, no request logs)')
-    f.set_defaults(backend='natemu', perf_log=True)
+    f.add_argument('--backend', choices=('natemu', 'qemu'), default='natemu', help='qemu: the same steps under QEMU (no timing log)')
+    f.set_defaults(perf_log=True)
     args = a.parse_args()
     if args.cmd == 'prepare': prepare(args.inputs); return 0
     if args.cmd == 'profile': signal.signal(signal.SIGTERM, lambda *_: sys.exit(3)); return profile(args)
