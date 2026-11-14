@@ -5732,9 +5732,21 @@ mod tests {
         let (second, b1) = block(&mut c1, 0x50_1000);
         assert_eq!(second, Some(Published::Already));
         assert_eq!((c1.hits, c1.compiles, c0.compiles), (1, 0, 1));
-        // A step request is not a template, and a non-template is not published.
-        c0.last = None;
-        assert_eq!(c0.publish(false, context, 0x40_1000, &b0, 0), None);
+        // A request the host did not find a template (the answer is in hand, `last` set): not published, and `last` is spent.
+        let Code::Block(again) = c0.compile(&bytes, 0x40_1000, false, &mut ()).unwrap() else {
+            panic!()
+        };
+        assert!(c0.last.is_some());
+        assert_eq!(c0.publish(false, context, 0x40_1000, &again, 0), None);
+        assert!(c0.last.is_none());
+        // The same hit as a template: the answer is in the ring already (and published nowhere twice).
+        let Code::Block(again) = c0.compile(&bytes, 0x40_1000, false, &mut ()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            c0.publish(true, context, 0x40_1000, &again, 0),
+            Some(Published::Already)
+        );
         let pool = publisher.pool();
         let mut staging = vec![0; natemu_abi::pool::MAX_ENTRY_BYTES];
         let e = pool.fetch(at, &mut staging).unwrap();
@@ -5760,6 +5772,170 @@ mod tests {
             block(&mut c0, 0x60_1000)
         };
         assert_eq!(third, Some(Published::Skipped(crate::publisher::Why::Off)));
+    }
+
+    /// A CPL-3 CPU at `rip` as the fetch tests use.
+    fn test_cpu(rip: u64) -> Cpu {
+        Cpu {
+            gpr: [0; 16],
+            rip,
+            rflags: 2,
+            cr0: 0,
+            cr3: 0,
+            cr4: 0,
+            efer: 0,
+            cpl: 3,
+            fs_base: 0,
+            gs_base: 0,
+            cr2: 0,
+            cr8: 0,
+            dr: exec::DR_RESET,
+            seg: exec::flat_segments(3),
+            ldtr: exec::LDTR_RESET,
+            tr: exec::TR_RESET,
+            gdtr: exec::TABLE_RESET,
+            idtr: exec::TABLE_RESET,
+            mov_ss: 0,
+            xmm: [[0; 2]; 16],
+            mxcsr: exec::MXCSR_RESET,
+            fcw: exec::FCW_INIT,
+            xcr0: 1,
+        }
+    }
+
+    /// The template pool through the request path (`translation`, with the real fexc, `FEXC`): a template request is
+    /// published after its block is staged and its context's gating values are noted; a step, a block cut at a limit and a block
+    /// whose answer read to the end of the bytes are not published (a step is not even noted); a context whose gating
+    /// differs turns the pool off, or is a host error under the check mode.
+    #[test]
+    fn translation_publishes_templates_only_and_notes_gating() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let memory = Memory::with_size(exec::BACKING_BYTES + (2 << 20)).unwrap();
+        let ram =
+            unsafe { GuestRam::new(0, 2 << 20, memory.0 as u64 + exec::BACKING_BYTES as u64) };
+        let area = Area {
+            memory: &memory,
+            vcpu: 0,
+            vcpus: 1,
+            epoch: 0,
+            base: 0,
+            ram,
+        };
+        let mut code = vec![0x48, 0x01, 0xd8, 0xc3];
+        code.resize(64, 0x90);
+        assert!(ram.copy_in(0x5000, &code) && ram.copy_in(0x5ffc, &code[..4]));
+        let fresh = || {
+            let layout = natemu_abi::pool::Layout {
+                index_slots: 64,
+                ring_bytes: 1 << 20,
+                control_bytes: 128,
+            };
+            let m = Arc::new(Memory::with_size(layout.span_bytes()).unwrap());
+            let p = Arc::new(crate::publisher::Publisher::with_layout(m, 0, layout));
+            let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            c.pool = Some(p.clone());
+            (c, p)
+        };
+        let published = |p: &crate::publisher::Publisher| {
+            let r: serde_json::Value =
+                serde_json::from_str(p.report().strip_prefix("pool ").unwrap()).unwrap();
+            r["published"].as_u64().unwrap()
+        };
+        let request = |c: &mut Compiler, rip: u64, step: bool, stop_at: Option<u64>| {
+            let mut s = State::new(0, test_cpu(rip));
+            s.fetch = [0x5000, u64::MAX];
+            let reply = translation(area, c, &mut s, step, stop_at, &mut Requests::default(), &mut ());
+            (reply.unwrap().unwrap(), s.cpu.code_context())
+        };
+        // A template: published, its context noted.
+        let (mut c, p) = fresh();
+        let (reply, context) = request(&mut c, 0x40_1000, false, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!(published(&p), 1);
+        assert!(p.gating_of(context).is_some(), "a block request notes its context's gating");
+        // A step request (its gating values are another vector's) is neither noted nor published.
+        let (mut c, p) = fresh();
+        let (reply, context) = request(&mut c, 0x40_1000, true, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!((published(&p), p.gating_of(context)), (0, None));
+        // A block cut at a limit (the stop RIP inside its bytes) is no template; the request is still noted.
+        let (mut c, p) = fresh();
+        let (reply, context) = request(&mut c, 0x40_1000, false, Some(0x40_1008));
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!(published(&p), 0);
+        assert!(p.gating_of(context).is_some());
+        // The answer read to the end of the bytes the walk gave (the block ends at its page's end, the next not walked).
+        let (mut c, p) = fresh();
+        let (reply, _) = request(&mut c, 0x40_1ffc, false, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert_eq!(published(&p), 0);
+        // The same request, the first template again: a hit published once (by whichever request reaches it first).
+        let (mut c, p) = fresh();
+        request(&mut c, 0x40_1000, false, None);
+        request(&mut c, 0x50_1000, false, None);
+        assert_eq!((published(&p), c.hits), (1, 1));
+        // Another vector under a context the pool knows: off (the reply is still the block); a host error under the check.
+        let (mut c, p) = fresh();
+        let (_, context) = request(&mut c, 0x40_1000, false, None);
+        assert!(p.note(context, &[1; GATING]) == false && p.is_off());
+        let (mut c, p) = fresh();
+        let context = test_context();
+        assert!(p.note(context, &[1; GATING]));
+        c.check_reuse = true;
+        let mut s = State::new(0, test_cpu(0x40_1000));
+        s.fetch = [0x5000, u64::MAX];
+        let e = translation(area, &mut c, &mut s, false, None, &mut Requests::default(), &mut ())
+            .err()
+            .unwrap();
+        assert!(e.contains("pool: gating values"), "{e}");
+        c.check_reuse = false;
+        c.noted.clear();
+        let (reply, _) = request(&mut c, 0x40_1000, false, None);
+        assert_eq!(reply, exec::REPLY_ADMITTED);
+        assert!(p.is_off());
+        assert_eq!(published(&p), 0);
+    }
+    fn test_context() -> u64 {
+        test_cpu(0).code_context()
+    }
+
+    /// The pool's backing with guest RAM above the PC hole: the high alias is mapped at the shifted offset too, and the span
+    /// is before all RAM (only touched pages are ever backed).
+    #[test]
+    fn high_guest_ram_follows_the_pool_too() {
+        let path =
+            std::env::temp_dir().join(format!("natemu-pool-high-{}.elf", std::process::id()));
+        std::fs::write(
+            &path,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
+        let ram = exec::LOW_RAM_END as usize + (2 << 20);
+        for pool in [false, true] {
+            let b = prepare_with_pool(path.to_str().unwrap(), cache::CODE_BYTES, 1, ram, pool)
+                .unwrap();
+            let span = if pool { cache::POOL_BYTES } else { 0 };
+            let ram_offset = b.stride + span;
+            assert_eq!(b.memory.1, ram_offset + exec::ram_end(ram as u64) as usize);
+            // The high alias's first block: the third GiB table is RAM's low part, the high part starts 4 GiB up.
+            let high = (exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize;
+            let d = u64::from_le_bytes(b.memory.read::<8>(
+                exec::RAM_TABLES_OFFSET + ((high >> 30) - 1) * 4096 + (high % (1 << 30)) / cache::BLOCK * 8,
+            ));
+            assert_eq!(
+                d & 0x0000_ffff_ffe0_0000,
+                crate::IPA + (ram_offset + exec::HIGH_RAM_START as usize) as u64
+            );
+            // And the host's own view: a page written through `ram` above the hole lands there.
+            assert!(b.ram.copy_in(exec::HIGH_RAM_START, &[0x5a; 8]));
+            assert_eq!(
+                b.memory.read::<8>(ram_offset + exec::HIGH_RAM_START as usize),
+                [0x5a; 8]
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     /// The bytes come only from the pages the resident walked: RIP's page to its end (more may follow until the next

@@ -36,8 +36,11 @@ pub(crate) struct Template<'a> {
 pub(crate) enum Published {
     /// At this position.
     Done(u64),
-    /// Kept in the ring still, from an earlier publication.
+    /// Kept in the ring still, from an earlier publication under this context.
     Already,
+    /// Kept in the ring still, but published under another context: the key includes the context, so it is not found for
+    /// this one, and it is not published again (two contexts using one answer would ping-pong). Counted.
+    OtherContext,
     /// Not published.
     Skipped(Why),
 }
@@ -53,11 +56,30 @@ pub(crate) enum Why {
     Malformed,
 }
 
+/// An answer's publication cell: the position it was last published at (below 2^46) and, above bit 48, a hash of the context it
+/// was published under.
+const CELL_POSITION: u64 = (1 << 48) - 1;
+fn context_tag(context: u64) -> u64 {
+    context.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48 << 48
+}
+/// What the cell `before` says of a template under `context`, with the ring's `tail`: `None` when it is not in the ring.
+fn in_ring(before: u64, tail: u64, context: u64) -> Option<Published> {
+    let position = before & CELL_POSITION;
+    (position != 0 && position >= tail).then(|| {
+        if before & !CELL_POSITION == context_tag(context) {
+            Published::Already
+        } else {
+            Published::OtherContext
+        }
+    })
+}
+
 #[derive(Default)]
 struct Counts {
     published: AtomicU64,
     bytes: AtomicU64,
     already: AtomicU64,
+    other_context: AtomicU64,
     off: AtomicU64,
     unpackable: AtomicU64,
     too_big: AtomicU64,
@@ -118,6 +140,11 @@ impl Publisher {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+    /// The first gating vector a block request of `context` carried (tests).
+    #[cfg(test)]
+    pub(crate) fn gating_of(&self, context: u64) -> Option<[u64; GATING]> {
+        self.state().gating.get(&context).copied()
+    }
     /// The pool as a reader sees it (tests; the resident maps the same span).
     #[cfg(test)]
     pub(crate) fn pool(&self) -> Pool {
@@ -163,6 +190,7 @@ impl Publisher {
         match result {
             Published::Done(_) => {}
             Published::Already => drop(c.already.fetch_add(1, Relaxed)),
+            Published::OtherContext => drop(c.other_context.fetch_add(1, Relaxed)),
             Published::Skipped(Why::Off) => drop(c.off.fetch_add(1, Relaxed)),
             Published::Skipped(Why::Unpackable) => drop(c.unpackable.fetch_add(1, Relaxed)),
             Published::Skipped(Why::TooBig) => drop(c.too_big.fetch_add(1, Relaxed)),
@@ -176,9 +204,8 @@ impl Publisher {
         }
         // Still in the ring: published at a position not below the tail (the usual case of a hit: no lock, no encoding). Checked
         // again under the lock, where another vCPU's publication of the same answer may have happened meanwhile.
-        let before = once.load(Relaxed);
-        if before != 0 && before >= self.pool.tail() {
-            return Published::Already;
+        if let Some(seen) = in_ring(once.load(Relaxed), self.pool.tail(), t.context) {
+            return seen;
         }
         let o = &t.block.object;
         let Some(h) = crate::relocation::read::<Header>(o, 0) else {
@@ -206,9 +233,8 @@ impl Publisher {
             ..
         } = &mut *state;
         // The entry is still in the ring: published at a position not below the tail.
-        let before = once.load(Relaxed);
-        if before != 0 && before >= writer.tail() {
-            return Published::Already;
+        if let Some(seen) = in_ring(once.load(Relaxed), writer.tail(), t.context) {
+            return seen;
         }
         // The packed relocations, in increasing order as the resident's copies keep them (`cache::place`); one that cannot be
         // packed ([`pack_reloc`]: `None`) makes the object no template for the resident.
@@ -239,7 +265,7 @@ impl Publisher {
         };
         match writer.publish(&parts, scratch) {
             Ok(position) => {
-                once.store(position, Relaxed);
+                once.store(position | context_tag(t.context), Relaxed);
                 self.counts.published.fetch_add(1, Relaxed);
                 self.counts
                     .bytes
@@ -258,6 +284,7 @@ impl Publisher {
             published: u64,
             bytes: u64,
             already: u64,
+            other_context: u64,
             skipped_off: u64,
             skipped_unpackable: u64,
             skipped_too_big: u64,
@@ -274,6 +301,7 @@ impl Publisher {
             published: c.published.load(Relaxed),
             bytes: c.bytes.load(Relaxed),
             already: c.already.load(Relaxed),
+            other_context: c.other_context.load(Relaxed),
             skipped_off: c.off.load(Relaxed),
             skipped_unpackable: c.unpackable.load(Relaxed),
             skipped_too_big: c.too_big.load(Relaxed),
@@ -401,7 +429,7 @@ mod tests {
         let Published::Done(at) = p.publish(&once, &template(&b, 0x7fff_0000_1000, &PREFIX)) else {
             panic!()
         };
-        assert_eq!(once.load(Relaxed), at);
+        assert_eq!(once.load(Relaxed) & CELL_POSITION, at);
         let pool = p.pool();
         let key = Key::new(3, 0x1000, &PREFIX, LEAD);
         assert!(pool.probe(&key).contains(&at));
@@ -466,7 +494,7 @@ mod tests {
         let Published::Done(again) = p.publish(&once, &template(&b, 0x2000, &PREFIX)) else {
             panic!()
         };
-        assert!(again > first && once.load(Relaxed) == again);
+        assert!(again > first && once.load(Relaxed) & CELL_POSITION == again);
         let r = report(&p);
         assert_eq!(r["published"], n + 2);
         assert_eq!(r["already"], n + 1);
@@ -510,6 +538,25 @@ mod tests {
                 r["skipped_malformed"].as_u64()
             ],
             [Some(4), Some(1), Some(2)]
+        );
+    }
+
+    /// An answer published under one context and used under another is not published again, and is counted.
+    #[test]
+    fn an_answer_used_under_another_context_is_counted_not_published() {
+        let p = publisher(LAYOUT);
+        let b = block(object(&code(), 0, &[]));
+        let once = AtomicU64::new(0);
+        let (mut a, mut other) = (template(&b, 0x1000, &PREFIX), template(&b, 0x1000, &PREFIX));
+        other.context = 4;
+        assert!(matches!(p.publish(&once, &a), Published::Done(_)));
+        assert_eq!(p.publish(&once, &other), Published::OtherContext);
+        a.context = 3;
+        assert_eq!(p.publish(&once, &a), Published::Already);
+        let r = report(&p);
+        assert_eq!(
+            (r["published"].as_u64(), r["other_context"].as_u64()),
+            (Some(1), Some(1))
         );
     }
 
