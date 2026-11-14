@@ -6,10 +6,16 @@
 // a `Deliver` callback instead of an interrupt source group, no snapshot/migration, trigger() added (from
 // virtio-devices/src/transport/pci_device.rs). Divergences from upstream's behaviour: MsixCap::new leaves Enable
 // clear (PCI 3.0 6.8.2.3); set_msg_ctl delivers pending vectors when MSI-X becomes enabled and unmasked, not when
-// the function mask clears (PCI 3.0 6.8.2.3, 6.8.2.9). Upstream items natemu does not use are kept, hence the allow below.
+// the function mask clears (PCI 3.0 6.8.2.3, 6.8.2.9); an optional bus-master gate (`set_gate`) holds every message,
+// sent or released, while the function's Bus Master bit is clear (PCI 3.0 6.2.2: no memory write, and an MSI is one),
+// and `release_pending` sends what became deliverable when it sets. Upstream items natemu does not use are kept, hence
+// the allow below.
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering::SeqCst},
+};
 use std::{io, result};
 
 use super::configuration::{PciCapability, PciCapabilityId};
@@ -73,6 +79,8 @@ pub struct MsixConfig {
     deliver: Deliver,
     masked: bool,
     enabled: bool,
+    /// natemu: the function's Bus Master bit (None: always set, as upstream).
+    gate: Option<Arc<AtomicBool>>,
 }
 
 impl MsixConfig {
@@ -92,6 +100,7 @@ impl MsixConfig {
             deliver,
             masked: true,
             enabled: false,
+            gate: None,
         })
     }
 
@@ -113,11 +122,30 @@ impl MsixConfig {
         // nothing is sent while MSI-X is disabled and enabling with the mask clear releases pending vectors
         // (PCI 3.0 6.8.2.3, 6.8.2.9). When that happens it is important to go through the entire PBA to check if
         // there was any pending MSI-X message to inject, given that the vector is not masked.
-        if !was_active && self.enabled && !self.masked {
-            for (index, entry) in self.table_entries.clone().iter().enumerate() {
-                if !entry.masked() && self.get_pba_bit(index as u16) == 1 {
-                    self.inject_msix_and_clear_pba(index);
-                }
+        if !was_active {
+            self.release_pending();
+        }
+    }
+
+    /// natemu: messages wait while `gate` is clear (the function's Bus Master bit).
+    pub fn set_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.gate = Some(gate);
+    }
+
+    /// natemu: the function may send a message now: bus mastering on (PCI 3.0 6.2.2).
+    fn may_send(&self) -> bool {
+        self.gate.as_ref().is_none_or(|g| g.load(SeqCst))
+    }
+
+    /// Send every pending vector whose entry is unmasked, if MSI-X is enabled, the function unmasked and the gate set
+    /// (upstream's loop from set_msg_ctl; natemu also calls it when bus mastering turns on).
+    pub fn release_pending(&mut self) {
+        if !self.enabled || self.masked || !self.may_send() {
+            return;
+        }
+        for (index, entry) in self.table_entries.clone().iter().enumerate() {
+            if !entry.masked() && self.get_pba_bit(index as u16) == 1 {
+                self.inject_msix_and_clear_pba(index);
             }
         }
     }
@@ -254,6 +282,7 @@ impl MsixConfig {
         // Check if bit has been flipped
         if !self.masked()
             && self.enabled()
+            && self.may_send()
             && old_entry.masked()
             && !table_entry.masked()
             && self.get_pba_bit(index as u16) == 1
@@ -357,9 +386,10 @@ impl MsixConfig {
     /// A device interrupt on `vector` (natemu addition; upstream has this in the virtio transport's
     /// `VirtioInterruptMsix::trigger`). Delivers the entry's message, or sets its pending bit when the entry or the
     /// function is masked (the unmask paths above then deliver it once). Does nothing while MSI-X is disabled or for
-    /// a vector beyond the table.
+    /// a vector beyond the table, or while the gate is clear (natemu: no message and nothing pending without bus
+    /// mastering).
     pub fn trigger(&mut self, vector: u16) {
-        if !self.enabled || usize::from(vector) >= self.table_entries.len() {
+        if !self.enabled || !self.may_send() || usize::from(vector) >= self.table_entries.len() {
             return;
         }
         // In case the vector control register associated with the entry has its first bit set, this means the
