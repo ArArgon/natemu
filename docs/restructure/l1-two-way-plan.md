@@ -82,20 +82,31 @@ For set `s` of `rip`, slots `w0 = 2s`, `w1 = 2s + 1`:
    differ); return. (Both ways are checked so a block is never in both.)
 2. Else if `owner(w0) == 0`: fill w0. Else if `owner(w1) == 0`: fill w1.
 3. Else the victim is w1 if `L1_NEXT` is set in w0's word, else w0; fill it and flip `L1_NEXT`. (`dispatch-study` counts
-   `L1_EVICTED` here, as today.)
+   `L1_EVICTED` here, as today, and a new `L1_NEW_CONFLICT` when the victim's RIP equals the filled RIP in bits 14:0 but
+   not in bit 15: a conflict today's 16-bit index did not have, section 6.)
 Filling a slot is today's work: list it if unlisted and the block non-global, write the owner (preserving the set's
-`L1_NEXT` when the slot is w0), write the eight words of its way, one `synchronize_code` over its 32 bytes. Both owners
-are current when step 3 runs: a non-current owner's slot was emptied by the CR3 pass or by `cut_one` already.
+`L1_NEXT` when the slot is w0), write the eight words of its way, one `synchronize_code` over its 32 bytes. Which way is
+the victim is a hint for performance only, never a correctness condition: whichever slot is overwritten, its owner is
+written first and its words after, as today (section 4, point 4).
 
 ### 3.4 Empty, kill, clear, lists
 
-- `cut_one`: for the block's set in every table, empty **each** slot whose owner is the block (a loop over the two
-  slots) and synchronize; an emptied way 0 gets `b set + 32`, an emptied way 1 `b DISPATCH_MISS`.
-- `tlb`'s CR3 pass: unchanged; the lists hold slot indices, `empty_l1(t, i)` picks the empty word by `i & 1`.
+- `cut_one`: today it takes the one index `rip & L1_MASK` and empties it where the owner is the block (`:2325-2332`);
+  now, for the block's set in every table, it loops over **both** slots and empties each whose owner is the block,
+  keyed on the owner, then synchronizes; an emptied way 0 gets `b set + 32`, an emptied way 1 `b DISPATCH_MISS`.
+- **Every raw owner read masks or preserves `L1_NEXT`**: `l1_block` masks `L1_LISTED | L1_NEXT`; `fill_l1`'s read of the
+  listed bit and its owner write keep `L1_NEXT`; `empty_l1` keeps both bits; `tlb`'s CR3 pass reads the owner through
+  `l1_block` before `block(owner - 1)` (`:710-711`), never raw (a raw read with the bit set would index block 2^30 and
+  halt or read garbage at the first CR3 load).
+- `tlb`'s CR3 pass: otherwise unchanged; the lists hold slot indices, `empty_l1(t, i)` picks the empty word by `i & 1`.
 - `clear_l1`: unchanged but for the per-way empty word; `synchronize_l1` covers the same 2 MiB.
 - `empty_l1(t, i)`: writes the way's empty word (`i & 1` decides) and keeps `L1_LISTED | L1_NEXT` in the owner.
 - `count_miss` (`dispatch-study`): classify by both slots of the set (`MISS_OTHER` only if neither holds the RIP;
   `MISS_SAME` if one does).
+- Constants: the abi assertion that ties `L1_BITS <= 16` to the 32-byte entry (`crates/abi/src/execution.rs:983`) is
+  rewritten for sets and ways (`L1_SET_BITS` = 15, `L1_WAYS` = 2, slot count 2^16, set bytes 64); `main.rs:33`'s
+  `l1_mask` template operand becomes the set mask; `L1_MASK`'s remaining users (`fill_l1`, `cut_one`, `count_miss`) go
+  through one `l1_slots_of(rip) -> (w0, w1)` helper.
 
 ### 3.5 Code synchronization
 
@@ -117,8 +128,8 @@ complete way 0.
   prologue with their own x0, which writes their own page base.
 - **Step block**: its computed exit is `b DISPATCH_MISS` (`:1312-1316`), unchanged.
 - **The fast-miss plan's test preludes** evict a block "with a block at V + 64 KiB"; under two ways that no longer
-  evicts (both fit). Those preludes need two evictors in the set (V + 64 KiB and V + 128 KiB, or V + 32 KiB and
-  V + 64 KiB); noted here for that plan's edit when it is built.
+  evicts (both fit). Those preludes need two evictors in V's set, and under the 15-bit index V + 32 KiB is in V's set
+  too (V + 32 KiB and V + 64 KiB, or V + 64 KiB and V + 128 KiB); noted here for that plan's edit when it is built.
 
 ## 4. Correctness
 
@@ -150,7 +161,7 @@ an empty slot branches to:
 | Event | Change |
 | --- | --- |
 | way-0 L1 hit | none (11 instructions) |
-| way-1 L1 hit | +6 instructions, one more taken branch: about +1-2 ns on a 3-4 ns transfer |
+| way-1 L1 hit | +6 instructions and one more taken branch, which the predictor may miss when the same dispatcher site alternates ways: about +1-2 ns predicted, about +4 ns mispredicted, on a 3-4 ns transfer |
 | dispatcher miss | +6 instructions before the `svc`: about +1-2 ns on a 300-500 ns event |
 | `fill_l1` | +1 owner load (the other way), the `L1_NEXT` read and flip: a few ns on about 60-100 ns |
 | `cut_one` | +1 owner load per table |
@@ -161,14 +172,23 @@ an empty slot branches to:
 
 A conflict miss into a current block costs the gate (about 70 ns, in `guest`) + `miss` 315 ns + one `lookup` probe 35
 ns + `enter` and `enter_copy` 80 ns = about **0.5 us on make**, and 70 + 220 + 27 + 73 = about **0.39 us on configure**
-(`natemu-raw/group-r1-profile-2`). The count's f for 2^15 sets is an upper bound (0.876 make, 0.893 configure); the
-exact 2^18 direct-mapped figure (0.756 / 0.692) is taken as the floor, since the two-way table serves every pair the
-larger table serves.
+(`natemu-raw/group-r1-profile-2`).
 
-- make: 88.6 M x (0.76-0.88) x 0.5 us = **34-39 vCPU-s of 561.5 busy (6-7%)**, about 8-9.5 s of 139 s wall; less the
-  way-1 hits' cost: unmeasured (no hit counter exists); if way-1 hits are a third of about 2.5 G dispatcher hits at
-  +1.5 ns, about 1.2 vCPU-s; and the misses' +6 instructions, under 0.1 vCPU-s.
-- configure: 5.5 M x (0.69-0.89) x 0.39 us = **1.5-1.9 s of 109.5 (1.4-1.7%)**, about the same in wall time (serial).
+**f has no lower bound from the count.** Two ways at 2^15 sets drop index bit 15: RIPs that sit in different 16-bit
+entries today (A and A + 32 KiB) share a set tomorrow. Three hot RIPs A, A + 32 KiB, A + 64 KiB taken in turn miss
+twice per round today (A and A + 64 KiB collide, A + 32 KiB has its own entry) and three times per round under
+two-way fill-order replacement (all three cycle through one set). The count simulated hits for today's misses only; it
+could not see misses that are hits today, so 0.876 (make) / 0.893 (configure) is an upper bound and the 2^18
+direct-mapped figure (0.756) is **not** a floor: the two-way table at 2^15 sets does not contain the 2^18 table's
+entries. The study's histograms are per 16-bit index (`tools/l1_study_an.py`, bins `hit_*` and the k-blocks-per-index
+rows), so the live-RIPs-per-15-bit-set distribution cannot be derived from them; chunk 1 counts the new conflicts
+instead (section 8: fills whose victim's RIP differs from the filled RIP in bit 15 alone).
+
+- make: **up to 88.6 M x 0.876 x 0.5 us = 39 vCPU-s of 561.5 busy (7%)**, about 9.5 s of 139 s wall; the plausible
+  figure is below that by the new conflicts (unknown) and the way-1 hits' cost (unmeasured: no hit counter exists; if
+  way-1 hits are a third of about 2.5 G dispatcher hits at +1.5-4 ns, about 1.2-3.3 vCPU-s), and the misses' +6
+  instructions, under 0.1 vCPU-s.
+- configure: **up to 5.5 M x 0.893 x 0.39 us = 1.9 s of 109.5 (1.7%)**, about the same in wall time (serial).
 
 The fast-miss plan's make pool shrinks to (1 - f) x 88.6 M; its gate is recomputed there (its section 7, step 3).
 
@@ -177,8 +197,11 @@ The fast-miss plan's make pool shrinks to (1 - f) x 88.6 M; its gate is recomput
 1. **Doubling the direct-mapped table** (2^17 or 2^18 entries): 53% / 76% of the conflicts for 2x / 4x the memory in
    a code area that is the capacity limit (88% full on make; 10 capacity flushes per run); the count shows pairs, which
    a second way catches at no memory.
-2. **Two ways at 2^16 sets** (4 MiB per table): 92% against 88% for 8 MiB more per vCPU out of the code area (decision
-   21: about 2 vCPU-s more on make for a likely extra capacity flush).
+2. **Two ways at 2^16 sets** (4 MiB per table): the exact 0.92, and it keeps every one of today's 16 index bits, so it
+   creates no new conflicts (section 6's risk does not apply to it); it costs 8 MiB more per vCPU out of a code area
+   whose make peak is 118 of 134 MB (16 MB of headroom today; 8 MB after). Rejected as the first build on memory
+   grounds (decision 21), **not** on the count: if the 2^15 variant misses its gate because of new conflicts, this is
+   the first fallback (section 9), measured for capacity flushes as well as misses.
 3. **MRU replacement** (promote the hit way): a store on every L1 hit, in generated code's hottest glue; fill-order
    needs one bit written by the resident only.
 4. **Moving way 0 to way 1 on a fill** (always fill way 0): rewrites sixteen words and synchronizes two lines per fill
@@ -202,15 +225,21 @@ review before the gate).**
   - `l1-pair` (QEMU values, natemu counts): warm A and B; K rounds A, B by `jmp r13`: values per k; misses 0 after the
     first round (the pair fits). The same with A and D.
   - `l1-triple` (QEMU values, natemu counts): K rounds A, B, C: fill-order replacement gives exactly 3 misses per round
-    (asserted); then rounds A, B, A, B after C: 0 misses after the first (C's way was the older).
+    (asserted); then rounds A, B, A, B after C (the set holds C in way 0 and B in way 1, way 1 the older): A misses and
+    replaces B, B misses and replaces C, then 0 misses (asserted: exactly 2 in that first round).
   - `l1-pair-invlpg` (QEMU): A in way 0, B in way 1; B's page remapped and INVLPG; `jmp r13` to B: the new frame's bytes.
     Also with the roles swapped (A remapped).
   - `l1-pair-cr3` (QEMU): A, B warm under table A; CR3 to table B where B's RIP maps other bytes: B's own bytes; back
     under A: A's bytes (the listed-entry pass emptied the way-1 slot).
   - `l1-pair-write` (QEMU): B's frame rewritten through its data alias; `jmp r13` to B: the new bytes (the kill emptied
     B's slot whichever way held it). Then the same with A, which is in way 0 with `L1_NEXT` set.
-  - `l1-global` (natemu counts): A global (PGE, G set), B not: a CR3 reload empties B's slot only; A hits after it, B
-    misses once.
+  - `l1-global` (natemu counts): B (non-global) filled first, into way 0; then A (global, PGE, G set) into way 1; a CR3
+    reload empties way 0 (listed) and leaves way 1: A must then hit with 0 misses (asserted), B misses once. A mutant
+    whose empty way 0 branches to the miss makes A miss every time.
+  - `l1-dup` (natemu counts): B in way 1 with `L1_NEXT` pointing at way 0 (fill A, then B; then fill A again into
+    nothing: the bit now names way 0); then a resident entry that ends at B without a dispatcher miss (a kept CPUID
+    just before B, or a linker target landing on B): `fill_l1` runs for B while B is in way 1. Afterwards A must still
+    hit (0 misses asserted). A mutant that checks "already there" on way 0 only duplicates B over A and A misses.
   - `l1-pic` (natemu): two PIC instances of one translation at ASLR aliases sharing a set: each runs with its own page
     base (`lea [rel]` values, as `reuse-alias`).
   - `contexts` extended: `CQ3` = LP + 0x1b1000 joins `CQ1`, `CQ2` so the three share a set and evict (today's pair no
@@ -219,35 +248,55 @@ review before the gate).**
   - Existing: every `run_k1.py` program at 1 and 4 vCPUs; the `pic-*` programs (instances with live L1 entries);
     `run_k2.py`; `run_slice3_vm.py smp coherence`; the `dispatch-study` build compiles and `count_miss`'s classes sum to
     the misses.
-  - Way-1 hit cost: a `run_k2.py cost` row `l1way1`: a loop of computed jumps between two blocks in one set (one in each
-    way) against the same loop with the two blocks in different sets; the difference in microseconds per iteration is
-    the way-1 cost per transfer. Gate: under 3 ns.
-- Tier 2 gate (one profile, main session): make's `miss` **count** down by at least 70% of f x 88.6 M at the count's
-  upper bound, i.e. by at least 54 M; configure's by at least 70% of 0.89 x 5.5 M = 3.4 M; **no increase in capacity
-  flushes** (same memory: the count is the check); `guest` not up by more than a quarter of the `miss` + `enter` saving
-  (the way-1 cost); `l1`, `tlb`, `link` unchanged within noise. Wall time is judged alone for this item (decision 21:
-  the largest single item of the round), three interleaved rounds.
+  - Way-1 hit cost: two `run_k2.py cost` rows. `l1way1`: a loop of computed jumps between two blocks in one set (one in
+    each way) against the same loop with the two blocks in different sets; the difference per iteration is the
+    predicted way-1 cost. `l1way1-rand`: many sets, each with a pair, visited in a pseudo-random order from one
+    dispatcher site, so the way-0/way-1 outcome is unpredictable, against the same walk over single-way sets: the
+    mispredicted cost. Gate: predicted under 3 ns, unpredictable under 6 ns.
+  - A resident checker (under `link-check`, run after each K1 program): every list's length is at most the slots, each
+    slot is listed at most once (its `L1_LISTED` bit set exactly when it is on the list).
+- Tier 2 gate (main session): make's `miss` **count** down by at least 70% of f x 88.6 M at the count's upper bound,
+  i.e. by at least 54 M, with `L1_NEW_CONFLICT` reported beside it; configure's by at least 70% of 0.89 x 5.5 M =
+  3.4 M; **no increase in capacity flushes** (same memory: the count is the check); `l1`, `tlb`, `link` unchanged within
+  noise. The way-1 cost is judged by the two cost rows and by `guest` over **three interleaved rounds** (a quarter of
+  the saving is about 8 vCPU-s on make, near its run-to-run spread, so one profile cannot judge it). Wall time is judged
+  alone for this item (decision 21: the largest single item of the round), the same three rounds.
 
 **Deliberate mutations, each turning its test red:**
 
 | Mutation | Caught by |
 | --- | --- |
-| M1 empty way 0 branches to the miss instead of set + 32 | `l1-pair` counts (B misses every round) |
+| M1 empty way 0 branches to the miss instead of set + 32 | `l1-global` (way 0 emptied by the CR3 reload; A in way 1 misses every time: counts) |
 | M2 way 0's `cbnz` to its own word 7 with `b DISPATCH_MISS` there (no chain) | `l1-pair` counts (way 1 never hit) |
 | M3 `cut_one` empties only way 0 | `l1-pair-invlpg`, `l1-pair-write` (B in way 1 runs stale bytes) |
-| M4 `l1_block` does not mask `L1_NEXT` | `l1-pair-write` second part (A in way 0 with the bit set is not found: stale bytes) |
+| M4 `l1_block` does not mask `L1_NEXT` | `l1-pair-write` second part: warm X, then Y (the set is full), then A, which replaces X in way 0 and sets the bit; then rewrite A's frame: `cut_one` compares the raw owner, does not find A, and A runs stale bytes. The same mutant also feeds `block(owner - 1)` a number with bit 30 set in the CR3 pass, which halts at the first CR3 load |
 | M5 `L1_NEXT` never flipped (always evict way 0) | `l1-triple` counts (A, B, C then A, B: the miss pattern differs) |
 | M6 dispatcher keeps `lsl #5` or the 16-bit mask | `fill_head`'s checker halts; every K1 program |
 | M7 lists store the set instead of the slot | `l1-pair-cr3` (way-1 slot not emptied at the CR3 load: stale bytes) |
-| M8 fill's "already there" check on way 0 only | `l1-pair` counts under `dispatch-study` (`L1_EVICTED` counts a self-eviction) |
-| M9 `empty_l1` drops `L1_LISTED` | `l1-pair-cr3` (an unlisted stale slot survives the CR3 pass) |
+| M8 fill's "already there" check on way 0 only | `l1-dup` (B duplicated over A at a resident re-entry; A misses: counts) |
+| M9 `empty_l1` drops `L1_LISTED` | the list checker (a slot listed twice: its bit clear while it is on the list), not a stale slot |
 | M10 way-1 words' `b DISPATCH_MISS` replaced by `b set + 32` (a loop) | every program hangs: the watchdog; `l1-pair` counts |
+| M11 `cut_one` keyed on one slot index instead of both owners | `l1-pair-write` (the block in the other way survives its kill) |
 
 ## 9. Stop rule and risks
 
-- Revert if make's `miss` count falls by less than 54 M after one round of diagnosis, with the folded set index (7.5)
-  the one variant tried in that round; or if `guest` rises by more than a quarter of the saving (the way-1 cost); or if
-  capacity flushes rise; or on any K1 red or `BAD_LINK` traced to the design (section 4) rather than a slip.
-- Risks: f at 2^15 sets is an upper bound (the 15-bit index merges RIPs differing in bit 15 into one set), so the real
-  removal may sit nearer the 0.76 floor; the way-1 hit cost is unmeasured until the `cost` row runs; the fast-miss
-  plan's make gate and its eviction preludes must be recomputed and rewritten once this lands (3.6, 6).
+- If make's `miss` count falls by less than 54 M, or the new-conflict counter explains the shortfall, the first fallback
+  is **two ways at 2^16 sets** (7.2: `L1_BITS` 17, 4 MiB per table, no new conflicts): built and measured once for
+  misses and for capacity flushes against the code area's headroom (make peaks at 118 of 134 MB); the folded set index
+  (7.5) is tried only after that. Revert if neither meets the gate after one round of diagnosis; also if `guest` rises
+  by more than a quarter of the saving over three interleaved rounds (the way-1 cost), if capacity flushes rise, or on
+  any K1 red or `BAD_LINK` traced to the design (section 4) rather than a slip.
+- Risks: f at 2^15 sets is an upper bound with no floor (section 6: the dropped bit 15 makes new conflicts the count
+  could not see); the way-1 hit may be a mispredicted branch (section 5), measured by the `cost` rows and the rounds, not
+  by one profile; the fast-miss plan's make gate and its eviction preludes must be recomputed and rewritten once this
+  lands (3.6, 6).
+
+## 10. Review response (independent review, November 14, 2026: accept with fixes; design correct)
+
+| Finding | Resolution |
+| --- | --- |
+| Gain floor wrong: 2^15 sets drop index bit 15, so RIPs in different entries today share a set; the count saw only today's misses, so 0.876 is an upper bound and 0.756 no floor | Fixed (6): "up to 39 / 1.9", no lower bound, the A, A + 32 KiB, A + 64 KiB example; the study's data is per 16-bit index and cannot bound the new conflicts, so chunk 1 counts them (`L1_NEW_CONFLICT`, 3.3) |
+| Rejection 2 (2^16 sets) must cite this risk; the stop rule should name it as the fallback before the folded index | Fixed (7.2, 9): no new conflicts, exact 0.92, 8 MiB against 16 MB of headroom (make peaks at 118 of 134 MB); first fallback, measured for capacity flushes too |
+| `cut_one` loops over both slots keyed on the owner; every raw owner read masks or preserves `L1_NEXT`; the abi assertion at `:983` and `main.rs:33`'s `l1_mask`; fill step 3 is a hint, not a condition | Fixed (3.3, 3.4) |
+| Way-1 hit may mispredict (~4 ns); the cost row measures the predicted case; one profile cannot judge the guest guard | Fixed (5, 8): an unpredictable `l1way1-rand` row; the guard judged over three interleaved rounds |
+| Blocking: M1 passed (`l1-pair` never empties way 0); M8 passed; M9 produces duplicate list entries, not a stale slot; M4 lacked its sequence; `l1-triple`'s "after C" explanation; the fast-miss prelude note | Fixed: M1 -> `l1-global` (B non-global into way 0, A global into way 1, CR3 reload, A hits with 0 misses); M8 -> new `l1-dup` (a resident re-entry at B while B is in way 1 and the bit names way 0); M9 -> the list checker; M4's sequence stated and its CR3-pass halt noted; `l1-triple`: B's way was the older, exactly 2 misses in that round; the prelude note names V + 32 KiB |
