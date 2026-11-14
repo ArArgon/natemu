@@ -265,7 +265,7 @@ Rules learned in this round:
     21 min wall vs 36 on November 11): 166/171; probes@1/@2 failed only because OrbStack was down (Docker reference)
     and pass with `NATEMU_REFERENCE_BACKEND=apple` (`round-suite-20261114-02`); k2-rdrand's expectation followed the
     pool's ENTROPY_WORDS 32 -> 30 (`0312884`, passes); io-coverage host-full is the known environmental failure;
-    net-linux could not bind port 8000 (a leftover server from the PCI acceptance run, pid 27567, left for the owner).
+    net-linux could not bind port 8000 (leftover http and iperf3 servers from the PCI acceptance run, pids 27567/27568; stopped with the owner's approval) and then passed (`round-suite-20261114-03`).
     IO5 full boot, mitigations off, natemu head with the pool on (`io5-natemu-mo-20261114-01`): PASS; use phase
     705 -> 564 s (-20%), configure 88.7 -> 67.9 s, make 492.3 -> 349.4 s (-29%), vs QEMU 901 s: natemu 0.63x QEMU (0.78x
     before this round). Benchmark suite (3 rounds) running: `natemu-raw/bench-round-20261114-01`.
