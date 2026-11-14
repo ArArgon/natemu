@@ -7,9 +7,10 @@
 // virtio-devices/src/transport/pci_device.rs). Divergences from upstream's behaviour: MsixCap::new leaves Enable
 // clear (PCI 3.0 6.8.2.3); set_msg_ctl delivers pending vectors when MSI-X becomes enabled and unmasked, not when
 // the function mask clears (PCI 3.0 6.8.2.3, 6.8.2.9); an optional bus-master gate (`set_gate`) holds every message,
-// sent or released, while the function's Bus Master bit is clear (PCI 3.0 6.2.2: no memory write, and an MSI is one),
-// and `release_pending` sends what became deliverable when it sets. Upstream items natemu does not use are kept, hence
-// the allow below.
+// sent or released, while the function's Bus Master bit is clear (PCI 3.0 6.2.2: no memory write, and an MSI is one):
+// trigger() then sets the pending bit as for a masked vector, and `release_pending` sends what became deliverable when
+// it sets. Additions: `clear_pending` (a device reset drops pending vectors, as QEMU's `msix_unuse_all_vectors` on a
+// virtio reset). Upstream items natemu does not use are kept, hence the allow below.
 #![allow(dead_code)]
 
 use std::sync::{
@@ -125,6 +126,11 @@ impl MsixConfig {
         if !was_active {
             self.release_pending();
         }
+    }
+
+    /// natemu: drop every pending vector (a device reset).
+    pub fn clear_pending(&mut self) {
+        self.pba_entries.fill(0);
     }
 
     /// natemu: messages wait while `gate` is clear (the function's Bus Master bit).
@@ -385,17 +391,17 @@ impl MsixConfig {
 
     /// A device interrupt on `vector` (natemu addition; upstream has this in the virtio transport's
     /// `VirtioInterruptMsix::trigger`). Delivers the entry's message, or sets its pending bit when the entry or the
-    /// function is masked (the unmask paths above then deliver it once). Does nothing while MSI-X is disabled or for
-    /// a vector beyond the table, or while the gate is clear (natemu: no message and nothing pending without bus
-    /// mastering).
+    /// function is masked or the gate is clear (the release paths above then deliver it once). Does nothing while
+    /// MSI-X is disabled or for a vector beyond the table.
     pub fn trigger(&mut self, vector: u16) {
-        if !self.enabled || !self.may_send() || usize::from(vector) >= self.table_entries.len() {
+        if !self.enabled || usize::from(vector) >= self.table_entries.len() {
             return;
         }
         // In case the vector control register associated with the entry has its first bit set, this means the
         // vector is masked and the device should not inject the interrupt. Instead, the Pending Bit Array table
-        // is updated to reflect there is a pending interrupt for this specific vector.
-        if self.masked || self.table_entries[usize::from(vector)].masked() {
+        // is updated to reflect there is a pending interrupt for this specific vector. natemu: likewise while the
+        // gate (Bus Master) is clear.
+        if self.masked || self.table_entries[usize::from(vector)].masked() || !self.may_send() {
             self.set_pba_bit(vector, false);
             return;
         }
