@@ -321,6 +321,15 @@ Rules learned in this round:
     103.4, make 535.9 -> 534.3 excluding one outlier head run at 579 with 12 flushes). Merged as a design fix (owner rule:
     wasteful designs are fixed even when the gain is small): milliseconds of scanning to kill ~3 blocks are gone.
 
+34. **Fault-around: the fill stops, the writable-on-read rule goes ahead** (plan `fault-around-plan.md`, reviewed twice;
+    chunk 0 study on branch `fault-count`, profile `natemu-raw/fault-count-profile-1`, analysis.txt; counts only). Fill
+    (prefetching neighbour shadows): best window W=8 nets +0.90 (configure, hit 39-45%) / +3.53 vCPU-s (make, hit
+    48-53%) against gates 1.5 / 4.0 — fail; with the measured removal cost per extra entry (177 / 423 ns, unmap_large)
+    no window is positive at all. Not built. Chunk 1 (install writable on a read when D=1, the write is granted, WB/WC,
+    frame not translated): 1.17 M (configure) / 4.56 M (make) upgrade aborts follow such reads (99.8%); saves ~0.88 s /
+    ~3.42 vCPU-s — passes; its would-be writable bits on frames later marked as code are 0.0% of marks in both spaces,
+    so it applies to user and supervisor. Being built (branch `fault-chunk1`).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
