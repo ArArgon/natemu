@@ -1070,7 +1070,7 @@ pub(crate) mod tests {
             };
             assert_eq!(rest(&map), rest(&plain));
         }
-        // A low RAM end reaching the window is refused, not overlapped.
+        // Guards a future limit: the 3 GiB cap above already refuses this, so the PCI-specific branch is not reachable today.
         let bad = Layout {
             low_end: u64::from(WINDOW.0),
             high: 0,
