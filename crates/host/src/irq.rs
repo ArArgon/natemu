@@ -245,8 +245,11 @@ impl Irqs {
         self.live.load(SeqCst)
     }
     /// A message-signalled interrupt (SDM Vol.3 11.11.1, 11.11.2): `address` bits 31:20 are 0xFEE, the destination ID is
-    /// bits 19:12, the redirection hint bit 3 (with fixed delivery it makes the message lowest-priority) and the
-    /// destination mode bit 2 (set: logical); `data` bits 7:0 are the vector and bits 10:8 the delivery mode. The trigger
+    /// bits 19:12, the redirection hint bit 3 and the destination mode bit 2 (set: logical); `data` bits 7:0 are the
+    /// vector and bits 10:8 the delivery mode. A set hint with fixed delivery is sent lowest-priority: 11.11.1 says only
+    /// the lowest-priority member of a logical destination takes it and a physical one names a single processor (0xFF
+    /// with the hint is forbidden there; it reaches one LAPIC here). KVM reads the hint so; QEMU's emulated APIC ignores
+    /// it (`apic_send_msi`), a difference no current Linux shows, since it writes the hint as 0. The trigger
     /// mode (data bit 15) is ignored: always edge, so the TMR bit is clear and the EOI stays inside the LAPIC. Whether some
     /// LAPIC accepted it; an address outside the window posts nothing.
     pub fn msi(&self, address: u64, data: u32) -> bool {
