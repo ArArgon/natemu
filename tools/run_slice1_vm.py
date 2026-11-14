@@ -16,7 +16,8 @@ import argparse, json, os, pathlib, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref  # noqa: E402
+import ref, asmcache  # noqa: E402
+asmcache.install(ref)      # clang runs once per distinct text (tools/asmcache.py), not once per shard and step
 # The driver option that turns on admission's code-shape debug check (off by default in the host). Passed by every test
 # runner (run_slice1_vm, run_slice1_faults, run_slice2_vm through run_program, run_slice2_faults, run_slice2_probes,
 # run_slice3_vm except `contain`, upstream_tests/run_asm); not by `contain` (isolation must not depend on it) or
