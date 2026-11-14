@@ -243,6 +243,17 @@ Rules learned in this round:
     (a 2 MiB control granule). The ring wraps on make (0.59 M overwritten, ~0.2% of busy): not worth a bigger window now.
     Disk: profiles now delete raw request logs after each step (`ba6d4c4`) after ENOSPC stopped all work twice.
 
+26. **Page record + fast miss path: measured, merge pending tests** (branch `fast-miss`; plans reviewed twice; code
+    review: accept, no code defect). Both on vs both off, same build (`natemu-raw/fm-{off,on}-profile-1`): configure
+    busy 114.1 -> 111.3 (-2.5%), make 552.7 -> 540.2 (-2.3%), make step 133.9 -> 130.8 s. The record answers 33.1 M /
+    61.5 M fetch walks (3.5 M / 3.8 M still walked): revalidation 2.94 -> 0.23 / 8.06 -> 0.54 vCPU-s. The fast path takes
+    16.6 M of configure's ~27 M misses (8.9 M decline with no current block, 1.08 M on `Unknown`) and 58.3 M of make's
+    65.8 M; its own cost shows as miss +2.1. Below the plans' estimates (make 21-29) but real. Blocking before merge
+    (review): the uncached check is the only guard on a new route (step-block exits now reach the fast path; a skipped
+    `uncached_end` would leave a UC shadow mapped) and needs a red-under-mutation test; plus the hook cases (I/O window,
+    peer code invalidation, reinject backlog, IF inside the miss). Possible follow-up: let `Mapped::Unknown` continue
+    the L2 search instead of ending it (fewer declines when processes map different code at one address).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
