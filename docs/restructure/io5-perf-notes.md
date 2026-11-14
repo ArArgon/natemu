@@ -281,6 +281,16 @@ Rules learned in this round:
     after it (not yet found). Label: a trade-off, not a waste — the same L1 halves make's misses. Fix candidate: 2-way at
     2^16 sets (no new conflicts, +8 MiB of code area per vCPU) — owner decision.
 
+30. **2-way L1 at 2^16 sets built and not merged; the hackbench/locks "regression" is mostly noise** (branch
+    `l1-two-way-16`, reviewed: accept; K1 496/496, all mutations red; gate `natemu-raw/l1-16-gate-20261114-01`, pool on in
+    both, uncontended). 2^16 vs 2^15: make misses 65.7 -> 51.3 M (as counted), but make 126.85 -> 126.1 s and configure
+    66.75 -> 67.75 s (both within spread), configure capacity flushes 10-11 -> 12, hackbench N=1 11.62 -> 12.02 s, locks
+    N=4 7.57 -> 7.62 s. Correction to decision 29: the same 2^15 head binary measured hackbench 12.35 s earlier today and
+    11.62 s here (round start 11.63), so 2-3 runs per build cannot separate a few-percent change on these benchmarks;
+    the two-way L1 is not shown to regress them. The owner's condition for 2^16 (recover hackbench/locks, no flush
+    increase) is not met: 8 MiB per vCPU buys nothing measurable, so 2^15 stays. Lesson: benchmark attributions below
+    ~5% need >= 5 interleaved runs per build on this machine.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
