@@ -1592,10 +1592,12 @@ impl std::hash::Hasher for Words {
         ((self.sum >> 64) as u64).reverse_bits()
     }
 }
-/// Answers per generation of the memory cache ([`Shard::insert`]), over all its shards: the installer boot keeps about 130 k.
-const GENERATION: usize = 1 << 18;
-/// And bytes per generation (about 80 MB for the installer's answers).
-const GENERATION_BYTES: usize = 128 << 20;
+/// Answers per generation of the memory cache ([`Shard::insert`]), over all its shards. Sized for a parallel build's working
+/// set (IO5, November 13: a CPython `make -j4` asks for about 660 k distinct blocks; with 2 x 256 k the generations cycled and
+/// fexc compiled 1.8 M answers again for other vCPUs); the installer boot keeps about 130 k.
+const GENERATION: usize = 1 << 20;
+/// And bytes per generation (answers average about 650 bytes: the build's set is about 450 MB).
+const GENERATION_BYTES: usize = 512 << 20;
 /// The memory cache's shards (perf chunk 13), each locked alone and bounded at a sixteenth of the generation bounds.
 const SHARDS: usize = 16;
 /// A kept answer and what it was compiled from: its RIP, the gating values (those with a bit in `read` matter) and the guest
@@ -1712,7 +1714,7 @@ impl Shard {
     }
     /// Keeps `entry` in the newer generation; when that holds a [`SHARDS`]th of [`GENERATION`] answers or of
     /// [`GENERATION_BYTES`] it becomes the older one (the older is dropped): every answer used or made in the shard's last
-    /// generation is kept, at most twice the bound (2 x 128 MiB over the shards). Returns the dropped generation, for the
+    /// generation is kept, at most twice the bound (2 x 512 MiB over the shards). Returns the dropped generation, for the
     /// caller to free after unlocking the shard (up to 16 k answers).
     fn insert(&mut self, limit: Option<u32>, entry: Arc<Entry>) -> Option<Cache> {
         let mut dropped = None;

@@ -167,7 +167,7 @@ def prepare(inputs):
 def command(args, disk, cache, phase='use'):
     cmdline = CMDLINE + (' mitigations=off' if args.mitigations_off else '')
     if args.backend == 'natemu':
-        return [ROOT / 'target/release/natemu'] + (['--runtime', args.runtime] if getattr(args, 'runtime', None) else []) + ['--fexc', args.fexc, '--kernel', args.inputs / 'vmlinuz', '--initrd',
+        return [getattr(args, 'natemu', None) or ROOT / 'target/release/natemu'] + (['--runtime', args.runtime] if getattr(args, 'runtime', None) else []) + ['--fexc', args.fexc, '--kernel', args.inputs / 'vmlinuz', '--initrd',
                 args.inputs / 'initrd.img', '--cmdline', cmdline, '--ram', f'{args.ram}G', '--vcpus', str(args.vcpus),
                 '--serial-stdin', '--disk', disk, '--net', '--rng', '--compile-cache', cache] + \
                (['--speculation-barriers'] if args.speculation_barriers else []) + \
@@ -399,6 +399,7 @@ def main():
     f.add_argument('--out', type=Path, required=True); f.add_argument('--steps', nargs='+', required=True,
                    choices=('boot', 'configure', 'make', 'make-net', 'make-disk', 'make-rng', 'pytest', 'timerfd'))
     f.add_argument('--runtime', type=Path, help='the resident (a `perf` build for 5 ms bucket snapshots)')
+    f.add_argument('--natemu', type=Path, help='the natemu binary (default: target/release/natemu)')
     f.add_argument('--fexc', type=Path, default=FEXC); f.add_argument('--vcpus', type=int, default=4)
     f.add_argument('--ram', type=int, default=8); f.add_argument('--limit', type=int, default=3600)
     f.add_argument('--mitigations-off', action='store_true'); f.add_argument('--speculation-barriers', action='store_true')
