@@ -2290,6 +2290,9 @@ pub struct Compiler {
     /// Page-currency plan chunk 1: the resident's [`cache::Control::pages`] ([`cache::PAGES_ON`] by default; `--page-currency
     /// on|off|check|check-halt`, [`parse_page_currency`]).
     pub page_currency: u64,
+    /// Fault-around plan chunk 1: [`cache::Control::writable_on_read_off`] (a demand read installs the shadow writable when the leaf has D
+    /// set and grants the write; on by default; `--writable-on-read on|off`, [`parse_writable_on_read`]; `NATEMU_WRITABLE_ON_READ` overrides it).
+    pub writable_on_read: bool,
     /// PIC study stage 2: the resident's [`cache::Control::pic`] ([`cache::PIC_USER`] by default; the program driver's
     /// [`cache::PIC_ALL`]); `NATEMU_PIC=off|user|all` overrides it.
     pub pic: u64,
@@ -2439,6 +2442,7 @@ impl Compiler {
             reuse_checks: 0,
             check_reuse: false,
             page_currency: cache::PAGES_ON,
+            writable_on_read: true,
             pic: cache::PIC_USER,
             pic_check_local: false,
             deadline: COMPILE_DEADLINE,
@@ -3328,6 +3332,16 @@ pub fn parse_page_currency(text: &str) -> std::result::Result<u64, String> {
     }
 }
 
+/// `--writable-on-read`'s (and `NATEMU_WRITABLE_ON_READ`'s) value: whether a demand read installs the shadow writable (chunk 1 of the
+/// fault-around plan) or read-only (before it).
+pub fn parse_writable_on_read(text: &str) -> std::result::Result<bool, String> {
+    match text {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("--writable-on-read {other}: on or off")),
+    }
+}
+
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
 /// which execution stops at a block boundary (blocks are fetched up to it, and
 /// never cached at it, so reaching it is a miss). A vCPU that stays in the guest
@@ -3373,6 +3387,15 @@ pub fn run(
     area.write_record(
         control + std::mem::offset_of!(cache::Control, miss_fast_off),
         u64::from(std::env::var("NATEMU_MISS_FAST").as_deref() == Ok("off")),
+    );
+    // Fault-around plan chunk 1 (A/B measurement): the flag's value, overridden by NATEMU_WRITABLE_ON_READ=on|off (every driver reads it).
+    let writable = match std::env::var("NATEMU_WRITABLE_ON_READ") {
+        Ok(v) => parse_writable_on_read(&v)?,
+        Err(_) => compiler.writable_on_read,
+    };
+    area.write_record(
+        control + std::mem::offset_of!(cache::Control, writable_on_read_off),
+        u64::from(!writable),
     );
     let pic = match std::env::var("NATEMU_PIC").as_deref() {
         Ok("off") => cache::PIC_OFF,

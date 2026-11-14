@@ -3352,9 +3352,18 @@ fn translate(
                     && matches!(kind, cpu::memory_type::WT | cpu::memory_type::WP));
             let shadow = !uncached || b.flags & cache::STEP != 0;
             let writable = access == Access::Write && t.writable && t.dirty;
-            // As a mark is set before the writable bits are read ([`mark`]), the writable bit is set before the marks
-            // are read: a vCPU marking the page then either shoots this shadow down or is seen here, and the write
-            // takes the code-write path. (Unshadowed, a write is made by the step block or [`split`] after this check.)
+            // Fault-around plan chunk 1 (3.7): a demand READ installs the shadow writable too when the leaf has D = 1 and the walk
+            // grants the write, on WB or WC memory, and no vCPU holds translations from the frame, by the read-side protocol of
+            // [`cpu::writable_on_read`] (not this path's: nothing is written here, so [`code_written`] is never called for a read).
+            let on_read = access == Access::Read
+                && cpu::writable_on_read(
+                    cache::control().writable_on_read_off == 0,
+                    t.writable,
+                    t.dirty,
+                    kind,
+                    &mut || cache::translated(t.gpa),
+                    &mut || cache::shadowed_writable(t.gpa),
+                );
             if writable {
                 if shadow {
                     cache::shadowed_writable(t.gpa);
@@ -3368,6 +3377,7 @@ fn translate(
             }
             cache::control().memory_types[kind as usize] += 1;
             let old = tables::descriptor(s.cpu.cpl, va);
+            let writable = writable || on_read;
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
                 s.upgrades += 1;
             }

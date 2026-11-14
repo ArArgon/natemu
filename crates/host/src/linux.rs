@@ -59,6 +59,8 @@ pub struct Boot {
     pub check_reuse: bool,
     /// Page-currency plan chunk 1: `Compiler::page_currency` (default on; `--page-currency` / `NATEMU_PAGE_CURRENCY`).
     pub page_currency: u64,
+    /// Fault-around plan chunk 1: `Compiler::writable_on_read` (default on; `--writable-on-read` / `NATEMU_WRITABLE_ON_READ`).
+    pub writable_on_read: bool,
     /// Debug: admission's code-shape check on every object (`Compiler::shape`; the test driver's `boot-linux --code-shape`).
     pub code_shape: bool,
     /// PCID plan P1 (owner, November 5): turn on the resident's page-walk speculation barriers. Off by default; on, the
@@ -99,6 +101,7 @@ impl Boot {
             compile_cache: compile_cache::Config::OFF,
             check_reuse: false,
             page_currency: exec::cache::PAGES_ON,
+            writable_on_read: true,
             code_shape: false,
             speculation_barriers: false,
             rng: false,
@@ -221,6 +224,7 @@ impl Boot {
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
             page_currency: self.page_currency,
+            writable_on_read: self.writable_on_read,
             code_shape: self.code_shape,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
@@ -252,6 +256,7 @@ pub struct Prepared {
     compile_cache: compile_cache::Config,
     check_reuse: bool,
     page_currency: u64,
+    writable_on_read: bool,
     code_shape: bool,
     /// [`Prepared::run`] has started: the backing is used.
     ran: AtomicBool,
@@ -421,6 +426,7 @@ impl Prepared {
             compiler.share(&answers);
             compiler.check_reuse = self.check_reuse;
             compiler.page_currency = self.page_currency;
+            compiler.writable_on_read = self.writable_on_read;
             compiler.shape = self.code_shape;
             let mut requests = execution::Requests {
                 devices: Some(self.devices.clone()),

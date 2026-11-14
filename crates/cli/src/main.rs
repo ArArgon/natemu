@@ -3,7 +3,7 @@
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
 //!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool[=false]] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
-//!       [--perf-log FILE] [--page-currency on|off|check]
+//!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off]
 //!
 //! Named arguments (clap; `natemu --help`). Seven fall back to `NATEMU_SERIAL_STDIN`,
 //! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
@@ -17,7 +17,8 @@
 //! input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode, Ctrl-C to the guest, Ctrl-A x cancels the run.
 //! `--page-currency` (default on; `NATEMU_PAGE_CURRENCY`): a per-vCPU record of fetch-walk results answers the resident's fetch
 //! translations as a TLB entry does (page-currency plan); `off` walks every one, `check` answers from the record and walks too,
-//! counting any difference. `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` to turn it off): the shared template pool, in
+//! counting any difference. `--writable-on-read` (default on; `NATEMU_WRITABLE_ON_READ`): a demand read installs the shadow writable when the
+//! guest entry has D set and grants the write, so a later write needs no second abort (fault-around plan chunk 1); `off` is the old behaviour. `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` to turn it off): the shared template pool, in
 //! which the host publishes admitted templates and each resident looks before asking the host (cross-vCPU reuse plan).
 //! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
@@ -71,6 +72,10 @@ struct Cli {
     /// does (off), or it answers and the walk is made too, a difference counted (check)
     #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check", default_value = "on", value_parser = parse_page_currency)]
     page_currency: u64,
+    /// Fault-around plan chunk 1: a demand read installs the shadow writable when the guest entry has D set and grants the write (on, the
+    /// default), or read-only as before (off); for A/B measurement
+    #[arg(long, env = "NATEMU_WRITABLE_ON_READ", value_name = "on|off", default_value = "on", value_parser = natemu::execution::parse_writable_on_read)]
+    writable_on_read: bool,
     /// Expose the virtio-MMIO entropy device
     #[arg(long)]
     rng: bool,
@@ -166,6 +171,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     )?;
     boot.speculation_barriers = cli.speculation_barriers;
     boot.page_currency = cli.page_currency;
+    boot.writable_on_read = cli.writable_on_read;
     boot.rng = cli.rng;
     boot.disk = cli.disk;
     boot.net = cli.net;

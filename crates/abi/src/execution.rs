@@ -796,6 +796,10 @@ pub mod cache {
         /// Set by the host from `NATEMU_MISS_FAST=off` (for A/B measurement only; zero, the default, is on): the fast miss path is
         /// never tried (nothing counted). Appended.
         pub miss_fast_off: u64,
+        /// Fault-around plan chunk 1, set by the host (`--writable-on-read`, `NATEMU_WRITABLE_ON_READ`; zero, the default, is on):
+        /// nonzero turns off installing a shadow writable at a demand read (a read installs read-only, as before the chunk).
+        /// Appended.
+        pub writable_on_read_off: u64,
     }
     /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
     pub mod pool_recheck {
