@@ -1360,10 +1360,13 @@ EXPECT_FAULT_AT = {'fa-ro': (FARO, 7)}
 # site into V's block is non-local (V's page is not the site's), so a CR3 load suspends it and the next revalidation of V's block
 # relinks it. Each program ends in a guest #PF (a load from a page no table maps) before the body's restore, so its last state
 # (records still suspended, or live) is what the host's link check sees; `cr3-relink` ends normally after a flush.
-RELINK_PROGRAMS = ('cr3-relink', 'relink-smc', 'relink-dead-source', 'relink-stale', 'relink-held', 'relink-global', 'relink-many')
+RELINK_PROGRAMS = ('cr3-relink', 'relink-smc', 'relink-dead-source', 'relink-stale', 'relink-held', 'relink-global', 'relink-many', 'relink-reclaim')
 RJ1, RJ2, RW, RG1, RS = 0x9000, 0xa000, 0xb000, 0xc000, 0x100   # site pages, W (global target), G1's page; S on V's page
 RM = 16                                                         # `relink-many`'s sites: RM / 2 on each of RJ1's and RJ2's pages
 RSITE = lambda d, k: d + (RJ1 if k % 2 == 0 else RJ2) + 0x100 * (k // 2)
+# `relink-reclaim` (test link capacity 4096, as `link-full`'s smaller one): RR sites, 8 bytes apart from d + RJ1 (`jmp V`), in A and in B:
+# more links than fit while the first space's are suspended, so a reclaim drops suspended records (and their outbound entries).
+RR, RR_CAP = 2500, 4096
 RFAULT = 0x7fff0000                                              # no table maps it: the end's #PF
 RELINK_END = f'    mov rax, [{RFAULT:#x}]\n'
 
@@ -1377,6 +1380,8 @@ def relink_bodies(k, i, n):
     run = lambda at, reg: call(f'q{next(tag)}', f'{at:#x}') + f'    add {reg}, rax\n'
     set_ = lambda at, reg: call(f'q{next(tag)}', f'{at:#x}') + f'    mov {reg}, rax\n'
     both = lambda reg: run(d + RJ1, reg) + run(d + RJ2, reg)
+    rr_loop = lambda reg: (f'    mov rbx, {d + RJ1:#x}\n    mov ecx, {RR}\n.r{reg}:\n    lea r13, [rel .e{reg}]\n    jmp rbx\n.e{reg}:\n    add {reg}, rax\n'
+                           '    add rbx, 8\n    dec ecx\n    jnz .r' + reg + '\n')
     rounds = lambda body: f'    mov ecx, {k}\n.l:\n' + body + '    dec ecx\n    jnz .l\n'
     upto_y2 = cr3(0) + set_(d + RJ1, 'r8') + cr3(1) + set_(d + RJ1, 'r9') + cr3(0) + put(d + F2) + set_(d + RJ1, 'r10')
     return {
@@ -1398,6 +1403,11 @@ def relink_bodies(k, i, n):
         # PGE off: J -> Y (non-global); V's PTE gets G and PGE goes on (a global flush: the link suspended); J again: Y is revalidated global, its
         # record relinked into the TLB segment; a CR3 reload keeps it (a global block stays current).
         'relink-global': (cr3(0) + set_(d + RJ1, 'r8') + put(d + F1, P.LEAF | G) + pge(True) + set_(d + RJ1, 'r9') + cr3(0) + set_(d + RJ1, 'r10') + RELINK_END),
+        # A: RR sites link into V's block; B: RR more (A's are suspended: the area fills in B, and the reclaim drops the suspended records first);
+        # then every site page written (a byte past each site's `jmp`): the sites die, each undoing its links out by its outbound list, which must
+        # name no record the reclaim dropped; the sites run again (new blocks) in B.
+        'relink-reclaim': (cr3(0) + rr_loop('r8') + cr3(1) + rr_loop('r9')
+                           + ''.join(f'    mov byte [{d + RJ1 + 0x1000 * q + 7:#x}], 0x90\n' for q in range(RR * 8 // 0x1000 + 1)) + rr_loop('r10') + RELINK_END),
         # `cr3-relink` with RM sites into V, while the TLB segment (G1 -> W, W global) and the local one (S -> V, S on V's page) hold
         # records that must not move. Each round: A (S, the sites), B (S, the sites), G1.
         'relink-many': (pge(True) + set_(d + RG1, 'r11') + '    xor r10d, r10d\n'
@@ -1415,6 +1425,8 @@ def relink_memory(name, i):
     to_v = lambda at: JMP(at, d)
     first = bytes.fromhex('bd01000000') + JMP(d + RJ1 + 5, d) if name == 'relink-dead-source' else to_v(d + RJ1)
     out = [mem(d + RJ1, first), mem(d + RJ2, to_v(d + RJ2))]
+    if name == 'relink-reclaim':
+        out = [mem(d + RJ1, b''.join(JMP(d + RJ1 + 8 * j, d) + b'\x90\x90\x90' for j in range(RR)))]
     if name == 'relink-many':
         out = [mem(RSITE(d, j), to_v(RSITE(d, j))) for j in range(RM)]
         # S on V's page in both frames (a local link into V's block); W (global) and G1 (`jmp W`, not global).
@@ -1439,6 +1451,7 @@ RELINK_VALUES = {
     'relink-stale': {'r8': {1}, 'r9': {2}, 'r10': {2}, 'r12': {1, 2}},
     'relink-held': {'r8': {1}, 'r9': {2}, 'r10': {2}},
     'relink-global': {'r8': {1}, 'r9': {1}, 'r10': {1}},
+    'relink-reclaim': {'r8': {RR}, 'r9': {2 * RR}, 'r10': {2 * RR}},
     'relink-many': lambda i, k: {'r8': {RM * k}, 'r9': {2 * RM * k}, 'r10': {9 * k}, 'r12': {k}, 'r14': {2 * k}},
 }
 # Least counts of k1.relink fields: relinked, relink_dropped, suspended, links_susp (the suspended segment's length at the end).
@@ -1450,6 +1463,7 @@ RELINK_LEAST = {
     'relink-held': {'relinked': 1, 'links_susp': 1},
     'relink-global': {'relinked': 1, 'suspended': 1},
     'relink-many': {'relinked': RM, 'links_susp': 1},
+    'relink-reclaim': {'suspended': RR},
 }
 EXPECT_STOP.update({n: ('guest_fault', '') for n in RELINK_PROGRAMS if n != 'cr3-relink'})
 EXPECT_FAULT.update({n: 14 for n in RELINK_PROGRAMS if n != 'cr3-relink'})
@@ -1871,6 +1885,8 @@ def run(a, prog, extra, host=None, runtime=None, tag='', check=True, page_mode=N
         env.update(POOL_ENV.get(prog['name'][3:].split('@')[0], {}))
     if full and CAP < MAX_LINKS:   # (the host's NATEMU_LINK_CAP: unset = production capacity)
         env['NATEMU_LINK_CAP'] = str(CAP)
+    if prog['name'].startswith('k1-relink-reclaim@'):
+        env['NATEMU_LINK_CAP'] = str(RR_CAP)
     short = prog['name'].split('@')[0].split('-', 1)[1]
     pmode = page_mode or PAGE_FORCED.get(short) or a.page_currency
     options = options + ['--page-currency', pmode]
@@ -2009,7 +2025,8 @@ def main():
                 # Perf chunk 11: the record area filled (more links made than it holds, no flush but the driver's first)
                 # and each fill cost at most two passes over it, each followed by at least a quarter of the area's links.
                 for v, c in enumerate(out['cpus'] if out and name == 'link-full' else []):
-                    count, links, flushes = c['stats']['k1']['reclaims'][0], c['stats']['links'], c['stats']['flushes']
+                    count, flushes = c['stats']['k1']['reclaims'][0], c['stats']['flushes']
+                    links = c['stats']['links'] + c['stats']['k1'].get('relink', {}).get('relinked', 0)   # (a relink makes a link too)
                     if not (links > CAP and count >= 1 and count <= 1 + 4 * links // CAP and flushes == 1):
                         problems.append(f'cpu{v} links {links}, full {count} times (at most {1 + 4 * links // CAP}; capacity {CAP}), flushes {flushes}')
                 seen = {}
@@ -2023,6 +2040,8 @@ def main():
                 for v, c in enumerate(out['cpus'] if out and name in RELINK_LEAST else []):
                     got = c['stats']['k1'].get('relink', {})
                     problems += [f'cpu{v} relink {f} = {got.get(f, 0)}, want at least {m}' for f, m in RELINK_LEAST[name].items() if got.get(f, 0) < m]
+                    if name == 'relink-reclaim' and c['stats']['k1']['reclaims'][0] < 1:
+                        problems.append(f"cpu{v} no reclaim at capacity {RR_CAP}")
                 stats = out and [{k: c['stats'].get(k) for k in ('requests', 'compiles', 'flushes', 'shadow_resets', 'links', 'unlinks', 'k1')} for c in out['cpus']]
                 entry = {'name': prog['name'], 'max_block': extra[0] if extra else None, 'check': check, 'problems': problems, 'seen': seen, 'stats': stats}
                 report.append(entry)

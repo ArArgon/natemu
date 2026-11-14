@@ -240,3 +240,27 @@ without the `link-check` build and the host check, which is why both gain explic
   compacts in a second, before the gap fill. One batch function serves every caller, `synchronize_words` included, so
   an IDC/DIC shortcut applies everywhere.
 - **N4, global flush.** Accepted. It restores `[links_susp, links_tlb)`, then sets `links_susp = links_cr3 = links_tlb`.
+
+## 8. As built (branch `relink`, November 14, 2026)
+
+Step 1 (`prune_tlb` batched; `linked_current` and its link-bucket ticks) and step 2 (suspension, relink) as designed, with these
+differences and findings:
+
+- **`prune_tlb` survives only in `pic-count` builds** (suspension is compiled out there). Every other build suspends: `suspend`
+  restores the words of `[links_susp, scope)` in the same two-pass batch (clean and barrier, then invalidate) and moves no record.
+  `synchronize_words` (arm and disarm) and relink's batch go through one `synchronize_offsets`; the CTR_EL0 shortcuts stay in
+  `clean_pou`, `clean_barrier` and `invalidate_pou` (and `synchronize_code`).
+- **Drain fix (`drain-fix`, outbound lists).** A suspended record stays on its source's outbound list, so a dead source's
+  `unlink_outbound` drops it (it skips the word's restore for a suspended record: `i < links_susp`); this replaces the plan's
+  "`prune(CHECKED, false)` drops suspended records with a dead source". `resume` keeps the outbound list right (`out_del` before the
+  slot is reused, `out_add` at the final slot; `list_moved` fixes the moved neighbour's cell), `drop_suspended` calls `out_del`.
+- **`cr3-link`'s end state does not hold a shared word.** The body's restore is a CR3 load and a CR4 write, so at every program's
+  end all non-local records are suspended and the word is unlinked. The held-word state (J -> Y2 live, J -> Y1 suspended, one word)
+  is reached by `relink-held`, which ends in a #PF before the restore; every new program ends so (`cr3-relink` after its flush).
+- **Linker entries.** A `cr3-relink` round costs 4 entries (two CR3-load exits, one trap per space) with relink and 6 without,
+  not 2 and 4: the CR3 loads' exits are entries too. `relink-many` is 4 against 2 + 2 RM.
+- **`relink-stale` runs with the page record off** (`--page-currency off`): with the record on, the PTE changed back to F1 inside
+  the epoch is not seen (the record is a TLB entry), so Y1 is never revalidated while J -> Y2 is live.
+- Reclaim: `drop_suspended` first; `prune(LOCAL, true)` and `unlink_all` only while more than 3/4 remains.
+- `link()` counts `relinked` beside links made in `link-full`'s reclaim bound (`run_k1.py`).
+- The relink walk halts `BAD_LINK` if a stop is armed (a tripwire: no resident path that arms returns into `lookup`).
