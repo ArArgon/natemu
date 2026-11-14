@@ -654,7 +654,7 @@ pub mod cache {
         pub flush_ticks: u64,
         pub full: [u64; 3],
         pub peak: [u64; 3],
-        /// Perf chunk 8: the link records' segments. `[0, links_cr3)` are links from another page into non-global targets
+        /// Perf chunk 8: the link records' segments (relink plan: after the suspended ones, `links_susp`, below). `[links_susp, links_cr3)` are links from another page into non-global targets
         /// (a CR3 load looks at them), `[links_cr3, links_tlb)` from another page into [`GLOBAL`] targets (every other
         /// TLB event looks at both), `[links_tlb, links_local)` local links: each linear page of the target is a page of the
         /// source translated from the same guest-physical page (only a death or a flush looks at them); PIC study stage 3:
@@ -806,6 +806,16 @@ pub mod cache {
         /// only). Plain counters in every build. Appended.
         pub linked_current: u64,
         pub linked_current_ticks: u64,
+        /// Relink plan, step 2: the suspension segment's end. The link records are five segments in this order:
+        /// `[0, links_susp)` suspended (a CR3 load or global flush restored the word and kept the record, on its target's inbound
+        /// list: relinked when a revalidation makes the target current again), then `[links_susp, links_cr3)`, `[links_cr3,
+        /// links_tlb)`, `[links_tlb, links_local)` and `[links_local, links)` as the fields above say. Appended.
+        pub links_susp: u64,
+        /// Records suspended (restored at a TLB event, kept), relinked (patched again at a revalidation) and dropped by a
+        /// relink (source dead, or its word no longer in its admitted form). Plain counters in every build. Appended.
+        pub suspended: u64,
+        pub relinked: u64,
+        pub relink_dropped: u64,
     }
     /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
     pub mod pool_recheck {
@@ -3188,7 +3198,7 @@ pub mod perf {
         pub count: [u64; BUCKETS],
     }
     pub const MAGIC: u64 = 0x7065_7266_0001;
-    pub const BUCKETS: usize = 27;
+    pub const BUCKETS: usize = 28;
     pub const OFFSET: usize = super::STATE_OFFSET + 0xe18;
     pub const VA: u64 = crate::PRIVATE + OFFSET as u64;
     const _: () = assert!(super::MMIO_OFFSET + size_of::<super::Mmio>() <= OFFSET);
@@ -3239,6 +3249,9 @@ pub mod perf {
     /// Cross-vCPU reuse (chunk 3): a lookup in the template pool (probes, copy of an entry, its checks and its placement; the
     /// second page's walk is `fetch`).
     pub const POOL: u64 = 26;
+    /// Relink plan, step 2: re-patching a target's suspended inbound links when a revalidation makes it current (`cache::relink`;
+    /// inside `lookup`'s time, charged alone).
+    pub const RELINK: u64 = 27;
     /// Perf chunk 14: a `perf` resident's halt wake-ups (`events::park`), each kind's count, summed and largest CNTVCT ticks
     /// and a histogram by microseconds (bins `< 1, < 4, < 16, < 64, < 256, < 1024, >= 1024`). Kinds: [`POST_WAKE`] a post
     /// (IPI or host interrupt, from `Events::rung`) to the first return from the wait after it; [`POST_RUN`] the same post to
@@ -3290,6 +3303,7 @@ pub mod perf {
         "enter_copy",
         "reuse",
         "pool",
+        "relink",
     ];
 }
 

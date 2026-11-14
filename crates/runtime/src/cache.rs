@@ -209,10 +209,11 @@ pub fn reset() {
         c.meta_used,
         c.blocks,
         c.links,
+        c.links_susp,
         c.links_cr3,
         c.links_tlb,
         c.links_local,
-    ) = (area::HEAD_BYTES as u64, 0, 0, 0, 0, 0, 0);
+    ) = (area::HEAD_BYTES as u64, 0, 0, 0, 0, 0, 0, 0);
     // A `checked` of 0 is never current.
     (c.epoch, c.global_epoch) = (c.epoch.max(1), c.global_epoch.max(1));
     (c.regions, c.large_regions, c.large_count) = ([0; 16], [0; 16], 0);
@@ -682,6 +683,12 @@ pub fn lookup(
                 if walked & LARGE != 0 {
                     mark_large(&b);
                 }
+                // Relink plan: the links the last TLB event suspended into it are patched again (after the walk: it may
+                // have killed their sources; after the flags: a global target's records belong to the TLB segment).
+                #[cfg(not(feature = "pic-count"))]
+                if block(n).inbound != 0 && c.links_susp != 0 {
+                    relink(n);
+                }
                 #[cfg(feature = "pic-count")]
                 if user(b.context) {
                     frame_met(block(n));
@@ -754,7 +761,13 @@ pub fn tlb(global: bool) -> Option<u64> {
     #[cfg(feature = "link-check")]
     check_l1_lists();
     // A CR3 load leaves global blocks current: only the links into non-global ones are looked at.
-    prune_tlb(if global { TLB } else { CR3 })
+    let scope = if global { TLB } else { CR3 };
+    // Relink plan: the links are undone but their records kept (suspended); `pic-count` builds (their links go through
+    // counting stubs) drop them as before.
+    #[cfg(not(feature = "pic-count"))]
+    return suspend(scope);
+    #[cfg(feature = "pic-count")]
+    prune_tlb(scope)
 }
 /// `link-check` builds, at the start and the end of every TLB flush (a CR3 load compacts the lists, which restores the
 /// invariant a missed kill broke, so the start is the check that sees it): each table's list is at most the slots long,
@@ -1816,14 +1829,19 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
         // free, every link goes. Each such pass is followed by at least a quarter of the area's links: amortised O(1)
         // per link (before, a pass that freed nothing was repeated at every linker entry).
         c.reclaims += 1;
-        let Some(mut n) = prune(LOCAL, true) else {
-            return Link::Bad;
-        };
+        // Suspended records first (relink plan): their words are restored already, so dropping them writes no code.
+        let mut n = drop_suspended();
         if control().links as usize > area::reclaim_floor(cap) {
-            let Some(all) = unlink_all() else {
+            let Some(local) = prune(LOCAL, true) else {
                 return Link::Bad;
             };
-            n += all;
+            n += local;
+            if control().links as usize > area::reclaim_floor(cap) {
+                let Some(all) = unlink_all() else {
+                    return Link::Bad;
+                };
+                n += all;
+            }
         }
         control().reclaimed += n;
     }
@@ -2050,13 +2068,17 @@ fn local(target: &Block, source: &Block) -> bool {
         .iter()
         .all(|&(p, g)| g == u64::MAX || pages(source).contains(&(p, g)))
 }
-/// The link records' segments ([`Control::links_cr3`], `links_tlb`, `links_local`, `links`), by which events look at them.
-const CR3: usize = 0;
-const TLB: usize = 1;
-const LOCAL: usize = 2;
-const CHECKED: usize = 3;
-fn ends(c: &mut Control) -> [&mut u64; 4] {
+/// The link records' segments ([`Control::links_susp`], `links_cr3`, `links_tlb`, `links_local`, `links`), by which events look
+/// at them. [`SUSP`]: links a TLB event undid, records kept (their words are restored: only a death, a reclaim, a cut of the
+/// target or the flush look at them, and [`relink`] when the target is current again). First, so a suspension moves no record.
+const SUSP: usize = 0;
+const CR3: usize = 1;
+const TLB: usize = 2;
+const LOCAL: usize = 3;
+const CHECKED: usize = 4;
+fn ends(c: &mut Control) -> [&mut u64; 5] {
     [
+        &mut c.links_susp,
         &mut c.links_cr3,
         &mut c.links_tlb,
         &mut c.links_local,
@@ -2159,7 +2181,7 @@ fn list_moved(from: u64, to: u64) {
 /// The segment holding record `i`.
 fn segment_of(i: u64) -> usize {
     let c = control();
-    (CR3..CHECKED).find(|&k| i < *ends(c)[k]).unwrap_or(CHECKED)
+    (SUSP..CHECKED).find(|&k| i < *ends(c)[k]).unwrap_or(CHECKED)
 }
 /// Appends `r` to segment `k`: each later segment's first record moves to that segment's end.
 fn insert(r: LinkRecord, k: usize) {
@@ -2209,8 +2231,11 @@ fn unlink_inbound(n: usize, all: bool) -> Option<u64> {
         let r = unsafe { record(i as usize).read() };
         at = r.next_in;
         if all || i < control().links_tlb {
-            unlink(r)?;
-            undone += 1;
+            // (A suspended record's word was restored when it was suspended.)
+            if i >= control().links_susp {
+                unlink(r)?;
+                undone += 1;
+            }
             remove(i, segment_of(i), &mut at);
         }
     }
@@ -2237,14 +2262,17 @@ pub fn unlink_all() -> Option<u64> {
     let c = control();
     for i in 0..c.links as usize {
         let r = unsafe { record(i).read() };
-        unlink(r)?;
+        // (Suspended records' words are restored already.)
+        if i as u64 >= c.links_susp {
+            unlink(r)?;
+        }
         if listed(&r) {
             unsafe { *inbound_head(r.target) = 0 };
         }
         unsafe { *out_slot(&r) = 0 };
     }
-    let n = c.links;
-    (c.links, c.links_cr3, c.links_tlb, c.links_local) = (0, 0, 0, 0);
+    let n = c.links - c.links_susp;
+    (c.links, c.links_susp, c.links_cr3, c.links_tlb, c.links_local) = (0, 0, 0, 0, 0);
     Some(n)
 }
 /// Restores the original word of the link point `r` describes, if it holds the branch `r` says, and makes it visible.
@@ -2597,14 +2625,18 @@ fn prune(scope: usize, strict: bool) -> Option<u64> {
             alive
         } else {
             let target = block(r.target as usize);
-            target.flags & DEAD == 0 && alive && ((k == LOCAL && !strict) || current(target))
+            // (A suspended record stays while both ends live: its target is not current, by design.)
+            target.flags & DEAD == 0 && alive && (k == SUSP || (k == LOCAL && !strict) || current(target))
         };
         if kept {
             i += 1;
             continue;
         }
-        unlink(r)?;
-        unlinked += 1;
+        // (A suspended record's word was restored when it was suspended: nothing to undo.)
+        if k != SUSP {
+            unlink(r)?;
+            unlinked += 1;
+        }
         remove(i, k, &mut 0);
     }
 }
@@ -2614,7 +2646,9 @@ fn prune(scope: usize, strict: bool) -> Option<u64> {
 /// record it drops, and a CR3 load drops nearly every record of its segment). The words' code synchronization is one
 /// batch: the first pass restores every undone word and cleans its line, moving no record; one barrier; the second
 /// invalidates each line as the records are compacted (a slot is written only after it was read), then the final barrier,
-/// before the gap fill.
+/// before the gap fill. Relink plan: only `pic-count` builds drop their records at a TLB event now (the others
+/// [`suspend`] them: it keeps their records).
+#[cfg(feature = "pic-count")]
 fn prune_tlb(scope: usize) -> Option<u64> {
     let c = control();
     let ctr = c.ctr_el0;
@@ -2631,7 +2665,7 @@ fn prune_tlb(scope: usize) -> Option<u64> {
     }
     clean_barrier(ctr);
     let (mut w, mut undone) = (0, 0);
-    let mut new = [0; 4];
+    let mut new = [0; 5];
     for k in 0..=scope {
         for i in if k == 0 { 0 } else { old[k - 1] }..old[k] {
             let r = unsafe { record(i as usize).read() };
@@ -2652,8 +2686,17 @@ fn prune_tlb(scope: usize) -> Option<u64> {
         new[k] = w;
     }
     unsafe { asm!("dsb ish", "isb") };
+    fill_gap(old, scope, w, &mut new);
+    for (e, n) in ends(c).into_iter().zip(new) {
+        *e = n;
+    }
+    Some(undone)
+}
+/// The segments up to `scope` were compacted to end at `w` (their new ends in `new`; `old` the ends before): each later
+/// segment's tail fills the gap before it, and its new end is `new[j]`.
+fn fill_gap(old: [u64; 5], scope: usize, w: u64, new: &mut [u64; 5]) {
     let gap = old[scope] - w;
-    for j in scope + 1..4 {
+    for j in scope + 1..5 {
         let (start, end) = (old[j - 1], old[j]);
         let m = gap.min(end - start);
         for t in 0..m {
@@ -2663,10 +2706,140 @@ fn prune_tlb(scope: usize) -> Option<u64> {
         }
         new[j] = old[j] - gap;
     }
-    for (e, n) in ends(c).into_iter().zip(new) {
-        *e = n;
+}
+/// A TLB event's links ([`CR3`] after a CR3 load, [`TLB`] too after a global flush): their words restored in one batch,
+/// their records kept: the suspended segment ends where the scope does (a segment first in the area, so no record moves), and
+/// the segments up to `scope` are empty. Relink plan section 3: after the epoch moved no record of the scanned segments names a
+/// current block (a CR3 load: every target there is non-global and was current only in the old epoch; a global flush: no
+/// block is current), and no record names a dead block or source (their deaths dropped them). Returns the links undone.
+#[cfg(not(feature = "pic-count"))]
+fn suspend(scope: usize) -> Option<u64> {
+    let c = control();
+    let ctr = c.ctr_el0;
+    let (from, to) = (c.links_susp, *ends(c)[scope]);
+    for i in from..to {
+        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(unsafe { record(i as usize).read() })?);
     }
-    Some(undone)
+    clean_barrier(ctr);
+    for i in from..to {
+        let r = unsafe { record(i as usize).read() };
+        // (Link records of these segments are never checked: the word is the source's code plus the offset.)
+        invalidate_pou(ctr, area::CODE_VA + u64::from(block(r.source as usize).code) + u64::from(r.offset));
+    }
+    unsafe { asm!("dsb ish", "isb") };
+    c.links_susp = to;
+    if scope == TLB {
+        c.links_cr3 = to;
+    }
+    c.suspended += to - from;
+    Some(to - from)
+}
+/// Drops every suspended record (no code is written: their words are restored): out of their targets' lists, then the later
+/// segments' tails fill the gap. Returns the records dropped.
+fn drop_suspended() -> u64 {
+    let c = control();
+    let n = c.links_susp;
+    for i in 0..n {
+        list_del(i as usize);
+    }
+    let old = ends(c).map(|e| *e);
+    let mut new = [0; 5];
+    fill_gap(old, SUSP, 0, &mut new);
+    for (e, v) in ends(c).into_iter().zip(new) {
+        *e = v;
+    }
+    n
+}
+/// Relink plan section 3: block `n` was just revalidated (its `checked` and flags are written, its source pages' walk is done):
+/// every suspended record on its inbound list whose source is alive and whose word is still in its admitted form is patched
+/// again, `b` to `n`'s entry, as [`link`] would write it now (the pairing was proved when the record was made; `n` is current,
+/// by this very revalidation), and moved out of the suspended segment (to the CR3 segment, or the TLB segment when the walk
+/// found `n` global), with one code synchronization for the batch. A record whose source is dead, or whose word holds anything
+/// else (the point was linked elsewhere meanwhile), is dropped. The walk keeps a cursor on the next record (`remove` and
+/// [`resume`] keep it right as records move).
+#[cfg(not(feature = "pic-count"))]
+fn relink(n: usize) {
+    let p = crate::perf::enter(crate::perf::RELINK);
+    if control().armed != 0 {
+        // (Every resident entry disarms first: a stop word could be overwritten here.)
+        crate::execution::halt_native([n as u64, control().armed, 0], natemu_abi::execution::stop::BAD_LINK)
+    }
+    let global = block(n).flags & GLOBAL != 0;
+    let entry = block(n).entry() - area::CODE_VA;
+    let mut batch = [0u32; 64];
+    let mut held = 0;
+    let mut at = block(n).inbound;
+    while at != 0 {
+        let i = u64::from(at) - 1;
+        let r = unsafe { record(i as usize).read() };
+        at = r.next_in;
+        if i >= control().links_susp {
+            continue; // a live record of the block (the list holds them all)
+        }
+        let source = block(r.source as usize);
+        let word_at = u64::from(source.code) + u64::from(r.offset);
+        if source.flags & DEAD != 0
+            || !source.links.iter().any(|p| p.offset != 0 && p.offset == r.offset && unlinked(source, p))
+        {
+            remove(i, SUSP, &mut at);
+            control().relink_dropped += 1;
+            continue;
+        }
+        unsafe { ((area::CODE_WRITE_VA + word_at) as *mut u32).write_volatile(branch(word_at, entry)) };
+        batch[held] = word_at as u32;
+        held += 1;
+        if held == batch.len() {
+            synchronize_offsets(batch.iter().map(|&o| u64::from(o)));
+            held = 0;
+        }
+        resume(i, r, global, &mut at);
+        control().relinked += 1;
+    }
+    if held != 0 {
+        synchronize_offsets(batch[..held].iter().map(|&o| u64::from(o)));
+    }
+    unsafe { (*block_ptr(n)).flags |= INBOUND };
+    crate::perf::leave(p);
+}
+/// [`relink`]'s record move: the suspended record `r` at slot `i` (its word patched) goes to the front of its target's list in
+/// the CR3 segment (the TLB segment if `global`), by boundary swaps, not [`insert`] (which moves each later segment's first record
+/// to its end without fixing a cursor). The last suspended record fills slot `i`; the suspended segment shrinks by that slot,
+/// which is now the CR3 segment's first; for a TLB destination the CR3 segment's last record fills that one in turn and the
+/// slot it leaves is the TLB segment's first. `follow` (the walk's cursor: a record's index + 1) is kept pointing at its record.
+#[cfg(not(feature = "pic-count"))]
+fn resume(i: u64, r: LinkRecord, global: bool, follow: &mut u32) {
+    list_del(i as usize);
+    let c = control();
+    let last = c.links_susp - 1;
+    if last != i {
+        unsafe { record(i as usize).write(record(last as usize).read()) };
+        list_moved(last, i);
+        if *follow == last as u32 + 1 {
+            *follow = i as u32 + 1;
+        }
+    }
+    c.links_susp = last;
+    let mut slot = last;
+    if global {
+        let end = c.links_cr3 - 1;
+        if end != last {
+            unsafe { record(last as usize).write(record(end as usize).read()) };
+            list_moved(end, last);
+            if *follow == end as u32 + 1 {
+                *follow = last as u32 + 1;
+            }
+        }
+        c.links_cr3 = end;
+        slot = end;
+    }
+    unsafe {
+        record(slot as usize).write(LinkRecord {
+            prev_in: 0,
+            next_in: 0,
+            ..r
+        })
+    };
+    list_add(slot as usize);
 }
 /// Self-check: every link point of every placed block holds its admitted word (after [`unlink_all`]).
 pub fn links_restored() -> bool {

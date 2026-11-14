@@ -706,10 +706,15 @@ pub struct K1 {
 struct K1Relink {
     linked_current: u64,
     linked_current_us: u64,
+    /// Records suspended at TLB events, relinked at revalidations, and dropped by a relink; the suspended segment's length now.
+    suspended: u64,
+    relinked: u64,
+    relink_dropped: u64,
+    links_susp: u64,
 }
 impl K1Relink {
     fn is_empty(&self) -> bool {
-        self.linked_current | self.linked_current_us == 0
+        self.linked_current | self.linked_current_us | self.suspended | self.relinked | self.relink_dropped | self.links_susp == 0
     }
 }
 /// `Control::pages` and its counters: fetch walks made, record hits, check-mode differences, 2 MiB leaves not recorded.
@@ -960,6 +965,10 @@ impl K1 {
             relink: K1Relink {
                 linked_current: c.linked_current,
                 linked_current_us: us(c.linked_current_ticks),
+                suspended: c.suspended,
+                relinked: c.relinked,
+                relink_dropped: c.relink_dropped,
+                links_susp: c.links_susp,
             },
         }
     }
@@ -1204,8 +1213,15 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
     let records: Vec<cache::LinkRecord> = (0..control.links as usize)
         .map(|i| link_record(area, i))
         .collect();
+    // Relink plan: the segments in order (suspended, CR3, TLB, local, checked); the suspended records (their words restored at a
+    // TLB event) are not linked points: only the live ones are described by the words below.
+    let ends = [control.links_susp, control.links_cr3, control.links_tlb, control.links_local, control.links];
+    if ends.windows(2).any(|w| w[0] > w[1]) {
+        return Err(format!("link segment ends {ends:?} are not in order"));
+    }
+    let live = &records[control.links_susp as usize..];
     // Each record also holds the patched word as admitted: the point's first word, or (checked) `svc #LINK`.
-    let described = records.iter().all(|r| {
+    let described = live.iter().all(|r| {
         let Some(b) = blocks.get(r.source as usize) else {
             return false;
         };
@@ -1232,10 +1248,10 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     }
             })
     });
-    if !described || records.len() != linked.len() {
+    if !described || live.len() != linked.len() {
         return Err(format!(
-            "{} link records for {} linked points",
-            records.len(),
+            "{} live link records for {} linked points",
+            live.len(),
             linked.len()
         ));
     }
@@ -1265,6 +1281,47 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         let local = i as u64 >= control.links_tlb;
         let current = t.checked == control.epoch
             || (t.flags & cache::GLOBAL != 0 && t.checked >= control.global_epoch);
+        // A suspended record (relink plan): a live source and target, the target not current (the epoch moved at the event that
+        // suspended it, and the target is revalidated only by a lookup, which relinks or drops its records), INBOUND set (a cut
+        // must find the list), the point it names present with its admitted word, and that word unlinked, or held by exactly one
+        // live record of the same point (the point was linked elsewhere meanwhile: the linker's link into another block of the
+        // same RIP).
+        if (i as u64) < control.links_susp {
+            let source = &blocks[r.source as usize];
+            let point = source.links.iter().find(|p| p.offset != 0 && p.offset == r.offset);
+            let admitted = point.is_some_and(|p| {
+                r.original == p.word
+                    && word(u64::from(source.code) + u64::from(p.offset)) == p.word
+                    && word(u64::from(source.code) + natemu_abi::pic::svc_slot(|o| word(u64::from(source.code) + o), p))
+                        == natemu_abi::pic::SVC_LINK
+            });
+            let held = linked.contains_key(&(r.source, r.offset));
+            let mut why = None;
+            if source.flags & cache::DEAD != 0 || t.flags & cache::DEAD != 0 {
+                why = Some("a dead end");
+            } else if current {
+                why = Some("a current target");
+            } else if t.flags & cache::INBOUND == 0 {
+                why = Some("no INBOUND on the target");
+            } else if point.is_none() || r.original != point.map_or(0, |p| p.word) {
+                why = Some("no such link point, or another original word");
+            } else if !admitted && !held {
+                why = Some("a word that is neither unlinked nor held by a live record");
+            }
+            if let Some(why) = why {
+                return Err(format!("suspended record {i} into the block at {:#x}: {why}", t.rip));
+            }
+            continue;
+        }
+        // The live CR3 segment's targets are not global, the TLB segment's are.
+        if !local && ((i as u64) < control.links_cr3) == (t.flags & cache::GLOBAL != 0) {
+            return Err(format!(
+                "record {i} ({}) into the block at {:#x}, flags {:#x}",
+                if (i as u64) < control.links_cr3 { "CR3 segment" } else { "TLB segment" },
+                t.rip,
+                t.flags
+            ));
+        }
         if local && t.flags & cache::LOCAL_INBOUND == 0
             || !local && !(current && t.flags & cache::INBOUND != 0)
         {
