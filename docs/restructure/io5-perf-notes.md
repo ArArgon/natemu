@@ -185,6 +185,15 @@ Rules learned in this round:
     with `NATEMU_QEMU_CACHE=off NATEMU_ASM_CACHE=off`. Remaining cost: ~40k VM launches per suite (a multi-program
     launch mode would cut it; measure a launch first).
 
+20. **Flush policy stopped after its count** (chunk 0, branch `flush-count`, profile `natemu-raw/flush-count-profile-1`,
+    `replay.txt`). The replay reproduced the census refetches (configure 1.199 M vs 1.155 M, +3.8%; make 2.757 M vs
+    2.830 M, -2.6%). Refetches come right after a flush (40% / 20% within the first C/16 placements; only 12% / 7.6%
+    later than C/2): the hot set is relearned at once, so carrying blocks forward costs about what it saves — (b)
+    carry-over nets +0.1 / +1.5 vCPU-s, (c) halves + carry-over -0.4 / +0.9. Only (a) slim instance records + a 2 Mi
+    index clears the floor at today's refetch price: +1.8 (1.6%) / +3.9 (0.7%), optimistic. The shared pool cuts the
+    host part of a refetch from ~2.0 to ~0.75 us, which puts (a) below the 1% floor, so the pool goes first and (a) is
+    re-evaluated after it (same replay, pool cost). Trace files pruned; replay.txt kept.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
