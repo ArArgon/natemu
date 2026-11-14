@@ -142,7 +142,7 @@ pub(crate) fn same_place(from: u64, to: u64) -> bool {
     (from ^ to) & (1 << 63 | 0xfff) == 0
 }
 
-fn read<T: Copy>(b: &[u8], at: usize) -> Option<T> {
+pub(crate) fn read<T: Copy>(b: &[u8], at: usize) -> Option<T> {
     let bytes = b.get(at..at.checked_add(size_of::<T>())?)?;
     // SAFETY: in bounds; the records are plain little-endian integers (`read_unaligned`).
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })

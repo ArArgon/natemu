@@ -32,7 +32,9 @@ pub mod io_test;
 /// metadata arena and its code area (the `exec`/`cache` offsets); block v (`v * stride` further) holds vCPU v's own
 /// window, lookup area, metadata arena and code area at the same offsets and leaves the global area's range unused
 /// (never mapped, so never backed): every vCPU maps block 0's. Guest RAM (M1: `ram_bytes`, chosen at prepare) follows
-/// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed.
+/// the last block, at `n * stride`; only the pages the guest or the host touch are ever backed. With the template pool
+/// ([`prepare_with_pool`]) its span (`cache::POOL_BYTES`) lies between the last block and guest RAM (RAM stays the backing's
+/// last bytes), every vCPU maps it read-only at `cache::POOL_VA`.
 pub struct Backing {
     /// Shared (not borrowed) by whatever outlives a move of the Backing: the chipset's LAPIC view ([`crate::irq`]) and the
     /// VM ([`Machine`]). Not public: replacing it would leave `ram` pointing into a mapping that is gone.
@@ -49,6 +51,8 @@ pub struct Backing {
     io_epoch: Mutex<u64>,
     /// Granted windows, for the performance log ([`io::WindowCounts`]).
     io_counts: io::WindowCounters,
+    /// The template pool's writer, shared by the run's compilers ([`Compiler::pool`]); `None`: no pool in this backing.
+    pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
 }
 impl Backing {
     /// The backing's mapping (shared: whoever holds a clone keeps it mapped).
@@ -149,6 +153,18 @@ impl Area<'_> {
 /// address space and shared record in place; guest RAM is zero. Each vCPU's code cache holds `code_bytes` of generated
 /// code (at most `cache::CODE_BYTES_MAX`).
 pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) -> Result<Backing> {
+    prepare_with_pool(resident, code_bytes, n, ram_bytes, false)
+}
+/// [`prepare`], with the shared template pool ([`natemu_abi::pool`]) when `pool` is set: its span is backed before guest RAM
+/// and mapped read-only into every vCPU's window, and the host publishes admitted templates into it (the resident does not
+/// read it yet).
+pub fn prepare_with_pool(
+    resident: &str,
+    code_bytes: usize,
+    n: usize,
+    ram_bytes: usize,
+    pool: bool,
+) -> Result<Backing> {
     unsafe extern "C" {
         fn getentropy(buf: *mut u8, len: usize) -> i32;
     }
@@ -156,7 +172,7 @@ pub fn prepare(resident: &str, code_bytes: usize, n: usize, ram_bytes: usize) ->
         // SAFETY: the buffer is writable and 8 bytes, below getentropy's 256-byte limit.
         unsafe { getentropy(bytes.as_mut_ptr(), bytes.len()) }
     })?;
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, pool)
 }
 
 fn random_guest_state_alias(fill: impl FnOnce(&mut [u8; 8]) -> i32) -> Result<u64> {
@@ -181,7 +197,7 @@ pub fn prepare_with_guest_state_alias(
     ram_bytes: usize,
     va: u64,
 ) -> Result<Backing> {
-    prepare_at_alias(resident, code_bytes, n, ram_bytes, va)
+    prepare_at_alias(resident, code_bytes, n, ram_bytes, va, false)
 }
 
 fn prepare_at_alias(
@@ -190,6 +206,7 @@ fn prepare_at_alias(
     n: usize,
     ram_bytes: usize,
     va: u64,
+    pool: bool,
 ) -> Result<Backing> {
     if !exec::guest_state_alias_valid(va) {
         return Err(format!(
@@ -217,7 +234,10 @@ fn prepare_at_alias(
     }
     let code_mapped = (cache::HEAD_BYTES + code_bytes).next_multiple_of(cache::BLOCK);
     let stride = exec::BACKING_BYTES + code_mapped;
-    let ram_offset = n * stride;
+    // The pool's span follows the last block and precedes guest RAM, so RAM stays the backing's last bytes (N7).
+    let pool_offset = n * stride;
+    let pool_bytes = if pool { cache::POOL_BYTES } else { 0 };
+    let ram_offset = pool_offset + pool_bytes;
     let ram_span = exec::ram_end(ram_bytes as u64) as usize;
     let memory = Memory::with_size(ram_offset + ram_span)?;
     load_resident(&memory, resident)?;
@@ -270,6 +290,13 @@ fn prepare_at_alias(
                 cache::GLOBAL_OFFSET,
             ),
         ]);
+        if pool {
+            spans.push(Span::read_only(
+                (cache::POOL_VA - PRIVATE) as usize,
+                cache::POOL_BYTES,
+                pool_offset,
+            ));
+        }
         if ram_bytes as u64 > exec::LOW_RAM_END {
             spans.push(Span::data(
                 (exec::GUEST_RAM_VA - PRIVATE + exec::HIGH_RAM_START) as usize,
@@ -294,14 +321,18 @@ fn prepare_at_alias(
     }
     // SAFETY: the alias is the backing's last `ram_span` bytes, alive as long as the Backing holding this value.
     let ram = unsafe { exec::guest_ram(ram_bytes as u64, memory.0 as u64 + ram_offset as u64) };
+    let memory = Arc::new(memory);
+    // Zero memory, nothing reading yet: the publisher makes the pool empty and on.
+    let pool = pool.then(|| Arc::new(crate::publisher::Publisher::new(memory.clone(), pool_offset)));
     Ok(Backing {
-        memory: Arc::new(memory),
+        memory,
         n,
         stride,
         ram,
         epoch: unsafe { mach_absolute_time() },
         io_epoch: Mutex::new(0),
         io_counts: io::WindowCounters::default(),
+        pool,
     })
 }
 /// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no).
@@ -1659,7 +1690,7 @@ impl Answer {
     }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-const GATING: usize = 11;
+pub(crate) const GATING: usize = 11;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -1742,6 +1773,9 @@ struct Entry {
     answer: Answer,
     /// Option (d): what admission made of `answer` at `rip`, set by the first use there ([`Compiler::answered`]).
     kept: std::sync::OnceLock<Box<Kept>>,
+    /// The template pool: the position this answer was last published at (0: never), so it is published once and again only
+    /// when that position has fallen below the ring's tail ([`crate::publisher::Publisher::publish`]).
+    published: AtomicU64,
 }
 /// Why an object answer was admitted again, or not ([`Compiler::admissions`]; the performance log's `state.admissions`). A hit
 /// that cannot reuse its kept form gets the first of `CPL0`, `BULK`, `SHAPE`, `SHORT_PREFIX` that applies.
@@ -2144,6 +2178,11 @@ pub struct Compiler {
     /// halving retry made it ([`Compiler::compile`]); the template rule of reuse inside the resident (perf chunk 10).
     read: usize,
     halved: bool,
+    /// The template pool's writer (the run's; [`Backing::pool`]) and, with it set, the answer the last request used and the
+    /// (context, gating values) pairs this vCPU already told it about ([`Compiler::note_gating`]).
+    pub(crate) pool: Option<Arc<crate::publisher::Publisher>>,
+    last: Option<Arc<Entry>>,
+    noted: Vec<(u64, [u64; GATING])>,
 }
 /// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
 /// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]); and
@@ -2257,6 +2296,9 @@ impl Compiler {
             perf: None,
             read: 0,
             halved: false,
+            pool: None,
+            last: None,
+            noted: Vec::new(),
         }
     }
     /// The admitted block for `bytes` at `rip` (only its first instruction if `step`); else the system instruction at
@@ -2273,6 +2315,7 @@ impl Compiler {
         // block stops `code_too_large`. R2 review: the same for a block with a spill area (`spill_area`).
         let mut limit = if step { Some(1) } else { self.max_instructions };
         self.halved = false;
+        self.last = None;
         loop {
             match self.compile_once(bytes, rip, limit, hook)? {
                 Ok(code) => return Ok(code),
@@ -2332,6 +2375,9 @@ impl Compiler {
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
             if let Some(code) = self.reuse(e, bytes, rip, limit, hook, None)? {
+                if self.pool.is_some() {
+                    self.last = Some(e.clone());
+                }
                 self.hits += 1;
                 self.hits_by_source[usize::from(e.owner)] += 1;
                 self.read = e.prefix.len();
@@ -2364,6 +2410,7 @@ impl Compiler {
                 whole,
                 answer: Answer::new(reply, at)?,
                 kept: Default::default(),
+                published: AtomicU64::new(0),
             });
             let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
             self.waited(waited);
@@ -2393,7 +2440,12 @@ impl Compiler {
                 why::FRESH
             };
             match self.reuse(&entry, bytes, rip, limit, hook, Some(origin))? {
-                Some(code) => return Ok(code),
+                Some(code) => {
+                    if self.pool.is_some() {
+                        self.last = Some(entry);
+                    }
+                    return Ok(code);
+                }
                 None => disk = false, // a disk answer for another RIP that is not fexc's here
             }
         }
@@ -2414,7 +2466,55 @@ impl Compiler {
                 "natemu: vCPU {} presents other features than the run's first compiler: it keeps its own answers",
                 self.vcpu
             );
+            // The pool is keyed without features: with a vCPU that differs it is off for the run.
+            if let Some(pool) = self.pool.take() {
+                pool.disable(crate::publisher::off::FEATURES);
+            }
         }
+    }
+    /// The template pool: the answer the last request used, published as the admitted `block` at `rip` under `context` when
+    /// the host found it a `template` (once per answer, [`crate::publisher::Publisher::publish`]; `rep_exits`: the reply's).
+    fn publish(
+        &mut self,
+        template: bool,
+        context: u64,
+        rip: u64,
+        block: &admission::Admitted,
+        rep_exits: u64,
+    ) -> Option<crate::publisher::Published> {
+        let (pool, entry) = (self.pool.as_ref()?, self.last.take()?);
+        template.then(|| {
+            pool.publish(
+                &entry.published,
+                &crate::publisher::Template {
+                    rip,
+                    context,
+                    prefix: &entry.prefix,
+                    block,
+                    rep_exits,
+                },
+            )
+        })
+    }
+    /// The template pool: a non-step block request under `context` with this compiler's gating values (a vCPU tells the
+    /// pool each pair once). A context whose requests differ in them turns the pool off ([`crate::publisher::Publisher::note`]);
+    /// under the check mode that is a host error.
+    fn note_gating(&mut self, context: u64) -> Result<()> {
+        let Some(pool) = &self.pool else { return Ok(()) };
+        let gating = self.gating();
+        if self.noted.contains(&(context, gating)) {
+            return Ok(());
+        }
+        if !pool.note(context, &gating) && self.check_reuse {
+            return Err(format!(
+                "pool: gating values {gating:?} under context {context:#x} differ from an earlier request's"
+            ));
+        }
+        if self.noted.len() == 8 {
+            self.noted.remove(0);
+        }
+        self.noted.push((context, gating));
+        Ok(())
     }
     /// The kept answer `e`, used at `rip`: as it is for its own RIP; for another, relocated (`None`: it would not be fexc's
     /// at `rip`, or admission refused the relocated object; logged; the caller compiles). `origin`: a [`why`] when this is
@@ -2817,6 +2917,15 @@ impl Compiler {
         self.charge(crate::perf::DISK_PUT, t);
         Ok((reply, rip))
     }
+}
+/// The reply's `rep_exits`: bit i set when link point i is the self-exit of the REP string instruction that ends the block.
+fn rep_exit_mask(block: &admission::Admitted) -> u64 {
+    block
+        .links
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| Some(p.target) == block.rep_self)
+        .fold(0, |m, (k, _)| m | 1 << k)
 }
 /// The performance log's hash of the guest bytes an answer read.
 fn hash(bytes: &[u8]) -> u64 {
@@ -3467,6 +3576,9 @@ fn translation(
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
         compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
+        if !step {
+            compiler.note_gating(state.cpu.code_context())?;
+        }
         let code = compiler.compile(&bytes, rip, step, hook)?;
         match &code {
             // The instruction at RIP runs past a breakpoint the bytes were cut at.
@@ -3598,20 +3710,19 @@ fn translation(
     state.link_points = [exec::LinkPoint::NONE; exec::MAX_LINK_POINTS];
     state.link_points[..block.links.len()].copy_from_slice(&block.links);
     state.dispatch_exit = block.dispatch_exit.map_or(0, u64::from);
-    state.rep_exits = block
-        .links
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| Some(p.target) == block.rep_self)
-        .fold(0, |m, (k, _)| m | 1 << k);
+    state.rep_exits = rep_exit_mask(&block);
     state.sti_first = u64::from(block.sti_first);
     compiler.charge(crate::perf::STAGE, t);
+    // The template pool (cross-vCPU reuse plan, chunk 2): a template is published after its admission, once per answer; the
+    // resident does not read the pool yet.
+    compiler.publish(template, state.cpu.code_context(), rip, &block, state.rep_exits);
     Ok(Ok(exec::REPLY_ADMITTED))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publisher::Published;
     #[test]
     fn link_cap_env_is_validated() {
         assert_eq!(link_cap_from(None), Ok(0));
@@ -3660,7 +3771,7 @@ mod tests {
             exec::GUEST_STATE_SLOT.end,
         ] {
             assert!(
-                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va)
+                prepare_at_alias("missing-resident", cache::CODE_BYTES, 1, cache::BLOCK, va, false)
                     .err()
                     .unwrap()
                     .starts_with("guest-state alias")
@@ -3962,6 +4073,7 @@ mod tests {
                 whole: false,
                 answer: Answer::Object(A.0.to_vec()),
                 kept: Default::default(),
+                published: AtomicU64::new(0),
             }
         }
         fn block(c: &Compiler, answer: &Answer, e: &Entry, rip: u64) -> Result<admission::Admitted> {
@@ -4083,6 +4195,7 @@ mod tests {
                 whole: honest.whole,
                 answer: honest.answer.clone(),
                 kept: Default::default(),
+                published: AtomicU64::new(0),
             };
             f.kept.set(Box::new(Kept { cpl0: k.cpl0, bulk: k.bulk, shape: k.shape, form })).ok().unwrap();
             assert!(c.reuse(&f, USER, B.1, None, &mut (), None).is_err());
@@ -4153,6 +4266,7 @@ mod tests {
             whole: false,
             answer: Answer::Object(prefix.into()),
             kept: Default::default(),
+                published: AtomicU64::new(0),
         })
     }
 
@@ -5510,6 +5624,142 @@ mod tests {
                 .unwrap();
             assert!(e.contains("guest RAM"), "{e}");
         }
+    }
+
+    /// The template pool's backing (cross-vCPU reuse plan, N7): its span follows the last vCPU's block and precedes guest RAM
+    /// (RAM stays the backing's last bytes, shifted by exactly the span), every vCPU maps it at `cache::POOL_VA` read-only and
+    /// never executable, and the pool starts empty and on. Without a pool nothing changes: RAM follows the last block and
+    /// the pool's address range is unmapped.
+    #[test]
+    fn the_pool_is_backed_before_guest_ram_and_mapped_read_only() {
+        let path =
+            std::env::temp_dir().join(format!("natemu-pool-backing-{}.elf", std::process::id()));
+        std::fs::write(
+            &path,
+            crate::memory::tests::resident_elf(&[(crate::PRIVATE, 4)]),
+        )
+        .unwrap();
+        let resident = path.to_str().unwrap();
+        let ram = 4usize << 20;
+        let entry = (cache::POOL_VA - PRIVATE) as usize % (1 << 30) / cache::BLOCK * 8;
+        for pool in [false, true] {
+            let b = prepare_with_pool(resident, cache::CODE_BYTES, 2, ram, pool).unwrap();
+            let span = if pool { cache::POOL_BYTES } else { 0 };
+            let (pool_offset, ram_offset) = (2 * b.stride, 2 * b.stride + span);
+            assert_eq!(b.memory.1, ram_offset + exec::ram_end(ram as u64) as usize);
+            // Guest RAM's alias starts at the end of the span, whatever is before it.
+            assert_eq!(
+                b.ram.range(0, 8).unwrap() as usize,
+                b.memory.0 as usize + ram_offset
+            );
+            assert_eq!(b.pool.is_some(), pool);
+            for v in 0..2 {
+                let window = v * b.stride;
+                let descriptor = |table: usize, index: usize| {
+                    u64::from_le_bytes(b.memory.read::<8>(window + table + index * 8))
+                };
+                // The pool's block descriptors (the first, a middle one, the last), in the window's second GiB.
+                let blocks = cache::POOL_BYTES / cache::BLOCK;
+                for k in [0, blocks / 2, blocks - 1] {
+                    let d = descriptor(exec::RAM_TABLES_OFFSET, entry / 8 + k);
+                    if !pool {
+                        assert_eq!(d, 0);
+                        continue;
+                    }
+                    assert_eq!(d & 3, 1, "a block descriptor");
+                    assert_eq!(
+                        d & 0x0000_ffff_ffe0_0000,
+                        crate::IPA + (pool_offset + k * cache::BLOCK) as u64
+                    );
+                    assert_eq!(d >> 53 & 3, 3, "never executable (PXN, UXN)");
+                    assert_eq!(d >> 6 & 3, 2, "AP: EL1 read-only, no EL0 access");
+                }
+                // Guest RAM's first block, in the third GiB, targets the shifted offset.
+                assert_eq!(
+                    descriptor(exec::RAM_TABLES_OFFSET + 4096, 0) & 0x0000_ffff_ffe0_0000,
+                    crate::IPA + ram_offset as u64
+                );
+            }
+            if let Some(p) = &b.pool {
+                let pool = p.pool();
+                assert!(pool.enabled() && pool.tail() == 0);
+                // The writer's span is the one the windows map: its first word is the switch, in the pool's first block.
+                assert_eq!(
+                    b.memory.read::<8>(pool_offset),
+                    1u64.to_le_bytes(),
+                    "the switch"
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Compiles with the real fexc (`FEXC`): the answer a vCPU compiles is published once, whichever vCPU's request used
+    /// it; the pool holds the block's code at the RIP it was admitted at with the bytes it read.
+    #[test]
+    fn answers_are_published_once_whichever_vcpu_uses_them() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let layout = natemu_abi::pool::PRODUCTION;
+        let memory = Arc::new(Memory::with_size(layout.span_bytes()).unwrap());
+        let publisher = Arc::new(crate::publisher::Publisher::new(memory, 0));
+        let answers = std::sync::OnceLock::new();
+        let compiler = |vcpu| {
+            let mut c = Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+            c.vcpu = vcpu;
+            c.pool = Some(publisher.clone());
+            c.share(&answers);
+            c
+        };
+        let (mut c0, mut c1) = (compiler(0), compiler(1));
+        let mut bytes = vec![0x48, 0x01, 0xd8, 0xc3];
+        bytes.resize(64, 0x90);
+        let context = 7;
+        let mut block = |c: &mut Compiler, rip| {
+            c.note_gating(context).unwrap();
+            let Code::Block(b) = c.compile(&bytes, rip, false, &mut ()).unwrap() else {
+                panic!()
+            };
+            let mask = rep_exit_mask(&b);
+            (c.publish(true, context, rip, &b, mask), b)
+        };
+        let (first, b0) = block(&mut c0, 0x40_1000);
+        let Some(Published::Done(at)) = first else {
+            panic!("{first:?}")
+        };
+        // Another vCPU's request, at another RIP of the half and page offset, is a hit of that answer: already published.
+        let (second, b1) = block(&mut c1, 0x50_1000);
+        assert_eq!(second, Some(Published::Already));
+        assert_eq!((c1.hits, c1.compiles, c0.compiles), (1, 0, 1));
+        // A step request is not a template, and a non-template is not published.
+        c0.last = None;
+        assert_eq!(c0.publish(false, context, 0x40_1000, &b0, 0), None);
+        let pool = publisher.pool();
+        let mut staging = vec![0; natemu_abi::pool::MAX_ENTRY_BYTES];
+        let e = pool.fetch(at, &mut staging).unwrap();
+        assert_eq!((e.rip, e.context, e.guest_bytes), (0x40_1000, context, b0.guest_bytes));
+        let h: natemu_abi::code_object::Header =
+            crate::relocation::read(&b0.object, 0).unwrap();
+        assert_eq!(
+            e.code,
+            &b0.object[h.code_offset as usize..][..h.code_size as usize]
+        );
+        assert!(e.prefix.len() >= 4 && e.prefix.len() < bytes.len() && e.prefix == &bytes[..e.prefix.len()]);
+        let key = natemu_abi::pool::Key::new(context, 0x7000_1000, &bytes, natemu_abi::pool::LEAD);
+        assert!(pool.probe(&key).contains(&at));
+        // Published by the admitted block at `rip`, whichever vCPU: the other RIP's block has other literals but the same size.
+        assert_eq!(b1.object.len(), b0.object.len());
+        // Gating: another vCPU's requests of the same context with other values turn the pool off (a host error under the check).
+        c1.sse_gated = true;
+        c1.check_reuse = true;
+        assert!(c1.note_gating(context).is_err());
+        assert!(publisher.is_off() && !pool.enabled());
+        let (third, _) = {
+            c1.check_reuse = false;
+            block(&mut c0, 0x60_1000)
+        };
+        assert_eq!(third, Some(Published::Skipped(crate::publisher::Why::Off)));
     }
 
     /// The bytes come only from the pages the resident walked: RIP's page to its end (more may follow until the next

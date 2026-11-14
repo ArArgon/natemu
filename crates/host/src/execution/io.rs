@@ -897,6 +897,7 @@ pub(crate) mod tests {
             epoch: 0,
             io_epoch: Mutex::new(0),
             io_counts: WindowCounters::default(),
+            pool: None,
         }
     }
     fn read(b: &Backing, at: usize, len: usize) -> Vec<u8> {

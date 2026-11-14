@@ -69,6 +69,10 @@ pub struct Boot {
     pub disk: Option<PathBuf>,
     /// Expose the virtio-MMIO network device on user-mode NAT ([`crate::virtio::Slirp`]).
     pub net: bool,
+    /// The shared template pool (cross-vCPU reuse plan, chunk 2): back a read-only span of about 274 MiB before guest RAM,
+    /// map it into every vCPU and publish admitted templates into it. The resident does not read it yet, so this only costs
+    /// the publication. Off by default. `--pool` / `NATEMU_POOL`.
+    pub pool: bool,
 }
 
 impl Boot {
@@ -96,6 +100,7 @@ impl Boot {
             rng: false,
             disk: None,
             net: false,
+            pool: false,
         }
     }
 
@@ -114,11 +119,12 @@ impl Boot {
         };
         layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
         require_vcpus(self.vcpus)?;
-        let backing = execution::prepare(
+        let backing = execution::prepare_with_pool(
             &self.runtime.to_string_lossy(),
             self.code_bytes,
             self.vcpus,
             self.ram as usize,
+            self.pool,
         )?;
         let mut manifest = Vec::new();
         if self.rng {
@@ -405,6 +411,7 @@ impl Prepared {
             compiler.disk = compile_cache::shared(&self.fexc, &self.compile_cache)?; // P3: the persistent compile cache
             compiler.perf = crate::perf::Recorder::new(v, start)?;
             compiler.vcpu = v as u8;
+            compiler.pool = backing.pool.clone();
             compiler.share(&answers);
             compiler.check_reuse = self.check_reuse;
             compiler.shape = self.code_shape;
@@ -564,6 +571,9 @@ impl Prepared {
         });
         if let Some(a) = answers.get() {
             crate::perf::line(&a.report());
+        }
+        if let Some(p) = &backing.pool {
+            crate::perf::line(&p.report());
         }
         if crate::perf::on() {
             crate::perf::line(&backing.io_window_counts().perf_line());

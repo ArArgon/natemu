@@ -107,6 +107,9 @@ pub(crate) struct Args {
     speculation_barriers: bool,
     #[arg(long)]
     rng: bool,
+    /// Publish admitted templates into the shared pool (cross-vCPU reuse plan chunk 2; the resident does not read it yet)
+    #[arg(long, env = "NATEMU_POOL", value_parser = clap::builder::BoolishValueParser::new())]
+    pool: bool,
     #[arg(long, value_name = "FILE")]
     serial: Option<String>,
     #[arg(long, env = "NATEMU_SERIAL_STDIN", value_parser = clap::builder::BoolishValueParser::new())]
@@ -149,6 +152,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         code_shape,
         speculation_barriers,
         rng,
+        pool,
         serial,
         serial_stdin,
         strict,
@@ -243,6 +247,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         code_shape,
         speculation_barriers,
         rng,
+        pool,
         ..natemu::linux::Boot::new(resident, fexc, image)
     };
     if let Some(path) = &serial {
