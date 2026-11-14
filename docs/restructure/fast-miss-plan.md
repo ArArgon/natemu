@@ -236,8 +236,9 @@ independent review before the gate, with the stale-state grep of 2.2 as a named 
     `miss_fast` per round 2, `revalidated` 0.
   - `miss-step` (QEMU): warm V, evict; TF set by `popf`; `jmp r13` to V: the single-step #DB is delivered after V's
     first instruction (the handler records RIP). Second part, TF clear: DR0 as an instruction breakpoint at V, warm and
-    evict with DR7 armed throughout (the code context includes DR7, so the warm block is in the armed context's table):
-    #DB before V's first instruction.
+    run V with DR7 armed throughout: a block at an armed instruction breakpoint is never put in L1 (`execution.rs:367`),
+    so no evict is needed, and each warming run delivers a #DB the test expects (the code context includes DR7 only
+    for data breakpoints, abi `execution.rs:1850-1851`): #DB before V's first instruction.
   - `miss-ac` (QEMU): CR0.AM and RFLAGS.AC at CPL 3 throughout (AC is part of the code context, abi `execution.rs:1851`,
     so warm and evict happen in that context): warm V, evict, `jmp r13` to V, whose first instruction is a misaligned
     load: #AC (the resume must set SCTLR_EL1.A).
@@ -280,7 +281,7 @@ hits now taken by the fast path (`miss_fast` counts).
 | skips `cache::pending` | hook case (b): counter 0, old bytes |
 | skips `events::none`, or reads IF from the record instead of the page at CPL 0 | hook case (c): counter 0, late delivery |
 | resumes without SCTLR_EL1.A | `miss-ac` |
-| PSTATE from the gate's SPSR instead of `BLOCK_SPSR | nzcv` | the resident checkers (SPSR.M/DAIF of generated code), `miss-counts` values |
+| PSTATE from the gate's SPSR instead of `BLOCK_SPSR | nzcv` | equivalent today (the gate's SPSR from EL0 is always `0x340 | NZCV`: SS cannot be set because DR7 declines); kept as a by-construction rule, no test can catch it |
 | takes a `SYSTEM` target as a block | `miss-system` (halt or wrong values) |
 | ignores `uncached_count` | the M2 UC programs (`run_slice3_vm.py`'s uncached cases) |
 | ignores `mov_ss`/`sti_shadow`/`mid_string` | the X2 shadow and REP tests (`events`, K1 `string` cases) |
