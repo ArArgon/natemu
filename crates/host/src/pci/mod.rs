@@ -9,11 +9,13 @@ use configuration::{PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeader
 use std::sync::{Arc, Mutex};
 
 pub mod platform {
-    /// The 32-bit memory window the bus forwards, `[start, end)`. The registry is frozen at launch, so the bus
-    /// registers all of it as one range and decodes BARs itself; a BAR outside it never decodes (PCI 3.0 3.2.5: a host
-    /// bridge forwards only the windows it is configured with). Also `_CRS` of `\_SB.PCI0` (ACPI 6.5 6.4.3.5).
+    /// The 32-bit memory window the bus forwards, `[start, end)`: natemu's choice, and the window the ACPI root
+    /// bridge's `_CRS` declares (`\_SB.PCI0`, ACPI 6.5 6.4.3.5). The registry is frozen at launch, so the bus
+    /// registers all of it as one range and decodes BARs itself; a BAR outside it never decodes, as the root bridge
+    /// forwards only what `_CRS` declares.
     pub const WINDOW: (u32, u32) = (0xE000_0000, 0xF000_0000);
-    /// Where firmware, on a PC, would program BAR0 of the function in `slot` (PCI 3.0 6.2.5.1): a 64 KiB stride.
+    /// BAR0's launch-time address for the function in `slot`: the assignment a firmware would make (natemu boots
+    /// without one), at natemu's choice of a 64 KiB stride; BAR format and sizing are PCI 3.0 6.2.5.1.
     pub const fn bar(slot: u8) -> u32 {
         WINDOW.0 + 0x1_0000 * slot as u32
     }
@@ -169,8 +171,10 @@ impl Device for ConfigPorts {
     }
     fn write(&mut self, _: usize, offset: u64, size: u64, value: u64) -> bool {
         match offset {
-            // Only a dword write reaches the address register (3.2.2.3.2); narrower ones are ignored.
-            0 if size == 4 => self.address = value as u32,
+            // Only a dword write reaches the address register (3.2.2.3.2); narrower ones are ignored. It keeps
+            // only the defined bits: enable, bus, device, function, register (bits 30:24 and 1:0 read 0). QEMU's
+            // i440FX stores the raw value; this follows the specification.
+            0 if size == 4 => self.address = value as u32 & 0x80ff_fffc,
             4..=7 if offset - 4 + size <= 4 => {
                 if let Some((f, reg)) = self.selected() {
                     f.config_write(reg, offset - 4, &value.to_le_bytes()[..size as usize]);
@@ -397,6 +401,26 @@ mod tests {
         d.port(0, 0xcfb, 1, Some(0)).unwrap();
         d.port(0, 0xcfa, 2, Some(0)).unwrap();
         assert_eq!(d.port(0, 0xcf8, 4, None), Ok(0x8000_0800));
+        d.port(0, 0xcf8, 4, Some(0xffff_ffff)).unwrap();
+        assert_eq!(d.port(0, 0xcf8, 4, None), Ok(0x80ff_fffc));
+    }
+    #[test]
+    fn installed_window_serves_accesses_through_the_registry() {
+        let a = Stub::new(1, bar(1));
+        let mut b = Bus::new();
+        b.add(1, a.clone()).unwrap();
+        let mut d = Devices::new(1 << 30);
+        b.install(&mut d).unwrap();
+        // the registry's own lookup, then the handle it would call without the mutex
+        let (dev, off) = d.find(bar(1) + 0x10).unwrap();
+        assert_eq!(off, 0x1_0010);
+        let direct = dev.lock().unwrap().direct().unwrap();
+        assert_eq!(
+            direct.access(0, off, 4, None),
+            Access::Completed(1 << 32 | 0x10)
+        );
+        assert_eq!(direct.access(0, off, 4, Some(9)), Access::Completed(0));
+        assert_eq!(a.last_write.load(SeqCst), 0x10 << 8 | 9);
     }
 
     #[test]
