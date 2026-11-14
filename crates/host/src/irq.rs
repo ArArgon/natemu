@@ -228,6 +228,11 @@ impl Irqs {
     pub fn line(&self, irq: usize, level: bool) -> Delivery {
         self.lock().line(irq, level)
     }
+    /// Line `irq`'s input level (tests).
+    #[cfg(test)]
+    pub(crate) fn level(&self, irq: usize) -> bool {
+        self.lock().lines >> irq & 1 != 0
+    }
     /// A guard a source holds while it may still fire.
     pub fn busy(&self) -> Busy {
         self.live.fetch_add(1, SeqCst);

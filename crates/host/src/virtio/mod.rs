@@ -7,6 +7,7 @@
 //! destroying the VM.
 mod block;
 mod net;
+mod pci;
 mod profile;
 mod queue;
 mod slirp;
@@ -31,7 +32,7 @@ use std::{
     collections::VecDeque,
     ops::Range,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock,
         atomic::{
             AtomicBool, AtomicU64,
             Ordering::{Relaxed, SeqCst},
@@ -66,6 +67,9 @@ mod reg {
     pub const QUEUE_DEVICE_HIGH: u64 = 0xa4;
     /// Device-specific configuration space.
     pub const CONFIG: u64 = 0x100;
+    /// Tags the PCI transport's private registers (`pci.rs`), above every MMIO offset: the MMIO front end never
+    /// makes them, and `Virtio::access` ignores them if it ever did.
+    pub const PCI: u64 = 1 << 40;
 }
 
 /// Device status bits (virtio 1.3 §2.1).
@@ -169,6 +173,10 @@ struct State {
     /// (raised when it goes idle, after [`COALESCE`] of them or [`COALESCE_TIME`], or when RX starves).
     owed: u32,
     owed_at: Option<Instant>,
+    /// The queues those held-back interrupts are for (bit n: queue n); only the PCI transport reads it.
+    owing: u8,
+    /// PCI: the queues' and the configuration's MSI-X vectors (unused under MMIO).
+    vectors: pci::Vectors,
     /// The Status register.
     status: u32,
     /// DeviceFeaturesSel and DriverFeaturesSel.
@@ -327,6 +335,8 @@ pub struct Virtio {
     /// The features the driver accepted, once FEATURES_OK holds (0 otherwise, and after a reset):
     /// read lock-free by the owner (EVENT_IDX, network checksum offloads).
     accepted: AtomicU64,
+    /// The PCI transport, once [`Virtio::pci`] made this a PCI function; unset, the device is an MMIO device.
+    pci: OnceLock<pci::Transport>,
 }
 enum Profile {
     Entropy,
@@ -764,6 +774,7 @@ impl Virtio {
             gates: Default::default(),
             kicks: Default::default(),
             accepted: AtomicU64::new(0),
+            pci: OnceLock::new(),
         })
     }
     /// Install a finite native-call schedule before the test driver starts the VM.
@@ -863,9 +874,15 @@ impl Virtio {
             self.irqs.release();
         }
     }
-    /// Drive the interrupt line from InterruptStatus (level-triggered).
+    /// Drive the interrupt line from InterruptStatus (level-triggered); under PCI, the INTx line from the ISR
+    /// (`pci::Transport::isr`).
     fn irq(&self, s: &State) {
-        self.irqs.line(self.gsi, s.interrupt != 0);
+        match self.pci.get() {
+            Some(pci) => pci.isr(s.interrupt),
+            None => {
+                self.irqs.line(self.gsi, s.interrupt != 0);
+            }
+        }
     }
     fn busy(&self, s: &mut State) {
         if s.busy.is_none() {
@@ -923,6 +940,8 @@ impl Virtio {
                 self.accepted.store(0, SeqCst);
                 s.owed = 0;
                 s.owed_at = None;
+                s.owing = 0;
+                s.vectors = Default::default();
                 s.device_sel = 0;
                 s.driver_sel = 0;
                 s.queue_sel = 0;
@@ -939,6 +958,7 @@ impl Virtio {
                     ..s.queues[i]
                 };
                 s.notified[i] = false;
+                s.owing &= !(1 << i);
                 if i == 0 {
                     s.received.clear();
                     s.rx_starved = false;
@@ -980,14 +1000,24 @@ impl Virtio {
     fn fail(&self, s: &mut State) {
         s.status |= status::NEEDS_RESET;
         s.notified = [false; 2];
-        if s.status & status::DRIVER_OK != 0 {
+        let live = s.status & status::DRIVER_OK != 0;
+        if live {
             s.interrupt |= CONFIG_CHANGE;
         }
         self.irq(s);
+        if let Some(pci) = self.pci.get().filter(|_| live) {
+            pci.trigger(&s.vectors, 0, true);
+        }
     }
     /// One register access under the same lock as physical IRQ publication. Only reset/disable
     /// can defer here; the outer waiting queue orders conflicting accesses behind retirement.
     fn register(&self, s: &mut State, offset: u64, value: Option<u64>) -> Access {
+        if offset & reg::PCI != 0 {
+            return match self.pci.get() {
+                Some(_) => self.pci_register(s, offset, value),
+                None => Access::Completed(0),
+            };
+        }
         match value {
             None => Access::Completed(self.read_register(s, offset).into()),
             // The caller validated the full access width.
@@ -1055,7 +1085,11 @@ impl Virtio {
     /// request; an invalid size fails the device.
     fn write_queue_layout(&self, s: &mut State, queue: usize, offset: u64, value: u32) -> Access {
         if s.queues[queue].ready || s.queue_active(queue) {
-            return Access::Refused;
+            // Under PCI the write is ignored instead: a refused BAR0 access would stop the vCPU (pci.rs).
+            return match self.pci.get() {
+                Some(_) => Access::Completed(0),
+                None => Access::Refused,
+            };
         }
         if offset == reg::QUEUE_NUM {
             let max = self.profile.queue_max().into();
@@ -1164,6 +1198,14 @@ impl Virtio {
         if offset == reg::QUEUE_NOTIFY && value.is_some_and(|q| self.kick(q)) {
             return Access::Completed(0);
         }
+        if offset & reg::PCI != 0 {
+            return Access::Completed(0);
+        }
+        self.locked_access(vcpu, offset, value)
+    }
+    /// A register access under the state lock: it completes, or waits in arrival order behind a closing reset.
+    /// Shared by the MMIO and PCI front ends.
+    fn locked_access(&self, vcpu: usize, offset: u64, value: Option<u64>) -> Access {
         let mut s = self.lock();
         // Reserve the waiting slot before applying a deferred lifecycle effect: a refusal must
         // leave the device unchanged.
@@ -1373,6 +1415,7 @@ impl Virtio {
     /// it or a reset closed the incarnation (ACK, reset and level publication share the lock).
     fn interrupt(&self, s: &mut State, id: Identity, used: &Used) {
         if s.current(id) && used.interrupt_wanted() {
+            s.owing |= 1 << id.queue;
             if matches!(self.profile, Profile::Network(_)) {
                 let since = *s.owed_at.get_or_insert_with(Instant::now);
                 s.owed += 1;
@@ -1387,12 +1430,17 @@ impl Virtio {
     fn accepted(&self, feature: u64) -> bool {
         self.accepted.load(SeqCst) & feature != 0
     }
+    /// The used-buffer interrupt, for every queue that owes one (PCI: each owing queue's vector once).
     fn raise(&self, s: &mut State) {
         s.owed = 0;
         s.owed_at = None;
+        let queues = std::mem::take(&mut s.owing);
         profile::raised(s.interrupt == 0);
         s.interrupt |= USED_BUFFER;
         self.irq(s);
+        if let Some(pci) = self.pci.get() {
+            pci.trigger(&s.vectors, queues, false);
+        }
     }
     /// Run once on an independent scoped host thread. Cancellation/stop closes admission; the
     /// method joins normal disk shutdown before returning. Fatal disk timeout/cancellation may
@@ -1870,7 +1918,7 @@ mod tests {
         assert_ne!(s.status, 0);
     }
     /// Negotiate, lay out and enable `queues` (eight entries each), then set DRIVER_OK.
-    fn live(r: &Virtio, queues: &[u64]) {
+    pub(super) fn live(r: &Virtio, queues: &[u64]) {
         negotiated(r);
         for &q in queues {
             write(r, reg::QUEUE_SEL, q);
@@ -1882,7 +1930,7 @@ mod tests {
         }
         write(r, reg::STATUS, 15);
     }
-    fn net() -> Arc<Virtio> {
+    pub(super) fn net() -> Arc<Virtio> {
         let r = device();
         Virtio::network(
             r.irqs.clone(),
