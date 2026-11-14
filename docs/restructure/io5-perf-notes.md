@@ -224,6 +224,13 @@ Rules learned in this round:
     understood (the host's own relocation accepts these requests, so the pool path is stricter or publishes a
     different form).
 
+24. **Page record's count passes** (chunk 0, branch `page-count`, profile `natemu-raw/page-count-profile-1`, counts
+    only). A per-vCPU record of fetch-walk results would answer 90.7% / 94.4% of revalidation walks and 90.2% / 93.2%
+    of placement walks (configure / make); 91.3% / 94.5% of revalidated blocks would need no walk at all; 0
+    disagreements in 33.2 M / 62.8 M would-be hits. Would-hit walks cost 105-133 ns, probes ~10 ns. Modelled net 3.0
+    (2.7%) / 7.1 (1.3%) vCPU-s (gate 1.5 / 3.5). Built next together with the fast miss path (plan order), since the
+    record is what lets a revalidating miss stay on the fast path.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
