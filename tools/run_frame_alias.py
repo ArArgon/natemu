@@ -19,7 +19,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/reference')]
-import ref
+import ref, asmcache
+asmcache.install(ref)      # clang runs once per distinct text (tools/asmcache.py)
 
 CODE, DATA, HIGH = 0x100000, 0x200000, 0xffff800000200000
 FRAME, MASK = 0xffff400000001000, (1 << 64) - 1
@@ -239,13 +240,17 @@ def main():
     inputs['guest_state_alias_override'] = a.guest_state_alias
     (a.out / 'inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
     rows = []
+    baselines = {}      # prefix-only description -> its run: cases sharing a prefix state (84 of 186) run it once
     for c in cases():
         if a.only not in c['name']:
             continue
         for cpl in (0, 3):
             name = f'{c["name"]}-cpl{cpl}'
             text, at, end = description(c, cpl)
-            before, rc0 = execute(a, description(c, cpl, True)[0], a.out / name / 'prefix')
+            prefix_text = description(c, cpl, True)[0]
+            if prefix_text not in baselines:
+                baselines[prefix_text] = execute(a, prefix_text, a.out / name / 'prefix')
+            before, rc0 = baselines[prefix_text]
             got, rc = execute(a, text, a.out / name / 'probe')
             errors = ([f'prefix failed: {rc0}'] if not before or before['stop'] != 'reached' else
                       [f'probe failed: {rc}'] if not got else judge(c, before, got, at, end))
