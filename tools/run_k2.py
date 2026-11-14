@@ -18,7 +18,7 @@
   differences in ns per iteration against the plan's gate (predicted under 3 ns, unpredictable under 6 ns): a judgement
   for the main session, not a failure here. The 6 ns is per iteration of the walk, not per way-1 hit: only about half the
   visits are way-1 hits, and the way-0 entries of shared sets also branch unpredictably (way 0 or way 1).
-- `rdrand`: 4,000 RDRANDs in a loop (the pool holds 32): all succeed, about one entropy refill exit per 32, values differ.
+- `rdrand`: 4,000 RDRANDs in a loop (the pool holds ENTROPY_WORDS = 30): all succeed, about one entropy refill exit per 30, values differ.
 - `xmc`: cross-modifying code at a system instruction, by the x86 protocol (deterministic: see `xmc`): vCPU 1 rewrites
   one byte of X (CLI <-> NOP, CLI <-> STI, SWAPGS <-> RDTSCP, FLD m80 <-> FILD m32, CLI -> INT3) paced by vCPU 0's
   progress, then raises a flag; vCPU 0, after CPUID, must execute the new instruction (observed) every time; INT3 must be
@@ -232,6 +232,9 @@ def cost(a, report):
     return failures
 
 
+ENTROPY_WORDS = 30   # natemu_abi ENTROPY_WORDS (30 since the pool's state-page fields; was 32)
+
+
 def rdrand(a, report):
     """RDRAND in a loop far beyond the pool (32 words): every one succeeds (CF = 1, counted in r10), the pool refilled by
     one host exit each time it runs dry (`entropy_exits`), and the values are not all equal (r11 ORs their XOR with the first)."""
@@ -242,7 +245,7 @@ def rdrand(a, report):
     else:
         g = [int(v, 0) for v in out['gpr']]
         st = out['stats']
-        if out['stop'] != 'reached' or g[10] != n or g[11] == 0 or not (n // 32 - 2 <= st['entropy_exits'] <= n // 32 + 2) or st['decode_exits'] > 2:
+        if out['stop'] != 'reached' or g[10] != n or g[11] == 0 or not (n // ENTROPY_WORDS - 2 <= st['entropy_exits'] <= n // ENTROPY_WORDS + 2) or st['decode_exits'] > 2:
             failures.append(f"rdrand: stop {out['stop']} {out['reason']} successes {g[10]} of {n}, or {g[11]:#x}, stats {st['entropy_exits']} entropy, {st['decode_exits']} decodes")
         report['rdrand'] = {'n': n, 'successes': g[10], 'entropy_exits': st['entropy_exits'], 'decode_exits': st['decode_exits']}
         print(report['rdrand'], flush=True)
