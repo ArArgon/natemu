@@ -1287,13 +1287,24 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         // live record of the same point (the point was linked elsewhere meanwhile: the linker's link into another block of the
         // same RIP).
         if (i as u64) < control.links_susp {
-            let source = &blocks[r.source as usize];
-            let point = source.links.iter().find(|p| p.offset != 0 && p.offset == r.offset());
+            let Some(source) = blocks.get(r.source as usize) else {
+                return Err(format!("suspended record {i} names block {} as its source", r.source));
+            };
+            // The point the record names (by its index, as the resident's relink reads it), and its pairing with the target as `link`
+            // required it: the point's offset is the record's, its target the block's RIP, both in one context, an absolute source
+            // and a target that is not an instance (shared and instance links are checked or local: never suspended).
+            let point = source.links.get(r.point()).filter(|p| p.offset != 0 && p.offset == r.offset());
             let admitted = point.is_some_and(|p| {
                 r.original == p.word
                     && word(u64::from(source.code) + u64::from(p.offset)) == p.word
                     && word(u64::from(source.code) + natemu_abi::pic::svc_slot(|o| word(u64::from(source.code) + o), p))
                         == natemu_abi::pic::SVC_LINK
+            });
+            let paired = point.is_some_and(|p| {
+                p.target == t.rip
+                    && source.context == t.context
+                    && source.flags & (cache::PIC | cache::INSTANCE | cache::SYSTEM | cache::STEP) == 0
+                    && t.flags & (cache::INSTANCE | cache::SYSTEM | cache::STEP) == 0
             });
             let held = linked.contains_key(&(r.source, r.offset()));
             let mut why = None;
@@ -1305,6 +1316,8 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 why = Some("no INBOUND on the target");
             } else if point.is_none() || r.original != point.map_or(0, |p| p.word) {
                 why = Some("no such link point, or another original word");
+            } else if !paired {
+                why = Some("a source and target that `link` would not pair (RIP, context, shared or instance)");
             } else if !admitted && !held {
                 why = Some("a word that is neither unlinked nor held by a live record");
             }

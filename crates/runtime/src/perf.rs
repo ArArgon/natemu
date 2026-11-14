@@ -57,8 +57,7 @@ pub fn link_since(mark: u64) -> u64 {
     // SAFETY: as in `charge`.
     unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack)) };
     let p = record();
-    p.ticks[LINK as usize] + if p.current == LINK { t.wrapping_sub(p.since) } else { 0 }
-        - mark
+    (p.ticks[LINK as usize] + if p.current == LINK { t.wrapping_sub(p.since) } else { 0 }) - mark
 }
 
 /// Perf chunk 14: one halt wake-up of `kind` ([`Wakes`]) that took `ticks`.

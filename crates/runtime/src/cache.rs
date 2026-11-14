@@ -705,7 +705,10 @@ pub fn lookup(
 /// links undone; `None` if a record does not describe its word (as [`unlink_all`]).
 pub fn tlb(global: bool) -> Option<u64> {
     #[cfg(feature = "link-check")]
-    check_l1_lists();
+    {
+        check_l1_lists();
+        check_out_slots();
+    }
     let c = control();
     c.epoch += 1;
     if global {
@@ -765,9 +768,41 @@ pub fn tlb(global: bool) -> Option<u64> {
     // Relink plan: the links are undone but their records kept (suspended); `pic-count` builds (their links go through
     // counting stubs) drop them as before.
     #[cfg(not(feature = "pic-count"))]
-    return suspend(scope);
+    {
+        let undone = suspend(scope);
+        #[cfg(feature = "link-check")]
+        check_out_slots();
+        return undone;
+    }
     #[cfg(feature = "pic-count")]
     prune_tlb(scope)
+}
+/// `link-check` builds, at the start and the end of every TLB flush: every outbound slot of every block names a live record of its
+/// source and point (none a suspended one), and every live record is named by its source's slot for its point. Halts
+/// `stop::LINK_CHECK` with the line, the block (or record) and the slot otherwise. (Relink plan: suspended records are named by none.)
+#[cfg(feature = "link-check")]
+#[track_caller]
+fn check_out_slots() {
+    let line = u64::from(core::panic::Location::caller().line());
+    let c = control();
+    for n in 0..c.blocks as usize {
+        for k in 0..MAX_LINK_POINTS {
+            let slot = u64::from(block(n).out[k]);
+            let named = slot
+                .checked_sub(1)
+                .filter(|&i| i >= c.links_susp && i < c.links)
+                .map(|i| unsafe { record(i as usize).read() });
+            if slot != 0 && !named.is_some_and(|r| r.source as usize == n && r.point() == k) {
+                crate::execution::halt_native([line, n as u64, slot], natemu_abi::execution::stop::LINK_CHECK)
+            }
+        }
+    }
+    for i in c.links_susp..c.links {
+        let r = unsafe { record(i as usize).read() };
+        if unsafe { *out_slot(&r) } != i as u32 + 1 {
+            crate::execution::halt_native([line, i, u64::from(r.source)], natemu_abi::execution::stop::LINK_CHECK)
+        }
+    }
 }
 /// `link-check` builds, at the start and the end of every TLB flush (a CR3 load compacts the lists, which restores the
 /// invariant a missed kill broke, so the start is the check that sees it): each table's list is at most the slots long,
@@ -2253,7 +2288,11 @@ fn unlink_outbound(n: usize) -> Option<u64> {
         let Some(i) = (block(n).out[k] as u64).checked_sub(1) else {
             continue;
         };
-        // (Relink plan: no suspended record is named by a slot; the guard keeps one from being unlinked twice if it ever were.)
+        // (Relink plan: no suspended record is named by a slot: `link-check` halts if one is; other builds skip the restore.)
+        #[cfg(feature = "link-check")]
+        if i < control().links_susp {
+            crate::execution::halt_native([n as u64, k as u64, i], natemu_abi::execution::stop::LINK_CHECK)
+        }
         if i >= control().links_susp {
             unlink(unsafe { record(i as usize).read() })?;
             undone += 1;
@@ -2730,6 +2769,11 @@ fn suspend(scope: usize) -> Option<u64> {
         let r = unsafe { record(i as usize).read() };
         // (A suspended record is named by no outbound slot: its source's point may be linked to another block meanwhile.)
         out_del(i as usize);
+        // (`link-check`: the epoch moved, so no target of the scanned segments is current: the premise of suspending without looking.)
+        #[cfg(feature = "link-check")]
+        if current(block(r.target as usize)) {
+            crate::execution::halt_native([i, u64::from(r.target), u64::from(r.source)], natemu_abi::execution::stop::LINK_CHECK)
+        }
         clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);
     }
     clean_barrier(ctr);
@@ -2794,9 +2838,13 @@ fn relink(n: usize) {
         }
         let source = block(r.source as usize);
         let word_at = u64::from(source.code) + u64::from(r.offset());
-        if source.flags & DEAD != 0
-            || !Some(&source.links[r.point()]).is_some_and(|p| p.offset != 0 && p.offset == r.offset() && unlinked(source, p))
-        {
+        let point = &source.links[r.point()];
+        // (The record proves the pairing, as `link` required it: the point is the record's and names the target's RIP; else the
+        // record is wrong, not stale.)
+        if point.offset != r.offset() || point.target != block(n).rip {
+            crate::execution::halt_native([n as u64, i, u64::from(r.source)], natemu_abi::execution::stop::BAD_LINK)
+        }
+        if source.flags & DEAD != 0 || !unlinked(source, point) {
             remove(i, SUSP, &mut at);
             control().relink_dropped += 1;
             continue;
