@@ -2,7 +2,7 @@
 """Stock-Linux block coverage through the normal CLI: partitioned disks, guest reboot, a full guest filesystem and
 host-side write failures. Correctness only (no timing claims); each VM gets 120 s; the VM lock is held shared.
 
-    python3 tools/run_io_coverage.py --fexc FEXC --out DIR [--cases C ...] [--inputs BLOCK_INPUTS]
+    python3 tools/run_io_coverage.py --fexc FEXC --out DIR [--cases C ...] [--inputs BLOCK_INPUTS] [--transport mmio|pci]
     python3 tools/run_io_coverage.py self-check
 
 The kernel, the stock Debian modules (virtio_mmio, virtio_blk, ext4 and its dependencies) and BusyBox come from a
@@ -61,6 +61,7 @@ import zlib
 
 from io_common import ROOT, VM_LOCK, digest, stop_group, write_json
 from raw_root import RAW_ROOT
+from io_common import PCI_PROBE, pci_errors
 from run_virtio_block import checked
 from run_virtio_rng import KVER
 
@@ -97,8 +98,8 @@ fail() { echo "COV-FAIL $*"; dmesg | tail -n 60; drain_console; poweroff -f; whi
 mount -t proc proc /proc && mount -t sysfs sysfs /sys && mount -t devtmpfs devtmpfs /dev || poweroff -f
 exec </dev/console >/dev/console 2>&1
 mount -t tmpfs tmpfs /tmp || fail tmpfs
-case= phase=
-for item in $(cat /proc/cmdline); do case "$item" in cov_case=*) case=${item#*=};; cov_phase=*) phase=${item#*=};; esac; done
+@PCI_PROBE@case= phase= transport=mmio
+for item in $(cat /proc/cmdline); do case "$item" in cov_case=*) case=${item#*=};; cov_phase=*) phase=${item#*=};; cov_transport=*) transport=${item#*=};; esac; done
 echo "COV-BEGIN case=$case phase=$phase cpus=$(nproc) kernel=$(uname -r)"
 for module in virtio_mmio virtio_blk crc32c_generic ext4; do modprobe "$module" || fail "module-$module"; done
 wait_dev() { n=0; while test ! -b "$1" && test $n -lt 100; do sleep 0.1; n=$((n+1)); done; test -b "$1" || fail "no-$1"; }
@@ -141,6 +142,7 @@ reboot-*)
     mount -t ext4 /dev/vda /m1 || fail mount
     cp /fixtures/a.bin /m1/a.bin && sync || fail write
     echo "COV-DATA a=$(sha /m1/a.bin)"
+    if test "$transport" = pci; then pci_probe; fi
     echo COV-REBOOT
     drain_console
     reboot -f
@@ -203,6 +205,7 @@ host-limit)
   echo "COV-READ a=$(rsha 65536 0 16) b2=$(rsha 65536 32 16) b3=$(rsha 65536 48 16) prefix=$(rsha 2048 16384 1) tail=$(rsha 2048 16385 31) above=$(rsha 65536 600 16)";;
 *) fail case;;
 esac
+if test "$transport" = pci; then pci_probe; fi
 echo "COV-ERRORS ioerr_logs=$(ioerrs) fs_errors=$(dmesg | grep -c 'EXT4-fs error')"
 echo COV-DMESG-BEGIN
 dmesg
@@ -211,7 +214,7 @@ echo "COV-PASS case=$case phase=$phase"
 drain_console || fail console-drain
 poweroff -f
 fail poweroff-returned
-'''
+'''.replace('@PCI_PROBE@', PCI_PROBE.replace('@P@', 'COV'))
 
 
 def pattern(label, size):
@@ -345,7 +348,7 @@ def limit_image():
     return bytes(image)
 
 
-def judge(case, phase, text, host, expect):
+def judge(case, phase, text, host, expect, pci=False):
     """Errors for one launch: guest serial TEXT, HOST facts (rc, stop, timeout, changed, fsck, table, exact)."""
     errors = []
     def require(ok, message):
@@ -356,6 +359,7 @@ def judge(case, phase, text, host, expect):
     require(one(r'^COV-BEGIN case=(\S+) phase=(\S+) cpus=\d+ kernel=(\S+)$') == (case, phase, KVER), 'wrong/missing begin, case, phase or kernel')
     require(not re.search(r'COV-FAIL|BUG:|Oops:|Kernel panic|Call Trace:|EXT4-fs error|Buffer I/O error|GPT:', text), 'guest/kernel/filesystem error')
     require(not host['timeout'], 'VM timed out')
+    if pci: errors += pci_errors(text, 'COV', 2, ('block',))
     reboot = case.startswith('reboot-') and phase == 'write'
     stop, rc = STOP.get(case, POWEROFF) if phase == 'write' else POWEROFF
     require(host['stop'] == stop and host['rc'] == rc, f"stop {host['stop']!r} rc={host['rc']}, expected {stop!r} rc={rc}")
@@ -430,7 +434,9 @@ def launch(args, case, phase, image, work, limit):
     command = [str(args.natemu), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.prepared / 'linux'),
                '--initrd', str(args.prepared / 'initramfs.cpio'), '--disk', str(image), '--vcpus', '2', '--ram', '1G',
                '--compile-cache', 'off', '--serial', str(work / 'serial.log'), '--cmdline',
-               f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case={case} cov_phase={phase}' + EXTRA.get(case, '')]
+               f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case={case} cov_phase={phase}' + EXTRA.get(case, '')
+               + (' cov_transport=pci' if args.transport == 'pci' else '')]
+    if args.transport == 'pci': command += ['--virtio-transport', 'pci']
     write_json(work / 'command.json', {'command': command, 'rlimit_fsize': limit})
     def limited():
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)    # inherited across exec: the write fails with EFBIG instead
@@ -477,7 +483,7 @@ def run_case(args, case):
                     'changed': after != before, 'fsck': fsck(args.e2fsck, image, ext4_offsets(base), launch_dir / 'fsck'),
                     'table': table_bytes(image, total) == table,
                     'exact': image.read_bytes() == limit_image() if base == 'host-limit' and phase == 'write' else None}
-            errors = judge(base, phase, text, host, expect)
+            errors = judge(base, phase, text, host, expect, args.transport == 'pci')
             entry = {'phase': phase, 'seconds': round(seconds, 1), 'disk_before': before, 'disk_after': after, **host, 'errors': errors}
             if base == 'host-full' and volume and phase == 'write':
                 entry['volume_free_kib'] = shutil.disk_usage(volume).free // 1024
@@ -586,6 +592,15 @@ def self_check():
                 for bad in (good.replace('n=3 ', 'n=4 '), good.replace(' vda: vda1 vda2 vda3', ' vda: vda1 vda2'),
                             good.replace('name=natemu-one', 'name=none') if case == 'gpt' else good.replace('name=none', 'name=natemu-one', 1)):
                     assert judge(case, phase, bad, host, expect), case; controls += 1
+    # PCI transport: the probe block is required and judged.
+    probe = ('COV-PCI-BEGIN\nCOV-PCI-DEV 0000:00:00.0 0x8086 0x1237 0x060000\nCOV-PCI-DEV 0000:00:01.0 0x1af4 0x1042 0x010000\n'
+             'COV-PCI-IRQ  28:          0        161  PCI-MSIX-0000:00:01.0   1-edge      virtio0-req.0\nCOV-PCI-END\n')
+    good = text('gpt', 'verify').replace('COV-ERRORS', probe + 'COV-ERRORS', 1)
+    host = {'rc': 0, 'timeout': False, 'stop': POWEROFF[0], 'changed': False, 'fsck': [0] * len(ext4_offsets('gpt')), 'table': True, 'exact': None, 'backend_errors': []}
+    assert not judge('gpt', 'verify', good, host, expect, True), judge('gpt', 'verify', good, host, expect, True)
+    assert judge('gpt', 'verify', text('gpt', 'verify'), host, expect, True)
+    for old, new in (('0x1042', '0x1041'), ('161', '0'), ('COV-PCI-END', 'COV-PCI-DMESG pci: Cannot find an available gap\nCOV-PCI-END')):
+        assert judge('gpt', 'verify', good.replace(old, new), host, expect, True), old
     # The live controls' outcomes: a host-full guest whose write did not fail, a host-limit guest with no limit.
     good = text('host-full', 'write').replace('dd_rc=1 eio=1', 'dd_rc=0 eio=0').replace('ioerr_logs=4', 'ioerr_logs=0')
     host = {'rc': 0, 'timeout': False, 'stop': POWEROFF[0], 'changed': True, 'fsck': [0], 'table': True, 'exact': None, 'backend_errors': []}
@@ -614,6 +629,7 @@ def main():
     parser.add_argument('--fexc', required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--inputs', type=Path, default=INPUTS, help='a tools/run_virtio_block.py prepare directory')
+    parser.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport (--virtio-transport); pci adds a guest probe and its checks')
     parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS, default=list(CASES + CONTROLS))
     args = parser.parse_args()
     if len(set(args.cases)) != len(args.cases): parser.error('duplicate cases')
