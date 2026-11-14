@@ -18,7 +18,14 @@
 //! command register or MSI-X enable and drives the line before releasing that lock. Whichever drives last does so
 //! after both the latest ISR store (it happened before its writer took the lock, or the driver is that writer) and
 //! the latest configuration write (made under the lock), so the line ends at the level of the latest state. Two
-//! state-path changes are ordered by the state lock, which their writers hold while they drive.
+//! state-path changes are ordered by the state lock, which their writers hold while they drive. MSI-X delivery takes
+//! only the MSI-X lock (then the chipset's): bus mastering reaches it as an atomic gate the configuration write stores.
+//!
+//! Notes. Under MSI-X a driver never reads the ISR, so its bit 0 stays set; disabling MSI-X without a device reset
+//! therefore asserts INTx at once from that stale bit (the specification's literal reading: the line is the ISR's
+//! OR; QEMU instead waits for the next interrupt), and `profile::raised` counts are skewed under PCI. Reads of the
+//! MSI-X table or PBA region past their entries return all-ones (`MsixConfig`'s behaviour), an exception to the
+//! rule that an unimplemented BAR0 offset reads zero.
 use super::{Access, Profile, State, Virtio, feature_word, reg};
 use crate::{
     irq::Irqs,
@@ -33,7 +40,7 @@ use crate::{
 };
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst},
 };
 
 /// Red Hat's virtio vendor ID (virtio 1.2 4.1.2).
@@ -127,6 +134,9 @@ pub(super) struct Transport {
     isr: AtomicU32,
     /// BAR0's base while memory decoding is on, else [`NO_BAR`]; stored under the configuration lock.
     bar: AtomicU64,
+    /// The command register's Bus Master bit, stored under the configuration lock; MSI-X's gate (`set_gate`), so a
+    /// message is sent or released only while it is set without the configuration lock on the delivery path.
+    bus_master: Arc<AtomicBool>,
     irqs: Irqs,
     gsi: usize,
 }
@@ -148,13 +158,9 @@ impl Transport {
     }
     /// Under the state lock: interrupts for the queues in `queues` (bit n: queue n) and, with `config`, a
     /// configuration change. MSI-X sends each distinct vector once, or marks it pending while masked; nothing without
-    /// bus mastering (PCI 3.0 6.2.2: a function then issues no memory write, and an MSI is one), for [`NO_VECTOR`], or
-    /// with MSI-X disabled (`MsixConfig::trigger`).
+    /// bus mastering (PCI 3.0 6.2.2: a function then issues no memory write, and an MSI is one; the gate), for
+    /// [`NO_VECTOR`], or with MSI-X disabled (`MsixConfig::trigger`). Takes only the MSI-X lock.
     pub(super) fn trigger(&self, vectors: &Vectors, queues: u8, config: bool) {
-        let cfg = lock(&self.config);
-        if cfg.command() & BUS_MASTER == 0 {
-            return;
-        }
         let mut msix = lock(&self.msix);
         let mut sent = [NO_VECTOR; 3];
         let wanted = (0..2)
@@ -231,9 +237,10 @@ impl Virtio {
         let id = self.profile.device_id() as u16;
         // One vector per queue and one for configuration changes.
         let vectors = self.profile.queue_count() as u16 + 1;
-        let msix = Arc::new(Mutex::new(
-            MsixConfig::new(vectors, deliver, 0).expect("MSI-X table"),
-        ));
+        let bus_master = Arc::new(AtomicBool::new(false));
+        let mut table = MsixConfig::new(vectors, deliver, 0).expect("MSI-X table");
+        table.set_gate(bus_master.clone());
+        let msix = Arc::new(Mutex::new(table));
         // QEMU's class codes (the spec's device table): mass storage / SCSI, network / Ethernet, and for entropy
         // class 0x00 subclass 0xff.
         let (class, subclass) = match self.profile {
@@ -283,6 +290,7 @@ impl Virtio {
             msix,
             isr: AtomicU32::new(0),
             bar: AtomicU64::new(NO_BAR),
+            bus_master,
             irqs: self.irqs.clone(),
             gsi: self.gsi,
         };
@@ -404,6 +412,11 @@ impl bus::Function for PciFunction {
             _ => config.get_bar_addr(0),
         };
         t.bar.store(bar, SeqCst);
+        let master = config.command() & BUS_MASTER != 0;
+        if !t.bus_master.swap(master, SeqCst) && master {
+            // Vectors held pending while bus mastering was off go out now, if MSI-X lets them.
+            lock(&t.msix).release_pending();
+        }
         t.drive(&config);
     }
     fn bar(&self) -> Option<u64> {
@@ -1041,8 +1054,9 @@ mod tests {
         assert_eq!(rig.read(TABLE + 24, 4), 0x61);
         rig.msix(true, false);
         rig.write(0x1a, 2, 1);
+        rig.write(0x1c, 2, 1);
         rig.write(0x14, 1, 15);
-        rig.d.lock().queues[0].ready = true;
+        assert!(rig.d.lock().queues[0].ready);
         complete(&rig.d, 0);
         assert_eq!(rig.sent(), [(0xfee0_3000, 0x61)]);
     }
@@ -1152,5 +1166,67 @@ mod tests {
         });
         assert_eq!(block.used_index(), 1);
         assert_eq!(block.r.lock().status, 15);
+    }
+    #[test]
+    fn a_pending_vector_waits_for_bus_mastering_on_every_release_path() {
+        let rig = rng(true);
+        // Pending under the function mask, then bus mastering off: unmasking the function sends nothing.
+        rig.msix(true, true);
+        complete(&rig.d, 0);
+        assert_eq!(pba(&rig), 2);
+        rig.command(MEMORY);
+        rig.msix(true, false);
+        assert!(rig.sent().is_empty());
+        assert_eq!(pba(&rig), 2, "still pending");
+        // The entry's own mask and unmask while off: nothing either.
+        rig.entry(1, true);
+        rig.entry(1, false);
+        assert!(rig.sent().is_empty());
+        assert_eq!(pba(&rig), 2);
+        // Bus mastering on: sent once.
+        rig.command(MEMORY | BUS_MASTER);
+        assert_eq!(rig.sent(), [message(1)]);
+        assert_eq!(pba(&rig), 0);
+        rig.command(MEMORY);
+        rig.command(MEMORY | BUS_MASTER);
+        assert_eq!(rig.sent().len(), 1);
+    }
+    /// The line-ordering argument under contention: completions and ISR reads on one thread, MSI-X Enable and
+    /// Interrupt Disable toggles through configuration writes on another; afterwards the line is at the level of the
+    /// final state.
+    #[test]
+    fn the_line_matches_the_final_state_after_racing_completions_and_config_writes() {
+        for round in 0..20 {
+            let rig = rng(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    for i in 0..500 {
+                        complete(&rig.d, 0);
+                        if (i + round) % 3 == 0 {
+                            rig.read(ISR, 1);
+                        }
+                    }
+                });
+                scope.spawn(|| {
+                    for i in 0..500u32 {
+                        rig.msix(i % 2 == 0, false);
+                        let disable = if (i + round) % 5 == 0 {
+                            INTX_DISABLE
+                        } else {
+                            0
+                        };
+                        rig.command(MEMORY | BUS_MASTER | disable);
+                    }
+                });
+            });
+            let msix = rig.cfg(rig.msix_cap() + 2) & 0x8000 != 0;
+            let disabled = rig.cfg(4) & u32::from(INTX_DISABLE) != 0;
+            let isr = rig.d.lock().interrupt;
+            assert_eq!(
+                rig.level(),
+                isr != 0 && !disabled && !msix,
+                "round {round}: isr {isr}, MSI-X {msix}, disable {disabled}"
+            );
+        }
     }
 }
