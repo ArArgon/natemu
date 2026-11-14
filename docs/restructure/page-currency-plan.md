@@ -162,7 +162,9 @@ In check mode, a program with no un-invalidated PTE edit must show zero disagree
 `PAGES_CHECK_HALT`); a program with such edits runs under `PAGES_CHECK` and asserts its expected `page_disagree` count
 (the `counts` form). In a 4-vCPU Linux run the count is expected to be small and nonzero (a peer edits a PTE before
 its shootdown IPI reaches this vCPU); the gate is a rate: at most 10 disagreements per million hits, and zero in
-single-vCPU Linux runs (N = 1 Linux edits a PTE and invalidates on the same CPU before any fetch of that page).
+single-vCPU Linux runs. The zero at N = 1 is an assumption (that Linux edits a PTE and invalidates on the same CPU
+before any fetch of that page); a disagreement there is traced (the address, the two frames, the preceding events)
+before it is called a design failure rather than a guest pattern to add to this list.
 
 ## 4. Correctness argument and the invariants it rests on
 
@@ -221,7 +223,7 @@ placement walks that hit, h (a new block or copy on a page already recorded this
 - configure, bucket averages (upper): `revalidate` 2.43 x 0.888 = 2.16 s less 22.8 M probes x 15 ns = 0.34 s; `fetch`'s
   walk part (about 100 of 138 ns) x 13.4 M x h = 0.67-1.07 s at h = 0.5-0.8, less 0.20 s of probes: **2.3-2.7 s**.
   With w at 50-70% of the average: **1.3-1.9 s of 109.5 busy vCPU-s (1.2-1.7%)**, about the same in wall time
-  (configure is serial). Planning number: the reviewer's **1.5-2.5 s**.
+  (configure is serial). Planning number: **1.3-1.9 s; chunk 0 decides.**
 - make: 6.37 x 0.914 = 5.82 less 52.1 M x 15 ns = 0.78; fetch 0.1 us x 12.0 M x h = 0.6-0.96 less 0.18: upper
   **5.5-5.8 vCPU-s**; at w = 50-70%: **3.3-4.3 vCPU-s of 561.5 (0.6-0.8%)**, under 1 s of wall.
 
@@ -287,9 +289,12 @@ before the gate).**
     then W: P1 must be walked and W replaced by the third frame's bytes.
   - `page-large` (natemu only; QEMU's jump cache fails `invlpg-large` already): X and Y in a 2 MiB page; X recorded;
     the PDE changed, INVLPG of another 4 KiB address of the page; Y runs the new frame's bytes.
-  - `page-large-edge` (natemu only): a 2 MiB leaf whose range ends past the VM's RAM end, X in the RAM part, Y past it:
-    X runs; the fetch of Y ends in the typed stop `no_code fetch_not_ram` (the runner gains an expected-stop form for
-    this program, as it has an either-outcome form for `pf-fetch`).
+  - `page-large-edge` (natemu only): guest RAM is a 2 MiB multiple (host `execution.rs:205`) and the 3-4 GiB hole's
+    bounds are 2 MiB aligned (abi `execution.rs:153-154`), so the only hole a 2 MiB leaf can straddle is the legacy
+    hole 0xA0000-0xFFFFF inside guest-physical 0-2 MiB (`LEGACY_HOLE`, `:173`; natemu's own boot identity map covers
+    it with a 2 MiB page, host `boot.rs`). The program maps a 2 MiB leaf at guest-physical 0, X in RAM below 0xA0000
+    and Y inside the hole: X runs; the fetch of Y must end in the typed stop `no_code fetch_not_ram` with the record on
+    or off (the runner gains an expected-stop form for this program, as it has an either-outcome form for `pf-fetch`).
   - `page-global` (natemu only): PGE on, V global and the same frame in A and B; A: X; B: Y hits across the CR3 load
     (count) with F1's bytes; then V's PTE -> F2 in B with no INVLPG and PGE toggled off and on: Y runs F2's bytes.
     Second part: PGE off, V with G set: A: X; B (V -> F2): Y runs F2's bytes.
@@ -305,6 +310,8 @@ before the gate).**
   - `page-size-check` (natemu only, under `--page-currency check`): LP by a 2 MiB page, X runs (2 MiB record); the PDE
     replaced by a page table of 4 KiB pages of the same frames with no INVLPG; Y on LP: `page_disagree` must be exactly
     1 (a 2 MiB record against a 4 KiB walk: same frame, other flags).
+  - `page-check-keep` (natemu only, under `check`): X on V (recorded, F1); V's entry -> F2 with no invalidation; Y and
+    then Z placed on V: both are placed from the F1 record (3.5 case 1) and `page_disagree` is exactly 2.
   - `page-counts`: 32 blocks on one page in a fresh space: `page_walks` 1, `page_hits` 31.
   - Existing programs that must stay green, in particular `walk` (the recording walk's A-bit write still kills the
     block), `cross`, `straddle`, `cross-link`, `no-invlpg`, `global`, `place-global`, `invlpg-page`, `invlpg-large`,
@@ -336,8 +343,8 @@ before the gate).**
 | M10 `invlpg` clears only the current privilege class's keys | `page-user-invlpg` (Y runs F1's bytes) |
 | M11 hit skips `mark` in `fetch_page` | `page-mark` (the second write goes through a writable shadow unnoticed; Y keeps the old bytes) |
 | M12 check mode compares frames only | `page-size-check` (count 0 instead of 1) |
-| M13 2 MiB leaf recorded without the RAM rule | `page-large-edge` (host error instead of the typed stop), the abi unit test |
-| M14 check walk overwrites the record | `page-share` (b) under `check` (the walk after the PTE edit would refresh the record; counts differ) |
+| M13 2 MiB leaf recorded without the RAM rule | `page-large-edge` (Y's outcome is no longer the typed stop), the abi unit test |
+| M14 check walk overwrites the record | `page-check-keep` (natemu only, under `check`): X on V recorded; V's entry changed to F2 with no invalidation; Y then Z placed on V: `page_disagree` must be 2 (both placements hit the F1 record against an F2 walk); under M14 the first check walk refreshes the record and the count is 1 |
 
 **Chunk 2 (the [fast-miss plan](fast-miss-plan.md)): the fast miss path takes record hits.**
 
@@ -364,7 +371,8 @@ before the gate).**
 | 1 GiB leaves | Dropped: the walk rejects PS at levels 3-4 (`paging.rs:227`) and PAE/LA57 changes are #GP, so no 1 GiB leaf reaches the record |
 | Permitted divergences | Listed (3.5), with the SDM sections and the programs that already assert them |
 | Check-mode threshold at 4 vCPUs | Set: at most 10 disagreements per million hits; zero at N = 1 (3.5) |
-| Gain optimistic (`fetch` includes `mark`; the average walk includes cold first walks) | Revised (6): the walk part of `fetch` only; w at 50-70% of the average until chunk 0 times would-hit and miss walks apart; planning number 1.5-2.5 s configure, 3.3-4.3 vCPU-s make; chunk 0's gate lowered to match, and a failed gate folds the record into item 2 |
+| Gain optimistic (`fetch` includes `mark`; the average walk includes cold first walks) | Revised (6): the walk part of `fetch` only; w at 50-70% of the average until chunk 0 times would-hit and miss walks apart; planning number 1.3-1.9 s configure, 3.3-4.3 vCPU-s make; chunk 0's gate lowered to match, and a failed gate folds the record into item 2 |
+| Re-review: `page-large-edge` as written (a leaf past the RAM end) cannot exist (RAM and hole bounds are 2 MiB aligned); M14 not caught by `page-share` (b) (it invalidates right after the edit); 6's arithmetic says 1.3-1.9 s; "zero disagreements at N = 1" is an assumption | Fixed: the program uses the legacy hole inside guest-physical 0-2 MiB, the only hole a 2 MiB leaf can straddle, and M13's text no longer presumes a host error; new program `page-check-keep` (two placements after an un-invalidated edit: count 2, 1 under M14); planning number 1.3-1.9 s, chunk 0 decides; the N = 1 zero is marked an assumption to trace before judging (3.5) |
 | Speculation barrier | The hit path ends in the walk's `sb` under the barrier switch (3.2 step 4), with the argument why no load depends on it |
 | Entry size | 32 bytes, two per line (3.1, 5) |
 | Key's `user` bit | From the `paging::Control` handed to the walk (3.1, 3.2) |
