@@ -618,7 +618,7 @@ impl Cost {
 
 /// Split consecutive requests into as few copy windows as the window bounds allow, each window
 /// holding whole requests plus `overhead`. A request that does not fit alone still gets its own
-/// window (its copy then fails); callers bound each request well below the window bounds.
+/// window (its copy then fails); callers bound each request below the window bounds (`block::MAX_DATA`).
 fn pack(costs: &[Cost], overhead: Cost) -> Vec<Range<usize>> {
     let mut windows = Vec::new();
     let (mut start, mut total) = (0, overhead);
@@ -2179,7 +2179,7 @@ mod tests {
         let cost = |spans, bytes| Cost { spans, bytes };
         let overhead = cost(2, 6);
         assert!(pack(&[], overhead).is_empty());
-        // 32 full-size reads: 128 KiB + status + element each; seven fit 1 MiB.
+        // 32 reads of 128 KiB + status + element each; seven fit 1 MiB.
         let read = cost(34, 128 * 1024 + 9);
         let windows = pack(&[read; 32], overhead);
         assert_eq!(windows.first(), Some(&(0..7)));

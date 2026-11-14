@@ -8,11 +8,12 @@ use cache::IoWindow;
 use std::mem::offset_of;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering::Acquire, fence};
 
-/// Room for a batch of block requests of up to 128 KiB each; larger batches split.
+/// Room for two block requests of the most data (504 KiB each, `virtio::block`), or a batch of smaller ones; larger
+/// batches split.
 pub const MAX_BYTES: usize = 1024 * 1024;
-/// Room for a batch of 32 block requests, each of up to 32 data segments plus header, status and
+/// Room for a batch of 32 block requests of 32 data segments each (128 KiB) plus header, status and
 /// used element, and the window's ring bookkeeping (a queue's metadata snapshot, used index and
-/// available-ring read). Larger batches split.
+/// available-ring read); a request may have up to 126 segments, and nine of those fit. Larger batches split.
 pub const MAX_SPANS: usize = 32 * 36 + 8;
 /// How long a windowless publication waits for posted vCPUs to drain before it falls back to a
 /// window. A running holder drains at its next block boundary after its doorbell (microseconds).

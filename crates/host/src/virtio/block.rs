@@ -48,10 +48,21 @@ const SECTOR: u64 = 512;
 /// type, reserved, sector.
 const HEADER: usize = 16;
 const ID_BYTES: usize = 20;
-/// Advertised size_max and seg_max, and their product's bound on one request's data.
+/// Advertised size_max and seg_max, and their product's bound on one request's data. seg_max is the queue's 128
+/// entries less a request's header and status descriptors (QEMU's rule for its own seg_max), so a request of the
+/// most data fills the ring: 504 KiB. It was 32 segments and 128 KiB until November 14, 2026; measured then on an
+/// M2 Max (2 vCPUs, PCI): 1 MiB direct writes 3.0-3.1 -> 3.5 GB/s, reads 3.2-3.6 -> 4.0, cold buffered reads
+/// 1.5-1.6 -> 1.8-1.9, buffered writes and 4 KiB I/O unchanged. A guest that makes the queue smaller than 128 must
+/// keep its requests within the ring itself; the device walks no more than the ring's size either way.
 const MAX_SEGMENT: usize = 4096;
-const MAX_SEGMENTS: usize = 32;
-pub(super) const MAX_DATA: usize = 128 * 1024;
+const MAX_SEGMENTS: usize = 126;
+pub(super) const MAX_DATA: usize = MAX_SEGMENTS * MAX_SEGMENT;
+// One request fits one copy window, with its header or status, its used element and the window's bookkeeping
+// (`gather_streams`, `complete_batch`): otherwise its copy would fail after the grant.
+const _: () = assert!(
+    MAX_DATA + HEADER + 64 <= crate::execution::io::MAX_BYTES
+        && MAX_SEGMENTS + 16 <= crate::execution::io::MAX_SPANS
+);
 /// DISCARD and WRITE_ZEROES (§5.2.6.2): at most this many 16-byte segments a request (sector, sectors, flags), each at
 /// most this many sectors, aligned by the driver to the host file's 4 KiB block (`discard_sector_alignment`), so a
 /// discard frees whole blocks of the image (`F_PUNCHHOLE`: APFS keeps the file sparse; without it a guest's deletes
@@ -1485,7 +1496,7 @@ impl Virtio {
                 jobs.push((slot, job));
             }
         }
-        // A lone request in flight with a short call (no sync) makes it here, outside the lock: no
+        // A lone request in flight with a plain read or write (no sync) makes its call here, outside the lock: no
         // hand-off to a worker and back. Kicks stay suppressed meanwhile; the completion re-reads
         // the ring. Like a worker's call, it runs even if a reset arrives before it starts.
         // Not while another queue has been notified: its requests would wait behind this call instead of joining it
@@ -2333,6 +2344,27 @@ mod tests {
         }
     }
     #[test]
+    fn a_request_of_the_most_segments_is_valid_and_one_more_is_not() {
+        let segments = |n: usize| -> Vec<Extent> {
+            (0..n)
+                .map(|i| Extent {
+                    gpa: 0x10000 + i as u64 * 4096,
+                    len: MAX_SEGMENT,
+                })
+                .collect()
+        };
+        let most = segments(MAX_SEGMENTS);
+        assert!(data_valid(&most));
+        assert_eq!(length(&most), MAX_DATA);
+        assert!(!data_valid(&segments(MAX_SEGMENTS + 1)));
+        assert!(!data_valid(&[Extent {
+            gpa: 0x10000,
+            len: MAX_SEGMENT + 1
+        }]));
+        // With its header and status it is exactly the 128 descriptors of the largest ring.
+        assert_eq!(MAX_SEGMENTS + 2, 128);
+    }
+    #[test]
     fn admission_stops_at_the_request_and_byte_bounds() {
         assert_eq!(request_limit(8), 8);
         assert_eq!(request_limit(128), MAX_REQUESTS);
@@ -2342,14 +2374,14 @@ mod tests {
         assert!(within_bounds(0, 0, MAX_BUFFERED + 1, 128));
         assert!(within_bounds(1, MAX_BUFFERED - 4096, 4096, 128));
         assert!(!within_bounds(1, MAX_BUFFERED - 4095, 4096, 128));
-        // A request reading 128 KiB reserves its readable header and its full IN data.
+        // A request reading the most data a request may hold reserves its readable header and its full IN data.
         let id = super::super::tests::device().lock().identity(0);
-        let large = read_request(id, 0, 256);
+        let large = read_request(id, 0, MAX_DATA / 512);
         assert_eq!(large.reserved, HEADER + MAX_DATA);
         let mut flight = Flight::default();
         let mut admitted = 0;
         while within_bounds(flight.len(), flight.reserved, large.reserved, 128) {
-            flight.insert(read_request(id, admitted, 256));
+            flight.insert(read_request(id, admitted, MAX_DATA / 512));
             admitted += 1;
         }
         assert_eq!(admitted as usize, MAX_BUFFERED / (HEADER + MAX_DATA));
@@ -2633,11 +2665,11 @@ pub(in crate::virtio) mod owner_tests {
     const HEADERS: u64 = 0x2000;
     const STATUS: u64 = 0x2800;
     const DATA: u64 = 0x3000;
-    /// One readable buffer of a header and 128 KiB, shared by every large request.
+    /// One readable buffer of a header and `MAX_DATA`, shared by every large request.
     const BIG: u64 = 0x10000;
-    const RAM: usize = 0x40000;
+    const RAM: usize = 0x100000;
     /// The second request queue's rings (`Rig::with_queues`): `DESC`, `AVAIL` and `USED` from here.
-    const Q1: u64 = 0x38000;
+    const Q1: u64 = 0xc0000;
 
     /// Disk calls that wait while `held`; reads return 0x5a. Each call records whether a disk worker made it.
     #[derive(Default)]
@@ -2822,7 +2854,7 @@ pub(in crate::virtio) mod owner_tests {
             self.desc(head + 2, STATUS + u64::from(k), 1, 2, 0);
             head
         }
-        /// Lay out request `k`: one readable buffer of a header and 128 KiB (a segment over size_max: gathered, then
+        /// Lay out request `k`: one readable buffer of a header and `MAX_DATA` (a segment over size_max: gathered, then
         /// answered IOERR without a disk call), then its status (descriptors 2k, 2k+1).
         fn big_request(&self, k: u16) -> u16 {
             let mut h = [0; 16];
