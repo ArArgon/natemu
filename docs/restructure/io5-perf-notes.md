@@ -214,6 +214,16 @@ Rules learned in this round:
     remove them (~5 vCPU-s more, +8 MiB code area per vCPU) — a possible follow-up. Net gain below the plan's
     "up to 34-39": the 0.5 us per-miss figure was optimistic and the misses left are the costlier ones.
 
+23. **Shared pool built; configure gate passed, make blocked by a re-check flaw** (branch `pool-rebased` 40df405 on
+    the two-way L1; chunks 2-3 reviewed for security twice; pool programs 128/128, full K1 368/368 default and
+    link-check, mutations red; `--check-reuse` boots (busybox, 1 and 4 vCPUs, 23.8 k pool hits) and IO5 configure
+    under check with no mismatch). Pool off vs on, same build (`natemu-raw/pool-{off,on}-profile-1`): configure busy
+    114.8 -> 110.1 (-4.1%, gate -3%), host requests 3.38 -> 1.67 M; make flat (547.7 -> 548.0): of 6.37 M probes, 3.55 M
+    found byte-matching entries the placement re-check refused (each after a ~0.5 us copy, then the host serves it
+    anyway), 0.57 M were overwritten (the 256 MiB ring wraps on make). Not default-on until the re-check refusals are
+    understood (the host's own relocation accepts these requests, so the pool path is stricter or publishes a
+    different form).
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
