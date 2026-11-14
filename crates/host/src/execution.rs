@@ -1662,7 +1662,9 @@ struct Entry {
     kept: std::sync::OnceLock<Box<Kept>>,
 }
 /// An answer's admitted form (its record without the object, which [`crate::relocation::resolved`] gives back) and the
-/// CPL-0, bulk and code-shape values admission ran under: it is reused only where they are the request's.
+/// CPL-0, bulk and code-shape values admission ran under: it is reused only where they are the request's. The feature
+/// bits (`supported`) are not compared: they are fixed per [`Compiler`], and [`Compiler::share`] joins only maps made for
+/// equal ones.
 struct Kept {
     cpl0: bool,
     bulk: bool,
@@ -1688,7 +1690,8 @@ impl Entry {
         size_of::<Self>()
             + self.prefix.len()
             + if let Answer::Object(o) = &self.answer {
-                o.len()
+                // And its kept form ([`Kept`], its link points at most): set after the answer is, but counted with it.
+                o.len() + size_of::<Kept>() + exec::MAX_LINK_POINTS * size_of::<exec::LinkPoint>()
             } else {
                 0
             }
@@ -2320,6 +2323,8 @@ impl Compiler {
                     );
                     return Ok(Some(code));
                 }
+                // The reuse check: a refusal or a kept form that is not admission's is an error, not a fallback.
+                Err(e) if self.check_reuse => return Err(e),
                 Err(e) => {
                     self.relocation_fallbacks += 1;
                     eprintln!(
@@ -3793,6 +3798,16 @@ mod tests {
             assert!((short.prefix.len() as u32) < short.kept.get().unwrap().form.guest_bytes);
             c.supported = 0;
             assert!(block(&c, &short.answer, &short, A.1).is_err(), "short prefix");
+            // The boundary: a prefix of exactly the block's guest bytes reuses, one byte less does not.
+            let g = e.kept.get().unwrap().form.guest_bytes as usize;
+            let (exact, less) = (kept_entry(g), kept_entry(g - 1));
+            for x in [&exact, &less] {
+                c.supported = u64::MAX;
+                block(&c, &x.answer, x, A.1).unwrap();
+            }
+            c.supported = 0;
+            assert!(block(&c, &exact.answer, &exact, A.1).is_ok(), "prefix == guest bytes");
+            assert!(block(&c, &less.answer, &less, A.1).is_err(), "prefix < guest bytes");
             let flips: [fn(&mut Compiler); 3] = [|c| c.cpl0 = true, |c| c.bulk = true, |c| c.shape = false];
             for flip in flips {
                 let mut d = compiler();
@@ -3801,6 +3816,78 @@ mod tests {
                 assert!(block(&d, &e.answer, &e, A.1).is_err());
             }
             assert!(block(&c, &e.answer, &e, A.1).is_ok(), "control");
+        }
+
+        /// An entry whose kept form is wrong (one more guest instruction than admission gives).
+        fn forged(c: &Compiler) -> Entry {
+            let e = kept_entry(USER.len());
+            block(c, &e.answer, &e, A.1).unwrap();
+            let k = e.kept.get().unwrap();
+            let form = admission::Admitted { guest_insns: k.form.guest_insns + 1, ..k.form.clone() };
+            let f = kept_entry(USER.len());
+            f.kept.set(Box::new(Kept { cpl0: k.cpl0, bulk: k.bulk, shape: k.shape, form })).ok().unwrap();
+            f
+        }
+
+        /// A form kept from another RIP's admission is never used: only the answer's own RIP keeps one.
+        #[test]
+        fn only_the_answers_own_rip_keeps_a_form() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            block(&c, &moved, &e, B.1).unwrap();
+            assert!(e.kept.get().is_none());
+            c.supported = 0;
+            assert!(block(&c, &e.answer, &e, A.1).is_err());
+        }
+
+        /// Under the reuse check a kept form that is not admission's is an error, at its RIP and at another.
+        #[test]
+        fn reuse_check_catches_a_forged_kept_form() {
+            let mut c = compiler();
+            let e = forged(&c);
+            // Used without the check, the forged form is what comes out (the control: the check is what catches it).
+            c.supported = 0;
+            assert_ne!(block(&c, &e.answer, &e, A.1).unwrap(), fresh(&c, A.0, A.1));
+            c.supported = u64::MAX;
+            c.check_reuse = true;
+            assert!(block(&c, &e.answer, &e, A.1).is_err());
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            assert!(block(&c, &moved, &e, B.1).is_err());
+            // The honest form passes the check.
+            let honest = kept_entry(USER.len());
+            block(&c, &honest.answer, &honest, A.1).unwrap();
+            assert!(block(&c, &honest.answer, &honest, A.1).is_ok());
+        }
+
+        /// The same through `reuse`, whose other-RIP arm would take the error for a relocation fallback (needs fexc, as the
+        /// reuse check asks it for its own answer).
+        #[test]
+        fn reuse_at_another_rip_under_the_check_is_an_error() {
+            let Some(fexc) = std::env::var_os("FEXC") else {
+                return;
+            };
+            let mut c = Compiler::with_features(Path::new(&fexc), u64::MAX, None);
+            c.shape = true;
+            c.check_reuse = true;
+            c.compile(USER, A.1, false, &mut ()).unwrap();
+            let honest = c.answers.find(USER, A.1, None, &c.gating()).0.unwrap();
+            assert!(honest.kept.get().is_some());
+            assert!(matches!(c.reuse(&honest, USER, B.1, None, &mut ()), Ok(Some(_))));
+            let k = honest.kept.get().unwrap();
+            let form = admission::Admitted { guest_insns: k.form.guest_insns + 1, ..k.form.clone() };
+            let f = Entry {
+                rip: honest.rip,
+                owner: 0,
+                read: honest.read,
+                gating: honest.gating,
+                prefix: honest.prefix.clone(),
+                whole: honest.whole,
+                answer: honest.answer.clone(),
+                kept: Default::default(),
+            };
+            f.kept.set(Box::new(Kept { cpl0: k.cpl0, bulk: k.bulk, shape: k.shape, form })).ok().unwrap();
+            assert!(c.reuse(&f, USER, B.1, None, &mut ()).is_err());
         }
 
         #[test]
@@ -4768,6 +4855,8 @@ mod tests {
                 Ok(Code::Block(_))
             ));
             edit(&mut c, |e| {
+                // The edited answer is no longer the one its kept form (option (d)) was admitted from.
+                e.kept = Default::default();
                 if let Answer::Object(o) = &mut e.answer {
                     let word = |o: &[u8], at: usize| {
                         u32::from_le_bytes(o[at..at + 4].try_into().unwrap()) as usize

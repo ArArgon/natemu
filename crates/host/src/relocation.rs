@@ -86,8 +86,9 @@ pub(crate) fn resolved(o: &[u8]) -> Option<Vec<u8>> {
 
 /// Option (d): the block admission gave the answer `from_object` at `from` (`form`: its record without the object), as it
 /// gives `to_object` (that answer moved to `to` by [`object`]; itself when `to == from`) without admitting it. At another
-/// RIP only where every relocation packs (at most `MAX_RELOCS`) and the resident's re-check, [`relocate_code`], accepts;
-/// `None`: admit it.
+/// RIP only where every relocation packs (at most `MAX_RELOCS`), the resident's re-check, [`relocate_code`], accepts, and
+/// its code is the moved answer's. `None`: admit it. The caller pairs the objects with the entry `form` was kept for: the
+/// answer at `from` and the same answer at `to`.
 pub(crate) fn kept(
     form: &Admitted,
     from_object: &[u8],
@@ -116,6 +117,10 @@ pub(crate) fn kept(
     let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
     links[..form.links.len()].copy_from_slice(&form.links);
     relocate_code(&mut code, &relocs, &mut links, from, to, h.guest_bytes).ok()?;
+    // Safety does not rest on two relocators agreeing: the code is the moved object's.
+    if rest.object.get(h.code_offset as usize..)?.get(..h.code_size as usize)? != code {
+        return None;
+    }
     Some(Admitted {
         links: links[..form.links.len()].to_vec(),
         rep_self: form.rep_self.map(|r| r.wrapping_add(to.wrapping_sub(from))),
@@ -573,6 +578,23 @@ mod tests {
             }
         }
     }
+    const REPSRC: &[u8] = fixture!("rep.src");
+    /// `xor eax, eax; rep movsb`: the block ends at a REP string, so its `rep_self` (the RIP of the instruction) moves.
+    const REP_A: (&[u8], u64) = (fixture!("rep-7f1234567100.obj"), 0x7f12_3456_7100);
+    const REP_B: (&[u8], u64) = (fixture!("rep-7f1234568100.obj"), 0x7f12_3456_8100);
+
+    /// Option (d): `rep_self` moves with the RIP, as admission gives it there.
+    #[test]
+    fn kept_form_moves_rep_self() {
+        let admit = |o: &[u8], rip| crate::admission::admit(o, rip, REPSRC, u64::MAX, true, false).unwrap();
+        for (from, to) in [(REP_A, REP_B), (REP_B, REP_A)] {
+            let form = Admitted { object: vec![], ..admit(from.0, from.1) };
+            assert_eq!(form.rep_self, Some(from.1 + 2));
+            let moved = object(from.0, from.1, to.1).unwrap();
+            assert_eq!(kept(&form, from.0, from.1, &moved, to.1), Some(admit(to.0, to.1)));
+        }
+    }
+
     /// Option (d): the kept form moved to the other RIP is admission's block there (both ways), and every refusal of the
     /// move leaves `None` (admit it).
     #[test]
@@ -587,6 +609,11 @@ mod tests {
         let form = Admitted { object: vec![], ..admit(USER_A.0, USER_A.1) };
         // Another page offset: relocate_code's place check.
         assert_eq!(kept(&form, USER_A.0, USER_A.1, USER_B.0, USER_B.1 + 8), None);
+        // The moved answer's code is not what the re-check gives: admitted (two relocators must agree).
+        let mut tampered = USER_B.0.to_vec();
+        let h: Header = read(&tampered, 0).unwrap();
+        tampered[h.code_offset as usize + 8] ^= 1;
+        assert_eq!(kept(&form, USER_A.0, USER_A.1, &tampered, USER_B.1), None);
         // A relocation that does not pack (a kind no RIP is in, or a literal outside the code).
         let mut odd = USER_A.0.to_vec();
         let h: Header = read(&odd, 0).unwrap();
