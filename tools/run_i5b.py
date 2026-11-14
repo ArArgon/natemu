@@ -30,7 +30,8 @@ import argparse, json, pathlib, struct, subprocess, sys, time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import run_slice3_vm as s3  # noqa: E402  (also puts tools/reference and tools/bench/smp on the path)
-import ref, smp, run_slice1_vm as vm1  # noqa: E402
+import ref, smp, run_slice1_vm as vm1, qemucache  # noqa: E402
+qemucache.install(smp)      # (run_slice3_vm did: idempotent)
 
 # QEMU's Haswell (11.1.2 TCG): leaf 0DH sub-leaves 0 and 2 and leaf 1 ECX equal the profile's; sub-leaf 1 also advertises
 # XSAVEOPT (EAX bit 0), which no comparison here executes or reads: with `-xsaveopt` this QEMU loops in vmexit(-1) right after a
@@ -445,15 +446,9 @@ def natemu(a, host, runtime, text, work, limit=None):
 
 
 def qemu(prog, stub, work, timeout=60):
-    img = smp.build_image(prog, stub)
-    work.mkdir(parents=True, exist_ok=True); p, dbg = work / 'image.bin', work / 'dbg.out'
-    p.write_bytes(img); dbg.unlink(missing_ok=True)
-    try:
-        r = subprocess.run(smp.qemu_args(1, 'multi', dbg, p, QCPU), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=timeout)
-        rc = r.returncode
-    except subprocess.TimeoutExpired:
-        return None
-    return smp.parse_dump(prog, dbg.read_bytes()) if rc == 1 else None
+    """QEMU's final state of `prog` (None: it did not finish or failed); an unchanged image is served from tools/qemucache.py."""
+    rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), work, 'multi', timeout=timeout, cpu=QCPU)
+    return smp.parse_dump(prog, dump) if rc == 1 else None
 
 
 def fxm(off, x87=True):
