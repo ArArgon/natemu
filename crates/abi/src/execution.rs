@@ -284,6 +284,11 @@ pub mod cache {
     pub const LOOKUP_BYTES: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(BLOCK);
     pub const GLOBAL_VA: u64 = PRIVATE + (1 << 30);
     pub const GLOBAL_BYTES: usize = (TABLE_PAGES + TABLE_PAGE_BYTES).next_multiple_of(BLOCK);
+    /// The template pool ([`crate::pool`], cross-vCPU reuse plan chunk 2): one span shared by all vCPUs like the global
+    /// area, written by the host only and mapped EL1 read-only, in the window's room between the global area and the
+    /// guest-RAM alias. In the backing it follows the last vCPU's block and precedes guest RAM (the host's `prepare`).
+    pub const POOL_VA: u64 = PRIVATE + 0x6000_0000;
+    pub const POOL_BYTES: usize = crate::pool::PRODUCTION.span_bytes();
     /// Mapping granule of the areas.
     pub const BLOCK: usize = 2 * MIB;
 
@@ -1034,13 +1039,16 @@ pub mod cache {
         crate::shadow::POOL_OFFSET + crate::shadow::POOL_PAGES * 4096 <= LOOKUP_OFFSET
             && LOOKUP_OFFSET % BLOCK == 0
     );
-    // Every area lies in PRIVATE..PRIVATE + 1 GiB, 2 MiB aligned, below the guest RAM alias (its own GiBs).
+    // Every per-vCPU area lies in PRIVATE..PRIVATE + 1 GiB; the shared global area and pool above it. All are 2 MiB
+    // aligned and below the guest RAM alias (its own GiBs).
     const _: () = assert!(crate::execution::GUEST_RAM_VA == PRIVATE + (2 << 30));
     const _: () = assert!(CODE_VA + CODE_BYTES_MAX as u64 <= CODE_WRITE_VA);
     const _: () = assert!(CODE_WRITE_VA + CODE_BYTES_MAX as u64 <= META_VA);
     const _: () = assert!(META_VA + META_BYTES as u64 <= LOOKUP_VA);
     const _: () = assert!(LOOKUP_VA + LOOKUP_BYTES as u64 <= GLOBAL_VA);
-    const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= super::GUEST_RAM_VA);
+    const _: () = assert!(GLOBAL_VA + GLOBAL_BYTES as u64 <= POOL_VA);
+    const _: () = assert!(POOL_VA + POOL_BYTES as u64 <= super::GUEST_RAM_VA);
+    const _: () = assert!(POOL_VA % BLOCK as u64 == 0 && POOL_BYTES % BLOCK == 0);
     const _: () = assert!(HEAD_BYTES + CODE_BYTES <= CODE_BYTES_MAX && CODE_BYTES % BLOCK == 0);
     const _: () = assert!(MAX_BLOCK_BYTES <= SLOT_BYTES && HEAD_BYTES % 64 == 0);
     const _: () =
