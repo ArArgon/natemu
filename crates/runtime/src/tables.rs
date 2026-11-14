@@ -141,8 +141,8 @@ pub fn unmap(va: u64) -> Result<(), Error> {
 pub fn reset() {
     space(false).reset()
 }
-/// Perf chunk 14: a CR3 load's reset (`Space::reset_cr3`): the supervisor space's global upper-half shadows stay when
-/// they are all global. Whether every shadow went.
+/// Perf chunk 14: a CR3 load's reset (`Space::reset_cr3`): the supervisor space's global upper-half shadows stay, its
+/// non-global ones go (listed; a full reset past `LIST_MAX`). Whether every shadow went.
 pub fn reset_cr3() -> bool {
     space(false).reset_cr3()
 }

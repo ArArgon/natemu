@@ -1337,8 +1337,8 @@ fn flush(s: &mut State) {
 }
 /// K1: a TLB flush (a CR3 load; `global`: a paging control change or an MTRR write, global entries too): every shadow
 /// goes (the data TLB) and blocks no longer current leave L1 and their links ([`cache::tlb`]); no translation is dropped.
-/// Perf chunk 14: a CR3 load keeps the supervisor space's upper-half shadows when every one of them shadows a global
-/// translation (as the TLB keeps global entries, SDM Vol.3 4.10.4.1; [`tables::reset_cr3`]). This vCPU's writable bits
+/// Perf chunk 14: a CR3 load keeps the supervisor space's upper-half shadows of global translations (as the TLB keeps
+/// global entries, SDM Vol.3 4.10.4.1; [`tables::reset_cr3`]: the non-global ones there go, listed). This vCPU's writable bits
 /// then stay as they were (a superset of its writable shadows; a peer's mark may ask it for a full reset it did not need)
 /// and its reset counter does not move (a peer waiting for its writable shadows to go waits for a full reset).
 fn tlb(s: &mut State, global: bool) {

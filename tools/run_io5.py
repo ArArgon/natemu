@@ -114,7 +114,7 @@ if [ $P = use ]; then
   dpkg-query -W > $L/packages.txt; say packages $(sha256sum < $L/packages.txt | cut -c1-16)
   span grow run 'growpart /dev/vda 1 && resize2fs /dev/vda1'
   say root_mib $(df -B1M --output=size / | tail -1)
-  span fetch-python run 'curl -fsS http://$H:8000/py.tar.xz -o /root/py.tar.xz && echo "$PYSHA  /root/py.tar.xz" | sha256sum -c &&
+  span fetch-python run 'curl -fsS http://$H/py.tar.xz -o /root/py.tar.xz && echo "$PYSHA  /root/py.tar.xz" | sha256sum -c &&
       mkdir -p /build && tar -C /build -xf /root/py.tar.xz'
   span configure run 'cd /build/Python-3.13.18 && ./configure'
   mkdir -p /data/dl /data/gen; rm -f /tmp/make.done; s=$(now)
@@ -145,6 +145,18 @@ say df $(df -B1M --output=used / | tail -1) uptime=$(cut -d' ' -f1 /proc/uptime)
 
 
 def sh(*cmd, **kw): return subprocess.run([str(c) for c in cmd], check=True, **kw)
+
+
+def serve_files(directory):
+    """An HTTP server for `directory` on the host's LAN address and a free port (other runners use 8000): the server and
+    the guest's "address:port"."""
+    import socket
+    with socket.socket() as s:
+        s.bind((lan_address(), 0))
+        port = s.getsockname()[1]
+    server = subprocess.Popen([sys.executable, '-m', 'http.server', '-b', lan_address(), str(port)], cwd=directory,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return server, f'{lan_address()}:{port}'
 
 
 def prepare(inputs):
@@ -194,7 +206,7 @@ def launch(cmd, work, phase, host, limit):
     t0 = time.time(); deadline = t0 + limit; buf = b''
     # The serial line ends lines with \r\r\n; the end marker is computed in the guest so the echoed command cannot match.
     steps = ((rb'login: $', 'root\n'), (rb'Password: $', PASSWORD + '\n'), (rb'# $',
-             f'curl -fsS http://{host}:8000/io5.sh -o /root/io5.sh && bash /root/io5.sh {phase} {host}; echo IO5-$((40+2))-END\n'),
+             f'curl -fsS http://{host}/io5.sh -o /root/io5.sh && bash /root/io5.sh {phase} {host}; echo IO5-$((40+2))-END\n'),
              (rb'IO5-42-END\r*\n', 'poweroff\n'))
     timed_out = False
     try:
@@ -274,9 +286,7 @@ def run(args):
                                   .replace('@PYTESTS@', PYTESTS).replace('@SNAP@', SNAPSHOT)
                                   .replace('@SOLO@', '1' if args.solo_build else '0'))
     shutil.copy(args.inputs / PYTHON, serve / 'py.tar.xz')
-    host = lan_address()
-    server = subprocess.Popen([sys.executable, '-m', 'http.server', '-b', host, '8000'], cwd=serve,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    server, host = serve_files(serve)
     result = {'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
               'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'perf_log': args.perf_log, 'command': [str(c) for c in command(args, disk, 'CACHE')],
               'natemu': digest(ROOT / 'target/release/natemu') if args.backend == 'natemu' else None, 'phases': {}}
@@ -351,9 +361,7 @@ def profile(args):
     args.out.mkdir(parents=True)
     serve = args.out / 'serve'; serve.mkdir()
     (serve / 'io5.sh').write_text(PROFILE.replace('@PYTESTS@', PYTESTS).replace('@KSHA@', LINUX_SHA))
-    host = lan_address()
-    server = subprocess.Popen([sys.executable, '-m', 'http.server', '-b', host, '8000'], cwd=serve,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    server, host = serve_files(serve)
     windows, ok, allocated = {}, True, {}
     try:
         time.sleep(1); assert server.poll() is None, 'http server'
