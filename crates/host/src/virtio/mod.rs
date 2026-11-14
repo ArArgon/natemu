@@ -114,6 +114,12 @@ const GATE_KILLED: u64 = 2;
 const RNG_MAX_QUEUE: u16 = 8;
 /// The most queues a device has: the disk's request queues over PCI (one per vCPU, up to this many: `block::F_MQ`);
 /// the network device has its receive and transmit queues, the others one.
+/// The disk's queue size. Without indirect descriptors a request takes a descriptor per segment and two more, so the
+/// ring bounds the requests in flight by their size: at 128, three of 128 KiB (a guest at depth 16 then waits on every
+/// completion) and one of 504 KiB. At 256 (QEMU's default), M2 Max, PCI, 2 vCPUs: fio 128 KiB depth 16 writes 12.6k to
+/// 17.4k IOPS and reads 21.5k to 28.6k, 1 MiB direct writes 2.7 to 3.5 GB/s and reads to 5.0, 4 KiB unchanged. 512
+/// and 1024 gain a little more on large reads and cost about 5% at 4 KiB depth 16 (each capture reads the whole table).
+const BLOCK_QUEUE: u16 = 256;
 pub const MAX_QUEUES: usize = 8;
 /// The most entropy one request returns (also getentropy's limit).
 const MAX_PAYLOAD: usize = 256;
@@ -371,7 +377,7 @@ impl Profile {
     fn queue_max(&self) -> u16 {
         match self {
             Self::Entropy => RNG_MAX_QUEUE,
-            Self::Block(_) => 128,
+            Self::Block(_) => BLOCK_QUEUE,
             Self::Network(_) => 256,
         }
     }

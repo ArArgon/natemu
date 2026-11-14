@@ -106,7 +106,7 @@ backend still awaits its deployment choice and implementation.
 capacity, locks it for cooperating natemu launches and holds its identity/capacity
 for the device lifetime. Other writers or truncators must be excluded; the lock
 cannot enforce that against unrelated software. Block uses the same modern
-transport, with queue size 128, 4096-byte data segments, 126 segments and 504 KiB
+transport, with queue size 256, 4096-byte data segments, 126 segments and 504 KiB
 per request. SIZE_MAX/SEG_MAX/VERSION_1 are required; BLK_SIZE/FLUSH are offered.
 IN/OUT/FLUSH/GET_ID operate on complete logical byte streams, including split
 headers and combined data/status descriptors. Used length covers only the

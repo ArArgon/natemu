@@ -751,7 +751,7 @@ mod tests {
         );
         for q in 0..4 {
             rig.write(0x16, 2, q);
-            assert_eq!(rig.read(0x18, 2), 128, "queue {q} exists");
+            assert_eq!(rig.read(0x18, 2), 256, "queue {q} exists");
             rig.write(0x1a, 2, q + 1);
             assert_eq!(rig.read(0x1a, 2), q + 1);
         }
