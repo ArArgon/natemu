@@ -33,7 +33,8 @@ These eight run at block sizes default and 1 and are compared with QEMU system m
   masks, CR0.TS), more than the dispatcher's L1 tables: each runs, or takes #NM or #XM, by its own context only; then an
   INVLPG, a code write and a CR3 reload made under one context reach the block another context's table holds. Perf
   chunk 19: two RIPs sharing one L1 entry (the same low 16 bits) called in turn each run their own code, and a CR3 reload
-  under another context reaches the entry's last owner.
+  under another context reaches the entry's last owner. Two-way L1: three such RIPs (one set, three RIPs: they evict each
+  other) run under every context of every round, tables cleared and reused around them.
 Perf chunk 8 (links kept across TLB events):
 - `place-global` (natemu only): a block placed from a global page under CR4.PGE is global at once: V remapped with no
   INVLPG and a CR3 reload, natemu keeps the old frame (the architecture allows either; r9 = 1 asserted); INVLPG: the new.
@@ -132,8 +133,27 @@ Perf chunk 12 (natemu only):
   of a new instruction breakpoint, never reached, then three linked calls to V; odd rounds also run CLI, a kept record that
   takes a number and no code): every call runs (r8 = 12).
 
+The two-way L1 (docs/restructure/l1-two-way-plan.md, chunk 1; blocks A, B, C, D at W, W + 64 KiB, W + 128 KiB, W + 32 KiB,
+each `mov eax, k; jmp r13`: A, B, C share RIP bits 15:0, D differs in bit 15, so all four share an L1 set: RIP bits 14:0;
+W = `L1W(i)`, set 0 of the index). Values are compared with QEMU unless noted; the natemu counts (dispatcher misses, a
+difference of two runs of one program, from a `perf` resident: `--perf-runtime`, built here when not given) are judged
+beside them:
+- `l1-pair`: K rounds A, B then K rounds A, D: values; no dispatcher miss per round after the first (the pair fits).
+- `l1-triple`: K rounds A, B, C, then A, B once after C: exactly 3 misses per round (fill-order replacement); that tail
+  costs exactly 2 misses (A replaces the older of the set's two, B the other) and a longer tail adds none; the variants
+  `l1-triple-t0` (no tail) and `l1-triple-t3` (three tails) are only measured, never listed. `l1-triple-d`: A, B, D in
+  turn: 3 misses a round, and `L1_NEW_CONFLICT` counts them (replacements whose victim differs in bit 15).
+- `l1-pair-invlpg`: A in way 0, B in way 1; B's page remapped and INVLPG: the new frame's bytes; then A's, the roles swapped.
+- `l1-pair-cr3`: A, B warm under table A; CR3 to table B, where B maps other bytes: B's own; back under A: A's.
+- `l1-pair-write`: B's frame rewritten through its data alias, then A's (way 0); then C replaces A in way 0 (the set's
+  next-victim bit now names way 1) and C's frame is rewritten: the new bytes each time.
+- `l1-global` (+ `l1-global-x`, only measured): B (not global) fills way 0, A (G set, PGE) way 1; each round a CR3 reload
+  empties way 0 and A runs again before B: no miss for A (the program against the one without A's call: no difference).
+- `l1-dup` (natemu only; + `l1-dup-x`): each round CR3 reload, A, B (way 1), then a CPUID at B - 2 whose next RIP is B: the
+  resident fills L1 for B while B is in way 1 (a CPUID is never in L1: one miss a round of its own), then A: no miss for it.
+- `l1-pic` (natemu only): two instances of one shared translation at aliases in one L1 set, each with its own page base.
 Writes DIR/k1.json; exit status 1 on any failure."""
-import argparse, json, os, pathlib, sys
+import argparse, json, os, pathlib, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
@@ -165,6 +185,90 @@ def walk_at(i):
     q = P.SYS_D(i) + WQ
     pte = (q >> 12 & 511) * 8
     return q, pte, q + pte - 2
+
+
+# The two-way L1 programs (module docstring). CPU i's blocks and frames lie in 0x2c0000 + 0x30000 i ..: above every page
+# `sys_tables` gives PTEs (their PTEs are written here, into both tables), clear of the next CPU's.
+L1W = lambda i: 0x2c0000 + 0x30000 * i
+L1_VARIANTS = ('l1-triple-t0', 'l1-triple-t3', 'l1-global-x', 'l1-dup-x')   # measured, never run beside the others
+L1_NAMES = ('l1-pair', 'l1-triple', 'l1-triple-d', 'l1-pair-invlpg', 'l1-pair-cr3', 'l1-pair-write', 'l1-global', 'l1-dup', 'l1-pic')
+L1_ALL = L1_NAMES + L1_VARIANTS
+
+
+def l1_pages(i):
+    """CPU i's blocks A, D, B, C (linear), the frames FA.. they map (also mapped at their own addresses: the data aliases),
+    second frames A2, B2 and PB (the page before B: a CPUID ends it, so its next RIP is B)."""
+    w = L1W(i)
+    return dict(A=w, D=w + 0x8000, B=w + 0x10000, C=w + 0x20000, PB=w + 0xf000, FA=w + 0x1000, FD=w + 0x9000, FB=w + 0x11000,
+                FC=w + 0x21000, A2=w + 0x2000, B2=w + 0x12000)
+
+
+def l1_memory(name, i):
+    """CPU i's PTEs (both tables, by `sys_leaf`) and frames for an L1 program: A, D, B, C map FA, FD, FB, FC (table B maps B to
+    B2); the frames and PB, A2, B2 are mapped at their own addresses (the data aliases). A is global in `l1-global`."""
+    if name == 'l1-pic':
+        return []
+    pg = l1_pages(i)
+    code = lambda at, v: {'addr': f'0x{at:x}', 'data': CODE(v).hex(), 'capture': False}
+    pte = lambda t, va, frame, bits=0: {'addr': f'0x{P.sys_leaf(i, t, va):x}', 'data': (frame | P.LEAF | bits).to_bytes(8, 'little').hex(), 'capture': False}
+    maps = {pg['A']: pg['FA'], pg['D']: pg['FD'], pg['B']: pg['FB'], pg['C']: pg['FC'], **{pg[x]: pg[x] for x in ('FA', 'FB', 'FC', 'FD', 'PB', 'A2', 'B2')}}
+    out = []
+    for t in (0, 1):
+        m = {**maps, **({pg['B']: pg['B2']} if t else {})}
+        out += [pte(t, va, frame, 0x100 if name.startswith('l1-global') and va == pg['A'] else 0) for va, frame in m.items()]
+    return out + [code(pg['FA'], 1), code(pg['FB'], 2), code(pg['FC'], 3), code(pg['FD'], 4), code(pg['A2'], 0x11), code(pg['B2'], 0x22),
+                  {'addr': f"0x{pg['PB'] + 0xffe:x}", 'data': '0fa2', 'capture': False}]   # (a CPUID ends PB: its next RIP is B)
+
+
+def l1_bodies(k, i, n):
+    pg = l1_pages(i)
+    A, B, C, D, PB = (pg[x] for x in ('A', 'B', 'C', 'D', 'PB'))
+    tag = iter(range(10_000))
+    c = lambda va, reg=None: call(f'l{next(tag)}', f'{va:#x}') + (f'    mov {reg}, rax\n' if reg else '')
+    add = lambda va, reg: call(f'l{next(tag)}', f'{va:#x}') + f'    add {reg}, rax\n'
+    def rounds(count, body, counter='ecx'):
+        label = f'.r{next(tag)}'
+        return f'    mov {counter}, {count}\n{label}:\n{body}    dec {counter}\n    jnz {label}\n'
+    leaf = lambda va: P.sys_leaf(i, 0, va)
+    put = lambda va, frame: f'    mov rax, {frame | P.LEAF:#x}\n    mov [{leaf(va):#x}], rax\n'
+    inv = lambda va: f'    mov rax, {va:#x}\n    invlpg [rax]\n'
+    cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
+    pge = lambda on: f'    mov rax, cr4\n    {"bts" if on else "btr"} rax, 7\n    mov cr4, rax\n'
+    # (8 bytes of `mov eax, v; jmp r13`: one store rewrites a block's code.)
+    rewrite = lambda frame, v: f'    mov rax, {int.from_bytes(CODE(v)[:8], "little"):#x}\n    mov [{frame:#x}], rax\n'
+    def tail(m):
+        return rounds(m, add(A, 'r12') + add(B, 'r14'), 'edx') if m else ''
+    def triple_with_tail(m):
+        return rounds(k, add(A, 'r8') + add(B, 'r9') + add(C, 'r10')) + tail(m)
+    def glob(with_a):
+        # B (not global) into way 0, A (global) into way 1; each round a CR3 reload empties way 0, then A (optional), then B.
+        return (pge(True) + c(B, 'r9') + c(A, 'r8')
+                + rounds(k, cr3('ta') + (add(A, 'r10') if with_a else '') + add(B, 'r12')))
+    def dup(with_a):
+        # (CPUID clobbers ecx: the counter is r14d.) Each round A (way 0), B (way 1), then the CPUID at B - 2 enters B through
+        # the resident, which fills its L1 entry again while B is in way 1; A runs again: it must still be in L1.
+        return rounds(k, cr3('ta') + add(A, 'r8') + add(B, 'r9') + add(B - 2, 'r10') + (add(A, 'r12') if with_a else ''), 'r14d')
+    pic = lambda: rounds(k, c(RV1) + '    mov r8, rax\n    mov r9, rsi\n' + c(RV6) + '    mov r10, rax\n    mov r12, rsi\n')
+    return {
+        'l1-pair': rounds(k, add(A, 'r8') + add(B, 'r9')) + rounds(k, add(A, 'r10') + add(D, 'r12')),
+        'l1-triple': triple_with_tail(1),
+        'l1-triple-t0': triple_with_tail(0),
+        'l1-triple-t3': triple_with_tail(3),
+        'l1-triple-d': rounds(k, add(A, 'r8') + add(B, 'r9') + add(D, 'r10')),
+        # A in way 0, B in way 1: B remapped (INVLPG) and run; A run; then A remapped (the way-0 block) and run, B again.
+        'l1-pair-invlpg': (c(A, 'r8') + c(B, 'r9') + put(B, pg['B2']) + inv(B) + c(B, 'r10') + c(A, 'r12')
+                           + put(A, pg['A2']) + inv(A) + c(A, 'r14') + c(B, 'r15')),
+        'l1-pair-cr3': (c(A, 'r8') + c(B, 'r9') + cr3('tb') + c(A, 'r10') + c(B, 'r12') + cr3('ta') + c(B, 'r14') + c(A, 'r15')),
+        # B's frame rewritten (B in way 1), then A's (way 0); C then replaces A in way 0 and sets the set's next-victim bit
+        # (the bit is in way 0's owner word): C's frame rewritten: its slot must go, whatever the word holds.
+        'l1-pair-write': (c(A, 'r8') + c(B, 'r9') + rewrite(pg['FB'], 0x22) + c(B, 'r10') + rewrite(pg['FA'], 0x11) + c(A, 'r12')
+                          + c(C, 'r14') + rewrite(pg['FC'], 0x33) + c(C, 'r15')),
+        'l1-global': glob(True),
+        'l1-global-x': glob(False),
+        'l1-dup': dup(True),
+        'l1-dup-x': dup(False),
+        'l1-pic': pic(),
+    }
 
 
 def bodies(k, i=0, n=1):
@@ -224,13 +328,14 @@ def bodies(k, i=0, n=1):
         # #NM; D, E, F (UM, ZM, DM clear: nothing raised) run. A block entered under another context than its own shows as
         # a wrong count (r8 runs, r14 #NM, r15 #XM). Then V's block, kept in A's table, is made stale under C (`ctx_kept`).
         'contexts': (ctx_idt(d) + f'    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n    xor r8d, r8d\n    xor r14d, r14d\n    xor r15d, r15d\n'
-                     f'    mov eax, 0x3f800000\n    movd xmm0, eax\n    mov eax, 0x0da24260\n    movd xmm1, eax\n    mov ecx, {k}\n.l:\n'
+                     f'    xor r11d, r11d\n    mov eax, 0x3f800000\n    movd xmm0, eax\n    mov eax, 0x0da24260\n    movd xmm1, eax\n    mov ecx, {k}\n.l:\n'
                      + ''.join(ctx_call(j, d, m) for j, m in enumerate((0, 1, 0, 1)))
                      + '    mov rax, cr0\n    bts rax, 3\n    mov cr0, rax\n' + ctx_call(4, d, None) + '    clts\n'
                      + ''.join(ctx_call(5 + j, d, j + 2) for j in range(3)) + '    dec ecx\n    jnz .l\n'
                      + ctx_call(8, d, 0) + ctx_kept(i) + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
         **links_bodies(k, i, n),
         **reuse_bodies(i, n),
+        **l1_bodies(k, i, n),
         'link-full': full_body(i, n),
         # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
         # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
@@ -357,6 +462,7 @@ RL, RL2, RLC = 0x9000, 0xa000, 0xc000
 # HIGH each table maps through three more table pages of its own (its PML4 entry, PDPT and PD at +0x5000, +0x6000, +0x7000).
 HIGH = 0x7f12_3440_0000
 RV1, RV2, RV3 = HIGH + 0xb000, HIGH + 0xd000, HIGH + 0xf000
+RV6 = RV1 + 0x8000                # `l1-pic`: RV1's partner in the two-way L1 (the same RIP bits 14:0, bit 15 differs)
 RX = 0xff7                       # `reuse-cross`: `lea rdx, [rel 0]` at RX, then `mov eax, imm32` across the page end
 LIB = lambda k: P.asm(f'mov ebx, {k}\nlea rax, [rel $$]\ncall .n\n.n:\npop rsi\njmp r13')   # rsi = alias + 17
 # PIC study stage 3 (module docstring): Y (rsi = alias + YN), X at XO, the trampoline page at RVT.
@@ -377,13 +483,15 @@ RE = P.asm('rep movsb\nmov ebx, 13\njmp r13')
 XFLAGS = P.SYS_D(0) + 0x7800     # `pic-xwrite`: per CPU a ready word, then (+ 0x40) a written word
 JMP = lambda at, to: b'\xe9' + (to - at - 5).to_bytes(4, 'little', signed=True)
 PIC = ('pic-two', 'pic-fork', 'pic-invlpg', 'pic-write', 'pic-abs', 'pic-pge', 'pic-gmap', 'pic-ctx', 'pic-twosrc', 'pic-cow',
-       'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again', 'pic-cross', 'pic-now')
+       'pic-twoframe', 'pic-xm', 'pic-flush', 'pic-write2', 'pic-pfault', 'pic-xwrite', 'pic-user', 'pic-rep', 'pic-repexit', 'pic-again', 'pic-cross', 'pic-now',
+       'l1-pic')
 # Least instances, checked links and local (same-page shared) links per CPU.
 PIC_MIN = {'pic-two': (2, 1, 1), 'pic-fork': (1, 0, 1), 'pic-invlpg': (1, 0, 1), 'pic-write': (1, 0, 1), 'pic-abs': (2, 1, 1),
            'pic-pge': (2, 1, 1), 'pic-gmap': (1, 0, 1), 'pic-ctx': (1, 1, 1), 'pic-twosrc': (3, 1, 1),
            'pic-cow': (1, 0, 1), 'pic-twoframe': (2, 1, 1), 'pic-xm': (2, 2, 0), 'pic-flush': (6, 2, 2), 'pic-write2': (1, 0, 1),
            'pic-pfault': (1, 0, 1), 'pic-xwrite': (1, 0, 1), 'pic-user': (0, 0, 0),
-           'pic-rep': (1, 0, 0), 'pic-repexit': (2, 0, 1), 'pic-again': (2, 1, 1), 'pic-cross': (1, 0, 0), 'pic-now': (1, 0, 1)}
+           'pic-rep': (1, 0, 0), 'pic-repexit': (2, 0, 1), 'pic-again': (2, 1, 1), 'pic-cross': (1, 0, 0), 'pic-now': (1, 0, 1),
+           'l1-pic': (1, 0, 1)}
 # Further `pic` counters per CPU: (counter, least, most): `pic-gmap` refuses the global instance (INSTANCE_REFUSED),
 # `pic-user` shares nothing (SHARES).
 PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)]}
@@ -578,6 +686,8 @@ def reuse_tables(name, i):
         return {RV1: RL, RV1 + 0x1000: RL2, RV3: RL, RV3 + 0x1000: RL2}, {}
     if name == 'pic-fork':
         return {RV1: RL, RV3: RL}, {RV1: RL}
+    if name == 'l1-pic':
+        return {RV1: RL, RV6: RL}, {}
     if name in ('pic-two', 'pic-pge', 'pic-write2', 'pic-user', 'pic-again'):
         return {RV1: RL, RV3: RL, RVT: RT}, {}
     if name in ('pic-twosrc', 'pic-flush', 'pic-xm', 'pic-repexit'):
@@ -655,9 +765,12 @@ def reuse_either(name):
             'pic-cross': {'r8': {0x100}, 'r9': {0x100}, 'r10': {RV3 + 0xffe}, 'r12': {0x200}, 'r14': {RV3 + 0xffe}, 'r15': {0x100},
                           'rbx': {0x100}},
             'pic-user': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
+            # Two instances of one translation in one L1 set: each with its own page base (rax) and return address (rsi).
+            'l1-pic': {'r8': {RV1}, 'r9': {RV1 + YN}, 'r10': {RV6}, 'r12': {RV6 + YN}},
         }[name]
     return judge
-REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC}}
+# (`l1-pic` shares one translation across two aliases; it asserts no copies: it is not a reuse program.)
+REUSE = {'reuse-alias': (1, 0), 'reuse-write': (1, 0), 'reuse-remap': (1, 0), 'reuse-cross': (1, 1), **{n: (1, 0) for n in PIC if n != 'l1-pic'}}
 
 IDT = 0x3000
 CX, CD = 0x9000, 0xa000                       # `contexts`: its code page and its MXCSR values (A, C, D, E, F)
@@ -681,7 +794,13 @@ def ctx_idt(d, vectors=(7, 19)):
 def ctx_call(tag, d, mxcsr):
     """`contexts`: LDMXCSR of value `mxcsr` (an index into CTX_MXCSR; None: none), then the call; r8 += 1 if it ran."""
     load = '' if mxcsr is None else f'    ldmxcsr [{d + CD + 4 * mxcsr:#x}]\n'
-    return load + f'    xor eax, eax\n' + call(f'x{tag}', f'{d + CX:#x}') + '    add r8, rax\n'
+    return load + f'    xor eax, eax\n' + call(f'x{tag}', f'{d + CX:#x}') + '    add r8, rax\n' + ctx_triple(tag)
+
+
+def ctx_triple(tag):
+    """`contexts` (two-way L1): Q1, Q2, Q3 (CQ1, CQ2, CQ3: one L1 set, three RIPs, so they evict each other) called in turn
+    under the context just loaded: each runs its own code (r11 += 0x1 + 0x10 + 0x300 a time)."""
+    return ''.join(call(f'y{tag}{j}', f'{LP + at:#x}') + '    add r11, rax\n' for j, at in enumerate((CQ1, CQ2, CQ3)))
 
 def ctx_kept(i):
     """`contexts`, after the rounds: under C (another L1 table), V is remapped to frame W1 with INVLPG, then W1's bytes are
@@ -700,12 +819,12 @@ def ctx_kept(i):
     return (load(1) + put(W1) + f'    mov rax, {V:#x}\n    invlpg [rax]\n' + run(0, 'r9')
             + load(1) + f'    mov byte [{W1 + 1:#x}], 3\n' + run(1, 'r10')
             + load(1) + put(W2) + '    mov rax, cr3\n    mov cr3, rax\n' + run(2, 'r12')
-            + load(0) + '    xor ebx, ebx\n    xor esi, esi\n    xor edi, edi\n'
-            + ''.join(q(f'{r}a', CQ1, 'rbx') + q(f'{r}b', CQ2, 'rsi') for r in range(3))
-            + load(1) + pde + '    mov rax, cr3\n    mov cr3, rax\n' + load(0) + q('c', CQ2, 'rdi'))
+            + load(0) + '    xor ebx, ebx\n    xor esi, esi\n    xor edi, edi\n    xor ebp, ebp\n'
+            + ''.join(q(f'{r}a', CQ1, 'rbx') + q(f'{r}b', CQ2, 'rsi') + q(f'{r}c', CQ3, 'rbp') for r in range(3))
+            + load(1) + pde + '    mov rax, cr3\n    mov cr3, rax\n' + load(0) + q('c', CQ2, 'rdi') + q('d', CQ3, 'rbp'))
 
 CW1, CW2 = 0xb000, 0xc000                     # `contexts`: V's other frames (`mov eax, 2` and `mov eax, 4`)
-CQ1, CQ2 = 0x1f1000, 0x1d1000                 # `contexts`: Q1 and Q2 in LP (the same low 16 bits)
+CQ1, CQ2, CQ3 = 0x1f1000, 0x1d1000, 0x1b1000  # `contexts`: Q1, Q2 and Q3 in LP (the same low 16 bits: one L1 set of the two-way table, three RIPs)
 
 # #NM and #XM: counted, and the call returns (r13) with RAX 0 (its `mov eax, 1` not run).
 CTX_HANDLERS = '.h7:\n    inc r14\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n.h19:\n    inc r15\n    xor eax, eax\n    mov [rsp], r13\n    iretq\n'
@@ -717,7 +836,10 @@ EITHER = {
     'walk': lambda i, k: {'r8': {walk_at(i)[0] | 7}, 'r9': {walk_at(i)[0] | 0x27}, 'r10': {walk_at(i)[0] | 0x27}},
     'pf-remap': {'r8': {1}, 'r14': {1}, 'r9': {2}},
     # K rounds of five runs, one #NM and two #XM, then a last run under A.
-    'contexts': lambda i, k: {'r8': {5 * k + 1}, 'r14': {k}, 'r15': {2 * k}, 'r9': {2}, 'r10': {3}, 'r12': {4}, 'rbx': {3}, 'rsi': {0x30}, 'rdi': {0x20}},
+    # (Two-way L1: rbp = Q3's three runs (0x300) and its run after the remap (0x400); r11 = Q1 + Q2 + Q3 (0x311) after each of the
+    # 8 K + 1 calls under a context.)
+    'contexts': lambda i, k: {'r8': {5 * k + 1}, 'r14': {k}, 'r15': {2 * k}, 'r9': {2}, 'r10': {3}, 'r12': {4}, 'rbx': {3}, 'rsi': {0x30}, 'rdi': {0x20},
+                              'rbp': {0xd00}, 'r11': {(8 * k + 1) * 0x311}},
     # Perf chunk 8: natemu's choice where the architecture allows either (r9 of `place-global`, `invlpg-page`, `local-gpa`).
     'place-global': {'r8': {1}, 'r9': {1}, 'r10': {2}, 'r12': {0x100}, 'rsi': {0x200}, 'rdi': {3}, 'rbp': {1}},
     'invlpg-page': {'r8': {3}, 'r9': {3}, 'r10': {2}},
@@ -727,7 +849,11 @@ EITHER = {
     'large-alias': {'r10': {1}, 'r8': {1}, 'r9': {2}},
     'large-reval': {'r8': {1}, 'r10': {1}, 'r9': {2}},
     **{f'large-{m}': {'r8': {m}, 'r9': {2}} for m in LM},
-    **{name: reuse_either(name) for name in REUSE},
+    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic')},
+    # CPUID leaves differ from QEMU's: natemu only. Per round (K rounds): A once (and again at the end unless -x), B, and the
+    # CPUID's way into B (eax = 2 from B's own code).
+    'l1-dup': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {k}},
+    'l1-dup-x': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}},
     'link-full': {'r8': {3}, 'r9': {6}, 'r10': {12}, 'r12': {6}},
     'hint-reset': {'r8': {12}},
 }
@@ -770,11 +896,11 @@ def program(name, n, k):
                       {'addr': f'0x{d + CW1:x}', 'data': P.asm('mov eax, 2\njmp r13').hex()}, {'addr': f'0x{d + CW2:x}', 'data': P.asm('mov eax, 4\njmp r13').hex()},
                       {'addr': f'0x{P.SYS_T(i, 0) + 0x2000 + 8 * (LP >> 21):x}', 'data': (LF1 | 0x80 | P.LEAF).to_bytes(8, 'little').hex(), 'capture': False}]
             extra += [{'addr': f'0x{f + at:x}', 'data': P.asm(f'mov eax, {k}\njmp r13').hex()}
-                      for f, at, k in ((LF1, CQ1, 1), (LF1, CQ2, 0x10), (LF2, CQ2, 0x20))] if i == 0 else []
+                      for f, at, k in ((LF1, CQ1, 1), (LF1, CQ2, 0x10), (LF2, CQ2, 0x20), (LF1, CQ3, 0x300), (LF2, CQ3, 0x400))] if i == 0 else []
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE else [])
-            + (full_memory(i) if name == 'link-full' else []))
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name == 'l1-pic' else [])
+            + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL else []))
     return out
 
 
@@ -883,6 +1009,57 @@ def adv_program(name, n):
     return out
 
 
+# The two-way L1 counts (module docstring): per program, what the difference of its dispatcher misses over rounds must be.
+COUNT_CHECKS = ('l1-pair', 'l1-triple', 'l1-triple-d', 'l1-global', 'l1-dup', 'l1-pic')
+
+
+def perf_runtime(a):
+    """The resident with its `perf` feature (the dispatcher-miss count), built into its own target directory."""
+    if a.perf_runtime:
+        return a.perf_runtime
+    target = ROOT / 'target' / 'perf'
+    out = target / 'aarch64-unknown-none/release/natemu-runtime'
+    if not (os.environ.get('NATEMU_PREBUILT') == '1' and out.exists()):
+        subprocess.run(['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none',
+                        '--features', 'perf'], cwd=ROOT, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True)
+    a.perf_runtime = out
+    return out
+
+
+def l1_counts(a, n, name, report):
+    """`name`'s dispatcher misses on each vCPU, as differences of runs of the program (and its variants) at K and 2K rounds:
+    the setup, the tails and the glue misses cancel. Returns the failures."""
+    k, failures, seen = a.k, [], {}
+    def m(prog, rounds, field=0):
+        if (prog, rounds) not in seen:
+            out, problems = run(a, program(prog, n, rounds), [], None, perf_runtime(a), f'-m{rounds}')
+            failures.extend(f'{prog}@{n} k={rounds}: {p}' for p in problems)
+            k1 = [c['stats']['k1'] for c in out['cpus']] if out else []
+            seen[prog, rounds] = [(x['dispatch_misses'], x['l1_counts'][6]) for x in k1] or [(None, None)] * n
+        return [x[field] for x in seen[prog, rounds]]
+    def expect(label, got, want):
+        if any(g is None for g in got) or not any(m(name, k)):
+            failures.append(f'{name}@{n} {label}: no counts (is the resident built with `perf`?)')
+        elif not all(want(g) for g in got):
+            failures.append(f'{name}@{n} {label} = {got}')
+    diff = lambda p, r1, p2, r2, f=0: [x - y if x is not None and y is not None else None for x, y in zip(m(p, r1, f), m(p2, r2, f))]
+    if name in ('l1-pair', 'l1-pic'):
+        expect(f'misses over {k} more rounds (want 0: the pair fits)', diff(name, 2 * k, name, k), lambda g: g == 0)
+    if name == 'l1-triple':
+        expect(f'misses over {k} more rounds of A, B, C (want {3 * k}: three a round)', diff(name, 2 * k, name, k), lambda g: g == 3 * k)
+        expect('misses of the tail A, B after C (want 2)', diff(name, k, 'l1-triple-t0', k), lambda g: g == 2)
+        expect('misses of two more tails (want 0)', diff('l1-triple-t3', k, name, k), lambda g: g == 0)
+        expect('L1_NEW_CONFLICT over more rounds (want 0: A, B, C agree in bit 15)', diff(name, 2 * k, name, k, 1), lambda g: g == 0)
+    if name == 'l1-triple-d':
+        expect(f'misses over {k} more rounds of A, B, D (want {3 * k})', diff(name, 2 * k, name, k), lambda g: g == 3 * k)
+        expect('L1_NEW_CONFLICT over more rounds (want some: D differs in bit 15)', diff(name, 2 * k, name, k, 1), lambda g: g > 0)
+    if name in ('l1-global', 'l1-dup'):
+        expect('misses of the extra A call a round (want 0)', diff(name, k, name + '-x', k), lambda g: g == 0)
+    report.append({'name': f'k1-{name}@{n}', 'max_block': None, 'stats': None, 'counts': {f'{p}/{r}': v for (p, r), v in seen.items()}, 'problems': failures})
+    print(json.dumps(report[-1]), flush=True)
+    return [f'counts {f}' for f in failures]
+
+
 def run(a, prog, extra, host=None, runtime=None, tag=''):
     work = a.out / 'work' / f"{prog['name']}{tag}{'-1' if extra else ''}"
     full = prog['name'].startswith('k1-link-full@')
@@ -915,6 +1092,7 @@ def main():
     ap.add_argument('--base-host', type=pathlib.Path)
     ap.add_argument('--base-runtime', type=pathlib.Path)
     ap.add_argument('--programs', type=lambda s: s.split(','), help='only these programs (and no counts)')
+    ap.add_argument('--perf-runtime', type=pathlib.Path, help="a resident built with `--features perf` for the two-way L1 programs' dispatcher-miss counts (default: built into target/perf here)")
     shard.add(ap)
     ap.add_argument('--full-links', action='store_true', help=f'link-full at the production link capacity ({MAX_LINKS} records: ~6 min at 1 vCPU, ~20 at 4) instead of the test capacity {LINK_CAP} (the end-of-round suite runs this once)')
     ap.add_argument('--timeout', type=int, default=300, help='seconds a run may take before it is killed as hung (the suite gives parallel shards more: link-full is slow under load)')
@@ -924,7 +1102,8 @@ def main():
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
     stub = smp.build_stub(a.out / 'qemu-build')
     report, failures = [], []
-    cases = [(n, name, adv) for adv, names in ((0, bodies(a.k)), (1, adv_setup(0))) for n in a.cpus for name in names if not a.programs or name in a.programs]
+    listed = [x for x in bodies(a.k) if x not in L1_VARIANTS]
+    cases = [(n, name, adv) for adv, names in ((0, listed), (1, adv_setup(0))) for n in a.cpus for name in names if not a.programs or name in a.programs]
     mine = set(shard.take(cases, a.shard))   # (CPU count, program) cases are independent; the counts below run on shard 1
     for n in a.cpus:
         for name in [x for x in bodies(a.k) if (n, x, 0) in mine]:
@@ -983,6 +1162,11 @@ def main():
                 report.append(entry)
                 print(json.dumps(entry), flush=True)
                 failures += [f"{prog['name']}{' (max-block 1)' if extra else ''}: {p}" for p in problems]
+    # The two-way L1 programs' dispatcher-miss counts (differences of runs at different round counts, from a perf resident).
+    # (Not under a PIC test mode: `svc` fills no L1 at all.)
+    for n in a.cpus:
+        for name in [x for x in COUNT_CHECKS if (n, x, 0) in mine and not os.environ.get('NATEMU_PIC_TEST')]:
+            failures += l1_counts(a, n, name, report)
     for n in a.cpus:
         for name in [x for x in adv_setup(0) if (n, x, 1) in mine]:
             prog = adv_program(name, n)
