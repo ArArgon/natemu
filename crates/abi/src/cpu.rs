@@ -239,8 +239,8 @@ pub fn writable_on_read(
     walk_writable: bool,
     dirty: bool,
     kind: u8,
-    translated: &mut dyn FnMut() -> bool,
-    mark_writable: &mut dyn FnMut(),
+    mut translated: impl FnMut() -> bool,
+    mut mark_writable: impl FnMut(),
 ) -> bool {
     if !(enabled && walk_writable && dirty && matches!(kind, WB | WC)) || translated() {
         return false;

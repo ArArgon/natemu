@@ -3361,8 +3361,8 @@ fn translate(
                     t.writable,
                     t.dirty,
                     kind,
-                    &mut || cache::translated(t.gpa),
-                    &mut || cache::shadowed_writable(t.gpa),
+                    || cache::translated(t.gpa),
+                    || cache::shadowed_writable(t.gpa),
                 );
             if writable {
                 if shadow {
@@ -4092,7 +4092,17 @@ fn install_ones(s: &mut State, va: u64) {
 /// set again and the marks read again, and a page marked meanwhile is shadowed read-only (the access faults again and
 /// takes the code-write path).
 fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
+    // Waiting for a peer's split lock serves its shadow-drop request, which resets this vCPU's shadows and clears its writable
+    // bits, this page's included: then the bit is set again and the marks read again, as after the eviction below (else a
+    // writable shadow without a bit lets a code write through it go unnoticed by a peer's later `mark`).
+    let generation = s.shadow_generation;
     split_wait(s, &[gpa]);
+    let writable = writable && {
+        generation == s.shadow_generation || {
+            cache::shadowed_writable(gpa);
+            !cache::translated(gpa)
+        }
+    };
     match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global) {
         Ok(()) => {}
         Err(shadow::Error::Capacity) => {
