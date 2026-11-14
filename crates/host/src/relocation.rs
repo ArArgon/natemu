@@ -4,7 +4,10 @@
 //! compile; whatever this module cannot make identical it refuses, and the caller compiles at `to`. Admission validates
 //! the result at `to` as it does a fresh object.
 use natemu_abi::code_object::{self as object, Header, Reloc};
-use natemu_abi::execution::{canonical, relocate_move};
+use crate::admission::Admitted;
+use natemu_abi::execution::{
+    LinkPoint, MAX_LINK_POINTS, cache::MAX_RELOCS, canonical, pack_reloc, relocate_code, relocate_move,
+};
 
 /// The object for `to`, or `None` when relocation alone would not give fexc's own answer there:
 /// - the block was cut before a direct branch to a non-canonical target (`unsupported_form`): at `to` the target may be
@@ -64,6 +67,60 @@ pub(crate) fn object(o: &[u8], from: u64, to: u64) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Option (d): `o`, an answer's object, as admission gives it back: its guest-RIP literal slots filled with their values
+/// (the only bytes admission changes). `None` when a slot lies outside the code (admission refused such an object).
+pub(crate) fn resolved(o: &[u8]) -> Option<Vec<u8>> {
+    let h: Header = read(o, 0)?;
+    let mut out = o.to_vec();
+    for i in 0..h.relocs_count as usize {
+        let r: Reloc = read(o, (h.relocs_offset as usize).checked_add(i * size_of::<Reloc>())?)?;
+        if r.kind == object::RELOC_GUEST_RIP_LITERAL {
+            let at = (h.code_offset as usize).checked_add(r.offset as usize)?;
+            out.get_mut(at..at.checked_add(8)?)?.copy_from_slice(&r.value.to_le_bytes());
+        }
+    }
+    Some(out)
+}
+
+/// Option (d): the block admission gave the answer `from_object` at `from` (`form`: its record without the object), as it
+/// gives `to_object` (that answer moved to `to` by [`object`]; itself when `to == from`) without admitting it. At another
+/// RIP only where every relocation packs (at most `MAX_RELOCS`) and the resident's re-check, [`relocate_code`], accepts;
+/// `None`: admit it.
+pub(crate) fn kept(
+    form: &Admitted,
+    from_object: &[u8],
+    from: u64,
+    to_object: &[u8],
+    to: u64,
+) -> Option<Admitted> {
+    let rest = Admitted { object: resolved(to_object)?, ..form.clone() };
+    if from == to {
+        return Some(rest);
+    }
+    let h: Header = read(from_object, 0)?;
+    let mut relocs = vec![];
+    for i in 0..h.relocs_count as usize {
+        let r: Reloc = read(from_object, (h.relocs_offset as usize).checked_add(i * size_of::<Reloc>())?)?;
+        relocs.extend(pack_reloc(&r, h.code_size)?);
+    }
+    relocs.sort();
+    if relocs.len() > MAX_RELOCS as usize || form.links.len() > MAX_LINK_POINTS {
+        return None;
+    }
+    let mut code = resolved(from_object)?
+        .get(h.code_offset as usize..)?
+        .get(..h.code_size as usize)?
+        .to_vec();
+    let mut links = [LinkPoint::NONE; MAX_LINK_POINTS];
+    links[..form.links.len()].copy_from_slice(&form.links);
+    relocate_code(&mut code, &relocs, &mut links, from, to, h.guest_bytes).ok()?;
+    Some(Admitted {
+        links: links[..form.links.len()].to_vec(),
+        rep_self: form.rep_self.map(|r| r.wrapping_add(to.wrapping_sub(from))),
+        ..rest
+    })
 }
 
 /// Whether a no-code answer of fexc's `reason` at one RIP is its answer at any other of the same half and page offset:
@@ -515,5 +572,25 @@ mod tests {
                 assert_eq!(have, w[..n]);
             }
         }
+    }
+    /// Option (d): the kept form moved to the other RIP is admission's block there (both ways), and every refusal of the
+    /// move leaves `None` (admit it).
+    #[test]
+    fn kept_form_moves_as_admission_does() {
+        let admit = |o: &[u8], rip| crate::admission::admit(o, rip, USER, u64::MAX, true, false).unwrap();
+        for (from, to) in [(USER_A, USER_B), (USER_B, USER_A)] {
+            let form = Admitted { object: vec![], ..admit(from.0, from.1) };
+            let moved = object(from.0, from.1, to.1).unwrap();
+            assert_eq!(kept(&form, from.0, from.1, &moved, to.1), Some(admit(to.0, to.1)));
+            assert_eq!(kept(&form, from.0, from.1, from.0, from.1), Some(admit(from.0, from.1)));
+        }
+        let form = Admitted { object: vec![], ..admit(USER_A.0, USER_A.1) };
+        // Another page offset: relocate_code's place check.
+        assert_eq!(kept(&form, USER_A.0, USER_A.1, USER_B.0, USER_B.1 + 8), None);
+        // A relocation that does not pack (a kind no RIP is in, or a literal outside the code).
+        let mut odd = USER_A.0.to_vec();
+        let h: Header = read(&odd, 0).unwrap();
+        odd[h.relocs_offset as usize + 4] = object::RELOC_OTHER;
+        assert_eq!(kept(&form, &odd, USER_A.1, USER_B.0, USER_B.1), None);
     }
 }

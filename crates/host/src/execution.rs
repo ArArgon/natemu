@@ -1658,6 +1658,16 @@ struct Entry {
     prefix: Vec<u8>,
     whole: bool,
     answer: Answer,
+    /// Option (d): what admission made of `answer` at `rip`, set by the first use there ([`Compiler::answered`]).
+    kept: std::sync::OnceLock<Box<Kept>>,
+}
+/// An answer's admitted form (its record without the object, which [`crate::relocation::resolved`] gives back) and the
+/// CPL-0, bulk and code-shape values admission ran under: it is reused only where they are the request's.
+struct Kept {
+    cpl0: bool,
+    bulk: bool,
+    shape: bool,
+    form: admission::Admitted,
 }
 impl Entry {
     /// PIC study: what makes it the same answer (its key with `limit`, gating values read, bytes read), hashed: a later
@@ -2228,6 +2238,7 @@ impl Compiler {
                 prefix,
                 whole,
                 answer: Answer::new(reply, at)?,
+                kept: Default::default(),
             });
             let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
             self.waited(waited);
@@ -2284,7 +2295,7 @@ impl Compiler {
         let t = self.stamp();
         let (from, read) = (e.rip, (e.read, e.whole, e.prefix.len()));
         let code = if from == rip {
-            self.answered(&e.answer, bytes, rip, hook)?
+            self.answered(&e.answer, bytes, rip, hook, Some(e))?
         } else {
             let Some(answer) = e.answer.at(from, rip) else {
                 self.relocation_refused += 1;
@@ -2296,7 +2307,7 @@ impl Compiler {
                 self.check(&answer, read, bytes, rip, limit, from, hook)?;
             }
             let t = self.stamp();
-            match self.answered(&answer, bytes, rip, hook) {
+            match self.answered(&answer, bytes, rip, hook, Some(e)) {
                 Ok(code) => {
                     self.relocated += 1;
                     self.charge(
@@ -2360,7 +2371,20 @@ impl Compiler {
         }
         Ok(())
     }
-    /// [`Compiler::compile_once`]'s use of an answer: admitted, or decoded.
+    /// Option (d): the block `e`'s kept form gives for `object` (its answer, moved to `rip`), without admission: only where
+    /// the request's CPL 0, bulk and code-shape values are those admission ran under, the answer's bytes cover the block's
+    /// ([`crate::relocation::kept`] for the rest). `None`: admit it.
+    fn skip(&self, e: &Entry, object: &[u8], rip: u64) -> Option<admission::Admitted> {
+        let (k, Answer::Object(from)) = (e.kept.get()?, &e.answer) else {
+            return None;
+        };
+        (k.cpl0 == self.cpl0
+            && k.bulk == self.bulk
+            && k.shape == self.shape
+            && e.prefix.len() >= k.form.guest_bytes as usize)
+            .then(|| crate::relocation::kept(&k.form, from, e.rip, object, rip))?
+    }
+    /// [`Compiler::compile_once`]'s use of an answer (`kept`: the entry it is, moved to `rip` or not): admitted, or decoded.
     #[cfg_attr(not(feature = "testing"), allow(unused_variables))]
     fn answered(
         &self,
@@ -2368,24 +2392,43 @@ impl Compiler {
         bytes: &[u8],
         rip: u64,
         hook: &mut impl Hook,
+        kept: Option<&Entry>,
     ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         Ok(match answer {
             Answer::Object(object) => match admission::retry(object) {
                 Some(n) => Err(n),
                 None => {
                     #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
-                    let mut admitted = admission::admit(
-                        object,
-                        rip,
-                        bytes,
-                        self.supported,
-                        self.shape,
-                        self.cpl0,
-                    )?;
-                    // Perf chunk 26: a bulk REP STOS only where asked for (never a step: TF traps after each iteration).
-                    if admitted.bulk && !self.bulk {
-                        return Err(format!("object refused: a bulk REP STOS loop in a request without --bulk at {rip:#x}").into());
-                    }
+                    let skipped = kept.and_then(|e| self.skip(e, object, rip));
+                    #[cfg_attr(not(feature = "testing"), allow(unused_mut))]
+                    let mut admitted = match skipped {
+                        Some(a) if !self.check_reuse => a,
+                        skipped => {
+                            let a = admission::admit(
+                                object,
+                                rip,
+                                bytes,
+                                self.supported,
+                                self.shape,
+                                self.cpl0,
+                            )?;
+                            // The reuse check: the kept form is admission's.
+                            if skipped.is_some_and(|s| s != a) {
+                                return Err(format!("reuse check: the kept admitted form at {rip:#x} is not admission's").into());
+                            }
+                            // Perf chunk 26: a bulk REP STOS only where asked for (never a step: TF traps after each iteration).
+                            if a.bulk && !self.bulk {
+                                return Err(format!("object refused: a bulk REP STOS loop in a request without --bulk at {rip:#x}").into());
+                            }
+                            // Option (d): kept for the next hit, from the admission at the answer's own RIP.
+                            if let Some(e) = kept.filter(|e| e.rip == rip) {
+                                let form = admission::Admitted { object: Vec::new(), ..a.clone() };
+                                let (cpl0, bulk, shape) = (self.cpl0, self.bulk, self.shape);
+                                let _ = e.kept.set(Box::new(Kept { cpl0, bulk, shape, form }));
+                            }
+                            a
+                        }
+                    };
                     #[cfg(feature = "testing")]
                     hook.admitted(&mut admitted.object);
                     Ok(Code::Block(admitted))
@@ -3663,6 +3706,89 @@ mod tests {
     ) -> Option<Arc<Entry>> {
         a.find(bytes, rip, limit, gating).0
     }
+    /// Option (d): an answer's kept admitted form is reused, without admission, only where it is admission's decision.
+    /// `supported = 0` makes admission refuse every object, so an `Ok` after it is a reuse (the control: it refuses).
+    mod kept_form {
+        use super::*;
+        const USER: &[u8] = include_bytes!("../tests/relocation/user.src");
+        const A: (&[u8], u64) = (include_bytes!("../tests/relocation/user-7f1234567100.obj"), 0x7f12_3456_7100);
+        const B: (&[u8], u64) = (include_bytes!("../tests/relocation/user-7f1234568100.obj"), 0x7f12_3456_8100);
+
+        fn compiler() -> Compiler {
+            let mut c = Compiler::with_features(Path::new("/nonexistent"), u64::MAX, None);
+            c.shape = true;
+            c
+        }
+        fn kept_entry(prefix: usize) -> Entry {
+            Entry {
+                rip: A.1,
+                owner: 0,
+                read: 0,
+                gating: [0; GATING],
+                prefix: USER[..prefix].into(),
+                whole: false,
+                answer: Answer::Object(A.0.to_vec()),
+                kept: Default::default(),
+            }
+        }
+        fn block(c: &Compiler, answer: &Answer, e: &Entry, rip: u64) -> Result<admission::Admitted> {
+            match c.answered(answer, USER, rip, &mut (), Some(e))? {
+                Ok(Code::Block(b)) => Ok(b),
+                _ => panic!("not a block"),
+            }
+        }
+        fn fresh(c: &Compiler, object: &[u8], rip: u64) -> admission::Admitted {
+            admission::admit(object, rip, USER, u64::MAX, c.shape, c.cpl0).unwrap()
+        }
+
+        #[test]
+        fn same_rip_hit_reuses_the_kept_form() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            let first = block(&c, &e.answer, &e, A.1).unwrap();
+            assert!(e.kept.get().is_some());
+            assert_eq!(first, fresh(&c, A.0, A.1));
+            c.supported = 0;
+            assert!(admission::admit(A.0, A.1, USER, 0, true, false).is_err(), "control");
+            assert_eq!(block(&c, &e.answer, &e, A.1).unwrap(), first);
+        }
+
+        #[test]
+        fn other_cpl0_bulk_shape_or_a_short_prefix_admit() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            block(&c, &e.answer, &e, A.1).unwrap();
+            let short = kept_entry(1);
+            block(&c, &short.answer, &short, A.1).unwrap();
+            assert!((short.prefix.len() as u32) < short.kept.get().unwrap().form.guest_bytes);
+            c.supported = 0;
+            assert!(block(&c, &short.answer, &short, A.1).is_err(), "short prefix");
+            let flips: [fn(&mut Compiler); 3] = [|c| c.cpl0 = true, |c| c.bulk = true, |c| c.shape = false];
+            for flip in flips {
+                let mut d = compiler();
+                d.supported = 0;
+                flip(&mut d);
+                assert!(block(&d, &e.answer, &e, A.1).is_err());
+            }
+            assert!(block(&c, &e.answer, &e, A.1).is_ok(), "control");
+        }
+
+        #[test]
+        fn another_rip_goes_through_relocations_check() {
+            let mut c = compiler();
+            let e = kept_entry(USER.len());
+            block(&c, &e.answer, &e, A.1).unwrap();
+            let moved = e.answer.at(A.1, B.1).unwrap();
+            let want = fresh(&c, B.0, B.1);
+            c.supported = 0;
+            assert_eq!(block(&c, &moved, &e, B.1).unwrap(), want);
+            // relocate_code refuses another page offset: admitted (and refused here, as admission is).
+            let off = Answer::Object(B.0.to_vec());
+            assert!(block(&c, &off, &e, B.1 + 8).is_err());
+        }
+    }
+
+
     fn entry(rip: u64, owner: u8, prefix: &[u8], read: u32, gating: [u64; GATING]) -> Arc<Entry> {
         Arc::new(Entry {
             rip,
@@ -3672,6 +3798,7 @@ mod tests {
             prefix: prefix.into(),
             whole: false,
             answer: Answer::Object(prefix.into()),
+            kept: Default::default(),
         })
     }
 
@@ -4209,7 +4336,7 @@ mod tests {
         c.bulk = false;
         assert!(!block(&mut c, &stos).bulk);
         let e = c
-            .answered(&Answer::Object(o), &stos, 0x1000, &mut ())
+            .answered(&Answer::Object(o), &stos, 0x1000, &mut (), None)
             .err()
             .unwrap();
         assert!(e.contains("--bulk"), "{e}");

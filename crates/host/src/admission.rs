@@ -139,6 +139,7 @@ fn table<T: Copy>(
 /// Feature bit of FlagM (the contract requires it: FEX emits CFINV/RMIF).
 const FLAGM: u64 = 1 << 8;
 
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Admitted {
     /// The object with its guest-RIP literals resolved.
     pub object: Vec<u8>,
