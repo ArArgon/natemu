@@ -48,9 +48,9 @@ const SECTOR: u64 = 512;
 /// type, reserved, sector.
 const HEADER: usize = 16;
 const ID_BYTES: usize = 20;
-/// Advertised size_max and seg_max, and their product's bound on one request's data. seg_max is the queue's 128
-/// entries less a request's header and status descriptors (QEMU's rule for its own seg_max), so a request of the
-/// most data fills the ring: 504 KiB. It was 32 segments and 128 KiB until November 14, 2026; measured then on an
+/// Advertised size_max and seg_max, and their product's bound on one request's data. seg_max is 128 ring entries
+/// less a request's header and status descriptors (the queue's size when this was set; it is 256 now,
+/// `BLOCK_QUEUE`, so two requests of the most data fit the ring): 504 KiB. It was 32 segments and 128 KiB until November 14, 2026; measured then on an
 /// M2 Max (2 vCPUs, PCI): 1 MiB direct writes 3.0-3.1 -> 3.5 GB/s, reads 3.2-3.6 -> 4.0, cold buffered reads
 /// 1.5-1.6 -> 1.8-1.9, buffered writes and 4 KiB I/O unchanged. A guest that makes the queue smaller than 128 must
 /// keep its requests within the ring itself; the device walks no more than the ring's size either way.
@@ -114,8 +114,8 @@ fn owner_spin_max() -> Duration {
 /// interrupted at once, as before. The count keeps a thread at a depth above it from ever running out of completions:
 /// holding until the vCPU halts made each of two threads on a vCPU block every 16 requests, and each switch between
 /// them (a CR3 load) resets the vCPU's shadow tables (four jobs at depth 16 on two vCPUs: 117k to 69k IOPS).
-/// The bounds are checked between the owner's passes: a request it runs itself (a lone one, `Pool::inline`) delays a
-/// held interrupt by that disk call. Holds that gather too little are backed off ([`Holds`]). `NATEMU_BLK_HOLD=IDLE_US,MAX_US,COUNT` sets the bounds
+/// The bounds are checked on every pass of the owner: a request it runs itself (a lone one, `Pool::inline`) delays
+/// a held interrupt by that disk call. Holds that gather too little are backed off ([`Holds`]). `NATEMU_BLK_HOLD=IDLE_US,MAX_US,COUNT` sets the bounds
 /// (a 0: never hold). M2 Max, 2 vCPUs, fio at 4 KiB: one job at depth 16 about 40k to 100k IOPS (host CPU per request
 /// 32 to 16 us), mixed 39k to 80k, four jobs 117k to about 135k; depth 1 and 128 KiB requests unchanged.
 #[derive(Clone, Copy)]
@@ -124,6 +124,7 @@ struct Hold {
     max: Duration,
     count: usize,
 }
+#[cfg(not(test))]
 const HOLD: Hold = Hold {
     idle: Duration::from_micros(30),
     max: Duration::from_micros(200),
@@ -1328,6 +1329,18 @@ impl Virtio {
                         self.release(full);
                         holds.settle(full, hold.count.div_ceil(2));
                     }
+                    // The other bounds, here as well: under steady work no pass reaches the hold's own section.
+                    let rest = owing & !full;
+                    let late = holds.first.is_some_and(|first| first.elapsed() >= hold.max);
+                    let over = if late {
+                        rest
+                    } else {
+                        self.halted_targets(guest, rest)
+                    };
+                    if over != 0 {
+                        self.release(over);
+                        holds.settle(over, hold.count.div_ceil(2));
+                    }
                 }
                 continue;
             }
@@ -1351,12 +1364,20 @@ impl Virtio {
             match hold() {
                 Some(hold) if owing | linger != 0 => {
                     let first = holds.first.unwrap_or(worked);
-                    let over = worked.elapsed() >= hold.idle
+                    // Every queue's hold ends idle or late; a halted target ends its own queue's.
+                    let over = if worked.elapsed() >= hold.idle
                         || owing != 0 && first.elapsed() >= hold.max
-                        || (0..snapshots.len()).any(|q| {
-                            (owing | linger) >> q & 1 != 0 && !self.target_running(guest, q)
-                        });
-                    if !over {
+                    {
+                        u8::MAX
+                    } else {
+                        self.halted_targets(guest, owing | linger)
+                    };
+                    if owing & over != 0 {
+                        self.release(over);
+                        holds.settle(over, hold.count.div_ceil(2));
+                    }
+                    linger &= !over;
+                    if (owing | linger) & !over != 0 {
                         let mut s = self.lock();
                         for id in &suppressed {
                             if s.current(*id) && s.accepting(id.queue) {
@@ -1368,11 +1389,6 @@ impl Virtio {
                         std::hint::spin_loop();
                         continue;
                     }
-                    if owing != 0 {
-                        self.release(u8::MAX);
-                        holds.settle(u8::MAX, hold.count.div_ceil(2));
-                    }
-                    linger = 0;
                 }
                 _ => {
                     holds.clear();
@@ -1385,17 +1401,27 @@ impl Virtio {
                 Duration::ZERO
             };
             if !suppressed.is_empty() {
-                // Requests on disk ring the bell as they finish; their completion reads the ring.
+                // A queue a hold left suppressed with none of its requests in flight has no completion coming to read
+                // its ring: clear it now, whatever the other queues do.
+                let (waiting, idle): (Vec<Identity>, Vec<Identity>) =
+                    suppressed.iter().partition(|id| flight.holds(id.queue));
+                let mut rearmed = false;
+                for &id in &idle {
+                    rearmed |= self.unsuppress(guest, id)?;
+                }
+                if rearmed {
+                    continue;
+                }
+                // Requests on disk ring the bell as they finish; their completion reads their queue's ring.
                 // (Only a fixed spin here: the adaptive window follows kicks, not the disk's latency.)
-                if !flight.is_empty()
+                if !waiting.is_empty()
                     && self
                         .wake
                         .wait_spinning(SUPPRESSED_WAIT, fixed.unwrap_or_default())
                 {
                     continue;
                 }
-                let mut rearmed = false;
-                for &id in &suppressed {
+                for &id in &waiting {
                     rearmed |= self.unsuppress(guest, id)?;
                 }
                 if rearmed {
@@ -2557,7 +2583,7 @@ mod tests {
             gpa: 0x10000,
             len: MAX_SEGMENT + 1
         }]));
-        // With its header and status it is exactly the 128 descriptors of the largest ring.
+        // With its header and status it takes 128 descriptors: half of the largest ring (`BLOCK_QUEUE`).
         assert_eq!(MAX_SEGMENTS + 2, 128);
     }
     #[test]
