@@ -194,6 +194,16 @@ Rules learned in this round:
     host part of a refetch from ~2.0 to ~0.75 us, which puts (a) below the 1% floor, so the pool goes first and (a) is
     re-evaluated after it (same replay, pool cost). Trace files pruned; replay.txt kept.
 
+21. **Two-way L1 first** (count build `l1-count`, profile `natemu-raw/l1-study-profile-1`; counts only, its timings are
+    perturbed). Current-target conflict misses reproduced the census (configure 5.51 M vs ~5.7 M; make 88.6 M vs
+    87.5 M); capacity flushes unchanged. Share of make's conflict misses removed (x ~0.5 us each): direct-mapped 2^17
+    0.53 (23.5 vCPU-s), 2^18 0.76 (33.5), 2-way 2^16 sets 0.92 (40.8, exact, 2x memory), 2-way 2^15 sets <= 0.88
+    (<= 38.8, upper bound, today's memory); configure 1.4-2.5 vCPU-s. Conflicts are pairs, not chains (0.4% of current
+    blocks share an index with 8+), so a second way catches what doubling cannot. Chosen: 2-way at today's memory
+    (~6.5-7% of make busy, the largest single item this round); the 2x variant gains ~2 vCPU-s more but takes 8 MiB per
+    vCPU from a code area already at 88% on make. Order (fast-miss plan section 7): 2-way L1, then page record + fast
+    miss path together.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
