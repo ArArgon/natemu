@@ -543,7 +543,7 @@ PIC_ENV = {'link-full': 'off', 'pic-user': 'user'}
 POOL = ('pool-peer', 'pool-frame', 'pool-smc', 'pool-ctx', 'pool-cross', 'pool-wrap', 'pool-fence', 'pool-race')
 RACE = 20000                      # `pool-race`: rounds of a write to the neighbour's page and a call of the own alias
 RLD, PW, PWE = 0xd000, 0xd000, 0xe000
-PX = 0xffa                       # `pool-cross`: `mov rax, imm64` at PX of RL, its immediate's last four bytes on RL2's (or RLC's) first
+POOL_X = 0xffa                   # `pool-cross`: `mov rax, imm64` at POOL_X of RL (not PX: the page programs' constants), its immediate's last four bytes on RL2's (or RLC's) first
 PW_BLOCKS = 1024                  # `inc ebx; jz $+2` (four bytes, two instructions, one block) per entry of the chain page
 POOL_ENV = {'pool-wrap': {'NATEMU_POOL_RING_KB': '64', 'NATEMU_POOL_INDEX_SLOTS': '4096'}}
 # Per CPU: the least blocks copied from the pool, and the least refusals by reason (resident `pool_refusal` names).
@@ -586,12 +586,12 @@ def pool_bodies(i, n=1):
                      + '    xor r14d, r14d\n    mov rax, cr0\n    bts rax, 3\n    mov cr0, rax\n' + call('z3', f'{RV3 + ZO:#x}')
                      + save(('rdi', 'r14')) + '    clts\n' + call('z4', f'{RV3 + ZO:#x}') + save(('rbp', 'rbx'))
                      + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
-        # A block crossing into a second page (`mov rax, imm64` at PX: its last four immediate bytes and the `jmp r13` on the next
+        # A block crossing into a second page (`mov rax, imm64` at POOL_X: its last four immediate bytes and the `jmp r13` on the next
         # page; it starts more than four bytes before the page's end, so its key's lead bytes are on the first page). RV1's
         # block, flush, RV2 in table A (the second frame the same): from the pool; RV2 in table B (its second frame RLC):
         # refused for its bytes, compiled.
-        'pool-cross': (call('x0', f'{RV1 + PX:#x}') + save(('r8', 'rax')) + flush + call('x1', f'{RV2 + PX:#x}')
-                       + save(('r10', 'rax')) + cr3('tb') + call('x2', f'{RV2 + PX:#x}') + save(('r14', 'rax')) + cr3('ta')),
+        'pool-cross': (call('x0', f'{RV1 + POOL_X:#x}') + save(('r8', 'rax')) + flush + call('x1', f'{RV2 + POOL_X:#x}')
+                       + save(('r10', 'rax')) + cr3('tb') + call('x2', f'{RV2 + POOL_X:#x}') + save(('r14', 'rax')) + cr3('ta')),
         # A chain of PW_BLOCKS blocks run three times with a flush between: a tiny ring wraps (a pool of 64 KiB against some
         # 300 KiB of entries), every CPU running the same bytes meanwhile.
         'pool-wrap': ('    jmp .over\n.run:\n    xor ebx, ebx\n    lea r13, [rel .back]\n' + f'    mov rax, {HIGH:#x}\n    jmp rax\n.back:\n    ret\n.over:\n'
@@ -942,7 +942,7 @@ def reuse_memory(name, i):
         tables += [{'addr': f'0x{d + RLD:x}', 'data': LIB(1).hex()}]
     if name == 'pool-cross':
         first = bytearray(0x1000)
-        first[PX:] = b'\x48\xb8\x00\x00\x00\x00'
+        first[POOL_X:] = b'\x48\xb8\x00\x00\x00\x00'
         tail = lambda k: bytes([k, 0, 0, 0]) + P.asm('jmp r13')
         return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': tail(1).hex()},
                          {'addr': f'0x{d + RLC:x}', 'data': tail(2).hex()}]
