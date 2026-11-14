@@ -78,6 +78,26 @@ Rules learned in this round:
     only within a page. In progress: IDC-gated code synchronization and L1 counters; next: a fast miss path (like
     `sys_fast`) and relink-on-revalidation (design under way).
 
+12. **Relink on revalidation is gated by a counter** ([relink-plan](relink-plan.md), under review): re-patching a
+    target's suspended inbound links when it is revalidated is exact (the word equals what the linker would write;
+    `lookup` is the single point where a block becomes current again), but it can only save linker traps whose target
+    is already current, and the first trap per target per epoch is the one that revalidates it. So step 1 batches the
+    code synchronization of TLB-event unlinks (est. ~8 vCPU-s on make, unmeasured) and adds `linked_current`; the
+    suspension segment is built only if `linked_current` x 0.6 us exceeds 1% of make's busy time.
+
+13. **Architecture review adopted as the roadmap** ([architecture-review-20261113](architecture-review-20261113.md),
+    Fable): guest code runs only 0.42 us (configure) / 1.17 us (make) between exceptions, and on configure the handlers
+    cost more than the code. Root causes: (A) currency, links and shadows are per address space and rebuilt per block
+    for every new process (configure 41% / make 27% of busy) — so make a new address space cheap rather than keep old
+    ones (why slots lost); (B) every event is a full-banking exception with full synchronizations (resident-only fixes);
+    (C) host round trips for cache hits and whole-area flushes when the block index fills; (D) guest code: FEX's
+    straight-line output is near native, the build gap is structure (glue: computed exits, svc exits) — no codegen track
+    until the sampler says so; (E) faults/interrupts (an interrupt costs 62 us on configure vs 12 on make: measure).
+    Plan: one scratch build with four counters (miss cause, revalidations per page-epoch, flush-attributable hits, aborts
+    per table page + A-bit) and two profile runs; then measurement groups R (resident: sync, fast miss, fast link,
+    relink), H (pool, flush policy), F (page currency, fault-around, delivery/irq), G (codegen, gated). Estimates if
+    groups R, H, F land (overlaps discounted): configure 76.7 -> ~50-58 s, make 139 -> ~112-120 s.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
