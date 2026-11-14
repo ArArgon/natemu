@@ -231,6 +231,18 @@ Rules learned in this round:
     (2.7%) / 7.1 (1.3%) vCPU-s (gate 1.5 / 3.5). Built next together with the fast miss path (plan order), since the
     record is what lets a revalidating miss stay on the fast path.
 
+25. **Shared pool passes its gate** after one fix (`5211757`): 99.5% of placement re-check refusals were the move check
+    refusing entries placed at the very RIP they were admitted for (the 32-bit RIP-move form below 4 GiB, and forms the
+    constant loader encodes differently) — the host's own path never relocates a same-RIP hit, so the pool was
+    stricter than the host. At distance 0 nothing is rewritten, so only the link points are re-verified (security
+    review: accept; the code is exactly as admitted at that RIP on every caller). Pool off vs on, same build
+    (`natemu-raw/pool-fix-{off,on}-profile-1`): configure busy 113.0 -> 106.2 (-6.0%), step 72.2 -> 68.6 s; make
+    547.3 -> 538.8 (-1.6%), step 133.4 -> 130.9 s; re-check refusals 0.85 M / 3.57 M -> 5 k / 8 k; cost per served block
+    0.76 / 0.89 us (gate <= 1.0); IO5 configure under `--check-reuse` with the pool: no mismatch. Merged off by default;
+    default-on (owner-approved after the gate) once the group's interleaved rounds confirm it. Backing is 274 MiB
+    (a 2 MiB control granule). The ring wraps on make (0.59 M overwritten, ~0.2% of busy): not worth a bigger window now.
+    Disk: profiles now delete raw request logs after each step (`ba6d4c4`) after ENOSPC stopped all work twice.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
@@ -246,5 +258,6 @@ dispatcher misses 6.5%; lookups/entries/revalidation/fetch/reuse 11%; TLB at CR3
 | natemu after decisions 2-7 | 76.7 s | 139.0 s (single run) |
 | natemu after group R1 (decision 16) | 73.0 s | 137.0 s (single run) |
 | natemu after two-way L1 (decision 22) | 72.7 s | 132.1 s (single run) |
+| ... with the shared pool on (decision 25) | 68.6 s | 130.9 s (single run) |
 | QEMU 11.1.2 TCG | 100.0 s | 531.7 s |
 | native (Apple VZ, arm64; median of 3) | 7.8 s | 27.1 s |
