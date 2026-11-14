@@ -2238,7 +2238,7 @@ mod tests {
 /// that can hold its calls, and a scripted copy that can make a guest register access (a reset or disable from another
 /// vCPU) inside a copy, before its grant.
 #[cfg(test)]
-mod owner_tests {
+pub(in crate::virtio) mod owner_tests {
     use super::*;
     use crate::execution::io::tests as io;
     use std::sync::{
@@ -2259,7 +2259,7 @@ mod owner_tests {
 
     /// Disk calls that wait while `held`; reads return 0x5a. Each call records whether a disk worker made it.
     #[derive(Default)]
-    struct Held {
+    pub(in crate::virtio) struct Held {
         held: Mutex<bool>,
         released: Condvar,
         calls: AtomicUsize,
@@ -2268,7 +2268,7 @@ mod owner_tests {
         panics: AtomicBool,
     }
     impl Held {
-        fn hold(&self, on: bool) {
+        pub(in crate::virtio) fn hold(&self, on: bool) {
             *self.held.lock().unwrap() = on;
             self.released.notify_all();
         }
@@ -2282,7 +2282,7 @@ mod owner_tests {
             let held = self.held.lock().unwrap();
             drop(self.released.wait_while(held, |h| *h).unwrap());
         }
-        fn calls(&self) -> usize {
+        pub(in crate::virtio) fn calls(&self) -> usize {
             self.calls.load(SeqCst)
         }
     }
@@ -2302,10 +2302,10 @@ mod owner_tests {
     }
 
     type Hook = Box<dyn FnMut(&Rig, &[Transfer<'_>]) + Send>;
-    struct Rig {
+    pub(in crate::virtio) struct Rig {
         b: crate::execution::Backing,
-        r: Arc<Virtio>,
-        disk: Arc<Held>,
+        pub(in crate::virtio) r: Arc<Virtio>,
+        pub(in crate::virtio) disk: Arc<Held>,
         path: std::path::PathBuf,
         /// Called with every copy's spans before the copy (and its grant).
         hook: Mutex<Option<Hook>>,
@@ -2319,7 +2319,7 @@ mod owner_tests {
             let _ = std::fs::remove_file(&self.path);
         }
     }
-    fn until(what: &str, f: impl Fn() -> bool) {
+    pub(in crate::virtio) fn until(what: &str, f: impl Fn() -> bool) {
         let start = Instant::now();
         while !f() {
             assert!(
@@ -2336,7 +2336,7 @@ mod owner_tests {
         )
     }
     impl Rig {
-        fn new(name: &str) -> Self {
+        pub(in crate::virtio) fn new(name: &str) -> Self {
             let path = std::env::temp_dir()
                 .join(format!("natemu-owner-{}-{name}.raw", std::process::id()));
             File::create(&path).unwrap().set_len(1 << 20).unwrap();
@@ -2393,7 +2393,7 @@ mod owner_tests {
         fn flags(&self) -> u16 {
             self.word(USED).load(SeqCst)
         }
-        fn used_index(&self) -> u16 {
+        pub(in crate::virtio) fn used_index(&self) -> u16 {
             self.word(USED + 2).load(SeqCst)
         }
         fn desc(&self, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
@@ -2405,7 +2405,7 @@ mod owner_tests {
             self.put(DESC + u64::from(i) * 16, &d);
         }
         /// Lay out request `k`: a 512-byte read of sector `k` (descriptors 3k..3k+2).
-        fn read_request(&self, k: u16) -> u16 {
+        pub(in crate::virtio) fn read_request(&self, k: u16) -> u16 {
             let header = HEADERS + u64::from(k) * 16;
             let mut h = [0; 16];
             h[..4].copy_from_slice(&T_IN.to_le_bytes());
@@ -2429,14 +2429,14 @@ mod owner_tests {
             head
         }
         /// Publish `head` in the available ring (no notification).
-        fn publish(&self, head: u16) {
+        pub(in crate::virtio) fn publish(&self, head: u16) {
             let mut idx = self.published.lock().unwrap();
             self.put(AVAIL + 4 + u64::from(*idx % SIZE) * 2, &head.to_le_bytes());
             *idx = idx.wrapping_add(1);
             self.word(AVAIL + 2).store(*idx, SeqCst);
         }
         /// Linux's `virtqueue_kick_prepare` without EVENT_IDX: notify unless the device suppressed it.
-        fn kick(&self) -> bool {
+        pub(in crate::virtio) fn kick(&self) -> bool {
             fence(SeqCst);
             let kick = self.flags() & USED_NO_NOTIFY == 0;
             if kick {
@@ -2465,7 +2465,7 @@ mod owner_tests {
             *self.hook.lock().unwrap() = Some(Box::new(hook));
         }
         /// Run the owner while `body` drives the guest; then release the disk, stop, and require a clean owner exit.
-        fn run(&self, body: impl FnOnce(&Rig)) {
+        pub(in crate::virtio) fn run(&self, body: impl FnOnce(&Rig)) {
             self.run_owner(|rig| {
                 body(rig);
                 rig.disk.hold(false);

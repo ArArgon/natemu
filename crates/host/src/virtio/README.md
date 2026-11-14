@@ -2,6 +2,8 @@
 
 Code map: `mod.rs` holds the MMIO transport (register offsets in `reg`, status
 bits in `status`), the shared lifecycle state, the owner loop and virtio-rng;
+`pci.rs` the virtio-PCI transport (configuration space, BAR0, MSI-X or INTx), whose
+common-configuration fields go through the MMIO registers' locked path;
 `queue.rs` the queue registers and the checked parse of owned metadata copies;
 `block.rs` virtio-blk, its disk workers and the block owner loop; `net.rs` the
 network frontend and `PacketPort`; `testing.rs` the test driver's disk-call
