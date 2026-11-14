@@ -261,6 +261,15 @@ Rules learned in this round:
     question (decision 22) is settled: no wall cost. The fast-miss merge (6089ca6) is in head. Pool -> default on (owner
     approval after the gate). Remaining: full suite (caches off), benchmark suite, IO5 full boot.
 
+28. **Round end: suite and IO5 full boot.** Full suite with both caches off (`natemu-raw/round-suite-20261114-01`,
+    21 min wall vs 36 on November 11): 166/171; probes@1/@2 failed only because OrbStack was down (Docker reference)
+    and pass with `NATEMU_REFERENCE_BACKEND=apple` (`round-suite-20261114-02`); k2-rdrand's expectation followed the
+    pool's ENTROPY_WORDS 32 -> 30 (`0312884`, passes); io-coverage host-full is the known environmental failure;
+    net-linux could not bind port 8000 (a leftover server from the PCI acceptance run, pid 27567, left for the owner).
+    IO5 full boot, mitigations off, natemu head with the pool on (`io5-natemu-mo-20261114-01`): PASS; use phase
+    705 -> 564 s (-20%), configure 88.7 -> 67.9 s, make 492.3 -> 349.4 s (-29%), vs QEMU 901 s: natemu 0.63x QEMU (0.78x
+    before this round). Benchmark suite (3 rounds) running: `natemu-raw/bench-round-20261114-01`.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
