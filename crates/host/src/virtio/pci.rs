@@ -174,6 +174,21 @@ impl Transport {
             sent[i] = v;
         }
     }
+    /// The one vCPU `queue`'s interrupt goes to, if its message names one now: MSI-X enabled, the vector assigned, and
+    /// its address a physical destination or a flat logical one with a single member (SDM Vol.3 11.11.1). None
+    /// otherwise (the caller then assumes nothing about who takes it).
+    pub(super) fn destination(&self, vectors: &Vectors, queue: usize) -> Option<usize> {
+        let msix = lock(&self.msix);
+        let entry = msix.table_entries.get(usize::from(vectors.0[queue]))?;
+        if !msix.enabled() || entry.msg_addr_hi != 0 || entry.msg_addr_lo >> 20 != 0xfee {
+            return None;
+        }
+        let dest = entry.msg_addr_lo >> 12 & 0xff;
+        match entry.msg_addr_lo & 4 != 0 {
+            false => (dest != 0xff).then_some(dest as usize),
+            true => (dest.count_ones() == 1).then(|| dest.trailing_zeros() as usize),
+        }
+    }
     /// Under the state lock, at a device reset: pending vectors belong to the closed incarnation (QEMU:
     /// `msix_unuse_all_vectors`); the table and MSI-X Enable are PCI state and stay.
     pub(super) fn clear_pending(&self) {
@@ -642,7 +657,7 @@ mod tests {
     }
     fn complete_as(d: &Virtio, s: &mut State, id: Identity) {
         let used = Used::new(s.queues[id.queue], [(0, 0)]);
-        d.interrupt(s, id, &used);
+        d.interrupt(s, id, &used, false);
     }
     fn pba(rig: &Driver) -> u64 {
         rig.read(PBA, 8)
@@ -740,6 +755,27 @@ mod tests {
             rig.write(0x1a, 2, q + 1);
             assert_eq!(rig.read(0x1a, 2), q + 1);
         }
+        // The one vCPU a queue's interrupt goes to (`Transport::destination`): told from its vector's message once
+        // MSI-X is on, when the address is a physical destination or a logical one with a single member.
+        let destination = |q| {
+            let vectors = rig.d.lock().vectors;
+            rig.d.pci.get().unwrap().destination(&vectors, q)
+        };
+        for (i, address) in [0xfee0_1000u64, 0xfee0_2004, 0xfee0_3004, 0xfeef_f000]
+            .into_iter()
+            .enumerate()
+        {
+            let i = i as u64;
+            rig.write(TABLE + 16 * (i + 1), 8, address);
+            rig.write(TABLE + 16 * (i + 1) + 8, 8, 0x40 + i);
+        }
+        assert_eq!(destination(0), None, "MSI-X off");
+        rig.msix(true, false);
+        assert_eq!(
+            [0, 1, 2, 3].map(destination),
+            [Some(1), Some(1), None, None],
+            "physical 1; logical bit 1; two members; broadcast"
+        );
         rig.write(0x16, 2, 4);
         assert_eq!(rig.read(0x18, 2), 0, "no fifth queue");
         // One queue: what the device was before (no feature bit, the configuration ends at blk_size).
