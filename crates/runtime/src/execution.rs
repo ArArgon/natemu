@@ -1009,9 +1009,12 @@ fn unwalk(s: &mut State) {
 /// remembered one). An entry is accepted only if every check passes on its private copy in the staging area (EL1-only window
 /// memory, unused between requests): the pool's own (a whole entry the host wrote at that position, not overwritten during
 /// the copy; the module's ordering argument), the full key (a slot's tag has 24 bits), the fences, the prefix against the
-/// guest's bytes as marked, no write posted meanwhile, the link points and computed exit as admitted (what [`ask`] checks of a
+/// guest's bytes as marked, no flush meanwhile, the link points and computed exit as admitted (what [`ask`] checks of a
 /// reply; the sites' contents are the host's admission, as for a reply) and the re-check of [`cache::copy_pooled`]. The
-/// block is then an ordinary template of this vCPU. `Some(Some)`: placed; `Some(None)`: the code area or metadata is full
+/// block is then an ordinary template of this vCPU, and `kept` (the caller) is what catches a write that raced the lookup: the
+/// pages were marked before their bytes were compared (the mark is a SeqCst fetch_or, `dmb ish` before the compare), so a
+/// write after the mark clears it and posts to this vCPU; `kept` takes the posted invalidations and discards the block if
+/// any source page's mark is gone (the generation, which only a flush moves, is not what says so). `Some(Some)`: placed; `Some(None)`: the code area or metadata is full
 /// (the caller flushes); `None`: ask the host (the walk of the next page undone). The pool's switch is a tripwire the host
 /// pulls when its own premise fails, read at each lookup; a lookup already under way is not stopped by it, so it is no barrier:
 /// every accepted entry was published by the host's own admission regardless.
@@ -1077,8 +1080,11 @@ unsafe fn pool_lookup(s: &mut State, context: u64) -> Option<Option<&'static Blo
                 }
                 Err(reason) => {
                     c.pool_refused[reason] += 1;
-                    // What fails every entry alike ends the lookup.
-                    if reason == why::FENCED || reason == why::STALE {
+                    // The next candidate walks the second page afresh if it crosses: nothing of this one's walk stays (a fault
+                    // left in `fetch_fault`, a page marked for no block) for a candidate that does not.
+                    unwalk(s);
+                    // A flush fails every entry alike and ends the lookup (a fence is judged by each entry's own length).
+                    if reason == why::STALE {
                         break 'lengths;
                     }
                 }
@@ -1138,7 +1144,10 @@ unsafe fn pooled_entry(
             return Err(why::BYTES);
         }
     }
-    // The guest's bytes now (pages marked: a write from here on is posted to this vCPU) are the entry's prefix.
+    // The guest's bytes now (pages marked: a write from here on is posted to this vCPU) are the entry's prefix. The mark is
+    // a SeqCst atomic and the compare's loads follow it in program order on the same vCPU; the barrier makes that order
+    // explicit for the loads from guest RAM (the host path has `dsb sy` before its `hvc`).
+    unsafe { core::arch::asm!("dmb ish", options(nostack, preserves_flags)) };
     let ram = guest_ram();
     let first = e.prefix.len().min(4096 - page_off);
     if !same_bytes(&ram, s.fetch[0] | page_off as u64, &e.prefix[..first])

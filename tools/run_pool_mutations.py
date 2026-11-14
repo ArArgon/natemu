@@ -19,7 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 POOL = 'crates/abi/src/pool.rs'
 RES = 'crates/runtime/src/execution.rs'
 HOST = 'crates/host/src/execution.rs'
-ALL = 'pool-peer,pool-frame,pool-smc,pool-ctx,pool-cross,pool-wrap,pool-fence'
+ALL = 'pool-peer,pool-frame,pool-smc,pool-ctx,pool-cross,pool-wrap,pool-fence,pool-race'
 
 BYTES = ("""    if !same_bytes(&ram, s.fetch[0] | page_off as u64, &e.prefix[..first])
         || (crosses && !same_bytes(&ram, s.fetch[1], &e.prefix[first..]))
@@ -35,6 +35,8 @@ MUTATIONS = {
         (HOST, "                &crate::publisher::Template {\n                    rip,\n                    context,", "                &crate::publisher::Template {\n                    rip,\n                    context: 0,"),
     ], 'pool-ctx'),
     'no-fence-check': ('k1', [(RES, "    if s.cpu.dr[5] & DR7_ENABLES != 0 {\n        c.pool_refused[", "    if false && s.cpu.dr[5] & DR7_ENABLES != 0 {\n        c.pool_refused[")], 'pool-fence'),
+    'no-kept-marked-check': ('k1', [(RES, "b.flags & cache::DEAD != 0 || b.source_gpa.iter().any(|&g| unmarked(g))", "b.flags & cache::DEAD != 0")], 'pool-race'),
+    'no-pool-take-invalidations': ('k1', [(RES, "    take_invalidations(s);\n    if s.generation != generation {\n        return Err(why::STALE);", "    if s.generation != generation {\n        return Err(why::STALE);")], 'pool-race,pool-smc'),
     'no-tail-check': ('k1', [(POOL, "        if position < tail {\n            return Err(Refusal::Overwritten);\n        }\n        let entry = decode", "        let _ = tail;\n        let entry = decode")], 'pool-wrap'),
     'no-slot-position-check': ('unit', [(POOL, "        if entry.position != position {\n            return Err(Refusal::Position);\n        }\n        Ok(entry)", "        Ok(entry)")], ''),
     'no-tail-check-unit': ('unit', [(POOL, "        if position < tail {\n            return Err(Refusal::Overwritten);\n        }\n        let entry = decode", "        let _ = tail;\n        let entry = decode")], ''),
@@ -42,6 +44,11 @@ MUTATIONS = {
     'no-prefix-length-check': ('unit', [(POOL, "    if guest_bytes == 0 || prefix > MAX_PREFIX as u32 || prefix < guest_bytes {", "    if guest_bytes == 0 || prefix > MAX_PREFIX as u32 {")], ''),
     'release-store-before-data': ('unit', [(POOL, "        self.store(place, &scratch[..n]);\n        self.link(&parts.key(), position);", "        self.link(&parts.key(), position);\n        self.store(place, &scratch[..n]);")], ''),
 }
+
+
+# Mutations that must stay green: the removed code is an early-out of a check `kept` makes again after the placement (it takes
+# the same posted invalidations and tests the generation and the marks), so no outcome can change.
+EQUIVALENT = {'no-pool-take-invalidations': "`kept` takes the same invalidations after the placement"}
 
 
 def sh(cmd, **kw):
@@ -69,8 +76,9 @@ def run_one(name, a):
         out = a.out / name
         r = sh([sys.executable, 'tools/run_k1.py', '--fexc', str(a.fexc), '--out', str(out), '--cpus', '1', '2',
                 '--programs', programs, '--host', str(host), '--runtime', str(runtime)])
-        failed = r.returncode != 0
-        return 'red' if failed else 'GREEN'
+        if r.returncode != 0:
+            return 'red'
+        return 'equivalent (green as documented): ' + EQUIVALENT[name] if name in EQUIVALENT else 'GREEN'
     finally:
         for path, text in saved.items():
             (ROOT / path).write_text(text)
@@ -99,7 +107,7 @@ def main():
     if dirty.strip():
         print('sources not restored:\n' + dirty)
         return 1
-    return 0 if all(v == 'red' for v in results.values()) else 1
+    return 0 if all(v == 'red' or v.startswith('equivalent') for v in results.values()) else 1
 
 
 if __name__ == '__main__':

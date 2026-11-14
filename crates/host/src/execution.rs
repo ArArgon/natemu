@@ -173,8 +173,8 @@ fn pool_layout_from_env() -> Result<natemu_abi::pool::Layout> {
         ring_bytes: ring.saturating_mul(1024),
         control_bytes: natemu_abi::pool::PRODUCTION.control_bytes,
     };
-    if !layout.valid() || layout.ring_bytes < 4096 {
-        return Err("NATEMU_POOL_RING_KB / NATEMU_POOL_INDEX_SLOTS: a ring of 4 KiB or more and a power of two of 8 or more slots".into());
+    if !layout.valid() || layout.ring_bytes < 4096 || layout.mapped_bytes() > cache::POOL_BYTES {
+        return Err("NATEMU_POOL_RING_KB / NATEMU_POOL_INDEX_SLOTS: a ring of 4 KiB or more and a power of two of 8 or more slots, the whole within the pool's address range".into());
     }
     eprintln!("natemu: the template pool's ring is {ring} KiB, its index {slots} slots (test hook)");
     Ok(layout)

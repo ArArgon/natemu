@@ -127,11 +127,14 @@ own and asks the pool; counts are per CPU, a peer may serve a first request too,
 - `pool-smc`: a pool-served copy, then a peer rewrites its page (`pic-xwrite`'s handshake; the CPU's own at N = 1): the copy
   dies and the new bytes run; then a byte past the key's four lead bytes changed: the entry is found and refused for its bytes.
 - `pool-ctx`: `divss` by zero compiled under a masked MXCSR, the cache flushed, run under an unmasked one: #XM is raised (the
-  entry of another context is not served), then masked again: it runs.
+  entry of another context is not served), then masked again: it runs; then under CR0.TS: #NM, and without it: it runs (the
+  programs are CPL 0: no program here runs a pool block under another CPL, whose context bits are keyed alike).
 - `pool-cross`: a block crossing into a second page: served where the second frame is the entry's, refused for its bytes where
   it differs.
 - `pool-wrap`: a 64 KiB ring (NATEMU_POOL_RING_KB, a 4096-slot index) overwritten over and over by 1024 blocks, three passes over
   them with flushes between, every CPU running the same bytes at once: values exact, overwritten entries refused.
+- `pool-race`: every CPU stores into its neighbour's frame and calls its own alias, many times, so lookups race the stores
+  (`kept` must discard a block whose page lost its mark); then a final value is stored and the alias must run it, no flush.
 - `pool-fence`: an instruction breakpoint armed in a block's bytes: not served, the #DB is taken (the stop RIP and host hook
   fences share the own-template path's code, `reuse_fenced`, which no program here arms).
 Perf chunk 11 (natemu only):
@@ -537,13 +540,14 @@ PIC_ENV = {'link-full': 'off', 'pic-user': 'user'}
 
 
 # Cross-vCPU reuse programs (module docstring). RLD: a frame of RL's bytes; PW, PWE: `pool-wrap`'s chain page and its end page.
-POOL = ('pool-peer', 'pool-frame', 'pool-smc', 'pool-ctx', 'pool-cross', 'pool-wrap', 'pool-fence')
+POOL = ('pool-peer', 'pool-frame', 'pool-smc', 'pool-ctx', 'pool-cross', 'pool-wrap', 'pool-fence', 'pool-race')
+RACE = 20000                      # `pool-race`: rounds of a write to the neighbour's page and a call of the own alias
 RLD, PW, PWE = 0xd000, 0xd000, 0xe000
 PX = 0xffa                       # `pool-cross`: `mov rax, imm64` at PX of RL, its immediate's last four bytes on RL2's (or RLC's) first
 PW_BLOCKS = 1024                  # `inc ebx; jz $+2` (four bytes, two instructions, one block) per entry of the chain page
 POOL_ENV = {'pool-wrap': {'NATEMU_POOL_RING_KB': '64', 'NATEMU_POOL_INDEX_SLOTS': '4096'}}
 # Per CPU: the least blocks copied from the pool, and the least refusals by reason (resident `pool_refusal` names).
-POOL_HITS = {'pool-peer': 1, 'pool-frame': 1, 'pool-smc': 1, 'pool-ctx': 0, 'pool-cross': 1, 'pool-wrap': 0, 'pool-fence': 0}
+POOL_HITS = {'pool-peer': 1, 'pool-frame': 1, 'pool-smc': 1, 'pool-ctx': 0, 'pool-cross': 1, 'pool-wrap': 0, 'pool-fence': 0, 'pool-race': 1}
 POOL_REFUSED = {'pool-smc': ('bytes', 1), 'pool-cross': ('bytes', 1), 'pool-wrap': ('overwritten', 100), 'pool-fence': ('fenced', 1)}
 PFLAGS = P.SYS_D(0) + 0x7800     # `pool-smc`: per CPU a ready word, then (+ 0x40) a written word (as `pic-xwrite`)
 
@@ -578,6 +582,9 @@ def pool_bodies(i, n=1):
                      '    mov eax, 0x3f800000\n    movd xmm0, eax\n    xorps xmm1, xmm1\n' + mx(0) + call('z0', f'{RV1 + ZO:#x}')
                      + save(('r8', 'rbx')) + flush + mx(3) + '    xor ebx, ebx\n' + call('z1', f'{RV3 + ZO:#x}')
                      + save(('r9', 'r15'), ('r10', 'rbx')) + mx(0) + call('z2', f'{RV3 + ZO:#x}') + save(('r12', 'rbx'))
+                     # CR0.TS: the same bytes under another context again (SSE gated: #NM, the handler counts it in r14).
+                     + '    xor r14d, r14d\n    mov rax, cr0\n    bts rax, 3\n    mov cr0, rax\n' + call('z3', f'{RV3 + ZO:#x}')
+                     + save(('rdi', 'r14')) + '    clts\n' + call('z4', f'{RV3 + ZO:#x}') + save(('rbp', 'rbx'))
                      + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
         # A block crossing into a second page (`mov rax, imm64` at PX: its last four immediate bytes and the `jmp r13` on the next
         # page; it starts more than four bytes before the page's end, so its key's lead bytes are on the first page). RV1's
@@ -595,6 +602,18 @@ def pool_bodies(i, n=1):
                        + f'    mov rax, {RV3 + 17:#x}\n    mov dr0, rax\n    mov eax, 1\n    mov dr7, rax\n' + call('b1', f'{RV3:#x}')
                        + save(('r9', 'rax'), ('r10', 'rsi'), ('r12', 'r14')) + '    xor eax, eax\n    mov dr7, rax\n'
                        + '    jmp .end\n.h1:\n    inc r14\n    or dword [rsp+16], 0x10000\n    iretq\n.end:\n'),
+        # Every CPU stores 1 or 3 into byte 1 of its neighbour's frame (`mov ebx, k`) and calls its own alias, RACE times: the
+        # stores kill the block, so each call asks the pool (its entries for both values), and a store lands now and then between
+        # the mark of a lookup and the block's placement, which `kept` must catch (the CPUID before each call enters the resident, which takes the posted invalidations). Then the neighbour's final value 7 is stored
+        # (after both are done, so the last store is not before a placement) and the own alias, with no flush, must run it.
+        'pool-race': (f'    mov qword [{PFLAGS + 8 * i:#x}], 1\n' + ''.join(f'.b{k}:\n    pause\n    cmp qword [{PFLAGS + 8 * k:#x}], 1\n    jne .b{k}\n' for k in range(n))
+                      + f'    mov r9d, {RACE}\n.l:\n    mov eax, r9d\n    and eax, 1\n    lea eax, [rax*2+1]\n    mov [{P.SYS_D(j) + RL + 1:#x}], al\n'
+                      + '    xor eax, eax\n    cpuid\n' + call('w0', f'{RV1:#x}') + '    dec r9d\n    jnz .l\n'
+                      + f'    mov qword [{PFLAGS + 0x80 + 8 * i:#x}], 1\n.r1:\n    pause\n    cmp qword [{PFLAGS + 0x80 + 8 * j:#x}], 1\n    jne .r1\n'
+                      f'.r1b:\n    pause\n    cmp qword [{PFLAGS + 0x80 + 8 * ((i - 1) % n):#x}], 1\n    jne .r1b\n'
+                      f'    mov byte [{P.SYS_D(j) + RL + 1:#x}], 7\n    mov qword [{PFLAGS + 0xc0 + 8 * j:#x}], 1\n'
+                      f'.r2:\n    pause\n    cmp qword [{PFLAGS + 0xc0 + 8 * i:#x}], 1\n    jne .r2\n    xor eax, eax\n    cpuid\n'
+                      + call('w1', f'{RV1:#x}') + save(('r8', 'rbx'))),
     }
     return out
 
@@ -917,7 +936,7 @@ def reuse_memory(name, i):
         return tables + [dict(P.zero(d + IDT, 0x1000), capture=False), {'addr': f'0x{d + RL:x}', 'data': page.hex()}]
     if name == 'pool-fence':
         tables += [dict(P.zero(d + IDT, 0x1000), capture=False)]
-    if name == 'pool-smc' and i == 0:
+    if name in ('pool-smc', 'pool-race') and i == 0:
         tables += [dict(P.zero(PFLAGS, 0x100), capture=False)]
     if name == 'pool-frame':
         tables += [{'addr': f'0x{d + RLD:x}', 'data': LIB(1).hex()}]
@@ -988,10 +1007,11 @@ def reuse_either(name):
             'pool-peer': {'r8': {RV1}, 'r9': {RV1 + 17}, 'r10': {RV2}, 'r12': {RV2 + 17}},
             'pool-frame': {'r8': {RV1}, 'r10': {RV3}, 'r12': {RV3 + 17}},
             'pool-smc': {'r8': {1}, 'r9': {1}, 'r10': {3}, 'r12': {0x1000003}},
-            'pool-ctx': {'r8': {5}, 'r9': {1}, 'r10': {0}, 'r12': {5}},
+            'pool-ctx': {'r8': {5}, 'r9': {1}, 'r10': {0}, 'r12': {5}, 'rdi': {1}, 'rbp': {5}},
             'pool-cross': {'r8': {1 << 32}, 'r10': {1 << 32}, 'r14': {2 << 32}},
             'pool-wrap': {'r8': {PW_BLOCKS}, 'r9': {PW_BLOCKS}, 'r10': {PW_BLOCKS}},
             'pool-fence': {'r8': {RV1}, 'r9': {RV3}, 'r10': {RV3 + 17}, 'r12': {1}},
+            'pool-race': {'r8': {7}},
         }[name]
     return judge
 # (`l1-pic` shares one translation across two aliases; it asserts no copies: it is not a reuse program.)

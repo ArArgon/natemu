@@ -789,7 +789,9 @@ pub mod cache {
         pub const MALFORMED: usize = 6;
         /// The pool's switch was off (the host's gating tripwire).
         pub const OFF: usize = 7;
-        /// A write to the pages was posted meanwhile (the generation moved).
+        /// The cache was flushed meanwhile (pending invalidations taken at the lookup moved the generation). A write to the
+        /// pages posted after their mark is not this: it is caught after the placement by `kept`'s check that the mark is
+        /// still set.
         pub const STALE: usize = 8;
         pub const COUNT: usize = 9;
         pub const NAMES: [&str; COUNT] = [
