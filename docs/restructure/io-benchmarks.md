@@ -1484,6 +1484,90 @@ comparisons) contains this noise: a low fio row may be placement, not a regressi
 is not explained by pinning: seq-read-128k occasionally collapses to about 8-9k IOPS (about 1 GiB/s;
 seen once in the first pinned matrix at four vCPUs); open.
 
+## PCI transport with multiqueue, interrupt hold and a 256-entry ring — November 14 (M2 Max)
+
+Measured on an Apple M2 Max (macOS 26.6.2), not the M4 of the earlier sections, and with a session harness, not
+`tools/run_io_matrix.py` (its pinned inputs are in the M4's `natemu-raw`): the matrix's fio jobs unchanged (io_uring,
+direct, 5 s each, verify headers) from an ext4 image holding Debian's fio, run in the play image, **no pinning of fio
+or interrupts**. Scripts, logs and the image: `natemu-raw/io-perf-20261114-01/`. One boot per cell unless a range is
+given; boot-to-boot variation on this machine is about +-10%, and the machine ran slower late in the day, so compare
+within a table, not across them. Branch `halt-poll` (on `pci`): halt polling, one request queue per vCPU over PCI,
+requests up to 504 KiB, the interrupt hold, queue size 256.
+
+Each step and what it did to the matrix (PCI, 2 vCPUs, IOPS; VZ: Apple `container` 1.7.1, the same jobs, Debian's
+arm64 fio; QEMU 11.1 TCG):
+
+| Job | `pci` tip | + halt polling | + multiqueue | + hold | + ring 256 (branch) | VZ | QEMU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rand-read 4k q1 | 15k | 28k | 24k | 26k | 25-26k | 27k | 8k |
+| rand-read 4k q16 | 38k | 44k | 42k | 108k | 106-108k | 154k | 11k |
+| rand-read 4k q64 | 66k | 77k | 42k | 111k | 106-110k | 225k | 11k |
+| seq-read 4k q16 | 39k | 48k | 49k | 113k | 102-103k | 190k | 11k |
+| mixed 4k q16 (read+write) | 60k | 69k | 36k | 79k | 76-77k | 116k | 13k |
+| rand-read 4k, 4 jobs q16 | 89-97k | 96k | 111k | 150k | 149-156k | 258k | 19k |
+| seq-read 128k q16 | 24-27k | 22.5k | 21.5k | 21.4k | 28.0-28.1k | 54k | 0.7k |
+| seq-write 128k q16 | 16.3k | 14.5k | 12.6k | 13.0k | 16.4-16.8k | 30k | 0.7k |
+
+What each row says:
+
+- **Halt polling** (a halted vCPU spins up to 15 us for its wake before `wfi`) is the depth-1 gain: 15k to 26k,
+  level with VZ. Chosen bound: host CPU per I/O within 20% of no polling.
+- **One queue per vCPU** puts a completion on the vCPU that submitted it. It helps several submitters (four jobs) and
+  hurt one submitter at depth: with a single queue the interrupt vCPU did the completion work in parallel, which is
+  the placement effect of "Run-to-run bimodality" above seen from the other side.
+- **Interrupt hold**: on one vCPU a request paid an exit for its kick and an interrupt that stops a running block,
+  about 13 of 28 us. While the vCPU an interrupt would go to is running, the device holds it (8 completions, 30 us
+  idle, 200 us, or the vCPU's halt) and reads the ring itself. q16: 42k to 108k IOPS at half the host CPU per request
+  (32 to 16 us). Holding until the vCPU halts was wrong for two threads on a vCPU: each then blocked every 16
+  requests and each switch between them (a CR3 load) resets the shadow tables (117k to 69k); hence the count.
+- **Ring 256**: without indirect descriptors a 128 KiB request takes 34 descriptors, so a 128-entry ring held three
+  and a guest at depth 16 ran at depth 3. That, not the queue layout, kept 128 KiB below the tip. 1 MiB direct `dd`:
+  writes 2.7 to 3.5 GB/s, reads to 5.0 GB/s. Larger rings gain a little more on large reads and cost about 5% at
+  4 KiB q16 (each capture copies the whole descriptor table).
+
+PCI against MMIO on the branch's binary (the handoff's A/B; two rounds, order alternated, free placement):
+
+| Job | MMIO 1 vCPU | PCI 1 vCPU | MMIO 4 vCPUs | PCI 4 vCPUs |
+| --- | --- | --- | --- | --- |
+| rand-read 4k q1 | 17.5-20.2k | 21.8-22.1k | 13.6-13.8k | 22.5-23.5k |
+| rand-read 4k q16 | 26.8-30.5k | 74.8-77.9k | 64.0-71.8k | 85.6-97.1k |
+| rand-read 4k q64 | 27.0-30.4k | 70.8-83.6k | 64.7-68.9k | 81.2-98.1k |
+| seq-read 4k q16 | 28.0-31.4k | 80.2-81.3k | 65.3-74.3k | 85.1-97.0k |
+| mixed 4k q16 (read+write) | 26.4k | 58.0-61.6k | 64.3-64.9k | 62.2-71.3k |
+| rand-read 4k, 4 jobs q16 (total) | 26-28k | 72k | 180-183k | 259-295k |
+| seq-read 128k q16 | 15.4-17.2k | 23.6-24.7k | 27.9-28.8k | 24.9-27.4k |
+| seq-write 128k q16 | 9.8-10.9k | 12.9-13.2k | 16.8-17.4k | 15.6-16.0k |
+
+PCI is ahead everywhere except 128 KiB at 4 vCPUs, where MMIO's single queue lets another vCPU take the completions
+(reads 5-11% behind, writes about 8%). The handoff's estimate of 10-15% at 1 vCPU and depth 1 is about right for depth 1 (10-25%); the
+rest of the 1-vCPU gain is the hold, which MMIO does not have (it needs the interrupt's target vCPU, known from the
+MSI-X message).
+
+Network (iperf3 to the host, 2 vCPUs, Mbit/s; tip and branch back to back, two rounds, order alternated):
+
+| | up | down | up, 8 streams | down, 8 streams |
+| --- | --- | --- | --- | --- |
+| `pci` tip, PCI | 1464-1572 | 3253-3428 | 2305-2396 | 7792-8519 |
+| branch, PCI | 1556-1595 | 3493-3594 | 2654-2704 | 8479-9126 |
+| `pci` tip, MMIO | 1567-1659 | 3524-3694 | 2347-2641 | 8370-8898 |
+| branch, MMIO | 1545-1581 | 3529-3736 | 2421-2558 | 8163-8429 |
+
+No transport effect and no regression: PCI and MMIO are level, the branch is at or above the tip on PCI and level on
+MMIO. An earlier pair of rounds had MMIO 13% ahead on the single download stream; six runs each way put both at
+3.3-4.3 Gbit/s, and the guest's vCPUs are 50-75% halted during it: the backend is the limit. Counting held-back
+network interrupts per queue over PCI was tried and made it slower (uploads 1.8 to 1.4-1.5 Gbit/s); not kept.
+
+Other checks on the branch: a 500 MiB random file and two concurrent copies hash the same before and after a
+power-off (written over PCI, read back over MMIO); 345 unit tests; the quick suite on this machine passes 51 steps,
+and the 34 that fail do so identically on the unmodified `pci` tip or for missing inputs: 24 need reference files
+that exist only in the M4's `natemu-raw`, `asm`, `i5c`, `i6-faults`, `i8-faults` and `i5b-images` fail
+floating-point cases (denormal and NaN flags; this M2 has no FEAT_AFP, the M4 does), `kicks` sees no stop at a
+resident entry or re-arm, and `system` differs from this machine's QEMU 11.1 in one case. The full suite, the pinned
+matrix runner and the lifecycle and coverage runners have not run on the branch: they need the M4's inputs.
+
+Known limits left in: a request the owner runs inline delays a held interrupt by that disk call; the hold exists
+only over PCI with MSI-X; `tools/run_fio_baselines.py` still gives the QEMU control one queue of 128.
+
 ## Bounded initial matrix (historical)
 
 Historical (November 8 planning; superseded by the measured sections above).
