@@ -38,8 +38,8 @@ MUTATIONS = {
                               '            if let Some(walked) = walked.filter(|_| block(n).flags & DEAD == 0) {\n                if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);\n                }\n                c.revalidated += 1;'),
                              (CACHE, '                #[cfg(not(feature = "pic-count"))]\n                if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);\n                }\n', '')],
                             'relink-global', False),
-    'suspend-leaves-links-patched': ([(CACHE, 'clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(unsafe { record(i as usize).read() })?);',
-                                       'clean_pou(ctr, area::CODE_WRITE_VA + u64::from(block(unsafe { record(i as usize).read() }.source as usize).code));')],
+    'suspend-leaves-links-patched': ([(CACHE, '        out_del(i as usize);\n        clean_pou(ctr, area::CODE_WRITE_VA + unlink_word(r)?);',
+                                       '        out_del(i as usize);\n        clean_pou(ctr, area::CODE_WRITE_VA + u64::from(block(r.source as usize).code));')],
                                      'cr3-link,cr3-relink', False),
     'relink-disabled': ([(CACHE, 'if block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);', 'if false && block(n).inbound != 0 && c.links_susp != 0 {\n                    relink(n);')], 'cr3-relink', False),
     'relink-skips-cursor-fix': ([(CACHE, '        if *follow == last as u32 + 1 {\n            *follow = i as u32 + 1;\n        }', ''),
@@ -47,7 +47,7 @@ MUTATIONS = {
     'relink-moves-with-insert': ([(CACHE, 'resume(i, r, global, &mut at);', 'remove(i, SUSP, &mut at);\n        insert(LinkRecord { prev_in: 0, next_in: 0, ..r }, if global { TLB } else { CR3 });')], 'relink-many', False),
     'host-rule-unlinked-only': ([(HOST, '} else if !admitted && !held {', '} else if !admitted {')], 'relink-held', False),
     # ---- the batch (step 1's synchronization, now `suspend`'s): a word left unrestored goes unnoticed until a link is taken
-    'suspend-skips-last-word': ([(CACHE, '    for i in from..to {\n        clean_pou(ctr, area::CODE_WRITE_VA', '    for i in from..to.saturating_sub(1) {\n        clean_pou(ctr, area::CODE_WRITE_VA')], 'cr3-relink,relink-many', False),
+    'suspend-skips-last-word': ([(CACHE, '    for i in from..to {\n        let r = unsafe { record(i as usize).read() };\n        // (A suspended record is named', '    for i in from..to.saturating_sub(1) {\n        let r = unsafe { record(i as usize).read() };\n        // (A suspended record is named')], 'cr3-relink,relink-many', False),
     # ---- the host check's other rules
 }
 # (Drain fix: a block's death undoes its links out by its outbound slots, `unlink_outbound`. A suspended record is named by no slot (its
