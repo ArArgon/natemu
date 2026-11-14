@@ -1766,7 +1766,7 @@ unsafe fn missed(frame: &NativeFrame) -> ! {
 }
 /// Halts with `native` in the record.
 #[inline(never)]
-fn halt_native(native: [u64; 3], reason: u64) -> ! {
+pub(crate) fn halt_native(native: [u64; 3], reason: u64) -> ! {
     let mut s = unsafe { load() };
     s.native = native;
     halt(&s, reason)

@@ -2132,6 +2132,8 @@ pub fn invlpg(address: u64) -> Option<u64> {
         if cut_one(n, false).is_some() {
             undone = undone.zip(unlink_inbound(n, false)).map(|(a, b)| a + b);
         }
+        #[cfg(feature = "link-check")]
+        check_inbound(n, false);
     };
     if held(&c.regions) {
         on_linear_page(address >> 12, &mut cut);
@@ -2193,9 +2195,31 @@ fn cut(doomed: impl Iterator<Item = usize>, dead: bool) -> Option<u64> {
             outbound |= k == CHECKED;
             undone += unlink_inbound(n, dead)?;
         }
+        #[cfg(feature = "link-check")]
+        if dead {
+            check_inbound(n, true);
+        }
     }
     // A dead block's own links out (there is no outbound index): one pass, as before.
     Some(undone + if outbound { prune(CHECKED, false)? } else { 0 })
+}
+/// `link-check` builds: block `n`'s inbound list, after a cut (`dead`: after its death), holds no record before
+/// [`Control::links_tlb`] (a dead block's: none at all). Halts `stop::LINK_CHECK` otherwise (or if the list does not
+/// end within [`area::MAX_LINKS`] steps).
+#[cfg(feature = "link-check")]
+fn check_inbound(n: usize, dead: bool) {
+    let mut at = block(n).inbound;
+    for _ in 0..=area::MAX_LINKS {
+        if at == 0 {
+            return;
+        }
+        if dead || at as u64 - 1 < control().links_tlb {
+            break;
+        }
+        at = unsafe { record(at as usize - 1).read() }.next_in;
+    }
+    let line = u64::from(core::panic::Location::caller().line());
+    crate::execution::halt_native([line, u64::from(at), n as u64], natemu_abi::execution::stop::LINK_CHECK)
 }
 /// [`cut`]'s work on block `n` but the link records: `Some` if its inbound list may hold links to undo (links from other
 /// pages may enter it, or it is dead and local links may), `Some(`[`CHECKED`]`)` if it is dead and links may leave it.

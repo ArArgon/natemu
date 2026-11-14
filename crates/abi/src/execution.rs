@@ -2471,6 +2471,10 @@ pub mod stop {
     /// (Perf chunk 10, numbered apart.) Under the host's check of reuse inside the resident ([`super::cache::REUSE_CHECK`]),
     /// a block copied from a template is not the host's answer at its RIP (code, sites, link points, exits or pages).
     pub const REUSE_MISMATCH: u64 = 64;
+    /// (Chunk 1b, `link-check` resident builds only.) A block's inbound list holds a record it must not: after an INVLPG
+    /// cut, a non-local record; after a block's death, any. `State::native` holds the halting line, the record's index
+    /// (+ 1) and the block's number.
+    pub const LINK_CHECK: u64 = 65;
 
     pub fn name(code: u64) -> &'static str {
         match code {
@@ -2493,6 +2497,7 @@ pub mod stop {
             UNSUPPORTED_MMIO => "unsupported_mmio",
             UNSUPPORTED_PORT => "unsupported_port",
             REUSE_MISMATCH => "reuse_mismatch",
+            LINK_CHECK => "link_check",
             _ => "none",
         }
     }
