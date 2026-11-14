@@ -119,6 +119,21 @@ link inside it) and, at 0x800, X (`jmp` to Y); frame RT a trampoline page (`jmp`
   block on its own page and frame, shares Y at link time and is local; RL then rewritten: both aliases run the new bytes.
 - `pic-user`: `pic-two` with `NATEMU_PIC=user`: CPL-0 code is never shared (SHARES 0), the same values.
 Instance eviction has no case: instances are freed with the arena at a flush (stage 3), which the flush tests cover.
+Cross-vCPU reuse (the host-published template pool, chunk 3 of its plan; natemu only, run with `--pool`, block sizes default
+and 1, the reuse check on (`--code-shape`) and off; a DR7 write flushes the cache, so the next request finds no template of its
+own and asks the pool; counts are per CPU, a peer may serve a first request too, so hits are least counts):
+- `pool-peer`: a frame at RV1 (table A), the cache flushed, the alias RV2 (table B) served from the pool: RV2's values.
+- `pool-frame`: the same bytes in another frame (RV1 -> RL, RV3 -> RLD): served by content, with RV3's values.
+- `pool-smc`: a pool-served copy, then a peer rewrites its page (`pic-xwrite`'s handshake; the CPU's own at N = 1): the copy
+  dies and the new bytes run; then a byte past the key's four lead bytes changed: the entry is found and refused for its bytes.
+- `pool-ctx`: `divss` by zero compiled under a masked MXCSR, the cache flushed, run under an unmasked one: #XM is raised (the
+  entry of another context is not served), then masked again: it runs.
+- `pool-cross`: a block crossing into a second page: served where the second frame is the entry's, refused for its bytes where
+  it differs.
+- `pool-wrap`: a 64 KiB ring (NATEMU_POOL_RING_KB, a 4096-slot index) overwritten over and over by 1024 blocks, three passes over
+  them with flushes between, every CPU running the same bytes at once: values exact, overwritten entries refused.
+- `pool-fence`: an instruction breakpoint armed in a block's bytes: not served, the #DB is taken (the stop RIP and host hook
+  fences share the own-template path's code, `reuse_fenced`, which no program here arms).
 Perf chunk 11 (natemu only):
 - `link-full`: more links than the record area holds. By default a test capacity of 16 Ki records (NATEMU_LINK_CAP: a
   chain of 20,480 link points through 5 pages above 4 GiB); `--full-links`: the production 512 Ki (a chain of 573,440 link
@@ -357,6 +372,7 @@ def bodies(k, i=0, n=1):
         **reuse_bodies(i, n),
         **l1_bodies(k, i, n),
         **page_bodies(i),
+        **pool_bodies(i, n),
         'link-full': full_body(i, n),
         # Perf chunk 12: four rounds, each arming a new instruction breakpoint at an address never run (the DR7 write
         # flushes the cache: blocks are numbered from 0 again) and then making three linked calls to V; odd rounds first
@@ -518,6 +534,67 @@ PIC_MIN = {'pic-two': (2, 1, 1), 'pic-fork': (1, 0, 1), 'pic-invlpg': (1, 0, 1),
 PIC_COUNT = {'pic-gmap': [(27, 1, None)], 'pic-user': [(25, 0, 0)]}
 # The resident's NATEMU_PIC per program (else the program driver's `all`).
 PIC_ENV = {'link-full': 'off', 'pic-user': 'user'}
+
+
+# Cross-vCPU reuse programs (module docstring). RLD: a frame of RL's bytes; PW, PWE: `pool-wrap`'s chain page and its end page.
+POOL = ('pool-peer', 'pool-frame', 'pool-smc', 'pool-ctx', 'pool-cross', 'pool-wrap', 'pool-fence')
+RLD, PW, PWE = 0xd000, 0xd000, 0xe000
+PW_BLOCKS = 1024                  # `inc ebx; jz $+2` (four bytes, two instructions, one block) per entry of the chain page
+POOL_ENV = {'pool-wrap': {'NATEMU_POOL_RING_KB': '64', 'NATEMU_POOL_INDEX_SLOTS': '4096'}}
+# Per CPU: the least blocks copied from the pool, and the least refusals by reason (resident `pool_refusal` names).
+POOL_HITS = {'pool-peer': 1, 'pool-frame': 1, 'pool-smc': 1, 'pool-ctx': 0, 'pool-cross': 1, 'pool-wrap': 0, 'pool-fence': 0}
+POOL_REFUSED = {'pool-smc': ('bytes', 1), 'pool-cross': ('bytes', 1), 'pool-wrap': ('overwritten', 100), 'pool-fence': ('fenced', 1)}
+PFLAGS = P.SYS_D(0) + 0x7800     # `pool-smc`: per CPU a ready word, then (+ 0x40) a written word (as `pic-xwrite`)
+
+
+def flush_text(d):
+    """A DR7 write with an instruction breakpoint at an address never run, then cleared: the cache is flushed."""
+    return f'    mov rax, {d + 0x7f00:#x}\n    mov dr0, rax\n    mov eax, 1\n    mov dr7, rax\n    xor eax, eax\n    mov dr7, rax\n'
+
+
+def pool_bodies(i, n=1):
+    d, j = P.SYS_D(i), (i + 1) % n
+    cr3 = lambda t: f'    mov rax, {{{t}:#x}}\n    mov cr3, rax\n'
+    save = lambda *regs: ''.join(f'    mov {r}, {s}\n' for r, s in regs)
+    flush = flush_text(d)
+    mx = lambda m: f'    ldmxcsr [{d + RL + 0x800 + 4 * m:#x}]\n'
+    out = {
+        # RV1 compiled (and published), flushed: RV2 (table B, the same offset and bytes) comes from the pool.
+        'pool-peer': (call('p0', f'{RV1:#x}') + save(('r8', 'rax'), ('r9', 'rsi')) + flush + cr3('tb') + call('p1', f'{RV2:#x}')
+                      + save(('r10', 'rax'), ('r12', 'rsi')) + cr3('ta')),
+        # Another frame of the same bytes (the own hint is by frame): by content.
+        'pool-frame': (call('f0', f'{RV1:#x}') + save(('r8', 'rax')) + call('f1', f'{RV3:#x}') + save(('r10', 'rax'), ('r12', 'rsi'))),
+        # RV1, flush, RV3 from the pool (rbx 1); a peer rewrites the page (`mov ebx, 3`): the copy dies, the new bytes run; then
+        # byte 4 (past the key's lead) changed on the own page, flush, RV1: found, refused for its bytes, compiled (0x1000003).
+        'pool-smc': (call('s0', f'{RV1:#x}') + save(('r8', 'rbx')) + flush + call('s1', f'{RV3:#x}') + save(('r9', 'rbx'))
+                     + f'    mov qword [{PFLAGS + 8 * i:#x}], 1\n.h1:\n    pause\n    cmp qword [{PFLAGS + 8 * j:#x}], 1\n    jne .h1\n'
+                     f'    mov byte [{P.SYS_D(j) + RL + 1:#x}], 3\n    mov qword [{PFLAGS + 0x40 + 8 * j:#x}], 1\n'
+                     f'.h2:\n    pause\n    cmp qword [{PFLAGS + 0x40 + 8 * i:#x}], 1\n    jne .h2\n    xor eax, eax\n    cpuid\n'
+                     + call('s2', f'{RV3:#x}') + save(('r10', 'rbx')) + flush + f'    mov byte [{d + RL + 4:#x}], 1\n'
+                     + call('s3', f'{RV1:#x}') + save(('r12', 'rbx'))),
+        # `divss` by zero compiled masked, flushed, run unmasked: #XM (not the other context's entry), then masked again.
+        'pool-ctx': ('    mov rax, cr4\n    or rax, 0x600\n    mov cr4, rax\n' + ctx_idt(d) + '    xor r14d, r14d\n    xor r15d, r15d\n'
+                     '    mov eax, 0x3f800000\n    movd xmm0, eax\n    xorps xmm1, xmm1\n' + mx(0) + call('z0', f'{RV1 + ZO:#x}')
+                     + save(('r8', 'rbx')) + flush + mx(3) + '    xor ebx, ebx\n' + call('z1', f'{RV3 + ZO:#x}')
+                     + save(('r9', 'r15'), ('r10', 'rbx')) + mx(0) + call('z2', f'{RV3 + ZO:#x}') + save(('r12', 'rbx'))
+                     + '    jmp .end\n' + CTX_HANDLERS + '.end:\n'),
+        # (As `reuse-cross`.) RV1's crossing block, flush, RV2 in table A (the second frame the same): from the pool; RV2 in
+        # table B (its second frame RLC): refused for its bytes, compiled.
+        'pool-cross': (call('x0', f'{RV1 + RX:#x}') + save(('r8', 'rax'), ('r9', 'rdx')) + flush + call('x1', f'{RV2 + RX:#x}')
+                       + save(('r10', 'rax'), ('r12', 'rdx')) + cr3('tb') + call('x2', f'{RV2 + RX:#x}') + save(('r14', 'rax'), ('r15', 'rdx'))
+                       + cr3('ta')),
+        # A chain of PW_BLOCKS blocks run three times with a flush between: a tiny ring wraps (a pool of 64 KiB against some
+        # 300 KiB of entries), every CPU running the same bytes meanwhile.
+        'pool-wrap': ('    jmp .over\n.run:\n    xor ebx, ebx\n    lea r13, [rel .back]\n' + f'    mov rax, {HIGH:#x}\n    jmp rax\n.back:\n    ret\n.over:\n'
+                      + '    call .run\n    mov r8, rbx\n' + flush + '    call .run\n    mov r9, rbx\n' + flush + '    call .run\n    mov r10, rbx\n'),
+        # RV1 compiled, flush, an instruction breakpoint on `pop rsi` (LIB + 17) of RV3 armed: not served from the pool (the
+        # cache would have it as one block), the block is cut there and the #DB taken once (r14).
+        'pool-fence': (ctx_idt(d, (1,)) + '    xor r14d, r14d\n' + call('b0', f'{RV1:#x}') + save(('r8', 'rax')) + flush
+                       + f'    mov rax, {RV3 + 17:#x}\n    mov dr0, rax\n    mov eax, 1\n    mov dr7, rax\n' + call('b1', f'{RV3:#x}')
+                       + save(('r9', 'rax'), ('r10', 'rsi'), ('r12', 'r14')) + '    xor eax, eax\n    mov dr7, rax\n'
+                       + '    jmp .end\n.h1:\n    inc r14\n    or dword [rsp+16], 0x10000\n    iretq\n.end:\n'),
+    }
+    return out
 
 
 def reuse_bodies(i, n=1):
@@ -795,6 +872,12 @@ def reuse_tables(name, i):
     """Per table (A, B): the linear page -> frame offset of the reuse programs' aliases."""
     if name == 'reuse-cross':
         return {RV1: RL, RV1 + 0x1000: RL2, RV2: RL, RV2 + 0x1000: RL2}, {RV2: RL, RV2 + 0x1000: RLC}
+    if name == 'pool-cross':
+        return {RV1: RL, RV1 + 0x1000: RL2, RV2: RL, RV2 + 0x1000: RL2}, {RV2: RL, RV2 + 0x1000: RLC}
+    if name == 'pool-frame':
+        return {RV1: RL, RV3: RLD}, {}
+    if name == 'pool-wrap':
+        return {HIGH: PW, HIGH + 0x1000: PWE}, {}
     if name == 'pic-cross':
         return {RV1: RL, RV1 + 0x1000: RL2, RV3: RL, RV3 + 0x1000: RL2}, {}
     if name == 'pic-fork':
@@ -822,7 +905,21 @@ def reuse_memory(name, i):
         tables += [entry(base + 8 * (HIGH >> 39 & 511), (base + 0x5000) | 0x27), entry(base + 0x5000 + 8 * (HIGH >> 30 & 511), (base + 0x6000) | 0x27),
                    entry(base + 0x6000 + 8 * (HIGH >> 21 & 511), (base + 0x7000) | 0x27)]
         tables += [entry(high_leaf(i, k, va), (d + f) | P.LEAF) for va, f in aliases.items()]
-    if name in ('reuse-cross', 'pic-cross'):
+    if name == 'pool-wrap':
+        return tables + [{'addr': f'0x{d + PW:x}', 'data': (b'\xff\xc3\x74\x00' * PW_BLOCKS).hex()},
+                         {'addr': f'0x{d + PWE:x}', 'data': P.asm('jmp r13').hex()}]
+    if name == 'pool-ctx':
+        page = bytearray(0x1000)
+        page[ZO:ZO + len(Z)] = Z
+        page[0x800:0x800 + 4 * len(CTX_MXCSR)] = b''.join(m.to_bytes(4, 'little') for m in CTX_MXCSR)
+        return tables + [dict(P.zero(d + IDT, 0x1000), capture=False), {'addr': f'0x{d + RL:x}', 'data': page.hex()}]
+    if name == 'pool-fence':
+        tables += [dict(P.zero(d + IDT, 0x1000), capture=False)]
+    if name == 'pool-smc' and i == 0:
+        tables += [dict(P.zero(PFLAGS, 0x100), capture=False)]
+    if name == 'pool-frame':
+        tables += [{'addr': f'0x{d + RLD:x}', 'data': LIB(1).hex()}]
+    if name in ('reuse-cross', 'pic-cross', 'pool-cross'):
         first = bytearray(0x1000)
         first[RX:] = P.asm('lea rdx, [rel $+7]') + b'\xb8\x00'
         return tables + [{'addr': f'0x{d + RL:x}', 'data': first.hex()}, {'addr': f'0x{d + RL2:x}', 'data': TAIL(1).hex()},
@@ -880,6 +977,13 @@ def reuse_either(name):
             'pic-user': {'r8': {RV3}, 'r9': {RV3 + YN}, 'r10': {RV3}, 'r12': {RV1}, 'r14': {RV1 + YN}, 'r15': {1}},
             # Two instances of one translation in one L1 set: each with its own page base (rax) and return address (rsi).
             'l1-pic': {'r8': {RV1}, 'r9': {RV1 + YN}, 'r10': {RV6}, 'r12': {RV6 + YN}},
+            'pool-peer': {'r8': {RV1}, 'r9': {RV1 + 17}, 'r10': {RV2}, 'r12': {RV2 + 17}},
+            'pool-frame': {'r8': {RV1}, 'r10': {RV3}, 'r12': {RV3 + 17}},
+            'pool-smc': {'r8': {1}, 'r9': {1}, 'r10': {3}, 'r12': {0x1000003}},
+            'pool-ctx': {'r8': {5}, 'r9': {1}, 'r10': {0}, 'r12': {5}},
+            'pool-cross': {'r8': {0x100}, 'r9': {RV1 + 0xffe}, 'r10': {0x100}, 'r12': {RV2 + 0xffe}, 'r14': {0x200}, 'r15': {RV2 + 0xffe}},
+            'pool-wrap': {'r8': {PW_BLOCKS}, 'r9': {PW_BLOCKS}, 'r10': {PW_BLOCKS}},
+            'pool-fence': {'r8': {RV1}, 'r9': {RV3}, 'r10': {RV3 + 17}, 'r12': {1}},
         }[name]
     return judge
 # (`l1-pic` shares one translation across two aliases; it asserts no copies: it is not a reuse program.)
@@ -962,7 +1066,7 @@ EITHER = {
     'large-alias': {'r10': {1}, 'r8': {1}, 'r9': {2}},
     'large-reval': {'r8': {1}, 'r10': {1}, 'r9': {2}},
     **{f'large-{m}': {'r8': {m}, 'r9': {2}} for m in LM},
-    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic')},
+    **{name: reuse_either(name) for name in (*REUSE, 'l1-pic', *POOL)},
     # CPUID leaves differ from QEMU's: natemu only. Per round (K rounds): A once (and again at the end unless -x), B, and the
     # CPUID's way into B (eax = 2 from B's own code).
     'l1-dup': lambda i, k: {'r8': {k}, 'r9': {2 * k}, 'r10': {2 * k}, 'r12': {k}},
@@ -1013,7 +1117,7 @@ def program(name, n, k):
                       for f, at, k in ((LF1, CQ1, 1), (LF1, CQ2, 0x10), (LF2, CQ2, 0x20), (LF1, CQ3, 0x300), (LF2, CQ3, 0x400))] if i == 0 else []
         out['memory'] += P.sys_tables(i, 0, n, a) + tb + [
             P.zero(d, 0x1000), {'addr': f'0x{d + F1:x}', 'data': CODE(1).hex()}, {'addr': f'0x{d + F2:x}', 'data': CODE(2).hex()},
-            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name == 'l1-pic' else [])
+            {'addr': f'0x{d + 0x3ffe:x}', 'data': 'b800'}, dict(P.zero(d + P.SAVE, 8), capture=False)] + (extra + links_memory(name, i, n) + (reuse_memory(name, i) if name in REUSE or name in POOL or name == 'l1-pic' else [])
             + (full_memory(i) if name == 'link-full' else []) + (l1_memory(name, i) if name in L1_ALL else [])
             + (page_memory(name, i) if name in PAGE_PROGRAMS else []))
     return out
@@ -1212,18 +1316,26 @@ def l1_counts(a, n, name, report):
     return [f'counts {f}' for f in failures]
 
 
-def run(a, prog, extra, host=None, runtime=None, tag=''):
-    work = a.out / 'work' / f"{prog['name']}{tag}{'-1' if extra else ''}"
+def run(a, prog, extra, host=None, runtime=None, tag='', check=True):
+    pooled = prog['name'][3:].split('@')[0] in POOL
+    work = a.out / 'work' / f"{prog['name']}{tag}{'-1' if extra else ''}{'' if check else '-nocheck'}"
     full = prog['name'].startswith('k1-link-full@')
     options = FULL_CODE if full else []
+    if pooled:   # the template pool: the host publishes, the residents look in it (one answer map for the CPUs)
+        options = options + ['--pool']
     # PIC study stage 3: link-full's one frame at FM addresses would be one shared translation linked once; the record
     # area's capacity is tested on absolute code (each address its own blocks and links).
     mode = PIC_ENV.get(prog['name'][3:].split('@')[0])
     env = dict(os.environ, **({'NATEMU_PIC': mode} if mode else {}))
     env.pop('NATEMU_LINK_CAP', None)   # (an inherited export must not shrink the full size, or any other program)
+    for var in ('NATEMU_POOL_RING_KB', 'NATEMU_POOL_INDEX_SLOTS', 'NATEMU_POOL_LOOKUP'):
+        env.pop(var, None)
+    if pooled:
+        env.update(POOL_ENV.get(prog['name'][3:].split('@')[0], {}))
     if full and CAP < MAX_LINKS:   # (the host's NATEMU_LINK_CAP: unset = production capacity)
         env['NATEMU_LINK_CAP'] = str(CAP)
-    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env)
+    rc, out, err = s3.driver(host or a.host, runtime or a.runtime, a.fexc, s3.smp_description(prog), work, options + extra, timeout=a.timeout, env=env,
+                             shape=check)
     problems = [] if rc == 0 else [f'driver exit {rc}: {err.strip()[-300:]}']
     short = prog['name'].split('@')[0].split('-', 1)[1]
     stop = EXPECT_STOP.get(short)
@@ -1277,8 +1389,9 @@ def main():
                 if want is None:
                     failures.append(f"{prog['name']}: QEMU run failed ({rc}) {err[-200:]}")
                     continue
-            for extra in ([], [1]):
-                out, problems = run(a, prog, extra)
+            # (The pool's programs also without the reuse check: production's, where a pool copy is not asked of the host.)
+            for extra, check in [([], True), ([1], True)] + ([([], False), ([1], False)] if name in POOL else []):
+                out, problems = run(a, prog, extra, check=check)
                 if name in ('pic-ctx', 'pic-xm'):  # (as `contexts`: once per context)
                     problems = [p for p in problems if 'host requests' not in p]
                 if name == 'contexts':  # its blocks are translated once per context, not once per RIP (the check's count)
@@ -1295,6 +1408,13 @@ def main():
                     reuse = c['stats']['k1']['reuse']
                     if reuse['copies'] < REUSE[name][0] or reuse['refused'][0] < REUSE[name][1]:
                         problems.append(f"cpu{v} reuse {reuse}, at least {REUSE[name]} (copies, refused[0])")
+                # Cross-vCPU reuse: the blocks copied from the pool, and the refusals by reason, per CPU.
+                for v, c in enumerate(out['cpus'] if out and name in POOL else []):
+                    pool = c['stats']['k1']['pool']
+                    if pool['hits'] < POOL_HITS[name]:
+                        problems.append(f"cpu{v} pool {pool}, at least {POOL_HITS[name]} blocks copied")
+                    if name in POOL_REFUSED and pool['refused'][POOL_REFUSED[name][0]] < POOL_REFUSED[name][1]:
+                        problems.append(f"cpu{v} pool {pool}, at least {POOL_REFUSED[name][1]} refusals for {POOL_REFUSED[name][0]}")
                 # PIC study stage 3: the least instances, checked links and local shared links (natemu_abi::pic::count).
                 for v, c in enumerate(out['cpus'] if out and name in PIC else []):
                     pic = c['stats']['k1']['pic']
@@ -1320,10 +1440,10 @@ def main():
                         seen[v] = got
                         problems += [f'cpu{v} {r} = {got[r]:#x}, allowed {[hex(x) for x in sorted(ok)]}' for r, ok in allowed.items() if got[r] not in ok]
                 stats = out and [{k: c['stats'].get(k) for k in ('requests', 'compiles', 'flushes', 'shadow_resets', 'links', 'unlinks', 'k1')} for c in out['cpus']]
-                entry = {'name': prog['name'], 'max_block': extra[0] if extra else None, 'problems': problems, 'seen': seen, 'stats': stats}
+                entry = {'name': prog['name'], 'max_block': extra[0] if extra else None, 'check': check, 'problems': problems, 'seen': seen, 'stats': stats}
                 report.append(entry)
                 print(json.dumps(entry), flush=True)
-                failures += [f"{prog['name']}{' (max-block 1)' if extra else ''}: {p}" for p in problems]
+                failures += [f"{prog['name']}{' (max-block 1)' if extra else ''}{'' if check else ' (no check)'}: {p}" for p in problems]
     # The two-way L1 programs' dispatcher-miss counts (differences of runs at different round counts, from a perf resident).
     # (Not under a PIC test mode: `svc` fills no L1 at all.)
     for n in a.cpus:

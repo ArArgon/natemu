@@ -1111,6 +1111,11 @@ pub(crate) struct Args {
     code_shape: bool,
     #[arg(long)]
     check_reuse: bool,
+    /// Cross-vCPU reuse (the template pool, chunk 3 of its plan): one answer map for every vCPU, the host publishes admitted
+    /// templates into the pool and each resident looks in it before asking (`NATEMU_POOL_LOOKUP=off`: publication only;
+    /// `NATEMU_POOL_RING_KB` and `NATEMU_POOL_INDEX_SLOTS`: a small pool).
+    #[arg(long, env = "NATEMU_POOL", value_parser = clap::builder::BoolishValueParser::new())]
+    pool: bool,
     #[arg(long = "strict-unassigned")]
     strict: bool,
     /// A test device's page (repeatable)
@@ -1383,6 +1388,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         max_instructions,
         code_shape,
         check_reuse,
+        pool,
         strict,
         device_at,
         irq_source,
@@ -1527,9 +1533,12 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
             n,
             ram_bytes as usize,
             va,
+            pool,
         )?,
-        None => execution::prepare(resident, code_bytes, n, ram_bytes as usize)?,
+        None => execution::prepare_with_pool(resident, code_bytes, n, ram_bytes as usize, pool)?,
     };
+    // One answer map for the vCPUs under the pool (its entries are the answers other vCPUs compiled).
+    let answers = std::sync::OnceLock::new();
     // SAFETY: the builder and the tables it makes are dropped before `backing` (this function owns both).
     let mut builder = Builder {
         ram: unsafe { backing.ram() },
@@ -1811,6 +1820,10 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         // PIC study: the test programs run at CPL 0 too; every privilege level's templates are shared when a second address
         // needs them, so the suites run shared code (`NATEMU_PIC` overrides).
         compiler.pic = cache::PIC_ALL;
+        if pool {
+            compiler.attach_pool(&backing);
+            compiler.share(&answers);
+        }
         let handlers = log_base(d.spaces[d.cpus[v].space].identity) + LOG_HANDLERS;
         let mut requests = execution::Requests {
             devices: Some(registry.clone()),

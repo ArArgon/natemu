@@ -144,13 +144,14 @@ import qemucache  # noqa: E402
 qemucache.install(smp)      # reference runs of an unchanged image are served from disk (tools/qemucache.py); k1 and pic import this too
 
 
-def driver(host, runtime, fexc, text, work, extra=(), timeout=None, env=None):
+def driver(host, runtime, fexc, text, work, extra=(), timeout=None, env=None, shape=True):
     """Runs one description; (returncode, stdout JSON or None, stderr). A run still going after `timeout` seconds is
-    killed: returncode 'timeout'. `env`: the driver's environment (default: this one's)."""
+    killed: returncode 'timeout'. `env`: the driver's environment (default: this one's). `shape` False: without
+    `--code-shape` (so without the reuse check), as production runs."""
     work.mkdir(parents=True, exist_ok=True)
     (work / 'program.txt').write_text(text)
     try:
-        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *vm.frame_alias_args(), *CODE_SHAPE, *map(str, extra)],
+        run = subprocess.run([host, runtime, 'run-program', fexc, work / 'program.txt', work, *vm.frame_alias_args(), *(CODE_SHAPE if shape else []), *map(str, extra)],
                              capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as e:
         err = e.stderr.decode(errors='replace') if isinstance(e.stderr, bytes) else e.stderr or ''
