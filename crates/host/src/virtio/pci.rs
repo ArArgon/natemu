@@ -26,7 +26,7 @@
 //! OR; QEMU instead waits for the next interrupt), and `profile::raised` counts are skewed under PCI. Reads of the
 //! MSI-X table or PBA region past their entries return all-ones (`MsixConfig`'s behaviour), an exception to the
 //! rule that an unimplemented BAR0 offset reads zero.
-use super::{Access, Profile, State, Virtio, feature_word, reg};
+use super::{Access, MAX_QUEUES, Profile, State, Virtio, feature_word, reg};
 use crate::{
     irq::Irqs,
     pci::{
@@ -85,16 +85,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The MSI-X vector of each queue (0, 1) and of configuration changes (2); a device reset returns them to
+/// The MSI-X vector of each queue and, last, of configuration changes; a device reset returns them to
 /// [`NO_VECTOR`] (virtio 1.2 4.1.5.1.2).
 #[derive(Clone, Copy)]
-pub(super) struct Vectors(pub(super) [u16; 3]);
+pub(super) struct Vectors(pub(super) [u16; MAX_QUEUES + 1]);
 impl Default for Vectors {
     fn default() -> Self {
-        Self([NO_VECTOR; 3])
+        Self([NO_VECTOR; MAX_QUEUES + 1])
     }
 }
-const CONFIG_VECTOR: usize = 2;
+const CONFIG_VECTOR: usize = MAX_QUEUES;
 
 /// A class subcode (`PciSubclass` needs a type; the values are QEMU's, as the spec's device table says).
 struct Subclass(u8);
@@ -163,8 +163,8 @@ impl Transport {
     /// set); nothing for [`NO_VECTOR`] or with MSI-X disabled (`MsixConfig::trigger`). Takes only the MSI-X lock.
     pub(super) fn trigger(&self, vectors: &Vectors, queues: u8, config: bool) {
         let mut msix = lock(&self.msix);
-        let mut sent = [NO_VECTOR; 3];
-        let wanted = (0..2)
+        let mut sent = [NO_VECTOR; MAX_QUEUES + 1];
+        let wanted = (0..MAX_QUEUES)
             .filter(|q| queues >> q & 1 != 0)
             .chain(config.then_some(CONFIG_VECTOR));
         for (i, v) in wanted.map(|i| vectors.0[i]).enumerate() {
@@ -696,6 +696,63 @@ mod tests {
         }
     }
     #[test]
+    fn a_disk_with_four_queues_offers_mq_and_a_vector_for_each() {
+        let path = std::env::temp_dir().join(format!("natemu-pci-mq-{}.raw", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let disk = |queues| {
+            let d = Virtio::block(
+                device().irqs.clone(),
+                crate::virtio::BLOCK_RESOURCE.gsi as usize,
+                &path,
+            )
+            .unwrap();
+            assert!(d.block_queues(0).is_err() && d.block_queues(MAX_QUEUES + 1).is_err());
+            d.block_queues(queues).unwrap();
+            let rig = attach(d);
+            assert!(
+                rig.d.block_queues(1).is_err(),
+                "fixed once it is a PCI function"
+            );
+            rig.command(MEMORY | BUS_MASTER);
+            rig.write(0x00, 4, 0);
+            rig
+        };
+        let rig = disk(4);
+        assert_eq!(rig.read(0x12, 2), 4, "num_queues");
+        assert_ne!(rig.read(0x04, 4) & 1 << 12, 0, "VIRTIO_BLK_F_MQ offered");
+        assert_eq!(
+            rig.read(0x2000 + 34, 2),
+            4,
+            "the device configuration's num_queues"
+        );
+        assert_eq!(rig.read(0x2000 + 20, 4), 512, "blk_size where it was");
+        assert_eq!(
+            rig.cfg(rig.caps()[0].0 + 2) & 0x7ff,
+            4,
+            "MSI-X table size - 1: a vector per queue and one more"
+        );
+        for q in 0..4 {
+            rig.write(0x16, 2, q);
+            assert_eq!(rig.read(0x18, 2), 128, "queue {q} exists");
+            rig.write(0x1a, 2, q + 1);
+            assert_eq!(rig.read(0x1a, 2), q + 1);
+        }
+        rig.write(0x16, 2, 4);
+        assert_eq!(rig.read(0x18, 2), 0, "no fifth queue");
+        // One queue: what the device was before (no feature bit, the configuration ends at blk_size).
+        drop(rig);
+        let rig = disk(1);
+        assert_eq!(rig.read(0x12, 2), 1);
+        assert_eq!(rig.read(0x04, 4) & 1 << 12, 0);
+        assert_eq!(rig.read(0x2000 + 34, 2), 0);
+        assert_eq!(rig.cfg(rig.caps()[0].0 + 2) & 0x7ff, 1);
+        drop(rig);
+        let _ = std::fs::remove_file(&path);
+    }
+    #[test]
     fn negotiation_reaches_driver_ok_with_exact_field_widths() {
         let rig = rng(true);
         assert_eq!(rig.f.bar(), Some(0xe001_0000));
@@ -708,7 +765,10 @@ mod tests {
             (s.queues[0].desc, s.queues[0].avail, s.queues[0].used),
             (0x1000, 0x1800, 0x1c00)
         );
-        assert_eq!(s.vectors.0, [1, NO_VECTOR, 0]);
+        assert_eq!(
+            (s.vectors.0[0], s.vectors.0[1], s.vectors.0[CONFIG_VECTOR]),
+            (1, NO_VECTOR, 0)
+        );
     }
     #[test]
     fn queue_size_reads_the_maximum_until_written() {
@@ -824,7 +884,7 @@ mod tests {
         assert_eq!(rig.read(ISR, 1), 0);
         assert_eq!(rig.read(0x10, 2), u64::from(NO_VECTOR));
         assert_eq!(rig.read(0x1a, 2), u64::from(NO_VECTOR));
-        assert_eq!(rig.d.lock().vectors.0, [NO_VECTOR; 3]);
+        assert_eq!(rig.d.lock().vectors.0, [NO_VECTOR; MAX_QUEUES + 1]);
         // MSI-X itself is PCI state: still enabled, the table kept.
         assert_eq!(rig.read(TABLE + 16, 8), message(1).0);
         assert!(lock(&rig.d.pci.get().unwrap().msix).enabled());
@@ -1006,7 +1066,8 @@ mod tests {
             rig.d.access(0, reg::PCI | 1 << 16 | ISR, 4, None),
             Access::Completed(0)
         );
-        assert_eq!(rig.d.lock().vectors.0, [1, NO_VECTOR, 0]);
+        let v = rig.d.lock().vectors.0;
+        assert_eq!((v[0], v[1], v[CONFIG_VECTOR]), (1, NO_VECTOR, 0));
         assert_eq!(rig.d.lock().interrupt, 1, "the ISR was not read");
         // And on an MMIO device the private path itself serves nothing.
         let mut s = plain.lock();

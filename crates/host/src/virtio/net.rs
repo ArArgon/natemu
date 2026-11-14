@@ -1038,13 +1038,13 @@ mod tests {
             // TX's open gate records a kick, which the owner takes under the lock.
             let mut s = d.lock();
             d.take_kicks(&mut s);
-            assert_eq!(s.notified, [false, true]);
-            s.notified = [false; 2];
+            assert_eq!(s.notified[..2], [false, true]);
+            s.notified = [false; super::MAX_QUEUES];
         }
         write(&d, reg::QUEUE_NOTIFY, 0);
         assert!(!d.lock().pending());
         assert!(p.receive(&frame()));
-        assert_eq!(d.lock().notified, [true, false]);
+        assert_eq!(d.lock().notified[..2], [true, false]);
         for _ in 1..RX_SLOTS {
             assert!(p.receive(&frame()));
         }
