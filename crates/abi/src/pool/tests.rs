@@ -17,10 +17,15 @@ struct Span {
 }
 impl Span {
     fn new(layout: Layout) -> Self {
+        Self::with_guard(layout, 0)
+    }
+    /// With `guard` words after the span, set to a sentinel: a reader that runs past the ring's end reads them.
+    fn with_guard(layout: Layout, guard: usize) -> Self {
         assert!(layout.valid());
+        let words = layout.span_bytes() / 8;
         Self {
-            memory: (0..layout.span_bytes() / 8)
-                .map(|_| AtomicU64::new(0))
+            memory: (0..words + guard)
+                .map(|i| AtomicU64::new(if i < words { 0 } else { 0x6a6a_6a6a_6a6a_6a6a }))
                 .collect(),
             layout,
         }
@@ -596,7 +601,7 @@ fn forged_header_inside_a_newer_entrys_prefix_is_refused() {
     );
     // The forgery is what a reader would decode at that place, were it not refused.
     let mut raw = vec![0u8; 192];
-    pool.copy_out(old as usize % TINY.ring_bytes, &mut raw);
+    assert!(pool.copy_out(old as usize % TINY.ring_bytes, &mut raw));
     assert_eq!(decode(&raw).unwrap().position, old);
     assert_eq!(
         pool.fetch(old, &mut staging).err(),
@@ -870,4 +875,38 @@ fn readers_never_accept_a_torn_or_forged_entry() {
         n(&accepted) > 1000 && n(&forgeries) > 500 && n(&overwritten) > 1000,
         "the run did not exercise the protocol"
     );
+}
+
+/// The ring-end bound: a slot (stale, or a defect) whose place lies near the ring's end, where the bytes after it are not the
+/// ring's: the header's length would run past the end, or the header itself does. The bytes there form, together with the
+/// guard after the span, a whole valid entry for exactly that position, so only the bound refuses it.
+#[test]
+fn an_entry_never_extends_past_the_rings_end() {
+    let span = Span::with_guard(TINY, 2048);
+    let (pool, _writer) = (span.pool(), span.writer());
+    let mut staging = vec![0u8; MAX_ENTRY_BYTES];
+    let mut buffer = vec![0u8; SCRATCH];
+    let ring = TINY.ring_bytes;
+    // (entry size, its place: the header fits before the ring's end or it does not, the entry never does)
+    for (n, place, want) in [
+        (1024, ring - 128, Refusal::Length),
+        (192, ring - 128, Refusal::Length),
+        (192, ring - 64, Refusal::Position),
+        (1024, ring - 64, Refusal::Position),
+    ] {
+        let o = sized(n, 1, 0x1000, [1, 2, 3, 4]);
+        let position = place as u64; // lap 0, and the tail is 0
+        o.parts().encode(position, &mut buffer).unwrap();
+        let first = (TINY.ring_offset() + place) / 8;
+        for (i, w) in buffer[..n].chunks_exact(8).enumerate() {
+            span.memory[first + i]
+                .store(u64::from_le_bytes(w.try_into().unwrap()), Ordering::Relaxed);
+        }
+        assert!(decode(&buffer[..n]).is_ok());
+        assert_eq!(
+            pool.fetch(position, &mut staging).err(),
+            Some(want),
+            "{n} bytes at place {place}"
+        );
+    }
 }

@@ -16,6 +16,26 @@
 //! is not below the tail. If any copied byte came from a later entry, the tail store that preceded it is visible to that
 //! load, so the entry is refused; every check then reads the private copy. Nothing in the resident admits code again:
 //! these two checks are what containment of the pool's code rests on.
+//!
+//! The argument (message passing with a fence on each side; no test can show a missing fence on this hardware, so this is
+//! the evidence). Notation: the writer's publication q covers the positions `[q, q + n)` and its ring place overwrites the
+//! positions `[q - ring, q + n - ring)`; its tail is `T_q = q + n - ring`, stored before its data.
+//! 1. Writer, per publication: tail store (relaxed); `fence(Release)`; data stores (relaxed); slot store (release).
+//! 2. Reader, per lookup: slot load (acquire); data loads (relaxed); `fence(Acquire)`; tail load (relaxed).
+//! 3. Suppose the reader accepted position p with `p >= tail` as loaded, yet some word it copied from `[p, p + len)` was
+//!    stored by a later publication q (the only way a word is not p's own: p's own publication happened before the slot it
+//!    named was visible, step 5). That store overwrote a position `x` in `[p, p + len)`, so `x < T_q`, hence `T_q > p`.
+//! 4. The load that returned q's word reads from a store that follows q's release fence in program order, and the reader's
+//!    acquire fence follows that load: the release fence synchronizes with the acquire fence, so q's tail store
+//!    happens-before the reader's tail load. The load therefore returns `T_q` or a later value; the tail never decreases
+//!    (`T` grows with the end of each publication), so it is `>= T_q > p`: the entry is refused (`Overwritten`). Nothing
+//!    but the tail load decides it, and it follows every data load.
+//! 5. Words that are p's own are complete: the slot naming p was stored (release) after p's data, and the reader's slot
+//!    load was acquire, so p's data stores are visible to its copy. A slot left over from an earlier lap names a position
+//!    below the tail once its place is reused, so step 3 refuses it whatever bytes it now finds there (B1). A slot stored
+//!    ahead of its data (a writer defect) finds another position's header at its place: the position check refuses it.
+//! 6. The header's `len` is read from the same copy before the rest is copied; it is untrusted, bounded by the staging area,
+//!    [`MAX_ENTRY_BYTES`] and the ring's end before any further load, and is only believed after step 4.
 use crate::code_object::Site;
 use crate::execution::{
     LinkPoint, MAX_LINK_POINTS, STAGING_BYTES,
@@ -406,13 +426,22 @@ impl Pool {
         }
         found
     }
-    /// Copies the `n` bytes at ring `place` into `out` word by word (relaxed atomic loads: the writer may be storing).
-    fn copy_out(&self, place: usize, out: &mut [u8]) {
-        debug_assert!(place % 8 == 0 && out.len() % 8 == 0);
+    /// Copies the `out.len()` bytes at ring `place` into `out` word by word (relaxed atomic loads: the writer may be
+    /// storing); false, nothing read, unless they lie inside the ring (and are whole words).
+    fn copy_out(&self, place: usize, out: &mut [u8]) -> bool {
+        if place % 8 != 0
+            || out.len() % 8 != 0
+            || place
+                .checked_add(out.len())
+                .is_none_or(|end| end > self.layout.ring_bytes)
+        {
+            return false;
+        }
         let at = self.layout.ring_offset() + place;
         for (i, w) in out.chunks_exact_mut(8).enumerate() {
             w.copy_from_slice(&self.word(at + 8 * i).load(Relaxed).to_le_bytes());
         }
+        true
     }
     /// The entry published at `position` (a slot's), copied into `staging` and decoded from the copy: its header first,
     /// then as many bytes as its length says (refused if that exceeds `staging` or [`MAX_ENTRY_BYTES`] or the ring's
@@ -429,7 +458,13 @@ impl Pool {
         if cap < HEADER_BYTES {
             return Err(Refusal::Length);
         }
-        self.copy_out(place, &mut staging[..HEADER_BYTES]);
+        // A place whose header would run past the ring's end holds no entry (they never straddle it): a slot like that is a
+        // defect or a stale one over bytes that are not ours.
+        if place + HEADER_BYTES > ring as usize
+            || !self.copy_out(place, &mut staging[..HEADER_BYTES])
+        {
+            return Err(Refusal::Position);
+        }
         let len = u32::from_le_bytes(staging[24..28].try_into().unwrap()) as usize;
         if len < HEADER_BYTES || len > cap || len % ALIGN != 0 || place + len > ring as usize {
             // The header may be a later entry's, torn or not: below the tail it is just overwritten.
@@ -440,7 +475,10 @@ impl Pool {
                 Refusal::Length
             });
         }
-        self.copy_out(place + HEADER_BYTES, &mut staging[HEADER_BYTES..len]);
+        if !self.copy_out(place + HEADER_BYTES, &mut staging[HEADER_BYTES..len]) {
+            return Err(Refusal::Length);
+        }
+        // Every load of the copy is before this fence and the tail load after it (module doc, steps 3-4).
         fence(Acquire);
         let tail = self.tail();
         if position < tail {
@@ -530,6 +568,8 @@ impl Writer {
     }
     /// The tail first (relaxed), then the release fence that orders it before every data store that follows (an entry of
     /// `n` bytes at `position` overwrites the positions `[position - ring, position + n - ring)`). Returns its place.
+    /// This fence is what a reader's acquire fence pairs with (module doc, step 4): a release store of the tail would
+    /// order the tail after earlier stores, not before the later data stores (review finding B2).
     fn begin(&mut self, position: u64, n: usize) -> usize {
         let ring = self.pool.layout.ring_bytes as u64;
         self.tail = (position + n as u64).saturating_sub(ring);
