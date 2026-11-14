@@ -358,6 +358,20 @@ Rules learned in this round:
     -31%). This ends the architecture review's gated roadmap (groups R, H, F); next by share is guest code (group G,
     sampler first).
 
+38. **Guest-code deep review (findings only; owner: no fixing at the end of the weekly window)**
+    ([guest-code-review-20261114](guest-code-review-20261114.md), Fable; fexc run directly on cc1/libc/dash/kernel and
+    bench bytes; no VM). Guest time is ~37% of configure's busy time and ~68% of make's, ~4.7x / ~3.3-3.8x native.
+    FEX's own instruction selection is not the gap (2.2-2.3 Arm words per x86 instruction); natemu's code is
+    2.9-3.2 linked (~1.3-1.4x), the extra being exactness/containment glue: split-store checks (~6-9% of guest time,
+    measured ceiling), load-then-move, per-RMW `mrs nzcv`, and the computed-exit sequence through the shared dispatcher
+    (15 words, an indirect branch whose target varies by RIP; 15-16.5% of build's EL0 samples measured, inferred 10-17%
+    of make's guest). Other items: possible cold predictor/cache state after each return from EL1 (unmeasured,
+    configure 10-25%?), REP MOVS one element per pass (bulk only for STOS), flags materialisation (3-6%), glibc AVX2
+    string functions (vpmovmskb 24 words), code footprint ~17 B per x86 instruction. Not costs: memory ordering,
+    address guard, alignment checks. All configure/make shares are inferred — neither step has been sampled; the review
+    specifies a resident timer sampler (no PMU under HVF) as the first step next window. Candidates are listed, not
+    recommended; any translator (FEX) change is the owner's call.
+
 ## Configure's busy time (clean round, 119 vCPU-s; buckets exclusive)
 
 Guest 30.8%; translation requests ~16% without the timing log (compile 4.7 s, admission 3.6, lookup/fetch/put/relocate
