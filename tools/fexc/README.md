@@ -428,7 +428,7 @@ Body rewrite (AFP fallback plan, chunk 1): `NATEMU_REPLAY_ADD_ARGS="--feature af
 `no_afp`). The replies differ from the recorded ones by design, so D = 0 no longer applies: the test compares the new compiler under the
 added arguments with the old one on the recorded bytes, which shows what M2 emulation changes (`--report` through
 `NATEMU_REPLAY_ARGS` prints the replies' summaries). The host-built arguments that depend on `no_afp` (`--x87-fpcr`) are not rewritten: they are unit-tested
-(`with_afp_on_the_fp_words_are_unchanged_for_every_mxcsr_and_fcw`). M2 emulation (`NATEMU_FEXC_FEATURE_OFF=afp`) needs a fexc built at or after `afp-c1-fexc-20261115-01`: an older shim would load the host's `X87_FPCR_EXPLICIT` (bit 32) into FPCR.
+(`with_afp_on_the_fp_words_are_unchanged_for_every_mxcsr_and_fcw`). `NATEMU_REPLAY_OLD_ADD_ARGS` adds arguments to the old compiler's bodies the same way: with both set equal the replies must be identical in code, JSON and object (only `args_read` may differ: a compiler reading more arguments), the common-mode check of a later chunk against the previous compiler. M2 emulation (`NATEMU_FEXC_FEATURE_OFF=afp`) needs a fexc built at or after `afp-c1-fexc-20261115-01`: an older shim would load the host's `X87_FPCR_EXPLICIT` (bit 32) into FPCR.
 
 **DAZ and FTZ without AFP** (AFP fallback chunk 3a, plan rows 4-6 and row 3's unmasked-PE part; none of it with AFP). `--daz` and
 `--ftz`, which the host sends only when `Cpu::no_afp` and MXCSR.DAZ, or effective FTZ (FTZ with UM masked), are set, are read only by
