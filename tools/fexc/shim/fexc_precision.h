@@ -229,7 +229,12 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           size_t Last = First;
           for (size_t i = 0; i < First; ++i) if (SimdFPOp(Insn[i].second)) Last = i;
           for (size_t i = 0; i < Last; ++i) if (SimdFPOp(Insn[i].second)) {
-            IREmit->SetWriteCursor(Insn[i].first);
+            // a step's check follows its flush (PlaceFlushes ran first): the flush's UFC/IXC belong to this step, not the next
+            Ref At = Insn[i].first;
+            for (size_t j = i + 1; j < Insn.size() && Insn[j].second == OP_FEXCFLUSH &&
+                                   IR.GetNode(IR.template GetOp<IROp_Header>(Insn[j].first)->Args[0]) == At; ++j)
+              At = Insn[j].first;
+            IREmit->SetWriteCursor(At);
             IREmit->_FexcSimdCheck(Mask);
           }
         }
