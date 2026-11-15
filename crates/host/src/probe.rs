@@ -48,10 +48,11 @@ impl Probe {
             .map(|(n, ..)| n)
             .collect()
     }
-    /// The refusal, listing everything missing at once; `None` when the host has all.
+    /// The refusal, listing everything missing at once (`host lacks lse2 pmull128`; the CLI adds its `natemu: ` prefix);
+    /// `None` when the host has all.
     pub(crate) fn refusal(&self) -> Option<String> {
         let missing = self.missing();
-        (!missing.is_empty()).then(|| format!("natemu: host lacks {}", missing.join(" ")))
+        (!missing.is_empty()).then(|| format!("host lacks {}", missing.join(" ")))
     }
     /// The terse startup line, `None` when there is nothing to say. Only the host part exists so far: `natemu: cpu host
     /// -afp` for a host without AFP. Hook for the guest feature map (generated constants, a later chunk): it becomes the
@@ -70,10 +71,15 @@ impl Probe {
 }
 
 /// The startup probe for a created vCPU: refuses with one message, prints the startup line once per process, and
-/// returns the probe. Call after the resident's setup (`execution::enter`).
+/// returns the probe. Called at the end of `execution::enter` (after the resident's setup wrote ACTLR_EL1), which is in
+/// the owners' setup error path: one setup error reaches the caller, and the CLI prints it once as `natemu: host lacks ...`.
 pub(crate) fn startup(cpu: &Vcpu) -> Result<Probe, String> {
+    startup_with(Probe::read(cpu)?)
+}
+/// [`startup`] on a probe already read: the bare refusal string, or the startup line (stderr, once per process, with
+/// its own `natemu: ` prefix since no error path prints it).
+fn startup_with(probe: Probe) -> Result<Probe, String> {
     static PRINTED: OnceLock<()> = OnceLock::new();
-    let probe = Probe::read(cpu)?;
     if let Some(refusal) = probe.refusal() {
         return Err(refusal);
     }
@@ -84,29 +90,31 @@ pub(crate) fn startup(cpu: &Vcpu) -> Result<Probe, String> {
 }
 
 /// The hypervisor's configuration view of the ID registers (no VM or vCPU needed; they agree on every register natemu
-/// reads), for the answers needed before any vCPU exists: CSV3 and SB. Cached; `None` when unreadable (then absent).
-fn config_view() -> Option<&'static [u64; ID_REGISTERS.len()]> {
-    static VIEW: OnceLock<Option<[u64; ID_REGISTERS.len()]>> = OnceLock::new();
+/// reads), for the answers needed before any vCPU exists: CSV3 and SB. Cached, the error too: a hypervisor failure is
+/// reported as such, never as an absent feature.
+fn config_view() -> Result<&'static [u64; ID_REGISTERS.len()], String> {
+    static VIEW: OnceLock<Result<[u64; ID_REGISTERS.len()], String>> = OnceLock::new();
     VIEW.get_or_init(|| {
         let mut id = [0; ID_REGISTERS.len()];
-        for (value, reg) in id.iter_mut().zip(CONFIG_REGISTERS) {
-            *value = config_id_register(reg).ok()?;
+        for ((value, reg), (name, _)) in id.iter_mut().zip(CONFIG_REGISTERS).zip(ID_REGISTERS) {
+            *value = config_id_register(reg).map_err(|e| format!("{name}: {e}"))?;
         }
-        Some(id)
+        Ok(id)
     })
     .as_ref()
+    .map_err(Clone::clone)
 }
-fn machine(name: &str) -> bool {
+fn machine(name: &str) -> Result<bool, String> {
     let row = MACHINE.iter().find(|r| r.0 == name).expect("machine row");
-    config_view().is_some_and(|id| detected(&row.1, id, true))
+    Ok(detected(&row.1, config_view()?, true))
 }
 /// FEAT_CSV3 (ID_AA64PFR0_EL1[63:60]): the host's loads do not pass faulting data on (the only condition for RDCL_NO
-/// besides `--speculation-barriers`).
-pub(crate) fn csv3() -> bool {
+/// besides `--speculation-barriers`). An error when the hypervisor cannot be read.
+pub(crate) fn csv3() -> Result<bool, String> {
     machine("csv3")
 }
 /// FEAT_SB (ID_AA64ISAR1_EL1[39:36]): the page-walk barriers' leaf instruction.
-pub(crate) fn sb() -> bool {
+pub(crate) fn sb() -> Result<bool, String> {
     machine("sb")
 }
 
@@ -147,7 +155,7 @@ mod tests {
         });
         assert_eq!(
             p.refusal().as_deref(),
-            Some("natemu: host lacks atomics_lse flagm lse2")
+            Some("host lacks atomics_lse flagm lse2")
         );
         // Each alone, and the TSO bit and PMULL (AES field 1: AES yes, PMULL no).
         assert_eq!(probe(|p| p.id[5] = 0).missing(), ["lse2"]);
@@ -158,7 +166,27 @@ mod tests {
         );
         assert_eq!(
             probe(|p| p.id[0] = 0).refusal().as_deref(),
-            Some("natemu: host lacks atomics_lse flagm crc32 aes sha pmull128")
+            Some("host lacks atomics_lse flagm crc32 aes sha pmull128")
+        );
+    }
+
+    #[test]
+    fn the_startup_refusal_is_the_bare_string() {
+        // One line `natemu: host lacks ...` reaches the user: the CLI (and the driver's main) add the prefix once.
+        let bad = probe(|p| p.id[5] = 0);
+        assert_eq!(startup_with(bad).unwrap_err(), "host lacks lse2");
+        assert!(startup_with(probe(|_| {})).is_ok());
+    }
+
+    #[test]
+    fn fp_and_advsimd_are_probed() {
+        // PFR0.FP [19:16] and AdvSIMD [23:20] read 0xF when absent (0 and 1 are implemented).
+        assert_eq!(probe(|p| p.id[2] |= 0xf << 16).missing(), ["fp"]);
+        assert_eq!(probe(|p| p.id[2] |= 0xf << 20).missing(), ["advsimd"]);
+        assert_eq!(probe(|p| p.id[2] |= 1 << 16 | 1 << 20).missing(), Vec::<&str>::new());
+        assert_eq!(
+            probe(|p| p.id[2] |= 0xff << 16).refusal().as_deref(),
+            Some("host lacks fp advsimd")
         );
     }
 
@@ -176,8 +204,7 @@ mod tests {
     #[ignore = "real host: compares the hypervisor's registers with sysctl"]
     fn csv3_and_sb_from_registers_equal_sysctl() {
         let sysctl = |n: &str| crate::execution::host_feature(n);
-        assert_eq!(csv3(), sysctl("FEAT_CSV3"));
-        assert_eq!(sb(), sysctl("FEAT_SB"));
-        assert!(config_view().is_some());
+        assert_eq!(csv3(), Ok(sysctl("FEAT_CSV3")));
+        assert_eq!(sb(), Ok(sysctl("FEAT_SB")));
     }
 }
