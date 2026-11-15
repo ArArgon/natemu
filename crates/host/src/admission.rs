@@ -113,7 +113,8 @@ pub(crate) const FEATURES: [Feature; 32] = [
         encodes: "AXFLAG/XAFLAG (SSE compare flags)",
         ..feature("flagm2", Fields(&[(ISAR0, 52, 2)]), Speed, true)
     },
-    feature("fcma", Fields(&[(ISAR1, 16, 1)]), Speed, true),
+    // Exactness, not Speed: FEX's ADDSUBPS fallback without FCMA flips a NaN's sign (AFP inventory 1.4).
+    feature("fcma", Fields(&[(ISAR1, 16, 1)]), Exactness, true),
     feature("crc32", Fields(&[(ISAR0, 16, 1)]), Required, true),
     feature("aes", Fields(&[(ISAR0, 4, 1)]), Required, true),
     feature("sha", Fields(&[(ISAR0, 8, 1), (ISAR0, 12, 1)]), Required, true),

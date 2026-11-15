@@ -51,6 +51,10 @@ Other distributions and kernels are untested. Major features still missing:
   import, so an older macOS refuses to load the binary. There is no runtime check for it. At startup natemu checks the
   vCPU for the hardware features it needs (FlagM, LSE, LSE2, the crypto extensions, Apple's TSO bit) and
   fails with one line naming everything missing, for example `natemu: host lacks lse2 pmull128`.
+  A boot prints one line naming the guest CPU, as the x86-64-v3 level plus what it adds, for example
+  `natemu: cpu x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt`.
+  The guest CPU is computed from the host's features. On a Mac without FEAT_AFP (M1, M2) the line ends `; host -afp`,
+  and some x86 floating-point corner cases differ (being fixed: the AFP fallback plan).
 - Xcode Command Line Tools (`xcode-select --install`)
 - [rustup](https://rustup.rs). The repository pins the Rust version, and rustup installs it automatically.
 - [Homebrew](https://brew.sh) packages: `brew install cmake ninja pkg-config libslirp e2fsprogs`
