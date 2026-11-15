@@ -24,9 +24,15 @@ Every AFP behaviour in the Arm pseudocode depends on FPCR.AH, FIZ or NEP being s
 gated that way (inventory 0, confirmed by the review). So an M4 with those three clear, and fexc told `afp=0`, is
 architecturally the M2's floating-point machine.
 
-Chunk 1 adds one input both sides share: a host-AFP bit in `Cpu`. Every host-independent function reads it: `fpcr`,
-`x87_fpcr`, `mxcsr_flags`, `simd_fault_flags`, `code_context` and the host's x87 and FPCR arguments to fexc. The host
-sets it from the probe after `NATEMU_FEXC_FEATURE_OFF`, so the host and the resident compute the same values. With it,
+Chunk 1 adds one input both sides share: a `no_afp` bit in `Cpu`. Every host-independent function reads it: `fpcr`,
+`x87_fpcr`, `mxcsr_flags`, `simd_fault_flags`, `code_context` and the host's x87 and FPCR arguments to fexc.
+
+The polarity is chosen so that zero is today's behaviour. Many places build a `Cpu` before the probe runs: the loader,
+`ap_wake`, the driver programs and the host's `test_cpu`. With this polarity none of them silently gets M2 FPCR words.
+
+The host sets the bit once, from the same `supported` value fexc is told, after `NATEMU_FEXC_FEATURE_OFF`, and before
+the first lookup. `x87_args` asserts that the bit agrees with `supported`'s afp bit. The resident's copy-and-restore
+paths carry the bit along, and the template pool keys on `code_context`. With it,
 `NATEMU_FEXC_FEATURE_OFF=afp` on the M4 is full M2 emulation:
 - All development, tests and benchmarks run on the M4 that way.
 - One confirming run on the real M2 (the owner) closes it.
@@ -41,7 +47,7 @@ Costs are in Arm instructions per affected x86 instruction, with constants hoist
 | --- | --- | --- | --- | --- |
 | 1 | `fpcr` writes RES0 bits; can't emulate an M2 (1) | the shared AFP bit (§1) | 0 | 0 |
 | 2 | MINSS/MAXSS/MINSD/MAXSD miss IE for a QNaN: FEX's non-AFP scalar path uses the quiet `fcmp` (1.5) | `fcmpe` in that path (fork patch) | 0 | 0 |
-| 3 | DAZ + FTZ (gcc `-Ofast`): an FZ flush sets UFC without IXC, so PE is missing (1.7, 1.8) | under effective FTZ, report UFC as UE and PE in `mxcsr_flags` and in `FexcMxcsr`. `FexcMxcsr` tests MXCSR at run time and is emitted only when `afp=0`. Under unmasked PE, add UFC to the check mask and report PE in `simd_fault_flags` | 0 | ~3 per STMXCSR; keyed code only for unmasked PE |
+| 3 | DAZ + FTZ (gcc `-Ofast`): an FZ flush sets UFC without IXC, so PE is missing (1.7, 1.8) | under effective FTZ, report UFC as UE and PE in `mxcsr_flags` and in `FexcMxcsr`. `FexcMxcsr` tests MXCSR at run time and is emitted only when `afp=0`. Under unmasked PE, add UFC to the check mask and report PE in `simd_fault_flags` | ~3 per STMXCSR (a rare instruction) | the same; keyed code only for unmasked PE |
 | 4 | DAZ alone does nothing, because FIZ is RES0 (1.7) | FZ = 0 and a software input flush per FP source (`cmtst`, `orr`, `and`: signed zero), in code keyed DAZ-only, following an op table (§2.1) | 0 | 3 per source |
 | 5 | FTZ alone also flushes inputs, and the flush lacks IXC (1.7) | FZ = 0 and a software output flush; an `fmul` by 1−2^-p raises UFC and IXC exactly for flushed lanes (verified by the review); code keyed FTZ-only; op table §2.1 | 0 | ~5 per result |
 | 6 | MIN/MAX under DAZ return the raw denormal (1.5 C) | under DAZ + FTZ, flush the selected result (3); under DAZ alone, row 4's input flush covers it | 0 | 3 per MIN/MAX |
@@ -72,6 +78,27 @@ every lowered op whether it gets the input flush, the output flush and the NaN g
 - **DPPS/DPPD and HADD/HSUB:** every intermediate step.
 - **MIN/MAX:** no NaN guard. They return a raw SNaN as x86 does, and `fcmeq` on it would raise IOC.
 - **Scalar ops:** the guard tests lane 0 only; upper lanes often hold NaN bit patterns.
+- **Conversions get no NaN guard:** FCVT, FCVTN, FCVTL, FRINT*, SCVTF and the conversions to integer.
+  `FPConvert` returns `FPConvertNaN` unless FPCR.DN is set, which doesn't depend on AH, so a guard would be wrong
+  across formats.
+
+**Fix-up rules per op class (required before chunk 4b, reviewed with it).** The fix-up is defined per FEX IR op, on the
+op's sources before lowering, with AH = 1's `FPNeg` keeping a NaN's sign. This matters because some lowerings negate in
+a separate word: VFMLS on ASIMD is `fneg` of the addend, then `fmla`.
+
+| Op class | Fix-up rule |
+| --- | --- |
+| Binary (FADD, FSUB, FMUL, FDIV, …) | source 1's NaN quieted, else source 2's, else the negative default NaN |
+| Unary FSQRT | the input's NaN quieted, else the negative default NaN |
+| FMA family | Rn, Rm, addend order; negations leave a NaN alone |
+| FADDP (HADD/HSUB) | the even and odd elements of the concatenated sources (`uzp1`/`uzp2`) |
+| FCADD #90 (ADDSUB) | operand 2's element swap plus its negation |
+| By-element FMLA/FMUL | the broadcast lane |
+| DPPS/DPPD | each intermediate product and sum |
+
+The table states, for each class, the temporaries it needs within the VTMP1/VTMP2 budget. Where the destination
+aliases a source, VTMP1 holds the result and the guard sits before the final `mov`, using only VTMP2. An op class that
+doesn't fit the budget is refused rather than spilled.
 
 ### 2.2 The NaN guard's placement and cost (decision A)
 
@@ -97,7 +124,12 @@ words of code size per op, executed only for NaN results. Temporaries use the em
 allocator values, so a guarded op needs no spill (a spill at one instruction is #UD in admission).
 
 **x87 is cheaper:** both of x87's wrong NaN cases under AH = 0 raise IOC, and `FexcX87End` already reads FPSR, so a
-single `tbnz` selects the fix-up.
+single `tbnz` selects the fix-up. `FexcX87End` is generic and runs after the stores, so the fix-up is emitted per x87
+instruction, with its op and a copy of the source it overwrites. That copy is a hot-path cost too, so x87 costs about 2
+instructions, not 1.
+
+IOC is also raised where the result is already right (FCOM on a NaN, FIST invalid, an SNaN load); for those
+instructions the fix-up leaves the result alone.
 
 **The rejected alternative:** detecting through FPSR.IOC for SSE too. Reading FPSR waits for every in-flight FP op, and
 the FMA cases with quiet NaNs raise no IOC.
@@ -142,8 +174,9 @@ deviation from the SDM on hosts without AFP. The M4 is unaffected either way.
 
 Every chunk keeps the M4 byte-identical:
 - replay of both recorded streams (`natemu-raw/cpu-c0-stream-20261115-02`) against the new fexc, 0 differences;
-- a unit test that, with AFP on, `code_context`, `fpcr`, `x87_fpcr`, `mxcsr_flags` and the x87 arguments are unchanged
-  for every MXCSR value and every FCW.RC.
+- a unit test that, with AFP on, `code_context`, `fpcr`, `x87_fpcr`, `mxcsr_flags` and `x87_args` are unchanged for
+  every MXCSR value (all 16 bits), every FCW.RC and every combination of FCW's six mask bits. The replay gate can't see
+  request bodies the host builds, so the test has to.
 
 Every functional gate runs in M2 emulation on the M4. Each chunk includes the admission and check-shape updates its
 code needs (`admission/structure.rs`). The full suite runs once, before merge.
@@ -153,7 +186,7 @@ code needs (`admission/structure.rs`). The full suite runs once, before merge.
 | 1. Emulation and baseline | the shared AFP bit; `fpcr`, `x87_fpcr`, `mxcsr_flags` and `code_context` follow it; the replay body-rewrite hook; unit tests updated | M4 byte-identity (both checks above). In M2 emulation, run the AFP-dependent runners (`run_i5a_de.py`, `run_i5c.py`, `run_i6_faults.py`, `run_i8_faults.py`, `run_i5b.py images`, the FEX ASM suite) and the QEMU corpora (`gen_i5a`/`gen_i6`/`gen_i8` comparisons): record the failing cases. This is the work list, and checks the inventory's predictions |
 | 2. Common-mode zero-cost fixes | rows 2, 3 | M4 byte-identity; in M2 emulation, the affected runner cases pass |
 | 3. Keyed rare modes | the key bits on hosts without AFP (DAZ, effective FTZ; x87 DE unmasked already keyed), reaching both sides and fexc's arguments; rows 4, 5, 6, 7, 8, 10 and row 3's unmasked-PE part; op tables §2.1 | M4 byte-identity; in M2 emulation, `run_i5c.py` DAZ, FTZ and unmasked cases, `run_i6_faults.py` x87 DE, and the corpora's DAZ/FTZ groups pass. A common-mode replay in M2 emulation shows these rows add no code there |
-| 4. NaN guard (decision A) | 4a: the guard with an empty fix-up, measured. 4b: the fix-up (§2.2), the x87 `tbnz` path, op tables | 4a: the benchmark gate of decision A. 4b: in M2 emulation, the NaN cases of the corpora and runners pass, and the gate is re-measured |
+| 4. NaN guard (decision A) | 4a: the guard with an empty fix-up, measured. 4b, which starts only after the per-op-class fix-up table (§2.1) has been reviewed: the fix-ups, the x87 path, op tables | 4a: the benchmark gate of decision A. 4b: in M2 emulation, the NaN cases of the corpora and runners pass, and the gate is re-measured |
 | 5. Records and the M2 run | declared deviations (per the owner's decisions) in the README, the contracts and the startup line's `host -afp`; the owner runs the probe tool and the runner subset on the M2 | the M2 run matches M2 emulation |
 
 **Performance method.** This follows the standing rules:
@@ -180,7 +213,7 @@ Rows 2-10's common-mode cost is checked structurally, by a common-mode replay in
 | Date | Chunk | State | Evidence |
 | --- | --- | --- | --- |
 | Nov 15 | research | done: [inventory](afp-inventory.md) | read-only; Arm ASL (Sail), code, SDM |
-| Nov 15 | plan | first draft reviewed (accept with required changes); revised (this text) | §7 |
+| Nov 15 | plan | reviewed twice; second round: accept with required changes, nothing blocks chunks 1-4a; answered (this text). The per-op-class fix-up table (§2.1) is reviewed before chunk 4b | §7 |
 
 ## 7. Review response (independent review, November 15)
 
@@ -199,3 +232,8 @@ Rows 2-10's common-mode cost is checked structurally, by a common-mode replay in
 | 11 | Row 9's slow path hides an SSE emulator | decision C |
 | 12 | Concessions decided without the owner; decision B argued from one guest | §3: decisions B, C and D; each states the SDM deviation and the exact cost |
 | 13 | Admission is never mentioned | §4: each chunk includes its admission and check-shape updates |
+| R1 | Second round: `Cpu` bit polarity and when it is set | `no_afp` (zero = today); set once from `supported` after the override; asserted in `x87_args` |
+| R2 | The test must cover FCW masks and `x87_args` | §4: all MXCSR bits × FCW.RC × the six masks, including `x87_args` |
+| R3 | "AH = 1 on the Arm op's operands" is undefined across multi-word lowerings, FADDP/FCADD/by-element/DPPS, FSQRT and conversions | §2.1: per-IR-op fix-up rules with the temporaries budget, reviewed before chunk 4b; FSQRT's rule; conversions get no guard |
+| R4 | x87 fix-up needs the operands; IOC also arises where the result is already right | §2.2: per-instruction fix-up with a copy (~2 instructions); IOC-but-correct cases left alone |
+| R5 | Row 3's common-mode cost | ~3 per STMXCSR |
