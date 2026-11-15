@@ -71,7 +71,19 @@ both transports, a `run.sh`, and four runs marked NOT A RESULT because the machi
   hackbench per arm (`hb/`): means 3.52 s main, 3.62 branch, 3.57 with polling off, 3.57 with the fix. The spreads are
   about 0.6 s, so this is at most a ~3% halt-polling cost and is not resolved. The default launch is not byte for byte
   `main`'s: the disk's 256-entry queue, seg_max 126 and halt polling apply to MMIO too.
-- Not rerun on the M4: the PCI-against-MMIO disk and network rounds (M2 Max numbers in io-benchmarks.md) and IO5.
+- Final commit 0dfd58f: full suite 171/173, only `host-full` on both transports (`pci-rebase-suite-20261114-02`).
+- PCI rechecks on 0dfd58f (`natemu-raw/pci-recheck-20261114-01`, binaries pinned in `bin/`): boots at 1/2/4 vCPUs (four
+  functions, MSI-X counting, no complaint lines, data and network checks), `pci=nomsi` at 2 and 4 (IO-APIC lines), the
+  mixed launch, an MMIO control, a network vector moved to CPUs 2 and 3 under traffic (counts moved, traffic went on),
+  and the block runner over PCI at 1/2/4 vCPUs all pass. Depth-1 4 KiB direct `dd` at 1 vCPU, two boots each (warm runs):
+  reads 0.096-0.102 s PCI against 0.115-0.118 s MMIO, writes 0.100-0.101 against 0.119-0.122.
+- Exit-count gate, the whole fio matrix at 2 vCPUs with the perf log (`gatec-*`): PCI 0 EOI exits on both vCPUs and
+  10,697 device exits for 9,648 queue notifications (the rest is setup); MMIO 182,655 EOI exits, 182,818 status reads
+  and acknowledges, 611,235 device exits. The notification count is per device, not per vCPU.
+- Disk matrix on the M4 (`matrix-table.txt`, kIOPS; one PCI run, two MMIO runs per cell): at 1 vCPU PCI is ahead on
+  every queued job (rand-read 4k q16 106 against 42-49) and level on fsync; at 4 vCPUs ahead on 4 KiB jobs (q16 121
+  against 91-93, four jobs 283 against 239) and level on 128 KiB (reads 33.5 against 35-36, writes 20.2 against
+  16-21). Not rerun on the M4: the network round (level on the M2 Max) and IO5.
 
 
 **Status, November 14 (branch `halt-poll`, on `pci`; an M2 Max without the M4's `natemu-raw`):** items 2 to 4 are
