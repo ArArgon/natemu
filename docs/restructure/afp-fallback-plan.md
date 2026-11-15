@@ -214,6 +214,7 @@ Rows 2-10's common-mode cost is checked structurally, by a common-mode replay in
 | --- | --- | --- | --- |
 | Nov 15 | research | done: [inventory](afp-inventory.md) | read-only; Arm ASL (Sail), code, SDM |
 | Nov 15 | plan | reviewed twice; second round: accept with required changes, nothing blocks chunks 1-4a; answered (this text). The per-op-class fix-up table (§2.1) is reviewed before chunk 4b | §7 |
+| Nov 15 | 1. Emulation and baseline | code part running (worktree `afp-c1`, branch `afp-c1-emulation`): `no_afp` in `Cpu`, host-conditional `fpcr`/`x87_fpcr`, exhaustive M4-identity unit test, replay body-rewrite hook. The VM baseline (runners in M2 emulation) follows the cpu-features suite | |
 
 ## 7. Review response (independent review, November 15)
 
