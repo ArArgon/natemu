@@ -1,6 +1,7 @@
 # CPU features and profiles: one source for what the guest sees and what the host offers
 
-Status: revised after independent review (November 15, 2026), branch `cpu-features` off `main` at 333b7b6. No code
+Status: accepted by independent review after three rounds (November 15, 2026; §7); awaiting owner decisions A and B
+(§6), branch `cpu-features` off `main` at 333b7b6. No code
 yet. Owner direction (November 15): build a centralized CPU feature/profile mechanism before deciding which new guest
 features to implement; there is a core (mandatory) set of features (§2.1); the M2 (no FEAT_AFP) floating-point work
 comes after this plan. The review's findings and how
@@ -75,8 +76,9 @@ There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profi
 
   FEX has software fallbacks for many Arm features (SHA, AES), so a feature lists an Arm feature as `required` only when
   no fallback exists.
-- `layout`: true when the feature changes XCR0's valid values, leaf 0xD or the XSAVE image, or when its transaction is
-  compiled into the resident. That covers AVX, MPX, AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
+- `layout`: true when the feature changes XCR0's valid values, leaf 0xD or the XSAVE image, or whose presence the
+  resident tests as a compile-time constant (today XSAVEC and XSAVEOPT; a resident transaction alone, such as RDRAND's or
+  CLWB's, does not make a feature `layout`). That covers AVX, MPX, AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
 - `selectable`: false by default. It may be set only when the feature is not `layout` and every consumer it touches
   tests its gate (§3).
 - `source`: the SDM section and the decision that set its state. The existing `source` strings stay.
@@ -297,4 +299,5 @@ are answered below.
 | R2-5 | The converse check relies on each entry's own list | Negative control added to chunk 3 |
 | R2-6 | Replay design sound; record the fexc hash; disk hygiene | Added to chunk 0 |
 | R2-7 | `core` versus dynamic bits | `core` applies to capability bits; dynamic bits are exempt |
+| R3-1 | Third round, verdict accept. `layout`'s "transaction compiled in" was too broad: it would force every resident-implemented feature into the core set | Narrowed to "presence tested as a compile-time constant" (today XSAVEC and XSAVEOPT) |
 | 12 | Blocking: §5 lacked the real decisions | §6 now lists decision A (runtime selection) and B. B was "subtraction allowed?"; after the owner's core-set direction it became "core membership", which settles subtraction: only optional features can be removed. The routine decisions are recorded as decided |
