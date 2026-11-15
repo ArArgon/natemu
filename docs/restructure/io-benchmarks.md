@@ -1558,12 +1558,19 @@ MMIO. An earlier pair of rounds had MMIO 13% ahead on the single download stream
 network interrupts per queue over PCI was tried and made it slower (uploads 1.8 to 1.4-1.5 Gbit/s); not kept.
 
 Other checks on the branch: a 500 MiB random file and two concurrent copies hash the same before and after a
-power-off (written over PCI, read back over MMIO); 345 unit tests; the quick suite on this machine passes 51 steps,
-and the 34 that fail do so identically on the unmodified `pci` tip or for missing inputs: 24 need reference files
+power-off (written over PCI, read back over MMIO); 345 unit tests. The I/O steps of the suite, in their full form,
+with inputs rebuilt here by `run_virtio_rng.py prepare` and `run_virtio_block.py prepare` from the pinned Debian
+kernel package, the current trixie installer and BusyBox (`natemu-raw/io-inputs-20261114-01`; the network tools
+root is iperf3's and curl's Debian closure extracted, without the CA bundle, which `--offline` does not use):
+`io-coverage` and `io-coverage-pci` pass every case but the known `host-full`, `net-linux` and `net-linux-pci` pass
+all five cases, `virtio-lifecycle` and `virtio-lifecycle-timed` pass, and `run_virtio_block.py run` passes at 1, 2
+and 4 vCPUs on both transports (`net-linux` and `net-linux-pci` must not run at once here: both start host servers
+on the same ports). The quick suite on this machine passes 51 steps; the rest fail identically on the unmodified
+`pci` tip or for missing inputs: 20 need QEMU reference corpora
 that exist only in the M4's `natemu-raw`, `asm`, `i5c`, `i6-faults`, `i8-faults` and `i5b-images` fail
 floating-point cases (denormal and NaN flags; this M2 has no FEAT_AFP, the M4 does), `kicks` sees no stop at a
-resident entry or re-arm, and `system` differs from this machine's QEMU 11.1 in one case. The full suite, the pinned
-matrix runner and the lifecycle and coverage runners have not run on the branch: they need the M4's inputs.
+resident entry or re-arm, and `system` differs from this machine's QEMU 11.1 in one case. The full suite and the
+pinned matrix runner have not run on the branch.
 
 Known limits left in: a request the owner runs inline delays a held interrupt by that disk call; the hold exists
 only over PCI with MSI-X; `tools/run_fio_baselines.py` still gives the QEMU control one queue of 128.

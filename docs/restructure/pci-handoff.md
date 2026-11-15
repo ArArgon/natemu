@@ -62,9 +62,11 @@ done in substance, with a session harness instead of the pinned runners
 ([io-benchmarks.md](io-benchmarks.md), "PCI transport with multiqueue, interrupt hold and a 256-entry ring"):
 PCI against MMIO for disk and network, and the records. The branch also adds, for the disk over PCI, one request
 queue per vCPU, an interrupt hold and a 256-entry ring, and halt polling for both transports; every matrix row and
-every iperf3 measure is at or above the `pci` tip. Still open: item 1 (the full suite needs the M4's inputs; the
-quick suite here passes 51 steps, the rest fail identically on the `pci` tip or for missing inputs), the same
-benchmarks in the pinned form on the M4, and item 5.
+every iperf3 measure is at or above the `pci` tip. The suite's I/O steps pass on the branch with inputs rebuilt
+here (`io-coverage` and `io-coverage-pci` apart from `host-full`, `net-linux`, `net-linux-pci`, both lifecycle
+steps, and the block runner on both transports). Still open: the rest of item 1 (the CPU steps need QEMU reference
+corpora from the M4; the quick suite here passes 51 steps, the rest fail identically on the `pci` tip or for those
+inputs), the same benchmarks in the pinned form on the M4, and item 5.
 
 1. **Full suite, once**: `python3 tools/run_suite.py --out DIR` on the branch tip; expect the known `io-coverage`
    `host-full` failure only (and the same in `io-coverage-pci`).
