@@ -13,6 +13,7 @@
 //! /5`), XGETBV/XSETBV (`0f 01 d0`, `d1`); and forms the presented CPU raises #UD for whatever their operands (unadvertised or VMX/SVM-only instructions). Anything
 //! else (other system instructions, F2/F3 prefixes on other forms, a 66 prefix on a far transfer, an FS/GS override on
 //! INVLPG) is `None`: the vCPU stops with fexc's reason, as for code it cannot compile.
+use natemu_abi::cpu_gates as gf;
 use natemu_abi::execution::{SREG_FS, SREG_GS, System, system};
 
 /// fexc's opcode maps (`FEXC_MAP_PRIMARY`, `FEXC_MAP_TWO`). The two-byte map is reported as 1 even with a 66 prefix (the
@@ -163,6 +164,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         (MAP_TWO, 0x33) => s.kind = system::RDPMC,
         (MAP_TWO, 0xa2) => s.kind = system::CPUID,
         (MAP_TWO, 0x31) => s.kind = system::RDTSC,
+        (MAP_TWO, 0x01) if *bytes.get(at)? == 0xf9 && !advertised(gf::GF_RDTSCP) => {
+            (at, rep_used, s.kind) = (at + 1, true, system::UD);
+        }
         (MAP_TWO, 0x01) if *bytes.get(at)? == 0xf9 => {
             at += 1;
             s.kind = system::RDTSCP;
@@ -179,8 +183,13 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         // X1c: the rest of mod = 11 outside SMSW (/4) and LMSW (/6): PBNDKB (c7), TDX SEAMRET/SEAMOPS (66 cd/ce; reserved
         // without 66), FRED ERETS/ERETU (f2/f3 ca, in c8..cc), UIRET (f3 ec): not advertised; d2, d3, eb, ed and the unprefixed forms are blank
         // in Table A-6 (reserved: #UD, SDM Vol.3 7.15 interrupt 6).
+        // The catalogue's feature of each form ([`group7`]): #UD while it is clear; advertised, the feature's own implementation
+        // decides, and none is built (a stop). The forms of no catalogue feature are #UD whatever the profile.
         (MAP_TWO, 0x01) if matches!(*bytes.get(at)?, 0xc0..=0xcf | 0xd2..=0xdf | 0xe8..=0xef | 0xfa..=0xff) =>
         {
+            if group7(bytes[at]).iter().any(|&f| advertised(f)) {
+                return None;
+            }
             (at, rep_used, s.kind) = (at + 1, true, system::UD);
         }
         // I5b: XGETBV and XSETBV (`0f 01 d0`, `d1`; NP: with 66 not decoded).
@@ -203,6 +212,9 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 // I10: RSTORSSP m64 (f3 0f 01 /5): "#UD If CR4.CET = 0" (CET not advertised); X1c: /5 m without F3 is blank in
                 // Table A-6 (reserved).
                 5 if s.memory == 1 => {
+                    if rep == 0xf3 && advertised(gf::GF_CET_SS) {
+                        return None;
+                    }
                     rep_used = true;
                     system::UD
                 }
@@ -294,22 +306,30 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             s.kind = system::WBINVD;
             rep_used = opcode == 0x09 && rep == 0xf3;
         }
-        // RDRAND (/6; F2/F3 #UD), RDSEED and RDPID (/7, f3), neither advertised: #UD.
+        // RDRAND (/6; F2/F3 #UD), RDSEED and RDPID (/7, f3): #UD while their feature is clear.
         (MAP_TWO, 0xc7) => {
             let reg = rm(bytes, &mut at, rex, &mut s)?;
-            // I5b: XRSTORS, XSAVES m (/3, /5): not advertised (CPUID.(EAX=0DH,ECX=1):EAX[3] = 0), #UD. XSAVEC m (/4, NP; since
+            // I5b: XRSTORS, XSAVES m (/3, /5): #UD while XSAVES (CPUID.(EAX=0DH,ECX=1):EAX[3]) is clear. XSAVEC m (/4, NP; since
             // November 3, EAX[1]): the resident's; with 66/F2/F3 not decoded (a stop, as XSAVE's), #UD while not advertised.
-            (s.kind, rep_used) = if s.memory != 0 && reg == 4 && advertised(XSAVEC_BIT.unwrap()) {
+            (s.kind, rep_used) = if s.memory != 0 && reg == 4 && advertised(gf::GF_XSAVEC) {
                 if operand16 || rep != 0 {
                     return None;
                 }
                 (system::XSAVEC, false)
             } else if s.memory != 0 && (3..=5).contains(&reg) {
+                if reg != 4 && advertised(gf::GF_XSAVES) {
+                    return None;
+                }
                 (system::UD, true)
             } else if s.memory != 0 || reg < 6 {
                 return None; // cmpxchg8b/16b (admitted) and other memory forms are never cut
-            } else if reg == 6 && rep == 0 {
+            } else if reg == 6 && rep == 0 && advertised(gf::GF_RDRAND) {
                 (system::RDRAND, false)
+            } else if reg == 7
+                && ((rep == 0 && advertised(gf::GF_RDSEED))
+                    || (rep == 0xf3 && advertised(gf::GF_RDPID)))
+            {
+                return None; // advertised: built with the feature (none is)
             } else {
                 (system::UD, true)
             };
@@ -317,8 +337,11 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         }
         // VMREAD/VMWRITE outside VMX operation; INVEPT/INVVPID (likewise) and INVPCID (not advertised): #UD. 66/F2 0f 78/79
         // are AMD's SSE4a EXTRQ/INSERTQ (CPUID.80000001H:ECX.SSE4A[6] = 0 on the profile; blank in Intel's Table A-3): #UD.
-        (MAP_TWO, 0x78 | 0x79) | (MAP_0F38, 0x80..=0x82) => (s.kind, rep_used) = (system::UD, true),
-        (MAP_TWO_F3..=MAP_TWO_66, 0x78 | 0x79) if !advertised(SSE4A) => {
+        (MAP_TWO, 0x78 | 0x79) | (MAP_0F38, 0x80 | 0x81) if !advertised(gf::GF_VMX) => {
+            (s.kind, rep_used) = (system::UD, true)
+        }
+        (MAP_0F38, 0x82) if !advertised(gf::GF_INVPCID) => (s.kind, rep_used) = (system::UD, true),
+        (MAP_TWO_F3..=MAP_TWO_66, 0x78 | 0x79) if !advertised(gf::GF_SSE4A) => {
             (s.kind, rep_used) = (system::UD, true)
         }
         // I9: MOVBE with a register operand (SDM MOVBE: #UD); F2 is CRC32, F3 is refused by fexc and a memory MOVBE is
@@ -336,14 +359,24 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
         }
         // (ADCX/ADOX, ADOX with 66 included, are never cut; cut with F3 last: F2 before F3, which the AMD machine runs as ADOX;
         // F2 last, alone or with 66, is #UD there.)
-        (MAP_0F38, 0xf6)
-            if advertised(ADX.unwrap()) && (rep == 0xf3 || (operand16 && rep == 0)) =>
-        {
+        (MAP_0F38, 0xf6) if advertised(gf::GF_ADX) && (rep == 0xf3 || (operand16 && rep == 0)) => {
             return None;
         }
-        (MAP_0F38, 0xf5 | 0xf6) => (s.kind, rep_used) = (system::UD, true),
+        // WRSS (NP f6) and WRUSS (66 f5): #UD while CET_SS is clear; the rest of f5/f6 (and ADCX/ADOX while ADX is clear) always.
+        (MAP_0F38, 0xf5 | 0xf6) => {
+            let wrss = rep == 0
+                && if opcode == 0xf6 {
+                    !operand16
+                } else {
+                    operand16
+                };
+            if wrss && advertised(gf::GF_CET_SS) {
+                return None;
+            }
+            (s.kind, rep_used) = (system::UD, true)
+        }
         (MAP_0F38, 0xc8..=0xcd) | (MAP_0F3A, 0xcc)
-            if !operand16 && rep == 0 && !advertised(SHA.unwrap()) =>
+            if !operand16 && rep == 0 && !advertised(gf::GF_SHA) =>
         {
             s.kind = system::UD
         }
@@ -621,7 +654,7 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
             s.kind = match (s.memory, reg) {
                 // X1c: PTWRITE r/m (F3 /4): "#UD If CPUID.(EAX=14H, ECX=0):EBX.PTWRITE[bit 4] = 0"; leaf 14H is Intel PT's
                 // (CPUID.07H:EBX.PT, not advertised).
-                (_, 4) if rep == 0xf3 && !operand16 && !advertised(PT.unwrap()) => system::UD,
+                (_, 4) if rep == 0xf3 && !operand16 && !advertised(gf::GF_PT) => system::UD,
                 (1, 2) if !operand16 => system::LDMXCSR,
                 (1, 3) if !operand16 => system::STMXCSR,
                 // I5b: FXSAVE, FXRSTOR, XSAVE, XRSTOR (NP); /6 is XSAVEOPT (CPUID.(EAX=0DH,ECX=1):EAX.XSAVEOPT, since November 3:
@@ -631,16 +664,15 @@ pub(crate) fn decode(bytes: &[u8], map: u8, opcode: u8) -> Option<System> {
                 (1, 1) if !operand16 => system::FXRSTOR,
                 (1, 4) if !operand16 => system::XSAVE,
                 (1, 5) if !operand16 => system::XRSTOR,
-                (1, 6) if operand16 && rep == 0 && advertised(CLWB.unwrap()) => system::CLFLUSH,
-                (1, 6) if !operand16 && rep == 0 && advertised(XSAVEOPT_BIT.unwrap()) => {
-                    system::XSAVE
-                }
+                (1, 6) if operand16 && rep == 0 && advertised(gf::GF_CLWB) => system::CLFLUSH,
+                (1, 6) if !operand16 && rep == 0 && advertised(gf::GF_XSAVEOPT) => system::XSAVE,
+                (1, 6) if !operand16 && rep == 0xf3 && advertised(gf::GF_CET_SS) => return None, // CLRSSBSY
                 (1, 6) => system::UD,
-                (1, 7) if operand16 && (rep != 0 || !advertised(CLFLUSHOPT.unwrap())) => system::UD,
+                (1, 7) if operand16 && (rep != 0 || !advertised(gf::GF_CLFLUSHOPT)) => system::UD,
                 (1, 7) if operand16 => system::CLFLUSH,
                 (1, 7) => system::CLFLUSH,
                 (0, 0..=3) if operand16 => return None, // 66 there: no SDM encoding (a stop, not a guess)
-                (0, 0..=3) if rep == 0xf3 => {
+                (0, 0..=3) if rep == 0xf3 && advertised(gf::GF_FSGSBASE) => {
                     rep_used = true;
                     s.size = if w { 8 } else { 4 };
                     [
@@ -720,9 +752,9 @@ pub(crate) fn vex_ud(bytes: &[u8]) -> Option<System> {
     None
 }
 
-/// A CPUID feature bit of the presented CPU: (leaf, subleaf, register EAX..EDX = 0..3, bit), read from the generated
-/// profile (`cpu_profile::CPUID`, from tools/models/cpu_profile.json).
-type Feature = (u32, u32, usize, u32);
+/// A CPUID feature bit of the presented CPU: (leaf, subleaf, register EAX..EDX = 0..3, bit): the catalogue's, generated
+/// (`natemu_abi::cpu_gates`, from tools/models/cpu_profile.json), read from the generated profile (`cpu_profile::CPUID`).
+type Feature = gf::Feature;
 fn advertised((leaf, sub, reg, bit): Feature) -> bool {
     use natemu_abi::cpu_profile::{ANY, CPUID};
     CPUID
@@ -732,38 +764,35 @@ fn advertised((leaf, sub, reg, bit): Feature) -> bool {
 }
 /// SSE and SSE2 (with MMX) are part of every 64-bit processor: their cells are defined whatever the profile.
 const BASE: Option<Feature> = None;
-const SSE3: Option<Feature> = Some((1, 0, 2, 0));
-const SSSE3: Option<Feature> = Some((1, 0, 2, 9));
-const SSE4_1: Option<Feature> = Some((1, 0, 2, 19));
-const SSE4_2: Option<Feature> = Some((1, 0, 2, 20));
-const PCLMULQDQ: Option<Feature> = Some((1, 0, 2, 1));
-const SSE4A: Feature = (0x8000_0001, 0, 2, 6);
-const AES: Option<Feature> = Some((1, 0, 2, 25));
-const MOVBE: Option<Feature> = Some((1, 0, 2, 22));
-const ADX: Option<Feature> = Some((7, 0, 1, 19));
-const SHA: Option<Feature> = Some((7, 0, 1, 29));
-const CLFLUSHOPT: Option<Feature> = Some((7, 0, 1, 23));
-const CLWB: Option<Feature> = Some((7, 0, 1, 24));
-const XSAVEOPT_BIT: Option<Feature> = Some((0xd, 1, 0, 0));
-const XSAVEC_BIT: Option<Feature> = Some((0xd, 1, 0, 1));
-const CET_SS: Option<Feature> = Some((7, 0, 2, 7));
-const GFNI: Option<Feature> = Some((7, 0, 2, 8));
-const KL: Option<Feature> = Some((7, 0, 2, 23));
-const MOVDIRI: Option<Feature> = Some((7, 0, 2, 27));
-const MOVDIR64B: Option<Feature> = Some((7, 0, 2, 28));
-const ENQCMD: Option<Feature> = Some((7, 0, 2, 29));
-/// Intel PT (PTWRITE is enumerated in its leaf 14H, which exists only with PT).
-const PT: Option<Feature> = Some((7, 0, 1, 25));
+/// The catalogue features that define the group-7 register forms (`0f 01 /r`, mod = 3), by ModRM byte: the form is #UD
+/// while all of them are clear. A form of no catalogue feature (ENCLV's neighbours PCONFIG, WRMSRNS, PBNDKB, the SVM group,
+/// MONITORX..INVLPGB, TDX, FRED, blank cells) is #UD whatever the profile.
+fn group7(modrm: u8) -> &'static [Feature] {
+    match modrm {
+        0xc0 | 0xcf | 0xd7 => &[gf::GF_SGX], // ENCLV, ENCLS, ENCLU
+        0xc1..=0xc4 | 0xd4 => &[gf::GF_VMX], // VMCALL, VMLAUNCH, VMRESUME, VMXOFF; VMFUNC
+        0xc8 | 0xc9 => &[gf::GF_MONITOR],    // MONITOR, MWAIT
+        0xca | 0xcb => &[gf::GF_SMAP],       // CLAC, STAC
+        0xd5 => &[gf::GF_RTM],               // XEND
+        0xd6 => &[gf::GF_RTM, gf::GF_HLE],   // XTEST
+        0xe8 => &[gf::GF_SERIALIZE, gf::GF_TSXLDTRK], // SERIALIZE (NP), XSUSLDTRK (F2)
+        0xe9 => &[gf::GF_TSXLDTRK],          // XRESLDTRK
+        0xea => &[gf::GF_CET_SS],            // SAVEPREVSSP
+        0xec => &[gf::GF_UINTR],             // UIRET
+        0xee | 0xef => &[gf::GF_PKU],        // RDPKRU, WRPKRU
+        _ => &[],
+    }
+}
 /// The legacy (non-VEX) cells of the SIMD rows of SDM Vol.2 Tables A-3 (two-byte), A-4 (0f 38) and A-5 (0f 3a): (map: 1,
 /// 2 or 3; first and last opcode; the mandatory prefixes defined there: N none, 6 66, 3 F3, 2 F2; the feature defining
 /// them). A cell of these rows not listed is blank.
 const SIMD: &[(u8, u8, u8, &[u8], Option<Feature>)] = &[
     (1, 0x10, 0x11, b"N632", BASE),
     (1, 0x12, 0x12, b"N6", BASE),
-    (1, 0x12, 0x12, b"32", SSE3),
+    (1, 0x12, 0x12, b"32", Some(gf::GF_SSE3)),
     (1, 0x13, 0x15, b"N6", BASE),
     (1, 0x16, 0x16, b"N6", BASE),
-    (1, 0x16, 0x16, b"3", SSE3),
+    (1, 0x16, 0x16, b"3", Some(gf::GF_SSE3)),
     (1, 0x17, 0x17, b"N6", BASE),
     (1, 0x28, 0x29, b"N6", BASE),
     (1, 0x2a, 0x2a, b"N632", BASE),
@@ -784,52 +813,52 @@ const SIMD: &[(u8, u8, u8, &[u8], Option<Feature>)] = &[
     (1, 0x70, 0x70, b"N632", BASE),
     (1, 0x71, 0x76, b"N6", BASE),
     (1, 0x77, 0x77, b"N", BASE),
-    (1, 0x7c, 0x7d, b"62", SSE3),
+    (1, 0x7c, 0x7d, b"62", Some(gf::GF_SSE3)),
     (1, 0x7e, 0x7f, b"N63", BASE),
     (1, 0xc2, 0xc2, b"N632", BASE),
     (1, 0xc4, 0xc6, b"N6", BASE),
-    (1, 0xd0, 0xd0, b"62", SSE3),
+    (1, 0xd0, 0xd0, b"62", Some(gf::GF_SSE3)),
     (1, 0xd1, 0xd5, b"N6", BASE),
     (1, 0xd6, 0xd6, b"632", BASE),
     (1, 0xd7, 0xe5, b"N6", BASE),
     (1, 0xe6, 0xe6, b"632", BASE),
     (1, 0xe7, 0xef, b"N6", BASE),
-    (1, 0xf0, 0xf0, b"2", SSE3),
+    (1, 0xf0, 0xf0, b"2", Some(gf::GF_SSE3)),
     (1, 0xf1, 0xfe, b"N6", BASE),
-    (2, 0x00, 0x0b, b"N6", SSSE3),
-    (2, 0x10, 0x10, b"6", SSE4_1),
-    (2, 0x14, 0x15, b"6", SSE4_1),
-    (2, 0x17, 0x17, b"6", SSE4_1),
-    (2, 0x1c, 0x1e, b"N6", SSSE3),
-    (2, 0x20, 0x25, b"6", SSE4_1),
-    (2, 0x28, 0x2b, b"6", SSE4_1),
-    (2, 0x30, 0x35, b"6", SSE4_1),
-    (2, 0x37, 0x37, b"6", SSE4_2),
-    (2, 0x38, 0x41, b"6", SSE4_1),
+    (2, 0x00, 0x0b, b"N6", Some(gf::GF_SSSE3)),
+    (2, 0x10, 0x10, b"6", Some(gf::GF_SSE4_1)),
+    (2, 0x14, 0x15, b"6", Some(gf::GF_SSE4_1)),
+    (2, 0x17, 0x17, b"6", Some(gf::GF_SSE4_1)),
+    (2, 0x1c, 0x1e, b"N6", Some(gf::GF_SSSE3)),
+    (2, 0x20, 0x25, b"6", Some(gf::GF_SSE4_1)),
+    (2, 0x28, 0x2b, b"6", Some(gf::GF_SSE4_1)),
+    (2, 0x30, 0x35, b"6", Some(gf::GF_SSE4_1)),
+    (2, 0x37, 0x37, b"6", Some(gf::GF_SSE4_2)),
+    (2, 0x38, 0x41, b"6", Some(gf::GF_SSE4_1)),
     (2, 0x80, 0x82, b"6", BASE),
-    (2, 0xc8, 0xcd, b"N", SHA),
-    (2, 0xcf, 0xcf, b"6", GFNI),
-    (2, 0xd8, 0xd8, b"3", KL),
-    (2, 0xdb, 0xdf, b"6", AES),
-    (2, 0xdc, 0xdf, b"3", KL),
-    (2, 0xf0, 0xf1, b"N6", MOVBE),
-    (2, 0xf0, 0xf1, b"2", SSE4_2),
-    (2, 0xf5, 0xf5, b"6", CET_SS),
-    (2, 0xf6, 0xf6, b"63", ADX),
-    (2, 0xf8, 0xf8, b"6", MOVDIR64B),
-    (2, 0xf8, 0xf8, b"32", ENQCMD),
-    (2, 0xf9, 0xf9, b"N", MOVDIRI),
-    (2, 0xfa, 0xfb, b"3", KL),
-    (3, 0x08, 0x0e, b"6", SSE4_1),
-    (3, 0x0f, 0x0f, b"N6", SSSE3),
-    (3, 0x14, 0x17, b"6", SSE4_1),
-    (3, 0x20, 0x22, b"6", SSE4_1),
-    (3, 0x40, 0x42, b"6", SSE4_1),
-    (3, 0x44, 0x44, b"6", PCLMULQDQ),
-    (3, 0x60, 0x63, b"6", SSE4_2),
-    (3, 0xcc, 0xcc, b"N", SHA),
-    (3, 0xce, 0xcf, b"6", GFNI),
-    (3, 0xdf, 0xdf, b"6", AES),
+    (2, 0xc8, 0xcd, b"N", Some(gf::GF_SHA)),
+    (2, 0xcf, 0xcf, b"6", Some(gf::GF_GFNI)),
+    (2, 0xd8, 0xd8, b"3", Some(gf::GF_KL)),
+    (2, 0xdb, 0xdf, b"6", Some(gf::GF_AES)),
+    (2, 0xdc, 0xdf, b"3", Some(gf::GF_KL)),
+    (2, 0xf0, 0xf1, b"N6", Some(gf::GF_MOVBE)),
+    (2, 0xf0, 0xf1, b"2", Some(gf::GF_SSE4_2)),
+    (2, 0xf5, 0xf5, b"6", Some(gf::GF_CET_SS)),
+    (2, 0xf6, 0xf6, b"63", Some(gf::GF_ADX)),
+    (2, 0xf8, 0xf8, b"6", Some(gf::GF_MOVDIR64B)),
+    (2, 0xf8, 0xf8, b"32", Some(gf::GF_ENQCMD)),
+    (2, 0xf9, 0xf9, b"N", Some(gf::GF_MOVDIRI)),
+    (2, 0xfa, 0xfb, b"3", Some(gf::GF_KL)),
+    (3, 0x08, 0x0e, b"6", Some(gf::GF_SSE4_1)),
+    (3, 0x0f, 0x0f, b"N6", Some(gf::GF_SSSE3)),
+    (3, 0x14, 0x17, b"6", Some(gf::GF_SSE4_1)),
+    (3, 0x20, 0x22, b"6", Some(gf::GF_SSE4_1)),
+    (3, 0x40, 0x42, b"6", Some(gf::GF_SSE4_1)),
+    (3, 0x44, 0x44, b"6", Some(gf::GF_PCLMULQDQ)),
+    (3, 0x60, 0x63, b"6", Some(gf::GF_SSE4_2)),
+    (3, 0xcc, 0xcc, b"N", Some(gf::GF_SHA)),
+    (3, 0xce, 0xcf, b"6", Some(gf::GF_GFNI)),
+    (3, 0xdf, 0xdf, b"6", Some(gf::GF_AES)),
 ];
 /// Two-byte opcodes whose rows are SIMD rows (the mandatory prefix selects the instruction); elsewhere F2/F3 are REP
 /// prefixes and 66 the operand size (SDM Vol.2 2.1.1: reserved, not #UD, on other instructions).
@@ -900,7 +929,7 @@ pub(crate) fn undefined(bytes: &[u8]) -> Option<System> {
             0xb8 => rep != 0xf3,
             0xc3 => modrm(2)?.0,
             // PTWRITE r (F3 /4 register; the memory form is a system cut, [`decode`]): Intel PT not advertised.
-            0xae => rep == 0xf3 && !p66 && modrm(2)? == (true, 4) && !advertised(PT.unwrap()),
+            0xae => rep == 0xf3 && !p66 && modrm(2)? == (true, 4) && !advertised(gf::GF_PT),
             0xc7 => match modrm(2)? {
                 (true, reg) => reg <= 5,
                 (false, reg) => matches!(reg, 0 | 2 | 6 | 7),
@@ -1101,7 +1130,8 @@ mod x1c_tests {
                         .and_then(Value::as_str)
                         .map(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap())
                 };
-                n("leaf") == Some(leaf) && n("subleaf").is_none_or(|s| s == sub)
+                let sub_of = e.get("subleaf").and_then(Value::as_u64);
+                n("leaf") == Some(leaf) && sub_of.is_none_or(|s| s == u64::from(sub))
             });
             let field = entry.and_then(|e| {
                 e.get("fields")?
@@ -1160,10 +1190,77 @@ mod x1c_tests {
             }
         }
         assert!(checked > 100, "{checked}");
-        assert_eq!(
-            super::advertised(super::PT.unwrap()),
-            state(super::PT.unwrap()) == "advertised"
-        );
+        // Every generated gate constant (`natemu_abi::cpu_gates`) is the catalogue's state, in the JSON and in the generated
+        // profile: a gate cannot disagree with what the resident's CPUID answers.
+        for (name, feature, on) in super::gf::GATES {
+            assert_eq!(state(feature) == "advertised", on, "{name}");
+            assert_eq!(super::advertised(feature), on, "{name}");
+        }
+    }
+    /// The forms of the features the profile does not advertise are #UD exactly while the catalogue's bit is clear: the
+    /// decode asks the generated gate, never a hand-written verdict. A form whose feature is advertised is not decoded here (a
+    /// stop: nothing builds it), and RDTSCP, FSGSBASE and RDRAND decode only while advertised.
+    #[test]
+    fn unadvertised_forms_follow_the_catalogue() {
+        use super::gf::*;
+        use super::{MAP_0F38, MAP_TWO, system};
+        let kind = |hex: &str, map, op| super::decode(&b(hex), map, op).map(|s| s.kind);
+        let mut checked = 0;
+        for (hex, map, op, features) in [
+            ("0fc7f8", MAP_TWO, 0xc7, &[GF_RDSEED][..]),
+            ("f30fc7f8", MAP_TWO, 0xc7, &[GF_RDPID]),
+            ("0fc72b", MAP_TWO, 0xc7, &[GF_XSAVES]),
+            ("0fc71b", MAP_TWO, 0xc7, &[GF_XSAVES]),
+            ("660f388200", MAP_0F38, 0x82, &[GF_INVPCID]),
+            ("660f388000", MAP_0F38, 0x80, &[GF_VMX]),
+            ("660f388100", MAP_0F38, 0x81, &[GF_VMX]),
+            ("0f38f6c1", MAP_0F38, 0xf6, &[GF_CET_SS]),
+            ("660f38f508", MAP_0F38, 0xf5, &[GF_CET_SS]),
+            ("0f01e8", MAP_TWO, 0x01, &[GF_SERIALIZE, GF_TSXLDTRK]),
+            ("f20f01e8", MAP_TWO, 0x01, &[GF_SERIALIZE, GF_TSXLDTRK]),
+            ("f20f01e9", MAP_TWO, 0x01, &[GF_TSXLDTRK]),
+            ("0f01ee", MAP_TWO, 0x01, &[GF_PKU]),
+            ("0f01ef", MAP_TWO, 0x01, &[GF_PKU]),
+            ("0f01ca", MAP_TWO, 0x01, &[GF_SMAP]),
+            ("0f01cb", MAP_TWO, 0x01, &[GF_SMAP]),
+            ("0f01c8", MAP_TWO, 0x01, &[GF_MONITOR]),
+            ("0f01c9", MAP_TWO, 0x01, &[GF_MONITOR]),
+            ("0f01d5", MAP_TWO, 0x01, &[GF_RTM]),
+            ("0f01d6", MAP_TWO, 0x01, &[GF_RTM, GF_HLE]),
+            ("0f01c1", MAP_TWO, 0x01, &[GF_VMX]),
+            ("0f01cf", MAP_TWO, 0x01, &[GF_SGX]),
+            ("f30f01ea", MAP_TWO, 0x01, &[GF_CET_SS]),
+            ("f30f01ec", MAP_TWO, 0x01, &[GF_UINTR]),
+            ("f30f012b", MAP_TWO, 0x01, &[GF_CET_SS]),
+            ("f30fae30", MAP_TWO, 0xae, &[GF_CET_SS]),
+        ] {
+            let on = features.iter().any(|&f| super::advertised(f));
+            assert_eq!(
+                kind(hex, map, op),
+                if on { None } else { Some(system::UD) },
+                "{hex}"
+            );
+            checked += 1;
+        }
+        // Decoded only while advertised, #UD otherwise.
+        for (hex, op, on, want) in [
+            ("0f01f9", 0x01, GF_RDTSCP, system::RDTSCP),
+            ("f3480faec0", 0xae, GF_FSGSBASE, system::RDFSBASE),
+            ("0fc7f0", 0xc7, GF_RDRAND, system::RDRAND),
+        ] {
+            let got = kind(hex, MAP_TWO, op);
+            assert_eq!(
+                got,
+                Some(if super::advertised(on) {
+                    want
+                } else {
+                    system::UD
+                }),
+                "{hex}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 25);
     }
     #[test]
     fn reserved_nops() {
@@ -2182,7 +2279,7 @@ mod tests {
                 ..mem(XRSTOR, 7, 0, 4)
             })
         ); // xrstor gs:[rdi]
-        let xsaveopt = if super::advertised(super::XSAVEOPT_BIT.unwrap()) {
+        let xsaveopt = if super::advertised(super::gf::GF_XSAVEOPT) {
             Some(mem(XSAVE, 0, 0, 3))
         } else {
             Some(System {
@@ -2197,7 +2294,7 @@ mod tests {
             xsaveopt.map(|s| s.kind)
         ); // xsaveopt64 [rdi+8]
         assert_eq!(d("f20fae30", 0xae).map(|s| s.kind), Some(UD));
-        let xsavec = super::advertised(super::XSAVEC_BIT.unwrap());
+        let xsavec = super::advertised(super::gf::GF_XSAVEC);
         assert_eq!(
             d("0fc727", 0xc7),
             if xsavec {
@@ -2226,7 +2323,7 @@ mod tests {
             length: 4,
             ..System::NONE
         });
-        let clwb = if super::advertised(super::CLWB.unwrap()) {
+        let clwb = if super::advertised(super::gf::GF_CLWB) {
             Some(System {
                 prefixes: 0,
                 ..mem(CLFLUSH, 0, 0, 4)
@@ -2611,7 +2708,7 @@ mod tests {
                 ..mem(CLFLUSH, 0, 8, 5)
             })
         ); // clflush gs:[rax+8]
-        let clflushopt = if super::advertised(super::CLFLUSHOPT.unwrap()) {
+        let clflushopt = if super::advertised(super::gf::GF_CLFLUSHOPT) {
             Some(mem(CLFLUSH, 0, 0, 4))
         } else {
             k(UD, 4)
@@ -2667,7 +2764,7 @@ mod tests {
             None
         );
         let adx = |n| {
-            if super::advertised(super::ADX.unwrap()) {
+            if super::advertised(super::gf::GF_ADX) {
                 None
             } else {
                 k(UD, n)
@@ -2697,7 +2794,7 @@ mod tests {
             super::decode(&[0x66, 0xf2, 0x0f, 0x38, 0xf6, 0xc1], MAP_0F38, 0xf6),
             k(UD, 5)
         ); // #UD on the AMD machine too
-        let sha = if super::advertised(super::SHA.unwrap()) {
+        let sha = if super::advertised(super::gf::GF_SHA) {
             None
         } else {
             k(UD, 3)
