@@ -22,7 +22,7 @@ tools/fexc/build.sh BUILD_DIR
 
 `BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX` (`.gitmodules`: the fork
 `https://github.com/ArArgon/natemu-fex`, branch `natemu`, `shallow = true`), pinned to the fork's commit
-`e9d27c7eae310144527958004970657d38a5d7f0` (`13e80cf`, `1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2, plus the `FexcFlush` IR op for the software DAZ/FTZ flush, chunk 3a; on the fork's `afp-c3a` branch, not yet on its `natemu` branch): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
+`7e8f5edd3542180f04fccdb29f30ab3e46efaa3b` (`13e80cf`, `1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2, plus the `FexcFlush` IR op for the software DAZ/FTZ flush, chunk 3a; on the fork's `afp-c3a` branch, not yet on its `natemu` branch): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
 at the pin) and the three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the
 revision FEX pins), checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the
 three externals into it (`git archive`), configures `CMakeLists.txt` against that tree, builds with 4 jobs and runs
@@ -440,7 +440,7 @@ sign; five vector instructions, VTMP1 for the mask, the result in an ordinary re
 instruction, on the op's own operands and result, as the M4's FIZ and FZ do for each Arm op: DAZ alone flushes every FP source of
 the ops in `FlushRuleOf`; FTZ alone flushes the results of arithmetic, FMA, HADD/HSUB/ADDSUB and the narrowing converts to single
 and raises UFC and IXC for each lane flushed (`fmul t, d, d` on the denormal: inexact and tiny in every rounding mode; two more
-instructions); DAZ and FTZ both flush only what MIN/MAX select. DPPS's first add level is flushed in `VFAddV` (`FexcFlushStep`).
+instructions); DAZ and FTZ both flush only what MIN/MAX select. DPPS's first add level is flushed in `VFAddV` (`FexcFlushStep`). Each DPPS/DPPD step check follows its step's flush. RPRES ops (`VFRECPPRECISION`/`VFRSQRTPRECISION`) have no flush rule (RPRES is off, above the floor; out of scope for M2).
 x87 instructions are left alone, VCVTPS2PH honours DAZ but not FTZ, RCP's result is flushed under FTZ alone without a flag (its
 flags are restored), and the unmasked-PE check mask gains UFC under effective FTZ (`SimdCheckMask`). `tools/fexc/test_slice1.py`
 (`AfpFlush`) pins the shapes; the replay with `afp=0` added shows the common mode unchanged.
