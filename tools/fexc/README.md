@@ -428,7 +428,7 @@ Body rewrite (AFP fallback plan, chunk 1): `NATEMU_REPLAY_ADD_ARGS="--feature af
 `no_afp`). The replies differ from the recorded ones by design, so D = 0 no longer applies: the test compares the new compiler under the
 added arguments with the old one on the recorded bytes, which shows what M2 emulation changes (`--report` through
 `NATEMU_REPLAY_ARGS` prints the replies' summaries). The host-built arguments that depend on `no_afp` (`--x87-fpcr`) are not rewritten: they are unit-tested
-(`with_afp_on_the_fp_words_are_unchanged_for_every_mxcsr_and_fcw`).
+(`with_afp_on_the_fp_words_are_unchanged_for_every_mxcsr_and_fcw`). M2 emulation (`NATEMU_FEXC_FEATURE_OFF=afp`) needs a fexc built at or after `afp-c1-fexc-20261115-01`: an older shim would load the host's `X87_FPCR_EXPLICIT` (bit 32) into FPCR.
 
 ## What builds
 
