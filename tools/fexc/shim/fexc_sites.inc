@@ -277,6 +277,44 @@ void Arm64JITCore::FexcSimdStep(ARMEmitter::VRegister R) {
   if (!fexc_simd_checked.count(Entry + FexcGuest)) return;
   FexcTinyLanes(R, 4, 2, uint64_t(fexc_simd_unmasked));
   FexcSimdCheckWords(FexcPrecision::SimdCheckMask());
+  FexcDenormalStep(R, 4);   // the second add level's inputs are these sums: its DE belongs to the final check
+}
+// AFP fallback chunk 3b, row 7: the software DE of one add level of DPPS/DPPD (VFAddV: `faddp` of the products, then of the two sums),
+// whose inputs only exist inside the JIT's op: before the level, or after the previous level's check. The 32-bit form tests the pairs
+// (0,1) and (2,3) of V (the sums are in lanes 0,1 and again in 2,3: the same pair twice), the 64-bit form the one pair. A pair is DE
+// when one of its two values is a denormal and neither is a NaN (x86's precedence, as `SoftDe`); then FPSR.IDC is set (only when
+// the flag is: a forward branch round `mrs; orr; msr`), for the check that follows the level. Writes VTMP1, VTMP2, TMP1 (the
+// check's own), TMP3 and TMP4; no NZCV. Nothing without AFP, with DE masked, or in an instruction without checks.
+void Arm64JITCore::FexcDenormalStep(ARMEmitter::VRegister V, uint32_t Elem) {
+  if (!fexc_no_afp || !fexc_simd_checked.count(Entry + FexcGuest) || !(uint64_t(fexc_simd_unmasked) >> 1 & 1)) return;
+  const bool Dbl = Elem == 8;
+  const auto Sz = Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
+  shl(Sz, VTMP1.Q(), V.Q(), 1);
+  cmeq(Sz, VTMP2.Q(), VTMP1.Q());
+  ushr(Sz, VTMP1.Q(), VTMP1.Q(), Dbl ? 53 : 24);
+  cmeq(Sz, VTMP1.Q(), VTMP1.Q());
+  bic(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());          // the denormal lanes
+  fcmeq(Sz, VTMP2.Q(), V.Q(), V.Q());
+  mvn(ARMEmitter::SubRegSize::i8Bit, VTMP2.Q(), VTMP2.Q());   // the NaN lanes
+  if (Dbl) {   // one pair: any denormal and no NaN
+    umaxv(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), VTMP1.Q());
+    umaxv(ARMEmitter::SubRegSize::i32Bit, VTMP2.Q(), VTMP2.Q());
+    fmov(ARMEmitter::Size::i32Bit, TMP3, VTMP1.S());
+    fmov(ARMEmitter::Size::i32Bit, TMP4, VTMP2.S());
+    bic(ARMEmitter::Size::i32Bit, TMP3, TMP3, TMP4);
+  } else {     // each 64-bit half is a pair
+    cmtst(ARMEmitter::SubRegSize::i64Bit, VTMP1.Q(), VTMP1.Q(), VTMP1.Q());
+    cmtst(ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), VTMP2.Q(), VTMP2.Q());
+    bic(VTMP1.Q(), VTMP1.Q(), VTMP2.Q());
+    umaxv(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), VTMP1.Q());
+    fmov(ARMEmitter::Size::i32Bit, TMP3, VTMP1.S());
+  }
+  ARMEmitter::ForwardLabel Skip;
+  (void)cbz(ARMEmitter::Size::i32Bit, TMP3, &Skip);
+  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x80);
+  msr(ARMEmitter::SystemRegister::FPSR, TMP1);
+  (void)Bind(&Skip);
 }
 // AFP fallback chunk 3a (rows 4-6, FexcPrecision::PlaceFlushes): the software DAZ / FTZ flush of each element of `Src` whose exponent
 // field is zero (a zero or a denormal: a zero keeps its bits) into `Dst`, a zero of the element's sign. With `Flags` (an FTZ

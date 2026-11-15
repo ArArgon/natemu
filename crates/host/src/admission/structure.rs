@@ -2369,6 +2369,10 @@ mod tests {
             "c5ed7ccb", "c5ed7dcb", // memory operands, 256-bit forms (two halves, one check) and DPPS's steps follow
             "f30f580b", "0f580b", "0f5a0b", "f20f5e0b", "f30f510b", "c4e269b90b", "c5fc5a0b", "c5ec58cb", "c4e26db8cb", "c5ef7ccb", "c4e36d40cbff",
             "c5ecc2cb01", "c4e27913ca", "c4e27d13ca", "c4e2791300", // VCVTPH2PS: half-precision sources, no DE
+            "660f3a40ca71", "660f3a41caff", "660f3a41ca31", "c4e36d40cbff", "c4e36941cbff", // DPPS, DPPD, VDPPS ymm: the add levels' DE inside VFAddV
+            "c4e26998cb", "c4e269a8cb", "c4e269a9cb", "c4e2e9a8cb", "c4e2e999cb", "c4e26d98cb", // VFMADD132/213 (ps, ss, pd, sd, ymm)
+            "c4e269a6cb", "c4e269a7cb", "c4e26d96cb", "c4e269b6cb", // VFMADDSUB/VFMSUBADD
+            "c5efd0cb", "c5edd0cb",   // VADDSUBPS/PD ymm
         ];
         let x87 = [
             "d903", "dd03", "d803", "dc03", "d80b", "dc0b", "d813", "dc13", "d81b", "dc1b", "d823", "dc23", "d82b", "dc2b", "d833", "dc33", "d83b",
