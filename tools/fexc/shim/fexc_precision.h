@@ -6,6 +6,7 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <cstddef>
+#include <initializer_list>
 #include <vector>
 
 namespace FexcPrecision {
@@ -138,6 +139,17 @@ inline bool SimdFPOp(FEXCore::IR::IROps Op) {
   default: return false;
   }
 }
+// The FPSR bits a SIMD check tests: those of the unmasked MXCSR exceptions (x86 flag order IE DE ZE OE UE PE -> IOC IDC DZC OFC UFC
+// IXC). AFP fallback chunk 3a, row 3: without AFP an FZ flush (DAZ and FTZ both set) raises UFC and no IXC, but x86 sets PE for a
+// flush: under effective FTZ (`--ftz`) an unmasked PE is tested through UFC too (UE is masked then, so every UFC is a flush).
+inline uint32_t SimdCheckMask() {
+  const uint64_t M = fexc_simd_unmasked;
+  constexpr uint32_t Arm[6] = {1, 1u << 7, 2, 4, 8, 16};
+  uint32_t Mask = 0;
+  for (int b = 0; b < 6; ++b) if (M >> b & 1) Mask |= Arm[b];
+  if (fexc_no_afp && (M >> 5 & 1) && fexc_ftz) Mask |= 8;
+  return Mask;
+}
 // The ops that commit an instruction's effect: everything with a side effect but the NZCV writers (the incoming NZCV is saved
 // for a fault point after one, patch 0006), instruction markers, loads, prefetches and FEX's rounding-mode bookkeeping.
 inline bool Commits(FEXCore::IR::IROps Op) {
@@ -149,7 +161,7 @@ inline bool Commits(FEXCore::IR::IROps Op) {
   case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG: case OP_RMIFNZCV: case OP_CONDADDNZCV:
   case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS: case OP_ADCNZCV: case OP_SBBNZCV:
   case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ: case OP_TESTZ: case OP_SHIFTFLAGS:
-  case OP_ROTATEFLAGS: return false;
+  case OP_ROTATEFLAGS: case OP_FEXCFLUSH: return false;
   default: return HasSideEffects(Op);
   }
 }
@@ -185,9 +197,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
         if (!Fp) Mask &= 0xf00;   // no floating-point op: only its stack fault can be raised
       } else {
         if (!Fp || fexc_fp_quiet.count(Rip)) return;
-        const uint64_t M = fexc_simd_unmasked;
-        constexpr uint32_t Arm[6] = {1, 1u << 7, 2, 4, 8, 16};
-        for (int b = 0; b < 6; ++b) if (M >> b & 1) Mask |= Arm[b];
+        Mask = SimdCheckMask();
       }
       if (!Mask) return;
       size_t First = Insn.size();
@@ -235,6 +245,133 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
       Insn.push_back({CodeNode, IROp->Op});
     }
     Finish();
+  }
+}
+// ---------------------------------------------------------------------------------------------
+// AFP fallback chunk 3a (plan rows 4-6): MXCSR.DAZ and effective FTZ on a host without FEAT_AFP, where FPCR.FIZ is RES0 and FZ also
+// flushes inputs (inventory 1.7). The host keys the code on both (`--daz`, `--ftz`) and runs it with FPCR.FZ = 1 only when both are
+// set; otherwise FZ = 0 and each Arm FP op of an SSE/AVX instruction gets what the M4's FIZ and FZ do to it, as `FexcFlush` ops (an
+// element whose exponent field is zero becomes a zero of its sign) around it, on the op's own operands and result:
+//   DAZ alone       every FP source operand of the ops in the table below is flushed first (no flag: DE is never set without AFP).
+//   FTZ alone       every FP result of the ops where x86 flushes (arithmetic, FMA, HADD/HSUB/ADDSUB, the narrowing converts to
+//                   single; not conversions to integer, ROUND, VCVTPS2PH, the compares, MIN/MAX, SQRT, RSQRT) is flushed after,
+//                   raising UFC and IXC for each lane flushed (x86 sets UE and PE; an op that rounded a tiny result raised both).
+//                   RCP's fdiv result is flushed too (as FZ does it on the M4) but raises nothing: its flags are restored after it.
+//   DAZ and FTZ     FZ = 1 flushes inputs and results in hardware (UFC alone: PE comes from UFC in `mxcsr_flags`), but MIN/MAX
+//                   return a raw operand, so their result is flushed (no flag).
+// x87 instructions (their own FPCR) are left alone. DPPS's first
+// add level inside VFAddV is flushed by the JIT (FexcFlushStep). The tininess band (an exact value just under MIN_NORMAL that
+// rounds up to it) stays the declared deviation of decision C.
+struct FlushRule {
+  uint8_t In[4] = {0xff, 0xff, 0xff, 0xff};   // the arguments flushed under DAZ, 0xff ends
+  uint8_t Out = 0;                            // the result is flushed: 1 under FTZ alone, with flags; 2 under DAZ and FTZ (MIN/MAX), 3 under FTZ alone (RCP), without
+  bool InScalar = false, OutScalar = false;   // element 0 only (the other bits are kept)
+  uint32_t InElem = 0, OutElem = 0;           // bytes of the operands' and the result's elements
+};
+inline bool FlushRuleOf(const FEXCore::IR::IROp_Header* Op, FlushRule& R) {
+  using namespace FEXCore::IR;
+  using std::initializer_list;
+  const uint32_t E = OpSizeToSize(Op->ElementSize), S = OpSizeToSize(Op->Size);
+  auto In = [&](initializer_list<uint8_t> A, uint32_t Elem, bool Scalar) {
+    size_t n = 0;
+    for (auto a : A) R.In[n++] = a;
+    R.InElem = Elem; R.InScalar = Scalar;
+  };
+  auto Out = [&](uint8_t Kind, uint32_t Elem, bool Scalar) { R.Out = Kind; R.OutElem = Elem; R.OutScalar = Scalar; };
+  switch (Op->Op) {
+  case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV: case OP_VFADDP: case OP_VFCADD:
+    In({0, 1}, E, S == E); Out(1, E, S == E); break;
+  case OP_VFMIN: case OP_VFMAX: In({0, 1}, E, S == E); Out(2, E, S == E); break;
+  case OP_VFMLA: case OP_VFMLS: case OP_VFNMLA: case OP_VFNMLS: In({0, 1, 2}, E, S == E); Out(1, E, S == E); break;
+  case OP_VFRECP: In({0}, E, S == E); Out(3, E, S == E); break;
+  case OP_VFSQRT: case OP_VFRSQRT: case OP_VECTOR_FTOS: case OP_VECTOR_FTOZS: case OP_VECTOR_FTOI:
+  case OP_VECTOR_FTOISIZED: In({0}, E, S == E); break;
+  case OP_VFCMPEQ: case OP_VFCMPNEQ: case OP_VFCMPLT: case OP_VFCMPGT: case OP_VFCMPLE: case OP_VFCMPORD: case OP_VFCMPUNO:
+    In({0, 1}, E, S == E); break;
+  case OP_VFADDV: In({0}, E, false); Out(1, E, true); break;   // (the result is element 0; the first add level: FexcFlushStep)
+  case OP_VFADDSCALARINSERT: case OP_VFSUBSCALARINSERT: case OP_VFMULSCALARINSERT: case OP_VFDIVSCALARINSERT:
+    In({0, 1}, E, true); Out(1, E, true); break;
+  case OP_VFMINSCALARINSERT: case OP_VFMAXSCALARINSERT: In({0, 1}, E, true); Out(2, E, true); break;
+  case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT: case OP_VFNMLSSCALARINSERT:
+    In({1, 2, 3}, E, true); Out(1, E, true); break;   // (argument 0 only supplies the upper elements)
+  case OP_VFRECPSCALARINSERT: In({1}, E, true); Out(3, E, true); break;
+  case OP_VFSQRTSCALARINSERT: case OP_VFRSQRTSCALARINSERT: case OP_VFTOISCALARINSERT: In({1}, E, true); break;
+  case OP_VFCMPSCALARINSERT: In({0, 1}, E, true); break;
+  case OP_VFTOFSCALARINSERT: {
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_VFToFScalarInsert>()->SrcElementSize);
+    In({1}, Src, true);
+    if (E == 4 && Src == 8) Out(1, E, true);
+    break;
+  }
+  case OP_FLOAT_FTOF: {
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_Float_FToF>()->SrcElementSize);
+    In({0}, Src, true);
+    if (S == 4 && Src == 8) Out(1, S, true);
+    break;
+  }
+  case OP_FLOAT_TOGPR_S: In({0}, OpSizeToSize(Op->C<IROp_Float_ToGPR_S>()->SrcElementSize), true); break;
+  case OP_FLOAT_TOGPR_ZS: In({0}, OpSizeToSize(Op->C<IROp_Float_ToGPR_ZS>()->SrcElementSize), true); break;
+  case OP_FCMP: In({0, 1}, OpSizeToSize(Op->C<IROp_FCmp>()->ElementSize), true); break;
+  case OP_VECTOR_F64TOI32: In({0}, 8, false); break;
+  case OP_VECTOR_FTOF: {
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_Vector_FToF>()->SrcElementSize);
+    In({0}, Src, false);
+    if (E == 4 && Src == 8) Out(1, E, false);
+    break;
+  }
+  case OP_VFCVTL2: In({0}, E >> 1, false); break;
+  case OP_VFCVTN2: In({1}, E << 1, false); if (E == 4) Out(1, E, false); break;   // (argument 0 holds the lower half, converted before)
+  default: return false;
+  }
+  return R.In[0] != 0xff;
+}
+// Places the flushes (run at the start of flag elimination, before PlaceFPChecks: the flush ops come before an instruction's first
+// commit, so before its check, and a flushed result's flags are checked). Nothing on a host with AFP, in a block without such an op,
+// or with neither key set; `--daz` and `--ftz` are read only once such an op is found.
+template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
+  using namespace FEXCore::IR;
+  if (!fexc_no_afp) return;
+  auto IR = IREmit->ViewIR();
+  const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
+  struct Found { Ref Node; uint64_t Rip; };
+  std::vector<Found> Ops;
+  uint64_t Rip = ~0ull;
+  for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
+    for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
+      if (IROp->Op == OP_GUESTOPCODE) { Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset; continue; }
+      FlushRule R;
+      if (Rip != ~0ull && !fexc_x87.count(Rip) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip});
+    }
+  }
+  if (Ops.empty()) return;
+  const bool Daz = fexc_daz, Ftz = fexc_ftz;
+  if (!Daz && !Ftz) return;
+  for (const auto& F : Ops) {
+    auto View = IREmit->ViewIR();
+    const auto* Op = View.template GetOp<IROp_Header>(F.Node);
+    FlushRule R;
+    FlushRuleOf(Op, R);
+    if (Daz && !Ftz) {   // the sources
+      if (R.InElem != 4 && R.InElem != 8) continue;   // (a half-precision source is not flushed)
+      IREmit->SetWriteCursorBefore(F.Node);
+      Ref Seen[4] = {}, Made[4] = {};   // a value read twice by the op (`addps xmm0, xmm0`) is flushed once
+      for (size_t i = 0; i < 4 && R.In[i] != 0xff; ++i) {
+        Ref Src = View.GetNode(Op->Args[R.In[i]]), Flushed = nullptr;
+        const auto SrcOp = View.template GetOp<IROp_Header>(Op->Args[R.In[i]])->Op;
+        if (SrcOp == OP_VECTOR_FTOI || SrcOp == OP_VECTOR_FTOISIZED) continue;   // integral values (CVTPS2DQ's FRINT before its FCVTZS): no denormal
+        for (size_t j = 0; j < i; ++j) if (Seen[j] == Src) Flushed = Made[j];
+        if (!Flushed) {
+          const auto Size = View.template GetOp<IROp_Header>(Op->Args[R.In[i]])->Size;
+          Flushed = IREmit->_FexcFlush(Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, Src, R.InScalar ? 1 : 0);
+        }
+        IREmit->ReplaceNodeArgument(F.Node, R.In[i], Flushed);
+        Seen[i] = Src; Made[i] = Flushed;
+      }
+    } else if (R.Out == (Daz && Ftz ? 2 : Ftz ? 1 : 0) || (R.Out == 3 && Ftz && !Daz)) {   // the result (3: RCP's, flushed without a flag under FTZ alone)
+      IREmit->SetWriteCursor(F.Node);
+      Ref Flushed = IREmit->_FexcFlush(Op->Size, R.OutElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, F.Node, (R.OutScalar ? 1 : 0) | (R.Out == 1 ? 2 : 0));
+      IREmit->ReplaceUsesWithAfter(F.Node, Flushed, Flushed);
+    }
   }
 }
 } // namespace FexcPrecision

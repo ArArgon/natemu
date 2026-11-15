@@ -153,7 +153,7 @@ struct FexcArg {
   FexcArg& operator=(T v) { value = v; return *this; }
 };
 enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR,
-             FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC, FEXC_ARG_BULK };
+             FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC, FEXC_ARG_BULK, FEXC_ARG_DAZ, FEXC_ARG_FTZ };
 // Profile slice1 (perf chunk 26): the host asks for bulk REP STOS (`--bulk`: never for a single-instruction step, nor while
 // alignment checking or a data breakpoint gates the block): FexcStringOp stores the part of the string inside RDI's page
 // first (FEX's `FexcRepStos`, JIT form in fexc_sites.inc).
@@ -235,6 +235,16 @@ constexpr uint32_t FEXC_X87_EXCEPTIONS = 0x4b4;
 // Under them the compiled code checks each instruction's exception flags before it commits anything (shim/fexc_sites.inc).
 inline FexcArg<uint64_t, FEXC_ARG_SIMD_UNMASKED> fexc_simd_unmasked;
 inline FexcArg<uint64_t, FEXC_ARG_X87_UNMASKED> fexc_x87_unmasked;
+// AFP fallback chunk 3a (plan rows 4-6 and row 3's unmasked-PE part). The host without FEAT_AFP (`--feature afp=0`: `fexc_no_afp`, set
+// per request from the features) keys its code on MXCSR.DAZ (`--daz`) and on effective FTZ, FTZ with UM masked (`--ftz`; the same
+// condition abi `fpcr` uses), and neither is ever sent otherwise. Both are read only where a SIMD floating-point op needs them
+// (FexcPrecision::PlaceFlushes and the PE check mask), and only when `fexc_no_afp`, so no answer of a host with AFP reads them.
+// FPCR.FZ is then 1 with DAZ and FTZ both (hardware flush, as the M4's FIZ and FZ), else 0: DAZ alone is a software input flush
+// per FP source, FTZ alone a software output flush with UFC and IXC for each flushed lane (FexcFlush); DAZ and FTZ both flush
+// only the raw result MIN/MAX select. x87 and the quiet RCP/RSQRT results are left alone.
+inline bool fexc_no_afp = false;
+inline FexcArg<bool, FEXC_ARG_DAZ> fexc_daz;
+inline FexcArg<bool, FEXC_ARG_FTZ> fexc_ftz;
 // Two bytes of FEX's flag array no FEX code uses (X87FLAG_DE_LOC, X87FLAG_ZE_LOC), guest-state fields for I5c, both in FPSR's
 // flag order: the MXCSR flags SIMD-checked instructions raised since the last resident entry (folded there into MXCSR), and the
 // flags the x87 ops of the current x87 instruction raised so far (folded into the x87 exception word at its end).

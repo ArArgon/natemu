@@ -267,10 +267,54 @@ DEF_OP(FexcRepStos) {
 void Arm64JITCore::FexcSimdStep(ARMEmitter::VRegister R) {
   if (!fexc_simd_checked.count(Entry + FexcGuest)) return;
   FexcTinyLanes(R, 4, 2, uint64_t(fexc_simd_unmasked));
-  uint32_t Mask = 0;
-  constexpr uint32_t Arm[6] = {1, 1u << 7, 2, 4, 8, 16};
-  for (int b = 0; b < 6; ++b) if (fexc_simd_unmasked >> b & 1) Mask |= Arm[b];
-  FexcSimdCheckWords(Mask);
+  FexcSimdCheckWords(FexcPrecision::SimdCheckMask());
+}
+// AFP fallback chunk 3a (rows 4-6, FexcPrecision::PlaceFlushes): the software DAZ / FTZ flush of each element of `Src` whose exponent
+// field is zero (a zero or a denormal: a zero keeps its bits) into `Dst`, a zero of the element's sign. With `Flags` (an FTZ
+// result) each lane flushed raises UFC and IXC: its denormal times itself is inexact and tiny in every rounding mode, a zero
+// lane raises nothing. `Scalar`: element 0 only, the other bits of `Src` kept; `Q`: a 128-bit register, else the low 64 bits.
+// Writes only VTMP1 (the mask) and VTMP2 (the denormal bits) beside `Dst`; it never reads `Src` after writing `Dst`.
+//   shl m, s, #1 (the sign out); ushr m, m, #(esize - exponent bits); cmeq m, m, #0 (all ones in a zero exponent);
+//   ushr m, m, #1 (all but the sign); [and t, s, m; fmul t, t, t;] bic d, s, m
+// A scalar element is shifted in a 64-bit scalar register, which zeroes the register above, so the mask keeps the other lanes:
+// 32 bits `shl d, d, #33; ushr d, d, #56; cmeq d, d, #0; ushr d, d, #33`, 64 bits `shl #1; ushr #53; cmeq; ushr #1`.
+void Arm64JITCore::FexcFlushWords(ARMEmitter::VRegister Dst, ARMEmitter::VRegister Src, uint32_t Elem, bool Q, bool Scalar, bool Flags) {
+  const bool Dbl = Elem == 8;
+  const auto Sz = Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
+  if (Scalar) {
+    constexpr auto D = ARMEmitter::ScalarRegSize::i64Bit;
+    shl(D, VTMP1, Src, Dbl ? 1 : 33);
+    ushr(D, VTMP1, VTMP1, Dbl ? 53 : 56);
+    cmeq(D, VTMP1, VTMP1);
+    ushr(D, VTMP1, VTMP1, Dbl ? 1 : 33);
+  } else if (Q) {
+    shl(Sz, VTMP1.Q(), Src.Q(), 1);
+    ushr(Sz, VTMP1.Q(), VTMP1.Q(), Dbl ? 53 : 24);
+    cmeq(Sz, VTMP1.Q(), VTMP1.Q());
+    ushr(Sz, VTMP1.Q(), VTMP1.Q(), 1);
+  } else {
+    LOGMAN_THROW_A_FMT(!Dbl, "a 64-bit vector of doubles is a scalar");
+    shl(Sz, VTMP1.D(), Src.D(), 1);
+    ushr(Sz, VTMP1.D(), VTMP1.D(), 24);
+    cmeq(Sz, VTMP1.D(), VTMP1.D());
+    ushr(Sz, VTMP1.D(), VTMP1.D(), 1);
+  }
+  if (Flags) {
+    and_(VTMP2.Q(), Src.Q(), VTMP1.Q());
+    fmul(Sz, VTMP2.Q(), VTMP2.Q(), VTMP2.Q());
+  }
+  bic(Dst.Q(), Src.Q(), VTMP1.Q());
+}
+DEF_OP(FexcFlush) {
+  const auto Op = IROp->C<IR::IROp_FexcFlush>();
+  FexcFlushWords(GetVReg(Node), GetVReg(Op->Vector), IR::OpSizeToSize(IROp->ElementSize), IROp->Size == IR::OpSize::i128Bit, Op->Mode & 1, Op->Mode & 2);
+}
+// DPPS's first add level (VFAddV's two `faddp`): its four sums are inputs of the second level and results of the first, so the
+// flush the keys ask for runs between them, in place (DAZ alone: no flag; FTZ alone: UFC and IXC), where the IR cannot reach.
+void Arm64JITCore::FexcFlushStep(ARMEmitter::VRegister R) {
+  if (!fexc_no_afp || fexc_x87.count(Entry + FexcGuest)) return;
+  const bool Daz = fexc_daz, Ftz = fexc_ftz;
+  if (Daz != Ftz) FexcFlushWords(R, R, 4, true, false, Ftz);
 }
 DEF_OP(FexcX87Check) {
   const auto Op = IROp->C<IR::IROp_FexcX87Check>();

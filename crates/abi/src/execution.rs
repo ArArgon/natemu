@@ -1898,11 +1898,26 @@ pub const MXCSR_MASKS: u64 = 0x1f80;
 /// underflow exception is unmasked (I5c: "If the underflow exception is not masked, the flush-to-zero bit is ignored", SDM
 /// Vol.1 10.2.3.3), RMode from RC (x86 00 nearest, 01 down, 10 up, 11 toward zero; Arm RN 00, RP 01, RM 10, RZ 11). With
 /// `no_afp` ([`Cpu::no_afp`]) AH, NEP and FIZ stay clear: they are RES0 without FEAT_AFP, and every AFP behaviour in Arm's
-/// pseudocode depends on one of them (AFP inventory 0), so an M4 running so is a host without AFP (plan section 1).
+/// pseudocode depends on one of them (AFP inventory 0), so an M4 running so is a host without AFP (plan section 1). There FZ
+/// flushes inputs and outputs both, so it is set only with DAZ and effective FTZ both (the hardware flush of rows 3 and 6);
+/// DAZ alone and FTZ alone flush in software, in code keyed on them ([`daz_key`], [`ftz_key`]; rows 4 and 5).
 pub const fn fpcr(mxcsr: u64, no_afp: bool) -> u64 {
     let rmode = [0, 2, 1, 3][(mxcsr >> 13 & 3) as usize];
-    let afp = if no_afp { 0 } else { 1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) };
-    afp | (mxcsr >> 15 & mxcsr >> 11 & 1) << 24 | rmode << 22
+    let ftz = mxcsr >> 15 & mxcsr >> 11 & 1;
+    if no_afp {
+        return (mxcsr >> 6 & ftz) << 24 | rmode << 22;
+    }
+    (1 << 1 | 1 << 2 | (mxcsr >> 6 & 1)) | ftz << 24 | rmode << 22
+}
+/// AFP fallback chunk 3a: 1 when `no_afp` and MXCSR.DAZ is set, else 0. Part of [`Cpu::code_context`] (bit 30) and fexc's `--daz`:
+/// without AFP, code for DAZ flushes its FP source operands in software.
+pub const fn daz_key(mxcsr: u64, no_afp: bool) -> u64 {
+    no_afp as u64 & mxcsr >> 6 & 1
+}
+/// AFP fallback chunk 3a: 1 when `no_afp` and FTZ is effective (MXCSR.FTZ with the underflow mask set, the condition [`fpcr`] and
+/// [`mxcsr_flags`] use), else 0. Part of [`Cpu::code_context`] (bit 31) and fexc's `--ftz`.
+pub const fn ftz_key(mxcsr: u64, no_afp: bool) -> u64 {
+    no_afp as u64 & mxcsr >> 15 & mxcsr >> 11 & 1
 }
 /// I5c: the MXCSR exceptions whose mask is clear, in flag order (bit 0 IE .. 5 PE); DE left out under DAZ, which never raises
 /// it (SDM Vol.1 10.2.3.4). 0 as Linux runs: fexc's `--simd-unmasked`, part of [`Cpu::code_context`].
@@ -1923,6 +1938,8 @@ pub const FPSR_PRE: u64 = 1 | 2 | 0x80;
 /// I5c: the FPSR flags an SSE/AVX instruction that raised an unmasked SIMD exception sets in MXCSR (SDM Vol.1 11.5.3.2,
 /// 11.5.3.3), from `raised`, its operation's FPSR flags (every element's): with an unmasked pre-computation exception the
 /// pre-computation flags only (post-computation conditions are not looked for), else all of them, masked ones included.
+/// Without AFP under effective FTZ the check also tests UFC when PE is unmasked (fexc's `SimdCheckMask`: a flush sets UFC and no IXC
+/// there), and the UFC kept here becomes UE and PE in [`mxcsr_flags`] (`no_afp`), so a flush with PE unmasked delivers #XM with both set.
 pub const fn simd_fault_flags(raised: u64, mxcsr: u64) -> u64 {
     let pre = raised & FPSR_PRE;
     if pre & fpsr_bits(simd_unmasked(mxcsr)) != 0 {
@@ -1966,7 +1983,7 @@ pub const fn fsw_summary(fsw: u64, fcw: u64) -> u64 {
 /// (inventory 1.7, 1.8), so under effective FTZ (FZ with UM masked, the condition [`fpcr`] uses) UFC also sets PE, as x86 does
 /// for a flushed result; without FTZ a UFC comes with IXC already.
 pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64, no_afp: bool) -> u64 {
-    let ftz = no_afp as u64 & mxcsr >> 15 & mxcsr >> 11;
+    let ftz = ftz_key(mxcsr, no_afp);
     let pe = fpsr >> 4 | (fpsr >> 3 & ftz);
     let de = if mxcsr & MXCSR_DAZ == 0 {
         fpsr >> 7 & 1
@@ -2248,7 +2265,10 @@ impl Cpu {
             // I5c: the unmasked MXCSR and FCW exceptions (0 with every exception masked): a translation checks each
             // floating-point instruction for them.
             | simd_unmasked(self.mxcsr) << 18
-            | x87_unmasked(self.fcw) << 24;
+            | x87_unmasked(self.fcw) << 24
+            // AFP fallback chunk 3a: without AFP, the code of DAZ and of effective FTZ differs (0 with AFP).
+            | daz_key(self.mxcsr, self.no_afp != 0) << 30
+            | ftz_key(self.mxcsr, self.no_afp != 0) << 31;
         word
     }
 }
@@ -3955,8 +3975,9 @@ mod tests {
         assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET, false), 0); // precision control has no FPCR effect (doubles throughout)
     }
 
-    /// AFP fallback chunk 1: without AFP no AFP bit (AH 1, NEP 2, FIZ 0) is ever written: FPCR holds RMode and FZ only, the
-    /// x87 word RMode only; `x87_fpcr` is still 0 exactly when it equals MXCSR's. Everything else of the words is as with AFP.
+    /// AFP fallback chunks 1 and 3a: without AFP no AFP bit (AH 1, NEP 2, FIZ 0) is ever written: FPCR holds RMode and FZ only,
+    /// the x87 word RMode only; `x87_fpcr` is still 0 exactly when it equals MXCSR's. RMode is as with AFP; FZ is set only with
+    /// DAZ and effective FTZ both (FZ also flushes inputs there, so DAZ alone and FTZ alone flush in software, keyed code).
     #[test]
     fn without_afp_the_fpcr_words_hold_no_afp_bits() {
         const AFP: u64 = 7;
@@ -3965,7 +3986,8 @@ mod tests {
         for mxcsr in 0..1u64 << 16 {
             let (with, without) = (fpcr(mxcsr, false), fpcr(mxcsr, true));
             assert_eq!(without & AFP, 0, "{mxcsr:#x}");
-            assert_eq!(without, with & !AFP, "{mxcsr:#x}: RMode and FZ as with AFP");
+            let fz = (with >> 24 & mxcsr >> 6 & 1) << 24;
+            assert_eq!(without, with & !AFP & !(1 << 24) | fz, "{mxcsr:#x}: RMode as with AFP, FZ with DAZ and FTZ");
             for rc in 0..4u64 {
                 let fcw = FCW_INIT & !(3 << 10) | rc << 10;
                 let x87 = x87_fpcr(fcw, mxcsr, true);
@@ -3979,9 +4001,49 @@ mod tests {
         // The default modes need no x87 word without AFP either; FTZ and a different RC do, and so does nearest rounding
         // under FTZ or another MXCSR.RC, whose FPCR is 0: it is sent with the explicit marker, never as a bare 0.
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, true), 0);
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, true), X87_FPCR_EXPLICIT);
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, true), 0); // FTZ alone: FZ stays clear (software flush)
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 6, true), 0); // DAZ alone, likewise
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15 | 1 << 6, true), X87_FPCR_EXPLICIT); // both: FZ = 1 (hardware flush)
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 13, true), X87_FPCR_EXPLICIT);
         assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true), X87_FPCR_EXPLICIT | 3 << 22);
+    }
+
+    /// AFP fallback chunk 3a: the keys. Without AFP code is keyed on MXCSR.DAZ (bit 30) and effective FTZ (bit 31: FTZ with UM
+    /// masked, the condition `fpcr` uses), whatever else MXCSR holds; with AFP never (and so `code_context` is as before: the host's
+    /// identity test covers every MXCSR). FZ is 1 exactly when both keys are, DAZ alone and FTZ alone leaving FZ clear.
+    #[test]
+    fn without_afp_code_is_keyed_on_daz_and_effective_ftz() {
+        let mut c = Cpu {
+            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
+            dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
+            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1,
+        };
+        let plain = c.code_context();
+        assert_eq!(plain >> 30, 0, "the default MXCSR keys nothing");
+        for mxcsr in 0..1u64 << 16 {
+            let (daz, ftz) = (mxcsr >> 6 & 1, mxcsr >> 15 & mxcsr >> 11 & 1);
+            c.no_afp = 1;
+            c.mxcsr = mxcsr;
+            let keyed = c.code_context();
+            assert_eq!((daz_key(mxcsr, true), ftz_key(mxcsr, true)), (daz, ftz));
+            assert_eq!(keyed >> 30, daz | ftz << 1, "{mxcsr:#x}");
+            assert_eq!(fpcr(mxcsr, true) >> 24 & 1, daz & ftz, "{mxcsr:#x}");
+            c.no_afp = 0;
+            assert_eq!((daz_key(mxcsr, false), ftz_key(mxcsr, false)), (0, 0));
+            assert_eq!(c.code_context() >> 30, 0, "{mxcsr:#x}: with AFP no key bit");
+            assert_eq!(fpcr(mxcsr, false) >> 24 & 1, ftz, "{mxcsr:#x}: AFP keeps FZ = FTZ");
+        }
+        // The same MXCSR with another mode is another context, so a mode change re-keys (LDMXCSR is a resident transaction).
+        c.no_afp = 1;
+        let ctx = |mxcsr: u64| Cpu { mxcsr, ..c }.code_context();
+        let modes = [MXCSR_RESET, MXCSR_RESET | MXCSR_DAZ, MXCSR_RESET | 1 << 15, MXCSR_RESET | MXCSR_DAZ | 1 << 15];
+        for (i, a) in modes.iter().enumerate() {
+            for b in &modes[..i] {
+                assert_ne!(ctx(*a), ctx(*b), "{a:#x} {b:#x}");
+            }
+        }
+        let um = !(1 << 11);
+        assert_eq!(ctx((MXCSR_RESET | 1 << 15) & um), ctx(MXCSR_RESET & um), "FTZ is ignored with UM unmasked");
     }
 
     /// AFP fallback row 3: without AFP, under effective FTZ (FZ, UM masked) a UFC also sets PE, since the flush has no IXC; no
