@@ -385,6 +385,43 @@ code, object, extent, args_read; only the host's fields in its JSON); the P3 rep
 difference from series32's fork mode, and chunk 2's replay of an installer boot's 1,142,279 recorded requests through
 series47-seg and series48-lean none in code, object, extent, args_read or `guest.end`.
 
+### Replay gate (CPU-features plan, chunk 0)
+
+A change to fexc, the shim or the feature tables that must not change any reply is proved by replaying a recorded request
+stream through the old and the new compiler and comparing every reply (status, code, JSON, object, extent, args_read: the
+whole payload). The streams are the requests the host sent, recorded by the host itself: `NATEMU_FEXC_RECORD=PATH` makes
+every `Compiler` (every vCPU) append each request it sends to fexc as u32 length + body, the format the test reads; the
+file is written whole records at a time under one lock, so several vCPUs share one file (the replay does not depend on
+their interleaving). Unset, it costs nothing. Requests answered from a cache never reach fexc, so record with the persistent
+cache off. A stream is several GB (an installer boot's is about 2.8 GB at N = 1): keep it under
+`natemu-raw/<dated dir>/`, never in the repository, and write the SHA-256 of the fexc that was recorded beside it
+(`shasum -a 256 .../obj/fexc > STREAM.fexc.sha256`; the request bodies do not depend on fexc, but the record states what the
+boot ran against). Record at N = 1 so the stream is one boot's single sequence.
+
+Record (one VM at a time, under the VM lock; `NATEMU_RAW_ROOT` set in a worktree):
+
+    export NATEMU_RAW_ROOT=/Users/liaozping/orca/natemu-raw
+    RAW=$NATEMU_RAW_ROOT; K=$RAW/kernel-census-20261028-01/dl; D=$RAW/DATED-DIR; mkdir -p $D
+    # installer boot (the Debian installer to "Select a language"):
+    NATEMU_FEXC_RECORD=$D/installer.stream /usr/bin/lockf -k $RAW/.vm.lock python3 tools/bench/boot.py --out $D/rec --name installer \
+        --emu natemu --vcpus 1 --kernel $K/linux --initrd $K/initrd.gz --fexc FEXC --cache off
+    # `build` boot (bench initramfs, kernel command line bench=build):
+    NATEMU_FEXC_RECORD=$D/build.stream /usr/bin/lockf -k $RAW/.vm.lock python3 tools/bench/run.py --out $D/rec --name build \
+        --emu natemu --vcpus 1 --bench build --kernel $K/linux --initrd $RAW/bench-20261105-03/out/bench.cpio --fexc FEXC --compile-cache off
+
+(`boot.py` and `run.py` run `target/release/natemu` and the resident beside it: build both first, as `run_boot_smoke.py`'s
+`build()` does.)
+
+Replay (no VM; `NATEMU_REPLAY_OLD` serves over the pipe, `FEXC` over the channel as the host runs it; the same binary in both
+is the self-check; `NATEMU_REPLAY_ARGS` passes server options to both, e.g. `--report`):
+
+    NATEMU_REPLAY=$D/installer.stream NATEMU_REPLAY_OLD=OLD_FEXC FEXC=NEW_FEXC \
+        cargo test --release -p natemu --lib -- --ignored --nocapture channel_replay_matches_the_pipe
+
+It prints `replay: N requests, D differences` and fails unless N > 0 and D = 0. A stream's replay takes minutes (about
+1 M requests at tens of microseconds each, twice). A later chunk's body-rewrite step (the host-derived mask) is not part of
+this tool yet.
+
 ## What builds
 
 `libfexcore.a`: decoder/frontend, x86 tables, OpDispatcher + IR, passes,
