@@ -223,7 +223,7 @@ extent and the guest end fields.
 | --- | --- | --- |
 | 0. Stream | Record the two request streams at 333b7b6, with the fexc SHA-256 beside each; the streams fall under the disk-hygiene rule (several GB each); make the replay a documented tool (stream path, body rewrite hook) | the replay of each stream against today's fexc is identical (a self-check) |
 | 1. Catalogue | Per-bit entries extended (`requires`, `host`, `msrs`, `cr4`, `subleaf`, `resident`, `gates`, `layout`, `not-built`); the derived core/optional classification; the validator | `cpu_profile.rs` regenerates identically; every advertised feature classifies as core; negative controls refused: a missing requirement, an advertised `not-built` feature, an x86-64-v3 feature made non-core by a required Arm feature above the floor, an optional layout feature |
-| 2. Host table and probe | Policy, `floor` and encoding-class fields in FEATURES; the floor recorded from a real M2 (its `sysctl hw.optional.arm` and the vCPU ID registers natemu reads; if none is at hand, from the M2's published ID-register values, marked unverified until a real M2 confirms them); the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM, LSE or a floor feature simulated missing; on the M4, CSV3/SB from registers equal sysctl's; on the M2, the probe passes and names AFP as an exactness difference |
+| 2. Host table and probe | Policy, `floor` and encoding-class fields in FEATURES; the floor from the appendix (sysctl, recorded) confirmed by the vCPU ID registers natemu reads, on the M2; the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM, LSE or a floor feature simulated missing; on the M4, CSV3/SB from registers equal sysctl's; on the M2, the probe passes and names AFP as an exactness difference |
 | 3. Gate constants | Generated `GF_*` for C++ and Rust; gated shim rows; the `x86_avx` rule; `system.rs` checks; cross-check test | replay identical on both streams and the standing corpora; a scratch build with SHA and ADX cleared in the JSON makes their forms #UD in fexc and the host decode alike (the old hand cut, now derived; not committed); negative control: a scratch optional entry with a deliberately missing shim gate fails the cross-check |
 | 4. Records | Contracts and README; the adding-a-feature checklist; the decision record's row | review |
 | 5. (with the first optional feature) Host-derived mask | Superset tables plus mask in `cache::Control`, computed from the probe; `--guest-features`; the vCPU-identity assertion | replay with the body rewrite identical; judge vectors identical for the all-core mask; a host lacking the optional feature's Arm feature answers per the judge without it |
@@ -262,9 +262,13 @@ ERMS/FSRM is a hint with no Arm feature behind it. RPRES is a host code-generati
    - the system features natemu implements itself stay;
    - nothing advertised today is removed.
 
-   This plan admits such extensions as core when they are built. It does not build them: VAES, VPCLMULQDQ, AVX-VNNI
-   and the rest are decided one at a time afterwards (the non-goal above). If the owner meant "build them now", that is
-   a scope change to confirm.
+   This plan admits such extensions when they are built. It does not build them: VAES, VPCLMULQDQ, AVX-VNNI and the
+   rest are decided one at a time afterwards (the non-goal above). Owner, November 15: "they are optional and dependent
+   on host's cpu features unless they are universally supported". That is the derivation of §2.1. Against the recorded
+   floor (appendix) all three are universally supported, so each would be core once built:
+   - VAES on AES;
+   - VPCLMULQDQ on PMULL;
+   - AVX-VNNI on DotProd, with I8MM also present.
 2. **Host floor:** the M2's Arm feature set and above. M1 and anything else below the floor isn't a target. A host is
    refused only for missing a feature something requires, and the check is by feature, never by chip name.
 3. **Host features eagerly determine guest features:** there is no guest cherry-picking. No option selects guest
@@ -308,3 +312,29 @@ are answered below.
 | R3-1 | Third round, verdict accept. `layout`'s "transaction compiled in" was too broad: it would force every resident-implemented feature into the core set | Narrowed to "presence tested as a compile-time constant" (today XSAVEC and XSAVEOPT) |
 | R4 | Fourth round, on the owner revision: SHA, AES and PCLMULQDQ have no FEX fallback, contrary to the second round's note; stale wording; `state` duplicated; OSXSAVE versus the v3 rule; build-now versus admit-when-built | `required` judged over the whole pipeline and listed for the three; wording fixed; validator checks `state` against the derivation; OSXSAVE exempt; §6 makes admit-when-built explicit and notes the CPUID-differs-by-host consequence; chunk 2 names a fallback source for the floor |
 | Owner | Decisions after the review (§6): no guest selection; the M2 floor; core derived from the floor | `selectable`, the `--cpu` option and the hand-marked `core` flag are removed. Core and optional are derived from Arm needs and the floor. §3 became the host-derived mask, built with the first optional feature. Earlier rows that mention selection, `-FEATURE` or decisions A and B describe the text as it was then |
+
+## Appendix: the host floor (recorded November 15, 2026)
+
+**Source.** `sysctl hw.optional.arm` on the owner's M2 Max, and the same on this M4. Chunk 2 confirms the floor through
+the vCPU's ID registers on the M2. Sysctl describes the host, and the vCPU's view can differ (§2.2).
+
+**The floor** is the Arm features both machines report. The M4 lacks one feature the M2 has (SSBS), so "the M2 and
+above" is the intersection of the two, not the M2's list:
+- AdvSIMD, AdvSIMD_HPFPCvt, FP16;
+- AES, PMULL, SHA1, SHA256, SHA3, SHA512;
+- BF16, I8MM, DotProd, FHM, RDM, FCMA, JSCVT, FRINTTS;
+- CRC32, FlagM, FlagM2;
+- LSE, LSE2, LRCPC, LRCPC2;
+- ECV, SB, CSV2, CSV3, DIT;
+- DPB, DPB2, PAuth, PAuth2, PACIMP, FPAC, BTI.
+
+Apple's TSO bit and the interrupt-controller API are part of the floor too, though they aren't ID-register features.
+
+**Above the floor** (M4 only): AFP, RPRES, WFxT, FPACCOMBINE, SME/SME2 and its variants, and synchronous FP exceptions.
+
+**M2 only:** SSBS. Natemu does not use it.
+
+**Against fexc's feature table.** Every Arm feature fexc uses when present is in the floor except AFP: atomics_lse,
+flagm, flagm2, fcma, crc32, aes, sha, pmull128, frintts, i8mm, dotprod, ecv. lrcpc and lrcpc2 are in the floor but off by
+policy. AFP is the one exactness feature. Neither machine reports RNG, CSSC, MOPS or SVE.
+
