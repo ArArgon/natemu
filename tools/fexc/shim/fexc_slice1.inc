@@ -15,6 +15,11 @@
 // "#UD If VEX.L = 1" and the like). fexc reports it as `cut_ud`, the host answers `system::UD` without decoding it.
 // SYSTEM wins over prefix checks (a rep insb is a system instruction); the allowlist never admits an
 // instruction that did not decode.
+// Feature gates: `GF_<NAME>` is 1 when tools/models/cpu_profile.json advertises the feature, else 0 (generated from it by
+// tools/models/gen_cpu_profile_rs.py). A row that refuses or allows a form because of a feature tests its constant: with the
+// feature clear the form is the precise #UD; with it advertised the form is whatever its implementation (the rows below) does,
+// and the validator refuses advertising a feature that is not built. tools/models/test_gates.py ties the names to the catalogue.
+#include <fexc_features.h>
 namespace FexcSlice1 {
 using namespace FEXCore::X86Tables;
 
@@ -58,8 +63,8 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   case 0x80: case 0x81: case 0x83: return Allow();                  // group 1 (82 is invalid in 64-bit mode)
   case 0x86: case 0x87: return Allow();                             // xchg; with memory: implicit LOCK, FEX's swpal (S3e)
   // 8f /1../7: reserved in Intel's map (group 1A has /0 only); AMD's XOP prefix (8f with map_select >= 8, so ModRM.reg != 0)
-  // is not advertised (GenuineIntel, CPUID.80000001H:ECX.XOP[11] = 0): #UD (I10).
-  case 0x8F: return has_modrm && reg == 0 ? Allow() : Ud("8f /1../7: XOP (not advertised) or reserved (#UD)");
+  // is #UD while XOP is clear (GenuineIntel, CPUID.80000001H:ECX.XOP[11] = 0) (I10). XOP advertised and unbuilt: refused.
+  case 0x8F: return has_modrm && reg == 0 ? Allow() : GF_XOP && reg != 0 ? Uns("XOP: not built") : Ud("8f /1../7: XOP (not advertised) or reserved (#UD)");
   case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3:
     if (!has_modrm || reg == 6) return Uns("shift group /6 alias");
     // The resident completes CL/zero-count memory carry rotates: FEX branches over their memory access at count zero.
@@ -67,7 +72,9 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
     if ((reg == 2 || reg == 3) && mod != 3 && (op == 0xD2 || op == 0xD3)) return Sys("memory rcl/rcr with CL: resident completion");
     return Allow();
   // Group 11 /1../6 is reserved; /7 is XABORT (c6 f8 ib) / XBEGIN (c7 f8 rel), #UD with CPUID.7.0:EBX.RTM[11] = 0 (I10).
-  case 0xC6: case 0xC7: return has_modrm && reg == 0 ? Allow() : Ud("group 11 other than mov: RTM xabort/xbegin (not advertised) or reserved (#UD)");
+  case 0xC6: case 0xC7:
+    if (has_modrm && reg == 0) return Allow();
+    return GF_RTM && reg == 7 ? Uns("xabort/xbegin: RTM not built") : Ud("group 11 other than mov: RTM xabort/xbegin (not advertised) or reserved (#UD)");
   case 0xF6: case 0xF7:
     if (!has_modrm) return Uns("group 3 without ModRM");
     return reg == 1 ? Uns("test /1 alias") : Allow();
@@ -83,7 +90,7 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   // 82 (group 1 alias); 62 is the EVEX prefix there (AVX-512 not advertised: #UD) (I10).
   case 0x27: case 0x2F: case 0x37: case 0x3F: case 0x60: case 0x61: case 0xD4: case 0xD5: case 0x82:
     return Ud("invalid in 64-bit mode (#UD)");
-  case 0x62: return Ud("EVEX (AVX-512 not advertised: #UD)");
+  case 0x62: return GF_AVX512F ? Uns("EVEX: AVX-512 not built") : Ud("EVEX (AVX-512 not advertised: #UD)");
   default: break;
   }
   if (op >= 0x50 && op <= 0x5F) return Allow();                     // push/pop r
@@ -153,25 +160,26 @@ inline Verdict Two(uint8_t op, bool plain, bool has_modrm, uint8_t mod, uint8_t 
   return Uns("not in the slice-1 allowlist");
 }
 
-// VEX map (FEXC_MAP_VEX): only the BMI1/BMI2 general-register forms the profile advertises. `vex` = map_select | pp << 2 |
-// L << 4. VEX.L = 1 is #UD for all of them.
+// VEX map (FEXC_MAP_VEX): only the BMI1/BMI2 general-register forms the profile advertises (each row needs its own feature:
+// with it clear the form is not allowed here and `Avx` makes it #UD). `vex` = map_select | pp << 2 | L << 4. VEX.L = 1 is #UD
+// for all of them.
 inline Verdict Vex(uint8_t vex, uint8_t op, bool has_modrm, uint8_t reg) {
   const uint8_t map = vex & 3, pp = vex >> 2 & 3;
   if (vex & 16) return Uns("VEX.L = 1 (BMI forms #UD)");
   if (map == 2) {
     switch (op) {
-    case 0xF2: if (pp == 0) return Allow(); break;                                     // andn
-    case 0xF3: if (pp == 0 && has_modrm && reg >= 1 && reg <= 3) return Allow(); break; // blsr/blsmsk/blsi
+    case 0xF2: if (GF_BMI1 && pp == 0) return Allow(); break;                           // andn
+    case 0xF3: if (GF_BMI1 && pp == 0 && has_modrm && reg >= 1 && reg <= 3) return Allow(); break; // blsr/blsmsk/blsi
     case 0xF5:
-      if (pp == 0) return Allow();                                                     // bzhi
-      if (pp >= 2) return Allow();                                                     // pdep, pext (I9: patch 0024's straight-line lowering)
+      if (GF_BMI2 && pp == 0) return Allow();                                          // bzhi
+      if (GF_BMI2 && pp >= 2) return Allow();                                          // pdep, pext (I9: patch 0024's straight-line lowering)
       break;
-    case 0xF6: if (pp == 3) return Allow(); break;                                     // mulx
-    case 0xF7: return Allow();                                                         // bextr/shlx/sarx/shrx
+    case 0xF6: if (GF_BMI2 && pp == 3) return Allow(); break;                          // mulx
+    case 0xF7: if (pp == 0 ? GF_BMI1 : GF_BMI2) return Allow(); break;                 // bextr (BMI1), shlx/sarx/shrx (BMI2)
     default: break;
     }
   }
-  if (map == 3 && op == 0xF0 && pp == 3) return Allow();                               // rorx
+  if (GF_BMI2 && map == 3 && op == 0xF0 && pp == 3) return Allow();                    // rorx
   return Uns("VEX form other than BMI1/BMI2 (AVX: chunk I8)");
 }
 
@@ -219,7 +227,8 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   const char* refuse = nullptr;
   bool mxcsr = false, gather = false, masked = false;
   uint16_t r = NONE;
-  if (map == 1 && pp == 0) {
+  if (!GF_AVX) {}                                                                  // without AVX every form of this table is NONE (#UD); BMI's are `Vex`'s
+  else if (map == 1 && pp == 0) {
     if (in(op, {0x10, 0x11, 0x51, 0x52, 0x53, 0x5a, 0x5b})) r = LL | NOV;
     else if (op == 0x12 || op == 0x16) r = L0;                                   // vmovlps/vmovhlps, vmovhps/vmovlhps
     else if (op == 0x13 || op == 0x17) r = L0 | NOV | MEM;
@@ -262,23 +271,25 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
   } else if (map == 2 && pp == 1) {
     if (op <= 0x0b || in(op, {0x28, 0x29, 0x2b, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x45, 0x47})) r = LL;
     else if (op == 0x0c || op == 0x0d || op == 0x46) r = LL | W0;
-    else if (in(op, {0x0e, 0x0f, 0x13, 0x18, 0x58, 0x59, 0x78, 0x79})) r = LL | W0 | NOV;
+    else if (in(op, {0x0e, 0x0f, 0x18, 0x58, 0x59, 0x78, 0x79}) || (GF_F16C && op == 0x13)) r = LL | W0 | NOV;   // 0x13: vcvtph2ps (F16C)
     else if (op == 0x16 || op == 0x36) r = L1 | W0;                              // vpermps, vpermd
     else if (op == 0x17 || (op >= 0x1c && op <= 0x1e) || (op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35)) r = LL | NOV;
     else if (op == 0x19) r = L1 | W0 | NOV;                                      // vbroadcastsd
     else if (op == 0x1a || op == 0x5a) r = L1 | W0 | NOV | MEM;                  // vbroadcastf128, vbroadcasti128
     else if (op == 0x2a) r = LL | NOV | MEM | ALIGN;                             // vmovntdqa
     else if (op == 0x41) r = L0 | NOV;                                           // vphminposuw
-    else if (in(op, {0x96, 0x97, 0x98, 0x9a, 0x9c, 0x9e, 0xa6, 0xa7, 0xa8, 0xaa, 0xac, 0xae, 0xb6, 0xb7, 0xb8, 0xba, 0xbc, 0xbe})) r = LL;
-    else if (in(op, {0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf})) r = L0;   // FMA scalar
+    else if (GF_FMA && in(op, {0x96, 0x97, 0x98, 0x9a, 0x9c, 0x9e, 0xa6, 0xa7, 0xa8, 0xaa, 0xac, 0xae, 0xb6, 0xb7, 0xb8, 0xba, 0xbc, 0xbe})) r = LL;
+    else if (GF_FMA && in(op, {0x99, 0x9b, 0x9d, 0x9f, 0xa9, 0xab, 0xad, 0xaf, 0xb9, 0xbb, 0xbd, 0xbf})) r = L0;   // FMA scalar
     else if (in(op, {0x2c, 0x2d, 0x2e, 0x2f, 0x8c, 0x8e})) { r = LL | MEM | (op <= 0x2f ? W0 : 0); masked = true; }   // vmaskmovps/pd, vpmaskmovd/q
     else if (op >= 0x90 && op <= 0x93) { r = LL | MEM; gather = true; }      // vpgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd
     else if (op == 0xdb) r = L0 | NOV;                                           // vaesimc (I9)
-    else if (op >= 0xdc && op <= 0xdf) r = L0;                                   // vaesenc/last, vaesdec/last (I9; VAES's L1 not advertised)
+    else if (op >= 0xdc && op <= 0xdf) r = GF_VAES ? LL : L0;                    // vaesenc/last, vaesdec/last (I9; the ymm form is VAES's)
+    else if (GF_AVX_VNNI && op >= 0x50 && op <= 0x53) { r = LL | W0; refuse = "AVX-VNNI: not built"; }   // vpdpbusd/s, vpdpwssd/s
+    else if (GF_GFNI && op == 0xcf) { r = LL | W0; refuse = "GFNI: not built"; }                          // vgf2p8mulb
   } else if (map == 3 && pp == 1) {
     if (op == 0x00 || op == 0x01) r = L1 | W1 | NOV;                             // vpermq, vpermpd
     else if (op == 0x02 || op == 0x4a || op == 0x4b || op == 0x4c) r = LL | W0;  // vpblendd, vblendvps/pd, vpblendvb
-    else if (op == 0x04 || op == 0x05 || op == 0x1d) r = LL | W0 | NOV;          // vpermilps/pd imm8, vcvtps2ph
+    else if (op == 0x04 || op == 0x05 || (GF_F16C && op == 0x1d)) r = LL | W0 | NOV;   // vpermilps/pd imm8, vcvtps2ph (F16C)
     else if (op == 0x06 || op == 0x18 || op == 0x38 || op == 0x46) r = L1 | W0;  // vperm2f128, vinsertf128, vinserti128, vperm2i128
     else if (op == 0x19 || op == 0x39) r = L1 | W0 | NOV;                        // vextractf128, vextracti128
     else if (op == 0x08 || op == 0x09) r = LL | NOV;
@@ -286,7 +297,8 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
     else if (in(op, {0x0c, 0x0d, 0x0e, 0x0f, 0x40, 0x42})) r = LL;
     else if (op >= 0x14 && op <= 0x17) r = L0 | NOV;
     else if (op >= 0x60 && op <= 0x63) r = L0 | NOV;                             // vpcmpestrm/i, vpcmpistrm/i (I6b: svc #STRING)
-    else if (op == 0x44) r = L0;                                                 // vpclmulqdq xmm (I9; the ymm form not advertised)
+    else if (op == 0x44) r = GF_VPCLMULQDQ ? LL : L0;                            // vpclmulqdq xmm (I9; the ymm form is VPCLMULQDQ's)
+    else if (GF_GFNI && (op == 0xce || op == 0xcf)) { r = LL | W1; refuse = "GFNI: not built"; }       // vgf2p8affineqb, vgf2p8affineinvqb
     else if (op == 0xdf) r = L0 | NOV;                                           // vaeskeygenassist (I9)
   }
   // I10: the encodings x86 makes #UD are delivered (`Ud`, before any gating: decode faults come first, SDM Vol.3 Table 6-2):
@@ -422,7 +434,7 @@ inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
     else if ((op >= 0x08 && op <= 0x0f && op != 0x0a && op != 0x0b) || (op >= 0x40 && op <= 0x42)) form = M128;
     else if (op == 0x44 || op == 0xdf) form = M128;        // pclmulqdq, aeskeygenassist (I9: exception class 4, aligned)
     else if (op >= 0x60 && op <= 0x63) form = UNALIGNED;   // pcmpestrm/i, pcmpistrm/i: no alignment (SDM); I6b: svc #STRING
-  } else if ((map == 5 && pfx == 0 && op >= 0xc8 && op <= 0xcd) || (map == 6 && pfx == 0 && op == 0xcc)) {
+  } else if (GF_SHA && ((map == 5 && pfx == 0 && op >= 0xc8 && op <= 0xcd) || (map == 6 && pfx == 0 && op == 0xcc))) {
     form = M128;   // SHA1NEXTE/MSG1/MSG2, SHA256RNDS2/MSG1/MSG2, SHA1RNDS4 (CPUID.7.0:EBX.SHA[29]; class 4, aligned): Arm SHA1*/SHA256*
   }
   if (form == NO) {
@@ -433,7 +445,7 @@ inline Verdict Sse(uint8_t map, uint8_t pfx, uint8_t op, bool has_modrm, uint8_t
       if (fexc_sse_gated) { Verdict v = Sys("SSE gated by CR0.EM/TS or CR4.OSFXSR (#UD/#NM)"); v.simd = true; return v; }
       return Sys("maskmovdqu: the resident's masked store");
     }
-    if ((map == 5 || map == 6) && pfx == 0) return Ud("0f 38 / 0f 3a form without a prefix that is no MMX form: none advertised (#UD)");
+    if ((map == 5 || map == 6) && pfx == 0) return Ud("0f 38 / 0f 3a form without a prefix that is no MMX form: none advertised (#UD; SHA's with SHA clear)");
     return none;
   }
   if (!has_modrm || (reg_only && mod != 3) || (mem_only && mod == 3)) return Ud("SSE form with an operand x86 makes #UD");
@@ -531,7 +543,7 @@ inline Verdict Undefined0F38(const DecodedInst& d, bool decoded, bool has_modrm,
       const uint8_t* b = fexc_guest_bytes ? fexc_guest_bytes(d.PC, d.InstSize) : nullptr;
       bool b66 = false, bf2 = false, bf3 = false;
       for (unsigned i = 0; b && i < d.InstSize && b[i] != 0x0F; ++i) { b66 |= b[i] == 0x66; bf2 |= b[i] == 0xF2; bf3 |= b[i] == 0xF3; }
-      if (b && !bf2 && (b66 || bf3)) return {UNSUPPORTED, false, nullptr};
+      if (b && !bf2 && (b66 || bf3)) return GF_ADX ? Verdict {UNSUPPORTED, false, nullptr} : Ud("adcx/adox (ADX not advertised: #UD)");
     }
     if ((op == 0xF0 || op == 0xF1) && !pf2 && !pf3 && has_modrm && mod == 3) return Sys("movbe with a register operand (#UD)");
     // I10: SDM MOVBE "#UD ... If REP (F3H) prefix is used" (FEX's decoder fails before the ModRM: any operand).
@@ -560,11 +572,11 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     const bool np66 = !(f & (DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX));
     // TPAUSE (66), UMONITOR (F3), UMWAIT (F2) 0f ae /6 register: "#UD If CPUID.7.0:ECX.WAITPKG[bit 5] = 0" (not advertised).
     // (Without a prefix, 0f ae /6 register is MFENCE.)
-    if (two && op == 0xAE && has_modrm && mod == 3 && reg == 6 &&
+    if (!GF_WAITPKG && two && op == 0xAE && has_modrm && mod == 3 && reg == 6 &&
         (f & (DecodeFlags::FLAG_OPERAND_SIZE | DecodeFlags::FLAG_REP_PREFIX | DecodeFlags::FLAG_REPNE_PREFIX)))
       return Ud("tpause/umonitor/umwait (WAITPKG not advertised: #UD)");
     // INCSSPD/INCSSPQ (F3 0f ae /5, register): SDM INCSSP "#UD If CR4.CET = 0" (CET is not advertised, so CR4.CET stays 0).
-    if (two && op == 0xAE && has_modrm && mod == 3 && reg == 5 && (f & DecodeFlags::FLAG_REP_PREFIX) && !(f & DecodeFlags::FLAG_REPNE_PREFIX))
+    if (!GF_CET_SS && two && op == 0xAE && has_modrm && mod == 3 && reg == 5 && (f & DecodeFlags::FLAG_REP_PREFIX) && !(f & DecodeFlags::FLAG_REPNE_PREFIX))
       return Ud("incssp (#UD with CR4.CET = 0; CET not advertised)");
     // The MMX/SSE shift groups 12-14 (0f 71..73, none or 66): only the register forms of /2 /4 /6 (0f 73: /2 /6, 66 0f 73 also
     // /3 /7) exist; FEX's decoder fails on the others, which are reserved (#UD).
@@ -574,7 +586,7 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
       if (!ok) return Ud("MMX/SSE shift group encoding x86 makes #UD");
     }
     // 3DNow! (0f 0f; CPUID.80000001H:EDX[31] = 0, not in Intel's map): #UD.
-    if (d.FexcMap == FEXC_MAP_3DNOW) return Ud("3DNow! (not advertised: #UD)");
+    if (!GF_3DNOW && d.FexcMap == FEXC_MAP_3DNOW) return Ud("3DNow! (not advertised: #UD)");
     // A VEX prefix FEX does not decode (an opcode no VEX feature FEX implements defines: AVX-VNNI, AMX, AVX-512 mask forms...):
     // none advertised, #UD; a 66/F2/F3/REX before it is #UD too (I8's vex_ud).
     if (!decoded && d.FexcMap == FEXC_MAP_VEX) return Ud("VEX form FEX does not decode: not advertised (#UD)");
@@ -600,7 +612,7 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     // ADX (November 3, CPUID.7.0:EBX.ADX[19]): ADCX (66 0f 38 f6) and ADOX (F3 0f 38 f6), r32/r64 (REX.W), r/m: FEX's ADXOp, an
     // Arm ADC whose carry-in is CF (ADCX) or OF moved into C (ADOX); the other flags are restored from the NZCV before it (RMIF),
     // PF/AF untouched. A general-register form (not gated by CR0/CR4); LOCK is #UD (above, not lockable).
-    else if (map == 5 && op == 0xF6 && !pf2 && (p66 || pf3) && has_modrm) v = Allow();
+    else if (GF_ADX && map == 5 && op == 0xF6 && !pf2 && (p66 || pf3) && has_modrm) v = Allow();
     else if (v = Mmx(map, pfx, op, has_modrm, mod, reg); v.why == nullptr) v = Sse(map, pfx, op, has_modrm, mod, reg);
     else if (v.mmx && v.kind != ALLOW && fexc_x87_gated) { v = Sys("MMX gated by CR0.EM/TS (#UD/#NM)"); v.mmx = true; v.gated = true; return v; }
     if (v.why == nullptr) v = {UNSUPPORTED, false, nullptr};
@@ -696,7 +708,7 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     // processors that do not support CET", RDSSP "a NOP when CET shadow stacks are not enabled and on processors that do not
     // support CET" (its destination unchanged), with no memory access. FEX decodes it as NOP from the base two-byte table
     // (NO_OVERLAY) whatever the 66/F2/F3 prefix and emits nothing. LOCK is cut above (#UD).
-    if (decoded && d.FexcMap == FEXC_MAP_TWO && op == 0x1E && has_modrm && !(d.Flags & DecodeFlags::FLAG_LOCK))
+    if (!GF_CET_IBT && !GF_CET_SS && decoded && d.FexcMap == FEXC_MAP_TWO && op == 0x1E && has_modrm && !(d.Flags & DecodeFlags::FLAG_LOCK))
       return Allow();
     return v;
   }
@@ -723,7 +735,7 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   // X1c (owner decision, November 2): F2 on a near CALL, RET, JMP or Jcc is MPX's BND prefix, ignored where MPX is not
   // enumerated (as on the modelled processor; pinned QEMU agrees): FEX compiles the branch as without it. Not on
   // LOOP/LOOPcc/JrCXZ (BND does not apply there).
-  const bool bnd = v.branch && !(primary && d.OPRaw >= 0xE0 && d.OPRaw <= 0xE3);
+  const bool bnd = !GF_MPX && v.branch && !(primary && d.OPRaw >= 0xE0 && d.OPRaw <= 0xE3);
   if ((f & DecodeFlags::FLAG_REPNE_PREFIX) && !compare && !bnd) return Uns(string ? "REPNE prefix on movs/stos/lods" : "REPNE prefix");
   // rep ret is a ret; F3 90 (no REX.B: that would be xchg r8, rax) is PAUSE, FEX's `yield`; F3 0f 38 f6 is ADOX (mandatory).
   const bool adox = d.FexcMap == FEXC_MAP_0F38 && op == 0xF6;   // admitted above only with F3 alone
