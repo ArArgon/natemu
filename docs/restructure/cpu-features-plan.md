@@ -123,7 +123,7 @@ the CPU's capability: OSXSAVE follows CR4.OSXSAVE, APIC follows APIC_BASE, and H
 
 The validator (`cpu_profile.py`, run by the generator and the tests) refuses:
 - an advertised feature whose `requires` is not advertised;
-- a `not-built` feature that is advertised;
+- a feature with `built: false` that is advertised;
 - an x86-64-v3 feature that is not core (OSXSAVE, a `dynamic` bit, is exempt);
 - a `state` that disagrees with the derivation. An advertised feature must be core, and a built core feature must be
   advertised. Optional features are `clear` with `built: true`, and the mask sets them per host;
@@ -384,7 +384,7 @@ extent and the guest end fields.
 | Chunk | Content | Gate |
 | --- | --- | --- |
 | 0. Stream | Record the two request streams at 333b7b6, with the fexc SHA-256 beside each; the streams fall under the disk-hygiene rule (several GB each); make the replay a documented tool (stream path, body rewrite hook) | the replay of each stream against today's fexc is identical (a self-check) |
-| 1. Catalogue | Per-bit entries extended (`requires`, `host`, `msrs`, `cr4`, `subleaf`, `resident`, `gates`, `layout`, `not-built`); the derived core/optional classification; the validator | `cpu_profile.rs` regenerates identically; every advertised feature classifies as core; negative controls refused: a missing requirement, an advertised `not-built` feature, an x86-64-v3 feature made non-core by a required Arm feature above the floor, an optional layout feature |
+| 1. Catalogue | Per-bit entries extended (`requires`, `host`, `msrs`, `cr4`, `subleaf`, `resident`, `gates`, `layout`, `built`); the derived core/optional classification; the validator | `cpu_profile.rs` regenerates identically; every advertised feature classifies as core; negative controls refused: a missing requirement, an advertised `built: false` feature, an x86-64-v3 feature made non-core by a required Arm feature above the floor, an optional layout feature |
 | 2. Host table and probe | Policy, `floor` and encoding-class fields in FEATURES; the floor from the appendix (sysctl, recorded) confirmed by the vCPU ID registers natemu reads, on the M2; the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM, LSE or a floor feature simulated missing; on the M4, CSV3/SB from registers equal sysctl's; on the M2, the probe passes and names AFP as an exactness difference; the fallback gate (§2.2a) on the M4 |
 | 3. Gate constants | Generated `GF_*` for C++ and Rust; gated shim rows; the `x86_avx` rule; `system.rs` checks; cross-check test | replay identical on both streams and the standing corpora; a scratch build with SHA and ADX cleared in the JSON makes their forms #UD in fexc and the host decode alike (the old hand cut, now derived; not committed); negative control: a scratch optional entry with a deliberately missing shim gate fails the cross-check |
 | 4. Records | Contracts and README; the adding-a-feature checklist; the decision record's row | review |
