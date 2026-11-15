@@ -7,7 +7,7 @@
 //! process: the program driver's stderr stays as it was. The interrupt-controller API is a deployment fact (its functions
 //! are strong imports: macOS 15 or later, stated in the README), not probed.
 use crate::admission::{
-    Class, FEATURES, ID_REGISTERS, MACHINE, detected, supported_features,
+    Class, FEATURES, ID_REGISTERS, MACHINE, detected, forced_off, supported_features,
 };
 use crate::vm::{ACTLR_EL1, Vcpu, config_id_register};
 use std::sync::OnceLock;
@@ -15,11 +15,15 @@ use std::sync::OnceLock;
 /// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
 const CONFIG_REGISTERS: [u32; ID_REGISTERS.len()] = [2, 3, 7, 4, 5, 6];
 
-/// What the host's vCPU shows: the ID registers and whether Apple's TSO bit (ACTLR_EL1 bit 1) reads back set.
+/// What the host's vCPU shows: the ID registers and whether Apple's TSO bit (ACTLR_EL1 bit 1) reads back set, and the
+/// features `NATEMU_FEXC_FEATURE_OFF` clears (FEATURES bits; test only: the fallback gate, plan section 2.2a). The exactness
+/// facts and the supported set both follow the effective set, so an M4 told `afp` off is a host without AFP in the startup line
+/// too (AFP fallback plan section 1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Probe {
     pub id: [u64; ID_REGISTERS.len()],
     pub tso: bool,
+    pub forced_off: u64,
 }
 impl Probe {
     /// Reads a created vCPU, after the resident's setup wrote ACTLR_EL1 (`vm.rs enter_resident_with_asid`).
@@ -31,6 +35,10 @@ impl Probe {
         Ok(Self {
             id,
             tso: cpu.sys(ACTLR_EL1)? & 2 != 0,
+            forced_off: match std::env::var_os("NATEMU_FEXC_FEATURE_OFF") {
+                Some(list) => forced_off(&list.to_string_lossy())?,
+                None => 0,
+            },
         })
     }
     /// Every `Required` item the host lacks (fexc features by fexc's name, then the machine's rows).
@@ -42,10 +50,11 @@ impl Probe {
         self.lacking(Class::Exactness)
     }
     fn lacking(&self, class: Class) -> Vec<&'static str> {
-        let features = FEATURES.iter().map(|f| (f.name, &f.detect, f.class));
-        let machine = MACHINE.iter().map(|&(n, ref d, c)| (n, d, c));
+        let off = |i: usize| self.forced_off >> i & 1 != 0;
+        let features = (FEATURES.iter().enumerate()).map(|(i, f)| (f.name, &f.detect, f.class, off(i)));
+        let machine = MACHINE.iter().map(|&(n, ref d, c)| (n, d, c, false));
         (features.chain(machine))
-            .filter(|&(_, d, c)| c == class && !detected(d, &self.id, self.tso))
+            .filter(|&(_, d, c, off)| c == class && (off || !detected(d, &self.id, self.tso)))
             .map(|(n, ..)| n)
             .collect()
     }
@@ -72,9 +81,9 @@ impl Probe {
         }
         line
     }
-    /// The fexc feature bits this vCPU can execute.
+    /// The fexc feature bits fexc is told: those this vCPU can execute, less `NATEMU_FEXC_FEATURE_OFF`'s.
     pub(crate) fn supported(&self) -> u64 {
-        supported_features(&self.id)
+        supported_features(&self.id) & !self.forced_off
     }
 }
 
@@ -146,7 +155,7 @@ mod tests {
         1 << 32,      // LSE2
     ];
     fn probe(f: impl FnOnce(&mut Probe)) -> Probe {
-        let mut p = Probe { id: FULL, tso: true };
+        let mut p = Probe { id: FULL, tso: true, forced_off: 0 };
         f(&mut p);
         p
     }
@@ -214,6 +223,20 @@ mod tests {
         assert!(p.line().ends_with(" +xsaveopt; host -afp"), "{}", p.line());
         assert_eq!(p.line().matches('\n').count(), 0); // one line
         assert_eq!(p.supported() & 1 << index("afp"), 0);
+    }
+
+    /// The startup line and the supported set follow the effective set: `NATEMU_FEXC_FEATURE_OFF=afp` on a host with AFP
+    /// prints `; host -afp` and clears the bit fexc is told; forcing a Speed feature off changes neither the line nor a Required item.
+    #[test]
+    fn a_forced_off_afp_is_a_host_without_afp() {
+        let forced = probe(|p| p.forced_off = 1 << index("afp"));
+        assert_eq!(forced.refusal(), None);
+        assert!(forced.line().ends_with(" +xsaveopt; host -afp"), "{}", forced.line());
+        assert_eq!(forced.supported() & 1 << index("afp"), 0);
+        assert_eq!(forced.supported(), probe(|p| p.id[4] = 0).supported());
+        let speed = probe(|p| p.forced_off = 1 << index("flagm2"));
+        assert_eq!(speed.line(), probe(|_| {}).line());
+        assert_eq!(speed.supported() & 1 << index("flagm2"), 0);
     }
 
     /// The startup probe reads the vCPU's registers; so does [`config_view`], and CSV3 and SB answered from it equal sysctl's

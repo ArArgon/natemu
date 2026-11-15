@@ -108,7 +108,7 @@ void Arm64JITCore::FexcX87Begin() {
   msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
   if (fexc_x87_fpcr) {
     mrs(TMP3, ARMEmitter::SystemRegister::FPCR);
-    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, fexc_x87_fpcr);
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, uint64_t(fexc_x87_fpcr) & 0xffffffffull); // bit 32: "explicit" (host `X87_FPCR_EXPLICIT`)
     msr(ARMEmitter::SystemRegister::FPCR, TMP1);
   }
 }

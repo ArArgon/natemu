@@ -2469,8 +2469,15 @@ pub struct Compiler {
 /// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
 /// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]); and
 /// (I5c) the MXCSR and FCW exceptions whose masks are clear, each instruction then checked for them (none as Linux runs). The
-/// same state is part of `Cpu::code_context`.
-pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
+/// same state is part of `Cpu::code_context`. AFP fallback chunk 1: the FPCR words follow `cpu.no_afp`, which must agree with
+/// `supported`'s afp bit (the value fexc is told: [`run`] sets the one from the other, so a disagreement is a host bug that
+/// would key shared code wrongly).
+pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64) -> Vec<String> {
+    assert_eq!(
+        cpu.no_afp != 0,
+        supported & 1 << admission::index("afp") == 0,
+        "Cpu::no_afp disagrees with the features fexc is told"
+    );
     let mut args = vec![];
     if cpu.cr0 & (exec::CR0_EM | exec::CR0_TS) != 0 {
         args.push("--x87-gated".into());
@@ -2478,7 +2485,7 @@ pub(crate) fn x87_args(cpu: &exec::Cpu) -> Vec<String> {
     if cpu.cr0 & (exec::CR0_TS | exec::CR0_MP) == exec::CR0_TS | exec::CR0_MP {
         args.push("--wait-gated".into());
     }
-    match exec::x87_fpcr(cpu.fcw, cpu.mxcsr) {
+    match exec::x87_fpcr(cpu.fcw, cpu.mxcsr, cpu.no_afp != 0) {
         0 => {}
         fpcr => args.extend(["--x87-fpcr".into(), format!("{fpcr:#x}")]),
     }
@@ -2526,6 +2533,19 @@ fn record_request(body: &[u8]) {
     write_record(&mut *out.lock().unwrap_or_else(|e| e.into_inner()), body)
         .expect("NATEMU_FEXC_RECORD: write");
 }
+/// AFP fallback chunk 1 (the replay's body-rewrite hook): `body` (u32 LE length of the NUL-terminated arguments, the arguments,
+/// then the guest bytes) with `add` appended to its arguments, e.g. `--feature afp=0` to replay an AFP host's recorded
+/// stream as a host without AFP asks for it. Only the replay test uses it.
+#[cfg(test)]
+fn with_added_args(body: &[u8], add: &[&str]) -> Vec<u8> {
+    let n = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+    let extra: Vec<u8> = add.iter().flat_map(|a| a.bytes().chain([0])).collect();
+    let mut out = ((n + extra.len()) as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&body[4..4 + n]);
+    out.extend(extra);
+    out.extend_from_slice(&body[4 + n..]);
+    out
+}
 /// One record in a single write (u32 LE length, then `body`).
 fn write_record(out: &mut impl std::io::Write, body: &[u8]) -> std::io::Result<()> {
     let mut record = Vec::with_capacity(4 + body.len());
@@ -2557,10 +2577,8 @@ impl Compiler {
     /// takes the supported features from the vCPU's registers.
     /// `NATEMU_FEXC_FEATURE_OFF=name,...` (test only: the fallback gate, plan section 2.2a) clears the named ones.
     pub fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
-        let mut supported = crate::probe::Probe::read(cpu)?.supported();
-        if let Some(list) = std::env::var_os("NATEMU_FEXC_FEATURE_OFF") {
-            supported &= !admission::forced_off(&list.to_string_lossy())?;
-        }
+        // `NATEMU_FEXC_FEATURE_OFF` is applied inside the probe, so its line and this set agree ([`crate::probe::Probe`]).
+        let supported = crate::probe::Probe::read(cpu)?.supported();
         Ok(Self::with_features(fexc, supported, max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
@@ -3511,6 +3529,10 @@ pub fn run(
     // The resident fetches nothing at the stop RIP (the run ends there).
     let mut state: State = area.read_record(exec::STATE_OFFSET);
     state.stop_at = stop_at.unwrap_or(u64::MAX);
+    // AFP fallback chunk 1 (plan section 1): `Cpu::no_afp`, once, from the same `supported` value fexc is told (after
+    // `NATEMU_FEXC_FEATURE_OFF`), before the first lookup or compile; every vCPU's run starts here (the loader's and the
+    // drivers' `Cpu` values predate the probe and carry 0).
+    state.cpu.no_afp = u64::from(compiler.supported & 1 << admission::index("afp") == 0);
     area.write_record(exec::STATE_OFFSET, state);
     // Perf chunk 10: reuse inside the resident, checked against the host's answers under the reuse check, and never into
     // a range the hook answers at (off when there are more of them than the resident keeps).
@@ -3951,7 +3973,7 @@ fn translation(
         };
         compiler.sse_gated = sse_gated(&state.cpu);
         compiler.avx_gated = avx_gated(&state.cpu);
-        compiler.x87 = x87_args(&state.cpu);
+        compiler.x87 = x87_args(&state.cpu, compiler.supported);
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
         compiler.cpl0 = state.cpu.cpl == 0 && !step;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
@@ -4910,6 +4932,19 @@ mod tests {
         assert_eq!(seen, [&b"\x05\0\0\0abcde+code"[..], b"x"]);
     }
 
+    #[test]
+    fn added_replay_arguments_keep_the_body_well_formed() {
+        let c = Compiler::with_features(Path::new("/nonexistent"), u64::MAX, None);
+        let body = c.body_with(&[0x90, 0xc3], "0x1234".into(), Some(4));
+        assert_eq!(with_added_args(&body, &[]), body);
+        let added = with_added_args(&body, &["--feature", "afp=0"]);
+        let args = |b: &[u8]| {
+            let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+            (b[4..4 + n].to_vec(), b[4 + n..].to_vec())
+        };
+        let ((old, bytes), (new, bytes2)) = (args(&body), args(&added));
+        assert_eq!((bytes, new), (bytes2, [&old[..], b"--feature\0afp=0\0"].concat()));
+    }
     #[test]
     fn body_bytes_are_unchanged() {
         fn reference(c: &Compiler, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
@@ -5943,8 +5978,9 @@ mod tests {
 
     /// Perf chunk 21's identity gate (`NATEMU_REPLAY` = a recorded request stream, u32 length + body as the host wrote
     /// them; `NATEMU_REPLAY_OLD` = a compiler run over the pipe, `FEXC` = one run over the channel as the host runs it;
-    /// `NATEMU_REPLAY_ARGS`: server options for both, e.g. `--report`): every reply identical (code, JSON, object, extent,
-    /// args_read: the whole payload).
+    /// `NATEMU_REPLAY_ARGS`: server options for both, e.g. `--report`; `NATEMU_REPLAY_ADD_ARGS`: request arguments added to
+    /// each body sent to `FEXC` only, e.g. `--feature afp=0`, a replay in M2 emulation, where the replies differ from the
+    /// recorded host's by design): every reply identical (code, JSON, object, extent, args_read: the whole payload).
     #[test]
     #[ignore]
     fn channel_replay_matches_the_pipe() {
@@ -5958,6 +5994,10 @@ mod tests {
         };
         let extra = std::env::var("NATEMU_REPLAY_ARGS").unwrap_or_default();
         let extra: Vec<&str> = extra.split_whitespace().collect();
+        // `NATEMU_REPLAY_ADD_ARGS`: request arguments added to every replayed body for the new compiler (`FEXC`) only, e.g.
+        // `--feature afp=0` (the old compiler gets the recorded bodies), so a recorded stream replays as a host without AFP.
+        let add = std::env::var("NATEMU_REPLAY_ADD_ARGS").unwrap_or_default();
+        let add: Vec<&str> = add.split_whitespace().collect();
         let mut pipe = Command::new(old)
             .arg("--serve")
             .args(&extra)
@@ -5978,8 +6018,9 @@ mod tests {
             from.read_exact(&mut word).unwrap();
             let mut want = vec![0; u32::from_le_bytes(word) as usize];
             from.read_exact(&mut want).unwrap();
+            let sent = if add.is_empty() { body } else { with_added_args(&body, &add) };
             let r = server
-                .request(&body, Instant::now() + COMPILE_DEADLINE)
+                .request(&sent, Instant::now() + COMPILE_DEADLINE)
                 .unwrap();
             let got: Vec<u8> = [
                 r.code as u32,
@@ -6008,7 +6049,8 @@ mod tests {
         drop(to);
         pipe.wait().unwrap();
         eprintln!("replay: {n} requests, {differ} differences");
-        assert!(n > 0 && differ == 0);
+        // With added arguments the replies differ from the recorded host's by design (M2 emulation): only the count gates.
+        assert!(n > 0 && (differ == 0 || !add.is_empty()));
     }
 
     #[test]
@@ -6177,6 +6219,145 @@ mod tests {
         assert_eq!(third, Some(Published::Skipped(crate::publisher::Why::Off)));
     }
 
+    /// AFP fallback plan section 4 (the M4 byte-identity gate the replay cannot see: these are built by the host): with AFP on
+    /// (`no_afp` 0), `code_context`, `fpcr`, `x87_fpcr`, `mxcsr_flags` and `x87_args` are what they were before `no_afp` existed,
+    /// for every MXCSR value (all 16 bits), every FCW.RC and every combination of FCW's six mask bits. The `old_*` functions are
+    /// verbatim copies of the pre-change ones (the commit before chunk 1); `fpsr` runs over every flag byte.
+    mod before_no_afp {
+        use super::*;
+        pub const fn fpcr(mxcsr: u64) -> u64 {
+            let rmode = [0, 2, 1, 3][(mxcsr >> 13 & 3) as usize];
+            1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) | (mxcsr >> 15 & mxcsr >> 11 & 1) << 24 | rmode << 22
+        }
+        pub const fn x87_fpcr(fcw: u64, mxcsr: u64) -> u64 {
+            let x87 = 1 << 1 | 1 << 2 | [0, 2, 1, 3][(fcw >> 10 & 3) as usize] << 22;
+            if x87 == fpcr(mxcsr) { 0 } else { x87 }
+        }
+        pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64) -> u64 {
+            let de = if mxcsr & exec::MXCSR_DAZ == 0 {
+                fpsr >> 7 & 1
+            } else {
+                0
+            };
+            (fpsr & 1)
+                | de << 1
+                | (fpsr >> 1 & 1) << 2
+                | (fpsr >> 2 & 1) << 3
+                | (fpsr >> 3 & 1) << 4
+                | (fpsr >> 4 & 1) << 5
+        }
+        pub fn code_context(c: &Cpu) -> u64 {
+            let bit = |on: bool, n: u32| u64::from(on) << n;
+            let word = c.cpl & 3
+                | bit(true, 2)
+                | bit(c.cr0 & exec::CR0_EM != 0, 9)
+                | bit(c.cr0 & exec::CR0_TS != 0, 10)
+                | bit(c.cr4 & exec::CR4_OSFXSR != 0, 11)
+                | bit(c.bit_tests_cut(), 12)
+                | bit(c.cr0 & exec::CR0_MP != 0, 13)
+                | (x87_fpcr(c.fcw, c.mxcsr) != 0) as u64 * (1 | (c.fcw >> 10 & 3) << 1) << 14
+                | bit(c.avx_enabled(), 17)
+                | exec::simd_unmasked(c.mxcsr) << 18
+                | exec::x87_unmasked(c.fcw) << 24;
+            word
+        }
+        pub fn x87_args(cpu: &Cpu) -> Vec<String> {
+            let mut args = vec![];
+            if cpu.cr0 & (exec::CR0_EM | exec::CR0_TS) != 0 {
+                args.push("--x87-gated".into());
+            }
+            if cpu.cr0 & (exec::CR0_TS | exec::CR0_MP) == exec::CR0_TS | exec::CR0_MP {
+                args.push("--wait-gated".into());
+            }
+            match x87_fpcr(cpu.fcw, cpu.mxcsr) {
+                0 => {}
+                fpcr => args.extend(["--x87-fpcr".into(), format!("{fpcr:#x}")]),
+            }
+            for (name, unmasked) in [
+                ("--simd-unmasked", exec::simd_unmasked(cpu.mxcsr)),
+                ("--x87-unmasked", exec::x87_unmasked(cpu.fcw)),
+            ] {
+                if unmasked != 0 {
+                    args.extend([name.into(), format!("{unmasked:#x}")]);
+                }
+            }
+            args
+        }
+    }
+    #[test]
+    fn with_afp_on_the_fp_words_are_unchanged_for_every_mxcsr_and_fcw() {
+        let afp = u64::MAX; // `supported` with the afp bit set
+        let mut cpu = test_cpu(0x1000);
+        assert_eq!(cpu.no_afp, 0);
+        cpu.cr0 |= exec::CR0_MP;
+        let (mut tested, mut keyed) = (0u64, 0u64);
+        for mxcsr in 0..1u64 << 16 {
+            for fpsr in 0..=0xffu64 {
+                assert_eq!(
+                    exec::mxcsr_flags(fpsr, mxcsr),
+                    before_no_afp::mxcsr_flags(fpsr, mxcsr),
+                    "mxcsr_flags {fpsr:#x} {mxcsr:#x}"
+                );
+            }
+            assert_eq!(exec::fpcr(mxcsr, false), before_no_afp::fpcr(mxcsr), "fpcr {mxcsr:#x}");
+            cpu.mxcsr = mxcsr;
+            // FCW: every RC (bits 11:10) with every combination of the six masks (5:0); precision control and the rest fixed.
+            for rc in 0..4u64 {
+                for masks in 0..1u64 << 6 {
+                    let fcw = (exec::FCW_INIT & !(0x3f | 3 << 10)) | rc << 10 | masks;
+                    cpu.fcw = fcw;
+                    assert_eq!(
+                        exec::x87_fpcr(fcw, mxcsr, false),
+                        before_no_afp::x87_fpcr(fcw, mxcsr),
+                        "x87_fpcr {fcw:#x} {mxcsr:#x}"
+                    );
+                    assert_eq!(
+                        cpu.code_context(),
+                        before_no_afp::code_context(&cpu),
+                        "code_context {fcw:#x} {mxcsr:#x}"
+                    );
+                    assert_eq!(
+                        x87_args(&cpu, afp),
+                        before_no_afp::x87_args(&cpu),
+                        "x87_args {fcw:#x} {mxcsr:#x}"
+                    );
+                    tested += 1;
+                    keyed += u64::from(exec::x87_fpcr(fcw, mxcsr, false) != 0);
+                }
+            }
+        }
+        assert_eq!(tested, 65536 * 256);
+        assert!(keyed > 0 && keyed < tested, "both keyed and unkeyed cases ran");
+    }
+    /// The same inputs without AFP: every x87 word is the AFP-less one (AH, NEP and FIZ never set), `x87_args` agrees with
+    /// `supported`'s afp bit (and panics when it does not), and `code_context` keys the x87 rounding exactly when `--x87-fpcr`
+    /// is sent.
+    #[test]
+    fn without_afp_x87_args_follow_the_bit_and_must_agree_with_supported() {
+        let no_afp = u64::MAX & !(1 << admission::index("afp"));
+        let mut cpu = Cpu { no_afp: 1, ..test_cpu(0x1000) };
+        for mxcsr in [0x1f80u64, 0x1f80 | 3 << 13, 0x1f80 | 1 << 15, 0x1f80 | 1 << 6, 0x1f80 | 3 << 13 | 1 << 15 | 1 << 6, 0] {
+            for fcw in [exec::FCW_INIT, exec::FCW_INIT | 1 << 10, exec::FCW_INIT | 3 << 10, 0x3f | 2 << 10] {
+                (cpu.mxcsr, cpu.fcw) = (mxcsr, fcw);
+                let args = x87_args(&cpu, no_afp);
+                let fpcr = exec::x87_fpcr(fcw, mxcsr, true);
+                assert_eq!(fpcr & 7, 0, "no AH, NEP or FIZ");
+                assert_eq!(args.iter().any(|a| a == "--x87-fpcr"), fpcr != 0);
+                assert_eq!(cpu.code_context() >> 14 & 1, u64::from(fpcr != 0));
+            }
+        }
+        // The default 1F80H with RC nearest: nothing is sent and nothing is keyed, as on an AFP host.
+        (cpu.mxcsr, cpu.fcw) = (exec::MXCSR_RESET, exec::FCW_INIT);
+        assert_eq!(x87_args(&cpu, no_afp), Vec::<String>::new());
+        assert_eq!(cpu.code_context(), Cpu { no_afp: 0, ..cpu }.code_context());
+        for (bit, supported) in [(0, no_afp), (1, u64::MAX)] {
+            let cpu = Cpu { no_afp: bit, ..cpu };
+            let e = std::panic::catch_unwind(|| x87_args(&cpu, supported)).unwrap_err();
+            let e = e.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(e.contains("disagrees"), "{e}");
+        }
+    }
+
     /// A CPL-3 CPU at `rip` as the fetch tests use.
     fn test_cpu(rip: u64) -> Cpu {
         Cpu {
@@ -6203,6 +6384,7 @@ mod tests {
             mxcsr: exec::MXCSR_RESET,
             fcw: exec::FCW_INIT,
             xcr0: 1,
+            no_afp: 0,
         }
     }
 
@@ -6497,6 +6679,7 @@ mod tests {
                 mxcsr: exec::MXCSR_RESET,
                 fcw: exec::FCW_INIT,
                 xcr0: 1,
+                no_afp: 0,
             },
         );
         s.fetch = [0x5000, u64::MAX];

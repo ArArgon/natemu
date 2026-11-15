@@ -217,7 +217,9 @@ inline std::map<uint64_t, uint32_t> fexc_mmio;
 // the guest-state page (`mm[i]`, low 8 bytes), TOP/C0..C3 in FEX's flag bytes, FCW and the abridged tag word in their FEX
 // fields. From the host: `--x87-gated` (CR0.EM or CR0.TS) cuts every x87 form d8..df as a system instruction (#NM),
 // `--wait-gated` (CR0.TS and CR0.MP) cuts WAIT/FWAIT (9b) likewise; `--x87-fpcr V` (V nonzero) is the FPCR x87 arithmetic
-// runs under (FCW.RC, no flush to zero) when it differs from MXCSR's (the resident enters blocks with MXCSR's FPCR).
+// runs under (FCW.RC, no flush to zero) when it differs from MXCSR's (the resident enters blocks with MXCSR's FPCR). V's low 32 bits
+// are the FPCR and bit 32 only makes V nonzero for an all-zero FPCR (AFP fallback chunk 1: without AFP, nearest rounding with no
+// flush is FPCR 0, which must still switch; the host sets bit 32 then, `X87_FPCR_EXPLICIT`).
 inline FexcArg<bool, FEXC_ARG_X87_GATED> fexc_x87_gated;
 inline FexcArg<bool, FEXC_ARG_WAIT_GATED> fexc_wait_gated;
 inline FexcArg<uint64_t, FEXC_ARG_X87_FPCR> fexc_x87_fpcr;

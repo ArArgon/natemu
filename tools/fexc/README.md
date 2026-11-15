@@ -184,7 +184,7 @@ allowlist's `X87` table admits the x87 forms whose reduced-precision lowering is
 (FNINIT, FNCLEX, FLDCW, FLDENV/FNSTENV, FRSTOR/FNSAVE, FLD/FSTP m80) as system instructions; transcendental, remainder and
 scale forms (host libm helpers), FBLD/FBSTP, FXAM, FXTRACT, the 287 no-ops and undocumented aliases are `unsupported_form`.
 `--x87-gated` (CR0.EM or TS) and `--wait-gated` (TS with MP) cut x87 forms and WAIT as gated (`cut_gated`, #NM); `--x87-fpcr V`
-runs x87 arithmetic under FPCR V when FCW.RC or MXCSR's FTZ/DAZ differ. The JIT wraps every floating-point op of an x87
+runs x87 arithmetic under FPCR V (its low 32 bits; bit 32 is the host's marker for a word of 0, which hosts without AFP send for nearest rounding) when FCW.RC or MXCSR's FTZ/DAZ differ. The JIT wraps every floating-point op of an x87
 instruction (`FexcX87Op`): FPSR cleared before it (MXCSR's flags kept in x3), its flags OR-ed into the x87 exception word at
 x28 + 0x4b4 after it. Patch 0019: the x87 stack pass on its slow path, stack faults (underflow/overflow: the indefinite, IE, SF, C1) with a flush after every op (the state is in the
 guest-state page at every boundary), TOP masked, ST(i) as context-indexed accesses; FIST/FISTP/FISTTP with x86's integer
@@ -419,8 +419,16 @@ is the self-check; `NATEMU_REPLAY_ARGS` passes server options to both, e.g. `--r
         cargo test --release -p natemu --lib -- --ignored --nocapture channel_replay_matches_the_pipe
 
 It prints `replay: N requests, D differences` and fails unless N > 0 and D = 0. A stream's replay takes minutes (about
-1 M requests at tens of microseconds each, twice). A later chunk's body-rewrite step (the host-derived mask) is not part of
-this tool yet.
+1 M requests at tens of microseconds each, twice).
+
+Body rewrite (AFP fallback plan, chunk 1): `NATEMU_REPLAY_ADD_ARGS="--feature afp=0"` appends those request arguments
+(whitespace-separated, each NUL-terminated like the host's) to every body sent to the new compiler (`FEXC`) only; the old one
+(`NATEMU_REPLAY_OLD`) still gets the recorded bytes. A recorded AFP stream then replays as a host without AFP asks for it
+(M2 emulation: the host adds `--feature afp=0` and the same arguments otherwise, plus whatever later chunks derive from
+`no_afp`). The replies differ from the recorded ones by design, so D = 0 no longer applies: the test compares the new compiler under the
+added arguments with the old one on the recorded bytes, which shows what M2 emulation changes (`--report` through
+`NATEMU_REPLAY_ARGS` prints the replies' summaries). The host-built arguments that depend on `no_afp` (`--x87-fpcr`) are not rewritten: they are unit-tested
+(`with_afp_on_the_fp_words_are_unchanged_for_every_mxcsr_and_fcw`).
 
 ## What builds
 

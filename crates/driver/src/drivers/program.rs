@@ -1852,6 +1852,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 } else {
                     natemu_abi::cpu_profile::XCR0_RESET
                 },
+                no_afp: 0,
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,
@@ -3281,6 +3282,7 @@ mod tests {
                 mxcsr: exec::MXCSR_RESET,
                 fcw: exec::FCW_INIT,
                 xcr0: 1,
+                no_afp: 0,
             },
         );
         s.fetch = [0x5000, u64::MAX];
