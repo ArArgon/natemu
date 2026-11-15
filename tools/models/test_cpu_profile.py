@@ -389,6 +389,48 @@ class Catalogue(unittest.TestCase):
     def test_subleaf_follows_where_the_feature_lives(self):
         self.fires(self.mutate('AVX_VNNI', subleaf=0), 'AVX_VNNI', 'subleaf')
 
+    # ---- exceptions (plan sec. 2.1): every built feature names its SDM exception class and the tests that cover it --------
+    def test_exceptions_are_present_on_every_built_feature(self):
+        built = [f[0] for f in P.features().values() if f[0]['built']]
+        self.assertGreater(len(built), 50)
+        for f in built:
+            self.assertIn('exceptions', f, f['name'])
+            self.assertIsInstance(f['simd_fp'], bool, f['name'])
+            for t in f.get('tests', []): self.assertTrue((cp.ROOT / t).is_file(), (f['name'], t))
+        self.assertEqual(P.features()['AVX_VNNI'][0]['exceptions'], ['VEX Type 4'])    # the plan's worked example, not built yet
+
+    def test_built_without_exceptions(self):
+        self.fires(self.mutate('SHA', exceptions=None), 'SHA', 'built but has no `exceptions`')
+        self.fires(self.mutate('SHA', simd_fp=None), 'SHA', '`simd_fp` is not true or false')
+
+    def test_exception_classes_are_a_closed_vocabulary(self):
+        self.fires(self.mutate('SHA', exceptions=['SSE Type 99x']), 'SHA', 'exceptions')
+        self.fires(self.mutate('SHA', exceptions=[]), 'SHA', 'exceptions')
+        self.fires(self.mutate('SHA', exceptions='SSE Type 4'), 'SHA', 'exceptions')
+        self.fires(self.mutate('SHA', exceptions=['none', 'GP']), 'SHA', '`none` with other classes')
+        self.assertEqual([m for m in self.mutate('SHA', exceptions=['SSE Type 4', 'GP']) if 'SHA' in m], [])
+
+    def test_built_feature_lists_its_fault_tests(self):
+        self.fires(self.mutate('SHA', tests=[]), 'SHA', 'lists no fault tests')
+        self.fires(self.mutate('SHA', tests=['tools/run_nonesuch.py']), 'SHA', 'existing files')
+        self.assertEqual([m for m in self.mutate('X2APIC', tests=[]) if 'X2APIC' in m], [])      # `none`: no instruction of its own
+
+    def test_simd_fp_needs_an_xm_test(self):
+        self.fires(self.mutate('SSE', tests=['tools/run_i5a_faults.py']), 'SSE', 'simd_fp but no #XM-covering test')
+        self.fires(self.mutate('SHA', simd_fp=True), 'SHA', 'simd_fp but no #XM-covering test')
+        self.fires(self.mutate('CMOV', simd_fp=True, tests=['tools/run_i5c.py']), 'CMOV', 'simd_fp but no SSE or VEX')
+        self.assertEqual([m for m in self.mutate('SSE', tests=['tools/run_i5c.py']) if 'SSE' in m], [])
+
+    def test_baseline_is_for_advertised_features(self):
+        self.fires(self.mutate('MONITOR', baseline=True), 'MONITOR', 'baseline')
+        self.fires(self.mutate('NX', baseline=1), 'NX', 'baseline')
+
+    def test_generated_lists(self):
+        self.assertEqual(P.startup_names(), ['adx', 'aes', 'clflushopt', 'clwb', 'fsgsbase', 'pclmulqdq', 'rdrand', 'rdtscp', 'sha',
+                                            'smep', 'umip', 'xsavec', 'xsaveopt'])
+        self.assertEqual(P.host_required(), ['aes', 'atomics_lse', 'crc32', 'pmull128', 'sha'])     # built features only: not wfxt
+        self.assertEqual({f['name'] for f in P.gated('resident')}, set())
+
 
 if __name__ == '__main__':
     unittest.main()
