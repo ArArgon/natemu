@@ -22,7 +22,7 @@ tools/fexc/build.sh BUILD_DIR
 
 `BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX` (`.gitmodules`: the fork
 `https://github.com/ArArgon/natemu-fex`, branch `natemu`, `shallow = true`), pinned to the fork's commit
-`13e80cfdfcccbacf4bfce76a2d84e7f5349fd3df` (`1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2; on the fork's `natemu` branch since November 15): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
+`e9d27c7eae310144527958004970657d38a5d7f0` (`13e80cf`, `1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2, plus the `FexcFlush` IR op for the software DAZ/FTZ flush, chunk 3a; on the fork's `afp-c3a` branch, not yet on its `natemu` branch): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
 at the pin) and the three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the
 revision FEX pins), checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the
 three externals into it (`git archive`), configures `CMakeLists.txt` against that tree, builds with 4 jobs and runs
