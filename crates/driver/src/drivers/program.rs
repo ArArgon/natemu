@@ -1874,7 +1874,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 mov_ss: 0,
             },
             false, // the program driver's slice tests never run the speculation barriers
-        );
+        )?;
         execution::set_lapic(
             backing.vcpu(v),
             natemu_abi::lapic::Lapic {

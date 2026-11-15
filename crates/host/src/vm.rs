@@ -67,6 +67,9 @@ pub(crate) fn config_id_register(feature_reg: u32) -> Result<u64> {
     let mut value = 0;
     unsafe {
         let config = hv_vcpu_config_create();
+        if config.is_null() {
+            return Err("hv_vcpu_config_create failed".into());
+        }
         let code = hv_vcpu_config_get_feature_reg(config, feature_reg, &mut value);
         os_release(config);
         hv(code, "hv_vcpu_config_get_feature_reg")?;

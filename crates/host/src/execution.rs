@@ -421,7 +421,7 @@ fn halt_poll_max_us() -> u64 {
 /// Sets the vCPU's initial architectural state (before it first runs). `speculation_barriers` turns on the resident's
 /// page-walk barriers (PCID plan P1) and, together with the host's FEAT_CSV3, is the sole condition for advertising
 /// RDCL_NO: a guest never sees "not susceptible to Meltdown" without the barriers that make it true.
-pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
+pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) -> Result<()> {
     let mut state = State::new(area.vcpu as u64, cpu);
     state.vcpus = area.vcpus as u64;
     state.halt_poll_max_us = halt_poll_max_us();
@@ -438,7 +438,7 @@ pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes.min(exec::LOW_RAM_END));
     // IA32_ARCH_CAPABILITIES: RDCL_NO only with the barriers on AND a host whose own loads do not pass faulting data on
     // (FEAT_CSV3). Off by default, so a default-command-line guest keeps PTI (owner decision, November 5).
-    let rdcl_no = speculation_barriers && crate::probe::csv3();
+    let rdcl_no = speculation_barriers && crate::probe::csv3()?;
     msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_ARCH_CAPABILITIES).unwrap()] =
         natemu_abi::cpu::arch_capabilities(rdcl_no);
     area.write_record(exec::MSRS_OFFSET, msrs);
@@ -451,6 +451,7 @@ pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     );
     refill_entropy(area);
     set_lapic(area, natemu_abi::lapic::RESET);
+    Ok(())
 }
 /// Sets the vCPU's local APIC record (X3) and the word peers match IPI destinations against, from its reset
 /// IA32_APIC_BASE (before it first runs).
@@ -501,7 +502,10 @@ pub fn enter(cpu: &Vcpu, area: Area, doorbell: bool) -> Result<()> {
         area.base,
         natemu_abi::shadow::TCR_BOTH,
         2 * area.vcpu as u8 + 2,
-    )
+    )?;
+    // The startup probe (host features, TSO readback) runs here, in the setup closure's error path, so a refusal is one
+    // setup error and not one per started owner.
+    crate::probe::startup(cpu).map(drop)
 }
 
 /// The global area word at `offset` (shared by all vCPUs; atomic access only).
@@ -2549,11 +2553,11 @@ impl Compiler {
     pub fn finish(&mut self) -> Option<(u64, u64, u64)> {
         self.server.as_mut().and_then(Server::finish)
     }
-    /// The compiler of the vCPU `cpu`, after the resident's setup (`enter`): runs the startup probe ([`crate::probe`]: one
-    /// refusal for every missing requirement, the startup line) and takes the supported features from it.
+    /// The compiler of the vCPU `cpu`, after the resident's setup (`enter`, which ran the startup probe: [`crate::probe`]):
+    /// takes the supported features from the vCPU's registers.
     /// `NATEMU_FEXC_FEATURE_OFF=name,...` (test only: the fallback gate, plan section 2.2a) clears the named ones.
     pub fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
-        let mut supported = crate::probe::startup(cpu)?.supported();
+        let mut supported = crate::probe::Probe::read(cpu)?.supported();
         if let Some(list) = std::env::var_os("NATEMU_FEXC_FEATURE_OFF") {
             supported &= !admission::forced_off(&list.to_string_lossy())?;
         }

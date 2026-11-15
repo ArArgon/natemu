@@ -43,6 +43,8 @@ pub(crate) enum Detect {
     Fields(&'static [(usize, u32, u64)]),
     /// Needs a register this host cannot read (ID_AA64ISAR2, DCZID, SVE length): refused.
     Unverifiable,
+    /// ID register fields (register, shift) that must not read 0xF (the signed "not implemented" of Armv8.0 FP and AdvSIMD).
+    Present(&'static [(usize, u32)]),
     /// Apple's TSO bit: ACTLR_EL1 bit 1 reads back set after the resident's setup wrote it ([`crate::probe`] only).
     Tso,
 }
@@ -142,9 +144,12 @@ pub(crate) const FEATURES: [Feature; 32] = [
     feature("x86_sse4a", Nothing, Setting, false),
 ];
 /// Machine needs that are not fexc features (no object bit, no `--feature`): the startup probe's own rows.
-pub(crate) const MACHINE: [(&str, Detect, Class); 4] = [
+pub(crate) const MACHINE: [(&str, Detect, Class); 6] = [
     ("lse2", Fields(&[(MMFR2, 32, 1)]), Required),
     ("apple_tso", Tso, Required),
+    // Armv8.0 FP and AdvSIMD (PFR0[19:16], [23:20]): every SSE-through-AVX2 form; 0xf means not implemented.
+    ("fp", Present(&[(PFR0, 16)]), Required),
+    ("advsimd", Present(&[(PFR0, 20)]), Required),
     ("csv3", Fields(&[(PFR0, 60, 1)]), Class::Option),
     ("sb", Fields(&[(ISAR1, 36, 1)]), Class::Option),
 ];
@@ -181,6 +186,7 @@ pub(crate) fn detected(d: &Detect, id: &[u64; ID_REGISTERS.len()], tso: bool) ->
         Fields(fields) => fields
             .iter()
             .all(|&(r, shift, min)| (id[r] >> shift) & 15 >= min),
+        Present(fields) => fields.iter().all(|&(r, shift)| (id[r] >> shift) & 15 != 15),
         Unverifiable => false,
         Tso => tso,
     }
@@ -200,11 +206,15 @@ pub(crate) fn feature_overrides(supported: u64) -> Vec<String> {
         .collect()
 }
 /// The feature bits `NATEMU_FEXC_FEATURE_OFF` (comma-separated fexc names; test only: the fallback gate, plan section 2.2a)
-/// names. An unknown name is an error. The caller clears them from `supported`; admission's subset check is unaffected.
+/// names. An unknown name is an error, and so is one that is not a Speed or Exactness feature (Required ones have no off
+/// path, the rest changes nothing or cannot be read from the vCPU). The caller clears them from `supported`; admission's subset check is unaffected.
 pub(crate) fn forced_off(list: &str) -> Result<u64, String> {
     (list.split(',').filter(|n| !n.is_empty()))
         .try_fold(0, |bits, name| match FEATURES.iter().position(|f| f.name == name) {
-            Some(i) => Ok(bits | 1 << i),
+            Some(i) if matches!(FEATURES[i].class, Speed | Exactness) => Ok(bits | 1 << i),
+            Some(_) => Err(format!(
+                "NATEMU_FEXC_FEATURE_OFF: {name} is not a speed or exactness feature"
+            )),
             None => Err(format!("NATEMU_FEXC_FEATURE_OFF: unknown feature {name:?}")),
         })
 }
@@ -1300,6 +1310,9 @@ mod tests {
             Ok(1 << index("flagm2") | 1 << index("ecv"))
         );
         assert!(forced_off("fcma,nonesuch").unwrap_err().contains("nonesuch"));
+        for name in ["flagm", "lrcpc", "sve128", "x86_avx"] {
+            assert!(forced_off(name).unwrap_err().contains("not a speed or exactness"), "{name}");
+        }
         // The arguments follow: the forced-off feature is sent as `name=0` and the rest are unchanged.
         let all = supported_features(&[u64::MAX; ID_REGISTERS.len()]);
         let off = all & !forced_off("frintts").unwrap();
