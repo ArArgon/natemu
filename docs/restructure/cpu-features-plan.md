@@ -76,6 +76,11 @@ There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profi
   `required` is judged over natemu's whole pipeline: FEX's lowering, plus admission accepting what it emits. FEX has
   no software path for SHA or AES (its dispatcher marks them unimplemented without the Arm feature), so SHA requires
   `sha`, AES requires `aes`, and PCLMULQDQ requires `pmull128`.
+
+  `required` is a list of alternatives: each item is one Arm feature or an any-of group. AVX-VNNI is the case today. It
+  requires DotProd or I8MM: FEX lowers it with USDOT under I8MM, else with SDOT plus a correction. I8MM is listed as
+  `speed` for it, not as required. A third class, `speed`, records Arm features that only make a feature faster
+  (ECV for RDTSC, FCMA for ADDSUBPS, FRINTTS, FlagM2, I8MM for AVX-VNNI). It never affects classification or startup.
 - `layout`: true when the feature changes XCR0's valid values, leaf 0xD or the XSAVE image, or whose presence the
   resident tests as a compile-time constant (today XSAVEC and XSAVEOPT; a resident transaction alone, such as RDRAND's or
   CLWB's, does not make a feature `layout`). That covers AVX, MPX, AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
@@ -334,6 +339,16 @@ Apple's TSO bit and the interrupt-controller API are part of the floor too, thou
 
 **M2 only:** SSBS. Natemu does not use it.
 
+**Best-effort tier: the M1** (owner, November 15). It isn't a target, but it should run whenever it meets the
+requirements. Known gaps against the floor are I8MM, ECV and BF16, besides everything above the floor. It has DotProd.
+Today no required entry names any of those, so the M1 gets the same guest CPU as the floor:
+- ECV is speed only;
+- I8MM is speed only for AVX-VNNI, whose any-of group DotProd satisfies.
+
+The validator warns, but doesn't refuse, when a core feature's `required` list stops being met by the M1's known set.
+That is the M1 record (recorded from sysctl when an M1 is at hand; until then marked unverified). The warning makes any
+loss of M1 support a visible decision.
+
 **Against fexc's feature table.** Every Arm feature fexc uses when present is in the floor except AFP: atomics_lse,
 flagm, flagm2, fcma, crc32, aes, sha, pmull128, frintts, i8mm, dotprod, ecv. lrcpc and lrcpc2 are in the floor but off by
 policy. AFP is the one exactness feature. Neither machine reports RNG, CSSC, MOPS or SVE.
@@ -359,7 +374,7 @@ it, or admission accepts only the encodings that use it.
 | FRINTTS | speed only | floating-point-to-integer conversions |
 | ECV | speed only | RDTSC (a self-synchronising counter read, else ISB and a counter read) |
 | SB, CSV3 | option only | `--speculation-barriers` and the RDCL_NO bit |
-| DotProd, I8MM | none in core yet | AVX-VNNI when built |
+| DotProd, or I8MM | none in core yet | AVX-VNNI when built: either one satisfies it (DotProd on the M1); I8MM gives the shorter sequence |
 | LRCPC, LRCPC2 | none (off by policy) | unused under hardware TSO |
 
 Bases with no extra Arm feature: BMI1/2, LZCNT, POPCNT (no CSSC: a vector sequence), MOVBE, ADX, AVX, AVX2. RDRAND
