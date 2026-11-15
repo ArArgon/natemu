@@ -2500,6 +2500,34 @@ pub(crate) fn avx_gated(cpu: &exec::Cpu) -> bool {
 /// The default [`Compiler::deadline`]: a large multiple of the slowest compile measured on the regression sets
 /// (S3h: at most 13.4 ms, server start included, over 6,080 vCPU runs of the corpora at N = 4 and N = 2 with block size 1).
 pub const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
+/// CPU-features plan chunk 0 (replay gate): `NATEMU_FEXC_RECORD=<path>` appends every request the host sends to fexc, as
+/// u32 length + body (the bytes [`Channel::post`] gets), the format `channel_replay_matches_the_pipe` reads. One file for
+/// all vCPUs: the file's mutex orders whole records, so a stream is never torn; the interleaving of vCPUs is
+/// arbitrary, and the replay does not depend on order (a server's reply is a function of the request alone). The
+/// variable is read once; unset, a request costs one atomic load. A file that cannot be opened or written stops the run (a
+/// silent miss would waste the boot that was meant to record).
+fn record_request(body: &[u8]) {
+    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| {
+        let path = std::env::var_os("NATEMU_FEXC_RECORD")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+        Some(Mutex::new(file.unwrap_or_else(|e| {
+            panic!("NATEMU_FEXC_RECORD {}: {e}", path.to_string_lossy())
+        })))
+    }) else {
+        return;
+    };
+    write_record(&mut *out.lock().unwrap_or_else(|e| e.into_inner()), body)
+        .expect("NATEMU_FEXC_RECORD: write");
+}
+/// One record in a single write (u32 LE length, then `body`).
+fn write_record(out: &mut impl std::io::Write, body: &[u8]) -> std::io::Result<()> {
+    let mut record = Vec::with_capacity(4 + body.len());
+    record.extend((body.len() as u32).to_le_bytes());
+    record.extend_from_slice(body);
+    out.write_all(&record)
+}
+
 impl Compiler {
     /// Now, when the performance log records this vCPU (else 0, unread).
     fn stamp(&self) -> u64 {
@@ -3154,6 +3182,7 @@ impl Compiler {
             return Ok((reply, at));
         }
         let body = self.body(bytes, rip, limit);
+        record_request(&body);
         let t = self.stamp();
         if self.server.is_none() {
             self.server = Some(Server::start(&self.fexc)?);
@@ -4859,6 +4888,23 @@ mod tests {
 
     /// With `FEXC` set: a repeated request is answered from the cache, a different RIP, bytes or block limit is compiled.
     /// The request body (and so every persistent-cache key) is byte for byte what the per-argument `String` version built.
+    /// The recorder's records are what `channel_replay_matches_the_pipe` reads: u32 length, then the body as posted.
+    #[test]
+    fn recorded_requests_read_back_as_the_replay_reads_them() {
+        let mut out = Vec::new();
+        for body in [&b"\x05\0\0\0abcde+code"[..], b"x"] {
+            super::write_record(&mut out, body).unwrap();
+        }
+        let mut at = 0;
+        let mut seen = Vec::new();
+        while at < out.len() {
+            let n = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+            seen.push(&out[at + 4..at + 4 + n]);
+            at += 4 + n;
+        }
+        assert_eq!(seen, [&b"\x05\0\0\0abcde+code"[..], b"x"]);
+    }
+
     #[test]
     fn body_bytes_are_unchanged() {
         fn reference(c: &Compiler, bytes: &[u8], rip: String, limit: Option<u32>) -> Vec<u8> {
