@@ -2466,6 +2466,8 @@ pub struct Compiler {
     last: Option<Arc<Entry>>,
     noted: Vec<(u64, [u64; GATING])>,
 }
+/// The afp row's bit in `supported` (the features fexc is told): [`Cpu::no_afp`] is its complement.
+const AFP: usize = admission::index("afp");
 /// fexc's x87 arguments for `cpu` (I6; SDM Vol.3 Table 2-2): every x87 form #NM under CR0.EM or CR0.TS, WAIT/FWAIT under CR0.TS
 /// with CR0.MP; x87 arithmetic under its own FPCR when FCW.RC or MXCSR's flush-to-zero/DAZ differ ([`exec::x87_fpcr`]); and
 /// (I5c) the MXCSR and FCW exceptions whose masks are clear, each instruction then checked for them (none as Linux runs). The
@@ -2475,7 +2477,7 @@ pub struct Compiler {
 pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64) -> Vec<String> {
     assert_eq!(
         cpu.no_afp != 0,
-        supported & 1 << admission::index("afp") == 0,
+        supported & 1 << AFP == 0,
         "Cpu::no_afp disagrees with the features fexc is told"
     );
     let mut args = vec![];
@@ -3532,7 +3534,7 @@ pub fn run(
     // AFP fallback chunk 1 (plan section 1): `Cpu::no_afp`, once, from the same `supported` value fexc is told (after
     // `NATEMU_FEXC_FEATURE_OFF`), before the first lookup or compile; every vCPU's run starts here (the loader's and the
     // drivers' `Cpu` values predate the probe and carry 0).
-    state.cpu.no_afp = u64::from(compiler.supported & 1 << admission::index("afp") == 0);
+    state.cpu.no_afp = u64::from(compiler.supported & 1 << AFP == 0);
     area.write_record(exec::STATE_OFFSET, state);
     // Perf chunk 10: reuse inside the resident, checked against the host's answers under the reuse check, and never into
     // a range the hook answers at (off when there are more of them than the resident keeps).
@@ -6334,7 +6336,7 @@ mod tests {
     /// is sent.
     #[test]
     fn without_afp_x87_args_follow_the_bit_and_must_agree_with_supported() {
-        let no_afp = u64::MAX & !(1 << admission::index("afp"));
+        let no_afp = u64::MAX & !(1 << AFP);
         let mut cpu = Cpu { no_afp: 1, ..test_cpu(0x1000) };
         for mxcsr in [0x1f80u64, 0x1f80 | 3 << 13, 0x1f80 | 1 << 15, 0x1f80 | 1 << 6, 0x1f80 | 3 << 13 | 1 << 15 | 1 << 6, 0] {
             for fcw in [exec::FCW_INIT, exec::FCW_INIT | 1 << 10, exec::FCW_INIT | 3 << 10, 0x3f | 2 << 10] {
