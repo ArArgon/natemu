@@ -20,6 +20,7 @@
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/memory.h>
+#include <fexc_features.h>
 #include <fexc_hook.h>
 
 #include <os/os_sync_wait_on_address.h>
@@ -78,9 +79,11 @@ static const std::vector<FeatureDef>& FeatureTable() {
     FEAT(SupportsECV, "ecv", true), FEAT(SupportsCLZERO, "clzero", false),
     FEAT(SupportsSVEBitPerm, "svebitperm", false), FEAT(SupportsFloatExceptions, "float_exceptions", false),
     FEAT(SupportsCacheMaintenanceOps, "cache_maintenance_ops", true), FEAT(PreferZVAForVZero, "prefer_zva_for_vzero", false),
-    // What FEX itself force-enables for the guest-visible x86 feature set.
-    FEAT(SupportsAVX, "x86_avx", true), FEAT(SupportsAES256, "x86_aes256", true), FEAT(Supports3DNow, "x86_3dnow", true),
-    FEAT(SupportsSSE4a, "x86_sse4a", false),
+    // What FEX itself force-enables for the guest-visible x86 feature set. `x86_avx` selects FEX's VEX decode table (BMI's
+    // too): on whenever the catalogue advertises a VEX feature (AVX, BMI1, BMI2, FMA, F16C; fexc_features.h, generated from
+    // cpu_profile.json). `x86_aes256`, `x86_3dnow` and `x86_sse4a` only feed FEX's CPUID.cpp, which natemu never calls: pinned.
+    FEAT(SupportsAVX, "x86_avx", GF_AVX || GF_BMI1 || GF_BMI2 || GF_FMA || GF_F16C), FEAT(SupportsAES256, "x86_aes256", true),
+    FEAT(Supports3DNow, "x86_3dnow", true), FEAT(SupportsSSE4a, "x86_sse4a", false),
   };
   return table;
 }
