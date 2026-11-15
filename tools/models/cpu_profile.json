@@ -381,7 +381,13 @@
      },
      "13": {
       "name": "CX16",
-      "state": "advertised"
+      "state": "advertised",
+      "host": {
+       "required": [
+        "atomics_lse"
+       ]
+      },
+      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; CMPXCHG8B/16B: admission accepts only LSE atomics"
      },
      "14": {
       "name": "XTPR",
@@ -508,6 +514,9 @@
       "host": {
        "exactness": [
         "afp"
+       ],
+       "speed": [
+        "flagm2"
        ]
       },
       "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
@@ -569,7 +578,13 @@
      },
      "8": {
       "name": "CX8",
-      "state": "advertised"
+      "state": "advertised",
+      "host": {
+       "required": [
+        "atomics_lse"
+       ]
+      },
+      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; CMPXCHG8B/16B: admission accepts only LSE atomics"
      },
      "9": {
       "name": "APIC",
@@ -669,12 +684,18 @@
       "host": {
        "exactness": [
         "afp"
+       ],
+       "speed": [
+        "flagm2"
        ]
       },
       "cr4": [
        "OSXMMEXCPT"
       ],
-      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
+      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); SSE requires FXSR: SDM Vol.1 sec. 11.6.2",
+      "requires": [
+       "FXSR"
+      ]
      },
      "26": {
       "name": "SSE2",
@@ -917,10 +938,10 @@
       "name": "AVX512F",
       "state": "clear",
       "requires": [
-       "AVX2"
+       "AVX"
       ],
       "layout": true,
-      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); AVX512F requires AVX: SDM Vol.1 sec. 15.2 (detection); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      },
      "17": {
       "name": "AVX512DQ",
@@ -1266,21 +1287,16 @@
        "AVX"
       ],
       "host": {
-       "required": [
-        [
-         "dotprod",
-         "i8mm"
-        ]
-       ],
        "speed": [
-        "i8mm"
+        "i8mm",
+        "dotprod"
        ]
       },
       "subleaf": 1,
       "gates": [
        "shim"
       ],
-      "source": "SDM Vol.2A CPUID 07H subleaf 1 EAX[4]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+      "source": "SDM Vol.2A CPUID 07H subleaf 1 EAX[4]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; no Arm feature is required: FEX lowers it with USDOT (I8MM), else SDOT plus a correction (DotProd), else plain SIMD (OpcodeDispatcher/Vector.cpp); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      }
     }
    },
@@ -1408,7 +1424,8 @@
        "XSAVE"
       ],
       "msrs": [
-       "0x1c4"
+       "0x1c4",
+       "0x1c5"
       ],
       "subleaf": 1,
       "layout": true,
@@ -1499,7 +1516,11 @@
      },
      "26": {
       "name": "PAGE1GB",
-      "state": "clear"
+      "state": "clear",
+      "resident": [
+       "a PDPTE with PS set is a reserved-bit #PF in the page walk (crates/abi/src/paging.rs)"
+      ],
+      "source": "resident: where natemu itself branches on the feature"
      },
      "27": {
       "name": "RDTSCP",

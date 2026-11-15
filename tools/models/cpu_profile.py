@@ -25,6 +25,7 @@ FLOOR = frozenset({'atomics_lse', 'flagm', 'flagm2', 'fcma', 'crc32', 'aes', 'sh
 FEXC = pathlib.Path(__file__).resolve().parents[1] / 'fexc/fexc.cpp'
 ARM_FEATURES = frozenset(n for n in re.findall(r'FEAT\(\w+, "(\w+)", (?:true|false)\)', FEXC.read_text())
                          if not n.startswith('x86_'))
+STATES = ('advertised', 'clear', 'dynamic')      # 'not built' is `built: false` on a clear entry, not a state
 HOST_CLASSES = ('required', 'exactness', 'speed')
 CONSUMERS = ('shim', 'system', 'resident')           # who may test a feature's generated constant (plan sec. 2.3)
 FIELD_KEYS = {'name', 'state', 'built', 'requires', 'host', 'msrs', 'cr4', 'subleaf', 'resident', 'gates', 'layout', 'source',
@@ -84,7 +85,7 @@ class Profile:
             for r, fs in e.get('fields', {}).items():
                 for b, f in fs.items():
                     sub = int(r.split('.')[0]) if '.' in r else e['subleaf']
-                    out.setdefault(f['name'], []).append(dict(f, leaf=_i(e['leaf']), sub=sub, reg=r.split('.')[-1], bit=int(b),
+                    out.setdefault(f['name'], []).append(dict(f, leaf=_i(e['leaf']), sub=sub, reg=r.split('.')[-1], bit=int(b), remote='.' in r,
                                                               built=f.get('built', f['state'] != 'clear')))
         return out
 
@@ -270,7 +271,8 @@ class Profile:
         for f in flat:
             n, st = f['name'], f['state']
             at = f'{f["leaf"]:#x}.{f["sub"]}.{f["reg"]}[{f["bit"]}] {n}'
-            unknown = set(f) - FIELD_KEYS - {'leaf', 'sub', 'reg', 'bit'}
+            if st not in STATES: err(f'{at}: state {st!r} is not one of {STATES}')
+            unknown = set(f) - FIELD_KEYS - {'leaf', 'sub', 'reg', 'bit', 'remote'}
             if unknown: err(f'{at}: unknown field {sorted(unknown)}')
             host = f.get('host', {})
             if set(host) - set(HOST_CLASSES): err(f'{at}: unknown host class {sorted(set(host) - set(HOST_CLASSES))}')
@@ -283,13 +285,18 @@ class Profile:
                 elif st == 'advertised' and cat[x][0]['state'] == 'clear': err(f'{at}: requires {x}, which is not advertised')
             for g in f.get('gates', []):
                 if g not in CONSUMERS: err(f'{at}: gates names {g!r}, not one of {CONSUMERS}')
+            if f['remote'] and (f['leaf'], f['sub']) in self.leaves:
+                err(f'{at}: stored under another subleaf\'s register key, but that subleaf has an entry: move it there')
             if 'subleaf' in f and f['subleaf'] != f['sub']: err(f'{at}: subleaf {f["subleaf"]} but it lives in subleaf {f["sub"]}')
             if st == 'advertised' and not f['built']: err(f'{at}: advertised but not built')
             if st == 'advertised' and not self.core(f):
                 out_of = [i for i in f.get('host', {}).get('required', []) if not self.host_ok(i)]
                 err(f'{at}: advertised but not core (requires {out_of} beyond the floor)')
             if st == 'clear' and f['built'] and self.core(f): err(f'{at}: built and core but not advertised')
+            if st == 'clear' and f['built'] and not self.core(f): err(f'{at}: optional feature needs the host-derived mask (chunk 5)')
             if st == 'clear' and f['built'] and f.get('layout'): err(f'{at}: optional layout feature (layout features must be core)')
+            # `msrs` = MSRs that exist only with this feature. An MSR shared by several features (IA32_U_CET, SPEC_CTRL, TSC_AUX)
+            # needs any-of semantics here before such a feature is built.
             for m in map(_i, f.get('msrs', [])):
                 if st == 'advertised' and m not in self._msr: err(f'{n} advertised but MSR {m:#x} missing')
                 if st == 'clear' and m in self._msr: err(f'{n} clear but MSR {m:#x} present')
