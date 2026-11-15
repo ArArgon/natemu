@@ -434,6 +434,16 @@ runs `InitCore()` (generates the dispatcher). Both succeed. No guest code has be
 `FEXCore/Source/CMakeLists.txt`; FEX's top-level CMake is not used (it assumes
 Linux and drags in the application layer).
 
+## Guest feature gates
+
+Every row of `shim/fexc_slice1.inc` that refuses or allows a form because of a CPU feature tests a constant `GF_<NAME>` (1 when
+`tools/models/cpu_profile.json` advertises the feature, else 0) from `shim/fexc_features.h`, which
+`tools/models/gen_cpu_profile_rs.py` generates (`--check` fails while it is stale). FEX's `x86_avx` host bit is
+`GF_AVX || GF_BMI1 || GF_BMI2 || GF_FMA || GF_F16C` (`fexc.cpp`); `x86_aes256`, `x86_3dnow` and `x86_sse4a` only feed FEX's
+`CPUID.cpp`, which fexc never calls, and stay pinned. A feature the shim gates lists `shim` in its catalogue `gates`;
+`tools/models/test_gates.py` fails when the shim, the host decode (`crates/host/src/system.rs`) and the catalogue disagree.
+The header is part of the shim, so a change to the catalogue changes the fexc binary hash (the compile cache refreshes by itself).
+
 ## Excluded
 
 - Everything under `Source/` (FEXLoader/FEXInterpreter, LinuxEmulation syscalls,
