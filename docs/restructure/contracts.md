@@ -1003,6 +1003,26 @@ memory accesses and unknown opcodes.
 - Observable today: binary.
 - Kind: design (plan §3.3 object contract); FEX encodings are producer-transport.
 
+**65. Every CPU feature decision comes from one catalogue, and every consumer follows it.**
+- The guest's x86 features are the per-bit entries of `tools/models/cpu_profile.json`. Each entry records:
+  - `requires`, `host`, `msrs`, `cr4`, `subleaf`, `resident`, `gates`, `layout`, `built`, `baseline`;
+  - `exceptions` with `simd_fp` and `tests`.
+- Core features are derived: a built feature whose required Arm features all lie in the host floor.
+- The shim's verdict rows and the host decode's #UD decisions test generated constants (`fexc_features.h`,
+  `cpu_gates.rs`), not hand-written verdicts.
+- Host Arm features are `admission::FEATURES` (class, floor) plus the probe's machine rows. They are checked once at
+  startup, which refuses with one line naming everything missing.
+- Enforced by:
+  - `cpu_profile.py` `catalogue_problems` (one negative control per rule, `test_cpu_profile.py`);
+  - `gen_cpu_profile_rs.py --check` (all three generated files);
+  - `tools/models/test_gates.py` (consumer gates in both directions);
+  - `system.rs` `undefined_follows_the_profile`, `unadvertised_forms_follow_the_catalogue`;
+  - `admission.rs` `fexc_reply_matches_the_table`, `classes_are_consistent`;
+  - `probe.rs` refusal tests.
+- Grid: every build; every boot (the probe).
+- Observable today: the startup line; #UD for forms of clear features; the refusal line.
+- Kind: design (`docs/restructure/cpu-features-plan.md`).
+
 ## 2. Internal-only assertions and their replacements
 
 The plan admits four replacement forms: a guest-visible outcome, a contract
