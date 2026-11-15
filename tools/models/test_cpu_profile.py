@@ -405,6 +405,8 @@ class Catalogue(unittest.TestCase):
 
     def test_exception_classes_are_a_closed_vocabulary(self):
         self.fires(self.mutate('SHA', exceptions=['SSE Type 99x']), 'SHA', 'exceptions')
+        for t in ('SSE Type 6', 'SSE Type 8', 'SSE Type 11'): self.fires(self.mutate('SHA', exceptions=[t]), 'SHA', 'exceptions')   # VEX-only classes
+        self.assertEqual([m for m in self.mutate('SHA', exceptions=['VEX Type 6']) if 'SHA' in m], [])
         self.fires(self.mutate('SHA', exceptions=[]), 'SHA', 'exceptions')
         self.fires(self.mutate('SHA', exceptions='SSE Type 4'), 'SHA', 'exceptions')
         self.fires(self.mutate('SHA', exceptions=['none', 'GP']), 'SHA', '`none` with other classes')
@@ -412,6 +414,8 @@ class Catalogue(unittest.TestCase):
 
     def test_built_feature_lists_its_fault_tests(self):
         self.fires(self.mutate('SHA', tests=[]), 'SHA', 'lists no fault tests')
+        self.assertEqual([m for m in self.mutate('SHA', tests=[], test_gap='none exercises it') if 'SHA' in m], [])   # a stated gap
+        self.fires(self.mutate('SHA', test_gap='x'), 'SHA', 'test_gap')                                          # not beside tests
         self.fires(self.mutate('SHA', tests=['tools/run_nonesuch.py']), 'SHA', 'existing files')
         self.assertEqual([m for m in self.mutate('X2APIC', tests=[]) if 'X2APIC' in m], [])      # `none`: no instruction of its own
 

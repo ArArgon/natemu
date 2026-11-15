@@ -19,6 +19,9 @@
 // tools/models/gen_cpu_profile_rs.py). A row that refuses or allows a form because of a feature tests its constant: with the
 // feature clear the form is the precise #UD; with it advertised the form is whatever its implementation (the rows below) does,
 // and the validator refuses advertising a feature that is not built. tools/models/test_gates.py ties the names to the catalogue.
+// The "advertised but not built" refusals (a gate choosing `Uns("... not built")` over `Ud(...)`: XOP, RTM, EVEX, AVX-VNNI, GFNI) are
+// placeholders for the feature's implementation: the validator refuses `state: advertised` on a feature with `built: false`, so
+// with a profile that passes they are unreachable until the feature is built and its rows replace them.
 #include <fexc_features.h>
 namespace FexcSlice1 {
 using namespace FEXCore::X86Tables;
@@ -64,6 +67,7 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   case 0x86: case 0x87: return Allow();                             // xchg; with memory: implicit LOCK, FEX's swpal (S3e)
   // 8f /1../7: reserved in Intel's map (group 1A has /0 only); AMD's XOP prefix (8f with map_select >= 8, so ModRM.reg != 0)
   // is #UD while XOP is clear (GenuineIntel, CPUID.80000001H:ECX.XOP[11] = 0) (I10). XOP advertised and unbuilt: refused.
+  // (XOP "not built": a placeholder, see the gates note above)
   case 0x8F: return has_modrm && reg == 0 ? Allow() : GF_XOP && reg != 0 ? Uns("XOP: not built") : Ud("8f /1../7: XOP (not advertised) or reserved (#UD)");
   case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3:
     if (!has_modrm || reg == 6) return Uns("shift group /6 alias");
@@ -74,6 +78,7 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   // Group 11 /1../6 is reserved; /7 is XABORT (c6 f8 ib) / XBEGIN (c7 f8 rel), #UD with CPUID.7.0:EBX.RTM[11] = 0 (I10).
   case 0xC6: case 0xC7:
     if (has_modrm && reg == 0) return Allow();
+    // (RTM "not built": a placeholder, unreachable while the validator refuses advertising it)
     return GF_RTM && reg == 7 ? Uns("xabort/xbegin: RTM not built") : Ud("group 11 other than mov: RTM xabort/xbegin (not advertised) or reserved (#UD)");
   case 0xF6: case 0xF7:
     if (!has_modrm) return Uns("group 3 without ModRM");
@@ -90,6 +95,7 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   // 82 (group 1 alias); 62 is the EVEX prefix there (AVX-512 not advertised: #UD) (I10).
   case 0x27: case 0x2F: case 0x37: case 0x3F: case 0x60: case 0x61: case 0xD4: case 0xD5: case 0x82:
     return Ud("invalid in 64-bit mode (#UD)");
+  // (EVEX "not built": a placeholder, unreachable while the validator refuses advertising AVX-512)
   case 0x62: return GF_AVX512F ? Uns("EVEX: AVX-512 not built") : Ud("EVEX (AVX-512 not advertised: #UD)");
   default: break;
   }
@@ -284,6 +290,7 @@ inline Verdict Avx(uint8_t map, uint8_t pp, uint8_t L, uint8_t W, uint8_t vvvv, 
     else if (op >= 0x90 && op <= 0x93) { r = LL | MEM; gather = true; }      // vpgatherdd/dq/qd/qq, vgatherdps/dpd/qps/qpd
     else if (op == 0xdb) r = L0 | NOV;                                           // vaesimc (I9)
     else if (op >= 0xdc && op <= 0xdf) r = GF_VAES ? LL : L0;                    // vaesenc/last, vaesdec/last (I9; the ymm form is VAES's)
+    // The AVX-VNNI and GFNI rows below are placeholders: unreachable while the validator refuses advertising them unbuilt.
     else if (GF_AVX_VNNI && op >= 0x50 && op <= 0x53) { r = LL | W0; refuse = "AVX-VNNI: not built"; }   // vpdpbusd/s, vpdpwssd/s
     else if (GF_GFNI && op == 0xcf) { r = LL | W0; refuse = "GFNI: not built"; }                          // vgf2p8mulb
   } else if (map == 3 && pp == 1) {

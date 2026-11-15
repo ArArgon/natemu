@@ -11,7 +11,8 @@
   "K": "Linux v6.12.107 arch/x86 (scratchpad bootsrc); paths relative to arch/x86 unless prefixed",
   "SDM": "Intel SDM revision 092 volume/section named in each entry",
   "census": "experiments/track03/kernel-census/results.md and forms-kernel.tsv",
-  "EXC": "`exceptions`/`simd_fp`/`tests` of a catalogue entry: the SDM exception class of the feature's instructions (Intel SDM Vol.2A sec. 2.4-2.8 \"Exception classes\" tables for the SSE and VEX Types, each instruction's \"Exceptions\" section for the others) and the corpora that exercise it (the runners' docstrings)"
+  "EXC": "`exceptions`/`simd_fp`/`tests` of a catalogue entry: the SDM exception class of the feature's instructions (Intel SDM Vol.2A sec. 2.4-2.8 \"Exception classes\" tables for the SSE and VEX Types, each instruction's \"Exceptions\" section for the others); `tests` lists the corpora under tools/ whose text contains forms of this feature and that judge faults of its class (#UD/#NM gating, memory faults, alignment, #AC, #XM); a built feature with none carries `test_gap` saying so instead of a decorative list. Legacy SSE classes are 1-5 and 7; 6, 8 and 11-13 are VEX-only",
+  "baseline": "`baseline: true` on an advertised capability bit: part of every x86-64 or PC platform (paging, MSRs, TSC, PAT, NX, x2APIC, ...); the startup line names the advertised features beyond x86-64-v3 except these"
  },
  "identity": {
   "vendor": "GenuineIntel",
@@ -319,7 +320,6 @@
       ],
       "simd_fp": true,
       "tests": [
-       "tools/fexc/test_slice1.py",
        "tools/run_i5a_faults.py",
        "tools/run_vector_ac.py",
        "tools/run_i5c.py",
@@ -342,13 +342,12 @@
        "system"
       ],
       "exceptions": [
-       "SSE Type 4"
+       "SSE Type 4",
+       "VEX Type 4"
       ],
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
        "tools/run_i9_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
@@ -412,7 +411,6 @@
       "tests": [
        "tools/fexc/test_slice1.py",
        "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
        "tools/run_i9_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
@@ -442,7 +440,6 @@
       "tests": [
        "tools/fexc/test_slice1.py",
        "tools/run_i8_faults.py",
-       "tools/run_vector_ac.py",
        "tools/run_i5c.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
@@ -507,7 +504,6 @@
       "tests": [
        "tools/fexc/test_slice1.py",
        "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
        "tools/run_i5c.py",
        "tools/run_i5a_de.py"
       ],
@@ -535,9 +531,7 @@
       "tests": [
        "tools/fexc/test_slice1.py",
        "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
-       "tools/run_i6b.py",
-       "tools/run_i9_faults.py"
+       "tools/run_i6b.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -581,8 +575,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py"
+       "tools/run_slice1_faults.py"
       ]
      },
      "24": {
@@ -608,14 +601,14 @@
        "system"
       ],
       "exceptions": [
-       "SSE Type 4"
+       "SSE Type 4",
+       "VEX Type 4"
       ],
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
-       "tools/run_i9_faults.py"
+       "tools/run_i9_faults.py",
+       "tools/run_i8_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -671,8 +664,7 @@
        "tools/fexc/test_slice1.py",
        "tools/run_i8_faults.py",
        "tools/run_vector_ac.py",
-       "tools/run_i5c.py",
-       "tools/run_i5a_de.py"
+       "tools/run_i5c.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
@@ -692,7 +684,6 @@
       "tests": [
        "tools/fexc/test_slice1.py",
        "tools/run_i8_faults.py",
-       "tools/run_vector_ac.py",
        "tools/run_i5c.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
@@ -853,7 +844,6 @@
       "tests": [
        "tools/fexc/test_slice1.py",
        "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py",
        "tools/run_nostop.py"
       ],
       "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; CMPXCHG8B/16B: admission accepts only LSE atomics"
@@ -885,8 +875,7 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/fexc/test_slice1.py",
-       "tools/run_slice3_vm.py"
+       "tools/fexc/test_slice1.py"
       ],
       "baseline": true,
       "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
@@ -941,8 +930,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py"
+       "tools/run_slice1_faults.py"
       ]
      },
      "16": {
@@ -1048,7 +1036,8 @@
        "SSE Type 3",
        "SSE Type 4",
        "SSE Type 5",
-       "SSE Type 7"
+       "SSE Type 7",
+       "MMX"
       ],
       "simd_fp": true,
       "tests": [
@@ -1080,7 +1069,8 @@
        "SSE Type 3",
        "SSE Type 4",
        "SSE Type 5",
-       "SSE Type 7"
+       "SSE Type 7",
+       "MMX"
       ],
       "simd_fp": true,
       "tests": [
@@ -1284,7 +1274,8 @@
        "shim"
       ],
       "exceptions": [
-       "VEX Type 13"
+       "VEX Type 13",
+       "GP"
       ],
       "simd_fp": false,
       "tests": [
@@ -1308,7 +1299,9 @@
       "exceptions": [
        "VEX Type 4",
        "VEX Type 6",
-       "VEX Type 12"
+       "VEX Type 12",
+       "VEX Type 5",
+       "VEX Type 7"
       ],
       "simd_fp": false,
       "tests": [
@@ -1431,8 +1424,6 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py",
        "tools/run_i9_faults.py"
       ]
      },
@@ -1470,7 +1461,6 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/fexc/test_slice1.py",
        "tools/run_i5b.py"
       ]
      },
@@ -1485,7 +1475,6 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/fexc/test_slice1.py",
        "tools/run_i5b.py"
       ]
      },
@@ -1526,8 +1515,6 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
        "tools/run_i9_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
@@ -1573,7 +1560,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice3_vm.py"
+       "tools/run_x1.py"
       ],
       "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
@@ -1970,7 +1957,6 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/fexc/test_slice1.py",
        "tools/run_i5b.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); resident: where natemu itself branches on the feature; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
@@ -1994,7 +1980,6 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/fexc/test_slice1.py",
        "tools/run_i5b.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); resident: where natemu itself branches on the feature; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
@@ -2102,9 +2087,7 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py"
+       "tools/fexc/test_slice1.py"
       ]
      },
      "5": {
@@ -2115,9 +2098,7 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py"
+       "tools/fexc/test_slice1.py"
       ]
      },
      "6": {

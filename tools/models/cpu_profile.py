@@ -29,13 +29,14 @@ STATES = ('advertised', 'clear', 'dynamic')      # 'not built' is `built: false`
 HOST_CLASSES = ('required', 'exactness', 'speed')
 CONSUMERS = ('shim', 'system', 'resident')           # who may test a feature's generated constant (plan sec. 2.3)
 FIELD_KEYS = {'name', 'state', 'built', 'requires', 'host', 'msrs', 'cr4', 'subleaf', 'resident', 'gates', 'layout', 'source',
-              'rule', 'exceptions', 'simd_fp', 'tests', 'baseline'}
+              'rule', 'exceptions', 'simd_fp', 'tests', 'test_gap', 'baseline'}
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 # `exceptions` (plan sec. 2.1): the SDM exception classes of the feature's instructions. `none`: no instruction of its own
 # (paging, MSR or platform behaviour); `GP`: general-purpose instructions (their own Exceptions sections); `SYS`: system or
 # state-management instructions (privilege, #UD gating, memory operands); `X87`; `MMX`; `SSE Type n` (legacy SIMD, SDM Vol.2A
 # 2.4-2.8) and `VEX Type n` (VEX-encoded: Vol.2A 2.8).
-EXCEPTION_CLASS = re.compile(r'none|GP|SYS|X87|MMX|(?:SSE|VEX) Type [1-9]\d?')
+# Legacy SSE has classes 1-5 and 7; VEX Types 6, 8 and 11-13 exist for VEX only.
+EXCEPTION_CLASS = re.compile(r'none|GP|SYS|X87|MMX|SSE Type [1-57]|VEX Type [1-9]\d?')
 # The corpora that deliver and judge #XM (an unmasked SIMD floating-point exception, before the destination is written).
 XM_TESTS = frozenset({'tools/run_i5c.py'})
 # x86-64-v1..v3 (x86-64 psABI, "x86-64 Microarchitecture Levels"), by catalogue name; the baseline's own SYSCALL and the
@@ -302,7 +303,9 @@ class Profile:
             if f['built'] and not isinstance(f.get('simd_fp'), bool): err(f'{at}: built but `simd_fp` is not true or false')
             if not isinstance(tests, list) or not all(isinstance(t, str) and (ROOT / t).is_file() for t in tests):
                 err(f'{at}: tests {tests!r}: a list of existing files')
-            elif f['built'] and exc not in (None, ['none']) and not tests: err(f'{at}: built, but lists no fault tests for its exception class {exc}')
+            elif f['built'] and exc not in (None, ['none']) and not tests and not isinstance(f.get('test_gap'), str):
+                err(f'{at}: built, but lists no fault tests for its exception class {exc} (and no `test_gap` saying so)')
+            if f.get('test_gap') is not None and (not isinstance(f['test_gap'], str) or tests): err(f'{at}: test_gap is a string and only for a feature with no tests')
             if f.get('simd_fp') is True:
                 if not (isinstance(tests, list) and XM_TESTS & set(tests)): err(f'{at}: simd_fp but no #XM-covering test ({sorted(XM_TESTS)})')
                 if not any(c.startswith(('SSE', 'VEX')) for c in exc or []): err(f'{at}: simd_fp but no SSE or VEX exception class')

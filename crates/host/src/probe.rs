@@ -95,9 +95,11 @@ fn startup_with(probe: Probe) -> Result<Probe, String> {
 /// path after a vCPU's setup passed [`startup`]; the program driver never calls it.
 pub(crate) fn announce(cpu: &Vcpu) {
     static PRINTED: OnceLock<()> = OnceLock::new();
-    if let Ok(probe) = Probe::read(cpu) {
-        PRINTED.get_or_init(|| eprintln!("{}", probe.line()));
-    }
+    PRINTED.get_or_init(|| {
+        if let Ok(probe) = Probe::read(cpu) {
+            eprintln!("{}", probe.line());
+        }
+    });
 }
 
 /// The hypervisor's configuration view of the ID registers (no VM or vCPU needed; they agree on every register natemu
