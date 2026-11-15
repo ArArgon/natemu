@@ -1,7 +1,7 @@
 # CPU features and profiles: one source for what the guest sees and what the host offers
 
-Status: accepted by independent review after three rounds (November 15, 2026; §7), then revised for the owner's
-decisions of the same day (§6): the guest CPU is x86-64-v3 plus easily translated extensions, the host floor is the
+Status: approved by the owner to build (November 15, 2026), after independent review (§7) and the owner's decisions
+(§6): the guest CPU is x86-64-v3 plus easily translated extensions, the host floor is the
 M2, and host features determine guest features, with no cherry-picking. Branch `cpu-features` off `main` at 333b7b6;
 no code yet. Owner direction (November 15): build a centralized CPU feature/profile mechanism before deciding which new
 guest features to implement; the M2 (no FEAT_AFP) floating-point work comes after this plan.
@@ -157,8 +157,16 @@ One host probe at startup does three things:
    resident runs it.
 
 The probe's record also holds the exactness facts the M2 work will need, such as whether AFP is present. Startup prints
-one stderr line naming the host's missing optional features and what that changes. There is no separate report
+one terse stderr line: the guest feature map and any missing exactness feature (§2.4). There is no separate report
 command.
+
+**Everything is detected at startup, never hard-coded per chip.** The probe reads the vCPU's registers and verifies
+every `required` Arm feature. The guest feature map it prints is computed from what it found:
+- core, when every requirement is met (otherwise the VM refuses to start);
+- plus, once chunk 5 exists, each optional feature whose Arm features this host has.
+
+The only build-time inputs are the catalogue's rules: which x86 feature needs which Arm feature. The chip records in
+the appendix are planning evidence, not inputs to the code.
 
 ### 2.2a Host feature classes: what each means and what the plan does for it
 
@@ -271,25 +279,18 @@ The machine needs that aren't fexc features get their own rows in the probe: LSE
 - every Arm feature a guest entry `required`s must be `Required` here;
 - every `Required` row must be named by some guest entry, or be a machine need.
 
-**At startup** the probe reads the vCPU's ID registers, checks the requirements once and prints one line.
+**At startup** the probe reads the vCPU's ID registers, checks the requirements once, and prints one terse line. The
+line gives the guest feature map, computed from the probe, beyond x86-64-v3. A missing exactness feature is the only
+host note. The list names come from the catalogue, so it can't drift.
 
-On the M4:
 ```
-natemu: host vCPU: all required features present; guest CPU: core (x86-64-v3 + AES, PCLMULQDQ, SHA, ADX, ...)
-```
-
-On the M2:
-```
-natemu: host vCPU: all required features present; exactness: no AFP (x86 floating-point corner cases differ:
-        NaN choice with two NaN inputs, denormal-operand flag, separate DAZ/FTZ, underflow rounding)
+natemu: cpu x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt
+natemu: cpu x86-64-v3 +adx +aes ... +xsaveopt; host -afp
+natemu: host lacks lse2 pmull
 ```
 
-On the M1, the same as the M2 plus `this host class is untested`.
-
-On a host missing a requirement:
-```
-natemu: refusing to start: the host vCPU lacks LSE2 (split-lock handling), PMULL (PCLMULQDQ)
-```
+The first line is a host with every feature, the second a host without AFP, and the third a refusal. The details of an
+exactness difference are in the README, not in the line.
 
 **The guest CPU each host gets** is identical today, because every built feature is core:
 
@@ -297,7 +298,7 @@ natemu: refusing to start: the host vCPU lacks LSE2 (split-lock handling), PMULL
 | --- | --- | --- | --- |
 | M4, macOS 26 | core | none | `ecv=0`, `rpres=0` (unreadable), ... |
 | M2 | core | no AFP | `afp=0`, `ecv=0`, ... |
-| M1 | core | no AFP; untested | `afp=0`, `ecv=0`, `i8mm=0`, ... |
+| M1 | core | no AFP | `afp=0`, `ecv=0`, `i8mm=0`, ... |
 
 **Consumers test generated constants** (`GF_*`, from the JSON), not hand-written verdicts:
 
@@ -331,7 +332,7 @@ cpu_profile.json 1.ecx[28] AVX: x86-64-v3 feature is not core (requires i8mm, wh
 **A future optional feature** (WAITPKG, once macOS shows ID_AA64ISAR2) has `"host": {"required": ["wfxt"]}`, with WFxT
 not in the floor, so it classifies as optional. That is the point where chunk 5's mask is built:
 - the M4 guest sees WAITPKG and the M2 guest doesn't;
-- the startup line names it: `guest CPU: core + WAITPKG (host WFxT)`.
+- the startup line shows it as `+waitpkg` on hosts that have WFxT.
 
 ## 3. The host-derived mask (built with the first optional feature)
 
@@ -450,7 +451,8 @@ No other optional feature is demanded.
    - VPCLMULQDQ on PMULL;
    - AVX-VNNI on DotProd, with I8MM also present.
 2. **Host floor:** first "the M2's feature set and above"; then (same day) the features common to the M1, the M2 and
-   the M4. The M1 is supported, but labelled unverified until natemu has run on one. A host is refused only for missing
+   the M4. The M1 is supported; it is unverified until natemu has run on one, a fact for the records, not for the
+   startup line. A host is refused only for missing
    a feature something requires, and the check is by feature, never by chip name. ECV stays out of the floor while
    the M1 record and the owner disagree about it; it is speed-only either way, and nothing may become `required` on
    it.
@@ -576,8 +578,8 @@ Apple's TSO bit and the interrupt-controller API are part of the floor too, thou
 
 **M2 only:** SSBS. Natemu does not use it.
 
-**The M1** (owner, November 15: first best-effort, then part of the floor). It is supported, and labelled unverified
-in the startup line until natemu has run on one.
+**The M1** (owner, November 15: first best-effort, then part of the floor). It is supported. It stays unverified in
+these records until natemu has run on one; the startup line says nothing about chips.
 
 **Record.** `sysctl hw.optional` from an M1 Pro (MacBookPro18,1), as published at
 https://gist.github.com/Mizux/fc3309b1efeb1454cc7b093c5f23992e. The owner pointed to it; the macOS version isn't
