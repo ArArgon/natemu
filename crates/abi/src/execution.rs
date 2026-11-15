@@ -1878,6 +1878,12 @@ pub struct Cpu {
     /// XCR0 (I5b; SDM Vol.1 13.3): written by XSETBV (one of the profile's [`crate::cpu_profile::XCR0_VALID`]), read by XGETBV and
     /// CPUID.0DH.0:EBX, and the requested-feature bitmap's mask for XSAVE/XRSTOR. Reset 1 (x87 only).
     pub xcr0: u64,
+    /// AFP fallback chunk 1: 1 when the host's floating point is that of a host without FEAT_AFP (the real one, or an M4
+    /// emulating it under `NATEMU_FEXC_FEATURE_OFF=afp`), 0 as on every AFP host (and for every `Cpu` built before the probe
+    /// ran: the loader, `ap_wake`, the drivers' programs). Set once per vCPU by the host, from the `supported` value fexc is
+    /// told, before the first lookup (`execution::run`); [`fpcr`], [`x87_fpcr`] and the host's `x87_args` read it. The resident
+    /// never writes it, and every copy of the bank (`s.cpu = c`) carries it. Plan section 1.
+    pub no_afp: u64,
 }
 /// The first native vector register of XMM0 (FEX's x64 `SRAFPR`: XMM0..XMM15 in v16..v31).
 pub const XMM_VREG: usize = 16;
@@ -1890,10 +1896,13 @@ pub const MXCSR_MASKS: u64 = 0x1f80;
 /// FPCR for generated code under `mxcsr` (FEX compiles with FEAT_AFP, DDI0487 FPCR): AH (x86 NaN and min/max rules) and NEP
 /// (scalar results keep the vector's upper lanes) always; FIZ = DAZ, FZ = FTZ (with AH, an output flush only) unless the
 /// underflow exception is unmasked (I5c: "If the underflow exception is not masked, the flush-to-zero bit is ignored", SDM
-/// Vol.1 10.2.3.3), RMode from RC (x86 00 nearest, 01 down, 10 up, 11 toward zero; Arm RN 00, RP 01, RM 10, RZ 11).
-pub const fn fpcr(mxcsr: u64) -> u64 {
+/// Vol.1 10.2.3.3), RMode from RC (x86 00 nearest, 01 down, 10 up, 11 toward zero; Arm RN 00, RP 01, RM 10, RZ 11). With
+/// `no_afp` ([`Cpu::no_afp`]) AH, NEP and FIZ stay clear: they are RES0 without FEAT_AFP, and every AFP behaviour in Arm's
+/// pseudocode depends on one of them (AFP inventory 0), so an M4 running so is a host without AFP (plan section 1).
+pub const fn fpcr(mxcsr: u64, no_afp: bool) -> u64 {
     let rmode = [0, 2, 1, 3][(mxcsr >> 13 & 3) as usize];
-    1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) | (mxcsr >> 15 & mxcsr >> 11 & 1) << 24 | rmode << 22
+    let afp = if no_afp { 0 } else { 1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) };
+    afp | (mxcsr >> 15 & mxcsr >> 11 & 1) << 24 | rmode << 22
 }
 /// I5c: the MXCSR exceptions whose mask is clear, in flag order (bit 0 IE .. 5 PE); DE left out under DAZ, which never raises
 /// it (SDM Vol.1 10.2.3.4). 0 as Linux runs: fexc's `--simd-unmasked`, part of [`Cpu::code_context`].
@@ -1974,11 +1983,22 @@ pub const MXCSR_DAZ: u64 = 1 << 6;
 pub const FCW_INIT: u64 = 0x37f;
 /// FCW's exception masks (IM DM ZM OM UM PM, bits 5:0).
 pub const FCW_MASKS: u64 = 0x3f;
-/// The FPCR x87 arithmetic runs under for `fcw` (I6): AH and NEP as for SSE, RMode from FCW.RC (bits 11:10, the same
-/// encoding as MXCSR.RC), no flush to zero; 0 when it equals MXCSR's ([`fpcr`]), which blocks are entered with.
-pub const fn x87_fpcr(fcw: u64, mxcsr: u64) -> u64 {
-    let x87 = 1 << 1 | 1 << 2 | [0, 2, 1, 3][(fcw >> 10 & 3) as usize] << 22;
-    if x87 == fpcr(mxcsr) { 0 } else { x87 }
+/// Bit 32 of fexc's `--x87-fpcr` value: without AFP the x87 FPCR can be 0 (nearest rounding, no AH/NEP), which `--x87-fpcr`
+/// would read as "none". [`x87_fpcr`] sets it then (only with `no_afp`); the shim loads the low 32 bits.
+pub const X87_FPCR_EXPLICIT: u64 = 1 << 32;
+/// The FPCR x87 arithmetic runs under for `fcw` (I6): AH and NEP as for SSE (clear with `no_afp`), RMode from FCW.RC (bits
+/// 11:10, the same encoding as MXCSR.RC), no flush to zero; 0 when it equals MXCSR's ([`fpcr`]), which blocks are entered
+/// with. With `no_afp` a word that differs carries [`X87_FPCR_EXPLICIT`], so it is never 0 (a bare 0 would be that "equal").
+pub const fn x87_fpcr(fcw: u64, mxcsr: u64, no_afp: bool) -> u64 {
+    let afp = if no_afp { 0 } else { 1 << 1 | 1 << 2 };
+    let x87 = afp | [0, 2, 1, 3][(fcw >> 10 & 3) as usize] << 22;
+    if x87 == fpcr(mxcsr, no_afp) {
+        0
+    } else if no_afp {
+        x87 | X87_FPCR_EXPLICIT
+    } else {
+        x87
+    }
 }
 
 /// A segment register's visible selector and hidden part. `attributes` are descriptor bits 47:40 (type, S, DPL, P) in
@@ -2219,7 +2239,7 @@ impl Cpu {
             | bit(self.cr4 & CR4_OSFXSR != 0, 11)
             | bit(self.bit_tests_cut(), 12)
             | bit(self.cr0 & CR0_MP != 0, 13)
-            | (x87_fpcr(self.fcw, self.mxcsr) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
+            | (x87_fpcr(self.fcw, self.mxcsr, self.no_afp != 0) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
             | bit(self.avx_enabled(), 17)
             // I5c: the unmasked MXCSR and FCW exceptions (0 with every exception masked): a translation checks each
             // floating-point instruction for them.
@@ -3915,27 +3935,56 @@ mod tests {
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.
     #[test]
     fn x87_fpcr_differs_only_when_it_must() {
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET), 0);
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, false), 0);
         for rc in 0..4u64 {
-            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | rc << 13), 0);
+            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | rc << 13, false), 0);
             assert_eq!(
-                x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13),
-                fpcr(MXCSR_RESET | rc << 13)
+                x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13, false),
+                fpcr(MXCSR_RESET | rc << 13, false)
             );
         }
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15), fpcr(MXCSR_RESET)); // FTZ
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, false), fpcr(MXCSR_RESET, false)); // FTZ
         assert_eq!(
-            x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ),
-            fpcr(MXCSR_RESET)
+            x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ, false),
+            fpcr(MXCSR_RESET, false)
         );
-        assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET), 0); // precision control has no FPCR effect (doubles throughout)
+        assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET, false), 0); // precision control has no FPCR effect (doubles throughout)
+    }
+
+    /// AFP fallback chunk 1: without AFP no AFP bit (AH 1, NEP 2, FIZ 0) is ever written: FPCR holds RMode and FZ only, the
+    /// x87 word RMode only; `x87_fpcr` is still 0 exactly when it equals MXCSR's. Everything else of the words is as with AFP.
+    #[test]
+    fn without_afp_the_fpcr_words_hold_no_afp_bits() {
+        const AFP: u64 = 7;
+        assert_eq!(fpcr(MXCSR_RESET, true), 0);
+        assert_eq!(fpcr(MXCSR_RESET, false), 6);
+        for mxcsr in 0..1u64 << 16 {
+            let (with, without) = (fpcr(mxcsr, false), fpcr(mxcsr, true));
+            assert_eq!(without & AFP, 0, "{mxcsr:#x}");
+            assert_eq!(without, with & !AFP, "{mxcsr:#x}: RMode and FZ as with AFP");
+            for rc in 0..4u64 {
+                let fcw = FCW_INIT & !(3 << 10) | rc << 10;
+                let x87 = x87_fpcr(fcw, mxcsr, true);
+                assert_eq!(x87 & AFP, 0);
+                // Own word: RMode from FCW.RC only (marked explicit); none when it equals MXCSR's.
+                let own = [0, 2, 1, 3][rc as usize] << 22;
+                let want = if own == without { 0 } else { own | X87_FPCR_EXPLICIT };
+                assert_eq!(x87, want, "{fcw:#x} {mxcsr:#x}");
+            }
+        }
+        // The default modes need no x87 word without AFP either; FTZ and a different RC do, and so does nearest rounding
+        // under FTZ or another MXCSR.RC, whose FPCR is 0: it is sent with the explicit marker, never as a bare 0.
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, true), 0);
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, true), X87_FPCR_EXPLICIT);
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 13, true), X87_FPCR_EXPLICIT);
+        assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true), X87_FPCR_EXPLICIT | 3 << 22);
     }
 
     /// I5c: FTZ only flushes with the underflow exception masked; the unmasked sets in flag order, DE dropped under DAZ.
     #[test]
     fn unmasked_exceptions_and_flush_to_zero() {
-        assert_eq!(fpcr(MXCSR_RESET | 1 << 15) & 1 << 24, 1 << 24);
-        assert_eq!(fpcr((MXCSR_RESET | 1 << 15) & !(1 << 11)) & 1 << 24, 0);
+        assert_eq!(fpcr(MXCSR_RESET | 1 << 15, false) & 1 << 24, 1 << 24);
+        assert_eq!(fpcr((MXCSR_RESET | 1 << 15) & !(1 << 11), false) & 1 << 24, 0);
         assert_eq!(
             (
                 simd_unmasked(MXCSR_RESET),
@@ -3977,6 +4026,7 @@ mod tests {
             mxcsr: MXCSR_RESET,
             fcw: FCW_INIT,
             xcr0: 1,
+            no_afp: 0,
         };
         let masked = c.code_context();
         c.mxcsr &= !(1 << 12);
@@ -4197,6 +4247,7 @@ mod tests {
             mxcsr: MXCSR_RESET,
             fcw: FCW_INIT,
             xcr0: crate::cpu_profile::XCR0_RESET,
+            no_afp: 0,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));

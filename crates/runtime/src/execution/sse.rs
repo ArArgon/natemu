@@ -20,7 +20,7 @@ pub(super) fn fill(f: &mut NativeFrame, c: &Cpu) {
     for (q, x) in f.q[XMM_VREG..].iter_mut().zip(&c.xmm) {
         *q = (u128::from(x[0]) | u128::from(x[1]) << 64).to_le_bytes();
     }
-    f.fpcr = fpcr(c.mxcsr);
+    f.fpcr = fpcr(c.mxcsr, c.no_afp != 0);
     f.fpsr = 0;
 }
 /// XMM from v16..v31 and the exception flags FPSR accumulated since the entry into the bank, with (I5c) those checked
