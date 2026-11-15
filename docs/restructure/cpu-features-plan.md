@@ -390,12 +390,41 @@ are answered below.
 | R4 | Fourth round, on the owner revision: SHA, AES and PCLMULQDQ have no FEX fallback, contrary to the second round's note; stale wording; `state` duplicated; OSXSAVE versus the v3 rule; build-now versus admit-when-built | `required` judged over the whole pipeline and listed for the three; wording fixed; validator checks `state` against the derivation; OSXSAVE exempt; §6 makes admit-when-built explicit and notes the CPUID-differs-by-host consequence; chunk 2 names a fallback source for the floor |
 | R5 | Fifth round, on the host classes: classes verified; the fallback gate had no override tool and its AFP and I8MM rows tested nothing real; LSE2 is in MMFR2, which isn't read; the GIC API is a strong import | Test-only override added; AFP and I8MM rows dropped with reasons; MMFR2 or sysctl named for LSE2; the minimum macOS stated as a deployment fact |
 | R6 | Owner question "move the M1, M2 and M4's common features to core", assessed independently: yes; ECV out until confirmed; the probe checks only declared requirements, not the whole floor; check the M1's IPA and interrupt-controller limits | Floor is M1 ∩ M2 ∩ M4 minus ECV; M1 supported and labelled unverified; the probe stays requirement-based (this revises my own suggestion to check the whole floor); the non-feature M1 checks are listed |
+| R7 | Owner: reports that Hypervisor.framework hides host features | Measured on the M4 (ECV hidden, SPECRES shown, ISAR2 unmodelled before macOS 27, SME shown) and recorded with online sources; the floor is defined over vCPU views; probe tool added |
 | Owner | Decisions after the review (§6): no guest selection; the M2 floor; core derived from the floor | `selectable`, the `--cpu` option and the hand-marked `core` flag are removed. Core and optional are derived from Arm needs and the floor. §3 became the host-derived mask, built with the first optional feature. Earlier rows that mention selection, `-FEATURE` or decisions A and B describe the text as it was then |
 
 ## Appendix: the host floor (recorded November 15, 2026)
 
 **Source.** `sysctl hw.optional.arm` on the owner's M2 Max, the same on this M4, and the published M1 Pro record below. Chunk 2 confirms the floor through
 the vCPU's ID registers on the M2. Sysctl describes the host, and the vCPU's view can differ (§2.2).
+
+**What the guest's virtual CPU sees differs from sysctl (measured November 15 on this M4, macOS 26.6.2).**
+`tools/hvf_id_probe/run.sh` creates a Hypervisor.framework vCPU, reads its ID registers, and compares them with sysctl.
+The vCPU configuration's feature registers and the created vCPU's registers agreed.
+- **ECV is hidden.** The vCPU's ID_AA64MMFR0.ECV is 0, though the host has it. So natemu already never uses the
+  self-synchronising counter read: admission sends `ecv=0`.
+- **SPECRES is shown** in the vCPU's ID_AA64ISAR1, though sysctl reports 0. Natemu doesn't use it.
+- **ID_AA64ISAR2 is not modelled before macOS 27.** The macOS 26 SDK has no feature-register ID for it; the macOS 27
+  SDK adds HV_FEATURE_REG_ID_AA64ISAR2_EL1 (see the reports below). So RPRES, WFxT, CSSC and MOPS can't be seen by a
+  guest, whatever the chip has. That blocks the WAITPKG-on-WFxT candidate until then.
+- **SME is shown** on the M4 (Hypervisor.framework has exposed it since macOS 15.2). Natemu doesn't use it.
+- Everything else that natemu or fexc uses matched sysctl: AFP, LSE2, I8MM, BF16, the crypto features, FlagM/FlagM2,
+  FCMA, FRINTTS, LRCPC/2, SB, CSV2/3.
+- The vCPU's ASIDBits is 16, and PARange is 40 bits on the M4.
+
+Reports found online agree:
+- Hypervisor.framework doesn't model ID_AA64ISAR2_EL1 before macOS 27.
+- QEMU masked SME on M4 hosts after macOS 15.2 exposed it, and SME2 support for QEMU's HVF backend is in review.
+
+No source lists which fields Hypervisor.framework masks, so the probe is the evidence. Sources:
+https://github.com/pH14/harmony/pull/373, https://miniswift.run/whats-new/hypervisor/,
+https://www.mail-archive.com/qemu-devel@nongnu.org/msg1097189.html,
+https://ratatoskr.run/qemu-devel/2026/02/14429600/t.
+
+**So the floor is defined over vCPU views, not sysctl.** Sysctl records are a first estimate only. Each record is
+kept with its chip and macOS version, because the view can change with macOS (ISAR2 in macOS 27). The probe at startup
+is the real check. The M4's vCPU view is recorded above. The M2's is pending: the owner runs
+`sh tools/hvf_id_probe/run.sh` there. The M1's is unknown: only a sysctl record exists.
 
 **The floor** (owner, November 15) is the Arm features the M1, M2 and M4 records all report, with ECV left out
 (unsettled for the M1, and speed-only):
