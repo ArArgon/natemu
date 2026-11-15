@@ -969,6 +969,18 @@ class AfpDenormal(unittest.TestCase):
             self.assertEqual(soft_de_words(native_words(form, *self.AFP0, '--simd-unmasked', '0x2')[1]), 1, name)
             self.assertEqual(soft_de_words(native_words(form, '--simd-unmasked', '0x2')[1]), 0, name)
 
+    def test_half_precision_sources_have_no_software_flag(self):
+        # VCVTPH2PS (xmm, ymm, memory): x86 raises no DE for a half denormal; the code is the plain check, and runs
+        for form in ('c4e27913ca', 'c4e27d13ca', 'c4e2791300'):
+            for mask in ('0x2', '0x3f'):
+                words, lines, spills = native_words(form, *self.AFP0, '--simd-unmasked', mask)
+                self.assertEqual((soft_de_words(lines), spills), (0, 0), (form, mask))
+                self.assertFalse({'fmul.h'} & {l.split()[0] for l in lines}, (form, mask))
+        words, lines, _ = native_words('c4e27913ca', *self.AFP0, '--simd-unmasked', '0x2')
+        i = next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR'))
+        x, _, _ = native_run(words[:i + 1], v=[0] * 18 + [0x3c000001] + [0] * 13)
+        self.assertFalse(x[0] & 0x80)
+
     def test_dpps_flags_its_multiplies_and_checks_each_step(self):
         words, lines, spills = native_words('660f3a40caff', *self.AFP0, '--simd-unmasked', '0x2')
         self.assertEqual(spills, 0)

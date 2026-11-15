@@ -226,6 +226,7 @@ inline bool DeRuleOf(const FEXCore::IR::IROp_Header* Op, DeRule& R) {
   case OP_VFCVTN2: Set(DeRule::Unary, {1}, E << 1, 16, false); break;
   default: return false;
   }
+  if (R.E < 4) R.K = DeRule::None;   // a half-precision source (VCVTPH2PS) has no DE: x86 does not raise it
   return R.K != DeRule::None;
 }
 inline FEXCore::IR::OpSize OpSz(uint32_t Bytes) {
