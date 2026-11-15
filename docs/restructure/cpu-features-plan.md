@@ -340,14 +340,21 @@ Apple's TSO bit and the interrupt-controller API are part of the floor too, thou
 **M2 only:** SSBS. Natemu does not use it.
 
 **Best-effort tier: the M1** (owner, November 15). It isn't a target, but it should run whenever it meets the
-requirements. Known gaps against the floor are I8MM, ECV and BF16, besides everything above the floor. It has DotProd.
-Today no required entry names any of those, so the M1 gets the same guest CPU as the floor:
-- ECV is speed only;
-- I8MM is speed only for AVX-VNNI, whose any-of group DotProd satisfies.
+requirements.
 
-The validator warns, but doesn't refuse, when a core feature's `required` list stops being met by the M1's known set.
-That is the M1 record (recorded from sysctl when an M1 is at hand; until then marked unverified). The warning makes any
-loss of M1 support a visible decision.
+**Record.** `sysctl hw.optional` from an M1 Pro (MacBookPro18,1), as published at
+https://gist.github.com/Mizux/fc3309b1efeb1454cc7b093c5f23992e. The owner pointed to it; the macOS version isn't
+stated. That macOS has no FEAT_CRC32 or FEAT_AFP keys: CRC32 comes from `hw.optional.armv8_crc32: 1`, and a missing key
+counts as absent.
+
+**Gaps against the floor:** I8MM, BF16, PAuth2, FPAC and BTI, plus everything above the floor (AFP, RPRES, WFxT, SME).
+The M1 Pro has every required feature: FlagM, FlagM2, LSE, LSE2, CRC32, AES, PMULL, SHA1/SHA256 and DotProd. The record
+lists ECV as present. The owner understands the M1 to lack it, so this is unsettled, but ECV is speed only and the
+outcome doesn't depend on it. So the M1 gets the same guest CPU as the floor, and I8MM is speed only for AVX-VNNI,
+whose any-of group DotProd satisfies.
+
+The validator warns, but doesn't refuse, when a core feature's `required` list stops being met by this record. That
+makes any loss of M1 support a visible decision.
 
 **Against fexc's feature table.** Every Arm feature fexc uses when present is in the floor except AFP: atomics_lse,
 flagm, flagm2, fcma, crc32, aes, sha, pmull128, frintts, i8mm, dotprod, ecv. lrcpc and lrcpc2 are in the floor but off by
