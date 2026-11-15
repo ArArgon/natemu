@@ -7,6 +7,7 @@ runners and models ask (`cpuid`, `msr_write_ok`, `cr4_valid_mask`, ...). Python 
 """
 import json
 import pathlib
+import re
 
 PATH = pathlib.Path(__file__).with_name('cpu_profile.json')
 MASK64 = (1 << 64) - 1
@@ -14,12 +15,24 @@ MTRR_TYPES = (0, 1, 4, 5, 6)           # UC, WC, WT, WP, WB (SDM Vol.3 11.11.2.1
 PAT_TYPES = MTRR_TYPES + (7,)          # plus UC-  (SDM Vol.3 11.12.2)
 RULES = {'canonical', 'reserved_gp', 'apic_base_extd_needs_en', 'ucode_low32_zero', 'misc_enable', 'mtrr_type_low_byte',
          'mtrr_type_all_bytes', 'pat_type_all_bytes', 'efer', 'always_gp', 'always_gp_on_write', 'lapic_owner'}
-# feature bit -> MSRs that must exist when it is advertised / must be absent when it is clear
-FEATURE_MSRS = {'1.edx.SEP': (0x174, 0x175, 0x176), '1.edx.MTRR': (0xfe, 0x2ff, 0x200, 0x201, 0x250, 0x268),
-                '1.edx.PAT': (0x277,), '1.edx.APIC': (0x1b,), '0x80000001.edx.RDTSCP': (0xC0000103,),
-                '7.0.edx.ARCH_CAPABILITIES': (0x10a,)}
-ABSENT_WHEN_CLEAR = {'7.0.ebx.TSC_ADJUST': 0x3b, '1.ecx.TSC_DEADLINE': 0x6e0, '13.1.eax.XSAVES': 0xda0, '13.1.eax.XFD': 0x1c4,
-                     '7.0.edx.SPEC_CTRL': 0x48, '7.0.ecx.CET_SS': 0x6a2, '1.edx.MCA': 0x179}
+# ---- the feature catalogue's judgement (cpu-features plan sec. 2.1) -------------------------------------------------------
+# Arm features the host provides on every supported machine: fexc feature names, copied from the plan's appendix
+# ("the host floor", the M1, M2 and M4 in common, ECV left out). The source of truth moves to `admission::FEATURES`' floor flags (chunk 2);
+# a host-crate test will tie that table to this set. NOT in it: i8mm, ecv, afp, rpres, wfxt.
+FLOOR = frozenset({'atomics_lse', 'flagm', 'flagm2', 'fcma', 'crc32', 'aes', 'sha', 'pmull128', 'frintts', 'dotprod', 'lrcpc',
+                   'lrcpc2'})
+# Every `host` item must be one of fexc's Arm feature names (tools/fexc/fexc.cpp FeatureTable), read from there.
+FEXC = pathlib.Path(__file__).resolve().parents[1] / 'fexc/fexc.cpp'
+ARM_FEATURES = frozenset(n for n in re.findall(r'FEAT\(\w+, "(\w+)", (?:true|false)\)', FEXC.read_text())
+                         if not n.startswith('x86_'))
+HOST_CLASSES = ('required', 'exactness', 'speed')
+CONSUMERS = ('shim', 'system', 'resident')           # who may test a feature's generated constant (plan sec. 2.3)
+FIELD_KEYS = {'name', 'state', 'built', 'requires', 'host', 'msrs', 'cr4', 'subleaf', 'resident', 'gates', 'layout', 'source',
+              'rule'}
+# x86-64-v1..v3 (x86-64 psABI, "x86-64 Microarchitecture Levels"), by catalogue name; the baseline's own SYSCALL and the
+# dynamic OSXSAVE are not capability bits and are left out.
+V3 = ('CMOV', 'CX8', 'FPU', 'FXSR', 'MMX', 'SSE', 'SSE2', 'CX16', 'LAHF', 'POPCNT', 'SSE3', 'SSE4_1', 'SSE4_2', 'SSSE3', 'AVX',
+      'AVX2', 'BMI1', 'BMI2', 'F16C', 'FMA', 'LZCNT', 'MOVBE', 'XSAVE')
 
 
 def _i(x):
@@ -55,6 +68,25 @@ class Profile:
         for e in d['absent_msrs']:
             for i in range(_i(e['index']), _i(e.get('index_last', e['index'])) + 1):
                 self.absent[i] = e
+
+    def _field_word(self, e, r):
+        """Static word of a `fields` register key: 'ecx', or 'sub.reg' (a subleaf with no entry of its own: zero)."""
+        if '.' not in r: return _i(e[r])
+        sub, reg = r.split('.')
+        x = self.leaves.get((_i(e['leaf']), int(sub)))
+        return _i(x[reg]) if x else 0
+
+    def features(self):
+        """The catalogue: {name: its `fields` entry plus leaf, sub, reg, bit and the resolved `built`}. `built` defaults to
+        true for an advertised or dynamic feature and false for a clear one."""
+        out = {}
+        for e in self.d['cpuid']:
+            for r, fs in e.get('fields', {}).items():
+                for b, f in fs.items():
+                    sub = int(r.split('.')[0]) if '.' in r else e['subleaf']
+                    out.setdefault(f['name'], []).append(dict(f, leaf=_i(e['leaf']), sub=sub, reg=r.split('.')[-1], bit=int(b),
+                                                              built=f.get('built', f['state'] != 'clear')))
+        return out
 
     # ---- features -------------------------------------------------------------------------------------------------
     def _reg(self, key):
@@ -216,6 +248,72 @@ class Profile:
         c = _i(e['committed_bits'])
         return (value & c) | (_i(e['reset']) & ~c)
 
+    # ---- feature catalogue ----------------------------------------------------------------------------------------
+    @staticmethod
+    def host_ok(item):
+        """One `host.required` item (an Arm feature name, or an any-of group) lies within the floor."""
+        return item in FLOOR if isinstance(item, str) else any(i in FLOOR for i in item)
+
+    def core(self, f):
+        """Core = built, and every Arm feature it requires is within the floor (plan sec. 2.1); derived, not hand-marked."""
+        return f['built'] and all(self.host_ok(i) for i in f.get('host', {}).get('required', []))
+
+    def catalogue_problems(self):
+        out = []
+        err = out.append
+        cat, flat = self.features(), []
+        names = {n for nm in self.names.values() for n in nm.values()}
+        for n, fl in cat.items():
+            if len(fl) > 1: err(f'{n}: more than one catalogue entry')
+            flat += fl
+        if set(cat) != names: err(f'feature_names and fields disagree: {sorted(set(cat) ^ names)}')
+        for f in flat:
+            n, st = f['name'], f['state']
+            at = f'{f["leaf"]:#x}.{f["sub"]}.{f["reg"]}[{f["bit"]}] {n}'
+            unknown = set(f) - FIELD_KEYS - {'leaf', 'sub', 'reg', 'bit'}
+            if unknown: err(f'{at}: unknown field {sorted(unknown)}')
+            host = f.get('host', {})
+            if set(host) - set(HOST_CLASSES): err(f'{at}: unknown host class {sorted(set(host) - set(HOST_CLASSES))}')
+            for c in HOST_CLASSES:
+                for item in host.get(c, []):
+                    for a in [item] if isinstance(item, str) else item:
+                        if a not in ARM_FEATURES: err(f'{at}: host {c} names {a!r}, not an fexc Arm feature')
+            for x in f.get('requires', []):
+                if x not in cat: err(f'{at}: requires {x!r}, which is not a feature')
+                elif st == 'advertised' and cat[x][0]['state'] == 'clear': err(f'{at}: requires {x}, which is not advertised')
+            for g in f.get('gates', []):
+                if g not in CONSUMERS: err(f'{at}: gates names {g!r}, not one of {CONSUMERS}')
+            if 'subleaf' in f and f['subleaf'] != f['sub']: err(f'{at}: subleaf {f["subleaf"]} but it lives in subleaf {f["sub"]}')
+            if st == 'advertised' and not f['built']: err(f'{at}: advertised but not built')
+            if st == 'advertised' and not self.core(f):
+                out_of = [i for i in f.get('host', {}).get('required', []) if not self.host_ok(i)]
+                err(f'{at}: advertised but not core (requires {out_of} beyond the floor)')
+            if st == 'clear' and f['built'] and self.core(f): err(f'{at}: built and core but not advertised')
+            if st == 'clear' and f['built'] and f.get('layout'): err(f'{at}: optional layout feature (layout features must be core)')
+            for m in map(_i, f.get('msrs', [])):
+                if st == 'advertised' and m not in self._msr: err(f'{n} advertised but MSR {m:#x} missing')
+                if st == 'clear' and m in self._msr: err(f'{n} clear but MSR {m:#x} present')
+            for b in f.get('cr4', []):
+                bit = self.d['control']['cr4']['bits'].get(b)
+                if bit is None or bit['gate'].rsplit('.', 1)[-1] != n: err(f'{at}: cr4 {b} is not gated on it')
+        for b, bit in self.d['control']['cr4']['bits'].items():
+            g = bit['gate']
+            if g.startswith('arch'): continue
+            f = cat.get(g.rsplit('.', 1)[-1])
+            if f is None or b not in f[0].get('cr4', []): err(f'CR4.{b}: gated on {g}, whose catalogue entry does not list it')
+        for n in V3:
+            f = cat.get(n)
+            if f is None: err(f'x86-64-v3 feature {n} has no catalogue entry')
+            elif f[0]['state'] != 'advertised': err(f'x86-64-v3 feature {n} is not advertised')
+        # leaf 7's highest subleaf (7.0 EAX) follows the highest advertised feature there (or any non-zero subleaf entry)
+        l7 = self.leaves.get((7, 0))
+        if l7 is not None:
+            top = max([f['sub'] for f in flat if f['leaf'] == 7 and f['state'] == 'advertised']
+                      + [s for (l, s), e in self.leaves.items() if l == 7 and any(_i(e[r]) for r in ('eax', 'ebx', 'ecx', 'edx'))]
+                      + [0])
+            if _i(l7['eax']) != top: err(f'leaf 7 max subleaf (7.0 EAX = {_i(l7["eax"])}) != highest advertised subleaf {top}')
+        return out
+
     # ---- validation -----------------------------------------------------------------------------------------------
     def problems(self):
         d, out = self.d, []
@@ -231,7 +329,7 @@ class Profile:
                 if not 0 <= _i(e[r]) < 1 << 32: err(f'{k} {r} out of 32-bit range')
             for r, fs in e.get('fields', {}).items():
                 for b, f in fs.items():
-                    on = _i(e[r]) >> int(b) & 1
+                    on = self._field_word(e, r) >> int(b) & 1
                     if (f['state'] == 'advertised') != bool(on): err(f'{k} {r} bit {b} {f["name"]}: state {f["state"]} but bit is {on}')
         for key, nm in self.names.items():
             word = self._reg(key)
@@ -297,6 +395,7 @@ class Profile:
                 if g.startswith('arch'):
                     if not bt['valid']: err(f'{reg}.{n}: architectural bit not valid')
                 elif bt['valid'] != self.feature(g): err(f'{reg}.{n}: valid={bt["valid"]} but {g} is {self.feature(g)}')
+        out += self.catalogue_problems()
         # 6 MSRs
         for i in set(self._msr) & set(self.absent): err(f'MSR {i:#x} both present and absent')
         for e in d['msrs']:
@@ -304,11 +403,6 @@ class Profile:
                 if r not in RULES: err(f'MSR {e["name"]}: unknown rule {r}')
             if e['access'] == 'rw':
                 if _i(e['reset']) & ~_i(e['writable_mask']): err(f'MSR {e["name"]}: reset outside writable mask')
-        for f, ms in FEATURE_MSRS.items():
-            if self.feature(f) and not all(m in self._msr for m in ms): err(f'{f} advertised but MSRs {[hex(m) for m in ms if m not in self._msr]} missing')
-        for f, m in ABSENT_WHEN_CLEAR.items():
-            if self.feature(f): err(f'{f} is advertised: update this check')
-            elif m in self._msr: err(f'{f} clear but MSR {m:#x} present')
         if not all(m in self._msr for m in range(0x200, 0x210)) or not all(m in self._msr for m in (0x250, 0x258, 0x259, *range(0x268, 0x270))): err('MTRR set incomplete')
         if self._msr[0xfe]['reset'] != '0x508' and _i(self._msr[0xfe]['reset']) & 0xFF != 8: err('MTRRCAP VCNT != 8')
         pat = _i(self._msr[0x277]['reset'])

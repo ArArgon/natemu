@@ -141,21 +141,29 @@
    "14": "MPX",
    "15": "RDT_A",
    "16": "AVX512F",
+   "17": "AVX512DQ",
    "18": "RDSEED",
    "19": "ADX",
    "20": "SMAP",
+   "21": "AVX512_IFMA",
    "23": "CLFLUSHOPT",
    "24": "CLWB",
    "25": "PT",
-   "29": "SHA"
+   "28": "AVX512CD",
+   "29": "SHA",
+   "30": "AVX512BW",
+   "31": "AVX512VL"
   },
   "7.0.ecx": {
+   "1": "AVX512_VBMI",
    "2": "UMIP",
    "3": "PKU",
    "4": "OSPKE",
    "5": "WAITPKG",
    "7": "CET_SS",
    "8": "GFNI",
+   "9": "VAES",
+   "10": "VPCLMULQDQ",
    "13": "TME_EN",
    "16": "LA57",
    "22": "RDPID",
@@ -175,6 +183,9 @@
    "14": "SERIALIZE",
    "16": "TSXLDTRK",
    "20": "CET_IBT",
+   "22": "AMX_BF16",
+   "24": "AMX_TILE",
+   "25": "AMX_INT8",
    "26": "SPEC_CTRL",
    "27": "STIBP",
    "28": "L1D_FLUSH",
@@ -211,6 +222,9 @@
   },
   "0x80000007.edx": {
    "8": "INVARIANT_TSC"
+  },
+  "7.1.eax": {
+   "4": "AVX_VNNI"
   }
  },
  "parameters": {
@@ -281,11 +295,29 @@
     "ecx": {
      "0": {
       "name": "SSE3",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSE2"
+      ],
+      "host": {
+       "speed": [
+        "fcma"
+       ]
+      },
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
      "1": {
       "name": "PCLMULQDQ",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSE2"
+      ],
+      "host": {
+       "required": [
+        "pmull128"
+       ]
+      },
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
      "2": {
       "name": "DTES64",
@@ -301,11 +333,19 @@
      },
      "5": {
       "name": "VMX",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "VMXE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "6": {
       "name": "SMX",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "SMXE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "7": {
       "name": "EIST",
@@ -317,7 +357,11 @@
      },
      "9": {
       "name": "SSSE3",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSE3"
+      ],
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
      "10": {
       "name": "CNXT_ID",
@@ -329,7 +373,11 @@
      },
      "12": {
       "name": "FMA",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "AVX"
+      ],
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
      "13": {
       "name": "CX16",
@@ -345,7 +393,11 @@
      },
      "17": {
       "name": "PCID",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "PCIDE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "18": {
       "name": "DCA",
@@ -353,15 +405,32 @@
      },
      "19": {
       "name": "SSE4_1",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSSE3"
+      ],
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
      "20": {
       "name": "SSE4_2",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSE4_1"
+      ],
+      "host": {
+       "required": [
+        "crc32"
+       ]
+      },
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
      "21": {
       "name": "X2APIC",
-      "state": "advertised"
+      "state": "advertised",
+      "resident": [
+       "ACPI MADT describes x2APIC local APICs (crates/host/src/boot/acpi.rs)"
+      ],
+      "source": "resident: where natemu itself branches on the feature"
      },
      "22": {
       "name": "MOVBE",
@@ -373,15 +442,33 @@
      },
      "24": {
       "name": "TSC_DEADLINE",
-      "state": "clear"
+      "state": "clear",
+      "msrs": [
+       "0x6e0"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "25": {
       "name": "AES",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSE2"
+      ],
+      "host": {
+       "required": [
+        "aes"
+       ]
+      },
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
      "26": {
       "name": "XSAVE",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "OSXSAVE"
+      ],
+      "layout": true,
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "27": {
       "name": "OSXSAVE",
@@ -390,11 +477,20 @@
      },
      "28": {
       "name": "AVX",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "XSAVE"
+      ],
+      "layout": true,
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "29": {
       "name": "F16C",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "AVX"
+      ],
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
      "30": {
       "name": "RDRAND",
@@ -408,23 +504,48 @@
     "edx": {
      "0": {
       "name": "FPU",
-      "state": "advertised"
+      "state": "advertised",
+      "host": {
+       "exactness": [
+        "afp"
+       ]
+      },
+      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
      "1": {
       "name": "VME",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "VME",
+       "PVI"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "2": {
       "name": "DE",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "DE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "3": {
       "name": "PSE",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "PSE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "4": {
       "name": "TSC",
-      "state": "advertised"
+      "state": "advertised",
+      "host": {
+       "speed": [
+        "ecv"
+       ]
+      },
+      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
      "5": {
       "name": "MSR",
@@ -432,11 +553,19 @@
      },
      "6": {
       "name": "PAE",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "PAE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "7": {
       "name": "MCE",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "MCE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "8": {
       "name": "CX8",
@@ -445,23 +574,50 @@
      "9": {
       "name": "APIC",
       "state": "dynamic",
-      "rule": "IA32_APIC_BASE bit 11 (EN); SVR software-disable does not clear it (CPU 16, Intel Vol.3 13.4.3)"
+      "rule": "IA32_APIC_BASE bit 11 (EN); SVR software-disable does not clear it (CPU 16, Intel Vol.3 13.4.3)",
+      "msrs": [
+       "0x1b"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "11": {
       "name": "SEP",
-      "state": "advertised"
+      "state": "advertised",
+      "msrs": [
+       "0x174",
+       "0x175",
+       "0x176"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "12": {
       "name": "MTRR",
-      "state": "advertised"
+      "state": "advertised",
+      "msrs": [
+       "0xfe",
+       "0x2ff",
+       "0x200",
+       "0x201",
+       "0x250",
+       "0x268"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "13": {
       "name": "PGE",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "PGE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "14": {
       "name": "MCA",
-      "state": "clear"
+      "state": "clear",
+      "msrs": [
+       "0x179"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "15": {
       "name": "CMOV",
@@ -469,7 +625,11 @@
      },
      "16": {
       "name": "PAT",
-      "state": "advertised"
+      "state": "advertised",
+      "msrs": [
+       "0x277"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "17": {
       "name": "PSE36",
@@ -497,15 +657,40 @@
      },
      "24": {
       "name": "FXSR",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "OSFXSR"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "25": {
       "name": "SSE",
-      "state": "advertised"
+      "state": "advertised",
+      "host": {
+       "exactness": [
+        "afp"
+       ]
+      },
+      "cr4": [
+       "OSXMMEXCPT"
+      ],
+      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "26": {
       "name": "SSE2",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSE"
+      ],
+      "host": {
+       "exactness": [
+        "afp"
+       ],
+       "speed": [
+        "frintts"
+       ]
+      },
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
      "27": {
       "name": "SS",
@@ -649,11 +834,19 @@
     "ebx": {
      "0": {
       "name": "FSGSBASE",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "FSGSBASE"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "1": {
       "name": "TSC_ADJUST",
-      "state": "clear"
+      "state": "clear",
+      "msrs": [
+       "0x3b"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "2": {
       "name": "SGX",
@@ -669,7 +862,11 @@
      },
      "5": {
       "name": "AVX2",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "AVX"
+      ],
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
      "6": {
       "name": "FDP_EXCPTN_ONLY",
@@ -677,7 +874,14 @@
      },
      "7": {
       "name": "SMEP",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "SMEP"
+      ],
+      "resident": [
+       "page-walk permission check (crates/abi/src/paging.rs)"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); resident: where natemu itself branches on the feature"
      },
      "8": {
       "name": "BMI2",
@@ -701,7 +905,9 @@
      },
      "14": {
       "name": "MPX",
-      "state": "clear"
+      "state": "clear",
+      "layout": true,
+      "source": "layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "15": {
       "name": "RDT_A",
@@ -709,7 +915,21 @@
      },
      "16": {
       "name": "AVX512F",
-      "state": "clear"
+      "state": "clear",
+      "requires": [
+       "AVX2"
+      ],
+      "layout": true,
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+     },
+     "17": {
+      "name": "AVX512DQ",
+      "state": "clear",
+      "requires": [
+       "AVX512F"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EBX[17]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      },
      "18": {
       "name": "RDSEED",
@@ -721,7 +941,23 @@
      },
      "20": {
       "name": "SMAP",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "SMAP"
+      ],
+      "resident": [
+       "STAC/CLAC are #UD while SMAP is clear (crates/host/src/system.rs)"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); resident: where natemu itself branches on the feature"
+     },
+     "21": {
+      "name": "AVX512_IFMA",
+      "state": "clear",
+      "requires": [
+       "AVX512F"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EBX[21]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      },
      "23": {
       "name": "CLFLUSHOPT",
@@ -735,19 +971,73 @@
       "name": "PT",
       "state": "clear"
      },
+     "28": {
+      "name": "AVX512CD",
+      "state": "clear",
+      "requires": [
+       "AVX512F"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EBX[28]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+     },
      "29": {
       "name": "SHA",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "SSE2"
+      ],
+      "host": {
+       "required": [
+        "sha"
+       ]
+      },
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
+     },
+     "30": {
+      "name": "AVX512BW",
+      "state": "clear",
+      "requires": [
+       "AVX512F"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EBX[30]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+     },
+     "31": {
+      "name": "AVX512VL",
+      "state": "clear",
+      "requires": [
+       "AVX512F"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EBX[31]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      }
     },
     "ecx": {
+     "1": {
+      "name": "AVX512_VBMI",
+      "state": "clear",
+      "requires": [
+       "AVX512F"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H ECX[1]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+     },
      "2": {
       "name": "UMIP",
-      "state": "advertised"
+      "state": "advertised",
+      "cr4": [
+       "UMIP"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "3": {
       "name": "PKU",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "PKE"
+      ],
+      "layout": true,
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "4": {
       "name": "OSPKE",
@@ -755,15 +1045,69 @@
      },
      "5": {
       "name": "WAITPKG",
-      "state": "clear"
+      "state": "clear",
+      "built": false,
+      "host": {
+       "required": [
+        "wfxt"
+       ]
+      },
+      "gates": [
+       "shim"
+      ],
+      "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; not built (cpu-features plan sec. 2.1, sec. 2.4): stays clear"
      },
      "7": {
       "name": "CET_SS",
-      "state": "clear"
+      "state": "clear",
+      "msrs": [
+       "0x6a2"
+      ],
+      "cr4": [
+       "CET"
+      ],
+      "layout": true,
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR; cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "8": {
       "name": "GFNI",
       "state": "clear"
+     },
+     "9": {
+      "name": "VAES",
+      "state": "clear",
+      "built": false,
+      "requires": [
+       "AVX",
+       "AES"
+      ],
+      "host": {
+       "required": [
+        "aes"
+       ]
+      },
+      "gates": [
+       "shim"
+      ],
+      "source": "SDM Vol.2A CPUID 07H ECX[9]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+     },
+     "10": {
+      "name": "VPCLMULQDQ",
+      "state": "clear",
+      "built": false,
+      "requires": [
+       "AVX",
+       "PCLMULQDQ"
+      ],
+      "host": {
+       "required": [
+        "pmull128"
+       ]
+      },
+      "gates": [
+       "shim"
+      ],
+      "source": "SDM Vol.2A CPUID 07H ECX[10]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      },
      "13": {
       "name": "TME_EN",
@@ -771,7 +1115,11 @@
      },
      "16": {
       "name": "LA57",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "LA57"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "22": {
       "name": "RDPID",
@@ -779,7 +1127,11 @@
      },
      "23": {
       "name": "KL",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "KL"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "24": {
       "name": "BUS_LOCK_DETECT",
@@ -807,7 +1159,11 @@
      },
      "31": {
       "name": "PKS",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "PKS"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      }
     },
     "edx": {
@@ -817,7 +1173,11 @@
      },
      "5": {
       "name": "UINTR",
-      "state": "clear"
+      "state": "clear",
+      "cr4": [
+       "UINTR"
+      ],
+      "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
      "10": {
       "name": "MD_CLEAR",
@@ -833,11 +1193,44 @@
      },
      "20": {
       "name": "CET_IBT",
-      "state": "clear"
+      "state": "clear",
+      "layout": true,
+      "source": "layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
+     },
+     "22": {
+      "name": "AMX_BF16",
+      "state": "clear",
+      "requires": [
+       "AMX_TILE"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EDX[22]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+     },
+     "24": {
+      "name": "AMX_TILE",
+      "state": "clear",
+      "requires": [
+       "XSAVE"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EDX[24]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
+     },
+     "25": {
+      "name": "AMX_INT8",
+      "state": "clear",
+      "requires": [
+       "AMX_TILE"
+      ],
+      "layout": true,
+      "source": "SDM Vol.2A CPUID 07H EDX[25]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image); catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      },
      "26": {
       "name": "SPEC_CTRL",
-      "state": "clear"
+      "state": "clear",
+      "msrs": [
+       "0x48"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "27": {
       "name": "STIBP",
@@ -849,7 +1242,11 @@
      },
      "29": {
       "name": "ARCH_CAPABILITIES",
-      "state": "advertised"
+      "state": "advertised",
+      "msrs": [
+       "0x10a"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "30": {
       "name": "CORE_CAPABILITIES",
@@ -858,6 +1255,32 @@
      "31": {
       "name": "SSBD",
       "state": "clear"
+     }
+    },
+    "1.eax": {
+     "4": {
+      "name": "AVX_VNNI",
+      "state": "clear",
+      "built": false,
+      "requires": [
+       "AVX"
+      ],
+      "host": {
+       "required": [
+        [
+         "dotprod",
+         "i8mm"
+        ]
+       ],
+       "speed": [
+        "i8mm"
+       ]
+      },
+      "subleaf": 1,
+      "gates": [
+       "shim"
+      ],
+      "source": "SDM Vol.2A CPUID 07H subleaf 1 EAX[4]; requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; catalogue entry for a feature natemu does not build (decision November 15, cpu-features plan sec. 2.1): stays clear"
      }
     }
    },
@@ -932,23 +1355,64 @@
     "eax": {
      "0": {
       "name": "XSAVEOPT",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "XSAVE"
+      ],
+      "subleaf": 1,
+      "resident": [
+       "XSAVEOPT path compiled into crates/runtime/src/execution/xsave.rs"
+      ],
+      "layout": true,
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); resident: where natemu itself branches on the feature; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "1": {
       "name": "XSAVEC",
-      "state": "advertised"
+      "state": "advertised",
+      "requires": [
+       "XSAVE"
+      ],
+      "subleaf": 1,
+      "resident": [
+       "XSAVEC/XRSTOR compacted form compiled into crates/runtime/src/execution/xsave.rs"
+      ],
+      "layout": true,
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); resident: where natemu itself branches on the feature; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "2": {
       "name": "XGETBV1",
-      "state": "clear"
+      "state": "clear",
+      "requires": [
+       "XSAVE"
+      ],
+      "subleaf": 1,
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
      "3": {
       "name": "XSAVES",
-      "state": "clear"
+      "state": "clear",
+      "requires": [
+       "XSAVE"
+      ],
+      "msrs": [
+       "0xda0"
+      ],
+      "subleaf": 1,
+      "layout": true,
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
      "4": {
       "name": "XFD",
-      "state": "clear"
+      "state": "clear",
+      "requires": [
+       "XSAVE"
+      ],
+      "msrs": [
+       "0x1c4"
+      ],
+      "subleaf": 1,
+      "layout": true,
+      "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      }
     }
    },
@@ -1027,7 +1491,11 @@
      },
      "20": {
       "name": "NX",
-      "state": "advertised"
+      "state": "advertised",
+      "resident": [
+       "page-walk reserved bit 63 and instruction-fetch permission follow EFER.NXE (crates/abi/src/paging.rs)"
+      ],
+      "source": "resident: where natemu itself branches on the feature"
      },
      "26": {
       "name": "PAGE1GB",
@@ -1035,7 +1503,11 @@
      },
      "27": {
       "name": "RDTSCP",
-      "state": "advertised"
+      "state": "advertised",
+      "msrs": [
+       "0xc0000103"
+      ],
+      "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
      "29": {
       "name": "LM",

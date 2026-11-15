@@ -373,7 +373,7 @@ class Slice1Cutting(unittest.TestCase):
         # (`Undefined0F38` cut every 0f 38 f6 before November 3).
         leaf = next(e for e in json.loads((REPO / 'tools/models/cpu_profile.json').read_text())['cpuid']
                     if e['leaf'] == '0x7' and e.get('subleaf') == 0)
-        self.assertEqual(leaf['fields']['ebx']['19'], {'name': 'ADX', 'state': 'advertised'})
+        self.assertEqual({k: leaf['fields']['ebx']['19'][k] for k in ('name', 'state')}, {'name': 'ADX', 'state': 'advertised'})
         self.assertIn('adox rax,rcx', ALLOWED)
 
     def test_sha_follows_the_profile(self):
@@ -381,7 +381,7 @@ class Slice1Cutting(unittest.TestCase):
         # shim's #UD cut back (fexc_slice1.inc `Undefined0F38`, before November 3); the host's decode and `undefined` follow it.
         leaf = next(e for e in json.loads((REPO / 'tools/models/cpu_profile.json').read_text())['cpuid']
                     if e['leaf'] == '0x7' and e.get('subleaf') == 0)
-        self.assertEqual(leaf['fields']['ebx']['29'], {'name': 'SHA', 'state': 'advertised'})
+        self.assertEqual({k: leaf['fields']['ebx']['29'][k] for k in ('name', 'state')}, {'name': 'SHA', 'state': 'advertised'})
         self.assertIn('sha1rnds4 xmm1,xmm2,0', ALLOWED)
 
     def test_unsupported_forms(self):
