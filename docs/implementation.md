@@ -271,6 +271,12 @@ and independent evidence review. Compare with QEMU under matched guest/workload,
 host resources and disclosed cache/build conditions. Attribute codegen, runtime
 and I/O costs separately where possible; boot time is not a general compiler score.
 
+**Published numbers.** [benchmarks.md](benchmarks.md) and the README's speed-up sentence show the latest full benchmark
+round (every program at 1 and 4 vCPUs, `tools/bench/run.py`), the Debian cloud-image workload (`tools/run_io5.py`) and
+the mitigations comparison. Whenever one of these is rerun on the merge head, or the QEMU baseline changes, update them in
+the same change set: the tables, geometric means and ranges, the date and the setup line. Per-change subsets and
+development timings do not update them. Both pages are user-facing: plain language, no internal stage names.
+
 A minimal initramfs can run `/init` and test programs without a disk-backed root
 filesystem ([Linux documentation](https://docs.kernel.org/filesystems/ramfs-rootfs-initramfs.html)).
 This brings application measurements before block/network completion. It does
