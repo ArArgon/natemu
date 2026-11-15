@@ -77,10 +77,11 @@ There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profi
   no software path for SHA or AES (its dispatcher marks them unimplemented without the Arm feature), so SHA requires
   `sha`, AES requires `aes`, and PCLMULQDQ requires `pmull128`.
 
-  `required` is a list of alternatives: each item is one Arm feature or an any-of group. AVX-VNNI is the case today. It
-  requires DotProd or I8MM: FEX lowers it with USDOT under I8MM, else with SDOT plus a correction. I8MM is listed as
-  `speed` for it, not as required. A third class, `speed`, records Arm features that only make a feature faster
-  (ECV for RDTSC, FCMA for ADDSUBPS, FRINTTS, FlagM2, I8MM for AVX-VNNI). It never affects classification or startup.
+  `required` is a list whose items are one Arm feature or an any-of group (no current entry needs a group). A third
+  class, `speed`, records Arm features that only make a feature faster: ECV for RDTSC, FCMA for ADDSUBPS, FRINTTS, FlagM2,
+  and I8MM and DotProd for AVX-VNNI. Chunk 1's review found that FEX lowers AVX-VNNI with USDOT under I8MM, else SDOT
+  with a correction, else a plain-SIMD sequence (OpcodeDispatcher/Vector.cpp, "Naive software implementation"), so it
+  requires no Arm feature. It never affects classification or startup.
 - `layout`: true when the feature changes XCR0's valid values, leaf 0xD or the XSAVE image, or whose presence the
   resident tests as a compile-time constant (today XSAVEC and XSAVEOPT; a resident transaction alone, such as RDRAND's or
   CLWB's, does not make a feature `layout`). That covers AVX, MPX, AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
@@ -253,11 +254,11 @@ CPU is the same on every supported host, and these compile-time constants are ex
 },
 "1.eax": {
   "4": {"name": "AVX_VNNI", "state": "clear", "built": false, "requires": ["AVX"], "subleaf": 1,
-        "host": {"required": [["dotprod", "i8mm"]], "speed": ["i8mm"]}, "gates": ["shim"]}
+        "host": {"speed": ["i8mm", "dotprod"]}, "gates": ["shim"]}
 }
 ```
 
-`[["dotprod", "i8mm"]]` is an any-of group. As built, AVX_VNNI's leaf 7 subleaf 1 entry sits in the 7.0 entry's `fields`
+As built, AVX_VNNI's leaf 7 subleaf 1 entry sits in the 7.0 entry's `fields`
 under the register key `"1.eax"`, so that the generated CPUID tables stay unchanged until a subleaf-1 row is needed. AVX's entry carries `"layout": true`. The `name` and `source` fields exist
 today; the rest are new.
 
@@ -400,7 +401,7 @@ Chunks 1, 2 and 0 are independent of each other. Chunk 3 depends on 0 and 1. Chu
 
 It classifies itself: core when its Arm needs are in the floor, otherwise optional, which needs chunk 5. The validator
 refuses the entry until each step is done. The cheap candidates of November 14 are core candidates, because their Arm
-needs (AES, PMULL, dotprod or i8mm) are expected in the M2 floor, to be confirmed by chunk 2's record:
+needs (AES, PMULL; AVX-VNNI needs none) are in the floor, to be confirmed by chunk 2's record:
 - VAES and VPCLMULQDQ need steps 1, 3 and 4 only;
 - AVX-VNNI needs steps 1, 3 and 4 plus leaf 7 subleaf 1.
 
@@ -502,6 +503,7 @@ are answered below.
 | R5 | Fifth round, on the host classes: classes verified; the fallback gate had no override tool and its AFP and I8MM rows tested nothing real; LSE2 is in MMFR2, which isn't read; the GIC API is a strong import | Test-only override added; AFP and I8MM rows dropped with reasons; MMFR2 or sysctl named for LSE2; the minimum macOS stated as a deployment fact |
 | R6 | Owner question "move the M1, M2 and M4's common features to core", assessed independently: yes; ECV out until confirmed; the probe checks only declared requirements, not the whole floor; check the M1's IPA and interrupt-controller limits | Floor is M1 ∩ M2 ∩ M4 minus ECV; M1 supported and labelled unverified; the probe stays requirement-based (this revises my own suggestion to check the whole floor); the non-feature M1 checks are listed |
 | R7 | Owner: reports that Hypervisor.framework hides host features | Measured on the M4 (ECV hidden, SPECRES shown, ISAR2 unmodelled before macOS 27, SME shown) and recorded with online sources; the floor is defined over vCPU views; probe tool added |
+| R8 | Chunk 1 review: AVX-VNNI has a plain-SIMD fallback in FEX | AVX-VNNI requires no Arm feature; DotProd and I8MM are speed only. Corrects the any-of example |
 | Owner | Decisions after the review (§6): no guest selection; the M2 floor; core derived from the floor | `selectable`, the `--cpu` option and the hand-marked `core` flag are removed. Core and optional are derived from Arm needs and the floor. §3 became the host-derived mask, built with the first optional feature. Earlier rows that mention selection, `-FEATURE` or decisions A and B describe the text as it was then |
 
 ## Appendix: the host floor (recorded November 15, 2026)
@@ -605,8 +607,7 @@ table uses sysctl. It doesn't state the chip variant or the macOS version.
 **Gaps against the floor:** I8MM, BF16, PAuth2, FPAC and BTI, plus everything above the floor (AFP, RPRES, WFxT, SME).
 The M1 Pro has every required feature: FlagM, FlagM2, LSE, LSE2, CRC32, AES, PMULL, SHA1/SHA256 and DotProd. The record
 lists ECV as present. The owner understands the M1 to lack it, so this is unsettled, but ECV is speed only and the
-outcome doesn't depend on it. So the M1 gets the same guest CPU as the floor, and I8MM is speed only for AVX-VNNI,
-whose any-of group DotProd satisfies.
+outcome doesn't depend on it. So the M1 gets the same guest CPU as the floor; I8MM is speed only for AVX-VNNI.
 
 Because the M1 is in the floor, the core derivation itself keeps any future core feature within the M1's means. No
 separate warning is needed.
@@ -641,7 +642,7 @@ it, or admission accepts only the encodings that use it.
 | FRINTTS | speed only | floating-point-to-integer conversions |
 | ECV | speed only | RDTSC (a self-synchronising counter read, else ISB and a counter read) |
 | SB, CSV3 | option only | `--speculation-barriers` and the RDCL_NO bit |
-| DotProd, or I8MM | none in core yet | AVX-VNNI when built: either one satisfies it (DotProd on the M1); I8MM gives the shorter sequence |
+| DotProd, I8MM | speed | AVX-VNNI when built: FEX uses I8MM, else DotProd, else plain SIMD |
 | LRCPC, LRCPC2 | none (off by policy) | unused under hardware TSO |
 
 Bases with no extra Arm feature: BMI1/2, LZCNT, POPCNT (no CSSC: a vector sequence), MOVBE, ADX, AVX, AVX2. RDRAND
