@@ -6013,6 +6013,10 @@ mod tests {
         // `--feature afp=0` (the old compiler gets the recorded bodies), so a recorded stream replays as a host without AFP.
         let add = std::env::var("NATEMU_REPLAY_ADD_ARGS").unwrap_or_default();
         let add: Vec<&str> = add.split_whitespace().collect();
+        // `NATEMU_REPLAY_OLD_ADD_ARGS`: the same for the old compiler, so two compilers are compared under the same added
+        // arguments (AFP fallback chunk 3a: the common mode of M2 emulation, afp=0, against the previous compiler's).
+        let old_add = std::env::var("NATEMU_REPLAY_OLD_ADD_ARGS").unwrap_or_default();
+        let old_add: Vec<&str> = old_add.split_whitespace().collect();
         let mut pipe = Command::new(old)
             .arg("--serve")
             .args(&extra)
@@ -6024,12 +6028,13 @@ mod tests {
         let mut server = Server::spawn(Path::new(&new), &extra).unwrap();
         let mut input =
             std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(stream).unwrap());
-        let (mut n, mut differ, mut word) = (0u64, 0u64, [0u8; 4]);
+        let (mut n, mut differ, mut other, mut word) = (0u64, 0u64, 0u64, [0u8; 4]);
         while input.read_exact(&mut word).is_ok() {
             let mut body = vec![0; u32::from_le_bytes(word) as usize];
             input.read_exact(&mut body).unwrap();
-            to.write_all(&word).unwrap();
-            to.write_all(&body).unwrap();
+            let recorded = if old_add.is_empty() { body.clone() } else { with_added_args(&body, &old_add) };
+            to.write_all(&(recorded.len() as u32).to_le_bytes()).unwrap();
+            to.write_all(&recorded).unwrap();
             from.read_exact(&mut word).unwrap();
             let mut want = vec![0; u32::from_le_bytes(word) as usize];
             from.read_exact(&mut want).unwrap();
@@ -6052,6 +6057,8 @@ mod tests {
             n += 1;
             if got != want {
                 differ += 1;
+                // (the word at 16..20 is args_read: a compiler that reads more arguments differs there alone)
+                other += u64::from(got[..16] != want[..16] || got[20..] != want[20..]);
                 if differ <= 10 {
                     eprintln!(
                         "request {n}: pipe {:02x?} channel {:02x?}",
@@ -6063,9 +6070,11 @@ mod tests {
         }
         drop(to);
         pipe.wait().unwrap();
-        eprintln!("replay: {n} requests, {differ} differences");
-        // With added arguments the replies differ from the recorded host's by design (M2 emulation): only the count gates.
-        assert!(n > 0 && (differ == 0 || !add.is_empty()));
+        eprintln!("replay: {n} requests, {differ} differences ({other} beyond args_read)");
+        // With added arguments the replies differ from the recorded host's by design (M2 emulation): only the count gates,
+        // unless the old compiler got the same arguments: then only args_read may differ (a compiler reading more arguments
+        // of the same request, e.g. 3a's --daz and --ftz without AFP; the code, JSON and object are the gate).
+        assert!(n > 0 && (differ == 0 || (!add.is_empty() && (add != old_add || other == 0))));
     }
 
     #[test]

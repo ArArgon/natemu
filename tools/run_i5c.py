@@ -149,6 +149,23 @@ def simd_cases():
     out.append(case('ldmxcsr-remask', ['ldmxcsr dword ptr [rdi + 0x80]', 'divss xmm1, xmm2', 'ldmxcsr dword ptr [rdi + 0x84]', 'movaps xmm1, xmm4', 'divss xmm1, xmm2'],
                     ['sse 1', f'xmm 1 {ONE:#x} 0', 'xmm 2 0 0', f'xmm 4 {ONE:#x} 0', f'memory {D + 0x280:#x} {struct.pack("<II", 0x1f80, 0x1d80).hex()}'], ('fault', 19),
                     check=lambda vm: [] if int(vm['mxcsr'], 0) == 0x1d84 else [f"mxcsr {vm['mxcsr']}"]))
+    # AFP fallback plan section 5 (mixed modes): LDMXCSR switches DAZ, and FTZ, on and off within one program; each switch re-keys
+    # the code, so the same multiply flushes or not as the current mode says (host without AFP: software flushes or FZ; with
+    # AFP: the hardware's). Results are saved in xmm6, xmm7 and xmm3.
+    def mixed(name, modes, x, finals, mxcsr):
+        lines = []
+        for i, dest in enumerate((6, 7, 3)):
+            lines += [f'ldmxcsr dword ptr [rdi + {0x80 + 4 * i}]', 'movaps xmm1, xmm5', 'mulss xmm1, xmm2', f'movaps xmm{dest}, xmm1']
+        def check(vm):
+            p = []
+            for dest, flushed in zip((6, 7, 3), finals):
+                lo = xmm_of(vm, dest)[0] & 0xffffffff
+                if (lo == 0) != flushed: p.append(f'xmm{dest} {lo:#x}: {"not " if flushed else ""}flushed, want the opposite')
+            if int(vm['mxcsr'], 0) != mxcsr: p.append(f"mxcsr {vm['mxcsr']}, want {mxcsr:#x}")
+            return p
+        out.append(case(name, lines, ['sse 1', f'xmm 5 {x[0]:#x} 0', f'xmm 2 {x[1]:#x} 0', f'memory {D + 0x280:#x} {struct.pack("<III", *modes).hex()}'], None, check=check))
+    mixed('mixed-daz-on-off-on', (MX | 0x40, MX, MX | 0x40), (DEN, TWO), (True, False, True), MX | 0x40)        # den * 2: zero under DAZ, else 2 * den
+    mixed('mixed-ftz-on-off-with-daz', (MX | 0x8000, MX, MX | 0x8000 | 0x40), (E100 | 1, E30), (True, False, True), 0x8000 | MX | 0x40 | UE | PE)   # the last flags are from the last mode only
     img = bytearray(512); img[0:2] = (0x37f).to_bytes(2, 'little'); img[24:28] = (0x1d80).to_bytes(4, 'little'); img[28:32] = (0xffff).to_bytes(4, 'little')
     out.append(case('fxrstor-unmasked-mxcsr', ['fxrstor [rsi]', f'mov eax, {ONE}', 'movd xmm1, eax', 'xorps xmm2, xmm2', 'divss xmm1, xmm2'],
                     ['sse 1', f'memory {D + 0x1000:#x} {img.hex()}'], ('fault', 19),

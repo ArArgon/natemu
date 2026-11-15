@@ -2293,6 +2293,42 @@ mod tests {
     /// A word in the middle of a straight-line block (`mov x4, x20` after the first load).
     const MIDDLE: (u32, u32) = (0xc, 0xaa14_03e4);
 
+    /// AFP fallback chunk 3a: with `FEXC` set, the code of the software DAZ and FTZ flushes (and of the unmasked-PE check under
+    /// FTZ) passes admission with the code-shape check, as every key and unmasked-exception combination of these forms compiles.
+    #[test]
+    fn the_flush_code_is_admitted() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let forms = [
+            "0f58ca", "660f5cca", "f30f59ca", "f20f5eca", "0f51ca", "0f5dca", "f20f5fca", "f20f7cca", "660fd0ca", "660f3a40caff",
+            "0fc2ca01", "0f2fca", "660f2eca", "0f5aca", "660f5aca", "f30f5aca", "f20f5aca", "660f5bca", "f2480f2cc2", "660f3a08ca04",
+            "0f53ca", "f30f52ca", "c4e269b8cb", "c4e2e9afcb", "c5ec59cb", "c5ed5ecb", "c4e3791dd100", "c5fd5aca", "c5fc5aca", "c5ed7ccb",
+        ];
+        let dir = std::env::temp_dir().join(format!("natemu-flush-admit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for hex in forms {
+            let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+            for keys in [&[][..], &["--daz"], &["--ftz"], &["--daz", "--ftz"]] {
+                for unmasked in ["0", "0x20", "0x3f"] {
+                    let object = dir.join("o");
+                    let out = std::process::Command::new(&fexc)
+                        .args(["--hex", hex, "--rip", "0x1000", "--profile", "slice1", "--feature", "afp=0", "--simd-unmasked", unmasked])
+                        .args(keys)
+                        .arg("--object")
+                        .arg(&object)
+                        .arg("--out")
+                        .arg("/dev/null")
+                        .output()
+                        .unwrap();
+                    assert!(out.status.success(), "{hex} {keys:?}");
+                    let object = std::fs::read(&object).unwrap();
+                    admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {keys:?} {unmasked}: {e}"));
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn real_blocks_are_admitted() {
         for (i, &f) in FIXTURES.iter().enumerate() {
