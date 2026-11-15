@@ -13,8 +13,12 @@ root=$(CDPATH= cd -- "$here/../.." && pwd)
 fex=$root/third_party/FEX
 pin=1df70f05044e3bf5a51652c79e5e6310eddaf6fe   # == third_party/FEX gitlink: Intel near widths, addr32 BT and LEAVE REX.W
 externals="fmt xxhash unordered_dense"
-git -C "$root" submodule update --init --depth 1 third_party/FEX
-for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done
+# A symlinked third_party/FEX (a git worktree sharing the main checkout's initialised submodule) is used as it is: git refuses to
+# update a submodule path that is a symlink. The pin check below still applies.
+if [ ! -L "$root/third_party/FEX" ]; then
+  git -C "$root" submodule update --init --depth 1 third_party/FEX
+  for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done
+fi
 [ "$(git -C "$fex" rev-parse HEAD)" = "$pin" ] || { echo "third_party/FEX is not at the pinned commit $pin" >&2; exit 1; }
 git -C "$fex" worktree prune
 mkdir "$build"

@@ -764,9 +764,10 @@ fn advertised((leaf, sub, reg, bit): Feature) -> bool {
 }
 /// SSE and SSE2 (with MMX) are part of every 64-bit processor: their cells are defined whatever the profile.
 const BASE: Option<Feature> = None;
-/// The catalogue features that define the group-7 register forms (`0f 01 /r`, mod = 3), by ModRM byte: the form is #UD
-/// while all of them are clear. A form of no catalogue feature (ENCLV's neighbours PCONFIG, WRMSRNS, PBNDKB, the SVM group,
-/// MONITORX..INVLPGB, TDX, FRED, blank cells) is #UD whatever the profile.
+/// The catalogue features that define the group-7 register forms (`0f 01 /r`, mod = 3) it knows, by ModRM byte and
+/// whatever the mandatory prefix (the union over the prefixes): the form is #UD while all of them are clear. The forms of
+/// no catalogue feature (PCONFIG, WRMSRNS, PBNDKB, the SVM group, MONITORX..INVLPGB, TDX, FRED, blank cells) are #UD
+/// whatever the profile.
 fn group7(modrm: u8) -> &'static [Feature] {
     match modrm {
         0xc0 | 0xcf | 0xd7 => &[gf::GF_SGX], // ENCLV, ENCLS, ENCLU
@@ -775,11 +776,11 @@ fn group7(modrm: u8) -> &'static [Feature] {
         0xca | 0xcb => &[gf::GF_SMAP],       // CLAC, STAC
         0xd5 => &[gf::GF_RTM],               // XEND
         0xd6 => &[gf::GF_RTM, gf::GF_HLE],   // XTEST
-        0xe8 => &[gf::GF_SERIALIZE, gf::GF_TSXLDTRK], // SERIALIZE (NP), XSUSLDTRK (F2)
+        0xe8 => &[gf::GF_SERIALIZE, gf::GF_TSXLDTRK, gf::GF_CET_SS], // SERIALIZE (NP), XSUSLDTRK (F2), SETSSBSY (F3)
         0xe9 => &[gf::GF_TSXLDTRK],          // XRESLDTRK
         0xea => &[gf::GF_CET_SS],            // SAVEPREVSSP
-        0xec => &[gf::GF_UINTR],             // UIRET
-        0xee | 0xef => &[gf::GF_PKU],        // RDPKRU, WRPKRU
+        0xec | 0xed => &[gf::GF_UINTR],      // UIRET, TESTUI (F3)
+        0xee | 0xef => &[gf::GF_PKU, gf::GF_UINTR], // RDPKRU, WRPKRU; CLUI, STUI (F3)
         _ => &[],
     }
 }
@@ -1231,6 +1232,10 @@ mod x1c_tests {
             ("0f01cf", MAP_TWO, 0x01, &[GF_SGX]),
             ("f30f01ea", MAP_TWO, 0x01, &[GF_CET_SS]),
             ("f30f01ec", MAP_TWO, 0x01, &[GF_UINTR]),
+            ("f30f01ed", MAP_TWO, 0x01, &[GF_UINTR]),
+            ("f30f01ee", MAP_TWO, 0x01, &[GF_PKU, GF_UINTR]),
+            ("f30f01ef", MAP_TWO, 0x01, &[GF_PKU, GF_UINTR]),
+            ("f30f01e8", MAP_TWO, 0x01, &[GF_SERIALIZE, GF_TSXLDTRK, GF_CET_SS]),
             ("f30f012b", MAP_TWO, 0x01, &[GF_CET_SS]),
             ("f30fae30", MAP_TWO, 0xae, &[GF_CET_SS]),
         ] {
