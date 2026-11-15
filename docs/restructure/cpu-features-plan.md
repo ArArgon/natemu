@@ -421,6 +421,30 @@ https://github.com/pH14/harmony/pull/373, https://miniswift.run/whats-new/hyperv
 https://www.mail-archive.com/qemu-devel@nongnu.org/msg1097189.html,
 https://ratatoskr.run/qemu-devel/2026/02/14429600/t.
 
+**What Hypervisor.framework masks (reverse-engineered, macOS 12).** utmapp's hand decompilation of
+Hypervisor.framework (https://github.com/utmapp/Hypervisor/blob/main/hv.c, from macOS 12.0b1, updated for 12.5.1)
+builds the guest's ID registers from the kernel's capabilities with fixed masks:
+- ISAR0 keeps everything but TME.
+- ISAR1 keeps bits 43:0 only, which hides BF16, I8MM, XS and LS64.
+- MMFR0 clears ECV and FGT and forces PARange to 36 bits.
+- MMFR1 keeps bits 31:0 only, which hides AFP.
+- MMFR2 keeps AT (LSE2).
+- PFR0 clears SVE, SEL2, AMU, MPAM and RME.
+- PFR1 keeps only SSBS.
+- ISAR2 isn't modelled at all.
+
+Our macOS 26 measurement on the M4 shows the masks have since been widened: I8MM, BF16, AFP, BTI and SME are now
+visible, and PARange is 40 bits. ECV is still cleared and ISAR2 is still absent. So:
+- **The vCPU view depends on the macOS version as well as the chip.** The floor is stated for natemu's minimum macOS
+  (15, the first with the interrupt-controller API), and the startup probe is the authority.
+- **Every `required` feature lies in fields that even the macOS 12 masks pass through:** FlagM, LSE, CRC32, AES, PMULL
+  and SHA in ISAR0, and LSE2 in MMFR2. They are visible on every macOS natemu can run on.
+- **The macOS-dependent features are all speed or exactness:** I8MM, BF16 and AFP.
+- ECV is masked in every version seen, which is one more reason it stays out of the floor.
+
+QEMU reads the same values through `hv_vcpu_config_get_feature_reg` without creating a vCPU
+(https://www.mail-archive.com/qemu-devel@nongnu.org/msg1148454.html), as the probe here does.
+
 **So the floor is defined over vCPU views, not sysctl.** Sysctl records are a first estimate only. Each record is
 kept with its chip and macOS version, because the view can change with macOS (ISAR2 in macOS 27). The probe at startup
 is the real check. The M4's vCPU view is recorded above. The M2's is pending: the owner runs
