@@ -11,7 +11,7 @@ case $build in /*) ;; *) build=$PWD/$build ;; esac   # git -C below would resolv
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 fex=$root/third_party/FEX
-pin=1df70f05044e3bf5a51652c79e5e6310eddaf6fe   # == third_party/FEX gitlink: Intel near widths, addr32 BT and LEAVE REX.W
+pin=13e80cfdfcccbacf4bfce76a2d84e7f5349fd3df   # == third_party/FEX gitlink: 1df70f0 (Intel near widths, addr32 BT, LEAVE REX.W) + non-AFP MINSS/MAXSS signalling compare
 externals="fmt xxhash unordered_dense"
 # A symlinked third_party/FEX (a git worktree sharing the main checkout's initialised submodule) is used as it is: git refuses to
 # update a submodule path that is a symlink. The pin check below still applies.
@@ -19,7 +19,9 @@ if [ ! -L "$root/third_party/FEX" ]; then
   git -C "$root" submodule update --init --depth 1 third_party/FEX
   for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done
 fi
-[ "$(git -C "$fex" rev-parse HEAD)" = "$pin" ] || { echo "third_party/FEX is not at the pinned commit $pin" >&2; exit 1; }
+# A shared checkout may sit on another branch: the pin only has to exist in it (the build is a detached worktree at the pin).
+{ [ -L "$root/third_party/FEX" ] || [ "$(git -C "$fex" rev-parse HEAD)" = "$pin" ]; } && git -C "$fex" cat-file -e "$pin^{commit}" ||
+  { echo "third_party/FEX is not at the pinned commit $pin" >&2; exit 1; }
 git -C "$fex" worktree prune
 mkdir "$build"
 git -C "$fex" worktree add -q --detach "$build/src" "$pin"

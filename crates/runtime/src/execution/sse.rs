@@ -30,7 +30,7 @@ pub(super) fn bank(c: &mut Cpu, f: &NativeFrame) {
         let v = u128::from_le_bytes(*q);
         *x = [v as u64, (v >> 64) as u64];
     }
-    c.mxcsr |= mxcsr_flags(f.fpsr | checked(), c.mxcsr);
+    c.mxcsr |= mxcsr_flags(f.fpsr | checked(), c.mxcsr, c.no_afp != 0);
 }
 /// I5c: the SIMD flag byte (FPSR order): the flags of the instructions checked for unmasked SIMD exceptions since the entry.
 fn checked() -> u64 {
@@ -48,7 +48,7 @@ fn checked() -> u64 {
 /// the bank holds the state before the instruction, `raised` its operation's FPSR flags. MXCSR gets the flags the SDM's
 /// precedence leaves ([`simd_fault_flags`]), then #XM, or #UD without CR4.OSXMMEXCPT. The destination is unchanged.
 pub(super) fn exception(c: &mut Cpu, before: u64, raised: u64) -> Exception {
-    c.mxcsr = before | mxcsr_flags(checked() | simd_fault_flags(raised, before), before);
+    c.mxcsr = before | mxcsr_flags(checked() | simd_fault_flags(raised, before), before, c.no_afp != 0);
     if c.cr4 & CR4_OSXMMEXCPT != 0 {
         [19, 0, 0]
     } else {

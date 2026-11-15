@@ -6296,7 +6296,7 @@ mod tests {
         for mxcsr in 0..1u64 << 16 {
             for fpsr in 0..=0xffu64 {
                 assert_eq!(
-                    exec::mxcsr_flags(fpsr, mxcsr),
+                    exec::mxcsr_flags(fpsr, mxcsr, false),
                     before_no_afp::mxcsr_flags(fpsr, mxcsr),
                     "mxcsr_flags {fpsr:#x} {mxcsr:#x}"
                 );
