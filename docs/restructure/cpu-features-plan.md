@@ -49,8 +49,8 @@ as it is (§5).
 
 ## 2. Design: one catalogue, consumers generated from it (compile time)
 
-This part meets the goal on its own: one place, tool-checked, default unchanged. Runtime selection (§3) is an owner
-decision on top of it.
+This part meets the goal on its own: one place, tool-checked, default unchanged. The host-derived mask (§3) is added
+on top of it with the first optional feature.
 
 ### 2.1 Guest catalogue: the existing per-bit entries, extended
 
@@ -73,8 +73,9 @@ There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profi
   - `exactness`: it runs, but with a known, reported difference. FEAT_AFP for SSE and x87 is this class: M1 and M2
     lack it.
 
-  FEX has software fallbacks for many Arm features (SHA, AES), so a feature lists an Arm feature as `required` only when
-  no fallback exists.
+  `required` is judged over natemu's whole pipeline: FEX's lowering, plus admission accepting what it emits. FEX has
+  no software path for SHA or AES (its dispatcher marks them unimplemented without the Arm feature), so SHA requires
+  `sha`, AES requires `aes`, and PCLMULQDQ requires `pmull128`.
 - `layout`: true when the feature changes XCR0's valid values, leaf 0xD or the XSAVE image, or whose presence the
   resident tests as a compile-time constant (today XSAVEC and XSAVEOPT; a resident transaction alone, such as RDRAND's or
   CLWB's, does not make a feature `layout`). That covers AVX, MPX, AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
@@ -112,7 +113,9 @@ the CPU's capability: OSXSAVE follows CR4.OSXSAVE, APIC follows APIC_BASE, and H
 The validator (`cpu_profile.py`, run by the generator and the tests) refuses:
 - an advertised feature whose `requires` is not advertised;
 - a `not-built` feature that is advertised;
-- an x86-64-v3 feature that is not core;
+- an x86-64-v3 feature that is not core (OSXSAVE, a `dynamic` bit, is exempt);
+- a `state` that disagrees with the derivation: a feature is `advertised` exactly when it is built and core (optional
+  features are `clear` in the JSON and set per host by the mask);
 - a core feature that requires an optional one;
 - an optional `layout` feature (layout features must be core, so XCR0, leaf 0xD and the XSAVE image are the same on
   every host);
@@ -156,8 +159,8 @@ The generator writes two files from the JSON:
 - the same constants as a Rust module in `crates/abi`, next to `cpu_profile.rs`.
 
 **Shim (`fexc_slice1.inc`).** Every row that tests a feature uses its `GF_*` constant: VAES's ymm form,
-VPCLMULQDQ's ymm form, AVX-VNNI, GFNI, RTM, CET, WAITPKG, SSE4a, 3DNow, plus the SHA and ADX rows. Rows for baseline
-`fixed` features need no gate. FEX's `x86_avx` follows this rule: 1 whenever any VEX feature is advertised (AVX, BMI1/2,
+VPCLMULQDQ's ymm form, AVX-VNNI, GFNI, RTM, CET, WAITPKG, SSE4a, 3DNow, plus the SHA and ADX rows. Rows for core
+features need no gate. FEX's `x86_avx` follows this rule: 1 whenever any VEX feature is advertised (AVX, BMI1/2,
 FMA, F16C), with the shim rejecting the AVX forms if AVX itself were clear. `x86_aes256`, `x86_3dnow` and `x86_sse4a`
 only feed FEX's CPUID.cpp, which natemu never calls; they stay pinned.
 
@@ -220,7 +223,7 @@ extent and the guest end fields.
 | --- | --- | --- |
 | 0. Stream | Record the two request streams at 333b7b6, with the fexc SHA-256 beside each; the streams fall under the disk-hygiene rule (several GB each); make the replay a documented tool (stream path, body rewrite hook) | the replay of each stream against today's fexc is identical (a self-check) |
 | 1. Catalogue | Per-bit entries extended (`requires`, `host`, `msrs`, `cr4`, `subleaf`, `resident`, `gates`, `layout`, `not-built`); the derived core/optional classification; the validator | `cpu_profile.rs` regenerates identically; every advertised feature classifies as core; negative controls refused: a missing requirement, an advertised `not-built` feature, an x86-64-v3 feature made non-core by a required Arm feature above the floor, an optional layout feature |
-| 2. Host table and probe | Policy, `floor` and encoding-class fields in FEATURES; the floor recorded from a real M2 (its `sysctl hw.optional.arm` and the vCPU ID registers natemu reads); the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM, LSE or a floor feature simulated missing; on the M4, CSV3/SB from registers equal sysctl's; on the M2, the probe passes and names AFP as an exactness difference |
+| 2. Host table and probe | Policy, `floor` and encoding-class fields in FEATURES; the floor recorded from a real M2 (its `sysctl hw.optional.arm` and the vCPU ID registers natemu reads; if none is at hand, from the M2's published ID-register values, marked unverified until a real M2 confirms them); the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM, LSE or a floor feature simulated missing; on the M4, CSV3/SB from registers equal sysctl's; on the M2, the probe passes and names AFP as an exactness difference |
 | 3. Gate constants | Generated `GF_*` for C++ and Rust; gated shim rows; the `x86_avx` rule; `system.rs` checks; cross-check test | replay identical on both streams and the standing corpora; a scratch build with SHA and ADX cleared in the JSON makes their forms #UD in fexc and the host decode alike (the old hand cut, now derived; not committed); negative control: a scratch optional entry with a deliberately missing shim gate fails the cross-check |
 | 4. Records | Contracts and README; the adding-a-feature checklist; the decision record's row | review |
 | 5. (with the first optional feature) Host-derived mask | Superset tables plus mask in `cache::Control`, computed from the probe; `--guest-features`; the vCPU-identity assertion | replay with the body rewrite identical; judge vectors identical for the all-core mask; a host lacking the optional feature's Arm feature answers per the judge without it |
@@ -258,10 +261,17 @@ ERMS/FSRM is a hint with no Arm feature behind it. RPRES is a host code-generati
    - every built feature whose Arm needs are in the host floor is core;
    - the system features natemu implements itself stay;
    - nothing advertised today is removed.
+
+   This plan admits such extensions as core when they are built. It does not build them: VAES, VPCLMULQDQ, AVX-VNNI
+   and the rest are decided one at a time afterwards (the non-goal above). If the owner meant "build them now", that is
+   a scope change to confirm.
 2. **Host floor:** the M2's Arm feature set and above. M1 and anything else below the floor isn't a target. A host is
    refused only for missing a feature something requires, and the check is by feature, never by chip name.
 3. **Host features eagerly determine guest features:** there is no guest cherry-picking. No option selects guest
-   features. The guest CPU is a function of the host (§2.1, §3).
+   features. The guest CPU is a function of the host (§2.1, §3). One consequence follows once an optional feature
+   exists: the same guest disk image sees different CPUID on an M2 and an M4. Software that chose code paths at
+   install time could find a feature missing after moving to an M2. Natemu has no saved VM state, so a guest always
+   boots afresh and probes again. That limits the effect to install-time choices, and it is accepted.
 
 Decided as routine:
 - The catalogue extends the JSON's per-bit entries.
@@ -287,6 +297,7 @@ are answered below.
 | 9 | A parallel `features` list duplicates the per-bit entries | The per-bit entries are extended; there is no parallel list |
 | 10 | Leaf 0xD, XSAVE and leaf 7's maximum subleaf | `layout` covers the listed features; the maximum subleaf is computed |
 | 11 | Missed risks: header feature bits, ACPI x2APIC, the per-vCPU mask, cache invalidation per rebuild | Each is stated in §2.3 and §3 |
+| 12 | Blocking: §5 lacked the real decisions | §6 now lists decision A (runtime selection) and B. B was "subtraction allowed?"; after the owner's core-set direction it became "core membership", which settles subtraction: only optional features can be removed. The routine decisions are recorded as decided |
 | R2-1 | Blocking (second round): the core text would refuse M1 and M2 (AFP), and the `host` field had been lost | `host` restored with `required` and `exactness`; AFP is exactness; decision B's sentence corrected |
 | R2-2 | Blocking: dropping optional features per host needs the per-launch mask | §2.1 says so: without chunk 5, the required Arm features of every advertised feature are hard requirements |
 | R2-3 | Blocking if A: the list of consumers that move missed MSR existence, the host decode and the shim; XSAVEC is not selectable | §3's list corrected, with a masked judge case |
@@ -295,5 +306,5 @@ are answered below.
 | R2-6 | Replay design sound; record the fexc hash; disk hygiene | Added to chunk 0 |
 | R2-7 | `core` versus dynamic bits | `core` applies to capability bits; dynamic bits are exempt |
 | R3-1 | Third round, verdict accept. `layout`'s "transaction compiled in" was too broad: it would force every resident-implemented feature into the core set | Narrowed to "presence tested as a compile-time constant" (today XSAVEC and XSAVEOPT) |
+| R4 | Fourth round, on the owner revision: SHA, AES and PCLMULQDQ have no FEX fallback, contrary to the second round's note; stale wording; `state` duplicated; OSXSAVE versus the v3 rule; build-now versus admit-when-built | `required` judged over the whole pipeline and listed for the three; wording fixed; validator checks `state` against the derivation; OSXSAVE exempt; §6 makes admit-when-built explicit and notes the CPUID-differs-by-host consequence; chunk 2 names a fallback source for the floor |
 | Owner | Decisions after the review (§6): no guest selection; the M2 floor; core derived from the floor | `selectable`, the `--cpu` option and the hand-marked `core` flag are removed. Core and optional are derived from Arm needs and the floor. §3 became the host-derived mask, built with the first optional feature. Earlier rows that mention selection, `-FEATURE` or decisions A and B describe the text as it was then |
-| 12 | Blocking: §5 lacked the real decisions | §6 now lists decision A (runtime selection) and B. B was "subtraction allowed?"; after the owner's core-set direction it became "core membership", which settles subtraction: only optional features can be removed. The routine decisions are recorded as decided |
