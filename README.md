@@ -1,42 +1,191 @@
 # natemu
 
-natemu is building an x86-64 Linux system emulator for Apple Silicon/macOS26,
-using host-side translation and a resident ARM64 runtime inside a VM. The goal is
-material improvement over QEMU TCG within an explicit correctness scope.
+natemu runs x86-64 Linux on Apple Silicon Macs, faster than QEMU TCG.
 
-**Current state:** I1–I4 and the post-I4 integrated validation pass are complete
-within their declared finite profiles on M4. A host-side FEX worker feeds the
-Rust resident runtime. Independent rebuilds pass 760 distinct native cases,
-25 intentional failures with fresh recovery controls, and 87 legacy jobs. Coverage
-includes kernel addresses, paging-off execution, concurrent mode transitions,
-ordering, translation coherence, precise recovery, lifetime and progress at
-N=1/2/3/4. A separate six-profile pinned-QEMU comparison also passes independent
-reproduction. The [validation report](docs/research/reviews/INV-03-01-i4v-coverage.md)
-records exact coverage, retained evidence and limitations.
+natemu is a *captive* emulator: the guest gets its own hardware VM through Hypervisor.framework.
+natemu translates the guest's x86-64 code to ARM64 and runs it inside that VM, next to a small
+runtime, so the Mac's hardware does most of the work:
 
-Next is I5: stock-kernel boot and small userspace workloads. Arbitrary guest
-programs, broad ISA/device support and workload performance remain unestablished.
+- **Memory:** guest page tables become real ARM page tables, so ordinary loads and stores need no
+  software lookup.
+- **Memory ordering:** Apple Silicon's hardware x86 memory-ordering mode (TSO) replaces barriers in
+  the generated code.
+- **Kernel work:** system calls, page faults, interrupts and translated-code lookups are handled
+  inside the VM. natemu leaves the VM mainly to translate new code and for device I/O.
 
-Start with the [implementation plan and local setup](docs/implementation.md).
-It records Rust/assembly/C++ ownership, the early producer loop, N-vCPU design,
-boot/initramfs progression and measurements alongside development. Read the
-[workflow](docs/research/README.md) for execution/review rules and
-[INV-03-01](docs/research/investigations/INV-03-01.md#current-direction--build-first-october-25-2026)
-for current results and the next assignment.
+QEMU TCG instead looks up every guest memory access in a software TLB and
+handles every page fault, system call and interrupt in the emulator itself.
+
+natemu runs 11 benchmarks about 4.5× faster than QEMU TCG (geometric mean; 1.4× to 41× per
+benchmark), and a context-switch-heavy Debian workload (package installs and a CPython build, with
+network and disk traffic alongside) 1.7× faster. See [benchmarks](docs/benchmarks.md).
+
+The translator is built on [FEX](https://github.com/FEX-Emu/FEX)'s x86 compiler. FEX runs Linux
+applications, not whole systems. natemu builds FEX's compiler natively on macOS, without FEX's Linux
+runtime, and extends it to compile kernel code and to raise exceptions at the exact faulting
+instruction. Privileged instructions go to natemu's runtime inside the VM. The changes live in
+[natemu-fex](https://github.com/ArArgon/natemu-fex).
+
+## Status: experimental
+
+natemu boots the stock Debian 13 cloud image unchanged, with networking and a disk. It has been
+tested only on an M4 Mac running macOS 26. Older Apple Silicon chips or macOS versions may lack
+hardware features natemu needs. Other distributions and kernels are untested. Major features still missing:
+
+- **Booting:** no BIOS or UEFI firmware. natemu starts a Linux kernel directly, so it cannot boot
+  installer ISOs or bootloaders.
+- **Devices:** a serial console, a network card, raw disk images and a random-number device only. No
+  PCI bus, display, keyboard, sound, USB or file sharing with the Mac. Disk images must be raw, not qcow2.
+- **Networking:** outbound IPv4 only. No IPv6, no port forwarding into the guest, and the guest
+  cannot reach the Mac's `localhost`.
+- **CPU:** 64-bit code only, so 32-bit programs do not run. No AVX-512, AMX or CET. x87 floating
+  point computes at 64-bit rather than 80-bit precision.
+- **Performance:** no fast path for process address-space switches (PCID), which makes Linux's
+  default Meltdown mitigation slow (see [Performance](#performance-and-cpu-vulnerability-mitigations)).
+
+## Requirements
+
+- An Apple Silicon Mac running macOS 26 (tested on M4)
+- Xcode Command Line Tools (`xcode-select --install`)
+- [rustup](https://rustup.rs). The repository pins the Rust version, and rustup installs it automatically.
+- [Homebrew](https://brew.sh) packages: `brew install cmake ninja pkg-config libslirp e2fsprogs`
+- Python 3 and git
+
+## Setup
+
+### 1. Get the source
+
+```sh
+git clone https://github.com/ArArgon/natemu.git
+cd natemu
+git submodule update --init
+```
+
+Check your machine (this installs nothing and starts no VM):
 
 ```sh
 ./tools/with-env python3 -B tools/check_setup.py
 ```
 
-The launcher supplies the durable sibling raw-data directory unless explicitly
-overridden. The check installs nothing and launches no VM or container. Missing
-inputs are reported separately from unverified runtime/FEX capabilities.
+### 2. Build natemu
 
-Grow one working emulator through tested increments. Plan the next executable
-slice; resolve consequential unknowns as they arise. SMP is designed for configured
-N throughout, with one/two-vCPU bring-up and early three/four-vCPU checks.
+```sh
+cargo build --release
+cargo build --release -p natemu-runtime --target aarch64-unknown-none
+codesign --force --sign - --entitlements crates/host/entitlements.plist target/release/natemu
+```
 
-Historical material at commit `a121702` and tag `track01-archive-2026-09-06` is
-not current direction or evidence; do not search it unless the task names it.
-The old reset plans under `docs/superpowers/` are historical. The frozen
-[Track01 reproduction program](experiments/track01/README.md) remains unchanged.
+The `codesign` step grants the binary access to Hypervisor.framework; repeat it after every rebuild.
+
+### 3. Build the x86 compiler
+
+```sh
+tools/fexc/build.sh ~/natemu-fexc
+```
+
+The directory must not exist yet. It takes about 30 seconds and produces `~/natemu-fexc/obj/fexc`.
+
+## Running a Debian cloud image
+
+natemu has no firmware or bootloader. It starts the kernel directly, so first copy the kernel and
+initramfs out of the image. `tools/boot_files.py` does that and prints the `root=` option for the
+image's root partition:
+
+```sh
+mkdir -p ~/natemu-vm && cd ~/natemu-vm
+IMG=debian-13-nocloud-amd64-20260914-2601
+curl -fLO https://cloud.debian.org/images/cloud/trixie/20260914-2601/$IMG.tar.xz
+tar -xJf $IMG.tar.xz disk.raw
+truncate -s 16G disk.raw                                  # room to grow; the file stays sparse
+ROOT=$(python3 ~/natemu/tools/boot_files.py disk.raw)     # writes vmlinuz and initrd.img here
+```
+
+The first boot also answers systemd's first-boot questions. Replace `CHANGE-ME` with the root
+password you want:
+
+```sh
+FIRSTBOOT="systemd.set_credential=firstboot.locale:C.UTF-8 systemd.set_credential=firstboot.timezone:UTC"
+FIRSTBOOT="$FIRSTBOOT systemd.set_credential=firstboot.keymap:us"
+FIRSTBOOT="$FIRSTBOOT systemd.set_credential=passwd.plaintext-password.root:CHANGE-ME"
+
+~/natemu/target/release/natemu --fexc ~/natemu-fexc/obj/fexc \
+  --kernel vmlinuz --initrd initrd.img --disk disk.raw --net --rng \
+  --ram 4G --vcpus 4 --serial-stdin --speculation-barriers \
+  --cmdline "$ROOT ro console=ttyS0 consoleblank=0 $FIRSTBOOT"
+```
+
+Later boots need only `--cmdline "$ROOT ro console=ttyS0 consoleblank=0"`.
+`--speculation-barriers` avoids a large slowdown (see [Performance](#performance-and-cpu-vulnerability-mitigations)).
+Log in as `root` on the console. To use the extra disk space, run
+`apt install cloud-guest-utils && growpart /dev/vda 1 && resize2fs /dev/vda1` once inside the guest.
+
+This is the build natemu has been tested with. Newer builds should work the same way, since nothing
+above depends on the build. They are listed at <https://cloud.debian.org/images/cloud/trixie/>.
+
+## Running a small RAM-only system
+
+`tools/play` builds a minimal Debian 13 system (bash, Python, gcc, curl, tmux and more) that runs
+entirely from an initramfs. It boots in seconds and needs no disk. Building it needs an x86-64 Linux
+machine you can reach over ssh (no root needed; it needs `apt-get`, `dpkg`, `curl`, `python3`,
+`zstd`, `kmod` and internet access):
+
+```sh
+tools/play/build.sh user@linux-host            # about 5 minutes; writes to ~/Library/Caches/natemu/play
+
+P=~/Library/Caches/natemu/play
+target/release/natemu --fexc ~/natemu-fexc/obj/fexc \
+  --kernel $P/bzImage --initrd $P/play.cpio.zst \
+  --cmdline 'console=ttyS0 mitigations=off nokaslr' \
+  --ram 2G --vcpus 2 --serial-stdin
+```
+
+You get a root shell with no login. See [tools/play/README.md](tools/play/README.md) for details.
+
+## Using natemu
+
+With `--serial-stdin` your terminal is the guest's console. **Ctrl-A x** quits natemu at any time,
+and Ctrl-C goes to the guest. `poweroff` inside the guest shuts it down cleanly.
+
+The first boot translates everything and takes a few seconds longer. Later boots reuse the
+translation cache in `~/Library/Caches/natemu/fexc` (`--compile-cache off` disables it).
+
+| Option | Guest device |
+| --- | --- |
+| `--net` | Network over user-mode NAT. The guest gets `10.0.2.15` by DHCP, and outbound connections work. The Mac's `localhost` is not reachable from the guest; use its LAN address. |
+| `--disk FILE` | A raw disk image, seen as `/dev/vda`. Only one natemu can use a disk at a time. |
+| `--rng` | A hardware random-number device. |
+
+`target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,
+2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error.
+
+## Performance and CPU vulnerability mitigations
+
+By default natemu reports its virtual CPU as affected by Meltdown. A Linux guest then turns on page
+table isolation (PTI), which switches page tables on every system call, interrupt and fault.
+natemu has no fast path for these switches yet, so PTI is by far the largest cost on a default
+kernel command line. Linux's other mitigations together cost about 1%.
+
+On the context-switch-heavy Debian workload, the default command line took more than twice as
+long as `mitigations=off` ([numbers](docs/benchmarks.md#cpu-vulnerability-mitigations)).
+
+Ways to recover the cost:
+
+- **`--speculation-barriers` (recommended).** natemu places speculation barriers in its own guest
+  page-table walk, so guest code cannot read memory it has no permission for, even speculatively.
+  natemu then reports the CPU as not affected by Meltdown, and Linux skips PTI on its own. Every
+  other guest mitigation stays on. natemu refuses this option on a CPU without the Arm speculation
+  barrier instruction (FEAT_SB).
+- **`mitigations=off` on the kernel command line.** Turns off every mitigation inside the guest.
+  It is as fast as the option above, but it also removes the guest's own protection between its
+  processes, so use it only when everything running in the guest is trusted. The RAM-only system
+  above uses it.
+
+## Development
+
+```sh
+cargo test --locked
+python3 -B -m unittest discover -s tools -p 'test_*.py'
+```
+
+The full correctness suite (`tools/run_suite.py`) compares natemu against QEMU and needs a local
+QEMU install. Its docstring lists the options.
