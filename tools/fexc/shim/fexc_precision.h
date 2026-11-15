@@ -7,6 +7,8 @@
 #include <FEXCore/Core/X86Enums.h>
 #include <cstddef>
 #include <initializer_list>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace FexcPrecision {
@@ -43,7 +45,8 @@ inline bool LoadsInto(FEXCore::IR::IROps Op) {
 // every static register (no value is coalesced into its static register across one), so at their stub the guest state is the
 // state before the instruction.
 inline bool CheckOp(FEXCore::IR::IROps Op) {
-  return Op == FEXCore::IR::OP_FEXCSIMDCHECK || Op == FEXCore::IR::OP_FEXCX87CHECK;
+  return Op == FEXCore::IR::OP_FEXCSIMDCHECK || Op == FEXCore::IR::OP_FEXCX87CHECK || Op == FEXCore::IR::OP_FEXCSIMDCHECKDE ||
+         Op == FEXCore::IR::OP_FEXCX87CHECKDE;
 }
 inline bool FaultPoint(FEXCore::IR::IROps Op) {
   return GuestMemOp(Op) || Op == FEXCore::IR::OP_DIV || Op == FEXCore::IR::OP_UDIV || CheckOp(Op);
@@ -150,6 +153,239 @@ inline uint32_t SimdCheckMask() {
   if (fexc_no_afp && (M >> 5 & 1) && fexc_ftz) Mask |= 8;
   return Mask;
 }
+// ---------------------------------------------------------------------------------------------
+// AFP fallback chunk 3b (plan rows 7, 8 and 10): without FEAT_AFP the host never sets IDC, and an inf*0 + QNaN FMA raises IOC. Only
+// for the exceptions the guest has unmasked (`--simd-unmasked`, `--x87-unmasked`: DE for rows 7 and 8, IE for row 10) and only without
+// AFP (`--feature afp=0`); with AFP, with the exception masked, or under DAZ (which drops DE from the unmasked set) nothing is placed.
+// The tests are integer and quiet-compare vector ops on the operands of the Arm op, placed before it, so they cost the allocator
+// nothing but its registers; none writes FPSR but a `fcmeq` of an SNaN lane, whose op raises IOC for it too.
+//
+// Row 7 (SSE/AVX): per op, a lane is a DE lane when an operand it examines is a denormal and none of them is a NaN (SDM Vol.1 11.5.2:
+// no DE beside IE for a NaN, nor for a negative SQRT operand, an inf*0 product, ZE); the lanes' bits go to a GPR, 0 or nonzero, which the
+// check takes as FPSR bit 7 (`FexcSimdCheckDe`). Several ops of one instruction (DPPS' multiplies, VCVTPS2PH ymm's halves) or'd, DPPS'
+// adds (whose inputs are products) left out: a denormal product needs an underflowing multiply.
+// Row 8 (x87): the memory operand of an m32/m64 FLD, arithmetic or FCOM/FCOMP is tested on its bits (a register holding a double
+// denormal is an 80-bit normal), none when ST0 is a NaN, and for a memory dividend (FDIVR) none when ST0 is zero. A stack fault drops it
+// in the check as it drops every flag (`FexcX87CheckDe`). Integer forms (FI*), FLD m80 and the register forms have no such operand.
+// Nodes PlaceFmaSanitize made (its quiet compares are not the guest's compares: no DE test of their own)
+inline std::set<const void*> FexcMade;
+struct DeRule {
+  enum Kind : uint8_t { None, Bin, Div, Sqrt, Unary, Fma, Pair, Cadd } K = None;
+  uint8_t Arg[3] = {0, 0, 0};   // the operands: Bin and Div 0 and 1, Unary and Sqrt 0, Fma the multiplicands 0 and 1 and the addend 2
+  uint32_t E = 0;               // bytes of an operand element
+  uint32_t B = 0;               // bytes of each operand the op examines: 4, 8 or 16
+  bool Scalar = false;          // element 0 only (B == E)
+  bool Upper = false;           // VFCVTL2: the upper 8 bytes of the operand
+  bool Flip = false;            // Fma: the product and the addend are subtracted (a*b - c, -(a*b) + c)
+};
+inline bool DeRuleOf(const FEXCore::IR::IROp_Header* Op, DeRule& R) {
+  using namespace FEXCore::IR;
+  using std::initializer_list;
+  const uint32_t E = OpSizeToSize(Op->ElementSize), S = OpSizeToSize(Op->Size);
+  auto Set = [&](DeRule::Kind K, initializer_list<uint8_t> A, uint32_t Elem, uint32_t Bytes, bool Scalar) {
+    size_t n = 0;
+    for (auto a : A) R.Arg[n++] = a;
+    R.K = K; R.E = Elem; R.B = Bytes; R.Scalar = Scalar;
+  };
+  switch (Op->Op) {
+  case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFMIN: case OP_VFMAX:
+  case OP_VFCMPEQ: case OP_VFCMPNEQ: case OP_VFCMPLT: case OP_VFCMPGT: case OP_VFCMPLE: case OP_VFCMPORD: case OP_VFCMPUNO:
+    Set(DeRule::Bin, {0, 1}, E, S, S == E); break;
+  case OP_VFDIV: Set(DeRule::Div, {0, 1}, E, S, S == E); break;
+  case OP_VFADDP: Set(DeRule::Pair, {0, 1}, E, S, false); break;
+  case OP_VFCADD: Set(DeRule::Cadd, {0, 1}, E, S, false); break;
+  case OP_VFSQRT: Set(DeRule::Sqrt, {0}, E, S, S == E); break;
+  case OP_VFMLA: case OP_VFMLS: case OP_VFNMLA: case OP_VFNMLS:
+    Set(DeRule::Fma, {0, 1, 2}, E, S, S == E); R.Flip = Op->Op == OP_VFMLS || Op->Op == OP_VFNMLA; break;
+  case OP_VFADDSCALARINSERT: case OP_VFSUBSCALARINSERT: case OP_VFMULSCALARINSERT: case OP_VFMINSCALARINSERT: case OP_VFMAXSCALARINSERT:
+  case OP_VFCMPSCALARINSERT: Set(DeRule::Bin, {0, 1}, E, E, true); break;
+  case OP_VFDIVSCALARINSERT: Set(DeRule::Div, {0, 1}, E, E, true); break;
+  case OP_VFSQRTSCALARINSERT: Set(DeRule::Sqrt, {1}, E, E, true); break;
+  case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT: case OP_VFNMLSSCALARINSERT:
+    Set(DeRule::Fma, {1, 2, 3}, E, E, true); R.Flip = Op->Op == OP_VFMLSSCALARINSERT || Op->Op == OP_VFNMLASCALARINSERT; break;
+  case OP_VFTOFSCALARINSERT: {
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_VFToFScalarInsert>()->SrcElementSize);
+    Set(DeRule::Unary, {1}, Src, Src, true); break;
+  }
+  case OP_FLOAT_FTOF: {
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_Float_FToF>()->SrcElementSize);
+    Set(DeRule::Unary, {0}, Src, Src, true); break;
+  }
+  case OP_FCMP: {
+    const uint32_t Elem = OpSizeToSize(Op->C<IROp_FCmp>()->ElementSize);
+    Set(DeRule::Bin, {0, 1}, Elem, Elem, true); break;
+  }
+  case OP_VECTOR_FTOF: {   // widening reads the low half of the source (cvtps2pd), narrowing all of it (cvtpd2ps, vcvtps2ph)
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_Vector_FToF>()->SrcElementSize);
+    const uint32_t Bytes = Src > E ? 16 : S / E * Src;
+    if (Bytes != 8 && Bytes != 16) ERROR_AND_DIE_FMT("fexc slice1 (AFP fallback 3b): a vector convert of {} bytes", Bytes);
+    Set(DeRule::Unary, {0}, Src, Bytes, false);
+    break;
+  }
+  case OP_VFCVTL2: Set(DeRule::Unary, {0}, E >> 1, 8, false); R.Upper = true; break;
+  case OP_VFCVTN2: Set(DeRule::Unary, {1}, E << 1, 16, false); break;
+  default: return false;
+  }
+  return R.K != DeRule::None;
+}
+inline FEXCore::IR::OpSize OpSz(uint32_t Bytes) {
+  using FEXCore::IR::OpSize;
+  return Bytes == 4 ? OpSize::i32Bit : Bytes == 8 ? OpSize::i64Bit : OpSize::i128Bit;
+}
+// The vector ops of one test; the operands' ops are placed at the emitter's write cursor. `Wide`: a 128-bit register (all lanes
+// examined; a 64-bit operand has its upper half zeroed first by `Canon`), else one scalar element (lane 0; the rest is not looked at).
+template<class Emitter> struct SoftDe {
+  using Ref = FEXCore::IR::Ref;
+  using OpSize = FEXCore::IR::OpSize;
+  Emitter* IR;
+  uint32_t E, B;
+  bool Scalar;
+  OpSize Es, Int, Cmp;   // element size; size of the integer ops (a scalar one is a 64-bit op); size of the compare (exact: no other lane is read)
+  SoftDe(Emitter* IREmit, uint32_t Elem, uint32_t Bytes, bool IsScalar)
+    : IR(IREmit), E(Elem), B(Bytes), Scalar(IsScalar), Es(OpSz(Elem)), Int(IsScalar ? OpSize::i64Bit : OpSize::i128Bit), Cmp(IsScalar ? OpSz(Elem) : OpSize::i128Bit) {}
+  Ref Canon(Ref X) { return Scalar || B == 16 ? X : IR->_VMov(OpSize::i64Bit, X); }
+  struct Class { Ref Den, Zero, Exp; };
+  // Denormal (exponent field zero, mantissa not), zero (either sign) and exponent field lanes of an operand
+  Class Of(Ref X) {
+    Ref T = IR->_VShlI(Int, Es, X, 1);   // the sign out
+    Ref Zero = IR->_VCMPEQZ(Int, Es, T);
+    Ref Exp = IR->_VUShrI(Int, Es, T, E == 4 ? 24 : 53);
+    return {IR->_VAndn(Int, IR->_VCMPEQZ(Int, Es, Exp), Zero), Zero, Exp};
+  }
+  Ref NotNaN(Ref X) { return IR->_VFCMPEQ(Cmp, Es, X, X); }   // quiet: an SNaN lane raises IOC, as the op itself does
+  Ref Or(Ref A, Ref C) { return IR->_VOr(Int, A, C); }
+  Ref And(Ref A, Ref C) { return IR->_VAnd(Int, A, C); }
+  Ref Andn(Ref A, Ref C) { return IR->_VAndn(Int, A, C); }   // A & ~C
+  Ref Bin(Ref A, Ref C, bool Div = false) {
+    const Class Ca = Of(A), Cb = Of(C);
+    Ref D = Div ? Or(Andn(Ca.Den, Cb.Zero), Cb.Den) : Or(Ca.Den, Cb.Den);   // a denormal divided by zero is ZE
+    return And(D, And(NotNaN(A), NotNaN(C)));
+  }
+  Ref Sqrt(Ref A) { return Andn(Of(A).Den, IR->_VCMPLTZ(Int, Es, A)); }   // a negative operand is IE
+  Ref Fma(Ref A, Ref C, Ref Add, bool Flip) {
+    const Class Ca = Of(A), Cb = Of(C), Cc = Of(Add);
+    Ref M = And(Or(Or(Ca.Den, Cb.Den), Cc.Den), And(And(NotNaN(A), NotNaN(C)), NotNaN(Add)));
+    // No DE beside IE: inf * 0, and an infinite product with an infinite addend of the opposite effective sign (inf - inf). A NaN lane
+    // is out already, so an exponent field of all ones is an infinity here.
+    Ref Ones = E == 4 ? IR->_VectorImm(Int, Es, 0xff) : IR->_VDupFromGPR(Int, Es, IR->_Constant(0x7ff));
+    Ref Ea = IR->_VCMPEQ(Int, Es, Ca.Exp, Ones), Eb = IR->_VCMPEQ(Int, Es, Cb.Exp, Ones), Ec = IR->_VCMPEQ(Int, Es, Cc.Exp, Ones);
+    Ref Bad = Or(And(Ea, Cb.Zero), And(Ca.Zero, Eb));
+    Ref Product = Or(Andn(Ea, Cb.Zero), Andn(Eb, Ca.Zero));
+    Ref Odd = IR->_VCMPLTZ(Int, Es, IR->_VXor(Int, IR->_VXor(Int, A, C), Add));   // an odd number of the three operands is negative
+    if (Flip) Odd = IR->_VNot(Int, Odd);   // (the signs of product and addend differ: odd, or even for the subtracting forms)
+    return Andn(M, Or(Bad, And(And(Product, Ec), Odd)));
+  }
+  // The lanes' mask as a GPR, nonzero (the low 32 bits) when some lane is set
+  Ref Flag(Ref M) {
+    if (!Scalar) M = IR->_VUMaxV(OpSize::i128Bit, OpSize::i32Bit, M);
+    return IR->_VExtractToGPR(OpSize::i128Bit, OpSize::i32Bit, M, 0);
+  }
+};
+// The test of the SSE/AVX op at `Node` (rule `R`): a GPR, 0 or nonzero, placed before the op.
+template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEXCore::IR::Ref Node, const FEXCore::IR::IROp_Header* Op, const DeRule& R) {
+  using namespace FEXCore::IR;
+  auto View = IREmit->ViewIR();
+  auto Arg = [&](int i) { return View.GetNode(Op->Args[R.Arg[i]]); };
+  IREmit->SetWriteCursorBefore(Node);
+  SoftDe<Emitter> D(IREmit, R.E, R.B, R.Scalar);
+  Ref M = nullptr;
+  switch (R.K) {
+  case DeRule::Bin: M = D.Bin(D.Canon(Arg(0)), D.Canon(Arg(1))); break;
+  case DeRule::Div: M = D.Bin(D.Canon(Arg(0)), D.Canon(Arg(1)), true); break;
+  case DeRule::Sqrt: M = D.Sqrt(D.Canon(Arg(0))); break;
+  case DeRule::Unary: {
+    Ref X = Arg(0);
+    if (R.Upper) X = IREmit->_VDupElement(OpSize::i128Bit, OpSize::i64Bit, X, 1);   // the upper half, down
+    M = D.Of(D.Canon(X)).Den;
+    break;
+  }
+  case DeRule::Fma: M = D.Fma(D.Canon(Arg(0)), D.Canon(Arg(1)), D.Canon(Arg(2)), R.Flip); break;
+  case DeRule::Pair: {   // HADD/HSUB: the even and odd elements of the two sources are one op's operands
+    if (R.B != 16) ERROR_AND_DIE_FMT("fexc slice1 (AFP fallback 3b): a pairwise op of {} bytes", R.B);
+    Ref X = Arg(0), Y = Arg(1);
+    M = D.Bin(IREmit->_VUnZip(OpSize::i128Bit, D.Es, X, Y), IREmit->_VUnZip2(OpSize::i128Bit, D.Es, X, Y));
+    break;
+  }
+  case DeRule::Cadd: {   // ADDSUB: Arg(1) is the swapped operand (VRev64 or VExtr, both involutions): swap it back
+    if (R.B != 16) ERROR_AND_DIE_FMT("fexc slice1 (AFP fallback 3b): an ADDSUB op of {} bytes", R.B);
+    Ref Y = Arg(1);
+    Y = R.E == 4 ? IREmit->_VRev64(OpSize::i128Bit, OpSize::i32Bit, Y) : IREmit->_VExtr(OpSize::i128Bit, OpSize::i8Bit, Y, Y, 8);
+    M = D.Bin(Arg(0), Y);
+    break;
+  }
+  default: return nullptr;
+  }
+  return D.Flag(M);
+}
+// x87 (row 8): the memory operand of an op is the load itself (FLD m64, arithmetic and FCOM m64: `LoadMem` into a vector register) or a
+// single converted to a double from one (m32): its element size, or 0.
+inline uint32_t X87MemBits(const FEXCore::IR::IRListView& View, FEXCore::IR::OrderedNodeWrapper Arg, FEXCore::IR::Ref& Bits) {
+  using namespace FEXCore::IR;
+  const auto Op = View.GetOp<IROp_Header>(Arg);
+  auto Load = [&](OrderedNodeWrapper W, uint32_t& Size) {
+    const auto L = View.GetOp<IROp_Header>(W);
+    if (L->Op != OP_LOADMEM && L->Op != OP_LOADMEMTSO) return false;
+    const auto Class = L->Op == OP_LOADMEM ? L->C<IROp_LoadMem>()->Class : L->C<IROp_LoadMemTSO>()->Class;
+    Size = OpSizeToSize(L->Size);
+    return Class == RegClass::FPR && (Size == 4 || Size == 8);
+  };
+  uint32_t Size = 0;
+  if (Load(Arg, Size)) { Bits = View.GetNode(Arg); return Size; }
+  if (Op->Op == OP_FLOAT_FTOF) {
+    const auto F = Op->C<IROp_Float_FToF>();
+    if (OpSizeToSize(F->SrcElementSize) == 4 && Load(F->Scalar, Size) && Size == 4) { Bits = View.GetNode(F->Scalar); return 4; }
+  }
+  return 0;
+}
+// The test of the x87 instruction's floating-point ops among `Ops` (all before its check): a GPR, 0 or nonzero, or null.
+template<class Emitter> inline FEXCore::IR::Ref BuildX87De(Emitter* IREmit, const std::vector<std::pair<FEXCore::IR::Ref, FEXCore::IR::IROps>>& Ops, size_t Count) {
+  using namespace FEXCore::IR;
+  using Ref = FEXCore::IR::Ref;
+  auto View = IREmit->ViewIR();
+  struct Hit { Ref Node, Bits, Other; uint32_t Elem; bool Div; };
+  std::vector<Hit> Hits;
+  bool Arith = false;   // an arithmetic or compare op with a memory operand: the converting FLOAT_FTOF of an m32 is its operand, not an FLD
+  for (size_t i = 0; i < Count; ++i) {
+    const auto Op = View.template GetOp<IROp_Header>(Ops[i].first);
+    switch (Op->Op) {
+    case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV: case OP_FCMP: {
+      for (int m = 0; m < 2; ++m) {
+        Ref Bits = nullptr;
+        const uint32_t Elem = X87MemBits(View, Op->Args[m], Bits);
+        if (!Elem) continue;
+        const bool Const = View.template GetOp<IROp_Header>(Op->Args[1 - m])->Op == OP_VCASTFROMGPR;   // FLD m64's multiply by 1.0
+        Hits.push_back({Ops[i].first, Bits, Const ? nullptr : View.GetNode(Op->Args[1 - m]), Elem, Op->Op == OP_VFDIV && m == 0});
+        Arith |= !Const;
+        break;
+      }
+      break;
+    }
+    default: break;
+    }
+  }
+  for (size_t i = 0; i < Count; ++i) {   // FLD m32: the conversion alone
+    const auto Op = View.template GetOp<IROp_Header>(Ops[i].first);
+    Ref Bits = nullptr;
+    if (!Arith && Op->Op == OP_FLOAT_FTOF && X87MemBits(View, Op->Args[0], Bits) == 4 && Hits.empty())
+      Hits.push_back({Ops[i].first, Bits, nullptr, 4, false});
+  }
+  Ref Flag = nullptr;
+  for (const auto& H : Hits) {
+    IREmit->SetWriteCursorBefore(H.Node);
+    SoftDe<Emitter> D(IREmit, H.Elem, H.Elem, true);
+    Ref M = D.Of(H.Bits).Den;
+    if (H.Other) {   // a NaN in ST0 (an integer test: this op's FPSR flags are the x87 wrapper's): no DE; a divide of a memory dividend by zero is ZE
+      SoftDe<Emitter> Q(IREmit, 8, 8, true);
+      Ref U = IREmit->_VUShrI(OpSize::i64Bit, OpSize::i64Bit, IREmit->_VShlI(OpSize::i64Bit, OpSize::i64Bit, H.Other, 1), 1);
+      Ref NaN = IREmit->_VCMPGT(OpSize::i64Bit, OpSize::i64Bit, U, IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, IREmit->_Constant(0x7ff0'0000'0000'0000ULL)));
+      M = D.Andn(M, NaN);
+      if (H.Div) M = D.Andn(M, Q.Of(H.Other).Zero);
+    }
+    Ref F = D.Flag(M);
+    Flag = Flag ? IREmit->_Or(OpSize::i32Bit, Flag, F) : F;
+  }
+  return Flag;
+}
 // The ops that commit an instruction's effect: everything with a side effect but the NZCV writers (the incoming NZCV is saved
 // for a fault point after one, patch 0006), instruction markers, loads, prefetches and FEX's rounding-mode bookkeeping.
 inline bool Commits(FEXCore::IR::IROps Op) {
@@ -158,6 +394,7 @@ inline bool Commits(FEXCore::IR::IROps Op) {
   case OP_GUESTOPCODE: case OP_INVALIDATEFLAGS: case OP_INLINECONSTANT: case OP_INLINEENTRYPOINTOFFSET: case OP_PREFETCH:
   case OP_LOADCONTEXTPAIR: case OP_LOADMEMPAIR: case OP_VLOADNONTEMPORAL: case OP_DIV: case OP_UDIV: case OP_FCMP: case OP_STORENZCV:
   case OP_SETROUNDINGMODE: case OP_PUSHROUNDINGMODE: case OP_POPROUNDINGMODE: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
+  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE:
   case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG: case OP_RMIFNZCV: case OP_CONDADDNZCV:
   case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS: case OP_ADCNZCV: case OP_SBBNZCV:
   case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ: case OP_TESTZ: case OP_SHIFTFLAGS:
@@ -205,6 +442,22 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
       for (size_t i = First; i < Insn.size(); ++i)
         if (SimdFPOp(Insn[i].second)) ERROR_AND_DIE_FMT("fexc slice1 (I5c): a floating-point op after the first commit at {:#x}", Rip);
       if (First == Insn.size()) ERROR_AND_DIE_FMT("fexc slice1 (I5c): no commit to check before at {:#x}", Rip);
+      // AFP fallback chunk 3b (rows 7 and 8): without AFP and with DE unmasked, the software denormal tests of the instruction's ops,
+      // placed before each op (SIMD: `Des`, the op's index and its flag) or before the x87 check (`X87De`).
+      std::vector<std::pair<size_t, Ref>> Des;
+      Ref X87De = nullptr;
+      if (fexc_no_afp) {
+        if (!X87 && (uint64_t(fexc_simd_unmasked) >> 1 & 1)) {
+          for (size_t i = 0; i < First; ++i) {
+            const auto* Op = IR.template GetOp<IROp_Header>(Insn[i].first);
+            DeRule R;
+            if (!FexcMade.count(Insn[i].first) && DeRuleOf(Op, R))
+              if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R)) Des.push_back({i, F});
+          }
+        } else if (X87 && (uint64_t(fexc_x87_unmasked) >> 1 & 1)) {
+          X87De = BuildX87De(IREmit, Insn, First);
+        }
+      }
       IREmit->SetWriteCursorBefore(Insn[First].first);
       if (X87) {
         const auto It = fexc_x87_extra.find(Rip);
@@ -221,22 +474,35 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           return Zero ? Zero : Zero = IREmit->_Constant(0);
         };
         Ref F = Arg(E.fault), O = Arg(E.overflow), I = Arg(E.invalid), T = Arg(E.tiny);
-        IREmit->_FexcX87Check(F, O, I, T, Mask, Store);
+        if (X87De) IREmit->_FexcX87CheckDe(F, O, I, T, X87De, Mask, Store);
+        else IREmit->_FexcX87Check(F, O, I, T, Mask, Store);
       } else {
         fexc_simd_checked.insert(Rip);
-        IREmit->_FexcSimdCheck(Mask);
-        if (Dpp) {   // DPPS/DPPD: every multiply and add step is checked in its order (VDPPS ymm: each half in turn)
+        std::vector<size_t> Steps;   // DPPS/DPPD: every multiply and add step is checked in its order (VDPPS ymm: each half in turn)
+        if (Dpp) {
           size_t Last = First;
           for (size_t i = 0; i < First; ++i) if (SimdFPOp(Insn[i].second)) Last = i;
-          for (size_t i = 0; i < Last; ++i) if (SimdFPOp(Insn[i].second)) {
-            // a step's check follows its flush (PlaceFlushes ran first): the flush's UFC/IXC belong to this step, not the next
-            Ref At = Insn[i].first;
-            for (size_t j = i + 1; j < Insn.size() && Insn[j].second == OP_FEXCFLUSH &&
-                                   IR.GetNode(IR.template GetOp<IROp_Header>(Insn[j].first)->Args[0]) == At; ++j)
-              At = Insn[j].first;
-            IREmit->SetWriteCursor(At);
-            IREmit->_FexcSimdCheck(Mask);
-          }
+          for (size_t i = 0; i < Last; ++i) if (SimdFPOp(Insn[i].second)) Steps.push_back(i);
+        }
+        // a check takes the software flags of the ops after the previous check up to its own point
+        auto Check = [&](long After, long Upto) {
+          Ref De = nullptr;
+          for (const auto& D : Des)
+            if (long(D.first) > After && long(D.first) <= Upto) De = De ? IREmit->_Or(OpSize::i32Bit, De, D.second) : D.second;
+          if (De) IREmit->_FexcSimdCheckDe(Mask, De);
+          else IREmit->_FexcSimdCheck(Mask);
+        };
+        Check(Steps.empty() ? -1 : long(Steps.back()), long(Insn.size()));
+        long Prev = -1;
+        for (size_t i : Steps) {
+          // a step's check follows its flush (PlaceFlushes ran first): the flush's UFC/IXC belong to this step, not the next
+          Ref At = Insn[i].first;
+          for (size_t j = i + 1; j < Insn.size() && Insn[j].second == OP_FEXCFLUSH &&
+                                 IR.GetNode(IR.template GetOp<IROp_Header>(Insn[j].first)->Args[0]) == At; ++j)
+            At = Insn[j].first;
+          IREmit->SetWriteCursor(At);
+          Check(Prev, long(i));
+          Prev = long(i);
         }
       }
     };
@@ -377,6 +643,52 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
       Ref Flushed = IREmit->_FexcFlush(Op->Size, R.OutElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, F.Node, (R.OutScalar ? 1 : 0) | (R.Out == 1 ? 2 : 0));
       IREmit->ReplaceUsesWithAfter(F.Node, Flushed, Flushed);
     }
+  }
+}
+// AFP fallback chunk 3b, row 10: with IE unmasked and no AFP, an FMA whose multiplicands are inf and 0 and whose addend is a NaN raises a
+// spurious IOC (x86 returns the QNaN, no IE: SDM Vol.1 Table 14-17), so a #XM. Under the unmasked IE (`--simd-unmasked` bit 0) the
+// multiplicands of each lane whose addend is a NaN are replaced by zero unless they are NaNs themselves (an SNaN multiplicand still
+// raises IOC): per multiplicand a quiet `fcmeq` of it and of the addend, `bic`, `bic`; the product is then 0, and the result NaN
+// is the addend's or a multiplicand's as before. 7 vector ops per FMA; the compares' nodes are `FexcMade` (no DE test of their own).
+template<class Emitter> inline void PlaceFmaSanitize(Emitter* IREmit) {
+  using namespace FEXCore::IR;
+  using Ref = FEXCore::IR::Ref;
+  if (!fexc_no_afp) return;
+  FexcMade.clear();   // (node addresses are reused from one compile to the next)
+  auto IR = IREmit->ViewIR();
+  const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
+  std::vector<Ref> Ops;
+  uint64_t Rip = ~0ull;
+  for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
+    for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
+      if (IROp->Op == OP_GUESTOPCODE) { Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset; continue; }
+      switch (IROp->Op) {
+      case OP_VFMLA: case OP_VFMLS: case OP_VFNMLA: case OP_VFNMLS:
+      case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT: case OP_VFNMLSSCALARINSERT:
+        if (Rip != ~0ull && !fexc_x87.count(Rip)) Ops.push_back(CodeNode);
+        break;
+      default: break;
+      }
+    }
+  }
+  if (Ops.empty() || !(uint64_t(fexc_simd_unmasked) & 1)) return;
+  for (Ref Node : Ops) {
+    auto View = IREmit->ViewIR();
+    const auto* Op = View.template GetOp<IROp_Header>(Node);
+    const bool Insert = Op->Op == OP_VFMLASCALARINSERT || Op->Op == OP_VFMLSSCALARINSERT || Op->Op == OP_VFNMLASCALARINSERT || Op->Op == OP_VFNMLSSCALARINSERT;
+    const uint32_t E = OpSizeToSize(Op->ElementSize), S = OpSizeToSize(Op->Size);
+    const bool Scalar = Insert || S == E;
+    if (!Scalar && S != 16) ERROR_AND_DIE_FMT("fexc slice1 (AFP fallback 3b): an FMA of {} bytes", S);
+    const uint8_t First = Insert ? 1 : 0;   // the multiplicands' arguments (the scalar forms' argument 0 only supplies the upper elements)
+    const OpSize Es = OpSz(E), Int = Scalar ? OpSize::i64Bit : OpSize::i128Bit, Cmp = Scalar ? Es : OpSize::i128Bit;
+    IREmit->SetWriteCursorBefore(Node);
+    Ref A = View.GetNode(Op->Args[First]), B = View.GetNode(Op->Args[First + 1]), C = View.GetNode(Op->Args[First + 2]);
+    Ref Cok = IREmit->_VFCMPEQ(Cmp, Es, C, C), Aok = IREmit->_VFCMPEQ(Cmp, Es, A, A), Bok = IREmit->_VFCMPEQ(Cmp, Es, B, B);
+    FexcMade.insert(Cok); FexcMade.insert(Aok); FexcMade.insert(Bok);
+    Ref A2 = IREmit->_VAndn(Int, A, IREmit->_VAndn(Int, Aok, Cok));
+    Ref B2 = IREmit->_VAndn(Int, B, IREmit->_VAndn(Int, Bok, Cok));
+    IREmit->ReplaceNodeArgument(Node, First, A2);
+    IREmit->ReplaceNodeArgument(Node, First + 1, B2);
   }
 }
 } // namespace FexcPrecision

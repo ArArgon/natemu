@@ -2018,6 +2018,9 @@ const fn ldr_state(size: u32, t: u32, at: u32) -> u32 {
 }
 const MOVZ_W1: u32 = 0x5280_0001; // movz w1, #imm16 (imm16 << 5)
 const AND_W1_W0_W1: u32 = 0x0a01_0001;
+/// `and w1, wD, #0x80` with D cleared (AFP fallback 3b: the software denormal flag's word of a check) and `orr w0, w0, w1`
+const AND_W1_WD_80: u32 = 0x1219_0001;
+const ORR_W0_W0_W1: u32 = 0x2a01_0000;
 const AND_W0_W0_W1: u32 = 0x0a01_0000;
 impl Verifier<'_> {
     /// Code shape (I5c): each floating-point exception stub is reached by its exact check.
@@ -2056,10 +2059,20 @@ impl Verifier<'_> {
                         ldr_state(1, 1, frame::SIMD_FLAGS) & !(1 << 22),
                         0xd51b_443f,
                     ];
+                    // Without AFP and with DE unmasked (AFP fallback 3b, row 7) the software denormal flag, 0 or nonzero in wD, is
+                    // FPSR bit 7 of the check word: `and w1, wD, #0x80; orr w0, w0, w1` right after the `mrs`.
+                    let plain = words(3).is_some_and(|w| {
+                        w[0] == 0xd53b_4420 && mask(w[1], 0x9f) && w[2] == AND_W1_W0_W1
+                    });
+                    let soft = words(5).is_some_and(|w| {
+                        w[0] == 0xd53b_4420
+                            && w[1] & 0xffff_fc1f == AND_W1_WD_80
+                            && w[2] == ORR_W0_W0_W1
+                            && mask(w[3], 0x9f)
+                            && w[4] == AND_W1_W0_W1
+                    });
                     let ok = c.cond == Some(CBNZ_W | 1)
-                        && words(3).is_some_and(|w| {
-                            w[0] == 0xd53b_4420 && mask(w[1], 0x9f) && w[2] == AND_W1_W0_W1
-                        })
+                        && (plain || soft)
                         && after
                             .iter()
                             .enumerate()
@@ -2067,9 +2080,21 @@ impl Verifier<'_> {
                     if !ok {
                         return fail();
                     }
-                    c.start - 12
+                    c.start - if plain { 12 } else { 20 }
                 }
                 X87 => {
+                    // Row 8: with DE unmasked and no AFP, `and w1, wD, #0x80; orr w0, w0, w1` follow the pending byte's load (the stack
+                    // fault then drops the software flag as it drops every flag).
+                    let soft = words(11).is_some_and(|w| {
+                        w[1] & 0xffff_fc1f == AND_W1_WD_80 && w[2] == ORR_W0_W0_W1
+                    });
+                    let words = |n: u32| {
+                        if n == 9 && soft {
+                            words(11).map(|w| [&w[..1], &w[3..]].concat())
+                        } else {
+                            words(n)
+                        }
+                    };
                     let ok = c.cond == Some(CBNZ_W | 1)
                         && words(9).is_some_and(|w| {
                             let f = w[1] >> 5 & 31;
@@ -2087,7 +2112,7 @@ impl Verifier<'_> {
                     if !ok {
                         return fail();
                     }
-                    c.start - 36
+                    c.start - if soft { 44 } else { 36 }
                 }
                 _ => {
                     let want = [
@@ -2324,6 +2349,60 @@ mod tests {
                     assert!(out.status.success(), "{hex} {keys:?}");
                     let object = std::fs::read(&object).unwrap();
                     admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {keys:?} {unmasked}: {e}"));
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// AFP fallback chunk 3b: with `FEXC` set, the code of the software denormal flag (rows 7 and 8: `and w1, wD, #0x80; orr w0, w0, w1`
+    /// in the SIMD and x87 checks) and of the FMA sanitizing (row 10) passes admission with the code-shape check, with no spill, under
+    /// every unmasked set that keys it (and the others), alone and with the flush keys; the same forms with AFP have the plain checks.
+    #[test]
+    fn the_software_flag_code_is_admitted() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let simd = [
+            "f30f58ca", "0f58ca", "660f5eca", "f20f5eca", "0f51ca", "f20f5fca", "f20f7cca", "660f7dca", "f20fd0ca", "660fd0ca", "660f3a40caff",
+            "0fc2ca01", "f30fc2ca00", "0f2fca", "660f2eca", "0f5aca", "660f5aca", "f30f5aca", "f20f5aca", "c4e3791dd100", "c5fc5aca", "c5fd5aca",
+            "c5e858cb", "c5ed5ecb", "c4e269b8cb", "c4e269b9cb", "c4e2e9b8cb", "c4e2e9b9cb", "c4e269bacb", "c4e2e9bdcb", "c4e2e9becb", "c4e2e9bbcb",
+            "c5ed7ccb", "c5ed7dcb", // memory operands, 256-bit forms (two halves, one check) and DPPS's steps follow
+            "f30f580b", "0f580b", "0f5a0b", "f20f5e0b", "f30f510b", "c4e269b90b", "c5fc5a0b", "c5ec58cb", "c4e26db8cb", "c5ef7ccb", "c4e36d40cbff",
+            "c5ecc2cb01",
+        ];
+        let x87 = [
+            "d903", "dd03", "d803", "dc03", "d80b", "dc0b", "d813", "dc13", "d81b", "dc1b", "d823", "dc23", "d82b", "dc2b", "d833", "dc33", "d83b",
+            "dc3b", "da03", "d9c0", "d8c1",
+        ];
+        let dir = std::env::temp_dir().join(format!("natemu-soft-flag-admit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (object, json) = (dir.join("o"), dir.join("j"));
+        let compile = |hex: &str, args: &[&str]| -> Vec<u8> {
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", hex, "--rip", "0x1000", "--profile", "slice1"])
+                .args(args)
+                .arg("--object")
+                .arg(&object)
+                .arg("--out")
+                .arg(&json)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex} {args:?}");
+            let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+            assert_eq!(report["code"]["layout"]["spill_bytes"], 0, "{hex} {args:?}: a spill");
+            std::fs::read(&object).unwrap()
+        };
+        for (forms, flag) in [(&simd[..], "--simd-unmasked"), (&x87[..], "--x87-unmasked")] {
+            for hex in forms {
+                let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+                for afp in [&["--feature", "afp=0"][..], &[]] {
+                    for unmasked in ["0x1", "0x2", "0x3", "0x3f"] {
+                        for keys in [&[][..], &["--ftz"]] {
+                            let args = [afp, &[flag, unmasked][..], keys].concat();
+                            let object = compile(hex, &args);
+                            admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {args:?}: {e}"));
+                        }
+                    }
                 }
             }
         }

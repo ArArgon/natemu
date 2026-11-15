@@ -7,9 +7,11 @@ comes from the instruction's architectural class, never from fexc's output. The 
 second compile of just the instructions before it: the code must be identical, so nothing of the cut instruction (or
 of FEX's mis-decode of it) leaks into the block.
 """
+import itertools
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -771,6 +773,354 @@ class AfpFlush(unittest.TestCase):
         self.assertEqual(tokens('660f3a41caff'), 'OFC' * 2)      # DPPD: products, the add
         self.assertEqual(tokens('c4e36d40caff'), 'OFC' * 6)      # VDPPS ymm: each half in turn
         self.assertEqual(tokens('c4e36941caff'), 'OFC' * 2)   # VDPPD xmm
+
+
+# AFP fallback chunk 3b (rows 7, 8, 10): the software denormal tests and the FMA sanitizing are checked by running the emitted code natively
+# (tools/fexc/exec_words.c, on the M4, whose FPCR the process leaves as an M2's: no AH, FZ clear) against an oracle written from the SDM.
+_NATIVE = {}
+
+
+def native_exe():
+    if 'exe' not in _NATIVE:
+        tmp = tempfile.mkdtemp(prefix='exec_words')
+        exe = Path(tmp) / 'exec_words'
+        subprocess.run(['clang', '-O1', '-o', str(exe), str(HERE / 'exec_words.c')], check=True, capture_output=True)
+        _NATIVE['exe'] = exe
+    return _NATIVE['exe']
+
+
+def native_run(words, x=None, v=None, buf=b'', ptrs=(), fpcr=None):
+    """Runs `words` with x[i], v[i] (128-bit ints), buf (8 KiB: x28 points at it) and x<reg> = buf + offset for `ptrs`, under FPCR `fpcr`
+    (default the process's: an M2's, no AH; 6 is the M4 as natemu runs it); returns (x, v, buf) after."""
+    x, v = list(x or [0] * 32), list(v or [0] * 32)
+    inp = struct.pack('<I', len(words)) + struct.pack(f'<{len(words)}I', *words) + struct.pack('<I', len(ptrs))
+    for reg, off in ptrs: inp += struct.pack('<II', reg, off)
+    inp += struct.pack('<32Q', *x) + b''.join(int(q).to_bytes(16, 'little') for q in v) + buf.ljust(8192, b'\0')
+    out = subprocess.run([str(native_exe())] + ([] if fpcr is None else [f'{fpcr:x}']), input=inp, capture_output=True, check=True).stdout
+    return (list(struct.unpack_from('<32Q', out, 0)), [int.from_bytes(out[256 + 16 * i:272 + 16 * i], 'little') for i in range(32)], out[768:])
+
+
+def fp_class(x, e):
+    """The IEEE class of the e-byte float bits x."""
+    man, ex = (23, 8) if e == 4 else (52, 11)
+    exp, frac = x >> man & (1 << ex) - 1, x & (1 << man) - 1
+    return dict(den=exp == 0 and frac != 0, zero=exp == 0 and frac == 0, nan=exp == (1 << ex) - 1 and frac != 0,
+                inf=exp == (1 << ex) - 1 and frac == 0, snan=exp == (1 << ex) - 1 and frac != 0 and not frac >> (man - 1), neg=bool(x >> (8 * e - 1)))
+
+
+# One value per class for 4- and 8-byte floats: normal, denormals (smallest, largest, negative), the smallest normal, zeros, infinities, QNaN, SNaN.
+VALUES = {4: dict(one=0x3f800000, den=0x00000001, dmax=0x007fffff, dneg=0x80000001, minn=0x00800000, zero=0, nzero=0x80000000,
+                  inf=0x7f800000, ninf=0xff800000, qnan=0x7fc00000, snan=0x7f800001),
+          8: dict(one=0x3ff0000000000000, den=1, dmax=0x000fffffffffffff, dneg=0x8000000000000001, minn=0x0010000000000000, zero=0,
+                  nzero=0x8000000000000000, inf=0x7ff0000000000000, ninf=0xfff0000000000000, qnan=0x7ff8000000000000, snan=0x7ff0000000000001)}
+
+
+def de_lane(kind, ops, e):
+    """x86's DE for one lane (SDM Vol.1 11.5.2, the I5a runner's rules): a denormal operand, none beside a NaN operand (IE) or, for a
+    divisor of zero, ZE (the dividend), a negative square root, an inf * 0 product."""
+    c = [fp_class(o, e) for o in ops]
+    if any(k['nan'] for k in c): return False
+    den = [k['den'] for k in c]
+    if kind == 'div': return (den[0] and not c[1]['zero']) or den[1]
+    if kind == 'sqrt': return den[0] and not c[0]['neg']
+    if kind == 'fma' and ((c[0]['inf'] and c[1]['zero']) or (c[0]['zero'] and c[1]['inf'])): return False
+    return any(den)
+
+
+def ie_lane(ops, e, name):
+    """x86's IE for a fused multiply-add lane (a, b, addend; SDM Vol.1 Table 14-17): an SNaN; inf * 0 unless the addend is a NaN; an infinite
+    product and addend of opposite signs (`name`: vfmadd a*b + c, vfmsub a*b - c, vfnmadd -(a*b) + c, vfnmsub -(a*b) - c)."""
+    a, b, c = (fp_class(o, e) for o in ops)
+    if a['snan'] or b['snan'] or c['snan']: return True
+    if a['nan'] or b['nan'] or c['nan']: return False
+    if (a['inf'] and b['zero']) or (a['zero'] and b['inf']): return True
+    pneg, cneg = name.startswith('vfnm'), name.startswith(('vfmsub', 'vfnmsub'))
+    product_inf = (a['inf'] and not b['zero']) or (b['inf'] and not a['zero'])
+    return product_inf and c['inf'] and (a['neg'] ^ b['neg'] ^ pneg) != (c['neg'] ^ cneg)
+
+
+def native_words(hexs, *extra):
+    key = (hexs, extra)
+    if key not in _NATIVE:
+        d, rc = run(hexs, RIP, *extra)
+        assert rc == 0, key
+        lay = d['code']['layout']
+        code = bytes.fromhex(d['code']['hex'])
+        lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal']
+        with tempfile.TemporaryDirectory() as t:
+            dis = check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+        b, e = lay['code_region_begin'], lay['code_region_end']
+        _NATIVE[key] = (list(struct.unpack(f'<{(e - b) // 4}I', code[b:e])), [dis[o].strip() for o in range(b, e, 4)], lay['spill_bytes'])
+    return _NATIVE[key]
+
+
+def soft_de_words(lines):
+    """The number of words of `lines` that are the software flag's `and w1, wD, #0x80`."""
+    return sum(l.startswith('and w1, w') and l.endswith('#0x80') for l in lines)
+
+
+# SSE/AVX forms of the rules of DeRuleOf: (name, hex, kind, element bytes, lanes examined, source registers in operand order).
+DE_FORMS = [
+    ('addss', 'f30f58ca', 'bin', 4, 1, (1, 2)), ('addps', '0f58ca', 'bin', 4, 4, (1, 2)), ('addsd', 'f20f58ca', 'bin', 8, 1, (1, 2)),
+    ('subpd', '660f5cca', 'bin', 8, 2, (1, 2)), ('mulps', '0f59ca', 'bin', 4, 4, (1, 2)), ('mulsd', 'f20f59ca', 'bin', 8, 1, (1, 2)),
+    ('divss', 'f30f5eca', 'div', 4, 1, (1, 2)), ('divps', '0f5eca', 'div', 4, 4, (1, 2)), ('divsd', 'f20f5eca', 'div', 8, 1, (1, 2)),
+    ('divpd', '660f5eca', 'div', 8, 2, (1, 2)), ('minps', '0f5dca', 'bin', 4, 4, (1, 2)), ('maxss', 'f30f5fca', 'bin', 4, 1, (1, 2)),
+    ('minpd', '660f5dca', 'bin', 8, 2, (1, 2)), ('sqrtps', '0f51ca', 'sqrt', 4, 4, (2,)), ('sqrtss', 'f30f51ca', 'sqrt', 4, 1, (2,)),
+    ('sqrtsd', 'f20f51ca', 'sqrt', 8, 1, (2,)), ('sqrtpd', '660f51ca', 'sqrt', 8, 2, (2,)),
+    ('haddps', 'f20f7cca', 'hadd', 4, 4, (1, 2)), ('hsubpd', '660f7dca', 'hadd', 8, 2, (1, 2)),
+    ('addsubps', 'f20fd0ca', 'bin', 4, 4, (1, 2)), ('addsubpd', '660fd0ca', 'bin', 8, 2, (1, 2)),
+    ('cmpltps', '0fc2ca01', 'bin', 4, 4, (1, 2)), ('cmpeqss', 'f30fc2ca00', 'bin', 4, 1, (1, 2)), ('cmpnlepd', '660fc2ca06', 'bin', 8, 2, (1, 2)),
+    ('comiss', '0f2fca', 'bin', 4, 1, (1, 2)), ('ucomisd', '660f2eca', 'bin', 8, 1, (1, 2)),
+    ('cvtps2pd', '0f5aca', 'unary', 4, 2, (2,)), ('cvtss2sd', 'f30f5aca', 'unary', 4, 1, (2,)), ('cvtpd2ps', '660f5aca', 'unary', 8, 2, (2,)),
+    ('cvtsd2ss', 'f20f5aca', 'unary', 8, 1, (2,)), ('vcvtps2ph', 'c4e3791dd100', 'unary', 4, 4, (2,)), ('vcvtps2pd ymm', 'c5fc5aca', 'unary', 4, 4, (2,)),
+    ('vaddps', 'c5e858cb', 'bin', 4, 4, (2, 3)), ('vdivsd', 'c5eb5ecb', 'div', 8, 1, (2, 3)),
+    ('vfmadd231ps', 'c4e269b8cb', 'fma', 4, 4, (2, 3, 1)), ('vfmadd231ss', 'c4e269b9cb', 'fma', 4, 1, (2, 3, 1)),
+    ('vfmadd231pd', 'c4e2e9b8cb', 'fma', 8, 2, (2, 3, 1)), ('vfmadd231sd', 'c4e2e9b9cb', 'fma', 8, 1, (2, 3, 1)),
+    ('vfmsub231ps', 'c4e269bacb', 'fma', 4, 4, (2, 3, 1)), ('vfnmadd231sd', 'c4e2e9bdcb', 'fma', 8, 1, (2, 3, 1)),
+    ('vfnmsub231pd', 'c4e2e9becb', 'fma', 8, 2, (2, 3, 1)),
+]
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpDenormal(unittest.TestCase):
+    """AFP fallback chunk 3b: rows 7 (SIMD DE), 8 (x87 DE) and 10 (FMA IE) without AFP, keyed on the exception being unmasked. The code is
+    run natively and judged by the SDM's rules (de_lane, ie_lane), the way the runners judge the M4."""
+    AFP0 = ['--feature', 'afp=0']
+
+    @staticmethod
+    def pack(lanes, e): return sum(l << 8 * e * k for k, l in enumerate(lanes))
+
+    def check_word(self, form, extra, regs):
+        """Runs the form up to its first SIMD check word (the software flag in) with xmm registers `regs` {n: 128-bit value}; x0."""
+        words, lines, spills = native_words(form, *self.AFP0, *extra)
+        self.assertEqual(spills, 0, form)
+        i = next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR'))
+        v = [0] * 32
+        for n, bits in regs.items(): v[16 + n] = bits
+        if extra == ('--simd-unmasked', '0x2'):
+            self.assertTrue(lines[i + 1].startswith('and w1, w') and lines[i + 1].endswith('#0x80') and lines[i + 2] == 'orr w0, w0, w1', lines[i:i + 3])
+            return native_run(words[:i + 3], v=v)[0][0]
+        return native_run(words[:i + 1], v=v)[0][0]
+
+    def test_simd_denormal_flag_follows_the_sdm(self):
+        cl = ['one', 'den', 'dneg', 'zero', 'inf', 'qnan', 'snan']
+        n = positive = 0
+        for name, form, kind, e, lanes, srcs in DE_FORMS:
+            if name.startswith(('vfmsub', 'vfnm')): continue   # (their sign-dependent IE, inf - inf, is judged against the M4's hardware below)
+            val, per = VALUES[e], 16 // e
+            junk = [val['snan'] if k % 2 else val['den'] for k in range(per)]   # lanes the form does not examine: never looked at
+            combos = itertools.product(('one', 'den', 'zero', 'inf', 'qnan', 'snan'), repeat=3) if kind == 'fma' else itertools.product(cl, repeat=len(srcs))
+            for combo in combos:
+                for pos in sorted({0, lanes - 1} if kind != 'hadd' else {0, 1}):   # (hadd: the pair in a, or in b)
+                    ops = [[val['one']] * lanes + junk[lanes:] for _ in srcs]
+                    if kind == 'hadd':
+                        ops[pos][0], ops[pos][1] = val[combo[0]], val[combo[1]]
+                        want = any(de_lane('bin', [ops[s][2 * k], ops[s][2 * k + 1]], e) for s in range(2) for k in range(lanes // 2))
+                    else:
+                        for r, c in enumerate(combo): ops[r][pos] = val[c]
+                        want = any(de_lane(kind, [ops[r][k] for r in range(len(srcs))], e) for k in range(lanes))
+                    got = self.check_word(form, ('--simd-unmasked', '0x2'), {s: self.pack(ops[r], e) for r, s in enumerate(srcs)}) & 0x80 != 0
+                    self.assertEqual(got, want, (name, pos, combo))
+                    n += 1
+                    positive += want
+        self.assertGreater(n, 3000)
+        self.assertGreater(positive, 500)
+        self.assertGreater(n - positive, 1500)
+
+    def test_simd_denormal_flag_is_the_m4s_idc(self):
+        """The same forms compiled for a host with AFP and run under the M4's FPCR (AH, NEP: natemu's FPCR on the M4) raise IDC in hardware:
+        the software flag of the code without AFP, run under an M2's FPCR, is that bit for every operand class (the plan's M2 = M4)."""
+        cl = ['one', 'den', 'dmax', 'dneg', 'minn', 'zero', 'inf', 'qnan', 'snan']
+        n = diff = 0
+        for name, form, kind, e, lanes, srcs in DE_FORMS:
+            val, per = VALUES[e], 16 // e
+            junk = [val['snan'] if k % 2 else val['den'] for k in range(per)]
+            words, lines, _ = native_words(form, '--simd-unmasked', '0x2')
+            hw = words[:next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR')) + 1]
+            for combo in (itertools.product(('one', 'den', 'zero', 'inf', 'ninf', 'qnan', 'snan'), repeat=3) if kind == 'fma' else itertools.product(cl, repeat=len(srcs))):
+                for pos in sorted({0, lanes - 1} if kind != 'hadd' else {0, 1}):
+                    ops = [[val['one']] * lanes + junk[lanes:] for _ in srcs]
+                    if kind == 'hadd': ops[pos][0], ops[pos][1] = val[combo[0]], val[combo[1]]
+                    else:
+                        for r, c in enumerate(combo): ops[r][pos] = val[c]
+                    regs = {s: self.pack(ops[r], e) for r, s in enumerate(srcs)}
+                    v = [0] * 32
+                    for r, bits in regs.items(): v[16 + r] = bits
+                    m4 = native_run(hw, v=v, fpcr=6)[0][0] >> 7 & 1
+                    got = self.check_word(form, ('--simd-unmasked', '0x2'), regs) >> 7 & 1
+                    if got != m4:
+                        diff += 1
+                        print('differs from the M4:', name, pos, combo, 'software', got, 'hardware', m4)
+                    n += 1
+        self.assertEqual(diff, 0)
+        self.assertGreater(n, 5000)
+
+    def test_simd_denormal_code_exists_only_without_afp_and_with_de_unmasked(self):
+        for extra in (['--simd-unmasked', '0x2'], ['--simd-unmasked', '0x3f']):
+            self.assertEqual(soft_de_words(native_words('f30f58ca', *extra)[1]), 0, extra)   # a host with AFP: IDC is the hardware's
+            self.assertEqual(soft_de_words(native_words('f30f58ca', *self.AFP0, *extra)[1]), 1, extra)
+        for mask in ('0x0', '0x3d', '0x1', '0x20'):   # DE masked (decision B): no software test
+            lines = native_words('f30f58ca', *self.AFP0, '--simd-unmasked', mask)[1]
+            self.assertEqual(soft_de_words(lines), 0, mask)
+            self.assertNotIn('cmeq.4s v3, v2, #0', lines, mask)
+        # common mode (nothing unmasked): the plain code, with no vector compare at all
+        self.assertFalse({'fcmeq', 'cmeq'} & {re.split(r'[. ]', l)[0] for l in native_words('f30f58ca', *self.AFP0)[1]})
+        for name, form, kind, e, lanes, srcs in DE_FORMS:
+            self.assertEqual(soft_de_words(native_words(form, *self.AFP0, '--simd-unmasked', '0x2')[1]), 1, name)
+            self.assertEqual(soft_de_words(native_words(form, '--simd-unmasked', '0x2')[1]), 0, name)
+
+    def test_dpps_flags_its_multiplies_and_checks_each_step(self):
+        words, lines, spills = native_words('660f3a40caff', *self.AFP0, '--simd-unmasked', '0x2')
+        self.assertEqual(spills, 0)
+        self.assertEqual(soft_de_words(lines), 1)   # the multiply's check carries the flag; the add levels' do not (their inputs are products)
+        self.assertEqual(sum(l.startswith('mrs x0, FPSR') for l in lines), 3)
+        i = next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR'))
+        for d, want in ((1, True), (0x3f800000, False)):
+            x, _, _ = native_run(words[:i + 3], v=[0] * 17 + [self.pack([d, 0x3f800000, 0x3f800000, 0x3f800000], 4), self.pack([0x3f800000] * 4, 4)] + [0] * 13)
+            self.assertEqual(bool(x[0] & 0x80), want, d)
+        # a denormal in an element the mask leaves out is not examined
+        words, lines, _ = native_words('660f3a40ca7f', *self.AFP0, '--simd-unmasked', '0x2')
+        i = next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR'))
+        x, _, _ = native_run(words[:i + 3], v=[0] * 17 + [self.pack([0x3f800000] * 3 + [1], 4), self.pack([0x3f800000] * 4, 4)] + [0] * 13)
+        self.assertFalse(x[0] & 0x80)
+
+    # row 8
+    X87 = [('fld m32', 'd903', 4, 'fld'), ('fld m64', 'dd03', 8, 'fld'), ('fadd m32', 'd803', 4, 'bin'), ('fadd m64', 'dc03', 8, 'bin'),
+           ('fmul m32', 'd80b', 4, 'bin'), ('fcom m64', 'dc13', 8, 'bin'), ('fcomp m32', 'd81b', 4, 'bin'), ('fsub m64', 'dc23', 8, 'bin'),
+           ('fsubr m32', 'd82b', 4, 'bin'), ('fdiv m64', 'dc33', 8, 'bin'), ('fdivr m64', 'dc3b', 8, 'divr'), ('fdivr m32', 'd83b', 4, 'divr')]
+
+    def x87_check_word(self, form, mem, e, st0, extra=('--x87-unmasked', '0x2')):
+        words, lines, spills = native_words(form, *self.AFP0, *extra)
+        self.assertEqual(spills, 0, form)
+        i = next(k for k, l in enumerate(lines) if l == 'ldrb w0, [x28, #0x412]')
+        self.assertTrue(lines[i + 1].startswith('and w1, w') and lines[i + 1].endswith('#0x80') and lines[i + 2] == 'orr w0, w0, w1', lines[i:i + 3])
+        j = next(k for k in range(i, len(lines)) if lines[k] == 'and w1, w0, w1')
+        buf = bytearray(8192)
+        buf[0x4b2] = 0 if st0 is None else 1               # valid tags: ST0 present or the stack empty (TOP, at 0x41b, is 0)
+        if st0 is not None: buf[0x420:0x428] = st0.to_bytes(8, 'little')
+        buf[0x1000:0x1000 + e] = mem.to_bytes(e, 'little')
+        return native_run(words[:j + 1], buf=bytes(buf), ptrs=[(6, 0x1000)])[0][0]
+
+    def test_x87_denormal_memory_operand_follows_the_sdm(self):
+        n = 0
+        for name, form, e, kind in self.X87:
+            for m in ('one', 'den', 'dneg', 'dmax', 'minn', 'zero', 'inf', 'qnan', 'snan'):
+                for r in (['none'] if kind == 'fld' else ['one', 'zero', 'den', 'inf', 'qnan', 'snan', 'none']):
+                    st0 = None if r == 'none' else VALUES[8][r]
+                    c0 = fp_class(st0, 8) if st0 is not None else None
+                    want = fp_class(VALUES[e][m], e)['den'] and (kind == 'fld' or (st0 is not None and not c0['nan'] and not (kind == 'divr' and c0['zero'])))
+                    x0 = self.x87_check_word(form, VALUES[e][m], e, st0)
+                    self.assertEqual(bool(x0 & 0x80), want, (name, m, r, hex(x0)))   # (a double denormal in a register is an 80-bit normal: ST0 den is no DE)
+                    if kind != 'fld' and r == 'none': self.assertTrue(x0 >> 8 & 1, 'the stack fault is in the word')
+                    n += 1
+        self.assertGreater(n, 400)
+
+    def test_x87_denormal_flag_is_the_m4s_idc_except_where_the_m4_deviates(self):
+        """As the SIMD test: the M4's x87 code (a host with AFP) under the M4's FPCR raises IDC for the same memory operands, but where the M4
+        deviates from x86 (below); a denormal double in ST0 is left out: the M4 reports DE for it (deviation 4 of the boot-features plan)."""
+        n = 0
+        for name, form, e, kind in self.X87:
+            words, lines, _ = native_words(form, '--x87-unmasked', '0x2')
+            i = next(k for k, l in enumerate(lines) if l == 'ldrb w0, [x28, #0x412]')
+            j = next(k for k in range(i, len(lines)) if lines[k] == 'and w1, w0, w1')
+            for m in ('one', 'den', 'dneg', 'dmax', 'minn', 'zero', 'inf', 'qnan', 'snan'):
+                for r in (['none'] if kind == 'fld' else ['one', 'zero', 'inf', 'qnan', 'snan', 'none']):
+                    st0 = None if r == 'none' else VALUES[8][r]
+                    buf = bytearray(8192)
+                    buf[0x4b2] = 0 if st0 is None else 1
+                    if st0 is not None: buf[0x420:0x428] = st0.to_bytes(8, 'little')
+                    buf[0x1000:0x1000 + e] = VALUES[e][m].to_bytes(e, 'little')
+                    hw = native_run(words[:j + 1], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=6)[0][0] >> 7 & 1
+                    got = self.x87_check_word(form, VALUES[e][m], e, st0) >> 7 & 1
+                    # (the M4's conversion of a single to a double is an op of its own, which raises IDC whatever ST0 holds: m32 arithmetic
+                    # beside a NaN, or FDIVR by zero, has DE there and in no x86)
+                    m4_artefact = e == 4 and kind != 'fld' and fp_class(VALUES[e][m], e)['den'] and (r in ('qnan', 'snan') or (kind == 'divr' and r == 'zero'))
+                    self.assertTrue(got == hw or (m4_artefact and (got, hw) == (0, 1)), (name, m, r, got, hw))
+                    n += 1
+        self.assertGreater(n, 400)
+
+    def test_x87_denormal_code_only_without_afp_and_with_de_unmasked(self):
+        for name, form, e, kind in self.X87:
+            for extra in (['--x87-unmasked', '0x2'], ['--x87-unmasked', '0x3f']):
+                self.assertEqual(soft_de_words(native_words(form, *extra)[1]), 0, name)   # a host with AFP
+                self.assertEqual(soft_de_words(native_words(form, *self.AFP0, *extra)[1]), 1, name)
+            for mask in ('0x0', '0x3d', '0x1'):   # DE masked (decision B): the code of a host with AFP
+                self.assertEqual(native_words(form, *self.AFP0, '--x87-unmasked', mask)[1], native_words(form, '--x87-unmasked', mask)[1], (name, mask))
+        # not the integer forms (fiadd m32, fiadd m16, fild), the register forms: no memory operand to test
+        for form in ('da03', 'de03', 'df03', 'd8c1', 'dec1', 'd9c0', 'd8d1', 'dfe9', 'd9e4'):
+            self.assertEqual(soft_de_words(native_words(form, *self.AFP0, '--x87-unmasked', '0x2')[1]), 0, form)
+
+    # row 10
+    def test_fma_inf_times_zero_with_a_qnan_addend_raises_no_ie_but_the_other_cases_do(self):
+        cl = ['one', 'zero', 'inf', 'ninf', 'qnan', 'snan']
+        n = 0
+        for name, form, kind, e, lanes, srcs in [f for f in DE_FORMS if f[2] == 'fma']:
+            val, per = VALUES[e], 16 // e
+            words, lines, spills = native_words(form, *self.AFP0, '--simd-unmasked', '0x1')
+            self.assertEqual(spills, 0, name)
+            i = next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR'))
+            for combo in itertools.product(cl, repeat=3):
+                for pos in sorted({0, lanes - 1}):
+                    ops = [[val['snan']] * per for _ in range(3)]       # (lanes not examined: SNaNs, which would raise IE if looked at)
+                    for r in range(3):
+                        for k in range(lanes): ops[r][k] = val['one']
+                        ops[r][pos] = val[combo[r]]
+                    want = any(ie_lane([ops[r][k] for r in range(3)], e, name) for k in range(lanes))
+                    v = [0] * 32
+                    for r, s in enumerate(srcs): v[16 + s] = self.pack(ops[r], e)
+                    x, vs, _ = native_run(words[:i + 1], v=v)
+                    self.assertEqual(bool(x[0] & 1), want, (name, pos, combo))
+                    n += 1
+        self.assertGreater(n, 2000)
+
+    def test_fma_ie_is_the_m4s_ioc(self):
+        """The IE of the FMA forms without AFP (sanitized) is the M4's hardware IOC (AH = 1), for every combination of operand classes."""
+        n = 0
+        for name, form, kind, e, lanes, srcs in [f for f in DE_FORMS if f[2] == 'fma']:
+            val, per = VALUES[e], 16 // e
+            words, lines, _ = native_words(form, '--simd-unmasked', '0x1')
+            hw = words[:next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR')) + 1]
+            sw, swl, _ = native_words(form, *self.AFP0, '--simd-unmasked', '0x1')
+            sw = sw[:next(k for k, l in enumerate(swl) if l.startswith('mrs x0, FPSR')) + 1]
+            for combo in itertools.product(('one', 'den', 'zero', 'inf', 'ninf', 'qnan', 'snan'), repeat=3):
+                for pos in sorted({0, lanes - 1}):
+                    ops = [[val['snan']] * per for _ in range(3)]
+                    for r in range(3):
+                        for k in range(lanes): ops[r][k] = val['one']
+                        ops[r][pos] = val[combo[r]]
+                    v = [0] * 32
+                    for r, s in enumerate(srcs): v[16 + s] = self.pack(ops[r], e)
+                    a, b = native_run(hw, v=v, fpcr=6)[0][0] & 1, native_run(sw, v=v)[0][0] & 1
+                    self.assertEqual((a, b), (a, a), (name, pos, combo))
+                    n += 1
+        self.assertGreater(n, 2000)
+
+    def test_fma_code_only_without_afp_and_with_ie_unmasked(self):
+        for name, form, kind, e, lanes, srcs in [f for f in DE_FORMS if f[2] == 'fma']:
+            sanitized = lambda *extra: sum(l.startswith('fcmeq') for l in native_words(form, *extra)[1])   # the three quiet compares
+            self.assertEqual(sanitized(*self.AFP0, '--simd-unmasked', '0x1'), 3, name)
+            self.assertEqual(sanitized('--simd-unmasked', '0x1'), 0, name)          # a host with AFP
+            for mask in ('0x0', '0x3c', '0x20'):
+                self.assertEqual(sanitized(*self.AFP0, '--simd-unmasked', mask), 0, (name, mask))   # IE masked: the plain code (decision D)
+
+    def test_fma_results_are_unchanged_by_the_sanitizing(self):
+        # normal operands: a*b + c exactly (small integers), lane by lane; with a QNaN addend the result is a NaN
+        f32 = lambda f: struct.unpack('<I', struct.pack('<f', f))[0]
+        for name in ('vfmadd231ps', 'vfmadd231ss'):
+            name, form, kind, e, lanes, srcs = next(f for f in DE_FORMS if f[0] == name)
+            words, lines, _ = native_words(form, *self.AFP0, '--simd-unmasked', '0x1')
+            end = next(k for k, l in enumerate(lines) if l.startswith('mov w0, #'))   # the block's exit: the destination is written by then
+            qn = 0x7fc00000
+            v = [0] * 32
+            v[16 + srcs[0]], v[16 + srcs[1]], v[16 + srcs[2]] = self.pack([f32(2.0)] * 4, 4), self.pack([f32(3.0)] * 4, 4), self.pack([f32(1.0), qn, f32(1.0), qn], 4)
+            x, vs, _ = native_run(words[:end], v=v)
+            dst = [vs[17] >> 32 * k & 0xffffffff for k in range(4)]
+            self.assertEqual(struct.unpack('<f', struct.pack('<I', dst[0]))[0], 7.0, name)
+            self.assertFalse(x[0] & 1, name)
+            if lanes == 4:
+                self.assertEqual(struct.unpack('<f', struct.pack('<I', dst[2]))[0], 7.0, name)
+                self.assertTrue(fp_class(dst[1], 4)['nan'] and fp_class(dst[3], 4)['nan'], name)
+
 
 
 def check_exits(test, d, tmp, what):
