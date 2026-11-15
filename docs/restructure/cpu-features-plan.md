@@ -86,8 +86,10 @@ There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profi
   CLWB's, does not make a feature `layout`). That covers AVX, MPX, AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
 - `source`: the SDM section and the decision that set its state. The existing `source` strings stay.
 
-`state` keeps its meaning: `advertised`, `clear` or `dynamic`. A new status, `not-built`, marks a feature with no
-implementation; it can never be advertised.
+`state` keeps its meaning: `advertised`, `clear` or `dynamic`. A new `built` boolean (as built, chunk 1) marks
+whether a feature has an implementation. It defaults to true for advertised and dynamic entries and false for clear
+ones. An entry with `built: false` can never be advertised. An optional feature, built but advertised only per host,
+stays `clear` with an explicit `built: true`.
 
 **Host features determine guest features (owner decisions, November 15).** There is no per-launch selection: no user
 picks guest features, and nothing cherry-picks them. The guest CPU on a host is computed from that host:
@@ -122,8 +124,8 @@ The validator (`cpu_profile.py`, run by the generator and the tests) refuses:
 - an advertised feature whose `requires` is not advertised;
 - a `not-built` feature that is advertised;
 - an x86-64-v3 feature that is not core (OSXSAVE, a `dynamic` bit, is exempt);
-- a `state` that disagrees with the derivation: a feature is `advertised` exactly when it is built and core (optional
-  features are `clear` in the JSON and set per host by the mask);
+- a `state` that disagrees with the derivation. An advertised feature must be core, and a built core feature must be
+  advertised. Optional features are `clear` with `built: true`, and the mask sets them per host;
 - a core feature that requires an optional one;
 - an optional `layout` feature (layout features must be core, so XCR0, leaf 0xD and the XSAVE image are the same on
   every host);
@@ -246,16 +248,17 @@ CPU is the same on every supported host, and these compile-time constants are ex
          "source": "SDM Vol.2A CPUID 07H EBX[29]; owner decision Nov 3"}
 },
 "7.0.ecx": {
-  "9": {"name": "VAES", "state": "not-built", "requires": ["AVX", "AES"],
+  "9": {"name": "VAES", "state": "clear", "built": false, "requires": ["AVX", "AES"],
         "host": {"required": ["aes"]}, "gates": ["shim"], "source": "SDM Vol.2A CPUID 07H ECX[9]"}
 },
-"7.1.eax": {
-  "4": {"name": "AVX_VNNI", "state": "not-built", "requires": ["AVX"], "subleaf": 1,
+"1.eax": {
+  "4": {"name": "AVX_VNNI", "state": "clear", "built": false, "requires": ["AVX"], "subleaf": 1,
         "host": {"required": [["dotprod", "i8mm"]], "speed": ["i8mm"]}, "gates": ["shim"]}
 }
 ```
 
-`[["dotprod", "i8mm"]]` is an any-of group. AVX's entry carries `"layout": true`. The `name` and `source` fields exist
+`[["dotprod", "i8mm"]]` is an any-of group. As built, AVX_VNNI's leaf 7 subleaf 1 entry sits in the 7.0 entry's `fields`
+under the register key `"1.eax"`, so that the generated CPUID tables stay unchanged until a subleaf-1 row is needed. AVX's entry carries `"layout": true`. The `name` and `source` fields exist
 today; the rest are new.
 
 **The host table** is `admission::FEATURES`, extended. It stays in fexc's table order and is checked against every
