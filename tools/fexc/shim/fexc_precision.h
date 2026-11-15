@@ -162,12 +162,13 @@ inline uint32_t SimdCheckMask() {
 //
 // Row 7 (SSE/AVX): per op, a lane is a DE lane when an operand it examines is a denormal and none of them is a NaN (SDM Vol.1 11.5.2:
 // no DE beside IE for a NaN, nor for a negative SQRT operand, an inf*0 product, ZE); the lanes' bits go to a GPR, 0 or nonzero, which the
-// check takes as FPSR bit 7 (`FexcSimdCheckDe`). Several ops of one instruction (DPPS' multiplies, VCVTPS2PH ymm's halves) or'd, DPPS'
-// adds (whose inputs are products) left out: a denormal product needs an underflowing multiply.
+// check takes as FPSR bit 7 (`FexcSimdCheckDe`). Several ops of one instruction (DPPS' multiplies, VCVTPS2PH ymm's halves) or'd. DPPS/DPPD's add
+// levels (inputs: the products, then the sums, an exact denormal product has no UE) are tested in the JIT, inside VFAddV (FexcDenormalStep).
 // Row 8 (x87): the memory operand of an m32/m64 FLD, arithmetic or FCOM/FCOMP is tested on its bits (a register holding a double
 // denormal is an 80-bit normal), none when ST0 is a NaN, and for a memory dividend (FDIVR) none when ST0 is zero. A stack fault drops it
 // in the check as it drops every flag (`FexcX87CheckDe`). Integer forms (FI*), FLD m80 and the register forms have no such operand.
-// Nodes PlaceFmaSanitize made (its quiet compares are not the guest's compares: no DE test of their own)
+// Nodes PlaceFmaSanitize made (its quiet compares are not the guest's compares: no DE test of their own). A global set, cleared at
+// the start of each compile: it assumes compiles do not run concurrently (fexc compiles one request at a time, in one thread).
 inline std::set<const void*> FexcMade;
 struct DeRule {
   enum Kind : uint8_t { None, Bin, Div, Sqrt, Unary, Fma, Pair, Cadd } K = None;
@@ -264,17 +265,24 @@ template<class Emitter> struct SoftDe {
   }
   Ref Sqrt(Ref A) { return Andn(Of(A).Den, IR->_VCMPLTZ(Int, Es, A)); }   // a negative operand is IE
   Ref Fma(Ref A, Ref C, Ref Add, bool Flip) {
-    const Class Ca = Of(A), Cb = Of(C), Cc = Of(Add);
-    Ref M = And(Or(Or(Ca.Den, Cb.Den), Cc.Den), And(And(NotNaN(A), NotNaN(C)), NotNaN(Add)));
     // No DE beside IE: inf * 0, and an infinite product with an infinite addend of the opposite effective sign (inf - inf). A NaN lane
-    // is out already, so an exponent field of all ones is an infinity here.
-    Ref Ones = E == 4 ? IR->_VectorImm(Int, Es, 0xff) : IR->_VDupFromGPR(Int, Es, IR->_Constant(0x7ff));
-    Ref Ea = IR->_VCMPEQ(Int, Es, Ca.Exp, Ones), Eb = IR->_VCMPEQ(Int, Es, Cb.Exp, Ones), Ec = IR->_VCMPEQ(Int, Es, Cc.Exp, Ones);
-    Ref Bad = Or(And(Ea, Cb.Zero), And(Ca.Zero, Eb));
-    Ref Product = Or(Andn(Ea, Cb.Zero), Andn(Eb, Ca.Zero));
+    // is out already (Nn), so an exponent field of all ones is an infinity here. Built operand by operand to keep few registers live
+    // (an ymm FMADDSUB with IE and DE both unmasked spilled with all three classes at once).
+    auto Ones = [&] { return E == 4 ? IR->_VectorImm(Int, Es, 0xff) : IR->_VDupFromGPR(Int, Es, IR->_Constant(0x7ff)); };   // (made where used: short-lived)
+    const Class Ca = Of(A), Cb = Of(C);
+    Ref Ia = IR->_VCMPEQ(Int, Es, Ca.Exp, Ones()), Ib = IR->_VCMPEQ(Int, Es, Cb.Exp, Ones());
+    Ref Bad = Or(And(Ia, Cb.Zero), And(Ca.Zero, Ib));
+    Ref Inf = Or(Ia, Ib);
+    Ref Dn = Or(Ca.Den, Cb.Den);
+    Ref Nn = And(NotNaN(A), NotNaN(C));
+    const Class Cc = Of(Add);
+    Dn = Or(Dn, Cc.Den);
+    Nn = And(Nn, NotNaN(Add));
+    Ref Ic = IR->_VCMPEQ(Int, Es, Cc.Exp, Ones());
     Ref Odd = IR->_VCMPLTZ(Int, Es, IR->_VXor(Int, IR->_VXor(Int, A, C), Add));   // an odd number of the three operands is negative
     if (Flip) Odd = IR->_VNot(Int, Odd);   // (the signs of product and addend differ: odd, or even for the subtracting forms)
-    return Andn(M, Or(Bad, And(And(Product, Ec), Odd)));
+    Ref Product = Andn(Inf, Bad);          // an infinite product: an infinity and a nonzero factor
+    return Andn(And(Dn, Nn), Or(Bad, And(And(Product, Ic), Odd)));
   }
   // The lanes' mask as a GPR, nonzero (the low 32 bits) when some lane is set
   Ref Flag(Ref M) {

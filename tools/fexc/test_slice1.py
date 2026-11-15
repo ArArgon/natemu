@@ -7,9 +7,11 @@ comes from the instruction's architectural class, never from fexc's output. The 
 second compile of just the instructions before it: the code must be identical, so nothing of the cut instruction (or
 of FEX's mis-decode of it) leaks into the block.
 """
+import collections
 import itertools
 import json
 import os
+import random
 import re
 import struct
 import subprocess
@@ -827,14 +829,17 @@ def de_lane(kind, ops, e):
     return any(den)
 
 
-def ie_lane(ops, e, name):
+def ie_lane(ops, e, name, lane=0):
     """x86's IE for a fused multiply-add lane (a, b, addend; SDM Vol.1 Table 14-17): an SNaN; inf * 0 unless the addend is a NaN; an infinite
     product and addend of opposite signs (`name`: vfmadd a*b + c, vfmsub a*b - c, vfnmadd -(a*b) + c, vfnmsub -(a*b) - c)."""
     a, b, c = (fp_class(o, e) for o in ops)
     if a['snan'] or b['snan'] or c['snan']: return True
     if a['nan'] or b['nan'] or c['nan']: return False
     if (a['inf'] and b['zero']) or (a['zero'] and b['inf']): return True
-    pneg, cneg = name.startswith('vfnm'), name.startswith(('vfmsub', 'vfnmsub'))
+    pneg = name.startswith('vfnm')
+    if 'addsub' in name: cneg = lane % 2 == 0      # (vfmaddsub: a*b - c in the even lanes, + c in the odd)
+    elif 'subadd' in name: cneg = lane % 2 == 1    # (vfmsubadd: the reverse)
+    else: cneg = name.startswith(('vfmsub', 'vfnmsub'))
     product_inf = (a['inf'] and not b['zero']) or (b['inf'] and not a['zero'])
     return product_inf and c['inf'] and (a['neg'] ^ b['neg'] ^ pneg) != (c['neg'] ^ cneg)
 
@@ -981,20 +986,65 @@ class AfpDenormal(unittest.TestCase):
         x, _, _ = native_run(words[:i + 1], v=[0] * 18 + [0x3c000001] + [0] * 13)
         self.assertFalse(x[0] & 0x80)
 
+    def first_de_check(self, form, extra, v, fpcr=None, soft=True, buf=b''):
+        """The index of the first check (multiply, add level 1, add level 2 ...) of the form whose check word has IDC, or None: each check is
+        run alone (a hit would branch to its stub), the earlier ones having passed."""
+        words, lines, _ = native_words(form, *(self.AFP0 if soft else ()), *extra)
+        checks = [k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR') and not lines[k + 1].startswith('orr x0, x0, #0x80')]
+        for n, i in enumerate(checks):
+            end = i + 3 if lines[i + 1].startswith('and w1, w') and lines[i + 1].endswith('#0x80') else i + 1
+            if native_run(words[:end], v=v, fpcr=fpcr, buf=buf)[0][0] & 0x80: return n
+        return None
+
+    def test_dpps_and_dppd_add_levels_flag_denormal_products_and_sums_as_the_m4_does(self):
+        rnd = random.Random(7)
+        tiny32, tiny64 = 0x1c800000, 0x1f70000000000000   # 2^-70 and 2^-520: their square is an exact denormal, no UE
+        hits = collections.Counter()
+        for name, form, e, per in (('dpps ff', '660f3a40caff', 4, 4), ('dpps 71', '660f3a40ca71', 4, 4), ('dpps f1', '660f3a40caf1', 4, 4),
+                                   ('dpps 3f', '660f3a40ca3f', 4, 4), ('dppd 33', '660f3a41ca33', 8, 2), ('dppd 31', '660f3a41ca31', 8, 2),
+                                   ('dppd 3f', '660f3a41ca3f', 8, 2), ('vdpps 71', 'c4e36940cb71', 4, 4), ('vdppd ff', 'c4e36941cbff', 8, 2)):
+            val = VALUES[e]
+            pool = [val['one'], val['one'], val['one'], tiny32 if e == 4 else tiny64, val['den'], val['zero'], val['inf'], val['qnan'], val['neg'] if 'neg' in val else val['ninf']]
+            cases = [([tiny32 if e == 4 else tiny64] + [val['one']] * (per - 1), [tiny32 if e == 4 else tiny64] + [0] * (per - 1))]   # the reviewer's: product 2^-140
+            if e == 4: cases.append(([0x00800001, 0x80800000, 0, 0], [0x3f800000, 0x3f800000, 0, 0]))   # normal products whose sum is an exact denormal: level 2's input
+            cases += [([rnd.choice(pool) for _ in range(per)], [rnd.choice(pool) for _ in range(per)]) for _ in range(150)]
+            for a, b in cases:
+                v = [0] * 32
+                v[17], v[18] = self.pack(a, e), self.pack(b, e)
+                if form.startswith('c4'): v[17], v[18], v[19] = 0, self.pack(b, e), self.pack(a, e)   # vdpps xmm1, xmm2, xmm3: xmm2 and xmm3 are read
+                m4 = self.first_de_check(form, ('--simd-unmasked', '0x2'), v, fpcr=6, soft=False)
+                sw = self.first_de_check(form, ('--simd-unmasked', '0x2'), v)
+                self.assertEqual(sw, m4, (name, [hex(x) for x in a], [hex(x) for x in b]))
+                hits[(name, m4)] += 1
+        # VDPPS ymm: the upper halves of ymm2 and ymm3 are in the guest state (0xe0, 0xf0), each half in turn through its own levels
+        pool = [0x3f800000, 0x3f800000, tiny32, 1, 0, 0x7fc00000, 0x00800001, 0x80800000]
+        for imm in ('ff', '71', 'f3'):
+            for _ in range(120):
+                lo = [[rnd.choice(pool) for _ in range(4)] for _ in range(4)]
+                v = [0] * 32
+                v[18], v[19] = self.pack(lo[0], 4), self.pack(lo[1], 4)
+                buf = bytearray(8192)
+                buf[0xe0:0x100] = struct.pack('<8I', *lo[2], *lo[3])
+                form = f'c4e36d40cb{imm}'
+                m4 = self.first_de_check(form, ('--simd-unmasked', '0x2'), v, fpcr=6, soft=False, buf=bytes(buf))
+                self.assertEqual(self.first_de_check(form, ('--simd-unmasked', '0x2'), v, buf=bytes(buf)), m4, (imm, lo))
+                hits[('vdpps ymm', m4)] += 1
+        self.assertTrue(hits[('vdpps ymm', None)] and any(hits[('vdpps ymm', k)] for k in range(1, 12)), hits)
+        for name in ('dpps ff', 'dppd 33'):
+            self.assertTrue(all(hits[(name, k)] for k in (None, 0, 1)), (name, hits))
+        self.assertTrue(hits[('dpps ff', 2)], hits)   # a denormal sum of normal products reaches the second level
+
     def test_dpps_flags_its_multiplies_and_checks_each_step(self):
         words, lines, spills = native_words('660f3a40caff', *self.AFP0, '--simd-unmasked', '0x2')
         self.assertEqual(spills, 0)
-        self.assertEqual(soft_de_words(lines), 1)   # the multiply's check carries the flag; the add levels' do not (their inputs are products)
-        self.assertEqual(sum(l.startswith('mrs x0, FPSR') for l in lines), 3)
-        i = next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR'))
+        self.assertEqual(soft_de_words(lines), 1)   # the multiply's check carries the flag; the add levels set IDC in FPSR themselves
+        self.assertEqual(sum(l.startswith('mrs x0, FPSR') for l in lines), 5)   # three checks and two IDC updates
         for d, want in ((1, True), (0x3f800000, False)):
-            x, _, _ = native_run(words[:i + 3], v=[0] * 17 + [self.pack([d, 0x3f800000, 0x3f800000, 0x3f800000], 4), self.pack([0x3f800000] * 4, 4)] + [0] * 13)
-            self.assertEqual(bool(x[0] & 0x80), want, d)
+            v = [0] * 17 + [self.pack([d, 0x3f800000, 0x3f800000, 0x3f800000], 4), self.pack([0x3f800000] * 4, 4)] + [0] * 13
+            self.assertEqual(self.first_de_check('660f3a40caff', ('--simd-unmasked', '0x2'), v) is not None, want, d)
         # a denormal in an element the mask leaves out is not examined
-        words, lines, _ = native_words('660f3a40ca7f', *self.AFP0, '--simd-unmasked', '0x2')
-        i = next(k for k, l in enumerate(lines) if l.startswith('mrs x0, FPSR'))
-        x, _, _ = native_run(words[:i + 3], v=[0] * 17 + [self.pack([0x3f800000] * 3 + [1], 4), self.pack([0x3f800000] * 4, 4)] + [0] * 13)
-        self.assertFalse(x[0] & 0x80)
+        v = [0] * 17 + [self.pack([0x3f800000] * 3 + [1], 4), self.pack([0x3f800000] * 4, 4)] + [0] * 13
+        self.assertIsNone(self.first_de_check('660f3a40ca7f', ('--simd-unmasked', '0x2'), v))
 
     # row 8
     X87 = [('fld m32', 'd903', 4, 'fld'), ('fld m64', 'dd03', 8, 'fld'), ('fadd m32', 'd803', 4, 'bin'), ('fadd m64', 'dc03', 8, 'bin'),
@@ -1077,7 +1127,7 @@ class AfpDenormal(unittest.TestCase):
                     for r in range(3):
                         for k in range(lanes): ops[r][k] = val['one']
                         ops[r][pos] = val[combo[r]]
-                    want = any(ie_lane([ops[r][k] for r in range(3)], e, name) for k in range(lanes))
+                    want = any(ie_lane([ops[r][k] for r in range(3)], e, name, k) for k in range(lanes))
                     v = [0] * 32
                     for r, s in enumerate(srcs): v[16 + s] = self.pack(ops[r], e)
                     x, vs, _ = native_run(words[:i + 1], v=v)
