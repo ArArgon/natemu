@@ -29,7 +29,15 @@ STATES = ('advertised', 'clear', 'dynamic')      # 'not built' is `built: false`
 HOST_CLASSES = ('required', 'exactness', 'speed')
 CONSUMERS = ('shim', 'system', 'resident')           # who may test a feature's generated constant (plan sec. 2.3)
 FIELD_KEYS = {'name', 'state', 'built', 'requires', 'host', 'msrs', 'cr4', 'subleaf', 'resident', 'gates', 'layout', 'source',
-              'rule'}
+              'rule', 'exceptions', 'simd_fp', 'tests', 'baseline'}
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+# `exceptions` (plan sec. 2.1): the SDM exception classes of the feature's instructions. `none`: no instruction of its own
+# (paging, MSR or platform behaviour); `GP`: general-purpose instructions (their own Exceptions sections); `SYS`: system or
+# state-management instructions (privilege, #UD gating, memory operands); `X87`; `MMX`; `SSE Type n` (legacy SIMD, SDM Vol.2A
+# 2.4-2.8) and `VEX Type n` (VEX-encoded: Vol.2A 2.8).
+EXCEPTION_CLASS = re.compile(r'none|GP|SYS|X87|MMX|(?:SSE|VEX) Type [1-9]\d?')
+# The corpora that deliver and judge #XM (an unmasked SIMD floating-point exception, before the destination is written).
+XM_TESTS = frozenset({'tools/run_i5c.py'})
 # x86-64-v1..v3 (x86-64 psABI, "x86-64 Microarchitecture Levels"), by catalogue name; the baseline's own SYSCALL and the
 # dynamic OSXSAVE are not capability bits and are left out.
 V3 = ('CMOV', 'CX8', 'FPU', 'FXSR', 'MMX', 'SSE', 'SSE2', 'CX16', 'LAHF', 'POPCNT', 'SSE3', 'SSE4_1', 'SSE4_2', 'SSSE3', 'AVX',
@@ -285,6 +293,20 @@ class Profile:
                 elif st == 'advertised' and cat[x][0]['state'] == 'clear': err(f'{at}: requires {x}, which is not advertised')
             for g in f.get('gates', []):
                 if g not in CONSUMERS: err(f'{at}: gates names {g!r}, not one of {CONSUMERS}')
+            exc, tests = f.get('exceptions'), f.get('tests', [])
+            if exc is None:
+                if f['built']: err(f'{at}: built but has no `exceptions` (the SDM exception class of its instructions)')
+            elif not isinstance(exc, list) or not exc or not all(isinstance(c, str) and EXCEPTION_CLASS.fullmatch(c) for c in exc):
+                err(f'{at}: exceptions {exc!r}: a list of {EXCEPTION_CLASS.pattern}')
+            elif 'none' in exc and len(exc) > 1: err(f'{at}: exceptions: `none` with other classes')
+            if f['built'] and not isinstance(f.get('simd_fp'), bool): err(f'{at}: built but `simd_fp` is not true or false')
+            if not isinstance(tests, list) or not all(isinstance(t, str) and (ROOT / t).is_file() for t in tests):
+                err(f'{at}: tests {tests!r}: a list of existing files')
+            elif f['built'] and exc not in (None, ['none']) and not tests: err(f'{at}: built, but lists no fault tests for its exception class {exc}')
+            if f.get('simd_fp') is True:
+                if not (isinstance(tests, list) and XM_TESTS & set(tests)): err(f'{at}: simd_fp but no #XM-covering test ({sorted(XM_TESTS)})')
+                if not any(c.startswith(('SSE', 'VEX')) for c in exc or []): err(f'{at}: simd_fp but no SSE or VEX exception class')
+            if 'baseline' in f and (f['baseline'] is not True or st != 'advertised'): err(f'{at}: baseline is true on an advertised feature only')
             if f['remote'] and (f['leaf'], f['sub']) in self.leaves:
                 err(f'{at}: stored under another subleaf\'s register key, but that subleaf has an entry: move it there')
             if 'subleaf' in f and f['subleaf'] != f['sub']: err(f'{at}: subleaf {f["subleaf"]} but it lives in subleaf {f["sub"]}')
@@ -320,6 +342,20 @@ class Profile:
                       + [0])
             if _i(l7['eax']) != top: err(f'leaf 7 max subleaf (7.0 EAX = {_i(l7["eax"])}) != highest advertised subleaf {top}')
         return out
+
+    # ---- generated gate constants (plan sec. 2.3) -----------------------------------------------------------------
+    def gated(self, *consumers):
+        """The catalogue features whose `gates` name one of `consumers`, in catalogue order."""
+        return [f[0] for f in self.features().values() if set(f[0].get('gates', [])) & set(consumers)]
+
+    def startup_names(self):
+        """Advertised capability bits beyond x86-64-v3 and the platform baseline, lower case: the startup line's guest map."""
+        return sorted(n.lower() for n, f in self.features().items() if f[0]['state'] == 'advertised' and n not in V3 and not f[0].get('baseline'))
+
+    def host_required(self):
+        """The Arm features (fexc names) the built guest features require, sorted; an any-of group contributes every member."""
+        return sorted({a for f in self.features().values() if f[0]['built'] for i in f[0].get('host', {}).get('required', [])
+                       for a in ([i] if isinstance(i, str) else i)})
 
     # ---- validation -----------------------------------------------------------------------------------------------
     def problems(self):
