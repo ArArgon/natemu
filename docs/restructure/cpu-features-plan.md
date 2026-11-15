@@ -157,6 +157,37 @@ The probe's record also holds the exactness facts the M2 work will need, such as
 one stderr line naming the host's missing optional features and what that changes. There is no separate report
 command.
 
+### 2.2a Host feature classes: what each means and what the plan does for it
+
+Every Arm feature (and each non-ID-register host property) gets exactly one class in `admission::FEATURES`. The class
+says how it is detected, what happens on a host without it, and what keeps it honest.
+
+| Class | Meaning | Members (floor: M2 ∩ M4) | Without it | Kept honest by |
+| --- | --- | --- | --- | --- |
+| **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP; non-register: Apple TSO bit, the interrupt-controller API (macOS version) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
+| **exactness** | runs without it, but some guest-visible result differs from x86 | AFP | runs; startup line names the difference; tests that depend on it are tagged with it | M2 work (after this plan): tagged test expectations; the AFP-dependent FPCR bits and flag mapping made conditional |
+| **speed** | a fallback exists; only performance changes | FlagM2, FCMA, FRINTTS, ECV, I8MM (for AVX-VNNI); above the floor RPRES (off by policy); neither chip CSSC, MOPS | fexc gets `name=0`; generated code takes FEX's fallback | the fallback gate (below) |
+| **option** | used only when a command-line option asks for it | SB (`--speculation-barriers`), CSV3 (RDCL_NO with that option) | the option is refused (SB) or the bit stays clear (CSV3) | existing refusal; probe reads both from the vCPU's registers |
+| **guest-optional** | backs an optional guest feature, advertised only where present (§3) | none built; first candidate WAITPKG on WFxT (M4 only) | the guest feature is absent on that host | the host-derived mask's tests (chunk 5) |
+| **off by policy** | present, but not used | LRCPC, LRCPC2 (hardware TSO makes them pointless), WFxT and RPRES until a feature needs them | nothing | the reply cross-check (FEATURES' policy matches fexc's table) |
+| **unused** | nothing in natemu or fexc uses it | SME/SME2, synchronous FP exceptions (precise exceptions are done in software by design), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
+
+**The fallback gate (new, chunk 2).** The speed class is the one most likely to break unnoticed: every machine that
+runs the suite today has all of it. On the M4, the standing corpora are compiled and run with each speed feature
+forced off in turn (`--feature NAME=0`, which the host already sends for missing features). The rules:
+- admission must accept every object;
+- results must equal the all-on run;
+- the M1-like combination (I8MM=0) and the M2-like one (AFP=0, the exactness class, results compared only outside the
+  AFP-tagged cases) run as two extra rows.
+
+This is the only way to cover an M1 without owning one.
+
+**Non-register host properties** are recorded in the same table with a probe of their own:
+- the TSO bit is written and read back;
+- the interrupt-controller API is a macOS version check;
+- the IPA size is already checked against the backing at VM creation, with a clear error;
+- the counter frequency: the inline-TSC fast path is used only at 24 MHz, else the transaction path; speed class.
+
 ### 2.3 Generated gate constants
 
 The generator writes two files from the JSON:
@@ -228,7 +259,7 @@ extent and the guest end fields.
 | --- | --- | --- |
 | 0. Stream | Record the two request streams at 333b7b6, with the fexc SHA-256 beside each; the streams fall under the disk-hygiene rule (several GB each); make the replay a documented tool (stream path, body rewrite hook) | the replay of each stream against today's fexc is identical (a self-check) |
 | 1. Catalogue | Per-bit entries extended (`requires`, `host`, `msrs`, `cr4`, `subleaf`, `resident`, `gates`, `layout`, `not-built`); the derived core/optional classification; the validator | `cpu_profile.rs` regenerates identically; every advertised feature classifies as core; negative controls refused: a missing requirement, an advertised `not-built` feature, an x86-64-v3 feature made non-core by a required Arm feature above the floor, an optional layout feature |
-| 2. Host table and probe | Policy, `floor` and encoding-class fields in FEATURES; the floor from the appendix (sysctl, recorded) confirmed by the vCPU ID registers natemu reads, on the M2; the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM, LSE or a floor feature simulated missing; on the M4, CSV3/SB from registers equal sysctl's; on the M2, the probe passes and names AFP as an exactness difference |
+| 2. Host table and probe | Policy, `floor` and encoding-class fields in FEATURES; the floor from the appendix (sysctl, recorded) confirmed by the vCPU ID registers natemu reads, on the M2; the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM, LSE or a floor feature simulated missing; on the M4, CSV3/SB from registers equal sysctl's; on the M2, the probe passes and names AFP as an exactness difference; the fallback gate (§2.2a) on the M4 |
 | 3. Gate constants | Generated `GF_*` for C++ and Rust; gated shim rows; the `x86_avx` rule; `system.rs` checks; cross-check test | replay identical on both streams and the standing corpora; a scratch build with SHA and ADX cleared in the JSON makes their forms #UD in fexc and the host decode alike (the old hand cut, now derived; not committed); negative control: a scratch optional entry with a deliberately missing shim gate fails the cross-check |
 | 4. Records | Contracts and README; the adding-a-feature checklist; the decision record's row | review |
 | 5. (with the first optional feature) Host-derived mask | Superset tables plus mask in `cache::Control`, computed from the probe; `--guest-features`; the vCPU-identity assertion | replay with the body rewrite identical; judge vectors identical for the all-core mask; a host lacking the optional feature's Arm feature answers per the judge without it |
@@ -249,6 +280,29 @@ needs (AES, PMULL, dotprod or i8mm) are expected in the M2 floor, to be confirme
 - AVX-VNNI needs steps 1, 3 and 4 plus leaf 7 subleaf 1.
 
 ERMS/FSRM is a hint with no Arm feature behind it. RPRES is a host code-generation policy, not a guest feature.
+
+### 4a. What natemu assumes today without checking (audit, November 15)
+
+These are host properties the code relies on with no check before this plan. Each one gets its class and a check.
+
+| Assumption | Where | Class | Action |
+| --- | --- | --- | --- |
+| LSE2 alignment behaviour for split locks | resident split-lock handling, code-object contract | required | add to the probe (chunk 2) |
+| AFP: FPCR.AH/NEP/FIZ, Arm IDC = x86 DE, Arm UFC judged after rounding, the x87 first-operand NaN rule | `execution::fpcr`, `mxcsr_flags`, the tiny-result checks, x87 patches; FP tests | exactness | startup line now; tagging and conditional code in the M2 work |
+| fexc's table defaults are the M4's view, and the off paths (FlagM2, FCMA, FRINTTS, ECV, I8MM, DotProd, CRC32, AES, SHA, PMULL) are never exercised | `fexc.cpp` FeatureTable | speed or required | fallback gate (§2.2a); required ones have no off path by definition, so the probe refuses instead |
+| Admission accepts only the encodings the M4 configuration emits (LSE atomics; CNTVCT or CNTVCTSS; the no-CSSC POPCNT) | `admission/structure.rs` | follows the class of each feature | fallback gate proves admission accepts every fallback; a new speed feature must list its encoding class |
+| The interrupt-controller API exists | vm.rs (GIC calls) | required | macOS version in the probe |
+| The resident is built with `+lse` | `.cargo/config.toml` | required | covered by LSE in the probe |
+
+Nothing else was found: the host binaries and fexc are built for the default Apple target, which runs on the M1, and
+the timer rate and IPA size are already checked.
+
+**Answer to the owner's question ("does natemu's assumption demand optional features?"):**
+- **AFP:** yes, as exactness only. Natemu runs without it, but its floating-point contracts and tests assume it.
+- **LSE2:** yes, as a hard need. It is in every chip's floor, so it becomes a stated requirement rather than an
+  optional feature.
+
+No other optional feature is demanded.
 
 ## 5. Deferred
 
