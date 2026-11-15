@@ -3507,7 +3507,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
 }
 
 /// I5c: a floating-point exception check stub (the state before its instruction is at the stub, as at an access site):
-/// an SSE/AVX instruction's unmasked SIMD exception (#XM or #UD, its operation's flags in FPSR), an x87 instruction's
+/// an SSE/AVX instruction's unmasked SIMD exception (#XM or #UD, its operation's flags in the check word x0: FPSR), an x87 instruction's
 /// unmasked exception that leaves its operands unaltered (its check word in w0: only the flags are set, and the
 /// instruction is done, `width` its length; #MF waits for the next waiting instruction), or a waiting instruction with an
 /// x87 exception pending (#MF with CR0.NE, else the stop `unsupported_ferr`: [`x87::pending`]).
@@ -3516,7 +3516,9 @@ fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
     let before = s.cpu.mxcsr;
     bank_at(&mut s, f, b, site);
     let e = match site.kind {
-        object::kind::SIMD => sse::exception(&mut s.cpu, before, f.fpsr),
+        // The check word (x0, as an x87 stub's): FPSR, and without AFP with DE unmasked also FPSR bit 7 (IDC) when the software test of
+        // the instruction's operands found a denormal (AFP fallback 3b, row 7). Where the hardware raises IDC the word is FPSR itself.
+        object::kind::SIMD => sse::exception(&mut s.cpu, before, f.x[0]),
         object::kind::X87 => {
             x87::exception(s.cpu.fcw, f.x[0]);
             s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(site.width));

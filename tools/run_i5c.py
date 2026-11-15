@@ -97,6 +97,15 @@ FORMS = [
     # Several elements (SDM Vol.1 11.5.3.2, Figure 11-9): every element's flags are ORed; an unmasked pre-computation one in
     # any element leaves only the pre-computation flags.
     ('addps-ie-oe', 'addps xmm1, xmm2', {1: lanes(INF, MAXF, ONE, ONE), 2: lanes(NINF, MAXF, ZERO, ZERO)}, IE | OE | PE, None, 1),
+    # AFP fallback chunk 3b (rows 7 and 8): the DE precedence (none beside a NaN operand, ZE or IE), and lanes an instruction does not examine.
+    # Each runs masked, with every other exception unmasked (DE among them: no fault) and, where it raises one, with it unmasked.
+    # (The cases that do raise DE are in `simd_cases`: with DE unmasked alone, as the masked flag is decision B of the AFP fallback.)
+    ('addss-qnan-de', 'addss xmm1, xmm2', {1: lanes(QN), 2: lanes(DEN)}, 0, None, 1),
+    ('addss-snan-de', 'addss xmm1, xmm2', {1: lanes(SN), 2: lanes(DEN)}, IE, None, 1),
+    ('divss-de-by-zero', 'divss xmm1, xmm2', {1: lanes(DEN), 2: lanes(ZERO)}, ZE, None, 1),
+    ('sqrtss-negative-denormal', 'sqrtss xmm1, xmm2', {1: lanes(ONE), 2: lanes(0x80000001)}, IE, None, 1),
+    ('addss-upper-lanes-denormal', 'addss xmm1, xmm2', {1: lanes(ONE, DEN, DEN, DEN), 2: lanes(ONE, DEN, DEN, DEN)}, 0, None, 1),
+    ('cvtps2pd-upper-lanes-denormal', 'cvtps2pd xmm1, xmm2', {1: (0, 0), 2: lanes(ONE, ONE, DEN, DEN)}, 0, None, 1),
     ('addps-de-oe', 'addps xmm1, xmm2', {1: lanes(DEN, MAXF, ONE, ONE), 2: lanes(ONE, MAXF, ZERO, ZERO)}, DE | OE | PE, None, 1),
     ('mulps-figure-11-9', 'mulps xmm1, xmm2', {1: lanes(DEN, ONE, MAXF, f32(1.5)), 2: lanes(ONE, ONE, TWO, DEN)}, DE | OE | UE | PE, None, 1),
     ('addpd-ze-free-pe', 'addpd xmm1, xmm2', {1: (f64(1.0), 0x7ff0000000000001), 2: (f64(2.0 ** -60), f64(1.0))}, IE | PE, None, 1),
@@ -211,6 +220,33 @@ def simd_cases():
         out.append(one(f'rv-ph-upper-{tag}', 'vcvtps2ph xmm1, ymm2, 4', {1: lanes(ONE), 2: lanes(ONE, ONE, ONE, ONE)}, mx, fl, want, 1,
                        prelude=['vinsertf128 ymm2, ymm2, xmmword ptr [rdi + 0x80], 1'], extra=[f'memory {D + 0x280:#x} {struct.pack("<IIII", *up).hex()}', 'xcr0 7']))
     out.append(one('rv-fma-inf0-qnan-ie', 'vfmadd231ss xmm1, xmm2, xmm3', {1: lanes(QN), 2: lanes(INF), 3: lanes(0)}, MX & ~(IE << 7), 0, None, 1))
+    # AFP fallback chunk 3b (row 7): DE unmasked alone: a denormal in one HADD pair beside a QNaN pair, in the upper lane of a vector, as an
+    # FMA's addend; none for the QNaN and denormal operands of one FMA.
+    NODE = MX & ~(DE << 7)
+    QN64, INF64 = 0x7ff8000000000000, 0x7ff0000000000000
+    out.append(one('rv-haddps-de-pair', 'haddps xmm1, xmm2', {1: lanes(ONE, ONE, DEN, ONE), 2: lanes(ONE, ONE, ONE, ONE)}, NODE, DE, 19, 1))
+    out.append(one('rv-haddps-qnan-pair-beside-de-pair', 'haddps xmm1, xmm2', {1: lanes(QN, ONE, DEN, ONE), 2: lanes(ONE, ONE, ONE, ONE)}, NODE, DE, 19, 1))
+    out.append(one('rv-haddps-qnan-and-denormal-in-a-pair', 'haddps xmm1, xmm2', {1: lanes(QN, DEN, ONE, ONE), 2: lanes(ONE, ONE, ONE, ONE)}, NODE, 0, None, 1))
+    out.append(one('rv-vaddps-de-high-lane', 'vaddps xmm1, xmm3, xmm2', {1: lanes(ONE), 2: lanes(ONE, ONE, ONE, DEN), 3: lanes(ONE, ONE, ONE, ONE)}, NODE, DE, 19, 1))
+    out.append(one('rv-vfmadd231ss-de-addend', 'vfmadd231ss xmm1, xmm2, xmm3', {1: lanes(DEN), 2: lanes(ONE), 3: lanes(ONE)}, NODE, DE, 19, 1))
+    out.append(one('rv-vfmadd231ss-qnan-and-denormal', 'vfmadd231ss xmm1, xmm2, xmm3', {1: lanes(DEN), 2: lanes(QN), 3: lanes(ONE)}, NODE, 0, None, 1))
+    out.append(one('rv-vfmsub231ps-inf-minus-inf-and-denormal-ie-not-de', 'vfmsub231ps xmm1, xmm2, xmm3',
+                   {1: lanes(INF, ONE, ONE, ONE), 2: lanes(INF, ONE, ONE, ONE), 3: lanes(DEN, ONE, ONE, ONE)}, MX & ~(DE << 7), IE, None, 1))   # IE (masked) beats DE
+    out.append(one('rv-sqrtps-de-lane2', 'sqrtps xmm1, xmm2', {1: (0, 0), 2: lanes(ONE, ONE, DEN, ONE)}, NODE, DE, 19, 1))
+    out.append(one('rv-cvtpd2ps-de-high-lane', 'cvtpd2ps xmm1, xmm2', {1: (0, 0), 2: (f64(1.0), 1)}, NODE, DE, 19, 1))
+    out.append(one('rv-cmpps-de-lane1', 'cmpltps xmm1, xmm2', {1: lanes(ONE, DEN, ONE, ONE), 2: lanes(ONE, ONE, ONE, ONE)}, NODE, DE, 19, 1))
+    out.append(one('rv-minpd-qnan-and-denormal-ie-not-de', 'minpd xmm1, xmm2', {1: (QN64, 1), 2: (1, QN64)}, NODE, IE, None, 1))   # a QNaN is IE (masked) in MIN/MAX: no DE
+    # AFP fallback chunk 3b (row 10): with IE unmasked, inf * 0 + QNaN raises nothing (vector, negated forms and double: a lane each), the
+    # real invalid cases still do: inf * 0 + a number, an SNaN multiplicand beside a QNaN addend, inf - inf (flags IE).
+    NOIE = MX & ~(IE << 7)
+    out.append(one('rv-fma-inf0-qnan-ie-ps', 'vfmadd231ps xmm1, xmm2, xmm3', {1: lanes(QN, ONE, QN, ONE), 2: lanes(INF, ONE, ZERO, ONE), 3: lanes(ZERO, ONE, INF, ONE)}, NOIE, 0, None, 1))
+    out.append(one('rv-fma-inf0-qnan-ie-pd-nmsub', 'vfnmsub231pd xmm1, xmm2, xmm3', {1: (QN64, QN64), 2: (INF64, 0), 3: (0, INF64)}, NOIE, 0, None, 1))
+    out.append(one('rv-fma-inf0-qnan-ie-sd-nmadd', 'vfnmadd231sd xmm1, xmm2, xmm3', {1: (QN64, 0), 2: (0, 0), 3: (INF64, 0)}, NOIE, 0, None, 1))
+    out.append(one('rv-fma-inf0-number-ie', 'vfmadd231ss xmm1, xmm2, xmm3', {1: lanes(ONE), 2: lanes(INF), 3: lanes(0)}, NOIE, IE, 19, 1))
+    out.append(one('rv-fma-inf0-number-ie-ps-lane3', 'vfmadd231ps xmm1, xmm2, xmm3', {1: lanes(QN, QN, QN, ONE), 2: lanes(INF, INF, INF, INF), 3: lanes(0, 0, 0, 0)}, NOIE, IE, 19, 1))
+    out.append(one('rv-fma-snan-multiplicand-qnan-addend-ie', 'vfmadd231ss xmm1, xmm2, xmm3', {1: lanes(QN), 2: lanes(SN), 3: lanes(ONE)}, NOIE, IE, 19, 1))
+    out.append(one('rv-fma-inf-minus-inf-ie', 'vfmsub231ss xmm1, xmm2, xmm3', {1: lanes(INF), 2: lanes(INF), 3: lanes(ONE)}, NOIE, IE, 19, 1))
+    out.append(one('rv-fma-qnan-addend-normal-multiplicands-ie', 'vfmadd231ps xmm1, xmm2, xmm3', {1: lanes(QN, QN, QN, QN), 2: lanes(TWO, TWO, TWO, TWO), 3: lanes(TWO, TWO, TWO, TWO)}, NOIE, 0, None, 1))
     out.append(one('rv-ph2ps-denormal-dm', 'vcvtph2ps xmm1, xmm2', {1: lanes(ONE), 2: lanes(0x3c000001)}, MX & ~(DE << 7), 0, None, 1))
     out.append(one('rv-ps2ph-denormal-pm', 'vcvtps2ph xmm1, xmm2, 4', {1: lanes(ONE), 2: lanes(1, ONE, ONE, ONE)}, MX & ~(PE << 7), DE | UE | PE, 19, 1))
     out.append(one('rv-ps2ph-denormal-dm', 'vcvtps2ph xmm1, xmm2, 4', {1: lanes(ONE), 2: lanes(1, ONE, ONE, ONE)}, MX & ~(DE << 7), DE, 19, 1))
@@ -350,6 +386,26 @@ def x87_cases():
     # FLD m32 of a denormal with DM unmasked: no push, DE.
     out.append(case('fld-m32-denormal-de', ['fninit', FLDCW, 'fld dword ptr [rdi + 0x100]', 'fwait'], cw(0x37d) + data(1), ('fault', 16),
                     check=expect(fsw=0x8082, top=0, ftw=0)))
+    # AFP fallback chunk 3b (row 8): DE of a memory operand in arithmetic and FCOM, with x87's precedence (none beside a NaN in ST0, or a
+    # memory dividend over a zero ST0, which is ZE). The m32 forms are not here: the M4 raises DE for them beside a NaN (its conversion
+    # of a single to a double is an op of its own), x86 does not. A denormal in a register is no DE (not here: the M4 raises it).
+    DM, DENBIT, QN64 = 0x37d, 1, 0x7ff8000000000000
+    for name, ins, setup in (('fadd', 'fadd qword ptr [rdi + 0x100]', ['fld1']), ('fsub', 'fsub qword ptr [rdi + 0x100]', ['fld1']),
+                             ('fsubr', 'fsubr qword ptr [rdi + 0x100]', ['fld1']), ('fmul', 'fmul qword ptr [rdi + 0x100]', ['fld1']),
+                             ('fdiv', 'fdiv qword ptr [rdi + 0x100]', ['fldz']), ('fdivr', 'fdivr qword ptr [rdi + 0x100]', ['fld1']),
+                             ('fcom', 'fcom qword ptr [rdi + 0x100]', ['fld1']), ('fcomp', 'fcomp qword ptr [rdi + 0x100]', ['fld1'])):
+        st0 = f64(0.0) if setup == ['fldz'] else f64(1.0)
+        out.append(case(f'{name}-m64-denormal-de', ['fninit', FLDCW] + setup + [ins, 'fwait'], cw(DM) + data(DENBIT), ('fault', 16),
+                        check=expect(fsw=0x8082 | 7 << 11, top=7, st={7: st0})))   # nothing written, no pop: TOP and ST0 as before
+    for name, ins in (('fadd', 'fadd qword ptr [rdi + 0x100]'), ('fdiv', 'fdiv qword ptr [rdi + 0x100]'), ('fmul', 'fmul qword ptr [rdi + 0x100]')):
+        out.append(case(f'{name}-m64-denormal-st0-qnan-no-de', ['fninit', FLDCW, 'fld qword ptr [rdi + 0x108]', ins, 'fwait'], cw(DM) + data(DENBIT, QN64), None,
+                        check=expect(fsw=7 << 11, top=7, st={7: QN64})))   # the QNaN comes back, nothing raised
+    out.append(case('fcom-m64-denormal-st0-qnan-ie-not-de', ['fninit', FLDCW, 'fld qword ptr [rdi + 0x108]', 'fcom qword ptr [rdi + 0x100]', 'fwait'], cw(DM) + data(DENBIT, QN64), None,
+                    check=expect(fsw=0x0001 | 0x4500 | 7 << 11, top=7)))   # IE (masked) for the QNaN, C3 C2 C0; no DE
+    out.append(case('fdivr-m64-denormal-st0-zero-ze-not-de', ['fninit', FLDCW, 'fldz', 'fdivr qword ptr [rdi + 0x100]', 'fwait'], cw(DM) + data(DENBIT), None,
+                    check=expect(fsw=0x0004 | 7 << 11, top=7, st={7: f64(float('inf'))})))   # den / 0: ZE (masked), the infinity stored
+    out.append(case('fld-m64-denormal-stack-overflow-ie-not-de', ['fninit', FLDCW] + ['fld1'] * 8 + ['fld qword ptr [rdi + 0x100]', 'fwait'], cw(0x37c) + data(DENBIT), ('fault', 16),
+                    check=expect(fsw=0x82c1, top=0, ftw=0xff)))   # a stack fault (IE unmasked) drops the DE
     # CVTPI2PD xmm, m64 takes no x87 exception (SDM CVTPI2PD); its mm form does.
     out.append(case('cvtpi2pd-m64-no-mf', zdiv + ['cvtpi2pd xmm1, qword ptr [rdi + 0x100]', 'fwait'], ['sse 1'] + cw(ZM), ('fault', 16)))
     out.append(case('cvtpi2pd-mm-mf', zdiv + ['cvtpi2pd xmm1, mm0'], ['sse 1'] + cw(ZM), ('fault', 16)))

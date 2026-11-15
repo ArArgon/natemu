@@ -167,8 +167,12 @@ void Arm64JITCore::FexcX87End() {
 //   #MF    (at a waiting instruction's start) ldrb w0, [x28, #ie]; ldrb w1, [x28, #pe]; orr w0, w0, w1, lsl #4;
 //          ldr w1, [x28, #exceptions]; orr w0, w0, w1; movz w1, #M; and w0, w0, w1; cbnz w0, P
 // ---------------------------------------------------------------------------------------------
-void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask) {
+void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask, const ARMEmitter::Register* De) {
   mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  if (De) {   // AFP fallback chunk 3b, row 7: the software denormal flag (nonzero low word) is FPSR bit 7 (IDC) of the check word, which the stub reads (x0)
+    and_(ARMEmitter::Size::i32Bit, TMP2, *De, 0x80);
+    orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
+  }
   movz(ARMEmitter::Size::i32Bit, TMP2, Mask);
   and_(ARMEmitter::Size::i32Bit, TMP2, TMP1, TMP2);
   cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP2, FexcStub(FEXC_SITE_SIMD, false));
@@ -179,6 +183,11 @@ void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask) {
 }
 DEF_OP(FexcSimdCheck) {
   FexcSimdCheckWords(IROp->C<IR::IROp_FexcSimdCheck>()->Mask);
+}
+DEF_OP(FexcSimdCheckDe) {
+  const auto Op = IROp->C<IR::IROp_FexcSimdCheckDe>();
+  const auto De = GetReg(Op->De);
+  FexcSimdCheckWords(Op->Mask, &De);
 }
 // Perf chunk 25: STMXCSR/VSTMXCSR's value (FEX's `FexcMxcsr`, fexc_slice1.inc `Classify`): MXCSR as the resident wrote it at the
 // block's entry (FEX's CPUState::mxcsr, frame::MXCSR on the host: the controls and the flags banked so far) with the flags
@@ -316,22 +325,36 @@ void Arm64JITCore::FexcFlushStep(ARMEmitter::VRegister R) {
   const bool Daz = fexc_daz, Ftz = fexc_ftz;
   if (Daz != Ftz) FexcFlushWords(R, R, 4, true, false, Ftz);
 }
-DEF_OP(FexcX87Check) {
-  const auto Op = IROp->C<IR::IROp_FexcX87Check>();
+// AFP fallback chunk 3b, row 8: `De` (FexcX87CheckDe), the software denormal-operand flag, is bit 7 (DE) of the pending byte before
+// the stack fault drops it: `and w1, wDe, #0x80; orr w0, w0, w1` after the byte's load.
+void Arm64JITCore::FexcX87CheckWords(IR::OrderedNodeWrapper Fault, IR::OrderedNodeWrapper Overflow, IR::OrderedNodeWrapper Invalid,
+                                     IR::OrderedNodeWrapper Tiny, uint32_t Mask, const IR::OrderedNodeWrapper* De) {
   ldrb(TMP1.W(), STATE, FEXC_X87_PENDING);
-  sub(ARMEmitter::Size::i32Bit, TMP2, GetReg(Op->Fault), 1);
+  if (De) {
+    and_(ARMEmitter::Size::i32Bit, TMP2, GetReg(*De), 0x80);
+    orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
+  }
+  sub(ARMEmitter::Size::i32Bit, TMP2, GetReg(Fault), 1);
   and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
-  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Fault), ARMEmitter::ShiftType::LSL, 8);
-  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Overflow), ARMEmitter::ShiftType::LSL, 9);
-  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Invalid), ARMEmitter::ShiftType::LSL, 10);
-  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Op->Tiny), ARMEmitter::ShiftType::LSL, 11);
-  movz(ARMEmitter::Size::i32Bit, TMP2, Op->Mask);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Fault), ARMEmitter::ShiftType::LSL, 8);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Overflow), ARMEmitter::ShiftType::LSL, 9);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Invalid), ARMEmitter::ShiftType::LSL, 10);
+  orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, GetReg(Tiny), ARMEmitter::ShiftType::LSL, 11);
+  movz(ARMEmitter::Size::i32Bit, TMP2, Mask);
   and_(ARMEmitter::Size::i32Bit, TMP2, TMP1, TMP2);
   const auto it = fexc_x87_length.find(Entry + FexcGuest);
   if (it == fexc_x87_length.end()) ERROR_AND_DIE_FMT("fexc slice1 (I5c): an x87 check outside an x87 instruction");
   auto* L = FexcStub(FEXC_SITE_X87, false);
   fexc_sites.back().width = it->second;
   cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP2, L);
+}
+DEF_OP(FexcX87Check) {
+  const auto Op = IROp->C<IR::IROp_FexcX87Check>();
+  FexcX87CheckWords(Op->Fault, Op->Overflow, Op->Invalid, Op->Tiny, Op->Mask, nullptr);
+}
+DEF_OP(FexcX87CheckDe) {
+  const auto Op = IROp->C<IR::IROp_FexcX87CheckDe>();
+  FexcX87CheckWords(Op->Fault, Op->Overflow, Op->Invalid, Op->Tiny, Op->Mask, &Op->De);
 }
 // The #MF check at the start of a waiting x87, WAIT or MMX instruction (SDM Vol.1 8.7.1): an exception flag whose mask is clear
 // is pending (FSW.ES). FSW's flags: FEX's IE byte, its PE byte and the exception word (FPSR order).

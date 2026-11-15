@@ -22,7 +22,7 @@ tools/fexc/build.sh BUILD_DIR
 
 `BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX` (`.gitmodules`: the fork
 `https://github.com/ArArgon/natemu-fex`, branch `natemu`, `shallow = true`), pinned to the fork's commit
-`7e8f5edd3542180f04fccdb29f30ab3e46efaa3b` (`13e80cf`, `1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2, plus the `FexcFlush` IR op for the software DAZ/FTZ flush, chunk 3a; on the fork's `afp-c3a` branch, not yet on its `natemu` branch): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
+`62713e6be26d03d9a30fad072d00ea782ee7c2f4` (`7e8f5ed` (`13e80cf`, `1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2, plus the `FexcFlush` IR op for the software DAZ/FTZ flush, chunk 3a; on the fork's `natemu` branch) plus the `FexcSimdCheckDe`/`FexcX87CheckDe` IR ops and the call of `PlaceFmaSanitize`, chunk 3b; on the fork's `afp-c3b` branch, not yet on its `natemu` branch): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
 at the pin) and the three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the
 revision FEX pins), checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the
 three externals into it (`git archive`), configures `CMakeLists.txt` against that tree, builds with 4 jobs and runs
@@ -444,6 +444,26 @@ instructions); DAZ and FTZ both flush only what MIN/MAX select. DPPS's first add
 x87 instructions are left alone, VCVTPS2PH honours DAZ but not FTZ, RCP's result is flushed under FTZ alone without a flag (its
 flags are restored), and the unmasked-PE check mask gains UFC under effective FTZ (`SimdCheckMask`). `tools/fexc/test_slice1.py`
 (`AfpFlush`) pins the shapes; the replay with `afp=0` added shows the common mode unchanged.
+
+**Software DE and the FMA sanitizing without AFP** (AFP fallback chunk 3b, plan rows 7, 8 and 10; none of it with AFP, none in the
+common mode: nothing is placed unless `fexc_no_afp` and the exception is unmasked in `--simd-unmasked` or `--x87-unmasked`, so no new
+argument and no new key; a compile reads no argument it did not read before). A host without FEAT_AFP never sets IDC, so with MXCSR.DM
+clear (DAZ drops DE from the host's unmasked set) `FexcPrecision::PlaceFPChecks` computes, before each SSE/AVX FP op of the table
+`DeRuleOf`, a flag from integer and quiet-compare vector ops on the op's operands (`SoftDe`): per lane a denormal (shift out the sign,
+exponent field zero, mantissa not) and no NaN operand (`fcmeq x, x`; a quiet compare raises IOC for an SNaN lane the op itself
+raises it for), none for a divisor of zero (the dividend), a negative SQRT operand, inf * 0 or an infinite product with an
+infinite addend of the opposite sign (all IE or ZE); HADD/HSUB test the even/odd pairs, ADDSUB the swapped operand back, the
+converts only the lanes they read (a 64-bit source is zero-extended first, VCVTL2's upper half is moved down). The lane masks reduce
+to a GPR (`umaxv`, `umov`) which the check takes as `FexcSimdCheckDe`: `and w1, wD, #0x80; orr w0, w0, w1` after `mrs x0, fpsr`, so
+the check word has IDC and the stub reads x0 (`fp_exception` in the resident). DPPS/DPPD's multiplies carry the flag in their own
+step checks; their add levels (inputs: products) have none. x87: the m32/m64 memory operand of an arithmetic op, FCOM(P) or FLD (the
+`LoadMem` itself, or the single converted from it) is tested on its bits the same way with an integer NaN test of ST0 (the x87
+wrapper's FPSR is not this op's) and, for a memory dividend, a zero ST0; `FexcX87CheckDe` ORs the flag into the pending byte before
+the stack fault drops it. Row 10: `PlaceFmaSanitize` zeroes, in each lane whose addend is a NaN, the multiplicands that are not NaNs
+(three quiet compares, four `bic`s: 7 vector ops), under unmasked IE. `tools/fexc/test_slice1.py` (`AfpDenormal`) runs the emitted
+code natively (`tools/fexc/exec_words.c`, on the M4 under an M2's FPCR) for every operand class of every form, against the SDM's rules
+and against the M4's own hardware IDC/IOC under FPCR AH = 1; `the_software_flag_code_is_admitted` (host) admits the forms with no
+spill.
 
 ## What builds
 
