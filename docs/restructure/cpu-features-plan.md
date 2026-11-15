@@ -164,7 +164,7 @@ says how it is detected, what happens on a host without it, and what keeps it ho
 
 | Class | Meaning | Members (floor: M2 ∩ M4) | Without it | Kept honest by |
 | --- | --- | --- | --- | --- |
-| **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP; non-register: Apple TSO bit, the interrupt-controller API (macOS version) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
+| **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP; non-register: Apple TSO bit; the interrupt-controller API (a minimum-macOS fact, not a probe: see below) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
 | **exactness** | runs without it, but some guest-visible result differs from x86 | AFP | runs; startup line names the difference; tests that depend on it are tagged with it | M2 work (after this plan): tagged test expectations; the AFP-dependent FPCR bits and flag mapping made conditional |
 | **speed** | a fallback exists; only performance changes | FlagM2, FCMA, FRINTTS, ECV, I8MM (for AVX-VNNI); above the floor RPRES (off by policy); neither chip CSSC, MOPS | fexc gets `name=0`; generated code takes FEX's fallback | the fallback gate (below) |
 | **option** | used only when a command-line option asks for it | SB (`--speculation-barriers`), CSV3 (RDCL_NO with that option) | the option is refused (SB) or the bit stays clear (CSV3) | existing refusal; probe reads both from the vCPU's registers |
@@ -173,18 +173,30 @@ says how it is detected, what happens on a host without it, and what keeps it ho
 | **unused** | nothing in natemu or fexc uses it | SME/SME2, synchronous FP exceptions (precise exceptions are done in software by design), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
 
 **The fallback gate (new, chunk 2).** The speed class is the one most likely to break unnoticed: every machine that
-runs the suite today has all of it. On the M4, the standing corpora are compiled and run with each speed feature
-forced off in turn (`--feature NAME=0`, which the host already sends for missing features). The rules:
-- admission must accept every object;
-- results must equal the all-on run;
-- the M1-like combination (I8MM=0) and the M2-like one (AFP=0, the exactness class, results compared only outside the
-  AFP-tagged cases) run as two extra rows.
+runs the suite today has all of it. No tool today forces a feature off in a boot or a corpus run: the host builds its
+`--feature NAME=0` arguments only from the vCPU's ID registers.
 
-This is the only way to cover an M1 without owning one.
+Chunk 2 adds a test-only override, `NATEMU_FEXC_FEATURE_OFF=name,...`, which removes the named features from
+`supported` before the arguments are built. Admission's subset check is unaffected, because clearing bits keeps the
+set a subset.
+
+On the M4, the standing corpora runners and one boot run with each speed feature forced off in turn (FlagM2, FCMA,
+FRINTTS, ECV). Each row uses a scratch compile cache, because the arguments change the key. The rules:
+- admission must accept every object;
+- results must equal the all-on run.
+
+What the gate can't do:
+- **I8MM.** It is used only by AVX-VNNI, which isn't built, so forcing it off exercises nothing until then. It joins
+  the gate with AVX-VNNI.
+- **AFP.** Forcing it off changes only FEX's code. The resident still sets FPCR.AH and NEP, and the M4 obeys them, a
+  combination that exists on no real machine. Exactness is covered only on a real M2 (the owner has one) and in the M2
+  work.
 
 **Non-register host properties** are recorded in the same table with a probe of their own:
 - the TSO bit is written and read back;
-- the interrupt-controller API is a macOS version check;
+- the interrupt-controller API: the `hv_gic_*` functions are strong imports, so on a macOS without them the binary
+  doesn't load at all. Its minimum macOS is stated as a build and deployment fact (README and the binary's
+  deployment target), not as a runtime check;
 - the IPA size is already checked against the backing at VM creation, with a clear error;
 - the counter frequency: the inline-TSC fast path is used only at 24 MHz, else the transaction path; speed class.
 
@@ -287,11 +299,11 @@ These are host properties the code relies on with no check before this plan. Eac
 
 | Assumption | Where | Class | Action |
 | --- | --- | --- | --- |
-| LSE2 alignment behaviour for split locks | resident split-lock handling, code-object contract | required | add to the probe (chunk 2) |
+| LSE2 alignment behaviour for split locks | resident split-lock handling, code-object contract | required | add to the probe (chunk 2). It is ID_AA64MMFR2_EL1, which admission doesn't read yet: add MMFR2 to the registers read through the hypervisor if it exposes it, else take sysctl `FEAT_LSE2` |
 | AFP: FPCR.AH/NEP/FIZ, Arm IDC = x86 DE, Arm UFC judged after rounding, the x87 first-operand NaN rule | `execution::fpcr`, `mxcsr_flags`, the tiny-result checks, x87 patches; FP tests | exactness | startup line now; tagging and conditional code in the M2 work |
-| fexc's table defaults are the M4's view, and the off paths (FlagM2, FCMA, FRINTTS, ECV, I8MM, DotProd, CRC32, AES, SHA, PMULL) are never exercised | `fexc.cpp` FeatureTable | speed or required | fallback gate (§2.2a); required ones have no off path by definition, so the probe refuses instead |
+| fexc's table defaults are the M4's view, and the off paths are never exercised: speed (FlagM2, FCMA, FRINTTS, ECV; DotProd/I8MM none today) and required (CRC32, AES, SHA, PMULL) | `fexc.cpp` FeatureTable | speed or required | fallback gate (§2.2a); required ones have no off path by definition, so the probe refuses instead |
 | Admission accepts only the encodings the M4 configuration emits (LSE atomics; CNTVCT or CNTVCTSS; the no-CSSC POPCNT) | `admission/structure.rs` | follows the class of each feature | fallback gate proves admission accepts every fallback; a new speed feature must list its encoding class |
-| The interrupt-controller API exists | vm.rs (GIC calls) | required | macOS version in the probe |
+| The interrupt-controller API exists | vm.rs (GIC calls, strong imports) | required | stated as the minimum macOS (build and deployment fact); dyld refuses an older system before any probe could run |
 | The resident is built with `+lse` | `.cargo/config.toml` | required | covered by LSE in the probe |
 
 Nothing else was found: the host binaries and fexc are built for the default Apple target, which runs on the M1, and
@@ -369,6 +381,7 @@ are answered below.
 | R2-6 | Replay design sound; record the fexc hash; disk hygiene | Added to chunk 0 |
 | R2-7 | `core` versus dynamic bits | `core` applies to capability bits; dynamic bits are exempt |
 | R3-1 | Third round, verdict accept. `layout`'s "transaction compiled in" was too broad: it would force every resident-implemented feature into the core set | Narrowed to "presence tested as a compile-time constant" (today XSAVEC and XSAVEOPT) |
+| R5 | Fifth round, on the host classes: classes verified; the fallback gate had no override tool and its AFP and I8MM rows tested nothing real; LSE2 is in MMFR2, which isn't read; the GIC API is a strong import | Test-only override added; AFP and I8MM rows dropped with reasons; MMFR2 or sysctl named for LSE2; the minimum macOS stated as a deployment fact |
 | R4 | Fourth round, on the owner revision: SHA, AES and PCLMULQDQ have no FEX fallback, contrary to the second round's note; stale wording; `state` duplicated; OSXSAVE versus the v3 rule; build-now versus admit-when-built | `required` judged over the whole pipeline and listed for the three; wording fixed; validator checks `state` against the derivation; OSXSAVE exempt; §6 makes admit-when-built explicit and notes the CPUID-differs-by-host consequence; chunk 2 names a fallback source for the floor |
 | Owner | Decisions after the review (§6): no guest selection; the M2 floor; core derived from the floor | `selectable`, the `--cpu` option and the hand-marked `core` flag are removed. Core and optional are derived from Arm needs and the floor. §3 became the host-derived mask, built with the first optional feature. Earlier rows that mention selection, `-FEATURE` or decisions A and B describe the text as it was then |
 
