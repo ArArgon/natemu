@@ -92,8 +92,11 @@ implementation; it can never be advertised.
 **Host features determine guest features (owner decisions, November 15).** There is no per-launch selection: no user
 picks guest features, and nothing cherry-picks them. The guest CPU on a host is computed from that host:
 
-- **Host floor:** the Arm feature set of the M2. It's recorded once from a real M2 (chunk 2) as the `floor` flag on
-  the entries of `admission::FEATURES`. The host probe checks features, not chip names. A host that lacks a floor
+- **Host floor:** the Arm features common to the M1, the M2 and the M4 (owner, November 15; appendix), with ECV
+  left out until a real M1 settles it. It's recorded as the `floor` flag on the entries of `admission::FEATURES`.
+  The floor is the planning set that core is derived from. The probe doesn't check the whole floor: it checks each
+  feature some entry declares as `required`. A floor feature nothing requires never refuses a host, and code may not
+  rely on a floor feature without declaring it. The host probe checks features, not chip names. A host that lacks a floor
   feature some core feature requires is refused at startup, with every missing item listed. Apple's TSO bit and the
   interrupt-controller API are part of the floor too, though they aren't ID-register features.
 - **Core (mandatory)** features are every `built` feature whose `host` `required` Arm features all lie in the floor.
@@ -162,7 +165,7 @@ command.
 Every Arm feature (and each non-ID-register host property) gets exactly one class in `admission::FEATURES`. The class
 says how it is detected, what happens on a host without it, and what keeps it honest.
 
-| Class | Meaning | Members (floor: M2 ∩ M4) | Without it | Kept honest by |
+| Class | Meaning | Members (floor: M1 ∩ M2 ∩ M4, ECV out) | Without it | Kept honest by |
 | --- | --- | --- | --- | --- |
 | **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP; non-register: Apple TSO bit; the interrupt-controller API (a minimum-macOS fact, not a probe: see below) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
 | **exactness** | runs without it, but some guest-visible result differs from x86 | AFP | runs; startup line names the difference; tests that depend on it are tagged with it | M2 work (after this plan): tagged test expectations; the AFP-dependent FPCR bits and flag mapping made conditional |
@@ -340,8 +343,11 @@ No other optional feature is demanded.
    - VAES on AES;
    - VPCLMULQDQ on PMULL;
    - AVX-VNNI on DotProd, with I8MM also present.
-2. **Host floor:** the M2's Arm feature set and above. M1 and anything else below the floor isn't a target. A host is
-   refused only for missing a feature something requires, and the check is by feature, never by chip name.
+2. **Host floor:** first "the M2's feature set and above"; then (same day) the features common to the M1, the M2 and
+   the M4. The M1 is supported, but labelled unverified until natemu has run on one. A host is refused only for missing
+   a feature something requires, and the check is by feature, never by chip name. ECV stays out of the floor while
+   the M1 record and the owner disagree about it; it is speed-only either way, and nothing may become `required` on
+   it.
 3. **Host features eagerly determine guest features:** there is no guest cherry-picking. No option selects guest
    features. The guest CPU is a function of the host (§2.1, §3). One consequence follows once an optional feature
    exists: the same guest disk image sees different CPUID on an M2 and an M4. Software that chose code paths at
@@ -383,22 +389,27 @@ are answered below.
 | R3-1 | Third round, verdict accept. `layout`'s "transaction compiled in" was too broad: it would force every resident-implemented feature into the core set | Narrowed to "presence tested as a compile-time constant" (today XSAVEC and XSAVEOPT) |
 | R4 | Fourth round, on the owner revision: SHA, AES and PCLMULQDQ have no FEX fallback, contrary to the second round's note; stale wording; `state` duplicated; OSXSAVE versus the v3 rule; build-now versus admit-when-built | `required` judged over the whole pipeline and listed for the three; wording fixed; validator checks `state` against the derivation; OSXSAVE exempt; §6 makes admit-when-built explicit and notes the CPUID-differs-by-host consequence; chunk 2 names a fallback source for the floor |
 | R5 | Fifth round, on the host classes: classes verified; the fallback gate had no override tool and its AFP and I8MM rows tested nothing real; LSE2 is in MMFR2, which isn't read; the GIC API is a strong import | Test-only override added; AFP and I8MM rows dropped with reasons; MMFR2 or sysctl named for LSE2; the minimum macOS stated as a deployment fact |
+| R6 | Owner question "move the M1, M2 and M4's common features to core", assessed independently: yes; ECV out until confirmed; the probe checks only declared requirements, not the whole floor; check the M1's IPA and interrupt-controller limits | Floor is M1 ∩ M2 ∩ M4 minus ECV; M1 supported and labelled unverified; the probe stays requirement-based (this revises my own suggestion to check the whole floor); the non-feature M1 checks are listed |
 | Owner | Decisions after the review (§6): no guest selection; the M2 floor; core derived from the floor | `selectable`, the `--cpu` option and the hand-marked `core` flag are removed. Core and optional are derived from Arm needs and the floor. §3 became the host-derived mask, built with the first optional feature. Earlier rows that mention selection, `-FEATURE` or decisions A and B describe the text as it was then |
 
 ## Appendix: the host floor (recorded November 15, 2026)
 
-**Source.** `sysctl hw.optional.arm` on the owner's M2 Max, and the same on this M4. Chunk 2 confirms the floor through
+**Source.** `sysctl hw.optional.arm` on the owner's M2 Max, the same on this M4, and the published M1 Pro record below. Chunk 2 confirms the floor through
 the vCPU's ID registers on the M2. Sysctl describes the host, and the vCPU's view can differ (§2.2).
 
-**The floor** is the Arm features both machines report. The M4 lacks one feature the M2 has (SSBS), so "the M2 and
-above" is the intersection of the two, not the M2's list:
+**The floor** (owner, November 15) is the Arm features the M1, M2 and M4 records all report, with ECV left out
+(unsettled for the M1, and speed-only):
 - AdvSIMD, AdvSIMD_HPFPCvt, FP16;
 - AES, PMULL, SHA1, SHA256, SHA3, SHA512;
-- BF16, I8MM, DotProd, FHM, RDM, FCMA, JSCVT, FRINTTS;
+- DotProd, FHM, RDM, FCMA, JSCVT, FRINTTS;
 - CRC32, FlagM, FlagM2;
 - LSE, LSE2, LRCPC, LRCPC2;
-- ECV, SB, CSV2, CSV3, DIT;
-- DPB, DPB2, PAuth, PAuth2, PACIMP, FPAC, BTI.
+- SB, CSV2, CSV3, DIT;
+- DPB, DPB2, PAuth, PACIMP.
+
+The earlier M2 ∩ M4 floor also had I8MM, BF16, PAuth2, FPAC, BTI and ECV. Nothing requires any of them, so no core
+guest feature changes. A future feature that strictly needs I8MM or BF16 becomes optional rather than core. A lowering
+that prefers I8MM must keep its DotProd or plain-SIMD path to stay core, as FEX's VPDPBUSD does.
 
 Apple's TSO bit and the interrupt-controller API are part of the floor too, though they aren't ID-register features.
 
@@ -406,8 +417,8 @@ Apple's TSO bit and the interrupt-controller API are part of the floor too, thou
 
 **M2 only:** SSBS. Natemu does not use it.
 
-**Best-effort tier: the M1** (owner, November 15). It isn't a target, but it should run whenever it meets the
-requirements.
+**The M1** (owner, November 15: first best-effort, then part of the floor). It is supported, and labelled unverified
+in the startup line until natemu has run on one.
 
 **Record.** `sysctl hw.optional` from an M1 Pro (MacBookPro18,1), as published at
 https://gist.github.com/Mizux/fc3309b1efeb1454cc7b093c5f23992e. The owner pointed to it; the macOS version isn't
@@ -420,11 +431,16 @@ lists ECV as present. The owner understands the M1 to lack it, so this is unsett
 outcome doesn't depend on it. So the M1 gets the same guest CPU as the floor, and I8MM is speed only for AVX-VNNI,
 whose any-of group DotProd satisfies.
 
-The validator warns, but doesn't refuse, when a core feature's `required` list stops being met by this record. That
-makes any loss of M1 support a visible decision.
+Because the M1 is in the floor, the core derivation itself keeps any future core feature within the M1's means. No
+separate warning is needed.
 
-**Against fexc's feature table.** Every Arm feature fexc uses when present is in the floor except AFP: atomics_lse,
-flagm, flagm2, fcma, crc32, aes, sha, pmull128, frintts, i8mm, dotprod, ecv. lrcpc and lrcpc2 are in the floor but off by
+**Before claiming the M1, check the non-feature limits**, which could refuse it whatever its features:
+- the hypervisor's maximum IPA size against natemu's address-space layout and default RAM (VM creation already checks
+  it; the M1's limit is believed smaller and is unconfirmed);
+- interrupt-controller (`hv_gic_*`) support on the M1 at the minimum macOS.
+
+**Against fexc's feature table.** Every Arm feature fexc uses when present is in the floor except AFP (exactness),
+I8MM and ECV (both speed): atomics_lse, flagm, flagm2, fcma, crc32, aes, sha, pmull128, frintts, dotprod. lrcpc and lrcpc2 are in the floor but off by
 policy. AFP is the one exactness feature. Neither machine reports RNG, CSSC, MOPS or SVE.
 
 
