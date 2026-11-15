@@ -355,9 +355,9 @@ needed no change).
   network up/down as the November 12 round), reusing recorded QEMU and VZ numbers. The interrupt vCPU is found as
   Task 7 describes, a stated change of method from the MMIO rounds. Expected: 1-vCPU queued jobs and
   depth 1 improve by roughly 10-15% (estimate from 3 exits x 1.5 us); 4-vCPU fio-bound jobs about unchanged.
-- [ ] Full suite once. Update `crates/host/src/virtio/README.md` (transport section, stated deviations), the
-  backlog row in `docs/research/investigations/INV-03-01.md`, and, only if `tools/run_io5.py` has reached `main` by
-  then (it is on `perf-real-workload`, not on this branch), its `EXPECTED` list (the PCI lines are MMIO-mode only).
+- [x] Full suite once (rebased tip, November 14: see the handoff). Update `crates/host/src/virtio/README.md` (transport section, stated deviations), the
+  backlog row in `docs/research/investigations/INV-03-01.md`. `tools/run_io5.py` (now on `main`) needs no change: it
+  has no transport option and always launches MMIO, so its `EXPECTED` PCI lines stay right.
 - [ ] Owner decides the default transport and the merge.
 
 ## Review focus

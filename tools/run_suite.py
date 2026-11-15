@@ -205,7 +205,7 @@ def steps(F, O):
     vm('io-coverage-pci', 'run_io_coverage.py', '--transport', 'pci', est=90)    # the same cases through virtio-PCI (MSI-X)
     # Network: stock Linux on user-mode NAT (DHCP, HTTP to the host, iperf3, a reset under traffic, cancel); no internet.
     add('net-linux', ['python3', 'tools/run_net_linux.py', 'run', '--offline', '--fexc', F, '--out', O / 'out' / 'net-linux'], est=35)
-    add('net-linux-pci', ['python3', 'tools/run_net_linux.py', 'run', '--offline', '--transport', 'pci', '--fexc', F, '--out', O / 'out' / 'net-linux-pci'], est=35)
+    add('net-linux-pci', ['python3', 'tools/run_net_linux.py', 'run', '--offline', '--transport', 'pci', '--fexc', F, '--out', O / 'out' / 'net-linux-pci'], est=80)   # waits for net-linux's host ports
     for n in (2, 3, 4): vm(f'r1b-c{n}', 'run_r1.py', 'r1b', '--cpus', n, est=25)
     # Fixed-address GP probes must name an unmapped page; DR watchpoints must name the actual frame.
     distant = {'faults', 'faults-1', 'events', 'privilege', 'k2-swapgs', 'k2-cr2', 'k2-stifirst', 'k2-verw'}

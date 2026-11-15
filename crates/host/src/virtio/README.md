@@ -302,7 +302,10 @@ drain publication share the state lock so S5 cannot hide an earlier failure.
 ## PCI transport
 
 `--virtio-transport pci` attaches every virtio device as a PCI function instead of
-a virtio-MMIO device; `mmio` (the default) keeps today's launch byte for byte. A
+a virtio-MMIO device; `mmio` (the default) keeps the ACPI tables and E820 map byte for
+byte (pinned by digest). The same branch did change the default launch in three ways: the
+disk's queue size (128 to 256) and seg_max (32 to 126) apply to both transports, and halt
+polling (`NATEMU_HALT_POLL_US`, 15 us) is on for every guest. A
 per-device form, e.g. `disk=pci,net=mmio,rng=mmio`, is experimental. The device
 code is the same either way: `pci.rs` is a second front end on the same state lock,
 register path, deferral and owner (`crates/host/src/pci/` holds the bus).
@@ -355,5 +358,4 @@ Evidence: acceptance in `natemu-raw/pci-accept-20261113-01` (network 15/15 at 1/
 vCPUs, block 6/6, I/O coverage over PCI passing apart from the host-full case, which
 fails identically on MMIO). Exit counts in `natemu-raw/pci-smoke-20261113-01`, the
 same boot-and-disk workload at 2 vCPUs: MMIO 409 EOI exits, 409 status reads, 409
-acknowledges and 2,476 device exits; PCI 0, 0, 0 and 1,772. A benchmark round is
-still to come.
+acknowledges and 2,476 device exits; PCI 0, 0, 0 and 1,772.

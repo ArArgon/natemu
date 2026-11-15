@@ -57,6 +57,23 @@ both transports, a `run.sh`, and four runs marked NOT A RESULT because the machi
 
 ## Remaining work
 
+**Status, November 14 evening (branch `pci-rebase`: `pci` rebased onto `main` 1c43377, M4, `natemu-raw` here):**
+- Full suite on the rebased tip 9816283 (`natemu-raw/pci-rebase-suite-20261114-01`): 170/173. `io-coverage` and
+  `io-coverage-pci` fail only the known `host-full` case. `net-linux-pci` failed because the suite runs it beside
+  `net-linux` and both bind the same host ports; fixed in 42e8fcd (a lock on the ports), and both then pass together.
+- Review fixes, each reviewed independently: a lone request's inline disk call no longer runs while an interrupt is
+  held (42e8fcd, with a unit test that fails without it); and the halt-poll window now judges a halt by its whole length
+  once it waits a second time (it did so only by the first wait, so an idle vCPU woken by doorbells that brought nothing
+  kept polling). After both: quick suite 83/85, only `host-full` failing (`pci-rebase-quick-20261114-01`).
+- CPU benchmarks, main (4c89205) against the branch's default launch, 3 interleaved rounds, 132 boots, none contended
+  (`natemu-raw/pci-rebase-ab-20261114-01/tables.txt`): every benchmark within -1.6..+2.1% at both 1 and 4 vCPUs, except
+  4-vCPU locks -5.8% (noise, as in decision 41 of io5-perf-notes) and 4-vCPU hackbench +3.8%. Ten more runs of
+  hackbench per arm (`hb/`): means 3.52 s main, 3.62 branch, 3.57 with polling off, 3.57 with the fix. The spreads are
+  about 0.6 s, so this is at most a ~3% halt-polling cost and is not resolved. The default launch is not byte for byte
+  `main`'s: the disk's 256-entry queue, seg_max 126 and halt polling apply to MMIO too.
+- Not rerun on the M4: the PCI-against-MMIO disk and network rounds (M2 Max numbers in io-benchmarks.md) and IO5.
+
+
 **Status, November 14 (branch `halt-poll`, on `pci`; an M2 Max without the M4's `natemu-raw`):** items 2 to 4 are
 done in substance, with a session harness instead of the pinned runners
 ([io-benchmarks.md](io-benchmarks.md), "PCI transport with multiqueue, interrupt hold and a 256-entry ring"):
