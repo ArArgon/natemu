@@ -268,6 +268,9 @@ def run(args):
     for name, sha in manifest['outputs'].items(): assert digest(args.prepared / name) == sha, name
     blob_sha, host = digest(args.prepared / 'serve/blob'), args.host or lan_address()
     # http.server's default listen backlog (5) would refuse the stress case's 64 parallel connections.
+    # The guest script names fixed host ports (8000, iperf3's 5201): one run's servers at a time (the suite runs
+    # net-linux and net-linux-pci in parallel).
+    ports = open(RAW_ROOT / '.net-ports.lock', 'a'); fcntl.flock(ports, fcntl.LOCK_EX)
     serve = ('import http.server as h, sys; h.ThreadingHTTPServer.request_queue_size = 512; '
              'h.ThreadingHTTPServer((sys.argv[1], 8000), h.SimpleHTTPRequestHandler).serve_forever()')
     servers = [subprocess.Popen([sys.executable, '-c', serve, host], cwd=args.prepared / 'serve',
@@ -300,6 +303,7 @@ def run(args):
                           + (f" drops {results[-1]['drops']}" if results[-1]['drops'] else ''), flush=True)
     finally:
         for s in servers: s.terminate(); s.wait()
+        ports.close()
     write_json(args.out / 'results.json', {'host': host, 'offline': args.offline, **({'transport': 'pci'} if args.transport == 'pci' else {}), 'prepared': str(args.prepared),
                                             'natemu': {str(args.natemu): digest(args.natemu)}, 'results': results})
     return 0 if all(r['pass'] for r in results) else 1
