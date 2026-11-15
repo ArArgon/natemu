@@ -83,7 +83,16 @@ both transports, a `run.sh`, and four runs marked NOT A RESULT because the machi
 - Disk matrix on the M4 (`matrix-table.txt`, kIOPS; one PCI run, two MMIO runs per cell): at 1 vCPU PCI is ahead on
   every queued job (rand-read 4k q16 106 against 42-49) and level on fsync; at 4 vCPUs ahead on 4 KiB jobs (q16 121
   against 91-93, four jobs 283 against 239) and level on 128 KiB (reads 33.5 against 35-36, writes 20.2 against
-  16-21). Not rerun on the M4: the network round (level on the M2 Max) and IO5.
+  16-21).
+- IO5 on 0dfd58f (`io5-pci-rebase-20261114-01`, MMIO, mitigations off): PASS, use 533.4 s against main's 522.2 s,
+  make 354.3 against 341.3 (+3.8%) with configure and pytest level. Not a regression: make shares the vCPUs with the
+  download and generate loops, whose work differed (generate 12 rounds against 10). A same-session pair with
+  `--solo-build` (`io5-main-solo-20261114-01`, `io5-branch-solo-20261114-01`, both PASS): make alone 121.4 s on both;
+  the combined make 341.1 against 347.4 with 86 against 91 download rounds.
+- Network, iperf3 at 2 vCPUs, the November 12 method (`pci-recheck-20261114-01/net`, 3 rounds rotated, Mbit/s):
+  main MMIO up 3386-3527, down 5756-5820; branch MMIO 3263-3553, 5726-5882 (level with main); branch PCI 3075-3104,
+  5431-5505: single streams over PCI about 9% (up) and 6% (down) behind MMIO on the M4, 8 streams down about 8% ahead.
+  Level on the M2 Max; not investigated. Bears on the default-transport decision, not a regression.
 
 
 **Status, November 14 (branch `halt-poll`, on `pci`; an M2 Max without the M4's `natemu-raw`):** items 2 to 4 are
