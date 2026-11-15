@@ -61,7 +61,7 @@ both transports, a `run.sh`, and four runs marked NOT A RESULT because the machi
 - Full suite on the rebased tip 9816283 (`natemu-raw/pci-rebase-suite-20261114-01`): 170/173. `io-coverage` and
   `io-coverage-pci` fail only the known `host-full` case. `net-linux-pci` failed because the suite runs it beside
   `net-linux` and both bind the same host ports; fixed in 42e8fcd (a lock on the ports), and both then pass together.
-- Review fixes, each reviewed independently: a lone request's inline disk call no longer runs while an interrupt is
+- Fixes for findings of two independent reviews: a lone request's inline disk call no longer runs while an interrupt is
   held (42e8fcd, with a unit test that fails without it); and the halt-poll window now judges a halt by its whole length
   once it waits a second time (it did so only by the first wait, so an idle vCPU woken by doorbells that brought nothing
   kept polling). After both: quick suite 83/85, only `host-full` failing (`pci-rebase-quick-20261114-01`).
