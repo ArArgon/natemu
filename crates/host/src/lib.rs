@@ -24,6 +24,7 @@ pub mod perf;
 mod publisher;
 mod pic;
 mod pit;
+mod probe;
 pub mod pm;
 mod relocation;
 pub mod report;

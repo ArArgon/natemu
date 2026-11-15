@@ -17,86 +17,196 @@ use natemu_abi::execution::{
 
 mod structure;
 
-/// The vCPU ID registers features are checked against, in [`Field::register`] order.
-pub(crate) const ID_REGISTERS: [(&str, u16); 5] = [
+/// The vCPU ID registers features are checked against, in the order of [`Detect::Fields`]' register index. MMFR2 (LSE2) joined for the startup
+/// probe ([`crate::probe`]); no fexc feature reads it.
+pub(crate) const ID_REGISTERS: [(&str, u16); 6] = [
     ("ID_AA64ISAR0_EL1", 0xc030),
     ("ID_AA64ISAR1_EL1", 0xc031),
     ("ID_AA64PFR0_EL1", 0xc020),
     ("ID_AA64MMFR0_EL1", 0xc038),
     ("ID_AA64MMFR1_EL1", 0xc039),
+    ("ID_AA64MMFR2_EL1", 0xc03a),
 ];
 const ISAR0: usize = 0;
 const ISAR1: usize = 1;
 const PFR0: usize = 2;
 const MMFR0: usize = 3;
 const MMFR1: usize = 4;
+const MMFR2: usize = 5;
 
-/// What a fexc feature bit needs from the vCPU.
+/// How a host feature is detected.
 #[derive(Clone, Copy)]
-enum Need {
+pub(crate) enum Detect {
     /// A code-generation setting or guest-visible x86 feature: nothing.
     Nothing,
     /// ID register fields (register, shift, minimum value), all required.
     Fields(&'static [(usize, u32, u64)]),
     /// Needs a register this host cannot read (ID_AA64ISAR2, DCZID, SVE length): refused.
     Unverifiable,
+    /// Apple's TSO bit: ACTLR_EL1 bit 1 reads back set after the resident's setup wrote it ([`crate::probe`] only).
+    Tso,
 }
-/// fexc's feature table (`fexc.cpp FeatureTable`), in object bit order.
-const FEATURES: [(&str, Need); 32] = {
-    use Need::*;
-    [
-        ("atomics_lse", Fields(&[(ISAR0, 20, 2)])),
-        ("lrcpc", Fields(&[(ISAR1, 20, 1)])),
-        ("lrcpc2", Fields(&[(ISAR1, 20, 2)])),
-        ("sve128", Fields(&[(PFR0, 32, 1)])),
-        ("sve256", Unverifiable),
-        ("preserve_all_abi", Nothing),
-        ("rpres", Unverifiable),
-        ("wfxt", Unverifiable),
-        ("flagm", Fields(&[(ISAR0, 52, 1)])),
-        ("flagm2", Fields(&[(ISAR0, 52, 2)])),
-        ("fcma", Fields(&[(ISAR1, 16, 1)])),
-        ("crc32", Fields(&[(ISAR0, 16, 1)])),
-        ("aes", Fields(&[(ISAR0, 4, 1)])),
-        ("sha", Fields(&[(ISAR0, 8, 1), (ISAR0, 12, 1)])),
-        ("pmull128", Fields(&[(ISAR0, 4, 2)])),
-        ("rng", Fields(&[(ISAR0, 60, 1)])),
-        ("cssc", Unverifiable),
-        ("afp", Fields(&[(MMFR1, 44, 1)])),
-        ("frintts", Fields(&[(ISAR1, 32, 1)])),
-        ("mops", Unverifiable),
-        ("i8mm", Fields(&[(ISAR1, 52, 1)])),
-        ("dotprod", Fields(&[(ISAR0, 44, 1)])),
-        ("ecv", Fields(&[(MMFR0, 60, 1)])),
-        ("clzero", Unverifiable),
-        ("svebitperm", Unverifiable),
-        ("float_exceptions", Unverifiable),
-        ("cache_maintenance_ops", Nothing),
-        ("prefer_zva_for_vzero", Unverifiable),
-        ("x86_avx", Nothing),
-        ("x86_aes256", Nothing),
-        ("x86_3dnow", Nothing),
-        ("x86_sse4a", Nothing),
-    ]
+/// What natemu does with a host feature (CPU-features plan section 2.2a). `Required` and `Exactness` are checked by the
+/// startup probe; the others only decide what fexc is told.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Class {
+    /// A core guest feature or the machine cannot run without it: startup refuses, listing every missing item.
+    Required,
+    /// Runs without it, but a guest-visible result differs from x86 (AFP): the startup line names it.
+    Exactness,
+    /// A fallback exists; fexc gets `name=0` and emits FEX's fallback (the fallback gate, `NATEMU_FEXC_FEATURE_OFF`).
+    Speed,
+    /// Used only when a command-line option asks for it (SB, CSV3).
+    Option,
+    /// Present on some hosts, never used: the reason.
+    Off(&'static str),
+    /// Nothing in natemu or fexc uses it; listed so a new use has to change its class.
+    Unused,
+    /// Not a host feature: a code-generation setting or a guest-visible x86 bit fexc forces (no vCPU dependency).
+    Setting,
+}
+// (Not `Class::*`: its `Option` would shadow the prelude's.)
+use {
+    Class::{Exactness, Off, Required, Setting, Speed, Unused},
+    Detect::*,
 };
+/// One host feature row.
+pub(crate) struct Feature {
+    /// fexc's name (`--feature NAME=0`; `features.host_features` in every reply).
+    pub name: &'static str,
+    pub detect: Detect,
+    pub class: Class,
+    /// Present on every supported chip's vCPU (the M1, M2 and M4 records; the plan's appendix floor).
+    #[allow(dead_code)] // read by the policy tests; chunk 1's validator and the host-derived mask use it
+    pub floor: bool,
+    /// The admission encoding class that depends on it (documentation; `structure.rs` holds the check).
+    #[allow(dead_code)] // documentation
+    pub encodes: &'static str,
+}
+const fn feature(name: &'static str, detect: Detect, class: Class, floor: bool) -> Feature {
+    Feature {
+        name,
+        detect,
+        class,
+        floor,
+        encodes: "",
+    }
+}
+const KEPT_OFF: Class = Off("kept off to match the reference producer");
+/// fexc's feature table (`fexc.cpp FeatureTable`), in object bit order, names and order checked against every fexc reply.
+pub(crate) const FEATURES: [Feature; 32] = [
+    Feature {
+        encodes: "LSE-only atomics (LOCK forms, XCHG, CMPXCHG; no exclusive-pair loops)",
+        ..feature("atomics_lse", Fields(&[(ISAR0, 20, 2)]), Required, true)
+    },
+    feature("lrcpc", Fields(&[(ISAR1, 20, 1)]), KEPT_OFF, true),
+    feature("lrcpc2", Fields(&[(ISAR1, 20, 2)]), KEPT_OFF, true),
+    feature("sve128", Fields(&[(PFR0, 32, 1)]), Unused, false),
+    feature("sve256", Unverifiable, Unused, false),
+    feature("preserve_all_abi", Nothing, Setting, false),
+    feature("rpres", Unverifiable, KEPT_OFF, false),
+    feature("wfxt", Unverifiable, KEPT_OFF, false),
+    feature("flagm", Fields(&[(ISAR0, 52, 1)]), Required, true),
+    Feature {
+        encodes: "AXFLAG/XAFLAG (SSE compare flags)",
+        ..feature("flagm2", Fields(&[(ISAR0, 52, 2)]), Speed, true)
+    },
+    feature("fcma", Fields(&[(ISAR1, 16, 1)]), Speed, true),
+    feature("crc32", Fields(&[(ISAR0, 16, 1)]), Required, true),
+    feature("aes", Fields(&[(ISAR0, 4, 1)]), Required, true),
+    feature("sha", Fields(&[(ISAR0, 8, 1), (ISAR0, 12, 1)]), Required, true),
+    feature("pmull128", Fields(&[(ISAR0, 4, 2)]), Required, true),
+    feature("rng", Fields(&[(ISAR0, 60, 1)]), Unused, false),
+    Feature {
+        encodes: "POPCNT: without CSSC a vector sequence",
+        ..feature("cssc", Unverifiable, Speed, false)
+    },
+    feature("afp", Fields(&[(MMFR1, 44, 1)]), Exactness, false),
+    feature("frintts", Fields(&[(ISAR1, 32, 1)]), Speed, true),
+    feature("mops", Unverifiable, Speed, false),
+    feature("i8mm", Fields(&[(ISAR1, 52, 1)]), Speed, false),
+    // Speed for now: nothing emits it until AVX-VNNI is built (plan section 2.2a).
+    feature("dotprod", Fields(&[(ISAR0, 44, 1)]), Speed, true),
+    Feature {
+        encodes: "RDTSC counter read: CNTVCTSS with ECV, else ISB and CNTVCT",
+        ..feature("ecv", Fields(&[(MMFR0, 60, 1)]), Speed, false)
+    },
+    feature("clzero", Unverifiable, Unused, false),
+    feature("svebitperm", Unverifiable, Unused, false),
+    feature("float_exceptions", Unverifiable, Unused, false),
+    feature("cache_maintenance_ops", Nothing, Setting, false),
+    feature("prefer_zva_for_vzero", Unverifiable, Setting, false),
+    feature("x86_avx", Nothing, Setting, false),
+    feature("x86_aes256", Nothing, Setting, false),
+    feature("x86_3dnow", Nothing, Setting, false),
+    feature("x86_sse4a", Nothing, Setting, false),
+];
+/// Machine needs that are not fexc features (no object bit, no `--feature`): the startup probe's own rows.
+pub(crate) const MACHINE: [(&str, Detect, Class); 4] = [
+    ("lse2", Fields(&[(MMFR2, 32, 1)]), Required),
+    ("apple_tso", Tso, Required),
+    ("csv3", Fields(&[(PFR0, 60, 1)]), Class::Option),
+    ("sb", Fields(&[(ISAR1, 36, 1)]), Class::Option),
+];
+/// Index (object bit) of the FEATURES row `name`: a lookup, so no code hard-codes a position. Fails to compile (const) or
+/// panics when there is no such row.
+pub(crate) const fn index(name: &str) -> usize {
+    let mut i = 0;
+    while i < FEATURES.len() {
+        if str_eq(FEATURES[i].name, name) {
+            return i;
+        }
+        i += 1;
+    }
+    panic!("no such host feature");
+}
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+/// Whether `d` holds for ID register values `id` (`tso`: the TSO readback). Unverifiable never does.
+pub(crate) fn detected(d: &Detect, id: &[u64; ID_REGISTERS.len()], tso: bool) -> bool {
+    match d {
+        Nothing => true,
+        Fields(fields) => fields
+            .iter()
+            .all(|&(r, shift, min)| (id[r] >> shift) & 15 >= min),
+        Unverifiable => false,
+        Tso => tso,
+    }
+}
 
 /// Feature bits the vCPU with these ID register values can execute.
 pub(crate) fn supported_features(id: &[u64; ID_REGISTERS.len()]) -> u64 {
-    let field = |&(r, shift, min): &(usize, u32, u64)| (id[r] >> shift) & 15 >= min;
     (FEATURES.iter().enumerate())
-        .filter(|(_, (_, need))| match need {
-            Need::Nothing => true,
-            Need::Fields(fields) => fields.iter().all(field),
-            Need::Unverifiable => false,
-        })
+        .filter(|(_, f)| detected(&f.detect, id, true))
         .fold(0, |bits, (i, _)| bits | 1 << i)
 }
 /// fexc `--feature` overrides that turn off every feature the vCPU lacks.
 pub(crate) fn feature_overrides(supported: u64) -> Vec<String> {
     (FEATURES.iter().enumerate())
         .filter(|&(i, _)| supported & 1 << i == 0)
-        .map(|(_, (name, _))| format!("{name}=0"))
+        .map(|(_, f)| format!("{}=0", f.name))
         .collect()
+}
+/// The feature bits `NATEMU_FEXC_FEATURE_OFF` (comma-separated fexc names; test only: the fallback gate, plan section 2.2a)
+/// names. An unknown name is an error. The caller clears them from `supported`; admission's subset check is unaffected.
+pub(crate) fn forced_off(list: &str) -> Result<u64, String> {
+    (list.split(',').filter(|n| !n.is_empty()))
+        .try_fold(0, |bits, name| match FEATURES.iter().position(|f| f.name == name) {
+            Some(i) => Ok(bits | 1 << i),
+            None => Err(format!("NATEMU_FEXC_FEATURE_OFF: unknown feature {name:?}")),
+        })
 }
 
 /// An object the host translates again from the same RIP with fewer guest instructions: its instruction count and why, the
@@ -137,7 +247,7 @@ fn table<T: Copy>(
 }
 
 /// Feature bit of FlagM (the contract requires it: FEX emits CFINV/RMIF).
-const FLAGM: u64 = 1 << 8;
+const FLAGM: u64 = 1 << index("flagm");
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Admitted {
@@ -1165,10 +1275,96 @@ mod tests {
         assert!(admit(&object(), RIP, &SOURCE, !(1 << 8)).is_err());
         assert!(admit(&header(|h| h.feature_count = 31), RIP, &SOURCE, ALL).is_err());
         // FlagM present, LSE absent: only Fields/Nothing bits whose fields hold.
-        let supported = supported_features(&[1 << 52, 0, 0, 0, 0]);
+        let supported = supported_features(&[1 << 52, 0, 0, 0, 0, 0]);
         assert!(supported & 1 << 8 != 0 && supported & 1 == 0 && supported & 1 << 9 == 0);
         assert!(supported & 1 << 5 != 0 && supported & 1 << 6 == 0);
         assert!(feature_overrides(supported).contains(&"atomics_lse=0".to_string()));
+    }
+
+    #[test]
+    fn features_are_found_by_name() {
+        assert_eq!(index("atomics_lse"), 0);
+        assert_eq!(index("flagm"), 8);
+        assert_eq!(FLAGM, 1 << 8);
+        assert_eq!(index("x86_sse4a"), FEATURES.len() - 1);
+        for (i, f) in FEATURES.iter().enumerate() {
+            assert_eq!(index(f.name), i, "{} is listed twice", f.name);
+        }
+    }
+
+    #[test]
+    fn forced_off_names_features_and_refuses_unknown_ones() {
+        assert_eq!(forced_off(""), Ok(0));
+        assert_eq!(
+            forced_off("flagm2,ecv"),
+            Ok(1 << index("flagm2") | 1 << index("ecv"))
+        );
+        assert!(forced_off("fcma,nonesuch").unwrap_err().contains("nonesuch"));
+        // The arguments follow: the forced-off feature is sent as `name=0` and the rest are unchanged.
+        let all = supported_features(&[u64::MAX; ID_REGISTERS.len()]);
+        let off = all & !forced_off("frintts").unwrap();
+        assert_eq!(feature_overrides(off).len(), feature_overrides(all).len() + 1);
+        assert!(feature_overrides(off).contains(&"frintts=0".to_string()));
+        // Admission's subset check is unaffected: an object built for `all` is refused only for what was cleared.
+        assert!(off & !all == 0);
+    }
+
+    #[test]
+    fn classes_are_consistent() {
+        for f in &FEATURES {
+            match f.class {
+                // No fallback: the probe must be able to check it, and every supported chip has it.
+                Class::Required => {
+                    assert!(matches!(f.detect, Fields(_)), "{} cannot be verified", f.name);
+                    assert!(f.floor, "{} is required but not in the floor", f.name);
+                }
+                Class::Off(why) => assert!(!why.is_empty()),
+                Class::Setting => assert!(matches!(f.detect, Nothing | Unverifiable)),
+                _ => {}
+            }
+        }
+        // The appendix floor, by name (plan: the features fexc uses when present, minus AFP, I8MM and ECV).
+        let floor: Vec<_> = FEATURES.iter().filter(|f| f.floor).map(|f| f.name).collect();
+        assert_eq!(
+            floor,
+            ["atomics_lse", "lrcpc", "lrcpc2", "flagm", "flagm2", "fcma", "crc32", "aes", "sha", "pmull128", "frintts", "dotprod"]
+        );
+        let class = |name| FEATURES[index(name)].class;
+        assert_eq!(class("afp"), Class::Exactness);
+        assert!(matches!(class("rpres"), Class::Off("kept off to match the reference producer")));
+    }
+
+    /// With `FEXC` set: fexc reports its feature table in every reply (`features.host_features`); its names, order and
+    /// defaults are FEATURES' names and order, and the defaults follow the policies: an `Off` feature defaults off,
+    /// a `Required` one on (fexc's defaults are what the CLI tools and corpus runners use).
+    #[test]
+    fn fexc_reply_matches_the_table() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let out = std::process::Command::new(fexc)
+            .args(["--hex", "90c3", "--rip", "0x1000", "--profile", "slice1"])
+            .output()
+            .unwrap();
+        let json = String::from_utf8(out.stdout).unwrap();
+        let table = json.split("\"host_features\":{").nth(1).expect("host_features");
+        let table = &table[..table.find('}').unwrap()];
+        let reply: Vec<(&str, bool)> = table
+            .split(',')
+            .map(|kv| {
+                let (k, v) = kv.split_once(':').unwrap();
+                (k.trim_matches('"'), v == "true")
+            })
+            .collect();
+        let names: Vec<_> = FEATURES.iter().map(|f| f.name).collect();
+        assert_eq!(reply.iter().map(|r| r.0).collect::<Vec<_>>(), names);
+        for (f, &(_, default)) in FEATURES.iter().zip(&reply) {
+            match f.class {
+                Class::Off(_) => assert!(!default, "{} is off by policy but fexc defaults it on", f.name),
+                Class::Required => assert!(default, "{} is required but fexc defaults it off", f.name),
+                _ => {}
+            }
+        }
     }
 
     #[test]
