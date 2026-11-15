@@ -688,6 +688,90 @@ class AfpFlush(unittest.TestCase):
         self.assertEqual(mask(*self.AFP0, '--ftz'), 0x18)
         self.assertEqual(mask(*self.AFP0, '--ftz', '--daz'), 0x18)
 
+    def lines(self, hexs, *extra):
+        d, rc = run(hexs, RIP, *extra)
+        self.assertEqual(rc, 0, (hexs, extra))
+        lay = d['code']['layout']
+        lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal']
+        with tempfile.TemporaryDirectory() as t:
+            dis = check_sites.disassemble(bytes.fromhex(d['code']['hex']), lay['code_region_end'], Path(t), lits)
+        return [x.strip() for o, x in sorted(dis.items()) if o >= lay['code_region_begin']]
+
+    @staticmethod
+    def fma_sources_are_distinct(code):
+        """Value-number the vector registers through the block (a move copies a value, any other write makes a value of its
+        mnemonic and the values it reads; a partial write also reads the old destination); every scalar FMA must read three
+        different values, which holds for `vfmadd* xmmA, xmmB, [mem]` with A, B and the load all different. A move of the upper
+        bits into a register that holds a source before the FMA reads it (the defect) makes two of the three the same value."""
+        val, found = {}, 0
+        def v(r): return val.get(r, ('init', r))
+        for ln in code:
+            m = re.match(r'([a-z0-9]+)(?:\.\w+)?\s+(.*)', ln)
+            if not m: continue
+            op, rest = m.groups()
+            regs = re.findall(r'\b[vsdqhb](\d+)\b(?!\s*,?\s*\[x)', rest)
+            ops = [x.strip() for x in re.split(r',\s*(?![^\[]*\])', rest)]
+            if op in ('fmadd', 'fmsub', 'fnmadd', 'fnmsub') and re.match(r'[sd]\d+$', ops[0]):
+                srcs = [v(x[1:]) for x in ops[1:4]]
+                found += 1
+                if len(set(srcs)) != 3: return None
+                val[ops[0][1:]] = (op, *srcs)
+            elif re.match(r'[vsdqhb]\d+(\[\d+\])?$', ops[0]) and op not in ('str', 'stp', 'fcmp', 'fcmpe', 'cmp'):
+                d = re.match(r'[vsdqhb](\d+)', ops[0]).group(1)
+                ins = [v(re.match(r'[vsdqhb](\d+)', x).group(1)) if re.match(r'[vsdqhb]\d+(\[\d+\])?$', x) else x for x in ops[1:]]
+                if op in ('mov', 'orr') and len(ops) == 2 or (op == 'orr' and len(set(ops[1:])) == 1):
+                    val[d] = ins[0]   # mov.16b vD, vN; orr.16b vD, vN, vN
+                elif op == 'mov' and '[' in ops[0] or op in ('ins', 'bsl', 'bif', 'bit', 'fmla', 'fmls'):
+                    val[d] = (op, v(d), *ins)
+                else:
+                    val[d] = (op, *ins)
+        return found
+
+    def test_scalar_fma_with_a_memory_operand_reads_its_sources_before_they_are_overwritten(self):
+        def enc(op, w, a, b):   # VEX.128.66.0F38.Wn op /r: xmm<a>, xmm<b>, [rbx]
+            return bytes([0xc4, 0xe2 if a < 8 else 0x62, w << 7 | (~b & 15) << 3 | 1, op, (a & 7) << 3 | 3]).hex()
+        n = 0
+        # 132/213/231 x madd/msub/nmadd/nmsub x ss/sd; the destination register is one of the operands (A) and, in the second
+        # block, the instruction after overwrites A, B and the loaded value's register so that all three die with the FMA
+        for base in (0x99, 0xa9, 0xb9):
+            for kind in (0, 2, 4, 6):
+                for w in (0, 1):
+                    for a, b in ((4, 0), (0, 4), (8, 1), (2, 3)):
+                        h = enc(base + kind, w, a, b)
+                        xor = lambda r: bytes([0xc5, 0xf8, 0x57, 0xc0 | (r & 7) << 3 | (r & 7)]).hex()   # vxorps xmm<r>, xmm0, xmm<r>... (r < 8)
+                        for tail in ('', xor(a) if a < 8 else '', xor(b) if b < 8 else ''):
+                            for extra in ([], ['--ftz'], ['--daz'], ['--daz', '--ftz']):
+                                code = self.lines(h + tail, *self.AFP0, *extra)
+                                got = self.fma_sources_are_distinct(code)
+                                self.assertTrue(got, (h, tail, extra, code))
+                                n += 1
+        self.assertEqual(n, 3 * 4 * 2 * 4 * 3 * 4)
+
+    def test_the_semantic_check_sees_the_clobbered_source(self):   # the defect's emitted code (i8 random-39: vfmadd213ss xmm4, xmm0, [mem])
+        bad = ['ldr s2, [x6]', 'mov.16b v2, v20', 'fmadd s0, s16, s20, s2']
+        good = ['ldr s2, [x6]', 'fmadd s0, s16, s20, s2', 'mov.16b v2, v20', 'mov.s v2[0], v0[0]']
+        self.assertIsNone(self.fma_sources_are_distinct(bad))
+        self.assertEqual(self.fma_sources_are_distinct(good), 1)
+
+    def test_dpps_and_dppd_step_checks_follow_their_flush(self):
+        # PlaceFlushes ran first, so a step's check goes after its flush (UFC and IXC are the step's own): O(p) F(lush) C(heck) per step
+        def tokens(h):
+            out, it = [], iter(self.lines(h, *self.AFP0, '--ftz', '--simd-unmasked', '0x20'))
+            for ln in it:
+                op = re.split(r'[. ]', ln)[0]
+                if op == 'shl':
+                    while not ln.startswith('bic'): ln = next(it)
+                    out.append('F')
+                elif op == 'mrs' and 'FPSR' in ln:
+                    while not ln.startswith('msr'): ln = next(it)
+                    out.append('C')
+                elif op in ('fmul', 'faddp'): out.append('O')
+            return ''.join(out)
+        self.assertEqual(tokens('660f3a40caff'), 'OFC' * 3)      # DPPS: products, first and second add level
+        self.assertEqual(tokens('660f3a41caff'), 'OFC' * 2)      # DPPD: products, the add
+        self.assertEqual(tokens('c4e36d40caff'), 'OFC' * 6)      # VDPPS ymm: each half in turn
+        self.assertEqual(tokens('c4e36941caff'), 'OFC' * 2)   # VDPPD xmm
+
 
 def check_exits(test, d, tmp, what):
     test.assertEqual({r['kind'] for r in d['code']['relocations']} - {'guest_rip_literal', 'guest_rip_move', 'dispatch_branch'}, set(), what)
