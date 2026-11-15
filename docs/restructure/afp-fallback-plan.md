@@ -24,8 +24,13 @@ Every AFP behaviour in the Arm pseudocode depends on FPCR.AH, FIZ or NEP being s
 gated that way (inventory 0, confirmed by the review). So an M4 with those three clear, and fexc told `afp=0`, is
 architecturally the M2's floating-point machine.
 
-Chunk 1 adds one input both sides share: a `no_afp` bit in `Cpu`. Every host-independent function reads it: `fpcr`,
-`x87_fpcr`, `mxcsr_flags`, `simd_fault_flags`, `code_context` and the host's x87 and FPCR arguments to fexc.
+Chunk 1 adds one input both sides share: a `no_afp` bit in `Cpu`. `fpcr`, `x87_fpcr`, `code_context` and the host's x87
+argument read it from chunk 1. `mxcsr_flags` and `simd_fault_flags` take it in chunks 2 and 3, where they change: chunk
+1 must only reproduce the M2.
+
+As built: without AFP, a legitimate x87 FPCR word can be 0 (round to nearest), which collided with the "0 = same as
+MXCSR's" contract. The x87 word without AFP therefore carries `X87_FPCR_EXPLICIT` (bit 32), and the shim loads its low
+32 bits. M2 emulation needs a fexc built at or after `afp-c1-fexc-20261115-01`.
 
 The polarity is chosen so that zero is today's behaviour. Many places build a `Cpu` before the probe runs: the loader,
 `ap_wake`, the driver programs and the host's `test_cpu`. With this polarity none of them silently gets M2 FPCR words.
@@ -183,7 +188,7 @@ code needs (`admission/structure.rs`). The full suite runs once, before merge.
 
 | Chunk | Content | Gate |
 | --- | --- | --- |
-| 1. Emulation and baseline | the shared AFP bit; `fpcr`, `x87_fpcr`, `mxcsr_flags` and `code_context` follow it; the replay body-rewrite hook; unit tests updated | M4 byte-identity (both checks above). In M2 emulation, run the AFP-dependent runners (`run_i5a_de.py`, `run_i5c.py`, `run_i6_faults.py`, `run_i8_faults.py`, `run_i5b.py images`, the FEX ASM suite) and the QEMU corpora (`gen_i5a`/`gen_i6`/`gen_i8` comparisons): record the failing cases. This is the work list, and checks the inventory's predictions |
+| 1. Emulation and baseline | the shared AFP bit; `fpcr`, `x87_fpcr` and `code_context` follow it (`mxcsr_flags` and `simd_fault_flags` in chunks 2-3); the replay body-rewrite hook; unit tests updated | M4 byte-identity (both checks above). In M2 emulation, run the AFP-dependent runners (`run_i5a_de.py`, `run_i5c.py`, `run_i6_faults.py`, `run_i8_faults.py`, `run_i5b.py images`, the FEX ASM suite) and the QEMU corpora (`gen_i5a`/`gen_i6`/`gen_i8` comparisons): record the failing cases. This is the work list, and checks the inventory's predictions |
 | 2. Common-mode zero-cost fixes | rows 2, 3 | M4 byte-identity; in M2 emulation, the affected runner cases pass |
 | 3. Keyed rare modes | the key bits on hosts without AFP (DAZ, effective FTZ; x87 DE unmasked already keyed), reaching both sides and fexc's arguments; rows 4, 5, 6, 7, 8, 10 and row 3's unmasked-PE part; op tables §2.1 | M4 byte-identity; in M2 emulation, `run_i5c.py` DAZ, FTZ and unmasked cases, `run_i6_faults.py` x87 DE, and the corpora's DAZ/FTZ groups pass. A common-mode replay in M2 emulation shows these rows add no code there |
 | 4. NaN guard (decision A) | 4a: the guard with an empty fix-up, measured. 4b, which starts only after the per-op-class fix-up table (§2.1) has been reviewed: the fix-ups, the x87 path, op tables | 4a: the benchmark gate of decision A. 4b: in M2 emulation, the NaN cases of the corpora and runners pass, and the gate is re-measured |
@@ -214,7 +219,7 @@ Rows 2-10's common-mode cost is checked structurally, by a common-mode replay in
 | --- | --- | --- | --- |
 | Nov 15 | research | done: [inventory](afp-inventory.md) | read-only; Arm ASL (Sail), code, SDM |
 | Nov 15 | plan | reviewed twice; second round: accept with required changes, nothing blocks chunks 1-4a; answered (this text). The per-op-class fix-up table (§2.1) is reviewed before chunk 4b | §7 |
-| Nov 15 | 1. Emulation and baseline | code part running (worktree `afp-c1`, branch `afp-c1-emulation`): `no_afp` in `Cpu`, host-conditional `fpcr`/`x87_fpcr`, exhaustive M4-identity unit test, replay body-rewrite hook. The VM baseline (runners in M2 emulation) follows the cpu-features suite | |
+| Nov 15 | 1. Emulation and baseline | **code done, reviewed and accepted** (afp-c1-emulation ece3057): `Cpu::no_afp`, host-conditional `fpcr`/`x87_fpcr`, `X87_FPCR_EXPLICIT`, the probe follows `NATEMU_FEXC_FEATURE_OFF` (startup line `; host -afp`), replay hook `NATEMU_REPLAY_ADD_ARGS`. **VM baseline next** (after the cpu-features suite) | exhaustive identity test (65536 MXCSR × FCW.RC × 64 masks) vs verbatim old functions; abi 110, host 387; fexc `natemu-raw/afp-c1-fexc-20261115-01` (SHA-256 89947bf8...); replay vs the cpu-c3 fexc: installer 124,024 and build 245,572 requests, 0 differences (`replay.txt` there) |
 
 ## 7. Review response (independent review, November 15)
 
