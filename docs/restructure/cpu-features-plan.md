@@ -86,6 +86,18 @@ There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profi
   resident tests as a compile-time constant (today XSAVEC and XSAVEOPT; a resident transaction alone, such as RDRAND's or
   CLWB's, does not make a feature `layout`). That covers AVX, MPX, AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
 - `source`: the SDM section and the decision that set its state. The existing `source` strings stay.
+- `exceptions` (owner question, November 15): the SDM exception class of the feature's instructions, e.g. VEX
+  "Type 4" for VAES and AVX-VNNI (SDM Vol.2A 2.8, exception conditions for VEX-encoded instructions; the legacy SSE
+  classes likewise), plus `simd_fp: true|false`. A `built` feature also lists the fault tests that cover its class:
+  - **#UD and #NM:** encoding (reserved VEX.L, W or vvvv), CR4.OSXSAVE and XCR0 gating, CR0.TS for #NM.
+  - **Memory faults:** #PF, #GP and #SS at the memory operand, including a 32-byte operand that crosses a page, with the
+    destination and every register unchanged (contract 41).
+  - **Alignment:** #GP for aligned forms, #AC under alignment checking.
+  - **#XM** (only when `simd_fp`): each unmasked exception, delivered before the destination is written, with x86's
+    flags and precedence. The instruction's floating-point ops must be ones `FexcPrecision::PlaceFPChecks` knows.
+
+  The validator refuses a `built` feature without `exceptions` or without its listed tests. Today's core features keep
+  the corpora that already cover them (I5a/I5c/I8/I9 fault runners), recorded per entry.
 
 `state` keeps its meaning: `advertised`, `clear` or `dynamic`. A new `built` boolean (as built, chunk 1) marks
 whether a feature has an implementation. It defaults to true for advertised and dynamic entries and false for clear
@@ -398,6 +410,23 @@ Chunks 1, 2 and 0 are independent of each other. Chunk 3 depends on 0 and 1. Chu
 3. Gate its rows.
 4. Add its tests.
 5. Mark it advertised.
+
+Step 4 includes its exception tests: the `exceptions` class decides which (§2.1). Natemu's mechanisms make precise
+exceptions general rather than per feature:
+- memory faults are recovered to the state before the instruction (contract 41), whatever FEX lowering produced the
+  access;
+- unmasked SIMD floating-point exceptions are checked after an instruction's floating-point ops and before it commits
+  (`FexcSimdCheck`);
+- forms of a feature the host's guest CPU lacks are a precise #UD (the gated rows).
+
+So a new feature needs no new exception machinery unless it brings a new kind of floating-point op or a new access
+shape. It still needs tests proving its forms meet the obligations, because those are the paths a new lowering can
+break:
+- a 256-bit form split into two 128-bit halves, faulting on the second;
+- an op missing from the floating-point check placement.
+
+VAES, VPCLMULQDQ and AVX-VNNI are integer instructions: SDM exception Type 4, no #XM. They need the #UD, memory-fault and
+page-crossing cases only.
 
 It classifies itself: core when its Arm needs are in the floor, otherwise optional, which needs chunk 5. The validator
 refuses the entry until each step is done. The cheap candidates of November 14 are core candidates, because their Arm
