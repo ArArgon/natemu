@@ -282,10 +282,12 @@ pub(super) fn park(s: &mut State) {
         deadline = lapic::deadline();
         // Halt polling: the first wait of this halt spins for its wake before it sleeps; the later ones (after the
         // timer's early wakes, or a doorbell that brought nothing to take) only sleep.
-        if polled.is_none() {
-            polled = Some((lapic::now(), super::io_halt_wait(s, s.halt_poll)));
-        } else {
+        // A halt that waits again was not ended by what the poll caught: it is judged by its whole length.
+        if let Some((_, caught)) = &mut polled {
+            *caught = false;
             super::io_halt_wait(s, 0);
+        } else {
+            polled = Some((lapic::now(), super::io_halt_wait(s, s.halt_poll)));
         }
         if crate::perf::ON && !woke {
             let r = rung.load(SeqCst);

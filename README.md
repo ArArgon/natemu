@@ -35,7 +35,7 @@ hardware features natemu needs. Other distributions and kernels are untested. Ma
 - **Booting:** no BIOS or UEFI firmware. natemu starts a Linux kernel directly, so it cannot boot
   installer ISOs or bootloaders.
 - **Devices:** a serial console, a network card, raw disk images and a random-number device only. No
-  PCI bus, display, keyboard, sound, USB or file sharing with the Mac. Disk images must be raw, not qcow2.
+  PCI bus by default (an experimental one: `--virtio-transport pci`), display, keyboard, sound, USB or file sharing with the Mac. Disk images must be raw, not qcow2.
 - **Networking:** outbound IPv4 only. No IPv6, no port forwarding into the guest, and the guest
   cannot reach the Mac's `localhost`.
 - **CPU:** 64-bit code only, so 32-bit programs do not run. No AVX-512, AMX or CET. x87 floating
