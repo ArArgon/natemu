@@ -380,6 +380,18 @@ the following:
   from the start, when it is built. Core forms keep their unnamed rows. The startup line names the optional features
   this host adds or lacks.
 
+## Progress (updated as chunks land; newest last)
+
+| Date | Chunk | State | Evidence |
+| --- | --- | --- | --- |
+| Nov 15 | plan | approved by the owner after five review rounds and the owner's decisions | §6, §7 |
+| Nov 15 | 0. Stream | **done, merged** (40dd5ff). `NATEMU_FEXC_RECORD` recorder; replay gate documented in tools/fexc/README.md | streams `natemu-raw/cpu-c0-stream-20261115-02`: installer 124,024 requests, `build` boot 245,572; self-replay 0 differences each; fexc `correctness-forms-20261107-02` |
+| Nov 15 | 1. Catalogue | **done, merged** (4b5ed10, 4d94d48). Per-bit entries extended; `built` flag; validator with a negative control per rule; core derived from the floor | independent review accepted after one round of fixes; `gen_cpu_profile_rs.py --check` identical; tools/models 287 tests OK; natemu-abi 108 passed |
+| Nov 15 | 2. Host table and probe | **reviewed, accepted; gate running** (cpu-c2-host 864a8a1). FEATURES with classes and floor; the probe in `execution::enter` (one refusal line); CSV3/SB from the vCPU; `NATEMU_FEXC_FEATURE_OFF` | 380 host unit tests; installer boot at 2 vCPUs (TSO read-back); CSV3/SB equal sysctl. Fallback gate: `build` boot verified with everything on and with FlagM2, FCMA and FRINTTS each forced off (ECV is already off: the vCPU hides it); K1 rows rerunning. The replies-unchanged check holds by construction: fexc is unchanged and `body_bytes_are_unchanged` passes. M2 probe run pending on the owner |
+| next | 3. Gate constants | not started. Adds the `exceptions` field and its backfill; the startup line's guest map; a host-crate test tying `cpu_profile.py`'s FLOOR to FEATURES | |
+| next | 4. Records | not started | |
+| after | AFP fallback (owner, Nov 15: plan, review, then build; must be performant) | not started | |
+
 ## 4. Chunks and gates
 
 The default launch is byte-for-byte unchanged in every chunk. The full suite runs once, before merge; targeted gates
