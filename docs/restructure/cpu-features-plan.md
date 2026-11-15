@@ -338,3 +338,31 @@ Apple's TSO bit and the interrupt-controller API are part of the floor too, thou
 flagm, flagm2, fcma, crc32, aes, sha, pmull128, frintts, i8mm, dotprod, ecv. lrcpc and lrcpc2 are in the floor but off by
 policy. AFP is the one exactness feature. Neither machine reports RNG, CSSC, MOPS or SVE.
 
+
+**What the core guest features rely on** (from FEX's dispatcher and natemu's admission; chunk 1 records these as each
+entry's `host` field). A feature is required when there is no fallback: FEX marks the instruction unimplemented without
+it, or admission accepts only the encodings that use it.
+
+| Arm feature | Class | Core guest features that use it |
+| --- | --- | --- |
+| FlagM | required | every flag-producing instruction (CFINV and friends; the code generator's settings require it) |
+| LSE | required | LOCK prefixes, XCHG with memory, CMPXCHG8B/16B (admission accepts only LSE atomics; the resident is built with LSE) |
+| Apple TSO bit, interrupt-controller API | required | the whole machine (x86 memory ordering; interrupts) |
+| CRC32 | required | SSE4.2's CRC32 |
+| AES | required | AES-NI |
+| PMULL (128-bit) | required | PCLMULQDQ |
+| SHA1, SHA256 | required | SHA-NI |
+| AdvSIMD, FP, FP16 conversions (Armv8.0 base) | required | SSE through AVX2, FMA, F16C |
+| AFP | exactness | SSE and x87 NaN choice, denormal flag, flush settings, underflow rounding |
+| FlagM2 | speed only | flag conversions |
+| FCMA | speed only | ADDSUBPS/ADDSUBPD |
+| FRINTTS | speed only | floating-point-to-integer conversions |
+| ECV | speed only | RDTSC (a self-synchronising counter read, else ISB and a counter read) |
+| SB, CSV3 | option only | `--speculation-barriers` and the RDCL_NO bit |
+| DotProd, I8MM | none in core yet | AVX-VNNI when built |
+| LRCPC, LRCPC2 | none (off by policy) | unused under hardware TSO |
+
+Bases with no extra Arm feature: BMI1/2, LZCNT, POPCNT (no CSSC: a vector sequence), MOVBE, ADX, AVX, AVX2. RDRAND
+uses the resident's host-entropy path, not FEAT_RNG. Natemu-implemented system features (FSGSBASE, SMEP, UMIP, x2APIC,
+RDTSCP, CLWB, CLFLUSHOPT, XSAVE family) need none. The resident's split-lock handling also assumes LSE2's alignment
+behaviour without checking it. LSE2 is in the floor; chunk 2 adds it to the probe's required list.
