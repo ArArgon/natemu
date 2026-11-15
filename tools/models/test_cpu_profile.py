@@ -316,7 +316,7 @@ class Catalogue(unittest.TestCase):
 
     def test_candidates_classify_themselves(self):
         feats = {n: dict(f[0], built=True) for n, f in P.features().items()}
-        for n in ('VAES', 'VPCLMULQDQ', 'AVX_VNNI'): self.assertTrue(P.core(feats[n]), n)   # AES, PMULL, dotprod|i8mm: within the floor
+        for n in ('VAES', 'VPCLMULQDQ', 'AVX_VNNI'): self.assertTrue(P.core(feats[n]), n)   # AES, PMULL: in the floor; AVX-VNNI needs no Arm feature (FEX has a plain-SIMD fallback)
         self.assertFalse(P.core(feats['WAITPKG']))                                          # WFxT is above the floor: optional
         for n in ('VAES', 'VPCLMULQDQ', 'AVX_VNNI', 'WAITPKG'): self.assertFalse(P.features()[n][0]['built'], n)
         self.assertEqual(P.features()['AVX_VNNI'][0]['sub'], 1)
@@ -325,6 +325,15 @@ class Catalogue(unittest.TestCase):
     def test_requires_not_advertised(self):
         self.fires(self.mutate('AES', requires=['VAES']), 'AES', 'requires VAES', 'not advertised')
         self.fires(self.clear('XSAVE'), 'AVX', 'requires XSAVE', 'not advertised')
+
+    def test_state_is_one_of_the_three(self):
+        self.fires(self.mutate('VAES', state='not-built'), 'VAES', "state 'not-built'")
+
+    def test_catalogue_host_data(self):
+        f = P.features()
+        self.assertEqual(f['AVX_VNNI'][0]['host'], {'speed': ['i8mm', 'dotprod']})
+        for n in ('CX8', 'CX16'): self.assertEqual(f[n][0]['host']['required'], ['atomics_lse'])
+        for n in ('SSE', 'FPU'): self.assertIn('flagm2', f[n][0]['host']['speed'])
 
     def test_requires_unknown_feature(self):
         self.fires(self.mutate('AES', requires=['NOPE']), 'AES', "requires 'NOPE'")
@@ -346,6 +355,15 @@ class Catalogue(unittest.TestCase):
     def test_optional_layout_feature(self):
         self.fires(self.mutate('MPX', built=True, host={'required': ['wfxt']}), 'MPX', 'optional layout')
         self.fires(self.mutate('MPX', built=True), 'MPX', 'built and core but not advertised')   # a built core feature is advertised
+
+    def test_built_optional_feature_is_refused_until_the_mask_exists(self):
+        self.fires(self.mutate('WAITPKG', built=True), 'WAITPKG', 'host-derived mask (chunk 5)')
+        self.assertEqual([m for m in P.problems() if 'WAITPKG' in m], [])             # not built: allowed
+
+    def test_remote_key_needs_the_subleaf_to_have_no_entry(self):
+        d = copy.deepcopy(RAW)
+        d['cpuid'].append({'leaf': '0x7', 'subleaf': 1, 'eax': '0x0', 'ebx': '0x0', 'ecx': '0x0', 'edx': '0x0', 'source': 'test'})
+        self.fires(cp.Profile(d).problems(), 'AVX_VNNI', 'move it there')
 
     def test_unknown_gate_consumer(self):
         self.fires(self.mutate('AES', gates=['kernel']), 'AES', "gates names 'kernel'")
