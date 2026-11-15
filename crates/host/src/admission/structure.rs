@@ -2368,7 +2368,7 @@ mod tests {
             "c5e858cb", "c5ed5ecb", "c4e269b8cb", "c4e269b9cb", "c4e2e9b8cb", "c4e2e9b9cb", "c4e269bacb", "c4e2e9bdcb", "c4e2e9becb", "c4e2e9bbcb",
             "c5ed7ccb", "c5ed7dcb", // memory operands, 256-bit forms (two halves, one check) and DPPS's steps follow
             "f30f580b", "0f580b", "0f5a0b", "f20f5e0b", "f30f510b", "c4e269b90b", "c5fc5a0b", "c5ec58cb", "c4e26db8cb", "c5ef7ccb", "c4e36d40cbff",
-            "c5ecc2cb01",
+            "c5ecc2cb01", "c4e27913ca", "c4e27d13ca", "c4e2791300", // VCVTPH2PS: half-precision sources, no DE
         ];
         let x87 = [
             "d903", "dd03", "d803", "dc03", "d80b", "dc0b", "d813", "dc13", "d81b", "dc1b", "d823", "dc23", "d82b", "dc2b", "d833", "dc33", "d83b",
