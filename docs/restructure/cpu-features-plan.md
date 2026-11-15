@@ -454,6 +454,19 @@ https://gist.github.com/Mizux/fc3309b1efeb1454cc7b093c5f23992e. The owner pointe
 stated. That macOS has no FEAT_CRC32 or FEAT_AFP keys: CRC32 comes from `hw.optional.armv8_crc32: 1`, and a missing key
 counts as absent.
 
+**Second record** (owner, November 15): https://github.com/lelegard/arm-cpusysregs/blob/main/docs/apple-m1-features.md.
+Its M1, M3 and M4 tables read the real ID registers at EL1 through a kernel extension (`sysregs -s`); its comparison
+table uses sysctl. It doesn't state the chip variant or the macOS version.
+- **Agrees with the first record** on every feature natemu requires: FlagM, FlagM2, LSE, LSE2, CRC32, AES, PMULL,
+  SHA1/256, DotProd, FRINTTS, FCMA, LRCPC/2, SB, CSV3. All present on the M1.
+- **Settles ECV:** the M1's register reads give ECV absent, though sysctl (its comparison table, and the first record)
+  says present. ECV stays out of the floor in any case; on the M4 the hypervisor hides it anyway.
+- **Shows sysctl under-reporting SPECRES:** the registers give it present on the M1, M3 and M4, while sysctl gives 0
+  on the M2 and the M4. This agrees with the M4 vCPU measurement above.
+- **Not fully reliable:** its M4 table gives I8MM absent, but the M4's sysctl and its vCPU's ID_AA64ISAR1 both give
+  I8MM present (measured here). The M3 table also contradicts the same page's comparison table on I8MM. So its tables
+  are an estimate, like sysctl, and the vCPU probe stays the evidence.
+
 **Gaps against the floor:** I8MM, BF16, PAuth2, FPAC and BTI, plus everything above the floor (AFP, RPRES, WFxT, SME).
 The M1 Pro has every required feature: FlagM, FlagM2, LSE, LSE2, CRC32, AES, PMULL, SHA1/SHA256 and DotProd. The record
 lists ECV as present. The owner understands the M1 to lack it, so this is unsettled, but ECV is speed only and the
