@@ -39,7 +39,8 @@ pub(super) fn store(s: &mut State, i: System) -> Result<(), Exception> {
     }
     if flags & simd_unmasked(before) != 0 {
         let raised = simd_fault_flags(fpsr_bits(flags), before);
-        s.cpu.mxcsr = before | mxcsr_flags(raised, before);
+        // Software flags (no FPSR, so no AFP difference): `no_afp` does not apply.
+        s.cpu.mxcsr = before | mxcsr_flags(raised, before, false);
         return Err(if s.cpu.cr4 & CR4_OSXMMEXCPT != 0 {
             [19, 0, 0]
         } else {

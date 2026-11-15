@@ -1962,8 +1962,12 @@ pub const fn fsw_summary(fsw: u64, fcw: u64) -> u64 {
 /// UFC -> UE, IXC -> PE, and IDC -> DE unless DAZ. With FPCR.AH = 1 and FIZ = 0 the M4 sets IDC for a denormal input it
 /// does not flush, with x86's precedence (none beside an IE or ZE of the same operation or a NaN operand; not for FP to
 /// integer conversions, FRINT* or the reciprocal estimates; the I5a review's measurements, `tools/run_i5a_de.py`). Under DAZ
-/// (FIZ = 1) IDC marks a flushed input, where x86 sets no DE.
-pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64) -> u64 {
+/// (FIZ = 1) IDC marks a flushed input, where x86 sets no DE. With `no_afp` ([`Cpu::no_afp`]) an FZ flush sets UFC without IXC
+/// (inventory 1.7, 1.8), so under effective FTZ (FZ with UM masked, the condition [`fpcr`] uses) UFC also sets PE, as x86 does
+/// for a flushed result; without FTZ a UFC comes with IXC already.
+pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64, no_afp: bool) -> u64 {
+    let ftz = no_afp as u64 & mxcsr >> 15 & mxcsr >> 11;
+    let pe = fpsr >> 4 | (fpsr >> 3 & ftz);
     let de = if mxcsr & MXCSR_DAZ == 0 {
         fpsr >> 7 & 1
     } else {
@@ -1974,7 +1978,7 @@ pub const fn mxcsr_flags(fpsr: u64, mxcsr: u64) -> u64 {
         | (fpsr >> 1 & 1) << 2
         | (fpsr >> 2 & 1) << 3
         | (fpsr >> 3 & 1) << 4
-        | (fpsr >> 4 & 1) << 5
+        | (pe & 1) << 5
 }
 /// MXCSR.DAZ (denormal source operands are zeros: no DE).
 pub const MXCSR_DAZ: u64 = 1 << 6;
@@ -3978,6 +3982,29 @@ mod tests {
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, true), X87_FPCR_EXPLICIT);
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 13, true), X87_FPCR_EXPLICIT);
         assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true), X87_FPCR_EXPLICIT | 3 << 22);
+    }
+
+    /// AFP fallback row 3: without AFP, under effective FTZ (FZ, UM masked) a UFC also sets PE, since the flush has no IXC; no
+    /// other flag, control or FPSR bit changes, and with AFP (or no FTZ, or UM unmasked) the mapping is the old one.
+    #[test]
+    fn without_afp_a_flush_under_ftz_also_sets_pe() {
+        const UE: u64 = 1 << 4;
+        const PE: u64 = 1 << 5;
+        let ftz = MXCSR_RESET | 1 << 15;
+        assert_eq!(mxcsr_flags(1 << 3, ftz, true), UE | PE);
+        assert_eq!(mxcsr_flags(1 << 3, ftz, false), UE);
+        assert_eq!(mxcsr_flags(1 << 3, MXCSR_RESET, true), UE); // no FTZ: UFC without IXC is a real UE only
+        assert_eq!(mxcsr_flags(1 << 3, ftz & !(1 << 11), true), UE); // UM unmasked: FTZ is ignored
+        assert_eq!(mxcsr_flags(0, ftz, true), 0);
+        assert_eq!(mxcsr_flags(1 << 4, ftz, true), PE);
+        for mxcsr in 0..1u64 << 16 {
+            for fpsr in 0..=0xffu64 {
+                let (with, without) = (mxcsr_flags(fpsr, mxcsr, false), mxcsr_flags(fpsr, mxcsr, true));
+                assert_eq!(without & !PE, with & !PE, "{fpsr:#x} {mxcsr:#x}");
+                let want = (fpsr >> 3 & mxcsr >> 15 & mxcsr >> 11 & 1) * PE;
+                assert_eq!(without, with | want, "{fpsr:#x} {mxcsr:#x}");
+            }
+        }
     }
 
     /// I5c: FTZ only flushes with the underflow exception masked; the unmasked sets in flag order, DE dropped under DAZ.

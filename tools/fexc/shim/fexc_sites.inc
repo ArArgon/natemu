@@ -184,8 +184,11 @@ DEF_OP(FexcSimdCheck) {
 // block's entry (FEX's CPUState::mxcsr, frame::MXCSR on the host: the controls and the flags banked so far) with the flags
 // generated code raised since, exactly as the resident's bank computes them (`sse::bank`, `mxcsr_flags`): FPSR's IOC, DZC,
 // OFC, UFC, IXC as IE, ZE, OE, UE, PE and IDC as DE unless DAZ, FPSR or-ed with the SIMD flag byte (the flags checked
-// instructions moved there under unmasked exceptions). Only x0/x1 and the destination are written.
-//   ldr wD, [x28, #mxcsr]; mrs x0, fpsr; ldrb w1, [x28, #simd_flags]; orr w0, w0, w1; and w1, w0, #1; orr wD, wD, w1;
+// instructions moved there under unmasked exceptions). Only x0/x1 and the destination are written. Without AFP (`afp=0`, AFP
+// fallback row 3; none of it on the M4) an FZ flush sets UFC without IXC, so under effective FTZ (FZ, UM masked: MXCSR bits 15
+// and 11) the UFC bit also sets PE: `and w1, wD, wD, lsr #4; and w1, w1, w0, lsl #8; ubfx w1, w1, #11, #1; orr w0, w0, w1, lsl #4`
+// after the `orr w0, w0, w1` (the same rule as `mxcsr_flags`'s `no_afp`).
+//   ldr wD, [x28, #mxcsr]; mrs x0, fpsr; ldrb w1, [x28, #simd_flags]; orr w0, w0, w1; [afp=0: the four above;] and w1, w0, #1; orr wD, wD, w1;
 //   ubfx w1, w0, #1, #4; orr wD, wD, w1, lsl #2; ubfx w0, w0, #7, #1; bic w0, w0, wD, lsr #6; orr wD, wD, w0, lsl #1
 DEF_OP(FexcMxcsr) {
   const auto Dst = GetReg(Node);
@@ -193,6 +196,12 @@ DEF_OP(FexcMxcsr) {
   mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
   ldrb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
   orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2);
+  if (!HostSupportsAFP) {
+    and_(ARMEmitter::Size::i32Bit, TMP2, Dst, Dst, ARMEmitter::ShiftType::LSR, 4);
+    and_(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1, ARMEmitter::ShiftType::LSL, 8);
+    ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP2, 11, 1);
+    orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2, ARMEmitter::ShiftType::LSL, 4);
+  }
   and_(ARMEmitter::Size::i32Bit, TMP2, TMP1, 1);
   orr(ARMEmitter::Size::i32Bit, Dst, Dst, TMP2);
   ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP1, 1, 4);
