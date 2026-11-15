@@ -778,7 +778,7 @@ mod tests {
         );
         rig.write(0x16, 2, 4);
         assert_eq!(rig.read(0x18, 2), 0, "no fifth queue");
-        // One queue: what the device was before (no feature bit, the configuration ends at blk_size).
+        // One queue: no VIRTIO_BLK_F_MQ, and the configuration's num_queues reads 0.
         drop(rig);
         let rig = disk(1);
         assert_eq!(rig.read(0x12, 2), 1);
