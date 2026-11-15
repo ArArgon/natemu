@@ -379,7 +379,9 @@ fn prepare_at_alias(
         pool,
     })
 }
-/// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no).
+/// Whether this host reports Arm feature `name` (`sysctl hw.optional.arm.<name>` = 1; absent or unreadable: no). Only the
+/// probe's sysctl cross-check test uses it: natemu answers from the vCPU's registers ([`crate::probe`]).
+#[cfg(test)]
 pub fn host_feature(name: &str) -> bool {
     unsafe extern "C" {
         fn sysctlbyname(
@@ -436,7 +438,7 @@ pub fn set_cpu(area: Area, cpu: Cpu, speculation_barriers: bool) {
     natemu_abi::cpu::firmware_mtrrs(&mut msrs, control.ram_bytes.min(exec::LOW_RAM_END));
     // IA32_ARCH_CAPABILITIES: RDCL_NO only with the barriers on AND a host whose own loads do not pass faulting data on
     // (FEAT_CSV3). Off by default, so a default-command-line guest keeps PTI (owner decision, November 5).
-    let rdcl_no = speculation_barriers && host_feature("FEAT_CSV3");
+    let rdcl_no = speculation_barriers && crate::probe::csv3();
     msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_ARCH_CAPABILITIES).unwrap()] =
         natemu_abi::cpu::arch_capabilities(rdcl_no);
     area.write_record(exec::MSRS_OFFSET, msrs);
@@ -2547,16 +2549,15 @@ impl Compiler {
     pub fn finish(&mut self) -> Option<(u64, u64, u64)> {
         self.server.as_mut().and_then(Server::finish)
     }
+    /// The compiler of the vCPU `cpu`, after the resident's setup (`enter`): runs the startup probe ([`crate::probe`]: one
+    /// refusal for every missing requirement, the startup line) and takes the supported features from it.
+    /// `NATEMU_FEXC_FEATURE_OFF=name,...` (test only: the fallback gate, plan section 2.2a) clears the named ones.
     pub fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
-        let mut id = [0; admission::ID_REGISTERS.len()];
-        for (value, (name, reg)) in id.iter_mut().zip(admission::ID_REGISTERS) {
-            *value = cpu.sys(reg).map_err(|e| format!("{name}: {e}"))?;
+        let mut supported = crate::probe::startup(cpu)?.supported();
+        if let Some(list) = std::env::var_os("NATEMU_FEXC_FEATURE_OFF") {
+            supported &= !admission::forced_off(&list.to_string_lossy())?;
         }
-        Ok(Self::with_features(
-            fexc,
-            admission::supported_features(&id),
-            max_instructions,
-        ))
+        Ok(Self::with_features(fexc, supported, max_instructions))
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self {

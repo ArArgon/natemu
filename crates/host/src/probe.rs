@@ -1,0 +1,183 @@
+//! The one startup probe (CPU-features plan section 2.2): reads the vCPU's ID registers (the ones admission reads, plus
+//! ID_AA64MMFR2_EL1 for LSE2) and Apple's TSO bit, checks every `Required` host item at once, and records the exactness
+//! facts (AFP). It fails with one message listing everything missing (`natemu: host lacks lse2 pmull`), prints the startup
+//! line, and answers CSV3 and SB from the vCPU's registers (never sysctl: the resident runs SB in the vCPU's view).
+//! [`startup`] runs when a vCPU's compiler is set up (after the resident's setup wrote ACTLR_EL1), and every vCPU repeats
+//! the check (cheap, identical); the line prints once per process. The interrupt-controller API is a deployment fact (its
+//! functions are strong imports: macOS 15 or later, stated in the README), not probed.
+use crate::admission::{
+    Class, FEATURES, ID_REGISTERS, MACHINE, detected, supported_features,
+};
+use crate::vm::{ACTLR_EL1, Vcpu, config_id_register};
+use std::sync::OnceLock;
+
+/// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
+const CONFIG_REGISTERS: [u32; ID_REGISTERS.len()] = [2, 3, 7, 4, 5, 6];
+
+/// What the host's vCPU shows: the ID registers and whether Apple's TSO bit (ACTLR_EL1 bit 1) reads back set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Probe {
+    pub id: [u64; ID_REGISTERS.len()],
+    pub tso: bool,
+}
+impl Probe {
+    /// Reads a created vCPU, after the resident's setup wrote ACTLR_EL1 (`vm.rs enter_resident_with_asid`).
+    pub(crate) fn read(cpu: &Vcpu) -> Result<Self, String> {
+        let mut id = [0; ID_REGISTERS.len()];
+        for (value, (name, reg)) in id.iter_mut().zip(ID_REGISTERS) {
+            *value = cpu.sys(reg).map_err(|e| format!("{name}: {e}"))?;
+        }
+        Ok(Self {
+            id,
+            tso: cpu.sys(ACTLR_EL1)? & 2 != 0,
+        })
+    }
+    /// Every `Required` item the host lacks (fexc features by fexc's name, then the machine's rows).
+    pub(crate) fn missing(&self) -> Vec<&'static str> {
+        self.lacking(Class::Required)
+    }
+    /// Every `Exactness` feature the host lacks (AFP).
+    pub(crate) fn inexact(&self) -> Vec<&'static str> {
+        self.lacking(Class::Exactness)
+    }
+    fn lacking(&self, class: Class) -> Vec<&'static str> {
+        let features = FEATURES.iter().map(|f| (f.name, &f.detect, f.class));
+        let machine = MACHINE.iter().map(|&(n, ref d, c)| (n, d, c));
+        (features.chain(machine))
+            .filter(|&(_, d, c)| c == class && !detected(d, &self.id, self.tso))
+            .map(|(n, ..)| n)
+            .collect()
+    }
+    /// The refusal, listing everything missing at once; `None` when the host has all.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        let missing = self.missing();
+        (!missing.is_empty()).then(|| format!("natemu: host lacks {}", missing.join(" ")))
+    }
+    /// The terse startup line, `None` when there is nothing to say. Only the host part exists so far: `natemu: cpu host
+    /// -afp` for a host without AFP. Hook for the guest feature map (generated constants, a later chunk): it becomes the
+    /// part before `; host`, and the line is then always printed.
+    pub(crate) fn line(&self) -> Option<String> {
+        let inexact = self.inexact();
+        (!inexact.is_empty()).then(|| {
+            let host: Vec<_> = inexact.iter().map(|n| format!("-{n}")).collect();
+            format!("natemu: cpu host {}", host.join(" "))
+        })
+    }
+    /// The fexc feature bits this vCPU can execute.
+    pub(crate) fn supported(&self) -> u64 {
+        supported_features(&self.id)
+    }
+}
+
+/// The startup probe for a created vCPU: refuses with one message, prints the startup line once per process, and
+/// returns the probe. Call after the resident's setup (`execution::enter`).
+pub(crate) fn startup(cpu: &Vcpu) -> Result<Probe, String> {
+    static PRINTED: OnceLock<()> = OnceLock::new();
+    let probe = Probe::read(cpu)?;
+    if let Some(refusal) = probe.refusal() {
+        return Err(refusal);
+    }
+    if let Some(line) = probe.line() {
+        PRINTED.get_or_init(|| eprintln!("{line}"));
+    }
+    Ok(probe)
+}
+
+/// The hypervisor's configuration view of the ID registers (no VM or vCPU needed; they agree on every register natemu
+/// reads), for the answers needed before any vCPU exists: CSV3 and SB. Cached; `None` when unreadable (then absent).
+fn config_view() -> Option<&'static [u64; ID_REGISTERS.len()]> {
+    static VIEW: OnceLock<Option<[u64; ID_REGISTERS.len()]>> = OnceLock::new();
+    VIEW.get_or_init(|| {
+        let mut id = [0; ID_REGISTERS.len()];
+        for (value, reg) in id.iter_mut().zip(CONFIG_REGISTERS) {
+            *value = config_id_register(reg).ok()?;
+        }
+        Some(id)
+    })
+    .as_ref()
+}
+fn machine(name: &str) -> bool {
+    let row = MACHINE.iter().find(|r| r.0 == name).expect("machine row");
+    config_view().is_some_and(|id| detected(&row.1, id, true))
+}
+/// FEAT_CSV3 (ID_AA64PFR0_EL1[63:60]): the host's loads do not pass faulting data on (the only condition for RDCL_NO
+/// besides `--speculation-barriers`).
+pub(crate) fn csv3() -> bool {
+    machine("csv3")
+}
+/// FEAT_SB (ID_AA64ISAR1_EL1[39:36]): the page-walk barriers' leaf instruction.
+pub(crate) fn sb() -> bool {
+    machine("sb")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admission::index;
+
+    /// ID registers of a host with everything required (bits set only for what natemu reads).
+    const FULL: [u64; ID_REGISTERS.len()] = [
+        2 << 20 | 2 << 52 | 1 << 16 | 2 << 4 | 1 << 8 | 1 << 12 | 1 << 44, // LSE, FlagM2, CRC32, PMULL, SHA1/2, DotProd
+        1 << 16 | 1 << 32 | 1 << 36 | 1 << 20,                              // FCMA, FRINTTS, SB, LRCPC
+        1 << 60,                                                            // CSV3
+        0,
+        1 << 44,      // AFP
+        1 << 32,      // LSE2
+    ];
+    fn probe(f: impl FnOnce(&mut Probe)) -> Probe {
+        let mut p = Probe { id: FULL, tso: true };
+        f(&mut p);
+        p
+    }
+
+    #[test]
+    fn a_full_host_passes_silently() {
+        let p = probe(|_| {});
+        assert_eq!(p.refusal(), None);
+        assert_eq!(p.line(), None);
+        assert_ne!(p.supported() & 1 << index("flagm"), 0);
+    }
+
+    #[test]
+    fn one_refusal_lists_everything_missing() {
+        // FlagM, LSE and LSE2 missing; the order is FEATURES' then the machine rows'.
+        let p = probe(|p| {
+            p.id[0] &= !(15 << 52) & !(15 << 20);
+            p.id[5] = 0;
+        });
+        assert_eq!(
+            p.refusal().as_deref(),
+            Some("natemu: host lacks atomics_lse flagm lse2")
+        );
+        // Each alone, and the TSO bit and PMULL (AES field 1: AES yes, PMULL no).
+        assert_eq!(probe(|p| p.id[5] = 0).missing(), ["lse2"]);
+        assert_eq!(probe(|p| p.tso = false).missing(), ["apple_tso"]);
+        assert_eq!(
+            probe(|p| p.id[0] = FULL[0] & !(15 << 4) | 1 << 4).missing(),
+            ["pmull128"]
+        );
+        assert_eq!(
+            probe(|p| p.id[0] = 0).refusal().as_deref(),
+            Some("natemu: host lacks atomics_lse flagm crc32 aes sha pmull128")
+        );
+    }
+
+    #[test]
+    fn a_host_without_afp_runs_with_a_note() {
+        let p = probe(|p| p.id[4] = 0);
+        assert_eq!(p.refusal(), None);
+        assert_eq!(p.line().as_deref(), Some("natemu: cpu host -afp"));
+        assert_eq!(p.supported() & 1 << index("afp"), 0);
+    }
+
+    /// The startup probe reads the vCPU's registers; so does [`config_view`], and CSV3 and SB answered from it equal sysctl's
+    /// (plan chunk 2 gate). Needs the real host and no entitlement: `cargo test -p natemu probe -- --ignored`.
+    #[test]
+    #[ignore = "real host: compares the hypervisor's registers with sysctl"]
+    fn csv3_and_sb_from_registers_equal_sysctl() {
+        let sysctl = |n: &str| crate::execution::host_feature(n);
+        assert_eq!(csv3(), sysctl("FEAT_CSV3"));
+        assert_eq!(sb(), sysctl("FEAT_SB"));
+        assert!(config_view().is_some());
+    }
+}

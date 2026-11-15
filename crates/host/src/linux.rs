@@ -165,10 +165,11 @@ impl Boot {
             return Err("network: forwarding and host-loopback options require --net".into());
         }
         self.net_options.validate()?;
-        // PCID plan P1: the barriers' leaf SB needs FEAT_SB; refuse to turn them on without it (default off needs nothing).
-        if self.speculation_barriers && !execution::host_feature("FEAT_SB") {
+        // PCID plan P1: the barriers' leaf SB needs FEAT_SB (the vCPU's ID_AA64ISAR1_EL1); refuse to turn them on without it
+        // (default off needs nothing).
+        if self.speculation_barriers && !crate::probe::sb() {
             return Err(
-                "--speculation-barriers: this host lacks FEAT_SB (sysctl hw.optional.arm.FEAT_SB)"
+                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)"
                     .into(),
             );
         }

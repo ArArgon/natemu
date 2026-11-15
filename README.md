@@ -46,7 +46,11 @@ Other distributions and kernels are untested. Major features still missing:
 
 ## Requirements
 
-- An Apple Silicon Mac running macOS 26 (tested on M4)
+- An Apple Silicon Mac running macOS 26 (tested on M4). The minimum is macOS 15: natemu uses
+  Hypervisor.framework's interrupt-controller API (`hv_gic_*`), which is linked as a required
+  import, so an older macOS refuses to load the binary. There is no runtime check for it. At startup natemu checks the
+  vCPU for the hardware features it needs (FlagM, LSE, LSE2, the crypto extensions, Apple's TSO bit) and
+  fails with one line naming everything missing, for example `natemu: host lacks lse2 pmull128`.
 - Xcode Command Line Tools (`xcode-select --install`)
 - [rustup](https://rustup.rs). The repository pins the Rust version, and rustup installs it automatically.
 - [Homebrew](https://brew.sh) packages: `brew install cmake ninja pkg-config libslirp e2fsprogs`

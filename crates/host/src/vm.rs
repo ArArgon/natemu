@@ -46,6 +46,8 @@ unsafe extern "C" {
     fn hv_vcpu_run(vcpu: u64) -> i32;
     fn hv_vcpu_set_trap_debug_exceptions(vcpu: u64, value: bool) -> i32;
     fn hv_vcpu_set_trap_debug_reg_accesses(vcpu: u64, value: bool) -> i32;
+    fn hv_vcpu_config_create() -> *mut c_void;
+    fn hv_vcpu_config_get_feature_reg(config: *mut c_void, reg: u32, value: *mut u64) -> i32;
     fn hv_vcpu_set_vtimer_offset(vcpu: u64, offset: u64) -> i32;
     fn hv_vcpus_exit(vcpus: *mut u64, count: u32) -> i32;
     fn hv_vm_get_max_vcpu_count(count: *mut u32) -> i32;
@@ -57,6 +59,19 @@ pub fn hv(code: i32, operation: &str) -> Result<()> {
     } else {
         Err(format!("{operation}: {:#x}", code as u32))
     }
+}
+
+/// The hypervisor's vCPU configuration's value of ID register `feature_reg` (`hv_feature_reg_t`): the view a vCPU gets,
+/// readable with no VM or vCPU (they agree on every register natemu reads; plan appendix).
+pub(crate) fn config_id_register(feature_reg: u32) -> Result<u64> {
+    let mut value = 0;
+    unsafe {
+        let config = hv_vcpu_config_create();
+        let code = hv_vcpu_config_get_feature_reg(config, feature_reg, &mut value);
+        os_release(config);
+        hv(code, "hv_vcpu_config_get_feature_reg")?;
+    }
+    Ok(value)
 }
 
 /// Fails unless the host can run `n` vCPUs in one VM.
@@ -311,9 +326,8 @@ impl Drop for Machine {
 
 pub(crate) const PC: u32 = 31;
 pub(crate) const CPSR: u32 = 34;
-pub(crate) const ID_AA64ISAR0_EL1: u16 = 0xc030;
+pub(crate) const ACTLR_EL1: u16 = 0xc081;
 const SCTLR_EL1: u16 = 0xc080;
-const ACTLR_EL1: u16 = 0xc081;
 const CPACR_EL1: u16 = 0xc082;
 const CNTV_CTL_EL0: u16 = 0xdf19;
 const MDSCR_EL1: u16 = 0x8012;
@@ -336,8 +350,7 @@ pub struct Vcpu {
     alive: bool,
 }
 impl Vcpu {
-    /// Creates a vCPU on the calling thread. FEAT_FlagM is an emulator requirement:
-    /// FEX-generated code uses CFINV.
+    /// Creates a vCPU on the calling thread. The host's features are checked once by [`crate::probe`], not here.
     pub fn create() -> Result<Self> {
         let mut cpu = Self {
             id: 0,
@@ -352,9 +365,6 @@ impl Vcpu {
             )?
         };
         cpu.alive = true;
-        if (cpu.sys(ID_AA64ISAR0_EL1)? >> 52) & 15 == 0 {
-            return Err("FlagM required for FEX-generated code (CFINV)".into());
-        }
         Ok(cpu)
     }
     pub(crate) fn id(&self) -> u64 {
