@@ -276,5 +276,101 @@ class Consistency(unittest.TestCase):
                 self.assertEqual(P.memory_type(st, a), WB if a < 0xa0000 else UC, (hex(L), hex(a)))
 
 
+class Catalogue(unittest.TestCase):
+    """The guest feature catalogue (cpu-features plan sec. 2.1): every validator rule fires on a mutated profile."""
+
+    @staticmethod
+    def field(d, name):
+        for e in d['cpuid']:
+            for r, fs in e.get('fields', {}).items():
+                for b, f in fs.items():
+                    if f['name'] == name: return e, r, b, f
+
+    def mutate(self, name, **kw):
+        """Problems after replacing keys of feature `name`'s entry (a value None removes the key)."""
+        d = copy.deepcopy(RAW)
+        f = self.field(d, name)[3]
+        for k, v in kw.items():
+            if v is None: f.pop(k, None)
+            else: f[k] = v
+        return cp.Profile(d).problems()
+
+    def clear(self, name):
+        """Problems after the feature is clear in both its word and its entry."""
+        d = copy.deepcopy(RAW)
+        e, r, b, f = self.field(d, name)
+        f['state'] = 'clear'
+        e[r] = hex(int(e[r], 16) & ~(1 << int(b)))
+        return cp.Profile(d).problems()
+
+    def fires(self, problems, *words):
+        self.assertTrue(any(all(w in m for w in words) for m in problems), (words, problems))
+
+    def test_profile_is_core(self):
+        feats = P.features()
+        adv = [f[0] for f in feats.values() if f[0]['state'] == 'advertised']
+        self.assertGreater(len(adv), 40)
+        for f in adv: self.assertTrue(P.core(f), f['name'])          # every advertised feature is core
+        self.assertTrue(cp.FLOOR <= cp.ARM_FEATURES)
+        self.assertEqual({n for n in cp.V3} - set(feats), set())
+
+    def test_candidates_classify_themselves(self):
+        feats = {n: dict(f[0], built=True) for n, f in P.features().items()}
+        for n in ('VAES', 'VPCLMULQDQ', 'AVX_VNNI'): self.assertTrue(P.core(feats[n]), n)   # AES, PMULL, dotprod|i8mm: within the floor
+        self.assertFalse(P.core(feats['WAITPKG']))                                          # WFxT is above the floor: optional
+        for n in ('VAES', 'VPCLMULQDQ', 'AVX_VNNI', 'WAITPKG'): self.assertFalse(P.features()[n][0]['built'], n)
+        self.assertEqual(P.features()['AVX_VNNI'][0]['sub'], 1)
+        self.assertEqual(P.cpuid(7, 1), (0, 0, 0, 0))
+
+    def test_requires_not_advertised(self):
+        self.fires(self.mutate('AES', requires=['VAES']), 'AES', 'requires VAES', 'not advertised')
+        self.fires(self.clear('XSAVE'), 'AVX', 'requires XSAVE', 'not advertised')
+
+    def test_requires_unknown_feature(self):
+        self.fires(self.mutate('AES', requires=['NOPE']), 'AES', "requires 'NOPE'")
+
+    def test_not_built_but_advertised(self):
+        self.fires(self.mutate('SHA', built=False), 'SHA', 'advertised but not built')
+
+    def test_v3_not_advertised(self):
+        self.fires(self.clear('CX16'), 'x86-64-v3 feature CX16 is not advertised')
+
+    def test_v3_made_non_core_by_an_arm_feature_above_the_floor(self):
+        self.fires(self.mutate('AVX', host={'required': ['ecv']}), 'AVX', 'not core', 'ecv')
+        self.fires(self.mutate('AVX', host={'required': [['i8mm', 'ecv']]}), 'AVX', 'not core')    # any-of group, none in the floor
+        self.assertEqual([m for m in self.mutate('AVX', host={'required': [['i8mm', 'dotprod']]}) if 'AVX' in m], [])
+
+    def test_unknown_arm_feature(self):
+        self.fires(self.mutate('AES', host={'required': ['aes_typo']}), 'AES', 'aes_typo', 'not an fexc Arm feature')
+
+    def test_optional_layout_feature(self):
+        self.fires(self.mutate('MPX', built=True, host={'required': ['wfxt']}), 'MPX', 'optional layout')
+        self.fires(self.mutate('MPX', built=True), 'MPX', 'built and core but not advertised')   # a built core feature is advertised
+
+    def test_unknown_gate_consumer(self):
+        self.fires(self.mutate('AES', gates=['kernel']), 'AES', "gates names 'kernel'")
+
+    def test_leaf7_max_subleaf(self):
+        d = copy.deepcopy(RAW)
+        next(e for e in d['cpuid'] if e['leaf'] == '0x7')['eax'] = '0x1'
+        self.fires(cp.Profile(d).problems(), 'leaf 7 max subleaf')
+        d = copy.deepcopy(RAW)                    # AVX-VNNI advertised without leaf 7's EAX saying subleaf 1 exists
+        self.field(d, 'AVX_VNNI')[3].update(state='advertised', built=True)
+        self.fires(cp.Profile(d).problems(), 'leaf 7 max subleaf')
+
+    def test_msr_listed_under_a_clear_feature_is_defined(self):
+        self.fires(self.mutate('TSC_ADJUST', msrs=['0x10a']), 'TSC_ADJUST', 'clear but MSR 0x10a present')
+
+    def test_msr_listed_under_an_advertised_feature_is_missing(self):
+        self.fires(self.mutate('RDTSCP', msrs=['0x3b']), 'RDTSCP', 'MSR 0x3b missing')
+
+    def test_cr4_listing_follows_the_control_gates(self):
+        self.fires(self.mutate('UMIP', cr4=None), 'CR4.UMIP')
+        self.fires(self.mutate('UMIP', cr4=['SMEP']), 'cr4 SMEP is not gated on it')
+
+    def test_subleaf_follows_where_the_feature_lives(self):
+        self.fires(self.mutate('AVX_VNNI', subleaf=0), 'AVX_VNNI', 'subleaf')
+
+
 if __name__ == '__main__':
     unittest.main()
