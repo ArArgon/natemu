@@ -166,7 +166,9 @@ deviation from the SDM on hosts without AFP. The M4 is unaffected either way.
 **C. The MIN_NORMAL band (rows 9 and 13).** A result whose exact value lies just below ±MIN_NORMAL and rounds to it.
 - **Deviation:** without AFP, Arm judges tininess before rounding (x86: after, SDM Vol.1 4.9.1.5). So:
   - masked: the UE flag is wrongly set;
-  - unmasked: a spurious #XM.
+  - unmasked: a spurious #XM;
+  - under DAZ + FTZ together (gcc `-Ofast`), which runs on the hardware flush (FZ = 1), the result itself is wrong:
+    0 instead of ±MIN_NORMAL (chunk 3a review). FTZ alone flushes in software and gets the result right.
 - **Exact:** needs exact recomputation in a resident slow path, a small SSE emulator, which natemu doesn't have.
 - **Recommendation:** accept both as declared deviations. They need a result within half an ulp below MIN_NORMAL.
 
