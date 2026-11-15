@@ -579,6 +579,116 @@ def literal_exits(d):
     return sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move' and r['register'] == 0)
 
 
+# AFP fallback chunk 3a: the guest forms (hex, assembled from Intel syntax once) whose DAZ/FTZ code the tests below pin.
+FLUSH_IN = ['shl', 'ushr', 'cmeq', 'ushr', 'bic']                       # an operand flushed to a zero of its sign (mask in VTMP1)
+FLUSH_OUT = ['shl', 'ushr', 'cmeq', 'ushr', 'and', 'fmul', 'bic']       # a result flushed, UFC and IXC raised for each lane flushed
+AFP_FP = {   # name -> hex: SSE/AVX floating-point forms of every class of FlushRuleOf (register operands, so each is one block)
+    'addps': '0f58ca', 'subpd': '660f5cca', 'mulss': 'f30f59ca', 'divsd': 'f20f5eca', 'sqrtps': '0f51ca', 'minps': '0f5dca', 'maxsd': 'f20f5fca',
+    'haddps': 'f20f7cca', 'addsubpd': '660fd0ca', 'dpps': '660f3a40ca ff'.replace(' ', ''), 'cmpltps': '0fc2ca01', 'cmpeqss': 'f30fc2ca00',
+    'comiss': '0f2fca', 'ucomisd': '660f2eca', 'cvtps2pd': '0f5aca', 'cvtpd2ps': '660f5aca', 'cvtss2sd': 'f30f5aca', 'cvtsd2ss': 'f20f5aca',
+    'cvtps2dq': '660f5bca', 'cvttsd2si': 'f2480f2cc2', 'roundps': '660f3a08ca04', 'rcpps': '0f53ca', 'rsqrtss': 'f30f52ca',
+    'vfmadd231ps': 'c4e269b8cb', 'vfnmsub213sd': 'c4e2e9afcb', 'vmulps ymm': 'c5ec59cb', 'vdivpd ymm': 'c5ed5ecb', 'vcvtps2ph': 'c4e3791dd100',
+    'vcvtpd2ps ymm': 'c5fd5aca', 'vcvtps2pd ymm': 'c5fc5aca', 'vhaddpd ymm': 'c5ed7ccb',
+}
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpFlush(unittest.TestCase):
+    """AFP fallback chunk 3a: `--daz` and `--ftz` (the host sends them only without AFP) and their software flushes. Their semantics
+    are checked by differential runs against the M4's own FIZ/FZ code on the M4 (the work's gate); these pin where the code goes."""
+    AFP0 = ['--feature', 'afp=0']
+
+    def words(self, hexs, *extra):
+        d, rc = run(hexs, RIP, *extra)
+        self.assertEqual(rc, 0, (hexs, extra))
+        lay = d['code']['layout']
+        code = bytes.fromhex(d['code']['hex'])
+        lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal']
+        with tempfile.TemporaryDirectory() as t:
+            dis = check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+        mn = [re.split(r'[. ]', x.strip())[0] for o, x in sorted(dis.items()) if o >= lay['code_region_begin']]
+        self.assertEqual(lay['spill_bytes'], 0, (hexs, extra))
+        return mn, region(d)
+
+    def test_a_host_with_afp_ignores_both_keys(self):
+        for name, h in AFP_FP.items():
+            for extra in ([], ['--simd-unmasked', '0x20']):
+                base = run(h, RIP, *extra)[0]
+                for keys in (['--daz'], ['--ftz'], ['--daz', '--ftz']):
+                    self.assertEqual(region(run(h, RIP, *extra, *keys)[0]), region(base), (name, keys, extra))
+
+    def test_no_keys_no_change_without_afp(self):
+        # (the common mode: the replay of the recorded streams with afp=0 added, against the previous compiler, pins the rest)
+        for name, h in AFP_FP.items():
+            mn, _ = self.words(h, *self.AFP0)
+            self.assertFalse({'cmeq'} & set(mn), name)
+
+    def test_daz_alone_flushes_every_fp_source_first(self):
+        def before(name_or_hex, op, *extra):   # the instructions before the first `op`
+            mn, _ = self.words(AFP_FP.get(name_or_hex, name_or_hex), *self.AFP0, '--daz', *extra)
+            return mn[:mn.index(op)]
+        self.assertEqual(before('addps', 'fadd'), FLUSH_IN * 2)
+        self.assertEqual(before('0f58c9', 'fadd'), FLUSH_IN)   # addps xmm1, xmm1: one value, flushed once
+        self.assertEqual(before('vfmadd231ps', 'fmla')[:15], FLUSH_IN * 3)
+        self.assertEqual(before('minps', 'fcmgt'), FLUSH_IN * 2)   # row 4 covers MIN/MAX: both sources, then the compare
+        self.assertEqual(before('comiss', 'fcmpe'), FLUSH_IN * 2)
+        self.assertEqual(before('cvtps2dq', 'frint32x'), FLUSH_IN)   # to integer: the source only (the FRINT's integral result is not flushed again)
+        self.assertEqual(self.words(AFP_FP['cvtps2dq'], *self.AFP0, '--daz')[0].count('cmeq'), 1)
+        self.assertEqual(before('vcvtps2ph', 'fcvtn')[-5:], FLUSH_IN)   # VCVTPS2PH honours DAZ (the imm8 rounding-mode FPCR switch comes first)
+        # DPPS: every FP op's inputs: both factors, the products, the first add level's sums
+        mn, _ = self.words(AFP_FP['dpps'], *self.AFP0, '--daz')
+        self.assertEqual(mn.count('shl'), 4, mn)
+        self.assertEqual(mn.count('faddp'), 2, mn)
+
+    def test_ftz_alone_flushes_the_results_that_x86_flushes_and_raises_ue_and_pe(self):
+        def after(name, op, *extra):   # the instructions after the first `op`
+            mn, _ = self.words(AFP_FP[name], *self.AFP0, '--ftz', *extra)
+            return mn[mn.index(op) + 1:]
+        self.assertEqual(after('addps', 'fadd')[:7], FLUSH_OUT)
+        mn, _ = self.words(AFP_FP['mulss'], *self.AFP0, '--ftz')   # the scalar's result is inserted into element 0, then flushed
+        self.assertEqual(mn[mn.index('shl'):][:7], FLUSH_OUT)
+        self.assertLess(mn.index('fmul'), mn.index('shl'))
+        self.assertEqual(after('vfmadd231ps', 'fmla')[:7], FLUSH_OUT)
+        for name in ('minps', 'maxsd', 'sqrtps', 'cmpltps', 'comiss', 'cvtps2dq', 'cvttsd2si', 'roundps', 'vcvtps2ph', 'cvtss2sd', 'rsqrtss'):
+            self.assertNotIn('cmeq', self.words(AFP_FP[name], *self.AFP0, '--ftz')[0], name)   # no FTZ on them
+        for name in ('cvtpd2ps', 'cvtsd2ss'):   # the narrowing converts to single
+            self.assertEqual(self.words(AFP_FP[name], *self.AFP0, '--ftz')[0].count('fmul'), 1, name)
+        mn, _ = self.words(AFP_FP['rcpps'], *self.AFP0, '--ftz')   # RCP's flags are restored: a flush without them
+        self.assertEqual(mn[mn.index('msr') + 1:][:5], FLUSH_IN)
+        self.assertNotIn('fmul', mn)
+        self.assertEqual(self.words(AFP_FP['dpps'], *self.AFP0, '--ftz')[0].count('fmul'), 4)   # products and both add levels
+
+    def test_daz_and_ftz_together_use_fz_and_flush_only_what_min_max_select(self):
+        for name, h in AFP_FP.items():
+            both, _ = self.words(h, *self.AFP0, '--daz', '--ftz')
+            plain, _ = self.words(h, *self.AFP0)
+            if name in ('minps', 'maxsd'):
+                core = both[:both.index('svc')]
+                while core[-1] in ('mov', 'movk', 'msr'): core.pop()   # (the NZCV restore follows the flush)
+                self.assertEqual(core[-5:], FLUSH_IN, name)   # the selected result, flushed with no flag
+                self.assertEqual(both.count('cmeq'), 1, name)
+            else:
+                self.assertEqual(both, plain, name)
+
+    def test_x87_instructions_are_left_alone(self):
+        for h in ('dc00', 'd8c1', 'dec1', 'd9c0'):   # fadd qword [rax]; fadd st0, st1; faddp; fld st0
+            plain, _ = self.words(h, *self.AFP0)
+            for keys in (['--daz'], ['--ftz'], ['--daz', '--ftz']):
+                self.assertEqual(self.words(h, *self.AFP0, *keys)[0], plain, (h, keys))
+
+    def test_unmasked_pe_also_tests_ufc_under_effective_ftz(self):
+        def mask(*extra):
+            _, r = self.words('0f58ca', *extra, '--simd-unmasked', '0x20')
+            m = [int.from_bytes(r[i:i + 4], 'little') for i in range(0, len(r), 4)]
+            return [(w >> 5) & 0xffff for w in m if w & 0xffe0001f == 0x52800001][0]   # movz w1, #M
+        self.assertEqual(mask(), 0x10)
+        self.assertEqual(mask('--ftz'), 0x10)                     # a host with AFP: never
+        self.assertEqual(mask(*self.AFP0), 0x10)
+        self.assertEqual(mask(*self.AFP0, '--daz'), 0x10)
+        self.assertEqual(mask(*self.AFP0, '--ftz'), 0x18)
+        self.assertEqual(mask(*self.AFP0, '--ftz', '--daz'), 0x18)
+
+
 def check_exits(test, d, tmp, what):
     test.assertEqual({r['kind'] for r in d['code']['relocations']} - {'guest_rip_literal', 'guest_rip_move', 'dispatch_branch'}, set(), what)
     test.assertEqual(d['state_abi']['state_pointer_loads'], [], what)

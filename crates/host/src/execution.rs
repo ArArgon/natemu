@@ -1966,7 +1966,7 @@ impl Answer {
     }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-pub(crate) const GATING: usize = 11;
+pub(crate) const GATING: usize = 13;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -2438,7 +2438,8 @@ pub struct Compiler {
     /// operand-sized unit against the breakpoints) and then steps compiled without it (`State::plain_step`).
     pub(crate) alignment_gated: bool,
     /// The vCPU's x87 gating and rounding (I6, [`x87_args`]) and its unmasked floating-point exceptions (I5c): fexc's
-    /// `--x87-gated`, `--wait-gated`, `--x87-fpcr`, `--simd-unmasked` and `--x87-unmasked` arguments.
+    /// `--x87-gated`, `--wait-gated`, `--x87-fpcr`, `--simd-unmasked`, `--x87-unmasked`, and (without AFP) `--daz` and `--ftz`
+    /// arguments.
     pub(crate) x87: Vec<String>,
     /// Perf chunk 15: a translate request at CPL 0 (never a step): fexc's `--cpl0`, under which it translates the one-byte
     /// CLI and STI inline (the CPL is part of `Cpu::code_context`, so such a block runs only at CPL 0).
@@ -2497,6 +2498,15 @@ pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64) -> Vec<String> {
     ] {
         if unmasked != 0 {
             args.extend([name.into(), format!("{unmasked:#x}")]);
+        }
+    }
+    // AFP fallback chunk 3a (rows 4-6): without AFP only, DAZ and effective FTZ, which `code_context` keys too.
+    for (name, on) in [
+        ("--daz", exec::daz_key(cpu.mxcsr, cpu.no_afp != 0)),
+        ("--ftz", exec::ftz_key(cpu.mxcsr, cpu.no_afp != 0)),
+    ] {
+        if on != 0 {
+            args.push(name.into());
         }
     }
     args
@@ -2664,7 +2674,8 @@ impl Compiler {
         }
     }
     /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, (I5c) the
-    /// unmasked SIMD and x87 exceptions, (perf chunk 15) CPL 0 and the inline TSC, and (perf chunk 26) bulk REP STOS.
+    /// unmasked SIMD and x87 exceptions, (perf chunk 15) CPL 0 and the inline TSC, (perf chunk 26) bulk REP STOS, and
+    /// (AFP fallback chunk 3a) DAZ and effective FTZ.
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
@@ -2688,6 +2699,8 @@ impl Compiler {
             self.cpl0.into(),
             self.tsc.into(),
             self.bulk.into(),
+            flag("--daz"),
+            flag("--ftz"),
         ]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
@@ -4711,7 +4724,7 @@ mod tests {
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);
         let g = [0; GATING];
-        let sse = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let sse = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         a.insert(
             None,
             entry(0x1100, 0, &[1, 2, 3, 4, 5], 0, g),
@@ -6303,6 +6316,15 @@ mod tests {
             }
             assert_eq!(exec::fpcr(mxcsr, false), before_no_afp::fpcr(mxcsr), "fpcr {mxcsr:#x}");
             cpu.mxcsr = mxcsr;
+            // AFP fallback chunk 3a: the DAZ and FTZ keys exist only without AFP (the context bits and fexc's `--daz`/`--ftz`);
+            // with AFP the words compared below (no key bit, no argument) are the old ones.
+            let off = Cpu { no_afp: 1, ..cpu };
+            let args = x87_args(&off, u64::MAX & !(1 << AFP));
+            assert_eq!(args.iter().any(|a| a == "--daz"), mxcsr >> 6 & 1 == 1, "{mxcsr:#x}");
+            assert_eq!(args.iter().any(|a| a == "--ftz"), mxcsr >> 15 & mxcsr >> 11 & 1 == 1, "{mxcsr:#x}");
+            assert_eq!(off.code_context() >> 30, mxcsr >> 6 & 1 | (mxcsr >> 15 & mxcsr >> 11 & 1) << 1, "{mxcsr:#x}");
+            assert_eq!(cpu.code_context() >> 30, 0);
+            assert!(!x87_args(&cpu, afp).iter().any(|a| a == "--daz" || a == "--ftz"));
             // FCW: every RC (bits 11:10) with every combination of the six masks (5:0); precision control and the rest fixed.
             for rc in 0..4u64 {
                 for masks in 0..1u64 << 6 {
@@ -6346,6 +6368,9 @@ mod tests {
                 assert_eq!(fpcr & 7, 0, "no AH, NEP or FIZ");
                 assert_eq!(args.iter().any(|a| a == "--x87-fpcr"), fpcr != 0);
                 assert_eq!(cpu.code_context() >> 14 & 1, u64::from(fpcr != 0));
+                // AFP fallback chunk 3a: DAZ and effective FTZ are sent exactly when keyed.
+                assert_eq!(args.iter().any(|a| a == "--daz"), cpu.code_context() >> 30 & 1 == 1);
+                assert_eq!(args.iter().any(|a| a == "--ftz"), cpu.code_context() >> 31 & 1 == 1);
             }
         }
         // The default 1F80H with RC nearest: nothing is sent and nothing is keyed, as on an AFP host.

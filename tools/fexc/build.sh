@@ -22,12 +22,14 @@ fi
 # A shared checkout may sit on another branch: the pin only has to exist in it (the build is a detached worktree at the pin).
 { [ -L "$root/third_party/FEX" ] || [ "$(git -C "$fex" rev-parse HEAD)" = "$pin" ]; } && git -C "$fex" cat-file -e "$pin^{commit}" ||
   { echo "third_party/FEX is not at the pinned commit $pin" >&2; exit 1; }
+# The pin is the superproject's gitlink (a bump of one without the other would build a compiler the tree does not name).
+[ "$(git -C "$root" rev-parse HEAD:third_party/FEX)" = "$pin" ] || { echo "pin $pin is not the committed gitlink of third_party/FEX" >&2; exit 1; }
 git -C "$fex" worktree prune
 mkdir "$build"
 git -C "$fex" worktree add -q --detach "$build/src" "$pin"
 for e in $externals; do
   mkdir -p "$build/src/External/$e"
-  git -C "$fex/External/$e" archive HEAD | tar x -C "$build/src/External/$e"
+  git -C "$fex/External/$e" archive "$(git -C "$fex" rev-parse "$pin:External/$e")" | tar x -C "$build/src/External/$e"   # as the pin records it
 done
 cmake -S "$here" -B "$build/obj" -G Ninja -DFEXC_SRC="$build/src" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++

@@ -356,7 +356,7 @@ at the guest bytes or at the input's size goes through `InWindow` (FEX's decoder
 `QueryGuestExecutableRange` but uses it only to check a range it then reads), which records the end of each range: the
 compile read only bytes `[0, extent)` and, when `extent` is less than their length, gives the same object, end reason and
 cut for any input of at least `extent` bytes with that prefix (the JSON differs in `input.size`, the input's length). The gating arguments (`--sse-gated`, `--avx-gated`, `--alignment-gated`, `--x87-gated`,
-`--wait-gated`, `--x87-fpcr`) are `FexcArg`s in `shim/fexc_hook.h`: reading one sets its bit (`FEXC_ARG_*`) in `args_read`;
+`--wait-gated`, `--x87-fpcr`, `--simd-unmasked`, `--x87-unmasked`, `--cpl0`, `--tsc`, `--bulk`, `--daz`, `--ftz`) are `FexcArg`s in `shim/fexc_hook.h`: reading one sets its bit (`FEXC_ARG_*`) in `args_read`;
 the shim tests the form before the flag, so a block without a gated form reads none of them. Both are 0 for an error.
 
 **Requests run in this process** (`--serve-mode reuse`, the default since P3): one FEX context per configuration (Config
@@ -429,6 +429,21 @@ Body rewrite (AFP fallback plan, chunk 1): `NATEMU_REPLAY_ADD_ARGS="--feature af
 added arguments with the old one on the recorded bytes, which shows what M2 emulation changes (`--report` through
 `NATEMU_REPLAY_ARGS` prints the replies' summaries). The host-built arguments that depend on `no_afp` (`--x87-fpcr`) are not rewritten: they are unit-tested
 (`with_afp_on_the_fp_words_are_unchanged_for_every_mxcsr_and_fcw`). M2 emulation (`NATEMU_FEXC_FEATURE_OFF=afp`) needs a fexc built at or after `afp-c1-fexc-20261115-01`: an older shim would load the host's `X87_FPCR_EXPLICIT` (bit 32) into FPCR.
+
+**DAZ and FTZ without AFP** (AFP fallback chunk 3a, plan rows 4-6 and row 3's unmasked-PE part; none of it with AFP). `--daz` and
+`--ftz`, which the host sends only when `Cpu::no_afp` and MXCSR.DAZ, or effective FTZ (FTZ with UM masked), are set, are read only by
+a compile with `--feature afp=0` (`fexc_no_afp`) and only where a SIMD floating-point op needs them, so no answer of a host with AFP
+depends on them (the M4 replies and request bodies are byte-identical). The host runs such code with FPCR.FZ = 1 only with both set
+(the hardware flush; `fpcr` in `crates/abi`); with DAZ alone or FTZ alone FZ = 0 and `FexcPrecision::PlaceFlushes` (a pass before
+the exception checks, `shim/fexc_precision.h`) puts `FexcFlush` IR ops (an element with a zero exponent field becomes a zero of its
+sign; five vector instructions, VTMP1 for the mask, the result in an ordinary register) around every FP op of an SSE/AVX
+instruction, on the op's own operands and result, as the M4's FIZ and FZ do for each Arm op: DAZ alone flushes every FP source of
+the ops in `FlushRuleOf`; FTZ alone flushes the results of arithmetic, FMA, HADD/HSUB/ADDSUB and the narrowing converts to single
+and raises UFC and IXC for each lane flushed (`fmul t, d, d` on the denormal: inexact and tiny in every rounding mode; two more
+instructions); DAZ and FTZ both flush only what MIN/MAX select. DPPS's first add level is flushed in `VFAddV` (`FexcFlushStep`).
+x87 instructions are left alone, VCVTPS2PH honours DAZ but not FTZ, RCP's result is flushed under FTZ alone without a flag (its
+flags are restored), and the unmasked-PE check mask gains UFC under effective FTZ (`SimdCheckMask`). `tools/fexc/test_slice1.py`
+(`AfpFlush`) pins the shapes; the replay with `afp=0` added shows the common mode unchanged.
 
 ## What builds
 
