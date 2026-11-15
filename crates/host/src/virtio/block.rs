@@ -1705,10 +1705,11 @@ impl Virtio {
         // hand-off to a worker and back. Kicks stay suppressed meanwhile; the completion re-reads
         // the ring. Like a worker's call, it runs even if a reset arrives before it starts.
         // Not while another queue has been notified: its requests would wait behind this call instead of joining it
-        // on the workers.
+        // on the workers. Not while an interrupt is held: the hold's limits are checked only after the call returns.
         let others = (0..self.profile.queue_count())
             .any(|q| q != id.queue && (s.notified[q] || self.kicks[q].load(SeqCst) != 0));
         let lone = !others
+            && s.owing == 0
             && flight.len() == 1
             && matches!(jobs[..], [(_, Job::Read(..) | Job::Write(_, _, false))]);
         if !lone {
@@ -3512,6 +3513,25 @@ pub(in crate::virtio) mod owner_tests {
             until("inline again", || rig.used_index() == 4);
         });
         assert_eq!(rig.by_worker(), [false, true, true, false]);
+    }
+
+    /// While an interrupt is held the owner makes no disk call itself: the hold's limits are checked between calls.
+    #[test]
+    fn no_inline_call_while_an_interrupt_is_held() {
+        let rig = Rig::new("held-inline");
+        rig.run(|rig| {
+            rig.r.target_runs.store(1, SeqCst);
+            rig.publish(rig.read_request(0));
+            assert!(rig.kick());
+            until("first retired", || {
+                rig.used_index() == 1 && rig.r.lock().in_flight.is_empty()
+            });
+            assert_eq!(rig.r.lock().owing, 1);
+            rig.publish(rig.read_request(1));
+            until("second completed", || rig.used_index() == 2);
+            rig.r.target_runs.store(0, SeqCst);
+        });
+        assert_eq!(rig.by_worker(), [false, true]);
     }
 
     #[test]

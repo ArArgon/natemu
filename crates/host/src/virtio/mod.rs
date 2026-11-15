@@ -1455,14 +1455,14 @@ impl Virtio {
         drop(transfers);
         Ok(Some(u16::from_le_bytes(index) != at))
     }
-    /// Whether `queue`'s interrupt would now reach one vCPU that is running (PCI with MSI-X on the running VM only):
-    /// false whenever that cannot be told. A hint: the vCPU may halt at any moment.
     /// Of `queues`, those whose interrupt's target is not running ([`Self::target_running`]).
     fn halted_targets(&self, guest: Guest<'_>, queues: u8) -> u8 {
         (0..MAX_QUEUES)
             .filter(|&q| queues >> q & 1 != 0 && !self.target_running(guest, q))
             .fold(0, |mask, q| mask | 1 << q)
     }
+    /// Whether `queue`'s interrupt would now reach one vCPU that is running (PCI with MSI-X on the running VM only):
+    /// false whenever that cannot be told. A hint: the vCPU may halt at any moment.
     fn target_running(&self, guest: Guest<'_>, queue: usize) -> bool {
         #[cfg(test)]
         if matches!(guest.copier, Copier::Test(_)) {
