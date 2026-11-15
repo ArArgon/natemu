@@ -488,6 +488,7 @@ impl Prepared {
         let prepare = |v: usize| -> Result<Vcpu> {
             let cpu = Vcpu::create()?;
             execution::enter(&cpu, backing.vcpu(v), true)?;
+            crate::probe::announce(&cpu);
             machine.route(v)?;
             Ok(cpu)
         };

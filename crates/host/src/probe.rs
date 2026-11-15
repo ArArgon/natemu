@@ -1,10 +1,11 @@
 //! The one startup probe (CPU-features plan section 2.2): reads the vCPU's ID registers (the ones admission reads, plus
 //! ID_AA64MMFR2_EL1 for LSE2) and Apple's TSO bit, checks every `Required` host item at once, and records the exactness
-//! facts (AFP). It fails with one message listing everything missing (`natemu: host lacks lse2 pmull`), prints the startup
-//! line, and answers CSV3 and SB from the vCPU's registers (never sysctl: the resident runs SB in the vCPU's view).
-//! [`startup`] runs when a vCPU's compiler is set up (after the resident's setup wrote ACTLR_EL1), and every vCPU repeats
-//! the check (cheap, identical); the line prints once per process. The interrupt-controller API is a deployment fact (its
-//! functions are strong imports: macOS 15 or later, stated in the README), not probed.
+//! facts (AFP). It fails with one message listing everything missing (`natemu: host lacks lse2 pmull`), and answers CSV3
+//! and SB from the vCPU's registers (never sysctl: the resident runs SB in the vCPU's view). [`startup`] runs when a vCPU's
+//! compiler is set up (after the resident's setup wrote ACTLR_EL1), and every vCPU repeats the check (cheap, identical).
+//! The startup line (the guest feature map and a host note) is printed by the Linux boot path only ([`announce`]), once per
+//! process: the program driver's stderr stays as it was. The interrupt-controller API is a deployment fact (its functions
+//! are strong imports: macOS 15 or later, stated in the README), not probed.
 use crate::admission::{
     Class, FEATURES, ID_REGISTERS, MACHINE, detected, supported_features,
 };
@@ -54,15 +55,22 @@ impl Probe {
         let missing = self.missing();
         (!missing.is_empty()).then(|| format!("host lacks {}", missing.join(" ")))
     }
-    /// The terse startup line, `None` when there is nothing to say. Only the host part exists so far: `natemu: cpu host
-    /// -afp` for a host without AFP. Hook for the guest feature map (generated constants, a later chunk): it becomes the
-    /// part before `; host`, and the line is then always printed.
-    pub(crate) fn line(&self) -> Option<String> {
+    /// The one terse startup line: the guest feature map (x86-64-v3 plus the advertised extensions, from the catalogue's
+    /// generated names), then `; host -afp` when the host lacks an exactness feature. The guest CPU is the same on every
+    /// supported host (every built feature is core), so only the host note varies.
+    pub(crate) fn line(&self) -> String {
+        let mut line = String::from("natemu: cpu x86-64-v3");
+        for name in natemu_abi::cpu_gates::ADVERTISED_BEYOND_V3 {
+            line.push_str(" +");
+            line.push_str(name);
+        }
         let inexact = self.inexact();
-        (!inexact.is_empty()).then(|| {
+        if !inexact.is_empty() {
             let host: Vec<_> = inexact.iter().map(|n| format!("-{n}")).collect();
-            format!("natemu: cpu host {}", host.join(" "))
-        })
+            line.push_str("; host ");
+            line.push_str(&host.join(" "));
+        }
+        line
     }
     /// The fexc feature bits this vCPU can execute.
     pub(crate) fn supported(&self) -> u64 {
@@ -76,17 +84,20 @@ impl Probe {
 pub(crate) fn startup(cpu: &Vcpu) -> Result<Probe, String> {
     startup_with(Probe::read(cpu)?)
 }
-/// [`startup`] on a probe already read: the bare refusal string, or the startup line (stderr, once per process, with
-/// its own `natemu: ` prefix since no error path prints it).
+/// [`startup`] on a probe already read: the bare refusal string.
 fn startup_with(probe: Probe) -> Result<Probe, String> {
+    match probe.refusal() {
+        Some(refusal) => Err(refusal),
+        None => Ok(probe),
+    }
+}
+/// Prints the startup line to stderr, once per process (it carries its own `natemu: ` prefix). Called by the Linux boot
+/// path after a vCPU's setup passed [`startup`]; the program driver never calls it.
+pub(crate) fn announce(cpu: &Vcpu) {
     static PRINTED: OnceLock<()> = OnceLock::new();
-    if let Some(refusal) = probe.refusal() {
-        return Err(refusal);
+    if let Ok(probe) = Probe::read(cpu) {
+        PRINTED.get_or_init(|| eprintln!("{}", probe.line()));
     }
-    if let Some(line) = probe.line() {
-        PRINTED.get_or_init(|| eprintln!("{line}"));
-    }
-    Ok(probe)
 }
 
 /// The hypervisor's configuration view of the ID registers (no VM or vCPU needed; they agree on every register natemu
@@ -139,10 +150,13 @@ mod tests {
     }
 
     #[test]
-    fn a_full_host_passes_silently() {
+    fn a_full_host_passes() {
         let p = probe(|_| {});
         assert_eq!(p.refusal(), None);
-        assert_eq!(p.line(), None);
+        assert_eq!(
+            p.line(),
+            "natemu: cpu x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt"
+        );
         assert_ne!(p.supported() & 1 << index("flagm"), 0);
     }
 
@@ -194,7 +208,9 @@ mod tests {
     fn a_host_without_afp_runs_with_a_note() {
         let p = probe(|p| p.id[4] = 0);
         assert_eq!(p.refusal(), None);
-        assert_eq!(p.line().as_deref(), Some("natemu: cpu host -afp"));
+        assert!(p.line().starts_with("natemu: cpu x86-64-v3 +adx "));
+        assert!(p.line().ends_with(" +xsaveopt; host -afp"), "{}", p.line());
+        assert_eq!(p.line().matches('\n').count(), 0); // one line
         assert_eq!(p.supported() & 1 << index("afp"), 0);
     }
 

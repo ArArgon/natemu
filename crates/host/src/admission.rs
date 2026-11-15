@@ -1347,6 +1347,38 @@ mod tests {
         assert!(matches!(class("rpres"), Class::Off("kept off to match the reference producer")));
     }
 
+    /// The host table and the guest catalogue (tools/models/cpu_profile.json, through its generated `cpu_gates` lists) name
+    /// the same Arm features: `cpu_profile.py`'s floor is FEATURES' `floor` flags; every Arm feature a built guest feature
+    /// requires is a `Required` row (or a machine row); every `Required` row is named by a guest feature or is a machine need.
+    #[test]
+    fn the_host_table_ties_to_the_catalogue() {
+        use natemu_abi::cpu_gates::{FLOOR, HOST_REQUIRED};
+        // Needs of the machine itself, named by no guest feature: FlagM (every flag-setting form; the plan's "FlagM and LSE
+        // for everything"). The MACHINE rows (LSE2, Apple's TSO bit, FP and AdvSIMD) are machine needs by definition.
+        const MACHINE_NEEDS: [&str; 1] = ["flagm"];
+        let floor: Vec<_> = FEATURES.iter().filter(|f| f.floor).map(|f| f.name).collect();
+        let mut catalogue = FLOOR.to_vec();
+        catalogue.sort_unstable();
+        let mut table = floor.clone();
+        table.sort_unstable();
+        assert_eq!(catalogue, table, "cpu_profile.py FLOOR and FEATURES' floor flags");
+        let required = |name: &str| {
+            FEATURES.iter().any(|f| f.name == name && f.class == Class::Required)
+                || MACHINE.iter().any(|m| m.0 == name && m.2 == Class::Required)
+        };
+        for name in HOST_REQUIRED {
+            assert!(required(name), "{name}: a built guest feature requires it, but it is no Required row");
+            assert!(floor.contains(&name), "{name}: required by a built guest feature (core) but not in the floor");
+        }
+        for f in FEATURES.iter().filter(|f| f.class == Class::Required) {
+            assert!(
+                HOST_REQUIRED.contains(&f.name) || MACHINE_NEEDS.contains(&f.name),
+                "{}: a Required row that no guest feature names and that is no machine need",
+                f.name
+            );
+        }
+    }
+
     /// With `FEXC` set: fexc reports its feature table in every reply (`features.host_features`); its names, order and
     /// defaults are FEATURES' names and order, and the defaults follow the policies: an `Off` feature defaults off,
     /// a `Required` one on (fexc's defaults are what the CLI tools and corpus runners use).
