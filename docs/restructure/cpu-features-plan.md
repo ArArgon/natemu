@@ -165,15 +165,15 @@ command.
 Every Arm feature (and each non-ID-register host property) gets exactly one class in `admission::FEATURES`. The class
 says how it is detected, what happens on a host without it, and what keeps it honest.
 
-| Class | Meaning | Members (floor: M1 ∩ M2 ∩ M4, ECV out) | Without it | Kept honest by |
+| Class | Meaning | Members, with what the guest's vCPU shows (M1/M2/M4 records; M4 measured on macOS 26) | Without it | Kept honest by |
 | --- | --- | --- | --- | --- |
-| **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP; non-register: Apple TSO bit; the interrupt-controller API (a minimum-macOS fact, not a probe: see below) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
-| **exactness** | runs without it, but some guest-visible result differs from x86 | AFP | runs; startup line names the difference; tests that depend on it are tagged with it | M2 work (after this plan): tagged test expectations; the AFP-dependent FPCR bits and flag mapping made conditional |
-| **speed** | a fallback exists; only performance changes | FlagM2, FCMA, FRINTTS, ECV, I8MM (for AVX-VNNI); above the floor RPRES (off by policy); neither chip CSSC, MOPS | fexc gets `name=0`; generated code takes FEX's fallback | the fallback gate (below) |
-| **option** | used only when a command-line option asks for it | SB (`--speculation-barriers`), CSV3 (RDCL_NO with that option) | the option is refused (SB) or the bit stays clear (CSV3) | existing refusal; probe reads both from the vCPU's registers |
-| **guest-optional** | backs an optional guest feature, advertised only where present (§3) | none built; first candidate WAITPKG on WFxT (M4 only) | the guest feature is absent on that host | the host-derived mask's tests (chunk 5) |
-| **off by policy** | present, but not used | LRCPC, LRCPC2 (hardware TSO makes them pointless), WFxT and RPRES until a feature needs them | nothing | the reply cross-check (FEATURES' policy matches fexc's table) |
-| **unused** | nothing in natemu or fexc uses it | SME/SME2, synchronous FP exceptions (precise exceptions are done in software by design), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
+| **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP: on all three chips, in fields every known Hypervisor.framework version passes through. Non-register: Apple TSO bit; the interrupt-controller API (minimum macOS 15, a deployment fact) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
+| **exactness** | runs without it, but some guest-visible result differs from x86 | AFP: M4 only (absent on M1 and M2; shown by macOS 26, hidden by the macOS 12 masks) | runs; startup line names the difference; tests that depend on it are tagged with it | M2 work (after this plan): tagged test expectations; the AFP-dependent FPCR bits and flag mapping made conditional |
+| **speed** | a fallback exists; only performance changes | FlagM2, FCMA, FRINTTS (all three chips); I8MM (M2, M4; macOS-dependent); ECV (hidden by Hypervisor.framework in every version seen, so never used today); RPRES, CSSC, MOPS (in ID_AA64ISAR2, invisible to guests before macOS 27; CSSC and MOPS on no current chip) | fexc gets `name=0`; generated code takes FEX's fallback | the fallback gate (below) |
+| **option** | used only when a command-line option asks for it | SB (`--speculation-barriers`), CSV3 (RDCL_NO with that option): all three chips | the option is refused (SB) or the bit stays clear (CSV3) | existing refusal; probe reads both from the vCPU's registers |
+| **guest-optional** | backs an optional guest feature, advertised only where present (§3) | none built. First candidate: WAITPKG on WFxT (M4 only), blocked until macOS 27 shows ID_AA64ISAR2 | the guest feature is absent on that host | the host-derived mask's tests (chunk 5) |
+| **off by policy** | present, but not used | LRCPC, LRCPC2 (all three chips; hardware TSO makes them pointless); RPRES and WFxT until a feature needs them (and macOS shows them) | nothing | the reply cross-check (FEATURES' policy matches fexc's table) |
+| **unused** | nothing in natemu or fexc uses it | SME/SME2 (M4; shown since macOS 15.2), SPECRES (shown in the vCPU though sysctl says 0), synchronous FP exceptions (precise exceptions are done in software by design), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
 
 **The fallback gate (new, chunk 2).** The speed class is the one most likely to break unnoticed: every machine that
 runs the suite today has all of it. No tool today forces a feature off in a boot or a corpus run: the host builds its
@@ -226,6 +226,112 @@ constants.
 compile cache is invalidated by the binary hash, as with every fexc rebuild today. The request arguments do not change.
 While every built feature is core, which is the case today and stays so for floor-translatable additions, the guest
 CPU is the same on every supported host, and these compile-time constants are exact.
+
+### 2.4 What it looks like (illustrative; names may change in the build)
+
+**A guest catalogue entry** extends the per-bit `fields` entry that `cpu_profile.json` already has:
+
+```json
+"7.0.ebx": {
+  "29": {"name": "SHA", "state": "advertised", "requires": ["SSE2"],
+         "host": {"required": ["sha"]}, "gates": ["shim", "system"],
+         "source": "SDM Vol.2A CPUID 07H EBX[29]; owner decision Nov 3"}
+},
+"7.0.ecx": {
+  "9": {"name": "VAES", "state": "not-built", "requires": ["AVX", "AES"],
+        "host": {"required": ["aes"]}, "gates": ["shim"], "source": "SDM Vol.2A CPUID 07H ECX[9]"}
+},
+"7.1.eax": {
+  "4": {"name": "AVX_VNNI", "state": "not-built", "requires": ["AVX"], "subleaf": 1,
+        "host": {"required": [["dotprod", "i8mm"]], "speed": ["i8mm"]}, "gates": ["shim"]}
+}
+```
+
+`[["dotprod", "i8mm"]]` is an any-of group. AVX's entry carries `"layout": true`. The `name` and `source` fields exist
+today; the rest are new.
+
+**The host table** is `admission::FEATURES`, extended. It stays in fexc's table order and is checked against every
+fexc reply:
+
+```rust
+const FEATURES: [Feature; 32] = [
+    Feature { name: "atomics_lse", detect: Fields(&[(ISAR0, 20, 2)]), class: Required, floor: true },
+    Feature { name: "flagm",       detect: Fields(&[(ISAR0, 52, 1)]), class: Required, floor: true },
+    Feature { name: "flagm2",      detect: Fields(&[(ISAR0, 52, 2)]), class: Speed,    floor: true },
+    Feature { name: "sha",         detect: Fields(&[(ISAR0, 8, 1), (ISAR0, 12, 1)]), class: Required, floor: true },
+    Feature { name: "afp",         detect: Fields(&[(MMFR1, 44, 1)]), class: Exactness, floor: false },
+    Feature { name: "ecv",         detect: Fields(&[(MMFR0, 60, 1)]), class: Speed,    floor: false },
+    Feature { name: "rpres",       detect: Unverifiable, class: Off("kept off to match the reference producer"), floor: false },
+    // ...
+];
+```
+
+The machine needs that aren't fexc features get their own rows in the probe: LSE2 from MMFR2, Apple's TSO bit
+(written and read back). The validator ties the two tables together:
+- every Arm feature a guest entry `required`s must be `Required` here;
+- every `Required` row must be named by some guest entry, or be a machine need.
+
+**At startup** the probe reads the vCPU's ID registers, checks the requirements once and prints one line.
+
+On the M4:
+```
+natemu: host vCPU: all required features present; guest CPU: core (x86-64-v3 + AES, PCLMULQDQ, SHA, ADX, ...)
+```
+
+On the M2:
+```
+natemu: host vCPU: all required features present; exactness: no AFP (x86 floating-point corner cases differ:
+        NaN choice with two NaN inputs, denormal-operand flag, separate DAZ/FTZ, underflow rounding)
+```
+
+On the M1, the same as the M2 plus `this host class is untested`.
+
+On a host missing a requirement:
+```
+natemu: refusing to start: the host vCPU lacks LSE2 (split-lock handling), PMULL (PCLMULQDQ)
+```
+
+**The guest CPU each host gets** is identical today, because every built feature is core:
+
+| Host | Guest CPU | Exactness note | fexc arguments (features the vCPU lacks) |
+| --- | --- | --- | --- |
+| M4, macOS 26 | core | none | `ecv=0`, `rpres=0` (unreadable), ... |
+| M2 | core | no AFP | `afp=0`, `ecv=0`, ... |
+| M1 | core | no AFP; untested | `afp=0`, `ecv=0`, `i8mm=0`, ... |
+
+**Consumers test generated constants** (`GF_*`, from the JSON), not hand-written verdicts:
+
+```cpp
+// fexc_slice1.inc, today:   else if (op >= 0xdc && op <= 0xdf) r = L0;  // VAES's L1 not advertised
+else if (op >= 0xdc && op <= 0xdf) r = GF_VAES ? L0 | L1 : L0;          // after: from the catalogue
+```
+
+```rust
+// system.rs, today: RDSEED and RDPID unconditionally #UD
+} else if reg == 7 && rep == 0xf3 && advertised(gf::RDPID) { (system::RDPID, false) } else { (system::UD, true) };
+```
+
+**The validator** runs in the generator and the tests and names what is wrong:
+
+```
+$ python3 tools/models/gen_cpu_profile_rs.py --check
+cpu_profile.json 7.0.ecx[9] VAES: advertised but not built
+cpu_profile.json 7.0.ecx[9] VAES: requires AVX, AES; AES is not advertised
+cpu_profile.json 7.1.eax[4] AVX_VNNI: shim has no gate GF_AVX_VNNI (gates lists shim)
+cpu_profile.json 1.ecx[28] AVX: x86-64-v3 feature is not core (requires i8mm, which is not in the floor)
+```
+
+**Adding VAES afterwards** is then this sequence:
+1. Set `state` to `advertised`. The validator fails until the next two steps are done.
+2. Gate the shim's VAES rows on `GF_VAES` (above).
+3. Add the corpus cases: VAESENC/VAESDEC ymm, compared against real x86.
+4. Rebuild. Because AES is in the floor, VAES classifies as core and appears on every supported host. The fexc binary
+   hash changes, so the compile cache refreshes by itself.
+
+**A future optional feature** (WAITPKG, once macOS shows ID_AA64ISAR2) has `"host": {"required": ["wfxt"]}`, with WFxT
+not in the floor, so it classifies as optional. That is the point where chunk 5's mask is built:
+- the M4 guest sees WAITPKG and the M2 guest doesn't;
+- the startup line names it: `guest CPU: core + WAITPKG (host WFxT)`.
 
 ## 3. The host-derived mask (built with the first optional feature)
 
