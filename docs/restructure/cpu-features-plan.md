@@ -1,214 +1,262 @@
 # CPU features and profiles: one source for what the guest sees and what the host offers
 
-Status: draft for independent review (November 15, 2026), branch `cpu-features` off `main` at 333b7b6. No code yet.
-Owner direction (November 15): build a centralized CPU feature/profile mechanism before deciding which new guest
-features to implement; the M2 (no FEAT_AFP) floating-point work comes after this plan.
+Status: revised after independent review (November 15, 2026), branch `cpu-features` off `main` at 333b7b6. No code
+yet. Owner direction (November 15): build a centralized CPU feature/profile mechanism before deciding which new guest
+features to implement; there is a core (mandatory) set of features (§2.1); the M2 (no FEAT_AFP) floating-point work
+comes after this plan. The review's findings and how
+each is answered are in §7. Two owner decisions are open (§6).
 
-**Goal:** every CPU feature decision, guest-visible (x86 CPUID, MSRs, control-register bits, instruction forms) or
-host-side (Arm features the generated code, the resident and the admission checks rely on), is made in one place, is
-checked for consistency by tools, and reaches every consumer from that place. Turning a guest feature on or off becomes
-an edit to one catalogue entry plus the feature's own implementation, never a hunt through hand-written tables.
+**Goal:** every CPU feature decision comes from one place, with tool-checked consistency, and reaches every consumer
+from that place. This covers decisions the guest sees (x86 CPUID, MSRs, control-register bits, instruction forms) and
+host-side ones (the Arm features that generated code, admission and the resident rely on). Changing a guest feature
+becomes an edit to its catalogue entry plus the feature's own implementation, not a hunt through hand-written tables.
+The default launch stays byte-for-byte as it is.
 
-**Non-goals:** implementing any new guest feature (RDPID, VAES, the deadline timer, ...); changing the default guest
-CPU; the M2 floating-point differences; selecting features that change register-state layout (AVX, XSAVE components,
-AVX-512); per-vCPU differing CPUs (every vCPU presents the same CPU, as on a real machine); AMD identity.
+**Non-goals:**
+- Implementing any new guest feature (RDPID, VAES, the deadline timer, ...).
+- Changing the default guest CPU.
+- The M2 floating-point differences.
+- Making layout-changing features selectable (§2.1).
+- Per-vCPU differing CPUs (every vCPU presents the same CPU, as on a real machine).
+- AMD identity.
+- Rewriting the reference generators (§5).
 
 ## 1. Where feature decisions live today
 
-The guest side already has a source: `tools/models/cpu_profile.json` (the accepted Intel profile of the decision record,
-every value with its source), judged by `tools/models/cpu_profile.py` and generated into `crates/abi/src/cpu_profile.rs`
-(CPUID table, MSR table, CR0/CR4/EFER/XCR0 valid masks). The resident's CPUID and MSR transactions and the host's SIMD
-decode table (`crates/host/src/system.rs`, `advertised()`) follow it, and tests tie them to it.
+The guest side already has a source: `tools/models/cpu_profile.json`, the accepted Intel profile of the decision record
+with every value sourced. `tools/models/cpu_profile.py` judges it, and it is generated into
+`crates/abi/src/cpu_profile.rs` (CPUID table, MSR table, CR0/CR4/EFER/XCR0 valid masks). The resident's CPUID and MSR
+transactions and the host's SIMD decode table (`crates/host/src/system.rs`, `advertised()`) follow it, and tests tie
+them to it. Each CPUID bit already has a `fields` entry with its name and state, and `feature_names` maps bits to names.
 
 Everything else restates the profile by hand, with nothing checking agreement:
 
 | Fact | Where it is stated | Tie |
 | --- | --- | --- |
-| Which x86 instruction forms the code generator accepts | `tools/fexc/shim/fexc_slice1.inc`: hand-written rows ("VAES's L1 not advertised", AVX-VNNI, GFNI, RTM, CET, WAITPKG, SSE4a, 3DNow refused) | none: fexc takes no profile input; `test_slice1.py` only checks the JSON still says "advertised" |
-| System-instruction forms that are #UD because a feature is clear | `system.rs`: RDSEED, RDPID, XSAVES/XRSTORS, INVPCID, group-7 register forms, WRSS... unconditional #UD | comments only |
-| FEX's guest-facing switches | `fexc.cpp` FeatureTable: `x86_avx`, `x86_aes256`, `x86_3dnow` on, `x86_sse4a` off. FEX's decoder drops its whole VEX table without `x86_avx` (BMI included) | none |
-| Arm features the generated code may use | `fexc.cpp` FeatureTable (32 entries, defaults "Apple M4 view" plus pins kept from the old producer: lrcpc, lrcpc2, rpres, wfxt off) and `crates/host/src/admission.rs` FEATURES (the same 32 names in the same order, with ID-register fields or "unverifiable") | only the count (32) and a positional FlagM index |
-| Hard host requirements | FlagM in four places (vm.rs vCPU creation, admission index, admission table, fexc refusal); LSE in four (resident `+lse` build flag, fexc default, admission accepting only LSE atomics, resident completion code); Apple's TSO bit written in vm.rs | none |
-| Host features read by name | `host_feature("FEAT_CSV3")`, `host_feature("FEAT_SB")` (sysctl) | none |
-| Floating-point assumptions | `fpcr()` writes AH and NEP whatever the host has; the flag mapping assumes FEAT_AFP | none (see the AFP discussion of November 14) |
-| Encodings admission accepts | `admission/structure.rs`: LSE-only atomics, the no-CSSC POPCNT sequence, CNTVCT vs CNTVCTSS by ECV | an Arm feature flipped on (CSSC, a non-LSE host) would emit code admission refuses |
-| Reference CPUs | about ten generators and runners each hard-code a QEMU `-cpu` string (`qemu64,+bmi1,...`, `Haswell,-pcid,...`, `max,-pcid,-smap`) with comments claiming parity | none |
-| Compile cache | key = fexc binary hash + request arguments (features the vCPU lacks, as `name=0`; gating flags) | the guest profile is not in the key; it reaches cached code only through the shim's hand-written rows, i.e. the fexc binary hash |
+| x86 forms the code generator accepts | `tools/fexc/shim/fexc_slice1.inc`. It is an allowlist, so unlisted forms are #UD. Baseline forms are allowed by rows that name no feature, or pass through FEX's decoder. Rows that do name a feature mostly refuse clear ones ("VAES's L1 not advertised", AVX-VNNI, GFNI, RTM, CET, WAITPKG, SSE4a, 3DNow). | none: fexc takes no profile input; `test_slice1.py` only checks that the JSON still says "advertised" |
+| System forms that are #UD because a feature is clear | `system.rs`: RDSEED, RDPID, XSAVES/XRSTORS, INVPCID, group-7 register forms, WRSS... all unconditional #UD | comments only |
+| FEX's guest-facing switch `x86_avx` | `fexc.cpp` FeatureTable default. It selects FEX's VEX table (Frontend.cpp:84-89; without it BMI goes too), and changes code for non-VEX XSAVE/XRSTOR | none |
+| Arm features the generated code may use | `fexc.cpp` FeatureTable (32 entries; defaults are the M4 view, plus pins kept from the old producer: lrcpc, lrcpc2, rpres, wfxt off) and `crates/host/src/admission.rs` FEATURES (the same names in the same order) | only the count and a positional FlagM index |
+| Hard host requirements | FlagM stated four times (vm.rs vCPU creation, the admission index, the admission table, fexc's refusal). LSE stated four times (the resident's `+lse` build flag, fexc's default, admission accepting only LSE atomics, the resident's completion code). Apple's TSO bit is written in vm.rs | none |
+| Host features read by name | `host_feature("FEAT_CSV3")`, `host_feature("FEAT_SB")` (sysctl), although both are fields of ID registers admission already reads (PFR0[63:60], ISAR1[39:36]) | none |
+| Floating-point assumptions | `fpcr()` writes AH and NEP whatever the host has | none |
+| Encodings admission accepts | `admission/structure.rs`: LSE-only atomics, the no-CSSC POPCNT sequence, CNTVCT or CNTVCTSS by ECV | a host feature flipped on (CSSC) would emit code admission refuses |
+| Compile cache | key = fexc binary hash + request arguments | the guest profile reaches cached code only through the shim's hand-written rows, i.e. through the binary hash |
 
-There is one guest profile and no way to select another; `--feature` exists only on the fexc command line.
+Reference corpora pin QEMU `-cpu` strings per generator. Where QEMU and the profile differ, the corpora record it
+explicitly (for example, `-cpu max` implements RDSEED and RDPID, which the profile does not advertise). That is left
+as it is (§5).
 
-## 2. Design
+## 2. Design: one catalogue, consumers generated from it (compile time)
 
-Three records, each with one owner file, and generators that carry them to every consumer.
+This part meets the goal on its own: one place, tool-checked, default unchanged. Runtime selection (§3) is an owner
+decision on top of it.
 
-### 2.1 Guest feature catalogue (x86)
+### 2.1 Guest catalogue: the existing per-bit entries, extended
 
-The catalogue extends `cpu_profile.json`; it does not start a second file. The JSON's per-bit `fields` entries already
-name every CPUID bit and its state. A feature gains the following fields:
+There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profile.json` gains these fields:
 
-- `id`: a stable short name (`VAES`, `RDPID`, `TSC_DEADLINE`).
-- `bits`: the CPUID bits it sets. Usually one; VAES and VPCLMULQDQ are one each.
-- `requires`: x86 features it depends on (VAES requires AVX and AES; AVX-VNNI requires AVX). The source is the SDM's
-  enumeration text.
-- `parts`: what else changes with it.
-  - MSRs that exist only with it. The existing hand-written `FEATURE_MSRS` and `ABSENT_WHEN_CLEAR` maps move here.
-  - CR4 or XCR0 bits it validates.
-  - The CPUID subleaves it needs (AVX-VNNI needs leaf 7 subleaf 1, which raises leaf 7's maximum subleaf).
-  - The instruction-form groups it gates (§2.4).
-- `host`: Arm features its implementation needs, split into required (refuse to advertise without them) and
-  exactness (advertise, but report a known difference).
-- `status`:
-  - `built`: implemented and tested.
-  - `not-built`: never advertised.
-  - `fixed`: always on or always off, because it changes register-state layout or the machine's identity.
-- `tests`: the corpora or runners that cover it (required for `built`).
-- `qemu`: QEMU's flag name, when QEMU has one.
-- `source`: the SDM section and the decision that set its state.
+- `requires`: x86 features it depends on, per the SDM's enumeration text. For example, VAES requires AVX and AES;
+  AVX-VNNI requires AVX.
+- `msrs`: MSRs that exist only with it. The hand-written `FEATURE_MSRS` and `ABSENT_WHEN_CLEAR` maps move here.
+- `cr4`: CR4 bits it validates.
+- `subleaf`: the CPUID subleaf it needs. AVX-VNNI is in leaf 7 subleaf 1, so leaf 7's maximum subleaf (7.0 EAX, 0
+  today) is computed from the highest enabled subleaf.
+- `resident`: behaviour in the resident or host that depends on it. Examples:
+  - STAC/CLAC #UD without SMAP.
+  - Page-walk reserved bits for NX and 1 GiB pages (`crates/abi/src/paging.rs`).
+  - The XSAVEC/XSAVEOPT paths compiled into `xsave.rs`.
+  - ACPI's MADT form under x2APIC.
+- `gates`: the generated constants that consumers test (§2.3).
+- `layout`: true when the feature changes XCR0's valid values, leaf 0xD, or the XSAVE image. That covers AVX, MPX,
+  AVX-512, PKU, CET, AMX, XSAVES/XFD, XSAVEC and XSAVEOPT.
+- `selectable`: false by default. It may be set only when the feature is not `layout` and every consumer it touches
+  tests its gate (§3).
+- `source`: the SDM section and the decision that set its state. The existing `source` strings stay.
 
-A **profile** is a name plus a set of enabled features. `baseline` is today's CPU, exactly. Any other profile, and any
-per-launch adjustment, is `baseline` plus or minus features. The generator computes CPUID values from the enabled set
-over the baseline's non-feature fields (identity, cache and topology leaves, the dynamic rules). Validation (in
-`cpu_profile.py`, run by the generator and the tests) refuses:
+`state` keeps its meaning: `advertised`, `clear` or `dynamic`. A new status, `not-built`, marks a feature with no
+implementation; it can never be advertised.
 
-- a feature whose `requires` is not enabled;
-- a feature that is `not-built`;
-- a `fixed` feature that was flipped;
-- a `built` feature without tests;
-- a CPUID bit that no catalogue entry or explicit "clear, no feature" entry covers.
+**Core set (owner direction, November 15).** A `core: true` entry marks a mandatory feature. Core features:
+- are always advertised and are never `selectable`, on every host, in every build and launch;
+- have every Arm feature they need for correctness (`host` required) become a hard host requirement, so the host probe
+  (§2.2) refuses to start a VM without it rather than drop the feature.
 
-**Host-conditional bits stay as they are, but declared.** ARCH_CAPABILITIES' RDCL_NO, set when the speculation barriers
-are on and the host has CSV3, becomes a catalogue condition instead of a special case in `cpu.rs` and `execution.rs`.
+Every other advertised or `built` feature is optional. An optional feature whose required Arm feature is missing is not
+offered on that host. Proposed membership is decision B (§6): today's baseline, all of it.
 
-### 2.2 Host capability record (Arm)
+The validator (`cpu_profile.py`, run by the generator and the tests) refuses:
+- an advertised feature whose `requires` is not advertised;
+- a `not-built` feature that is advertised;
+- `selectable` on a `layout` feature;
+- `selectable` on a feature whose `resident` behaviour is not gated;
+- a core feature that is clear, `not-built` or `selectable`;
+- a core feature that requires a non-core feature;
+- a `layout` feature that is optional (layout features are core or clear).
 
-A single file, `tools/models/host_features.json`, replaces the two hand-kept 32-entry tables. Each Arm feature has:
+### 2.2 Host Arm features: keep the existing table as the source
 
-- its fexc/FEX field name;
-- how it is detected: an ID-register field, a sysctl name, or "not detectable";
+`admission::FEATURES` stays the source. It gains two fields per entry:
+
 - a **policy**: one of
   - `use when present`;
-  - `off` (with its reason, e.g. "kept off to match the reference producer" for rpres, wfxt and lrcpc);
+  - `off` (with a reason; for rpres, wfxt, lrcpc and lrcpc2: "kept off to match the reference producer"; the ISAR2
+    class can't be read from the vCPU and stays off until a feature needs it);
   - `required` (FlagM, LSE);
-- the admission encoding classes that depend on it (LSE-only atomics, the POPCNT sequence, CNTVCT/CNTVCTSS).
+- the admission encoding classes that depend on it (LSE-only atomics, the POPCNT sequence, CNTVCT or CNTVCTSS).
 
-The generator writes a C++ header that `fexc.cpp` includes (the table, without defaults) and a Rust table for
-`crates/host`. The test of the header and the Rust table replaces the count check.
+The tie to fexc is a host test, not a generated header. fexc already reports its table in order with each value, in
+every reply (`features.host_features`). The test compares those names, their order and their defaults with FEATURES
+and their policies. fexc keeps its defaults, which the CLI tools and corpus runners rely on. The request arguments are
+unchanged: only features the vCPU lacks are sent, as `name=0`.
 
-At startup a single probe builds the **host record**:
+One host probe at startup does three things:
+1. Read the ID registers admission already reads, through the hypervisor's vCPU view.
+2. Check the hard requirements once: FlagM, LSE, the TSO bit and the interrupt-controller API. It fails with one
+   message listing everything missing. This replaces the duplicate FlagM checks in vm.rs and admission (fexc's own
+   refusal stays, as its CLI guard).
+3. Answer CSV3 and SB from PFR0 and ISAR1 instead of sysctl. This is the vCPU's view, which matters for SB because the
+   resident runs it.
 
-- Read the vCPU's ID registers through the hypervisor, as admission does today.
-- Read sysctl for features those registers cannot show (CSV3, SB, and the ID_AA64ISAR2 class: RPRES, WFxT, CSSC,
-  MOPS).
-- Check the hard requirements in one place, with one error listing every missing item (FlagM, LSE, the TSO bit, the
-  interrupt-controller API).
-- Compute the code-generation feature set as policy ∩ present. The host passes it to fexc explicitly as the full set,
-  so fexc has no defaults left to drift.
+The probe's record also holds the exactness facts the M2 work will need, such as whether AFP is present. Startup prints
+one stderr line naming the host's missing optional features and what that changes. There is no separate report
+command.
 
-The host record also carries the exactness facts the guest catalogue asks about (AFP present or not), so the M2 work
-has one place to read them. It is printed by a new `natemu --cpu-report` together with the selected guest profile.
+### 2.3 Generated gate constants
 
-Open point, to verify in chunk 2 rather than assume: whether the hypervisor's vCPU shows the same features as sysctl
-reports for the host. For example, the M4's sysctl lists SME, and we do not know whether the vCPU presents it. The probe
-prefers the vCPU's view and, for registers the host cannot read through the hypervisor, can have the resident read them
-at EL1 during boot (`mrs ID_AA64ISAR2_EL1`, DCZID_EL0). Chunk 2 compares the two views on the M4 and records any
-difference.
+The generator writes two files from the JSON:
+- `GF_*` constants as a C++ header for the shim;
+- the same constants as a Rust module in `crates/abi`, next to `cpu_profile.rs`.
 
-### 2.3 The effective CPU at launch
+**Shim (`fexc_slice1.inc`).** Every row that tests a feature uses its `GF_*` constant: VAES's ymm form,
+VPCLMULQDQ's ymm form, AVX-VNNI, GFNI, RTM, CET, WAITPKG, SSE4a, 3DNow, plus the SHA and ADX rows. Rows for baseline
+`fixed` features need no gate. FEX's `x86_avx` follows this rule: 1 whenever any VEX feature is advertised (AVX, BMI1/2,
+FMA, F16C), with the shim rejecting the AVX forms if AVX itself were clear. `x86_aes256`, `x86_3dnow` and `x86_sse4a`
+only feed FEX's CPUID.cpp, which natemu never calls; they stay pinned.
 
-`--cpu <profile>[,+FEATURE|,-FEATURE...]` (and `NATEMU_CPU`) selects the guest CPU. Without it the guest gets
-`baseline`. The host validates the request against the catalogue (§2.1) and the host record:
+**Host decode (`system.rs`).** Every unconditional "#UD, not advertised" becomes `advertised(feature)` on the same
+constants.
 
-- a feature whose required Arm features are absent is refused, with the reason;
-- an exactness difference is printed by `--cpu-report` and at startup.
+**Cross-check test.** It reads the JSON, the shim and `system.rs`. It fails when:
+- a gate names a feature the catalogue lacks;
+- a feature with a `gates` entry has no gate in a consumer it lists.
 
-The host then builds the **effective CPU tables**: CPUID entries, MSR table, CR0/CR4/EFER/XCR0 valid masks and the
-guest feature mask. It writes them to a read-only boot page that the resident reads. Today these tables are compiled
-into the resident from the single generated profile.
+**Flipping a feature** is then an edit to the JSON and a rebuild. That changes the fexc binary, so the persistent
+compile cache is invalidated by the binary hash, as with every fexc rebuild today. The request arguments do not change.
 
-The tables are small (27 CPUID entries, 50 MSRs). CPUID and MSR transactions are not hot, so reading from a page costs
-nothing measurable. A new fixed-layout record goes into `crates/abi` with layout tests, like the other boot records.
-`cpu_profile.rs` stays generated and becomes the `baseline` instance, used by tests and by the host as the default.
+## 3. Option: guest features selected per launch (owner decision A)
 
-The CPU is fixed for the VM's lifetime: no CPUID value changes during a run. Natemu has no live migration or saved VM
-state today; when it gets one, that state records the effective CPU.
+Compile-time centralisation (§2) leaves one guest CPU per build. Selecting features per launch adds two things:
+- a feature can be tested while it is off by default;
+- a feature that needs an Arm feature the host lacks can be refused on that host.
 
-### 2.4 Consumers driven by the effective CPU
+It costs the following:
 
-- **Code generator (fexc).** A new argument passes the guest feature mask to fexc. The shim's hand-written verdict
-  rows become rows gated on generated feature constants (`GF_VAES`, `GF_AVX_VNNI`, ...). A form whose feature is clear
-  is #UD, as today. A form whose feature is set is decoded through FEX's existing lowering. FEX's guest-facing switches
-  (`x86_avx`, `x86_aes256`, `x86_3dnow`, `x86_sse4a`) are derived from the mask instead of defaults. Each shim row names
-  its feature, and a test checks every named feature exists in the catalogue.
-- **Host system-instruction decode.** Every unconditional "#UD because not advertised" in `system.rs` becomes
-  `advertised(feature)` against the effective CPU. A feature that is advertised but has no resident transaction cannot
-  occur, because `not-built` features are refused at launch. This turns those comments into checks without changing
-  behaviour.
-- **Compile cache.** The guest feature mask and the full code-generation feature set are added to the request
-  arguments, hence to both the in-memory and on-disk keys. The persistent cache is invalidated once.
-- **Reference tooling.** `cpu_profile.py` gains `qemu_cpu(features, base)`. Each generator and runner declares the
-  features its corpus needs instead of a free-text `-cpu` string. A check refuses a corpus that needs a feature the
-  profile does not advertise, or a QEMU model missing one. Where QEMU lacks a feature, the catalogue says so, and the
-  reference must come from real x86 (the tiebreaker rule).
+- **Resident tables: one compiled superset plus a mask.** The MSR array's length and its slot numbers are computed at
+  compile time (`cpu.rs` `Msrs`, `msr()`, the reset and MTRR slots), and the host and driver share that layout. So the
+  tables can't come from a page. The generator compiles one superset covering every `built` feature, and tags each
+  feature-gated CPUID bit, MSR and CR4 bit with its feature. The host writes one guest feature mask into
+  `cache::Control`, the record it already writes and the resident already trusts (beside `speculation_barriers`). The
+  resident ANDs the superset with that mask. The compiled-in consumers that move to reading the mask:
+  - `XSAVEC` in `xsave.rs`;
+  - `CR4_VALID` in `execution.rs`;
+  - `cpu.rs`'s CPUID answers.
 
-## 3. Chunks
+  Layout features are not selectable, so XCR0 and leaf 0xD stay constant.
+- **fexc.** One compact argument, `--guest-features HEX`, carries the mask. It goes into the request arguments and so
+  into the persistent key (adding about 20 bytes). The object header carries only host feature bits, so admission
+  can't see the guest mask. That is safe only because the persistent key includes the arguments, and this plan states
+  it as a contract. The mask is the same on every vCPU; `set_cpu` asserts it.
+- **Command line.** `--cpu +FEATURE,-FEATURE` (and `NATEMU_CPU`) adjusts the baseline; there are no named profiles.
+  The validator refuses non-`selectable` features. Without the option the mask is the baseline, and the replies
+  are byte-identical (§4).
+- **Core features can't be removed.** `-FEATURE` applies only to optional features. Removing a feature means every one
+  of its forms must be gated: in the shim, where baseline forms are allowed by unnamed rows or by FEX's own decoder, and
+  in `system.rs` and the resident. That is why core membership (decision B) sets most of this option's cost. With the
+  whole baseline as core, only features added later are optional, and they are gated from the start.
 
-Each chunk keeps the default launch byte-for-byte as it is: same CPUID and MSR answers, and every fexc reply identical
-on the recorded request streams (installer and `build` boot) and the standing corpora. The full suite runs once, before
-merge. Targeted gates run between chunks.
+## 4. Chunks and gates
+
+The default launch is byte-for-byte unchanged in every chunk. The full suite runs once, before merge; targeted gates
+run between chunks.
+
+**Replay gate.** No recorded compile stream exists today: the earlier streams were deleted, and they were captured by
+ad-hoc `tee`. Chunk 0 records one installer boot's and one `build` boot's request stream at 333b7b6, kept under
+`natemu-raw`. The ignored test `channel_replay_matches_the_pipe` then replays them, comparing status, code, object,
+extent and the guest end fields.
+- Compile-time chunks don't change request bodies, so the replay sends the same bodies to the old and the new fexc.
+- Chunk 5 adds a body-rewrite step: the old body goes to the old fexc, the body plus the baseline mask goes to the new
+  fexc.
 
 | Chunk | Content | Gate |
 | --- | --- | --- |
-| 1. Catalogue | Feature entries in `cpu_profile.json` for every CPUID bit; `requires`, `parts`, `status`, `tests`, `qemu`; the validator; the profile mechanism with `baseline` only; generated feature IDs for Rust and C++ | `baseline` regenerates today's `cpu_profile.rs` exactly; validator negative controls (a missing requirement, a `not-built` feature, an uncovered bit) each refused |
-| 2. Host record | `host_features.json`; generated fexc header and Rust table; one probe; requirements checked once; FlagM/LSE duplicates removed; `--cpu-report`; vCPU-versus-sysctl comparison on the M4 | fexc replies byte-identical with the full feature set passed explicitly; startup refusal tested by simulating a missing FlagM or LSE |
-| 3. Effective CPU in the resident | Boot-page record; the resident's CPUID, MSR, CR4 and XSETBV checks read it; `--cpu` parsing and validation | CPUID/MSR judge vectors identical for `baseline`; a test profile (`baseline,-SHA`) answers per the judge |
-| 4. Code generator and decode | Guest mask to fexc; gated shim rows; derived FEX guest switches; `system.rs` checks; mask in the cache key | default replies byte-identical; under `baseline,-SHA,-ADX` the SHA and ADX forms are #UD in fexc and the host decode alike (the old hand cut, now derived); a shim-row/catalogue cross-check test |
-| 5. Reference tooling | `qemu_cpu()`; generators and runners declare features; corpus/profile check | every existing corpus reproduces with the generated `-cpu` string (identical expected outputs) |
-| 6. Records | Contracts and README pages; the catalogue's adding-a-feature checklist; INV-03-01 row | review |
+| 0. Stream | Record the two request streams at 333b7b6; make the replay a documented tool (stream path, body rewrite hook) | the replay of each stream against today's fexc is identical (a self-check) |
+| 1. Catalogue | Per-bit entries extended (`requires`, `msrs`, `cr4`, `subleaf`, `resident`, `gates`, `layout`, `core`, `selectable`, `not-built`); the validator | `cpu_profile.rs` regenerates identically; negative controls refused: a missing requirement, an advertised `not-built` feature, `selectable` on a layout feature, a clear or selectable core feature, a core feature requiring an optional one |
+| 2. Host table and probe | Policy and encoding-class fields in FEATURES; the fexc-reply cross-check test; one probe with the requirements checked once; CSV3/SB read from the vCPU's registers; the startup line | `test_serve.py`: replies unchanged; startup refusal tested with FlagM or LSE simulated missing; on the M4, CSV3/SB from registers equal sysctl's |
+| 3. Gate constants | Generated `GF_*` for C++ and Rust; gated shim rows; the `x86_avx` rule; `system.rs` checks; cross-check test | replay identical on both streams and the standing corpora; a scratch build with SHA and ADX cleared in the JSON makes their forms #UD in fexc and the host decode alike (the old hand cut, now derived; not committed) |
+| 4. Records | Contracts and README; the adding-a-feature checklist; the decision record's row | review |
+| 5. (decision A) Runtime selection | Superset tables plus mask in `cache::Control`; `--guest-features`; `--cpu`; the vCPU-identity assertion | replay with the body rewrite identical; judge vectors identical for the baseline mask; a test profile answering per the judge |
 
-Size: chunks 1, 3 and 4 are the substance. Chunk 2 is mostly moving tables. Chunk 5 touches many scripts but each
-change is small. Chunk 4 depends on 1. Chunk 3 depends on 1. Chunks 2 and 1 are independent.
+Chunks 1, 2 and 0 are independent of each other. Chunk 3 depends on 0 and 1. Chunk 5 depends on all of them.
 
-**Adding a feature afterwards** (what this plan buys) is a fixed list:
-
-1. Write its catalogue entry.
-2. Implement its resident or host parts, if any.
-3. Gate its shim rows on its constant.
+**Adding a feature afterwards:**
+1. Extend its entry.
+2. Build its resident or host parts.
+3. Gate its rows.
 4. Add its tests.
-5. Set its status to `built`.
+5. Mark it advertised, or, with chunk 5, `selectable`.
 
-Validation refuses the entry until each step is done. The cheap candidates of November 14 (VAES/VPCLMULQDQ, AVX-VNNI,
-ERMS/FSRM, RPRES) then need steps 1, 3 and 4 only.
+The validator refuses the entry until each step is done. The cheap candidates of November 14 (VAES/VPCLMULQDQ,
+AVX-VNNI, ERMS/FSRM) then need steps 1, 3 and 4 only. RPRES is a host policy change in FEATURES, plus a way to read
+ISAR2.
 
-## 4. Review focus
+## 5. Deferred
 
-- Does the catalogue capture every place a guest feature acts? In particular CPUID subleaves and maximum-leaf values,
-  XSAVE-dependent leaf 0xd values, CR4/XCR0 validity, MSR existence, and #UD versus refusal for forms of clear
-  features.
-- Is the byte-identical gate for chunks 2 and 4 sufficient, given that passing the full feature set changes the request
-  arguments (and so the cache key) but must not change code?
-- Boot-page tables versus compiled-in profiles: correctness of the resident trusting a host-written page (it is host
-  data, not guest data; the page is mapped read-only to the resident and outside guest RAM).
-- Is "vCPU view first, resident EL1 read for registers the host cannot read" sound, and what if the hypervisor hides a
-  feature the host has?
-- Are `fixed` features (AVX, XSAVE components) correctly excluded from selection, and is anything else layout-changing?
-- The reference tooling: is declaring per-corpus features enough to stop the parity comments drifting again?
+- **Reference tooling.** Many `-cpu` strings are for benchmark or system runs where parity isn't claimed, and the
+  frozen corpora reproduce standing evidence. Rewriting them adds risk for no stated goal. New corpora may use a small
+  `qemu_cpu(features)` helper in `cpu_profile.py`, added with the first feature that needs one.
+- **Reading the ISAR2 class or DCZID through the resident at boot.** Every such feature is off by policy today. Build
+  it with RPRES or the M2 work.
+- **RDCL_NO.** It stays the five-line coupling in `execution.rs`; a declarative condition for one case isn't worth the
+  machinery.
 
-## 5. Owner decisions
+## 6. Owner decisions
 
-1. **Catalogue location:** extend `cpu_profile.json` (recommended: it is already the accepted, sourced, judged profile)
-   or a separate catalogue file.
-2. **Selection surface:** `--cpu <profile>` with `+FEATURE/-FEATURE` adjustments (recommended), or named profiles
-   only.
-3. **Resident tables:** host-built boot page (recommended: any profile, one code path) or every profile compiled into
-   the resident.
-4. **Policy pins kept from the old producer** (lrcpc, lrcpc2, rpres, wfxt off): keep as `off` with that reason now, and
-   decide each one when a feature asks for it (recommended), or revisit now.
+**A. Do we need guest features selected per launch (§3, chunk 5)?**
+- Without it, every guest feature is fixed per build, and changing one is a JSON edit plus a rebuild.
+- With it, a feature can be shipped off by default and switched on for testing, and refused on hosts that lack its Arm
+  support.
+- The M2 work doesn't need it: SSE is baseline, and the M2's differences are host-side.
 
-## 6. Risks
+Recommendation: build §2 now (chunks 0-4), and add chunk 5 when a feature first needs to ship off by default.
 
-- **The shim's gated rows change instruction lengths or stop shapes for clear features.** The byte-identical gate on
-  recorded streams and corpora catches it.
-- **The hypervisor's vCPU view and sysctl disagree.** Chunk 2 measures this before anything relies on it.
-- **QEMU cannot express a feature.** The catalogue's `qemu` field is empty and the real-x86 rule applies, as today.
-- **Scope creep into implementing features.** Every chunk's gate is "default unchanged". New features come afterwards,
-  one decision at a time.
+**B. Which features are core (mandatory)?** The core set itself is decided (owner, November 15); its membership is
+open. Recommendation: today's whole baseline. It is what every corpus, boot and benchmark has run on. Making any of it
+optional means gating forms that are allowed today by unnamed shim rows and FEX's own decoder (§3). Every Apple chip so
+far has the Arm features it needs, given FlagM and LSE. The alternative is a smaller core, such as x86-64-v2 or v3,
+with later additions (SHA, ADX, CLFLUSHOPT, CLWB, UMIP) optional. That buys the ability to switch those off, at the
+gating cost. Core membership can shrink later only by doing that gating. Whatever is chosen, the layout features
+advertised today (AVX, XSAVE, XSAVEOPT, XSAVEC) must stay core, so x86-64-v3 is the smallest practical core.
+
+Decided as routine, no longer open:
+- The catalogue extends the JSON's per-bit entries.
+- The policy pins from the old producer are kept as `off` with their reason, and revisited when a feature needs them.
+
+## 7. Review response (independent review, November 15)
+
+Verdict: accept with required changes. Every finding is accepted.
+
+| # | Finding | Answer |
+| --- | --- | --- |
+| 1 | Blocking: a boot-page MSR table breaks the compile-time MSR layout and its consumers | The boot page is dropped. §3 uses a compiled superset plus a mask in `cache::Control`, and names the consumers that move |
+| 2 | Blocking: `-FEATURE` would leave baseline forms running (the shim is an allowlist) | Added `selectable` with the converse check, `layout`, and the `resident` field. Subtraction is owner decision B |
+| 3 | Blocking: the replay gate can't run (no stream; bodies change) | Chunk 0 records the streams; a body-rewrite step is added for chunk 5; chunk 2 uses `test_serve.py` |
+| 4 | CSV3 and SB are register fields already read; the EL1 ISAR2 read would run the resident before the feature set is known | Both are read from the vCPU's registers; the EL1 read is deferred (§5) |
+| 5 | `host_features.json` and the generated header are more than needed; dropping fexc's defaults breaks the CLI | FEATURES stays the source; the tie is a reply cross-check test; the defaults are kept; the arguments are unchanged |
+| 6 | Reference-tooling chunk is over-scoped | Deferred (§5) |
+| 7 | Named profiles, the report command and the RDCL_NO condition are over-scoped | Named profiles dropped; a startup line replaces the report command; RDCL_NO is left as it is |
+| 8 | `x86_avx` gates VEX and XSAVE code; the other switches are dead | The `x86_avx` rule is in §2.3; the others stay pinned |
+| 9 | A parallel `features` list duplicates the per-bit entries | The per-bit entries are extended; there is no parallel list |
+| 10 | Leaf 0xD, XSAVE and leaf 7's maximum subleaf | `layout` covers the listed features; the maximum subleaf is computed |
+| 11 | Missed risks: header feature bits, ACPI x2APIC, the per-vCPU mask, cache invalidation per rebuild | Each is stated in §2.3 and §3 |
+| 12 | Blocking: §5 lacked the real decisions | §6 now lists decision A (runtime selection) and B. B was "subtraction allowed?"; after the owner's core-set direction it became "core membership", which settles subtraction: only optional features can be removed. The routine decisions are recorded as decided |
