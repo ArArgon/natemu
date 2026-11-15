@@ -68,6 +68,8 @@ There is no parallel feature list. Each CPUID bit's `fields` entry in `cpu_profi
   - The XSAVEC/XSAVEOPT paths compiled into `xsave.rs`.
   - ACPI's MADT form under x2APIC.
 - `gates`: the generated constants that consumers test (§2.3).
+- `baseline` (as built, chunk 3): true for features the startup line leaves out because every x86-64 CPU of this kind
+  has them (the line lists only what goes beyond x86-64-v3, e.g. not x2APIC).
 - `host`: the Arm features its implementation uses, in two classes.
   - `required`: without it the feature can't be executed (FlagM and LSE for everything).
   - `exactness`: it runs, but with a known, reported difference. FEAT_AFP for SSE and x87 is this class: M1 and M2
@@ -143,7 +145,8 @@ The validator (`cpu_profile.py`, run by the generator and the tests) refuses:
 - an optional `layout` feature (layout features must be core, so XCR0, leaf 0xD and the XSAVE image are the same on
   every host);
 - an optional feature whose `resident` behaviour is not gated on the mask;
-- a `host` `required` entry that names an Arm feature `admission::FEATURES` doesn't know.
+- a `host` `required` entry that names an Arm feature `admission::FEATURES` doesn't know. For built entries the name
+  must be a `Required` row; a not-built entry may name another class (WAITPKG names wfxt, an `Off` row).
 
 ### 2.2 Host Arm features: keep the existing table as the source
 
@@ -229,8 +232,13 @@ What the gate can't do:
 ### 2.3 Generated gate constants
 
 The generator writes two files from the JSON:
-- `GF_*` constants as a C++ header for the shim;
-- the same constants as a Rust module in `crates/abi`, next to `cpu_profile.rs`.
+- `GF_*` constants as a C++ header for the shim (`tools/fexc/shim/fexc_features.h`: 1 or 0 per shim-gated feature);
+- a Rust module in `crates/abi` (`cpu_gates.rs`, next to `cpu_profile.rs`), where each `GF_*` is the feature's CPUID
+  bit coordinates for the host's `advertised()`, plus the startup-line names, FLOOR and the host requirements.
+
+As built (chunk 3), SSE4A, XOP and 3DNOW gained clear, not-built entries (AMD bits) so their refusals have a feature to
+test. In a worktree, `tools/fexc/build.sh` refuses the symlinked `third_party/FEX`; chunk 3's fexc was built from a copy
+of the script without its two submodule-update lines, against the main checkout's submodule at the pin.
 
 **Shim (`fexc_slice1.inc`).** Every row that tests a feature uses its `GF_*` constant: VAES's ymm form,
 VPCLMULQDQ's ymm form, AVX-VNNI, GFNI, RTM, CET, WAITPKG, SSE4a, 3DNow, plus the SHA and ADX rows. Rows for core
@@ -388,7 +396,7 @@ the following:
 | Nov 15 | 0. Stream | **done, merged** (40dd5ff). `NATEMU_FEXC_RECORD` recorder; replay gate documented in tools/fexc/README.md | streams `natemu-raw/cpu-c0-stream-20261115-02`: installer 124,024 requests, `build` boot 245,572; self-replay 0 differences each; fexc `correctness-forms-20261107-02` |
 | Nov 15 | 1. Catalogue | **done, merged** (4b5ed10, 4d94d48). Per-bit entries extended; `built` flag; validator with a negative control per rule; core derived from the floor | independent review accepted after one round of fixes; `gen_cpu_profile_rs.py --check` identical; tools/models 287 tests OK; natemu-abi 108 passed |
 | Nov 15 | 2. Host table and probe | **done, merged** (1c80b42, 848f82d). FEATURES with classes and floor; the probe in `execution::enter` (one refusal line); CSV3/SB from the vCPU; `NATEMU_FEXC_FEATURE_OFF` (speed/exactness only); FP/AdvSIMD probed | review accepted after one round; 381 host unit tests; installer boot at 2 vCPUs (TSO read-back); CSV3/SB equal sysctl. Fallback gate (`natemu-raw/cpu-c2-fallback-20261115-01`): K1 0 failures and the `build` boot verified with everything on and with FlagM2, FCMA, FRINTTS each forced off (ECV already off: the vCPU hides it). The replies-unchanged check holds by construction (fexc unchanged; `body_bytes_are_unchanged`). M2 probe run pending on the owner |
-| next | 3. Gate constants | not started. Adds the `exceptions` field and its backfill; the startup line's guest map; a host-crate test tying `cpu_profile.py`'s FLOOR to FEATURES | |
+| Nov 15 | 3. Gate constants | **built, in review** (cpu-c3-gates, 5 commits). Generated `fexc_features.h` and `cpu_gates.rs`; shim and `system.rs` gates; `x86_avx` derived; `exceptions`/`simd_fp`/`tests` on every built entry; FLOOR tie test; startup line in the CLI boot path | new fexc `natemu-raw/cpu-c3-fexc-20261115-01` (SHA-256 f481b58a...); replay vs the old fexc: installer 124,024 and build 245,572 requests, 0 differences; test_slice1 38 OK; test_serve 1978 identical; tools/models 301 OK; abi 109; host 383; scratch control with SHA and ADX cleared: #UD in fexc and the host decode; installer boot prints `natemu: cpu x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt` |
 | next | 4. Records | not started | |
 | after | AFP fallback (owner, Nov 15: plan, review, then build; must be performant) | not started | |
 
