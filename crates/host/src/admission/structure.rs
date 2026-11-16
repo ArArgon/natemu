@@ -2408,7 +2408,7 @@ mod tests {
             for hex in forms {
                 let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
                 for afp in [&["--feature", "afp=0"][..], &[]] {
-                    for unmasked in ["0x1", "0x2", "0x3", "0x10", "0x3f"] {
+                    for unmasked in ["0x0", "0x1", "0x2", "0x3", "0x10", "0x3f"] {
                         for keys in [&[][..], &["--ftz"]] {
                             let args = [afp, &[flag, unmasked][..], keys].concat();
                             let object = compile(hex, &args);
