@@ -141,7 +141,7 @@ template<class View> inline const FEXCore::IR::IROp_Header* NegOneMul(View& IR, 
   return C == NamedVectorConstant::NAMED_VECTOR_NEG_ONE_PS || C == NamedVectorConstant::NAMED_VECTOR_NEG_ONE_PD ? M : nullptr;
 }
 // natemu slice1 (no AFP): the multiply of ADDSUB's, VFMADDSUB's and the packed VFMSUB/VFNMSUB's lowering (an operand by the named constant
-// (-1, 1, -1, 1), (1, -1, 1, -1) or -1.0; the dispatcher's ADDSUBPOpImpl, AVX128_VFMAddSubImpl, AVX128_VFMAImpl) is exact (by 1.0 and -1.0) and not an x86 operation: no DE test and no DAZ/FTZ flush of its own (an FTZ flush of the
+// (-1, 1, -1, 1) or -1.0; the dispatcher's ADDSUBPOpImpl, AVX128_VFMAddSubImpl, AVX128_VFMAImpl) is exact (by 1.0 and -1.0) and not an x86 operation: no DE test and no DAZ/FTZ flush of its own (an FTZ flush of the
 // exact product would raise UFC where x86 raises nothing); the add that follows takes both for the product, which a denormal Src2
 // makes a denormal as well.
 template<class View> inline bool IsAddSubMul(View& IR, const FEXCore::IR::IROp_Header* Op) {
@@ -151,7 +151,6 @@ template<class View> inline bool IsAddSubMul(View& IR, const FEXCore::IR::IROp_H
   if (K->Op != OP_LOADNAMEDVECTORCONSTANT) return false;
   const auto C = K->template C<IROp_LoadNamedVectorConstant>()->Constant;
   return C == NamedVectorConstant::NAMED_VECTOR_PADDSUBPS_MUL || C == NamedVectorConstant::NAMED_VECTOR_PADDSUBPD_MUL ||
-         C == NamedVectorConstant::NAMED_VECTOR_PSUBADDPS_MUL || C == NamedVectorConstant::NAMED_VECTOR_PSUBADDPD_MUL ||
          C == NamedVectorConstant::NAMED_VECTOR_NEG_ONE_PS || C == NamedVectorConstant::NAMED_VECTOR_NEG_ONE_PD;
 }
 inline bool SimdFPOp(FEXCore::IR::IROps Op) {
