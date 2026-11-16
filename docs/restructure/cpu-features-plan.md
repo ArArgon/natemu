@@ -199,7 +199,7 @@ says how it is detected, what happens on a host without it, and what keeps it ho
 | **option** | used only when a command-line option asks for it | SB (`--speculation-barriers`), CSV3 (RDCL_NO with that option): all three chips | the option is refused (SB) or the bit stays clear (CSV3) | existing refusal; probe reads both from the vCPU's registers |
 | **guest-optional** | backs an optional guest feature, advertised only where present (§3) | none built. First candidate: WAITPKG on WFxT (M4 only), blocked until macOS 27 shows ID_AA64ISAR2 | the guest feature is absent on that host | the host-derived mask's tests (chunk 5) |
 | **off by policy** | present, but not used | LRCPC, LRCPC2 (all three chips; hardware TSO makes them pointless); RPRES and WFxT until a feature needs them (and macOS shows them) | nothing | the reply cross-check (FEATURES' policy matches fexc's table) |
-| **unused** | nothing in natemu or fexc uses it | SME/SME2 (M4; shown since macOS 15.2), SPECRES (shown in the vCPU though sysctl says 0), synchronous FP exceptions (precise exceptions are done in software by design), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
+| **unused** | nothing in natemu or fexc uses it | SME/SME2 (M4; shown since macOS 15.2), SPECRES (shown in the vCPU though sysctl says 0), synchronous FP exceptions (unused today; present on M1, M2 and M4; the accurate FP mode plans to use them), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
 
 **The fallback gate (new, chunk 2).** The speed class is the one most likely to break unnoticed: every machine that
 runs the suite today has all of it. No tool today forces a feature off in a boot or a corpus run: the host builds its
@@ -630,7 +630,9 @@ that prefers I8MM must keep its DotProd or plain-SIMD path to stay core, as FEX'
 
 Apple's TSO bit and the interrupt-controller API are part of the floor too, though they aren't ID-register features.
 
-**Above the floor** (M4 only): AFP, RPRES, WFxT, FPACCOMBINE, SME/SME2 and its variants, and synchronous FP exceptions.
+**Above the floor** (M4 only): AFP, RPRES, WFxT, FPACCOMBINE, SME/SME2 and its variants.
+
+**Correction (November 16):** synchronous (trapped) FP exceptions are in the floor, not M4-only. `hw.optional.arm.FP_SyncExceptions` is 1 on an M1 Pro, an M2 Max and the M4 (owner). On the M2 Max and the M4 the traps are precise and reach a guest's own EL1 vector under Hypervisor.framework, 29-70 ns per trap (`tools/fp_trap_probe/run.sh`, on branch `afp-fallback`); the M1 is not yet measured that way. The accurate floating-point mode plans to use them.
 
 **M2 only:** SSBS. Natemu does not use it.
 
