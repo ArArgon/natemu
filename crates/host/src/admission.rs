@@ -76,6 +76,8 @@ use {
 pub(crate) struct Feature {
     /// fexc's name (`--feature NAME=0`; `features.host_features` in every reply).
     pub name: &'static str,
+    /// Arm's name (`FEAT_DotProd`) for the startup lines; empty for features they never name.
+    pub arm: &'static str,
     pub detect: Detect,
     pub class: Class,
     /// Present on every supported chip's vCPU (the M1, M2 and M4 records; the plan's appendix floor).
@@ -88,6 +90,7 @@ pub(crate) struct Feature {
 const fn feature(name: &'static str, detect: Detect, class: Class, floor: bool) -> Feature {
     Feature {
         name,
+        arm: "",
         detect,
         class,
         floor,
@@ -111,10 +114,11 @@ pub(crate) const FEATURES: [Feature; 32] = [
     feature("flagm", Fields(&[(ISAR0, 52, 1)]), Required, true),
     Feature {
         encodes: "AXFLAG/XAFLAG (SSE compare flags)",
+        arm: "FEAT_FlagM2",
         ..feature("flagm2", Fields(&[(ISAR0, 52, 2)]), Speed, true)
     },
     // Exactness, not Speed: FEX's ADDSUBPS fallback without FCMA flips a NaN's sign (AFP inventory 1.4).
-    feature("fcma", Fields(&[(ISAR1, 16, 1)]), Exactness, true),
+    Feature { arm: "FEAT_FCMA", ..feature("fcma", Fields(&[(ISAR1, 16, 1)]), Exactness, true) },
     feature("crc32", Fields(&[(ISAR0, 16, 1)]), Required, true),
     feature("aes", Fields(&[(ISAR0, 4, 1)]), Required, true),
     feature("sha", Fields(&[(ISAR0, 8, 1), (ISAR0, 12, 1)]), Required, true),
@@ -122,16 +126,18 @@ pub(crate) const FEATURES: [Feature; 32] = [
     feature("rng", Fields(&[(ISAR0, 60, 1)]), Unused, false),
     Feature {
         encodes: "POPCNT: without CSSC a vector sequence",
+        arm: "FEAT_CSSC",
         ..feature("cssc", Unverifiable, Speed, false)
     },
-    feature("afp", Fields(&[(MMFR1, 44, 1)]), Exactness, false),
-    feature("frintts", Fields(&[(ISAR1, 32, 1)]), Speed, true),
-    feature("mops", Unverifiable, Speed, false),
-    feature("i8mm", Fields(&[(ISAR1, 52, 1)]), Speed, false),
+    Feature { arm: "FEAT_AFP", ..feature("afp", Fields(&[(MMFR1, 44, 1)]), Exactness, false) },
+    Feature { arm: "FEAT_FRINTTS", ..feature("frintts", Fields(&[(ISAR1, 32, 1)]), Speed, true) },
+    Feature { arm: "FEAT_MOPS", ..feature("mops", Unverifiable, Speed, false) },
+    Feature { arm: "FEAT_I8MM", ..feature("i8mm", Fields(&[(ISAR1, 52, 1)]), Speed, false) },
     // Speed for now: nothing emits it until AVX-VNNI is built (plan section 2.2a).
-    feature("dotprod", Fields(&[(ISAR0, 44, 1)]), Speed, true),
+    Feature { arm: "FEAT_DotProd", ..feature("dotprod", Fields(&[(ISAR0, 44, 1)]), Speed, true) },
     Feature {
         encodes: "RDTSC counter read: CNTVCTSS with ECV, else ISB and CNTVCT",
+        arm: "FEAT_ECV",
         ..feature("ecv", Fields(&[(MMFR0, 60, 1)]), Speed, false)
     },
     feature("clzero", Unverifiable, Unused, false),

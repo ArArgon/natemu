@@ -51,12 +51,12 @@ Other distributions and kernels are untested. Major features still missing:
   import, so an older macOS refuses to load the binary. There is no runtime check for it. At startup natemu checks the
   vCPU for the hardware features it needs (FlagM, LSE, LSE2, the crypto extensions, Apple's TSO bit) and
   fails with one line naming everything missing, for example `natemu: host lacks lse2 pmull128`.
-  A boot prints a few startup lines, one decision each: the guest CPU, as the x86-64-v3 level plus what it adds
-  (`natemu: cpu x86-64-v3 +adx +aes ... +xsaveopt`); the floating-point mode (`natemu: fp fast`); the speculation
-  barriers (`on` or `off`); the perf class (host features missing, for which the slower fallback code is emitted);
-  the shared template pool; and the compile cache. The guest CPU is computed from the host's features. On a Mac
-  without FEAT_AFP (M1, M2) the fp line reads `natemu: fp fast, degraded: host lacks FEAT_AFP (some x86 floating-point
-  corner cases differ)` (being fixed: the AFP fallback plan).
+  A boot prints startup lines of the form `natemu: <topic>: <value>`, one decision each: `cpu` (the x86-64-v3 level plus
+  what the guest CPU adds, computed from the host's features), `fp` (`fast mode`; on a Mac without FEAT_AFP, M1 or M2,
+  `fast mode, degraded (host lacks FEAT_AFP)`, and some x86 floating-point corner cases differ; being fixed: the AFP
+  fallback plan), `acceleration` (each host feature natemu can use for speed, `+` used and `-` the slower fallback code),
+  `meltdown` (`speculation barriers` or `none`), and `code cache` (`pool on, disk 512 MiB at ~/Library/Caches/natemu/fexc`: the shared template pool and the compile cache on disk, or `disk off`). Stops and errors
+  have no colon after their first words, which is how tools tell them apart.
 - Xcode Command Line Tools (`xcode-select --install`)
 - [rustup](https://rustup.rs). The repository pins the Rust version, and rustup installs it automatically.
 - [Homebrew](https://brew.sh) packages: `brew install cmake ninja pkg-config libslirp e2fsprogs`
