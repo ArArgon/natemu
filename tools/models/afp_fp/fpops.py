@@ -64,6 +64,9 @@ def H_addsub(S, base, ops, vex):
     f = fmt_of(base); w = f.w
     d, a, b, _ = src12(ops); size = d['size']; n = size // w
     X, Y = L(S.read(a, size), w, n), L(S.read(b, size), w, n); r = []
+    if not S.mode.negflip_pk:   # fast mode without AFP: the subtrahend is multiplied by (-1, 1) first, which quiets an SNaN (IE) before the add
+        for i in range(n):
+            if cls(f, Y[i])[0] == 'snan': S.st.add('IE'); Y[i] = quiet(f, Y[i])
     for i in range(n):
         if i % 2 == 0:
             y = Y[i]
@@ -226,6 +229,8 @@ def H_fma(S, base, ops, vex):
         elif kind == 'fnmsub': np_, nc_ = 1, 1
         elif kind == 'fmaddsub': np_, nc_ = 0, 1 if i % 2 == 0 else 0
         else: np_, nc_ = 0, 0 if i % 2 == 0 else 1
+        if not scalar and not S.mode.negflip_pk and (nc_ or kind in ('fmaddsub', 'fmsubadd')) and cls(f, c_)[0] == 'snan':
+            S.st.add('IE'); c_ = quiet(f, c_)   # fast mode without AFP: the addend is multiplied by -1.0 / (-1, 1) first, which quiets an SNaN
         r[i] = fma_core(S, f, a_, b_, c_, np_, nc_, 0)
     S.wv(d, P(r, w) if not scalar else (S.read(d, 128) & ~mask(w) & M128) | r[0], size, vex)
 for k in ('fmadd', 'fmsub', 'fnmadd', 'fnmsub', 'fmaddsub', 'fmsubadd'):
