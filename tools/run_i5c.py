@@ -343,9 +343,9 @@ def simd_cases():
                    extra=[f'memory {D + 0x280:#x} {a_hi.hex()}', f'memory {D + 0x290:#x} {b_hi.hex()}', 'xcr0 7'], ymm=False))
     ymm('band-vmulps-ymm-upper-not-tiny', struct.pack('<IIII', A32[0], ONE, ONE, ONE), struct.pack('<IIII', A32[1], ONE, ONE, ONE), PE, None)
     ymm('band-vmulps-ymm-upper-tiny', struct.pack('<IIII', B32[0], ONE, ONE, ONE), struct.pack('<IIII', B32[1], ONE, ONE, ONE), UE | PE, 19)
-    # Controls: an add and a square root never produce a tiny inexact result (a tiny sum is exact; a root is never tiny): MIN_NORMAL from 2 * 2^-127 is
-    # exact, and raises nothing.
-    out.append(one('band-addss-exact-min-normal', 'addss xmm1, xmm2', {1: lanes(0x00400000), 2: lanes(0x00400000)}, UM, 0, None, 1))
+    # Controls: an add and a square root never produce a tiny inexact result (a tiny sum is exact; a root is never tiny): MIN_NORMAL from 2^-125 - 2^-126 is
+    # exact, and raises nothing (normal operands, so no DE either).
+    out.append(one('band-addss-exact-min-normal', 'addss xmm1, xmm2', {1: lanes(0x01000000), 2: lanes(0x80800000)}, UM, 0, None, 1))
     # x87 arithmetic leaves MXCSR alone and does not trip a SIMD check (its own FPSR wrapper).
     out.append(case('x87-between-simd', ['fninit', 'fld1', 'fldz', 'fdivp st(1), st(0)', 'addss xmm3, xmm3', 'fstp st(0)'],
                     ['sse 1', f'mxcsr {MX & ~(ZE << 7):#x}', f'xmm 3 {ONE:#x} 0'], None,
