@@ -71,7 +71,7 @@ On a Mac without FEAT_AFP (M1, M2) natemu's default floating-point mode, fast, k
 documented deviations (the M4 has none; the names are the ones `tools/fp_deviations.py` and the test runners use):
 
 - `masked-sse-de`: with DE masked, an SSE or AVX instruction on a denormal operand does not set MXCSR.DE (the result is right).
-- `nan-results`: a NaN result can differ from x86 in sign or choice: the default NaN is positive, negated FMA forms and ADDSUB flip a NaN's sign, two-NaN and three-NaN choices follow Arm's order, RSQRT's NaN has the other sign.
+- `nan-results`: a NaN result can differ from x86 in sign or choice: the default NaN is positive, the one-instruction negated FMA forms (the scalar ones, the packed FNMADD and the first multiplicand of FNMSUB) flip a NaN's sign, two-NaN and three-NaN choices follow Arm's order, RSQRT's NaN has the other sign.
 - `fma-invalid-flag`: an FMA of infinity times zero plus a QNaN returns the default NaN and sets MXCSR.IE (x86: the QNaN, no flag).
 - `band-ue-flag`: with UE masked, a result just below the smallest normal number that rounds up to it can set MXCSR.UE (x86 judges tininess after rounding).
 - `daz-ftz-band`: with DAZ and FTZ both set, a result just below the smallest normal number that rounds up to it is 0 instead of the smallest normal.

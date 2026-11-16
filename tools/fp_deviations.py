@@ -18,8 +18,8 @@ DM = 0x100                # MXCSR.DM, the DE mask (set: masked)
 CLASSES = {
     'masked-sse-de': ('B', 'with DE masked, an SSE or AVX instruction on a denormal operand does not set MXCSR.DE (the result is right)',
                       'a runner case: the exact MXCSR with DE cleared, everything else exact'),
-    'nan-results': ('A', "a NaN result can differ from x86 in sign or choice: the default NaN is positive, negated FMA forms and ADDSUB "
-                         "flip a NaN's sign, two-NaN and three-NaN choices follow Arm's order, RSQRT's NaN has the other sign",
+    'nan-results': ('A', "a NaN result can differ from x86 in sign or choice: the default NaN is positive, the one-instruction negated FMA forms "
+                         "(the scalar ones, the packed FNMADD and the first multiplicand of FNMSUB) flip a NaN's sign, two-NaN and three-NaN choices follow Arm's order, RSQRT's NaN has the other sign",
                     "a corpus program: the final state the offline model predicts (tools/models/afp_fp)"),
     'fma-invalid-flag': ('D', 'an FMA of infinity times zero plus a QNaN returns the default NaN and sets MXCSR.IE (x86: the QNaN, no flag)',
                          'a corpus program: the model-predicted final state'),

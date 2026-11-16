@@ -140,7 +140,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "41d8b33af32c5a95593c64875eaa2504182b8ec642ce4cdad0d3953066a3c03b"
+     "sha256": "c16e9d1d567b79ae05757cff4d3f33e8cfd4e006777580aa103c693d57bdd8b2"
     },
     {
      "addr": "0x300000",
@@ -150,7 +150,6 @@
    "model": [
     "a",
     "b3",
-    "c",
     "f1"
    ],
    "rflags": "0x0",
@@ -181,7 +180,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "55d796a4e2c79659c137b664368e822c4dfbdb521c2ae3e8a26d5d472561e76f"
+     "sha256": "a7ee15845728160515510ade74baaa482c7f5ed681a260abf454677b5cf270d6"
     },
     {
      "addr": "0x300000",
@@ -221,7 +220,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "b7f3f7dc73e6b6aa3432968b6ded4536a278ebae1f87efefb502c22faff5558c"
+     "sha256": "74bacadb6b482747812441c7d9b40e748d6988ddc72e6338ecc8ea33a80cd2ae"
     },
     {
      "addr": "0x300000",
@@ -234,45 +233,6 @@
    ],
    "rflags": "0x0",
    "rip": "0x00000000001001fd"
-  },
-  "i8-forms-023": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x0",
-    "0x963190c2a065bb5d",
-    "0x965132e681cb17ee",
-    "0x200f8e",
-    "0x301003",
-    "0x201249",
-    "0x200fc8",
-    "0x200ea5",
-    "0x3",
-    "0xffffffffffffff80",
-    "0x0",
-    "0xedadb68b282b4d8d",
-    "0x201097",
-    "0x200e88",
-    "0x0",
-    "0x8000"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "ad90b82548790546ea65cee3ca48dc02f2bba98a57414a98d1af07e4dcd073e4"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "e0926e69fc6c26955d9608943c73f38c098e7495d4d7ae636572c7c30d42d85d"
-    }
-   ],
-   "model": [
-    "b3",
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x00000000001001fb"
   },
   "i8-forms-030": {
    "classes": [
@@ -528,7 +488,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "32c3c79a438fd414aeaf8a6230c7ab26b3cc803e5c448ee54162a08d68246473"
+     "sha256": "3ba29bb520f29fdae8b89bb32ea879cfa504afd1285aefa805b88ed85216cc74"
     },
     {
      "addr": "0x300000",
@@ -567,7 +527,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "f10467775eb76c0dc1d5734665bee40de4e825e0a8cf2f9554cd166313ac9b1a"
+     "sha256": "f41e6d1c060967f45e1cab8bb30f901aee6823e49e7bc7a9118a2b00543f11d9"
     },
     {
      "addr": "0x300000",
@@ -607,7 +567,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "5927063e40650cb9b651c70c36deafefdeb524aa1f7f756ca413b51e38da71a4"
+     "sha256": "2661372b5597300d74140277f87f2dc3dc50919d929460bfd49676e24f82c076"
     },
     {
      "addr": "0x300000",
@@ -648,7 +608,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "0062c7bc00a5cec3ce9325f593c58fe045584a0cba9a3aefe4bf14e725bfd320"
+     "sha256": "4a126a76792ed79b085a342ec7f5bf4cd11483465a2a6feae9ec484e225b421d"
     },
     {
      "addr": "0x300000",
@@ -656,8 +616,7 @@
     }
    ],
    "model": [
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x0",
    "rip": "0x0000000000100211"
@@ -687,7 +646,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "b17844150fa6688d7b8dcae228a4882277a4c82273c30c9ebf44d1cf8026d1b2"
+     "sha256": "d1ef444a046fb662c79bed6802ca902a8ed138b548062bc12f6342af8a465845"
     },
     {
      "addr": "0x300000",
@@ -739,44 +698,6 @@
    "rflags": "0x4",
    "rip": "0x0000000000100211"
   },
-  "i8-random-06": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x628ad4da6190021",
-    "0x991282f2dbc88f06",
-    "0xdc1f46c5fdd5ecde",
-    "0x20114c",
-    "0x300ffb",
-    "0x2010ed",
-    "0x200d15",
-    "0x200fb2",
-    "0x5",
-    "0xe847c52ca6af1b9a",
-    "0x0",
-    "0x852a181306edffea",
-    "0x2011b3",
-    "0x200e91",
-    "0x5505b0bfa0bdb395",
-    "0xf962ec1924acc81a"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "68cdf65c0fecd0e4f7cbbac8276fd5578c40e64d4c39b47378dba6ad283d80f9"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "3558b06eda5cbdcb108e8d3db5fe0ee0dc2b2faaa1898656016a5ee951d1eabe"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x00000000001001ea"
-  },
   "i8-random-07": {
    "classes": [
     "nan-results"
@@ -802,7 +723,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "73c0f3c1e52714a90e2248124e83ddf12d595b7628d1c07a5cd154577eb07a8c"
+     "sha256": "2d1eb33953b85d030558c3d565aabd9a9049dc4845ed8d48454ff07031018add"
     },
     {
      "addr": "0x300000",
@@ -881,7 +802,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "7073543060f0723fa74a8a3830d391c28cf3fd757e5ebc08c326ce7fe17b93f4"
+     "sha256": "25ab9562ed482aa32af2db79556a737d8364c6e5b92fb34e9fdbf05dab161eb8"
     },
     {
      "addr": "0x300000",
@@ -889,49 +810,10 @@
     }
    ],
    "model": [
-    "a",
-    "c"
+    "a"
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100244"
-  },
-  "i8-random-15": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0xd43e8e30d60d874a",
-    "0xffffffff",
-    "0x9844592827b2a221",
-    "0x2012ef",
-    "0x300ffa",
-    "0x20139d",
-    "0x2011ba",
-    "0x200f87",
-    "0x3",
-    "0x7fff",
-    "0x9da99bb0a84365dd",
-    "0x0",
-    "0x2013f4",
-    "0x201364",
-    "0x6c349826450c892c",
-    "0x80000000"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "d724fca3e6d6f3ae46043f9e98204d6e1727ee43d0964e91c9ee08f0cfbb75e1"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "de9e55cbb5fa9986221574c872f172e726d03efb7a6e15e6121a9e8f9cd3c7a1"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x00000000001001f9"
   },
   "i8-random-18": {
    "classes": [
@@ -958,7 +840,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "4caf3ac18ac83c0372e75e117f5e80fc2338aebc56cc2b08da610639c7512889"
+     "sha256": "d5ec722b4644291244cce5bacd323449dd60489006cd3b5a0f11d0ccfdb93b97"
     },
     {
      "addr": "0x300000",
@@ -966,8 +848,7 @@
     }
    ],
    "model": [
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100277"
@@ -1048,44 +929,6 @@
    ],
    "rflags": "0x4",
    "rip": "0x000000000010024f"
-  },
-  "i8-random-25": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x5984ce704f4e4c16",
-    "0x8000000000000000",
-    "0xdb5b9c59b36ed97d",
-    "0x200fe6",
-    "0x300ffb",
-    "0x20130d",
-    "0x200ede",
-    "0x2013b2",
-    "0x2",
-    "0xffff",
-    "0x5366769ee90eac9",
-    "0x0",
-    "0x20105a",
-    "0x200ecc",
-    "0x0",
-    "0x8000"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "9990c28229d1dac95cd949b28b7a586bddd7f3488be2b39d01b11a8b2b52507e"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "d9324878f34623aa1a0fe36f67d7d08283bf4fd2f3d0c85f4963930beb08fe84"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x0000000000100206"
   },
   "i8-random-28": {
    "classes": [
@@ -1188,7 +1031,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "784e009fe7d3c8997d0b59f1a546df9b4aa89fe900cc29edca1fe2fe83e27060"
+     "sha256": "ff42ac51f935ee9049325546719807b392b2e2a40d246a1662e92bc8816bee81"
     },
     {
      "addr": "0x300000",
@@ -1201,44 +1044,6 @@
    ],
    "rflags": "0x0",
    "rip": "0x000000000010025d"
-  },
-  "i8-random-34": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0xcd4c3462e0491817",
-    "0xffffffffffffff80",
-    "0x280103d8a6dffb76",
-    "0x2013f9",
-    "0x301007",
-    "0x200e0f",
-    "0x200da7",
-    "0x200cd9",
-    "0x0",
-    "0x7fff",
-    "0x80000000",
-    "0x1",
-    "0x200e82",
-    "0x201328",
-    "0xf84f5c03c31da13a",
-    "0x85992a7645bbd53b"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "80892ee57d013063f14364868f6f2422d193dcfb44c38eacdd7f42e3389ae468"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "71b2d9df14f2cf3c9d9bdfbd0689e2c95d6dc2642bd9da3018f35d64256ecd94"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x000000000010020b"
   },
   "i8-random-35": {
    "classes": [
@@ -1277,83 +1082,6 @@
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100212"
-  },
-  "i8-random-36": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0xb10a",
-    "0x8000",
-    "0x10b977993e3859",
-    "0x201033",
-    "0x301007",
-    "0x200d70",
-    "0x200cb9",
-    "0x201152",
-    "0x4",
-    "0x1",
-    "0xb3213813ff6124ce",
-    "0x78424470988a096e",
-    "0x200d7f",
-    "0x2012ff",
-    "0x64016b9afab4fbb3",
-    "0x80"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "d2606702a730bc5a2f6350af0292c7e9c7fb8b3bd1ac886b1085f0124a8a4fa0"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "435ccbf822c0eadde5724538b080e5c36ce1b0222a8d606dc1d22f5c3b2702db"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x0000000000100252"
-  },
-  "i8-random-42": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x7060fab789bfb50f",
-    "0x0",
-    "0x9cfdc09f0f976d7c",
-    "0x201317",
-    "0x300ff9",
-    "0x20112e",
-    "0x201222",
-    "0x200db2",
-    "0x7",
-    "0x66288b9eaf3445a7",
-    "0x8000",
-    "0x845ddea48ac50f58",
-    "0x2013e0",
-    "0x200e98",
-    "0xafe2f39836a9a658",
-    "0x2bca4df14f38fe6f"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "2dc7555a6d123627d0a6dea9c7c98c62fc03a1b4a17c939156cc5d4c3e2e3207"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "13fdec41be570040adaec154049e5346dc0c36c45992b40da978eb8fa7885d44"
-    }
-   ],
-   "model": [
-    "b3",
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x0000000000100222"
   },
   "i8-random-44": {
    "classes": [
@@ -1419,7 +1147,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "23033ff23915fc3b33e5f4d6757e12910fe1e8b9692eda7f980c8c6ba92c0572"
+     "sha256": "36e80de2ad7bc00f8013507b494c9ac3a3cc772cdb2c006fb16f8b7132b5dc91"
     },
     {
      "addr": "0x300000",
@@ -1427,8 +1155,7 @@
     }
    ],
    "model": [
-    "a",
-    "c"
+    "a"
    ],
    "rflags": "0x0",
    "rip": "0x00000000001001ee"
@@ -1458,7 +1185,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "4a812a3297d9c43aa6b23d45235d61f6e5daa7707083fa4130e96535747c9dc2"
+     "sha256": "ee4777c08966d9335a313a0fc5ca88c2a05f7d530de0056f3e2ec1bdcb915877"
     },
     {
      "addr": "0x300000",
@@ -1472,44 +1199,6 @@
    ],
    "rflags": "0x0",
    "rip": "0x00000000001001f4"
-  },
-  "i8-random-53": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x9bacafb0c2d69034",
-    "0xff",
-    "0x996fba3dd332f2bf",
-    "0x201183",
-    "0x301003",
-    "0x2013cb",
-    "0x200eec",
-    "0x200f33",
-    "0x3",
-    "0x461dfdd5b97d0f37",
-    "0xb3db036fd9a08883",
-    "0x39c8ec77c69c4bcd",
-    "0x20125f",
-    "0x2012e8",
-    "0x7fffffff",
-    "0x52"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "3a026d1ea18a7a1bf287d9f224a37f82be7d81e8214d5495d7c03fc17a40f40b"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "cff3ceb94b59c20d6733add723427e5b10290f17af5434be8b174c9c2f0c5732"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x00000000001001ec"
   }
  },
  "i8-corpus-20261030-02": {
@@ -1779,44 +1468,6 @@
    "rflags": "0x4",
    "rip": "0x00000000001002a7"
   },
-  "i8-forms-003": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x71beef5f7e0432c2",
-    "0xff",
-    "0xffffffff",
-    "0x2012a4",
-    "0x300fff",
-    "0x200dbe",
-    "0x200c12",
-    "0x20114a",
-    "0x2",
-    "0xd344f360d0021b23",
-    "0x7fff",
-    "0x8b72910610ce4afe",
-    "0x2013cf",
-    "0x200f80",
-    "0x80000000",
-    "0xad68a5c8adc93973"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "0d4ceb06c0719c63794958f9c2f510831cd179ef8c9de439db84162e3446d5d0"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "6da790619cd5544ceb7746cbbf125186082963248e918a88e809a5fdb29a6caf"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x00000000001002e5"
-  },
   "i8-forms-013": {
    "classes": [
     "nan-results"
@@ -1956,7 +1607,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "730bbc7fbd5ed9e868611cb165145e5aa8225a38ffb0b725583d16f492a3de4e"
+     "sha256": "04d68c15762a322cd7cb3e0c950ab4e0e0c68af0d515769a951bd322251b4aa0"
     },
     {
      "addr": "0x300000",
@@ -1965,8 +1616,7 @@
    ],
    "model": [
     "a",
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x0",
    "rip": "0x000000000010033b"
@@ -1996,7 +1646,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "a627f16be5e9a6b9c855092a36c143d4904f447d8101728a38aafbecb27d9da2"
+     "sha256": "b5d653bc62c8ab4b9bba46095f8a16336f25b9faa66846f4ce2c635f9b57b21a"
     },
     {
      "addr": "0x300000",
@@ -2035,7 +1685,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "50edeeaf510f439570f7fd71c96e62ab62b3eab052c1898f3320e778517a6343"
+     "sha256": "f2c3b2124af4a92797ba382f85f71a15c4bd6fd58c2dbf24c32fdf0430a88158"
     },
     {
      "addr": "0x300000",
@@ -2075,7 +1725,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "9dd363ef0c078ca83fcbb81458b69cf286901fe0236c880e66355e35211fc698"
+     "sha256": "4adef2dd32fe2b72fcefeb66fb2765c80c9ab9afa68063998af9ddf05f76cdc6"
     },
     {
      "addr": "0x300000",
@@ -2084,8 +1734,7 @@
    ],
    "model": [
     "a",
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x4",
    "rip": "0x00000000001002ff"
@@ -2324,44 +1973,6 @@
    "rflags": "0x4",
    "rip": "0x00000000001002c7"
   },
-  "i8-forms-046": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0xffffffffffffff80",
-    "0x8cd391245d8aec2e",
-    "0x51cc802809ae23cd",
-    "0x200dae",
-    "0x300ffc",
-    "0x200d24",
-    "0x200df2",
-    "0x200cb8",
-    "0x7",
-    "0x27b5beeb9e5252d6",
-    "0xe82985b94c0ca6b9",
-    "0x41b17812b16e3394",
-    "0x2011c1",
-    "0x200ed4",
-    "0xffffffff",
-    "0xffff"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "9001ec7c134cece0a2a9d3ba001259d35ea7c663ed33720703093978a45b62aa"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "3ef13d2ce0f2857cca64497452533e8ffe69d9f15fb7c370488c3bbaee5de02d"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x0000000000100306"
-  },
   "i8-forms-056": {
    "classes": [
     "nan-results"
@@ -2463,7 +2074,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "c436dde81bc825225ce98172cf81506b225cf692da84ef786a1f625b17e453c5"
+     "sha256": "701b265d3274600ac4c0355e6e70b3909c68d81e50ff13ad1481da3c24b13065"
     },
     {
      "addr": "0x300000",
@@ -2503,7 +2114,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "4f23340900615acdc69ecc138397dbd0bb1771fb2f304b04f671076bd580ac4b"
+     "sha256": "9e5a2542d057125d9786db4033e0dbe1fcebfc4e8a5c05980c540a301708044d"
     },
     {
      "addr": "0x300000",
@@ -2511,10 +2122,11 @@
     }
    ],
    "model": [
+    "a",
     "b3",
     "c"
    ],
-   "rflags": "0x4",
+   "rflags": "0x0",
    "rip": "0x000000000010030e"
   },
   "i8-forms-065": {
@@ -2543,7 +2155,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "174fb090d7e96891e64cc8b8b837ccd8f4355110a5d96fd4e53954f358b276ad"
+     "sha256": "b184ca157bce2214e35dd820eaaa816aef3e1b8ffce0c11507dbf6b968ef1265"
     },
     {
      "addr": "0x300000",
@@ -2584,7 +2196,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "0b264a488bafceb2e5736e764c85d61ce9de803a345c3a4f30596b7d0613564c"
+     "sha256": "8c0e4f4855f1cefbbda7dd6f07e96f29b30a18f0f1f4a0f12dca22cac7033677"
     },
     {
      "addr": "0x300000",
@@ -2593,8 +2205,7 @@
    ],
    "model": [
     "a",
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100317"
@@ -2624,7 +2235,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "7afe57d476365ed67cb753676ba5851be7ecc84b8164ba4bbcf9e3f556c21a77"
+     "sha256": "8fb8b2cab6a5cf7d990534d01ec76558d0b778bed0bcd13b01db780d494aac29"
     },
     {
      "addr": "0x300000",
@@ -2632,8 +2243,7 @@
     }
    ],
    "model": [
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x0",
    "rip": "0x000000000010021d"
@@ -2702,7 +2312,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "01bdb3c6139d7e0ca4d78bb1e5f615a7e51d85eef60aff4b08f6701b74d0d002"
+     "sha256": "393f82b2578add0b73a698e84fbe84928295d18e418767ffb58fe0c09b7347ac"
     },
     {
      "addr": "0x300000",
@@ -2710,8 +2320,7 @@
     }
    ],
    "model": [
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x0",
    "rip": "0x00000000001002dd"
@@ -2741,7 +2350,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "233b3ece468530d93c63a29bddd23cfe563363e1ec402973d5e1db142b0e9c2a"
+     "sha256": "545c64f5fd768a960146a21e1ae5ddac92187aebba0d78c7218acc66f3f2a9e4"
     },
     {
      "addr": "0x300000",
@@ -2856,7 +2465,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "a8b761b4ac85af2dd073241550dbead66487e91dd75bfd5520464c4604c7a1f9"
+     "sha256": "d188fe8edfbbd547183983d9e55c0c7188e2e0dc477b123fabfe1ecd763dc018"
     },
     {
      "addr": "0x300000",
@@ -2865,8 +2474,7 @@
    ],
    "model": [
     "a",
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x0",
    "rip": "0x000000000010024f"
@@ -2909,44 +2517,6 @@
    "rflags": "0x0",
    "rip": "0x000000000010024d"
   },
-  "i8-random-038": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0xa4",
-    "0x8000",
-    "0x80000000",
-    "0x200cb2",
-    "0x301005",
-    "0x2011a1",
-    "0x200e3a",
-    "0x200e53",
-    "0x7",
-    "0x1ca541dc0dd9639a",
-    "0x1",
-    "0x2bea4492bf85c5a3",
-    "0x200f9c",
-    "0x20110d",
-    "0x10e6fcd686deb309",
-    "0x0"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "dc75a2da597f8041142d1d47abf5eeefeca6f1d540d97d8eb263da92aa022ac2"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "0535eec7379b422b676f345b5034fc555381888a58dbff82080f9f6fef491bf0"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x0000000000100275"
-  },
   "i8-random-039": {
    "classes": [
     "nan-results"
@@ -2972,7 +2542,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "25d4943c41913146a6fec61384b19ccccac112679e47e46a1b756fc9558913a9"
+     "sha256": "3a69a10a6b98249a46d1a57de1efdf1e385c44c97ab76036ff1eeecd2ec6ca60"
     },
     {
      "addr": "0x300000",
@@ -3010,7 +2580,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "5c8b3d5cc88b05750dd7fcde0413bcb9763e33075669ef2e3c979344f6fbf69a"
+     "sha256": "1af532749e4b14fead083bbc891f168401675caab31de76cfffc4c77cb3abab1"
     },
     {
      "addr": "0x300000",
@@ -3076,7 +2646,7 @@
     "0x201296",
     "0x0",
     "0x325fcd9719ce0b43",
-    "0x0",
+    "0x2",
     "0x8000000000000000",
     "0x200c0c",
     "0x200e2a",
@@ -3086,7 +2656,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "353f1941fc11b3e048102ab0da38fc67664ef8747af9255280e9559dabfc6af5"
+     "sha256": "884e9041a076422ea402cab3033897885e0d42455ca98f4b8feae849754fd561"
     },
     {
      "addr": "0x300000",
@@ -3099,44 +2669,6 @@
    ],
    "rflags": "0x0",
    "rip": "0x00000000001001ff"
-  },
-  "i8-random-050": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0xf17c61a184ad93f2",
-    "0x7fffffffffffffff",
-    "0x2258ca8968bc3e81",
-    "0x201065",
-    "0x300ff9",
-    "0x200df5",
-    "0x201160",
-    "0x2012f2",
-    "0x3",
-    "0x8c637be31270cd20",
-    "0x157b6b244db8c1d2",
-    "0x361a3e3b1ca25fe5",
-    "0x201007",
-    "0x200fe5",
-    "0xf3b502105ef20caa",
-    "0x8373b38c468308f2"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "8b846890d7e5371ee976b187d4930a52015081d759e28de46ea51fa9dfa4f96e"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "9836ef63346adb86d7fe8dee67fdfdefb18cb5860e5e2a44dc4e5e1cd54bf5de"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x0000000000100200"
   },
   "i8-random-052": {
    "classes": [
@@ -3163,7 +2695,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "65b755caa65426bb3b9ef66c39e9c434936c304c6477ef08541b518f8f8c6cdd"
+     "sha256": "17b0f22984b30299c79e496250bbef74e7fc4c2f2c691aa6a94dac6bf2d191e6"
     },
     {
      "addr": "0x300000",
@@ -3171,8 +2703,7 @@
     }
    ],
    "model": [
-    "a",
-    "c"
+    "a"
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100223"
@@ -3202,7 +2733,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "8dbea67f04cf78fd090fdf84a4eb3874c40148bf5a1bd277229acf9effb4e66e"
+     "sha256": "c660ede2d4df1a6d2ce7062a75a744217e9a911e24d94b86e0be8340fed4855a"
     },
     {
      "addr": "0x300000",
@@ -3210,49 +2741,10 @@
     }
    ],
    "model": [
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100200"
-  },
-  "i8-random-059": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x0",
-    "0x6a4bf98f92919355",
-    "0xff7fffff",
-    "0x200d15",
-    "0x301001",
-    "0x200c31",
-    "0x201246",
-    "0x201091",
-    "0x0",
-    "0x2a1ac7a2ba2413d5",
-    "0x2a81011ebf3d751b",
-    "0x80000000",
-    "0x200dbd",
-    "0x20133b",
-    "0x9d7f5f1e6d152a7a",
-    "0x7fff"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "f15e7344f06bd7353c49956dddbb48ca5d8c887ffbbaaec9a954288c5da9552d"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "1f5ab2925e188a42762ffecd82736179063343222342e99f661793587955cabf"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x000000000010020d"
   },
   "i8-random-061": {
    "classes": [
@@ -3317,7 +2809,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "2506b75935dc7f02b2149a6fd3ae7aa469bfba61eb0e0fa9f5c199b0d5015e76"
+     "sha256": "bb1696b9e62886c453a46c01762d80098b95f35ba9b1ccb62fe5df90c772e5dc"
     },
     {
      "addr": "0x300000",
@@ -3326,8 +2818,7 @@
    ],
    "model": [
     "a",
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100232"
@@ -3357,7 +2848,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "6d6331247003b5b25890f1b59168a08020f8f359d188640e06ca241aa19c7d3c"
+     "sha256": "3f6af1598746f202f9a2d85dc238ae62d813355ead2c634504f2671a8b0e4762"
     },
     {
      "addr": "0x300000",
@@ -3471,7 +2962,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "31cc2ffa1e1f4309a13c62327e1fd6e70a1e4dd80ec848b4a69eb07377ad169c"
+     "sha256": "377011a8e85286107365ec20efe58b87654885630553118c10233b6dcbc3301f"
     },
     {
      "addr": "0x300000",
@@ -3585,7 +3076,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "170c4d4733a5d2e9c008bdc3babdef8b9543a10ee25c7091da1df802d109182b"
+     "sha256": "d4063cbb881e9d74184365157827d1d9009e5f80095afba660dfb483446b8e8b"
     },
     {
      "addr": "0x300000",
@@ -3593,8 +3084,7 @@
     }
    ],
    "model": [
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x4",
    "rip": "0x0000000000100250"
@@ -3636,44 +3126,6 @@
    ],
    "rflags": "0x4",
    "rip": "0x000000000010026d"
-  },
-  "i8-random-090": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x7fffffffffffffff",
-    "0xea7521ed9828cbf9",
-    "0x7fffffff",
-    "0x200d66",
-    "0x301004",
-    "0x200d12",
-    "0x200daa",
-    "0x200fed",
-    "0x3",
-    "0x0",
-    "0xefe2d2d57df9781b",
-    "0x80",
-    "0x200fed",
-    "0x200c18",
-    "0xe19a3db64723f777",
-    "0x64ab36858e52db6"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "f362d71d025cb9fe8d6c4b8fa044bc754012f5f8fd9c1d41608e58630d2d87a6"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "6730bcf62fd75ca6cda8d8f21bb4c9c59909c4f60a9ec0c261f4bad39b5483d5"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x000000000010024c"
   },
   "i8-random-096": {
    "classes": [
@@ -3776,7 +3228,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "0d900372c4aa9f4838adb69c721b22031e39c60437c80b5268a689e2aa1a56b8"
+     "sha256": "c8559e56febd88e5fcd6e3a072a929a2c89b79c00eb3c6eaaabcfb35cc626403"
     },
     {
      "addr": "0x300000",
@@ -3789,44 +3241,6 @@
    ],
    "rflags": "0x0",
    "rip": "0x00000000001001fa"
-  },
-  "i8-random-107": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x80000000",
-    "0x7fff",
-    "0x6a1d6695fe9598d9",
-    "0x20131c",
-    "0x300ffe",
-    "0x2010fb",
-    "0x201259",
-    "0x2013a5",
-    "0x1",
-    "0x80",
-    "0x5b7baaaea817bbd5",
-    "0xd854d1236b2fde2e",
-    "0x200d5e",
-    "0x20129e",
-    "0x5d4fa14a2c1e75e7",
-    "0x6a6bf40824e3d1e3"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "80194f6f124253ca112e8e2de3ae096d6443365a24f08539d579f246a6ee2690"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "f039cb588463c5670affbd8068d5c5fe7f53251003204e2c94504d1cffb4131c"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x0000000000100298"
   },
   "i8-random-110": {
    "classes": [
@@ -4020,44 +3434,6 @@
    "rflags": "0x4",
    "rip": "0x0000000000100243"
   },
-  "i8-random-124": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0x7fffffffffffffff",
-    "0xe1a3818edce76697",
-    "0xffffffffffffffff",
-    "0x200d44",
-    "0x300ffd",
-    "0x200c4c",
-    "0x200edc",
-    "0x200e40",
-    "0x1",
-    "0x80000000",
-    "0x0",
-    "0xc384b8540e946c9",
-    "0x200e8a",
-    "0x201089",
-    "0x0",
-    "0xffffffff"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "5a79dda0c3e2f6459a43b530058cbd72782fb08805972ebf12565200f59e5744"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "572ead6259eca12ebfc0eda1770806775c666e831775c2667b2afbc9afc768d7"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x4",
-   "rip": "0x00000000001002af"
-  },
   "i8-random-126": {
    "classes": [
     "nan-results"
@@ -4199,7 +3575,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "faea7869eecdd587e8f7f1a99d982dff0bbd760aafc0859d0091b89fa5aa667c"
+     "sha256": "d7647699b4b5f80cdea91363611415dd516c82be9138c9189403fc267daf847e"
     },
     {
      "addr": "0x300000",
@@ -4238,7 +3614,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "927c889005e6dc0e814bdca139bb81e6ee298e086efe0842f78fa56cfbfc65a3"
+     "sha256": "b7ed009102cba4f8112c1613338f535628d46bf77ab38d64b67206eefac656cb"
     },
     {
      "addr": "0x300000",
@@ -4246,49 +3622,10 @@
     }
    ],
    "model": [
-    "b3",
-    "c"
+    "b3"
    ],
    "rflags": "0x0",
    "rip": "0x0000000000100285"
-  },
-  "i8-random-141": {
-   "classes": [
-    "nan-results"
-   ],
-   "gpr": [
-    "0xf7f80e248070ce16",
-    "0x6083159301a4c8",
-    "0x4",
-    "0x200e29",
-    "0x300ffb",
-    "0x200fb4",
-    "0x201023",
-    "0x200f81",
-    "0x2",
-    "0x1bc5b55f550acbff",
-    "0x72903adc8b45ae2c",
-    "0x89fdfdef655dbcc1",
-    "0x20133e",
-    "0x200d63",
-    "0x5e6b50a558f7664d",
-    "0xa8f665616d586be8"
-   ],
-   "memory": [
-    {
-     "addr": "0x200000",
-     "sha256": "51842df3b1131801a699852e27422852519d2b8194d4d70844d54181ded98b27"
-    },
-    {
-     "addr": "0x300000",
-     "sha256": "3f027bf5480e0f9bb93112b98038f15cda6d7add42691404c009086902b65383"
-    }
-   ],
-   "model": [
-    "c"
-   ],
-   "rflags": "0x0",
-   "rip": "0x0000000000100239"
   },
   "i8-random-142": {
    "classes": [
