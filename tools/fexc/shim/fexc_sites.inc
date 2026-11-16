@@ -201,6 +201,7 @@ DEF_OP(FexcSimdCheck) {
   FexcSimdCheckWords(IROp->C<IR::IROp_FexcSimdCheck>()->Mask);
 }
 DEF_OP(FexcKeep) {   // emits no code: the operand stays live up to the check that follows (the resident reads its register at the stub)
+  if (SpillSlots) return;   // a fill could reuse a register an earlier FexcKeep named: no description, the check behaves as before
   const auto Op = IROp->C<IR::IROp_FexcKeep>();
   FexcKeepList.push_back({Op->Tag, uint8_t(GetVReg(Op->Value).Idx())});
 }
