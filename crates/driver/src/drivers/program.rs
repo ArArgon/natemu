@@ -1131,7 +1131,7 @@ pub(crate) struct Args {
     #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check|check-halt", default_value = "on", value_parser = natemu::execution::parse_page_currency)]
     page_currency: u64,
     /// Floating-point mode (AFP accurate plan chunk 1): fast (the default) or accurate; every runner selects it with `NATEMU_FP`
-    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", value_parser = natemu::execution::parse_fp)]
+    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_fp)]
     fp: bool,
     #[arg(long = "strict-unassigned")]
     strict: bool,
