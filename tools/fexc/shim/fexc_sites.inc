@@ -503,7 +503,8 @@ void Arm64JITCore::FexcTinyLanes(ARMEmitter::VRegister R, uint32_t Elem, uint32_
 // IOC skips the fix-up: with AH = 1's rule applied to the Arm op's own operands (the first operand if a NaN, else the second, quieted;
 // else the negative default NaN), the M2 equals the M4. IOC where the result is right (an SNaN first operand) gets the same answer.
 // The op's destination may overwrite a source, so a source it aliases is copied first (VTMP1, VTMP2: the scalar ops use neither).
-// Scalar double ops only (what the x87 lowering emits); FLD m64's multiply by 1.0 (an SNaN is quieted either way) has none.
+// Scalar double ops only (what the x87 lowering emits; after register allocation the args are registers, so FLD m64's multiply by 1.0
+// is not told apart: its fix-up gives the quieted SNaN it already had).
 //   hot path: [mov v16, src1] [mov v17, src2]  op  ...FexcX87End...  tbz x0, #0, done
 //   fix-up:   fmov x1, S1; ubfx x2, x1, #0, #63; movz x3, #0x7ff0, lsl #48; sub x2, x3, x2; tbnz x2, #63, first;
 //             [fmov x1, S2; ubfx x2, x1, #0, #63; sub x2, x3, x2; tbnz x2, #63, first;] movz x1, #0xfff8, lsl #48; b put;
@@ -514,8 +515,7 @@ bool Arm64JITCore::FexcX87NanOp(const IR::IROp_Header* IROp) {
   if (IROp->Op != IROps::OP_VFADD && IROp->Op != IROps::OP_VFSUB && IROp->Op != IROps::OP_VFMUL && IROp->Op != IROps::OP_VFDIV &&
       IROp->Op != IROps::OP_VFSQRT) return false;
   if (IROp->Size != IR::OpSize::i64Bit || IROp->ElementSize != IR::OpSize::i64Bit) return false;
-  return IROp->Op == IROps::OP_VFSQRT || (IR->GetOp<IR::IROp_Header>(IROp->Args[0])->Op != IROps::OP_VCASTFROMGPR &&
-                                          IR->GetOp<IR::IROp_Header>(IROp->Args[1])->Op != IROps::OP_VCASTFROMGPR);
+  return true;
 }
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
   if (FexcQuietOp(IROp)) msr(ARMEmitter::SystemRegister::FPSR, TMP4);

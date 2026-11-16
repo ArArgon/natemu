@@ -1106,8 +1106,9 @@ class AfpDenormal(unittest.TestCase):
             for extra in (['--x87-unmasked', '0x2'], ['--x87-unmasked', '0x3f']):
                 self.assertEqual(soft_de_words(native_words(form, *extra)[1]), 0, name)   # a host with AFP
                 self.assertEqual(soft_de_words(native_words(form, *self.AFP0, *extra)[1]), 1, name)
-            for mask in ('0x0', '0x3d', '0x1'):   # DE masked (decision B): the code of a host with AFP
-                self.assertEqual(native_words(form, *self.AFP0, '--x87-unmasked', mask)[1], native_words(form, '--x87-unmasked', mask)[1], (name, mask))
+            for mask in ('0x0', '0x3d', '0x1'):   # DE masked: a host with AFP has none of it; without, the flag is or-ed into the pending byte (AfpX87 judges it)
+                self.assertFalse(any(l.startswith('and w') and l.endswith('#0x80') for l in native_words(form, '--x87-unmasked', mask)[1]), (name, mask))
+                self.assertTrue(any(l.startswith('and w') and l.endswith('#0x80') for l in native_words(form, *self.AFP0, '--x87-unmasked', mask)[1]), (name, mask))
         # not the integer forms (fiadd m32, fiadd m16, fild), the register forms: no memory operand to test
         for form in ('da03', 'de03', 'df03', 'd8c1', 'dec1', 'd9c0', 'd8d1', 'dfe9', 'd9e4'):
             self.assertEqual(soft_de_words(native_words(form, *self.AFP0, '--x87-unmasked', '0x2')[1]), 0, form)
@@ -1296,6 +1297,76 @@ def uz_block(fexc, hexs, *extra):
         m = re.match(r'(b\.\w+|cbn?z|tbn?z) .*0x([0-9a-f]+)$', l)
         if m and int(m.group(2), 16) >= b + 4 * n: words[k] = 0xd503201f
     return words, lines[:n], lay['spill_bytes']
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpX87(unittest.TestCase):
+    """AFP fallback, x87 in default mode (afp=0): the masked DE of m32/m64 memory operands and the NaN results of arithmetic. The M4
+    (FPCR 6, AFP code) is the oracle: the guest state after the instruction (ST registers as stored doubles, the pending flags, TOP, tags)
+    is the same as the M2's (FPCR 0, afp=0 code). The one known deviation: the M4 raises DE for an m32 operand beside a NaN in ST0 (and
+    FDIVR m32 over a zero ST0), where x86 does not (the afp=0 flag is judged against x86's rule instead)."""
+    D = dict(one=0x3ff0000000000000, two=0x4000000000000000, zero=0, nzero=1 << 63, inf=0x7ff0000000000000, ninf=0xfff0000000000000,
+             qnan=0x7ff8000000000000, nqnan=0xfff8000000000000, qnanp=0x7ff8000000001234, snan=0x7ff0000000000001, nsnan=0xfff0000000000007,
+             snanp=0x7ff4000000000000)
+    M4 = {4: dict(one=0x3f800000, den=1, dmax=0x7fffff, dneg=0x80000001, zero=0, nzero=0x80000000, inf=0x7f800000, ninf=0xff800000,
+                  qnan=0x7fc00000, nqnan=0xffc00000, qnanp=0x7fc01234, snan=0x7f800001, nsnan=0xff800007, snanp=0x7fa00000),
+          8: dict(one=D['one'], den=1, dmax=0xfffffffffffff, dneg=(1 << 63) | 1, zero=0, nzero=1 << 63, inf=D['inf'], ninf=D['ninf'], qnan=D['qnan'],
+                  nqnan=D['nqnan'], qnanp=D['qnanp'], snan=D['snan'], nsnan=D['nsnan'], snanp=D['snanp'])}
+    MEM = [(n + ' m' + str(8 * e), n, h, e) for e in (4, 8) for n, h in zip(('fadd', 'fmul', 'fcom', 'fcomp', 'fsub', 'fsubr', 'fdiv', 'fdivr'),
+           (['d803', 'd80b', 'd813', 'd81b', 'd823', 'd82b', 'd833', 'd83b'] if e == 4 else ['dc03', 'dc0b', 'dc13', 'dc1b', 'dc23', 'dc2b', 'dc33', 'dc3b']))] + \
+          [('fld m32', 'fld', 'd903', 4), ('fld m64', 'fld', 'dd03', 8)]
+    # register forms (ST0 op STi, STi op ST0, the P forms), FSQRT, FRNDINT, FCOM, FXAM-free negation/abs
+    REG = ['d8c1', 'd8c9', 'd8e1', 'd8e9', 'd8f1', 'd8f9', 'dcc1', 'dcc9', 'dce1', 'dce9', 'dcf1', 'dcf9', 'dec1', 'dec9', 'dee1', 'dee9', 'def1', 'def9',
+           'd9fa', 'd9fc', 'd8d1', 'd8d9', 'd9c0', 'd9e0', 'd9e1', 'dfe9']
+
+    def run_form(self, form, afp, st0, st1, mem, e):
+        words, lines, spills = native_words(form, *([] if afp else ['--feature', 'afp=0']))
+        self.assertEqual(spills, 0, form)
+        i = max(k for k, l in enumerate(lines) if l.startswith('svc'))
+        while lines[i - 1].startswith(('mov w0', 'movk w0')): i -= 1
+        buf = bytearray(8192)
+        buf[0x4b2] = 3 if st1 is not None else 1   # tags: ST0 (and ST1) valid, TOP 0
+        buf[0x420:0x428] = st0.to_bytes(8, 'little')
+        if st1 is not None: buf[0x430:0x438] = st1.to_bytes(8, 'little')
+        if mem is not None: buf[0x1000:0x1000 + e] = mem.to_bytes(e, 'little')
+        return native_run(words[:i], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=6 if afp else 0)[2][:0x500]
+
+    def test_memory_operands_follow_the_m4_and_x86(self):
+        n = 0
+        for name, op, form, e in self.MEM:
+            vals = self.M4[e]
+            for a, st0 in self.D.items():
+                for m, mem in vals.items():
+                    r0, r1 = self.run_form(form, False, st0, None, mem, e), self.run_form(form, True, st0, None, mem, e)
+                    nan0 = fp_class(st0, 8)['nan']
+                    zero0 = fp_class(st0, 8)['zero']
+                    # x86: DE for a denormal operand, none beside a NaN in ST0 (IE), a memory dividend over a zero ST0 is ZE
+                    de = fp_class(mem, e)['den'] and (op == 'fld' or not (nan0 or (op == 'fdivr' and zero0)))
+                    self.assertEqual(bool(r0[0x4b4] & 0x80), de, (name, a, m))
+                    quirk = e == 4 and (nan0 or (op == 'fdivr' and zero0))   # the M4's DE deviation
+                    mask = [k for k in range(len(r0)) if not (k == 0x4b4 and quirk)]
+                    self.assertEqual([r0[k] for k in mask], [r1[k] for k in mask], (name, a, m))
+                    n += 1
+        self.assertGreater(n, 2000)
+
+    def test_register_forms_follow_the_m4(self):
+        for form in self.REG:
+            for (a, st0), (b, st1) in itertools.product(self.D.items(), repeat=2):
+                self.assertEqual(self.run_form(form, False, st0, st1, None, 8), self.run_form(form, True, st0, st1, None, 8), (form, a, b))
+
+    def test_integer_operands_follow_the_m4(self):
+        for form, e in (('da03', 4), ('da0b', 4), ('da2b', 4), ('da33', 4), ('de03', 2), ('de3b', 2), ('da13', 4), ('db03', 4)):
+            for a, st0 in self.D.items():
+                for m in (0, 1, 5, 0x7fffffff, 0x80000000, 0xffff):
+                    m &= (1 << 8 * e) - 1
+                    self.assertEqual(self.run_form(form, False, st0, None, m, e), self.run_form(form, True, st0, None, m, e), (form, a, m))
+
+    def test_invalid_operations_give_the_negative_indefinite(self):
+        """x86's real indefinite is the negative QNaN (AH = 0's default is the positive one); the NaN-operand cases are judged by the M4 above."""
+        for form, st0, st1 in (('d8f1', self.D['zero'], self.D['zero']), ('d8e1', self.D['inf'], self.D['inf']), ('d8c9', self.D['inf'], self.D['zero']),
+                               ('d8c1', self.D['inf'], self.D['ninf']), ('d9fa', 0xbff0000000000000, None), ('d9fa', self.D['ninf'], None)):
+            got = int.from_bytes(self.run_form(form, False, st0, st1, None, 8)[0x420:0x428], 'little')
+            self.assertEqual(got, 0xfff8000000000000, (form, hex(got)))
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
