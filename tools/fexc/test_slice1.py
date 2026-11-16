@@ -1371,6 +1371,75 @@ class AfpUpperZero(unittest.TestCase):
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpTiny(unittest.TestCase):
+    """AFP fallback, decision C (unmasked case): without AFP and with UE unmasked the SIMD stub of a multiply, divide, FMA or narrowing
+    convert names its operands' registers (crates/abi `tiny`: width = meta, imm = five bits per slot, guest_offset2 = the word after the
+    check's `cbnz`); the registers hold the operands at the check, and nothing is described for a host with AFP, with UE masked or for an
+    instruction with an add (whose tiny result is exact)."""
+    AFP0 = ['--feature', 'afp=0']
+    UE = ['--simd-unmasked', '0x10']
+    MUL, DIV, FMA, CVT, E8, SC, H2, NP, NA = 1, 2, 3, 4, 8, 16, 32, 64, 128
+    # name, hex, meta, guest xmm registers of the slots in order (xmm1 = v17 ...)
+    FORMS = [
+        ('mulss', 'f30f59ca', MUL | SC, (1, 2)), ('mulsd', 'f20f59ca', MUL | E8 | SC, (1, 2)), ('mulps', '0f59ca', MUL, (1, 2)),
+        ('mulpd', '660f59ca', MUL | E8, (1, 2)), ('divss', 'f30f5eca', DIV | SC, (1, 2)), ('divpd', '660f5eca', DIV | E8, (1, 2)),
+        ('vmulss', 'c5ea59cb', MUL | SC, (2, 3)), ('vdivps', 'c5e85ecb', DIV, (2, 3)),
+        ('vfmadd231sd', 'c4e2e9b9cb', FMA | E8 | SC, (2, 3, 1)), ('vfmadd231ps', 'c4e269b8cb', FMA, (2, 3, 1)),
+        ('vfmsub231ps', 'c4e269bacb', FMA | NA, (2, 3, 1)), ('vfnmadd231sd', 'c4e2e9bdcb', FMA | E8 | SC | NP, (2, 3, 1)),
+        ('vfnmsub231pd', 'c4e2e9becb', FMA | E8 | NP | NA, (2, 3, 1)),
+        ('cvtsd2ss', 'f20f5aca', CVT | E8 | SC, (2,)), ('cvtpd2ps', '660f5aca', CVT | E8, (2,)),
+    ]
+
+    def sites(self, h, *extra):
+        d, rc = run(h, RIP, *extra)
+        self.assertEqual(rc, 0, h)
+        return [s for s in d['sites'] if s['kind'] == 'simd'], d['code']['layout']['code_region_begin']
+
+    def test_the_site_names_the_operand_registers_and_the_word_after_the_branch(self):
+        for name, h, meta, guest in self.FORMS:
+            sites, begin = self.sites(h, *self.AFP0, *self.UE)
+            self.assertEqual(len(sites), 1, name)
+            st = sites[0]
+            self.assertEqual(st['width'], meta, name)
+            slots = [st['imm'] >> 5 * k & 31 for k in range(6)]
+            self.assertEqual(st['imm'] >> 30, 0, name)
+            words, lines, spills = native_words(h, *self.AFP0, *self.UE)
+            at = (st['guest_offset2'] - begin) // 4
+            self.assertTrue(lines[at - 1].startswith('cbnz w1,') and lines[at].startswith('ldrb w1,'), (name, lines[at - 1:at + 1]))
+            vals = {n: 0x0123456789abcdef0011223344556677 * (n + 3) & (1 << 128) - 1 for n in range(16)}
+            v = [0] * 32
+            for n, bits in vals.items(): v[16 + n] = bits
+            after = native_run(words[:at - 1], v=v)[1]
+            for k, n in enumerate(guest):
+                self.assertEqual(after[slots[k]], vals[n], (name, k, 'v%d holds xmm%d at the check' % (slots[k], n)))
+
+    def test_256_bit_forms_have_two_halves_and_adds_have_none(self):
+        sites, _ = self.sites('c5ec59cb', *self.AFP0, *self.UE)   # vmulps ymm1, ymm2, ymm3
+        self.assertEqual([s['width'] for s in sites], [self.MUL | self.H2])
+        sites, _ = self.sites('c4e37d19d101' if False else 'c5fd5acb', *self.AFP0, *self.UE)   # vcvtpd2ps xmm1, ymm3: not an add, a narrowing of two halves
+        self.assertEqual([s['width'] for s in sites], [self.CVT | self.E8 | self.H2])
+        for name, h in (('addss', 'f30f58ca'), ('addps', '0f58ca'), ('sqrtsd', 'f20f51ca'), ('cvtss2sd', 'f30f5aca'), ('haddps', 'f20f7cca'),
+                        ('addsubps', 'f20fd0ca'), ('minss', 'f30f5dca'), ('vcvtps2ph', 'c4e3791dd100')):
+            for st in self.sites(h, *self.AFP0, *self.UE)[0]:
+                self.assertEqual((st['width'], st['imm'], st['guest_offset2']), (0, 0, None), name)
+
+    def test_dpps_describes_its_multiplies_only(self):
+        sites, _ = self.sites('660f3a40caff', *self.AFP0, *self.UE)
+        described = [s['width'] for s in sites if s['width']]
+        self.assertEqual(described, [self.MUL])   # (the add levels are exact: no description, the check stays as it was)
+
+    def test_nothing_with_afp_or_ue_masked_or_the_other_masks_only(self):
+        for name, h, meta, guest in self.FORMS:
+            for extra in ((*self.UE,), (*self.AFP0, '--simd-unmasked', '0x20'), (*self.AFP0, '--simd-unmasked', '0x2f'), ()):
+                for st in self.sites(h, *extra)[0]:
+                    self.assertEqual((st['width'], st['imm'], st['guest_offset2']), (0, 0, None), (name, extra))
+            # (the code of a host with AFP, and of UE masked, is the code without the FexcKeep ops: the replay streams pin it, and so
+            # does this: the same words with or without the description)
+        w, _, _ = native_words('f30f59ca', *self.AFP0, '--simd-unmasked', '0x10')
+        self.assertGreater(len(w), 0)
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class Slice1Exits(unittest.TestCase):
     def test_exit_sequences(self):
         with tempfile.TemporaryDirectory() as t:

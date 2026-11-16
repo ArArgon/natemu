@@ -176,6 +176,22 @@ void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask, const ARMEmitter::Register*
   movz(ARMEmitter::Size::i32Bit, TMP2, Mask);
   and_(ARMEmitter::Size::i32Bit, TMP2, TMP1, TMP2);
   cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP2, FexcStub(FEXC_SITE_SIMD, false));
+  if (!FexcKeepList.empty()) {   // AFP fallback, decision C: the operands the FexcKeep ops named, in the stub's site (see fexc_hook.h)
+    uint32_t Imm = 0, Meta = 0;
+    bool Half2 = false;
+    for (auto [Tag, Reg] : FexcKeepList) {
+      const uint32_t M = Tag & 0xff, Pos = Tag >> 8 & 3, Half = Tag >> 10 & 1;
+      if (Meta && (Meta & ~0x20u) != (M & ~0x20u)) ERROR_AND_DIE_FMT("fexc slice1 (AFP fallback): the FexcKeep operands of one check disagree");
+      Meta = M;
+      Half2 |= Half != 0;
+      Imm |= uint32_t(Reg) << (5 * (3 * Half + Pos));
+    }
+    auto& S = fexc_sites.back();
+    S.width = uint8_t(Meta | (Half2 ? 0x20u : 0u));
+    S.imm = int32_t(Imm);
+    S.guest_offset2 = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);   // the word after the branch (a far check's `b` included)
+    FexcKeepList.clear();
+  }
   ldrb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
   orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
   strb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
@@ -183,6 +199,10 @@ void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask, const ARMEmitter::Register*
 }
 DEF_OP(FexcSimdCheck) {
   FexcSimdCheckWords(IROp->C<IR::IROp_FexcSimdCheck>()->Mask);
+}
+DEF_OP(FexcKeep) {   // emits no code: the operand stays live up to the check that follows (the resident reads its register at the stub)
+  const auto Op = IROp->C<IR::IROp_FexcKeep>();
+  FexcKeepList.push_back({Op->Tag, uint8_t(GetVReg(Op->Value).Idx())});
 }
 DEF_OP(FexcSimdCheckDe) {
   const auto Op = IROp->C<IR::IROp_FexcSimdCheckDe>();

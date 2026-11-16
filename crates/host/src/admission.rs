@@ -801,15 +801,18 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
 fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
     use object::kind::*;
     if addressless(s) {
+        // AFP fallback, decision C: a SIMD stub may describe its instruction's operands (width = meta, imm = registers,
+        // guest_offset2 = the offset after the check's cbnz, which `fp_checks` verifies against the code).
+        let described = s.kind == SIMD && s.width != 0;
         let width = if s.kind == X87 {
             (1..=15).contains(&s.width)
         } else {
-            s.width == 0
+            s.width == 0 || described && natemu_abi::tiny::Desc::decode(s.width, s.imm).is_some()
         };
         return access.is_none()
-            && s.guest_offset2 == object::NONE32
-            && (s.base_reg, s.index_reg, s.imm, s.writeback)
-                == (object::NO_REG, object::NO_REG, 0, object::WB_NONE)
+            && (s.guest_offset2 == object::NONE32) != described
+            && (s.base_reg, s.index_reg, s.writeback) == (object::NO_REG, object::NO_REG, object::WB_NONE)
+            && (s.imm == 0 || described)
             && width
             && (s.intent, s.rmw, s.segment)
                 == (object::INTENT_READ, object::RMW_NONE, object::SEG_DS);
@@ -1657,6 +1660,32 @@ mod tests {
     }
     const BRK1: u32 = 0xd420_0020;
     const BRK2: u32 = 0xd420_0040;
+
+    #[test]
+    fn a_simd_stub_may_describe_its_operands_and_only_consistently() {
+        use natemu_abi::tiny::{Desc, MUL};
+        let (meta, imm) = Desc { meta: MUL, regs: [1, 2, 0, 0, 0, 0] }.encode();
+        let simd = |width: u8, imm: i32, g2: u32| Site {
+            kind: object::kind::SIMD,
+            width,
+            imm,
+            guest_offset2: g2,
+            base_reg: object::NO_REG,
+            index_reg: object::NO_REG,
+            writeback: object::WB_NONE,
+            intent: object::INTENT_READ,
+            rmw: object::RMW_NONE,
+            segment: object::SEG_DS,
+            ..load_site(8)
+        };
+        assert!(stub_matches(&simd(0, 0, object::NONE32), None));
+        assert!(stub_matches(&simd(meta, imm, 40), None));
+        assert!(!stub_matches(&simd(meta, imm, object::NONE32), None)); // described, no resume point
+        assert!(!stub_matches(&simd(0, 0, 40), None)); // a resume point, no description
+        assert!(!stub_matches(&simd(0, imm, object::NONE32), None)); // registers without a description
+        assert!(!stub_matches(&simd(7, imm, 40), None)); // a kind no shim writes
+        assert!(!stub_matches(&simd(meta, imm | 1 << 31, 40), None));
+    }
 
     #[test]
     fn check_stubs_must_be_brk_words_covering_a_matching_access() {

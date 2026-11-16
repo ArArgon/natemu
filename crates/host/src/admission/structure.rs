@@ -2077,7 +2077,9 @@ impl Verifier<'_> {
                             .iter()
                             .enumerate()
                             .all(|(k, &w)| self.word(c.end + 4 + 4 * k as u32) == w);
-                    if !ok {
+                    // A described stub (the operands of the instruction's multiplies, divides, FMAs and narrowing converts, read by the resident when
+                    // UFC is the only unmasked flag) resumes at the word after the `cbnz`.
+                    if !ok || st.guest_offset2 != object::NONE32 && st.guest_offset2 != c.end + 4 {
                         return fail();
                     }
                     c.start - if plain { 12 } else { 20 }
@@ -2373,6 +2375,7 @@ mod tests {
             "c4e26998cb", "c4e269a8cb", "c4e269a9cb", "c4e2e9a8cb", "c4e2e999cb", "c4e26d98cb", // VFMADD132/213 (ps, ss, pd, sd, ymm)
             "c4e269a6cb", "c4e269a7cb", "c4e26d96cb", "c4e269b6cb", // VFMADDSUB/VFMSUBADD
             "c5efd0cb", "c5edd0cb",   // VADDSUBPS/PD ymm
+            "f30f59ca", "f20f59ca", "660f59ca", "c5ec59cb", "c5e85ecb", "c4e2e9b9cb", "c5fd5aca", "f20f590b", // AFP fallback decision C: described stubs
         ];
         let x87 = [
             "d903", "dd03", "d803", "dc03", "d80b", "dc0b", "d813", "dc13", "d81b", "dc1b", "d823", "dc23", "d82b", "dc2b", "d833", "dc33", "d83b",
@@ -2400,7 +2403,7 @@ mod tests {
             for hex in forms {
                 let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
                 for afp in [&["--feature", "afp=0"][..], &[]] {
-                    for unmasked in ["0x1", "0x2", "0x3", "0x3f"] {
+                    for unmasked in ["0x1", "0x2", "0x3", "0x10", "0x3f"] {
                         for keys in [&[][..], &["--ftz"]] {
                             let args = [afp, &[flag, unmasked][..], keys].concat();
                             let object = compile(hex, &args);

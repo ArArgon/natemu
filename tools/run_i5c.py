@@ -253,6 +253,93 @@ def simd_cases():
     for tag, ins, v, mx in (('cvtps2pi-upper-pe', 'cvtps2pi mm0, xmm1', f32(1.5), MX & ~(PE << 7)), ('cvttps2pi-upper-ie', 'cvttps2pi mm0, xmm1', f32(3e9), MX & ~(IE << 7)),
                             ('cvtps2pi-upper-masked', 'cvtps2pi mm0, xmm1', f32(1.5), MX), ('cvttps2pi-upper-masked', 'cvttps2pi mm0, xmm1', f32(3e9), MX)):
         out.append(one(f'rv-{tag}', ins, {1: lanes(ONE, ONE, v, ONE)}, mx, 0, None, None))
+    # AFP fallback, decision C (the unmasked case): x86 judges tininess AFTER rounding to the destination precision as if the exponent range were
+    # unbounded (SDM Vol.1 4.9.1.5), a host without FEAT_AFP BEFORE it. A result whose exact value lies just below +-MIN_NORMAL and that rounds to it
+    # is not tiny on x86: no UE, no #XM (PE only; the result is +-MIN_NORMAL). Just below it, between half an ulp of the destination format below MIN_NORMAL and
+    # half the denormal spacing, the exact value is tiny on x86 although the denormal-grid rounding also gives MIN_NORMAL (the hardware result alone does not
+    # tell): UE, #XM. Rows from tools/models/gen_tiny_vectors.py's reference (A: not tiny after rounding, B: tiny): (rc, tag, a, b, c, sign of the exact value).
+    UM = MX & ~(UE << 7)
+    MIN32, MIN64 = 0x00800000, 0x0010000000000000
+    BAND = {
+        'mulss': [(0, 'A', 0x2339d5a4, 0x9cb05433, 0, -1), (0, 'B', 0x243ce5cf, 0x1bad7835, 0, 1), (1, 'A', 0x1ecfc2ac, 0xa11db859, 0, -1),
+                  (1, 'B', 0x1c54cb25, 0xa399fd58, 0, -1), (2, 'A', 0x20341153, 0x1fb5f9dd, 0, 1), (2, 'B', 0x20285b00, 0x1fc2a2c2, 0, 1),
+                  (3, 'B', 0x2339d5a4, 0x9cb05433, 0, -1), (3, 'B', 0x20341153, 0x1fb5f9dd, 0, 1)],
+        'mulsd': [(0, 'A', 0x1f8af557d8e94b15, 0xa072fe03c4afc4e7, 0, -1), (0, 'B', 0x1fee9079ed52a241, 0x2010c064b2495dd7, 0, 1),
+                  (1, 'A', 0x1faa123f90f5380e, 0xa053a37285f2af8b, 0, -1), (1, 'B', 0x1f868f91f6cdb2f8, 0xa076b1b7b845c507, 0, -1),
+                  (2, 'A', 0x1ff19de2b4ff00ae, 0x200d103224303c4f, 0, 1), (2, 'B', 0x2067ca07cc099a1e, 0x1f9585bb3ca3298e, 0, 1),
+                  (3, 'B', 0x1f8af557d8e94b15, 0xa072fe03c4afc4e7, 0, -1)],
+        # (a quotient of two p-bit numbers is never within half a spacing of MIN_NORMAL without being tiny after rounding: 2^-150 at least away
+        # for binary32, so every divide row is B; 0x00ffffff / 2 is MIN_NORMAL - 2^-150 exactly, a tie that the denormal grid rounds up)
+        'divss': [(0, 'B', 0x00ffffff, 0x40000000, 0, 1), (1, 'B', 0x85eeea5c, 0x44eeea5d, 0, -1), (2, 'B', 0x0861e8ae, 0x4761e8af, 0, 1)],
+        'divsd': [(1, 'B', 0x81383e87ea252462, 0x41183e87ea252463, 0, -1), (2, 'B', 0x010c74bbb4f79d8c, 0x40ec74bbb4f79d8d, 0, 1)],
+        'vfmadd231ss': [(0, 'A', 0x1e89be55, 0x2014595a, 0x8093f487, -1), (0, 'B', 0x20f18fba, 0x2094faee, 0x81f927bd, 1),
+                        (1, 'A', 0x1f40067c, 0x202ede93, 0x80c195ae, -1), (1, 'B', 0x1d4b97eb, 0x1efb7398, 0x8080c7f9, -1),
+                        (2, 'A', 0x1ecdcac0, 0x1d27e175, 0x007f790b, 1), (2, 'B', 0x200d2136, 0x205a9758, 0x8071036f, 1)],
+        'vfmadd231sd': [(0, 'A', 0x1fb565a120813528, 0x1fdc0878d2a0aa01, 0x000fda82d1a2a870, 1), (0, 'B', 0x1ffcf3857641db78, 0x1ff43ff26f698dfb, 0x0006d6f8e8744033, 1),
+                        (1, 'A', 0x200386bd68673f6f, 0x1fc608a367c102e3, 0x8011ae3cf398ab29, -1), (1, 'B', 0x1ffb3098c13335d4, 0x200db5dff35536e5, 0x80249f49cc429241, -1),
+                        (2, 'A', 0x1ffc3e35ecdacf38, 0x1ffa242aa6ef10e4, 0x000476c446f3a1a9, 1), (2, 'B', 0x2009fdf4c84ad24d, 0x201147fe338eb9de, 0x802412c7f6578f27, 1)],
+        'cvtsd2ss': [(0, 'A', 0x380ffffff7490213, 0, 0, 1), (0, 'B', 0x380fffffe06cfe0a, 0, 0, 1), (1, 'A', 0xb80ffffff0000000, 0, 0, -1),
+                     (1, 'B', 0xb80fffffcd8af040, 0, 0, -1), (2, 'A', 0x380fffffffb2d2c8, 0, 0, 1), (2, 'B', 0x380fffffd519fa45, 0, 0, 1),
+                     (3, 'B', 0x380ffffff7490213, 0, 0, 1)],
+    }
+    SPEC = {   # insn, element bits, registers (xmm1 = destination or the addend, the sources), the destination's format and element bits
+        'mulss': ('mulss xmm1, xmm2', 32, (1, 2), 32), 'mulsd': ('mulsd xmm1, xmm2', 64, (1, 2), 64), 'divss': ('divss xmm1, xmm2', 32, (1, 2), 32),
+        'divsd': ('divsd xmm1, xmm2', 64, (1, 2), 64), 'vfmadd231ss': ('vfmadd231ss xmm1, xmm2, xmm3', 32, (2, 3, 1), 32),
+        'vfmadd231sd': ('vfmadd231sd xmm1, xmm2, xmm3', 64, (2, 3, 1), 64), 'cvtsd2ss': ('cvtsd2ss xmm1, xmm2', 64, (2,), 32),
+    }
+    def band_result(vm, dest, lane0, bits, rest=()):
+        got = xmm_of(vm, dest)
+        want = (lane0 | (rest[0] if rest else 0) << bits, rest[1] if len(rest) > 1 else 0) if bits == 32 else (lane0, rest[0] if rest else 0)
+        return [] if got == want else [f'xmm{dest} {got[0]:#x} {got[1]:#x}, want {want[0]:#x} {want[1]:#x}']
+    for op, rows in BAND.items():
+        insn, ebits, srcs, dbits = SPEC[op]
+        for rc, tag, a, b, c, sign in rows:
+            x = {srcs[k]: ((v, 0) if ebits == 64 else (v, 0)) for k, v in enumerate((a, b, c)[:len(srcs)])}
+            if op == 'cvtsd2ss': x[1] = lanes(ONE)
+            elif op == 'vfmadd231ss' or op == 'vfmadd231sd': pass
+            mx = UM | rc << 13
+            name = f'band-{op}-rc{rc}-{"not-tiny" if tag == "A" else "tiny"}{"-neg" if sign < 0 else ""}'
+            if tag == 'A':   # no #XM: the result is +-MIN_NORMAL, PE (inexact) is the only flag
+                c1 = one(name, insn, x, mx, PE, None, 1)
+                old, res = c1['check'], (MIN32 if dbits == 32 else MIN64) | (sign < 0) << (dbits - 1)
+                c1['check'] = lambda vm, old=old, res=res, dbits=dbits: old(vm) + band_result(vm, 1, res, dbits)
+                out.append(c1)
+            else:            # #XM (UE and PE): the destination unchanged
+                out.append(one(name, insn, x, mx, UE | PE, 19, 1))
+    # A band lane beside other lanes (packed, SDM Vol.1 11.5.3.2: the flags are those of the elements together, UE for any tiny one).
+    A32, B32 = (0x2339d5a4, 0x9cb05433), (0x243ce5cf, 0x1bad7835)      # (a, b): A not tiny, B tiny (round to nearest, mulps)
+    A64, B64 = (0x1f8af557d8e94b15, 0xa072fe03c4afc4e7), (0x1fee9079ed52a241, 0x2010c064b2495dd7)
+    def packed(name, insn, x, mx, flags, fault, res=None, ymm=None, prelude=(), extra=()):
+        c1 = one(name, insn, x, mx, flags, fault, 1, prelude=prelude, extra=extra, ymm=ymm is not None)
+        if res is not None:
+            old = c1['check']
+            c1['check'] = lambda vm, old=old, res=res: old(vm) + ([] if xmm_of(vm, 1) == res else [f'xmm1 {xmm_of(vm, 1)[0]:#x} {xmm_of(vm, 1)[1]:#x}, want {res[0]:#x} {res[1]:#x}'])
+        out.append(c1)
+    m = lambda s: MIN32 | (s << 31)
+    packed('band-mulps-lane0-not-tiny', 'mulps xmm1, xmm2', {1: lanes(A32[0], ONE, ONE, ONE), 2: lanes(A32[1], ONE, ONE, ONE)}, UM, PE, None, res=(m(1) | ONE << 32, ONE | ONE << 32))
+    packed('band-mulps-lane0-not-tiny-lane1-tiny-sub-band', 'mulps xmm1, xmm2', {1: lanes(A32[0], B32[0], ONE, ONE), 2: lanes(A32[1], B32[1], ONE, ONE)}, UM, UE | PE, 19)
+    packed('band-mulps-lane0-not-tiny-lane1-exact-tiny', 'mulps xmm1, xmm2', {1: lanes(A32[0], E100, ONE, ONE), 2: lanes(A32[1], E30, ONE, ONE)}, UM, UE | PE, 19)
+    packed('band-mulps-lane0-not-tiny-lane1-tiny-first', 'mulps xmm1, xmm2', {1: lanes(B32[0], A32[0], ONE, ONE), 2: lanes(B32[1], A32[1], ONE, ONE)}, UM, UE | PE, 19)
+    packed('band-mulps-both-lanes-not-tiny', 'mulps xmm1, xmm2', {1: lanes(A32[0], A32[0], ONE, ONE), 2: lanes(A32[1], A32[1], ONE, ONE)}, UM, PE, None, res=(m(1) | m(1) << 32, ONE | ONE << 32))
+    packed('band-mulps-lane0-not-tiny-lane1-overflow-oe-masked', 'mulps xmm1, xmm2', {1: lanes(A32[0], MAXF, ONE, ONE), 2: lanes(A32[1], TWO, ONE, ONE)}, UM, OE | PE, None,
+           res=(m(1) | INF << 32, ONE | ONE << 32))
+    packed('band-mulps-lane0-not-tiny-pe-unmasked', 'mulps xmm1, xmm2', {1: lanes(A32[0], ONE, ONE, ONE), 2: lanes(A32[1], ONE, ONE, ONE)}, UM & ~(PE << 7), PE, 19)
+    packed('band-mulps-lane1-tiny-pe-unmasked', 'mulps xmm1, xmm2', {1: lanes(A32[0], B32[0], ONE, ONE), 2: lanes(A32[1], B32[1], ONE, ONE)}, UM & ~(PE << 7), UE | PE, 19)
+    packed('band-mulpd-lane0-not-tiny-lane1-tiny', 'mulpd xmm1, xmm2', {1: (A64[0], B64[0]), 2: (A64[1], B64[1])}, UM, UE | PE, 19)
+    packed('band-mulpd-lane0-tiny-lane1-not-tiny', 'mulpd xmm1, xmm2', {1: (B64[0], A64[0]), 2: (B64[1], A64[1])}, UM, UE | PE, 19)
+    packed('band-mulpd-both-not-tiny', 'mulpd xmm1, xmm2', {1: (A64[0], A64[0]), 2: (A64[1], A64[1])}, UM, PE, None, res=(MIN64 | 1 << 63, MIN64 | 1 << 63))
+    packed('band-cvtpd2ps-lane0-not-tiny-lane1-tiny', 'cvtpd2ps xmm1, xmm2', {1: (0, 0), 2: (0x380ffffff7490213, 0x380fffffe06cfe0a)}, UM, UE | PE, 19)
+    packed('band-cvtpd2ps-lane0-tiny-lane1-not-tiny', 'cvtpd2ps xmm1, xmm2', {1: (0, 0), 2: (0x380fffffe06cfe0a, 0x380ffffff7490213)}, UM, UE | PE, 19)
+    packed('band-cvtpd2ps-both-not-tiny', 'cvtpd2ps xmm1, xmm2', {1: (0, 0), 2: (0x380ffffff7490213, 0x380ffffff7490213)}, UM, PE, None, res=(MIN32 | MIN32 << 32, 0))
+    # A 256-bit multiply: each half's lanes count (both halves are checked before either is written).
+    ymm = lambda name, a_hi, b_hi, flags, fault: out.append(one(name, 'vmulps ymm1, ymm1, ymm2', {1: lanes(A32[0], ONE, ONE, ONE), 2: lanes(A32[1], ONE, ONE, ONE)}, UM, flags, fault, 1,
+                   prelude=['vinsertf128 ymm1, ymm1, xmmword ptr [rdi + 0x80], 1', 'vinsertf128 ymm2, ymm2, xmmword ptr [rdi + 0x90], 1'],
+                   extra=[f'memory {D + 0x280:#x} {a_hi.hex()}', f'memory {D + 0x290:#x} {b_hi.hex()}', 'xcr0 7'], ymm=False))
+    ymm('band-vmulps-ymm-upper-not-tiny', struct.pack('<IIII', A32[0], ONE, ONE, ONE), struct.pack('<IIII', A32[1], ONE, ONE, ONE), PE, None)
+    ymm('band-vmulps-ymm-upper-tiny', struct.pack('<IIII', B32[0], ONE, ONE, ONE), struct.pack('<IIII', B32[1], ONE, ONE, ONE), UE | PE, 19)
+    # Controls: an add and a square root never produce a tiny inexact result (a tiny sum is exact; a root is never tiny): MIN_NORMAL from 2 * 2^-127 is
+    # exact, and raises nothing.
+    out.append(one('band-addss-exact-min-normal', 'addss xmm1, xmm2', {1: lanes(0x00400000), 2: lanes(0x00400000)}, UM, 0, None, 1))
     # x87 arithmetic leaves MXCSR alone and does not trip a SIMD check (its own FPSR wrapper).
     out.append(case('x87-between-simd', ['fninit', 'fld1', 'fldz', 'fdivp st(1), st(0)', 'addss xmm3, xmm3', 'fstp st(0)'],
                     ['sse 1', f'mxcsr {MX & ~(ZE << 7):#x}', f'xmm 3 {ONE:#x} 0'], None,
