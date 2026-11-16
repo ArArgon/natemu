@@ -1010,7 +1010,7 @@ memory accesses and unknown opcodes.
 - Core features are derived: a built feature whose required Arm features all lie in the host floor.
 - The shim's verdict rows and the host decode's #UD decisions test generated constants (`fexc_features.h`,
   `cpu_gates.rs`), not hand-written verdicts.
-- Host Arm features are `admission::FEATURES` (class, floor) plus the probe's machine rows. They are checked once at
+- Host Arm features are `admission::FEATURES` (class, floor) plus the probe's machine rows (LSE2, Apple's TSO bit, FP and AdvSIMD, trapped FP exceptions `fptraps`). They are checked once at
   startup, which refuses with one line naming everything missing.
 - Enforced by:
   - `cpu_profile.py` `catalogue_problems` (one negative control per rule, `test_cpu_profile.py`);

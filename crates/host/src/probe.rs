@@ -7,9 +7,9 @@
 //! process: the program driver's stderr stays as it was. The interrupt-controller API is a deployment fact (its functions
 //! are strong imports: macOS 15 or later, stated in the README), not probed.
 use crate::admission::{
-    Class, FEATURES, ID_REGISTERS, MACHINE, detected, forced_off, supported_features,
+    Class, FEATURES, FPTRAPS_MASK, ID_REGISTERS, MACHINE, detected, forced_off, supported_features,
 };
-use crate::vm::{ACTLR_EL1, Vcpu, config_id_register};
+use crate::vm::{ACTLR_EL1, FPCR, Vcpu, config_id_register};
 use std::sync::OnceLock;
 
 /// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
@@ -34,6 +34,8 @@ pub(crate) struct Launch {
 pub(crate) struct Probe {
     pub id: [u64; ID_REGISTERS.len()],
     pub tso: bool,
+    /// The six FPCR trap-enable bits read back set ([`FPTRAPS_MASK`]).
+    pub fptraps: bool,
     pub forced_off: u64,
 }
 impl Probe {
@@ -43,8 +45,14 @@ impl Probe {
         for (value, (name, reg)) in id.iter_mut().zip(ID_REGISTERS) {
             *value = cpu.sys(reg).map_err(|e| format!("{name}: {e}"))?;
         }
+        // FPCR by the host (HV_REG_FPCR): write the enables, read back, restore. Nothing is left enabled.
+        let fpcr = cpu.reg(FPCR)?;
+        cpu.set_reg(FPCR, fpcr | FPTRAPS_MASK)?;
+        let back = cpu.reg(FPCR);
+        cpu.set_reg(FPCR, fpcr)?;
         Ok(Self {
             id,
+            fptraps: back? & FPTRAPS_MASK == FPTRAPS_MASK,
             tso: cpu.sys(ACTLR_EL1)? & 2 != 0,
             forced_off: match std::env::var_os("NATEMU_FEXC_FEATURE_OFF") {
                 Some(list) => forced_off(&list.to_string_lossy())?,
@@ -65,7 +73,7 @@ impl Probe {
         let features = (FEATURES.iter().enumerate()).map(|(i, f)| (f.name, &f.detect, f.class, off(i)));
         let machine = MACHINE.iter().map(|&(n, ref d, c)| (n, d, c, false));
         (features.chain(machine))
-            .filter(|&(_, d, c, off)| c == class && (off || !detected(d, &self.id, self.tso)))
+            .filter(|&(_, d, c, off)| c == class && (off || !detected(d, &self.id, self.tso, self.fptraps)))
             .map(|(n, ..)| n)
             .collect()
     }
@@ -172,7 +180,7 @@ fn config_view() -> Result<&'static [u64; ID_REGISTERS.len()], String> {
 }
 fn machine(name: &str) -> Result<bool, String> {
     let row = MACHINE.iter().find(|r| r.0 == name).expect("machine row");
-    Ok(detected(&row.1, config_view()?, true))
+    Ok(detected(&row.1, config_view()?, true, true))
 }
 /// FEAT_CSV3 (ID_AA64PFR0_EL1[63:60]): the host's loads do not pass faulting data on (the only condition for RDCL_NO
 /// besides `--speculation-barriers`). An error when the hypervisor cannot be read.
@@ -200,7 +208,7 @@ mod tests {
     ];
     const LAUNCH: Launch = Launch { speculation_barriers: false, pool: true, compile_cache: None };
     fn probe(f: impl FnOnce(&mut Probe)) -> Probe {
-        let mut p = Probe { id: FULL, tso: true, forced_off: 0 };
+        let mut p = Probe { id: FULL, tso: true, fptraps: true, forced_off: 0 };
         f(&mut p);
         p
     }
@@ -263,6 +271,9 @@ mod tests {
         // Each alone, and the TSO bit and PMULL (AES field 1: AES yes, PMULL no).
         assert_eq!(probe(|p| p.id[5] = 0).missing(), ["lse2"]);
         assert_eq!(probe(|p| p.tso = false).missing(), ["apple_tso"]);
+        // A host whose FPCR trap-enable readback is 0 is refused by name.
+        assert_eq!(probe(|p| p.fptraps = false).missing(), ["fptraps"]);
+        assert_eq!(probe(|p| p.fptraps = false).refusal().as_deref(), Some("host lacks fptraps"));
         assert_eq!(
             probe(|p| p.id[0] = FULL[0] & !(15 << 4) | 1 << 4).missing(),
             ["pmull128"]

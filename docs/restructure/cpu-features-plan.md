@@ -193,13 +193,13 @@ says how it is detected, what happens on a host without it, and what keeps it ho
 
 | Class | Meaning | Members, with what the guest's vCPU shows (M1/M2/M4 records; M4 measured on macOS 26) | Without it | Kept honest by |
 | --- | --- | --- | --- | --- |
-| **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP: on all three chips, in fields every known Hypervisor.framework version passes through. Non-register: Apple TSO bit; the interrupt-controller API (minimum macOS 15, a deployment fact) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
+| **required** | a core guest feature, or the machine itself, cannot run without it | FlagM, LSE, LSE2, CRC32, AES, PMULL, SHA1+SHA256, Armv8.0 SIMD/FP: on all three chips, in fields every known Hypervisor.framework version passes through. Non-register: Apple TSO bit; trapped (synchronous) FP exceptions, `fptraps` (macOS `hw.optional.arm.FP_SyncExceptions`; all six FPCR trap-enable bits IOE DZE OFE UFE IXE IDE read back set; on the M1 Pro, M2 Max and M4; Nov 16: moved from unused to required, accurate FP mode relies on them); the interrupt-controller API (minimum macOS 15, a deployment fact) | startup refuses, listing every missing item | the probe (chunk 2); a refusal test per item with the item simulated missing |
 | **exactness** | runs without it, but some guest-visible result differs from x86 | FCMA (all three chips; its fallback flips ADDSUBPS NaN signs); AFP: M4 only (absent on M1 and M2; shown by macOS 26, hidden by the macOS 12 masks) | runs; startup line names the difference; tests that depend on it are tagged with it | M2 work (after this plan): tagged test expectations; the AFP-dependent FPCR bits and flag mapping made conditional |
 | **speed** | a fallback exists; only performance changes | FlagM2, FRINTTS (all three chips; FCMA moved to exactness in chunk 4: its fallback flips NaN signs); I8MM (M2, M4; macOS-dependent); ECV (hidden by Hypervisor.framework in every version seen, so never used today); RPRES, CSSC, MOPS (in ID_AA64ISAR2, invisible to guests before macOS 27; CSSC and MOPS on no current chip) | fexc gets `name=0`; generated code takes FEX's fallback | the fallback gate (below) |
 | **option** | used only when a command-line option asks for it | SB (`--speculation-barriers`), CSV3 (RDCL_NO with that option): all three chips | the option is refused (SB) or the bit stays clear (CSV3) | existing refusal; probe reads both from the vCPU's registers |
 | **guest-optional** | backs an optional guest feature, advertised only where present (§3) | none built. First candidate: WAITPKG on WFxT (M4 only), blocked until macOS 27 shows ID_AA64ISAR2 | the guest feature is absent on that host | the host-derived mask's tests (chunk 5) |
 | **off by policy** | present, but not used | LRCPC, LRCPC2 (all three chips; hardware TSO makes them pointless); RPRES and WFxT until a feature needs them (and macOS shows them) | nothing | the reply cross-check (FEATURES' policy matches fexc's table) |
-| **unused** | nothing in natemu or fexc uses it | SME/SME2 (M4; shown since macOS 15.2), SPECRES (shown in the vCPU though sysctl says 0), synchronous FP exceptions (unused today; present on M1, M2 and M4; the accurate FP mode plans to use them), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
+| **unused** | nothing in natemu or fexc uses it | SME/SME2 (M4; shown since macOS 15.2), SPECRES (shown in the vCPU though sysctl says 0), BF16, FHM, RDM, JSCVT, SHA3, SHA512, PAuth/PAuth2/FPAC, BTI, DIT, DPB/DPB2, SSBS | nothing | listed so a new use has to change its class |
 
 **The fallback gate (new, chunk 2).** The speed class is the one most likely to break unnoticed: every machine that
 runs the suite today has all of it. No tool today forces a feature off in a boot or a corpus run: the host builds its
@@ -632,7 +632,7 @@ Apple's TSO bit and the interrupt-controller API are part of the floor too, thou
 
 **Above the floor** (M4 only): AFP, RPRES, WFxT, FPACCOMBINE, SME/SME2 and its variants.
 
-**Correction (November 16):** synchronous (trapped) FP exceptions are in the floor, not M4-only. `hw.optional.arm.FP_SyncExceptions` is 1 on an M1 Pro, an M2 Max and the M4 (owner). On the M2 Max and the M4 the traps are precise and reach a guest's own EL1 vector under Hypervisor.framework, 29-70 ns per trap (`tools/fp_trap_probe/run.sh`, on branch `afp-fallback`); the M1 is not yet measured that way. The accurate floating-point mode plans to use them.
+**Correction (November 16):** synchronous (trapped) FP exceptions are in the floor, not M4-only. `hw.optional.arm.FP_SyncExceptions` is 1 on an M1 Pro, an M2 Max and the M4 (owner). On the M2 Max and the M4 the traps are precise and reach a guest's own EL1 vector under Hypervisor.framework, 29-70 ns per trap (`tools/fp_trap_probe/run.sh`, on branch `afp-fallback`); the M1 is not yet measured that way. They are now a required host feature: the resident checks the trap-enable bits at its first run and natemu refuses a host without them.
 
 **M2 only:** SSBS. Natemu does not use it.
 
@@ -683,7 +683,7 @@ it, or admission accepts only the encodings that use it.
 | --- | --- | --- |
 | FlagM | required | every flag-producing instruction (CFINV and friends; the code generator's settings require it) |
 | LSE | required | LOCK prefixes, XCHG with memory, CMPXCHG8B/16B (admission accepts only LSE atomics; the resident is built with LSE) |
-| Apple TSO bit, interrupt-controller API | required | the whole machine (x86 memory ordering; interrupts) |
+| Apple TSO bit, trapped FP exceptions (`fptraps`), interrupt-controller API | required | the whole machine (x86 memory ordering; accurate FP mode's unmasked exceptions; interrupts) |
 | CRC32 | required | SSE4.2's CRC32 |
 | AES | required | AES-NI |
 | PMULL (128-bit) | required | PCLMULQDQ |

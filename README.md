@@ -49,7 +49,7 @@ Other distributions and kernels are untested. Major features still missing:
 - An Apple Silicon Mac running macOS 26 (tested on M4). The minimum is macOS 15: natemu uses
   Hypervisor.framework's interrupt-controller API (`hv_gic_*`), which is linked as a required
   import, so an older macOS refuses to load the binary. There is no runtime check for it. At startup natemu checks the
-  vCPU for the hardware features it needs (FlagM, LSE, LSE2, the crypto extensions, Apple's TSO bit) and
+  vCPU for the hardware features it needs (FlagM, LSE, LSE2, the crypto extensions, Apple's TSO bit, trapped floating-point exceptions) and
   fails with one line naming everything missing, for example `natemu: host lacks lse2 pmull128`.
   A boot prints startup lines of the form `natemu: <topic>: <value>`, one decision each: `cpu` (the x86-64-v3 level plus
   what the guest CPU adds, computed from the host's features), `fp` (`fast mode`; on a Mac without FEAT_AFP, M1 or M2,
