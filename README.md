@@ -53,8 +53,8 @@ Other distributions and kernels are untested. Major features still missing:
   fails with one line naming everything missing, for example `natemu: host lacks lse2 pmull128`.
   A boot prints startup lines of the form `natemu: <topic>: <value>`, one decision each: `cpu` (the x86-64-v3 level plus
   what the guest CPU adds, computed from the host's features), `fp` (`fast mode`; on a Mac without FEAT_AFP, M1 or M2,
-  `fast mode, degraded (host lacks FEAT_AFP)`, and some x86 floating-point corner cases differ; being fixed: the AFP
-  fallback plan), `acceleration` (each host feature natemu can use for speed, `+` used and `-` the slower fallback code),
+  `fast mode, degraded (host lacks FEAT_AFP)`: a few x86 floating-point corner cases differ, listed under "Floating point on
+  Macs without AFP" below; a planned accurate mode makes them exact), `acceleration` (each host feature natemu can use for speed, `+` used and `-` the slower fallback code),
   `meltdown` (`speculation barriers` or `none`), and `code cache` (`pool on, disk 512 MiB at ~/Library/Caches/natemu/fexc`: the shared template pool and the compile cache on disk, or `disk off`). Tools recognise these lines by those
   topics only: errors and warnings can also read `natemu: disk lock: ...`. If the compile cache cannot be opened, a later
   `natemu: code cache: disk off (reason)` line corrects it.
