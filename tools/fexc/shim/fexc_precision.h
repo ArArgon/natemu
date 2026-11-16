@@ -130,6 +130,16 @@ inline void Prescan(const FEXCore::IR::IRListView& IR) {
 //     else, and resumes after the instruction; #MF follows at the next waiting instruction).
 // The x87 check's operands are the lowering's fexc_x87_extra (fexc_hook.h).
 // SSE/AVX ops that may raise an MXCSR flag (the I5a/I8 lowerings; x87 instructions' ops are the x87 wrapper's).
+// The multiply `Node` (the addend of a packed FMA of the lowering) by the named constant -1.0, or null.
+template<class View> inline const FEXCore::IR::IROp_Header* NegOneMul(View& IR, FEXCore::IR::OrderedNodeWrapper Arg) {
+  using namespace FEXCore::IR;
+  const auto* M = IR.template GetOp<IROp_Header>(Arg);
+  if (M->Op != OP_VFMUL) return nullptr;
+  const auto* K = IR.template GetOp<IROp_Header>(M->Args[1]);
+  if (K->Op != OP_LOADNAMEDVECTORCONSTANT) return nullptr;
+  const auto C = K->template C<IROp_LoadNamedVectorConstant>()->Constant;
+  return C == NamedVectorConstant::NAMED_VECTOR_NEG_ONE_PS || C == NamedVectorConstant::NAMED_VECTOR_NEG_ONE_PD ? M : nullptr;
+}
 // natemu slice1 (no AFP): the multiply of ADDSUB's, VFMADDSUB's and the packed VFMSUB/VFNMSUB's lowering (an operand by the named constant
 // (-1, 1, -1, 1), (1, -1, 1, -1) or -1.0; the dispatcher's ADDSUBPOpImpl, AVX128_VFMAddSubImpl, AVX128_VFMAImpl) is exact (by 1.0 and -1.0) and not an x86 operation: no DE test and no DAZ/FTZ flush of its own (an FTZ flush of the
 // exact product would raise UFC where x86 raises nothing); the add that follows takes both for the product, which a denormal Src2
@@ -442,7 +452,7 @@ inline bool Commits(FEXCore::IR::IROps Op) {
 // `tiny`), which it reads from the registers at the check's stub; FexcKeep ops before the check keep them live. `TinyDescOf` says for one
 // op whether it can raise a UFC the resident could not judge (returns false: an add, a subtract, a half-precision narrowing... the
 // instruction then keeps today's behaviour) and describes the ones it can: meta (crates/abi `tiny`) and the operands by position.
-struct TinyDesc { uint8_t Meta = 0; uint8_t Arg[3] {}; const FEXCore::IR::IROp_Header* Op = nullptr; };   // Arg: indices into Op->Args
+struct TinyDesc { uint8_t Meta = 0; uint8_t Arg[3] {}; const FEXCore::IR::IROp_Header* Op = nullptr; const FEXCore::IR::IROp_Header* Neg = nullptr; };   // Neg: the multiply by -1.0 of the addend (below)   // Arg: indices into Op->Args
 inline bool TinyDescOf(const FEXCore::IR::IROp_Header* Op, TinyDesc& D) {
   using namespace FEXCore::IR;
   D.Op = Op;
@@ -614,14 +624,18 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
             bool Ok = true;
             for (long i = After + 1; i <= Upto && i < long(First) && Ok; ++i) {
               TinyDesc D;
+              if (IsAddSubMul(IR, IR.template GetOp<IROp_Header>(Insn[i].first))) continue;   // (an exact multiply by 1.0 or -1.0: no tininess)
               Ok = TinyDescOf(IR.template GetOp<IROp_Header>(Insn[i].first), D);
+              // the packed VFMSUB/VFNMSUB addend negated by NegOneMul: the FMA is described as it was (the addend negated), on the guest's addend
+              if (Ok && (D.Op->Op == OP_VFMLA || D.Op->Op == OP_VFNMLA))
+                if (const auto* M = NegOneMul(IR, D.Op->Args[2])) { D.Meta |= 1 << 7; D.Neg = M; }
               if (Ok && D.Meta) { if (N == 2) Ok = false; else Ds[N++] = D; }
             }
             if (Ok && N == 2 && Ds[0].Meta != Ds[1].Meta) Ok = false;
             if (Ok && N)
               for (size_t h = 0; h < N; ++h)
                 for (size_t k = 0; k < ((Ds[h].Meta & 7) == 3 ? 3u : (Ds[h].Meta & 7) == 4 ? 1u : 2u); ++k)
-                  IREmit->_FexcKeep(IR.GetNode(Ds[h].Op->Args[Ds[h].Arg[k]]), uint32_t(Ds[h].Meta) | uint32_t(k) << 8 | uint32_t(h) << 10);
+                  IREmit->_FexcKeep(IR.GetNode(k == 2 && Ds[h].Neg ? Ds[h].Neg->Args[0] : Ds[h].Op->Args[Ds[h].Arg[k]]), uint32_t(Ds[h].Meta) | uint32_t(k) << 8 | uint32_t(h) << 10);
           }
           Ref De = nullptr;
           for (const auto& D : Des)
