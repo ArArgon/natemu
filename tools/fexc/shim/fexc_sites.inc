@@ -217,6 +217,44 @@ DEF_OP(FexcSimdDe) {
   msr(ARMEmitter::SystemRegister::FPSR, TMP1);
   (void)Bind(&Skip);
 }
+// AFP accurate plan, chunk 2 (B), the screen: a lane whose exponent field is nonzero can never raise DE, so when every examined lane of
+// every source is such, the exact test (the span up to FexcSimdSkipEnd) is skipped. `cmtst` of each source with the exponent mask,
+// the sources and'ed, the lanes reduced (`uminv`; a scalar op looks at lane 0 only, its low 32 bits), and all ones is `add #1` = 0:
+//   mov/dup mask; cmtst D, A, mask; [cmtst T, B, mask; and D, D, T]...; [uminv s, D;] fmov w, s|D; add w, w, #1; cbz w, END
+// A zero (or denormal) lane falls into the exact test, so the flag stays exact. Writes Dst, VTMP1, VTMP2 and TMP1; no NZCV.
+static ARMEmitter::ForwardLabel FexcSpanEnd;
+static bool FexcSpanOpen = false;
+DEF_OP(FexcSimdSkip) {
+  FexcSpanOpen = false;
+  if (SpillSlots) return;   // a fill inside the span would be skipped with it: the exact test always runs
+  const auto Op = IROp->C<IR::IROp_FexcSimdSkip>();
+  const bool Dbl = IROp->ElementSize == IR::OpSize::i64Bit, Scalar = Op->Mode >> 8 & 1;
+  const auto Sz = Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
+  const auto Dst = GetVReg(Node);
+  const IR::OrderedNodeWrapper Src[3] = {Op->A, Op->B, Op->C};
+  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Dbl ? 0x7ff0'0000'0000'0000ULL : 0x7f80'0000ULL);
+  dup(Sz, VTMP1.Q(), TMP1);
+  cmtst(Sz, Dst.Q(), GetVReg(Src[0]).Q(), VTMP1.Q());
+  for (uint32_t i = 1; i < (Op->Mode & 255); ++i) {
+    cmtst(Sz, VTMP2.Q(), GetVReg(Src[i]).Q(), VTMP1.Q());
+    and_(Dst.Q(), Dst.Q(), VTMP2.Q());
+  }
+  if (Scalar) {
+    fmov(ARMEmitter::Size::i32Bit, TMP1, Dst.S());
+  } else {
+    uminv(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), Dst.Q());
+    fmov(ARMEmitter::Size::i32Bit, TMP1, VTMP1.S());
+  }
+  add(ARMEmitter::Size::i32Bit, TMP1, TMP1, 1);
+  FexcSpanEnd = {};
+  (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &FexcSpanEnd);
+  FexcSpanOpen = true;
+}
+DEF_OP(FexcSimdSkipEnd) {
+  if (!FexcSpanOpen) return;
+  (void)Bind(&FexcSpanEnd);
+  FexcSpanOpen = false;
+}
 DEF_OP(FexcSimdCheckDe) {
   const auto Op = IROp->C<IR::IROp_FexcSimdCheckDe>();
   const auto De = GetReg(Op->De);
