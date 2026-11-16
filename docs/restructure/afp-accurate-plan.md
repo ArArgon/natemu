@@ -164,9 +164,13 @@ Natively it costs:
 - a packed block: +139%;
 - a LuaJIT-like scalar block: +66%.
 
-Of that, +38% is a temporary and move that keep the state from before the instruction. They are needed only where the
-destination is also a source. VEX three-operand forms with a separate destination skip them. All four items share this
-mechanism.
+Of that, +38% is the temporary and move that keep the state from before the instruction. Every guarded form keeps them,
+including VEX three-operand forms whose destination is separate. Without them the destination would be written before a
+step that can still fault or run other bytes:
+- another vCPU unmapping a memory operand's page gives a #PF with the destination already written;
+- with cross-modifying code, the step runs the new bytes over a destination the old instruction wrote.
+
+All four items share this mechanism.
 
 **The invariant: no guest register is written before the instruction's last test.** A stub must see the state from
 before the instruction, so the invariant is stated and tested per form:
@@ -194,10 +198,17 @@ from the host (a hypervisor call), and the step block is placed uncached in the 
 1 ns. Hits are rare for NaN results in ordinary code, but not for zero and flushed results (§4 C). Under DAZ + FTZ every
 correctly flushed result hits, so the round trip sits on the normal path of gcc `-Ofast` code.
 
-So **a resident-cached exact step is in scope** (chunk 3). A result stub's step block is kept in the cache under its RIP
-and context with a step marker, like any block, so a second hit is an in-VM branch to compiled code. Self-modifying-code
-steps stay uncached, because their bytes are about to change. Measuring first was rejected: under DAZ + FTZ the storm is
-by design, not an accident.
+So **a resident-cached exact step is in scope** (chunk 3). A result stub's step block is kept in the cache, and its key
+works both ways:
+- **The step marker is part of the lookup key.** The stub looks up only step-marked blocks, and normal dispatch, linking
+  and the template pool never find them. Otherwise the stub would find the guarded block at that RIP and loop, or
+  dispatch would run a one-instruction block.
+- **The step lookup goes through the same mapped-source check as any block,** so a remap to another source page misses.
+- **The block keeps the STEP flag:** it is never linked, `code_written` never re-steps it, and a NaN stub inside it halts.
+
+A second hit avoids the host round trip but is still a stub: a breakpoint, resident entry, bank, lookup and entry, about
+0.1-0.4 µs by the earlier measurement of kept system instructions. Self-modifying-code steps stay uncached, because their
+bytes are about to change. Measuring first was rejected: under DAZ + FTZ the storm is by design, not an accident.
 
 **The range test.** Multiplies, divides, FMAs and narrowing conversions are the only operations that can raise UFC
 without AFP (§4 C). For them one comparison catches NaN or tiny. Take the magnitude's bits u. Then
@@ -262,8 +273,9 @@ The chunk verifies two assumptions:
 test catches both. The hot block still runs under FZ = 1: every entry sets FPCR from MXCSR.
 
 So the exact step writes FPCR itself: `msr fpcr` with FZ = 0 before the operation, and the block's value again before
-every exit. That is the same shape fexc already emits for an instruction's own rounding mode around ROUND. Admission
-allows it only in `--exact-step` compiles, and checks that it is restored on every path.
+every exit. Stubs need no restore, because the resident refills FPCR at every entry. That is the same shape fexc already
+emits for an instruction's own rounding mode around ROUND. Admission allows it only in `--exact-step` compiles. It pins
+the exact words: the value read with only FZ cleared, so no trap-enable bit can be set.
 
 The step then recomputes the result with the software flushes (rows 4 and 5), which FTZ alone already uses correctly, and
 its UFC goes through the band decision. Rows 4 and 5 have never run together, so their combination is tested natively
@@ -312,7 +324,7 @@ denormal, band and zero classes, results and flags bit-identical. The fast-mode 
 | 0. Test hygiene | registry, README list and parity test; run_i5c's structured MXCSR; driver reports `afp` and `fp` (`fp` always fast until chunk 1); the three runners and corpus judging; the model and its predicted states copied to evidence | §2 |
 | 1. Frame | option and variable, `Cpu` field, key bit 32, `--accurate` and `--exact-step` (accepted, no effect yet), `ResetGlobals`, the fp line's value, driver's `fp`, abi contract | identity test with the mode and steps; M4 replay 0 differences; M2 emulation fast replay 0 differences; a boot in each mode prints the right fp line |
 | 2. B | row 7's test with DE masked, the FPSR write, admission rule | native oracle for DE; in M2 emulation, accurate: run_i5a_de, run_i5c and run_i8_faults pass with no deviation counted |
-| 3. A with D and RSQRT | the reference branch's stub rebased; the per-form invariant; fix-up table reviewed first, then the fix-ups in `--exact-step` with allocator values; the cached exact step; row 10 with IE masked; RSQRT guarded | the exhaustive step-admission and no-spill test; invariant cases (high half only, last step only, destination aliasing each source); native oracle (NaN classes); a run_i5c loop taking the stub many times (second hit cached); in M2 emulation, accurate: i8 and i8b fully pass (i8b: only the seven departures) |
+| 3. A with D and RSQRT | the reference branch's stub rebased; the per-form invariant; fix-up table reviewed first, then the fix-ups in `--exact-step` with allocator values; the cached exact step; row 10 with IE masked; RSQRT guarded | the exhaustive step-admission and no-spill test; invariant cases (high half only, last step only, destination aliasing each source); native oracle (NaN classes); a run_i5c loop taking the stub many times (second hit from the step cache; a guarded block at the same RIP is never found by the step lookup, nor a step block by dispatch); in M2 emulation, accurate: i8 and i8b fully pass (i8b: only the seven departures) |
 | 4. C masked | range test with zero exclusion, UFC removal before banking, masked disposition at the stub, the STMXCSR, LDMXCSR and FXRSTOR checks; starts after the owner's trap test | run_i5c band cases (every rounding mode, f32 and f64, UE set earlier by LDMXCSR, a packed op with a NaN in one lane and a band result in another, a band lane beside real underflow); zero-exclusion cases; native oracle |
 | 5. C under DAZ + FTZ | the step's own FPCR and its admission rule; steps with rows 4 + 5 combined | native oracle of the combination; run_i5c DAZ + FTZ band and flush cases; the corpora's DAZ/FTZ programs in accurate mode |
 | 6. Cost, records, M2 run | one benchmark round in M2 emulation, fast vs accurate (cray, luajit, luajit-interp, zstd, sqlite, avx; 5 interleaved runs), plus an existing FP benchmark program built with `-Ofast` (DAZ + FTZ, flush-heavy), with stub hits counted; README: the option, its cost, fast mode's deviation list; the owner's M2 run of the probe and runner subset in both modes | numbers recorded here and in the investigation record's progress log; the M2 matches M2 emulation |
@@ -327,6 +339,7 @@ denormal, band and zero classes, results and flags bit-identical. The fast-mode 
 - C masked waits for the owner's trap test.
 - C under DAZ + FTZ uses C masked's test and decision.
 - Chunks 2 and 3 are independent and may swap.
+- Chunk 1's fp-line gate needs branch `startup-lines` merged first.
 
 ## 7. Decisions for the owner
 
@@ -350,7 +363,7 @@ Decided here, with reasons in the text; the owner may overrule any of them:
 
 ## 8. Risks
 
-- **Stub hits.** Even cached, each hit is a resident entry and a step. Code with many NaN or tiny results that survive the
+- **Stub hits.** Even cached, each hit is a resident entry, a bank and a lookup (about 0.1-0.4 µs). Code with many NaN or tiny results that survive the
   zero exclusion pays per hit. Chunk 6 counts them.
 - **The UFC-clear rule** depends on every UFC-raising operation being range-tested. A missed lowering (a new FEX op that
   multiplies) would make the band decision wrong without any sign. Mitigations: the op table is checked against FEX's
@@ -376,9 +389,12 @@ Decided here, with reasons in the text; the owner may overrule any of them:
 | N1 | A tagged case that comes out exact should fail | §2: adopted |
 | N2 | Judge tagged corpus programs against the model's prediction | §2: adopted; predicted states stored as evidence |
 | N3 | `shl #1` doubles both constants | §3 |
-| N4 | The temporary and move are needed only when the destination is a source | §3 |
+| N4 | The temporary and move are needed only when the destination is a source | §3; reverted in round 2 (R2-1) |
 | N5 | Records: the abi contract and the investigation record | §1, chunk 6 |
 | Q1 | Make the hygiene rule a plan decision | §2, §7 |
+| R2-1 | Second round: skipping the temporary breaks the invariant (a #PF from an unmapped page, or cross-modifying code, after the destination is written) | §3: every guarded form keeps the temporary |
+| R2-2 | The cached step's key must work both ways | §3: the step marker is part of the key, both directions; the mapped-source check; the STEP flag kept |
+| R2-N | Pin the step's `msr fpcr` words; stubs need no restore; a cached hit is ~0.1-0.4 µs, not a plain branch; chunk 1 depends on `startup-lines` | §4 C under DAZ + FTZ, §3, §6 order |
 | Owner | Startup output becomes one line per decision | §1: this plan sets the fp line's value; the degraded note uses chunk 0's descriptions |
 
 ## 10. Progress
