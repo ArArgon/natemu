@@ -15,13 +15,13 @@ F16, F32, F64 = Fmt(5, 10), Fmt(8, 23), Fmt(11, 52)
 
 class Mode:
     """Behaviour switches. name: 'q' (QEMU/x86 reference), 'hw' (M4 natemu), 'm2' (no AFP)."""
-    def __init__(s, name, dnan_neg=True, nan2='qemu', fma='qemu', negflip=False, daz_ignored=False, ftz_in=False, fz_out_arm=False, fma_inf0q=False, tiny_before=False,
+    def __init__(s, name, dnan_neg=True, nan2='qemu', fma='qemu', negflip=False, negflip_pk=False, daz_ignored=False, ftz_in=False, fz_out_arm=False, fma_inf0q=False, tiny_before=False,
                  minmax_qnan_ie=True, ue_nozero=False, hadd_swap=False):
         s.__dict__.update(locals()); del s.__dict__['s']
 
 Q = Mode('q')
 HW = Mode('hw', nan2='hw', fma='hw')
-M2 = Mode('m2', dnan_neg=False, nan2='arm', fma='arm', negflip=True, daz_ignored=True, ftz_in=True, fz_out_arm=True, fma_inf0q=True, tiny_before=True, minmax_qnan_ie=False, hadd_swap=True)
+M2 = Mode('m2', dnan_neg=False, nan2='arm', fma='arm', negflip=True, negflip_pk=True, daz_ignored=True, ftz_in=True, fz_out_arm=True, fma_inf0q=True, tiny_before=True, minmax_qnan_ie=False, hadd_swap=True)
 import dataclasses
 BASE = Mode('base', nan2='hw', hadd_swap=True)    # natemu on the M4 (AH=1) as far as the corpora show
 def variant(**kw):
@@ -31,6 +31,7 @@ CLASSES = {
     'b2': dict(nan2='arm'),
     'b3': dict(fma='arm'),
     'c': dict(negflip=True),
+    'c2': dict(negflip_pk=True),   # the packed addend negation and ADDSUB: fixed in fast mode since the fmul-by-minus-one lowering (not in FAST_ON)
     'd1': dict(daz_ignored=True),
     'd2': dict(ftz_in=True),
     'd3': dict(fz_out_arm=True),

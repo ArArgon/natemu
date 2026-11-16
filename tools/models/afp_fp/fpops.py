@@ -67,7 +67,7 @@ def H_addsub(S, base, ops, vex):
     for i in range(n):
         if i % 2 == 0:
             y = Y[i]
-            if S.mode.negflip and isnan(cls(f, y)[0]): y ^= f.sign
+            if S.mode.negflip_pk and isnan(cls(f, y)[0]): y ^= f.sign
             r.append(fp.addsub(f, X[i], y, True, S.mode, S.mx, S.st))
         else: r.append(fp.addsub(f, X[i], Y[i], False, S.mode, S.mx, S.st))
     S.wv(d, P(r, w), size, vex)
@@ -185,7 +185,7 @@ def fma_core(S, f, a, b, c, negp, negc, ndst_neg_a):
                 t = [x for x in nans if x[2] == k][0]
                 if isnan(t[1]): pick = t; break
         r = quiet(f, pick[0])
-        if mode.negflip and ((pick[2] == 'c' and negc) or (pick[2] == 'a' and negp)): r ^= f.sign
+        if (mode.negflip and pick[2] == 'a' and negp) or (pick[2] == 'c' and negc and (mode.negflip_pk if not S.fma_scalar else mode.negflip)): r ^= f.sign
         return r
     if infzero:
         st.add('IE'); return dnan(f, mode)
@@ -215,7 +215,7 @@ def H_fma(S, base, ops, vex):
     D = L(S.read(d, size), w, size // w); B = L(S.read(s2, size), w, size // w)
     C = L(S.read(s3, size if not scalar else w), w, size // w if not scalar else 1)
     if scalar: C = [S.read(s3, w) if s3['k'] == 'm' else S.read(s3, 128) & mask(w)]
-    S.fma_order = ['a', 'b', 'c']
+    S.fma_order = ['a', 'b', 'c']; S.fma_scalar = scalar
     r = list(D)
     for i in range(n):
         roles = dict(d=D[i], c2=B[i], c3=C[i])

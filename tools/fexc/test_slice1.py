@@ -1499,6 +1499,125 @@ class AfpAccurateDe(unittest.TestCase):
             self.assertIn('msr FPSR, x0', native_words(form, *self.AFP0)[1], name) if name not in self.NO_DE else None
             self.assertEqual(unmasked, native_words(form, '--feature', 'afp=0', '--simd-unmasked', '0x2')[1], name)   # DE unmasked: as fast mode
 
+class AfpNegation(unittest.TestCase):
+    """AFP fallback, the free NaN-sign fixes (afp=0, fast mode): the addend of the packed VFMSUB/VFNMSUB/VFMADDSUB/VFMSUBADD and ADDSUB's
+    subtrahend are negated by `fmul` by -1.0 / (-1, 1, -1, 1) (then `fmul`'s result is added) instead of `fneg` / `fcadd`, so a NaN keeps
+    its sign as on x86. Run natively on the M4: the afp=0 code under an M2's FPCR against the AFP code under the M4's (AH = 1), over every
+    combination of operand classes (zeros, denormals, infinities, QNaN, negative QNaN, SNaN) in every lane position, under every DAZ/FTZ key:
+    the result lanes and the FPSR's flags (IOC DZC OFC UFC IXC) are identical. Not compared, as documented fast-mode deviations of
+    other causes: more than one NaN operand (FMA's NaN order), a NaN first multiplicand of VFNMSUB (its fmls is one op), inf * 0 beside a NaN (class D) and invalid operations without a NaN operand
+    (the default NaN's sign). Every 13th batch, all of them with $AFP_NEG_FULL=1 (18 minutes). $FEXC_OLD (the compiler before the change) must fail the same comparison, and differ from the new afp=0 code
+    in the sign of NaN lanes only (flags never, IDC included)."""
+    FPSR_MASK = 0x1f   # IOC DZC OFC UFC IXC against the M4. IDC (0x80) is left out there: AH = 1 sets it for a denormal, FIZ does not, FZ does; an M2 sets it with FZ only (DE is software)
+    CLASSES = {4: dict(one=0x3f800000, den=1, dneg=0x80000001, zero=0, nzero=0x80000000, inf=0x7f800000, ninf=0xff800000, qnan=0x7fc00000,
+                       nqnan=0xffc00000, snan=0x7f800001),
+               8: dict(one=0x3ff0000000000000, den=1, dneg=1 << 63 | 1, zero=0, nzero=1 << 63, inf=0x7ff0000000000000, ninf=0xfff0000000000000,
+                       qnan=0x7ff8000000000000, nqnan=0xfff8000000000000, snan=0x7ff0000000000001)}
+    KEYS = ((), ('--daz',), ('--ftz',), ('--daz', '--ftz'))
+    # the registers (v16, v17, v18) = (xmm0, xmm1, xmm2): the multiplicands and the addend by operand order; the kind names ie_lane's rules
+    ORDERS = {'231': (1, 2, 0), '213': (1, 0, 2)}
+    KINDS = ('vfmsub', 'vfnmsub', 'vfmaddsub', 'vfmsubadd')
+
+    def valid(self, e, ops, name, lane, daz=False):
+        """The combination is compared: at most one NaN operand, and with a NaN no inf * 0 (D); with none, no invalid operation (under DAZ a
+        denormal is a zero)."""
+        if daz: ops = [o & 1 << 8 * e - 1 if fp_class(o, e)['den'] else o for o in ops]
+        k = [fp_class(o, e) for o in ops]
+        nans = sum(x['nan'] for x in k)
+        if nans > 1 or (name == 'vfnmsub' and k[0]['nan']): return False   # (the one-op fmls negates the first multiplicand: a NaN there still flips)
+        if name == 'addsub':   # x -/+ y (v16, v17): inf - inf
+            return nans > 0 or not (k[0]['inf'] and k[1]['inf'] and (k[0]['neg'] == k[1]['neg']) == (lane % 2 == 0))
+        if nans: return not ((k[0]['inf'] and k[1]['zero']) or (k[0]['zero'] and k[1]['inf']))
+        return not ie_lane(ops, e, name, lane)
+
+    def exec(self, fexc, hexs, e, lanes, key, afp):
+        """(v16's lanes, FPSR flags) of the code of `hexs` for the lanes' (v16, v17, v18) operand values."""
+        ck = (fexc, hexs, afp, key)
+        if ck not in _NATIVE:
+            words, _, spills = uz_block(fexc, hexs, *([] if afp else ['--feature', 'afp=0', *key]))
+            self.assertEqual(spills, 0, hexs)
+            # (the flags are cleared first and stored last: msr fpsr, xzr ... mrs x1, fpsr; str x1, [x28, #0x1ff8])
+            _NATIVE[ck] = [0xd51b443f] + words + [0xd53b4421, 0xf9000000 | 0x3ff << 10 | 28 << 5 | 1]
+        w = _NATIVE[ck]
+        v = [0] * 32
+        for j in range(len(lanes[0])): v[16 + j] = sum(lanes[i][j] << (8 * e * i) for i in range(len(lanes)))
+        daz, ftz = '--daz' in key, '--ftz' in key
+        r = native_run(w, v=v, fpcr=(6 | daz | ftz << 24) if afp else (daz and ftz) << 24)
+        return [r[1][16] >> (8 * e * i) & (1 << 8 * e) - 1 for i in range(len(lanes))], struct.unpack_from('<Q', r[2], 0x1ff8)[0] & 0x9f
+
+    def batches(self, e, roles, name, nops, daz=False):
+        """Batches of the compared combinations, one per lane of the register: a combination sits in lanes of the parity it is valid for."""
+        n = 16 // e
+        every = list(itertools.product(self.CLASSES[e].values(), repeat=nops))
+        pools = [[c for c in every if self.valid(e, [c[r] for r in roles] if nops == 3 else c, name, par, daz)] for par in (0, 1)]
+        # (every 13th batch unless $AFP_NEG_FULL: the full product is about 68000 native runs, 18 minutes)
+        for i in range(0, max(map(len, pools)), (n + 1) // 2 * (1 if os.environ.get('AFP_NEG_FULL') else 13)):
+            yield [pools[l % 2][(i + l // 2) % len(pools[l % 2])] for l in range(n)]
+
+    def compare(self, fexc, forms):
+        """[(form, key, lanes, new result, M4 result, new flags, M4 flags)] of the batches that differ, and the number compared."""
+        bad, n = [], 0
+        for name, e, roles, text, nops, kind in forms:
+            hexs = x86_asm([text])
+            for key in self.KEYS:
+                for b in self.batches(e, roles, kind, nops, '--daz' in key):
+                    a0, f0 = self.exec(fexc, hexs, e, b, key, False)
+                    a1, f1 = self.exec(FEXC, hexs, e, b, key, True)
+                    n += 1
+                    f0, f1 = f0 & self.FPSR_MASK, f1 & self.FPSR_MASK
+                    if (a0, f0) != (a1, f1): bad.append((name, key, [tuple(hex(x) for x in c) for c in b], [hex(x) for x in a0], [hex(x) for x in a1], f0, f1))
+        return bad, n
+
+    def forms(self):
+        fma = [(f'{k}{o}{t}', 4 if t == 'ps' else 8, r, f'{k}{o}{t} xmm0, xmm1, xmm2', 3, k) for k in self.KINDS for o, r in self.ORDERS.items() for t in ('ps', 'pd')]
+        add = [(f'{v}addsub{t}', 4 if t == 'ps' else 8, (0, 1), f'{v}addsub{t} xmm0, ' + ('xmm0, xmm1' if v else 'xmm1'), 2, 'addsub')
+               for v in ('', 'v') for t in ('ps', 'pd')]
+        return fma, add
+
+    def test_negations_keep_a_nans_sign_and_every_other_result_and_flag(self):
+        fma, add = self.forms()
+        bad, n = self.compare(FEXC, fma + add)
+        self.assertGreater(n, 500)
+        self.assertEqual(bad[:3], [], f'{len(bad)} of {n} batches differ')
+
+    @unittest.skipUnless(os.environ.get('FEXC_OLD'), 'set $FEXC_OLD to the compiler before the change')
+    def test_the_old_compiler_differs_in_nan_signs_only(self):
+        old = os.environ['FEXC_OLD']
+        fma, add = self.forms()
+        bad, n = self.compare(old, fma + add)
+        self.assertGreater(len(bad), 20)
+        for name, key, lanes, a0, a1, f0, f1 in bad:
+            e = 4 if name.endswith('ps') else 8
+            self.assertEqual(f0, f1, (name, key, lanes))
+            for x, y in zip(a0, a1):
+                x, y = int(x, 16), int(y, 16)
+                if x != y: self.assertTrue(fp_class(x, e)['nan'] and fp_class(y, e)['nan'] and x ^ y == 1 << 8 * e - 1, (name, key, hex(x), hex(y)))
+        # the new compiler against the old one: the same flags everywhere, the results the same but a NaN's sign
+        for name, e, roles, text, nops, kind in fma + add:
+            hexs = x86_asm([text])
+            for key in self.KEYS:
+                for b in self.batches(e, roles, kind, nops, '--daz' in key):
+                    a0, f0 = self.exec(FEXC, hexs, e, b, key, False)
+                    a1, f1 = self.exec(old, hexs, e, b, key, False)
+                    self.assertEqual(f0, f1, (name, key))
+
+    def test_only_the_changed_forms_change_and_the_m4_code_is_the_old_code(self):
+        """The changed forms' afp=0 code differs from the AFP code (the new lowering); the one-op forms (scalar fmsub/fnmsub, packed
+        fnmadd) and the rest are as they were: with $FEXC_OLD the M4's code is byte-identical to the old compiler's for every line, and the
+        afp=0 code differs from the old one for the changed lines only."""
+        old = os.environ.get('FEXC_OLD')
+        same = ['vfmadd231ps xmm0, xmm1, xmm2', 'vfnmadd231ps xmm0, xmm1, xmm2', 'vfmsub231sd xmm0, xmm1, xmm2', 'vfnmsub231ss xmm0, xmm1, xmm2',
+                'vfmadd231pd ymm0, ymm1, ymm2', 'vfnmadd231pd ymm0, ymm1, ymm2', 'haddps xmm0, xmm1', 'subps xmm0, xmm1', 'xorps xmm0, xmm1']
+        changed = ['vfmsub231ps xmm0, xmm1, xmm2', 'vfnmsub231pd xmm0, xmm1, xmm2', 'vfmaddsub231ps ymm0, ymm1, ymm2', 'vfmsubadd231pd xmm0, xmm1, xmm2',
+                   'addsubps xmm0, xmm1', 'vaddsubpd ymm0, ymm1, ymm2']
+        for line in same + changed:
+            h = x86_asm([line])
+            afp, afp0 = uz_block(FEXC, h)[0], uz_block(FEXC, h, '--feature', 'afp=0')[0]
+            if line in changed: self.assertNotEqual(afp0, afp, line)
+            if old:
+                self.assertEqual(afp, uz_block(old, h)[0], line)
+                self.assertEqual(afp0 == uz_block(old, h, '--feature', 'afp=0')[0], line in same, line)
+
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class AfpUpperZero(unittest.TestCase):
