@@ -3,12 +3,17 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 
 from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+# The startup lines natemu prints (`natemu: <topic>: ...`); crates/host/src/probe.rs `TOPICS` is this list (a unit test checks it).
+# Stops, errors and warnings (`natemu: disk lock: ...`, `natemu: pci: ...`) are not startup lines.
+STARTUP_TOPICS = ('cpu', 'fp', 'acceleration', 'meltdown', 'code cache')
+STARTUP_LINE = re.compile(r'^natemu: (?:%s): ' % '|'.join(STARTUP_TOPICS))
 VM_LOCK = RAW_ROOT / '.vm.lock'   # default --lock: one VM-running agent at a time (flock on this file)
 
 

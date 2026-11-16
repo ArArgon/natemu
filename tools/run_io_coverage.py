@@ -59,7 +59,7 @@ import time
 import uuid
 import zlib
 
-from io_common import ROOT, VM_LOCK, digest, stop_group, write_json
+from io_common import STARTUP_LINE, ROOT, VM_LOCK, digest, stop_group, write_json
 from raw_root import RAW_ROOT
 from io_common import PCI_PROBE, patch, pci_errors, pci_self_test
 from run_virtio_block import checked
@@ -420,11 +420,8 @@ def judge(case, phase, text, host, expect, pci=False):
     return errors
 
 
-STARTUP = re.compile(r'natemu: [a-z]+(?: [a-z]+)?: ')  # the startup lines (a colon after the topic; stops have none)
-
-
 def last_stop(stderr):
-    lines = [l for l in stderr.splitlines() if l.startswith('natemu: ') and not STARTUP.match(l)]
+    lines = [l for l in stderr.splitlines() if l.startswith('natemu: ') and not STARTUP_LINE.match(l)]
     return lines[-1] if lines else None
 
 
@@ -534,6 +531,8 @@ def run(args):
 def self_check():
     """Synthetic passing launches for every case and phase, then mutations the judge must reject. No VM."""
     expect, controls = expected_values(), 0
+    assert last_stop('natemu: cpu: x\nnatemu: Power(1)\nnatemu: code cache: pool on, disk off\n') == 'natemu: Power(1)'
+    assert last_stop('natemu: cpu: x\nnatemu: disk lock: held\n') == 'natemu: disk lock: held', 'errors shaped topic: value are stops'
     def text(case, phase):
         t = [f'COV-BEGIN case={case} phase={phase} cpus=2 kernel={KVER}']
         if case in ('gpt', 'mbr'):

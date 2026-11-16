@@ -3,7 +3,7 @@
 //! facts (AFP). It fails with one message listing everything missing (`natemu: host lacks lse2 pmull`), and answers CSV3
 //! and SB from the vCPU's registers (never sysctl: the resident runs SB in the vCPU's view). [`startup`] runs when a vCPU's
 //! compiler is set up (after the resident's setup wrote ACTLR_EL1), and every vCPU repeats the check (cheap, identical).
-//! The startup lines (the guest feature map, then one line per code-generation decision) is printed by the Linux boot path only ([`announce`]), once per
+//! The startup lines (the guest feature map, then one line per code-generation decision) are printed by the Linux boot path only ([`announce`]), once per
 //! process: the program driver's stderr stays as it was. The interrupt-controller API is a deployment fact (its functions
 //! are strong imports: macOS 15 or later, stated in the README), not probed.
 use crate::admission::{
@@ -14,6 +14,9 @@ use std::sync::OnceLock;
 
 /// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
 const CONFIG_REGISTERS: [u32; ID_REGISTERS.len()] = [2, 3, 7, 4, 5, 6];
+
+/// The startup lines' topics, in print order; `tools/io_common.py` `STARTUP_TOPICS` is the same list (a test compares them).
+pub(crate) const TOPICS: [&str; 5] = ["cpu", "fp", "acceleration", "meltdown", "code cache"];
 
 /// The launch options that change generated code or its reuse (see [`Probe::lines`]).
 pub(crate) struct Launch {
@@ -76,7 +79,7 @@ impl Probe {
     /// first): the guest feature map, the floating-point mode, the Speed-class host features (`+` used, `-` FEX's fallback),
     /// the Meltdown mitigation, then the code reuse (pool and disk cache). The guest CPU is the same on
     /// every supported host (every built feature is core); the other lines vary with the host and options. Tools recognise
-    /// a startup line by the colon after its topic (stops and errors have none).
+    /// a startup line by its topic, one of [`TOPICS`] (not by shape: errors and warnings also read `natemu: disk lock: ...`).
     pub(crate) fn lines(&self, launch: &Launch) -> Vec<String> {
         let mut cpu = String::from("cpu: x86-64-v3");
         for name in natemu_abi::cpu_gates::ADVERTISED_BEYOND_V3 {
@@ -98,6 +101,7 @@ impl Probe {
             Some((dir, cap)) => {
                 let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let shown = match home.and_then(|h| dir.strip_prefix(h).ok().map(|r| r.to_owned())) {
+                    Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
                     Some(rest) => format!("~/{}", rest.display()),
                     None => dir.display().to_string(),
                 };
@@ -200,6 +204,27 @@ mod tests {
         let mut p = Probe { id: FULL, tso: true, forced_off: 0 };
         f(&mut p);
         p
+    }
+
+    /// The topics are the tools' list, and every line printed is one of them.
+    #[test]
+    fn topics_match_the_tools_list() {
+        let tools = include_str!("../../../tools/io_common.py");
+        let list = TOPICS.map(|t| format!("'{t}'")).join(", ");
+        assert!(tools.contains(&format!("STARTUP_TOPICS = ({list})")), "tools/io_common.py STARTUP_TOPICS differs from {list}");
+        let lines = probe(|_| {}).lines(&LAUNCH);
+        for (line, topic) in lines.iter().zip(TOPICS) {
+            assert!(line.starts_with(&format!("natemu: {topic}: ")), "{line}");
+        }
+        assert_eq!(lines.len(), TOPICS.len());
+    }
+
+    /// Every Speed and Exactness row has the Arm name the startup lines print.
+    #[test]
+    fn speed_and_exactness_rows_have_arm_names() {
+        for f in FEATURES.iter().filter(|f| matches!(f.class, Class::Speed | Class::Exactness)) {
+            assert!(f.arm.starts_with("FEAT_"), "{}", f.name);
+        }
     }
 
     #[test]

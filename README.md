@@ -55,8 +55,9 @@ Other distributions and kernels are untested. Major features still missing:
   what the guest CPU adds, computed from the host's features), `fp` (`fast mode`; on a Mac without FEAT_AFP, M1 or M2,
   `fast mode, degraded (host lacks FEAT_AFP)`, and some x86 floating-point corner cases differ; being fixed: the AFP
   fallback plan), `acceleration` (each host feature natemu can use for speed, `+` used and `-` the slower fallback code),
-  `meltdown` (`speculation barriers` or `none`), and `code cache` (`pool on, disk 512 MiB at ~/Library/Caches/natemu/fexc`: the shared template pool and the compile cache on disk, or `disk off`). Stops and errors
-  have no colon after their first words, which is how tools tell them apart.
+  `meltdown` (`speculation barriers` or `none`), and `code cache` (`pool on, disk 512 MiB at ~/Library/Caches/natemu/fexc`: the shared template pool and the compile cache on disk, or `disk off`). Tools recognise these lines by those
+  topics only: errors and warnings can also read `natemu: disk lock: ...`. If the compile cache cannot be opened, a later
+  `natemu: code cache: disk off (reason)` line corrects it.
 - Xcode Command Line Tools (`xcode-select --install`)
 - [rustup](https://rustup.rs). The repository pins the Rust version, and rustup installs it automatically.
 - [Homebrew](https://brew.sh) packages: `brew install cmake ninja pkg-config libslirp e2fsprogs`
