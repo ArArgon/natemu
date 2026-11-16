@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unmasked floating-point exceptions (boot-features plan, chunk I5c), judged by the SDM rules below.
 
-    tools/with-env python3 tools/run_i5c.py --fexc FEXC --out DIR [--max-block N] [--only SUBSTR] [--host H --runtime R] [--skip-m4-bug]
+    tools/with-env python3 tools/run_i5c.py --fexc FEXC --out DIR [--max-block N] [--only SUBSTR] [--host H --runtime R]
 
 SIMD (SDM Vol.1 11.5, Vol.3 events 19 and 6): for each SSE/AVX/FMA/F16C form and the flags it raises, the run with every
 exception masked (no fault, MXCSR's flags), with each raised flag unmasked alone (#XM at the instruction, the destination
@@ -501,8 +501,8 @@ def x87_cases():
                     check=expect(fsw=0x82c1, top=0, ftw=0xff)))   # a stack fault (IE unmasked) drops the DE
     # AFP fallback, x87 in default mode (no AFP: M2, or M2 emulation NATEMU_FEXC_FEATURE_OFF=afp): FSW.DE of an m32/m64 operand with every exception
     # masked (set, nothing raised), with the same precedence; and the NaN results of arithmetic (x86's negative "real indefinite" for an
-    # invalid operation; a NaN operand's quieted self). Must pass on the M4 too, except the cases marked m4_bug: the M4 sets DE for an m32
-    # operand beside a NaN in ST0 (and FDIVR m32 over a zero ST0), where x86 does not (`--skip-m4-bug` leaves them out).
+    # invalid operation; a NaN operand's quieted self). Must pass on the M4 too (its m32 convert's IDC beside a NaN in ST0,
+    # or FDIVR m32 over a zero ST0, is dropped by the AFP code: FexcAfterOp).
     MK = 0x384f                                       # IE, DE, ZE, OE, SF and TOP (PE, UE, the condition codes are not judged)
     DEN32, SN32 = 1, 0x7f800001
     QN64, SN64, INF64, INDEF = 0x7ff8000000000000, 0x7ff0000000000001, 0x7ff0000000000000, 0xfff8000000000000
@@ -518,17 +518,14 @@ def x87_cases():
                             check=expect(fsw=DE | dtop(pops) << 11, mask=MK)))
         # DE-free: a NaN in ST0 (IE for an SNaN, nothing for a QNaN); a memory dividend over a zero ST0 is ZE.
         for name, ins in (('fadd', 'fadd'), ('fmul', 'fmul'), ('fdiv', 'fdiv'), ('fsub', 'fsub')):
-            c = case(f'{name}-m{w}-denormal-st0-qnan-masked-no-de', ['fninit', 'fld qword ptr [rdi + 0x108]', f'{ins} {ptr} ptr [rdi + 0x100]', 'fwait'],
-                     data(den, QN64), None, check=expect(fsw=7 << 11, mask=MK, st={7: QN64}))
-            c['m4_bug'] = w == 32; out.append(c)
+            out.append(case(f'{name}-m{w}-denormal-st0-qnan-masked-no-de', ['fninit', 'fld qword ptr [rdi + 0x108]', f'{ins} {ptr} ptr [rdi + 0x100]', 'fwait'],
+                            data(den, QN64), None, check=expect(fsw=7 << 11, mask=MK, st={7: QN64})))
             out.append(case(f'{name}-m{w}-snan-masked-ie-quieted', ['fninit', 'fld1', f'{ins} {ptr} ptr [rdi + 0x100]', 'fwait'],
                             data(SN32 if w == 32 else SN64), None, check=expect(fsw=IE | 7 << 11, mask=MK, st={7: SN32D if w == 32 else SN64Q})))
-        c = case(f'fcom-m{w}-denormal-st0-qnan-masked-ie-not-de', ['fninit', 'fld qword ptr [rdi + 0x108]', f'fcom {ptr} ptr [rdi + 0x100]', 'fwait'],
-                 data(den, QN64), None, check=expect(fsw=IE | 7 << 11, mask=MK))
-        c['m4_bug'] = w == 32; out.append(c)
-        c = case(f'fdivr-m{w}-denormal-st0-zero-masked-ze-not-de', ['fninit', 'fldz', f'fdivr {ptr} ptr [rdi + 0x100]', 'fwait'], data(den), None,
-                 check=expect(fsw=ZE | 7 << 11, mask=MK, st={7: INF64}))
-        c['m4_bug'] = w == 32; out.append(c)
+        out.append(case(f'fcom-m{w}-denormal-st0-qnan-masked-ie-not-de', ['fninit', 'fld qword ptr [rdi + 0x108]', f'fcom {ptr} ptr [rdi + 0x100]', 'fwait'],
+                        data(den, QN64), None, check=expect(fsw=IE | 7 << 11, mask=MK)))
+        out.append(case(f'fdivr-m{w}-denormal-st0-zero-masked-ze-not-de', ['fninit', 'fldz', f'fdivr {ptr} ptr [rdi + 0x100]', 'fwait'], data(den), None,
+                        check=expect(fsw=ZE | 7 << 11, mask=MK, st={7: INF64})))
         out.append(case(f'fld-m{w}-denormal-masked-de', ['fninit', f'fld {ptr} ptr [rdi + 0x100]', 'fwait'], data(den), None, check=expect(fsw=DE | 7 << 11, mask=MK)))
     out.append(case('fld-m64-snan-masked-ie-quieted', ['fninit', 'fld qword ptr [rdi + 0x100]', 'fwait'], data(SN64), None, check=expect(fsw=IE | 7 << 11, mask=MK, st={7: SN64Q})))
     out.append(case('fld-m32-snan-masked-ie-quieted', ['fninit', 'fld dword ptr [rdi + 0x100]', 'fwait'], data(SN32), None, check=expect(fsw=IE | 7 << 11, mask=MK, st={7: SN32D})))
@@ -621,13 +618,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fexc', type=pathlib.Path, required=True); ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--max-block', type=int); ap.add_argument('--only'); ap.add_argument('--host'); ap.add_argument('--runtime')
-    ap.add_argument('--skip-m4-bug', action='store_true', help='leave out the x87 m32 cases the M4 gets wrong (DE beside a NaN in ST0)')
     a = ap.parse_args()
     host, runtime = (a.host, a.runtime) if a.host else vm1.build()
     results, bad = [], 0
     for c in cases():
         if a.only and a.only not in c['name']: continue
-        if a.skip_m4_bug and c.get('m4_bug'): continue
         code, labels = ref.assemble('\n'.join(f'{l}\nl{i}:' for i, l in enumerate(c['lines'])), labels=True)
         offsets = [0] + [labels[f'l{i}'] for i in range(len(c['lines']) - 1)]
         work = a.out / 'work' / c['name']; work.mkdir(parents=True, exist_ok=True)

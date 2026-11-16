@@ -1303,8 +1303,8 @@ def uz_block(fexc, hexs, *extra):
 class AfpX87(unittest.TestCase):
     """AFP fallback, x87 in default mode (afp=0): the masked DE of m32/m64 memory operands and the NaN results of arithmetic. The M4
     (FPCR 6, AFP code) is the oracle: the guest state after the instruction (ST registers as stored doubles, the pending flags, TOP, tags)
-    is the same as the M2's (FPCR 0, afp=0 code). The one known deviation: the M4 raises DE for an m32 operand beside a NaN in ST0 (and
-    FDIVR m32 over a zero ST0), where x86 does not (the afp=0 flag is judged against x86's rule instead)."""
+    is the same as the M2's (FPCR 0, afp=0 code), and FSW.DE of both is x86's rule (below). Both the M4's code and the afp=0 code fix the
+    m32 convert's IDC (a denormal single beside a NaN in ST0, or FDIVR m32 over a zero ST0: the M4 hardware raises DE, x86 does not)."""
     D = dict(one=0x3ff0000000000000, two=0x4000000000000000, zero=0, nzero=1 << 63, inf=0x7ff0000000000000, ninf=0xfff0000000000000,
              qnan=0x7ff8000000000000, nqnan=0xfff8000000000000, qnanp=0x7ff8000000001234, snan=0x7ff0000000000001, nsnan=0xfff0000000000007,
              snanp=0x7ff4000000000000)
@@ -1343,9 +1343,8 @@ class AfpX87(unittest.TestCase):
                     # x86: DE for a denormal operand, none beside a NaN in ST0 (IE), a memory dividend over a zero ST0 is ZE
                     de = fp_class(mem, e)['den'] and (op == 'fld' or not (nan0 or (op == 'fdivr' and zero0)))
                     self.assertEqual(bool(r0[0x4b4] & 0x80), de, (name, a, m))
-                    quirk = e == 4 and (nan0 or (op == 'fdivr' and zero0))   # the M4's DE deviation
-                    mask = [k for k in range(len(r0)) if not (k == 0x4b4 and quirk)]
-                    self.assertEqual([r0[k] for k in mask], [r1[k] for k in mask], (name, a, m))
+                    self.assertEqual(bool(r1[0x4b4] & 0x80), de, (name, a, m, 'AFP'))
+                    self.assertEqual(r0, r1, (name, a, m))
                     n += 1
         self.assertGreater(n, 2000)
 
