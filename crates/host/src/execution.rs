@@ -6059,7 +6059,8 @@ mod tests {
             if got != want {
                 differ += 1;
                 // `NATEMU_REPLAY_DUMP`: a directory that gets each differing request (`N.req`: the body sent) and both replies
-                // (`N.old`, `N.new`: the whole payload, as compared), to classify the differences.
+                // (`N.old`, `N.new`: the whole payload, as compared), to classify the differences. A dump run never fails:
+                // read the count from the printed `replay:` line.
                 if let Some(dir) = std::env::var_os("NATEMU_REPLAY_DUMP") {
                     let dir = Path::new(&dir);
                     std::fs::write(dir.join(format!("{n}.req")), &sent_copy).unwrap();
