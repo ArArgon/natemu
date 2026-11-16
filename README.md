@@ -28,16 +28,17 @@ instruction. Privileged instructions go to natemu's runtime inside the VM. The c
 
 ## Status: experimental
 
-natemu boots the stock Debian 13 cloud image unchanged, with networking and a disk. It has been
-tested only on an M4 Mac running macOS 26. Older Apple Silicon chips or macOS versions may lack
-hardware features natemu needs. Other distributions and kernels are untested. Major features still missing:
+natemu boots the stock Debian 13 cloud image unchanged, with networking and a disk. The cloud-image
+workflow has been tested on an M4 Mac running macOS 26; targeted networking checks also pass on
+M2 Max. Other Apple Silicon chips or macOS versions may lack hardware features natemu needs.
+Other distributions and kernels are untested. Major features still missing:
 
 - **Booting:** no BIOS or UEFI firmware. natemu starts a Linux kernel directly, so it cannot boot
   installer ISOs or bootloaders.
 - **Devices:** a serial console, a network card, raw disk images and a random-number device only. No
   PCI bus by default (an experimental one: `--virtio-transport pci`), display, keyboard, sound, USB or file sharing with the Mac. Disk images must be raw, not qcow2.
-- **Networking:** outbound IPv4 only. No IPv6, no port forwarding into the guest, and the guest
-  cannot reach the Mac's `localhost`.
+- **Networking:** IPv4 user-mode NAT, with localhost port forwarding and opt-in guest access to
+  the Mac's `localhost`. No IPv6 or bridged networking.
 - **CPU:** 64-bit code only, so 32-bit programs do not run. No AVX-512, AMX or CET. x87 floating
   point computes at 64-bit rather than 80-bit precision.
 - **Performance:** no fast path for process address-space switches (PCID), which makes Linux's
@@ -149,14 +150,45 @@ and Ctrl-C goes to the guest. `poweroff` inside the guest shuts it down cleanly.
 The first boot translates everything and takes a few seconds longer. Later boots reuse the
 translation cache in `~/Library/Caches/natemu/fexc` (`--compile-cache off` disables it).
 
-| Option | Guest device |
+| Option | Effect |
 | --- | --- |
-| `--net` | Network over user-mode NAT. The guest gets `10.0.2.15` by DHCP, and outbound connections work. The Mac's `localhost` is not reachable from the guest; use its LAN address. |
+| `--net` | IPv4 network over user-mode NAT. The guest gets `10.0.2.15` by DHCP. Guest access to the Mac's `localhost` is off by default; its LAN address remains reachable. |
+| `--net-forward HOST:GUEST` | Forward a TCP port from the Mac's `127.0.0.1` to the guest. Repeat for more ports; use `udp:HOST:GUEST` for UDP. Requires `--net`. |
+| `--net-host-loopback` | Let the guest reach the Mac's `127.0.0.1:PORT` through `10.0.2.2:PORT`. Requires `--net`; also required for UDP forwarding. |
 | `--disk FILE` | A raw disk image, seen as `/dev/vda`. Only one natemu can use a disk at a time. |
 | `--rng` | A hardware random-number device. |
 
 `target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,
 2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error.
+
+### Host–guest networking
+
+To reach a guest service from the Mac, add `--net --net-forward 8080:8000` to the launch
+command. For example, start an HTTP server inside the guest:
+
+```sh
+python3 -m http.server 8000 --bind 0.0.0.0
+```
+
+Then run `curl http://127.0.0.1:8080/` on the Mac. Forwards bind only the Mac's `127.0.0.1`
+and target `10.0.2.15`; guest services must listen on that address or all interfaces, not
+just guest localhost. With an SSH server and account configured in the guest, use
+`--net-forward 2222:22` and connect with `ssh -p 2222 user@127.0.0.1`.
+
+TCP forwarding works with host-loopback access disabled. For UDP, add both
+`--net-host-loopback --net-forward udp:19000:9000` alongside `--net`. The explicit flag is
+required because libslirp otherwise blocks forwarded UDP replies. It also grants broad access
+to the Mac's IPv4 localhost services, including ones that trust local connections, by using
+`10.0.2.2:PORT`. It does not join the guest's and Mac's loopback interfaces or limit access
+to the forwarded ports.
+
+Use different host ports for concurrent VMs; an occupied port fails the launch. UDP host
+port 53 and multiple UDP forwards to the same guest port are unsupported. UDP clients must
+not use source ports 53, 67 or 69. See [host–guest service details](tools/play/README.md#hostguest-services)
+for the full rules and file-copy examples.
+
+At startup, natemu prints the expected guest address, gateway/DNS, loopback setting and
+installed forwards. This confirms configuration, not that the guest service is ready.
 
 ## Performance and CPU vulnerability mitigations
 
