@@ -305,7 +305,7 @@ template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEX
   if (Spanned && (R.Scalar || R.B == 16)) {
     const int N = R.K == DeRule::Fma ? 3 : R.K == DeRule::Bin || R.K == DeRule::Div || R.K == DeRule::Pair || R.K == DeRule::Cadd ? 2 : 1;
     Ref A = Arg(0);
-    IREmit->_FexcSimdSkip(OpSize::i128Bit, OpSz(R.E), A, N > 1 ? Arg(1) : A, N > 2 ? Arg(2) : A, N | (R.Scalar ? 1u << 8 : 0u));
+    IREmit->_FexcSimdSkip(A, N > 1 ? Arg(1) : A, N > 2 ? Arg(2) : A, N | (R.Scalar ? 1u << 8 : 0u) | (R.E == 8 ? 1u << 9 : 0u));
     *Spanned = true;
   }
   SoftDe<Emitter> D(IREmit, R.E, R.B, R.Scalar);

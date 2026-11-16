@@ -1376,6 +1376,7 @@ class AfpAccurateDe(unittest.TestCase):
     FPSR.IDC is identical, and so is every result bit outside the lanes whose M4 result is a NaN (chunk 3's, the NaN rules). $ORACLE_TRIALS
     trials per form (default 60)."""
     AFP0 = ['--feature', 'afp=0', '--accurate']
+    NO_DE = ('roundps', 'rcpps', 'cvtps2dq', 'cvttsd2si', 'vcvtph2ps xmm', 'vcvtph2ps ymm', 'vcvtph2ps m')   # no software flag at all
     MEM = 0x1000
     # (name, hex, source element bytes, result lane bytes). [rbx] is x6 (the memory operand at buf + 0x1000); register forms use xmm1/2/3.
     FORMS = [(n, h, e, e) for n, h, _, e, _, _ in DE_FORMS if n not in ('vcvtps2ph', 'vcvtps2pd ymm', 'cvtps2pd', 'cvtss2sd', 'cvtpd2ps', 'cvtsd2ss')] + [
@@ -1417,10 +1418,32 @@ class AfpAccurateDe(unittest.TestCase):
         if k < 0.80: return rnd.getrandbits(man) | rnd.getrandbits(1) << (bits - 1)   # a random denormal or zero
         return rnd.getrandbits(bits)
 
-    def make(self, rnd, e):
+    @staticmethod
+    def normal(rnd, e):
+        """A lane with a nonzero exponent field (a normal, an infinity or a NaN): the exponent screen's skip."""
+        bits, man = 8 * e, 23 if e == 4 else 52
+        v = rnd.getrandbits(bits)
+        return v if v >> man & ((1 << bits - 1 - man) - 1) else v | 1 << man
+
+    def make(self, rnd, e, mode=0):
+        """mode 0: the classes above; 1: every lane of every register has a nonzero exponent (the screen skips); 2: as 1 but one lane of
+        one of xmm1, xmm2, xmm3, the memory operand or the upper halves is a zero or a denormal (the screen falls into the exact test)."""
         per = 16 // e
-        vec = lambda: sum(self.lane(rnd, e) << 8 * e * k for k in range(per))
-        return [vec() for _ in range(16)], [vec() for _ in range(16)], vec() | vec() << 128 | vec() << 256 | vec() << 384
+        lane = (lambda: self.lane(rnd, e)) if mode == 0 else (lambda: self.normal(rnd, e))
+        vec = lambda: sum(lane() << 8 * e * k for k in range(per))
+        xmm, hi, mem = [vec() for _ in range(16)], [vec() for _ in range(16)], vec() | vec() << 128 | vec() << 256 | vec() << 384
+        if mode == 2:
+            k = rnd.randrange(per)
+            put = lambda v: v & ~(((1 << 8 * e) - 1) << 8 * e * k) | VALUES[e][rnd.choice(('den', 'dmax', 'dneg', 'zero', 'nzero'))] << 8 * e * k
+            where = rnd.choice(('x1', 'x2', 'x3', 'mem', 'hi'))
+            if where == 'mem':
+                k = rnd.randrange(64 // e)
+                mem = put(mem)
+            elif where == 'hi':
+                n = rnd.randrange(16); hi[n] = put(hi[n])
+            else:
+                n = int(where[1]); xmm[n] = put(xmm[n])
+        return xmm, hi, mem
 
     def run_one(self, form, afp, xmm, hi, mem):
         words, lines, spills = native_words(form, *([] if afp else self.AFP0))
@@ -1451,7 +1474,7 @@ class AfpAccurateDe(unittest.TestCase):
         for name, form, e, re_ in self.FORMS:
             if e == 2: e = 4   # (half-precision sources: random 4-byte lanes are random half pairs)
             for t in range(trials):
-                xmm, hi, mem = self.make(rnd, e)
+                xmm, hi, mem = self.make(rnd, e, (0, 1, 2, 2)[t % 4])
                 f4, v4, b4 = self.run_one(form, True, xmm, hi, mem)
                 fa, va, ba = self.run_one(form, False, xmm, hi, mem)
                 ctx = (name, t, [hex(q) for q in xmm[:4]], hex(mem), 'M4 FPSR', hex(f4), 'accurate', hex(fa))
@@ -1470,9 +1493,10 @@ class AfpAccurateDe(unittest.TestCase):
             fast = native_words(form, '--feature', 'afp=0')[1]
             daz = native_words(form, *self.AFP0, '--daz')[1]
             unmasked = native_words(form, *self.AFP0, '--simd-unmasked', '0x2')[1]
-            self.assertEqual(soft_de_words(fast), 0, name)   # fast mode: the plain code, no test
-            self.assertEqual(soft_de_words(daz), 0, name)    # DAZ: x86 sets no DE
-            self.assertNotIn('msr FPSR, x0', fast, name)
+            # (the flag is `cbz; mrs x0, fpsr; orr x0, x0, #0x80; msr FPSR, x0`: no other FPSR write is in these ops' words)
+            self.assertNotIn('msr FPSR, x0', fast, name)   # fast mode: the plain code, no test
+            self.assertNotIn('msr FPSR, x0', daz, name)    # DAZ: x86 sets no DE
+            self.assertIn('msr FPSR, x0', native_words(form, *self.AFP0)[1], name) if name not in self.NO_DE else None
             self.assertEqual(unmasked, native_words(form, '--feature', 'afp=0', '--simd-unmasked', '0x2')[1], name)   # DE unmasked: as fast mode
 
 
