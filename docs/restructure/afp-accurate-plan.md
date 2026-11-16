@@ -167,27 +167,39 @@ replaces the previous revision's result stubs, exact steps, cached step and rang
 
 **The handler.** It works on the one Arm instruction, not on the guest instruction. Nothing is banked and no step is
 compiled.
-1. **Recognise the trap.** EC 0x2C from EL0 is classified first, before the site lookup. The faulting word is read at ELR.
-2. **Re-run the word.** The handler restores the native register file from the frame: V registers, and also GPRs and NZCV,
-   because compares write NZCV and conversions write a GPR. It then sets FPCR to the frame's value with the trap enables
-   cleared, clears FPSR, runs the word once, reads FPSR, and saves the registers back. The destination was unchanged at
-   the trap, so the operands are intact for the patch below, even when the destination aliases a source.
-3. **The re-run slot.** It is per vCPU, a small table of executable slots keyed by the instruction word. A slot is filled
-   and synchronised (I-cache maintenance, with the existing CTR_EL0 shortcuts) only when the word is new. A repeated trap
-   costs no maintenance.
-4. **Patch to the M4's semantics.** The re-run gave the AH = 0 answer. The handler decodes the word's operation class and
-   patches it:
-   - **NaN lanes (IOE).** Each lane whose result is a NaN is recomputed from the intact operands by AH = 1's rules (the
-     fix-up table of the AFP plan's §2.1, now per Arm operation): binary ops take source 1's NaN quieted, else source
-     2's, else the negative default NaN; FMA takes Rn, Rm, then the addend, and negation leaves a NaN alone. IOC is
-     recomputed per lane from the operand classes (SNaN, inf×0 unless the addend is a QNaN, inf−inf, 0/0, inf/inf, square
-     root of a negative).
-   - **UFC (UFE).** UFC is recomputed per lane by the existing integer model of tininess after rounding. The handler
-     decodes the word into the model's description (multiply, divide, FMA, convert; element size; lanes).
-   - Every other class, such as compares, conversions to integer and MIN/MAX, keeps the re-run as it is. That is exactly
-     what the hardware does without traps.
-5. **Finish.** The patched flags are ORed into the frame's FPSR (the trap left it untouched, so attribution is exact), and
-   the handler returns to ELR + 4.
+
+1. **Recognise the trap.** EC 0x2C from EL0, at an ELR inside an admitted block (or the step block), is classified first,
+   before the site lookup. An EC 0x2C taken at EL1, or at an ELR outside admitted code, halts with a named stop and never
+   reaches the decoder. The resident runs with FPCR = 0, so it never traps legitimately: `save_native` zeroes FPCR before
+   resident code, and the x87 helpers run in the resident.
+
+2. **Save the operands, then re-run the word in place at EL0 (decided).** The handler copies the word's source registers
+   from the frame into its own save area. It then returns to ELR with the trap enables cleared in the frame's FPCR (the
+   value captured at the trap, so ROUND's own rounding mode is kept), FPSR cleared, and the hardware single-step armed. The
+   word runs once in place, and the software-step exception (an exception class the resident already handles) brings it
+   back. FPSR then holds this word's flags alone.
+
+   The alternative was a per-vCPU table of executable slots, filled with the trapped word. That needs writable-and-
+   executable resident memory and I-cache maintenance. Re-running in place costs one more exception, about 37 ns, and
+   needs neither.
+
+3. **Patch by mode, never by cause.** One word can raise IOC in one lane and UFC in another, while the ISS names only one
+   exception, so the cause in ESR is never used. What the handler patches depends only on the mode's enabled traps:
+   - **Accurate mode, NaN lanes.** Each lane whose result is a NaN is recomputed from the saved operands by AH = 1's
+     rules (the AFP plan's §2.1 table, per Arm operation): binary ops take source 1's NaN quieted, else source 2's, else
+     the negative default NaN; FMA takes Rn, Rm, then the addend, and negation leaves a NaN alone. IOC is taken from the
+     re-run, and removed only for lanes where AH = 1 raises none: FMA inf×0 with a QNaN addend (D).
+   - **Both modes where UFE is on: UFC.** UFC is recomputed per lane by the existing integer model of tininess after
+     rounding. The handler decodes the word into the model's description (multiply, divide, FMA, convert; element size;
+     lanes).
+   - **Fast mode patches only UFC.** Patching NaN lanes there would make fast-mode NaN results exact only in words that
+     happened to trap. That would be nondeterministic, and it breaks chunk 0's tagged-but-exact rule.
+   - **Under DAZ + FTZ, the per-word flush** (§4).
+   - Every other class (compares, conversions to integer, MIN/MAX) keeps the re-run as it is, which is exactly what the
+     hardware does without traps. An Arm FP word the handler's table doesn't know halts with a named stop.
+
+4. **Finish.** The patched flags are ORed into the FPSR from before the trap (the trap left it untouched, so attribution
+   is exact). The trap enables are restored, and execution continues after the word.
 
 **What else this touches.**
 - **Banking and #XM.** The existing check stubs and banking are unchanged. They run after the handler returned, and see
@@ -225,12 +237,12 @@ The registry's classes gain "fixed by": fast mode or accurate mode.
 
 | Item | Design | Where the code goes | Cost estimate | Admission |
 | --- | --- | --- | --- | --- |
-| A without FMA order: default NaN sign, SNaN choice, D, RSQRT's sign | IOE trap; the handler's NaN patch | resident (handler, slot), host (`fpcr`, probe) | 0 when nothing traps (measured in a VM); 63-70 ns per invalid or SNaN result | none |
+| A without FMA order: default NaN sign, SNaN choice, D, RSQRT's sign | IOE trap; the handler's NaN patch | resident (handler, in-place re-run), host (`fpcr`, probe) | 0 when nothing traps (measured in a VM); ~100 ns per invalid or SNaN result (63-70 ns measured with a re-run, plus the single-step exception, ~37 ns) | none |
 | A, negations | the free codegen fixes of fast mode (branch `afp-negfree`): `fmul` by −1 instead of `fneg` in VFMLS, VFNMLS and VFMADDSUB; ADDSUB as `fmul` by a sign mask plus `fadd` | fexc / FEX fork (fast mode, both modes) | measured free (same issue count) | none new |
 | A, FMA order and one-instruction negating FMAs | FMA forms only: the result kept in a temporary; `fcmge` of the result (a signalling compare: any NaN lane raises IOC, so IOE traps; no NZCV, no branch, no reduction); the handler, told by the site, recomputes the NaN lanes from the FMA's operands | fexc shim (check plus site), resident (site kind) | one SIMD op per FMA plus the temporary (a full-register `mov`, measured free): estimate ≤2× on pure FMA streams, ~0 on code without FMA; fallback, the measured `fmaxv`/`fcmp`/`b.vs` shape, 2.3-2.9× on pure FMA | the check's shape and its site |
 | B, masked SSE DE | unchanged: chunk 2 (row 7's test with DE masked, behind the cheap per-op screen being added) | as built | chunk 2's numbers | as built |
-| C masked, MIN_NORMAL band | UFE trap; the handler decides UFC per lane with the tininess model | resident (handler) | 0 to +4.3% enabled; 63-70 ns per tiny result | none |
-| C under DAZ + FTZ | FZ = 0, UFE on, and the software input flush of DAZ (row 4, already built); the handler gives x86's flushed result and flags (row 5's rule) for each trapping tiny result | host (`fpcr`), fexc (row 4 under accurate DAZ + FTZ), resident (handler) | row 4's input flush (fast mode's DAZ-only cost) plus 63-70 ns per tiny result | none new |
+| C masked, MIN_NORMAL band | UFE trap; the handler decides UFC per lane with the tininess model | resident (handler) | 0 to +4.3% enabled; ~100 ns per tiny result | none |
+| C under DAZ + FTZ | FZ = 0, UFE on, and the software input flush of DAZ (row 4, already built); the handler gives x86's flushed result and flags (row 5's rule) for each trapping tiny result | host (`fpcr`), fexc (row 4 under accurate DAZ + FTZ), resident (handler) | row 4's input flush (fast mode's DAZ-only cost) plus ~100 ns per tiny result | none new |
 
 **A.** IOE catches every case of A that raises IOC: the default NaN's sign, the SNaN choice, D (inf×0 + QNaN), and RSQRT's
 sign (FEX's RSQRT is `fsqrt` + `fdiv` with FPSR restored around it, so the patched negative NaN flows through and no flag
@@ -249,23 +261,49 @@ The FMA check:
 - **The temporary.** The FMA writes into it, and the guest register is written only after the check. So "no guest
   register written before the instruction's last test" (previous review) still holds, for the same reasons: 256-bit
   halves, scalar upper bits, destination = addend.
-- **The site.** It names the FMA's word and the register holding the original addend.
-- **At a check trap,** the handler recomputes the NaN lanes from the intact operands, writes the temporary, adds no flag
-  for the compare itself, and returns.
+- **The site** names the FMA's word and all three operand registers: Rn, Rm and the original addend. They are kept live to
+  the check. Without that, register allocation could reuse a register that dies at the FMA, such as a memory operand's
+  load register. They are kept on the check op itself, the way fast mode's C-unmasked check keeps its operands. As
+  there, a compile with spill slots gets no description; the FMA check then can't be built, and the compile is refused
+  and retried without the FMA in the block, never emitted unchecked.
+- **The check's destination** is a JIT temporary that admission pins as never read: the handler resumes after the
+  `fcmge`, so that register is stale.
+- **At a check trap,** the handler recomputes the NaN lanes from the three named operands, writes the temporary, adds no
+  flag for the compare itself, and returns.
+- **Native evidence** that the check is a true signalling test: `fcmge` with a QNaN raises IOC (scalar and `.4s`); with a
+  denormal and FZ = 0 it raises nothing; `fcmeq` with a QNaN raises nothing.
 - **Order of traps.** An SNaN FMA traps first at the FMA itself, and then again at the check; both give the same answer.
 - **Cost.** It is unmeasured. Chunk 4 measures it natively first. If it is worse than the measured branch shape, the
   branch shape (to a stub that is the same handler) is used.
 
 **C masked.** The trap is precise and FPSR is untouched, so this operation's UFC is known exactly. The previous revision's
 "FPSR.UFC kept clear" rule and "UFC removed before banking" are no longer needed. A UFE trap per tiny result costs
-63-70 ns. Real x86 also takes a microcode assist of a similar size on denormal results, so denormal-heavy code is slow on
+~100 ns. Real x86 also takes a microcode assist of a similar size on denormal results, so denormal-heavy code is slow on
 both.
 
-**C under DAZ + FTZ (decided now).** The alternative was the range test plus a step per flushed result. Its hot-path test
-is cheaper than row 4's input flush. But it needs all the stub, step and cached-step machinery, which nothing else needs
-any more. Its per-flush cost is 0.1-1.5 µs against a trap's 63-70 ns, and under `-Ofast` flushes are routine. The
-trap-based shape reuses built code (row 4) and one handler. Its hot-path cost is the class fast mode already pays for DAZ
-alone. Chunk 2's per-op screen could later skip the input flush when no source is denormal.
+**C under DAZ + FTZ (decided now).** With FZ = 0 and UFE on, every Arm word that produces a tiny result traps, exact
+results and adds/subtracts included. The flush is therefore applied by the handler per Arm word, only while
+`cpu.mxcsr` has DAZ and effective FTZ (constant within a block); under FTZ alone, row 5's software flush stays as built.
+
+The handler's word table says which words flush:
+- arithmetic results (add, subtract, multiply, divide, FMA, DPPS steps, narrowing conversions to single or double):
+  flushed to ±0, with UE + PE, x86's FTZ result;
+- `fcvtn` to half (VCVTPS2PH ignores FTZ): UE decided by the model, no flush;
+- RCP's quiet `fdiv`: flushed (its flags are restored afterwards anyway);
+- row 5's own flush `fmul` and `afp-negfree`'s `fmul` by −1: never flushed by the handler. Row 4 flushes inputs before the
+  new negating `fmul` words, so they never see a denormal under DAZ. Otherwise they would produce a tiny result and a
+  wrong UE + PE.
+
+The gate cases run under DAZ + FTZ and under DAZ alone:
+- VFMLS, VFNMLS, VFMADDSUB and ADDSUB with denormal inputs;
+- an add or subtract with an exact tiny result under FTZ, checked against real x86 (the AMD machine used for the DPPS
+  check).
+
+**Why this shape.** The alternative was the range test plus a step per flushed result. Its hot-path test is cheaper than
+row 4's input flush, but it needs all the stub, step and cached-step machinery, which nothing else needs any more. Its
+per-flush cost is 0.1-1.5 µs against a trap's ~100 ns, and under `-Ofast` flushes are routine. The trap-based shape
+reuses built code (row 4) and the one handler. Its hot-path cost is the class fast mode already pays for DAZ alone.
+Chunk 2's per-op screen could later skip the input flush when no source is denormal.
 
 The `-Ofast` workload in chunk 6 reports the trap count, so this decision is checked, not just argued.
 
@@ -281,7 +319,7 @@ fast mode's contract is exact fixes that cost nothing measurable.
   emulation, five interleaved runs, cray, luajit and luajit-interp at most 3% slower geometric mean and at most 5% on
   any one, and zstd, sqlite and avx with no regression.
 - **IOE** would make A's trapped cases free in fast mode too. Its traps also fire where the result is already right
-  (COMISS with a quiet NaN, a conversion to integer of a NaN or an out-of-range value), each 63-70 ns. The same gate plus
+  (COMISS with a quiet NaN, a conversion to integer of a NaN or an out-of-range value), each ~100 ns. The same gate plus
   trap counts decides it, but it changes your November 16 split (decision 1).
 
 Fast mode's FMA order and negating FMAs stay documented deviations; the FMA check stays in accurate mode.
@@ -290,11 +328,11 @@ Fast mode's FMA order and negating FMAs stay documented deviations; the FMA chec
 belong with accurate 80-bit x87.
 
 **Cost per block.** These are estimates against fast mode on a host with traps:
-- c-ray's and LuaJIT's hot blocks have no FMA, so A and C add about 0-4%. B dominates: chunk 2 measured 2.6 → 42.5 ns
-  before its screen.
+- c-ray's and LuaJIT's hot blocks have no FMA, so A and C add about 0-4%. B dominates: chunk 2 measured c-ray's hot block
+  at 2.6 → 42.5 ns, about 16×, before its screen.
 - FMA-heavy code (the avx benchmark) pays the FMA check, ≤2× on FMA issue by estimate.
 - `-Ofast` code pays row 4's input flush in place of B, plus traps.
-- Every invalid, SNaN or tiny result costs 63-70 ns.
+- Every invalid, SNaN or tiny result costs ~100 ns.
 
 Chunk 6 measures all of it.
 
@@ -324,10 +362,10 @@ results and flags bit-identical.
 | 0. Test hygiene | done | §2 |
 | 1. Frame | done | §1 |
 | 2. B | built (screen in progress) | as in §10 |
-| 3. Traps and C masked | `fpcr` trap bits (after `fptraps-core` merges); x87 trap-free FPCR; the EL0 EC 0x2C handler, re-run slot, UFC patch; registry "fixed by"; C masked in accurate mode | handler unit tests per word class; native oracle (band, tiny, exact tiny, packed lanes mixing band and real underflow, every rounding mode); run_i5c band cases pass in M2 emulation, accurate; x87 runners unchanged; trap counts and VM trap cost |
+| 3. Traps and C masked | `fpcr` trap bits (after `fptraps-core` merges); x87 trap-free FPCR; the EL0 EC 0x2C handler (named stop for EL1 or outside admitted code), in-place re-run by single-step, UFC patch; registry "fixed by"; C masked in accurate mode | handler unit tests per word class; native oracle (band, tiny, exact tiny, packed lanes mixing band and real underflow, every rounding mode); run_i5c band cases pass in M2 emulation, accurate; x87 runners unchanged; trap counts and VM trap cost |
 | 4. A | the `afp-negfree` fixes merged first; IOE and the NaN patch (D, SNaN, RSQRT); the FMA check and its site; `--exact-step` removed | NaN classes in the native oracle; check-trap cases (NaN only in a high half, destination aliasing each FMA source, an SNaN FMA trapping twice); the FMA check's native cost against the branch shape; in M2 emulation, accurate: i8 and i8b fully pass (i8b: only the seven departures) |
 | 5. C under DAZ + FTZ | FZ = 0 with UFE under accurate DAZ + FTZ; row 4's input flush emitted there; the handler's FTZ result | native oracle; run_i5c DAZ + FTZ band and flush cases; the corpora's DAZ/FTZ programs in accurate mode |
-| 6. Cost, fast-mode gate, records, M2 run | one benchmark round in M2 emulation: fast before and after UFE (and IOE), accurate; cray, luajit, luajit-interp, zstd, sqlite, avx (5 interleaved runs), plus an existing FP benchmark program built with `-Ofast`; trap counts; README and registry for whatever moved into fast mode; the owner's M2 run of the runner subset in both modes | the fast-mode gate (§4) decides what moves; numbers recorded here and in the investigation record; the M2 matches M2 emulation; the owner's M1 run of `tools/fp_trap_probe/run.sh` confirms precise, in-VM traps on the M1 |
+| 6. Cost, fast-mode gate, records, M2 run | one benchmark round in M2 emulation: fast before and after UFE (and IOE), accurate; cray, luajit, luajit-interp, zstd, sqlite, avx (5 interleaved runs), plus an existing FP benchmark program built with `-Ofast`; trap counts, split by the fast-mode traps that fire if UFE or IOE move to fast mode (UFE: `fmul` by −1 of a denormal, exact denormal add/subtract, row 5's flush `fmul` under FTZ alone; IOE: COMISS with a QNaN, scalar MIN/MAX `fcmpe`, `fcvtzs` of a NaN); README and registry for whatever moved into fast mode; the owner's M2 run of the runner subset in both modes | the fast-mode gate (§4) decides what moves; numbers recorded here and in the investigation record; the M2 matches M2 emulation; the owner's M1 run of `tools/fp_trap_probe/run.sh` confirms precise, in-VM traps on the M1 |
 
 **Order and why.**
 - Chunk 3 builds the trap machinery with its simplest consumer. The tininess model and its tests already exist, so the
@@ -359,15 +397,16 @@ Decided here, with reasons in the text; the owner may overrule any of them:
 
 ## 8. Risks
 
-- **Trap storms.** Code with many invalid, SNaN or tiny results pays 63-70 ns each, in fast mode too if C masked or IOE
+- **Trap storms.** Code with many invalid, SNaN or tiny results pays ~100 ns each, in fast mode too if C masked or IOE
   move there. Chunk 6 counts traps on every benchmark, and the gate is measured with UFE and IOE on.
 - **Handler coverage.** Every Arm FP word FEX emits must decode to a class, and an unknown word stops the guest rather
   than being patched wrongly. A build-time check lists FEX's FP ops against the handler's table, and the native oracle
   covers each class.
 - **Trap availability.** The M1 reports traps, but their precision and delivery in a VM are confirmed only on the M2 Max
   and the M4 (chunk 6 gates the M1). A host or macOS version that hides the enables is refused at startup (`fptraps-core`).
-- **The re-run slot** is executable memory the resident writes. It lives in the resident's private window, executable
-  only at EL1, and is filled only with a word read from admitted code.
+- **The in-place re-run** depends on single-step and the trap-enable restore being exact; a wrong restore would leave
+  traps off silently. The handler unit tests and the native oracle check that each trapped word ends with the original
+  FPCR.
 - **Fork changes.** All shim and FEX changes go on the fork's `natemu` branch, under the same rules as the fast-mode work
   (owner-authored commits, nothing offered upstream).
 
@@ -395,9 +434,14 @@ Decided here, with reasons in the text; the owner may overrule any of them:
 | T7 | Owner: trapped FP exceptions become a Required host feature | §3: no fallback, refusal or trap-availability key; both modes rely on traps; chunk 3 follows `fptraps-core` |
 | T2 | Owner: "whatever is best for performance within each mode's contract" | §4: C masked (UFE) moves into fast mode if the standing benchmark gate passes; IOE in fast mode under the same gate is decision 1 |
 | T3 | Which A cases raise no IOC | §4 A: only FMA multi-QNaN order and the one-instruction negating FMAs remain after the `afp-negfree` fixes; an `fcmge` check that traps, on FMA forms only |
-| T4 | DAZ + FTZ: range test with steps, or FZ = 0 with UFE | §4: FZ = 0, UFE and row 4's input flush (no stub machinery left; 63-70 ns per tiny result against 0.1-1.5 µs per step) |
+| T4 | DAZ + FTZ: range test with steps, or FZ = 0 with UFE | §4: FZ = 0, UFE and row 4's input flush (no stub machinery left; ~100 ns per tiny result against 0.1-1.5 µs per step) |
 | T5 | x87 runs on the same Arm words | §3: the x87 FPCR word is explicit and trap-free whenever traps are on |
 | T6 | B and UFE | §4 B: chunk 2 unchanged; UFE could later cover the result side of a dataflow B |
+| R3-1 | Patch by mode, never by the cause in ESR; fast mode must patch only UFC | §3 step 3 |
+| R3-2 | The FMA check's operands may die before the check; its destination is stale after a trap | §4 A: Rn, Rm and the addend kept live on the check op and named; a compile with spill slots is refused, not emitted unchecked; admission pins that the check's destination is never read; native evidence that `fcmge` signals on a QNaN |
+| R3-3 | Under DAZ + FTZ every tiny word traps; which words flush | §4: the per-word flush table, only under DAZ + FTZ; row 4 before the negating `fmul`s; gate cases incl. real x86 |
+| R3-4 | EC 0x2C at EL1 or outside admitted code | §3 step 1: named stop, decoder never runs |
+| R3-N | IOC from the re-run; in-place re-run instead of a W+X slot; fast-mode trap list in chunk 6; chunk 2's 16× | adopted: §3 step 2 (in place, one more exception, no W+X memory), §3 step 3, chunk 6, §4 cost |
 | Owner | Startup output becomes one line per decision | §1: this plan sets the fp line's value; the degraded note uses chunk 0's descriptions |
 
 ## 10. Progress
