@@ -310,7 +310,7 @@ impl Boot {
             launch: crate::probe::Launch {
                 speculation_barriers: self.speculation_barriers,
                 pool: self.pool,
-                compile_cache: self.compile_cache.dir.clone(),
+                compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
             },
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,

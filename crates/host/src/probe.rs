@@ -19,7 +19,8 @@ const CONFIG_REGISTERS: [u32; ID_REGISTERS.len()] = [2, 3, 7, 4, 5, 6];
 pub(crate) struct Launch {
     pub speculation_barriers: bool,
     pub pool: bool,
-    pub compile_cache: Option<std::path::PathBuf>,
+    /// The disk cache's directory and cap in bytes, when on.
+    pub compile_cache: Option<(std::path::PathBuf, u64)>,
 }
 
 /// What the host's vCPU shows: the ID registers and whether Apple's TSO bit (ACTLR_EL1 bit 1) reads back set, and the
@@ -71,45 +72,53 @@ impl Probe {
         let missing = self.missing();
         (!missing.is_empty()).then(|| format!("host lacks {}", missing.join(" ")))
     }
-    /// The startup lines, one decision each (a verbose option may later gate all but the first): the guest feature map
-    /// (x86-64-v3 plus the advertised extensions, from the catalogue's generated names), the floating-point mode, the
-    /// speculation barriers, the perf class, then the launch options that change generated code or its reuse. The guest CPU
-    /// is the same on every supported host (every built feature is core); the other lines vary with the host and options.
+    /// The startup lines, `natemu: <topic>: <value>`, one decision each (a verbose option may later gate all but the
+    /// first): the guest feature map, the floating-point mode, the Speed-class host features (`+` used, `-` FEX's fallback),
+    /// the Meltdown mitigation, then the code reuse (pool and disk cache). The guest CPU is the same on
+    /// every supported host (every built feature is core); the other lines vary with the host and options. Tools recognise
+    /// a startup line by the colon after its topic (stops and errors have none).
     pub(crate) fn lines(&self, launch: &Launch) -> Vec<String> {
-        let mut cpu = String::from("natemu: cpu x86-64-v3");
+        let mut cpu = String::from("cpu: x86-64-v3");
         for name in natemu_abi::cpu_gates::ADVERTISED_BEYOND_V3 {
             cpu.push_str(" +");
             cpu.push_str(name);
         }
         // Only `fast` exists today; the `accurate` mode adds its own value here.
-        let mut fp = String::from("natemu: fp fast");
-        let inexact = self.inexact();
+        let mut fp = String::from("fp: fast mode");
+        let inexact = self.inexact_arm();
         if !inexact.is_empty() {
-            let host: Vec<_> = inexact.iter().map(|n| format!("FEAT_{}", n.to_uppercase())).collect();
-            fp.push_str(&format!(
-                ", degraded: host lacks {} (some x86 floating-point corner cases differ)",
-                host.join(" ")
-            ));
+            fp.push_str(&format!(", degraded (host lacks {})", inexact.join(" ")));
         }
+        let missing = self.lacking(Class::Speed);
+        let accel: Vec<_> = (FEATURES.iter().filter(|f| f.class == Class::Speed))
+            .map(|f| format!("{}{}", if missing.contains(&f.name) { '-' } else { '+' }, f.arm))
+            .collect();
         let onoff = |b: bool| if b { "on" } else { "off" };
-        let slow = self.lacking(Class::Speed);
-        let perf = if slow.is_empty() {
-            "natemu: perf all host fast paths".to_string()
-        } else {
-            format!("natemu: perf fallbacks for {}", slow.join(" "))
-        };
-        let cache = match &launch.compile_cache {
-            Some(dir) => format!("on ({})", dir.display()),
+        let disk = match &launch.compile_cache {
+            Some((dir, cap)) => {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let shown = match home.and_then(|h| dir.strip_prefix(h).ok().map(|r| r.to_owned())) {
+                    Some(rest) => format!("~/{}", rest.display()),
+                    None => dir.display().to_string(),
+                };
+                format!("{} MiB at {shown}", cap >> 20)
+            }
             None => "off".into(),
         };
-        vec![
+        [
             cpu,
             fp,
-            format!("natemu: speculation barriers {}", onoff(launch.speculation_barriers)),
-            perf,
-            format!("natemu: template pool {}", onoff(launch.pool)),
-            format!("natemu: compile cache {cache}"),
+            format!("acceleration: {}", accel.join(" ")),
+            format!("meltdown: {}", if launch.speculation_barriers { "speculation barriers" } else { "none" }),
+            format!("code cache: pool {}, disk {disk}", onoff(launch.pool)),
         ]
+        .map(|l| format!("natemu: {l}"))
+        .into()
+    }
+    /// [`Probe::inexact`] by Arm's names.
+    fn inexact_arm(&self) -> Vec<&'static str> {
+        let names = self.inexact();
+        (FEATURES.iter()).filter(|f| names.contains(&f.name)).map(|f| f.arm).collect()
     }
     /// The fexc feature bits fexc is told: those this vCPU can execute, less `NATEMU_FEXC_FEATURE_OFF`'s.
     pub(crate) fn supported(&self) -> u64 {
@@ -200,17 +209,19 @@ mod tests {
         let lines = p.lines(&LAUNCH);
         assert_eq!(
             lines[0],
-            "natemu: cpu x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt"
+            "natemu: cpu: x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt"
         );
-        assert_eq!(lines[1], "natemu: fp fast");
-        assert_eq!(lines[2], "natemu: speculation barriers off");
-        assert!(lines[3].starts_with("natemu: perf "), "{}", lines[3]);
-        assert_eq!(lines[4], "natemu: template pool on");
-        assert_eq!(lines[5], "natemu: compile cache off");
-        let on = Launch { speculation_barriers: true, pool: false, compile_cache: Some("/c".into()) };
+        assert_eq!(lines[1], "natemu: fp: fast mode");
+        assert_eq!(
+            lines[2],
+            "natemu: acceleration: +FEAT_FlagM2 -FEAT_CSSC +FEAT_FRINTTS -FEAT_MOPS -FEAT_I8MM +FEAT_DotProd -FEAT_ECV"
+        );
+        assert_eq!(lines[3], "natemu: meltdown: none");
+        assert_eq!(lines[4], "natemu: code cache: pool on, disk off");
+        let on = Launch { speculation_barriers: true, pool: false, compile_cache: Some(("/c".into(), 64 << 20)) };
         let lines = p.lines(&on);
-        assert_eq!(lines[2], "natemu: speculation barriers on");
-        assert_eq!((lines[4].as_str(), lines[5].as_str()), ("natemu: template pool off", "natemu: compile cache on (/c)"));
+        assert_eq!(lines[3], "natemu: meltdown: speculation barriers");
+        assert_eq!(lines[4], "natemu: code cache: pool off, disk 64 MiB at /c");
         assert_ne!(p.supported() & 1 << index("flagm"), 0);
     }
 
@@ -264,10 +275,11 @@ mod tests {
         assert_eq!(p.refusal(), None);
         let lines = p.lines(&LAUNCH);
         assert!(lines.iter().all(|l| l.starts_with("natemu: ") && !l.contains('\n')));
+        assert!(lines.iter().all(|l| l["natemu: ".len()..].split_once(": ").is_some_and(|(t, _)| !t.contains(['(', '\n']))));
         assert!(lines[0].ends_with(" +xsaveopt"), "{}", lines[0]);
         assert_eq!(
             lines[1],
-            "natemu: fp fast, degraded: host lacks FEAT_AFP (some x86 floating-point corner cases differ)"
+            "natemu: fp: fast mode, degraded (host lacks FEAT_AFP)"
         );
         assert_eq!(p.supported() & 1 << index("afp"), 0);
     }
@@ -278,12 +290,12 @@ mod tests {
     fn a_forced_off_afp_is_a_host_without_afp() {
         let forced = probe(|p| p.forced_off = 1 << index("afp"));
         assert_eq!(forced.refusal(), None);
-        assert!(forced.lines(&LAUNCH)[1].contains("degraded: host lacks FEAT_AFP"));
+        assert!(forced.lines(&LAUNCH)[1].contains("degraded (host lacks FEAT_AFP)"));
         assert_eq!(forced.supported() & 1 << index("afp"), 0);
         assert_eq!(forced.supported(), probe(|p| p.id[4] = 0).supported());
         let speed = probe(|p| p.forced_off = 1 << index("flagm2"));
-        assert_eq!(speed.lines(&LAUNCH)[..3], probe(|_| {}).lines(&LAUNCH)[..3]);
-        assert!(speed.lines(&LAUNCH)[3].contains("flagm2"));
+        assert_eq!(speed.lines(&LAUNCH)[..2], probe(|_| {}).lines(&LAUNCH)[..2]);
+        assert!(speed.lines(&LAUNCH)[2].contains("-FEAT_FlagM2"));
         assert_eq!(speed.supported() & 1 << index("flagm2"), 0);
     }
 

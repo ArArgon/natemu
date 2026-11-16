@@ -420,11 +420,11 @@ def judge(case, phase, text, host, expect, pci=False):
     return errors
 
 
-STARTUP = tuple(f'natemu: {w} ' for w in ('cpu', 'fp', 'speculation', 'perf', 'template', 'compile'))  # the startup lines
+STARTUP = re.compile(r'natemu: [a-z]+(?: [a-z]+)?: ')  # the startup lines (a colon after the topic; stops have none)
 
 
 def last_stop(stderr):
-    lines = [l for l in stderr.splitlines() if l.startswith('natemu: ') and not l.startswith(STARTUP)]
+    lines = [l for l in stderr.splitlines() if l.startswith('natemu: ') and not STARTUP.match(l)]
     return lines[-1] if lines else None
 
 
