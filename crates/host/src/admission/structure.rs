@@ -2407,9 +2407,13 @@ mod tests {
         for (forms, flag) in [(&simd[..], "--simd-unmasked"), (&x87[..], "--x87-unmasked")] {
             for hex in forms {
                 let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
-                for afp in [&["--feature", "afp=0"][..], &[]] {
+                // (accurate mode, AFP accurate plan chunk 2: the masked DE flag's `cbz; mrs; orr; msr` forward-skipped span; `--daz` drops it)
+                for afp in [&["--feature", "afp=0"][..], &["--feature", "afp=0", "--accurate"], &[]] {
                     for unmasked in ["0x0", "0x1", "0x2", "0x3", "0x10", "0x3f"] {
-                        for keys in [&[][..], &["--ftz"]] {
+                        for keys in [&[][..], &["--ftz"], &["--daz"], &["--daz", "--ftz"]] {
+                            if afp.is_empty() && keys.contains(&"--daz") {
+                                continue;
+                            }
                             let args = [afp, &[flag, unmasked][..], keys].concat();
                             let object = compile(hex, &args);
                             admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {args:?}: {e}"));

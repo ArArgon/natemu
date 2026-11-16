@@ -205,6 +205,18 @@ DEF_OP(FexcKeep) {   // emits no code: the operand stays live up to the check th
   const auto Op = IROp->C<IR::IROp_FexcKeep>();
   FexcKeepList.push_back({Op->Tag, uint8_t(GetVReg(Op->Value).Idx())});
 }
+// AFP accurate plan, chunk 2 (B): the software denormal flag of an op with DE masked goes to FPSR.IDC, where the M4 raises it: the
+// resident's bank and `FexcMxcsr` already read it as MXCSR.DE (unless DAZ). A hit skips forward into `mrs; orr; msr`.
+//   cbz wD, S; mrs x?, fpsr; orr x?, x?, #0x80; msr fpsr, x?; S:
+DEF_OP(FexcSimdDe) {
+  const auto Op = IROp->C<IR::IROp_FexcSimdDe>();
+  ARMEmitter::ForwardLabel Skip;
+  (void)cbz(ARMEmitter::Size::i32Bit, GetReg(Op->De), &Skip);
+  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x80);
+  msr(ARMEmitter::SystemRegister::FPSR, TMP1);
+  (void)Bind(&Skip);
+}
 DEF_OP(FexcSimdCheckDe) {
   const auto Op = IROp->C<IR::IROp_FexcSimdCheckDe>();
   const auto De = GetReg(Op->De);
@@ -295,9 +307,10 @@ DEF_OP(FexcRepStos) {
 // multiply operation, in the order of their execution"; the multiply has its own check op, PlaceFPChecks): the two sums'
 // exact-tiny test and their check. Nothing of the instruction is committed yet, so the state before it holds here too.
 void Arm64JITCore::FexcSimdStep(ARMEmitter::VRegister R) {
-  if (!fexc_simd_checked.count(Entry + FexcGuest)) return;
-  FexcTinyLanes(R, 4, 2, uint64_t(fexc_simd_unmasked));
-  FexcSimdCheckWords(FexcPrecision::SimdCheckMask());
+  if (fexc_simd_checked.count(Entry + FexcGuest)) {
+    FexcTinyLanes(R, 4, 2, uint64_t(fexc_simd_unmasked));
+    FexcSimdCheckWords(FexcPrecision::SimdCheckMask());
+  }
   FexcDenormalStep(R, 4);   // the second add level's inputs are these sums: its DE belongs to the final check
 }
 // AFP fallback chunk 3b, row 7: the software DE of one add level of DPPS/DPPD (VFAddV: `faddp` of the products, then of the two sums),
@@ -307,7 +320,10 @@ void Arm64JITCore::FexcSimdStep(ARMEmitter::VRegister R) {
 // the flag is: a forward branch round `mrs; orr; msr`), for the check that follows the level. Writes VTMP1, VTMP2, TMP1 (the
 // check's own), TMP3 and TMP4; no NZCV. Nothing without AFP, with DE masked, or in an instruction without checks.
 void Arm64JITCore::FexcDenormalStep(ARMEmitter::VRegister V, uint32_t Elem) {
-  if (!fexc_no_afp || !fexc_simd_checked.count(Entry + FexcGuest) || !(uint64_t(fexc_simd_unmasked) >> 1 & 1)) return;
+  // (unmasked DE: the check that follows takes the flag; masked DE, accurate mode: `fexc_simd_de_masked`, nothing follows, FPSR keeps it)
+  if (!fexc_no_afp) return;
+  const uint64_t Rip = Entry + FexcGuest;
+  if (!(fexc_simd_checked.count(Rip) && (uint64_t(fexc_simd_unmasked) >> 1 & 1)) && !fexc_simd_de_masked.count(Rip)) return;
   const bool Dbl = Elem == 8;
   const auto Sz = Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
   shl(Sz, VTMP1.Q(), V.Q(), 1);

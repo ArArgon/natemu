@@ -22,7 +22,7 @@ tools/fexc/build.sh BUILD_DIR
 
 `BUILD_DIR` must not exist. FEX comes from the submodule `third_party/FEX` (`.gitmodules`: the fork
 `https://github.com/ArArgon/natemu-fex`, branch `natemu`, `shallow = true`), pinned to the fork's commit
-`791857f8d59ea08a78822b890feb9682568509f7` (`726f3c0` plus the `FexcKeep` IR op, which keeps the operands of a checked op live for the unmasked-UE tininess decision, and the declaration of `FexcX87NanOp`, the x87 NaN fix-up of hosts without AFP, which lives in the shim; `726f3c0` is `8254266` plus the non-AFP scalar ops' direct write when the upper bits are known zero (`MarkUpperZero`); `8254266` is `7e8f5ed` plus the `FexcSimdCheckDe`/`FexcX87CheckDe` IR ops, the call of `PlaceFmaSanitize` and the `FexcDenormalStep` hook in `VFAddV`, chunk 3b; `7e8f5ed` is `13e80cf` plus the `FexcFlush` IR op for the software DAZ/FTZ flush, chunk 3a; `13e80cf` is `1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2; all on the fork's `natemu` branch): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
+`807033da4b38e4735159cccb8b1a3a7cd49cb977` (`791857f8d59ea08a78822b890feb9682568509f7` plus the `FexcSimdDe` IR op, which sets FPSR.IDC from the software denormal flag of an op with DE masked, AFP accurate plan chunk 2; `791857f` is `726f3c0` plus the `FexcKeep` IR op, which keeps the operands of a checked op live for the unmasked-UE tininess decision, and the declaration of `FexcX87NanOp`, the x87 NaN fix-up of hosts without AFP, which lives in the shim; `726f3c0` is `8254266` plus the non-AFP scalar ops' direct write when the upper bits are known zero (`MarkUpperZero`); `8254266` is `7e8f5ed` plus the `FexcSimdCheckDe`/`FexcX87CheckDe` IR ops, the call of `PlaceFmaSanitize` and the `FexcDenormalStep` hook in `VFAddV`, chunk 3b; `7e8f5ed` is `13e80cf` plus the `FexcFlush` IR op for the software DAZ/FTZ flush, chunk 3a; `13e80cf` is `1df70f05` plus the non-AFP scalar MIN/MAX signalling compare, AFP fallback row 2; all on the fork's `natemu` branch): upstream `48d71752e2a363d5535181f803b0b0e9666c1825` plus the retained fork patches, no-stop work, November 7 CPU/RAM corrections and the COR-03/05/06 width/address fixes. The script initialises the submodule (only when it is not already
 at the pin) and the three FEX externals the build uses (`External/fmt`, `xxhash`, `unordered_dense`, each shallow at the
 revision FEX pins), checks the pin, creates `BUILD_DIR/src` as a detached git worktree of the submodule at the pin, copies the
 three externals into it (`git archive`), configures `CMakeLists.txt` against that tree, builds with 4 jobs and runs
@@ -435,6 +435,19 @@ step request, `--exact-step`, only when `Cpu::code_context` bit 32 is set (accur
 and does nothing with them yet (chunks 2-5 will read them, as `FEXC_ARG_ACCURATE` and `FEXC_ARG_EXACT_STEP`); it refuses either
 with AFP (`--feature afp` on) and resets both for every request, so serve mode never carries one request's mode into the next
 (`test_serve.py` runs the sequence).
+
+**Masked SSE/AVX DE in accurate mode** (AFP accurate plan chunk 2, item B). With `--feature afp=0 --accurate`, MXCSR.DM set (`--simd-unmasked` without
+bit 1) and no `--daz` (x86 sets no DE under DAZ), `PlaceFPChecks` builds the same software denormal flag as the unmasked case (`BuildSimdDe`: row 7's
+test with x86's precedence, half-precision sources never) before each op of the table `DeRuleOf`, and a new IR op `FexcSimdDe` (fork commit `807033d`)
+sets FPSR.IDC from it: `cbz wD, S; mrs x0, fpsr; orr x0, x0, #0x80; msr fpsr, x0; S:` (a forward-skipped span; admission already accepts `mrs`/`msr fpsr`
+and a forward branch that lands on the op). The write comes before the op, where the M4's hardware raises IDC, so the resident's bank, `FexcMxcsr` and
+the unmasked-exception check word see exactly the M4's FPSR (`mxcsr_flags` maps IDC to DE unless DAZ; nothing in the host changes). DPPS/DPPD's add levels
+(inside VFAddV, `FexcDenormalStep`) are tested too: `fexc_simd_de_masked` names the instructions that carry the flag with DE masked. With DE unmasked
+the flag stays in the check word (above); without `--accurate`, with AFP (refused anyway) or under DAZ nothing is placed. Reading `--accurate` and
+`--daz` is gated on the instruction being an SSE/AVX FP op without AFP, so the answers' `args_read` of fast mode and of AFP hosts are unchanged.
+`test_slice1.py` (`AfpAccurateDe`) runs the afp=0 accurate code natively under an M2's FPCR against the AFP code under the M4's (every SSE/AVX
+form the DE test covers plus memory operands, 256-bit and DPPS/DPPD forms, random operands): FPSR.IDC and every result bit outside the lanes the M4
+holds a NaN in (the NaN rules are the next chunk's) are identical.
 
 **DAZ and FTZ without AFP** (AFP fallback chunk 3a, plan rows 4-6 and row 3's unmasked-PE part; none of it with AFP). `--daz` and
 `--ftz`, which the host sends only when `Cpu::no_afp` and MXCSR.DAZ, or effective FTZ (FTZ with UM masked), are set, are read only by

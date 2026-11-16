@@ -508,7 +508,10 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
       }
       // AFP fallback (the owner's default mode): without AFP an x87 m32/m64 memory operand's DE is set by software even masked (below).
       const bool MaskedDe = fexc_no_afp && X87 && Fp && !(uint64_t(fexc_x87_unmasked) >> 1 & 1);
-      if (!Mask && !MaskedDe) return;
+      // AFP accurate plan, chunk 2 (B): accurate mode without AFP and with DE masked (and no DAZ: x86 sets no DE then) sets the flag of each
+      // SSE/AVX op by software, into FPSR.IDC (FexcSimdDe, before the op: no commit or fault point lies between it and the op).
+      const bool SimdDe = !X87 && fexc_no_afp && fexc_accurate && !(uint64_t(fexc_simd_unmasked) >> 1 & 1) && !fexc_daz;
+      if (!Mask && !MaskedDe && !SimdDe) return;
       size_t First = Insn.size();
       for (size_t i = 0; i < Insn.size(); ++i) if (Commits(Insn[i].second)) { First = i; break; }
       if (Mask) {
@@ -530,6 +533,14 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           }
         } else if (X87 && (uint64_t(fexc_x87_unmasked) >> 1 & 1)) {
           X87De = BuildX87De(IREmit, Insn, First);
+        } else if (SimdDe) {
+          fexc_simd_de_masked.insert(Rip);
+          for (size_t i = 0; i < Insn.size(); ++i) {
+            const auto* Op = IR.template GetOp<IROp_Header>(Insn[i].first);
+            DeRule R;
+            if (!FexcMade.count(Insn[i].first) && DeRuleOf(Op, R))
+              if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R)) IREmit->_FexcSimdDe(F);
+          }
         } else if (MaskedDe) {
           // DE masked: FSW.DE is set, nothing is raised. The flag is or-ed into the pending byte (the instruction's end commits it,
           // after a stack fault dropped the operation's flags: FEX's FexcEndInstruction) where BuildX87De left the cursor, which
