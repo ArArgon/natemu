@@ -74,7 +74,13 @@ pub struct Shared {
     pub actlr: u64,
     pub tcr: u64,
     pub mode: u64,
+    /// FPCR as the resident read it back after writing the six trap-enable bits (`FPTRAPS_MASK`); FPCR is restored.
+    pub fpcr_traps: u64,
 }
+/// FPCR IOE, DZE, OFE, UFE, IXE, IDE: the trap-enable bits trapped FP exceptions need (all six are required).
+pub const FPTRAPS_MASK: u64 = 0x9f00;
+/// The resident's `PANIC` detail when [`Shared::fpcr_traps`] lacks a bit of [`FPTRAPS_MASK`].
+pub const FPTRAPS_DETAIL: u64 = 12;
 
 const _: () = assert!(core::mem::size_of::<Shared>() <= 4096);
 const _: () = assert!(core::mem::size_of::<NativeFrame>() == 800);

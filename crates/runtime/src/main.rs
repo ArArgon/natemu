@@ -62,8 +62,18 @@ unsafe extern "C" fn runtime_main() -> ! {
         ptr::write_volatile(&raw mut (*s).sctlr, sctlr);
         ptr::write_volatile(&raw mut (*s).actlr, actlr);
         ptr::write_volatile(&raw mut (*s).tcr, tcr);
+        // Trapped FP exceptions: the host cannot read FPCR's hardware value before a vCPU runs (HVF caches what it set), so the
+        // enables are written and read back here, then FPCR is restored: nothing stays enabled.
+        let (mut saved, mut back): (u64, u64);
+        asm!("mrs {0}, FPCR", "msr FPCR, {2}", "isb", "mrs {1}, FPCR", "msr FPCR, {0}", "isb",
+             out(reg) saved, out(reg) back, in(reg) natemu_abi::FPTRAPS_MASK);
+        let _ = saved;
+        ptr::write_volatile(&raw mut (*s).fpcr_traps, back);
         if current_el != 4 || sctlr & 0x1005 != 0x1005 || actlr & 2 != 2 {
             stop(PANIC, 10);
+        }
+        if back & natemu_abi::FPTRAPS_MASK != natemu_abi::FPTRAPS_MASK {
+            stop(PANIC, natemu_abi::FPTRAPS_DETAIL);
         }
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
             execution::start();

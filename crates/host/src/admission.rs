@@ -47,13 +47,13 @@ pub(crate) enum Detect {
     Present(&'static [(usize, u32)]),
     /// Apple's TSO bit: ACTLR_EL1 bit 1 reads back set after the resident's setup wrote it ([`crate::probe`] only).
     Tso,
-    /// Trapped FP exceptions: the six FPCR trap-enable bits ([`FPTRAPS_MASK`]) read back set after the host wrote them
-    /// ([`crate::probe`] only; `hw.optional.arm.FP_SyncExceptions` has no ID-register field).
+    /// Trapped FP exceptions: the six FPCR trap-enable bits ([`FPTRAPS_MASK`]) read back set after the resident wrote them
+    /// (`runtime_main`: HVF returns the host's own FPCR value until the vCPU has run; [`crate::probe::fptraps_refusal`]; `hw.optional.arm.FP_SyncExceptions` has no ID-register field).
     FpTraps,
 }
 /// FPCR IOE (8), DZE (9), OFE (10), UFE (11), IXE (12), IDE (15): one per x86 exception (IE, ZE, OE, UE, PE, DE), RAZ/WI where
 /// unimplemented. All six are required: an unmasked x86 exception must trap whichever one the guest unmasks.
-pub(crate) const FPTRAPS_MASK: u64 = 0x9f00;
+pub(crate) use natemu_abi::FPTRAPS_MASK;
 /// What natemu does with a host feature (CPU-features plan section 2.2a). `Required` and `Exactness` are checked by the
 /// startup probe; the others only decide what fexc is told.
 #[derive(Clone, Copy, PartialEq, Debug)]

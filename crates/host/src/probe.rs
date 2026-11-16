@@ -9,7 +9,7 @@
 use crate::admission::{
     Class, FEATURES, FPTRAPS_MASK, ID_REGISTERS, MACHINE, detected, forced_off, supported_features,
 };
-use crate::vm::{ACTLR_EL1, FPCR, Vcpu, config_id_register};
+use crate::vm::{ACTLR_EL1, Vcpu, config_id_register};
 use std::sync::OnceLock;
 
 /// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
@@ -34,7 +34,8 @@ pub(crate) struct Launch {
 pub(crate) struct Probe {
     pub id: [u64; ID_REGISTERS.len()],
     pub tso: bool,
-    /// The six FPCR trap-enable bits read back set ([`FPTRAPS_MASK`]).
+    /// The six FPCR trap-enable bits read back set ([`FPTRAPS_MASK`]); `true` at startup, set from the resident's readback
+    /// ([`fptraps_refusal`]): HVF returns the host's own FPCR value until the vCPU has run, so the host cannot check it here.
     pub fptraps: bool,
     pub forced_off: u64,
 }
@@ -45,14 +46,10 @@ impl Probe {
         for (value, (name, reg)) in id.iter_mut().zip(ID_REGISTERS) {
             *value = cpu.sys(reg).map_err(|e| format!("{name}: {e}"))?;
         }
-        // FPCR by the host (HV_REG_FPCR): write the enables, read back, restore. Nothing is left enabled.
-        let fpcr = cpu.reg(FPCR)?;
-        cpu.set_reg(FPCR, fpcr | FPTRAPS_MASK)?;
-        let back = cpu.reg(FPCR);
-        cpu.set_reg(FPCR, fpcr)?;
         Ok(Self {
             id,
-            fptraps: back? & FPTRAPS_MASK == FPTRAPS_MASK,
+            // Not readable here: the resident's first run reads it back ([`fptraps_refusal`]).
+            fptraps: true,
             tso: cpu.sys(ACTLR_EL1)? & 2 != 0,
             forced_off: match std::env::var_os("NATEMU_FEXC_FEATURE_OFF") {
                 Some(list) => forced_off(&list.to_string_lossy())?,
@@ -135,6 +132,13 @@ impl Probe {
     pub(crate) fn supported(&self) -> u64 {
         supported_features(&self.id) & !self.forced_off
     }
+}
+
+/// The refusal for the resident's FPCR readback `fpcr` (`Shared::fpcr_traps`, read after the vCPU ran): `host lacks fptraps`
+/// unless every [`FPTRAPS_MASK`] bit read back set.
+pub(crate) fn fptraps_refusal(fpcr: u64) -> Option<String> {
+    let probe = Probe { id: [0; ID_REGISTERS.len()], tso: true, fptraps: fpcr & FPTRAPS_MASK == FPTRAPS_MASK, forced_off: 0 };
+    (!probe.fptraps).then(|| format!("host lacks {}", MACHINE.iter().find(|r| matches!(r.1, crate::admission::Detect::FpTraps)).unwrap().0))
 }
 
 /// The startup probe for a created vCPU: refuses with one message, prints the startup line once per process, and
@@ -274,6 +278,11 @@ mod tests {
         // A host whose FPCR trap-enable readback is 0 is refused by name.
         assert_eq!(probe(|p| p.fptraps = false).missing(), ["fptraps"]);
         assert_eq!(probe(|p| p.fptraps = false).refusal().as_deref(), Some("host lacks fptraps"));
+        // The resident's readback: a RES0 bit (0x20) or no bit reads 0 and is refused; all six pass.
+        assert_eq!(fptraps_refusal(0x9f00).as_deref(), None);
+        assert_eq!(fptraps_refusal(0x9f20).as_deref(), None);
+        assert_eq!(fptraps_refusal(0).as_deref(), Some("host lacks fptraps"));
+        assert_eq!(fptraps_refusal(0x9e00).as_deref(), Some("host lacks fptraps"));
         assert_eq!(
             probe(|p| p.id[0] = FULL[0] & !(15 << 4) | 1 << 4).missing(),
             ["pmull128"]
