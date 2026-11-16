@@ -506,12 +506,16 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
         if (!Fp || fexc_fp_quiet.count(Rip)) return;
         Mask = SimdCheckMask();
       }
-      if (!Mask) return;
+      // AFP fallback (the owner's default mode): without AFP an x87 m32/m64 memory operand's DE is set by software even masked (below).
+      const bool MaskedDe = fexc_no_afp && X87 && Fp && !(uint64_t(fexc_x87_unmasked) >> 1 & 1);
+      if (!Mask && !MaskedDe) return;
       size_t First = Insn.size();
       for (size_t i = 0; i < Insn.size(); ++i) if (Commits(Insn[i].second)) { First = i; break; }
-      for (size_t i = First; i < Insn.size(); ++i)
-        if (SimdFPOp(Insn[i].second)) ERROR_AND_DIE_FMT("fexc slice1 (I5c): a floating-point op after the first commit at {:#x}", Rip);
-      if (First == Insn.size()) ERROR_AND_DIE_FMT("fexc slice1 (I5c): no commit to check before at {:#x}", Rip);
+      if (Mask) {
+        for (size_t i = First; i < Insn.size(); ++i)
+          if (SimdFPOp(Insn[i].second)) ERROR_AND_DIE_FMT("fexc slice1 (I5c): a floating-point op after the first commit at {:#x}", Rip);
+        if (First == Insn.size()) ERROR_AND_DIE_FMT("fexc slice1 (I5c): no commit to check before at {:#x}", Rip);
+      }
       // AFP fallback chunk 3b (rows 7 and 8): without AFP and with DE unmasked, the software denormal tests of the instruction's ops,
       // placed before each op (SIMD: `Des`, the op's index and its flag) or before the x87 check (`X87De`).
       std::vector<std::pair<size_t, Ref>> Des;
@@ -526,8 +530,17 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           }
         } else if (X87 && (uint64_t(fexc_x87_unmasked) >> 1 & 1)) {
           X87De = BuildX87De(IREmit, Insn, First);
+        } else if (MaskedDe) {
+          // DE masked: FSW.DE is set, nothing is raised. The flag is or-ed into the pending byte (the instruction's end commits it,
+          // after a stack fault dropped the operation's flags: FEX's FexcEndInstruction) where BuildX87De left the cursor, which
+          // is before the last of the ops that examine the operand: no commit, no fault point between.
+          if (Ref De = BuildX87De(IREmit, Insn, Insn.size())) {
+            Ref P = IREmit->_LoadContextGPR(OpSize::i8Bit, FEXC_X87_PENDING);
+            IREmit->_StoreContextGPR(OpSize::i8Bit, IREmit->_Or(OpSize::i32Bit, P, IREmit->_And(OpSize::i32Bit, De, IREmit->_Constant(0x80))), FEXC_X87_PENDING);
+          }
         }
       }
+      if (!Mask) return;
       IREmit->SetWriteCursorBefore(Insn[First].first);
       if (X87) {
         const auto It = fexc_x87_extra.find(Rip);
