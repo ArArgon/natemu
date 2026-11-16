@@ -88,3 +88,21 @@ class Runners(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+class I8bJudge(unittest.TestCase):
+    """run_suite's i8b judge: on the M4 the 7 known QEMU departures fail; without AFP the tagged ones must be `deviated`."""
+    def judge(self, rows):
+        import tempfile, run_suite
+        out = pathlib.Path(tempfile.mkdtemp()); (out / 'results.json').write_text(json.dumps({'results': rows}))
+        return run_suite.i8b_judge(out)[0]
+    def test_known_departures(self):
+        import run_suite
+        known, tagged = run_suite.I8B_KNOWN, run_suite.I8B_KNOWN & set(dev.corpus_deviations(run_suite.I8B_CORPUS))
+        m4, m2 = {'afp': True, 'fp': 'fast'}, {'afp': False, 'fp': 'fast'}
+        self.assertTrue(tagged)
+        self.assertTrue(self.judge([{'name': n, 'outcome': 'fail', 'vm': m4} for n in known]))
+        dev_rows = [{'name': n, 'outcome': 'deviated' if n in tagged else 'fail', 'vm': m2} for n in known]
+        self.assertTrue(self.judge(dev_rows))
+        self.assertFalse(self.judge([dict(r, outcome='fail') for r in dev_rows]))   # tagged ones exact or otherwise wrong
+        self.assertFalse(self.judge([{'name': n, 'outcome': 'fail', 'vm': m4} for n in known] + [{'name': 'x', 'outcome': 'fail', 'vm': m4}]))
