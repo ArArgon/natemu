@@ -3759,6 +3759,9 @@ fn serve(
             0x49 => {
                 let s: Shared = area.read_record(SHARED_OFFSET);
                 let state: State = area.read_record(exec::STATE_OFFSET);
+                if s.status == natemu_abi::PANIC && s.detail == natemu_abi::FPTRAPS_DETAIL {
+                    return Err(crate::probe::fptraps_refusal(s.fpcr_traps).unwrap_or_else(|| "resident stopped on FPCR".into()));
+                }
                 if !exec::entry_frame_rest_zero(&s.initial) {
                     return Err("the resident's entry frame holds a field it does not write".into());
                 }
