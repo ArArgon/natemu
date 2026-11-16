@@ -330,6 +330,7 @@ template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEX
   case DeRule::Cadd: {   // ADDSUB: Arg(1) is the swapped operand (VRev64 or VExtr, both involutions): swap it back
     if (R.B != 16) ERROR_AND_DIE_FMT("fexc slice1 (AFP fallback 3b): an ADDSUB op of {} bytes", R.B);
     Ref Y = Arg(1);
+    if (Op->C<IROp_VFCADD>()->Rotate != 0)   // (Rotate 0: the no-AFP lowering's unswapped source)
     Y = R.E == 4 ? IREmit->_VRev64(OpSize::i128Bit, OpSize::i32Bit, Y) : IREmit->_VExtr(OpSize::i128Bit, OpSize::i8Bit, Y, Y, 8);
     M = D.Bin(Arg(0), Y);
     break;
