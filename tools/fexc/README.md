@@ -477,6 +477,18 @@ code natively (`tools/fexc/exec_words.c`, on the M4 under an M2's FPCR) for ever
 and against the M4's own hardware IDC/IOC under FPCR AH = 1; `the_software_flag_code_is_admitted` (host) admits the forms with no
 spill.
 
+**x87 in the default mode without AFP** (AFP fallback, the owner's cheap exactness fixes; none of it with AFP, nor in M4 code). (1) FSW.DE
+of an m32/m64 operand with DM *masked*: `PlaceFPChecks` computes the same `BuildX87De` flag (the same precedence) and ORs it into the pending
+byte (no fault point: the instruction's end commits it after a stack fault dropped the operation's flags). (2) NaN results of x87
+arithmetic (`FexcX87NanOp`: scalar double `VFADD/VFSUB/VFMUL/VFDIV/VFSQRT` of the x87 lowering, so FADD/FSUB/FSUBR/FMUL/FDIV/FDIVR in every
+form incl. P and m32/m64/FI*, FSQRT, FLD m64's multiply by 1.0): with AH = 0 the default NaN is positive (x86: negative) and an SNaN
+operand beats a QNaN one. Both raise IOC, which `FexcX87End` has just read (x0), so `tbz x0, #0` skips a fix-up that computes AH = 1's
+result (the first NaN operand quieted, else the negative default NaN) from copies of the sources the op overwrote (`mov v16/v17`, 0-2
+instructions); the hot path pays that and one `tbz`. FPREM, FSCALE, F2XM1, FYL2X, FPTAN, FPATAN, FSIN/FCOS, FXTRACT are resident
+helpers (`svc`), not affected; FRNDINT is plain and passes. Two-NaN operands keep the M4's first-operand rule (COR-09), x86's own differs.
+`test_slice1.py` (`AfpX87`) runs every form over the operand classes natively under an M2's FPCR with afp=0 code against AFP code under the
+M4's FPCR (all guest state identical; the M4's m32 DE beside a NaN in ST0 is the known exception, judged against x86's rule instead).
+
 ## What builds
 
 `libfexcore.a`: decoder/frontend, x86 tables, OpDispatcher + IR, passes,

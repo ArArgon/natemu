@@ -1281,7 +1281,7 @@ impl<'a> Verifier<'a> {
     /// I6 (code shape): an x87 stack slot, FEX's `mm[I]` in the guest-state page: `add x0, x28, xI, lsl #4` right before an
     /// 8-byte access `[x0, #mm]` (I = (TOP + i) & 7, which fexc masks; the hardware keeps any address inside EL0's mappings).
     /// The index register's last write before the `add` must be `and wI, wN, #7` (fexc masks every index: TOP is guest data),
-    /// and no branch may enter after that `and` up to the access, so every path to the access masks the index and adds it
+    /// and no branch from outside that span may enter after that `and` up to the access, so every path to the access masks the index and adds it
     /// (the slot stays inside the guest-state page: x28 + 0x420 + 7 * 16 + 8 <= x28 + 0x498).
     fn x87_slot(&self, m: Mem, at: u32) -> bool {
         if at < ENTRY_OFFSET + 4
@@ -1297,7 +1297,8 @@ impl<'a> Verifier<'a> {
             k -= 4;
             if self.insn(k).is_some_and(|i| i.writes() & 1 << index != 0) {
                 return self.word(k) & 0xffff_fc1f == 0x1200_0800 | index   // and wI, wN, #0x7
-                    && self.branches_into(k, at).next().is_none();
+                    // (a branch from between the mask and the access, as AFP fallback's x87 NaN fix-up has, passed the mask itself)
+                    && self.branches_into(k, at).all(|(src, _)| src > k && src < at);
             }
         }
         false
@@ -2380,6 +2381,8 @@ mod tests {
         let x87 = [
             "d903", "dd03", "d803", "dc03", "d80b", "dc0b", "d813", "dc13", "d81b", "dc1b", "d823", "dc23", "d82b", "dc2b", "d833", "dc33", "d83b",
             "dc3b", "da03", "d9c0", "d8c1",
+            // the NaN fix-up of AFP fallback (afp=0): registers, P forms, the destination aliasing a source, FSQRT, FLD
+            "d8c9", "d8f1", "dcc1", "dce9", "dec1", "dec9", "def1", "d9fa", "d9e0",
         ];
         let dir = std::env::temp_dir().join(format!("natemu-soft-flag-admit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
