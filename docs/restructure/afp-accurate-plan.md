@@ -179,6 +179,16 @@ compiled.
    word runs once in place, and the software-step exception (an exception class the resident already handles) brings it
    back. FPSR then holds this word's flags alone.
 
+   The resident already single-steps for data watchpoints, and that code assumes every step is a watchpoint step: it
+   re-arms the monitor-debug enable (MDE) unconditionally and restores nothing in FPCR. So:
+   - a per-vCPU "FP re-run in flight" marker tells the two steps apart, and the step handler dispatches on it;
+   - the trap enables are put back into the frame's FPCR when the FP step returns, and also when a pending step is
+     cancelled. Otherwise a later entry could resume with the trap-free FPCR captured for the re-run, and accurate mode
+     would silently run without traps;
+   - MDE is left as it was;
+   - the performance log counts FP re-run steps separately from watchpoint steps;
+   - a unit test takes an FP trap in the step block while a watchpoint is armed.
+
    The alternative was a per-vCPU table of executable slots, filled with the trapped word. That needs writable-and-
    executable resident memory and I-cache maintenance. Re-running in place costs one more exception, about 37 ns, and
    needs neither.
@@ -266,6 +276,10 @@ The FMA check:
   load register. They are kept on the check op itself, the way fast mode's C-unmasked check keeps its operands. As
   there, a compile with spill slots gets no description; the FMA check then can't be built, and the compile is refused
   and retried without the FMA in the block, never emitted unchecked.
+- **No stop and no cliff.** The exhaustive admission test covers every FMA form under every key, 128- and 256-bit, compiled
+  alone with no spill slots, so the retry without the FMA can never end in a stop. Keeping three operands live raises
+  register pressure, most for 256-bit. If refusals were frequent they would cut FMA loops into one-instruction blocks, so
+  chunk 4's gate counts spill-slot compiles among FMA blocks on the recorded streams and on the avx benchmark.
 - **The check's destination** is a JIT temporary that admission pins as never read: the handler resumes after the
   `fcmge`, so that register is stale.
 - **At a check trap,** the handler recomputes the NaN lanes from the three named operands, writes the temporary, adds no
@@ -363,7 +377,7 @@ results and flags bit-identical.
 | 1. Frame | done | §1 |
 | 2. B | built (screen in progress) | as in §10 |
 | 3. Traps and C masked | `fpcr` trap bits (after `fptraps-core` merges); x87 trap-free FPCR; the EL0 EC 0x2C handler (named stop for EL1 or outside admitted code), in-place re-run by single-step, UFC patch; registry "fixed by"; C masked in accurate mode | handler unit tests per word class; native oracle (band, tiny, exact tiny, packed lanes mixing band and real underflow, every rounding mode); run_i5c band cases pass in M2 emulation, accurate; x87 runners unchanged; trap counts and VM trap cost |
-| 4. A | the `afp-negfree` fixes merged first; IOE and the NaN patch (D, SNaN, RSQRT); the FMA check and its site; `--exact-step` removed | NaN classes in the native oracle; check-trap cases (NaN only in a high half, destination aliasing each FMA source, an SNaN FMA trapping twice); the FMA check's native cost against the branch shape; in M2 emulation, accurate: i8 and i8b fully pass (i8b: only the seven departures) |
+| 4. A | the `afp-negfree` fixes merged first; IOE and the NaN patch (D, SNaN, RSQRT); the FMA check and its site; `--exact-step` removed | NaN classes in the native oracle; check-trap cases (NaN only in a high half, destination aliasing each FMA source, an SNaN FMA trapping twice); the FMA check's native cost against the branch shape; spill-slot compiles among FMA blocks (recorded streams, avx); an FP trap in the step block with a watchpoint armed; in M2 emulation, accurate: i8 and i8b fully pass (i8b: only the seven departures) |
 | 5. C under DAZ + FTZ | FZ = 0 with UFE under accurate DAZ + FTZ; row 4's input flush emitted there; the handler's FTZ result | native oracle; run_i5c DAZ + FTZ band and flush cases; the corpora's DAZ/FTZ programs in accurate mode |
 | 6. Cost, fast-mode gate, records, M2 run | one benchmark round in M2 emulation: fast before and after UFE (and IOE), accurate; cray, luajit, luajit-interp, zstd, sqlite, avx (5 interleaved runs), plus an existing FP benchmark program built with `-Ofast`; trap counts, split by the fast-mode traps that fire if UFE or IOE move to fast mode (UFE: `fmul` by −1 of a denormal, exact denormal add/subtract, row 5's flush `fmul` under FTZ alone; IOE: COMISS with a QNaN, scalar MIN/MAX `fcmpe`, `fcvtzs` of a NaN); README and registry for whatever moved into fast mode; the owner's M2 run of the runner subset in both modes | the fast-mode gate (§4) decides what moves; numbers recorded here and in the investigation record; the M2 matches M2 emulation; the owner's M1 run of `tools/fp_trap_probe/run.sh` confirms precise, in-VM traps on the M1 |
 
@@ -442,6 +456,8 @@ Decided here, with reasons in the text; the owner may overrule any of them:
 | R3-3 | Under DAZ + FTZ every tiny word traps; which words flush | §4: the per-word flush table, only under DAZ + FTZ; row 4 before the negating `fmul`s; gate cases incl. real x86 |
 | R3-4 | EC 0x2C at EL1 or outside admitted code | §3 step 1: named stop, decoder never runs |
 | R3-N | IOC from the re-run; in-place re-run instead of a W+X slot; fast-mode trap list in chunk 6; chunk 2's 16× | adopted: §3 step 2 (in place, one more exception, no W+X memory), §3 step 3, chunk 6, §4 cost |
+| R4-1 | The FP re-run's single step must be told apart from a watchpoint step | §3 step 2: an in-flight marker; trap enables restored on return and on cancel; MDE untouched; separate perf counts; a unit test with a watchpoint armed |
+| R4-2 | The FMA check's refusal must not become a stop or a performance cliff | §4 A: the exhaustive no-spill test over FMA forms × keys × 256-bit; chunk 4 counts spill-slot compiles among FMA blocks |
 | Owner | Startup output becomes one line per decision | §1: this plan sets the fp line's value; the degraded note uses chunk 0's descriptions |
 
 ## 10. Progress
