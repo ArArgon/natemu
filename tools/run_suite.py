@@ -32,6 +32,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
 # The compiler boot-handoff §5's `F=../natemu-raw/...` line names.
 FEXC = RAW / re.search(r'^F=\.\./natemu-raw/(\S+)', (ROOT / 'docs/restructure/boot-handoff.md').read_text(), re.M)[1]
+I8B_CORPUS = 'i8-corpus-20261030-02'   # i8b's directory (the deviation predictions' key)
 I8B_KNOWN = {'i8-forms-001', 'i8-forms-045', 'i8-random-067', 'i8-random-077', 'i8-random-097', 'i8-random-111', 'i8-random-126'}
 SERIAL_WHY = {
     'kicks': 'host kicker threads against hot loops (boot-handoff §5: timing-sensitive)',
@@ -91,16 +92,19 @@ class Step:
 
 
 def i8b_judge(out):
-    """i8b passes with exactly the 7 known QEMU departures. In a run that judges the documented fast-mode deviations (a host without
-    AFP: tools/fp_deviations.py) a known departure that is also tagged is `deviated` against the model's state instead of failing;
-    each known departure must still fail or be deviated, and nothing else may fail."""
+    """i8b passes with exactly the 7 known QEMU departures failing. In a run that judges the documented fast-mode deviations (a host
+    without AFP: tools/fp_deviations.py) the known departures that are also tagged must instead be `deviated` against the model's state
+    (coming out exact, or in another wrong state, fails), the others must still fail, and nothing else may fail."""
+    import fp_deviations
     try: res = json.loads((out / 'results.json').read_text())['results']
     except (OSError, ValueError, KeyError) as e: return False, f'no results.json ({e})'
     bad = {r['name'] for r in res if r['outcome'] == 'fail'}
     deviated = {r['name'] for r in res if r['outcome'] == 'deviated'}
-    ok = bad <= I8B_KNOWN and I8B_KNOWN - bad == deviated & I8B_KNOWN
-    return ok, 'the known QEMU departures' + (f' ({len(bad)} fail, {len(I8B_KNOWN & deviated)} deviated as documented)' if deviated else ' (7)') if ok else \
-        f'failures {sorted(bad)}, known {sorted(I8B_KNOWN)}, known deviated {sorted(I8B_KNOWN & deviated)}'
+    rule = any(fp_deviations.applies(r.get('vm') or {}) for r in res)
+    tagged = I8B_KNOWN & set(fp_deviations.corpus_deviations(I8B_CORPUS)) if rule else set()
+    ok = bad == I8B_KNOWN - tagged and tagged <= deviated
+    return ok, 'the known QEMU departures' + (f' ({len(bad)} fail, {len(tagged)} deviated as documented)' if rule else ' (7)') if ok else \
+        f'failures {sorted(bad)}, known {sorted(I8B_KNOWN)}, known and tagged {sorted(tagged)}, deviated of those {sorted(tagged & deviated)}'
 
 
 def deviated_note(log):
@@ -141,7 +145,7 @@ def steps(F, O):
     vm('vector-split-smp', 'run_vector_split_smp.py')
     vm('maskmovq', 'run_maskmovq.py', '--no-build')
     vm('maskmovq-1', 'run_maskmovq.py', '--no-build', '--max-block', '1')
-    corpora = {'seed': 's1d1-seed4242', 'i8': 'i8-corpus-20261030-01', 'i8b': 'i8-corpus-20261030-02', 'i9': 'i9-corpus-20261030-01',
+    corpora = {'seed': 's1d1-seed4242', 'i8': 'i8-corpus-20261030-01', 'i8b': I8B_CORPUS, 'i9': 'i9-corpus-20261030-01',
                'i9-big': 'i9-big-20261030-01', 'sha': 'sha-corpus-20261103-01', 'adx': 'adx-corpus-20261104-01',
                'xsave': 'xsave-corpus-20261104-01', 'i10': 'i10-corpus-20261030-01', 'rex': 'rex-corpus-20261102-02',
                'br66': 'br66-corpus-20261102-01', 'i7': 'i7-corpus-20261103-01'}
