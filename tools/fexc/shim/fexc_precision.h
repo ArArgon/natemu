@@ -712,7 +712,9 @@ template<class Emitter> inline void PlaceFmaSanitize(Emitter* IREmit) {
 // the IR before register allocation (the JIT sees registers only), conservatively: per value, the lowest byte from which its
 // register's bits are known zero (16: none), from its definition (UpperZeroFrom); a static register read (LoadRegister) has the
 // value stored to it earlier in the same code block, and nothing known otherwise (a value from before the block). The resident's
-// services inside a block (FexcX87Svc, FexcStringSvc) change no register. Cleared at each compile, as FexcMade.
+// x87 service inside a block (FexcX87Svc) changes no XMM register; FexcStringSvc writes scratch registers only and needs no entry.
+// Cleared at each compile, as FexcMade; keyed by node pointer, so it assumes one compile at a time (fexc is single-threaded) and
+// that each run of this pass is followed by its own JIT.
 inline std::set<const void*> UpperZeroOps;
 // `Z(arg)`: that byte for an argument already seen; `Stored`: the values the code block stored to the XMM static registers so far.
 template<class ZFn> inline uint32_t UpperZeroFrom(const FEXCore::IR::IROp_Header* Op, ZFn Z, FEXCore::IR::Ref const* Stored) {
