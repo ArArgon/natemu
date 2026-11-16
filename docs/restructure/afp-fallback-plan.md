@@ -147,11 +147,11 @@ direction: make the simple ones exact (D, and C's unmasked case), then look for 
 The NaN guard of A is being measured (§6). D and RSQRT's NaN sign ride on A's out-of-line stub (chunk 4b); C's
 unmasked case is a resident recomputation at the existing #XM stub.
 
-**Owner (November 16, after the second NaN-guard measurement and the exactness research, §6):** the costly exact
-behaviours move into a special opt-in mode, which accurate (80-bit) x87 will also join. The default mode stays fast:
-it keeps the cheap exact fixes (C unmasked; x87 masked DE for m32/m64; x87 NaN results; C's masked flag if the M2 has
-FP traps) and documents the rest as deviations on hosts without AFP. The special mode (a launch option, part of the
-compile key, so default code and the M4 stay byte-identical) holds A (with D and RSQRT's NaN sign), B for SSE, C's
+**Owner (November 16, after the second NaN-guard measurement and the exactness research, §6):** two floating-point
+modes, **fast** (the default) and **accurate**; accurate (80-bit) x87 joins accurate mode. Fast mode keeps the cheap
+exact fixes (on hosts without AFP: C unmasked; x87 masked DE for m32/m64; x87 NaN results; C's masked flag if the M2
+has FP traps) and documents the rest as deviations on hosts without AFP. Accurate mode (a launch option, part of the
+compile key, so fast-mode code is unchanged by its existence) holds A (with D and RSQRT's NaN sign), B for SSE, C's
 masked flag (if no traps), C's DAZ + FTZ result, and accurate x87 on every host. It gets its own reviewed plan; its
 cost is measured and documented, not gated.
 
