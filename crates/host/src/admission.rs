@@ -47,7 +47,13 @@ pub(crate) enum Detect {
     Present(&'static [(usize, u32)]),
     /// Apple's TSO bit: ACTLR_EL1 bit 1 reads back set after the resident's setup wrote it ([`crate::probe`] only).
     Tso,
+    /// Trapped FP exceptions: the six FPCR trap-enable bits ([`FPTRAPS_MASK`]) read back set after the host wrote them
+    /// ([`crate::probe`] only; `hw.optional.arm.FP_SyncExceptions` has no ID-register field).
+    FpTraps,
 }
+/// FPCR IOE (8), DZE (9), OFE (10), UFE (11), IXE (12), IDE (15): one per x86 exception (IE, ZE, OE, UE, PE, DE), RAZ/WI where
+/// unimplemented. All six are required: an unmasked x86 exception must trap whichever one the guest unmasks.
+pub(crate) const FPTRAPS_MASK: u64 = 0x9f00;
 /// What natemu does with a host feature (CPU-features plan section 2.2a). `Required` and `Exactness` are checked by the
 /// startup probe; the others only decide what fexc is told.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -151,9 +157,13 @@ pub(crate) const FEATURES: [Feature; 32] = [
     feature("x86_sse4a", Nothing, Setting, false),
 ];
 /// Machine needs that are not fexc features (no object bit, no `--feature`): the startup probe's own rows.
-pub(crate) const MACHINE: [(&str, Detect, Class); 6] = [
+pub(crate) const MACHINE: [(&str, Detect, Class); 7] = [
     ("lse2", Fields(&[(MMFR2, 32, 1)]), Required),
     ("apple_tso", Tso, Required),
+    // Arm: FEAT_FP_SyncExceptions has no name in the ID registers; macOS's `hw.optional.arm.FP_SyncExceptions`. Accurate FP mode
+    // (and fast mode's masked-UE flag) rely on the traps with no fallback. Not the `float_exceptions` row below (fexc's own
+    // feature, which stays off so code is unchanged).
+    ("fptraps", FpTraps, Required),
     // Armv8.0 FP and AdvSIMD (PFR0[19:16], [23:20]): every SSE-through-AVX2 form; 0xf means not implemented.
     ("fp", Present(&[(PFR0, 16)]), Required),
     ("advsimd", Present(&[(PFR0, 20)]), Required),
@@ -186,8 +196,8 @@ const fn str_eq(a: &str, b: &str) -> bool {
     }
     true
 }
-/// Whether `d` holds for ID register values `id` (`tso`: the TSO readback). Unverifiable never does.
-pub(crate) fn detected(d: &Detect, id: &[u64; ID_REGISTERS.len()], tso: bool) -> bool {
+/// Whether `d` holds for ID register values `id` (`tso`, `fptraps`: the readbacks). Unverifiable never does.
+pub(crate) fn detected(d: &Detect, id: &[u64; ID_REGISTERS.len()], tso: bool, fptraps: bool) -> bool {
     match d {
         Nothing => true,
         Fields(fields) => fields
@@ -196,13 +206,14 @@ pub(crate) fn detected(d: &Detect, id: &[u64; ID_REGISTERS.len()], tso: bool) ->
         Present(fields) => fields.iter().all(|&(r, shift)| (id[r] >> shift) & 15 != 15),
         Unverifiable => false,
         Tso => tso,
+        FpTraps => fptraps,
     }
 }
 
 /// Feature bits the vCPU with these ID register values can execute.
 pub(crate) fn supported_features(id: &[u64; ID_REGISTERS.len()]) -> u64 {
     (FEATURES.iter().enumerate())
-        .filter(|(_, f)| detected(&f.detect, id, true))
+        .filter(|(_, f)| detected(&f.detect, id, true, true))
         .fold(0, |bits, (i, _)| bits | 1 << i)
 }
 /// fexc `--feature` overrides that turn off every feature the vCPU lacks.

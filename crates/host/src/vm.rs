@@ -328,6 +328,7 @@ impl Drop for Machine {
 }
 
 pub(crate) const PC: u32 = 31;
+pub(crate) const FPCR: u32 = 32;
 pub(crate) const CPSR: u32 = 34;
 pub(crate) const ACTLR_EL1: u16 = 0xc081;
 const SCTLR_EL1: u16 = 0xc080;
