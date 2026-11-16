@@ -2436,6 +2436,19 @@ mod tests {
             0x1400_0000 | (store - b) as u32,
             "unrecorded memory access",
         );
+        // AFP accurate plan chunk 2b: the masked-DE screen's `cbz` skips the exact test forward; retargeted one word into the unmasked-IE check's
+        // window (past its `mrs x0, fpsr`) it enters the check from before it: refused. (Left as built it is admitted: the loop above.)
+        let hex = [0x0f, 0x58, 0xca];
+        let object = compile("0f58ca", &["--feature", "afp=0", "--accurate", "--simd-unmasked", "0x1"]);
+        let h: Header = super::super::record(&object, 0);
+        let word = |i: usize| u32::from_le_bytes(object[h.code_offset as usize + 4 * i..][..4].try_into().unwrap());
+        let words = (object.len() - h.code_offset as usize) / 4;
+        let target = |i: usize| i as i64 + sext(word(i) >> 5 & 0x7_ffff, 19);
+        let mrs = (0..words).rev().find(|&i| word(i) == 0xd53b_4420).expect("mrs x0, fpsr");
+        let skip = (0..mrs).rev().find(|&i| word(i) & 0x7f00_0000 == 0x3400_0000 && (i as i64) < target(i) && target(i) <= mrs as i64)
+            .expect("the screen's cbz");
+        let retargeted = word(skip) & !(0x7_ffff << 5) | ((mrs as i64 + 1 - skip as i64) as u32 & 0x7_ffff) << 5;
+        refused((&object, &hex), 4 * skip as u32, word(skip), retargeted, "floating-point stub");
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
