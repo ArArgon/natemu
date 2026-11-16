@@ -294,11 +294,20 @@ template<class Emitter> struct SoftDe {
   }
 };
 // The test of the SSE/AVX op at `Node` (rule `R`): a GPR, 0 or nonzero, placed before the op.
-template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEXCore::IR::Ref Node, const FEXCore::IR::IROp_Header* Op, const DeRule& R) {
+// `Spanned` (accurate mode's masked DE, chunk 2 B): the test is placed inside a span that FexcSimdSkip opens, which skips it when no
+// examined lane of a source is a zero or denormal (exponent field zero); the caller closes the span (FexcSimdSkipEnd) after the flag's
+// use. The screen covers a full 128-bit op or a scalar one; a 64-bit operand (a widening convert's low half) keeps the plain test.
+template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEXCore::IR::Ref Node, const FEXCore::IR::IROp_Header* Op, const DeRule& R, bool* Spanned = nullptr) {
   using namespace FEXCore::IR;
   auto View = IREmit->ViewIR();
   auto Arg = [&](int i) { return View.GetNode(Op->Args[R.Arg[i]]); };
   IREmit->SetWriteCursorBefore(Node);
+  if (Spanned && (R.Scalar || R.B == 16)) {
+    const int N = R.K == DeRule::Fma ? 3 : R.K == DeRule::Bin || R.K == DeRule::Div || R.K == DeRule::Pair || R.K == DeRule::Cadd ? 2 : 1;
+    Ref A = Arg(0);
+    IREmit->_FexcSimdSkip(OpSize::i128Bit, OpSz(R.E), A, N > 1 ? Arg(1) : A, N > 2 ? Arg(2) : A, N | (R.Scalar ? 1u << 8 : 0u));
+    *Spanned = true;
+  }
   SoftDe<Emitter> D(IREmit, R.E, R.B, R.Scalar);
   Ref M = nullptr;
   switch (R.K) {
@@ -538,8 +547,11 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           for (size_t i = 0; i < Insn.size(); ++i) {
             const auto* Op = IR.template GetOp<IROp_Header>(Insn[i].first);
             DeRule R;
-            if (!FexcMade.count(Insn[i].first) && DeRuleOf(Op, R))
-              if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R)) IREmit->_FexcSimdDe(F);
+            if (!FexcMade.count(Insn[i].first) && DeRuleOf(Op, R)) {
+              bool Spanned = false;
+              if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R, &Spanned)) IREmit->_FexcSimdDe(F);
+              if (Spanned) IREmit->_FexcSimdSkipEnd();
+            }
           }
         } else if (MaskedDe) {
           // DE masked: FSW.DE is set, nothing is raised. The flag is or-ed into the pending byte (the instruction's end commits it,
