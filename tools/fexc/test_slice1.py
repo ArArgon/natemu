@@ -1223,6 +1223,153 @@ def check_exits(test, d, tmp, what):
     return exits, '\n'.join(f'{o:4x}: {t}' for o, t in lines)
 
 
+# No-AFP scalar ops writing their register directly (FexcPrecision::MarkUpperZero): random straight-line sequences of scalar SSE/AVX
+# ops, the values that make a register's upper bits known zero (loads, zeroing idioms, MOVQ/MOVD, copies, scalar results) and the ones
+# that make them unknown (live-in registers with garbage upper bits, packed and shuffle ops, MOVSS/MOVSD/MOVLPD/MOVHPS merges, 256-bit
+# ops), run natively. The oracle is the code FEX compiles for a host with AFP (its scalar ops merge in hardware: FPCR.NEP) run under the
+# M4's FPCR, the code without AFP running with FPCR.AH too (else its default NaN differs, a deviation of its own); with $FEXC_OLD (a
+# compiler without the change), also that compiler's code without AFP, both with an M2's FPCR. Bit for bit.
+UZ_GPRS = [7, 5, 6, 8, 11, 12, 13, 14, 15, 19, 29, 26, 27]   # the static GPRs (rcx, rdx, ... PF, AF) but rax and the harness's x9 x10 x16 x17
+UZ_FORMS = [
+    # known zero above the element
+    'movsd {d}, qword ptr [rax+{o}]', 'movss {d}, dword ptr [rax+{o}]', 'movq {d}, qword ptr [rax+{o}]', 'movd {d}, dword ptr [rax+{o}]',
+    'movq {d}, rcx', 'movd {d}, ecx', 'xorps {d}, {d}', 'pxor {d}, {d}', 'vxorps {d}, {d}, {d}', 'movq {d}, {s}', 'vmovsd {d}, qword ptr [rax+{o}]',
+    'vmovss {d}, dword ptr [rax+{o}]',
+    # copies and merges
+    'movaps {d}, {s}', 'movapd {d}, {s}', 'movsd {d}, {s}', 'movss {d}, {s}', 'vmovsd {d}, {s}, {t}', 'vmovss {d}, {s}, {t}', 'vmovaps {d}, {s}',
+    'movlpd {d}, qword ptr [rax+{o}]', 'movhpd {d}, qword ptr [rax+{o}]', 'movlps {d}, qword ptr [rax+{o}]', 'movhps {d}, qword ptr [rax+{o}]',
+    # scalar ops
+    'addsd {d}, {s}', 'addss {d}, {s}', 'mulsd {d}, qword ptr [rax+{o}]', 'mulss {d}, {s}', 'subsd {d}, {s}', 'subss {d}, dword ptr [rax+{o}]',
+    'divsd {d}, qword ptr [rax+{o}]', 'divss {d}, dword ptr [rax+{o}]', 'minsd {d}, {s}', 'maxsd {d}, qword ptr [rax+{o}]', 'minss {d}, {s}',
+    'maxss {d}, {s}', 'sqrtsd {d}, qword ptr [rax+{o}]', 'sqrtss {d}, dword ptr [rax+{o}]', 'cvtss2sd {d}, {s}', 'cvtsd2ss {d}, {s}',
+    'cvtss2sd {d}, dword ptr [rax+{o}]', 'cvtsi2sd {d}, rcx', 'cvtsi2ss {d}, ecx', 'cvtsi2sd {d}, dword ptr [rax+{o}]', 'cmpsd {d}, {s}, {i8}',
+    'cmpss {d}, {s}, {i8}', 'roundsd {d}, {s}, {i16}', 'roundss {d}, {s}, {i16}', 'rcpss {d}, dword ptr [rax+{o}]',
+    'rsqrtss {d}, dword ptr [rax+{o}]', 'vaddsd {d}, {s}, {t}', 'vmulss {d}, {s}, {t}', 'vsubsd {d}, {s}, qword ptr [rax+{o}]',
+    'vdivss {d}, {s}, {t}', 'vminsd {d}, {s}, {t}', 'vmaxss {d}, {s}, {t}', 'vsqrtsd {d}, {s}, qword ptr [rax+{o}]', 'vcvtss2sd {d}, {s}, {t}',
+    'vcvtsd2ss {d}, {s}, {t}', 'vcvtsi2sd {d}, {s}, rcx', 'vcvtsi2ss {d}, {s}, ecx', 'vcmpsd {d}, {s}, {t}, {i32}', 'vcmpss {d}, {s}, {t}, {i8}',
+    'vroundsd {d}, {s}, {t}, {i16}', 'vfmadd231sd {d}, {s}, {t}', 'vfmadd213ss {d}, {s}, {t}', 'vfnmadd132sd {d}, {s}, {t}',
+    'vfmsub231ss {d}, {s}, {t}', 'vfnmsub213sd {d}, {s}, qword ptr [rax+{o}]',
+    # packed, bitwise and shuffles
+    'addpd {d}, {s}', 'mulps {d}, {s}', 'unpcklpd {d}, {s}', 'unpcklps {d}, {s}', 'shufpd {d}, {s}, {i4}', 'movlhps {d}, {s}', 'movhlps {d}, {s}',
+    'movups {d}, xmmword ptr [rax+{o16}]', 'pshufd {d}, {s}, {i256}', 'andpd {d}, {s}', 'xorpd {d}, {s}', 'andnpd {d}, {s}', 'orps {d}, {s}',
+    'andpd {d}, xmmword ptr [rax+{o16}]', 'xorps {d}, xmmword ptr [rax+{o16}]', 'vandpd {d}, {s}, {t}', 'insertps {d}, {s}, {i256}',
+    'vaddpd {D}, {S}, {T}', 'vxorpd {D}, {S}, {T}', 'vzeroupper', 'vbroadcastsd {D}, qword ptr [rax+{o}]',
+    # stores
+    'movsd qword ptr [rax+{o}], {s}', 'movups xmmword ptr [rax+{o16}], {s}', 'vmovups ymmword ptr [rax+{o16}], {S}',
+]
+UZ_SCALAR = re.compile(r'^v?(add|sub|mul|div|min|max|sqrt|cvtss2|cvtsd2|cvtsi2|cmp|round|rcp|rsqrt|fn?m(add|sub)\d+)s[sd]\b')
+_UZ_ASM = {}
+
+
+def x86_asm(lines):
+    """The bytes of `lines` (Intel syntax), assembled by clang for x86-64."""
+    key = tuple(lines)
+    if key not in _UZ_ASM:
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t) / 'a.s').write_text('.intel_syntax noprefix\n' + '\n'.join(lines) + '\n')
+            subprocess.run(['clang', '-c', '-target', 'x86_64-linux-gnu', str(Path(t) / 'a.s'), '-o', str(Path(t) / 'a.o')], check=True, capture_output=True)
+            f = (Path(t) / 'a.o').read_bytes()
+        shoff, = struct.unpack_from('<Q', f, 0x28)
+        shentsize, shnum, shstrndx = struct.unpack_from('<HHH', f, 0x3a)
+        secs = [struct.unpack_from('<IIQQQQIIQQ', f, shoff + i * shentsize) for i in range(shnum)]
+        names = secs[shstrndx][4]
+        text = next(x for x in secs if f[names + x[0]:f.index(b'\0', names + x[0])] == b'.text')
+        _UZ_ASM[key] = f[text[4]:text[4] + text[5]].hex()
+    return _UZ_ASM[key]
+
+
+def uz_block(fexc, hexs, *extra):
+    """(words up to the block's exit `svc`, their text, spill bytes) of `hexs` compiled by `fexc`; every instruction translated."""
+    r = subprocess.run([fexc, '--profile', 'slice1', '--hex', hexs, '--rip', hex(RIP), *extra], capture_output=True, text=True, timeout=120)
+    d = json.loads(r.stdout)
+    assert r.returncode == 0 and d['guest']['end']['reason'] == 'end_of_input', (hexs, extra, d['guest']['end'])
+    lay = d['code']['layout']
+    code = bytes.fromhex(d['code']['hex'])
+    lits = [(x['offset'], x['size']) for x in d['code']['relocations'] if x['kind'] == 'guest_rip_literal']
+    with tempfile.TemporaryDirectory() as t:
+        dis = check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+    b, e = lay['code_region_begin'], lay['code_region_end']
+    lines = [dis[o].strip() for o in range(b, e, 4)]
+    n = next(k for k, l in enumerate(lines) if l.startswith('svc'))
+    words = list(struct.unpack(f'<{n}I', code[b:b + 4 * n]))
+    for k, l in enumerate(lines[:n]):   # a branch to a stub (an unmasked exception's #XM, a guard) falls through: the state is compared
+        m = re.match(r'(b\.\w+|cbn?z|tbn?z) .*0x([0-9a-f]+)$', l)
+        if m and int(m.group(2), 16) >= b + 4 * n: words[k] = 0xd503201f
+    return words, lines[:n], lay['spill_bytes']
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpUpperZero(unittest.TestCase):
+    AFP0 = ('--feature', 'afp=0')
+
+    @staticmethod
+    def ins(lines):   # FEX's insert of a scalar result into the register (`mov.d v16[0], v0[0]`, `mov.s ...`)
+        return sum(bool(re.match(r'mov\.[hsd] v\d+\[0\], v0\[0\]$', l)) for l in lines)
+
+    def test_known_zero_destinations_lose_the_insert(self):
+        def ins(lines, *extra): return self.ins(uz_block(FEXC, x86_asm(lines), *self.AFP0, *extra)[1])
+        z = ['movsd xmm0, qword ptr [rax]']
+        self.assertEqual(ins(['addsd xmm0, xmm1']), 1)   # xmm0 live in: its bits 127:64 are the guest's
+        self.assertEqual(ins(z + ['cvtsd2ss xmm0, xmm1']), 1)   # bits 63:32 of the double stay
+        self.assertEqual(ins(['movss xmm0, dword ptr [rax]', 'cvtsd2ss xmm0, xmm1']), 0)
+        for op in ('addsd xmm0, xmm1', 'mulsd xmm0, qword ptr [rax+8]', 'sqrtsd xmm0, xmm1', 'minsd xmm0, xmm1', 'cvtss2sd xmm0, xmm1',
+                   'cvtsi2sd xmm0, rcx', 'cmpsd xmm0, xmm1, 1', 'roundsd xmm0, xmm1, 4', 'vfmadd231sd xmm0, xmm1, xmm2', 'divsd xmm0, xmm0'):
+            self.assertEqual(ins(z + [op]), 0, op)
+            for dirty in ('movhpd xmm0, qword ptr [rax+8]', 'unpcklpd xmm0, xmm1', 'addpd xmm0, xmm1', 'shufpd xmm0, xmm1, 1', 'movaps xmm0, xmm3'):
+                self.assertEqual(ins(z + [dirty, op]), 1, (dirty, op))
+        self.assertEqual(ins(['xorps xmm0, xmm0', 'cvtsi2ss xmm0, ecx', 'addss xmm0, xmm1', 'cvtss2sd xmm0, xmm0', 'addsd xmm0, xmm0']), 0)
+        self.assertEqual(ins(['cvtsi2ss xmm0, ecx']), 1)   # into a live-in destination
+        self.assertEqual(ins(['movss xmm0, dword ptr [rax]', 'addsd xmm0, xmm1']), 0)   # (bits 63:32 of the load are zero too)
+        self.assertEqual(ins(['movsd xmm0, qword ptr [rax]', 'addsd xmm0, xmm1', 'addss xmm0, xmm1']), 1)   # an sd result: bits 63:32 unknown
+        self.assertEqual(ins(['movsd xmm0, qword ptr [rax]', 'movss xmm0, xmm1', 'addsd xmm0, xmm1']), 0)   # merges into a zeroed register
+        self.assertEqual(ins(['movsd xmm0, qword ptr [rax]', 'movsd xmm0, xmm1', 'addsd xmm0, xmm1']), 0)
+        self.assertEqual(ins(['movsd xmm0, qword ptr [rax]', 'movsd xmm0, xmm1', 'addss xmm0, xmm1']), 1)   # bits 63:32 are xmm1's
+        self.assertEqual(ins(['movss xmm0, dword ptr [rax]', 'movq xmm0, xmm3', 'addss xmm0, xmm1']), 1)   # MOVQ keeps bits 63:32
+        self.assertEqual(ins(['movsd xmm2, qword ptr [rax]', 'vaddsd xmm0, xmm2, xmm1', 'mulsd xmm0, xmm1']), 0)   # VEX: src1's bits
+        self.assertEqual(ins(['vaddsd xmm0, xmm2, xmm1']), 1)
+        self.assertEqual(ins(['movsd xmm0, qword ptr [rax]', 'cmpneqsd xmm0, xmm1']), 1)   # NEQ/UNO/ORD insert themselves
+        self.assertEqual(ins(['movq xmm0, qword ptr [rax]', 'xorpd xmm0, xmmword ptr [rax+16]', 'addsd xmm0, xmm1']), 1)   # a 16-byte mask
+        self.assertEqual(ins(['movq xmm0, qword ptr [rax]', 'movq xmm3, qword ptr [rax+8]', 'xorpd xmm0, xmm3', 'addsd xmm0, xmm1']), 0)
+        self.assertEqual(ins(['movsd xmm0, qword ptr [rax]', 'addsd xmm0, xmm1'], '--daz', '--ftz'), 0)   # through the flushes
+        self.assertEqual(self.ins(uz_block(FEXC, x86_asm(['movsd xmm0, qword ptr [rax]', 'addsd xmm0, xmm1']))[1]), 0)   # AFP: no insert at all
+
+    def test_sequences_keep_every_bit(self):
+        rnd = random.Random(11)
+        old = os.environ.get('FEXC_OLD')
+        flt = lambda: struct.unpack('<I', struct.pack('<f', rnd.choice((1, -1)) * rnd.uniform(0.5, 100)))[0]
+        vec = lambda: sum(flt() << 32 * k for k in range(4))
+        n = removed = 0
+        for case in range(220):
+            regs = [f'xmm{k}' for k in range(6)]
+            lines = []
+            for _ in range(rnd.randint(3, 12)):
+                f = rnd.choice(UZ_FORMS)
+                d, s, t = rnd.choice(regs), rnd.choice(regs), rnd.choice(regs)
+                lines.append(f.format(d=d, s=s, t=t, D=d.replace('x', 'y', 1), S=s.replace('x', 'y', 1), T=t.replace('x', 'y', 1),
+                                      o=8 * rnd.randint(0, 15), o16=16 * rnd.randint(0, 7), i8=rnd.randint(0, 7), i32=rnd.randint(0, 31),
+                                      i16=rnd.randint(0, 15), i4=rnd.randint(0, 3), i256=rnd.randint(0, 255)))
+            hexs = x86_asm(lines)
+            extra = rnd.choice(((), (), ('--daz',), ('--ftz',), ('--simd-unmasked', '0x2')))
+            x = [rnd.getrandbits(64) for _ in range(32)]
+            x[4], x[7] = 0, vec() & (1 << 64) - 1   # rax: the memory operands (x4 = buf + 0x1000); rcx: two floats
+            v = [0] * 16 + [vec() for _ in range(16)]
+            buf = bytearray(8192)
+            for k in range(0x1000, 0x1100, 4): buf[k:k + 4] = struct.pack('<I', flt())
+            for k in range(0x1800, 0x1a00, 4): buf[k:k + 4] = struct.pack('<I', flt())   # (the frame's upper YMM halves and around)
+            words, text, spills = uz_block(FEXC, hexs, *self.AFP0, *extra)
+            self.assertEqual(spills, 0, lines)
+            run = lambda w, fpcr: native_run(w, x=x, v=v, buf=bytes(buf), ptrs=[(4, 0x1000)], fpcr=fpcr)
+            state = lambda r: ([r[0][k] for k in UZ_GPRS], r[1][16:], r[2])
+            # the AFP code ignores the keys (the M4's FPCR flushes: FIZ for DAZ, FZ for FTZ); AH for both, so their NaNs agree
+            afp = 6 | ('--daz' in extra) | ('--ftz' in extra) << 24
+            self.assertEqual(state(run(words, 2)), state(run(uz_block(FEXC, hexs, *extra)[0], afp)), (lines, extra))
+            if old: self.assertEqual(state(run(words, 0)), state(run(uz_block(old, hexs, *self.AFP0, *extra)[0], 0)), (lines, extra))
+            n += sum(bool(UZ_SCALAR.match(l)) for l in lines)
+            if old: removed += self.ins(uz_block(old, hexs, *self.AFP0, *extra)[1]) - self.ins(text)
+        self.assertGreater(n, 300)
+        if old: print(f'\nAfpUpperZero: {n} scalar ops, {removed} inserts removed against $FEXC_OLD', file=sys.stderr)
+
+
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class Slice1Exits(unittest.TestCase):
     def test_exit_sequences(self):
