@@ -5,9 +5,12 @@
 #include <fexc_hook.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
+#include "Interface/IR/RegisterAllocationData.h"
+#include <algorithm>
 #include <cstddef>
 #include <initializer_list>
 #include <set>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -698,6 +701,112 @@ template<class Emitter> inline void PlaceFmaSanitize(Emitter* IREmit) {
     Ref B2 = IREmit->_VAndn(Int, B, IREmit->_VAndn(Int, Bok, Cok));
     IREmit->ReplaceNodeArgument(Node, First, A2);
     IREmit->ReplaceNodeArgument(Node, First + 1, B2);
+  }
+}
+// ---------------------------------------------------------------------------------------------
+// Without FEAT_AFP (FPCR.NEP) an Arm scalar FP op zeroes its register above the element, so FEX computes x86's scalar op (which
+// keeps the destination's other bits: ADDSD/ADDSS and the other scalar SSE/AVX forms) into a temporary and inserts it (`ins`), an
+// extra FP/SIMD op per scalar op. When the bits above the element of the value that supplies them (argument 0: Vector1, an FMA's
+// Upper, VSToFGPRInsert's Vector) are known zero, the scalar op writes its register directly: the same 128 bits. `UpperZeroOps`
+// holds those ops (the JIT's VFScalarOperation, VFScalarUnaryOperation and VFScalarFMAOperation read it). Known zero is decided on
+// the IR before register allocation (the JIT sees registers only), conservatively: per value, the lowest byte from which its
+// register's bits are known zero (16: none), from its definition (UpperZeroFrom); a static register read (LoadRegister) has the
+// value stored to it earlier in the same code block, and nothing known otherwise (a value from before the block). The resident's
+// services inside a block (FexcX87Svc, FexcStringSvc) change no register. Cleared at each compile, as FexcMade.
+inline std::set<const void*> UpperZeroOps;
+// `Z(arg)`: that byte for an argument already seen; `Stored`: the values the code block stored to the XMM static registers so far.
+template<class ZFn> inline uint32_t UpperZeroFrom(const FEXCore::IR::IROp_Header* Op, ZFn Z, FEXCore::IR::Ref const* Stored) {
+  using namespace FEXCore::IR;
+  const uint32_t Size = OpSizeToSize(Op->Size), E = OpSizeToSize(Op->ElementSize);
+  // a 128-bit op replacing the low `Elem` bytes of argument 0 and keeping the rest (256-bit ops are split without SVE256)
+  auto Through = [&](uint32_t Elem) { return Size == 16 ? std::max(Elem, Z(Op->Args[0])) : 16u; };
+  auto Vec = [&](uint32_t F) { return Size == 16 ? F : Size < 16 ? std::min(8u, F) : 16u; };   // (under 16 bytes: `.8b`, the rest zeroed)
+  switch (Op->Op) {
+  // ldr b/h/s/d: MOVSS/MOVSD/MOVD/MOVQ xmm, m (FEX stores the node as the whole register: it relies on the zero bits already)
+  case OP_LOADMEM: return Op->C<IROp_LoadMem>()->Class == RegClass::FPR ? Size : 16;
+  case OP_LOADMEMTSO: return Op->C<IROp_LoadMemTSO>()->Class == RegClass::FPR ? Size : 16;
+  case OP_LOADNAMEDVECTORCONSTANT: return Op->C<IROp_LoadNamedVectorConstant>()->Constant == NamedVectorConstant::NAMED_VECTOR_ZERO ? 0 : 16;   // XORPS x, x
+  case OP_VCASTFROMGPR: return E;   // fmov s/d from a GPR (uxtb/uxth first): MOVD/MOVQ xmm, r
+  case OP_VMOV: return Size < 16 ? Size : Size == 16 ? Z(Op->Args[0]) : 16;   // under 16 bytes zero-extending (MOVQ xmm, xmm), else a copy
+  case OP_VINSELEMENT: return Op->C<IROp_VInsElement>()->DestIdx == 0 ? Through(E) : 16;   // MOVSS/MOVSD xmm, xmm (argument 0: DestVector)
+  case OP_FEXCFLUSH: return Z(Op->Args[0]);   // (it only clears bits: `bic`)
+  // bitwise (XORPD/ANDPD/ANDNPD with a mask: negation, fabs)
+  case OP_VAND: return Vec(std::min(Z(Op->Args[0]), Z(Op->Args[1])));
+  case OP_VOR: case OP_VXOR: return Vec(std::max(Z(Op->Args[0]), Z(Op->Args[1])));
+  case OP_VANDN: return Vec(Z(Op->Args[0]));   // Vector1 & ~Vector2
+  case OP_LOADREGISTER: {
+    const auto* L = Op->C<IROp_LoadRegister>();
+    return L->Class == RegClass::FPR && L->Reg < 16 && Stored[L->Reg] ? Z(Stored[L->Reg]) : 16;
+  }
+  case OP_VFADDSCALARINSERT: case OP_VFSUBSCALARINSERT: case OP_VFMULSCALARINSERT: case OP_VFDIVSCALARINSERT:
+  case OP_VFMINSCALARINSERT: case OP_VFMAXSCALARINSERT: case OP_VFSQRTSCALARINSERT: case OP_VFRSQRTSCALARINSERT:
+  case OP_VFRECPSCALARINSERT: case OP_VFTOFSCALARINSERT: case OP_VFTOISCALARINSERT: case OP_VFCMPSCALARINSERT:
+  case OP_VSTOFGPRINSERT: case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT:
+  case OP_VFNMLSSCALARINSERT:
+    return Through(E);
+  case OP_VSTOFVECTORINSERT: return Through(Op->C<IROp_VSToFVectorInsert>()->HasTwoElements ? 8 : E);   // (CVTPI2PS: two elements)
+  default: return 16;
+  }
+}
+// Ops with side effects that write no XMM static register (any other, a call or a service, ends what MarkUpperZero knows of them).
+inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op) {
+  using namespace FEXCore::IR;
+  switch (Op) {
+  case OP_DUMMY: case OP_INVALIDATEFLAGS: case OP_GUESTOPCODE: case OP_SETROUNDINGMODE: case OP_PUSHROUNDINGMODE:
+  case OP_POPROUNDINGMODE: case OP_STOREPF: case OP_STOREAF: case OP_LOADCONTEXTPAIR: case OP_STORECONTEXT: case OP_STORECONTEXTPAIR:
+  case OP_STORECONTEXTINDEXED: case OP_STORENZCV: case OP_LOADMEMPAIR: case OP_STOREMEM: case OP_STOREMEMPAIR: case OP_STOREMEMTSO:
+  case OP_VSTOREVECTORMASKED: case OP_VSTOREVECTORELEMENT: case OP_PUSH: case OP_PUSHTWO: case OP_POP: case OP_POPTWO:
+  case OP_FENCE: case OP_PREFETCH: case OP_VSTORENONTEMPORAL: case OP_VSTORENONTEMPORALPAIR: case OP_VLOADNONTEMPORAL:
+  case OP_CAS: case OP_CASPAIR: case OP_ATOMICSWAP: case OP_ATOMICFETCHADD: case OP_ATOMICFETCHSUB: case OP_ATOMICFETCHAND:
+  case OP_ATOMICFETCHCLR: case OP_ATOMICFETCHOR: case OP_ATOMICFETCHXOR: case OP_ATOMICFETCHNEG: case OP_INLINEENTRYPOINTOFFSET:
+  case OP_INLINECONSTANT: case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG:
+  case OP_RMIFNZCV: case OP_CONDADDNZCV: case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS:
+  case OP_ADCNZCV: case OP_SBBNZCV: case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ:
+  case OP_TESTZ: case OP_SHIFTFLAGS: case OP_ROTATEFLAGS: case OP_FCMP: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
+  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCFLUSH: case OP_FEXCMXCSR: case OP_FEXCREPSTOS: case OP_FEXCX87SVC:
+    return true;
+  default: return false;
+  }
+}
+// The scalar ops the JIT may write directly (run last before register allocation: after the flushes and the FMA sanitizing).
+template<class Emitter> inline void MarkUpperZero(Emitter* IREmit) {
+  using namespace FEXCore::IR;
+  UpperZeroOps.clear();
+  if (!fexc_no_afp) return;
+  auto View = IREmit->ViewIR();
+  std::vector<uint8_t> From(View.GetSSACount(), 16);
+  auto Z = [&](auto Node) -> uint32_t {
+    const uint32_t Id = [&] { if constexpr (std::is_same_v<decltype(Node), Ref>) return View.GetID(Node).Value; else return Node.ID().Value; }();
+    return Id < From.size() ? From[Id] : 16;
+  };
+  for (auto [BlockNode, BlockHeader] : View.GetBlocks()) {
+    Ref Stored[16] = {};
+    for (auto [CodeNode, IROp] : View.GetCode(BlockNode)) {
+      if (IROp->Op == OP_STOREREGISTER) {
+        const PhysicalRegister R(CodeNode);
+        if (R.AsRegClass() == RegClass::FPRFixed && R.Reg < 16) {
+          Stored[R.Reg] = OpSizeToSize(IROp->Size) == 16 ? View.GetNode(IROp->Args[0]) : nullptr;
+        }
+        continue;
+      }
+      if (HasSideEffects(IROp->Op) && !KeepsStaticFPRs(IROp->Op)) std::fill(std::begin(Stored), std::end(Stored), nullptr);
+      const uint32_t F = UpperZeroFrom(IROp, Z, Stored);
+      From[View.GetID(CodeNode).Value] = uint8_t(F);
+      switch (IROp->Op) {
+      case OP_VFCMPSCALARINSERT: {   // UNO, NEQ and ORD build their result in VTMP1 and insert it into Dst themselves: never direct
+        const auto C = IROp->template C<IROp_VFCMPScalarInsert>()->Op;
+        if (C != FloatCompareOp::EQ && C != FloatCompareOp::LT && C != FloatCompareOp::LE) continue;
+        break;
+      }
+      case OP_VSTOFVECTORINSERT: if (IROp->template C<IROp_VSToFVectorInsert>()->HasTwoElements) continue; break;   // (not a scalar op)
+      case OP_VFADDSCALARINSERT: case OP_VFSUBSCALARINSERT: case OP_VFMULSCALARINSERT: case OP_VFDIVSCALARINSERT:
+      case OP_VFMINSCALARINSERT: case OP_VFMAXSCALARINSERT: case OP_VFSQRTSCALARINSERT: case OP_VFRSQRTSCALARINSERT:
+      case OP_VFRECPSCALARINSERT: case OP_VFTOFSCALARINSERT: case OP_VFTOISCALARINSERT: case OP_VSTOFGPRINSERT:
+      case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT: case OP_VFNMLSSCALARINSERT: break;
+      default: continue;
+      }
+      if (OpSizeToSize(IROp->Size) == 16 && Z(IROp->Args[0]) <= OpSizeToSize(IROp->ElementSize)) UpperZeroOps.insert(CodeNode);
+    }
   }
 }
 } // namespace FexcPrecision

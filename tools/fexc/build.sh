@@ -11,7 +11,7 @@ case $build in /*) ;; *) build=$PWD/$build ;; esac   # git -C below would resolv
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 fex=$root/third_party/FEX
-pin=825426687cb09c920e9bcfafbbd887dfd695bbfd   # == third_party/FEX gitlink: 7e8f5ed (13e80cf (1df70f0 + non-AFP MINSS/MAXSS signalling compare) + FexcFlush) + FexcSimdCheckDe/FexcX87CheckDe (AFP fallback 3b)
+pin=726f3c0aa60ea0cb7407b4b66daed1a23d7781a2   # == third_party/FEX gitlink: 8254266 (7e8f5ed (13e80cf (1df70f0 + non-AFP MINSS/MAXSS signalling compare) + FexcFlush) + FexcSimdCheckDe/FexcX87CheckDe (AFP fallback 3b)) + non-AFP scalar direct write (MarkUpperZero)
 externals="fmt xxhash unordered_dense"
 # A symlinked third_party/FEX (a git worktree sharing the main checkout's initialised submodule) is used as it is: git refuses to
 # update a submodule path that is a symlink. The pin check below still applies.
