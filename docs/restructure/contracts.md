@@ -1043,6 +1043,24 @@ memory accesses and unknown opcodes.
 - Observable today: the startup `fp:` line; MXCSR/FSW flags and NaN results in the tagged cases.
 - Kind: design (`docs/restructure/afp-fallback-plan.md`).
 
+**67. The floating-point mode is one process-wide choice, carried in `Cpu` and keyed only where it changes code.**
+- `--fp fast|accurate` (`natemu`; `NATEMU_FP` for it and for the test driver; the flag wins; anything else is refused with one line)
+  fixes the mode for the process. The host sets `Cpu::accurate_fp` once per vCPU in `execution::run`, beside `Cpu::no_afp`; the
+  resident never writes it and every copy of the bank carries it.
+- `Cpu::code_context` bit 32 is accurate mode AND no AFP (`accurate_key`). Block and step requests carry fexc's `--accurate`
+  (and a step `--exact-step`) exactly when it is set, so on a host with AFP, accurate mode changes no context, request, gating
+  value or code. fexc refuses either argument with AFP and resets both per request. The context word is 64 bits wide in the
+  resident's cache, the template pool's key and the publication tag, so the two modes share no compiled code.
+- The startup line is `natemu: fp: accurate mode` (no degraded note: without AFP the code is exact, with AFP it is unchanged) or
+  `natemu: fp: fast mode[, degraded (host lacks FEAT_AFP)]`; the program driver's result reports `fp` (`fast` or `accurate`) and
+  `afp`, which the runners judge from (`tools/fp_deviations.py`).
+- Enforced by: the AFP identity unit test (fast and accurate mode, block and step requests), `without_afp_accurate_mode_sets_bit_32_and_the_arguments_exactly_then`,
+  abi `accurate_mode_keys_bit_32_only_without_afp`, probe `accurate_mode_names_itself_on_every_host`, `tools/fexc/test_serve.py` (the
+  accurate and exact-step sequence), the replay identity gate.
+- Grid: every compiler change; every runner in both modes.
+- Observable today: the startup `fp:` line; the driver's `fp` field. Accurate mode's behaviour itself comes with chunks 2-5.
+- Kind: design (`docs/restructure/afp-accurate-plan.md`).
+
 ## 2. Internal-only assertions and their replacements
 
 The plan admits four replacement forms: a guest-visible outcome, a contract

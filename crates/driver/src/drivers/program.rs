@@ -1130,6 +1130,9 @@ pub(crate) struct Args {
     /// does (off), or it answers and the walk is made too, a difference counted (check; check-halt stops at one)
     #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check|check-halt", default_value = "on", value_parser = natemu::execution::parse_page_currency)]
     page_currency: u64,
+    /// Floating-point mode (AFP accurate plan chunk 1): fast (the default) or accurate; every runner selects it with `NATEMU_FP`
+    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", value_parser = natemu::execution::parse_fp)]
+    fp: bool,
     #[arg(long = "strict-unassigned")]
     strict: bool,
     /// A test device's page (repeatable)
@@ -1479,6 +1482,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         check_reuse,
         pool,
         page_currency,
+        fp,
         strict,
         device_at,
         irq_source,
@@ -1853,6 +1857,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     natemu_abi::cpu_profile::XCR0_RESET
                 },
                 no_afp: 0,
+                accurate_fp: 0,
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,
@@ -1911,6 +1916,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         // The suites' code-shape option also checks every answer reused at another RIP (perf chunk 4).
         compiler.check_reuse = code_shape || check_reuse;
         compiler.page_currency = page_currency;
+        compiler.accurate_fp = fp;
         // (Local links stay under the code-shape check: the programs' values test them; `--check-reuse` alone makes none.)
         compiler.pic_check_local = code_shape;
         // PIC study: the test programs run at CPL 0 too; every privilege level's templates are shared when a second address
@@ -2760,7 +2766,7 @@ fn report(
         vcpu: area.vcpu(),
         tso: shared.actlr & 2 != 0,
         afp: s.cpu.no_afp == 0,
-        fp: FP_MODE,
+        fp: fp_mode(s.cpu.accurate_fp != 0),
         stop: kind,
         reason,
         gpr: hexes(&s.cpu.gpr),
@@ -2869,7 +2875,10 @@ fn report(
 
 /// One vCPU's result line (or `cpus` entry): its final state, its space's memory and A/D bits, and its counters; the
 /// run adds its kicks and, where it made a device access, `mmio`.
-const FP_MODE: &str = "fast";
+/// The result's `fp`: the mode the vCPU ran in (`Cpu::accurate_fp`, set from `--fp` / `NATEMU_FP` in `execution::run`).
+const fn fp_mode(accurate: bool) -> &'static str {
+    if accurate { "accurate" } else { "fast" }
+}
 
 #[derive(Serialize)]
 struct CpuResult {
@@ -2878,7 +2887,7 @@ struct CpuResult {
     /// What the probe decided (after `NATEMU_FEXC_FEATURE_OFF`): the host has FEAT_AFP. AFP accurate plan chunk 0: the runners
     /// judge the documented deviations from this and `fp`, not from their own environment.
     afp: bool,
-    /// The floating-point mode (`fast`; accurate mode joins in chunk 1).
+    /// The floating-point mode the vCPU ran in: `fast` or `accurate` (what `Cpu::accurate_fp` says, whatever the host).
     fp: &'static str,
     stop: &'static str,
     reason: String,
@@ -3292,6 +3301,7 @@ mod tests {
                 fcw: exec::FCW_INIT,
                 xcr0: 1,
                 no_afp: 0,
+                accurate_fp: 0,
             },
         );
         s.fetch = [0x5000, u64::MAX];
@@ -3373,7 +3383,7 @@ mod json_tests {
             vcpu: 1,
             tso: true,
             afp: false,
-            fp: FP_MODE,
+            fp: fp_mode(false),
             stop: "guest_fault",
             reason: reason.into(),
             gpr: (0..16).map(|_| Hex(next())).collect(),

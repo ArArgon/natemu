@@ -1966,7 +1966,7 @@ impl Answer {
     }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-pub(crate) const GATING: usize = 13;
+pub(crate) const GATING: usize = 15;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -2439,8 +2439,11 @@ pub struct Compiler {
     pub(crate) alignment_gated: bool,
     /// The vCPU's x87 gating and rounding (I6, [`x87_args`]) and its unmasked floating-point exceptions (I5c): fexc's
     /// `--x87-gated`, `--wait-gated`, `--x87-fpcr`, `--simd-unmasked`, `--x87-unmasked`, and (without AFP) `--daz` and `--ftz`
-    /// arguments.
+    /// arguments, and (AFP accurate plan chunk 1) `--accurate` and, for a step, `--exact-step`.
     pub(crate) x87: Vec<String>,
+    /// AFP accurate plan chunk 1: the process runs in accurate floating-point mode (`--fp accurate`). Fixed for the process; the
+    /// vCPU's [`exec::Cpu::accurate_fp`] is set from it in [`run`], and only a host without AFP then changes code (key bit 32).
+    pub accurate_fp: bool,
     /// Perf chunk 15: a translate request at CPL 0 (never a step): fexc's `--cpl0`, under which it translates the one-byte
     /// CLI and STI inline (the CPL is part of `Cpu::code_context`, so such a block runs only at CPL 0).
     pub(crate) cpl0: bool,
@@ -2475,7 +2478,7 @@ const AFP: usize = admission::index("afp");
 /// same state is part of `Cpu::code_context`. AFP fallback chunk 1: the FPCR words follow `cpu.no_afp`, which must agree with
 /// `supported`'s afp bit (the value fexc is told: [`run`] sets the one from the other, so a disagreement is a host bug that
 /// would key shared code wrongly).
-pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64) -> Vec<String> {
+pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64, step: bool) -> Vec<String> {
     assert_eq!(
         cpu.no_afp != 0,
         supported & 1 << AFP == 0,
@@ -2507,6 +2510,14 @@ pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64) -> Vec<String> {
     ] {
         if on != 0 {
             args.push(name.into());
+        }
+    }
+    // AFP accurate plan chunk 1: accurate mode without AFP only (`code_context` bit 32, the same condition), so accurate mode on an
+    // AFP host changes no request; `--exact-step` only in a step request. fexc accepts both and does nothing with them yet.
+    if exec::accurate_key(cpu.accurate_fp, cpu.no_afp) != 0 {
+        args.push("--accurate".into());
+        if step {
+            args.push("--exact-step".into());
         }
     }
     args
@@ -2630,6 +2641,7 @@ impl Compiler {
             avx_gated: false,
             alignment_gated: false,
             x87: vec![],
+            accurate_fp: false,
             cpl0: false,
             tsc: false,
             cpl3: false,
@@ -2675,7 +2687,7 @@ impl Compiler {
     }
     /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, (I5c) the
     /// unmasked SIMD and x87 exceptions, (perf chunk 15) CPL 0 and the inline TSC, (perf chunk 26) bulk REP STOS, and
-    /// (AFP fallback chunk 3a) DAZ and effective FTZ.
+    /// (AFP fallback chunk 3a) DAZ and effective FTZ, and (AFP accurate plan chunk 1) accurate mode and its exact step.
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
@@ -2701,6 +2713,8 @@ impl Compiler {
             self.bulk.into(),
             flag("--daz"),
             flag("--ftz"),
+            flag("--accurate"),
+            flag("--exact-step"),
         ]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
@@ -3524,6 +3538,15 @@ pub fn parse_writable_on_read(text: &str) -> std::result::Result<bool, String> {
     }
 }
 
+/// `--fp`'s (and `NATEMU_FP`'s) value: whether the floating-point mode is accurate (AFP accurate plan chunk 1) or fast (the default).
+pub fn parse_fp(text: &str) -> std::result::Result<bool, String> {
+    match text {
+        "fast" => Ok(false),
+        "accurate" => Ok(true),
+        other => Err(format!("--fp {other}: fast or accurate")),
+    }
+}
+
 /// Runs the vCPU (entered at the resident, see [`enter`]) until it stops; `stop_at` is a RIP at
 /// which execution stops at a block boundary (blocks are fetched up to it, and
 /// never cached at it, so reaching it is a miss). A vCPU that stays in the guest
@@ -3548,6 +3571,8 @@ pub fn run(
     // `NATEMU_FEXC_FEATURE_OFF`), before the first lookup or compile; every vCPU's run starts here (the loader's and the
     // drivers' `Cpu` values predate the probe and carry 0).
     state.cpu.no_afp = u64::from(compiler.supported & 1 << AFP == 0);
+    // AFP accurate plan chunk 1: the mode, once, in the same place (`code_context` bit 32 is it AND `no_afp`).
+    state.cpu.accurate_fp = u64::from(compiler.accurate_fp);
     area.write_record(exec::STATE_OFFSET, state);
     // Perf chunk 10: reuse inside the resident, checked against the host's answers under the reuse check, and never into
     // a range the hook answers at (off when there are more of them than the resident keeps).
@@ -3991,7 +4016,7 @@ fn translation(
         };
         compiler.sse_gated = sse_gated(&state.cpu);
         compiler.avx_gated = avx_gated(&state.cpu);
-        compiler.x87 = x87_args(&state.cpu, compiler.supported);
+        compiler.x87 = x87_args(&state.cpu, compiler.supported, step);
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
         compiler.cpl0 = state.cpu.cpl == 0 && !step;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
@@ -4727,7 +4752,8 @@ mod tests {
     fn shared_answers_keep_colliding_keys_apart() {
         let a = Answers::new(u64::MAX);
         let g = [0; GATING];
-        let sse = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut sse = [0; GATING];
+        sse[0] = 1;
         a.insert(
             None,
             entry(0x1100, 0, &[1, 2, 3, 4, 5], 0, g),
@@ -6328,6 +6354,10 @@ mod tests {
         assert_eq!(cpu.no_afp, 0);
         cpu.cr0 |= exec::CR0_MP;
         let (mut tested, mut keyed) = (0u64, 0u64);
+        let mut compilers = [(); 2].map(|_| {
+            let one = || Compiler::with_features(Path::new("fexc"), afp, None);
+            (one(), one())
+        });
         for mxcsr in 0..1u64 << 16 {
             for fpsr in 0..=0xffu64 {
                 assert_eq!(
@@ -6341,12 +6371,12 @@ mod tests {
             // AFP fallback chunk 3a: the DAZ and FTZ keys exist only without AFP (the context bits and fexc's `--daz`/`--ftz`);
             // with AFP the words compared below (no key bit, no argument) are the old ones.
             let off = Cpu { no_afp: 1, ..cpu };
-            let args = x87_args(&off, u64::MAX & !(1 << AFP));
+            let args = x87_args(&off, u64::MAX & !(1 << AFP), false);
             assert_eq!(args.iter().any(|a| a == "--daz"), mxcsr >> 6 & 1 == 1, "{mxcsr:#x}");
             assert_eq!(args.iter().any(|a| a == "--ftz"), mxcsr >> 15 & mxcsr >> 11 & 1 == 1, "{mxcsr:#x}");
             assert_eq!(off.code_context() >> 30, mxcsr >> 6 & 1 | (mxcsr >> 15 & mxcsr >> 11 & 1) << 1, "{mxcsr:#x}");
             assert_eq!(cpu.code_context() >> 30, 0);
-            assert!(!x87_args(&cpu, afp).iter().any(|a| a == "--daz" || a == "--ftz"));
+            assert!(!x87_args(&cpu, afp, false).iter().any(|a| a == "--daz" || a == "--ftz"));
             // FCW: every RC (bits 11:10) with every combination of the six masks (5:0); precision control and the rest fixed.
             for rc in 0..4u64 {
                 for masks in 0..1u64 << 6 {
@@ -6363,10 +6393,21 @@ mod tests {
                         "code_context {fcw:#x} {mxcsr:#x}"
                     );
                     assert_eq!(
-                        x87_args(&cpu, afp),
+                        x87_args(&cpu, afp, false),
                         before_no_afp::x87_args(&cpu),
                         "x87_args {fcw:#x} {mxcsr:#x}"
                     );
+                    // AFP accurate plan chunk 1: accurate mode on an AFP host changes nothing: the context, the block request's and
+                    // the step request's arguments and the gating values are those of fast mode (and so the old ones). `fpcr`,
+                    // `x87_fpcr` and `mxcsr_flags` take no mode (their signatures are the proof; compared above).
+                    let accurate = Cpu { accurate_fp: 1, ..cpu };
+                    assert_eq!(accurate.code_context(), cpu.code_context(), "code_context {fcw:#x} {mxcsr:#x}");
+                    for (step, (fast_c, accurate_c)) in [false, true].into_iter().zip(&mut compilers) {
+                        let args = x87_args(&cpu, afp, step);
+                        assert_eq!(x87_args(&accurate, afp, step), args, "step {step}: x87_args {fcw:#x} {mxcsr:#x}");
+                        (fast_c.x87, accurate_c.x87) = (args, x87_args(&accurate, afp, step));
+                        assert_eq!(fast_c.gating(), accurate_c.gating(), "step {step}: gating {fcw:#x} {mxcsr:#x}");
+                    }
                     tested += 1;
                     keyed += u64::from(exec::x87_fpcr(fcw, mxcsr, false) != 0);
                 }
@@ -6385,7 +6426,7 @@ mod tests {
         for mxcsr in [0x1f80u64, 0x1f80 | 3 << 13, 0x1f80 | 1 << 15, 0x1f80 | 1 << 6, 0x1f80 | 3 << 13 | 1 << 15 | 1 << 6, 0] {
             for fcw in [exec::FCW_INIT, exec::FCW_INIT | 1 << 10, exec::FCW_INIT | 3 << 10, 0x3f | 2 << 10] {
                 (cpu.mxcsr, cpu.fcw) = (mxcsr, fcw);
-                let args = x87_args(&cpu, no_afp);
+                let args = x87_args(&cpu, no_afp, false);
                 let fpcr = exec::x87_fpcr(fcw, mxcsr, true);
                 assert_eq!(fpcr & 7, 0, "no AH, NEP or FIZ");
                 assert_eq!(args.iter().any(|a| a == "--x87-fpcr"), fpcr != 0);
@@ -6397,13 +6438,62 @@ mod tests {
         }
         // The default 1F80H with RC nearest: nothing is sent and nothing is keyed, as on an AFP host.
         (cpu.mxcsr, cpu.fcw) = (exec::MXCSR_RESET, exec::FCW_INIT);
-        assert_eq!(x87_args(&cpu, no_afp), Vec::<String>::new());
+        assert_eq!(x87_args(&cpu, no_afp, false), Vec::<String>::new());
         assert_eq!(cpu.code_context(), Cpu { no_afp: 0, ..cpu }.code_context());
         for (bit, supported) in [(0, no_afp), (1, u64::MAX)] {
             let cpu = Cpu { no_afp: bit, ..cpu };
-            let e = std::panic::catch_unwind(|| x87_args(&cpu, supported)).unwrap_err();
+            let e = std::panic::catch_unwind(|| x87_args(&cpu, supported, false)).unwrap_err();
             let e = e.downcast_ref::<String>().cloned().unwrap_or_default();
             assert!(e.contains("disagrees"), "{e}");
+        }
+    }
+
+    /// AFP accurate plan chunk 1: without AFP, accurate mode sets `code_context` bit 32 and sends `--accurate` (and `--exact-step`
+    /// in a step request) exactly then; fast mode and accurate mode on an AFP host send and set neither; and the two modes share
+    /// no compiled code: the context, the request body (the persistent cache's key and the in-memory answers' gating), the
+    /// pool's key differ.
+    #[test]
+    fn without_afp_accurate_mode_sets_bit_32_and_the_arguments_exactly_then() {
+        let no_afp = u64::MAX & !(1 << AFP);
+        let afp = u64::MAX;
+        let mut cpu = Cpu { no_afp: 1, ..test_cpu(0x1000) };
+        for mxcsr in [0x1f80u64, 0x1f80 | 3 << 13, 0x1f80 | 1 << 15 | 1 << 6, 0] {
+            for fcw in [exec::FCW_INIT, exec::FCW_INIT | 3 << 10, 0x3f | 2 << 10] {
+                (cpu.mxcsr, cpu.fcw) = (mxcsr, fcw);
+                let (fast, accurate) = (Cpu { accurate_fp: 0, ..cpu }, Cpu { accurate_fp: 1, ..cpu });
+                // Bit 32 alone is the difference, and no other bit moves.
+                assert_eq!(fast.code_context() >> 32, 0);
+                assert_eq!(accurate.code_context() >> 32, 1);
+                assert_eq!(accurate.code_context() & !(1 << 32), fast.code_context());
+                for step in [false, true] {
+                    let (f, a) = (x87_args(&fast, no_afp, step), x87_args(&accurate, no_afp, step));
+                    let mut with = f.clone();
+                    with.push("--accurate".into());
+                    if step {
+                        with.push("--exact-step".into());
+                    }
+                    assert_eq!(a, with, "step {step}: the mode's arguments follow the rest");
+                    assert!(!f.iter().any(|x| x == "--accurate" || x == "--exact-step"));
+                    // The two modes' requests differ, so a persistent-cache key and an in-memory answer differ.
+                    let compiler = |args: Vec<String>| {
+                        let mut c = Compiler::with_features(Path::new("fexc"), no_afp, None);
+                        c.x87 = args;
+                        c
+                    };
+                    let (cf, ca) = (compiler(f), compiler(a));
+                    assert_ne!(cf.body_with(&[0x90], "0x1000".into(), None), ca.body_with(&[0x90], "0x1000".into(), None));
+                    assert_ne!(cf.gating(), ca.gating());
+                    assert_eq!(ca.gating()[GATING - 2..], [1, u64::from(step)]);
+                }
+                // The pool's key and the publication tag hash the whole 64-bit word.
+                let key = |c: &Cpu| natemu_abi::pool::Key::new(c.code_context(), 0x1000, &[0x90], 1);
+                assert_ne!(key(&fast), key(&accurate));
+                assert_ne!(crate::publisher::context_tag_of(fast.code_context()), crate::publisher::context_tag_of(accurate.code_context()));
+                // Accurate mode on an AFP host, and fast mode anywhere, send and set nothing of the mode.
+                let on_afp = Cpu { no_afp: 0, accurate_fp: 1, ..cpu };
+                assert_eq!(on_afp.code_context() >> 32, 0);
+                assert!(!x87_args(&on_afp, afp, true).iter().any(|x| x == "--accurate" || x == "--exact-step"));
+            }
         }
     }
 
@@ -6434,6 +6524,7 @@ mod tests {
             fcw: exec::FCW_INIT,
             xcr0: 1,
             no_afp: 0,
+            accurate_fp: 0,
         }
     }
 
@@ -6729,6 +6820,7 @@ mod tests {
                 fcw: exec::FCW_INIT,
                 xcr0: 1,
                 no_afp: 0,
+                accurate_fp: 0,
             },
         );
         s.fetch = [0x5000, u64::MAX];

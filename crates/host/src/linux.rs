@@ -109,6 +109,8 @@ pub struct Boot {
     /// host must have FEAT_SB (checked in [`Boot::prepare`]) and IA32_ARCH_CAPABILITIES advertises RDCL_NO when the host
     /// also has FEAT_CSV3, so a default command line then boots with PTI off. `--speculation-barriers` / `NATEMU_SPECULATION_BARRIERS`.
     pub speculation_barriers: bool,
+    /// AFP accurate plan chunk 1: accurate floating-point mode (`Compiler::accurate_fp`; `--fp accurate` / `NATEMU_FP`). Default fast.
+    pub accurate_fp: bool,
     /// Expose the modern virtio entropy device (native entropy, copied completions).
     pub rng: bool,
     /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
@@ -150,6 +152,7 @@ impl Boot {
             writable_on_read: true,
             code_shape: false,
             speculation_barriers: false,
+            accurate_fp: false,
             rng: false,
             disk: None,
             net: false,
@@ -309,6 +312,7 @@ impl Boot {
             watchdog: self.watchdog,
             launch: crate::probe::Launch {
                 speculation_barriers: self.speculation_barriers,
+                accurate_fp: self.accurate_fp,
                 pool: self.pool,
                 compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
             },
@@ -317,6 +321,7 @@ impl Boot {
             page_currency: self.page_currency,
             writable_on_read: self.writable_on_read,
             code_shape: self.code_shape,
+            accurate_fp: self.accurate_fp,
             ran: AtomicBool::new(false),
             cancel: Arc::default(),
             serial_input: Mutex::new(None),
@@ -351,6 +356,7 @@ pub struct Prepared {
     page_currency: u64,
     writable_on_read: bool,
     code_shape: bool,
+    accurate_fp: bool,
     /// [`Prepared::run`] has started: the backing is used.
     ran: AtomicBool,
     /// The run's cancellation flag ([`Prepared::canceller`]).
@@ -522,6 +528,7 @@ impl Prepared {
             compiler.page_currency = self.page_currency;
             compiler.writable_on_read = self.writable_on_read;
             compiler.shape = self.code_shape;
+            compiler.accurate_fp = self.accurate_fp;
             let mut requests = execution::Requests {
                 devices: Some(self.devices.clone()),
                 ..Default::default()
