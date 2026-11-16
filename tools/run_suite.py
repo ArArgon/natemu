@@ -91,10 +91,23 @@ class Step:
 
 
 def i8b_judge(out):
+    """i8b passes with exactly the 7 known QEMU departures. In a run that judges the documented fast-mode deviations (a host without
+    AFP: tools/fp_deviations.py) a known departure that is also tagged is `deviated` against the model's state instead of failing;
+    each known departure must still fail or be deviated, and nothing else may fail."""
     try: res = json.loads((out / 'results.json').read_text())['results']
     except (OSError, ValueError, KeyError) as e: return False, f'no results.json ({e})'
     bad = {r['name'] for r in res if r['outcome'] == 'fail'}
-    return bad == I8B_KNOWN, 'the 7 known QEMU departures' if bad == I8B_KNOWN else f'failures {sorted(bad)}, known {sorted(I8B_KNOWN)}'
+    deviated = {r['name'] for r in res if r['outcome'] == 'deviated'}
+    ok = bad <= I8B_KNOWN and I8B_KNOWN - bad == deviated & I8B_KNOWN
+    return ok, 'the known QEMU departures' + (f' ({len(bad)} fail, {len(I8B_KNOWN & deviated)} deviated as documented)' if deviated else ' (7)') if ok else \
+        f'failures {sorted(bad)}, known {sorted(I8B_KNOWN)}, known deviated {sorted(I8B_KNOWN & deviated)}'
+
+
+def deviated_note(log):
+    """The runner's own count of cases judged against a documented deviation (tools/fp_deviations.py), for the results line."""
+    try: lines = [l for l in log.read_text(errors='replace').splitlines() if 'deviated as documented' in l]
+    except OSError: return ''
+    return re.sub(r'^.*?(\d+ deviated as documented)', r'\1', lines[-1]) if lines else ''
 
 
 def steps(F, O):
@@ -244,6 +257,7 @@ class Suite:
             with self.lock: self.procs.discard(p)
         ok, note = rc == 0, ''
         if rc == 1 and s.judge: ok, note = s.judge(self.O / 'out' / s.name)
+        if ok and (d := deviated_note(log)) and d not in note: note = f'{note}; {d}' if note else d
         return ok, rc, time.monotonic() - t, log, note
 
     def record(self, s, r, rerun=None):

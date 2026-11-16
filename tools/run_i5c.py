@@ -23,7 +23,7 @@ judge these cases: the expectations are the SDM's.
 import argparse, json, pathlib, struct, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
-import run_slice1_vm as vm1, ref
+import run_slice1_vm as vm1, ref, fp_deviations as dev
 
 D = 0x200000
 CODE = 0x10000
@@ -38,10 +38,18 @@ E30, E100 = 0x30800000, 0x0d800000                    # 2^-30, 2^-100
 lanes = lambda *v: (v[0] | v[1] << 32, v[2] | v[3] << 32) if len(v) == 4 else (v[0] | (v[1] if len(v) > 1 else 0) << 32, 0)
 
 
-def case(name, lines, setup=(), want=None, at=None, check=None, cpl=3, ne=True):
-    """`want`: None (reach the hlt), ('fault', vector) at line `at` (default the last of `lines`), ('stop', reason)."""
+def case(name, lines, setup=(), want=None, at=None, check=None, cpl=3, ne=True, mx=None):
+    """`want`: None (reach the hlt), ('fault', vector) at line `at` (default the last of `lines`), ('stop', reason).
+    `mx`: the structured expected MXCSR of a SIMD case (`mxc`): judged by `judge` through tools/fp_deviations.py, which tags a case
+    with a documented deviation of fast mode on a host without AFP; `check` keeps everything that is not MXCSR."""
     return {'name': name, 'lines': list(lines) + AFTER, 'setup': list(setup) + (['ne 1'] if ne else []), 'want': want,
-            'at': len(lines) - 1 if at is None else at, 'check': check, 'cpl': cpl}
+            'at': len(lines) - 1 if at is None else at, 'check': check, 'cpl': cpl, 'mx': mx}
+
+
+def mxc(want, start=MX):
+    """A SIMD case's expected MXCSR at the end (an int, or a tuple of acceptable values) and its starting one (the driver's reset value
+    unless the setup says `mxcsr`)."""
+    return dev.make_mx(start, want)
 
 
 def xmm_of(vm, n):
@@ -116,16 +124,15 @@ def simd_cases():
     out = []
     regs = lambda x: [f'xmm {n} {lo:#x} {hi:#x}' for n, (lo, hi) in x.items()]
     def one(name, insn, x, mxcsr, flags, fault, dest, prelude=(), extra=(), ymm=False):
-        def check(vm, x=x, mxcsr=mxcsr, flags=flags, dest=dest, fault=fault):
+        def check(vm, x=x, dest=dest, fault=fault):
             p = []
-            if int(vm['mxcsr'], 0) != mxcsr | flags: p.append(f"mxcsr {vm['mxcsr']}, want {mxcsr | flags:#x}")
             if fault and dest is not None and xmm_of(vm, dest) != x[dest]: p.append(f'xmm{dest} written: {xmm_of(vm, dest)}')
             if fault and int(vm['rflags'], 0) & 0x8d5: p.append(f"rflags {vm['rflags']}: the instruction's flags written")
             if fault and ymm and [int(v, 0) for v in vm['ymmh'][2 * dest:2 * dest + 2]] != list(lanes(ONE, ONE, ONE, ONE)): p.append(f"ymm upper {vm['ymmh'][2 * dest:2 * dest + 2]}")
             return p
         vex = insn.startswith('v') or any(l.startswith('v') for l in prelude)
         return case(name, list(prelude) + [insn], ['sse 1', f'mxcsr {mxcsr:#x}', f'gpr-rbx 0x7fffffff'] + (['xcr0 7'] if vex and 'xcr0 7' not in extra else []) + regs(x) + list(extra),
-                    ('fault', fault) if fault else None, check=check)
+                    ('fault', fault) if fault else None, check=check, mx=mxc(mxcsr | flags, mxcsr))
     for name, insn, x, raised, tiny, dest in FORMS:
         out.append(one(f'{name}-masked', insn, x, MX, raised, None, dest))
         triggers = [f for f in (IE, DE, ZE, OE, UE, PE) if raised & f] + ([UE] if tiny else [])
@@ -152,12 +159,12 @@ def simd_cases():
     ld = lambda v: [f'memory {D + 0x280:#x} {struct.pack("<I", v).hex()}']
     out.append(case('ldmxcsr-rekey', ['divss xmm1, xmm2', 'ldmxcsr dword ptr [rdi + 0x80]', 'addss xmm3, xmm3', 'movaps xmm1, xmm4', 'divss xmm1, xmm2'],
                     ['sse 1', f'xmm 1 {ONE:#x} 0', 'xmm 2 0 0', f'xmm 3 {ONE:#x} 0', f'xmm 4 {ONE:#x} 0'] + ld(0x1d84), ('fault', 19),
-                    check=lambda vm: [] if int(vm['mxcsr'], 0) == 0x1d84 else [f"mxcsr {vm['mxcsr']}"]))
+                    mx=mxc(0x1d84)))
     out.append(case('ldmxcsr-flag-set-no-fault', ['ldmxcsr dword ptr [rdi + 0x80]', 'addss xmm3, xmm3'],
-                    ['sse 1', f'xmm 3 {ONE:#x} 0'] + ld(0x1d84), None, check=lambda vm: [] if int(vm['mxcsr'], 0) == 0x1d84 else [f"mxcsr {vm['mxcsr']}"]))
+                    ['sse 1', f'xmm 3 {ONE:#x} 0'] + ld(0x1d84), None, mx=mxc(0x1d84)))
     out.append(case('ldmxcsr-remask', ['ldmxcsr dword ptr [rdi + 0x80]', 'divss xmm1, xmm2', 'ldmxcsr dword ptr [rdi + 0x84]', 'movaps xmm1, xmm4', 'divss xmm1, xmm2'],
                     ['sse 1', f'xmm 1 {ONE:#x} 0', 'xmm 2 0 0', f'xmm 4 {ONE:#x} 0', f'memory {D + 0x280:#x} {struct.pack("<II", 0x1f80, 0x1d80).hex()}'], ('fault', 19),
-                    check=lambda vm: [] if int(vm['mxcsr'], 0) == 0x1d84 else [f"mxcsr {vm['mxcsr']}"]))
+                    mx=mxc(0x1d84)))
     # AFP fallback plan section 5 (mixed modes): LDMXCSR switches DAZ, and FTZ, on and off within one program; each switch re-keys
     # the code, so the same multiply flushes or not as the current mode says (host without AFP: software flushes or FZ; with
     # AFP: the hardware's). Results are saved in xmm6, xmm7 and xmm3.
@@ -170,25 +177,22 @@ def simd_cases():
             for dest, flushed in zip((6, 7, 3), finals):
                 lo = xmm_of(vm, dest)[0] & 0xffffffff
                 if (lo == 0) != flushed: p.append(f'xmm{dest} {lo:#x}: {"not " if flushed else ""}flushed, want the opposite')
-            if int(vm['mxcsr'], 0) != mxcsr: p.append(f"mxcsr {vm['mxcsr']}, want {mxcsr:#x}")
             return p
-        out.append(case(name, lines, ['sse 1', f'xmm 5 {x[0]:#x} 0', f'xmm 2 {x[1]:#x} 0', f'memory {D + 0x280:#x} {struct.pack("<III", *modes).hex()}'], None, check=check))
+        out.append(case(name, lines, ['sse 1', f'xmm 5 {x[0]:#x} 0', f'xmm 2 {x[1]:#x} 0', f'memory {D + 0x280:#x} {struct.pack("<III", *modes).hex()}'], None, check=check, mx=mxc(mxcsr)))
     mixed('mixed-daz-on-off-on', (MX | 0x40, MX, MX | 0x40), (DEN, TWO), (True, False, True), MX | 0x40)        # den * 2: zero under DAZ, else 2 * den
     mixed('mixed-ftz-on-off-with-daz', (MX | 0x8000, MX, MX | 0x8000 | 0x40), (E100 | 1, E30), (True, False, True), 0x8000 | MX | 0x40 | UE | PE)   # the last flags are from the last mode only
     img = bytearray(512); img[0:2] = (0x37f).to_bytes(2, 'little'); img[24:28] = (0x1d80).to_bytes(4, 'little'); img[28:32] = (0xffff).to_bytes(4, 'little')
     out.append(case('fxrstor-unmasked-mxcsr', ['fxrstor [rsi]', f'mov eax, {ONE}', 'movd xmm1, eax', 'xorps xmm2, xmm2', 'divss xmm1, xmm2'],
-                    ['sse 1', f'memory {D + 0x1000:#x} {img.hex()}'], ('fault', 19),
-                    check=lambda vm: [] if int(vm['mxcsr'], 0) == 0x1d84 else [f"mxcsr {vm['mxcsr']}"]))
+                    ['sse 1', f'memory {D + 0x1000:#x} {img.hex()}'], ('fault', 19), mx=mxc(0x1d84)))
     out.append(case('vldmxcsr-unmasked', ['vldmxcsr dword ptr [rdi + 0x80]', 'vdivss xmm1, xmm1, xmm2'],
-                    ['sse 1', 'xcr0 7', f'xmm 1 {ONE:#x} 0', 'xmm 2 0 0'] + ld(0x1d80), ('fault', 19),
-                    check=lambda vm: [] if int(vm['mxcsr'], 0) == 0x1d84 else [f"mxcsr {vm['mxcsr']}"]))
+                    ['sse 1', 'xcr0 7', f'xmm 1 {ONE:#x} 0', 'xmm 2 0 0'] + ld(0x1d80), ('fault', 19), mx=mxc(0x1d84)))
     # Without CR4.OSXMMEXCPT: #UD, the flags set (11.5.3.2 step 2). At CPL 0, OSXMMEXCPT cleared first.
     cr4 = ['mov rax, cr4', 'btr rax, 10', 'mov cr4, rax']
     out.append(case('no-osxmmexcpt-ud', cr4 + ['divss xmm1, xmm2'], ['sse 1', f'mxcsr {MX & ~(ZE << 7):#x}', f'xmm 1 {ONE:#x} 0', 'xmm 2 0 0'],
-                    ('fault', 6), cpl=0, check=lambda vm: ([] if int(vm['mxcsr'], 0) == (MX & ~(ZE << 7)) | ZE else [f"mxcsr {vm['mxcsr']}"]) +
-                    ([] if xmm_of(vm, 1) == (ONE, 0) else ['xmm1 written'])))
+                    ('fault', 6), cpl=0, check=lambda vm: [] if xmm_of(vm, 1) == (ONE, 0) else ['xmm1 written'],
+                    mx=mxc((MX & ~(ZE << 7)) | ZE, MX & ~(ZE << 7))))
     out.append(case('no-osxmmexcpt-masked-runs', cr4 + ['divss xmm1, xmm2'], ['sse 1', f'xmm 1 {ONE:#x} 0', 'xmm 2 0 0'], None, cpl=0,
-                    check=lambda vm: [] if int(vm['mxcsr'], 0) == MX | ZE else [f"mxcsr {vm['mxcsr']}"]))
+                    mx=mxc(MX | ZE)))
     # FPSR does not leak from an instruction that raises nothing (RCPPS's exact division of 1/0) into the next one's check.
     out.append(one('rcpps-then-checked', 'addss xmm1, xmm2', {1: lanes(ONE), 2: lanes(ONE), 4: (0, 0)}, MX & ~0x1f80, 0, None, 1,
                    prelude=['rcpps xmm3, xmm4']))
@@ -203,14 +207,12 @@ def simd_cases():
     c = one('vdpps-ymm-steps', 'vdpps ymm1, ymm1, ymm2, 0x11', {1: lanes(MAXF, 0, 0, 0), 2: lanes(TWO, 0, 0, 0)}, MX & ~(IE << 7), IE, 19, 1,
             prelude=['vinsertf128 ymm1, ymm1, xmmword ptr [rdi + 0x80], 1', 'vinsertf128 ymm2, ymm2, xmmword ptr [rdi + 0x90], 1'],
             extra=[f'memory {D + 0x280:#x} {hi}', 'xcr0 7'])
-    one_order = c['check']
-    c['check'] = lambda vm, f=one_order: f(vm) if int(vm['mxcsr'], 0) != (MX & ~(IE << 7)) | IE | OE | PE else f({**vm, 'mxcsr': hex((MX & ~(IE << 7)) | IE)})
+    c['mx'] = mxc(((MX & ~(IE << 7)) | IE, (MX & ~(IE << 7)) | IE | OE | PE), MX & ~(IE << 7))
     out.append(c)
     # XRSTOR re-keys as FXRSTOR does (the SSE component loads MXCSR).
     x = bytearray(832); x[24:28] = (0x1d80).to_bytes(4, 'little'); x[28:32] = (0xffff).to_bytes(4, 'little'); x[512:520] = (2).to_bytes(8, 'little')
     out.append(case('xrstor-unmasked-mxcsr', ['mov eax, 2', 'xor edx, edx', 'xrstor [rsi]', f'mov eax, {ONE}', 'movd xmm1, eax', 'xorps xmm2, xmm2', 'divss xmm1, xmm2'],
-                    ['sse 1', 'xcr0 7', f'memory {D + 0x1000:#x} {x.hex()}'], ('fault', 19),
-                    check=lambda vm: [] if int(vm['mxcsr'], 0) == 0x1d84 else [f"mxcsr {vm['mxcsr']}"]))
+                    ['sse 1', 'xcr0 7', f'memory {D + 0x1000:#x} {x.hex()}'], ('fault', 19), mx=mxc(0x1d84)))
     # Review cases (independent I5c review): VCVTPS2PH's upper lanes one by one; FMA inf * 0 + QNaN (no IE: SDM Vol.1 Table
     # 14-17); VCVTPH2PS of a half denormal (no DE); VCVTPS2PH of a single denormal (DE, UE, PE); CVT(T)PS2PI mm, xmm read only
     # xmm's low two floats (SDM CVTPS2PI: the upper two raise nothing, masked or not).
@@ -349,7 +351,7 @@ def simd_cases():
     # x87 arithmetic leaves MXCSR alone and does not trip a SIMD check (its own FPSR wrapper).
     out.append(case('x87-between-simd', ['fninit', 'fld1', 'fldz', 'fdivp st(1), st(0)', 'addss xmm3, xmm3', 'fstp st(0)'],
                     ['sse 1', f'mxcsr {MX & ~(ZE << 7):#x}', f'xmm 3 {ONE:#x} 0'], None,
-                    check=lambda vm: [] if int(vm['mxcsr'], 0) == MX & ~(ZE << 7) else [f"mxcsr {vm['mxcsr']}"]))
+                    mx=mxc(MX & ~(ZE << 7), MX & ~(ZE << 7))))
     return out
 
 
@@ -609,18 +611,48 @@ def judge(c, vm, offsets):
             problems.append(f"fault {vm['stop']} {vm['reason']} {vm['fault']} rip {vm['rip']}, want vector {want[1]} at {rip:#x}")
     elif not vm1.at_hlt(vm, CODE + offsets[-1]):
         problems.append(f"did not reach hlt: {vm['stop']} {vm['reason']} {vm['fault']} rip {vm['rip']}")
-    if c['check'] and not problems:
-        problems += c['check'](vm)
-    return problems
+    kind = 'ok'
+    if not problems:
+        if c['check']: problems += c['check'](vm)
+        if c['mx']:
+            kind, why = dev.mxcsr_verdict(c['mx'], vm, int(vm['mxcsr'], 0))
+            if why: problems.append(why)
+    return problems, ('fail' if problems else kind)
+
+
+TAGGED = 21      # the cases tagged `masked-sse-de`: 21 of 417 (update with the case list)
+
+
+def self_check():
+    cs = cases()
+    simd = [c['mx'] for c in cs if c['mx']]
+    tagged = [m for m in simd if m['tag']]
+    if len(tagged) != TAGGED: sys.exit(f'run_i5c self-check FAILED: {len(tagged)} tagged cases, expected {TAGGED}')
+    dev.self_check(tagged[0], next(m for m in simd if not m['tag'] and not isinstance(m['want'], tuple)), 'run_i5c')
+    # `judge` itself: a case tagged masked-sse-de reaches its hlt with the deviated MXCSR, as a report of a host without AFP.
+    c = next(c for c in cs if c['mx'] and c['mx']['tag'] and c['want'] is None)
+    code, labels = ref.assemble('\n'.join(f'{l}\nl{i}:' for i, l in enumerate(c['lines'])), labels=True)
+    offsets = [0] + [labels[f'l{i}'] for i in range(len(c['lines']) - 1)]
+    vm = lambda mx, **r: {'stop': 'resident', 'reason': 'halted', 'rip': hex(CODE + offsets[-1] + 1), 'mxcsr': hex(mx), 'fault': [], **r}
+    w, d = c['mx']['want'], dev.deviated_mxcsr(c['mx']['want'])
+    for report, mx, kind in (({'afp': False, 'fp': 'fast'}, d, 'deviated'), ({'afp': False, 'fp': 'fast'}, w, 'fail'),
+                             ({'afp': False, 'fp': 'fast'}, d ^ 1, 'fail'), ({'afp': True, 'fp': 'fast'}, w, 'ok'),
+                             ({'afp': True, 'fp': 'fast'}, d, 'fail'), ({'afp': False, 'fp': 'accurate'}, d, 'fail')):
+        got = judge(c, vm(mx, **report), offsets)[1]
+        if got != kind: sys.exit(f"run_i5c self-check FAILED: judge({c['name']}, {report}, mxcsr {mx:#x}) is {got}, want {kind}")
+    print(f'{len(cs)} cases ({len(simd)} SIMD), {len(tagged)} tagged masked-sse-de')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--fexc', type=pathlib.Path, required=True); ap.add_argument('--out', type=pathlib.Path, required=True)
+    ap.add_argument('--fexc', type=pathlib.Path); ap.add_argument('--out', type=pathlib.Path)
     ap.add_argument('--max-block', type=int); ap.add_argument('--only'); ap.add_argument('--host'); ap.add_argument('--runtime')
+    ap.add_argument('--self-check', action='store_true', help='no VM: the case tags and the judging rule (tools/fp_deviations.py)')
     a = ap.parse_args()
+    if a.self_check: return self_check()
+    if not (a.fexc and a.out): ap.error('--fexc and --out are required')
     host, runtime = (a.host, a.runtime) if a.host else vm1.build()
-    results, bad = [], 0
+    results, counts, reports = [], dev.Counts(), set()
     for c in cases():
         if a.only and a.only not in c['name']: continue
         code, labels = ref.assemble('\n'.join(f'{l}\nl{i}:' for i, l in enumerate(c['lines'])), labels=True)
@@ -629,12 +661,17 @@ def main():
         (work / 'program.txt').write_text(description(c, code))
         run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + ([str(a.max_block)] if a.max_block else []) +
                              vm1.CODE_SHAPE, capture_output=True, text=True)
-        problems = [f'driver: {run.stderr.strip()[-300:]}'] if run.returncode else judge(c, json.loads(run.stdout), offsets)
-        bad += bool(problems)
-        results.append({'name': c['name'], 'ok': not problems, 'problems': problems})
+        if run.returncode: problems, kind = [f'driver: {run.stderr.strip()[-300:]}'], 'fail'
+        else:
+            vm = json.loads(run.stdout)
+            reports.add((vm.get('afp'), vm.get('fp')))
+            problems, kind = judge(c, vm, offsets)
+        tag = c['mx'] and c['mx']['tag']
+        counts.add(kind, tag)
+        results.append({'name': c['name'], 'ok': not problems, 'outcome': kind, 'tag': tag, 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400])
     (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
-    print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')
-    sys.exit(1 if bad else 0)
+    print(f'afp/fp as reported: {sorted(reports, key=str)}: ' + counts.line())
+    sys.exit(1 if counts.bad else 0)
 
 if __name__ == '__main__': main()

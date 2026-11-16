@@ -4,6 +4,7 @@ rules below and against natemu's own run of the same program cut before the inst
 set CR0/CR4/XCR0 and its fault state lacks the vector registers).
 
     tools/with-env python3 tools/run_i8_faults.py --fexc FEXC --out DIR [--max-block N] [--only SUBSTR]
+    python3 tools/run_i8_faults.py --self-check        (no VM: the case tags and the judging rule's mutation checks)
 
 Each case: a prelude (YMM0..15's upper halves loaded by VINSERTI128 from the data, so they are not zero; then any control
 changes at CPL 0), one VEX instruction, then instructions that must not run. Expected (SDM Vol.2 2.4/2.5/2.8 and each
@@ -20,6 +21,9 @@ instruction's exception table; Vol.3 6.15):
     (I10: delivered); VLDMXCSR/VSTMXCSR run LDMXCSR/STMXCSR's transaction under the AVX gating;
   - the YMM upper halves exact at a fault right after register-only vector instructions (they stay cached there);
   - HADD/HSUB with two QNaNs: the SDM's operand order (HADD high element first) with the first-source rule.
+On a host without FEAT_AFP in fast mode (the run's own report says `afp` false and `fp` fast) a case that expects DE with DE
+masked is judged against the documented deviation `masked-sse-de` (tools/fp_deviations.py): the exact MXCSR with DE clear;
+the exact MXCSR then fails. Everywhere else every case is judged exactly.
 At a fault: RIP the instruction, and the general registers, XMM, the YMM upper halves, MXCSR and the data region exactly as
 in the run cut before the instruction (nothing committed: a crossing store wrote no byte). A case without a fault reaches its
 `hlt`.
@@ -27,7 +31,7 @@ in the run cut before the instruction (nothing committed: a crossing store wrote
 import argparse, json, pathlib, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
-import run_slice1_vm as vm1, ref
+import run_slice1_vm as vm1, ref, fp_deviations as dev
 from run_i5a_faults import D, CODE, XMM, GPR0, NONCANON, PRELUDE, AFTER
 
 YMMH = [f'vinserti128 ymm{i}, ymm{i}, xmmword ptr [{D + 0x600 + 16 * i}], 1' for i in range(16)]
@@ -246,7 +250,21 @@ def run(a, host, runtime, c, lines, tag):
     return json.loads(r.stdout), offsets, None
 
 
+RESET_MXCSR = 0x1f80     # the driver's MXCSR before every program (these cases never set `mxcsr`)
+
+
+def mx_of(c):
+    """The structured expected MXCSR of a case that judges it (`want` = ['mxcsr', value]), else None."""
+    return dev.make_mx(RESET_MXCSR, c['want'][1]) if c['want'] and c['want'][0] == 'mxcsr' else None
+
+
 def judge(a, host, runtime, c):
+    """(problems, kind): kind is ok, deviated (as documented) or fail."""
+    res = judge_state(a, host, runtime, c)
+    return res if isinstance(res, tuple) else (res, 'fail' if res else 'ok')
+
+
+def judge_state(a, host, runtime, c):
     lines = c['pre'] + c['lines'] + AFTER
     vm, offsets, err = run(a, host, runtime, c, lines, c['name'])
     if vm is None: return [f'driver: {err}']
@@ -273,8 +291,9 @@ def judge(a, host, runtime, c):
         ok = vm1.at_hlt(vm, CODE + offsets[-1]) and m == want[2]
         return [] if ok else [f"memory {m} ({vm['stop']} {vm['reason']}), want {want[2]}"]
     if want[0] == 'mxcsr':
-        ok = vm1.at_hlt(vm, CODE + offsets[-1]) and int(vm['mxcsr'], 0) == want[1]
-        return [] if ok else [f"mxcsr {vm['mxcsr']} ({vm['stop']} {vm['reason']}), want {want[1]:#x}"]
+        if not vm1.at_hlt(vm, CODE + offsets[-1]): return [f"did not reach hlt: {vm['stop']} {vm['reason']} {vm['fault']} rip {vm['rip']}"]
+        kind, why = dev.mxcsr_verdict(mx_of(c), vm, int(vm['mxcsr'], 0))
+        return ([why] if why else []), kind
     if want[0] == 'roundtrip':
         cut, _, err = run(a, host, runtime, c, c['pre'] + ['hlt'], c['name'] + '-cut')
         if cut is None: return [f'cut run: {err}']
@@ -307,21 +326,37 @@ def judge(a, host, runtime, c):
     return problems
 
 
+TAGGED = 8       # the cases tagged `masked-sse-de`: 8 of 846 (update with the case list)
+
+
+def self_check():
+    cs = cases()
+    simd = [mx_of(c) for c in cs if c['want'] and c['want'][0] == 'mxcsr']
+    tagged = [m for m in simd if m['tag']]
+    if len(tagged) != TAGGED: sys.exit(f'run_i8_faults self-check FAILED: {len(tagged)} tagged cases, expected {TAGGED}')
+    dev.self_check(tagged[0], next(m for m in simd if not m['tag']), 'run_i8_faults')
+    print(f'{len(cs)} cases, {len(tagged)} tagged masked-sse-de')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--fexc', type=pathlib.Path, required=True); ap.add_argument('--out', type=pathlib.Path, required=True)
+    ap.add_argument('--fexc', type=pathlib.Path); ap.add_argument('--out', type=pathlib.Path)
+    ap.add_argument('--self-check', action='store_true')
     ap.add_argument('--max-block', type=int); ap.add_argument('--no-build', action='store_true'); ap.add_argument('--only')
     a = ap.parse_args()
+    if a.self_check: return self_check()
+    if not (a.fexc and a.out): ap.error('--fexc and --out are required')
     host, runtime = (ROOT / 'target/release/natemu-host', ROOT / 'target/aarch64-unknown-none/release/natemu-runtime') if a.no_build else vm1.build()
-    results, bad = [], 0
+    results, counts = [], dev.Counts()
     for c in cases():
         if a.only and a.only not in c['name']: continue
-        problems = judge(a, host, runtime, c)
-        bad += bool(problems)
-        results.append({'name': c['name'], 'insn': c['insn'], 'ok': not problems, 'problems': problems})
+        problems, kind = judge(a, host, runtime, c)
+        m = mx_of(c)
+        counts.add(kind, m and m['tag'])
+        results.append({'name': c['name'], 'insn': c['insn'], 'ok': kind != 'fail', 'outcome': kind, 'tag': m and m['tag'], 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400], flush=True)
     (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
-    print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')
-    sys.exit(1 if bad else 0)
+    print(counts.line())
+    sys.exit(1 if counts.bad else 0)
 
 if __name__ == '__main__': main()

@@ -2759,6 +2759,8 @@ fn report(
     Ok(CpuResult {
         vcpu: area.vcpu(),
         tso: shared.actlr & 2 != 0,
+        afp: s.cpu.no_afp == 0,
+        fp: FP_MODE,
         stop: kind,
         reason,
         gpr: hexes(&s.cpu.gpr),
@@ -2867,10 +2869,17 @@ fn report(
 
 /// One vCPU's result line (or `cpus` entry): its final state, its space's memory and A/D bits, and its counters; the
 /// run adds its kicks and, where it made a device access, `mmio`.
+const FP_MODE: &str = "fast";
+
 #[derive(Serialize)]
 struct CpuResult {
     vcpu: usize,
     tso: bool,
+    /// What the probe decided (after `NATEMU_FEXC_FEATURE_OFF`): the host has FEAT_AFP. AFP accurate plan chunk 0: the runners
+    /// judge the documented deviations from this and `fp`, not from their own environment.
+    afp: bool,
+    /// The floating-point mode (`fast`; accurate mode joins in chunk 1).
+    fp: &'static str,
     stop: &'static str,
     reason: String,
     gpr: Vec<Hex>,
@@ -3363,6 +3372,8 @@ mod json_tests {
         CpuResult {
             vcpu: 1,
             tso: true,
+            afp: false,
+            fp: FP_MODE,
             stop: "guest_fault",
             reason: reason.into(),
             gpr: (0..16).map(|_| Hex(next())).collect(),
@@ -3501,9 +3512,11 @@ mod json_tests {
         let kind = r.stop;
         let reason = &r.reason;
         let mut out = format!(
-            "{{\"vcpu\":{},\"tso\":{},\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"xmm\":[{}],\"mxcsr\":\"{:#x}\",\"memory\":[",
+            "{{\"vcpu\":{},\"tso\":{},\"afp\":{},\"fp\":\"{}\",\"stop\":\"{kind}\",\"reason\":\"{reason}\",\"gpr\":[{}],\"rip\":\"{:#x}\",\"rflags\":\"{:#x}\",\"xmm\":[{}],\"mxcsr\":\"{:#x}\",\"memory\":[",
             r.vcpu,
             r.tso,
+            r.afp,
+            r.fp,
             list(&r.gpr),
             r.rip.0,
             r.rflags.0,
