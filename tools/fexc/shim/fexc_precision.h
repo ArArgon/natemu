@@ -130,6 +130,18 @@ inline void Prescan(const FEXCore::IR::IRListView& IR) {
 //     else, and resumes after the instruction; #MF follows at the next waiting instruction).
 // The x87 check's operands are the lowering's fexc_x87_extra (fexc_hook.h).
 // SSE/AVX ops that may raise an MXCSR flag (the I5a/I8 lowerings; x87 instructions' ops are the x87 wrapper's).
+// natemu slice1 (no AFP): the multiply of ADDSUB's lowering (Src2 by the named constant (-1, 1, -1, 1); the dispatcher's
+// ADDSUBPOpImpl) is exact (by 1.0 and -1.0) and not an x86 operation: no DE test and no DAZ/FTZ flush of its own (an FTZ flush of the
+// exact product would raise UFC where x86 raises nothing); the add that follows takes both for the product, which a denormal Src2
+// makes a denormal as well.
+template<class View> inline bool IsAddSubMul(View& IR, const FEXCore::IR::IROp_Header* Op) {
+  using namespace FEXCore::IR;
+  if (Op->Op != OP_VFMUL) return false;
+  const auto* K = IR.template GetOp<IROp_Header>(Op->Args[1]);
+  if (K->Op != OP_LOADNAMEDVECTORCONSTANT) return false;
+  const auto C = K->template C<IROp_LoadNamedVectorConstant>()->Constant;
+  return C == NamedVectorConstant::NAMED_VECTOR_PADDSUBPS_MUL || C == NamedVectorConstant::NAMED_VECTOR_PADDSUBPD_MUL;
+}
 inline bool SimdFPOp(FEXCore::IR::IROps Op) {
   using namespace FEXCore::IR;
   switch (Op) {
@@ -537,7 +549,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           for (size_t i = 0; i < First; ++i) {
             const auto* Op = IR.template GetOp<IROp_Header>(Insn[i].first);
             DeRule R;
-            if (!FexcMade.count(Insn[i].first) && DeRuleOf(Op, R))
+            if (!FexcMade.count(Insn[i].first) && !IsAddSubMul(IR, Op) && DeRuleOf(Op, R))
               if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R)) Des.push_back({i, F});
           }
         } else if (X87 && (uint64_t(fexc_x87_unmasked) >> 1 & 1)) {
@@ -734,7 +746,7 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
     for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
       if (IROp->Op == OP_GUESTOPCODE) { Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset; continue; }
       FlushRule R;
-      if (Rip != ~0ull && !fexc_x87.count(Rip) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip});
+      if (Rip != ~0ull && !fexc_x87.count(Rip) && !IsAddSubMul(IR, IROp) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip});
     }
   }
   if (Ops.empty()) return;
