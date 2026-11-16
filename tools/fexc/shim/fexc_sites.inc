@@ -497,10 +497,57 @@ void Arm64JITCore::FexcTinyLanes(ARMEmitter::VRegister R, uint32_t Elem, uint32_
   (void)Bind(&Done);
 }
 
+// AFP fallback (default mode, hosts without AFP): the NaN result of an x87 arithmetic op. FPCR.AH = 0 returns the positive default NaN
+// where x86 has the negative "real indefinite", and picks an SNaN operand before a QNaN one where AH = 1 (the M4's, and natemu's) takes
+// the first NaN operand, quieted. Both differing cases raise IOC, and FexcX87End has just read FPSR into x0 (TMP1), so one `tbz` on
+// IOC skips the fix-up: with AH = 1's rule applied to the Arm op's own operands (the first operand if a NaN, else the second, quieted;
+// else the negative default NaN), the M2 equals the M4. IOC where the result is right (an SNaN first operand) gets the same answer.
+// The op's destination may overwrite a source, so a source it aliases is copied first (VTMP1, VTMP2: the scalar ops use neither).
+// Scalar double ops only (what the x87 lowering emits); FLD m64's multiply by 1.0 (an SNaN is quieted either way) has none.
+//   hot path: [mov v16, src1] [mov v17, src2]  op  ...FexcX87End...  tbz x0, #0, done
+//   fix-up:   fmov x1, S1; ubfx x2, x1, #0, #63; movz x3, #0x7ff0, lsl #48; sub x2, x3, x2; tbnz x2, #63, first;
+//             [fmov x1, S2; ubfx x2, x1, #0, #63; sub x2, x3, x2; tbnz x2, #63, first;] movz x1, #0xfff8, lsl #48; b put;
+//             first: orr x1, x1, #(1 << 51); put: fmov Dd, x1; done:
+bool Arm64JITCore::FexcX87NanOp(const IR::IROp_Header* IROp) {
+  using IR::IROps;
+  if (!fexc_no_afp || !FexcX87Op(IROp)) return false;
+  if (IROp->Op != IROps::OP_VFADD && IROp->Op != IROps::OP_VFSUB && IROp->Op != IROps::OP_VFMUL && IROp->Op != IROps::OP_VFDIV &&
+      IROp->Op != IROps::OP_VFSQRT) return false;
+  if (IROp->Size != IR::OpSize::i64Bit || IROp->ElementSize != IR::OpSize::i64Bit) return false;
+  return IROp->Op == IROps::OP_VFSQRT || (IR->GetOp<IR::IROp_Header>(IROp->Args[0])->Op != IROps::OP_VCASTFROMGPR &&
+                                          IR->GetOp<IR::IROp_Header>(IROp->Args[1])->Op != IROps::OP_VCASTFROMGPR);
+}
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
   if (FexcQuietOp(IROp)) msr(ARMEmitter::SystemRegister::FPSR, TMP4);
   if (fexc_slice1) FexcTinyCheck(IROp, Node);
   if (FexcX87Op(IROp)) FexcX87End();
+  if (FexcX87NanOp(IROp)) {
+    const bool Unary = IROp->Op == IR::OP_VFSQRT;
+    const auto Dst = GetVReg(Node);
+    const auto A = GetVReg(IROp->Args[0]), B = GetVReg(IROp->Args[Unary ? 0 : 1]);
+    const auto S1 = Dst == A ? VTMP1 : A;
+    const auto S2 = Dst == B ? (A == B ? VTMP1 : VTMP2) : B;
+    ARMEmitter::ForwardLabel First, Put, Done;
+    (void)tbz(TMP1, 0, &Done);
+    fmov(ARMEmitter::Size::i64Bit, TMP2, S1.D());
+    ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP2, 0, 63);
+    movz(ARMEmitter::Size::i64Bit, TMP4, 0x7ff0, 48);
+    sub(ARMEmitter::Size::i64Bit, TMP3, TMP4, TMP3);
+    (void)tbnz(TMP3, 63, &First);
+    if (!Unary) {
+      fmov(ARMEmitter::Size::i64Bit, TMP2, S2.D());
+      ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP2, 0, 63);
+      sub(ARMEmitter::Size::i64Bit, TMP3, TMP4, TMP3);
+      (void)tbnz(TMP3, 63, &First);
+    }
+    movz(ARMEmitter::Size::i64Bit, TMP2, 0xfff8, 48);
+    (void)b(&Put);
+    (void)Bind(&First);
+    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1ull << 51);
+    (void)Bind(&Put);
+    fmov(ARMEmitter::Size::i64Bit, Dst.D(), TMP2);
+    (void)Bind(&Done);
+  }
   FexcRecordOp(IROp, Node, Begin);
   if (fexc_slice1) FexcCheckTarget(Node);
 }
@@ -776,6 +823,11 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   using IR::IROps;
   if (FexcQuietOp(IROp)) mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
   if (FexcX87Op(IROp)) FexcX87Begin();
+  if (FexcX87NanOp(IROp)) {   // the sources the op overwrites, for the NaN fix-up (FexcAfterOp)
+    const auto Dst = GetVReg(Node), A = GetVReg(IROp->Args[0]), B = GetVReg(IROp->Args[IROp->Op == IROps::OP_VFSQRT ? 0 : 1]);
+    if (Dst == A) mov(VTMP1.Q(), A.Q());
+    if (Dst == B && A != B) mov(VTMP2.Q(), B.Q());
+  }
   const IR::OrderedNodeWrapper* Addr = nullptr;
   const IR::OrderedNodeWrapper* Offset = nullptr;
   IR::MemOffsetType Type = IR::MemOffsetType::SXTX;
