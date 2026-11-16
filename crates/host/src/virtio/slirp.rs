@@ -4,18 +4,96 @@
 //! timers and queues slirp's frames for the guest. No root, entitlement or host interface.
 //!
 //! Network: 10.0.2.0/24, gateway 10.0.2.2, DNS 10.0.2.3 (the host's resolvers), DHCP from 10.0.2.15.
-//! IPv4 only; the guest cannot reach the host's loopback. IPv6, ICMPv6 echo, port forwarding and a
-//! separate contained process are follow-on work (io-plan.md, INV-03-03 claims 59/73).
+//! IPv4 only; localhost forwards are static and guest access to host loopback is opt-in.
+//! IPv6, ICMPv6 echo and a separate contained process are follow-on work (io-plan.md, INV-03-03 claims 59/73).
 use super::PacketPort;
 use crate::Result;
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::Instant;
+
+/// Transport of a static localhost listener forwarded into the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForwardProtocol {
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Display for ForwardProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        })
+    }
+}
+
+/// A localhost listener targeting the fixed DHCP address, 10.0.2.15.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortForward {
+    pub protocol: ForwardProtocol,
+    pub host_port: NonZeroU16,
+    pub guest_port: NonZeroU16,
+}
+
+impl std::fmt::Display for PortForward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} 127.0.0.1:{} -> 10.0.2.15:{}",
+            self.protocol, self.host_port, self.guest_port
+        )
+    }
+}
+
+/// Per-launch configuration; host-loopback access is disabled by default and required for UDP forwards.
+#[derive(Clone, Debug, Default)]
+pub struct SlirpOptions {
+    pub forwards: Vec<PortForward>,
+    pub host_loopback: bool,
+}
+
+impl SlirpOptions {
+    /// Validate the complete configuration before any listeners or VM resources are created.
+    pub fn validate(&self) -> Result<()> {
+        for (i, rule) in self.forwards.iter().enumerate() {
+            if rule.protocol == ForwardProtocol::Udp {
+                if !self.host_loopback {
+                    return Err("network: UDP forwarding requires --net-host-loopback (libslirp replies use host loopback)".into());
+                }
+                if rule.host_port.get() == 53 {
+                    return Err("network: UDP forwarding from host port 53 is unsupported (libslirp reserves gateway DNS)".into());
+                }
+            }
+            if self.forwards[..i]
+                .iter()
+                .any(|prior| prior.protocol == rule.protocol && prior.host_port == rule.host_port)
+            {
+                return Err(format!(
+                    "network: duplicate {} listener 127.0.0.1:{}",
+                    rule.protocol, rule.host_port
+                ));
+            }
+            if rule.protocol == ForwardProtocol::Udp
+                && self.forwards[..i].iter().any(|prior| {
+                    prior.protocol == ForwardProtocol::Udp && prior.guest_port == rule.guest_port
+                })
+            {
+                return Err(format!(
+                    "network: duplicate UDP guest port {} is unsupported (libslirp selects replies by guest port)",
+                    rule.guest_port
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 #[repr(C)]
 struct SlirpStack {
@@ -93,6 +171,14 @@ unsafe extern "C" {
         opaque: Opaque,
     ) -> *mut SlirpStack;
     fn slirp_cleanup(slirp: *mut SlirpStack);
+    fn slirp_add_hostfwd(
+        slirp: *mut SlirpStack,
+        is_udp: c_int,
+        host_addr: In4,
+        host_port: c_int,
+        guest_addr: In4,
+        guest_port: c_int,
+    ) -> c_int;
     fn slirp_pollfds_fill_socket(
         slirp: *mut SlirpStack,
         timeout: *mut u32,
@@ -264,7 +350,8 @@ impl Slirp {
         rx_segmentation: false,
     };
 
-    pub fn new(port: PacketPort) -> Result<Self> {
+    pub fn new(port: PacketPort, options: &SlirpOptions) -> Result<Self> {
+        options.validate()?;
         let (bell, ring) = UnixStream::pair().map_err(|e| format!("network doorbell: {e}"))?;
         for s in [&bell, &ring] {
             s.set_nonblocking(true)
@@ -310,7 +397,7 @@ impl Slirp {
             vdomainname: std::ptr::null(),
             if_mtu: 1500,
             if_mru: 1500,
-            disable_host_loopback: true,
+            disable_host_loopback: !options.host_loopback,
             enable_emu: false,
             outbound_addr: std::ptr::null(),
             outbound_addr6: std::ptr::null(),
@@ -330,6 +417,23 @@ impl Slirp {
         };
         if stack.is_null() {
             return Err("network: libslirp did not start".into());
+        }
+        // The owner exists before installing anything: every failure drops the stack and closes
+        // listeners installed by earlier rules. Addresses are network order; ports are host order.
+        for rule in &options.forwards {
+            let result = unsafe {
+                slirp_add_hostfwd(
+                    stack,
+                    (rule.protocol == ForwardProtocol::Udp) as c_int,
+                    ipv4(127, 0, 0, 1),
+                    rule.host_port.get().into(),
+                    ipv4(10, 0, 2, 15),
+                    rule.guest_port.get().into(),
+                )
+            };
+            if result < 0 {
+                return Err(format!("network: could not install {rule}"));
+            }
         }
         Ok(slirp)
     }
@@ -466,6 +570,271 @@ impl Drop for Slirp {
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
+    use std::net::{TcpListener, UdpSocket};
+
+    fn device() -> (Arc<super::super::Virtio>, PacketPort) {
+        let rng = super::super::tests::device();
+        super::super::Virtio::network(
+            rng.irqs.clone(),
+            super::super::NET_RESOURCE.gsi as usize,
+            Slirp::MAC,
+            Slirp::OFFLOADS,
+        )
+        .unwrap()
+    }
+
+    enum Listener {
+        Tcp(TcpListener),
+        Udp(UdpSocket),
+    }
+    impl Listener {
+        fn bind(protocol: ForwardProtocol, port: u16) -> std::io::Result<Self> {
+            match protocol {
+                ForwardProtocol::Tcp => TcpListener::bind(("127.0.0.1", port)).map(Self::Tcp),
+                ForwardProtocol::Udp => UdpSocket::bind(("127.0.0.1", port)).map(Self::Udp),
+            }
+        }
+
+        fn port(&self) -> NonZeroU16 {
+            match self {
+                Self::Tcp(s) => s.local_addr(),
+                Self::Udp(s) => s.local_addr(),
+            }
+            .unwrap()
+            .port()
+            .try_into()
+            .unwrap()
+        }
+    }
+
+    fn rule(protocol: ForwardProtocol, host_port: NonZeroU16) -> PortForward {
+        PortForward {
+            protocol,
+            host_port,
+            guest_port: 5201.try_into().unwrap(),
+        }
+    }
+
+    #[test]
+    fn udp_forwarding_requires_explicit_host_loopback() {
+        let mut options = SlirpOptions::default();
+        assert!(!options.host_loopback);
+        options.validate().unwrap();
+        options.forwards = vec![rule(ForwardProtocol::Tcp, 15201.try_into().unwrap())];
+        options.validate().unwrap();
+        options
+            .forwards
+            .push(rule(ForwardProtocol::Udp, 15201.try_into().unwrap()));
+        let error = options
+            .validate()
+            .expect_err("UDP needs explicit loopback access");
+        assert!(error.contains("requires --net-host-loopback"), "{error}");
+        assert!(
+            !options.host_loopback,
+            "validation must not enable loopback"
+        );
+        options.host_loopback = true;
+        options.validate().unwrap();
+    }
+
+    #[test]
+    fn udp_forwarding_refuses_reserved_host_dns_port_but_accepts_guest_dns() {
+        let mut options = SlirpOptions {
+            host_loopback: true,
+            forwards: vec![rule(ForwardProtocol::Udp, 53.try_into().unwrap())],
+        };
+        let error = options
+            .validate()
+            .expect_err("libslirp reserves host UDP port 53");
+        assert!(
+            error.contains("UDP forwarding from host port 53 is unsupported"),
+            "{error}"
+        );
+        options.forwards[0].protocol = ForwardProtocol::Tcp;
+        options.host_loopback = false;
+        options.validate().unwrap();
+        options.forwards[0] = PortForward {
+            protocol: ForwardProtocol::Udp,
+            host_port: 19053.try_into().unwrap(),
+            guest_port: 53.try_into().unwrap(),
+        };
+        options.host_loopback = true;
+        options.validate().unwrap();
+        for host in [67, 69] {
+            options.forwards[0].host_port = host.try_into().unwrap();
+            options.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn only_udp_requires_unique_guest_ports() {
+        let mut options = SlirpOptions {
+            host_loopback: true,
+            forwards: vec![
+                rule(ForwardProtocol::Udp, 15201.try_into().unwrap()),
+                rule(ForwardProtocol::Udp, 15202.try_into().unwrap()),
+            ],
+        };
+        let error = options
+            .validate()
+            .expect_err("UDP reply sockets match only the guest endpoint");
+        assert!(error.contains("duplicate UDP guest port 5201"), "{error}");
+        options.forwards[1].guest_port = 5202.try_into().unwrap();
+        options.validate().unwrap();
+        options.forwards[1].guest_port = 5201.try_into().unwrap();
+        options.forwards[1].protocol = ForwardProtocol::Tcp;
+        options.validate().unwrap();
+        options.forwards[0].protocol = ForwardProtocol::Tcp;
+        options.host_loopback = false;
+        options.validate().unwrap();
+    }
+
+    #[test]
+    fn udp_policy_validation_precedes_any_forward_installation() {
+        let occupied = Listener::bind(ForwardProtocol::Tcp, 0).unwrap();
+        let tcp = rule(ForwardProtocol::Tcp, occupied.port());
+        let udp = rule(ForwardProtocol::Udp, 15201.try_into().unwrap());
+        for (options, expected) in [
+            (
+                SlirpOptions {
+                    forwards: vec![tcp, udp],
+                    host_loopback: false,
+                },
+                "requires --net-host-loopback",
+            ),
+            (
+                SlirpOptions {
+                    forwards: vec![
+                        tcp,
+                        PortForward {
+                            host_port: 53.try_into().unwrap(),
+                            ..udp
+                        },
+                    ],
+                    host_loopback: true,
+                },
+                "UDP forwarding from host port 53 is unsupported",
+            ),
+            (
+                SlirpOptions {
+                    forwards: vec![
+                        tcp,
+                        udp,
+                        PortForward {
+                            host_port: 15202.try_into().unwrap(),
+                            ..udp
+                        },
+                    ],
+                    host_loopback: true,
+                },
+                "duplicate UDP guest port 5201",
+            ),
+        ] {
+            let (_device, port) = device();
+            let error = Slirp::new(port, &options)
+                .err()
+                .expect("invalid UDP configuration");
+            assert!(
+                error.contains(expected),
+                "policy validation must precede the TCP bind failure: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwards_bind_until_the_stack_drops() {
+        for protocol in [ForwardProtocol::Tcp, ForwardProtocol::Udp] {
+            let reservation = Listener::bind(protocol, 0).unwrap();
+            let host = reservation.port();
+            drop(reservation);
+            let options = SlirpOptions {
+                forwards: vec![rule(protocol, host)],
+                host_loopback: protocol == ForwardProtocol::Udp,
+            };
+            let (_device, port) = device();
+            let stack = Slirp::new(port, &options).unwrap();
+            assert!(
+                Listener::bind(protocol, host.get()).is_err(),
+                "{protocol} listener missing"
+            );
+            drop(stack);
+            Listener::bind(protocol, host.get()).expect("drop releases the listener");
+        }
+    }
+
+    #[test]
+    fn a_failed_rule_releases_every_previously_installed_listener() {
+        for protocol in [ForwardProtocol::Tcp, ForwardProtocol::Udp] {
+            let occupied = Listener::bind(protocol, 0).unwrap();
+            let available = Listener::bind(protocol, 0).unwrap();
+            let first = rule(protocol, available.port());
+            let second = PortForward {
+                guest_port: 5202.try_into().unwrap(),
+                ..rule(protocol, occupied.port())
+            };
+            drop(available);
+            let options = SlirpOptions {
+                forwards: vec![first, second],
+                host_loopback: protocol == ForwardProtocol::Udp,
+            };
+            let (_device, port) = device();
+            let error = Slirp::new(port, &options)
+                .err()
+                .expect("occupied port must refuse launch");
+            assert!(error.contains(&second.to_string()), "{error}");
+            Listener::bind(protocol, first.host_port.get())
+                .expect("rollback releases the first rule");
+            assert!(
+                Listener::bind(protocol, second.host_port.get()).is_err(),
+                "collision fixture stays bound"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_and_udp_can_forward_the_same_numerical_port() {
+        let tcp = Listener::bind(ForwardProtocol::Tcp, 0).unwrap();
+        let host = tcp.port();
+        let udp = Listener::bind(ForwardProtocol::Udp, host.get()).unwrap();
+        drop((tcp, udp));
+        let options = SlirpOptions {
+            forwards: vec![
+                rule(ForwardProtocol::Tcp, host),
+                rule(ForwardProtocol::Udp, host),
+            ],
+            host_loopback: true,
+        };
+        let (_device, port) = device();
+        let stack = Slirp::new(port, &options).unwrap();
+        for protocol in [ForwardProtocol::Tcp, ForwardProtocol::Udp] {
+            assert!(Listener::bind(protocol, host.get()).is_err());
+        }
+        drop(stack);
+        let _tcp = Listener::bind(ForwardProtocol::Tcp, host.get()).unwrap();
+        let _udp = Listener::bind(ForwardProtocol::Udp, host.get()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_validation_precedes_any_forward_installation() {
+        for protocol in [ForwardProtocol::Tcp, ForwardProtocol::Udp] {
+            let occupied = Listener::bind(protocol, 0).unwrap();
+            let rule = rule(protocol, occupied.port());
+            let options = SlirpOptions {
+                forwards: vec![rule, rule],
+                host_loopback: protocol == ForwardProtocol::Udp,
+            };
+            let (_device, port) = device();
+            let error = Slirp::new(port, &options).err().expect("duplicate refused");
+            assert!(
+                error.contains(&format!(
+                    "duplicate {protocol} listener 127.0.0.1:{}",
+                    rule.host_port
+                )),
+                "{error}"
+            );
+        }
+    }
+
     /// Offsets printed by a C program against libslirp 4.9.6's header (aarch64 macOS).
     #[test]
     fn bindings_match_the_c_layout() {

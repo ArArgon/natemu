@@ -3,7 +3,8 @@
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
 //!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool[=false]] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
-//!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off] [--rng] [--disk FILE] [--net] [--virtio-transport SPEC]
+//!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off] [--rng] [--disk FILE] [--net]
+//!       [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT] [--net-host-loopback] [--virtio-transport SPEC]
 //!
 //! Named arguments (clap; `natemu --help`). Seven fall back to `NATEMU_SERIAL_STDIN`,
 //! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
@@ -25,6 +26,7 @@
 use clap::Parser;
 use natemu::execution::Stop;
 use natemu::linux::{Boot, Transport, Transports};
+use natemu::virtio::{ForwardProtocol, PortForward, SlirpOptions};
 use std::path::PathBuf;
 
 /// Largest image or initrd read (the boot protocol's 32-bit sizes).
@@ -85,6 +87,13 @@ struct Cli {
     /// Expose a virtio network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
     #[arg(long)]
     net: bool,
+    /// Forward host 127.0.0.1:HOST_PORT to guest 10.0.2.15:GUEST_PORT (repeatable; default TCP)
+    /// UDP requires --net-host-loopback; host port 53 and repeated UDP guest ports are unsupported
+    #[arg(long, requires = "net", value_name = "[tcp|udp:]HOST_PORT:GUEST_PORT", value_parser = port_forward)]
+    net_forward: Vec<PortForward>,
+    /// Allow guest 10.0.2.2:PORT to reach host 127.0.0.1:PORT (broad localhost access; default off)
+    #[arg(long, requires = "net")]
+    net_host_loopback: bool,
     /// The shared template pool (a read-only 274 MiB span of address space, backed as touched): the host publishes admitted
     /// templates into it and each resident looks in it before asking the host. On by default; `--pool=false` or `NATEMU_POOL=0`
     /// turns it off (`NATEMU_POOL_LOOKUP=off`: publication only)
@@ -115,6 +124,61 @@ struct Cli {
     /// Write the timing log (natemu::perf) to FILE
     #[arg(long, value_name = "FILE", env = "NATEMU_PERF_LOG")]
     perf_log: Option<PathBuf>,
+}
+
+fn port_forward(text: &str) -> Result<PortForward, String> {
+    let bad =
+        || format!("bad forward {text:?}: [tcp|udp:]HOST_PORT:GUEST_PORT, decimal ports 1–65535");
+    let fields: Vec<_> = text.split(':').collect();
+    let (protocol, host, guest) = match fields.as_slice() {
+        [host, guest] => (ForwardProtocol::Tcp, *host, *guest),
+        ["tcp", host, guest] => (ForwardProtocol::Tcp, *host, *guest),
+        ["udp", host, guest] => (ForwardProtocol::Udp, *host, *guest),
+        _ => return Err(bad()),
+    };
+    let port = |digits: &str| {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        digits.parse().map_err(|_| bad())
+    };
+    Ok(PortForward {
+        protocol,
+        host_port: port(host)?,
+        guest_port: port(guest)?,
+    })
+}
+
+fn network_summary(enabled: bool, options: &SlirpOptions) -> String {
+    use std::fmt::Write;
+    if !enabled {
+        return String::new();
+    }
+    let mut summary = String::from(
+        "natemu-net: libslirp IPv4; DHCP expected 10.0.2.15; gateway 10.0.2.2; DNS 10.0.2.3\n",
+    );
+    summary.push_str(if options.host_loopback {
+        "natemu-net: host loopback enabled: 10.0.2.2:PORT -> host 127.0.0.1:PORT\n"
+    } else {
+        "natemu-net: host loopback disabled\n"
+    });
+    for rule in &options.forwards {
+        writeln!(&mut summary, "natemu-net: {rule}").unwrap();
+    }
+    summary
+}
+
+/// No success text escapes on a preparation failure, including a refused forward.
+fn report_prepared<T>(
+    prepared: natemu::Result<T>,
+    summary: &str,
+    output: &mut impl std::io::Write,
+) -> natemu::Result<T> {
+    let prepared = prepared?;
+    output
+        .write_all(summary.as_bytes())
+        .map_err(|e| format!("network summary: {e}"))?;
+    Ok(prepared)
 }
 
 /// `--page-currency`: on, off or check (the library also knows `check-halt`, a test mode that stops the run at a difference).
@@ -206,6 +270,11 @@ fn built_runtime() -> Option<PathBuf> {
 }
 
 fn boot(cli: Cli) -> natemu::Result<Stop> {
+    let net_options = SlirpOptions {
+        forwards: cli.net_forward,
+        host_loopback: cli.net_host_loopback,
+    };
+    net_options.validate()?;
     // Performance phase (perf plan §2): the library's timing log (`natemu::perf`), off unless set.
     if let Some(path) = cli.perf_log {
         natemu::perf::enable(path)?;
@@ -230,6 +299,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     boot.rng = cli.rng;
     boot.disk = cli.disk;
     boot.net = cli.net;
+    boot.net_options = net_options;
     boot.pool = cli.pool;
     boot.check_reuse = cli.check_reuse;
     boot.transports = cli.virtio_transport;
@@ -243,8 +313,9 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
         ),
         None => Box::new(std::io::stdout()),
     });
+    let summary = network_summary(boot.net, &boot.net_options);
+    let prepared = report_prepared(boot.prepare(), &summary, &mut std::io::stderr().lock())?;
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
-    let prepared = boot.prepare()?;
     prepared.canceller().on_signals();
     if cli.serial_stdin {
         prepared.serial_input(natemu::linux::serial_stdin()); // raw mode only once the signals are handled
@@ -291,11 +362,192 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    // CLI parsing reads the environment, which check_reuse_option temporarily changes.
+    static CLI_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn udp_policy_is_checked_before_cli_input_files_are_opened() {
+        use clap::Parser;
+        let _env = CLI_ENV.lock().unwrap();
+        let base = [
+            "natemu",
+            "--runtime",
+            "missing-runtime",
+            "--fexc",
+            "missing-fexc",
+            "--kernel",
+            "missing-kernel",
+            "--net",
+        ];
+        for (extra, expected) in [
+            (
+                vec!["--net-forward", "udp:15201:5201"],
+                "requires --net-host-loopback",
+            ),
+            (
+                vec!["--net-host-loopback", "--net-forward", "udp:53:5201"],
+                "UDP forwarding from host port 53 is unsupported",
+            ),
+            (
+                vec![
+                    "--net-host-loopback",
+                    "--net-forward",
+                    "udp:15201:5201",
+                    "--net-forward",
+                    "udp:15202:5201",
+                ],
+                "duplicate UDP guest port 5201",
+            ),
+        ] {
+            let cli = super::Cli::try_parse_from(base.iter().chain(&extra)).unwrap();
+            let error = super::boot(cli).err().expect("invalid UDP configuration");
+            assert!(error.contains(expected), "{error}");
+        }
+        for extra in [
+            vec!["--net-forward", "15201:5201"],
+            vec!["--net-host-loopback", "--net-forward", "udp:15201:5201"],
+        ] {
+            let cli = super::Cli::try_parse_from(base.iter().chain(&extra)).unwrap();
+            let error = super::boot(cli)
+                .err()
+                .expect("fixture input does not exist");
+            assert!(
+                error.contains("--runtime missing-runtime"),
+                "accepted policy must reach input checks: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_summary_describes_policy_and_static_mappings() {
+        let mut options = super::SlirpOptions::default();
+        assert_eq!(super::network_summary(false, &options), "");
+        assert_eq!(
+            super::network_summary(true, &options),
+            "natemu-net: libslirp IPv4; DHCP expected 10.0.2.15; gateway 10.0.2.2; DNS 10.0.2.3\nnatemu-net: host loopback disabled\n"
+        );
+        options.host_loopback = true;
+        options.forwards = vec![
+            super::port_forward("2222:22").unwrap(),
+            super::port_forward("udp:19000:9000").unwrap(),
+        ];
+        assert_eq!(
+            super::network_summary(true, &options),
+            "natemu-net: libslirp IPv4; DHCP expected 10.0.2.15; gateway 10.0.2.2; DNS 10.0.2.3\nnatemu-net: host loopback enabled: 10.0.2.2:PORT -> host 127.0.0.1:PORT\nnatemu-net: tcp 127.0.0.1:2222 -> 10.0.2.15:22\nnatemu-net: udp 127.0.0.1:19000 -> 10.0.2.15:9000\n"
+        );
+        assert_eq!(super::network_summary(false, &options), "");
+    }
+
+    #[test]
+    fn network_summary_is_written_only_for_successful_preparation() {
+        let summary = "natemu-net: host loopback disabled\n";
+        let mut output = Vec::new();
+        let bind_error =
+            "network: could not install tcp 127.0.0.1:2222 -> 10.0.2.15:22".to_string();
+        assert_eq!(
+            super::report_prepared::<()>(Err(bind_error.clone()), summary, &mut output),
+            Err(bind_error)
+        );
+        assert!(
+            output.is_empty(),
+            "failed preparation must not announce a configured network"
+        );
+        assert_eq!(super::report_prepared(Ok(7), summary, &mut output), Ok(7));
+        assert_eq!(output, summary.as_bytes());
+        output.clear();
+        assert_eq!(super::report_prepared(Ok(7), "", &mut output), Ok(7));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn network_options_accept_static_forwards_and_require_networking() {
+        use clap::Parser;
+        let _env = CLI_ENV.lock().unwrap();
+        let base = ["natemu", "--fexc", "f", "--kernel", "k"];
+        let parse = |extra: &[&str]| super::Cli::try_parse_from(base.iter().chain(extra));
+        let defaults = parse(&[]).unwrap();
+        assert!(!defaults.net && !defaults.net_host_loopback && defaults.net_forward.is_empty());
+        for rule in ["2222:22", "tcp:1:65535", "udp:65535:1"] {
+            let cli = parse(&["--net", "--net-forward", rule]).unwrap();
+            assert_eq!(cli.net_forward.len(), 1);
+            let forward = cli.net_forward[0];
+            assert_eq!(
+                forward.protocol,
+                if rule.starts_with("udp:") {
+                    super::ForwardProtocol::Udp
+                } else {
+                    super::ForwardProtocol::Tcp
+                }
+            );
+            let (host, guest) = if rule == "2222:22" {
+                (2222, 22)
+            } else if rule.starts_with("tcp:") {
+                (1, 65535)
+            } else {
+                (65535, 1)
+            };
+            assert_eq!(
+                (forward.host_port.get(), forward.guest_port.get()),
+                (host, guest)
+            );
+        }
+        let cli = parse(&[
+            "--net",
+            "--net-host-loopback",
+            "--net-forward",
+            "2222:22",
+            "--net-forward",
+            "udp:2222:22",
+        ])
+        .unwrap();
+        assert!(cli.net_host_loopback);
+        assert_eq!(
+            cli.net_forward
+                .iter()
+                .map(|f| f.protocol)
+                .collect::<Vec<_>>(),
+            vec![super::ForwardProtocol::Tcp, super::ForwardProtocol::Udp]
+        );
+        for extra in [
+            vec!["--net-host-loopback"],
+            vec!["--net-forward", "2222:22"],
+        ] {
+            assert!(parse(&extra).is_err());
+        }
+        for rule in [
+            "",
+            "1",
+            "1:",
+            ":1",
+            "tcp:1",
+            "tcp:1:2:3",
+            "sctp:1:2",
+            "TCP:1:2",
+            "0:1",
+            "1:0",
+            "65536:1",
+            "1:65536",
+            "+1:2",
+            "1:-2",
+            " 1:2",
+            "1:2 ",
+            "1:2\n",
+            "0x10:2",
+            "１:2",
+        ] {
+            assert!(
+                parse(&["--net", "--net-forward", rule]).is_err(),
+                "{rule:?}"
+            );
+        }
+    }
+
     /// `--check-reuse` and `NATEMU_CHECK_REUSE` (a flag wins, a switch's variable takes 1/0, true/false, on/off) reach
     /// `Boot::check_reuse`'s switch; off by default.
     #[test]
     fn check_reuse_option() {
         use clap::Parser;
+        let _env = CLI_ENV.lock().unwrap();
         let base = ["natemu", "--fexc", "f", "--kernel", "k"];
         let parse = |extra: &[&str]| {
             super::Cli::try_parse_from(base.iter().chain(extra))
@@ -311,10 +563,18 @@ mod tests {
                 .unwrap()
                 .pool
         };
-        assert!(pool(&[]) && pool(&["--pool"]) && pool(&["--pool=true"]) && !pool(&["--pool=false"]));
+        assert!(
+            pool(&[]) && pool(&["--pool"]) && pool(&["--pool=true"]) && !pool(&["--pool=false"])
+        );
         assert!(super::Cli::try_parse_from(base.iter().chain(&["--pool", "false"])).is_err());
-        // The variable, set for this test only (no other test reads it).
-        for (value, want) in [("1", true), ("true", true), ("on", true), ("0", false), ("off", false)] {
+        // The variable, set for this test only (CLI_ENV excludes other CLI parsing tests).
+        for (value, want) in [
+            ("1", true),
+            ("true", true),
+            ("on", true),
+            ("0", false),
+            ("off", false),
+        ] {
             // SAFETY: this is the only test touching the process environment, and it runs no threads of its own.
             unsafe { std::env::set_var("NATEMU_CHECK_REUSE", value) };
             assert_eq!(parse(&[]), want, "{value}");
@@ -322,7 +582,13 @@ mod tests {
         unsafe { std::env::set_var("NATEMU_CHECK_REUSE", "sometimes") };
         assert!(super::Cli::try_parse_from(base).is_err());
         unsafe { std::env::remove_var("NATEMU_CHECK_REUSE") };
-        for (value, want) in [("0", false), ("off", false), ("false", false), ("1", true), ("on", true)] {
+        for (value, want) in [
+            ("0", false),
+            ("off", false),
+            ("false", false),
+            ("1", true),
+            ("on", true),
+        ] {
             // SAFETY: as above.
             unsafe { std::env::set_var("NATEMU_POOL", value) };
             assert_eq!(pool(&[]), want, "NATEMU_POOL={value}");

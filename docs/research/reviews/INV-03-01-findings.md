@@ -1,5 +1,167 @@
 # INV-03-01 — source findings review
 
+## Libslirp usability implementation — November 15, 2026, revised UDP contract
+
+**Final disposition: ACCEPT the scoped implementation.** Twelve final primary
+VMs and six independent replay VMs pass. `/root/slirp_plan_review` independently
+accepts evidence validity and decision relevance with no substantive blockers;
+`/root/network_review` independently built and replayed the new cases.
+Implementation is in the isolated `codex/slirp-usability` worktree. The
+owner-approved UDP opt-in contract replaces the earlier assumption that UDP
+forwarding works with loopback disabled.
+
+**Independent review before execution:** `/root/slirp_implementation` authored
+the production changes and `/root/slirp_runner` authored the runner changes.
+Separate read-only reviewers `/root/slirp_spec_review` and
+`/root/slirp_plan_review` accepted the implementation against the written
+contract and the bounded method, with 691 retained source hashes verified.
+This was permission to collect evidence, not a claim that the UDP premise had
+been demonstrated. Candidate-01 passed 377 host and six CLI tests. Revised
+candidate-02 and independent replica-02 pass 382 host and seven CLI tests
+(four host tests ignored), release builds, signing and runner self-checks.
+Primary and independent pinned FEX builds/compiler checks are retained too.
+
+**Observed result and diagnosis:** the guest sees each incoming UDP handshake
+from `10.0.2.2:CLIENT_PORT`; the host client receives no handshake reply and
+reaches its 20-second deadline. Exact libslirp 4.9.7 source shows that
+`udp_input` finds the host-forward socket by the guest source endpoint and
+passes the reply through `sosendto` to `sotranslate_out4`. That translation
+rejects the virtual host address when `disable_host_loopback` is true, without
+a UDP-forward exception. Both implementation authors independently traced this
+path. The installed version's public API provides no separate reply permission.
+Independent reviewer `/root/slirp_plan_review` then verified the diagnosis
+against the exact release and both failed sessions: `udp_input` lines 173,
+203–205 and 228; `sosendto` lines 779–786; `sotranslate_out4` lines 990–996.
+**Evidence validity:** accept this source-backed failure mechanism, without
+claiming an instrumented trace. **Decision relevance:** explicit loopback opt-in
+is a sound minimal policy option; the owner subsequently selected it below.
+
+**Owner decision:** require explicit `--net-host-loopback` for UDP forwarding;
+the owner selected this option after reviewing its broader localhost access.
+Reject UDP without the flag; no rule enables it implicitly. A blanket exception for host-forward
+sockets is insufficient: socket lookup by the guest source endpoint alone does not
+limit a guest's destination to an observed forwarding peer. The current default
+remains off.
+
+The reviewer also accepts narrow source-backed UDP constraints: reject host
+listener port 53 because gateway-DNS translation overwrites the initial peer
+port; reject duplicate guest UDP ports because source-endpoint-only lookup can
+select the wrong host listener for a reply. Document host client source ports
+53/67/69 as unsupported (DNS/BOOTP/TFTP handling intercepts replies). These
+are source-derived limitations, not new runtime observations; they do not
+exclude guest port 53, host listener ports 67/69 or equivalent TCP combinations.
+References in retained 4.9.7: `udp.c` lines 138–173, 203–228 and 400–409;
+`socket.c` lines 18–49, 985–987 and 1082–1088. Implementation authors separately
+verified the constraints before changing validation and documentation.
+
+**Runner correction:** candidate-02's first MMIO case has positive TCP receive
+counts before/after reset, but an informational ACPI shutdown printk splits the
+last JSON marker. The strict judge correctly reports failure; that failed run
+is preserved. Candidate-03 changes only the runner and two planning/status
+documents. Common guest init sets console loglevel 5, retaining warnings/errors
+and the complete kernel log, while suppressing routine informational console
+output. Strict JSON parsing is unchanged; split/truncated-record mutations still
+fail. Both candidate-03 and replica-03 freshly pass runner self-checks.
+
+`/root/slirp_plan_review` independently verified all 691 source files, identical
+producing Rust/build inputs, original build receipts and both sets of binary
+hashes. Candidate-03 reuses candidate-02 binaries; replica-03 reuses only the
+replicator's fresh replica-02 Rust build and unchanged independent replica-01
+FEX build. Both methods freshly prepare the corrected guest images for each
+transport. **Evidence validity and decision relevance: accept pre-execution,
+no substantive blockers.** This does not promote either failed run to a pass.
+
+**Evidence and bounds:** retained at
+`natemu-raw/slirp-usability-20261115-01/` outside Git. `candidate-01` contains
+sources, build commands/results, hashes, pre-execution review and the failed
+`mmio-forward/forward-n2` outputs. `udp-policy-source` contains the exact release
+archive/source and installed-header/library provenance; the archive checksum
+matches the installed Homebrew formula. `replica-01` contains independent fresh
+source/compiler/Rust builds and self-checks, but no VM evidence. `candidate-02`
+retains the revised producing build and corrupted-output failure. `candidate-03`
+and `replica-03` retain corrected sources, provenance and final execution
+artifacts. The revised bound is 14 primary VMs (two preserved failed cases plus
+12 final checks) and six replay VMs, all two-vCPU/1-GiB guests with 180-second
+limits and cancellation within ten seconds, inside four engineering hours.
+All 12 final primary cases and six independent replay cases pass on M2 Max/macOS
+26.6.2 with libslirp 4.9.7. The
+reviewer independently parsed guest/host receiver JSON, reset/DHCP ordering,
+exact summaries and argv, known-server HTTP deny/allow controls, listener
+release and cancellation progress/exit timing. No primary evidence blocker was
+found. The reviewer independently checked the same observations in all six
+replica runs, fresh guest-image/source hashes, independent binary provenance,
+and PCI identity/live MSI-X. All replay wrapper steps pass without timeout.
+**Evidence validity: accepted. Decision relevance: accepted** for the fixed
+endpoints, explicit policy, two-vCPU guests and tested lifecycle cases. No
+performance, M4, IPv6 or general host-isolation claim is made.
+
+| Behavior | Primary MMIO / PCI | Independent replay |
+| --- | --- | --- |
+| TCP forwarding with loopback disabled, before/after reset | Pass / pass | Pass on both transports |
+| Default-off loopback denial with forwarded TCP and known live HTTP server | Pass / pass | Pass on both transports |
+| Explicit loopback access and TCP/UDP forwarding, before/after reset | Pass / pass | Pass on both transports |
+| Basic NAT, reset under traffic, cancellation with a TCP forward | Pass / pass | Not repeated; primary regression coverage |
+
+Host-only policy, collision, rollback and drop checks pass in both independently
+built Rust suites. Console correction checks preserve strict failure on corrupt
+artifacts; neither earlier failure is relabeled as a passing final case.
+The work used the revised bound of 14 primary VMs including two failures, six
+replays and about one hour; retained artifacts occupy approximately 3.1 GiB.
+This completes the usability slice, not the wider network contract or Track03.
+The full suite remains required before push or merge.
+
+## Libslirp usability plan review — November 15, 2026
+
+**Subject:** [libslirp usability plan](../../restructure/slirp-usability-plan.md).
+Owner criterion: keep three requested conveniences simple—static host-to-guest
+TCP/UDP forwarding, explicitly enabled guest access to host loopback (default
+off), and a startup summary. The current libslirp/virtio architecture is fixed;
+vmnet and other interface-based backends remain separate work. This review
+decides whether the bounded plan is ready for implementation, not whether the
+new behavior already works.
+
+**Independence and material:** `/root` authored all changes. Reviewers worked
+in separate read-only contexts and did not edit the plan, production code,
+tests or oracles. `/root/network_review` had supplied earlier source/test
+advice; `/root/slirp_plan_review` started from the written artifact in a fresh
+context. Both inspected the complete plan, relevant repository workflow and
+current device direction, CLI/Boot/Slirp ownership paths, no-VM virtio fixture,
+network runner and its judges, installed libslirp 4.9.7 API, and supporting
+upstream source/documentation. No git-history audit or VM run was performed.
+
+| Reviewer | Evidence validity | Decision relevance | Final disposition |
+| --- | --- | --- | --- |
+| `/root/network_review` | Accept the source-grounded plan and revised checks; no runtime claim | Accept fixed endpoints, startup-only rules, default-off loopback and existing test reuse | Accepted after recheck; no substantive blockers |
+| `/root/slirp_plan_review` | Accept after correcting the cancellation oracle described below | Accept the three conveniences within the stated scope and budget | Accepted after recheck; no substantive blockers |
+
+**Findings and return:** the first review found no design/FFI blocker and
+requested a nonblocking clarification of listener-release checks. The fresh
+review found one substantive acceptance-method defect: the current runner
+prints cancellation readiness before starting iperf3, then sleeps, so it does
+not establish traffic under cancellation. Relying on that existing test could
+accept a shutdown claim without its intended workload.
+
+The author corrected Task 4 to require a retained RX increase of at least
+1 MiB after starting the traffic child, with that child still alive, before
+SIGINT. Missing/zero progress must fail judge self-check mutations; the
+10-second cancellation bound remains. Post-exit listener checks now explicitly
+use host-only TCP bind-and-listen with `SO_REUSEADDR` and UDP bind without reuse,
+avoiding TCP TIME_WAIT false failures, hidden stale UDP listeners and extra
+unbudgeted VMs. A direct upstream forwarding-source citation was added. Both
+reviewers re-read the changes and affected assumptions and accepted the return.
+
+**Limits and budget:** two independent source reviews and one correction return;
+no implementation, build, network experiment, replay or performance claim in
+this planning task. The proposed implementation bound remains four engineering
+hours, 12 primary and six replay VMs with the specified per-VM limits. Code and
+oracle review, retained acceptance runs and independent fresh-build replay are
+future implementation obligations; the existing full-suite push/merge rule is
+unchanged. No unrelated follow-up is made a prerequisite.
+
+**Final disposition: accepted plan, no unresolved substantive blockers.** The
+task ends at the reviewed document; it does not complete implementation or the
+broader network contract.
+
 ## Restructure plan review — October 26, 2026 owner direction
 
 **Independent reviewers:** `/root/plan_owner_review` and

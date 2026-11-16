@@ -12,7 +12,7 @@ mod profile;
 mod queue;
 mod slirp;
 pub use net::{Frame, Gso, Offloads, PacketPort, RxChecksum, RxMeta, TxMeta};
-pub use slirp::Slirp;
+pub use slirp::{ForwardProtocol, PortForward, Slirp, SlirpOptions};
 #[cfg(feature = "testing")]
 pub mod testing;
 use crate::{

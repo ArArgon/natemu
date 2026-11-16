@@ -85,8 +85,14 @@ performance repairs, safety stress coverage, and a repair of the serial console
 stall under sustained output. Since November 12 the network has a backend: user-mode NAT on libslirp
 (`--net`; vmnet still needs root). Remaining: network stress/edge cases and combined
 disk/network acceptance. Current status and the next assignment live in
-[INV-03-01](research/investigations/INV-03-01.md#current-io-state--november-9);
+[INV-03-01](research/investigations/INV-03-01.md#current-io-state--november-11);
 measured numbers live in the [I/O benchmark record](restructure/io-benchmarks.md).
+The November 15 [libslirp usability plan](restructure/slirp-usability-plan.md)
+adds a bounded follow-up: static localhost TCP/UDP forwards, explicitly enabled
+host-loopback access (default off), and a startup summary. Implemented and
+independently accepted on `codex/slirp-usability`: TCP works with loopback off;
+UDP requires explicit `--net-host-loopback`. Twelve primary and six independent
+replay VMs pass on MMIO/PCI at two vCPUs; the plan records limits and evidence.
 
 The [ABI coverage matrix](research/specs/arm64-execution-abi.md#7-experiment-and-independent-oracle)
 is the minimum retained behavior target, reached incrementally. New producer and

@@ -115,6 +115,8 @@ pub struct Boot {
     pub disk: Option<PathBuf>,
     /// Expose the virtio network device on user-mode NAT ([`crate::virtio::Slirp`]).
     pub net: bool,
+    /// Static localhost forwards and explicit host-loopback access; requires `net`.
+    pub net_options: crate::virtio::SlirpOptions,
     /// The shared template pool (cross-vCPU reuse plan): back a read-only span of about 274 MiB of address space before guest
     /// RAM (pages are backed as touched), map it into every vCPU, publish admitted templates into it and let each resident look
     /// in it before asking the host. On by default (the gate passed, November 14: configure -3.3%, make -1.8% wall);
@@ -151,6 +153,7 @@ impl Boot {
             rng: false,
             disk: None,
             net: false,
+            net_options: crate::virtio::SlirpOptions::default(),
             pool: true,
             transports: Transports::all(Transport::Mmio),
         }
@@ -158,6 +161,10 @@ impl Boot {
 
     /// Loads everything into a new backing and builds the devices; nothing runs yet.
     pub fn prepare(self) -> Result<Prepared> {
+        if !self.net && (self.net_options.host_loopback || !self.net_options.forwards.is_empty()) {
+            return Err("network: forwarding and host-loopback options require --net".into());
+        }
+        self.net_options.validate()?;
         // PCID plan P1: the barriers' leaf SB needs FEAT_SB; refuse to turn them on without it (default off needs nothing).
         if self.speculation_barriers && !execution::host_feature("FEAT_SB") {
             return Err(
@@ -274,7 +281,7 @@ impl Boot {
                 mac,
                 crate::virtio::Slirp::OFFLOADS,
             )?;
-            net = Some(crate::virtio::Slirp::new(port)?);
+            net = Some(crate::virtio::Slirp::new(port, &self.net_options)?);
             if pci_net {
                 bus.add(NET_SLOT, device.pci(NET_SLOT))?;
             } else {
@@ -758,6 +765,69 @@ impl Prepared {
 mod tests {
     use super::*;
     use natemu_abi::lapic::{RESET, SVR_ENABLE};
+
+    #[test]
+    fn network_defaults_keep_forwarding_and_host_loopback_off() {
+        let boot = Boot::new("missing-runtime", "missing-fexc", vec![]);
+        assert!(!boot.net);
+        assert!(boot.net_options.forwards.is_empty());
+        assert!(!boot.net_options.host_loopback);
+    }
+
+    #[test]
+    fn udp_policy_is_checked_before_ram_or_vm_preparation() {
+        let mut boot = Boot::new("missing-runtime", "missing-fexc", vec![]);
+        boot.net = true;
+        boot.ram = 0;
+        boot.net_options.forwards = vec![crate::virtio::PortForward {
+            protocol: crate::virtio::ForwardProtocol::Udp,
+            host_port: 15201.try_into().unwrap(),
+            guest_port: 5201.try_into().unwrap(),
+        }];
+        let error = boot.prepare().err().expect("UDP needs explicit opt-in");
+        assert!(error.contains("requires --net-host-loopback"), "{error}");
+    }
+
+    #[test]
+    fn network_options_are_validated_before_ram_or_vm_preparation() {
+        use crate::virtio::{ForwardProtocol, PortForward, SlirpOptions};
+        let forward = PortForward {
+            protocol: ForwardProtocol::Tcp,
+            host_port: 2222.try_into().unwrap(),
+            guest_port: 22.try_into().unwrap(),
+        };
+        for options in [
+            SlirpOptions {
+                host_loopback: true,
+                ..Default::default()
+            },
+            SlirpOptions {
+                forwards: vec![forward],
+                ..Default::default()
+            },
+        ] {
+            let mut boot = Boot::new("missing-runtime", "missing-fexc", vec![]);
+            boot.ram = 0; // A later preparation error must not mask the option error.
+            boot.net_options = options;
+            let error = boot.prepare().err().expect("options require networking");
+            assert!(error.contains("require --net"), "{error}");
+        }
+        let mut boot = Boot::new("missing-runtime", "missing-fexc", vec![]);
+        boot.ram = 0;
+        boot.net = true;
+        boot.net_options.forwards = vec![
+            forward,
+            PortForward {
+                guest_port: 80.try_into().unwrap(),
+                ..forward
+            },
+        ];
+        let error = boot.prepare().err().expect("duplicate listener");
+        assert!(
+            error.contains("duplicate tcp listener 127.0.0.1:2222"),
+            "{error}"
+        );
+    }
 
     /// Writes 64 KiB of zeros below the caller's frame: whatever a returned function left on the stack is gone.
     #[inline(never)]

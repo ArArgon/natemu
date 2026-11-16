@@ -769,7 +769,11 @@ and replication (`natemu-raw/net-slirp-20261112-01`, `natemu-raw/net-replica-202
 throughput is recorded, not yet benchmarked: about 775 Mbit/s guest-to-host and 1.3 Gbit/s
 host-to-guest). This is the first scope of the network contract above, not all of it:
 IPv6 and ICMPv6, the mixed-family resolver correction (03-03 claim 59), the contained
-broker process (claim 70) and port forwarding remain follow-on work.
+broker process (claim 70) remain follow-on work. The November 15
+[libslirp usability slice](slirp-usability-plan.md) adds static localhost
+TCP/UDP forwarding, opt-in host-loopback access and a startup summary. It is
+independently accepted on MMIO/PCI at two vCPUs; UDP requires explicit loopback
+opt-in and retains the documented libslirp port limitations.
 
 **Stress and edge cases (November 12).** Guest reboot, a never-loaded driver and three
 resets under traffic pass at 1/2/4 vCPUs. The stress case first **failed**: with 8 streams
