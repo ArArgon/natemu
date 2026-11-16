@@ -6039,6 +6039,7 @@ mod tests {
             let mut want = vec![0; u32::from_le_bytes(word) as usize];
             from.read_exact(&mut want).unwrap();
             let sent = if add.is_empty() { body } else { with_added_args(&body, &add) };
+            let sent_copy = sent.clone();
             let r = server
                 .request(&sent, Instant::now() + COMPILE_DEADLINE)
                 .unwrap();
@@ -6057,6 +6058,14 @@ mod tests {
             n += 1;
             if got != want {
                 differ += 1;
+                // `NATEMU_REPLAY_DUMP`: a directory that gets each differing request (`N.req`: the body sent) and both replies
+                // (`N.old`, `N.new`: the whole payload, as compared), to classify the differences.
+                if let Some(dir) = std::env::var_os("NATEMU_REPLAY_DUMP") {
+                    let dir = Path::new(&dir);
+                    std::fs::write(dir.join(format!("{n}.req")), &sent_copy).unwrap();
+                    std::fs::write(dir.join(format!("{n}.old")), &want).unwrap();
+                    std::fs::write(dir.join(format!("{n}.new")), &got).unwrap();
+                }
                 // (the word at 16..20 is args_read: a compiler that reads more arguments differs there alone)
                 other += u64::from(got[..16] != want[..16] || got[20..] != want[20..]);
                 if differ <= 10 {
@@ -6074,7 +6083,7 @@ mod tests {
         // With added arguments the replies differ from the recorded host's by design (M2 emulation): only the count gates,
         // unless the old compiler got the same arguments: then only args_read may differ (a compiler reading more arguments
         // of the same request, e.g. 3a's --daz and --ftz without AFP; the code, JSON and object are the gate).
-        assert!(n > 0 && (differ == 0 || (!add.is_empty() && (add != old_add || other == 0))));
+        assert!(n > 0 && (std::env::var_os("NATEMU_REPLAY_DUMP").is_some() || differ == 0 || (!add.is_empty() && (add != old_add || other == 0))));
     }
 
     #[test]

@@ -258,7 +258,7 @@ constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
 // Recorded by the allowlist (I5c): guest RIP of each waiting x87 instruction, WAIT/FWAIT and MMX instruction (it delivers a
 // pending x87 exception, #MF, before it runs: SDM Vol.1 8.7.1), of each FST/FSTP m32/m64 (an unmasked OE/UE stores nothing)
 // and each x87 instruction's length (the resident resumes after one whose unmasked exception left its operands unaltered).
-inline std::set<uint64_t> fexc_x87_waiting, fexc_x87_store;
+inline std::set<uint64_t> fexc_x87_waiting, fexc_x87_store, fexc_x87_m32;   // fexc_x87_m32: x87 instructions with an m32 convert (AFP hosts' DE fix-up)
 inline std::map<uint64_t, uint8_t> fexc_x87_length;
 // The x87 lowering's check operands per guest RIP (I5c; IR nodes, FEX's Ref): stack fault, stack overflow, invalid operand
 // (FST m64's SNaN, FIST's out-of-range value) and exact tiny (FST m64), each a 0/1 value or null.

@@ -517,10 +517,42 @@ bool Arm64JITCore::FexcX87NanOp(const IR::IROp_Header* IROp) {
   if (IROp->Size != IR::OpSize::i64Bit || IROp->ElementSize != IR::OpSize::i64Bit) return false;
   return true;
 }
+// Hosts with AFP: FEX converts an x87 m32 operand to a double in a separate `fcvt`, whose IDC (the single is denormal) goes into the pending
+// flags even where x86 raises no DE: a NaN in ST0 (IE has precedence; SDM Vol.1 4.9.2, 8.5.1) and a memory dividend over a zero ST0 (FDIVR:
+// ZE only; AMD hardware). With IDC pending (the single is a finite nonzero number), the result of an arithmetic op is a NaN exactly when
+// ST0 is one (FCOM: either operand is), and DZC is set exactly for the zero divisor; either drops DE. Hot path: one `tbz` on the pending
+// byte FexcX87End has just stored (TMP2), after the m32 convert's instruction only. M64 operands need none (the op itself sees them: a NaN
+// operand takes precedence over IDC on the M4, verified by the AfpX87 oracle). Hosts without AFP have the software test instead.
+//   tbz w2, #7, done; tbnz w1, #1, clear; [fmov x3, Dd; ubfx; movz; sub; tbnz x3, #63, clear]...; b done; clear: and w2, w2, #~0x80; strb w2
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
   if (FexcQuietOp(IROp)) msr(ARMEmitter::SystemRegister::FPSR, TMP4);
   if (fexc_slice1) FexcTinyCheck(IROp, Node);
   if (FexcX87Op(IROp)) FexcX87End();
+  if (FexcX87Op(IROp) && !fexc_no_afp) {
+    using IR::IROps;
+    const uint64_t Rip = Entry + FexcGuest;
+    const bool Cmp = IROp->Op == IROps::OP_FCMP;
+    if (IROp->Op == IROps::OP_FLOAT_FTOF) {
+      if (IR::OpSizeToSize(IROp->C<IR::IROp_Float_FToF>()->SrcElementSize) == 4) fexc_x87_m32.insert(Rip);
+    } else if (fexc_x87_m32.count(Rip) && (Cmp || IROp->Op == IROps::OP_VFADD || IROp->Op == IROps::OP_VFSUB || IROp->Op == IROps::OP_VFMUL ||
+                                           IROp->Op == IROps::OP_VFDIV)) {
+      ARMEmitter::ForwardLabel Clear, Done;
+      (void)tbz(TMP2, 7, &Done);
+      (void)tbnz(TMP1, 1, &Clear);
+      movz(ARMEmitter::Size::i64Bit, TMP4, 0x7ff0, 48);
+      for (int i = 0; i < (Cmp ? 2 : 1); ++i) {
+        fmov(ARMEmitter::Size::i64Bit, TMP3, (Cmp ? GetVReg(IROp->Args[i]) : GetVReg(Node)).D());
+        ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP3, 0, 63);
+        sub(ARMEmitter::Size::i64Bit, TMP3, TMP4, TMP3);
+        (void)tbnz(TMP3, 63, &Clear);
+      }
+      (void)b(&Done);
+      (void)Bind(&Clear);
+      and_(ARMEmitter::Size::i32Bit, TMP2, TMP2, 0xffffff7fu);
+      strb(TMP2.W(), STATE, FEXC_X87_PENDING);
+      (void)Bind(&Done);
+    }
+  }
   if (FexcX87NanOp(IROp)) {
     const bool Unary = IROp->Op == IR::OP_VFSQRT;
     const auto Dst = GetVReg(Node);
