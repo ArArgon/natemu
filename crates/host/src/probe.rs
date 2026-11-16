@@ -81,13 +81,13 @@ impl Probe {
     /// every supported host (every built feature is core); the other lines vary with the host and options. Tools recognise
     /// a startup line by its topic, one of [`TOPICS`] (not by shape: errors and warnings also read `natemu: disk lock: ...`).
     pub(crate) fn lines(&self, launch: &Launch) -> Vec<String> {
-        let mut cpu = String::from("cpu: x86-64-v3");
+        let mut cpu = String::from("x86-64-v3");
         for name in natemu_abi::cpu_gates::ADVERTISED_BEYOND_V3 {
             cpu.push_str(" +");
             cpu.push_str(name);
         }
         // Only `fast` exists today; the `accurate` mode adds its own value here.
-        let mut fp = String::from("fp: fast mode");
+        let mut fp = String::from("fast mode");
         let inexact = self.inexact_arm();
         if !inexact.is_empty() {
             fp.push_str(&format!(", degraded (host lacks {})", inexact.join(" ")));
@@ -109,15 +109,14 @@ impl Probe {
             }
             None => "off".into(),
         };
-        [
+        let values = [
             cpu,
             fp,
-            format!("acceleration: {}", accel.join(" ")),
-            format!("meltdown: {}", if launch.speculation_barriers { "speculation barriers" } else { "none" }),
-            format!("code cache: pool {}, disk {disk}", onoff(launch.pool)),
-        ]
-        .map(|l| format!("natemu: {l}"))
-        .into()
+            accel.join(" "),
+            (if launch.speculation_barriers { "speculation barriers" } else { "none" }).into(),
+            format!("pool {}, disk {disk}", onoff(launch.pool)),
+        ];
+        TOPICS.iter().zip(values).map(|(topic, value)| format!("natemu: {topic}: {value}")).collect()
     }
     /// [`Probe::inexact`] by Arm's names.
     fn inexact_arm(&self) -> Vec<&'static str> {
