@@ -307,6 +307,11 @@ impl Boot {
             max_block: self.max_block,
             stop_at: self.stop_at,
             watchdog: self.watchdog,
+            launch: crate::probe::Launch {
+                speculation_barriers: self.speculation_barriers,
+                pool: self.pool,
+                compile_cache: self.compile_cache.dir.clone(),
+            },
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
             page_currency: self.page_currency,
@@ -340,6 +345,8 @@ pub struct Prepared {
     stop_at: Option<u64>,
     watchdog: Duration,
     compile_cache: compile_cache::Config,
+    /// The options the startup lines report.
+    launch: crate::probe::Launch,
     check_reuse: bool,
     page_currency: u64,
     writable_on_read: bool,
@@ -488,7 +495,7 @@ impl Prepared {
         let prepare = |v: usize| -> Result<Vcpu> {
             let cpu = Vcpu::create()?;
             execution::enter(&cpu, backing.vcpu(v), true)?;
-            crate::probe::announce(&cpu);
+            crate::probe::announce(&cpu, &self.launch);
             machine.route(v)?;
             Ok(cpu)
         };
