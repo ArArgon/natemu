@@ -186,11 +186,44 @@ when a TX packet is queued, when an RX request finishes, and at drain and stop.
 through hand-written bindings for libslirp 4.9 (config version 6, layout checked by a
 unit test), linked from Homebrew by `crates/host/build.rs`. No root, entitlement or
 host interface. The guest sees 10.0.2.0/24: gateway 10.0.2.2, DNS 10.0.2.3 (forwarded
-to the host's resolvers), DHCP lease 10.0.2.15, MAC 52:54:00:12:34:56. IPv4 only, and
-the guest cannot reach the host's loopback (as with VZ NAT); reach host services on
-the host's LAN address. No port forwarding.
+to the host's resolvers), expected DHCP lease 10.0.2.15, MAC 52:54:00:12:34:56. IPv4
+only. Host-loopback access is disabled by default; the guest can still reach host
+services on the host's LAN address.
 
-`Slirp::new` starts the stack before boot (a failure refuses the launch). One thread
+`--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT` adds a static listener on
+`127.0.0.1:HOST_PORT` targeting `10.0.2.15:GUEST_PORT`. Repeat it for several
+listeners; omitted protocol means TCP. Both ports must be decimal 1–65535.
+Duplicate protocol/host-port pairs are refused before any binding, while TCP and
+UDP may share a numerical port. A bind failure refuses the launch and releases
+every listener already installed. Different VMs need different host ports.
+The guest service must listen on its NIC address or all interfaces, not just
+guest localhost. TCP forwarding works with host-loopback access disabled.
+UDP forwarding requires explicit `--net-host-loopback`: libslirp 4.9.7 otherwise
+blocks replies to the localhost client. The launch rejects UDP rules without
+that opt-in; it never enables broad loopback access automatically.
+
+UDP host port 53 is refused because libslirp's gateway-DNS handling rewrites it.
+Each UDP rule must also target a distinct guest port: libslirp selects the reply
+socket using only the guest endpoint, so two host listeners cannot share it.
+TCP rules may reuse a guest port, and TCP/UDP may share one. UDP clients using
+source port 53, 67 or 69 are unsupported: replies hit libslirp's built-in DNS,
+BOOTP or TFTP handling. This does not prohibit UDP host ports 67/69 or guest port
+53. These are existing backend limits, not configurable filtering rules.
+
+`--net-host-loopback` explicitly permits guest `10.0.2.2:PORT` to reach host
+`127.0.0.1:PORT`. This grants broad access to localhost services, including those
+that rely on local connections instead of authentication; it is not a per-port
+permission or a host-isolation guarantee. Both new options require `--net`.
+After preparation succeeds, the CLI prints the expected addresses, loopback
+policy and installed mappings once to stderr with the `natemu-net:` prefix.
+This reports configuration, not DHCP completion or guest-service readiness.
+See [the play recipes](../../../../tools/play/README.md#hostguest-services) for
+HTTP, SSH and file copies. Bind/guest addresses, subnet changes, live rule edits,
+automatic ports and IPv6 are not supported.
+
+`Slirp::new(port, &options)` validates all rules, starts the stack and installs
+its forwards before boot (a failure refuses the launch). The stack owns its
+listeners, including cleanup on partial construction failure. One thread
 (`Slirp::run`, in `Prepared::run`'s scope, joined after the devices stop) owns it:
 it feeds queued guest TX frames to `slirp_input`, hands slirp's output frames to the
 guest in order through `PacketPort::receive` (up to 4096 waiting, then new ones drop;
@@ -210,8 +243,18 @@ receive stream (three times), ends cleanly at guest reboot, powers off with the
 driver never loaded, and exits promptly on SIGINT under traffic; with the internet, DNS
 and a CA-verified HTTPS download. `--cases stress` (not in the suite): 60 s of 8 streams
 each way, 100 parallel streams, 500 short connections 64 at a time, UDP floods both
-ways, then the network still works. Not yet covered: IPv6/ICMPv6, port forwarding,
-a separate contained process, combined disk+network load.
+ways, then the network still works. Parser/default-policy tests and no-traffic
+TCP/UDP bind, collision, rollback and drop tests cover the new configuration.
+The November 15 usability checks pass on MMIO and PCI at two vCPUs on M2 Max,
+macOS 26.6.2/libslirp 4.9.7: TCP forwarding with loopback off before/after reset,
+default-off loopback denial with a live-host/TCP control, and opt-in loopback
+HTTP plus TCP/UDP forwarding before/after reset. All six new-case runs were
+independently replayed from separately built binaries. Basic NAT, reset under
+traffic and cancellation with a TCP forward also pass primary regression runs;
+listener release is checked after exit. Retained sources, failures and review:
+[usability plan](../../../../docs/restructure/slirp-usability-plan.md).
+Not yet covered:
+IPv6/ICMPv6, a separate contained process, combined disk+network load.
 
 Throughput (November 12, 2 vCPUs, iperf3 to the host, `natemu-raw/net-slirp-20261112-01/vmm-compare-01`):
 upload ~3.5 Gbit/s, download ~5.7 Gbit/s, 8 streams each way ~3.4/2.75 Gbit/s (checksum
