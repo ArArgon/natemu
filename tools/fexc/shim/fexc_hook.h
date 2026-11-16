@@ -272,3 +272,6 @@ struct FexcX87Extras { void* fault {}; void* overflow {}; void* invalid {}; void
 inline std::map<uint64_t, FexcX87Extras> fexc_x87_extra;
 // Filled when the checks are placed (I5c): guest RIP of each instruction given a SIMD exception check.
 inline std::set<uint64_t> fexc_simd_checked;
+// AFP accurate plan, chunk 2 (B): the instructions (RIPs) whose software DE flag is set with DE masked (accurate mode, no AFP, MXCSR.DM set, no
+// DAZ): PlaceFPChecks fills it, FexcDenormalStep (DPPS/DPPD's add levels, inside the JIT) reads it.
+inline std::set<uint64_t> fexc_simd_de_masked;

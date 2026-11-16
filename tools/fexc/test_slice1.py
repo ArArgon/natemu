@@ -1369,6 +1369,114 @@ class AfpX87(unittest.TestCase):
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpAccurateDe(unittest.TestCase):
+    """AFP accurate plan, chunk 2 (B): with `--accurate` and DE masked a host without AFP sets MXCSR.DE (FPSR.IDC) by software. The oracle is the
+    M4: the same instruction compiled for a host with AFP and run under the M4's FPCR (AH, NEP) against the afp=0 accurate code run under an
+    M2's FPCR (0), on random operands (denormal, NaN, zero, infinity, normal classes in every lane, in registers, memory and the upper halves):
+    FPSR.IDC is identical, and so is every result bit outside the lanes whose M4 result is a NaN (chunk 3's, the NaN rules). $ORACLE_TRIALS
+    trials per form (default 60)."""
+    AFP0 = ['--feature', 'afp=0', '--accurate']
+    MEM = 0x1000
+    # (name, hex, source element bytes, result lane bytes). [rbx] is x6 (the memory operand at buf + 0x1000); register forms use xmm1/2/3.
+    FORMS = [(n, h, e, e) for n, h, _, e, _, _ in DE_FORMS if n not in ('vcvtps2ph', 'vcvtps2pd ymm', 'cvtps2pd', 'cvtss2sd', 'cvtpd2ps', 'cvtsd2ss')] + [
+        ('cvtps2pd', '0f5aca', 4, 8), ('cvtss2sd', 'f30f5aca', 4, 8), ('cvtpd2ps', '660f5aca', 8, 4), ('cvtsd2ss', 'f20f5aca', 8, 4),
+        ('vcvtps2ph xmm', 'c4e3791dd100', 4, 2), ('vcvtps2ph ymm', 'c4e37d1dd100', 4, 2),
+        ('vcvtps2pd ymm', 'c5fc5aca', 4, 8), ('vcvtpd2ps xmm,ymm', 'c5fd5aca', 8, 4), ('vcvtph2ps xmm', 'c4e27913ca', 2, 4), ('vcvtph2ps ymm', 'c4e27d13ca', 2, 4),
+        ('vcvtph2ps m', 'c4e279130b', 2, 4),
+        # memory operands
+        ('addps m', '0f580b', 4, 4), ('addss m', 'f30f580b', 4, 4), ('mulsd m', 'f20f590b', 8, 8), ('divps m', '0f5e0b', 4, 4), ('divsd m', 'f20f5e0b', 8, 8),
+        ('sqrtpd m', '660f510b', 8, 8), ('sqrtss m', 'f30f510b', 4, 4), ('minps m', '0f5d0b', 4, 4), ('cmpltps m', '0fc20b01', 4, 4), ('comiss m', '0f2f0b', 4, 4),
+        ('ucomisd m', '660f2e0b', 8, 8), ('cvtps2pd m', '0f5a0b', 4, 8), ('cvtss2sd m', 'f30f5a0b', 4, 8), ('cvtpd2ps m', '660f5a0b', 8, 4),
+        ('haddps m', 'f20f7c0b', 4, 4), ('addsubpd m', '660fd00b', 8, 8), ('vaddps m', 'c5e8580b', 4, 4), ('vmulsd m', 'c5eb590b', 8, 8),
+        ('vfmadd231ps m', 'c4e269b80b', 4, 4), ('vfmadd231sd m', 'c4e2e9b90b', 8, 8), ('vfnmsub231ss m', 'c4e269bf0b', 4, 4),
+        # 256-bit
+        ('vaddps ymm', 'c5ec58cb', 4, 4), ('vsubpd ymm', 'c5ed5ccb', 8, 8), ('vmulps ymm m', 'c5ec590b', 4, 4), ('vdivps ymm', 'c5ec5ecb', 4, 4),
+        ('vdivpd ymm m', 'c5ed5e0b', 8, 8), ('vsqrtps ymm', 'c5fc51ca', 4, 4), ('vsqrtpd ymm', 'c5fd51ca', 8, 8), ('vminpd ymm', 'c5ed5dcb', 8, 8),
+        ('vhaddps ymm', 'c5ef7ccb', 4, 4), ('vhsubpd ymm', 'c5ed7dcb', 8, 8), ('vaddsubps ymm', 'c5efd0cb', 4, 4), ('vcmpltps ymm', 'c5ecc2cb01', 4, 4),
+        ('vfmadd231ps ymm', 'c4e26db8cb', 4, 4), ('vfmadd231pd ymm', 'c4e2edb8cb', 8, 8), ('vfmsub231ps ymm', 'c4e26dbacb', 4, 4),
+        ('vfnmadd231pd ymm', 'c4e2edbccb', 8, 8), ('vfmaddsub231ps ymm', 'c4e26db6cb', 4, 4), ('vfmsubadd231pd xmm', 'c4e2e9b7cb', 8, 8),
+        ('vfmaddsub231ps xmm', 'c4e269b6cb', 4, 4), ('vfmadd231ps ymm m', 'c4e26db80b', 4, 4),
+        # scalars (VEX), SSE4.1 dot products
+        ('vaddss', 'c5ea58cb', 4, 4), ('vsubsd', 'c5eb5ccb', 8, 8), ('vsqrtss', 'c5ea51cb', 4, 4), ('vminsd', 'c5eb5dcb', 8, 8), ('vcmpeqss', 'c5eac2cb00', 4, 4),
+        ('vcvtss2sd', 'c5ea5acb', 4, 8), ('vcvtsd2ss', 'c5eb5acb', 8, 4), ('vcomisd', 'c5f92fca', 8, 8), ('vucomiss', 'c5f82eca', 4, 4),
+        ('dpps ff', '660f3a40caff', 4, 4), ('dpps 71', '660f3a40ca71', 4, 4), ('dpps 3f', '660f3a40ca3f', 4, 4), ('dppd 33', '660f3a41ca33', 8, 8),
+        ('dppd 31', '660f3a41ca31', 8, 8), ('dppd ff m', '660f3a410bff', 8, 8), ('dpps f1 m', '660f3a400bf1', 4, 4),
+        ('vdpps 71', 'c4e36940cb71', 4, 4), ('vdpps ymm ff', 'c4e36d40cbff', 4, 4), ('vdpps ymm 7f m', 'c4e36d400b7f', 4, 4), ('vdppd ff', 'c4e36941cbff', 8, 8),
+        # not tested by software at all: no DE (rounding, reciprocals, integer conversions)
+        ('roundps', '660f3a08ca04', 4, 4), ('rcpps', '0f53ca', 4, 4), ('cvtps2dq', '660f5bca', 4, 4), ('cvttsd2si', 'f20f2cc2', 8, 8),
+    ]
+
+    @staticmethod
+    def lane(rnd, e):
+        v = VALUES[e]
+        k = rnd.random()
+        bits, man = 8 * e, 23 if e == 4 else 52
+        if k < 0.30: return v[rnd.choice(('one', 'minn', 'zero', 'nzero', 'inf', 'ninf', 'qnan', 'snan'))]
+        if k < 0.50: return v[rnd.choice(('den', 'dmax', 'dneg'))]
+        if k < 0.65: return rnd.getrandbits(bits - 1 - man) << man   # a zero mantissa: normal powers of two, zero or infinity
+        if k < 0.80: return rnd.getrandbits(man) | rnd.getrandbits(1) << (bits - 1)   # a random denormal or zero
+        return rnd.getrandbits(bits)
+
+    def make(self, rnd, e):
+        per = 16 // e
+        vec = lambda: sum(self.lane(rnd, e) << 8 * e * k for k in range(per))
+        return [vec() for _ in range(16)], [vec() for _ in range(16)], vec() | vec() << 128 | vec() << 256 | vec() << 384
+
+    def run_one(self, form, afp, xmm, hi, mem):
+        words, lines, spills = native_words(form, *([] if afp else self.AFP0))
+        self.assertEqual(spills, 0, form)
+        i = max(k for k, l in enumerate(lines) if l.startswith('svc'))
+        while lines[i - 1].startswith(('mov w0', 'movk w0')): i -= 1
+        words = [0xd51b443f] + words[:i] + [0xd53b4420]   # msr fpsr, xzr ... mrs x0, fpsr
+        buf = bytearray(8192)
+        for n in range(16): buf[0xc0 + 16 * n:0xd0 + 16 * n] = hi[n].to_bytes(16, 'little')
+        buf[self.MEM:self.MEM + 64] = mem.to_bytes(64, 'little')
+        v = [0] * 32
+        for n in range(16): v[16 + n] = xmm[n]
+        x, v, b = native_run(words, v=v, buf=bytes(buf), ptrs=[(6, self.MEM)], fpcr=6 if afp else 0)
+        return x[0], v[16:], b
+
+    @staticmethod
+    def same_outside_nans(m4, ours, e):
+        """The bytes of two equal-length results, equal except in the e-byte lanes where `m4` holds a NaN (the NaN rules are chunk 3's)."""
+        for k in range(0, len(m4), e):
+            a, b = m4[k:k + e], ours[k:k + e]
+            if a != b and not fp_class(int.from_bytes(a, 'little'), e)['nan']: return False
+        return True
+
+    def test_oracle(self):
+        trials = int(os.environ.get('ORACLE_TRIALS', 60))
+        rnd = random.Random(2026)
+        n = idc = 0
+        for name, form, e, re_ in self.FORMS:
+            if e == 2: e = 4   # (half-precision sources: random 4-byte lanes are random half pairs)
+            for t in range(trials):
+                xmm, hi, mem = self.make(rnd, e)
+                f4, v4, b4 = self.run_one(form, True, xmm, hi, mem)
+                fa, va, ba = self.run_one(form, False, xmm, hi, mem)
+                ctx = (name, t, [hex(q) for q in xmm[:4]], hex(mem), 'M4 FPSR', hex(f4), 'accurate', hex(fa))
+                self.assertEqual(fa & 0x80, f4 & 0x80, ctx)
+                self.assertTrue(all(self.same_outside_nans(a.to_bytes(16, 'little'), b.to_bytes(16, 'little'), re_) for a, b in zip(v4, va)), ctx)
+                # memory (a store form's result), the upper halves and the rest of the guest state outside the NaN lanes
+                self.assertTrue(self.same_outside_nans(b4[0xc0:0x1c0], ba[0xc0:0x1c0], re_), ctx)
+                self.assertTrue(self.same_outside_nans(b4[self.MEM:self.MEM + 64], ba[self.MEM:self.MEM + 64], re_), ctx)
+                self.assertEqual(b4[:0xc0] + b4[0x1c0:self.MEM], ba[:0xc0] + ba[0x1c0:self.MEM], ctx)
+                n += 1
+                idc += bool(f4 & 0x80)
+        self.assertGreater(idc, n // 10)
+
+    def test_fast_mode_and_daz_have_no_software_flag(self):
+        for name, form, e, re_ in self.FORMS:
+            fast = native_words(form, '--feature', 'afp=0')[1]
+            daz = native_words(form, *self.AFP0, '--daz')[1]
+            unmasked = native_words(form, *self.AFP0, '--simd-unmasked', '0x2')[1]
+            self.assertEqual(soft_de_words(fast), 0, name)   # fast mode: the plain code, no test
+            self.assertEqual(soft_de_words(daz), 0, name)    # DAZ: x86 sets no DE
+            self.assertNotIn('msr FPSR, x0', fast, name)
+            self.assertEqual(unmasked, native_words(form, '--feature', 'afp=0', '--simd-unmasked', '0x2')[1], name)   # DE unmasked: as fast mode
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class AfpUpperZero(unittest.TestCase):
     AFP0 = ('--feature', 'afp=0')
 
