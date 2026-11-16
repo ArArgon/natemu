@@ -198,7 +198,7 @@ pub struct DiskCache {
     writer: Mutex<Option<std::sync::mpsc::Sender<Entry>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Bytes of the packs kept at start (after eviction), and their entries.
-    #[allow(dead_code)] // no longer printed at open
+    #[allow(dead_code)] // read only by the tests (eviction and entry counts) since the open line went
     pub(crate) bytes: u64,
     #[allow(dead_code)]
     pub(crate) entries: usize,
