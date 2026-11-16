@@ -7,9 +7,10 @@
 //! process: the program driver's stderr stays as it was. The interrupt-controller API is a deployment fact (its functions
 //! are strong imports: macOS 15 or later, stated in the README), not probed.
 use crate::admission::{
-    Class, FEATURES, FPTRAPS_MASK, ID_REGISTERS, MACHINE, detected, forced_off, supported_features,
+    Class, FEATURES, ID_REGISTERS, MACHINE, detected, forced_off, supported_features,
 };
 use crate::vm::{ACTLR_EL1, Vcpu, config_id_register};
+use natemu_abi::FPTRAPS_MASK;
 use std::sync::OnceLock;
 
 /// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
@@ -34,9 +35,6 @@ pub(crate) struct Launch {
 pub(crate) struct Probe {
     pub id: [u64; ID_REGISTERS.len()],
     pub tso: bool,
-    /// The six FPCR trap-enable bits read back set ([`FPTRAPS_MASK`]); `true` at startup, set from the resident's readback
-    /// ([`fptraps_refusal`]): HVF returns the host's own FPCR value until the vCPU has run, so the host cannot check it here.
-    pub fptraps: bool,
     pub forced_off: u64,
 }
 impl Probe {
@@ -48,8 +46,6 @@ impl Probe {
         }
         Ok(Self {
             id,
-            // Not readable here: the resident's first run reads it back ([`fptraps_refusal`]).
-            fptraps: true,
             tso: cpu.sys(ACTLR_EL1)? & 2 != 0,
             forced_off: match std::env::var_os("NATEMU_FEXC_FEATURE_OFF") {
                 Some(list) => forced_off(&list.to_string_lossy())?,
@@ -70,7 +66,7 @@ impl Probe {
         let features = (FEATURES.iter().enumerate()).map(|(i, f)| (f.name, &f.detect, f.class, off(i)));
         let machine = MACHINE.iter().map(|&(n, ref d, c)| (n, d, c, false));
         (features.chain(machine))
-            .filter(|&(_, d, c, off)| c == class && (off || !detected(d, &self.id, self.tso, self.fptraps)))
+            .filter(|&(_, d, c, off)| c == class && (off || !detected(d, &self.id, self.tso)))
             .map(|(n, ..)| n)
             .collect()
     }
@@ -137,8 +133,7 @@ impl Probe {
 /// The refusal for the resident's FPCR readback `fpcr` (`Shared::fpcr_traps`, read after the vCPU ran): `host lacks fptraps`
 /// unless every [`FPTRAPS_MASK`] bit read back set.
 pub(crate) fn fptraps_refusal(fpcr: u64) -> Option<String> {
-    let probe = Probe { id: [0; ID_REGISTERS.len()], tso: true, fptraps: fpcr & FPTRAPS_MASK == FPTRAPS_MASK, forced_off: 0 };
-    (!probe.fptraps).then(|| format!("host lacks {}", MACHINE.iter().find(|r| matches!(r.1, crate::admission::Detect::FpTraps)).unwrap().0))
+    (fpcr & FPTRAPS_MASK != FPTRAPS_MASK).then(|| "host lacks fptraps".into())
 }
 
 /// The startup probe for a created vCPU: refuses with one message, prints the startup line once per process, and
@@ -184,7 +179,7 @@ fn config_view() -> Result<&'static [u64; ID_REGISTERS.len()], String> {
 }
 fn machine(name: &str) -> Result<bool, String> {
     let row = MACHINE.iter().find(|r| r.0 == name).expect("machine row");
-    Ok(detected(&row.1, config_view()?, true, true))
+    Ok(detected(&row.1, config_view()?, true))
 }
 /// FEAT_CSV3 (ID_AA64PFR0_EL1[63:60]): the host's loads do not pass faulting data on (the only condition for RDCL_NO
 /// besides `--speculation-barriers`). An error when the hypervisor cannot be read.
@@ -212,7 +207,7 @@ mod tests {
     ];
     const LAUNCH: Launch = Launch { speculation_barriers: false, pool: true, compile_cache: None };
     fn probe(f: impl FnOnce(&mut Probe)) -> Probe {
-        let mut p = Probe { id: FULL, tso: true, fptraps: true, forced_off: 0 };
+        let mut p = Probe { id: FULL, tso: true, forced_off: 0 };
         f(&mut p);
         p
     }
@@ -275,10 +270,7 @@ mod tests {
         // Each alone, and the TSO bit and PMULL (AES field 1: AES yes, PMULL no).
         assert_eq!(probe(|p| p.id[5] = 0).missing(), ["lse2"]);
         assert_eq!(probe(|p| p.tso = false).missing(), ["apple_tso"]);
-        // A host whose FPCR trap-enable readback is 0 is refused by name.
-        assert_eq!(probe(|p| p.fptraps = false).missing(), ["fptraps"]);
-        assert_eq!(probe(|p| p.fptraps = false).refusal().as_deref(), Some("host lacks fptraps"));
-        // The resident's readback: a RES0 bit (0x20) or no bit reads 0 and is refused; all six pass.
+        // The resident's FPCR readback: a RES0 bit (0x20) or no bit reads 0 and is refused; all six pass.
         assert_eq!(fptraps_refusal(0x9f00).as_deref(), None);
         assert_eq!(fptraps_refusal(0x9f20).as_deref(), None);
         assert_eq!(fptraps_refusal(0).as_deref(), Some("host lacks fptraps"));

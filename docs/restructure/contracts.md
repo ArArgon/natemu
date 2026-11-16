@@ -1010,8 +1010,9 @@ memory accesses and unknown opcodes.
 - Core features are derived: a built feature whose required Arm features all lie in the host floor.
 - The shim's verdict rows and the host decode's #UD decisions test generated constants (`fexc_features.h`,
   `cpu_gates.rs`), not hand-written verdicts.
-- Host Arm features are `admission::FEATURES` (class, floor) plus the probe's machine rows (LSE2, Apple's TSO bit, FP and AdvSIMD, trapped FP exceptions `fptraps`). They are checked once at
-  startup, which refuses with one line naming everything missing.
+- Host Arm features are `admission::FEATURES` (class, floor) plus the probe's machine rows (LSE2, Apple's TSO bit, FP and AdvSIMD). They are checked once at
+  startup, which refuses with one line naming everything missing. Trapped FP exceptions (`fptraps`, required) are refused separately,
+  by the resident's FPCR readback at its first run (after the Linux path's startup lines), as `host lacks fptraps`.
 - Enforced by:
   - `cpu_profile.py` `catalogue_problems` (one negative control per rule, `test_cpu_profile.py`);
   - `gen_cpu_profile_rs.py --check` (all three generated files);
