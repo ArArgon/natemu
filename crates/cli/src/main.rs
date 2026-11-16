@@ -71,7 +71,7 @@ struct Cli {
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
     /// Floating-point mode (AFP accurate plan chunk 1): fast (the default) or accurate; accurate changes code only on a host without FEAT_AFP
-    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", value_parser = natemu::execution::parse_fp)]
+    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_fp)]
     fp: bool,
     /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
     /// does (off), or it answers and the walk is made too, a difference counted (check)

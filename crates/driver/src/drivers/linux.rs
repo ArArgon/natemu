@@ -109,7 +109,7 @@ pub(crate) struct Args {
     page_currency: u64,
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
-    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", value_parser = natemu::execution::parse_fp)]
+    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_fp)]
     fp: bool,
     #[arg(long)]
     rng: bool,
