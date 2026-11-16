@@ -258,10 +258,15 @@ def mx_of(c):
     return dev.make_mx(RESET_MXCSR, c['want'][1]) if c['want'] and c['want'][0] == 'mxcsr' else None
 
 
-def judge(a, host, runtime, c):
+def judge_kind(a, host, runtime, c):
     """(problems, kind): kind is ok, deviated (as documented) or fail."""
     res = judge_state(a, host, runtime, c)
     return res if isinstance(res, tuple) else (res, 'fail' if res else 'ok')
+
+
+def judge(a, host, runtime, c):
+    """The problems (empty: as expected, or deviated as documented). run_i9_faults, run_i10_faults and run_maskmovq call this."""
+    return judge_kind(a, host, runtime, c)[0]
 
 
 def judge_state(a, host, runtime, c):
@@ -350,7 +355,7 @@ def main():
     results, counts = [], dev.Counts()
     for c in cases():
         if a.only and a.only not in c['name']: continue
-        problems, kind = judge(a, host, runtime, c)
+        problems, kind = judge_kind(a, host, runtime, c)
         m = mx_of(c)
         counts.add(kind, m and m['tag'])
         results.append({'name': c['name'], 'insn': c['insn'], 'ok': kind != 'fail', 'outcome': kind, 'tag': m and m['tag'], 'problems': problems})
