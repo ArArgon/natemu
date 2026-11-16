@@ -1281,7 +1281,8 @@ impl<'a> Verifier<'a> {
     /// I6 (code shape): an x87 stack slot, FEX's `mm[I]` in the guest-state page: `add x0, x28, xI, lsl #4` right before an
     /// 8-byte access `[x0, #mm]` (I = (TOP + i) & 7, which fexc masks; the hardware keeps any address inside EL0's mappings).
     /// The index register's last write before the `add` must be `and wI, wN, #7` (fexc masks every index: TOP is guest data),
-    /// and no branch from outside that span may enter after that `and` up to the access, so every path to the access masks the index and adds it
+    /// and no branch from outside that span may enter after that `and` up to the access, nor any branch reach the access itself,
+    /// so every path to the access masks the index and adds it
     /// (the slot stays inside the guest-state page: x28 + 0x420 + 7 * 16 + 8 <= x28 + 0x498).
     fn x87_slot(&self, m: Mem, at: u32) -> bool {
         if at < ENTRY_OFFSET + 4
@@ -1297,8 +1298,9 @@ impl<'a> Verifier<'a> {
             k -= 4;
             if self.insn(k).is_some_and(|i| i.writes() & 1 << index != 0) {
                 return self.word(k) & 0xffff_fc1f == 0x1200_0800 | index   // and wI, wN, #0x7
-                    // (a branch from between the mask and the access, as AFP fallback's x87 NaN fix-up has, passed the mask itself)
-                    && self.branches_into(k, at).all(|(src, _)| src > k && src < at);
+                    // (a branch from between the mask and the `add`, as AFP fallback's x87 NaN fix-up has, passed the mask itself;
+                    // its target must not be the access, which would skip the `add`)
+                    && self.branches_into(k, at).all(|(src, t)| src > k && src < at && t < at);
             }
         }
         false
@@ -2416,6 +2418,20 @@ mod tests {
                 }
             }
         }
+        // The NaN fix-up's `b` (between the mask and the `add`) retargeted to the slot store skips the `add`: refused.
+        let object = compile("d8c9", &["--feature", "afp=0"]);
+        let h: Header = super::super::record(&object, 0);
+        let word = |i: usize| u32::from_le_bytes(object[h.code_offset as usize + 4 * i..][..4].try_into().unwrap());
+        let words = (object.len() - h.code_offset as usize) / 4;
+        let store = (0..words).rev().find(|&i| word(i) & 0xffff_ffe0 == 0xfd02_1000).expect("str dN, [x0, #0x420]");
+        let b = (0..store).rev().find(|&i| word(i) & 0xfc00_0000 == 0x1400_0000).expect("the fix-up's b");
+        refused(
+            (&object, &[0xd8, 0xc9]),
+            4 * b as u32,
+            word(b),
+            0x1400_0000 | (store - b) as u32,
+            "unrecorded memory access",
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
