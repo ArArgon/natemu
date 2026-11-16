@@ -245,6 +245,12 @@ inline FexcArg<uint64_t, FEXC_ARG_X87_UNMASKED> fexc_x87_unmasked;
 inline bool fexc_no_afp = false;
 inline FexcArg<bool, FEXC_ARG_DAZ> fexc_daz;
 inline FexcArg<bool, FEXC_ARG_FTZ> fexc_ftz;
+// AFP fallback, decision C (the unmasked case): FexcKeep ops (placed right before a SIMD check, only without AFP and with MXCSR.UM clear)
+// name the operands of the instruction's multiplies, divides, FMAs and narrowing converts, each with a tag (crates/abi `tiny`: the
+// descriptor's meta byte | position << 8 | half << 10); the JIT collects (tag, vector register) here and the check that follows takes
+// them into its stub's site: `width` = meta, `imm` = five bits per register by slot (3 * half + position), `guest_offset2` = the native
+// offset after the check's `cbnz` (the resident resumes there when it finds no operand lane tiny after rounding).
+inline std::vector<std::pair<uint32_t, uint8_t>> FexcKeepList;
 // Two bytes of FEX's flag array no FEX code uses (X87FLAG_DE_LOC, X87FLAG_ZE_LOC), guest-state fields for I5c, both in FPSR's
 // flag order: the MXCSR flags SIMD-checked instructions raised since the last resident entry (folded there into MXCSR), and the
 // flags the x87 ops of the current x87 instruction raised so far (folded into the x87 exception word at its end).

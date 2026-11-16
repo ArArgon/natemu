@@ -55,7 +55,9 @@ pub mod kind {
     /// I5c check stubs (no access, no address): an SSE/AVX instruction raised an unmasked SIMD exception (#XM, or #UD without
     /// CR4.OSXMMEXCPT; `brk #5`); an x87 instruction raised an unmasked exception that leaves its operands unaltered (`brk #7`:
     /// `width` its length, its check word in w0); a waiting x87, WAIT or MMX instruction found an x87 exception pending (#MF,
-    /// `brk #8`). (`brk #6` is the resident's stop word, `execution::STOP_IMM`.)
+    /// `brk #8`). (`brk #6` is the resident's stop word, `execution::STOP_IMM`.) Without AFP and with UE unmasked a SIMD stub may
+    /// describe the operands of its instruction's multiplies, divides, FMAs and narrowing converts ([`crate::tiny`]): `width` =
+    /// the descriptor's meta byte, `imm` its registers, `guest_offset2` the offset after the check's `cbnz` (else 0, 0, [`NONE32`]).
     pub const SIMD: u8 = 15;
     pub const X87: u8 = 16;
     pub const PENDING: u8 = 17;

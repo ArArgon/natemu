@@ -406,12 +406,70 @@ inline bool Commits(FEXCore::IR::IROps Op) {
   case OP_GUESTOPCODE: case OP_INVALIDATEFLAGS: case OP_INLINECONSTANT: case OP_INLINEENTRYPOINTOFFSET: case OP_PREFETCH:
   case OP_LOADCONTEXTPAIR: case OP_LOADMEMPAIR: case OP_VLOADNONTEMPORAL: case OP_DIV: case OP_UDIV: case OP_FCMP: case OP_STORENZCV:
   case OP_SETROUNDINGMODE: case OP_PUSHROUNDINGMODE: case OP_POPROUNDINGMODE: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
-  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE:
+  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP:
   case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG: case OP_RMIFNZCV: case OP_CONDADDNZCV:
   case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS: case OP_ADCNZCV: case OP_SBBNZCV:
   case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ: case OP_TESTZ: case OP_SHIFTFLAGS:
   case OP_ROTATEFLAGS: case OP_FEXCFLUSH: return false;
   default: return HasSideEffects(Op);
+  }
+}
+// AFP fallback, decision C (the unmasked case): without FEAT_AFP Arm judges tininess before rounding, x86 after (inventory 1.8), so a
+// result that rounds up to +-MIN_NORMAL raises UFC and a spurious #XM. The resident decides exactly from the operands (crates/abi
+// `tiny`), which it reads from the registers at the check's stub; FexcKeep ops before the check keep them live. `TinyDescOf` says for one
+// op whether it can raise a UFC the resident could not judge (returns false: an add, a subtract, a half-precision narrowing... the
+// instruction then keeps today's behaviour) and describes the ones it can: meta (crates/abi `tiny`) and the operands by position.
+struct TinyDesc { uint8_t Meta = 0; uint8_t Arg[3] {}; const FEXCore::IR::IROp_Header* Op = nullptr; };   // Arg: indices into Op->Args
+inline bool TinyDescOf(const FEXCore::IR::IROp_Header* Op, TinyDesc& D) {
+  using namespace FEXCore::IR;
+  D.Op = Op;
+  constexpr uint8_t Mul = 1, Div = 2, Fma = 3, Cvt = 4, Elem8 = 1 << 3, Scalar = 1 << 4, NegP = 1 << 6, NegA = 1 << 7;
+  const uint32_t Size = OpSizeToSize(Op->Size), E = OpSizeToSize(Op->ElementSize);
+  auto Bin = [&](uint8_t Kind, bool Sc, uint8_t Neg = 0, size_t First = 0) {
+    if (E != 4 && E != 8) return false;
+    if (!Sc && Size != 16) return false;
+    D.Meta = Kind | (E == 8 ? Elem8 : 0) | (Sc ? Scalar : 0) | Neg;
+    const size_t N = Kind == Fma ? 3 : 2;
+    for (size_t i = 0; i < N; ++i) D.Arg[i] = uint8_t(First + i);
+    return true;
+  };
+  switch (Op->Op) {
+  case OP_VFMUL: return Bin(Mul, false);
+  case OP_VFDIV: return Bin(Div, false);
+  case OP_VFMLA: return Bin(Fma, false);
+  case OP_VFMLS: return Bin(Fma, false, NegA);
+  case OP_VFNMLA: return Bin(Fma, false, NegP);
+  case OP_VFNMLS: return Bin(Fma, false, NegP | NegA);
+  case OP_VFMULSCALARINSERT: return Bin(Mul, true);
+  case OP_VFDIVSCALARINSERT: return Bin(Div, true);
+  case OP_VFMLASCALARINSERT: return Bin(Fma, true, 0, 1);
+  case OP_VFMLSSCALARINSERT: return Bin(Fma, true, NegA, 1);
+  case OP_VFNMLASCALARINSERT: return Bin(Fma, true, NegP, 1);
+  case OP_VFNMLSSCALARINSERT: return Bin(Fma, true, NegP | NegA, 1);
+  case OP_VFTOFSCALARINSERT: {   // Vector1 holds the upper elements, Vector2 the source
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_VFToFScalarInsert>()->SrcElementSize);
+    if (E >= Src) { D.Meta = 0; return true; }   // widening or same size: no underflow
+    if (!(E == 4 && Src == 8)) return false;
+    D.Meta = Cvt | Elem8 | Scalar; D.Arg[0] = 1;
+    return true;
+  }
+  case OP_FLOAT_FTOF: {
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_Float_FToF>()->SrcElementSize), Dst = Size;
+    if (Dst >= Src) { D.Meta = 0; return true; }
+    if (!(Dst == 4 && Src == 8)) return false;
+    D.Meta = Cvt | Elem8 | Scalar; D.Arg[0] = 0;
+    return true;
+  }
+  case OP_VECTOR_FTOF: {
+    const uint32_t Src = OpSizeToSize(Op->C<IROp_Vector_FToF>()->SrcElementSize);
+    if (E >= Src) { D.Meta = 0; return true; }
+    if (!(E == 4 && Src == 8 && Size == 16)) return false;
+    D.Meta = Cvt | Elem8; D.Arg[0] = 0;
+    return true;
+  }
+  case OP_VFADD: case OP_VFSUB: case OP_VFADDP: case OP_VFCADD: case OP_VFADDV: case OP_VFADDSCALARINSERT: case OP_VFSUBSCALARINSERT:
+  case OP_VFCVTN2: return false;   // exact sums (a tiny sum is a denormal: the shim's exact-tiny test) and VCVTPS2PH's halves
+  default: D.Meta = 0; return true;
   }
 }
 // Places the checks (run at the start of flag elimination, after the x87 stack pass, before register allocation). An
@@ -498,6 +556,23 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
         }
         // a check takes the software flags of the ops after the previous check up to its own point
         auto Check = [&](long After, long Upto) {
+          // AFP fallback, decision C: the operands of the multiplies, divides, FMAs and narrowing converts after the previous check, kept live
+          // for the resident (at most two ops, the halves of a 256-bit one, all alike: else the instruction is not described)
+          if (fexc_no_afp && (uint64_t(fexc_simd_unmasked) >> 4 & 1)) {
+            TinyDesc Ds[2];
+            size_t N = 0;
+            bool Ok = true;
+            for (long i = After + 1; i <= Upto && i < long(First) && Ok; ++i) {
+              TinyDesc D;
+              Ok = TinyDescOf(IR.template GetOp<IROp_Header>(Insn[i].first), D);
+              if (Ok && D.Meta) { if (N == 2) Ok = false; else Ds[N++] = D; }
+            }
+            if (Ok && N == 2 && Ds[0].Meta != Ds[1].Meta) Ok = false;
+            if (Ok && N)
+              for (size_t h = 0; h < N; ++h)
+                for (size_t k = 0; k < ((Ds[h].Meta & 7) == 3 ? 3u : (Ds[h].Meta & 7) == 4 ? 1u : 2u); ++k)
+                  IREmit->_FexcKeep(IR.GetNode(Ds[h].Op->Args[Ds[h].Arg[k]]), uint32_t(Ds[h].Meta) | uint32_t(k) << 8 | uint32_t(h) << 10);
+          }
           Ref De = nullptr;
           for (const auto& D : Des)
             if (long(D.first) > After && long(D.first) <= Upto) De = De ? IREmit->_Or(OpSize::i32Bit, De, D.second) : D.second;
@@ -765,7 +840,7 @@ inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op) {
   case OP_RMIFNZCV: case OP_CONDADDNZCV: case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS:
   case OP_ADCNZCV: case OP_SBBNZCV: case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ:
   case OP_TESTZ: case OP_SHIFTFLAGS: case OP_ROTATEFLAGS: case OP_FCMP: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
-  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCFLUSH: case OP_FEXCMXCSR: case OP_FEXCREPSTOS: case OP_FEXCX87SVC:
+  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP: case OP_FEXCFLUSH: case OP_FEXCMXCSR: case OP_FEXCREPSTOS: case OP_FEXCX87SVC:
     return true;
   default: return false;
   }

@@ -1935,6 +1935,8 @@ pub const fn fpsr_bits(x86: u64) -> u64 {
 }
 /// FPSR's pre-computation flags (IOC, DZC, IDC: invalid, divide-by-zero, denormal; SDM Vol.1 4.9.2, 11.5.3).
 pub const FPSR_PRE: u64 = 1 | 2 | 0x80;
+/// FPSR.UFC (underflow, tiny before rounding and inexact: Arm's judgement without FEAT_AFP; x86 judges after rounding: [`crate::tiny`]).
+pub const FPSR_UFC: u64 = 8;
 /// I5c: the FPSR flags an SSE/AVX instruction that raised an unmasked SIMD exception sets in MXCSR (SDM Vol.1 11.5.3.2,
 /// 11.5.3.3), from `raised`, its operation's FPSR flags (every element's): with an unmasked pre-computation exception the
 /// pre-computation flags only (post-computation conditions are not looked for), else all of them, masked ones included.

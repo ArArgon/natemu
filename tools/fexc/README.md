@@ -445,6 +445,18 @@ x87 instructions are left alone, VCVTPS2PH honours DAZ but not FTZ, RCP's result
 flags are restored), and the unmasked-PE check mask gains UFC under effective FTZ (`SimdCheckMask`). `tools/fexc/test_slice1.py`
 (`AfpFlush`) pins the shapes; the replay with `afp=0` added shows the common mode unchanged.
 
+**Tininess after rounding without AFP** (AFP fallback, decision C, the unmasked case; none of it with AFP or with UE masked: nothing is
+placed unless `fexc_no_afp` and UE is unmasked in `--simd-unmasked`). Arm judges tininess before rounding, x86 after (SDM Vol.1
+4.9.1.5), so a multiply, divide, FMA or binary64 to binary32 narrowing whose exact result lies just below +-MIN_NORMAL and rounds to it
+raises UFC and a spurious #XM; the result itself (+-MIN_NORMAL) is x86's. The hardware result does not tell the cases apart (x86's band is half
+as wide as the denormal grid's for round to nearest), so the resident recomputes the exact value from the operands (crates/abi `tiny`).
+Before the check of such an instruction `PlaceFPChecks` places one `FexcKeep` per operand (FEX op: no code; it only keeps the register
+live up to the check), with a tag (kind, element size, scalar, halves, FMA negations, position); the JIT records the registers in the
+check's stub site: `width` = the meta byte, `imm` = five bits per slot (3 * half + position), `guest_offset2` = the offset after the check's
+`cbnz` (where the resident resumes when it finds no operand lane tiny after rounding, with the check word's UFC cleared). An instruction
+with an add, subtract or any other op that can raise a UFC the resident could not judge is not described (its check stays as it was).
+Admission checks the descriptor and that the resume point follows the check's branch. Tests: `AfpTiny` in test_slice1.py.
+
 **Software DE and the FMA sanitizing without AFP** (AFP fallback chunk 3b, plan rows 7, 8 and 10; none of it with AFP, none in the
 common mode: nothing is placed unless `fexc_no_afp` and the exception is unmasked in `--simd-unmasked` or `--x87-unmasked`, so no new
 argument and no new key; a compile reads no argument it did not read before). A host without FEAT_AFP never sets IDC, so with MXCSR.DM

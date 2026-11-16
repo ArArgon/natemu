@@ -49,6 +49,7 @@ use natemu_abi::{
     guest_memory::{self, CodePages, CodeWrites},
     paging::{self, Access, Fault},
     shadow::{self, READ_ONLY},
+    tiny,
 };
 
 unsafe extern "C" {
@@ -3498,7 +3499,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             // A legacy SSE operand that is not 16-byte aligned (I5a): #GP(0) before any walk.
             object::kind::ALIGN => guest_fault(s, f, b, &site, [13, 0, 0]),
             object::kind::SIMD | object::kind::X87 | object::kind::PENDING => {
-                fp_exception(s, f, b, &site)
+                fp_exception(s, f, b, &site, spsr)
             }
             object::kind::SPLIT => split(s, f, b, all, &site, spsr),
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
@@ -3512,13 +3513,34 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
 /// instruction is done, `width` its length; #MF waits for the next waiting instruction), or a waiting instruction with an
 /// x87 exception pending (#MF with CR0.NE, else the stop `unsupported_ferr`: [`x87::pending`]).
 #[inline(never)]
-fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
+fn fp_exception(mut s: State, f: &NativeFrame, b: &Block, site: &Site, spsr: u64) -> ! {
     let before = s.cpu.mxcsr;
+    // The check word (x0, as an x87 stub's): FPSR, and without AFP with DE unmasked also FPSR bit 7 (IDC) when the software test of
+    // the instruction's operands found a denormal (AFP fallback 3b, row 7). Where the hardware raises IDC the word is FPSR itself.
+    let mut word = f.x[0];
+    if site.kind == object::kind::SIMD && s.cpu.no_afp != 0 {
+        // AFP fallback, decision C: without AFP, UFC means tiny before rounding, x86 judges after it. With UE unmasked the site
+        // (width, imm: crates/abi `tiny`) says which operands the instruction's multiplies, divides, FMAs and narrowing converts
+        // had, in the registers the stub still holds: when no lane is tiny after rounding (round to ±MIN_NORMAL), x86 raises no UE.
+        if let Some(d) = tiny::Desc::decode(site.width, site.imm)
+            .filter(|_| site.guest_offset2 != object::NONE32 && word & FPSR_UFC != 0 && simd_unmasked(before) & 16 != 0)
+            && !tiny::any_tiny(&d, (before >> 13 & 3) as u32, |r| f.q[r as usize & 31])
+        {
+            word &= !FPSR_UFC;
+            // Nothing else unmasked is raised: the instruction completes. Its check passed, so generated code goes on after the check
+            // with the word the flags are folded from (x0) without the UFC, as if the hardware had not raised it.
+            if word & fpsr_bits(simd_unmasked(before)) == 0 {
+                unsafe {
+                    let frame = &raw mut (*shared()).captured;
+                    (*frame).x[0] = word;
+                    resume(&s, frame, b.code_va() + u64::from(site.guest_offset2), spsr)
+                }
+            }
+        }
+    }
     bank_at(&mut s, f, b, site);
     let e = match site.kind {
-        // The check word (x0, as an x87 stub's): FPSR, and without AFP with DE unmasked also FPSR bit 7 (IDC) when the software test of
-        // the instruction's operands found a denormal (AFP fallback 3b, row 7). Where the hardware raises IDC the word is FPSR itself.
-        object::kind::SIMD => sse::exception(&mut s.cpu, before, f.x[0]),
+        object::kind::SIMD => sse::exception(&mut s.cpu, before, word),
         object::kind::X87 => {
             x87::exception(s.cpu.fcw, f.x[0]);
             s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(site.width));
