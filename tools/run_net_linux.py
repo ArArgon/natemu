@@ -51,6 +51,7 @@ import time
 import tempfile
 
 from io_common import PCI_PROBE, ROOT, VM_LOCK, digest, patch, pci_errors, pci_self_test, stop_group, write_json
+from io_common import STARTUP_LINE
 from raw_root import RAW_ROOT
 from run_virtio_rng import KVER
 
@@ -289,7 +290,7 @@ def judge(case, text, stderr, code, elapsed, blob_sha, internet, pci=None, host_
     protocols = forward_protocols(case)
     if protocols:
         require(host_results.get('release') == {protocol: True for protocol in protocols}, 'forward listeners not released')
-    stops = re.findall(r'^natemu: (?![a-z]+(?: [a-z]+)?: )(\S+)', stderr, re.M)   # the stops, not the startup lines (`natemu: <topic>: <value>`; stops have no colon after the first words)
+    stops = re.findall(r'^natemu: (\S+)', '\n'.join(l for l in stderr.splitlines() if not STARTUP_LINE.match(l)), re.M)   # the stops, not the startup lines (io_common.STARTUP_TOPICS)
     if case == 'cancel':
         require(dhcp and all(d == 'ip=10.0.2.15 mask=24 router=10.0.2.2 dns=10.0.2.3' for d in dhcp), f'DHCP lease {dhcp}')
         require(code == 2 and stops and all(s == 'Cancelled' for s in stops), f'cancel: exit {code}, stops {stops}')
@@ -728,6 +729,8 @@ def self_check():
     text, err, code, t = good['nodriver']
     assert judge('nodriver', text, 'natemu: Halted\n', 2, t, sha, True)
     assert judge('nodriver', text, 'natemu: cpu: x86-64-v3 +adx\nnatemu: fp: fast mode, degraded (host lacks FEAT_AFP)\nnatemu: acceleration: +FEAT_DotProd -FEAT_CSSC\nnatemu: meltdown: none\nnatemu: code cache: pool on, disk off\n' + err, code, t, sha, True) == []   # the startup line is no stop
+    for other in ('natemu: disk lock: held by another process\n', 'natemu: pci: bad bar\n'):   # warnings and errors that look like `topic: value` are still seen
+        assert judge('nodriver', text, other + err, code, t, sha, True) != [], other
     text, err, code, t = good['cancel']
     assert judge('cancel', text.replace('NET-CANCEL-READY\n', ''), err, code, t, sha, True), 'cancel accepted without traffic proof'
     assert judge('cancel', text, err, code, 12.0, sha, True)
