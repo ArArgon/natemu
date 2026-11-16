@@ -141,6 +141,12 @@ the FMA cases with quiet NaNs raise no IOC.
 
 ## 3. Decisions for the owner
 
+**Owner (November 15, after chunk 3b):** B, C and D were never decided; they are recommendations only. The owner's
+direction: make the simple ones exact (D, and C's unmasked case), then look for efficient ways to make the rest exact
+(B, C's masked flag, C's DAZ + FTZ result); only if their cost stays too high do they become documented deviations.
+The NaN guard of A is being measured (§6). D and RSQRT's NaN sign ride on A's out-of-line stub (chunk 4b); C's
+unmasked case is a resident recomputation at the existing #XM stub.
+
 The requirement is "x86-exact". Each of the following is either an exact fix at the stated cost or a declared
 deviation from the SDM on hosts without AFP. The M4 is unaffected either way.
 
