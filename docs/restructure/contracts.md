@@ -1023,6 +1023,25 @@ memory accesses and unknown opcodes.
 - Observable today: the startup line; #UD for forms of clear features; the refusal line.
 - Kind: design (`docs/restructure/cpu-features-plan.md`).
 
+**66. Floating point on a host without FEAT_AFP: fast mode is exact except for a registered list of deviations, and the M4 is exact.**
+- On an M1 or M2 (no FEAT_AFP; emulated on an M4 with `NATEMU_FEXC_FEATURE_OFF=afp`), the default fast mode makes the cheap
+  cases exact (AFP fallback plan rows 2-10, known-zero upper bits, unmasked UE tininess, x87 masked DE for m32/m64, x87 NaN
+  results). What it leaves different from x86 is the registry `tools/fp_deviations.py` `CLASSES` (masked SSE DE, NaN results,
+  the masked FMA inf×0+QNaN IE flag, the masked UE flag in the MIN_NORMAL band, the DAZ+FTZ band result); the README lists the
+  same names. Accurate mode (planned, `docs/restructure/afp-accurate-plan.md`) removes them.
+- On a host with AFP the generated code for the default mode is unchanged by any of this (byte-identical replay of both
+  recorded streams), and every FP runner and corpus is judged exactly.
+- The startup line `natemu: fp: fast mode, degraded (host lacks FEAT_AFP)` names the condition.
+- Enforced by:
+  - `tools/test_fp_deviations.py` (README and registry in step; the judging rule; the i8b judge);
+  - each FP runner's self-check (a tagged case that comes out exact fails; an untagged failure fails; strict judging on the M4,
+    in accurate mode, and for a report without the mode fields);
+  - the replay identity gate (`channel_replay_matches_the_pipe`) and the AFP identity unit test;
+  - the native oracles `AfpDenormal`, `AfpTiny`, `AfpX87` in `tools/fexc/test_slice1.py` (no-AFP code against the M4's hardware).
+- Grid: every FP runner run, in both modes; every compiler change.
+- Observable today: the startup `fp:` line; MXCSR/FSW flags and NaN results in the tagged cases.
+- Kind: design (`docs/restructure/afp-fallback-plan.md`).
+
 ## 2. Internal-only assertions and their replacements
 
 The plan admits four replacement forms: a guest-visible outcome, a contract
