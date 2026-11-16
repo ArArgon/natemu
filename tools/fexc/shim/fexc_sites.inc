@@ -505,7 +505,7 @@ void Arm64JITCore::FexcTinyLanes(ARMEmitter::VRegister R, uint32_t Elem, uint32_
 // The op's destination may overwrite a source, so a source it aliases is copied first (VTMP1, VTMP2: the scalar ops use neither).
 // Scalar double ops only (what the x87 lowering emits; after register allocation the args are registers, so FLD m64's multiply by 1.0
 // is not told apart: its fix-up gives the quieted SNaN it already had).
-//   hot path: [mov v16, src1] [mov v17, src2]  op  ...FexcX87End...  tbz x0, #0, done
+//   hot path: [mov v0, src1] [mov v1, src2] (VTMP1, VTMP2)  op  ...FexcX87End...  tbz x0, #0, done
 //   fix-up:   fmov x1, S1; ubfx x2, x1, #0, #63; movz x3, #0x7ff0, lsl #48; sub x2, x3, x2; tbnz x2, #63, first;
 //             [fmov x1, S2; ubfx x2, x1, #0, #63; sub x2, x3, x2; tbnz x2, #63, first;] movz x1, #0xfff8, lsl #48; b put;
 //             first: orr x1, x1, #(1 << 51); put: fmov Dd, x1; done:
