@@ -3,6 +3,7 @@
 never sets DE, so it cannot arbitrate.
 
     tools/with-env python3 tools/run_i5a_de.py --fexc FEXC --out DIR [--max-block N]
+    python3 tools/run_i5a_de.py --self-check        (no VM: the case tags and the judging rule's mutation checks)
 
 Expected (SDM Vol.2, each instruction's "SIMD Floating-Point Exceptions"; Vol.1 4.9.2 and 11.5.2 precedence; every exception
 masked): DE is set when an operand the instruction computes on is a denormal and MXCSR.DAZ is 0, for the forms that list
@@ -11,11 +12,14 @@ float-to-float conversions), never for the forms that do not (RCP/RSQRT estimate
 shuffle, blend, insert and move forms), never under DAZ, and not when the same operation reports IE (a NaN operand, QNaN
 included: no denormal is examined then) or ZE (a denormal divided by zero). Each case is one instruction between an LDMXCSR
 (1F80H, or 1FC0H with DAZ) and an STMXCSR; the other operand elements are 1.0. Only MXCSR.DE is judged.
+On a host without FEAT_AFP in fast mode (the run's own report says `afp` false and `fp` fast) a case that expects DE with DE
+masked is judged against the documented deviation `masked-sse-de` (DE missing, tools/fp_deviations.py), not skipped: DE set
+there fails, and so does any other result; everywhere else every case is judged as the SDM says.
 """
 import argparse, json, pathlib, struct, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
-import run_slice1_vm as vm1, ref
+import run_slice1_vm as vm1, ref, fp_deviations as dev
 
 D = 0x200000
 F32 = dict(one=0x3f800000, den=0x00000001, qnan=0x7fc00000, zero=0)
@@ -75,11 +79,31 @@ def cases():
     return out
 
 
+TAGGED = 98      # the cases tagged `masked-sse-de`: 98 of 351 (update with the case list)
+
+
+def mx_of(mx, de):
+    """The structured expected MXCSR of a case, DE only: every other bit is the starting one (the case judges DE alone)."""
+    return dev.make_mx(mx, mx | 2 if de else mx)
+
+
+def self_check():
+    cs = cases()
+    tags = [mx_of(c[4], c[5]) for c in cs]
+    n = sum(t['tag'] is not None for t in tags)
+    if n != TAGGED: sys.exit(f'run_i5a_de self-check FAILED: {n} tagged cases, expected {TAGGED}')
+    dev.self_check(next(t for t in tags if t['tag']), next(t for t in tags if not t['tag'] and t['want'] & 2 == 0), 'run_i5a_de')
+    print(f'{len(cs)} cases, {n} tagged masked-sse-de')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--fexc', type=pathlib.Path, required=True); ap.add_argument('--out', type=pathlib.Path, required=True)
+    ap.add_argument('--fexc', type=pathlib.Path); ap.add_argument('--out', type=pathlib.Path)
     ap.add_argument('--max-block', type=int); ap.add_argument('--no-build', action='store_true')
+    ap.add_argument('--self-check', action='store_true')
     a = ap.parse_args()
+    if a.self_check: return self_check()
+    if not (a.fexc and a.out): ap.error('--fexc and --out are required')
     host, runtime = (ROOT / 'target/release/natemu-host', ROOT / 'target/aarch64-unknown-none/release/natemu-runtime') if a.no_build else vm1.build()
     cs = cases()
     mem, lines = bytearray(0x40 * len(cs) + 0x40), []
@@ -98,15 +122,17 @@ def main():
     if run.returncode: sys.exit(f'driver: {run.stderr[-500:]}')
     d = json.loads(run.stdout); got = bytes.fromhex(d['memory'][0]['data'])
     if not vm1.at_hlt(d, 0x100000 + len(code) - 1): sys.exit(f"stopped {d['stop']} {d['reason']} at {d['rip']}")
-    bad, results = 0, []
+    counts, results = dev.Counts(), []
     for i, (name, text, x, y, mx, de) in enumerate(cs):
         out = struct.unpack_from('<I', got, 0x40 * i + 36)[0]
-        ok = bool(out & 2) == de
-        bad += not ok
-        results.append({'case': name, 'mxcsr_in': hex(mx), 'mxcsr_out': hex(out), 'de_expected': de, 'ok': ok})
-        if not ok: print('MISMATCH', name, f'MXCSR {out:#x}, DE expected {de}')
+        m = mx_of(mx, de)
+        kind, why = dev.mxcsr_verdict(m, d, (mx & ~2) | out & 2)      # DE only
+        counts.add(kind, m['tag'])
+        results.append({'case': name, 'mxcsr_in': hex(mx), 'mxcsr_out': hex(out), 'de_expected': de, 'tag': m['tag'], 'outcome': kind, 'ok': kind != 'fail'})
+        if kind == 'fail': print('MISMATCH', name, f'MXCSR {out:#x}, DE expected {de}' + (f': {why}' if why else ''))
     (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
-    print(f'{len(cs)} cases ({len(FORMS)} forms), {len(cs) - bad} as the SDM says, {bad} not')
+    print(f"afp {d.get('afp')}, fp {d.get('fp')}: " + counts.line().replace('cases,', f'cases ({len(FORMS)} forms),', 1))
+    bad = counts.bad
     sys.exit(1 if bad else 0)
 
 if __name__ == '__main__': main()

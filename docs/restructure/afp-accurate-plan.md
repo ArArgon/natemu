@@ -402,7 +402,7 @@ Decided here, with reasons in the text; the owner may overrule any of them:
 | Date | Chunk | State | Evidence |
 | --- | --- | --- | --- |
 | Nov 16 | plan | written; reviewed (accept with required changes); revised (§9) | this file |
-| | 0. Test hygiene | | |
+| Nov 16 | 0. Test hygiene | built, self-checks and offline re-judging pass; VM runs pending. Tagged: 21 (run_i5c), 98 (run_i5a_de), 8 (run_i8_faults), i8 39, i8b 73 (not 77: four of i8b's 77 are known QEMU departures with no M2 cause) | `natemu-raw/afp-accurate-c0-20261116-01`, `tools/fp_deviations.py` |
 | | 1. Frame | | |
 | | 2. B (masked SSE DE) | | |
 | | 3. A with D and RSQRT | | |
