@@ -3,7 +3,7 @@
 //! facts (AFP). It fails with one message listing everything missing (`natemu: host lacks lse2 pmull`), and answers CSV3
 //! and SB from the vCPU's registers (never sysctl: the resident runs SB in the vCPU's view). [`startup`] runs when a vCPU's
 //! compiler is set up (after the resident's setup wrote ACTLR_EL1), and every vCPU repeats the check (cheap, identical).
-//! The startup line (the guest feature map and a host note) is printed by the Linux boot path only ([`announce`]), once per
+//! The startup lines (the guest feature map, then one line per code-generation decision) is printed by the Linux boot path only ([`announce`]), once per
 //! process: the program driver's stderr stays as it was. The interrupt-controller API is a deployment fact (its functions
 //! are strong imports: macOS 15 or later, stated in the README), not probed.
 use crate::admission::{
@@ -15,9 +15,16 @@ use std::sync::OnceLock;
 /// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
 const CONFIG_REGISTERS: [u32; ID_REGISTERS.len()] = [2, 3, 7, 4, 5, 6];
 
+/// The launch options that change generated code or its reuse (see [`Probe::lines`]).
+pub(crate) struct Launch {
+    pub speculation_barriers: bool,
+    pub pool: bool,
+    pub compile_cache: Option<std::path::PathBuf>,
+}
+
 /// What the host's vCPU shows: the ID registers and whether Apple's TSO bit (ACTLR_EL1 bit 1) reads back set, and the
 /// features `NATEMU_FEXC_FEATURE_OFF` clears (FEATURES bits; test only: the fallback gate, plan section 2.2a). The exactness
-/// facts and the supported set both follow the effective set, so an M4 told `afp` off is a host without AFP in the startup line
+/// facts and the supported set both follow the effective set, so an M4 told `afp` off is a host without AFP in the fp line
 /// too (AFP fallback plan section 1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Probe {
@@ -64,22 +71,45 @@ impl Probe {
         let missing = self.missing();
         (!missing.is_empty()).then(|| format!("host lacks {}", missing.join(" ")))
     }
-    /// The one terse startup line: the guest feature map (x86-64-v3 plus the advertised extensions, from the catalogue's
-    /// generated names), then `; host -afp` when the host lacks an exactness feature. The guest CPU is the same on every
-    /// supported host (every built feature is core), so only the host note varies.
-    pub(crate) fn line(&self) -> String {
-        let mut line = String::from("natemu: cpu x86-64-v3");
+    /// The startup lines, one decision each (a verbose option may later gate all but the first): the guest feature map
+    /// (x86-64-v3 plus the advertised extensions, from the catalogue's generated names), the floating-point mode, the
+    /// speculation barriers, the perf class, then the launch options that change generated code or its reuse. The guest CPU
+    /// is the same on every supported host (every built feature is core); the other lines vary with the host and options.
+    pub(crate) fn lines(&self, launch: &Launch) -> Vec<String> {
+        let mut cpu = String::from("natemu: cpu x86-64-v3");
         for name in natemu_abi::cpu_gates::ADVERTISED_BEYOND_V3 {
-            line.push_str(" +");
-            line.push_str(name);
+            cpu.push_str(" +");
+            cpu.push_str(name);
         }
+        // Only `fast` exists today; the `accurate` mode adds its own value here.
+        let mut fp = String::from("natemu: fp fast");
         let inexact = self.inexact();
         if !inexact.is_empty() {
-            let host: Vec<_> = inexact.iter().map(|n| format!("-{n}")).collect();
-            line.push_str("; host ");
-            line.push_str(&host.join(" "));
+            let host: Vec<_> = inexact.iter().map(|n| format!("FEAT_{}", n.to_uppercase())).collect();
+            fp.push_str(&format!(
+                ", degraded: host lacks {} (some x86 floating-point corner cases differ)",
+                host.join(" ")
+            ));
         }
-        line
+        let onoff = |b: bool| if b { "on" } else { "off" };
+        let slow = self.lacking(Class::Speed);
+        let perf = if slow.is_empty() {
+            "natemu: perf all host fast paths".to_string()
+        } else {
+            format!("natemu: perf fallbacks for {}", slow.join(" "))
+        };
+        let cache = match &launch.compile_cache {
+            Some(dir) => format!("on ({})", dir.display()),
+            None => "off".into(),
+        };
+        vec![
+            cpu,
+            fp,
+            format!("natemu: speculation barriers {}", onoff(launch.speculation_barriers)),
+            perf,
+            format!("natemu: template pool {}", onoff(launch.pool)),
+            format!("natemu: compile cache {cache}"),
+        ]
     }
     /// The fexc feature bits fexc is told: those this vCPU can execute, less `NATEMU_FEXC_FEATURE_OFF`'s.
     pub(crate) fn supported(&self) -> u64 {
@@ -100,13 +130,15 @@ fn startup_with(probe: Probe) -> Result<Probe, String> {
         None => Ok(probe),
     }
 }
-/// Prints the startup line to stderr, once per process (it carries its own `natemu: ` prefix). Called by the Linux boot
+/// Prints the startup lines to stderr, once per process (each carries its own `natemu: ` prefix). Called by the Linux boot
 /// path after a vCPU's setup passed [`startup`]; the program driver never calls it.
-pub(crate) fn announce(cpu: &Vcpu) {
+pub(crate) fn announce(cpu: &Vcpu, launch: &Launch) {
     static PRINTED: OnceLock<()> = OnceLock::new();
     PRINTED.get_or_init(|| {
         if let Ok(probe) = Probe::read(cpu) {
-            eprintln!("{}", probe.line());
+            for line in probe.lines(launch) {
+                eprintln!("{line}");
+            }
         }
     });
 }
@@ -154,6 +186,7 @@ mod tests {
         1 << 44,      // AFP
         1 << 32,      // LSE2
     ];
+    const LAUNCH: Launch = Launch { speculation_barriers: false, pool: true, compile_cache: None };
     fn probe(f: impl FnOnce(&mut Probe)) -> Probe {
         let mut p = Probe { id: FULL, tso: true, forced_off: 0 };
         f(&mut p);
@@ -164,10 +197,20 @@ mod tests {
     fn a_full_host_passes() {
         let p = probe(|_| {});
         assert_eq!(p.refusal(), None);
+        let lines = p.lines(&LAUNCH);
         assert_eq!(
-            p.line(),
+            lines[0],
             "natemu: cpu x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt"
         );
+        assert_eq!(lines[1], "natemu: fp fast");
+        assert_eq!(lines[2], "natemu: speculation barriers off");
+        assert!(lines[3].starts_with("natemu: perf "), "{}", lines[3]);
+        assert_eq!(lines[4], "natemu: template pool on");
+        assert_eq!(lines[5], "natemu: compile cache off");
+        let on = Launch { speculation_barriers: true, pool: false, compile_cache: Some("/c".into()) };
+        let lines = p.lines(&on);
+        assert_eq!(lines[2], "natemu: speculation barriers on");
+        assert_eq!((lines[4].as_str(), lines[5].as_str()), ("natemu: template pool off", "natemu: compile cache on (/c)"));
         assert_ne!(p.supported() & 1 << index("flagm"), 0);
     }
 
@@ -219,23 +262,28 @@ mod tests {
     fn a_host_without_afp_runs_with_a_note() {
         let p = probe(|p| p.id[4] = 0);
         assert_eq!(p.refusal(), None);
-        assert!(p.line().starts_with("natemu: cpu x86-64-v3 +adx "));
-        assert!(p.line().ends_with(" +xsaveopt; host -afp"), "{}", p.line());
-        assert_eq!(p.line().matches('\n').count(), 0); // one line
+        let lines = p.lines(&LAUNCH);
+        assert!(lines.iter().all(|l| l.starts_with("natemu: ") && !l.contains('\n')));
+        assert!(lines[0].ends_with(" +xsaveopt"), "{}", lines[0]);
+        assert_eq!(
+            lines[1],
+            "natemu: fp fast, degraded: host lacks FEAT_AFP (some x86 floating-point corner cases differ)"
+        );
         assert_eq!(p.supported() & 1 << index("afp"), 0);
     }
 
     /// The startup line and the supported set follow the effective set: `NATEMU_FEXC_FEATURE_OFF=afp` on a host with AFP
-    /// prints `; host -afp` and clears the bit fexc is told; forcing a Speed feature off changes neither the line nor a Required item.
+    /// prints the degraded fp line and clears the bit fexc is told; forcing a Speed feature off changes neither the line nor a Required item.
     #[test]
     fn a_forced_off_afp_is_a_host_without_afp() {
         let forced = probe(|p| p.forced_off = 1 << index("afp"));
         assert_eq!(forced.refusal(), None);
-        assert!(forced.line().ends_with(" +xsaveopt; host -afp"), "{}", forced.line());
+        assert!(forced.lines(&LAUNCH)[1].contains("degraded: host lacks FEAT_AFP"));
         assert_eq!(forced.supported() & 1 << index("afp"), 0);
         assert_eq!(forced.supported(), probe(|p| p.id[4] = 0).supported());
         let speed = probe(|p| p.forced_off = 1 << index("flagm2"));
-        assert_eq!(speed.line(), probe(|_| {}).line());
+        assert_eq!(speed.lines(&LAUNCH)[..3], probe(|_| {}).lines(&LAUNCH)[..3]);
+        assert!(speed.lines(&LAUNCH)[3].contains("flagm2"));
         assert_eq!(speed.supported() & 1 << index("flagm2"), 0);
     }
 

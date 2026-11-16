@@ -289,7 +289,7 @@ def judge(case, text, stderr, code, elapsed, blob_sha, internet, pci=None, host_
     protocols = forward_protocols(case)
     if protocols:
         require(host_results.get('release') == {protocol: True for protocol in protocols}, 'forward listeners not released')
-    stops = re.findall(r'^natemu: (?!cpu )(\S+)', stderr, re.M)   # the stops, not the startup line `natemu: cpu x86-64-v3 ...`
+    stops = re.findall(r'^natemu: (?!(?:cpu|fp|speculation|perf|template|compile) )(\S+)', stderr, re.M)   # the stops, not the startup lines `natemu: cpu ...`, `fp`, `speculation barriers`, `perf`, `template pool`, `compile cache`
     if case == 'cancel':
         require(dhcp and all(d == 'ip=10.0.2.15 mask=24 router=10.0.2.2 dns=10.0.2.3' for d in dhcp), f'DHCP lease {dhcp}')
         require(code == 2 and stops and all(s == 'Cancelled' for s in stops), f'cancel: exit {code}, stops {stops}')
@@ -727,7 +727,7 @@ def self_check():
     assert judge('reboot', text, 'natemu: Power(1)\n', 0, t, sha, True)
     text, err, code, t = good['nodriver']
     assert judge('nodriver', text, 'natemu: Halted\n', 2, t, sha, True)
-    assert judge('nodriver', text, 'natemu: cpu x86-64-v3 +adx; host -afp\n' + err, code, t, sha, True) == []   # the startup line is no stop
+    assert judge('nodriver', text, 'natemu: cpu x86-64-v3 +adx\nnatemu: fp fast, degraded: host lacks FEAT_AFP (x)\nnatemu: speculation barriers off\nnatemu: perf all host fast paths\nnatemu: template pool on\nnatemu: compile cache off\n' + err, code, t, sha, True) == []   # the startup line is no stop
     text, err, code, t = good['cancel']
     assert judge('cancel', text.replace('NET-CANCEL-READY\n', ''), err, code, t, sha, True), 'cancel accepted without traffic proof'
     assert judge('cancel', text, err, code, 12.0, sha, True)
