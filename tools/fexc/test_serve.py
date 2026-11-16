@@ -133,6 +133,32 @@ def adversarial():
     return [(f'adv {c.hex()} {" ".join(v)}', v + ['--rip', '0x1000'], c) for c in codes for v in variants]
 
 
+def modes(fexc, mode):
+    """AFP accurate plan chunk 1: `--accurate` and `--exact-step` (accepted, no codegen effect yet) never carry into the next request.
+    One server: fast afp=0, accurate afp=0, fast again, an accurate step, fast again, then the refusals with AFP and the fast request
+    after each. Every fast reply must equal the first one's (and the one-shot CLI's), every accurate one's object too."""
+    code, off = bytes.fromhex('4801d84883c001c3'), FIXED + ['--feature', 'afp=0', '--rip', '0x1000']
+    on = FIXED + ['--rip', '0x1000']
+    srv, bad = Server(fexc, 'reuse', report=False), 0
+    with tempfile.TemporaryDirectory() as t:
+        want = cli(fexc, off, code, Path(t))
+        want_on = cli(fexc, on, code, Path(t))
+        steps = [('fast afp=0', off, want), ('accurate afp=0', off + ['--accurate'], want), ('fast afp=0 after accurate', off, want),
+                 ('accurate step afp=0', off + ['--accurate', '--exact-step', '--max-insts', '1'], None),
+                 ('fast afp=0 after step', off, want),
+                 ('--accurate with AFP', on + ['--accurate'], 'refused'), ('fast AFP after the refusal', on, want_on),
+                 ('--exact-step with AFP', on + ['--exact-step'], 'refused'), ('fast afp=0 after the refusal', off, want)]
+        for label, args, expect in steps:
+            got = srv.compile(args, code)
+            ok = got[0] >= 2 if expect == 'refused' else got[0] == 0 and (expect is None or (got[0], got[2]) == (expect[0], expect[2]))
+            if expect == 'refused' and ok: ok = b'--feature afp=0' in got[1]
+            if not ok:
+                bad += 1; print(f'MODE DIFF {label}: code {got[0]} {got[1][:100]!r}')
+        srv.close()
+    print(f'accurate/exact-step sequence: {"each request unaffected by the last" if not bad else f"{bad} DIFFERENCES"}')
+    return bad
+
+
 def p95(v):
     return sorted(v)[int(len(v) * 0.95)]
 
@@ -186,7 +212,7 @@ def main():
     ok = sum(1 for e in expect if e[0] == 0)
     print(f'{len(reqs)} requests ({ok} with an object), mode {a.mode}, both orders: {"identical" if not bad else f"{bad} DIFFERENCES"}; '
           f'server without --report: {"same answers, host fields only" if not bad_lean else f"{bad_lean} DIFFERENCES"}')
-    bad += bad_lean
+    bad += bad_lean + modes(a.fexc, a.mode)
     if a.time:
         ms = lambda v: f'mean {statistics.mean(v) * 1e3:.2f} ms p95 {p95(v) * 1e3:.2f} ms'
         print(f'latency per compile: CLI {ms(t_cli)}; server {ms(t_srv)}')

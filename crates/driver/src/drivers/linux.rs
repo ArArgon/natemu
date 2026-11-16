@@ -109,6 +109,8 @@ pub(crate) struct Args {
     page_currency: u64,
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
+    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", value_parser = natemu::execution::parse_fp)]
+    fp: bool,
     #[arg(long)]
     rng: bool,
     /// The shared template pool (cross-vCPU reuse plan): on by default; `--pool=false` or `NATEMU_POOL=0` turns it off
@@ -164,6 +166,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         code_shape,
         page_currency,
         speculation_barriers,
+        fp,
         rng,
         pool,
         serial,
@@ -261,6 +264,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
         code_shape,
         page_currency,
         speculation_barriers,
+        accurate_fp: fp,
         rng,
         pool,
         ..natemu::linux::Boot::new(resident, fexc, image)

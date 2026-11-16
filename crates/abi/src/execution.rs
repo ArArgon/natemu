@@ -1884,6 +1884,12 @@ pub struct Cpu {
     /// told, before the first lookup (`execution::run`); [`fpcr`], [`x87_fpcr`] and the host's `x87_args` read it. The resident
     /// never writes it, and every copy of the bank (`s.cpu = c`) carries it. Plan section 1.
     pub no_afp: u64,
+    /// AFP accurate plan chunk 1: 1 when the process runs in accurate floating-point mode (`--fp accurate`, `NATEMU_FP`), on
+    /// every host: the mode itself, 0 in fast mode and for every `Cpu` built before the probe ran. Set once per vCPU from the
+    /// compiler's mode in `execution::run`, beside [`Self::no_afp`]; never written by the resident, carried by every copy of the
+    /// bank. The code differs only where the mode meets a host without AFP ([`accurate_key`], `code_context` bit 32), and the
+    /// program driver reports it as `fp`.
+    pub accurate_fp: u64,
 }
 /// The first native vector register of XMM0 (FEX's x64 `SRAFPR`: XMM0..XMM15 in v16..v31).
 pub const XMM_VREG: usize = 16;
@@ -1908,6 +1914,11 @@ pub const fn fpcr(mxcsr: u64, no_afp: bool) -> u64 {
         return (mxcsr >> 6 & ftz) << 24 | rmode << 22;
     }
     (1 << 1 | 1 << 2 | (mxcsr >> 6 & 1)) | ftz << 24 | rmode << 22
+}
+/// AFP accurate plan chunk 1: 1 when the mode is accurate and the host lacks AFP, else 0: [`Cpu::code_context`] bit 32, and fexc's
+/// `--accurate` (and, for steps, `--exact-step`) are sent exactly then. The one place the two inputs meet.
+pub const fn accurate_key(accurate_fp: u64, no_afp: u64) -> u64 {
+    (accurate_fp != 0 && no_afp != 0) as u64
 }
 /// AFP fallback chunk 3a: 1 when `no_afp` and MXCSR.DAZ is set, else 0. Part of [`Cpu::code_context`] (bit 30) and fexc's `--daz`:
 /// without AFP, code for DAZ flushes its FP source operands in software.
@@ -2270,7 +2281,9 @@ impl Cpu {
             | x87_unmasked(self.fcw) << 24
             // AFP fallback chunk 3a: without AFP, the code of DAZ and of effective FTZ differs (0 with AFP).
             | daz_key(self.mxcsr, self.no_afp != 0) << 30
-            | ftz_key(self.mxcsr, self.no_afp != 0) << 31;
+            | ftz_key(self.mxcsr, self.no_afp != 0) << 31
+            // AFP accurate plan chunk 1: accurate mode without AFP only; on an AFP host accurate mode changes no code, so no bit.
+            | accurate_key(self.accurate_fp, self.no_afp) << 32;
         word
     }
 }
@@ -4010,6 +4023,21 @@ mod tests {
         assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true), X87_FPCR_EXPLICIT | 3 << 22);
     }
 
+    /// AFP accurate plan chunk 1: `code_context` bit 32 is accurate mode AND no AFP, and nothing else moves: accurate mode on an AFP
+    /// host and fast mode anywhere leave the word as it was (bit 32 clear).
+    #[test]
+    fn accurate_mode_keys_bit_32_only_without_afp() {
+        let c = |no_afp, accurate_fp| Cpu {
+            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
+            dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
+            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp, accurate_fp,
+        };
+        let base = c(0, 0).code_context();
+        assert_eq!([c(0, 1), c(1, 0)].map(|c| c.code_context()), [base, base]);
+        assert_eq!(c(1, 1).code_context(), base | 1 << 32);
+        assert_eq!(base >> 32, 0);
+    }
+
     /// AFP fallback chunk 3a: the keys. Without AFP code is keyed on MXCSR.DAZ (bit 30) and effective FTZ (bit 31: FTZ with UM
     /// masked, the condition `fpcr` uses), whatever else MXCSR holds; with AFP never (and so `code_context` is as before: the host's
     /// identity test covers every MXCSR). FZ is 1 exactly when both keys are, DAZ alone and FTZ alone leaving FZ clear.
@@ -4018,7 +4046,7 @@ mod tests {
         let mut c = Cpu {
             gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
             dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
-            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1,
+            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1, accurate_fp: 0,
         };
         let plain = c.code_context();
         assert_eq!(plain >> 30, 0, "the default MXCSR keys nothing");
@@ -4118,6 +4146,7 @@ mod tests {
             fcw: FCW_INIT,
             xcr0: 1,
             no_afp: 0,
+            accurate_fp: 0,
         };
         let masked = c.code_context();
         c.mxcsr &= !(1 << 12);
@@ -4339,6 +4368,7 @@ mod tests {
             fcw: FCW_INIT,
             xcr0: crate::cpu_profile::XCR0_RESET,
             no_afp: 0,
+            accurate_fp: 0,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));

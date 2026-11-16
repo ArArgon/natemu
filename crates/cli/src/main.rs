@@ -2,12 +2,12 @@
 //! cache on by default ([`natemu::compile_cache::Config::new`]).
 //!
 //!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
-//!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--pool[=false]] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
+//!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--fp fast|accurate] [--pool[=false]] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
 //!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off] [--rng] [--disk FILE] [--net]
 //!       [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT] [--net-host-loopback] [--virtio-transport SPEC]
 //!
-//! Named arguments (clap; `natemu --help`). Seven fall back to `NATEMU_SERIAL_STDIN`,
-//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
+//! Named arguments (clap; `natemu --help`). Eight fall back to `NATEMU_SERIAL_STDIN`,
+//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_FP`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
 //! over its variable; a switch's variable takes 1/0, true/false, yes/no, on/off). `--runtime` defaults to the resident built beside this binary
 //! (`<target>/aarch64-unknown-none/<profile>/natemu-runtime` for `<target>/<profile>/natemu`) when that file exists.
 //! `--ram` takes bytes, 0x hex, or a K/M/G suffix (binary units: 2G = 2048M = 0x80000000). COM1's output goes to
@@ -70,6 +70,9 @@ struct Cli {
     /// The resident's page-walk speculation barriers (needs FEAT_SB)
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
+    /// Floating-point mode (AFP accurate plan chunk 1): fast (the default) or accurate; accurate changes code only on a host without FEAT_AFP
+    #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", value_parser = natemu::execution::parse_fp)]
+    fp: bool,
     /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
     /// does (off), or it answers and the walk is made too, a difference counted (check)
     #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check", default_value = "on", value_parser = parse_page_currency)]
@@ -294,6 +297,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
         cli.compile_cache_mb,
     )?;
     boot.speculation_barriers = cli.speculation_barriers;
+    boot.accurate_fp = cli.fp;
     boot.page_currency = cli.page_currency;
     boot.writable_on_read = cli.writable_on_read;
     boot.rng = cli.rng;

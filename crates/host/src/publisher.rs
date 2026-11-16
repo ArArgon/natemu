@@ -62,6 +62,11 @@ const CELL_POSITION: u64 = (1 << 48) - 1;
 fn context_tag(context: u64) -> u64 {
     context.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48 << 48
 }
+/// [`context_tag`] for the host's tests of the key's width.
+#[cfg(test)]
+pub(crate) fn context_tag_of(context: u64) -> u64 {
+    context_tag(context)
+}
 /// What the cell `before` says of a template under `context`, with the ring's `tail`: `None` when it is not in the ring.
 fn in_ring(before: u64, tail: u64, context: u64) -> Option<Published> {
     let position = before & CELL_POSITION;

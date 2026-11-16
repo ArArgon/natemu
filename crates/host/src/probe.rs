@@ -22,6 +22,8 @@ pub(crate) const TOPICS: [&str; 5] = ["cpu", "fp", "acceleration", "meltdown", "
 /// The launch options that change generated code or its reuse (see [`Probe::lines`]).
 pub(crate) struct Launch {
     pub speculation_barriers: bool,
+    /// `--fp accurate` (AFP accurate plan chunk 1).
+    pub accurate_fp: bool,
     pub pool: bool,
     /// The disk cache's directory and cap in bytes, when on.
     pub compile_cache: Option<(std::path::PathBuf, u64)>,
@@ -87,10 +89,11 @@ impl Probe {
             cpu.push_str(" +");
             cpu.push_str(name);
         }
-        // Only `fast` exists today; the `accurate` mode adds its own value here.
-        let mut fp = String::from("fast mode");
+        // Accurate mode names itself and nothing else: on a host without AFP it makes the code exact (no degraded note), and on
+        // one with AFP it changes no code (the plan's section 1: the line reports the chosen mode). Fast mode adds the note.
+        let mut fp = String::from(if launch.accurate_fp { "accurate mode" } else { "fast mode" });
         let inexact = self.inexact_arm();
-        if !inexact.is_empty() {
+        if !inexact.is_empty() && !launch.accurate_fp {
             fp.push_str(&format!(", degraded (host lacks {})", inexact.join(" ")));
         }
         let missing = self.lacking(Class::Speed);
@@ -205,7 +208,7 @@ mod tests {
         1 << 44,      // AFP
         1 << 32,      // LSE2
     ];
-    const LAUNCH: Launch = Launch { speculation_barriers: false, pool: true, compile_cache: None };
+    const LAUNCH: Launch = Launch { speculation_barriers: false, accurate_fp: false, pool: true, compile_cache: None };
     fn probe(f: impl FnOnce(&mut Probe)) -> Probe {
         let mut p = Probe { id: FULL, tso: true, forced_off: 0 };
         f(&mut p);
@@ -249,7 +252,7 @@ mod tests {
         );
         assert_eq!(lines[3], "natemu: meltdown: none");
         assert_eq!(lines[4], "natemu: code cache: pool on, disk off");
-        let on = Launch { speculation_barriers: true, pool: false, compile_cache: Some(("/c".into(), 64 << 20)) };
+        let on = Launch { speculation_barriers: true, accurate_fp: false, pool: false, compile_cache: Some(("/c".into(), 64 << 20)) };
         let lines = p.lines(&on);
         assert_eq!(lines[3], "natemu: meltdown: speculation barriers");
         assert_eq!(lines[4], "natemu: code cache: pool off, disk 64 MiB at /c");
@@ -318,6 +321,20 @@ mod tests {
             "natemu: fp: fast mode, degraded (host lacks FEAT_AFP)"
         );
         assert_eq!(p.supported() & 1 << index("afp"), 0);
+    }
+
+    /// AFP accurate plan chunk 1: accurate mode prints `accurate mode`, with no degraded note, on a host with AFP (where it changes no
+    /// code) and on one without (where it makes the code exact); every other line is the same as in fast mode.
+    #[test]
+    fn accurate_mode_names_itself_on_every_host() {
+        let accurate = Launch { accurate_fp: true, ..LAUNCH };
+        for p in [probe(|_| {}), probe(|p| p.forced_off = 1 << index("afp")), probe(|p| p.id[4] = 0)] {
+            let (fast, acc) = (p.lines(&LAUNCH), p.lines(&accurate));
+            assert_eq!(acc[1], "natemu: fp: accurate mode");
+            assert_eq!([&acc[..1], &acc[2..]].concat(), [&fast[..1], &fast[2..]].concat());
+        }
+        assert_eq!(probe(|_| {}).lines(&LAUNCH)[1], "natemu: fp: fast mode");
+        assert_eq!(probe(|p| p.forced_off = 1 << index("afp")).lines(&LAUNCH)[1], "natemu: fp: fast mode, degraded (host lacks FEAT_AFP)");
     }
 
     /// The startup line and the supported set follow the effective set: `NATEMU_FEXC_FEATURE_OFF=afp` on a host with AFP
