@@ -2445,8 +2445,9 @@ mod tests {
         let words = (object.len() - h.code_offset as usize) / 4;
         let target = |i: usize| i as i64 + sext(word(i) >> 5 & 0x7_ffff, 19);
         let mrs = (0..words).rev().find(|&i| word(i) == 0xd53b_4420).expect("mrs x0, fpsr");
-        let skip = (0..mrs).rev().find(|&i| word(i) & 0x7f00_0000 == 0x3400_0000 && (i as i64) < target(i) && target(i) <= mrs as i64)
-            .expect("the screen's cbz");
+        // the screen's own `cbz w0` (chunk 2's flag branch, `cbz w20`, also targets the check: not that one)
+        let skip = (0..mrs).find(|&i| word(i) & 0xff00_001f == 0x3400_0000 && (i as i64) < target(i) && target(i) <= mrs as i64)
+            .expect("the screen's cbz w0");
         let retargeted = word(skip) & !(0x7_ffff << 5) | ((mrs as i64 + 1 - skip as i64) as u32 & 0x7_ffff) << 5;
         refused((&object, &hex), 4 * skip as u32, word(skip), retargeted, "floating-point stub");
         std::fs::remove_dir_all(&dir).unwrap();
