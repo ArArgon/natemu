@@ -21,6 +21,7 @@ the policy: its fault address is in the same page, its error code claims a write
 read-modify-write's load as a read and a never-mapped page as a protection fault, so its error code is not the reference.) Writes DIR/faults.json;
 exit status 1 on any failure."""
 import argparse, json, os, pathlib, shutil, sys
+from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
@@ -31,7 +32,7 @@ PAGES = [gen.DATA, gen.DATA + PAGE, gen.STACK, gen.STACK + PAGE]
 
 
 def qemu_path():
-    raw = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+    raw = RAW_ROOT
     return raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
 
 

@@ -5,9 +5,11 @@ The end-to-end programs are compared with a tiny independent Python model of ADD
 import json, os, pathlib, shutil, subprocess, sys, unittest
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
+from raw_root import RAW_ROOT
 import flags, ref, build_slice1
 
-RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', HERE.parent.parent.parent / 'natemu-raw')) / 'reference-slice1-20261026-01'
+RAW = RAW_ROOT / 'reference-slice1-20261026-01'
 QEMU = RAW / 'pin' / 'qemu-x86_64-static'
 M64 = 2**64 - 1
 

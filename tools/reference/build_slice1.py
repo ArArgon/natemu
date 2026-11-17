@@ -17,6 +17,8 @@ REPO = HERE.parents[1]
 FIX = REPO / 'fixtures' / 'slice1'
 PROGRAMS, EXPECTED, MANIFEST, RECORD = (FIX / n for n in ('programs.json', 'expected.json', 'manifest.json', 'build.json'))
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
+from raw_root import RAW_ROOT
 import ref
 
 
@@ -28,7 +30,7 @@ def sha(*paths): return hashlib.sha256(b''.join(p.read_bytes() for p in paths)).
 def clang_version():
     if not shutil.which('clang'): raise Unavailable('clang not found (needed to generate programs.json)')
     return subprocess.run(['clang', '--version'], capture_output=True, text=True).stdout.splitlines()[0]
-def raw_dir(): return pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', REPO.parent / 'natemu-raw')) / 'reference-slice1-20261026-01'
+def raw_dir(): return RAW_ROOT / 'reference-slice1-20261026-01'
 def need_docker():
     if not shutil.which('docker') or subprocess.run(['docker', 'info'], capture_output=True).returncode:
         raise Unavailable('Docker is not available; expected.json cannot be built (programs.json is unaffected)')

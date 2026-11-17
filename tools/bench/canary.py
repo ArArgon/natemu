@@ -20,7 +20,9 @@ import argparse, fcntl, json, os, pathlib, signal, subprocess, sys, tempfile, ti
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 HERE = pathlib.Path(__file__).resolve().parent
-RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+sys.path.insert(0, str(ROOT / 'tools'))
+from raw_root import RAW_ROOT
+RAW = RAW_ROOT
 KERNEL = RAW / 'kernel-census-20261028-01/dl/linux'
 INITRD = RAW / 'cpython-profile-20261110-01/work/initrd.cpio.zst'
 FEXC = RAW / 'correctness-forms-20261107-02/candidate-bin/fexc'

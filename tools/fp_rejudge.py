@@ -11,6 +11,7 @@ program's report, so they are judged by the real code. Prints the runners' count
 `run_suite.i8b_judge` rejects it).
 """
 import argparse, json, pathlib, re, sys
+from raw_root import RAW_ROOT
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
 import fp_deviations as dev
@@ -84,7 +85,7 @@ def rejudge_corpus(corpus, out, report, raw):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('runner', choices=['run_i5c', 'run_i5a_de', 'run_i8_faults', 'i8', 'i8b']); ap.add_argument('results', type=pathlib.Path)
-    ap.add_argument('--host', choices=['m2', 'm4'], required=True); ap.add_argument('--raw', type=pathlib.Path, default=ROOT.parent / 'natemu-raw')
+    ap.add_argument('--host', choices=['m2', 'm4'], required=True); ap.add_argument('--raw', type=pathlib.Path, default=RAW_ROOT)
     a = ap.parse_args()
     report = {'afp': a.host == 'm4', 'fp': 'fast'}
     bad = rejudge_corpus(a.runner, a.results, report, a.raw) if a.runner in ('i8', 'i8b') else rejudge_runner(a.runner, a.results, report)
