@@ -13,25 +13,26 @@
 //! clear (virtio 1.2 4.1.4.5; PCI 3.0 6.2.2, 6.8.3.3). Functions may share the line: it is a wired-OR in the chipset
 //! (`Irqs::wired`, one bit per slot), so this function's level is its own part of the line.
 //!
-//! Lock order: virtio state, then this configuration space, then MSI-X, then the chipset. The line's level is decided
-//! and driven only under the MSI-X lock, from the ISR atomic, the Interrupt Disable atomic (stored by a configuration
-//! write before it drives), the stale bits and MSI-X Enable (both kept under that lock): a state-path change stores the
-//! ISR, then takes the MSI-X lock and drives; a configuration write stores Interrupt Disable, changes MSI-X Enable (in
-//! the table, under the same lock), then takes the lock and drives. Whichever drives last does so after the latest
-//! store of each input, so the line ends at the level of the latest state. Each new interrupt ([`Transport::trigger`])
-//! decides under that one lock between an MSI-X message and INTx, so an MSI-X disable cannot fall between the decision
-//! and the delivery. MSI-X delivery takes only the MSI-X lock (then the chipset's): bus mastering reaches it as an
-//! atomic gate the configuration write stores.
+//! Lock order: virtio state or this configuration space (never one under the other), then MSI-X, then the chipset. The
+//! line's level is decided and driven only under the MSI-X lock, from the ISR atomic, the Interrupt Disable atomic
+//! (stored by a configuration write before it drives), the stale bits and MSI-X Enable (both kept under that lock): a
+//! state-path change stores the ISR, then takes the MSI-X lock and drives; a configuration write stores Interrupt
+//! Disable, changes MSI-X Enable (in the table, under the same lock), then takes the lock and drives. Whichever drives
+//! last does so after the latest store of each input, so the line ends at the level of the latest state. Each new
+//! interrupt ([`Transport::trigger`]) decides under that one lock between an MSI-X message and INTx, so an MSI-X
+//! disable cannot fall between the decision and the delivery. MSI-X delivery takes only the MSI-X lock (then the
+//! chipset's): bus mastering reaches it as an atomic gate the configuration write stores.
 //!
 //! Notes. Under MSI-X a driver never reads the ISR, so its bit 0 stays set. Disabling MSI-X without a device reset
 //! leaves those bits stale: they do not assert INTx (nor the status register's Interrupt Status) until the device's
-//! next interrupt, as in QEMU, which asserts at the next notification. The specification's literal reading (the line
-//! is the ISR's OR) would assert at once; on a shared line that stale bit, which no driver reads, would hold the line
-//! for every function on it and Linux would disable the line ("nobody cared"; the I/O coverage case `sharedintx`,
-//! launch `stale`). An ISR read or reset clears stale bits as it clears the ISR. `profile::raised` counts are skewed
-//! under PCI. Reads of the
-//! MSI-X table or PBA region past their entries return all-ones (`MsixConfig`'s behaviour), an exception to the
-//! rule that an unimplemented BAR0 offset reads zero.
+//! next interrupt, as in QEMU, which asserts at the next notification. The specification's literal reading (the line is
+//! the ISR's OR) would assert at once; on a shared line that stale bit, which no driver reads, would hold the line for
+//! every function on it and Linux would disable the line ("nobody cared"; the I/O coverage case `sharedintx`, launch
+//! `stale`). An ISR read or reset clears stale bits as it clears the ISR. MSI-X messages still held pending (masked
+//! vector, Function Mask or Bus Master clear) at the disable become stale bits too and never reach INTx, as in QEMU;
+//! Linux resets the device after disabling MSI-X. `profile::raised` counts are skewed under PCI. Reads of the MSI-X
+//! table or PBA region past their entries return all-ones (`MsixConfig`'s behaviour), an exception to the rule that an
+//! unimplemented BAR0 offset reads zero.
 use super::{Access, MAX_QUEUES, Profile, State, Virtio, feature_word, reg};
 use crate::{
     irq::Irqs,
@@ -1520,20 +1521,38 @@ mod tests {
     /// final state.
     #[test]
     fn the_line_matches_the_final_state_after_racing_completions_and_config_writes() {
-        for round in 0..20 {
+        use std::sync::atomic::AtomicU64;
+        // An oracle from the operations' order alone (a shared ticket taken before and after each one), not from the
+        // transport's state: a completion that started after the last MSI-X disable ended was on INTx, so with MSI-X
+        // still off the line must show the ISR; a disable that started after the last completion ended leaves every
+        // bit stale, so the line must be low. Rounds alternate which thread runs longer (the long writer ends on a disable), so both cases occur.
+        let (mut on_intx, mut stale_only) = (0, 0);
+        for round in 0..40u32 {
             let rig = rng(false);
-            std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    for i in 0..500 {
+            let ticket = AtomicU64::new(0);
+            let (completions, writes) = if round % 2 == 0 { (500, 60) } else { (60, 501) };
+            let ((cs, ce), (ds, de)) = std::thread::scope(|scope| {
+                let c = scope.spawn(|| {
+                    let mut last = (0, 0);
+                    for i in 0..completions {
+                        let start = ticket.fetch_add(1, SeqCst);
                         complete(&rig.d, 0);
+                        last = (start, ticket.fetch_add(1, SeqCst));
                         if (i + round) % 3 == 0 {
                             rig.read(ISR, 1);
                         }
                     }
+                    last
                 });
-                scope.spawn(|| {
-                    for i in 0..500u32 {
-                        rig.msix(i % 2 == round % 2, false);
+                let w = scope.spawn(|| {
+                    let mut last = (0, 0);
+                    for i in 0..writes {
+                        let on = i % 2 == round % 2;
+                        let start = ticket.fetch_add(1, SeqCst);
+                        rig.msix(on, false);
+                        if !on {
+                            last = (start, ticket.fetch_add(1, SeqCst));
+                        }
                         let disable = if (i + round) % 5 == 0 {
                             INTX_DISABLE
                         } else {
@@ -1541,31 +1560,41 @@ mod tests {
                         };
                         rig.command(MEMORY | BUS_MASTER | disable);
                     }
+                    last
                 });
+                (c.join().unwrap(), w.join().unwrap())
             });
             let msix = rig.cfg(rig.msix_cap() + 2) & 0x8000 != 0;
             let disabled = rig.cfg(4) & u32::from(INTX_DISABLE) != 0;
             let isr = rig.d.lock().interrupt;
-            // The line is at the level of the final state: the ISR less the bits an MSI-X disable left stale (a
-            // subset of the ISR), with Interrupt Disable and MSI-X Enable as they ended.
-            let stale = rig.d.pci.get().unwrap().stale.load(SeqCst);
-            assert_eq!(
-                stale & !isr,
-                0,
-                "round {round}: stale {stale} outside the ISR {isr}"
-            );
-            assert_eq!(
-                rig.level(),
-                isr & !stale != 0 && !disabled && !msix,
-                "round {round}: isr {isr}, stale {stale}, MSI-X {msix}, disable {disabled}"
-            );
+            let what = format!("round {round}: isr {isr}, MSI-X {msix}, disable {disabled}");
+            if msix || disabled {
+                assert!(!rig.level(), "{what}");
+            } else if cs > de {
+                on_intx += 1;
+                assert_eq!(
+                    rig.level(),
+                    isr != 0,
+                    "{what}: a completion after the last disable"
+                );
+            } else if ds > ce {
+                stale_only += 1;
+                assert!(
+                    !rig.level(),
+                    "{what}: the last disable after the last completion"
+                );
+            }
             // And no interrupt was lost: one more completion leaves the line at the ISR's literal level.
             complete(&rig.d, 0);
             assert_eq!(
                 rig.level(),
                 !disabled && !msix,
-                "round {round}: a completion after the race, MSI-X {msix}, disable {disabled}"
+                "{what}: a completion after the race"
             );
         }
+        assert!(
+            on_intx > 0 && stale_only > 0,
+            "cases seen: {on_intx} on INTx, {stale_only} stale"
+        );
     }
 }
