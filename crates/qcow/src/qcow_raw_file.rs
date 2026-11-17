@@ -1,6 +1,6 @@
 // Copyright 2018 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE-BSD-3-Clause file.
+// found in the LICENSES/BSD-3-Clause.txt file.
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
@@ -387,16 +387,17 @@ impl QcowRawFile {
     }
 }
 
-impl Clone for QcowRawFile {
-    fn clone(&self) -> Self {
-        QcowRawFile {
-            file: self.file.try_clone().expect("QcowRawFile cloning failed"),
+impl QcowRawFile {
+    /// Duplicates the file handle (natemu: upstream's `Clone` panicked on failure).
+    pub(super) fn try_clone(&self) -> io::Result<Self> {
+        Ok(QcowRawFile {
+            file: self.file.try_clone()?,
             cluster_size: self.cluster_size,
             cluster_mask: self.cluster_mask,
             refcount_block_entries: self.refcount_block_entries,
             read_refcount_fn: self.read_refcount_fn,
             write_refcount_fn: self.write_refcount_fn,
-        }
+        })
     }
 }
 

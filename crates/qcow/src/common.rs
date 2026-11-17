@@ -46,7 +46,7 @@ pub(super) fn decompress_cluster(
 /// Applies one deallocation action to the data file and refcount table.
 pub(super) fn apply_dealloc_action(
     metadata: &QcowMetadata,
-    data_file: &mut QcowRawFile,
+    data_file: &QcowRawFile,
     action: &DeallocAction,
 ) -> io::Result<()> {
     match action {
@@ -54,7 +54,7 @@ pub(super) fn apply_dealloc_action(
             host_offset,
             length,
         } => {
-            data_file.file_mut().punch_hole(*host_offset, *length)?;
+            data_file.file().punch_hole(*host_offset, *length)?;
             metadata.complete_punch_hole(*host_offset);
             Ok(())
         }
@@ -62,7 +62,7 @@ pub(super) fn apply_dealloc_action(
             host_offset,
             length,
         } => data_file
-            .file_mut()
+            .file()
             .write_zeroes_at(*host_offset, *length)
             .map(|_| ()),
     }
@@ -72,7 +72,7 @@ pub(super) fn apply_dealloc_action(
 /// every action.
 pub(super) fn deallocate_range(
     metadata: &QcowMetadata,
-    data_file: &mut QcowRawFile,
+    data_file: &QcowRawFile,
     offset: u64,
     length: usize,
     sparse: bool,

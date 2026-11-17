@@ -1,6 +1,6 @@
 // Copyright 2018 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE-BSD-3-Clause file.
+// found in the LICENSES/BSD-3-Clause.txt file.
 //
 // Copyright 2026 The Cloud Hypervisor Authors. All rights reserved.
 //
@@ -1455,8 +1455,11 @@ impl QcowState {
         let mut decompressed = vec![0u8; cluster_size];
         let decompressed_size = decoder
             .decode(&compressed, &mut decompressed)
-            .map_err(|_| {
-                self.set_corrupt_bit_best_effort();
+            .map_err(|e| {
+                // natemu: "compression unsupported" is not corruption; do not flag the image.
+                if !matches!(e, super::decoder::Error::Unsupported) {
+                    self.set_corrupt_bit_best_effort();
+                }
                 io::Error::from_raw_os_error(EIO)
             })?;
         if decompressed_size as u64 != self.raw_file.cluster_size() {
@@ -2259,6 +2262,36 @@ mod tests {
             inner.unref_clusters.contains(&data_cluster)
                 || inner.avail_clusters.contains(&data_cluster),
             "the data cluster of a failed write must return to the allocator"
+        );
+    }
+
+    // natemu: a write into a compressed cluster fails with EIO because compression is not
+    // supported; that must not flag a valid image as corrupt.
+    #[test]
+    fn write_into_compressed_cluster_is_eio_without_corrupt_bit() {
+        let cluster_size: u64 = 1 << 16;
+        let temp = TestImage::new(64 * cluster_size);
+        {
+            let mut inner = open_state(&temp);
+            inner
+                .map_write(0, Some(vec![0xab; cluster_size as usize]))
+                .expect("seed write");
+            inner.sync_caches().expect("flush");
+        }
+        super::super::test_util::compress_allocated_clusters(
+            &mut temp.as_file().try_clone().unwrap(),
+        );
+        let mut inner = open_state(&temp);
+        let err = inner
+            .map_write(0, Some(vec![0u8; cluster_size as usize]))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert!(!inner.header.is_corrupt());
+        drop(inner);
+        let header = super::QcowHeader::new(&temp.aligned_file()).unwrap();
+        assert!(
+            !header.is_corrupt(),
+            "valid image was flagged corrupt on disk"
         );
     }
 

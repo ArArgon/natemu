@@ -54,9 +54,28 @@ qcow2 image code vendored from Cloud Hypervisor, adapted to build and test on ma
 - Test helpers: `vmm_sys_util` `TempFile`/`TempDir` -> small std versions in `test_util.rs`;
   `compress_allocated_clusters` emits deflate "stored" blocks instead of using flate2.
 
+## Review fixes (after vendoring)
+
+- A copy-on-write into a compressed cluster returns EIO but no longer sets the corrupt bit when the
+  decoder says "unsupported" (upstream sets it for any decode failure; here that would flag a valid
+  image and make it reopen read-only). Genuine size mismatches still flag corruption. Test:
+  `write_into_compressed_cluster_is_eio_without_corrupt_bit`.
+- `punch_hole_fd` falls back to zero writes only on EOPNOTSUPP/ENOTSUP (as upstream `sparse.rs`);
+  other errors propagate. `offset + length` is checked and must fit `off_t`.
+- No file-handle duplication per deallocate: `ImageFile` punch/zero methods take `&self`, and the
+  panicking `Clone` impls (`ImageFile`, `QcowRawFile`) are gone; `try_clone` returns `io::Result`.
+- Licence header references point at `LICENSES/BSD-3-Clause.txt`.
+
+## Backing file paths
+
+A relative backing name resolves against the directory of the referring image, as given by the path
+passed to `with_path`. Callers must always pass `with_path`; without it the name resolves against the
+working directory. A symlinked image resolves against the link's directory, unlike upstream's
+`/proc/self/fd` lookup (which gave the target's directory). Path security policy is the facade's.
+
 ## Tests
 
-`cargo test -p natemu-qcow`: 140 pass, 1 ignored, 0 fail (macOS aarch64).
+`cargo test -p natemu-qcow`: 141 pass, 1 ignored, 0 fail (macOS aarch64).
 
 Upstream tests changed or not run:
 
@@ -69,7 +88,7 @@ Upstream tests changed or not run:
   scatter-read tests use slices).
 - Removed: `raw_backing_file_uses_direct_io` (O_DIRECT is gone); upstream `aligned_file`, `sparse`
   and `block/src/lib.rs` tests; the 8 `mod.rs` engine tests (4 re-written without the engine).
-- Added (natemu): `file.rs` (2), `lib.rs` (4 backing-file and zero-over-backing tests that stand in
+- Added (natemu): `file.rs` (2), `metadata.rs` (1, corrupt bit), `lib.rs` (4 backing-file and zero-over-backing tests that stand in
   for part of the dropped engine tests).
 - Not ported: the 65 engine_sync tests (backing chains, multi-queue reads, relative backing paths,
   partial-failure reporting). They need the final facade; port them there.

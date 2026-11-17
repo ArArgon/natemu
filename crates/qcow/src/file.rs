@@ -1,3 +1,5 @@
+// Copyright 2026 natemu contributors. All rights reserved.
+//
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 // natemu-written replacement for Cloud Hypervisor's `AlignedFile` (block/src/aligned_file.rs), the
@@ -180,14 +182,21 @@ struct FPunchHole {
 /// 4 KiB alignment; other file systems may not support it). Linux: `fallocate(PUNCH_HOLE |
 /// KEEP_SIZE)` with the same zero-write fallback.
 pub fn punch_hole_fd(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    let end = offset
+        .checked_add(length)
+        .filter(|&e| i64::try_from(e).is_ok())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
     let zero = |o: u64, l: u64| write_zero_range(|b, p| file.write_at(b, p), o, l);
     if length == 0 {
         return Ok(());
     }
+    // Only "not supported here" falls back to zero writes (as upstream sparse.rs); any other
+    // error from the punch propagates.
+    let unsupported =
+        |e: &io::Error| matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOTSUP));
     #[cfg(target_os = "macos")]
     {
         const ALIGN: u64 = 4096;
-        let end = offset + length;
         let a_start = offset.next_multiple_of(ALIGN);
         let a_end = end & !(ALIGN - 1);
         if a_start < a_end {
@@ -203,6 +212,10 @@ pub fn punch_hole_fd(file: &File, offset: u64, length: u64) -> io::Result<()> {
                 zero(offset, a_start - offset)?;
                 return zero(a_end, end - a_end);
             }
+            let e = io::Error::last_os_error();
+            if !unsupported(&e) {
+                return Err(e);
+            }
         }
         zero(offset, length)
     }
@@ -217,10 +230,21 @@ pub fn punch_hole_fd(file: &File, offset: u64, length: u64) -> io::Result<()> {
                 length as libc::off_t,
             )
         };
-        if r == 0 { Ok(()) } else { zero(offset, length) }
+        if r == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if unsupported(&e) {
+            zero(offset, length)
+        } else {
+            Err(e)
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    zero(offset, length)
+    {
+        let _ = (end, unsupported);
+        zero(offset, length)
+    }
 }
 
 /// The file handle the vendored qcow code uses everywhere `AlignedFile` was used upstream.
@@ -291,16 +315,16 @@ impl ImageFile {
         self.layer.is_writable()
     }
 
-    pub fn punch_hole(&mut self, offset: u64, length: u64) -> io::Result<()> {
+    pub fn punch_hole(&self, offset: u64, length: u64) -> io::Result<()> {
         self.layer.punch_hole(offset, length)
     }
 
-    pub fn write_zeroes_at(&mut self, offset: u64, length: usize) -> io::Result<usize> {
+    pub fn write_zeroes_at(&self, offset: u64, length: usize) -> io::Result<usize> {
         self.layer.write_zeroes(offset, length as u64)?;
         Ok(length)
     }
 
-    pub fn write_all_zeroes_at(&mut self, offset: u64, length: usize) -> io::Result<()> {
+    pub fn write_all_zeroes_at(&self, offset: u64, length: usize) -> io::Result<()> {
         self.write_zeroes_at(offset, length).map(|_| ())
     }
 
@@ -320,12 +344,6 @@ impl FileExt for ImageFile {
     }
 }
 
-impl Clone for ImageFile {
-    fn clone(&self) -> Self {
-        self.try_clone().expect("ImageFile cloning failed")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +352,7 @@ mod tests {
     #[test]
     fn write_zeroes_and_punch_hole_read_back_zero() {
         let tmp = TempFile::new().unwrap();
-        let mut f = ImageFile::new(tmp.as_file().try_clone().unwrap());
+        let f = ImageFile::new(tmp.as_file().try_clone().unwrap());
         f.write_all_at(&vec![0xAA; 20000], 0).unwrap();
         f.write_all_zeroes_at(100, 300).unwrap();
         // Unaligned head and tail plus an aligned interior page.
@@ -357,7 +375,7 @@ mod tests {
         f.sync_all().unwrap();
         f.barrier_sync().unwrap();
         f.full_sync().unwrap();
-        let g = f.clone();
+        let g = f.try_clone().unwrap();
         let mut b = [0u8; 3];
         g.read_exact_at(&mut b, 0).unwrap();
         assert_eq!(&b, b"abc");
