@@ -338,8 +338,10 @@ class Suite:
 
 
 def idle():
-    """Waits until no natemu or QEMU VM process runs (the suite's rule for timing-sensitive steps)."""
-    checks = (['pgrep', '-f', 'natemu' + '-host'], ['pgrep', '-fx', '.*/natemu .*'], ['pgrep', '-f', 'qemu' + '-system'])
+    """Waits until no natemu or QEMU VM process runs (the suite's rule for timing-sensitive steps). By process name, not command
+    line: a job queued on the VM lock (`lockf ... run.py --natemu .../natemu`) is not a VM, and counting it deadlocks against this
+    step, which holds the lock it waits for."""
+    checks = (['pgrep', '-x', 'natemu' + '-host'], ['pgrep', '-x', 'natemu'], ['pgrep', '-f', '^[^ ]*qemu' + '-system'])
     while any(subprocess.run(c, stdout=subprocess.DEVNULL).returncode == 0 for c in checks): time.sleep(5)
 
 
