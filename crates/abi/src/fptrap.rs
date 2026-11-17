@@ -16,11 +16,33 @@ use crate::tiny;
 /// FPSR.UFC.
 pub const UFC: u64 = 8;
 
-/// A word whose UFC the model decides: the operation's kind and element size, the lanes it covers, and its source registers.
+/// FPSR.IOC.
+pub const IOC: u64 = 1;
+
+/// How a word's NaN lanes are decided in accurate mode (AFP accurate plan chunk 4): by FPCR.AH = 1's rules, which are x86's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nan {
+    /// No NaN rule differs from the hardware's (conversions: a NaN operand is quieted, the same under both).
+    None,
+    /// Two sources `rn`, `rm` (or its element `index`): add, subtract, multiply, divide.
+    Bin,
+    /// One source `rn` (square root).
+    Un,
+    /// Three sources `rn`, `rm`, `ra`: fused multiply-add.
+    Fma,
+    /// Pairwise add: lane i of the first half is the pair (2i, 2i + 1) of `rn`, of the second half of `rm`; a scalar word adds the two
+    /// elements of `rn`.
+    Pair,
+}
+
+/// A word the handler patches: the operation's kind and element size, the lanes it covers, and its source registers. `kind` is for the
+/// UFC model ([`tiny`]) and `nan` for accurate mode's NaN lanes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Op {
-    /// [`tiny::MUL`], [`tiny::DIV`], [`tiny::FMA`], [`tiny::CVT`] (binary64 to binary32) or [`tiny::CVT16`] (binary32 to binary16).
+    /// [`tiny::MUL`], [`tiny::DIV`], [`tiny::FMA`], [`tiny::CVT`] (binary64 to binary32) or [`tiny::CVT16`] (binary32 to binary16); 0: the
+    /// word never raises UFC (an add, subtract, square root, pairwise add), only its NaN lanes are patched.
     pub kind: u8,
+    pub nan: Nan,
     /// Source elements are binary64 (not for [`tiny::CVT16`], whose sources are binary32).
     pub wide: bool,
     /// FMA's negated product (FMSUB, FNMADD, FMLS) and negated addend (FNMADD, FNMSUB).
@@ -55,6 +77,11 @@ impl Op {
 fn op(kind: u8, wide: bool, lanes: u8, w: u32) -> Op {
     Op {
         kind,
+        nan: match kind {
+            tiny::MUL | tiny::DIV => Nan::Bin,
+            tiny::FMA => Nan::Fma,
+            _ => Nan::None,
+        },
         wide,
         neg: (false, false),
         lanes,
@@ -67,18 +94,26 @@ fn op(kind: u8, wide: bool, lanes: u8, w: u32) -> Op {
     }
 }
 
-/// The class of the Arm word `w`, `None` when the table does not know it.
+/// The class of the Arm word `w`, `None` when the table does not know it. Accurate mode's IOE makes every word that can raise IOC trap, so
+/// the table holds all the floating-point words FEX emits for SSE/AVX: the arithmetic (patched), and the compares, conversions and
+/// roundings (kept: the re-run's result and flags are the hardware's, the same under AH = 1).
 pub fn classify(w: u32) -> Option<Class> {
     use Class::{Keep, Patch};
+    let nan = |kind: u8, nan: Nan, wide: bool, lanes: u8| Some(Patch(Op { nan, ..op(kind, wide, lanes, w) }));
     let ty = w >> 22 & 3;
     // Scalar floating point, two sources: FMUL 0, FDIV 1, FADD 2, FSUB 3, FMAX/FMIN/FMAXNM/FMINNM 4-7, FNMUL 8 (binary32, binary64).
     if w & 0xff20_0c00 == 0x1e20_0800 && ty < 2 {
         return match w >> 12 & 15 {
             0 | 8 => Some(Patch(op(tiny::MUL, ty == 1, 1, w))),
             1 => Some(Patch(op(tiny::DIV, ty == 1, 1, w))),
-            2..=7 => Some(Keep),
+            2 | 3 => nan(0, Nan::Bin, ty == 1, 1),
+            4..=7 => Some(Keep),
             _ => None,
         };
+    }
+    // Scalar compares: FCMP, FCMPE (with a register or zero).
+    if w & 0xff20_fc07 == 0x1e20_2000 && ty < 2 {
+        return Some(Keep);
     }
     // Scalar fused multiply-add: FMADD, FMSUB, FNMADD, FNMSUB (o1 bit 21, o0 bit 15).
     if w & 0xff00_0000 == 0x1f00_0000 && ty < 2 {
@@ -101,9 +136,21 @@ pub fn classify(w: u32) -> Option<Class> {
             _ => None,
         };
     }
+    // Scalar one source: FSQRT 3 (patched), FRINT* 8-0xf and FRINT32/64 0x10-0x13 (kept; FMOV, FABS and FNEG raise nothing).
+    if w & 0xff20_7c00 == 0x1e20_4000 && ty < 2 {
+        return match w >> 15 & 0x3f {
+            3 => nan(0, Nan::Un, ty == 1, 1),
+            8..=0xf | 0x10..=0x13 => Some(Keep),
+            _ => None,
+        };
+    }
+    // Floating point to integer: FCVT{N,P,M,Z,A}{S,U} (rmode bits 20:19, opcode bits 18:16 0 or 1), and the fixed-point FCVTZS/FCVTZU.
+    if w & 0x7f20_fc00 == 0x1e20_0000 && matches!(w >> 16 & 7, 0 | 1) || w & 0x7f3e_0000 == 0x1e18_0000 {
+        return Some(Keep);
+    }
     let (u, a, sz, q) = (w >> 29 & 1, w >> 23 & 1, w >> 22 & 1, w >> 30 & 1);
     let wide = sz == 1;
-    // Vector three-register-same, floating point: FMUL, FDIV, FMLA, FMLS (patched), FADD, FSUB, FADDP, FABD (kept).
+    // Vector three-register-same, floating point: FMUL, FDIV, FMLA, FMLS, FADD, FSUB, FADDP (patched), FABD, the compares (kept).
     if w & 0x9f20_0400 == 0x0e20_0400 && !(wide && q == 0) {
         let lanes = if wide || q == 0 { 2 } else { 4 };
         return match (u, a, w >> 11 & 31) {
@@ -114,7 +161,10 @@ pub fn classify(w: u32) -> Option<Class> {
                 o.neg.0 = a == 1;
                 Some(Patch(o))
             }
-            (0, _, 0x1a) | (1, 0 | 1, 0x1a) => Some(Keep),
+            (0, _, 0x1a) => nan(0, Nan::Bin, wide, lanes),
+            (1, 0, 0x1a) => nan(0, Nan::Pair, wide, lanes),
+            (1, 1, 0x1a) => Some(Keep),
+            (_, _, 0x1c | 0x1d) => Some(Keep), // FCMEQ, FCMGE, FCMGT, FACGE, FACGT
             _ => None,
         };
     }
@@ -136,20 +186,36 @@ pub fn classify(w: u32) -> Option<Class> {
         o.neg.0 = w >> 12 & 15 == 5;
         return Some(Patch(o));
     }
-    // Vector FCVTN/FCVTN2 (S to H, D to S; Q picks the destination half), FCVTL/FCVTL2 (kept); the estimates kept.
+    // Vector two-register misc: FCVTN/FCVTN2 (S to H, D to S; Q picks the destination half), FCVTL/FCVTL2, the estimates, the compares with
+    // zero, the roundings and the conversions to integer (kept), FSQRT (patched).
     if w & 0x9f3e_0c00 == 0x0e20_0800 {
         return match (u, a, w >> 12 & 31) {
             (0, 0, 0x16) if wide => Some(Patch(Op { upper: q == 1, ..op(tiny::CVT, true, 2, w) })),
             (0, 0, 0x16) => Some(Patch(op(tiny::CVT16, false, 4, w))),
             (0, 0, 0x17) | (0, 1, 0x1d) | (1, 1, 0x1d) => Some(Keep),
+            (_, 1, 0xc | 0xd) | (0, 1, 0xe) => Some(Keep), // FCMGT, FCMEQ, FCMGE, FCMLE, FCMLT with zero
+            (_, 0, 0x18 | 0x19) | (0, 1, 0x18 | 0x19) | (1, 1, 0x19) => Some(Keep), // FRINTN M A X P Z I
+            (_, 0, 0x1e | 0x1f) => Some(Keep), // FRINT32, FRINT64
+            (_, _, 0x1a..=0x1c) => Some(Keep), // FCVTxS, FCVTxU
+            (1, 1, 0x1f) if !(wide && q == 0) => nan(0, Nan::Un, wide, if wide || q == 0 { 2 } else { 4 }),
             _ => None,
         };
     }
-    // Scalar FRECPE and FRSQRTE, scalar FADDP (pairwise add), vector FCADD: kept.
-    if w & 0xdf3e_0c00 == 0x5e20_0800 && matches!((u, a, w >> 12 & 31), (0, 1, 0x1d) | (1, 1, 0x1d)) {
+    // Scalar two-register misc: FRECPE, FRSQRTE, the compares with zero, the conversions to integer: kept.
+    if w & 0xdf3e_0c00 == 0x5e20_0800
+        && matches!((u, a, w >> 12 & 31), (0, 1, 0x1d) | (1, 1, 0x1d) | (_, 1, 0xc | 0xd) | (0, 1, 0xe) | (_, _, 0x1a..=0x1c))
+    {
         return Some(Keep);
     }
-    if w & 0xffbf_fc00 == 0x7e30_d800 || w & 0xbf20_ec00 == 0x2e00_e400 {
+    // Scalar compares, two registers.
+    if w & 0xdf20_0400 == 0x5e20_0400 && matches!(w >> 11 & 31, 0x1c | 0x1d) {
+        return Some(Keep);
+    }
+    // Scalar FADDP (pairwise add of the two elements of a vector), vector FCADD.
+    if w & 0xffbf_fc00 == 0x7e30_d800 {
+        return nan(0, Nan::Pair, w >> 22 & 1 == 1, 1);
+    }
+    if w & 0xbf20_ec00 == 0x2e00_e400 {
         return Some(Keep);
     }
     None
@@ -160,8 +226,98 @@ pub const fn x86_rc(fpcr: u64) -> u32 {
     [0, 2, 1, 3][(fpcr >> 22 & 3) as usize]
 }
 
+/// The NaN class of an `e`-byte element: 0 none, 1 quiet, 2 signalling.
+fn nan_class(v: u64, wide: bool) -> u8 {
+    let (exp, frac, quiet) = if wide { (v >> 52 & 0x7ff == 0x7ff, v & (1 << 52) - 1, 1u64 << 51) } else { (v >> 23 & 0xff == 0xff, v & (1 << 23) - 1, 1u64 << 22) };
+    if !exp || frac == 0 {
+        0
+    } else if frac & quiet != 0 {
+        1
+    } else {
+        2
+    }
+}
+fn elem(q: &[u8; 16], k: usize, wide: bool) -> u64 {
+    if wide {
+        u64::from_le_bytes(q[8 * k..8 * k + 8].try_into().unwrap())
+    } else {
+        u64::from(u32::from_le_bytes(q[4 * k..4 * k + 4].try_into().unwrap()))
+    }
+}
+fn put_elem(q: &mut [u8; 16], k: usize, wide: bool, v: u64) {
+    if wide {
+        q[8 * k..8 * k + 8].copy_from_slice(&v.to_le_bytes());
+    } else {
+        q[4 * k..4 * k + 4].copy_from_slice(&(v as u32).to_le_bytes());
+    }
+}
+/// FPCR.AH = 1's result for a lane whose operands `ops` (in the operation's order: first source first, the addend of an FMA last) include a
+/// NaN: the first NaN, quieted (x86 returns the first source's NaN, converted to quiet if signalling), and whether an operand was an SNaN
+/// (IOC). `None` when no operand is a NaN.
+fn first_nan(ops: &[u64], wide: bool) -> Option<(u64, bool)> {
+    let first = ops.iter().copied().find(|&v| nan_class(v, wide) != 0)?;
+    let quiet = if wide { 1u64 << 51 } else { 1 << 22 };
+    Some((first | quiet, ops.iter().any(|&v| nan_class(v, wide) == 2)))
+}
+/// The default NaN of AH = 1: negative (x86's real indefinite).
+fn default_nan(wide: bool) -> u64 {
+    if wide { 0xfff8_0000_0000_0000 } else { 0xffc0_0000 }
+}
+
+/// Accurate mode's NaN lanes of a re-run word (AFP accurate plan chunk 4, §4 A): every lane of `dest` whose operands hold a NaN is the first
+/// NaN among them quieted, and every lane that is a NaN with none among its operands (an invalid operation) is the negative default NaN, as
+/// FPCR.AH = 1 (x86) does; for an FMA the IOC is also recomputed (AH = 1 raises none for infinity times zero beside a quiet NaN addend: D).
+/// Returns the FPSR flags of `rerun` with that IOC.
+fn patch_nan(o: &Op, q: &[[u8; 16]; 3], rerun: u64, dest: &mut [u8; 16]) -> u64 {
+    let w = o.wide;
+    let mut ioc = false;
+    for i in 0..usize::from(o.lanes) {
+        let b_at = |k: Option<u8>| usize::from(k.unwrap_or(i as u8));
+        let ops: [u64; 3] = match o.nan {
+            Nan::None => return rerun,
+            Nan::Un => [elem(&q[0], i, w), 0, 0],
+            Nan::Bin => [elem(&q[0], i, w), elem(&q[1], b_at(o.index), w), 0],
+            Nan::Fma => [elem(&q[0], i, w), elem(&q[1], b_at(o.index), w), elem(&q[2], i, w)],
+            Nan::Pair => {
+                let n = if o.lanes == 1 { 1 } else { usize::from(o.lanes) / 2 };
+                let (r, k) = if i < n { (0, i) } else { (1, i - n) };
+                [elem(&q[r], 2 * k, w), elem(&q[r], 2 * k + 1, w), 0]
+            }
+        };
+        let count = match o.nan { Nan::Un => 1, Nan::Fma => 3, _ => 2 };
+        let got = elem(dest, i, w);
+        match first_nan(&ops[..count], w) {
+            Some((v, snan)) => {
+                put_elem(dest, i, w, v);
+                ioc |= snan;
+            }
+            None if nan_class(got, w) != 0 => {
+                put_elem(dest, i, w, default_nan(w));
+                ioc = true;
+            }
+            None => {}
+        }
+    }
+    // Only an FMA's IOC is recomputed: for the others the hardware's is the same under both AH values.
+    if o.nan == Nan::Fma { rerun & !IOC | if ioc { IOC } else { 0 } } else { rerun }
+}
+
+/// The FMA NaN check (AFP accurate plan chunk 4): the lanes of `result` (the FMA's result register, `lanes` of `wide` elements) whose
+/// operands `q` (Rn, Rm, the addend, as they were at the check: the site names the registers) hold a NaN become the first of them,
+/// quieted, as AH = 1 (x86) chooses; the other lanes are left (an invalid lane was patched at the FMA's own IOE trap). No flag changes:
+/// the compare that trapped is skipped.
+pub fn fma_check(wide: bool, lanes: usize, q: &[[u8; 16]; 3], result: &mut [u8; 16]) {
+    for i in 0..lanes {
+        let ops = [elem(&q[0], i, wide), elem(&q[1], i, wide), elem(&q[2], i, wide)];
+        if let Some((v, _)) = first_nan(&ops, wide) {
+            put_elem(result, i, wide, v);
+        }
+    }
+}
+
 /// FPSR after the word, from `rerun` (the flags of the re-run alone) and the word's `class`: [`UFC`] is kept exactly when some lane is
-/// tiny after rounding and inexact ([`tiny::lane_underflow`]); the rest is the hardware's. `q` holds the registers [`Op::sources`] names, in
+/// tiny after rounding and inexact ([`tiny::lane_underflow`]); the rest is the hardware's, but with `nan` (accurate mode, FPCR.IOE on) the
+/// NaN lanes of `dest` and an FMA's IOC are AH = 1's too ([`patch_nan`]). `q` holds the registers [`Op::sources`] names, in
 /// that order, at the trap; `rc` is the x86 rounding mode the word ran under. A re-run without UFC needs no model: Arm's UFC (tiny before
 /// rounding and inexact) holds whenever x86's masked UE does.
 ///
@@ -170,10 +326,15 @@ pub const fn x86_rc(fpcr: u64) -> u32 {
 /// something still below MIN_NORMAL (tiny after rounding) and that Arm's denormal grid rounds up to +-MIN_NORMAL must be +-0 too (with
 /// UE and PE: the UFC kept here becomes both). Single and double lanes of multiplies, divides, FMAs and the double-to-single narrowing
 /// (VCVTPS2PH ignores FTZ).
-pub fn patch(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64, ftz: bool, dest: &mut [u8; 16]) -> u64 {
+pub fn patch(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64, ftz: bool, dest: &mut [u8; 16], nan: bool) -> u64 {
     let Class::Patch(o) = class else {
         return rerun;
     };
+    let flags = if o.kind != 0 { patch_ufc(&o, rc, q, rerun, ftz, dest) } else { rerun };
+    if nan { patch_nan(&o, q, flags, dest) } else { flags }
+}
+
+fn patch_ufc(o: &Op, rc: u32, q: &[[u8; 16]; 3], rerun: u64, ftz: bool, dest: &mut [u8; 16]) -> u64 {
     if rerun & UFC == 0 {
         return rerun;
     }
@@ -238,13 +399,14 @@ mod tests {
         assert_eq!(patched(0x1e23_c041).kind, tiny::CVT16); // fcvt h1, s2
         assert_eq!(classify(0x1e63_c041), None); // fcvt h1, d2: x86 has no such conversion
         for keep in [
-            0x1e63_2841, 0x1e23_3841, 0x1e23_4841, // fadd, fsub, fmax
+            0x1e23_4841, // fmax
             0x1e22_c041, 0x1ee2_4041, 0x1ee2_c041, // fcvt widening
-            0x4e23_d441, 0x4ee3_d441, 0x6e23_d441, 0x6ea3_d441, // fadd, fsub, faddp, fabd (vector)
-            0x0e21_7841, 0x4e61_7841, // fcvtl, fcvtl2
-            0x4ea1_d841, 0x6ee1_d841, 0x5ea1_d841, 0x7ee1_d841, // frecpe, frsqrte (vector, scalar)
-            0x7e30_d841, 0x7e70_d841, // faddp (scalar)
-            0x6e83_e441, 0x6ec3_f441, // fcadd #90, #270
+            0x6ea3_d441, // fabd (vector)
+            0x1e62_2020, 0x1e22_2030, 0x1e20_2038, // fcmp, fcmpe (register, zero)
+            0x4e23_e441, 0x6ee3_e441, 0x6e23_e441, 0x6ea3_ec41, 0x5e23_e441, 0x7ea3_e441, // fcmeq, fcmgt, fcmge, facgt (vector, scalar)
+            0x4ea0_d841, 0x4ea0_e841, 0x6ee0_d841, 0x5ee0_d841, // fcmeq, fcmlt, fcmle with zero (vector, scalar)
+            0x1e64_c041, 0x1e27_4041, 0x6e21_9841, 0x6ee1_9841, 0x6e21_e841, 0x1e68_4041, // frintp, frintx, frintx, frinti, frint32x, frint32z
+            0x1e78_0041, 0x4ea1_b841, 0x9e28_0041, 0x5ea1_b841, // fcvtzs, fcvtzs, fcvtps, fcvtzs (scalar vector form)
         ] {
             assert_eq!(classify(keep), Some(Class::Keep), "{keep:#x}");
         }
@@ -269,8 +431,12 @@ mod tests {
         assert_eq!((patched(0x0e21_6841).kind, patched(0x0e21_6841).lanes), (tiny::CVT16, 4)); // fcvtn v1.4h, v2.4s
         assert_eq!(patched(0x4e21_6841).kind, tiny::CVT16); // fcvtn2
         assert_eq!((patched(0x0e61_6841).kind, patched(0x0e61_6841).lanes), (tiny::CVT, 2)); // fcvtn v1.2s, v2.2d
-        // Unknown: fsqrt, fmulx, frecps, fneg (none can trap UFE), an integer add, a load.
-        for unknown in [0x6ea1_f841, 0x1e21_c041, 0x4e23_dc41, 0x4e23_fc41, 0x6ea0_f841, 0x4ea3_8441, 0xf940_0000] {
+        for (w, kind, nan) in [(0x1e63_2841, 0, Nan::Bin), (0x1e23_3841, 0, Nan::Bin), (0x4e23_d441, 0, Nan::Bin), (0x4ee3_d441, 0, Nan::Bin), (0x6e23_d441, 0, Nan::Pair), (0x7e30_d841, 0, Nan::Pair), (0x1e21_c041, 0, Nan::Un), (0x6ea1_f841, 0, Nan::Un)] {
+            let o = patched(w);
+            assert_eq!((o.kind, o.nan), (kind, nan), "{w:#x}");
+        }
+        // Unknown: fmulx, frecps, fneg, an integer add, a load.
+        for unknown in [0x4e23_dc41, 0x4e23_fc41, 0x6ea0_f841, 0x4ea3_8441, 0xf940_0000] {
             assert_eq!(classify(unknown), None, "{unknown:#x}");
         }
     }
@@ -296,6 +462,7 @@ mod tests {
         let real = (0x0000_0003u32, half); // 3 * 2^-149 * 0.5 = 1.5 * 2^-149: inexact and tiny
         let mul = Class::Patch(Op {
             kind: tiny::MUL,
+            nan: Nan::Bin,
             wide: false,
             neg: (false, false),
             lanes: 4,
@@ -313,23 +480,23 @@ mod tests {
         let none = (one, one);
         // band + exact tiny: x86 raises nothing; the re-run's UFC goes
         let r = regs([band, exact_tiny, none, none]);
-        assert_eq!(patch(mul, 0, &r, UFC | 0x10, false, &mut [0; 16]), 0x10);
+        assert_eq!(patch(mul, 0, &r, UFC | 0x10, false, &mut [0; 16], false), 0x10);
         // band + real underflow: UFC stays
         let r = regs([band, real, none, none]);
-        assert_eq!(patch(mul, 0, &r, UFC | 0x10, false, &mut [0; 16]), UFC | 0x10);
+        assert_eq!(patch(mul, 0, &r, UFC | 0x10, false, &mut [0; 16], false), UFC | 0x10);
         // a NaN lane's IOC next to a band lane: IOC kept, UFC removed
         let r = regs([(0x7fc0_0000, one), band, none, none]);
-        assert_eq!(patch(mul, 0, &r, UFC | 0x10 | ioc, false, &mut [0; 16]), 0x10 | ioc);
+        assert_eq!(patch(mul, 0, &r, UFC | 0x10 | ioc, false, &mut [0; 16], false), 0x10 | ioc);
         // the band depends on the rounding mode: up (x86 rc 2) rounds a positive band value to MIN_NORMAL too, down (1) and zero (3) do not
         let r = regs([band, none, none, none]);
-        assert_eq!([0, 1, 2, 3].map(|rc| patch(mul, rc, &r, UFC | 0x10, false, &mut [0; 16]) & UFC), [0, UFC, 0, UFC]);
+        assert_eq!([0, 1, 2, 3].map(|rc| patch(mul, rc, &r, UFC | 0x10, false, &mut [0; 16], false) & UFC), [0, UFC, 0, UFC]);
         // no UFC in the re-run: nothing to do (and no model run)
-        assert_eq!(patch(mul, 0, &r, 0x10, false, &mut [0; 16]), 0x10);
-        assert_eq!(patch(Class::Keep, 0, &r, UFC, false, &mut [0; 16]), UFC);
+        assert_eq!(patch(mul, 0, &r, 0x10, false, &mut [0; 16], false), 0x10);
+        assert_eq!(patch(Class::Keep, 0, &r, UFC, false, &mut [0; 16], false), UFC);
         // a scalar word looks at lane 0 only
         let scalar = Class::Patch(Op { lanes: 1, ..match mul { Class::Patch(o) => o, _ => unreachable!() } });
         let r = regs([none, band, none, none]);
-        assert_eq!(patch(scalar, 0, &r, UFC | 0x10, false, &mut [0; 16]), 0x10);
+        assert_eq!(patch(scalar, 0, &r, UFC | 0x10, false, &mut [0; 16], false), 0x10);
     }
 }
 
@@ -486,15 +653,14 @@ mod native {
                 let (_, rerun, word) = f(fpcr, &q);
                 let (_, afp, _) = f(fpcr | 1 << 1 | 1 << 2, &q);
                 let class = classify(word).unwrap_or_else(|| panic!("{name}: {word:#x} unknown"));
-                assert_eq!(matches!(class, Class::Patch(_)), expect_patch, "{name} {word:#x}");
                 // the registers the table names, as the trap would have saved them (v1..v4 are `q[0..4]`)
                 let mut saved = [[0u8; 16]; 3];
                 if let Class::Patch(o) = class {
                     for (s, reg) in saved.iter_mut().zip(o.sources()) {
-                        *s = q[usize::from(reg) - 1];
+                        *s = q[(usize::from(reg).wrapping_sub(1)).min(3)];
                     }
                 }
-                let got = patch(class, x86_rc(fpcr), &saved, rerun, false, &mut [0; 16]);
+                let got = patch(class, x86_rc(fpcr), &saved, rerun, false, &mut [0; 16], false);
                 // (FMA's IOC for infinity times zero plus a QNaN is deviation D, chunk 4's: AH = 1 raises none)
                 // (the estimates differ under AH = 1 in OFC/IXC for a denormal input; FEX's RCP/RSQRT here use fdiv/fsqrt, only UFC matters)
                 let mask = if name.starts_with("fr") { UFC } else if matches!(class, Class::Patch(Op { kind: tiny::FMA, .. })) { 0x1e } else { 0x1f };
@@ -534,7 +700,7 @@ mod native {
                     }
                 }
                 let before = out;
-                let mut got = patch(class, x86_rc(fpcr), &saved, rerun, true, &mut out);
+                let mut got = patch(class, x86_rc(fpcr), &saved, rerun, true, &mut out, false);
                 band += u32::from(before != out);
                 for k in 0..16 / re {
                     let mut raw = [0u8; 8];
@@ -605,7 +771,7 @@ mod native {
         for (s, reg) in saved.iter_mut().zip(o.sources()) {
             *s = q[usize::from(reg) - 1];
         }
-        let got = patch(Class::Patch(o), 0, &saved, rerun, true, &mut out);
+        let got = patch(Class::Patch(o), 0, &saved, rerun, true, &mut out, false);
         assert_eq!((get(&out, 4, 0), got & UFC), (0, UFC));
     }
 
@@ -667,6 +833,125 @@ mod native {
         ];
         for &(name, f, e) in kept {
             check(name, f, e, false, n / 4, false);
+        }
+    }
+
+    /// NaN-heavy operands: every lane of v1..v4 is one of the special classes (quiet and signalling NaNs of both signs with distinct payloads,
+    /// infinities, zeros, ones, a denormal) or random, so that every operand position holds NaNs, several at once, and infinity times zero.
+    fn nan_operands(r: &mut Rng, e: usize) -> [[u8; 16]; 4] {
+        let (p, ..) = params(e);
+        let top = if e == 4 { 255 } else { 2047 };
+        let mut q = [[0u8; 16]; 4];
+        for lane in 0..16 / e {
+            for reg in 0..4 {
+                let (sign, payload) = (r.below(2), 1 + r.below(0xffff));
+                let v = match r.below(11) {
+                    0 | 1 => pack(e, sign, top, 1 << (p - 2) | payload), // quiet NaN
+                    2 => pack(e, sign, top, payload),                    // signalling NaN
+                    3 => pack(e, sign, top, 0),                          // infinity
+                    4 => pack(e, sign, 0, 0),                            // zero
+                    5 | 6 => pack(e, sign, if e == 4 { 127 } else { 1023 }, 0), // one
+                    7 => pack(e, sign, 0, payload),                      // denormal
+                    8 => pack(e, sign, if e == 4 { 130 } else { 1030 }, r.next()), // a few
+                    _ => r.next() & (u64::MAX >> (64 - 8 * e)),
+                };
+                put(&mut q[reg], e, lane, v);
+            }
+        }
+        q
+    }
+
+    /// AFP accurate plan chunk 4: the word re-run as the trap runs it (AH = 0, no traps) then patched with accurate mode's NaN rules equals
+    /// the M4's AH = 1 run: every result lane bit for bit and the flags IOC, DZC, OFC, UFC, IXC; for an FMA also after the check
+    /// ([`fma_check`]) that follows it in generated code. Operands as the table saves them.
+    fn check_nan(name: &str, f: Form, e: usize, trials: u32) {
+        let mut r = Rng(0x2545_f491_4f6c_dd1d ^ name.len() as u64 * 6151);
+        let (mut nan_lanes, mut ioc_removed, mut checked, mut quiet_checks) = (0u32, 0u32, 0u32, 0u32);
+        for _ in 0..trials {
+            let q = nan_operands(&mut r, e);
+            for rmode in 0..4u64 {
+                let fpcr = rmode << 22;
+                let (mut out, rerun, word) = f(fpcr, &q);
+                let (afp_out, afp, _) = f(fpcr | 1 << 1 | 1 << 2, &q);
+                let class = classify(word).unwrap_or_else(|| panic!("{name}: {word:#x} unknown"));
+                let Class::Patch(o) = class else { panic!("{name}: {word:#x} is not patched") };
+                let mut saved = [[0u8; 16]; 3];
+                for (s, reg) in saved.iter_mut().zip(o.sources()) {
+                    *s = q[usize::from(reg).wrapping_sub(1).min(3)];
+                }
+                // An FMA that raised no IOC does not trap at itself (two quiet NaNs, a negated NaN): only the check that follows it is taken
+                if o.kind == tiny::FMA && o.index.is_none() && rerun & IOC == 0 {
+                    let (lanes, wide) = (usize::from(o.lanes), o.wide);
+                    let mut raw = out;
+                    fma_check(wide, lanes, &saved, &mut raw);
+                    let bytes = lanes * if wide { 8 } else { 4 };
+                    assert_eq!(raw[..bytes], afp_out[..bytes], "{name} untrapped rmode {rmode} word {word:#x}\nq {q:x?}");
+                    quiet_checks += 1;
+                }
+                let got = patch(class, x86_rc(fpcr), &saved, rerun, false, &mut out, true);
+                if o.kind == tiny::FMA {
+                    let (lanes, wide) = (usize::from(o.lanes), o.wide);
+                    let mut by_check = out;
+                    fma_check(wide, lanes, &saved, &mut by_check);
+                    // (the check only touches lanes with a NaN operand: the by-element forms' index is not part of it)
+                    if o.index.is_none() {
+                        let bytes = lanes * if wide { 8 } else { 4 };
+                        assert_eq!(by_check[..bytes], afp_out[..bytes], "{name} check rmode {rmode} word {word:#x}\nq {q:x?}");
+                        checked += 1;
+                    }
+                }
+                assert_eq!(got & 0x1f, afp & 0x1f, "{name} rmode {rmode} word {word:#x} rerun {rerun:#x} afp {afp:#x}\nq {q:x?}");
+                // every lane (the NaN rules differ only in NaN lanes, but the whole register must match)
+                // (the lanes the word writes: a scalar word under NEP keeps the destination's upper lanes, which a word without it zeroes)
+                let bytes = usize::from(o.lanes) * if o.wide { 8 } else { 4 };
+                assert_eq!(out[..bytes], afp_out[..bytes], "{name} rmode {rmode} word {word:#x}\nq {q:x?}");
+                nan_lanes += 1;
+                ioc_removed += u32::from(rerun & IOC != 0 && got & IOC == 0);
+            }
+        }
+        eprintln!("{name}: {trials} trials x 4 modes ({nan_lanes} runs), IOC removed {ioc_removed}, check ran {checked}, of which without a trap at the FMA {quiet_checks}");
+    }
+
+    #[test]
+    fn patched_nan_lanes_match_the_m4s_ah1() {
+        let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        let forms: &[(&str, Form, usize)] = &[
+            ("fmul s", form!("fmul s1, s2, s3"), 4),
+            ("fmul d", form!("fmul d1, d2, d3"), 8),
+            ("fnmul d", form!("fnmul d1, d2, d3"), 8),
+            ("fmul .4s", form!("fmul v1.4s, v2.4s, v3.4s"), 4),
+            ("fmul .2d", form!("fmul v1.2d, v2.2d, v3.2d"), 8),
+            ("fmul .4s[2]", form!("fmul v1.4s, v2.4s, v3.s[2]"), 4),
+            ("fdiv s", form!("fdiv s1, s2, s3"), 4),
+            ("fdiv .2d", form!("fdiv v1.2d, v2.2d, v3.2d"), 8),
+            ("fdiv .4s", form!("fdiv v1.4s, v2.4s, v3.4s"), 4),
+            ("fadd d", form!("fadd d1, d2, d3"), 8),
+            ("fsub s", form!("fsub s1, s2, s3"), 4),
+            ("fadd .4s", form!("fadd v1.4s, v2.4s, v3.4s"), 4),
+            ("fsub .2d", form!("fsub v1.2d, v2.2d, v3.2d"), 8),
+            ("faddp .4s", form!("faddp v1.4s, v2.4s, v3.4s"), 4),
+            ("faddp .2d", form!("faddp v1.2d, v2.2d, v3.2d"), 8),
+            ("faddp s", form!("faddp s1, v2.2s"), 4),
+            ("faddp d", form!("faddp d1, v2.2d"), 8),
+            ("fsqrt s", form!("fsqrt s1, s2"), 4),
+            ("fsqrt d", form!("fsqrt d1, d2"), 8),
+            ("fsqrt .4s", form!("fsqrt v1.4s, v2.4s"), 4),
+            ("fsqrt .2d", form!("fsqrt v1.2d, v2.2d"), 8),
+            ("fmadd s", form!("fmadd s1, s2, s3, s4"), 4),
+            ("fmadd d", form!("fmadd d1, d2, d3, d4"), 8),
+            ("fmsub d", form!("fmsub d1, d2, d3, d4"), 8),
+            ("fnmadd s", form!("fnmadd s1, s2, s3, s4"), 4),
+            ("fnmsub d", form!("fnmsub d1, d2, d3, d4"), 8),
+            ("fmla .4s", form!("fmla v1.4s, v2.4s, v3.4s"), 4),
+            ("fmls .4s", form!("fmls v1.4s, v2.4s, v3.4s"), 4),
+            ("fmla .2d", form!("fmla v1.2d, v2.2d, v3.2d"), 8),
+            ("fmls .2d", form!("fmls v1.2d, v2.2d, v3.2d"), 8),
+            ("fmla .4s[3]", form!("fmla v1.4s, v2.4s, v3.s[3]"), 4),
+            ("fmls .2d[1]", form!("fmls v1.2d, v2.2d, v3.d[1]"), 8),
+            ("fmla s[1]", form!("fmla s1, s2, v3.s[1]"), 4),
+        ];
+        for &(name, f, e) in forms {
+            check_nan(name, f, e, n);
         }
     }
 }

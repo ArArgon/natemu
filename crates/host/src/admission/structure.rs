@@ -640,6 +640,8 @@ pub(super) struct Code<'a> {
     pub literals: &'a [Range<usize>],
     pub accesses: &'a [Site],
     pub stubs: &'a [Site],
+    /// The FMA NaN checks (AFP accurate plan chunk 4), in the body.
+    pub fma: &'a [Site],
     pub pcs: &'a [PcEntry],
     pub relocs: &'a [Reloc],
     /// Guest bytes given to fexc, at `rip`; the block translated `guest_bytes` of them.
@@ -688,6 +690,7 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
         v.branch_target()?;
         v.divisions()?;
         v.fp_checks()?;
+        v.fma_checks()?;
         if let Some(i) = v.claimed.iter().position(|&ok| !ok) {
             return Err(format!(
                 "stub at {:#x} is reached by no check of its kind",
@@ -2026,6 +2029,44 @@ const AND_W1_WD_80: u32 = 0x1219_0001;
 const ORR_W0_W0_W1: u32 = 0x2a01_0000;
 const AND_W0_W0_W1: u32 = 0x0a01_0000;
 impl Verifier<'_> {
+    /// AFP accurate plan chunk 4 (R4-2): each FMA NaN check site is the word `fcmge vT, vR, #0` (T = 1, JIT's VTMP2; vector .4s/.2d or
+    /// scalar s/d, as the descriptor says; R no temporary), in the instruction the site names, and its destination is never read: the handler skips the word, so v1 is stale after it, and the first
+    /// word after it that names v1 as the first source (Rn) of a floating-point or SIMD word, without having written it first (up to the next branch),
+    /// would read it; the other fields are the JIT's convention (its temporaries are written before they are read).
+    fn fma_checks(&mut self) -> Result<(), String> {
+        for s in self.c.fma {
+            let at = s.native_offset;
+            let fail = |why: &str| Err(format!("FMA check at {at:#x}: {why}"));
+            let w = self.word(at);
+            let d = natemu_abi::tiny::Desc::decode(s.width, s.imm).ok_or("FMA check: descriptor")?;
+            let (dbl, scalar) = (d.meta & natemu_abi::tiny::ELEM8 != 0, d.meta & natemu_abi::tiny::SCALAR != 0);
+            let sz = u32::from(dbl) << 22;
+            let shape = if scalar { 0x7ea0_c800 | sz } else { 0x6ea0_c800 | sz };
+            if w & 0xffff_fc1f != shape | 1 || w >> 5 & 31 < 2 {
+                return fail("not `fcmge v1, vR, #0`");
+            }
+            if self.instruction(at).is_none_or(|(g, lo)| g != s.guest_offset || lo != s.insn_native_offset) {
+                return fail("not in its instruction");
+            }
+            let mut k = at + 4;
+            while k < self.c.code.len() as u32 {
+                let Some(i) = self.insn(k) else { break };
+                if !matches!(i, Insn::Data(_) | Insn::Mem(_) | Insn::Other) {
+                    break;
+                }
+                let x = self.word(k);
+                let fp = x >> 25 & 7 == 7 || x >> 26 & 1 == 1 && x >> 25 & 5 == 4;
+                if fp && x >> 5 & 31 == 1 && x & 31 != 1 {
+                    return fail("its destination v1 is read");
+                }
+                if fp && x & 31 == 1 {
+                    break; // written again: the stale value is gone
+                }
+                k += 4;
+            }
+        }
+        Ok(())
+    }
     /// Code shape (I5c): each floating-point exception stub is reached by its exact check.
     fn fp_checks(&mut self) -> Result<(), String> {
         use object::kind::*;
@@ -2356,6 +2397,102 @@ mod tests {
                     admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {keys:?} {unmasked}: {e}"));
                 }
             }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// AFP accurate plan chunk 4 (R4-2), the exhaustive admission and no-spill test of the FMA NaN check: with `FEXC` set, every FMA form
+    /// (vfmadd, vfmsub, vfnmadd, vfnmsub, vfmaddsub, vfmsubadd; 132, 213, 231; ps, pd, ss, sd where they exist; xmm and ymm; register and memory
+    /// operand) under every key (none, DAZ, FTZ, both) and unmasked set, compiled alone in accurate mode without AFP, has no spill area, one
+    /// check site per 128-bit FMA, and passes admission with the code-shape check; mutated checks are refused (the destination register, a
+    /// compared register that is a temporary, a branch target). Fast mode has no check.
+    #[test]
+    fn the_fma_check_code_is_admitted_for_every_fma_form_and_key() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        // (opcode of the packed form, has a scalar form, is an add-sub form): the scalar opcode is the packed one + 1
+        let families: [(u8, bool); 6] = [(0x98, true), (0x9a, true), (0x9c, true), (0x9e, true), (0x96, false), (0x97, false)];
+        let mut forms = Vec::new();
+        for (base, scalar) in families {
+            for order in [0x00u8, 0x10, 0x20] {
+                for w in [false, true] {
+                    for (ymm, mem) in [(false, false), (false, true), (true, false), (true, true)] {
+                        for sc in [false, true] {
+                            if sc && (!scalar || ymm) {
+                                continue;
+                            }
+                            // VEX.66.0F38.W: c4 e2 [W vvvv L 01] opcode modrm (xmm1 = dest, xmm2 = vvvv, xmm3 or [rbx])
+                            let vex = (w as u8) << 7 | 0b0110_1000 | (ymm as u8) << 2 | 1;
+                            let (opcode, modrm) = (base + order + sc as u8, if mem { 0x0b } else { 0xcb });
+                            forms.push(format!("c4e2{vex:02x}{opcode:02x}{modrm:02x}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(forms.len() >= 120, "{}", forms.len());
+        let dir = std::env::temp_dir().join(format!("natemu-fma-admit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (object, json) = (dir.join("o"), dir.join("j"));
+        let compile = |hex: &str, args: &[&str]| -> (Vec<u8>, Vec<u64>) {
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", hex, "--rip", "0x1000", "--profile", "slice1", "--feature", "afp=0"])
+                .args(args)
+                .arg("--object")
+                .arg(&object)
+                .arg("--out")
+                .arg(&json)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex} {args:?}");
+            let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+            // (fast mode is only compared for its sites: its blocks with IE and DE both unmasked spill today, a case the host retries)
+            assert!(report["code"]["layout"]["spill_bytes"] == 0 || !args.contains(&"--accurate"), "{hex} {args:?}: a spill");
+            let at = report["sites"].as_array().unwrap().iter().filter(|s| s["kind"] == "fma").map(|s| s["native_offset"].as_u64().unwrap()).collect();
+            (std::fs::read(&object).unwrap(), at)
+        };
+        let mut checked = 0;
+        for hex in &forms {
+            let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+            let ymm = u8::from_str_radix(&hex[4..6], 16).unwrap() >> 2 & 1 == 1;
+            for keys in [&[][..], &["--daz"], &["--ftz"], &["--daz", "--ftz"]] {
+                for unmasked in ["0", "0x1", "0x10", "0x3f"] {
+                    let mut args = vec!["--accurate", "--simd-unmasked", unmasked];
+                    args.extend_from_slice(keys);
+                    let (obj, sites) = compile(hex, &args);
+                    assert_eq!(sites.len(), if ymm { 2 } else { 1 }, "{hex} {args:?}");
+                    admit((&obj, &source)).unwrap_or_else(|e| panic!("{hex} {args:?}: {e}"));
+                    checked += 1;
+                    // fast mode: no check
+                    let fast: Vec<&str> = args.iter().copied().filter(|a| *a != "--accurate").collect();
+                    assert!(compile(hex, &fast).1.is_empty(), "{hex}");
+                }
+            }
+        }
+        assert!(checked >= 1500, "{checked}");
+        // mutations of one check
+        let hex = "c4e269b8cb";
+        let source = vec![0xc4, 0xe2, 0x69, 0xb8, 0xcb];
+        let (obj, sites) = compile(hex, &["--accurate"]);
+        let h: natemu_abi::code_object::Header = super::super::record(&obj, 0);
+        let at = sites[0] as usize;
+        let word = u32::from_le_bytes(obj[h.code_offset as usize + at..][..4].try_into().unwrap());
+        assert_eq!(word & 0xffff_fc1f, 0x6ea0_c800 | 1, "fcmge.4s v1, vR, #0");
+        let with = |new: u32| {
+            let mut o = obj.clone();
+            o[h.code_offset as usize + at..][..4].copy_from_slice(&new.to_le_bytes());
+            admit((&o, &source))
+        };
+        admit((&obj, &source)).unwrap();
+        for (new, why) in [
+            (word & !31 | 5, "not `fcmge v1"),           // the destination is another register
+            (word & !(31 << 5) | 1 << 5, "not `fcmge v1"), // the compared register is a temporary
+            (word | 1 << 22, "not `fcmge v1"),           // .2d for a single-precision FMA
+            (word & !(1 << 30), "not `fcmge v1"),        // .2s
+            (0xd503_201f, "unrecognised instruction"),   // a nop (no decoded class)
+        ] {
+            let e = with(new).expect_err(&format!("{new:#x}"));
+            assert!(e.contains(why), "{new:#x}: {e}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

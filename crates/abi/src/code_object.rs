@@ -61,6 +61,11 @@ pub mod kind {
     pub const SIMD: u8 = 15;
     pub const X87: u8 = 16;
     pub const PENDING: u8 = 17;
+    /// AFP accurate plan chunk 4: the NaN check of a fused multiply-add, in the body (no stub, no brk): the site is the check's `fcmge`
+    /// word (`fcmge vD, vR, #0`, D = v1, never read), which traps (FPCR.IOE) on any NaN lane of R, the FMA's result. `width` = the
+    /// [`crate::tiny::Desc`] meta byte (kind FMA, element size and scalar bits only), `imm` = Rn, Rm and the addend's registers (slots
+    /// 0..2), `guest_offset2` [`NONE32`], no address registers.
+    pub const FMA: u8 = 18;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;
