@@ -14,20 +14,22 @@
 //! (`Irqs::wired`, one bit per slot), so this function's level is its own part of the line.
 //!
 //! Lock order: virtio state, then this configuration space, then MSI-X, then the chipset. The line's level is decided
-//! and driven only under the configuration-space lock, from the ISR atomic and the configuration space: a state-path
-//! change stores the ISR, then takes the configuration lock and drives the line; a configuration write changes the
-//! command register or MSI-X enable and drives the line before releasing that lock. Whichever drives last does so
-//! after both the latest ISR store (it happened before its writer took the lock, or the driver is that writer) and
-//! the latest configuration write (made under the lock), so the line ends at the level of the latest state. Two
-//! state-path changes are ordered by the state lock, which their writers hold while they drive. MSI-X delivery takes
-//! only the MSI-X lock (then the chipset's): bus mastering reaches it as an atomic gate the configuration write stores.
+//! and driven only under the MSI-X lock, from the ISR atomic, the Interrupt Disable atomic (stored by a configuration
+//! write before it drives), the stale bits and MSI-X Enable (both kept under that lock): a state-path change stores the
+//! ISR, then takes the MSI-X lock and drives; a configuration write stores Interrupt Disable, changes MSI-X Enable (in
+//! the table, under the same lock), then takes the lock and drives. Whichever drives last does so after the latest
+//! store of each input, so the line ends at the level of the latest state. Each new interrupt ([`Transport::trigger`])
+//! decides under that one lock between an MSI-X message and INTx, so an MSI-X disable cannot fall between the decision
+//! and the delivery. MSI-X delivery takes only the MSI-X lock (then the chipset's): bus mastering reaches it as an
+//! atomic gate the configuration write stores.
 //!
-//! Notes. Under MSI-X a driver never reads the ISR, so its bit 0 stays set; disabling MSI-X without a device reset
-//! therefore asserts INTx at once from that stale bit (the specification's literal reading: the line is the ISR's
-//! OR; QEMU instead waits for the next interrupt), and `profile::raised` counts are skewed under PCI. On a shared
-//! line, with Interrupt Disable also clear and the driver still on MSI-X, that bit holds the line for every function
-//! on it and Linux disables the line ("nobody cared"; the I/O coverage case `sharedintx`, launch `stale`, unresolved:
-//! Linux itself never gets there, as it sets Interrupt Disable with MSI-X and resets before unbinding). Reads of the
+//! Notes. Under MSI-X a driver never reads the ISR, so its bit 0 stays set. Disabling MSI-X without a device reset
+//! leaves those bits stale: they do not assert INTx (nor the status register's Interrupt Status) until the device's
+//! next interrupt, as in QEMU, which asserts at the next notification. The specification's literal reading (the line
+//! is the ISR's OR) would assert at once; on a shared line that stale bit, which no driver reads, would hold the line
+//! for every function on it and Linux would disable the line ("nobody cared"; the I/O coverage case `sharedintx`,
+//! launch `stale`). An ISR read or reset clears stale bits as it clears the ISR. `profile::raised` counts are skewed
+//! under PCI. Reads of the
 //! MSI-X table or PBA region past their entries return all-ones (`MsixConfig`'s behaviour), an exception to the
 //! rule that an unimplemented BAR0 offset reads zero.
 use super::{Access, MAX_QUEUES, Profile, State, Virtio, feature_word, reg};
@@ -44,7 +46,10 @@ use crate::{
 };
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst},
+    atomic::{
+        AtomicBool, AtomicU32, AtomicU64,
+        Ordering::{Relaxed, SeqCst},
+    },
 };
 
 /// Red Hat's virtio vendor ID (virtio 1.2 4.1.2).
@@ -146,21 +151,39 @@ pub(super) struct Transport {
     gsi: usize,
     /// This function's bit on its shared INTx line (1 << slot): PCI functions may share a line (`Irqs::wired`).
     wire: u32,
+    /// The command register's Interrupt Disable, stored under the configuration lock before that write drives.
+    intx_off: AtomicBool,
+    /// ISR bits left when MSI-X was disabled; they assert nothing until the next interrupt. Under the MSI-X lock.
+    stale: AtomicU32,
+    /// MSI-X Enable as last followed ([`Self::follow`]). Under the MSI-X lock.
+    msix_on: AtomicBool,
 }
 impl Transport {
-    /// Under the state lock: the ISR is now `isr`; drive the INTx line if it changed.
+    /// Under the state lock: the ISR is now `isr` (a new interrupt, an ISR read or a reset); drive the INTx line if it
+    /// changed. Bits read or reset away are no longer stale.
     pub(super) fn isr(&self, isr: u32) {
-        // Unchanged, the line is already at its level: the last drive followed the last change of either input.
+        // Unchanged, the line is already at its level: the last drive followed the last change of every input.
         if self.isr.swap(isr, SeqCst) != isr {
-            self.drive(&lock(&self.config));
+            let msix = lock(&self.msix);
+            self.stale.fetch_and(isr, Relaxed);
+            self.drive(&msix);
         }
     }
-    /// Under the configuration lock: INTx asserted while the ISR is nonzero, Interrupt Disable is clear and MSI-X is
-    /// disabled (virtio 1.2 4.1.4.5; PCI 3.0 6.2.2, 6.8.3.3). The chipset passes only changes on.
-    fn drive(&self, config: &PciConfiguration) {
-        let level = self.isr.load(SeqCst) != 0
-            && config.command() & INTX_DISABLE == 0
-            && !lock(&self.msix).enabled();
+    /// Under the MSI-X lock: a 1 -> 0 change of MSI-X Enable since the last call makes the ISR's bits stale.
+    fn follow(&self, msix: &MsixConfig) {
+        let on = msix.enabled();
+        if self.msix_on.swap(on, Relaxed) && !on {
+            self.stale.store(self.isr.load(SeqCst), Relaxed);
+        }
+    }
+    /// The bits INTx shows: the ISR less the stale ones (under the MSI-X lock).
+    fn pending(&self) -> u32 {
+        self.isr.load(SeqCst) & !self.stale.load(Relaxed)
+    }
+    /// Under the MSI-X lock: INTx asserted while MSI-X is disabled, Interrupt Disable is clear and the ISR has a bit
+    /// that is not stale (virtio 1.2 4.1.4.5; PCI 3.0 6.2.2, 6.8.3.3). The chipset passes only changes on.
+    fn drive(&self, msix: &MsixConfig) {
+        let level = self.pending() != 0 && !self.intx_off.load(SeqCst) && !msix.enabled();
         self.irqs.wired(self.gsi, self.wire, level);
     }
     /// Under the state lock: interrupts for the queues in `queues` (bit n: queue n) and, with `config`, a
@@ -169,6 +192,14 @@ impl Transport {
     /// set); nothing for [`NO_VECTOR`] or with MSI-X disabled (`MsixConfig::trigger`). Takes only the MSI-X lock.
     pub(super) fn trigger(&self, vectors: &Vectors, queues: u8, config: bool) {
         let mut msix = lock(&self.msix);
+        if !msix.enabled() {
+            // On INTx (the ISR was set before this call): a new interrupt, so nothing is stale any more (QEMU asserts at
+            // the next notification). An MSI-X disable not yet followed is followed here, with nothing stale.
+            if self.msix_on.swap(false, Relaxed) | (self.stale.swap(0, Relaxed) != 0) {
+                self.drive(&msix);
+            }
+            return;
+        }
         let mut sent = [NO_VECTOR; MAX_QUEUES + 1];
         let wanted = (0..MAX_QUEUES)
             .filter(|q| queues >> q & 1 != 0)
@@ -321,6 +352,9 @@ impl Virtio {
             irqs: self.irqs.clone(),
             gsi: self.gsi,
             wire: 1 << slot,
+            intx_off: AtomicBool::new(false),
+            stale: AtomicU32::new(0),
+            msix_on: AtomicBool::new(false),
         };
         assert!(
             self.pci.set(transport).is_ok(),
@@ -424,7 +458,13 @@ impl bus::Function for PciFunction {
         match reg_idx {
             // Interrupt Status mirrors the ISR while INTx is the function's interrupt (virtio 1.2 4.1.4.5; PCI 3.0
             // 6.2.3: whatever Interrupt Disable says).
-            1 if t.isr.load(SeqCst) != 0 && !lock(&t.msix).enabled() => value | INTERRUPT_STATUS,
+            1 if {
+                let msix = lock(&t.msix);
+                t.pending() != 0 && !msix.enabled()
+            } =>
+            {
+                value | INTERRUPT_STATUS
+            }
             15 => value | INTA,
             _ => value,
         }
@@ -444,11 +484,15 @@ impl bus::Function for PciFunction {
         };
         t.bar.store(bar, SeqCst);
         let master = config.command() & BUS_MASTER != 0;
+        t.intx_off
+            .store(config.command() & INTX_DISABLE != 0, SeqCst);
+        let mut msix = lock(&t.msix);
         if !t.bus_master.swap(master, SeqCst) && master {
             // Vectors held pending while bus mastering was off go out now, if MSI-X lets them.
-            lock(&t.msix).release_pending();
+            msix.release_pending();
         }
-        t.drive(&config);
+        t.follow(&msix);
+        t.drive(&msix);
     }
     fn bar(&self) -> Option<u64> {
         let bar = self.transport().bar.load(SeqCst);
@@ -1268,7 +1312,12 @@ mod tests {
         complete(&rig.d, 0);
         assert!(!rig.level());
         rig.msix(false, false);
-        assert!(rig.level(), "disabling re-evaluates the line from the ISR");
+        assert!(!rig.level(), "the bit set under MSI-X is stale: no INTx");
+        assert_eq!(rig.cfg(4) & INTERRUPT_STATUS, 0, "nor Interrupt Status");
+        complete(&rig.d, 0);
+        assert!(rig.level(), "the next interrupt asserts it");
+        assert_eq!(rig.read(ISR, 1), 1);
+        assert!(!rig.level());
     }
     /// Two functions on one INTx line (slots 3 and 4, as a placement shares them): the line is the OR of the two; one
     /// lowering (ISR read, device reset) while the other is high keeps it asserted; a reset drops the function's part.
@@ -1290,12 +1339,41 @@ mod tests {
         complete(&b.d, 0);
         b.write(0x14, 1, 0);
         assert!(!a.level(), "b's reset drops its part");
-        // An MSI-X function with a stale ISR asserts the shared line when MSI-X goes off without a reset.
+    }
+    /// The hazard of a shared line: b on MSI-X leaves its ISR set; MSI-X goes off without a reset (and Interrupt
+    /// Disable is clear). b's stale bit must not hold the line: when a, the other function on it, is read, the line
+    /// drops. b's next interrupt asserts it again.
+    #[test]
+    fn a_stale_isr_does_not_hold_a_shared_line() {
+        let a = rig_on_line(3);
+        let b = attach_at(Virtio::rng(a.d.irqs.clone(), a.d.gsi), 4);
         live_over_pci(&b, true);
         complete(&b.d, 0);
-        assert!(!a.level());
+        complete(&a.d, 0);
+        assert!(a.level());
         b.msix(false, false);
-        assert!(a.level(), "the stale ISR bit");
+        assert_eq!(b.d.lock().interrupt, 1, "b's ISR is still set");
+        assert_eq!(a.read(ISR, 1), 1);
+        assert!(!a.level(), "b's stale bit holds nothing");
+        complete(&b.d, 0);
+        assert!(a.level(), "b's next interrupt asserts the line");
+        assert_eq!(b.read(ISR, 1), 1);
+        assert!(!a.level());
+    }
+    /// The window of a configuration write that disables MSI-X: the table's Enable is clear, the write has not yet
+    /// followed it, and a completion comes in between. The completion decides on INTx under the MSI-X lock and follows
+    /// the disable itself, so the write that follows next finds nothing to make stale: the interrupt is not lost.
+    #[test]
+    fn a_completion_inside_an_msix_disable_is_not_lost() {
+        let rig = rng(true);
+        assert_eq!(rig.read(ISR, 1), 0);
+        let t = rig.d.pci.get().unwrap();
+        lock(&t.msix).set_msg_ctl(0);
+        complete(&rig.d, 0);
+        rig.command(MEMORY | BUS_MASTER);
+        assert!(rig.level(), "the completion after the disable is on INTx");
+        assert_eq!(rig.read(ISR, 1), 1);
+        assert!(!rig.level());
     }
     fn rig_on_line(slot: u8) -> Driver {
         let rig = attach_at(device(), slot);
@@ -1468,10 +1546,25 @@ mod tests {
             let msix = rig.cfg(rig.msix_cap() + 2) & 0x8000 != 0;
             let disabled = rig.cfg(4) & u32::from(INTX_DISABLE) != 0;
             let isr = rig.d.lock().interrupt;
+            // The line is at the level of the final state: the ISR less the bits an MSI-X disable left stale (a
+            // subset of the ISR), with Interrupt Disable and MSI-X Enable as they ended.
+            let stale = rig.d.pci.get().unwrap().stale.load(SeqCst);
+            assert_eq!(
+                stale & !isr,
+                0,
+                "round {round}: stale {stale} outside the ISR {isr}"
+            );
             assert_eq!(
                 rig.level(),
-                isr != 0 && !disabled && !msix,
-                "round {round}: isr {isr}, MSI-X {msix}, disable {disabled}"
+                isr & !stale != 0 && !disabled && !msix,
+                "round {round}: isr {isr}, stale {stale}, MSI-X {msix}, disable {disabled}"
+            );
+            // And no interrupt was lost: one more completion leaves the line at the ISR's literal level.
+            complete(&rig.d, 0);
+            assert_eq!(
+                rig.level(),
+                !disabled && !msix,
+                "round {round}: a completion after the race, MSI-X {msix}, disable {disabled}"
             );
         }
     }
