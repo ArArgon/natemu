@@ -135,6 +135,10 @@ struct Placed {
 /// (`Boot::transports.disk` is read only there, to fill each `DiskSpec::transport`). Which names (`vda`..) Linux gives
 /// when MMIO and PCI disks are mixed is unverified; the VM test covers each transport on its own.
 fn place(w: &Wanted) -> Result<Vec<Placed>> {
+    place_lines(w, SHARED_INTX)
+}
+/// [`place`] with PCI functions sharing INTx lines (`shared`) or each on a line of its own (the fallback).
+fn place_lines(w: &Wanted, shared: bool) -> Result<Vec<Placed>> {
     use crate::virtio::{BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE};
     let pci = |t: Transport| t == Transport::Pci;
     let on_pci_disks = w.disks.iter().filter(|&&t| pci(t)).count();
@@ -196,7 +200,7 @@ fn place(w: &Wanted) -> Result<Vec<Placed>> {
         (p.slot <= RNG_SLOT && !held.contains(&line)).then_some(line)
     };
     let mut taken = held.clone();
-    if !SHARED_INTX {
+    if !shared {
         taken.extend(out.iter().filter(|p| p.pci).filter_map(fixed));
     }
     let pool: Vec<u32> = (16..24).filter(|l| !taken.contains(l)).collect();
@@ -207,7 +211,7 @@ fn place(w: &Wanted) -> Result<Vec<Placed>> {
         p.intx = match fixed(p) {
             Some(line) => line,
             None => {
-                let i = if SHARED_INTX {
+                let i = if shared {
                     next % pool.len().max(1)
                 } else {
                     next
@@ -1447,6 +1451,23 @@ mod placement_tests {
             place(&wanted(&full, Mmio)).unwrap_err(),
             "no interrupt line left for PCI slot 1 (lines 16-23 are all held)"
         );
+    }
+    /// The fallback (`SHARED_INTX = false`): every device on a line of its own, so PCI is capped by lines again.
+    #[test]
+    fn the_unique_line_fallback_gives_exclusive_lines_and_six_pci_disks() {
+        for other in [Mmio, Pci] {
+            for n in 1..=MAX_MMIO_DISKS {
+                let p = place_lines(&wanted(&vec![Pci; n], other), false).unwrap();
+                let lines = p.iter().map(|q| if q.pci { q.intx } else { q.res.gsi });
+                distinct(lines.collect(), "lines");
+            }
+            assert_eq!(
+                place_lines(&wanted(&[Pci; 7], other), false).unwrap_err(),
+                "no interrupt line left for PCI slot 9 (lines 16-23 are all held)"
+            );
+        }
+        let shared = place_lines(&wanted(&[Pci; 8], Pci), true).unwrap();
+        assert_eq!(shared.len(), 10);
     }
     #[test]
     fn too_many_disks_are_refused_per_transport() {
