@@ -105,12 +105,19 @@ pub(super) unsafe fn stepped(elr: u64, spsr: u64) -> ! {
         let Some(class) = fptrap::classify(word) else {
             halt_native([0, u64::from(word), elr], stop::FP_WORD)
         };
-        let flags = fptrap::patch(class, fptrap::x86_rc((*r).fpcr), &(*r).q, (*frame).fpsr);
+        let s = load();
+        // FTZ alone (a trap with DAZ and FTZ both would be none: FZ = 1 never traps): the block was compiled under the key of the MXCSR
+        // the bank holds (LDMXCSR ends a block), so its effective FTZ is that value's; the patch then also flushes a band lane's value.
+        let ftz = ftz_key(s.cpu.mxcsr, true) != 0;
+        let rd = match class {
+            fptrap::Class::Patch(op) => usize::from(op.rd),
+            fptrap::Class::Keep => 0,
+        };
+        let flags = fptrap::patch(class, fptrap::x86_rc((*r).fpcr), &(*r).q, (*frame).fpsr, ftz, &mut (*frame).q[rd]);
         (*frame).fpsr = (*r).fpsr | flags;
         (*frame).fpcr = (*r).fpcr;
         core::ptr::write_volatile(&raw mut (*r).active, 0);
         cache::control().fp_steps += 1;
-        let s = load();
         resume(&s, frame, elr, spsr & !(SPSR_SS | SPSR_I))
     }
 }
