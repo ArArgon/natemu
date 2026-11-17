@@ -57,6 +57,17 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
                  device, a write in the file system) fails; the writable disk gets its block; the host checks that the ISO and
                  the ext4 image are byte-identical afterwards. A last launch pair runs two VMs at once on one read-only ISO
                  (the shared lock): both boot, and while both hold it a writable lock on the file and a writable launch are refused.
+  sharedintx     (not in the default list; `--cases sharedintx`, with the default --transport mmio) PCI functions sharing
+                 INTx lines (design step 6), every device on PCI from a config file (disks, NIC, entropy). load: `pci=nomsi`
+                 (INTx only), 8 disks at 1 and 4 vCPUs and 29 disks (every slot) at 4 vCPUs; the guest checks the disks
+                 are at their slots in list order and that IO-APIC lines carry several virtio devices, then in four
+                 overlapping rounds writes a 4 MiB random pattern to every disk at once (direct I/O, 4/16/64 KiB blocks)
+                 while reading back the previous round and the entropy device; every read must match, no I/O error or
+                 timeout, and the host checks each image's three copies against the guest's hash. stale: MSI on, 8 disks
+                 at 2 vCPUs: slot 1 is rebound with MSI disallowed (INTx on line 16, which slot 4 shares while on MSI-X);
+                 slot 4 is unbound and rebound (Linux resets it first), then its MSI-X Enable and Interrupt Disable are
+                 cleared under its bound driver without a reset, so its stale ISR asserts the shared line; slot 1's disk
+                 must keep working at normal speed after each step, and Linux must not disable the line.
 Live negative controls (the judge must FAIL them): host-full-control (the host-full guest with the image on the normal
 disk) and host-limit-control (the host-limit guest without the limit)."""
 import argparse
@@ -91,7 +102,7 @@ LIMIT = 32 * MiB + 2048          # host-limit: RLIMIT_FSIZE
 PATTERN_AT = 32 * MiB            # host-limit: 64 KiB of pattern from here
 APPLETS = ('sh', 'mount', 'umount', 'modprobe', 'cat', 'grep', 'awk', 'dd', 'wc', 'sha256sum', 'dmesg', 'sync',
            'poweroff', 'reboot', 'sleep', 'readlink', 'mkdir', 'cp', 'rm', 'stty', 'nproc', 'uname', 'mkswap', 'swapon', 'swapoff',
-           'df', 'tail', 'test', 'ls', 'blockdev')
+           'df', 'tail', 'test', 'ls', 'blockdev', 'hexdump', 'timeout')
 CASES = ('gpt', 'mbr', 'reboot-acpi', 'reboot-kbd', 'reboot-triple', 'fs-full', 'host-full', 'host-limit', 'trim')
 CONTROLS = ('host-full-control', 'host-limit-control')
 # The image each case starts from, and its extra kernel parameters.
@@ -285,6 +296,72 @@ readonly)
   sync
   echo "COV-RWERR n=$(dmesg | grep -c "I/O error, dev $rw")"
   if test "$phase" = share; then n=0; while test $n -lt 25; do echo "COV-HOLD $(cat /proc/uptime)"; sleep 1; n=$((n+1)); done; fi;;
+sharedintx)
+  for item in $(cat /proc/cmdline); do case "$item" in cov_disks=*) list=${item#*=};; esac; done
+  IFS=,; set -- $list; IFS=' '; disks="$*"
+  modprobe virtio-rng || fail module-virtio-rng
+  for d in $disks; do wait_dev /dev/$d; done
+  for d in $disks; do echo "COV-DISK $d dev=$(readlink -f /sys/block/$d/device)"; done
+  echo "COV-NDISKS $(ls /sys/block | grep -c '^vd')"
+  irqs() { grep -E 'virtio|MSI' /proc/interrupts | while read -r line; do echo "COV-IRQ $line"; done; }
+  irqs
+  if test "$phase" = load; then
+    for d in $disks; do dd if=/dev/urandom of=/tmp/$d bs=1M count=4 2>/dev/null || fail pattern; echo "COV-PAT $d $(sha /tmp/$d)"; done
+    t0=$(cat /proc/uptime)
+    # Round r writes copy r (r < 3) on every disk at once while reading back copy r - 1 and the entropy device.
+    for r in 0 1 2 3; do
+      bs=$((4096 << (r % 3 * 2)))
+      for d in $disks; do
+        if test $r -lt 3; then (dd if=/tmp/$d of=/dev/$d bs=$bs seek=$((r * 4194304 / bs)) oflag=direct conv=notrunc 2>/dev/null || echo "COV-IOFAIL write-$d-$r") & fi
+        if test $r -gt 0; then (p=$((r - 1)); s=$(dd if=/dev/$d bs=$bs skip=$((p * 4194304 / bs)) count=$((4194304 / bs)) iflag=direct 2>/dev/null | sha256sum); test "${s%% *}" = "$(sha /tmp/$d)" || echo "COV-IOFAIL read-$d-$p") & fi
+      done
+      (dd if=/dev/hwrng of=/dev/null bs=64 count=64 2>/dev/null || echo "COV-IOFAIL hwrng-$r") &
+      wait
+    done
+    t1=$(cat /proc/uptime)
+    echo "COV-LOAD t0=${t0%% *} t1=${t1%% *}"
+  else
+    P=/sys/bus/pci/devices; D=/sys/bus/pci/drivers/virtio-pci; A=0000:00:01.0; B=0000:00:04.0
+    blk() { n=0; while test $n -lt 100; do for x in $P/$1/virtio*/block/*; do test -e "$x" && { echo ${x##*/}; return; }; done; sleep 0.1; n=$((n+1)); done; }
+    byte() { hexdump -s $2 -n 1 -e '1/1 "%u"' $P/$1/config; }
+    asha=$(sha /fixtures/a.bin)
+    cat > /tmp/chk <<'EOF'
+dd if=/fixtures/a.bin of=/dev/$1 bs=4k seek=256 oflag=direct conv=notrunc 2>/dev/null || exit 1
+s=$(dd if=/dev/$1 bs=4k skip=256 count=256 iflag=direct 2>/dev/null | sha256sum) || exit 1
+test "${s%% *}" = "$2"
+EOF
+    # One 1 MiB write and read-back on disk $1, at most 30 s: "rc=0 s=SECONDS" when it matched.
+    chk() { t0=$(cat /proc/uptime); timeout 30 sh /tmp/chk $1 $asha; rc=$?; t1=$(cat /proc/uptime); echo "rc=$rc s=$(awk "BEGIN{printf \"%.2f\", ${t1%% *} - ${t0%% *}}")"; }
+    echo $A > $D/unbind || fail unbind-a
+    echo 0 > $P/$A/msi_bus || fail msi-bus
+    echo $A > $D/bind || fail bind-a
+    a=$(blk $A); b=$(blk $B); test -n "$a" && test -n "$b" || fail names
+    echo "COV-STALE-DEVS a=$a b=$b irq_a=$(cat $P/$A/irq)"
+    irqs
+    echo "COV-STALE step=base a=[$(chk $a)] b=[$(chk $b)]"
+    dd if=/dev/$b of=/dev/null bs=4k count=64 iflag=direct 2>/dev/null
+    echo $B > $D/unbind || fail unbind-b
+    echo "COV-STALE step=unbound a=[$(chk $a)]"
+    echo $B > $D/bind || fail bind-b
+    b=$(blk $B); test -n "$b" || fail rebind-b
+    echo "COV-STALE step=rebound a=[$(chk $a)] b=[$(chk $b)]"
+    # Leave slot 4's ISR bit set (a driver on MSI-X never reads it), then MSI-X Enable and Interrupt Disable off.
+    dd if=/dev/$b of=/dev/null bs=4k count=64 iflag=direct 2>/dev/null
+    cap=$(byte $B 52)
+    while test "$cap" -ne 0 && test "$(byte $B $cap)" -ne 17; do cap=$(byte $B $((cap + 1))); done
+    test "$cap" -ne 0 || fail msix-cap
+    echo "COV-STALE-CFG cap=$cap ctl_hi=$(byte $B $((cap + 3))) cmd_hi=$(byte $B 5)"
+    printf '\000' | dd of=$P/$B/config bs=1 seek=$((cap + 3)) conv=notrunc 2>/dev/null || fail msix-off
+    printf '\000' | dd of=$P/$B/config bs=1 seek=5 conv=notrunc 2>/dev/null || fail intx-on
+    echo "COV-STALE-CFG after ctl_hi=$(byte $B $((cap + 3))) cmd_hi=$(byte $B 5)"
+    sleep 2
+    echo "COV-STALE step=msix-off a=[$(chk $a)]"
+    sleep 2
+    echo "COV-STALE step=msix-off-later a=[$(chk $a)]"
+    dmesg | grep -E 'nobody cared|Disabling IRQ' | while read -r l; do echo "COV-STALE-DMESG $l"; done
+  fi
+  irqs
+  echo "COV-SHARED-ERRORS io=$(dmesg | grep -c 'I/O error') timeouts=$(dmesg | grep -ciE 'timed? ?out') unhandled=$(dmesg | grep -cE 'nobody cared|Disabling IRQ')";;
 *) fail case;;
 esac
 echo "COV-ERRORS ioerr_logs=$(ioerrs) fs_errors=$(dmesg | grep -c 'EXT4-fs error')"
@@ -869,9 +946,128 @@ def run_readonly(args):
     return result
 
 
+# The sharedintx case: (name, disks, vCPUs, phase, extra kernel parameters). Disk k is at slot 1 (k = 0) or 3 + k.
+SHARED_LAUNCHES = (('nomsi-8-n1', 8, 1, 'load', ' pci=nomsi'), ('nomsi-8-n4', 8, 4, 'load', ' pci=nomsi'),
+                   ('nomsi-29-n4', 29, 4, 'load', ' pci=nomsi'), ('stale-8-n2', 8, 2, 'stale', ''))
+SHARED_SIZE = 16 * MiB
+SHARED_SECONDS = 300
+
+
+def vd_name(k):
+    """Linux's name of the k-th virtio disk (virtblk_name_format: vda..vdz, vdaa..)."""
+    return 'vd' + (chr(96 + k // 26) if k >= 26 else '') + chr(97 + k % 26)
+
+
+def sharedintx_judge(text, host, phase, n):
+    """Errors of one sharedintx launch."""
+    errors = []
+    def require(ok, message):
+        if not ok: errors.append(message)
+    def one(regex):
+        found = re.findall(regex, text, re.M)
+        return found[0] if len(found) == 1 else None
+    require(one(r'^COV-BEGIN case=(\S+) phase=(\S+) cpus=\d+ kernel=(\S+)$') == ('sharedintx', phase, KVER), 'wrong/missing begin')
+    require(not re.search(r'COV-FAIL|COV-IOFAIL|BUG:|Oops:|Kernel panic|Call Trace:|Buffer I/O error', text), 'guest, kernel or I/O error')
+    require(not host['timeout'], 'VM timed out')
+    require(host['stop'] == POWEROFF[0] and host['rc'] == POWEROFF[1], f"stop {host['stop']!r} rc={host['rc']}")
+    require(not host['backend_errors'], f"host call failures {host['backend_errors']}")
+    require(one(r'^COV-PASS case=(\S+) phase=(\S+)$') == ('sharedintx', phase), 'guest did not finish')
+    disks = re.findall(r'^COV-DISK (\S+) dev=(\S+)$', text, re.M)
+    want = [(vd_name(k), 1 if k == 0 else 3 + k) for k in range(n)]
+    require(len(disks) == n and all(d == name and re.search(rf'/0000:00:{slot:02x}\.0/virtio\d+$', dev) for (d, dev), (name, slot) in zip(disks, want)),
+            f'disks not at their slots in list order: {disks}')
+    require(one(r'^COV-NDISKS (\d+)$') == str(n), 'a disk is missing or extra')
+    summary = one(r'^COV-SHARED-ERRORS io=(\d+) timeouts=(\d+) unhandled=(\d+)$')
+    require(summary == ('0', '0', '0'), f'I/O errors, timeouts or an unhandled (disabled) line: {summary}')
+    irq = re.findall(r'^COV-IRQ (\d+):.*?IO-APIC\s+(\d+)-fasteoi\s+(.*)$', text, re.M)
+    shared = {line for _, line, names in irq if len(re.findall(r'virtio\d+', names)) > 1}
+    if phase == 'load':
+        require(not re.search(r'^COV-IRQ .*PCI-MSI', text, re.M), 'an MSI under pci=nomsi')
+        # Two disks on 16, a disk and the entropy device on 18 (the NIC on 17 has no driver in this initramfs).
+        require({'16', '18'} <= shared, f'lines 16 and 18 not shared: shared lines {sorted(shared)}')
+        require(re.search(r'^COV-LOAD t0=[\d.]+ t1=[\d.]+$', text, re.M) is not None, 'load did not finish')
+        require(host['written'], 'an image does not hold its three copies of the guest pattern')
+    else:
+        steps = dict(re.findall(r'^COV-STALE step=(\S+) (.*)$', text, re.M))
+        require(list(steps) == ['base', 'unbound', 'rebound', 'msix-off', 'msix-off-later'], f'stale steps {list(steps)}')
+        for step, line in steps.items():
+            for dev, rc, sec in re.findall(r'(\w)=\[rc=(\d+) s=([\d.]+)\]', line):
+                require(rc == '0' and float(sec) < 5, f'{step}: disk {dev} rc={rc} after {sec} s')
+        require(one(r'^COV-STALE-DEVS a=(\S+) b=(\S+) irq_a=16$') is not None, 'slot 1 not on INTx line 16')
+        require(re.search(r'^COV-STALE-DMESG', text, re.M) is None, 'Linux reported or disabled an unhandled line')
+    return errors
+
+
+def sharedintx_launch(args, name, n, vcpus, phase, extra, work):
+    """One launch, every device on PCI from a config file; returns the result entry."""
+    paths = []
+    for k in range(n):
+        path = work / f'd{k}.raw'
+        with path.open('xb') as f: f.truncate(SHARED_SIZE)
+        paths.append(path)
+    names = [vd_name(k) for k in range(n)]
+    q = lambda p: json.dumps(str(p))
+    cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case=sharedintx cov_phase={phase} cov_disks={",".join(names)}' + extra
+    config = work / 'vm.toml'
+    config.write_text(f"""[machine]
+ram = "1G"
+vcpus = {vcpus}
+transport = {{ disk = "pci", nic = "pci", rng = "pci" }}
+[serial]
+output = {q(work / 'serial.log')}
+[engine]
+fexc = {q(args.fexc)}
+runtime = {q(args.runtime)}
+compile_cache = "off"
+[boot.kernel]
+image = {q(args.prepared / 'linux')}
+initrd = {q(args.prepared / 'initramfs.cpio')}
+cmdline = {q(cmdline)}
+""" + ''.join(f'[[disk]]\nid = "d{k}"\npath = {q(p)}\n' for k, p in enumerate(paths)) + '[[nic]]\nid = "net0"\n[[rng]]\nid = "rng0"\n')
+    command = [str(args.natemu), '--config', str(config)]
+    write_json(work / 'command.json', {'command': command})
+    env = dict(os.environ); env.pop('NATEMU_PERF_LOG', None)
+    started, timeout = time.monotonic(), False
+    with (work / 'stdout.log').open('wb') as out, (work / 'stderr.log').open('wb') as err:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env, start_new_session=True)
+        try: process.wait(timeout=SHARED_SECONDS)
+        except subprocess.TimeoutExpired: timeout = True; stop_group(process)
+        except BaseException: stop_group(process); raise
+    seconds = time.monotonic() - started
+    text = (work / 'serial.log').read_text(errors='replace').replace('\r', '') if (work / 'serial.log').exists() else ''
+    stderr = (work / 'stderr.log').read_text(errors='replace')
+    pats = dict(re.findall(r'^COV-PAT (\S+) (\S+)$', text, re.M))
+    def written():
+        for d, path in zip(names, paths):
+            data = path.read_bytes()
+            if d not in pats or any(sha(data[i * 4 * MiB:(i + 1) * 4 * MiB]) != pats[d] for i in range(3)) or any(data[12 * MiB:]): return False
+        return True
+    host = {'rc': process.returncode, 'timeout': timeout, 'stop': last_stop(stderr),
+            'backend_errors': [l for l in stderr.splitlines() if l.startswith('virtio-block: ')], 'written': phase == 'load' and written()}
+    errors = sharedintx_judge(text, host, phase, n)
+    load = re.search(r'^COV-LOAD t0=([\d.]+) t1=([\d.]+)$', text, re.M)
+    for path in paths: path.unlink()
+    entry = {'phase': name, 'seconds': round(seconds, 1), 'load_seconds': round(float(load[2]) - float(load[1]), 1) if load else None,
+             'stale': re.findall(r'^COV-STALE.*$', text, re.M), 'rc': process.returncode, 'stop': host['stop'], 'errors': errors}
+    print(json.dumps({'case': 'sharedintx', **entry}), flush=True)
+    return entry
+
+
+def run_sharedintx(args):
+    work = args.out / 'sharedintx'; work.mkdir()
+    result = {'case': 'sharedintx', 'launches': []}
+    for name, n, vcpus, phase, extra in SHARED_LAUNCHES:
+        launch_dir = work / name; launch_dir.mkdir()
+        result['launches'].append(sharedintx_launch(args, name, n, vcpus, phase, extra, launch_dir))
+    result['pass'] = not any(l['errors'] for l in result['launches'])
+    write_json(work / 'result.json', result)
+    return result
+
+
 def run_case(args, case):
     """Both launches of CASE (a control: of the case it controls); returns the result."""
     if case == 'multidisk': return run_multidisk(args)
+    if case == 'sharedintx': return run_sharedintx(args)
     if case == 'readonly': return run_readonly(args)
     base = case.removesuffix('-control')
     work = args.out / case; work.mkdir()
@@ -1100,9 +1296,9 @@ def main():
     parser.add_argument('--inputs', type=Path, default=INPUTS, help='a tools/run_virtio_block.py prepare directory')
     parser.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport (--virtio-transport); pci adds a guest probe and its checks')
     parser.add_argument('--kernel-deb', type=Path, default=KERNEL_DEB, help='the pinned Debian kernel package (the readonly case takes isofs.ko from it)')
-    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS + ('multidisk', 'readonly'), default=list(CASES + CONTROLS))
+    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS + ('multidisk', 'readonly', 'sharedintx'), default=list(CASES + CONTROLS))
     args = parser.parse_args()
-    if {'multidisk', 'readonly'} & set(args.cases) and args.transport != 'mmio': parser.error('multidisk and readonly set their own transports; leave --transport at mmio')
+    if {'multidisk', 'readonly', 'sharedintx'} & set(args.cases) and args.transport != 'mmio': parser.error('multidisk, readonly and sharedintx set their own transports; leave --transport at mmio')
     if len(set(args.cases)) != len(args.cases): parser.error('duplicate cases')
     return run(args)
 
