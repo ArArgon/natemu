@@ -25,6 +25,7 @@ Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock
 NATEMU_RAM and other environment variables pass through to every step (the 4 MiB suite: NATEMU_RAM=0x400000).
 Writes DIR/results.txt (step, phase, result, exit code, seconds, log; one line per step as it ends) and DIR/logs/;
 a passing step's output and temporary directories are deleted, a failing step's kept. Exit status 1 on any failure.
+Steps `*-m2f`/`*-m2a` run FP runners emulating a host without FEAT_AFP (NATEMU_FEXC_FEATURE_OFF=afp), fast / accurate (NATEMU_FP=accurate).
 --only/--skip take comma-separated step names or fnmatch patterns (`k1-*`, `faults@*`); `release` always runs."""
 import argparse, dataclasses, datetime, fcntl, fnmatch, json, os, pathlib, re, shutil, signal, subprocess, sys, threading, time
 
@@ -160,6 +161,17 @@ def steps(F, O):
             vm(r[4:-3].replace('_', '-') + sfx, r, *blk, est=est)
         vm('i6b' + sfx, 'run_i6b.py', 'corpus', *blk, RAW / 'i6b-corpus-20261030-01/programs.json', RAW / 'i6b-corpus-20261030-01/expected.json')
         vm('i6b-cases' + sfx, 'run_i6b.py', 'cases', *blk)
+    # FP regressions on hosts without FEAT_AFP (M1/M2), caught on this M4: the same runners with NATEMU_FEXC_FEATURE_OFF=afp, in fast
+    # mode (documented deviations counted: tools/fp_deviations.py) and accurate mode (NATEMU_FP=accurate: exact). Owner, Nov 16.
+    # i8/i8b are not run in accurate mode yet: exact NaN results arrive with accurate chunk 4; add them to the loop then.
+    for tag, fp in (('m2f', None), ('m2a', 'accurate')):
+        fpenv = ['env', 'NATEMU_FEXC_FEATURE_OFF=afp'] + ([f'NATEMU_FP={fp}'] if fp else [])
+        def fpvm(name, script, *args, **kw):
+            vm(name, script, *args, **kw); S[-1].argv = fpenv + S[-1].argv
+        for r, est in (('run_i5c.py', 8), ('run_i5a_de.py', 10), ('run_i6_faults.py', 10), ('run_i8_faults.py', 45)):
+            fpvm(r[4:-3].replace('_', '-') + '-' + tag, r, est=est)
+        if fp is None:
+            for c in ('i8', 'i8b'): fpvm(f'{c}-{tag}', 'run_slice1_vm.py', *pair(c), judge=i8b_judge if c == 'i8b' else None)
     vm('flow', 'run_slice2_vm.py', '--programs', RAW / 's2d/corpus/programs.json', '--expected', RAW / 's2d/corpus/expected.json')
     for size in ('default', '1', '2'): shards(SHARDS['loopfaults'], f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=120)
     shards(SHARDS['probes'], 'probes', 'run_slice2_probes.py', est=PROBES_EST)
