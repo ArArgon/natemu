@@ -23,6 +23,7 @@ failed guest verification, e2fsck, digest or `qemu-img check` in a run (the runn
 Overlay comparisons (C, D) measure cluster allocation: reported, not gated.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -132,7 +133,7 @@ def others():
 
 
 def env_record(args, dest):
-    rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'pgrep_natemu': sh_out('pgrep', '-fl', 'natemu'), 'other_vm_processes': others(),
+    rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'pgrep_natemu': [l[:150] for l in sh_out('pgrep', '-fl', 'natemu').splitlines()], 'other_vm_processes': others(),
            'loadavg': os.getloadavg(), 'free_disk_bytes': shutil.disk_usage(PERF).free, 'repo_commit': sh_out('git', '-C', TOOLS.parent, 'rev-parse', 'HEAD'),
            'baseline_commit': BASELINE_COMMIT, 'final_commit': args.final_commit or sh_out('git', '-C', TOOLS.parent, 'rev-parse', 'HEAD'),
            'sha256': {}, 'fexc': str(args.fexc), 'matrix_input_image_sha256': None}
@@ -196,21 +197,23 @@ def one_run(args, spec, dest):
     if shutil.disk_usage(PERF).free < (4 if spec['kind'] == 'io5' else 3) << 30:
         raise SystemExit('stopping: less than 3-4 GiB free disk (rerun after freeing space; finished runs are kept)')
     mf = manifest(args, spec, dest)
-    cmd = command(args, spec, out, mf)
-    before = others()
-    began = time.time()
-    for attempt in range(60):   # the matrix runner takes its lock without waiting and dies with BlockingIOError: wait and retry
+    # The driver holds the real VM lock for the whole run (a blocking wait in the queue of the other agents' runners); the runner
+    # itself gets a private lock file, because the matrix runner would otherwise fail at once when anyone else is queued.
+    cmd = command(argparse.Namespace(**dict(vars(args), lock=dest / 'runner.lock')), spec, out, mf)
+    print('  waiting for the VM lock', flush=True)
+    with Path(args.lock).open('a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        before = others()
+        began = time.time()
         if out.exists(): shutil.rmtree(out)
         with logf.open('w') as lf:
             rc = subprocess.run([str(c) for c in cmd], stdout=lf, stderr=subprocess.STDOUT, timeout=3 * 3600 if spec['kind'] == 'io5' else 1800).returncode
-        if rc != 0 and not (out / 'results.json').exists() and not (out / 'result.json').exists() and 'BlockingIOError' in logf.read_text(errors='replace'):
-            print('  VM lock busy, waiting 60 s', flush=True); time.sleep(60); continue
-        break
+        after = others()
     try: m, problems = (metrics_matrix if spec['kind'] == 'matrix' else metrics_io5)(out)
     except (OSError, KeyError, ValueError, IndexError) as e: m, problems = None, [f'no usable result: {e!r} (rc {rc})']
     clean(out)
     return dict(spec, ok=m is not None and rc == 0, problems=problems, rc=rc, seconds=round(time.time() - began), metrics=m or {},
-                others_before=before, others_after=others(), dir=str(out), command=show(cmd), time=time.strftime('%F %T'))
+                others_before=before, others_after=after, dir=str(out), command=show(cmd), time=time.strftime('%F %T'))
 
 
 def load_runs(dest):
@@ -252,7 +255,7 @@ def compare(base, new, noise):
         mb, mn = statistics.median(b), statistics.median(n)
         perf = mn / mb if direction(job) == 'higher' else mb / mn
         loss, nz = 1 - perf, noise.get(job)
-        within = loss <= (nz or 0)
+        within = nz is not None and abs(loss) <= nz   # no measured noise (single runs): every difference counts
         verdict = 'noise' if within else ('FLAG>20%' if loss > .20 else 'FLAG>5%' if loss > .05 else 'ok')
         if loss > .20 and within: verdict = 'FLAG>20% (inside noise)'
         row = dict(job=job, dir=direction(job), base_median=mb, base_min=min(b), base_max=max(b), new_median=mn, new_min=min(n), new_max=max(n),
