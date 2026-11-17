@@ -336,6 +336,7 @@ def run(args):
                 if code != 0 or timed_out: break
     finally:
         stop_group(server)
+        if not args.keep_disk: disk.unlink(missing_ok=True)    # also after a failed or interrupted launch
     # The manifest the second boot checked must be the one the first boot fingerprinted on the console (not a shorter copy).
     use, verify = result['phases'].get('use', {}), result['phases'].get('verify', {})
     fingerprint = use.get('values', {}).get('manifest', [])
@@ -345,7 +346,6 @@ def run(args):
         verify['problems'].append(f'manifest checked on relaunch differs from the first boot fingerprint {fingerprint}')
     result['pass'] = len(result['phases']) == 2 and not any(r['problems'] for r in result['phases'].values())
     write_json(args.out / 'result.json', result)
-    if not args.keep_disk: disk.unlink()
     print('PASS' if result['pass'] else 'FAIL', args.out)
     return 0 if result['pass'] else 1
 

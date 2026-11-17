@@ -787,20 +787,32 @@ pub fn validate(cfg: &Config) -> Res<()> {
             cfg.rngs.len()
         ));
     }
-    // The same file twice (by device and inode; a missing file, such as an overlay not created yet, is no file): two
-    // read-only uses share the shared lock, as do overlays on one base and a base that is also a read-only disk; a
-    // writable use and any other use would collide on the exclusive lock, or let one disk change another's base.
-    let key = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    // The same file twice: by device and inode, or for a missing file (an overlay not created yet) by its canonical
+    // folder and name. Two read-only uses of an existing file share the shared lock, as do overlays on one base and a
+    // base that is also a read-only disk; a writable use and any other use would collide on the exclusive lock, or let
+    // one disk change another's base.
+    let key = |p: &Path| file_id(p);
     for (i, a) in cfg.disks.iter().enumerate() {
         for b in &cfg.disks[i + 1..] {
-            if key(&a.path).is_some() && key(&a.path) == key(&b.path) {
-                if a.readonly && b.readonly {
-                    continue; // two read-only uses of one image share the lock
+            match (key(&a.path), key(&b.path)) {
+                (Some(FileId::Missing(x)), Some(FileId::Missing(y))) if x == y => {
+                    return Err(format!(
+                        "{who}: disks {:?} and {:?} both name {}, which does not exist yet; one new image can be one disk's only",
+                        a.id,
+                        b.id,
+                        x.display()
+                    ));
                 }
-                return Err(format!(
-                    "{who}: disks {:?} and {:?} are the same file; that is allowed only when both are readonly",
-                    a.id, b.id
-                ));
+                (Some(x), Some(y)) if x == y => {
+                    if a.readonly && b.readonly {
+                        continue; // two read-only uses of one image share the lock
+                    }
+                    return Err(format!(
+                        "{who}: disks {:?} and {:?} are the same file; that is allowed only when both are readonly",
+                        a.id, b.id
+                    ));
+                }
+                _ => {}
             }
         }
         let Some(base) = a.backing.as_deref() else {
@@ -821,6 +833,28 @@ pub fn validate(cfg: &Config) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// What makes two disk paths one file.
+#[derive(PartialEq)]
+enum FileId {
+    /// An existing file: device and inode.
+    File(u64, u64),
+    /// A missing file in an existing folder: the folder's canonical path joined with the name.
+    Missing(PathBuf),
+}
+/// `None`: neither the file nor its folder exists (the open reports it).
+fn file_id(p: &Path) -> Option<FileId> {
+    if let Ok(m) = std::fs::metadata(p) {
+        return Some(FileId::File(m.dev(), m.ino()));
+    }
+    let folder = p
+        .parent()
+        .filter(|f| !f.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Some(FileId::Missing(
+        std::fs::canonicalize(folder).ok()?.join(p.file_name()?),
+    ))
 }
 
 /// Builds the configuration: defaults, file, environment, flags, `--set`; then validates it.
