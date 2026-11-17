@@ -17,7 +17,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        RwLock, RwLockReadGuard,
         atomic::{AtomicBool, Ordering::SeqCst},
     },
 };
@@ -82,6 +82,25 @@ fn check(header: &QcowHeader, path: &Path, read_only: bool) -> Result<()> {
         return Err(format!(
             "disk {p}: the image has internal snapshots, which natemu does not write; open it read-only, \
              or copy it without them (qemu-img convert -O qcow2)"
+        ));
+    }
+    // The vendored code never grows the refcount table, so allocation fails once the file outgrows what it covers
+    // (qemu-img gives a small image a one-cluster table: about 4 GiB of file at 4 KiB clusters). Refuse up front
+    // when the table cannot cover everything the image can need: every data cluster, its L2 tables twice (a moved
+    // table and its old copy until a flush), the L1 table and header, the refcount blocks twice, and some slack.
+    let cluster = 1u64 << header.cluster_bits;
+    let per_block = cluster * 8 / (1u64 << header.refcount_order);
+    let covered = (u64::from(header.refcount_table_clusters) * cluster / 8)
+        .saturating_mul(per_block)
+        .saturating_mul(cluster);
+    let data = header.size.div_ceil(cluster);
+    let l2 = data.div_ceil(cluster / 8);
+    let clusters = data + 2 * l2 + l2.div_ceil(cluster / 8) + 64;
+    let need = (clusters + 2 * clusters.div_ceil(per_block)).saturating_mul(cluster);
+    if covered < need {
+        return Err(format!(
+            "disk {p}: its refcount table covers {covered} bytes of file, less than the {need} this image can grow to, \
+             and natemu cannot grow it; copy the image (qemu-img convert -O qcow2 -o cluster_size=65536 {p} ...)"
         ));
     }
     Ok(())
@@ -306,9 +325,12 @@ struct Qcow {
     cluster: u64,
     /// A table write or a sync failed: every later write and sync of the disk fails; reads go on.
     failed: AtomicBool,
-    /// A power-off sync cleared the dirty bit: the next change sets it again first (under `dirtying`).
+    /// A power-off sync cleared the dirty bit: the next change sets it again first.
     clean: AtomicBool,
-    dirtying: Mutex<()>,
+    /// Held shared by every change for its whole call and exclusively by the power-off sync, so no change can land
+    /// after `close_clean` cleared the dirty bit. (The device also drains only once nothing is in flight; this
+    /// keeps the backend safe without relying on that.)
+    dirtying: RwLock<()>,
 }
 
 const FAILED: &str = "an earlier qcow2 table write or sync of this disk failed";
@@ -325,19 +347,25 @@ impl Qcow {
             read_only,
             failed: AtomicBool::new(false),
             clean: AtomicBool::new(false),
-            dirtying: Mutex::new(()),
+            dirtying: RwLock::new(()),
         })
     }
-    /// Refuse a change to a read-only or failed image; set the dirty bit again after a clean close.
-    fn changing(&self) -> io::Result<()> {
+    /// Refuse a change to a read-only or failed image; set the dirty bit again after a clean close. The guard is
+    /// held for the whole change.
+    fn changing(&self) -> io::Result<RwLockReadGuard<'_, ()>> {
         if self.read_only {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
         if self.failed.load(SeqCst) {
             return Err(io::Error::other(FAILED));
         }
-        if self.clean.load(SeqCst) {
-            let _held = self.dirtying.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let held = self.dirtying.read().unwrap_or_else(|e| e.into_inner());
+            if !self.clean.load(SeqCst) {
+                return Ok(held);
+            }
+            drop(held);
+            let _only = self.dirtying.write().unwrap_or_else(|e| e.into_inner());
             if self.clean.load(SeqCst) {
                 self.disk
                     .mark_dirty()
@@ -345,7 +373,6 @@ impl Qcow {
                 self.clean.store(false, SeqCst);
             }
         }
-        Ok(())
     }
     /// An error of a call that may have written tables (an eviction): a failed table write fails the disk.
     fn noted(&self, e: io::Error) -> io::Error {
@@ -364,7 +391,7 @@ impl DiskBackend for Qcow {
         Ok(buf.len())
     }
     fn write(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
-        self.changing()?;
+        let _held = self.changing()?;
         self.disk
             .write_all_at(offset, buf)
             .map_err(|e| self.noted(e))?;
@@ -379,7 +406,7 @@ impl DiskBackend for Qcow {
             return Err(io::Error::other(FAILED));
         }
         let result = if full {
-            let _held = self.dirtying.lock().unwrap_or_else(|e| e.into_inner());
+            let _only = self.dirtying.write().unwrap_or_else(|e| e.into_inner());
             self.disk
                 .close_clean()
                 .map(|()| self.clean.store(true, SeqCst))
@@ -390,8 +417,11 @@ impl DiskBackend for Qcow {
     }
     /// The whole clusters inside the range are freed (and then read as zeros, also over a backing file); partial
     /// clusters at the ends are left as they are (a hint).
+    /// Upstream race, kept: a write mapped to a cluster just before an overlapping discard frees it can land after
+    /// the cluster is reused for another address (it needs a flush in between). Only overlapping in-flight requests
+    /// can do that, and virtio-blk promises nothing for them.
     fn discard(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.changing()?;
+        let _held = self.changing()?;
         let (start, end) = (
             offset.next_multiple_of(self.cluster),
             (offset + len) / self.cluster * self.cluster,
@@ -405,7 +435,7 @@ impl DiskBackend for Qcow {
     }
     /// Whole clusters get the zero flag (table updates only), partial ones zeros written.
     fn write_zeroes(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.changing()?;
+        let _held = self.changing()?;
         self.disk
             .deallocate(offset, len as usize, true)
             .map_err(|e| self.noted(e))

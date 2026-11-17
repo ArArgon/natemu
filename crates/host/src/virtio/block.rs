@@ -1342,7 +1342,8 @@ impl Virtio {
         self.settle(&mut s);
     }
     /// Power-off drain once nothing is in flight: a final full sync on a worker (it covers every
-    /// completed write), the workers' join, then a quiet device.
+    /// completed write), the workers' join, then a quiet device. Backends rely on that contract (the
+    /// qcow2 backend clears its dirty bit in this sync); it also refuses a change racing the sync itself.
     pub(super) fn drain_disk(&self, mut pool: Pool, cancel: &AtomicBool) -> Result<()> {
         pool.submit(FINAL_SYNC, Job::Flush(true))?;
         let done = loop {

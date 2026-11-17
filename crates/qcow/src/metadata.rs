@@ -457,6 +457,8 @@ impl QcowMetadata {
     pub(super) fn close_clean(&self) -> io::Result<()> {
         let mut inner = self.inner.write().unwrap();
         inner.sync_caches()?;
+        // natemu: no unused growth tail is left behind (qemu-img check would see it as free space).
+        inner.raw_file.trim()?;
         inner.raw_file.file().full_sync()?;
         let mut freed = mem::take(&mut inner.unref_clusters);
         inner.avail_clusters.append(&mut freed);
@@ -591,8 +593,13 @@ impl QcowMetadata {
     /// `unref_clusters` (rather than directly to `avail_clusters`) preserves
     /// the existing rule that metadata must be flushed before a freed cluster
     /// can be allocated again.
-    pub(super) fn complete_punch_hole(&self, host_offset: u64) {
-        self.inner.write().unwrap().unref_clusters.push(host_offset);
+    /// natemu: for several clusters under one lock (merged punches).
+    pub(super) fn complete_punch_holes(&self, host_offsets: impl Iterator<Item = u64>) {
+        self.inner
+            .write()
+            .unwrap()
+            .unref_clusters
+            .extend(host_offsets);
     }
 
     pub(super) fn virtual_size(&self) -> u64 {
@@ -633,7 +640,9 @@ impl QcowMetadata {
 impl Drop for QcowMetadata {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        // After a failed table write the tables on disk are unknown: write nothing more.
         if inner.raw_file.file().is_writable()
+            && !inner.table_write_failed
             && let Err(e) = inner.sync_caches()
         {
             log::warn!("Failed to write QCOW2 metadata on close: {e}");
@@ -1239,6 +1248,7 @@ impl QcowState {
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
         }
         self.raw_file.file_mut().set_len(new_file_end)?;
+        self.raw_file.forget_end();
 
         // Set refcounts for the contiguous range
         for i in 0..new_l1_clusters {
@@ -1681,6 +1691,8 @@ mod tests {
 
     // Restrict allocation without changing the free lists or flushing caches.
     fn limit_growth(state: &mut super::QcowState, additional_clusters: u64) -> u64 {
+        // natemu: the file end is the allocation end only without a growth tail.
+        state.raw_file.trim().unwrap();
         let cluster_size = state.raw_file.cluster_size();
         let file_clusters = state
             .raw_file
