@@ -1067,7 +1067,7 @@ memory accesses and unknown opcodes.
   admitted code stops `fp_trap`, an Arm word the table does not know stops `fp_word` (never patched wrongly).
 - Chunk 6b: every patched word (`fptrap::Class::Patch`: multiplies, divides, FMAs, adds, subtracts, square roots, pairwise adds, narrowing
   converts, all arrangements, by-element forms and FCVTN2) is performed in the resident from `fptrap::TABLE`: pre-assembled instructions in the
-  resident's text (execute-only, never written, nothing to synchronise), one per canonical word (the guest word with Rd, Rn, Rm, Ra renamed
+  resident's text (read-only and executable, never written, nothing to synchronise), one per canonical word (the guest word with Rd, Rn, Rm, Ra renamed
   v0..v3), found by a hash of it (`fptrap::slot`; a word with no entry is a build error in the sweep test `every_patched_word_has_a_table_entry`).
   `fptrap::exec` loads v0..v3 from the frame (v0 = Rd's old value: FMLA's accumulator, FCVTN2's kept half), runs the instruction under the trapped
   FPCR without the trap enables and FPSR cleared, stores v0 to Rd and returns FPSR, then the patch runs as before and execution resumes after the

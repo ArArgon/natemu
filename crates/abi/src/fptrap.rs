@@ -525,7 +525,7 @@ const fn build() -> [u32; 2 * SLOTS] {
 }
 
 /// The pre-assembled instructions: slot `s` is `[instruction, ret]` at words `2 s`, `2 s + 1`. The resident places a copy in its text
-/// (execute-only memory is never written: nothing to synchronise) and the native tests in a page they make executable.
+/// (read-only executable text is never written: nothing to synchronise) and the native tests in a page they make executable.
 pub const TABLE: [u32; 2 * SLOTS] = build();
 
 /// The table slot (in the copy at `base`) holding the canonical word of the patched word `w`, `None` when it has no entry.

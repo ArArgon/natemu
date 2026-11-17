@@ -8,7 +8,7 @@
 //!    or from EL0 at a PC inside no admitted block or the step block, or an Arm word the table does not know, halts with a named stop
 //!    ([`stop::FP_TRAP`], [`stop::FP_WORD`]) and never reaches the decoder;
 //! 2. **the table path** (chunk 6b, every [`fptrap::Class::Patch`] word): the operation is performed here, in the resident, by the
-//!    word's entry in a fixed table of pre-assembled instructions ([`fptrap::TABLE`], in this image's text: execute-only, never written;
+//!    word's entry in a fixed table of pre-assembled instructions ([`fptrap::TABLE`], in this image's text: read-only and executable, never written;
 //!    the entry is the word with its registers renamed v0..v3, so arrangement, element size, by-element index and form are the guest's)
 //!    on registers loaded from the frame, under the trapped FPCR with the trap enables cleared and FPSR cleared ([`fptrap::exec`]), the
 //!    result stored to the frame's Rd: what the hardware's re-run gave, with no second exception;
