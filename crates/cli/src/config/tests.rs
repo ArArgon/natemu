@@ -902,6 +902,27 @@ fn backing_files_follow_the_same_file_rule() {
             "{e}"
         );
     }
+    // Paths that do not exist yet are compared by folder and name: one new overlay named twice (through another
+    // spelling of its folder), or one disk's new image named as another's backing.
+    let new = d.join("new.qcow2");
+    let e = err(run(&[
+        disk("a", &new, false, Some(&base)),
+        disk("b", &d.join("./new.qcow2"), false, Some(&base)),
+    ]));
+    assert!(
+        e.contains("disks \"a\" and \"b\" both name") && e.contains("does not exist yet"),
+        "{e}"
+    );
+    let e = err(run(&[
+        disk("a", &top, false, Some(&new)),
+        disk("b", &new, false, Some(&base)),
+    ]));
+    assert!(
+        e.contains("the backing file of disk \"a\" is disk \"b\""),
+        "{e}"
+    );
+    let e = err(run(&[disk("a", &new, false, Some(&new))]));
+    assert!(e.contains("is its own backing file"), "{e}");
     // Shared read-only: two overlays on one base (one not created yet), and the base also a read-only disk.
     assert!(
         run(&[

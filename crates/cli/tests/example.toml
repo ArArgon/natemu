@@ -23,7 +23,7 @@ cmdline = "console=ttyS0 root=/dev/vda1 ro"
 
 [[disk]]                     # the guest sees disks in this order: /dev/vda, /dev/vdb, ...
 id = "root"
-path = "runs/r1/root.qcow2"  # a qcow2 overlay, created at the first launch when missing
+path = "runs/r1/root.qcow2"  # a qcow2 overlay, created at the first launch when missing (runs/r1 must exist)
 backing = "debian13.raw"     # its base: opened read-only, never written
 
 [[disk]]

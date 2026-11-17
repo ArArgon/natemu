@@ -40,7 +40,7 @@ cmdline = "console=ttyS0 root=/dev/vda1 ro"
 
 [[disk]]                     # the guest sees disks in this order: /dev/vda, /dev/vdb, ...
 id = "root"
-path = "runs/r1/root.qcow2"  # a qcow2 overlay, created at the first launch when missing
+path = "runs/r1/root.qcow2"  # a qcow2 overlay, created at the first launch when missing (runs/r1 must exist)
 backing = "debian13.raw"     # its base: opened read-only, never written
 
 [[disk]]
@@ -174,7 +174,9 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `c.toml: the backing file of disk "a" is disk "b", which is writable; ...` | A base must not change under its overlay |
 | `disk top.qcow2: top.qcow2 is based on /x/base.raw; add backing = "/x/base.raw" to this disk (or --set disk.disk0.backing=/x/base.raw)` | An overlay opened without its base |
 | `disk top.qcow2: top.qcow2 is based on /x/base.raw, not on the backing /y/other.raw` | `backing` names another file than the overlay's |
-| `a backing file needs a qcow2 image` | `backing` on a raw image |
+| `disk d.raw: a backing file needs a qcow2 image` | `backing` on a raw image |
+| `c.toml: disks "a" and "b" both name /x/new.qcow2, which does not exist yet; ...` | One new overlay named by two disks |
+| `disk top.qcow2: another launch created this overlay first; launch again to use it` | Two launches created one overlay at once |
 | `disk top.qcow2: does not exist; a read-only overlay is never created ...` | `readonly` and `backing` on a missing file |
 
 ## Limits
@@ -187,7 +189,7 @@ none) and the key. All of these are found before the VM starts, and the process 
 - Disk images are detected by content, not name (raw or qcow2; VMDK, VHDX, VDI, VHD and DMG are
   refused by name).
 - **Overlays.** A disk with `backing` is a qcow2 overlay over that base (raw or qcow2). If `path`
-  does not exist, natemu creates it (never overwriting a file): a qcow2 v3 image, 64 KiB clusters,
+  does not exist, natemu creates it (never overwriting a file, and never creating folders): a qcow2 v3 image, 64 KiB clusters,
   the base's virtual size, recording the base's absolute path and format, as `qemu-img create -f
   qcow2 -b BASE -F FMT` would. If it exists, it must be a qcow2 image based on that same file
   (compared by device and inode). A read-only disk with `backing` must already exist. The base is
@@ -195,6 +197,16 @@ none) and the key. All of these are found before the VM starts, and the process 
   must not be another disk's writable image. An overlay whose base the configuration does not name
   is refused, with the key to add (a downloaded image could otherwise name any host file). Bases
   below the configured one must be named relative to their image's folder, with a backing format.
+- The new overlay is written under a temporary name in the same folder,
+  `.NAME.natemu-new-PID-TIME-N`, and moved to `path` only when complete, so `path` never holds a
+  partial image. A crash while creating leaves at most such a file; natemu never reads it, and it
+  may be deleted.
+- An overlay natemu creates records its base by absolute path, so in M1 it cannot itself be the
+  `backing` of another overlay: links below the configured base must be relative names (a
+  downloaded image could otherwise name any host file). Point the second overlay's `backing` at
+  the original base instead, or make the chain with qemu-img using relative names
+  (`qemu-img create -f qcow2 -b mid.qcow2 -F qcow2 top.qcow2` in the folder of `mid.qcow2`, itself
+  made with a relative `-b`), and name the chain's top base as `backing`.
 - Two read-only disks on one file get different serials: the second use's serial starts with a
   letter after `f` (`g`, `h`, ...), so it matches no file's.
 - A file's `[boot.kernel]` must give `image` unless `--kernel` supplies it.
