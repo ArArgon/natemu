@@ -35,7 +35,8 @@ CLASSES = {
 # Which mode fixes each class on a host without AFP (plan section 3, "fixed by"): accurate mode, in the chunk named; fast mode never,
 # unless chunk 6's gate moves UFE (band-ue-flag) or IOE (nan-results, fma-invalid-flag) there.
 FIXED_BY = {'masked-sse-de': 'accurate (chunk 2)', 'nan-results': 'accurate (chunk 4)', 'fma-invalid-flag': 'accurate (chunk 4)',
-            'band-ue-flag': 'accurate (chunk 3: UFE trap, handler); fast only if chunk 6 moves UFE', 'daz-ftz-band': 'accurate (chunk 5)'}
+            'band-ue-flag': 'accurate (chunk 3: UFE trap, handler); fast only if chunk 6 moves UFE', 'daz-ftz-band': 'accurate (chunk 5)',
+            'ftz-band': 'accurate (chunk 3: the handler flushes the band lane under FTZ alone)'}
 assert FIXED_BY.keys() == CLASSES.keys()
 
 

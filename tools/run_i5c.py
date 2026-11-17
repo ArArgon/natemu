@@ -152,8 +152,8 @@ def simd_cases():
     # (tiny, unchanged) and FTZ flushes it to +0 with UE and PE; Arm's denormal grid rounds it up to MIN_NORMAL. Nearest and round up.
     for rc in (0, 2):
         c1 = one(f'ftz-band-flush-rc{rc}', 'mulss xmm1, xmm2', {1: lanes(0x1ffff000, ONE, ONE, ONE), 2: lanes(0x20000800, ONE, ONE, ONE)}, MX | 0x8000 | rc << 13, UE | PE, None, 1)
-        old = c1['check']
-        c1['check'] = lambda vm, old=old: old(vm) + ([] if xmm_of(vm, 1) == (ONE << 32, ONE | ONE << 32) else [f'xmm1 {xmm_of(vm, 1)[0]:#x} {xmm_of(vm, 1)[1]:#x}, want 0x{ONE << 32:x} (lane 0 flushed to +0)'])
+        # A registered value deviation (fp_deviations `ftz-band`): fast mode without AFP leaves +MIN_NORMAL in lane 0, every other setting +0.
+        c1['value'] = {'tag': 'ftz-band', 'read': lambda vm: xmm_of(vm, 1), 'exact': (ONE << 32, ONE | ONE << 32), 'deviated': (0x00800000 | ONE << 32, ONE | ONE << 32)}
         out.append(c1)
     # DAZ: a denormal source is zero, no DE whatever DM (10.2.3.4).
     out.append(one('daz-de-unmasked', 'addss xmm1, xmm2', {1: lanes(ONE), 2: lanes(DEN)}, (MX | 0x40) & ~(DE << 7), 0, None, 1))
@@ -626,6 +626,12 @@ def judge(c, vm, offsets):
         if c['mx']:
             kind, why = dev.mxcsr_verdict(c['mx'], vm, int(vm['mxcsr'], 0))
             if why: problems.append(why)
+        v = c.get('value')
+        if v:   # a case with a registered value deviation: judged in one place, `dev.verdict`
+            got = v['read'](vm)
+            vk, why = dev.verdict(v['tag'], vm, got, v['exact'], v['deviated'])
+            if vk == 'fail': problems.append(why or f"{v['tag']} case: value {got[0]:#x} {got[1]:#x}, want {v['exact'][0]:#x} {v['exact'][1]:#x}")
+            elif vk == 'deviated' and kind == 'ok': kind = 'deviated'
     return problems, ('fail' if problems else kind)
 
 
@@ -649,7 +655,21 @@ def self_check():
                              ({'afp': True, 'fp': 'fast'}, d, 'fail'), ({'afp': False, 'fp': 'accurate'}, d, 'fail')):
         got = judge(c, vm(mx, **report), offsets)[1]
         if got != kind: sys.exit(f"run_i5c self-check FAILED: judge({c['name']}, {report}, mxcsr {mx:#x}) is {got}, want {kind}")
-    print(f'{len(cs)} cases ({len(simd)} SIMD), {len(tagged)} tagged masked-sse-de')
+    # a case with a registered value deviation (`ftz-band`): the deviated value in fast mode without AFP, exact everywhere else
+    c = next(c for c in cs if c.get('value'))
+    code, labels = ref.assemble('\n'.join(f'{l}\nl{i}:' for i, l in enumerate(c['lines'])), labels=True)
+    offsets = [0] + [labels[f'l{i}'] for i in range(len(c['lines']) - 1)]
+    v = c['value']
+    def vmv(value, **r):
+        x = [hex(0)] * 32; x[2], x[3] = hex(value[0]), hex(value[1])
+        return {'stop': 'resident', 'reason': 'halted', 'rip': hex(CODE + offsets[-1] + 1), 'mxcsr': hex(c['mx']['want']), 'fault': [], 'xmm': x, **r}
+    m2, m4, acc = {'afp': False, 'fp': 'fast'}, {'afp': True, 'fp': 'fast'}, {'afp': False, 'fp': 'accurate'}
+    other = (v['deviated'][0] ^ 1, v['deviated'][1])
+    for report, value, kind in ((m2, v['deviated'], 'deviated'), (m2, v['exact'], 'fail'), (m2, other, 'fail'), (m4, v['exact'], 'ok'),
+                                (m4, v['deviated'], 'fail'), (acc, v['exact'], 'ok'), (acc, v['deviated'], 'fail'), ({}, v['deviated'], 'fail')):
+        got = judge(c, vmv(value, **report), offsets)[1]
+        if got != kind: sys.exit(f"run_i5c self-check FAILED: judge({c['name']}, {report}, lane {value[0]:#x}) is {got}, want {kind}")
+    print(f'{len(cs)} cases ({len(simd)} SIMD), {len(tagged)} tagged masked-sse-de, {sum(1 for c in cs if c.get("value"))} with a value deviation (ftz-band)')
 
 
 def main():
@@ -675,7 +695,7 @@ def main():
             vm = json.loads(run.stdout)
             reports.add((vm.get('afp'), vm.get('fp')))
             problems, kind = judge(c, vm, offsets)
-        tag = c['mx'] and c['mx']['tag']
+        tag = (c['mx'] and c['mx']['tag']) or (c.get('value') or {}).get('tag')
         counts.add(kind, tag)
         results.append({'name': c['name'], 'ok': not problems, 'outcome': kind, 'tag': tag, 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400])
