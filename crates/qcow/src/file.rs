@@ -110,11 +110,15 @@ impl FileLayer for StdFile {
 }
 
 fn fcntl_sync(fd: libc::c_int, cmd: libc::c_int) -> io::Result<()> {
-    // SAFETY: fcntl with a no-argument sync command on a valid descriptor.
-    if unsafe { libc::fcntl(fd, cmd) } < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+    loop {
+        // SAFETY: fcntl with a no-argument sync command on a valid descriptor.
+        if unsafe { libc::fcntl(fd, cmd) } >= 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
     }
 }
 
@@ -143,6 +147,13 @@ pub fn sync_fd(fd: libc::c_int, kind: SyncKind) -> io::Result<()> {
         };
         match fcntl_sync(fd, cmd) {
             Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL)) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    log::warn!(
+                        "this file system refuses F_BARRIERFSYNC/F_FULLFSYNC ({e}); using fsync, \
+                         which orders nothing against a power loss"
+                    )
+                });
                 fsync_retry_eintr(fd)
             }
             r => r,
