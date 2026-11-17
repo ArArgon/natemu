@@ -1,0 +1,804 @@
+use super::*;
+use crate::{CLI_ENV, parse_cli};
+use natemu::linux::Transport::{Mmio, Pci};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    CLI_ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A fresh temporary folder.
+fn dir() -> PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "natemu-cfg-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Loads the configuration of `natemu ARGS`.
+fn load_args(args: &[&str]) -> Res<Config> {
+    let cli = parse_cli(std::iter::once("natemu").chain(args.iter().copied()))
+        .map_err(|e| e.to_string())?;
+    load(&cli)
+}
+const BASE: [&str; 4] = ["--fexc", "f", "--kernel", "k"];
+fn load_old(extra: &[&str]) -> Res<Config> {
+    load_args(&[&BASE[..], extra].concat())
+}
+/// Writes `toml` as vm.toml in a new folder and loads `natemu --config vm.toml ARGS`.
+fn load_file(toml: &str, args: &[&str]) -> (PathBuf, Res<Config>) {
+    let d = dir();
+    let f = d.join("vm.toml");
+    std::fs::write(&f, toml).unwrap();
+    let mut a = vec!["--config", f.to_str().unwrap()];
+    a.extend(args);
+    (d, load_args(&a))
+}
+const MIN: &str = "[engine]\nfexc = \"fexc\"\n[boot.kernel]\nimage = \"vmlinuz\"\n";
+fn err(r: Res<Config>) -> String {
+    r.expect_err("expected a refusal")
+}
+
+// ---- equivalence with the old command line (33a99fb8) ------------------------------------------------------------------
+
+/// What the library sees, for comparison.
+#[derive(Debug, PartialEq)]
+struct Fields {
+    runtime: PathBuf,
+    fexc: PathBuf,
+    kernel: Vec<u8>,
+    initrd: Option<Vec<u8>>,
+    cmdline: String,
+    ram: u64,
+    vcpus: usize,
+    cache: (Option<PathBuf>, u64),
+    speculation_barriers: bool,
+    accurate_fp: bool,
+    page_currency: u64,
+    writable_on_read: bool,
+    rng: bool,
+    disk: Option<PathBuf>,
+    net: bool,
+    forwards: Vec<(bool, u16, u16)>,
+    host_loopback: bool,
+    pool: bool,
+    check_reuse: bool,
+    transports: Transports,
+    perf_log: Option<PathBuf>,
+    serial: Option<PathBuf>,
+    serial_stdin: bool,
+}
+fn fields(
+    b: &Boot,
+    perf_log: Option<PathBuf>,
+    serial: Option<PathBuf>,
+    serial_stdin: bool,
+) -> Fields {
+    Fields {
+        runtime: b.runtime.clone(),
+        fexc: b.fexc.clone(),
+        kernel: b.kernel.clone(),
+        initrd: b.initrd.clone(),
+        cmdline: b.cmdline.clone(),
+        ram: b.ram,
+        vcpus: b.vcpus,
+        cache: (b.compile_cache.dir.clone(), b.compile_cache.cap),
+        speculation_barriers: b.speculation_barriers,
+        accurate_fp: b.accurate_fp,
+        page_currency: b.page_currency,
+        writable_on_read: b.writable_on_read,
+        rng: b.rng,
+        disk: b.disk.clone(),
+        net: b.net,
+        forwards: b
+            .net_options
+            .forwards
+            .iter()
+            .map(|f| {
+                (
+                    f.protocol == natemu::virtio::ForwardProtocol::Udp,
+                    f.host_port.get(),
+                    f.guest_port.get(),
+                )
+            })
+            .collect(),
+        host_loopback: b.net_options.host_loopback,
+        pool: b.pool,
+        check_reuse: b.check_reuse,
+        transports: b.transports,
+        perf_log,
+        serial,
+        serial_stdin,
+    }
+}
+/// The expectation: the field mapping of `boot()` in crates/cli/src/main.rs at commit 33a99fb8, copied statement for
+/// statement (the same `Boot::new` and the old defaults) onto the clap struct, which still has the old flag fields.
+fn legacy(cli: &Cli) -> Fields {
+    let net_options = SlirpOptions {
+        forwards: cli.net_forward.clone(),
+        host_loopback: cli.net_host_loopback,
+    };
+    let mut boot = Boot::new("RT", cli.fexc.clone().unwrap(), vec![7]);
+    boot.compile_cache = natemu::compile_cache::Config::new(
+        cli.compile_cache.as_deref().map(|p| p.as_os_str()),
+        cli.compile_cache_mb,
+    )
+    .unwrap();
+    boot.speculation_barriers = cli.speculation_barriers;
+    boot.accurate_fp = cli.fp;
+    boot.page_currency = cli.page_currency;
+    boot.writable_on_read = cli.writable_on_read;
+    boot.rng = cli.rng;
+    boot.disk = cli.disk.clone();
+    boot.net = cli.net;
+    boot.net_options = net_options;
+    boot.pool = cli.pool;
+    boot.check_reuse = cli.check_reuse;
+    boot.transports = cli.virtio_transport;
+    boot.initrd = cli.initrd.as_ref().map(|_| vec![8]);
+    boot.cmdline = cli.cmdline.clone().unwrap_or_default();
+    boot.ram = cli.ram.unwrap_or(boot.ram);
+    boot.vcpus = cli.vcpus.unwrap_or(boot.vcpus);
+    fields(
+        &boot,
+        cli.perf_log.clone(),
+        cli.serial.clone(),
+        cli.serial_stdin,
+    )
+}
+fn new_way(cli: &Cli) -> Fields {
+    let cfg = load(cli).unwrap();
+    let boot = to_boot(
+        &cfg,
+        "RT".into(),
+        vec![7],
+        cfg.initrd.as_ref().map(|_| vec![8]),
+    )
+    .unwrap();
+    fields(
+        &boot,
+        cfg.perf_log.clone(),
+        cfg.serial_output.clone(),
+        cfg.serial_stdin,
+    )
+}
+
+#[test]
+fn old_command_lines_build_the_same_boot() {
+    let _env = lock();
+    let every_flag = "--runtime r --initrd i --cmdline console=ttyS0 --ram 4G --vcpus 4 --serial out.txt --serial-stdin \
+        --speculation-barriers --fp accurate --page-currency off --writable-on-read off --rng --disk d.raw --net \
+        --net-forward 2222:22 --net-forward udp:19000:9000 --net-host-loopback --pool=false --check-reuse \
+        --virtio-transport disk=pci,net=mmio --compile-cache /c --compile-cache-mb 64 --perf-log p.log";
+    let lines: &[&str] = &[
+        "",
+        every_flag,
+        "--cmdline 3",
+        "--cmdline -x",
+        "--ram 0x80000000 --vcpus 2",
+        "--ram 2048M",
+        "--ram 64k",
+        "--pool",
+        "--pool=true",
+        "--virtio-transport pci",
+        "--virtio-transport mmio",
+        "--virtio-transport disk=pci",
+        "--virtio-transport net=pci --net --rng --disk d",
+        "--virtio-transport rng=pci,disk=mmio --rng",
+        "--compile-cache off",
+        "--compile-cache-mb 1",
+        "--fp fast --page-currency check --writable-on-read on",
+        "--net --net-forward tcp:1:65535",
+        "--net --net-host-loopback",
+        "--disk /abs/d.raw",
+        "--serial-stdin --serial s",
+        "--rng",
+    ];
+    for line in lines {
+        let args: Vec<&str> = BASE
+            .iter()
+            .copied()
+            .chain(line.split_whitespace())
+            .collect();
+        let cli = parse_cli(std::iter::once("natemu").chain(args.iter().copied())).unwrap();
+        assert_eq!(new_way(&cli), legacy(&cli), "{line}");
+    }
+    // The environment variables: each, on its own and beaten by its flag.
+    let vars = [
+        ("NATEMU_SERIAL_STDIN", "yes"),
+        ("NATEMU_SPECULATION_BARRIERS", "on"),
+        ("NATEMU_FP", "accurate"),
+        ("NATEMU_PAGE_CURRENCY", "off"),
+        ("NATEMU_WRITABLE_ON_READ", "off"),
+        ("NATEMU_POOL", "0"),
+        ("NATEMU_CHECK_REUSE", "true"),
+        ("NATEMU_COMPILE_CACHE", "/envcache"),
+        ("NATEMU_COMPILE_CACHE_MB", "9"),
+        ("NATEMU_PERF_LOG", "env.log"),
+    ];
+    for (name, value) in vars {
+        // SAFETY: CLI_ENV is held, and every test that reads the environment holds it.
+        unsafe { std::env::set_var(name, value) };
+        for line in [
+            "",
+            "--fp fast --page-currency on --writable-on-read on --pool --compile-cache off --compile-cache-mb 1 --perf-log f.log",
+        ] {
+            let args: Vec<&str> = BASE
+                .iter()
+                .copied()
+                .chain(line.split_whitespace())
+                .collect();
+            let cli = parse_cli(std::iter::once("natemu").chain(args.iter().copied())).unwrap();
+            assert_eq!(new_way(&cli), legacy(&cli), "{name} {line}");
+        }
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+#[test]
+fn old_command_line_without_a_kernel_or_fexc_fails_clearly() {
+    let _env = lock();
+    assert!(err(load_args(&["--fexc", "f"])).contains("no boot method"));
+    assert!(err(load_args(&["--kernel", "k"])).contains("no fexc"));
+    assert!(err(load_args(&["--fexc", "f", "--initrd", "i"])).contains("no boot method"));
+}
+
+// ---- old spellings ------------------------------------------------------------------------------------------------------
+
+#[test]
+fn boolean_words_in_flags_env_and_set() {
+    let _env = lock();
+    for (word, want) in [
+        ("1", true),
+        ("yes", true),
+        ("on", true),
+        ("true", true),
+        ("0", false),
+        ("no", false),
+        ("off", false),
+        ("false", false),
+    ] {
+        unsafe { std::env::set_var("NATEMU_SERIAL_STDIN", word) };
+        assert_eq!(load_old(&[]).unwrap().serial_stdin, want, "env {word}");
+        unsafe { std::env::remove_var("NATEMU_SERIAL_STDIN") };
+        let set = format!("serial.stdin={word}");
+        assert_eq!(
+            load_old(&["--set", &set]).unwrap().serial_stdin,
+            want,
+            "--set {word}"
+        );
+        let set = format!("debug.pool={word}");
+        assert_eq!(
+            load_old(&["--set", &set]).unwrap().pool,
+            want,
+            "--set pool {word}"
+        );
+    }
+    assert!(
+        err(load_old(&["--set", "serial.stdin=maybe"])).contains("--set serial.stdin: bad boolean")
+    );
+}
+
+#[test]
+fn numeric_cmdline_stays_a_string() {
+    let _env = lock();
+    assert_eq!(load_old(&["--cmdline", "3"]).unwrap().cmdline, "3");
+    assert_eq!(
+        load_old(&["--set", "boot.kernel.cmdline=3"])
+            .unwrap()
+            .cmdline,
+        "3"
+    );
+    let (_, c) = load_file(&format!("{MIN}cmdline = \"3\"\n"), &[]);
+    assert_eq!(c.unwrap().cmdline, "3");
+}
+
+#[test]
+fn paths_resolve_against_the_file_or_the_working_directory() {
+    let _env = lock();
+    let (d, c) = load_file(
+        "[engine]\nfexc = \"../build/fexc\"\ncompile_cache = \"off\"\n[boot.kernel]\nimage = \"vmlinuz\"\ninitrd = \"sub/initrd\"\n[serial]\noutput = \"s.log\"\n[debug]\nperf_log = \"/abs/p.log\"\n",
+        &[],
+    );
+    let c = c.unwrap();
+    assert_eq!(c.kernel, Some(d.join("vmlinuz")));
+    assert_eq!(c.initrd, Some(d.join("sub/initrd")));
+    assert_eq!(c.fexc, Some(d.join("../build/fexc")));
+    assert_eq!(c.serial_output, Some(d.join("s.log")));
+    assert_eq!(c.perf_log, Some(PathBuf::from("/abs/p.log")));
+    assert_eq!(c.compile_cache, Some(PathBuf::from("off")));
+    // Flag and --set values are kept as given (the working directory's).
+    let (_, c) = load_file(
+        MIN,
+        &[
+            "--kernel",
+            "rel/k",
+            "--set",
+            "boot.kernel.initrd=rel/i",
+            "--set",
+            "engine.fexc=./f",
+        ],
+    );
+    let c = c.unwrap();
+    assert_eq!(c.kernel, Some(PathBuf::from("rel/k")));
+    assert_eq!(c.initrd, Some(PathBuf::from("rel/i")));
+    assert_eq!(c.fexc, Some(PathBuf::from("./f")));
+}
+
+#[test]
+fn transports_default_and_partial_specs() {
+    let _env = lock();
+    assert_eq!(
+        load_old(&[]).unwrap().transports,
+        Transports::all(Mmio),
+        "no file: mmio"
+    );
+    let (_, c) = load_file(MIN, &[]);
+    assert_eq!(
+        c.unwrap().transports,
+        Transports::all(Pci),
+        "with a file: pci"
+    );
+    // A partial old spec: unnamed kinds are mmio, even with a file; net= is the nic.
+    assert_eq!(
+        load_old(&["--virtio-transport", "disk=pci"])
+            .unwrap()
+            .transports,
+        Transports {
+            disk: Pci,
+            net: Mmio,
+            rng: Mmio
+        }
+    );
+    let (_, c) = load_file(MIN, &["--virtio-transport", "net=pci"]);
+    assert_eq!(
+        c.unwrap().transports,
+        Transports {
+            disk: Mmio,
+            net: Pci,
+            rng: Mmio
+        }
+    );
+    // The file's table: nic is the network device; unnamed keys keep the file default (pci).
+    let (_, c) = load_file(
+        &format!("[machine]\ntransport = {{ nic = \"mmio\" }}\n{MIN}"),
+        &[],
+    );
+    assert_eq!(
+        c.unwrap().transports,
+        Transports {
+            disk: Pci,
+            net: Mmio,
+            rng: Pci
+        }
+    );
+    let (_, c) = load_file(MIN, &["--set", "machine.transport.rng=mmio"]);
+    assert_eq!(c.unwrap().transports.rng, Mmio);
+    assert!(
+        err(load_file(
+            &format!("[machine]\ntransport = {{ net = \"pci\" }}\n{MIN}"),
+            &[]
+        )
+        .1)
+        .contains("net")
+    );
+}
+
+#[test]
+fn ram_forms_in_the_file() {
+    let _env = lock();
+    let (_, c) = load_file(&format!("[machine]\nram = \"4G\"\nvcpus = 3\n{MIN}"), &[]);
+    let c = c.unwrap();
+    assert_eq!((c.ram, c.vcpus), (Some(4 << 30), Some(3)));
+    let (_, c) = load_file(
+        &format!("[machine]\nram = 4096\n{MIN}"),
+        &["--ram", "0x2000"],
+    );
+    assert_eq!(c.unwrap().ram, Some(0x2000), "a flag beats the file");
+    assert!(
+        err(load_file(&format!("[machine]\nram = \"2T\"\n{MIN}"), &[]).1)
+            .contains("machine.ram: bad size")
+    );
+}
+
+// ---- the layers ---------------------------------------------------------------------------------------------------------
+
+#[test]
+fn layers_file_then_environment_then_flag_then_set() {
+    let _env = lock();
+    let file = "[engine]\nfexc = \"fexc\"\nfp = \"accurate\"\n[boot.kernel]\nimage = \"vmlinuz\"\n";
+    assert!(load_file(file, &[]).1.unwrap().fp, "file");
+    unsafe { std::env::set_var("NATEMU_FP", "fast") };
+    let cli = |args: &[&str]| {
+        let d = dir();
+        std::fs::write(d.join("vm.toml"), file).unwrap();
+        let mut a = vec![
+            "--config".to_string(),
+            d.join("vm.toml").display().to_string(),
+        ];
+        a.extend(args.iter().map(|s| s.to_string()));
+        parse_cli(std::iter::once("natemu".to_string()).chain(a)).unwrap()
+    };
+    assert!(
+        !load(&cli(&[])).unwrap().fp,
+        "the environment beats the file"
+    );
+    assert!(
+        load(&cli(&["--fp", "accurate"])).unwrap().fp,
+        "the flag beats the environment"
+    );
+    assert!(
+        !load(&cli(&["--set", "engine.fp=fast"])).unwrap().fp,
+        "--set beats the file"
+    );
+    assert_eq!(
+        deprecations(&cli(&[])),
+        ["natemu: NATEMU_FP is deprecated; use [engine] fp or --set engine.fp=..."],
+        "one warning, only for a value from the environment"
+    );
+    assert!(
+        deprecations(&cli(&["--fp", "fast"])).is_empty(),
+        "the flag was given, so the value is not from the environment"
+    );
+    unsafe { std::env::remove_var("NATEMU_FP") };
+    assert!(deprecations(&cli(&[])).is_empty());
+}
+
+#[test]
+fn every_env_variable_warns_once() {
+    let _env = lock();
+    let vars = [
+        "NATEMU_SERIAL_STDIN",
+        "NATEMU_SPECULATION_BARRIERS",
+        "NATEMU_FP",
+        "NATEMU_PAGE_CURRENCY",
+        "NATEMU_WRITABLE_ON_READ",
+        "NATEMU_POOL",
+        "NATEMU_CHECK_REUSE",
+        "NATEMU_COMPILE_CACHE",
+        "NATEMU_COMPILE_CACHE_MB",
+        "NATEMU_PERF_LOG",
+    ];
+    let value = |v: &str| match v {
+        "NATEMU_FP" => "fast",
+        "NATEMU_PAGE_CURRENCY" | "NATEMU_WRITABLE_ON_READ" => "on",
+        "NATEMU_COMPILE_CACHE_MB" => "5",
+        "NATEMU_COMPILE_CACHE" | "NATEMU_PERF_LOG" => "x",
+        _ => "1",
+    };
+    for v in vars {
+        unsafe { std::env::set_var(v, value(v)) };
+    }
+    let cli = parse_cli(["natemu", "--fexc", "f", "--kernel", "k"]).unwrap();
+    let w = deprecations(&cli);
+    for v in vars {
+        unsafe { std::env::remove_var(v) };
+    }
+    assert_eq!(w.len(), 10);
+    for v in vars {
+        assert_eq!(
+            w.iter()
+                .filter(|l| l.contains(&format!("{v} is deprecated")))
+                .count(),
+            1,
+            "{v}"
+        );
+    }
+}
+
+#[test]
+fn set_errors() {
+    let _env = lock();
+    assert!(
+        err(load_old(&["--set", "machine.ramm=1"]))
+            .contains("--set machine.ramm: unknown key; expected one of machine.ram")
+    );
+    assert!(err(load_old(&["--set", "ram"])).contains("expected key=value"));
+    assert!(
+        err(load_old(&[
+            "--set",
+            "engine.fp=fast",
+            "--set",
+            "engine.fp=accurate"
+        ]))
+        .contains("set twice")
+    );
+    assert!(
+        err(load_old(&["--fp", "fast", "--set", "engine.fp=accurate"]))
+            .contains("--set engine.fp: set twice")
+    );
+    assert!(
+        err(load_old(&[
+            "--virtio-transport",
+            "pci",
+            "--set",
+            "machine.transport.disk=mmio"
+        ]))
+        .contains("set twice")
+    );
+    assert!(err(load_old(&["--set", "machine.ram=2T"])).contains("--set machine.ram: bad size"));
+    assert!(err(load_old(&["--set", "engine.fp=medium"])).contains("fast or accurate"));
+    assert!(
+        err(load_old(&["--set", "debug.page_currency=check-halt"])).contains("on, off or check")
+    );
+}
+
+#[test]
+fn set_edits_devices_but_cannot_create_them() {
+    let _env = lock();
+    let file =
+        format!("{MIN}[[disk]]\nid = \"root\"\npath = \"root.raw\"\n[[nic]]\nid = \"net0\"\n");
+    let (d, c) = load_file(
+        &file,
+        &[
+            "--set",
+            "disk.root.readonly=yes",
+            "--set",
+            "disk.root.path=other.raw",
+            "--set",
+            "nic.net0.forward=tcp:2222:22,udp:5:6",
+        ],
+    );
+    let c = c.unwrap();
+    assert!(c.disks[0].readonly);
+    assert_eq!(c.disks[0].path, PathBuf::from("other.raw"));
+    assert_eq!(c.nics[0].forward.len(), 2);
+    let _ = d;
+    let e = err(load_file(&file, &["--set", "disk.boot.path=x"]).1);
+    assert!(
+        e.contains("--set disk.boot.path: no disk with id \"boot\""),
+        "{e}"
+    );
+    assert!(err(load_old(&["--set", "disk.disk0.path=x"])).contains("no disk with id"));
+    assert!(err(load_file(&file, &["--set", "disk.root.fromat=x"]).1).contains("unknown key"));
+}
+
+#[test]
+fn device_flags_are_refused_when_the_file_lists_that_kind() {
+    let _env = lock();
+    let file = format!(
+        "{MIN}[[disk]]\nid = \"root\"\npath = \"root.raw\"\n[[nic]]\nid = \"n\"\n[[rng]]\nid = \"r\"\n"
+    );
+    for flag in [["--disk", "x"], ["--net", ""], ["--rng", ""]] {
+        let args: Vec<&str> = flag.iter().copied().filter(|a| !a.is_empty()).collect();
+        let e = err(load_file(&file, &args).1);
+        assert!(
+            e.contains(&format!("{}: the config file lists", flag[0])),
+            "{e}"
+        );
+    }
+    // Kinds the file does not list may still come from flags.
+    let (_, c) = load_file(
+        &format!("{MIN}[[disk]]\nid = \"root\"\npath = \"root.raw\"\n"),
+        &["--net", "--net-forward", "1:2", "--rng"],
+    );
+    let c = c.unwrap();
+    assert_eq!(
+        (
+            c.nics.len(),
+            c.rngs.len(),
+            c.nics[0].id.as_str(),
+            c.rngs[0].id.as_str()
+        ),
+        (1, 1, "net0", "rng0")
+    );
+    let c = load_old(&["--disk", "d", "--net", "--rng"]).unwrap();
+    assert_eq!(c.disks[0].id, "disk0");
+}
+
+// ---- the file's validation ----------------------------------------------------------------------------------------------
+
+#[test]
+fn unknown_keys_name_the_file_and_the_key_path() {
+    let _env = lock();
+    let file = format!(
+        "{MIN}[[disk]]\nid = \"a\"\npath = \"a\"\n[[disk]]\nid = \"b\"\npath = \"b\"\nfromat = \"raw\"\n"
+    );
+    let e = err(load_file(&file, &[]).1);
+    assert!(
+        e.contains("vm.toml: ")
+            && e.contains("fromat")
+            && e.contains("expected one of")
+            && !e.contains('\n'),
+        "{e}"
+    );
+    assert!(e.contains("disk[1]"), "{e}");
+    for (toml, key) in [
+        ("[machine]\nramm = 1\n", "ramm"),
+        ("[bogus]\n", "bogus"),
+        ("[serial]\nout = 1\n", "out"),
+        ("[debug]\nx = 1\n", "x"),
+    ] {
+        let e = err(load_file(&format!("{MIN}{toml}"), &[]).1);
+        assert!(
+            e.contains("vm.toml") && e.contains(key) && !e.contains('\n'),
+            "{e}"
+        );
+    }
+    // A field of the other boot method is an unknown key of this one.
+    let e = err(load_file(
+        "[engine]\nfexc = \"f\"\n[boot.kernel]\nimage = \"k\"\nvariables = \"x\"\n",
+        &[],
+    )
+    .1);
+    assert!(e.contains("variables"), "{e}");
+    let e = err(load_file(
+        "[engine]\nfexc = \"f\"\n[boot.kernel]\ninitrd = \"x\"\n",
+        &[],
+    )
+    .1);
+    assert!(e.contains("image"), "{e}");
+}
+
+#[test]
+fn boot_method_rules() {
+    let _env = lock();
+    let eng = "[engine]\nfexc = \"f\"\n";
+    let e = err(load_file(&format!("{eng}[boot]\n"), &[]).1);
+    assert!(
+        e.contains(
+            "[boot] needs exactly one boot method, [boot.kernel] or [boot.uefi]; found none"
+        ),
+        "{e}"
+    );
+    let e = err(load_file(
+        &format!("{eng}[boot.kernel]\nimage = \"k\"\n[boot.uefi]\n"),
+        &[],
+    )
+    .1);
+    assert!(e.contains("found both"), "{e}");
+    let e = err(load_file(&format!("{eng}[boot.uefi]\nfirmware = \"x\"\n"), &[]).1);
+    assert!(
+        e.contains("UEFI boot is planned (M3) and not built yet"),
+        "{e}"
+    );
+    // No [boot] at all and no --kernel: no boot method; --kernel supplies one.
+    assert!(err(load_file(eng, &[]).1).contains("no boot method"));
+    assert_eq!(
+        load_file(eng, &["--kernel", "k"]).1.unwrap().kernel,
+        Some(PathBuf::from("k"))
+    );
+}
+
+#[test]
+fn device_id_rules() {
+    let _env = lock();
+    let disk = |id: &str, path: &str| format!("[[disk]]\nid = \"{id}\"\npath = \"{path}\"\n");
+    let e = err(load_file(
+        &format!(
+            "{MIN}{}{}{}",
+            disk("root", "a"),
+            disk("b", "b"),
+            disk("root", "c")
+        ),
+        &[],
+    )
+    .1);
+    assert!(
+        e.contains("device id \"root\" is used twice (disk 1 and disk 3)"),
+        "{e}"
+    );
+    let e = err(load_file(
+        &format!("{MIN}{}[[nic]]\nid = \"root\"\n", disk("root", "a")),
+        &[],
+    )
+    .1);
+    assert!(e.contains("used twice (disk 1 and nic 1)"), "{e}");
+    for bad in ["Root", "a b", "a.b", ""] {
+        let e = err(load_file(&format!("{MIN}{}", disk(bad, "a")), &[]).1);
+        assert!(e.contains("must match [a-z0-9_-]+"), "{bad}: {e}");
+    }
+    assert!(
+        load_file(&format!("{MIN}{}", disk("a_b-9", "a")), &[])
+            .1
+            .is_ok()
+    );
+    assert!(
+        err(load_file(
+            &format!("{MIN}[[nic]]\nid = \"a\"\n[[nic]]\nid = \"b\"\n"),
+            &[]
+        )
+        .1)
+        .contains("at most one [[nic]]")
+    );
+    assert!(
+        err(load_file(
+            &format!("{MIN}[[rng]]\nid = \"a\"\n[[rng]]\nid = \"b\"\n"),
+            &[]
+        )
+        .1)
+        .contains("at most one [[rng]]")
+    );
+    // Required fields.
+    assert!(err(load_file(&format!("{MIN}[[disk]]\nid = \"a\"\n"), &[]).1).contains("path"));
+}
+
+#[test]
+fn disks_that_are_the_same_file_are_refused() {
+    let _env = lock();
+    let d = dir();
+    let (a, b, c) = (d.join("a.raw"), d.join("b.raw"), d.join("c.raw"));
+    std::fs::write(&a, b"x").unwrap();
+    std::fs::hard_link(&a, &b).unwrap();
+    std::fs::write(&c, b"y").unwrap();
+    let disks = |x: &Path, y: &Path| {
+        format!(
+            "{MIN}[[disk]]\nid = \"root\"\npath = \"{}\"\n[[disk]]\nid = \"copy\"\npath = \"{}\"\n",
+            x.display(),
+            y.display()
+        )
+    };
+    let e = err(load_file(&disks(&a, &b), &[]).1);
+    assert!(
+        e.contains("disks \"root\" and \"copy\" are the same file"),
+        "{e}"
+    );
+    assert!(err(load_file(&disks(&a, &a), &[]).1).contains("same file"));
+    assert!(load_file(&disks(&a, &c), &[]).1.is_ok());
+}
+
+#[test]
+fn file_forwards_and_debug_values_use_the_old_parsers() {
+    let _env = lock();
+    let (_, c) = load_file(
+        &format!(
+            "{MIN}[[nic]]\nid = \"n\"\nforward = [\"2222:22\", \"udp:9:8\"]\nhost_loopback = true\n[debug]\npage_currency = \"check\"\nwritable_on_read = false\npool = false\n"
+        ),
+        &[],
+    );
+    let c = c.unwrap();
+    assert_eq!(c.nics[0].forward.len(), 2);
+    assert!(c.nics[0].host_loopback && !c.pool && !c.writable_on_read);
+    assert_eq!(
+        c.page_currency,
+        crate::parse_page_currency("check").unwrap()
+    );
+    assert!(
+        err(load_file(
+            &format!("{MIN}[[nic]]\nid = \"n\"\nforward = [\"x\"]\n"),
+            &[]
+        )
+        .1)
+        .contains("nic[0].forward: bad forward")
+    );
+    assert!(
+        err(load_file(
+            &format!("{MIN}[debug]\npage_currency = \"check-halt\"\n"),
+            &[]
+        )
+        .1)
+        .contains("debug.page_currency")
+    );
+    assert!(err(load_args(&["--config", "/nonexistent/vm.toml"])).contains("/nonexistent/vm.toml"));
+}
+
+#[test]
+fn a_file_boot_is_the_same_boot_as_the_flags() {
+    let _env = lock();
+    let (d, c) = load_file(
+        "[machine]\nram = \"1G\"\nvcpus = 2\ntransport = { disk = \"mmio\", nic = \"mmio\", rng = \"mmio\" }\n[engine]\nfexc = \"fexc\"\nfp = \"accurate\"\ncompile_cache = \"off\"\n[boot.kernel]\nimage = \"k\"\ncmdline = \"quiet\"\n[[disk]]\nid = \"root\"\npath = \"r.raw\"\n[[rng]]\nid = \"r\"\n",
+        &[],
+    );
+    let cfg = c.unwrap();
+    let b = to_boot(&cfg, "RT".into(), vec![1], None).unwrap();
+    assert_eq!(
+        (b.ram, b.vcpus, b.accurate_fp, b.rng, b.net),
+        (1 << 30, 2, true, true, false)
+    );
+    assert_eq!(b.disk, Some(d.join("r.raw")));
+    assert_eq!(b.cmdline, "quiet");
+    assert_eq!(b.transports, Transports::all(Mmio));
+    // Not built yet: several or read-only disks.
+    let mut two = cfg.clone();
+    two.disks[0].readonly = true;
+    assert!(
+        to_boot(&two, "RT".into(), vec![1], None)
+            .err()
+            .unwrap()
+            .contains("not built yet")
+    );
+}

@@ -23,9 +23,10 @@
 //! which the host publishes admitted templates and each resident looks before asking the host (cross-vCPU reuse plan).
 //! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
-use clap::Parser;
+mod config;
+use clap::{CommandFactory, FromArgMatches};
 use natemu::execution::Stop;
-use natemu::linux::{Boot, Transport, Transports};
+use natemu::linux::{Transport, Transports};
 use natemu::virtio::{ForwardProtocol, PortForward, SlirpOptions};
 use std::path::PathBuf;
 
@@ -33,22 +34,31 @@ use std::path::PathBuf;
 const MAX_INPUT: usize = 1 << 32;
 
 /// Boot a Linux bzImage (x86-64) under natemu.
-#[derive(Parser)]
+#[derive(clap::Parser)]
 #[command(
     name = "natemu",
     after_help = "Exit status: 0 the guest powered off, 2 any other stop (reset, a typed stop, a watchdog, \
     SIGINT/SIGTERM), 1 a host error. A flag wins over its environment variable."
 )]
 struct Cli {
+    /// A configuration file (TOML; see docs/m1-config-and-qcow2-design.md): below the environment variables and the flags
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Override one setting, `key=value` (repeatable; a key set twice is an error; cannot create a device)
+    #[arg(long = "set", value_name = "KEY=VALUE", allow_hyphen_values = true)]
+    set: Vec<String>,
+    /// Which flags clap took from the command line and from the environment (filled by [`parse_cli`])
+    #[arg(skip)]
+    given: config::Given,
     /// The resident runtime ELF [default: the one built beside this binary]
     #[arg(long, value_name = "FILE")]
     runtime: Option<PathBuf>,
     /// The fexc compiler
     #[arg(long, value_name = "FILE")]
-    fexc: PathBuf,
+    fexc: Option<PathBuf>,
     /// The Linux bzImage
     #[arg(long, value_name = "FILE")]
-    kernel: PathBuf,
+    kernel: Option<PathBuf>,
     /// An initrd (initramfs) to load
     #[arg(long, value_name = "FILE")]
     initrd: Option<PathBuf>,
@@ -127,6 +137,26 @@ struct Cli {
     /// Write the timing log (natemu::perf) to FILE
     #[arg(long, value_name = "FILE", env = "NATEMU_PERF_LOG")]
     perf_log: Option<PathBuf>,
+}
+
+/// Parses the command line, recording which flags came from it and which from an environment variable.
+fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    use clap::parser::ValueSource;
+    let matches = Cli::command().try_get_matches_from(args)?;
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    for id in matches.ids() {
+        let id = id.as_str();
+        match matches.value_source(id) {
+            Some(ValueSource::CommandLine) => cli.given.cmd.insert(id.to_string()),
+            Some(ValueSource::EnvVariable) => cli.given.env.insert(id.to_string()),
+            _ => false,
+        };
+    }
+    Ok(cli)
 }
 
 fn port_forward(text: &str) -> Result<PortForward, String> {
@@ -273,45 +303,31 @@ fn built_runtime() -> Option<PathBuf> {
 }
 
 fn boot(cli: Cli) -> natemu::Result<Stop> {
-    let net_options = SlirpOptions {
-        forwards: cli.net_forward,
-        host_loopback: cli.net_host_loopback,
-    };
+    for warning in config::deprecations(&cli) {
+        eprintln!("{warning}");
+    }
+    let cfg = config::load(&cli)?;
+    let net_options = cfg.net_options();
     net_options.validate()?;
     // Performance phase (perf plan §2): the library's timing log (`natemu::perf`), off unless set.
-    if let Some(path) = cli.perf_log {
+    if let Some(path) = &cfg.perf_log {
         natemu::perf::enable(path)?;
         natemu::perf::mark("main");
     }
-    let runtime = cli
+    let runtime = cfg
         .runtime
+        .clone()
         .or_else(built_runtime)
         .ok_or("--runtime FILE: no resident built beside this binary")?;
-    for (what, path) in [("--runtime", &runtime), ("--fexc", &cli.fexc)] {
+    let fexc = cfg.fexc.as_ref().unwrap(); // `config::validate` checked
+    for (what, path) in [("--runtime", &runtime), ("--fexc", fexc)] {
         std::fs::metadata(path).map_err(|e| format!("{what} {}: {e}", path.display()))?;
     }
     let read = |path: &PathBuf| natemu::memory::read_input(&path.to_string_lossy(), MAX_INPUT);
-    let mut boot = Boot::new(runtime, cli.fexc, read(&cli.kernel)?);
-    boot.compile_cache = natemu::compile_cache::Config::new(
-        cli.compile_cache.as_deref().map(|p| p.as_os_str()),
-        cli.compile_cache_mb,
-    )?;
-    boot.speculation_barriers = cli.speculation_barriers;
-    boot.accurate_fp = cli.fp;
-    boot.page_currency = cli.page_currency;
-    boot.writable_on_read = cli.writable_on_read;
-    boot.rng = cli.rng;
-    boot.disk = cli.disk;
-    boot.net = cli.net;
-    boot.net_options = net_options;
-    boot.pool = cli.pool;
-    boot.check_reuse = cli.check_reuse;
-    boot.transports = cli.virtio_transport;
-    boot.initrd = cli.initrd.as_ref().map(read).transpose()?;
-    boot.cmdline = cli.cmdline.unwrap_or_default();
-    boot.ram = cli.ram.unwrap_or(boot.ram);
-    boot.vcpus = cli.vcpus.unwrap_or(boot.vcpus);
-    boot.serial = Some(match &cli.serial {
+    let kernel = read(cfg.kernel.as_ref().unwrap())?;
+    let initrd = cfg.initrd.as_ref().map(read).transpose()?;
+    let mut boot = config::to_boot(&cfg, runtime, kernel, initrd)?;
+    boot.serial = Some(match &cfg.serial_output {
         Some(path) => Box::new(
             std::fs::File::create(path).map_err(|e| format!("--serial {}: {e}", path.display()))?,
         ),
@@ -321,7 +337,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     let prepared = report_prepared(boot.prepare(), &summary, &mut std::io::stderr().lock())?;
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
     prepared.canceller().on_signals();
-    if cli.serial_stdin {
+    if cfg.serial_stdin {
         prepared.serial_input(natemu::linux::serial_stdin()); // raw mode only once the signals are handled
     }
     // The stop of the vCPU whose end ended the run (any vCPU may power off), else the BSP's.
@@ -338,7 +354,7 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
 }
 
 fn main() {
-    let cli = match Cli::try_parse() {
+    let cli = match parse_cli(std::env::args_os()) {
         Ok(cli) => cli,
         Err(e) if !e.use_stderr() => e.exit(), // --help: standard output, exit 0
         Err(e) => {
@@ -364,14 +380,16 @@ fn main() {
     }
 }
 
+// CLI parsing reads the environment, which some tests temporarily change; they hold this lock.
+#[cfg(test)]
+static CLI_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
-    // CLI parsing reads the environment, which check_reuse_option temporarily changes.
-    static CLI_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::CLI_ENV;
 
     #[test]
     fn udp_policy_is_checked_before_cli_input_files_are_opened() {
-        use clap::Parser;
         let _env = CLI_ENV.lock().unwrap();
         let base = [
             "natemu",
@@ -403,7 +421,7 @@ mod tests {
                 "duplicate UDP guest port 5201",
             ),
         ] {
-            let cli = super::Cli::try_parse_from(base.iter().chain(&extra)).unwrap();
+            let cli = super::parse_cli(base.iter().chain(&extra)).unwrap();
             let error = super::boot(cli).err().expect("invalid UDP configuration");
             assert!(error.contains(expected), "{error}");
         }
@@ -411,7 +429,7 @@ mod tests {
             vec!["--net-forward", "15201:5201"],
             vec!["--net-host-loopback", "--net-forward", "udp:15201:5201"],
         ] {
-            let cli = super::Cli::try_parse_from(base.iter().chain(&extra)).unwrap();
+            let cli = super::parse_cli(base.iter().chain(&extra)).unwrap();
             let error = super::boot(cli)
                 .err()
                 .expect("fixture input does not exist");
@@ -465,10 +483,9 @@ mod tests {
 
     #[test]
     fn network_options_accept_static_forwards_and_require_networking() {
-        use clap::Parser;
         let _env = CLI_ENV.lock().unwrap();
         let base = ["natemu", "--fexc", "f", "--kernel", "k"];
-        let parse = |extra: &[&str]| super::Cli::try_parse_from(base.iter().chain(extra));
+        let parse = |extra: &[&str]| super::parse_cli(base.iter().chain(extra));
         let defaults = parse(&[]).unwrap();
         assert!(!defaults.net && !defaults.net_host_loopback && defaults.net_forward.is_empty());
         for rule in ["2222:22", "tcp:1:65535", "udp:65535:1"] {
@@ -550,11 +567,10 @@ mod tests {
     /// `Boot::check_reuse`'s switch; off by default.
     #[test]
     fn check_reuse_option() {
-        use clap::Parser;
         let _env = CLI_ENV.lock().unwrap();
         let base = ["natemu", "--fexc", "f", "--kernel", "k"];
         let parse = |extra: &[&str]| {
-            super::Cli::try_parse_from(base.iter().chain(extra))
+            super::parse_cli(base.iter().chain(extra))
                 .unwrap()
                 .check_reuse
         };
@@ -562,15 +578,11 @@ mod tests {
         assert!(parse(&["--check-reuse"]));
         assert!(!parse(&["--pool"]));
         // The pool: on by default, `--pool` on, `--pool=false` off, `NATEMU_POOL` 1/0 either way (a flag wins).
-        let pool = |extra: &[&str]| {
-            super::Cli::try_parse_from(base.iter().chain(extra))
-                .unwrap()
-                .pool
-        };
+        let pool = |extra: &[&str]| super::parse_cli(base.iter().chain(extra)).unwrap().pool;
         assert!(
             pool(&[]) && pool(&["--pool"]) && pool(&["--pool=true"]) && !pool(&["--pool=false"])
         );
-        assert!(super::Cli::try_parse_from(base.iter().chain(&["--pool", "false"])).is_err());
+        assert!(super::parse_cli(base.iter().chain(&["--pool", "false"])).is_err());
         // The variable, set for this test only (CLI_ENV excludes other CLI parsing tests).
         for (value, want) in [
             ("1", true),
@@ -584,7 +596,7 @@ mod tests {
             assert_eq!(parse(&[]), want, "{value}");
         }
         unsafe { std::env::set_var("NATEMU_CHECK_REUSE", "sometimes") };
-        assert!(super::Cli::try_parse_from(base).is_err());
+        assert!(super::parse_cli(base).is_err());
         unsafe { std::env::remove_var("NATEMU_CHECK_REUSE") };
         for (value, want) in [
             ("0", false),
