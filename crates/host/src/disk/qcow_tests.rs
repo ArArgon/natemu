@@ -1066,3 +1066,769 @@ fn other_container_formats_made_by_qemu_img_are_refused_by_name() {
         eprintln!("skipped: DMG fixture: hdiutil failed");
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Gate: 64 GiB of WRITE_ZEROES on a fresh overlay, timed, with a reader running.
+
+#[test]
+fn write_zeroes_of_64_gib_on_a_fresh_overlay_is_table_only_and_fast() {
+    let dir = Dir::new("zeroes");
+    let (base, top) = (dir.at("base.raw"), dir.at("top.qcow2"));
+    std::fs::write(&base, base_bytes(1 << 12)).unwrap();
+    create_ready(&top, 64 << 30, 16, Some((&base, Some("raw"))));
+    let image = open(&top, false, Some(&base)).unwrap();
+    let b: Arc<dyn DiskBackend> = image.backend.into();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (b, stop) = (b.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut worst = Duration::ZERO;
+            let mut buf = vec![0; 4096];
+            let mut i = 0u64;
+            while !stop.load(SeqCst) {
+                let t = Instant::now();
+                b.read(&mut buf, (i * 7919 % (1 << 24)) << 12).unwrap();
+                worst = worst.max(t.elapsed());
+                i += 1;
+            }
+            worst
+        })
+    };
+    let mut slowest = Duration::ZERO;
+    let start = Instant::now();
+    // 32 ranges of 2 GiB: one request's worth.
+    for r in 0..32u64 {
+        let t = Instant::now();
+        b.write_zeroes(r << 31, 1 << 31).unwrap();
+        slowest = slowest.max(t.elapsed());
+    }
+    let total = start.elapsed();
+    let t = Instant::now();
+    b.sync(false).unwrap();
+    let sync = t.elapsed();
+    stop.store(true, SeqCst);
+    let worst_read = reader.join().unwrap();
+    eprintln!(
+        "64 GiB write-zeroes: {total:?} in all, slowest 2 GiB range {slowest:?}, sync {sync:?}, \
+         slowest concurrent 4 KiB read {worst_read:?}, image {} bytes",
+        std::fs::metadata(&top).unwrap().len()
+    );
+    assert!(total < Duration::from_secs(5), "{total:?}");
+    assert!(
+        read(&*b, 0, 4096).iter().all(|&x| x == 0)
+            && read(&*b, (64 << 30) - 4096, 4096).iter().all(|&x| x == 0)
+    );
+    assert!(std::fs::metadata(&top).unwrap().len() < 64 << 20);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Gate: concurrent sub-cluster writes and reads to the same unallocated clusters over a backing file, with discards
+// and flushes, compared against the same operations on a raw image.
+
+/// Thread `t` of `threads` owns the sectors `s` with `s % threads == t`: in the shared region (clusters every thread
+/// writes into) and in its own discard region (clusters it alone owns, freed and reallocated).
+#[test]
+fn concurrent_writers_readers_discards_and_flushes_over_a_backing_file_match_raw() {
+    const THREADS: u64 = 8;
+    const CLUSTER: u64 = 1 << 16;
+    const SHARED: u64 = 16; // clusters
+    const OWN: u64 = 4; // clusters per thread
+    let sectors = (SHARED + THREADS * OWN) * CLUSTER / 512;
+    let dir = Dir::new("concurrent");
+    let (base, top, raw) = (dir.at("base.raw"), dir.at("top.qcow2"), dir.at("same.raw"));
+    std::fs::write(&base, base_bytes(sectors)).unwrap();
+    for round in 0..6u64 {
+        // A fresh overlay each round: every first write races to allocate.
+        let _ = std::fs::remove_file(&top);
+        std::fs::write(&raw, base_bytes(sectors)).unwrap();
+        create_ready(&top, sectors * 512, 16, Some((&base, Some("raw"))));
+        let image = open(&top, false, Some(&base)).unwrap();
+        let q: Arc<dyn DiskBackend> = image.backend.into();
+        let flushes = Arc::new(Mutex::new(())); // the device serialises syncs (Sticky)
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (q, flushes) = (q.clone(), flushes.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x9e37_79b9 ^ (t + 1) * (round + 7));
+                    let mut ops = Vec::new(); // (sector, Some(tag) | None = zeros), replayed on raw
+                    let own = |rng: &mut Rng| {
+                        let region = if rng.below(3) == 0 {
+                            SHARED * CLUSTER / 512 + (t * OWN + rng.below(OWN)) * CLUSTER / 512
+                        } else {
+                            rng.below(SHARED) * CLUSTER / 512
+                        };
+                        let s = region + rng.below(CLUSTER / 512);
+                        s - s % THREADS + t
+                    };
+                    for i in 0..400u32 {
+                        match rng.below(10) {
+                            0..5 => {
+                                let s = own(&mut rng);
+                                let tag = (round as u32) << 24 | (t as u32) << 16 | i;
+                                q.write(&sector(tag, GUEST, s), s * 512).unwrap();
+                                ops.push((s, Some(tag)));
+                            }
+                            5..8 => {
+                                // Any sector of the shared clusters: base, zeros (a discarded own cluster), or a
+                                // write of its owner; never anything else.
+                                let s = rng.below(sectors);
+                                let got = read(&*q, s * 512, 512);
+                                let tagged = got[..4] == GUEST.to_le_bytes()
+                                    && got
+                                        == sector(
+                                            u32::from_le_bytes(got[4..8].try_into().unwrap()),
+                                            GUEST,
+                                            s,
+                                        );
+                                let owner = (u32::from_le_bytes(got[4..8].try_into().unwrap())
+                                    >> 16
+                                    & 0xff) as u64;
+                                assert!(
+                                    got == sector(0, BASE, s)
+                                        || got.iter().all(|&x| x == 0)
+                                        || (tagged && owner == s % THREADS),
+                                    "sector {s}: {:?}",
+                                    &got[..16]
+                                );
+                            }
+                            8 => {
+                                let c = SHARED + t * OWN + rng.below(OWN);
+                                q.discard(c * CLUSTER, CLUSTER).unwrap();
+                                // The whole cluster reads zeros; only this thread writes in it.
+                                for s in c * CLUSTER / 512..(c + 1) * CLUSTER / 512 {
+                                    ops.push((s, None));
+                                }
+                            }
+                            _ => {
+                                let _held = flushes.lock().unwrap();
+                                q.sync(false).unwrap();
+                            }
+                        }
+                    }
+                    ops
+                })
+            })
+            .collect();
+        let ops: Vec<_> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        // The same operations on raw (each sector has one owner, so their order across threads does not matter).
+        let raw_file = OpenOptions::new().write(true).open(&raw).unwrap();
+        for (s, tag) in &ops {
+            let data = tag.map_or(vec![0; 512], |tag| sector(tag, GUEST, *s));
+            raw_file.write_all_at(&data, s * 512).unwrap();
+        }
+        let want = std::fs::read(&raw).unwrap();
+        assert!(
+            read(&*q, 0, want.len()) == want,
+            "round {round}: qcow2 and raw differ"
+        );
+        q.sync(true).unwrap();
+        drop(q);
+        let again = open(&top, true, Some(&base)).unwrap();
+        assert!(
+            read(&*again.backend, 0, want.len()) == want,
+            "round {round}: differ after reopen"
+        );
+        drop(again);
+        check_clean(&top);
+    }
+    if qemu_img().is_some() {
+        let (ok, text) = qemu(&[
+            "compare",
+            "-F",
+            "raw",
+            top.to_str().unwrap(),
+            raw.to_str().unwrap(),
+        ]);
+        assert!(ok, "{text}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Gate: random write/zero/discard/read sequences on qcow2 and raw; qemu-img check and compare.
+
+#[test]
+fn random_sequences_match_raw_and_pass_qemu_img_check_and_compare() {
+    if qemu_img().is_none() {
+        return skipped("differential test (qemu-img check and compare)");
+    }
+    for (seed, bits, backed) in [
+        (1u64, 16u32, true),
+        (2, 16, false),
+        (3, 9, true),
+        (4, 12, true),
+        (5, 9, false),
+    ] {
+        let dir = Dir::new("diff");
+        let cluster = 1u64 << bits;
+        let size = 4u64 << 20;
+        let (base, top, raw) = (dir.at("base.raw"), dir.at("top.qcow2"), dir.at("same.raw"));
+        let start = if backed {
+            base_bytes(size / 512)
+        } else {
+            vec![0; size as usize]
+        };
+        std::fs::write(&base, &start).unwrap();
+        std::fs::write(&raw, &start).unwrap();
+        create_ready(&top, size, bits, backed.then_some((&*base, Some("raw"))));
+        let (qi, ri) = (
+            open(&top, false, backed.then_some(&*base)).unwrap(),
+            open(&raw, false, None).unwrap(),
+        );
+        let (q, r) = (&*qi.backend, &*ri.backend);
+        let mut rng = Rng(seed * 0x1234_5678_9abc);
+        for i in 0..600u32 {
+            let s = rng.below(size / 512);
+            let n = 1 + rng.below((3 * cluster / 512).min(size / 512 - s));
+            match rng.below(10) {
+                0..5 => {
+                    let data: Vec<u8> = (s..s + n).flat_map(|x| sector(i, GUEST, x)).collect();
+                    write(q, s * 512, &data);
+                    write(r, s * 512, &data);
+                }
+                5 => {
+                    q.write_zeroes(s * 512, n * 512).unwrap();
+                    r.write_zeroes(s * 512, n * 512).unwrap();
+                }
+                6 => {
+                    // Whole clusters (both images then read zeros there).
+                    let c = s * 512 / cluster;
+                    let k = 1 + rng.below(3).min(size / cluster - c - 1);
+                    q.discard(c * cluster, k * cluster).unwrap();
+                    r.write_zeroes(c * cluster, k * cluster).unwrap();
+                }
+                7 => {
+                    q.sync(false).unwrap();
+                }
+                _ => assert!(
+                    read(q, s * 512, n as usize * 512) == read(r, s * 512, n as usize * 512),
+                    "seed {seed} op {i}"
+                ),
+            }
+        }
+        q.sync(true).unwrap();
+        r.sync(true).unwrap();
+        // Close both before qemu-img reads them.
+        drop((qi, ri));
+        check_clean(&top);
+        let (ok, text) = qemu(&[
+            "compare",
+            "-F",
+            "raw",
+            top.to_str().unwrap(),
+            raw.to_str().unwrap(),
+        ]);
+        assert!(ok, "seed {seed}: {text}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Gate: crashes that see the write order. The recording layer keeps every write, barrier and sync; a simulated crash
+// at a point keeps everything before the last sync, everything before each barrier that a later kept write depends
+// on, and a selection (random, or a fixed case) of the other writes, each write torn into 4 KiB pieces. The image is
+// then reopened writable (refcount rebuild) and checked: every sector holds its value at the last completed flush or
+// a value written after it, base data is never lost, qemu-img check is clean, and every cluster can be written.
+
+/// What the guest did, in order: writes (zeros for WRITE_ZEROES and DISCARD) and syncs, with their log positions.
+enum Guest {
+    Write {
+        sector: u64,
+        data: Vec<u8>,
+        at: usize,
+    },
+    Sync {
+        done: usize,
+    },
+}
+
+struct Run {
+    dir: Dir,
+    base: PathBuf,
+    initial: Vec<u8>,
+    sectors: u64,
+    cluster: u64,
+    history: Vec<Guest>,
+    q: Arc<Qcow>,
+    rec: Recording,
+}
+
+impl Run {
+    fn new(tag: &str, size: u64, bits: u32) -> Self {
+        let dir = Dir::new(tag);
+        let (base, top) = (dir.at("base.raw"), dir.at("top.qcow2"));
+        std::fs::write(&base, base_bytes(size / 512)).unwrap();
+        create_ready(&top, size, bits, Some((&base, Some("raw"))));
+        let initial = std::fs::read(&top).unwrap();
+        let (q, rec) = recorded(&top, Some(&base));
+        Self {
+            dir,
+            base,
+            initial,
+            sectors: size / 512,
+            cluster: 1 << bits,
+            history: Vec::new(),
+            q,
+            rec,
+        }
+    }
+    fn at(&self) -> usize {
+        self.rec.log().ops.len()
+    }
+    fn write(&mut self, sector: u64, data: Vec<u8>) {
+        let at = self.at();
+        self.q.write(&data, sector * 512).unwrap();
+        self.history.push(Guest::Write { sector, data, at });
+    }
+    fn zero(&mut self, sector: u64, n: u64, discard: bool) {
+        let at = self.at();
+        if discard {
+            self.q.discard(sector * 512, n * 512).unwrap();
+        } else {
+            self.q.write_zeroes(sector * 512, n * 512).unwrap();
+        }
+        self.history.push(Guest::Write {
+            sector,
+            data: vec![0; n as usize * 512],
+            at,
+        });
+    }
+    fn sync(&mut self) {
+        let slot = self.history.len();
+        self.history.push(Guest::Sync { done: usize::MAX });
+        self.q.sync(false).unwrap();
+        let done = self.at();
+        self.history[slot] = Guest::Sync { done };
+    }
+    /// The log index of every guest sync's final fsync (a crash just before it: tables written, not yet durable).
+    fn sync_points(&self) -> Vec<usize> {
+        self.history
+            .iter()
+            .filter_map(|g| match g {
+                Guest::Sync { done, .. } => Some(done - 1),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The image bytes after a crash at log position `p`, keeping `keep`'s choice of the unsynced pieces.
+    fn crashed(
+        &self,
+        ops: &[Op],
+        p: usize,
+        keep: &mut dyn FnMut(&Op, u64, u64) -> bool,
+    ) -> Vec<u8> {
+        let last_sync = ops[..p]
+            .iter()
+            .rposition(|o| matches!(o, Op::Sync))
+            .map_or(0, |i| i + 1);
+        let mut image = self.initial.clone();
+        let apply = |image: &mut Vec<u8>, op: &Op, from: u64, to: u64| match op {
+            Op::Write(offset, data) => {
+                let (start, end) = (from as usize, to as usize);
+                if image.len() < end {
+                    image.resize(end, 0);
+                }
+                image[start..end]
+                    .copy_from_slice(&data[start - *offset as usize..end - *offset as usize]);
+            }
+            Op::SetLen(len) => image.resize(*len as usize, 0),
+            _ => {}
+        };
+        for op in &ops[..last_sync] {
+            if let Op::Write(o, d) = op {
+                apply(&mut image, op, *o, o + d.len() as u64);
+            } else {
+                apply(&mut image, op, 0, 0);
+            }
+        }
+        // The unsynced pieces: writes torn at 4 KiB boundaries, length changes whole.
+        let mut pieces = Vec::new();
+        for (i, op) in ops.iter().enumerate().take(p).skip(last_sync) {
+            match op {
+                Op::Write(o, d) => {
+                    let end = o + d.len() as u64;
+                    let mut from = *o;
+                    while from < end {
+                        let to = ((from / 4096 + 1) * 4096).min(end);
+                        pieces.push((i, from, to));
+                        from = to;
+                    }
+                }
+                Op::SetLen(_) => pieces.push((i, 0, 0)),
+                _ => {}
+            }
+        }
+        let mut kept: Vec<bool> = pieces
+            .iter()
+            .map(|&(i, f, t)| keep(&ops[i], f, t))
+            .collect();
+        // Barrier closure: a kept piece keeps every piece before the last barrier preceding it.
+        if let Some(latest) = pieces
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| **k)
+            .map(|(p, _)| p.0)
+            .max()
+        {
+            if let Some(b) = ops[last_sync..latest]
+                .iter()
+                .rposition(|o| matches!(o, Op::Barrier))
+            {
+                let b = last_sync + b;
+                for (k, &(i, _, _)) in kept.iter_mut().zip(&pieces) {
+                    *k |= i < b;
+                }
+            }
+        }
+        for (&(i, f, t), k) in pieces.iter().zip(kept) {
+            if k {
+                apply(&mut image, &ops[i], f, t);
+            }
+        }
+        image
+    }
+
+    /// Reopen `image` writable and check it against the guest history for a crash at `p`.
+    fn verify(&self, image: Vec<u8>, p: usize, label: &str, qemu_check: bool) {
+        // The last flush whose fsync completed before the crash.
+        let last = self
+            .history
+            .iter()
+            .rposition(|g| matches!(g, Guest::Sync { done, .. } if *done <= p));
+        let mut flushed = base_bytes(self.sectors);
+        let mut later: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
+        for (k, g) in self.history.iter().enumerate() {
+            let Guest::Write { sector, data, at } = g else {
+                continue;
+            };
+            if last.is_some_and(|l| k < l) {
+                flushed[*sector as usize * 512..*sector as usize * 512 + data.len()]
+                    .copy_from_slice(data);
+            } else if *at < p {
+                for (j, chunk) in data.chunks(512).enumerate() {
+                    later
+                        .entry(sector + j as u64)
+                        .or_default()
+                        .push(chunk.to_vec());
+                }
+            }
+        }
+        let path = self.dir.at("crashed.qcow2");
+        std::fs::write(&path, image).unwrap();
+        let reopened =
+            open(&path, false, Some(&self.base)).unwrap_or_else(|e| panic!("{label}: reopen: {e}"));
+        let b = &*reopened.backend;
+        let got = read(b, 0, self.sectors as usize * 512);
+        for s in 0..self.sectors {
+            let one = &got[s as usize * 512..][..512];
+            let ok = one == &flushed[s as usize * 512..][..512]
+                || later.get(&s).is_some_and(|v| v.iter().any(|c| c == one));
+            assert!(
+                ok,
+                "{label}: sector {s} holds {:?}, not its flushed value or a later write",
+                &one[..16]
+            );
+        }
+        // The clusters the guest wrote still take a write (a cluster counted twice would refuse it); at most 64 of
+        // them, spread out (each allocation at the file end is a slow ftruncate).
+        let mut written: Vec<u64> = self
+            .history
+            .iter()
+            .filter_map(|g| match g {
+                Guest::Write { sector, .. } => Some(sector * 512 / self.cluster),
+                _ => None,
+            })
+            .collect();
+        written.sort_unstable();
+        written.dedup();
+        let step = written.len().div_ceil(64).max(1);
+        for &c in written.iter().step_by(step) {
+            b.write(&[0x5a; 512], c * self.cluster)
+                .unwrap_or_else(|e| panic!("{label}: cluster {c}: {e}"));
+        }
+        b.sync(true).unwrap();
+        drop(reopened);
+        if qemu_check {
+            check_clean(&path);
+        }
+    }
+}
+
+/// Header fields of the image bytes: the L1 table's range.
+fn l1_range(image: &[u8]) -> (u64, u64) {
+    let be = |at: usize, n: usize| {
+        image[at..at + n]
+            .iter()
+            .fold(0u64, |a, &b| a << 8 | b as u64)
+    };
+    (be(40, 8), be(36, 4) * 8)
+}
+/// The L2 tables the image's L1 points at.
+fn l2_tables(image: &[u8]) -> Vec<u64> {
+    let (offset, len) = l1_range(image);
+    image[offset as usize..(offset + len) as usize]
+        .chunks(8)
+        .map(|c| u64::from_be_bytes(c.try_into().unwrap()) & 0x00ff_ffff_ffff_fe00)
+        .filter(|&a| a != 0)
+        .collect()
+}
+fn overlaps(op: &Op, from: u64, to: u64, start: u64, len: u64) -> bool {
+    matches!(op, Op::Write(..)) && from < start + len && start < to
+}
+
+/// Random guest sequences; a crash at each flush's fsync with random, L1-only and in-place-L2-only selections, and at
+/// random points.
+fn crash_seeds(bits: u32, size: u64, seeds: u64, ops: u32) {
+    let seeds = std::env::var("NATEMU_QCOW_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(seeds);
+    let mut checks = 0;
+    for seed in 1..=seeds {
+        let mut run = Run::new("crash", size, bits);
+        let mut rng = Rng(seed * 0x51_7cc1_b727_220a ^ bits as u64);
+        let (sectors, per) = (run.sectors, run.cluster / 512);
+        for i in 0..ops {
+            let s = rng.below(sectors);
+            match rng.below(10) {
+                0..6 => {
+                    let n = 1 + rng.below((3 * per).min(sectors - s));
+                    let data = (s..s + n).flat_map(|x| sector(i + 1, GUEST, x)).collect();
+                    run.write(s, data);
+                }
+                6 => {
+                    let n = 1 + rng.below((2 * per).min(sectors - s));
+                    run.zero(s, n, false);
+                }
+                7 => {
+                    let c = s / per;
+                    run.zero(c * per, per, true);
+                }
+                _ => run.sync(),
+            }
+        }
+        let log = run.rec.log().ops.clone();
+        let first = log.iter().position(|o| matches!(o, Op::Sync)).unwrap() + 1;
+        let mut points: Vec<usize> = run.sync_points();
+        points.extend((0..8).map(|_| first + rng.below((log.len() - first) as u64) as usize));
+        points.push(log.len());
+        for (n, &p) in points.iter().enumerate() {
+            let label = format!("bits {bits} seed {seed} crash at {p}/{}", log.len());
+            let durable = run.crashed(&log, p, &mut |_, _, _| false);
+            let l1 = l1_range(&durable);
+            let tables = l2_tables(&durable);
+            let c = run.cluster;
+            let mut r = Rng(rng.next() | 1);
+            run.verify(
+                run.crashed(&log, p, &mut |_, _, _| r.below(2) == 0),
+                p,
+                &format!("{label} random"),
+                n % 6 == 0,
+            );
+            run.verify(
+                run.crashed(&log, p, &mut |op, f, t| overlaps(op, f, t, l1.0, l1.1)),
+                p,
+                &format!("{label} L1 kept, the rest dropped"),
+                false,
+            );
+            run.verify(
+                run.crashed(&log, p, &mut |op, f, t| {
+                    tables.iter().any(|&a| overlaps(op, f, t, a, c))
+                }),
+                p,
+                &format!("{label} in-place L2 kept, the rest dropped"),
+                false,
+            );
+            checks += 3;
+        }
+    }
+    eprintln!(
+        "crash test: cluster {} bytes, {seeds} seeds, {checks} crash images checked",
+        1u64 << bits
+    );
+}
+
+#[test]
+fn crashes_keep_every_flushed_sector_with_64k_clusters() {
+    crash_seeds(16, 4 << 20, 10, 150);
+}
+
+#[test]
+fn crashes_keep_every_flushed_sector_with_512_byte_clusters_and_l2_evictions() {
+    // 4 MiB of 512-byte clusters is 128 L2 tables: more than the 100-table cache, so dirty tables are evicted.
+    crash_seeds(9, 4 << 20, 6, 400);
+}
+
+/// Fixed case: data written, then the L2 table that points at it changed in place (a discard dirties the table
+/// without moving it), then a crash keeping that table's write and dropping everything it does not depend on.
+#[test]
+fn crash_keeping_an_in_place_l2_write_keeps_the_data_it_points_at() {
+    let mut run = Run::new("inplace", 1 << 20, 16);
+    let per = run.cluster / 512;
+    run.write(0, (0..per).flat_map(|x| sector(1, GUEST, x)).collect());
+    run.sync();
+    run.zero(0, per, true); // the clean L2 table changed in place
+    run.write(2 * per + 3, sector(2, GUEST, 2 * per + 3)); // a new data cluster, its entry in that same table
+    run.sync();
+    let log = run.rec.log().ops.clone();
+    let p = *run.sync_points().last().unwrap();
+    let durable = run.crashed(&log, p, &mut |_, _, _| false);
+    let tables = l2_tables(&durable);
+    assert_eq!(tables.len(), 1);
+    let image = run.crashed(&log, p, &mut |op, f, t| {
+        overlaps(op, f, t, tables[0], 1 << 16)
+    });
+    run.verify(image, p, "in-place L2 kept", true);
+}
+
+/// Fixed case, the eviction path: a table changed in place and given a new data cluster is evicted from the L2 cache
+/// (more than 100 tables in use) before any flush; a crash right after the eviction keeps that table's write.
+#[test]
+fn crash_keeping_an_evicted_in_place_l2_keeps_the_data_it_points_at() {
+    // 512-byte clusters: one sector per cluster, 64 per L2 table; 512 tables against a 100-table cache.
+    let mut run = Run::new("evict", 16 << 20, 9);
+    for t in 0..512 {
+        run.write(t * 64 + 1, sector(1, GUEST, t * 64 + 1));
+    }
+    run.sync();
+    let tables = l2_tables(&run.rec.log().live);
+    let start = run.at();
+    let in_place = |op: &Op, f: u64, t: u64| tables.iter().any(|&a| overlaps(op, f, t, a, 512));
+    // Each table in turn: changed in place (a zero flag over the base), then given a new data cluster. The cache
+    // holds 100 tables, so loading the next ones evicts dirty ones: the first such write is the crash point.
+    for t in 0..512 {
+        run.zero(t * 64 + 1, 1, true);
+        run.write(t * 64 + 5, sector(3, GUEST, t * 64 + 5));
+    }
+    let log = run.rec.log().ops.clone();
+    let first = (start..log.len()).find(|&i| match &log[i] {
+        Op::Write(at, d) => in_place(&log[i], *at, at + d.len() as u64),
+        _ => false,
+    });
+    let p = first.expect("no dirty table was evicted") + 1;
+    let image = run.crashed(&log, p, &mut |op, f, t| in_place(op, f, t));
+    run.verify(image, p, "evicted in-place L2 kept", true);
+}
+
+/// Fixed case: a flush moves an L2 table (its old cluster is freed) and, while its fsync runs, another worker
+/// allocates a cluster; a crash before that fsync keeps the worker's data and drops the new L1. The freed cluster
+/// must not have been reused: the durable L1 still points at it.
+#[test]
+fn crash_before_the_fsync_of_a_flush_that_freed_a_cluster_finds_it_unreused() {
+    let mut run = Run::new("reuse", 1 << 20, 16);
+    let per = run.cluster / 512;
+    run.write(0, (0..per).flat_map(|x| sector(1, GUEST, x)).collect());
+    run.sync();
+    // The table is clean: this write moves it to a new cluster and frees the old one.
+    run.write(
+        per,
+        (per..2 * per).flat_map(|x| sector(2, GUEST, x)).collect(),
+    );
+    let q = run.q.clone();
+    let y = (4 * per..5 * per)
+        .flat_map(|x| sector(3, GUEST, x))
+        .collect::<Vec<u8>>();
+    let hook_data = y.clone();
+    run.rec.log().on_sync = Some(Box::new(move || {
+        q.write(&hook_data, 4 * per * 512).map(|_| ()).unwrap()
+    }));
+    let at = run.at();
+    let slot = run.history.len();
+    run.history.push(Guest::Sync { done: usize::MAX });
+    run.history.push(Guest::Write {
+        sector: 4 * per,
+        data: y,
+        at,
+    });
+    run.q.sync(false).unwrap();
+    let done = run.at();
+    run.history[slot] = Guest::Sync { done };
+    let log = run.rec.log().ops.clone();
+    let p = done - 1;
+    let l1 = l1_range(&run.initial);
+    let image = run.crashed(&log, p, &mut |op, f, t| !overlaps(op, f, t, l1.0, l1.1));
+    run.verify(image, p, "worker data kept, new L1 dropped", true);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// A real kill: only the unclean-exit refcount rebuild path (a kill keeps the page cache, so it cannot see ordering).
+
+#[test]
+#[ignore = "the child of kill_leaves_an_image_the_next_writable_open_rebuilds"]
+fn kill_child() {
+    let Ok(path) = std::env::var("NATEMU_QCOW_KILL_CHILD") else {
+        return;
+    };
+    let image = open(Path::new(&path), false, None).unwrap();
+    let b = &*image.backend;
+    let mut out = std::io::stdout();
+    for i in 0u64.. {
+        let c = i % 256;
+        b.write(&sector(i as u32, GUEST, c).repeat(128), c << 16)
+            .unwrap();
+        if i % 4 == 3 {
+            b.sync(false).unwrap();
+            use std::io::Write;
+            writeln!(out, "synced {i}").unwrap();
+            out.flush().unwrap();
+        }
+    }
+}
+
+#[test]
+fn kill_leaves_an_image_the_next_writable_open_rebuilds() {
+    use std::io::BufRead;
+    let dir = Dir::new("kill");
+    let path = dir.at("a.qcow2");
+    create_ready(&path, 16 << 20, 16, None);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "disk::qcow::tests::kill_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("NATEMU_QCOW_KILL_CHILD", &path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut last = None;
+    // The pipe stays open until the kill (the child must die by SIGKILL, not by a closed pipe).
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    for line in lines.by_ref() {
+        let line = line.unwrap();
+        if let Some(n) = line.strip_prefix("synced ") {
+            last = Some(n.parse::<u64>().unwrap());
+            if last.unwrap() >= 600 {
+                break;
+            }
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(lines);
+    let last = last.expect("the child synced");
+    let t = Instant::now();
+    let image = open(&path, false, None).unwrap();
+    eprintln!(
+        "kill test: rebuilt after {} writes in {:?}",
+        last + 1,
+        t.elapsed()
+    );
+    // Every cluster holds its newest synced write or a later one (a kill keeps the page cache).
+    for c in 0..256u64 {
+        let newest = (0..=last).rev().find(|j| j % 256 == c).unwrap();
+        let got = read(&*image.backend, c << 16, 512);
+        let tag = u32::from_le_bytes(got[4..8].try_into().unwrap()) as u64;
+        assert!(
+            tag >= newest && tag % 256 == c && got == sector(tag as u32, GUEST, c),
+            "cluster {c}"
+        );
+    }
+    image.backend.sync(true).unwrap();
+    drop(image);
+    check_clean(&path);
+}
