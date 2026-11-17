@@ -33,7 +33,7 @@ The price is speed, only where a program really hits those cases or is built to 
 | cray-strict (the same without `-ffast-math`: DAZ and FTZ clear) | +473% (Nov 17; nearly all of it the per-operation denormal-input screen) |
 | luajit | +29.3% |
 | luajit-interp | +16.7% |
-| sqlite | about +5.5% (x87 floating-point mode switching around x87 instructions, a known remaining cost) |
+| sqlite | about +5.5% (not the x87 mode switching once thought: removing it changed nothing; cause not yet attributed) |
 | avx | about +2.5% |
 | zstd | about 0 |
 
