@@ -793,8 +793,11 @@ pub fn validate(cfg: &Config) -> Res<()> {
     for (i, a) in cfg.disks.iter().enumerate() {
         for b in &cfg.disks[i + 1..] {
             if key(a).is_some() && key(a) == key(b) {
+                if a.readonly && b.readonly {
+                    continue; // two read-only uses of one image share the lock
+                }
                 return Err(format!(
-                    "{who}: disks {:?} and {:?} are the same file",
+                    "{who}: disks {:?} and {:?} are the same file; that is allowed only when both are readonly",
                     a.id, b.id
                 ));
             }
@@ -834,10 +837,8 @@ pub fn to_boot(
     initrd: Option<Vec<u8>>,
 ) -> Res<Boot> {
     let who = cfg.who();
-    if cfg.disks.iter().any(|d| d.readonly || d.backing.is_some()) {
-        return Err(format!(
-            "{who}: read-only disks and backing files are not built yet"
-        ));
+    if cfg.disks.iter().any(|d| d.backing.is_some()) {
+        return Err(format!("{who}: backing files are not built yet"));
     }
     let mut boot = Boot::new(runtime, cfg.fexc.clone().ok_or("no fexc")?, kernel);
     boot.compile_cache = natemu::compile_cache::Config::new(
@@ -856,6 +857,7 @@ pub fn to_boot(
             id: d.id.clone(),
             path: d.path.clone(),
             transport: cfg.transports.disk,
+            readonly: d.readonly,
         })
         .collect();
     boot.net = !cfg.nics.is_empty();

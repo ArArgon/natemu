@@ -49,6 +49,14 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
                  disks PCI with the entropy device on MMIO. The guest checks that /dev/vda, vdb, vdc are the listed disks in
                  order (size, GET_ID serial = host device and inode, the first 4 KiB), that there is no vdd, reads each disk
                  (rough speed line) and writes a block to each; the host checks every image's bytes.
+  readonly       (not in the default list; `--cases readonly`, with the default --transport mmio) read-only disks end to end,
+                 on MMIO and on PCI, in three positions: [rw, ISO, raw ext4] and [ISO, rw]. The ISO is made by `hdiutil
+                 makehybrid -iso -joliet`; the guest needs isofs.ko, taken from the pinned Debian kernel package
+                 (--kernel-deb). The guest checks the device's read-only flag (1; the writable disk 0), no write cache,
+                 no discard, mounts the ISO (iso9660) and the raw ext4 read-only and reads them, and every write (dd to the
+                 device, a write in the file system) fails; the writable disk gets its block; the host checks that the ISO and
+                 the ext4 image are byte-identical afterwards. A last launch pair runs two VMs at once on one read-only ISO
+                 (the shared lock): both boot, and while both hold it a writable lock on the file and a writable launch are refused.
 Live negative controls (the judge must FAIL them): host-full-control (the host-full guest with the image on the normal
 disk) and host-limit-control (the host-limit guest without the limit)."""
 import argparse
@@ -72,9 +80,10 @@ import zlib
 from io_common import STARTUP_LINE, ROOT, VM_LOCK, digest, stop_group, write_json
 from raw_root import RAW_ROOT
 from io_common import PCI_PROBE, patch, pci_errors, pci_self_test
-from run_virtio_block import checked
+from run_virtio_block import checked, KERNEL_DEB_SHA
 from run_virtio_rng import KVER
 
+KERNEL_DEB = RAW_ROOT / 'io3-block-20261108-01/prerequisites/linux-image-6.12.107+deb13-amd64_6.12.107-1_amd64.deb'
 INPUTS = RAW_ROOT / 'io3-block-20261108-01/inputs-01'
 MiB = 1 << 20
 SECTOR = 512
@@ -245,6 +254,31 @@ multidisk)
   dd if=/fixtures/b.bin of=/dev/vdb bs=512 count=1 skip=0 seek=8 conv=notrunc 2>/dev/null || fail write-b
   dd if=/fixtures/a.bin of=/dev/vdc bs=512 count=1 skip=1 seek=8 conv=notrunc 2>/dev/null || fail write-c
   sync;;
+readonly)
+  for item in $(cat /proc/cmdline); do case "$item" in cov_iso=*) iso=${item#*=};; cov_ext=*) ext=${item#*=};; cov_rw=*) rw=${item#*=};; esac; done
+  modprobe isofs || fail module-isofs
+  for d in $rw $iso $ext; do wait_dev /dev/$d; done
+  for d in $rw $iso $ext; do echo "COV-RO $d ro=$(cat /sys/block/$d/ro) size=$(cat /sys/block/$d/size) cache=$(cat /sys/block/$d/queue/write_cache | tr ' ' _) discard=$(cat /sys/block/$d/queue/discard_max_bytes) zeroes=$(cat /sys/block/$d/queue/write_zeroes_max_bytes)"; done
+  mount -t iso9660 -o ro /dev/$iso /m1 || fail mount-iso
+  files=0; sums=
+  for f in /m1/*; do files=$((files+1)); sums="$sums$(sha $f)"; done
+  dd if=/fixtures/a.bin of=/dev/$iso bs=512 count=1 conv=notrunc 2>/dev/null; dd_rc=$?
+  mount -o remount,rw /m1 2>/dev/null
+  echo x > /m1/new 2>/dev/null; write_rc=$?
+  echo "COV-ISO files=$files sum=$sums dd_rc=$dd_rc write_rc=$write_rc"
+  umount /m1 || fail umount-iso
+  if test -n "$ext"; then
+    mount -t ext4 -o ro /dev/$ext /m2 || fail mount-ext
+    lost=$(ls /m2)
+    dd if=/fixtures/a.bin of=/dev/$ext bs=512 count=1 conv=notrunc 2>/dev/null; dd_rc=$?
+    mount -o remount,rw /m2 2>/dev/null
+    echo x > /m2/new 2>/dev/null; write_rc=$?
+    echo "COV-EXT ls=$lost dd_rc=$dd_rc write_rc=$write_rc"
+    umount /m2 || fail umount-ext
+  fi
+  dd if=/fixtures/a.bin of=/dev/$rw bs=512 count=1 seek=8 conv=notrunc 2>/dev/null || fail write-rw
+  sync
+  if test "$phase" = share; then echo COV-HOLD; sleep 12; fi;;
 *) fail case;;
 esac
 echo "COV-ERRORS ioerr_logs=$(ioerrs) fs_errors=$(dmesg | grep -c 'EXT4-fs error')"
@@ -355,7 +389,7 @@ def zeroout_program():
     return elf + bytes(code)
 
 
-def prepare(out, inputs, transport='mmio'):
+def prepare(out, inputs, transport='mmio', kernel_deb=None):
     """Kernel, initramfs and the base images in OUT; returns the manifest."""
     out.mkdir(parents=True)
     manifest = json.loads((inputs / 'inputs.json').read_text())
@@ -372,6 +406,22 @@ def prepare(out, inputs, transport='mmio'):
     for d in ('m1', 'm2', 'fixtures'): (tree / d).mkdir()
     a, b, p = fixtures()
     (tree / 'fixtures/a.bin').write_bytes(a); (tree / 'fixtures/b.bin').write_bytes(b)
+    if kernel_deb:    # isofs.ko (and cdrom.ko, its dependency) for the readonly case, from the pinned package
+        import io, lzma, tarfile
+        assert digest(kernel_deb) == KERNEL_DEB_SHA, 'kernel package pin mismatch'
+        with tarfile.open(fileobj=io.BytesIO(subprocess.check_output(['ar', 'p', str(kernel_deb), 'data.tar.xz'], timeout=60))) as package:
+            for member in package:
+                name = Path(member.name).name
+                if name not in ('isofs.ko.xz', 'cdrom.ko.xz'): continue
+                data = lzma.decompress(package.extractfile(member).read())
+                assert ('vermagic=' + KVER).encode() in data, name
+                rel = 'kernel/' + member.name.split(f'/{KVER}/kernel/', 1)[1].removesuffix('.xz')
+                depends = re.search(rb'depends=([^\0]*)', data).group(1).decode()
+                assert depends in ('', 'cdrom'), (name, depends)
+                dest = tree / 'lib/modules' / KVER / rel
+                dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(data)
+                with (tree / 'lib/modules' / KVER / 'modules.dep').open('a') as f:
+                    f.write(f'{rel}: ' + ('kernel/drivers/cdrom/cdrom.ko' if depends else '') + '\n')
     (tree / 'init').write_text(INIT_PCI if transport == 'pci' else INIT); (tree / 'init').chmod(0o755)
     spec = importlib.util.spec_from_file_location('mkcpio', ROOT / 'tools/play/mkcpio.py')
     mkcpio = importlib.util.module_from_spec(spec); spec.loader.exec_module(mkcpio)
@@ -409,7 +459,7 @@ def ext4_offsets(case):
     """Byte offsets of the image's ext4 file systems."""
     if case in ('gpt', 'mbr', 'trim'): return [s * SECTOR for s, _, _ in PARTS['table'][:2]]
     if case.startswith('host-full'): return [PARTS['hostfull'][0][0] * SECTOR]
-    if case.startswith('host-limit') or case == 'multidisk': return []
+    if case.startswith('host-limit') or case in ('multidisk', 'readonly'): return []
     return [0]
 
 
@@ -491,6 +541,21 @@ def judge(case, phase, text, host, expect, pci=False):
         require(len(disks) == 3 and all(re.search(w, d[4]) for w, d in zip(want, disks)), f'disks are not on {host["transport"]}: {[d[4] for d in disks]}')
         require(one(r'^COV-NODISK vdd$') is not None, 'a fourth disk appeared')
         require(host['written'], 'a disk did not receive its own block (or another one did)')
+        require(io_errors == 0, 'I/O errors logged')
+    elif case == 'readonly':
+        ro = re.findall(r'^COV-RO (\S+) ro=(\d) size=(\d+) cache=(\S+) discard=(\d+) zeroes=(\d+)$', text, re.M)
+        want = [(dev, str(int(r)), str(sectors)) for dev, r, sectors in host['layout']]
+        require([d[:3] for d in ro] == want, f'guest disks {ro}, expected {want}')
+        require(all((d[3] == 'write_through' and d[4] == d[5] == '0') == (d[1] == '1') for d in ro) and len(ro) == len(want),
+                f'a read-only disk offers a write cache, discard or write-zeroes, or the writable one does not: {ro}')
+        iso = one(r'^COV-ISO files=(\d+) sum=(\S*) dd_rc=(\d+) write_rc=(\d+)$')
+        require(iso is not None and iso[:2] == ('1', host['iso_sha']) and iso[2] != '0' and iso[3] != '0', f'ISO contents or a write that did not fail: {iso}')
+        if host['has_ext']:
+            ext = one(r'^COV-EXT ls=(.*) dd_rc=(\d+) write_rc=(\d+)$')
+            require(ext is not None and ext[0] == 'lost+found' and ext[1] != '0' and ext[2] != '0', f'ext4 listing or a write that did not fail: {ext}')
+        require(host['ro_unchanged'], 'a read-only image changed on the host')
+        require(host['written'], 'the writable disk did not receive its block')
+        if phase == 'share': require(one(r'^COV-HOLD$') is not None, 'guest did not reach the hold point')
         require(io_errors == 0, 'I/O errors logged')
     elif case == 'host-full':
         if phase == 'write':
@@ -645,9 +710,150 @@ def run_multidisk(args):
     return result
 
 
+# The readonly case. Layouts: disks as (role, guest device) in list order; roles rw = writable raw, iso, ext = read-only raw ext4.
+RO_LAYOUTS = {'rw-iso-ext': (('rw', 'vda'), ('iso', 'vdb'), ('ext', 'vdc')), 'iso-rw': (('iso', 'vda'), ('rw', 'vdb'))}
+RO_LAUNCHES = (('mmio', 'mmio', 'rw-iso-ext'), ('pci', 'pci', 'rw-iso-ext'), ('mmio-iso-first', 'mmio', 'iso-rw'), ('pci-iso-first', 'pci', 'iso-rw'))
+RO_RW_SIZE = 8 * MiB
+
+
+def readonly_iso(work):
+    """An ISO (hdiutil makehybrid) with one file: (path, the file's sha256)."""
+    src = work / 'iso-src'; src.mkdir()
+    data = pattern(b'natemu-iso', 64 << 10)
+    (src / 'PAYLOAD.BIN').write_bytes(data)
+    checked(['hdiutil', 'makehybrid', '-iso', '-joliet', '-o', work / 'ro.iso', src], work / 'hdiutil.log')
+    shutil.rmtree(src)
+    return work / 'ro.iso', sha(data)
+
+
+def readonly_config(args, work, name, transport, disks, cmdline):
+    """A config file with DISKS ((path, readonly) in list order); returns the command line."""
+    q = lambda p: json.dumps(str(p))
+    config = work / f'{name}.toml'
+    config.write_text(f"""[machine]
+ram = "1G"
+vcpus = 2
+transport = {{ disk = "{transport}", nic = "{transport}", rng = "{transport}" }}
+[serial]
+output = {q(work / (name + '-serial.log'))}
+[engine]
+fexc = {q(args.fexc)}
+runtime = {q(args.runtime)}
+compile_cache = "off"
+[boot.kernel]
+image = {q(args.prepared / 'linux')}
+initrd = {q(args.prepared / 'initramfs.cpio')}
+cmdline = {q(cmdline)}
+""" + ''.join(f'[[disk]]\nid = "d{i}"\npath = {q(p)}\nreadonly = {"true" if ro else "false"}\n' for i, (p, ro) in enumerate(disks)))
+    return [str(args.natemu), '--config', str(config)]
+
+
+def readonly_judge(work, name, phase, process, timeout, rw, iso, iso_sha, ext, layout, before):
+    """(errors, host facts) of one finished launch."""
+    log = work / (name + '-serial.log')
+    text = log.read_text(errors='replace').replace('\r', '') if log.exists() else ''
+    stderr = (work / (name + '-stderr.log')).read_text(errors='replace')
+    a = fixtures()[0]
+    data = rw.read_bytes()[:16384]
+    size = {'rw': RO_RW_SIZE, 'iso': iso.stat().st_size, 'ext': ext.stat().st_size if ext else 0}
+    host = {'rc': process.returncode, 'timeout': timeout, 'stop': last_stop(stderr),
+            'backend_errors': [l for l in stderr.splitlines() if l.startswith('virtio-block: ')],
+            'changed': phase == 'write', 'fsck': [], 'table': True, 'exact': None,
+            'layout': [(dev, role != 'rw', size[role] // SECTOR) for role, dev in sorted(layout, key=lambda d: ('rw', 'iso', 'ext').index(d[0]))],  # the guest prints rw, iso, ext
+            'iso_sha': iso_sha, 'has_ext': ext is not None,
+            'written': data[8 * 512:9 * 512] == a[:512] and not any(data[:4096]) and not any(data[4608:]),
+            'ro_unchanged': before == (digest(iso), digest(ext) if ext else None)}
+    return judge('readonly', phase, text, host, expected_values(), False), host
+
+
+def readonly_launch(args, name, transport, layout_name, work):
+    iso, iso_sha = readonly_iso(work)
+    layout = RO_LAYOUTS[layout_name]
+    rw = work / 'rw.raw'
+    with rw.open('xb') as f: f.truncate(RO_RW_SIZE)
+    ext = None
+    if any(role == 'ext' for role, _ in layout):
+        ext = work / 'ext.raw'; checked(['cp', '-c', args.prepared / 'data.raw', ext], work / 'clone.log')
+    paths = {'rw': (rw, False), 'iso': (iso, True), 'ext': (ext, True)}
+    dev = {role: d for role, d in layout}
+    cmdline = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case=readonly cov_phase=write cov_rw=%s cov_iso=%s' % (dev['rw'], dev['iso'])
+    if ext: cmdline += ' cov_ext=' + dev['ext']
+    before = (digest(iso), digest(ext) if ext else None)
+    command = readonly_config(args, work, name, transport, [paths[role] for role, _ in layout], cmdline)
+    started, timeout = time.monotonic(), False
+    with (work / (name + '-stdout.log')).open('wb') as out, (work / (name + '-stderr.log')).open('wb') as err:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        try: process.wait(timeout=120)
+        except subprocess.TimeoutExpired: timeout = True; stop_group(process)
+        except BaseException: stop_group(process); raise
+    errors, host = readonly_judge(work, name, 'write', process, timeout, rw, iso, iso_sha, ext, layout, before)
+    for path in (rw, iso, ext):
+        if path: path.unlink()
+    entry = {'phase': name, 'seconds': round(time.monotonic() - started, 1), 'rc': process.returncode, 'stop': host['stop'], 'errors': errors}
+    print(json.dumps({'case': 'readonly', **entry}), flush=True)
+    return entry
+
+
+def readonly_share(args, work):
+    """Two VMs at once on one read-only ISO under the shared VM lock; while both hold it, a writable lock and a writable launch are refused."""
+    iso, iso_sha = readonly_iso(work)
+    layout = RO_LAYOUTS['iso-rw']
+    before = (digest(iso), None)
+    cmdline = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case=readonly cov_phase=share cov_rw=vdb cov_iso=vda'
+    vms, errors, started = [], [], time.monotonic()
+    held = lambda n: (work / f'vm{n}-serial.log').exists() and 'COV-HOLD' in (work / f'vm{n}-serial.log').read_text(errors='replace')
+    try:
+        for n in (1, 2):
+            rw = work / f'rw{n}.raw'
+            with rw.open('xb') as f: f.truncate(RO_RW_SIZE)
+            command = readonly_config(args, work, f'vm{n}', 'mmio', [(iso, True), (rw, False)], cmdline)
+            with (work / f'vm{n}-stdout.log').open('wb') as out, (work / f'vm{n}-stderr.log').open('wb') as err:
+                vms.append((subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True), rw))
+        deadline = time.monotonic() + 100
+        while time.monotonic() < deadline and not (held(1) and held(2)) and all(p.poll() is None for p, _ in vms): time.sleep(0.5)
+        if not (held(1) and held(2)): errors.append('both guests did not reach the hold point')
+        else:
+            with iso.open('rb') as f:    # the advisory lock the VMs use (flock): a writer is refused, another reader is not
+                try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); errors.append('an exclusive lock on the shared ISO succeeded')
+                except BlockingIOError: pass
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            command = readonly_config(args, work, 'writer', 'mmio', [(iso, False)], cmdline)
+            done = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+            if done.returncode == 0 or b'disk lock: held by another process' not in done.stderr:
+                errors.append(f'a writable launch on the shared ISO was not refused by the lock (rc={done.returncode}): {done.stderr[-300:]!r}')
+        for n, (process, rw) in enumerate(vms, 1):
+            timeout = False
+            try: process.wait(timeout=120)
+            except subprocess.TimeoutExpired: timeout = True; stop_group(process)
+            e, _ = readonly_judge(work, f'vm{n}', 'share', process, timeout, rw, iso, iso_sha, None, layout, before)
+            errors += [f'vm{n}: {m}' for m in e]
+    finally:
+        for process, rw in vms:
+            if process.poll() is None: stop_group(process)
+            rw.unlink(missing_ok=True)
+        iso.unlink(missing_ok=True)
+    entry = {'phase': 'share', 'seconds': round(time.monotonic() - started, 1), 'errors': errors}
+    print(json.dumps({'case': 'readonly', **entry}), flush=True)
+    return entry
+
+
+def run_readonly(args):
+    work = args.out / 'readonly'; work.mkdir()
+    result = {'case': 'readonly', 'launches': []}
+    for name, transport, layout in RO_LAUNCHES:
+        launch_dir = work / name; launch_dir.mkdir()
+        result['launches'].append(readonly_launch(args, name, transport, layout, launch_dir))
+    share = work / 'share'; share.mkdir()
+    result['launches'].append(readonly_share(args, share))
+    result['pass'] = not any(l['errors'] for l in result['launches'])
+    write_json(work / 'result.json', result)
+    return result
+
+
 def run_case(args, case):
     """Both launches of CASE (a control: of the case it controls); returns the result."""
     if case == 'multidisk': return run_multidisk(args)
+    if case == 'readonly': return run_readonly(args)
     base = case.removesuffix('-control')
     work = args.out / case; work.mkdir()
     volume = None
@@ -706,7 +912,7 @@ def run(args):
         from run_boot_smoke import build
         args.natemu, args.runtime = build()
     args.fexc = Path(args.fexc).resolve(strict=True)
-    inputs = prepare(args.out / 'prepared', args.inputs, args.transport)
+    inputs = prepare(args.out / 'prepared', args.inputs, args.transport, args.kernel_deb if 'readonly' in args.cases else None)
     args.prepared, args.e2fsck = args.out / 'prepared', Path(inputs['e2fsck'])
     write_json(args.out / 'manifest.json', {'cases': args.cases, 'seconds_per_vm': 120, 'source_root': str(ROOT),
                'artifacts': {str(p): digest(p) for p in (args.natemu, args.runtime, args.fexc, Path(__file__))}, 'inputs': inputs})
@@ -832,9 +1038,10 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--inputs', type=Path, default=INPUTS, help='a tools/run_virtio_block.py prepare directory')
     parser.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport (--virtio-transport); pci adds a guest probe and its checks')
-    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS + ('multidisk',), default=list(CASES + CONTROLS))
+    parser.add_argument('--kernel-deb', type=Path, default=KERNEL_DEB, help='the pinned Debian kernel package (the readonly case takes isofs.ko from it)')
+    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS + ('multidisk', 'readonly'), default=list(CASES + CONTROLS))
     args = parser.parse_args()
-    if 'multidisk' in args.cases and args.transport != 'mmio': parser.error('multidisk sets its own transports; leave --transport at mmio')
+    if {'multidisk', 'readonly'} & set(args.cases) and args.transport != 'mmio': parser.error('multidisk and readonly set their own transports; leave --transport at mmio')
     if len(set(args.cases)) != len(args.cases): parser.error('duplicate cases')
     return run(args)
 
