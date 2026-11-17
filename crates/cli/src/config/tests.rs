@@ -140,6 +140,7 @@ fn legacy(cli: &Cli) -> Fields {
             id: "disk0".into(),
             path: path.clone(),
             transport: cli.virtio_transport.disk,
+            readonly: false,
         })
         .collect();
     boot.net = cli.net;
@@ -750,6 +751,29 @@ fn disks_that_are_the_same_file_are_refused() {
 }
 
 #[test]
+fn one_file_twice_is_allowed_only_when_both_uses_are_read_only() {
+    let _env = lock();
+    let d = dir();
+    let a = d.join("a.iso");
+    std::fs::write(&a, b"x").unwrap();
+    let disk = |id: &str, ro: bool| {
+        format!(
+            "[[disk]]\nid = \"{id}\"\npath = \"{}\"\nreadonly = {ro}\n",
+            a.display()
+        )
+    };
+    let both = |x: bool, y: bool| format!("{MIN}{}{}", disk("one", x), disk("two", y));
+    assert!(load_file(&both(true, true), &[]).1.is_ok());
+    for (x, y) in [(true, false), (false, true), (false, false)] {
+        let e = err(load_file(&both(x, y), &[]).1);
+        assert!(
+            e.contains("same file") && e.contains("both are readonly"),
+            "{e}"
+        );
+    }
+}
+
+#[test]
 fn file_forwards_and_debug_values_use_the_old_parsers() {
     let _env = lock();
     let (_, c) = load_file(
@@ -813,8 +837,18 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
     let boot = to_boot(&three, "RT".into(), vec![1], None).unwrap();
     let ids: Vec<_> = boot.disks.iter().map(|d| d.id.as_str()).collect();
     assert_eq!(ids, ["root", "b", "c"]);
+    // Read-only reaches the launch description per disk, in any position.
+    let mut ro = three.clone();
+    ro.disks[1].readonly = true;
+    let flags: Vec<_> = to_boot(&ro, "RT".into(), vec![1], None)
+        .unwrap()
+        .disks
+        .iter()
+        .map(|d| d.readonly)
+        .collect();
+    assert_eq!(flags, [false, true, false]);
     let mut two = cfg.clone();
-    two.disks[0].readonly = true;
+    two.disks[0].backing = Some("base.raw".into());
     assert!(
         to_boot(&two, "RT".into(), vec![1], None)
             .err()

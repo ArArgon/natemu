@@ -71,6 +71,8 @@ pub struct DiskSpec {
     /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
     pub path: PathBuf,
     pub transport: Transport,
+    /// Opened read-only: shared lock, the guest sees the read-only bit and no flush, discard or write-zeroes.
+    pub readonly: bool,
 }
 
 /// The most disks: each takes an interrupt line, 18 + its index (disk 0 is on 16), and the controller has lines 16-23.
@@ -412,7 +414,12 @@ impl Boot {
                 Kind::Rng => crate::virtio::Virtio::rng(irqs.clone(), gsi),
                 Kind::Disk(k) => {
                     let disk =
-                        crate::virtio::Virtio::block(irqs.clone(), gsi, &self.disks[k].path)?;
+                        crate::virtio::Virtio::block_mode(
+                            irqs.clone(),
+                            gsi,
+                            &self.disks[k].path,
+                            self.disks[k].readonly,
+                        )?;
                     if p.pci {
                         // One request queue per vCPU: the guest then takes each completion on the vCPU that sent the request.
                         disk.block_queues(disk_queues(self.vcpus))?;

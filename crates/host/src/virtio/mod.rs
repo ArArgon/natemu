@@ -775,7 +775,16 @@ impl Virtio {
         Self::new(irqs, gsi, Profile::Entropy)
     }
     pub fn block(irqs: Irqs, gsi: usize, path: &std::path::Path) -> Result<Arc<Self>> {
-        Self::block_image(irqs, gsi, crate::disk::open(path, false, None)?)
+        Self::block_mode(irqs, gsi, path, false)
+    }
+    /// As [`Self::block`], read-only when asked (shared lock; the image offers nothing that writes).
+    pub fn block_mode(
+        irqs: Irqs,
+        gsi: usize,
+        path: &std::path::Path,
+        read_only: bool,
+    ) -> Result<Arc<Self>> {
+        Self::block_image(irqs, gsi, crate::disk::open(path, read_only, None)?)
     }
     /// A block device on an opened image: it offers what the image allows.
     pub(crate) fn block_image(irqs: Irqs, gsi: usize, image: crate::disk::Image) -> Result<Arc<Self>> {
