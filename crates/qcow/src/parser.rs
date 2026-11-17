@@ -6,24 +6,29 @@
 
 use std::cmp::{max, min};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+#[cfg(test)]
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
+#[cfg(test)]
 use std::path::Path;
 use std::{io, result, str};
 
 use log::warn;
 use thiserror::Error;
 
+#[cfg(test)]
+use super::header::QCOW_MAGIC;
 pub use super::header::{
     BackingFileConfig, CompressionType, ImageType, IncompatFeatures, MissingFeatureError,
     QcowHeader,
 };
 use super::header::{
-    MAX_CLUSTER_BITS, MAX_QCOW_FILE_SIZE, MAX_RAM_POINTER_TABLE_SIZE, MIN_CLUSTER_BITS, QCOW_MAGIC,
+    MAX_CLUSTER_BITS, MAX_QCOW_FILE_SIZE, MAX_RAM_POINTER_TABLE_SIZE, MIN_CLUSTER_BITS,
     offset_is_cluster_boundary,
 };
 use super::qcow_raw_file::QcowRawFile;
 use super::refcount::RefCount;
+#[cfg(test)]
 pub(crate) use super::util::MAX_NESTING_DEPTH;
 use super::util::{
     L1_TABLE_OFFSET_MASK, compressed_cluster_range_is_valid, l2_entry_compressed_cluster_layout,
@@ -36,6 +41,10 @@ use crate::file::ImageFile;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("The backing file given does not match the image header")]
+    BackingFileMismatch,
+    #[error("A qcow2 backing file must be opened read-only")]
+    WritableBackingFile,
     #[error("Backing file I/O error: {0}")]
     BackingFileIo(String /* path */, #[source] io::Error),
     #[error("Backing file offset {0:#x} with zero size")]
@@ -143,12 +152,46 @@ pub(crate) enum BackingKind {
     },
 }
 /// Backing file wrapper
-pub(crate) struct BackingFile {
+pub struct BackingFile {
     kind: BackingKind,
     virtual_size: u64,
 }
 
 impl BackingFile {
+    /// natemu: a raw backing file the caller opened and vetted. Reads past its end are zeros.
+    pub fn raw(file: ImageFile) -> BlockResult<Self> {
+        let virtual_size = file
+            .file_len()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::GettingFileSize(e)))?;
+        Ok(Self {
+            kind: BackingKind::Raw(file),
+            virtual_size,
+        })
+    }
+
+    /// natemu: a qcow2 backing file the caller opened read-only, with the backing file its header
+    /// names (if any) already opened by the caller. The parser itself never opens a path.
+    pub fn qcow2(file: ImageFile, backing: Option<BackingFile>) -> BlockResult<Self> {
+        if file.is_writable() {
+            return Err(BlockError::new(
+                BlockErrorKind::InvalidFormat,
+                Error::WritableBackingFile,
+            ));
+        }
+        let (inner, nested_backing, _sparse) = parse_qcow_with(file, backing, true)?;
+        let virtual_size = inner.header.size;
+        Ok(Self {
+            kind: BackingKind::Qcow {
+                inner: Box::new(inner),
+                backing: nested_backing.map(Box::new),
+            },
+            virtual_size,
+        })
+    }
+
+    /// Upstream's opener: follows the header's backing path itself and guesses its format.
+    /// natemu: tests only; the product opens backing files through its own policy.
+    #[cfg(test)]
     fn new(
         backing_file_config: Option<&BackingFileConfig>,
         max_nesting_depth: u32,
@@ -233,16 +276,35 @@ impl Debug for BackingFile {
     }
 }
 
-/// Parses and validates a QCOW2 image file, returning the metadata, backing
-/// file and sparse flag.
-///
-/// Used by [`crate::QcowDisk`] when opening an image.
+/// Upstream's entry point: parses `file` and opens its backing chain by the header's paths.
+/// natemu: tests only (see [`BackingFile::new`]).
+#[cfg(test)]
 pub(crate) fn parse_qcow(
     file: ImageFile,
     max_nesting_depth: u32,
     sparse: bool,
 ) -> BlockResult<(metadata::QcowState, Option<BackingFile>, bool)> {
-    let mut header = QcowHeader::new(&file).map_err(|e| {
+    let header = read_header(&file)?;
+    // QCOW2 relative backing paths are resolved from the image that stores
+    // them. Resolve only the config passed to BackingFile::new(), leaving the
+    // header copy unchanged so the original backing filename is preserved.
+    let backing_file_config = header.backing_file.as_ref().map(|config| {
+        let mut config = config.clone();
+        if !Path::new(&config.path).is_absolute()
+            && let Some(disk_path) = file.path()
+            && disk_path.exists()
+            && let Some(parent) = disk_path.parent()
+        {
+            config.path = parent.join(&config.path).to_string_lossy().into_owned();
+        }
+        config
+    });
+    let backing_file = BackingFile::new(backing_file_config.as_ref(), max_nesting_depth, sparse)?;
+    parse_qcow_with(file, backing_file, sparse)
+}
+
+fn read_header(file: &ImageFile) -> BlockResult<QcowHeader> {
+    QcowHeader::new(file).map_err(|e| {
         let kind = match &e {
             Error::InvalidMagic
             | Error::BackingFileTooLong(_)
@@ -254,7 +316,25 @@ pub(crate) fn parse_qcow(
             _ => BlockErrorKind::Io,
         };
         BlockError::new(kind, e)
-    })?;
+    })
+}
+
+/// Parses and validates a QCOW2 image file whose backing file (if its header names one) the
+/// caller has already opened, returning the metadata, backing file and sparse flag.
+///
+/// Used by [`crate::QcowDisk`] when opening an image.
+pub(crate) fn parse_qcow_with(
+    file: ImageFile,
+    backing_file: Option<BackingFile>,
+    sparse: bool,
+) -> BlockResult<(metadata::QcowState, Option<BackingFile>, bool)> {
+    let mut header = read_header(&file)?;
+    if header.backing_file.is_some() != backing_file.is_some() {
+        return Err(BlockError::new(
+            BlockErrorKind::InvalidFormat,
+            Error::BackingFileMismatch,
+        ));
+    }
 
     // Only v2 and v3 files are supported.
     if header.version != 2 && header.version != 3 {
@@ -298,23 +378,6 @@ pub(crate) fn parse_qcow(
             Error::InvalidL1TableSize(header.l1_size),
         ));
     }
-
-    // QCOW2 relative backing paths are resolved from the image that stores
-    // them. Resolve only the config passed to BackingFile::new(), leaving the
-    // header copy unchanged so the original backing filename is preserved.
-    let backing_file_config = header.backing_file.as_ref().map(|config| {
-        let mut config = config.clone();
-        if !Path::new(&config.path).is_absolute()
-            && let Some(disk_path) = file.path()
-            && disk_path.exists()
-            && let Some(parent) = disk_path.parent()
-        {
-            config.path = parent.join(&config.path).to_string_lossy().into_owned();
-        }
-        config
-    });
-
-    let backing_file = BackingFile::new(backing_file_config.as_ref(), max_nesting_depth, sparse)?;
 
     // Validate refcount order to be 0..6
     let refcount_bits: u64 = 0x01u64.checked_shl(header.refcount_order).ok_or_else(|| {
@@ -505,6 +568,7 @@ pub(crate) fn parse_qcow(
         refcounts,
         avail_clusters,
         unref_clusters: Vec::new(),
+        table_write_failed: false,
     };
 
     Ok((inner, backing_file, sparse))
@@ -864,6 +928,8 @@ fn rebuild_refcounts(raw_file: &mut QcowRawFile, mut header: QcowHeader) -> Bloc
 }
 
 /// Detect the type of an image file by checking for a valid qcow2 header.
+/// natemu: tests only; the product never guesses a backing file's format from its contents.
+#[cfg(test)]
 fn detect_image_type(file: &mut ImageFile) -> BlockResult<ImageType> {
     let mut magic_bytes = [0u8; 4];
     file.read_exact_at(&mut magic_bytes, 0)
@@ -2226,6 +2292,8 @@ mod tests {
             "Dirty bit should be set while file is open"
         );
 
+        // natemu: only a clean close clears it; a plain drop (any exit but power-off) keeps it.
+        disk.close_clean().unwrap();
         drop(disk);
 
         assert_eq!(

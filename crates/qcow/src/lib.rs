@@ -23,21 +23,25 @@ mod test_util;
 mod util;
 mod vec_cache;
 
+#[cfg(test)]
 use std::fs::File;
 use std::io;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 
 pub use error::{BlockError, BlockErrorKind, BlockResult, ErrorContext, ErrorOp};
 pub use parser::{
-    BackingFileConfig, CompressionType, Error, ImageType, IncompatFeatures, MissingFeatureError,
-    QcowHeader,
+    BackingFile, BackingFileConfig, CompressionType, Error, ImageType, IncompatFeatures,
+    MissingFeatureError, QcowHeader,
 };
 use thiserror::Error as ThisError;
 
 use self::backing::shared_backing_from;
-use self::file::ImageFile;
+use self::file::{ImageFile, SyncKind};
 use self::metadata::{BackingRead, QcowMetadata};
+use self::parser::parse_qcow_with;
+#[cfg(test)]
 use self::parser::{MAX_NESTING_DEPTH, parse_qcow};
 use self::qcow_raw_file::QcowRawFile;
 
@@ -74,14 +78,42 @@ impl std::fmt::Debug for QcowDisk {
 }
 
 impl QcowDisk {
-    /// Open `file`. `backing_files` allows following backing files (to `MAX_NESTING_DEPTH`).
-    /// Without a path, a relative backing file name is resolved against the working directory;
-    /// use [`QcowDisk::with_path`] to resolve it against the image's directory.
+    /// natemu: open `file` with the backing file its header names, which the caller opened
+    /// ([`BackingFile::raw`], [`BackingFile::qcow2`]); `None` when the header names none. A
+    /// writable file gets the dirty bit (synced) before this returns, and a rebuild of its
+    /// refcounts if it was found dirty; a read-only one is never written.
+    pub fn open(file: ImageFile, backing: Option<BackingFile>) -> BlockResult<Self> {
+        let (inner, backing_file, sparse) =
+            parse_qcow_with(file, backing, true).map_err(|e| e.with_op(ErrorOp::Open))?;
+        Self::from_state(inner, backing_file, sparse)
+    }
+
+    fn from_state(
+        inner: metadata::QcowState,
+        backing_file: Option<parser::BackingFile>,
+        sparse: bool,
+    ) -> BlockResult<Self> {
+        let data_raw_file = inner
+            .raw_file
+            .try_clone()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, parser::Error::CloneBackingFile(e)))?;
+        Ok(QcowDisk {
+            metadata: Arc::new(QcowMetadata::new(inner)),
+            backing_file: backing_file.map(shared_backing_from).transpose()?,
+            sparse,
+            data_raw_file,
+        })
+    }
+
+    /// Upstream's opener: `backing_files` allows following backing files (to
+    /// `MAX_NESTING_DEPTH`) by the paths in their headers. natemu: tests only.
+    #[cfg(test)]
     pub fn new(file: File, backing_files: bool, sparse: bool) -> BlockResult<Self> {
         Self::from_image_file(ImageFile::new(file), backing_files, sparse)
     }
 
     /// Like [`QcowDisk::new`], recording the `path` the file was opened from.
+    #[cfg(test)]
     pub fn with_path(
         file: File,
         path: &Path,
@@ -92,6 +124,7 @@ impl QcowDisk {
     }
 
     /// Open on an arbitrary file layer.
+    #[cfg(test)]
     pub fn from_image_file(
         raw_file: ImageFile,
         backing_files: bool,
@@ -107,16 +140,7 @@ impl QcowDisk {
                 };
                 e.with_op(ErrorOp::Open)
             })?;
-        let data_raw_file = inner
-            .raw_file
-            .try_clone()
-            .map_err(|e| BlockError::new(BlockErrorKind::Io, parser::Error::CloneBackingFile(e)))?;
-        Ok(QcowDisk {
-            metadata: Arc::new(QcowMetadata::new(inner)),
-            backing_file: backing_file.map(shared_backing_from).transpose()?,
-            sparse,
-            data_raw_file,
-        })
+        Self::from_state(inner, backing_file, sparse)
     }
 
     pub fn logical_size(&self) -> u64 {
@@ -143,10 +167,44 @@ impl QcowDisk {
         })
     }
 
+    #[cfg(test)]
     pub fn sync_metadata(&self) -> BlockResult<()> {
-        self.metadata
-            .flush()
+        self.sync(SyncKind::Fsync)
             .map_err(|e| BlockError::new(BlockErrorKind::Io, DiskFileError::SyncMetadata(e)))
+    }
+
+    /// natemu: a guest FLUSH (`Fsync`) or a full sync, in the write order of the design (section
+    /// 4): data, barrier, L2 tables and refcount blocks, barrier, L1 and refcount tables (all
+    /// under the table lock), then `kind` with the lock released, so reads and writes go on
+    /// meanwhile. Clusters freed by those tables return to the free list only after the sync
+    /// succeeds. Callers serialise syncs.
+    pub fn sync(&self, kind: SyncKind) -> io::Result<()> {
+        let freed = self.metadata.write_tables()?;
+        self.data_raw_file.file().sync(kind)?;
+        self.metadata.release(freed);
+        Ok(())
+    }
+
+    /// natemu: the clean close of a power-off: the tables, F_FULLFSYNC, the dirty bit cleared,
+    /// F_FULLFSYNC. Any other exit (drop) writes the tables without a sync and keeps the dirty
+    /// bit. A later change must call [`Self::mark_dirty`] first.
+    pub fn close_clean(&self) -> io::Result<()> {
+        self.metadata.close_clean()
+    }
+
+    /// natemu: set the dirty bit again (synced) after [`Self::close_clean`].
+    pub fn mark_dirty(&self) -> io::Result<()> {
+        self.metadata.mark_dirty()
+    }
+
+    /// natemu: whether a table write failed; the image's on-disk tables are then unknown.
+    pub fn tables_failed(&self) -> bool {
+        self.metadata.tables_failed()
+    }
+
+    /// The cluster size in bytes.
+    pub fn cluster_size(&self) -> u64 {
+        self.metadata.cluster_size()
     }
 
     /// Synchronous guest-offset write (copy-on-write over a backing file as needed).
@@ -228,7 +286,7 @@ pub(crate) fn create_image_with_cluster_bits(
         .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
     let (inner, _backing, _sparse) = parse_qcow(raw, MAX_NESTING_DEPTH, true)?;
     // Flush dirty caches and clear the dirty bit
-    QcowMetadata::new(inner).shutdown();
+    QcowMetadata::new(inner).close_clean()?;
     Ok(())
 }
 
@@ -333,8 +391,10 @@ mod tests {
         );
     }
 
+    // natemu: upstream cleared the dirty bit when the last owner dropped; here only a clean
+    // close does (the power-off drain), and a drop leaves it set.
     #[test]
-    fn dirty_bit_cleared_when_last_metadata_owner_drops() {
+    fn dirty_bit_cleared_only_by_a_clean_close() {
         let file = make_qcow_file();
         let inspect = file.try_clone().unwrap();
         let disk = QcowDisk::new(file, false, true).unwrap();
@@ -342,8 +402,17 @@ mod tests {
 
         drop(disk);
         assert!(dirty_bit_is_set(&inspect));
-
         drop(other_owner);
+        assert!(dirty_bit_is_set(&inspect));
+
+        let disk = QcowDisk::new(inspect.try_clone().unwrap(), false, true).unwrap();
+        disk.write_all_at(0, &[1; 512]).unwrap();
+        disk.close_clean().unwrap();
+        assert!(!dirty_bit_is_set(&inspect));
+        disk.mark_dirty().unwrap();
+        assert!(dirty_bit_is_set(&inspect));
+        disk.close_clean().unwrap();
+        drop(disk);
         assert!(!dirty_bit_is_set(&inspect));
     }
 

@@ -711,7 +711,9 @@ impl QcowHeader {
                 self.incompatible_features &= !IncompatFeatures::DIRTY.bits();
             }
             self.write_incompatible_features(file)?;
-            file.fsync()
+            // natemu: F_FULLFSYNC (upstream fsync): the bit must be on stable storage before any
+            // table write that relies on it (dirty) or as the last word on the image (corrupt).
+            file.full_sync()
                 .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::SyncingHeader(e)))?;
         }
         Ok(())
@@ -725,7 +727,9 @@ impl QcowHeader {
         if self.version == 3 {
             self.incompatible_features |= IncompatFeatures::CORRUPT.bits();
             self.write_incompatible_features(file)?;
-            file.fsync()
+            // natemu: F_FULLFSYNC (upstream fsync): the bit must be on stable storage before any
+            // table write that relies on it (dirty) or as the last word on the image (corrupt).
+            file.full_sync()
                 .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::SyncingHeader(e)))?;
         }
         Ok(())
@@ -745,7 +749,7 @@ impl QcowHeader {
             self.autoclear_features = 0;
             file.write_all_at(&0u64.to_be_bytes(), AUTOCLEAR_FEATURES_OFFSET)
                 .map_err(Error::WritingHeader)?;
-            file.fsync().map_err(Error::SyncingHeader)?;
+            file.full_sync().map_err(Error::SyncingHeader)?;
         }
         Ok(())
     }

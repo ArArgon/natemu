@@ -18,9 +18,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 use super::decoder::Decoder;
-use super::metadata::{
-    BackingRead, ClusterReadMapping, ClusterWriteMapping, DeallocAction, QcowMetadata,
-};
+use super::metadata::{BackingRead, ClusterReadMapping, DeallocAction, QcowMetadata};
 use super::qcow_raw_file::QcowRawFile;
 
 /// Decompress a full QCOW2 cluster from compressed data.
@@ -115,28 +113,31 @@ pub(super) fn cow_write_at(
         let remaining_in_cluster = (cluster_size - intra_offset) as usize;
         let count = min(total_len - buf_offset, remaining_in_cluster);
 
-        let backing_data = if let Some(backing) = backing_file
-            .as_ref()
-            .filter(|_| intra_offset != 0 || count < cluster_size as usize)
-        {
-            let cluster_begin = curr_addr - intra_offset;
-            let mut data = vec![0u8; cluster_size as usize];
-            backing.read_at(cluster_begin, &mut data)?;
-            Some(data)
-        } else {
-            None
+        let chunk = &data[buf_offset..buf_offset + count];
+        let whole = intra_offset == 0 && count == cluster_size as usize;
+        // natemu: a whole-cluster write over a backing file passes its own data as the fill, so
+        // a newly allocated cluster holds it (written under the table lock) before its L2 entry
+        // exists. Upstream allocated it unwritten and wrote the data after the lock: a racing
+        // read, or a crash in which a flush or eviction made that entry durable before the data,
+        // then saw zeros, neither the old (backing) nor the new data.
+        let backing_data = match backing_file {
+            Some(_) if whole => None,
+            Some(backing) => {
+                let cluster_begin = curr_addr - intra_offset;
+                let mut data = vec![0u8; cluster_size as usize];
+                backing.read_at(cluster_begin, &mut data)?;
+                Some(data)
+            }
+            None => None,
+        };
+        let fill = match backing_file {
+            Some(_) if whole => Some(chunk),
+            _ => backing_data.as_deref(),
         };
 
-        let mapping = metadata.map_cluster_for_write(curr_addr, backing_data)?;
-
-        match mapping {
-            ClusterWriteMapping::Allocated {
-                offset: host_offset,
-            } => {
-                data_file
-                    .file()
-                    .write_all_at(&data[buf_offset..buf_offset + count], host_offset)?;
-            }
+        let (host_offset, filled) = metadata.map_cluster_for_write(curr_addr, fill)?;
+        if !(whole && filled) {
+            data_file.file().write_all_at(chunk, host_offset)?;
         }
         buf_offset += count;
     }

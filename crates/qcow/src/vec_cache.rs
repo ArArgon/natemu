@@ -138,6 +138,11 @@ impl<T: Cacheable> CacheMap<T> {
         self.map.iter_mut()
     }
 
+    /// natemu: whether any cached entry needs writing.
+    pub(super) fn any_dirty(&self) -> bool {
+        self.map.values().any(Cacheable::dirty)
+    }
+
     // Check if the refblock cache is full and we need to evict.
     pub(super) fn insert<F>(&mut self, index: usize, block: T, write_callback: F) -> io::Result<()>
     where
