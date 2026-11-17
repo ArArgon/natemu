@@ -132,7 +132,7 @@ pub(crate) fn open_disk(
             "disk {}: a backing file needs a qcow2 image",
             path.display()
         )),
-        None => raw::image(file, read_only),
+        None => raw::image(file, path, read_only),
         Some(Format::Qcow2) => qcow::image(file, path, read_only, backing, id),
         Some(Format::Refused(name)) => Err(format!(
             "disk {}: this looks like a {name} image; natemu reads raw and qcow2 (qemu-img convert -O qcow2 ...)",

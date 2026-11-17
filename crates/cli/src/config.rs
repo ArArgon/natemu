@@ -135,12 +135,6 @@ struct FMachine {
     transport: Option<FTransport>,
 }
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum FSize {
-    Bytes(u64),
-    Text(String),
-}
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FTransport {
     disk: Option<String>,

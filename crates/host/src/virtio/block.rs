@@ -9,7 +9,6 @@ use super::*;
 pub(super) use crate::disk::DiskBackend as Calls;
 use crate::disk::Image;
 use std::{
-    path::Path,
     sync::mpsc::{self, Receiver, SyncSender},
     thread::JoinHandle,
     time::Instant,
@@ -283,8 +282,9 @@ pub(super) struct Disk {
     pub id: [u8; ID_BYTES],
 }
 impl Disk {
-    /// A raw read-write image at `path` (tests and the launch code that has only a path).
-    pub fn open(path: &Path) -> Result<Self> {
+    /// A read-write image at `path`, raw or qcow2 (tests).
+    #[cfg(test)]
+    pub fn open(path: &std::path::Path) -> Result<Self> {
         Ok(Self::new(crate::disk::open(path, false, None)?))
     }
     pub fn new(image: Image) -> Self {

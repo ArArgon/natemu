@@ -14,7 +14,12 @@ const SECTOR: u64 = 512;
 /// The host block size: DISCARD and WRITE_ZEROES free whole blocks only.
 const HOLE: u64 = 4096;
 
-const NOT_A_DISK: &str = "disk must be a nonempty regular file with sector-aligned capacity";
+fn not_a_disk(path: &Path) -> String {
+    format!(
+        "disk {}: must be a nonempty regular file with sector-aligned capacity",
+        path.display()
+    )
+}
 
 /// Open `path` for the checks and the format detection: the file, its first sector and its last. A writable image
 /// takes the exclusive lock, a read-only one a shared lock (see [`image`]). The capacity check is the format's (a
@@ -28,7 +33,7 @@ pub(super) fn inspect(path: &Path, read_only: bool) -> Result<(File, Vec<u8>, Ve
     let info = file.metadata().map_err(|e| e.to_string())?;
     let len = info.len();
     if !info.is_file() || len < SECTOR || len > i64::MAX as u64 {
-        return Err(NOT_A_DISK.into());
+        return Err(not_a_disk(path));
     }
     lock(&file, path, read_only)?;
     let (mut head, mut tail) = (vec![0; SECTOR as usize], vec![0; SECTOR as usize]);
@@ -50,7 +55,10 @@ pub(super) fn lock(file: &File, path: &Path, shared: bool) -> Result<()> {
     };
     match locked {
         Ok(()) => Ok(()),
-        Err(TryLockError::WouldBlock) => Err("disk lock: held by another process".into()),
+        Err(TryLockError::WouldBlock) => Err(format!(
+            "disk lock: held by another process ({})",
+            path.display()
+        )),
         // A file system without flock (a network share): a reader goes on, a writer is refused.
         Err(TryLockError::Error(e)) if shared && unsupported(&e) => {
             eprintln!(
@@ -59,7 +67,7 @@ pub(super) fn lock(file: &File, path: &Path, shared: bool) -> Result<()> {
             );
             Ok(())
         }
-        Err(TryLockError::Error(e)) => Err(format!("disk lock: {e}")),
+        Err(TryLockError::Error(e)) => Err(format!("disk lock: {}: {e}", path.display())),
     }
 }
 
@@ -81,10 +89,10 @@ fn unsupported(e: &std::io::Error) -> bool {
 }
 
 /// The raw image on a file [`inspect`] opened and locked.
-pub(super) fn image(file: File, read_only: bool) -> Result<Image> {
+pub(super) fn image(file: File, path: &Path, read_only: bool) -> Result<Image> {
     let info = file.metadata().map_err(|e| e.to_string())?;
     if info.len() % SECTOR != 0 {
-        return Err(NOT_A_DISK.into());
+        return Err(not_a_disk(path));
     }
     let id = id(&info);
     Ok(Image {

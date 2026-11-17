@@ -840,7 +840,7 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
     );
     assert_eq!(b.cmdline, "quiet");
     assert_eq!(b.transports, Transports::all(Mmio));
-    // Several plain disks keep their order; read-only disks are not built yet.
+    // Several plain disks keep their order.
     let mut three = cfg.clone();
     for id in ["b", "c"] {
         let mut d = three.disks[0].clone();

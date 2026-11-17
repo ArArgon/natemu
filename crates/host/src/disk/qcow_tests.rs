@@ -41,12 +41,18 @@ impl Drop for Dir {
     }
 }
 
-/// qemu-img, if installed.
+/// qemu-img, if installed. With NATEMU_REQUIRE_QEMU_IMG=1 (the suite sets it when qemu-img is present) a missing
+/// qemu-img fails the test instead of skipping the checks that need it.
 fn qemu_img() -> Option<PathBuf> {
-    ["/opt/homebrew/bin/qemu-img", "/usr/local/bin/qemu-img"]
+    let found = ["/opt/homebrew/bin/qemu-img", "/usr/local/bin/qemu-img"]
         .iter()
         .map(PathBuf::from)
-        .find(|p| p.exists())
+        .find(|p| p.exists());
+    assert!(
+        found.is_some() || std::env::var_os("NATEMU_REQUIRE_QEMU_IMG").is_none_or(|v| v != "1"),
+        "NATEMU_REQUIRE_QEMU_IMG=1, but qemu-img is not installed"
+    );
+    found
 }
 fn skipped(what: &str) {
     eprintln!("skipped: {what}: qemu-img not found (install qemu to run it)");

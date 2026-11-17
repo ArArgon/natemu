@@ -416,7 +416,8 @@ impl Boot {
         // (default off needs nothing).
         if self.speculation_barriers && !crate::probe::sb()? {
             return Err(
-                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)".into(),
+                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)"
+                    .into(),
             );
         }
         let t = self.transports;
@@ -529,11 +530,7 @@ impl Boot {
                 speculation_barriers: self.speculation_barriers,
                 accurate_fp: self.accurate_fp,
                 pool: self.pool,
-                compile_cache: self
-                    .compile_cache
-                    .dir
-                    .clone()
-                    .map(|d| (d, self.compile_cache.cap)),
+                compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
             },
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
