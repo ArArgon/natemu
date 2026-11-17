@@ -5,6 +5,28 @@ answers. Covers M1's "configuration format and device list, multi-disk with read
 and "qcow2 disk images". Owner decisions are marked as such; everything else is a proposal.
 *(Unverified)* marks what I did not check.
 
+**Status: built, with these deviations** (the sections below are the plan; this list is what the
+built code does differently, each a deliberate choice from the reviews):
+
+- **Links below the configured base** (section 4, backing files): the name must be relative, made of
+  plain components, and lead into the referring image's own folder or below it (symbolic links among
+  the folders are resolved first); it must carry a format extension (the format is not detected for
+  such links); the file is opened with O_NOFOLLOW and must be a regular file.
+- **Overlay creation**: the overlay is written under a temporary name (mode 0600) and moved into
+  place by an exclusive rename, so the path never holds a partial file and an existing file is never
+  overwritten. The plan said "exclusive create".
+- **Refcount table**: an image whose refcount table cannot cover everything it can grow to is refused
+  at open (the vendored code never grows the table; `qemu-img` gives a small image a one-cluster
+  table, enough for about 4 GiB of file at 4 KiB clusters). Not in the plan's strict-opener list.
+- **Disk placement** counts disks per transport (PCI slots and MMIO pages/lines/uids), not the
+  `3 + k` table below.
+- **Punch budget**: DISCARD and WRITE_ZEROES hole punches are merged and limited by a time budget per
+  disk window, with a 128 MiB cap per punch.
+- **Shared interrupt lines** rotate over 16-23 (not only 16-19); the stale-ISR rule is in the
+  interrupt-lines section.
+- **Freed clusters** are released for reuse only after an fsync and F_BARRIERFSYNC, so a crash cannot
+  leave a reused cluster pointed at by an old table.
+
 ## 1. The configuration file
 
 ```toml
@@ -169,8 +191,8 @@ speed cost only, measured in the multi-disk gate.
 **Order.** Disks get slots in list order and the guest names them in that order; kinds are
 independent (removing the NIC moves no disk). Inserting a disk renumbers the later ones, like
 moving a cable. No `slot` field in M1; revisit at M3, where UEFI boot entries record the boot
-disk's PCI path. Under MMIO the order relies on Linux probing in ACPI node order *(unverified;
-the multi-disk gate checks it)*.
+disk's PCI path. Under MMIO the order relies on Linux probing in ACPI node order (settled: the multi-disk gate
+verifies it, on MMIO and PCI).
 
 **Unchanged old launches.** The pinned ACPI test hashes a different device order than a real
 launch builds, so it proves nothing about old command lines. Lane A's first commit therefore
@@ -345,18 +367,20 @@ snapshots. Compressed clusters are read as an I/O error (compression code droppe
   follow the rules below.
 - Relative backing names resolve against the referring image's folder (the qcow2 rule).
 - Depth capped at 16; loops detected by device and inode.
-- The backing format comes from the header extension when present, otherwise from detection.
+- The backing format comes from the header extension when present, otherwise from detection. (Built: for
+  links below the configured base the extension is required, see the status list.)
 - Reads past the end of a shorter backing file return zeros.
 - Backing files are opened read-only with a shared lock.
 - **`backing` in the config**: if `path` does not exist, natemu creates a v3 overlay there
-  (exclusive create, so it never overwrites), recording the base's absolute path and format; if
-  it exists, it must be a qcow2 whose backing is that same file, else refused. *(Unverified:
-  that the vendored header code creates an overlay with a backing name; if not, a small writer
-  is added.)*
+  (written under a temporary name and moved into place by an exclusive rename, so it never overwrites and never
+  appears half written; mode 0600), recording the base's absolute path and format; if
+  it exists, it must be a qcow2 whose backing is that same file, else refused. (Settled: the
+  vendored crate writes the overlay header with a backing name (`create_overlay`); `qemu-img` and
+  the overlay coverage case accept the result.)
 
-**Throw-away overlays** (placeholder, owner decision): an option to create the overlay in a
-temporary folder and delete it after the launch would suit the test tiers. To be decided before
-the runners move to qcow2.
+**Throw-away overlays** (still OPEN; the owner has not decided): an option to create the overlay in a
+temporary folder and delete it after the launch would suit the test tiers. The test runners now
+make and delete their own per-run overlays outside natemu, so no natemu option exists yet.
 
 ## 5. Work split: two lanes
 
@@ -505,7 +529,7 @@ That is 16 fio matrix runs and one IO5 run.
 Decided since the first draft: the backing-name policy, the tolerances, and shared PCI lines in
 M1. Still open:
 
-1. **Throw-away overlays**: decide before the runners move to qcow2.
+1. **Throw-away overlays**: still open, the owner has not decided. The runners work without it.
 
 Risks to keep in view:
 
