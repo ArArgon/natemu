@@ -6,6 +6,13 @@ if [ "$#" -eq 0 ]; then
     exit 2
 fi
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-: "${NATEMU_RAW_ROOT:=$project_root/../natemu-raw}"
+# Default: natemu-raw beside the main checkout, also from inside a worktree (git's common dir is the main checkout's .git).
+if [ -z "${NATEMU_RAW_ROOT:-}" ]; then
+    if common=$(git -C "$project_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+        NATEMU_RAW_ROOT=$(dirname "$(dirname "$common")")/natemu-raw
+    else
+        NATEMU_RAW_ROOT=$project_root/../natemu-raw
+    fi
+fi
 export NATEMU_RAW_ROOT
 exec "$@"
