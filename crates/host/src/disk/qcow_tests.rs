@@ -3,7 +3,7 @@
 //! the 64 GiB write-zeroes timing and a real kill. qemu-img (for checks and fixtures) is optional: those parts say
 //! "skipped" when it is absent.
 use super::*;
-use crate::disk::{DiskBackend, open};
+use crate::disk::DiskBackend;
 use natemu_qcow::file::FileLayer;
 use std::{
     collections::HashMap,
@@ -17,6 +17,26 @@ use std::{
 // Helpers.
 
 const SECTOR: usize = 512;
+
+/// [`crate::disk::open`], retried for up to 2 s while the lock is "held by another process". Tests run in threads of
+/// one process, and others spawn children (qemu-img, hdiutil): a spawn duplicates every open descriptor in the child
+/// until it execs, and a flock is released only when all copies are closed, so an image this test just dropped can
+/// look locked for a moment. Test-isolation only (natemu forks nothing around a reopen); tests that expect the
+/// refusal use [`error`], which does not retry.
+fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> crate::Result<crate::disk::Image> {
+    let start = Instant::now();
+    loop {
+        match crate::disk::open(path, read_only, backing) {
+            Err(e)
+                if e.contains("held by another process")
+                    && start.elapsed() < Duration::from_secs(2) =>
+            {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            r => return r,
+        }
+    }
+}
 
 /// A scratch folder, deleted on drop.
 struct Dir(PathBuf);
@@ -135,7 +155,9 @@ fn create_ready(path: &Path, size: u64, bits: u32, backing: Option<(&Path, Optio
     image.backend.sync(true).unwrap();
 }
 fn error(path: &Path, read_only: bool, backing: Option<&Path>) -> String {
-    open(path, read_only, backing).err().expect("refused")
+    crate::disk::open(path, read_only, backing)
+        .err()
+        .expect("refused")
 }
 fn read(b: &dyn DiskBackend, offset: u64, len: usize) -> Vec<u8> {
     let mut buf = vec![0; len];
