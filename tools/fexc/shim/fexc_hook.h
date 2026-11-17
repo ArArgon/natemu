@@ -47,6 +47,7 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_X87 = 16,                       // slice1 stub (I5c): an x87 instruction raised an unmasked exception that leaves its
                                             // operands unaltered (width: the instruction's length; w0: its check word)
   FEXC_SITE_PENDING = 17,                   // slice1 stub (I5c): a waiting x87, WAIT or MMX instruction with an x87 exception pending (#MF)
+  FEXC_SITE_FMA = 18,                       // slice1 (AFP accurate plan, chunk 4): the NaN check of a fused multiply-add, in the body (FexcFmaCheck)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
 struct FexcSiteInfo {
@@ -154,7 +155,7 @@ struct FexcArg {
 };
 enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR,
              FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC, FEXC_ARG_BULK, FEXC_ARG_DAZ, FEXC_ARG_FTZ,
-             FEXC_ARG_ACCURATE, FEXC_ARG_EXACT_STEP };
+             FEXC_ARG_ACCURATE };
 // Profile slice1 (perf chunk 26): the host asks for bulk REP STOS (`--bulk`: never for a single-instruction step, nor while
 // alignment checking or a data breakpoint gates the block): FexcStringOp stores the part of the string inside RDI's page
 // first (FEX's `FexcRepStos`, JIT form in fexc_sites.inc).
@@ -246,11 +247,10 @@ inline FexcArg<uint64_t, FEXC_ARG_X87_UNMASKED> fexc_x87_unmasked;
 inline bool fexc_no_afp = false;
 inline FexcArg<bool, FEXC_ARG_DAZ> fexc_daz;
 inline FexcArg<bool, FEXC_ARG_FTZ> fexc_ftz;
-// AFP accurate plan, chunk 1 (the frame): `--accurate` (accurate floating-point mode, host without AFP) and `--exact-step` (a step
-// request in it). Both are sent only without AFP; fexc refuses either with AFP. No compile reads them yet (chunks 2-5 do), so
-// no answer's args_read has their bits.
+// AFP accurate plan, chunk 1 (the frame): `--accurate` (accurate floating-point mode, host without AFP). Sent only without AFP; fexc refuses
+// it with AFP. Read only where a SIMD floating-point op needs it (chunks 2 and 4: the masked-DE test, the FMA NaN check). (Chunk 1's
+// `--exact-step` is gone: traps replaced the exact steps, plan section 5.)
 inline FexcArg<bool, FEXC_ARG_ACCURATE> fexc_accurate;
-inline FexcArg<bool, FEXC_ARG_EXACT_STEP> fexc_exact_step;
 // AFP fallback, decision C (the unmasked case): FexcKeep ops (placed right before a SIMD check, only without AFP and with MXCSR.UM clear)
 // name the operands of the instruction's multiplies, divides, FMAs and narrowing converts, each with a tag (crates/abi `tiny`: the
 // descriptor's meta byte | position << 8 | half << 10); the JIT collects (tag, vector register) here and the check that follows takes

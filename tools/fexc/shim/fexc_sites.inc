@@ -200,6 +200,35 @@ void Arm64JITCore::FexcSimdCheckWords(uint32_t Mask, const ARMEmitter::Register*
 DEF_OP(FexcSimdCheck) {
   FexcSimdCheckWords(IROp->C<IR::IROp_FexcSimdCheck>()->Mask);
 }
+// AFP accurate plan, chunk 4 (A): the NaN check of an FMA (FexcPrecision::PlaceFmaChecks): `fcmge vTMP2, vResult, #0` (scalar: lane 0), a
+// signalling compare that raises IOC for a NaN lane, so the FPCR.IOE trap is taken at this word; the resident recomputes the NaN lanes from the
+// operands the site names and resumes after it. The site (kind FMA) is at the word: width = the mode (bit 3 8-byte elements, bit 4 scalar),
+// imm = the operand registers, five bits each (Vector1, Vector2, Addend: crates/abi `tiny::Desc` slots 0..2). The destination VTMP2 is never read.
+DEF_OP(FexcFmaCheck) {
+  const auto Op = IROp->C<IR::IROp_FexcFmaCheck>();
+  const bool Dbl = Op->Mode >> 3 & 1, Scalar = Op->Mode >> 4 & 1;
+  const auto R = GetVReg(Op->Result);
+  const uint32_t At = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+  if (Scalar) fcmge(Dbl ? ARMEmitter::ScalarRegSize::i64Bit : ARMEmitter::ScalarRegSize::i32Bit, VTMP2, R);
+  else fcmge(Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit, VTMP2.Q(), R.Q());
+  FexcSiteInfo S {};
+  S.kind = FEXC_SITE_FMA;
+  S.guest_offset = FexcGuest;
+  S.guest_offset2 = FEXC_NONE32;
+  S.insn_native_offset = FexcInsnNative;
+  S.native_offset = At;
+  S.base_reg = S.index_reg = 0xff;
+  S.cf_inverted = FexcCf;
+  S.flags_written_before = FexcNzcvWritten;
+  S.nzcv = FexcNzcvSaved;
+  S.completed_effects = 0;
+  S.located = 1;
+  S.access_native_offset = FEXC_NONE32;
+  S.width = uint8_t(3 | (Op->Mode & 0x18));   // tiny::FMA | ELEM8 | SCALAR
+  S.imm = int32_t(uint32_t(GetVReg(Op->Vector1).Idx()) | uint32_t(GetVReg(Op->Vector2).Idx()) << 5 | uint32_t(GetVReg(Op->Addend).Idx()) << 10);
+  S.ir_op = "fma_check";
+  fexc_sites.push_back(S);
+}
 DEF_OP(FexcKeep) {   // emits no code: the operand stays live up to the check that follows (the resident reads its register at the stub)
   if (SpillSlots) return;   // a fill could reuse a register an earlier FexcKeep named: no description, the check behaves as before
   const auto Op = IROp->C<IR::IROp_FexcKeep>();
