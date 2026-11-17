@@ -38,7 +38,7 @@ pub(super) fn inspect(path: &Path, read_only: bool) -> Result<(File, Vec<u8>, Ve
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Err("disk lock: held by another process".into()),
         // A file system without flock (a network share): a reader goes on, a writer is refused.
-        Err(TryLockError::Error(e)) if read_only && e.kind() == std::io::ErrorKind::Unsupported => {
+        Err(TryLockError::Error(e)) if read_only && unsupported(&e) => {
             eprintln!(
                 "disk {}: no file locking here; opened read-only without a lock",
                 path.display()
@@ -52,6 +52,11 @@ pub(super) fn inspect(path: &Path, read_only: bool) -> Result<(File, Vec<u8>, Ve
     file.read_exact_at(&mut tail, len - SECTOR)
         .map_err(|e| format!("disk {}: {e}", path.display()))?;
     Ok((file, head, tail))
+}
+
+/// An error for "not supported here": macOS answers ENOTSUP (45), which std does not categorise.
+fn unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported || e.raw_os_error() == Some(45)
 }
 
 /// The raw image on a file [`inspect`] opened and locked.
@@ -83,10 +88,16 @@ pub(super) fn image(file: File, read_only: bool) -> Result<Image> {
 struct Raw {
     file: File,
     read_only: bool,
+    /// Held across the first-sector guard's check and write.
+    first: std::sync::Mutex<()>,
 }
 impl Raw {
     fn new(file: File, read_only: bool) -> Self {
-        Self { file, read_only }
+        Self {
+            file,
+            read_only,
+            first: Default::default(),
+        }
     }
     /// Deallocate whole host blocks (`F_PUNCHHOLE`): they then read as zeros.
     fn hole(&self, offset: u64, len: u64) -> std::io::Result<()> {
@@ -122,7 +133,13 @@ impl Raw {
     /// no error). With `zero` the partial ones at the ends are written with zeros, or without holes the whole range.
     /// ponytail: a zeroed range without host holes is one synchronous write of up to 2 GiB, inside the call limit only
     /// on a fast disk; split it into jobs if a host file system without holes matters.
-    fn punch(&self, offset: u64, len: u64, zero: bool) -> std::io::Result<()> {
+    fn punch(
+        &self,
+        offset: u64,
+        len: u64,
+        zero: bool,
+        write: &dyn Fn(&[u8], u64) -> std::io::Result<usize>,
+    ) -> std::io::Result<()> {
         if self.read_only {
             return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         }
@@ -131,30 +148,29 @@ impl Raw {
         let holed = first < last
             && match self.hole(first, last - first) {
                 Ok(()) => true,
-                Err(e)
-                    if matches!(e.kind(), std::io::ErrorKind::Unsupported)
-                        || e.raw_os_error() == Some(45) =>
-                {
-                    false
-                }
+                Err(e) if unsupported(&e) => false,
                 Err(e) => return Err(e),
             };
         if !zero {
             return Ok(());
         }
         if holed {
-            self.zeros(offset, first)?;
-            self.zeros(last, end)
+            Self::zeros(write, offset, first)?;
+            Self::zeros(write, last, end)
         } else {
-            self.zeros(offset, end)
+            Self::zeros(write, offset, end)
         }
     }
     /// Writes zeros over [`from`, `to`).
-    fn zeros(&self, mut from: u64, to: u64) -> std::io::Result<()> {
+    fn zeros(
+        write: &dyn Fn(&[u8], u64) -> std::io::Result<usize>,
+        mut from: u64,
+        to: u64,
+    ) -> std::io::Result<()> {
         const CHUNK: [u8; 1 << 16] = [0; 1 << 16];
         while from < to {
             let n = (to - from).min(CHUNK.len() as u64) as usize;
-            match self.file.write_at(&CHUNK[..n], from)? {
+            match write(&CHUNK[..n], from)? {
                 0 => return Err(std::io::Error::other("native disk call made zero progress")),
                 w => from += w.min(n) as u64,
             }
@@ -172,8 +188,10 @@ impl DiskBackend for Raw {
         }
         // First-sector guard: a guest write that would make the first four bytes the qcow2 magic fails, as QEMU's
         // raw format does; the next launch would otherwise detect qcow2 and follow a backing file name the guest chose.
-        // ponytail: not atomic against another worker's write to the same four bytes; a lock if that ever matters.
+        // Check and write are one step under `first`, so two partial writes cannot each see the other's old bytes.
+        // Only writes that start in the first four bytes pay for the lock. Other writes cannot change those bytes.
         if offset < 4 && !bytes.is_empty() {
+            let _held = self.first.lock().unwrap_or_else(|e| e.into_inner());
             let mut first = [0; 4];
             let n = self.file.read_at(&mut first, 0)?;
             first[n..].fill(0);
@@ -185,6 +203,7 @@ impl DiskBackend for Raw {
                     "a write that would make the image look like qcow2",
                 ));
             }
+            return self.file.write_at(bytes, offset);
         }
         self.file.write_at(bytes, offset)
     }
@@ -210,10 +229,18 @@ impl DiskBackend for Raw {
         }
     }
     fn discard(&self, offset: u64, len: u64) -> std::io::Result<()> {
-        self.punch(offset, len, false)
+        self.punch(offset, len, false, &|b, o| self.file.write_at(b, o))
     }
     fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()> {
-        self.punch(offset, len, true)
+        self.write_zeroes_with(offset, len, &|b, o| self.file.write_at(b, o))
+    }
+    fn write_zeroes_with(
+        &self,
+        offset: u64,
+        len: u64,
+        write: &dyn Fn(&[u8], u64) -> std::io::Result<usize>,
+    ) -> std::io::Result<()> {
+        self.punch(offset, len, true, write)
     }
 }
 
@@ -300,6 +327,31 @@ mod tests {
             "a reader opened beside a writer"
         );
         drop(w);
+        std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn a_missing_lock_facility_is_enotsup_on_macos() {
+        assert!(unsupported(&std::io::Error::from_raw_os_error(45)));
+        assert!(unsupported(&std::io::ErrorKind::Unsupported.into()));
+        assert!(!unsupported(&std::io::Error::from_raw_os_error(5)));
+    }
+    #[test]
+    fn racing_partial_writes_never_make_the_magic() {
+        let path = temp("race", &[0; 4096]);
+        let w: std::sync::Arc<dyn DiskBackend> = crate::disk::open(&path, false, None)
+            .unwrap()
+            .backend
+            .into();
+        for _ in 0..20000 {
+            w.write(&[0; 4], 0).unwrap();
+            let (a, b) = (w.clone(), w.clone());
+            let ta = std::thread::spawn(move || a.write(b"QF", 0).is_ok());
+            let tb = std::thread::spawn(move || b.write(b"I\xfb", 2).is_ok());
+            let (ra, rb) = (ta.join().unwrap(), tb.join().unwrap());
+            let mut head = [0; 4];
+            w.read(&mut head, 0).unwrap();
+            assert!(head != QCOW2_MAGIC && !(ra && rb), "magic written");
+        }
         std::fs::remove_file(&path).unwrap();
     }
     #[test]

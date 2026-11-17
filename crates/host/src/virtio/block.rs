@@ -1870,6 +1870,9 @@ mod tests {
         }
     }
     impl Calls for Script {
+        fn write_zeroes(&self, _: u64, _: u64) -> std::io::Result<()> {
+            Ok(())
+        }
         fn read(&self, b: &mut [u8], o: u64) -> std::io::Result<usize> {
             b.fill(0xa5);
             self.write(b, o)
@@ -1900,6 +1903,9 @@ mod tests {
         /// The first `n` syncs fail; a write at offset 0 fails.
         struct Fails(AtomicUsize, Mutex<Vec<bool>>);
         impl Calls for Fails {
+            fn write_zeroes(&self, _: u64, _: u64) -> std::io::Result<()> {
+                Ok(())
+            }
             fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
                 Ok(b.len())
             }
@@ -1958,6 +1964,9 @@ mod tests {
         /// The first sync waits (at most 300 ms) for a second to enter the host, then fails; a second would succeed.
         struct Racing(Mutex<usize>, Condvar);
         impl Calls for Racing {
+            fn write_zeroes(&self, _: u64, _: u64) -> std::io::Result<()> {
+                Ok(())
+            }
             fn read(&self, _: &mut [u8], _: u64) -> std::io::Result<usize> {
                 unreachable!()
             }
@@ -2031,6 +2040,9 @@ mod tests {
             }
         }
         impl Calls for Blocked {
+            fn write_zeroes(&self, _: u64, _: u64) -> std::io::Result<()> {
+                Ok(())
+            }
             fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
                 self.started.lock().unwrap().send(()).unwrap();
                 self.release.lock().unwrap().recv().unwrap();
@@ -2072,6 +2084,9 @@ mod tests {
             signal: Condvar,
         }
         impl Calls for Arc<Gated> {
+            fn write_zeroes(&self, _: u64, _: u64) -> std::io::Result<()> {
+                Ok(())
+            }
             fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
                 self.calls.fetch_add(1, SeqCst);
                 let open = self.open.lock().unwrap();
@@ -2147,6 +2162,38 @@ mod tests {
         b.extend(segment(8, 8, 0));
         let s = Streams::new(&[desc(0, b.len() as u32, false), desc(500, 512, true), desc(900, 1, true)]).unwrap();
         assert_eq!(status(&s, b, FEATURES), S_IOERR);
+    }
+    #[test]
+    fn a_discard_job_and_a_write_zeroes_job_reach_their_own_backend_calls() {
+        #[derive(Default)]
+        struct Rec(Mutex<Vec<(&'static str, u64, u64)>>);
+        impl Calls for Rec {
+            fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+            fn write(&self, b: &[u8], _: u64) -> std::io::Result<usize> {
+                Ok(b.len())
+            }
+            fn sync(&self, _: bool) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn discard(&self, o: u64, l: u64) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(("discard", o, l));
+                Ok(())
+            }
+            fn write_zeroes(&self, o: u64, l: u64) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(("zeroes", o, l));
+                Err(std::io::Error::other("zeroes failed"))
+            }
+        }
+        let rec = Rec::default();
+        assert!(execute(&rec, Job::Punch(vec![(4096, 8192), (0, 512)], false)).error.is_none());
+        let done = execute(&rec, Job::Punch(vec![(512, 1024), (0, 512)], true));
+        assert_eq!(done.error.as_deref(), Some("zeroes failed"), "stops at the first failing range");
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            [("discard", 4096, 8192), ("discard", 0, 512), ("zeroes", 512, 1024)]
+        );
     }
     #[test]
     fn a_read_only_image_offers_no_flush_discard_or_write_zeroes_and_refuses_writes() {
@@ -2246,6 +2293,9 @@ mod tests {
             signal: Condvar,
         }
         impl Calls for Ordered {
+            fn write_zeroes(&self, _: u64, _: u64) -> std::io::Result<()> {
+                Ok(())
+            }
             fn read(&self, _: &mut [u8], _: u64) -> std::io::Result<usize> {
                 unreachable!()
             }
@@ -2814,6 +2864,9 @@ pub(in crate::virtio) mod owner_tests {
         }
     }
     impl Calls for Held {
+        fn write_zeroes(&self, _: u64, _: u64) -> std::io::Result<()> {
+            Ok(())
+        }
         fn read(&self, b: &mut [u8], _: u64) -> std::io::Result<usize> {
             self.call();
             b.fill(0x5a);

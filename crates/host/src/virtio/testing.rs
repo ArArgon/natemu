@@ -327,7 +327,8 @@ impl Calls for Controlled {
         self.native.discard(offset, len)
     }
     fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()> {
-        self.native.write_zeroes(offset, len)
+        self.native
+            .write_zeroes_with(offset, len, &|bytes, at| self.write(bytes, at))
     }
 }
 
