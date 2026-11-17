@@ -1492,6 +1492,32 @@ class AfpAccurateDe(unittest.TestCase):
                 idc += bool(f4 & 0x80)
         self.assertGreater(idc, n // 10)
 
+    # the forms whose lowering negates an operand by an internal multiply (ADDSUB, the packed VFMSUB/VFNMSUB/VFMADDSUB/VFMSUBADD)
+    NEG_FORMS = ('addsubps', 'addsubpd', 'vaddsubps ymm', 'vfmsub231ps ymm', 'vfnmsub231ps', 'vfnmsub231pd', 'vfmaddsub231ps xmm', 'vfmaddsub231ps ymm',
+                 'vfmsubadd231pd xmm', 'vfmsubadd231ps', 'vfmsub231ps', 'vfmsub231pd', 'vfnmsub231ps ymm', 'vfmsubadd231ps ymm')
+
+    def test_nan_beside_denormal_in_one_lane(self):
+        """x86 sets no DE when the other operand of the lane is a NaN: a NaN in one of xmm1..xmm3 and a denormal in another, in every lane
+        (every register-role assignment), M4 against the afp=0 accurate code (the internal negation multiplies are not guest operations)."""
+        extra = {'vfmsub231ps': 'c4e269bacb', 'vfmsub231pd': 'c4e2e9bacb', 'vfnmsub231ps': 'c4e269bfcb', 'vfnmsub231pd': 'c4e2e9bfcb',
+                 'vfnmsub231ps ymm': 'c4e26dbfcb', 'vfmsubadd231ps': 'c4e269b7cb', 'vfmsubadd231ps ymm': 'c4e26db7cb'}
+        forms = [(n, h, e) for n, h, e, _ in self.FORMS if n in self.NEG_FORMS and n not in extra]
+        forms += [(n, extra[n], 8 if n.endswith('pd') else 4) for n in self.NEG_FORMS if n in extra]
+        self.assertGreater(len(forms), 8)
+        for name, form, e in forms:
+            V = VALUES[e]
+            for nan, den, other in itertools.permutations(range(3)):
+                for nk, dk, ok in itertools.product(('qnan', 'snan'), ('den', 'dneg'), ('one', 'zero', 'inf')):
+                    reg = [0, 0, 0]
+                    for r, k in ((nan, nk), (den, dk), (other, ok)):
+                        reg[r] = sum(V[k] << 8 * e * i for i in range(16 // e))
+                    xmm = [0, *reg] + [0] * 12
+                    hi = [0, *reg] + [0] * 12
+                    f4, v4, _ = self.run_one(form, True, xmm, hi, 0)
+                    fa, va, _ = self.run_one(form, False, xmm, hi, 0)
+                    ctx = (name, nk, dk, ok, (nan, den, other), 'M4', hex(f4), 'accurate', hex(fa))
+                    self.assertEqual(fa & 0x80, f4 & 0x80, ctx)
+
     def test_fast_mode_and_daz_have_no_software_flag(self):
         for name, form, e, re_ in self.FORMS:
             fast = native_words(form, '--feature', 'afp=0')[1]
