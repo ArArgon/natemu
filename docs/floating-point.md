@@ -30,7 +30,7 @@ The price is speed, only where a program really hits those cases or is built to 
 | Benchmark | Extra time |
 | --- | --- |
 | cray (built with `-ffast-math`, so DAZ and FTZ) | +163% (was +623% before the DAZ screen) |
-| cray-strict (the same without `-ffast-math`: DAZ and FTZ clear) | +473% (Nov 17; nearly all of it the per-operation denormal-input screen) |
+| cray-strict (the same without `-ffast-math`: DAZ and FTZ clear) | +273% (was +473% before the denormal-input screen's hoisted constants, zero tier and in-block skip; the rest is mostly screens of values entering a block) |
 | luajit | +29.3% |
 | luajit-interp | +16.7% |
 | sqlite | about +5.5% (not the x87 mode switching once thought: removing it changed nothing; cause not yet attributed) |
