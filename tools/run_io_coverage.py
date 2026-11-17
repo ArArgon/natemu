@@ -33,6 +33,11 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
                  relaunch reads p1. (Had the full volume failed an fsync instead, every later FLUSH and S5 would fail,
                  correctly: a host sync failure is sticky, crates/host/src/virtio/block.rs. APFS reports ENOSPC at
                  pwrite, so they succeed.)
+  trim           DISCARD and WRITE_ZEROES end to end on the gpt image's unused third partition: a 1 MiB pattern, then
+                 `blkdiscard` (BusyBox: DISCARD) over 128 KiB and a BLKZEROOUT ioctl (a tiny static program, ZEROOUT; BusyBox
+                 has no -z) over an unaligned range, and `fstrim` on the mounted ext4; the host's image bytes are exact
+                 (the discarded 4 KiB-aligned range reads as zeros, the zeroed range too, the rest of the pattern stays),
+                 fsck clean, the files written before the trim intact, the device's discard/write-zeroes limits non-zero.
   host-limit     RLIMIT_FSIZE on the natemu process (SIGXFSZ ignored) makes every host pwrite ending past LIMIT fail
                  with EFBIG, deterministically: a 64 KiB O_DIRECT write (one 16-segment request) straddling LIMIT gets a
                  2048-byte short write then EFBIG (IOERR), two of four concurrent writers above LIMIT fail while the two
@@ -73,10 +78,10 @@ PATTERN_AT = 32 * MiB            # host-limit: 64 KiB of pattern from here
 APPLETS = ('sh', 'mount', 'umount', 'modprobe', 'cat', 'grep', 'awk', 'dd', 'wc', 'sha256sum', 'dmesg', 'sync',
            'poweroff', 'reboot', 'sleep', 'mkdir', 'cp', 'rm', 'stty', 'nproc', 'uname', 'mkswap', 'swapon', 'swapoff',
            'df', 'tail', 'test', 'ls')
-CASES = ('gpt', 'mbr', 'reboot-acpi', 'reboot-kbd', 'reboot-triple', 'fs-full', 'host-full', 'host-limit')
+CASES = ('gpt', 'mbr', 'reboot-acpi', 'reboot-kbd', 'reboot-triple', 'fs-full', 'host-full', 'host-limit', 'trim')
 CONTROLS = ('host-full-control', 'host-limit-control')
 # The image each case starts from, and its extra kernel parameters.
-IMAGE = {'gpt': 'gpt.raw', 'mbr': 'mbr.raw', 'reboot-acpi': 'data.raw', 'reboot-kbd': 'data.raw', 'reboot-triple': 'data.raw',
+IMAGE = {'trim': 'gpt.raw', 'gpt': 'gpt.raw', 'mbr': 'mbr.raw', 'reboot-acpi': 'data.raw', 'reboot-kbd': 'data.raw', 'reboot-triple': 'data.raw',
          'fs-full': 'data.raw', 'host-full': 'hostfull.raw', 'host-limit': 'limit.raw'}
 EXTRA = {'reboot-kbd': ' reboot=k', 'reboot-triple': ' reboot=t'}
 # The write launch's expected host stop (stderr's last `natemu: ...` line) and exit status; every verify launch: S5.
@@ -85,6 +90,8 @@ STOP = {'reboot-acpi': ('natemu: Power(2)', 2), 'reboot-kbd': ('natemu: Power(2)
         'reboot-triple': ('natemu: Resident { stop: 16, status: 1, detail: 16 }', 2)}
 # natemu's stderr line for each failed host call (block.rs), by write launch; none anywhere else.
 BACKEND_ERRORS = {'host-full': 'virtio-block: No space left on device (os error 28)', 'host-limit': 'virtio-block: File too large (os error 27)'}
+# trim: the third partition's pattern (1 MiB of fixture a), a DISCARD range and a ZEROOUT range, in bytes from its start.
+TRIM_DISCARD, TRIM_ZERO = (262144, 131072), (524800, 201216)
 PARTS = {  # (first sector, sectors, GPT name) for gpt/mbr
     'table': [(2048, 40960, 'natemu-one'), (43008, 40960, 'natemu-two'), (83968, 32768, 'natemu-swap')],
     'hostfull': [(2048, 32768, 'natemu-fs'), (34816, 225280, 'natemu-raw')]}
@@ -186,6 +193,24 @@ host-full)
   mount -t ext4 -o ro /dev/vda1 /m1 || fail mount-ro
   echo "COV-DATA a=$(sha /m1/a.bin)"
   umount /m1 || fail umount-ro;;
+trim)
+  parts 3
+  if test "$phase" = write; then
+    mount -t ext4 /dev/vda1 /m1 || fail mount-p1
+    cp /fixtures/a.bin /m1/a.bin && cp /fixtures/b.bin /m1/b.bin && sync || fail copy
+    rm /m1/b.bin && sync || fail rm
+    fstrim -v /m1 > /tmp/fstrim.out 2>&1; fstrim_rc=$?
+    umount /m1 || fail umount
+    dd if=/fixtures/a.bin of=/dev/vda3 bs=64k oflag=direct conv=notrunc 2>/dev/null || fail pattern
+    blkdiscard -o 262144 -l 131072 /dev/vda3; discard_rc=$?
+    zeroout; zeroout_rc=$?
+    sync
+    echo "COV-TRIM fstrim_rc=$fstrim_rc discard_rc=$discard_rc zeroout_rc=$zeroout_rc discard_max=$(cat /sys/block/vda/queue/discard_max_bytes) zeroes_max=$(cat /sys/block/vda/queue/write_zeroes_max_bytes)"
+    echo "COV-FSTRIM $(cat /tmp/fstrim.out)"
+  fi
+  mount -t ext4 -o ro /dev/vda1 /m1 || fail mount-ro
+  echo "COV-DATA a=$(sha /m1/a.bin) b=$(test -e /m1/b.bin && echo present || echo gone)"
+  umount /m1 || fail umount-ro;;
 host-limit)
   if test "$phase" = write; then
     dd if=/fixtures/a.bin of=/dev/vda bs=64k oflag=direct conv=notrunc 2>/dev/null || fail below-write
@@ -286,6 +311,32 @@ def sparse_copy(src, dst):
             if block.count(0) != len(block): os.pwrite(o.fileno(), block, at)
 
 
+def zeroout_program():
+    """A static x86-64 ELF: open /dev/vda3 read-write and BLKZEROOUT (0x127f) the TRIM_ZERO range; exit status 0, the
+    ioctl's errno, or 100 when the open fails. (BusyBox's blkdiscard has no -z.)"""
+    path = b'/dev/vda3\0'
+    code = bytearray(b'\xb8\x02\x00\x00\x00')                  # mov eax, 2 (open)
+    lea_rdi = len(code); code += b'\x48\x8d\x3d\0\0\0\0'      # lea rdi, [rip+path]
+    code += b'\xbe\x02\x00\x00\x00\x31\xd2\x0f\x05'         # mov esi, 2 (O_RDWR); xor edx, edx; syscall
+    code += b'\x48\x85\xc0'                                 # test rax, rax
+    js = len(code); code += b'\x78\0'                         # js fail
+    code += b'\x89\xc7\xb8\x10\x00\x00\x00\xbe\x7f\x12\x00\x00'  # mov edi, eax; mov eax, 16; mov esi, 0x127f
+    lea_rdx = len(code); code += b'\x48\x8d\x15\0\0\0\0'      # lea rdx, [rip+range]
+    code += b'\x0f\x05\xf7\xd8\x89\xc7\xeb\x05'                 # syscall; neg eax; mov edi, eax; jmp done
+    code[js + 1] = len(code) - (js + 2)
+    code += b'\xbf\x64\x00\x00\x00'                         # fail: mov edi, 100
+    code += b'\xb8\x3c\x00\x00\x00\x0f\x05'                 # done: mov eax, 60; syscall
+    path_at = len(code); code += path
+    range_at = len(code); code += struct.pack('<QQ', *TRIM_ZERO)
+    struct.pack_into('<i', code, lea_rdi + 3, path_at - (lea_rdi + 7))
+    struct.pack_into('<i', code, lea_rdx + 3, range_at - (lea_rdx + 7))
+    base, head = 0x400000, 64 + 56
+    elf = b'\x7fELF\x02\x01\x01' + bytes(9) + struct.pack('<HHIQQQIHHHHHH', 2, 62, 1, base + head, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+    size = head + len(code)
+    elf += struct.pack('<IIQQQQQQ', 1, 7, 0, base, base, size, size, 0x1000)
+    return elf + bytes(code)
+
+
 def prepare(out, inputs, transport='mmio'):
     """Kernel, initramfs and the base images in OUT; returns the manifest."""
     out.mkdir(parents=True)
@@ -297,6 +348,9 @@ def prepare(out, inputs, transport='mmio'):
     shutil.rmtree(tree / 'newroot'); (tree / 'init').unlink()
     for name in APPLETS:
         if not (tree / 'bin' / name).is_symlink(): (tree / 'bin' / name).symlink_to('busybox')
+    for name in ('blkdiscard', 'fstrim'):
+        if not (tree / 'bin' / name).is_symlink(): (tree / 'bin' / name).symlink_to('busybox')
+    (tree / 'bin/zeroout').write_bytes(zeroout_program()); (tree / 'bin/zeroout').chmod(0o755)
     for d in ('m1', 'm2', 'fixtures'): (tree / d).mkdir()
     a, b, p = fixtures()
     (tree / 'fixtures/a.bin').write_bytes(a); (tree / 'fixtures/b.bin').write_bytes(b)
@@ -335,7 +389,7 @@ def prepare(out, inputs, transport='mmio'):
 
 def ext4_offsets(case):
     """Byte offsets of the image's ext4 file systems."""
-    if case in ('gpt', 'mbr'): return [s * SECTOR for s, _, _ in PARTS['table'][:2]]
+    if case in ('gpt', 'mbr', 'trim'): return [s * SECTOR for s, _, _ in PARTS['table'][:2]]
     if case.startswith('host-full'): return [PARTS['hostfull'][0][0] * SECTOR]
     if case.startswith('host-limit'): return []
     return [0]
@@ -402,6 +456,13 @@ def judge(case, phase, text, host, expect, pci=False):
                     'ENOSPC not reported, space left, a later write succeeded or sync failed')
         require(one(r'^COV-DATA keep=(\S+) after=(\S+)$') == (expect['a'], expect['b']), 'file contents differ')
         require(io_errors == 0, 'I/O errors logged')
+    elif case == 'trim':
+        if phase == 'write':
+            require(one(r'^COV-TRIM fstrim_rc=(\d+) discard_rc=(\d+) zeroout_rc=(\d+) discard_max=(\d+) zeroes_max=(\d+)$')
+                    in {('0', '0', '0', '2147483648', '2147483648')}, 'fstrim, DISCARD or ZEROOUT failed, or the device limits are not offered')
+            require(host['exact'], 'the discarded and zeroed ranges, or the rest of the pattern, differ on the host')
+        require(one(r'^COV-DATA a=(\S+) b=(\S+)$') == (expect['a'], 'gone'), 'file contents differ')
+        require(io_errors == 0, 'I/O errors logged')
     elif case == 'host-full':
         if phase == 'write':
             full = one(r'^COV-HOSTFULL dd_rc=(\d+) eio=(\d) flush_rc=(\d+) ioerr_logs=(\d+)$')
@@ -418,6 +479,15 @@ def judge(case, phase, text, host, expect, pci=False):
         require(one(r'^COV-READ a=(\S+) b2=(\S+) b3=(\S+) prefix=(\S+) tail=(\S+) above=(\S+)$')
                 == (expect['a'], expect['b'], expect['b'], expect['prefix'], expect['tail'], expect['zero']), 'read-back differs')
     return errors
+
+
+def trim_exact(image):
+    """The third partition after the trim write launch: the pattern with the DISCARD and ZEROOUT ranges zero."""
+    a, _, _ = fixtures()
+    want = bytearray(a + bytes(2 * MiB - len(a)))
+    for at, n in (TRIM_DISCARD, TRIM_ZERO): want[at:at + n] = bytes(n)
+    with image.open('rb') as f:
+        f.seek(PARTS['table'][2][0] * SECTOR); return f.read(2 * MiB) == bytes(want)
 
 
 def last_stop(stderr):
@@ -484,7 +554,7 @@ def run_case(args, case):
                     'backend_errors': [l for l in stderr.splitlines() if l.startswith('virtio-block: ')],
                     'changed': after != before, 'fsck': fsck(args.e2fsck, image, ext4_offsets(base), launch_dir / 'fsck'),
                     'table': table_bytes(image, total) == table,
-                    'exact': image.read_bytes() == limit_image() if base == 'host-limit' and phase == 'write' else None}
+                    'exact': image.read_bytes() == limit_image() if base == 'host-limit' and phase == 'write' else trim_exact(image) if base == 'trim' and phase == 'write' else None}
             errors = judge(base, phase, text, host, expect, args.transport == 'pci')
             entry = {'phase': phase, 'seconds': round(seconds, 1), 'disk_before': before, 'disk_after': after, **host, 'errors': errors}
             if base == 'host-full' and volume and phase == 'write':
@@ -545,6 +615,9 @@ def self_check():
         elif case == 'fs-full':
             t += ['COV-FULL dd_rc=1 enospc=1 avail=0 more=enospc sync_rc=0'] if phase == 'write' else []
             t += [f'COV-DATA keep={expect["a"]} after={expect["b"]}']
+        elif case == 'trim':
+            t += ['COV-TRIM fstrim_rc=0 discard_rc=0 zeroout_rc=0 discard_max=2147483648 zeroes_max=2147483648'] if phase == 'write' else []
+            t += [f'COV-DATA a={expect["a"]} b=gone']
         elif case == 'host-full':
             t += ['COV-HOSTFULL dd_rc=1 eio=1 flush_rc=0 ioerr_logs=4'] if phase == 'write' else []
             t += [f'COV-DATA a={expect["a"]}']
