@@ -81,7 +81,7 @@ SECTOR = 512
 LIMIT = 32 * MiB + 2048          # host-limit: RLIMIT_FSIZE
 PATTERN_AT = 32 * MiB            # host-limit: 64 KiB of pattern from here
 APPLETS = ('sh', 'mount', 'umount', 'modprobe', 'cat', 'grep', 'awk', 'dd', 'wc', 'sha256sum', 'dmesg', 'sync',
-           'poweroff', 'reboot', 'sleep', 'mkdir', 'cp', 'rm', 'stty', 'nproc', 'uname', 'mkswap', 'swapon', 'swapoff',
+           'poweroff', 'reboot', 'sleep', 'readlink', 'mkdir', 'cp', 'rm', 'stty', 'nproc', 'uname', 'mkswap', 'swapon', 'swapoff',
            'df', 'tail', 'test', 'ls')
 CASES = ('gpt', 'mbr', 'reboot-acpi', 'reboot-kbd', 'reboot-triple', 'fs-full', 'host-full', 'host-limit', 'trim')
 CONTROLS = ('host-full-control', 'host-limit-control')
@@ -235,7 +235,7 @@ host-limit)
 multidisk)
   hsha() { s=$(dd if=$1 bs=4096 count=1 2>/dev/null | sha256sum) || fail read; echo "${s%% *}"; }
   for d in vda vdb vdc; do wait_dev /dev/$d; done
-  for d in vda vdb vdc; do echo "COV-DISK $d size=$(cat /sys/block/$d/size) serial=$(cat /sys/block/$d/serial) head=$(hsha /dev/$d)"; done
+  for d in vda vdb vdc; do echo "COV-DISK $d size=$(cat /sys/block/$d/size) serial=$(cat /sys/block/$d/serial) head=$(hsha /dev/$d) dev=$(readlink -f /sys/block/$d/device)"; done
   test ! -e /sys/block/vdd && echo "COV-NODISK vdd" || echo "COV-EXTRADISK vdd"
   t0=$(cat /proc/uptime)
   for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do for d in vda vdb vdc; do dd if=/dev/$d of=/dev/null bs=1M count=8 iflag=direct 2>/dev/null || fail read-$d; done; done
@@ -482,9 +482,13 @@ def judge(case, phase, text, host, expect, pci=False):
         require(one(r'^COV-DATA a=(\S+) b=(\S+)$') == (expect['a'], 'gone'), 'file contents differ')
         require(io_errors == 0, 'I/O errors logged')
     elif case == 'multidisk':
-        disks = re.findall(r'^COV-DISK (\S+) size=(\d+) serial=(\S+) head=(\S+)$', text, re.M)
-        require(disks == [(f'vd{n}', str(size // SECTOR), serial, head) for n, (size, serial, head) in zip('abc', host['disks'])],
+        disks = re.findall(r'^COV-DISK (\S+) size=(\d+) serial=(\S+) head=(\S+) dev=(\S+)$', text, re.M)
+        require([d[:4] for d in disks] == [(f'vd{n}', str(size // SECTOR), serial, head) for n, (size, serial, head) in zip('abc', host['disks'])],
                 f'guest disks {disks}, host disks {host["disks"]}')
+        # The transport the file asked for, and (PCI) the slots: 00:01.0, then 04.0, 05.0; (MMIO) the ACPI virtio-mmio node.
+        if host['transport'] == 'pci': want = [rf'/pci0000:00/0000:00:{slot:02x}\.0/virtio\d+$' for slot in (1, 4, 5)]
+        else: want = [r'/LNRO0005:\d+/virtio\d+$'] * 3
+        require(len(disks) == 3 and all(re.search(w, d[4]) for w, d in zip(want, disks)), f'disks are not on {host["transport"]}: {[d[4] for d in disks]}')
         require(one(r'^COV-NODISK vdd$') is not None, 'a fourth disk appeared')
         require(host['written'], 'a disk did not receive its own block (or another one did)')
         require(io_errors == 0, 'I/O errors logged')
@@ -620,7 +624,7 @@ cmdline = {q(cmdline)}
     host = {'rc': process.returncode, 'timeout': timeout, 'stop': last_stop(stderr),
             'backend_errors': [l for l in stderr.splitlines() if l.startswith('virtio-block: ')],
             'changed': True, 'fsck': [], 'table': True, 'exact': None,
-            'disks': facts, 'written': multidisk_written(paths)}
+            'disks': facts, 'transport': disk_t, 'written': multidisk_written(paths)}
     errors = judge('multidisk', 'write', text, host, expected_values(), False)
     speed = re.search(r'^COV-SPEED t0=([\d.]+) t1=([\d.]+)$', text, re.M)
     mibs = round(384 / max(float(speed[2]) - float(speed[1]), 0.01), 1) if speed else None
