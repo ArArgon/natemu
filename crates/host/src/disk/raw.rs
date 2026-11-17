@@ -14,8 +14,11 @@ const SECTOR: u64 = 512;
 /// The host block size: DISCARD and WRITE_ZEROES free whole blocks only.
 const HOLE: u64 = 4096;
 
+const NOT_A_DISK: &str = "disk must be a nonempty regular file with sector-aligned capacity";
+
 /// Open `path` for the checks and the format detection: the file, its first sector and its last. A writable image
-/// takes the exclusive lock, a read-only one a shared lock (see [`image`]).
+/// takes the exclusive lock, a read-only one a shared lock (see [`image`]). The capacity check is the format's (a
+/// qcow2 file's length need not be sector-aligned).
 pub(super) fn inspect(path: &Path, read_only: bool) -> Result<(File, Vec<u8>, Vec<u8>)> {
     let file = OpenOptions::new()
         .read(true)
@@ -24,34 +27,52 @@ pub(super) fn inspect(path: &Path, read_only: bool) -> Result<(File, Vec<u8>, Ve
         .map_err(|e| format!("disk {}: {e}", path.display()))?;
     let info = file.metadata().map_err(|e| e.to_string())?;
     let len = info.len();
-    if !info.is_file() || len == 0 || len % SECTOR != 0 || len > i64::MAX as u64 {
-        return Err("disk must be a nonempty regular file with sector-aligned capacity".into());
+    if !info.is_file() || len < SECTOR || len > i64::MAX as u64 {
+        return Err(NOT_A_DISK.into());
     }
-    // Advisory exclusion among cooperating launches; users must exclude other writers/truncators. Read-only images
-    // share, so launches can share a base or an ISO and a writer is refused while a reader holds it.
-    let locked = if read_only {
-        file.try_lock_shared()
-    } else {
-        file.try_lock()
-    };
-    match locked {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Err("disk lock: held by another process".into()),
-        // A file system without flock (a network share): a reader goes on, a writer is refused.
-        Err(TryLockError::Error(e)) if read_only && unsupported(&e) => {
-            eprintln!(
-                "disk {}: no file locking here; opened read-only without a lock",
-                path.display()
-            );
-        }
-        Err(TryLockError::Error(e)) => return Err(format!("disk lock: {e}")),
-    }
+    lock(&file, path, read_only)?;
     let (mut head, mut tail) = (vec![0; SECTOR as usize], vec![0; SECTOR as usize]);
     file.read_exact_at(&mut head, 0)
         .map_err(|e| format!("disk {}: {e}", path.display()))?;
     file.read_exact_at(&mut tail, len - SECTOR)
         .map_err(|e| format!("disk {}: {e}", path.display()))?;
     Ok((file, head, tail))
+}
+
+/// Advisory exclusion among cooperating launches; users must exclude other writers/truncators. A `shared` lock (a
+/// read-only image or a backing file) lets launches share a base or an ISO, and a writer is refused while a reader
+/// holds it.
+pub(super) fn lock(file: &File, path: &Path, shared: bool) -> Result<()> {
+    let locked = if shared {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    };
+    match locked {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err("disk lock: held by another process".into()),
+        // A file system without flock (a network share): a reader goes on, a writer is refused.
+        Err(TryLockError::Error(e)) if shared && unsupported(&e) => {
+            eprintln!(
+                "disk {}: no file locking here; opened read-only without a lock",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(TryLockError::Error(e)) => Err(format!("disk lock: {e}")),
+    }
+}
+
+/// GET_ID's answer for the file: its device and inode, in hex.
+pub(super) fn id(info: &std::fs::Metadata) -> [u8; 20] {
+    format!(
+        "{:08x}{:012x}",
+        info.dev() as u32,
+        info.ino() & 0xffff_ffff_ffff
+    )
+    .into_bytes()
+    .try_into()
+    .expect("8 + 12 hex digits")
 }
 
 /// An error for "not supported here": macOS answers ENOTSUP (45), which std does not categorise.
@@ -62,14 +83,10 @@ fn unsupported(e: &std::io::Error) -> bool {
 /// The raw image on a file [`inspect`] opened and locked.
 pub(super) fn image(file: File, read_only: bool) -> Result<Image> {
     let info = file.metadata().map_err(|e| e.to_string())?;
-    let id = format!(
-        "{:08x}{:012x}",
-        info.dev() as u32,
-        info.ino() & 0xffff_ffff_ffff
-    )
-    .into_bytes()
-    .try_into()
-    .expect("8 + 12 hex digits");
+    if info.len() % SECTOR != 0 {
+        return Err(NOT_A_DISK.into());
+    }
+    let id = id(&info);
     Ok(Image {
         backend: Box::new(Raw::new(file, read_only)),
         capacity: info.len(),
