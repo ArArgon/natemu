@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import subprocess
 
@@ -144,11 +145,32 @@ def overlay_set(base):
     return ['--set', f'disk.disk0.backing={pathlib.Path(base).resolve()}']
 
 
+def _qemu_img(*args):
+    """Run qemu-img; on failure raise RuntimeError carrying its command and stderr (capture_output otherwise hides the cause)."""
+    p = subprocess.run([need_qemu_img(), *map(str, args)], capture_output=True, text=True)
+    if p.returncode: raise RuntimeError(f'qemu-img {" ".join(map(str, args))} failed (exit {p.returncode}): {p.stderr.strip() or p.stdout.strip()}')
+    return p.stdout
+
+
+def convert_need(src):
+    """Upper bound in bytes of what a sparse raw copy of SRC allocates: the allocated size of every file in its backing chain."""
+    chain = json.loads(_qemu_img('info', '--output=json', '--backing-chain', src))
+    return sum(i.get('actual-size', 0) for i in chain)
+
+
+def raw_shortfall(src, dst):
+    """None when the volume of DST can hold a sparse raw copy of SRC (+1 GiB margin), else the 'not enough free disk space' message."""
+    need, free = convert_need(src), shutil.disk_usage(pathlib.Path(dst).resolve().parent).free
+    if need + (1 << 30) > free:
+        return f'not enough free disk space for the raw copy of {src}: need ~{need / 2**30:.1f} GiB (+1 GiB margin), have {free / 2**30:.1f} GiB'
+
+
 def qcow2_convert(src, dst, fmt, *options, size=None):
-    """qemu-img convert SRC (raw or qcow2) into DST of format FMT ('raw': sparse; 'qcow2': with OPTIONS, e.g. preallocation=metadata)."""
-    cmd = [need_qemu_img(), 'convert', '-O', fmt] + (['-o', ','.join(options)] if options else []) + [str(src), str(dst)]
-    subprocess.run(cmd, check=True, capture_output=True)
-    if size is not None: subprocess.run([need_qemu_img(), 'resize', '-f', fmt] + (['--preallocation=metadata'] if fmt == 'qcow2' else []) + [str(dst), str(size)], check=True, capture_output=True)
+    """qemu-img convert SRC (raw or qcow2) into DST of format FMT ('raw': sparse; 'qcow2': with OPTIONS, e.g. preallocation=metadata).
+    A raw target first checks the volume can hold the data (RuntimeError 'not enough free disk space'); qemu-img's stderr is always reported."""
+    if fmt == 'raw' and (short := raw_shortfall(src, dst)): raise RuntimeError(short)
+    _qemu_img('convert', '-O', fmt, *(['-o', ','.join(options)] if options else []), src, dst)
+    if size is not None: _qemu_img('resize', '-f', fmt, *(['--preallocation=metadata'] if fmt == 'qcow2' else []), dst, size)
 
 
 def qcow2_input(raw, qcow, size=None):
