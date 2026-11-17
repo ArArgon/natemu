@@ -753,6 +753,11 @@ inline bool FlushRuleOf(const FEXCore::IR::IROp_Header* Op, FlushRule& R) {
 // Places the flushes (run at the start of flag elimination, before PlaceFPChecks: the flush ops come before an instruction's first
 // commit, so before its check, and a flushed result's flags are checked). Nothing on a host with AFP, in a block without such an op,
 // or with neither key set; `--daz` and `--ftz` are read only once such an op is found.
+// The `FexcFlush` mode of a DAZ input flush: bit 0 element 0 only; bit 2 (AFP accurate plan, chunk 6b) the exact screen (the JIT skips
+// the flush when no examined lane has a zero exponent field), for a 128-bit or scalar value (a 64-bit vector keeps the plain flush).
+inline uint8_t FlushMode(FEXCore::IR::OpSize Size, bool Scalar) {
+  return (Scalar ? 1 : 0) | (Scalar || Size == FEXCore::IR::OpSize::i128Bit ? 4 : 0);
+}
 template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
   using namespace FEXCore::IR;
   if (!fexc_no_afp) return;
@@ -783,7 +788,7 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
       FlushRule R;
       FlushRuleOf(Op, R);
       IREmit->SetWriteCursorBefore(Node);
-      Ref Flushed = IREmit->_FexcFlush(Op->Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, View.GetNode(Op->Args[0]), R.InScalar ? 1 : 0);
+      Ref Flushed = IREmit->_FexcFlush(Op->Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, View.GetNode(Op->Args[0]), FlushMode(Op->Size, R.InScalar));
       IREmit->ReplaceNodeArgument(Node, 0, Flushed);
     }
   }
@@ -806,7 +811,7 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
         for (size_t j = 0; j < i; ++j) if (Seen[j] == Src) Flushed = Made[j];
         if (!Flushed) {
           const auto Size = View.template GetOp<IROp_Header>(Op->Args[R.In[i]])->Size;
-          Flushed = IREmit->_FexcFlush(Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, Src, R.InScalar ? 1 : 0);
+          Flushed = IREmit->_FexcFlush(Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, Src, FlushMode(Size, R.InScalar));
         }
         IREmit->ReplaceNodeArgument(F.Node, R.In[i], Flushed);
         Seen[i] = Src; Made[i] = Flushed;

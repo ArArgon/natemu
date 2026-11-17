@@ -586,6 +586,9 @@ def literal_exits(d):
 # AFP fallback chunk 3a: the guest forms (hex, assembled from Intel syntax once) whose DAZ/FTZ code the tests below pin.
 FLUSH_IN = ['shl', 'ushr', 'cmeq', 'ushr', 'bic']                       # an operand flushed to a zero of its sign (mask in VTMP1)
 FLUSH_OUT = ['shl', 'ushr', 'cmeq', 'ushr', 'and', 'fmul', 'bic']       # a result flushed, UFC and IXC raised for each lane flushed
+# AFP accurate plan chunk 6b: each DAZ input flush sits behind its exact screen (register copies, `mov`, left out of the lists)
+SCREEN_V = ['dup', 'cmtst', 'uminv', 'fmov', 'add', 'cbz']   # a 128-bit source: all lanes' exponent fields nonzero skips the flush
+SCREEN_S = ['fmov', 'and', 'cbnz']                           # a scalar source: lane 0's exponent field nonzero skips it
 AFP_FP = {   # name -> hex: SSE/AVX floating-point forms of every class of FlushRuleOf (register operands, so each is one block)
     'addps': '0f58ca', 'subpd': '660f5cca', 'mulss': 'f30f59ca', 'divsd': 'f20f5eca', 'sqrtps': '0f51ca', 'minps': '0f5dca', 'maxsd': 'f20f5fca',
     'haddps': 'f20f7cca', 'addsubpd': '660fd0ca', 'dpps': '660f3a40ca ff'.replace(' ', ''), 'cmpltps': '0fc2ca01', 'cmpeqss': 'f30fc2ca00',
@@ -628,21 +631,27 @@ class AfpFlush(unittest.TestCase):
             self.assertFalse({'cmeq'} & set(mn), name)
 
     def test_daz_alone_flushes_every_fp_source_first(self):
-        def before(name_or_hex, op, *extra):   # the instructions before the first `op`
+        def before(name_or_hex, op, *extra):   # the instructions before the first `op`, register copies left out
             mn, _ = self.words(AFP_FP.get(name_or_hex, name_or_hex), *self.AFP0, '--daz', *extra)
-            return mn[:mn.index(op)]
-        self.assertEqual(before('addps', 'fadd'), FLUSH_IN * 2)
-        self.assertEqual(before('0f58c9', 'fadd'), FLUSH_IN)   # addps xmm1, xmm1: one value, flushed once
-        self.assertEqual(before('vfmadd231ps', 'fmla')[:15], FLUSH_IN * 3)
-        self.assertEqual(before('minps', 'fcmgt'), FLUSH_IN * 2)   # row 4 covers MIN/MAX: both sources, then the compare
-        self.assertEqual(before('comiss', 'fcmpe'), FLUSH_IN * 2)
-        self.assertEqual(before('cvtps2dq', 'frint32x'), FLUSH_IN)   # to integer: the source only (the FRINT's integral result is not flushed again)
+            return [m for m in mn[:mn.index(op)] if m != 'mov']
+        V, S = SCREEN_V + FLUSH_IN, SCREEN_S + FLUSH_IN
+        self.assertEqual(before('addps', 'fadd'), V * 2)
+        self.assertEqual(before('0f58c9', 'fadd'), V)   # addps xmm1, xmm1: one value, flushed once
+        self.assertEqual(before('vfmadd231ps', 'fmla')[:3 * len(V)], V * 3)
+        self.assertEqual(before('minps', 'fcmgt'), V * 2)   # row 4 covers MIN/MAX: both sources, then the compare
+        self.assertEqual(before('comiss', 'fcmpe'), S * 2)
+        self.assertEqual(before('mulss', 'fmul')[-len(S):], S)   # a scalar source: lane 0's screen
+        self.assertEqual(before('cvtps2dq', 'frint32x'), V)   # to integer: the source only (the FRINT's integral result is not flushed again)
         self.assertEqual(self.words(AFP_FP['cvtps2dq'], *self.AFP0, '--daz')[0].count('cmeq'), 1)
-        self.assertEqual(before('vcvtps2ph', 'fcvtn')[-5:], FLUSH_IN)   # VCVTPS2PH honours DAZ (the imm8 rounding-mode FPCR switch comes first)
+        self.assertEqual(before('vcvtps2ph', 'fcvtn')[-len(V):], V)   # VCVTPS2PH honours DAZ (the imm8 rounding-mode FPCR switch comes first)
         # DPPS: every FP op's inputs: both factors, the products, the first add level's sums
         mn, _ = self.words(AFP_FP['dpps'], *self.AFP0, '--daz')
         self.assertEqual(mn.count('shl'), 4, mn)
         self.assertEqual(mn.count('faddp'), 2, mn)
+        # the screen's branch only skips forward over the flush's own five words, and no key but DAZ has one
+        for h in ('addps', 'mulss', 'divsd'):
+            self.assertNotIn('uminv', self.words(AFP_FP[h], *self.AFP0, '--ftz')[0], h)
+            self.assertNotIn('uminv', self.words(AFP_FP[h], *self.AFP0)[0], h)
 
     def test_ftz_alone_flushes_the_results_that_x86_flushes_and_raises_ue_and_pe(self):
         def after(name, op, *extra):   # the instructions after the first `op`
@@ -1530,6 +1539,68 @@ class AfpAccurateDe(unittest.TestCase):
             if re.match(r'vfn?m(add|sub)', name):   # (chunk 4: an FMA has the NaN check after it, which also changes register allocation: no comparison;
                 continue                 # fast mode's own code is the replay gate's and AfpAccurateFma's)
             self.assertEqual(unmasked, native_words(form, '--feature', 'afp=0', '--simd-unmasked', '0x2')[1], name)   # DE unmasked: as fast mode
+
+FEXC_BASE = os.environ.get('FEXC_BASE')   # the compiler before AFP accurate chunk 6b (the unscreened DAZ input flush): AfpDazScreen's oracle
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK) and FEXC_BASE and os.access(FEXC_BASE, os.X_OK), 'needs $FEXC and $FEXC_BASE (the compiler before the screen)')
+class AfpDazScreen(unittest.TestCase):
+    """AFP accurate plan, chunk 6b: row 4's DAZ input flush runs behind an exact screen (FexcFlush mode bit 2: skipped when no examined lane has
+    a zero exponent field). Both compilers' code for every FP form of AfpAccurateDe (registers, memory, 256-bit, the upper halves) is run natively
+    on operands that take the screen both ways (every lane normal or inf or NaN: skipped; one denormal or zero lane in any source: falls into
+    the flush; and the random classes) under DAZ alone (fast and accurate) and accurate DAZ + FTZ: every result bit, the memory and FPSR equal
+    to the unscreened code's. $ORACLE_TRIALS trials per form (default 40)."""
+    def words(self, fexc, form, extra):
+        key = (fexc, form, tuple(extra))
+        if key not in _NATIVE:
+            d = json.loads(subprocess.run([fexc, '--profile', 'slice1', '--hex', form, '--rip', hex(RIP), '--feature', 'afp=0', *extra], capture_output=True, text=True, check=True).stdout)
+            lay = d['code']['layout']
+            code = bytes.fromhex(d['code']['hex'])
+            lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal']
+            with tempfile.TemporaryDirectory() as t:
+                dis = check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+            b, e = lay['code_region_begin'], lay['code_region_end']
+            lines = [dis[o].strip() for o in range(b, e, 4)]
+            self.assertEqual(lay['spill_bytes'], 0, (form, extra))
+            _NATIVE[key] = (list(struct.unpack(f'<{(e - b) // 4}I', code[b:e])), lines)
+        return _NATIVE[key]
+
+    def run_one(self, fexc, form, extra, xmm, hi, mem):
+        words, lines = self.words(fexc, form, extra)
+        i = max(k for k, l in enumerate(lines) if l.startswith('svc'))
+        while lines[i - 1].startswith(('mov w0', 'movk w0')): i -= 1
+        words = [0xd51b443f] + words[:i] + [0xd53b4420]
+        buf = bytearray(8192)
+        for n in range(16): buf[0xc0 + 16 * n:0xd0 + 16 * n] = hi[n].to_bytes(16, 'little')
+        buf[AfpAccurateDe.MEM:AfpAccurateDe.MEM + 64] = mem.to_bytes(64, 'little')
+        v = [0] * 32
+        for n in range(16): v[16 + n] = xmm[n]
+        x, v, b = native_run(words, v=v, buf=bytes(buf), ptrs=[(6, AfpAccurateDe.MEM)], fpcr=0)
+        return x[0], v[16:], b
+
+    def test_the_screen_changes_no_result_and_no_flag(self):
+        trials = int(os.environ.get('ORACLE_TRIALS', 40))
+        rnd = random.Random(61)
+        gen = AfpAccurateDe(); n = skipped = 0
+        for name, form, e, _ in AfpAccurateDe.FORMS:
+            if e == 2: e = 4
+            for extra in (['--daz'], ['--accurate', '--daz'], ['--accurate', '--daz', '--ftz']):
+                if name.startswith('vcvtph2ps'): continue   # (no FP source: no flush)
+                for t in range(trials):
+                    xmm, hi, mem = gen.make(rnd, e, (0, 1, 2, 2)[t % 4])
+                    a = self.run_one(FEXC_BASE, form, extra, xmm, hi, mem)
+                    b = self.run_one(FEXC, form, extra, xmm, hi, mem)
+                    self.assertEqual(a[0], b[0], (name, extra, t, 'FPSR'))
+                    self.assertEqual((a[1], a[2]), (b[1], b[2]), (name, extra, t, [hex(q) for q in xmm[:4]], hex(mem)))
+                    n += 1
+        self.assertGreater(n, 3000)
+
+    def test_keys_without_daz_and_fast_daz_ftz_are_unchanged(self):
+        for name, form, e, _ in AfpAccurateDe.FORMS:
+            for extra in ([], ['--accurate'], ['--ftz'], ['--accurate', '--ftz'], ['--daz', '--ftz'], ['--simd-unmasked', '0x2'], ['--accurate', '--simd-unmasked', '0x3f'],
+                          ['--simd-unmasked', '0x20', '--ftz']):
+                self.assertEqual(self.words(FEXC, form, extra), self.words(FEXC_BASE, form, extra), (name, extra))
+
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class AfpAccurateFma(unittest.TestCase):
