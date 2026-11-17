@@ -10,7 +10,8 @@
 //! [`Transport::isr`]'s atomic under the state lock. With MSI-X enabled a used-buffer interrupt sends the queue's
 //! vector and a configuration change the configuration vector ([`Transport::trigger`]); with MSI-X disabled the
 //! device's GSI is an INTx line asserted while the ISR is nonzero and the command register's Interrupt Disable is
-//! clear (virtio 1.2 4.1.4.5; PCI 3.0 6.2.2, 6.8.3.3).
+//! clear (virtio 1.2 4.1.4.5; PCI 3.0 6.2.2, 6.8.3.3). Functions may share the line: it is a wired-OR in the chipset
+//! (`Irqs::wired`, one bit per slot), so this function's level is its own part of the line.
 //!
 //! Lock order: virtio state, then this configuration space, then MSI-X, then the chipset. The line's level is decided
 //! and driven only under the configuration-space lock, from the ISR atomic and the configuration space: a state-path
@@ -140,6 +141,8 @@ pub(super) struct Transport {
     bus_master: Arc<AtomicBool>,
     irqs: Irqs,
     gsi: usize,
+    /// This function's bit on its shared INTx line (1 << slot): PCI functions may share a line (`Irqs::wired`).
+    wire: u32,
 }
 impl Transport {
     /// Under the state lock: the ISR is now `isr`; drive the INTx line if it changed.
@@ -155,7 +158,7 @@ impl Transport {
         let level = self.isr.load(SeqCst) != 0
             && config.command() & INTX_DISABLE == 0
             && !lock(&self.msix).enabled();
-        self.irqs.line(self.gsi, level);
+        self.irqs.wired(self.gsi, self.wire, level);
     }
     /// Under the state lock: interrupts for the queues in `queues` (bit n: queue n) and, with `config`, a
     /// configuration change. MSI-X sends each distinct vector once, or marks it pending while masked or without bus
@@ -314,6 +317,7 @@ impl Virtio {
             bus_master,
             irqs: self.irqs.clone(),
             gsi: self.gsi,
+            wire: 1 << slot,
         };
         assert!(
             self.pci.set(transport).is_ok(),
@@ -528,9 +532,12 @@ mod tests {
         sent: Sent,
     }
     fn attach(d: Arc<Virtio>) -> Driver {
+        attach_at(d, 1)
+    }
+    fn attach_at(d: Arc<Virtio>, slot: u8) -> Driver {
         let sent = Sent::default();
         let log = sent.clone();
-        let f = d.pci_with(1, Arc::new(move |a, v| log.lock().unwrap().push((a, v))));
+        let f = d.pci_with(slot, Arc::new(move |a, v| log.lock().unwrap().push((a, v))));
         Driver { d, f, sent }
     }
     /// Entry i's message: physical destination i, vector 0x40 + i.
@@ -1259,6 +1266,38 @@ mod tests {
         assert!(!rig.level());
         rig.msix(false, false);
         assert!(rig.level(), "disabling re-evaluates the line from the ISR");
+    }
+    /// Two functions on one INTx line (slots 3 and 4, as a placement shares them): the line is the OR of the two; one
+    /// lowering (ISR read, device reset) while the other is high keeps it asserted; a reset drops the function's part.
+    #[test]
+    fn two_functions_share_one_intx_line() {
+        let a = rig_on_line(3);
+        let b = attach_at(Virtio::rng(a.d.irqs.clone(), a.d.gsi), 4);
+        live_over_pci(&b, false);
+        complete(&a.d, 0);
+        complete(&b.d, 0);
+        assert!(a.level());
+        assert_eq!(a.read(ISR, 1), 1);
+        assert!(a.level(), "b still holds the line");
+        complete(&a.d, 0);
+        assert_eq!(b.read(ISR, 1), 1);
+        assert!(a.level(), "a holds it again");
+        a.write(0x14, 1, 0);
+        assert!(!a.level(), "a's reset drops its part; b's was read");
+        complete(&b.d, 0);
+        b.write(0x14, 1, 0);
+        assert!(!a.level(), "b's reset drops its part");
+        // An MSI-X function with a stale ISR asserts the shared line when MSI-X goes off without a reset.
+        live_over_pci(&b, true);
+        complete(&b.d, 0);
+        assert!(!a.level());
+        b.msix(false, false);
+        assert!(a.level(), "the stale ISR bit");
+    }
+    fn rig_on_line(slot: u8) -> Driver {
+        let rig = attach_at(device(), slot);
+        live_over_pci(&rig, false);
+        rig
     }
     #[test]
     fn isr_read_lowers_the_line() {

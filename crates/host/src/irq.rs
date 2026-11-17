@@ -124,6 +124,8 @@ pub(crate) struct Chipset {
     pic: Pic,
     /// Input levels by line (ISA IRQ 0..15, GSI 16..23).
     lines: u32,
+    /// Shared (wired-OR) lines: per line, the sources holding it asserted ([`Irqs::wired`]; PCI INTx, bit = slot).
+    sources: [u32; ioapic::PINS],
     lapics: Lapics,
 }
 impl Chipset {
@@ -197,6 +199,20 @@ impl Chipset {
             _ => pic,
         }
     }
+    /// A wired-OR line: `source`'s (one bit) level on line `irq`; the line is asserted while any source holds it, and
+    /// [`Self::line`] sees only the OR's changes. Under the chipset lock, so two sources' drives cannot reorder.
+    fn wired(&mut self, irq: usize, source: u32, level: bool) -> Delivery {
+        let Some(s) = self.sources.get_mut(irq) else {
+            return Delivery::None;
+        };
+        if level {
+            *s |= source;
+        } else {
+            *s &= !source;
+        }
+        let or = *s != 0;
+        self.line(irq, or)
+    }
 }
 
 /// L4b: what a rising edge on a line did (for the lost-tick policies): some APIC took it into a clear IRR bit, or every
@@ -227,6 +243,11 @@ impl Irqs {
     /// Sets line `irq` (ISA IRQ 0..15, GSI 16..23) to `level` (1 = asserted), from any thread; what a rise did.
     pub fn line(&self, irq: usize, level: bool) -> Delivery {
         self.lock().line(irq, level)
+    }
+    /// A shared level line (PCI INTx): `source` (a distinct bit per source; the PCI slot's) sets its own level on line
+    /// `irq`, whose level is the OR of its sources'. A line is driven either this way or by [`Self::line`], never both.
+    pub fn wired(&self, irq: usize, source: u32, level: bool) -> Delivery {
+        self.lock().wired(irq, source, level)
     }
     /// Line `irq`'s input level (tests).
     #[cfg(test)]
@@ -384,6 +405,7 @@ pub fn install(
         ioapic: Ioapic::new(),
         pic: Pic::new(),
         lines: 0,
+        sources: [0; ioapic::PINS],
         lapics,
     };
     let irqs = Irqs {
@@ -447,6 +469,7 @@ mod tests {
             ioapic: Ioapic::new(),
             pic: Pic::new(),
             lines: 0,
+            sources: [0; ioapic::PINS],
             lapics,
         };
         for (sel, v) in [(0x10 + 2 * 4, 0x41), (0x10 + 2 * 2, 0x42)] {
@@ -491,6 +514,7 @@ mod tests {
                 ioapic: Ioapic::new(),
                 pic: Pic::new(),
                 lines: 0,
+                sources: [0; ioapic::PINS],
                 lapics,
             })),
             live: Arc::default(),
@@ -533,6 +557,43 @@ mod tests {
         let i = irqs(board(&[x | lapic::x2apic_ldr(0), x | lapic::x2apic_ldr(1)]));
         assert!(i.msi(0xFEE0_2004, 0x53));
         assert!(pending(&i, 1, 0x53) && !pending(&i, 0, 0x53));
+    }
+
+    /// A wired-OR line (GSI 16, level-triggered, vector 0x60, to vCPU 0): two sources raise and lower it interleaved; the
+    /// line stays asserted while either holds it, and an EOI with it still high delivers again.
+    #[test]
+    fn a_shared_line_is_the_or_of_its_sources() {
+        let i = irqs(board(&[xapic(0)]));
+        {
+            let mut c = i.lock();
+            let (a, mut w) = c.wires();
+            a.write(0, 4, 0x10 + 2 * 16, &mut w);
+            a.write(0x10, 4, 1 << 15 | 0x60, &mut w);
+            a.write(0, 4, 0x11 + 2 * 16, &mut w);
+            a.write(0x10, 4, 0, &mut w);
+        }
+        let sent = || i.lock().lapics.messages.get();
+        let (a, b) = (1 << 3, 1 << 4);
+        assert_eq!(i.wired(16, a, true), Delivery::Fresh);
+        assert_eq!(i.wired(16, b, true), Delivery::None, "no change: no edge");
+        assert_eq!(i.wired(16, a, false), Delivery::None);
+        assert!(i.level(16), "b still holds it");
+        assert_eq!(sent(), 1);
+        i.eoi(0x60);
+        assert_eq!(sent(), 2, "EOI while still high delivers again");
+        i.wired(16, a, true);
+        i.wired(16, b, false);
+        assert!(i.level(16), "a holds it again");
+        i.wired(16, a, false);
+        assert!(!i.level(16));
+        i.eoi(0x60);
+        assert_eq!(sent(), 2, "EOI with the line low: nothing");
+        i.wired(16, b, true);
+        assert_eq!(sent(), 3);
+        // Lowering a source that never raised changes nothing; a line outside the controller is ignored.
+        i.wired(16, a, false);
+        assert!(i.level(16));
+        assert_eq!(i.wired(24, a, true), Delivery::None);
     }
 
     /// Vectors 0..15 are illegal for a fixed interrupt (SDM 11.5.3): dropped.
