@@ -834,9 +834,6 @@ pub fn to_boot(
     initrd: Option<Vec<u8>>,
 ) -> Res<Boot> {
     let who = cfg.who();
-    if cfg.disks.len() > 1 {
-        return Err(format!("{who}: more than one disk is not built yet"));
-    }
     if cfg.disks.iter().any(|d| d.readonly || d.backing.is_some()) {
         return Err(format!(
             "{who}: read-only disks and backing files are not built yet"
