@@ -6,12 +6,9 @@
 //! a host power loss or macOS crash; the power-off drain ends with F_FULLFSYNC, so a clean shutdown is fully durable.
 use super::profile;
 use super::*;
+pub(super) use crate::disk::DiskBackend as Calls;
+use crate::disk::Image;
 use std::{
-    fs::{File, OpenOptions, TryLockError},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{FileExt, MetadataExt},
-    },
     path::Path,
     sync::mpsc::{self, Receiver, SyncSender},
     thread::JoinHandle,
@@ -21,6 +18,7 @@ use std::{
 /// Feature bits offered (virtio 1.3 §5.2.3).
 const F_SIZE_MAX: u64 = 1 << 1;
 const F_SEG_MAX: u64 = 1 << 2;
+const F_RO: u64 = 1 << 5;
 const F_BLK_SIZE: u64 = 1 << 6;
 pub(super) const F_FLUSH: u64 = 1 << 9;
 const F_DISCARD: u64 = 1 << 13;
@@ -273,7 +271,11 @@ pub(super) struct Disk {
     #[cfg(test)]
     pub call_limit: Mutex<Option<Duration>>,
     /// Taken by the workers when the owner starts.
-    file: Mutex<Option<File>>,
+    backend: Mutex<Option<Box<dyn Calls>>>,
+    /// What the image offers: read-only (no FLUSH, DISCARD or WRITE_ZEROES), DISCARD, WRITE_ZEROES.
+    read_only: bool,
+    discard: bool,
+    write_zeroes: bool,
     /// The request queues ([`Virtio::block_queues`]; 1 unless set before the device is set up).
     queues: std::sync::atomic::AtomicUsize,
     pub capacity: u64,
@@ -281,45 +283,26 @@ pub(super) struct Disk {
     pub id: [u8; ID_BYTES],
 }
 impl Disk {
+    /// A raw read-write image at `path` (tests and the launch code that has only a path).
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| format!("disk {}: {e}", path.display()))?;
-        let info = file.metadata().map_err(|e| e.to_string())?;
-        let len = info.len();
-        if !info.is_file() || len == 0 || len % SECTOR != 0 || len > i64::MAX as u64 {
-            return Err("disk must be a nonempty regular file with sector-aligned capacity".into());
-        }
-        // Advisory exclusion among cooperating launches; users must exclude other writers/truncators.
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err("disk lock: held by another process".into());
-            }
-            Err(TryLockError::Error(e)) => return Err(format!("disk lock: {e}")),
-        }
-        let id = format!(
-            "{:08x}{:012x}",
-            info.dev() as u32,
-            info.ino() & 0xffff_ffff_ffff
-        )
-        .into_bytes()
-        .try_into()
-        .expect("8 + 12 hex digits");
-        Ok(Self {
+        Ok(Self::new(crate::disk::open(path, false, None)?))
+    }
+    pub fn new(image: Image) -> Self {
+        Self {
             #[cfg(feature = "testing")]
             control: Mutex::new(None),
             #[cfg(test)]
             script: Mutex::new(None),
             #[cfg(test)]
             call_limit: Mutex::new(None),
-            file: Mutex::new(Some(file)),
+            backend: Mutex::new(Some(image.backend)),
+            read_only: image.read_only,
+            discard: image.discard,
+            write_zeroes: image.write_zeroes,
             queues: std::sync::atomic::AtomicUsize::new(1),
-            capacity: len,
-            id,
-        })
+            capacity: image.capacity,
+            id: image.id,
+        }
     }
     pub fn queues(&self) -> usize {
         self.queues.load(SeqCst)
@@ -327,9 +310,20 @@ impl Disk {
     pub fn set_queues(&self, count: usize) {
         self.queues.store(count, SeqCst);
     }
-    /// The features offered: [`FEATURES`], and VIRTIO_BLK_F_MQ with more than one request queue.
+    /// The features offered: [`FEATURES`] as the image allows (a read-only one offers F_RO and no FLUSH, DISCARD or
+    /// WRITE_ZEROES), and VIRTIO_BLK_F_MQ with more than one request queue.
     pub fn features(&self) -> u64 {
-        FEATURES | if self.queues() > 1 { F_MQ } else { 0 }
+        let mut f = FEATURES;
+        if self.read_only {
+            f = f & !F_FLUSH | F_RO;
+        }
+        if !self.discard {
+            f &= !F_DISCARD;
+        }
+        if !self.write_zeroes {
+            f &= !F_WRITE_ZEROES;
+        }
+        f | if self.queues() > 1 { F_MQ } else { 0 }
     }
     /// Configuration space: capacity (sectors), size_max, seg_max, geometry (unused), blk_size, topology, writeback
     /// (unused: not offered), num_queues at offset 34 (with more than one request queue; 0 otherwise, VIRTIO_BLK_F_MQ
@@ -362,21 +356,21 @@ impl Disk {
         Ok(pool)
     }
     fn spawn(&self, bell: Arc<Bell>) -> Result<Pool> {
-        let file = self
-            .file
+        let backend = self
+            .backend
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or("disk workers already started")?;
         #[cfg(feature = "testing")]
         if let Some(control) = self.control() {
-            return Pool::spawn(super::testing::Controlled::new(Native(file), control), bell);
+            return Pool::spawn(super::testing::Controlled::new(backend, control), bell);
         }
         #[cfg(test)]
         if let Some(script) = self.script.lock().unwrap_or_else(|e| e.into_inner()).take() {
             return Pool::spawn(Scripted(script), bell);
         }
-        Pool::spawn(Native(file), bell)
+        Pool::spawn(backend, bell)
     }
     #[cfg(feature = "testing")]
     fn control(&self) -> Option<Arc<super::testing::Control>> {
@@ -395,7 +389,7 @@ pub(super) enum Job {
     Write(u64, Vec<u8>, bool),
     /// Sync the file; `true`: a full sync (the power-off drain's), else a plain one (a guest FLUSH's).
     Flush(bool),
-    /// DISCARD (`false`) or WRITE_ZEROES (`true`) these (offset, length) byte ranges ([`punch`]).
+    /// DISCARD (`false`) or WRITE_ZEROES (`true`) these (offset, length) byte ranges (`DiskBackend::discard`, `write_zeroes`).
     Punch(Vec<(u64, u64)>, bool),
 }
 /// A job's result: the bytes read (empty for a write or on error) and the first error.
@@ -593,18 +587,6 @@ fn run(calls: &dyn Calls, shared: &Mutex<Board>, slot: usize, job: Job) -> bool 
     true
 }
 
-/// The workers' native file calls; replaced by scripted calls in tests and test schedules.
-/// Calls run concurrently on one file.
-pub(super) trait Calls: Send + Sync {
-    fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
-    fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize>;
-    /// `full`: to stable storage (F_FULLFSYNC); otherwise to the host OS (fsync).
-    fn sync(&self, full: bool) -> std::io::Result<()>;
-    /// Deallocate whole host blocks (`F_PUNCHHOLE`): they then read as zeros.
-    fn punch(&self, _offset: u64, _len: u64) -> std::io::Result<()> {
-        Err(std::io::ErrorKind::Unsupported.into())
-    }
-}
 /// Host sync failures are sticky for the launch: after any failed sync (a guest FLUSH, a write-through OUT's
 /// sync or the power-off full sync), every later sync fails without a call. The host may have dropped dirty
 /// pages of writes already reported complete, so a later success would claim durability it cannot give. As
@@ -649,71 +631,13 @@ impl<C: Calls> Calls for Sticky<C> {
         failed.0 = result.is_err();
         result
     }
-    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
-        self.calls.punch(offset, len)
+    fn discard(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.calls.discard(offset, len)
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.calls.write_zeroes(offset, len)
     }
 }
-/// One positioned read or write per call (pread/pwrite: a short count is returned as is, EINTR
-/// is an error). A full sync is F_FULLFSYNC (`File::sync_all` on Apple platforms); a plain one is
-/// fsync(2), as QEMU's guest flush: it survives a natemu crash but not a host power loss or macOS
-/// crash (std's `sync_data` is F_FULLFSYNC on Apple platforms too, so fsync is called directly).
-pub(super) struct Native(File);
-impl Calls for Native {
-    fn read(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        self.0.read_at(bytes, offset)
-    }
-    fn write(&self, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
-        self.0.write_at(bytes, offset)
-    }
-    fn sync(&self, full: bool) -> std::io::Result<()> {
-        if full {
-            return self.0.sync_all();
-        }
-        unsafe extern "C" {
-            fn fsync(fd: i32) -> i32;
-        }
-        // As `sync_all`, retry on EINTR.
-        loop {
-            if unsafe { fsync(self.0.as_raw_fd()) } == 0 {
-                return Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-    }
-    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
-        /// `struct fpunchhole` of <sys/fcntl.h>.
-        #[repr(C)]
-        struct Hole {
-            flags: u32,
-            reserved: u32,
-            offset: i64,
-            length: i64,
-        }
-        const F_PUNCHHOLE: i32 = 99;
-        unsafe extern "C" {
-            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-        }
-        let hole = Hole {
-            flags: 0,
-            reserved: 0,
-            offset: offset as i64,
-            length: len as i64,
-        };
-        loop {
-            if unsafe { fcntl(self.0.as_raw_fd(), F_PUNCHHOLE, &hole as *const Hole) } == 0 {
-                return Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-    }
-}
-
 /// Unit tests' scripted native calls.
 #[cfg(test)]
 struct Scripted(Arc<dyn Calls>);
@@ -728,8 +652,11 @@ impl Calls for Scripted {
     fn sync(&self, full: bool) -> std::io::Result<()> {
         self.0.sync(full)
     }
-    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
-        self.0.punch(offset, len)
+    fn discard(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.0.discard(offset, len)
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.0.write_zeroes(offset, len)
     }
 }
 
@@ -749,7 +676,9 @@ fn execute(native: &(impl Calls + ?Sized), job: Job) -> Done {
         Job::Punch(ranges, zero) => {
             let error = ranges
                 .into_iter()
-                .find_map(|(offset, len)| punch(native, offset, len, zero).err())
+                .find_map(|(offset, len)| {
+                    if zero { native.write_zeroes(offset, len) } else { native.discard(offset, len) }.err()
+                })
                 .map(|e| e.to_string());
             return Done {
                 data: Vec::new(),
@@ -785,43 +714,6 @@ fn execute(native: &(impl Calls + ?Sized), job: Job) -> Done {
         data.clear();
     }
     Done { data, error }
-}
-
-/// DISCARD (`zero` false): the range's whole host blocks become holes; partial blocks stay as they are, and a file
-/// system without holes is no error (a discard is a hint). WRITE_ZEROES: the whole blocks become holes and the partial
-/// ones at the ends are written with zeros; without holes the whole range is written with zeros.
-/// ponytail: a zeroed range without host holes is one synchronous write of up to 2 GiB, inside the call limit only on
-/// a fast disk; split it into jobs if a host file system without holes matters.
-fn punch(native: &(impl Calls + ?Sized), offset: u64, len: u64, zero: bool) -> std::io::Result<()> {
-    let end = offset + len;
-    let (first, last) = (offset.next_multiple_of(HOLE), end / HOLE * HOLE);
-    let holed = first < last
-        && match native.punch(first, last - first) {
-            Ok(()) => true,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported) || e.raw_os_error() == Some(45) => false,
-            Err(e) => return Err(e),
-        };
-    if !zero {
-        return Ok(());
-    }
-    if holed {
-        zeros(native, offset, first)?;
-        zeros(native, last, end)
-    } else {
-        zeros(native, offset, end)
-    }
-}
-/// Writes zeros over [`from`, `to`).
-fn zeros(native: &(impl Calls + ?Sized), mut from: u64, to: u64) -> std::io::Result<()> {
-    const CHUNK: [u8; 1 << 16] = [0; 1 << 16];
-    while from < to {
-        let n = (to - from).min(CHUNK.len() as u64) as usize;
-        match native.write(&CHUNK[..n], from)? {
-            0 => return Err(std::io::Error::other("native disk call made zero progress")),
-            w => from += w.min(n) as u64,
-        }
-    }
-    Ok(())
 }
 
 /// A guest-physical byte range.
@@ -1184,6 +1076,8 @@ fn start(streams: &Streams, bytes: Vec<u8>, disk: &Disk, features: u64) -> Start
     };
     match command {
         Command::Read(offset, len) => Start::Call(Job::Read(offset, len)),
+        // Not offered on a read-only image: a driver that writes anyway gets an I/O error.
+        Command::Write(..) | Command::Punch(..) if disk.read_only => Start::Answer(Reply::without_data(S_IOERR)),
         Command::Write(offset, bytes, stable) => Start::Call(Job::Write(offset, bytes, stable)),
         Command::Flush => Start::Call(Job::Flush(false)),
         Command::Punch(ranges, zero) => Start::Call(Job::Punch(ranges, zero)),
@@ -2215,23 +2109,6 @@ mod tests {
         );
     }
     #[test]
-    fn native_plain_and_full_syncs_succeed_on_a_file() {
-        let path = std::env::temp_dir().join(format!("natemu-sync-test-{}", std::process::id()));
-        let native = Native(
-            File::options()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap(),
-        );
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(native.write(&[0xa5; 512], 0).unwrap(), 512);
-        native.sync(false).unwrap();
-        native.sync(true).unwrap();
-    }
-    #[test]
     fn discard_and_write_zeroes_decode_their_segments() {
         let path = std::env::temp_dir().join(format!("natemu-discard-decode-{}", std::process::id()));
         std::fs::write(&path, vec![0; 1 << 20]).unwrap();
@@ -2272,27 +2149,33 @@ mod tests {
         assert_eq!(status(&s, b, FEATURES), S_IOERR);
     }
     #[test]
-    fn punched_ranges_read_as_zeros_and_free_whole_blocks() {
-        use std::os::unix::fs::MetadataExt;
-        let path = std::env::temp_dir().join(format!("natemu-punch-test-{}", std::process::id()));
-        let file = File::options().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
-        let native = Native(file.try_clone().unwrap());
-        assert_eq!(native.write(&[0xa5; 1 << 16], 0).unwrap(), 1 << 16);
-        native.sync(false).unwrap();
-        let blocks = || file.metadata().unwrap().blocks();
-        let before = blocks();
-        // WRITE_ZEROES over unaligned ends: zeros exactly there, the whole blocks inside become holes.
-        assert!(execute(&native, Job::Punch(vec![(1000, 20000)], true)).error.is_none());
-        // DISCARD: whole blocks only; the partial block at its start keeps its bytes.
-        assert!(execute(&native, Job::Punch(vec![(40000, 16384)], false)).error.is_none());
-        native.sync(false).unwrap();
-        let mut data = vec![0; 1 << 16];
-        assert_eq!(native.read(&mut data, 0).unwrap(), 1 << 16);
+    fn a_read_only_image_offers_no_flush_discard_or_write_zeroes_and_refuses_writes() {
+        let path = std::env::temp_dir().join(format!("natemu-ro-device-{}", std::process::id()));
+        std::fs::write(&path, vec![0; 1 << 16]).unwrap();
+        let rw = Disk::open(&path).unwrap();
+        assert_eq!(rw.features() & (F_RO | F_FLUSH | F_DISCARD | F_WRITE_ZEROES), F_FLUSH | F_DISCARD | F_WRITE_ZEROES);
+        drop(rw);
+        let disk = Disk::new(crate::disk::open(&path, true, None).unwrap());
         std::fs::remove_file(&path).unwrap();
-        let zero = |r: std::ops::Range<usize>| data[r].iter().all(|&b| b == 0);
-        let kept = |r: std::ops::Range<usize>| data[r].iter().all(|&b| b == 0xa5);
-        assert!(kept(0..1000) && zero(1000..21000) && kept(21000..40960) && zero(40960..53248) && kept(53248..65536));
-        assert!(blocks() < before, "no host blocks freed: {} -> {}", before, blocks());
+        assert_eq!(disk.features() & (F_RO | F_FLUSH | F_DISCARD | F_WRITE_ZEROES), F_RO);
+        let on = disk.features();
+        let (s, b) = (Streams::new(&[desc(0, 528, false), desc(900, 1, true)]).unwrap(), {
+            let mut b = header(T_OUT, 0);
+            b.extend([1; 512]);
+            b
+        });
+        assert!(matches!(start(&s, b, &disk, on), Start::Answer(Reply { status: [S_IOERR], .. })));
+        let s = Streams::new(&[desc(0, 16, false), desc(900, 1, true)]).unwrap();
+        assert!(matches!(start(&s, header(T_FLUSH, 0), &disk, on), Start::Answer(Reply { status: [S_UNSUPP], .. })));
+        let mut b = header(T_DISCARD, 0);
+        b.extend([0; 16]);
+        let s = Streams::new(&[desc(0, 32, false), desc(900, 1, true)]).unwrap();
+        assert!(matches!(start(&s, b, &disk, on), Start::Answer(Reply { status: [S_UNSUPP], .. })));
+        // Forced past the offer, a discard is still an I/O error.
+        let mut b = header(T_DISCARD, 0);
+        b.extend([0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+        let s = Streams::new(&[desc(0, 32, false), desc(900, 1, true)]).unwrap();
+        assert!(matches!(start(&s, b, &disk, FEATURES), Start::Answer(Reply { status: [S_IOERR], .. })));
     }
     #[test]
     fn decoded_out_payload_moves_into_its_job() {
@@ -2882,6 +2765,7 @@ mod tests {
 pub(in crate::virtio) mod owner_tests {
     use super::*;
     use crate::execution::io::tests as io;
+    use std::fs::File;
     use std::sync::{
         Condvar,
         atomic::{AtomicU16, AtomicUsize, fence},
