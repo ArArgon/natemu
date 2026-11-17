@@ -1029,7 +1029,8 @@ memory accesses and unknown opcodes.
   cases exact (AFP fallback plan rows 2-10, known-zero upper bits, unmasked UE tininess, x87 masked DE for m32/m64, x87 NaN
   results). What it leaves different from x86 is the registry `tools/fp_deviations.py` `CLASSES` (masked SSE DE, NaN results,
   the masked FMA inf×0+QNaN IE flag, the masked UE flag in the MIN_NORMAL band, the DAZ+FTZ band result, the FTZ-alone band result); the README lists the
-  same names. Accurate mode (planned, `docs/restructure/afp-accurate-plan.md`) removes them.
+  same names. Accurate mode (`--fp accurate`, `docs/restructure/afp-accurate-plan.md`; contracts 67 and 68) removes every one of them
+  (`FIXED_BY` in the registry); fast mode keeps them, because the fast-mode gate failed for UFE and IOE (chunk 6).
 - On a host with AFP the generated code for the default mode is unchanged by any of this (byte-identical replay of both
   recorded streams), and every FP runner and corpus is judged exactly.
 - The startup line `natemu: fp: fast mode, degraded (host lacks FEAT_AFP)` names the condition.
@@ -1058,7 +1059,8 @@ memory accesses and unknown opcodes.
   abi `accurate_mode_keys_bit_32_only_without_afp`, probe `accurate_mode_names_itself_on_every_host`, `tools/fexc/test_serve.py` (the
   accurate-mode sequence), the replay identity gate.
 - Grid: every compiler change; every runner in both modes.
-- Observable today: the startup `fp:` line; the driver's `fp` field. Accurate mode's behaviour itself comes with chunks 2-5.
+- Observable today: the startup `fp:` line; the driver's `fp` field; accurate mode's exactness (contract 68). FP traps are a required host
+  feature of accurate mode (owner, Nov 16).
 - Kind: design (`docs/restructure/afp-accurate-plan.md`).
 
 **68. A trapped FP exception is handled in the resident by performing its one Arm word there (from a fixed instruction table; a step re-run only for kept classes); what is patched depends on the mode, never on ESR.**
@@ -1078,6 +1080,11 @@ memory accesses and unknown opcodes.
   `Shared::fp_rerun.active` is the per-vCPU marker that tells that step from a watchpoint step; the trap enables and the guest's FPSR are restored
   when the step returns and when it is abandoned (`finish` calls `fp_cancel` before the frame is copied); MDE is untouched;
   `Control::fp_traps`/`fp_steps` count apart from `debug_steps` (`fp_steps` only for the fallback).
+- Under accurate DAZ + FTZ (FZ = 0 with UFE) the handler flushes every tiny result lane to a zero of its sign (UFC) and also any result lane
+  that is a denormal, whatever the tininess model said (`patch_ufc`, `FLUSH_ALL`). The JIT relies on it: the DAZ input flush is behind an exact
+  exponent screen (`FexcFlush` mode bit 2) and is not placed for a source that is the result of an add, subtract, multiply, divide, square root,
+  pairwise add or FMA earlier in the block (`FlushedResultOf`). Pinned by `AfpDazFree` (including
+  `test_every_producer_word_is_in_the_flushing_class`, with abi `producer_words_are_all_in_the_flushing_class`) and `AfpDazScreen`.
 - UFC is patched per lane by the tininess model, x86's masked underflow (tiny after rounding and inexact). Chunk 4 (IOE) also decides, by the
   mode (`FPCR_IOE` in the trapped FPCR), the NaN lanes of the re-run by FPCR.AH = 1's rules (the first NaN among the operands, quieted; the negative
   default NaN for an invalid operation) and an FMA's IOC (none for infinity times zero beside a QNaN addend): `fptrap::patch`'s `nan`.
