@@ -25,7 +25,8 @@ Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock
 NATEMU_RAM and other environment variables pass through to every step (the 4 MiB suite: NATEMU_RAM=0x400000).
 Steps after phase 1 get NATEMU_VM_LOCK_HELD=1: the suite already holds the VM lock for them (shared or exclusive), so a step
 that would take it itself must not (another flock from a step blocks on a serial step's exclusive lock forever).
-Writes DIR/results.txt (step, phase, result, exit code, seconds, log; one line per step as it ends) and DIR/logs/;
+Writes DIR/results.txt (step, phase, result, exit code, seconds, log; one line per step as it ends; a step whose tool is missing
+(qemu-img) gets a `SKIP` line and shows in the summary as `N/M passed, K skipped`, M not counting it) and DIR/logs/;
 a passing step's output and temporary directories are deleted, a failing step's kept. Exit status 1 on any failure.
 Steps `*-m2f`/`*-m2a` run FP runners emulating a host without FEAT_AFP (NATEMU_FEXC_FEATURE_OFF=afp), fast / accurate (NATEMU_FP=accurate).
 --only/--skip take comma-separated step names or fnmatch patterns (`k1-*`, `faults@*`); `release` always runs."""
@@ -52,6 +53,8 @@ SERIAL_WHY = {
     'l4a-stress': 'failed twice in the parallel phase, never alone: a vCPU stopped by the guest watchdog (random 0-255 us '
                   'delays between line changes)',
     'k1-c4': 'each run killed after 300 s: link-full at 4 vCPUs, block size 1, exceeded it in the parallel phase at -j 6 (par k1 steps now take one slot per vCPU and a 450 s kill: oversubscribed P cores were the cause)',
+    'io-coverage-sharedintx': 'a few minutes of 8 to 29 disks on shared INTx lines (pci=nomsi) at 4 vCPUs: a stale interrupt status or a lost line shows as a guest hang, '
+                              'so it needs vCPUs truly concurrent and the machine not loaded',
     'boot-smoke': 'Ctrl-C must end the stub within 5 s; boots under a 120 s timeout',
     'vector-split-smp': 'three vCPUs exercise split-lock ownership and vector completion concurrently',
     'virtio-lifecycle-timed': 'held-call schedules released or timed out at 3 s, the 50 ms windowless drain deadline (code-page: none '
@@ -94,6 +97,7 @@ class Step:
     est: int = 5          # seconds in the parallel phase (November 5, -j 4): it starts the longest first
     w: int = 1            # processes the step runs at once (its own --parallel/--jobs)
     judge: object = None  # judge(out dir) -> (ok, note) when the step exits 1
+    skip: str = ''        # why the step cannot run here (a missing tool): not run, shown as a SKIP line and counted apart
     core: str = 'P'       # P, or E: started on the efficiency cores (only E_OK steps, only by the scheduler)
 
 
@@ -122,15 +126,17 @@ def deviated_note(log):
 
 def steps(F, O):
     S, cargo = [], ['cargo', '+1.97.0']
-    def add(name, argv, phase=None, est=5, w=1, judge=None):
-        S.append(Step(name, [str(x) for x in argv], phase or ('ser' if name in SERIAL_WHY else 'par'), est, w, judge))
+    def add(name, argv, phase=None, est=5, w=1, judge=None, skip=''):
+        S.append(Step(name, [str(x) for x in argv], phase or ('ser' if name in SERIAL_WHY else 'par'), est, w, judge, skip=skip))
     def vm(name, script, *args, **kw): add(name, ['python3', f'tools/{script}', *args, '--fexc', F, '--out', O / 'out' / name], **kw)
     def s3(name, *args, **kw): vm(name, 'run_slice3_vm.py', *args, **kw)
     def shards(n, name, script, *args, est, **kw):    # n steps `name@I`, each one `--shard I/N` of the runner (tools/shard.py)
         for i in range(1, n + 1): vm(f'{name}@{i}', script, *args, '--shard', f'{i}/{n}', est=-(-est // n), **kw)
     add('build', cargo + ['build', '--offline', '--locked'], 'pre')
-    add('cargo-test', cargo + ['test', '--offline', '--locked'], 'pre')
-    add('cargo-test-fexc', ['env', f'FEXC={F}'] + cargo + ['test', '--offline', '--locked'], 'pre')
+    # With qemu-img installed the host qcow2 tests must run their qemu-img checks, not skip them (the tests fail without it).
+    rq = ['NATEMU_REQUIRE_QEMU_IMG=1'] if io_common.qemu_img() else []
+    add('cargo-test', ['env', *rq] + cargo + ['test', '--offline', '--locked'], 'pre', est=330)
+    add('cargo-test-fexc', ['env', f'FEXC={F}', *rq] + cargo + ['test', '--offline', '--locked'], 'pre', est=330)
     add('runtime', cargo + ['build', '--offline', '--locked', '--release', '-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], 'pre')
     for l in ('l1', 'l2', 'l2-iasl'): add(l, ['python3', f"tools/run_{l.replace('-', '_')}.py", '--out', O / 'out' / l], 'pre')   # their cargo builds re-link the host unsigned: before `release`
     # What the runners' own build() calls make and sign, last: NATEMU_PREBUILT=1 makes later build() calls use them.
@@ -237,10 +243,15 @@ def steps(F, O):
                    '--cases', *(c for c in lc.CASES if not c.startswith('publish-') and (c in lc.TIMED) == timed)], est=5)
     vm('io-coverage', 'run_io_coverage.py', est=90)
     vm('io-coverage-pci', 'run_io_coverage.py', '--transport', 'pci', est=90)    # the same cases through virtio-PCI (MSI-X)
-    # qcow2 disks (the gpt and trim guests on a preallocated qcow2, host side checked with qemu-img): needs qemu-img; without it the
-    # step is left out and the skip is printed here (stderr), since the suite has no skipped state.
-    if io_common.qemu_img(): vm('io-coverage-qcow2', 'run_io_coverage.py', '--cases', 'qcow2', 'qcow2-trim', est=60)
-    else: print('run_suite: io-coverage-qcow2 SKIPPED: qemu-img is not installed (brew install qemu); the qcow2 I/O coverage is NOT part of this run', file=sys.stderr, flush=True)
+    # qcow2 disks (the gpt and trim guests on a preallocated qcow2; the gpt guest on an overlay over a raw base; host side checked
+    # with qemu-img): need qemu-img. Without it the steps are SKIPPED: a SKIP line in results.txt and a count in the summary.
+    nq = '' if io_common.qemu_img() else 'qemu-img is not installed (brew install qemu); this qcow2 coverage is NOT part of this run'
+    vm('io-coverage-qcow2', 'run_io_coverage.py', '--cases', 'qcow2', 'qcow2-trim', est=60, skip=nq)
+    vm('io-coverage-overlay', 'run_io_coverage.py', '--cases', 'overlay', est=60, skip=nq)
+    # Several disks (MMIO and PCI orders), read-only disks (also two VMs on one ISO), and PCI functions sharing INTx lines.
+    vm('io-coverage-multidisk', 'run_io_coverage.py', '--cases', 'multidisk', est=60)
+    vm('io-coverage-readonly', 'run_io_coverage.py', '--cases', 'readonly', est=60, w=2)
+    vm('io-coverage-sharedintx', 'run_io_coverage.py', '--cases', 'sharedintx', est=240, w=4)
     # Network: stock Linux on user-mode NAT (DHCP, HTTP to the host, iperf3, a reset under traffic, cancel); no internet.
     add('net-linux', ['python3', 'tools/run_net_linux.py', 'run', '--offline', '--fexc', F, '--out', O / 'out' / 'net-linux'], est=35)
     add('net-linux-pci', ['python3', 'tools/run_net_linux.py', 'run', '--offline', '--transport', 'pci', '--fexc', F, '--out', O / 'out' / 'net-linux-pci'], est=80)   # waits for net-linux's host ports
@@ -369,11 +380,16 @@ def main():
     todo = [s for s in steps(a.fexc, a.out) if s.name == 'release' or ((a.only is None or match(s.name, a.only)) and not match(s.name, a.skip)
                                                                        and (not a.quick or match(s.name, QUICK)))]
     if a.list:
-        for s in todo: print(f"{s.name:<18} {s.phase:<4} {'x' + str(s.w) if s.w > 1 else '  '} {SERIAL_WHY.get(s.name, '')}")
+        for s in todo: print(f"{s.name:<18} {s.phase:<4} {'x' + str(s.w) if s.w > 1 else '  '} {'SKIPPED (' + s.skip + ') ' if s.skip else ''}{SERIAL_WHY.get(s.name, '')}")
         return
     if not a.fexc.is_file(): sys.exit(f'no compiler at {a.fexc}')
+    skipped = [s for s in todo if s.skip]       # not run: shown as SKIP lines and counted apart from passed and failed
+    todo = [s for s in todo if not s.skip]
     suite, t0 = Suite(a), time.monotonic()
     suite.results.write(f'# {datetime.datetime.now():%Y-%m-%d %H:%M:%S} fexc {a.fexc} -j {a.j} -e {a.e}' + (' --quick' if a.quick else '') + '\n')
+    for s in skipped:
+        line = f"{s.name:<18} {s.phase:<4} SKIP {s.skip}"
+        suite.results.write(line + '\n'); print(line, flush=True)
     phase_s = {}
     try:
         suite.flock(fcntl.LOCK_SH)
@@ -396,7 +412,7 @@ def main():
         suite.failed.extend(n for n in missing if n not in suite.failed)
         print('Missing results: ' + ', '.join(missing), flush=True)
     summary = f"# wall {time.monotonic() - t0:.0f}s ({', '.join(f'{k} {v:.0f}s' for k, v in phase_s.items())}); " \
-              f"{len(todo) - len(suite.failed)}/{len(todo)} passed" + (f"; FAILED: {' '.join(suite.failed)}" if suite.failed else '')
+              f"{len(todo) - len(suite.failed)}/{len(todo)} passed" + (f", {len(skipped)} skipped" if skipped else '') + (f"; FAILED: {' '.join(suite.failed)}" if suite.failed else '')
     by = {s.name: s for s in todo}      # a step far over its estimate (an E step: over est * E_SLOW) would start too late: report it
     drift = [f'{n} {t:.0f}s (est {by[n].est})' for n, t in sorted(suite.times.items(), key=lambda x: -x[1])
              if t > 60 and t > 2 * by[n].est * (E_SLOW if by[n].core == 'E' else 1) and n != 'k1-c4'][:12]
