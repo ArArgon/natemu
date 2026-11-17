@@ -520,7 +520,8 @@ def run(args):
                'artifacts': {str(p): digest(p) for p in (args.natemu, args.runtime, args.fexc, Path(__file__))}, 'inputs': inputs})
     results = []
     with VM_LOCK.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)    # correctness only: shared with other correctness runs (tools/vmlock.py)
+        if not os.environ.get('NATEMU_VM_LOCK_HELD'):   # run_suite holds it for its steps (a serial step's exclusive lock would block this)
+            fcntl.flock(lock, fcntl.LOCK_SH)    # correctness only: shared with other correctness runs (tools/vmlock.py)
         for case in args.cases:
             results.append(run_case(args, case)); write_json(args.out / 'results.json', results)
             print(f"{case}: {'PASS' if results[-1]['pass'] else 'FAIL'}", flush=True)

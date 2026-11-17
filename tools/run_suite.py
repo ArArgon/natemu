@@ -23,6 +23,8 @@ a failed one is rerun once alone and both results recorded (the rerun's decides)
 Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock and each serial step an exclusive one
 (benchmarks take it exclusively with `/usr/bin/lockf -k`), and a serial step also waits until no other VM process runs.
 NATEMU_RAM and other environment variables pass through to every step (the 4 MiB suite: NATEMU_RAM=0x400000).
+Steps after phase 1 get NATEMU_VM_LOCK_HELD=1: the suite already holds the VM lock for them (shared or exclusive), so a step
+that would take it itself must not (another flock from a step blocks on a serial step's exclusive lock forever).
 Writes DIR/results.txt (step, phase, result, exit code, seconds, log; one line per step as it ends) and DIR/logs/;
 a passing step's output and temporary directories are deleted, a failing step's kept. Exit status 1 on any failure.
 Steps `*-m2f`/`*-m2a` run FP runners emulating a host without FEAT_AFP (NATEMU_FEXC_FEATURE_OFF=afp), fast / accurate (NATEMU_FP=accurate).
@@ -263,7 +265,7 @@ class Suite:
     def run(self, s, tag=''):
         log, tmp = self.O / 'logs' / f'{s.name}{tag}.log', self.O / 'tmp' / s.name
         tmp.mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ, NATEMU_RAW_ROOT=str(RAW), TMPDIR=f'{tmp}/', **({} if s.phase == 'pre' else {'NATEMU_PREBUILT': '1'}))
+        env = dict(os.environ, NATEMU_RAW_ROOT=str(RAW), TMPDIR=f'{tmp}/', **({} if s.phase == 'pre' else {'NATEMU_PREBUILT': '1', 'NATEMU_VM_LOCK_HELD': '1'}))
         t = time.monotonic()
         with open(log, 'w') as f:
             argv = ['taskpolicy', '-c', 'background', *s.argv] if s.core == 'E' else s.argv
