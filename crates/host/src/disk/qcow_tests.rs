@@ -896,7 +896,7 @@ fn relative_backing_names_resolve_against_the_referring_image_and_missing_ones_a
 }
 
 #[test]
-fn the_config_named_base_format_is_its_extension_or_its_magic() {
+fn the_config_named_base_is_parsed_as_detected_and_an_extension_must_agree() {
     let dir = Dir::new("format");
     let (raw_base, q_base, vmdk) = (
         dir.at("base.raw"),
@@ -916,18 +916,45 @@ fn the_config_named_base_format_is_its_extension_or_its_magic() {
         read(&*open(&top, true, Some(&q_base)).unwrap().backend, 0, 4096),
         vec![8; 4096]
     );
-    // The extension wins over the magic: "raw" shows the qcow2 file's bytes.
-    let as_raw = dir.at("as-raw.qcow2");
-    create(
-        &as_raw,
-        1 << 20,
-        16,
-        Some((q_base.to_str().unwrap(), Some("raw"))),
-    );
-    assert_eq!(
-        &read(&*open(&as_raw, true, Some(&q_base)).unwrap().backend, 0, 4)[..],
-        b"QFI\xfb"
-    );
+    // The extension must agree with what the base is: all four combinations.
+    for (base, said, ok) in [
+        (&raw_base, "raw", true),
+        (&q_base, "qcow2", true),
+        (&raw_base, "qcow2", false),
+        (&q_base, "raw", false),
+    ] {
+        let over = dir.at(&format!(
+            "says-{said}-{}.qcow2",
+            base.extension().unwrap().to_str().unwrap()
+        ));
+        create(
+            &over,
+            1 << 20,
+            16,
+            Some((base.to_str().unwrap(), Some(said))),
+        );
+        let result = open(&over, true, Some(base));
+        if ok {
+            assert!(
+                result.is_ok(),
+                "{said} over {}: {:?}",
+                base.display(),
+                result.err()
+            );
+        } else {
+            let e = result.err().expect("refused");
+            let looks = if said == "raw" { "qcow2" } else { "raw" };
+            let name = over.file_name().unwrap().to_str().unwrap();
+            assert!(
+                e.contains(&format!(
+                    "{name} says its base {} is {said} but it looks like {looks}",
+                    base.display()
+                )) && e.contains(&format!("qemu-img rebase -u -F {looks}"))
+                    && !e.contains('\n'),
+                "{e}"
+            );
+        }
+    }
     // Another container's magic is refused.
     let mut bytes = vec![0; 1 << 16];
     bytes[..4].copy_from_slice(b"KDMV");
