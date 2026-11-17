@@ -158,6 +158,15 @@ def simd_cases():
     # DAZ: a denormal source is zero, no DE whatever DM (10.2.3.4).
     out.append(one('daz-de-unmasked', 'addss xmm1, xmm2', {1: lanes(ONE), 2: lanes(DEN)}, (MX | 0x40) & ~(DE << 7), 0, None, 1))
     out.append(one('daz-ze-unmasked', 'divss xmm1, xmm2', {1: lanes(ONE), 2: lanes(DEN)}, (MX | 0x40) & ~(ZE << 7), ZE, 19, 1))
+    # The in-block skip of the DE screen (AFP accurate plan, accurate mode without AFP): an operand that is the result of an earlier FP op of the
+    # block is not screened, but with DE unmasked every operand is tested as ever: the exact difference of two doubles is a denormal (a tiny
+    # result: the resident's trap handler writes it), and the next instruction that computes on it faults (#XM, DE alone), after a
+    # producer in between too.
+    min64 = 0x0010000000000000
+    tiny = {1: (min64 + 1, 0), 2: (min64, 0)}
+    out.append(one('de-unmasked-inblock-tiny-consumer', 'addsd xmm1, xmm1', tiny, MX & ~(DE << 7), DE, 19, None, prelude=['subsd xmm1, xmm2']))
+    out.append(one('de-unmasked-inblock-tiny-producer-between', 'mulsd xmm1, xmm1', tiny, MX & ~(DE << 7), DE, 19, None,
+                   prelude=['subsd xmm1, xmm2', 'addsd xmm5, xmm5']))
     # A YMM form: both halves checked before either is written.
     out.append(one('vaddps-ymm-pe', 'vaddps ymm1, ymm1, ymm2', {1: lanes(ONE, ONE, ONE, ONE), 2: lanes(ONE, ONE, ONE, ONE)}, MX & ~(PE << 7), PE, 19, 1,
                    prelude=['vbroadcastss ymm2, dword ptr [rdi + 0x80]', 'vbroadcastss ymm1, dword ptr [rdi + 0x84]'],

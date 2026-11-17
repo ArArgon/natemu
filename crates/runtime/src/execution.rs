@@ -3470,6 +3470,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     object::kind::SIMD => brk(5),
                     object::kind::X87 => brk(7),
                     object::kind::PENDING => brk(8),
+                    object::kind::DENORM => brk(9),
                     // S4: a watchpoint (EC 0x34, from EL0) at an access site: FAR names a watched byte, not necessarily the access's.
                     _ if esr >> 26 == 0x34 => !matches!(site.kind, object::kind::OTHER),
                     _ => {
@@ -3520,10 +3521,24 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             object::kind::SIMD | object::kind::X87 | object::kind::PENDING => {
                 fp_exception(s, f, b, &site, spsr)
             }
+            object::kind::DENORM => denormal_exit(s, f, b, &site),
             object::kind::SPLIT => split(s, f, b, all, &site, spsr),
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }
+}
+
+/// The in-block DE screen skip's check (`DENORM` stub): the FP trap handler ([`fp::trap`]) wrote a result that may be a denormal since the
+/// last check, and the code that follows skipped the screens of operands it took for such results. The pending byte is cleared and the vCPU
+/// leaves the block at the instruction the stub precedes (the bank holds the state before it, as at any site; the instructions before it
+/// completed): the dispatcher's next block screens every operand of that instruction as a block-entry value.
+#[inline(never)]
+fn denormal_exit(mut s: State, f: &NativeFrame, b: &Block, site: &Site) -> ! {
+    // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
+    unsafe { (FRAME_VA as *mut u8).add(frame::DE_PENDING as usize).write_volatile(0) };
+    bank_at(&mut s, f, b, site);
+    completed(&mut s);
+    unsafe { dispatch(&mut s) }
 }
 
 /// I5c: a floating-point exception check stub (the state before its instruction is at the stub, as at an access site):

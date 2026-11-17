@@ -2097,7 +2097,7 @@ impl Verifier<'_> {
         use object::kind::*;
         for i in 0..self.c.stubs.len() {
             let (st, c) = (self.c.stubs[i], self.checks[i]);
-            if !matches!(st.kind, SIMD | X87 | PENDING) {
+            if !matches!(st.kind, SIMD | X87 | PENDING | DENORM) {
                 continue;
             }
             let at = st.native_offset;
@@ -2152,6 +2152,15 @@ impl Verifier<'_> {
                         return fail();
                     }
                     c.start - if plain { 12 } else { 20 }
+                }
+                DENORM => {
+                    // The in-block DE screen skip's check: `ldrb w0, [x28, #DE_PENDING]; cbnz w0, stub`, before its instruction's first floating-point
+                    // op (the state at the stub is the state before the instruction; the resident exits to the dispatcher there).
+                    let ok = c.cond == Some(CBNZ_W) && c.start == c.end && words(1).is_some_and(|w| w[0] == ldr_state(1, 0, frame::DE_PENDING));
+                    if !ok {
+                        return fail();
+                    }
+                    c.start - 4
                 }
                 X87 => {
                     // Row 8: with DE unmasked and no AFP, `and w1, wD, #0x80; orr w0, w0, w1` follow the pending byte's load (the stack
@@ -2729,6 +2738,72 @@ mod tests {
             .expect("the screen's cbz w0");
         let retargeted = word(skip) & !(0x7_ffff << 5) | ((mrs as i64 + 1 - skip as i64) as u32 & 0x7_ffff) << 5;
         refused((&object, &hex), 4 * skip as u32, word(skip), retargeted, "floating-point stub");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// The in-block skip of the masked DE screen (accurate mode without AFP): with `FEXC` set, a block whose later instruction computes on an
+    /// earlier instruction's result has the `DENORM` check (`ldrb w0, [x28, #DE_PENDING]; cbnz w0, stub; brk #9`) and is admitted under every
+    /// key; fast mode, DAZ, FTZ and DE unmasked have none; a check that reads another byte, or whose stub is reached by another branch, is refused.
+    #[test]
+    fn the_denormal_check_is_admitted() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        // subsd, addsd, mulsd (scalar chain); addps, mulps, subps (packed); addsd, movaps, mulsd (a copy); addss, addpd (sizes differ: no skip)
+        let chains = ["f20f5ccaf20f58c9f20f59c9", "0f58ca0f59c90f5cc9", "f20f58caf20f28d9f20f59d9", "f30f58ca660f58c9"];
+        let dir = std::env::temp_dir().join(format!("natemu-denorm-admit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (object, json) = (dir.join("o"), dir.join("j"));
+        let compile = |hex: &str, args: &[&str]| -> Vec<u8> {
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", hex, "--rip", "0x1000", "--profile", "slice1"])
+                .args(args)
+                .arg("--object")
+                .arg(&object)
+                .arg("--out")
+                .arg(&json)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex} {args:?}");
+            let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+            assert_eq!(report["code"]["layout"]["spill_bytes"], 0, "{hex} {args:?}: a spill");
+            std::fs::read(&object).unwrap()
+        };
+        let denorm_sites = |object: &[u8]| -> usize {
+            let h: Header = super::super::record(object, 0);
+            (0..h.sites_count as usize)
+                .filter(|&i| super::super::record::<Site>(object, h.sites_offset as usize + i * std::mem::size_of::<Site>()).kind == natemu_abi::code_object::kind::DENORM)
+                .count()
+        };
+        let mut seen = 0;
+        for hex in chains {
+            let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+            for afp in [&["--feature", "afp=0"][..], &["--feature", "afp=0", "--accurate"], &[]] {
+                for unmasked in ["0x0", "0x1", "0x2", "0x10", "0x3f"] {
+                    for keys in [&[][..], &["--ftz"], &["--daz"], &["--daz", "--ftz"]] {
+                        if afp.is_empty() && keys.contains(&"--daz") {
+                            continue;
+                        }
+                        let args = [afp, &["--simd-unmasked", unmasked][..], keys].concat();
+                        let object = compile(hex, &args);
+                        admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {args:?}: {e}"));
+                        let accurate_skip = afp.contains(&"--accurate") && keys.is_empty() && matches!(unmasked, "0x0" | "0x1" | "0x10");
+                        if !accurate_skip {
+                            assert_eq!(denorm_sites(&object), 0, "{hex} {args:?}: a denormal check outside accurate mode with DE masked and no DAZ or FTZ");
+                        }
+                        seen += denorm_sites(&object);
+                    }
+                }
+            }
+        }
+        assert!(seen >= 6, "{seen} denormal checks");
+        // The check's byte: another x28 field (the x87 PE byte) is no denormal check: refused.
+        let hex = [0xf2, 0x0f, 0x5c, 0xca, 0xf2, 0x0f, 0x58, 0xc9];
+        let object = compile("f20f5ccaf20f58c9", &["--feature", "afp=0", "--accurate"]);
+        let h: Header = super::super::record(&object, 0);
+        let word = |i: usize| u32::from_le_bytes(object[h.code_offset as usize + 4 * i..][..4].try_into().unwrap());
+        let words = (object.len() - h.code_offset as usize) / 4;
+        let check = (0..words).find(|&i| word(i) == ldr_state(1, 0, frame::DE_PENDING)).expect("the check's ldrb");
+        refused((&object, &hex), 4 * check as u32, word(check), ldr_state(1, 0, frame::X87_PE), "floating-point stub");
         std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

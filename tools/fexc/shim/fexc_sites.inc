@@ -271,7 +271,7 @@ void Arm64JITCore::FexcHoistPlan() {
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     for (auto [Node, IROp] : IR->GetCode(BlockNode)) {
       switch (IROp->Op) {
-      case IR::OP_FEXCSIMDSKIP: ++Count[IROp->C<IR::IROp_FexcSimdSkip>()->Mode >> 9 & 1]; continue;
+      case IR::OP_FEXCSIMDSKIP: if (!(IROp->C<IR::IROp_FexcSimdSkip>()->Mode >> 10 & 1)) ++Count[IROp->C<IR::IROp_FexcSimdSkip>()->Mode >> 9 & 1]; continue;
       case IR::OP_SYSCALL: case IR::OP_THUNK: case IR::OP_CPUID: case IR::OP_XGETBV: case IR::OP_PROCESSORID: case IR::OP_RDRAND:
       case IR::OP_CALLBACKRETURN: case IR::OP_PRINT: case IR::OP_PRINTMSG: case IR::OP_MONOBACKPATCHERWRITE:
       case IR::OP_THREADREMOVECODEENTRY: case IR::OP_FEXCX87SVC: return;
@@ -302,8 +302,13 @@ void Arm64JITCore::FexcHoistEmit() {
 }
 DEF_OP(FexcSimdSkip) {
   FexcSpanOpen = false;
-  if (SpillSlots) return;   // a fill inside the span would be skipped with it: the exact test always runs
   const auto Op = IROp->C<IR::IROp_FexcSimdSkip>();
+  if (Op->Mode >> 10 & 1) {   // the in-block skip's check (before an instruction whose screens the skip dropped): no span; exits to the dispatcher
+    ldrb(TMP1.W(), STATE, FEXC_DE_PENDING);   // when the resident's FP trap handler wrote a result that may be a denormal since the last check
+    cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, FexcStub(FEXC_SITE_DENORM, false));
+    return;
+  }
+  if (SpillSlots) return;   // a fill inside the span would be skipped with it: the exact test always runs
   const uint32_t N = Op->Mode & 255;
   const bool Scalar = Op->Mode >> 8 & 1, Dbl = Op->Mode >> 9 & 1;
   const auto Sz = Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
@@ -997,7 +1002,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -1016,7 +1021,7 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
   S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
-            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : "guard";
+            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : "guard";
   const size_t Index = fexc_sites.size();
   fexc_sites.push_back(S);
   if (Link) FexcPendingLink.push_back(Index);
@@ -1155,7 +1160,7 @@ void Arm64JITCore::FexcEmitStubs() {
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     const uint8_t K = fexc_sites[Index].kind;
     brk(K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
-        K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : FexcBrkGuard);
+        K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : K == FEXC_SITE_DENORM ? FexcBrkDenorm : FexcBrkGuard);
   }
 }
 

@@ -48,6 +48,8 @@ enum FexcSiteKind : uint8_t {
                                             // operands unaltered (width: the instruction's length; w0: its check word)
   FEXC_SITE_PENDING = 17,                   // slice1 stub (I5c): a waiting x87, WAIT or MMX instruction with an x87 exception pending (#MF)
   FEXC_SITE_FMA = 18,                       // slice1 (AFP accurate plan, chunk 4): the NaN check of a fused multiply-add, in the body (FexcFmaCheck)
+  FEXC_SITE_DENORM = 19,                    // slice1 stub (in-block DE screen skip): the resident's FP trap handler left a denormal result since the
+                                            // last check; exit to the dispatcher at this instruction (no access, no address, the state before it)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
 struct FexcSiteInfo {
@@ -261,6 +263,9 @@ inline std::vector<std::pair<uint32_t, uint8_t>> FexcKeepList;
 // flag order: the MXCSR flags SIMD-checked instructions raised since the last resident entry (folded there into MXCSR), and the
 // flags the x87 ops of the current x87 instruction raised so far (folded into the x87 exception word at its end).
 constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
+// FEX's X87FLAG_OE_LOC byte (no FEX code uses it): set by the resident's FP trap handler when it writes a result that may be a denormal
+// (DAZ and FTZ clear), cleared by the resident at a DENORM stub; the in-block DE screen skip's check reads it (`frame::DE_PENDING`).
+constexpr uint32_t FEXC_DE_PENDING = 0x3f0 + 35;
 // Recorded by the allowlist (I5c): guest RIP of each waiting x87 instruction, WAIT/FWAIT and MMX instruction (it delivers a
 // pending x87 exception, #MF, before it runs: SDM Vol.1 8.7.1), of each FST/FSTP m32/m64 (an unmasked OE/UE stores nothing)
 // and each x87 instruction's length (the resident resumes after one whose unmasked exception left its operands unaltered).
