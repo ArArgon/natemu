@@ -2845,6 +2845,8 @@ fn report(
             code_breaks: control.code_breaks,
             watch_hits: control.watch_hits,
             watchpoints: control.watchpoints,
+            fp_traps: control.fp_traps,
+            fp_steps: control.fp_steps,
             mailbox: [
                 s.mailbox,
                 s.mailbox_wakes,
@@ -2995,6 +2997,9 @@ struct CpuStats {
     code_breaks: u64,
     watch_hits: u64,
     watchpoints: u64,
+    /// AFP accurate plan chunk 3: trapped FP exceptions handled, and the software steps that re-ran their words.
+    fp_traps: u64,
+    fp_steps: u64,
     /// Address, wakes, acknowledged (guest TSC ns) and the mark's us.
     mailbox: [u64; 4],
     decode_exits: u64,
@@ -3465,6 +3470,8 @@ mod json_tests {
                 code_breaks: next(),
                 watch_hits: next(),
                 watchpoints: next(),
+                fp_traps: next(),
+                fp_steps: next(),
                 mailbox: [next(), next(), next(), next()],
                 decode_exits: next(),
                 decodes,
@@ -3608,7 +3615,7 @@ mod json_tests {
         });
         let _ = write!(
             out,
-            "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"debug_steps\":{},\"debug_traps\":{},\"code_breaks\":{},\"watch_hits\":{},\"watchpoints\":{},\"mailbox\":[{},{},{},{}],\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
+            "],\"stats\":{{\"blocks\":{},\"l2_hits\":{},\"requests\":{},\"distinct\":{},\"host_requests\":{},\"flushes\":{},\"compiles\":{},\"compile_max_us\":{},\"steps\":{},\"shootdowns\":{},\"stops\":{},\"systems\":{},\"invalidations\":{},\"retries\":{},\"upgrades\":{},\"evictions\":{},\"shadow_resets\":{},\"splits\":{},\"linker\":{},\"links\":{},\"unlinks\":{},\"stale_links\":{},\"full_links\":{},\"link_points\":{},\"linked\":{},\"dispatch_exits\":{},\"interrupts\":{},\"nmis\":{},\"halts\":{},\"shadow_steps\":{},\"debug_steps\":{},\"debug_traps\":{},\"code_breaks\":{},\"watch_hits\":{},\"watchpoints\":{},\"fp_traps\":{},\"fp_steps\":{},\"mailbox\":[{},{},{},{}],\"decode_exits\":{},\"decodes\":{{{}}},\"entropy_exits\":{},\"k1\":{}}},\"fault\":[{}],\"native\":[{}],\"frame_intact\":{},\"tampered\":{},\"links_check\":\"{}\",\"block_rips\":[{}]{}}}",
             s.blocks,
             s.l2_hits,
             s.requests,
@@ -3644,6 +3651,8 @@ mod json_tests {
             s.code_breaks,
             s.watch_hits,
             s.watchpoints,
+            s.fp_traps,
+            s.fp_steps,
             s.mailbox[0],
             s.mailbox[1],
             s.mailbox[2],

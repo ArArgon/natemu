@@ -88,6 +88,13 @@ def cases(a, report):
         # (lea 7 bytes, mov dr0 3, mov eax 5, mov dr7 3: RIP + 14 is the fourth NOP, at 0x100015)
         'xbp-len01': (code('lea rax, [rip + 14]\nmov dr0, rax\n' + dr7(0x40001) + 'nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop'), 'guest_fault', [1, 0, 0, 0x100015]),
     }
+    # AFP accurate chunk 3 (plan section 3, R4-1): an FP trap in the step block while a data watchpoint is armed. Under TF the MULSS runs alone
+    # (the step block); in accurate mode without AFP (`NATEMU_FP=accurate NATEMU_FEXC_FEATURE_OFF=afp`) 3 * 2^-149 * 0.5 is a tiny, inexact
+    # result, so UFE traps and the resident re-runs the word under its own software step while DR0 stays armed (on an address nothing
+    # touches). The single-step #DB must follow the MULSS exactly as without the trap; in every other mode the case is the plain TF one.
+    fp_setup = 'mov eax, 3\nmovd xmm1, eax\nmov eax, 0x3f000000\nmovd xmm2, eax\nmov rax, 0x3e8000\nmov dr0, rax\n' + dr7(0xd0001)
+    fp_tf = fp_setup + tf_on + 'mulss xmm1, xmm2\nnop'
+    table['fp-trap-in-step-block-with-watchpoint'] = (code(fp_tf), 'guest_fault', [1, 0, 0, before_nop(fp_tf)])
     for name, (hexcode, stop, fault) in table.items():
         for block in (None, 1):
             rc, out, err = s3.driver(a.host, a.runtime, a.fexc, base + f'code {hexcode}\n', a.out / 'cases' / f'{name}-{block}', [block] if block else [], timeout=120)

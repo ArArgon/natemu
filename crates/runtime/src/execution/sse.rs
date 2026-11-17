@@ -9,7 +9,8 @@
 //! flag, DE included, comes from FPSR (`mxcsr_flags`: IDC is DE unless DAZ). Unmasked SIMD exceptions (I5c): blocks made
 //! under an MXCSR with a mask clear (part of `Cpu::code_context`) check each floating-point instruction's flags before it
 //! commits anything; a hit reaches [`exception`] (#XM, or #UD without OSXMMEXCPT), a pass moves its flags into the SIMD flag
-//! byte (banked here). FP trap enables stay clear: FPCR is built from MXCSR without them.
+//! byte (banked here). FP trap enables (AFP accurate plan chunk 3): UFE only in accurate mode without AFP wherever FZ = 0 ([`fpcr_run`]), handled by `fp`;
+//! otherwise FPCR is built from MXCSR without them.
 use super::segments::{Exception, address, linear};
 use super::*;
 
@@ -20,7 +21,7 @@ pub(super) fn fill(f: &mut NativeFrame, c: &Cpu) {
     for (q, x) in f.q[XMM_VREG..].iter_mut().zip(&c.xmm) {
         *q = (u128::from(x[0]) | u128::from(x[1]) << 64).to_le_bytes();
     }
-    f.fpcr = fpcr(c.mxcsr, c.no_afp != 0);
+    f.fpcr = fpcr_run(c.mxcsr, c.no_afp != 0, accurate_key(c.accurate_fp, c.no_afp) != 0);
     f.fpsr = 0;
 }
 /// XMM from v16..v31 and the exception flags FPSR accumulated since the entry into the bank, with (I5c) those checked
