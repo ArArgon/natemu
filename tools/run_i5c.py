@@ -394,6 +394,52 @@ def simd_cases():
     packed('daz-ftz-dpps-denormal-product', 'dpps xmm1, xmm2, 0xf1', {1: lanes(f70, ONE, ONE, ONE), 2: lanes(f70, ONE, ONE, ONE)}, DF, UE | PE, None, res=(0x40400000, 0))
     packed('daz-ftz-dpps-denormal-input', 'dpps xmm1, xmm2, 0xf1', {1: lanes(DEN, ONE, ONE, ONE), 2: lanes(ONE, ONE, ONE, ONE)}, DF, 0, None, res=(0x40400000, 0))
     packed('daz-ftz-dpps-denormal-sum', 'dpps xmm1, xmm2, 0x31', {1: lanes(0x00c00000, 0x80800000, 0, 0), 2: lanes(ONE, ONE, 0, 0)}, DF, UE | PE, None, res=zz)
+    # DAZ dedupe (accurate mode without AFP: one input flush per distinct value, the flushed copy feeds FP consumers only): a denormal is a zero
+    # to every multiply, and the guest's own register or memory keeps its bits. Run under DAZ + FTZ and under DAZ alone; every product is by 1.0, so a
+    # source that was not flushed would show (the denormal itself under DAZ alone, UE and PE under DAZ + FTZ). 1 is the smallest denormal of
+    # a double (and of a float); `d1` and `f1` are 1.0.
+    d1, d1f = f64(1.0), f32(1.0)
+    DEN2 = 0x40000000   # a double denormal (2^-1043) whose low float is 2.0 and whose high float is zero: a double flush changes it, a float flush does not
+    def dedupe(name, lines, x, res, mem=None, finals=(), rax=None, flags=0, mxs=(MX | 0x40,)):
+        for tag, start in (('daz-ftz', DF), ('daz', MX | 0x40)):
+            def check(vm, res=res, rax=rax):
+                p = [f'xmm{n} {xmm_of(vm, n)[0]:#x} {xmm_of(vm, n)[1]:#x}, want {w[0]:#x} {w[1]:#x}' for n, w in res.items() if xmm_of(vm, n) != w]
+                if rax is not None and int(vm['gpr'][0], 0) != rax: p.append(f"rax {vm['gpr'][0]}, want {rax:#x}")
+                return p
+            out.append(case(f'dedupe-{tag}-{name}', lines, ['sse 1', f'mxcsr {start:#x}', f'gpr-rbx 0x7fffffff'] + regs(x) + ([f'memory {D + 0x280:#x} {mem.hex()}'] if mem else []),
+                            None, check=check, mx=mxc(flags or start, start)))
+    Z = (0, 0)
+    # the reviewer's two cases: a scalar screen does not cover a later packed read; the flushed copy is never written back
+    dedupe('scalar-then-packed', ['mulsd xmm1, xmm0', 'mulpd xmm2, xmm0'], {0: (1, 1), 1: (d1, 5), 2: (d1, d1)}, {1: (0, 5), 2: Z, 0: (1, 1)})
+    dedupe('packed-then-scalar', ['mulpd xmm2, xmm0', 'mulsd xmm1, xmm0'], {0: (1, 1), 1: (d1, 5), 2: (d1, d1)}, {1: (0, 5), 2: Z, 0: (1, 1)})
+    dedupe('flushed-copy-not-written-back', ['mulsd xmm1, xmm0', 'movq rax, xmm0', 'movq xmm3, xmm0'], {0: (1, 7), 1: (d1, 0)}, {1: Z, 0: (1, 7), 3: (1, 0)}, rax=1)
+    # a value read twice in one instruction, and by later instructions
+    dedupe('same-instruction', ['mulsd xmm0, xmm0'], {0: (1, 7)}, {0: (0, 7)})
+    dedupe('across-instructions', ['mulsd xmm1, xmm0', 'mulsd xmm2, xmm0', 'addsd xmm3, xmm0'], {0: (1, 7), 1: (d1, 0), 2: (d1, 0), 3: (d1, 0)}, {1: Z, 2: Z, 3: (d1, 0), 0: (1, 7)})
+    # a copy, then reads of both: the same value
+    dedupe('copy', ['movaps xmm4, xmm0', 'mulsd xmm1, xmm0', 'mulsd xmm2, xmm4', 'mulsd xmm3, xmm0'], {0: (1, 7), 1: (d1, 0), 2: (d1, 0), 3: (d1, 0)},
+           {1: Z, 2: Z, 3: Z, 0: (1, 7), 4: (1, 7)})
+    # an intervening write of the register: the later read is another value (a full store, a merge, an arithmetic result)
+    dedupe('write-between-movaps', ['mulsd xmm1, xmm0', 'movaps xmm0, xmm5', 'mulsd xmm2, xmm0'], {0: (1, 7), 1: (d1, 0), 2: (d1, 0), 5: (d1, 9)}, {1: Z, 2: (d1, 0), 0: (d1, 9)})
+    dedupe('write-between-movsd', ['mulsd xmm1, xmm0', 'movsd xmm0, xmm5', 'mulsd xmm2, xmm0'], {0: (1, 7), 1: (d1, 0), 2: (d1, 0), 5: (d1, 9)}, {1: Z, 2: (d1, 0), 0: (d1, 7)})
+    dedupe('write-between-arith', ['mulsd xmm1, xmm0', 'addsd xmm0, xmm5', 'mulsd xmm2, xmm0'], {0: (1, 7), 1: (d1, 0), 2: (d1, 0), 5: (d1, 9)}, {1: Z, 2: (d1, 0), 0: (d1, 7)})
+    dedupe('write-between-movq', ['mulsd xmm1, xmm0', 'movq xmm0, xmm5', 'mulsd xmm2, xmm0'], {0: (1, 7), 1: (d1, 0), 2: (d1, 0), 5: (d1, 9)}, {1: Z, 2: (d1, 0), 0: (d1, 0)})
+    # packed against scalar, and against another element size (the same bits are a different set of values)
+    dedupe('float-then-double', ['mulss xmm1, xmm0', 'mulsd xmm2, xmm0'], {0: (DEN2, 0), 1: (d1f, 0), 2: (d1, 0)}, {1: (DEN2, 0), 2: Z, 0: (DEN2, 0)})
+    dedupe('double-then-float', ['mulsd xmm2, xmm0', 'mulss xmm1, xmm0'], {0: (DEN2, 0), 1: (d1f, 0), 2: (d1, 0)}, {1: (DEN2, 0), 2: Z, 0: (DEN2, 0)})
+    dedupe('packed-float-then-double', ['mulps xmm1, xmm0', 'mulpd xmm2, xmm0'], {0: (DEN2, DEN2), 1: (d1f | d1f << 32, d1f | d1f << 32), 2: (d1, d1)},
+           {1: (DEN2, DEN2), 2: Z, 0: (DEN2, DEN2)})
+    # the same address loaded twice: memory can change between the loads, each is screened
+    dedupe('load-twice', ['mulsd xmm1, qword ptr [rdi + 0x80]', 'mulsd xmm2, qword ptr [rdi + 0x80]'], {1: (d1, 0), 2: (d1, 0)}, {1: Z, 2: Z}, mem=struct.pack('<Q', 1))
+    dedupe('load-changed-between', ['mulsd xmm1, qword ptr [rdi + 0x80]', 'mov rax, 1', 'mov qword ptr [rdi + 0x80], rax', 'mulsd xmm2, qword ptr [rdi + 0x80]'],
+           {1: (d1, 0), 2: (d1, 0)}, {1: (d1, 0), 2: Z}, mem=struct.pack('<Q', d1), rax=1)
+    # LDMXCSR switches DAZ between two reads of one value: each read follows the mode in force (the DE of the read with DAZ clear)
+    for tag, first, second, finals in (('off-on', 0x1f80, DF, ((1, 0), Z)), ('on-off', DF, 0x1f80, (Z, (1, 0)))):
+        out.append(case(f'dedupe-ldmxcsr-{tag}', ['ldmxcsr dword ptr [rdi + 0x80]', 'mulsd xmm1, xmm0', 'ldmxcsr dword ptr [rdi + 0x84]', 'mulsd xmm2, xmm0', 'mulsd xmm3, xmm0'],
+                        ['sse 1', f'mxcsr {first:#x}', f'xmm 0 0x1 0x7', f'xmm 1 {d1:#x} 0', f'xmm 2 {d1:#x} 0', f'xmm 3 {d1:#x} 0',
+                         f'memory {D + 0x280:#x} {struct.pack("<II", first, second).hex()}'], None,
+                        check=lambda vm, finals=finals: [f'xmm{n} {xmm_of(vm, n)[0]:#x}, want {w[0]:#x}' for n, w in zip((1, 2, 3), (finals[0], finals[1], finals[1])) if xmm_of(vm, n) != w],
+                        mx=mxc(second | DE if second == 0x1f80 else second, first)))
     # VCVTPS2PH ignores FTZ: an exact half denormal keeps its value and raises nothing
     packed('daz-ftz-vcvtps2ph-ignores-ftz', 'vcvtps2ph xmm1, xmm2, 4', {1: lanes(ONE), 2: lanes(f32(2.0 ** -20), ONE, ONE, ONE)}, DF, 0, None, res=(0x3c003c003c000010, 0),
            extra=['xcr0 7'])
@@ -693,7 +739,7 @@ def judge(c, vm, offsets):
     return problems, ('fail' if problems else kind)
 
 
-TAGGED = 21      # the cases tagged `masked-sse-de`: 21 of 417 (update with the case list)
+TAGGED = 22      # the cases tagged `masked-sse-de`: 22 of 512 (update with the case list)
 
 
 def self_check():

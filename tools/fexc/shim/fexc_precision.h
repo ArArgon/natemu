@@ -11,6 +11,7 @@
 #include <initializer_list>
 #include <set>
 #include <map>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -890,8 +891,11 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
   if (!fexc_no_afp) return;
   auto IR = IREmit->ViewIR();
   const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
-  struct Found { Ref Node; uint64_t Rip; };
+  struct Found { Ref Node; uint64_t Rip; Ref Block; };
   std::vector<Found> Ops;
+  // DAZ dedupe (accurate mode): `Canon` names the value a static XMM register load reads (the earlier load or stored value it equals, by the
+  // same last-stored tracking as `Known`: reset per IR block, cleared by side effects, a store of another size or a load of another size is a new value)
+  std::map<Ref, Ref> Canon;
   std::vector<Ref> NegMuls;   // the sign-mask and negating multiplies (IsAddSubMul), not x86 operations
   std::map<Ref, FlushedResult> Produced;   // chunk 6b: results the handler keeps free of denormals (accurate DAZ + FTZ), and loads of them
   uint64_t Rip = ~0ull;
@@ -900,26 +904,38 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
     // block, a store of another size or an op that may write the static registers is unknown)
     FlushedResult InReg[16];
     bool Known[16] = {};
+    struct RegVal { Ref Node = nullptr; uint32_t Size = 0; } Val[16];
     for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
       if (IROp->Op == OP_GUESTOPCODE) { Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset; continue; }
       if (IROp->Op == OP_STOREREGISTER) {
         const PhysicalRegister PR(CodeNode);
         if (PR.AsRegClass() == RegClass::FPRFixed && PR.Reg < 16) {
+          const Ref Arg = IR.GetNode(IROp->Args[0]);
+          const auto C = Canon.find(Arg);
+          Val[PR.Reg] = OpSizeToSize(IROp->Size) == 16 ? RegVal{C != Canon.end() ? C->second : Arg, 16} : RegVal{};
           const auto It = Produced.find(IR.GetNode(IROp->Args[0]));
           Known[PR.Reg] = It != Produced.end() && OpSizeToSize(IROp->Size) == 16;
           if (Known[PR.Reg]) InReg[PR.Reg] = It->second;
         }
         continue;
       }
-      if (HasSideEffects(IROp->Op) && !KeepsStaticFPRs(IROp->Op)) std::fill(std::begin(Known), std::end(Known), false);
+      if (HasSideEffects(IROp->Op) && !KeepsStaticFPRs(IROp->Op)) {
+        std::fill(std::begin(Known), std::end(Known), false);
+        std::fill(std::begin(Val), std::end(Val), RegVal{});
+      }
       if (IROp->Op == OP_LOADREGISTER) {
         const auto* L = IROp->template C<IROp_LoadRegister>();
+        if (L->Class == RegClass::FPR && L->Reg < 16) {
+          const uint32_t Sz = OpSizeToSize(IROp->Size);
+          if (Val[L->Reg].Node && Val[L->Reg].Size == Sz) Canon[CodeNode] = Val[L->Reg].Node;
+          else Val[L->Reg] = {CodeNode, Sz};
+        }
         if (L->Class == RegClass::FPR && L->Reg < 16 && Known[L->Reg]) Produced[CodeNode] = InReg[L->Reg];
         continue;
       }
       FlushRule R;
       if (Rip != ~0ull && !fexc_x87.count(Rip) && IsAddSubMul(IR, IROp)) NegMuls.push_back(CodeNode);
-      else if (Rip != ~0ull && !fexc_x87.count(Rip) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip});
+      else if (Rip != ~0ull && !fexc_x87.count(Rip) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip, BlockNode});
       FlushedResult P;
       if (Rip != ~0ull && !fexc_x87.count(Rip) && !IsAddSubMul(IR, IROp) && FlushedResultOf(IROp, P)) Produced[CodeNode] = P;
     }
@@ -932,6 +948,10 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
   // the product), so a denormal never reaches one and no tiny result or flag comes from it.
   // (chunk 6b) a source that is such a result needs no flush: same element size, and a scalar result only for a scalar use
   const bool Free = Daz && Ftz && fexc_accurate;
+  // DAZ dedupe (accurate mode only; fast mode's words stay as they were): a value flushed by an earlier op of the IR block is flushed
+  // once; later reads of the same value (same canonical register value, element size, scalar or vector, size) take the earlier copy. Exact: under DAZ
+  // the flush is a pure function of the bits and raises no flag; the copy feeds the consuming FP op only, never a store.
+  std::map<std::tuple<Ref, Ref, uint32_t, bool, OpSize>, Ref> Flushes;
   auto NoDenormal = [&](Ref Src, uint32_t Elem, bool Scalar) {
     if (!Free) return false;
     const auto It = Produced.find(Src);
@@ -967,9 +987,16 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
         if (SrcOp == OP_VECTOR_FTOI || SrcOp == OP_VECTOR_FTOISIZED) continue;   // integral values (CVTPS2DQ's FRINT before its FCVTZS): no denormal
         if (NoDenormal(Src, R.InElem, R.InScalar)) continue;   // (chunk 6b) the result of a flushing op: nothing to flush
         for (size_t j = 0; j < i; ++j) if (Seen[j] == Src) Flushed = Made[j];
+        const auto Size = View.template GetOp<IROp_Header>(Op->Args[R.In[i]])->Size;
+        const auto CIt = Canon.find(Src);
+        const auto Key = std::make_tuple(F.Block, CIt != Canon.end() ? CIt->second : Src, R.InElem, R.InScalar, Size);
+        if (!Flushed && fexc_accurate) {
+          const auto It = Flushes.find(Key);
+          if (It != Flushes.end()) Flushed = It->second;
+        }
         if (!Flushed) {
-          const auto Size = View.template GetOp<IROp_Header>(Op->Args[R.In[i]])->Size;
           Flushed = IREmit->_FexcFlush(Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, Src, FlushMode(Size, R.InScalar));
+          if (fexc_accurate) Flushes[Key] = Flushed;
         }
         IREmit->ReplaceNodeArgument(F.Node, R.In[i], Flushed);
         Seen[i] = Src; Made[i] = Flushed;
