@@ -1048,28 +1048,35 @@ memory accesses and unknown opcodes.
   fixes the mode for the process. The host sets `Cpu::accurate_fp` once per vCPU in `execution::run`, beside `Cpu::no_afp`; the
   resident never writes it and every copy of the bank carries it.
 - `Cpu::code_context` bit 32 is accurate mode AND no AFP (`accurate_key`). Block and step requests carry fexc's `--accurate`
-  (and a step `--exact-step`) exactly when it is set, so on a host with AFP, accurate mode changes no context, request, gating
-  value or code. fexc refuses either argument with AFP and resets both per request. The context word is 64 bits wide in the
+  exactly when it is set, so on a host with AFP, accurate mode changes no context, request, gating
+  value or code. fexc refuses the argument with AFP and resets it per request. The context word is 64 bits wide in the
   resident's cache, the template pool's key and the publication tag, so the two modes share no compiled code.
 - The startup line is `natemu: fp: accurate mode` (no degraded note: without AFP the code is exact, with AFP it is unchanged) or
   `natemu: fp: fast mode[, degraded (host lacks FEAT_AFP)]`; the program driver's result reports `fp` (`fast` or `accurate`) and
   `afp`, which the runners judge from (`tools/fp_deviations.py`).
 - Enforced by: the AFP identity unit test (fast and accurate mode, block and step requests), `without_afp_accurate_mode_sets_bit_32_and_the_arguments_exactly_then`,
   abi `accurate_mode_keys_bit_32_only_without_afp`, probe `accurate_mode_names_itself_on_every_host`, `tools/fexc/test_serve.py` (the
-  accurate and exact-step sequence), the replay identity gate.
+  accurate-mode sequence), the replay identity gate.
 - Grid: every compiler change; every runner in both modes.
 - Observable today: the startup `fp:` line; the driver's `fp` field. Accurate mode's behaviour itself comes with chunks 2-5.
 - Kind: design (`docs/restructure/afp-accurate-plan.md`).
 
 **68. A trapped FP exception is handled in the resident by re-running its one Arm word in place; what is patched depends on the mode, never on ESR.**
-- Accurate mode without AFP runs generated code with FPCR.UFE wherever FZ = 0 (`fpcr_run`); x87 never traps (its word is explicit and trap-free).
+- Accurate mode without AFP runs generated code with FPCR.IOE always and UFE wherever FZ = 0 (`fpcr_run`); x87 never traps (its word is explicit and trap-free).
   EC 0x2C from EL0 inside admitted code (or the step block) is classified before any site lookup (`fptrap::classify`); EC 0x2C at EL1 or outside
   admitted code stops `fp_trap`, an Arm word the table does not know stops `fp_word` (never patched wrongly).
 - The word is re-run under a software step with the trap enables and FPSR cleared; `Shared::fp_rerun.active` is the per-vCPU marker that tells
   that step from a watchpoint step; the trap enables and the guest's FPSR are restored when the step returns and when it is abandoned (`finish`
   calls `fp_cancel` before the frame is copied); MDE is untouched; `Control::fp_traps`/`fp_steps` count apart from `debug_steps`.
-- Chunk 3 patches UFC only: per lane, by the tininess model, x86's masked underflow (tiny after rounding and inexact).
-- Enforced by: abi `fptrap` tests (the decode table, per-lane UFC, and the native oracle against the M4's AFP flags), `accurate_mode_without_afp_enables_ufe_where_fz_is_clear`,
+- UFC is patched per lane by the tininess model, x86's masked underflow (tiny after rounding and inexact). Chunk 4 (IOE) also decides, by the
+  mode (`FPCR_IOE` in the trapped FPCR), the NaN lanes of the re-run by FPCR.AH = 1's rules (the first NaN among the operands, quieted; the negative
+  default NaN for an invalid operation) and an FMA's IOC (none for infinity times zero beside a QNaN addend): `fptrap::patch`'s `nan`.
+- The FMA NaN check (chunk 4): in accurate mode without AFP every FMA is followed by `fcmge v1, vResult, #0`, a site of kind FMA (`code_object::kind::FMA`,
+  18; `width` the `tiny::Desc` meta byte, `imm` the registers Rn, Rm and the addend), in the body. A NaN lane traps it; the handler recomputes the NaN
+  lanes of the result from those registers (`fptrap::fma_check`) and resumes after the word (no re-run, no flag). Admission pins the site: the exact
+  word, destination v1 (the JIT's VTMP2), no read of it after, no temporaries as operands, no spill (a block that spills is retried with fewer
+  instructions, as any block); `--exact-step` is gone.
+- Enforced by: abi `fptrap` tests (the decode table, per-lane UFC, and the native oracles against the M4's AFP flags and AH = 1's NaN lanes), `accurate_mode_without_afp_enables_ioe_and_ufe_where_fz_is_clear`, `the_fma_check_code_is_admitted_for_every_fma_form_and_key`, `AfpAccurateFma`,
   the host identity test, `tools/run_s4.py` case `fp-trap-in-step-block-with-watchpoint`, run_i5c's band cases in accurate M2 emulation.
 - Kind: design (`docs/restructure/afp-accurate-plan.md`).
 
