@@ -460,9 +460,46 @@ void Arm64JITCore::FexcFlushWords(ARMEmitter::VRegister Dst, ARMEmitter::VRegist
   }
   bic(Dst.Q(), Src.Q(), VTMP1.Q());
 }
+// AFP accurate plan, chunk 6b: the screen of a DAZ input flush (`$Mode` bit 2): a lane whose exponent field is nonzero is no zero or
+// denormal, so when every examined lane (all of a 128-bit vector, lane 0 of a scalar) is such, the flush is the identity and its words
+// are skipped. The destination first takes the source (`mov`, only when the registers differ), the flush then runs in place over the
+// forward `cbz`; a zero lane falls into the flush (its bits are kept, so still exact). Writes TMP1 and VTMP1/VTMP2; no NZCV.
+//   scalar: fmov w|x, s|d; and w|x, w|x, #exponent; cbnz END
+//   vector: movz mask; dup; cmtst D, src, mask; uminv s, D; fmov w, s; add w, w, #1; cbz END    (all lanes good: all ones)
 DEF_OP(FexcFlush) {
   const auto Op = IROp->C<IR::IROp_FexcFlush>();
-  FexcFlushWords(GetVReg(Node), GetVReg(Op->Vector), IR::OpSizeToSize(IROp->ElementSize), IROp->Size == IR::OpSize::i128Bit, Op->Mode & 1, Op->Mode & 2);
+  const auto Dst = GetVReg(Node), Src = GetVReg(Op->Vector);
+  const uint32_t Elem = IR::OpSizeToSize(IROp->ElementSize);
+  const bool Q = IROp->Size == IR::OpSize::i128Bit, Scalar = Op->Mode & 1;
+  if (!(Op->Mode & 4)) {
+    FexcFlushWords(Dst, Src, Elem, Q, Scalar, Op->Mode & 2);
+    return;
+  }
+  LOGMAN_THROW_A_FMT(!(Op->Mode & 2) && (Q || Scalar), "a screened flush is a DAZ input flush of a 128-bit or scalar value");
+  const bool Dbl = Elem == 8;
+  if (Dst.Idx() != Src.Idx()) mov(Dst.Q(), Src.Q());
+  ARMEmitter::ForwardLabel End;
+  if (Scalar) {
+    if (Dbl) {
+      fmov(ARMEmitter::Size::i64Bit, TMP1, Dst.D());
+      and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x7ff0'0000'0000'0000ULL);
+    } else {
+      fmov(ARMEmitter::Size::i32Bit, TMP1, Dst.S());
+      and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, 0x7f80'0000);
+    }
+    (void)cbnz(Dbl ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit, TMP1, &End);
+  } else {
+    const auto Sz = Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Dbl ? 0x7ff0'0000'0000'0000ULL : 0x7f80'0000ULL);
+    dup(Sz, VTMP1.Q(), TMP1);
+    cmtst(Sz, VTMP2.Q(), Dst.Q(), VTMP1.Q());
+    uminv(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), VTMP2.Q());
+    fmov(ARMEmitter::Size::i32Bit, TMP1, VTMP1.S());
+    add(ARMEmitter::Size::i32Bit, TMP1, TMP1, 1);
+    (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &End);
+  }
+  FexcFlushWords(Dst, Dst, Elem, Q, Scalar, false);
+  (void)Bind(&End);
 }
 // DPPS's first add level (VFAddV's two `faddp`): its four sums are inputs of the second level and results of the first, so the
 // flush the keys ask for runs between them, in place (DAZ alone: no flag; FTZ alone: UFC and IXC), where the IR cannot reach.

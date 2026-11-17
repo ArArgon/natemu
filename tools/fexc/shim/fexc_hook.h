@@ -242,7 +242,7 @@ inline FexcArg<uint64_t, FEXC_ARG_X87_UNMASKED> fexc_x87_unmasked;
 // condition abi `fpcr` uses), and neither is ever sent otherwise. Both are read only where a SIMD floating-point op needs them
 // (FexcPrecision::PlaceFlushes and the PE check mask), and only when `fexc_no_afp`, so no answer of a host with AFP reads them.
 // FPCR.FZ is then 1 with DAZ and FTZ both (hardware flush, as the M4's FIZ and FZ), else 0: DAZ alone is a software input flush
-// per FP source, FTZ alone a software output flush with UFC and IXC for each flushed lane (FexcFlush); DAZ and FTZ both flush
+// per FP source (behind an exact exponent screen, `FexcFlush` mode bit 2: AFP accurate plan chunk 6b), FTZ alone a software output flush with UFC and IXC for each flushed lane (FexcFlush); DAZ and FTZ both flush
 // only the raw result MIN/MAX select. x87 and the quiet RCP/RSQRT results are left alone.
 inline bool fexc_no_afp = false;
 inline FexcArg<bool, FEXC_ARG_DAZ> fexc_daz;
