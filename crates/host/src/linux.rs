@@ -454,12 +454,13 @@ impl Boot {
             let v = match p.kind {
                 Kind::Rng => crate::virtio::Virtio::rng(irqs.clone(), gsi),
                 Kind::Disk(k) => {
-                    let disk = crate::virtio::Virtio::block_mode(
-                        irqs.clone(),
-                        gsi,
-                        &self.disks[k].path,
-                        self.disks[k].readonly,
-                    )?;
+                    let disk =
+                        crate::virtio::Virtio::block_mode(
+                            irqs.clone(),
+                            gsi,
+                            &self.disks[k].path,
+                            self.disks[k].readonly,
+                        )?;
                     if p.pci {
                         // One request queue per vCPU: the guest then takes each completion on the vCPU that sent the request.
                         disk.block_queues(disk_queues(self.vcpus))?;
@@ -505,11 +506,7 @@ impl Boot {
                 speculation_barriers: self.speculation_barriers,
                 accurate_fp: self.accurate_fp,
                 pool: self.pool,
-                compile_cache: self
-                    .compile_cache
-                    .dir
-                    .clone()
-                    .map(|d| (d, self.compile_cache.cap)),
+                compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
             },
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
