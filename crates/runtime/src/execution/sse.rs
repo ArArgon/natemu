@@ -9,7 +9,7 @@
 //! flag, DE included, comes from FPSR (`mxcsr_flags`: IDC is DE unless DAZ). Unmasked SIMD exceptions (I5c): blocks made
 //! under an MXCSR with a mask clear (part of `Cpu::code_context`) check each floating-point instruction's flags before it
 //! commits anything; a hit reaches [`exception`] (#XM, or #UD without OSXMMEXCPT), a pass moves its flags into the SIMD flag
-//! byte (banked here). FP trap enables (AFP accurate plan chunk 3): UFE only in accurate mode without AFP wherever FZ = 0 ([`fpcr_run`]), handled by `fp`;
+//! byte (banked here). FP trap enables (AFP accurate plan chunks 3 and 4): IOE always and UFE wherever FZ = 0, in accurate mode without AFP ([`fpcr_run`]), handled by `fp`;
 //! otherwise FPCR is built from MXCSR without them.
 use super::segments::{Exception, address, linear};
 use super::*;

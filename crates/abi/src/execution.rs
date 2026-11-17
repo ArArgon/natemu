@@ -1922,20 +1922,23 @@ pub const fn fpcr(mxcsr: u64, no_afp: bool) -> u64 {
 /// FPCR.UFE: trapped underflow (a result tiny before rounding, exact ones too, raises a synchronous exception, EC 0x2C, with
 /// the destination and FPSR unchanged). Never trapped while FZ = 1 (the hardware flush of DAZ + FTZ), which is the plan's chunk 5.
 pub const FPCR_UFE: u64 = 1 << 11;
+/// FPCR.IOE: trapped invalid operation (every IOC case raises EC 0x2C with the destination and FPSR unchanged).
+pub const FPCR_IOE: u64 = 1 << 8;
 /// AFP accurate plan chunk 3: [`fpcr`] plus the trap enables the mode wants, which the resident's lower-EL vector handles (`fptrap`):
 /// UFE in accurate mode without AFP (`accurate` is [`accurate_key`]) wherever FZ = 0, so the masked UE flag of the MIN_NORMAL band is
-/// decided per operation. Every other case is [`fpcr`] exactly, so fast mode and every AFP host run as before. x87 never traps:
+/// decided per operation, and (chunk 4) IOE everywhere in it, so every NaN result is decided per operation (x86's choice, the default NaN's
+/// sign, D). Every other case is [`fpcr`] exactly, so fast mode and every AFP host run as before. x87 never traps:
 /// [`x87_fpcr`] is explicit and trap-free wherever this word has a trap bit.
 pub const fn fpcr_run(mxcsr: u64, no_afp: bool, accurate: bool) -> u64 {
     let base = fpcr(mxcsr, no_afp);
-    if accurate && no_afp && base & 1 << 24 == 0 {
-        base | FPCR_UFE
+    if accurate && no_afp {
+        base | FPCR_IOE | if base & 1 << 24 == 0 { FPCR_UFE } else { 0 }
     } else {
         base
     }
 }
 /// AFP accurate plan chunk 1: 1 when the mode is accurate and the host lacks AFP, else 0: [`Cpu::code_context`] bit 32, and fexc's
-/// `--accurate` (and, for steps, `--exact-step`) are sent exactly then. The one place the two inputs meet.
+/// `--accurate` is sent exactly then. The one place the two inputs meet.
 pub const fn accurate_key(accurate_fp: u64, no_afp: u64) -> u64 {
     (accurate_fp != 0 && no_afp != 0) as u64
 }
@@ -4000,35 +4003,34 @@ mod tests {
     }
 
     /// I6: x87 arithmetic runs under MXCSR's FPCR when FCW.RC equals MXCSR.RC and neither FTZ nor DAZ is set, else under its own.
-    /// AFP accurate plan chunk 3: UFE is on exactly in accurate mode without AFP where FZ is clear, and is the only bit that differs from
-    /// [`fpcr`] (so fast mode, AFP hosts and every FZ = 1 word are as before); x87 words never carry a trap bit and are explicit wherever
-    /// the SSE word has one (the block switches to them around every x87 operation).
+    /// AFP accurate plan chunks 3 and 4: IOE is on in accurate mode without AFP always, UFE where FZ is clear; they are the only bits that
+    /// differ from [`fpcr`] (so fast mode and AFP hosts are as before); x87 words never carry a trap bit and are explicit wherever the
+    /// SSE word has one (the block switches to them around every x87 operation), which is every word in accurate mode without AFP.
     #[test]
-    fn accurate_mode_without_afp_enables_ufe_where_fz_is_clear() {
+    fn accurate_mode_without_afp_enables_ioe_and_ufe_where_fz_is_clear() {
         let (mut on, mut off) = (0, 0);
         for mxcsr in 0..1u64 << 16 {
             for (no_afp, accurate) in [(false, false), (false, true), (true, false), (true, true)] {
                 let (w, base) = (fpcr_run(mxcsr, no_afp, accurate), fpcr(mxcsr, no_afp));
-                if accurate && no_afp && base >> 24 & 1 == 0 {
-                    assert_eq!(w, base | FPCR_UFE, "{mxcsr:#x}");
+                if accurate && no_afp {
+                    assert_eq!(w, base | FPCR_IOE | if base >> 24 & 1 == 0 { FPCR_UFE } else { 0 }, "{mxcsr:#x}");
                     on += 1;
-                } else {
-                    assert_eq!(w, base, "{mxcsr:#x} {no_afp} {accurate}");
-                    off += 1;
-                }
-                if w & FPCR_UFE != 0 {
                     for fcw in [FCW_INIT, FCW_INIT | 3 << 10, 0x3f | 1 << 10] {
                         let x87 = x87_fpcr(fcw, mxcsr, no_afp, accurate);
                         assert_eq!(x87 & crate::FPTRAPS_MASK, 0, "x87 never traps");
                         assert_ne!(x87 & X87_FPCR_EXPLICIT, 0, "explicit, so a switch is emitted: {mxcsr:#x}");
                     }
+                } else {
+                    assert_eq!(w, base, "{mxcsr:#x} {no_afp} {accurate}");
+                    off += 1;
                 }
             }
         }
         assert!(on > 0 && off > on);
-        // DAZ + FTZ (FZ = 1, the hardware flush) never traps in this chunk
+        // DAZ + FTZ (FZ = 1, the hardware flush) never traps UFE, but IOE is on
         assert_eq!(fpcr_run(MXCSR_RESET | 1 << 15 | 1 << 6, true, true) & FPCR_UFE, 0);
-        assert_eq!(fpcr_run(MXCSR_RESET, true, true), FPCR_UFE);
+        assert_eq!(fpcr_run(MXCSR_RESET | 1 << 15 | 1 << 6, true, true) & FPCR_IOE, FPCR_IOE);
+        assert_eq!(fpcr_run(MXCSR_RESET, true, true), FPCR_UFE | FPCR_IOE);
     }
     #[test]
     fn x87_fpcr_differs_only_when_it_must() {

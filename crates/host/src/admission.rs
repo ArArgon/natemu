@@ -371,17 +371,15 @@ pub(crate) fn admit(
     let (mut admitted, parts) = admit_records(bytes, rip, source, supported, cpl0)?;
     let h = &parts.header;
     let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
-    let split = parts
-        .sites
-        .iter()
-        .position(is_stub)
-        .unwrap_or(parts.sites.len());
-    let (accesses, stubs) = parts.sites.split_at(split);
+    let (fma, rest): (Vec<Site>, Vec<Site>) = parts.sites.iter().partition(|s| s.kind == object::kind::FMA);
+    let split = rest.iter().position(is_stub).unwrap_or(rest.len());
+    let (accesses, stubs) = rest.split_at(split);
     let c = structure::Code {
         code,
         literals: &parts.literals,
         accesses,
         stubs,
+        fma: &fma,
         pcs: &parts.pcs,
         relocs: &parts.relocs,
         source,
@@ -581,8 +579,15 @@ fn admit_records(
     if !sorted(&sites.iter().map(|s| s.native_offset).collect::<Vec<_>>()) {
         return fail("access sites not sorted");
     }
-    // Access sites, then the check stubs placed after the body.
-    let (accesses, stubs) = sites.split_at(sites.iter().position(is_stub).unwrap_or(sites.len()));
+    // The FMA NaN checks (AFP accurate plan chunk 4) are in the body, between the access sites: apart; then the access sites, then the
+    // check stubs placed after the body.
+    let (fma, rest): (Vec<Site>, Vec<Site>) = sites.iter().partition(|s| s.kind == object::kind::FMA);
+    for s in &fma {
+        if !site_fields_valid(s, &h, region) || !fma_site_ok(s) {
+            return fail(&format!("FMA check site at native offset {:#x}", s.native_offset));
+        }
+    }
+    let (accesses, stubs) = rest.split_at(rest.iter().position(is_stub).unwrap_or(rest.len()));
     for s in accesses {
         if !site_fields_valid(s, &h, region)
             // M3: a load or store site may carry its instruction's completion record (fexc series23-m3): its length must end
@@ -760,7 +765,7 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.segment <= object::SEG_SS
         && (register(s.base_reg)
             || s.base_reg == 31
-            || (addressless(s) && s.base_reg == object::NO_REG))
+            || ((addressless(s) || s.kind == object::kind::FMA) && s.base_reg == object::NO_REG))
         && (register(s.index_reg) || s.index_reg == object::NO_REG)
         && s.extend <= object::EXT_SXTX
         && s.shift <= 4
@@ -769,6 +774,23 @@ fn site_fields_valid(s: &Site, h: &Header, region: u32) -> bool {
         && s.nzcv <= object::NZCV_SAVED
         && s.completed_effects == object::EFFECTS_NONE
         && s.located == 1
+}
+
+/// AFP accurate plan chunk 4: the record of an FMA NaN check: the descriptor of an FMA (element size and scalar bits only) whose three
+/// operand registers are no temporary (v0, v1), no address, no stub, nothing else. The word at the site is `structure`'s.
+fn fma_site_ok(s: &Site) -> bool {
+    use natemu_abi::tiny;
+    let Some(d) = tiny::Desc::decode(s.width, s.imm) else {
+        return false;
+    };
+    d.meta & 7 == tiny::FMA
+        && d.meta & !(7 | tiny::ELEM8 | tiny::SCALAR) == 0
+        && d.regs[..3].iter().all(|&r| r >= 2)
+        && d.regs[3..] == [0; 3]
+        && s.guest_offset2 == object::NONE32
+        && (s.base_reg, s.index_reg, s.writeback) == (object::NO_REG, object::NO_REG, object::WB_NONE)
+        && (s.intent, s.rmw, s.segment) == (object::INTENT_READ, object::RMW_NONE, object::SEG_DS)
+        && s.data_class == object::CLASS_GPR
 }
 
 fn is_stub(s: &Site) -> bool {

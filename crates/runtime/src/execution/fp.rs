@@ -14,6 +14,12 @@
 //!    (what is patched depends on the mode's enabled traps, never on the cause in ESR), they are ORed into the FPSR from before the
 //!    trap, and the trap enables are put back in the frame's FPCR.
 //!
+//! AFP accurate plan chunk 4 (IOE, NaN lanes): in accurate mode the trap enables also hold IOE. The re-run's patch then also decides the NaN
+//! lanes and an FMA's IOC by FPCR.AH = 1's rules ([`fptrap::patch`]'s `nan`; the mode, never the cause in ESR: `FPCR_IOE` in the trapped
+//! FPCR). An FMA's result is also tested by a check word, `fcmge vD, vR, #0` (a site of kind FMA): it traps on any NaN lane, and there no
+//! re-run is needed: the word is skipped after the NaN lanes of R are recomputed from the three operand registers the site names
+//! ([`fptrap::fma_check`]).
+//!
 //! The resident already single-steps for watchpoints (`watch`), which assumes every step is one: it re-arms MDE and restores nothing
 //! in FPCR. The marker tells the two apart ([`returned`] dispatches on it); MDE is left as it was here, so a watchpoint armed while an
 //! FP word re-runs stays armed; [`cancel`] (any other entry while the marker is set) restores the trap enables and the step state, so
@@ -67,6 +73,24 @@ pub(super) unsafe fn trap(f: &NativeFrame, esr: u64, elr: u64, spsr: u64) -> ! {
             stop_at(0, elr, stop::FP_TRAP)
         };
         let at = elr - b.code_va();
+        // The FMA NaN check: a site of kind FMA at this very word (the compare itself is skipped, no flag is added).
+        let sites = cache::sites(b);
+        if let Ok(i) = sites.binary_search_by_key(&at, |site| u64::from(site.native_offset)) {
+            let site = sites[i];
+            let word = ((natemu_abi::execution::cache::CODE_WRITE_VA + (elr - cache::CODE_VA)) as *const u32).read_volatile();
+            let Some(d) = natemu_abi::tiny::Desc::decode(site.width, site.imm).filter(|d| site.kind == natemu_abi::code_object::kind::FMA && d.meta & 7 == natemu_abi::tiny::FMA) else {
+                stop_at(u64::from(word), at, stop::FP_WORD)
+            };
+            let frame = &raw mut (*shared()).captured;
+            let q = [(*frame).q[usize::from(d.regs[0])], (*frame).q[usize::from(d.regs[1])], (*frame).q[usize::from(d.regs[2])]];
+            let wide = d.meta & natemu_abi::tiny::ELEM8 != 0;
+            let lanes = if d.meta & natemu_abi::tiny::SCALAR != 0 { 1 } else if wide { 2 } else { 4 };
+            // the result register: the compare's source
+            fptrap::fma_check(wide, lanes, &q, &mut (*frame).q[(word >> 5 & 31) as usize]);
+            cache::control().fp_traps += 1;
+            let s = load();
+            resume(&s, frame, elr + 4, spsr)
+        }
         // The word, from the code area's writable alias (the executable one is not readable at EL1's choice of attributes).
         let word = ((natemu_abi::execution::cache::CODE_WRITE_VA + (elr - cache::CODE_VA)) as *const u32).read_volatile();
         let Some(class) = fptrap::classify(word) else {
@@ -113,7 +137,14 @@ pub(super) unsafe fn stepped(elr: u64, spsr: u64) -> ! {
             fptrap::Class::Patch(op) => usize::from(op.rd),
             fptrap::Class::Keep => 0,
         };
-        let flags = fptrap::patch(class, fptrap::x86_rc((*r).fpcr), &(*r).q, (*frame).fpsr, ftz, &mut (*frame).q[rd]);
+        let nan = (*r).fpcr & natemu_abi::execution::FPCR_IOE != 0;
+        // FZ = 1 (DAZ and FTZ both: the hardware flush; UFE never traps then, only IOE does): the re-run's UFC is the flush's, which stays as
+        // the hardware gives it (chunk 5 decides the rest), so the UFC model is not run.
+        let class = match class {
+            fptrap::Class::Patch(o) if (*r).fpcr >> 24 & 1 != 0 => fptrap::Class::Patch(fptrap::Op { kind: 0, ..o }),
+            c => c,
+        };
+        let flags = fptrap::patch(class, fptrap::x86_rc((*r).fpcr), &(*r).q, (*frame).fpsr, ftz, &mut (*frame).q[rd], nan);
         (*frame).fpsr = (*r).fpsr | flags;
         (*frame).fpcr = (*r).fpcr;
         core::ptr::write_volatile(&raw mut (*r).active, 0);
