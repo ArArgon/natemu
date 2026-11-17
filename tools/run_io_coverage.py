@@ -44,6 +44,11 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
                  below succeed, a FLUSH afterwards and every later read succeed; the image is compared byte for byte
                  with its exact expected contents (the straddling request's landed 2048-byte prefix included: no
                  rollback is promised) and a relaunch without the limit reads it back.
+  multidisk      (not in the default list; `--cases multidisk`, with the default --transport mmio) three disks of 8, 16 and 24 MiB
+                 listed in a config file, launched four ways: all MMIO, all PCI, disks MMIO with the entropy device on PCI,
+                 disks PCI with the entropy device on MMIO. The guest checks that /dev/vda, vdb, vdc are the listed disks in
+                 order (size, GET_ID serial = host device and inode, the first 4 KiB), that there is no vdd, reads each disk
+                 (rough speed line) and writes a block to each; the host checks every image's bytes.
 Live negative controls (the judge must FAIL them): host-full-control (the host-full guest with the image on the normal
 disk) and host-limit-control (the host-limit guest without the limit)."""
 import argparse
@@ -227,6 +232,19 @@ host-limit)
     echo "COV-LIMIT straddle=$straddle seio=$seio below=$r1,$r3 above=$r2,$r4 flush_rc=$flush_rc ioerr_logs=$(ioerrs)"
   fi
   echo "COV-READ a=$(rsha 65536 0 16) b2=$(rsha 65536 32 16) b3=$(rsha 65536 48 16) prefix=$(rsha 2048 16384 1) tail=$(rsha 2048 16385 31) above=$(rsha 65536 600 16)";;
+multidisk)
+  hsha() { s=$(dd if=$1 bs=4096 count=1 2>/dev/null | sha256sum) || fail read; echo "${s%% *}"; }
+  for d in vda vdb vdc; do wait_dev /dev/$d; done
+  for d in vda vdb vdc; do echo "COV-DISK $d size=$(cat /sys/block/$d/size) serial=$(cat /sys/block/$d/serial) head=$(hsha /dev/$d)"; done
+  test ! -e /sys/block/vdd && echo "COV-NODISK vdd" || echo "COV-EXTRADISK vdd"
+  t0=$(cat /proc/uptime)
+  for pass in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do for d in vda vdb vdc; do dd if=/dev/$d of=/dev/null bs=1M count=8 iflag=direct 2>/dev/null || fail read-$d; done; done
+  t1=$(cat /proc/uptime)
+  echo "COV-SPEED t0=${t0%% *} t1=${t1%% *}"
+  dd if=/fixtures/a.bin of=/dev/vda bs=512 count=1 skip=0 seek=8 conv=notrunc 2>/dev/null || fail write-a
+  dd if=/fixtures/b.bin of=/dev/vdb bs=512 count=1 skip=0 seek=8 conv=notrunc 2>/dev/null || fail write-b
+  dd if=/fixtures/a.bin of=/dev/vdc bs=512 count=1 skip=1 seek=8 conv=notrunc 2>/dev/null || fail write-c
+  sync;;
 *) fail case;;
 esac
 echo "COV-ERRORS ioerr_logs=$(ioerrs) fs_errors=$(dmesg | grep -c 'EXT4-fs error')"
@@ -391,7 +409,7 @@ def ext4_offsets(case):
     """Byte offsets of the image's ext4 file systems."""
     if case in ('gpt', 'mbr', 'trim'): return [s * SECTOR for s, _, _ in PARTS['table'][:2]]
     if case.startswith('host-full'): return [PARTS['hostfull'][0][0] * SECTOR]
-    if case.startswith('host-limit'): return []
+    if case.startswith('host-limit') or case == 'multidisk': return []
     return [0]
 
 
@@ -463,6 +481,13 @@ def judge(case, phase, text, host, expect, pci=False):
             require(host['exact'], 'the discarded and zeroed ranges, or the rest of the pattern, differ on the host')
         require(one(r'^COV-DATA a=(\S+) b=(\S+)$') == (expect['a'], 'gone'), 'file contents differ')
         require(io_errors == 0, 'I/O errors logged')
+    elif case == 'multidisk':
+        disks = re.findall(r'^COV-DISK (\S+) size=(\d+) serial=(\S+) head=(\S+)$', text, re.M)
+        require(disks == [(f'vd{n}', str(size // SECTOR), serial, head) for n, (size, serial, head) in zip('abc', host['disks'])],
+                f'guest disks {disks}, host disks {host["disks"]}')
+        require(one(r'^COV-NODISK vdd$') is not None, 'a fourth disk appeared')
+        require(host['written'], 'a disk did not receive its own block (or another one did)')
+        require(io_errors == 0, 'I/O errors logged')
     elif case == 'host-full':
         if phase == 'write':
             full = one(r'^COV-HOSTFULL dd_rc=(\d+) eio=(\d) flush_rc=(\d+) ioerr_logs=(\d+)$')
@@ -524,8 +549,101 @@ def launch(args, case, phase, image, work, limit):
     return process.returncode, timeout, time.monotonic() - started
 
 
+MULTI_SIZES = (8 * MiB, 16 * MiB, 24 * MiB)
+# (name, [disk transport, other-devices transport]); the file's `machine.transport` has disk, nic and rng.
+MULTI_LAUNCHES = (('mmio', 'mmio', 'mmio'), ('pci', 'pci', 'pci'), ('disks-mmio-rng-pci', 'mmio', 'pci'), ('disks-pci-rng-mmio', 'pci', 'mmio'))
+
+
+def multidisk_images(work):
+    """Three sparse images, each with a distinct first 4 KiB: (paths, the host facts the guest must report)."""
+    paths = []
+    for i, size in enumerate(MULTI_SIZES):
+        path = work / f'd{i}.raw'
+        with path.open('xb') as f: f.truncate(size); f.write(pattern(b'natemu-multi-%d' % i, 4096))
+        paths.append(path)
+    return paths
+
+
+def multidisk_facts(paths):
+    """What the guest must see per disk (size, GET_ID serial: device and inode as raw.rs formats them, first 4 KiB)."""
+    out = []
+    for path in paths:
+        st = path.stat()
+        out.append((st.st_size, f'{st.st_dev & 0xffffffff:08x}{st.st_ino & 0xffffffffffff:012x}', sha(path.read_bytes()[:4096])))
+    return out
+
+
+def multidisk_written(paths):
+    """Each image holds its own 512-byte block at 4096 and nothing else changed in the first 16 KiB."""
+    a, b, _ = fixtures()
+    want = (a[:512], b[:512], a[512:1024])
+    for i, (path, block) in enumerate(zip(paths, want)):
+        data = path.read_bytes()[:16384]
+        if data[:4096] != pattern(b'natemu-multi-%d' % i, 4096) or data[4096:4608] != block or any(data[4608:]): return False
+    return True
+
+
+def multidisk_launch(args, name, disk_t, other_t, work):
+    """One three-disk launch from a config file (the only way to list several disks); returns the result entry."""
+    paths = multidisk_images(work)
+    facts = multidisk_facts(paths)
+    q = lambda p: json.dumps(str(p))
+    cmdline = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case=multidisk cov_phase=write'
+    config = work / 'vm.toml'
+    config.write_text(f"""[machine]
+ram = "1G"
+vcpus = 2
+transport = {{ disk = "{disk_t}", nic = "{other_t}", rng = "{other_t}" }}
+[serial]
+output = {q(work / 'serial.log')}
+[engine]
+fexc = {q(args.fexc)}
+runtime = {q(args.runtime)}
+compile_cache = "off"
+[boot.kernel]
+image = {q(args.prepared / 'linux')}
+initrd = {q(args.prepared / 'initramfs.cpio')}
+cmdline = {q(cmdline)}
+""" + ''.join(f'[[disk]]\nid = "d{i}"\npath = {q(p)}\n' for i, p in enumerate(paths)) + '[[rng]]\nid = "rng0"\n')
+    command = [str(args.natemu), '--config', str(config)]
+    write_json(work / 'command.json', {'command': command})
+    env = dict(os.environ); env.pop('NATEMU_PERF_LOG', None)
+    started, timeout = time.monotonic(), False
+    with (work / 'stdout.log').open('wb') as out, (work / 'stderr.log').open('wb') as err:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env, start_new_session=True)
+        try: process.wait(timeout=120)
+        except subprocess.TimeoutExpired: timeout = True; stop_group(process)
+        except BaseException: stop_group(process); raise
+    seconds = time.monotonic() - started
+    text = (work / 'serial.log').read_text(errors='replace').replace('\r', '') if (work / 'serial.log').exists() else ''
+    stderr = (work / 'stderr.log').read_text(errors='replace')
+    host = {'rc': process.returncode, 'timeout': timeout, 'stop': last_stop(stderr),
+            'backend_errors': [l for l in stderr.splitlines() if l.startswith('virtio-block: ')],
+            'changed': True, 'fsck': [], 'table': True, 'exact': None,
+            'disks': facts, 'written': multidisk_written(paths)}
+    errors = judge('multidisk', 'write', text, host, expected_values(), False)
+    speed = re.search(r'^COV-SPEED t0=([\d.]+) t1=([\d.]+)$', text, re.M)
+    mibs = round(384 / max(float(speed[2]) - float(speed[1]), 0.01), 1) if speed else None
+    for path in paths: path.unlink()
+    entry = {'phase': name, 'seconds': round(seconds, 1), 'read_mib_s': mibs, 'rc': process.returncode, 'stop': host['stop'], 'errors': errors}
+    print(json.dumps({'case': 'multidisk', **entry}), flush=True)
+    return entry
+
+
+def run_multidisk(args):
+    work = args.out / 'multidisk'; work.mkdir()
+    result = {'case': 'multidisk', 'launches': []}
+    for name, disk_t, other_t in MULTI_LAUNCHES:
+        launch_dir = work / name; launch_dir.mkdir()
+        result['launches'].append(multidisk_launch(args, name, disk_t, other_t, launch_dir))
+    result['pass'] = not any(l['errors'] for l in result['launches'])
+    write_json(work / 'result.json', result)
+    return result
+
+
 def run_case(args, case):
     """Both launches of CASE (a control: of the case it controls); returns the result."""
+    if case == 'multidisk': return run_multidisk(args)
     base = case.removesuffix('-control')
     work = args.out / case; work.mkdir()
     volume = None
@@ -710,8 +828,9 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--inputs', type=Path, default=INPUTS, help='a tools/run_virtio_block.py prepare directory')
     parser.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport (--virtio-transport); pci adds a guest probe and its checks')
-    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS, default=list(CASES + CONTROLS))
+    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS + ('multidisk',), default=list(CASES + CONTROLS))
     args = parser.parse_args()
+    if 'multidisk' in args.cases and args.transport != 'mmio': parser.error('multidisk sets its own transports; leave --transport at mmio')
     if len(set(args.cases)) != len(args.cases): parser.error('duplicate cases')
     return run(args)
 

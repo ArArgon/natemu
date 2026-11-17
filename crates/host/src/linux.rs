@@ -1209,6 +1209,107 @@ mod report_tests {
     }
 }
 
+/// Placement of one to six disks on MMIO, PCI and both, with the other devices (design section 3).
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use Transport::{Mmio, Pci};
+    fn wanted(disks: &[Transport], other: Transport) -> Wanted {
+        Wanted {
+            rng: Some(other),
+            disks: disks.to_vec(),
+            net: Some(other),
+        }
+    }
+    fn disk(p: &[Placed], k: usize) -> Placed {
+        *p.iter().find(|p| p.kind == Kind::Disk(k)).unwrap()
+    }
+    #[test]
+    fn disks_take_slots_pages_lines_and_uids_in_list_order() {
+        for n in 1..=MAX_DISKS {
+            for (disks, other) in [
+                (vec![Mmio; n], Pci),
+                (vec![Pci; n], Mmio),
+                ((0..n).map(|k| [Mmio, Pci][k % 2]).collect(), Mmio),
+                ((0..n).map(|k| [Pci, Mmio][k % 2]).collect(), Pci),
+            ] {
+                let p = place(&wanted(&disks, other)).unwrap();
+                assert_eq!(p.len(), n + 2);
+                let (mut slots, mut pages, mut lines, mut uids) = (vec![], vec![], vec![], vec![]);
+                for q in &p {
+                    slots.push(q.slot as u32);
+                    pages.push(q.res.base);
+                    lines.push(q.res.gsi);
+                    uids.push(q.res.uid as u32);
+                }
+                for v in [&slots, &pages, &lines, &uids] {
+                    let mut u = v.to_vec();
+                    u.sort_unstable();
+                    u.dedup();
+                    assert_eq!(
+                        u.len(),
+                        v.len(),
+                        "a collision: {slots:?} {pages:?} {lines:?} {uids:?}"
+                    );
+                }
+                assert!(lines.iter().all(|l| (16..24).contains(l)));
+                for k in 0..n {
+                    let d = disk(&p, k);
+                    assert_eq!(d.pci, disks[k] == Pci);
+                    let k32 = k as u32;
+                    if k == 0 {
+                        assert_eq!(
+                            (d.slot, d.res.base, d.res.gsi, d.res.uid),
+                            (1, 0xf000_0000, 16, 0)
+                        );
+                    } else {
+                        assert_eq!(
+                            (d.slot, d.res.base, d.res.gsi, d.res.uid),
+                            (
+                                3 + k as u8,
+                                0xf000_0000 + (2 + k32) * 4096,
+                                18 + k32,
+                                2 + k as u8
+                            )
+                        );
+                    }
+                }
+                let net = p.iter().find(|q| q.kind == Kind::Net).unwrap();
+                let rng = p.iter().find(|q| q.kind == Kind::Rng).unwrap();
+                assert_eq!(
+                    (net.slot, net.res.base, net.res.gsi, net.res.uid),
+                    (2, 0xf000_1000, 17, 1)
+                );
+                assert_eq!(
+                    (rng.slot, rng.res.base, rng.res.gsi, rng.res.uid),
+                    (3, 0xf000_2000, 18, 2)
+                );
+                // The tables list exactly what was placed.
+                let plan = plan_tables(1, boot::ACPI_NVS.0, &p, 1 << 30).unwrap();
+                assert_eq!(plan.manifest.len() + plan.functions.len(), p.len());
+                assert_eq!(plan.functions.len(), p.iter().filter(|q| q.pci).count());
+            }
+        }
+    }
+    #[test]
+    fn more_than_six_disks_are_refused() {
+        let e = place(&wanted(&[Mmio; 7], Mmio)).unwrap_err();
+        assert_eq!(
+            e,
+            "at most 6 disks on mmio (interrupt lines 16-23); use pci for more"
+        );
+        let e = place(&wanted(&[Mmio, Pci, Pci, Pci, Pci, Pci, Pci], Mmio)).unwrap_err();
+        assert!(e.starts_with("at most 6 disks on mmio"), "{e}");
+        let e = place(&wanted(&[Pci; 7], Pci)).unwrap_err();
+        assert!(
+            e.contains("shared PCI interrupt lines are not built")
+                || e.contains("until shared PCI"),
+            "{e}"
+        );
+        assert!(place(&wanted(&[], Mmio)).unwrap().len() == 2);
+    }
+}
+
 /// Pins what old command lines produce, before any refactor of how devices are configured. Each line of `EXPECTED` is
 /// `manifest|PCI functions|digest of the ACPI blobs (address and bytes)|mailbox|(low_end, high, pci)|digest of the e820
 /// map`, for 1 and 4 vCPUs, the 8 subsets of {rng, disk, net} (bit 0 rng, 1 disk, 2 net) and four transport mixes (all

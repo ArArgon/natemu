@@ -803,7 +803,16 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
     );
     assert_eq!(b.cmdline, "quiet");
     assert_eq!(b.transports, Transports::all(Mmio));
-    // Not built yet: several or read-only disks.
+    // Several plain disks keep their order; read-only disks are not built yet.
+    let mut three = cfg.clone();
+    for id in ["b", "c"] {
+        let mut d = three.disks[0].clone();
+        (d.id, d.path) = (id.into(), d.path.with_file_name(format!("{id}.raw")));
+        three.disks.push(d);
+    }
+    let boot = to_boot(&three, "RT".into(), vec![1], None).unwrap();
+    let ids: Vec<_> = boot.disks.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(ids, ["root", "b", "c"]);
     let mut two = cfg.clone();
     two.disks[0].readonly = true;
     assert!(
