@@ -2,51 +2,34 @@
 
 natemu runs x86-64 Linux on Apple Silicon Macs, faster than QEMU TCG.
 
-natemu is a *captive* emulator: the guest gets its own hardware VM through Hypervisor.framework.
-natemu translates the guest's x86-64 code to ARM64 and runs it inside that VM, next to a small
-runtime, so the Mac's hardware does most of the work:
+natemu runs the guest in its own hardware VM (Hypervisor.framework), translates its x86-64 code to ARM64 and lets the
+Mac's hardware do most of the work: guest page tables become real page tables, Apple Silicon's x86 memory-ordering mode
+keeps multithreaded code correct without extra barriers, and system calls, page faults and interrupts are handled inside
+the VM. QEMU TCG does all of these in software.
 
-- **Memory:** guest page tables become real ARM page tables, so ordinary loads and stores need no
-  software lookup.
-- **Memory ordering:** Apple Silicon's hardware x86 memory-ordering mode (TSO) replaces barriers in
-  the generated code.
-- **Kernel work:** system calls, page faults, interrupts and translated-code lookups are handled
-  inside the VM. natemu leaves the VM mainly to translate new code and for device I/O.
+natemu runs 11 benchmarks about 4.5× faster than QEMU TCG (1.4× to 41× per benchmark), and a Debian package-install and
+build workload 1.7× faster. See [benchmarks](docs/benchmarks.md).
 
-QEMU TCG instead looks up every guest memory access in a software TLB and
-handles every page fault, system call and interrupt in the emulator itself.
-
-natemu runs 11 benchmarks about 4.5× faster than QEMU TCG (geometric mean; 1.4× to 41× per
-benchmark), and a context-switch-heavy Debian workload (package installs and a CPython build, with
-network and disk traffic alongside) 1.7× faster. See [benchmarks](docs/benchmarks.md).
-
-The translator is built on [FEX](https://github.com/FEX-Emu/FEX)'s x86 compiler. FEX runs Linux
-applications, not whole systems. natemu builds FEX's compiler natively on macOS, without FEX's Linux
-runtime, and extends it to compile kernel code and to raise exceptions at the exact faulting
-instruction. Privileged instructions go to natemu's runtime inside the VM. The changes live in
+The x86 translator is [FEX](https://github.com/FEX-Emu/FEX)'s compiler, extended to run whole systems; the changes live in
 [natemu-fex](https://github.com/ArArgon/natemu-fex).
 
 ## Status: experimental
 
-natemu boots the stock Debian 13 cloud image unchanged, with networking and a disk. The cloud-image
-workflow has been tested on an M4 Mac running macOS 26; targeted networking checks also pass on
-M2 Max. Other Apple Silicon chips or macOS versions may lack hardware features natemu needs.
-Other distributions and kernels are untested. Major features still missing:
+natemu boots the unmodified Debian 13 cloud image with networking and a disk. It is tested on an M4 Mac running macOS 26
+(an M2 passes the floating-point and networking checks); other distributions and kernels are untested. Not yet supported:
 
-- **Booting:** no BIOS or UEFI firmware. natemu starts a Linux kernel directly, so it cannot boot
-  installer ISOs or bootloaders.
-- **Devices:** a serial console, a network card, raw disk images and a random-number device only. No
-  PCI bus by default (an experimental one: `--virtio-transport pci`), display, keyboard, sound, USB or file sharing with the Mac. Disk images must be raw, not qcow2.
-- **Networking:** IPv4 user-mode NAT, with localhost port forwarding and opt-in guest access to
-  the Mac's `localhost`. No IPv6 or bridged networking.
-- **CPU:** 64-bit code only, so 32-bit programs do not run. No AVX-512, AMX or CET. x87 floating
-  point computes at 64-bit rather than 80-bit precision.
-- **Performance:** no fast path for process address-space switches (PCID), which makes Linux's
-  default Meltdown mitigation slow (see [Performance](#performance-and-cpu-vulnerability-mitigations)).
+- **Booting:** no BIOS or UEFI. natemu starts a Linux kernel directly, so installer ISOs and bootloaders do not work.
+- **Devices:** serial console, network, raw disk images and a random-number device only. No display, keyboard, sound, USB,
+  shared folders or qcow2 images.
+- **Networking:** IPv4 only, through NAT, with port forwarding. No IPv6 or bridged networking.
+- **CPU:** 64-bit programs only. No AVX-512. x87 floating point uses 64-bit rather than 80-bit precision.
+- **Performance:** Linux's default Meltdown protection is slow under natemu; see
+  [Performance](#performance-and-cpu-vulnerability-mitigations) for the fix.
 
 ## Requirements
 
-- An Apple Silicon Mac running macOS 15 or later; tested on an M4 and an M2 Max. If the Mac lacks a CPU feature natemu needs, natemu stops at startup with one line naming it, for example `natemu: host lacks lse2`.
+- An Apple Silicon Mac running macOS 15 or later; tested on M4 and M2 running macOS 26. natemu refuses to start on a Mac
+  that lacks a hardware feature it needs.
 - Xcode Command Line Tools (`xcode-select --install`)
 - [rustup](https://rustup.rs). The repository pins the Rust version, and rustup installs it automatically.
 - [Homebrew](https://brew.sh) packages: `brew install cmake ninja pkg-config libslirp e2fsprogs`
@@ -54,28 +37,9 @@ Other distributions and kernels are untested. Major features still missing:
 
 ### Floating point on M1 and M2
 
-On an M4, x86 floating-point results are exact. M1 and M2 chips lack an Arm feature (FEAT_AFP) that natemu uses to match
-x86's behaviour in a few rare corner cases, so natemu has two floating-point modes there:
-
-- **Fast** (the default). Results match x86 except in rare corner cases: some numbers right at the edge of the smallest
-  representable values, the sign of some NaN ("not a number") results, and a few status flags. Ordinary programs do not
-  notice.
-- **Accurate** (`--fp accurate`). Results and flags match real x86 exactly, but programs that do a lot of floating-point
-  math run slower. Use it when results must agree with x86 bit for bit, such as a numerical test suite that compares
-  against x86 output.
-
-On an M4 both modes are the same and cost nothing extra. How much slower accurate mode is on an M1 or M2:
-
-| Program | Extra time in accurate mode |
-| --- | --- |
-| c-ray ray tracer, ordinary build | +473% |
-| c-ray ray tracer, built with `-ffast-math` | +162% |
-| LuaJIT (JIT on / interpreter only) | +29% / +17% |
-| SQLite | about +5% |
-| x264 video encoding (AVX2) | about +2.5% |
-| zstd compression | about 0 |
-
-The exact list of differences, how accurate mode works, and how to test a Mac are in
+On M1 and M2, a few rare floating-point edge cases come out slightly differently from real x86 by default. Ordinary
+programs do not notice. If you need results that match x86 bit for bit, use `--fp accurate`; it can make math-heavy
+programs several times slower. On M4 results are always exact, at no cost. Details:
 [docs/floating-point.md](docs/floating-point.md).
 
 ## Setup
@@ -173,8 +137,8 @@ You get a root shell with no login. See [tools/play/README.md](tools/play/README
 With `--serial-stdin` your terminal is the guest's console. **Ctrl-A x** quits natemu at any time,
 and Ctrl-C goes to the guest. `poweroff` inside the guest shuts it down cleanly.
 
-The first boot translates everything and takes a few seconds longer. Later boots reuse the
-translation cache in `~/Library/Caches/natemu/fexc` (`--compile-cache off` disables it).
+The first boot translates everything and takes a few seconds longer; later boots reuse a cache in
+`~/Library/Caches/natemu/fexc` (`--compile-cache off` disables it).
 
 | Option | Effect |
 | --- | --- |
@@ -184,72 +148,36 @@ translation cache in `~/Library/Caches/natemu/fexc` (`--compile-cache off` disab
 | `--disk FILE` | A raw disk image, seen as `/dev/vda`. Only one natemu can use a disk at a time. |
 | `--rng` | A hardware random-number device. |
 
-At startup natemu prints one line per decision about how it runs on this Mac, for example:
-
-```
-natemu: cpu: x86-64-v3 +adx +aes +clflushopt +clwb +fsgsbase +pclmulqdq +rdrand +rdtscp +sha +smep +umip +xsavec +xsaveopt
-natemu: fp: fast mode, degraded (host lacks FEAT_AFP)
-natemu: acceleration: +FEAT_FlagM2 -FEAT_CSSC +FEAT_FRINTTS -FEAT_MOPS +FEAT_I8MM +FEAT_DotProd -FEAT_ECV
-natemu: meltdown: none
-natemu: code cache: pool on, disk 512 MiB at ~/Library/Caches/natemu/fexc
-```
-
-`cpu` is what the guest sees, `fp` the floating-point mode (`fast mode` on an M4, `accurate mode` with `--fp accurate`),
-`acceleration` which host features natemu uses for speed (`-` means a slower fallback), and `code cache` where compiled code is kept.
+At startup natemu prints a few `natemu: ...` lines describing how it will run on this Mac: the CPU it shows the guest,
+the floating-point mode, which hardware speed-ups it uses, and where it caches translated code.
 
 `target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,
 2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error.
 
 ### Host–guest networking
 
-To reach a guest service from the Mac, add `--net --net-forward 8080:8000` to the launch
-command. For example, start an HTTP server inside the guest:
+To reach a service in the guest from the Mac, forward a port: `--net --net-forward 8080:8000` makes the guest's port 8000
+available at `127.0.0.1:8080` on the Mac. The guest service must listen on all interfaces (for example
+`python3 -m http.server 8000 --bind 0.0.0.0`), not only on its own localhost. For SSH, use `--net-forward 2222:22` and
+`ssh -p 2222 user@127.0.0.1`.
 
-```sh
-python3 -m http.server 8000 --bind 0.0.0.0
-```
+`--net-host-loopback` lets the guest reach services on the Mac's localhost at `10.0.2.2`. Turn it on only if you trust
+the guest: it exposes every localhost service on the Mac. UDP forwarding needs it too.
 
-Then run `curl http://127.0.0.1:8080/` on the Mac. Forwards bind only the Mac's `127.0.0.1`
-and target `10.0.2.15`; guest services must listen on that address or all interfaces, not
-just guest localhost. With an SSH server and account configured in the guest, use
-`--net-forward 2222:22` and connect with `ssh -p 2222 user@127.0.0.1`.
-
-TCP forwarding works with host-loopback access disabled. For UDP, add both
-`--net-host-loopback --net-forward udp:19000:9000` alongside `--net`. The explicit flag is
-required because libslirp otherwise blocks forwarded UDP replies. It also grants broad access
-to the Mac's IPv4 localhost services, including ones that trust local connections, by using
-`10.0.2.2:PORT`. It does not join the guest's and Mac's loopback interfaces or limit access
-to the forwarded ports.
-
-Use different host ports for concurrent VMs; an occupied port fails the launch. UDP host
-port 53 and multiple UDP forwards to the same guest port are unsupported. UDP clients must
-not use source ports 53, 67 or 69. See [host–guest service details](tools/play/README.md#hostguest-services)
-for the full rules and file-copy examples.
-
-At startup, natemu prints the expected guest address, gateway/DNS, loopback setting and
-installed forwards. This confirms configuration, not that the guest service is ready.
+Each running VM needs its own host ports. The full rules, UDP limits and file-copy examples are in
+[tools/play/README.md](tools/play/README.md#hostguest-services).
 
 ## Performance and CPU vulnerability mitigations
 
-By default natemu reports its virtual CPU as affected by Meltdown. A Linux guest then turns on page
-table isolation (PTI), which switches page tables on every system call, interrupt and fault.
-natemu has no fast path for these switches yet, so PTI is by far the largest cost on a default
-kernel command line. Linux's other mitigations together cost about 1%.
+Linux protects itself from the Meltdown CPU flaw by switching page tables on every system call and interrupt (PTI).
+natemu has no fast path for that yet, so with a default kernel command line a busy Debian guest runs more than twice as
+slowly ([numbers](docs/benchmarks.md#cpu-vulnerability-mitigations)). Two ways to avoid it:
 
-On the context-switch-heavy Debian workload, the default command line took more than twice as
-long as `mitigations=off` ([numbers](docs/benchmarks.md#cpu-vulnerability-mitigations)).
-
-Ways to recover the cost:
-
-- **`--speculation-barriers` (recommended).** natemu places speculation barriers in its own guest
-  page-table walk, so guest code cannot read memory it has no permission for, even speculatively.
-  natemu then reports the CPU as not affected by Meltdown, and Linux skips PTI on its own. Every
-  other guest mitigation stays on. natemu refuses this option on a CPU without the Arm speculation
-  barrier instruction (FEAT_SB).
-- **`mitigations=off` on the kernel command line.** Turns off every mitigation inside the guest.
-  It is as fast as the option above, but it also removes the guest's own protection between its
-  processes, so use it only when everything running in the guest is trusted. The RAM-only system
-  above uses it.
+- **`--speculation-barriers` (recommended).** natemu protects guest memory itself, tells the guest its CPU is not
+  affected, and Linux skips PTI. All other protections stay on. natemu refuses this option on a Mac that lacks the CPU
+  feature it needs.
+- **`mitigations=off` on the kernel command line.** Equally fast, but it turns off all of the guest's own protections, so
+  use it only when everything in the guest is trusted. The RAM-only system above uses it.
 
 ## Development
 
