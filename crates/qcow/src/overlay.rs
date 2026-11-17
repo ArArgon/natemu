@@ -102,11 +102,12 @@ pub fn create_overlay(file: &File, size: u64, backing: &str, format: ImageType) 
         )));
     }
 
-    file.write_all_at(&h, 0)?;
     file.write_all_at(&rb.to_be_bytes(), rt)?;
     file.write_all_at(&vec![0, 1].repeat(metadata as usize), rb)?;
     // The L1 table's zero entries: the file ends after them, as qemu-img's does.
-    file.set_len(l1 + l1_size * 8)
+    file.set_len(l1 + l1_size * 8)?;
+    // The header last: until it lands, the file is no qcow2 image.
+    file.write_all_at(&h, 0)
 }
 
 #[cfg(test)]

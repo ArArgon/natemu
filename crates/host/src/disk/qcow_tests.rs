@@ -811,6 +811,62 @@ fn a_missing_overlay_is_created_over_its_base_and_an_existing_file_never_overwri
 }
 
 #[test]
+fn an_overlay_appears_whole_or_not_at_all_and_one_of_two_creators_wins() {
+    let dir = Dir::new("publish");
+    let (base, top) = (dir.at("base.raw"), dir.at("top.qcow2"));
+    std::fs::write(&base, base_bytes(2048)).unwrap();
+    let names = || {
+        std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(".top.qcow2.natemu-new-"))
+            .collect::<Vec<_>>()
+    };
+    // A crash after the temporary file is written: nothing at the real path, a stale temporary name only.
+    let temp = write_temp(&top, &base).unwrap();
+    assert!(!top.exists() && names().len() == 1, "{:?}", names());
+    check_clean(&temp);
+    // The real path existing (here: written meanwhile) is never overwritten.
+    std::fs::write(&top, b"someone else's").unwrap();
+    assert_eq!(
+        publish(&temp, &top).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(&top).unwrap(), b"someone else's");
+    std::fs::remove_file(&temp).unwrap();
+    std::fs::remove_file(&top).unwrap();
+    // Two creators at once: exactly one wins, the other is told; no temporary file is left.
+    for _ in 0..20 {
+        let gate = std::sync::Barrier::new(2);
+        let results: Vec<_> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        gate.wait();
+                        super::create(&top, &base)
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        let e = results.into_iter().find_map(|r| r.err()).unwrap();
+        assert!(
+            e.contains(&top.display().to_string())
+                && e.contains("another launch created this overlay first"),
+            "{e}"
+        );
+        assert!(names().is_empty(), "{:?}", names());
+        check_clean(&top);
+        std::fs::remove_file(&top).unwrap();
+    }
+}
+
+#[test]
 fn relative_backing_names_resolve_against_the_referring_image_and_missing_ones_are_named() {
     let dir = Dir::new("relative");
     std::fs::create_dir(dir.at("sub")).unwrap();

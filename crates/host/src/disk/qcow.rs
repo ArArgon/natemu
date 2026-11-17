@@ -32,6 +32,7 @@ pub(super) fn image(
     path: &Path,
     read_only: bool,
     backing: Option<&Path>,
+    id: &str,
 ) -> Result<Image> {
     let info = file
         .metadata()
@@ -40,7 +41,7 @@ pub(super) fn image(
     let header = QcowHeader::new(&top).map_err(|e| refused(path, &e))?;
     check(&header, path, read_only)?;
     let seen = vec![(info.dev(), info.ino())];
-    let chain = chain(path, &header, backing, seen)?;
+    let chain = chain(path, &header, backing, seen, id)?;
     let qcow =
         Qcow::open(top, chain, read_only).map_err(|e| format!("disk {}: {e}", path.display()))?;
     Ok(Image {
@@ -105,8 +106,61 @@ fn check(header: &QcowHeader, path: &Path, read_only: bool) -> Result<()> {
 
 /// Create a new overlay at `path` (which must not exist: never overwritten) over `base`, which is opened read-only
 /// with a shared lock: virtual size the base's, the base's absolute canonical path and its detected format recorded
-/// in the header, mode 0600. A half-written file is removed.
+/// in the header, mode 0600. The overlay is written in full under a temporary name in the same folder ([`temp_name`])
+/// and then moved to `path` by an exclusive rename, so `path` never holds a partial file: a crash leaves at most a
+/// stale temporary file (never read by natemu; safe to delete), and of two launches creating one path, one wins and
+/// the other is refused with a message naming the path.
 pub(super) fn create(path: &Path, base: &Path) -> Result<()> {
+    let temp = write_temp(path, base)?;
+    let p = path.display();
+    publish(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            format!("disk {p}: another launch created this overlay first; launch again to use it")
+        } else {
+            format!("disk {p}: creating the overlay: {e}")
+        }
+    })
+}
+
+/// The temporary name of an overlay being created at `path`: `.NAME.natemu-new-PID-NANOS-N` in `path`'s folder (N
+/// counts this process's creations: the clock alone can repeat).
+fn temp_name(path: &Path) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let name = path
+        .file_name()
+        .map_or("disk".into(), |n| n.to_string_lossy());
+    path.with_file_name(format!(
+        ".{name}.natemu-new-{}-{nanos}-{n}",
+        std::process::id()
+    ))
+}
+
+/// Move `temp` to `path` unless `path` exists (AlreadyExists then): renamex_np with RENAME_EXCL, or, on a file
+/// system without it, a hard link then the temporary name's removal.
+fn publish(temp: &Path, path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other);
+    let (from, to) = (c(temp)?, c(path)?);
+    // SAFETY: two NUL-terminated paths that outlive the call.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if !matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL)) {
+        return Err(e);
+    }
+    std::fs::hard_link(temp, path)?;
+    std::fs::remove_file(temp)
+}
+
+/// Write the whole overlay (header last) under [`temp_name`], exclusively locked while written, then F_FULLFSYNC.
+/// Returns the temporary path; on failure nothing is left behind.
+fn write_temp(path: &Path, base: &Path) -> Result<PathBuf> {
     let (file, head, tail) = raw::inspect(base, true)?;
     let b = base.display();
     let (format, size) = match detect(&head, &tail) {
@@ -130,17 +184,21 @@ pub(super) fn create(path: &Path, base: &Path) -> Result<()> {
         .to_str()
         .ok_or_else(|| format!("disk {b}: the backing path is not UTF-8"))?;
     let p = path.display();
+    let temp = temp_name(path);
     let new = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
+        .open(&temp)
         .map_err(|e| format!("disk {p}: creating the overlay: {e}"))?;
-    natemu_qcow::create_overlay(&new, size, name, format)
+    new.try_lock()
+        .map_err(io::Error::from)
+        .and_then(|()| natemu_qcow::create_overlay(&new, size, name, format))
         .and_then(|()| new.sync_all())
+        .map(|()| temp.clone())
         .map_err(|e| {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&temp);
             format!("disk {p}: creating the overlay over {b}: {e}")
         })
 }
@@ -183,6 +241,7 @@ fn chain(
     header: &QcowHeader,
     backing: Option<&Path>,
     mut seen: Vec<(u64, u64)>,
+    id: &str,
 ) -> Result<Option<BackingFile>> {
     let name = path
         .file_name()
@@ -199,7 +258,7 @@ fn chain(
         (Some(c), None) => {
             let named = resolve(path, &c.path);
             return Err(format!(
-                "disk {}: {name} is based on {n}; add backing = \"{n}\" to this disk (or --set disk.ID.backing={n})",
+                "disk {}: {name} is based on {n}; add backing = \"{n}\" to this disk (or --set disk.{id}.backing={n})",
                 path.display(),
                 n = named.display()
             ));
