@@ -65,6 +65,58 @@ const BLOCK_SLOT: u8 = 1;
 const NET_SLOT: u8 = 2;
 const RNG_SLOT: u8 = 3;
 
+/// What the enabled devices and transports give the guest: the memory map and the ACPI tables, with the lists the tables
+/// were built from. Pure (no host state), so a launch can be pinned by a test.
+struct LaunchPlan {
+    /// ACPI lists each enabled device once: virtio-MMIO devices here, PCI functions below as (slot, GSI).
+    #[allow(dead_code)] // read by the pinning test
+    manifest: Vec<boot::acpi::VirtioMmio>,
+    #[allow(dead_code)]
+    functions: Vec<(u8, u32)>,
+    tables: boot::acpi::Tables,
+    layout: Layout,
+}
+
+/// `enabled` is [rng, disk, net].
+fn launch_plan(
+    vcpus: usize,
+    rsdp: u64,
+    enabled: [bool; 3],
+    t: Transports,
+    ram: u64,
+) -> Result<LaunchPlan> {
+    let [rng, disk, net] = enabled;
+    let on_pci = |enabled: bool, t: Transport| enabled && t == Transport::Pci;
+    let (pci_rng, pci_disk, pci_net) =
+        (on_pci(rng, t.rng), on_pci(disk, t.disk), on_pci(net, t.net));
+    let layout = Layout {
+        low_end: ram.min(exec::LOW_RAM_END),
+        high: ram.saturating_sub(exec::LOW_RAM_END),
+        pci: pci_rng || pci_disk || pci_net,
+    };
+    layout.e820().map_err(|e| e.to_string())?;
+    let (mut manifest, mut functions) = (Vec::new(), Vec::new());
+    for (enabled, pci, resource, slot) in [
+        (rng, pci_rng, crate::virtio::RNG_RESOURCE, RNG_SLOT),
+        (disk, pci_disk, crate::virtio::BLOCK_RESOURCE, BLOCK_SLOT),
+        (net, pci_net, crate::virtio::NET_RESOURCE, NET_SLOT),
+    ] {
+        if pci {
+            functions.push((slot, resource.gsi));
+        } else if enabled {
+            manifest.push(resource);
+        }
+    }
+    functions.sort_unstable();
+    let tables = boot::acpi::build_with_devices(vcpus, rsdp, &manifest, &functions);
+    Ok(LaunchPlan {
+        manifest,
+        functions,
+        tables,
+        layout,
+    })
+}
+
 /// What to boot and how.
 pub struct Boot {
     /// The resident (the built `natemu-runtime` ELF) and the fexc binary.
@@ -172,8 +224,7 @@ impl Boot {
         // (default off needs nothing).
         if self.speculation_barriers && !crate::probe::sb()? {
             return Err(
-                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)"
-                    .into(),
+                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)".into(),
             );
         }
         let t = self.transports;
@@ -181,12 +232,14 @@ impl Boot {
         let pci_rng = on_pci(self.rng, t.rng);
         let pci_disk = on_pci(self.disk.is_some(), t.disk);
         let pci_net = on_pci(self.net, t.net);
-        let layout = Layout {
-            low_end: self.ram.min(exec::LOW_RAM_END),
-            high: self.ram.saturating_sub(exec::LOW_RAM_END),
-            pci: pci_rng || pci_disk || pci_net,
-        };
-        layout.e820().map_err(|e| e.to_string())?; // before allocating the RAM
+        let plan = launch_plan(
+            self.vcpus,
+            self.rsdp,
+            [self.rng, self.disk.is_some(), self.net],
+            t,
+            self.ram,
+        )?; // the memory map is checked before allocating the RAM
+        let (layout, tables) = (plan.layout, plan.tables);
         require_vcpus(self.vcpus)?;
         let backing = execution::prepare_with_pool(
             &self.runtime.to_string_lossy(),
@@ -195,26 +248,6 @@ impl Boot {
             self.ram as usize,
             self.pool,
         )?;
-        // ACPI lists each enabled device once: virtio-MMIO devices in the manifest, PCI functions as (slot, GSI).
-        let (mut manifest, mut functions) = (Vec::new(), Vec::new());
-        for (enabled, pci, resource, slot) in [
-            (self.rng, pci_rng, crate::virtio::RNG_RESOURCE, RNG_SLOT),
-            (
-                self.disk.is_some(),
-                pci_disk,
-                crate::virtio::BLOCK_RESOURCE,
-                BLOCK_SLOT,
-            ),
-            (self.net, pci_net, crate::virtio::NET_RESOURCE, NET_SLOT),
-        ] {
-            if pci {
-                functions.push((slot, resource.gsi));
-            } else if enabled {
-                manifest.push(resource);
-            }
-        }
-        functions.sort_unstable();
-        let tables = boot::acpi::build_with_devices(self.vcpus, self.rsdp, &manifest, &functions);
         let inputs = Inputs {
             image: &self.kernel,
             cmdline: &self.cmdline,
@@ -1076,4 +1109,132 @@ mod report_tests {
         old["pool"] = serde_json::json!({"probes": 0, "hits": 0, "candidates": 0, "refused": {}, "recheck": {}});
         assert_eq!(old, serde_json::to_value(&v).unwrap());
     }
+}
+
+/// Pins what old command lines produce, before any refactor of how devices are configured. Each line of `EXPECTED` is
+/// `manifest|PCI functions|digest of the ACPI blobs (address and bytes)|mailbox|(low_end, high, pci)|digest of the e820
+/// map`, for 1 and 4 vCPUs, the 8 subsets of {rng, disk, net} (bit 0 rng, 1 disk, 2 net) and four transport mixes (all
+/// MMIO, all PCI, disk=pci only, net and rng pci with disk mmio), at 1 GiB, then one 5 GiB all-PCI case. RECORDED on the
+/// unmodified `prepare()` (commit 33a99fb8: the same logic inline in a throwaway test, printing these strings), then
+/// the table building was extracted into `launch_plan` and this test, now calling it, passes unchanged.
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    fn fnv(parts: impl IntoIterator<Item = u8>) -> u64 {
+        parts.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+    fn describe(vcpus: usize, en: [bool; 3], t: Transports, ram: u64) -> String {
+        let p = launch_plan(vcpus, 0xe0000, en, t, ram).unwrap();
+        let tdig = fnv(p
+            .tables
+            .blobs
+            .iter()
+            .flat_map(|(a, b)| a.to_le_bytes().into_iter().chain(b.iter().copied())));
+        let edig = fnv(p.layout.e820().unwrap().iter().flat_map(|e| {
+            [e.addr, e.size, e.kind.into()]
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+        }));
+        let m: Vec<_> = p.manifest.iter().map(|r| (r.uid, r.base, r.gsi)).collect();
+        format!(
+            "{m:?}|{:?}|{tdig}|{}|{:?}|{edig}",
+            p.functions,
+            p.tables.mailbox,
+            (p.layout.low_end, p.layout.high, p.layout.pci)
+        )
+    }
+    #[test]
+    fn launch_plans_are_unchanged() {
+        use Transport::{Mmio, Pci};
+        let mk = |disk, net, rng| Transports { disk, net, rng };
+        let mixes = [
+            Transports::all(Mmio),
+            Transports::all(Pci),
+            mk(Pci, Mmio, Mmio),
+            mk(Mmio, Pci, Pci),
+        ];
+        let mut got = Vec::new();
+        for vcpus in [1usize, 4] {
+            for bits in 0..8u8 {
+                let en = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0];
+                for t in mixes {
+                    got.push(describe(vcpus, en, t, 1 << 30));
+                }
+            }
+        }
+        got.push(describe(2, [true; 3], Transports::all(Pci), 5 << 30));
+        assert_eq!(got.len(), EXPECTED.len());
+        for (i, (g, e)) in got.iter().zip(EXPECTED).enumerate() {
+            assert_eq!(g, e, "case {i}");
+        }
+    }
+    const EXPECTED: [&str; 65] = [
+        "[]|[]|8683927379363334234|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[]|8683927379363334234|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[]|8683927379363334234|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[]|8683927379363334234|921600|(1073741824, 0, false)|11246234427793253812",
+        "[(2, 4026540032, 18)]|[]|5375753071444348913|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(3, 18)]|15230757283896671807|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18)]|[]|5375753071444348913|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(3, 18)]|15230757283896671807|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[]|17940052538898997745|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16)]|10815605412818430783|921600|(1073741824, 0, true)|10185747342727102902",
+        "[]|[(1, 16)]|10815605412818430783|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[]|17940052538898997745|921600|(1073741824, 0, false)|11246234427793253812",
+        "[(2, 4026540032, 18), (0, 4026531840, 16)]|[]|2608073096665658639|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16), (3, 18)]|7701233824722222481|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18)]|[(1, 16)]|11325732782077295185|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[(3, 18)]|4385955677451561101|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(1, 4026535936, 17)]|[]|10434972639185307171|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17)]|8458926672213940961|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(1, 4026535936, 17)]|[]|10434972639185307171|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17)]|8458926672213940961|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (1, 4026535936, 17)]|[]|9307176071924944093|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17), (3, 18)]|15996578981730913563|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (1, 4026535936, 17)]|[]|9307176071924944093|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17), (3, 18)]|15996578981730913563|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16), (1, 4026535936, 17)]|[]|14726685445734183771|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16), (2, 17)]|17510501564858698455|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(1, 4026535936, 17)]|[(1, 16)]|14775432196468106267|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[(2, 17)]|17255870486886280667|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (0, 4026531840, 16), (1, 4026535936, 17)]|[]|6802036744791988189|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16), (2, 17), (3, 18)]|10007449349731813985|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (1, 4026535936, 17)]|[(1, 16)]|14305060659731109615|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[(2, 17), (3, 18)]|15720951344671610257|921600|(1073741824, 0, true)|10185747342727102902",
+        "[]|[]|15650480460277406583|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[]|15650480460277406583|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[]|15650480460277406583|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[]|15650480460277406583|921600|(1073741824, 0, false)|11246234427793253812",
+        "[(2, 4026540032, 18)]|[]|5488293268031787171|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(3, 18)]|9519332276044885563|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18)]|[]|5488293268031787171|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(3, 18)]|9519332276044885563|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[]|2540593831516174829|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16)]|2670576648376611531|921600|(1073741824, 0, true)|10185747342727102902",
+        "[]|[(1, 16)]|2670576648376611531|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[]|2540593831516174829|921600|(1073741824, 0, false)|11246234427793253812",
+        "[(2, 4026540032, 18), (0, 4026531840, 16)]|[]|17145885431883977733|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16), (3, 18)]|8956633636123709807|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18)]|[(1, 16)]|6454835963402824395|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[(3, 18)]|2918402946676318213|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(1, 4026535936, 17)]|[]|2553366794430872745|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17)]|6094271419725815665|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(1, 4026535936, 17)]|[]|2553366794430872745|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17)]|6094271419725815665|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (1, 4026535936, 17)]|[]|11896369052494919211|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17), (3, 18)]|3151210603246389213|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (1, 4026535936, 17)]|[]|11896369052494919211|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(2, 17), (3, 18)]|3151210603246389213|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16), (1, 4026535936, 17)]|[]|7561738713919067625|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16), (2, 17)]|13344063196818160585|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(1, 4026535936, 17)]|[(1, 16)]|10580941184734063321|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[(2, 17)]|11375465782727428791|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (0, 4026531840, 16), (1, 4026535936, 17)]|[]|6818934124008030400|921600|(1073741824, 0, false)|11246234427793253812",
+        "[]|[(1, 16), (2, 17), (3, 18)]|1805215330570771227|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(2, 4026540032, 18), (1, 4026535936, 17)]|[(1, 16)]|15299883696375072588|921600|(1073741824, 0, true)|10185747342727102902",
+        "[(0, 4026531840, 16)]|[(2, 17), (3, 18)]|16796781598206999483|921600|(1073741824, 0, true)|10185747342727102902",
+        "[]|[(1, 16), (2, 17), (3, 18)]|6769698338711986635|921600|(3221225472, 2147483648, true)|161888604255309990",
+    ];
 }
