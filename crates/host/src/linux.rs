@@ -68,7 +68,7 @@ const RNG_SLOT: u8 = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskSpec {
     pub id: String,
-    /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
+    /// The disk file: a writable one is locked exclusively for this VM's lifetime (excludes other writers/truncators); a read-only one takes a shared lock.
     pub path: PathBuf,
     pub transport: Transport,
     /// Opened read-only: shared lock, the guest sees the read-only bit and no flush, discard or write-zeroes.
