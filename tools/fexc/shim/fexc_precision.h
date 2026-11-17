@@ -51,6 +51,10 @@ inline bool CheckOp(FEXCore::IR::IROps Op) {
   return Op == FEXCore::IR::OP_FEXCSIMDCHECK || Op == FEXCore::IR::OP_FEXCX87CHECK || Op == FEXCore::IR::OP_FEXCSIMDCHECKDE ||
          Op == FEXCore::IR::OP_FEXCX87CHECKDE;
 }
+// AFP accurate plan, chunk 4: the FMA NaN check is no fault point (the resident resumes after it, no guest exception comes of it), but for
+// register allocation it is as a check: no value is coalesced into its static register across it (the guest register is written only after
+// the check, and the operands it names are still in theirs).
+inline bool StaticBarrier(FEXCore::IR::IROps Op) { return CheckOp(Op) || Op == FEXCore::IR::OP_FEXCFMACHECK; }
 inline bool FaultPoint(FEXCore::IR::IROps Op) {
   return GuestMemOp(Op) || Op == FEXCore::IR::OP_DIV || Op == FEXCore::IR::OP_UDIV || CheckOp(Op);
 }
@@ -438,7 +442,7 @@ inline bool Commits(FEXCore::IR::IROps Op) {
   case OP_GUESTOPCODE: case OP_INVALIDATEFLAGS: case OP_INLINECONSTANT: case OP_INLINEENTRYPOINTOFFSET: case OP_PREFETCH:
   case OP_LOADCONTEXTPAIR: case OP_LOADMEMPAIR: case OP_VLOADNONTEMPORAL: case OP_DIV: case OP_UDIV: case OP_FCMP: case OP_STORENZCV:
   case OP_SETROUNDINGMODE: case OP_PUSHROUNDINGMODE: case OP_POPROUNDINGMODE: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
-  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP:
+  case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP: case OP_FEXCFMACHECK:
   case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG: case OP_RMIFNZCV: case OP_CONDADDNZCV:
   case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS: case OP_ADCNZCV: case OP_SBBNZCV:
   case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ: case OP_TESTZ: case OP_SHIFTFLAGS:
@@ -822,6 +826,9 @@ template<class Emitter> inline void PlaceFmaSanitize(Emitter* IREmit) {
     }
   }
   if (Ops.empty() || !(uint64_t(fexc_simd_unmasked) & 1)) return;
+  // AFP accurate plan, chunk 4: accurate mode takes D (inf*0 + QNaN) exactly at the IOE trap (the handler removes that IOC), so the seven ops
+  // are not needed (read only here, where an FMA with IE unmasked needs it)
+  if (fexc_accurate) return;
   for (Ref Node : Ops) {
     auto View = IREmit->ViewIR();
     const auto* Op = View.template GetOp<IROp_Header>(Node);
@@ -839,6 +846,47 @@ template<class Emitter> inline void PlaceFmaSanitize(Emitter* IREmit) {
     Ref B2 = IREmit->_VAndn(Int, B, IREmit->_VAndn(Int, Bok, Cok));
     IREmit->ReplaceNodeArgument(Node, First, A2);
     IREmit->ReplaceNodeArgument(Node, First + 1, B2);
+  }
+}
+// AFP accurate plan, chunk 4 (A): the NaN check of each fused multiply-add of accurate mode (no AFP). With FPCR.IOE on, every FMA whose result
+// is invalid or has an SNaN operand traps at the FMA itself and is patched by AH = 1's rules; what raises nothing, and is therefore wrong, is
+// a lane with more than one quiet NaN (Arm without AH takes the addend first, x86 Rn first) and the one-instruction negating forms (`fmls`,
+// `fnmsub`..., which flip a NaN's sign). So the result of every FMA is tested: `fcmge` of it with zero, a signalling compare, raises IOC for
+// any NaN lane, and the resident's trap recomputes the NaN lanes from the three operands. FexcFmaCheck names the result and the operands
+// (all kept live up to it: register allocation must not reuse a register that dies at the FMA, and the guest register is written after it).
+template<class Emitter> inline void PlaceFmaChecks(Emitter* IREmit) {
+  using namespace FEXCore::IR;
+  using Ref = FEXCore::IR::Ref;
+  if (!fexc_no_afp) return;
+  auto IR = IREmit->ViewIR();
+  const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
+  std::vector<Ref> Ops;
+  uint64_t Rip = ~0ull;
+  for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
+    for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
+      if (IROp->Op == OP_GUESTOPCODE) { Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset; continue; }
+      switch (IROp->Op) {
+      case OP_VFMLA: case OP_VFMLS: case OP_VFNMLA: case OP_VFNMLS:
+      case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT: case OP_VFNMLSSCALARINSERT:
+        if (Rip != ~0ull && !fexc_x87.count(Rip)) Ops.push_back(CodeNode);
+        break;
+      default: break;
+      }
+    }
+  }
+  if (Ops.empty() || !fexc_accurate) return;
+  for (Ref Node : Ops) {
+    auto View = IREmit->ViewIR();
+    const auto* Op = View.template GetOp<IROp_Header>(Node);
+    const bool Insert = Op->Op == OP_VFMLASCALARINSERT || Op->Op == OP_VFMLSSCALARINSERT || Op->Op == OP_VFNMLASCALARINSERT || Op->Op == OP_VFNMLSSCALARINSERT;
+    const uint32_t E = OpSizeToSize(Op->ElementSize), S = OpSizeToSize(Op->Size);
+    if (E != 4 && E != 8) continue;   // (no x86 FMA has another element)
+    const bool Scalar = Insert || S == E;
+    if (!Scalar && S != 16) ERROR_AND_DIE_FMT("fexc slice1 (AFP accurate chunk 4): an FMA of {} bytes", S);
+    const uint8_t First = Insert ? 1 : 0;   // the scalar-insert forms' argument 0 only supplies the upper elements
+    IREmit->SetWriteCursor(Node);
+    IREmit->_FexcFmaCheck(Node, View.GetNode(Op->Args[First]), View.GetNode(Op->Args[First + 1]), View.GetNode(Op->Args[First + 2]),
+                          (E == 8 ? 8u : 0u) | (Scalar ? 16u : 0u));
   }
 }
 // ---------------------------------------------------------------------------------------------
@@ -904,6 +952,7 @@ inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op) {
   case OP_ADCNZCV: case OP_SBBNZCV: case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ:
   case OP_TESTZ: case OP_SHIFTFLAGS: case OP_ROTATEFLAGS: case OP_FCMP: case OP_FEXCSIMDCHECK: case OP_FEXCX87CHECK:
   case OP_FEXCSIMDCHECKDE: case OP_FEXCX87CHECKDE: case OP_FEXCKEEP: case OP_FEXCFLUSH: case OP_FEXCMXCSR: case OP_FEXCREPSTOS: case OP_FEXCX87SVC:
+  case OP_FEXCFMACHECK:
     return true;
   default: return false;
   }

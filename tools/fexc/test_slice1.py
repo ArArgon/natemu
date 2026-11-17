@@ -1527,7 +1527,89 @@ class AfpAccurateDe(unittest.TestCase):
             self.assertNotIn('msr FPSR, x0', fast, name)   # fast mode: the plain code, no test
             self.assertNotIn('msr FPSR, x0', daz, name)    # DAZ: x86 sets no DE
             self.assertIn('msr FPSR, x0', native_words(form, *self.AFP0)[1], name) if name not in self.NO_DE else None
+            if re.match(r'vfn?m(add|sub)', name):   # (chunk 4: an FMA has the NaN check after it, which also changes register allocation: no comparison;
+                continue                 # fast mode's own code is the replay gate's and AfpAccurateFma's)
             self.assertEqual(unmasked, native_words(form, '--feature', 'afp=0', '--simd-unmasked', '0x2')[1], name)   # DE unmasked: as fast mode
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpAccurateFma(unittest.TestCase):
+    """AFP accurate plan, chunk 4 (A): in accurate mode without AFP every FMA is followed by the NaN check `fcmge v1, vResult, #0` (a site of
+    kind `fma`, the three operand registers in `imm`), and nothing else about an FMA's code changes. The resident's handler and `fptrap`'s native
+    oracle are the Rust side; here the shape: the check exists exactly in accurate mode, the registers it names still hold the operands when it
+    runs (the destination aliasing each source), the result is in the register it compares, the guest register is written after it, and every
+    FP mnemonic FEX emits in accurate mode is one the handler's table classifies."""
+    AFP0 = ['--feature', 'afp=0', '--accurate']
+
+    @staticmethod
+    def vex(opcode, w, ymm, vvvv, rm):
+        """VEX.66.0F38 `opcode xmm1, xmm<vvvv>, xmm<rm>`."""
+        return f"c4e2{(w << 7 | (~vvvv & 15) << 3 | ymm << 2 | 1):02x}{opcode:02x}{0xc0 | 1 << 3 | rm:02x}"
+
+    def test_every_fma_has_one_check_in_accurate_mode_only(self):
+        n = 0
+        for opcode in [o + k for o in (0x98, 0x9a, 0x9c, 0x9e, 0x96, 0x97) for k in (0x00, 0x10, 0x20)]:
+            for scalar in (False, True):
+                if scalar and opcode & 15 >= 6 and opcode & 15 != 8 and opcode & 15 not in (10, 12, 14):
+                    continue
+                if scalar and opcode & 15 in (6, 7):
+                    continue
+                for w in (0, 1):
+                    for ymm in ((0, 1) if not scalar else (0,)):
+                        for vvvv, rm in ((2, 3), (1, 3), (2, 1), (1, 1), (2, 2)):
+                            hexs = self.vex(opcode + scalar, w, ymm, vvvv, rm)
+                            d, rc = run(hexs, RIP, *self.AFP0)
+                            self.assertEqual(rc, 0, hexs)
+                            sites = [x for x in d['sites'] if x['kind'] == 'fma']
+                            self.assertEqual(len(sites), 2 if ymm else 1, hexs)
+                            self.assertEqual(d['code']['layout']['spill_bytes'], 0, hexs)
+                            fast, rc = run(hexs, RIP, '--feature', 'afp=0')
+                            self.assertEqual([x for x in fast['sites'] if x['kind'] == 'fma'], [], hexs)
+                            n += 1
+        self.assertGreater(n, 400)
+
+    def test_the_named_registers_hold_the_operands_at_the_check(self):
+        """Run the code up to (not including) each check natively: the static registers the site names are as they were, the result register
+        (the check's source) holds the FMA's result, and the guest destination is not yet written."""
+        rnd = random.Random(44)
+        n = 0
+        for opcode in (0x98, 0xa8, 0xb8, 0x9a, 0xaa, 0xba, 0x9c, 0xac, 0xbc, 0x9e, 0xae, 0xbe, 0xb6, 0xa7, 0x99, 0xb9, 0xbf):
+            for w in (0, 1):
+                for vvvv, rm in ((2, 3), (1, 3), (2, 1), (1, 1), (2, 2)):
+                    hexs = self.vex(opcode, w, 0, vvvv, rm)
+                    d, rc = run(hexs, RIP, *self.AFP0)
+                    words, lines, spills = native_words(hexs, *self.AFP0)
+                    lay = d['code']['layout']
+                    site = next(x for x in d['sites'] if x['kind'] == 'fma')
+                    at = (site['native_offset'] - lay['code_region_begin']) // 4
+                    self.assertTrue(lines[at].startswith('fcmge'), (hexs, lines[at]))
+                    regs = [site['imm'] >> (5 * k) & 31 for k in range(3)]
+                    v = [0] * 32
+                    for r in range(16, 32): v[r] = rnd.getrandbits(128)
+                    x, v2, _ = native_run(words[:at], v=v, fpcr=0)
+                    for r in regs:
+                        if r >= 16: self.assertEqual(v2[r], v[r], (hexs, regs, 'operand overwritten', lines[:at]))
+                    res = (words[at] >> 5) & 31
+                    self.assertNotIn(res, regs, (hexs, 'the result shares a register with an operand'))
+                    self.assertEqual(v2[17], v[17], (hexs, 'the guest destination written before the check'))
+                    n += 1
+        self.assertGreater(n, 100)
+
+    def test_every_fp_mnemonic_in_accurate_mode_is_in_the_handlers_table(self):
+        known = {'fadd', 'faddp', 'fcmeq', 'fcmge', 'fcmgt', 'fcmp', 'fcmpe', 'fcvt', 'fcvtl', 'fcvtl2', 'fcvtn', 'fcvtn2', 'fcvtzs', 'fdiv',
+                 'fmadd', 'fmla', 'fmls', 'fmsub', 'fmul', 'fnmadd', 'fnmsub', 'frint32x', 'frint32z', 'frintx', 'fsqrt', 'fsub',
+                 # no floating-point exception: moves, selects, sign changes, integer SIMD
+                 'fcsel', 'fmov', 'fneg', 'fabs'}
+        seen = set()
+        forms = {h for _, h, *_ in DE_FORMS} | {h for _, h, *_ in AfpAccurateDe.FORMS}
+        for h in sorted(forms):
+            for extra in ([], ['--daz'], ['--ftz'], ['--daz', '--ftz'], ['--simd-unmasked', '0x3f']):
+                _, lines, _ = native_words(h, *self.AFP0, *extra)
+                for l in lines:
+                    m = re.split(r'[ .]', l)[0]
+                    if m.startswith('f') and m != 'fcsel': seen.add(m)
+        self.assertEqual(seen - known, set())
+        self.assertGreater(len(seen), 15)
+
 
 class AfpNegation(unittest.TestCase):
     """AFP fallback, the free NaN-sign fixes (afp=0, fast mode): the addend of the packed VFMSUB/VFNMSUB/VFMADDSUB/VFMSUBADD and ADDSUB's
