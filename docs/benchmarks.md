@@ -36,7 +36,8 @@ natemu, and up to 30% faster for `build`.
 | `luajit` | LuaJIT 2.1 running 16 programs from its benchmark suite |
 | `luajit-interp` | the same with the JIT off (`-joff`) |
 | `mem` | stress-ng 0.19.02 `vm`, `mmap` and `fork` stressors with `--verify` |
-| `cray` | c-ray 1.1 multithreaded ray tracer, 1280×960 |
+| `cray` | c-ray 1.1 multithreaded ray tracer, 1280×960 (the release's `-O3 -ffast-math`, so it links crtfastmath and runs with MXCSR DAZ+FTZ set) |
+| `cray-strict` | the same renderer built without `-ffast-math` (DAZ and FTZ clear, ordinary IEEE FP): the FP-heavy program for the non-DAZ mode that FP gates need; it renders the same picture as `cray` |
 | `7zip` | 7-Zip 25.01 LZMA2 compression of 12 MiB of Silesia, then a test pass |
 | `sqlite` | SQLite 3.46.1 `speedtest1 --memdb --size 160` (single-threaded) |
 | `avx` | x264 0.164 encoding 300 CIF frames on its AVX2 paths |
