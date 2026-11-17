@@ -525,6 +525,64 @@ mod tests {
         );
     }
 
+    /// Counts the bytes read from the backing file it wraps.
+    struct CountingBacking(Arc<dyn BackingRead>, Arc<std::sync::atomic::AtomicU64>);
+
+    impl BackingRead for CountingBacking {
+        fn read_at(&self, address: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.1
+                .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            self.0.read_at(address, buf)
+        }
+    }
+
+    // A write reads the backing file only to fill a cluster it newly allocates over unallocated
+    // (backing) space: never for a cluster the overlay already holds or one with the zero flag.
+    #[test]
+    fn writes_read_the_backing_file_only_for_a_copy_on_write_fill() {
+        let dir = test_util::TempDir::new().unwrap();
+        let base = pattern(8 * CL as usize, 5);
+        let bpath = raw_backing(&dir, "base.raw", &base);
+        let f = overlay_in(
+            &dir,
+            "o.qcow2",
+            8 * CL,
+            bpath.to_str().unwrap(),
+            ImageType::Raw,
+        );
+        let mut disk = QcowDisk::new(f, true, true).unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let inner = disk.backing_file.take().unwrap();
+        disk.backing_file = Some(Arc::new(CountingBacking(inner, Arc::clone(&count))));
+        let read_since = || count.swap(0, std::sync::atomic::Ordering::SeqCst);
+        let mut expect = base.clone();
+        let write = |expect: &mut Vec<u8>, at: u64, data: &[u8]| {
+            disk.write_all_at(at, data).unwrap();
+            expect[at as usize..at as usize + data.len()].copy_from_slice(data);
+        };
+
+        write(&mut expect, 4096, &[1; 4096]);
+        assert_eq!(read_since(), CL, "first partial write: one cluster's fill");
+        write(&mut expect, 3 * 4096, &[2; 4096]);
+        assert_eq!(read_since(), 0, "partial write into an allocated cluster");
+        disk.deallocate(100, 512, true).unwrap();
+        expect[100..612].fill(0);
+        assert_eq!(read_since(), 0, "partial write-zeroes into an allocated cluster");
+        write(&mut expect, CL, &[3; CL as usize]);
+        assert_eq!(read_since(), 0, "whole-cluster write");
+        disk.deallocate(2 * CL, CL as usize, true).unwrap();
+        read_since();
+        write(&mut expect, 2 * CL + 100, &[4; 4096]);
+        assert_eq!(read_since(), 0, "partial write over a zero-flag cluster");
+        expect[2 * CL as usize..3 * CL as usize].fill(0);
+        expect[2 * CL as usize + 100..2 * CL as usize + 4196].fill(4);
+        write(&mut expect, 4 * CL - 4096, &[5; 8192]);
+        assert_eq!(read_since(), 2 * CL, "first write spanning two clusters");
+        write(&mut expect, 4 * CL - 2048, &[6; 4096]);
+        assert_eq!(read_since(), 0, "second write spanning the same two clusters");
+        assert_eq!(disk.read_all_at(0, base.len()), expect);
+    }
+
     #[test]
     fn relative_backing_resolves_against_image_directory_only_with_a_path() {
         let dir = test_util::TempDir::new().unwrap();

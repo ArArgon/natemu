@@ -180,22 +180,25 @@ pub(super) fn cow_write_at(
         // exists. Upstream allocated it unwritten and wrote the data after the lock: a racing
         // read, or a crash in which a flush or eviction made that entry durable before the data,
         // then saw zeros, neither the old (backing) nor the new data.
-        let backing_data = match backing_file {
-            Some(_) if whole => None,
-            Some(backing) => {
-                let cluster_begin = curr_addr - intra_offset;
-                let mut data = vec![0u8; cluster_size as usize];
-                backing.read_at(cluster_begin, &mut data)?;
-                Some(data)
+        // natemu: a partial write reads the backing cluster (outside the lock) only when the
+        // cluster turns out to need it as a fill; upstream read it for every partial write, even
+        // into a cluster the overlay already held.
+        let mut backing_data = None;
+        let (host_offset, filled) = loop {
+            let fill = match backing_file {
+                Some(_) if whole => Some(chunk),
+                _ => backing_data.as_deref(),
+            };
+            if let Some(mapped) =
+                metadata.map_cluster_for_write(curr_addr, fill, backing_file.is_some())?
+            {
+                break mapped;
             }
-            None => None,
+            let cluster_begin = curr_addr - intra_offset;
+            let mut data = vec![0u8; cluster_size as usize];
+            backing_file.as_ref().unwrap().read_at(cluster_begin, &mut data)?;
+            backing_data = Some(data);
         };
-        let fill = match backing_file {
-            Some(_) if whole => Some(chunk),
-            _ => backing_data.as_deref(),
-        };
-
-        let (host_offset, filled) = metadata.map_cluster_for_write(curr_addr, fill)?;
         if !(whole && filled) {
             data_file.file().write_all_at(chunk, host_offset)?;
         }

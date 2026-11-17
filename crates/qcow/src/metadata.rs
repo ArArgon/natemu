@@ -402,13 +402,22 @@ impl QcowMetadata {
     /// natemu: `fill` is borrowed, and the result (host offset, filled) says whether this call
     /// wrote `fill` into a newly allocated cluster, under the lock. A caller that passes its own
     /// whole-cluster data as `fill` then need not write it again.
+    ///
+    /// natemu: with `backing` and no `fill`, returns `None` (nothing changed) when the cluster
+    /// would need a copy-on-write fill (it is unallocated over the backing file): the caller reads
+    /// the fill outside the lock and calls again. A cluster the overlay holds, or one with the
+    /// zero flag, needs no fill, so no backing read.
     pub(super) fn map_cluster_for_write(
         &self,
         address: u64,
         fill: Option<&[u8]>,
-    ) -> io::Result<(u64, bool)> {
+        backing: bool,
+    ) -> io::Result<Option<(u64, bool)>> {
         let mut inner = self.inner.write().unwrap();
-        inner.map_write_with(address, fill)
+        if backing && fill.is_none() && inner.needs_backing_fill(address)? {
+            return Ok(None);
+        }
+        inner.map_write_with(address, fill).map(Some)
     }
 
     /// natemu: steps 2-5 of the write order (design section 4) under the table lock: a barrier
@@ -566,6 +575,7 @@ impl QcowMetadata {
                 // Copy backing data to preserve bytes outside the range.
                 let backing_data = if let Some(backing) = backing_file
                     && count != cluster_size as usize
+                    && inner.needs_backing_fill(curr_addr)?
                 {
                     let cluster_begin = curr_addr - offset_in_cluster as u64;
                     let mut data = vec![0u8; cluster_size as usize];
@@ -728,6 +738,15 @@ impl QcowState {
                 length: count as u64,
             }))
         }
+    }
+
+    /// natemu: whether a write to `address` would allocate over unallocated (backing) space,
+    /// so a partial write needs the backing cluster as its copy-on-write fill.
+    fn needs_backing_fill(&mut self, address: u64) -> io::Result<bool> {
+        Ok(matches!(
+            self.map_read_with_populate(address, 1, true)?,
+            ClusterReadMapping::Backing { .. }
+        ))
     }
 
     /// Slow path read mapping. Requires exclusive access to populate cache.
