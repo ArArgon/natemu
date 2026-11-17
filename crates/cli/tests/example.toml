@@ -1,0 +1,50 @@
+# debian.toml: a direct-boot Debian launch. Relative paths mean this file's folder.
+
+[machine]                    # what the guest sees
+ram = "4G"                   # bytes, 0x hex, or a K/M/G suffix
+vcpus = 2
+transport = { disk = "pci", nic = "pci", rng = "pci" }   # "mmio" or "pci"
+
+[serial]                     # COM1's host end
+output = "serial.log"        # a file; the word "stdout" means standard output
+stdin = false                # true: the terminal is the console (Ctrl-A x quits)
+
+[engine]                     # how natemu runs the guest
+fexc = "../build/fexc"
+fp = "fast"                  # or "accurate"
+compile_cache = "off"        # a folder or "off"; left out, the user cache folder
+compile_cache_mb = 512
+speculation_barriers = false
+
+[boot.kernel]
+image = "vmlinuz-6.12.107"
+initrd = "initrd.img-6.12.107"
+cmdline = "console=ttyS0 root=/dev/vda1 ro"
+
+[[disk]]                     # the guest sees disks in this order: /dev/vda, /dev/vdb, ...
+id = "root"
+path = "debian13.raw"
+
+[[disk]]
+id = "data"
+path = "data.raw"
+
+[[disk]]
+id = "tools"
+path = "tools.iso"
+readonly = true              # an ISO, or any image the guest must not change
+
+[[nic]]                      # user-mode NAT (slirp)
+id = "net0"
+forward = ["tcp:2222:22", "8080:80"]   # host 127.0.0.1 port : guest port
+host_loopback = false
+
+[[rng]]
+id = "rng0"
+
+[debug]                      # experiment switches; the defaults are right for normal use
+pool = true
+check_reuse = false
+page_currency = "on"         # on, off or check
+writable_on_read = true
+perf_log = "perf.log"

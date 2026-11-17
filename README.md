@@ -151,6 +151,9 @@ The first boot translates everything and takes a few seconds longer; later boots
 At startup natemu prints a few `natemu: ...` lines describing how it will run on this Mac: the CPU it shows the guest,
 the floating-point mode, which hardware speed-ups it uses, and where it caches translated code.
 
+A launch can also be described in a TOML file (`--config FILE`), which adds several disks and
+read-only disks; see [docs/configuration.md](docs/configuration.md).
+
 `target/release/natemu --help` lists every option. natemu exits 0 when the guest powers off,
 2 for any other stop (reset, crash, Ctrl-A x) and 1 on a host error.
 

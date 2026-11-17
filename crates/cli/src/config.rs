@@ -545,8 +545,6 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-// TODO(step 7): `--virtio-transport`'s help says [default: mmio], which is wrong with a --config file (the default is pci there);
-// and the serial keyword `stdout` of the file and --set differs from the flag, where `--serial stdout` is a file name.
 const KEYS: [&str; 22] = [
     "machine.ram",
     "machine.vcpus",

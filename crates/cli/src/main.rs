@@ -1,26 +1,44 @@
 //! `natemu`, the boot entry: boots a Linux bzImage on the library's [`natemu::linux::Boot`] with the persistent compile
 //! cache on by default ([`natemu::compile_cache::Config::new`]).
 //!
-//!   natemu --fexc FILE --kernel FILE [--runtime FILE] [--initrd FILE] [--cmdline TEXT] [--ram SIZE] [--vcpus N]
-//!       [--serial FILE] [--serial-stdin] [--speculation-barriers] [--fp fast|accurate] [--pool[=false]] [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N]
-//!       [--perf-log FILE] [--page-currency on|off|check] [--writable-on-read on|off] [--rng] [--disk FILE] [--net]
-//!       [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT] [--net-host-loopback] [--virtio-transport SPEC]
+//!   natemu [--config FILE] [--set KEY=VALUE]... [--fexc FILE] [--kernel FILE] [--runtime FILE] [--initrd FILE] [--cmdline TEXT]
+//!       [--ram SIZE] [--vcpus N] [--serial FILE] [--serial-stdin] [--speculation-barriers] [--fp fast|accurate] [--pool[=false]]
+//!       [--check-reuse] [--compile-cache DIR|off] [--compile-cache-mb N] [--perf-log FILE] [--page-currency on|off|check]
+//!       [--writable-on-read on|off] [--rng] [--disk FILE] [--net] [--net-forward [tcp|udp:]HOST_PORT:GUEST_PORT]
+//!       [--net-host-loopback] [--virtio-transport SPEC]
 //!
-//! Named arguments (clap; `natemu --help`). Eight fall back to `NATEMU_SERIAL_STDIN`,
-//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_FP`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG` (a flag wins
-//! over its variable; a switch's variable takes 1/0, true/false, yes/no, on/off). `--runtime` defaults to the resident built beside this binary
-//! (`<target>/aarch64-unknown-none/<profile>/natemu-runtime` for `<target>/<profile>/natemu`) when that file exists.
-//! `--ram` takes bytes, 0x hex, or a K/M/G suffix (binary units: 2G = 2048M = 0x80000000). COM1's output goes to
-//! `--serial FILE` (default standard output). The stop of the vCPU that ended the run is written to standard error.
-//! Exits 0 when the guest powered off, 2 at any other stop (SIGINT or SIGTERM cancels the run: `Cancelled`; a second one
-//! exits 130 at once), 1 on a host error (a failed serial write and a refused command line included; `--help` exits 0).
-//! `--perf-log FILE` turns on the library's timing log (`natemu::perf`). `--serial-stdin` (off by default) feeds standard
-//! input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode, Ctrl-C to the guest, Ctrl-A x cancels the run.
-//! `--page-currency` (default on; `NATEMU_PAGE_CURRENCY`): a per-vCPU record of fetch-walk results answers the resident's fetch
-//! translations as a TLB entry does (page-currency plan); `off` walks every one, `check` answers from the record and walks too,
-//! counting any difference. `--writable-on-read` (default on; `NATEMU_WRITABLE_ON_READ`): a demand read installs the shadow writable when the
-//! guest entry has D set and grants the write, so a later write needs no second abort (fault-around plan chunk 1); `off` is the old behaviour. `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` to turn it off): the shared template pool, in
-//! which the host publishes admitted templates and each resident looks before asking the host (cross-vCPU reuse plan).
+//! Named arguments (clap; `natemu --help`); the configuration file is described in docs/configuration.md.
+//!
+//! **Layers.** A launch is built lowest first from: the built-in defaults, the `--config FILE`, the deprecated environment
+//! variables, the flags, then `--set KEY=VALUE` (so `--set` wins). `--kernel` and `--fexc` are required unless the file gives
+//! `[boot.kernel] image` and `[engine] fexc`. `--disk`, `--net` and `--rng` are refused when the file lists devices of that
+//! kind; edit a listed device with `--set disk.ID.path=...`. Paths in the file are relative to the file's folder; paths in
+//! flags and `--set` are relative to the working directory.
+//!
+//! **Transport.** Virtio devices attach over PCI when a `--config` file is given and over MMIO without one (the old command
+//! lines); `--virtio-transport` and `machine.transport` override either.
+//!
+//! **Disks.** `--disk FILE` is the first writable disk (id `disk0`); the image format (raw, or qcow2 once that backend
+//! lands) is detected from its first bytes, not from the name. Disks beyond the first, read-only disks and ids come from the file.
+//!
+//! **Serial.** `--serial FILE` writes COM1 to that file, so `--serial stdout` is a file named `stdout`; the keyword form is
+//! `[serial] output = "stdout"` (or `--set serial.output=stdout`), which means standard output. Without either, COM1 goes
+//! to standard output. The stop of the vCPU that ended the run is written to standard error.
+//!
+//! **Environment variables (deprecated).** Ten flags still fall back to a variable: `NATEMU_SERIAL_STDIN`,
+//! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_FP`, `NATEMU_PAGE_CURRENCY`, `NATEMU_WRITABLE_ON_READ`, `NATEMU_POOL`,
+//! `NATEMU_CHECK_REUSE`, `NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG`. They work as before (a flag
+//! wins over its variable; a switch's variable takes 1/0, true/false, yes/no, on/off) but each one used prints once to
+//! standard error `natemu: NAME is deprecated; use [section] field or --set section.field=...`.
+//!
+//! `--runtime` defaults to the resident built beside this binary (`<target>/aarch64-unknown-none/<profile>/natemu-runtime`
+//! for `<target>/<profile>/natemu`) when that file exists. `--ram` takes bytes, 0x hex, or a K/M/G suffix (binary units:
+//! 2G = 2048M = 0x80000000). Exits 0 when the guest powered off, 2 at any other stop (SIGINT or SIGTERM cancels the run:
+//! `Cancelled`; a second one exits 130 at once), 1 on a host error (a failed serial write and a refused command line
+//! included; `--help` exits 0). `--perf-log FILE` turns on the library's timing log (`natemu::perf`). `--serial-stdin` (off
+//! by default) feeds standard input to COM1 (`natemu::linux::serial_stdin`): a terminal in raw mode, Ctrl-C to the guest,
+//! Ctrl-A x cancels the run. `--page-currency` and `--writable-on-read` are debug and measurement switches (see their
+//! help). `--pool` (default on; `--pool=false` or `NATEMU_POOL=0` turns it off) is the shared template pool.
 //! `--speculation-barriers` turns on the resident's page-walk barriers (refused without FEAT_SB; with FEAT_CSV3 they
 //! advertise RDCL_NO: `natemu::linux::Boot::speculation_barriers`).
 mod config;
@@ -37,14 +55,20 @@ const MAX_INPUT: usize = 1 << 32;
 #[derive(clap::Parser)]
 #[command(
     name = "natemu",
-    after_help = "Exit status: 0 the guest powered off, 2 any other stop (reset, a typed stop, a watchdog, \
+    after_help = "Settings are layered, lowest first: defaults, --config FILE, environment variables (deprecated), flags, --set. \
+    --kernel and --fexc may instead come from the file. Virtio devices use PCI with a --config file and MMIO without one \
+    (--virtio-transport overrides). The ten environment variables NATEMU_SERIAL_STDIN, _SPECULATION_BARRIERS, _FP, \
+    _PAGE_CURRENCY, _WRITABLE_ON_READ, _POOL, _CHECK_REUSE, _COMPILE_CACHE, _COMPILE_CACHE_MB and _PERF_LOG are deprecated: \
+    they still work, and each one used prints a warning to standard error naming the file key to use. \
+    See docs/configuration.md.\n\n\
+    Exit status: 0 the guest powered off, 2 any other stop (reset, a typed stop, a watchdog, \
     SIGINT/SIGTERM), 1 a host error. A flag wins over its environment variable."
 )]
 struct Cli {
-    /// A configuration file (TOML; see docs/m1-config-and-qcow2-design.md): below the environment variables and the flags
+    /// A configuration file (TOML; see docs/configuration.md); its settings are overridden by the environment variables, the flags and `--set`
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// Override one setting, `key=value` (repeatable; a key set twice is an error; cannot create a device)
+    /// Override one setting, e.g. `machine.ram=4G` or `disk.root.readonly=true` (repeatable; wins over everything else; a key set twice is an error; a device is addressed by its id and cannot be created)
     #[arg(long = "set", value_name = "KEY=VALUE", allow_hyphen_values = true)]
     set: Vec<String>,
     /// Which flags clap took from the command line and from the environment (filled by [`parse_cli`])
@@ -53,10 +77,10 @@ struct Cli {
     /// The resident runtime ELF [default: the one built beside this binary]
     #[arg(long, value_name = "FILE")]
     runtime: Option<PathBuf>,
-    /// The fexc compiler
+    /// The fexc compiler (required unless the --config file has `[engine] fexc`)
     #[arg(long, value_name = "FILE")]
     fexc: Option<PathBuf>,
-    /// The Linux bzImage
+    /// The Linux bzImage (required unless the --config file has `[boot.kernel] image`)
     #[arg(long, value_name = "FILE")]
     kernel: Option<PathBuf>,
     /// An initrd (initramfs) to load
@@ -71,7 +95,7 @@ struct Cli {
     /// Processors [default: 1]
     #[arg(long, value_name = "N")]
     vcpus: Option<usize>,
-    /// Write COM1's output to FILE [default: standard output]
+    /// Write COM1's output to FILE [default: standard output]; the name `stdout` here is a file (the file key `output = "stdout"` means standard output)
     #[arg(long, value_name = "FILE")]
     serial: Option<PathBuf>,
     /// Feed standard input to COM1; Ctrl-A x cancels the run
@@ -80,21 +104,21 @@ struct Cli {
     /// The resident's page-walk speculation barriers (needs FEAT_SB)
     #[arg(long, env = "NATEMU_SPECULATION_BARRIERS", value_parser = clap::builder::BoolishValueParser::new())]
     speculation_barriers: bool,
-    /// Floating-point mode (AFP accurate plan chunk 1): fast (the default) or accurate; accurate changes code only on a host without FEAT_AFP
+    /// Floating-point mode: fast (the default) or accurate (changes the generated code only on a host without FEAT_AFP)
     #[arg(long, env = "NATEMU_FP", value_name = "fast|accurate", default_value = "fast", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_fp)]
     fp: bool,
-    /// Page-currency plan chunk 1: the page record of fetch-walk results answers fetch translations (on, the default), none
-    /// does (off), or it answers and the walk is made too, a difference counted (check)
+    /// Debug: a per-vCPU record of instruction-fetch page walks answers fetch translations (on, the default), none does (off),
+    /// or it answers and the walk is made too, any difference counted (check)
     #[arg(long, env = "NATEMU_PAGE_CURRENCY", value_name = "on|off|check", default_value = "on", value_parser = parse_page_currency)]
     page_currency: u64,
-    /// Fault-around plan chunk 1: a demand read installs the shadow writable when the guest entry has D set and grants the write (on, the
-    /// default), or read-only as before (off); for A/B measurement
+    /// Debug: a demand read maps the page writable when the guest entry is dirty and writable, saving a later fault (on, the
+    /// default), or read-only (off); for A/B measurement
     #[arg(long, env = "NATEMU_WRITABLE_ON_READ", value_name = "on|off", default_value = "on", action = clap::ArgAction::Set, value_parser = natemu::execution::parse_writable_on_read)]
     writable_on_read: bool,
     /// Expose the virtio entropy device
     #[arg(long)]
     rng: bool,
-    /// Writable raw disk image (exclusive use; successful S5 includes full-sync)
+    /// The first disk, writable (id disk0; the image format is detected from its content: raw, or qcow2 once that backend lands; exclusive use; a guest power-off flushes it to the device). More disks, read-only disks and ids need a --config file
     #[arg(long, value_name = "FILE")]
     disk: Option<PathBuf>,
     /// Expose a virtio network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)
@@ -107,7 +131,7 @@ struct Cli {
     /// Allow guest 10.0.2.2:PORT to reach host 127.0.0.1:PORT (broad localhost access; default off)
     #[arg(long, requires = "net")]
     net_host_loopback: bool,
-    /// The shared template pool (a read-only 274 MiB span of address space, backed as touched): the host publishes admitted
+    /// Debug: the shared template pool (a read-only 274 MiB span of address space, backed as touched): the host publishes admitted
     /// templates into it and each resident looks in it before asking the host. On by default; `--pool=false` or `NATEMU_POOL=0`
     /// turns it off (`NATEMU_POOL_LOOKUP=off`: publication only)
     #[arg(
@@ -121,12 +145,12 @@ struct Cli {
     )]
     pool: bool,
     /// Debug: every block the resident copies instead of asking the host (a template of its own, or a pool entry) and every
-    /// answer reused at another RIP is also compiled by the host and must be equal (a mismatch stops the run); as boot-linux's
+    /// answer reused at another RIP is also compiled by the host and must be equal (a mismatch stops the run)
     #[arg(long, env = "NATEMU_CHECK_REUSE", value_parser = clap::builder::BoolishValueParser::new())]
     check_reuse: bool,
     /// How virtio devices attach: `mmio` or `pci` for all, or (experimental) per device, e.g. `disk=pci,net=mmio,rng=mmio`
-    /// (keys disk, net, rng; unnamed devices take mmio)
-    #[arg(long, value_name = "SPEC", value_parser = transports, default_value = "mmio")]
+    /// (keys disk, net, rng; unnamed devices take mmio) [default: pci with a --config file, mmio without one]
+    #[arg(long, value_name = "SPEC", value_parser = transports, default_value = "mmio", hide_default_value = true)]
     virtio_transport: Transports,
     /// The persistent compile cache's directory, or off [default: ~/Library/Caches/natemu/fexc]
     #[arg(long, value_name = "DIR|off", env = "NATEMU_COMPILE_CACHE")]
