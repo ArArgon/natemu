@@ -1,0 +1,185 @@
+# Configuring a natemu launch
+
+A launch can be described in a TOML file and started with `natemu --config FILE`. The file holds the
+same settings as the command-line flags, plus a device list (several disks, read-only disks) that
+the flags cannot express. Flags still work alone, exactly as before.
+
+Settings are layered, lowest first: built-in defaults, the file, the deprecated environment
+variables, the flags, then `--set KEY=VALUE`. A later layer overrides an earlier one. Paths in the
+file are relative to the file's folder; paths in flags and `--set` are relative to the working
+directory. `--kernel` and `--fexc` are only required when the file does not give
+`[boot.kernel] image` and `[engine] fexc`.
+
+## An annotated example
+
+This is `crates/cli/tests/example.toml`, which the tests parse, so it stays valid.
+
+```toml
+# debian.toml: a direct-boot Debian launch. Relative paths mean this file's folder.
+
+[machine]                    # what the guest sees
+ram = "4G"                   # bytes, 0x hex, or a K/M/G suffix
+vcpus = 2
+transport = { disk = "pci", nic = "pci", rng = "pci" }   # "mmio" or "pci"
+
+[serial]                     # COM1's host end
+output = "serial.log"        # a file; the word "stdout" means standard output
+stdin = false                # true: the terminal is the console (Ctrl-A x quits)
+
+[engine]                     # how natemu runs the guest
+fexc = "../build/fexc"
+fp = "fast"                  # or "accurate"
+compile_cache = "off"        # a folder or "off"; left out, the user cache folder
+compile_cache_mb = 512
+speculation_barriers = false
+
+[boot.kernel]
+image = "vmlinuz-6.12.107"
+initrd = "initrd.img-6.12.107"
+cmdline = "console=ttyS0 root=/dev/vda1 ro"
+
+[[disk]]                     # the guest sees disks in this order: /dev/vda, /dev/vdb, ...
+id = "root"
+path = "debian13.raw"
+
+[[disk]]
+id = "data"
+path = "data.raw"
+
+[[disk]]
+id = "tools"
+path = "tools.iso"
+readonly = true              # an ISO, or any image the guest must not change
+
+[[nic]]                      # user-mode NAT (slirp)
+id = "net0"
+forward = ["tcp:2222:22", "8080:80"]   # host 127.0.0.1 port : guest port
+host_loopback = false
+
+[[rng]]
+id = "rng0"
+
+[debug]                      # experiment switches; the defaults are right for normal use
+pool = true
+check_reuse = false
+page_currency = "on"         # on, off or check
+writable_on_read = true
+perf_log = "perf.log"
+```
+
+## Sections and defaults
+
+Every table rejects unknown keys, so a misspelled key is an error, not silently ignored.
+
+| Section | Key | Default | Meaning |
+| --- | --- | --- | --- |
+| `[machine]` | `ram` | `2G` | Guest RAM: a size string (as `--ram`) or an integer of bytes |
+| | `vcpus` | `1` | Processors |
+| | `transport` | all `pci` with a file | `disk`, `nic`, `rng`, each `"mmio"` or `"pci"` |
+| `[serial]` | `output` | standard output | A file path, or the word `stdout` |
+| | `stdin` | `false` | Feed standard input to COM1 |
+| `[engine]` | `fexc` | none (required) | The fexc compiler |
+| | `runtime` | the resident built beside the binary | The resident runtime ELF |
+| | `fp` | `"fast"` | `"fast"` or `"accurate"` |
+| | `compile_cache` | the user cache folder | A folder, or `"off"` |
+| | `compile_cache_mb` | `512` | Cache cap in MiB |
+| | `speculation_barriers` | `false` | Page-walk barriers (needs FEAT_SB) |
+| `[boot.kernel]` | `image` | none (required) | The Linux bzImage |
+| | `initrd`, `cmdline` | none, empty | Initramfs and kernel command line |
+| `[[disk]]` | `id`, `path` | required | A disk image |
+| | `readonly` | `false` | The guest cannot write it |
+| | `backing` | none | qcow2 backing file (see limits) |
+| `[[nic]]` | `id` | required | User-mode NAT network device |
+| | `forward` | none | List of `[tcp\|udp:]HOST_PORT:GUEST_PORT` strings |
+| | `host_loopback` | `false` | The guest may reach the Mac's `127.0.0.1` via `10.0.2.2` |
+| `[[rng]]` | `id` | required | Entropy device |
+| `[debug]` | `pool` | `true` | Shared template pool |
+| | `check_reuse` | `false` | Verify every reused block (a mismatch stops the run) |
+| | `page_currency` | `"on"` | `on`, `off` or `check` |
+| | `writable_on_read` | `true` | Map a page writable on a demand read of a dirty entry |
+| | `perf_log` | none | Write the timing log to a file |
+
+The `[debug]` keys are experiment and measurement switches; leave them alone for normal use.
+
+`[boot]` must name exactly one boot method. Only `[boot.kernel]` exists; `[boot.uefi]` is refused
+for now.
+
+### Transport default
+
+Virtio devices attach over PCI when a `--config` file is given and over MMIO when there is none
+(the old command lines). `machine.transport` or `--virtio-transport` overrides either.
+
+### Serial: `stdout` as a keyword and as a file name
+
+`[serial] output = "stdout"` (and `--set serial.output=stdout`) means standard output. The flag
+`--serial stdout` is a file named `stdout` in the working directory, as it always was. To write
+to standard output with the flag, leave `--serial` out.
+
+### The device list and guest names
+
+The guest names disks in list order: the first `[[disk]]` is `/dev/vda`, the second `/dev/vdb`, and so on.
+Inserting a disk in the middle renumbers every later one, so a `root=` on the command line must
+follow the list. Name devices by `id` only in the file and in `--set`; the guest never sees ids.
+
+## Overriding with `--set`
+
+`--set KEY=VALUE` is repeatable and wins over everything else. Keys are the table path:
+`--set machine.ram=8G`, `--set engine.fp=accurate`, `--set boot.kernel.cmdline="console=ttyS0 root=/dev/vdb1"`.
+A device is addressed by its id: `--set disk.root.path=other.raw`, `--set disk.tools.readonly=false`,
+`--set nic.net0.forward=tcp:2222:22,8080:80` (a comma-separated list). `--set` can change a listed
+device but cannot create one. Setting one key twice on the command line (by flag, `--set`, or
+both) is an error. `--disk`, `--net` and `--rng` are refused when the file lists devices of that
+kind. `--set machine.transport` takes both `nic=` and the old `net=`.
+
+## Deprecated environment variables
+
+Ten flags can still be set from the environment: `NATEMU_SERIAL_STDIN`, `NATEMU_SPECULATION_BARRIERS`,
+`NATEMU_FP`, `NATEMU_PAGE_CURRENCY`, `NATEMU_WRITABLE_ON_READ`, `NATEMU_POOL`, `NATEMU_CHECK_REUSE`,
+`NATEMU_COMPILE_CACHE`, `NATEMU_COMPILE_CACHE_MB` and `NATEMU_PERF_LOG`. They sit above the file and
+below the flags. Each one used prints once to standard error, for example:
+
+```
+natemu: NATEMU_FP is deprecated; use [engine] fp or --set engine.fp=...
+```
+
+## Errors you can see
+
+Every message is one line, starts with `natemu:`, and names the file (or `config` when there is
+none) and the key. All of these are found before the VM starts, and the process exits 1.
+
+| Message (shortened) | Meaning |
+| --- | --- |
+| `c.toml: bogus: unknown field 'bogus', expected one of ...` | A misspelled or unknown table |
+| `c.toml: disk[0].fromat: unknown field 'fromat', expected one of ...` | A misspelled key; `disk[0]` is the first `[[disk]]` |
+| `c.toml: string values must be quoted, expected literal string` | TOML syntax error (the text is the TOML parser's) |
+| `c.toml: machine.ram: bad size 4X: bytes, 0x hex, or a K/M/G suffix` | `ram` is not a size |
+| `c.toml: machine.transport.disk: bad transport "usb": mmio or pci` | Transport is not `mmio` or `pci` |
+| `c.toml: [boot] needs exactly one boot method, [boot.kernel] or [boot.uefi]; found none` | `[boot]` without a method (also `found both`) |
+| `c.toml: [boot.uefi]: UEFI boot is planned (M3) and not built yet` | No UEFI boot yet |
+| `c.toml: [boot.kernel] needs image (or pass --kernel FILE)` | The table has no kernel |
+| `c.toml: no boot method: --kernel FILE, or [boot.kernel] in a --config file` | No kernel anywhere |
+| `c.toml: no fexc: --fexc FILE, or [engine] fexc in a --config file` | No compiler anywhere |
+| `c.toml: device id "A b" must match [a-z0-9_-]+ (disk 1)` | An id has other characters |
+| `c.toml: device id "a" is used twice (disk 1 and nic 1)` | Ids are unique across all device kinds |
+| `c.toml: at most one [[nic]] is supported in M1; found 2` | Also for `[[rng]]` |
+| `c.toml: disks "a" and "b" are the same file; that is allowed only when both are readonly` | One image, two writers |
+| `c.toml: nic[0].forward: bad forward "x": [tcp\|udp:]HOST_PORT:GUEST_PORT, decimal ports 1-65535` | A forward is malformed |
+| `--set bad: expected key=value` | `--set` without `=` |
+| `--set disk.zz.path: no disk with id "zz" (an override cannot create a device)` | Unknown device id |
+| `--set machine.nope: unknown key; expected one of ...` | Unknown key; the message lists all valid keys |
+| `--set machine.ram: set twice on the command line` | A key given twice |
+| `--disk: the config file lists [[disk]] devices; use --set disk.ID.path=... or edit the file` | Flag and file disagree on who owns the devices |
+| `c.toml: backing files are not built yet` | See limits |
+
+## Limits
+
+- At most 6 disks on MMIO and 29 on PCI. Over either, the launch is refused with
+  `at most 6 disks on mmio (interrupt lines 16-23); use pci for more` (or
+  `PCI slots 1-31 are all used: at most 29 disks on pci`).
+- One NIC and one entropy device.
+- No `[boot.uefi]` yet.
+- Disk images are detected by content, not name (raw or qcow2). A qcow2 image can be a launch's
+  disk once the qcow2 backend lands; until then it is refused with a message saying so. The
+  `backing` key (a qcow2 overlay over a base image) is parsed but not yet built from the
+  configuration: a launch with `backing` is refused until a later step.
+- A file's `[boot.kernel]` must give `image` unless `--kernel` supplies it.

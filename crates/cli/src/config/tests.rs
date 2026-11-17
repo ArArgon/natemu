@@ -977,3 +977,19 @@ fn review_fixes() {
         .is_err()
     );
 }
+
+/// The annotated example in docs/configuration.md is the file crates/cli/tests/example.toml, and it loads.
+#[test]
+fn the_documented_example_is_in_the_doc_and_loads() {
+    let _env = lock();
+    let example = include_str!("../../tests/example.toml");
+    assert!(include_str!("../../../../docs/configuration.md").contains(example));
+    let (d, c) = load_file(example, &[]);
+    let cfg = c.unwrap();
+    assert_eq!(cfg.disks.len(), 3);
+    assert!(cfg.disks[2].readonly && !cfg.disks[0].readonly);
+    assert_eq!((cfg.nics.len(), cfg.rngs.len()), (1, 1));
+    assert_eq!(cfg.nics[0].forward.len(), 2);
+    assert_eq!(cfg.ram, Some(4 << 30));
+    assert_eq!(cfg.fexc, Some(d.join("../build/fexc")));
+}
