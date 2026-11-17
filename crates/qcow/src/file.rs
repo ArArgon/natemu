@@ -150,8 +150,9 @@ pub fn sync_fd(fd: libc::c_int, kind: SyncKind) -> io::Result<()> {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     log::warn!(
-                        "this file system refuses F_BARRIERFSYNC/F_FULLFSYNC ({e}); using fsync, \
-                         which orders nothing against a power loss"
+                        "this file system refuses F_BARRIERFSYNC/F_FULLFSYNC ({e}); falling back \
+                         to fsync: images on it are NOT safe against a power loss (a qcow2 image \
+                         can be corrupted, not just lose recent writes)"
                     )
                 });
                 fsync_retry_eintr(fd)

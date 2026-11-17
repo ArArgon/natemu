@@ -15,7 +15,8 @@
 use std::cmp::min;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::decoder::Decoder;
 use super::metadata::{BackingRead, ClusterReadMapping, DeallocAction, QcowMetadata};
@@ -41,13 +42,40 @@ pub(super) fn decompress_cluster(
     Ok(decompressed)
 }
 
-/// Applies one deallocation action to the data file and refcount table.
-/// natemu: how long one deallocation may spend punching holes. Past it, freed clusters go to the
+/// natemu: how long a disk may spend punching holes per [`PUNCH_WINDOW`]. Past it, freed clusters go to the
 /// free list unpunched: their contents no longer matter (reads come from the tables, and a reused
 /// cluster is written whole under the table lock), so only host space is reclaimed later. This
 /// keeps a guest DISCARD or WRITE_ZEROES over many scattered clusters (32 ranges of 2 GiB in one
 /// request) inside the device's 10 s call limit.
-const PUNCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+const PUNCH_TIME: Duration = Duration::from_millis(250);
+/// The window [`PUNCH_TIME`] applies to: longer than the device's call limit, so no request (one
+/// call or the up to 32 calls of one DISCARD or WRITE_ZEROES) can punch for longer than
+/// `PUNCH_TIME` plus one punch, wherever its boundaries fall (the backend does not see them).
+const PUNCH_WINDOW: Duration = Duration::from_secs(10);
+/// The longest single punch, so one punch cannot hold a worker long.
+const MAX_PUNCH: u64 = 128 << 20;
+
+/// natemu: the punching time a disk has left in the current [`PUNCH_WINDOW`].
+#[derive(Debug)]
+pub(super) struct PunchBudget(Mutex<(Instant, Duration)>);
+
+impl PunchBudget {
+    pub(super) fn new() -> Self {
+        Self(Mutex::new((Instant::now(), Duration::ZERO)))
+    }
+
+    fn available(&self) -> bool {
+        let mut window = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if window.0.elapsed() >= PUNCH_WINDOW {
+            *window = (Instant::now(), Duration::ZERO);
+        }
+        window.1 < PUNCH_TIME
+    }
+
+    fn spend(&self, time: Duration) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1 += time;
+    }
+}
 
 /// Deallocates a byte range, returning the first error after applying
 /// every action. natemu: contiguous punches are one call (upstream punched per cluster, about
@@ -60,6 +88,7 @@ pub(super) fn deallocate_range(
     sparse: bool,
     write_zeroes: bool,
     backing_file: Option<&dyn BackingRead>,
+    budget: &PunchBudget,
 ) -> io::Result<()> {
     let actions = metadata.deallocate_bytes(
         offset,
@@ -68,7 +97,6 @@ pub(super) fn deallocate_range(
         write_zeroes || backing_file.is_some(),
         backing_file,
     )?;
-    let deadline = std::time::Instant::now() + PUNCH_BUDGET;
     let mut first_error = None;
     let mut i = 0;
     while i < actions.len() {
@@ -84,12 +112,16 @@ pub(super) fn deallocate_range(
                     length,
                 }) = actions.get(j)
                     && next == end
+                    && end + length - host_offset <= MAX_PUNCH.max(length)
                 {
                     end += length;
                     j += 1;
                 }
-                let punched = if std::time::Instant::now() < deadline {
-                    data_file.file().punch_hole(host_offset, end - host_offset)
+                let punched = if budget.available() {
+                    let start = Instant::now();
+                    let result = data_file.file().punch_hole(host_offset, end - host_offset);
+                    budget.spend(start.elapsed());
+                    result
                 } else {
                     Ok(())
                 };

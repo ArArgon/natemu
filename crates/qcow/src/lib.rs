@@ -66,6 +66,8 @@ pub struct QcowDisk {
     backing_file: Option<Arc<dyn BackingRead>>,
     sparse: bool,
     data_raw_file: QcowRawFile,
+    /// natemu: the punching time left to deallocations (see `common::PunchBudget`).
+    punch_budget: common::PunchBudget,
 }
 
 impl std::fmt::Debug for QcowDisk {
@@ -102,6 +104,7 @@ impl QcowDisk {
             backing_file: backing_file.map(shared_backing_from).transpose()?,
             sparse,
             data_raw_file,
+            punch_budget: common::PunchBudget::new(),
         })
     }
 
@@ -249,6 +252,7 @@ impl QcowDisk {
             self.sparse,
             write_zeroes,
             self.backing_file.as_deref(),
+            &self.punch_budget,
         )
     }
 
