@@ -377,7 +377,9 @@ fn patch_ufc(o: &Op, rc: u32, q: &[[u8; 16]; 3], rerun: u64, flush: u8, dest: &m
             // an add, subtract or square root is exact: tiny exactly when the result is a denormal
             let tiny = if o.kind == 0 { v & !sign <= man && v & !sign != 0 } else { tiny::lane_tiny(o.kind, o.wide, o.neg, rc, a, b, c) };
             // FTZ alone: software flushes the denormals (row 5), so only the band's MIN_NORMAL is left to fix here
-            if tiny && (flush == FLUSH_ALL || v & !sign == min) {
+            // DAZ + FTZ: also any denormal result, whatever the tininess model said (the shim's DAZ skip rule relies on a flushed result holding none)
+            let denormal = flush == FLUSH_ALL && v & !sign <= man && v & !sign != 0;
+            if denormal || tiny && (flush == FLUSH_ALL || v & !sign == min) {
                 dest[at..at + size].copy_from_slice(&(v & sign).to_le_bytes()[..size]);
                 under = true;
                 continue;
@@ -571,6 +573,23 @@ pub unsafe fn exec(at: *const u32, fpcr: u64, d: *mut [u8; 16], n: *const [u8; 1
 mod tests {
     extern crate std;
     use super::*;
+
+    /// Review item A2 (driven by `AfpDazFree.test_every_producer_word_is_in_the_flushing_class` in tools/fexc/test_slice1.py, which writes the
+    /// file named by `NATEMU_PRODUCER_WORDS`, one `name hexword` per line): the shim's DAZ skip rule assumes every Arm FP word a producer lowers
+    /// to is one the handler flushes, so none may be classified Keep (or unknown).
+    #[test]
+    fn producer_words_are_all_in_the_flushing_class() {
+        let Some(path) = std::env::var_os("NATEMU_PRODUCER_WORDS") else { return };
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut n = 0;
+        for line in text.lines() {
+            let (name, w) = line.rsplit_once(' ').unwrap();
+            let w = u32::from_str_radix(w, 16).unwrap();
+            assert!(matches!(classify(w), Some(Class::Patch(_))), "{name}: {w:#010x} is not in the flushing class");
+            n += 1;
+        }
+        assert!(n > 0, "no producer words");
+    }
 
     /// Chunk 6b: every word [`classify`] patches has a table entry whose instruction is the word with its registers renamed (so the same
     /// operation, arrangement, element size, index and form); the sweep covers every value of the bits above Rd and Rn (the registers' own
