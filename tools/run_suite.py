@@ -163,15 +163,15 @@ def steps(F, O):
         vm('i6b-cases' + sfx, 'run_i6b.py', 'cases', *blk)
     # FP regressions on hosts without FEAT_AFP (M1/M2), caught on this M4: the same runners with NATEMU_FEXC_FEATURE_OFF=afp, in fast
     # mode (documented deviations counted: tools/fp_deviations.py) and accurate mode (NATEMU_FP=accurate: exact). Owner, Nov 16.
-    # i8/i8b are not run in accurate mode yet: exact NaN results arrive with accurate chunk 4; add them to the loop then.
+    # i8/i8b: accurate mode (chunk 4) judges every program exactly; i8b_judge applies no deviation rule there (the report says `fp` accurate),
+    # so only its 7 known QEMU departures may fail.
     for tag, fp in (('m2f', None), ('m2a', 'accurate')):
         fpenv = ['env', 'NATEMU_FEXC_FEATURE_OFF=afp'] + ([f'NATEMU_FP={fp}'] if fp else [])
         def fpvm(name, script, *args, **kw):
             vm(name, script, *args, **kw); S[-1].argv = fpenv + S[-1].argv
         for r, est in (('run_i5c.py', 8), ('run_i5a_de.py', 10), ('run_i6_faults.py', 10), ('run_i8_faults.py', 45)):
             fpvm(r[4:-3].replace('_', '-') + '-' + tag, r, est=est)
-        if fp is None:
-            for c in ('i8', 'i8b'): fpvm(f'{c}-{tag}', 'run_slice1_vm.py', *pair(c), judge=i8b_judge if c == 'i8b' else None)
+        for c in ('i8', 'i8b'): fpvm(f'{c}-{tag}', 'run_slice1_vm.py', *pair(c), judge=i8b_judge if c == 'i8b' else None)
     vm('flow', 'run_slice2_vm.py', '--programs', RAW / 's2d/corpus/programs.json', '--expected', RAW / 's2d/corpus/expected.json')
     for size in ('default', '1', '2'): shards(SHARDS['loopfaults'], f'loopfaults-{size}', 'run_slice2_faults.py', '--sizes', size, est=120)
     shards(SHARDS['probes'], 'probes', 'run_slice2_probes.py', est=PROBES_EST)
