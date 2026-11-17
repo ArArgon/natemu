@@ -327,15 +327,27 @@ pub fn fma_check(wide: bool, lanes: usize, q: &[[u8; 16]; 3], result: &mut [u8; 
 /// UE and PE: the UFC kept here becomes both). Single and double lanes of multiplies, divides, FMAs and the double-to-single narrowing
 /// (VCVTPS2PH ignores FTZ).
 pub fn patch(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64, ftz: bool, dest: &mut [u8; 16], nan: bool) -> u64 {
+    patch_flush(class, rc, q, rerun, u8::from(ftz), dest, nan)
+}
+
+/// Software flush of the result under DAZ + FTZ (AFP accurate plan chunk 5): FZ stays 0 with UFE on and row 4 flushes the inputs, so every
+/// tiny result traps (exact ones too: an add's) and the patch gives x86's FTZ result in each lane.
+pub const FLUSH_ALL: u8 = 2;
+
+/// [`patch`] with `flush`: 0 none, 1 the band under FTZ alone (what `ftz` means), [`FLUSH_ALL`] the full flush of DAZ + FTZ: in every lane of
+/// every word that x86 flushes, a result tiny after rounding (a denormal, a zero from underflow, or the band's +-MIN_NORMAL that x86 rounds
+/// below it) becomes +-0 with UFC (UE and PE: `mxcsr_flags`); a band result that x86 rounds up to MIN_NORMAL stays, its IXC being PE.
+/// VCVTPS2PH's `fcvtn` is never flushed (UE by the model alone).
+pub fn patch_flush(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64, flush: u8, dest: &mut [u8; 16], nan: bool) -> u64 {
     let Class::Patch(o) = class else {
         return rerun;
     };
-    let flags = if o.kind != 0 { patch_ufc(&o, rc, q, rerun, ftz, dest) } else { rerun };
+    let flags = if o.kind != 0 || flush == FLUSH_ALL { patch_ufc(&o, rc, q, rerun, flush, dest) } else { rerun };
     if nan { patch_nan(&o, q, flags, dest) } else { flags }
 }
 
-fn patch_ufc(o: &Op, rc: u32, q: &[[u8; 16]; 3], rerun: u64, ftz: bool, dest: &mut [u8; 16]) -> u64 {
-    if rerun & UFC == 0 {
+fn patch_ufc(o: &Op, rc: u32, q: &[[u8; 16]; 3], rerun: u64, flush: u8, dest: &mut [u8; 16]) -> u64 {
+    if rerun & UFC == 0 && flush != FLUSH_ALL {
         return rerun;
     }
     let lane = |r: usize, i: usize, wide: bool| -> u64 {
@@ -354,19 +366,23 @@ fn patch_ufc(o: &Op, rc: u32, q: &[[u8; 16]; 3], rerun: u64, ftz: bool, dest: &m
             _ => lane(1, i, o.wide),
         };
         let c = if o.kind == tiny::FMA { lane(2, i, o.wide) } else { 0 };
-        if ftz && o.kind != tiny::CVT16 && tiny::lane_tiny(o.kind, o.wide, o.neg, rc, a, b, c) {
+        if flush != 0 && o.kind != tiny::CVT16 {
             // result lane: same index and size, or for the narrowing 4 bytes at 4 * i (+ 8 for FCVTN2)
             let (size, at) = if o.kind == tiny::CVT { (4, 4 * i + 8 * usize::from(o.upper)) } else if o.wide { (8, 8 * i) } else { (4, 4 * i) };
             let mut raw = [0u8; 8];
             raw[..size].copy_from_slice(&dest[at..at + size]);
             let (v, sign) = (u64::from_le_bytes(raw), 1u64 << (8 * size - 1));
-            if v & !sign == if size == 4 { 0x0080_0000 } else { 0x0010_0000_0000_0000 } {
+            let (man, min) = if size == 4 { (0x007f_ffff, 0x0080_0000) } else { (0x000f_ffff_ffff_ffff, 0x0010_0000_0000_0000) };
+            // an add, subtract or square root is exact: tiny exactly when the result is a denormal
+            let tiny = if o.kind == 0 { v & !sign <= man && v & !sign != 0 } else { tiny::lane_tiny(o.kind, o.wide, o.neg, rc, a, b, c) };
+            // FTZ alone: software flushes the denormals (row 5), so only the band's MIN_NORMAL is left to fix here
+            if tiny && (flush == FLUSH_ALL || v & !sign == min) {
                 dest[at..at + size].copy_from_slice(&(v & sign).to_le_bytes()[..size]);
                 under = true;
                 continue;
             }
         }
-        under |= tiny::lane_underflow(o.kind, o.wide, o.neg, rc, a, b, c);
+        under |= o.kind != 0 && tiny::lane_underflow(o.kind, o.wide, o.neg, rc, a, b, c);
     }
     rerun & !UFC | if under { UFC } else { 0 }
 }
@@ -773,6 +789,115 @@ mod native {
         }
         let got = patch(Class::Patch(o), 0, &saved, rerun, true, &mut out, false);
         assert_eq!((get(&out, 4, 0), got & UFC), (0, UFC));
+    }
+
+    /// AFP accurate plan chunk 5: under DAZ + FTZ on a host without AFP accurate mode runs FZ = 0 with UFE; row 4 flushes the inputs (here: a
+    /// denormal lane of every operand register becomes a zero of its sign) and the trap's patch ([`FLUSH_ALL`], with the NaN rules) must give
+    /// what the M4 gives with AH = 1, FIZ = 1 and FZ = 1 on the original operands: every result lane bit for bit and every flag (UE and PE
+    /// through `mxcsr_flags`), in every rounding mode, on the band, real and exact tiny results, denormal inputs and NaNs.
+    fn check_daz_ftz(name: &str, f: Form, e: usize, re: usize, lanes: usize, narrowing: bool, trials: u32) {
+        let mut r = Rng(0xd1ce_5eed_0bad_cafe ^ name.len() as u64 * 15_485_863);
+        let (mut flushed, mut band_kept, mut band_flushed) = (0u32, 0u32, 0u32);
+        let mxcsr = 0x1f80 | 1 << 15 | 1 << 6;
+        let min = if re == 4 { 0x0080_0000 } else { 0x0010_0000_0000_0000 };
+        for t in 0..trials {
+            let orig = if t % 3 == 0 { nan_operands(&mut r, e) } else { operands(&mut r, e, narrowing) };
+            let mut q = orig;
+            for reg in &mut q {
+                for k in 0..16 / e {
+                    let v = get(reg, e, k);
+                    let (exp, man, sign) = if e == 4 { (v >> 23 & 255, v & 0x7f_ffff, v & 1 << 31) } else { (v >> 52 & 2047, v & ((1 << 52) - 1), v & 1 << 63) };
+                    if exp == 0 && man != 0 {
+                        put(reg, e, k, sign);
+                    }
+                }
+            }
+            for rmode in 0..4u64 {
+                let fpcr = rmode << 22;
+                let (mut out, rerun, word) = f(fpcr, &q);
+                let (afp_out, afp, _) = f(fpcr | 1 | 1 << 1 | 1 << 2 | 1 << 24, &orig);
+                let class = classify(word).unwrap();
+                let mut saved = [[0u8; 16]; 3];
+                if let Class::Patch(o) = class {
+                    for (s, reg) in saved.iter_mut().zip(o.sources()) {
+                        *s = q[usize::from(reg).wrapping_sub(1).min(3)];
+                    }
+                }
+                let got = patch_flush(class, x86_rc(fpcr), &saved, rerun, FLUSH_ALL, &mut out, true);
+                for k in 0..lanes {
+                    let (a, b) = (get(&out, re, k), get(&afp_out, re, k));
+                    assert_eq!(a, b, "{name} rmode {rmode} word {word:#x} lane {k}\nq {orig:x?}");
+                    let (sign, mag) = (1u64 << (8 * re - 1), a & !(1u64 << (8 * re - 1)));
+                    let _ = sign;
+                    flushed += u32::from(mag == 0 && get(&q[0], e, 0) != u64::MAX);
+                    band_kept += u32::from(mag == min);
+                }
+                band_flushed += u32::from(rerun & UFC != 0 && got & UFC == 0);
+                let ours = mxcsr_flags(got, mxcsr, true);
+                let theirs = mxcsr_flags(afp, mxcsr, false);
+                assert_eq!(ours, theirs, "{name} rmode {rmode} word {word:#x} flags rerun {rerun:#x} got {got:#x} afp {afp:#x}\nq {orig:x?}");
+            }
+        }
+        eprintln!("{name}: DAZ+FTZ, {trials} trials x 4 modes, zero lanes {flushed}, MIN_NORMAL lanes {band_kept}, rerun UFC dropped {band_flushed}");
+    }
+
+    #[test]
+    fn under_daz_and_ftz_the_patch_flushes_like_the_m4s_fiz_and_fz() {
+        let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
+        let forms: &[(&str, Form, usize, usize, usize, bool)] = &[
+            ("fmul s", form!("fmul s1, s2, s3"), 4, 4, 1, false),
+            ("fmul d", form!("fmul d1, d2, d3"), 8, 8, 1, false),
+            ("fnmul d", form!("fnmul d1, d2, d3"), 8, 8, 1, false),
+            ("fmul .4s", form!("fmul v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fmul .2d", form!("fmul v1.2d, v2.2d, v3.2d"), 8, 8, 2, false),
+            ("fmul .4s[2]", form!("fmul v1.4s, v2.4s, v3.s[2]"), 4, 4, 4, false),
+            ("fdiv .4s", form!("fdiv v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fdiv d", form!("fdiv d1, d2, d3"), 8, 8, 1, false),
+            ("fmadd s", form!("fmadd s1, s2, s3, s4"), 4, 4, 1, false),
+            ("fmsub d", form!("fmsub d1, d2, d3, d4"), 8, 8, 1, false),
+            ("fnmadd s", form!("fnmadd s1, s2, s3, s4"), 4, 4, 1, false),
+            ("fnmsub d", form!("fnmsub d1, d2, d3, d4"), 8, 8, 1, false),
+            ("fmla .4s", form!("fmla v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fmls .2d", form!("fmls v1.2d, v2.2d, v3.2d"), 8, 8, 2, false),
+            ("fmla .4s[3]", form!("fmla v1.4s, v2.4s, v3.s[3]"), 4, 4, 4, false),
+            ("fmla s[1]", form!("fmla s1, s2, v3.s[1]"), 4, 4, 1, false),
+            ("fcvt s,d", form!("fcvt s1, d2"), 8, 4, 1, true),
+            ("fcvtn .2s,.2d", form!("fcvtn v1.2s, v2.2d"), 8, 4, 2, true),
+            ("fadd .4s", form!("fadd v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fadd d", form!("fadd d1, d2, d3"), 8, 8, 1, false),
+            ("fsub s", form!("fsub s1, s2, s3"), 4, 4, 1, false),
+            ("fsub .2d", form!("fsub v1.2d, v2.2d, v3.2d"), 8, 8, 2, false),
+            ("faddp .4s", form!("faddp v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("faddp .2d", form!("faddp v1.2d, v2.2d, v3.2d"), 8, 8, 2, false),
+            ("faddp s", form!("faddp s1, v2.2s"), 4, 4, 1, false),
+            ("fsqrt .4s", form!("fsqrt v1.4s, v2.4s"), 4, 4, 4, false),
+        ];
+        for &(name, f, e, re, lanes, narrowing) in forms {
+            check_daz_ftz(name, f, e, re, lanes, narrowing, n);
+        }
+        // VCVTPS2PH ignores FTZ: UE is the model's, the value is the hardware's (no flush)
+        let f = form!("fcvtn v1.4h, v2.4s");
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let mut dropped = 0;
+        for _ in 0..n {
+            let q = operands(&mut r, 4, true);
+            for rmode in 0..4u64 {
+                let (mut out, rerun, word) = f(rmode << 22, &q);
+                let class = classify(word).unwrap();
+                let Class::Patch(o) = class else { panic!() };
+                let mut saved = [[0u8; 16]; 3];
+                for (s, reg) in saved.iter_mut().zip(o.sources()) {
+                    *s = q[usize::from(reg).wrapping_sub(1).min(3)];
+                }
+                let before = out;
+                let all = patch_flush(class, x86_rc(rmode << 22), &saved, rerun, FLUSH_ALL, &mut out, false);
+                let mut plain = before;
+                assert_eq!(all, patch(class, x86_rc(rmode << 22), &saved, rerun, false, &mut plain, false));
+                assert_eq!(out, before, "VCVTPS2PH is never flushed");
+                dropped += u32::from(rerun & UFC != 0 && all & UFC == 0);
+            }
+        }
+        eprintln!("fcvtn .4h: no flush; band UFC dropped {dropped}");
     }
 
     #[test]

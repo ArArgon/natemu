@@ -760,23 +760,42 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
   const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
   struct Found { Ref Node; uint64_t Rip; };
   std::vector<Found> Ops;
+  std::vector<Ref> NegMuls;   // the sign-mask and negating multiplies (IsAddSubMul), not x86 operations
   uint64_t Rip = ~0ull;
   for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
     for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
       if (IROp->Op == OP_GUESTOPCODE) { Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset; continue; }
       FlushRule R;
-      if (Rip != ~0ull && !fexc_x87.count(Rip) && !IsAddSubMul(IR, IROp) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip});
+      if (Rip != ~0ull && !fexc_x87.count(Rip) && IsAddSubMul(IR, IROp)) NegMuls.push_back(CodeNode);
+      else if (Rip != ~0ull && !fexc_x87.count(Rip) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip});
     }
   }
   if (Ops.empty()) return;
   const bool Daz = fexc_daz, Ftz = fexc_ftz;
   if (!Daz && !Ftz) return;
+  // AFP accurate plan chunk 5: accurate mode runs DAZ + FTZ with FZ = 0 (UFE traps every tiny result and the resident flushes it, but never
+  // the result of the exact sign-mask and negating multiplies): their multiplicand is flushed first (row 4 before them, whatever consumes
+  // the product), so a denormal never reaches one and no tiny result or flag comes from it.
+  if (Daz && Ftz && fexc_accurate) {
+    for (Ref Node : NegMuls) {
+      auto View = IREmit->ViewIR();
+      const auto* Op = View.template GetOp<IROp_Header>(Node);
+      FlushRule R;
+      FlushRuleOf(Op, R);
+      IREmit->SetWriteCursorBefore(Node);
+      Ref Flushed = IREmit->_FexcFlush(Op->Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, View.GetNode(Op->Args[0]), R.InScalar ? 1 : 0);
+      IREmit->ReplaceNodeArgument(Node, 0, Flushed);
+    }
+  }
   for (const auto& F : Ops) {
     auto View = IREmit->ViewIR();
     const auto* Op = View.template GetOp<IROp_Header>(F.Node);
     FlushRule R;
     FlushRuleOf(Op, R);
-    if (Daz && !Ftz) {   // the sources
+    // AFP accurate plan chunk 5: accurate mode runs DAZ + FTZ with FZ = 0 (UFE traps every tiny result, the resident flushes it), so the inputs
+    // are flushed here as under DAZ alone; fast mode keeps FZ = 1 (the hardware flushes both).
+    const bool AccDazFtz = Daz && Ftz && fexc_accurate;
+    if (Daz && (!Ftz || AccDazFtz)) {   // the sources
       if (R.InElem != 4 && R.InElem != 8) continue;   // (a half-precision source is not flushed)
       IREmit->SetWriteCursorBefore(F.Node);
       Ref Seen[4] = {}, Made[4] = {};   // a value read twice by the op (`addps xmm0, xmm0`) is flushed once

@@ -1920,19 +1920,20 @@ pub const fn fpcr(mxcsr: u64, no_afp: bool) -> u64 {
     (1 << 1 | 1 << 2 | (mxcsr >> 6 & 1)) | ftz << 24 | rmode << 22
 }
 /// FPCR.UFE: trapped underflow (a result tiny before rounding, exact ones too, raises a synchronous exception, EC 0x2C, with
-/// the destination and FPSR unchanged). Never trapped while FZ = 1 (the hardware flush of DAZ + FTZ), which is the plan's chunk 5.
+/// the destination and FPSR unchanged). Never trapped while FZ = 1 (the hardware flush of DAZ + FTZ), which accurate mode never runs with.
 pub const FPCR_UFE: u64 = 1 << 11;
 /// FPCR.IOE: trapped invalid operation (every IOC case raises EC 0x2C with the destination and FPSR unchanged).
 pub const FPCR_IOE: u64 = 1 << 8;
 /// AFP accurate plan chunk 3: [`fpcr`] plus the trap enables the mode wants, which the resident's lower-EL vector handles (`fptrap`):
 /// UFE in accurate mode without AFP (`accurate` is [`accurate_key`]) wherever FZ = 0, so the masked UE flag of the MIN_NORMAL band is
 /// decided per operation, and (chunk 4) IOE everywhere in it, so every NaN result is decided per operation (x86's choice, the default NaN's
-/// sign, D). Every other case is [`fpcr`] exactly, so fast mode and every AFP host run as before. x87 never traps:
+/// sign, D); and (chunk 5) never FZ = 1: under DAZ + FTZ the flush is the handler's (UFE traps every tiny result) and row 4's software input
+/// flush, so FZ = 0 there. Every other case is [`fpcr`] exactly, so fast mode and every AFP host run as before. x87 never traps:
 /// [`x87_fpcr`] is explicit and trap-free wherever this word has a trap bit.
 pub const fn fpcr_run(mxcsr: u64, no_afp: bool, accurate: bool) -> u64 {
     let base = fpcr(mxcsr, no_afp);
     if accurate && no_afp {
-        base | FPCR_IOE | if base & 1 << 24 == 0 { FPCR_UFE } else { 0 }
+        base & !(1 << 24) | FPCR_IOE | FPCR_UFE
     } else {
         base
     }
@@ -4013,7 +4014,7 @@ mod tests {
             for (no_afp, accurate) in [(false, false), (false, true), (true, false), (true, true)] {
                 let (w, base) = (fpcr_run(mxcsr, no_afp, accurate), fpcr(mxcsr, no_afp));
                 if accurate && no_afp {
-                    assert_eq!(w, base | FPCR_IOE | if base >> 24 & 1 == 0 { FPCR_UFE } else { 0 }, "{mxcsr:#x}");
+                    assert_eq!(w, base & !(1 << 24) | FPCR_IOE | FPCR_UFE, "{mxcsr:#x}");
                     on += 1;
                     for fcw in [FCW_INIT, FCW_INIT | 3 << 10, 0x3f | 1 << 10] {
                         let x87 = x87_fpcr(fcw, mxcsr, no_afp, accurate);
@@ -4027,9 +4028,10 @@ mod tests {
             }
         }
         assert!(on > 0 && off > on);
-        // DAZ + FTZ (FZ = 1, the hardware flush) never traps UFE, but IOE is on
-        assert_eq!(fpcr_run(MXCSR_RESET | 1 << 15 | 1 << 6, true, true) & FPCR_UFE, 0);
-        assert_eq!(fpcr_run(MXCSR_RESET | 1 << 15 | 1 << 6, true, true) & FPCR_IOE, FPCR_IOE);
+        // chunk 5: DAZ + FTZ runs with FZ = 0 (the hardware flush is the handler's now) and both traps on; fast mode keeps FZ = 1
+        let both = MXCSR_RESET | 1 << 15 | 1 << 6;
+        assert_eq!(fpcr_run(both, true, true), FPCR_UFE | FPCR_IOE);
+        assert_eq!(fpcr_run(both, true, false) >> 24 & 1, 1);
         assert_eq!(fpcr_run(MXCSR_RESET, true, true), FPCR_UFE | FPCR_IOE);
     }
     #[test]

@@ -26,7 +26,7 @@ CLASSES = {
     'band-ue-flag': ('C', 'with UE masked, a result just below the smallest normal number that rounds up to it can set MXCSR.UE (x86 judges tininess after rounding)',
                      'a case with MXCSR.UE set where x86 sets none (no tagged case yet)'),
     'daz-ftz-band': ('C', 'with DAZ and FTZ both set, a result just below the smallest normal number that rounds up to it is 0 instead of the smallest normal',
-                     'the zero result (no tagged case yet)'),
+                     'a runner case: +-0 with UE and PE where x86 gives +-MIN_NORMAL with PE (run_i5c `daz-ftz-band-*`)'),
     'ftz-band': ('C', 'with FTZ set and DAZ clear, a result whose exact value lies just below the smallest normal number, which x86 flushes to 0 (tiny after rounding to the destination precision) but Arm\'s denormal rounding carries up to the smallest normal, is the smallest normal instead of 0 (the flags are right)',
                  'the smallest-normal result (no tagged case yet)'),
 }
@@ -36,7 +36,7 @@ CLASSES = {
 # unless chunk 6's gate moves UFE (band-ue-flag) or IOE (nan-results, fma-invalid-flag) there.
 FIXED_BY = {'masked-sse-de': 'accurate (chunk 2)', 'nan-results': 'accurate (chunk 4: IOE trap, the handler patches NaN lanes; the FMA NaN check)',
             'fma-invalid-flag': 'accurate (chunk 4: the handler removes the IOC of infinity times zero beside a QNaN addend)',
-            'band-ue-flag': 'accurate (chunk 3: UFE trap, handler); fast only if chunk 6 moves UFE', 'daz-ftz-band': 'accurate (chunk 5)',
+            'band-ue-flag': 'accurate (chunk 3: UFE trap, handler); fast only if chunk 6 moves UFE', 'daz-ftz-band': 'accurate (chunk 5: FZ = 0 with UFE under DAZ + FTZ, row 4\'s input flush, the handler gives x86\'s flushed result)',
             'ftz-band': 'accurate (chunk 3: the handler flushes the band lane under FTZ alone)'}
 assert FIXED_BY.keys() == CLASSES.keys()
 
