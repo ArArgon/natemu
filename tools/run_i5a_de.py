@@ -70,6 +70,16 @@ def cases():
         if binary and de:
             # (HADD/HSUB add pairs inside one operand: the QNaN and the denormal meet in different operations, so DE stays.)
             out.append((f'{text} | QNaN and denormal', text, lane0(k['qnan']), lane0(k['den']), 0x1f80, text.startswith(('hadd', 'hsub'))))
+        # The screen's zero tier (zero lanes are exact: no DE; only a nonzero mantissa under a zero exponent is a denormal):
+        # -0.0, the largest denormal, a zero operand beside a denormal one, a zero lane beside a denormal lane.
+        big, neg0 = (0x007fffff, 0x80000000) if t == 32 else (0x000fffffffffffff, 1 << 63)
+        out.append((f'{text} | src -0.0', text, one, lane0(neg0), 0x1f80, False))
+        out.append((f'{text} | src largest denormal', text, one, lane0(big), 0x1f80, de))
+        out.append((f'{text} | zero dst, smallest denormal src', text, lane0(k['zero']), lane0(k['den']), 0x1f80, de))
+        out.append((f'{text} | -0.0 dst, largest denormal src', text, lane0(neg0), lane0(big), 0x1f80, de))
+        out.append((f'{text} | zero src beside a normal dst', text, one, lane0(k['zero']), 0x1f80, False))
+        out.append((f'{text} | smallest denormal, zero in lane 1', text, one, [k['den'], k['zero']] + one[2:], 0x1f80, de))
+        out.append((f'{text} | negative smallest denormal', text, one, lane0(k['den'] | neg0), 0x1f80, de and not text.startswith('sqrt')))   # (sqrt of a negative: IE, no DE)
         if text.startswith('div'):
             out.append((f'{text} | denormal / 0', text, lane0(k['den']), lane0(k['zero']), 0x1f80, False))
     for text, t, lane, de in EXTRA:
@@ -79,7 +89,7 @@ def cases():
     return out
 
 
-TAGGED = 98      # the cases tagged `masked-sse-de`: 98 of 351 (update with the case list)
+TAGGED = 339    # the cases tagged `masked-sse-de`: 339 of 876 (update with the case list)
 
 
 def mx_of(mx, de):
