@@ -81,9 +81,7 @@ pub struct DiskSpec {
 impl DiskSpec {
     /// Its image (a new overlay created first when `backing` names a base and a writable `path` does not exist).
     fn open(&self) -> Result<crate::disk::Image> {
-        // The facade names the key to add as `disk.ID.backing`; this knows the id.
-        crate::disk::open(&self.path, self.readonly, self.backing.as_deref())
-            .map_err(|e| e.replace("disk.ID.", &format!("disk.{}.", self.id)))
+        crate::disk::open_disk(&self.id, &self.path, self.readonly, self.backing.as_deref())
     }
 }
 

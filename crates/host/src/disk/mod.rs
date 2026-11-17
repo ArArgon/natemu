@@ -104,6 +104,16 @@ fn detect(head: &[u8], tail: &[u8]) -> Option<Format> {
 /// `backing`, a writable `path` that does not exist is first created as a new qcow2 overlay over it; a read-only one
 /// never is.
 pub(crate) fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> Result<Image> {
+    open_disk("ID", path, read_only, backing)
+}
+
+/// [`open`] for the disk with id `id`, which its messages name (the `--set disk.ID.backing` hint).
+pub(crate) fn open_disk(
+    id: &str,
+    path: &Path,
+    read_only: bool,
+    backing: Option<&Path>,
+) -> Result<Image> {
     if let Some(base) = backing
         && std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
     {
@@ -118,9 +128,12 @@ pub(crate) fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> Resu
     }
     let (file, head, tail) = raw::inspect(path, read_only)?;
     match detect(&head, &tail) {
-        None if backing.is_some() => Err("a backing file needs a qcow2 image".into()),
+        None if backing.is_some() => Err(format!(
+            "disk {}: a backing file needs a qcow2 image",
+            path.display()
+        )),
         None => raw::image(file, read_only),
-        Some(Format::Qcow2) => qcow::image(file, path, read_only, backing),
+        Some(Format::Qcow2) => qcow::image(file, path, read_only, backing, id),
         Some(Format::Refused(name)) => Err(format!(
             "disk {}: this looks like a {name} image; natemu reads raw and qcow2 (qemu-img convert -O qcow2 ...)",
             path.display()
