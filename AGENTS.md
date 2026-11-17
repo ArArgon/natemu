@@ -16,3 +16,10 @@ only substantive correctness, execution or reproduction defects block acceptance
 Do not read or search git history for archived Track01 material unless the task
 names it. Before creating or revising error or learning records, read
 [the error documentation guidance](docs/retrospectives/README.md).
+
+## README
+
+`README.md` is for a newcomer who wants to run natemu: plain prose, what to do and what they will see, hardware named by chip
+(M1, M2, M4) and any unavoidable term explained in a few words. Mechanism, exact deviation lists, measurement history and tool
+internals go on a page under `docs/`, linked from the README. Done when someone who has never seen the codebase understands
+every README sentence.
