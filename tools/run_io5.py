@@ -31,7 +31,8 @@ run --image-format qcow2 (default raw; the raw records stay comparable): natemu'
 disk.raw (`qemu-img convert -O qcow2 -o preallocation=metadata`, then `qemu-img resize --preallocation=metadata` to 16 GiB, so
 the run measures steady state, not allocation; the seconds go in result.json), cloned per run with `cp -c` and given as
 --disk. The offline checks (e2fsck, debugfs) run on a temporary raw conversion deleted right after each launch, and
-`qemu-img check` must find nothing. --keep-disk keeps the qcow2; `profile` steps need a raw snapshot. --image-format overlay:
+`qemu-img check` must find nothing. If the volume cannot hold that copy (needs about the allocated size of the overlay and its base; checked first, and printed when skipped)
+the launch records `offline_skipped` and runs console_checks instead: kernel and journal error lines from the console and (verify boot) no journal recovery, but NOT e2fsck -fn, the superblock state or the files copied out. --keep-disk keeps the qcow2; `profile` steps need a raw snapshot. --image-format overlay:
 a new, empty 16 GiB qcow2 overlay over INPUTS/disk.raw made per run (`qemu-img create -b -F raw`; past the base's end it
 reads zeros), given as --disk with --set disk.disk0.backing=INPUTS/disk.raw; the same checks as qcow2, plus disk.raw's hash
 unchanged after each launch. Needs qemu-img."""
@@ -50,7 +51,7 @@ import subprocess
 import sys
 import time
 
-from io_common import IMAGE_FORMATS, ROOT, VM_LOCK, check_image_format, overlay_create, overlay_set, digest, qcow2_input, qcow2_problems, raw_of, stop_group, write_json
+from io_common import IMAGE_FORMATS, ROOT, VM_LOCK, check_image_format, overlay_create, overlay_set, digest, qcow2_input, qcow2_problems, raw_of, raw_shortfall, stop_group, write_json
 from raw_root import RAW_ROOT
 from run_net_linux import lan_address
 
@@ -149,6 +150,8 @@ else
   span net run 'curl -fsS https://deb.debian.org/debian/dists/trixie/Release -o /tmp/Release && grep -m1 "^Codename: trixie" /tmp/Release'
 fi
 dmesg > $L/dmesg-$P.log; journalctl -b -p err --no-pager -q > $L/journal-err-$P.log
+[ $P = use ] || say manifest $(sha256sum < $L/manifest | cut -c1-16) files=$(wc -l < $L/manifest)
+sed 's/^/IO5jerr /' $L/journal-err-$P.log   # for the host's console-only checks (no raw view of the disk)
 say df $(df -B1M --output=used / | tail -1) uptime=$(cut -d' ' -f1 /proc/uptime)
 '''
 
@@ -282,6 +285,18 @@ def offline(disk, work, phase):
     return problems
 
 
+def console_checks(work, phase):
+    """The checks of offline() that the console can answer, for when the volume cannot hold a raw view of the disk: the kernel
+    lines on the serial log (dmesg, at the console log level) and the journal errors the guest echoed; in the verify boot
+    also that the journal was not recovered (the first boot's unmount was clean). NOT done: e2fsck -fn, the superblock
+    state, copying the guest's files out (the manifest fingerprint is compared from the verify boot's console line)."""
+    text = (work / f'serial-{phase}.log').read_bytes().decode(errors='replace').replace('\r', '')
+    lines = [(l, 'dmesg') for l in text.splitlines() if re.search(BAD, l) and not l.startswith('IO5jerr ')]
+    lines += [(l[8:], 'journal-err') for l in text.splitlines() if l.startswith('IO5jerr ')]
+    if phase == 'verify': lines += [(l, 'journal') for l in text.splitlines() if re.search(r'EXT4-fs \(\w+\): (recovery complete|orphan cleanup)', l)]
+    return [f'{k}: {l.strip()[:160]}' for l, k in lines if not any(re.search(e, l) for e in EXPECTED)]
+
+
 def judge(work, phase, code, timed_out):
     text = (work / f'serial-{phase}.log').read_bytes().decode(errors='replace').replace('\r', '')
     markers = re.findall(r'^IO5 (.*)$', text, re.M)
@@ -328,7 +343,12 @@ def run(args):
                 code, timed_out, seconds = launch(command(args, disk, args.out / 'compile-cache', phase), args.out, phase, host, limit)
                 contended = before + others()
                 r = judge(args.out, phase, code, timed_out)
-                with raw_of(disk, qcow, args.out / 'view.raw') as raw: r['problems'] += offline(raw, args.out, phase)
+                short = raw_shortfall(disk, args.out) if qcow else None
+                if short:    # no room for the raw view: console checks only, recorded (not a silent pass)
+                    print(f'{phase}: offline checks (e2fsck, superblock, guest files) SKIPPED: {short}', flush=True)
+                    r['offline_skipped'] = short; r['problems'] += console_checks(args.out, phase)
+                else:
+                    with raw_of(disk, qcow, args.out / 'view.raw') as raw: r['problems'] += offline(raw, args.out, phase)
                 if qcow: found, report = qcow2_problems(disk); write_json(args.out / f'qemu-img-check-{phase}.json', report); r['problems'] += found
                 if overlay and digest(args.inputs / 'disk.raw') != recorded['disk.raw']: r['problems'].append('the overlay\'s base disk.raw changed')
                 r.update(exit=code, seconds=seconds, contended=contended); result['phases'][phase] = r
@@ -336,13 +356,14 @@ def run(args):
                 if code != 0 or timed_out: break
     finally:
         stop_group(server)
+        if disk.exists(): print(f'disk {disk}: {os.path.getsize(disk) / 2**30:.1f} GiB apparent, {os.stat(disk).st_blocks * 512 / 2**30:.1f} GiB allocated', flush=True)
         if not args.keep_disk: disk.unlink(missing_ok=True)    # also after a failed or interrupted launch
     # The manifest the second boot checked must be the one the first boot fingerprinted on the console (not a shorter copy).
     use, verify = result['phases'].get('use', {}), result['phases'].get('verify', {})
     fingerprint = use.get('values', {}).get('manifest', [])
     checked = args.out / 'manifest-verify'
-    if verify and (not checked.exists() or fingerprint != [hashlib.sha256(checked.read_bytes()).hexdigest()[:16],
-                                                           f'files={len(checked.read_bytes().splitlines())}']):
+    seen = [hashlib.sha256(checked.read_bytes()).hexdigest()[:16], f'files={len(checked.read_bytes().splitlines())}'] if checked.exists() else verify.get('values', {}).get('manifest')   # file copied out, else the verify boot's console line
+    if verify and fingerprint != seen:
         verify['problems'].append(f'manifest checked on relaunch differs from the first boot fingerprint {fingerprint}')
     result['pass'] = len(result['phases']) == 2 and not any(r['problems'] for r in result['phases'].values())
     write_json(args.out / 'result.json', result)
