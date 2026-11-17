@@ -42,32 +42,16 @@ pub(super) fn decompress_cluster(
 }
 
 /// Applies one deallocation action to the data file and refcount table.
-pub(super) fn apply_dealloc_action(
-    metadata: &QcowMetadata,
-    data_file: &QcowRawFile,
-    action: &DeallocAction,
-) -> io::Result<()> {
-    match action {
-        DeallocAction::PunchHole {
-            host_offset,
-            length,
-        } => {
-            data_file.file().punch_hole(*host_offset, *length)?;
-            metadata.complete_punch_hole(*host_offset);
-            Ok(())
-        }
-        DeallocAction::WriteZeroes {
-            host_offset,
-            length,
-        } => data_file
-            .file()
-            .write_zeroes_at(*host_offset, *length)
-            .map(|_| ()),
-    }
-}
+/// natemu: how long one deallocation may spend punching holes. Past it, freed clusters go to the
+/// free list unpunched: their contents no longer matter (reads come from the tables, and a reused
+/// cluster is written whole under the table lock), so only host space is reclaimed later. This
+/// keeps a guest DISCARD or WRITE_ZEROES over many scattered clusters (32 ranges of 2 GiB in one
+/// request) inside the device's 10 s call limit.
+const PUNCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Deallocates a byte range, returning the first error after applying
-/// every action.
+/// every action. natemu: contiguous punches are one call (upstream punched per cluster, about
+/// 13 us each on APFS: 64 GiB of allocated clusters took about 14 s), with a time budget.
 pub(super) fn deallocate_range(
     metadata: &QcowMetadata,
     data_file: &QcowRawFile,
@@ -84,10 +68,54 @@ pub(super) fn deallocate_range(
         write_zeroes || backing_file.is_some(),
         backing_file,
     )?;
+    let deadline = std::time::Instant::now() + PUNCH_BUDGET;
     let mut first_error = None;
-    for action in &actions {
-        if let Err(e) = apply_dealloc_action(metadata, data_file, action) {
-            first_error.get_or_insert(e);
+    let mut i = 0;
+    while i < actions.len() {
+        match actions[i] {
+            DeallocAction::PunchHole {
+                host_offset,
+                length,
+            } => {
+                let mut end = host_offset + length;
+                let mut j = i + 1;
+                while let Some(&DeallocAction::PunchHole {
+                    host_offset: next,
+                    length,
+                }) = actions.get(j)
+                    && next == end
+                {
+                    end += length;
+                    j += 1;
+                }
+                let punched = if std::time::Instant::now() < deadline {
+                    data_file.file().punch_hole(host_offset, end - host_offset)
+                } else {
+                    Ok(())
+                };
+                match punched {
+                    // A failed punch keeps its clusters reserved (off both free lists).
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                    Ok(()) => {
+                        metadata.complete_punch_holes(actions[i..j].iter().map(|a| match a {
+                            DeallocAction::PunchHole { host_offset, .. } => *host_offset,
+                            DeallocAction::WriteZeroes { .. } => unreachable!(),
+                        }))
+                    }
+                }
+                i = j;
+            }
+            DeallocAction::WriteZeroes {
+                host_offset,
+                length,
+            } => {
+                if let Err(e) = data_file.file().write_zeroes_at(host_offset, length) {
+                    first_error.get_or_insert(e);
+                }
+                i += 1;
+            }
         }
     }
     first_error.map_or(Ok(()), Err)

@@ -157,7 +157,16 @@ pub(super) struct QcowRawFile {
     refcount_block_entries: u64,
     read_refcount_fn: RefcountReader,
     write_refcount_fn: RefcountWriter,
+    /// natemu: (end of the last cluster allocated at the file end, file length) once known, so
+    /// allocation needs neither an fstat nor an ftruncate per cluster: the file grows in steps of
+    /// [`GROWTH`]. `None` reads both from the file again (after a length change made elsewhere).
+    end: Option<(u64, u64)>,
 }
+
+/// natemu: how far the file grows at a time when clusters are allocated at its end. The unused tail
+/// (refcount 0) is cut by [`QcowRawFile::trim`] at a clean close; after an unclean one it is free
+/// space that the next open puts on the free list.
+const GROWTH: u64 = 1 << 20;
 
 impl QcowRawFile {
     /// Creates a `QcowRawFile` from the given `File`, `None` is returned if `cluster_size` is not
@@ -189,6 +198,7 @@ impl QcowRawFile {
             refcount_block_entries,
             read_refcount_fn,
             write_refcount_fn,
+            end: None,
         })
     }
 
@@ -323,25 +333,55 @@ impl QcowRawFile {
         &mut self,
         max_valid_cluster_offset: u64,
     ) -> io::Result<Option<u64>> {
-        // Determine where the new end of the file should be and set_len, which
-        // translates to truncate(2).
-        let file_end: u64 = self.physical_size()?;
-        // Round the file end up to a cluster boundary.
-        let new_cluster_address: u64 = file_end
-            .div_ceil(self.cluster_size)
-            .checked_mul(self.cluster_size)
-            .ok_or_else(|| io::Error::other("Aligned file end overflow"))?;
+        let (alloc_end, len) = match self.end {
+            Some(end) => end,
+            None => {
+                let len = self.physical_size()?;
+                // Round the file end up to a cluster boundary.
+                let end = len
+                    .div_ceil(self.cluster_size)
+                    .checked_mul(self.cluster_size)
+                    .ok_or_else(|| io::Error::other("Aligned file end overflow"))?;
+                (end, len)
+            }
+        };
+        let new_cluster_address = alloc_end;
 
         if new_cluster_address > max_valid_cluster_offset {
             return Ok(None);
         }
 
-        let new_len = new_cluster_address
+        let new_end = new_cluster_address
             .checked_add(self.cluster_size)
             .ok_or_else(|| io::Error::other("New cluster end overflow"))?;
-        self.file.set_len(new_len)?;
+        let mut len = len;
+        if new_end > len {
+            // natemu: grow by GROWTH, within what the refcounts can cover.
+            let cap = max_valid_cluster_offset.saturating_add(self.cluster_size);
+            len = new_end.saturating_add(GROWTH).min(cap).max(new_end);
+            self.end = None;
+            self.file.set_len(len)?;
+        }
+        self.end = Some((new_end, len));
 
         Ok(Some(new_cluster_address))
+    }
+
+    /// natemu: forget the cached file end (the length was changed by other code).
+    pub(super) fn forget_end(&mut self) {
+        self.end = None;
+    }
+
+    /// natemu: cut the unused tail left by growth steps (a clean close).
+    pub(super) fn trim(&mut self) -> io::Result<()> {
+        if let Some((alloc_end, len)) = self.end
+            && len > alloc_end
+        {
+            self.end = None;
+            self.file.set_len(alloc_end)?;
+            self.end = Some((alloc_end, alloc_end));
+        }
+        Ok(())
     }
 
     /// Returns a reference to the underlying file.
@@ -397,6 +437,7 @@ impl QcowRawFile {
             refcount_block_entries: self.refcount_block_entries,
             read_refcount_fn: self.read_refcount_fn,
             write_refcount_fn: self.write_refcount_fn,
+            end: None,
         })
     }
 }
@@ -618,7 +659,15 @@ mod tests {
 
         assert_eq!(addr % CLUSTER_SIZE, 0);
         assert!(addr >= before);
-        assert_eq!(qcow.physical_size().unwrap(), addr + CLUSTER_SIZE);
+        // natemu: the file grows in steps; the next cluster follows without a length change, and
+        // a trim cuts the unused tail.
+        assert!(qcow.physical_size().unwrap() >= addr + CLUSTER_SIZE);
+        assert_eq!(
+            qcow.add_cluster_end(u64::MAX).unwrap(),
+            Some(addr + CLUSTER_SIZE)
+        );
+        qcow.trim().unwrap();
+        assert_eq!(qcow.physical_size().unwrap(), addr + 2 * CLUSTER_SIZE);
     }
 
     #[test]
