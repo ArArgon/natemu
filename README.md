@@ -97,6 +97,9 @@ The price is speed, only where a program really hits those cases or is built to 
 
 Fast mode stays the default: making only the underflow or only the NaN fixes always-on cost +16% to +18% on average, which was too much.
 
+To check a Mac, run `sh tools/fp_check/run.sh` from a checkout (after the setup below): it builds into `$TMPDIR`, runs the trap probe
+and the floating-point test runners in both modes, and writes `$TMPDIR/fp_check/report.txt`.
+
 ## Setup
 
 ### 1. Get the source
