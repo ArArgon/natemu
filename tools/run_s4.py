@@ -92,15 +92,21 @@ def cases(a, report):
     # (the step block); in accurate mode without AFP (`NATEMU_FP=accurate NATEMU_FEXC_FEATURE_OFF=afp`) 3 * 2^-149 * 0.5 is a tiny, inexact
     # result, so UFE traps and the resident re-runs the word under its own software step while DR0 stays armed (on an address nothing
     # touches). The single-step #DB must follow the MULSS exactly as without the trap; in every other mode the case is the plain TF one.
-    fp_setup = 'mov eax, 3\nmovd xmm1, eax\nmov eax, 0x3f000000\nmovd xmm2, eax\nmov rax, 0x3e8000\nmov dr0, rax\n' + dr7(0xd0001)
+    fp_setup = 'mov rax, 0x3e8000\nmov dr0, rax\n' + dr7(0xd0001)
+    sse = {'fp-trap-in-step-block-with-watchpoint': 'sse 1\nxmm 1 0x3 0\nxmm 2 0x3f000000 0\n'}   # SSE on, xmm1 = 3 * 2^-149, xmm2 = 0.5
     fp_tf = fp_setup + tf_on + 'mulss xmm1, xmm2\nnop'
     table['fp-trap-in-step-block-with-watchpoint'] = (code(fp_tf), 'guest_fault', [1, 0, 0, before_nop(fp_tf)])
     for name, (hexcode, stop, fault) in table.items():
         for block in (None, 1):
-            rc, out, err = s3.driver(a.host, a.runtime, a.fexc, base + f'code {hexcode}\n', a.out / 'cases' / f'{name}-{block}', [block] if block else [], timeout=120)
+            rc, out, err = s3.driver(a.host, a.runtime, a.fexc, base + sse.get(name, '') + f'code {hexcode}\n', a.out / 'cases' / f'{name}-{block}', [block] if block else [], timeout=120)
             stopped = out and (out['reason'].split()[0] if out['stop'] == 'resident' else out['stop'])
             got = out and (stopped, [int(v, 0) for v in out.get('fault', [])] if out['stop'] == 'guest_fault' else None)
             ok = bool(out) and got[0] == stop and (fault is None or got[1] == fault)
+            # The thing the case is for: in accurate mode without AFP the word must really have trapped and been re-run by its own step.
+            if ok and name.startswith('fp-trap') and out.get('afp') is False and out.get('fp') == 'accurate':
+                st = (out.get('cpus') or [out])[0].get('stats', {})
+                ok = st.get('fp_traps', 0) >= 1 and st.get('fp_steps', 0) >= 1
+                got = (got, {k: st.get(k) for k in ('fp_traps', 'fp_steps')})
             rows.append({'case': name, 'block': block, 'ok': ok, 'got': got, 'err': None if out else err[-300:]})
             print(json.dumps(rows[-1]), flush=True)
             if not ok: failures.append(f'case {name} block={block}: {rows[-1]}')

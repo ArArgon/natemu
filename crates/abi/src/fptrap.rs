@@ -9,7 +9,7 @@
 //!
 //! A word is either [`Class::Keep`] (the re-run's flags are what the hardware gives without traps, which is right) or [`Class::Patch`]
 //! (a multiply, divide, fused multiply-add or narrowing convert: UFC is recomputed). A word in neither class is unknown: the resident
-//! halts with a named stop rather than patch it wrongly. UFE traps every result tiny before rounding, exact ones too, so the Keep class
+//! halts with a named stop rather than patch it wrongly. (`fcvt h, d` is unclassified on purpose: no x86 instruction produces it.) UFE traps every result tiny before rounding, exact ones too, so the Keep class
 //! holds the adds and subtracts, which never raise UFC (a tiny sum is exact).
 use crate::tiny;
 
@@ -34,6 +34,9 @@ pub struct Op {
     pub ra: u8,
     /// A by-element word: `rm`'s element `index` is every lane's second operand.
     pub index: Option<u8>,
+    /// The destination register, and for FCVTN2 whether the narrowed lanes go to its upper half.
+    pub rd: u8,
+    pub upper: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +62,8 @@ fn op(kind: u8, wide: bool, lanes: u8, w: u32) -> Op {
         rm: (w >> 16 & 31) as u8,
         ra: (w & 31) as u8,
         index: None,
+        rd: (w & 31) as u8,
+        upper: false,
     }
 }
 
@@ -134,7 +139,7 @@ pub fn classify(w: u32) -> Option<Class> {
     // Vector FCVTN/FCVTN2 (S to H, D to S; Q picks the destination half), FCVTL/FCVTL2 (kept); the estimates kept.
     if w & 0x9f3e_0c00 == 0x0e20_0800 {
         return match (u, a, w >> 12 & 31) {
-            (0, 0, 0x16) if wide => Some(Patch(op(tiny::CVT, true, 2, w))),
+            (0, 0, 0x16) if wide => Some(Patch(Op { upper: q == 1, ..op(tiny::CVT, true, 2, w) })),
             (0, 0, 0x16) => Some(Patch(op(tiny::CVT16, false, 4, w))),
             (0, 0, 0x17) | (0, 1, 0x1d) | (1, 1, 0x1d) => Some(Keep),
             _ => None,
@@ -159,7 +164,13 @@ pub const fn x86_rc(fpcr: u64) -> u32 {
 /// tiny after rounding and inexact ([`tiny::lane_underflow`]); the rest is the hardware's. `q` holds the registers [`Op::sources`] names, in
 /// that order, at the trap; `rc` is the x86 rounding mode the word ran under. A re-run without UFC needs no model: Arm's UFC (tiny before
 /// rounding and inexact) holds whenever x86's masked UE does.
-pub fn patch(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64) -> u64 {
+///
+/// `ftz` (x86's FTZ in effect with UM masked, and DAZ clear: with both the hardware flushes and nothing traps) also fixes the value, in
+/// `dest` (the destination register after the re-run): software flushes only results with a zero exponent, but a result that x86 rounds to
+/// something still below MIN_NORMAL (tiny after rounding) and that Arm's denormal grid rounds up to +-MIN_NORMAL must be +-0 too (with
+/// UE and PE: the UFC kept here becomes both). Single and double lanes of multiplies, divides, FMAs and the double-to-single narrowing
+/// (VCVTPS2PH ignores FTZ).
+pub fn patch(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64, ftz: bool, dest: &mut [u8; 16]) -> u64 {
     let Class::Patch(o) = class else {
         return rerun;
     };
@@ -173,7 +184,8 @@ pub fn patch(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64) -> u64 {
             u64::from(u32::from_le_bytes(q[r][4 * i..4 * i + 4].try_into().unwrap()))
         }
     };
-    let under = (0..usize::from(o.lanes)).any(|i| {
+    let mut under = false;
+    for i in 0..usize::from(o.lanes) {
         let a = lane(0, i, o.wide);
         let b = match (o.kind, o.index) {
             (tiny::CVT | tiny::CVT16, _) => 0,
@@ -181,8 +193,20 @@ pub fn patch(class: Class, rc: u32, q: &[[u8; 16]; 3], rerun: u64) -> u64 {
             _ => lane(1, i, o.wide),
         };
         let c = if o.kind == tiny::FMA { lane(2, i, o.wide) } else { 0 };
-        tiny::lane_underflow(o.kind, o.wide, o.neg, rc, a, b, c)
-    });
+        if ftz && o.kind != tiny::CVT16 && tiny::lane_tiny(o.kind, o.wide, o.neg, rc, a, b, c) {
+            // result lane: same index and size, or for the narrowing 4 bytes at 4 * i (+ 8 for FCVTN2)
+            let (size, at) = if o.kind == tiny::CVT { (4, 4 * i + 8 * usize::from(o.upper)) } else if o.wide { (8, 8 * i) } else { (4, 4 * i) };
+            let mut raw = [0u8; 8];
+            raw[..size].copy_from_slice(&dest[at..at + size]);
+            let (v, sign) = (u64::from_le_bytes(raw), 1u64 << (8 * size - 1));
+            if v & !sign == if size == 4 { 0x0080_0000 } else { 0x0010_0000_0000_0000 } {
+                dest[at..at + size].copy_from_slice(&(v & sign).to_le_bytes()[..size]);
+                under = true;
+                continue;
+            }
+        }
+        under |= tiny::lane_underflow(o.kind, o.wide, o.neg, rc, a, b, c);
+    }
     rerun & !UFC | if under { UFC } else { 0 }
 }
 
@@ -279,6 +303,8 @@ mod tests {
             rm: 1,
             ra: 2,
             index: None,
+            rd: 0,
+            upper: false,
         });
         let regs = |lanes: [(u32, u32); 4]| {
             [q(lanes.map(|l| l.0)), q(lanes.map(|l| l.1)), [0; 16]]
@@ -287,23 +313,23 @@ mod tests {
         let none = (one, one);
         // band + exact tiny: x86 raises nothing; the re-run's UFC goes
         let r = regs([band, exact_tiny, none, none]);
-        assert_eq!(patch(mul, 0, &r, UFC | 0x10), 0x10);
+        assert_eq!(patch(mul, 0, &r, UFC | 0x10, false, &mut [0; 16]), 0x10);
         // band + real underflow: UFC stays
         let r = regs([band, real, none, none]);
-        assert_eq!(patch(mul, 0, &r, UFC | 0x10), UFC | 0x10);
+        assert_eq!(patch(mul, 0, &r, UFC | 0x10, false, &mut [0; 16]), UFC | 0x10);
         // a NaN lane's IOC next to a band lane: IOC kept, UFC removed
         let r = regs([(0x7fc0_0000, one), band, none, none]);
-        assert_eq!(patch(mul, 0, &r, UFC | 0x10 | ioc), 0x10 | ioc);
+        assert_eq!(patch(mul, 0, &r, UFC | 0x10 | ioc, false, &mut [0; 16]), 0x10 | ioc);
         // the band depends on the rounding mode: up (x86 rc 2) rounds a positive band value to MIN_NORMAL too, down (1) and zero (3) do not
         let r = regs([band, none, none, none]);
-        assert_eq!([0, 1, 2, 3].map(|rc| patch(mul, rc, &r, UFC | 0x10) & UFC), [0, UFC, 0, UFC]);
+        assert_eq!([0, 1, 2, 3].map(|rc| patch(mul, rc, &r, UFC | 0x10, false, &mut [0; 16]) & UFC), [0, UFC, 0, UFC]);
         // no UFC in the re-run: nothing to do (and no model run)
-        assert_eq!(patch(mul, 0, &r, 0x10), 0x10);
-        assert_eq!(patch(Class::Keep, 0, &r, UFC), UFC);
+        assert_eq!(patch(mul, 0, &r, 0x10, false, &mut [0; 16]), 0x10);
+        assert_eq!(patch(Class::Keep, 0, &r, UFC, false, &mut [0; 16]), UFC);
         // a scalar word looks at lane 0 only
         let scalar = Class::Patch(Op { lanes: 1, ..match mul { Class::Patch(o) => o, _ => unreachable!() } });
         let r = regs([none, band, none, none]);
-        assert_eq!(patch(scalar, 0, &r, UFC | 0x10), 0x10);
+        assert_eq!(patch(scalar, 0, &r, UFC | 0x10, false, &mut [0; 16]), 0x10);
     }
 }
 
@@ -317,6 +343,7 @@ mod native {
     extern crate std;
     use super::*;
     use core::arch::asm;
+    use crate::execution::mxcsr_flags;
     use std::eprintln;
 
     type Form = fn(u64, &[[u8; 16]; 4]) -> ([u8; 16], u64, u32);
@@ -426,6 +453,15 @@ mod native {
                 put(&mut q[0], e, lane, [0, 1, pack(e, 1, 0, 1)][r.below(3) as usize]);
                 put(&mut q[3], e, lane, [0, 1, pack(e, 1, 0, 1)][r.below(3) as usize]);
             }
+            // FMA cancellation: an addend that cancels the (rounded) product up to a few units of the last place, so the sum is tiny and
+            // exact or inexact by the product's low bits and the sign of the leftover
+            if r.below(4) == 0 && !narrowing {
+                let (a, b) = (get(&q[1], e, lane), get(&q[2], e, lane));
+                let prod = if e == 4 { u64::from((f32::from_bits(a as u32) * f32::from_bits(b as u32)).to_bits()) } else { (f64::from_bits(a) * f64::from_bits(b)).to_bits() };
+                let c = (prod ^ 1 << (8 * e - 1)).wrapping_add(r.below(5)).wrapping_sub(2) & (u64::MAX >> (64 - 8 * e));
+                put(&mut q[0], e, lane, c);
+                put(&mut q[3], e, lane, c);
+            }
             if r.below(3) != 0 && !narrowing {
                 if let Some(a) = band_partner(r, e, get(&q[2], e, lane)) {
                     put(&mut q[1], e, lane, a);
@@ -458,8 +494,11 @@ mod native {
                         *s = q[usize::from(reg) - 1];
                     }
                 }
-                let got = patch(class, x86_rc(fpcr), &saved, rerun);
-                assert_eq!(got & 0x1f, afp & 0x1f, "{name} rmode {rmode} word {word:#x} rerun {rerun:#x} afp {afp:#x}\nq {q:x?}");
+                let got = patch(class, x86_rc(fpcr), &saved, rerun, false, &mut [0; 16]);
+                // (FMA's IOC for infinity times zero plus a QNaN is deviation D, chunk 4's: AH = 1 raises none)
+                // (the estimates differ under AH = 1 in OFC/IXC for a denormal input; FEX's RCP/RSQRT here use fdiv/fsqrt, only UFC matters)
+                let mask = if name.starts_with("fr") { UFC } else if matches!(class, Class::Patch(Op { kind: tiny::FMA, .. })) { 0x1e } else { 0x1f };
+                assert_eq!(got & mask, afp & mask, "{name} rmode {rmode} word {word:#x} rerun {rerun:#x} afp {afp:#x}\nq {q:x?}");
                 // (and the patch only ever touches UFC)
                 assert_eq!(got & !UFC, rerun & !UFC, "{name}");
                 if rerun & UFC != 0 {
@@ -471,6 +510,103 @@ mod native {
         if expect_patch && !narrowing {
             assert!(kept > 0, "{name}: no real underflow met");
         }
+    }
+
+    /// Under FTZ alone (DAZ clear, effective FTZ: FZ stays 0 and software flushes zero-exponent results, row 5) the trap's patch also flushes
+    /// a band lane to +-0: the whole destination and the x86 flags (UE, PE) must equal the M4's AH = 1 run with FZ = 1 (the hardware's x86-like
+    /// flush). Row 5 is emulated here on every written lane: a result with a zero exponent and a nonzero mantissa becomes +-0 and raises UFC.
+    fn check_ftz(name: &str, f: Form, e: usize, re: usize, lanes: usize, narrowing: bool, trials: u32) {
+        let mut r = Rng(0xfeed_f00d_1234_5678 ^ name.len() as u64 * 104_729);
+        let (mut flushed, mut band) = (0u32, 0u32);
+        let mxcsr = 0x1f80 | 1 << 15;
+        let nan = |v: u64| (v >> (8 * re - 1 - if re == 4 { 8 } else { 11 })) & ((1 << if re == 4 { 8 } else { 11 }) - 1) == (1 << if re == 4 { 8 } else { 11 }) - 1 && v & ((1 << if re == 4 { 23 } else { 52 }) - 1) != 0;
+        for _ in 0..trials {
+            let q = operands(&mut r, e, narrowing);
+            for rmode in 0..4u64 {
+                let fpcr = rmode << 22;
+                let (mut out, rerun, word) = f(fpcr, &q);
+                let (afp_out, afp, _) = f(fpcr | 1 << 1 | 1 << 2 | 1 << 24, &q);
+                let class = classify(word).unwrap();
+                let mut saved = [[0u8; 16]; 3];
+                if let Class::Patch(o) = class {
+                    for (s, reg) in saved.iter_mut().zip(o.sources()) {
+                        *s = q[usize::from(reg) - 1];
+                    }
+                }
+                let before = out;
+                let mut got = patch(class, x86_rc(fpcr), &saved, rerun, true, &mut out);
+                band += u32::from(before != out);
+                for k in 0..16 / re {
+                    let mut raw = [0u8; 8];
+                    raw[..re].copy_from_slice(&out[re * k..re * k + re]);
+                    let v = u64::from_le_bytes(raw);
+                    let (exp_bits, man_bits) = if re == 4 { (8, 23) } else { (11, 52) };
+                    if v >> man_bits & ((1 << exp_bits) - 1) == 0 && v & ((1 << man_bits) - 1) != 0 {
+                        out[re * k..re * k + re].copy_from_slice(&(v & 1 << (8 * re - 1)).to_le_bytes()[..re]);
+                        got |= UFC;
+                        flushed += 1;
+                    }
+                }
+                let m = if matches!(class, Class::Patch(Op { kind: tiny::FMA, .. })) { !3 } else { !2 };
+                let ours = mxcsr_flags(got, mxcsr, true) & m;
+                let theirs = mxcsr_flags(afp, mxcsr, false) & m;
+                assert_eq!(ours, theirs, "{name} rmode {rmode} word {word:#x} flags\nq {q:x?}");
+                for k in 0..lanes {
+                    let at = |o: &[u8; 16]| {
+                        let mut raw = [0u8; 8];
+                        raw[..re].copy_from_slice(&o[re * k..re * k + re]);
+                        u64::from_le_bytes(raw)
+                    };
+                    if nan(at(&out)) || nan(at(&afp_out)) {
+                        continue;
+                    }
+                    assert_eq!(at(&out), at(&afp_out), "{name} rmode {rmode} word {word:#x} lane {k}\nq {q:x?}");
+                }
+            }
+        }
+        eprintln!("{name}: FTZ, {trials} trials x 4 modes, {band} band lanes flushed by the patch, {flushed} by row 5");
+    }
+
+    #[test]
+    fn under_ftz_alone_the_patch_flushes_the_band_like_the_m4s_fz() {
+        let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
+        let forms: &[(&str, Form, usize, usize, usize, bool)] = &[
+            ("fmul s", form!("fmul s1, s2, s3"), 4, 4, 1, false),
+            ("fmul d", form!("fmul d1, d2, d3"), 8, 8, 1, false),
+            ("fmul .4s", form!("fmul v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fmul .2d", form!("fmul v1.2d, v2.2d, v3.2d"), 8, 8, 2, false),
+            ("fmul .4s[2]", form!("fmul v1.4s, v2.4s, v3.s[2]"), 4, 4, 4, false),
+            ("fdiv .4s", form!("fdiv v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fdiv d", form!("fdiv d1, d2, d3"), 8, 8, 1, false),
+            ("fmadd s", form!("fmadd s1, s2, s3, s4"), 4, 4, 1, false),
+            ("fnmsub d", form!("fnmsub d1, d2, d3, d4"), 8, 8, 1, false),
+            ("fmla .4s", form!("fmla v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fmls .2d", form!("fmls v1.2d, v2.2d, v3.2d"), 8, 8, 2, false),
+            ("fmla .4s[3]", form!("fmla v1.4s, v2.4s, v3.s[3]"), 4, 4, 4, false),
+            ("fcvt s,d", form!("fcvt s1, d2"), 8, 4, 1, true),
+            ("fcvtn .2s,.2d", form!("fcvtn v1.2s, v2.2d"), 8, 4, 2, true),
+            ("fadd .4s", form!("fadd v1.4s, v2.4s, v3.4s"), 4, 4, 4, false),
+            ("fsub d", form!("fsub d1, d2, d3"), 8, 8, 1, false),
+        ];
+        for &(name, f, e, re, lanes, narrowing) in forms {
+            check_ftz(name, f, e, re, lanes, narrowing, n);
+        }
+        // the reviewer's case: 4095 * 2^-75 times 4097 * 2^-75 is 2^-126 - 2^-150, which x86 rounds below MIN_NORMAL (flush to 0) and Arm's
+        // denormal grid rounds up to it
+        let (a, b) = ((4095.0f32 * 2f32.powi(-75)).to_bits(), (4097.0f32 * 2f32.powi(-75)).to_bits());
+        let mut q = [[0u8; 16]; 4];
+        put(&mut q[1], 4, 0, u64::from(a));
+        put(&mut q[2], 4, 0, u64::from(b));
+        let f = form!("fmul s1, s2, s3");
+        let (mut out, rerun, word) = f(0, &q);
+        assert_eq!(get(&out, 4, 0), 0x0080_0000);
+        let mut saved = [[0u8; 16]; 3];
+        let Some(Class::Patch(o)) = classify(word) else { panic!() };
+        for (s, reg) in saved.iter_mut().zip(o.sources()) {
+            *s = q[usize::from(reg) - 1];
+        }
+        let got = patch(Class::Patch(o), 0, &saved, rerun, true, &mut out);
+        assert_eq!((get(&out, 4, 0), got & UFC), (0, UFC));
     }
 
     #[test]
@@ -486,6 +622,9 @@ mod native {
             ("fmul .4s[2]", form!("fmul v1.4s, v2.4s, v3.s[2]"), 4, false),
             ("fmul .2d[1]", form!("fmul v1.2d, v2.2d, v3.d[1]"), 8, false),
             ("fmul d[1]", form!("fmul d1, d2, v3.d[1]"), 8, false),
+            ("fmul s[1]", form!("fmul s1, s2, v3.s[1]"), 4, false),
+            ("fdiv .2s", form!("fdiv v1.2s, v2.2s, v3.2s"), 4, false),
+            ("fmadd d", form!("fmadd d1, d2, d3, d4"), 8, false),
             ("fdiv s", form!("fdiv s1, s2, s3"), 4, false),
             ("fdiv d", form!("fdiv d1, d2, d3"), 8, false),
             ("fdiv .4s", form!("fdiv v1.4s, v2.4s, v3.4s"), 4, false),
@@ -519,6 +658,11 @@ mod native {
             ("fsub .2d", form!("fsub v1.2d, v2.2d, v3.2d"), 8),
             ("faddp .4s", form!("faddp v1.4s, v2.4s, v3.4s"), 4),
             ("fcadd .2d", form!("fcadd v1.2d, v2.2d, v3.2d, #90"), 8),
+            ("fcadd .4s #270", form!("fcadd v1.4s, v2.4s, v3.4s, #270"), 4),
+            ("faddp s", form!("faddp s1, v2.2s"), 4),
+            ("fcvtl .4s", form!("fcvtl v1.4s, v2.4h"), 4),
+            ("frecpe .4s", form!("frecpe v1.4s, v2.4s"), 4),
+            ("frsqrte .2d", form!("frsqrte v1.2d, v2.2d"), 8),
             ("fabd .4s", form!("fabd v1.4s, v2.4s, v3.4s"), 4),
         ];
         for &(name, f, e) in kept {

@@ -148,6 +148,13 @@ def simd_cases():
     out.append(one('ftz-ue-unmasked', 'mulss xmm1, xmm2', tiny, (MX | 0x8000) & ~(UE << 7), UE | PE, 19, 1))
     out.append(one('ftz-ue-masked', 'mulss xmm1, xmm2', tiny, MX | 0x8000, UE | PE, None, 1))
     out.append(one('ftz-exact-tiny-ue-unmasked', 'mulss xmm1, xmm2', {1: lanes(E100), 2: lanes(E30)}, (MX | 0x8000) & ~(UE << 7), UE, 19, 1))
+    # AFP accurate chunk 3 (FTZ alone, DAZ clear): 4095 * 2^-75 times 4097 * 2^-75 is 2^-126 - 2^-150: x86 rounds it to a value below MIN_NORMAL
+    # (tiny, unchanged) and FTZ flushes it to +0 with UE and PE; Arm's denormal grid rounds it up to MIN_NORMAL. Nearest and round up.
+    for rc in (0, 2):
+        c1 = one(f'ftz-band-flush-rc{rc}', 'mulss xmm1, xmm2', {1: lanes(0x1ffff000, ONE, ONE, ONE), 2: lanes(0x20000800, ONE, ONE, ONE)}, MX | 0x8000 | rc << 13, UE | PE, None, 1)
+        old = c1['check']
+        c1['check'] = lambda vm, old=old: old(vm) + ([] if xmm_of(vm, 1) == (ONE << 32, ONE | ONE << 32) else [f'xmm1 {xmm_of(vm, 1)[0]:#x} {xmm_of(vm, 1)[1]:#x}, want 0x{ONE << 32:x} (lane 0 flushed to +0)'])
+        out.append(c1)
     # DAZ: a denormal source is zero, no DE whatever DM (10.2.3.4).
     out.append(one('daz-de-unmasked', 'addss xmm1, xmm2', {1: lanes(ONE), 2: lanes(DEN)}, (MX | 0x40) & ~(DE << 7), 0, None, 1))
     out.append(one('daz-ze-unmasked', 'divss xmm1, xmm2', {1: lanes(ONE), 2: lanes(DEN)}, (MX | 0x40) & ~(ZE << 7), ZE, 19, 1))
@@ -325,6 +332,8 @@ def simd_cases():
         out.append(c1)
     m = lambda s: MIN32 | (s << 31)
     packed('band-mulps-lane0-not-tiny', 'mulps xmm1, xmm2', {1: lanes(A32[0], ONE, ONE, ONE), 2: lanes(A32[1], ONE, ONE, ONE)}, UM, PE, None, res=(m(1) | ONE << 32, ONE | ONE << 32))
+    # The destination is the addend (FMLA): the handler's re-run overwrites it, so the band decision must come from the operands saved at the trap.
+    packed('band-vfmadd231ps-dest-is-addend-lane0-not-tiny', 'vfmadd231ps xmm1, xmm2, xmm3', {1: lanes(ZERO, ZERO, ZERO, ZERO), 2: lanes(A32[0], ONE, ONE, ONE), 3: lanes(A32[1], ONE, ONE, ONE)}, UM, PE, None, res=(m(1) | ONE << 32, ONE | ONE << 32))
     packed('band-mulps-lane0-not-tiny-lane1-tiny-sub-band', 'mulps xmm1, xmm2', {1: lanes(A32[0], B32[0], ONE, ONE), 2: lanes(A32[1], B32[1], ONE, ONE)}, UM, UE | PE, 19)
     packed('band-mulps-lane0-not-tiny-lane1-exact-tiny', 'mulps xmm1, xmm2', {1: lanes(A32[0], E100, ONE, ONE), 2: lanes(A32[1], E30, ONE, ONE)}, UM, UE | PE, 19)
     packed('band-mulps-lane0-not-tiny-lane1-tiny-first', 'mulps xmm1, xmm2', {1: lanes(B32[0], A32[0], ONE, ONE), 2: lanes(B32[1], A32[1], ONE, ONE)}, UM, UE | PE, 19)
