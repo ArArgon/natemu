@@ -357,6 +357,55 @@ def simd_cases():
     # Controls: an add and a square root never produce a tiny inexact result (a tiny sum is exact; a root is never tiny): MIN_NORMAL from 2^-125 - 2^-126 is
     # exact, and raises nothing (normal operands, so no DE either).
     out.append(one('band-addss-exact-min-normal', 'addss xmm1, xmm2', {1: lanes(0x01000000), 2: lanes(0x80800000)}, UM, 0, None, 1))
+    # AFP accurate chunk 5: DAZ + FTZ together, every exception masked (FZ = 0 with UFE in accurate mode without AFP: row 4 flushes the sources, the
+    # trap handler gives x86's flushed result and UE + PE; the M4 and fast mode flush in hardware). A denormal source is a zero (no DE, no PE), a tiny
+    # result (exact ones too) is +-0 with UE and PE, a result that x86 rounds up to MIN_NORMAL is not tiny: +-MIN_NORMAL with PE (fast mode without AFP
+    # flushes it to 0 with UE and PE: the registered deviation `daz-ftz-band`, value and flags). Results are the whole xmm1.
+    DF = MX | 0x8000 | 0x40
+    zz, dz = (0, 0), lambda *v: (v[0] | v[1] << 32, v[2] | v[3] << 32)
+    packed('daz-ftz-flush-mulss', 'mulss xmm1, xmm2', {1: lanes(E100 | 1), 2: lanes(E30)}, DF, UE | PE, None, res=zz)
+    packed('daz-ftz-exact-tiny-mulss', 'mulss xmm1, xmm2', {1: lanes(E100), 2: lanes(E30)}, DF, UE | PE, None, res=zz)
+    packed('daz-ftz-denormal-input-mulss', 'mulss xmm1, xmm2', {1: lanes(DEN), 2: lanes(TWO)}, DF, 0, None, res=zz)
+    packed('daz-ftz-denormal-input-addss', 'addss xmm1, xmm2', {1: lanes(ONE), 2: lanes(DEN)}, DF, 0, None, res=(ONE, 0))
+    packed('daz-ftz-exact-tiny-addss', 'addss xmm1, xmm2', {1: lanes(0x00c00000), 2: lanes(0x80800000)}, DF, UE | PE, None, res=zz)
+    packed('daz-ftz-exact-tiny-subsd', 'subsd xmm1, xmm2', {1: (0x0018000000000000, 0), 2: (0x0010000000000000, 0)}, DF, UE | PE, None, res=zz)
+    packed('daz-ftz-exact-tiny-addps-lanes', 'addps xmm1, xmm2', {1: lanes(0x00c00000, ONE, ONE, ONE), 2: lanes(0x80800000, ONE, ONE, ONE)}, DF, UE | PE, None,
+           res=dz(0, TWO, TWO, TWO))
+    packed('daz-ftz-mulps-mixed-lanes', 'mulps xmm1, xmm2', {1: lanes(E100 | 1, ONE, DEN, TWO), 2: lanes(E30, TWO, ONE, ONE)}, DF, UE | PE, None, res=dz(0, TWO, 0, TWO))
+    # the negating and sign-mask multiplies of ADDSUB, FMSUB, FNMADD and FMADDSUB see no denormal (row 4 runs before them): no flag, the exact value
+    packed('daz-ftz-addsubps-denormal', 'addsubps xmm1, xmm2', {1: lanes(ONE, ONE, ONE, ONE), 2: lanes(DEN, DEN, DEN, DEN)}, DF, 0, None, res=dz(ONE, ONE, ONE, ONE))
+    for ins in ('vfmsub231ps', 'vfnmadd231ps', 'vfmaddsub231ps', 'vfmsubadd231ps', 'vfnmsub231ps'):
+        sign = -1 if ins in ('vfnmadd231ps', 'vfnmsub231ps') else 1
+        packed(f'daz-ftz-{ins}-denormal-addend', f'{ins} xmm1, xmm2, xmm3', {1: lanes(DEN, DEN, DEN, DEN), 2: lanes(ONE, ONE, ONE, ONE), 3: lanes(TWO, TWO, TWO, TWO)}, DF, 0, None,
+               res=dz(*([0xc0000000] * 4 if sign < 0 else [TWO] * 4)))
+    packed('daz-ftz-vfmadd231ps-flush', 'vfmadd231ps xmm1, xmm2, xmm3', {1: lanes(0, 0, 0, 0), 2: lanes(E100 | 1, ONE, ONE, ONE), 3: lanes(E30, ONE, ONE, ONE)}, DF, UE | PE, None,
+           res=dz(0, ONE, ONE, ONE))
+    # DPPS's steps: a denormal product is flushed (UE + PE), a denormal input is zero, a denormal sum of the first add level is flushed too
+    f70 = f32(2.0 ** -70)
+    packed('daz-ftz-dpps-denormal-product', 'dpps xmm1, xmm2, 0xf1', {1: lanes(f70, ONE, ONE, ONE), 2: lanes(f70, ONE, ONE, ONE)}, DF, UE | PE, None, res=(0x40400000, 0))
+    packed('daz-ftz-dpps-denormal-input', 'dpps xmm1, xmm2, 0xf1', {1: lanes(DEN, ONE, ONE, ONE), 2: lanes(ONE, ONE, ONE, ONE)}, DF, 0, None, res=(0x40400000, 0))
+    packed('daz-ftz-dpps-denormal-sum', 'dpps xmm1, xmm2, 0x31', {1: lanes(0x00c00000, 0x80800000, 0, 0), 2: lanes(ONE, ONE, 0, 0)}, DF, UE | PE, None, res=zz)
+    # VCVTPS2PH ignores FTZ: an exact half denormal keeps its value and raises nothing
+    packed('daz-ftz-vcvtps2ph-ignores-ftz', 'vcvtps2ph xmm1, xmm2, 4', {1: lanes(ONE), 2: lanes(f32(2.0 ** -20), ONE, ONE, ONE)}, DF, 0, None, res=(0x3c003c003c000010, 0),
+           extra=['xcr0 7'])
+    for op, rows in BAND.items():
+        insn, ebits, srcs, dbits = SPEC[op]
+        for rc, tag, a, b, c, sign in rows:
+            x = {srcs[k]: (v, 0) for k, v in enumerate((a, b, c)[:len(srcs)])}
+            if op == 'cvtsd2ss': x[1] = lanes(ONE)
+            start, neg = DF | rc << 13, (1 << (dbits - 1)) if sign < 0 else 0
+            name = f'daz-ftz-band-{op}-rc{rc}-{"not-tiny" if tag == "A" else "tiny"}{"-neg" if sign < 0 else ""}'
+            if tag == 'A':   # +-MIN_NORMAL and PE; fast mode without AFP: +-0 with UE and PE
+                c1 = one(name, insn, x, start, PE, None, 1)
+                c1['mx'] = None
+                res = ((MIN32 if dbits == 32 else MIN64) | neg, start | PE)
+                c1['value'] = {'tag': 'daz-ftz-band', 'read': lambda vm: (xmm_of(vm, 1)[0], int(vm['mxcsr'], 0)), 'exact': res, 'deviated': (neg, start | UE | PE)}
+                out.append(c1)
+            else:            # tiny after rounding: +-0, UE and PE, in every mode
+                c1 = one(name, insn, x, start, UE | PE, None, 1)
+                old = c1['check']
+                c1['check'] = lambda vm, old=old, neg=neg, dbits=dbits: old(vm) + band_result(vm, 1, neg, dbits)
+                out.append(c1)
     # x87 arithmetic leaves MXCSR alone and does not trip a SIMD check (its own FPSR wrapper).
     out.append(case('x87-between-simd', ['fninit', 'fld1', 'fldz', 'fdivp st(1), st(0)', 'addss xmm3, xmm3', 'fstp st(0)'],
                     ['sse 1', f'mxcsr {MX & ~(ZE << 7):#x}', f'xmm 3 {ONE:#x} 0'], None,
@@ -669,7 +718,21 @@ def self_check():
                                 (m4, v['deviated'], 'fail'), (acc, v['exact'], 'ok'), (acc, v['deviated'], 'fail'), ({}, v['deviated'], 'fail')):
         got = judge(c, vmv(value, **report), offsets)[1]
         if got != kind: sys.exit(f"run_i5c self-check FAILED: judge({c['name']}, {report}, lane {value[0]:#x}) is {got}, want {kind}")
-    print(f'{len(cs)} cases ({len(simd)} SIMD), {len(tagged)} tagged masked-sse-de, {sum(1 for c in cs if c.get("value"))} with a value deviation (ftz-band)')
+    # a DAZ + FTZ band case (`daz-ftz-band`: value and MXCSR flags deviate together): fast mode without AFP gives +-0 with UE and PE, the M4 and
+    # accurate mode must give +-MIN_NORMAL with PE and nothing else
+    c = next(c for c in cs if c.get('value') and c['value']['tag'] == 'daz-ftz-band')
+    code, labels = ref.assemble('\n'.join(f'{l}\nl{i}:' for i, l in enumerate(c['lines'])), labels=True)
+    offsets = [0] + [labels[f'l{i}'] for i in range(len(c['lines']) - 1)]
+    v = c['value']
+    def vmd(value, **r):
+        x = [hex(0)] * 32; x[2] = hex(value[0])
+        return {'stop': 'resident', 'reason': 'halted', 'rip': hex(CODE + offsets[-1] + 1), 'mxcsr': hex(value[1]), 'fault': [], 'xmm': x, **r}
+    for report, value, kind in ((m2, v['deviated'], 'deviated'), (m2, v['exact'], 'fail'), (m2, (v['deviated'][0], v['exact'][1]), 'fail'),
+                                (m2, (v['exact'][0], v['deviated'][1]), 'fail'), (m4, v['exact'], 'ok'), (m4, v['deviated'], 'fail'),
+                                (acc, v['exact'], 'ok'), (acc, v['deviated'], 'fail'), ({}, v['deviated'], 'fail')):
+        got = judge(c, vmd(value, **report), offsets)[1]
+        if got != kind: sys.exit(f"run_i5c self-check FAILED: judge({c['name']}, {report}, {value[0]:#x} {value[1]:#x}) is {got}, want {kind}")
+    print(f'{len(cs)} cases ({len(simd)} SIMD), {len(tagged)} tagged masked-sse-de, {sum(1 for c in cs if c.get("value"))} with a value deviation (ftz-band, daz-ftz-band)')
 
 
 def main():

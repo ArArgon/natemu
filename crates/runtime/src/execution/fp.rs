@@ -20,6 +20,10 @@
 //! re-run is needed: the word is skipped after the NaN lanes of R are recomputed from the three operand registers the site names
 //! ([`fptrap::fma_check`]).
 //!
+//! AFP accurate plan chunk 5 (DAZ + FTZ): accurate mode never runs FZ = 1; with DAZ and FTZ both on, UFE traps every tiny result (exact ones
+//! too) and the patch flushes it to x86's FTZ result ([`fptrap::FLUSH_ALL`], chosen from the MXCSR the block was compiled under); fexc's
+//! row 4 has flushed the inputs.
+//!
 //! The resident already single-steps for watchpoints (`watch`), which assumes every step is one: it re-arms MDE and restores nothing
 //! in FPCR. The marker tells the two apart ([`returned`] dispatches on it); MDE is left as it was here, so a watchpoint armed while an
 //! FP word re-runs stays armed; [`cancel`] (any other entry while the marker is set) restores the trap enables and the step state, so
@@ -136,21 +140,17 @@ pub(super) unsafe fn stepped(elr: u64, spsr: u64) -> ! {
             halt_native([0, u64::from(word), elr], stop::FP_WORD)
         };
         let s = load();
-        // FTZ alone (a trap with DAZ and FTZ both would be none: FZ = 1 never traps): the block was compiled under the key of the MXCSR
-        // the bank holds (LDMXCSR ends a block), so its effective FTZ is that value's; the patch then also flushes a band lane's value.
+        // The block was compiled under the key of the MXCSR the bank holds (LDMXCSR ends a block). FTZ alone: software flushes the
+        // denormals and the patch fixes the band's MIN_NORMAL. DAZ + FTZ (accurate mode runs FZ = 0 then, row 4 flushed the inputs): every
+        // tiny result traps and the patch flushes it (x86's FTZ result), chunk 5.
         let ftz = ftz_key(s.cpu.mxcsr, true) != 0;
+        let flush = if !ftz { 0 } else if daz_key(s.cpu.mxcsr, true) != 0 { fptrap::FLUSH_ALL } else { 1 };
         let rd = match class {
             fptrap::Class::Patch(op) => usize::from(op.rd),
             fptrap::Class::Keep => 0,
         };
         let nan = (*r).fpcr & natemu_abi::execution::FPCR_IOE != 0;
-        // FZ = 1 (DAZ and FTZ both: the hardware flush; UFE never traps then, only IOE does): the re-run's UFC is the flush's, which stays as
-        // the hardware gives it (chunk 5 decides the rest), so the UFC model is not run.
-        let class = match class {
-            fptrap::Class::Patch(o) if (*r).fpcr >> 24 & 1 != 0 => fptrap::Class::Patch(fptrap::Op { kind: 0, ..o }),
-            c => c,
-        };
-        let flags = fptrap::patch(class, fptrap::x86_rc((*r).fpcr), &(*r).q, (*frame).fpsr, ftz, &mut (*frame).q[rd], nan);
+        let flags = fptrap::patch_flush(class, fptrap::x86_rc((*r).fpcr), &(*r).q, (*frame).fpsr, flush, &mut (*frame).q[rd], nan);
         (*frame).fpsr = (*r).fpsr | flags;
         (*frame).fpcr = (*r).fpcr;
         core::ptr::write_volatile(&raw mut (*r).active, 0);

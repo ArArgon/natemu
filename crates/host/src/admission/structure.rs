@@ -2389,6 +2389,9 @@ mod tests {
     /// A word in the middle of a straight-line block (`mov x4, x20` after the first load).
     const MIDDLE: (u32, u32) = (0xc, 0xaa14_03e4);
 
+    fn itertools_product<'a>(modes: [bool; 2], keys: [&'a [&'a str]; 4]) -> Vec<(bool, &'a [&'a str])> {
+        modes.iter().flat_map(|&m| keys.iter().map(move |&k| (m, k))).collect()
+    }
     /// AFP fallback chunk 3a: with `FEXC` set, the code of the software DAZ and FTZ flushes (and of the unmasked-PE check under
     /// FTZ) passes admission with the code-shape check, as every key and unmasked-exception combination of these forms compiles.
     #[test]
@@ -2400,28 +2403,72 @@ mod tests {
             "0f58ca", "660f5cca", "f30f59ca", "f20f5eca", "0f51ca", "0f5dca", "f20f5fca", "f20f7cca", "660fd0ca", "660f3a40caff",
             "0fc2ca01", "0f2fca", "660f2eca", "0f5aca", "660f5aca", "f30f5aca", "f20f5aca", "660f5bca", "f2480f2cc2", "660f3a08ca04",
             "0f53ca", "f30f52ca", "c4e269b8cb", "c4e2e9afcb", "c5ec59cb", "c5ed5ecb", "c4e3791dd100", "c5fd5aca", "c5fc5aca", "c5ed7ccb",
+            // chunk 5: the negating and sign-mask multiplies (ADDSUB, FMSUB, FNMADD, FMADDSUB, FMSUBADD; xmm and ymm) in accurate DAZ + FTZ
+            "c5e9d0cb", "c5edd0cb", "c4e269bacb", "c4e26dbacb", "c4e269bccb", "c4e269b6cb", "c4e2e9b7cb", "f30f58ca", "f20f58ca", "660f58ca",
         ];
         let dir = std::env::temp_dir().join(format!("natemu-flush-admit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for hex in forms {
             let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
-            for keys in [&[][..], &["--daz"], &["--ftz"], &["--daz", "--ftz"]] {
+            // (chunk 5: accurate mode too: DAZ + FTZ there is FZ = 0 with the software input flush, and must not spill)
+            for (accurate, keys) in itertools_product([false, true], [&[][..], &["--daz"], &["--ftz"], &["--daz", "--ftz"]]) {
                 for unmasked in ["0", "0x20", "0x3f"] {
                     let object = dir.join("o");
+                    let json = dir.join("j");
                     let out = std::process::Command::new(&fexc)
                         .args(["--hex", hex, "--rip", "0x1000", "--profile", "slice1", "--feature", "afp=0", "--simd-unmasked", unmasked])
                         .args(keys)
+                        .args(accurate.then_some("--accurate"))
                         .arg("--object")
                         .arg(&object)
                         .arg("--out")
-                        .arg("/dev/null")
+                        .arg(&json)
                         .output()
                         .unwrap();
                     assert!(out.status.success(), "{hex} {keys:?}");
+                    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+                    assert!(!accurate || report["code"]["layout"]["spill_bytes"] == 0, "{hex} {keys:?} {unmasked}: a spill");
                     let object = std::fs::read(&object).unwrap();
-                    admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {keys:?} {unmasked}: {e}"));
+                    admit((&object, &source)).unwrap_or_else(|e| panic!("{hex} {keys:?} {accurate} {unmasked}: {e}"));
                 }
             }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// AFP accurate plan chunk 5 (R3-3): in accurate DAZ + FTZ the sign-mask and negating multiplies (ADDSUB, FMSUB, FNMADD, FMADDSUB) are never
+    /// flushed by the resident, so row 4's input flush (`bic`, the mask's last word) must come before the first multiply: a denormal into one would
+    /// trap with a tiny result. Fast mode (FZ = 1, no flush at all) and the AFP-less build with DAZ + FTZ outside accurate mode are not changed.
+    #[test]
+    fn accurate_daz_and_ftz_flush_the_sources_before_the_negating_multiplies() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("natemu-daz-ftz-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let object = dir.join("o");
+        let words = |hex: &str, args: &[&str]| -> Vec<u32> {
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", hex, "--rip", "0x1000", "--profile", "slice1", "--feature", "afp=0"])
+                .args(args)
+                .arg("--object")
+                .arg(&object)
+                .arg("--out")
+                .arg("/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex} {args:?}");
+            let o = std::fs::read(&object).unwrap();
+            let h: natemu_abi::code_object::Header = super::super::record(&o, 0);
+            o[h.code_offset as usize..][..h.code_region_end as usize].chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect()
+        };
+        let is_fmul = |w: u32| w & 0xbfa0_fc00 == 0x2e20_dc00;
+        let is_bic = |w: u32| w & 0xffe0_fc00 == 0x4e60_1c00;
+        for hex in ["660fd0ca", "c5e9d0cb", "c4e269bacb", "c4e269b6cb", "c4e26dbacb"] {
+            let w = words(hex, &["--accurate", "--daz", "--ftz"]);
+            let (m, b) = (w.iter().position(|&x| is_fmul(x)).expect("a multiply"), w.iter().position(|&x| is_bic(x)).expect("a flush"));
+            assert!(b < m, "{hex}: the first flush at {b} is after the first multiply at {m}");
+            // the other keys and modes: no flush at all with DAZ + FTZ in fast mode (FZ = 1), and accurate FTZ alone flushes outputs only
+            assert!(!words(hex, &["--daz", "--ftz"]).iter().any(|&x| is_bic(x)), "{hex}: fast mode has no flush");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
