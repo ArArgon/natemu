@@ -802,3 +802,124 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
             .contains("not built yet")
     );
 }
+
+#[test]
+fn every_set_key_has_a_handler_and_old_flags_map_to_known_keys() {
+    let _env = lock();
+    for key in KEYS {
+        for value in ["on", "1", "x", "mmio", "fast", "2G"] {
+            let mut cfg = Config::new(None);
+            let r = set(&mut cfg, &format!("{key}={value}"), &mut BTreeSet::new());
+            let e = r.err().unwrap_or_default();
+            assert!(
+                !e.contains("unknown key") && !e.contains("no handler"),
+                "{key}={value}: {e}"
+            );
+        }
+    }
+    // apply_flags asserts (debug builds) that every key it claims is in KEYS; this line gives every flag.
+    let _ = load_old(&[
+        "--runtime",
+        "r",
+        "--initrd",
+        "i",
+        "--cmdline",
+        "c",
+        "--ram",
+        "1G",
+        "--vcpus",
+        "1",
+        "--serial",
+        "s",
+        "--serial-stdin",
+        "--speculation-barriers",
+        "--fp",
+        "fast",
+        "--page-currency",
+        "on",
+        "--writable-on-read",
+        "on",
+        "--rng",
+        "--disk",
+        "d",
+        "--net",
+        "--net-forward",
+        "1:2",
+        "--net-host-loopback",
+        "--pool",
+        "--check-reuse",
+        "--virtio-transport",
+        "pci",
+        "--compile-cache",
+        "off",
+        "--compile-cache-mb",
+        "1",
+        "--perf-log",
+        "p",
+    ])
+    .unwrap();
+}
+
+#[test]
+fn review_fixes() {
+    let _env = lock();
+    // (1) nic= and net= both in --set machine.transport.
+    for spec in ["nic=pci", "net=pci"] {
+        let c = load_old(&["--set", &format!("machine.transport={spec}")]).unwrap();
+        assert_eq!(
+            c.transports,
+            Transports {
+                disk: Mmio,
+                net: Pci,
+                rng: Mmio
+            },
+            "{spec}"
+        );
+    }
+    // (3) `off` is special only for compile_cache.
+    let (d, c) = load_file(
+        "[engine]\nfexc = \"off\"\ncompile_cache = \"off\"\n[boot.kernel]\nimage = \"off\"\n",
+        &[],
+    );
+    let c = c.unwrap();
+    assert_eq!(
+        (c.fexc, c.kernel),
+        (Some(d.join("off")), Some(d.join("off")))
+    );
+    assert_eq!(c.compile_cache, Some(PathBuf::from("off")));
+    // (4) readable ram errors.
+    for bad in ["-1", "true", "[1]"] {
+        let e = err(load_file(&format!("[machine]\nram = {bad}\n{MIN}"), &[]).1);
+        assert!(
+            e.contains("machine.ram: expected a size string") && !e.contains("untagged"),
+            "{e}"
+        );
+    }
+    // (5) --kernel supplies a missing image; without it the error names the table.
+    let file = "[engine]\nfexc = \"f\"\n[boot.kernel]\ncmdline = \"q\"\n";
+    let c = load_file(file, &["--kernel", "k"]).1.unwrap();
+    assert_eq!(
+        (c.kernel, c.cmdline.as_str()),
+        (Some(PathBuf::from("k")), "q")
+    );
+    assert!(err(load_file(file, &[]).1).contains("[boot.kernel] needs image"));
+    // (7) --net alone does not claim nic.net0.host_loopback or forward.
+    let c = load_old(&[
+        "--net",
+        "--set",
+        "nic.net0.host_loopback=on",
+        "--set",
+        "nic.net0.forward=1:2",
+    ])
+    .unwrap();
+    assert!(c.nics[0].host_loopback);
+    assert!(
+        load_old(&[
+            "--net",
+            "--net-host-loopback",
+            "--set",
+            "nic.net0.host_loopback=on"
+        ])
+        .is_err()
+    );
+}
