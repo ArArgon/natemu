@@ -24,6 +24,9 @@ pub const DIV: u8 = 2;
 pub const FMA: u8 = 3;
 /// binary64 to binary32 (CVTSD2SS, CVTPD2PS).
 pub const CVT: u8 = 4;
+/// binary32 to binary16 (VCVTPS2PH's `fcvtn`), for [`lane_underflow`] only: no site describes it ([`Desc::decode`] refuses it), because
+/// the unmasked case has no check for it; the resident's FP trap handler (AFP accurate plan chunk 3) decodes the Arm word itself.
+pub const CVT16: u8 = 5;
 /// Meta byte bits: 8-byte source elements, scalar (lane 0 only), a second half (ymm: two 128-bit ops), FMA's negated product (FNMADD,
 /// FNMSUB) and negated addend (FMSUB, FNMSUB).
 pub const ELEM8: u8 = 1 << 3;
@@ -95,6 +98,14 @@ impl Wide {
             }
         }
         0
+    }
+    fn trailing_zeros(&self) -> i64 {
+        for k in 0..6 {
+            if self.0[k] != 0 {
+                return 64 * k as i64 + i64::from(self.0[k].trailing_zeros());
+            }
+        }
+        i64::MAX
     }
     fn shl(&self, n: u32) -> Wide {
         let (limbs, bits) = ((n / 64) as usize, n % 64);
@@ -214,46 +225,76 @@ fn dyadic(m: u128, exp: i64) -> Dyadic {
 }
 
 /// One lane's exact tininess after rounding, for operands `a`, `b`, `c` (bit patterns; `wide`: binary64, else binary32; for
-/// [`CVT`] `a` is a binary64 and the result binary32). Zero, infinity, NaN and an exact zero result are not tiny.
+/// [`CVT`] `a` is a binary64 and the result binary32, for [`CVT16`] `a` is a binary32 and `wide` false). Zero, infinity, NaN and an
+/// exact zero result are not tiny.
 pub fn lane_tiny(kind: u8, wide: bool, neg: (bool, bool), rc: u32, a: u64, b: u64, c: u64) -> bool {
+    lane_judge(kind, wide, neg, rc, a, b, c).0
+}
+
+/// x86's masked underflow (SDM Vol.1 4.9.1.5: UE is set for a result that is tiny after rounding AND inexact, loss of accuracy being
+/// detected as an inexact result) for one lane: [`lane_tiny`] and not exact. A tiny result lies on the denormal grid (spacing
+/// 2^(emin - p + 1)), which x86 and Arm both round to, so a tiny lane is exact iff its exact value is a multiple of the spacing.
+pub fn lane_underflow(kind: u8, wide: bool, neg: (bool, bool), rc: u32, a: u64, b: u64, c: u64) -> bool {
+    let (tiny, exact) = lane_judge(kind, wide, neg, rc, a, b, c);
+    tiny && !exact
+}
+
+/// (tiny after rounding, exact) of one lane ([`lane_tiny`]); the second is meaningful only when the first is true.
+fn lane_judge(kind: u8, wide: bool, neg: (bool, bool), rc: u32, a: u64, b: u64, c: u64) -> (bool, bool) {
     let (p, emin) = match (kind, wide) {
+        (CVT16, _) => (11, -14),
         (CVT, _) | (_, false) => (24, -126),
         _ => (53, -1022),
     };
+    let grid = emin - i64::from(p) + 1;
     let Some((sa, ma, ea)) = parse(a, wide) else {
-        return false;
+        return (false, true);
     };
     let (negative, mag) = match kind {
-        CVT => (sa, dyadic(ma.into(), ea)),
+        CVT | CVT16 => (sa, dyadic(ma.into(), ea)),
         MUL | FMA => {
             let Some((sb, mb, eb)) = parse(b, wide) else {
-                return false;
+                return (false, true);
             };
             let product = (sa ^ sb ^ neg.0, u128::from(ma) * u128::from(mb), ea + eb);
             if kind == MUL {
                 (product.0, dyadic(product.1, product.2))
             } else {
                 let Some((sc, mc, ec)) = parse(c, wide) else {
-                    return false;
+                    return (false, true);
                 };
                 match sum(product, (sc ^ neg.1, u128::from(mc), ec)) {
                     Some(v) => v,
-                    None => return false,
+                    None => return (false, true),
                 }
             }
         }
         _ => {
             // a / b: compare ma * 2^ea / (mb * 2^eb) with the constants K * 2^k through ma * 2^ea against K * mb * 2^(k + eb).
             let Some((sb, mb, eb)) = parse(b, wide) else {
-                return false;
+                return (false, true);
             };
             if ma == 0 || mb == 0 {
-                return false;
+                return (false, true);
             }
-            return div_tiny(sa ^ sb, ma, ea, mb, eb, rc, p, emin);
+            return (
+                div_tiny(sa ^ sb, ma, ea, mb, eb, rc, p, emin),
+                div_exact(ma, ea, mb, eb, grid),
+            );
         }
     };
-    !mag.mant.is_zero() && tiny_value(negative, mag, rc, p, emin)
+    if mag.mant.is_zero() {
+        return (false, true);
+    }
+    let exact = mag.exp >= grid || mag.mant.trailing_zeros() >= grid - mag.exp;
+    (tiny_value(negative, mag, rc, p, emin), exact)
+}
+
+/// Is `ma * 2^ea / (mb * 2^eb)` a multiple of `2^grid`? With `ma = x * 2^i`, `mb = y * 2^j` (x, y odd): `x / y * 2^(i - j + ea - eb - grid)`
+/// is an integer iff `y` divides `x` and the exponent is not negative.
+fn div_exact(ma: u64, ea: i64, mb: u64, eb: i64, grid: i64) -> bool {
+    let (i, j) = (i64::from(ma.trailing_zeros()), i64::from(mb.trailing_zeros()));
+    (ma >> i) % (mb >> j) == 0 && i - j + ea - eb - grid >= 0
 }
 
 /// The exact sum of two signed dyadic numbers (sign, significand, exponent); `None` for zero.

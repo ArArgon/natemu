@@ -88,6 +88,7 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
         let s = shared();
         // Perf chunk 22: a literal exit or a dispatcher miss is served from the gate's frame alone (`linker`, `missed`);
         // the copy is for the entries that may resume generated code mid-block (`resume` and its callers).
+        execution::fp_cancel(frame as *mut NativeFrame, fault);
         if !(fault == 1 && execution::frame_only()) {
             copy_frame(&raw mut (*s).captured, frame);
         }

@@ -2491,7 +2491,7 @@ pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64, step: bool) -> Vec<Strin
     if cpu.cr0 & (exec::CR0_TS | exec::CR0_MP) == exec::CR0_TS | exec::CR0_MP {
         args.push("--wait-gated".into());
     }
-    match exec::x87_fpcr(cpu.fcw, cpu.mxcsr, cpu.no_afp != 0) {
+    match exec::x87_fpcr(cpu.fcw, cpu.mxcsr, cpu.no_afp != 0, exec::accurate_key(cpu.accurate_fp, cpu.no_afp) != 0) {
         0 => {}
         fpcr => args.extend(["--x87-fpcr".into(), format!("{fpcr:#x}")]),
     }
@@ -6367,6 +6367,12 @@ mod tests {
                 );
             }
             assert_eq!(exec::fpcr(mxcsr, false), before_no_afp::fpcr(mxcsr), "fpcr {mxcsr:#x}");
+            // AFP accurate plan chunk 3: the trap enables are accurate mode without AFP only; with AFP, in either mode, the FPCR a block is
+            // entered with is the old one (the `accurate` argument is `accurate_key`, 0 with AFP).
+            for accurate_fp in [0, 1] {
+                let on = exec::accurate_key(accurate_fp, 0) != 0;
+                assert_eq!(exec::fpcr_run(mxcsr, false, on), before_no_afp::fpcr(mxcsr), "fpcr_run {mxcsr:#x}");
+            }
             cpu.mxcsr = mxcsr;
             // AFP fallback chunk 3a: the DAZ and FTZ keys exist only without AFP (the context bits and fexc's `--daz`/`--ftz`);
             // with AFP the words compared below (no key bit, no argument) are the old ones.
@@ -6383,7 +6389,7 @@ mod tests {
                     let fcw = (exec::FCW_INIT & !(0x3f | 3 << 10)) | rc << 10 | masks;
                     cpu.fcw = fcw;
                     assert_eq!(
-                        exec::x87_fpcr(fcw, mxcsr, false),
+                        exec::x87_fpcr(fcw, mxcsr, false, false),
                         before_no_afp::x87_fpcr(fcw, mxcsr),
                         "x87_fpcr {fcw:#x} {mxcsr:#x}"
                     );
@@ -6409,7 +6415,7 @@ mod tests {
                         assert_eq!(fast_c.gating(), accurate_c.gating(), "step {step}: gating {fcw:#x} {mxcsr:#x}");
                     }
                     tested += 1;
-                    keyed += u64::from(exec::x87_fpcr(fcw, mxcsr, false) != 0);
+                    keyed += u64::from(exec::x87_fpcr(fcw, mxcsr, false, false) != 0);
                 }
             }
         }
@@ -6427,7 +6433,7 @@ mod tests {
             for fcw in [exec::FCW_INIT, exec::FCW_INIT | 1 << 10, exec::FCW_INIT | 3 << 10, 0x3f | 2 << 10] {
                 (cpu.mxcsr, cpu.fcw) = (mxcsr, fcw);
                 let args = x87_args(&cpu, no_afp, false);
-                let fpcr = exec::x87_fpcr(fcw, mxcsr, true);
+                let fpcr = exec::x87_fpcr(fcw, mxcsr, true, false);
                 assert_eq!(fpcr & 7, 0, "no AH, NEP or FIZ");
                 assert_eq!(args.iter().any(|a| a == "--x87-fpcr"), fpcr != 0);
                 assert_eq!(cpu.code_context() >> 14 & 1, u64::from(fpcr != 0));
@@ -6464,9 +6470,18 @@ mod tests {
                 // Bit 32 alone is the difference, and no other bit moves.
                 assert_eq!(fast.code_context() >> 32, 0);
                 assert_eq!(accurate.code_context() >> 32, 1);
-                assert_eq!(accurate.code_context() & !(1 << 32), fast.code_context());
+                // (Chunk 3: but the x87 rounding bits 14-16 and `--x87-fpcr`, which accurate mode's UFE makes an x87 block switch to.)
+                const X87_BITS: u64 = 7 << 14;
+                assert_eq!(accurate.code_context() & !(1 << 32 | X87_BITS), fast.code_context() & !X87_BITS);
+                let strip = |mut v: Vec<String>| {
+                    if let Some(i) = v.iter().position(|x| x == "--x87-fpcr") {
+                        v.drain(i..i + 2);
+                    }
+                    v
+                };
                 for step in [false, true] {
-                    let (f, a) = (x87_args(&fast, no_afp, step), x87_args(&accurate, no_afp, step));
+                    let (f, a) = (x87_args(&fast, no_afp, step), strip(x87_args(&accurate, no_afp, step)));
+                    let f = strip(f);
                     let mut with = f.clone();
                     with.push("--accurate".into());
                     if step {

@@ -1061,6 +1061,18 @@ memory accesses and unknown opcodes.
 - Observable today: the startup `fp:` line; the driver's `fp` field. Accurate mode's behaviour itself comes with chunks 2-5.
 - Kind: design (`docs/restructure/afp-accurate-plan.md`).
 
+**68. A trapped FP exception is handled in the resident by re-running its one Arm word in place; what is patched depends on the mode, never on ESR.**
+- Accurate mode without AFP runs generated code with FPCR.UFE wherever FZ = 0 (`fpcr_run`); x87 never traps (its word is explicit and trap-free).
+  EC 0x2C from EL0 inside admitted code (or the step block) is classified before any site lookup (`fptrap::classify`); EC 0x2C at EL1 or outside
+  admitted code stops `fp_trap`, an Arm word the table does not know stops `fp_word` (never patched wrongly).
+- The word is re-run under a software step with the trap enables and FPSR cleared; `Shared::fp_rerun.active` is the per-vCPU marker that tells
+  that step from a watchpoint step; the trap enables and the guest's FPSR are restored when the step returns and when it is abandoned (`finish`
+  calls `fp_cancel` before the frame is copied); MDE is untouched; `Control::fp_traps`/`fp_steps` count apart from `debug_steps`.
+- Chunk 3 patches UFC only: per lane, by the tininess model, x86's masked underflow (tiny after rounding and inexact).
+- Enforced by: abi `fptrap` tests (the decode table, per-lane UFC, and the native oracle against the M4's AFP flags), `accurate_mode_without_afp_enables_ufe_where_fz_is_clear`,
+  the host identity test, `tools/run_s4.py` case `fp-trap-in-step-block-with-watchpoint`, run_i5c's band cases in accurate M2 emulation.
+- Kind: design (`docs/restructure/afp-accurate-plan.md`).
+
 ## 2. Internal-only assertions and their replacements
 
 The plan admits four replacement forms: a guest-visible outcome, a contract

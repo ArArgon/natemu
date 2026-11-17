@@ -23,6 +23,7 @@ use natemu_abi::execution::cache::fast_decline;
 use natemu_abi::execution::perf::SysFastDecline;
 mod delivery;
 mod events;
+mod fp;
 mod gather;
 mod half;
 mod helpers;
@@ -116,6 +117,7 @@ pub unsafe fn start() -> ! {
     cache::read_ctr_el0();
     // The entry frame's fields `enter` never writes are zero ([`enter`]).
     unsafe { (*shared()).initial = NativeFrame::ZERO };
+    fp::reset();
     let mut s = unsafe { load() };
     if !guest_state_alias_valid(cache::control().guest_state_va)
         || s.cpu.control().is_none()
@@ -2077,11 +2079,19 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
         if cache::control().pic_test != 0 {
             (*shared()).initial.x[0] = 0;
         }
-        // S4: a watched access's software step completed; any other entry abandons a step in flight.
-        if esr >> 26 == 0x32 && kind != 3 {
+        // S4: a watched access's software step completed; any other entry abandons a step in flight. AFP accurate chunk 3: the
+        // step of an FP trap's re-run is told apart by its marker (`fp::cancel` abandoned one that is not this step, in `finish`).
+        if esr >> 26 == fp::EC_STEP && kind != 3 {
+            if fp::active() {
+                fp::stepped(elr, spsr)
+            }
             watch::stepped(elr, spsr)
         }
         let spsr = watch::cancel(spsr);
+        // A trapped FP exception (UFE in accurate mode without AFP): the word is re-run in place and its flags patched.
+        if esr >> 26 == fp::EC_FP_TRAP && kind != 3 {
+            fp::trap(frame, esr, elr, spsr)
+        }
         if kind == 3 {
             interrupted(frame)
         }
@@ -2108,6 +2118,12 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
         }
         halt_native([esr, 0, elr], stop::UNKNOWN_ABORT)
     }
+}
+/// AFP accurate chunk 3: at every exception entry before the frame is copied; abandons an FP re-run in flight that this entry is not
+/// the step of ([`fp::cancel`]).
+#[inline(always)]
+pub unsafe fn fp_cancel(frame: *mut NativeFrame, kind: u64) {
+    unsafe { fp::cancel(frame, kind) }
 }
 /// Perf chunk 22: the synchronous exception being taken is an `svc #LINK` or `svc #MISS` (ESR_EL1: EC 0x15 and its
 /// immediate), whose service ([`linker`], [`missed`], or a halt) reads only the gate's frame, never `Shared::captured`.
@@ -2154,7 +2170,8 @@ pub(crate) fn halt_native(native: [u64; 3], reason: u64) -> ! {
 fn resident_fault(native: [u64; 3]) -> ! {
     let mut s = unsafe { load() };
     s.native = native;
-    halt(&s, stop::UNKNOWN_ABORT)
+    // AFP accurate chunk 3: an FP trap at EL1 means the resident ran with trap enables (it runs with FPCR = 0: `save_native`).
+    halt(&s, if native[0] >> 26 == fp::EC_FP_TRAP { stop::FP_TRAP } else { stop::UNKNOWN_ABORT })
 }
 
 /// The 128/64 division (`svc #DIV_U/DIV_S` from a block, FEX's LUDIV/LDIV): x0 high, x1 low, x2 divisor in; x0

@@ -32,6 +32,13 @@ CLASSES = {
 }
 
 
+# Which mode fixes each class on a host without AFP (plan section 3, "fixed by"): accurate mode, in the chunk named; fast mode never,
+# unless chunk 6's gate moves UFE (band-ue-flag) or IOE (nan-results, fma-invalid-flag) there.
+FIXED_BY = {'masked-sse-de': 'accurate (chunk 2)', 'nan-results': 'accurate (chunk 4)', 'fma-invalid-flag': 'accurate (chunk 4)',
+            'band-ue-flag': 'accurate (chunk 3: UFE trap, handler); fast only if chunk 6 moves UFE', 'daz-ftz-band': 'accurate (chunk 5)'}
+assert FIXED_BY.keys() == CLASSES.keys()
+
+
 # The corpus programs tagged with a NaN class, by corpus directory (names repeat between i8 and i8b, and the key ties the list to one
 # corpus version), with the final state the offline model predicts for fast mode (tools/models/afp_fp/predict.py writes it).
 PREDICTIONS = pathlib.Path(__file__).resolve().parent / 'models/afp_fp/predictions.json'
