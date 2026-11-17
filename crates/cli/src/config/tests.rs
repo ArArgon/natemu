@@ -61,7 +61,7 @@ struct Fields {
     page_currency: u64,
     writable_on_read: bool,
     rng: bool,
-    disk: Option<PathBuf>,
+    disks: Vec<natemu::linux::DiskSpec>,
     net: bool,
     forwards: Vec<(bool, u16, u16)>,
     host_loopback: bool,
@@ -92,7 +92,7 @@ fn fields(
         page_currency: b.page_currency,
         writable_on_read: b.writable_on_read,
         rng: b.rng,
-        disk: b.disk.clone(),
+        disks: b.disks.clone(),
         net: b.net,
         forwards: b
             .net_options
@@ -133,7 +133,15 @@ fn legacy(cli: &Cli) -> Fields {
     boot.page_currency = cli.page_currency;
     boot.writable_on_read = cli.writable_on_read;
     boot.rng = cli.rng;
-    boot.disk = cli.disk.clone();
+    boot.disks = cli
+        .disk
+        .iter()
+        .map(|path| natemu::linux::DiskSpec {
+            id: "disk0".into(),
+            path: path.clone(),
+            transport: cli.virtio_transport.disk,
+        })
+        .collect();
     boot.net = cli.net;
     boot.net_options = net_options;
     boot.pool = cli.pool;
@@ -789,7 +797,10 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
         (b.ram, b.vcpus, b.accurate_fp, b.rng, b.net),
         (1 << 30, 2, true, true, false)
     );
-    assert_eq!(b.disk, Some(d.join("r.raw")));
+    assert_eq!(
+        b.disks.first().map(|d| d.path.clone()),
+        Some(d.join("r.raw"))
+    );
     assert_eq!(b.cmdline, "quiet");
     assert_eq!(b.transports, Transports::all(Mmio));
     // Not built yet: several or read-only disks.
