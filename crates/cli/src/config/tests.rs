@@ -1044,6 +1044,7 @@ fn the_documented_example_is_in_the_doc_and_loads() {
     let cfg = c.unwrap();
     assert_eq!(cfg.disks.len(), 3);
     assert!(cfg.disks[2].readonly && !cfg.disks[0].readonly);
+    assert_eq!(cfg.disks[0].backing, Some(d.join("debian13.raw")));
     assert_eq!((cfg.nics.len(), cfg.rngs.len()), (1, 1));
     assert_eq!(cfg.nics[0].forward.len(), 2);
     assert_eq!(cfg.ram, Some(4 << 30));

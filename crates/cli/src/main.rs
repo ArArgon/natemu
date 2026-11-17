@@ -18,8 +18,9 @@
 //! **Transport.** Virtio devices attach over PCI when a `--config` file is given and over MMIO without one (the old command
 //! lines); `--virtio-transport` and `machine.transport` override either.
 //!
-//! **Disks.** `--disk FILE` is the first writable disk (id `disk0`); the image format (raw, or qcow2 once that backend
-//! lands) is detected from its first bytes, not from the name. Disks beyond the first, read-only disks and ids come from the file.
+//! **Disks.** `--disk FILE` is the first writable disk (id `disk0`); the image format (raw or qcow2) is detected from its
+//! first bytes, not from the name. Disks beyond the first, read-only disks, ids and qcow2 backing files (`backing`) come
+//! from the file or `--set disk.ID.backing=FILE`.
 //!
 //! **Serial.** `--serial FILE` writes COM1 to that file, so `--serial stdout` is a file named `stdout`; the keyword form is
 //! `[serial] output = "stdout"` (or `--set serial.output=stdout`), which means standard output. Without either, COM1 goes
@@ -118,7 +119,7 @@ struct Cli {
     /// Expose the virtio entropy device
     #[arg(long)]
     rng: bool,
-    /// The first disk, writable (id disk0; the image format is detected from its content: raw, or qcow2 once that backend lands; exclusive use; a guest power-off flushes it to the device). More disks, read-only disks and ids need a --config file
+    /// The first disk, writable (id disk0; the image format is detected from its content: raw or qcow2 (an overlay also needs --set disk.disk0.backing=BASE); exclusive use; a guest power-off flushes it to the device). More disks, read-only disks and ids need a --config file
     #[arg(long, value_name = "FILE")]
     disk: Option<PathBuf>,
     /// Expose a virtio network device on user-mode NAT (libslirp; IPv4, DHCP, DNS)

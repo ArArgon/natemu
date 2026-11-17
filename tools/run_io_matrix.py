@@ -15,7 +15,9 @@ inputs directory as INPUTS/root.qcow2 (`qemu-img convert -O qcow2 -o preallocati
 already allocated and the jobs measure steady state, not allocation; the seconds are in qcow2-prep.json), cloned per run with
 `cp -c`, and launched with --disk. The image hashes and the offline e2fsck still judge raw bytes: after each launch the qcow2 is
 converted to a temporary raw file (deleted at once), and `qemu-img check` must report nothing (corruptions, leaks).
---image-format overlay is refused until the overlay step. Needs qemu-img.
+--image-format overlay: the disk is a new, empty qcow2 overlay over INPUTS/root.raw made per run (`qemu-img create -b -F raw`)
+and launched with --disk and --set disk.disk0.backing=INPUTS/root.raw; the checks are those of qcow2, plus root.raw's hash
+unchanged at the end. Needs qemu-img.
 """
 import argparse
 import copy
@@ -32,7 +34,7 @@ import time
 
 import run_fio_admission as admission
 import run_fio_baselines as baselines
-from io_common import PCI_PROBE, IMAGE_FORMATS, check_image_format, patch, pci_errors, pci_self_test, qcow2_input, qcow2_problems, raw_of
+from io_common import PCI_PROBE, IMAGE_FORMATS, check_image_format, overlay_create, overlay_set, patch, pci_errors, pci_self_test, qcow2_input, qcow2_problems, raw_of
 
 block = admission.block
 digest, write_json, checked = admission.digest, admission.write_json, admission.checked
@@ -385,7 +387,9 @@ def run(args):
     else:
         version = subprocess.check_output([str(binary), '--version'], text=True, timeout=10)
         if not version.startswith('QEMU emulator version 11.1.2'): raise ValueError('QEMU version differs')
-    qcow = check_image_format(args.image_format) == 'qcow2'
+    overlay = check_image_format(args.image_format) == 'overlay'
+    qcow = args.image_format != 'raw'
+    base = args.inputs / 'root.raw'
     pci = args.transport == 'pci'
     if pci and args.backend != 'natemu': raise ValueError('--transport pci is a natemu option')
     if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise ValueError('--transport pci needs inputs from prepare --transport pci')
@@ -401,8 +405,10 @@ def run(args):
     with args.lock.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         image = args.out / ('root.qcow2' if qcow else 'root.raw'); scratch = args.out / 'view.raw'
-        if qcow: write_json(args.out / 'qcow2-prep.json', {'seconds': qcow2_input(args.inputs / 'root.raw', args.inputs / 'root.qcow2')})
-        checked(['cp', '-c', args.inputs / ('root.qcow2' if qcow else 'root.raw'), image], args.out / 'clone.log')
+        if overlay: overlay_create(base, image)
+        else:
+            if qcow: write_json(args.out / 'qcow2-prep.json', {'seconds': qcow2_input(base, args.inputs / 'root.qcow2')})
+            checked(['cp', '-c', args.inputs / ('root.qcow2' if qcow else 'root.raw'), image], args.out / 'clone.log')
         with raw_of(image, qcow, scratch) as raw:
             if digest(raw) != pin['outputs']['root.raw']: raise ValueError('clone differs')
         for phase in ('write', 'verify'):
@@ -412,7 +418,8 @@ def run(args):
             if args.backend == 'natemu':
                 command = [str(binary), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.inputs / 'linux'),
                     '--initrd', str(args.inputs / 'bootstrap.cpio'), '--disk', str(image), '--vcpus', str(args.cpus), '--ram', '2G',
-                    '--compile-cache', 'off', '--serial', str(case / 'serial.log'), '--cmdline', cmdline] + (['--virtio-transport', 'pci'] if pci else [])
+                    '--compile-cache', 'off', '--serial', str(case / 'serial.log'), '--cmdline', cmdline] + (['--virtio-transport', 'pci'] if pci else []) + \
+                    (overlay_set(base) if overlay else [])
             else:
                 command = [str(binary), '-machine', 'pc-i440fx-11.1', '-accel', 'tcg,thread=multi', '-cpu', 'max', '-smp', str(args.cpus),
                     '-m', '2048', '-nodefaults', '-display', 'none', '-monitor', 'none', '-no-reboot', '-serial', 'file:' + str(case / 'serial.log'),
@@ -432,6 +439,7 @@ def run(args):
             if qcow:
                 found, report = qcow2_problems(image); write_json(case / 'qemu-img-check.json', report)
                 errors += found
+            if overlay and digest(base) != pin['outputs']['root.raw']: errors.append('the overlay\'s base root.raw changed')
             if phase == 'write':
                 if before == after: errors.append('main image unchanged')
                 persisted = hashes
@@ -546,7 +554,7 @@ def main():
     a.add_argument('--cpus', type=int, choices=(1, 2, 4), required=True)
     for n in ('executable', 'inputs', 'out', 'lock'): a.add_argument('--' + n, type=Path, required=True)
     for n in ('runtime', 'fexc', 'build-manifest'): a.add_argument('--' + n, type=Path)
-    a.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default) or qcow2: see the module docstring; overlay is not built yet')
+    a.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default), qcow2 or overlay: see the module docstring')
     args = p.parse_args()
     for k, v in vars(args).items():
         if isinstance(v, Path): setattr(args, k, v.resolve())

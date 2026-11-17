@@ -40,7 +40,8 @@ cmdline = "console=ttyS0 root=/dev/vda1 ro"
 
 [[disk]]                     # the guest sees disks in this order: /dev/vda, /dev/vdb, ...
 id = "root"
-path = "debian13.raw"
+path = "runs/r1/root.qcow2"  # a qcow2 overlay, created at the first launch when missing
+backing = "debian13.raw"     # its base: opened read-only, never written
 
 [[disk]]
 id = "data"
@@ -88,7 +89,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `initrd`, `cmdline` | none, empty | Initramfs and kernel command line |
 | `[[disk]]` | `id`, `path` | required | A disk image |
 | | `readonly` | `false` | The guest cannot write it |
-| | `backing` | none | qcow2 backing file (see limits) |
+| | `backing` | none | The base image of a qcow2 overlay at `path` (see below) |
 | `[[nic]]` | `id` | required | User-mode NAT network device |
 | | `forward` | none | List of `[tcp\|udp:]HOST_PORT:GUEST_PORT` strings |
 | | `host_loopback` | `false` | The guest may reach the Mac's `127.0.0.1` via `10.0.2.2` |
@@ -169,7 +170,12 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `--set machine.nope: unknown key; expected one of ...` | Unknown key; the message lists all valid keys |
 | `--set machine.ram: set twice on the command line` | A key given twice |
 | `--disk: the config file lists [[disk]] devices; use --set disk.ID.path=... or edit the file` | Flag and file disagree on who owns the devices |
-| `c.toml: backing files are not built yet` | See limits |
+| `c.toml: disk "a" is its own backing file` | `backing` and `path` are one file |
+| `c.toml: the backing file of disk "a" is disk "b", which is writable; ...` | A base must not change under its overlay |
+| `disk top.qcow2: top.qcow2 is based on /x/base.raw; add backing = "/x/base.raw" to this disk (or --set disk.disk0.backing=/x/base.raw)` | An overlay opened without its base |
+| `disk top.qcow2: top.qcow2 is based on /x/base.raw, not on the backing /y/other.raw` | `backing` names another file than the overlay's |
+| `a backing file needs a qcow2 image` | `backing` on a raw image |
+| `disk top.qcow2: does not exist; a read-only overlay is never created ...` | `readonly` and `backing` on a missing file |
 
 ## Limits
 
@@ -178,8 +184,17 @@ none) and the key. All of these are found before the VM starts, and the process 
   `PCI slots 1-31 are all used: at most 29 disks on pci`).
 - One NIC and one entropy device.
 - No `[boot.uefi]` yet.
-- Disk images are detected by content, not name (raw or qcow2). A qcow2 image can be a launch's
-  disk once the qcow2 backend lands; until then it is refused with a message saying so. The
-  `backing` key (a qcow2 overlay over a base image) is parsed but not yet built from the
-  configuration: a launch with `backing` is refused until a later step.
+- Disk images are detected by content, not name (raw or qcow2; VMDK, VHDX, VDI, VHD and DMG are
+  refused by name).
+- **Overlays.** A disk with `backing` is a qcow2 overlay over that base (raw or qcow2). If `path`
+  does not exist, natemu creates it (never overwriting a file): a qcow2 v3 image, 64 KiB clusters,
+  the base's virtual size, recording the base's absolute path and format, as `qemu-img create -f
+  qcow2 -b BASE -F FMT` would. If it exists, it must be a qcow2 image based on that same file
+  (compared by device and inode). A read-only disk with `backing` must already exist. The base is
+  opened read-only with a shared lock, so several overlays (and read-only disks) may share it; it
+  must not be another disk's writable image. An overlay whose base the configuration does not name
+  is refused, with the key to add (a downloaded image could otherwise name any host file). Bases
+  below the configured one must be named relative to their image's folder, with a backing format.
+- Two read-only disks on one file get different serials: the second use's serial starts with a
+  letter after `f` (`g`, `h`, ...), so it matches no file's.
 - A file's `[boot.kernel]` must give `image` unless `--kernel` supplies it.
