@@ -883,6 +883,74 @@ fn deeper_links_need_a_format_a_regular_file_no_symlink_no_loop_and_depth_16() {
     assert!(error(&t17, true, Some(&dir.at("d16.qcow2"))).contains("deeper than 16"));
 }
 
+#[test]
+fn links_below_the_configured_base_stay_inside_the_referring_images_folder() {
+    let dir = Dir::new("escape");
+    let outside = Dir::new("outside");
+    let secret = outside.at("secret.raw");
+    std::fs::write(&secret, base_bytes(2048)).unwrap();
+    std::fs::create_dir(dir.at("sub")).unwrap();
+    std::fs::write(dir.at("sub/inner.raw"), base_bytes(2048)).unwrap();
+    std::fs::write(dir.at("bottom.raw"), base_bytes(2048)).unwrap();
+    std::os::unix::fs::symlink(&outside.0, dir.at("linkdir")).unwrap();
+    let secret_name = secret.to_str().unwrap().to_owned();
+    let refused = [
+        secret_name.as_str(),    // absolute
+        "../outside/secret.raw", // ..
+        "sub/../bottom.raw",     // .. inside the folder
+        "./bottom.raw",          // .
+        "sub//inner.raw",        // an empty component
+        "linkdir/secret.raw",    // a symbolic link among the folders, pointing outside
+    ];
+    let mut let_through = Vec::new();
+    for (i, name) in refused.iter().enumerate() {
+        let (base, top) = (
+            dir.at(&format!("b{i}.qcow2")),
+            dir.at(&format!("t{i}.qcow2")),
+        );
+        create(&base, 1 << 20, 16, Some((name, Some("raw"))));
+        create(
+            &top,
+            1 << 20,
+            16,
+            Some((base.to_str().unwrap(), Some("qcow2"))),
+        );
+        let want = format!(
+            "b{i}.qcow2 names {name} as its backing file; backing files below the configured base must be \
+             relative paths inside b{i}.qcow2's folder"
+        );
+        if !open(&top, true, Some(&base))
+            .err()
+            .is_some_and(|e| e.contains(&want))
+        {
+            let_through.push(*name);
+        }
+    }
+    assert!(let_through.is_empty(), "not refused: {let_through:?}");
+    // A plain relative name into a subfolder is followed.
+    let (base, top) = (dir.at("ok.qcow2"), dir.at("tok.qcow2"));
+    create(&base, 1 << 20, 16, Some(("sub/inner.raw", Some("raw"))));
+    create(
+        &top,
+        1 << 20,
+        16,
+        Some((base.to_str().unwrap(), Some("qcow2"))),
+    );
+    assert_eq!(
+        read(&*open(&top, true, Some(&base)).unwrap().backend, 0, 512),
+        base_bytes(1)
+    );
+    // The configured base itself may be anywhere (the caller named it): a top over the outside file opens.
+    let over = dir.at("over-outside.qcow2");
+    create(
+        &over,
+        1 << 20,
+        16,
+        Some((secret_name.as_str(), Some("raw"))),
+    );
+    assert!(open(&over, true, Some(&secret)).is_ok());
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // qemu-img fixtures: each refused kind, and the other formats' files.
 

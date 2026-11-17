@@ -187,9 +187,12 @@ fn chain(
     open_backing(file, backing, format, &mut seen, 1).map(Some)
 }
 
-/// Open one backing file (`depth` below the top image) as `format`, following the links of a qcow2 one: each must
-/// carry a backing-format extension (a format is never guessed from a file's contents), be a regular file reached
-/// without a final symbolic link, and not repeat a file of the chain.
+/// Open one backing file (`depth` below the top image) as `format`, following the links of a qcow2 one. The names
+/// below the config-named base come from image headers nobody configured, so each link must ([`link_target`]) be a
+/// relative name inside the referring image's own folder, carry a backing-format extension (a format is never
+/// guessed from a file's contents), be a regular file reached without a final symbolic link, and not repeat a file
+/// of the chain. A later config key could let a user opt in to other files: an allow-list by device and inode in
+/// the config, not a looser rule here.
 fn open_backing(
     file: File,
     path: &Path,
@@ -205,7 +208,7 @@ fn open_backing(
     let next = match &header.backing_file {
         None => None,
         Some(link) => {
-            let named = resolve(path, &link.path);
+            let named = link_target(path, &link.path)?;
             let at = || format!("disk {}: backing file {}", path.display(), named.display());
             let Some(format) = link.format else {
                 return Err(format!(
@@ -242,6 +245,57 @@ fn open_backing(
         }
     };
     BackingFile::qcow2(image, next).map_err(|e| refused(path, &e))
+}
+
+/// Where a link below the config-named base may lead: `name` must be relative, made of plain components (no `..`,
+/// no `.`, not empty), and lead into the referring image's own folder or a folder below it after every directory
+/// component is resolved (realpath), so neither `..` nor a symbolic link among the folders can leave it. The final
+/// component is then opened with O_NOFOLLOW by the caller.
+/// ponytail: the folders are resolved before the open, so a host process swapping a folder for a symbolic link in
+/// between could still redirect it; per-component openat would close that if host-side races matter.
+fn link_target(referrer: &Path, name: &str) -> Result<PathBuf> {
+    let file = referrer
+        .file_name()
+        .map_or(referrer.to_string_lossy(), |n| n.to_string_lossy());
+    let refuse = || {
+        format!(
+            "disk {}: {file} names {name} as its backing file; backing files below the configured base must be \
+             relative paths inside {file}'s folder",
+            referrer.display()
+        )
+    };
+    let relative = Path::new(name);
+    let plain = !name.is_empty()
+        && relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && !name
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..");
+    if !plain {
+        return Err(refuse());
+    }
+    let folder = referrer
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let folder = std::fs::canonicalize(folder)
+        .map_err(|e| format!("disk {}: its folder: {e}", referrer.display()))?;
+    let joined = folder.join(relative);
+    let (Some(parent), Some(last)) = (joined.parent(), joined.file_name()) else {
+        return Err(refuse());
+    };
+    let parent = std::fs::canonicalize(parent).map_err(|e| {
+        format!(
+            "disk {}: backing file {}: {e}",
+            referrer.display(),
+            joined.display()
+        )
+    })?;
+    if !parent.starts_with(&folder) {
+        return Err(refuse());
+    }
+    Ok(parent.join(last))
 }
 
 /// The backend: one opened qcow2 image. The vendored code does its own table locking; see the module notes for the
