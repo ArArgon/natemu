@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     os::unix::fs::FileExt,
     process::Command,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
@@ -174,6 +174,10 @@ enum Op {
     Write(u64, Vec<u8>),
     SetLen(u64),
     Barrier,
+    /// A plain fsync: durable across a natemu or macOS crash, but on macOS neither durable nor ordered
+    /// across a power loss (the drive cache).
+    Fsync,
+    /// F_FULLFSYNC: durable and ordered in every model.
     Sync,
 }
 #[derive(Default)]
@@ -185,6 +189,7 @@ struct Log {
     /// Run (once) inside the next punch, before it.
     on_punch: Option<Box<dyn FnOnce() + Send>>,
     fail_punch: bool,
+    punches: usize,
     fail_writes: bool,
 }
 #[derive(Clone)]
@@ -247,7 +252,11 @@ impl FileLayer for Recording {
         if let Some(hook) = hook {
             hook();
         }
-        self.log().ops.push(Op::Sync);
+        self.log().ops.push(if kind == SyncKind::Full {
+            Op::Sync
+        } else {
+            Op::Fsync
+        });
         Ok(())
     }
     fn punch_hole(&self, offset: u64, length: u64) -> io::Result<()> {
@@ -255,6 +264,7 @@ impl FileLayer for Recording {
         if let Some(hook) = hook {
             hook();
         }
+        self.log().punches += 1;
         if self.log().fail_punch {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
@@ -601,10 +611,19 @@ fn a_failed_punch_is_reported_and_its_cluster_stays_reserved() {
     assert!(q.discard(0, 1 << 16).is_err());
     rec.log().fail_punch = false;
     q.sync(false).unwrap();
-    let len = rec.log().live.len();
-    q.write(&[2; 1 << 16], 1 << 17).unwrap();
+    // The host cluster holding the 1s (the punch failed, so they are still there).
+    let at = rec
+        .log()
+        .live
+        .chunks(1 << 16)
+        .position(|c| c.iter().all(|&x| x == 1))
+        .unwrap();
+    for c in 2..6 {
+        q.write(&[2; 1 << 16], c << 16).unwrap();
+    }
+    let live = rec.log().live.clone();
     assert!(
-        rec.log().live.len() > len,
+        live[at << 16..][..1 << 16].iter().all(|&x| x == 1),
         "the cluster of the failed punch was handed out again"
     );
     assert!(read(&*q, 0, 1 << 16).iter().all(|&x| x == 0));
@@ -1190,6 +1209,174 @@ fn write_zeroes_of_64_gib_on_a_fresh_overlay_is_table_only_and_fast() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Gate: DISCARD and WRITE_ZEROES over allocated clusters stay inside the call limit.
+
+#[test]
+fn a_discard_of_contiguous_clusters_is_a_few_punches() {
+    let dir = Dir::new("punches");
+    let path = dir.at("a.qcow2");
+    create_ready(&path, 64 << 20, 16, None);
+    let (q, rec) = recorded(&path, None);
+    // 512 clusters written in order: allocated one after another at the file end.
+    for c in 0..512u64 {
+        q.write(&[c as u8 | 1; 512], c << 16).unwrap();
+    }
+    q.sync(false).unwrap();
+    q.discard(0, 512 << 16).unwrap();
+    let punches = rec.log().punches;
+    assert!(
+        punches <= 4,
+        "{punches} punch calls for 512 contiguous clusters"
+    );
+    assert!(read(&*q, 0, 512 << 16).iter().all(|&x| x == 0));
+    // The freed clusters are reused after the next flush.
+    q.sync(false).unwrap();
+    let len = rec.log().live.len();
+    for c in 0..64u64 {
+        q.write(&[7; 1 << 16], (600 + c) << 16).unwrap();
+    }
+    assert_eq!(rec.log().live.len(), len, "freed clusters were not reused");
+}
+
+#[test]
+fn discard_and_write_zeroes_of_4_gib_of_allocated_clusters_are_timed() {
+    let dir = Dir::new("bigdiscard");
+    let path = dir.at("a.qcow2");
+    create_ready(&path, 8 << 30, 16, None);
+    let image = open(&path, false, None).unwrap();
+    let b = &*image.backend;
+    // One sector in each 64 KiB cluster of the first 4 GiB: 65536 allocated clusters, 256 MiB on the host.
+    for c in 0..(1u64 << 16) {
+        b.write(&[1; 512], c << 16).unwrap();
+    }
+    b.sync(false).unwrap();
+    let mut slowest = Duration::ZERO;
+    for (r, zero) in [(0u64, false), (1, true)] {
+        let t = Instant::now();
+        if zero {
+            b.write_zeroes(r << 31, 1 << 31).unwrap();
+        } else {
+            b.discard(r << 31, 1 << 31).unwrap();
+        }
+        slowest = slowest.max(t.elapsed());
+    }
+    eprintln!(
+        "2 GiB of allocated clusters: slowest discard/write-zeroes call {slowest:?} (32 such ranges make one request)"
+    );
+    assert!(slowest < Duration::from_secs(3), "{slowest:?}");
+    assert!(
+        read(b, 0, 1 << 16).iter().all(|&x| x == 0)
+            && read(b, 3 << 30, 1 << 16).iter().all(|&x| x == 0)
+    );
+    b.sync(true).unwrap();
+    drop(image);
+    check_clean(&path);
+}
+
+#[test]
+fn an_image_whose_refcount_table_cannot_cover_it_is_refused_for_writing() {
+    if qemu_img().is_none() {
+        return skipped("refcount table coverage fixture");
+    }
+    let dir = Dir::new("reftable");
+    let (big, small) = (dir.at("big.qcow2"), dir.at("small.qcow2"));
+    // qemu-img gives both a one-cluster refcount table: 4 GiB of file at 4 KiB clusters.
+    for (path, size) in [(&big, "64G"), (&small, "1G")] {
+        let (ok, text) = qemu(&[
+            "create",
+            "-f",
+            "qcow2",
+            "-o",
+            "cluster_size=4096",
+            path.to_str().unwrap(),
+            size,
+        ]);
+        assert!(ok, "{text}");
+    }
+    let e = error(&big, false, None);
+    assert!(
+        e.contains("big.qcow2") && e.contains("refcount table covers") && !e.contains('\n'),
+        "{e}"
+    );
+    assert!(open(&big, true, None).is_ok(), "read-only never allocates");
+    assert!(open(&small, false, None).is_ok());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Gate: whole-cluster writes over a backing file racing reads of the same clusters (the deviation from upstream:
+// the guest data is the new cluster's fill, so a reader never sees the unwritten cluster).
+
+#[test]
+fn whole_cluster_writes_racing_reads_over_a_backing_file_never_show_zeros() {
+    const CLUSTERS: u64 = 64;
+    const SECTORS: u64 = CLUSTERS * 128;
+    let dir = Dir::new("whole");
+    let (base, top, raw) = (dir.at("base.raw"), dir.at("top.qcow2"), dir.at("same.raw"));
+    std::fs::write(&base, base_bytes(SECTORS)).unwrap();
+    for round in 0..8u64 {
+        let _ = std::fs::remove_file(&top);
+        create_ready(&top, SECTORS * 512, 16, Some((&base, Some("raw"))));
+        std::fs::write(&raw, base_bytes(SECTORS)).unwrap();
+        let q: Arc<dyn DiskBackend> = open(&top, false, Some(&base)).unwrap().backend.into();
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let (q, stop) = (q.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x77 + t + round * 10);
+                    let mut reads = 0u64;
+                    while !stop.load(SeqCst) {
+                        let s = rng.below(SECTORS);
+                        let got = read(&*q, s * 512, 512);
+                        let tag = u32::from_le_bytes(got[4..8].try_into().unwrap());
+                        assert!(
+                            got == sector(0, BASE, s) || got == sector(tag, GUEST, s),
+                            "round {round} sector {s}: neither base nor new data: {:?}",
+                            &got[..16]
+                        );
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+        // 4 writers, each its own clusters, each cluster written whole once (the allocating write).
+        let writers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let q = q.clone();
+                std::thread::spawn(move || {
+                    for c in (t..CLUSTERS).step_by(4) {
+                        let data: Vec<u8> = (c * 128..(c + 1) * 128)
+                            .flat_map(|s| sector(c as u32 + 1, GUEST, s))
+                            .collect();
+                        q.write(&data, c << 16).unwrap();
+                    }
+                })
+            })
+            .collect();
+        writers.into_iter().for_each(|w| w.join().unwrap());
+        stop.store(true, SeqCst);
+        let reads: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(reads > 0);
+        let raw_file = OpenOptions::new().write(true).open(&raw).unwrap();
+        for c in 0..CLUSTERS {
+            let data: Vec<u8> = (c * 128..(c + 1) * 128)
+                .flat_map(|s| sector(c as u32 + 1, GUEST, s))
+                .collect();
+            raw_file.write_all_at(&data, c << 16).unwrap();
+        }
+        let want = std::fs::read(&raw).unwrap();
+        assert!(
+            read(&*q, 0, want.len()) == want,
+            "round {round}: qcow2 and raw differ"
+        );
+        q.sync(true).unwrap();
+        drop(q);
+        check_clean(&top);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Gate: concurrent sub-cluster writes and reads to the same unallocated clusters over a backing file, with discards
 // and flushes, compared against the same operations on a raw image.
 
@@ -1420,6 +1607,9 @@ struct Run {
     history: Vec<Guest>,
     q: Arc<Qcow>,
     rec: Recording,
+    /// The crash model: false, a natemu or macOS crash (an fsync is durable); true, a power loss on macOS (only
+    /// F_FULLFSYNC is durable, only F_BARRIERFSYNC and F_FULLFSYNC order).
+    power: std::cell::Cell<bool>,
 }
 
 impl Run {
@@ -1439,6 +1629,7 @@ impl Run {
             history: Vec::new(),
             q,
             rec,
+            power: std::cell::Cell::new(false),
         }
     }
     fn at(&self) -> usize {
@@ -1471,13 +1662,20 @@ impl Run {
     }
     /// The log index of every guest sync's final fsync (a crash just before it: tables written, not yet durable).
     fn sync_points(&self) -> Vec<usize> {
+        let ops = self.rec.log().ops.clone();
         self.history
             .iter()
             .filter_map(|g| match g {
-                Guest::Sync { done, .. } => Some(done - 1),
+                Guest::Sync { done, .. } => {
+                    ops[..*done].iter().rposition(|o| matches!(o, Op::Fsync))
+                }
                 _ => None,
             })
             .collect()
+    }
+    /// Whether an op is a durability point in the current crash model.
+    fn durable(&self, op: &Op) -> bool {
+        matches!(op, Op::Sync) || matches!(op, Op::Fsync) && !self.power.get()
     }
 
     /// The image bytes after a crash at log position `p`, keeping `keep`'s choice of the unsynced pieces.
@@ -1489,7 +1687,7 @@ impl Run {
     ) -> Vec<u8> {
         let last_sync = ops[..p]
             .iter()
-            .rposition(|o| matches!(o, Op::Sync))
+            .rposition(|o| self.durable(o))
             .map_or(0, |i| i + 1);
         let mut image = self.initial.clone();
         let apply = |image: &mut Vec<u8>, op: &Op, from: u64, to: u64| match op {
@@ -1560,11 +1758,12 @@ impl Run {
 
     /// Reopen `image` writable and check it against the guest history for a crash at `p`.
     fn verify(&self, image: Vec<u8>, p: usize, label: &str, qemu_check: bool) {
-        // The last flush whose fsync completed before the crash.
+        // The last flush whose fsync completed before the crash; none survives a power loss (fsync only).
         let last = self
             .history
             .iter()
-            .rposition(|g| matches!(g, Guest::Sync { done, .. } if *done <= p));
+            .rposition(|g| matches!(g, Guest::Sync { done, .. } if *done <= p))
+            .filter(|_| !self.power.get());
         let mut flushed = base_bytes(self.sectors);
         let mut later: HashMap<u64, Vec<Vec<u8>>> = HashMap::new();
         for (k, g) in self.history.iter().enumerate() {
@@ -1709,6 +1908,24 @@ fn crash_seeds(bits: u32, size: u64, seeds: u64, ops: u32) {
                 &format!("{label} in-place L2 kept, the rest dropped"),
                 false,
             );
+            // A power loss: no guest flush is durable (fsync only), but nothing may be corrupt.
+            run.power.set(true);
+            let mut r = Rng(rng.next() | 1);
+            run.verify(
+                run.crashed(&log, p, &mut |_, _, _| r.below(2) == 0),
+                p,
+                &format!("{label} power loss, random"),
+                false,
+            );
+            let l1 = l1_range(&run.initial);
+            run.verify(
+                run.crashed(&log, p, &mut |op, f, t| !overlaps(op, f, t, l1.0, l1.1)),
+                p,
+                &format!("{label} power loss, L1 writes dropped"),
+                false,
+            );
+            run.power.set(false);
+            checks += 2;
             checks += 3;
         }
     }
@@ -1814,10 +2031,46 @@ fn crash_before_the_fsync_of_a_flush_that_freed_a_cluster_finds_it_unreused() {
     let done = run.at();
     run.history[slot] = Guest::Sync { done };
     let log = run.rec.log().ops.clone();
-    let p = done - 1;
+    let p = log[..done]
+        .iter()
+        .rposition(|o| matches!(o, Op::Fsync))
+        .unwrap();
     let l1 = l1_range(&run.initial);
     let image = run.crashed(&log, p, &mut |op, f, t| !overlaps(op, f, t, l1.0, l1.1));
     run.verify(image, p, "worker data kept, new L1 dropped", true);
+}
+
+/// Fixed case, a power loss: a flush moves an L2 table (freeing its old cluster) and completes with its fsync; the
+/// next write reuses that cluster. On macOS the fsync orders nothing against a power loss, so only the barrier after
+/// it keeps the new L1 ahead of the guest data in the reused cluster. The crash keeps that data and drops the L1.
+#[test]
+fn power_loss_after_a_flush_that_freed_a_cluster_never_shows_guest_data_as_a_table() {
+    let mut run = Run::new("reuse-power", 1 << 20, 16);
+    let per = run.cluster / 512;
+    run.write(0, (0..per).flat_map(|x| sector(1, GUEST, x)).collect());
+    run.sync();
+    run.write(
+        per,
+        (per..2 * per).flat_map(|x| sector(2, GUEST, x)).collect(),
+    );
+    run.sync(); // the table moved; its old cluster is free after this flush
+    run.write(
+        4 * per,
+        (4 * per..5 * per)
+            .flat_map(|x| sector(3, GUEST, x))
+            .collect(),
+    );
+    let log = run.rec.log().ops.clone();
+    let p = log.len();
+    let l1 = l1_range(&run.initial);
+    run.power.set(true);
+    let image = run.crashed(&log, p, &mut |op, f, t| !overlaps(op, f, t, l1.0, l1.1));
+    run.verify(
+        image,
+        p,
+        "power loss: data in the reused cluster kept, new L1 dropped",
+        true,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------------------------

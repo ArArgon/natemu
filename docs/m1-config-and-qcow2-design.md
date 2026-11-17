@@ -234,8 +234,10 @@ read-only backend's `sync` succeeds without a call.
 **Locks**: writable top image exclusive (today's flock); read-only images and backing files
 shared, so VMs can share one base or ISO and a writer is refused while a reader holds it. On a
 file system without flock (network shares return "unsupported"), a read-only image or backing
-file opens with a warning; a writable one is refused as today. QEMU uses a different lock type,
-so natemu's lock does not exclude QEMU (true today).
+file opens with a warning; a writable one is refused as today. On macOS natemu's flock and QEMU's
+fcntl locks do conflict (checked with qemu-img 11.1.2: `qemu-img info` and `qemu-io` fail on an image
+natemu holds, and a QEMU holder makes natemu's flock fail), so natemu and QEMU exclude each other; a
+`qemu-img check` of an open image is refused.
 
 **The ten behaviours every backend keeps**: (1) short transfers returned as is, never zero
 progress, errors never retried; (2) safe under four workers plus the owner; (3) fsync on guest
@@ -297,6 +299,11 @@ for the facade, one order everywhere (flush, cache eviction, exit):
 6. `fsync(2)` for a guest FLUSH, F_FULLFSYNC at power-off.
 
 An eviction of an in-place L2 table does steps 1-3 only (no L1 change is needed).
+
+**macOS fsync caveat.** fsync(2) on macOS neither flushes the drive cache nor orders writes against a
+power loss; only F_BARRIERFSYNC (ordering) and F_FULLFSYNC (durability and ordering) do. So a guest
+FLUSH (fsync, owner's policy) makes writes survive a natemu or macOS crash, not a power loss; the
+barriers above keep the image consistent after a power loss as well.
 Further rules:
 - **Dirty bit.** Refcount blocks need no ordering against L2: the dirty bit stays set while the
   image is open, so refcounts are rebuilt after any crash. Only a clean power-off drain clears
@@ -304,7 +311,9 @@ Further rules:
 - **Lock.** The table lock is held for steps 2-5 but not for the final fsync (Sticky already
   serialises syncs), so reads, the owner's inline ones included, do not stall behind an fsync.
 - **Freed clusters.** Clusters freed since the last flush go back to the free list only after
-  that flush's fsync returns. Upstream moves them under the lock right after writing the tables;
+  that flush's fsync returns and then, since that fsync orders nothing against a power loss, one
+  more F_BARRIERFSYNC (issued only when clusters are pending), so guest data written into a reused
+  cluster cannot reach the disk before the tables that stopped pointing at it. Upstream moves them under the lock right after writing the tables;
   with the fsync outside the lock, a reused cluster could otherwise be counted twice after a
   crash.
 - **Failed table write.** After one, every later write and sync of that disk fails (it joins the

@@ -177,10 +177,15 @@ impl QcowDisk {
     /// 4): data, barrier, L2 tables and refcount blocks, barrier, L1 and refcount tables (all
     /// under the table lock), then `kind` with the lock released, so reads and writes go on
     /// meanwhile. Clusters freed by those tables return to the free list only after the sync
-    /// succeeds. Callers serialise syncs.
+    /// succeeds and, after a plain fsync, an F_BARRIERFSYNC: on macOS fsync orders nothing
+    /// against a power loss, so without the barrier guest data written into a reused cluster
+    /// could reach the disk before the tables that stopped pointing at it. Callers serialise syncs.
     pub fn sync(&self, kind: SyncKind) -> io::Result<()> {
         let freed = self.metadata.write_tables()?;
         self.data_raw_file.file().sync(kind)?;
+        if !freed.is_empty() && kind == SyncKind::Fsync {
+            self.data_raw_file.file().barrier_sync()?;
+        }
         self.metadata.release(freed);
         Ok(())
     }
