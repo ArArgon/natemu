@@ -88,15 +88,12 @@ fn check(header: &QcowHeader, path: &Path, read_only: bool) -> Result<()> {
     // (qemu-img gives a small image a one-cluster table: about 4 GiB of file at 4 KiB clusters). Refuse up front
     // when the table cannot cover everything the image can need: every data cluster, its L2 tables twice (a moved
     // table and its old copy until a flush), the L1 table and header, the refcount blocks twice, and some slack.
-    let cluster = 1u64 << header.cluster_bits;
-    let per_block = cluster * 8 / (1u64 << header.refcount_order);
-    let covered = (u64::from(header.refcount_table_clusters) * cluster / 8)
-        .saturating_mul(per_block)
-        .saturating_mul(cluster);
-    let data = header.size.div_ceil(cluster);
-    let l2 = data.div_ceil(cluster / 8);
-    let clusters = data + 2 * l2 + l2.div_ceil(cluster / 8) + 64;
-    let need = (clusters + 2 * clusters.div_ceil(per_block)).saturating_mul(cluster);
+    let covered = natemu_qcow::refcount_coverage(
+        header.refcount_table_clusters.into(),
+        header.cluster_bits,
+        header.refcount_order,
+    );
+    let need = natemu_qcow::growth_bound(header.size, header.cluster_bits, header.refcount_order);
     if covered < need {
         return Err(format!(
             "disk {p}: its refcount table covers {covered} bytes of file, less than the {need} this image can grow to, \
@@ -104,6 +101,48 @@ fn check(header: &QcowHeader, path: &Path, read_only: bool) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Create a new overlay at `path` (which must not exist: never overwritten) over `base`, which is opened read-only
+/// with a shared lock: virtual size the base's, the base's absolute canonical path and its detected format recorded
+/// in the header, mode 0600. A half-written file is removed.
+pub(super) fn create(path: &Path, base: &Path) -> Result<()> {
+    let (file, head, tail) = raw::inspect(base, true)?;
+    let b = base.display();
+    let (format, size) = match detect(&head, &tail) {
+        None => (
+            ImageType::Raw,
+            file.metadata().map_err(|e| format!("disk {b}: {e}"))?.len(),
+        ),
+        Some(Format::Qcow2) => {
+            let header = QcowHeader::new(&ImageFile::with_path(file, base))
+                .map_err(|e| refused(base, &e))?;
+            (ImageType::Qcow2, header.size)
+        }
+        Some(Format::Refused(kind)) => {
+            return Err(format!(
+                "disk {b}: the backing file looks like a {kind} image; natemu reads raw and qcow2"
+            ));
+        }
+    };
+    let name = std::fs::canonicalize(base).map_err(|e| format!("disk {b}: {e}"))?;
+    let name = name
+        .to_str()
+        .ok_or_else(|| format!("disk {b}: the backing path is not UTF-8"))?;
+    let p = path.display();
+    let new = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("disk {p}: creating the overlay: {e}"))?;
+    natemu_qcow::create_overlay(&new, size, name, format)
+        .and_then(|()| new.sync_all())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(path);
+            format!("disk {p}: creating the overlay over {b}: {e}")
+        })
 }
 
 /// One line naming the file: the vendored error and its causes.

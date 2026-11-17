@@ -100,8 +100,22 @@ fn detect(head: &[u8], tail: &[u8]) -> Option<Format> {
 }
 
 /// Open the image at `path` (`read_only`: shared lock, nothing offered that writes) by its detected format. `backing`
-/// names a backing file; only qcow2 has one, and a qcow2 image that names one opens only when it is this file.
+/// names a backing file; only qcow2 has one, and a qcow2 image that names one opens only when it is this file. With
+/// `backing`, a writable `path` that does not exist is first created as a new qcow2 overlay over it; a read-only one
+/// never is.
 pub(crate) fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> Result<Image> {
+    if let Some(base) = backing
+        && std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        if read_only {
+            return Err(format!(
+                "disk {}: does not exist; a read-only overlay is never created (drop readonly to create it over {})",
+                path.display(),
+                base.display()
+            ));
+        }
+        qcow::create(path, base)?;
+    }
     let (file, head, tail) = raw::inspect(path, read_only)?;
     match detect(&head, &tail) {
         None if backing.is_some() => Err("a backing file needs a qcow2 image".into()),
