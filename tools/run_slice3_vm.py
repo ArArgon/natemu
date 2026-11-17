@@ -323,6 +323,18 @@ def cmd_smp(a, host, runtime):
         stats = [{k: cpu['stats'][k] for k in ('blocks', 'requests', 'links', 'retries', 'linked', 'link_points')} for cpu in cpus]
         return [{**e, 'outcome': outcome, 'diffs': diffs, 'stats': stats}]
     entries = run_groups(a, host, runtime, groups, judge)
+    # The lost race below is timing-dependent (missed in about one run in five): a run without it repeats neg-race@N, up to
+    # four more runs, each judged as above, before the check counts it.
+    def raced(n):
+        race = [s['linked'] for e in entries if e['name'] == f'neg-race@{n}' for s in e.get('stats', [])]
+        free = [s['linked'] for e in entries if e['name'] == f'neg-private@{n}' for s in e.get('stats', [])]
+        return not (race and free) or max(race) > max(free)
+    for n in a.cpus:
+        for retry in range(4):
+            if raced(n): break
+            order = [next(p for p in programs if p['name'] == f'neg-race@{n}')]
+            entries += run_groups(a, host, runtime, [(f'neg-race@{n}-retry{retry}', smp_description(order[0]),
+                                                      [a.max_block] if a.max_block else [])], judge)
     by = collections.defaultdict(collections.Counter)
     for e in entries: by[e['name']][e['outcome']] += 1
     for name, c in by.items(): print(f'{name}: {dict(c)}', flush=True)
