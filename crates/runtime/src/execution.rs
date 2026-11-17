@@ -2051,8 +2051,9 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
 /// IRQ gate (3) end here. An exception from EL1 (the resident's own fault) halts at once (`unknown_abort`). Any stop
 /// armed is disarmed first ([`cache::disarm`]). The `svc` entries come from EL0: a literal exit (the linker), the
 /// dispatcher's miss (only from its own `svc`), and a division; any other `svc` is an unknown abort.
-pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
+pub unsafe fn returned(frame_ptr: *mut NativeFrame, kind: u64) -> ! {
     unsafe {
+        let frame = &*frame_ptr;
         let (esr, far, elr, spsr): (u64, u64, u64, u64);
         asm!("mrs {0}, esr_el1", "mrs {1}, far_el1", "mrs {2}, elr_el1", "mrs {3}, spsr_el1",
              out(reg) esr, out(reg) far, out(reg) elr, out(reg) spsr);
@@ -2090,7 +2091,7 @@ pub unsafe fn returned(frame: &NativeFrame, kind: u64) -> ! {
         let spsr = watch::cancel(spsr);
         // A trapped FP exception (UFE in accurate mode without AFP): the word is re-run in place and its flags patched.
         if esr >> 26 == fp::EC_FP_TRAP && kind != 3 {
-            fp::trap(frame, esr, elr, spsr)
+            fp::trap(frame_ptr, esr, elr, spsr)
         }
         if kind == 3 {
             interrupted(frame)
@@ -2126,11 +2127,12 @@ pub unsafe fn fp_cancel(frame: *mut NativeFrame, kind: u64) {
     unsafe { fp::cancel(frame, kind) }
 }
 /// Perf chunk 22: the synchronous exception being taken is an `svc #LINK` or `svc #MISS` (ESR_EL1: EC 0x15 and its
-/// immediate), whose service ([`linker`], [`missed`], or a halt) reads only the gate's frame, never `Shared::captured`.
+/// immediate), whose service ([`linker`], [`missed`], or a halt) reads only the gate's frame, never `Shared::captured`. AFP accurate chunk
+/// 6b: also a trapped FP exception (EC 0x2C): [`fp::trap`] works on the gate's frame in place, and copies it only for its step fallback.
 pub fn frame_only() -> bool {
     let esr: u64;
     unsafe { asm!("mrs {0}, esr_el1", out(reg) esr) };
-    esr >> 26 == 0x15 && matches!((esr & 0xffff) as u16, svc::LINK | svc::MISS)
+    esr >> 26 == fp::EC_FP_TRAP || esr >> 26 == 0x15 && matches!((esr & 0xffff) as u16, svc::LINK | svc::MISS)
 }
 /// A block exit to the dispatcher's miss: guest state is in the static registers, NZCV (CF inverted) and PF/AF registers.
 /// Not inlined, as [`halt_native`]: `returned` holds no state copy (the nested-entry stack bound).

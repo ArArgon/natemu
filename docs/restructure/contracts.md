@@ -1061,13 +1061,23 @@ memory accesses and unknown opcodes.
 - Observable today: the startup `fp:` line; the driver's `fp` field. Accurate mode's behaviour itself comes with chunks 2-5.
 - Kind: design (`docs/restructure/afp-accurate-plan.md`).
 
-**68. A trapped FP exception is handled in the resident by re-running its one Arm word in place; what is patched depends on the mode, never on ESR.**
+**68. A trapped FP exception is handled in the resident by performing its one Arm word there (from a fixed instruction table; a step re-run only for kept classes); what is patched depends on the mode, never on ESR.**
 - Accurate mode without AFP runs generated code with FPCR.IOE always and UFE wherever FZ = 0 (`fpcr_run`); x87 never traps (its word is explicit and trap-free).
   EC 0x2C from EL0 inside admitted code (or the step block) is classified before any site lookup (`fptrap::classify`); EC 0x2C at EL1 or outside
   admitted code stops `fp_trap`, an Arm word the table does not know stops `fp_word` (never patched wrongly).
-- The word is re-run under a software step with the trap enables and FPSR cleared; `Shared::fp_rerun.active` is the per-vCPU marker that tells
-  that step from a watchpoint step; the trap enables and the guest's FPSR are restored when the step returns and when it is abandoned (`finish`
-  calls `fp_cancel` before the frame is copied); MDE is untouched; `Control::fp_traps`/`fp_steps` count apart from `debug_steps`.
+- Chunk 6b: every patched word (`fptrap::Class::Patch`: multiplies, divides, FMAs, adds, subtracts, square roots, pairwise adds, narrowing
+  converts, all arrangements, by-element forms and FCVTN2) is performed in the resident from `fptrap::TABLE`: pre-assembled instructions in the
+  resident's text (execute-only, never written, nothing to synchronise), one per canonical word (the guest word with Rd, Rn, Rm, Ra renamed
+  v0..v3), found by a hash of it (`fptrap::slot`; a word with no entry is a build error in the sweep test `every_patched_word_has_a_table_entry`).
+  `fptrap::exec` loads v0..v3 from the frame (v0 = Rd's old value: FMLA's accumulator, FCVTN2's kept half), runs the instruction under the trapped
+  FPCR without the trap enables and FPSR cleared, stores v0 to Rd and returns FPSR, then the patch runs as before and execution resumes after the
+  word: no second exception, no FPCR change in the frame, no marker, no step. The handler works on the gate's frame in place (`frame_only` is true
+  for EC 0x2C: `finish` does not copy it) and reads the vCPU record in place (no `State` copy).
+- The step fallback (kept classes: compares, conversions to integer, min/max, roundings, widening converts, FCADD: they trap only for invalid
+  operands and their result is the hardware's): the word is re-run under a software step with the trap enables and FPSR cleared;
+  `Shared::fp_rerun.active` is the per-vCPU marker that tells that step from a watchpoint step; the trap enables and the guest's FPSR are restored
+  when the step returns and when it is abandoned (`finish` calls `fp_cancel` before the frame is copied); MDE is untouched;
+  `Control::fp_traps`/`fp_steps` count apart from `debug_steps` (`fp_steps` only for the fallback).
 - UFC is patched per lane by the tininess model, x86's masked underflow (tiny after rounding and inexact). Chunk 4 (IOE) also decides, by the
   mode (`FPCR_IOE` in the trapped FPCR), the NaN lanes of the re-run by FPCR.AH = 1's rules (the first NaN among the operands, quieted; the negative
   default NaN for an invalid operation) and an FMA's IOC (none for infinity times zero beside a QNaN addend): `fptrap::patch`'s `nan`.
@@ -1077,7 +1087,7 @@ memory accesses and unknown opcodes.
   word, destination v1 (the JIT's VTMP2), no read of it after, no temporaries as operands, no spill (a block that spills is retried with fewer
   instructions, as any block); `--exact-step` is gone.
 - Enforced by: abi `fptrap` tests (the decode table, per-lane UFC, and the native oracles against the M4's AFP flags and AH = 1's NaN lanes), `accurate_mode_without_afp_enables_ioe_and_ufe_where_fz_is_clear`, `the_fma_check_code_is_admitted_for_every_fma_form_and_key`, `AfpAccurateFma`,
-  the host identity test, `tools/run_s4.py` case `fp-trap-in-step-block-with-watchpoint`, run_i5c's band cases in accurate M2 emulation.
+  `the_table_equals_the_word_run_in_place_for_every_entry` and the oracles run through the table (`via_table`), the host identity test, `tools/run_s4.py` cases `fp-trap-in-step-block-with-watchpoint` (table path) and `fp-trap-step-fallback-with-watchpoint` (step fallback), run_i5c's band cases in accurate M2 emulation.
 - Kind: design (`docs/restructure/afp-accurate-plan.md`).
 
 ## 2. Internal-only assertions and their replacements
