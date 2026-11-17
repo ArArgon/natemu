@@ -145,9 +145,20 @@ lines (16-23) and today holds one level per line, so no two devices can share on
 **PCI interrupt lines (owner decision: shared, as real PCI).** A PCI function's fallback (INTx)
 line becomes a shared level line, as on real boards where many slots share four lines. The
 first three slots keep their old lines (slot 1 → 16, 2 → 17, 3 → 18), so old launches are
-unchanged. Slots 4 and up take, round robin, the lines among 16-19 that no MMIO device in the
-same launch holds. The ACPI routing table may route any slot to any line, so this is a platform
-choice, not a guest-visible oddity. With MSI-X (the normal case) the line is never used.
+unchanged. Slots 4 and up take, round robin in slot order, the lines among 16-23 that no MMIO
+device in the same launch holds (built: not only 16-19, because MMIO disks hold 16 and 19-23, so
+with mixed transports 16-19 can all be held; eight lines also mean fewer functions per line). A
+slot 1-3 function whose old line an MMIO device holds rotates too. The ACPI routing table may
+route any slot to any line, so this is a platform choice, not a guest-visible oddity. With MSI-X
+(the normal case) the line is never used.
+
+**Stale status at an MSI-X disable.** Status bits pending when MSI-X is turned off without a
+reset (a driver on MSI-X never reads them) do not count for INTx until the device's next
+interrupt, as in QEMU; an ISR read or a reset clears them as usual. Otherwise a stale bit that no
+driver reads holds a shared line for every function on it, and Linux disables the line ("nobody
+cared"), which the `sharedintx` coverage case showed. The MSI-X lock covers the decision between
+an MSI-X message and INTx, the send, and the line drive, so a concurrent disable cannot drop an
+interrupt; the line state itself stays under the chipset mutex.
 
 **Limits.** PCI disks: up to 29 (31 usable slots less the NIC and entropy device). MMIO devices
 keep exclusive lines: 8 in all, so at most 6 MMIO disks. M1 keeps one NIC and one entropy device.
