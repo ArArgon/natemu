@@ -79,6 +79,8 @@ const MAX_BUFFERED: usize = 4 << 20;
 /// A native call running longer abandons the workers, and the VM fails. The owner checks its workers' calls; a watchdog
 /// thread checks the owner's own (inline) call every tenth of the limit.
 const CALL_LIMIT: Duration = Duration::from_secs(10);
+/// A native call longer than this is logged (IO5 on a qcow2 overlay: every call under 1 s on a healthy host).
+const SLOW_CALL: Duration = Duration::from_secs(2);
 /// Bounded spins before blocking, after recent activity: the owner's on its bell after it admitted or completed work,
 /// a worker's on the job queue after it finished a job. They trade host CPU for a condition-variable wake. Measured
 /// (io-benchmarks.md, "Shorter depth-1 path"): fixed owner spins of 5–10 µs gained nothing measurable at depth 1,
@@ -484,10 +486,12 @@ impl Pool {
     /// Give up on every outstanding call for good: queued jobs never run, running calls keep
     /// only owned storage until they retire. Returns the VM-fatal error.
     pub fn abandon(&mut self) -> String {
+        // Name the call past the limit, if one is: the owner can see it before the watchdog's next look.
+        let stalled = stalled_call(&self.board).map_or(String::new(), |c| format!(" ({c})"));
         board(&self.board).abandoned = true;
         self.jobs.take();
         self.workers.clear();
-        "disk operation abandoned: VM worker must terminate; file may have partial effects".into()
+        format!("disk operation abandoned{stalled}: VM worker must terminate; file may have partial effects")
     }
     /// Close and join the workers. Called only with no outstanding job.
     pub fn finish(mut self) -> Result<()> {
@@ -580,8 +584,15 @@ fn run(calls: &dyn Calls, shared: &Mutex<Board>, slot: usize, job: Job) -> bool 
     let began = profile::taken_by_worker(slot);
     let done = execute(calls, job);
     profile::called(slot, began);
+    let took = start.elapsed();
     let mut board = board(shared);
-    board.overran |= start.elapsed() > board.limit();
+    board.overran |= took > board.limit();
+    // A slow host disk shows before it reaches the limit: one comparison per call.
+    if took > SLOW_CALL
+        && let Some((.., kind, offset)) = board.running.iter().find(|c| c.0 == slot)
+    {
+        eprintln!("virtio-block: slow host disk: {kind} at file offset {offset:#x} took {took:.1?}");
+    }
     board.running.retain(|c| c.0 != slot);
     board.finished.push((slot, done));
     true
@@ -3542,7 +3553,8 @@ pub(in crate::virtio) mod owner_tests {
             assert!(start.elapsed() >= limit / 2);
             assert_eq!(rig.used_index(), 0);
         });
-        assert!(result.unwrap_err().contains("abandoned"));
+        let error = result.unwrap_err();
+        assert!(error.contains("abandoned (a call that finished past the 500ms limit)"), "{error}");
         assert_eq!(rig.used_index(), 0, "the overrun call is not published");
     }
 
