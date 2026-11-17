@@ -44,6 +44,7 @@ every access counted and logged). Needs fexc series23-m3 (completion records on 
 
 Writes DIR/m3.json; exit status 1 on any failure."""
 import argparse, concurrent.futures as cf, json, pathlib, random, subprocess, sys
+from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference')); sys.path.insert(0, str(ROOT / 'tools' / 'models'))
@@ -168,7 +169,7 @@ def corpus_programs(n, seed):
 def corpus(a, host, runtime, report):
     import mmio_model
     progs = corpus_programs(a.programs, a.seed)
-    raw = pathlib.Path(__import__('os').environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+    raw = RAW_ROOT
     qemu = raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
     expected_path = a.out / 'qemu.json'
     if not expected_path.exists():

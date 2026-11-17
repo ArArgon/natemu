@@ -21,9 +21,10 @@ so they wait), Ctrl-A x 1.5 s in with the pipe still open; pass: the stub ends w
 The compile cache is off unless NATEMU_COMPILE_CACHE is set (hermetic). Writes DIR/smoke-N.serial, DIR/smoke.json;
 exit 1 on a failure."""
 import argparse, json, os, pathlib, signal, subprocess, sys, time
+from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw')) / 'kernel-census-20261028-01/dl'
+RAW = RAW_ROOT / 'kernel-census-20261028-01/dl'
 MARKER = 'natemu-boot-smoke-ok'
 CMDLINE = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr rdinit=/bin/busybox -- sh -c "echo {MARKER}; poweroff -f"'
 

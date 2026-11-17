@@ -135,6 +135,7 @@ translates their page (`finish`, `finish-late`), as `coherence` (QEMU reference,
 
 Writes DIR/<mode>.json; exit status 1 on any failure."""
 import argparse, collections, concurrent.futures as cf, json, os, pathlib, random, re, subprocess, sys
+from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
@@ -2236,7 +2237,7 @@ def main():
     ap.add_argument('--max-block', type=int)
     ap.add_argument('--parallel', type=int, default=1)
     ap.add_argument('--seed', type=int, default=20261027)
-    raw = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+    raw = RAW_ROOT
     flow = [raw / 's2d/corpus/programs.json', raw / 's2d/corpus/expected.json']
     ap.add_argument('--flow', type=pathlib.Path, nargs=2, default=flow if all(f.exists() for f in flow) else None)
     ap.add_argument('--no-faults', action='store_true')

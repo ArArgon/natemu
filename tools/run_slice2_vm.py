@@ -11,6 +11,7 @@ programs file; the expected final states come only from a full pinned-QEMU run o
 memory equal to QEMU's (the same checks as tools/run_slice1_vm.py). Writes DIR/{programs,expected,results}.json;
 exit status 1 on any failure."""
 import argparse, json, os, pathlib, sys
+from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
@@ -20,7 +21,7 @@ MAX_EXECUTED = 60_000       # a corpus program is bounded by construction; a run
 
 
 def qemu_path():
-    raw = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+    raw = RAW_ROOT
     return raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
 
 

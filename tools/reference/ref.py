@@ -15,6 +15,7 @@ Execution is the code bytes followed by fallthrough into a capture sequence.  Se
 import argparse, hashlib, json, os, pathlib, re, sqlite3, struct, subprocess, sys, tempfile, uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
+from raw_root import RAW_ROOT
 import flags
 
 # The pinned QEMU container image (Debian bookworm, qemu-user-static 7.2) and the SHA-256 of its QEMU binaries and
@@ -550,7 +551,7 @@ def main():
     ap.add_argument('programs', type=pathlib.Path); ap.add_argument('-o', '--output', type=pathlib.Path, required=True)
     ap.add_argument('--workdir', type=pathlib.Path); ap.add_argument('--qemu', type=pathlib.Path)
     a = ap.parse_args()
-    raw = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', HERE.parent.parent.parent / 'natemu-raw'))
+    raw = RAW_ROOT
     qemu = a.qemu or raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
     work = a.workdir or raw / 'reference-slice1-20261026-01' / 'run'
     work.mkdir(parents=True, exist_ok=True)

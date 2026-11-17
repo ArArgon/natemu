@@ -81,6 +81,7 @@ run (nothing later ran, no partial store),
 and the FEX frame intact. A stop at a declared slice limit before the expected fault (unsupported_form)
 is "unsupported". Writes DIR/faults.json; exit status 1 on any failure."""
 import argparse, json, pathlib, re, subprocess, sys
+from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
@@ -978,7 +979,7 @@ def initial_result(p):
 
 def ref_qemu():
     import os
-    raw = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+    raw = RAW_ROOT
     return raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
 
 def case_description(case):

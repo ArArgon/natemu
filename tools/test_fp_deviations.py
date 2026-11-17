@@ -1,10 +1,11 @@
 """Accurate-FP plan chunk 0: the deviation registry, docs/floating-point.md's list of it, the judging rule, and each runner's no-VM self-check."""
 import json, os, pathlib, re, sys, unittest
+from raw_root import RAW_ROOT
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
 import fp_deviations as dev
 
-RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+RAW = RAW_ROOT
 
 
 def readme_list():   # (the list moved from the README to docs/floating-point.md)

@@ -30,11 +30,12 @@ a passing step's output and temporary directories are deleted, a failing step's 
 Steps `*-m2f`/`*-m2a` run FP runners emulating a host without FEAT_AFP (NATEMU_FEXC_FEATURE_OFF=afp), fast / accurate (NATEMU_FP=accurate).
 --only/--skip take comma-separated step names or fnmatch patterns (`k1-*`, `faults@*`); `release` always runs."""
 import argparse, dataclasses, datetime, fcntl, fnmatch, json, os, pathlib, re, shutil, signal, subprocess, sys, threading, time
+from raw_root import RAW_ROOT
 
 import io_common
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
+RAW = RAW_ROOT
 # The compiler boot-handoff §5's `F=../natemu-raw/...` line names.
 FEXC = RAW / re.search(r'^F=\.\./natemu-raw/(\S+)', (ROOT / 'docs/restructure/boot-handoff.md').read_text(), re.M)[1]
 I8B_CORPUS = 'i8-corpus-20261030-02'   # i8b's directory (the deviation predictions' key)

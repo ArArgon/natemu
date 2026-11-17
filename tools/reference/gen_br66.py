@@ -17,6 +17,8 @@ reference for these bytes: the expected state is pinned QEMU's run of the twin p
 import argparse, json, os, pathlib, random, struct, subprocess, sys, uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
+from raw_root import RAW_ROOT
 import flags, gen_rex, ref
 
 
@@ -76,7 +78,7 @@ def main():
     ap.add_argument('--seed', type=int, default=20261102); ap.add_argument('--qemu', type=pathlib.Path)
     ap.add_argument('-n', type=int, default=12)
     a = ap.parse_args()
-    raw = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', HERE.parent.parent.parent / 'natemu-raw'))
+    raw = RAW_ROOT
     qemu = (a.qemu or raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static').resolve()
     rng = random.Random(a.seed)
     pairs = [pair(f'o16-branches-{i:03d}', rng.getrandbits(64)) for i in range(a.n)]

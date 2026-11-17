@@ -8,8 +8,9 @@ The one lock primitive is BSD flock(2) on that file: Python's fcntl.flock, the s
 on this file. Shared: many parallel, correctness-only VM runs. Exclusive: timing-sensitive runs and benchmarks (what
 `lockf -k` takes). Waits for the lock."""
 import fcntl, os, pathlib, sys
+from raw_root import RAW_ROOT
 
-RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', pathlib.Path(__file__).resolve().parent.parent.parent / 'natemu-raw'))
+RAW = RAW_ROOT
 
 
 def main():
