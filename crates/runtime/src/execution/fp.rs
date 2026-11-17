@@ -81,6 +81,12 @@ pub(super) unsafe fn trap(f: &NativeFrame, esr: u64, elr: u64, spsr: u64) -> ! {
             let Some(d) = natemu_abi::tiny::Desc::decode(site.width, site.imm).filter(|d| site.kind == natemu_abi::code_object::kind::FMA && d.meta & 7 == natemu_abi::tiny::FMA) else {
                 stop_at(u64::from(word), at, stop::FP_WORD)
             };
+            // The word must be `fcmge v1, vR, #0` of the descriptor's shape (vector .4s/.2d or scalar s/d): a misplaced site would skip an FMA.
+            let sz = u32::from(d.meta & natemu_abi::tiny::ELEM8 != 0) << 22;
+            let shape = if d.meta & natemu_abi::tiny::SCALAR != 0 { 0x7ea0_c800 } else { 0x6ea0_c800 } | sz | 1;
+            if word & 0xffff_fc1f != shape || word >> 5 & 31 < 2 {
+                stop_at(u64::from(word), at, stop::FP_WORD)
+            }
             let frame = &raw mut (*shared()).captured;
             let q = [(*frame).q[usize::from(d.regs[0])], (*frame).q[usize::from(d.regs[1])], (*frame).q[usize::from(d.regs[2])]];
             let wide = d.meta & natemu_abi::tiny::ELEM8 != 0;
