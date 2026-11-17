@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <initializer_list>
 #include <set>
+#include <map>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -753,6 +754,32 @@ inline bool FlushRuleOf(const FEXCore::IR::IROp_Header* Op, FlushRule& R) {
 // Places the flushes (run at the start of flag elimination, before PlaceFPChecks: the flush ops come before an instruction's first
 // commit, so before its check, and a flushed result's flags are checked). Nothing on a host with AFP, in a block without such an op,
 // or with neither key set; `--daz` and `--ftz` are read only once such an op is found.
+// AFP accurate plan, chunk 6b (accurate DAZ + FTZ only: FZ = 0 with UFE, so every tiny result traps and the resident's handler flushes it): the
+// elements of the result of an op whose Arm words the handler classifies as flushing (`Patch` with a flush: add, subtract, multiply, divide,
+// square root, pairwise add, FMA) are never zero-exponent denormals, so a DAZ input flush of such a source has nothing to do and is not placed.
+// Only the final result of these ops counts: a scalar-insert result has only element 0 known (the upper elements come from argument 0), a
+// 64-bit or 256-bit op is not looked at, and the sign-mask and negating multiplies (`IsAddSubMul`: never flushed by the handler) are not in
+// the set. Not producers: moves, shuffles, logic, integer ops, loads, inserts, conversions (VCVTPS2PH is never flushed; widening ones come from
+// unknown elements), MIN/MAX (their result is a raw operand), the estimates (RCP/RSQRT) and a value that enters the block.
+struct FlushedResult { uint32_t Elem = 0; bool Scalar = false; };
+inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op);
+inline bool FlushedResultOf(const FEXCore::IR::IROp_Header* Op, FlushedResult& P) {
+  using namespace FEXCore::IR;
+  const uint32_t E = OpSizeToSize(Op->ElementSize), S = OpSizeToSize(Op->Size);
+  if (E != 4 && E != 8) return false;
+  switch (Op->Op) {
+  case OP_VFADD: case OP_VFSUB: case OP_VFMUL: case OP_VFDIV: case OP_VFSQRT: case OP_VFADDP:
+  case OP_VFMLA: case OP_VFMLS: case OP_VFNMLA: case OP_VFNMLS:
+    if (S != 16 && S != E) return false;
+    P = {E, S == E};
+    return true;
+  case OP_VFADDSCALARINSERT: case OP_VFSUBSCALARINSERT: case OP_VFMULSCALARINSERT: case OP_VFDIVSCALARINSERT: case OP_VFSQRTSCALARINSERT:
+  case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT: case OP_VFNMLSSCALARINSERT:
+    P = {E, true};
+    return true;
+  default: return false;
+  }
+}
 // The `FexcFlush` mode of a DAZ input flush: bit 0 element 0 only; bit 2 (AFP accurate plan, chunk 6b) the exact screen (the JIT skips
 // the flush when no examined lane has a zero exponent field), for a 128-bit or scalar value (a 64-bit vector keeps the plain flush).
 inline uint8_t FlushMode(FEXCore::IR::OpSize Size, bool Scalar) {
@@ -766,13 +793,35 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
   struct Found { Ref Node; uint64_t Rip; };
   std::vector<Found> Ops;
   std::vector<Ref> NegMuls;   // the sign-mask and negating multiplies (IsAddSubMul), not x86 operations
+  std::map<Ref, FlushedResult> Produced;   // chunk 6b: results the handler keeps free of denormals (accurate DAZ + FTZ), and loads of them
   uint64_t Rip = ~0ull;
   for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
+    // The guest XMM registers' last stored value in this block, when it is such a result (as MarkUpperZero's `Stored`: a value that enters the
+    // block, a store of another size or an op that may write the static registers is unknown)
+    FlushedResult InReg[16];
+    bool Known[16] = {};
     for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) {
       if (IROp->Op == OP_GUESTOPCODE) { Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset; continue; }
+      if (IROp->Op == OP_STOREREGISTER) {
+        const PhysicalRegister PR(CodeNode);
+        if (PR.AsRegClass() == RegClass::FPRFixed && PR.Reg < 16) {
+          const auto It = Produced.find(IR.GetNode(IROp->Args[0]));
+          Known[PR.Reg] = It != Produced.end() && OpSizeToSize(IROp->Size) == 16;
+          if (Known[PR.Reg]) InReg[PR.Reg] = It->second;
+        }
+        continue;
+      }
+      if (HasSideEffects(IROp->Op) && !KeepsStaticFPRs(IROp->Op)) std::fill(std::begin(Known), std::end(Known), false);
+      if (IROp->Op == OP_LOADREGISTER) {
+        const auto* L = IROp->template C<IROp_LoadRegister>();
+        if (L->Class == RegClass::FPR && L->Reg < 16 && Known[L->Reg]) Produced[CodeNode] = InReg[L->Reg];
+        continue;
+      }
       FlushRule R;
       if (Rip != ~0ull && !fexc_x87.count(Rip) && IsAddSubMul(IR, IROp)) NegMuls.push_back(CodeNode);
       else if (Rip != ~0ull && !fexc_x87.count(Rip) && FlushRuleOf(IROp, R)) Ops.push_back({CodeNode, Rip});
+      FlushedResult P;
+      if (Rip != ~0ull && !fexc_x87.count(Rip) && !IsAddSubMul(IR, IROp) && FlushedResultOf(IROp, P)) Produced[CodeNode] = P;
     }
   }
   if (Ops.empty()) return;
@@ -781,6 +830,13 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
   // AFP accurate plan chunk 5: accurate mode runs DAZ + FTZ with FZ = 0 (UFE traps every tiny result and the resident flushes it, but never
   // the result of the exact sign-mask and negating multiplies): their multiplicand is flushed first (row 4 before them, whatever consumes
   // the product), so a denormal never reaches one and no tiny result or flag comes from it.
+  // (chunk 6b) a source that is such a result needs no flush: same element size, and a scalar result only for a scalar use
+  const bool Free = Daz && Ftz && fexc_accurate;
+  auto NoDenormal = [&](Ref Src, uint32_t Elem, bool Scalar) {
+    if (!Free) return false;
+    const auto It = Produced.find(Src);
+    return It != Produced.end() && It->second.Elem == Elem && (!It->second.Scalar || Scalar);
+  };
   if (Daz && Ftz && fexc_accurate) {
     for (Ref Node : NegMuls) {
       auto View = IREmit->ViewIR();
@@ -788,6 +844,7 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
       FlushRule R;
       FlushRuleOf(Op, R);
       IREmit->SetWriteCursorBefore(Node);
+      if (NoDenormal(View.GetNode(Op->Args[0]), R.InElem, R.InScalar)) continue;
       Ref Flushed = IREmit->_FexcFlush(Op->Size, R.InElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, View.GetNode(Op->Args[0]), FlushMode(Op->Size, R.InScalar));
       IREmit->ReplaceNodeArgument(Node, 0, Flushed);
     }
@@ -808,6 +865,7 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
         Ref Src = View.GetNode(Op->Args[R.In[i]]), Flushed = nullptr;
         const auto SrcOp = View.template GetOp<IROp_Header>(Op->Args[R.In[i]])->Op;
         if (SrcOp == OP_VECTOR_FTOI || SrcOp == OP_VECTOR_FTOISIZED) continue;   // integral values (CVTPS2DQ's FRINT before its FCVTZS): no denormal
+        if (NoDenormal(Src, R.InElem, R.InScalar)) continue;   // (chunk 6b) the result of a flushing op: nothing to flush
         for (size_t j = 0; j < i; ++j) if (Seen[j] == Src) Flushed = Made[j];
         if (!Flushed) {
           const auto Size = View.template GetOp<IROp_Header>(Op->Args[R.In[i]])->Size;
