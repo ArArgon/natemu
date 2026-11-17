@@ -24,7 +24,10 @@
 //!
 //! Notes. Under MSI-X a driver never reads the ISR, so its bit 0 stays set; disabling MSI-X without a device reset
 //! therefore asserts INTx at once from that stale bit (the specification's literal reading: the line is the ISR's
-//! OR; QEMU instead waits for the next interrupt), and `profile::raised` counts are skewed under PCI. Reads of the
+//! OR; QEMU instead waits for the next interrupt), and `profile::raised` counts are skewed under PCI. On a shared
+//! line, with Interrupt Disable also clear and the driver still on MSI-X, that bit holds the line for every function
+//! on it and Linux disables the line ("nobody cared"; the I/O coverage case `sharedintx`, launch `stale`, unresolved:
+//! Linux itself never gets there, as it sets Interrupt Disable with MSI-X and resets before unbinding). Reads of the
 //! MSI-X table or PBA region past their entries return all-ones (`MsixConfig`'s behaviour), an exception to the
 //! rule that an unimplemented BAR0 offset reads zero.
 use super::{Access, MAX_QUEUES, Profile, State, Virtio, feature_word, reg};
