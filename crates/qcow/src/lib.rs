@@ -107,7 +107,10 @@ impl QcowDisk {
                 };
                 e.with_op(ErrorOp::Open)
             })?;
-        let data_raw_file = inner.raw_file.clone();
+        let data_raw_file = inner
+            .raw_file
+            .try_clone()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, parser::Error::CloneBackingFile(e)))?;
         Ok(QcowDisk {
             metadata: Arc::new(QcowMetadata::new(inner)),
             backing_file: backing_file.map(shared_backing_from).transpose()?,
@@ -177,7 +180,7 @@ impl QcowDisk {
     pub fn deallocate(&self, offset: u64, length: usize, write_zeroes: bool) -> io::Result<()> {
         common::deallocate_range(
             &self.metadata,
-            &mut self.data_raw_file.clone(),
+            &self.data_raw_file,
             offset,
             length,
             self.sparse,
