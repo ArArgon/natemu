@@ -19,9 +19,9 @@ CLASSES = {
     'masked-sse-de': ('B', 'with DE masked, an SSE or AVX instruction on a denormal operand does not set MXCSR.DE (the result is right)',
                       'a runner case: the exact MXCSR with DE cleared, everything else exact'),
     'nan-results': ('A', "a NaN result can differ from x86 in sign or choice: the default NaN is positive, the one-instruction negated FMA forms "
-                         "(the scalar ones, the packed FNMADD and the first multiplicand of FNMSUB) flip a NaN's sign, two-NaN and three-NaN choices follow Arm's order, RSQRT's NaN has the other sign",
+                         "(the scalar ones, the packed FNMADD and the first multiplicand of FNMSUB) flip a NaN's sign, two-NaN and three-NaN choices follow Arm's order (the addend of the packed FMSUB and FNMSUB and the subtracted lanes of FMADDSUB and FMSUBADD arrive quieted, so an SNaN there takes no priority), RSQRT's NaN has the other sign",
                     "a corpus program: the final state the offline model predicts (tools/models/afp_fp)"),
-    'fma-invalid-flag': ('D', 'an FMA of infinity times zero plus a QNaN returns the default NaN and sets MXCSR.IE (x86: the QNaN, no flag)',
+    'fma-invalid-flag': ('D', 'an FMA of infinity times zero plus a QNaN, or plus an SNaN addend of the packed FMSUB, FNMSUB or the subtracted lanes of FMADDSUB and FMSUBADD, returns the default NaN and sets MXCSR.IE (x86: the NaN, quieted; no flag for a QNaN)',
                          'a corpus program: the model-predicted final state'),
     'band-ue-flag': ('C', 'with UE masked, a result just below the smallest normal number that rounds up to it can set MXCSR.UE (x86 judges tininess after rounding)',
                      'a case with MXCSR.UE set where x86 sets none (no tagged case yet)'),
