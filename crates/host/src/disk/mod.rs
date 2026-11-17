@@ -4,6 +4,7 @@
 use crate::Result;
 use std::path::Path;
 
+mod qcow;
 mod raw;
 
 /// The workers' calls on an image. Every method may run on the four workers (and a lone read or write on the owner
@@ -99,13 +100,13 @@ fn detect(head: &[u8], tail: &[u8]) -> Option<Format> {
 }
 
 /// Open the image at `path` (`read_only`: shared lock, nothing offered that writes) by its detected format. `backing`
-/// names a backing file; only qcow2 has one.
+/// names a backing file; only qcow2 has one, and a qcow2 image that names one opens only when it is this file.
 pub(crate) fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> Result<Image> {
     let (file, head, tail) = raw::inspect(path, read_only)?;
     match detect(&head, &tail) {
         None if backing.is_some() => Err("a backing file needs a qcow2 image".into()),
         None => raw::image(file, read_only),
-        Some(Format::Qcow2) => Err(format!("disk {}: qcow2 not built yet", path.display())),
+        Some(Format::Qcow2) => qcow::image(file, path, read_only, backing),
         Some(Format::Refused(name)) => Err(format!(
             "disk {}: this looks like a {name} image; natemu reads raw and qcow2 (qemu-img convert -O qcow2 ...)",
             path.display()
@@ -133,8 +134,7 @@ mod tests {
         result.err().expect("refused")
     }
     #[test]
-    fn detection_refuses_other_containers_and_names_qcow2_as_not_built() {
-        assert!(error(&image(4096, 0, b"QFI\xfb"), "q").contains("qcow2 not built yet"));
+    fn detection_refuses_other_containers() {
         for (bytes, name) in [
             (image(4096, 0, b"KDMV"), "VMDK"),
             (image(4096, 0, b"vhdxfile"), "VHDX"),
