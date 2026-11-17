@@ -145,6 +145,11 @@ impl RefCount {
         })
     }
 
+    /// natemu: whether a refcount block or the refcount table needs writing.
+    pub(super) fn dirty(&self) -> bool {
+        self.ref_table.dirty() || self.refblock_cache.any_dirty()
+    }
+
     /// Returns the number of refcounts per block.
     pub(super) fn refcounts_per_block(&self) -> u64 {
         self.refcount_block_entries

@@ -293,14 +293,11 @@ impl ImageFile {
         self.layer.set_len(size)
     }
 
-    /// `fsync` class (see [`SyncKind::Fsync`]).
-    pub fn sync_all(&self) -> io::Result<()> {
-        self.layer.sync(SyncKind::Fsync)
-    }
-
-    /// Same as [`Self::sync_all`]: macOS has no `fdatasync`.
-    pub fn sync_data(&self) -> io::Result<()> {
-        self.layer.sync(SyncKind::Fsync)
+    /// natemu: upstream's `sync_all`/`sync_data`/`fsync` are gone so every flush point names its
+    /// kind: an ordering point is [`Self::barrier_sync`], the header bits are [`Self::full_sync`],
+    /// and the guest FLUSH's final sync is the caller's ([`crate::QcowDisk::sync`]).
+    pub fn sync(&self, kind: SyncKind) -> io::Result<()> {
+        self.layer.sync(kind)
     }
 
     pub fn barrier_sync(&self) -> io::Result<()> {
@@ -326,11 +323,6 @@ impl ImageFile {
 
     pub fn write_all_zeroes_at(&self, offset: u64, length: usize) -> io::Result<()> {
         self.write_zeroes_at(offset, length).map(|_| ())
-    }
-
-    /// Plain `fsync` (upstream `FileSync::fsync`).
-    pub fn fsync(&mut self) -> io::Result<()> {
-        self.layer.sync(SyncKind::Fsync)
     }
 }
 
@@ -372,7 +364,7 @@ mod tests {
         let tmp = TempFile::new().unwrap();
         let f = ImageFile::new(tmp.as_file().try_clone().unwrap());
         f.write_all_at(b"abc", 0).unwrap();
-        f.sync_all().unwrap();
+        f.sync(SyncKind::Fsync).unwrap();
         f.barrier_sync().unwrap();
         f.full_sync().unwrap();
         let g = f.try_clone().unwrap();

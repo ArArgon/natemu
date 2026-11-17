@@ -10,6 +10,8 @@
 //! manipulation and integer arithmetic. Shared across the `qcow` submodules.
 
 /// Nesting depth limit for disk formats that can open other disk files.
+/// natemu: tests only; the facade opens backing chains itself (depth 16).
+#[cfg(test)]
 pub(crate) const MAX_NESTING_DEPTH: u32 = 10;
 
 // bits 0-8 and 56-63 are reserved.

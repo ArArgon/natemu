@@ -38,13 +38,9 @@ qcow2 image code vendored from Cloud Hypervisor, adapted to build and test on ma
   `fcntl(F_PUNCHHOLE)` on the 4 KiB-aligned interior with zero writes for the edges, and zero
   writes for the whole range if the call is refused (Linux: `fallocate(PUNCH_HOLE|KEEP_SIZE)`
   with the same fallback).
-- `FileSync::fsync` -> `libc::fsync` (EINTR retried). Note: Rust's `File::sync_all` is
-  `F_FULLFSYNC` on macOS, so the vendored flush points are now cheaper than upstream's. They are
-  `ImageFile::sync_all`/`sync_data`/`fsync` = `SyncKind::Fsync`. `barrier_fsync`, `full_fsync`,
-  `ImageFile::barrier_sync`, `ImageFile::full_sync` and `file::sync_fd(fd, SyncKind)` request
-  `F_BARRIERFSYNC` and `F_FULLFSYNC` (plain fsync on other systems, or if the file system refuses
-  the fcntl). Nothing calls them yet: the write-ordering rule (barrier between data, tables, and
-  L1/refcount table) is the facade's next step.
+- `FileSync::fsync` and the `sync_all`/`sync_data` flush points -> an explicit `SyncKind` at each
+  point (`ImageFile::sync(kind)`, `barrier_sync`, `full_sync`; `F_BARRIERFSYNC`/`F_FULLFSYNC` on
+  macOS, plain fsync elsewhere or when the file system refuses the fcntl). See "Write order".
 - `mod.rs` -> `lib.rs`. `QcowDisk` keeps the opener (`new`, `with_path`, `from_image_file`),
   `resize`, `sync_metadata`, sizes, and gains plain-slice `write_all_at`, `read_exact_at` and
   `deallocate`, built on `common.rs` (`cow_write_at`, `scatter_read`, `deallocate_range`: upstream's
@@ -66,7 +62,31 @@ qcow2 image code vendored from Cloud Hypervisor, adapted to build and test on ma
   panicking `Clone` impls (`ImageFile`, `QcowRawFile`) are gone; `try_clone` returns `io::Result`.
 - Licence header references point at `LICENSES/BSD-3-Clause.txt`.
 
-## Backing file paths
+## Write order, dirty bit and backing files (the facade step)
+
+The rules are the design record's (docs/m1-config-and-qcow2-design.md, section 4); the host facade
+is `crates/host/src/disk/qcow.rs`.
+
+- `sync_caches` (metadata.rs): a barrier (data before tables; needed for L2 tables changed in place),
+  dirty L2 tables and refcount blocks, a barrier (upstream: `sync_all`), then the L1 and refcount
+  tables. No final sync: `QcowDisk::sync(kind)` runs it with the table lock released, and only then
+  returns the clusters those tables freed to the free list (`write_tables`/`release`; upstream moved
+  them under the lock right after its sync). A dirty L2 evicted from the cache is written after a
+  barrier. Resize/L1-growth `sync_all` points are barriers.
+- The dirty, corrupt and autoclear header writes use `F_FULLFSYNC`.
+- `Drop` writes the tables without a sync and keeps the dirty bit (upstream flushed and cleared it);
+  only `close_clean` (the power-off drain) clears it, after an `F_FULLFSYNC`, with another;
+  `mark_dirty` sets it again. A failed table write (flush or eviction) is reported by
+  `tables_failed`.
+- A whole-cluster write over a backing file passes its own data as the fill, so a new cluster holds
+  it before its L2 entry exists (upstream left it unwritten until after the lock: a racing read, or a
+  crash after a flush or eviction made the entry durable, saw zeros). Fills are borrowed slices.
+- The parser no longer opens backing files: `QcowDisk::open(file, backing)` takes a chain the caller
+  opened (`BackingFile::raw`, `BackingFile::qcow2`, read-only), and the header's backing presence must
+  match. Upstream's path-following opener (`QcowDisk::new`/`with_path`, `parse_qcow`, format
+  guessing) is kept for the vendored tests only (`cfg(test)`).
+
+## Backing file paths (tests only now)
 
 A relative backing name resolves against the directory of the referring image, as given by the path
 passed to `with_path`. Callers must always pass `with_path`; without it the name resolves against the
@@ -90,8 +110,13 @@ Upstream tests changed or not run:
   and `block/src/lib.rs` tests; the 8 `mod.rs` engine tests (4 re-written without the engine).
 - Added (natemu): `file.rs` (2), `metadata.rs` (1, corrupt bit), `lib.rs` (4 backing-file and zero-over-backing tests that stand in
   for part of the dropped engine tests).
-- Not ported: the 65 engine_sync tests (backing chains, multi-queue reads, relative backing paths,
-  partial-failure reporting). They need the final facade; port them there.
+- Not ported: the 65 engine_sync tests. The behaviours they covered are rebuilt as facade tests in
+  `crates/host/src/disk/qcow_tests.rs` (free-list reuse, out-of-bounds L2 entries, failed punch,
+  stale punch vs a new L2, backing reads past the end, relative and missing backing names, a
+  three-layer chain, concurrent multi-queue I/O, visibility after sync and reopen, v2, compressed).
+- Changed: `dirty_bit_cleared_when_last_metadata_owner_drops` became
+  `dirty_bit_cleared_only_by_a_clean_close`, and `dirty_bit_set_on_open_cleared_on_close_v3` closes
+  cleanly before checking (a drop keeps the bit now).
 
 ## Dependencies and licences (checked by hand; `cargo-deny` is not configured)
 

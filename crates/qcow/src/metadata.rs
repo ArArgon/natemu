@@ -20,6 +20,9 @@ use std::cmp::min;
 use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, RwLock};
+
+#[cfg(test)]
+use crate::file::SyncKind;
 use std::{io, mem};
 
 use libc::{EINVAL, EIO};
@@ -294,6 +297,8 @@ pub(crate) struct QcowState {
     pub(crate) refcounts: RefCount,
     pub(crate) avail_clusters: Vec<u64>,
     pub(crate) unref_clusters: Vec<u64>,
+    /// natemu: a table write (flush or eviction) failed; see `QcowMetadata::tables_failed`.
+    pub(crate) table_write_failed: bool,
     /// Dedicated file descriptor for metadata I/O covering L2 table reads,
     /// refcount block reads and dirty eviction writes. This is a dup clone
     /// of the original fd, separate from the per queue data I/O fds.
@@ -393,39 +398,95 @@ impl QcowMetadata {
     /// unallocated and a backing file exists, the caller should have already
     /// read the backing cluster data and pass it here. If None, the new
     /// cluster is zeroed.
+    ///
+    /// natemu: `fill` is borrowed, and the result (host offset, filled) says whether this call
+    /// wrote `fill` into a newly allocated cluster, under the lock. A caller that passes its own
+    /// whole-cluster data as `fill` then need not write it again.
     pub(super) fn map_cluster_for_write(
         &self,
         address: u64,
-        backing_data: Option<Vec<u8>>,
-    ) -> io::Result<ClusterWriteMapping> {
+        fill: Option<&[u8]>,
+    ) -> io::Result<(u64, bool)> {
         let mut inner = self.inner.write().unwrap();
-        inner.map_write(address, backing_data)
+        inner.map_write_with(address, fill)
     }
 
-    pub(super) fn flush(&self) -> io::Result<()> {
+    /// natemu: steps 2-5 of the write order (design section 4) under the table lock: a barrier
+    /// (data before tables), the dirty L2 tables and refcount blocks, a barrier, then the L1 and
+    /// refcount tables. The final sync is the caller's, outside the lock. Returns the clusters
+    /// freed by the tables just written: they may be reused only after that sync returns
+    /// ([`Self::release`]); before it, a reused cluster could still be referenced on disk.
+    pub(super) fn write_tables(&self) -> io::Result<Vec<u64>> {
         let mut inner = self.inner.write().unwrap();
         inner.sync_caches()?;
-        let mut unref = mem::take(&mut inner.unref_clusters);
-        inner.avail_clusters.append(&mut unref);
+        Ok(mem::take(&mut inner.unref_clusters))
+    }
+
+    /// Return clusters from [`Self::write_tables`] to the free list once their sync succeeded.
+    pub(super) fn release(&self, mut freed: Vec<u64>) {
+        self.inner
+            .write()
+            .unwrap()
+            .avail_clusters
+            .append(&mut freed);
+    }
+
+    /// Tables, sync and release in one call, the sync under the lock (tests only).
+    #[cfg(test)]
+    pub(super) fn flush(&self) -> io::Result<()> {
+        let freed = self.write_tables()?;
+        self.inner
+            .read()
+            .unwrap()
+            .raw_file
+            .file()
+            .sync(SyncKind::Fsync)?;
+        self.release(freed);
         Ok(())
     }
 
-    /// Flushes dirty metadata caches and clears the dirty bit for
-    /// clean shutdown.
-    pub(super) fn shutdown(&self) {
+    /// natemu: whether a table write failed (a flush or an eviction): the on-disk tables are then
+    /// unknown, and the caller fails every later write and sync of the image.
+    pub(super) fn tables_failed(&self) -> bool {
+        self.inner.read().unwrap().table_write_failed
+    }
+
+    /// Clean close, the power-off drain's (natemu; upstream's `shutdown` ran on every drop): the
+    /// tables, F_FULLFSYNC, then the dirty bit cleared with another F_FULLFSYNC. On any error the
+    /// dirty bit stays set. [`Self::mark_dirty`] undoes it before a later change.
+    pub(super) fn close_clean(&self) -> io::Result<()> {
         let mut inner = self.inner.write().unwrap();
-        if let Err(e) = inner.sync_caches() {
-            log::warn!("Failed to flush QCOW2 metadata on shutdown: {e}");
-            return;
-        }
+        inner.sync_caches()?;
+        inner.raw_file.file().full_sync()?;
+        let mut freed = mem::take(&mut inner.unref_clusters);
+        inner.avail_clusters.append(&mut freed);
         let QcowState {
             ref mut header,
             ref mut raw_file,
             ..
         } = *inner;
         if raw_file.file().is_writable() {
-            let _ = header.set_dirty_bit(raw_file.file_mut(), false);
+            header
+                .set_dirty_bit(raw_file.file_mut(), false)
+                .map_err(io::Error::other)?;
         }
+        Ok(())
+    }
+
+    /// Set the dirty bit again (F_FULLFSYNC) if [`Self::close_clean`] cleared it.
+    pub(super) fn mark_dirty(&self) -> io::Result<()> {
+        let mut inner = self.inner.write().unwrap();
+        let QcowState {
+            ref mut header,
+            ref mut raw_file,
+            ..
+        } = *inner;
+        if header.incompatible_features & super::IncompatFeatures::DIRTY.bits() == 0 {
+            header
+                .set_dirty_bit(raw_file.file_mut(), true)
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
     }
 
     /// Resizes the QCOW2 image to the given new size. Only grow is
@@ -565,9 +626,18 @@ impl QcowMetadata {
     }
 }
 
+/// natemu: every exit but the power-off drain ([`QcowMetadata::close_clean`]) runs steps 1-5 of
+/// the write order without the final sync and leaves the dirty bit set, so completed writes
+/// survive a natemu exit (as on a raw image) and the next writable open rebuilds the refcounts.
+/// Upstream flushed and cleared the dirty bit here.
 impl Drop for QcowMetadata {
     fn drop(&mut self) {
-        self.shutdown();
+        let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+        if inner.raw_file.file().is_writable()
+            && let Err(e) = inner.sync_caches()
+        {
+            log::warn!("Failed to write QCOW2 metadata on close: {e}");
+        }
     }
 }
 
@@ -704,6 +774,18 @@ impl QcowState {
         address: u64,
         backing_data: Option<Vec<u8>>,
     ) -> io::Result<ClusterWriteMapping> {
+        let (offset, _) = self.map_write_with(address, backing_data.as_deref())?;
+        Ok(ClusterWriteMapping::Allocated { offset })
+    }
+
+    /// natemu: [`Self::map_write`] with a borrowed fill; also returns whether the fill was written
+    /// into a newly allocated cluster.
+    fn map_write_with(
+        &mut self,
+        address: u64,
+        backing_data: Option<&[u8]>,
+    ) -> io::Result<(u64, bool)> {
+        let mut filled = false;
         if address >= self.header.size {
             return Err(io::Error::from_raw_os_error(EINVAL));
         }
@@ -773,6 +855,7 @@ impl QcowState {
             let cluster_addr = if l2_entry_is_zero(l2_entry) {
                 self.append_zeroed_data_cluster()?
             } else {
+                filled = backing_data.is_some();
                 self.append_data_cluster(backing_data)?
             };
             self.update_cluster_addr(l1_index, l2_index, cluster_addr)?;
@@ -798,9 +881,7 @@ impl QcowState {
         };
 
         let intra_offset = self.raw_file.cluster_offset(address);
-        Ok(ClusterWriteMapping::Allocated {
-            offset: cluster_addr + intra_offset,
-        })
+        Ok((cluster_addr + intra_offset, filled))
     }
 
     // -- Address computation helpers --
@@ -938,26 +1019,32 @@ impl QcowState {
             l2_offsets,
             refcounts,
             l2_cache,
+            table_write_failed,
             ..
         } = self;
-        l2_cache.insert(index, table, |index, evicted| {
-            write_l2_table(
-                raw_file,
-                header,
-                l2_offsets,
-                refcounts,
-                l1_table[index],
-                evicted,
-            )
-        })
+        l2_cache
+            .insert(index, table, |index, evicted| {
+                // natemu: steps 1-3 of the write order. The evicted table may be one the durable
+                // L1 points at (changed in place), so the data its new entries point at goes first.
+                raw_file.file().barrier_sync()?;
+                write_l2_table(
+                    raw_file,
+                    header,
+                    l2_offsets,
+                    refcounts,
+                    l1_table[index],
+                    evicted,
+                )
+            })
+            .inspect_err(|_| *table_write_failed = true)
     }
 
     /// Allocates a new cluster from the free list or by extending the file.
-    fn get_new_cluster(&mut self, initial_data: Option<Vec<u8>>) -> io::Result<u64> {
+    fn get_new_cluster(&mut self, initial_data: Option<&[u8]>) -> io::Result<u64> {
         if let Some(free_cluster) = self.avail_clusters.pop() {
             self.reject_invalid_data_cluster_offset(free_cluster)?;
             if let Some(initial_data) = initial_data {
-                self.raw_file.write_cluster(free_cluster, &initial_data)?;
+                self.raw_file.write_cluster(free_cluster, initial_data)?;
             } else {
                 self.raw_file.zero_cluster(free_cluster)?;
             }
@@ -968,7 +1055,7 @@ impl QcowState {
         if let Some(new_cluster) = self.raw_file.add_cluster_end(max_valid)? {
             self.reject_invalid_data_cluster_offset(new_cluster)?;
             if let Some(initial_data) = initial_data {
-                self.raw_file.write_cluster(new_cluster, &initial_data)?;
+                self.raw_file.write_cluster(new_cluster, initial_data)?;
             }
             Ok(new_cluster)
         } else {
@@ -994,7 +1081,7 @@ impl QcowState {
 
     /// Allocates a cluster and sets its refcount to 1. A cluster this fails
     /// to claim goes back to the allocator.
-    fn append_data_cluster(&mut self, initial_data: Option<Vec<u8>>) -> io::Result<u64> {
+    fn append_data_cluster(&mut self, initial_data: Option<&[u8]>) -> io::Result<u64> {
         let new_addr = self.get_new_cluster(initial_data)?;
         if let Err(e) = self.set_cluster_refcount_track_freed(new_addr, 1) {
             self.release_unreferenced_cluster(new_addr);
@@ -1110,7 +1197,8 @@ impl QcowState {
             .update(self.raw_file.file_mut())
             .map_err(|e| io::Error::other(format!("failed to write header during resize: {e}")))?;
 
-        self.raw_file.file_mut().sync_all()?;
+        // natemu: an ordering point (upstream sync_all); durability is the caller's sync.
+        self.raw_file.file().barrier_sync()?;
 
         Ok(())
     }
@@ -1181,7 +1269,8 @@ impl QcowState {
         self.raw_file
             .write_pointer_table_direct(new_l1_offset, new_l1_data.iter())?;
 
-        self.raw_file.file_mut().sync_all()?;
+        // natemu: the new L1 before the header that points at it (upstream sync_all).
+        self.raw_file.file().barrier_sync()?;
 
         self.header.l1_size = new_l1_size;
         self.header.l1_table_offset = new_l1_offset;
@@ -1190,7 +1279,9 @@ impl QcowState {
             .update(self.raw_file.file_mut())
             .map_err(|e| io::Error::other(format!("failed to write header during resize: {e}")))?;
 
-        self.raw_file.file_mut().sync_all()?;
+        // natemu: an ordering point (upstream sync_all). The old L1 clusters go to the unref list
+        // and are reused only after a later flush's sync.
+        self.raw_file.file().barrier_sync()?;
 
         // Free old L1 table clusters
         let old_l1_bytes = old_l1_size as u64 * size_of::<u64>() as u64;
@@ -1310,6 +1401,9 @@ impl QcowState {
                 ) {
                     self.set_corrupt_bit_best_effort();
                 }
+                if matches!(e, refcount::Error::EvictingRefCounts(_)) {
+                    self.table_write_failed = true;
+                }
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("failed to get cluster refcount: {e}"),
@@ -1349,6 +1443,7 @@ impl QcowState {
                     refcount_set = true;
                 }
                 Err(refcount::Error::EvictingRefCounts(e)) => {
+                    self.table_write_failed = true;
                     return Err(e);
                 }
                 Err(refcount::Error::InvalidIndex) => {
@@ -1392,8 +1487,25 @@ impl QcowState {
         Ok(unref_clusters)
     }
 
-    /// Flushes all dirty metadata to disk.
+    /// Writes all dirty metadata (steps 2-5 of the write order, see `QcowMetadata::write_tables`).
+    /// natemu: upstream wrote L2 tables and refcount blocks, `sync_all`, then the L1 and refcount
+    /// tables and `sync_data`. Here a barrier comes first (data before tables, needed for tables
+    /// changed in place), the `sync_all` is a barrier (L2 before the L1 that points at it), and
+    /// the final sync is the caller's. A failure marks `table_write_failed`.
     fn sync_caches(&mut self) -> io::Result<()> {
+        let result = self.write_dirty_tables();
+        if result.is_err() {
+            self.table_write_failed = true;
+        }
+        result
+    }
+
+    fn write_dirty_tables(&mut self) -> io::Result<()> {
+        if !self.l1_table.dirty() && !self.l2_cache.any_dirty() && !self.refcounts.dirty() {
+            return Ok(());
+        }
+        // Step 2: data (guest writes and copy-on-write fills) before any table entry.
+        self.raw_file.file().barrier_sync()?;
         for (l1_index, l2_table) in self.l2_cache.iter_mut().filter(|(_k, v)| v.dirty()) {
             write_l2_table(
                 &mut self.raw_file,
@@ -1408,11 +1520,11 @@ impl QcowState {
         let layout = MetadataLayout::new(&self.header, &self.l2_offsets);
         // Write the modified refcount blocks.
         self.refcounts.flush_blocks(&mut self.raw_file, layout)?;
-        // Sync metadata and data clusters.
-        self.raw_file.file_mut().sync_all()?;
+        // Step 4: L2 tables (and refcount blocks) before the L1 and refcount tables.
+        self.raw_file.file().barrier_sync()?;
 
-        // Push L1 table and refcount table last.
-        let mut sync_required = if self.l1_table.dirty() {
+        // Step 5: push L1 table and refcount table last.
+        if self.l1_table.dirty() {
             let refcounts = &mut self.refcounts;
             self.raw_file.write_pointer_table(
                 self.header.l1_table_offset,
@@ -1429,14 +1541,8 @@ impl QcowState {
                 },
             )?;
             self.l1_table.mark_clean();
-            true
-        } else {
-            false
-        };
-        sync_required |= self.refcounts.flush_table(&mut self.raw_file)?;
-        if sync_required {
-            self.raw_file.file_mut().sync_data()?;
         }
+        self.refcounts.flush_table(&mut self.raw_file)?;
 
         Ok(())
     }
@@ -1727,7 +1833,7 @@ mod tests {
             .unwrap();
         // Force writeback to fail by pointing L2 at the L1 table.
         state.l1_table[0] = state.header.l1_table_offset;
-        super::QcowMetadata::new(state).shutdown();
+        super::QcowMetadata::new(state).close_clean().ok();
 
         let raw = temp.aligned_file();
         let header = super::QcowHeader::new(&raw).unwrap();
@@ -2376,7 +2482,7 @@ mod tests {
         } = MetadataFixture::new(64 * cluster_size);
         inner.map_write(0, None).expect("seed write");
         let l2_table = inner.l1_table[0];
-        super::QcowMetadata::new(inner).shutdown();
+        super::QcowMetadata::new(inner).close_clean().ok();
         temp.as_file()
             .write_all_at(&CLUSTER_USED_FLAG.to_be_bytes(), l2_table)
             .unwrap();
@@ -2608,7 +2714,7 @@ mod tests {
             "cluster {offset:#x} is not from the file end"
         );
         temp.as_file().write_all_at(&[0xa5; 16], offset).unwrap();
-        super::QcowMetadata::new(inner).shutdown();
+        super::QcowMetadata::new(inner).close_clean().ok();
 
         assert_eq!(read_back(&mut open_state(&temp)), [0xa5; 16]);
 
@@ -2660,7 +2766,7 @@ mod tests {
             assert!(guest < size, "allocated the whole disk without ENOSPC");
         };
         assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
-        super::QcowMetadata::new(inner).shutdown();
+        super::QcowMetadata::new(inner).close_clean().ok();
 
         let mut inner = open_state(&temp);
         let super::ClusterReadMapping::Allocated { offset, .. } = inner
