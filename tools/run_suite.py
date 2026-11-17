@@ -53,8 +53,6 @@ SERIAL_WHY = {
     'l4a-stress': 'failed twice in the parallel phase, never alone: a vCPU stopped by the guest watchdog (random 0-255 us '
                   'delays between line changes)',
     'k1-c4': 'each run killed after 300 s: link-full at 4 vCPUs, block size 1, exceeded it in the parallel phase at -j 6 (par k1 steps now take one slot per vCPU and a 450 s kill: oversubscribed P cores were the cause)',
-    'io-coverage-sharedintx': 'a few minutes of 8 to 29 disks on shared INTx lines (pci=nomsi) at 4 vCPUs: a stale interrupt status or a lost line shows as a guest hang, '
-                              'so it needs vCPUs truly concurrent and the machine not loaded',
     'boot-smoke': 'Ctrl-C must end the stub within 5 s; boots under a 120 s timeout',
     'vector-split-smp': 'three vCPUs exercise split-lock ownership and vector completion concurrently',
     'virtio-lifecycle-timed': 'held-call schedules released or timed out at 3 s, the 50 ms windowless drain deadline (code-page: none '
