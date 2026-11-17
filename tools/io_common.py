@@ -109,6 +109,9 @@ def pci_self_test():
 # raw file (qemu-img writes it sparse), checks that, and deletes it at once. The qcow2 input is prepared ONCE per inputs
 # directory from the raw one with preallocation=metadata: a plain convert would leave free space unallocated, and the run
 # would measure cluster allocation instead of the steady state. Nothing here touches raw runs.
+# --image-format overlay: a new, empty qcow2 overlay per run over the raw input (`qemu-img create -b BASE -F raw`, in the
+# run folder, deleted with the run's disk), launched with `--set disk.disk0.backing=BASE` (natemu refuses an overlay whose
+# base the launch does not name); the base's hash must be unchanged afterwards.
 IMAGE_FORMATS = ('raw', 'qcow2', 'overlay')
 
 
@@ -125,8 +128,20 @@ def need_qemu_img(what='--image-format qcow2'):
 
 
 def check_image_format(fmt):
-    if fmt == 'overlay': raise SystemExit('--image-format overlay: not built until the overlay step (a qcow2 overlay on a raw base named by the config file\'s `backing` key)')
+    if fmt != 'raw': need_qemu_img(f'--image-format {fmt}')
     return fmt
+
+
+def overlay_create(base, overlay, size=None):
+    """A new, empty qcow2 overlay OVERLAY over the raw BASE (its absolute path recorded), as `qemu-img create -b -F raw` makes
+    it; SIZE bytes (default the base's; reads past a shorter base are zeros)."""
+    subprocess.run([need_qemu_img(), 'create', '-q', '-f', 'qcow2', '-b', str(pathlib.Path(base).resolve()), '-F', 'raw', str(overlay)]
+                   + ([str(size)] if size else []), check=True, capture_output=True)
+
+
+def overlay_set(base):
+    """The natemu arguments naming BASE as the --disk overlay's backing file."""
+    return ['--set', f'disk.disk0.backing={pathlib.Path(base).resolve()}']
 
 
 def qcow2_convert(src, dst, fmt, *options, size=None):

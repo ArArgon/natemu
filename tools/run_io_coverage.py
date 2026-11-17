@@ -76,6 +76,14 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
                  raw copy is identical. qcow2-trim also needs `qemu-img map` to show the DISCARDed 128 KiB holding no data and
                  the 1 MiB pattern's data clusters shrunk from 16 to at most 12 (the discard and the ZEROOUT's whole clusters).
                  Their judge (qcow2_errors) is self-checked with mutations; no live control.
+  overlay        (not in the default list; needs qemu-img) the gpt guest on a qcow2 overlay over a raw base (an APFS clone of
+                 the prepared gpt image): the write launch names an overlay path that does not exist with the base as its
+                 `backing` in a generated config file, so natemu creates it; the verify launch boots the same overlay again.
+                 After each launch, besides the qcow2 checks above (on the overlay's raw view), the base's hash is unchanged
+                 and `qemu-img info` names the base's absolute path and format raw. Then refusals, each needing a nonzero exit,
+                 its message and an unchanged overlay: the overlay given by --disk alone (the message names the base and the key
+                 to add), and an overlay made by `qemu-img create -b BASE -F raw` launched with another file as its backing.
+                 Its judge (overlay_errors, refusal_errors) is self-checked with mutations.
 Live negative controls (the judge must FAIL them): host-full-control (the host-full guest with the image on the normal
 disk) and host-limit-control (the host-limit guest without the limit)."""
 import argparse
@@ -114,7 +122,7 @@ APPLETS = ('sh', 'mount', 'umount', 'modprobe', 'cat', 'grep', 'awk', 'dd', 'wc'
 CASES = ('gpt', 'mbr', 'reboot-acpi', 'reboot-kbd', 'reboot-triple', 'fs-full', 'host-full', 'host-limit', 'trim')
 CONTROLS = ('host-full-control', 'host-limit-control')
 # qcow2 cases: the gpt and trim guests on a preallocated qcow2 image; the host checks read a temporary raw conversion.
-QCOW2_CASES = {'qcow2': 'gpt', 'qcow2-trim': 'trim'}
+QCOW2_CASES = {'qcow2': 'gpt', 'qcow2-trim': 'trim', 'overlay': 'gpt'}
 QCOW_CLUSTER = 65536
 # The image each case starts from, and its extra kernel parameters.
 IMAGE = {'trim': 'gpt.raw', 'gpt': 'gpt.raw', 'mbr': 'mbr.raw', 'reboot-acpi': 'data.raw', 'reboot-kbd': 'data.raw', 'reboot-triple': 'data.raw',
@@ -724,12 +732,66 @@ def qcow2_errors(q, base, phase):
     return errors
 
 
-def launch(args, case, phase, image, work, limit):
+def overlay_host(image, base, base_sha):
+    """The overlay facts after a launch: the base unchanged, and the backing file and format `qemu-img info` reads from the header."""
+    info = json.loads(subprocess.run([need_qemu_img(), 'info', '--output=json', str(image)], capture_output=True, text=True, check=True).stdout)
+    return {'base_unchanged': digest(base) == base_sha, 'backing': info.get('backing-filename'), 'backing_format': info.get('backing-filename-format'),
+            'want_backing': str(base.resolve())}
+
+
+def overlay_errors(o):
+    errors = [] if o['base_unchanged'] else ['the base image changed']
+    if o['backing'] != o['want_backing']: errors.append(f'backing file {o["backing"]!r}, not {o["want_backing"]!r}')
+    if o['backing_format'] != 'raw': errors.append(f'backing format {o["backing_format"]!r}, not raw')
+    return errors
+
+
+def overlay_config(path, disk, backing):
+    q = lambda p: json.dumps(str(p))
+    path.write_text(f'[[disk]]\nid = "disk0"\npath = {q(disk)}\n' + (f'backing = {q(backing)}\n' if backing else ''))
+    return path
+
+
+def refusal_errors(r):
+    """A refused launch: nonzero exit before any boot, the expected message, the overlay's bytes unchanged."""
+    errors = [] if r['rc'] not in (0, None) and not r['timeout'] else [f'not refused (exit {r["rc"]}, timeout {r["timeout"]})']
+    if not all(m in r['stderr'] for m in r['messages']): errors.append(f'stderr lacks {r["messages"]}: {r["stderr"][-300:]!r}')
+    if r['booted']: errors.append('the guest booted')
+    if not r['unchanged']: errors.append('the overlay changed')
+    return errors
+
+
+def overlay_refusals(args, work, image, base):
+    """The overlay without its base (--disk alone), and a qemu-img overlay whose config names another file as its backing."""
+    other = work / 'other.raw'; checked(['cp', '-c', base, other], work / 'clone-other.log')
+    made = work / 'made.qcow2'
+    subprocess.run([need_qemu_img(), 'create', '-q', '-f', 'qcow2', '-b', str(base.resolve()), '-F', 'raw', str(made)], check=True, capture_output=True)
+    named = str(base.resolve())
+    results = []
+    for name, disk, config, messages in (
+            ('no-backing', image, None, [f'add backing = "{named}"', f'--set disk.disk0.backing={named}']),
+            ('mismatch', made, overlay_config(work / 'mismatch.toml', made, other), [f'is based on {named}, not on the backing {other}'])):
+        launch_dir = work / name; launch_dir.mkdir()
+        before = digest(disk)
+        rc, timeout, seconds = launch(args, 'gpt', 'verify', disk, launch_dir, 0, config)
+        serial = launch_dir / 'serial.log'
+        r = {'name': name, 'rc': rc, 'timeout': timeout, 'stderr': (launch_dir / 'stderr.log').read_text(errors='replace'), 'messages': messages,
+             'booted': serial.exists() and 'COV-BEGIN' in serial.read_text(errors='replace'), 'unchanged': digest(disk) == before}
+        r['errors'] = refusal_errors(r); r['seconds'] = round(seconds, 1)
+        write_json(launch_dir / 'result.json', r); results.append(r)
+        print(json.dumps({'case': 'overlay', 'refusal': name, 'errors': r['errors']}), flush=True)
+    for leftover in (other, made): leftover.unlink(missing_ok=True)
+    return results
+
+
+def launch(args, case, phase, image, work, limit, config=None):
+    """One launch; CONFIG (a config file listing the disk) replaces --disk IMAGE and makes the transport explicit."""
+    disk = ['--config', str(config), '--virtio-transport', args.transport] if config else ['--disk', str(image)]
     command = [str(args.natemu), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.prepared / 'linux'),
-               '--initrd', str(args.prepared / 'initramfs.cpio'), '--disk', str(image), '--vcpus', '2', '--ram', '1G',
+               '--initrd', str(args.prepared / 'initramfs.cpio')] + disk + ['--vcpus', '2', '--ram', '1G',
                '--compile-cache', 'off', '--serial', str(work / 'serial.log'), '--cmdline',
                f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case={case} cov_phase={phase}' + EXTRA.get(case, '')]
-    if args.transport == 'pci': command += ['--virtio-transport', 'pci']
+    if args.transport == 'pci' and not config: command += ['--virtio-transport', 'pci']
     write_json(work / 'command.json', {'command': command, 'rlimit_fsize': limit})
     def limited():
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)    # inherited across exec: the write fails with EFBIG instead
@@ -1124,20 +1186,29 @@ def run_case(args, case):
     result = {'case': case, 'launches': []}
     try:
         image = (volume or work) / ('disk.qcow2' if qcow else 'disk.raw'); scratch = work / 'view.raw'
-        if volume: sparse_copy(args.prepared / IMAGE[base], image)
+        overlay = work / 'base.raw' if case == 'overlay' else None    # the overlay's base; natemu creates the overlay
+        if overlay: checked(['cp', '-c', args.prepared / IMAGE[base], overlay], work / 'clone.log'); base_sha = digest(overlay)
+        elif volume: sparse_copy(args.prepared / IMAGE[base], image)
         elif qcow: qcow2_convert(args.prepared / IMAGE[base], image, 'qcow2', 'preallocation=metadata')
         else: checked(['cp', '-c', args.prepared / IMAGE[base], image], work / 'clone.log')
         total = os.path.getsize(args.prepared / IMAGE[base]) // SECTOR
-        with raw_of(image, qcow, scratch) as raw: table = table_bytes(raw, total)
-        start_clusters = qcow2_problems(image)[1].get('allocated-clusters') if qcow else None
+        with raw_of(overlay or image, qcow and not overlay, scratch) as raw: table = table_bytes(raw, total)
+        start_clusters = qcow2_problems(image)[1].get('allocated-clusters') if qcow and not overlay else None
         expect = expected_values()
         for phase in ('write', 'verify'):
             launch_dir = work / phase; launch_dir.mkdir()
-            with raw_of(image, qcow, scratch) as raw: before = digest(raw)
+            if overlay and not image.exists(): before = base_sha    # the new overlay reads as its base
+            else:
+                with raw_of(image, qcow, scratch) as raw: before = digest(raw)
             limit = LIMIT if case == 'host-limit' and phase == 'write' else 0
-            rc, timeout, seconds = launch(args, base, phase, image, launch_dir, limit)
+            config = overlay_config(launch_dir / 'vm.toml', image, overlay) if overlay else None
+            rc, timeout, seconds = launch(args, base, phase, image, launch_dir, limit, config)
             text = (launch_dir / 'serial.log').read_text(errors='replace').replace('\r', '') if (launch_dir / 'serial.log').exists() else ''
             stderr = (launch_dir / 'stderr.log').read_text(errors='replace')
+            if overlay and not image.exists():
+                errors = ['natemu did not create the overlay']
+                entry = {'phase': phase, 'rc': rc, 'stderr': (launch_dir / 'stderr.log').read_text(errors='replace')[-500:], 'errors': errors}
+                result['launches'].append(entry); print(json.dumps({'case': case, **entry}), flush=True); break
             with raw_of(image, qcow, scratch) as raw:    # the raw bytes: the image itself, or the qcow2's temporary conversion
                 after = digest(raw)
                 host = {'rc': rc, 'timeout': timeout, 'stop': last_stop(stderr),
@@ -1148,17 +1219,21 @@ def run_case(args, case):
                 q = qcow2_host(image, raw, base, phase, start_clusters) if qcow else None
             errors = judge(base, phase, text, host, expect, args.transport == 'pci') + (qcow2_errors(q, base, phase) if qcow else [])
             if qcow: host['qcow2'] = q
+            if overlay: host['overlay'] = o = overlay_host(image, overlay, base_sha); errors += overlay_errors(o)
             entry = {'phase': phase, 'seconds': round(seconds, 1), 'disk_before': before, 'disk_after': after, **host, 'errors': errors}
             if base == 'host-full' and volume and phase == 'write':
                 entry['volume_free_kib'] = shutil.disk_usage(volume).free // 1024
             write_json(launch_dir / 'result.json', entry); result['launches'].append(entry)
             print(json.dumps({'case': case, **entry}), flush=True)
             if errors: break
+        if overlay and len(result['launches']) == 2 and not any(l['errors'] for l in result['launches']):
+            result['refusals'] = overlay_refusals(args, work, image, overlay)
+            if any(r['errors'] for r in result['refusals']): result['launches'][-1]['errors'] += ['a refusal launch failed']
     finally:
         if volume:
             subprocess.run(['hdiutil', 'detach', str(volume)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
             (work / 'volume.sparseimage').unlink(missing_ok=True)
-        for leftover in (work / 'disk.raw', work / 'disk.qcow2', work / 'view.raw'): leftover.unlink(missing_ok=True)
+        for leftover in (work / 'disk.raw', work / 'disk.qcow2', work / 'view.raw', work / 'base.raw', work / 'other.raw', work / 'made.qcow2'): leftover.unlink(missing_ok=True)
     failed = any(l['errors'] for l in result['launches'])
     # A control passes when the judge rejects it.
     result['pass'] = failed if case in CONTROLS else not failed and len(result['launches']) == 2
@@ -1379,6 +1454,18 @@ def self_check():
             bad += [dict(good, trim=None), dict(good, trim=dict(good['trim'], discard_data=QCOW_CLUSTER)), dict(good, trim=dict(good['trim'], pattern_data=13 * QCOW_CLUSTER)),
                     dict(good, trim=dict(good['trim'], pattern_data=0)), dict(good, allocated_clusters=1024)]
         for b in bad: assert qcow2_errors(b, base, phase), (base, phase, b); controls += 1
+    # overlay: the host judge rejects a changed base, another backing file or format; the refusal judge an exit 0, a timeout,
+    # a missing message, a boot, a changed overlay.
+    good = {'base_unchanged': True, 'backing': '/x/base.raw', 'backing_format': 'raw', 'want_backing': '/x/base.raw'}
+    assert not overlay_errors(good)
+    for b in (dict(good, base_unchanged=False), dict(good, backing='/x/other.raw'), dict(good, backing=None), dict(good, backing_format='qcow2')):
+        assert overlay_errors(b), b; controls += 1
+    good = {'rc': 1, 'timeout': False, 'stderr': 'natemu: disk x: x.qcow2 is based on /b; add backing = "/b" to this disk (or --set disk.disk0.backing=/b)\n',
+            'messages': ['add backing = "/b"', '--set disk.disk0.backing=/b'], 'booted': False, 'unchanged': True}
+    assert not refusal_errors(good), refusal_errors(good)
+    for b in (dict(good, rc=0), dict(good, rc=None, timeout=True), dict(good, stderr='natemu: disk lock: held by another process'),
+              dict(good, stderr=good['stderr'].replace('disk0', 'ID')), dict(good, booted=True), dict(good, unchanged=False)):
+        assert refusal_errors(b), b; controls += 1
     assert qcow2_data_bytes.__doc__ and set(QCOW2_CASES.values()) <= set(CASES)
     controls += count[0]
     pci_self_test()
