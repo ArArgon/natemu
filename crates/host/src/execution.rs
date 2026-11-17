@@ -2491,7 +2491,7 @@ pub(crate) fn x87_args(cpu: &exec::Cpu, supported: u64) -> Vec<String> {
     if cpu.cr0 & (exec::CR0_TS | exec::CR0_MP) == exec::CR0_TS | exec::CR0_MP {
         args.push("--wait-gated".into());
     }
-    match exec::x87_fpcr(cpu.fcw, cpu.mxcsr, cpu.no_afp != 0, exec::accurate_key(cpu.accurate_fp, cpu.no_afp) != 0) {
+    match exec::x87_fpcr(cpu.fcw, cpu.mxcsr, cpu.no_afp != 0, cpu.accurate_fp) {
         0 => {}
         fpcr => args.extend(["--x87-fpcr".into(), format!("{fpcr:#x}")]),
     }
@@ -3569,6 +3569,10 @@ pub fn run(
     state.cpu.no_afp = u64::from(compiler.supported & 1 << AFP == 0);
     // AFP accurate plan chunk 1: the mode, once, in the same place (`code_context` bit 32 is it AND `no_afp`).
     state.cpu.accurate_fp = u64::from(compiler.accurate_fp);
+    // AFP accurate plan chunk 6, measurement only: `NATEMU_FP_TRAPS` (ufe, ioe, ufe+ioe) turns on fast mode's trap enables (no AFP only).
+    if let Ok(v) = std::env::var("NATEMU_FP_TRAPS") {
+        state.cpu.accurate_fp |= v.split('+').map(|t| match t { "ufe" => exec::FP_FAST_UFE, "ioe" => exec::FP_FAST_IOE, "" => 0, o => panic!("NATEMU_FP_TRAPS {o}: ufe, ioe or ufe+ioe") }).sum::<u64>();
+    }
     area.write_record(exec::STATE_OFFSET, state);
     // Perf chunk 10: reuse inside the resident, checked against the host's answers under the reuse check, and never into
     // a range the hook answers at (off when there are more of them than the resident keeps).
@@ -6365,9 +6369,8 @@ mod tests {
             assert_eq!(exec::fpcr(mxcsr, false), before_no_afp::fpcr(mxcsr), "fpcr {mxcsr:#x}");
             // AFP accurate plan chunk 3: the trap enables are accurate mode without AFP only; with AFP, in either mode, the FPCR a block is
             // entered with is the old one (the `accurate` argument is `accurate_key`, 0 with AFP).
-            for accurate_fp in [0, 1] {
-                let on = exec::accurate_key(accurate_fp, 0) != 0;
-                assert_eq!(exec::fpcr_run(mxcsr, false, on), before_no_afp::fpcr(mxcsr), "fpcr_run {mxcsr:#x}");
+            for accurate_fp in 0..8 {
+                assert_eq!(exec::fpcr_run(mxcsr, false, accurate_fp), before_no_afp::fpcr(mxcsr), "fpcr_run {mxcsr:#x}");
             }
             cpu.mxcsr = mxcsr;
             // AFP fallback chunk 3a: the DAZ and FTZ keys exist only without AFP (the context bits and fexc's `--daz`/`--ftz`);
@@ -6385,7 +6388,7 @@ mod tests {
                     let fcw = (exec::FCW_INIT & !(0x3f | 3 << 10)) | rc << 10 | masks;
                     cpu.fcw = fcw;
                     assert_eq!(
-                        exec::x87_fpcr(fcw, mxcsr, false, false),
+                        exec::x87_fpcr(fcw, mxcsr, false, 0),
                         before_no_afp::x87_fpcr(fcw, mxcsr),
                         "x87_fpcr {fcw:#x} {mxcsr:#x}"
                     );
@@ -6411,7 +6414,7 @@ mod tests {
                         assert_eq!(fast_c.gating(), accurate_c.gating(), "step {step}: gating {fcw:#x} {mxcsr:#x}");
                     }
                     tested += 1;
-                    keyed += u64::from(exec::x87_fpcr(fcw, mxcsr, false, false) != 0);
+                    keyed += u64::from(exec::x87_fpcr(fcw, mxcsr, false, 0) != 0);
                 }
             }
         }
@@ -6429,7 +6432,7 @@ mod tests {
             for fcw in [exec::FCW_INIT, exec::FCW_INIT | 1 << 10, exec::FCW_INIT | 3 << 10, 0x3f | 2 << 10] {
                 (cpu.mxcsr, cpu.fcw) = (mxcsr, fcw);
                 let args = x87_args(&cpu, no_afp);
-                let fpcr = exec::x87_fpcr(fcw, mxcsr, true, false);
+                let fpcr = exec::x87_fpcr(fcw, mxcsr, true, 0);
                 assert_eq!(fpcr & 7, 0, "no AH, NEP or FIZ");
                 assert_eq!(args.iter().any(|a| a == "--x87-fpcr"), fpcr != 0);
                 assert_eq!(cpu.code_context() >> 14 & 1, u64::from(fpcr != 0));

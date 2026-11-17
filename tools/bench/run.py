@@ -39,6 +39,17 @@ def foreign(me):
     return found
 
 
+def fp_traps(stderr):
+    """Summed over vCPUs: traps, steps and `hist` (cause * 8 + class; causes ufe, ioe, other, fma-check; classes add, mul, div, fma,
+    cvt, fcmp, fcvtz, other) as {cause: {class: n}} with only the non-zero cells; None if natemu printed no line (no FP trap counts)."""
+    lines = re.findall(r'natemu-fp-traps vcpu \d+ traps (\d+) steps (\d+) hist \[([\d, ]+)\]', stderr)
+    if not lines: return None
+    hist = [sum(int(l[2].split(',')[i]) for l in lines) for i in range(32)]
+    names = ['ufe', 'ioe', 'other', 'check']; classes = ['add', 'mul', 'div', 'fma', 'cvt', 'fcmp', 'fcvtz', 'other']
+    return dict(traps=sum(int(l[0]) for l in lines), steps=sum(int(l[1]) for l in lines),
+                by={names[c]: {classes[i % 8]: hist[i] for i in range(8 * c, 8 * c + 8) if hist[i]} for c in range(4)})
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     for name in ('--out', '--name', '--emu', '--vcpus', '--bench', '--kernel', '--initrd'): ap.add_argument(name, required=True)
@@ -60,6 +71,7 @@ def main():
     if os.path.exists(serial): os.remove(serial)
     env = dict(os.environ)
     env.pop('NATEMU_PERF_LOG', None)
+    env['NATEMU_FP_TRAP_COUNTS'] = '1'   # natemu prints its trapped-FP counts on stderr at the end (whole boot, both runs)
     if emu == 'natemu':
         if not a.fexc: ap.error('--emu natemu needs --fexc')
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd,
@@ -132,6 +144,7 @@ def main():
                            phases=phase_bounds[0], phases2=phase_bounds[1]),
                total_s=round(total, 3), cpus=re.findall(r'cpus=(\d+)', text)[:1], contended=sorted(others), rc=p.returncode,
                cmd=[str(c) for c in cmd], stderr=pathlib.Path(f'{out}/{name}.stderr').read_text()[-300:])
+    rec['fp_traps'] = fp_traps(pathlib.Path(f'{out}/{name}.stderr').read_text())
     with open(f'{out}/bench.jsonl', 'a') as f: f.write(json.dumps(rec) + '\n')
     print(json.dumps({k: rec[k] for k in ('name', 'verified', 'wall_s', 'wall2_s', 'guest_s', 'guest2_s', 'phases', 'phases2', 'boot_to_start_s', 'total_s', 'contended')}))
     sys.exit(1 if not verified else 3 if others else 0)

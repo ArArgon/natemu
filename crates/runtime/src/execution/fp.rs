@@ -98,6 +98,7 @@ pub(super) unsafe fn trap(f: &NativeFrame, esr: u64, elr: u64, spsr: u64) -> ! {
             // the result register: the compare's source
             fptrap::fma_check(wide, lanes, &q, &mut (*frame).q[(word >> 5 & 31) as usize]);
             cache::control().fp_traps += 1;
+            cache::control().fp_hist[24 + usize::from(d.meta & 7).min(4)] += 1;
             let s = load();
             resume(&s, frame, elr + 4, spsr)
         }
@@ -118,6 +119,15 @@ pub(super) unsafe fn trap(f: &NativeFrame, esr: u64, elr: u64, spsr: u64) -> ! {
         core::ptr::write_volatile(&raw mut (*r).active, 1);
         let c = cache::control();
         c.fp_traps += 1;
+        // chunk 6: by cause (ISS: UFF bit 3, IOF bit 0) and word class
+        let cause = if esr >> 3 & 1 != 0 { 0 } else if esr & 1 != 0 { 1 } else { 2 };
+        let class_no = match class {
+            fptrap::Class::Patch(o) => usize::from(o.kind).min(4),
+            fptrap::Class::Keep if word & 0xff20_fc07 == 0x1e20_2000 => 5,
+            fptrap::Class::Keep if word & 0x7f3e_fc00 == 0x1e38_0000 => 6,
+            fptrap::Class::Keep => 7,
+        };
+        c.fp_hist[8 * cause + class_no] += 1;
         // The re-run: the same registers with the enables off and FPSR clear.
         let resume_frame = &raw mut (*shared()).captured;
         (*resume_frame).fpcr = f.fpcr & !FPTRAPS_MASK;
@@ -144,13 +154,16 @@ pub(super) unsafe fn stepped(elr: u64, spsr: u64) -> ! {
         // denormals and the patch fixes the band's MIN_NORMAL. DAZ + FTZ (accurate mode runs FZ = 0 then, row 4 flushed the inputs): every
         // tiny result traps and the patch flushes it (x86's FTZ result), chunk 5.
         let ftz = ftz_key(s.cpu.mxcsr, true) != 0;
-        let flush = if !ftz { 0 } else if daz_key(s.cpu.mxcsr, true) != 0 { fptrap::FLUSH_ALL } else { 1 };
+        // Fast mode's hardware flush (FZ = 1, the re-run's FPCR) never traps for UFE; an IOE trap there patches NaNs only (UFC kept as run).
+        let fz = (*r).fpcr >> 24 & 1 != 0;
+        let flush = if fz || !ftz { 0 } else if daz_key(s.cpu.mxcsr, true) != 0 { fptrap::FLUSH_ALL } else { 1 };
         let rd = match class {
             fptrap::Class::Patch(op) => usize::from(op.rd),
             fptrap::Class::Keep => 0,
         };
         let nan = (*r).fpcr & natemu_abi::execution::FPCR_IOE != 0;
         let flags = fptrap::patch_flush(class, fptrap::x86_rc((*r).fpcr), &(*r).q, (*frame).fpsr, flush, &mut (*frame).q[rd], nan);
+        let flags = if fz { flags & !natemu_abi::execution::FPSR_UFC | (*r).fpsr & natemu_abi::execution::FPSR_UFC } else { flags };
         (*frame).fpsr = (*r).fpsr | flags;
         (*frame).fpcr = (*r).fpcr;
         core::ptr::write_volatile(&raw mut (*r).active, 0);
