@@ -852,7 +852,15 @@ pub fn to_boot(
     boot.page_currency = cfg.page_currency;
     boot.writable_on_read = cfg.writable_on_read;
     boot.rng = !cfg.rngs.is_empty();
-    boot.disk = cfg.disks.first().map(|d| d.path.clone());
+    boot.disks = cfg
+        .disks
+        .iter()
+        .map(|d| natemu::linux::DiskSpec {
+            id: d.id.clone(),
+            path: d.path.clone(),
+            transport: cfg.transports.disk,
+        })
+        .collect();
     boot.net = !cfg.nics.is_empty();
     boot.net_options = cfg.net_options();
     boot.pool = cfg.pool;

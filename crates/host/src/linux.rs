@@ -59,16 +59,116 @@ impl Transports {
         }
     }
 }
-/// PCI slots of the virtio functions (00:01.0 block, 00:02.0 network, 00:03.0 entropy); the GSIs are the MMIO
-/// resources' (`BLOCK_RESOURCE.gsi` and so on), which the functions keep as their INTx lines.
+/// PCI slots of the first disk, the network device and the entropy device (00:01.0, 00:02.0, 00:03.0); more disks follow.
 const BLOCK_SLOT: u8 = 1;
 const NET_SLOT: u8 = 2;
 const RNG_SLOT: u8 = 3;
 
-/// What the enabled devices and transports give the guest: the memory map and the ACPI tables, with the lists the tables
-/// were built from. Pure (no host state), so a launch can be pinned by a test.
+/// One disk of the guest: the list order is the order the guest names them (`/dev/vda`, `vdb`, ...).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiskSpec {
+    pub id: String,
+    /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
+    pub path: PathBuf,
+    pub transport: Transport,
+}
+
+/// The most disks: each takes an interrupt line, 18 + its index (disk 0 is on 16), and the controller has lines 16-23.
+/// ponytail: PCI is capped the same way until PCI functions can share a line (design step 6).
+const MAX_DISKS: usize = 6;
+
+/// Which devices a launch has and on what transport. The input of [`place`].
+struct Wanted {
+    rng: Option<Transport>,
+    disks: Vec<Transport>,
+    net: Option<Transport>,
+}
+#[cfg(test)]
+impl Wanted {
+    /// The old one-of-each form: `enabled` is [rng, disk, net].
+    fn old(enabled: [bool; 3], t: Transports) -> Self {
+        let [rng, disk, net] = enabled;
+        Self {
+            rng: rng.then_some(t.rng),
+            disks: if disk { vec![t.disk] } else { vec![] },
+            net: net.then_some(t.net),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Rng,
+    Disk(usize),
+    Net,
+}
+/// Where one device lives: both the ACPI tables and the device wiring in `prepare` read this, so they cannot disagree.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    kind: Kind,
+    pci: bool,
+    /// PCI slot (used when `pci`).
+    slot: u8,
+    /// MMIO page, ACPI uid and interrupt line (the line is also the PCI function's INTx line).
+    res: boot::acpi::VirtioMmio,
+}
+
+/// The placement rule (design section 3). First disk, NIC, entropy: PCI slots 1, 2, 3, pages 0xF000_0000/1000/2000, lines
+/// 16/17/18, uids 0/1/2. Disk k >= 1: slot 3 + k, page 0xF000_0000 + (2 + k) * 4 KiB, line 18 + k, uid 2 + k.
+/// Returned in wiring order: entropy, disk 0, network, then disks 1 and up.
+fn place(w: &Wanted) -> Result<Vec<Placed>> {
+    use crate::virtio::{BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE};
+    if w.disks.len() > MAX_DISKS {
+        return Err(if w.disks.iter().all(|&t| t == Transport::Pci) {
+            format!("at most {MAX_DISKS} disks until shared PCI interrupt lines are built")
+        } else {
+            format!("at most {MAX_DISKS} disks on mmio (interrupt lines 16-23); use pci for more")
+        });
+    }
+    let pci = |t: Transport| t == Transport::Pci;
+    let one = |kind, t: Option<Transport>, slot, res| {
+        t.map(|t| Placed {
+            kind,
+            pci: pci(t),
+            slot,
+            res,
+        })
+    };
+    let disk = |k: usize| {
+        let res = if k == 0 {
+            BLOCK_RESOURCE
+        } else {
+            let n = 2 + k as u32;
+            boot::acpi::VirtioMmio {
+                uid: n as u8,
+                base: 0xf000_0000 + n * 4096,
+                gsi: 16 + n,
+            }
+        };
+        let slot = if k == 0 { BLOCK_SLOT } else { 3 + k as u8 };
+        Placed {
+            kind: Kind::Disk(k),
+            pci: pci(w.disks[k]),
+            slot,
+            res,
+        }
+    };
+    let mut out: Vec<_> = one(Kind::Rng, w.rng, RNG_SLOT, RNG_RESOURCE)
+        .into_iter()
+        .collect();
+    out.extend((!w.disks.is_empty()).then(|| disk(0)));
+    out.extend(one(Kind::Net, w.net, NET_SLOT, NET_RESOURCE));
+    out.extend((1..w.disks.len()).map(disk));
+    if let Some(p) = out.iter().find(|p| p.pci && p.slot > 31) {
+        return Err(format!("PCI slots 1-31 are all used (slot {})", p.slot));
+    }
+    Ok(out)
+}
+
+/// What the placed devices give the guest: the memory map and the ACPI tables, with the lists the tables were built
+/// from. Pure (no host state), so a launch can be pinned by a test.
 struct LaunchPlan {
-    /// ACPI lists each enabled device once: virtio-MMIO devices here, PCI functions below as (slot, GSI).
+    /// ACPI lists each device once: virtio-MMIO devices here, PCI functions below as (slot, GSI).
     #[allow(dead_code)] // read by the pinning test
     manifest: Vec<boot::acpi::VirtioMmio>,
     #[allow(dead_code)]
@@ -77,42 +177,30 @@ struct LaunchPlan {
     layout: Layout,
 }
 
-/// The memory map for `ram` bytes; `Err` when it is not a valid one. `enabled` is [rng, disk, net].
-fn launch_layout(enabled: [bool; 3], t: Transports, ram: u64) -> Result<Layout> {
-    let [rng, disk, net] = enabled;
-    let on_pci = |enabled: bool, t: Transport| enabled && t == Transport::Pci;
+/// The memory map for `ram` bytes; `Err` when it is not a valid one.
+fn layout_of(placed: &[Placed], ram: u64) -> Result<Layout> {
     let layout = Layout {
         low_end: ram.min(exec::LOW_RAM_END),
         high: ram.saturating_sub(exec::LOW_RAM_END),
-        pci: on_pci(rng, t.rng) || on_pci(disk, t.disk) || on_pci(net, t.net),
+        pci: placed.iter().any(|p| p.pci),
     };
     layout.e820().map_err(|e| e.to_string())?;
     Ok(layout)
 }
+#[cfg(test)]
+fn launch_layout(enabled: [bool; 3], t: Transports, ram: u64) -> Result<Layout> {
+    layout_of(&place(&Wanted::old(enabled, t))?, ram)
+}
 
 /// The ACPI tables and the lists they are built from (panics on a vCPU count outside 1..=254, as `build_with_devices`).
-fn launch_plan(
-    vcpus: usize,
-    rsdp: u64,
-    enabled: [bool; 3],
-    t: Transports,
-    ram: u64,
-) -> Result<LaunchPlan> {
-    let [rng, disk, net] = enabled;
-    let on_pci = |enabled: bool, t: Transport| enabled && t == Transport::Pci;
-    let (pci_rng, pci_disk, pci_net) =
-        (on_pci(rng, t.rng), on_pci(disk, t.disk), on_pci(net, t.net));
-    let layout = launch_layout(enabled, t, ram)?;
+fn plan_tables(vcpus: usize, rsdp: u64, placed: &[Placed], ram: u64) -> Result<LaunchPlan> {
+    let layout = layout_of(placed, ram)?;
     let (mut manifest, mut functions) = (Vec::new(), Vec::new());
-    for (enabled, pci, resource, slot) in [
-        (rng, pci_rng, crate::virtio::RNG_RESOURCE, RNG_SLOT),
-        (disk, pci_disk, crate::virtio::BLOCK_RESOURCE, BLOCK_SLOT),
-        (net, pci_net, crate::virtio::NET_RESOURCE, NET_SLOT),
-    ] {
-        if pci {
-            functions.push((slot, resource.gsi));
-        } else if enabled {
-            manifest.push(resource);
+    for p in placed {
+        if p.pci {
+            functions.push((p.slot, p.res.gsi));
+        } else {
+            manifest.push(p.res);
         }
     }
     functions.sort_unstable();
@@ -123,6 +211,16 @@ fn launch_plan(
         tables,
         layout,
     })
+}
+#[cfg(test)]
+fn launch_plan(
+    vcpus: usize,
+    rsdp: u64,
+    enabled: [bool; 3],
+    t: Transports,
+    ram: u64,
+) -> Result<LaunchPlan> {
+    plan_tables(vcpus, rsdp, &place(&Wanted::old(enabled, t))?, ram)
 }
 
 /// What to boot and how.
@@ -173,8 +271,8 @@ pub struct Boot {
     pub accurate_fp: bool,
     /// Expose the modern virtio entropy device (native entropy, copied completions).
     pub rng: bool,
-    /// Owned writable raw disk; excludes other writers/truncators for this VM's lifetime.
-    pub disk: Option<PathBuf>,
+    /// The disks, in the order the guest sees them (each with its own transport; `transports.disk` is not read here).
+    pub disks: Vec<DiskSpec>,
     /// Expose the virtio network device on user-mode NAT ([`crate::virtio::Slirp`]).
     pub net: bool,
     /// Static localhost forwards and explicit host-loopback access; requires `net`.
@@ -214,7 +312,7 @@ impl Boot {
             speculation_barriers: false,
             accurate_fp: false,
             rng: false,
-            disk: None,
+            disks: Vec::new(),
             net: false,
             net_options: crate::virtio::SlirpOptions::default(),
             pool: true,
@@ -232,17 +330,16 @@ impl Boot {
         // (default off needs nothing).
         if self.speculation_barriers && !crate::probe::sb()? {
             return Err(
-                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)"
-                    .into(),
+                "--speculation-barriers: this host lacks FEAT_SB (ID_AA64ISAR1_EL1.SB)".into(),
             );
         }
         let t = self.transports;
-        let on_pci = |enabled: bool, t: Transport| enabled && t == Transport::Pci;
-        let pci_rng = on_pci(self.rng, t.rng);
-        let pci_disk = on_pci(self.disk.is_some(), t.disk);
-        let pci_net = on_pci(self.net, t.net);
-        let enabled = [self.rng, self.disk.is_some(), self.net];
-        launch_layout(enabled, t, self.ram)?; // before require_vcpus and before allocating the RAM
+        let placed = place(&Wanted {
+            rng: self.rng.then_some(t.rng),
+            disks: self.disks.iter().map(|d| d.transport).collect(),
+            net: self.net.then_some(t.net),
+        })?;
+        layout_of(&placed, self.ram)?; // before require_vcpus and before allocating the RAM
         require_vcpus(self.vcpus)?;
         let backing = execution::prepare_with_pool(
             &self.runtime.to_string_lossy(),
@@ -251,7 +348,7 @@ impl Boot {
             self.ram as usize,
             self.pool,
         )?;
-        let plan = launch_plan(self.vcpus, self.rsdp, enabled, t, self.ram)?;
+        let plan = plan_tables(self.vcpus, self.rsdp, &placed, self.ram)?;
         let (layout, tables) = (plan.layout, plan.tables);
         let inputs = Inputs {
             image: &self.kernel,
@@ -291,45 +388,37 @@ impl Boot {
         let board = clock::install(&mut devices, &irqs, lost, &uart)?;
         let mut virtio = Vec::new();
         let mut bus = crate::pci::Bus::new();
-        if self.rng {
-            let resource = crate::virtio::RNG_RESOURCE;
-            let rng = crate::virtio::Virtio::rng(irqs.clone(), resource.gsi as usize);
-            if pci_rng {
-                bus.add(RNG_SLOT, rng.pci(RNG_SLOT))?;
-            } else {
-                devices.register(resource.base.into(), 4096, rng.device())?;
-            }
-            virtio.push(rng);
-        }
-        if let Some(path) = &self.disk {
-            let resource = crate::virtio::BLOCK_RESOURCE;
-            let disk = crate::virtio::Virtio::block(irqs.clone(), resource.gsi as usize, path)?;
-            if pci_disk {
-                // One request queue per vCPU: the guest then takes each completion on the vCPU that sent the request.
-                disk.block_queues(disk_queues(self.vcpus))?;
-                bus.add(BLOCK_SLOT, disk.pci(BLOCK_SLOT))?;
-            } else {
-                devices.register(resource.base.into(), 4096, disk.device())?;
-            }
-            virtio.push(disk);
-        }
         let mut net = None;
-        if self.net {
-            let resource = crate::virtio::NET_RESOURCE;
-            let mac = crate::virtio::Slirp::MAC;
-            let (device, port) = crate::virtio::Virtio::network(
-                irqs.clone(),
-                resource.gsi as usize,
-                mac,
-                crate::virtio::Slirp::OFFLOADS,
-            )?;
-            net = Some(crate::virtio::Slirp::new(port, &self.net_options)?);
-            if pci_net {
-                bus.add(NET_SLOT, device.pci(NET_SLOT))?;
+        for p in &placed {
+            let gsi = p.res.gsi as usize;
+            let v = match p.kind {
+                Kind::Rng => crate::virtio::Virtio::rng(irqs.clone(), gsi),
+                Kind::Disk(k) => {
+                    let disk =
+                        crate::virtio::Virtio::block(irqs.clone(), gsi, &self.disks[k].path)?;
+                    if p.pci {
+                        // One request queue per vCPU: the guest then takes each completion on the vCPU that sent the request.
+                        disk.block_queues(disk_queues(self.vcpus))?;
+                    }
+                    disk
+                }
+                Kind::Net => {
+                    let (v, port) = crate::virtio::Virtio::network(
+                        irqs.clone(),
+                        gsi,
+                        crate::virtio::Slirp::MAC,
+                        crate::virtio::Slirp::OFFLOADS,
+                    )?;
+                    net = Some(crate::virtio::Slirp::new(port, &self.net_options)?);
+                    v
+                }
+            };
+            if p.pci {
+                bus.add(p.slot, v.pci(p.slot))?;
             } else {
-                devices.register(resource.base.into(), 4096, device.device())?;
+                devices.register(p.res.base.into(), 4096, v.device())?;
             }
-            virtio.push(device);
+            virtio.push(v);
         }
         if layout.pci {
             bus.install(&mut devices)?;
@@ -352,7 +441,11 @@ impl Boot {
                 speculation_barriers: self.speculation_barriers,
                 accurate_fp: self.accurate_fp,
                 pool: self.pool,
-                compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
+                compile_cache: self
+                    .compile_cache
+                    .dir
+                    .clone()
+                    .map(|d| (d, self.compile_cache.cap)),
             },
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
