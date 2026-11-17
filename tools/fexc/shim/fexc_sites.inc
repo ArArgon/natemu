@@ -253,6 +253,53 @@ DEF_OP(FexcSimdDe) {
 // A zero (or denormal) lane falls into the exact test, so the flag stays exact. Writes VTMP1, VTMP2 and TMP1; no NZCV.
 static ARMEmitter::ForwardLabel FexcSpanEnd;
 static bool FexcSpanOpen = false;
+// The screen's constants, once per compiled unit instead of once per screen (`mov; dup` each). A dynamic vector register that no node of
+// the unit holds is free for the whole unit (v2..v15; the guest's xmm registers are static v16..v31), so the constants stay in free
+// registers, written after each entry prologue (FexcHoistEmit). Only when nothing in the unit can clobber them: no call (syscall, thunk,
+// cpuid, an interpreter fallback, the resident's x87 service) and no spill slot. Per element size (0: 32-bit, 1: 64-bit) E = the
+// exponent mask; M = the mantissa mask, and S one scratch register, for the zero tier: a lane with a zero exponent field is a denormal
+// only when its mantissa is nonzero, so the exact test is skipped too when no lane of any source is one (zero lanes are exact).
+// Without the registers (or in a unit with no FexcSimdSkip: fast mode, AFP, DAZ) the code is the unhoisted one, word for word.
+static struct {
+  bool HasE[2] {}, HasM[2] {}, HasS {};
+  uint8_t E[2] {}, M[2] {}, S {};   // indices into GeneralFPRegisters
+} FexcHoist;
+void Arm64JITCore::FexcHoistPlan() {
+  FexcHoist = {};
+  if (SpillSlots) return;
+  uint32_t Used = 0, Count[2] = {};
+  for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
+    for (auto [Node, IROp] : IR->GetCode(BlockNode)) {
+      switch (IROp->Op) {
+      case IR::OP_FEXCSIMDSKIP: ++Count[IROp->C<IR::IROp_FexcSimdSkip>()->Mode >> 9 & 1]; continue;
+      case IR::OP_SYSCALL: case IR::OP_THUNK: case IR::OP_CPUID: case IR::OP_XGETBV: case IR::OP_PROCESSORID: case IR::OP_RDRAND:
+      case IR::OP_CALLBACKRETURN: case IR::OP_PRINT: case IR::OP_PRINTMSG: case IR::OP_MONOBACKPATCHERWRITE:
+      case IR::OP_THREADREMOVECODEENTRY: case IR::OP_FEXCX87SVC: return;
+      default: break;
+      }
+      FallbackInfo Info;
+      if (InterpreterOps::GetFallbackHandler(IROp, &Info)) return;   // a call (conservative: also ops the JIT has its own code for)
+      if (GetHasDest(IROp->Op) && GetRegClass(Node) == IR::RegClass::FPR) Used |= 1u << IR::PhysicalRegister(Node).Reg;
+    }
+  }
+  uint32_t Free = 0;
+  for (size_t i = 0; i < GeneralFPRegisters.size(); ++i) Free |= uint32_t(!(Used >> i & 1)) << i;
+  const auto Take = [&](uint8_t& R) { if (!Free) return false; R = uint8_t(__builtin_ctz(Free)); Free &= Free - 1; return true; };
+  for (int s = 0; s < 2; ++s) FexcHoist.HasE[s] = Count[s] && Take(FexcHoist.E[s]);
+  FexcHoist.HasS = Take(FexcHoist.S);
+  for (int s = 0; s < 2; ++s) FexcHoist.HasM[s] = FexcHoist.HasS && FexcHoist.HasE[s] && Take(FexcHoist.M[s]);
+}
+void Arm64JITCore::FexcHoistEmit() {
+  for (int s = 0; s < 2; ++s) {
+    if (!FexcHoist.HasE[s]) continue;
+    const auto Sz = s ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, s ? 0x7ff0'0000'0000'0000ULL : 0x7f80'0000ULL);
+    dup(Sz, GeneralFPRegisters[FexcHoist.E[s]].Q(), TMP1);
+    if (!FexcHoist.HasM[s]) continue;
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, s ? 0x000f'ffff'ffff'ffffULL : 0x007f'ffffULL);
+    dup(Sz, GeneralFPRegisters[FexcHoist.M[s]].Q(), TMP1);
+  }
+}
 DEF_OP(FexcSimdSkip) {
   FexcSpanOpen = false;
   if (SpillSlots) return;   // a fill inside the span would be skipped with it: the exact test always runs
@@ -261,25 +308,45 @@ DEF_OP(FexcSimdSkip) {
   const bool Scalar = Op->Mode >> 8 & 1, Dbl = Op->Mode >> 9 & 1;
   const auto Sz = Dbl ? ARMEmitter::SubRegSize::i64Bit : ARMEmitter::SubRegSize::i32Bit;
   const IR::OrderedNodeWrapper Src[3] = {Op->A, Op->B, Op->C};
+  const bool Hoisted = FexcHoist.HasE[Dbl], Tier2 = FexcHoist.HasM[Dbl];
   // Two vector temporaries only (an extra register spilled FMADDSUB ymm): VTMP1 holds the mask, VTMP2 the lanes. The last source's
-  // cmtst overwrites the mask; a third source needs it again (TMP1 still holds it, one `dup`).
-  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Dbl ? 0x7ff0'0000'0000'0000ULL : 0x7f80'0000ULL);
-  dup(Sz, VTMP1.Q(), TMP1);
-  cmtst(Sz, VTMP2.Q(), GetVReg(Src[0]).Q(), VTMP1.Q());
-  for (uint32_t i = 1; i < N; ++i) {
-    cmtst(Sz, VTMP1.Q(), GetVReg(Src[i]).Q(), VTMP1.Q());
-    and_(VTMP2.Q(), VTMP2.Q(), VTMP1.Q());
-    if (i + 1 < N) dup(Sz, VTMP1.Q(), TMP1);
+  // cmtst overwrites the mask; a third source needs it again (TMP1 still holds it, one `dup`). Hoisted: the mask is E, never written.
+  const auto E = Hoisted ? GeneralFPRegisters[FexcHoist.E[Dbl]] : VTMP1;
+  if (!Hoisted) {
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Dbl ? 0x7ff0'0000'0000'0000ULL : 0x7f80'0000ULL);
+    dup(Sz, VTMP1.Q(), TMP1);
   }
-  auto Lanes = VTMP2;
-  if (!Scalar) {
-    uminv(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), VTMP2.Q());
-    Lanes = VTMP1;
-  }
-  fmov(ARMEmitter::Size::i32Bit, TMP1, Lanes.S());
-  add(ARMEmitter::Size::i32Bit, TMP1, TMP1, 1);
+  const auto Reduce = [&] {   // all lanes (lane 0 of a scalar op) set: `add #1` = 0, then skip the exact test
+    auto Lanes = VTMP2;
+    if (!Scalar) {
+      uminv(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), VTMP2.Q());
+      Lanes = VTMP1;
+    }
+    fmov(ARMEmitter::Size::i32Bit, TMP1, Lanes.S());
+    add(ARMEmitter::Size::i32Bit, TMP1, TMP1, 1);
+    (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &FexcSpanEnd);
+  };
   FexcSpanEnd = {};
-  (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &FexcSpanEnd);
+  cmtst(Sz, VTMP2.Q(), GetVReg(Src[0]).Q(), E.Q());
+  for (uint32_t i = 1; i < N; ++i) {
+    cmtst(Sz, VTMP1.Q(), GetVReg(Src[i]).Q(), E.Q());
+    and_(VTMP2.Q(), VTMP2.Q(), VTMP1.Q());
+    if (!Hoisted && i + 1 < N) dup(Sz, VTMP1.Q(), TMP1);
+  }
+  Reduce();
+  if (Tier2) {   // zero tier: a lane is good when its exponent field is nonzero (E) or its mantissa is zero (not M): orn
+    const auto M = GeneralFPRegisters[FexcHoist.M[Dbl]], S = GeneralFPRegisters[FexcHoist.S];
+    cmtst(Sz, VTMP2.Q(), GetVReg(Src[0]).Q(), E.Q());
+    cmtst(Sz, VTMP1.Q(), GetVReg(Src[0]).Q(), M.Q());
+    orn(VTMP2.Q(), VTMP2.Q(), VTMP1.Q());
+    for (uint32_t i = 1; i < N; ++i) {
+      cmtst(Sz, VTMP1.Q(), GetVReg(Src[i]).Q(), E.Q());
+      cmtst(Sz, S.Q(), GetVReg(Src[i]).Q(), M.Q());
+      orn(VTMP1.Q(), VTMP1.Q(), S.Q());
+      and_(VTMP2.Q(), VTMP2.Q(), VTMP1.Q());
+    }
+    Reduce();
+  }
   FexcSpanOpen = true;
 }
 DEF_OP(FexcSimdSkipEnd) {
