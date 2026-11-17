@@ -27,6 +27,8 @@ CLASSES = {
                      'a case with MXCSR.UE set where x86 sets none (no tagged case yet)'),
     'daz-ftz-band': ('C', 'with DAZ and FTZ both set, a result just below the smallest normal number that rounds up to it is 0 instead of the smallest normal',
                      'the zero result (no tagged case yet)'),
+    'ftz-band': ('C', 'with FTZ set and DAZ clear, a result whose exact value lies just below the smallest normal number, which x86 flushes to 0 (tiny after rounding to the destination precision) but Arm\'s denormal rounding carries up to the smallest normal, is the smallest normal instead of 0 (the flags are right)',
+                 'the smallest-normal result (no tagged case yet)'),
 }
 
 

@@ -1028,7 +1028,7 @@ memory accesses and unknown opcodes.
 - On an M1 or M2 (no FEAT_AFP; emulated on an M4 with `NATEMU_FEXC_FEATURE_OFF=afp`), the default fast mode makes the cheap
   cases exact (AFP fallback plan rows 2-10, known-zero upper bits, unmasked UE tininess, x87 masked DE for m32/m64, x87 NaN
   results). What it leaves different from x86 is the registry `tools/fp_deviations.py` `CLASSES` (masked SSE DE, NaN results,
-  the masked FMA inf×0+QNaN IE flag, the masked UE flag in the MIN_NORMAL band, the DAZ+FTZ band result); the README lists the
+  the masked FMA inf×0+QNaN IE flag, the masked UE flag in the MIN_NORMAL band, the DAZ+FTZ band result, the FTZ-alone band result); the README lists the
   same names. Accurate mode (planned, `docs/restructure/afp-accurate-plan.md`) removes them.
 - On a host with AFP the generated code for the default mode is unchanged by any of this (byte-identical replay of both
   recorded streams), and every FP runner and corpus is judged exactly.

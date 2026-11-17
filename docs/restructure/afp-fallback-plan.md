@@ -182,7 +182,7 @@ deviation from the SDM on hosts without AFP. The M4 is unaffected either way.
   - masked: the UE flag is wrongly set;
   - unmasked: a spurious #XM;
   - under DAZ + FTZ together (gcc `-Ofast`), which runs on the hardware flush (FZ = 1), the result itself is wrong:
-    0 instead of ±MIN_NORMAL (chunk 3a review). FTZ alone flushes in software and gets the result right.
+    0 instead of ±MIN_NORMAL (chunk 3a review). FTZ alone flushes in software, but only results whose exponent field is zero: a result that x86 flushes (tiny after rounding) while Arm's denormal rounding carries it up to ±MIN_NORMAL stays ±MIN_NORMAL (found by the accurate chunk 3 review, Nov 16; registered as `ftz-band`; the flags are right).
 - **Exact:** needs exact recomputation in a resident slow path, a small SSE emulator, which natemu doesn't have.
 - **Recommendation:** accept both as declared deviations. They need a result within half an ulp below MIN_NORMAL.
 
