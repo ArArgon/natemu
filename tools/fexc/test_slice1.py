@@ -1586,6 +1586,7 @@ class AfpDazScreen(unittest.TestCase):
             if e == 2: e = 4
             for extra in (['--daz'], ['--accurate', '--daz'], ['--accurate', '--daz', '--ftz']):
                 if name.startswith('vcvtph2ps'): continue   # (no FP source: no flush)
+                if extra[-1] == '--ftz' and 'dpp' in name: continue   # (chunk 6b: a product feeds the adds unflushed there, as the handler flushes it: AfpDazFree and the VM judge those)
                 for t in range(trials):
                     xmm, hi, mem = gen.make(rnd, e, (0, 1, 2, 2)[t % 4])
                     a = self.run_one(FEXC_BASE, form, extra, xmm, hi, mem)
@@ -1600,6 +1601,76 @@ class AfpDazScreen(unittest.TestCase):
             for extra in ([], ['--accurate'], ['--ftz'], ['--accurate', '--ftz'], ['--daz', '--ftz'], ['--simd-unmasked', '0x2'], ['--accurate', '--simd-unmasked', '0x3f'],
                           ['--simd-unmasked', '0x20', '--ftz']):
                 self.assertEqual(self.words(FEXC, form, extra), self.words(FEXC_BASE, form, extra), (name, extra))
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class AfpDazFree(unittest.TestCase):
+    """AFP accurate plan, chunk 6b, the last lever: under accurate DAZ + FTZ (FZ = 0 with UFE) every tiny result traps and the resident flushes
+    it, so a source that is the result of an add, subtract, multiply, divide, square root, pairwise add or FMA earlier in the block (also through
+    the guest register) has no denormal and its DAZ input flush is not placed. The native oracle runs without the handler, so this pins the
+    producers exactly: which ones free a source (same element size; a scalar result only for a scalar use) and which never do (moves, logic,
+    shuffles, loads, conversions, MIN/MAX, the estimates, an integer or a block-entry value), and that no other key does it."""
+    AFP0 = ['--feature', 'afp=0']
+
+    def screens(self, hexs, *extra):
+        d, rc = run(hexs, RIP, *self.AFP0, *extra)
+        self.assertEqual(rc, 0, (hexs, extra))
+        lay = d['code']['layout']
+        code = bytes.fromhex(d['code']['hex'])
+        lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal']
+        with tempfile.TemporaryDirectory() as t:
+            dis = check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+        self.assertEqual(lay['spill_bytes'], 0, (hexs, extra))
+        mn = [re.split(r'[. ]', x.strip())[0] for o, x in sorted(dis.items()) if o >= lay['code_region_begin']]
+        return mn.count('cbnz') + mn.count('uminv')
+
+    ACC = ['--accurate', '--daz', '--ftz']
+    # producer (writes xmm0), then the consumer reading xmm0 and xmm1: x86 hex
+    ADDSD, ADDPD, ADDSS, ADDPS = 'f20f58c1', '660f58c1', 'f30f58c1', '0f58c1'
+
+    def freed(self, prod, cons, extra=ACC):   # (the default is a list: not mutated)
+        """How many flushes the producer saves of the consumer's: the screens of both alone minus the screens of the pair."""
+        return self.screens(prod, *extra) + self.screens(cons, *extra) - self.screens(prod + cons, *extra)
+
+    def test_the_flushing_producers_free_their_result(self):
+        cases = {   # producer: (consumer, saved)
+            'mulsd': ('f20f59c2', self.ADDSD, 1), 'subsd': ('f20f5cc2', self.ADDSD, 1), 'divsd': ('f20f5ec2', self.ADDSD, 1),
+            'addsd': (self.ADDSD, self.ADDSD, 1), 'sqrtsd': ('f20f51c2', self.ADDSD, 1), 'mulss': ('f30f59c2', self.ADDSS, 1),
+            'mulpd': ('660f59c2', self.ADDPD, 1), 'subps': ('0f5cc2', self.ADDPS, 1), 'sqrtpd': ('660f51c2', self.ADDPD, 1),
+            'divps': ('0f5ec2', self.ADDPS, 1), 'haddps': ('f20f7cc2', self.ADDPS, 1),
+            'mulpd -> scalar use (element 0 of a full result)': ('660f59c2', self.ADDSD, 1),
+            'vfmadd231sd': ('c4e2e9b9c2', self.ADDSD, 1), 'vfmadd231pd': ('c4e2e9b8c2', self.ADDPD, 1), 'vfmadd231ps': ('c4e269b8c2', self.ADDPS, 1),
+        }
+        for name, (prod, cons, saved) in cases.items():
+            self.assertEqual(self.freed(prod, cons), saved, name)
+            for extra in (['--daz'], ['--accurate', '--daz'], ['--daz', '--ftz']):   # no other key frees a source
+                self.assertEqual(self.freed(prod, cons, extra), 0, (name, extra))
+
+    def test_everything_else_leaves_the_flush(self):
+        cases = {
+            'movaps': ('0f28c2', self.ADDPS), 'andps': ('0f54c2', self.ADDPS), 'andpd (scalar use)': ('660f54c2', self.ADDSD),
+            'minsd': ('f20f5dc2', self.ADDSD), 'maxps': ('0f5fc2', self.ADDPS), 'rcpss': ('f30f53c2', self.ADDSS), 'rsqrtps': ('0f52c2', self.ADDPS),
+            'cvtsi2sd': ('f2480f2ac0', self.ADDSD), 'cvtss2sd': ('f30f5ac2', self.ADDSD), 'cvtsd2ss': ('f20f5ac2', self.ADDSS),
+            'cvtps2pd': ('0f5ac2', self.ADDPD), 'cvtdq2ps': ('0f5bc2', self.ADDPS), 'pshufd': ('660f70c200', self.ADDPD),
+            'movsd xmm0, xmm2': ('f20f10c2', self.ADDSD), 'movsd xmm0, [rax]': ('f20f1000', self.ADDSD), 'movups xmm0, [rax]': ('0f1000', self.ADDPS),
+            'unpcklpd': ('660f14c2', self.ADDPD), 'pxor': ('660fefc2', self.ADDPD), 'movq xmm0, rax': ('66480f6ec0', self.ADDSD),
+            'vcvtps2ph': ('c4e3791dc000', self.ADDPS),
+            # a producer that does not own what the consumer reads
+            'mulss -> addsd (other element size)': ('f30f59c2', self.ADDSD), 'mulsd -> addpd (the upper element)': ('f20f59c2', self.ADDPD),
+            'mulps -> addpd': ('0f59c2', self.ADDPD), 'mulpd -> addps': ('660f59c2', self.ADDPS),
+        }
+        for name, (prod, cons) in cases.items():
+            self.assertEqual(self.freed(prod, cons), 0, name)
+
+    def test_the_value_must_come_from_this_block_and_survive(self):
+        mul = 'f20f59c2'
+        # a value that enters the block: the consumer alone; a producer whose result was overwritten by a move from xmm3 before the use
+        self.assertEqual(self.freed(mul + 'f20f10c3', self.ADDSD), 0)         # movsd xmm0, xmm3 (the product is gone)
+        self.assertEqual(self.freed(mul + '660fefc0', self.ADDSD), 0)         # pxor xmm0, xmm0
+        self.assertEqual(self.freed(mul + 'f20f1100', self.ADDSD), 1)         # movsd [rax], xmm0: a store, xmm0 still the product
+        self.assertEqual(self.freed(mul + '0f28d0', self.ADDSD), 1)           # movaps xmm2, xmm0: a copy of it elsewhere changes nothing
+        # the sign-mask and negating multiplies are not producers (the handler never flushes them): ADDSUB's result is its fadd's
+        self.assertEqual(self.freed('660fd0c2', self.ADDPD), 1)
 
 
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
