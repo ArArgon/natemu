@@ -281,19 +281,30 @@ fn chain(
             backing.display()
         ));
     }
-    let format = match named.format {
-        Some(format) => format,
-        None => match detect(&head, &tail) {
-            Some(Format::Qcow2) => ImageType::Qcow2,
-            None => ImageType::Raw,
-            Some(Format::Refused(kind)) => {
-                return Err(format!(
-                    "disk {}: the backing file looks like a {kind} image; natemu reads raw and qcow2",
-                    backing.display()
-                ));
-            }
-        },
+    // The configured base is parsed as what it is: the overlay's backing-format extension (if any) must agree
+    // with detection, so a downloaded overlay cannot have a raw base parsed as qcow2 or the reverse.
+    let format = match detect(&head, &tail) {
+        Some(Format::Qcow2) => ImageType::Qcow2,
+        None => ImageType::Raw,
+        Some(Format::Refused(kind)) => {
+            return Err(format!(
+                "disk {}: the backing file looks like a {kind} image; natemu reads raw and qcow2",
+                backing.display()
+            ));
+        }
     };
+    if let Some(said) = named.format
+        && said != format
+    {
+        return Err(format!(
+            "disk {}: {name} says its base {} is {said} but it looks like {format}; fix with \
+             qemu-img rebase -u -F {format} -b {} {}",
+            path.display(),
+            backing.display(),
+            backing.display(),
+            path.display()
+        ));
+    }
     if seen.contains(&id) {
         return Err(format!(
             "disk {}: the image is its own backing file",
