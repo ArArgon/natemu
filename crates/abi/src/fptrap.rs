@@ -9,8 +9,9 @@
 //!
 //! A word is either [`Class::Keep`] (the re-run's flags are what the hardware gives without traps, which is right) or [`Class::Patch`]
 //! (a multiply, divide, fused multiply-add or narrowing convert: UFC is recomputed). A word in neither class is unknown: the resident
-//! halts with a named stop rather than patch it wrongly. (`fcvt h, d` is unclassified on purpose: no x86 instruction produces it.) UFE traps every result tiny before rounding, exact ones too, so the Keep class
-//! holds the adds and subtracts, which never raise UFC (a tiny sum is exact).
+//! halts with a named stop rather than patch it wrongly. (`fcvt h, d` is unclassified on purpose: no x86 instruction produces it.) UFE traps every result tiny before rounding, exact ones too, so adds, subtracts and
+//! pairwise adds are patched too (kind 0: no UFC from the model, but NaN lanes and, under DAZ + FTZ, the flush of a denormal sum). The Keep class
+//! holds FCADD (never emitted in accurate mode: a test pins that; its exact tiny lanes would trap unflushed), min/max, compares and the like.
 use crate::tiny;
 
 /// FPSR.UFC.
@@ -827,9 +828,8 @@ mod native {
                 for k in 0..lanes {
                     let (a, b) = (get(&out, re, k), get(&afp_out, re, k));
                     assert_eq!(a, b, "{name} rmode {rmode} word {word:#x} lane {k}\nq {orig:x?}");
-                    let (sign, mag) = (1u64 << (8 * re - 1), a & !(1u64 << (8 * re - 1)));
-                    let _ = sign;
-                    flushed += u32::from(mag == 0 && get(&q[0], e, 0) != u64::MAX);
+                    let mag = a & !(1u64 << (8 * re - 1));
+                    flushed += u32::from(mag == 0);
                     band_kept += u32::from(mag == min);
                 }
                 band_flushed += u32::from(rerun & UFC != 0 && got & UFC == 0);
