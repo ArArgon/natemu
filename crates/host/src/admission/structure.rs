@@ -2018,6 +2018,30 @@ impl<'a> Verifier<'a> {
     }
 }
 
+/// Whether the floating-point or SIMD word `x` reads v1 (AFP accurate plan chunk 4: the FMA check's stale destination): as Rn, as Rm (the
+/// three-register classes and the by-element, scalar and permute forms), as a scalar FMA's Rm or addend, as the destination of an accumulating
+/// form (fmla, fmls, mla, mls, bsl, bit, bif, ins), or as the data of a SIMD store.
+fn reads_v1(x: u32) -> bool {
+    let (rd, rn, rm, ra) = (x & 31, x >> 5 & 31, x >> 16 & 31, x >> 10 & 31);
+    if x >> 26 & 1 == 1 && x >> 25 & 5 == 4 {
+        return x >> 22 & 1 == 0 && rd == 1; // a store of q1 (a load writes it)
+    }
+    let three_same = x & 0x9f20_0400 == 0x0e20_0400;
+    let opcode = x >> 11 & 31;
+    let scalar_fma = x & 0xff00_0000 == 0x1f00_0000;
+    let accumulates = three_same && (x >> 29 & 1 == 0 && matches!(opcode, 0x19 | 0x12) || x >> 29 & 1 == 1 && opcode == 0x03 && x >> 22 & 3 != 0)
+        || x & 0x9f00_0400 == 0x0f00_0000 && matches!(x >> 12 & 15, 1 | 5) // fmla, fmls by element
+        || x & 0xffe0_8400 == 0x6e00_0400 || x & 0xffe0_fc00 == 0x4e00_1c00; // ins (element, general)
+    let rm_read = three_same
+        || x & 0xff20_0c00 == 0x1e20_0800 // scalar two sources
+        || scalar_fma
+        || x & 0x9f00_0400 == 0x0f00_0000 // by element
+        || x & 0xbf20_0c00 == 0x0e00_0800 // zip, uzp, trn
+        || x & 0xbf20_8400 == 0x2e00_0000 // ext
+        || x & 0xdf20_0400 == 0x5e20_0400; // scalar three-same
+    rn == 1 || rm_read && rm == 1 || accumulates && rd == 1 || scalar_fma && ra == 1
+}
+
 /// `ldrb|ldr wT, [x28, #at]` (unsigned offset).
 const fn ldr_state(size: u32, t: u32, at: u32) -> u32 {
     (if size == 1 { 0x3940_0000 } else { 0xb940_0000 }) | (at / size) << 10 | 28 << 5 | t
@@ -2030,9 +2054,10 @@ const ORR_W0_W0_W1: u32 = 0x2a01_0000;
 const AND_W0_W0_W1: u32 = 0x0a01_0000;
 impl Verifier<'_> {
     /// AFP accurate plan chunk 4 (R4-2): each FMA NaN check site is the word `fcmge vT, vR, #0` (T = 1, JIT's VTMP2; vector .4s/.2d or
-    /// scalar s/d, as the descriptor says; R no temporary), in the instruction the site names, and its destination is never read: the handler skips the word, so v1 is stale after it, and the first
-    /// word after it that names v1 as the first source (Rn) of a floating-point or SIMD word, without having written it first (up to the next branch),
-    /// would read it; the other fields are the JIT's convention (its temporaries are written before they are read).
+    /// scalar s/d, as the descriptor says; R no temporary), in the instruction the site names, and its destination is never read: the handler
+    /// skips the word, so v1 is stale after it. The words after it (up to the next branch) are scanned: a word that reads v1 before one writes it
+    /// is refused ([`reads_v1`]: Rn, Rm and a scalar FMA's addend of the floating-point and SIMD classes, the destination of the
+    /// accumulating forms (fmla, fmls, mla, mls, bsl, bit, bif, ins), and a store of q1).
     fn fma_checks(&mut self) -> Result<(), String> {
         for s in self.c.fma {
             let at = s.native_offset;
@@ -2056,10 +2081,10 @@ impl Verifier<'_> {
                 }
                 let x = self.word(k);
                 let fp = x >> 25 & 7 == 7 || x >> 26 & 1 == 1 && x >> 25 & 5 == 4;
-                if fp && x >> 5 & 31 == 1 && x & 31 != 1 {
+                if fp && reads_v1(x) {
                     return fail("its destination v1 is read");
                 }
-                if fp && x & 31 == 1 {
+                if fp && x & 31 == 1 && !(x >> 26 & 1 == 1 && x >> 25 & 5 == 4 && x >> 22 & 1 == 0) {
                     break; // written again: the stale value is gone
                 }
                 k += 4;
@@ -2412,25 +2437,30 @@ mod tests {
         };
         // (opcode of the packed form, has a scalar form, is an add-sub form): the scalar opcode is the packed one + 1
         let families: [(u8, bool); 6] = [(0x98, true), (0x9a, true), (0x9c, true), (0x9e, true), (0x96, false), (0x97, false)];
-        let mut forms = Vec::new();
+        // (hex, two 128-bit halves): register forms also with the destination aliasing each source (vvvv and rm = xmm1), scalar forms also VEX.L1
+        // (ignored) and W1
+        let mut forms: Vec<(String, bool, bool)> = Vec::new();
         for (base, scalar) in families {
             for order in [0x00u8, 0x10, 0x20] {
                 for w in [false, true] {
                     for (ymm, mem) in [(false, false), (false, true), (true, false), (true, true)] {
                         for sc in [false, true] {
-                            if sc && (!scalar || ymm) {
+                            if sc && !scalar {
                                 continue;
                             }
-                            // VEX.66.0F38.W: c4 e2 [W vvvv L 01] opcode modrm (xmm1 = dest, xmm2 = vvvv, xmm3 or [rbx])
-                            let vex = (w as u8) << 7 | 0b0110_1000 | (ymm as u8) << 2 | 1;
-                            let (opcode, modrm) = (base + order + sc as u8, if mem { 0x0b } else { 0xcb });
-                            forms.push(format!("c4e2{vex:02x}{opcode:02x}{modrm:02x}"));
+                            let operands: &[(u8, u8)] = if mem { &[(2, 0x0b)] } else { &[(2, 3), (1, 3), (2, 1), (1, 1), (2, 2)] };
+                            for &(vvvv, rm) in operands {
+                                // VEX.66.0F38.W: c4 e2 [W vvvv L 01] opcode modrm (xmm1 = dest, xmm<vvvv>, xmm<rm> or [rbx])
+                                let vex = (w as u8) << 7 | ((!vvvv & 15) << 3) | (ymm as u8) << 2 | 1;
+                                let (opcode, modrm) = (base + order + sc as u8, if mem { rm } else { 0xc8 | rm });
+                                forms.push((format!("c4e2{vex:02x}{opcode:02x}{modrm:02x}"), ymm && !sc, mem || (vvvv, rm) == (2, 3)));
+                            }
                         }
                     }
                 }
             }
         }
-        assert!(forms.len() >= 120, "{}", forms.len());
+        assert!(forms.len() >= 400, "{}", forms.len());
         let dir = std::env::temp_dir().join(format!("natemu-fma-admit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (object, json) = (dir.join("o"), dir.join("j"));
@@ -2452,11 +2482,15 @@ mod tests {
             (std::fs::read(&object).unwrap(), at)
         };
         let mut checked = 0;
-        for hex in &forms {
+        for (hex, ymm, full) in &forms {
+            let (hex, ymm) = (hex.as_str(), *ymm);
             let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
-            let ymm = u8::from_str_radix(&hex[4..6], 16).unwrap() >> 2 & 1 == 1;
+            // (the aliasing register forms: the plain key and the heaviest one)
             for keys in [&[][..], &["--daz"], &["--ftz"], &["--daz", "--ftz"]] {
                 for unmasked in ["0", "0x1", "0x10", "0x3f"] {
+                    if !full && !(keys.is_empty() && unmasked == "0" || keys.len() == 2 && unmasked == "0x3f") {
+                        continue;
+                    }
                     let mut args = vec!["--accurate", "--simd-unmasked", unmasked];
                     args.extend_from_slice(keys);
                     let (obj, sites) = compile(hex, &args);
@@ -2469,7 +2503,7 @@ mod tests {
                 }
             }
         }
-        assert!(checked >= 1500, "{checked}");
+        assert!(checked >= 3000, "{checked}");
         // mutations of one check
         let hex = "c4e269b8cb";
         let source = vec![0xc4, 0xe2, 0x69, 0xb8, 0xcb];
@@ -2494,7 +2528,60 @@ mod tests {
             let e = with(new).expect_err(&format!("{new:#x}"));
             assert!(e.contains(why), "{new:#x}: {e}");
         }
+        // v1 read after the check (the word at +8 is `orr v17.16b, v2.16b, v2.16b`, the FMA result's move to the guest register)
+        let moved = u32::from_le_bytes(obj[h.code_offset as usize + at + 8..][..4].try_into().unwrap());
+        assert_eq!(moved, 0x4ea2_1c51, "orr v17.16b, v2.16b, v2.16b");
+        let with_next = |new: u32| {
+            let mut o = obj.clone();
+            o[h.code_offset as usize + at + 8..][..4].copy_from_slice(&new.to_le_bytes());
+            admit((&o, &source))
+        };
+        for (new, what) in [
+            (0x4ea1_1c31, "Rn"),                                  // orr v17.16b, v1.16b, v1.16b
+            (0x4e21_d451, "Rm"),                                  // fadd v17.4s, v2.4s, v1.4s
+            (0x6e63_1c41, "an accumulating destination"),         // bsl v1.16b, v2.16b, v3.16b
+            (0x4e0c_1c01, "ins"),                                // mov v1.s[1], w0 (keeps the other lanes)
+            (0x3d80_0000 | 13 << 10 | 28 << 5 | 1, "a store of q1"), // str q1, [x28, #0xd0]
+        ] {
+            let e = with_next(new).expect_err(what);
+            assert!(e.contains("v1 is read"), "{what} {new:#x}: {e}");
+        }
+        // a write of v1 first ends the scan: `orr v1.16b, v2.16b, v2.16b` then a read is fine
+        assert!(with_next(0x4ea2_1c41).is_ok());
+        // the record: a site naming another instruction, a temporary as an operand, an extra descriptor slot, an address register
+        let site_at = h.sites_offset as usize + sites_index(&obj, &h, at as u32) * std::mem::size_of::<Site>();
+        let with_site = |f: &dyn Fn(&mut Site)| {
+            let mut o = obj.clone();
+            let mut st: Site = super::super::record(&o, site_at);
+            f(&mut st);
+            // SAFETY: `Site` is plain data (repr(C)), written back over its own bytes.
+            let bytes = unsafe { std::slice::from_raw_parts((&raw const st).cast::<u8>(), std::mem::size_of::<Site>()) };
+            o[site_at..site_at + bytes.len()].copy_from_slice(bytes);
+            admit((&o, &source))
+        };
+        let (want, ok) = ("FMA check", with_site(&|_| {}));
+        ok.unwrap();
+        for (f, what) in [
+            (&(|s: &mut Site| s.guest_offset = 1) as &dyn Fn(&mut Site), "not in its instruction"),
+            (&|s: &mut Site| s.imm = s.imm & !31 | 1, "a temporary as Rn"),
+            (&|s: &mut Site| s.imm |= 1 << 15, "an extra descriptor slot"),
+            (&|s: &mut Site| s.base_reg = 3, "a base register"),
+            (&|s: &mut Site| s.index_reg = 3, "an index register"),
+            (&|s: &mut Site| s.width |= tiny_half2(), "a second-half flag"),
+        ] {
+            let e = with_site(f).expect_err(what);
+            assert!(e.contains(want) || e.contains("not in its instruction"), "{what}: {e}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// The index of the site at native offset `at` in the object's site table.
+    fn sites_index(obj: &[u8], h: &natemu_abi::code_object::Header, at: u32) -> usize {
+        (0..h.sites_count as usize)
+            .find(|&i| super::super::record::<Site>(obj, h.sites_offset as usize + i * std::mem::size_of::<Site>()).native_offset == at)
+            .unwrap()
+    }
+    fn tiny_half2() -> u8 {
+        natemu_abi::tiny::HALF2
     }
     /// AFP fallback chunk 3b: with `FEXC` set, the code of the software denormal flag (rows 7 and 8: `and w1, wD, #0x80; orr w0, w0, w1`
     /// in the SIMD and x87 checks) and of the FMA sanitizing (row 10) passes admission with the code-shape check, with no spill, under
