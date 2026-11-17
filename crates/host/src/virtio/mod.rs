@@ -775,20 +775,19 @@ impl Virtio {
         Self::new(irqs, gsi, Profile::Entropy)
     }
     pub fn block(irqs: Irqs, gsi: usize, path: &std::path::Path) -> Result<Arc<Self>> {
-        Self::block_mode(irqs, gsi, path, false)
-    }
-    /// As [`Self::block`], read-only when asked (shared lock; the image offers nothing that writes).
-    pub fn block_mode(
-        irqs: Irqs,
-        gsi: usize,
-        path: &std::path::Path,
-        read_only: bool,
-    ) -> Result<Arc<Self>> {
-        Self::block_image(irqs, gsi, crate::disk::open(path, read_only, None)?)
+        Self::block_image(irqs, gsi, crate::disk::open(path, false, None)?)
     }
     /// A block device on an opened image: it offers what the image allows.
-    pub(crate) fn block_image(irqs: Irqs, gsi: usize, image: crate::disk::Image) -> Result<Arc<Self>> {
-        Ok(Self::new(irqs, gsi, Profile::Block(block::Disk::new(image))))
+    pub(crate) fn block_image(
+        irqs: Irqs,
+        gsi: usize,
+        image: crate::disk::Image,
+    ) -> Result<Arc<Self>> {
+        Ok(Self::new(
+            irqs,
+            gsi,
+            Profile::Block(block::Disk::new(image)),
+        ))
     }
     /// Before the device is made a PCI function or runs: give the disk `count` request queues (1..=[`MAX_QUEUES`];
     /// more than one offers VIRTIO_BLK_F_MQ, so a driver can complete each request on the CPU that sent it). The launch

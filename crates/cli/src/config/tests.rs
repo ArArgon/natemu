@@ -141,6 +141,7 @@ fn legacy(cli: &Cli) -> Fields {
             path: path.clone(),
             transport: cli.virtio_transport.disk,
             readonly: false,
+            backing: None,
         })
         .collect();
     boot.net = cli.net;
@@ -320,6 +321,15 @@ fn paths_resolve_against_the_file_or_the_working_directory() {
     assert_eq!(c.serial_output, Some(d.join("s.log")));
     assert_eq!(c.perf_log, Some(PathBuf::from("/abs/p.log")));
     assert_eq!(c.compile_cache, Some(PathBuf::from("off")));
+    let (d, c) = load_file(
+        &format!(
+            "{MIN}[[disk]]\nid = \"root\"\npath = \"runs/top.qcow2\"\nbacking = \"images/base.raw\"\n"
+        ),
+        &[],
+    );
+    let disk = &c.unwrap().disks[0];
+    assert_eq!(disk.path, d.join("runs/top.qcow2"));
+    assert_eq!(disk.backing, Some(d.join("images/base.raw")));
     // Flag and --set values are kept as given (the working directory's).
     let (_, c) = load_file(
         MIN,
@@ -549,12 +559,15 @@ fn set_edits_devices_but_cannot_create_them() {
             "--set",
             "disk.root.path=other.raw",
             "--set",
+            "disk.root.backing=rel/base.raw",
+            "--set",
             "nic.net0.forward=tcp:2222:22,udp:5:6",
         ],
     );
     let c = c.unwrap();
     assert!(c.disks[0].readonly);
     assert_eq!(c.disks[0].path, PathBuf::from("other.raw"));
+    assert_eq!(c.disks[0].backing, Some(PathBuf::from("rel/base.raw")));
     assert_eq!(c.nics[0].forward.len(), 2);
     let _ = d;
     let e = err(load_file(&file, &["--set", "disk.boot.path=x"]).1);
@@ -847,13 +860,56 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
         .map(|d| d.readonly)
         .collect();
     assert_eq!(flags, [false, true, false]);
+    // A backing file reaches the launch description.
     let mut two = cfg.clone();
     two.disks[0].backing = Some("base.raw".into());
+    let boot = to_boot(&two, "RT".into(), vec![1], None).unwrap();
+    assert_eq!(boot.disks[0].backing, Some(PathBuf::from("base.raw")));
+}
+
+#[test]
+fn backing_files_follow_the_same_file_rule() {
+    let _env = lock();
+    let d = dir();
+    let (base, top, other) = (d.join("base.raw"), d.join("top.qcow2"), d.join("o.qcow2"));
+    std::fs::write(&base, b"x").unwrap();
+    std::fs::write(&top, b"y").unwrap();
+    let disk = |id: &str, path: &Path, ro: bool, backing: Option<&Path>| {
+        let b = backing.map_or(String::new(), |b| {
+            format!("backing = \"{}\"\n", b.display())
+        });
+        format!(
+            "[[disk]]\nid = \"{id}\"\npath = \"{}\"\nreadonly = {ro}\n{b}",
+            path.display()
+        )
+    };
+    let run = |disks: &[String]| load_file(&format!("{MIN}{}", disks.concat()), &[]).1;
+    // Its own top.
+    let e = err(run(&[disk("a", &top, false, Some(&top))]));
+    assert!(e.contains("disk \"a\" is its own backing file"), "{e}");
+    // Another disk's writable image, before or after it in the list.
+    for order in [false, true] {
+        let mut disks = vec![
+            disk("a", &top, false, Some(&base)),
+            disk("b", &base, false, None),
+        ];
+        if order {
+            disks.reverse();
+        }
+        let e = err(run(&disks));
+        assert!(
+            e.contains("the backing file of disk \"a\" is disk \"b\", which is writable"),
+            "{e}"
+        );
+    }
+    // Shared read-only: two overlays on one base (one not created yet), and the base also a read-only disk.
     assert!(
-        to_boot(&two, "RT".into(), vec![1], None)
-            .err()
-            .unwrap()
-            .contains("not built yet")
+        run(&[
+            disk("a", &top, false, Some(&base)),
+            disk("b", &other, false, Some(&base)),
+            disk("c", &base, true, None),
+        ])
+        .is_ok()
     );
 }
 
