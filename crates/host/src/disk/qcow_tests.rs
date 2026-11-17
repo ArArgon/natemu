@@ -190,6 +190,7 @@ struct Log {
     on_punch: Option<Box<dyn FnOnce() + Send>>,
     fail_punch: bool,
     punches: usize,
+    longest_punch: u64,
     fail_writes: bool,
 }
 #[derive(Clone)]
@@ -264,7 +265,11 @@ impl FileLayer for Recording {
         if let Some(hook) = hook {
             hook();
         }
-        self.log().punches += 1;
+        {
+            let mut log = self.log();
+            log.punches += 1;
+            log.longest_punch = log.longest_punch.max(length);
+        }
         if self.log().fail_punch {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
@@ -1215,20 +1220,24 @@ fn write_zeroes_of_64_gib_on_a_fresh_overlay_is_table_only_and_fast() {
 fn a_discard_of_contiguous_clusters_is_a_few_punches() {
     let dir = Dir::new("punches");
     let path = dir.at("a.qcow2");
-    create_ready(&path, 64 << 20, 16, None);
+    create_ready(&path, 256 << 20, 16, None);
     let (q, rec) = recorded(&path, None);
-    // 512 clusters written in order: allocated one after another at the file end.
-    for c in 0..512u64 {
+    // 3000 clusters (about 190 MiB) written in order: allocated one after another at the file end.
+    for c in 0..3000u64 {
         q.write(&[c as u8 | 1; 512], c << 16).unwrap();
     }
     q.sync(false).unwrap();
-    q.discard(0, 512 << 16).unwrap();
-    let punches = rec.log().punches;
+    q.discard(0, 3000 << 16).unwrap();
+    let (punches, longest) = {
+        let log = rec.log();
+        (log.punches, log.longest_punch)
+    };
+    // Merged, but no punch longer than 128 MiB (one punch must not hold a worker long).
     assert!(
-        punches <= 4,
-        "{punches} punch calls for 512 contiguous clusters"
+        (2..=6).contains(&punches) && longest <= 128 << 20,
+        "{punches} punch calls, the longest {longest} bytes, for 3000 contiguous clusters"
     );
-    assert!(read(&*q, 0, 512 << 16).iter().all(|&x| x == 0));
+    assert!(read(&*q, 0, 3000 << 16).iter().all(|&x| x == 0));
     // The freed clusters are reused after the next flush.
     q.sync(false).unwrap();
     let len = rec.log().live.len();
@@ -1245,24 +1254,39 @@ fn discard_and_write_zeroes_of_4_gib_of_allocated_clusters_are_timed() {
     create_ready(&path, 8 << 30, 16, None);
     let image = open(&path, false, None).unwrap();
     let b = &*image.backend;
-    // One sector in each 64 KiB cluster of the first 4 GiB: 65536 allocated clusters, 256 MiB on the host.
-    for c in 0..(1u64 << 16) {
+    // The first 2 GiB fully written (2 GiB on the host), then one sector in each cluster of the next 2 GiB.
+    let full = vec![1u8; 1 << 20];
+    for m in 0..2048u64 {
+        b.write(&full, m << 20).unwrap();
+    }
+    for c in (1u64 << 15)..(1 << 16) {
         b.write(&[1; 512], c << 16).unwrap();
     }
     b.sync(false).unwrap();
     let mut slowest = Duration::ZERO;
-    for (r, zero) in [(0u64, false), (1, true)] {
+    for (what, offset, len, zero) in [
+        ("discard, 1 GiB fully written", 0u64, 1u64 << 30, false),
+        ("write-zeroes, 1 GiB fully written", 1 << 30, 1 << 30, true),
+        (
+            "discard, 2 GiB of one-sector clusters",
+            2 << 30,
+            2 << 30,
+            false,
+        ),
+    ] {
         let t = Instant::now();
         if zero {
-            b.write_zeroes(r << 31, 1 << 31).unwrap();
+            b.write_zeroes(offset, len).unwrap();
         } else {
-            b.discard(r << 31, 1 << 31).unwrap();
+            b.discard(offset, len).unwrap();
         }
-        slowest = slowest.max(t.elapsed());
+        let took = t.elapsed();
+        slowest = slowest.max(took);
+        eprintln!(
+            "{what}: {took:?}, {:.0} ms per GiB",
+            took.as_secs_f64() * 1000.0 / (len as f64 / (1u64 << 30) as f64)
+        );
     }
-    eprintln!(
-        "2 GiB of allocated clusters: slowest discard/write-zeroes call {slowest:?} (32 such ranges make one request)"
-    );
     assert!(slowest < Duration::from_secs(3), "{slowest:?}");
     assert!(
         read(b, 0, 1 << 16).iter().all(|&x| x == 0)

@@ -435,12 +435,14 @@ impl QcowMetadata {
     #[cfg(test)]
     pub(super) fn flush(&self) -> io::Result<()> {
         let freed = self.write_tables()?;
-        self.inner
-            .read()
-            .unwrap()
-            .raw_file
-            .file()
-            .sync(SyncKind::Fsync)?;
+        {
+            let inner = self.inner.read().unwrap();
+            inner.raw_file.file().sync(SyncKind::Fsync)?;
+            // The same rule as `QcowDisk::sync`: a barrier before freed clusters are reused.
+            if !freed.is_empty() {
+                inner.raw_file.file().barrier_sync()?;
+            }
+        }
         self.release(freed);
         Ok(())
     }
