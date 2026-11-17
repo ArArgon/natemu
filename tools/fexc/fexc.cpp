@@ -268,7 +268,7 @@ uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
   return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
 }
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align",
-                                "simd", "x87", "pending", "fma"};
+                                "simd", "x87", "pending", "fma", "denorm"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};

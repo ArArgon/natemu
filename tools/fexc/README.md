@@ -464,6 +464,13 @@ and a block with spill slots (a fill inside the span would be skipped with it) k
 `test_slice1.py` (`AfpAccurateDe`) runs the afp=0 accurate code natively under an M2's FPCR against the AFP code under the M4's (every SSE/AVX
 form the DE test covers plus memory operands, 256-bit and DPPS/DPPD forms, random operands): FPSR.IDC and every result bit outside the lanes the M4
 holds a NaN in (the NaN rules are the next chunk's) are identical.
+*The in-block skip* (accurate mode, no AFP, DE masked, DAZ and FTZ clear; `PlaceFPChecks`, shim only): an operand lane that is the result of an arithmetic op (the `FlushedResultOf`
+set: add, subtract, multiply, divide, square root, pairwise add, FMA, scalar forms) of an earlier guest instruction of the IR block, at the same element size and lanes, is
+left out of the screen and of the test's denormal term (its NaN and zero lanes still count); all operands known: no test. Every tiny result traps (UFE) and the resident's
+handler writes `frame::DE_PENDING` (FEX's OE flag byte) then, so the instruction's first FP op, when it has a skipped operand and a producer ran since the last check, is preceded by
+`ldrb w0, [x28, #0x413]; cbnz w0, stub` (`FexcSimdSkip` mode bit 10, site kind `DENORM`, `brk #9`): the resident clears the byte and dispatches at that instruction, whose block
+screens every operand as an entry value. Loads, shuffles, moves, logic and blends, partial merges, other element sizes, conversions, MIN/MAX and FEX's helper multiplies are
+unknown. FTZ keys, DAZ keys, AFP and fast mode are byte-identical.
 
 **DAZ and FTZ without AFP** (AFP fallback chunk 3a, plan rows 4-6 and row 3's unmasked-PE part; none of it with AFP). `--daz` and
 `--ftz`, which the host sends only when `Cpu::no_afp` and MXCSR.DAZ, or effective FTZ (FTZ with UM masked), are set, are read only by

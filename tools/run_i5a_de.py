@@ -86,10 +86,57 @@ def cases():
         k = F32 if t == 32 else F64; n = 4 if t == 32 else 2
         v = [k['den'] if i == lane else k['one'] for i in range(n)]
         out.append((f'{text} | denormal in element {lane}', text, v, v, 0x1f80, de))
-    return out
+    return [c + (None,) for c in out] + sequences()
 
 
-TAGGED = 339    # the cases tagged `masked-sse-de`: 339 of 876 (update with the case list)
+def sequences():
+    """Several instructions between the LDMXCSR and the STMXCSR (the in-block skip of the DE screen, AFP accurate plan: an operand that is
+    the result of an earlier FP op of the block needs no screen; the cases are the independent reviewer's). `@mid` / `@tmp` / `@y1` are
+    this case's addresses of an extra STMXCSR result, an 8-byte scratch and the second quadword of the source. The last element is the
+    expected DE at the `@mid` STMXCSR (None: the case has none). x86 sets DE exactly when an FP op computes on a denormal operand."""
+    one, mx = [0x3f800000] * 4, 0x1f80
+    d64 = lambda lo, hi=0: [lo & 0xffffffff, lo >> 32, hi & 0xffffffff, hi >> 32]
+    f64 = lambda v: struct.unpack('<Q', struct.pack('<d', v))[0]
+    D1, MIN64, QNAN64 = 1, 0x0010000000000000, 0x7ff8000000000000
+    # a tiny result that is inexact: (1 + 2^-52) 2^-540 * 1.5 * 2^-500 = 1.5 * 2^-1040 + 2^-1091 on a grid of 2^-1074
+    xi, yi = f64((1 + 2.0 ** -52) * 2.0 ** -540), f64(1.5 * 2.0 ** -500)
+    rows = [
+        # an f64 result read as f32: the low word of 1 + 2^-52 is the f32 denormal 1 (the high lane 0.0)
+        ('addpd result, mulps reads its low word', 'addpd xmm1, xmm2\nmulps xmm1, xmm1', d64(f64(1.0)), d64(f64(2.0 ** -52)), True, None),
+        ('addpd result, addss reads its low word', 'addpd xmm1, xmm2\naddss xmm1, xmm1', d64(f64(1.0)), d64(f64(2.0 ** -52)), True, None),
+        # an f32 result read as f64: 2.0f with a zero upper word is the f64 denormal 0x40000000
+        ('addps result, mulpd reads two lanes as one double', 'addps xmm1, xmm2\nmulpd xmm1, xmm1', [0x3f800000, 0, 0, 0], [0x3f800000, 0, 0, 0], True, None),
+        # addss writes lane 0 only: lane 1 is the entry value, a denormal
+        ('addss merges into an entry denormal, mulps reads it', 'addss xmm1, xmm2\nmulps xmm1, xmm2', [0x3f800000, 1, 0x3f800000, 0x3f800000], one, True, None),
+        ('addsd merges into an entry denormal, mulpd reads it', 'addsd xmm1, xmm2\nmulpd xmm1, xmm2', d64(f64(1.0), D1), d64(f64(1.0), f64(1.0)), True, None),
+        # bit operations and a blend turn an in-block result into a denormal (the value is unknown after them)
+        ('andps makes a denormal of an in-block result', 'addps xmm1, xmm2\nandps xmm1, xmm2\nmulps xmm1, xmm1', one, [0x3f800003] * 4, True, None),
+        ('xorps makes a denormal of an in-block result', 'addps xmm1, xmm2\nxorps xmm1, xmm2\nmulps xmm1, xmm1', [0x34000000] * 4, one, True, None),
+        ('blendps puts a denormal into an in-block result', 'addps xmm1, xmm1\nblendps xmm1, xmm2, 1\nmulss xmm1, xmm1', one, [1, 0x3f800000, 0x3f800000, 0x3f800000], True, None),
+        # a store and a load are unknown (x87 stores a denormal into the slot the producer's result was stored to)
+        ('fstp m64 then movsd load', 'addsd xmm1, xmm2\nmovsd qword ptr [@tmp], xmm1\nfld qword ptr [@y1]\nfstp qword ptr [@tmp]\nmovsd xmm1, qword ptr [@tmp]\nmulsd xmm1, xmm1',
+         d64(f64(1.0)), d64(f64(1.0), D1), True, None),
+        # DE is no function of the denormal alone: a QNaN beside it suppresses it, a normal operand does not
+        ('x denormal: addsd nan,x then mulsd 1.0,x', 'movapd xmm3, xmm2\naddsd xmm3, xmm1\nmovsd xmm4, qword ptr [@y1]\nmulsd xmm4, xmm1',
+         d64(D1), d64(QNAN64, f64(1.0)), True, None),
+        ('x denormal: addsd nan,x only', 'movapd xmm3, xmm2\naddsd xmm3, xmm1', d64(D1), d64(QNAN64, f64(1.0)), False, None),
+        # a denormal made by subtraction and stored is no operand
+        ('denormal by subtraction, stored, no consumer', 'subsd xmm1, xmm2\nmovsd qword ptr [@tmp], xmm1', d64(MIN64 + 1), d64(MIN64), False, None),
+        ('inexact tiny product, no consumer', 'mulsd xmm1, xmm2\nmovsd qword ptr [@tmp], xmm1', d64(xi), d64(yi), False, None),
+        # a tiny result consumed two instructions later: STMXCSR before the consumer shows no DE, after it DE
+        ('tiny result, consumer after STMXCSR', 'subsd xmm1, xmm2\nmovaps xmm5, xmm5\nstmxcsr dword ptr [@mid]\naddsd xmm1, xmm1', d64(MIN64 + 1), d64(MIN64), True, False),
+        ('inexact tiny product, consumer after STMXCSR', 'mulsd xmm1, xmm2\nstmxcsr dword ptr [@mid]\naddsd xmm1, xmm1', d64(xi), d64(yi), True, False),
+        ('tiny result, copy, consumer of the copy', 'subsd xmm1, xmm2\nmovaps xmm3, xmm1\naddsd xmm3, xmm3', d64(MIN64 + 1), d64(MIN64), True, None),
+        ('tiny result, a producer between, consumer', 'subsd xmm1, xmm2\naddsd xmm5, xmm5\nmulsd xmm1, xmm1', d64(MIN64 + 1), d64(MIN64), True, None),
+        ('tiny result (2^-64 * 2^-64), packed consumer', 'mulps xmm1, xmm2\naddps xmm1, xmm1', [0x1f800000] * 4, [0x1f800000] * 4, True, None),
+        ('normal chain, no DE', 'addsd xmm1, xmm2\nmulsd xmm1, xmm1\nsubsd xmm1, xmm2', d64(f64(1.0)), d64(f64(1.0)), False, None),
+        # LDMXCSR clears DE: the denormal is consumed again after it
+        ('LDMXCSR clears DE between two consumers', 'mulss xmm3, xmm1\nldmxcsr dword ptr [@mx]\nstmxcsr dword ptr [@mid]\nmulss xmm3, xmm1', [1, 0x3f800000, 0x3f800000, 0x3f800000], one, True, False),
+    ]
+    return [(name, text, x, y, mx, de, mid) for name, text, x, y, de, mid in rows]
+
+
+TAGGED = 355    # the cases tagged `masked-sse-de`: 355 of 896 (update with the case list)
 
 
 def mx_of(mx, de):
@@ -117,12 +164,13 @@ def main():
     host, runtime = (ROOT / 'target/release/natemu-host', ROOT / 'target/aarch64-unknown-none/release/natemu-runtime') if a.no_build else vm1.build()
     cs = cases()
     mem, lines = bytearray(0x40 * len(cs) + 0x40), []
-    for i, (name, text, x, y, mx, _) in enumerate(cs):
+    for i, (name, text, x, y, mx, _, _) in enumerate(cs):
         base = 0x40 * i
         mem[base:base + 16], mem[base + 16:base + 32] = vec(32 if len(x) == 4 else 64, x), vec(32 if len(y) == 4 else 64, y)
         struct.pack_into('<I', mem, base + 32, mx)
+        for tag, at in (('@mid', 40), ('@tmp', 48), ('@y1', 24), ('@mx', 32)): text = text.replace(tag, str(D + base + at))
         lines += [f'ldmxcsr dword ptr [{D + base + 32}]', f'movdqu xmm1, xmmword ptr [{D + base}]',
-                  f'movdqu xmm2, xmmword ptr [{D + base + 16}]', text, f'stmxcsr dword ptr [{D + base + 36}]']
+                  f'movdqu xmm2, xmmword ptr [{D + base + 16}]'] + text.split('\n') + [f'stmxcsr dword ptr [{D + base + 36}]']
     code = ref.assemble('\n'.join(lines + ['hlt']))
     a.out.mkdir(parents=True, exist_ok=True)
     desc = f"rip 0x100000\nrflags 0x2\ngpr {' '.join(['0x0'] * 4 + ['0x301000'] + ['0x0'] * 11)}\ncode {code.hex()}\nmemory {D:#x} {mem.hex()}\nsse 1\n"
@@ -133,13 +181,20 @@ def main():
     d = json.loads(run.stdout); got = bytes.fromhex(d['memory'][0]['data'])
     if not vm1.at_hlt(d, 0x100000 + len(code) - 1): sys.exit(f"stopped {d['stop']} {d['reason']} at {d['rip']}")
     counts, results = dev.Counts(), []
-    for i, (name, text, x, y, mx, de) in enumerate(cs):
+    for i, (name, text, x, y, mx, de, mid) in enumerate(cs):
         out = struct.unpack_from('<I', got, 0x40 * i + 36)[0]
         m = mx_of(mx, de)
         kind, why = dev.mxcsr_verdict(m, d, (mx & ~2) | out & 2)      # DE only
         counts.add(kind, m['tag'])
         results.append({'case': name, 'mxcsr_in': hex(mx), 'mxcsr_out': hex(out), 'de_expected': de, 'tag': m['tag'], 'outcome': kind, 'ok': kind != 'fail'})
         if kind == 'fail': print('MISMATCH', name, f'MXCSR {out:#x}, DE expected {de}' + (f': {why}' if why else ''))
+        if mid is not None:   # the STMXCSR in the middle of a sequence (expected DE clear: no deviation applies)
+            got_mid = struct.unpack_from('<I', got, 0x40 * i + 40)[0]
+            kind, why = dev.mxcsr_verdict(mx_of(mx, mid), d, (mx & ~2) | got_mid & 2)
+            counts.add(kind, None)
+            if kind == 'fail': print('MISMATCH', name, '(STMXCSR in the middle)', f'MXCSR {got_mid:#x}, DE expected {mid}' + (f': {why}' if why else ''))
+            bad_mid = kind == 'fail'
+            results[-1]['mid_ok'] = not bad_mid
     (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
     print(f"afp {d.get('afp')}, fp {d.get('fp')}: " + counts.line().replace('cases,', f'cases ({len(FORMS)} forms),', 1))
     bad = counts.bad

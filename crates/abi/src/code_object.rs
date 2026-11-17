@@ -66,6 +66,11 @@ pub mod kind {
     /// [`crate::tiny::Desc`] meta byte (kind FMA, element size and scalar bits only), `imm` = Rn, Rm and the addend's registers (slots
     /// 0..2), `guest_offset2` [`NONE32`], no address registers.
     pub const FMA: u8 = 18;
+    /// The in-block skip of the masked DE screen (accurate mode without AFP): a check stub (`brk #9`, no access, no address, `width` 0) reached by
+    /// `ldrb w0, [x28, #DE_PENDING]; cbnz w0` right before an instruction whose operand screens were dropped because the operands are
+    /// results of earlier FP ops in the block. The resident's FP trap handler sets the byte when it writes a result that may be a denormal;
+    /// at the stub it clears the byte and exits to the dispatcher at the stub's instruction, the state before it, as at any site.
+    pub const DENORM: u8 = 19;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

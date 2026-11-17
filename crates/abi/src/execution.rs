@@ -1395,6 +1395,10 @@ pub mod frame {
     /// not complete and is dropped). Both are 0 while every exception is masked.
     pub const SIMD_FLAGS: u32 = FLAGS + 33;
     pub const X87_PENDING: u32 = FLAGS + 34;
+    /// FEX's X87FLAG_OE_LOC byte (no FEX code uses it): 1 when the resident's FP trap handler (accurate mode without AFP, DAZ and FTZ
+    /// clear) wrote a result that may be a denormal, since an admitted `DENORM` check last tested it (generated code only reads it; the
+    /// resident clears it at the check's stub). Not cleared at entries: a stale 1 costs one spurious exit to the dispatcher.
+    pub const DE_PENDING: u32 = FLAGS + 35;
     /// The upper 128 bits of YMM0..YMM15 (I5b; XSAVE state component 2, YMM_Hi128): FEX's `avx_high[16][2]`, where FEX keeps
     /// them without SVE256, two little-endian quadwords per register. Generated code reads and writes them (I8: the VEX forms,
     /// each instruction storing the halves it wrote before the next starts); XSAVE and XRSTOR use the same copy. Zero at
@@ -1403,7 +1407,7 @@ pub mod frame {
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's (perf chunk 25: its entry value readable,
     /// [`MXCSR`]). Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 18] = [
+    pub const GUEST_STATE: [(u32, u32); 19] = [
         (TSC_OFFSET, 8),
         (AVX_HIGH, 256),
         (MXCSR, 4),
@@ -1417,6 +1421,7 @@ pub mod frame {
         (FAST_STRINGS, 1),
         (X87_IE, 1),
         (SIMD_FLAGS, 2),
+        (DE_PENDING, 1),
         (X87_PE, 2),
         (X87_C0, 4),
         (X87_C3, 1),
@@ -3941,7 +3946,13 @@ mod tests {
         );
         assert!(
             !inside(&frame::GUEST_STATE, frame::X87_MM + 128)
-                && !inside(&frame::GUEST_STATE, frame::X87_IE + 3)
+                && !inside(&frame::GUEST_STATE, frame::X87_IE + 4)
+        );
+        // The DE-pending byte (FEX's OE flag byte): readable by generated code, written only by the resident.
+        assert_eq!(frame::DE_PENDING, 0x413);
+        assert!(
+            inside(&frame::GUEST_STATE, frame::DE_PENDING)
+                && !inside(&frame::GUEST_STATE_WRITABLE, frame::DE_PENDING)
         );
         // I5c: the SIMD flag byte and the x87 pending byte, FEX's flag bytes 33 and 34, readable and writable.
         assert_eq!((frame::SIMD_FLAGS, frame::X87_PENDING), (0x411, 0x412));
