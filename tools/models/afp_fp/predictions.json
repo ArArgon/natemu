@@ -1762,7 +1762,7 @@
    "memory": [
     {
      "addr": "0x200000",
-     "sha256": "a1661d68e2a044ee391a5379d78a9a5b38838fb339af3a3c30cbb4dea1c3c6cf"
+     "sha256": "4adef2dd32fe2b72fcefeb66fb2765c80c9ab9afa68063998af9ddf05f76cdc6"
     },
     {
      "addr": "0x300000",

@@ -1368,6 +1368,10 @@ class AfpX87(unittest.TestCase):
             self.assertEqual(got, 0xfff8000000000000, (form, hex(got)))
 
 
+def kind_of(name):
+    return name.rstrip('0123456789psd').replace('vfnmsub', 'vfnmsub')
+
+
 @unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
 class AfpAccurateDe(unittest.TestCase):
     """AFP accurate plan, chunk 2 (B): with `--accurate` and DE masked a host without AFP sets MXCSR.DE (FPSR.IDC) by software. The oracle is the
@@ -1600,6 +1604,60 @@ class AfpNegation(unittest.TestCase):
                     a0, f0 = self.exec(FEXC, hexs, e, b, key, False)
                     a1, f1 = self.exec(old, hexs, e, b, key, False)
                     self.assertEqual(f0, f1, (name, key))
+
+    SNAN, SNAN2, QNAN, NQNAN, INF = 0x7f800001, 0x7f800002, 0x7fc00000, 0xffc00000, 0x7f800000
+
+    def lanes(self, fexc, text, ops, afp, e=4):
+        return self.exec(fexc, x86_asm([text]), e, [tuple(ops)] * (16 // e), (), afp)
+
+    def test_nan_corner_cases_are_pinned(self):
+        """The cases the sweep above skips, each against the M4's code (the x86 result). Fast mode's documented differences: the addend of the
+        packed VFMSUB/VFNMSUB and the subtracted lanes of VFMADDSUB/VFMSUBADD reach the FMA quieted (by the multiply: IE is raised for an
+        SNaN), so an SNaN addend with inf * 0 gives the default NaN (x86: the SNaN, quieted) and a second NaN is chosen as Arm does; the added
+        lanes of VFMADDSUB/VFMSUBADD reach it as they are (exact); ADDSUB's operand is quieted too, which makes the QNaN first operand win as in x86."""
+        S, S2, Q, INF = self.SNAN, self.SNAN2, self.QNAN, self.INF
+        # (v16, v17, v18) = (xmm0, xmm1, xmm2); the 231 forms add xmm0, multiplying xmm1 and xmm2
+        new, m4 = self.lanes(FEXC, 'vfmsub231ps xmm0, xmm1, xmm2', (S, INF, 0), False), self.lanes(FEXC, 'vfmsub231ps xmm0, xmm1, xmm2', (S, INF, 0), True)
+        self.assertEqual(m4, ([S | 1 << 22] * 4, 1))
+        self.assertEqual(new, ([Q] * 4, 1))   # the default NaN: a documented difference (nan-results, fma-invalid-flag)
+        # addend SNaN, a multiplicand SNaN: the SNaN multiplicand is chosen (as the M4 does)
+        self.assertEqual(self.lanes(FEXC, 'vfmsub231ps xmm0, xmm1, xmm2', (S, S2, 0x3f800000), False), self.lanes(FEXC, 'vfmsub231ps xmm0, xmm1, xmm2', (S, S2, 0x3f800000), True))
+        # VFMADDSUB: the added lanes keep an SNaN addend (inf * 0 + SNaN: the SNaN, quieted, as x86), the subtracted lanes give the default NaN
+        new, m4 = (self.lanes(f, 'vfmaddsub231ps xmm0, xmm1, xmm2', (S, INF, 0), a)[0] for f, a in ((FEXC, False), (FEXC, True)))
+        self.assertEqual(m4, [S | 1 << 22] * 4)
+        self.assertEqual(sorted(new), [Q, Q, S | 1 << 22, S | 1 << 22])
+        # ADDSUB: QNaN first operand, SNaN second: the QNaN, as x86
+        for text in ('addsubps xmm0, xmm1', 'vaddsubps xmm0, xmm0, xmm1'):
+            self.assertEqual(self.lanes(FEXC, text, (Q, S), False)[0], [Q] * 4)
+            self.assertEqual(self.lanes(FEXC, text, (Q, S), True)[0], [Q] * 4)
+        old = os.environ.get('FEXC_OLD')
+        if old:
+            self.assertEqual(self.lanes(old, 'vfmsub231ps xmm0, xmm1, xmm2', (S, INF, 0), False)[0], [0xffc00001] * 4)
+            lanes = self.lanes(old, 'vfmaddsub231ps xmm0, xmm1, xmm2', (S, INF, 0), False)[0]
+            self.assertEqual(sorted(lanes), [S | 1 << 22, S | 1 << 22, 0xffc00001, 0xffc00001])
+
+    @unittest.skipUnless(os.environ.get('FEXC_OLD'), 'set $FEXC_OLD to the compiler before the change')
+    def test_no_exact_case_becomes_wrong(self):
+        """Every combination of operand classes (zeros, one, infinity, QNaN, negative QNaN, two SNaNs) in every position, all lanes alike, for
+        each changed form: where the old compiler's afp=0 code equals the M4's result and flags, the new code does too, but for the packed
+        FMSUB/FNMSUB with several QNaNs of both signs (the old negation flipped the addend's sign, which matched the M4 by chance; the choice
+        between two NaNs is Arm's order, a documented difference whichever sign comes out)."""
+        old = os.environ['FEXC_OLD']
+        fma, add = self.forms()
+        worse = []
+        for name, e, roles, text, nops, kind in fma + add:
+            cl = [0, self.CLASSES[e]['one'], self.CLASSES[e]['inf'], self.CLASSES[e]['qnan'], self.CLASSES[e]['nqnan'], self.CLASSES[e]['snan'], self.CLASSES[e]['snan'] + 1]
+            hexs = x86_asm([text])
+            for ops in itertools.product(cl, repeat=nops):
+                lanes = [ops] * (16 // e)
+                m4 = self.exec(FEXC, hexs, e, lanes, (), True)
+                o, n = self.exec(old, hexs, e, lanes, (), False), self.exec(FEXC, hexs, e, lanes, (), False)
+                m4, o, n = [(r[0], r[1] & self.FPSR_MASK) for r in (m4, o, n)]
+                if o == m4 and n != m4: worse.append((name, ops, e))
+        for name, ops, e in worse:
+            k = [fp_class(x, e) for x in ops]
+            qs = [x for x, c in zip(ops, k) if c['nan']]
+            self.assertTrue(kind_of(name) in ('vfmsub', 'vfnmsub') and len(qs) >= 2 and not any(fp_class(x, e)['snan'] for x in qs) and len(set(qs)) > 1, (name, [hex(x) for x in ops]))
 
     def test_only_the_changed_forms_change_and_the_m4_code_is_the_old_code(self):
         """The changed forms' afp=0 code differs from the AFP code (the new lowering); the one-op forms (scalar fmsub/fnmsub, packed
