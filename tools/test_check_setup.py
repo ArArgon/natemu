@@ -19,12 +19,29 @@ class SetupChecks(unittest.TestCase):
         env.pop("NATEMU_RAW_ROOT", None)
         command = ["sh", launcher, sys.executable, "-B", "-c",
                    "import os; print(os.environ['NATEMU_RAW_ROOT'])"]
-        # The default belongs to the project, not the caller's current directory.
+        # The default belongs to the project, not the caller's current directory or where this checkout lives: build a
+        # plain checkout and a linked worktree of it in a temporary folder. A plain checkout uses its own sibling
+        # natemu-raw; a linked worktree uses the MAIN checkout's sibling; NATEMU_RAW_ROOT wins over both.
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
         with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(command, cwd=directory, env=env,
-                                    capture_output=True, text=True, check=True)
-            self.assertEqual(Path(result.stdout.strip()).resolve(),
-                             (check_setup.REPO.parent / "natemu-raw").resolve())
+            base = Path(directory).resolve()
+            main = base / "main"
+            (main / "tools").mkdir(parents=True)
+            (main / "tools" / "with-env").write_bytes((check_setup.REPO / "tools" / "with-env").read_bytes())
+            subprocess.run(git + ["init", "-q"], cwd=main, check=True)
+            subprocess.run(git + ["add", "."], cwd=main, check=True)
+            subprocess.run(git + ["commit", "-q", "-m", "x"], cwd=main, check=True)
+            tree = base / "elsewhere" / "tree"
+            subprocess.run(git + ["worktree", "add", "-q", "--detach", str(tree)], cwd=main, check=True)
+
+            def default(root, **extra):
+                run = subprocess.run(["sh", str(root / "tools" / "with-env"), sys.executable, "-B", "-c",
+                                      "import os; print(os.environ['NATEMU_RAW_ROOT'])"],
+                                     cwd=directory, env=dict(env, **extra), capture_output=True, text=True, check=True)
+                return Path(run.stdout.strip()).resolve()
+            self.assertEqual(default(main), base / "natemu-raw")
+            self.assertEqual(default(tree), base / "natemu-raw")
+            self.assertEqual(default(tree, NATEMU_RAW_ROOT=str(base / "x")), base / "x")
             env["NATEMU_RAW_ROOT"] = directory
             result = subprocess.run(command, env=env, capture_output=True,
                                     text=True, check=True)
