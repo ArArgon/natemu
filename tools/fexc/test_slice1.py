@@ -1646,6 +1646,43 @@ class AfpDazFree(unittest.TestCase):
             for extra in (['--daz'], ['--accurate', '--daz'], ['--daz', '--ftz']):   # no other key frees a source
                 self.assertEqual(self.freed(prod, cons, extra), 0, (name, extra))
 
+    PRODUCERS = {   # every producer the shim's skip rule trusts (FlushedResultOf), scalar, packed and fused forms
+        'addsd': ADDSD, 'addpd': ADDPD, 'addss': ADDSS, 'addps': ADDPS, 'subsd': 'f20f5cc2', 'subps': '0f5cc2', 'mulsd': 'f20f59c2', 'mulss': 'f30f59c2',
+        'mulpd': '660f59c2', 'mulps': '0f59c2', 'divsd': 'f20f5ec2', 'divps': '0f5ec2', 'divpd': '660f5ec2', 'sqrtsd': 'f20f51c2', 'sqrtss': 'f30f51c2',
+        'sqrtps': '0f51c2', 'sqrtpd': '660f51c2', 'haddps': 'f20f7cc2', 'haddpd': '660f7cc2', 'vfmadd231sd': 'c4e2e9b9c2', 'vfmadd231ss': 'c4e269b9c2',
+        'vfmadd231pd': 'c4e2e9b8c2', 'vfmadd231ps': 'c4e269b8c2', 'vfmsub231sd': 'c4e2e9bbc2', 'vfmsub231ps': 'c4e269bac2',
+        'vfnmadd231sd': 'c4e2e9bdc2', 'vfnmadd231pd': 'c4e2e9bcc2', 'vfnmsub231sd': 'c4e2e9bfc2', 'vfnmsub231ps': 'c4e269bec2',
+        'vaddsd (vex)': 'c5fb58c1', 'vmulps ymm': 'c5fc59c1', 'vdivpd ymm': 'c5fd5ec1', 'vsqrtps ymm': 'c5fc51c1',
+    }
+    NOT_ARITHMETIC = ('fmov', 'fabs', 'fneg', 'fcm', 'fcsel', 'fccmp')   # moves, sign changes and compares (the FMA's NaN check) produce no value; the rest must be Patch
+
+    def test_every_producer_word_is_in_the_flushing_class(self):
+        """The skip rule's premise (review item A2): every Arm FP computing word a producer lowers to under accurate DAZ + FTZ is one the resident's
+        handler flushes (`fptrap::classify` says Patch), so a Keep-class word in a producer's lowering fails here. The classification is the Rust
+        test `producer_words_are_all_in_the_flushing_class`, fed the words."""
+        lines = []
+        for name, h in self.PRODUCERS.items():
+            d, rc = run(h, RIP, *self.AFP0, *self.ACC)
+            self.assertEqual(rc, 0, name)
+            lay = d['code']['layout']
+            code = bytes.fromhex(d['code']['hex'])
+            lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal']
+            with tempfile.TemporaryDirectory() as t:
+                dis = check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+            got = 0
+            for o in range(lay['code_region_begin'], lay['code_region_end'], 4):
+                mn = re.split(r'[. ]', dis[o].strip())[0]
+                if mn.startswith('f') and not mn.startswith(self.NOT_ARITHMETIC):
+                    lines.append(f'{name}:{mn} {struct.unpack_from("<I", code, o)[0]:08x}')
+                    got += 1
+            self.assertGreater(got, 0, name)
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / 'words'
+            f.write_text('\n'.join(lines) + '\n')
+            r = subprocess.run(['cargo', 'test', '-q', '-p', 'natemu-abi', 'producer_words_are_all_in_the_flushing_class'], cwd=Path(__file__).resolve().parents[2],
+                               env={**os.environ, 'NATEMU_PRODUCER_WORDS': str(f)}, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-2000:])
+
     def test_everything_else_leaves_the_flush(self):
         cases = {
             'movaps': ('0f28c2', self.ADDPS), 'andps': ('0f54c2', self.ADDPS), 'andpd (scalar use)': ('660f54c2', self.ADDSD),
