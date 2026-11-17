@@ -2389,7 +2389,7 @@ mod tests {
     /// A word in the middle of a straight-line block (`mov x4, x20` after the first load).
     const MIDDLE: (u32, u32) = (0xc, 0xaa14_03e4);
 
-    fn itertools_product<'a>(modes: [bool; 2], keys: [&'a [&'a str]; 4]) -> Vec<(bool, &'a [&'a str])> {
+    fn key_modes<'a>(modes: [bool; 2], keys: [&'a [&'a str]; 4]) -> Vec<(bool, &'a [&'a str])> {
         modes.iter().flat_map(|&m| keys.iter().map(move |&k| (m, k))).collect()
     }
     /// AFP fallback chunk 3a: with `FEXC` set, the code of the software DAZ and FTZ flushes (and of the unmasked-PE check under
@@ -2411,7 +2411,7 @@ mod tests {
         for hex in forms {
             let source: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
             // (chunk 5: accurate mode too: DAZ + FTZ there is FZ = 0 with the software input flush, and must not spill)
-            for (accurate, keys) in itertools_product([false, true], [&[][..], &["--daz"], &["--ftz"], &["--daz", "--ftz"]]) {
+            for (accurate, keys) in key_modes([false, true], [&[][..], &["--daz"], &["--ftz"], &["--daz", "--ftz"]]) {
                 for unmasked in ["0", "0x20", "0x3f"] {
                     let object = dir.join("o");
                     let json = dir.join("j");
@@ -2467,6 +2467,14 @@ mod tests {
             let w = words(hex, &["--accurate", "--daz", "--ftz"]);
             let (m, b) = (w.iter().position(|&x| is_fmul(x)).expect("a multiply"), w.iter().position(|&x| is_bic(x)).expect("a flush"));
             assert!(b < m, "{hex}: the first flush at {b} is after the first multiply at {m}");
+            // every sign-mask multiply reads a register written by an earlier `bic` (the flush); the other operand is the constant (`fmov`)
+            for (i, &x) in w.iter().enumerate().filter(|&(_, &x)| is_fmul(x)) {
+                let (rn, rm) = (x >> 5 & 31, x >> 16 & 31);
+                let flushed = |r: u32| w[..i].iter().any(|&y| is_bic(y) && y & 31 == r);
+                assert!(flushed(rn) || flushed(rm), "{hex}: the multiply at {i} has no flushed source");
+            }
+            // FCADD is a Keep word in the handler's table: accurate mode must never emit it (its exact tiny lanes would trap unflushed)
+            assert!(!w.iter().any(|&x| x & 0xbf20_ec00 == 0x2e00_e400), "{hex}: fcadd");
             // the other keys and modes: no flush at all with DAZ + FTZ in fast mode (FZ = 1), and accurate FTZ alone flushes outputs only
             assert!(!words(hex, &["--daz", "--ftz"]).iter().any(|&x| is_bic(x)), "{hex}: fast mode has no flush");
         }
