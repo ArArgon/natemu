@@ -1,0 +1,14 @@
+[package]
+name = "natemu-qcow"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "qcow2 image code vendored from Cloud Hypervisor (see README.md), adapted for macOS"
+license = "Apache-2.0 AND BSD-3-Clause"
+
+[dependencies]
+bitflags.workspace = true
+libc.workspace = true
+log.workspace = true
+thiserror.workspace = true
+zerocopy = { workspace = true, features = ["derive"] }
