@@ -1282,10 +1282,48 @@ def self_check():
         rejected('multidisk', lines[:2] + lines[3:], host)
         rejected('multidisk', lines[:2] + [lines[3], lines[2]] + lines[4:], host)
     rejected('multidisk', multi((1, 5, 4)), dict(base, disks=facts, transport='pci', written=True))
+    # sharedintx: the judge rejects a missing, extra or misplaced disk, an MSI under pci=nomsi, an unshared line, I/O
+    # failures, errors, a disabled line, an unfinished load, a bad image, a slow or failed stale step, a missing step.
+    def shared(phase, n):
+        lines = [f'COV-BEGIN case=sharedintx phase={phase} cpus=2 kernel={KVER}']
+        lines += [f'COV-DISK {vd_name(k)} dev=/sys/devices/pci0000:00/0000:00:{1 if k == 0 else 3 + k:02x}.0/virtio{k}' for k in range(n)]
+        lines += [f'COV-NDISKS {n}', 'COV-IRQ 16:        6   IO-APIC  16-fasteoi   virtio0, virtio3',
+                  'COV-IRQ 18:        5   IO-APIC  18-fasteoi   virtio5, virtio2', 'COV-IRQ 19:        3   IO-APIC  19-fasteoi   virtio6']
+        if phase == 'load': lines += ['COV-LOAD t0=3.05 t1=6.04']
+        else:
+            lines += ['COV-STALE-DEVS a=vda b=vdb irq_a=16', 'COV-STALE step=base a=[rc=0 s=0.05] b=[rc=0 s=0.03]',
+                      'COV-STALE step=unbound a=[rc=0 s=0.03]', 'COV-STALE step=rebound a=[rc=0 s=0.03] b=[rc=0 s=0.02]',
+                      'COV-STALE step=msix-off a=[rc=0 s=0.05]', 'COV-STALE step=msix-off-later a=[rc=0 s=0.05]']
+        return lines + ['COV-SHARED-ERRORS io=0 timeouts=0 unhandled=0', f'COV-PASS case=sharedintx phase={phase}']
+    def shared_rejected(phase, n, lines, host):
+        assert sharedintx_judge('\n'.join(lines) + '\n', host, phase, n), (phase, lines, host); count[0] += 1
+    for phase in ('load', 'stale'):
+        n, lines = 8, shared(phase, 8)
+        host = {'rc': 0, 'timeout': False, 'stop': POWEROFF[0], 'backend_errors': [], 'written': phase == 'load'}
+        assert not sharedintx_judge('\n'.join(lines) + '\n', host, phase, n), sharedintx_judge('\n'.join(lines) + '\n', host, phase, n)
+        for k, v in (('rc', 1), ('timeout', True), ('stop', 'natemu: Cancelled'), ('backend_errors', ['virtio-block: x'])):
+            shared_rejected(phase, n, lines, dict(host, **{k: v}))
+        shared_rejected(phase, 9, lines, host)
+        for i, line in enumerate(lines):
+            for old, new in (('io=0', 'io=1'), ('timeouts=0', 'timeouts=2'), ('unhandled=0', 'unhandled=1'), ('COV-NDISKS 8', 'COV-NDISKS 9'),
+                             ('00:05.0', '00:06.0'), ('vdb dev', 'vdc dev'),
+                             ('rc=0 s=0.05', 'rc=143 s=30.02'), ('rc=0 s=0.03', 'rc=0 s=9.10'), ('irq_a=16', 'irq_a=24'),
+                             ('COV-PASS', 'COV-NOPASS'), ('COV-LOAD t0', 'COV-NOLOAD t0')):
+                if old in line: shared_rejected(phase, n, lines[:i] + [line.replace(old, new, 1)] + lines[i + 1:], host)
+            if line.startswith(('COV-DISK', 'COV-STALE step')): shared_rejected(phase, n, lines[:i] + lines[i + 1:], host)
+        shared_rejected(phase, n, lines + ['COV-IOFAIL read-vdc-1'], host)
+        shared_rejected(phase, n, lines + ['[    4.38] Call Trace:'], host)
+        if phase == 'load':    # sharing is required under load only
+            for old, new in (('virtio0, virtio3', 'virtio0'), ('virtio5, virtio2', 'virtio5')):
+                shared_rejected(phase, n, [l.replace(old, new) for l in lines], host)
+            shared_rejected(phase, n, lines, dict(host, written=False))
+            shared_rejected(phase, n, lines + ['COV-IRQ 24:        3   PCI-MSIX-0000:00:01.0   1-edge      virtio0-req.0'], host)
+        else:
+            shared_rejected(phase, n, lines + ['COV-STALE-DMESG [    4.38] Disabling IRQ #16'], host)
     controls += count[0]
     pci_self_test()
     for script in (INIT, INIT_PCI): subprocess.run(['sh', '-n'], input=script, text=True, check=True)
-    print(f'PASS: {len(CASES)} cases x 2 launches judged; {controls} negative judge controls; readonly/multidisk judges; GPT/limit-oracle/sparse-copy checks; shell syntax. No VM.')
+    print(f'PASS: {len(CASES)} cases x 2 launches judged; {controls} negative judge controls; readonly/multidisk/sharedintx judges; GPT/limit-oracle/sparse-copy checks; shell syntax. No VM.')
 
 
 def main():
