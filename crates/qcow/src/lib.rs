@@ -15,6 +15,7 @@ mod error;
 pub mod file;
 mod header;
 mod metadata;
+mod overlay;
 mod parser;
 mod qcow_raw_file;
 mod refcount;
@@ -31,6 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use error::{BlockError, BlockErrorKind, BlockResult, ErrorContext, ErrorOp};
+pub use overlay::{create_overlay, growth_bound, refcount_coverage};
 pub use parser::{
     BackingFile, BackingFileConfig, CompressionType, Error, ImageType, IncompatFeatures,
     MissingFeatureError, QcowHeader,

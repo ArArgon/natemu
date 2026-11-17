@@ -745,6 +745,72 @@ fn the_embedded_backing_name_is_followed_only_when_the_caller_names_that_file() 
 }
 
 #[test]
+fn a_missing_overlay_is_created_over_its_base_and_an_existing_file_never_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new("create");
+    let (base, qbase) = (dir.at("base.raw"), dir.at("base.qcow2"));
+    std::fs::write(&base, base_bytes(4096)).unwrap();
+    create_ready(&qbase, 3 << 20, 16, None);
+    for (b, format, size) in [(&base, "raw", 2 << 20), (&qbase, "qcow2", 3 << 20)] {
+        let top = dir.at(&format!("top-{format}.qcow2"));
+        // Through a relative-looking path: the header records the canonical absolute one.
+        let image = open(
+            &top,
+            false,
+            Some(&dir.at(&format!(
+                "sub/../{}",
+                b.file_name().unwrap().to_str().unwrap()
+            ))),
+        );
+        assert!(image.is_err(), "sub does not exist");
+        assert!(!top.exists(), "nothing left behind");
+        let image = open(&top, false, Some(b)).unwrap();
+        assert_eq!(image.capacity, size);
+        if format == "raw" {
+            assert_eq!(read(&*image.backend, 0, 8192), base_bytes(16));
+        }
+        write(&*image.backend, 4096, &sector(1, GUEST, 8));
+        image.backend.sync(true).unwrap();
+        drop(image);
+        assert_eq!(
+            std::fs::metadata(&top).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        check_clean(&top);
+        if qemu_img().is_some() {
+            let (ok, info) = qemu(&["info", top.to_str().unwrap()]);
+            assert!(
+                ok && info.contains(&format!("backing file: {}", b.display()))
+                    && info.contains(&format!("backing file format: {format}")),
+                "{info}"
+            );
+        }
+        // Reopened (exists now): the data is there; a read-only disk opens it without creating anything.
+        let image = open(&top, true, Some(b)).unwrap();
+        assert_eq!(read(&*image.backend, 4096, 512), sector(1, GUEST, 8));
+    }
+    assert_eq!(
+        std::fs::read(&base).unwrap(),
+        base_bytes(4096),
+        "the base is never written"
+    );
+    // An existing file is opened, never replaced: a raw one with a backing is refused and left as it was.
+    let raw = dir.at("existing.raw");
+    std::fs::write(&raw, base_bytes(8)).unwrap();
+    assert!(error(&raw, false, Some(&base)).contains("a backing file needs a qcow2 image"));
+    assert_eq!(std::fs::read(&raw).unwrap(), base_bytes(8));
+    // A read-only overlay is never created; a base of a refused kind makes no overlay.
+    let none = dir.at("none.qcow2");
+    assert!(error(&none, true, Some(&base)).contains("never created"));
+    let vhdx = dir.at("x.vhdx");
+    let mut bytes = vec![0u8; 4096];
+    bytes[..8].copy_from_slice(b"vhdxfile");
+    std::fs::write(&vhdx, bytes).unwrap();
+    assert!(error(&none, false, Some(&vhdx)).contains("looks like a VHDX image"));
+    assert!(!none.exists());
+}
+
+#[test]
 fn relative_backing_names_resolve_against_the_referring_image_and_missing_ones_are_named() {
     let dir = Dir::new("relative");
     std::fs::create_dir(dir.at("sub")).unwrap();
