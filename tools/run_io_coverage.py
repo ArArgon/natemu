@@ -91,7 +91,7 @@ LIMIT = 32 * MiB + 2048          # host-limit: RLIMIT_FSIZE
 PATTERN_AT = 32 * MiB            # host-limit: 64 KiB of pattern from here
 APPLETS = ('sh', 'mount', 'umount', 'modprobe', 'cat', 'grep', 'awk', 'dd', 'wc', 'sha256sum', 'dmesg', 'sync',
            'poweroff', 'reboot', 'sleep', 'readlink', 'mkdir', 'cp', 'rm', 'stty', 'nproc', 'uname', 'mkswap', 'swapon', 'swapoff',
-           'df', 'tail', 'test', 'ls')
+           'df', 'tail', 'test', 'ls', 'blockdev')
 CASES = ('gpt', 'mbr', 'reboot-acpi', 'reboot-kbd', 'reboot-triple', 'fs-full', 'host-full', 'host-limit', 'trim')
 CONTROLS = ('host-full-control', 'host-limit-control')
 # The image each case starts from, and its extra kernel parameters.
@@ -262,23 +262,29 @@ readonly)
   mount -t iso9660 -o ro /dev/$iso /m1 || fail mount-iso
   files=0; sums=
   for f in /m1/*; do files=$((files+1)); sums="$sums$(sha $f)"; done
-  dd if=/fixtures/a.bin of=/dev/$iso bs=512 count=1 conv=notrunc 2>/dev/null; dd_rc=$?
   mount -o remount,rw /m1 2>/dev/null
   echo x > /m1/new 2>/dev/null; write_rc=$?
-  echo "COV-ISO files=$files sum=$sums dd_rc=$dd_rc write_rc=$write_rc"
   umount /m1 || fail umount-iso
+  # The flag is 1 (checked above). Try to clear it (BLKROSET): the kernel keeps a driver-set read-only flag (ro_after stays 1), so
+  # a guest cannot reach the device with a write; the device's own refusal (I/O error) is a unit test (block.rs). A missing
+  # tool (rc 127) is a failure of the check, not a refused write.
+  blockdev --setrw /dev/$iso; setrw_rc=$?
+  dd if=/fixtures/a.bin of=/dev/$iso bs=512 count=1 oflag=direct conv=notrunc 2>/dev/null; dd_rc=$?
+  echo "COV-ISO files=$files sum=$sums setrw_rc=$setrw_rc ro_after=$(cat /sys/block/$iso/ro) dd_rc=$dd_rc write_rc=$write_rc"
   if test -n "$ext"; then
     mount -t ext4 -o ro /dev/$ext /m2 || fail mount-ext
     lost=$(ls /m2)
-    dd if=/fixtures/a.bin of=/dev/$ext bs=512 count=1 conv=notrunc 2>/dev/null; dd_rc=$?
     mount -o remount,rw /m2 2>/dev/null
     echo x > /m2/new 2>/dev/null; write_rc=$?
-    echo "COV-EXT ls=$lost dd_rc=$dd_rc write_rc=$write_rc"
     umount /m2 || fail umount-ext
+    blockdev --setrw /dev/$ext; setrw_rc=$?
+    dd if=/fixtures/a.bin of=/dev/$ext bs=512 count=1 oflag=direct conv=notrunc 2>/dev/null; dd_rc=$?
+    echo "COV-EXT ls=$lost setrw_rc=$setrw_rc ro_after=$(cat /sys/block/$ext/ro) dd_rc=$dd_rc write_rc=$write_rc"
   fi
   dd if=/fixtures/a.bin of=/dev/$rw bs=512 count=1 seek=8 conv=notrunc 2>/dev/null || fail write-rw
   sync
-  if test "$phase" = share; then echo COV-HOLD; sleep 12; fi;;
+  echo "COV-RWERR n=$(dmesg | grep -c "I/O error, dev $rw")"
+  if test "$phase" = share; then n=0; while test $n -lt 25; do echo "COV-HOLD $(cat /proc/uptime)"; sleep 1; n=$((n+1)); done; fi;;
 *) fail case;;
 esac
 echo "COV-ERRORS ioerr_logs=$(ioerrs) fs_errors=$(dmesg | grep -c 'EXT4-fs error')"
@@ -546,17 +552,19 @@ def judge(case, phase, text, host, expect, pci=False):
         ro = re.findall(r'^COV-RO (\S+) ro=(\d) size=(\d+) cache=(\S+) discard=(\d+) zeroes=(\d+)$', text, re.M)
         want = [(dev, str(int(r)), str(sectors)) for dev, r, sectors in host['layout']]
         require([d[:3] for d in ro] == want, f'guest disks {ro}, expected {want}')
-        require(all((d[3] == 'write_through' and d[4] == d[5] == '0') == (d[1] == '1') for d in ro) and len(ro) == len(want),
+        require(all((d[3] == 'write_through' and d[4] == d[5] == '0') if d[1] == '1' else (d[3] == 'write_back' and d[4] != '0' and d[5] != '0') for d in ro) and len(ro) == len(want),
                 f'a read-only disk offers a write cache, discard or write-zeroes, or the writable one does not: {ro}')
-        iso = one(r'^COV-ISO files=(\d+) sum=(\S*) dd_rc=(\d+) write_rc=(\d+)$')
-        require(iso is not None and iso[:2] == ('1', host['iso_sha']) and iso[2] != '0' and iso[3] != '0', f'ISO contents or a write that did not fail: {iso}')
+        # Each read-only device: BLKROSET was accepted (not rc 127) and did not clear the flag; the write failed (not rc 127).
+        refused = lambda f: f[0] == '0' and f[1] == '1' and f[2] not in ('0', '127') and f[3] not in ('0', '127')
+        iso = one(r'^COV-ISO files=(\d+) sum=(\S*) setrw_rc=(\d+) ro_after=(\d+) dd_rc=(\d+) write_rc=(\d+)$')
+        require(iso is not None and iso[:2] == ('1', host['iso_sha']) and refused(iso[2:]), f'ISO contents, or the write was not refused: {iso}')
         if host['has_ext']:
-            ext = one(r'^COV-EXT ls=(.*) dd_rc=(\d+) write_rc=(\d+)$')
-            require(ext is not None and ext[0] == 'lost+found' and ext[1] != '0' and ext[2] != '0', f'ext4 listing or a write that did not fail: {ext}')
+            ext = one(r'^COV-EXT ls=(.*) setrw_rc=(\d+) ro_after=(\d+) dd_rc=(\d+) write_rc=(\d+)$')
+            require(ext is not None and ext[0] == 'lost+found' and refused(ext[1:]), f'ext4 listing, or the write was not refused: {ext}')
         require(host['ro_unchanged'], 'a read-only image changed on the host')
         require(host['written'], 'the writable disk did not receive its block')
-        if phase == 'share': require(one(r'^COV-HOLD$') is not None, 'guest did not reach the hold point')
-        require(io_errors == 0, 'I/O errors logged')
+        if phase == 'share': require(len(re.findall(r'^COV-HOLD ', text, re.M)) >= 20, 'guest did not hold to the end')
+        require(one(r'^COV-RWERR n=0$') is not None, 'I/O errors on the writable disk')
     elif case == 'host-full':
         if phase == 'write':
             full = one(r'^COV-HOSTFULL dd_rc=(\d+) eio=(\d) flush_rc=(\d+) ioerr_logs=(\d+)$')
@@ -801,7 +809,9 @@ def readonly_share(args, work):
     before = (digest(iso), None)
     cmdline = 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr cov_case=readonly cov_phase=share cov_rw=vdb cov_iso=vda'
     vms, errors, started = [], [], time.monotonic()
-    held = lambda n: (work / f'vm{n}-serial.log').exists() and 'COV-HOLD' in (work / f'vm{n}-serial.log').read_text(errors='replace')
+    def holds(n):    # the guest prints a COV-HOLD line every second for 25 s while it has the ISO
+        log = work / f'vm{n}-serial.log'
+        return log.read_text(errors='replace').count('COV-HOLD ') if log.exists() else 0
     try:
         for n in (1, 2):
             rw = work / f'rw{n}.raw'
@@ -810,17 +820,26 @@ def readonly_share(args, work):
             with (work / f'vm{n}-stdout.log').open('wb') as out, (work / f'vm{n}-stderr.log').open('wb') as err:
                 vms.append((subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True), rw))
         deadline = time.monotonic() + 100
-        while time.monotonic() < deadline and not (held(1) and held(2)) and all(p.poll() is None for p, _ in vms): time.sleep(0.5)
-        if not (held(1) and held(2)): errors.append('both guests did not reach the hold point')
+        while time.monotonic() < deadline and not (holds(1) and holds(2)) and all(p.poll() is None for p, _ in vms): time.sleep(0.5)
+        if not (holds(1) and holds(2)): errors.append('both guests did not reach the hold point')
         else:
+            seen = (holds(1), holds(2))
             with iso.open('rb') as f:    # the advisory lock the VMs use (flock): a writer is refused, another reader is not
                 try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); errors.append('an exclusive lock on the shared ISO succeeded')
                 except BlockingIOError: pass
                 fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
             command = readonly_config(args, work, 'writer', 'mmio', [(iso, False)], cmdline)
-            done = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-            if done.returncode == 0 or b'disk lock: held by another process' not in done.stderr:
-                errors.append(f'a writable launch on the shared ISO was not refused by the lock (rc={done.returncode}): {done.stderr[-300:]!r}')
+            writer = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            try: _, werr = writer.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                stop_group(writer); errors.append('a writable launch on the shared ISO did not exit (it was not refused by the lock)')
+            else:
+                if writer.returncode == 0 or b'disk lock: held by another process' not in werr:
+                    errors.append(f'a writable launch on the shared ISO was not refused by the lock (rc={writer.returncode}): {werr[-300:]!r}')
+            # Both VMs held the lock at once: each is still running and prints a further COV-HOLD line after the tests above.
+            end = time.monotonic() + 15
+            while time.monotonic() < end and not (holds(1) > seen[0] and holds(2) > seen[1]): time.sleep(0.5)
+            if not (holds(1) > seen[0] and holds(2) > seen[1] and all(p.poll() is None for p, _ in vms)): errors.append('the two VMs did not both keep the shared ISO while the lock was tested')
         for n, (process, rw) in enumerate(vms, 1):
             timeout = False
             try: process.wait(timeout=120)
@@ -1026,9 +1045,51 @@ def self_check():
         assert struct.unpack_from('<I', data, SECTOR + 88)[0] == zlib.crc32(data[2 * SECTOR:2 * SECTOR + 128 * 128])
         assert data[-33 * SECTOR:-SECTOR] == data[2 * SECTOR:34 * SECTOR] and data[510:512] == b'\x55\xaa' and data[450] == 0xee
         copy = Path(tmp) / 'c.raw'; sparse_copy(path, copy); assert copy.read_bytes() == data
+    # readonly and multidisk: the judge rejects a missing read-only flag, a writable result, a changed host image, a missing or
+    # reordered disk, a wrong transport or slot, and every changed marker value.
+    count = [0]
+    def tail(case): return ['COV-ERRORS ioerr_logs=0 fs_errors=0', 'COV-DMESG-BEGIN', 'COV-DMESG-END', f'COV-PASS case={case} phase=write']
+    def judged(case, lines, host): return judge(case, 'write', '\n'.join(lines) + '\n', host, expect)
+    def rejected(case, lines, host): assert judged(case, lines, host), (case, lines, host); count[0] += 1
+    def mutate(lines, host, case, prefixes, bad_hosts):
+        for i, line in enumerate(lines):
+            if line.split()[0] not in prefixes: continue
+            for field in line.split()[1:]:
+                key, _, value = field.partition('=')
+                if key == 'dev': continue    # the virtio instance number is free; the transport and the slots are judged below
+                new = {'0': '1', '1': '0'}.get(value, '0' if value.isdigit() else value[:-1] + ('1' if value.endswith('0') else '0'))
+                rejected(case, lines[:i] + [line.replace(field, f'{key}={new}')] + lines[i + 1:], host)
+        for k, v in bad_hosts: rejected(case, lines, dict(host, **{k: v}))
+    base = {'rc': 0, 'timeout': False, 'stop': POWEROFF[0], 'changed': True, 'fsck': [], 'table': True, 'exact': None, 'backend_errors': []}
+    begin = lambda case: f'COV-BEGIN case={case} phase=write cpus=2 kernel={KVER}'
+    rw = 'COV-RO vda ro=0 size=16384 cache=write_back discard=2147483648 zeroes=2147483648'
+    iso, ext = 'COV-RO vdb ro=1 size=1800 cache=write_through discard=0 zeroes=0', 'COV-RO vdc ro=1 size=131072 cache=write_through discard=0 zeroes=0'
+    refusal = 'setrw_rc=0 ro_after=1 dd_rc=1 write_rc=1'
+    good = [begin('readonly'), rw, iso, ext, f'COV-ISO files=1 sum={"ab" * 32} {refusal}', f'COV-EXT ls=lost+found {refusal}', 'COV-RWERR n=0'] + tail('readonly')
+    host = dict(base, layout=[('vda', False, 16384), ('vdb', True, 1800), ('vdc', True, 131072)], iso_sha='ab' * 32, has_ext=True, written=True, ro_unchanged=True)
+    assert not judged('readonly', good, host), judged('readonly', good, host)
+    mutate(good, host, 'readonly', ('COV-RO', 'COV-ISO', 'COV-EXT', 'COV-RWERR'),
+           [('written', False), ('ro_unchanged', False), ('iso_sha', 'cd' * 32),
+            ('layout', [('vda', False, 16384), ('vdb', False, 1800), ('vdc', True, 131072)]), ('layout', [('vda', True, 16384), ('vdb', True, 1800), ('vdc', True, 131072)]),
+            ('layout', [('vda', False, 16384), ('vdc', True, 131072), ('vdb', True, 1800)])])
+    for bad in (good[:2] + good[3:], good[:2] + [good[3], good[2]] + good[4:], [l for l in good if not l.startswith('COV-EXT')],
+                [l.replace('setrw_rc=0', 'setrw_rc=127') for l in good], [l.replace('dd_rc=1', 'dd_rc=127') for l in good]):
+        rejected('readonly', bad, host)
+    facts = [(size, f'{i:08x}{i + 1:012x}', sha(bytes([i]))) for i, size in enumerate((8 * MiB, 16 * MiB, 24 * MiB))]
+    def multi(slots):
+        dev = (lambda n: '/LNRO0005:0%d/virtio%d' % (n, n)) if slots is None else (lambda n: '/pci0000:00/0000:00:%02x.0/virtio%d' % (slots[n], n))
+        return [begin('multidisk')] + [f'COV-DISK vd{c} size={f[0] // SECTOR} serial={f[1]} head={f[2]} dev={dev(n)}' for n, (c, f) in enumerate(zip('abc', facts))] + ['COV-NODISK vdd'] + tail('multidisk')
+    for transport, lines in (('mmio', multi(None)), ('pci', multi((1, 4, 5)))):
+        host = dict(base, disks=facts, transport=transport, written=True)
+        assert not judged('multidisk', lines, host), (transport, judged('multidisk', lines, host))
+        mutate(lines, host, 'multidisk', ('COV-DISK',), [('written', False), ('disks', facts[1:] + facts[:1]), ('disks', facts[:2]), ('transport', 'pci' if transport == 'mmio' else 'mmio')])
+        rejected('multidisk', lines[:2] + lines[3:], host)
+        rejected('multidisk', lines[:2] + [lines[3], lines[2]] + lines[4:], host)
+    rejected('multidisk', multi((1, 5, 4)), dict(base, disks=facts, transport='pci', written=True))
+    controls += count[0]
     pci_self_test()
     for script in (INIT, INIT_PCI): subprocess.run(['sh', '-n'], input=script, text=True, check=True)
-    print(f'PASS: {len(CASES)} cases x 2 launches judged; {controls} negative judge controls; GPT/limit-oracle/sparse-copy checks; shell syntax. No VM.')
+    print(f'PASS: {len(CASES)} cases x 2 launches judged; {controls} negative judge controls; readonly/multidisk judges; GPT/limit-oracle/sparse-copy checks; shell syntax. No VM.')
 
 
 def main():
