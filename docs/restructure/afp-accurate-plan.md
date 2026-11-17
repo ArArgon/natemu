@@ -396,6 +396,8 @@ results and flags bit-identical.
 2. **The standing suite:** should the full suite gain two FP groups in M2 emulation? Both would run run_i5c, run_i5a_de,
    run_i6_faults, run_i8_faults, the FEX ASM suite, i8 and i8b: one in fast mode, judged with deviations, and one in
    accurate mode, judged fully. That adds their run time to every merge.
+   **Owner (Nov 16): yes.** Built as `*-m2f` / `*-m2a` steps in tools/run_suite.py (i5c, i5a-de, i6-faults, i8-faults in both; i8 and
+   i8b fast only until accurate chunk 4); the FEX ASM suite is not in them.
 
 Decided here, with reasons in the text; the owner may overrule any of them:
 - the hygiene rule;
