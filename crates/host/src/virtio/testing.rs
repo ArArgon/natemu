@@ -3,7 +3,7 @@
 //! is before entering a native call. `commit` records one request's RAM publication, before
 //! IRQ/index retirement.
 use super::{
-    block::{Calls, Native},
+    block::Calls,
     *,
 };
 use std::sync::atomic::AtomicUsize;
@@ -231,13 +231,13 @@ pub struct ControlReport {
     events: Vec<String>,
 }
 pub(super) struct Controlled {
-    native: Native,
+    native: Box<dyn Calls>,
     control: Arc<Control>,
     /// Calls of a ReadError/WriteError schedule so far (BatchError: 1 after its short call, 2 after its EIO).
     phase: AtomicUsize,
 }
 impl Controlled {
-    pub fn new(native: Native, control: Arc<Control>) -> Self {
+    pub fn new(native: Box<dyn Calls>, control: Arc<Control>) -> Self {
         Self {
             native,
             control,
@@ -323,8 +323,11 @@ impl Calls for Controlled {
         });
         result
     }
-    fn punch(&self, offset: u64, len: u64) -> std::io::Result<()> {
-        self.native.punch(offset, len)
+    fn discard(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.native.discard(offset, len)
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        self.native.write_zeroes(offset, len)
     }
 }
 

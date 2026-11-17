@@ -13,6 +13,7 @@ pub mod boot;
 pub mod clock;
 pub mod compile_cache;
 pub mod devices;
+mod disk;
 pub mod execution;
 mod ioapic;
 pub mod irq;
