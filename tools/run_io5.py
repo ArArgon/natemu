@@ -317,7 +317,7 @@ def run(args):
     server, host = serve_files(serve)
     result = {'image_format': args.image_format, 'qcow2_prep_seconds': prep if qcow and not overlay else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
               'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'perf_log': args.perf_log, 'command': [str(c) for c in command(args, disk, 'CACHE')],
-              'natemu': digest(ROOT / 'target/release/natemu') if args.backend == 'natemu' else None, 'phases': {}}
+              'natemu': digest(args.natemu or ROOT / 'target/release/natemu') if args.backend == 'natemu' else None, 'phases': {}}
     try:
         time.sleep(1); assert server.poll() is None, 'http server'
         with open(args.lock, 'a') as lock:
@@ -442,6 +442,8 @@ def main():
     r = sub.add_parser('run')
     r.add_argument('--backend', choices=('natemu', 'qemu'), required=True)
     r.add_argument('--inputs', type=Path, required=True); r.add_argument('--out', type=Path, required=True)
+    r.add_argument('--natemu', type=Path, help='the natemu binary (default: target/release/natemu)')
+    r.add_argument('--runtime', type=Path, help='the resident natemu-runtime (default: beside the binary)')
     r.add_argument('--fexc', type=Path, default=FEXC); r.add_argument('--vcpus', type=int, default=4)
     r.add_argument('--ram', type=int, default=8, help='GiB'); r.add_argument('--limit', type=int, default=7200, help='use-phase seconds')
     r.add_argument('--speculation-barriers', action='store_true', help="natemu's page-walk barriers (RDCL_NO: Linux runs without PTI)")
