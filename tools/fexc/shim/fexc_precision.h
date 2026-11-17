@@ -285,29 +285,41 @@ template<class Emitter> struct SoftDe {
     Ref Exp = IR->_VUShrI(Int, Es, T, E == 4 ? 24 : 53);
     return {IR->_VAndn(Int, IR->_VCMPEQZ(Int, Es, Exp), Zero), Zero, Exp};
   }
+  // An operand the in-block skip knows is no denormal in the examined lanes (BuildSimdDe's `Skip`): no `Den` (null); `Zero` only when asked
+  // (a divisor), `Exp` too for an FMA's operands.
+  Class OfKnown(Ref X, bool WantZero, bool WantExp) {
+    Ref T = WantZero || WantExp ? IR->_VShlI(Int, Es, X, 1) : nullptr;
+    Ref Zero = WantZero || WantExp ? IR->_VCMPEQZ(Int, Es, T) : nullptr;
+    Ref Exp = WantExp ? IR->_VUShrI(Int, Es, T, E == 4 ? 24 : 53) : nullptr;
+    return {nullptr, Zero, Exp};
+  }
+  Ref OrN(Ref A, Ref C) { return A && C ? Or(A, C) : A ? A : C; }
   Ref NotNaN(Ref X) { return IR->_VFCMPEQ(Cmp, Es, X, X); }   // quiet: an SNaN lane raises IOC, as the op itself does
   Ref Or(Ref A, Ref C) { return IR->_VOr(Int, A, C); }
   Ref And(Ref A, Ref C) { return IR->_VAnd(Int, A, C); }
   Ref Andn(Ref A, Ref C) { return IR->_VAndn(Int, A, C); }   // A & ~C
-  Ref Bin(Ref A, Ref C, bool Div = false) {
-    const Class Ca = Of(A), Cb = Of(C);
-    Ref D = Div ? Or(Andn(Ca.Den, Cb.Zero), Cb.Den) : Or(Ca.Den, Cb.Den);   // a denormal divided by zero is ZE
+  // `Skip` bit 0 / 1: the operand is known to hold no denormal in the examined lanes (its NaN and zero lanes still matter: a NaN beside a
+  // denormal suppresses DE, a zero divisor too); at least one operand is tested.
+  Ref Bin(Ref A, Ref C, bool Div = false, uint32_t Skip = 0) {
+    const Class Ca = Skip & 1 ? OfKnown(A, false, false) : Of(A), Cb = Skip & 2 ? OfKnown(C, Div, false) : Of(C);
+    Ref D = Skip ? (Div && Ca.Den ? Andn(Ca.Den, Cb.Zero) : Skip & 1 ? Cb.Den : Ca.Den)
+                 : Div ? Or(Andn(Ca.Den, Cb.Zero), Cb.Den) : Or(Ca.Den, Cb.Den);   // a denormal divided by zero is ZE
     return And(D, And(NotNaN(A), NotNaN(C)));
   }
   Ref Sqrt(Ref A) { return Andn(Of(A).Den, IR->_VCMPLTZ(Int, Es, A)); }   // a negative operand is IE
-  Ref Fma(Ref A, Ref C, Ref Add, bool Flip) {
+  Ref Fma(Ref A, Ref C, Ref Add, bool Flip, uint32_t Skip = 0) {   // `Skip` bits 0..2 as for Bin
     // No DE beside IE: inf * 0, and an infinite product with an infinite addend of the opposite effective sign (inf - inf). A NaN lane
     // is out already (Nn), so an exponent field of all ones is an infinity here. Built operand by operand to keep few registers live
     // (an ymm FMADDSUB with IE and DE both unmasked spilled with all three classes at once).
     auto Ones = [&] { return E == 4 ? IR->_VectorImm(Int, Es, 0xff) : IR->_VDupFromGPR(Int, Es, IR->_Constant(0x7ff)); };   // (made where used: short-lived)
-    const Class Ca = Of(A), Cb = Of(C);
+    const Class Ca = Skip & 1 ? OfKnown(A, true, true) : Of(A), Cb = Skip & 2 ? OfKnown(C, true, true) : Of(C);
     Ref Ia = IR->_VCMPEQ(Int, Es, Ca.Exp, Ones()), Ib = IR->_VCMPEQ(Int, Es, Cb.Exp, Ones());
     Ref Bad = Or(And(Ia, Cb.Zero), And(Ca.Zero, Ib));
     Ref Inf = Or(Ia, Ib);
-    Ref Dn = Or(Ca.Den, Cb.Den);
+    Ref Dn = OrN(Ca.Den, Cb.Den);
     Ref Nn = And(NotNaN(A), NotNaN(C));
-    const Class Cc = Of(Add);
-    Dn = Or(Dn, Cc.Den);
+    const Class Cc = Skip & 4 ? OfKnown(Add, true, true) : Of(Add);
+    Dn = OrN(Dn, Cc.Den);
     Nn = And(Nn, NotNaN(Add));
     Ref Ic = IR->_VCMPEQ(Int, Es, Cc.Exp, Ones());
     Ref Odd = IR->_VCMPLTZ(Int, Es, IR->_VXor(Int, IR->_VXor(Int, A, C), Add));   // an odd number of the three operands is negative
@@ -325,22 +337,28 @@ template<class Emitter> struct SoftDe {
 // `Spanned` (accurate mode's masked DE, chunk 2 B): the test is placed inside a span that FexcSimdSkip opens, which skips it when no
 // examined lane of a source is a zero or denormal (exponent field zero); the caller closes the span (FexcSimdSkipEnd) after the flag's
 // use. The screen covers a full 128-bit op or a scalar one; a 64-bit operand (a widening convert's low half) keeps the plain test.
-template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEXCore::IR::Ref Node, const FEXCore::IR::IROp_Header* Op, const DeRule& R, bool* Spanned = nullptr) {
+// `Skip` (bit i: operand i of the rule; only with `Spanned`, a Bin, Div, Sqrt, Fma or Unary rule): the operand is known to hold no denormal in
+// the lanes the op examines (the result of an earlier op in the block: SimdDeKnown), so it is left out of the screen and of the test's denormal
+// term, though its NaN and zero lanes still count (they suppress DE); none left: no test at all (null).
+template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEXCore::IR::Ref Node, const FEXCore::IR::IROp_Header* Op, const DeRule& R, bool* Spanned = nullptr, uint32_t Skip = 0) {
   using namespace FEXCore::IR;
   auto View = IREmit->ViewIR();
   auto Arg = [&](int i) { return View.GetNode(Op->Args[R.Arg[i]]); };
   IREmit->SetWriteCursorBefore(Node);
   if (Spanned && (R.Scalar || R.B == 16)) {
     const int N = R.K == DeRule::Fma ? 3 : R.K == DeRule::Bin || R.K == DeRule::Div || R.K == DeRule::Pair || R.K == DeRule::Cadd ? 2 : 1;
-    Ref A = Arg(0);
-    IREmit->_FexcSimdSkip(A, N > 1 ? Arg(1) : A, N > 2 ? Arg(2) : A, N | (R.Scalar ? 1u << 8 : 0u) | (R.E == 8 ? 1u << 9 : 0u));
+    Ref Kept[3] = {};
+    int M = 0;
+    for (int i = 0; i < N; ++i) if (!(Skip >> i & 1)) Kept[M++] = Arg(i);
+    if (!M) return nullptr;   // every operand known: nothing can set DE
+    IREmit->_FexcSimdSkip(Kept[0], M > 1 ? Kept[1] : Kept[0], M > 2 ? Kept[2] : Kept[0], M | (R.Scalar ? 1u << 8 : 0u) | (R.E == 8 ? 1u << 9 : 0u));
     *Spanned = true;
   }
   SoftDe<Emitter> D(IREmit, R.E, R.B, R.Scalar);
   Ref M = nullptr;
   switch (R.K) {
-  case DeRule::Bin: M = D.Bin(D.Canon(Arg(0)), D.Canon(Arg(1))); break;
-  case DeRule::Div: M = D.Bin(D.Canon(Arg(0)), D.Canon(Arg(1)), true); break;
+  case DeRule::Bin: M = D.Bin(D.Canon(Arg(0)), D.Canon(Arg(1)), false, Skip); break;
+  case DeRule::Div: M = D.Bin(D.Canon(Arg(0)), D.Canon(Arg(1)), true, Skip); break;
   case DeRule::Sqrt: M = D.Sqrt(D.Canon(Arg(0))); break;
   case DeRule::Unary: {
     Ref X = Arg(0);
@@ -348,7 +366,7 @@ template<class Emitter> inline FEXCore::IR::Ref BuildSimdDe(Emitter* IREmit, FEX
     M = D.Of(D.Canon(X)).Den;
     break;
   }
-  case DeRule::Fma: M = D.Fma(D.Canon(Arg(0)), D.Canon(Arg(1)), D.Canon(Arg(2)), R.Flip); break;
+  case DeRule::Fma: M = D.Fma(D.Canon(Arg(0)), D.Canon(Arg(1)), D.Canon(Arg(2)), R.Flip, Skip); break;
   case DeRule::Pair: {   // HADD/HSUB: the even and odd elements of the two sources are one op's operands
     if (R.B != 16) ERROR_AND_DIE_FMT("fexc slice1 (AFP fallback 3b): a pairwise op of {} bytes", R.B);
     Ref X = Arg(0), Y = Arg(1);
@@ -509,15 +527,45 @@ inline bool TinyDescOf(const FEXCore::IR::IROp_Header* Op, TinyDesc& D) {
   default: D.Meta = 0; return true;
   }
 }
+// (declared here for PlaceFPChecks, defined with PlaceFlushes below) the result of an op the handler leaves free of denormals, and the ops that
+// write no XMM static register.
+struct FlushedResult { uint32_t Elem = 0; bool Scalar = false; };
+inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op);
+inline bool FlushedResultOf(const FEXCore::IR::IROp_Header* Op, FlushedResult& P);
+// The ops that write PSTATE.NZCV (Commits' list of them): none may precede a check that exits with the state before its instruction.
+inline bool NzcvWriterOp(FEXCore::IR::IROps Op) {
+  using namespace FEXCore::IR;
+  switch (Op) {
+  case OP_FCMP: case OP_STORENZCV: case OP_ADDWITHFLAGS: case OP_ADDNZCV: case OP_SETSMALLNZV: case OP_CARRYINVERT: case OP_AXFLAG: case OP_RMIFNZCV:
+  case OP_CONDADDNZCV: case OP_CONDSUBNZCV: case OP_ADCWITHFLAGS: case OP_ADCZEROWITHFLAGS: case OP_SBBWITHFLAGS: case OP_ADCNZCV: case OP_SBBNZCV:
+  case OP_SUBWITHFLAGS: case OP_CMPPAIRZ: case OP_SUBNZCV: case OP_ANDWITHFLAGS: case OP_TESTNZ: case OP_TESTZ: case OP_SHIFTFLAGS: case OP_ROTATEFLAGS:
+    return true;
+  default: return false;
+  }
+}
 // Places the checks (run at the start of flag elimination, after the x87 stack pass, before register allocation). An
 // instruction whose floating-point op follows its first commit has no exact check point: the compile fails (a producer bug).
 template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a template: IREmitter is complete only in its caller)
   using namespace FEXCore::IR;
   auto IR = IREmit->ViewIR();
   const uint64_t Rip0 = IR.GetHeader()->OriginalRIP;
+  // In-block skip of the masked DE screen (accurate mode, no AFP, DE masked, DAZ and FTZ clear): an operand lane that is the result of an
+  // earlier floating-point arithmetic op of an earlier guest instruction in the block, at the same element size and lanes (as PlaceFlushes'
+  // `Produced`: the result, or a load of the guest XMM register it was stored to), is never a denormal the screen could find, for every tiny
+  // result traps (UFE) and the resident's handler then leaves a flag (`frame::DE_PENDING`) that the check placed before the next instruction
+  // with a skipped operand tests (a DENORM stub: the block exits there and the dispatcher's next block screens the value as an entry value).
+  // Tracked per lane and element size, per IR block; block-entry values, loads, shuffles, moves, logic ops, partial merges, other element
+  // sizes, x87 results, conversions, MIN/MAX, the estimates and FEX's helper multiplies are unknown (screened as before). No dedupe of
+  // repeated screens of one value: DE is no function of the value alone (a NaN beside it, a zero divisor, sqrt of a negative, inf * 0).
+  const bool Skippable = fexc_no_afp && fexc_accurate && !(uint64_t(fexc_simd_unmasked) >> 1 & 1) && !fexc_daz && !fexc_ftz;
   for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
     std::vector<std::pair<Ref, IROps>> Insn;
     uint64_t Rip = ~0ull;
+    struct Prod { uint32_t Elem = 0; bool Scalar = false; uint32_t Id = 0; };
+    std::map<Ref, Prod> Produced;
+    Prod InReg[16];
+    bool Known[16] = {}, Dirty = false, Pending = false;   // Dirty: an op that can leave the flag ran since the last check
+    uint32_t Id = 0;                                       // the guest instruction's number in this IR block
     auto Finish = [&]() {
       if (Rip == ~0ull || Insn.empty()) return;
       const bool X87 = fexc_x87.count(Rip) != 0;
@@ -572,12 +620,43 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           X87De = BuildX87De(IREmit, Insn, First);
         } else if (SimdDe) {
           fexc_simd_de_masked.insert(Rip);
+          // The skipped operands of each op (bit k: operand k of its rule), only for the instruction's first floating-point op, which comes
+          // before every commit and NZCV write, so the exit check placed before it sees the state before the instruction.
+          std::vector<uint32_t> Skips(Insn.size(), 0);
+          if (Skippable && !Produced.empty()) {
+            size_t FirstFp = 0;
+            while (FirstFp < Insn.size() && !SimdFPOp(Insn[FirstFp].second)) ++FirstFp;
+            bool Ok = FirstFp < First;
+            for (size_t i = 0; Ok && i < FirstFp; ++i) Ok = !NzcvWriterOp(Insn[i].second);
+            for (size_t i = 0; Ok && i < Insn.size(); ++i) {
+              const auto* Op = IR.template GetOp<IROp_Header>(Insn[i].first);
+              DeRule R;
+              if (FexcMade.count(Insn[i].first) || IsAddSubMul(IR, Op) || !DeRuleOf(Op, R)) continue;
+              if (!(R.Scalar || R.B == 16) || R.Upper || !(R.K == DeRule::Bin || R.K == DeRule::Div || R.K == DeRule::Sqrt || R.K == DeRule::Fma || R.K == DeRule::Unary)) continue;
+              const int N = R.K == DeRule::Fma ? 3 : R.K == DeRule::Bin || R.K == DeRule::Div ? 2 : 1;
+              for (int k = 0; k < N; ++k) {
+                const auto It = Produced.find(IR.GetNode(Op->Args[R.Arg[k]]));
+                if (It != Produced.end() && It->second.Id != Id && It->second.Elem == R.E && (!It->second.Scalar || R.Scalar)) Skips[i] |= 1u << k;
+              }
+              if (Skips[i] && i != FirstFp) Ok = false;
+            }
+            if (!Ok) std::fill(Skips.begin(), Skips.end(), 0);
+            else if (Dirty && FirstFp < Insn.size() && Skips[FirstFp]) {
+              const auto* Op = IR.template GetOp<IROp_Header>(Insn[FirstFp].first);
+              DeRule R;
+              DeRuleOf(Op, R);
+              IREmit->SetWriteCursorBefore(Insn[FirstFp].first);
+              Ref A = IR.GetNode(Op->Args[R.Arg[0]]);
+              IREmit->_FexcSimdSkip(A, A, A, 1u << 10);   // the check: exit (before this instruction) when the handler left a denormal result
+              Dirty = false;
+            }
+          }
           for (size_t i = 0; i < Insn.size(); ++i) {
             const auto* Op = IR.template GetOp<IROp_Header>(Insn[i].first);
             DeRule R;
             if (!FexcMade.count(Insn[i].first) && !IsAddSubMul(IR, Op) && DeRuleOf(Op, R)) {
               bool Spanned = false;
-              if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R, &Spanned)) IREmit->_FexcSimdDe(F);
+              if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R, &Spanned, Skips[i])) IREmit->_FexcSimdDe(F);
               if (Spanned) IREmit->_FexcSimdSkipEnd();
             }
           }
@@ -665,8 +744,31 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
       if (IROp->Op == OP_GUESTOPCODE) {
         Finish();
         Insn.clear();
+        Dirty |= Pending;
+        Pending = false;
+        ++Id;
         Rip = Rip0 + IROp->template C<IROp_GuestOpcode>()->GuestEntryOffset;
         continue;
+      }
+      if (Skippable) {   // (as PlaceFlushes: the XMM registers' last stored values; a producer's number is its instruction's)
+        if (IROp->Op == OP_STOREREGISTER) {
+          const PhysicalRegister PR(CodeNode);
+          if (PR.AsRegClass() == RegClass::FPRFixed && PR.Reg < 16) {
+            const auto It = Produced.find(IR.GetNode(IROp->Args[0]));
+            Known[PR.Reg] = It != Produced.end() && OpSizeToSize(IROp->Size) == 16;
+            if (Known[PR.Reg]) InReg[PR.Reg] = It->second;
+          }
+        } else {
+          if (HasSideEffects(IROp->Op) && !KeepsStaticFPRs(IROp->Op)) std::fill(std::begin(Known), std::end(Known), false);
+          FlushedResult P;
+          if (IROp->Op == OP_LOADREGISTER) {
+            const auto* L = IROp->template C<IROp_LoadRegister>();
+            if (L->Class == RegClass::FPR && L->Reg < 16 && Known[L->Reg]) Produced[CodeNode] = InReg[L->Reg];
+          } else if (Rip != ~0ull && !fexc_x87.count(Rip) && !IsAddSubMul(IR, IROp) && FlushedResultOf(IROp, P)) {
+            Produced[CodeNode] = {P.Elem, P.Scalar, Id};
+            Pending = true;
+          }
+        }
       }
       Insn.push_back({CodeNode, IROp->Op});
     }
@@ -761,8 +863,6 @@ inline bool FlushRuleOf(const FEXCore::IR::IROp_Header* Op, FlushRule& R) {
 // 64-bit or 256-bit op is not looked at, and the sign-mask and negating multiplies (`IsAddSubMul`: never flushed by the handler) are not in
 // the set. Not producers: moves, shuffles, logic, integer ops, loads, inserts, conversions (VCVTPS2PH is never flushed; widening ones come from
 // unknown elements), MIN/MAX (their result is a raw operand), the estimates (RCP/RSQRT) and a value that enters the block.
-struct FlushedResult { uint32_t Elem = 0; bool Scalar = false; };
-inline bool KeepsStaticFPRs(FEXCore::IR::IROps Op);
 inline bool FlushedResultOf(const FEXCore::IR::IROp_Header* Op, FlushedResult& P) {
   using namespace FEXCore::IR;
   const uint32_t E = OpSizeToSize(Op->ElementSize), S = OpSizeToSize(Op->Size);

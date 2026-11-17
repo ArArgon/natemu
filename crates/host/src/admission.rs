@@ -799,15 +799,16 @@ fn is_stub(s: &Site) -> bool {
         object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE | object::kind::ALIGN
     ) || addressless(s)
 }
-/// A stub with no access and no address: divide (#DE) and (I5c) the floating-point exception checks.
+/// A stub with no access and no address: divide (#DE), (I5c) the floating-point exception checks and the denormal-result check.
 fn addressless(s: &Site) -> bool {
     matches!(
         s.kind,
-        object::kind::DIVIDE | object::kind::SIMD | object::kind::X87 | object::kind::PENDING
+        object::kind::DIVIDE | object::kind::SIMD | object::kind::X87 | object::kind::PENDING | object::kind::DENORM
     )
 }
 /// `brk #1` (branch target), `brk #2` (split), `brk #3` (divide), `brk #4` (alignment, I5a), and (I5c) `brk #5` (SIMD
-/// exception), `brk #7` (x87 exception), `brk #8` (pending x87 exception); `brk #6` is the resident's stop word.
+/// exception), `brk #7` (x87 exception), `brk #8` (pending x87 exception), `brk #9` (a denormal result the resident's FP trap handler
+/// left: the in-block DE screen skip's check); `brk #6` is the resident's stop word.
 pub(crate) fn stub_word(kind: u8) -> u32 {
     let imm = match kind {
         object::kind::GUARD => 1,
@@ -816,6 +817,7 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
         object::kind::SIMD => 5,
         object::kind::X87 => 7,
         object::kind::PENDING => 8,
+        object::kind::DENORM => 9,
         _ => 3,
     };
     0xd420_0000 | imm << 5

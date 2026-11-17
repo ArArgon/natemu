@@ -132,6 +132,12 @@ pub(super) unsafe fn trap(f: *mut NativeFrame, esr: u64, elr: u64, spsr: u64) ->
         };
         c.fp_hist[8 * cause + class_no] += 1;
         let (fpcr, fpsr) = ((*f).fpcr, (*f).fpsr);
+        // The in-block DE screen skip (accurate mode, DAZ and FTZ clear): the patch may write a denormal result, which code compiled after
+        // an earlier op of its block no longer screens: leave the flag its next check tests (it exits there: `denormal_exit`). Under FTZ
+        // the result is flushed, under DAZ nothing is skipped; fast mode (FZ = 1) never traps for UFE.
+        if fpcr >> 24 & 1 == 0 && ftz_key(s.cpu.mxcsr, true) == 0 && daz_key(s.cpu.mxcsr, true) == 0 {
+            (FRAME_VA as *mut u8).add(frame::DE_PENDING as usize).write_volatile(1);
+        }
         if let fptrap::Class::Patch(op) = class {
             if let Some(entry) = fptrap::slot(TABLE.as_ptr(), word, &op) {
                 // The table path: the operation performed here under the trapped FPCR without its enables (so ROUND's rounding mode is
