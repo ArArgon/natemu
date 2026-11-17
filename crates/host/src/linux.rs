@@ -75,9 +75,14 @@ pub struct DiskSpec {
     pub readonly: bool,
 }
 
-/// The most disks: each takes an interrupt line, 18 + its index (disk 0 is on 16), and the controller has lines 16-23.
-/// ponytail: PCI is capped the same way until PCI functions can share a line (design step 6).
-const MAX_DISKS: usize = 6;
+/// The most MMIO disks: each holds an exclusive interrupt line (16, then 19-23), and the controller has lines 16-23.
+const MAX_MMIO_DISKS: usize = 6;
+/// The most PCI disks: slots 1 and 4-31 (slot 0 is the host bridge, 2 and 3 the network and entropy devices).
+const MAX_PCI_DISKS: usize = 29;
+/// PCI functions share INTx lines (design step 6, as real PCI). The documented fallback is `false`: each PCI function
+/// then takes a line no other device holds, which refuses a launch once lines 16-23 run out (6 disks with the NIC and
+/// the entropy device).
+const SHARED_INTX: bool = true;
 
 /// Which devices a launch has and on what transport. The input of [`place`].
 struct Wanted {
@@ -113,42 +118,48 @@ struct Placed {
     slot: u8,
     /// MMIO page, ACPI uid and interrupt line (used when not `pci`).
     res: boot::acpi::VirtioMmio,
-    /// The PCI function's INTx line (used when `pci`). Equal to `res.gsi` until PCI functions share lines (design step 6),
-    /// which will change this field alone.
+    /// The PCI function's INTx line (used when `pci`), possibly shared with other PCI functions, never with an MMIO device.
     intx: u32,
 }
 
 /// The placement rule (design section 3). First disk, NIC, entropy: PCI slots 1, 2, 3, pages 0xF000_0000/1000/2000, lines
-/// 16/17/18, uids 0/1/2. Disks: the m-th disk on MMIO takes page 0xF000_0000 (m = 0) or 0xF000_0000 + (2 + m) * 4 KiB and
-/// uid 0 or 2 + m; the p-th disk on PCI takes slot 1 (p = 0) or 3 + p; both counted among the disks of their own
-/// transport, so a mixed list leaves no gaps. A disk's interrupt line (MMIO line and PCI INTx line alike) is 16 for the
-/// first disk and 18 + k for the disk at list position k, so no two devices share one: at most 6 disks, whatever the
-/// transports. Returned in wiring order: entropy, disk 0, network, then disks 1 and up.
+/// 16/17/18, uids 0/1/2. Disks: the m-th disk on MMIO takes page 0xF000_0000 (m = 0) or 0xF000_0000 + (2 + m) * 4 KiB,
+/// uid 0 or 2 + m and the exclusive line 16 or 18 + m; the p-th disk on PCI takes slot 1 (p = 0) or 3 + p; both counted
+/// among the disks of their own transport, so a mixed list leaves no gaps. PCI INTx lines: slots 1-3 keep 16/17/18 (old
+/// launches unchanged) unless an MMIO device holds that line; the other PCI functions take, round robin in slot order,
+/// the lines 16-23 that no MMIO device holds, so they share lines with each other ([`SHARED_INTX`]), never with an MMIO
+/// device. Every line is inside 16-23, as `Virtio::new` asserts. Returned in wiring order: entropy, disk 0, network,
+/// then disks 1 and up.
 ///
 /// Per-disk transports exist only in the library: the CLI and the config file have one `transport.disk` for all disks
 /// (`Boot::transports.disk` is read only there, to fill each `DiskSpec::transport`). Which names (`vda`..) Linux gives
 /// when MMIO and PCI disks are mixed is unverified; the VM test covers each transport on its own.
 fn place(w: &Wanted) -> Result<Vec<Placed>> {
     use crate::virtio::{BLOCK_RESOURCE, NET_RESOURCE, RNG_RESOURCE};
-    if w.disks.len() > MAX_DISKS {
+    let pci = |t: Transport| t == Transport::Pci;
+    let on_pci_disks = w.disks.iter().filter(|&&t| pci(t)).count();
+    if w.disks.len() - on_pci_disks > MAX_MMIO_DISKS {
         return Err(format!(
-            "at most {MAX_DISKS} disks (one interrupt line each; PCI functions cannot share lines yet)"
+            "at most {MAX_MMIO_DISKS} disks on mmio (interrupt lines 16-23); use pci for more"
         ));
     }
-    let pci = |t: Transport| t == Transport::Pci;
+    if on_pci_disks > MAX_PCI_DISKS {
+        return Err(format!(
+            "PCI slots 1-31 are all used: at most {MAX_PCI_DISKS} disks on pci"
+        ));
+    }
     let one = |kind, t: Option<Transport>, slot, res: boot::acpi::VirtioMmio| {
         t.map(|t| Placed {
             kind,
             pci: pci(t),
             slot,
             res,
-            intx: res.gsi,
+            intx: 0,
         })
     };
     let (mut mmio, mut on_pci) = (0u32, 0u8);
     let mut disk = |k: usize| {
         let t = pci(w.disks[k]);
-        let line = if k == 0 { 16 } else { 18 + k as u32 };
         let m = mmio;
         mmio += !t as u32;
         let res = if t || m == 0 {
@@ -157,7 +168,7 @@ fn place(w: &Wanted) -> Result<Vec<Placed>> {
             boot::acpi::VirtioMmio {
                 uid: (2 + m) as u8,
                 base: 0xf000_0000 + (2 + m) * 4096,
-                gsi: 0,
+                gsi: 18 + m,
             }
         };
         let p = on_pci;
@@ -166,8 +177,8 @@ fn place(w: &Wanted) -> Result<Vec<Placed>> {
             kind: Kind::Disk(k),
             pci: t,
             slot: if p == 0 { BLOCK_SLOT } else { 3 + p },
-            res: boot::acpi::VirtioMmio { gsi: line, ..res },
-            intx: line,
+            res,
+            intx: 0,
         }
     };
     let mut out: Vec<_> = one(Kind::Rng, w.rng, RNG_SLOT, RNG_RESOURCE)
@@ -178,8 +189,38 @@ fn place(w: &Wanted) -> Result<Vec<Placed>> {
     for k in 1..w.disks.len() {
         out.push(disk(k));
     }
-    if let Some(p) = out.iter().find(|p| p.pci && p.slot > 31) {
-        return Err(format!("PCI slots 1-31 are all used (slot {})", p.slot));
+    // INTx lines. A slot 1-3 function keeps its old line unless an MMIO device holds it.
+    let held: Vec<u32> = out.iter().filter(|p| !p.pci).map(|p| p.res.gsi).collect();
+    let fixed = |p: &Placed| {
+        let line = 15 + u32::from(p.slot);
+        (p.slot <= RNG_SLOT && !held.contains(&line)).then_some(line)
+    };
+    let mut taken = held.clone();
+    if !SHARED_INTX {
+        taken.extend(out.iter().filter(|p| p.pci).filter_map(fixed));
+    }
+    let pool: Vec<u32> = (16..24).filter(|l| !taken.contains(l)).collect();
+    let mut next = 0;
+    let mut by_slot: Vec<_> = out.iter_mut().filter(|p| p.pci).collect();
+    by_slot.sort_unstable_by_key(|p| p.slot);
+    for p in by_slot {
+        p.intx = match fixed(p) {
+            Some(line) => line,
+            None => {
+                let i = if SHARED_INTX {
+                    next % pool.len().max(1)
+                } else {
+                    next
+                };
+                next += 1;
+                *pool.get(i).ok_or_else(|| {
+                    format!(
+                        "no interrupt line left for PCI slot {} (lines 16-23 are all held)",
+                        p.slot
+                    )
+                })?
+            }
+        };
     }
     Ok(out)
 }
@@ -413,13 +454,12 @@ impl Boot {
             let v = match p.kind {
                 Kind::Rng => crate::virtio::Virtio::rng(irqs.clone(), gsi),
                 Kind::Disk(k) => {
-                    let disk =
-                        crate::virtio::Virtio::block_mode(
-                            irqs.clone(),
-                            gsi,
-                            &self.disks[k].path,
-                            self.disks[k].readonly,
-                        )?;
+                    let disk = crate::virtio::Virtio::block_mode(
+                        irqs.clone(),
+                        gsi,
+                        &self.disks[k].path,
+                        self.disks[k].readonly,
+                    )?;
                     if p.pci {
                         // One request queue per vCPU: the guest then takes each completion on the vCPU that sent the request.
                         disk.block_queues(disk_queues(self.vcpus))?;
@@ -465,7 +505,11 @@ impl Boot {
                 speculation_barriers: self.speculation_barriers,
                 accurate_fp: self.accurate_fp,
                 pool: self.pool,
-                compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
+                compile_cache: self
+                    .compile_cache
+                    .dir
+                    .clone()
+                    .map(|d| (d, self.compile_cache.cap)),
             },
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
@@ -1229,13 +1273,11 @@ mod report_tests {
     }
 }
 
-/// Placement of one to six disks on MMIO, PCI and mixed lists, with the other devices (design section 3).
+/// Placement of disks on MMIO, PCI and mixed lists, with the other devices (design section 3).
 #[cfg(test)]
 mod placement_tests {
     use super::*;
     use Transport::{Mmio, Pci};
-    const CAP: &str =
-        "at most 6 disks (one interrupt line each; PCI functions cannot share lines yet)";
     fn wanted(disks: &[Transport], other: Transport) -> Wanted {
         Wanted {
             rng: Some(other),
@@ -1268,79 +1310,157 @@ mod placement_tests {
         u.dedup();
         assert_eq!(u.len(), v.len(), "{what} collide: {v:?}");
     }
+    /// The invariants of any placement: distinct slots, pages and uids; MMIO lines exclusive (no other MMIO device and
+    /// no PCI function on them); every line in 16-23; disks dense per transport; NIC and entropy at their old places.
+    fn check(disks: &[Transport], other: Transport) -> Vec<Placed> {
+        let p = place(&wanted(disks, other)).unwrap();
+        assert_eq!(p.len(), disks.len() + 2);
+        distinct(
+            p.iter().filter(|q| q.pci).map(|q| q.slot).collect(),
+            "slots",
+        );
+        distinct(
+            p.iter().filter(|q| !q.pci).map(|q| q.res.base).collect(),
+            "pages",
+        );
+        distinct(
+            p.iter().filter(|q| !q.pci).map(|q| q.res.uid).collect(),
+            "uids",
+        );
+        let mmio: Vec<_> = p.iter().filter(|q| !q.pci).map(|q| q.res.gsi).collect();
+        distinct(mmio.clone(), "MMIO lines");
+        for q in p.iter().filter(|q| q.pci) {
+            assert!(
+                !mmio.contains(&q.intx),
+                "slot {} on MMIO line {}",
+                q.slot,
+                q.intx
+            );
+        }
+        let lines = p.iter().map(|q| if q.pci { q.intx } else { q.res.gsi });
+        assert!(
+            lines.clone().all(|l| (16..24).contains(&l)),
+            "{:?}",
+            lines.collect::<Vec<_>>()
+        );
+        let (mut m, mut pc) = (0u32, 0u8);
+        for (k, &t) in disks.iter().enumerate() {
+            let d = p.iter().find(|q| q.kind == Kind::Disk(k)).unwrap();
+            assert_eq!(d.pci, t == Pci);
+            if d.pci {
+                assert_eq!(d.slot, if pc == 0 { 1 } else { 3 + pc });
+                pc += 1;
+            } else {
+                let want = if m == 0 {
+                    (0, 0xf000_0000, 16)
+                } else {
+                    (2 + m, 0xf000_0000 + (2 + m) * 4096, 18 + m)
+                };
+                assert_eq!((d.res.uid as u32, d.res.base, d.res.gsi), want);
+                m += 1;
+            }
+        }
+        let line = |q: &Placed| if q.pci { q.intx } else { q.res.gsi };
+        let net = p.iter().find(|q| q.kind == Kind::Net).unwrap();
+        let rng = p.iter().find(|q| q.kind == Kind::Rng).unwrap();
+        assert_eq!(
+            (net.slot, net.res.base, line(net), net.res.uid),
+            (2, 0xf000_1000, 17, 1)
+        );
+        assert_eq!(
+            (rng.slot, rng.res.base, line(rng), rng.res.uid),
+            (3, 0xf000_2000, 18, 2)
+        );
+        let plan = plan_tables(1, boot::ACPI_NVS.0, &p, 1 << 30).unwrap();
+        assert_eq!(plan.manifest.len() + plan.functions.len(), p.len());
+        // The routing table (`_PRT`) routes each slot to its INTx line.
+        let mut f: Vec<_> = p
+            .iter()
+            .filter(|q| q.pci)
+            .map(|q| (q.slot, q.intx))
+            .collect();
+        f.sort_unstable();
+        assert_eq!(plan.functions, f);
+        p
+    }
     #[test]
     fn placement_is_dense_per_transport_and_never_collides() {
-        for n in 1..=MAX_DISKS {
+        for n in 1..=MAX_MMIO_DISKS {
             for disks in lists(n) {
                 for other in [Mmio, Pci] {
-                    let p = place(&wanted(&disks, other)).unwrap();
-                    assert_eq!(p.len(), n + 2);
-                    distinct(
-                        p.iter().filter(|q| q.pci).map(|q| q.slot).collect(),
-                        "slots",
-                    );
-                    distinct(
-                        p.iter().filter(|q| !q.pci).map(|q| q.res.base).collect(),
-                        "pages",
-                    );
-                    distinct(
-                        p.iter().filter(|q| !q.pci).map(|q| q.res.uid).collect(),
-                        "uids",
-                    );
-                    // Lines are exclusive across both transports and inside the controller's 16-23.
-                    let lines: Vec<_> = p
-                        .iter()
-                        .map(|q| if q.pci { q.intx } else { q.res.gsi })
-                        .collect();
-                    distinct(lines.clone(), "lines");
-                    assert!(lines.iter().all(|l| (16..24).contains(l)), "{lines:?}");
-                    // Disks: the m-th MMIO disk and the p-th PCI disk are dense, the first of each at the old values.
-                    let (mut m, mut pc) = (0u32, 0u8);
-                    for k in 0..n {
-                        let d = p.iter().find(|q| q.kind == Kind::Disk(k)).unwrap();
-                        assert_eq!(d.pci, disks[k] == Pci);
-                        let line = if k == 0 { 16 } else { 18 + k as u32 };
-                        assert_eq!((d.res.gsi, d.intx), (line, line));
-                        if d.pci {
-                            assert_eq!(d.slot, if pc == 0 { 1 } else { 3 + pc });
-                            pc += 1;
-                        } else {
-                            let want = if m == 0 {
-                                (0, 0xf000_0000)
-                            } else {
-                                (2 + m, 0xf000_0000 + (2 + m) * 4096)
-                            };
-                            assert_eq!((d.res.uid as u32, d.res.base), want);
-                            m += 1;
-                        }
-                    }
-                    let net = p.iter().find(|q| q.kind == Kind::Net).unwrap();
-                    let rng = p.iter().find(|q| q.kind == Kind::Rng).unwrap();
-                    assert_eq!(
-                        (net.slot, net.res.base, net.res.gsi, net.res.uid),
-                        (2, 0xf000_1000, 17, 1)
-                    );
-                    assert_eq!(
-                        (rng.slot, rng.res.base, rng.res.gsi, rng.res.uid),
-                        (3, 0xf000_2000, 18, 2)
-                    );
-                    let plan = plan_tables(1, boot::ACPI_NVS.0, &p, 1 << 30).unwrap();
-                    assert_eq!(plan.manifest.len() + plan.functions.len(), p.len());
-                    assert_eq!(plan.functions.len(), p.iter().filter(|q| q.pci).count());
+                    check(&disks, other);
                 }
             }
         }
     }
+    /// 29 PCI disks with the NIC and entropy device on PCI: slots 1-31, slots 1-3 on 16/17/18, slots 4-31 round robin
+    /// over 16-23. With the NIC and entropy device on MMIO, their lines 17 and 18 are left out of the rotation.
     #[test]
-    fn more_than_six_disks_are_refused_whatever_the_transports() {
-        for disks in [
-            vec![Mmio; 7],
-            vec![Pci; 7],
-            vec![Mmio, Pci, Pci, Pci, Pci, Pci, Pci],
-            lists(8).remove(2),
-        ] {
-            assert_eq!(place(&wanted(&disks, Mmio)).unwrap_err(), CAP);
+    fn twenty_nine_pci_disks_share_lines_round_robin() {
+        let p = check(&[Pci; MAX_PCI_DISKS], Pci);
+        let mut f: Vec<_> = p.iter().map(|q| (q.slot, q.intx)).collect();
+        f.sort_unstable();
+        let want: Vec<_> = (1..=31u8)
+            .map(|s| {
+                (
+                    s,
+                    if s <= 3 {
+                        15 + u32::from(s)
+                    } else {
+                        16 + u32::from(s - 4) % 8
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(f, want);
+        let p = check(&[Pci; MAX_PCI_DISKS], Mmio);
+        let rot = [16, 19, 20, 21, 22, 23];
+        for q in p.iter().filter(|q| q.pci) {
+            let want = if q.slot == 1 {
+                16
+            } else {
+                rot[usize::from(q.slot - 4) % rot.len()]
+            };
+            assert_eq!(q.intx, want, "slot {}", q.slot);
         }
+        // The pinned case's lines: eight PCI disks share 16, 17 and 18 with slots 1-3.
+        let p = check(&[Pci; 8], Pci);
+        let on = |l| p.iter().filter(|q| q.intx == l).count();
+        assert_eq!([16, 17, 18, 19, 23].map(on), [2, 2, 2, 1, 0]);
+    }
+    /// Mixed lists up to the line budget: MMIO disks hold 16 and 19-23; PCI disks rotate over what is left.
+    #[test]
+    fn mixed_lists_keep_mmio_lines_exclusive() {
+        let mut big = vec![Mmio; MAX_MMIO_DISKS];
+        big.extend([Pci; MAX_PCI_DISKS]);
+        let p = check(&big, Pci);
+        assert!(
+            p.iter()
+                .filter(|q| q.pci)
+                .all(|q| [17, 18].contains(&q.intx))
+        );
+        // The first PCI disk takes slot 1, but line 16 is the first MMIO disk's: it rotates too.
+        let p = check(&[Mmio, Pci, Pci], Mmio);
+        let d1 = p.iter().find(|q| q.kind == Kind::Disk(1)).unwrap();
+        assert_eq!((d1.slot, d1.intx), (1, 19));
+        // Every line held by MMIO: no line is left for a PCI disk.
+        let mut full = vec![Mmio; MAX_MMIO_DISKS];
+        full.push(Pci);
+        assert_eq!(
+            place(&wanted(&full, Mmio)).unwrap_err(),
+            "no interrupt line left for PCI slot 1 (lines 16-23 are all held)"
+        );
+    }
+    #[test]
+    fn too_many_disks_are_refused_per_transport() {
+        let mmio = "at most 6 disks on mmio (interrupt lines 16-23); use pci for more";
+        let pci = "PCI slots 1-31 are all used: at most 29 disks on pci";
+        let mut seven = vec![Mmio; 7];
+        assert_eq!(place(&wanted(&seven, Pci)).unwrap_err(), mmio);
+        seven.extend([Pci; 3]);
+        assert_eq!(place(&wanted(&seven, Pci)).unwrap_err(), mmio);
+        assert_eq!(place(&wanted(&[Pci; 30], Pci)).unwrap_err(), pci);
+        assert_eq!(place(&wanted(&[Pci; 30], Mmio)).unwrap_err(), pci);
         assert_eq!(place(&wanted(&[], Mmio)).unwrap().len(), 2);
     }
 }
