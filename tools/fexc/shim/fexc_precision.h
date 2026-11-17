@@ -570,7 +570,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
           for (size_t i = 0; i < Insn.size(); ++i) {
             const auto* Op = IR.template GetOp<IROp_Header>(Insn[i].first);
             DeRule R;
-            if (!FexcMade.count(Insn[i].first) && DeRuleOf(Op, R)) {
+            if (!FexcMade.count(Insn[i].first) && !IsAddSubMul(IR, Op) && DeRuleOf(Op, R)) {
               bool Spanned = false;
               if (Ref F = BuildSimdDe(IREmit, Insn[i].first, Op, R, &Spanned)) IREmit->_FexcSimdDe(F);
               if (Spanned) IREmit->_FexcSimdSkipEnd();
