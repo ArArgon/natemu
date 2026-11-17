@@ -73,6 +73,30 @@ pub struct DiskSpec {
     pub transport: Transport,
     /// Opened read-only: shared lock, the guest sees the read-only bit and no flush, discard or write-zeroes.
     pub readonly: bool,
+    /// The base of a qcow2 overlay at `path` (read-only, shared lock). A writable `path` that does not exist is created
+    /// as a new overlay over it; an existing one must name this same file as its backing file.
+    pub backing: Option<PathBuf>,
+}
+
+impl DiskSpec {
+    /// Its image (a new overlay created first when `backing` names a base and a writable `path` does not exist).
+    fn open(&self) -> Result<crate::disk::Image> {
+        // The facade names the key to add as `disk.ID.backing`; this knows the id.
+        crate::disk::open(&self.path, self.readonly, self.backing.as_deref())
+            .map_err(|e| e.replace("disk.ID.", &format!("disk.{}.", self.id)))
+    }
+}
+
+/// GET_ID serials are a file's device and inode in hex, so two read-only disks on one file would share one. A repeat
+/// gets a non-hex first character ('g', 'h', ...: never any file's serial) by its place in the list; the first use,
+/// and so every launch that names each file once, keeps the file's serial.
+fn unique_serial(id: &mut [u8; 20], used: &mut Vec<[u8; 20]>) {
+    const MARKS: &[u8] = b"ghijklmnopqrstuvwxyzGHIJKLMNOPQRSTUVWXYZ";
+    let mut marks = MARKS.iter();
+    while used.contains(id) {
+        id[0] = *marks.next().expect("fewer disks than marks");
+    }
+    used.push(*id);
 }
 
 /// The most MMIO disks: each holds an exclusive interrupt line (16, then 19-23), and the controller has lines 16-23.
@@ -451,6 +475,7 @@ impl Boot {
         // L4b: the PIT and port 61H, the RTC, the ACPI PM block and reset register.
         let board = clock::install(&mut devices, &irqs, lost, &uart)?;
         let mut virtio = Vec::new();
+        let mut serials = Vec::new();
         let mut bus = crate::pci::Bus::new();
         let mut net = None;
         for p in &placed {
@@ -458,13 +483,9 @@ impl Boot {
             let v = match p.kind {
                 Kind::Rng => crate::virtio::Virtio::rng(irqs.clone(), gsi),
                 Kind::Disk(k) => {
-                    let disk =
-                        crate::virtio::Virtio::block_mode(
-                            irqs.clone(),
-                            gsi,
-                            &self.disks[k].path,
-                            self.disks[k].readonly,
-                        )?;
+                    let mut image = self.disks[k].open()?;
+                    unique_serial(&mut image.id, &mut serials);
+                    let disk = crate::virtio::Virtio::block_image(irqs.clone(), gsi, image)?;
                     if p.pci {
                         // One request queue per vCPU: the guest then takes each completion on the vCPU that sent the request.
                         disk.block_queues(disk_queues(self.vcpus))?;
@@ -510,7 +531,11 @@ impl Boot {
                 speculation_barriers: self.speculation_barriers,
                 accurate_fp: self.accurate_fp,
                 pool: self.pool,
-                compile_cache: self.compile_cache.dir.clone().map(|d| (d, self.compile_cache.cap)),
+                compile_cache: self
+                    .compile_cache
+                    .dir
+                    .clone()
+                    .map(|d| (d, self.compile_cache.cap)),
             },
             compile_cache: self.compile_cache,
             check_reuse: self.check_reuse,
@@ -985,6 +1010,54 @@ impl Prepared {
 mod tests {
     use super::*;
     use natemu_abi::lapic::{RESET, SVR_ENABLE};
+
+    #[test]
+    fn an_overlay_named_without_its_base_says_which_key_to_add() {
+        let dir = std::env::temp_dir().join(format!("natemu-linux-overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (base, top) = (dir.join("base.raw"), dir.join("top.qcow2"));
+        std::fs::write(&base, vec![0u8; 1 << 20]).unwrap();
+        let spec = |readonly, backing: Option<&std::path::Path>| DiskSpec {
+            id: "disk0".into(),
+            path: top.clone(),
+            transport: Transport::Mmio,
+            readonly,
+            backing: backing.map(Into::into),
+        };
+        // Read-only: never created.
+        let e = spec(true, Some(&base)).open().err().unwrap();
+        assert!(e.contains("never created") && !top.exists(), "{e}");
+        // Created, then reopened with its base; without it, the error names the key to add.
+        let image = spec(false, Some(&base)).open().unwrap();
+        assert_eq!(image.capacity, 1 << 20);
+        drop(image);
+        assert!(spec(false, Some(&base)).open().is_ok());
+        let e = spec(false, None).open().err().unwrap();
+        let named = std::fs::canonicalize(&base).unwrap();
+        assert!(
+            e.contains(&format!("add backing = \"{}\"", named.display()))
+                && e.contains(&format!("--set disk.disk0.backing={}", named.display())),
+            "{e}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_repeated_file_gets_a_serial_no_file_has_and_the_first_use_keeps_its_own() {
+        let mut used = vec![];
+        let (a, b) = (*b"0100001000000000002a", *b"0100001000000000002b");
+        let ids: Vec<[u8; 20]> = [a, b, a, a, b]
+            .into_iter()
+            .map(|mut id| {
+                unique_serial(&mut id, &mut used);
+                id
+            })
+            .collect();
+        assert_eq!(ids[..2], [a, b]);
+        assert_eq!(&ids[2][..], b"g100001000000000002a");
+        assert_eq!(&ids[3][..], b"h100001000000000002a");
+        assert_eq!(&ids[4][..], b"g100001000000000002b");
+    }
 
     #[test]
     fn network_defaults_keep_forwarding_and_host_loopback_off() {

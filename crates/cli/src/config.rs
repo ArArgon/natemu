@@ -787,10 +787,13 @@ pub fn validate(cfg: &Config) -> Res<()> {
             cfg.rngs.len()
         ));
     }
-    let key = |d: &Disk| std::fs::metadata(&d.path).ok().map(|m| (m.dev(), m.ino()));
+    // The same file twice (by device and inode; a missing file, such as an overlay not created yet, is no file): two
+    // read-only uses share the shared lock, as do overlays on one base and a base that is also a read-only disk; a
+    // writable use and any other use would collide on the exclusive lock, or let one disk change another's base.
+    let key = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
     for (i, a) in cfg.disks.iter().enumerate() {
         for b in &cfg.disks[i + 1..] {
-            if key(a).is_some() && key(a) == key(b) {
+            if key(&a.path).is_some() && key(&a.path) == key(&b.path) {
                 if a.readonly && b.readonly {
                     continue; // two read-only uses of one image share the lock
                 }
@@ -799,6 +802,22 @@ pub fn validate(cfg: &Config) -> Res<()> {
                     a.id, b.id
                 ));
             }
+        }
+        let Some(base) = a.backing.as_deref() else {
+            continue;
+        };
+        if key(base).is_some() && key(base) == key(&a.path) {
+            return Err(format!("{who}: disk {:?} is its own backing file", a.id));
+        }
+        if let Some(b) = cfg
+            .disks
+            .iter()
+            .find(|b| !b.readonly && key(base).is_some() && key(base) == key(&b.path))
+        {
+            return Err(format!(
+                "{who}: the backing file of disk {:?} is disk {:?}, which is writable; a base must not change under its overlay",
+                a.id, b.id
+            ));
         }
     }
     Ok(())
@@ -834,10 +853,6 @@ pub fn to_boot(
     kernel: Vec<u8>,
     initrd: Option<Vec<u8>>,
 ) -> Res<Boot> {
-    let who = cfg.who();
-    if cfg.disks.iter().any(|d| d.backing.is_some()) {
-        return Err(format!("{who}: backing files are not built yet"));
-    }
     let mut boot = Boot::new(runtime, cfg.fexc.clone().ok_or("no fexc")?, kernel);
     boot.compile_cache = natemu::compile_cache::Config::new(
         cfg.compile_cache.as_deref().map(|p| p.as_os_str()),
@@ -856,6 +871,7 @@ pub fn to_boot(
             path: d.path.clone(),
             transport: cfg.transports.disk,
             readonly: d.readonly,
+            backing: d.backing.clone(),
         })
         .collect();
     boot.net = !cfg.nics.is_empty();
