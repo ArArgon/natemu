@@ -88,24 +88,30 @@ def cases(a, report):
         # (lea 7 bytes, mov dr0 3, mov eax 5, mov dr7 3: RIP + 14 is the fourth NOP, at 0x100015)
         'xbp-len01': (code('lea rax, [rip + 14]\nmov dr0, rax\n' + dr7(0x40001) + 'nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop'), 'guest_fault', [1, 0, 0, 0x100015]),
     }
-    # AFP accurate chunk 3 (plan section 3, R4-1): an FP trap in the step block while a data watchpoint is armed. Under TF the MULSS runs alone
-    # (the step block); in accurate mode without AFP (`NATEMU_FP=accurate NATEMU_FEXC_FEATURE_OFF=afp`) 3 * 2^-149 * 0.5 is a tiny, inexact
-    # result, so UFE traps and the resident re-runs the word under its own software step while DR0 stays armed (on an address nothing
-    # touches). The single-step #DB must follow the MULSS exactly as without the trap; in every other mode the case is the plain TF one.
+    # AFP accurate chunk 3 (plan section 3, R4-1): an FP trap in the step block while a data watchpoint is armed. Under TF the instruction
+    # runs alone (the step block); in accurate mode without AFP (`NATEMU_FP=accurate NATEMU_FEXC_FEATURE_OFF=afp`) the single-step #DB must
+    # follow it exactly as without the trap while DR0 stays armed (on an address nothing touches); in every other mode the case is the plain
+    # TF one. Two words, two paths (chunk 6b): MULSS of 3 * 2^-149 * 0.5 is a tiny, inexact result, so UFE traps and the resident performs
+    # the multiply from its instruction table (no step: `fp_steps` stays 0); CVTTSS2SI of a quiet NaN is `fcvtzs`, an invalid operation that
+    # IOE traps and whose class (kept) the resident re-runs under its own software step while DR0 is armed (`fp_steps` >= 1).
     fp_setup = 'mov rax, 0x3e8000\nmov dr0, rax\n' + dr7(0xd0001)
-    sse = {'fp-trap-in-step-block-with-watchpoint': 'sse 1\nxmm 1 0x3 0\nxmm 2 0x3f000000 0\n'}   # SSE on, xmm1 = 3 * 2^-149, xmm2 = 0.5
+    sse = {'fp-trap-in-step-block-with-watchpoint': 'sse 1\nxmm 1 0x3 0\nxmm 2 0x3f000000 0\n',   # SSE on, xmm1 = 3 * 2^-149, xmm2 = 0.5
+           'fp-trap-step-fallback-with-watchpoint': 'sse 1\nxmm 1 0x7fc00000 0\n'}               # xmm1 = a quiet NaN
     fp_tf = fp_setup + tf_on + 'mulss xmm1, xmm2\nnop'
     table['fp-trap-in-step-block-with-watchpoint'] = (code(fp_tf), 'guest_fault', [1, 0, 0, before_nop(fp_tf)])
+    fp_cvt = fp_setup + tf_on + 'cvttss2si eax, xmm1\nnop'
+    table['fp-trap-step-fallback-with-watchpoint'] = (code(fp_cvt), 'guest_fault', [1, 0, 0, before_nop(fp_cvt)])
+    steps = {'fp-trap-in-step-block-with-watchpoint': lambda st: st.get('fp_steps', 0) == 0, 'fp-trap-step-fallback-with-watchpoint': lambda st: st.get('fp_steps', 0) >= 1}
     for name, (hexcode, stop, fault) in table.items():
         for block in (None, 1):
             rc, out, err = s3.driver(a.host, a.runtime, a.fexc, base + sse.get(name, '') + f'code {hexcode}\n', a.out / 'cases' / f'{name}-{block}', [block] if block else [], timeout=120)
             stopped = out and (out['reason'].split()[0] if out['stop'] == 'resident' else out['stop'])
             got = out and (stopped, [int(v, 0) for v in out.get('fault', [])] if out['stop'] == 'guest_fault' else None)
             ok = bool(out) and got[0] == stop and (fault is None or got[1] == fault)
-            # The thing the case is for: in accurate mode without AFP the word must really have trapped and been re-run by its own step.
+            # The thing the case is for: in accurate mode without AFP the word must really have trapped, and gone the path the case names.
             if ok and name.startswith('fp-trap') and out.get('afp') is False and out.get('fp') == 'accurate':
                 st = (out.get('cpus') or [out])[0].get('stats', {})
-                ok = st.get('fp_traps', 0) >= 1 and st.get('fp_steps', 0) >= 1
+                ok = st.get('fp_traps', 0) >= 1 and steps[name](st)
                 got = (got, {k: st.get(k) for k in ('fp_traps', 'fp_steps')})
             rows.append({'case': name, 'block': block, 'ok': ok, 'got': got, 'err': None if out else err[-300:]})
             print(json.dumps(rows[-1]), flush=True)

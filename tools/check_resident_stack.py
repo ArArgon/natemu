@@ -41,7 +41,8 @@ SAVES = {'exception_capture': 1, 'irq_gate': 3}  # gate -> `finish` kind
 NO_STACK = ('dispatch_template',)                 # run by generated code (EL0) with a 0-byte budget
 BOOT = '_start'
 # Indirect branches allowed in reachable code: (function, instruction) -> functions it reaches.
-INDIRECT = {('_start', 'br x9'): ['private_start']}      # boot: to the linked address of the next label
+INDIRECT = {('_start', 'br x9'): ['private_start'],      # boot: to the linked address of the next label
+            ('natemu_abi::fptrap::exec', 'blr x8'): []}  # AFP accurate chunk 6b: into a slot of the FP instruction table (`insn; ret`: a leaf)
 # Stack switches: function -> {(instruction, literal source)}. `msr spsel, #1` selects SP_EL1, at its top whenever
 # generated code runs.
 STACK_SWITCHES = {'private_start': {('mov sp, x9', 'EXCEPTION_STACK_TOP'), ('msr spsel, #0x0', None)},

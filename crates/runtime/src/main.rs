@@ -93,7 +93,7 @@ unsafe extern "C" fn finish(frame: *const NativeFrame, fault: u64) -> ! {
             copy_frame(&raw mut (*s).captured, frame);
         }
         if ptr::read_volatile(&raw const (*s).mode) == natemu_abi::execution::MODE {
-            execution::returned(&*frame, fault);
+            execution::returned(frame as *mut NativeFrame, fault);
         }
         stop(PANIC, 11);
     }

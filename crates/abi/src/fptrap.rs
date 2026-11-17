@@ -388,9 +388,213 @@ fn patch_ufc(o: &Op, rc: u32, q: &[[u8; 16]; 3], rerun: u64, flush: u8, dest: &m
     rerun & !UFC | if under { UFC } else { 0 }
 }
 
+// ---- The instruction table (AFP accurate plan, chunk 6b): the trapped operation performed in the resident, not re-run at EL0 ----
+
+/// Slots of [`TABLE`] (two words each: the instruction and a `ret`), indexed by a hash of the instruction's canonical word.
+pub const SLOTS: usize = 512;
+const HASH: u32 = 0x3206_dcbf;
+const RET: u32 = 0xd65f_03c0;
+const fn slot_of(canonical: u32) -> usize {
+    (canonical.wrapping_mul(HASH) >> (32 - 9)) as usize
+}
+
+/// Whether the word has an Rm field (bits 20:16); the two-register forms hold opcode bits there.
+fn has_rm(o: &Op) -> bool {
+    !(matches!(o.kind, tiny::CVT | tiny::CVT16) || o.nan == Nan::Un || o.nan == Nan::Pair && o.lanes == 1)
+}
+
+/// The canonical word of a [`Class::Patch`] word `w`: the same instruction with Rd = v0, Rn = v1, Rm = v2 and (a scalar fused multiply-add's)
+/// Ra = v3. Everything else (arrangement, element size, the by-element index, the negation bits) stays.
+pub fn canon(w: u32, o: &Op) -> u32 {
+    let mut c = w & !0x3ff | 1 << 5;
+    if has_rm(o) {
+        c = c & !(0x1f << 16) | 2 << 16;
+    }
+    if w & 0xff00_0000 == 0x1f00_0000 {
+        c = c & !(0x1f << 10) | 3 << 10;
+    }
+    c
+}
+
+/// Every canonical word the table holds, one per operation x arrangement x element size x by-element index x form (see [`classify`]'s
+/// patched arms; a test pins that every patched word has its entry).
+const fn canonical() -> [u32; 100] {
+    let mut out = [0u32; 100];
+    let mut n = 0;
+    let (rn, rm, ra) = (1u32 << 5, 2u32 << 16, 3u32 << 10);
+    // scalar two sources: FMUL, FDIV, FADD, FSUB, FNMUL
+    let mut ty = 0;
+    while ty < 2 {
+        let opcs = [0u32, 1, 2, 3, 8];
+        let mut k = 0;
+        while k < 5 {
+            out[n] = 0x1e20_0800 | ty << 22 | opcs[k] << 12 | rn | rm;
+            n += 1;
+            k += 1;
+        }
+        ty += 1;
+    }
+    // scalar FMADD, FMSUB, FNMADD, FNMSUB
+    let mut v = 0;
+    while v < 8 {
+        out[n] = 0x1f00_0000 | (v >> 2) << 22 | (v >> 1 & 1) << 21 | (v & 1) << 15 | rn | rm | ra;
+        n += 1;
+        v += 1;
+    }
+    // scalar FCVT s,d and h,s; FSQRT s, d
+    out[n] = 0x1e62_4020;
+    out[n + 1] = 0x1e23_c020;
+    out[n + 2] = 0x1e21_c020;
+    out[n + 3] = 0x1e61_c020;
+    n += 4;
+    // vector three-register-same: FMUL, FDIV, FMLA, FMLS, FADD, FSUB, FADDP x (.2s, .4s, .2d)
+    let ops = [(1u32, 0u32, 0x1bu32), (1, 0, 0x1f), (0, 0, 0x19), (0, 1, 0x19), (0, 0, 0x1a), (0, 1, 0x1a), (1, 0, 0x1a)];
+    let arr = [(0u32, 0u32), (1, 0), (1, 1)];
+    let mut i = 0;
+    while i < 7 {
+        let mut j = 0;
+        while j < 3 {
+            out[n] = 0x0e20_0400 | arr[j].0 << 30 | ops[i].0 << 29 | ops[i].1 << 23 | arr[j].1 << 22 | ops[i].2 << 11 | rn | rm;
+            n += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    // by element, vector then scalar: FMLA (1), FMLS (5), FMUL (9); single (index H:L) and double (index H)
+    let opc = [1u32, 5, 9];
+    let mut i = 0;
+    while i < 3 {
+        let mut pass = 0;
+        while pass < 2 {
+            // (q, size, index count)
+            let shapes = if pass == 0 { [(0u32, 2u32, 4u32), (1, 2, 4), (1, 3, 2)] } else { [(1, 2, 4), (1, 3, 2), (1, 3, 0)] };
+            let base: u32 = if pass == 0 { 0x0f00_0000 } else { 0x5f00_0000 };
+            let mut j = 0;
+            while j < 3 {
+                let (q, size, count) = shapes[j];
+                let mut x = 0;
+                while x < count {
+                    let (h, l) = if size == 2 { (x >> 1, x & 1) } else { (x, 0) };
+                    let qb = if pass == 0 { q << 30 } else { 0 };
+                    out[n] = base | qb | size << 22 | l << 21 | opc[i] << 12 | h << 11 | rn | rm;
+                    n += 1;
+                    x += 1;
+                }
+                j += 1;
+            }
+            pass += 1;
+        }
+        i += 1;
+    }
+    // FCVTN, FCVTN2 (S to H, D to S); vector FSQRT (.2s, .4s, .2d); scalar FADDP
+    let mut k = 0;
+    while k < 4 {
+        out[n] = 0x0e21_6800 | (k >> 1) << 30 | (k & 1) << 22 | rn;
+        n += 1;
+        k += 1;
+    }
+    let mut j = 0;
+    while j < 3 {
+        out[n] = 0x2ea1_f800 | arr[j].0 << 30 | arr[j].1 << 22 | rn;
+        n += 1;
+        j += 1;
+    }
+    out[n] = 0x7e30_d820;
+    out[n + 1] = 0x7e70_d820;
+    n += 2;
+    assert!(n == 100);
+    out
+}
+
+const fn build() -> [u32; 2 * SLOTS] {
+    let words = canonical();
+    let mut t = [0u32; 2 * SLOTS];
+    let mut i = 0;
+    while i < SLOTS {
+        t[2 * i + 1] = RET;
+        i += 1;
+    }
+    let mut k = 0;
+    while k < words.len() {
+        let s = slot_of(words[k]);
+        assert!(t[2 * s] == 0, "slot collision: change HASH");
+        t[2 * s] = words[k];
+        k += 1;
+    }
+    t
+}
+
+/// The pre-assembled instructions: slot `s` is `[instruction, ret]` at words `2 s`, `2 s + 1`. The resident places a copy in its text
+/// (execute-only memory is never written: nothing to synchronise) and the native tests in a page they make executable.
+pub const TABLE: [u32; 2 * SLOTS] = build();
+
+/// The table slot (in the copy at `base`) holding the canonical word of the patched word `w`, `None` when it has no entry.
+///
+/// # Safety
+/// `base` points at a copy of [`TABLE`].
+pub unsafe fn slot(base: *const u32, w: u32, o: &Op) -> Option<*const u32> {
+    let c = canon(w, o);
+    // SAFETY: the index is below SLOTS.
+    let at = unsafe { base.add(2 * slot_of(c)) };
+    (unsafe { at.read() } == c).then_some(at)
+}
+
+/// Performs the instruction of the slot `at` the way a re-run of the guest's word would: `d` (the word's Rd, its old value is the
+/// accumulator of FMLA and the kept half of FCVTN2), `n`, `m`, `a` (Rn, Rm, a scalar FMA's Ra) are loaded into v0..v3, the instruction runs
+/// under `fpcr` (the guest's with the trap enables cleared) and FPSR cleared, and v0 is stored to `d`. Returns the word's own FPSR. The
+/// caller's FPCR is restored. A register may be the same as another: all four are read before anything is written.
+///
+/// # Safety
+/// `at` is a slot of a [`TABLE`] copy in executable memory; the pointers are valid for 16 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)] // one `blr`, at a known place: tools/check_resident_stack.py lists it
+pub unsafe fn exec(at: *const u32, fpcr: u64, d: *mut [u8; 16], n: *const [u8; 16], m: *const [u8; 16], a: *const [u8; 16]) -> u64 {
+    let fpsr: u64;
+    // SAFETY: as documented; the slot's `ret` returns here (x30); every register the slot or the caller's ABI may clobber is declared.
+    unsafe {
+        core::arch::asm!(
+            "ldr q0, [{d}]", "ldr q1, [{n}]", "ldr q2, [{m}]", "ldr q3, [{a}]",
+            "mrs x9, fpcr",
+            "msr fpcr, {fpcr}", "msr fpsr, xzr",
+            "blr x8",
+            "mrs x10, fpsr", "msr fpcr, x9",
+            "str q0, [{d}]",
+            d = in(reg) d, n = in(reg) n, m = in(reg) m, a = in(reg) a, in("x8") at, fpcr = in(reg) fpcr,
+            out("x9") _, out("x10") fpsr, out("x30") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+        );
+    }
+    fpsr
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+
+    /// Chunk 6b: every word [`classify`] patches has a table entry whose instruction is the word with its registers renamed (so the same
+    /// operation, arrangement, element size, index and form); the sweep covers every value of the bits above Rd and Rn (the registers' own
+    /// values never change what a word is). Classification is the same for the canonical word. Fully patched means no fallback to a step.
+    #[test]
+    fn every_patched_word_has_a_table_entry() {
+        let mut seen = std::collections::BTreeSet::new();
+        for hi in 0..1u32 << 22 {
+            for low in [0, 0x3ff, 0x1a5] {
+                let w = hi << 10 | low;
+                let Some(Class::Patch(o)) = classify(w) else { continue };
+                // SAFETY: the table in this process.
+                let at = unsafe { slot(TABLE.as_ptr(), w, &o) }.unwrap_or_else(|| panic!("{w:#x} has no table entry"));
+                let c = unsafe { at.read() };
+                assert_eq!(c, canon(w, &o));
+                let Some(Class::Patch(p)) = classify(c) else { panic!("{c:#x} (canonical of {w:#x}) not patched") };
+                assert_eq!((p.kind, p.nan, p.wide, p.neg, p.lanes, p.index, p.upper), (o.kind, o.nan, o.wide, o.neg, o.lanes, o.index, o.upper), "{w:#x}");
+                assert_eq!(unsafe { at.add(1).read() }, 0xd65f_03c0);
+                seen.insert(c);
+            }
+        }
+        // and no entry is unused: the table holds exactly the canonical words of the patched words
+        assert_eq!(seen.len(), 100);
+    }
 
     fn patched(w: u32) -> Op {
         match classify(w) {
@@ -557,6 +761,52 @@ mod native {
         }};
     }
 
+
+    // ---- Chunk 6b: the same runs through the resident's instruction table ----
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+        fn sys_icache_invalidate(start: *mut u8, len: usize);
+    }
+    /// A page holding `words`, made executable.
+    fn exec_page(words: &[u32]) -> *const u32 {
+        // SAFETY: an anonymous private page, written then made read-execute.
+        unsafe {
+            let p = mmap(core::ptr::null_mut(), 16384, 3, 0x1002, -1, 0);
+            assert!(p as isize != -1, "mmap");
+            core::ptr::copy_nonoverlapping(words.as_ptr(), p.cast::<u32>(), words.len());
+            assert_eq!(mprotect(p, 16384, 5), 0, "mprotect");
+            sys_icache_invalidate(p, 16384);
+            p.cast()
+        }
+    }
+    fn table_page() -> *const u32 {
+        static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PAGE.get_or_init(|| exec_page(&TABLE) as usize) as *const u32
+    }
+    /// The table's run of `word`: its result register and FPSR (`None` for a word the table does not hold: a kept class). `regs` is the
+    /// register file as the trap saw it; only the word's Rd changes.
+    fn table_run(word: u32, fpcr: u64, regs: &mut [[u8; 16]; 32]) -> Option<u64> {
+        let Some(Class::Patch(o)) = classify(word) else { return None };
+        // SAFETY: the table page; the pointers lie in `regs`.
+        unsafe {
+            let at = slot(table_page(), word, &o).unwrap_or_else(|| panic!("{word:#x}: no table entry"));
+            let p = regs.as_mut_ptr();
+            Some(exec(at, fpcr, p.add(usize::from(o.rd)), p.add(usize::from(o.rn)), p.add(usize::from(o.rm)), p.add(usize::from(o.ra))))
+        }
+    }
+    /// A form's run (`f`: v1 = Rd, v2, v3, v4) as [`Form`] gives it, and the table's run of the same word on the same registers: result and
+    /// FPSR must be bit for bit the hardware's (the trap's old re-run). Words the table does not hold (kept classes) are the direct run alone.
+    fn via_table(f: Form, fpcr: u64, q: &[[u8; 16]; 4]) -> ([u8; 16], u64, u32) {
+        let direct = f(fpcr, q);
+        let mut regs = [[0u8; 16]; 32];
+        regs[1..5].copy_from_slice(q);
+        if let Some(fpsr) = table_run(direct.2, fpcr, &mut regs) {
+            assert_eq!((regs[1], fpsr), (direct.0, direct.1), "table vs hardware: word {:#x} fpcr {fpcr:#x}\nq {q:x?}", direct.2);
+        }
+        direct
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -667,7 +917,7 @@ mod native {
             let q = operands(&mut r, e, narrowing);
             for rmode in 0..4u64 {
                 let fpcr = rmode << 22;
-                let (_, rerun, word) = f(fpcr, &q);
+                let (_, rerun, word) = via_table(f, fpcr, &q);
                 let (_, afp, _) = f(fpcr | 1 << 1 | 1 << 2, &q);
                 let class = classify(word).unwrap_or_else(|| panic!("{name}: {word:#x} unknown"));
                 // the registers the table names, as the trap would have saved them (v1..v4 are `q[0..4]`)
@@ -707,7 +957,7 @@ mod native {
             let q = operands(&mut r, e, narrowing);
             for rmode in 0..4u64 {
                 let fpcr = rmode << 22;
-                let (mut out, rerun, word) = f(fpcr, &q);
+                let (mut out, rerun, word) = via_table(f, fpcr, &q);
                 let (afp_out, afp, _) = f(fpcr | 1 << 1 | 1 << 2 | 1 << 24, &q);
                 let class = classify(word).unwrap();
                 let mut saved = [[0u8; 16]; 3];
@@ -781,7 +1031,7 @@ mod native {
         put(&mut q[1], 4, 0, u64::from(a));
         put(&mut q[2], 4, 0, u64::from(b));
         let f = form!("fmul s1, s2, s3");
-        let (mut out, rerun, word) = f(0, &q);
+        let (mut out, rerun, word) = via_table(f, 0, &q);
         assert_eq!(get(&out, 4, 0), 0x0080_0000);
         let mut saved = [[0u8; 16]; 3];
         let Some(Class::Patch(o)) = classify(word) else { panic!() };
@@ -815,7 +1065,7 @@ mod native {
             }
             for rmode in 0..4u64 {
                 let fpcr = rmode << 22;
-                let (mut out, rerun, word) = f(fpcr, &q);
+                let (mut out, rerun, word) = via_table(f, fpcr, &q);
                 let (afp_out, afp, _) = f(fpcr | 1 | 1 << 1 | 1 << 2 | 1 << 24, &orig);
                 let class = classify(word).unwrap();
                 let mut saved = [[0u8; 16]; 3];
@@ -882,7 +1132,7 @@ mod native {
         for _ in 0..n {
             let q = operands(&mut r, 4, true);
             for rmode in 0..4u64 {
-                let (mut out, rerun, word) = f(rmode << 22, &q);
+                let (mut out, rerun, word) = via_table(f, rmode << 22, &q);
                 let class = classify(word).unwrap();
                 let Class::Patch(o) = class else { panic!() };
                 let mut saved = [[0u8; 16]; 3];
@@ -996,7 +1246,7 @@ mod native {
             let q = nan_operands(&mut r, e);
             for rmode in 0..4u64 {
                 let fpcr = rmode << 22;
-                let (mut out, rerun, word) = f(fpcr, &q);
+                let (mut out, rerun, word) = via_table(f, fpcr, &q);
                 let (afp_out, afp, _) = f(fpcr | 1 << 1 | 1 << 2, &q);
                 let class = classify(word).unwrap_or_else(|| panic!("{name}: {word:#x} unknown"));
                 let Class::Patch(o) = class else { panic!("{name}: {word:#x} is not patched") };
@@ -1078,6 +1328,111 @@ mod native {
         for &(name, f, e) in forms {
             check_nan(name, f, e, n);
         }
+    }
+
+    /// Cost of the pieces of a trap that run natively (`cargo test --release -p natemu-abi -- --ignored --nocapture per_trap_cost`): the table's
+    /// op (`exec`) and the patch of a tiny multiply, ns each. Chunk 6b's profile of where a trap's time goes.
+    #[test]
+    #[ignore]
+    fn per_trap_cost() {
+        let word = 0x1e63_0841u32; // fmul d1, d2, d3
+        let Some(Class::Patch(o)) = classify(word) else { panic!() };
+        let mut regs = [[0u8; 16]; 32];
+        // 3 * 2^-1074 times 0.5: tiny and inexact (UFC)
+        regs[2][..8].copy_from_slice(&3u64.to_le_bytes());
+        regs[3][..8].copy_from_slice(&0x3fe0_0000_0000_0000u64.to_le_bytes());
+        const N: u32 = 2_000_000;
+        let t = std::time::Instant::now();
+        let mut fpsr = 0;
+        for _ in 0..N {
+            fpsr |= table_run(core::hint::black_box(word), 0, &mut regs).unwrap();
+        }
+        let exec_ns = t.elapsed().as_nanos() as f64 / f64::from(N);
+        let src = [regs[2], regs[3], [0; 16]];
+        let t = std::time::Instant::now();
+        let mut flags = 0;
+        for _ in 0..N {
+            let mut dest = regs[1];
+            flags |= patch_flush(Class::Patch(o), 0, core::hint::black_box(&src), UFC, 0, &mut dest, true);
+        }
+        let patch_ns = t.elapsed().as_nanos() as f64 / f64::from(N);
+        let t = std::time::Instant::now();
+        let mut n = 0u32;
+        for i in 0..N {
+            n += classify(core::hint::black_box(word ^ (i & 0x3ff))).is_some() as u32;
+        }
+        let classify_ns = t.elapsed().as_nanos() as f64 / f64::from(N);
+        eprintln!("per trap: exec {exec_ns:.1} ns, patch_flush (tiny fmul d, nan rules) {patch_ns:.1} ns, classify {classify_ns:.1} ns ({fpsr:#x} {flags:#x} {n})");
+    }
+
+    /// Direct run of an arbitrary word on a whole register file: the file after, and FPSR.
+    fn direct_run(word: u32, fpcr: u64, regs: &mut [[u8; 16]; 32]) -> u64 {
+        let at = exec_page(&[word, RET]);
+        let fpsr: u64;
+        // SAFETY: loads and stores the 32 registers through `regs`; FPCR is restored; the page's `ret` returns here.
+        unsafe {
+            asm!(
+                "ldp q0, q1, [{r}]", "ldp q2, q3, [{r}, #32]", "ldp q4, q5, [{r}, #64]", "ldp q6, q7, [{r}, #96]",
+                "ldp q8, q9, [{r}, #128]", "ldp q10, q11, [{r}, #160]", "ldp q12, q13, [{r}, #192]", "ldp q14, q15, [{r}, #224]",
+                "ldp q16, q17, [{r}, #256]", "ldp q18, q19, [{r}, #288]", "ldp q20, q21, [{r}, #320]", "ldp q22, q23, [{r}, #352]",
+                "ldp q24, q25, [{r}, #384]", "ldp q26, q27, [{r}, #416]", "ldp q28, q29, [{r}, #448]", "ldp q30, q31, [{r}, #480]",
+                "mrs x9, fpcr", "msr fpcr, {c}", "msr fpsr, xzr",
+                "blr {at}",
+                "mrs x10, fpsr", "msr fpcr, x9",
+                "stp q0, q1, [{r}]", "stp q2, q3, [{r}, #32]", "stp q4, q5, [{r}, #64]", "stp q6, q7, [{r}, #96]",
+                "stp q8, q9, [{r}, #128]", "stp q10, q11, [{r}, #160]", "stp q12, q13, [{r}, #192]", "stp q14, q15, [{r}, #224]",
+                "stp q16, q17, [{r}, #256]", "stp q18, q19, [{r}, #288]", "stp q20, q21, [{r}, #320]", "stp q22, q23, [{r}, #352]",
+                "stp q24, q25, [{r}, #384]", "stp q26, q27, [{r}, #416]", "stp q28, q29, [{r}, #448]", "stp q30, q31, [{r}, #480]",
+                r = in(reg) regs.as_mut_ptr(), c = in(reg) fpcr, at = in(reg) at,
+                out("x9") _, out("x10") fpsr,
+                out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+                clobber_abi("C"),
+            );
+        }
+        fpsr
+    }
+
+    /// Chunk 6b gate: for every table entry, with arbitrary registers for Rd, Rn, Rm, Ra (small numbers, so that they alias), every
+    /// rounding mode, FZ set and clear, and arbitrary and NaN-heavy operands in all 32 registers, the table's run of the guest's word
+    /// equals the word run in place (the trap's old re-run): the destination register bit for bit, FPSR, and every other register untouched.
+    #[test]
+    fn the_table_equals_the_word_run_in_place_for_every_entry() {
+        let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let mut r = Rng(0x0dd_ba11_5eed_f00d);
+        let mut words = 0;
+        for &c in TABLE.iter().step_by(2).filter(|&&c| c != 0) {
+            let Some(Class::Patch(o)) = classify(c) else { panic!("{c:#x}") };
+            let e = if o.wide { 8 } else { 4 };
+            for t in 0..n {
+                // the guest's word: this entry's, with registers (0..8: aliasing; a by-element Rm and an FMA's Ra anywhere)
+                let small = |r: &mut Rng| {
+                    let range = if r.below(4) == 0 { 32 } else { 8 };
+                    r.below(range) as u32
+                };
+                let (rd, rn, rm, ra) = (small(&mut r), small(&mut r), small(&mut r), small(&mut r));
+                let mut g = c & !0x3ff | rd | rn << 5;
+                if has_rm(&o) {
+                    g = g & !(0x1f << 16) | rm << 16;
+                }
+                if c & 0xff00_0000 == 0x1f00_0000 {
+                    g = g & !(0x1f << 10) | ra << 10;
+                }
+                let Some(Class::Patch(og)) = classify(g) else { panic!("{g:#x} from {c:#x}") };
+                assert_eq!(canon(g, &og), c);
+                let mut regs = [[0u8; 16]; 32];
+                for k in 0..8 {
+                    let q = if (t + k) % 2 == 0 { operands(&mut r, e, o.kind == tiny::CVT || o.kind == tiny::CVT16) } else { nan_operands(&mut r, e) };
+                    regs[4 * k as usize..4 * k as usize + 4].copy_from_slice(&q);
+                }
+                let fpcr = (r.below(4) << 22 | r.below(2) << 24) as u64;
+                let (mut direct, mut table) = (regs, regs);
+                let fd = direct_run(g, fpcr, &mut direct);
+                let ft = table_run(g, fpcr, &mut table).unwrap();
+                assert_eq!((direct, fd), (table, ft), "{g:#x} (entry {c:#x}) fpcr {fpcr:#x}\nregs {regs:x?}");
+                words += 1;
+            }
+        }
+        eprintln!("table vs word in place: {words} runs over all 100 entries");
     }
 }
 
