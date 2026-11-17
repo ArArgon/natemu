@@ -230,7 +230,8 @@ to natemu-raw.
     python3 tools/bench/boot.py --out DIR --name NAME --emu natemu --vcpus 1 --kernel BZIMAGE --initrd INSTALLER_INITRD \
         --fexc FEXC --cache off
 
-`run.py`: one boot of the bench initramfs (built by natemu-raw/bench-20261105-03/scripts/build.sh), the benchmark run twice
+`run.py`: one boot of the bench initramfs (built by natemu-raw/bench-20261117-01/scripts/build.sh on the reference box; that image adds
+`cray-strict` to bench-20261105-03 and leaves every other benchmark unchanged), the benchmark run twice
 in the guest, each timed START to END on the serial console (`wall_s`, `wall2_s`; the guest's own `guest_s`, `guest2_s`;
 per phase `phases`, `phases2`) and verified (`verified1`, `verified2`); a line per boot in DIR/bench.jsonl. `boot.py`: the
 Debian boot timed from process start to its end-point line (the installer's "Select a language", or the root-fs panic
