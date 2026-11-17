@@ -323,7 +323,8 @@ def cmd_smp(a, host, runtime):
         stats = [{k: cpu['stats'][k] for k in ('blocks', 'requests', 'links', 'retries', 'linked', 'link_points')} for cpu in cpus]
         return [{**e, 'outcome': outcome, 'diffs': diffs, 'stats': stats}]
     entries = run_groups(a, host, runtime, groups, judge)
-    # The lost race below is timing-dependent (missed in about one run in five): a run without it repeats neg-race@N, up to
+    # The lost race below needs the CPUs' NEG loops to overlap; a host that deschedules all but one for the loop's few ms
+    # misses it (2 runs of about 800 on Nov 17, both beside other heavy host work). A run without it repeats neg-race@N, up to
     # four more runs, each judged as above, before the check counts it.
     def raced(n):
         race = [s['linked'] for e in entries if e['name'] == f'neg-race@{n}' for s in e.get('stats', [])]
