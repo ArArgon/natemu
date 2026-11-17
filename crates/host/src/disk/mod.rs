@@ -20,8 +20,15 @@ pub(crate) trait DiskBackend: Send + Sync {
         Ok(())
     }
     /// Afterwards the range reads as zeros; the backend may deallocate it.
-    fn write_zeroes(&self, _offset: u64, _len: u64) -> std::io::Result<()> {
-        Err(std::io::ErrorKind::Unsupported.into())
+    fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()>;
+    /// [`Self::write_zeroes`] where the backend's data writes go through `write` (a test wrapper that observes them).
+    fn write_zeroes_with(
+        &self,
+        offset: u64,
+        len: u64,
+        _write: &dyn Fn(&[u8], u64) -> std::io::Result<usize>,
+    ) -> std::io::Result<()> {
+        self.write_zeroes(offset, len)
     }
 }
 impl DiskBackend for Box<dyn DiskBackend> {
@@ -39,6 +46,14 @@ impl DiskBackend for Box<dyn DiskBackend> {
     }
     fn write_zeroes(&self, offset: u64, len: u64) -> std::io::Result<()> {
         (**self).write_zeroes(offset, len)
+    }
+    fn write_zeroes_with(
+        &self,
+        offset: u64,
+        len: u64,
+        write: &dyn Fn(&[u8], u64) -> std::io::Result<usize>,
+    ) -> std::io::Result<()> {
+        (**self).write_zeroes_with(offset, len, write)
     }
 }
 
