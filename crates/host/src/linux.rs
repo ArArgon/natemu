@@ -77,7 +77,20 @@ struct LaunchPlan {
     layout: Layout,
 }
 
-/// `enabled` is [rng, disk, net].
+/// The memory map for `ram` bytes; `Err` when it is not a valid one. `enabled` is [rng, disk, net].
+fn launch_layout(enabled: [bool; 3], t: Transports, ram: u64) -> Result<Layout> {
+    let [rng, disk, net] = enabled;
+    let on_pci = |enabled: bool, t: Transport| enabled && t == Transport::Pci;
+    let layout = Layout {
+        low_end: ram.min(exec::LOW_RAM_END),
+        high: ram.saturating_sub(exec::LOW_RAM_END),
+        pci: on_pci(rng, t.rng) || on_pci(disk, t.disk) || on_pci(net, t.net),
+    };
+    layout.e820().map_err(|e| e.to_string())?;
+    Ok(layout)
+}
+
+/// The ACPI tables and the lists they are built from (panics on a vCPU count outside 1..=254, as `build_with_devices`).
 fn launch_plan(
     vcpus: usize,
     rsdp: u64,
@@ -89,12 +102,7 @@ fn launch_plan(
     let on_pci = |enabled: bool, t: Transport| enabled && t == Transport::Pci;
     let (pci_rng, pci_disk, pci_net) =
         (on_pci(rng, t.rng), on_pci(disk, t.disk), on_pci(net, t.net));
-    let layout = Layout {
-        low_end: ram.min(exec::LOW_RAM_END),
-        high: ram.saturating_sub(exec::LOW_RAM_END),
-        pci: pci_rng || pci_disk || pci_net,
-    };
-    layout.e820().map_err(|e| e.to_string())?;
+    let layout = launch_layout(enabled, t, ram)?;
     let (mut manifest, mut functions) = (Vec::new(), Vec::new());
     for (enabled, pci, resource, slot) in [
         (rng, pci_rng, crate::virtio::RNG_RESOURCE, RNG_SLOT),
@@ -232,14 +240,8 @@ impl Boot {
         let pci_rng = on_pci(self.rng, t.rng);
         let pci_disk = on_pci(self.disk.is_some(), t.disk);
         let pci_net = on_pci(self.net, t.net);
-        let plan = launch_plan(
-            self.vcpus,
-            self.rsdp,
-            [self.rng, self.disk.is_some(), self.net],
-            t,
-            self.ram,
-        )?; // the memory map is checked before allocating the RAM
-        let (layout, tables) = (plan.layout, plan.tables);
+        let enabled = [self.rng, self.disk.is_some(), self.net];
+        launch_layout(enabled, t, self.ram)?; // before require_vcpus and before allocating the RAM
         require_vcpus(self.vcpus)?;
         let backing = execution::prepare_with_pool(
             &self.runtime.to_string_lossy(),
@@ -248,6 +250,8 @@ impl Boot {
             self.ram as usize,
             self.pool,
         )?;
+        let plan = launch_plan(self.vcpus, self.rsdp, enabled, t, self.ram)?;
+        let (layout, tables) = (plan.layout, plan.tables);
         let inputs = Inputs {
             image: &self.kernel,
             cmdline: &self.cmdline,
@@ -1168,6 +1172,28 @@ mod pin_tests {
         assert_eq!(got.len(), EXPECTED.len());
         for (i, (g, e)) in got.iter().zip(EXPECTED).enumerate() {
             assert_eq!(g, e, "case {i}");
+        }
+    }
+    /// Bad RAM sizes give the memory map's error (before any vCPU check in `prepare`), and 0 or 255 vCPUs the table
+    /// builder's assert, as on the original code (checked at 33a99fb8 with a throwaway test on the original calls). The
+    /// host-limit error is `require_vcpus`'s, which `prepare` still calls between the two.
+    #[test]
+    fn bad_sizes_give_the_original_errors() {
+        let t = Transports::default();
+        for ram in [1u64 << 20, (1 << 30) + 4096, 0] {
+            let want = format!(
+                "load refused: BAD_LAYOUT: BadLayout(\"low RAM end {:#x}: a 2 MiB multiple above the map's RAM start 0x1000000, at most 3 GiB\")",
+                ram.min(exec::LOW_RAM_END)
+            );
+            assert_eq!(launch_layout([true; 3], t, ram).unwrap_err(), want);
+            assert_eq!(launch_plan(1, 0xe0000, [true; 3], t, ram).err(), Some(want));
+        }
+        for v in [0usize, 255] {
+            let r = std::panic::catch_unwind(|| {
+                launch_plan(v, 0xe0000, [false; 3], t, 1 << 30).map(|_| ())
+            });
+            let msg = *r.unwrap_err().downcast::<&str>().unwrap();
+            assert_eq!(msg, "xAPIC MADT entries hold APIC IDs below 255");
         }
     }
     const EXPECTED: [&str; 65] = [
