@@ -25,7 +25,14 @@ lines (copied out with debugfs) all in EXPECTED; no natemu network guest-error l
 are recorded; times are not judged (the QEMU run is the matched comparison; compare first boots: natemu's
 second boot reuses the first boot's compile cache). --mitigations-off adds mitigations=off on both backends, so both
 guests do the same kernel work; the stock line leaves PTI on, which QEMU TCG's guest also chooses. The download and
-generate loops run for as long as make does, so their work differs between backends; --solo-build times the build alone. The VM lock is held exclusively (a timed comparison)."""
+generate loops run for as long as make does, so their work differs between backends; --solo-build times the build alone. The VM lock is held exclusively (a timed comparison).
+
+run --image-format qcow2 (default raw; the raw records stay comparable): natemu's qcow2 disk. INPUTS/disk.qcow2 is made once from
+disk.raw (`qemu-img convert -O qcow2 -o preallocation=metadata`, then `qemu-img resize --preallocation=metadata` to 16 GiB, so
+the run measures steady state, not allocation; the seconds go in result.json), cloned per run with `cp -c` and given as
+--disk. The offline checks (e2fsck, debugfs) run on a temporary raw conversion deleted right after each launch, and
+`qemu-img check` must find nothing. --keep-disk keeps the qcow2; `profile` steps need a raw snapshot. --image-format overlay
+is refused until the overlay step. Needs qemu-img."""
 import argparse
 import fcntl
 import hashlib
@@ -41,7 +48,7 @@ import subprocess
 import sys
 import time
 
-from io_common import ROOT, VM_LOCK, digest, stop_group, write_json
+from io_common import IMAGE_FORMATS, ROOT, VM_LOCK, check_image_format, digest, qcow2_input, qcow2_problems, raw_of, stop_group, write_json
 from raw_root import RAW_ROOT
 from run_net_linux import lan_address
 
@@ -200,7 +207,7 @@ def command(args, disk, cache, phase='use'):
     return [QEMU, '-nodefaults', '-machine', 'pc-i440fx-11.1,hpet=off,i8042=off,vmport=off', '-accel', 'tcg,thread=multi',
             '-cpu', QCPU, '-m', str(args.ram * 1024), '-smp', str(args.vcpus), '-kernel', args.inputs / 'vmlinuz',
             '-initrd', args.inputs / 'initrd.img', '-append', cmdline, '-display', 'none', '-monitor', 'none',
-            '-serial', 'stdio', '-no-reboot', '-drive', f'file={disk},format=raw,if=none,id=d,cache=writeback,aio=threads',
+            '-serial', 'stdio', '-no-reboot', '-drive', f'file={disk},format={"qcow2" if str(disk).endswith(".qcow2") else "raw"},if=none,id=d,cache=writeback,aio=threads',
             '-device', 'virtio-blk-pci,drive=d,num-queues=1', '-netdev', 'user,id=n', '-device', 'virtio-net-pci,netdev=n',
             '-device', 'virtio-rng-pci']
 
@@ -288,18 +295,22 @@ def judge(work, phase, code, timed_out):
 
 
 def run(args):
+    qcow = check_image_format(args.image_format) == 'qcow2'
     args.out.mkdir(parents=True)
     recorded = json.loads((args.inputs / 'inputs.json').read_text())
     for name in ('disk.raw', 'vmlinuz', 'initrd.img', PYTHON): assert digest(args.inputs / name) == recorded[name], name
-    disk = args.out / 'disk.raw'
-    sh('cp', '-c', args.inputs / 'disk.raw', disk); os.truncate(disk, DISK_BYTES)
+    disk = args.out / ('disk.qcow2' if qcow else 'disk.raw')
+    if qcow:   # prepared once per inputs directory: preallocated metadata, grown to 16 GiB (also preallocated metadata)
+        prep = qcow2_input(args.inputs / 'disk.raw', args.inputs / 'disk.qcow2', DISK_BYTES); print(f'qcow2 input: {prep:.1f}s (0 = reused)', flush=True)
+        sh('cp', '-c', args.inputs / 'disk.qcow2', disk)
+    else: sh('cp', '-c', args.inputs / 'disk.raw', disk); os.truncate(disk, DISK_BYTES)
     serve = args.out / 'serve'; serve.mkdir()
     (serve / 'io5.sh').write_text(GUEST.replace('@PYSHA@', PYTHON_SHA).replace('@KSHA@', LINUX_SHA)
                                   .replace('@PYTESTS@', PYTESTS).replace('@SNAP@', SNAPSHOT)
                                   .replace('@SOLO@', '1' if args.solo_build else '0'))
     shutil.copy(args.inputs / PYTHON, serve / 'py.tar.xz')
     server, host = serve_files(serve)
-    result = {'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
+    result = {'image_format': args.image_format, 'qcow2_prep_seconds': prep if qcow else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
               'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'perf_log': args.perf_log, 'command': [str(c) for c in command(args, disk, 'CACHE')],
               'natemu': digest(ROOT / 'target/release/natemu') if args.backend == 'natemu' else None, 'phases': {}}
     try:
@@ -312,7 +323,8 @@ def run(args):
                 code, timed_out, seconds = launch(command(args, disk, args.out / 'compile-cache', phase), args.out, phase, host, limit)
                 contended = before + others()
                 r = judge(args.out, phase, code, timed_out)
-                r['problems'] += offline(disk, args.out, phase)
+                with raw_of(disk, qcow, args.out / 'view.raw') as raw: r['problems'] += offline(raw, args.out, phase)
+                if qcow: found, report = qcow2_problems(disk); write_json(args.out / f'qemu-img-check-{phase}.json', report); r['problems'] += found
                 r.update(exit=code, seconds=seconds, contended=contended); result['phases'][phase] = r
                 print(f'{phase}: exit {code} in {seconds}s, problems {r["problems"]}', flush=True)
                 if code != 0 or timed_out: break
@@ -431,6 +443,7 @@ def main():
     r.add_argument('--solo-build', action='store_true', help='diagnostic: after the manifest, configure and make the source again alone')
     r.add_argument('--perf-log', action='store_true', help='natemu: write each launch\'s timing log to OUT/perf-PHASE.log')
     r.add_argument('--lock', type=Path, default=VM_LOCK); r.add_argument('--keep-disk', action='store_true')
+    r.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default) or qcow2 (see the docstring); overlay is not built yet')
     f = sub.add_parser('profile', help='one step per boot from a snapshot disk, with the timing log')
     f.add_argument('--snapshot', type=Path, required=True); f.add_argument('--inputs', type=Path, required=True)
     f.add_argument('--out', type=Path, required=True); f.add_argument('--steps', nargs='+', required=True,

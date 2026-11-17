@@ -9,6 +9,13 @@ pinned: the guest reads the queue vector's effective_affinity_list, records that
 off it (the guest script lives in the image: use inputs from `prepare --transport pci`).
 prepare/self-check never run a VM. run owns one fresh main/read-only-restart pair,
 600/120 seconds, no retry. Whole-system measurements, not isolated SSD numbers.
+
+run --image-format qcow2 (natemu; default raw, whose records stay comparable): the disk is a qcow2 image. It is prepared once per
+inputs directory as INPUTS/root.qcow2 (`qemu-img convert -O qcow2 -o preallocation=metadata` from root.raw, so free space is
+already allocated and the jobs measure steady state, not allocation; the seconds are in qcow2-prep.json), cloned per run with
+`cp -c`, and launched with --disk. The image hashes and the offline e2fsck still judge raw bytes: after each launch the qcow2 is
+converted to a temporary raw file (deleted at once), and `qemu-img check` must report nothing (corruptions, leaks).
+--image-format overlay is refused until the overlay step. Needs qemu-img.
 """
 import argparse
 import copy
@@ -25,7 +32,7 @@ import time
 
 import run_fio_admission as admission
 import run_fio_baselines as baselines
-from io_common import PCI_PROBE, patch, pci_errors, pci_self_test
+from io_common import PCI_PROBE, IMAGE_FORMATS, check_image_format, patch, pci_errors, pci_self_test, qcow2_input, qcow2_problems, raw_of
 
 block = admission.block
 digest, write_json, checked = admission.digest, admission.write_json, admission.checked
@@ -378,11 +385,12 @@ def run(args):
     else:
         version = subprocess.check_output([str(binary), '--version'], text=True, timeout=10)
         if not version.startswith('QEMU emulator version 11.1.2'): raise ValueError('QEMU version differs')
+    qcow = check_image_format(args.image_format) == 'qcow2'
     pci = args.transport == 'pci'
     if pci and args.backend != 'natemu': raise ValueError('--transport pci is a natemu option')
     if pci and 'pci_probe' not in (args.inputs / 'rootfs/sbin/init').read_text(): raise ValueError('--transport pci needs inputs from prepare --transport pci')
     args.out.mkdir(parents=True, exist_ok=False)
-    write_json(args.out / 'manifest.json', {'backend': args.backend, 'cpus': args.cpus, **({'transport': 'pci'} if pci else {}), 'artifacts': artifacts,
+    write_json(args.out / 'manifest.json', {'backend': args.backend, 'cpus': args.cpus, **({'transport': 'pci'} if pci else {}), 'image_format': args.image_format, 'artifacts': artifacts,
         'input_manifest': {'path': str(args.inputs / 'inputs.json'), 'sha256': digest(args.inputs / 'inputs.json')},
         'oracle_sources': {str(p.resolve()): digest(p) for p in SOURCES},
         'bounds': {'vm_launches': 2, 'main_seconds': 600, 'verify_seconds': 120, 'log_bytes_per_vm': 32 << 20},
@@ -392,11 +400,14 @@ def run(args):
     results, persisted = [], None
     with args.lock.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        image = args.out / 'root.raw'
-        checked(['cp', '-c', args.inputs / 'root.raw', image], args.out / 'clone.log')
-        if digest(image) != pin['outputs']['root.raw']: raise ValueError('clone differs')
+        image = args.out / ('root.qcow2' if qcow else 'root.raw'); scratch = args.out / 'view.raw'
+        if qcow: write_json(args.out / 'qcow2-prep.json', {'seconds': qcow2_input(args.inputs / 'root.raw', args.inputs / 'root.qcow2')})
+        checked(['cp', '-c', args.inputs / ('root.qcow2' if qcow else 'root.raw'), image], args.out / 'clone.log')
+        with raw_of(image, qcow, scratch) as raw:
+            if digest(raw) != pin['outputs']['root.raw']: raise ValueError('clone differs')
         for phase in ('write', 'verify'):
-            case = args.out / phase; case.mkdir(); before = digest(image)
+            case = args.out / phase; case.mkdir()
+            with raw_of(image, qcow, scratch) as raw: before = digest(raw)
             cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr root=/dev/vda io_phase={phase} io_rng=0'
             if args.backend == 'natemu':
                 command = [str(binary), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.inputs / 'linux'),
@@ -406,7 +417,7 @@ def run(args):
                 command = [str(binary), '-machine', 'pc-i440fx-11.1', '-accel', 'tcg,thread=multi', '-cpu', 'max', '-smp', str(args.cpus),
                     '-m', '2048', '-nodefaults', '-display', 'none', '-monitor', 'none', '-no-reboot', '-serial', 'file:' + str(case / 'serial.log'),
                     '-kernel', str(args.inputs / 'linux'), '-initrd', str(args.inputs / 'bootstrap.cpio'), '-append', cmdline,
-                    '-drive', f'file={image},format=raw,if=none,id=disk,cache=writeback,aio=threads', '-device', baselines.DEVICE]
+                    '-drive', f'file={image},format={"qcow2" if qcow else "raw"},if=none,id=disk,cache=writeback,aio=threads', '-device', baselines.DEVICE]
             result = execute(command, case, 600 if phase == 'write' else 120)
             serial = case / 'serial.log'; text = serial.read_text(errors='replace').replace('\r', '') if serial.exists() else ''
             errors, logs, data, hashes = judge(text, phase, args.cpus, pci)
@@ -414,9 +425,13 @@ def run(args):
             for name, content in logs.items(): (exported / name).write_text(content)
             if result['returncode'] != 0 or result['timeout'] or result['log_limit']: errors.append('process failure/timeout/log limit')
             if set(result['host_time']) != {'real', 'user', 'sys'}: errors.append('missing host CPU/time metrics')
-            try: checked([fsck, '-fn', image], case / 'fsck.log')
-            except (RuntimeError, subprocess.TimeoutExpired) as e: errors.append('offline fsck: ' + str(e))
-            after = digest(image)
+            with raw_of(image, qcow, scratch) as raw:
+                try: checked([fsck, '-fn', raw], case / 'fsck.log')
+                except (RuntimeError, subprocess.TimeoutExpired) as e: errors.append('offline fsck: ' + str(e))
+                after = digest(raw)
+            if qcow:
+                found, report = qcow2_problems(image); write_json(case / 'qemu-img-check.json', report)
+                errors += found
             if phase == 'write':
                 if before == after: errors.append('main image unchanged')
                 persisted = hashes
@@ -531,6 +546,7 @@ def main():
     a.add_argument('--cpus', type=int, choices=(1, 2, 4), required=True)
     for n in ('executable', 'inputs', 'out', 'lock'): a.add_argument('--' + n, type=Path, required=True)
     for n in ('runtime', 'fexc', 'build-manifest'): a.add_argument('--' + n, type=Path)
+    a.add_argument('--image-format', choices=IMAGE_FORMATS, default='raw', help='raw (default) or qcow2: see the module docstring; overlay is not built yet')
     args = p.parse_args()
     for k, v in vars(args).items():
         if isinstance(v, Path): setattr(args, k, v.resolve())

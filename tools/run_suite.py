@@ -31,6 +31,8 @@ Steps `*-m2f`/`*-m2a` run FP runners emulating a host without FEAT_AFP (NATEMU_F
 --only/--skip take comma-separated step names or fnmatch patterns (`k1-*`, `faults@*`); `release` always runs."""
 import argparse, dataclasses, datetime, fcntl, fnmatch, json, os, pathlib, re, shutil, signal, subprocess, sys, threading, time
 
+import io_common
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
 # The compiler boot-handoff §5's `F=../natemu-raw/...` line names.
@@ -234,6 +236,10 @@ def steps(F, O):
                    '--cases', *(c for c in lc.CASES if not c.startswith('publish-') and (c in lc.TIMED) == timed)], est=5)
     vm('io-coverage', 'run_io_coverage.py', est=90)
     vm('io-coverage-pci', 'run_io_coverage.py', '--transport', 'pci', est=90)    # the same cases through virtio-PCI (MSI-X)
+    # qcow2 disks (the gpt and trim guests on a preallocated qcow2, host side checked with qemu-img): needs qemu-img; without it the
+    # step is left out and the skip is printed here (stderr), since the suite has no skipped state.
+    if io_common.qemu_img(): vm('io-coverage-qcow2', 'run_io_coverage.py', '--cases', 'qcow2', 'qcow2-trim', est=60)
+    else: print('run_suite: io-coverage-qcow2 SKIPPED: qemu-img is not installed (brew install qemu); the qcow2 I/O coverage is NOT part of this run', file=sys.stderr, flush=True)
     # Network: stock Linux on user-mode NAT (DHCP, HTTP to the host, iperf3, a reset under traffic, cancel); no internet.
     add('net-linux', ['python3', 'tools/run_net_linux.py', 'run', '--offline', '--fexc', F, '--out', O / 'out' / 'net-linux'], est=35)
     add('net-linux-pci', ['python3', 'tools/run_net_linux.py', 'run', '--offline', '--transport', 'pci', '--fexc', F, '--out', O / 'out' / 'net-linux-pci'], est=80)   # waits for net-linux's host ports

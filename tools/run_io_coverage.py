@@ -68,6 +68,14 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
                  slot 4 is unbound and rebound (Linux resets it first), then its MSI-X Enable and Interrupt Disable are
                  cleared under its bound driver without a reset, so its stale ISR asserts the shared line; slot 1's disk
                  must keep working at normal speed after each step, and Linux must not disable the line.
+  qcow2, qcow2-trim  (not in the default list; need qemu-img, else a clear refusal) the gpt and trim guests on a qcow2 disk: the
+                 raw image is converted with `qemu-img convert -O qcow2 -o preallocation=metadata` (free space allocated up
+                 front, as in the runners' --image-format qcow2) and launched with --disk. The host checks that read bytes
+                 (image changed, offline fsck, partition table, the trim byte-exactness) run on a temporary raw conversion,
+                 deleted after each launch; added: `qemu-img check` finds nothing, and `qemu-img compare` of the qcow2 with that
+                 raw copy is identical. qcow2-trim also needs `qemu-img map` to show the DISCARDed 128 KiB holding no data and
+                 the 1 MiB pattern's data clusters shrunk from 16 to at most 12 (the discard and the ZEROOUT's whole clusters).
+                 Their judge (qcow2_errors) is self-checked with mutations; no live control.
 Live negative controls (the judge must FAIL them): host-full-control (the host-full guest with the image on the normal
 disk) and host-limit-control (the host-limit guest without the limit)."""
 import argparse
@@ -90,7 +98,7 @@ import zlib
 
 from io_common import STARTUP_LINE, ROOT, VM_LOCK, digest, stop_group, write_json
 from raw_root import RAW_ROOT
-from io_common import PCI_PROBE, patch, pci_errors, pci_self_test
+from io_common import PCI_PROBE, patch, pci_errors, pci_self_test, qcow2_convert, qcow2_problems, raw_of, need_qemu_img
 from run_virtio_block import checked, KERNEL_DEB_SHA
 from run_virtio_rng import KVER
 
@@ -105,6 +113,9 @@ APPLETS = ('sh', 'mount', 'umount', 'modprobe', 'cat', 'grep', 'awk', 'dd', 'wc'
            'df', 'tail', 'test', 'ls', 'blockdev', 'hexdump', 'timeout')
 CASES = ('gpt', 'mbr', 'reboot-acpi', 'reboot-kbd', 'reboot-triple', 'fs-full', 'host-full', 'host-limit', 'trim')
 CONTROLS = ('host-full-control', 'host-limit-control')
+# qcow2 cases: the gpt and trim guests on a preallocated qcow2 image; the host checks read a temporary raw conversion.
+QCOW2_CASES = {'qcow2': 'gpt', 'qcow2-trim': 'trim'}
+QCOW_CLUSTER = 65536
 # The image each case starts from, and its extra kernel parameters.
 IMAGE = {'trim': 'gpt.raw', 'gpt': 'gpt.raw', 'mbr': 'mbr.raw', 'reboot-acpi': 'data.raw', 'reboot-kbd': 'data.raw', 'reboot-triple': 'data.raw',
          'fs-full': 'data.raw', 'host-full': 'hostfull.raw', 'host-limit': 'limit.raw'}
@@ -682,6 +693,37 @@ def fsck(e2fsck, image, offsets, log):
     return results
 
 
+def qcow2_data_bytes(image, start, length):
+    """Bytes of [START, START+LENGTH) that `qemu-img map` reports as data (allocated, not zero) in a qcow2 IMAGE."""
+    out = subprocess.run([need_qemu_img(), 'map', '--output=json', '-f', 'qcow2', str(image)], capture_output=True, text=True, check=True).stdout
+    return sum(max(0, min(e['start'] + e['length'], start + length) - max(e['start'], start)) for e in json.loads(out) if e['data'] and not e.get('zero'))
+
+
+def qcow2_host(image, raw, base, phase, start_clusters):
+    """The qcow2 facts after a launch: qemu-img check findings, compare result against the raw conversion, trim map numbers."""
+    compare = subprocess.run([need_qemu_img(), 'compare', '-f', 'qcow2', '-F', 'raw', str(image), str(raw)], capture_output=True, text=True).returncode
+    found, report = qcow2_problems(image)
+    trim = None
+    if base == 'trim' and phase == 'write':
+        start = PARTS['table'][2][0] * SECTOR
+        trim = {'discard_data': qcow2_data_bytes(image, start + TRIM_DISCARD[0], TRIM_DISCARD[1]), 'pattern_data': qcow2_data_bytes(image, start, MiB)}
+    return {'check': found, 'compare_rc': compare, 'trim': trim, 'allocated_clusters': report.get('allocated-clusters'), 'start_clusters': start_clusters}
+
+
+def qcow2_errors(q, base, phase):
+    errors = list(q['check'])
+    if q['compare_rc'] != 0: errors.append(f'qemu-img compare: exit {q["compare_rc"]}')
+    if base == 'trim' and phase == 'write':
+        t = q['trim']
+        if t is None: errors.append('no trim map')
+        else:
+            if t['discard_data']: errors.append(f'discarded range still holds {t["discard_data"]} data bytes')
+            if t['pattern_data'] > 12 * QCOW_CLUSTER: errors.append(f'pattern still holds {t["pattern_data"] // QCOW_CLUSTER} data clusters (max 12 after the discard and zero ranges)')
+            if q['allocated_clusters'] is None or q['allocated_clusters'] >= q['start_clusters']: errors.append(f'allocated clusters did not shrink ({q["start_clusters"]} -> {q["allocated_clusters"]})')
+            if t['pattern_data'] == 0: errors.append('no pattern data at all (the map is wrong or the write never landed)')
+    return errors
+
+
 def launch(args, case, phase, image, work, limit):
     command = [str(args.natemu), '--runtime', str(args.runtime), '--fexc', str(args.fexc), '--kernel', str(args.prepared / 'linux'),
                '--initrd', str(args.prepared / 'initramfs.cpio'), '--disk', str(image), '--vcpus', '2', '--ram', '1G',
@@ -1069,7 +1111,9 @@ def run_case(args, case):
     if case == 'multidisk': return run_multidisk(args)
     if case == 'sharedintx': return run_sharedintx(args)
     if case == 'readonly': return run_readonly(args)
-    base = case.removesuffix('-control')
+    qcow = case in QCOW2_CASES
+    if qcow: need_qemu_img(f'--cases {case}')
+    base = QCOW2_CASES.get(case) or case.removesuffix('-control')
     work = args.out / case; work.mkdir()
     volume = None
     if base == 'host-full' and case == base:
@@ -1079,26 +1123,31 @@ def run_case(args, case):
         checked(['hdiutil', 'attach', '-nobrowse', '-mountpoint', volume, work / 'volume.sparseimage'], work / 'hdiutil-attach.log')
     result = {'case': case, 'launches': []}
     try:
-        image = (volume or work) / 'disk.raw'
+        image = (volume or work) / ('disk.qcow2' if qcow else 'disk.raw'); scratch = work / 'view.raw'
         if volume: sparse_copy(args.prepared / IMAGE[base], image)
+        elif qcow: qcow2_convert(args.prepared / IMAGE[base], image, 'qcow2', 'preallocation=metadata')
         else: checked(['cp', '-c', args.prepared / IMAGE[base], image], work / 'clone.log')
-        total = os.path.getsize(image) // SECTOR
-        table = table_bytes(image, total)
+        total = os.path.getsize(args.prepared / IMAGE[base]) // SECTOR
+        with raw_of(image, qcow, scratch) as raw: table = table_bytes(raw, total)
+        start_clusters = qcow2_problems(image)[1].get('allocated-clusters') if qcow else None
         expect = expected_values()
         for phase in ('write', 'verify'):
             launch_dir = work / phase; launch_dir.mkdir()
-            before = digest(image)
+            with raw_of(image, qcow, scratch) as raw: before = digest(raw)
             limit = LIMIT if case == 'host-limit' and phase == 'write' else 0
             rc, timeout, seconds = launch(args, base, phase, image, launch_dir, limit)
             text = (launch_dir / 'serial.log').read_text(errors='replace').replace('\r', '') if (launch_dir / 'serial.log').exists() else ''
-            after = digest(image)
             stderr = (launch_dir / 'stderr.log').read_text(errors='replace')
-            host = {'rc': rc, 'timeout': timeout, 'stop': last_stop(stderr),
-                    'backend_errors': [l for l in stderr.splitlines() if l.startswith('virtio-block: ')],
-                    'changed': after != before, 'fsck': fsck(args.e2fsck, image, ext4_offsets(base), launch_dir / 'fsck'),
-                    'table': table_bytes(image, total) == table,
-                    'exact': image.read_bytes() == limit_image() if base == 'host-limit' and phase == 'write' else trim_exact(image) if base == 'trim' and phase == 'write' else None}
-            errors = judge(base, phase, text, host, expect, args.transport == 'pci')
+            with raw_of(image, qcow, scratch) as raw:    # the raw bytes: the image itself, or the qcow2's temporary conversion
+                after = digest(raw)
+                host = {'rc': rc, 'timeout': timeout, 'stop': last_stop(stderr),
+                        'backend_errors': [l for l in stderr.splitlines() if l.startswith('virtio-block: ')],
+                        'changed': after != before, 'fsck': fsck(args.e2fsck, raw, ext4_offsets(base), launch_dir / 'fsck'),
+                        'table': table_bytes(raw, total) == table,
+                        'exact': raw.read_bytes() == limit_image() if base == 'host-limit' and phase == 'write' else trim_exact(raw) if base == 'trim' and phase == 'write' else None}
+                q = qcow2_host(image, raw, base, phase, start_clusters) if qcow else None
+            errors = judge(base, phase, text, host, expect, args.transport == 'pci') + (qcow2_errors(q, base, phase) if qcow else [])
+            if qcow: host['qcow2'] = q
             entry = {'phase': phase, 'seconds': round(seconds, 1), 'disk_before': before, 'disk_after': after, **host, 'errors': errors}
             if base == 'host-full' and volume and phase == 'write':
                 entry['volume_free_kib'] = shutil.disk_usage(volume).free // 1024
@@ -1109,7 +1158,7 @@ def run_case(args, case):
         if volume:
             subprocess.run(['hdiutil', 'detach', str(volume)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
             (work / 'volume.sparseimage').unlink(missing_ok=True)
-        for leftover in (work / 'disk.raw',): leftover.unlink(missing_ok=True)
+        for leftover in (work / 'disk.raw', work / 'disk.qcow2', work / 'view.raw'): leftover.unlink(missing_ok=True)
     failed = any(l['errors'] for l in result['launches'])
     # A control passes when the judge rejects it.
     result['pass'] = failed if case in CONTROLS else not failed and len(result['launches']) == 2
@@ -1320,6 +1369,17 @@ def self_check():
             shared_rejected(phase, n, lines + ['COV-IRQ 24:        3   PCI-MSIX-0000:00:01.0   1-edge      virtio0-req.0'], host)
         else:
             shared_rejected(phase, n, lines + ['COV-STALE-DMESG [    4.38] Disabling IRQ #16'], host)
+    # qcow2: the host judge accepts a clean launch and rejects each finding.
+    for base, phase, good in (('gpt', 'write', {'check': [], 'compare_rc': 0, 'trim': None}),
+                              ('trim', 'write', {'check': [], 'compare_rc': 0, 'trim': {'discard_data': 0, 'pattern_data': 12 * QCOW_CLUSTER}, 'allocated_clusters': 803, 'start_clusters': 1024}),
+                              ('trim', 'verify', {'check': [], 'compare_rc': 0, 'trim': None})):
+        assert not qcow2_errors(good, base, phase), (base, phase)
+        bad = [dict(good, check=['qemu-img check: leaks=1']), dict(good, compare_rc=1)]
+        if good['trim'] and phase == 'write':
+            bad += [dict(good, trim=None), dict(good, trim=dict(good['trim'], discard_data=QCOW_CLUSTER)), dict(good, trim=dict(good['trim'], pattern_data=13 * QCOW_CLUSTER)),
+                    dict(good, trim=dict(good['trim'], pattern_data=0)), dict(good, allocated_clusters=1024)]
+        for b in bad: assert qcow2_errors(b, base, phase), (base, phase, b); controls += 1
+    assert qcow2_data_bytes.__doc__ and set(QCOW2_CASES.values()) <= set(CASES)
     controls += count[0]
     pci_self_test()
     for script in (INIT, INIT_PCI): subprocess.run(['sh', '-n'], input=script, text=True, check=True)
@@ -1334,7 +1394,7 @@ def main():
     parser.add_argument('--inputs', type=Path, default=INPUTS, help='a tools/run_virtio_block.py prepare directory')
     parser.add_argument('--transport', choices=('mmio', 'pci'), default='mmio', help='virtio transport (--virtio-transport); pci adds a guest probe and its checks')
     parser.add_argument('--kernel-deb', type=Path, default=KERNEL_DEB, help='the pinned Debian kernel package (the readonly case takes isofs.ko from it)')
-    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS + ('multidisk', 'readonly', 'sharedintx'), default=list(CASES + CONTROLS))
+    parser.add_argument('--cases', nargs='+', choices=CASES + CONTROLS + tuple(QCOW2_CASES) + ('multidisk', 'readonly', 'sharedintx'), default=list(CASES + CONTROLS))
     args = parser.parse_args()
     if {'multidisk', 'readonly', 'sharedintx'} & set(args.cases) and args.transport != 'mmio': parser.error('multidisk, readonly and sharedintx set their own transports; leave --transport at mmio')
     if len(set(args.cases)) != len(args.cases): parser.error('duplicate cases')

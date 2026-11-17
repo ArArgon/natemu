@@ -1,4 +1,5 @@
 """Helpers shared by the run_io_*, run_fio_*, run_virtio_* and run_serial_stress runners."""
+import contextlib
 import hashlib
 import json
 import os
@@ -101,3 +102,63 @@ def pci_self_test():
         assert pci_errors(probe(bad), 'X', 2, ('block',)), bad
     assert pci_errors(probe().replace('161', '0'), 'X', 2, ('block',)) and pci_errors(probe().replace('0x1042', '0x1041'), 'X', 2, ('block',))
     assert pci_errors(probe().replace('X-PCI-END\n', ''), 'X', 2, ('block',))
+
+
+# --- qcow2 images (--image-format qcow2) -----------------------------------------------------------------------------
+# The runners' own checks (e2fsck, debugfs, digests) read raw files, so a qcow2 run converts the image back to a temporary
+# raw file (qemu-img writes it sparse), checks that, and deletes it at once. The qcow2 input is prepared ONCE per inputs
+# directory from the raw one with preallocation=metadata: a plain convert would leave free space unallocated, and the run
+# would measure cluster allocation instead of the steady state. Nothing here touches raw runs.
+IMAGE_FORMATS = ('raw', 'qcow2', 'overlay')
+
+
+def qemu_img():
+    """The qemu-img binary, or None when it is not installed."""
+    import shutil
+    return shutil.which('qemu-img') or ('/opt/homebrew/bin/qemu-img' if os.access('/opt/homebrew/bin/qemu-img', os.X_OK) else None)
+
+
+def need_qemu_img(what='--image-format qcow2'):
+    q = qemu_img()
+    if q is None: raise SystemExit(f'{what} needs qemu-img (brew install qemu); it is not installed')
+    return q
+
+
+def check_image_format(fmt):
+    if fmt == 'overlay': raise SystemExit('--image-format overlay: not built until the overlay step (a qcow2 overlay on a raw base named by the config file\'s `backing` key)')
+    return fmt
+
+
+def qcow2_convert(src, dst, fmt, *options, size=None):
+    """qemu-img convert SRC (raw or qcow2) into DST of format FMT ('raw': sparse; 'qcow2': with OPTIONS, e.g. preallocation=metadata)."""
+    cmd = [need_qemu_img(), 'convert', '-O', fmt] + (['-o', ','.join(options)] if options else []) + [str(src), str(dst)]
+    subprocess.run(cmd, check=True, capture_output=True)
+    if size is not None: subprocess.run([need_qemu_img(), 'resize', '-f', fmt] + (['--preallocation=metadata'] if fmt == 'qcow2' else []) + [str(dst), str(size)], check=True, capture_output=True)
+
+
+def qcow2_input(raw, qcow, size=None):
+    """Prepare QCOW once from RAW (reused when present): preallocated metadata, grown to SIZE bytes. Returns the seconds spent (0 if reused)."""
+    import time
+    if qcow.exists(): return 0.0
+    began, part = time.monotonic(), qcow.with_name(qcow.name + '.part')
+    qcow2_convert(raw, part, 'qcow2', 'preallocation=metadata', size=size)
+    part.rename(qcow)
+    return time.monotonic() - began
+
+
+def qcow2_problems(image):
+    """`qemu-img check` findings on a stopped image (empty list = clean); also returns the parsed report."""
+    p = subprocess.run([need_qemu_img(), 'check', '--output=json', str(image)], capture_output=True, text=True)
+    try: report = json.loads(p.stdout)
+    except ValueError: return [f'qemu-img check: exit {p.returncode}, no report: {p.stderr.strip()[:200]}'], {}
+    bad = [f'{k}={report[k]}' for k in ('corruptions', 'leaks', 'check-errors', 'corruptions-fixed', 'leaks-fixed') if report.get(k)]
+    return ([f'qemu-img check exit {p.returncode}'] if p.returncode else []) + (['qemu-img check: ' + ' '.join(bad)] if bad else []), report
+
+
+@contextlib.contextmanager
+def raw_of(image, qcow, scratch):
+    """The raw bytes of IMAGE for the runners' checks: IMAGE itself when raw, else a temporary raw copy at SCRATCH (deleted on exit)."""
+    if not qcow: yield image; return
+    qcow2_convert(image, scratch, 'raw')
+    try: yield scratch
+    finally: scratch.unlink(missing_ok=True)
