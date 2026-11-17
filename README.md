@@ -19,8 +19,10 @@ natemu boots the unmodified Debian 13 cloud image with networking and a disk. It
 (an M2 passes the floating-point and networking checks); other distributions and kernels are untested. Not yet supported:
 
 - **Booting:** no BIOS or UEFI. natemu starts a Linux kernel directly, so installer ISOs and bootloaders do not work.
-- **Devices:** serial console, network, raw disk images and a random-number device only. No display, keyboard, sound, USB,
-  shared folders or qcow2 images.
+- **Devices:** serial console, network, disk images (raw or qcow2; several, some read-only, from a `--config` file, see
+  [docs/configuration.md](docs/configuration.md)) and a random-number device only. A launch with a `--config` file uses a PCI
+  bus by default; one without it uses MMIO devices (PCI with `--virtio-transport pci`). No display, keyboard, sound, USB or
+  shared folders.
 - **Networking:** IPv4 only, through NAT, with port forwarding. No IPv6 or bridged networking.
 - **CPU:** 64-bit programs only. No AVX-512. x87 floating point uses 64-bit rather than 80-bit precision.
 - **Performance:** Linux's default Meltdown protection is slow under natemu; see
@@ -145,7 +147,7 @@ The first boot translates everything and takes a few seconds longer; later boots
 | `--net` | IPv4 network over user-mode NAT. The guest gets `10.0.2.15` by DHCP. Guest access to the Mac's `localhost` is off by default; its LAN address remains reachable. |
 | `--net-forward HOST:GUEST` | Forward a TCP port from the Mac's `127.0.0.1` to the guest. Repeat for more ports; use `udp:HOST:GUEST` for UDP. Requires `--net`. |
 | `--net-host-loopback` | Let the guest reach the Mac's `127.0.0.1:PORT` through `10.0.2.2:PORT`. Requires `--net`; also required for UDP forwarding. |
-| `--disk FILE` | A raw disk image, seen as `/dev/vda`. Only one natemu can use a disk at a time. |
+| `--disk FILE` | A raw or qcow2 disk image, seen as `/dev/vda`. Only one natemu can use a disk at a time. |
 | `--rng` | A hardware random-number device. |
 
 At startup natemu prints a few `natemu: ...` lines describing how it will run on this Mac: the CPU it shows the guest,
