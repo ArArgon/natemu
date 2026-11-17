@@ -716,6 +716,14 @@ impl Prepared {
                 "natemu: the resident was built with its `perf` feature but the performance log is off (NATEMU_PERF_LOG): its accounting slows every resident entry"
             );
         }
+        // AFP accurate plan chunk 6: `NATEMU_FP_TRAP_COUNTS=1` reports each vCPU's trapped-FP counts on stderr after the run, for `tools/bench/run.py`
+        // (`fp_hist`: cause * 8 + class, see `cache::Control`).
+        if std::env::var_os("NATEMU_FP_TRAP_COUNTS").is_some() {
+            for v in 0..vcpus {
+                let c: exec::cache::Control = backing.vcpu(v).read_record(exec::cache::LOOKUP_OFFSET + exec::cache::CONTROL);
+                eprintln!("natemu-fp-traps vcpu {v} traps {} steps {} hist {:?}", c.fp_traps, c.fp_steps, c.fp_hist);
+            }
+        }
         if let Some(e) = supervision.error {
             return Err(e);
         }

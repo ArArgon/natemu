@@ -633,6 +633,10 @@ pub mod cache {
         /// words (counted apart from `debug_steps`, which are watchpoint steps).
         pub fp_traps: u64,
         pub fp_steps: u64,
+        /// AFP accurate plan chunk 6: `fp_traps` by cause (the ISS flag: 0 UFE, 1 IOE, 2 other, 3 the FMA check) times word class
+        /// (0 add/sub/sqrt, 1 multiply, 2 divide, 3 FMA, 4 narrowing convert, 5 `fcmp`/`fcmpe`, 6 scalar `fcvtz`, 7 any other kept word):
+        /// index `8 * cause + class`.
+        pub fp_hist: [u64; 32],
         /// M2: data shadows of guest RAM installed, by the page's effective memory type (index: the encoding,
         /// [`crate::cpu::memory_type`]). A UC page is shadowed only while the instruction accessing it runs alone (owner
         /// decision, November 2: uncached RAM keeps x86 strong ordering), so its count is one per such access and page (and per re-install, e.g. an upgrade to writable).
@@ -1930,18 +1934,27 @@ pub const FPCR_IOE: u64 = 1 << 8;
 /// sign, D); and (chunk 5) never FZ = 1: under DAZ + FTZ the flush is the handler's (UFE traps every tiny result) and row 4's software input
 /// flush, so FZ = 0 there. Every other case is [`fpcr`] exactly, so fast mode and every AFP host run as before. x87 never traps:
 /// [`x87_fpcr`] is explicit and trap-free wherever this word has a trap bit.
-pub const fn fpcr_run(mxcsr: u64, no_afp: bool, accurate: bool) -> u64 {
+pub const fn fpcr_run(mxcsr: u64, no_afp: bool, mode: u64) -> u64 {
     let base = fpcr(mxcsr, no_afp);
-    if accurate && no_afp {
+    if !no_afp {
+        base
+    } else if mode & 1 != 0 {
         base & !(1 << 24) | FPCR_IOE | FPCR_UFE
     } else {
-        base
+        // Chunk 6 measurement (`NATEMU_FP_TRAPS`): fast mode with the trap enables the gate asks about. UFE wherever FZ = 0 (the hardware flush
+        // of DAZ + FTZ keeps FZ = 1, fast mode's contract); the handler patches by fast mode's rule (`fp::stepped`).
+        base | if mode & FP_FAST_UFE != 0 && base >> 24 & 1 == 0 { FPCR_UFE } else { 0 } | if mode & FP_FAST_IOE != 0 { FPCR_IOE } else { 0 }
     }
 }
+/// Bits of [`Cpu::accurate_fp`] above the mode (bit 0): chunk 6's measurement-only fast-mode trap enables (UFE, IOE) on a host without AFP.
+/// They change no code but x87's FPCR word ([`x87_fpcr`], keyed by `code_context` bits 14-16), so a winner becomes the default by
+/// making these the fast mode's value of `Cpu::accurate_fp`.
+pub const FP_FAST_UFE: u64 = 2;
+pub const FP_FAST_IOE: u64 = 4;
 /// AFP accurate plan chunk 1: 1 when the mode is accurate and the host lacks AFP, else 0: [`Cpu::code_context`] bit 32, and fexc's
 /// `--accurate` is sent exactly then. The one place the two inputs meet.
 pub const fn accurate_key(accurate_fp: u64, no_afp: u64) -> u64 {
-    (accurate_fp != 0 && no_afp != 0) as u64
+    (accurate_fp & 1 != 0 && no_afp != 0) as u64
 }
 /// AFP fallback chunk 3a: 1 when `no_afp` and MXCSR.DAZ is set, else 0. Part of [`Cpu::code_context`] (bit 30) and fexc's `--daz`:
 /// without AFP, code for DAZ flushes its FP source operands in software.
@@ -2046,10 +2059,10 @@ pub const X87_FPCR_EXPLICIT: u64 = 1 << 32;
 /// The FPCR x87 arithmetic runs under for `fcw` (I6): AH and NEP as for SSE (clear with `no_afp`), RMode from FCW.RC (bits
 /// 11:10, the same encoding as MXCSR.RC), no flush to zero; 0 when it equals MXCSR's ([`fpcr`]), which blocks are entered
 /// with. With `no_afp` a word that differs carries [`X87_FPCR_EXPLICIT`], so it is never 0 (a bare 0 would be that "equal").
-pub const fn x87_fpcr(fcw: u64, mxcsr: u64, no_afp: bool, accurate: bool) -> u64 {
+pub const fn x87_fpcr(fcw: u64, mxcsr: u64, no_afp: bool, mode: u64) -> u64 {
     let afp = if no_afp { 0 } else { 1 << 1 | 1 << 2 };
     let x87 = afp | [0, 2, 1, 3][(fcw >> 10 & 3) as usize] << 22;
-    if x87 == fpcr_run(mxcsr, no_afp, accurate) {
+    if x87 == fpcr_run(mxcsr, no_afp, mode) {
         0
     } else if no_afp {
         x87 | X87_FPCR_EXPLICIT
@@ -2296,7 +2309,7 @@ impl Cpu {
             | bit(self.cr4 & CR4_OSFXSR != 0, 11)
             | bit(self.bit_tests_cut(), 12)
             | bit(self.cr0 & CR0_MP != 0, 13)
-            | (x87_fpcr(self.fcw, self.mxcsr, self.no_afp != 0, accurate_key(self.accurate_fp, self.no_afp) != 0) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
+            | (x87_fpcr(self.fcw, self.mxcsr, self.no_afp != 0, self.accurate_fp) != 0) as u64 * (1 | (self.fcw >> 10 & 3) << 1) << 14
             | bit(self.avx_enabled(), 17)
             // I5c: the unmasked MXCSR and FCW exceptions (0 with every exception masked): a translation checks each
             // floating-point instruction for them.
@@ -4012,12 +4025,12 @@ mod tests {
         let (mut on, mut off) = (0, 0);
         for mxcsr in 0..1u64 << 16 {
             for (no_afp, accurate) in [(false, false), (false, true), (true, false), (true, true)] {
-                let (w, base) = (fpcr_run(mxcsr, no_afp, accurate), fpcr(mxcsr, no_afp));
+                let (w, base) = (fpcr_run(mxcsr, no_afp, u64::from(accurate)), fpcr(mxcsr, no_afp));
                 if accurate && no_afp {
                     assert_eq!(w, base & !(1 << 24) | FPCR_IOE | FPCR_UFE, "{mxcsr:#x}");
                     on += 1;
                     for fcw in [FCW_INIT, FCW_INIT | 3 << 10, 0x3f | 1 << 10] {
-                        let x87 = x87_fpcr(fcw, mxcsr, no_afp, accurate);
+                        let x87 = x87_fpcr(fcw, mxcsr, no_afp, u64::from(accurate));
                         assert_eq!(x87 & crate::FPTRAPS_MASK, 0, "x87 never traps");
                         assert_ne!(x87 & X87_FPCR_EXPLICIT, 0, "explicit, so a switch is emitted: {mxcsr:#x}");
                     }
@@ -4030,26 +4043,37 @@ mod tests {
         assert!(on > 0 && off > on);
         // chunk 5: DAZ + FTZ runs with FZ = 0 (the hardware flush is the handler's now) and both traps on; fast mode keeps FZ = 1
         let both = MXCSR_RESET | 1 << 15 | 1 << 6;
-        assert_eq!(fpcr_run(both, true, true), FPCR_UFE | FPCR_IOE);
-        assert_eq!(fpcr_run(both, true, false) >> 24 & 1, 1);
-        assert_eq!(fpcr_run(MXCSR_RESET, true, true), FPCR_UFE | FPCR_IOE);
+        assert_eq!(fpcr_run(both, true, 1), FPCR_UFE | FPCR_IOE);
+        assert_eq!(fpcr_run(both, true, 0) >> 24 & 1, 1);
+        assert_eq!(fpcr_run(MXCSR_RESET, true, 1), FPCR_UFE | FPCR_IOE);
+        // chunk 6: the measurement-only fast modes: the fast word plus UFE (where FZ = 0) and/or IOE; none changes an AFP host
+        for mxcsr in [MXCSR_RESET, both, MXCSR_RESET | 1 << 15, MXCSR_RESET | 1 << 13] {
+            let base = fpcr(mxcsr, true);
+            let ufe = if base >> 24 & 1 == 0 { FPCR_UFE } else { 0 };
+            assert_eq!(fpcr_run(mxcsr, true, FP_FAST_UFE), base | ufe);
+            assert_eq!(fpcr_run(mxcsr, true, FP_FAST_IOE), base | FPCR_IOE);
+            assert_eq!(fpcr_run(mxcsr, true, FP_FAST_UFE | FP_FAST_IOE), base | ufe | FPCR_IOE);
+            assert_eq!(fpcr_run(mxcsr, false, FP_FAST_UFE | FP_FAST_IOE), fpcr(mxcsr, false));
+            assert_ne!(x87_fpcr(FCW_INIT, mxcsr, true, FP_FAST_IOE), 0, "keyed: x87 switches to its trap-free word");
+            assert_eq!(accurate_key(FP_FAST_UFE | FP_FAST_IOE, 1), 0);
+        }
     }
     #[test]
     fn x87_fpcr_differs_only_when_it_must() {
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, false, false), 0);
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, false, 0), 0);
         for rc in 0..4u64 {
-            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | rc << 13, false, false), 0);
+            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | rc << 13, false, 0), 0);
             assert_eq!(
-                x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13, false, false),
+                x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13, false, 0),
                 fpcr(MXCSR_RESET | rc << 13, false)
             );
         }
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, false, false), fpcr(MXCSR_RESET, false)); // FTZ
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, false, 0), fpcr(MXCSR_RESET, false)); // FTZ
         assert_eq!(
-            x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ, false, false),
+            x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ, false, 0),
             fpcr(MXCSR_RESET, false)
         );
-        assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET, false, false), 0); // precision control has no FPCR effect (doubles throughout)
+        assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET, false, 0), 0); // precision control has no FPCR effect (doubles throughout)
     }
 
     /// AFP fallback chunks 1 and 3a: without AFP no AFP bit (AH 1, NEP 2, FIZ 0) is ever written: FPCR holds RMode and FZ only,
@@ -4067,7 +4091,7 @@ mod tests {
             assert_eq!(without, with & !AFP & !(1 << 24) | fz, "{mxcsr:#x}: RMode as with AFP, FZ with DAZ and FTZ");
             for rc in 0..4u64 {
                 let fcw = FCW_INIT & !(3 << 10) | rc << 10;
-                let x87 = x87_fpcr(fcw, mxcsr, true, false);
+                let x87 = x87_fpcr(fcw, mxcsr, true, 0);
                 assert_eq!(x87 & AFP, 0);
                 // Own word: RMode from FCW.RC only (marked explicit); none when it equals MXCSR's.
                 let own = [0, 2, 1, 3][rc as usize] << 22;
@@ -4077,12 +4101,12 @@ mod tests {
         }
         // The default modes need no x87 word without AFP either; FTZ and a different RC do, and so does nearest rounding
         // under FTZ or another MXCSR.RC, whose FPCR is 0: it is sent with the explicit marker, never as a bare 0.
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, true, false), 0);
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, true, false), 0); // FTZ alone: FZ stays clear (software flush)
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 6, true, false), 0); // DAZ alone, likewise
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15 | 1 << 6, true, false), X87_FPCR_EXPLICIT); // both: FZ = 1 (hardware flush)
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 13, true, false), X87_FPCR_EXPLICIT);
-        assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true, false), X87_FPCR_EXPLICIT | 3 << 22);
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, true, 0), 0);
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, true, 0), 0); // FTZ alone: FZ stays clear (software flush)
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 6, true, 0), 0); // DAZ alone, likewise
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15 | 1 << 6, true, 0), X87_FPCR_EXPLICIT); // both: FZ = 1 (hardware flush)
+        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 13, true, 0), X87_FPCR_EXPLICIT);
+        assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true, 0), X87_FPCR_EXPLICIT | 3 << 22);
     }
 
     /// AFP accurate plan chunk 1: `code_context` bit 32 is accurate mode AND no AFP, and nothing else moves: accurate mode on an AFP

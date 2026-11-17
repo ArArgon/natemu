@@ -88,6 +88,14 @@ class TimingTests(unittest.TestCase):
         self.assertLess(rec['wall_bounds_s'][0], 0)   # same-read markers have overlapping uncertainty intervals
         self.assertGreater(rec['wall_bounds_s'][1], 0)
 
+    def test_fp_trap_counts_are_summed_and_split(self):
+        h = [0] * 32; h[1] = 3; h[8 + 5] = 2
+        line = f'natemu-fp-traps vcpu 0 traps 5 steps 5 hist {h}\n'
+        r = bench.fp_traps(line + line)
+        self.assertEqual((r['traps'], r['steps']), (10, 10))
+        self.assertEqual(r['by'], {'ufe': {'mul': 6}, 'ioe': {'fcmp': 4}, 'other': {}, 'check': {}})
+        self.assertIsNone(bench.fp_traps('natemu: nothing\n'))
+
 
 if __name__ == '__main__':
     unittest.main()

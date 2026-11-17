@@ -2766,7 +2766,7 @@ fn report(
         vcpu: area.vcpu(),
         tso: shared.actlr & 2 != 0,
         afp: s.cpu.no_afp == 0,
-        fp: fp_mode(s.cpu.accurate_fp != 0),
+        fp: fp_mode(s.cpu.accurate_fp & 1 != 0),
         stop: kind,
         reason,
         gpr: hexes(&s.cpu.gpr),
