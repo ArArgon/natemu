@@ -49,6 +49,8 @@ pub struct Config {
     pub compile_cache_mb: Option<u64>,
     pub speculation_barriers: bool,
     pub kernel: Option<PathBuf>,
+    /// The file has a `[boot.kernel]` table (its `image` may still come from `--kernel`).
+    pub kernel_table: bool,
     pub initrd: Option<PathBuf>,
     pub cmdline: String,
     pub disks: Vec<Disk>,
@@ -82,6 +84,7 @@ impl Config {
             compile_cache_mb: None,
             speculation_barriers: false,
             kernel: None,
+            kernel_table: false,
             initrd: None,
             cmdline: String::new(),
             disks: vec![],
@@ -94,7 +97,7 @@ impl Config {
             perf_log: None,
         }
     }
-    /// The message prefix: the file's name, else `natemu`.
+    /// The prefix of this configuration's error messages: the config file's name as given, or `config` when there is none.
     fn who(&self) -> &str {
         self.file.as_deref().unwrap_or("config")
     }
@@ -127,11 +130,10 @@ struct FileConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FMachine {
-    ram: Option<FSize>,
+    ram: Option<toml::Value>,
     vcpus: Option<usize>,
     transport: Option<FTransport>,
 }
-/// `ram = "4G"` or a plain integer of bytes.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum FSize {
@@ -170,7 +172,7 @@ struct FBoot {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FKernel {
-    image: PathBuf,
+    image: Option<PathBuf>, // required after merging with --kernel (see `validate`)
     initrd: Option<PathBuf>,
     cmdline: Option<String>,
 }
@@ -204,9 +206,9 @@ struct FDebug {
     perf_log: Option<PathBuf>,
 }
 
-/// A file value's path: relative ones are taken from the file's folder (`off` stays the word).
+/// A file value's path: relative ones are taken from the file's folder.
 fn rel(base: &Path, p: &Path) -> PathBuf {
-    if p.is_absolute() || p == Path::new("off") {
+    if p.is_absolute() {
         p.to_path_buf()
     } else {
         base.join(p)
@@ -232,11 +234,18 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
     let who = cfg.who().to_string();
     if let Some(m) = f.machine {
         if let Some(r) = m.ram {
+            // `"4G"` (any `--ram` spelling as a string) or a plain integer of bytes.
+            let bad = || {
+                format!(
+                    "{who}: machine.ram: expected a size string like \"4G\" or a non-negative integer of bytes"
+                )
+            };
             cfg.ram = Some(match r {
-                FSize::Bytes(n) => n,
-                FSize::Text(t) => {
+                toml::Value::Integer(n) => u64::try_from(n).map_err(|_| bad())?,
+                toml::Value::String(t) => {
                     crate::size(&t).map_err(|e| format!("{who}: machine.ram: {e}"))?
                 }
+                _ => return Err(bad()),
             });
         }
         cfg.vcpus = m.vcpus.or(cfg.vcpus);
@@ -268,7 +277,13 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         }
         cfg.compile_cache = e
             .compile_cache
-            .map(|p| rel(base, Path::new(&p)))
+            .map(|p| {
+                if p == "off" {
+                    PathBuf::from(p)
+                } else {
+                    rel(base, Path::new(&p))
+                }
+            }) // `off` is a word, not a path
             .or(cfg.compile_cache.take());
         cfg.compile_cache_mb = e.compile_cache_mb.or(cfg.compile_cache_mb);
         cfg.speculation_barriers = e.speculation_barriers.unwrap_or(cfg.speculation_barriers);
@@ -291,7 +306,8 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
                 ));
             }
             (Some(k), None) => {
-                cfg.kernel = Some(rel(base, &k.image));
+                cfg.kernel_table = true;
+                cfg.kernel = k.image.map(|p| rel(base, &p)).or(cfg.kernel.take());
                 cfg.initrd = k.initrd.map(|p| rel(base, &p));
                 cfg.cmdline = k.cmdline.unwrap_or_default();
             }
@@ -406,6 +422,11 @@ fn apply_flags(
     seen: &mut BTreeSet<String>,
 ) -> Res<()> {
     let mut on = |id: &str, keys: &[&str]| {
+        debug_assert!(
+            keys.iter()
+                .all(|k| KEYS.contains(k) || k.starts_with("disk.") || k.starts_with("nic.")),
+            "{keys:?}"
+        );
         let hit = given.contains(id);
         if hit {
             seen.extend(keys.iter().map(|k| k.to_string()));
@@ -498,7 +519,10 @@ fn apply_flags(
             backing: None,
         });
     }
-    if on("net", &["nic.net0.forward", "nic.net0.host_loopback"]) && cli.net {
+    // --net claims no key of its own; its options claim theirs.
+    on("net_forward", &["nic.net0.forward"]);
+    on("net_host_loopback", &["nic.net0.host_loopback"]);
+    if on("net", &[]) && cli.net {
         if !cfg.nics.is_empty() {
             return Err(refuse("--net", "nic", "forward"));
         }
@@ -519,9 +543,35 @@ fn apply_flags(
 
 // ---- --set -------------------------------------------------------------------------------------------------------------
 
-const SET_KEYS: &str = "machine.ram, machine.vcpus, machine.transport[.disk|.nic|.rng], serial.output, serial.stdin, \
-    engine.{fexc,runtime,fp,compile_cache,compile_cache_mb,speculation_barriers}, boot.kernel.{image,initrd,cmdline}, \
-    debug.{check_reuse,pool,page_currency,writable_on_read,perf_log}, disk.ID.{path,readonly,backing}, nic.ID.{forward,host_loopback}";
+/// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
+/// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
+// TODO(step 7): `--virtio-transport`'s help says [default: mmio], which is wrong with a --config file (the default is pci there);
+// and the serial keyword `stdout` of the file and --set differs from the flag, where `--serial stdout` is a file name.
+const KEYS: [&str; 22] = [
+    "machine.ram",
+    "machine.vcpus",
+    "machine.transport",
+    "machine.transport.disk",
+    "machine.transport.nic",
+    "machine.transport.rng",
+    "serial.output",
+    "serial.stdin",
+    "engine.fexc",
+    "engine.runtime",
+    "engine.fp",
+    "engine.compile_cache",
+    "engine.compile_cache_mb",
+    "engine.speculation_barriers",
+    "boot.kernel.image",
+    "boot.kernel.initrd",
+    "boot.kernel.cmdline",
+    "debug.check_reuse",
+    "debug.pool",
+    "debug.page_currency",
+    "debug.writable_on_read",
+    "debug.perf_log",
+];
+const DEVICE_KEYS: &str = "disk.ID.{path,readonly,backing}, nic.ID.{forward,host_loopback}";
 
 fn boolish(text: &str) -> Res<bool> {
     use clap::builder::TypedValueParser;
@@ -607,32 +657,11 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
     } else {
         vec![key]
     };
-    let known = [
-        "machine.ram",
-        "machine.vcpus",
-        "machine.transport",
-        "machine.transport.disk",
-        "machine.transport.nic",
-        "machine.transport.rng",
-        "serial.output",
-        "serial.stdin",
-        "engine.fexc",
-        "engine.runtime",
-        "engine.fp",
-        "engine.compile_cache",
-        "engine.compile_cache_mb",
-        "engine.speculation_barriers",
-        "boot.kernel.image",
-        "boot.kernel.initrd",
-        "boot.kernel.cmdline",
-        "debug.check_reuse",
-        "debug.pool",
-        "debug.page_currency",
-        "debug.writable_on_read",
-        "debug.perf_log",
-    ];
-    if !known.contains(&key) {
-        return Err(err(format!("unknown key; expected one of {SET_KEYS}")));
+    if !KEYS.contains(&key) {
+        return Err(err(format!(
+            "unknown key; expected one of {}, {DEVICE_KEYS}",
+            KEYS.join(", ")
+        )));
     }
     if group.iter().any(|k| seen.contains(*k)) {
         return Err(err("set twice on the command line".into()));
@@ -646,7 +675,17 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
                     .map_err(|_| err(format!("bad count {text:?}")))?,
             )
         }
-        "machine.transport" => cfg.transports = crate::transports(text).map_err(err)?,
+        "machine.transport" => {
+            // `nic=` is the new name of the old flag's `net=`; both are accepted.
+            let spec: Vec<String> = text
+                .split(',')
+                .map(|p| {
+                    p.strip_prefix("nic=")
+                        .map_or(p.to_string(), |v| format!("net={v}"))
+                })
+                .collect();
+            cfg.transports = crate::transports(&spec.join(",")).map_err(err)?
+        }
         "machine.transport.disk" => cfg.transports.disk = transport_word(text).map_err(err)?,
         "machine.transport.nic" => cfg.transports.net = transport_word(text).map_err(err)?,
         "machine.transport.rng" => cfg.transports.rng = transport_word(text).map_err(err)?,
@@ -675,7 +714,7 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
             cfg.writable_on_read = natemu::execution::parse_writable_on_read(text).map_err(err)?
         }
         "debug.perf_log" => cfg.perf_log = Some(path()),
-        _ => unreachable!(),
+        _ => return Err(err("internal error: no handler for this key".into())),
     }
     Ok(())
 }
@@ -692,6 +731,11 @@ fn id_ok(id: &str) -> bool {
 /// The checks that need no VM (design §1): all before anything is opened except the same-file test, which stats the disks.
 pub fn validate(cfg: &Config) -> Res<()> {
     let who = cfg.who();
+    if cfg.kernel.is_none() && cfg.kernel_table {
+        return Err(format!(
+            "{who}: [boot.kernel] needs image (or pass --kernel FILE)"
+        ));
+    }
     if cfg.kernel.is_none() {
         return Err(format!(
             "{who}: no boot method: --kernel FILE, or [boot.kernel] in a --config file"
