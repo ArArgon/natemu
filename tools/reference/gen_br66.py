@@ -2,6 +2,8 @@
 """Seeded corpus: 66 (operand-size prefix) on near direct branches in 64-bit mode, with SDM-derived expected states.
 
     tools/with-env python3 tools/reference/gen_br66.py --out DIR [--seed N] [--qemu QEMU]
+    python3 tools/reference/gen_br66.py -o PROGRAMS.json [--seed N]      # programs only, each with its twin as
+                                                                         # `reference_program` (testkit seeds QEMU on it)
 
 Intel ignores 66 on a near direct branch in 64-bit mode: the operand size is forced to 64 bits and the displacement stays
 rel8/rel32 (SDM Vol.2 CALL: "the operand size for near call (and all near branches) is forced to 64-bits", "In 64-bit
@@ -74,10 +76,18 @@ def run_qemu(twins, work, qemu):
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--out', type=pathlib.Path, required=True)
+    ap = argparse.ArgumentParser(); ap.add_argument('--out', type=pathlib.Path)
+    ap.add_argument('-o', '--output', type=pathlib.Path, help='programs only (with their twins); no QEMU run')
     ap.add_argument('--seed', type=int, default=20261102); ap.add_argument('--qemu', type=pathlib.Path)
     ap.add_argument('-n', type=int, default=12)
     a = ap.parse_args()
+    if a.output:
+        rng = random.Random(a.seed)
+        pairs = [pair(f'o16-branches-{i:03d}', rng.getrandbits(64)) for i in range(a.n)]
+        a.output.write_text(json.dumps({'generator': {'script': 'tools/reference/gen_br66.py', 'seed': a.seed},
+                                        'programs': [dict(p, reference_program=t) for p, t in pairs]}, indent=1) + '\n')
+        print(f'{len(pairs)} programs (with twins) -> {a.output}'); return
+    if not a.out: ap.error('--out DIR or -o PROGRAMS.json')
     raw = RAW_ROOT
     qemu = (a.qemu or raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static').resolve()
     rng = random.Random(a.seed)

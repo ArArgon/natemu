@@ -1,0 +1,216 @@
+# Straight-line and control-flow program corpora (spec R2), compared with locked answers: QEMU, real x86 (sha, adx,
+# xsave: instructions or flags the pinned QEMU lacks) or FEX (x87). Every corpus is generated here; nothing is stored.
+[family]
+name = "programs"
+covers = ["crates/**", "third_party/FEX", "tools/fexc/**", "tools/reference/**"]
+
+[input.fix]
+generator = "tools/reference/gen_slice1.py"
+args = ["--seed", "20261026"]
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.seed]
+generator = "tools/reference/gen_slice1.py"
+args = ["--seed", "4242", "--random", "20"]
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.i9]
+generator = "tools/reference/gen_i9.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.i9-big]
+generator = "tools/reference/gen_i9.py"
+args = ["--big"]
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.i10]
+generator = "tools/reference/gen_i10.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.rex]
+generator = "tools/reference/gen_rex.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.i7]
+generator = "tools/reference/gen_i7.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.sha]
+generator = "tools/reference/gen_sha.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.adx]
+generator = "tools/reference/gen_adx.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.xsave]
+generator = "tools/reference/gen_xsave.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.br66]
+generator = "tools/reference/gen_br66.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py", "tools/reference/gen_rex.py"]
+
+[input.i6b]
+generator = "tools/reference/gen_i6b.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[input.s2d]
+generator = "tools/reference/gen_slice2.py"
+args = []
+sources = ["tools/reference/gen_slice1.py", "tools/reference/flags.py"]
+
+[[suite]]
+name = "fix"
+kind = "deterministic"
+harness = "programs"
+input = "fix"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = true
+
+[[suite]]
+name = "seed"
+kind = "deterministic"
+harness = "programs"
+input = "seed"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+
+[[suite]]
+name = "i9"
+kind = "deterministic"
+harness = "programs"
+input = "i9"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+
+[[suite]]
+name = "i9-big"
+kind = "deterministic"
+harness = "programs"
+input = "i9-big"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+
+[[suite]]
+name = "i10"
+kind = "deterministic"
+harness = "programs"
+input = "i10"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+
+[[suite]]
+name = "rex"
+kind = "deterministic"
+harness = "programs"
+input = "rex"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+
+[[suite]]
+name = "i7"
+kind = "deterministic"
+harness = "programs"
+input = "i7"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+
+[[suite]]
+name = "i7-cpl0"
+kind = "deterministic"
+harness = "programs"
+input = "i7"
+reference = "qemu"
+batch = 64
+smoke = false
+matrix = { "engine.max_block" = [0, 1], "program.cpl" = [0] }
+
+[[suite]]
+name = "sha"
+kind = "deterministic"
+harness = "programs"
+input = "sha"
+reference = "x86"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+x86_flag = "sha_ni"
+
+[[suite]]
+name = "adx"
+kind = "deterministic"
+harness = "programs"
+input = "adx"
+reference = "x86"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+x86_flag = "adx"
+
+[[suite]]
+name = "xsave"
+kind = "deterministic"
+harness = "programs"
+input = "xsave"
+reference = "x86"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+x86_flag = "xsavec"
+
+[[suite]]
+name = "br66"
+kind = "deterministic"
+harness = "programs"
+input = "br66"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+# QEMU 7.2 follows AMD for 66 on near branches; natemu, like Intel, ignores it: QEMU runs each program's
+# twin with 3E for 66 (gen_br66.py), whose result is Intel's for the program.
+
+[[suite]]
+name = "i6b"
+kind = "deterministic"
+harness = "programs"
+input = "i6b"
+reference = "qemu"
+matrix = { "engine.max_block" = [0, 1] }
+batch = 64
+smoke = false
+# x87 against FEX's reduced precision until accurate 80-bit x87 (owner, November 18); PCMPxSTRx against QEMU.
+reference_overrides = { "i6b-x87-*" = "fex" }
+
+[[suite]]
+name = "flow"
+kind = "deterministic"
+harness = "programs"
+input = "s2d"
+reference = "qemu"
+batch = 64
+smoke = false

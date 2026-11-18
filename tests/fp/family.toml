@@ -20,7 +20,7 @@ kind = "deterministic"
 harness = "programs"
 input = "i8"
 reference = "qemu"
-matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false] }
+matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false], "engine.max_block" = [0, 1] }
 batch = 64
 smoke = ["i8-forms-000"]
 # QEMU 7.2's two-NaN choice departs from x86 here (tools/models/afp_fp: natemu's accurate result is x86's): x86 answer.
@@ -32,7 +32,7 @@ kind = "deterministic"
 harness = "programs"
 input = "i8b"
 reference = "qemu"
-matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false] }
+matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false], "engine.max_block" = [0, 1] }
 batch = 64
 smoke = ["i8-forms-000"]
 # QEMU 7.2's two-NaN choices depart from x86 in these (run_suite.py I8B_KNOWN): their answers come from real x86 (R2.13a).

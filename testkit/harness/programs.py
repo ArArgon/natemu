@@ -72,28 +72,54 @@ class Programs:
 
     # --- seeding (natemu-test lock) ---
 
+    @staticmethod
+    def reference_of(suite, name: str) -> str:
+        """The case's reference: an exact override, else the first matching glob override, else the suite's (R2.13a)."""
+        import fnmatch
+        ov = suite.extra.get('reference_overrides', {})
+        if name in ov: return ov[name]
+        return next((r for pat, r in ov.items() if fnmatch.fnmatchcase(name, pat)), suite.reference)
+
     def seed(self, fam, suite, rules=None) -> dict:
+        """Answers from each case's reference: `qemu` (the pinned QEMU user build, through ref.run_programs; a program may
+        name a `reference_program` twin that QEMU runs instead, as gen_br66 does), `x86` (tools/reference/ref_native.py on
+        NATEMU_X86_HOST; suite `x86_flag` is the CPU flag it must have) or `fex` (natemu's own result: the reference for x87
+        while it runs in FEX's reduced precision). Flow programs also lock QEMU's RFLAGS mask."""
         from testkit import family as fammod
         ref, _ = _ref()
         _, programs = build_input(fam, suite.input)
-        overrides = suite.extra.get('reference_overrides', {})
         work = pathlib.Path(tempfile.mkdtemp(prefix='testkit-seed-'))
         os.environ.setdefault('NATEMU_REFERENCE_BACKEND', 'apple')
         os.environ['NATEMU_REF_CACHE'] = 'off'
-        qemu_progs = [p for p in programs if overrides.get(p['name'], suite.reference) == 'qemu']
-        results, prov = ref.run_programs(qemu_progs, work / 'qemu', artifacts.qemu_user())
-        answers = {p['name']: answer(p, r['qemu']) for p, r in zip(qemu_progs, results)}
-        x86 = [p for p in programs if overrides.get(p['name'], suite.reference) == 'x86']
-        if x86:
+        by_ref = {}
+        for p in programs: by_ref.setdefault(self.reference_of(suite, p['name']), []).append(p)
+        answers, masks, tools = {}, {}, set()
+        if q := by_ref.get('qemu'):
+            runs = [dict(p['reference_program'], name=p['name']) if 'reference_program' in p else p for p in q]
+            results, prov = ref.run_programs(runs, work / 'qemu', artifacts.qemu_user())
+            tools.add(f'qemu: qemu-x86_64-static ({prov["container_backend"]})')
+            for p, r in zip(q, results):
+                m = ref.num(r['rflags_compare_mask']) if ref.norm(p)['flow'] else None
+                if m is not None: masks[p['name']] = hex(m)
+                answers[p['name']] = answer(p, r['qemu'], m)
+        if x86 := by_ref.get('x86'):
             hostname = os.environ.get('NATEMU_X86_HOST')
             if hostname:
                 pf = work / 'x86.json'; pf.write_text(json.dumps({'programs': x86}))
-                subprocess.run([sys.executable, str(REF / 'ref_native.py'), pf, '-o', work / 'x86-out.json', '--host', hostname],
-                               check=True)
+                flag = ['--require-flag', suite.extra['x86_flag']] if suite.extra.get('x86_flag') else []
+                subprocess.run([sys.executable, str(REF / 'ref_native.py'), pf, '-o', work / 'x86-out.json', '--host', hostname,
+                                *flag], check=True)
                 for p, r in zip(x86, json.loads((work / 'x86-out.json').read_text())['results']):
                     answers[p['name']] = answer(p, r['qemu'])
+                tools.add(f'x86: {hostname}')
             else:
                 for p in x86: answers[p['name']] = ''          # no answer yet: these cases report stale-lock
+        if fexp := by_ref.get('fex'):
+            n, fexc = artifacts.natemu(), artifacts.fexc()
+            for p in fexp:
+                vm = self._run_natemu(n, fexc, p, dict(os.environ), work / 'fex' / p['name'], None)
+                answers[p['name']] = answer(p, vm) if isinstance(vm, dict) and vm.get('stop') == 'reached' else ''
+            tools.add(f'fex: natemu {n.key[:12]} (FEX reduced-precision x87)')
         excluded = {}
         if fam.rules:
             for v in fammod.expand(suite):
@@ -103,11 +129,22 @@ class Programs:
         h = host.detect()
         return {'fingerprint': lock.fingerprint_suite(fam, suite, sources(), qemu_pin()), 'reference': suite.reference,
                 'input': corpus_hash(programs),
-                'seeded': {'tool': f'{suite.reference}: qemu-x86_64-static ({prov["container_backend"]})' if suite.reference == 'qemu'
-                           else 'x86', 'pin': qemu_pin(), 'machine': h.chip,
+                'seeded': {'tool': f'{suite.reference}: ' + '; '.join(sorted(tools)), 'pin': qemu_pin(), 'machine': h.chip,
                            'date': datetime.date.today().isoformat()},
                 'cases': {p['name']: answers[p['name']] for p in programs}, 'excluded': excluded,
-                'x86_cases': sorted(p['name'] for p in x86)}
+                'x86_cases': sorted(p['name'] for p in by_ref.get('x86', [])),
+                'fex_cases': sorted(p['name'] for p in by_ref.get('fex', [])), 'masks': masks}
+
+    @staticmethod
+    def _run_natemu(n, fexc, p, env, work, max_block):
+        """One program in natemu (`run-program`): the driver's report, or an error string."""
+        import run_slice1_vm as v1
+        work.mkdir(parents=True, exist_ok=True)
+        (work / 'program.txt').write_text(v1.description(p))
+        r = subprocess.run([n.host, n.runtime, 'run-program', fexc, work / 'program.txt', work,
+                            *([str(max_block)] if max_block else []), *v1.CODE_SHAPE], capture_output=True, text=True, env=env)
+        if r.returncode != 0: return f'natemu-host exit {r.returncode}: {r.stderr[-1500:]}'
+        return json.loads(r.stdout)
 
     # --- running ---
 
@@ -138,19 +175,17 @@ class Programs:
                     ok = hashlib.sha256(hit).hexdigest() == want
                     out[it.nodeid] = CaseResult('passed' if ok else 'failed', '' if ok else 'reused output differs from the lock',
                                                 'reused' if ok else None); continue
-                work = pathlib.Path(td) / it.case
-                work.mkdir()
-                (work / 'program.txt').write_text(v1.description(p))
-                r = subprocess.run([n.host, n.runtime, 'run-program', fexc, work / 'program.txt', work, *v1.CODE_SHAPE],
-                                   capture_output=True, text=True, env=e)
-                if r.returncode != 0:
-                    out[it.nodeid] = CaseResult('failed', f'natemu-host exit {r.returncode}: {r.stderr[-1500:]}'); continue
-                vm = json.loads(r.stdout)
+                if (cpl := it.variant.get('program.cpl')) is not None:
+                    p = dict(p, cpl=cpl)            # run at this CPL against the same answer (the programs are CPL-neutral)
+                vm = self._run_natemu(n, fexc, p, e, pathlib.Path(td) / it.case, it.variant.get('engine.max_block') or None)
+                if isinstance(vm, str):
+                    out[it.nodeid] = CaseResult('failed', vm); continue
                 if limit := v1.declared_limit(vm):
                     out[it.nodeid] = CaseResult('skipped', f'stopped at {vm["rip"]}: {limit}', 'unsupported'); continue
                 problems = [] if vm['stop'] == 'reached' else [f"stopped {vm['stop']} {vm['reason']} at {vm['rip']}"]
                 problems += v1.page_checks(p, vm)
-                got = normalize(p, vm)
+                m = locked.get('masks', {}).get(it.case)
+                got = normalize(p, vm, int(m, 16) if m else None)
                 if hashlib.sha256(got).hexdigest() != want:
                     problems.append('final state differs from the locked answer'
                                     + ('' if not config.getoption('diff') else ': ' + self._diff(p, vm)))

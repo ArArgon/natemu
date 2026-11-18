@@ -16,23 +16,26 @@ def _ref():
     return ref, flags
 
 
-def mask_of(program: dict) -> int:
+def mask_of(program: dict, mask: int | None = None) -> int:
+    """The RFLAGS compare mask: given (locked at seeding, from the reference's executed path) for a flow program,
+    else derived from the program's annotations exactly as ref.py does."""
     ref, flags = _ref()
+    if mask is not None: return mask
     if ref.norm(program)['flow']:
-        raise ValueError(f"{program['name']}: a flow program (ref.py derives its RFLAGS mask from the executed path); not supported here")
+        raise ValueError(f"{program['name']}: a flow program needs the mask locked at seeding (ref.py derives it from the executed path)")
     return flags.TRACKED & ~flags.analyze(ref.norm(program)['insns'])
 
 
-def normalize(program: dict, state: dict) -> bytes:
+def normalize(program: dict, state: dict, mask: int | None = None) -> bytes:
     """Canonical bytes of a final state (QEMU's result['qemu'] or natemu's report): what ref.compare compares."""
     ref, _ = _ref()
-    return json.dumps({'gpr': [ref.num(v) for v in state['gpr']], 'rflags': ref.num(state['rflags']) & mask_of(program),
+    return json.dumps({'gpr': [ref.num(v) for v in state['gpr']], 'rflags': ref.num(state['rflags']) & mask_of(program, mask),
                        'rip': ref.num(state['rip']),
                        'memory': [[ref.num(m['addr']), m['data']] for m in state['memory']]}, separators=(',', ':')).encode()
 
 
-def answer(program: dict, state: dict) -> str:
-    return hashlib.sha256(normalize(program, state)).hexdigest()
+def answer(program: dict, state: dict, mask: int | None = None) -> str:
+    return hashlib.sha256(normalize(program, state, mask)).hexdigest()
 
 
 def corpus_hash(programs: list) -> str:

@@ -48,12 +48,19 @@ def test_corpus_hash_ignores_header():
 
 
 def test_rules_exclude_tagged_fast_no_afp():
+    import sys
     from testkit import family
+    sys.path.insert(0, str(paths.repo_root() / 'tools'))
+    import fp_deviations
     fam = family.load(paths.repo_root() / 'tests' / 'fp' / 'family.toml')
-    s = fam.suite('i8')
-    vs = {v.id: v for v in family.expand(s)}
-    tagged = 'i8-forms-001'
-    assert fam.rules('i8', tagged, vs['afp=False,fp=fast'], {'afp': 'hidden'}) == 'nan-results'
-    assert fam.rules('i8', tagged, vs['afp=False,fp=accurate'], {'afp': 'real'}) is None
-    assert fam.rules('i8', tagged, vs['afp=True,fp=fast'], {'afp': 'real'}) is None
-    assert fam.rules('i8', 'i8-forms-000', vs['afp=False,fp=fast'], {'afp': 'real'}) is None
+    vs = {v.id: v for v in family.expand(fam.suite('i8'))}
+    tags = fp_deviations.corpus_deviations('i8-corpus-20261030-01')
+    tagged = sorted(tags)[0]
+    fast_off = next(i for i, v in vs.items() if 'afp=False' in i and 'fp=fast' in i)
+    acc_off = next(i for i, v in vs.items() if 'afp=False' in i and 'fp=accurate' in i)
+    fast_on = next(i for i, v in vs.items() if 'afp=True' in i and 'fp=fast' in i)
+    assert fam.rules('i8', tagged, vs[fast_off], {'afp': 'hidden'}) == '+'.join(tags[tagged]['classes'])
+    assert fam.rules('i8', tagged, vs[acc_off], {'afp': 'real'}) is None
+    assert fam.rules('i8', tagged, vs[fast_on], {'afp': 'real'}) is None
+    untagged = next(n for n in ('i8-addr-00', 'i8-addr-01', 'i8-addr-02') if n not in tags)
+    assert fam.rules('i8', untagged, vs[fast_off], {'afp': 'real'}) is None
