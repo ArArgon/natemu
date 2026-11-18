@@ -1026,8 +1026,8 @@ mod tests {
         let image = spec(false, Some(&base)).open().unwrap();
         assert_eq!(image.capacity, 1 << 20);
         drop(image);
-        assert!(spec(false, Some(&base)).open().is_ok());
-        let e = spec(false, None).open().err().unwrap();
+        assert!(crate::disk::retry_lock(|| spec(false, Some(&base)).open()).is_ok());
+        let e = crate::disk::retry_lock(|| spec(false, None).open()).err().unwrap();
         let named = std::fs::canonicalize(&base).unwrap();
         assert!(
             e.contains(&format!("add backing = \"{}\"", named.display()))

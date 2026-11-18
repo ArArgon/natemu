@@ -141,6 +141,27 @@ pub(crate) fn open_disk(
     }
 }
 
+/// Runs `f`, retrying for up to 2 s while it fails with "held by another process". Tests run in threads of one
+/// process, and others spawn children (qemu-img, hdiutil): a spawn duplicates every open descriptor in the child
+/// until it execs, and a flock is released only when all copies are closed, so an image a test just dropped can
+/// look locked for a moment. Test-isolation only (natemu forks nothing around a reopen); tests that expect the
+/// lock refusal must not use it.
+#[cfg(test)]
+pub(crate) fn retry_lock<T>(mut f: impl FnMut() -> crate::Result<T>) -> crate::Result<T> {
+    let start = std::time::Instant::now();
+    loop {
+        match f() {
+            Err(e)
+                if e.contains("held by another process")
+                    && start.elapsed() < std::time::Duration::from_secs(2) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            r => return r,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
