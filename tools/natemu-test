@@ -1,0 +1,23 @@
+#!/bin/sh
+# natemu-test: the test runner (docs/testing.md). Creates, once per machine and per version of testkit/requirements.lock,
+# a virtual environment with exactly the pinned packages (pip --require-hashes), then runs `python -m testkit`.
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+cache=${NATEMU_TEST_CACHE:-$HOME/Library/Caches/natemu/testkit}
+lock=$repo/testkit/requirements.lock
+tag=$(shasum -a 256 "$lock" | cut -c1-16)
+venv=$cache/venv/$tag
+if [ ! -x "$venv/bin/python" ]; then
+    mkdir -p "$cache/venv"
+    tmp=$cache/venv/.tmp-$tag-$$
+    rm -rf "$tmp"
+    python3 -m venv "$tmp"
+    "$tmp/bin/python" -m pip install -q --disable-pip-version-check --require-hashes -r "$lock"
+    # Move into place only when complete; a concurrent creator that finished first wins.
+    # (rename(2) fails on an existing non-empty folder, where mv would move the new one inside it.)
+    "$tmp/bin/python" -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' "$tmp" "$venv" 2>/dev/null || rm -rf "$tmp"
+    # venv scripts embed their own path; the interpreter itself does not, so -m works from the moved folder.
+fi
+export PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
+cd "$repo"
+exec "$venv/bin/python" -m testkit "$@"

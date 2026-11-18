@@ -27,3 +27,4 @@ scratch/
 /.claude/worktrees/
 *.orig
 *-verify.state
+.natemu/
