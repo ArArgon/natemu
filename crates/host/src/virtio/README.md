@@ -109,6 +109,12 @@ cannot enforce that against unrelated software. Block uses the same modern
 transport, with queue size 256, 4096-byte data segments, 126 segments and 504 KiB
 per request. SIZE_MAX/SEG_MAX/VERSION_1 are required; BLK_SIZE/FLUSH/DISCARD/WRITE_ZEROES are
 offered, and MQ with more than one request queue (PCI: one per vCPU, up to 8).
+INDIRECT_DESC is offered too, so a request takes one ring slot: without it a 64 KiB
+request took 18 of 256, Linux (which assumes two) kept the ring full, and with several
+queues its retries left some requests waiting seconds. The indirect tables of one
+admission pass are copied in one window and parsed from the owned copies, with the
+spec's checks (no NEXT beside INDIRECT, none inside a table, a length a multiple of 16,
+at most 256 descriptors through a table).
 IN/OUT/FLUSH/GET_ID operate on complete logical byte streams, including split
 headers and combined data/status descriptors. Used length covers only the
 initialized writable prefix. A failed IN publishes no partial data and len=0.

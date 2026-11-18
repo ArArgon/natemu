@@ -28,7 +28,7 @@ use crate::{
     vm::Machine,
 };
 use natemu_abi::guest_memory::GuestRam;
-use queue::{Descriptor, Queue, Snapshot};
+use queue::{Descriptor, Queue, Snapshot, indirect_chain};
 use std::{
     collections::VecDeque,
     ops::Range,
@@ -99,6 +99,9 @@ const VERSION_1: u64 = 1 << 32;
 /// VIRTIO_F_EVENT_IDX (virtio 1.2 §2.7.10): the used_event/avail_event fields after each ring replace the
 /// flags below. Offered by the network device only.
 const EVENT_IDX: u64 = 1 << 29;
+/// VIRTIO_RING_F_INDIRECT_DESC (virtio 1.3 §2.7.5.3): a chain may end in a descriptor naming a table of
+/// descriptors, so a request takes one ring slot. Offered by the disk only.
+const INDIRECT_DESC: u64 = 1 << 28;
 /// Network: at most this many completions, or this long, share one held-back interrupt.
 const COALESCE: u32 = 32;
 const COALESCE_TIME: Duration = Duration::from_micros(100);
@@ -113,9 +116,10 @@ const USED_NO_NOTIFY: u16 = 1;
 const GATE_OPEN: u64 = 1;
 const GATE_KILLED: u64 = 2;
 const RNG_MAX_QUEUE: u16 = 8;
-/// The disk's queue size. Without indirect descriptors a request takes a descriptor per segment and two more, so the
-/// ring bounds the requests in flight by their size: at 128, three of 128 KiB (a guest at depth 16 then waits on every
-/// completion) and one of 504 KiB. At 256 (QEMU's default), M2 Max, PCI, 2 vCPUs: fio 128 KiB depth 16 writes 12.6k to
+/// The disk's queue size. Without indirect descriptors (a driver may decline them) a request takes a descriptor per
+/// segment and two more, so the ring bounds the requests in flight by their size: at 128, three of 128 KiB (a guest at
+/// depth 16 then waits on every completion) and one of 504 KiB. With them a request takes one slot. At 256 (QEMU's
+/// default), M2 Max, PCI, 2 vCPUs: fio 128 KiB depth 16 writes 12.6k to
 /// 17.4k IOPS and reads 21.5k to 28.6k, 1 MiB direct writes 2.7 to 3.5 GB/s and reads to 5.0, 4 KiB unchanged. 512
 /// and 1024 gain a little more on large reads and cost about 5% at 4 KiB depth 16 (each capture reads the whole table).
 const BLOCK_QUEUE: u16 = 256;

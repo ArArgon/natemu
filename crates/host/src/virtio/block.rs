@@ -24,8 +24,23 @@ const F_DISCARD: u64 = 1 << 13;
 const F_WRITE_ZEROES: u64 = 1 << 14;
 /// VIRTIO_BLK_F_MQ (virtio 1.2 5.2.3): the device has `num_queues` request queues (5.2.4); offered with more than one.
 const F_MQ: u64 = 1 << 12;
-pub(super) const FEATURES: u64 =
-    VERSION_1 | F_SIZE_MAX | F_SEG_MAX | F_BLK_SIZE | F_FLUSH | F_DISCARD | F_WRITE_ZEROES;
+/// INDIRECT_DESC: without it a 64 KiB request takes 18 of the ring's 256 slots, so 14 fit while Linux queues 128 (half
+/// the ring); its retries of a full ring under the `none` scheduler, the default with several queues, left some
+/// requests waiting seconds (M4, PCI, 4 queues, fio 64 KiB at depth 4x256: worst 0.56 s reads, 1.3 s writes, against
+/// 0.018 s and 0.024 s with Linux kept within the ring).
+pub(super) const FEATURES: u64 = VERSION_1
+    | INDIRECT_DESC
+    | F_SIZE_MAX
+    | F_SEG_MAX
+    | F_BLK_SIZE
+    | F_FLUSH
+    | F_DISCARD
+    | F_WRITE_ZEROES;
+// One copy holds every indirect table of an admission pass: at most MAX_REQUESTS tables of at most BLOCK_QUEUE entries.
+const _: () = assert!(
+    MAX_REQUESTS <= crate::execution::io::MAX_SPANS
+        && MAX_REQUESTS * BLOCK_QUEUE as usize * 16 <= crate::execution::io::MAX_BYTES
+);
 /// The driver must honour the segment limits below.
 pub(super) const REQUIRED: u64 = VERSION_1 | F_SIZE_MAX | F_SEG_MAX;
 
@@ -47,10 +62,12 @@ const HEADER: usize = 16;
 const ID_BYTES: usize = 20;
 /// Advertised size_max and seg_max, and their product's bound on one request's data. seg_max is 128 ring entries
 /// less a request's header and status descriptors (the queue's size when this was set; it is 256 now,
-/// `BLOCK_QUEUE`, so two requests of the most data fit the ring): 504 KiB. It was 32 segments and 128 KiB until November 14, 2026; measured then on an
+/// `BLOCK_QUEUE`, so without indirect descriptors two requests of the most data fit the ring; with them a request
+/// takes one slot): 504 KiB. It was 32 segments and 128 KiB until November 14, 2026; measured then on an
 /// M2 Max (2 vCPUs, PCI): 1 MiB direct writes 3.0-3.1 -> 3.5 GB/s, reads 3.2-3.6 -> 4.0, cold buffered reads
-/// 1.5-1.6 -> 1.8-1.9, buffered writes and 4 KiB I/O unchanged. A guest that makes the queue smaller than 128 must
-/// keep its requests within the ring itself; the device walks no more than the ring's size either way.
+/// 1.5-1.6 -> 1.8-1.9, buffered writes and 4 KiB I/O unchanged. A guest that makes the queue smaller than 128 and
+/// declines indirect descriptors must keep its requests within the ring itself; the device walks no more than the
+/// ring's size of direct descriptors, or `BLOCK_QUEUE` through a table.
 const MAX_SEGMENT: usize = 4096;
 const MAX_SEGMENTS: usize = 126;
 pub(super) const MAX_DATA: usize = MAX_SEGMENTS * MAX_SEGMENT;
@@ -1473,23 +1490,73 @@ impl Virtio {
             self.settle(&mut self.lock());
             return Ok(false);
         }
-        let mut admitted = Vec::new();
-        let mut next = q;
-        let (mut count, mut reserved) = (flight.len(), flight.reserved);
-        while invalid.is_none() && count < request_limit(q.size) {
-            let (head, descriptors) = match snapshot.chain(next) {
-                Ok(Some(chain)) => chain,
+        // The chains the request bound may admit, in order. A malformed one ends the walk; it fails the device only
+        // once every chain before it was admitted (as when each chain was admitted as soon as it was parsed).
+        let (mut chains, mut walk, mut malformed) = (Vec::new(), q, None);
+        let indirect = self.accepted(INDIRECT_DESC).then_some(BLOCK_QUEUE);
+        while invalid.is_none() && flight.len() + chains.len() < request_limit(q.size) {
+            match snapshot.chain_with(walk, indirect) {
+                // A table outside RAM is a malformed chain where it stands.
+                Ok(Some((_, c)))
+                    if c.last().is_some_and(|d| {
+                        d.is_indirect() && ram.range(d.addr(), d.len().into()).is_none()
+                    }) =>
+                {
+                    malformed = Some("indirect table outside RAM".into());
+                    break;
+                }
+                Ok(Some(chain)) => chains.push(chain),
                 Ok(None) if recapture => {
                     recapture = false;
-                    if !self.capture(guest, snapshot, next, id)? {
+                    if !self.capture(guest, snapshot, walk, id)? {
                         break;
                     }
                     continue;
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    invalid = Some(e);
+                    malformed = Some(e);
                     break;
+                }
+            }
+            walk.next_avail = walk.next_avail.wrapping_add(1);
+        }
+        // Every indirect table in one copy (owned, then parsed like the ring's table).
+        let mut tables: Vec<Vec<u8>> = chains
+            .iter()
+            .map(|(_, c)| match c.last() {
+                Some(d) if d.is_indirect() => vec![0; d.len() as usize],
+                _ => Vec::new(),
+            })
+            .collect();
+        let mut reads: Vec<Transfer<'_>> = chains
+            .iter()
+            .zip(tables.iter_mut())
+            .filter(|(_, table)| !table.is_empty())
+            .map(|((_, c), table)| Transfer::Read {
+                gpa: c[c.len() - 1].addr(),
+                bytes: table,
+            })
+            .collect();
+        if !reads.is_empty() && !self.copy(guest, id, &mut reads, None)? {
+            self.settle(&mut self.lock());
+            return Ok(false);
+        }
+        drop(reads);
+        let walked = chains.len();
+        let mut admitted = Vec::new();
+        let mut next = q;
+        let (mut count, mut reserved) = (flight.len(), flight.reserved);
+        for ((head, chain), table) in chains.into_iter().zip(tables) {
+            let descriptors = if table.is_empty() {
+                chain
+            } else {
+                match indirect_chain(&chain, &table) {
+                    Ok(descriptors) => descriptors,
+                    Err(e) => {
+                        invalid = Some(e);
+                        break;
+                    }
                 }
             };
             let streams = match chain_streams(ram, &descriptors) {
@@ -1514,6 +1581,9 @@ impl Virtio {
             });
             next.next_avail = next.next_avail.wrapping_add(1);
             (count, reserved) = (count + 1, reserved + bytes);
+        }
+        if invalid.is_none() && admitted.len() == walked {
+            invalid = malformed;
         }
         if !self.commit_admission(id, next, admitted.len(), invalid, snapshot) {
             return Ok(false);
@@ -2847,6 +2917,8 @@ pub(in crate::virtio) mod owner_tests {
     const RAM: usize = 0x100000;
     /// The second request queue's rings (`Rig::with_queues`): `DESC`, `AVAIL` and `USED` from here.
     const Q1: u64 = 0xc0000;
+    /// Indirect tables (`Rig::indirect_read_request`), 48 bytes each.
+    const TABLES: u64 = 0x90000;
 
     /// Disk calls that wait while `held`; reads return 0x5a. Each call records whether a disk worker made it.
     #[derive(Default)]
@@ -2963,7 +3035,7 @@ pub(in crate::virtio) mod owner_tests {
                 (reg::DRIVER_FEATURES_SEL, 0),
                 (
                     reg::DRIVER_FEATURES,
-                    F_SIZE_MAX | F_SEG_MAX | if queues > 1 { F_MQ } else { 0 },
+                    INDIRECT_DESC | F_SIZE_MAX | F_SEG_MAX | if queues > 1 { F_MQ } else { 0 },
                 ),
                 (reg::DRIVER_FEATURES_SEL, 1),
                 (reg::DRIVER_FEATURES, 1),
@@ -3032,6 +3104,36 @@ pub(in crate::virtio) mod owner_tests {
             self.desc(head, header, 16, 1, head + 1);
             self.desc(head + 1, DATA + u64::from(k) * 512, 512, 3, head + 2);
             self.desc(head + 2, STATUS + u64::from(k), 1, 2, 0);
+            head
+        }
+        /// Lay out request `k` with `read_request`'s buffers, its three descriptors in an indirect table at `table`
+        /// that ring descriptor `64 + k` names.
+        fn indirect_read_request(&self, k: u16, table: u64) -> u16 {
+            let header = HEADERS + u64::from(k) * 16;
+            let mut h = [0; 16];
+            h[..4].copy_from_slice(&T_IN.to_le_bytes());
+            h[8..].copy_from_slice(&u64::from(k).to_le_bytes());
+            self.put(header, &h);
+            let mut t = [0; 48];
+            for (i, (addr, len, flags, next)) in [
+                (header, 16, 1, 1),
+                (DATA + u64::from(k) * 512, 512, 3, 2),
+                (STATUS + u64::from(k), 1, 2, 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let d = &mut t[i * 16..][..16];
+                d[..8].copy_from_slice(&u64::to_le_bytes(addr));
+                d[8..12].copy_from_slice(&u32::to_le_bytes(len));
+                d[12..14].copy_from_slice(&u16::to_le_bytes(flags));
+                d[14..].copy_from_slice(&u16::to_le_bytes(next));
+            }
+            if self.b.ram.range(table, 48).is_some() {
+                self.put(table, &t);
+            }
+            let head = 64 + k;
+            self.desc(head, table, 48, 4, 0);
             head
         }
         /// Lay out request `k`: one readable buffer of a header and `MAX_DATA` (a segment over size_max: gathered, then
@@ -3216,6 +3318,61 @@ pub(in crate::virtio) mod owner_tests {
             data[k as usize] = unsafe { *at };
         }
         assert_eq!(data, [S_OK; 3]);
+    }
+
+    /// The status byte and data of request `k` (`read_request` or `indirect_read_request`).
+    fn answer(rig: &Rig, k: u64) -> (u8, Vec<u8>) {
+        let status = rig.b.ram.range(STATUS + k, 1).unwrap();
+        let data = rig.b.ram.range(DATA + k * 512, 512).unwrap();
+        // SAFETY: fixture RAM in bounds; the owner has stopped.
+        unsafe { (*status, std::slice::from_raw_parts(data, 512).to_vec()) }
+    }
+    #[test]
+    fn a_request_in_an_indirect_table_is_read_and_completed_like_a_direct_one() {
+        let rig = Rig::new("indirect");
+        assert_ne!(rig.r.lock().features & INDIRECT_DESC, 0);
+        for k in 0..2 {
+            rig.put(STATUS + k, &[0xff]);
+        }
+        rig.run(|rig| {
+            rig.publish(rig.indirect_read_request(0, TABLES));
+            rig.publish(rig.read_request(1));
+            assert!(rig.kick());
+            until("both completed", || rig.used_index() == 2);
+        });
+        for k in 0..2 {
+            assert_eq!(answer(&rig, k), (S_OK, vec![0x5a; 512]), "request {k}");
+        }
+        assert_eq!(rig.r.lock().status & status::NEEDS_RESET, 0);
+    }
+    #[test]
+    fn a_malformed_indirect_table_fails_the_device_after_the_requests_before_it() {
+        // A table outside RAM, and one whose last entry points back at the first (a loop).
+        for looped in [false, true] {
+            let rig = Rig::new(&format!("indirect-bad-{looped}"));
+            for k in 0..2 {
+                rig.put(STATUS + k, &[0xff]);
+            }
+            rig.run(|rig| {
+                rig.publish(rig.indirect_read_request(0, TABLES));
+                if looped {
+                    let head = rig.indirect_read_request(1, TABLES + 48);
+                    rig.put(TABLES + 48 + 2 * 16 + 12, &u16::to_le_bytes(3));
+                    rig.publish(head);
+                } else {
+                    rig.publish(rig.indirect_read_request(1, RAM as u64 - 16));
+                }
+                assert!(rig.kick());
+                until("the first completed", || rig.used_index() == 1);
+            });
+            assert_eq!(answer(&rig, 0), (S_OK, vec![0x5a; 512]), "looped {looped}");
+            assert_eq!(
+                answer(&rig, 1).0,
+                0xff,
+                "the malformed request is never answered"
+            );
+            assert_ne!(rig.r.lock().status & status::NEEDS_RESET, 0);
+        }
     }
 
     #[test]
