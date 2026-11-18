@@ -11,6 +11,25 @@ listed last; natemu bugs are recorded here, not fixed.
 | --- | --- | --- | --- |
 | `i8-faults-m2a`, case `chain3-movaps-mis` | M2 Max (no AFP), accurate FP | "cut run did not reach its hlt: watchdog resident pc=0x8000400cf210 shadows_asked=[] retries=0"; xmm and ymmh changed at the fault. 845 of 846 cases pass. | `NATEMU_FP=accurate tools/with-env python3 tools/run_i8_faults.py --fexc FEXC --out OUT` (the step's argv in tools/run_suite.py) |
 
+Open, to recheck on an idle machine (both passed on a later attempt; whether each is a load-sensitive test or a missing
+natemu path is not settled):
+
+- `kicks` (`run_slice3_vm.py kicks --kicks 1000 --cpus 1 2 4`), check `adversarial`: "no stop at ['resident']" (once
+  also 'rearms'): the per-place stop counter for `resident` stayed 0 (entry 14,550, exit 19,361, irq_sgis 28,678). Failed
+  in every seeding attempt (4 of 4, plus 2 earlier), passed on the rerun of the locked run. The case holds an exclusive
+  claim, but other agents' QEMU reference containers and builds ran outside the scheduler. The check needs a peer's
+  doorbell pending exactly as a vCPU enters the resident; with `--reps 1` it gets two multi-vCPU runs.
+- `l4b`, case `cases/frozen` (a 100 µs PIT/IRR window over 20,000 trials): "reached rbx=1, want 0" on both attempts of
+  one seeding run with all 8 performance cores busy; passed in the other seeding run and in the locked run.
+
+## Reference infrastructure
+
+- **Rosetta refuses the QEMU binary under load.** In Apple `container`'s amd64 containers, executing the pinned
+  qemu-x86_64-static fails with "Permission denied" (exit 126) in bursts when many reference containers run at once (42 of
+  200 executions in one container under load, none idle); once a container starts refusing, later jobs in it fail too.
+  `ref.py` now gives each container a private copy of the binary and reruns refused jobs in fresh containers, backing off
+  between attempts. A refusal is never a result: no program exits 126.
+
 ## References: where they are wrong and what replaced them
 
 - **QEMU 7.2 (user mode, the pinned corpus reference):** besides i8b's seven known two-NaN departures, `i8-forms-044` of

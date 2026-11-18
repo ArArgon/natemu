@@ -125,7 +125,7 @@ class Runner:
         for it in batch:
             spec = self._spec(it.suite, it.case)
             o = rundir / 'out' / it.case
-            extra = {'fex_asm': artifacts.fex_asm()} if any('{fex_asm}' in a for a in spec['argv']) else {}
+            extra = {'fex_asm': artifacts.fex_asm()}        # FEX's unittests/ASM at the pin ({fex_asm}, NATEMU_FEX_ASM)
             argv = [a.format(fexc=fexc, out=o, natemu_entry=n.entry, natemu_host=n.host, natemu_runtime=n.runtime,
                              raw=root or legacy_raw(), **extra) for a in spec['argv']]
             if argv[0].endswith('.py'): argv = [sys.executable, *argv]
@@ -134,6 +134,7 @@ class Runner:
                        NATEMU_REFERENCE_BACKEND='apple', NATEMU_COMPILE_CACHE=str(artifacts.compile_cache(n)),
                        **{k: str(v) for k, v in spec.get('env', {}).items()})
             if root: env['NATEMU_RAW_ROOT'] = str(root)
+            env['NATEMU_FEX_ASM'] = str(extra['fex_asm'])
             if os.environ.get('TESTKIT_SEED_ANSWERS') == '1':     # seeding (`natemu-test lock FAMILY --from-run RUN`)
                 (rundir / 'answers').mkdir(exist_ok=True)
                 env.update(NATEMU_ANSWERS='seed', NATEMU_ANSWERS_LOG=str(rundir / 'answers' / f'{it.case}.jsonl'))

@@ -160,7 +160,9 @@ PROBES = [
     # which ref.py's disassembly cross-check refuses.)
     {'name': 'long-body', 'gpr': gprs(), 'memory': [], 'main': [('loop', 'ecx', 3, alu_body(7, 70))]},
 ]
-FEX_SMC = ROOT / 'third_party' / 'FEX' / 'unittests' / 'ASM' / 'SelfModifyingCode'
+import os
+# FEX's upstream ASM tests: NATEMU_FEX_ASM (the framework's copy at the FEX pin, testkit.artifacts.fex_asm), else the submodule
+FEX_SMC = pathlib.Path(os.environ.get('NATEMU_FEX_ASM') or ROOT / 'third_party' / 'FEX' / 'unittests' / 'ASM') / 'SelfModifyingCode'
 # Self-modifying programs (assembly, extra memory regions). Expected values come only from QEMU; the comments say what
 # the SDM rule ("Handling Self- and Cross-Modifying Code") makes them compute.
 SMC = [
@@ -226,7 +228,9 @@ def smc_programs():
                 'Lcopy: mov r10, qword ptr [r8]\nmov qword ptr [r9], r10\nlea r8, [r8 + 8]\nlea r9, [r9 + 8]\nloop Lcopy\nmov rcx, r12')
         add(name, ref.assemble('Lcode:\n' + text + tail), CODE, memory + [{'addr': CODE_COPY, 'data': '00' * size}],
             gprs(rsp=STACK + 0x800), {})
-    for test in sorted(FEX_SMC.glob('*.asm')):
+    tests = sorted(FEX_SMC.glob('*.asm'))
+    if not tests: sys.exit(f'no FEX SelfModifyingCode tests under {FEX_SMC} (an uninitialised third_party/FEX? set NATEMU_FEX_ASM)')
+    for test in tests:
         source = test.read_text()
         config = json.loads(source.split('%ifdef CONFIG', 1)[1].split('%endif', 1)[0])
         with __import__('tempfile').TemporaryDirectory() as d:
