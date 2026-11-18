@@ -117,8 +117,9 @@ IMAGE_FORMATS = ('raw', 'qcow2', 'overlay')
 
 
 def qemu_img():
-    """The qemu-img binary, or None when it is not installed."""
+    """The qemu-img binary (NATEMU_QEMU_IMG: one to use instead, testkit's pinned build), or None when it is not installed."""
     import shutil
+    if os.environ.get('NATEMU_QEMU_IMG'): return os.environ['NATEMU_QEMU_IMG']
     return shutil.which('qemu-img') or ('/opt/homebrew/bin/qemu-img' if os.access('/opt/homebrew/bin/qemu-img', os.X_OK) else None)
 
 

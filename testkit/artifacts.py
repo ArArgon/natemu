@@ -133,6 +133,66 @@ def qemu_user() -> pathlib.Path:
     return p
 
 
+# QEMU system mode as the runners use it: TCG only, headless (-nographic / -display none), the pc machine with its
+# default VGA (pixman), user networking (slirp) and qemu-img. --without-default-features keeps optional libraries that
+# happen to be installed out of the build, so every Mac builds the same feature set; --disable-download keeps meson to
+# the subprojects shipped in the tarball.
+QEMU_CONFIGURE = ['--target-list=x86_64-softmmu', '--without-default-features', '--enable-tools', '--enable-pixman',
+                  '--enable-slirp', '--enable-zstd', '--disable-docs', '--disable-gtk', '--disable-sdl', '--disable-cocoa',
+                  '--disable-download']
+QEMU_BUILD_DEPS = ['glib', 'pixman', 'pkgconf', 'ninja', 'libslirp', 'zstd']     # Homebrew's, not pinned
+QEMU_WHEELS = ['setuptools-wheel', 'wheel-wheel']        # resources configure's build venv needs (tests/resources.toml)
+
+
+def qemu_system() -> pathlib.Path:
+    """The bin folder of QEMU 11.1.2 built from the pinned release tarball (resource qemu-src): qemu-system-x86_64 and
+    qemu-img, with the firmware in <entry>/share/qemu (where QEMU and tools/qemucache.py look for it). Built in a scratch
+    folder, installed into the entry; Homebrew's libraries are the build dependencies, their versions in build-info.txt."""
+    import inspect
+    if p := _pinned('qemu-system'): return pathlib.Path(p)
+    decls = resources.declarations()
+    for r in ('qemu-src', *QEMU_WHEELS):
+        if r not in decls: raise resources.Unpreparable(r, 'not declared in tests/resources.toml')
+    decl = decls['qemu-src']
+    k = cache.key('qemu-system', *(decls[r]['sha256'] for r in ('qemu-src', *QEMU_WHEELS)), *QEMU_CONFIGURE,
+                  inspect.getsource(qemu_system))
+
+    def build(out: pathlib.Path):
+        brew = shutil.which('brew') or '/opt/homebrew/bin/brew'
+        if not os.access(brew, os.X_OK):
+            raise BuildFailure('qemu-system', 'needs Homebrew for its build dependencies: brew install ' + ' '.join(QEMU_BUILD_DEPS))
+        prefix = subprocess.run([brew, '--prefix'], capture_output=True, text=True, check=True).stdout.strip()
+        versions = subprocess.run([brew, 'list', '--versions', *QEMU_BUILD_DEPS], capture_output=True, text=True).stdout
+        missing = [d for d in QEMU_BUILD_DEPS if not any(l.split()[:1] == [d] for l in versions.splitlines())]
+        if missing:
+            raise BuildFailure('qemu-system', 'missing Homebrew build dependencies: brew install ' + ' '.join(missing))
+        tarball, wheels = resources.fetch('qemu-src'), [resources.fetch(r) for r in QEMU_WHEELS]
+        scratch = paths.cache_root() / 'build-tmp' / f'qemu-{k[:16]}-{os.getpid()}'
+        shutil.rmtree(scratch, ignore_errors=True); scratch.mkdir(parents=True)
+        env = dict(os.environ, PATH=f'{prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin')
+        try:
+            _run(['tar', '-xf', tarball, '-C', scratch])
+            src = next(scratch.glob('qemu-*'))
+            for w in wheels: shutil.copy(w, src / 'python' / 'wheels' / w.name)
+            (src / 'build').mkdir(exist_ok=True)
+            _run([src / 'configure', f'--prefix={out}', *QEMU_CONFIGURE], cwd=src / 'build', env=env)
+            _run(['make', f'-j{os.cpu_count() or 4}'], cwd=src / 'build', env=env)
+            _run(['make', 'install'], cwd=src / 'build', env=env)
+            cc = subprocess.run(['cc', '--version'], capture_output=True, text=True, env=env).stdout.splitlines()[:1]
+            py = subprocess.run(['python3', '--version'], capture_output=True, text=True, env=env).stdout.strip()
+            (out / 'build-info.txt').write_text(
+                f'source: {decl["urls"][0]} sha256 {decl["sha256"]}\nconfigure: {" ".join(QEMU_CONFIGURE)}\n'
+                f'compiler: {" ".join(cc)}\npython: {py}\nhomebrew ({prefix}, not pinned):\n{versions}')
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        for exe in ('qemu-system-x86_64', 'qemu-img'):
+            if not (out / 'bin' / exe).is_file(): raise BuildFailure('qemu-system', f'make install left no bin/{exe}')
+
+    b = cache.get_or_build('qemu-system', k, build) / 'bin'
+    pin_for_run('qemu-system', str(b))
+    return b
+
+
 def compile_cache(n: Natemu) -> pathlib.Path:
     """natemu's own compile cache for this build only (spec R8.8), so builds never share or evict each other's."""
     d = paths.cache_root() / 'compile-cache' / n.key
@@ -204,7 +264,8 @@ def bench_image() -> pathlib.Path:
 
 
 RESOLVERS = {'natemu': lambda: [natemu().entry], 'fexc': lambda: [fexc()], 'nextest': lambda: [nextest()],
-             'qemu-user': lambda: [qemu_user()], 'bench-image': lambda: [bench_image()]}
+             'qemu-user': lambda: [qemu_user()], 'bench-image': lambda: [bench_image()],
+             'qemu-system': lambda: [qemu_system()]}
 
 
 def resolve(name: str) -> list[pathlib.Path]:

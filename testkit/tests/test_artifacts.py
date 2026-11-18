@@ -1,3 +1,4 @@
+import pathlib
 import subprocess
 
 import pytest
@@ -38,3 +39,16 @@ def test_qemu_user_pinned():
 def test_nextest_runs():
     out = subprocess.run([artifacts.nextest(), 'nextest', '--version'], capture_output=True, text=True)
     assert out.returncode == 0 and '0.9.150' in out.stdout
+
+
+@pytest.mark.slow
+def test_qemu_system_pinned():
+    b = artifacts.qemu_system()
+    out = subprocess.run([b / 'qemu-system-x86_64', '--version'], capture_output=True, text=True)
+    assert out.returncode == 0 and 'version 11.1.2' in out.stdout, out.stdout
+    assert (b / 'qemu-img').is_file()
+    share = b.parent / 'share' / 'qemu'
+    assert (share / 'bios-256k.bin').is_file()
+    # QEMU looks for its firmware there even though the entry was moved into place after `make install` (relocatable)
+    dirs = subprocess.run([b / 'qemu-system-x86_64', '-L', 'help'], capture_output=True, text=True).stdout
+    assert share.resolve() in {pathlib.Path(l.strip()).resolve() for l in dirs.splitlines() if l.strip()}, dirs

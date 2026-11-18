@@ -6,11 +6,12 @@
     python3 tools/bench/smp/smp.py litmus   --out DIR [--runs 20] [--k 32768] [--tests sb,mp] [--single-runs 3 --single-k 4096]
     python3 tools/bench/smp/smp.py build    [--k 32768]       # (re)write programs.json and litmus.json next to this file
 """
-import argparse, collections, hashlib, json, pathlib, shutil, subprocess, sys, time
+import argparse, collections, hashlib, json, os, pathlib, shutil, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE.parent.parent))
-QEMU = shutil.which('qemu-system-x86_64') or '/opt/homebrew/bin/qemu-system-x86_64'
+# NATEMU_QEMU_SYSTEM: a qemu-system-x86_64 to use instead (testkit's pinned build, testkit.artifacts.qemu_system).
+QEMU = os.environ.get('NATEMU_QEMU_SYSTEM') or shutil.which('qemu-system-x86_64') or '/opt/homebrew/bin/qemu-system-x86_64'
 CFG, RESULT, CAPTURE, LOW, HIGH = 0x106000, 0x107000, 0x100800, 0x110000, 0x400000
 FLAG_MASK = 0x8d5
 # `system` programs (CPL0 bodies with system instructions) run on natemu's CPU model: QEMU's max CPU without PCID and
