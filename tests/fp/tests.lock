@@ -8,7 +8,8 @@ fingerprint = "d9c158d6ddc489d69cf664f0bc1c0a0868001140e21e4ae9642095599e3e1121"
 output = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 
 [suite.i8]
-fingerprint = "6ecd25936cf9e8f8ed8002c090fec83a42169063ad9f9a50b1aa445c61cd5921"
+fex_cases = []
+fingerprint = "0213420ca6202e923521f0fa08f665b1253ee7e2c13d9038c51330a2d8467767"
 input = "3301ce5d15f97269ab58c470af97be2b9ee9f880fbbc67dcc4d1fe72a24b57f7"
 reference = "qemu"
 x86_cases = [
@@ -264,7 +265,47 @@ i8-shifts-28 = "550469107f047d14596359e8f833523725d7503de54448cadaff10a3408e2729
 i8-shifts-29 = "ddd7f1b744d95082f307388daa6b8a83b9cdaae1e947434adde1498c22361b94"
 
 [suite.i8.excluded]
-"afp=False,fp=fast" = [
+"afp=False,fp=fast,max_block=0" = [
+    "i8-addr-13",
+    "i8-addr-15",
+    "i8-addr-16",
+    "i8-addr-20",
+    "i8-addr-22",
+    "i8-addr-27",
+    "i8-forms-000",
+    "i8-forms-013",
+    "i8-forms-014",
+    "i8-forms-019",
+    "i8-forms-020",
+    "i8-forms-021",
+    "i8-forms-022",
+    "i8-forms-023",
+    "i8-forms-031",
+    "i8-forms-032",
+    "i8-forms-033",
+    "i8-forms-034",
+    "i8-forms-035",
+    "i8-forms-043",
+    "i8-forms-044",
+    "i8-forms-056",
+    "i8-forms-057",
+    "i8-forms-062",
+    "i8-forms-063",
+    "i8-forms-064",
+    "i8-forms-065",
+    "i8-forms-066",
+    "i8-forms-068",
+    "i8-random-024",
+    "i8-random-031",
+    "i8-random-032",
+    "i8-random-033",
+    "i8-random-037",
+    "i8-random-044",
+    "i8-random-047",
+    "i8-random-050",
+    "i8-random-051",
+]
+"afp=False,fp=fast,max_block=1" = [
     "i8-addr-13",
     "i8-addr-15",
     "i8-addr-16",
@@ -305,14 +346,17 @@ i8-shifts-29 = "ddd7f1b744d95082f307388daa6b8a83b9cdaae1e947434adde1498c22361b94
     "i8-random-051",
 ]
 
+[suite.i8.masks]
+
 [suite.i8.seeded]
 date = "2026-11-18"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
-tool = "qemu: qemu-x86_64-static (apple)"
+tool = "qemu: qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"
 
 [suite.i8b]
-fingerprint = "4680fa1443f1c63a0a932bcfc1a81edf43721261e54c8b6f78ac31930db643ce"
+fex_cases = []
+fingerprint = "38e16a4e0d9e4f7136461cd0d1d04013a6fb768caa5ce9a1c56695aff39de444"
 input = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 reference = "qemu"
 x86_cases = [
@@ -664,7 +708,72 @@ i8-shifts-28 = "5ee078557e4341738de814d41e5b80a97533e469bfb54ec9b39e93c232212882
 i8-shifts-29 = "28a143f356866b735a92afabe602a8bec0dd88d83ffec622de2a8fab74dd710b"
 
 [suite.i8b.excluded]
-"afp=False,fp=fast" = [
+"afp=False,fp=fast,max_block=0" = [
+    "i8-addr-03",
+    "i8-addr-04",
+    "i8-addr-13",
+    "i8-addr-17",
+    "i8-addr-22",
+    "i8-addr-25",
+    "i8-forms-000",
+    "i8-forms-013",
+    "i8-forms-014",
+    "i8-forms-019",
+    "i8-forms-020",
+    "i8-forms-021",
+    "i8-forms-022",
+    "i8-forms-023",
+    "i8-forms-031",
+    "i8-forms-032",
+    "i8-forms-033",
+    "i8-forms-034",
+    "i8-forms-035",
+    "i8-forms-043",
+    "i8-forms-056",
+    "i8-forms-062",
+    "i8-forms-063",
+    "i8-forms-064",
+    "i8-forms-065",
+    "i8-forms-066",
+    "i8-random-007",
+    "i8-random-011",
+    "i8-random-012",
+    "i8-random-020",
+    "i8-random-022",
+    "i8-random-029",
+    "i8-random-032",
+    "i8-random-039",
+    "i8-random-042",
+    "i8-random-044",
+    "i8-random-047",
+    "i8-random-052",
+    "i8-random-055",
+    "i8-random-061",
+    "i8-random-065",
+    "i8-random-069",
+    "i8-random-070",
+    "i8-random-071",
+    "i8-random-077",
+    "i8-random-079",
+    "i8-random-083",
+    "i8-random-088",
+    "i8-random-089",
+    "i8-random-096",
+    "i8-random-102",
+    "i8-random-104",
+    "i8-random-110",
+    "i8-random-111",
+    "i8-random-113",
+    "i8-random-115",
+    "i8-random-121",
+    "i8-random-126",
+    "i8-random-129",
+    "i8-random-132",
+    "i8-random-135",
+    "i8-random-136",
+    "i8-random-142",
+]
+"afp=False,fp=fast,max_block=1" = [
     "i8-addr-03",
     "i8-addr-04",
     "i8-addr-13",
@@ -730,8 +839,10 @@ i8-shifts-29 = "28a143f356866b735a92afabe602a8bec0dd88d83ffec622de2a8fab74dd710b
     "i8-random-142",
 ]
 
+[suite.i8b.masks]
+
 [suite.i8b.seeded]
 date = "2026-11-18"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
-tool = "qemu: qemu-x86_64-static (apple)"
+tool = "qemu: qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"
