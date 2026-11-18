@@ -79,6 +79,25 @@ def generate(key, folder):
     return out
 
 
+def locked_answers(suite, progs, lock, bad):
+    """QEMU-shaped results from the model's QEMU rules, each checked against the answer hash locked for the case (testkit's
+    normalizer, the same one every run uses); a case locked from real x86 (or not yet answered) is not compared."""
+    import tomllib
+    sys.path.insert(0, str(HERE.parent.parent.parent))
+    from testkit.harness.normalize_programs import answer
+    locked = tomllib.loads(lock.read_text())['suite'][suite]
+    x86 = set(locked.get('x86_cases', []))
+    exp = {}
+    for n, p in progs.items():
+        m = model_result(p)
+        want = locked['cases'].get(n, '')
+        ref_rules = model_result(p, fp.BASE) if n in x86 else m     # x86-answered cases: the model's x86 rules must match
+        if want and answer(p, ref_rules['qemu']) != want:
+            bad += 1; print(f"MODEL({'x86' if n in x86 else 'QEMU'} rules) != locked answer", suite, n)
+        exp[n] = m
+    return exp, bad
+
+
 def model_result(program, mode=fp.Q):
     """A result shaped as a QEMU result from the model's rules `mode` (default QEMU's, which reproduce every QEMU answer of both
     corpora): the final state, the RIP after the straight-line code and the RFLAGS mask the reference derives."""
@@ -89,19 +108,20 @@ def model_result(program, mode=fp.Q):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--expected', type=pathlib.Path, help='folder holding <corpus key>/expected.json (default: tools/raw_root.py)')
+    ap.add_argument('--expected', type=pathlib.Path, help='folder holding <corpus key>/expected.json (natemu-raw); by default the '
+                    "model's QEMU rules are checked against the answer hashes locked in tests/fp/tests.lock instead")
+    ap.add_argument('--lock', type=pathlib.Path, default=HERE.parent.parent.parent / 'tests' / 'fp' / 'tests.lock')
     ap.add_argument('--run', type=pathlib.Path, help='a natemu run in M2 emulation, to check the model against (never a tag source)')
     ap.add_argument('--write', type=pathlib.Path)
     a = ap.parse_args()
-    if a.expected is None:
-        sys.path.insert(0, str(HERE.parent.parent))
-        from raw_root import RAW_ROOT
-        a.expected = RAW_ROOT
     out, bad = {}, 0
     with tempfile.TemporaryDirectory() as tmp:
         for c, d in CORPORA.items():
             progs = {p['name']: p for p in json.loads(generate(d, tmp).read_text())['programs']}
-            exp = {r['name']: r for r in json.loads((a.expected / d / 'expected.json').read_text())['results']}
+            if a.expected:
+                exp = {r['name']: r for r in json.loads((a.expected / d / 'expected.json').read_text())['results']}
+            else:
+                exp, bad = locked_answers(c, progs, a.lock, bad)
             if set(exp) != set(progs): sys.exit(f'{d}: the QEMU answers name other programs than gen_i8.py makes now')
             res = {r['name']: r for r in json.loads((a.run / 'out' / c / 'results.json').read_text())['results']} if a.run else {}
             tagged, fast_differs, natemu_differs = {}, 0, 0

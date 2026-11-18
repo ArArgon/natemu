@@ -106,7 +106,8 @@ class Programs:
                 'seeded': {'tool': f'{suite.reference}: qemu-x86_64-static ({prov["container_backend"]})' if suite.reference == 'qemu'
                            else 'x86', 'pin': qemu_pin(), 'machine': h.chip,
                            'date': datetime.date.today().isoformat()},
-                'cases': {p['name']: answers[p['name']] for p in programs}, 'excluded': excluded}
+                'cases': {p['name']: answers[p['name']] for p in programs}, 'excluded': excluded,
+                'x86_cases': sorted(p['name'] for p in x86)}
 
     # --- running ---
 

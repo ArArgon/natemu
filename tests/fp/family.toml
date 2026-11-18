@@ -23,6 +23,8 @@ reference = "qemu"
 matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false] }
 batch = 64
 smoke = ["i8-forms-000"]
+# QEMU 7.2's two-NaN choice departs from x86 here (tools/models/afp_fp: natemu's accurate result is x86's): x86 answer.
+reference_overrides = { "i8-forms-044" = "x86" }
 
 [[suite]]
 name = "i8b"
