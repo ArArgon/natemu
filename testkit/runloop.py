@@ -64,9 +64,10 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
         s = g[0].suite
         for i in range(0, len(g), max(1, s.batch)):
             chunk = g[i:i + s.batch]
-            exp = [table.get(it.nodeid) for it in chunk]
-            req = Request(id=uuid.uuid4().hex, owner_pid=os.getpid(), cores=_cores(s.needs.cores, pool.cfg),
-                          exclusive=s.needs.exclusive, perf=s.needs.perf or s.needs.dedicated, priority=prio,
+            exp = [table.get(it.nodeid, it.harness.expected(it.case) if hasattr(it.harness, 'expected') else None) for it in chunk]
+            nd = it_needs(chunk[0])
+            req = Request(id=uuid.uuid4().hex, owner_pid=os.getpid(), cores=_cores(nd.cores, pool.cfg),
+                          exclusive=nd.exclusive, perf=nd.perf or nd.dedicated, priority=prio,
                           asked=time.time(), expected=None if None in exp else sum(exp),
                           label=f'{g[0].fam.name}/{s.name}' + (f'[{g[0].variant.id}]' if g[0].variant.params else ''),
                           worktree=paths.repo_root().name)
@@ -79,6 +80,12 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
             units.append(Unit(len(units), chunk, req, env, float(s.params.get('timeout', 3600))))
     units.sort(key=lambda u: -(u.req.expected if u.req.expected is not None else 1e9))
     return units, refused
+
+
+def it_needs(item):
+    """A suite's claims, or per case where the harness knows them (wrapped legacy steps)."""
+    h = item.harness
+    return h.case_needs(item.fam, item.suite, item.case) if hasattr(h, 'case_needs') else item.suite.needs
 
 
 def report_without_running(item, category, reason):
