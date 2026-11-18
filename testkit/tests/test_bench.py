@@ -28,7 +28,7 @@ def test_ssh_builder_runs_recipe_and_cleans_up(tmp_path):
     log = tmp_path / 'ssh.log'
     fake_ssh = tmp_path / 'ssh'
     fake_ssh.write_text(f'#!/bin/sh\n# skip -o OPT pairs and the host\nwhile [ "$1" = -o ]; do shift 2; done; shift\n'
-                        f'echo "$@" >> {log}\nexport TMPDIR={remote}\nexec sh -c "$(echo "$@" | sed "s#mktemp -d /tmp/#mktemp -d {remote}/#")"\n')
+                        f'echo "$@" >> {log}\nexport TMPDIR={remote}\nexport HOME={remote}\nexec sh -c "$*"\n')
     fake_scp = tmp_path / 'scp'
     fake_scp.write_text('#!/bin/sh\nwhile [ "$1" = -q ] || [ "$1" = -o ]; do [ "$1" = -o ] && shift; shift; done\n'
                         'cp "${1#*:}" "$2"\n')

@@ -170,7 +170,7 @@ def _build_bench_ssh(recipe: pathlib.Path, out: pathlib.Path, hostname: str, ssh
     """The recipe's own build.sh, natively on an x86-64 Linux machine (it needs apt-get, dpkg, curl, python3, binutils,
     tclsh there, as on the reference box), in a temporary folder that is removed afterwards: nothing is kept there."""
     opts = ['-o', 'BatchMode=yes']
-    d = _run([ssh, *opts, hostname, 'mktemp -d /tmp/natemu-bench-XXXXXX']).stdout.strip()
+    d = _run([ssh, *opts, hostname, 'mktemp -d "$HOME/.natemu-bench-XXXXXX"']).stdout.strip()   # on disk, not a RAM /tmp
     try:
         tar = subprocess.run(['tar', '-C', str(recipe), '-cf', '-', '.'], capture_output=True, check=True).stdout
         r = subprocess.run([ssh, *opts, hostname, f'tar -C {d} -xf -'], input=tar, capture_output=True)
