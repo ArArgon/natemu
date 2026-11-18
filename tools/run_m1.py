@@ -122,6 +122,9 @@ def main():
         print(f"{name}: {'ok' if ok else 'FAIL'} {'' if ok else keep}", flush=True)
         if not ok: failures.append(name)
     (a.out / 'm1.json').write_text(json.dumps({'results': results, 'failures': failures}, indent=1) + '\n')
+    (a.out / 'results.json').write_text(json.dumps({'results': [
+        {'name': r['case'], 'outcome': 'match' if r['ok'] else 'fail', 'diffs': [] if r['ok'] else [json.dumps(r['detail'])]}
+        for r in results]}, indent=1) + '\n')
     print(f'{len(results)} cases, {len(failures)} failures')
     sys.exit(1 if failures else 0)
 

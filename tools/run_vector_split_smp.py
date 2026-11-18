@@ -105,7 +105,8 @@ def main():
             rows.append({'block': block, 'errors': errors, 'completions': [c['stats']['splits'] for c in cpus]})
         if not output: rows.append({'block': block, 'errors': errors})
         print(rows[-1], flush=True)
-    (a.out / 'results.json').write_text(json.dumps(rows, indent=2) + '\n')
+    (a.out / 'results.json').write_text(json.dumps({'results': [
+        {**r, 'name': f"block-{r['block']}", 'outcome': 'fail' if r['errors'] else 'match', 'diffs': r['errors']} for r in rows]}, indent=2) + '\n')
     return int(any(r['errors'] for r in rows))
 
 

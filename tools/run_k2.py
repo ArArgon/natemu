@@ -60,7 +60,7 @@ import argparse, json, pathlib, statistics, subprocess, sys, time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, run_slice1_vm as vm, programs as P, fp_deviations as dev  # noqa: E402
+import ref, results_json, run_slice1_vm as vm, programs as P, fp_deviations as dev  # noqa: E402
 
 CODE, DATA, STACK = 0x100000, 0x300000, 0x3f0000
 F80_ONE = bytes.fromhex('0000000000000080ff3f')
@@ -2565,6 +2565,7 @@ def main():
     if 'verw' in a.only: failures += verw(a, report)
     if 'gather' in a.only: failures += gather(a, report)
     (a.out / 'k2.json').write_text(json.dumps(report, indent=1) + '\n')
+    results_json.write(a.out, report)
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)
 

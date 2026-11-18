@@ -502,6 +502,13 @@ def main():
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         results = list(ex.map(lambda p: one(host, runtime, a.fexc, a.src, a.out, p, known, disabled, a.keep, a.max_block), tests))
     (a.out / 'results.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in results))
+    # Per-test results for the test framework (outcome names: match, fail, unsupported, excluded); the exit rule is unchanged.
+    # A precision deviation is the documented x87 reduced-precision deviation (I6): excluded by name, with its reason.
+    outcome = {'pass': 'match', 'fail': 'fail', 'unsupported': 'unsupported', 'precision deviation': 'excluded'}
+    (a.out / 'results.json').write_text(json.dumps({'results': [
+        {'name': r['test'], 'outcome': outcome[r['outcome']],
+         'diffs': [' '.join(x for x in (r.get('reason'), r.get('detail')) if x)] if r['outcome'] != 'pass' else []}
+        for r in results]}, indent=1) + '\n')
     if a.selftest:
         bad = [(r['test'], r['outcome'], r.get('reason'), SELFTEST[r['test']][1:]) for r in results
                if (r['outcome'], (r.get('reason') or '')[:len(SELFTEST[r['test']][2])]) != SELFTEST[r['test']][1:]]
