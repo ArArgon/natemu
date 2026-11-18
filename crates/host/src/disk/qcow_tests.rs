@@ -199,6 +199,8 @@ struct Log {
     ops: Vec<Op>,
     /// Run (once) inside the next fsync, before it is recorded: what a worker does while a flush's fsync runs.
     on_sync: Option<Box<dyn FnOnce() + Send>>,
+    /// Run (once) inside the next barrier, before it is recorded.
+    on_barrier: Option<Box<dyn FnOnce() + Send>>,
     /// Run (once) inside the next punch, before it.
     on_punch: Option<Box<dyn FnOnce() + Send>>,
     fail_punch: bool,
@@ -259,6 +261,10 @@ impl FileLayer for Recording {
     }
     fn sync(&self, kind: SyncKind) -> io::Result<()> {
         if kind == SyncKind::Barrier {
+            let hook = self.log().on_barrier.take();
+            if let Some(hook) = hook {
+                hook();
+            }
             self.log().ops.push(Op::Barrier);
             return Ok(());
         }
@@ -1373,6 +1379,33 @@ fn write_zeroes_of_64_gib_on_a_fresh_overlay_is_table_only_and_fast() {
             && read(&*b, (64 << 30) - 4096, 4096).iter().all(|&x| x == 0)
     );
     assert!(std::fs::metadata(&top).unwrap().len() < 64 << 20);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Gate: a flush's first barrier runs outside the table lock. On APFS F_BARRIERFSYNC writes out the file's whole cache
+// (seconds after gigabytes of guest writes); every guest write takes the table lock, so under it they all stalled.
+
+#[test]
+fn a_write_goes_on_while_a_flush_writes_out_the_data() {
+    let dir = Dir::new("barrier-unlocked");
+    let path = dir.at("a.qcow2");
+    create_ready(&path, 4 << 20, 16, None);
+    let (q, rec) = recorded(&path, None);
+    q.write(&[1; 512], 0).unwrap(); // a new cluster: the tables are dirty
+    let (done, wrote) = std::sync::mpsc::channel();
+    let writer = q.clone();
+    rec.log().on_barrier = Some(Box::new(move || {
+        std::thread::spawn(move || {
+            writer.write(&[2; 512], 1 << 20).unwrap();
+            let _ = done.send(());
+        });
+        assert!(
+            wrote.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a guest write waited for the flush's data barrier"
+        );
+    }));
+    q.sync(false).unwrap();
+    assert_eq!(read(&*q, 1 << 20, 512), vec![2; 512]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

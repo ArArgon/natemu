@@ -314,7 +314,8 @@ entry landed first reads as zeros (losing even base-image data in sectors the gu
 or an L1 entry points at an L2 table that never arrived (losing every mapping under it). Rule
 for the facade, one order everywhere (flush, cache eviction, exit):
 1. data (already written by the guest writes and copy-on-write fills);
-2. `F_BARRIERFSYNC` (a cheap macOS ordering barrier);
+2. `F_BARRIERFSYNC` (a macOS ordering barrier; on APFS it writes out the file's whole cache, so a flush
+   first runs one outside the table lock and this one covers only the writes completed meanwhile);
 3. dirty L2 tables and refcount blocks;
 4. `F_BARRIERFSYNC`;
 5. L1 table, refcount table and header;
