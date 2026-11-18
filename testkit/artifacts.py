@@ -263,9 +263,32 @@ def bench_image() -> pathlib.Path:
     return f
 
 
+
+def fex_asm() -> pathlib.Path:
+    """FEX's upstream ASM unit tests (unittests/ASM: the .asm files, Includes and the known-failure lists) at the committed
+    FEX pin, extracted from the submodule's git objects, which every worktree shares through the main repository, so a
+    fresh worktree's empty third_party/FEX needs no fetch. Initialises the submodule only if those objects are missing."""
+    if p := _pinned('fex-asm'): return pathlib.Path(p)
+    pin = _git('rev-parse', 'HEAD:third_party/FEX').strip()
+    root = paths.repo_root()
+
+    def build(out: pathlib.Path):
+        common = pathlib.Path(_git('rev-parse', '--path-format=absolute', '--git-common-dir').strip())
+        gd = common / 'modules' / 'third_party' / 'FEX'
+        if subprocess.run(['git', f'--git-dir={gd}', 'cat-file', '-e', f'{pin}^{{commit}}'], capture_output=True).returncode:
+            _run(['git', '-C', root, 'submodule', 'update', '--init', '--depth', '1', 'third_party/FEX'], cwd=root)
+            gd = pathlib.Path(subprocess.run(['git', '-C', str(root / 'third_party/FEX'), 'rev-parse', '--absolute-git-dir'],
+                                             capture_output=True, text=True, check=True).stdout.strip())
+        arc = subprocess.run(['git', f'--git-dir={gd}', 'archive', pin, 'unittests/ASM'], capture_output=True, check=True).stdout
+        subprocess.run(['tar', 'x', '-C', str(out)], input=arc, check=True)
+
+    d = cache.get_or_build('fex-asm', hashlib.sha256(f'fex-asm {pin}'.encode()).hexdigest(), build) / 'unittests' / 'ASM'
+    pin_for_run('fex-asm', str(d))
+    return d
+
 RESOLVERS = {'natemu': lambda: [natemu().entry], 'fexc': lambda: [fexc()], 'nextest': lambda: [nextest()],
              'qemu-user': lambda: [qemu_user()], 'bench-image': lambda: [bench_image()],
-             'qemu-system': lambda: [qemu_system()]}
+             'qemu-system': lambda: [qemu_system()], 'fex-asm': lambda: [fex_asm()]}
 
 
 def resolve(name: str) -> list[pathlib.Path]:

@@ -47,12 +47,12 @@ smoke = true
 argv = ["tools/run_maskmovq.py", "--no-build", "--max-block", "1", "--fexc", "{fexc}", "--out", "{out}"]
 
 [suite.cases."asm"]
-argv = ["tools/fexc/upstream_tests/run_asm.py", "--jobs", "4", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tools/fexc/upstream_tests/run_asm.py", "--jobs", "4", "--fexc", "{fexc}", "--out", "{out}", "--src", "{fex_asm}"]
 needs = { cores = 4, perf = true }
 smoke = true
 
 [suite.cases."asm-1"]
-argv = ["tools/fexc/upstream_tests/run_asm.py", "--jobs", "4", "--max-block", "1", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tools/fexc/upstream_tests/run_asm.py", "--jobs", "4", "--max-block", "1", "--fexc", "{fexc}", "--out", "{out}", "--src", "{fex_asm}"]
 needs = { cores = 4, perf = true }
 
 [suite.cases."m3"]

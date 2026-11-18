@@ -9,6 +9,12 @@ def dispatch(command: str, args: list[str]) -> int:
     return handler(args)
 
 
+def cmd_xref(args):
+    from testkit import xref
+    xref.main(args)
+    return 0
+
+
 def cmd_run(args):
     from testkit import runs
     rid = None

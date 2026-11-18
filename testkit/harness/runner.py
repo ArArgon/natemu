@@ -5,7 +5,9 @@ natemu-raw), its writable state in the machine's state folder (NATEMU_STATE_ROOT
 writes per-case results (`adapters` below); a runner that writes none is judged by its exit status alone, and says so.
 
     [[suite]] kind = "judged"  harness = "runner"
-    [suite.cases.<name>]  argv = ["tools/run_x.py", "--fexc", "{fexc}", "--out", "{out}", ...]
+    [suite.cases.<name>]  argv = ["tools/run_x.py", "--fexc", "{fexc}", "--out", "{out}", ...]   (also {raw},
+                          {natemu_entry}, {natemu_host}, {natemu_runtime}: the framework's builds; {fex_asm}: FEX's
+                          unittests/ASM at the pin)
                           needs = {...}  smoke = true  judge = "judges:name"  results = "results.json"
 """
 import fnmatch
@@ -120,7 +122,9 @@ class Runner:
         for it in batch:
             spec = self._spec(it.suite, it.case)
             o = rundir / 'out' / it.case
-            argv = [a.format(fexc=fexc, out=o, natemu_entry=n.entry, raw=root or legacy_raw()) for a in spec['argv']]
+            extra = {'fex_asm': artifacts.fex_asm()} if any('{fex_asm}' in a for a in spec['argv']) else {}
+            argv = [a.format(fexc=fexc, out=o, natemu_entry=n.entry, natemu_host=n.host, natemu_runtime=n.runtime,
+                             raw=root or legacy_raw(), **extra) for a in spec['argv']]
             if argv[0].endswith('.py'): argv = [sys.executable, *argv]
             env = dict(os.environ, NATEMU_PREBUILT='1', NATEMU_VM_LOCK_HELD='1', NATEMU_STATE_ROOT=str(_state_root()),
                        NATEMU_ANSWERS='locked', NATEMU_ANSWERS_LOCK=str(it.fam.dir / 'tests.lock'),
@@ -131,6 +135,7 @@ class Runner:
             env.update(NATEMU_QEMU_SYSTEM=str(qbin / 'qemu-system-x86_64'), NATEMU_QEMU_IMG=str(qbin / 'qemu-img'),
                        NATEMU_QEMU_PIN='qemu-system 11.1.2 src', PATH=f'{qbin}:{env.get("PATH", "")}')
             builder = spec.get('builds', False)
+            if not builder: env['CARGO_TARGET_DIR'] = str(n.entry)   # runners that find natemu in the target folder get this build
             attempts = 2 if spec.get('rerun', it.suite.rerun) else 1
             notes, ok = [], False
             for k in range(attempts):

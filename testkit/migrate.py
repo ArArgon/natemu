@@ -4,6 +4,7 @@ programs families becomes a case of exactly one family, with its old claims (SER
 committed like any other test file.
 """
 import fnmatch
+import os
 import pathlib
 import sys
 
@@ -26,6 +27,9 @@ FAMILIES = [  # (family, patterns), first match wins
     ('system', ['*']),
 ]
 BUILDERS = {'l1', 'l2', 'l2-iasl', 'boot-smoke'}
+# run_suite's w counts parallel VMs; these run --parallel 2 VMs of up to 4 vCPUs whose checks (lost races, litmus claims)
+# need every vCPU on its own core at once
+CORES = {'smp': 8, 'litmus': 8}
 
 
 def toml_str(s): return '"' + str(s).replace('\\', '\\\\').replace('"', '\\"') + '"'
@@ -37,6 +41,7 @@ def main() -> int:
     FEXC, OUT = '/__FEXC__', pathlib.Path('/__OUT__')
     steps = run_suite.steps(FEXC, OUT)
     raw = str(run_suite.RAW)
+    target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', run_suite.ROOT / 'target'))
     covered = {s for v in COVERED.values() for s in v}
     fams = {}
     for s in steps:
@@ -45,13 +50,17 @@ def main() -> int:
         argv = []
         for a in s.argv:
             a = a.replace(FEXC, '{fexc}').replace(str(OUT / 'out' / s.name), '{out}').replace(raw, '{raw}')
+            for rel, ph in (('release/natemu-host', '{natemu_host}'), ('aarch64-unknown-none/release/natemu-runtime', '{natemu_runtime}')):
+                if a == str(target / rel): a = ph          # the framework's natemu build, not this checkout's target/
             argv.append(a)
         if argv[:1] == ['python3']: argv = argv[1:]
+        if argv[:1] == ['tools/fexc/upstream_tests/run_asm.py'] and '--src' not in argv:
+            argv += ['--src', '{fex_asm}']          # FEX's ASM tests from the framework (a fresh worktree's submodule is empty)
         needs = {}
         if s.phase == 'ser' or s.name in BUILDERS:
             needs = {'exclusive': True, 'why': run_suite.SERIAL_WHY.get(s.name, 'builds natemu in the worktree')}
         else:
-            if s.w > 1: needs['cores'] = s.w
+            if s.w > 1 or s.name in CORES: needs['cores'] = CORES.get(s.name, s.w)
             if not any(fnmatch.fnmatch(s.name, p) for p in run_suite.E_OK): needs['perf'] = True
         case = {'argv': argv, 'needs': needs, 'smoke': any(fnmatch.fnmatch(s.name, p) for p in run_suite.QUICK),
                 'builds': s.name in BUILDERS, 'rerun': s.phase == 'ser'}

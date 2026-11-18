@@ -11,12 +11,12 @@ harness = "runner"
 params = { timeout = 3600 }
 
 [suite.cases."virtio-lifecycle"]
-argv = ["tools/run_virtio_lifecycle.py", "run", "--host", "/Users/liaozhiping/Documents/codex/natemu/target/release/natemu-host", "--no-lock", "--runtime", "/Users/liaozhiping/Documents/codex/natemu/target/aarch64-unknown-none/release/natemu-runtime", "--fexc", "{fexc}", "--out", "{out}", "--cases", "read-error", "write-error", "malformed", "malformed-later", "fullqueue", "table-page", "batch-read-error", "batch-write-error", "flush-error", "flush-error-power", "sync-error-writethrough"]
+argv = ["tools/run_virtio_lifecycle.py", "run", "--host", "{natemu_host}", "--no-lock", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}", "--cases", "read-error", "write-error", "malformed", "malformed-later", "fullqueue", "table-page", "batch-read-error", "batch-write-error", "flush-error", "flush-error-power", "sync-error-writethrough"]
 needs = { perf = true }
 smoke = true
 
 [suite.cases."virtio-lifecycle-timed"]
-argv = ["tools/run_virtio_lifecycle.py", "run", "--host", "/Users/liaozhiping/Documents/codex/natemu/target/release/natemu-host", "--no-lock", "--runtime", "/Users/liaozhiping/Documents/codex/natemu/target/aarch64-unknown-none/release/natemu-runtime", "--fexc", "{fexc}", "--out", "{out}", "--cases", "reset", "disable", "power-scalar", "power-rep", "power-sync-error", "power-rep-halt", "out-of-order", "cancel-batch", "reset-mixed", "code-page", "drain-expiry"]
+argv = ["tools/run_virtio_lifecycle.py", "run", "--host", "{natemu_host}", "--no-lock", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}", "--cases", "reset", "disable", "power-scalar", "power-rep", "power-sync-error", "power-rep-halt", "out-of-order", "cancel-batch", "reset-mixed", "code-page", "drain-expiry"]
 needs = { exclusive = true, why = "held-call schedules released or timed out at 3 s, the 50 ms windowless drain deadline (code-page: none may expire), a fixed guest delay against a 300 ms port exit (drain-expiry)" }
 smoke = true
 rerun = true

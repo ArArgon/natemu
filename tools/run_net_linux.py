@@ -761,7 +761,7 @@ def main():
     r.add_argument('--prepared', type=Path, help='a prepare output [default: prepare into OUT/prepared]')
     r.add_argument('--fexc', type=Path, required=True)
     r.add_argument('--out', type=Path, required=True)
-    r.add_argument('--natemu', type=Path, default=ROOT / 'target/release/natemu')
+    r.add_argument('--natemu', type=Path, default=Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target')) / 'release/natemu')
     r.add_argument('--runtime', type=Path, default=ROOT / 'target/aarch64-unknown-none/release/natemu-runtime')
     r.add_argument('--cases', nargs='+', choices=CASES + EXTRA_CASES, default=list(CASES))
     r.add_argument('--vcpus', nargs='+', type=int, default=[2])

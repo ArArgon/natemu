@@ -8,6 +8,7 @@
     tools/natemu-test check-lock [FAMILY_DIR]  stale or suspicious lock entries
     tools/natemu-test prepare [selection]      build and fetch what a selection needs, run nothing
     tools/natemu-test gc                       clean the cache down to its cap
+    tools/natemu-test xref FAMILY_DIR... -o F  where QEMU and the x86 machine differ on the program corpora
     tools/natemu-test -m pytest ...            plain pytest (the framework's own tests)
 """
 import argparse
@@ -22,6 +23,7 @@ COMMANDS = {
     'check-lock': 'report stale or suspicious lock entries',
     'prepare': 'build and fetch what a selection needs without running it',
     'gc': 'clean the cache down to its size cap',
+    'xref': 'compare QEMU with the x86 machine over the program corpora',
 }
 
 
