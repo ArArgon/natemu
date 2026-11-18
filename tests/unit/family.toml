@@ -1,0 +1,33 @@
+# Unit tests (spec R3.8, R6.3a): every tier runs all of them. Rust through cargo-nextest; the Python tool tests that
+# `unittest discover -s tools` finds, one file per case, each test reported on its own.
+[family]
+name = "unit"
+
+[[suite]]
+name = "rust"
+kind = "units"
+harness = "units"
+params = { tool = "nextest" }
+needs = { cores = "all" }
+
+[[suite]]
+name = "rust-fexc"
+kind = "units"
+harness = "units"
+params = { tool = "nextest", fexc = true }
+needs = { cores = "all" }
+
+[[suite]]
+name = "python"
+kind = "units"
+harness = "units"
+params = { tool = "pytest", exclude = ["tools/test_vm_lock.py", "tools/test_check_setup.py"], fexc = true }
+batch = 8
+
+[[suite]]
+name = "python-timed"
+# test_vm_lock sleeps and test_check_setup has a 50 ms deadline: performance cores only (as run_suite kept them).
+kind = "units"
+harness = "units"
+params = { tool = "pytest", include = ["tools/test_vm_lock.py", "tools/test_check_setup.py"], fexc = true }
+needs = { perf = true }

@@ -168,6 +168,7 @@ class Controller:
             hook.pytest_runtest_logstart(nodeid=ev['nodeid'], location=tuple(ev['location']))
         elif ev['kind'] == 'report':
             rep = hook.pytest_report_from_serializable(config=self.config, data=ev['data'])
+            if isinstance(rep.longrepr, list): rep.longrepr = tuple(rep.longrepr)       # JSON turned the skip tuple into a list
             hook.pytest_runtest_logreport(report=rep)
             if rep.when == 'teardown' or (rep.when == 'setup' and not rep.passed):
                 u.done.add(rep.nodeid)
