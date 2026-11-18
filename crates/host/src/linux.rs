@@ -76,11 +76,23 @@ pub struct DiskSpec {
     /// The base of a qcow2 overlay at `path` (read-only, shared lock). A writable `path` that does not exist is created
     /// as a new overlay over it; an existing one must name this same file as its backing file.
     pub backing: Option<PathBuf>,
+    /// Throw-away writes (QEMU's snapshot=on): `path` is the read-only base of a new overlay in the temporary folder,
+    /// deleted as soon as it is open, so the guest's writes vanish when the VM exits. Not with `readonly` or `backing`.
+    pub snapshot: bool,
 }
 
 impl DiskSpec {
     /// Its image (a new overlay created first when `backing` names a base and a writable `path` does not exist).
     fn open(&self) -> Result<crate::disk::Image> {
+        if self.snapshot {
+            if self.readonly || self.backing.is_some() {
+                return Err(format!(
+                    "disk {}: snapshot goes with neither readonly nor backing",
+                    self.id
+                ));
+            }
+            return crate::disk::open_snapshot(&self.id, &self.path);
+        }
         crate::disk::open_disk(&self.id, &self.path, self.readonly, self.backing.as_deref())
     }
 }
@@ -1018,6 +1030,7 @@ mod tests {
             transport: Transport::Mmio,
             readonly,
             backing: backing.map(Into::into),
+            snapshot: false,
         };
         // Read-only: never created.
         let e = spec(true, Some(&base)).open().err().unwrap();
@@ -1034,6 +1047,57 @@ mod tests {
                 && e.contains(&format!("--set disk.disk0.backing={}", named.display())),
             "{e}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_disk_keeps_its_base_unchanged_and_leaves_no_file() {
+        let dir =
+            std::env::temp_dir().join(format!("natemu-linux-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.raw");
+        let pattern: Vec<u8> = (0..1u32 << 20).map(|i| (i * 7) as u8).collect();
+        std::fs::write(&base, &pattern).unwrap();
+        let spec = |readonly, backing: Option<&std::path::Path>| DiskSpec {
+            id: "snapdisk".into(),
+            path: base.clone(),
+            transport: Transport::Mmio,
+            readonly,
+            backing: backing.map(Into::into),
+            snapshot: true,
+        };
+        let leftovers = || {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("natemu-snapshot-{}-snapdisk-", std::process::id()))
+                })
+                .count()
+        };
+        let image = spec(false, None).open().unwrap();
+        assert_eq!(image.capacity, 1 << 20);
+        assert_eq!(leftovers(), 0, "the overlay file is deleted once open");
+        // Writes go to the open overlay: read back there, the base keeps its bytes (and stays shareable read-only).
+        let (calls, mut buf) = (&image.backend, vec![0u8; 4096]);
+        calls.write(&[0xAB; 4096], 8192).unwrap();
+        calls.read(&mut buf, 8192).unwrap();
+        assert_eq!(buf, vec![0xAB; 4096]);
+        calls.read(&mut buf, 0).unwrap();
+        assert_eq!(buf, pattern[..4096]);
+        calls.sync(false).unwrap();
+        assert!(crate::disk::open(&base, true, None).is_ok());
+        drop(image);
+        assert_eq!(std::fs::read(&base).unwrap(), pattern);
+        for (readonly, backing) in [(true, None), (false, Some(base.as_path()))] {
+            let e = spec(readonly, backing).open().err().unwrap();
+            assert!(
+                e.contains("snapshot goes with neither readonly nor backing"),
+                "{e}"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

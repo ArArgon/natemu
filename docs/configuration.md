@@ -90,6 +90,7 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | `[[disk]]` | `id`, `path` | required | A disk image |
 | | `readonly` | `false` | The guest cannot write it |
 | | `backing` | none | The base image of a qcow2 overlay at `path` (see below) |
+| | `snapshot` | `false` | The guest's writes are thrown away when the VM exits; `path` is never changed (see below) |
 | `[[nic]]` | `id` | required | User-mode NAT network device |
 | | `forward` | none | List of `[tcp\|udp:]HOST_PORT:GUEST_PORT` strings |
 | | `host_loopback` | `false` | The guest may reach the Mac's `127.0.0.1` via `10.0.2.2` |
@@ -163,7 +164,7 @@ none) and the key. All of these are found before the VM starts, and the process 
 | `c.toml: device id "A b" must match [a-z0-9_-]+ (disk 1)` | An id has other characters |
 | `c.toml: device id "a" is used twice (disk 1 and nic 1)` | Ids are unique across all device kinds |
 | `c.toml: at most one [[nic]] is supported in M1; found 2` | Also for `[[rng]]` |
-| `c.toml: disks "a" and "b" are the same file; that is allowed only when both are readonly` | One image, two writers |
+| `c.toml: disks "a" and "b" are the same file; that is allowed only when both are readonly or snapshot` | One image, two writers |
 | `c.toml: nic[0].forward: bad forward "x": [tcp\|udp:]HOST_PORT:GUEST_PORT, decimal ports 1-65535` | A forward is malformed |
 | `--set bad: expected key=value` | `--set` without `=` |
 | `--set disk.zz.path: no disk with id "zz" (an override cannot create a device)` | Unknown device id |
@@ -197,6 +198,11 @@ none) and the key. All of these are found before the VM starts, and the process 
   must not be another disk's writable image. An overlay whose base the configuration does not name
   is refused, with the key to add (a downloaded image could otherwise name any host file). Bases
   below the configured one must be named relative to their image's folder, with a backing format.
+- **Snapshot disks** (`snapshot = true`, or `--set disk.disk0.snapshot=true` with `--disk`): the guest can write
+  to the disk as usual, but every change is thrown away when the VM exits, as with QEMU's `-snapshot`. natemu
+  creates an empty overlay over `path` in the temporary folder and deletes the file as soon as it is open, so the
+  changes live only in that open, already-deleted file and the Mac frees its space at exit, even after a crash.
+  `path` is opened read-only, so other read-only or snapshot disks may share it. Not with `readonly` or `backing`.
 - The new overlay is written under a temporary name in the same folder,
   `.NAME.natemu-new-PID-TIME-N`, and moved to `path` only when complete, so `path` never holds a
   partial image. A crash while creating leaves at most such a file; natemu never reads it, and it

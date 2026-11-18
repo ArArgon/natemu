@@ -378,9 +378,9 @@ snapshots. Compressed clusters are read as an I/O error (compression code droppe
   vendored crate writes the overlay header with a backing name (`create_overlay`); `qemu-img` and
   the overlay coverage case accept the result.)
 
-**Throw-away overlays** (still OPEN; the owner has not decided): an option to create the overlay in a
-temporary folder and delete it after the launch would suit the test tiers. The test runners now
-make and delete their own per-run overlays outside natemu, so no natemu option exists yet.
+**Throw-away overlays** (built November 17, the owner: "we can have it if it is simple"): the disk key
+`snapshot = true` (QEMU's `snapshot=on`) creates an empty overlay over `path` in the temporary folder and
+deletes it once open; `path` is opened read-only. The test runners still make their own per-run overlays.
 
 ## 5. Work split: two lanes
 
@@ -529,7 +529,7 @@ That is 16 fio matrix runs and one IO5 run.
 Decided since the first draft: the backing-name policy, the tolerances, and shared PCI lines in
 M1. Still open:
 
-1. **Throw-away overlays**: still open, the owner has not decided. The runners work without it.
+1. **Throw-away overlays**: built as the `snapshot` disk key (section 4).
 
 Risks to keep in view:
 

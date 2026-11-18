@@ -142,6 +142,7 @@ fn legacy(cli: &Cli) -> Fields {
             transport: cli.virtio_transport.disk,
             readonly: false,
             backing: None,
+            snapshot: false,
         })
         .collect();
     boot.net = cli.net;
@@ -865,6 +866,64 @@ fn a_file_boot_is_the_same_boot_as_the_flags() {
     two.disks[0].backing = Some("base.raw".into());
     let boot = to_boot(&two, "RT".into(), vec![1], None).unwrap();
     assert_eq!(boot.disks[0].backing, Some(PathBuf::from("base.raw")));
+}
+
+#[test]
+fn a_snapshot_disk_is_a_read_only_use_of_its_file() {
+    let _env = lock();
+    let d = dir();
+    let (a, top) = (d.join("a.raw"), d.join("top.qcow2"));
+    std::fs::write(&a, b"x").unwrap();
+    let disk = |id: &str, path: &Path, extra: &str| {
+        format!(
+            "[[disk]]\nid = \"{id}\"\npath = \"{}\"\n{extra}",
+            path.display()
+        )
+    };
+    let run = |disks: &[String]| load_file(&format!("{MIN}{}", disks.concat()), &[]).1;
+    let c = run(&[disk("one", &a, "snapshot = true\n")]).unwrap();
+    assert!(c.disks[0].snapshot && !c.disks[0].readonly);
+    assert_eq!(
+        load_file(
+            &format!("{MIN}{}", disk("one", &a, "")),
+            &["--set", "disk.one.snapshot=yes"]
+        )
+        .1
+        .unwrap()
+        .disks[0]
+            .snapshot,
+        true
+    );
+    // With a read-only use, another snapshot or an overlay over it; never with a writable use.
+    assert!(
+        run(&[
+            disk("one", &a, "snapshot = true\n"),
+            disk("two", &a, "readonly = true\n")
+        ])
+        .is_ok()
+    );
+    assert!(
+        run(&[
+            disk("one", &a, "snapshot = true\n"),
+            disk("two", &a, "snapshot = true\n")
+        ])
+        .is_ok()
+    );
+    assert!(
+        run(&[
+            disk("one", &a, "snapshot = true\n"),
+            disk("two", &top, &format!("backing = \"{}\"\n", a.display()))
+        ])
+        .is_ok()
+    );
+    let e = err(run(&[
+        disk("one", &a, "snapshot = true\n"),
+        disk("two", &a, ""),
+    ]));
+    assert!(
+        e.contains("same file") && e.contains("readonly or snapshot"),
+        "{e}"
+    );
 }
 
 #[test]
