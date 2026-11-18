@@ -473,6 +473,7 @@ set -eu
 qemu=$1
 uname -a > /work/container.kernel
 for d in /work/jobs/*; do
+    [ ! -f "$d/rc" ] || continue    # done in an earlier container (see the 126 retry below)
     debug=in_asm
     [ ! -f "$d/flow" ] || debug=in_asm,exec,nochain
     step=
@@ -490,12 +491,19 @@ done
                 '--mount', f'type=bind,source={qemu.parent},target=/reference,readonly',
                 '--workdir', '/work', APPLE_IMAGE, '/bin/sh', '/work/container_entry.sh', '/reference/' + qemu.name]
         (workdir / 'container-command.json').write_text(json.dumps(args) + '\n')
-        try:
-            r = subprocess.run(args, capture_output=True, timeout=1200)
-            (workdir / 'container.stderr').write_bytes(r.stderr)
-            require(r.returncode == 0, 'container failed: ' + r.stderr.decode()[-500:])
-        finally:
-            subprocess.run(['container', 'delete', '--force', name], capture_output=True, timeout=30)
+        for f in (workdir / 'jobs').glob('*/rc'): f.unlink()
+        for attempt in range(8):
+            try:
+                r = subprocess.run(args, capture_output=True, timeout=1200)
+                (workdir / 'container.stderr').write_bytes(r.stderr)
+                require(r.returncode == 0, 'container failed: ' + r.stderr.decode()[-500:])
+            finally:
+                subprocess.run(['container', 'delete', '--force', name], capture_output=True, timeout=30)
+            # Rosetta in a container intermittently stops executing the x86 binary after some dozens of runs ("Permission denied",
+            # exit 126, for every later job of that container): the jobs it did not run are run again in a fresh container.
+            again = [f for f in (workdir / 'jobs').glob('*/rc') if f.read_text().strip() == '126']
+            if not again: break
+            for f in again: f.unlink()
     else:
         run_docker_reference(workdir, qemu, name, token, cidfile)
     results = []

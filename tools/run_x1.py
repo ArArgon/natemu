@@ -21,7 +21,7 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, smp, answers, entry, programs as P, run_slice1_vm as vm  # noqa: E402
+import case_results, ref, smp, answers, entry, programs as P, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end, smp_description, vm_state  # noqa: E402
 from models import delivery_model as dm  # noqa: E402
 
@@ -450,6 +450,7 @@ def main():
             report[mode] = []
             failures += fn(a, report[mode])
     (a.out / 'x1.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    case_results.write(a.out, [c for m, v in report.items() for c in case_results.program_cases(m, v)], failures)
     for f in failures: print('FAIL', f)
     print({k: f'{sum(1 for r in v if not any(x["problems"] for x in r["runs"]))}/{len(v)} ok' for k, v in report.items()})
     sys.exit(1 if failures else 0)

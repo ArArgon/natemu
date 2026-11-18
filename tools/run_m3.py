@@ -48,7 +48,7 @@ from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference')); sys.path.insert(0, str(ROOT / 'tools' / 'models'))
-import ref, answers, run_slice1_vm as vm  # noqa: E402
+import case_results, ref, answers, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import kick_checks  # noqa: E402
 
 CODE, DEV, GPA, PREV, NEXT = 0x100000, 0x200000, 0xfeb0_0000, 0x1ff000, 0x201000
@@ -210,7 +210,7 @@ def corpus(a, host, runtime, report):
     with cf.ThreadPoolExecutor(a.parallel) as pool:
         for (p, b, c), diffs in zip(jobs, pool.map(one, jobs)):
             if diffs: failures.append(f"{p['name']} block={b} cpl={c}: {'; '.join(diffs)[:600]}")
-    report['corpus'] = {'programs': len(progs), 'runs': len(jobs), 'accesses': sum(len(p['insns']) for p in progs), 'failures': failures}
+    report['corpus'] = {'names': [(f"{p['name']} block={b} cpl={c}", f"{p['name']} block={b} cpl={c}: ") for p, b, c in jobs], 'programs': len(progs), 'runs': len(jobs), 'accesses': sum(len(p['insns']) for p in progs), 'failures': failures}
     return failures
 
 
@@ -403,7 +403,7 @@ def run_cases(a, host, runtime, cases, report, key):
         for name, block, problems in pool.map(one, jobs):
             rows.append({'name': name, 'block': block, 'problems': problems})
             if problems: failures.append(f'{name} block={block}: {"; ".join(problems)}')
-    report[key] = {'cases': len(cases), 'runs': len(jobs), 'failures': failures}
+    report[key] = {'names': [(f"{r['name']} block={r['block']}", f"{r['name']} block={r['block']}: ") for r in rows], 'cases': len(cases), 'runs': len(jobs), 'failures': failures}
     return failures
 
 
@@ -574,8 +574,9 @@ def main():
     if 'xmc' in a.only: failures += xmc(a, host, runtime, report)
     if 'boundary' in a.only: failures += boundary(a, host, runtime, report)
     (a.out / 'm3.json').write_text(json.dumps(report, indent=1) + '\n')
+    case_results.write(a.out, [(f'{k}/{n}', pre) for k, g in report.items() for n, pre in (g.get('names') or [(k, k)])], failures)
     for f in failures: print('FAIL', f)
-    print({k: {kk: (len(vv) if kk == 'failures' else vv) for kk, vv in v.items() if kk != 'runs'} for k, v in report.items()})
+    print({k: {kk: (len(vv) if kk == 'failures' else vv) for kk, vv in v.items() if kk not in ('runs', 'names')} for k, v in report.items()})
     sys.exit(1 if failures else 0)
 
 

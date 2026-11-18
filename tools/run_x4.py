@@ -37,7 +37,7 @@ Writes DIR/x4.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/bench/smp'))
-import smp, answers, run_slice1_vm as vm  # noqa: E402
+import case_results, smp, answers, run_slice1_vm as vm  # noqa: E402
 from programs import STACK, asm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, smp_description  # noqa: E402
 from models import mailbox_model  # noqa: E402
@@ -656,6 +656,7 @@ def main():
     if lat:
         summary['wake_latency_us'] = {'n': len(lat), 'min': min(lat) / 1000, 'median': statistics.median(lat) / 1000, 'max': max(lat) / 1000}
     (a.out / 'x4.json').write_text(json.dumps({'report': report, 'failures': failures, 'summary': summary}, indent=1) + '\n')
+    case_results.write(a.out, [c for m, v in report.items() for c in case_results.program_cases(m, v)], failures)
     for f in failures: print('FAIL', f)
     print(summary)
     sys.exit(1 if failures else 0)

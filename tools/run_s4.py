@@ -18,7 +18,7 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, run_slice1_vm as vm, run_slice3_vm as s3, smp, debug, answers  # noqa: E402
+import case_results, ref, run_slice1_vm as vm, run_slice3_vm as s3, smp, debug, answers  # noqa: E402
 
 
 # Where pinned QEMU departs from the SDM in a register (the SDM's value is judged by `debug.expect` or below): the
@@ -164,6 +164,8 @@ def main():
     if 'programs' in a.only: failures += programs(a, report)
     if 'cases' in a.only: failures += cases(a, report)
     (a.out / 's4.json').write_text(json.dumps(report, indent=1, default=str) + '\n')
+    case_results.write(a.out, [(f"programs/{r['program']}/block-{r['block']}", f"{r['program']} block={r['block']}") for r in report.get('programs', {}).get('rows', [])] +
+                       [(f"cases/{r['case']}/block-{r['block']}", f"case {r['case']} block={r['block']}") for r in report.get('cases', {}).get('rows', [])], failures)
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)
 
