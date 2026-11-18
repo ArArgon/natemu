@@ -11,7 +11,7 @@ from typing import Callable, Iterable
 
 from testkit import paths
 
-SKIP_KINDS = {'state', 'locks', 'venv'}     # not entries: machine state, build locks, the framework's own environments
+SKIP_KINDS = {'state', 'locks', 'venv', 'build-tmp', 'compile-cache'}     # not entries: machine state, build locks, the framework's own environments
 
 
 def key(*parts) -> str:
@@ -177,12 +177,20 @@ def gc(cap_bytes: int, roots: set[pathlib.Path]) -> list[pathlib.Path]:
     total = sum(sizes.values())
     keep = leased() | {pathlib.Path(r) for r in roots}
     deleted = []
+    import time as _t
+    started = _t.time()
     for e in sorted(es, key=lambda e: e.stat().st_mtime):
         if total <= cap_bytes: break
         if e in keep: continue
         with _flock(paths.cache_root() / 'locks' / f'{e.parent.name}-{e.name}'):
+            # re-check under the key's lock: another run may have just used, leased or deleted it
+            try:
+                if e.stat().st_mtime >= started or e in leased(): continue
+            except FileNotFoundError:
+                continue
             trash = e.parent / f'.trash-{e.name}-{os.getpid()}'
-            os.rename(e, trash)
+            try: os.rename(e, trash)
+            except FileNotFoundError: continue
             _rmtree(trash)
         total -= sizes[e]; deleted.append(e)
     return deleted

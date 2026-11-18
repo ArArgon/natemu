@@ -55,30 +55,52 @@ def _run(cmd, **kw):
     return r
 
 
+def _pinned(name: str):
+    """What preparation resolved for this run (TESTKIT_ARTIFACTS), so every worker of a run uses the same binaries even
+    if the worktree changes while it runs."""
+    import json
+    return json.loads(os.environ.get('TESTKIT_ARTIFACTS', '{}')).get(name)
+
+
+def pin_for_run(name: str, value) -> None:
+    import json
+    d = json.loads(os.environ.get('TESTKIT_ARTIFACTS', '{}'))
+    d[name] = value
+    os.environ['TESTKIT_ARTIFACTS'] = json.dumps(d)
+
+
 def natemu() -> Natemu:
     """The release host, the `natemu` stub and the resident, built in the worktree's target/ and copied, signed, into
     an entry laid out like a cargo target folder."""
+    if p := _pinned('natemu'): return Natemu(pathlib.Path(p['entry']), p['key'])
     k = source_key(NATEMU_SOURCES, 'natemu-v1')
     root = paths.repo_root()
 
     def build(out: pathlib.Path):
-        target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', root / 'target'))
-        _run(['cargo', '+1.97.0', 'fetch', '--locked'], cwd=root)      # a new machine, or new dependencies (R1.3)
-        _run(CARGO + ['-p', 'natemu-host'], cwd=root)
-        _run(CARGO + ['-p', 'natemu-cli', '--bin', 'natemu'], cwd=root)
-        _run(CARGO + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=root)
+        # A private target folder per worktree: never the worktree's target/, which old runners and other runs execute from.
+        target = paths.cache_root() / 'build-tmp' / ('target-' + hashlib.sha256(str(root).encode()).hexdigest()[:12])
+        env = dict(os.environ, CARGO_TARGET_DIR=str(target))
+        _run(['cargo', '+1.97.0', 'fetch', '--locked'], cwd=root, env=env)      # a new machine, or new dependencies (R1.3)
+        _run(CARGO + ['-p', 'natemu-host'], cwd=root, env=env)
+        _run(CARGO + ['-p', 'natemu-cli', '--bin', 'natemu'], cwd=root, env=env)
+        _run(CARGO + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=root, env=env)
+        if source_key(NATEMU_SOURCES, 'natemu-v1') != k:
+            raise BuildFailure('natemu', 'the sources changed while building; run again')
         for rel in ('release/natemu-host', 'release/natemu', 'aarch64-unknown-none/release/natemu-runtime'):
             (out / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(target / rel, out / rel)
         for rel in ('release/natemu-host', 'release/natemu'):
             _run(['codesign', '--force', '--sign', '-', '--entitlements', root / 'crates/host/entitlements.plist', out / rel])
 
-    return Natemu(cache.get_or_build('natemu', k, build), k)
+    n = Natemu(cache.get_or_build('natemu', k, build), k)
+    pin_for_run('natemu', {'entry': str(n.entry), 'key': k})
+    return n
 
 
 def fexc() -> pathlib.Path:
     """The fexc compiler at the committed FEX pin, built by tools/fexc/build.sh in a scratch folder; only the binary is
     kept."""
+    if p := _pinned('fexc'): return pathlib.Path(p)
     pin = _git('rev-parse', 'HEAD:third_party/FEX').strip()
     k = source_key(['tools/fexc'], 'fexc', pin)
     root = paths.repo_root()
@@ -93,7 +115,9 @@ def fexc() -> pathlib.Path:
             shutil.rmtree(scratch, ignore_errors=True)
             subprocess.run(['git', '-C', str(root / 'third_party/FEX'), 'worktree', 'prune'], capture_output=True)
 
-    return cache.get_or_build('fexc', k, build) / 'fexc'
+    f = cache.get_or_build('fexc', k, build) / 'fexc'
+    pin_for_run('fexc', str(f))
+    return f
 
 
 def nextest() -> pathlib.Path:

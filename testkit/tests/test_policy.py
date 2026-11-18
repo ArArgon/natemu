@@ -158,3 +158,9 @@ def test_external_busy_keeps_window_closed():
     st_ = State(waiting=[req(exclusive=True, expected=5)])
     assert decide(st_, CFG, 0.0, external_busy=True).grants == []
     assert decide(st_, CFG, 0.0).grants[0][1] == 'X'
+
+
+def test_external_busy_does_not_starve_shared():
+    st_ = State(waiting=[req(exclusive=True, expected=5), req(cores=1, expected=None), req(cores=1, expected=30)])
+    g = decide(st_, CFG, 0.0, external_busy=True).grants
+    assert len(g) == 2 and all(cls != 'X' for _, cls in g)

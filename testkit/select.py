@@ -23,7 +23,8 @@ from testkit.collect import CaseItem
 def _rx(glob: str):
     out, i = '', 0
     while i < len(glob):
-        if glob.startswith('**', i): out += '.*'; i += 2
+        if glob.startswith('**/', i): out += '(?:.*/)?'; i += 3
+        elif glob.startswith('**', i): out += '.*'; i += 2
         elif glob[i] == '*': out += '[^/]*'; i += 1
         elif glob[i] == '?': out += '[^/]'; i += 1
         else: out += re.escape(glob[i]); i += 1
@@ -40,8 +41,9 @@ def changed_files(base: str | None = None) -> list[str]:
     def git(*a):
         return subprocess.run(['git', '-C', root, *a], capture_output=True, text=True).stdout.split('\n')
     if base is None:
-        mb = git('merge-base', 'HEAD', 'main')[0]
-        base = mb or 'HEAD'
+        base = git('merge-base', 'HEAD', 'main')[0] or git('merge-base', 'HEAD', 'origin/main')[0]
+        if not base:
+            raise pytest.UsageError('--tier affected: no main or origin/main to compare with; pass --base REV')
     files = set(git('diff', '--name-only', base)) | set(git('ls-files', '--others', '--exclude-standard'))
     return sorted(f for f in files if f)
 

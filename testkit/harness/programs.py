@@ -30,6 +30,8 @@ def _ref():
 
 def mask_of(program: dict) -> int:
     ref, flags = _ref()
+    if ref.norm(program)['flow']:
+        raise ValueError(f"{program['name']}: a flow program (ref.py derives its RFLAGS mask from the executed path); not supported here")
     return flags.TRACKED & ~flags.analyze(ref.norm(program)['insns'])
 
 
@@ -191,8 +193,8 @@ class Programs:
     @staticmethod
     def _reuse_key(n, locked, it) -> str:
         h = host.detect()
-        return cache.key('outputs', n.key, locked.get('input', ''), it.case, it.variant.id, h.chip,
-                         json.dumps(it.place.met), h.os_build, *sources())
+        return cache.key('outputs', n.key, artifacts.fexc().parent.name, locked.get('input', ''), it.case, it.variant.id,
+                         h.chip, json.dumps(it.place.met), h.os_build, *sources(), paths.repo_root() / 'tools' / 'run_slice1_vm.py')
 
     @staticmethod
     def _reused(key) -> bytes | None:

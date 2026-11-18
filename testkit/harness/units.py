@@ -87,7 +87,9 @@ class Units:
         if not subs:
             return CaseResult('failed', f'nextest ran no tests (exit {r.returncode}):\n{r.stderr[-3000:]}')
         bad = [s.name for s in subs if s.outcome == 'failed']
-        return CaseResult('failed' if bad else 'passed', f'{len(bad)} failed: ' + ', '.join(bad[:10]) if bad else '', sub=subs)
+        if bad: return CaseResult('failed', f'{len(bad)} failed: ' + ', '.join(bad[:10]), sub=subs)
+        if r.returncode != 0: return CaseResult('failed', f'nextest exit {r.returncode}:\n{r.stderr[-3000:]}', sub=subs)
+        return CaseResult('passed', sub=subs)
 
     def pytest_file(self, it) -> CaseResult:
         with tempfile.TemporaryDirectory() as d:

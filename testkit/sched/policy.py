@@ -98,6 +98,8 @@ def decide(state: State, cfg: Config, now: float, external_busy: bool = False) -
     pending = window_pending(view, cfg, now)
     if pending and not shared_held and not external_busy:       # drained: open a window
         return Decision([(excl[0], 'X')], now, last_closed)
+    if pending and external_busy and not shared_held:
+        pending = False             # the window waits for something outside the pool; do not starve shared work meanwhile
 
     horizon = max((g.start + (g.request.expected if g.request.expected is not None else math.inf) for g in shared_held),
                   default=now)

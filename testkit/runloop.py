@@ -248,7 +248,8 @@ class Worker:
     def watch(pid):
         while True:
             try: os.kill(pid, 0)
-            except ProcessLookupError: os._exit(3)      # the controller died: its claim is gone, so stop now
+            except ProcessLookupError:                  # the controller died: its claim is gone, so stop with every child
+                os.killpg(0, signal.SIGKILL)
             time.sleep(1)
 
     def pytest_collection_modifyitems(self, session, config, items):

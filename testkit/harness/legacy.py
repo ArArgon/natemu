@@ -89,7 +89,9 @@ class Legacy:
 
     def resolve(self, req):
         if req.kind == 'legacy':
-            install_signed(artifacts.natemu()); return []
+            n = artifacts.natemu()
+            with build_lock(True): install_signed(n)
+            return []
         return artifacts.resolve(req.name)
 
     def not_runnable(self, case) -> str | None:
@@ -107,6 +109,8 @@ class Legacy:
             if why := self.not_runnable(it.case):
                 out[it.nodeid] = CaseResult('skipped', why, 'not-runnable'); continue
             s = steps(fexc, rundir)[it.case]
+            if s.skip:
+                out[it.nodeid] = CaseResult('skipped', s.skip, 'not-runnable'); continue
             builder = it.case in BUILDERS
             attempts = 2 if s.phase == 'ser' else 1
             notes = []

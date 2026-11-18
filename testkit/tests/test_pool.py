@@ -80,3 +80,13 @@ def test_vm_lock_interop(tmp_path):
     time.sleep(0.5); assert p.is_alive()        # the window waits for the old runner
     fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
     p.join(5); assert p.exitcode == 0
+
+
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _no_outside_vms(monkeypatch):
+    """The machine's real VM processes are not these tests' business."""
+    from testkit.sched import pool as p
+    monkeypatch.setattr(p, 'outside_vms', lambda: [])
