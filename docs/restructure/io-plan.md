@@ -1154,6 +1154,39 @@ CR3 loads return to one of the vCPU's last 8 roots. Done: the answer cache holds
 make -6.7%, `41edbb5`); DISCARD/WRITE_ZEROES free image blocks (`69db2ed`; the IO5 image had grown to 15 GiB for 3 GiB of
 data). Planned, under review: [root retention](root-retention-plan.md) (state kept per recently used CR3 root).
 
+## Disk stalls under heavy random writes — November 18
+
+Reported on an M3: fio 64 KiB random writes (`libaio`, 4 jobs at depth 256, `direct=1`) on ext4 over a qcow2 overlay
+stalled for seconds and printed `virtio-block: slow host disk ... took 2.1s`. Reproduced on the M4; three natemu causes,
+fixed on branch `disk-io-stalls`, and one host constraint:
+
+- **A slow host call stopped the VM.** On a busy healthy Mac an fsync took 18.8 s (native fio, no VM); natemu failed the
+  VM after 10 s. The limit is now 2 minutes (Linux's hung-task warning); the power-off drain waits 30 s past it.
+- **A qcow2 flush blocked every write.** The flush's F_BARRIERFSYNC, which on APFS writes out the file's whole cache, ran
+  under the table lock every write takes. A barrier now runs first outside the lock: the locked part measured 3-23 ms.
+- **PCI's four queues left requests waiting seconds.** Without indirect descriptors a 64 KiB request took 18 of 256 ring
+  slots, so 14 fit while Linux queued 128; its retries of a full ring under the `none` scheduler (Linux's default with
+  several queues) delayed some requests 0.5-18 s while natemu answered each in under 100 ms. The disk now offers
+  VIRTIO_RING_F_INDIRECT_DESC. fio 64 KiB random on a cached raw disk, PCI 4 queues: worst 0.56 s reads / 1.31 s writes
+  before, 0.02-0.09 s / 0.02-0.03 s after; reads 124k to 131k-151k IOPS, writes 93k to 104k; MMIO and one-queue PCI also
+  faster. The reported job on a RAM-disk image (so the SSD adds nothing), three runs of each build alternating: 4,056 /
+  3,928 MiB/s (first / second file) with indirect against 3,593 / 3,436 without, worst write 0.05-0.11 against 0.16-0.44 s.
+- **Host constraint (accepted).** On APFS a write that fills a hole or grows the file waits for a running fsync of it
+  (native: a 1.93 s write during a 1.93 s fsync on a sparse file; under 0.2 s on a filled one), and growing a file
+  froze all writers up to 2.1 s with no sync at all. Sparse raw images and growing qcow2 images get this;
+  [configuration.md](../configuration.md) says how to preallocate.
+
+The full suite passed (190/190) on the branch. A qcow2 test harness race found on the way (a child another test spawns
+holds an image's lock briefly: 7 of 40 stressed runs failed on main) is fixed in the tests.
+
+Open, not investigated:
+- **A guest package download stalled once** (1 of 5 `apt-get install fio` runs over slirp, mid-transfer; the retry
+  passed). A networking case of its own if it recurs.
+- **A long locked qcow2 flush is still possible:** when the unlocked barrier is long and the guest keeps writing, the
+  locked one has that much more (seen once, 4.75 s, at unmount with no write waiting). Removing it means copying the
+  dirty tables under the lock and writing them outside it, a larger change to the vendored code.
+- **Not rerun on the M3** where it was reported.
+
 ## Future direct-payload work
 
 Keep immutable request metadata, backend ownership and ordered completion as
