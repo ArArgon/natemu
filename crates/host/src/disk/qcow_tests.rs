@@ -1349,6 +1349,7 @@ fn other_container_formats_made_by_qemu_img_are_refused_by_name() {
 // Gate: 64 GiB of WRITE_ZEROES on a fresh overlay, timed, with a reader running.
 
 #[test]
+#[ignore = "timed (a 5 s bound): run alone by tests/unit's rust-timed suite, not beside other disk-heavy tests"]
 fn write_zeroes_of_64_gib_on_a_fresh_overlay_is_table_only_and_fast() {
     let dir = Dir::new("zeroes");
     let (base, top) = (dir.at("base.raw"), dir.at("top.qcow2"));

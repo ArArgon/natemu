@@ -28,6 +28,15 @@ matrix = { "host.afp" = [true] }
 needs = { cores = "all" }
 
 [[suite]]
+name = "rust-timed"
+# Rust tests with a wall-clock bound: #[ignore]d in the rust suites (where nextest runs disk-heavy tests beside them; the
+# 64 GiB write-zeroes took 13 s against its 5 s bound there on the M4, 0.04 s alone), run here alone.
+kind = "units"
+harness = "units"
+params = { tool = "nextest", args = ["--run-ignored", "only", "-E", "test(/write_zeroes_of_64_gib_on_a_fresh_overlay/)"] }
+needs = { exclusive = true, why = "a wall-clock bound on disk work (qcow write-zeroes of 64 GiB in under 5 s)" }
+
+[[suite]]
 name = "python"
 kind = "units"
 harness = "units"
