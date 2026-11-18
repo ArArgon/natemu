@@ -31,6 +31,7 @@ from fractions import Fraction
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
 import smp, answers, apic, timers, ref, run_slice1_vm as vm  # noqa: E402
+import case_results  # noqa: E402
 from run_slice3_vm import driver  # noqa: E402
 from run_x3 import natemu_memory, qemu_memory  # noqa: E402
 from run_l4a import run_natemu, qemu  # noqa: E402
@@ -266,6 +267,7 @@ def main():
             report[mode] = []
             failures += fn(a, report[mode])
     (a.out / 'l4b.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    case_results.write_report(a.out, report, failures)
     for f in failures: print('FAIL', f)
     print({k: f"{sum(1 for r in v if not r['problems'])}/{len(v)} ok" for k, v in report.items()})
     sys.exit(1 if failures else 0)

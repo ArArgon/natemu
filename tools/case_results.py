@@ -1,9 +1,11 @@
-"""Per-case results.json for the test framework (testkit/harness/runner.py:per_case) from the reports of run_x1/x3/x4/m3/s4:
-{"results": [{"name", "outcome": match|fail, "diffs": [...]}]}.
+"""Per-case results.json for the test framework (testkit/harness/runner.py:per_case):
+{"results": [{"name", "outcome": match|fail, "diffs": [...]}]}, written from a runner's own judgement; it adds no check and
+never says match where the runner's exit status says failure.
 
-It only restates what the runner already judged: the failure lines that begin with a case's prefix are that case's diffs.
-A failure line no case claims is reported as one failing entry `other`, so every failure shows up in the file and the file
-never says match where the runner's exit status says failure. It adds no check."""
+    write(out, cases, failures)          cases [(name, prefix)]: the failure lines beginning with a case's prefix are its
+                                         diffs (x1/x3/x4/m3/s4)
+    write_report(out, report, failures)  one case per report entry with `problems` (k1/l3/l4a/l4b/m2/r1/pic)
+"""
 import json
 
 
@@ -37,3 +39,35 @@ def program_cases(mode, report):
         elif 'max_block' in e: cases.append((f"{mode}/{n}/max-block-{e['max_block']}", f"{n} (max-block {e['max_block']}): "))
         else: cases.append((f'{mode}/{n}', f'{n}: '))
     return cases
+
+
+
+def _entries(node, path):
+    if isinstance(node, dict):
+        if 'problems' in node or 'runs' in node:
+            name = '/'.join(path + [str(node['name'])]) if 'name' in node else '/'.join(path + [f"block={node.get('block')}"])
+            for r in node.get('runs') or []:
+                yield from _entries(r, [name])
+            if node.get('problems') or not node.get('runs'):
+                yield name, node.get('problems') or []
+        else:
+            for k, v in node.items():
+                if isinstance(v, (list, dict)): yield from _entries(v, path + [k])
+    elif isinstance(node, list):
+        for v in node: yield from _entries(v, path)
+
+
+def write_report(out, report, failures):
+    """From a report (a list of entries or a dict of such lists, an entry having `problems` and maybe `runs` with their
+    own; k1/l3/l4a/l4b/m2/r1/pic): one case per entry. Failures the report does not show become an entry of their own."""
+    rows = {}
+    for name, problems in _entries(report, []):
+        n, k = name, 1
+        while n in rows:
+            k += 1
+            n = f'{name}#{k}'
+        rows[n] = [str(p) for p in problems]
+    if failures and not any(rows.values()):
+        rows['failures'] = [str(f) for f in failures]
+    results = [{'name': n, 'outcome': 'fail' if d else 'match', 'diffs': d} for n, d in rows.items()]
+    (out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')

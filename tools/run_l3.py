@@ -42,6 +42,7 @@ import argparse, json, os, pathlib, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
 import ref, smp, answers, events, ports, run_slice1_vm as vm  # noqa: E402
+import case_results  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end, vm_state, kick_checks  # noqa: E402
 
 RF = 1 << 16
@@ -470,6 +471,7 @@ def main():
     if 'pages' in a.only: failures += cmd_pages(a, report)
     report['failures'] = failures
     (a.out / 'l3.json').write_text(json.dumps(report, indent=1, default=str) + '\n')
+    case_results.write_report(a.out, report, failures)
     print(f'{len(failures)} failures')
     sys.exit(1 if failures else 0)
 

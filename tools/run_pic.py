@@ -217,7 +217,7 @@ def main():
     ap.add_argument('--programs', help="run_k1.py's --programs")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
-    failed = []
+    failed, results = [], []
     for mode in a.modes.split(','):
         a.host, a.runtime = vm.build()
         d = types.SimpleNamespace(host=a.host, runtime=a.runtime, fexc=a.fexc, out=a.out)
@@ -225,6 +225,7 @@ def main():
             bad = {'ac': ac, 'fence': fence}[mode](d)
             print(f"{mode}: {'FAIL ' + '; '.join(bad) if bad else 'ok'}", flush=True)
             failed += [mode] * bool(bad)
+            results.append((mode, bad))
             continue
         # The CPL-3 cases (clean in `user`; under each test mode with it, as the K1 programs below).
         env = {} if mode == 'user' else {'NATEMU_PIC_TEST': mode}
@@ -241,6 +242,7 @@ def main():
         if mode == 'user':
             print(f"user: {'FAIL ' + '; '.join(user_bad) if user_bad else 'ok'} ({', '.join(USER)})", flush=True)
             failed += [mode] * bool(user_bad)
+            results.append((mode, user_bad))
             continue
         out = a.out / mode
         env = dict(os.environ, NATEMU_PIC_TEST=mode)
@@ -277,6 +279,8 @@ def main():
               f"{total[SVC_STOPS]}, links local/checked/abs->shared "
               f"{total[SAME]}/{total[CHECKED]}/{total[ABS_TO_SHARED]})", flush=True)
         failed += [mode] * bool(bad)
+        results.append((mode, bad))
+    (a.out / 'results.json').write_text(json.dumps({'results': [{'name': m, 'outcome': 'fail' if b else 'match', 'diffs': b} for m, b in results]}) + '\n')
     return int(bool(failed))
 
 

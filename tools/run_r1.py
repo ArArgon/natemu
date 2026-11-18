@@ -43,6 +43,7 @@ import argparse, json, pathlib, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
 import smp, answers, apic, irqs, programs as P, run_slice1_vm as vm  # noqa: E402
+import case_results  # noqa: E402
 from models import segment_model as sm  # noqa: E402
 from run_slice3_vm import vm_state  # noqa: E402
 from run_l4a import run_natemu, qemu, uart_problems  # noqa: E402
@@ -1301,6 +1302,7 @@ def main():
                 for n in a.cpus:
                     failures += run_one_r1b(a, name, n, report)
     (a.out / f'{a.mode}.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    case_results.write_report(a.out, report, failures)
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)
 

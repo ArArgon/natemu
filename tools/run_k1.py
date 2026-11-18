@@ -201,6 +201,7 @@ import argparse, json, os, pathlib, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
 import run_slice1_vm as vm, run_slice3_vm as s3, smp, shard, programs as P  # noqa: E402
+import case_results  # noqa: E402
 
 F1, F2 = 0x1000, 0x2000
 CODE = lambda k: P.asm(f'mov eax, {k}\njmp r13') + b'\x90' * 8
@@ -2142,6 +2143,7 @@ def main():
     if not a.programs and a.shard[0] == 1 and (not all(k1) or k1[0]['requests'] != k1[1]['requests'] or k1[0]['compiles'] != k1[1]['compiles']):
         failures.append(f'counts: requests or compiles grow with the rounds: {k1}')
     (a.out / 'k1.json').write_text(json.dumps({'report': report, 'counts': counts, 'failures': failures}, indent=1) + '\n')
+    case_results.write_report(a.out, report, failures)
     for f in failures: print('FAIL', f)
     sys.exit(1 if failures else 0)
 
