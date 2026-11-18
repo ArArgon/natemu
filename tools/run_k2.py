@@ -60,7 +60,7 @@ import argparse, json, pathlib, statistics, subprocess, sys, time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, run_slice1_vm as vm, programs as P  # noqa: E402
+import ref, run_slice1_vm as vm, programs as P, fp_deviations as dev  # noqa: E402
 
 CODE, DATA, STACK = 0x100000, 0x300000, 0x3f0000
 F80_ONE = bytes.fromhex('0000000000000080ff3f')
@@ -1293,7 +1293,8 @@ def stmxcsr(a, report):
     fxsave [FX+512k]` steps (OP's flags, from operands in memory, raised on a fresh MXCSR):
     - `flags`: SQRTSS of -1 (IE), 1 + the smallest denormal (DE, PE), 1 / 0 (ZE), FLT_MAX * 2 (OE, PE), FLT_MIN * FLT_MIN
       (UE, PE), 1 + 2^-30 (PE), the last by VSTMXCSR; and IE, ZE and PE raised in three blocks (a JMP, then a CPUID between):
-      all three stored.
+      all three stored. On a host without AFP in fast mode (the run's report) the DE of the denormal step is excluded
+      (`masked-sse-de`, tools/fp_deviations.py), the rest of its MXCSR exact.
     - `controls`: LDMXCSR of every flag set, of FTZ | RC 11 | DAZ, of RC 01: stored as loaded; DAZ with a denormal operand
       (no DE, exact); FTZ with FLT_MIN * 0.5 (zero, UE, PE); ZM unmasked with an inexact add (PE through the SIMD flag byte).
     - `place`: a store to an odd address and one crossing into the next page (the bytes, no fault); at CPL 3 with CR0.AM and
@@ -1325,7 +1326,7 @@ def stmxcsr(a, report):
                 f'memory {OUT:#x} {bytes(0x400).hex()}\nmemory {FX:#x} {bytes(512 * len(steps)).hex()}\nregion 0x3e0000 0x10000\n{extra_lines}')
         tag = f'{name}-cpl{cpl}-{block}'
         _, out, err = driver(a, text, a.out / 'stmxcsr' / tag, [block] if block else [])
-        problems = []
+        problems, excluded = [], set()
         if not out:
             problems.append(f'driver: {err}')
         else:
@@ -1339,12 +1340,19 @@ def stmxcsr(a, report):
                     problems.append(f"stop {out['stop']} {out.get('reason')} rip {out.get('rip')} fault {out.get('fault')}")
                 for k, (ctl, op, store, want) in enumerate(steps):
                     got, banked = word(OUT + 4 * k), word(FX + 512 * k + 24)
-                    if (got, banked) != (want, want):
-                        problems.append(f'step {k} ({op.splitlines()[-1]}, {store}): stored {got:#x}, FXSAVE {banked:#x}, want {want:#x}')
+                    # A documented deviation (tools/fp_deviations.py) where the run's own report says no AFP and fast mode: a
+                    # step tagged masked-sse-de leaves only its DE bit out of the comparison (reported as excluded, never
+                    # expected wrong); every other bit is exact, and the whole value on an AFP host or in accurate mode.
+                    cls = dev.tag_mxcsr(True, ctl, want)
+                    mask = ~dev.DE if cls and dev.applies(out) else ~0
+                    if mask != ~0: excluded.add(cls)
+                    if got is None or banked is None or (got & mask, banked & mask) != (want & mask, want & mask):
+                        problems.append(f'step {k} ({op.splitlines()[-1]}, {store}): stored {got and hex(got)}, FXSAVE {banked and hex(banked)}, want {want:#x}'
+                                        + (f' (DE excluded: {cls})' if mask != ~0 else ''))
             if out['stats']['decodes'].get(f'{0x20:#x}') or out['stats']['decodes'].get(f'{0x33:#x}'):
                 problems.append(f"STMXCSR/VSTMXCSR decoded: {out['stats']['decodes']}")
-        runs.append({'case': tag, 'ok': not problems, 'problems': problems})
-        print(json.dumps(runs[-1]), flush=True)
+        runs.append({'case': tag, 'ok': not problems, 'problems': problems, **({'excluded': sorted(excluded)} if excluded else {})})
+        print(json.dumps(runs[-1]) + (f" excluded: {', '.join(sorted(excluded))}" if excluded else ''), flush=True)
         if problems: failures.append(f'stmxcsr {tag}: {problems}')
     R = 0x1f80
     flags = [(R, ops['ie'], 'stmxcsr', R | 0x01), (R, ops['de'], 'stmxcsr', R | 0x22), (R, ops['ze'], 'stmxcsr', R | 0x04),
