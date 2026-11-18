@@ -30,9 +30,12 @@ Cases (the guest kernel has CONFIG_EFI_PARTITION=y and CONFIG_MSDOS_PARTITION=y 
   host-full      the image lives on a 32 MiB APFS disk image (hdiutil, no sudo): p1 ext4 is written first, then
                  O_DIRECT writes to the raw p2 exhaust the host volume (pwrite ENOSPC): the guest's dd gets EIO, the
                  kernel logs `I/O error, dev vda`, a FLUSH afterwards and later reads of p1 succeed, S5 succeeds and a
-                 relaunch reads p1. (Had the full volume failed an fsync instead, every later FLUSH and S5 would fail,
-                 correctly: a host sync failure is sticky, crates/host/src/virtio/block.rs. APFS reports ENOSPC at
-                 pwrite, so they succeed.)
+                 relaunch reads p1. Whether the full volume then also fails the FLUSH's host fsync depends on the
+                 host (APFS needs metadata space for it; seen both ways on one Mac): if it does, that FLUSH fails
+                 and, a host sync failure being sticky (crates/host/src/virtio/block.rs), S5's final sync fails
+                 too: the write launch must then log the one sticky refusal and end with that typed stop (exit 1).
+                 A 2 MiB ballast file on the volume is deleted before the relaunch: with space back, the host can
+                 commit what the full volume could not, so the relaunch's final sync succeeds either way.
   trim           DISCARD and WRITE_ZEROES end to end on the gpt image's unused third partition: a 1 MiB pattern, then
                  `blkdiscard` (BusyBox: DISCARD) over 128 KiB and a BLKZEROOUT ioctl (a tiny static program, ZEROOUT; BusyBox
                  has no -z) over an unaligned range, and `fstrim` on the mounted ext4; the host's image bytes are exact
@@ -134,6 +137,9 @@ STOP = {'reboot-acpi': ('natemu: Power(2)', 2), 'reboot-kbd': ('natemu: Power(2)
         'reboot-triple': ('natemu: Resident { stop: 16, status: 1, detail: 16 }', 2)}
 # natemu's stderr line for each failed host call (block.rs), by write launch; none anywhere else.
 BACKEND_ERRORS = {'host-full': 'virtio-block: No space left on device (os error 28)', 'host-limit': 'virtio-block: File too large (os error 27)'}
+# host-full when the host's fsync failed too: the sticky refusal (logged once) and the stop of the final sync it refuses.
+STICKY = 'virtio-block: an earlier host sync of this disk failed: every later sync of this launch fails'
+STICKY_STOP = ('natemu: disk shutdown full-sync: an earlier host sync of this disk failed', 1)
 # trim: the third partition's pattern (1 MiB of fixture a), a DISCARD range and a ZEROOUT range, in bytes from its start.
 TRIM_DISCARD, TRIM_ZERO = (262144, 131072), (524800, 201216)
 PARTS = {  # (first sector, sectors, GPT name) for gpt/mbr
@@ -588,13 +594,15 @@ def judge(case, phase, text, host, expect, pci=False):
     require(not host['timeout'], 'VM timed out')
     if pci: errors += pci_errors(text, 'COV', 2, ('block',))
     reboot = case.startswith('reboot-') and phase == 'write'
-    stop, rc = STOP.get(case, POWEROFF) if phase == 'write' else POWEROFF
+    failed_calls = host['backend_errors']
+    sticky = phase == 'write' and case == 'host-full' and STICKY in failed_calls
+    stop, rc = STICKY_STOP if sticky else STOP.get(case, POWEROFF) if phase == 'write' else POWEROFF
     require(host['stop'] == stop and host['rc'] == rc, f"stop {host['stop']!r} rc={host['rc']}, expected {stop!r} rc={rc}")
     require(host['fsck'] == [0] * len(ext4_offsets(case)) or reboot, f"offline e2fsck results {host['fsck']}")
-    failed_calls = host['backend_errors']
     if phase == 'write' and case == 'host-limit': require(failed_calls == [BACKEND_ERRORS[case]] * 3, f'host call failures {failed_calls}')
     elif phase == 'write' and case == 'host-full':
-        require(len(failed_calls) >= 1 and set(failed_calls) == {BACKEND_ERRORS[case]}, f'host call failures {failed_calls}')
+        require(failed_calls.count(BACKEND_ERRORS[case]) >= 1 and failed_calls.count(STICKY) == sticky
+                and set(failed_calls) <= {BACKEND_ERRORS[case], STICKY}, f'host call failures {failed_calls}')
     else: require(not failed_calls, f'host call failures {failed_calls}')
     if not reboot:
         require(one(r'^COV-PASS case=(\S+) phase=(\S+)$') == (case, phase), 'guest did not finish')
@@ -664,7 +672,7 @@ def judge(case, phase, text, host, expect, pci=False):
     elif case == 'host-full':
         if phase == 'write':
             full = one(r'^COV-HOSTFULL dd_rc=(\d+) eio=(\d) flush_rc=(\d+) ioerr_logs=(\d+)$')
-            require(full is not None and full[0] != '0' and full[1:3] == ('1', '0') and int(full[3]) >= 1,
+            require(full is not None and full[0] != '0' and full[1:3] == ('1', str(int(sticky))) and int(full[3]) >= 1,
                     f'host ENOSPC not seen as an I/O error, or FLUSH failed ({full})')
         else: require(io_errors == 0, 'I/O errors logged on relaunch')
         require(one(r'^COV-DATA a=(\S+)$') == expect['a'], 'data written before the failure differs')
@@ -1188,7 +1196,9 @@ def run_case(args, case):
         image = (volume or work) / ('disk.qcow2' if qcow else 'disk.raw'); scratch = work / 'view.raw'
         overlay = work / 'base.raw' if case == 'overlay' else None    # the overlay's base; natemu creates the overlay
         if overlay: checked(['cp', '-c', args.prepared / IMAGE[base], overlay], work / 'clone.log'); base_sha = digest(overlay)
-        elif volume: sparse_copy(args.prepared / IMAGE[base], image)
+        elif volume:
+            sparse_copy(args.prepared / IMAGE[base], image)
+            with (volume / 'ballast').open('xb') as f: f.write(bytes(2 * MiB)); os.fsync(f.fileno())
         elif qcow: qcow2_convert(args.prepared / IMAGE[base], image, 'qcow2', 'preallocation=metadata')
         else: checked(['cp', '-c', args.prepared / IMAGE[base], image], work / 'clone.log')
         total = os.path.getsize(args.prepared / IMAGE[base]) // SECTOR
@@ -1196,6 +1206,7 @@ def run_case(args, case):
         start_clusters = qcow2_problems(image)[1].get('allocated-clusters') if qcow and not overlay else None
         expect = expected_values()
         for phase in ('write', 'verify'):
+            if volume and phase == 'verify': (volume / 'ballast').unlink()
             launch_dir = work / phase; launch_dir.mkdir()
             if overlay and not image.exists(): before = base_sha    # the new overlay reads as its base
             else:
@@ -1351,6 +1362,15 @@ def self_check():
     good = text('host-full', 'write').replace('dd_rc=1 eio=1', 'dd_rc=0 eio=0').replace('ioerr_logs=4', 'ioerr_logs=0')
     host = {'rc': 0, 'timeout': False, 'stop': POWEROFF[0], 'changed': True, 'fsck': [0], 'table': True, 'exact': None, 'backend_errors': []}
     assert judge('host-full', 'write', good, host, expect); controls += 1
+    # host-full when the host fsync failed too: FLUSH fails, one sticky refusal, S5's sync refused.
+    good = text('host-full', 'write').replace('flush_rc=0', 'flush_rc=1')
+    host = {'rc': STICKY_STOP[1], 'timeout': False, 'stop': STICKY_STOP[0], 'changed': True, 'fsck': [0], 'table': True, 'exact': None,
+            'backend_errors': [BACKEND_ERRORS['host-full']] * 2 + [STICKY]}
+    assert not judge('host-full', 'write', good, host, expect), judge('host-full', 'write', good, host, expect)
+    for bad_text, bad_host in ((good.replace('flush_rc=1', 'flush_rc=0'), host), (good, dict(host, stop=POWEROFF[0], rc=0)),
+                               (good, dict(host, backend_errors=host['backend_errors'] + [STICKY])), (good, dict(host, backend_errors=[STICKY])),
+                               (good, dict(host, backend_errors=host['backend_errors'][:-1]))):
+        assert judge('host-full', 'write', bad_text, bad_host, expect); controls += 1
     # Exact-image oracle and table helpers.
     image = limit_image(); a, b, p = fixtures()
     assert image[PATTERN_AT:LIMIT] == b[:2048] and image[LIMIT:PATTERN_AT + 65536] == p[2048:] and image[4 * MiB:PATTERN_AT] == bytes(PATTERN_AT - 4 * MiB)
