@@ -338,7 +338,7 @@ def main():
         state, err = run('tiny-cache', program, ['--code-cache', '1'])
         ok = state is None and 'must hold the largest block' in err
         failures += not ok
-        out.append({'name': 'tiny-cache', 'stderr': err})
+        out.append({'name': 'tiny-cache', 'diffs': [] if ok else ['check failed (see the log)'], 'stderr': err})
         print(f"tiny-cache --code-cache 1: {'match' if ok else 'fail'} {err}")
 
     # Linking (S2c): once a hot loop's edges are linked it runs without entering the resident, so N and 2N iterations
@@ -363,7 +363,7 @@ def main():
             print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
         ok = len(counts) == 2 and counts[0] == counts[1] and counts[0][2] > 0
         failures += not ok
-        out.append({'name': 'hot-loop-entries', 'args': args, 'counts': counts})
+        out.append({'name': 'hot-loop-entries', 'diffs': [] if ok else ['check failed (see the log)'], 'args': args, 'counts': counts})
         print(f"hot loop {' '.join(args)}: {'match' if ok else 'fail'} (resident entries, linker entries, linked) at N, 2N: {counts}")
 
     if shard.last(a.shard):   # the one-off checks
@@ -373,7 +373,7 @@ def main():
         state, err = run('forged-exit', program, ['--forge-exit'])
         ok = state is not None and state['stop'] == 'resident' and state['reason'].startswith('bad_reply') and state['stats']['links'] == 0
         failures += not ok
-        out.append({'name': 'forged-exit', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+        out.append({'name': 'forged-exit', 'diffs': [] if ok else ['check failed (see the log)'], 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
         print(f"forged-exit: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']}")
 
         # Run-time tampering (driver options): what admission and the resident never produce must be caught. A host-supplied
@@ -384,23 +384,24 @@ def main():
         state, err = run('tamper-offset', program, flush_args + ['--tamper', 'offset'])
         ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_reply')
         failures += not ok
-        out.append({'name': 'tamper-offset', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+        out.append({'name': 'tamper-offset', 'diffs': [] if ok else ['check failed (see the log)'], 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
         print(f"tamper offset: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
         for kind in ('word', 'record'):
             state, err = run(f'tamper-{kind}', program, flush_args + ['--tamper', kind])
             ok = state is not None and state['tampered'] and state['stop'] == 'resident' and state['reason'].startswith('bad_link')
             failures += not ok
-            out.append({'name': f'tamper-{kind}', 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
+            out.append({'name': f'tamper-{kind}', 'diffs': [] if ok else ['check failed (see the log)'], 'stop': state and state['stop'], 'reason': state and state['reason'], 'stderr': err})
             print(f"tamper {kind} before a flush: {'match' if ok else 'fail'} {state and state['stop']} {state and state['reason']} {err}")
             small, _, _ = add_chain(3, 40)
             state, err = run(f'tamper-after-{kind}', small, ['--tamper-after', kind])
             ok = state is not None and state['tampered'] and state['stop'] == 'reached' and state['links_check'] != 'ok'
             failures += not ok
-            out.append({'name': f'tamper-after-{kind}', 'links_check': state and state['links_check'], 'stderr': err})
+            out.append({'name': f'tamper-after-{kind}', 'diffs': [] if ok else ['check failed (see the log)'], 'links_check': state and state['links_check'], 'stderr': err})
             print(f"tamper {kind} after the run: {'match' if ok else 'fail'} host self-check: {state and state['links_check']} {err}")
         state, err = run('untampered', add_chain(3, 40)[0], [])
         ok = state is not None and state['links_check'] == 'ok' and not state['tampered']
         failures += not ok
+        out.append({'name': 'untampered', 'diffs': [] if ok else ['check failed (see the log)']})
         print(f"untampered: {'match' if ok else 'fail'} {state and state['links_check']}")
 
         # The watchdog stops a loop that never ends (no host exit after its first block; linked, it never leaves the code).
@@ -408,7 +409,7 @@ def main():
         state, err = run('spin', spin, ['--watchdog-ms', '300'])
         ok = state is not None and state['stop'] == 'watchdog' and state['stats']['linked'] == 1
         failures += not ok
-        out.append({'name': 'spin', 'stop': state and state['stop'], 'stats': state and state['stats'], 'stderr': err})
+        out.append({'name': 'spin', 'diffs': [] if ok else ['check failed (see the log)'], 'stop': state and state['stop'], 'stats': state and state['stats'], 'stderr': err})
         print(f"spin --watchdog-ms 300: {'match' if ok else 'fail'} {state and state['stop']} {state and state['stats']}")
 
     # Self-modifying code (S2e). Each program runs in the VM with its code pages writable (regions over the code holding
@@ -439,6 +440,12 @@ def main():
             out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
             print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")
     (a.out / 'probes.json').write_text(json.dumps(out, indent=1) + '\n')
+    seen, results = {}, []     # per-case results, one per entry (a name repeats with its arguments)
+    for e in out:
+        label = ' '.join([e['name'], *map(str, e.get('args') or [])])
+        seen[label] = seen.get(label, 0) + 1
+        results.append({'name': label if seen[label] == 1 else f'{label} #{seen[label]}', 'outcome': 'fail' if e['diffs'] else 'match', 'diffs': e['diffs']})
+    (a.out / 'results.json').write_text(json.dumps({'results': results}, indent=1) + '\n')
     print(f'{len(out) - failures} match, {failures} fail')
     sys.exit(1 if failures else 0)
 

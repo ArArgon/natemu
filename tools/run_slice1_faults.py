@@ -1077,7 +1077,7 @@ def evaluate(case, out):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('programs', type=pathlib.Path, nargs='*', default=[ROOT / 'fixtures/slice1/programs.json'])
+    ap.add_argument('programs', type=pathlib.Path, nargs='*', help='program files (default: the slice-1 corpus, generated into --out by tools/reference/gen_slice1.py with the manifest seed)')
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--max-block', type=int)
@@ -1088,8 +1088,13 @@ def main():
     shard.add(ap)
     a = ap.parse_args()
     host, runtime = vm.build()
-    programs = [p for f in a.programs for p in json.loads(f.read_text())['programs']]
     a.out.mkdir(parents=True, exist_ok=True)
+    if not a.programs:      # the slice-1 corpus is generated (seeded, as fixtures/slice1/manifest.json), never read from a stored file
+        gen_out = a.out / 'slice1-programs.json'
+        seed = json.loads((ROOT / 'fixtures/slice1/manifest.json').read_text())['generator']['seed']
+        subprocess.run([sys.executable, '-B', str(ROOT / 'tools/reference/gen_slice1.py'), '-o', gen_out, '--seed', str(seed)], check=True, stdout=subprocess.DEVNULL)
+        a.programs = [gen_out]
+    programs = [p for f in a.programs for p in json.loads(f.read_text())['programs']]
     cases = expectations(programs, [] if a.no_probes else probes(not a.no_window), a.out / 'ref', paging=not a.no_paging)
     if a.only: cases = [c for c in cases if a.only in c[0]]
     cases = shard.take(cases, a.shard)
@@ -1121,6 +1126,7 @@ def main():
                 cells.setdefault(key, {}).setdefault(e['outcome'], 0); cells[key][e['outcome']] += 1
                 break
     (a.out / 'faults.json').write_text(json.dumps({'counts': counts, 'kinds': kinds, 'cells': cells, 'at_access': at_access, 'results': results}, indent=1) + '\n')
+    (a.out / 'results.json').write_text(json.dumps({'results': [{'name': e['case'], 'outcome': e['outcome'], 'diffs': e['diffs']} for e in results]}, indent=1) + '\n')
     print(json.dumps(kinds, indent=1)); print(f'{len(cells)} paging cells:', json.dumps(cells)); print('cells faulting at the access under test:', json.dumps(at_access)); print(counts)
     sys.exit(1 if counts['fail'] else 0)
 

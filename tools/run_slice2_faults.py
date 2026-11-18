@@ -206,6 +206,8 @@ def main():
         print(f'[{size}] {counts} matched faults {kinds["fault"]} ({deep} after more than 50 executed instructions), matched runs to the end {kinds["end"]}', flush=True)
         failures += counts['fail'] + counts['unsupported']
     (a.out / 'faults.json').write_text(json.dumps({'results': report}, indent=1) + '\n')
+    (a.out / 'results.json').write_text(json.dumps({'results': [{'name': f"{e['case']} [{e['size']}]", 'outcome': e['outcome'], 'diffs': e['diffs']}
+                                                                for e in report]}, indent=1) + '\n')
     sys.exit(1 if failures else 0)
 
 
