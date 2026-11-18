@@ -24,6 +24,14 @@ listed last; natemu bugs are recorded here, not fixed.
 - **QEMU system mode was unpinned:** Homebrew's `qemu-system-x86_64` is 11.1.3 on the M2 Max and 11.1.2 on the M4, while
   the runners' known-departure lists assume 11.1.2. testkit now builds 11.1.2 from its signed release tarball.
 
+- **Rosetta is not a reference (checked November 18):** the 1,374 straight-line programs of the programs and fp families,
+  run through Rosetta in an amd64 container (`tools/reference/ref_native.py --rosetta`), agree with the locked answer in
+  451, differ in 461 and crash in 462. Crashes are SIGILL for instructions it lacks (SHA, ADX, XSAVEC, the FS/GS-base and
+  66-branch corpora, parts of i9/i10/rex and the AVX corpora). In the integer fixtures every difference is RFLAGS.AF
+  (bit 4): Rosetta leaves the auxiliary carry flag clear where x86 sets it. Its ELF loader also needs the first PT_LOAD at
+  file offset 0, which Linux and QEMU do not (`rosetta_elf` adapts the harness ELF). Usable for quick experiments, not
+  for answers.
+
 ## Test-side defects fixed
 
 - Four `natemu-abi` fptrap tests compared with the M4's FPCR.AH/FIZ/NEP, which a host without FEAT_AFP ignores: they are
