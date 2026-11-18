@@ -780,6 +780,23 @@ mod native {
         }};
     }
 
+    /// Whether this host has FEAT_AFP (`sysctl hw.optional.arm.FEAT_AFP` = 1; absent or unreadable: no). The M4-comparison tests set
+    /// FPCR.AH, FIZ and NEP, which a host without it ignores (RES0), so their reference run would be the M2's arithmetic, not the M4's:
+    /// on such a host they are skipped, with a line naming the test.
+    fn afp_host(test: &str) -> bool {
+        unsafe extern "C" {
+            fn sysctlbyname(name: *const core::ffi::c_char, old: *mut core::ffi::c_void, len: *mut usize, new: *mut core::ffi::c_void, newlen: usize) -> i32;
+        }
+        let (mut value, mut len) = (0i32, core::mem::size_of::<i32>());
+        // SAFETY: a NUL-terminated name; `value` and `len` describe a writable 4-byte buffer; no new value is set.
+        let rc = unsafe { sysctlbyname(c"hw.optional.arm.FEAT_AFP".as_ptr(), (&raw mut value).cast(), &mut len, core::ptr::null_mut(), 0) };
+        let afp = rc == 0 && len == core::mem::size_of::<i32>() && value == 1;
+        if !afp {
+            eprintln!("{test}: skipped, this host lacks FEAT_AFP (the reference run needs the M4's FPCR.AH/FIZ/NEP)");
+        }
+        afp
+    }
+
 
     // ---- Chunk 6b: the same runs through the resident's instruction table ----
     unsafe extern "C" {
@@ -1021,6 +1038,9 @@ mod native {
 
     #[test]
     fn under_ftz_alone_the_patch_flushes_the_band_like_the_m4s_fz() {
+        if !afp_host("under_ftz_alone_the_patch_flushes_the_band_like_the_m4s_fz") {
+            return;
+        }
         let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
         let forms: &[(&str, Form, usize, usize, usize, bool)] = &[
             ("fmul s", form!("fmul s1, s2, s3"), 4, 4, 1, false),
@@ -1112,6 +1132,9 @@ mod native {
 
     #[test]
     fn under_daz_and_ftz_the_patch_flushes_like_the_m4s_fiz_and_fz() {
+        if !afp_host("under_daz_and_ftz_the_patch_flushes_like_the_m4s_fiz_and_fz") {
+            return;
+        }
         let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
         let forms: &[(&str, Form, usize, usize, usize, bool)] = &[
             ("fmul s", form!("fmul s1, s2, s3"), 4, 4, 1, false),
@@ -1171,6 +1194,9 @@ mod native {
 
     #[test]
     fn patched_words_match_the_m4s_afp_flags() {
+        if !afp_host("patched_words_match_the_m4s_afp_flags") {
+            return;
+        }
         let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(4000);
         let patched: &[(&str, Form, usize, bool)] = &[
             ("fmul s", form!("fmul s1, s2, s3"), 4, false),
@@ -1308,6 +1334,9 @@ mod native {
 
     #[test]
     fn patched_nan_lanes_match_the_m4s_ah1() {
+        if !afp_host("patched_nan_lanes_match_the_m4s_ah1") {
+            return;
+        }
         let n: u32 = std::env::var("ORACLE_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
         let forms: &[(&str, Form, usize)] = &[
             ("fmul s", form!("fmul s1, s2, s3"), 4),
