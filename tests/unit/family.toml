@@ -18,6 +18,16 @@ params = { tool = "nextest", fexc = true }
 needs = { cores = "all" }
 
 [[suite]]
+name = "rust-afp"
+# Rust tests that compare with the M4's FEAT_AFP hardware: #[ignore]d everywhere (reported as skipped by the rust suites),
+# run here only on a host that has AFP (they cannot be emulated by hiding a feature).
+kind = "units"
+harness = "units"
+params = { tool = "nextest", args = ["--run-ignored", "only", "-E", "test(/::native::.*m4s/)"] }
+matrix = { "host.afp" = [true] }
+needs = { cores = "all" }
+
+[[suite]]
 name = "python"
 kind = "units"
 harness = "units"

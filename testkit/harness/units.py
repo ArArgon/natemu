@@ -82,7 +82,8 @@ class Units:
         env['PATH'] = f'{artifacts.nextest().parent}:{env["PATH"]}'
         env['NEXTEST_EXPERIMENTAL_LIBTEST_JSON'] = '1'
         r = subprocess.run(['cargo', '+1.97.0', 'nextest', 'run', '--offline', '--locked', '--no-fail-fast',
-                            '--message-format', 'libtest-json'], cwd=paths.repo_root(), env=env, capture_output=True, text=True)
+                            '--message-format', 'libtest-json', *it.suite.params.get('args', [])],
+                           cwd=paths.repo_root(), env=env, capture_output=True, text=True)
         subs = parse_libtest_json(r.stdout)
         if not subs:
             return CaseResult('failed', f'nextest ran no tests (exit {r.returncode}):\n{r.stderr[-3000:]}')
