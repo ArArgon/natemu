@@ -168,6 +168,8 @@ def main():
         for x in v:
             print('  ', x)
     (o.out / 'l2-iasl.json').write_text(json.dumps(report, indent=1))
+    (o.out / 'results.json').write_text(json.dumps({'results': [   # per-case rows for the framework
+        {'name': f'n{n}', 'outcome': 'fail' if v else 'match', 'diffs': list(map(str, v))} for n, v in report.items()]}, indent=1))
     sys.exit(1 if any(report.values()) else 0)
 
 

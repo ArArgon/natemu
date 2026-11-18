@@ -53,6 +53,9 @@ def main():
         for v in bad:
             print('  ', v)
     (o.out / 'l2.json').write_text(json.dumps(report, indent=1, default=str))
+    (o.out / 'results.json').write_text(json.dumps({'results': [   # per-case rows for the framework
+        {'name': k, 'outcome': 'fail' if r['violations'] else 'match', 'diffs': list(map(str, r['violations']))}
+        for k, r in report.items()]}, indent=1))
     sys.exit(1 if fail else 0)
 
 

@@ -1252,6 +1252,12 @@ def run_case(args, case):
     return result
 
 
+def case_row(r):
+    """A result as a per-case row of results.json ({'results': [{name, outcome, diffs, ...}]}); a control passes when its judge rejects it."""
+    errors = [f"{l['phase']}: {e}" for l in r['launches'] for e in l['errors']]
+    return dict(r, name=r['case'], outcome='match' if r['pass'] else 'fail', diffs=[] if r['pass'] else errors or ['no launch passed both phases'])
+
+
 def run(args):
     args.out = args.out.resolve(); args.out.mkdir(parents=True, exist_ok=False)
     args.inputs = args.inputs.resolve(strict=True)
@@ -1271,7 +1277,7 @@ def run(args):
         if not os.environ.get('NATEMU_VM_LOCK_HELD'):   # run_suite holds it for its steps (a serial step's exclusive lock would block this)
             fcntl.flock(lock, fcntl.LOCK_SH)    # correctness only: shared with other correctness runs (tools/vmlock.py)
         for case in args.cases:
-            results.append(run_case(args, case)); write_json(args.out / 'results.json', results)
+            results.append(run_case(args, case)); write_json(args.out / 'results.json', {'results': [case_row(r) for r in results]})
             print(f"{case}: {'PASS' if results[-1]['pass'] else 'FAIL'}", flush=True)
     for name in ('gpt.raw', 'mbr.raw', 'hostfull.raw', 'data.raw', 'limit.raw'): (args.prepared / name).unlink()
     return 0 if all(r['pass'] for r in results) else 1

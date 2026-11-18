@@ -539,6 +539,7 @@ def run(args):
                     drops = re.findall(r'^net (\{.*\})$', perf.read_text(errors='replace'), re.M) if perf.exists() else []
                     results.append({'case': case, 'vcpus': vcpus, 'exit': code, 'seconds': round(elapsed, 2),
                                     'pass': not reasons, 'reasons': reasons, 'speeds': speeds,
+                                    'name': f'{case}-n{vcpus}', 'outcome': 'fail' if reasons else 'match', 'diffs': reasons,
                                     'drops': json.loads(drops[-1]) if drops else None})
                     print(f"{case} n={vcpus}: {'PASS' if not reasons else 'FAIL ' + '; '.join(reasons)} ({elapsed:.1f} s)"
                           + (f" drops {results[-1]['drops']}" if results[-1]['drops'] else ''), flush=True)

@@ -900,7 +900,8 @@ def main():
         if not args.no_lock: fcntl.flock(lock, fcntl.LOCK_EX if set(args.cases) & set(TIMED) else fcntl.LOCK_SH)
         for case in args.cases:
             result = run_case(args, case); results.append(result)
-            (args.out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+            rows = [dict(r, name=r['case'], outcome='match' if r['pass'] else 'fail', diffs=r['errors']) for r in results]   # per-case rows for the framework
+            (args.out / 'results.json').write_text(json.dumps({'results': rows}, indent=2) + '\n')
             if not result['pass']: break
     return 0 if len(results) == len(args.cases) and all(r['pass'] for r in results) else 1
 

@@ -244,6 +244,9 @@ def main():
         for r in bad:
             print('  FAIL', json.dumps(r))
     (o.out / 'l1.json').write_text(json.dumps(report, indent=1))
+    (o.out / 'results.json').write_text(json.dumps({'results': [   # per-case rows for the framework
+        {'name': f"{mode}/{r['case']}", 'outcome': 'match' if r['ok'] else 'fail', 'diffs': [] if r['ok'] else [json.dumps(r, default=str)]}
+        for mode, rs in report.items() for r in rs]}, indent=1))
     sys.exit(1 if any(not r['ok'] for v in report.values() for r in v) else 0)
 
 
