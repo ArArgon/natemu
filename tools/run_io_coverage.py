@@ -528,7 +528,8 @@ def prepare(out, inputs, transport='mmio', kernel_deb=None):
                 assert depends in ('', 'cdrom'), (name, depends)
                 dest = tree / 'lib/modules' / KVER / rel
                 dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(data)
-                with (tree / 'lib/modules' / KVER / 'modules.dep').open('a') as f:
+                dep = tree / 'lib/modules' / KVER / 'modules.dep'; dep.chmod(dep.stat().st_mode | 0o200)   # copied from a read-only input root
+                with dep.open('a') as f:
                     f.write(f'{rel}: ' + ('kernel/drivers/cdrom/cdrom.ko' if depends else '') + '\n')
     (tree / 'init').write_text(INIT_PCI if transport == 'pci' else INIT); (tree / 'init').chmod(0o755)
     spec = importlib.util.spec_from_file_location('mkcpio', ROOT / 'tools/play/mkcpio.py')
