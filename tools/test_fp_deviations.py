@@ -1,4 +1,4 @@
-"""Accurate-FP plan chunk 0: the deviation registry, README's list of it, the judging rule, and each runner's no-VM self-check."""
+"""Accurate-FP plan chunk 0: the deviation registry, docs/floating-point.md's list of it, the judging rule, and each runner's no-VM self-check."""
 import json, os, pathlib, re, sys, unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
@@ -7,9 +7,9 @@ import fp_deviations as dev
 RAW = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT', ROOT.parent / 'natemu-raw'))
 
 
-def readme_list():
-    text = (ROOT / 'README.md').read_text()
-    body = text.split('### Floating point on Macs without AFP (fast mode)\n', 1)[1].split('\n#', 1)[0]
+def readme_list():   # (the list moved from the README to docs/floating-point.md)
+    text = (ROOT / 'docs/floating-point.md').read_text()
+    body = text.split('## Fast mode on a Mac without FEAT_AFP\n', 1)[1].split('\n#', 1)[0]
     return dict(re.findall(r'^- `([a-z-]+)`: (.*)$', body, re.M))
 
 
