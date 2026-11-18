@@ -29,6 +29,9 @@ def main(argv: list[str]) -> int:
     if argv[:2] == ['-m', 'pytest']:
         import pytest
         return pytest.main(argv[2:])
+    if argv and argv[0] in COMMANDS:            # everything after the command goes to it (pytest options included)
+        from testkit import cli
+        return cli.dispatch(argv[0], argv[1:])
     ap = argparse.ArgumentParser(prog='natemu-test', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='command', required=True)
     for name, help_ in COMMANDS.items():

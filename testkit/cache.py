@@ -95,6 +95,15 @@ def _rmtree(p: pathlib.Path) -> None:
     shutil.rmtree(p, onexc=fix)
 
 
+def entry_of(p: pathlib.Path) -> pathlib.Path | None:
+    """The cache entry folder containing `p`, or None when `p` is outside the cache."""
+    try:
+        rel = pathlib.Path(p).resolve().relative_to(paths.cache_root().resolve())
+    except ValueError:
+        return None
+    return paths.cache_root() / rel.parts[0] / rel.parts[1] if len(rel.parts) >= 2 else None
+
+
 def _leases_dir() -> pathlib.Path:
     return paths.state_dir() / 'leases'
 

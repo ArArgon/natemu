@@ -67,11 +67,15 @@ class Pool:
                 st.waiting.append(req)
 
     def poll(self, req_id: str) -> Grant | None:
+        return self.poll_many([req_id]).get(req_id)
+
+    def poll_many(self, ids: list[str]) -> dict:
+        """One decision for the whole machine; the grants (held) among `ids`."""
+        wanted = set(ids)
         now = time.time()
         with self._state() as st:
             busy = False
-            if window_pending(st, self.cfg, now) and not any(g.core_class != 'X' for g in st.held) \
-                    and not any(g.core_class == 'X' for g in st.held):
+            if window_pending(st, self.cfg, now) and not st.held:
                 busy = bool(external_busy())
             self.last_external = busy
             d = decide(st, self.cfg, now, external_busy=busy)
@@ -79,7 +83,7 @@ class Pool:
             for r, cls in d.grants:
                 st.waiting = [w for w in st.waiting if w.id != r.id]
                 st.held.append(Grant(r, now, cls))
-            return next((g for g in st.held if g.request.id == req_id), None)
+            return {g.request.id: g for g in st.held if g.request.id in wanted}
 
     def release(self, req_id: str) -> None:
         with self._state() as st:

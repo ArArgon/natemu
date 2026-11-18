@@ -28,6 +28,8 @@ def argparse_hidden():
 
 def pytest_configure(config):
     config.pluginmanager.register(Summary(), 'testkit-summary')
+    import importlib
+    config.pluginmanager.register(importlib.import_module('testkit.runloop'), 'testkit-runloop')
     for m in ('smoke: a smoke case', 'deterministic: locked answer', 'judged: judged by code', 'legacy: wrapped legacy step',
               'units: unit test suite'):
         config.addinivalue_line('markers', m)

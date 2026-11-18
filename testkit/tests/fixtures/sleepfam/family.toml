@@ -1,0 +1,29 @@
+[family]
+name = "sleepfam"
+
+[[suite]]
+name = "shared"
+kind = "judged"
+harness = "harness.py:Sleep"
+params = { n = 6, seconds = 0.3 }
+batch = 2
+
+[[suite]]
+name = "excl"
+kind = "judged"
+harness = "harness.py:Sleep"
+params = { n = 2, seconds = 0.3 }
+needs = { exclusive = true, why = "a timing bound" }
+
+[[suite]]
+name = "die"
+kind = "judged"
+harness = "harness.py:Sleep"
+params = { n = 2, seconds = 0.1, die = "c0" }
+batch = 2
+
+[[suite]]
+name = "needsbad"
+kind = "judged"
+harness = "harness.py:Sleep"
+params = { n = 1, seconds = 0.1, resource = "bad" }
