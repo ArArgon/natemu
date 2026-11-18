@@ -1,5 +1,5 @@
 """x86 AVX/FMA program simulator for the i8/i8b corpora with switchable NaN/flush models (see fp.py)."""
-import re, json, subprocess, os, struct
+import re, json, subprocess, os, struct, tempfile
 from fractions import Fraction as Fr
 import fp
 from fp import F16, F32, F64, cls, enc, rnd, rint, p2, floorlog2
@@ -56,13 +56,12 @@ def split_ops(s):
 def rip_lengths(prog):
     """instruction end addresses via clang+llvm-objdump (only needed for rip-relative operands)"""
     code = bytes.fromhex(prog['code'])
-    d = '/private/tmp/claude-501/-Users-liaozping-orca-natemu/b45b8060-227a-5c49-b86e-03a4068edd0d/scratchpad/ripwork'
-    os.makedirs(d, exist_ok=True)
-    s = d + '/p.s'; o = d + '/p.o'
-    open(s, 'w').write('.text\n.globl _f\n_f:\n.byte ' + ','.join(str(b) for b in code) + '\n')
-    subprocess.run(['clang', '-target', 'x86_64-apple-macos', '-c', s, '-o', o], check=True)
-    out = subprocess.run(['/Library/Developer/CommandLineTools/usr/bin/llvm-objdump', '-d', '--no-show-raw-insn', '--x86-asm-syntax=att', o],
-                         capture_output=True, text=True, check=True).stdout
+    with tempfile.TemporaryDirectory() as d:     # (was a fixed scratch folder of one session, shared by concurrent runs)
+        s = d + '/p.s'; o = d + '/p.o'
+        with open(s, 'w') as f: f.write('.text\n.globl _f\n_f:\n.byte ' + ','.join(str(b) for b in code) + '\n')
+        subprocess.run(['clang', '-target', 'x86_64-apple-macos', '-c', s, '-o', o], check=True)
+        out = subprocess.run(['/Library/Developer/CommandLineTools/usr/bin/llvm-objdump', '-d', '--no-show-raw-insn', '--x86-asm-syntax=att', o],
+                             capture_output=True, text=True, check=True).stdout
     addrs = []
     for line in out.splitlines():
         m = re.match(r'\s*([0-9a-f]+):\s', line)

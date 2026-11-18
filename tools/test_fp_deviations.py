@@ -1,11 +1,8 @@
 """Accurate-FP plan chunk 0: the deviation registry, docs/floating-point.md's list of it, the judging rule, and each runner's no-VM self-check."""
-import json, os, pathlib, re, sys, unittest
-from raw_root import RAW_ROOT
+import json, pathlib, re, sys, unittest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
 import fp_deviations as dev
-
-RAW = RAW_ROOT
 
 
 def readme_list():   # (the list moved from the README to docs/floating-point.md)
@@ -81,11 +78,18 @@ class Runners(unittest.TestCase):
         run_i8_faults.self_check()
 
     def test_corpora(self):
-        import run_slice1_vm
-        for n in ('01', '02'):
-            d = RAW / f'i8-corpus-20261030-{n}'
-            if not d.is_dir(): self.skipTest(f'no {d}')
-            run_slice1_vm.self_check(d / 'programs.json', d / 'expected.json')
+        """The corpora as gen_i8.py makes them now, in folders named by the predictions' keys, with answers from the model's QEMU
+        rules (they reproduce every QEMU answer: predict.py checks it): no raw-results folder is read."""
+        import shutil, tempfile, run_slice1_vm
+        sys.path.insert(0, str(ROOT / 'tools/models/afp_fp'))
+        import predict
+        if not shutil.which('clang'): self.skipTest('no clang: gen_i8.py assembles the i8 corpora with it')
+        with tempfile.TemporaryDirectory() as tmp:
+            for key in predict.CORPORA.values():
+                programs = predict.generate(key, tmp)
+                expected = programs.parent / 'expected.json'
+                expected.write_text(json.dumps({'results': [predict.model_result(p) for p in json.loads(programs.read_text())['programs']]}))
+                run_slice1_vm.self_check(programs, expected)
 
 
 if __name__ == '__main__': unittest.main()

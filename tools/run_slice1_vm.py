@@ -121,6 +121,11 @@ def run_program(host, runtime, fexc, p, expected, work, max_block=None, tagged=N
         entry['outcome'] = 'fail'
     return entry
 
+def corpus_key(programs):
+    """The predictions' key of a corpus: the name of the folder `programs` is in, as given (a symlinked corpus folder keeps its
+    name: resolving it would give the link target's)."""
+    return pathlib.Path(os.path.abspath(programs)).parent.name
+
 def self_check(programs, expected):
     """No VM: the corpus judging rule on synthetic reports of a corpus (`programs`, `expected` as the arguments of a run). A program
     tagged in the predictions is judged against the model's state: the documented state is `deviated`, the exact (QEMU) one fails, a
@@ -128,10 +133,13 @@ def self_check(programs, expected):
     program passes exactly and fails with one byte changed (a deviated state is no excuse)."""
     sys.path.insert(0, str(ROOT / 'tools/models/afp_fp'))
     import predict
-    tags = dev.corpus_deviations(programs.resolve().parent.name)
+    tags = dev.corpus_deviations(corpus_key(programs))
     progs = {p['name']: p for p in json.loads(programs.read_text())['programs']}
     exp = {r['name']: r for r in json.loads(expected.read_text())['results']}
     if not tags: sys.exit(f'{programs.parent.name}: no tagged programs in the predictions (nothing to check)')
+    stale = sorted(set(tags) - set(progs))
+    if stale: sys.exit(f'run_slice1_vm self-check FAILED: the predictions tag programs this corpus does not have (stale: '
+                       f'rerun tools/models/afp_fp/predict.py): {stale[:5]}')
     def report(p, gpr, rflags, rip, memory, **extra):
         pages = {}
         for addr, size in [(ref.num(p['rip']), len(p['code']) // 2)] + [(ref.num(m['addr']), len(m['data']) // 2) for m in memory]:
@@ -178,7 +186,7 @@ def main():
     a = ap.parse_args()
     if a.self_check: return self_check(a.programs, a.expected)
     if not (a.fexc and a.out): ap.error('--fexc and --out are required')
-    key = a.programs.resolve().parent.name
+    key = corpus_key(a.programs)
     tags = dev.corpus_deviations(key) if a.cpl is None else {}
     host, runtime = build()
     expected = {r['name']: r for r in json.loads(a.expected.read_text())['results']}
