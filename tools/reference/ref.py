@@ -12,7 +12,7 @@ GPR order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15.  All integers may be JSON nu
 "0x.." strings; this tool writes hex strings.  Every memory region is captured at the end.
 Execution is the code bytes followed by fallthrough into a capture sequence.  See README.md.
 """
-import argparse, hashlib, json, os, pathlib, re, sqlite3, struct, subprocess, sys, tempfile, uuid
+import argparse, hashlib, json, os, pathlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from raw_root import RAW_ROOT, STATE_ROOT
@@ -486,10 +486,12 @@ for d in /work/jobs/*; do
      echo "$rc" > rc)
 done
 ''')
+        # The reference binary is copied into the work folder (a mount source of this container alone): containers of
+        # concurrent runs that bind the same shared folder (the framework's input root) get "Permission denied" on it.
+        (workdir / 'reference').mkdir(exist_ok=True); shutil.copy2(qemu, workdir / 'reference' / qemu.name)
         args = ['container', 'run', '--rm', '--name', name, '--network', 'none', '--read-only', '--cpus', '2', '--memory', '512m',
                 '--mount', f'type=bind,source={workdir},target=/work',
-                '--mount', f'type=bind,source={qemu.parent},target=/reference,readonly',
-                '--workdir', '/work', APPLE_IMAGE, '/bin/sh', '/work/container_entry.sh', '/reference/' + qemu.name]
+                '--workdir', '/work', APPLE_IMAGE, '/bin/sh', '/work/container_entry.sh', '/work/reference/' + qemu.name]
         (workdir / 'container-command.json').write_text(json.dumps(args) + '\n')
         for f in (workdir / 'jobs').glob('*/rc'): f.unlink()
         for attempt in range(8):
