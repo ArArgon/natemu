@@ -1185,7 +1185,6 @@ Open, not investigated:
 - **A long locked qcow2 flush is still possible:** when the unlocked barrier is long and the guest keeps writing, the
   locked one has that much more (seen once, 4.75 s, at unmount with no write waiting). Removing it means copying the
   dirty tables under the lock and writing them outside it, a larger change to the vendored code.
-- **Not rerun on the M3** where it was reported.
 
 ## Future direct-payload work
 
