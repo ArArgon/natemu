@@ -1,0 +1,2 @@
+# External resources (docs/testing.md, spec R14). Each is fetched once per machine from the first URL that answers and
+# is used only if its sha256 matches. URLs are versioned or dated, never "latest". A vanished upstream means re-pinning here.
