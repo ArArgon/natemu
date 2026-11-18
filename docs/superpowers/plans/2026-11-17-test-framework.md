@@ -576,3 +576,19 @@ the M4; the November 17 spike showed the approach works. Measured on the M2 Max:
 reuse); all unit tests in 8 min; the smoke tier in 18 min, above the 10-minute target (the two full nextest passes take
 most of it). Not yet done: a full `--gate` run against `tools/run_suite.py` on the same commit, a run on the M4, x86
 answers for i8b's seven QEMU departures, a claim that keeps concurrent QEMU reference containers from timing out.
+
+### Verification on the M2 Max (November 18)
+
+- Full gate (`run --gate`): 44 min; 2,028 unit tests and 173 of 177 wrapped steps passed, 1,049 FP cases passed
+  (reused from an identical earlier run, re-checked against the lock), 1,164 AFP-on variants not runnable (no AFP here).
+  No failure came from the framework. The failures are natemu's behavior without AFP, from unchanged scripts:
+  the four AFP-dependent `natemu-abi` fptrap tests (also under plain `cargo test`), 24 i8 programs that deviate in fast
+  mode without a deviation tag and `i8-forms-044` in accurate mode (both as `tools/run_slice1_vm.py` reports them),
+  `i8-1` (the same programs at block size 1), `k2-stmxcsr` (the documented `masked-sse-de` deviation),
+  `i8-faults-m2a` (1 of 846: `chain3-movaps-mis` hits the watchdog in accurate mode), `system` (its QEMU_DIFFERS list
+  disagrees with this machine's QEMU), and `test_fp_deviations` (natemu-raw's corpus folder here is a symlink).
+- Benchmarks (`run --tier bench`): all 20 measured in 10.5 min while the gate run shared the machine; every guest
+  benchmark verified both runs, none contended. The guest image was built from `tools/bench/image` on the x86 box
+  (`ssh:ubuntu@192.168.12.10`) and its expected outputs equal the M4 reference image's.
+- Seen once, not again in the gate: two wrapped steps whose QEMU reference containers started at the same moment timed
+  out in Apple's container service (XPC timeout). A claim for reference-container starts would prevent it.
