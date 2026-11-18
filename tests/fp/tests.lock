@@ -11,6 +11,7 @@ output = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 fex_cases = []
 fingerprint = "0213420ca6202e923521f0fa08f665b1253ee7e2c13d9038c51330a2d8467767"
 input = "3301ce5d15f97269ab58c470af97be2b9ee9f880fbbc67dcc4d1fe72a24b57f7"
+model_cases = []
 reference = "qemu"
 x86_cases = [
     "i8-forms-044",
@@ -356,16 +357,18 @@ tool = "qemu: qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"
 
 [suite.i8b]
 fex_cases = []
-fingerprint = "38e16a4e0d9e4f7136461cd0d1d04013a6fb768caa5ce9a1c56695aff39de444"
+fingerprint = "6bc4b89c11b4656b0817635bdcefc6870bd660b62ec36a16f81cf07933400b8f"
 input = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
+model_cases = [
+    "i8-forms-045",
+    "i8-random-097",
+    "i8-random-111",
+]
 reference = "qemu"
 x86_cases = [
     "i8-forms-001",
-    "i8-forms-045",
     "i8-random-067",
     "i8-random-077",
-    "i8-random-097",
-    "i8-random-111",
     "i8-random-126",
 ]
 
@@ -495,7 +498,7 @@ i8-forms-041 = "6704095d45e715dbaf43e9ac20276593457049ef141bd0af8377eff398031267
 i8-forms-042 = "478656d72627824d10359fc0dd307b514c987d0abe74738f7f57e2722cd6bf80"
 i8-forms-043 = "e2029449770dfd939abf4f094670ed5f487d947cf35eff42e9d4c285c8eab487"
 i8-forms-044 = "1c81b07447f6e40b33a589f2001bb67485e200adc4cea065feec67eddaffc071"
-i8-forms-045 = "99d8ab9fbd71321cc7e51aa8cbc1e66127878a6379b992abd8d616776b54eb85"
+i8-forms-045 = "8652bb412919d6fb28fd2cfde84f482fce1ff9ef298d6723dd28094454db5463"
 i8-forms-046 = "d97b59385a6d7883d8a6a4e3cd5adf200c66859cd7d6bb218070b4f139a0a0c1"
 i8-forms-047 = "3deb938a673590623622d4bd6e3cdeb50569b933ae199d383e54aac24a912753"
 i8-forms-048 = "71b1f72ca888fc9081fb69df0e074c89c80759142b59d5bbaebc3c41be9b6dc7"
@@ -623,7 +626,7 @@ i8-random-093 = "061970c0a566d63f0a4c8a33e84c52144c788fa7592bbe319960c0cf73631a5
 i8-random-094 = "7834db30e82f3a1699ec09d0d1332acf41ff985de91ce3a7e883216d7406405e"
 i8-random-095 = "7afe6abf25a35d18f49bf3edab0a7c48182cbea26d77a08e369a6aa9aae71a0c"
 i8-random-096 = "960d45466d26009d6358473d93aff8a72f4dac9a3fdbc796f5d961196d2754c4"
-i8-random-097 = "28a58dc6de51d9ca32518db952581c5dfeaea6b1b28dcf94fc8a22d7e2011751"
+i8-random-097 = "1c81ba7241f4f26bb6745d1f066e536e234aed499c0a673c231aa31566778748"
 i8-random-098 = "94b95196c9607a9597b6dfcb1da13fb33d84046f518fb491096cfe4c15771a4c"
 i8-random-099 = "ee9f1c316e6b1c203d0ea0c98a5d2d96c383187cca6add67ec9c39955c5eee8c"
 i8-random-100 = "267a9e75accf6019eafc6d5350ba46df9b67beed6334ca7fc8e5351c89044122"
@@ -637,7 +640,7 @@ i8-random-107 = "467f3bf24bf5ea7a40c9eb2052b8880b05430f947a70b17355c2b963cd102bf
 i8-random-108 = "2b3c5b9cfab708acb5d0c529a4395b4d8f1d8cf6f0113929c6d8d739721e1109"
 i8-random-109 = "a0fc96d1484f0c3571701b72389b2722ce8b121ad89577f9183f8facaa7b4224"
 i8-random-110 = "8bd131ee6d9ae5af79168d77dd26084c0fd8e507dc6689d54e26c89a7fffa49d"
-i8-random-111 = "9c888c14d8248ce1858bdc7c873d86ac59b7366fb44c6462a0e90ae88894d4f0"
+i8-random-111 = "7ac682a31e0546817c1cc33a1f5cf996ef289d46adecefc70b04c2eefd3d3462"
 i8-random-112 = "bc9d4985d5da610123b5b1412f47ea19269e7f24ab89ae8a8daa40daf3900e1b"
 i8-random-113 = "8966a736aad8df0f5d79ba7dab841a0fcde2d8ab4bae76b9db3fceb5bc5eb32b"
 i8-random-114 = "e81e2c8ced8cfb853c48be40e2ec74274fae8b9082a0370d8e8d5cfe8977a5a7"
@@ -845,4 +848,4 @@ i8-shifts-29 = "28a143f356866b735a92afabe602a8bec0dd88d83ffec622de2a8fab74dd710b
 date = "2026-11-18"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
-tool = "qemu: qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"
+tool = "qemu: model: tools/models/afp_fp (Intel SDM rules); qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"

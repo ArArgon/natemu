@@ -114,6 +114,15 @@ class Programs:
                 tools.add(f'x86: {hostname}')
             else:
                 for p in x86: answers[p['name']] = ''          # no answer yet: these cases report stale-lock
+        if mp := by_ref.get('model'):
+            # tools/models/afp_fp: the Intel SDM's FP rules (fp.BASE); it reproduces every QEMU answer of the i8 corpora and the
+            # real-x86 answers where AMD and Intel agree. The reference where they may not (two-NaN choices).
+            md = str(paths.repo_root() / 'tools' / 'models' / 'afp_fp')
+            if md not in sys.path: sys.path.insert(0, md)
+            import fp as fpmodel, predict
+            for p in mp:
+                answers[p['name']] = answer(p, predict.model_result(p, fpmodel.BASE)['qemu'])
+            tools.add('model: tools/models/afp_fp (Intel SDM rules)')
         if fexp := by_ref.get('fex'):
             n, fexc = artifacts.natemu(), artifacts.fexc()
             for p in fexp:
@@ -133,7 +142,8 @@ class Programs:
                            'date': datetime.date.today().isoformat()},
                 'cases': {p['name']: answers[p['name']] for p in programs}, 'excluded': excluded,
                 'x86_cases': sorted(p['name'] for p in by_ref.get('x86', [])),
-                'fex_cases': sorted(p['name'] for p in by_ref.get('fex', [])), 'masks': masks}
+                'fex_cases': sorted(p['name'] for p in by_ref.get('fex', [])),
+                'model_cases': sorted(p['name'] for p in by_ref.get('model', [])), 'masks': masks}
 
     @staticmethod
     def _run_natemu(n, fexc, p, env, work, max_block):

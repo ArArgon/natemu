@@ -86,7 +86,7 @@ def locked_answers(suite, progs, lock, bad):
     sys.path.insert(0, str(HERE.parent.parent.parent))
     from testkit.harness.normalize_programs import answer
     locked = tomllib.loads(lock.read_text())['suite'][suite]
-    x86 = set(locked.get('x86_cases', []))
+    x86 = set(locked.get('x86_cases', [])) | set(locked.get('model_cases', []))
     exp = {}
     for n, p in progs.items():
         m = model_result(p)
