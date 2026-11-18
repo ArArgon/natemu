@@ -85,7 +85,8 @@ What each kind means for the references:
 - **Approximations (RCPPS, RSQRTPS, RCPSS, RSQRTSS: 24 cases).** The SDM bounds only their relative error (1.5 × 2⁻¹²);
   the exact bits are each processor's own table. QEMU returns the correctly rounded 1/x and 1/√x, the Ryzen its own
   approximation (low mantissa bits differ), and Intel parts have yet another. The locks take QEMU's value, which natemu
-  reproduces in accurate mode: valid under the SDM but bit-identical to no real processor.
+  reproduces in accurate mode: valid under the SDM but bit-identical to no real processor. Each processor's table is
+  fixed: the 24 programs gave the same bits in three runs on the Ryzen (November 18).
 - **Two-NaN choices.** QEMU departs from the SDM's rule in the four i8b cases above and in `i8-forms-044` (already from
   x86); the Ryzen departs from it in `i8-random-058` (HADDPD keeps the other NaN), where the SDM model gives QEMU's answer,
   as for the three i8b cases already on the model.
