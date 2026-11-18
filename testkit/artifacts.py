@@ -1,0 +1,124 @@
+"""Built and fetched tools the harnesses need, each a cache entry keyed by what it is built from (spec R8.3): natemu's
+binaries (signed), the fexc compiler at the FEX pin, cargo-nextest and the QEMU reference binary."""
+import dataclasses
+import hashlib
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+from testkit import cache, paths, resources
+from testkit.prepare import BuildFailure
+
+CARGO = ['cargo', '+1.97.0', 'build', '--offline', '--locked', '--release']
+NATEMU_SOURCES = ['crates', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo']
+
+
+def _git(*a, check=True) -> str:
+    return subprocess.run(['git', '-C', str(paths.repo_root()), *a], capture_output=True, text=True, check=check).stdout
+
+
+def source_key(rel_paths: list[str], *extra: str) -> str:
+    """Identity of the worktree's sources under `rel_paths`: the index's blob hashes plus the bytes of every file that
+    differs from HEAD or is untracked there, so uncommitted edits make a new key."""
+    root = paths.repo_root()
+    parts = [_git('ls-files', '-s', '--', *rel_paths)]
+    changed = set(_git('diff', '--name-only', 'HEAD', '--', *rel_paths).split()) | \
+        set(_git('ls-files', '--others', '--exclude-standard', '--', *rel_paths).split())
+    for f in sorted(changed):
+        p = root / f
+        parts.append(f)
+        parts.append(p.read_bytes() if p.is_file() else b'<deleted>')
+    return cache.key(*parts, *extra)
+
+
+@dataclasses.dataclass(frozen=True)
+class Natemu:
+    entry: pathlib.Path
+    key: str
+
+    @property
+    def host(self): return self.entry / 'release/natemu-host'
+
+    @property
+    def stub(self): return self.entry / 'release/natemu'
+
+    @property
+    def runtime(self): return self.entry / 'aarch64-unknown-none/release/natemu-runtime'
+
+
+def _run(cmd, **kw):
+    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    if r.returncode != 0:
+        raise BuildFailure(' '.join(map(str, cmd[:6])), (r.stderr or r.stdout)[-1500:])
+    return r
+
+
+def natemu() -> Natemu:
+    """The release host, the `natemu` stub and the resident, built in the worktree's target/ and copied, signed, into
+    an entry laid out like a cargo target folder."""
+    k = source_key(NATEMU_SOURCES, 'natemu-v1')
+    root = paths.repo_root()
+
+    def build(out: pathlib.Path):
+        target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', root / 'target'))
+        _run(['cargo', '+1.97.0', 'fetch', '--locked'], cwd=root)      # a new machine, or new dependencies (R1.3)
+        _run(CARGO + ['-p', 'natemu-host'], cwd=root)
+        _run(CARGO + ['-p', 'natemu-cli', '--bin', 'natemu'], cwd=root)
+        _run(CARGO + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=root)
+        for rel in ('release/natemu-host', 'release/natemu', 'aarch64-unknown-none/release/natemu-runtime'):
+            (out / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target / rel, out / rel)
+        for rel in ('release/natemu-host', 'release/natemu'):
+            _run(['codesign', '--force', '--sign', '-', '--entitlements', root / 'crates/host/entitlements.plist', out / rel])
+
+    return Natemu(cache.get_or_build('natemu', k, build), k)
+
+
+def fexc() -> pathlib.Path:
+    """The fexc compiler at the committed FEX pin, built by tools/fexc/build.sh in a scratch folder; only the binary is
+    kept."""
+    pin = _git('rev-parse', 'HEAD:third_party/FEX').strip()
+    k = source_key(['tools/fexc'], 'fexc', pin)
+    root = paths.repo_root()
+
+    def build(out: pathlib.Path):
+        scratch = paths.cache_root() / 'build-tmp' / f'fexc-{k[:16]}-{os.getpid()}'
+        shutil.rmtree(scratch, ignore_errors=True); scratch.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _run(['sh', root / 'tools/fexc/build.sh', scratch], cwd=root)
+            shutil.copy2(scratch / 'obj/fexc', out / 'fexc')
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+            subprocess.run(['git', '-C', str(root / 'third_party/FEX'), 'worktree', 'prune'], capture_output=True)
+
+    return cache.get_or_build('fexc', k, build) / 'fexc'
+
+
+def nextest() -> pathlib.Path:
+    return resources.fetch('cargo-nextest')
+
+
+def qemu_user() -> pathlib.Path:
+    p = resources.fetch('qemu-user-static')
+    sys.path.insert(0, str(paths.repo_root() / 'tools' / 'reference'))
+    import ref
+    if hashlib.sha256(p.read_bytes()).hexdigest() != ref.PINS['qemu-x86_64-static']:
+        raise BuildFailure('qemu-user-static', 'extracted qemu-x86_64-static does not match ref.PINS')
+    return p
+
+
+def compile_cache(n: Natemu) -> pathlib.Path:
+    """natemu's own compile cache for this build only (spec R8.8), so builds never share or evict each other's."""
+    d = paths.cache_root() / 'compile-cache' / n.key
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+RESOLVERS = {'natemu': lambda: [natemu().entry], 'fexc': lambda: [fexc()], 'nextest': lambda: [nextest()],
+             'qemu-user': lambda: [qemu_user()]}
+
+
+def resolve(name: str) -> list[pathlib.Path]:
+    return RESOLVERS[name]()

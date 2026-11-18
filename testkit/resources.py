@@ -3,6 +3,7 @@ the cache once per machine, never used unverified; and resources derived from th
 import hashlib
 import inspect
 import pathlib
+import shutil
 import subprocess
 import tarfile
 import tomllib
@@ -39,7 +40,10 @@ def _extract(archive: pathlib.Path, member: str, out: pathlib.Path) -> None:
     with tarfile.open(archive) as t:
         m = next((x for x in t.getmembers() if x.name.lstrip('./') == member.lstrip('./')), None)
         if m is None: raise FileNotFoundError(f'{member} not in archive')
-        (out / pathlib.PurePosixPath(member).name).write_bytes(t.extractfile(m).read())
+        dest = out / pathlib.PurePosixPath(member).name
+        dest.write_bytes(t.extractfile(m).read())
+        dest.chmod(0o755 if m.mode & 0o111 else 0o644)
+    if (out / '.deb').exists(): shutil.rmtree(out / '.deb')
 
 
 def fetch(name: str, decl: dict | None = None) -> pathlib.Path:

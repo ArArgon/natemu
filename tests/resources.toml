@@ -1,2 +1,16 @@
 # External resources (docs/testing.md, spec R14). Each is fetched once per machine from the first URL that answers and
 # is used only if its sha256 matches. URLs are versioned or dated, never "latest". A vanished upstream means re-pinning here.
+
+[resource.cargo-nextest]
+# nextest 0.9.150 (October 26, 2026), the universal macOS build; sha256 from the release's own .sha256 asset.
+urls = ["https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150/cargo-nextest-0.9.150-universal-apple-darwin.tar.gz"]
+sha256 = "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a"
+extract = "cargo-nextest"
+
+[resource.qemu-user-static]
+# Debian bookworm's qemu-user-static 1:7.2+dfsg-7+deb12u18+b3 for arm64: the package tools/reference/ref.py pins
+# (PINS['qemu-arm64.deb']); its qemu-x86_64-static is the QEMU reference used for seeding.
+urls = ["https://deb.debian.org/debian/pool/main/q/qemu/qemu-user-static_7.2+dfsg-7+deb12u18+b3_arm64.deb",
+        "https://snapshot.debian.org/archive/debian/20260526T203455Z/pool/main/q/qemu/qemu-user-static_7.2+dfsg-7+deb12u18+b3_arm64.deb"]
+sha256 = "e420c417c12b42ca774795b62888d5388da0e08c1ef263dea1490e5ce4e32a0b"
+extract = "usr/bin/qemu-x86_64-static"
