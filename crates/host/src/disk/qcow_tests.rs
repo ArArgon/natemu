@@ -18,7 +18,8 @@ use std::{
 
 const SECTOR: usize = 512;
 
-/// [`crate::disk::open`] via [`crate::disk::retry_lock`]; tests that expect the refusal use [`error`], which does not retry.
+/// [`crate::disk::open`] via [`crate::disk::retry_lock`]; tests that expect the lock refusal use [`lock_refusal`], which
+/// does not retry.
 fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> crate::Result<crate::disk::Image> {
     crate::disk::retry_lock(|| crate::disk::open(path, read_only, backing))
 }
@@ -62,15 +63,26 @@ fn qemu_img() -> Option<PathBuf> {
 fn skipped(what: &str) {
     eprintln!("skipped: {what}: qemu-img not found (install qemu to run it)");
 }
-/// Run qemu-img; panics on a failed start, returns (success, output text).
+/// Run qemu-img; panics on a failed start, returns (success, output text). A lock still held by a copy of an image
+/// descriptor in another test's child (as [`crate::disk::retry_lock`] describes) is retried for up to 2 s.
 fn qemu(args: &[&str]) -> (bool, String) {
-    let out = Command::new(qemu_img().unwrap())
-        .args(args)
-        .output()
-        .unwrap();
-    let text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    (out.status.success(), text)
+    let start = Instant::now();
+    loop {
+        let out = Command::new(qemu_img().unwrap())
+            .args(args)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        if out.status.success()
+            || !(text.contains("Failed to lock")
+                || text.contains("Is another process using the image"))
+            || start.elapsed() > Duration::from_secs(2)
+        {
+            return (out.status.success(), text);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 /// `qemu-img check` must report a clean image.
 fn check_clean(path: &Path) {
@@ -139,7 +151,13 @@ fn create_ready(path: &Path, size: u64, bits: u32, backing: Option<(&Path, Optio
     let image = open(path, false, backing.map(|b| b.0)).unwrap();
     image.backend.sync(true).unwrap();
 }
+/// The refusal of an open expected to fail for another reason than the lock (a lock still held by another test's
+/// spawn is retried, as in [`open`]).
 fn error(path: &Path, read_only: bool, backing: Option<&Path>) -> String {
+    open(path, read_only, backing).err().expect("refused")
+}
+/// The refusal of an open expected to find the lock held: not retried.
+fn lock_refusal(path: &Path, read_only: bool, backing: Option<&Path>) -> String {
     crate::disk::open(path, read_only, backing)
         .err()
         .expect("refused")
@@ -503,16 +521,16 @@ fn locks_exclusive_for_a_writer_shared_for_readers_and_backing_files() {
     create_ready(&top, 1 << 20, 16, Some((&base, Some("raw"))));
     create_ready(&top2, 1 << 20, 16, Some((&base, Some("raw"))));
     let a = open(&top, false, Some(&base)).unwrap();
-    assert!(error(&top, false, Some(&base)).contains("held by another process"));
-    assert!(error(&top, true, Some(&base)).contains("held by another process"));
+    assert!(lock_refusal(&top, false, Some(&base)).contains("held by another process"));
+    assert!(lock_refusal(&top, true, Some(&base)).contains("held by another process"));
     // Two overlays share one base; a writer of the base is refused while they hold it.
     let b = open(&top2, false, Some(&base)).unwrap();
-    assert!(error(&base, false, None).contains("held by another process"));
+    assert!(lock_refusal(&base, false, None).contains("held by another process"));
     assert!(open(&base, true, None).is_ok());
     drop((a, b));
     let r1 = open(&top, true, Some(&base)).unwrap();
     let r2 = open(&top, true, Some(&base)).unwrap();
-    assert!(error(&top, false, Some(&base)).contains("held by another process"));
+    assert!(lock_refusal(&top, false, Some(&base)).contains("held by another process"));
     drop((r1, r2));
     assert!(open(&base, false, None).is_ok());
 }
