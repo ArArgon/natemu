@@ -26,7 +26,7 @@ Expected:
 import argparse, json, pathlib, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
-import run_slice1_vm as vm1, ref
+import run_slice1_vm as vm1, ref, fp_deviations as dev
 import run_i8_faults as i8
 from run_i5a_faults import D, CODE, NONCANON
 
@@ -271,7 +271,7 @@ def main():
         bad += bool(problems)
         results.append({'name': name, 'insn': asm, 'ok': not problems, 'problems': problems})
         if problems: print('FAIL', name, '; '.join(problems)[:400], flush=True)
-    (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
+    dev.write_results(a.out / 'results.json', results)
     print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')
     sys.exit(1 if bad else 0)
 

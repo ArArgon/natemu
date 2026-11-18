@@ -195,7 +195,7 @@ def main():
             if kind == 'fail': print('MISMATCH', name, '(STMXCSR in the middle)', f'MXCSR {got_mid:#x}, DE expected {mid}' + (f': {why}' if why else ''))
             bad_mid = kind == 'fail'
             results[-1]['mid_ok'] = not bad_mid
-    (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
+    dev.write_results(a.out / 'results.json', results)
     print(f"afp {d.get('afp')}, fp {d.get('fp')}: " + counts.line().replace('cases,', f'cases ({len(FORMS)} forms),', 1))
     bad = counts.bad
     sys.exit(1 if bad else 0)

@@ -19,7 +19,7 @@ at the fault equal to the state before the instruction.
 import argparse, json, pathlib, struct, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
-import run_slice1_vm as vm1, ref
+import run_slice1_vm as vm1, ref, fp_deviations as dev
 
 TOLERANCE = 2
 
@@ -301,6 +301,7 @@ def cases(a, host, runtime):
         results.append({'name': c['name'], 'ok': not problems, 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400])
     (a.out / 'cases.json').write_text(json.dumps(results, indent=1) + '\n')
+    dev.write_results(a.out / 'results.json', results)
     print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')
     return bad == 0
 

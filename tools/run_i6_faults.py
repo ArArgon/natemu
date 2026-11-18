@@ -22,7 +22,7 @@ FDIV-bug check (FLD; FDIV; FMUL; FLD; FSUBP; FISTP; FWAIT; FNINIT gives 0).
 import argparse, json, pathlib, struct, subprocess, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
-import run_slice1_vm as vm1, ref
+import run_slice1_vm as vm1, ref, fp_deviations as dev
 
 D = 0x200000
 CODE = 0x10000
@@ -360,7 +360,7 @@ def main():
         bad += bool(problems)
         results.append({'name': c['name'], 'insn': c['insn'], 'ok': not problems, 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400])
-    (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
+    dev.write_results(a.out / 'results.json', results)
     print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')
     sys.exit(1 if bad else 0)
 

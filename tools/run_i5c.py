@@ -817,7 +817,7 @@ def main():
         counts.add(kind, tag)
         results.append({'name': c['name'], 'ok': not problems, 'outcome': kind, 'tag': tag, 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400])
-    (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
+    dev.write_results(a.out / 'results.json', results)
     print(f'afp/fp as reported: {sorted(reports, key=str)}: ' + counts.line())
     sys.exit(1 if counts.bad else 0)
 

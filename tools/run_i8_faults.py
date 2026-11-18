@@ -360,7 +360,7 @@ def main():
         counts.add(kind, m and m['tag'])
         results.append({'name': c['name'], 'insn': c['insn'], 'ok': kind != 'fail', 'outcome': kind, 'tag': m and m['tag'], 'problems': problems})
         if problems: print('FAIL', c['name'], '; '.join(problems)[:400], flush=True)
-    (a.out / 'results.json').write_text(json.dumps(results, indent=1) + '\n')
+    dev.write_results(a.out / 'results.json', results)
     print(counts.line())
     sys.exit(1 if counts.bad else 0)
 

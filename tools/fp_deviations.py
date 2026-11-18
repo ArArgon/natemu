@@ -145,3 +145,18 @@ def self_check(tagged, untagged, label):
     need(make_mx(0x1e80, DE | 0x1e80)['tag'] is None, 'DE unmasked is tagged')
     need(make_mx(0x1f80, DE | 0x1f80, simd=False)['tag'] is None, 'a non-SIMD case is tagged')
     print(f'{label} self-check: ok')
+
+
+def write_results(path, rows):
+    """The framework's per-case file: {"results": [{name, outcome, diffs}]} from a runner's rows (name or case; ok; problems; outcome
+    ok|deviated|fail; tag). A documented deviation is `excluded` with its class name, never asserted as an expected value;
+    a row with mid_ok False (the STMXCSR in the middle of a sequence) fails."""
+    out = []
+    for r in rows:
+        name = r.get('name') or r['case']
+        kind = r.get('outcome') or ('ok' if r.get('ok', True) else 'fail')
+        diffs = [str(p) for p in (r.get('problems') or [])]
+        if r.get('mid_ok') is False: kind, diffs = 'fail', diffs + ['MXCSR in the middle of the sequence differs']
+        if kind == 'deviated': out.append({'name': name, 'outcome': 'excluded', 'diffs': [f"deviated as documented: {r.get('tag')}"]})
+        else: out.append({'name': name, 'outcome': 'fail' if kind == 'fail' else 'match', 'diffs': diffs})
+    pathlib.Path(path).write_text(json.dumps({'results': out}, indent=1) + '\n')
