@@ -9,7 +9,7 @@ output = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 
 [suite.i8]
 fex_cases = []
-fingerprint = "35c0bb95eac1dd0a1af81a38d391ed15c0ab44d4605af23a6dfb5d3297f43e32"
+fingerprint = "ad2c98f42898e192412f156c6bbac7deeb24fe1be201620b01b46238adfef257"
 input = "3301ce5d15f97269ab58c470af97be2b9ee9f880fbbc67dcc4d1fe72a24b57f7"
 model_cases = []
 reference = "qemu"
@@ -357,7 +357,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple); x86: ubuntu@192.168.12.10"
 
 [suite.i8b]
 fex_cases = []
-fingerprint = "d2a4a0fabe11f3eb50ce98857ca2ef76a1ce256e444353d1a35dd20e6b2fba1c"
+fingerprint = "81efbe3373e50f3af65bb3c702d9ebe837fa8bc2827b4c504c79e6a1117d3971"
 input = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 model_cases = [
     "i8-forms-045",

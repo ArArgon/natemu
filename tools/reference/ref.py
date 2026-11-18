@@ -12,7 +12,7 @@ GPR order: rax rcx rdx rbx rsp rbp rsi rdi r8..r15.  All integers may be JSON nu
 "0x.." strings; this tool writes hex strings.  Every memory region is captured at the end.
 Execution is the code bytes followed by fallthrough into a capture sequence.  See README.md.
 """
-import argparse, hashlib, json, os, pathlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, uuid
+import argparse, hashlib, json, os, pathlib, re, shutil, sqlite3, struct, subprocess, sys, tempfile, time, uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from raw_root import RAW_ROOT, STATE_ROOT
@@ -494,15 +494,16 @@ done
                 '--workdir', '/work', APPLE_IMAGE, '/bin/sh', '/work/container_entry.sh', '/work/reference/' + qemu.name]
         (workdir / 'container-command.json').write_text(json.dumps(args) + '\n')
         for f in (workdir / 'jobs').glob('*/rc'): f.unlink()
-        for attempt in range(8):
+        for attempt in range(15):
+            if attempt: time.sleep(min(2 * attempt, 10))     # the refusals come in bursts under load: back off
             try:
                 r = subprocess.run(args, capture_output=True, timeout=1200)
                 (workdir / 'container.stderr').write_bytes(r.stderr)
                 require(r.returncode == 0, 'container failed: ' + r.stderr.decode()[-500:])
             finally:
                 subprocess.run(['container', 'delete', '--force', name], capture_output=True, timeout=30)
-            # Rosetta in a container intermittently stops executing the x86 binary after some dozens of runs ("Permission denied",
-            # exit 126, for every later job of that container): the jobs it did not run are run again in a fresh container.
+            # Rosetta in a container intermittently refuses to execute the x86 binary ("Permission denied", exit 126), in bursts
+            # under machine load (many concurrent containers): the jobs it refused are run again in a fresh container.
             again = [f for f in (workdir / 'jobs').glob('*/rc') if f.read_text().strip() == '126']
             if not again: break
             for f in again: f.unlink()
