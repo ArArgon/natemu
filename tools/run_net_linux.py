@@ -52,7 +52,7 @@ import tempfile
 
 from io_common import PCI_PROBE, ROOT, VM_LOCK, digest, patch, pci_errors, pci_self_test, stop_group, write_json
 from io_common import STARTUP_LINE
-from raw_root import RAW_ROOT
+from raw_root import RAW_ROOT, STATE_ROOT
 from run_virtio_rng import KVER
 
 KERNEL_DEB = RAW_ROOT / 'io3-block-20261108-01/prerequisites/linux-image-6.12.107+deb13-amd64_6.12.107-1_amd64.deb'
@@ -486,7 +486,7 @@ def run(args):
     needs_lan = any(case not in LOCAL_CASES for case in args.cases)
     host = (args.host or lan_address()) if needs_lan else '127.0.0.1'
     # Serialize the fixed HTTP, iperf and forwarded ports across both transports.
-    ports = open(RAW_ROOT / '.net-ports.lock', 'a'); fcntl.flock(ports, fcntl.LOCK_EX)
+    ports = open(STATE_ROOT / '.net-ports.lock', 'a'); fcntl.flock(ports, fcntl.LOCK_EX)
     serve = ('import http.server as h, sys; h.ThreadingHTTPServer.request_queue_size = 512; '
              'h.ThreadingHTTPServer((sys.argv[1], 8000), h.SimpleHTTPRequestHandler).serve_forever()')
     http_hosts = set()

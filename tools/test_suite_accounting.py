@@ -56,7 +56,7 @@ class Accounting(unittest.TestCase):
 
     def test_failed_write_is_not_completed(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(suite, 'RAW', pathlib.Path(directory)):
+            with patch.object(suite, 'STATE_ROOT', pathlib.Path(directory)):
                 owner = suite.Suite(types.SimpleNamespace(out=pathlib.Path(directory)))
             owner.results.close()
             os.close(owner.vmlock)
@@ -68,7 +68,7 @@ class Accounting(unittest.TestCase):
 
     def test_print_failure_preserves_failed_result(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(suite, 'RAW', pathlib.Path(directory)):
+            with patch.object(suite, 'STATE_ROOT', pathlib.Path(directory)):
                 owner = suite.Suite(types.SimpleNamespace(out=pathlib.Path(directory)))
             try:
                 with patch('builtins.print', side_effect=BrokenPipeError('synthetic output failure')):

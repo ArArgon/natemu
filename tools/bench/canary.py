@@ -21,7 +21,7 @@ import argparse, fcntl, json, os, pathlib, signal, subprocess, sys, tempfile, ti
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / 'tools'))
-from raw_root import RAW_ROOT
+from raw_root import RAW_ROOT, STATE_ROOT
 RAW = RAW_ROOT
 KERNEL = RAW / 'kernel-census-20261028-01/dl/linux'
 INITRD = RAW / 'cpython-profile-20261110-01/work/initrd.cpio.zst'
@@ -74,7 +74,7 @@ ITEMS = (boot, cpython, micro)
 
 def measure(exe):
     values = {}
-    with tempfile.TemporaryDirectory() as d, open(RAW / '.vm.lock', 'a') as lock:
+    with tempfile.TemporaryDirectory() as d, open(STATE_ROOT / '.vm.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         for item in ITEMS:
             work = pathlib.Path(d) / item.__name__; work.mkdir()

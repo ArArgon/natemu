@@ -34,7 +34,7 @@ class AsmCache(unittest.TestCase):
     def setUp(self):
         CALLS.clear()
         self.dir = tempfile.TemporaryDirectory(); self.addCleanup(self.dir.cleanup)
-        env = patch.dict(os.environ, {'NATEMU_RAW_ROOT': self.dir.name}); env.start(); self.addCleanup(env.stop)
+        env = patch.dict(os.environ, {'NATEMU_RAW_ROOT': self.dir.name + '/inputs', 'NATEMU_STATE_ROOT': self.dir.name}); env.start(); self.addCleanup(env.stop)
         os.environ.pop('NATEMU_ASM_CACHE', None)
 
     def process(self, assemble=assemble_a, version='1'):

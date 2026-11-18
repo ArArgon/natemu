@@ -370,6 +370,7 @@ def run(args):
             work = args.out / f'n{n}'; work.mkdir()
             image = work / 'root.raw'
             checked(['cp', '-c', args.inputs / 'root.raw', image], work / 'clone.log')
+            image.chmod(0o644)      # the clone keeps the source's mode: read-only when the inputs are a cache entry
             baseline = digest(image)
             assert baseline == inputs['outputs']['root.raw']
             for phase in ('write', 'verify'):

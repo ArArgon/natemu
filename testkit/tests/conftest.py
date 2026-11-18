@@ -24,3 +24,4 @@ collect_ignore = ['fixtures']       # fixture families are run by pytester, not 
 def _isolated_raw_root(monkeypatch, tmp_path_factory):
     """Never touch the machine's real natemu-raw (its .vm.lock) from the framework's own tests."""
     monkeypatch.setenv('NATEMU_RAW_ROOT', str(tmp_path_factory.mktemp('raw')))
+    monkeypatch.delenv('NATEMU_STATE_ROOT', raising=False)

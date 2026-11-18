@@ -27,7 +27,7 @@ durability match. No network benchmark endpoint has been contacted.
 
 The network clients are now staged separately at
 `natemu-raw/io-network-tools-20261108-01`: iperf3 `3.18-2+deb13u2`, curl
-`8.14.1-2+deb13u5` and netperf `2.7.0+git20210121.3bc455b+ds-3`, with OpenSSL
+`8.14.1-2+deb13u7` (the staged files' version; this line said deb13u5) and netperf `2.7.0+git20210121.3bc455b+ds-3`, with OpenSSL
 and a bundle of 150 packaged CA roots. Independent static review verifies the
 signed package index, all 66 archives/dependency edges/extracted files and the
 41-object ELF dependency set. No guest tool or packet service has executed;

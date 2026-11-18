@@ -20,7 +20,7 @@ TMPDIR; a step whose time ends far from its `est` is reported at the end (update
 would otherwise start last); (3) `ser`, one at a
 time, alone: the steps whose judgement depends on wall time or on vCPUs running truly concurrently (see SERIAL_WHY);
 a failed one is rerun once alone and both results recorded (the rerun's decides).
-Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock and phase 3 an exclusive one throughout
+Machine coordination: phases 1-2 hold a shared flock on NATEMU_STATE_ROOT/.vm.lock (default NATEMU_RAW_ROOT) and phase 3 an exclusive one throughout
 (benchmarks take it exclusively with `/usr/bin/lockf -k`), and a serial step also waits until no other VM process runs.
 NATEMU_RAM and other environment variables pass through to every step (the 4 MiB suite: NATEMU_RAM=0x400000).
 Steps after phase 1 get NATEMU_VM_LOCK_HELD=1: the suite already holds the VM lock for them (shared or exclusive), so a step
@@ -31,7 +31,7 @@ a passing step's output and temporary directories are deleted, a failing step's 
 Steps `*-m2f`/`*-m2a` run FP runners emulating a host without FEAT_AFP (NATEMU_FEXC_FEATURE_OFF=afp), fast / accurate (NATEMU_FP=accurate).
 --only/--skip take comma-separated step names or fnmatch patterns (`k1-*`, `faults@*`); `release` always runs."""
 import argparse, dataclasses, datetime, fcntl, fnmatch, json, os, pathlib, re, shutil, signal, subprocess, sys, threading, time
-from raw_root import RAW_ROOT
+from raw_root import RAW_ROOT, STATE_ROOT
 
 import io_common
 
@@ -270,7 +270,7 @@ class Suite:
         self.finished, self.times = set(), {}
         for d in ('logs', 'out', 'tmp'): (a.out / d).mkdir(parents=True, exist_ok=True)
         self.results = open(a.out / 'results.txt', 'a', buffering=1)
-        self.vmlock = os.open(RAW / '.vm.lock', os.O_RDWR | os.O_CREAT, 0o644)
+        self.vmlock = os.open(STATE_ROOT / '.vm.lock', os.O_RDWR | os.O_CREAT, 0o644)
 
     def flock(self, mode):
         try: fcntl.flock(self.vmlock, mode | fcntl.LOCK_NB)

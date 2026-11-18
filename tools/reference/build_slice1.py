@@ -18,7 +18,7 @@ FIX = REPO / 'fixtures' / 'slice1'
 PROGRAMS, EXPECTED, MANIFEST, RECORD = (FIX / n for n in ('programs.json', 'expected.json', 'manifest.json', 'build.json'))
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
-from raw_root import RAW_ROOT
+from raw_root import RAW_ROOT, STATE_ROOT
 import ref
 
 
@@ -65,8 +65,8 @@ def build(programs_only=False):
     if not programs_only:
         e_in = {'programs_sha256': sha(PROGRAMS), 'qemu': m['qemu'], 'ref_sha256': sha(HERE / 'ref.py', HERE / 'flags.py', HERE / 'container_entry.py')}
         if not (EXPECTED.exists() and rec.get('expected_inputs') == e_in):
-            need_docker(); raw = raw_dir(); (raw / 'run').mkdir(parents=True, exist_ok=True); new = EXPECTED.with_name('expected.json.new')
-            run('ref.py', PROGRAMS, '-o', new, '--qemu', raw / 'pin' / 'qemu-x86_64-static', '--workdir', raw / 'run')
+            need_docker(); raw = raw_dir(); work = STATE_ROOT / raw.name / 'run'; work.mkdir(parents=True, exist_ok=True); new = EXPECTED.with_name('expected.json.new')
+            run('ref.py', PROGRAMS, '-o', new, '--qemu', raw / 'pin' / 'qemu-x86_64-static', '--workdir', work)
             os.replace(new, EXPECTED); done.append('expected.json'); rec['expected_inputs'] = e_in
         check_pins(m)
     rec['sha256'] = {'programs.json': sha(PROGRAMS), **({'expected.json': sha(EXPECTED)} if EXPECTED.exists() else {})}

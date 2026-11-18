@@ -30,7 +30,7 @@ class VmLock(unittest.TestCase):
         p.wait()
         fcntl.flock(self.suite.vmlock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     def test_vmlock_py_holds_the_lock(self):
-        env = dict(os.environ, NATEMU_RAW_ROOT=self.d.name)
+        env = dict(os.environ, NATEMU_RAW_ROOT=self.d.name); env.pop('NATEMU_STATE_ROOT', None)
         for mode, other_shared_ok in (('shared', True), ('exclusive', False)):
             p = subprocess.Popen([sys.executable, TOOLS / 'vmlock.py', mode, 'sleep', '3'], env=env); time.sleep(1)
             with self.assertRaises(BlockingIOError): fcntl.flock(self.suite.vmlock, fcntl.LOCK_EX | fcntl.LOCK_NB)

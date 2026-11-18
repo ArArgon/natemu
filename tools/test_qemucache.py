@@ -36,7 +36,7 @@ def fake_smp(root, calls, binary=b'qemu', firmware=b'bios'):
 class QemuCache(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory(); self.addCleanup(self.dir.cleanup)
-        env = patch.dict(os.environ, {'NATEMU_RAW_ROOT': self.dir.name}); env.start(); self.addCleanup(env.stop)
+        env = patch.dict(os.environ, {'NATEMU_RAW_ROOT': self.dir.name + '/inputs', 'NATEMU_STATE_ROOT': self.dir.name}); env.start(); self.addCleanup(env.stop)
         os.environ.pop('NATEMU_QEMU_CACHE', None)
         self.calls = []; QUEUE.clear()
 

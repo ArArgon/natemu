@@ -129,10 +129,17 @@ def raw_root() -> pathlib.Path | None:
     return root if root.is_dir() else None
 
 
+def vm_lock_file() -> pathlib.Path | None:
+    """The old runners' VM lock (tools/raw_root.py STATE_ROOT): in $NATEMU_STATE_ROOT, else in the raw root."""
+    s = os.environ.get('NATEMU_STATE_ROOT')
+    root = pathlib.Path(s) if s else raw_root()
+    return root / '.vm.lock' if root is not None and root.is_dir() else None
+
+
 @contextlib.contextmanager
 def vm_lock(grant: Grant, lock_file: pathlib.Path | None = None):
     """Hold the old runners' VM lock for this grant: exclusively for a window, shared otherwise. No-op without natemu-raw."""
-    f = lock_file or ((raw_root() / '.vm.lock') if raw_root() else None)
+    f = lock_file or vm_lock_file()
     if f is None:
         yield; return
     fd = os.open(f, os.O_RDWR | os.O_CREAT, 0o644)
@@ -157,7 +164,7 @@ def outside_vms() -> list[str]:
 def external_busy(lock_file: pathlib.Path | None = None) -> str:
     """Why a window cannot open now, or '' (R4.7, R4.9): an old runner holds natemu-raw/.vm.lock, or VMs run that the
     framework did not start (an exclusive window opens only on a drained machine, so any VM process is outside it)."""
-    f = lock_file or ((raw_root() / '.vm.lock') if raw_root() else None)
+    f = lock_file or vm_lock_file()
     if f is not None and f.exists():
         fd = os.open(f, os.O_RDWR)
         try:

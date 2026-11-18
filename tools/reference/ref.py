@@ -15,7 +15,7 @@ Execution is the code bytes followed by fallthrough into a capture sequence.  Se
 import argparse, hashlib, json, os, pathlib, re, sqlite3, struct, subprocess, sys, tempfile, uuid
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
-from raw_root import RAW_ROOT
+from raw_root import RAW_ROOT, STATE_ROOT
 import flags
 
 # The pinned QEMU container image (Debian bookworm, qemu-user-static 7.2) and the SHA-256 of its QEMU binaries and
@@ -407,11 +407,11 @@ def check_flow(p, log, stop=None):
 
 
 def _cache():
-    """The reference-result cache (sqlite, NATEMU_RAW_ROOT/ref-cache.sqlite; NATEMU_REF_CACHE=off disables it), or None. A result
+    """The reference-result cache (sqlite, NATEMU_STATE_ROOT/ref-cache.sqlite, else NATEMU_RAW_ROOT's; NATEMU_REF_CACHE=off disables it), or None. A result
     is QEMU's deterministic answer for one program, so it is stored under a hash of the program, the pinned QEMU binary, the
     backend and this directory's sources (a change to how results are read or checked misses); a program run again, as faults and
     faults-1 or the three loop-fault sizes do, skips the container. Only runs with the original annotation check are cached."""
-    root = os.environ.get('NATEMU_RAW_ROOT')
+    root = os.environ.get('NATEMU_STATE_ROOT') or os.environ.get('NATEMU_RAW_ROOT')
     if os.environ.get('NATEMU_REF_CACHE') == 'off' or not root or check_annotations.__name__ != 'check_annotations': return None
     db = sqlite3.connect(pathlib.Path(root) / 'ref-cache.sqlite', timeout=300)
     db.execute('pragma journal_mode=wal')
@@ -553,7 +553,7 @@ def main():
     a = ap.parse_args()
     raw = RAW_ROOT
     qemu = a.qemu or raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
-    work = a.workdir or raw / 'reference-slice1-20261026-01' / 'run'
+    work = a.workdir or STATE_ROOT / 'reference-slice1-20261026-01' / 'run'
     work.mkdir(parents=True, exist_ok=True)
     programs = json.loads(a.programs.read_text())['programs']
     results, prov = run_programs(programs, work, qemu)

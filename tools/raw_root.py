@@ -1,6 +1,11 @@
 """Where raw results and inputs live: $NATEMU_RAW_ROOT, else natemu-raw beside the main checkout (the same default as
 tools/with-env). Inside a git worktree the main checkout is found through `git rev-parse --git-common-dir`, so a worktree
-under .claude/worktrees/X uses the same folder (and the same VM lock) as the main checkout."""
+under .claude/worktrees/X uses the same folder (and the same VM lock) as the main checkout.
+
+What the runners write there for coordination and reuse (the VM and port locks, the sqlite result caches, the reference
+work folder) goes to STATE_ROOT instead: $NATEMU_STATE_ROOT, else the raw root, so by default nothing moves. Set it when
+the raw root is a read-only input root (testkit/inputs.py), and to the same folder for every runner on the machine, since
+the VM lock only excludes runners that use the same file."""
 import os
 import pathlib
 import subprocess
@@ -17,6 +22,7 @@ def default_root(repo=pathlib.Path(__file__).resolve().parents[1]):
 
 
 RAW_ROOT = pathlib.Path(os.environ.get('NATEMU_RAW_ROOT') or default_root())
+STATE_ROOT = pathlib.Path(os.environ.get('NATEMU_STATE_ROOT') or RAW_ROOT)
 
 if __name__ == '__main__':   # self-check: from the repo root and from a folder inside it the answer is the same
     here = default_root()

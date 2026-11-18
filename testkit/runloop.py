@@ -155,9 +155,9 @@ class Controller:
             for u in waiting + running: self.pool.release(u.req.id)
 
     def start(self, u: Unit, grant) -> bool:
-        lock = poolmod.raw_root()
+        lock = poolmod.vm_lock_file()
         if lock is not None:
-            fd = os.open(lock / '.vm.lock', os.O_RDWR | os.O_CREAT, 0o644)
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
             try:
                 fcntl.flock(fd, (fcntl.LOCK_EX if grant.core_class == 'X' else fcntl.LOCK_SH) | fcntl.LOCK_NB)
             except BlockingIOError:

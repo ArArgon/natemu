@@ -148,3 +148,11 @@ wrapped yet: the drift canary and stored baselines (`tools/bench/canary.py`), wh
 `tests/legacy` runs every step of `tools/run_suite.py` that no family has replaced yet, unchanged, with its old pass
 rule. These steps still read `natemu-raw`. To move one: write a family for it, then list the step under `replaced` in
 `tests/legacy/family.toml`. `tools/run_suite.py` stays until every step has moved.
+
+The inputs those runners read can also be built on any machine instead of copied: `testkit.inputs.root()` makes a cache
+entry laid out like `natemu-raw` (the netboot kernel and initrd, the QEMU reference binary, the virtio block inputs and
+kernel package, the network tools' root, the i7 and s2d program corpora; no expected answers) from pinned downloads and
+recipes in the repo (`tools/io/network-rootfs` for the network tools). Point a runner at it with
+`NATEMU_RAW_ROOT=<that folder>` and `NATEMU_STATE_ROOT=<a writable folder>`: the entry is read-only, and the runners'
+VM and port locks, result caches and reference work folder go to the state root (by default the raw root, as before).
+Every runner on the machine must use the same state root, since the VM lock only excludes runners that share its file.

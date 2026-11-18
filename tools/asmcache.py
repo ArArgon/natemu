@@ -6,8 +6,8 @@ clang, but the fault runners assemble thousands of one-line programs and every s
 
 Wraps `ref.assemble` in place (tools/reference is not touched: its sources key the reference-result cache). The key is a
 hash of the text, `labels`, `clang --version` (one spawn per process) and the source of `ref.assemble` itself, so a
-different assembler or a change to how the object is read misses. Stored in NATEMU_RAW_ROOT/asm-cache.sqlite (WAL; no
-persistence without NATEMU_RAW_ROOT; NATEMU_ASM_CACHE=off disables it); misses are written in batches and at exit, so
+different assembler or a change to how the object is read misses. Stored in NATEMU_STATE_ROOT/asm-cache.sqlite (else
+NATEMU_RAW_ROOT; no persistence without either; WAL; NATEMU_ASM_CACHE=off disables it); misses are written in batches and at exit, so
 parallel steps rarely meet a locked database. Failures (an assembler error) are never cached; an unreadable row or database
 is a miss (reported once on stderr), so a `ValueError('assembler: ...')` always means clang rejected the text."""
 import atexit, hashlib, inspect, json, os, pathlib, sqlite3, subprocess, sys
@@ -26,7 +26,7 @@ def install(ref):
 
     def db():
         if 'db' not in state:
-            root, state['db'] = os.environ.get('NATEMU_RAW_ROOT'), None
+            root, state['db'] = os.environ.get('NATEMU_STATE_ROOT') or os.environ.get('NATEMU_RAW_ROOT'), None
             if root and os.environ.get('NATEMU_ASM_CACHE') != 'off':
                 try:
                     state['db'] = sqlite3.connect(pathlib.Path(root) / 'asm-cache.sqlite', timeout=300)

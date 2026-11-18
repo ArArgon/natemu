@@ -11,7 +11,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
-from raw_root import RAW_ROOT  # noqa: E402
+from raw_root import RAW_ROOT, STATE_ROOT  # noqa: E402
 RAW = RAW_ROOT
 WORK = RAW / 'public-cpu-ram-20261107-01'
 mode = sys.argv[1]
@@ -113,7 +113,7 @@ files = [kernel, out / 'image.cpio', *[candidate / n for n in ['natemu', 'natemu
 if mode.startswith('kernel-'):
     files += [WORK / 'build/kernel.config', WORK / 'build/lkmm-oracle.txt', WORK / 'sources/lkmm-generated.tar.gz']
 manifest = dict(cases=cases, candidate={n: str(candidate / n) for n in ['natemu', 'natemu-host', 'natemu-runtime', 'fexc']},
-    qemu='/opt/homebrew/bin/qemu-system-x86_64', lock=str(RAW / '.vm.lock'),
+    qemu='/opt/homebrew/bin/qemu-system-x86_64', lock=str(STATE_ROOT / '.vm.lock'),
     qcpu='Haswell,-pcid,-hle,-rtm,-invpcid,-tsc-deadline,-erms,-mca,-mce,+sha-ni,+adx,+clflushopt,+clwb,+smep,+umip',
     pins={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
     source_commit=subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip())

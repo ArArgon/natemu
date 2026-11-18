@@ -17,7 +17,7 @@ Where it applies: every runner that imports tools/run_slice3_vm.py or tools/run_
 corpora, kicks, events and system, x1, x3, m2, l3, l4, r1, s4, capacity, vector_split_smp ...), including their stress steps,
 whose QEMU references are deterministic final states. Not wrapped: runs with extra QEMU arguments (a serial file the caller
 reads back), and the benchmarks' and smp.py's own calls (timing, determinism samples), which never import this module.
-Stored in NATEMU_RAW_ROOT/qemu-cache.sqlite (WAL; no persistence without NATEMU_RAW_ROOT; NATEMU_QEMU_CACHE=off disables it,
+Stored in NATEMU_STATE_ROOT/qemu-cache.sqlite (else NATEMU_RAW_ROOT; no persistence without either; WAL; NATEMU_QEMU_CACHE=off disables it,
 e.g. for a final gate)."""
 import hashlib, json, os, pathlib, sqlite3, sys, zlib
 
@@ -51,7 +51,7 @@ def install(smp):
 
     def db():
         if 'db' not in state:
-            root, state['db'] = os.environ.get('NATEMU_RAW_ROOT'), None
+            root, state['db'] = os.environ.get('NATEMU_STATE_ROOT') or os.environ.get('NATEMU_RAW_ROOT'), None
             if root and os.environ.get('NATEMU_QEMU_CACHE') != 'off':
                 try:
                     state['db'] = sqlite3.connect(pathlib.Path(root) / 'qemu-cache.sqlite', timeout=300)
