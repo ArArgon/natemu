@@ -101,7 +101,8 @@ class Runner:
         return False
 
     def requirements(self, fam, suite, variant):
-        reqs = [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'), Requirement('legacy', 'target')]
+        reqs = [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'), Requirement('legacy', 'target'),
+                Requirement('artifact', 'qemu-system')]
         return reqs + [Requirement('input-root', 'root')]
 
     def resolve(self, req):
@@ -126,6 +127,9 @@ class Runner:
                        NATEMU_REFERENCE_BACKEND='apple', NATEMU_COMPILE_CACHE=str(artifacts.compile_cache(n)),
                        **{k: str(v) for k, v in spec.get('env', {}).items()})
             if root: env['NATEMU_RAW_ROOT'] = str(root)
+            qbin = artifacts.qemu_system()           # the pinned QEMU 11.1.2 build (system mode and qemu-img)
+            env.update(NATEMU_QEMU_SYSTEM=str(qbin / 'qemu-system-x86_64'), NATEMU_QEMU_IMG=str(qbin / 'qemu-img'),
+                       NATEMU_QEMU_PIN='qemu-system 11.1.2 src', PATH=f'{qbin}:{env.get("PATH", "")}')
             builder = spec.get('builds', False)
             attempts = 2 if spec.get('rerun', it.suite.rerun) else 1
             notes, ok = [], False

@@ -63,7 +63,8 @@ class Units:
         return [f for f in files if not any(fnmatch.fnmatch(f, g) for g in exc)]
 
     def requirements(self, fam, suite, variant):
-        need = [Requirement('artifact', 'nextest')] if suite.params.get('tool') == 'nextest' else []
+        need = [Requirement('artifact', 'qemu-system')]
+        need += [Requirement('artifact', 'nextest')] if suite.params.get('tool') == 'nextest' else []
         return need + ([Requirement('artifact', 'fexc')] if suite.params.get('fexc') else [])
 
     def resolve(self, req):
@@ -73,7 +74,9 @@ class Units:
         return {it.nodeid: (self.nextest(it) if it.suite.params.get('tool') == 'nextest' else self.pytest_file(it)) for it in batch}
 
     def _env(self, it):
-        env = dict(os.environ, NATEMU_REQUIRE_QEMU_IMG='1')
+        qbin = artifacts.qemu_system()                 # the pinned qemu-img first on PATH
+        env = dict(os.environ, NATEMU_REQUIRE_QEMU_IMG='1', NATEMU_QEMU_IMG=str(qbin / 'qemu-img'),
+                   PATH=f'{qbin}:{os.environ.get("PATH", "")}')
         if it.suite.params.get('fexc'): env['FEXC'] = str(artifacts.fexc())
         return env
 
