@@ -1,0 +1,10 @@
+# Change-based selection (docs/testing.md, spec R6.3b). A changed file matching a `shared` rule is shared machinery:
+# every family's smoke cases run. Families declare what they cover in their own family.toml (`covers`).
+shared = [
+    "testkit/**",
+    "pytest.ini",
+    "tests/features.toml",
+    "tests/resources.toml",
+    "tools/natemu-test",
+    "tools/reference/**",
+]

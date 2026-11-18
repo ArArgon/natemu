@@ -13,12 +13,20 @@ def cmd_run(args):
     from testkit import runs
     rid = None
     if args[:1] == ['--run-id']: rid, args = args[1], args[2:]
-    return runs.run(args, rid)
+    return runs.run(with_default_tier(args), rid)
+
+
+def with_default_tier(args):
+    """`run` without --tier, --gate or a path selects the affected tier (spec R6.1)."""
+    import os
+    if any(a.startswith('--tier') or a == '--gate' for a in args): return args
+    if any(not a.startswith('-') and os.path.exists(a.split('::')[0]) for a in args): return args
+    return ['--tier', 'affected', *args]
 
 
 def cmd_submit(args):
     from testkit import runs
-    print(runs.submit(args))
+    print(runs.submit(with_default_tier(args)))
     return 0
 
 
