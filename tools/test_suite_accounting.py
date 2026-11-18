@@ -31,7 +31,8 @@ class Accounting(unittest.TestCase):
                     raise RuntimeError('synthetic worker failure')
                 return True, 0, 0.0, owner.O / 'logs/synthetic.log', ''
 
-            with patch.object(suite, 'RAW', root), patch.object(suite, 'steps', return_value=[step]), \
+            with patch.object(suite, 'RAW', root), patch.object(suite, 'STATE_ROOT', root), \
+                 patch.object(suite, 'steps', return_value=[step]), \
                  patch.object(suite.Suite, 'run', run), \
                  patch.object(suite.Suite, '__init__', init), \
                  patch.object(suite.subprocess, 'run', return_value=types.SimpleNamespace(stdout='1')), \
