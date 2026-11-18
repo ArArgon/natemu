@@ -1122,8 +1122,9 @@ fn the_documented_example_is_in_the_doc_and_loads() {
     assert!(include_str!("../../../../docs/configuration.md").contains(example));
     let (d, c) = load_file(example, &[]);
     let cfg = c.unwrap();
-    assert_eq!(cfg.disks.len(), 3);
+    assert_eq!(cfg.disks.len(), 4);
     assert!(cfg.disks[2].readonly && !cfg.disks[0].readonly);
+    assert!(cfg.disks[3].snapshot && !cfg.disks[3].readonly && !cfg.disks[0].snapshot);
     assert_eq!(cfg.disks[0].backing, Some(d.join("debian13.raw")));
     assert_eq!((cfg.nics.len(), cfg.rngs.len()), (1, 1));
     assert_eq!(cfg.nics[0].forward.len(), 2);

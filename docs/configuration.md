@@ -52,6 +52,11 @@ id = "tools"
 path = "tools.iso"
 readonly = true              # an ISO, or any image the guest must not change
 
+[[disk]]
+id = "scratch"
+path = "clean.raw"
+snapshot = true              # the guest may write; every change is thrown away when the VM exits
+
 [[nic]]                      # user-mode NAT (slirp)
 id = "net0"
 forward = ["tcp:2222:22", "8080:80"]   # host 127.0.0.1 port : guest port
