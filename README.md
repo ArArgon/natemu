@@ -191,5 +191,9 @@ cargo test --locked
 python3 -B -m unittest discover -s tools -p 'test_*.py'
 ```
 
-The full correctness suite (`tools/run_suite.py`) compares natemu against QEMU and needs a local
-QEMU install. Its docstring lists the options.
+`tools/natemu-test run` runs the tests your change concerns, and `tools/natemu-test run --gate` runs all of them. The
+first run on a Mac downloads and builds what the tests need, which takes a few minutes. [Testing](docs/testing.md)
+explains the rest.
+
+The older correctness suite (`tools/run_suite.py`) compares natemu against QEMU and needs a local QEMU install. Its
+docstring lists the options.

@@ -343,7 +343,9 @@ paging cells), `tools/run_slice2_vm.py` (control flow), `tools/run_slice2_faults
 ASM suite) and `tools/run_slice3_vm.py` (N vCPUs: corpora, smp, limits, kicks, system, coherence, sharedpt, litmus,
 contain). Each takes `--fexc FEXC --out DIR` and runs under `./tools/with-env`.
 
-**Running the suite** (`tools/run_suite.py`; its docstring has the options). The full suite is what must pass before a push
+**Running the suite.** The new runner is `tools/natemu-test` ([docs/testing.md](testing.md)): it runs the unit tests, the
+migrated families and every remaining `run_suite.py` step (wrapped) on any Mac. Until every step has moved,
+`tools/run_suite.py` (its docstring has the options) stays the reference for a push or merge. The full suite is what must pass before a push
 or merge; `--quick` (one small member of every runner family, about ten minutes, the same pass rules) is the development loop
 and never replaces it. Speed levers, all keeping every case: long runners are split (`--shard I/N` of faults, loop faults,
 probes and k1: the independent cases dealt round-robin, the union is the unsplit run; corpora per vCPU count); a step far from
