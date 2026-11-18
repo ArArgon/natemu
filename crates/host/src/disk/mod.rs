@@ -107,6 +107,22 @@ pub(crate) fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> Resu
     open_disk("ID", path, read_only, backing)
 }
 
+/// A throw-away overlay over `base` (opened read-only): created in the temporary folder and deleted once open, so only
+/// this launch's open file holds the guest's writes and the host frees it at exit, a crash included.
+pub(crate) fn open_snapshot(id: &str, base: &Path) -> Result<Image> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let top = std::env::temp_dir().join(format!(
+        "natemu-snapshot-{}-{id}-{nanos}.qcow2",
+        std::process::id()
+    ));
+    qcow::create(&top, base)?;
+    let image = open_disk(id, &top, false, Some(base));
+    let _ = std::fs::remove_file(&top);
+    image
+}
+
 /// [`open`] for the disk with id `id`, which its messages name (the `--set disk.ID.backing` hint).
 pub(crate) fn open_disk(
     id: &str,

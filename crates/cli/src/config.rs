@@ -20,6 +20,7 @@ pub struct Disk {
     pub path: PathBuf,
     pub readonly: bool,
     pub backing: Option<PathBuf>,
+    pub snapshot: bool,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Nic {
@@ -177,6 +178,7 @@ struct FDisk {
     path: PathBuf,
     readonly: Option<bool>,
     backing: Option<PathBuf>,
+    snapshot: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,6 +315,7 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
             path: rel(base, &d.path),
             readonly: d.readonly.unwrap_or(false),
             backing: d.backing.map(|p| rel(base, &p)),
+            snapshot: d.snapshot.unwrap_or(false),
         });
     }
     for (i, n) in f.nic.into_iter().enumerate() {
@@ -511,6 +514,7 @@ fn apply_flags(
             path,
             readonly: false,
             backing: None,
+            snapshot: false,
         });
     }
     // --net claims no key of its own; its options claim theirs.
@@ -563,7 +567,8 @@ const KEYS: [&str; 22] = [
     "debug.writable_on_read",
     "debug.perf_log",
 ];
-const DEVICE_KEYS: &str = "disk.ID.{path,readonly,backing}, nic.ID.{forward,host_loopback}";
+const DEVICE_KEYS: &str =
+    "disk.ID.{path,readonly,backing,snapshot}, nic.ID.{forward,host_loopback}";
 
 fn boolish(text: &str) -> Res<bool> {
     use clap::builder::TypedValueParser;
@@ -605,9 +610,10 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
                     "path" => d.path = path(),
                     "readonly" => d.readonly = boolish(text).map_err(err)?,
                     "backing" => d.backing = Some(path()),
+                    "snapshot" => d.snapshot = boolish(text).map_err(err)?,
                     _ => {
                         return Err(err(
-                            "unknown key; expected one of path, readonly, backing".into()
+                            "unknown key; expected one of path, readonly, backing, snapshot".into(),
                         ));
                     }
                 }
@@ -798,11 +804,11 @@ pub fn validate(cfg: &Config) -> Res<()> {
                     ));
                 }
                 (Some(x), Some(y)) if x == y => {
-                    if a.readonly && b.readonly {
-                        continue; // two read-only uses of one image share the lock
+                    if (a.readonly || a.snapshot) && (b.readonly || b.snapshot) {
+                        continue; // two read-only uses of one image share the lock (a snapshot only reads its file)
                     }
                     return Err(format!(
-                        "{who}: disks {:?} and {:?} are the same file; that is allowed only when both are readonly",
+                        "{who}: disks {:?} and {:?} are the same file; that is allowed only when both are readonly or snapshot",
                         a.id, b.id
                     ));
                 }
@@ -815,11 +821,9 @@ pub fn validate(cfg: &Config) -> Res<()> {
         if key(base).is_some() && key(base) == key(&a.path) {
             return Err(format!("{who}: disk {:?} is its own backing file", a.id));
         }
-        if let Some(b) = cfg
-            .disks
-            .iter()
-            .find(|b| !b.readonly && key(base).is_some() && key(base) == key(&b.path))
-        {
+        if let Some(b) = cfg.disks.iter().find(|b| {
+            !b.readonly && !b.snapshot && key(base).is_some() && key(base) == key(&b.path)
+        }) {
             return Err(format!(
                 "{who}: the backing file of disk {:?} is disk {:?}, which is writable; a base must not change under its overlay",
                 a.id, b.id
@@ -900,6 +904,7 @@ pub fn to_boot(
             transport: cfg.transports.disk,
             readonly: d.readonly,
             backing: d.backing.clone(),
+            snapshot: d.snapshot,
         })
         .collect();
     boot.net = !cfg.nics.is_empty();
