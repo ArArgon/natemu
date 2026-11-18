@@ -34,6 +34,7 @@ class Unit:
     def __init__(self, n, items, req, env, timeout):
         self.n, self.items, self.req, self.env, self.timeout = n, items, req, env, timeout
         self.proc = self.grant = self.started = self.vmlock = None
+        self.first_test = self.ended = None
         self.offset = 0
         self.done = set()
 
@@ -102,6 +103,28 @@ class Controller:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.pool = poolmod.Pool()
         self.reasons = {}
+        rd = self.dir.parent
+        try: t0 = json.loads((rd / 'run.json').read_text())['started']
+        except (OSError, ValueError, KeyError): t0 = time.time()
+        self.t = {'run': rd.name, 'started': t0, 'units': []}      # testkit.timings
+        self.config._testkit_timings = self.t
+
+    def save_timings(self) -> None:
+        """Never stops the run: a failed write (a full disk) only loses the times."""
+        from testkit import timings
+        try:
+            self.t['units'] = [self.unit_times(u) for u in getattr(self, 'units', [])]
+            timings.write(self.dir.parent, self.t)
+        except Exception as e:
+            print(f'testkit: could not record times: {e}', file=sys.stderr)
+
+    @staticmethod
+    def unit_times(u) -> dict:
+        it = u.items[0]
+        label = u.req.label if len(u.items) > 1 else f'{it.fam.name}/{it.suite.name}/{it.case}'
+        return {'label': label, 'family': it.fam.name, 'suite': it.suite.name, 'items': len(u.items),
+                'cores': u.req.cores, 'core_class': u.grant.core_class if u.grant else '', 'asked': u.req.asked,
+                'granted': u.started, 'first_test': u.first_test, 'ended': u.ended}
 
     def prepare_only(self) -> None:
         """`natemu-test prepare` (spec R14.4): build and fetch what the selected items need, under the same shared claim and
@@ -109,7 +132,11 @@ class Controller:
         are not reported at all."""
         from testkit import prepare
         live = [i for i in self.session.items if isinstance(i, CaseItem) and not i.preset]
-        failed = prepare.prepare(live, self.pool, self.config)
+        self.t['collected'] = time.time()
+        self.t['prepare'] = rec = {'start': time.time()}
+        try: failed = prepare.prepare(live, self.pool, self.config, rec)
+        finally: rec['end'] = time.time()
+        self.save_timings()
         for it in live:
             if it.nodeid in failed:
                 report_without_running(it, *failed[it.nodeid])
@@ -124,16 +151,21 @@ class Controller:
 
     def run(self) -> None:
         items = self.session.items
+        self.t['collected'] = time.time()
         plain = [i for i in items if not isinstance(i, CaseItem) or i.preset]
         for i in plain:
             i.ihook.pytest_runtest_protocol(item=i, nextitem=None)
+        if plain: self.t['plain'] = [self.t['collected'], time.time()]
         live = [i for i in items if isinstance(i, CaseItem) and not i.preset]
         from testkit import prepare
-        failed = prepare.prepare(live, self.pool, self.config)
+        self.t['prepare'] = rec = {'start': time.time()}
+        try: failed = prepare.prepare(live, self.pool, self.config, rec)
+        finally: rec['end'] = time.time()
         for it in live:
             if it.nodeid in failed: report_without_running(it, *failed[it.nodeid])
         live = [i for i in live if i.nodeid not in failed]
         units, refused = build_units(live, self.config, self.pool)
+        self.units = units
         for it, c, r in refused: report_without_running(it, c, r)
         for u in units: self.pool.submit(u.req)
         waiting, running = list(units), []
@@ -153,6 +185,7 @@ class Controller:
         finally:
             for u in running: self.kill(u)
             for u in waiting + running: self.pool.release(u.req.id)
+            self.save_timings()
 
     def start(self, u: Unit, grant) -> bool:
         lock = poolmod.vm_lock_file()
@@ -195,6 +228,8 @@ class Controller:
             hook.pytest_runtest_logstart(nodeid=ev['nodeid'], location=tuple(ev['location']))
         elif ev['kind'] == 'report':
             rep = hook.pytest_report_from_serializable(config=self.config, data=ev['data'])
+            st = ev['data'].get('start') or 0
+            if st and (u.first_test is None or st < u.first_test): u.first_test = st
             if isinstance(rep.longrepr, list): rep.longrepr = tuple(rep.longrepr)       # JSON turned the skip tuple into a list
             hook.pytest_runtest_logreport(report=rep)
             if rep.when == 'teardown' or (rep.when == 'setup' and not rep.passed):
@@ -205,6 +240,7 @@ class Controller:
     def finish(self, u: Unit) -> None:
         if u.proc.poll() is None: self.kill(u, 'timed out after %.0f s' % u.timeout)
         self.tail(u)
+        u.ended = time.time()
         code = u.proc.returncode
         why = f'worker died (signal {-code})' if code is not None and code < 0 else f'worker ended with status {code}'
         if getattr(u, 'killed', None): why = u.killed
@@ -228,6 +264,7 @@ class Controller:
 
     def kill(self, u: Unit, why: str = 'run interrupted') -> None:
         u.killed = why
+        if u.ended is None: u.ended = time.time()
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try: os.killpg(u.proc.pid, sig)
             except ProcessLookupError: break

@@ -44,10 +44,13 @@ def run(args: list[str], run_id: str | None = None) -> int:
     prune(paths.runs_dir(root))
     os.environ['TESTKIT_RUN_DIR'] = str(d)
     argv = ['-c', str(root / 'pytest.ini'), '--rootdir', str(root), f'--junitxml={d / "junit.xml"}', *args]
+    from testkit import timings
     try:
         code = int(pytest.main(argv))
     finally:
+        t = time.time()
         cleanup(rid, root)
+        timings.update(d, pytest_end=t, cleanup=[t, time.time()], finished=time.time())
     (d / 'result.json').write_text(json.dumps({'exit': code, 'finished': time.time()}))
     return code
 

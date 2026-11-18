@@ -36,8 +36,15 @@ tools/natemu-test prepare --tier bench    # build and fetch what a selection nee
 
 Preparation only claims the machine when something is missing; what is already in the cache is just looked up.
 
-Each run keeps its output in `.natemu/runs/<id>/` (JUnit in `junit.xml`, every worker's log under `units/`). The 20
-newest runs are kept, and any run folder with a file named `keep` in it.
+Each run keeps its output in `.natemu/runs/<id>/` (JUnit in `junit.xml`, every worker's log under `units/`, each
+runner case's log under `runner/`). A passed case's output folder is deleted as soon as it passes; a failed case keeps
+its own in `out/<case>` (`run --keep-outputs` keeps them all). The 20 newest runs are kept, and any run folder with a
+file named `keep` in it.
+
+At the end of every run a `times` section says where the time went: start-up and collection, preparation (what was
+built and what came from the cache), the tests themselves, and the report, with each family's share and its longest
+unit. `tools/natemu-test times [RUN] --detail` shows it again later with the cleanup after the run, every unit split
+into queue, start-up and test time, and the slowest requirements to prepare.
 
 ## What a result means
 
@@ -114,6 +121,14 @@ identified by what it was built from, and is shared by every checkout. Entries a
 run the cache is cleaned down to its cap (100 GiB; `NATEMU_TEST_CACHE_CAP`), least recently used first, keeping what
 any live checkout used last and what running runs hold. `tools/natemu-test gc` cleans on demand. Each checkout's own
 cargo `target/` folder is not part of it.
+
+```sh
+tools/natemu-test clean      # this checkout's finished run folders and leftover temporary folders; cache down to its cap
+tools/natemu-test purge      # the same, and every cache entry no running run uses: the next run rebuilds what it needs
+```
+
+Both take `--dry-run` to say what would go and how much. Neither touches a running run, a run folder with a `keep`
+file, the current Python environment or the machine's scheduler state and recorded durations.
 
 Downloads are declared once in `tests/resources.toml` with their URLs and pinned sha256; nothing is used unverified.
 

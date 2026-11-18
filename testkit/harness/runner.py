@@ -6,6 +6,7 @@ TESTKIT_SEED_ANSWERS=1 (QEMU runs, each case's answers go to <run>/answers/<case
 `natemu-test lock FAMILY --from-run RUN [RUN ...]` (tools/reference/answers.py); two seeding runs keep only the provisional
 answers both agree on. Each case reports per case where the runner
 writes per-case results (`adapters` below); a runner that writes none is judged by its exit status alone, and says so.
+A passed case's output folder is deleted when it ends (`drop_outputs`); a failed case's stays in <run>/out/<case>.
 
     [[suite]] kind = "judged"  harness = "runner"
     [suite.cases.<name>]  argv = ["tools/run_x.py", "--fexc", "{fexc}", "--out", "{out}", ...]   (also {raw},
@@ -17,6 +18,7 @@ import fnmatch
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -86,6 +88,14 @@ def per_case(out_dir: pathlib.Path, name: str) -> list | None:
     return None
 
 
+def drop_outputs(o: pathlib.Path) -> None:
+    """A passed case's output folder goes (gate runs left 4 GB of them); its log in <run>/runner/ stays. A failed case
+    keeps its outputs, and TESTKIT_KEEP_OUTPUTS=1 (`run --keep-outputs`) keeps every case's."""
+    if os.environ.get('TESTKIT_KEEP_OUTPUTS') == '1': return
+    for d in (o, o.with_name(o.name + '.first')):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def legacy_raw():
     from testkit.sched.pool import raw_root
     return raw_root() or '/nonexistent-natemu-raw'
@@ -107,7 +117,7 @@ class Runner:
 
     def requirements(self, fam, suite, variant):
         reqs = [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'), Requirement('legacy', 'target'),
-                Requirement('artifact', 'qemu-system')]
+                Requirement('artifact', 'qemu-system'), Requirement('artifact', 'fex-asm')]
         return reqs + [Requirement('input-root', 'root')]
 
     def resolve(self, req):
@@ -157,6 +167,7 @@ class Runner:
             res = CaseResult('passed' if ok else 'failed', ' | '.join(notes),
                              sub=[SubResult(name, oc, msg) for name, oc, msg in (subs or [])])
             out[it.nodeid] = res
+            if ok and all(oc != 'failed' for _, oc, _ in subs or []): drop_outputs(o)
         return out
 
     def once(self, argv, env, o, rundir, case, attempt, spec, it):

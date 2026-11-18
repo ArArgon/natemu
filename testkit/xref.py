@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import sys
+import shutil
 import tempfile
 
 from testkit import artifacts, family, lock
@@ -121,6 +122,7 @@ def main(argv=None):
             report.append(r)
             print(f'{fam.name}/{s.name}: {r["differ"]} of {r["programs"]} differ', flush=True)
             a.output.write_text(json.dumps(report, indent=1) + '\n')
+    shutil.rmtree(work, ignore_errors=True)
     print(f'wrote {a.output}')
 
 

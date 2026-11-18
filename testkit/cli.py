@@ -68,6 +68,21 @@ def cmd_gc(args):
     return 0
 
 
+def cmd_clean(args):
+    from testkit import clean
+    return clean.clean(dry='--dry-run' in args)
+
+
+def cmd_purge(args):
+    from testkit import clean
+    return clean.clean(dry='--dry-run' in args, purge=True)
+
+
+def cmd_times(args):
+    from testkit import timings
+    return timings.main(args)
+
+
 def cmd_lock(args):
     """Build each deterministic suite's input, seed its answers, write tests.lock (spec R2.3, R2.8)."""
     import pathlib

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -81,6 +82,11 @@ class Programs:
         return next((r for pat, r in ov.items() if fnmatch.fnmatchcase(name, pat)), suite.reference)
 
     def seed(self, fam, suite, rules=None) -> dict:
+        work = pathlib.Path(tempfile.mkdtemp(prefix='testkit-seed-'))
+        try: return self._seed(fam, suite, work)
+        finally: shutil.rmtree(work, ignore_errors=True)
+
+    def _seed(self, fam, suite, work) -> dict:
         """Answers from each case's reference: `qemu` (the pinned QEMU user build, through ref.run_programs; a program may
         name a `reference_program` twin that QEMU runs instead, as gen_br66 does), `x86` (tools/reference/ref_native.py on
         NATEMU_X86_HOST; suite `x86_flag` is the CPU flag it must have) or `fex` (natemu's own result: the reference for x87
@@ -88,7 +94,6 @@ class Programs:
         from testkit import family as fammod
         ref, _ = _ref()
         _, programs = build_input(fam, suite.input)
-        work = pathlib.Path(tempfile.mkdtemp(prefix='testkit-seed-'))
         os.environ.setdefault('NATEMU_REFERENCE_BACKEND', 'apple')
         os.environ['NATEMU_REF_CACHE'] = 'off'
         by_ref = {}
@@ -231,7 +236,8 @@ class Programs:
     def _diff(p, vm) -> str:
         """Seed this one case to show what differs (needs the QEMU reference: R2.4)."""
         ref, _ = _ref()
-        res, _ = ref.run_programs([p], tempfile.mkdtemp(prefix='testkit-diff-'), artifacts.qemu_user())
+        with tempfile.TemporaryDirectory(prefix='testkit-diff-') as td:
+            res, _ = ref.run_programs([p], td, artifacts.qemu_user())
         return '; '.join(ref.compare(res[0], [ref.num(x) for x in vm['gpr']], ref.num(vm['rflags']), ref.num(vm['rip']),
                                      vm['memory'])) or 'no difference under ref.compare'
 

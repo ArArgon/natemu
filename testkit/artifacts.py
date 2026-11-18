@@ -269,6 +269,13 @@ def fex_asm() -> pathlib.Path:
     FEX pin, extracted from the submodule's git objects, which every worktree shares through the main repository, so a
     fresh worktree's empty third_party/FEX needs no fetch. Initialises the submodule only if those objects are missing."""
     if p := _pinned('fex-asm'): return pathlib.Path(p)
+    try: return _fex_asm()
+    except subprocess.CalledProcessError as e:      # a build failure of the cases that need it, never of the whole run
+        raise BuildFailure('fex-asm', f'{" ".join(map(str, e.cmd[:4]))}: exit {e.returncode}: '
+                                      f'{(e.stderr or b"")[-800:]!r}') from None
+
+
+def _fex_asm() -> pathlib.Path:
     pin = _git('rev-parse', 'HEAD:third_party/FEX').strip()
     root = paths.repo_root()
 

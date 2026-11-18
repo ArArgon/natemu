@@ -16,6 +16,7 @@ def pytest_addoption(parser):
     g.addoption('--fresh', action='store_true', help='never reuse an earlier result')
     g.addoption('--priority', default=None, choices=['interactive', 'gate'])
     g.addoption('--diff', action='store_true', help='on a failure, seed the one case to show what differs')
+    g.addoption('--keep-outputs', action='store_true', help="keep passed cases' output folders in the run folder")
     g.addoption('--testkit-worker', default=None, help=argparse_hidden())
     g.addoption('--testkit-report', default=None, help=argparse_hidden())
     g.addoption('--testkit-inprocess', action='store_true', help='run items in this process (no run loop)')
@@ -30,6 +31,9 @@ def argparse_hidden():
 
 
 def pytest_configure(config):
+    if config.getoption('keep_outputs'):
+        import os
+        os.environ['TESTKIT_KEEP_OUTPUTS'] = '1'       # workers inherit it (testkit.harness.runner.drop_outputs)
     config.pluginmanager.register(Summary(), 'testkit-summary')
     import importlib
     config.pluginmanager.register(importlib.import_module('testkit.runloop'), 'testkit-runloop')
@@ -68,6 +72,16 @@ class Summary:
             self.items.append((c, report.nodeid, reason))
 
     def pytest_terminal_summary(self, terminalreporter):
+        t = getattr(terminalreporter.config, '_testkit_timings', None)
+        if t and t.get('collected'):
+            import time
+            from testkit import timings
+            terminalreporter.section('times')
+            try: lines = timings.brief(dict(t, pytest_end=time.time()))
+            except Exception as e: lines = [f'could not summarize the times: {e!r}']
+            for line in lines:
+                terminalreporter.write_line(line)
+            terminalreporter.write_line('  (cleanup and per-unit detail: tools/natemu-test times %s --detail)' % t['run'])
         groups = {}
         for c, nodeid, reason in self.items:
             if c in ('reused', 'wrapped'): continue

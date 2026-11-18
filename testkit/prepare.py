@@ -14,8 +14,11 @@ class BuildFailure(Exception):
         super().__init__(f'{name}: {reason}'); self.name, self.reason = name, reason
 
 
-def prepare(items, pool, config) -> dict:
-    """nodeid -> (category, reason) for items whose requirements could not be prepared."""
+def prepare(items, pool, config, record: dict | None = None) -> dict:
+    """nodeid -> (category, reason) for items whose requirements could not be prepared. `record` (testkit.timings)
+    gets each requirement's time, whether it was built or fetched, and the wait for the CPU claim."""
+    rec = record if record is not None else {}
+    rec.setdefault('reqs', []); rec.setdefault('waited', 0.0)
     needs = {}                  # requirement -> (harness, [items])
     for it in items:
         if not hasattr(it.harness, 'requirements'): continue
@@ -27,14 +30,17 @@ def prepare(items, pool, config) -> dict:
     tr = config.pluginmanager.get_plugin('terminalreporter')
     failed = {}
 
-    def attempt(r, harness, its):
+    def attempt(r, harness, its, built=False):
+        t0, ok = time.time(), False
         try:
             entries = harness.resolve(r)
             cache.lease(run_id, [cache.entry_of(e) for e in entries if cache.entry_of(e)])
+            ok = True
         except Unpreparable as e:
             for it in its: failed[it.nodeid] = ('unpreparable', str(e))
         except BuildFailure as e:
             for it in its: failed[it.nodeid] = ('build-failure', str(e))
+        rec['reqs'].append({'kind': r.kind, 'name': str(r.name), 's': time.time() - t0, 'built': built, 'ok': ok})
 
     # First pass, no claim: everything already in the cache is only looked up (and leased).
     missing = []
@@ -47,15 +53,17 @@ def prepare(items, pool, config) -> dict:
     req = Request(id=uuid.uuid4().hex, owner_pid=os.getpid(), cores=min(4, pool.cfg.p_cores), label='prepare',
                   worktree=str(config.rootpath.name))
     pool.submit(req)
+    asked = time.time()
     said = None
     while not pool.poll(req.id):
         w = pool.waiting_reason(req.id)
         if w != said and tr: tr.write_line(f'testkit: preparing waits: {w}'); said = w
         time.sleep(0.2)
+    rec['waited'] = time.time() - asked
     try:
         for r in missing:
             if tr: tr.write_line(f'testkit: preparing {r.kind} {r.name}')
-            attempt(r, *needs[r])
+            attempt(r, *needs[r], built=True)
     finally:
         pool.release(req.id)
     return failed
