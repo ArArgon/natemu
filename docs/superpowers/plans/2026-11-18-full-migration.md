@@ -183,3 +183,8 @@ answer is never stored; a run never needs QEMU). These revisions replace the tas
 - **Bulk migration runs in parallel agents,** one per runner family (faults, smp, system, io, boot, static), once the
   answer hooks and the input root have landed; each brings its family to locked, per-case results and reports test-side
   fixes and natemu findings.
+- **Where an expectation lives (owner, November 18):** answers produced by running a reference (QEMU, x86, the model,
+  FEX) go in the lock with hash, short value and reproduction steps. Expectations derived by reasoning (SDM tables,
+  hand-computed values) are code: inline in the test beside the case, reviewed as code, no lock and no reproduction
+  steps. A check that needs no VM (a rule table, the decoder, the FP model, a parser) belongs in a unit test (cargo test or
+  pytest); one that judges what natemu does when it runs guest code is an integration test, even with a static expectation.
