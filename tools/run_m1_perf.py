@@ -42,7 +42,7 @@ from io_common import VM_LOCK  # noqa: E402
 from raw_root import RAW_ROOT  # noqa: E402
 
 PERF = RAW_ROOT / 'm1-perf'
-BASELINE_COMMIT = '33a99fb8'
+BASELINE_COMMIT = 'ecec5d77'   # main after the Nov 17 rebase (was 33a99fb8)
 FEXC = RAW_ROOT / 'batch1-fexc-20261116-03/obj/fexc'
 FIO_PREP = RAW_ROOT / 'io-benchmark-prep-20261108-01'
 BLOCK_INPUTS = RAW_ROOT / 'io3-block-20261108-01/inputs-01'
