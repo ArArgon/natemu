@@ -65,6 +65,16 @@ def build_lock(exclusive: bool):
         fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
 
+@functools.cache
+def reference_backend() -> str:
+    """ref.py's QEMU backend for wrapped steps: docker when its pinned image is here, else Apple's container (which
+    pulls its image by a pinned digest)."""
+    if str(TOOLS / 'reference') not in sys.path: sys.path.insert(0, str(TOOLS / 'reference'))
+    import ref
+    r = subprocess.run(['docker', 'image', 'inspect', ref.IMAGE], capture_output=True)
+    return 'docker' if r.returncode == 0 else 'apple'
+
+
 class Legacy:
     def cases(self, fam, suite):
         replaced = set(suite.params.get('replaced', []))
@@ -129,7 +139,9 @@ class Legacy:
         if attempt:                                     # keep the first attempt's output beside the rerun's (R8.5)
             first = rundir / 'out' / s.name
             if first.exists(): first.rename(first.with_name(first.name + '.first'))
-        env = dict(os.environ, NATEMU_PREBUILT='1', NATEMU_VM_LOCK_HELD='1')
+        from testkit.sched.pool import raw_root
+        env = dict(os.environ, NATEMU_PREBUILT='1', NATEMU_VM_LOCK_HELD='1', NATEMU_RAW_ROOT=str(raw_root()))   # as tools/with-env
+        env.setdefault('NATEMU_REFERENCE_BACKEND', reference_backend())
         if s.name in ('cargo-test', 'cargo-test-fexc'): env['NATEMU_REQUIRE_QEMU_IMG'] = '1'
         t0 = time.time()
         with open(log, 'wb') as f:

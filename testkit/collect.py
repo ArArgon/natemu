@@ -27,10 +27,10 @@ class FamilyFile(pytest.File):
                     met = {k[5:]: ('real' if v.get(k) else 'hidden') for k, _ in v.params if k.startswith('host.')}
                     now = sorted(c for c in cases if fam.rules(suite.name, c, v, met))
                     if now != sorted(locked_ex.get(v.id, [])):
-                        yield ExclusionCheck.from_parent(self, name=f'{suite.name}::(exclusions)[{v.id}]',
+                        yield ExclusionCheck.from_parent(self, name=f'{suite.name}/(exclusions)[{v.id}]',
                                                          why=f'{len(now)} excluded now, {len(locked_ex.get(v.id, []))} in the lock')
                 for case in cases:
-                    name = f'{suite.name}::{case}' + (f'[{v.id}]' if v.params else '')
+                    name = f'{suite.name}/{case}' + (f'[{v.id}]' if v.params else '')
                     yield CaseItem.from_parent(self, name=name, fam=fam, suite=suite, case=case, variant=v,
                                                place=place, harness=harness, lock_status=status)
 
