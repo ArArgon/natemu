@@ -145,8 +145,13 @@ answer is never stored; a run never needs QEMU). These revisions replace the tas
   directly are converted one by one. Keys are machine-independent: the program or image bytes, the QEMU pin (source
   tarball sha256 and build options), the QEMU arguments; never the backend, a binary hash or a code hash. Mismatch
   details need `--diff` (seeds the one case live).
-- **Approximate comparisons:** `run_i6b`'s corpus is compared within 2 ulp, which a hash cannot express. Open: keep it
-  live-QEMU-free by locking the reference values themselves (storing answers), or make it exact. Asked of the owner.
+- **References (owner, November 18):** every case is checked against correct x86 behavior, from whichever source gives
+  it (QEMU or the x86 machine; choosing is the test writer's job, R2.13a), except x87: x87 is checked against FEX's
+  result (reduced precision, the only x87 mode natemu has: `tools/fexc/fexc.cpp` fixes X87REDUCEDPRECISION=1) until
+  accurate 80-bit x87 exists (docs/restructure/afp-accurate-plan.md), when the accurate variant moves to x86 answers.
+  So the programs harness gains a third reference, `fex` (seeded by running natemu; the lock records that provenance),
+  and `run_i6b`'s 2-ulp tolerance against QEMU goes away: its 48 x87 programs take `fex`, its 64 SSE4.2 PCMPxSTRx
+  programs keep QEMU's answers (QEMU and the Ryzen agree on all 64, checked November 18).
 - **Task 2' (inputs and state):** the input root stays an immutable cache entry. Writable state (`.vm.lock`,
   `.net-ports.lock`, `asm-cache.sqlite`, `build_slice1`'s run folder) moves to `NATEMU_STATE_ROOT` (default: the raw
   root, so the old suite is unchanged), set by testkit to a per-machine state folder. Added inputs: the `s2d` corpus
