@@ -6,10 +6,13 @@ use crate::execution::io::Transfer;
 use natemu_abi::guest_memory::GuestRam;
 
 /// VIRTQ_DESC_F_NEXT and VIRTQ_DESC_F_WRITE: the only descriptor flags with no feature to
-/// negotiate (indirect descriptors are not offered).
+/// negotiate.
 const NEXT: u16 = 1;
 const WRITE: u16 = 2;
 const PLAIN_FLAGS: u16 = NEXT | WRITE;
+/// VIRTQ_DESC_F_INDIRECT (virtio 1.3 §2.7.5.3): the buffer is a table of descriptors. Only with
+/// VIRTIO_RING_F_INDIRECT_DESC (the disk offers it).
+const INDIRECT: u16 = 4;
 
 /// One split-ring descriptor (virtio 1.3 §2.7.5), decoded from an owned table copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,6 +55,9 @@ impl Descriptor {
     }
     pub fn has_next(&self) -> bool {
         self.flags & NEXT != 0
+    }
+    pub fn is_indirect(&self) -> bool {
+        self.flags & INDIRECT != 0
     }
 }
 
@@ -152,6 +158,19 @@ impl Snapshot {
     }
     /// Return an entire validated direct chain or an error; never an accepted prefix.
     pub fn chain(&self, q: Queue) -> Result<Option<(u16, Vec<Descriptor>)>> {
+        self.chain_with(q, None)
+    }
+    /// [`Self::chain`]; with `indirect` (negotiated: the most descriptors a chain through a table may
+    /// have) the chain may end in one descriptor naming a table (§2.7.5.3.2: zero or more direct
+    /// descriptors, then that one), returned last for [`indirect_chain`] once the table is copied. That
+    /// descriptor has no NEXT (§2.7.5.3.1) and a length a non-zero multiple of 16; its WRITE flag is
+    /// ignored (§2.7.5.3.2). The bound is the device's, not the queue's size: Linux sizes a table by
+    /// its segments, not by the ring (QEMU allows 1024 whatever the ring).
+    pub fn chain_with(
+        &self,
+        q: Queue,
+        indirect: Option<u16>,
+    ) -> Result<Option<(u16, Vec<Descriptor>)>> {
         let pending = self.avail_index().wrapping_sub(q.next_avail);
         if pending > q.size {
             return Err("virtio available index exceeds queue capacity".into());
@@ -162,7 +181,12 @@ impl Snapshot {
         let slot = 4 + usize::from(q.next_avail % q.size) * 2;
         let head = u16::from_le_bytes([self.avail[slot], self.avail[slot + 1]]);
         // The whole chain or an error: every index in the table, at most `size` descriptors (no
-        // loop), only negotiated flags (no indirect), and a total length that fits in u32.
+        // loop), only negotiated flags, and a total length that fits in u32.
+        let flags = if indirect.is_some() {
+            PLAIN_FLAGS | INDIRECT
+        } else {
+            PLAIN_FLAGS
+        };
         let (mut chain, mut index, mut total) = (Vec::new(), head, 0u32);
         loop {
             if index >= q.size {
@@ -172,8 +196,23 @@ impl Snapshot {
                 return Err("virtio chain: longer than the queue (a loop)".into());
             }
             let d = Descriptor::read(&self.table, index);
-            if d.flags() & !PLAIN_FLAGS != 0 {
+            if d.flags() & !flags != 0 {
                 return Err("virtio unnegotiated descriptor flags".into());
+            }
+            if d.is_indirect() {
+                if d.has_next() {
+                    return Err("virtio chain: an indirect descriptor with NEXT".into());
+                }
+                if d.len() == 0 || d.len() % 16 != 0 {
+                    return Err(
+                        "virtio chain: an indirect table's length is not a multiple of 16".into(),
+                    );
+                }
+                if chain.len() + d.len() as usize / 16 > usize::from(indirect.unwrap_or(0)) {
+                    return Err("virtio chain: longer than the device allows (indirect)".into());
+                }
+                chain.push(d);
+                break;
             }
             total = total
                 .checked_add(d.len())
@@ -188,11 +227,51 @@ impl Snapshot {
     }
 }
 
+/// The chain of a [`Snapshot::chain_with`] result whose last descriptor is indirect, its table copied
+/// into `table` (that descriptor's length): the direct descriptors, then the table's chain from entry 0.
+/// The whole chain or an error: every next index inside the table, at most its entries (no loop), no
+/// INDIRECT inside it (§2.7.5.3.1), and a total length that fits in u32.
+pub(crate) fn indirect_chain(chain: &[Descriptor], table: &[u8]) -> Result<Vec<Descriptor>> {
+    let (last, direct) = chain.split_last().ok_or("virtio chain: empty")?;
+    debug_assert!(last.is_indirect() && table.len() == last.len() as usize);
+    let entries = table.len() / 16;
+    let mut total = 0u32;
+    for d in direct {
+        total = total
+            .checked_add(d.len())
+            .ok_or("virtio chain: total length overflows")?;
+    }
+    let (mut out, mut index) = (direct.to_vec(), 0u16);
+    loop {
+        if usize::from(index) >= entries {
+            return Err("virtio indirect chain: descriptor index out of range".into());
+        }
+        if out.len() - direct.len() == entries {
+            return Err("virtio indirect chain: longer than its table (a loop)".into());
+        }
+        let d = Descriptor::read(table, index);
+        if d.flags() & !PLAIN_FLAGS != 0 {
+            return Err("virtio indirect chain: INDIRECT or unknown descriptor flags".into());
+        }
+        total = total
+            .checked_add(d.len())
+            .ok_or("virtio chain: total length overflows")?;
+        out.push(d);
+        if !d.has_next() {
+            return Ok(out);
+        }
+        index = d.next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn put(s: &mut Snapshot, i: usize, addr: u64, len: u32, flags: u16, next: u16) {
-        let d = &mut s.table[i * 16..i * 16 + 16];
+        entry(&mut s.table, i, addr, len, flags, next);
+    }
+    fn entry(table: &mut [u8], i: usize, addr: u64, len: u32, flags: u16, next: u16) {
+        let d = &mut table[i * 16..i * 16 + 16];
         d[..8].copy_from_slice(&addr.to_le_bytes());
         d[8..12].copy_from_slice(&len.to_le_bytes());
         d[12..14].copy_from_slice(&flags.to_le_bytes());
@@ -214,6 +293,75 @@ mod tests {
         assert!(s.chain(q).is_err());
         put(&mut s, 0, 0x1000, 4, 2, 0);
         assert_eq!(s.chain(q).unwrap().unwrap().1.len(), 1);
+    }
+    #[test]
+    fn indirect_tables_are_followed_only_when_negotiated_and_checked() {
+        let mut s = Snapshot::new(8);
+        let q = Queue {
+            size: 8,
+            ..Default::default()
+        };
+        let refused = |s: &Snapshot, why: &str| {
+            let e = s.chain_with(q, Some(8)).unwrap_err().to_string();
+            assert!(e.contains(why), "{e:?} lacks {why:?}");
+        };
+        s.avail[2] = 1;
+        // A head naming a three-entry table; its WRITE flag is ignored.
+        put(&mut s, 0, 0x8000, 48, INDIRECT | WRITE, 0);
+        assert!(s.chain(q).unwrap_err().to_string().contains("unnegotiated"));
+        let (head, chain) = s.chain_with(q, Some(8)).unwrap().unwrap();
+        assert_eq!((head, chain.len(), chain[0].addr()), (0, 1, 0x8000));
+        // The table's chain from entry 0, in next order: header, data, status.
+        let mut table = vec![0; 48];
+        entry(&mut table, 0, 0x1000, 16, NEXT, 2);
+        entry(&mut table, 2, 0x2000, 512, NEXT | WRITE, 1);
+        entry(&mut table, 1, 0x3000, 1, WRITE, 0);
+        let all = indirect_chain(&chain, &table).unwrap();
+        let addrs: Vec<u64> = all.iter().map(Descriptor::addr).collect();
+        assert_eq!(addrs, [0x1000, 0x2000, 0x3000]);
+        assert!(!all[0].is_write_only() && all[2].is_write_only());
+        let bad = |t: &[u8], why: &str| {
+            let e = indirect_chain(&chain, t).unwrap_err().to_string();
+            assert!(e.contains(why), "{e:?} lacks {why:?}");
+        };
+        let mut t = table.clone();
+        entry(&mut t, 1, 0x3000, 1, WRITE | NEXT, 3);
+        bad(&t, "out of range");
+        entry(&mut t, 1, 0x3000, 1, WRITE | NEXT, 0);
+        bad(&t, "loop");
+        entry(&mut t, 1, 0x3000, 48, INDIRECT, 0);
+        bad(&t, "INDIRECT");
+        entry(&mut t, 0, 0x1000, u32::MAX, NEXT, 2);
+        entry(&mut t, 1, 0x3000, 1, WRITE, 0);
+        bad(&t, "overflows");
+        // The descriptor naming a table: no NEXT, a non-zero multiple of 16, within the device's bound (8 here).
+        put(&mut s, 0, 0x8000, 48, INDIRECT | NEXT, 1);
+        refused(&s, "with NEXT");
+        for len in [0, 20] {
+            put(&mut s, 0, 0x8000, len, INDIRECT, 0);
+            refused(&s, "multiple of 16");
+        }
+        put(&mut s, 0, 0x8000, 9 * 16, INDIRECT, 0);
+        refused(&s, "longer than the device allows");
+        // Direct descriptors, then a table (§2.7.5.3.2): seven entries fit beside one, eight do not. The bound is
+        // the device's, not the queue's: a 16-entry table passes a 16 bound on an 8-entry queue.
+        put(&mut s, 0, 0x1000, 16, NEXT, 1);
+        put(&mut s, 1, 0x8000, 8 * 16, INDIRECT, 0);
+        refused(&s, "longer than the device allows");
+        put(&mut s, 1, 0x8000, 7 * 16, INDIRECT, 0);
+        let (_, chain) = s.chain_with(q, Some(8)).unwrap().unwrap();
+        assert_eq!(chain.len(), 2);
+        let mut table = vec![0; 7 * 16];
+        entry(&mut table, 0, 0x2000, 512, NEXT | WRITE, 1);
+        entry(&mut table, 1, 0x3000, 1, WRITE, 0);
+        let addrs: Vec<u64> = indirect_chain(&chain, &table)
+            .unwrap()
+            .iter()
+            .map(Descriptor::addr)
+            .collect();
+        assert_eq!(addrs, [0x1000, 0x2000, 0x3000]);
+        put(&mut s, 1, 0x8000, 15 * 16, INDIRECT, 0);
+        assert!(s.chain_with(q, Some(16)).unwrap().is_some());
     }
     #[test]
     fn loops_bad_heads_and_overlong_totals_are_refused() {
