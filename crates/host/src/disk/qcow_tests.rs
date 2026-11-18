@@ -18,24 +18,9 @@ use std::{
 
 const SECTOR: usize = 512;
 
-/// [`crate::disk::open`], retried for up to 2 s while the lock is "held by another process". Tests run in threads of
-/// one process, and others spawn children (qemu-img, hdiutil): a spawn duplicates every open descriptor in the child
-/// until it execs, and a flock is released only when all copies are closed, so an image this test just dropped can
-/// look locked for a moment. Test-isolation only (natemu forks nothing around a reopen); tests that expect the
-/// refusal use [`error`], which does not retry.
+/// [`crate::disk::open`] via [`crate::disk::retry_lock`]; tests that expect the refusal use [`error`], which does not retry.
 fn open(path: &Path, read_only: bool, backing: Option<&Path>) -> crate::Result<crate::disk::Image> {
-    let start = Instant::now();
-    loop {
-        match crate::disk::open(path, read_only, backing) {
-            Err(e)
-                if e.contains("held by another process")
-                    && start.elapsed() < Duration::from_secs(2) =>
-            {
-                std::thread::sleep(Duration::from_millis(5))
-            }
-            r => return r,
-        }
-    }
+    crate::disk::retry_lock(|| crate::disk::open(path, read_only, backing))
 }
 
 /// A scratch folder, deleted on drop.
