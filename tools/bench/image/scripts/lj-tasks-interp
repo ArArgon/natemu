@@ -1,0 +1,16 @@
+cd /bench/lj && luajit -joff euler14-bit.lua 1e6 > /tmp/lj/euler14-bit.out
+cd /bench/lj && luajit -joff ray.lua 1 > /tmp/lj/ray.out
+cd /bench/lj && luajit -joff fasta.lua 2e5 | luajit -joff k-nucleotide.lua > /tmp/lj/k-nucleotide.out
+cd /bench/lj && luajit -joff life.lua > /tmp/lj/life.out
+cd /bench/lj && luajit -joff nsieve.lua 9 > /tmp/lj/nsieve.out
+cd /bench/lj && luajit -joff mandelbrot.lua 700 > /tmp/lj/mandelbrot.out
+cd /bench/lj && luajit -joff spectral-norm.lua 400 > /tmp/lj/spectral-norm.out
+cd /bench/lj && luajit -joff nbody.lua 2e5 > /tmp/lj/nbody.out
+cd /bench/lj && luajit -joff pidigits-nogmp.lua 700 > /tmp/lj/pidigits-nogmp.out
+cd /bench/lj && luajit -joff fasta.lua 2e5 | luajit -joff revcomp.lua > /tmp/lj/revcomp.out
+cd /bench/lj && luajit -joff recursive-fib.lua 33 > /tmp/lj/recursive-fib.out
+cd /bench/lj && luajit -joff partialsums.lua 1e6 > /tmp/lj/partialsums.out
+cd /bench/lj && luajit -joff binary-trees.lua 12 > /tmp/lj/binary-trees.out
+cd /bench/lj && luajit -joff fannkuch.lua 9 > /tmp/lj/fannkuch.out
+cd /bench/lj && luajit -joff chameneos.lua 2e5 > /tmp/lj/chameneos.out
+cd /bench/lj && luajit -joff coroutine-ring.lua 1e6 > /tmp/lj/coroutine-ring.out

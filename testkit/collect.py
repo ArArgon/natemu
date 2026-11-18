@@ -66,6 +66,7 @@ class CaseItem(pytest.Item):
         for s in r.sub:
             emit_sub(self, s)
         if r.category: self.user_properties.append(('testkit', r.category))
+        if r.category == 'measured': self.user_properties.append(('testkit-note', r.message))
         if r.outcome == 'skipped': pytest.skip(f'{r.category or "skipped"}: {r.message}')
         if r.outcome == 'failed': raise CaseFailure(r.message)
 

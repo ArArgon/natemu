@@ -1,0 +1,115 @@
+#!/bin/sh
+# Benchmark initramfs /init (busybox sh). Kernel command line:
+# bench=build|zstd|hackbench|locks|luajit|luajit-interp|mem|cray|cray-strict|7zip|sqlite|avx|shell [jobs=N]
+# (jobs defaults to the online CPU count). The benchmark runs twice in the one boot: run 1 (cold) and run 2 (warm; same
+# command, outputs removed or overwritten). Each run prints NATEMU-BENCH-START (run 2: START2), the benchmark's own output and
+# timing (busybox time per phase; a NATEMU-BENCH-PHASE / PHASE2 line after each named phase), NATEMU-BENCH-END (END2) with the
+# guest's elapsed seconds (/proc/uptime), then NATEMU-BENCH-VERIFY (VERIFY2) ok or FAIL for that run; then powers off (ACPI S5).
+export PATH=/usr/bin HOME=/tmp
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /tmp
+echo 1 > /proc/sys/kernel/printk          # keep kernel messages off the console between the markers
+bench=none; jobs=$(nproc)
+for a in $(cat /proc/cmdline); do
+    case $a in bench=*) bench=${a#bench=};; jobs=*) jobs=${a#jobs=};; esac
+done
+
+# Pinned workloads (README "The set and why"); each is the same total work at any jobs value.
+B=/bench
+now() { cut -d' ' -f1 /proc/uptime; }
+since() { awk "BEGIN{printf \"%.2f\", $(now) - $1}"; }
+rc=0
+phase() {  # NAME CMD: run CMD timed; a NATEMU-BENCH-PHASE line unless NAME is -; the first failure's status in rc
+    p0=$(now); time sh -c "$2"; r=$?
+    [ "$1" = - ] || echo "NATEMU-BENCH-PHASE$sfx bench=$bench jobs=$jobs name=$1 rc=$r guest_s=$(since $p0)"
+    [ $r = 0 ] || [ $rc != 0 ] || rc=$r
+}
+# zstd: compress with N workers (one frame), decompress (zstd 1.5.7 decompresses one frame single-threaded), then the
+# decompressed output's sha256 (busybox sha256sum) against the input's, both read in the guest, and the pinned value.
+zverify="a=\$(sha256sum < $B/input | cut -d' ' -f1); b=\$(sha256sum < /tmp/out.raw | cut -d' ' -f1)
+[ \"\$a\" = \"\$b\" ] && [ \"\$a\" = @INPUT_SHA@ ] || { echo NATEMU-BENCH-VERIFY FAIL sha256 input=\$a output=\$b want=@INPUT_SHA@; exit 1; }"
+case $bench in
+build)     cd $B/zstd-1.5.7
+           run() { phase - "make -s -C lib -j$jobs libzstd.a CC=gcc AR=x86_64-linux-gnu-ar CFLAGS='-O0 -ffile-prefix-map=$PWD/=' ZSTD_LEGACY_SUPPORT=0 ZSTD_LIB_DICTBUILDER=0 >/tmp/build.log 2>&1"; } ;;
+zstd)      run() { phase compress "zstd -q -f -12 -B4194304 -T$jobs $B/input -o /tmp/out.zst"
+                   phase decompress "zstd -q -f -d /tmp/out.zst -o /tmp/out.raw"
+                   phase verify "$zverify"; } ;;
+hackbench) run() { phase - "hackbench -p -g 4 -l 5000"; } ;;      # fixed work at any jobs; scaling from the vCPU count
+locks)     run() { phase - "locks $jobs $((200000000 / jobs))"; } ;;
+# luajit: LuaJIT 2.1 (static) running 16 of Mike Pall's benchmark programs (LuaJIT-test-cleanup/bench), each its own process;
+# tasks in /bench/lj/tasks, run by xargs -P jobs (same total work at any jobs; the fasta ones are pipelines).
+luajit)    mkdir -p /tmp/lj; run() { phase - "xargs -P$jobs -I{} sh -c '{}' < $B/lj/tasks"; } ;;
+# mem: stress-ng 0.19.02 (static), three phases with fixed bogo-op counts and --verify. --vm-bytes and --mmap-bytes are totals
+# divided among the workers, so they are given as 32 MiB x jobs: every worker has a 32 MiB region and ops are divided by jobs.
+mem)       sng="stress-ng --no-rand-seed --verify --metrics"
+           mphase() {  # NAME STRESSOR-OPTIONS OPS: one phase; ok only if stress-ng passed (memchk) with at least OPS bogo ops
+               phase $1 "$sng $2 > /tmp/mem-$1.log 2>&1 && $B/memchk /tmp/mem-$1.log $3"; }
+           run() { mphase vm   "--vm $jobs --vm-bytes $((32 * jobs))M --vm-method lfsr32 --vm-ops 6000" 6000
+                   mphase mmap "--mmap $jobs --mmap-bytes $((32 * jobs))M --mmap-ops 48" 48
+                   mphase fork "--fork $jobs --fork-vm --fork-ops 720" 720; } ;;
+# cray: c-ray 1.1 (c-ray-mt, the multi-threaded version used as a benchmark) rendering the sphfract scene, -t jobs threads.
+cray)      run() { phase - "$B/c-ray-mt -t $jobs -s 1280x960 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+# cray-strict: the same renderer built without -ffast-math (no crtfastmath, so MXCSR DAZ and FTZ stay clear: ordinary IEEE FP).
+cray-strict) run() { phase - "$B/c-ray-mt-strict -t $jobs -s 1280x960 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+# luajit-interp: the same binary and programs with -joff (interpreter only, no JIT), smaller parameters (lj-tasks-interp).
+luajit-interp) mkdir -p /tmp/lj; run() { phase - "xargs -P$jobs -I{} sh -c '{}' < $B/lj/tasks-interp"; } ;;
+# 7zip: 7-Zip 25.01 (7zz): the first 12 MiB of the input compressed with LZMA2 level 5 in 4 MiB blocks, -mmt=jobs (the archive
+# is the same at any jobs), then `7zz t` on the archive; the extracted data's sha256 and the archive's md5 are checked after END.
+7zip)      run() { phase compress "cd /tmp && 7zz a -bso0 -bsp0 -mx=5 -m0=lzma2:c=4m -mmt=$jobs -mtm=off in7.7z in7"
+                   phase test "7zz t -bso0 -bsp0 -mmt=$jobs /tmp/in7.7z"; } ;;
+# sqlite: speedtest1 (SQLite 3.46.1) on an in-memory database, --size 160, --verify (hash of all query results); one process,
+# the same work at any jobs.
+sqlite)    run() { phase - "speedtest1 --memdb --verify --size 160 :memory: > /tmp/st.out"; } ;;
+# avx: x264 0.164 (AVX2 assembly under the guest CPU model) encoding foreman_cif.y4m (Xiph, 300 frames CIF), preset slower,
+# crf 23, --threads jobs; the bitstream's md5 is checked after END (it depends on the thread count, not on the CPU model
+# unless AVX-512 or no SIMD is present).
+avx)       run() { phase - "x264 --preset slower --crf 23 --threads $jobs -o /tmp/x.264 $B/foreman_cif.y4m 2> /tmp/x264.log"; } ;;
+shell)     exec setsid cttyhack sh ;;
+*)         echo "NATEMU-BENCH-ERROR unknown bench=$bench"; poweroff -f ;;
+esac
+
+# Untimed set-up before each run. Run 2 removes run 1's outputs (and the build's objects) so it does the same work again.
+prep() {
+    case $bench in
+    build) [ $1 = 1 ] || make -s -C lib clean >/dev/null 2>&1 ;;
+    zstd)  rm -f /tmp/out.zst /tmp/out.raw ;;
+    7zip)  rm -f /tmp/in7.7z; [ -f /tmp/in7 ] || head -c 12582912 $B/input > /tmp/in7 ;;
+    esac
+}
+# Verification after each run's END marker (outside the timed span): the outputs are deterministic at every jobs value.
+verify() {
+    case $bench in
+    build) got=$rc:$(md5sum lib/libzstd.a | cut -d' ' -f1); want=0:@BUILD_MD5@
+           [ $rc = 0 ] || tail -20 /tmp/build.log ;;
+    zstd)  got=$rc:$(md5sum /tmp/out.zst | cut -d' ' -f1); want=0:@ZSTD_MD5@ ;;
+    luajit) cd /tmp/lj; got=$rc:$(md5sum -c $B/lj/expect.md5 2>&1 | grep -c -v ': OK$'); want=0:0
+           [ "$got" = "$want" ] || md5sum -c $B/lj/expect.md5 2>&1 | grep -v ': OK$' ;;
+    luajit-interp) cd /tmp/lj; got=$rc:$(md5sum -c $B/lj/expect-interp.md5 2>&1 | grep -c -v ': OK$'); want=0:0
+           [ "$got" = "$want" ] || md5sum -c $B/lj/expect-interp.md5 2>&1 | grep -v ': OK$' ;;
+    cray)  got=$rc:$(md5sum /tmp/cray.ppm | cut -d' ' -f1); want=0:@CRAY_MD5@ ;;
+    cray-strict) got=$rc:$(md5sum /tmp/cray.ppm | cut -d' ' -f1); want=0:@CRAYS_MD5@ ;;
+    7zip)  got=$rc:$(cd /tmp && 7zz x -so -bso0 -bsp0 in7.7z | sha256sum | cut -d' ' -f1):$(md5sum /tmp/in7.7z | cut -d' ' -f1)
+           want=0:@IN7_SHA@:@Z7_MD5@ ;;
+    sqlite) got=$rc:$(sed -n 's/^Verification Hash: //p' /tmp/st.out | tr -d ' '); want=0:@SQL_HASH@ ;;
+    avx)   case $jobs in 1) xw=@X264_MD5_1@;; 2) xw=@X264_MD5_2@;; 3) xw=@X264_MD5_3@;; 4) xw=@X264_MD5_4@;;
+                         5) xw=@X264_MD5_5@;; 6) xw=@X264_MD5_6@;; 7) xw=@X264_MD5_7@;; 8) xw=@X264_MD5_8@;; *) xw=no-hash-for-jobs;; esac
+           got=$rc:$(md5sum /tmp/x.264 | cut -d' ' -f1); want=0:$xw
+           grep -E 'cpu capabilities' /tmp/x264.log ;;
+    *)     got=$rc; want=0 ;;
+    esac
+    [ "$got" = "$want" ] && echo "NATEMU-BENCH-VERIFY$sfx ok" || echo "NATEMU-BENCH-VERIFY$sfx FAIL got=$got want=$want"
+}
+
+for r in 1 2; do
+    sfx=; [ $r = 1 ] || sfx=$r
+    rc=0
+    prep $r
+    echo "NATEMU-BENCH-START$sfx bench=$bench jobs=$jobs cpus=$(nproc)"
+    t0=$(now)
+    run
+    echo "NATEMU-BENCH-END$sfx bench=$bench jobs=$jobs rc=$rc guest_s=$(since $t0)"
+    verify
+done
+poweroff -f

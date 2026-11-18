@@ -62,13 +62,15 @@ class Summary:
         if report.when == 'call' or (report.when == 'setup' and not report.passed) or (report.when == 'teardown' and report.failed):
             self.outcome[report.nodeid] = c if c and not (c == 'wrapped' and report.failed) else report.outcome
         if c and (report.when == 'call' or (report.when == 'setup' and report.skipped)):
-            reason = report.longrepr[2] if report.skipped and isinstance(report.longrepr, tuple) else ''
+            reason = report.longrepr[2] if report.skipped and isinstance(report.longrepr, tuple) else \
+                dict(report.user_properties).get('testkit-note', '')
             self.items.append((c, report.nodeid, reason))
 
     def pytest_terminal_summary(self, terminalreporter):
         groups = {}
         for c, nodeid, reason in self.items:
             if c in ('reused', 'wrapped'): continue
+            if c == 'measured': reason = nodeid.rsplit('/', 1)[-1] + ': ' + reason
             groups.setdefault((c, reason.removeprefix('Skipped: ')), []).append(nodeid)
         if not groups: return
         terminalreporter.section('testkit')

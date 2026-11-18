@@ -10,6 +10,7 @@ CATEGORIES = {
     'reused': ('R', 'REUSED'),
     'unsupported': ('u', 'UNSUPPORTED'),
     'wrapped': ('W', 'WRAPPED'),
+    'measured': ('M', 'MEASURED'),
     'exclusion-changed': ('C', 'EXCLUSION CHANGED'),
 }
 GATE_FAILS = ('failed', 'error', 'stale-lock', 'build-failure', 'unpreparable', 'not-runnable', 'exclusion-changed')

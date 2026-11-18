@@ -1,0 +1,100 @@
+# Benchmarks (spec R3.6): the existing tools/bench scripts, wrapped, each alone on the machine; run only when named
+# (`--tier bench`). Numbers are kept per machine and never compared across machines. The guest benchmarks' initramfs is
+# built on the Mac from tools/bench/image (testkit/artifacts.py:bench_image); the kernel is Debian's pinned package.
+[family]
+name = "bench"
+covers = ["tools/bench/**"]
+
+[[suite]]
+name = "bench"
+kind = "legacy"
+harness = "bench"
+tier = "bench"
+params = { timeout = 7200 }
+
+[suite.cases.micro-qemu]
+argv = ["python3", "tools/bench/run_qemu.py", "--out", "{out}", "--reps", "3", "--no-linux-user"]
+
+[suite.cases.micro-natemu]
+argv = ["python3", "tools/bench/run_natemu.py", "--fexc", "{fexc}", "--out", "{out}", "--reps", "3"]
+
+[suite.cases.smp-selftest]
+argv = ["python3", "tools/bench/smp/smp.py", "selftest", "--out", "{out}"]
+
+[suite.cases.smp-det]
+argv = ["python3", "tools/bench/smp/smp.py", "det", "--out", "{out}", "--reps", "2", "--cpus", "2,4"]
+
+[suite.cases.smp-litmus]
+argv = ["python3", "tools/bench/smp/smp.py", "litmus", "--out", "{out}", "--runs", "3", "--tests", "sb,mp"]
+
+[suite.cases.boot-natemu]
+argv = ["python3", "tools/bench/boot.py", "--out", "{out}", "--name", "boot", "--emu", "natemu", "--vcpus", "1",
+        "--kernel", "{kernel}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}", "--cache", "off"]
+
+[suite.cases.boot-qemu]
+argv = ["python3", "tools/bench/boot.py", "--out", "{out}", "--name", "boot", "--emu", "qemu-multi", "--vcpus", "1",
+        "--kernel", "{kernel}"]
+
+[suite.cases.guest-build]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "build", "--emu", "natemu", "--vcpus", "1", "--bench", "build",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-zstd]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "natemu", "--vcpus", "1", "--bench", "zstd",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-hackbench]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-locks]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "locks", "--emu", "natemu", "--vcpus", "1", "--bench", "locks",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-luajit]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit", "--emu", "natemu", "--vcpus", "1", "--bench", "luajit",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-luajit-interp]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "luajit-interp", "--emu", "natemu", "--vcpus", "1", "--bench", "luajit-interp",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-mem]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "mem", "--emu", "natemu", "--vcpus", "1", "--bench", "mem",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-cray]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray", "--emu", "natemu", "--vcpus", "1", "--bench", "cray",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-cray-strict]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray-strict", "--emu", "natemu", "--vcpus", "1", "--bench", "cray-strict",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-7zip]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "7zip", "--emu", "natemu", "--vcpus", "1", "--bench", "7zip",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-sqlite]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite", "--emu", "natemu", "--vcpus", "1", "--bench", "sqlite",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-avx]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "avx", "--emu", "natemu", "--vcpus", "1", "--bench", "avx",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-zstd-qemu]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "zstd",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}"]

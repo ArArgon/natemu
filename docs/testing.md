@@ -111,6 +111,23 @@ cargo `target/` folder is not part of it.
 
 Downloads are declared once in `tests/resources.toml` with their URLs and pinned sha256; nothing is used unverified.
 
+## Benchmarks
+
+```sh
+tools/natemu-test run --tier bench                    # every benchmark, each alone on the machine
+tools/natemu-test run --tier bench -k guest-zstd      # one
+```
+
+`tests/bench` wraps the existing `tools/bench` scripts unchanged: the micro-benchmarks against QEMU, the SMP tools, Linux
+boot times, and the guest benchmarks of [benchmarks](benchmarks.md) (12 programs at 1 vCPU, and `zstd` on QEMU for
+comparison). Each takes the whole machine. Numbers are written per machine, to
+`.natemu/runs/<id>/bench/<machine id>/<benchmark>/`, and never compared across machines.
+
+The guest benchmarks' initramfs is built on the Mac the first time it is needed, from `tools/bench/image` (the reference
+box's recipe, unchanged), inside an amd64 Debian container that Apple's `container` runs through Rosetta; the kernel is
+Debian's pinned package. Building the image takes a while once per machine; after that it comes from the cache. Not
+wrapped yet: the drift canary and stored baselines (`tools/bench/canary.py`), whose inputs still live in `natemu-raw`.
+
 ## Moving the old suite over
 
 `tests/legacy` runs every step of `tools/run_suite.py` that no family has replaced yet, unchanged, with its old pass

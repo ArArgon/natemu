@@ -69,7 +69,8 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
             req = Request(id=uuid.uuid4().hex, owner_pid=os.getpid(), cores=_cores(nd.cores, pool.cfg),
                           exclusive=nd.exclusive, perf=nd.perf or nd.dedicated, priority=prio,
                           asked=time.time(), expected=None if None in exp else sum(exp),
-                          label=f'{g[0].fam.name}/{s.name}' + (f'[{g[0].variant.id}]' if g[0].variant.params else ''),
+                          label=f'{g[0].fam.name}/{s.name}' + (f'/{chunk[0].case}' if s.kind == 'legacy' else '')
+                                + (f'[{g[0].variant.id}]' if g[0].variant.params else ''),
                           worktree=paths.repo_root().name)
             if pool.unsatisfiable(req):
                 refused += [(it, 'not-runnable', f'needs {req.cores} cores; this machine has {pool.cfg.p_cores} '

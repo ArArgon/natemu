@@ -140,8 +140,30 @@ def compile_cache(n: Natemu) -> pathlib.Path:
     return d
 
 
+# Debian 13 (trixie) 20251117, amd64 variant of the multi-platform index, run through Rosetta.
+BENCH_BUILDER = 'docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f'
+
+
+def bench_image() -> pathlib.Path:
+    """The benchmark initramfs (bench.cpio), built on this Mac from tools/bench/image in an amd64 Debian container (spec
+    R1.3, R14.3): an environment input, cached per machine, keyed by the recipe and the builder image."""
+    if p := _pinned('bench-image'): return pathlib.Path(p)
+    recipe = paths.repo_root() / 'tools' / 'bench' / 'image'
+    k = cache.key('bench-image', recipe, BENCH_BUILDER)
+
+    def build(out: pathlib.Path):
+        _run(['container', 'run', '--rm', '--arch', 'amd64', '--cpus', '4', '--memory', '8g',
+              '--volume', f'{recipe}:/recipe:ro', '--volume', f'{out}:/work', BENCH_BUILDER, 'bash', '/recipe/container.sh'],
+             timeout=4 * 3600)
+        if not (out / 'bench.cpio').exists(): raise BuildFailure('bench-image', 'no bench.cpio produced')
+
+    f = cache.get_or_build('bench-image', k, build) / 'bench.cpio'
+    pin_for_run('bench-image', str(f))
+    return f
+
+
 RESOLVERS = {'natemu': lambda: [natemu().entry], 'fexc': lambda: [fexc()], 'nextest': lambda: [nextest()],
-             'qemu-user': lambda: [qemu_user()]}
+             'qemu-user': lambda: [qemu_user()], 'bench-image': lambda: [bench_image()]}
 
 
 def resolve(name: str) -> list[pathlib.Path]:
