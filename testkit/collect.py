@@ -1,0 +1,83 @@
+"""Collect `family.toml` files into pytest items: one CaseItem per (suite, case, variant). Exclusions, placement and
+lock state are decided here, so an item that will not run says why before anything starts (spec R2.13, R5.4)."""
+import pathlib
+
+import pytest
+
+from testkit import family, host
+from testkit.harness import CaseResult
+
+KEY = pytest.StashKey[dict]()       # session stash: nodeid -> CaseResult, filled a batch at a time
+
+
+class FamilyFile(pytest.File):
+    def collect(self):
+        fam = family.load(pathlib.Path(self.path))
+        h = host.detect()
+        require_real = frozenset(self.config.getoption('require_real') or ())
+        for suite in fam.suites:
+            harness = family.harness_for(fam, suite)
+            status = harness.lock_status(fam, suite) if hasattr(harness, 'lock_status') else 'ok'
+            cases = harness.cases(fam, suite)
+            if status != 'ok' and not cases: cases = ['(unlocked)']
+            for v in family.expand(suite):
+                place = family.placement(v, h, require_real)
+                for case in cases:
+                    name = f'{suite.name}::{case}' + (f'[{v.id}]' if v.params else '')
+                    yield CaseItem.from_parent(self, name=name, fam=fam, suite=suite, case=case, variant=v,
+                                               place=place, harness=harness, lock_status=status)
+
+
+class CaseItem(pytest.Item):
+    def __init__(self, *, fam, suite, case, variant, place, harness, lock_status, **kw):
+        super().__init__(**kw)
+        self.fam, self.suite, self.case, self.variant, self.place, self.harness = fam, suite, case, variant, place, harness
+        self.unit_key = (fam.name, suite.name, variant.id)
+        if suite.smoke is True or (isinstance(suite.smoke, list) and case in suite.smoke):
+            self.add_marker('smoke')
+        self.add_marker(suite.kind)
+        skip = None
+        if not place.runnable:
+            skip = ('not-runnable', place.reason)
+        elif lock_status != 'ok':
+            skip = ('stale-lock', f'{suite.name}: lock {lock_status} (run natemu-test lock {fam.dir.name})')
+        elif fam.rules and (why := fam.rules(suite.name, case, variant, dict(place.met))):
+            skip = ('excluded', why)
+        self.preset = skip
+        if skip:
+            self.user_properties.append(('testkit', skip[0]))
+            self.add_marker(pytest.mark.skip(reason=f'{skip[0]}: {skip[1]}'))
+
+    def runtest(self):
+        results = self.session.stash.setdefault(KEY, {})
+        if self.nodeid not in results:
+            batch = [i for i in self.session.items if isinstance(i, CaseItem) and i.unit_key == self.unit_key
+                     and not i.preset and i.nodeid not in results]
+            results.update(self.harness.run(batch, self.config))
+        r: CaseResult = results.get(self.nodeid) or CaseResult('failed', 'the harness reported nothing for this case')
+        for s in r.sub:
+            emit_sub(self, s)
+        if r.category: self.user_properties.append(('testkit', r.category))
+        if r.outcome == 'skipped': pytest.skip(f'{r.category or "skipped"}: {r.message}')
+        if r.outcome == 'failed': raise CaseFailure(r.message)
+
+    def repr_failure(self, excinfo):
+        if isinstance(excinfo.value, CaseFailure): return str(excinfo.value)
+        return super().repr_failure(excinfo)
+
+    def reportinfo(self):
+        return self.path, 0, self.name
+
+
+class CaseFailure(Exception):
+    pass
+
+
+def emit_sub(item, s):
+    """A per-test result of a units suite, reported under its own node id."""
+    from _pytest.reports import TestReport
+    nodeid = f'{item.nodeid}::{s.name}'
+    longrepr = None if s.outcome == 'passed' else ((str(item.path), 0, s.longrepr or s.outcome) if s.outcome == 'skipped'
+                                                   else s.longrepr or 'failed')
+    rep = TestReport(nodeid, (str(item.path), None, nodeid), {}, s.outcome, longrepr, 'call', duration=s.duration)
+    item.ihook.pytest_runtest_logreport(report=rep)

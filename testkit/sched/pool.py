@@ -69,7 +69,12 @@ class Pool:
     def poll(self, req_id: str) -> Grant | None:
         now = time.time()
         with self._state() as st:
-            d = decide(st, self.cfg, now)
+            busy = False
+            if window_pending(st, self.cfg, now) and not any(g.core_class != 'X' for g in st.held) \
+                    and not any(g.core_class == 'X' for g in st.held):
+                busy = bool(external_busy())
+            self.last_external = busy
+            d = decide(st, self.cfg, now, external_busy=busy)
             st.window_open_since, st.last_window_closed = d.window_open_since, d.last_window_closed
             for r, cls in d.grants:
                 st.waiting = [w for w in st.waiting if w.id != r.id]
@@ -93,6 +98,8 @@ class Pool:
         with self._state() as st:
             me = next((r for r in st.waiting if r.id == req_id), None)
             if me is None: return 'running' if any(g.request.id == req_id for g in st.held) else 'not queued'
+            if getattr(self, 'last_external', False):
+                return f'window waits for the machine: {external_busy()}'
             x = next((g for g in st.held if g.core_class == 'X'), None)
             if x:
                 left = f', ~{max(0, x.start + x.request.expected - now):.0f} s left' if x.request.expected else ''
@@ -141,3 +148,19 @@ def outside_vms() -> list[str]:
         r = subprocess.run(c, capture_output=True, text=True)
         found += r.stdout.split()
     return found
+
+
+def external_busy(lock_file: pathlib.Path | None = None) -> str:
+    """Why a window cannot open now, or '' (R4.7, R4.9): an old runner holds natemu-raw/.vm.lock, or VMs run that the
+    framework did not start (an exclusive window opens only on a drained machine, so any VM process is outside it)."""
+    f = lock_file or ((raw_root() / '.vm.lock') if raw_root() else None)
+    if f is not None and f.exists():
+        fd = os.open(f, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(fd, fcntl.LOCK_UN)
+        except BlockingIOError:
+            return f'{f} is held by another runner'
+        finally:
+            os.close(fd)
+    vms = outside_vms()
+    return f'VM processes running outside the framework: {" ".join(vms)}' if vms else ''

@@ -152,3 +152,9 @@ def test_random_workloads_invariants(w):
     satisfiable = [r for r in rs if not unsatisfiable(r, CFG)]
     assert {x[0].id for x in done} == {r.id for r in satisfiable}           # nothing waits forever
     assert all(unsatisfiable(r, CFG) for r in final.waiting)
+
+
+def test_external_busy_keeps_window_closed():
+    st_ = State(waiting=[req(exclusive=True, expected=5)])
+    assert decide(st_, CFG, 0.0, external_busy=True).grants == []
+    assert decide(st_, CFG, 0.0).grants[0][1] == 'X'

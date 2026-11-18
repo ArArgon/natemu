@@ -8,6 +8,8 @@ lock=$repo/testkit/requirements.lock
 tag=$(shasum -a 256 "$lock" | cut -c1-16)
 venv=$cache/venv/$tag
 if [ ! -x "$venv/bin/python" ]; then
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' ||
+        { echo "natemu-test: needs python3 3.11 or later (found $(python3 --version 2>&1))" >&2; exit 1; }
     mkdir -p "$cache/venv"
     tmp=$cache/venv/.tmp-$tag-$$
     rm -rf "$tmp"

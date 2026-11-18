@@ -82,7 +82,8 @@ def window_pending(state: State, cfg: Config, now: float) -> bool:
     return state.last_window_closed is None or not shared_waiting or now - state.last_window_closed >= cfg.min_shared
 
 
-def decide(state: State, cfg: Config, now: float) -> Decision:
+def decide(state: State, cfg: Config, now: float, external_busy: bool = False) -> Decision:
+    """`external_busy`: the old runners' VM lock is held elsewhere, or VMs run outside the framework; no window opens."""
     open_since, last_closed = state.window_open_since, state.last_window_closed
     if any(g.core_class == 'X' for g in state.held):
         return Decision([], open_since, last_closed)
@@ -95,7 +96,7 @@ def decide(state: State, cfg: Config, now: float) -> Decision:
         open_since, last_closed = None, now                     # queue empty or budget spent: close
     view = State(state.held, state.waiting, open_since, last_closed)
     pending = window_pending(view, cfg, now)
-    if pending and not shared_held:                             # drained: open a window
+    if pending and not shared_held and not external_busy:       # drained: open a window
         return Decision([(excl[0], 'X')], now, last_closed)
 
     horizon = max((g.start + (g.request.expected if g.request.expected is not None else math.inf) for g in shared_held),

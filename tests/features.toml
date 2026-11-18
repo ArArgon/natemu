@@ -1,0 +1,6 @@
+# Host features tests may require (docs/testing.md, spec R5). `detect`: the name in `sysctl hw.optional.arm` (FEAT_ stripped,
+# lowercased). `hide_env`: how a machine that has the feature runs as if it did not; today the host's test-only switch
+# (crates/host/src/admission.rs), until natemu's configuration has a key for it.
+[feature.afp]
+detect = "afp"
+hide_env = { NATEMU_FEXC_FEATURE_OFF = "afp" }

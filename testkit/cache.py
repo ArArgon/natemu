@@ -72,10 +72,27 @@ def get_or_build(kind: str, k: str, build: Callable[[pathlib.Path], None], *, si
         tmp.mkdir(parents=True)
         try:
             build(tmp)
+            _readonly(tmp)
             os.rename(tmp, entry)
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True); raise
     return entry
+
+
+def _readonly(p: pathlib.Path) -> None:
+    """A published entry is read-only, so a stray build cannot relink files other runs are executing."""
+    for dirpath, dirs, files in os.walk(p):
+        for n in files:
+            f = os.path.join(dirpath, n)
+            if not os.path.islink(f): os.chmod(f, os.stat(f).st_mode & ~0o222)
+
+
+def _rmtree(p: pathlib.Path) -> None:
+    def fix(func, path, exc):
+        os.chmod(os.path.dirname(path), 0o755); os.chmod(path, 0o644) if os.path.isfile(path) else None; func(path)
+    for dirpath, dirs, files in os.walk(p):
+        os.chmod(dirpath, 0o755)
+    shutil.rmtree(p, onexc=fix)
 
 
 def _leases_dir() -> pathlib.Path:
@@ -157,6 +174,6 @@ def gc(cap_bytes: int, roots: set[pathlib.Path]) -> list[pathlib.Path]:
         with _flock(paths.cache_root() / 'locks' / f'{e.parent.name}-{e.name}'):
             trash = e.parent / f'.trash-{e.name}-{os.getpid()}'
             os.rename(e, trash)
-            shutil.rmtree(trash, ignore_errors=True)
+            _rmtree(trash)
         total -= sizes[e]; deleted.append(e)
     return deleted

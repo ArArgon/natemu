@@ -28,8 +28,19 @@ def parse_sysctl(text: str) -> dict:
     return out
 
 
-@functools.cache
 def detect() -> Host:
+    """This machine. NATEMU_TEST_HOST_FEATURES="afp=0,sb=1" overrides detected features (the framework's own tests)."""
+    h = _detect()
+    if v := __import__('os').environ.get('NATEMU_TEST_HOST_FEATURES'):
+        f = dict(h.features)
+        for kv in v.split(','):
+            k, _, x = kv.partition('='); f[k] = x not in ('0', 'false', '')
+        h = dataclasses.replace(h, features=f)
+    return h
+
+
+@functools.cache
+def _detect() -> Host:
     p, e, chip = _out('sysctl', '-n', 'hw.perflevel0.physicalcpu', 'hw.perflevel1.physicalcpu',
                       'machdep.cpu.brand_string').splitlines()[:3]
     uuid = re.search(r'"IOPlatformUUID" = "([0-9A-F-]{36})"', _out('ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'))[1]

@@ -1,0 +1,11 @@
+[family]
+name = "fam"
+covers = ["fixtures-src/**"]
+
+[[suite]]
+name = "s"
+kind = "judged"
+harness = "harness.py:Echo"
+matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false] }
+smoke = ["c0"]
+batch = 8
