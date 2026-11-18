@@ -154,7 +154,7 @@ def main():
         results.append(r)
     (a.out / 'smoke.json').write_text(json.dumps(results, indent=1) + '\n')
     (a.out / 'results.json').write_text(json.dumps({'results': [   # per-case rows for the framework
-        {'name': f"{r['case']}-n{r['vcpus']}", 'outcome': 'match' if r['ok'] else 'fail', 'diffs': [] if r['ok'] else [json.dumps(r)]}
+        {'name': f"{r.get('case', 'boot')}-n{r['vcpus']}", 'outcome': 'match' if r['ok'] else 'fail', 'diffs': [] if r['ok'] else [json.dumps(r)]}
         for r in results]}, indent=1) + '\n')
     ok = all(r['ok'] for r in results)
     print(f'boot smoke: {sum(r["ok"] for r in results)}/{len(results)} ' + ('ok' if ok else 'FAILED'))
