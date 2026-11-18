@@ -72,8 +72,9 @@ def cmd_lock(args):
     """Build each deterministic suite's input, seed its answers, write tests.lock (spec R2.3, R2.8)."""
     import pathlib
     from testkit import family, lock
-    if not args: print('natemu-test lock FAMILY_DIR [SUITE ...]'); return 2
+    if not args: print('natemu-test lock FAMILY_DIR [SUITE ...] | FAMILY_DIR --from-run RUN [RUN ...]'); return 2
     fam = family.load(pathlib.Path(args[0]).resolve() / 'family.toml')
+    if args[1:2] == ['--from-run']: return lock_answers(fam, args[2:])
     want = set(args[1:])
     data = lock.read(fam)
     for suite in fam.suites:
@@ -87,6 +88,37 @@ def cmd_lock(args):
         print(f'  {len(s["cases"])} cases, {sum(1 for a in s["cases"].values() if not a)} without an answer, '
               f'{sum(len(v) for v in s.get("excluded", {}).values())} exclusions')
     lock.write(fam, data)
+    return 0
+
+
+def lock_answers(fam, runs) -> int:
+    """The family's QEMU answers ([answers] in tests.lock) from seeding runs (TESTKIT_SEED_ANSWERS=1): every case's log
+    under <run>/answers. An answer that differs from the locked one is an error, not an update: delete the stale entry."""
+    import json, pathlib, sys
+    from testkit import lock, paths
+    sys.path.insert(0, str(paths.repo_root() / 'tools' / 'reference'))
+    import answers
+    mine = {c for s in fam.suites for c in s.extra.get('cases', {})}
+    logs = []
+    for r in runs:
+        d = pathlib.Path(r) if '/' in r else paths.runs_dir() / r
+        got = sorted(p for p in (d / 'answers').glob('*.jsonl') if p.stem in mine)
+        if not got: print(f'{d}: no answer logs for {fam.name} (was it run with TESTKIT_SEED_ANSWERS=1?)'); return 2
+        logs += got
+    dropped = []
+    new = answers.build_lock([str(p) for p in logs], dropped)
+    data = lock.read(fam)
+    old = data.get('answers', {})
+    bad = [k for k, e in new.items() if k in old and old[k]['sha256'] != e.sha256]
+    if bad:
+        print(f'{len(bad)} answers differ from the locked ones (delete them from tests.lock to reseed): {bad[:5]}'); return 1
+    for k, e in new.items():
+        old[k] = {'sha256': e.sha256, **({'value': e.value} if e.value is not None else {}),
+                  **({'aux': json.dumps(e.aux, sort_keys=True, separators=(',', ':'))} if e.aux else {}), 'repro': e.repro}
+    data['answers'] = old
+    lock.write(fam, data)
+    print(f'{fam.name}: {len(new)} answers from {len(logs)} logs ({sum(e.value is not None for e in new.values())} inline), '
+          f'{len(dropped)} provisional ones left out (seeds differ); {len(old)} in the lock')
     return 0
 
 

@@ -1,7 +1,10 @@
 """Runner scripts as migrated families (spec R13.2): a case runs one tools/run_*.py invocation, unchanged in what it
 checks, with its inputs from the framework's input root (testkit.inputs; NATEMU_RAW_ROOT points there, never at
 natemu-raw), its writable state in the machine's state folder (NATEMU_STATE_ROOT), and its QEMU answers in locked mode
-(NATEMU_ANSWERS=locked, the family's tests.lock): it never starts QEMU. Each case reports per case where the runner
+(NATEMU_ANSWERS=locked, the family's tests.lock [answers]): it never starts QEMU. Seeding is a run with
+TESTKIT_SEED_ANSWERS=1 (QEMU runs, each case's answers go to <run>/answers/<case>.jsonl), then
+`natemu-test lock FAMILY --from-run RUN [RUN ...]` (tools/reference/answers.py); two seeding runs keep only the provisional
+answers both agree on. Each case reports per case where the runner
 writes per-case results (`adapters` below); a runner that writes none is judged by its exit status alone, and says so.
 
     [[suite]] kind = "judged"  harness = "runner"
@@ -131,6 +134,9 @@ class Runner:
                        NATEMU_REFERENCE_BACKEND='apple', NATEMU_COMPILE_CACHE=str(artifacts.compile_cache(n)),
                        **{k: str(v) for k, v in spec.get('env', {}).items()})
             if root: env['NATEMU_RAW_ROOT'] = str(root)
+            if os.environ.get('TESTKIT_SEED_ANSWERS') == '1':     # seeding (`natemu-test lock FAMILY --from-run RUN`)
+                (rundir / 'answers').mkdir(exist_ok=True)
+                env.update(NATEMU_ANSWERS='seed', NATEMU_ANSWERS_LOG=str(rundir / 'answers' / f'{it.case}.jsonl'))
             qbin = artifacts.qemu_system()           # the pinned QEMU 11.1.2 build (system mode and qemu-img)
             env.update(NATEMU_QEMU_SYSTEM=str(qbin / 'qemu-system-x86_64'), NATEMU_QEMU_IMG=str(qbin / 'qemu-img'),
                        NATEMU_QEMU_PIN='qemu-system 11.1.2 src', PATH=f'{qbin}:{env.get("PATH", "")}')
