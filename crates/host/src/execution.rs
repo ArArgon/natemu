@@ -3888,7 +3888,8 @@ fn serve(
                 if devices.quiesce()? {
                     return Ok(Stop::Power(devices.power()));
                 }
-                if start.elapsed() > Duration::from_secs(30) {
+                // Past the disk call limit: the drain's final full sync is one disk call.
+                if start.elapsed() > crate::virtio::DISK_CALL_LIMIT + Duration::from_secs(30) {
                     return Err("device shutdown drain timed out".into());
                 }
                 state.reply = exec::REPLY_POWER_POLL;

@@ -11,6 +11,7 @@ mod pci;
 mod profile;
 mod queue;
 mod slirp;
+pub(crate) use block::CALL_LIMIT as DISK_CALL_LIMIT;
 pub use net::{Frame, Gso, Offloads, PacketPort, RxChecksum, RxMeta, TxMeta};
 pub use slirp::{ForwardProtocol, PortForward, Slirp, SlirpOptions};
 #[cfg(feature = "testing")]

@@ -46,11 +46,11 @@ pub(super) fn decompress_cluster(
 /// free list unpunched: their contents no longer matter (reads come from the tables, and a reused
 /// cluster is written whole under the table lock), so only host space is reclaimed later. This
 /// keeps a guest DISCARD or WRITE_ZEROES over many scattered clusters (32 ranges of 2 GiB in one
-/// request) inside the device's 10 s call limit.
+/// request) far inside the device's call limit (2 minutes).
 const PUNCH_TIME: Duration = Duration::from_millis(250);
-/// The window [`PUNCH_TIME`] applies to: longer than the device's call limit, so no request (one
-/// call or the up to 32 calls of one DISCARD or WRITE_ZEROES) can punch for longer than
-/// `PUNCH_TIME` plus one punch, wherever its boundaries fall (the backend does not see them).
+/// The window [`PUNCH_TIME`] applies to. A request (one call or the up to 32 calls of one DISCARD or
+/// WRITE_ZEROES) longer than the window can punch `PUNCH_TIME` per window it spans, at most about 3 s
+/// within the call limit, wherever its boundaries fall (the backend does not see them).
 const PUNCH_WINDOW: Duration = Duration::from_secs(10);
 /// The longest single punch, so one punch cannot hold a worker long.
 const MAX_PUNCH: u64 = 128 << 20;

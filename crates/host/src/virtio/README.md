@@ -156,9 +156,9 @@ nonreturning wait that services copy windows. Quiesce closes new admission and
 completes the requests already in flight, then performs a final full-sync on a
 worker and joins the workers. Only successful retirement permits PowerOff.
 
-A native disk call has a ten-second deadline from when it starts (an owner's
+A native disk call has a two-minute deadline from when it starts (an owner's
 inline call is watched by a scoped watchdog thread, which cancels the VM);
-shutdown has a thirty-second poll deadline. A stalled native syscall is not
+shutdown has a poll deadline thirty seconds past that. A stalled native syscall is not
 forcibly canceled: its owned file/buffers remain alive in detached workers (jobs
 still queued never run), with no guest RAM, IRQ or Machine reference; the VM
 fails and the normal CLI exits its per-VM process. An owner's inline call is

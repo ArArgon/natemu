@@ -218,6 +218,14 @@ none) and the key. All of these are found before the VM starts, and the process 
   the original base instead, or make the chain with qemu-img using relative names
   (`qemu-img create -f qcow2 -b mid.qcow2 -F qcow2 top.qcow2` in the folder of `mid.qcow2`, itself
   made with a relative `-b`), and name the chain's top base as `backing`.
+- **Heavy writes to a new image can pause for seconds.** A sparse raw image, or a qcow2 image that is
+  still growing, gets its space from macOS as the guest writes. While the guest's disk flush is being
+  written out, macOS holds those writes back. A busy Mac can take 10–20 s to write the flush out, and
+  the guest then waits that long (natemu reports `virtio-block: slow host disk` past 2 s; it gives up
+  on a single disk operation only after 2 minutes). Writes into space the image already holds don't
+  wait, so preallocating the image (`mkfile 16g disk.raw` for raw, or `qemu-img create -f qcow2 -o
+  preallocation=full disk.qcow2 16G` for qcow2) keeps writes going; a guest that waits for its own
+  flush still waits as long.
 - Two read-only disks on one file get different serials: the second use's serial starts with a
   letter after `f` (`g`, `h`, ...), so it matches no file's.
 - A file's `[boot.kernel]` must give `image` unless `--kernel` supplies it.
