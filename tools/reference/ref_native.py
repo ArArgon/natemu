@@ -30,6 +30,30 @@ def rosetta_elf(elf: bytes) -> bytes:
     return bytes(e)
 
 
+def execute(progs, host=None, rosetta=None, require_flag=None, timeout=600):
+    """Run normalized programs (ref.norm) on the x86 machine over ssh, or here through Rosetta with `rosetta` (an image):
+    [(exit status, output bytes)] per program, and the machine's description (uname, CPU model, the flag if reported).
+    Any program kind: flow and fault-mode programs run too (the caller derives their compare mask; ref_native's own
+    command line takes plain programs only, since their mask comes from the annotations)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w') as t:
+        for i, p in enumerate(progs):
+            elf = ref.build_elf(p)[0]
+            if rosetta: elf = rosetta_elf(elf)
+            info = tarfile.TarInfo(f'p{i:04d}.elf'); info.size = len(elf); info.mode = 0o755
+            t.addfile(info, io.BytesIO(elf))
+    script = REMOTE.replace('FLAG', require_flag or 'fpu')
+    cmd = (['container', 'run', '--rm', '-i', '--arch', 'amd64', '--network', 'none', rosetta, 'sh', '-c', script] if rosetta
+           else ['ssh', '-o', 'BatchMode=yes', host, script])
+    r = subprocess.run(cmd, input=buf.getvalue(), capture_output=True, timeout=timeout)
+    ref.require(r.returncode == 0, cmd[0] + ': ' + r.stderr.decode()[-500:])
+    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as t:
+        files = {m.name: t.extractfile(m).read() for m in t.getmembers()}
+    rcs = dict(line.split() for line in files['rc'].decode().splitlines())
+    return [(rcs[f'p{i:04d}.elf'], files.get(f'p{i:04d}.out', b'')) for i in range(len(progs))], \
+        files['env'].decode().strip().splitlines()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('programs', type=pathlib.Path); ap.add_argument('-o', '--output', type=pathlib.Path, required=True)
@@ -42,28 +66,14 @@ def main():
     programs = json.loads(a.programs.read_text())['programs']
     progs = [ref.norm(p) for p in programs]
     ref.require(not any(p['flow'] or p['faults'] is not None or p['prefix'] is not None for p in progs), 'plain programs only')
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode='w') as t:
-        for i, p in enumerate(progs):
-            elf = ref.build_elf(p)[0]
-            if a.rosetta: elf = rosetta_elf(elf)
-            info = tarfile.TarInfo(f'p{i:04d}.elf'); info.size = len(elf); info.mode = 0o755
-            t.addfile(info, io.BytesIO(elf))
-    script = REMOTE.replace('FLAG', a.require_flag or 'fpu')
-    cmd = (['container', 'run', '--rm', '-i', '--arch', 'amd64', '--network', 'none', a.rosetta, 'sh', '-c', script] if a.rosetta
-           else ['ssh', '-o', 'BatchMode=yes', a.host, script])
-    r = subprocess.run(cmd, input=buf.getvalue(), capture_output=True, timeout=600)
-    ref.require(r.returncode == 0, cmd[0] + ': ' + r.stderr.decode()[-500:])
-    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as t:
-        files = {m.name: t.extractfile(m).read() for m in t.getmembers()}
-    rcs = dict(line.split() for line in files['rc'].decode().splitlines())
+    outs, env = execute(progs, a.host, a.rosetta, a.require_flag)
     results = []
     for i, (src, p) in enumerate(zip(programs, progs)):
-        ref.require(rcs[f'p{i:04d}.elf'] == '0', f"exit status {rcs[f'p{i:04d}.elf']} for {p['name']} (a signal: the instruction faulted)")
-        final, _ = ref.parse_output(p, files[f'p{i:04d}.out'])
+        rc, out = outs[i]
+        ref.require(rc == '0', f"exit status {rc} for {p['name']} (a signal: the instruction faulted)")
+        final, _ = ref.parse_output(p, out)
         und = flags.analyze(p['insns'])
         results.append({'name': p['name'], 'qemu': final, 'undefined_flags': ref.hx(und), 'rflags_compare_mask': ref.hx(flags.TRACKED & ~und)})
-    env = files['env'].decode().strip().splitlines()
     ref.require(not a.require_flag or a.require_flag in env, f'the machine does not report {a.require_flag}')
     a.output.write_text(json.dumps({'format': ref.FORMAT, 'reference': 'rosetta' if a.rosetta else 'native',
                                     'host': a.rosetta or a.host, 'machine': env,
