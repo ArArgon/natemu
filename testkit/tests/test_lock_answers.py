@@ -36,7 +36,9 @@ def test_seed_logs_round_trip_into_the_family_lock(tmp_path):
     got = answers.read_lock(str(lock.path_of(fam)))
     assert set(got) == {'k/one'}
     assert got['k/one'].sha256 == '11' and got['k/one'].value == '{"x":1}' and got['k/one'].aux == {'mask': 2261}
-    assert got['k/one'].repro['args'] == ['-cpu', 'max']
+    assert got['k/one'].repro == {'supplier': 'qemu-user', 'pin': 'p', 'args': ['-cpu', 'max']}   # stored once, expanded
+    raw = lock.read(fam)
+    assert len(raw['repro']) == 1 and raw['answers']['k/one']['repro'] == next(iter(raw['repro']))
     (tmp_path / 'r3' / 'answers').mkdir(parents=True)
     (tmp_path / 'r3' / 'answers' / 'c1.jsonl').write_text(entry('k/one', '99') + '\n')
     assert cli.lock_answers(fam, [str(tmp_path / 'r3')]) == 1                    # a changed answer is refused

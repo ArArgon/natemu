@@ -166,6 +166,26 @@ class Entry:
         self.sha256, self.value, self.aux, self.repro = sha256, value, aux or {}, repro or {}
 
 
+OWN = ('program_sha256', 'image_sha256')       # what differs per answer; the rest of a repro is shared by many
+
+
+def share_repro(repro, sets):
+    """A lock entry's repro as one line, "<set> program_sha256=<hex>": supplier, pin and args are stored once in
+    [repro.<set>] (`sets`, filled in), since thousands of answers share them; the rest are the answer's own."""
+    if not isinstance(repro, dict): return repro
+    common = {k: v for k, v in repro.items() if k not in OWN}
+    sid = digest(json.dumps(common, sort_keys=True, separators=(',', ':')).encode())[:12]
+    sets.setdefault(sid, common)
+    return ' '.join([sid] + [f'{k}={repro[k]}' for k in OWN if k in repro])     # one line: "<set> program_sha256=<hex>"
+
+
+def expand_repro(repro, sets):
+    if isinstance(repro, str):
+        sid, *own = repro.split(' ')
+        return {**sets[sid], **dict(f.split('=', 1) for f in own)}
+    return repro
+
+
 def read_lock(path=None):
     import tomllib
     path = path or os.environ.get('NATEMU_ANSWERS_LOCK')
@@ -173,8 +193,9 @@ def read_lock(path=None):
     ck = ('lock', path, os.stat(path).st_mtime_ns)
     with _lock:
         if ck not in _cache:
-            with open(path, 'rb') as f: table = tomllib.load(f).get('answers', {})
-            _cache[ck] = {k: Entry(v['sha256'], v.get('value'), json.loads(v.get('aux') or '{}'), v.get('repro'))
+            with open(path, 'rb') as f: doc = tomllib.load(f)
+            table, sets = doc.get('answers', {}), doc.get('repro', {})
+            _cache[ck] = {k: Entry(v['sha256'], v.get('value'), json.loads(v.get('aux') or '{}'), expand_repro(v.get('repro'), sets))
                           for k, v in table.items()}
         return _cache[ck]
 

@@ -53,7 +53,7 @@ output = "48989ba878ad1e92e27f362feefb688e9e2f7439e7a93786aa2995ce42afc50c"
 
 [suite.adx]
 fex_cases = []
-fingerprint = "ec791dce6856b67d0e4fb0a1d3cc5f4b4ddd7e598490b9fa51ca36b263f8084f"
+fingerprint = "f649d5ec6567be83c9528a7abb3e9639b44f89f8f49e28bbd82f21df704fe4fa"
 input = "8b96017f009a529dc2c49901e5238db9c21dadfe8ee1ca5ecdf5067f873d8556"
 model_cases = []
 reference = "x86"
@@ -186,7 +186,7 @@ tool = "x86: x86: ubuntu@192.168.12.10"
 
 [suite.br66]
 fex_cases = []
-fingerprint = "402f157ebf076eea55e0050f3ce3e3daaa951d0a96cb96f4f915a58b0f2db9b1"
+fingerprint = "cc484ca9958bd14609ce14e59f54c712c30afd936b7f0efb6aa621e873d97784"
 input = "1c44db06300500ecac5839e8d62c081939def312a69fa86e79cbb4e939fe2667"
 model_cases = []
 reference = "qemu"
@@ -218,7 +218,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.fix]
 fex_cases = []
-fingerprint = "791ab9b7fb07773721085b5c2f5c8b70b2ae2f806e5fd65d8570e4370dd0a2b5"
+fingerprint = "d17d9c216548f1aa93299e6062e2685c58ecbecfbd0831a4f5f4f7c9476fa083"
 input = "a9cf8a1abeedbe5b5413d9d644985cc8898d9a364a891fef9505bd86b5de4de4"
 model_cases = []
 reference = "qemu"
@@ -302,7 +302,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.flow]
 fex_cases = []
-fingerprint = "1e024373ab4fa9e9421dcd0ba0528a7c3cae6287e30aa0f280828d27df920527"
+fingerprint = "e6dbc7bfe5c191a8acb28ea90d2d895da5a2afa2dff6ce3b445d15ee3ff5acc3"
 input = "a879740cf01c9d51aa4211a42c5eceba823129482c7ae7edc0e5e17ffb522239"
 model_cases = []
 reference = "qemu"
@@ -450,7 +450,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i10]
 fex_cases = []
-fingerprint = "9ab147dea327e8b4413f021e35ebe33f235c596f010e07599e8a65323031620c"
+fingerprint = "3393885720c9b1072cf576cb82e2c85822249faf003a7ee73fb6d8dd275f671b"
 input = "bb1fb920c46479a76797fcb5be09ec078dc68af807ef1298ce77009ad7eb65e4"
 model_cases = []
 reference = "qemu"
@@ -607,7 +607,7 @@ fex_cases = [
     "i6b-x87-046",
     "i6b-x87-047",
 ]
-fingerprint = "e9afd2ae08e69448b682b11004ee69019c777c6cd46392a55c41c8b00930e19e"
+fingerprint = "b2843fed9ca934aaf4cf47d1376f51e6159f49a131a58858e1328f809a96fade"
 input = "cf5deb60bc80fe2ae646a3adf8cc8db9f2e0963e94027a9b2d1c15e3de18b1cb"
 model_cases = []
 reference = "qemu"
@@ -739,7 +739,7 @@ tool = "qemu: fex: natemu 094f9b992cc4 (FEX reduced-precision x87); qemu: qemu-x
 
 [suite.i7]
 fex_cases = []
-fingerprint = "3cc68e83054cc728c9a4d2099c0a11644c53a2b2494f6d92eb8c368e4fc3525f"
+fingerprint = "7a13e25cb6b71b28528ce1e8dfc890e4c24feab6655bb83499cbb9e129e2cc25"
 input = "46cb952f54aae6636524f435e43486d50db13681e709d34858e2dd7ad7a36fd4"
 model_cases = []
 reference = "qemu"
@@ -828,7 +828,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i7-cpl0]
 fex_cases = []
-fingerprint = "e28d8dd3593e308d392659df4d4d331e0689489f0ff9eb09f2f48836c6a51287"
+fingerprint = "cf28b87898becc17a011e13f9b49ad7b347464429e99a8d3c7f4f253ab6e27e4"
 input = "46cb952f54aae6636524f435e43486d50db13681e709d34858e2dd7ad7a36fd4"
 model_cases = []
 reference = "qemu"
@@ -917,7 +917,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i9]
 fex_cases = []
-fingerprint = "da321eef11e7f7c4ff081beee615a5c697578cc254422d9820af68d6af5a1e52"
+fingerprint = "464d38f5ce04fdc3b1a7e159f2a1319e3d719693df7b56375a313f1d224bf47b"
 input = "6c7b626fd9ad9a18942bf8a97860e8aa73349456d3d7793ec7c501ba254dadbd"
 model_cases = []
 reference = "qemu"
@@ -1057,7 +1057,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.i9-big]
 fex_cases = []
-fingerprint = "1f234f6b6dcbbde08236f47ce6b2061896f41e6586763ea37cf85aa4aa53953c"
+fingerprint = "4536b7a350d17d155a19b1ff95b3a2b8da14473134ba3073ad2161dd64c15627"
 input = "ada92f4f49c08065e736cdfda3e8af4a7a56b7a8f2085292b4355aeddb6d4d6f"
 model_cases = []
 reference = "qemu"
@@ -1082,7 +1082,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.rex]
 fex_cases = []
-fingerprint = "3b669b5441ec1f405b742ca675a8ebfa953f3b25bd4283d13462b1e99db4f630"
+fingerprint = "874c7afe600362708d707b62771c881acba3274104b22e2399a35730a17e7cd6"
 input = "a7d9d8878131f209a8630bb33d4c82c8e4fc4235ac99d69886a8dbc89f4debf1"
 model_cases = []
 reference = "qemu"
@@ -1139,7 +1139,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.seed]
 fex_cases = []
-fingerprint = "45d7f39ecfded3e7de3071c6b0a645536cccc34a17145ea342da25b5305e1bb0"
+fingerprint = "2ce309b5612605d2ab17c31178c1ee30845586ab351a9a83c9fd3c62e43a4c84"
 input = "bb7833ae832cd4b1d232ff0912ffe0f8dba5116ca58e37778448506807082c9f"
 model_cases = []
 reference = "qemu"
@@ -1203,7 +1203,7 @@ tool = "qemu: qemu: qemu-x86_64-static (apple)"
 
 [suite.sha]
 fex_cases = []
-fingerprint = "2e9c5d9a16f0916a0e1f24f6ed815cfaca7954d1caefd666a9630b152f0ef141"
+fingerprint = "10631a6edf8e1bd66e22c5eac429691d3734eefff385950c4adc384bd00b6664"
 input = "a9ee6fdaac82cce8049621bb03977d0376d1e953a82e77afda36ea64e9049bf8"
 model_cases = []
 reference = "x86"
@@ -1344,7 +1344,7 @@ tool = "x86: x86: ubuntu@192.168.12.10"
 
 [suite.xsave]
 fex_cases = []
-fingerprint = "0a0468e134a278b1bf8f4ab9ef25c04b69b124d43f4c381c8e78d9c83851b7e9"
+fingerprint = "954d05f5f34687d43f9c181981e28f76858dc391ebd7915c877c2e6b3b453750"
 input = "48989ba878ad1e92e27f362feefb688e9e2f7439e7a93786aa2995ce42afc50c"
 model_cases = []
 reference = "x86"

@@ -108,14 +108,15 @@ def lock_answers(fam, runs) -> int:
     dropped = []
     new = answers.build_lock([str(p) for p in logs], dropped)
     data = lock.read(fam)
-    old = data.get('answers', {})
+    old, sets = data.get('answers', {}), data.get('repro', {})
     bad = [k for k, e in new.items() if k in old and old[k]['sha256'] != e.sha256]
     if bad:
         print(f'{len(bad)} answers differ from the locked ones (delete them from tests.lock to reseed): {bad[:5]}'); return 1
     for k, e in new.items():
         old[k] = {'sha256': e.sha256, **({'value': e.value} if e.value is not None else {}),
-                  **({'aux': json.dumps(e.aux, sort_keys=True, separators=(',', ':'))} if e.aux else {}), 'repro': e.repro}
-    data['answers'] = old
+                  **({'aux': json.dumps(e.aux, sort_keys=True, separators=(',', ':'))} if e.aux else {}),
+                  'repro': answers.share_repro(e.repro, sets)}
+    data['answers'], data['repro'] = old, sets
     lock.write(fam, data)
     print(f'{fam.name}: {len(new)} answers from {len(logs)} logs ({sum(e.value is not None for e in new.values())} inline), '
           f'{len(dropped)} provisional ones left out (seeds differ); {len(old)} in the lock')
