@@ -32,6 +32,37 @@ listed last; natemu bugs are recorded here, not fixed.
   file offset 0, which Linux and QEMU do not (`rosetta_elf` adapts the harness ELF). Usable for quick experiments, not
   for answers.
 
+## QEMU and the AMD box compared (November 18)
+
+`tools/natemu-test xref tests/programs tests/fp --natemu` ran each of the 1,369 programs of both families under the pinned
+QEMU 7.2 and natively on the Ryzen 7 8845HS, and natemu on every case where the two differ. Each difference was traced to
+its first diverging instruction by running prefixes of the program (the first k instructions plus the final register dump)
+on both. natemu in accurate mode agrees with the locked answer in every case; no natemu bug came out of it.
+
+| Corpus | Programs | Differ | Why |
+| --- | --- | --- | --- |
+| fix, seed, i9, i9-big, i10, rex, i7, flow | 491 | 0 | Integer, flags, addressing, REX, branches, CPL: the two agree exactly. |
+| i8 (SSE/AVX) | 246 | 10 | 8 are RCPPS/RSQRTPS/RSQRTSS approximations; 2 are two-NaN choices (below). |
+| i8b (SSE/AVX) | 336 | 20 | 16 are approximations; 4 are QEMU's known two-NaN departures (`i8-forms-001`, `i8-random-067`, `-077`, `-126`, already answered from x86). |
+| i6b (x87, SSE4.2) | 112 | 36 | FSIN/FCOS/FSINCOS/FPTAN results 1 to 26 ulps apart (double results); one FPREM status word. |
+| adx | 56 | 49 | QEMU mishandles the 32-bit forms of ADCX/ADOX: every divergence is the first 32-bit ADCX or ADOX, where a cut program crashes QEMU (SIGTRAP); 30 whole programs crash it too. |
+| sha, xsave | 116 | 116 | QEMU 7.2 lacks SHA and XSAVEC (SIGILL). |
+| br66 | 12 | 12 | The Ryzen honours a 66 prefix on near branches (16-bit target, then a crash); Intel ignores it (SDM), as natemu does. |
+
+What each kind means for the references:
+
+- **Approximations (RCPPS, RSQRTPS, RCPSS, RSQRTSS: 24 cases).** The SDM bounds only their relative error (1.5 × 2⁻¹²);
+  the exact bits are each processor's own table. QEMU returns the correctly rounded 1/x and 1/√x, the Ryzen its own
+  approximation (low mantissa bits differ), and Intel parts have yet another. The locks take QEMU's value, which natemu
+  reproduces in accurate mode: valid under the SDM but bit-identical to no real processor.
+- **Two-NaN choices.** QEMU departs from the SDM's rule in the four i8b cases above and in `i8-forms-044` (already from
+  x86); the Ryzen departs from it in `i8-random-058` (HADDPD keeps the other NaN), where the SDM model gives QEMU's answer,
+  as for the three i8b cases already on the model.
+- **x87 transcendentals.** The Ryzen's FSIN/FCOS/FPTAN differ from QEMU's softfloat in the last bits (FPTAN the most); no
+  reference is exact here. x87 is answered from FEX's reduced-precision result for now (owner decision), which matches
+  QEMU in 16 of these cases. FPREM on a quiet NaN and zero sets C3 and C0 on the Ryzen, clears them in QEMU.
+- **ADX.** QEMU is wrong; the corpus is already answered from x86, which natemu matches.
+
 ## Test-side defects fixed
 
 - Four `natemu-abi` fptrap tests compared with the M4's FPCR.AH/FIZ/NEP, which a host without FEAT_AFP ignores: they are
