@@ -567,3 +567,12 @@ An independent review found these; each overrides the task text above where they
   `boot-smoke`) hold a per-worktree build lock exclusively (other legacy units of that worktree hold it shared), and the
   signed binaries are copied back after each. A step whose `natemu-raw` inputs are absent is `not-runnable: needs
   natemu-raw (PATH)`; a `Step.skip` maps to `not-runnable`.
+
+## Status (November 18)
+
+Tasks 1–16 are implemented on branch `test-framework`; an independent code review's twelve findings are fixed. Task 17
+(remote execution) is not built: it was optional, and testing it needs Remote Login on a test Mac (`ssh localhost`) or
+the M4; the November 17 spike showed the approach works. Measured on the M2 Max: the FP family in 14 s (8 s with
+reuse); all unit tests in 8 min; the smoke tier in 18 min, above the 10-minute target (the two full nextest passes take
+most of it). Not yet done: a full `--gate` run against `tools/run_suite.py` on the same commit, a run on the M4, x86
+answers for i8b's seven QEMU departures, a claim that keeps concurrent QEMU reference containers from timing out.
