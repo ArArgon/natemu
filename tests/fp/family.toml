@@ -38,5 +38,4 @@ smoke = ["i8-forms-000"]
 # QEMU 7.2's two-NaN choices depart from x86 in these (run_suite.py I8B_KNOWN), so they take another reference (R2.13a):
 # real x86 where AMD and Intel agree; the Intel-SDM model (tools/models/afp_fp) for the three where the AMD box returns
 # another NaN than the SDM's (HADDPS, MAXPD and FMA two-NaN choices; natemu and the model agree there).
-reference_overrides = { "i8-forms-001" = "x86", "i8-random-067" = "x86", "i8-random-077" = "x86", "i8-random-126" = "x86",
-                        "i8-forms-045" = "model", "i8-random-097" = "model", "i8-random-111" = "model" }
+reference_overrides = { "i8-forms-001" = "x86", "i8-random-067" = "x86", "i8-random-077" = "x86", "i8-random-126" = "x86", "i8-forms-045" = "model", "i8-random-097" = "model", "i8-random-111" = "model" }

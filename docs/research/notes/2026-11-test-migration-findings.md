@@ -11,8 +11,9 @@ listed last; natemu bugs are recorded here, not fixed.
 | --- | --- | --- | --- |
 | `i8-faults-m2a`, case `chain3-movaps-mis` | M2 Max (no AFP), accurate FP | "cut run did not reach its hlt: watchdog resident pc=0x8000400cf210 shadows_asked=[] retries=0"; xmm and ymmh changed at the fault. 845 of 846 cases pass. | `NATEMU_FP=accurate tools/with-env python3 tools/run_i8_faults.py --fexc FEXC --out OUT` (the step's argv in tools/run_suite.py) |
 
-Open, to recheck on an idle machine (both passed on a later attempt; whether each is a load-sensitive test or a missing
-natemu path is not settled):
+Load-sensitive, not settled as bugs: both failed only while several agents loaded the M2 Max, and both passed on the first
+attempt in the full gate on the idle machine (run 20261118-045129-009e). A test that needs an idle machine should say
+so in its claims; whether either also hides a missing natemu path is open.
 
 - `kicks` (`run_slice3_vm.py kicks --kicks 1000 --cpus 1 2 4`), check `adversarial`: "no stop at ['resident']" (once
   also 'rearms'): the per-place stop counter for `resident` stayed 0 (entry 14,550, exit 19,361, irq_sgis 28,678). Failed
