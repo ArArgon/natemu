@@ -42,10 +42,10 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import smp, apic, irqs, programs as P, run_slice1_vm as vm  # noqa: E402
+import smp, answers, apic, irqs, programs as P, run_slice1_vm as vm  # noqa: E402
 from models import segment_model as sm  # noqa: E402
 from run_slice3_vm import vm_state  # noqa: E402
-from run_l4a import run_natemu, qemu  # noqa: E402
+from run_l4a import run_natemu, qemu, uart_problems  # noqa: E402
 
 D = P.SYS_D(0)                    # 0x280000: data of the sys_text programs
 SAVE = D + P.SAVE                 # +0 CR3 (sys_text), +8 GS base, +0x10 IDTR
@@ -743,29 +743,31 @@ def run_one(a, name, report):
         entry['problems'].append(f'QEMU run failed ({err})')
         report.append(entry)
         return entry['problems']
-    entry['problems'] += [f'QEMU vs SDM: {p}' for p in judge(expect, State(want, sent), labels)]
+    entry['problems'] += [f'QEMU vs SDM: {p}' for p in answers.derive(want, 'sdm', lambda w: judge(expect, State(w, sent), labels))]
     for limit in (None, 1):
         out, problems = run_natemu(a, prog, a.out / 'work' / f"{name}-{limit or 'd'}", [limit] if limit else [])
         if out is not None:
             got = vm_state(prog, out)
             mine = bytes.fromhex(out.get('uart') or '')
-            problems += smp.compare(prog, masked(got), masked(want))
-            if mine != sent: problems.append(f'UART bytes {mine!r} != QEMU {sent!r}')
+            problems += smp.compare(prog, masked(got), answers.view(want, 'tsc-masked', masked))
+            problems += uart_problems(want, mine, sent)
             problems += [f'natemu vs SDM: {p}' for p in judge(expect, State(got, mine), labels)]
         entry['runs'].append({'max_block': limit, 'problems': problems})
         entry['problems'] += [f'max-block {limit}: {p}' for p in problems]
     if a.negative:
         if name == 'r1-timer':
-            bad = {'cpus': want['cpus'], 'memory': []}
-            for reg in want['memory']:
-                data = bytearray(reg['data'])
-                if reg['addr'] == apic.LOG(0):
-                    for k in range(0, len(data), 0x40):
-                        rip = int.from_bytes(data[k + 8:k + 16], 'little')
-                        if int.from_bytes(data[k:k + 8], 'little') == TV and rip == labels['r1t_after_hlt']:
-                            data[k + 8:k + 16] = (rip - 1).to_bytes(8, 'little')
-                bad['memory'].append({'addr': reg['addr'], 'data': bytes(data)})
-            vprog, vwant = prog, bad
+            def mutated(want):
+                bad = {'cpus': want['cpus'], 'memory': []}
+                for reg in want['memory']:
+                    data = bytearray(reg['data'])
+                    if reg['addr'] == apic.LOG(0):
+                        for k in range(0, len(data), 0x40):
+                            rip = int.from_bytes(data[k + 8:k + 16], 'little')
+                            if int.from_bytes(data[k:k + 8], 'little') == TV and rip == labels['r1t_after_hlt']:
+                                data[k + 8:k + 16] = (rip - 1).to_bytes(8, 'little')
+                    bad['memory'].append({'addr': reg['addr'], 'data': bytes(data)})
+                return bad
+            vprog, vwant = prog, answers.view(want, f"negative/wake-rip/{labels['r1t_after_hlt']:#x}", mutated)
         else:
             vprog, vwant = build(variant=True)[0], want
         out, problems = run_natemu(a, vprog, a.out / 'work' / f'{name}-negative', [], reached=False)
@@ -773,7 +775,8 @@ def run_one(a, name, report):
         if out is not None:
             got = vm_state(vprog, out)
             mine = bytes.fromhex(out.get('uart') or '')
-            flagged += smp.compare(vprog, masked(got), masked(vwant)) + ([f'UART {mine!r}'] if mine != sent else [])
+            flagged += smp.compare(vprog, masked(got), answers.view(vwant, 'tsc-masked', masked)) + (
+                [] if answers.equal(want, 'uart', mine.hex(), sent.hex() if sent is not None else None) else [f'UART {mine!r}'])
             flagged += judge(expect, State(got, mine), labels) if vprog is prog else []
         entry['negative'] = {'change': NEGATIVE[name], 'flagged': flagged[:8]}
         if not flagged: entry['problems'].append(f'negative control not flagged ({NEGATIVE[name]})')
@@ -1237,7 +1240,7 @@ def run_one_r1b(a, name, n, report):
         want, _, err = qemu(prog, a.out / 'qemu' / f'{name}@{n}')
         if want is None:
             entry['problems'].append(f'QEMU run failed ({err})'); report.append(entry); return [f'{name}@{n}: QEMU fail']
-        entry['problems'] += [f'QEMU vs SDM: {p}' for p in judge(expect, State(want), labels)]
+        entry['problems'] += [f'QEMU vs SDM: {p}' for p in answers.derive(want, 'sdm', lambda w: judge(expect, State(w), labels))]
     for limit in (None, 1):
         work = a.out / 'work' / f"{name}@{n}-{limit or 'd'}"
         if dual:

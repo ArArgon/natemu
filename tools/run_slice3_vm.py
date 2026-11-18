@@ -141,7 +141,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
 sys.path.insert(0, str(ROOT / 'tools' / 'bench' / 'smp'))
 import ref, run_slice1_vm as vm, run_slice1_faults as faults, smp, model_smp, programs  # noqa: E402
-import qemucache  # noqa: E402
+import qemucache, answers  # noqa: E402
 qemucache.install(smp)      # reference runs of an unchanged image are served from disk (tools/qemucache.py); k1 and pic import this too
 
 
@@ -534,16 +534,30 @@ def adversarial_program(n, iterations):
             'memory': [{'addr': '0x110800', 'size': 8, 'fill': 'zero'}]}
 
 
-def qemu_reference(prog, work):
-    """The program's final state under pinned QEMU system mode (smp.parse_dump form)."""
-    rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, smp.build_stub(work)), work, 'multi', timeout=600)
+def qemu_reference(prog, work, hang_ok=False):
+    """The program's final state under pinned QEMU system mode (smp.parse_dump form). `hang_ok`: a timeout (RuntimeError
+    here) is an answer the caller expects (tools/reference/answers.py records it)."""
+    rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, smp.build_stub(work)), work, 'multi', timeout=600, hang_ok=hang_ok)
     if rc != 1: raise RuntimeError(f'QEMU {prog["name"]}: {rc} {err}')
     return smp.parse_dump(prog, dump)
 
 
-def judge_smp(prog, want, out, kicks):
+def qemu_view(want, label, change):
+    """QEMU's answer `want` (smp.parse_dump's shape) changed by `change` (which edits a copy in place) before it is compared:
+    an answers.view (tools/reference/answers.py) under `label`; in live mode just the changed copy."""
+    def apply(w):
+        w = {**w, 'cpus': [dict(c) for c in w['cpus']], 'memory': [dict(m) for m in w['memory']]}
+        change(w)
+        return w
+    return answers.view(want, label, apply)
+
+
+def tupled(f): return tuple(f) if isinstance(f, list) else f
+
+
+def judge_smp(prog, want, out, kicks, view=None):
     """Differences of a natemu run of `prog` from QEMU's `want`; `kicks[v]`: kicks vCPU v must have been issued (None:
-    no count required)."""
+    no count required). `view`: (label, change) applied to both states before they are compared (fields not compared)."""
     diffs = []
     cpus = out['cpus']
     for v, (c, cpu) in enumerate(zip(prog['cpus'], cpus)):
@@ -554,6 +568,9 @@ def judge_smp(prog, want, out, kicks):
     memory = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpus[0]['memory']}
     got = {'cpus': [{'gpr': [smp.num(x) for x in cpu['gpr']], 'rflags': smp.num(cpu['rflags'])} for cpu in cpus],
            'memory': [{'addr': smp.num(r['addr']), 'data': memory[smp.num(r['addr'])]} for r in prog['memory'] if r.get('capture', True)]}
+    if view:
+        label, change = view
+        got, want = qemu_view(got, label, change), qemu_view(want, label, change)
     return diffs + smp.compare(prog, got, want)
 
 
@@ -1329,8 +1346,8 @@ def cmd_events(a, host, runtime):
             if want is None:
                 failures.append(f'{label}: QEMU run failed ({rc} {err})')
             else:
-                qlogs = [[(e[0], e[1], e[2], e[3] & ~events.RF, *e[4:]) for e in events.log(m['data'])] for m in want['memory'][:n]]
-                entry['qemu'] = events.judge(prog, qlogs)
+                qlogs = lambda w: [[(e[0], e[1], e[2], e[3] & ~events.RF, *e[4:]) for e in events.log(m['data'])] for m in w['memory'][:n]]
+                entry['qemu'] = answers.derive(want, 'events.judge', lambda w: events.judge(prog, qlogs(w)))
                 if name in QEMU_EVENTS_DIFFER:
                     entry['qemu_differs'], entry['qemu'] = (entry['qemu'], []) if entry['qemu'] else (None, [f'listed in QEMU_EVENTS_DIFFER but QEMU agrees'])
                 failures += [f'{label}: QEMU vs delivery_model: {d}' for d in entry['qemu']]
@@ -1350,7 +1367,7 @@ def cmd_events(a, host, runtime):
                     diffs += events.judge(prog, event_logs(prog, [mems[0]] * n))
                     if want is not None:
                         got = {'cpus': [{'gpr': [smp.num(x) for x in c['gpr']], 'rflags': smp.num(c['rflags']), 'fault': None} for c in out['cpus']], 'memory': []}
-                        diffs += smp.compare(prog['qemu'], got, {'cpus': want['cpus'], 'memory': []})
+                        diffs += smp.compare(prog['qemu'], got, answers.view(want, 'registers', lambda w: {'cpus': w['cpus'], 'memory': []}))
                 entry['runs'].append({'max_block': limit[0] if limit else None, 'diffs': diffs})
                 failures += [f"{label}{' (max-block 1)' if limit else ''}: {d}" for d in diffs]
             bad = any(r['diffs'] for r in entry['runs']) or entry.get('qemu')
@@ -1418,7 +1435,7 @@ def events_stress(a, host, runtime, stub, report):
                         got = vm_state(prog['natemu'], out)
                         keep = lambda st: {'cpus': st['cpus'], 'memory': [m for m in st['memory'] if any(m['addr'] == events.DATA(i) for i in range(n))]}
                         for c in got['cpus']: c['fault'] = None
-                        diffs += smp.compare(prog['qemu'], keep(got), keep(want))
+                        diffs += smp.compare(prog['qemu'], keep(got), answers.view(want, 'data-regions', keep))
                 print(f"{label}{' (max-block 1)' if limit else ''}: {'ok' if not diffs else 'FAIL'} delivered {delivered}, "
                       f"judged: {dict(coverage)}",
                       *diffs[:8], sep='\n  ', flush=True)
@@ -1484,20 +1501,29 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
         if want is None and not (model and name in QEMU_DIFFERS): failures.append(f'{name}: QEMU run failed ({rc})'); continue
         # A listed case QEMU does not finish (it takes another path) is judged by segment_model alone.
         want = want or {'cpus': [{'fault': f'QEMU: {rc}'}], 'memory': []}
-        for c in want['cpus']: c['fault'] = qemu_fault(c['fault']) if not isinstance(c['fault'], str) else c['fault']
+        def corrected(w):
+            for c in w['cpus']: c['fault'] = qemu_fault(c['fault']) if not isinstance(c['fault'], str) else c['fault']
+        want = qemu_view(want, 'qemu_fault', corrected)
         # Bytes where QEMU leaves what the SDM changes (an accessed bit set by a CS load): QEMU must differ there, and the
         # SDM's value is compared instead.
-        for addr, value in prog['params'].get('sdm_bytes', {}).items():
-            region = next(r for r in want['memory'] if r['addr'] <= smp.num(addr) < r['addr'] + len(r['data']))
-            at = smp.num(addr) - region['addr']
-            if region['data'][at] == value: failures.append(f'{name}: QEMU writes the SDM value at {addr}: drop sdm_bytes')
-            region['data'] = region['data'][:at] + bytes([value]) + region['data'][at + 1:]
+        sdm = prog['params'].get('sdm_bytes', {})
+        def region_of(w, addr): return next(r for r in w['memory'] if r['addr'] <= smp.num(addr) < r['addr'] + len(r['data']))
+        if sdm:
+            failures += answers.derive(want, 'sdm_bytes', lambda w: [
+                f'{name}: QEMU writes the SDM value at {addr}: drop sdm_bytes' for addr, value in sdm.items()
+                if region_of(w, addr)['data'][smp.num(addr) - region_of(w, addr)['addr']] == value])
+            def sdm_values(w):
+                for addr, value in sdm.items():
+                    region = region_of(w, addr); at = smp.num(addr) - region['addr']
+                    region['data'] = region['data'][:at] + bytes([value]) + region['data'][at + 1:]
+            want = qemu_view(want, 'sdm_bytes/' + ','.join(f'{k}={v}' for k, v in sorted(sdm.items())), sdm_values)
+        faults = [tupled(f) for f in answers.derive(want, 'faults', lambda w: [c['fault'] for c in w['cpus']])]
         permitted = None
         if model:
             # segment_model's permitted outcomes as faults in smp's shape (None: the instruction completes).
             fault = lambda f: f and (f[0], f[1], model['at'], f[2] if f[0] == 14 else 0)
             permitted = {fault(f) for _, f in model['permitted']}
-            entry['qemu'] = qf = want['cpus'][0]['fault']
+            entry['qemu'] = qf = faults[0]
             if qf not in permitted:
                 if name in QEMU_DIFFERS: entry['qemu_differs'] = QEMU_DIFFERS[name]
                 else: failures.append(f"{name}: QEMU {qf}, segment_model permits {sorted(permitted, key=str)}")
@@ -1510,7 +1536,7 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
                 diffs = []
                 for v_, (c, cpu) in enumerate(zip(prog['cpus'], out['cpus'])):
                     end = body_end(prog, smp.num(c['rip']))
-                    done = want['cpus'][v_]['fault'] is None if permitted is None else vm_fault(cpu) is None
+                    done = faults[v_] is None if permitted is None else vm_fault(cpu) is None
                     if done and (cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end):
                         diffs.append(f"cpu{v_} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
                     diffs += [f'cpu{v_} ' + d for d in per_vcpu_checks(cpu)]
@@ -1518,7 +1544,7 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
                 g = got['cpus'][0]['fault']
                 if permitted is not None and g not in permitted:
                     diffs.append(f"fault {g} not permitted by segment_model {sorted(permitted, key=str)}")
-                if permitted is None or g == want['cpus'][0]['fault']:
+                if permitted is None or g == faults[0]:
                     diffs += smp.compare(prog, got, want)
                 # S3: result bytes the model gives (syscalls.py's LAR/LSL/VERR/VERW tables): one of the permitted images.
                 if prog['params'].get('model_memory'):
@@ -1568,23 +1594,29 @@ def cmd_system(a, host, runtime):
             assert (b'\x0f\x22' not in prefix or 'cr4' in declared) and b'\x0f\x30' not in prefix \
                 and (b'\x0f\x23' not in prefix or 'dr7' in declared), f'{name}: the prefix changes controls'
             ctl = {'cr0': 0x80010011, 'cr4': 0x20, 'efer': 0xd00, 'dr7': 0x400, **declared}
-            vector = sfm.fault(code, want['cpus'][0]['gpr'], c.get('cpl', 3), ctl['cr0'], ctl['cr4'], ctl['efer'], ctl['dr7'])
+            # (the model's fault at QEMU's prefix state: a value derived from QEMU's answer, answers.derive)
+            vector = answers.derive(want, f"system_fault_model/{code.hex()}/{c.get('cpl', 3)}/{answers.digest(answers.canon(ctl))[:16]}",
+                                    lambda w: sfm.fault(code, w['cpus'][0]['gpr'], c.get('cpl', 3), ctl['cr0'], ctl['cr4'], ctl['efer'], ctl['dr7']))
             if vector is None: failures.append(f'{name}: the model expects no fault'); continue
-            want['cpus'][0]['fault'] = (*vector, at, 0)
+            fault = (*vector, at, 0)
+            want = qemu_view(want, f'fault/{list(fault)}', lambda w: w['cpus'][0].__setitem__('fault', fault))
             full, rc = qemu(prog, name, timeout=10, hang_ok=name in QEMU_HANGS)
-            entry['qemu'] = 'hang' if rc == 'timeout' else (full and full['cpus'][0]['fault'] and list(full['cpus'][0]['fault'])) or 'no fault'
+            entry['qemu'] = 'hang' if rc == 'timeout' else (full and answers.derive(full, 'cpu0-fault', lambda f: f['cpus'][0]['fault'] and list(f['cpus'][0]['fault']))) or 'no fault'
             # Where QEMU does raise an exception, it is the model's.
-            if isinstance(entry['qemu'], list) and tuple(entry['qemu']) != want['cpus'][0]['fault']:
+            if isinstance(entry['qemu'], list) and tuple(entry['qemu']) != fault:
                 if name in QEMU_DIFFERS: entry['qemu_differs'] = QEMU_DIFFERS[name]
-                else: failures.append(f"{name}: QEMU raises {entry['qemu']}, the model {want['cpus'][0]['fault']}")
+                else: failures.append(f"{name}: QEMU raises {entry['qemu']}, the model {fault}")
             elif name in QEMU_DIFFERS: failures.append(f'{name}: listed in QEMU_DIFFERS but QEMU agrees ({entry["qemu"]})')
         else:
             want, rc = qemu(prog, name)
             if want is None: failures.append(f'{name}: QEMU run failed ({rc})'); continue
-            for c in want['cpus']: c['fault'] = qemu_fault(c['fault'])
+            def corrected(w):
+                for c in w['cpus']: c['fault'] = qemu_fault(c['fault'])
+            want = qemu_view(want, 'qemu_fault', corrected)
             # X1a: QEMU's frames are a reference only where they agree with delivery_model (the plan's fault references).
             if prog['params'].get('delivery'):
-                failures += [f'{name}: QEMU vs delivery_model: {d}' for d in delivery_log_problems(prog, want)]
+                failures += [f'{name}: QEMU vs delivery_model: {d}' for d in answers.derive(want, 'delivery_model', lambda w: delivery_log_problems(prog, w))]
+        faults = [tupled(f) for f in answers.derive(want, 'faults', lambda w: [c['fault'] for c in w['cpus']])]
         # (profile, EDX): profile 22's first WRMSR writes a legal EAX, so with EDX = 1 only EDX is reserved.
         model_profile, edx = {'sysfault-efer-lme-clear@1': (25, 0), 'sysfault-cr4-pae-clear@1': (27, 0),
                               'sysfault-cr0-pg-clear@1': (28, 0), 'sysfault-efer-reserved-1@1': (29, 0),
@@ -1592,7 +1624,7 @@ def cmd_system(a, host, runtime):
         if model_profile:
             last = modes.model(model_profile, 0, modes.data(model_profile, [0] * 0x400), edx)['records'][-1]
             entry['modes_model'] = (model_profile, last['vector'])
-            if last['vector'] != want['cpus'][0]['fault'][0]:
+            if last['vector'] != faults[0][0]:
                 failures.append(f"{name}: modes_model profile {model_profile} gives vector {last['vector']}")
         for limit in ([], [1]):
             rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{name}{'-1' if limit else ''}", limit)
@@ -1602,7 +1634,7 @@ def cmd_system(a, host, runtime):
                 diffs = []
                 for v, (c, cpu) in enumerate(zip(prog['cpus'], out['cpus'])):
                     end = body_end(prog, smp.num(c['rip']))
-                    if want['cpus'][v]['fault'] is None and (cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end):
+                    if faults[v] is None and (cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end):
                         diffs.append(f"cpu{v} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
                     diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(cpu)]
                 if prog['params'].get('either'):
@@ -1739,9 +1771,8 @@ def cmd_sharedpt(a, host, runtime):
                     if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end:
                         diffs.append(f"cpu{v} stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
                     diffs += [f'cpu{v} ' + d for d in per_vcpu_checks(cpu)]
-                got = vm_state(prog, out)
-                got['cpus'] = want['cpus']
-                diffs += ['qemu: ' + d for d in smp.compare(prog, got, want)]
+                got = {'cpus': [], 'memory': vm_state(prog, out)['memory']}      # registers are not compared
+                diffs += ['qemu: ' + d for d in smp.compare(prog, got, answers.view(want, 'memory', lambda w: {'cpus': [], 'memory': w['memory']}))]
                 try:
                     found, hist = sharedpt.judge(prog, out)
                 except (KeyError, ValueError) as e:

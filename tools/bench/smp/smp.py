@@ -10,6 +10,8 @@ import argparse, collections, hashlib, json, os, pathlib, shutil, subprocess, sy
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE.parent.parent))
+sys.path.insert(0, str(HERE.parent.parent / 'reference'))
+import answers  # noqa: E402  (tools/reference/answers.py: NATEMU_ANSWERS live | seed | locked)
 # NATEMU_QEMU_SYSTEM: a qemu-system-x86_64 to use instead (testkit's pinned build, testkit.artifacts.qemu_system).
 QEMU = os.environ.get('NATEMU_QEMU_SYSTEM') or shutil.which('qemu-system-x86_64') or '/opt/homebrew/bin/qemu-system-x86_64'
 CFG, RESULT, CAPTURE, LOW, HIGH = 0x106000, 0x107000, 0x100800, 0x110000, 0x400000
@@ -89,9 +91,23 @@ def qemu_args(n, mode, dbg, img, cpu='max', extra=()):
 def default_cpu(prog): return SYSTEM_CPU if prog.get('system') else 'max'
 
 
-def run_image(prog, img, work, mode='multi', timeout=120, extra=(), cpu=None):
+def answer_key(prog, img, mode='multi', extra=(), cpu=None):
+    """The machine-independent key of a run (tools/reference/answers.py): QEMU's arguments with the file paths replaced,
+    the image's sha256, the system QEMU's pin name."""
+    args = qemu_args(prog['ncpu'], mode, 'DBG', 'IMG', cpu or default_cpu(prog), extra)[1:]
+    return answers.system_key([('file:PATH' if str(x).startswith('file:') else str(x)) for x in args], img)
+
+
+def run_image(prog, img, work, mode='multi', timeout=120, extra=(), cpu=None, hang_ok=False):
     """`extra`: more QEMU arguments (L3: `-serial file:PATH` gives the machine COM1 at 3F8H, in place of `-serial none`);
-    `cpu`: a QEMU CPU model other than `default_cpu(prog)` (tools/run_i5b.py)."""
+    `cpu`: a QEMU CPU model other than `default_cpu(prog)` (tools/run_i5b.py); `hang_ok`: a timeout is the expected answer.
+    NATEMU_ANSWERS seed/locked: the dump is an answers.Dump carrying the key (locked: QEMU is not run, the exit status is
+    the lock's, the dump empty)."""
+    if not answers.active(): return _run_image(prog, img, work, mode, timeout, extra, cpu)
+    return answers.system_run(answer_key(prog, img, mode, extra, cpu), lambda: _run_image(prog, img, work, mode, timeout, extra, cpu), hang_ok)
+
+
+def _run_image(prog, img, work, mode='multi', timeout=120, extra=(), cpu=None):
     work.mkdir(parents=True, exist_ok=True); p, dbg = work / 'image.bin', work / 'dbg.out'
     p.write_bytes(img); dbg.unlink(missing_ok=True); t0 = time.perf_counter()
     try:
@@ -105,7 +121,13 @@ def run_image(prog, img, work, mode='multi', timeout=120, extra=(), cpu=None):
 
 def parse_dump(prog, data):
     """-> {'cpus': [{'gpr': [16 ints], 'rflags': int}], 'memory': [{'addr','data'}...captured regions in program order]}; a
-    `system` program's CPUs also have 'fault': None or (vector, error code, RIP, CR2 (#PF only, else 0)). Raises ValueError."""
+    `system` program's CPUs also have 'fault': None or (vector, error code, RIP, CR2 (#PF only, else 0)). Raises ValueError.
+    An answers.Dump (NATEMU_ANSWERS seed/locked) gives an answers.Ref (locked: a placeholder)."""
+    if isinstance(data, answers.Dump): return answers.system_parsed(data, lambda: _parse_dump(prog, bytes(data)))
+    return _parse_dump(prog, data)
+
+
+def _parse_dump(prog, data):
     n = prog['ncpu']; caps = [(a, s) for a, s, c, _ in regions(prog) if c]
     system = bool(prog.get('system'))
     want = 16 + 136 * n + 40 * n * system + sum(s for _, s in caps) + 8
@@ -124,7 +146,13 @@ def parse_dump(prog, data):
 
 
 def compare(prog, got, want):
-    """Differences (list of strings) between two parsed states; RFLAGS only under FLAG_MASK. `want` has the same shape."""
+    """Differences (list of strings) between two parsed states; RFLAGS only under FLAG_MASK. `want` has the same shape.
+    A `want` from QEMU carrying an answer key (NATEMU_ANSWERS seed/locked) is the comparison point of
+    tools/reference/answers.py (locked: [] or one difference)."""
+    return answers.system_compare(got, want, lambda: _compare(prog, got, want))
+
+
+def _compare(prog, got, want):
     d = []
     for i, (g, w) in enumerate(zip(got['cpus'], want['cpus'])):
         for k, (x, y) in enumerate(zip(g['gpr'], w['gpr'])):

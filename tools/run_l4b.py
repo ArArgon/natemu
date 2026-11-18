@@ -30,7 +30,7 @@ from fractions import Fraction
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import smp, apic, timers, ref, run_slice1_vm as vm  # noqa: E402
+import smp, answers, apic, timers, ref, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver  # noqa: E402
 from run_x3 import natemu_memory, qemu_memory  # noqa: E402
 from run_l4a import run_natemu, qemu  # noqa: E402
@@ -49,7 +49,8 @@ def cmd_qemu(a, report):
     for prog, _ in [f() for f in (timers.pit_program, timers.rtc_program, timers.pm_program, timers.more_program) if not a.programs or f.__name__.split("_")[0] in a.programs]:
         label, check = prog['name'], CHECKS[prog['name'].split('-x')[0]]
         want, _, err = qemu(prog, a.out / 'qemu' / label)
-        problems = [f'QEMU run failed ({err})'] if want is None else [f'QEMU vs model: {d}' for d in check(qemu_memory(prog, want), False)[0]]
+        problems = [f'QEMU run failed ({err})'] if want is None else \
+            [f'QEMU vs model: {d}' for d in answers.derive(want, 'model', lambda w: check(qemu_memory(prog, w), False)[0])]
         summaries = {}
         for limit in (None, 1):
             out, p = run_natemu(a, prog, a.out / 'work' / f"{label}-{limit or 'd'}", [limit] if limit else [])
@@ -58,9 +59,14 @@ def cmd_qemu(a, report):
                 p2, summaries[limit or 'default'] = check(mem, True)
                 p += p2
                 if want is not None:
-                    q = compared(qemu_memory(prog, want))
                     skip = DEPARTURES.get(label.split('-x')[0], set())
-                    p += [f'k{k}: natemu {x:#x} != QEMU {y:#x}' for k, (x, y) in enumerate(zip(compared(mem), q)) if x != y and k not in skip]
+                    def slots(m): return [x for k, x in enumerate(compared(m)) if k not in skip]
+                    def live(mem=mem, skip=skip):
+                        q = compared(qemu_memory(prog, want))
+                        return [f'k{k}: natemu {x:#x} != QEMU {y:#x}' for k, (x, y) in enumerate(zip(compared(mem), q)) if x != y and k not in skip]
+                    # (DATA slots below timers.RAW but the departures: a comparison point of tools/reference/answers.py)
+                    p += answers.compared(want, 'slots/' + ','.join(map(str, sorted(skip))), lambda w: (slots(qemu_memory(prog, w)), {}),
+                                          lambda aux, mem=mem: slots(mem), live)
             problems += [f'max-block {limit}: {x}' for x in p]
         report.append({'name': label, 'problems': problems, 'summary': summaries})
         failures += [f'{label}: {p}' for p in problems]
@@ -69,7 +75,8 @@ def cmd_qemu(a, report):
     prog, labels = timers.s5_program()
     label = prog['name']
     rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, smp.build_stub(a.out / 'qemu' / label)), a.out / 'qemu' / label, 'multi')
-    problems = [] if rc == 0 and not dump else [f'QEMU: exit {rc}, dump {len(dump)} bytes (expected a power-off)']
+    empty = answers.derive(dump, 'empty', lambda d: not d)       # (locked: the exit and this from the lock)
+    problems = [] if rc == 0 and empty else [f'QEMU: exit {rc}, dump {"empty" if empty else "not empty"} (expected a power-off)']
     out, p = run_natemu(a, prog, a.out / 'work' / label, reached=False)
     if out is not None and out['cpus'][0]['stop'] != 'poweroff':
         p.append(f"natemu: {out['cpus'][0]['stop']} {out['cpus'][0]['reason']}")

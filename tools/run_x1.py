@@ -21,7 +21,7 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, smp, entry, programs as P, run_slice1_vm as vm  # noqa: E402
+import ref, smp, answers, entry, programs as P, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end, smp_description, vm_state  # noqa: E402
 from models import delivery_model as dm  # noqa: E402
 
@@ -104,7 +104,7 @@ def cmd_qemu(a, report):
         if want is None:
             failures.append(f'{label}: QEMU run failed ({rc} {err})')
         else:
-            q = model_problems(prog, {r['addr']: r['data'] for r in want['memory']}, qemu=True)
+            q = answers.derive(want, 'model_problems', lambda w: model_problems(prog, {r['addr']: r['data'] for r in w['memory']}, qemu=True))
             e['qemu_vs_model'] = q
             failures += [f'{label}: QEMU vs model: {d}' for d in q]
         for limit in (None, 1):
@@ -121,7 +121,7 @@ def cmd_qemu(a, report):
                 got = vm_state(prog, out)
                 problems += model_problems(prog, {r['addr']: r['data'] for r in got['memory']})
                 if want is not None:
-                    problems += smp.compare(prog, without_rf(prog, got), without_rf(prog, want))
+                    problems += smp.compare(prog, without_rf(prog, got), answers.view(want, 'without-rf', lambda w: without_rf(prog, w)))
             e['runs'].append({'max_block': limit, 'problems': problems})
             failures += [f'{label} (max-block {limit}): {p}' for p in problems]
         print(f"{label}: {'FAIL' if any(r['problems'] for r in e['runs']) or e.get('qemu_vs_model') else 'ok'}",
@@ -146,7 +146,8 @@ def plain_program(a, stub, report, prog, expected):
     if want is None:
         failures.append(f'{label}: QEMU run failed ({rc} {err})')
     else:
-        e['qemu_vs_sdm'] = sdm([smp.num(x) for x in want['cpus'][0]['gpr']])
+        e['qemu_vs_sdm'] = answers.derive(want, 'sdm/' + ','.join(f'{r}={v:#x}' for r, v in sorted(expected.items())),
+                                          lambda w: sdm([smp.num(x) for x in w['cpus'][0]['gpr']]))
         failures += [f'{label}: QEMU vs SDM: {d}' for d in e['qemu_vs_sdm']]
     for limit in (None, 1):
         rc, out, err = driver(a.host, a.runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{label}-{limit or 'd'}", [limit] if limit else [])

@@ -30,7 +30,7 @@ import argparse, json, pathlib, struct, subprocess, sys, time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import run_slice3_vm as s3  # noqa: E402  (also puts tools/reference and tools/bench/smp on the path)
-import ref, smp, run_slice1_vm as vm1, qemucache  # noqa: E402
+import ref, smp, answers, run_slice1_vm as vm1, qemucache  # noqa: E402
 qemucache.install(smp)      # (run_slice3_vm did: idempotent)
 
 # QEMU's Haswell (11.1.2 TCG): leaf 0DH sub-leaves 0 and 2 and leaf 1 ECX equal the profile's; sub-leaf 1 also advertises
@@ -484,8 +484,11 @@ def run_images(a, host, runtime, stub, results):
             diffs += s3.per_vcpu_checks(cpu)
             got = s3.vm_state(prog, out)
             if want:
-                w = masked(want, mask, got['memory'][0]['data'])
-                diffs += [f"max-block {limit}: {x}" for x in smp.compare(prog, got, {**w, 'cpus': [{**w['cpus'][0], 'fault': None}]})]
+                # The masked ranges are left out of the comparison (zero in both states); QEMU's run ends without a fault.
+                zero = bytes(max((off + n for off, n, *_ in mask), default=0))
+                w = answers.view(want, 'masked/' + ','.join(f'{off}+{n}' for off, n, *_ in mask),
+                                 lambda w: (lambda w: {**w, 'cpus': [{**w['cpus'][0], 'fault': None}]})(masked(w, mask, zero)))
+                diffs += [f"max-block {limit}: {x}" for x in smp.compare(prog, masked(got, mask, zero), w)]
             for off, n, *value in mask:     # natemu's: 0 (pointers, reserved bytes), or the value I6 deviation 2 gives
                 if got['memory'][0]['data'][off:off + n] != (value[0] if value else bytes(n)):
                     diffs.append(f"natemu bytes at +{off:#x}: {got['memory'][0]['data'][off:off + n].hex()}")
@@ -535,7 +538,7 @@ def run_faults(a, host, runtime, stub, results):
                 j = next(k for k in range(len(m)) if m[k] != m0[k]); problems.append(f'memory written at +{j:#x}')
         if c['qemu'] and not a.no_qemu and c['want'] is not None and c['want'][0] != 'stop':
             full = qemu(prog, stub, a.out / 'qemu' / c['name'], timeout=30)
-            qf = full and full['cpus'][0].get('fault')
+            qf = full and s3.tupled(answers.derive(full, 'cpu0-fault', lambda f: f['cpus'][0].get('fault')))
             exp = (c['want'][0], c['want'][1], at, c['want'][2] if c['want'][0] == 14 else 0)
             differs = QEMU_DIFFERS.get(c['name']) or c.get('qemu_differs_if')
             if qf != exp:
@@ -544,7 +547,7 @@ def run_faults(a, host, runtime, stub, results):
             elif differs: problems.append('QEMU_DIFFERS lists it but QEMU agrees')
         elif c['qemu'] and not a.no_qemu and c['want'] is None:
             full = qemu(prog, stub, a.out / 'qemu' / c['name'], timeout=30)
-            qf = full and full['cpus'][0].get('fault')
+            qf = full and s3.tupled(answers.derive(full, 'cpu0-fault', lambda f: f['cpus'][0].get('fault')))
             if full is None or qf is not None:
                 if c.get('qemu_differs_if') and qf is not None: c['qemu_differs'] = f"{qf}: {c['qemu_differs_if']}"
                 else: problems.append(f"QEMU: {qf} (the rule: no fault)")

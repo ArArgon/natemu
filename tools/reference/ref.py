@@ -16,7 +16,7 @@ import argparse, hashlib, json, os, pathlib, re, sqlite3, struct, subprocess, sy
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from raw_root import RAW_ROOT, STATE_ROOT
-import flags
+import flags, answers
 
 # The pinned QEMU container image (Debian bookworm, qemu-user-static 7.2) and the SHA-256 of its QEMU binaries and
 # sources (the pins of the earlier I4-V QEMU check, run_i4v_qemu.py, deleted at S3i).
@@ -424,8 +424,23 @@ def _key(program, digest, backend):
     return hashlib.sha256(json.dumps([program, digest, backend, code, FORMAT], sort_keys=True, default=str).encode()).hexdigest()
 
 
+def qemu_args(p):
+    """QEMU's arguments for a normalized program `p` (as container_entry runs it), with the harness format: part of the
+    answer key (tools/reference/answers.py)."""
+    return [FORMAT, '-cpu', p['cpu'], *(['-singlestep'] if p['faults'] is not None else []),
+            '-d', 'in_asm,exec,nochain' if p['flow'] else 'in_asm', '-D', 'qemu.log', 'prog.elf']
+
+
 def run_programs(programs, workdir, qemu):
-    """Run all programs in one pinned-image container; return (results, provenance)."""
+    """Run all programs in one pinned-image container; return (results, provenance). NATEMU_ANSWERS=seed: each result is
+    an answers.Ref carrying its key (and its projection is recorded); locked: QEMU is not run, every result is a
+    placeholder carrying its key, or the answer rebuilt from the lock's inline value (tools/reference/answers.py)."""
+    if not answers.active(): return _run_programs(programs, workdir, qemu)
+    keyed = [answers.user_key(p, qemu_args(p)) for p in map(norm, programs)]
+    return answers.user_results(keyed, lambda: _run_programs(programs, workdir, qemu))
+
+
+def _run_programs(programs, workdir, qemu):
     workdir = pathlib.Path(workdir).resolve(); qemu = pathlib.Path(qemu).resolve()
     digest = hashlib.sha256(qemu.read_bytes()).hexdigest()
     require(digest == PINS['qemu-x86_64-static'], 'QEMU binary does not match the pinned hash')
@@ -531,7 +546,13 @@ def run_docker_reference(workdir, qemu, name, token, cidfile):
 def compare(result, gpr, rflags, rip, memory):
     """Differences between a QEMU `result` and another implementation's final state ([] = equal).
     gpr: 16 ints; rflags, rip: ints; memory: list of {'addr','data'} with exactly the program's regions, in order.
-    RFLAGS is compared only under the rule-derived mask (undefined bits excluded); IF/bit1 are ignored."""
+    RFLAGS is compared only under the rule-derived mask (undefined bits excluded); IF/bit1 are ignored.
+    A `result` carrying an answer key (NATEMU_ANSWERS seed/locked) is the comparison point of tools/reference/answers.py:
+    seed records the projection, locked compares its hash ([] or one difference, no field diff)."""
+    return answers.user_compare(result, gpr, rflags, rip, memory, lambda: _compare(result, gpr, rflags, rip, memory))
+
+
+def _compare(result, gpr, rflags, rip, memory):
     diffs, q = [], result['qemu']
     for i, r in enumerate(REGS):
         if num(q['gpr'][i]) != gpr[i]: diffs.append(f'{r}: qemu {q["gpr"][i]} vs {gpr[i]:#x}')

@@ -35,7 +35,7 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import smp, apic, irqs, events, run_slice1_vm as vm  # noqa: E402
+import smp, answers, apic, irqs, events, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end  # noqa: E402
 from run_x3 import compare_qemu, natemu_memory, qemu_memory  # noqa: E402
 
@@ -64,7 +64,15 @@ def qemu(prog, work):
     rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), work, 'multi', extra=['-serial', f'file:{serial}'])
     if rc != 1:
         return None, None, f'{rc} {err}'
-    return smp.parse_dump(prog, dump), serial.read_bytes().split(b'Booting from ROM..')[-1], None
+    # (NATEMU_ANSWERS=locked: QEMU did not run, so no serial file; the UART comparison is by the answer's hash, uart_equal)
+    sent = None if answers.mode() == 'locked' else serial.read_bytes().split(b'Booting from ROM..')[-1]
+    return smp.parse_dump(prog, dump), sent, None
+
+
+def uart_problems(want, mine, sent):
+    """natemu's UART bytes against QEMU's serial output (`want`: QEMU's answer, the key of tools/reference/answers.py)."""
+    if answers.equal(want, 'uart', mine.hex(), sent.hex() if sent is not None else None): return []
+    return [f'UART bytes {mine!r} != QEMU {sent!r}' if sent is not None else f'UART bytes {mine!r}: {answers.HASH_ONLY}']
 
 
 # ---- the model: what the datasheets and the SDM give for each program ------------------------------------------
@@ -130,16 +138,14 @@ def check_program(a, prog, label, compare=True, modes=(None, 1)):
         want, sent, err = qemu(prog, a.out / 'qemu' / label)
         if want is None:
             return [f'QEMU run failed ({err})']
-        problems += [f'QEMU vs model: {d}' for d in model_problems(prog, qemu_memory(prog, want))]
+        problems += [f'QEMU vs model: {d}' for d in answers.derive(want, 'model_problems', lambda w: model_problems(prog, qemu_memory(prog, w)))]
     for limit in modes:
         out, p = run_natemu(a, prog, a.out / 'work' / f"{label}-{limit or 'd'}", [limit] if limit else [])
         if out is not None:
             p += model_problems(prog, natemu_memory(out))
             if want is not None:
                 p += compare_qemu(prog, out, want)
-                mine = bytes.fromhex(out.get('uart', ''))
-                if mine != sent:
-                    p.append(f'UART bytes {mine!r} != QEMU {sent!r}')
+                p += uart_problems(want, bytes.fromhex(out.get('uart', '')), sent)
         problems += [f'max-block {limit}: {x}' for x in p]
     return problems
 

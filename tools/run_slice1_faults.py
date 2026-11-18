@@ -85,7 +85,7 @@ from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice1 as gen, gen_i1, run_slice1_vm as vm, delivery_check, shard  # noqa: E402
+import ref, answers, gen_slice1 as gen, gen_i1, run_slice1_vm as vm, delivery_check, shard  # noqa: E402
 
 M64, PAGE = 2**64 - 1, 4096
 SIZES = {'byte': 1, 'word': 2, 'dword': 4, 'qword': 8, 'xmmword': 16}
@@ -319,10 +319,19 @@ class Machine:
             if leaf is None: return (14, max(start, page), error)
         return None
 
-def first_fault(evs, machine, read):
-    """The x86 exception of one instruction's events on the `Machine`, or None (its accesses set A/D)."""
+def first_fault(evs, machine, read=None):
+    """The x86 exception of one instruction's events on the `Machine`, or None (its accesses set A/D). Events from
+    `reference_events` carry their divide/target verdicts (`read` unused); raw `events` read memory through `read`."""
     for e in evs:
         if e[0] in ('ud', 'align'): return (6, 0, 0) if e[0] == 'ud' else (13, 0, 0)
+        if e[0] == 'divide' and len(e) == 4:      # resolved: ('divide', signed, bytes, ('de', bool) | ('unreadable', why))
+            if e[3][0] == 'unreadable': raise Unsupported(e[3][1])
+            if e[3][1]: return (0, 0, 0)
+            continue
+        if e[0] == 'target' and isinstance(e[1], tuple) and e[1][0] in ('canonical', 'unreadable'):     # resolved
+            if e[1][0] == 'unreadable': raise Unsupported(e[1][1])
+            if not e[1][1]: return (13, 0, 0)
+            continue
         if e[0] == 'divide':
             _, signed, w, src, rax, rdx = e
             d = int.from_bytes(read(src[1], w), 'little') if isinstance(src, tuple) else src
@@ -378,6 +387,35 @@ def reader(result):
     return read
 
 def state(result): return dict(zip(ref.REGS, (ref.num(v) for v in result['qemu']['gpr'])))
+
+def tuples(x): return tuple(tuples(v) for v in x) if isinstance(x, (list, tuple)) else x
+
+def reference_events(result, text, segs, next_rip):
+    """`events` of one instruction in the QEMU prefix state `result`, the memory it reads for a divisor or a branch target
+    resolved there into the verdict (#DE or not, canonical or not). A value derived from QEMU's answer: with
+    NATEMU_ANSWERS seed/locked it is kept in the lock's aux (tools/reference/answers.py), so locked runs need no QEMU.
+    Raises Unsupported as `events` does."""
+    def derive(r):
+        try: evs = events(text, dict(state(r), **segs), next_rip)
+        except Unsupported as e: return ['unsupported', str(e)]
+        read, out = reader(r), []
+        def resolved(f):
+            try: return f()
+            except Unsupported as e: return ('unreadable', str(e))
+        for e in evs:
+            if e[0] == 'divide':
+                _, signed, w, src, rax, rdx = e
+                d = (lambda: int.from_bytes(read(src[1], w), 'little')) if isinstance(src, tuple) else (lambda: src)
+                e = ('divide', signed, w, resolved(lambda: ('de', divide_error(signed, w, d(), rax, rdx))))
+            elif e[0] == 'target':
+                t = e[1]
+                v = (lambda: int.from_bytes(read(t[1], 8), 'little')) if isinstance(t, tuple) else (lambda: t)
+                e = ('target', resolved(lambda: ('canonical', canonical(v()))))
+            out.append(e)
+        return ['ok', out]
+    got = tuples(answers.derive(result, f'events/{next_rip:#x}/{text}', derive))
+    if got[0] == 'unsupported': raise Unsupported(got[1])
+    return list(got[1])
 def bases(p): return {'fs': ref.num(p.get('fsbase', 0)) & M64, 'gs': ref.num(p.get('gsbase', 0)) & M64}    # I7
 
 # Built-in probes: (name, registers, lines, index of the faulting line, mutations).
@@ -842,11 +880,10 @@ def relocate(p, results, mine, code, data, scr):
             out.append(dict(m, addr=hex(a + delta(a)), data=bytes_.hex()))
         return out
     q = dict(p, rip=hex(ref.num(p['rip']) + code), gpr=moved(p['gpr']), memory=mem(p['memory']), scratch=p['scratch'] + scr)
-    rs = list(results)       # only this program's results (`mine`) move
+    rs = list(results)       # only this program's results (`mine`) move: views of QEMU's answers (tools/reference/answers.py)
     for i in mine:
-        r = results[i]
-        rs[i] = dict(r, qemu=dict(r['qemu'], rip=ref.hx(ref.num(r['qemu']['rip']) + code), gpr=moved(r['qemu']['gpr']),
-                                  memory=mem(r['qemu']['memory'])))
+        rs[i] = answers.view(results[i], f'relocated/{code:#x}/{data:#x}/{scr:#x}', lambda r: dict(
+            r, qemu=dict(r['qemu'], rip=ref.hx(ref.num(r['qemu']['rip']) + code), gpr=moved(r['qemu']['gpr']), memory=mem(r['qemu']['memory']))))
     return q, rs
 
 def run_case(p, offs, evs, read, mut):
@@ -857,7 +894,7 @@ def run_case(p, offs, evs, read, mut):
     for k in range(len(offs) - 1):
         fault = m.fetch(rip + offs[k], offs[k + 1] - offs[k])
         if fault: i, fetched = k, True; break
-        fault = first_fault(evs.get(k, []), m, read(k)) if k in evs else None
+        fault = first_fault(evs.get(k, []), m) if k in evs else None
         if fault: i = k; break
     code = set(pages(rip, offs[-1]))
     data = {pg for x in p['memory'] for pg in pages(ref.num(x['addr']), len(x['data']) // 2)}
@@ -910,10 +947,10 @@ def expectations(programs, probe_specs, work, paging=True):
             rip = ref.num(q['rip'])
             # A corpus program with raw `.byte` lines (e.g. gen_i7's prefix-rule edges): the model cannot read their accesses.
             if any(l.startswith('.byte') for l in q['asm']): print(f"skip {q['name']} ({where}): raw .byte lines"); continue
-            try: evs = {i: events(q['asm'][i], dict(state(rs[j]), **bases(q)), rip + offs[i + 1]) for i, j in at.items()}
+            try: evs = {i: reference_events(rs[j], q['asm'][i], bases(q), rip + offs[i + 1]) for i, j in at.items()}
             except Unsupported as e: print(f"skip {q['name']} ({where}): {e}"); continue
             def case(name, mut):
-                f, i, fetched, ad = run_case(q, offs, evs, lambda k: reader(rs[at[k]]), mut)
+                f, i, fetched, ad = run_case(q, offs, evs, None, mut)
                 if not f: r = rs[full]
                 elif i in at: r = rs[at[i]]
                 elif i == 0: r = initial_result(q)
@@ -927,7 +964,7 @@ def expectations(programs, probe_specs, work, paging=True):
                 for page in touched:
                     for mode in ('unmap', 'readonly'):
                         mut = {mode: [page]}
-                        f, i, fetched, ad = run_case(q, offs, evs, lambda k: reader(rs[at[k]]), mut)
+                        f, i, fetched, ad = run_case(q, offs, evs, None, mut)
                         if f: cases.append((f"{q['name']}@{where}/{mode}-{page:#x}", q, mut, f, offs[i], rs[at[i]], describe(q['asm'][i], evs[i], f), ad))
             if not paging: continue
             n = 2 if corpus else 6
@@ -938,21 +975,22 @@ def expectations(programs, probe_specs, work, paging=True):
             for v in take(('code', corpus, where), CODE_VARIANTS, n + 1): case(*cell(v, min(code_pages), code_pages, take('memtype', MEMTYPES, 1)[0]))
     for p, offs, k, mut, j in probing:
         rip, r = ref.num(p['rip']), results[j]
-        r['qemu']['rip'] = ref.hx(rip + offs[k])
+        at_rip = lambda r, a: dict(r, qemu=dict(r['qemu'], rip=ref.hx(a)))      # QEMU ran it at `here`: the case's RIP
+        r = answers.view(results[j], f'rip/{rip + offs[k]:#x}', lambda r: at_rip(r, rip + offs[k]))
         m = layout(p, mut)
         fetched = m.fetch(rip + offs[k], offs[k + 1] - offs[k])
-        try: evs = events(p['asm'][k], dict(state(r), **bases(p)), rip + offs[k + 1])
+        try: evs = reference_events(r, p['asm'][k], bases(p), rip + offs[k + 1])
         except Unsupported:     # a straddling branch: its fetch fault or the QEMU full run is the reference
             if not mut.get('straddle'): raise
             evs = []
         if mut.get('atomic') or mut.get('refused'):
             cases.append((p['name'], p, mut, None, offs[k], r, ATOMIC if mut.get('atomic') else REFUSED, None)); continue
         if mut.get('nofault'):      # the full run: the program reaches its end
-            if first_fault(evs, m, reader(r)): raise ValueError(f"{p['name']}: a no-fault probe faults in the model")
-            r['qemu']['rip'] = ref.hx(rip + offs[-1])
-            if mut.get('zf_only'): r = dict(r, rflags_compare_mask=ref.hx(0x40))
+            if first_fault(evs, m): raise ValueError(f"{p['name']}: a no-fault probe faults in the model")
+            r = answers.view(results[j], f'rip/{rip + offs[-1]:#x}', lambda r: at_rip(r, rip + offs[-1]))
+            if mut.get('zf_only'): r = answers.view(r, 'mask/0x40', lambda r: dict(r, rflags_compare_mask=ref.hx(0x40)))
             cases.append((p['name'], p, {}, None, offs[-1], r, 'runs to its end', None)); continue
-        f = fetched or mut.get('expect') or first_fault(evs, m, reader(r))
+        f = fetched or mut.get('expect') or first_fault(evs, m)
         if not f: raise ValueError(f"{p['name']}: the probe does not fault")
         cases.append((p['name'], p, mut, f, offs[k], r, describe(p['asm'][k], [] if fetched else evs, f, bool(fetched)), None))
     if skipped: print(f'{len(skipped)} paging cells skipped (fetch fault after the first instruction, no QEMU prefix): {skipped[:5]}')

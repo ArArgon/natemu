@@ -25,7 +25,7 @@ from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice2 as gen, run_slice1_vm as vm, run_slice1_faults as F, delivery_check, shard  # noqa: E402
+import ref, answers, gen_slice2 as gen, run_slice1_vm as vm, run_slice1_faults as F, delivery_check, shard  # noqa: E402
 
 PAGE = 4096
 PAGES = [gen.DATA, gen.DATA + PAGE, gen.STACK, gen.STACK + PAGE]
@@ -118,25 +118,32 @@ def reference(jobs, work):
     left lazily computed (a faulting `setcc` store after a `cmp` reports stale AF or CF, even single-stepped), so phase 2 runs
     the straight-line program with the effects of the executed path up to the fault (gen_slice2.unrolled) to its end, where the
     capture is exact; its state is the expected one. A phase-1 context that differs from it in more than flags would be a QEMU
-    defect and is returned. Returns (results, [(case, differing parts)])."""
+    defect and is returned. Returns ([(result, summary)], [(case, differing parts)]): `summary` {unroll, path_ix, fault,
+    executed_insns} is derived from phase 1's answer (tools/reference/answers.py: kept in the lock's aux), the result is
+    a view of the answers (phase 2's state at phase 1's RIP)."""
     first, second = [], []
     for i in range(0, len(jobs), 200):      # batches bound the disk the QEMU logs take
         first += ref.run_programs(jobs[i:i + 200], work, qemu_path())[0]
-        shutil.rmtree(work / 'jobs')
-    exact = [dict(gen.unrolled(j, path(j, r['path_ix'])), name=j['name'] + '/path', faults={'protect': []}) for j, r in zip(jobs, first) if unroll(j, r)]
+        shutil.rmtree(work / 'jobs', ignore_errors=True)     # (none when NATEMU_ANSWERS=locked: QEMU did not run)
+    info = [answers.derive(r, 'phase1', lambda r, j=j: {'unroll': unroll(j, r), 'path_ix': r.get('path_ix'), 'fault': r.get('fault'),
+                                                         'executed_insns': r.get('executed_insns')}) for j, r in zip(jobs, first)]
+    exact = [dict(gen.unrolled(j, path(j, f['path_ix'])), name=j['name'] + '/path', faults={'protect': []}) for j, f in zip(jobs, info) if f['unroll']]
     for i in range(0, len(exact), 200):
         second += ref.run_programs(exact[i:i + 200], work, qemu_path())[0]
-        shutil.rmtree(work / 'jobs')
+        shutil.rmtree(work / 'jobs', ignore_errors=True)
     second, results, diffs = iter(second), [], []
-    for j, r in zip(jobs, first):
-        if unroll(j, r):
+    for j, r, f in zip(jobs, first, info):
+        if f['unroll']:
             t = next(second)
-            q1, q2 = r['qemu'], dict(t['qemu'], rip=r['qemu']['rip'])
-            changed = (ref.num(q1['rflags']) ^ ref.num(q2['rflags'])) & ref.num(t['rflags_compare_mask'])
-            wrong = [k for k in ('gpr', 'memory') if q1[k] != q2[k]] + ['rflags'] * (changed != 0)
+            def wrong_parts(r, t=t):     # QEMU's signal context against its exact path state (QEMU against QEMU)
+                q1, q2 = r['qemu'], dict(t['qemu'], rip=r['qemu']['rip'])
+                changed = (ref.num(q1['rflags']) ^ ref.num(q2['rflags'])) & ref.num(t['rflags_compare_mask'])
+                return [k for k in ('gpr', 'memory') if q1[k] != q2[k]] + ['rflags'] * (changed != 0)
+            wrong = answers.derive(r, f'signal-context/{answers.key_of(t)}', wrong_parts)
             if wrong: diffs.append((j['name'], wrong))
-            r = dict(r, qemu=q2, rflags_compare_mask=t['rflags_compare_mask'], undefined_flags=t['undefined_flags'])
-        results.append(r)
+            r = answers.view(r, f'exact-path/{answers.key_of(t)}', lambda r, t=t: dict(
+                r, qemu=dict(t['qemu'], rip=r['qemu']['rip']), rflags_compare_mask=t['rflags_compare_mask'], undefined_flags=t['undefined_flags']))
+        results.append((r, f))
     return results, diffs
 
 
@@ -156,7 +163,7 @@ def main():
     plan = shard.take(cases(programs), a.shard)
     jobs = [dict(p, name=name, faults={'protect': [{'addr': pg, 'mode': mode} for mode, pg in muts]}) for name, p, muts in plan]
     results, signal_diffs = reference(jobs, a.out / 'ref')
-    faulted = sum(1 for r in results if r.get('fault'))
+    faulted = sum(1 for _, f in results if f['fault'])
     print(f'{len(plan)} cases ({len(programs)} programs); QEMU faulted in {faulted}, ran to the end in {len(plan) - faulted}', flush=True)
     print(f'QEMU signal context differs from the exact path state in {len(signal_diffs)} cases (flags only): {signal_diffs[:12]}', flush=True)
     assert all(set(d) <= {'rflags'} for _, d in signal_diffs), 'QEMU signal context differs from the exact path state in more than flags'
@@ -164,38 +171,37 @@ def main():
     report, failures = [], 0
     for size in a.sizes:
         counts, kinds = {'match': 0, 'unsupported': 0, 'fail': 0}, {'fault': 0, 'end': 0}
-        for n, ((name, p, muts), want) in enumerate(zip(plan, results)):
+        for n, ((name, p, muts), (want, info)) in enumerate(zip(plan, results)):
             work = a.out / 'work' / size / f'c{n:04d}'
             work.mkdir(parents=True, exist_ok=True)
             (work / 'program.txt').write_text(vm.description(p) + ''.join(f'{mode} {pg:#x}\n' for mode, pg in muts))
             import subprocess
             run = subprocess.run([host, runtime, 'run-program', a.fexc, work / 'program.txt', work] + ([] if size == 'default' else [size]) + vm.CODE_SHAPE,
                                  capture_output=True, text=True)
-            entry = {'case': name, 'size': size, 'qemu_fault': want.get('fault'), 'qemu_executed': want.get('executed_insns'), 'returncode': run.returncode, 'stderr': run.stderr[-500:]}
+            entry = {'case': name, 'size': size, 'qemu_fault': info['fault'], 'qemu_executed': info['executed_insns'], 'returncode': run.returncode, 'stderr': run.stderr[-500:]}
             if run.returncode:
                 entry['outcome'], diffs = 'fail', ['host error']
             else:
                 out = json.loads(run.stdout)
                 entry['vm'] = {k: out[k] for k in ('stop', 'reason', 'rip', 'rflags', 'gpr', 'fault', 'stats', 'frame_intact')}
-                q = want['qemu']
                 limit = vm.declared_limit(out)
                 if limit:
                     entry['outcome'], diffs = 'unsupported', [limit]
                 else:
-                    if want.get('fault'):
-                        expected, diffs = expected_fault(p, muts, want)
+                    if info['fault']:
+                        expected, diffs = answers.derive(want, f'expected_fault/{muts}', lambda w: expected_fault(p, muts, w))
                         if expected: diffs += compare_fault(expected, out, int(p.get('cpl', 3)))
                     else:
                         diffs = [] if out['stop'] == 'reached' else [f"QEMU ran to the end; VM stopped {out['stop']} {out['reason']} at {out['rip']}"]
                     diffs += ref.compare(want, [ref.num(v) for v in out['gpr']], ref.num(out['rflags']), ref.num(out['rip']), out['memory'])
                     if not out['frame_intact']: diffs.append('FEX frame changed')
                     entry['outcome'] = 'fail' if diffs else 'match'
-                    kinds['fault' if want.get('fault') else 'end'] += entry['outcome'] == 'match'
+                    kinds['fault' if info['fault'] else 'end'] += entry['outcome'] == 'match'
             entry['diffs'] = diffs
             counts[entry['outcome']] += 1
             report.append(entry)
             if entry['outcome'] != 'match':
-                print(f"[{size}] {name}: {entry['outcome']} qemu={want.get('fault')} {'; '.join(diffs)[:300]} {entry['stderr'].strip()[-200:]}", flush=True)
+                print(f"[{size}] {name}: {entry['outcome']} qemu={info['fault']} {'; '.join(diffs)[:300]} {entry['stderr'].strip()[-200:]}", flush=True)
         deep = sum(1 for e in report if e['size'] == size and e['qemu_fault'] and e['qemu_executed'] > 50)
         print(f'[{size}] {counts} matched faults {kinds["fault"]} ({deep} after more than 50 executed instructions), matched runs to the end {kinds["end"]}', flush=True)
         failures += counts['fail'] + counts['unsupported']

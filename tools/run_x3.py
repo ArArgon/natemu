@@ -30,7 +30,7 @@ from fractions import Fraction
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, smp, apic, events, run_slice1_vm as vm  # noqa: E402
+import ref, smp, answers, apic, events, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end  # noqa: E402
 
 R = Fraction(125, 3)              # TSC ticks per crystal tick (CPUID.15H: 1 GHz / 24 MHz)
@@ -144,8 +144,27 @@ def model_problems(prog, mem, qemu=False):
     return out
 
 
+def qemu_projection(prog, gprs, regions, bases):
+    """What compare_qemu compares (tools/reference/answers.py): each CPU's GPRs; QEMU's captured regions `bases` (logs
+    with their TSC fields cleared; with peers not the logs) as natemu's `regions` or QEMU's hold them."""
+    data = masked_logs(prog, regions)
+    keep = [b for b in bases if not (prog['ncpu'] > 1 and any(b == apic.LOG(i) for i in range(prog['ncpu'])))]
+    return {'gpr': gprs, 'regions': [[b, data[b].hex() if data.get(b) is not None else None] for b in keep]}
+
+
 def compare_qemu(prog, out, want):
-    """natemu vs QEMU: GPRs and flags, and every captured region (logs without TSC)."""
+    """natemu vs QEMU: GPRs and flags, and every captured region (logs without TSC). A comparison point of
+    tools/reference/answers.py (NATEMU_ANSWERS seed/locked)."""
+    def project_want(w):
+        n = min(len(out['cpus']), len(w['cpus']))
+        bases = [r['addr'] for r in w['memory']]
+        return qemu_projection(prog, [list(c['gpr']) for c in w['cpus'][:n]], qemu_memory(prog, w).regions, bases), {'ncpu': n, 'bases': bases}
+    def project_got(aux):
+        return qemu_projection(prog, [[smp.num(v) for v in c['gpr']] for c in out['cpus'][:aux['ncpu']]], natemu_memory(out).regions, aux['bases'])
+    return answers.compared(want, 'compare_qemu', project_want, project_got, lambda: _compare_qemu(prog, out, want))
+
+
+def _compare_qemu(prog, out, want):
     diffs = []
     for i, (c, w) in enumerate(zip(out['cpus'], want['cpus'])):
         for k, (x, y) in enumerate(zip([smp.num(v) for v in c['gpr']], w['gpr'])):
@@ -172,9 +191,12 @@ def compare_fault_cases(prog, out, want):
     """apic-faults: natemu vs QEMU on every case outside QEMU_DEVIATIONS: #GP or not, and the faulting RIP."""
     known = QEMU_DEVIATIONS[prog['name'].split('@')[0]]
     gp = lambda mem: {e[6]: e[1] for e in logs(prog, mem)[0] if e[0] == 13 and e[6] not in known}
-    mine, theirs = gp(natemu_memory(out)), gp(qemu_memory(prog, want))
     agreeing = len(apic.FAULT_CASES) - len(known)
-    return [] if mine == theirs else [f'#GP (case: RIP) on the {agreeing} agreeing cases: natemu {mine} != QEMU {theirs}']
+    def live():
+        mine, theirs = gp(natemu_memory(out)), gp(qemu_memory(prog, want))
+        return [] if mine == theirs else [f'#GP (case: RIP) on the {agreeing} agreeing cases: natemu {mine} != QEMU {theirs}']
+    pairs = lambda mem: sorted(gp(mem).items())
+    return answers.compared(want, 'fault_cases', lambda w: (pairs(qemu_memory(prog, w)), {}), lambda aux: pairs(natemu_memory(out)), live)
 
 
 def cmd_qemu(a, report):
@@ -190,7 +212,7 @@ def cmd_qemu(a, report):
         if want is None:
             failures.append(f'{label}: QEMU run failed ({rc} {err})')
         else:
-            q = model_problems(prog, qemu_memory(prog, want), qemu=True)
+            q = answers.derive(want, 'model_problems', lambda w: model_problems(prog, qemu_memory(prog, w), qemu=True))
             entry['qemu_vs_model'] = q
             failures += [f'{label}: QEMU vs model: {d}' for d in q]
         for limit in (None, 1):

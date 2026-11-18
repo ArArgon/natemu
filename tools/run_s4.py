@@ -18,7 +18,7 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, run_slice1_vm as vm, run_slice3_vm as s3, smp, debug  # noqa: E402
+import ref, run_slice1_vm as vm, run_slice3_vm as s3, smp, debug, answers  # noqa: E402
 
 
 # Where pinned QEMU departs from the SDM in a register (the SDM's value is judged by `debug.expect` or below): the
@@ -28,14 +28,27 @@ QEMU_DIFFERS = {'s4-dr': {'cpu0 r8:': 'QEMU keeps DR6 bit 12 written as 1; SDM V
                                          'SDM 18.3.1.2: a trap between iterations, the REP resumes'}}
 
 
+def not_compared(name, qemu_vs_sdm):
+    """What the comparison with QEMU leaves out: the registers QEMU_DIFFERS names, the log region where QEMU's log departs
+    from the SDM (a view of both states, so a hash-only locked answer compares the same fields)."""
+    regs = sorted(smp.REGS.index(k.split()[1].rstrip(':')) for k in QEMU_DIFFERS.get(name, {}))
+    if not regs and not qemu_vs_sdm: return None
+    def change(st):
+        for k in regs: st['cpus'][0] = {**st['cpus'][0], 'gpr': [0 if j == k else x for j, x in enumerate(st['cpus'][0]['gpr'])]}
+        if qemu_vs_sdm: st['memory'] = [m for m in st['memory'] if m['addr'] != debug.LOG]
+    return f"not-compared/{','.join(map(str, regs))}/{'log' if qemu_vs_sdm else ''}", change
+
+
 def programs(a, report):
     failures, rows = [], []
     for name in a.programs or debug.PROGRAMS:
         prog = debug.program(name)
         try:
-            want = s3.qemu_reference(prog, a.out / 'qemu' / name)
-            qlog = debug.log_of(prog, {r['addr']: r['data'] for r in want['memory']})
-            qemu_vs_sdm = debug.judge(prog, qlog)
+            want = s3.qemu_reference(prog, a.out / 'qemu' / name, hang_ok=True)
+            mem = lambda w: {r['addr']: r['data'] for r in w['memory']}
+            qemu_vs_sdm = answers.derive(want, 'sdm', lambda w: debug.judge(prog, debug.log_of(prog, mem(w))))
+            try: qlog = debug.log_of(prog, mem(want))
+            except answers.Unavailable: qlog = []      # (NATEMU_ANSWERS=locked, a hash-only answer: QEMU's log is not stored)
         except RuntimeError as e:   # QEMU itself fails (recorded as its departure; natemu is judged by the SDM alone)
             want, qlog, qemu_vs_sdm = None, [], [f'QEMU did not finish: {str(e)[:200]}']
         for block in (None, 1):
@@ -47,7 +60,7 @@ def programs(a, report):
             memory = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpu['memory']}
             log = debug.log_of(prog, memory)
             vs_sdm = debug.judge(prog, log)
-            vs_qemu = s3.judge_smp(prog, want, out, [None]) if want else []
+            vs_qemu = s3.judge_smp(prog, want, out, [None], view=not_compared(name, qemu_vs_sdm)) if want else []
             st = cpu['stats']
             rows.append({'program': name, 'block': block, 'events': len(log), 'sdm': vs_sdm, 'qemu': vs_qemu, 'qemu_vs_sdm': qemu_vs_sdm,
                          'log': debug.show(prog, log), 'qemu_log': debug.show(prog, qlog), 'expected': debug.show(prog, debug.expect(prog)),

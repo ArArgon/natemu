@@ -37,7 +37,7 @@ Writes DIR/x4.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/bench/smp'))
-import smp, run_slice1_vm as vm  # noqa: E402
+import smp, answers, run_slice1_vm as vm  # noqa: E402
 from programs import STACK, asm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, smp_description  # noqa: E402
 from models import mailbox_model  # noqa: E402
@@ -630,7 +630,7 @@ def cmd_trampoline(a, report):
                                 r['data'] = r['data'][:k] + v.to_bytes(8, 'little') + r['data'][k + 8:]
                     return state
                 # The BSP's registers differ only by its wake loop (rax, rdx: none written; RIP is the stop): all compared.
-                problems += smp.compare(q, no_iopl(got), no_iopl({**want, 'memory': [dict(r) for r in want['memory']]}))
+                problems += smp.compare(q, no_iopl(got), answers.view(want, 'no-iopl', lambda w: no_iopl({**w, 'memory': [dict(r) for r in w['memory']]})))
             report.append({'name': tag, 'problems': problems})
             failures += [f'{tag}: {p}' for p in problems]
             print(tag, 'ok' if not problems else problems[:4], flush=True)

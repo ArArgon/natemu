@@ -78,6 +78,9 @@ def install(smp):
         except sqlite3.Error as e: warn(f'cannot write ({e})')      # a cache that cannot be written only costs time
 
     def run_image(prog, img, work, mode='multi', timeout=120, extra=(), hang_ok=False, cpu=None):
+        # NATEMU_ANSWERS seed/locked (tools/reference/answers.py): smp.run_image itself keeps or serves the answer (seed
+        # runs QEMU fresh: one observed timeout of a hang case is its answer; locked never runs it).
+        if getattr(smp, 'answers', None) and smp.answers.active(): return real(prog, img, work, mode, timeout, extra, cpu=cpu, hang_ok=hang_ok)
         if extra or not db(): return real(prog, img, work, mode, timeout, extra, cpu=cpu)
         if 'binary' not in state: state['binary'] = binary_hash(smp.QEMU)
         key = key_of(smp, prog, img, mode, cpu, state['binary'])

@@ -41,7 +41,7 @@ import argparse, json, os, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import ref, smp, events, ports, run_slice1_vm as vm  # noqa: E402
+import ref, smp, answers, events, ports, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end, vm_state, kick_checks  # noqa: E402
 
 RF = 1 << 16
@@ -70,6 +70,8 @@ def qemu(prog, work):
     rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), work, 'multi', extra=['-serial', f'file:{serial}'])
     if rc != 1: raise RuntimeError(f"QEMU {prog['name']}: {rc} {err}")
     # SeaBIOS writes its banner to COM1 before the program: the program's output is what follows it.
+    # (NATEMU_ANSWERS=locked: no QEMU run, no serial file: the UART output is compared by its locked hash, answers.equal.)
+    if answers.mode() == 'locked': return smp.parse_dump(prog, dump), None
     sent = serial.read_bytes()
     return smp.parse_dump(prog, dump), sent.split(b'Booting from ROM..')[-1]
 
@@ -80,13 +82,14 @@ def cmd_qemu(a, report):
     for p in progs:
         name = p['qemu']['name']
         want, sent = qemu(p['qemu'], a.out / 'qemu' / name)
-        entry = {'name': name, 'qemu_uart_bytes': len(sent), 'runs': []}
+        entry = {'name': name, 'qemu_uart_bytes': len(sent) if sent is not None else None, 'runs': []}
         for block in (None, 1):
             out, problems = natemu(a, p, a.out / 'natemu' / f'{name}-{block}', [block] if block else [])
             if out:
                 problems += smp.compare(p['qemu'], vm_state(p['natemu'], out), want)
                 got = bytes.fromhex(out.get('uart', ''))
-                if got != sent: problems.append(f'uart output {got!r} != QEMU {sent!r}')
+                if not answers.equal(want, 'uart', got.hex(), sent.hex() if sent is not None else None):
+                    problems.append(f'uart output {got!r} != QEMU {sent!r}' if sent is not None else f'uart output {got!r}: {answers.HASH_ONLY}')
                 if name.startswith('l3-unassigned'):
                     counts = {int(e['port'], 0): (e['reads'], e['writes']) for e in out.get('ports', []) if e['unassigned']}
                     if counts != tally(ports.UNASSIGNED_ACCESSES): problems.append(f'unassigned port counts {counts} != {tally(ports.UNASSIGNED_ACCESSES)}')

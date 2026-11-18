@@ -27,7 +27,7 @@ import argparse, json, pathlib, random, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice1 as gen, run_slice1_vm as vm, shard  # noqa: E402
+import ref, answers, gen_slice1 as gen, run_slice1_vm as vm, shard  # noqa: E402
 
 CODE, DATA, STACK = 0x100000, 0x200000, 0x300000
 
@@ -252,10 +252,11 @@ def main():
     host, runtime = vm.build()
     a.out.mkdir(parents=True, exist_ok=True)
     built = {p['name']: build(p) for p in PROBES}
-    raw = pathlib.Path(__import__('os').environ['NATEMU_RAW_ROOT'])
-    qemu = a.qemu or raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
+    from raw_root import RAW_ROOT      # (NATEMU_RAW_ROOT, else natemu-raw beside the main checkout, as tools/with-env)
+    qemu = a.qemu or RAW_ROOT / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
     results, _ = ref.run_programs([r for _, r, _ in built.values()], a.out / 'ref', qemu)
-    expected = {r['name']: r for r in results}
+    # (the results are in the programs' order; RIP is not compared here: QEMU's ends past the capture, the VM at `end`)
+    expected = {n: answers.view(r, 'rip-not-compared', lambda r: dict(r, qemu=dict(r['qemu'], rip='0x0'))) for n, r in zip(built, results)}
     out, failures = [], 0
 
     def run(name, program, args):
@@ -273,8 +274,7 @@ def main():
             diffs = [f'host error: {err}']
         else:
             s = state['stats']
-            diffs = ref.compare(expected[name], [ref.num(v) for v in state['gpr']], ref.num(state['rflags']),
-                                ref.num(expected[name]['qemu']['rip']), state['memory'])
+            diffs = ref.compare(expected[name], [ref.num(v) for v in state['gpr']], ref.num(state['rflags']), 0, state['memory'])
             if state['stop'] != 'reached' or ref.num(state['rip']) != end:
                 diffs.insert(0, f"stopped {state['stop']} {state['reason']} at {state['rip']}, end {end:#x}")
             if flushes and s['flushes'] < 3:
@@ -432,8 +432,9 @@ def main():
             if state is not None and (state['stop'] != 'reached' or ref.num(state['rip']) != end):
                 diffs.insert(0, f"stopped {state['stop']} {state['reason']} at {state['rip']}, end {end:#x}")
             # FEX's expected registers (RegData): a second reference.
-            diffs += [f'{r}: FEX expects {v:#x}, qemu {result["qemu"]["gpr"][ref.REGS.index(r)]}'
-                      for r, v in expected_gpr.items() if ref.num(result['qemu']['gpr'][ref.REGS.index(r)]) != v]
+            diffs += answers.derive(result, 'fex/' + ','.join(f'{r}={v:#x}' for r, v in sorted(expected_gpr.items())), lambda result: [
+                f'{r}: FEX expects {v:#x}, qemu {result["qemu"]["gpr"][ref.REGS.index(r)]}'
+                for r, v in expected_gpr.items() if ref.num(result['qemu']['gpr'][ref.REGS.index(r)]) != v])
             failures += bool(diffs)
             out.append({'name': program['name'], 'args': args, 'stats': state and state['stats'], 'diffs': diffs, 'stderr': err})
             print(f"{program['name']} {' '.join(args)}: {'fail' if diffs else 'match'} {state and state['stats']} {'; '.join(diffs)[:300]}")

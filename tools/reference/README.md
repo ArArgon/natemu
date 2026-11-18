@@ -184,3 +184,23 @@ otherwise it does nothing. Without Docker or the pinned QEMU it still builds `pr
 - Outputs are not hash-gated: host clang is not pinned, and correctness rests on QEMU plus `ref.py`'s per-run checks.
 - `fixtures/slice1/build.json` (git-ignored) records what was actually built: inputs, host clang version and sha256 of both
   outputs. Cite it when reporting a verification run's corpus.
+
+## Locked answers (`answers.py`, NATEMU_ANSWERS)
+
+The runners (`tools/run_*.py`) compare natemu with QEMU at a few comparison points: `ref.compare` (user mode),
+`smp.compare` (system mode), and the runners' own ones (`run_x3.compare_qemu`, `run_l4b`'s DATA slots, the UART output of
+l3/l4a/r1). `NATEMU_ANSWERS` chooses how:
+
+- `live` (default): QEMU runs as before and the comparison is field by field.
+- `seed`: as live, and each answer is appended to `NATEMU_ANSWERS_LOG` (JSON lines): its key, the sha256 of the comparison's
+  projection (exactly the fields it compares, after its masks), the projection itself when at most 1 KiB (`value`), how to
+  reproduce it (`repro`: supplier, pin, program or image sha256, QEMU arguments) and small values the projection needs
+  (`aux`, e.g. the RFLAGS mask). `python3 tools/reference/answers.py lock LOG... -o LOCK` writes a lock from logs.
+- `locked`: QEMU never runs. An answer with an inline value comes back rebuilt (the field-by-field comparison runs); one
+  with a hash only comes back as a placeholder, and the comparison hashes natemu's projection. A key missing from
+  `NATEMU_ANSWERS_LOCK` prints `ANSWER-MISSING <key>` and the run exits non-zero.
+
+A key is the program (or the image's sha256), the QEMU pin name (`NATEMU_QEMU_PIN`, e.g. `qemu-user 7.2 deb12u18;qemu-system
+11.1.2 src`) and QEMU's arguments; never the backend or a binary or code hash. A runner that changes an answer before
+comparing it does so through `answers.view` (the key gains `/label`); one that reads a value of the answer to build a case
+or to check QEMU against a model uses `answers.derive` (`#label`, the value in aux).

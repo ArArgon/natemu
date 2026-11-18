@@ -48,7 +48,7 @@ from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference')); sys.path.insert(0, str(ROOT / 'tools' / 'models'))
-import ref, run_slice1_vm as vm  # noqa: E402
+import ref, answers, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import kick_checks  # noqa: E402
 
 CODE, DEV, GPA, PREV, NEXT = 0x100000, 0x200000, 0xfeb0_0000, 0x1ff000, 0x201000
@@ -172,18 +172,24 @@ def corpus(a, host, runtime, report):
     raw = RAW_ROOT
     qemu = raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
     expected_path = a.out / 'qemu.json'
-    if not expected_path.exists():
-        results, _ = ref.run_programs(progs, a.out / 'qemu-work', qemu)
-        expected_path.write_text(json.dumps(results))
-    expected = {r['name']: r for r in json.loads(expected_path.read_text())}
+    if answers.active():        # (NATEMU_ANSWERS seed/locked: the answers carry their keys, no local file of them)
+        expected = {p['name']: r for p, r in zip(progs, ref.run_programs(progs, a.out / 'qemu-work', qemu)[0])}
+    else:
+        if not expected_path.exists():
+            results, _ = ref.run_programs(progs, a.out / 'qemu-work', qemu)
+            expected_path.write_text(json.dumps(results))
+        expected = {r['name']: r for r in json.loads(expected_path.read_text())}
     failures = []
     def one(job):
         p, block, cpl = job
         text = vm.description(dict(p, memory=[]) | ({'cpl': cpl})) + mmio_lines(bytes.fromhex(p['memory'][0]['data']))
         rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'corpus' / f"{p['name']}-{block}-{cpl}", [block] if block else [])
         if out is None: return [f'driver {rc}: {err}']
-        diffs = ref.compare(expected[p['name']], [int(x, 0) for x in out['gpr']], int(out['rflags'], 0), int(out['rip'], 0), out['memory'])
-        if 'sdm_rax' in p:      # QEMU differs from the SDM here (judged by the SDM's value instead)
+        want, gpr = expected[p['name']], [int(x, 0) for x in out['gpr']]
+        if 'sdm_rax' in p:      # QEMU differs from the SDM here (judged by the SDM's value instead): RAX is not compared with QEMU
+            want, gpr = answers.view(want, 'rax-not-compared', lambda r: dict(r, qemu=dict(r['qemu'], gpr=['0x0'] + r['qemu']['gpr'][1:]))), [0] + gpr[1:]
+        diffs = ref.compare(want, gpr, int(out['rflags'], 0), int(out['rip'], 0), out['memory'])
+        if 'sdm_rax' in p:
             diffs = [d for d in diffs if not d.startswith('rax:')] + ([] if int(out['gpr'][0], 0) == p['sdm_rax'] else [f"rax {out['gpr'][0]} != SDM {p['sdm_rax']:#x}"])
         if out['stop'] != 'reached': diffs.insert(0, f"stopped {out['stop']} {out['reason']}")
         gpr = [int(x, 0) for x in p['gpr']]

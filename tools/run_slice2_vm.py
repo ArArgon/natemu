@@ -15,7 +15,7 @@ from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference'))
-import ref, gen_slice2 as gen, run_slice1_vm as vm  # noqa: E402
+import ref, answers, gen_slice2 as gen, run_slice1_vm as vm  # noqa: E402
 
 MAX_EXECUTED = 60_000       # a corpus program is bounded by construction; a run longer than this is a generator defect
 
@@ -46,11 +46,11 @@ def main():
         results, prov = ref.run_programs(programs, a.out / 'ref', qemu_path())
         (a.out / 'expected.json').write_text(json.dumps({**prov, 'results': results}, indent=1) + '\n')
     (a.out / 'programs.json').write_text(json.dumps({'programs': programs}, indent=1) + '\n')
-    expected = {r['name']: r for r in results}
-    too_long = [r['name'] for r in results if r.get('executed_insns', 0) > MAX_EXECUTED]
+    expected = {p['name']: r for p, r in zip(programs, results)}
+    executed = {p['name']: answers.derive(r, 'executed_insns', lambda r: r.get('executed_insns', 0)) for p, r in zip(programs, results)}
+    too_long = [n for n, k in executed.items() if k > MAX_EXECUTED]
     assert not too_long, f'programs over {MAX_EXECUTED} executed instructions: {too_long}'
-    print(f"{len(programs)} programs; executed instructions {min(r.get('executed_insns', 0) for r in results)}.."
-          f"{max(r.get('executed_insns', 0) for r in results)}", flush=True)
+    print(f"{len(programs)} programs; executed instructions {min(executed.values())}..{max(executed.values())}", flush=True)
     host, runtime = vm.build()
     out, failures = [], 0
     for size in a.sizes:
