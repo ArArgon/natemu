@@ -173,3 +173,13 @@ answer is never stored; a run never needs QEMU). These revisions replace the tas
 - **Found while seeding fp (November 18):** the offline model's x86 rules disagree with the real-x86 answers for i8b's
   i8-forms-045, i8-random-097 and i8-random-111. To check against natemu's accurate mode before deciding whether the
   model or the x86 harness is wrong.
+
+- **Answers, final form (owner left the balance to the implementer, November 18):** each locked answer has its sha256
+  (always), its canonical value inline when that is at most 1 KiB (so runners compare unchanged and failures show real
+  diffs), and reproduction steps (supplier, its pin, the program or image and arguments) so anyone can re-derive and check
+  it. Larger answers are hash plus reproduction steps. References come from a supplier with several backends (QEMU user
+  or system, the x86 machine, the Intel-SDM model, FEX for x87; Rosetta once validated per instruction group), each answer
+  recording which; seeding is pooled per backend.
+- **Bulk migration runs in parallel agents,** one per runner family (faults, smp, system, io, boot, static), once the
+  answer hooks and the input root have landed; each brings its family to locked, per-case results and reports test-side
+  fixes and natemu findings.
