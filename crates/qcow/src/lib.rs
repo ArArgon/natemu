@@ -185,7 +185,13 @@ impl QcowDisk {
     /// succeeds and, after a plain fsync, an F_BARRIERFSYNC: on macOS fsync orders nothing
     /// against a power loss, so without the barrier guest data written into a reused cluster
     /// could reach the disk before the tables that stopped pointing at it. Callers serialise syncs.
+    /// When tables are to be written, a barrier first runs outside the lock: on APFS F_BARRIERFSYNC writes out the
+    /// file's whole cache (seconds after gigabytes of guest writes), and every guest write takes the table lock. The
+    /// barrier under the lock then covers only the writes that completed meanwhile.
     pub fn sync(&self, kind: SyncKind) -> io::Result<()> {
+        if self.metadata.tables_dirty() {
+            self.data_raw_file.file().barrier_sync()?;
+        }
         let freed = self.metadata.write_tables()?;
         self.data_raw_file.file().sync(kind)?;
         if !freed.is_empty() && kind == SyncKind::Fsync {

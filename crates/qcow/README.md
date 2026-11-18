@@ -71,7 +71,9 @@ is `crates/host/src/disk/qcow.rs`.
   dirty L2 tables and refcount blocks, a barrier (upstream: `sync_all`), then the L1 and refcount
   tables. No final sync: `QcowDisk::sync(kind)` runs it with the table lock released, and only then
   returns the clusters those tables freed to the free list (`write_tables`/`release`; upstream moved
-  them under the lock right after its sync). A dirty L2 evicted from the cache is written after a
+  them under the lock right after its sync). When tables are dirty, `QcowDisk::sync` first runs a
+  barrier outside the lock: on APFS F_BARRIERFSYNC writes out the file's whole cache, which under the
+  lock stalled every guest write for seconds. A dirty L2 evicted from the cache is written after a
   barrier. Resize/L1-growth `sync_all` points are barriers.
 - The dirty, corrupt and autoclear header writes use `F_FULLFSYNC`.
 - `Drop` writes the tables without a sync and keeps the dirty bit (upstream flushed and cleared it);

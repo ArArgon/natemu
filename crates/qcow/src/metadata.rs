@@ -431,6 +431,12 @@ impl QcowMetadata {
         Ok(mem::take(&mut inner.unref_clusters))
     }
 
+    /// natemu: whether [`Self::write_tables`] has tables to write.
+    pub(super) fn tables_dirty(&self) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.l1_table.dirty() || inner.l2_cache.any_dirty() || inner.refcounts.dirty()
+    }
+
     /// Return clusters from [`Self::write_tables`] to the free list once their sync succeeded.
     pub(super) fn release(&self, mut freed: Vec<u64>) {
         self.inner
