@@ -130,6 +130,27 @@ class Answers(unittest.TestCase):
         with mock.patch.dict(os.environ, {'NATEMU_ANSWERS': 'locked'}), self.assertRaises(ValueError):
             ref.run_programs([PROG], self.dir.name, '/nonexistent/qemu')
 
+    def test_provisional_answers_that_differ_are_left_out(self):
+        other = pathlib.Path(self.dir.name, 'other.log')
+        with mock.patch.dict(os.environ, {'NATEMU_ANSWERS': 'seed'}):
+            answers.record('P', b'1', {}, provisional=True); answers.record('C', b'1', {}, provisional=True); answers.record('C', b'1', {})
+            os.environ['NATEMU_ANSWERS_LOG'] = str(other); answers._cache.clear()
+            answers.record('P', b'2', {}, provisional=True); answers.record('C', b'1', {})
+        dropped = []
+        self.assertEqual(sorted(answers.build_lock([self.log, other], dropped)), ['C'])
+        self.assertEqual(dropped, ['P'])
+        with mock.patch.dict(os.environ, {'NATEMU_ANSWERS': 'seed', 'NATEMU_ANSWERS_LOG': str(other)}):
+            answers.record('C', b'2', {})                      # a comparison seeded with two answers
+        with self.assertRaises(ValueError): answers.build_lock([self.log, other])
+
+    def test_tampered_derived_value_is_refused(self):
+        with mock.patch.dict(os.environ, {'NATEMU_ANSWERS': 'seed'}):
+            answers.derive(answers.Ref({'x': 1}, 'K'), 'x', lambda r: r['x'])
+        answers.write_lock(answers.build_lock([self.log]), self.lock)
+        self.lock.write_text(self.lock.read_text().replace('{\\"value\\":1}', '{\\"value\\":2}'))
+        with mock.patch.dict(os.environ, {'NATEMU_ANSWERS': 'locked'}), self.assertRaises(ValueError):
+            answers.derive(answers.Ref.placeholder('K'), 'x', None)
+
     def test_system_seed_then_locked(self):
         prog = {'name': 's', 'ncpu': 1, 'memory': [{'addr': '0x200000', 'data': '00'}], 'cpus': [{}], 'bodies': []}
         want = {'cpus': [{'gpr': list(range(16)), 'rflags': 0x46}], 'memory': [{'addr': 0x200000, 'data': b'\x01'}]}

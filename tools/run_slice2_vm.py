@@ -46,7 +46,8 @@ def main():
         results, prov = ref.run_programs(programs, a.out / 'ref', qemu_path())
         (a.out / 'expected.json').write_text(json.dumps({**prov, 'results': results}, indent=1) + '\n')
     (a.out / 'programs.json').write_text(json.dumps({'programs': programs}, indent=1) + '\n')
-    expected = {p['name']: r for p, r in zip(programs, results)}
+    # (QEMU's answers in the programs' order; a results file by name, as before)
+    expected = {p['name']: r for p, r in zip(programs, results)} if answers.active() and not a.expected else {r['name']: r for r in results}
     executed = {p['name']: answers.derive(r, 'executed_insns', lambda r: r.get('executed_insns', 0)) for p, r in zip(programs, results)}
     too_long = [n for n, k in executed.items() if k > MAX_EXECUTED]
     assert not too_long, f'programs over {MAX_EXECUTED} executed instructions: {too_long}'

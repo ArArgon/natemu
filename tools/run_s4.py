@@ -44,7 +44,7 @@ def programs(a, report):
     for name in a.programs or debug.PROGRAMS:
         prog = debug.program(name)
         try:
-            want = s3.qemu_reference(prog, a.out / 'qemu' / name, hang_ok=True)
+            want = s3.qemu_reference(prog, a.out / 'qemu' / name)
             mem = lambda w: {r['addr']: r['data'] for r in w['memory']}
             qemu_vs_sdm = answers.derive(want, 'sdm', lambda w: debug.judge(prog, debug.log_of(prog, mem(w))))
             try: qlog = debug.log_of(prog, mem(want))

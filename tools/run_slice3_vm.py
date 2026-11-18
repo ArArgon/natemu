@@ -1509,14 +1509,14 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
         sdm = prog['params'].get('sdm_bytes', {})
         def region_of(w, addr): return next(r for r in w['memory'] if r['addr'] <= smp.num(addr) < r['addr'] + len(r['data']))
         if sdm:
-            failures += answers.derive(want, 'sdm_bytes', lambda w: [
-                f'{name}: QEMU writes the SDM value at {addr}: drop sdm_bytes' for addr, value in sdm.items()
-                if region_of(w, addr)['data'][smp.num(addr) - region_of(w, addr)['addr']] == value])
+            label = ','.join(f'{k}={v}' for k, v in sorted(sdm.items()))
+            failures += [f'{name}: QEMU writes the SDM value at {addr}: drop sdm_bytes' for addr in answers.derive(want, 'sdm_bytes/' + label, lambda w: [
+                addr for addr, value in sdm.items() if region_of(w, addr)['data'][smp.num(addr) - region_of(w, addr)['addr']] == value])]
             def sdm_values(w):
                 for addr, value in sdm.items():
                     region = region_of(w, addr); at = smp.num(addr) - region['addr']
                     region['data'] = region['data'][:at] + bytes([value]) + region['data'][at + 1:]
-            want = qemu_view(want, 'sdm_bytes/' + ','.join(f'{k}={v}' for k, v in sorted(sdm.items())), sdm_values)
+            want = qemu_view(want, 'sdm_bytes/' + label, sdm_values)
         faults = [tupled(f) for f in answers.derive(want, 'faults', lambda w: [c['fault'] for c in w['cpus']])]
         permitted = None
         if model:

@@ -47,7 +47,7 @@ def pin(kind):
     for p in (os.environ.get('NATEMU_QEMU_PIN') or '').split(';'):
         if p.strip().startswith(f'qemu-{kind}'): return p.strip()
     if kind == 'user': return USER_PIN
-    raise RuntimeError(f'NATEMU_QEMU_PIN names no qemu-{kind} pin (e.g. "qemu-system 11.1.2 src"); it is part of every answer key')
+    raise Unconfigured(f'NATEMU_QEMU_PIN names no qemu-{kind} pin (e.g. "qemu-system 11.1.2 src"); it is part of every answer key')
 
 
 def digest(data):
@@ -78,6 +78,11 @@ class Missing(Exception):
             new = key not in MISSING
             MISSING.add(key)
         if new: print(f'ANSWER-MISSING {key}', flush=True)
+
+
+class Unconfigured(Exception):
+    """A seed/locked run without its settings (NATEMU_QEMU_PIN, NATEMU_ANSWERS_LOG, NATEMU_ANSWERS_LOCK). Not a
+    RuntimeError, so no runner takes it for a QEMU failure."""
 
 
 class Unavailable(Exception):
@@ -137,17 +142,20 @@ def _derived(repro, kind, label):
 
 # --- the log and the lock ---
 
-def record(key, projection, repro, aux=None):
-    """Seed mode: one answer's projection (canonical bytes) under `key`, inline when small."""
+def record(key, projection, repro, aux=None, provisional=False):
+    """Seed mode: one answer's projection (canonical bytes) under `key`, inline when small. `provisional`: recorded where
+    QEMU ran (so seeding does not depend on natemu reaching the comparison) but not known to be what any comparison uses
+    (x3's and l4b's runs hold TSC samples their own comparisons mask): a lock keeps it only if every seed agrees."""
     entry = {'key': key, 'sha256': digest(projection), 'repro': repro, 'aux': aux or {}}
+    if provisional: entry['provisional'] = True
     if len(projection) <= VALUE_MAX: entry['value'] = projection.decode()
     line = json.dumps(entry, sort_keys=True, separators=(',', ':'))
     path = os.environ.get('NATEMU_ANSWERS_LOG')
-    if not path: raise RuntimeError('NATEMU_ANSWERS=seed needs NATEMU_ANSWERS_LOG (the JSON-lines file the answers go to)')
+    if not path: raise Unconfigured('NATEMU_ANSWERS=seed needs NATEMU_ANSWERS_LOG (the JSON-lines file the answers go to)')
     with _lock:
         seen = _cache.setdefault(('seen', path), {})
         old = seen.get(key)
-        if old is not None and old != entry['sha256']:
+        if old is not None and old != entry['sha256'] and not provisional:
             print(f'ANSWER-CONFLICT {key}: seeded twice with different answers in one run', file=sys.stderr, flush=True)
         seen[key] = entry['sha256']
         with open(path, 'a') as f: f.write(line + '\n')
@@ -161,7 +169,7 @@ class Entry:
 def read_lock(path=None):
     import tomllib
     path = path or os.environ.get('NATEMU_ANSWERS_LOCK')
-    if not path: raise RuntimeError('NATEMU_ANSWERS=locked needs NATEMU_ANSWERS_LOCK (the lock with [answers])')
+    if not path: raise Unconfigured('NATEMU_ANSWERS=locked needs NATEMU_ANSWERS_LOCK (the lock with [answers])')
     ck = ('lock', path, os.stat(path).st_mtime_ns)
     with _lock:
         if ck not in _cache:
@@ -185,16 +193,26 @@ def lookup(key):
     return e
 
 
-def build_lock(logs):
-    """{key: Entry} from seed logs; a key seeded with two answers is a determinism problem (ValueError)."""
-    out, bad = {}, []
+def build_lock(logs, dropped=None):
+    """{key: Entry} from seed logs; a key a comparison seeded with two answers is a determinism problem (ValueError). A
+    provisional key (see `record`) with two answers is left out (listed in `dropped`): a comparison never used it."""
+    out, bad, prov = {}, [], {}
     for path in logs:
         with open(path) as f:
             for n, line in enumerate(f, 1):
                 if not line.strip(): continue
                 r = json.loads(line)
+                e = Entry(r['sha256'], r.get('value'), r.get('aux'), r.get('repro'))
+                if r.get('provisional'):
+                    prov.setdefault(r['key'], {})[r['sha256']] = e
+                    continue
                 if r['key'] in out and out[r['key']].sha256 != r['sha256']: bad.append(f"{r['key']} ({path}:{n})")
-                out.setdefault(r['key'], Entry(r['sha256'], r.get('value'), r.get('aux'), r.get('repro')))
+                out.setdefault(r['key'], e)
+    for k, es in prov.items():
+        if k in out:
+            if out[k].sha256 not in es or len(es) > 1: bad.append(f'{k} (its comparison and where QEMU ran disagree)')
+        elif len(es) == 1: out[k] = next(iter(es.values()))
+        elif dropped is not None: dropped.append(k)
     if bad: raise ValueError(f'{len(bad)} keys seeded with different answers: ' + ', '.join(bad[:20]))
     return out
 
@@ -252,12 +270,13 @@ def compared(want, label, project_want, project_got, live):
 
 def view(obj, label, fn):
     """The answer transformed by the runner before a comparison (a mask, a subset, a move): `fn(obj)` with the key
-    `<key>/<label>`. `label` must name the transform deterministically (it is part of the key). Locked: from a
-    rebuilt answer the view is computed; from a placeholder it is the lock's value of the view, or a placeholder."""
+    `<key>/<label>`. `label` must name the transform deterministically (it is part of the key). Locked: the lock's own
+    entry of the view (rebuilt from its value, else a placeholder), never recomputed from a rebuilt answer (which holds
+    only the projection's fields, RFLAGS already masked)."""
     if not isinstance(obj, Ref): return fn(obj)
     k, repro = f'{obj.key}/{label}', _derived(obj.repro, 'view', label)
-    if not obj.locked: return Ref(fn(obj), k, repro, partial=obj.partial)
-    return rebuilt(k, repro)
+    if mode() == 'locked': return rebuilt(k, repro)
+    return Ref(fn(obj), k, repro)
 
 
 def derive(obj, label, fn):
@@ -269,7 +288,9 @@ def derive(obj, label, fn):
         v = json.loads(canon(fn(obj)))
         record(k, canon(v), _derived(obj.repro, 'derived', label), {'value': v})
         return v
-    return lookup(k).aux['value']
+    e = lookup(k)
+    if digest(canon(e.aux.get('value'))) != e.sha256: raise ValueError(f'lock entry {k}: its aux value does not hash to its sha256')
+    return e.aux['value']
 
 
 # --- rebuilding answers from inline values ---
@@ -312,10 +333,10 @@ def user_projection(gpr, rflags, rip, memory, mask):
                        'memory': [[num(m['addr']), m['data']] for m in memory]}, separators=(',', ':')).encode()
 
 
-def user_record(result):
+def user_record(result, provisional=False):
     """Seed: the projection of a ref.run_programs result (or a view of one)."""
     q, mask = result['qemu'], int(result['rflags_compare_mask'], 0)
-    record(result.key, user_projection(q['gpr'], q['rflags'], q['rip'], q['memory'], mask), result.repro, {'mask': mask})
+    record(result.key, user_projection(q['gpr'], q['rflags'], q['rip'], q['memory'], mask), result.repro, {'mask': mask}, provisional)
 
 
 def user_results(keyed, run):
@@ -324,7 +345,7 @@ def user_results(keyed, run):
         return [rebuilt(k, r) for k, r in keyed], {'answers': 'locked', 'cache_hits': 0}
     results, prov = run()
     results = [Ref(x, k, r) for x, (k, r) in zip(results, keyed)]
-    for x in results: user_record(x)
+    for x in results: user_record(x, provisional=True)
     return results, prov
 
 
@@ -369,15 +390,15 @@ def system_projection(state, ncpu=None):
                   'memory': [[m['addr'], bytes(m['data']).hex()] for m in state['memory']]})
 
 
-def system_record(want):
-    record(want.key, system_projection(want), want.repro, {'ncpu': len(want['cpus'])})
+def system_record(want, provisional=False):
+    record(want.key, system_projection(want), want.repro, {'ncpu': len(want['cpus'])}, provisional)
 
 
 def system_parsed(dump, parse):
     """smp.parse_dump's hook: the parsed answer as a Ref (seed: also recorded, so seeding does not depend on natemu)."""
     if mode() == 'locked': return rebuilt(dump.key, dump.repro)
     want = Ref(parse(), dump.key, dump.repro)
-    system_record(want)
+    system_record(want, provisional=True)
     return want
 
 
@@ -400,7 +421,9 @@ def main(argv=None):
     lk.add_argument('-o', '--output', required=True)
     lk.add_argument('--merge', help='an existing lock whose answers are kept (the logs must agree with it)')
     a = ap.parse_args(argv)
-    entries = build_lock(a.logs)
+    dropped = []
+    entries = build_lock(a.logs, dropped)
+    if dropped: print(f'{len(dropped)} provisional answers differ between seeds (no comparison uses them): left out')
     if a.merge and os.path.exists(a.merge):
         old = read_lock(a.merge)
         bad = [k for k in entries if k in old and old[k].sha256 != entries[k].sha256]

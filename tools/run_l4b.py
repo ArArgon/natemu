@@ -75,8 +75,8 @@ def cmd_qemu(a, report):
     prog, labels = timers.s5_program()
     label = prog['name']
     rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, smp.build_stub(a.out / 'qemu' / label)), a.out / 'qemu' / label, 'multi')
-    empty = answers.derive(dump, 'empty', lambda d: not d)       # (locked: the exit and this from the lock)
-    problems = [] if rc == 0 and empty else [f'QEMU: exit {rc}, dump {"empty" if empty else "not empty"} (expected a power-off)']
+    size = answers.derive(dump, 'dump-bytes', len)       # (locked: the exit status and this from the lock)
+    problems = [] if rc == 0 and not size else [f'QEMU: exit {rc}, dump {size} bytes (expected a power-off)']
     out, p = run_natemu(a, prog, a.out / 'work' / label, reached=False)
     if out is not None and out['cpus'][0]['stop'] != 'poweroff':
         p.append(f"natemu: {out['cpus'][0]['stop']} {out['cpus'][0]['reason']}")

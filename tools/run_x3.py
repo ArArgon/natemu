@@ -156,7 +156,7 @@ def compare_qemu(prog, out, want):
     """natemu vs QEMU: GPRs and flags, and every captured region (logs without TSC). A comparison point of
     tools/reference/answers.py (NATEMU_ANSWERS seed/locked)."""
     def project_want(w):
-        n = min(len(out['cpus']), len(w['cpus']))
+        n = len(w['cpus'])          # (natemu's are cut to these, as the zip does)
         bases = [r['addr'] for r in w['memory']]
         return qemu_projection(prog, [list(c['gpr']) for c in w['cpus'][:n]], qemu_memory(prog, w).regions, bases), {'ncpu': n, 'bases': bases}
     def project_got(aux):
