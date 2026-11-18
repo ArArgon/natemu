@@ -170,6 +170,27 @@ def write_results(out, entries):
                                                               for n, d in cases.items()]}, indent=1) + '\n')
 
 
+def write_failure_results(out, names, failures):
+    """write_results for a mode that reports a flat failure list: every failure reads "CASE: difference" (CASE may end in
+    " (max-block 1)", folded into the case); `names`, the cases that ran in order, are a match unless they have failures.
+    A failure whose case is not in `names` makes its own case (the mode's checks and exit status are unchanged)."""
+    entries = [(n, []) for n in names]
+    for f in failures:
+        key = re.sub(r' \(max-block 1\)$', '', f.split(': ', 1)[0]) if ': ' in f else 'run'
+        entries.append((key, [f.split(': ', 1)[-1]]))
+    write_results(out, entries)
+
+
+def report_names(report):
+    """The case names of a mode's report (a list of entries, or lists of entries by group): their `name` or `label`, with
+    `rep` and `max_block` where they tell runs of one program apart."""
+    names = []
+    for e in (x for v in (report.values() if isinstance(report, dict) else [report]) for x in v):
+        n = e.get('label') or e.get('name')
+        if n: names.append(n + (f" rep{e['rep']}" if 'rep' in e else ''))
+    return names
+
+
 def kick_checks(out, kicks=None):
     """Doorbell accounting of one vCPU's output (`kicks`: every kick must have been issued)."""
     k, problems = out.get('kicks'), []
@@ -207,11 +228,23 @@ def per_vcpu_checks(out):
     return problems
 
 
+def slice1_corpus(out):
+    """The first-slice programs and QEMU's results by name. The corpus is generated, not committed (fixtures/slice1/.gitignore;
+    the seeded generator makes the same bytes as the committed seed's output; inputs only), and QEMU's results come from
+    ref.run_programs (NATEMU_ANSWERS seed records them, locked returns them from the lock without starting QEMU)."""
+    corpus = out / 'slice1-programs.json'
+    if not corpus.exists():
+        out.mkdir(parents=True, exist_ok=True)
+        subprocess.run([sys.executable, str(ROOT / 'tools/reference/gen_slice1.py'), '-o', str(corpus)], check=True, capture_output=True)
+    programs = json.loads(corpus.read_text())['programs']
+    results, _ = ref.run_programs(programs, out / 'ref-slice1', faults.ref_qemu())
+    return programs, {p['name']: r for p, r in zip(programs, results)}
+
+
 def corpus_items(a):
     """[(name, single description, evaluate(out) -> (outcome, diffs))]."""
     items = []
-    fixtures = json.loads((ROOT / 'fixtures/slice1/programs.json').read_text())['programs']
-    expected = {r['name']: r for r in json.loads((ROOT / 'fixtures/slice1/expected.json').read_text())['results']}
+    fixtures, expected = slice1_corpus(a.out)
     for p in fixtures:
         items.append(('fixture/' + p['name'], vm.description(p), lambda out, p=p: vm.evaluate(p, expected[p['name']], out)))
     if a.flow:
@@ -281,6 +314,9 @@ def cmd_corpora(a, host, runtime):
         failed += counts['fail']
         results += entries
     (a.out / 'corpora.json').write_text(json.dumps({'results': results}, indent=1, default=str) + '\n')
+    # per-case report: one case per program and vCPU count (an unsupported program, a declared limit, is not a failure)
+    (a.out / 'results.json').write_text(json.dumps({'results': [
+        {'name': f"N={e['n']} {e['name']}", 'outcome': e['outcome'], 'diffs': [str(x) for x in e['diffs']]} for e in results]}, indent=1) + '\n')
     return failed
 
 
@@ -678,6 +714,8 @@ def cmd_kicks(a, host, runtime):
             report['forge'].append({'kind': kind, 'vcpu': v, 'returncode': rc, 'stops': stops, 'native': out and out['cpus'][v]['native']})
             print(f'forged {kind} on vCPU {v}: {"ok" if ok else "FAIL"} {stops}', flush=True)
             if not ok: failures.append(f'forged {kind} on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
+    write_failure_results(a.out, [f"{e['name']} rep{e['rep']}" for k in ('hot', 'rep', 'adversarial') for e in report[k]]
+                          + [f"peer rep{e['rep']}" for e in report['peer']] + [f"forged {e['kind']} on vCPU {e['vcpu']}" for e in report['forge']], failures)
     (a.out / 'kicks.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     return len(failures)
 
@@ -1384,6 +1422,7 @@ def cmd_events(a, host, runtime):
         failures += events_stress(a, host, runtime, stub, report)
     print(QEMU_EVENTS_RF, *[f'{k}: {v}' for k, v in QEMU_EVENTS_DIFFER.items()], sep='\n')
     for f in failures: print(f)
+    write_failure_results(a.out, report_names(report), failures)
     (a.out / 'events.json').write_text(json.dumps({'report': report, 'failures': failures, 'qemu_differs': [QEMU_EVENTS_RF, QEMU_EVENTS_DIFFER]}, indent=1, default=str) + '\n')
     return len(failures)
 
@@ -1697,6 +1736,7 @@ def cmd_system(a, host, runtime):
         if not ok: failures.append(f'tampered system reply: {rc} {stops} {err.strip()[-200:]}')
     for g in gaps: print('GAP', g, '--', SYSTEM_GAPS[g.split(':')[0].replace(' (max-block 1)', '')])
     for f in failures: print(f)
+    write_failure_results(a.out, report_names(report), failures)
     (a.out / 'system.json').write_text(json.dumps({'report': report, 'failures': failures, 'gaps': gaps}, indent=1, default=str) + '\n')
     return len(failures)
 
@@ -1704,6 +1744,7 @@ def cmd_system(a, host, runtime):
 def cmd_coherence(a, host, runtime):
     failures, report = coherence_runs(a, host, runtime, a.programs)
     for f in failures: print(f)
+    write_failure_results(a.out, report_names(report), failures)
     (a.out / 'coherence.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     return len(failures)
 
@@ -1790,6 +1831,7 @@ def cmd_sharedpt(a, host, runtime):
             report.append({'name': name, 'max_block': limit[0] if limit else None, 'runs': len(entries), 'ok': len(entries) - len(bad),
                            'stats': dict(totals), 'histories': dict(sorted(hist.items())), 'diffs': [e['diffs'] for e in bad][:3]})
     for f in failures: print(f)
+    write_failure_results(a.out, report_names(report), failures)
     (a.out / 'sharedpt.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     return len(failures)
 
@@ -2134,8 +2176,7 @@ def spin_program(iterations):
 def cmd_contain(a, host, runtime):
     """See the module docstring (`contain`)."""
     import time
-    fixtures = json.loads((ROOT / 'fixtures/slice1/programs.json').read_text())['programs']
-    expected = {r['name']: r for r in json.loads((ROOT / 'fixtures/slice1/expected.json').read_text())['results']}
+    fixtures, expected = slice1_corpus(a.out)
     fixture = vm.description(fixtures[0])
     report, failures, fresh_runs = {k: [] for k in ('tamper', 'unacked', 'compiler', 'stall', 'spin', 'legit', 'fresh')}, [], [0]
     wd = a.watchdog_ms
@@ -2284,6 +2325,7 @@ def cmd_contain(a, host, runtime):
         failures += bad
     for f in failures: print(f)
     print(f"fresh-process controls: {len(report['fresh'])}, failing {sum(bool(r['diffs']) for r in report['fresh'])}")
+    write_failure_results(a.out, report_names(report), failures)
     (a.out / 'contain.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     return len(failures)
 
