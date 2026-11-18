@@ -8,6 +8,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends curl ca-certificates python3 binutils tcl xz-utils >/dev/null
-bash /recipe/scripts/build.sh /work/b > /work/build.log 2>&1 || { tail -40 /work/build.log >&2; exit 1; }
-cp /work/b/out/bench.cpio /work/b/out/expected.txt /work/
-rm -rf /work/b
+# Build inside the container's own file system: on the folder shared with the Mac even root cannot override file
+# modes, and dpkg -x needs to (packages ship read-only folders that later packages write into).
+bash /recipe/scripts/build.sh /build/b > /work/build.log 2>&1 || { tail -40 /work/build.log >&2; exit 1; }
+cp /build/b/out/bench.cpio /build/b/out/expected.txt /work/

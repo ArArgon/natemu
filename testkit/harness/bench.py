@@ -67,7 +67,11 @@ class Bench:
             if r.returncode != 0:
                 out[it.nodeid] = CaseResult('failed', f'exit {r.returncode} after {took:.0f} s; log {d / "log.txt"}\n' + '\n'.join(tail))
                 continue
-            out[it.nodeid] = CaseResult('passed', f'{took:.0f} s on {h.chip}; numbers in {d}', 'measured')
+            built = ''
+            if vals['bench_image']:
+                bt = pathlib.Path(vals['bench_image']).parent / 'builder.txt'
+                built = f'; image built by {bt.read_text().strip()}' if bt.exists() else ''
+            out[it.nodeid] = CaseResult('passed', f'{took:.0f} s on {h.chip}{built}; numbers in {d}', 'measured')
         return out
 
 

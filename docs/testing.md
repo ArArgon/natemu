@@ -123,9 +123,18 @@ boot times, and the guest benchmarks of [benchmarks](benchmarks.md) (12 programs
 comparison). Each takes the whole machine. Numbers are written per machine, to
 `.natemu/runs/<id>/bench/<machine id>/<benchmark>/`, and never compared across machines.
 
-The guest benchmarks' initramfs is built on the Mac the first time it is needed, from `tools/bench/image` (the reference
-box's recipe, unchanged), inside an amd64 Debian container that Apple's `container` runs through Rosetta; the kernel is
-Debian's pinned package. Building the image takes a while once per machine; after that it comes from the cache. Not
+The guest benchmarks' initramfs is built the first time it is needed, from `tools/bench/image` (the reference box's
+recipe, unchanged), and then comes from the cache; the kernel is Debian's pinned package. Where it is built is a setting:
+
+```toml
+# .natemu/config.toml (this machine only, not committed); or NATEMU_BENCH_BUILDER=...
+[bench]
+builder = "local"                   # default: this Mac, in an amd64 Debian container through Rosetta
+# builder = "ssh:ubuntu@x86-box"    # a real x86-64 Linux machine: the recipe is copied there, built, fetched, removed
+```
+
+The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
+Switching builders builds a new image rather than reusing the other one's. Not
 wrapped yet: the drift canary and stored baselines (`tools/bench/canary.py`), whose inputs still live in `natemu-raw`.
 
 ## Moving the old suite over

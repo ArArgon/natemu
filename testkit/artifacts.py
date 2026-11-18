@@ -144,18 +144,59 @@ def compile_cache(n: Natemu) -> pathlib.Path:
 BENCH_BUILDER = 'docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f208977f39dccda1fd120e878129463f7fa3b8f'
 
 
+def local_config() -> dict:
+    """This machine's settings: .natemu/config.toml in the worktree (not committed; spec R9)."""
+    import tomllib
+    f = paths.repo_root() / '.natemu' / 'config.toml'
+    return tomllib.loads(f.read_text()) if f.exists() else {}
+
+
+def bench_builder() -> str:
+    """Where the benchmark programs are built: 'local' (this Mac, an amd64 container through Rosetta) or
+    'ssh:user@host' (a real x86-64 Linux machine). NATEMU_BENCH_BUILDER, else [bench] builder in .natemu/config.toml."""
+    b = os.environ.get('NATEMU_BENCH_BUILDER') or local_config().get('bench', {}).get('builder', 'local')
+    if b != 'local' and not b.startswith('ssh:'):
+        raise BuildFailure('bench-image', f'unknown builder {b!r}: local or ssh:user@host')
+    return b
+
+
+def _build_bench_local(recipe: pathlib.Path, out: pathlib.Path) -> None:
+    _run(['container', 'run', '--rm', '--arch', 'amd64', '--cpus', '4', '--memory', '8g',
+          '--volume', f'{recipe}:/recipe:ro', '--volume', f'{out}:/work', BENCH_BUILDER, 'bash', '/recipe/container.sh'],
+         timeout=4 * 3600)
+
+
+def _build_bench_ssh(recipe: pathlib.Path, out: pathlib.Path, hostname: str, ssh: str = 'ssh', scp: str = 'scp') -> None:
+    """The recipe's own build.sh, natively on an x86-64 Linux machine (it needs apt-get, dpkg, curl, python3, binutils,
+    tclsh there, as on the reference box), in a temporary folder that is removed afterwards: nothing is kept there."""
+    opts = ['-o', 'BatchMode=yes']
+    d = _run([ssh, *opts, hostname, 'mktemp -d /tmp/natemu-bench-XXXXXX']).stdout.strip()
+    try:
+        tar = subprocess.run(['tar', '-C', str(recipe), '-cf', '-', '.'], capture_output=True, check=True).stdout
+        r = subprocess.run([ssh, *opts, hostname, f'tar -C {d} -xf -'], input=tar, capture_output=True)
+        if r.returncode: raise BuildFailure('bench-image', r.stderr.decode()[-1000:])
+        _run([ssh, *opts, hostname, f'bash {d}/scripts/build.sh {d}/b > {d}/build.log 2>&1 || {{ tail -40 {d}/build.log; exit 1; }}'],
+             timeout=4 * 3600)
+        for f in ('bench.cpio', 'expected.txt'):
+            _run([scp, '-q', *opts, f'{hostname}:{d}/b/out/{f}', str(out / f)])
+    finally:
+        subprocess.run([ssh, *opts, hostname, f'rm -rf {d}'], capture_output=True)
+
+
 def bench_image() -> pathlib.Path:
-    """The benchmark initramfs (bench.cpio), built on this Mac from tools/bench/image in an amd64 Debian container (spec
-    R1.3, R14.3): an environment input, cached per machine, keyed by the recipe and the builder image."""
+    """The benchmark initramfs (bench.cpio), built from tools/bench/image by the configured builder (spec R1.3, R14.3): an
+    environment input, cached per machine, keyed by the recipe and the builder. The builder is recorded beside it."""
     if p := _pinned('bench-image'): return pathlib.Path(p)
     recipe = paths.repo_root() / 'tools' / 'bench' / 'image'
-    k = cache.key('bench-image', recipe, BENCH_BUILDER)
+    builder = bench_builder()
+    k = cache.key('bench-image', recipe, BENCH_BUILDER if builder == 'local' else builder)
 
     def build(out: pathlib.Path):
-        _run(['container', 'run', '--rm', '--arch', 'amd64', '--cpus', '4', '--memory', '8g',
-              '--volume', f'{recipe}:/recipe:ro', '--volume', f'{out}:/work', BENCH_BUILDER, 'bash', '/recipe/container.sh'],
-             timeout=4 * 3600)
+        if builder == 'local': _build_bench_local(recipe, out)
+        else: _build_bench_ssh(recipe, out, builder[4:])
         if not (out / 'bench.cpio').exists(): raise BuildFailure('bench-image', 'no bench.cpio produced')
+        (out / 'builder.txt').write_text(('local: ' + BENCH_BUILDER + ' (amd64 through Rosetta)' if builder == 'local'
+                                          else builder) + '\n')
 
     f = cache.get_or_build('bench-image', k, build) / 'bench.cpio'
     pin_for_run('bench-image', str(f))
