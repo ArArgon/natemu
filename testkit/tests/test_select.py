@@ -59,5 +59,6 @@ def test_gate_combines_coverage_across_runs(pytester, family_dir, monkeypatch, t
     monkeypatch.setenv('TESTKIT_RUN_DIR', str(tmp_path / 'm2'))
     (tmp_path / 'm2').mkdir()
     assert pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', 'tests').ret == 1
-    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', '--with-run', str(tmp_path / 'm4'), 'tests')
+    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', '--rootdir', str(pytester.path),
+                                      '--with-run', str(tmp_path / 'm4'), 'tests')
     assert r.ret == 0, r.stdout.str()
