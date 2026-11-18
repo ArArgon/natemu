@@ -19,6 +19,7 @@ def pytest_addoption(parser):
     g.addoption('--testkit-worker', default=None, help=argparse_hidden())
     g.addoption('--testkit-report', default=None, help=argparse_hidden())
     g.addoption('--testkit-inprocess', action='store_true', help='run items in this process (no run loop)')
+    g.addoption('--testkit-prepare-only', action='store_true', help='prepare what the selection needs; run nothing')
     g.addoption('--with-run', action='append', default=[], help='another run folder of the same commit whose passes '
                 'cover items not runnable here (R5.7)')
 

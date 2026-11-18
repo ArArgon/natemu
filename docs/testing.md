@@ -30,6 +30,12 @@ tools/natemu-test status RUN              # one run
 tools/natemu-test wait RUN                # wait for it; exits with its status
 ```
 
+```sh
+tools/natemu-test prepare --tier bench    # build and fetch what a selection needs, run nothing (same selection as run)
+```
+
+Preparation only claims the machine when something is missing; what is already in the cache is just looked up.
+
 Each run keeps its output in `.natemu/runs/<id>/` (JUnit in `junit.xml`, every worker's log under `units/`). The 20
 newest runs are kept, and any run folder with a file named `keep` in it.
 

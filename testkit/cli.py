@@ -42,6 +42,12 @@ def cmd_wait(args):
     return runs.wait(args[0])
 
 
+def cmd_prepare(args):
+    """Build and fetch everything a selection needs (same selection as `run`), run nothing (spec R14.4)."""
+    from testkit import runs
+    return runs.run(with_default_tier(args) + ['--testkit-prepare-only'])
+
+
 def cmd_gc(args):
     from testkit import cache, runs
     import pathlib

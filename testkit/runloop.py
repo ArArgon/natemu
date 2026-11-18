@@ -103,6 +103,25 @@ class Controller:
         self.pool = poolmod.Pool()
         self.reasons = {}
 
+    def prepare_only(self) -> None:
+        """`natemu-test prepare` (spec R14.4): build and fetch what the selected items need, under the same shared claim and
+        rules as a run, and run nothing. An item whose requirements failed is reported with its category; the others
+        are not reported at all."""
+        from testkit import prepare
+        live = [i for i in self.session.items if isinstance(i, CaseItem) and not i.preset]
+        failed = prepare.prepare(live, self.pool, self.config)
+        for it in live:
+            if it.nodeid in failed:
+                report_without_running(it, *failed[it.nodeid])
+                self.session.testsfailed += 1
+        tr = self.config.pluginmanager.get_plugin('terminalreporter')
+        if tr:
+            n = len({r for it in live for r in (it.harness.requirements(it.fam, it.suite, it.variant)
+                                               if hasattr(it.harness, 'requirements') else [])})
+            tr.write_line(f'testkit: prepared {n} requirement(s) for {len(live)} item(s); '
+                          f'{len({f[1] for f in failed.values()})} failed' if failed else
+                          f'testkit: prepared {n} requirement(s) for {len(live)} item(s); nothing run')
+
     def run(self) -> None:
         items = self.session.items
         plain = [i for i in items if not isinstance(i, CaseItem) or i.preset]
@@ -232,7 +251,8 @@ def pytest_runtestloop(session):
     if session.testsfailed and cfg.option.continue_on_collection_errors is False: return None
     if not any(isinstance(i, CaseItem) for i in session.items): return None     # plain pytest: pytest's own loop
     if cfg.option.collectonly: return None
-    Controller(session).run()
+    c = Controller(session)
+    c.prepare_only() if cfg.getoption('testkit_prepare_only') else c.run()
     return True
 
 

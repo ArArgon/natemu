@@ -57,12 +57,29 @@ def _flock(path: pathlib.Path, mode=fcntl.LOCK_EX):
         fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
 
+class Miss(Exception):
+    """Raised instead of building while peeking (testkit.prepare's first pass)."""
+
+
+_peeking = False
+
+
+@contextlib.contextmanager
+def peek():
+    """Within this block a missing entry raises Miss instead of being built: what is already here costs no claim."""
+    global _peeking
+    old, _peeking = _peeking, True
+    try: yield
+    finally: _peeking = old
+
+
 def get_or_build(kind: str, k: str, build: Callable[[pathlib.Path], None], *, size_hint: int = 0) -> pathlib.Path:
     """The entry, building it with `build(tmpdir)` if missing. One builder per key machine-wide; a waiter gets its result.
     A failed or killed build leaves nothing that is ever served."""
     entry = entry_path(kind, k)
     if entry.is_dir():
         os.utime(entry); return entry
+    if _peeking: raise Miss(f'{kind}/{k[:12]}')
     with _flock(paths.cache_root() / 'locks' / f'{kind}-{k}'):
         if entry.is_dir():
             os.utime(entry); return entry

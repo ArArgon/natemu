@@ -71,3 +71,12 @@ def test_submit_wait_status(env, monkeypatch, tmp_path):
     assert 'machine:' in st.stdout
     w = subprocess.run([sys.executable, '-m', 'testkit', 'wait', rid], capture_output=True, text=True, env=e, timeout=60)
     assert w.returncode == 0 and 'exit status 0' in w.stdout, w.stdout + w.stderr
+
+
+def test_prepare_only_runs_nothing(pytester, env):
+    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-prepare-only', '-k', 'shared', 'tests')
+    assert r.ret == 0 and 'nothing run' in r.stdout.str(), r.stdout.str()
+    assert not (env / 'sleep.log').exists()                      # no test body ran
+    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-prepare-only', '-k', 'needsbad', 'tests')
+    out = r.stdout.str()
+    assert r.ret == 1 and '1 unpreparable' in out and 'connection refused' in out, out

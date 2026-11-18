@@ -94,3 +94,13 @@ def test_cap_parse(monkeypatch):
     assert cache.cap_bytes() == 2 << 30
     monkeypatch.delenv('NATEMU_TEST_CACHE_CAP')
     assert cache.cap_bytes() == 100 << 30
+
+
+def test_peek_raises_instead_of_building():
+    with pytest.raises(cache.Miss):
+        with cache.peek():
+            cache.get_or_build('x', 'p1', lambda d: (d / 'f').write_text('built'))
+    assert not cache.entry_path('x', 'p1').exists()
+    e = cache.get_or_build('x', 'p1', lambda d: (d / 'f').write_text('built'))
+    with cache.peek():
+        assert cache.get_or_build('x', 'p1', lambda d: None) == e
