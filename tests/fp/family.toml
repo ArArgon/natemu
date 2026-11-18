@@ -1,0 +1,38 @@
+# AVX/AVX2/FMA/F16C straight-line corpora (the I8 corpora), judged against locked QEMU answers in every FP mode, with
+# and without AFP. tests/fp/rules.py excludes the documented fast-mode deviations on hosts without AFP (spec R2.13).
+[family]
+name = "fp"
+covers = ["crates/runtime/src/**/fp*", "crates/runtime/src/fp/**", "crates/abi/src/fptrap.rs", "third_party/FEX",
+          "tools/fexc/**", "tools/fp_deviations.py", "tools/reference/gen_i8.py", "tools/reference/gen_i5a.py"]
+
+[input.i8]
+generator = "tools/reference/gen_i8.py"
+args = ["--seed", "20261030", "--random", "60"]
+sources = ["tools/reference/gen_slice1.py", "tools/reference/gen_i5a.py", "tools/reference/flags.py"]
+
+[input.i8b]
+generator = "tools/reference/gen_i8.py"
+sources = ["tools/reference/gen_slice1.py", "tools/reference/gen_i5a.py", "tools/reference/flags.py"]
+
+[[suite]]
+name = "i8"
+kind = "deterministic"
+harness = "programs"
+input = "i8"
+reference = "qemu"
+matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false] }
+batch = 64
+smoke = ["i8-forms-000"]
+
+[[suite]]
+name = "i8b"
+kind = "deterministic"
+harness = "programs"
+input = "i8b"
+reference = "qemu"
+matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false] }
+batch = 64
+smoke = ["i8-forms-000"]
+# QEMU 7.2's two-NaN choices depart from x86 in these (run_suite.py I8B_KNOWN): their answers come from real x86 (R2.13a).
+reference_overrides = { "i8-forms-001" = "x86", "i8-forms-045" = "x86", "i8-random-067" = "x86", "i8-random-077" = "x86",
+                        "i8-random-097" = "x86", "i8-random-111" = "x86", "i8-random-126" = "x86" }

@@ -54,3 +54,41 @@ def cmd_gc(args):
     deleted = cache.gc(cache.cap_bytes(), roots)
     print(f'deleted {len(deleted)} entries')
     return 0
+
+
+def cmd_lock(args):
+    """Build each deterministic suite's input, seed its answers, write tests.lock (spec R2.3, R2.8)."""
+    import pathlib
+    from testkit import family, lock
+    if not args: print('natemu-test lock FAMILY_DIR [SUITE ...]'); return 2
+    fam = family.load(pathlib.Path(args[0]).resolve() / 'family.toml')
+    want = set(args[1:])
+    data = lock.read(fam)
+    for suite in fam.suites:
+        if suite.kind != 'deterministic' or (want and suite.name not in want): continue
+        h = family.harness_for(fam, suite)
+        print(f'seeding {fam.name}/{suite.name} ...', flush=True)
+        data.setdefault('suite', {})[suite.name] = h.seed(fam, suite)
+        data.setdefault('input', {})[suite.input] = {'fingerprint': lock.fingerprint_input(fam, suite.input),
+                                                    'output': data['suite'][suite.name]['input']}
+        s = data['suite'][suite.name]
+        print(f'  {len(s["cases"])} cases, {sum(1 for a in s["cases"].values() if not a)} without an answer, '
+              f'{sum(len(v) for v in s.get("excluded", {}).values())} exclusions')
+    lock.write(fam, data)
+    return 0
+
+
+def cmd_check_lock(args):
+    import pathlib
+    from testkit import family, lock
+    fams = [family.load(pathlib.Path(a).resolve() / 'family.toml') for a in args] if args else family.families()
+    probs = []
+    for fam in fams:
+        for s in fam.suites:
+            h = family.harness_for(fam, s)
+            if s.kind == 'deterministic' and hasattr(h, 'lock_status'):
+                from testkit.harness import programs
+                probs += lock.check(fam, lambda suite: (programs.sources(), programs.qemu_pin()))
+                break
+    for p in probs: print(p)
+    return 1 if any('stale' in p or 'missing' in p or 'collapsed' in p or 'seeded by' in p for p in probs) else 0

@@ -20,8 +20,15 @@ class FamilyFile(pytest.File):
             status = harness.lock_status(fam, suite) if hasattr(harness, 'lock_status') else 'ok'
             cases = harness.cases(fam, suite)
             if status != 'ok' and not cases: cases = ['(unlocked)']
+            locked_ex = harness.locked_exclusions(fam, suite) if status == 'ok' and hasattr(harness, 'locked_exclusions') else None
             for v in family.expand(suite):
                 place = family.placement(v, h, require_real)
+                if locked_ex is not None and fam.rules:
+                    met = {k[5:]: ('real' if v.get(k) else 'hidden') for k, _ in v.params if k.startswith('host.')}
+                    now = sorted(c for c in cases if fam.rules(suite.name, c, v, met))
+                    if now != sorted(locked_ex.get(v.id, [])):
+                        yield ExclusionCheck.from_parent(self, name=f'{suite.name}::(exclusions)[{v.id}]',
+                                                         why=f'{len(now)} excluded now, {len(locked_ex.get(v.id, []))} in the lock')
                 for case in cases:
                     name = f'{suite.name}::{case}' + (f'[{v.id}]' if v.params else '')
                     yield CaseItem.from_parent(self, name=name, fam=fam, suite=suite, case=case, variant=v,
@@ -67,6 +74,18 @@ class CaseItem(pytest.Item):
 
     def reportinfo(self):
         return self.path, 0, self.name
+
+
+class ExclusionCheck(pytest.Item):
+    """The family's rule excludes other cases than the lock records (R2.13): a gate failure, never a quiet pass."""
+    def __init__(self, *, why, **kw):
+        super().__init__(**kw)
+        self.user_properties.append(('testkit', 'exclusion-changed'))
+        self.add_marker(pytest.mark.skip(reason=f'exclusion-changed: {why} (re-lock if intended)'))
+
+    def runtest(self): pass
+
+    def reportinfo(self): return self.path, 0, self.name
 
 
 class CaseFailure(Exception):
