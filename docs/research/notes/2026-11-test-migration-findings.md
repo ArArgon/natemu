@@ -31,6 +31,17 @@ so in its claims; whether either also hides a missing natemu path is open.
   `ref.py` now gives each container a private copy of the binary and reruns refused jobs in fresh containers, backing off
   between attempts. A refusal is never a result: no program exits 126.
 
+## The M4 as a test host (gate of November 18)
+
+- **Homebrew's Python cannot serve other processes there.** A TCP server run by `/opt/homebrew/bin/python3` (3.14) accepts
+  no connection from another process (curl, nc and another Python time out), while the same server under
+  `/usr/bin/python3` works and an in-process client works; the firewall is off. The framework's environment is built
+  from the `python3` first on PATH, and net-linux's host fixtures run with it, so net-linux and net-linux-pci fail there
+  before any guest runs. Most likely the macOS Local Network permission of Homebrew's Python app, which an ssh session
+  cannot grant: a setting on that Mac, not natemu.
+- **Disk nearly full** (95%, 11 GiB free after the gate's builds): the qcow 64 GiB write-zeroes test took 13 s beside
+  nextest's other disk tests and 0.04 s alone; it now runs alone in `rust-timed`.
+
 ## References: where they are wrong and what replaced them
 
 - **QEMU 7.2 (user mode, the pinned corpus reference):** besides i8b's seven known two-NaN departures, `i8-forms-044` of
