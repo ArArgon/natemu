@@ -161,6 +161,15 @@ def driver(host, runtime, fexc, text, work, extra=(), timeout=None, env=None, sh
     return run.returncode, out, run.stderr[-2000:]
 
 
+def write_results(out, entries):
+    """The per-case report the test framework reads (`results.json` in the output folder): entries (name, diffs) in order;
+    an empty diffs list is a match. Written beside the mode's own file; the mode's checks and exit status are unchanged."""
+    cases = {}
+    for name, diffs in entries: cases.setdefault(name, []).extend(diffs)
+    (out / 'results.json').write_text(json.dumps({'results': [{'name': n, 'outcome': 'fail' if d else 'match', 'diffs': [str(x) for x in d]}
+                                                              for n, d in cases.items()]}, indent=1) + '\n')
+
+
 def kick_checks(out, kicks=None):
     """Doorbell accounting of one vCPU's output (`kicks`: every kick must have been issued)."""
     k, problems = out.get('kicks'), []
@@ -344,13 +353,15 @@ def cmd_smp(a, host, runtime):
         if e['outcome'] != 'match': print(f"{e['name']} rep{e['rep']} {e['outcome']}: {'; '.join(e['diffs'])[:400]}")
     # I3: LOCK NEG's lost-race exit to its own RIP must have run: under the race some CPU linked an exit that no CPU of the
     # race-free loop ever takes (the same code; its other exits are taken in both).
-    lost = 0
+    lost, entries_lost = 0, []
     for n in a.cpus:
         race = [s['linked'] for e in entries if e['name'] == f'neg-race@{n}' for s in e['stats']]
         free = [s['linked'] for e in entries if e['name'] == f'neg-private@{n}' for s in e['stats']]
         if race and free:
             print(f"neg-race@{n}: linked exits per CPU {sorted(set(race))}, race-free {sorted(set(free))}", flush=True)
             if max(race) <= max(free): lost += 1; print(f'neg-race@{n}: no CPU took the lost-race self-exit')
+            if max(race) <= max(free): entries_lost.append((f'neg-race@{n}', ['no CPU took the lost-race self-exit']))
+    write_results(a.out, [(e['name'], e['diffs']) for e in entries] + entries_lost)
     (a.out / 'smp.json').write_text(json.dumps({'results': entries}, indent=1) + '\n')
     return sum(c['fail'] for c in by.values()) + lost
 
@@ -367,7 +378,9 @@ def cmd_litmus(a, host, runtime):
     cells = [(f, n, v) for f in families for n in a.cpus for v in variants
              if programs.litmus_family(f, n) and not (f in ('xchg', 'xadd', 'cas', 'cas-read', 'cas8b-read') and v.startswith('split'))]   # (no plain location to split)
     failures, report = [], []
+    cell_results = []
     for f, n, v in cells:
+        cell_start = len(failures)
         test = programs.litmus_family(f, n)
         prog = programs.family_program(test, v, a.k, fences=not control)
         allowed = model.enumerate_outcomes(test).outcomes
@@ -405,10 +418,12 @@ def cmd_litmus(a, host, runtime):
         else:
             if forbidden: failures.append(f'{label}: forbidden {forbidden}')
             if unchained: failures.append(f'{label}: not linearizable {unchained[:3]}')
+        cell_results.append((label, failures[cell_start:]))
         report.append({'family': f, 'n': n, 'variant': v, 'control': control, 'trials': trials,
                        'histogram': {str(o): c for o, c in sorted(hist.items())}, 'allowed': len(allowed),
                        'forbidden': {str(o): c for o, c in forbidden.items()}, 'run_diffs': bad})
     for x in failures: print(x)
+    write_results(a.out, cell_results)
     (a.out / (f'litmus-{a.control}.json' if control else 'litmus.json')).write_text(json.dumps({'report': report, 'failures': failures}, indent=1) + '\n')
     return len(failures)
 
@@ -417,19 +432,30 @@ def cmd_limits(a, host, runtime):
     failures, report = [], {}
     loop = 'body 0x100000 ebfe\n'                  # jmp $: a linked loop with no exit
     over_capacity = loop + ''.join('cpu\nrip 0x100000\n' for _ in range(65))
+    cases = []
     rc, out, err = driver(host, runtime, a.fexc, over_capacity, a.out / 'work' / 'over-capacity')
     report['over_capacity'] = {'returncode': rc, 'stderr': err.strip()}
     if rc == 0 or '65 vCPUs' not in err: failures.append(f'65 vCPUs not refused: {rc} {err.strip()[-200:]}')
-    straight = vm.description(json.loads((ROOT / 'fixtures/slice1/programs.json').read_text())['programs'][0])
+    cases.append(('over-capacity', failures[:]))
+    # The first-slice corpus is generated, not committed (fixtures/slice1/.gitignore): where this checkout has none, the
+    # seeded generator makes it (the same bytes as the committed seed's output; inputs only, no QEMU).
+    corpus = ROOT / 'fixtures/slice1/programs.json'
+    if not corpus.exists():
+        corpus = a.out / 'slice1-programs.json'
+        subprocess.run([sys.executable, str(ROOT / 'tools/reference/gen_slice1.py'), '-o', str(corpus)], check=True, capture_output=True)
+    straight = vm.description(json.loads(corpus.read_text())['programs'][0])
     for v in range(4):
         text = ''.join('cpu\n' + (straight if w == v else 'rip 0x100000\nbody 0x100000 ebfe\n') for w in range(4))
         rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'work' / f'forge{v}', ['--forge-exit', '--tamper-vcpu', v])
         stops = [(c['stop'], c['reason']) for c in out['cpus']] if out else None
         report[f'forge{v}'] = {'returncode': rc, 'stops': stops, 'stderr': err.strip()[-300:]}
         want = [('resident', 'bad_reply status=1 detail=2') if w == v else ('cancelled', '') for w in range(4)]
+        before = len(failures)
         if rc or stops != want: failures.append(f'forged exit on vCPU {v}: {rc} {stops} {err.strip()[-200:]}')
+        cases.append((f'forge{v}', failures[before:]))
     for f in failures: print(f)
     print(json.dumps(report, indent=1))
+    write_results(a.out, cases)
     (a.out / 'limits.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1) + '\n')
     return len(failures)
 
@@ -1085,6 +1111,7 @@ def cmd_delivery(a, host, runtime):
         report.append({'name': name, 'model': want['outcome'], 'events': want['events']})
         print(f"{name}: {'FAIL' if any(f.startswith(name + ':') or f.startswith(name + ' (') for f in failures) else 'ok'} {want['outcome']} {want['events']}", flush=True)
     for f in failures: print(f)
+    write_results(a.out, [(r['name'], [f for f in failures if f.startswith(r['name'] + ':') or f.startswith(r['name'] + ' (')]) for r in report])
     (a.out / 'delivery.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     return len(failures)
 
@@ -1950,6 +1977,8 @@ def cmd_privilege(a, host, runtime):
             if seen.get(('loop10', n)) != seen.get(('loop1000', n)):
                 failures.append(f"retries at 10 and 1000 rounds differ ({n} vCPUs{', max-block 1' if limit else ''}): {seen.get(('loop10', n))} {seen.get(('loop1000', n))}")
     for f in failures: print(f)
+    write_results(a.out, [(r['name'] + (' (max-block 1)' if r['max_block'] else ''), r['diffs']) for r in report]
+                  + [('loop-retries', [f for f in failures if f.startswith('retries at 10 and 1000')])])
     (a.out / 'privilege.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     return len(failures)
 
