@@ -23,33 +23,7 @@ for p in (REF, paths.repo_root() / 'tools'):
     if str(p) not in sys.path: sys.path.insert(0, str(p))
 
 
-def _ref():
-    import flags, ref  # noqa: E401  (tools/reference)
-    return ref, flags
-
-
-def mask_of(program: dict) -> int:
-    ref, flags = _ref()
-    if ref.norm(program)['flow']:
-        raise ValueError(f"{program['name']}: a flow program (ref.py derives its RFLAGS mask from the executed path); not supported here")
-    return flags.TRACKED & ~flags.analyze(ref.norm(program)['insns'])
-
-
-def normalize(program: dict, state: dict) -> bytes:
-    """Canonical bytes of a final state (QEMU's result['qemu'] or natemu's report): what ref.compare compares."""
-    ref, _ = _ref()
-    return json.dumps({'gpr': [ref.num(v) for v in state['gpr']], 'rflags': ref.num(state['rflags']) & mask_of(program),
-                       'rip': ref.num(state['rip']),
-                       'memory': [[ref.num(m['addr']), m['data']] for m in state['memory']]}, separators=(',', ':')).encode()
-
-
-def answer(program: dict, state: dict) -> str:
-    return hashlib.sha256(normalize(program, state)).hexdigest()
-
-
-def corpus_hash(programs: list) -> str:
-    """The input's identity: the programs only, not the generator header (which records the local clang, R2.15)."""
-    return hashlib.sha256(json.dumps(programs, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+from testkit.harness.normalize_programs import _ref, answer, corpus_hash, mask_of, normalize  # noqa: E402,F401
 
 
 def build_input(fam, name: str) -> tuple[pathlib.Path, list]:
@@ -72,7 +46,8 @@ def qemu_pin() -> str:
 
 def sources() -> list[pathlib.Path]:
     """What decides an answer besides the input (R2.7): this normalizer and the reference tool's sources."""
-    return [pathlib.Path(__file__), REF / 'ref.py', REF / 'flags.py', REF / 'container_entry.py']
+    from testkit.harness import normalize_programs
+    return [pathlib.Path(normalize_programs.__file__), REF / 'ref.py', REF / 'flags.py', REF / 'container_entry.py']
 
 
 class Programs:
@@ -194,7 +169,8 @@ class Programs:
     def _reuse_key(n, locked, it) -> str:
         h = host.detect()
         return cache.key('outputs', n.key, artifacts.fexc().parent.name, locked.get('input', ''), it.case, it.variant.id,
-                         h.chip, json.dumps(it.place.met), h.os_build, *sources(), paths.repo_root() / 'tools' / 'run_slice1_vm.py')
+                         h.chip, json.dumps(it.place.met), h.os_build, *sources(), pathlib.Path(__file__),
+                         paths.repo_root() / 'tools' / 'run_slice1_vm.py')
 
     @staticmethod
     def _reused(key) -> bytes | None:

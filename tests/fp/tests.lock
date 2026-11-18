@@ -8,7 +8,7 @@ fingerprint = "d9c158d6ddc489d69cf664f0bc1c0a0868001140e21e4ae9642095599e3e1121"
 output = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 
 [suite.i8]
-fingerprint = "9d6402d7537b815852b2660a5e037ab2a45930c3e61be8010d711a6c1b7ef39b"
+fingerprint = "4f455465c583a95e01d9b70559b3f08abf7ee1d07aea8c8ec1a4454b59a8b06e"
 input = "3301ce5d15f97269ab58c470af97be2b9ee9f880fbbc67dcc4d1fe72a24b57f7"
 reference = "qemu"
 
@@ -281,13 +281,13 @@ i8-shifts-29 = "ddd7f1b744d95082f307388daa6b8a83b9cdaae1e947434adde1498c22361b94
 ]
 
 [suite.i8.seeded]
-date = "2026-11-17"
+date = "2026-11-18"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu-x86_64-static (apple)"
 
 [suite.i8b]
-fingerprint = "b4b2c3038639b243d5e5b3bf9a33fd8c0fe36d1858332bc93432403d0743a81d"
+fingerprint = "4680fa1443f1c63a0a932bcfc1a81edf43721261e54c8b6f78ac31930db643ce"
 input = "3c25dd609f642ad9be1edfa3cb91a00f9b269468b862d2739a8b363053357dc9"
 reference = "qemu"
 
@@ -697,7 +697,7 @@ i8-shifts-29 = "28a143f356866b735a92afabe602a8bec0dd88d83ffec622de2a8fab74dd710b
 ]
 
 [suite.i8b.seeded]
-date = "2026-11-17"
+date = "2026-11-18"
 machine = "Apple M2 Max"
 pin = "16ce7dbb6626f3c0e1f932f831817dbf3b506c848a168d16f2172151e9666594"
 tool = "qemu: qemu-x86_64-static (apple)"
