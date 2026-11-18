@@ -188,3 +188,18 @@ answer is never stored; a run never needs QEMU). These revisions replace the tas
   hand-computed values) are code: inline in the test beside the case, reviewed as code, no lock and no reproduction
   steps. A check that needs no VM (a rule table, the decoder, the FP model, a parser) belongs in a unit test (cargo test or
   pytest); one that judges what natemu does when it runs guest code is an integration test, even with a static expectation.
+
+## Status (November 18)
+
+- **Migrated:** every `tools/run_suite.py` step runs in a family: unit, fp and programs in their own harnesses; the 148
+  runner cases in `tests/{boot,static,system,smp,faults,io}`, each reporting per case and comparing with locked QEMU
+  answers (faults 11,882, smp 8,304, system 1,640). The legacy family is removed. Batch A (SDM- and model-judged runners)
+  and batch B (QEMU-comparing runners) ran as parallel agents; their findings are in
+  docs/research/notes/2026-11-test-migration-findings.md.
+- **M2 Max gate** (run 20261118-045129-009e, idle machine, 32 min): 82,954 passed, 2,329 not runnable (FEAT_AFP variants),
+  2 failed (probes: answers seeded in a worktree without FEX's tests; fixed and reseeded, probes now 88/88 locked).
+- **M4 gate** (scratch clone `~/natemu-testkit-gate`, run 20261118-054302-7e7b, 51 min): 85,074 passed, 2 not runnable,
+  7 failed: `test_suite_accounting` (fixed: it opened the real natemu-raw lock), net-linux and net-linux-pci (the M4's
+  Homebrew Python, which the framework's environment is built from, cannot accept connections from other processes; the
+  system Python can: a setting on that Mac), and the qcow 64 GiB write-zeroes timing test (13 s against a 5 s bound, on a
+  disk 95% full). The bench tier was not run there (the M4 has no ssh access to the x86 builder). Coverage was not combined.
