@@ -20,7 +20,7 @@ TMPDIR; a step whose time ends far from its `est` is reported at the end (update
 would otherwise start last); (3) `ser`, one at a
 time, alone: the steps whose judgement depends on wall time or on vCPUs running truly concurrently (see SERIAL_WHY);
 a failed one is rerun once alone and both results recorded (the rerun's decides).
-Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock and each serial step an exclusive one
+Machine coordination: phases 1-2 hold a shared flock on NATEMU_RAW_ROOT/.vm.lock and phase 3 an exclusive one throughout
 (benchmarks take it exclusively with `/usr/bin/lockf -k`), and a serial step also waits until no other VM process runs.
 NATEMU_RAM and other environment variables pass through to every step (the 4 MiB suite: NATEMU_RAM=0x400000).
 Steps after phase 1 get NATEMU_VM_LOCK_HELD=1: the suite already holds the VM lock for them (shared or exclusive), so a step
@@ -321,16 +321,13 @@ class Suite:
                 threads.append(threading.Thread(target=go, args=(s, w), daemon=True)); threads[-1].start()
         for t in threads: t.join()
 
-    def serial(self, s):
-        self.flock(fcntl.LOCK_EX)
-        try:
-            idle(); r = self.run(s)
-            if not r[0]:        # the suite's rule: one rerun alone, recorded beside the first result
-                first = self.O / 'out' / s.name
-                if first.exists(): first.rename(first.with_name(s.name + '.first'))
-                idle(); return self.record(s, r, self.run(s, '.rerun'))
-            return self.record(s, r)
-        finally: fcntl.flock(self.vmlock, fcntl.LOCK_UN)
+    def serial(self, s):    # (the caller holds the exclusive VM lock)
+        idle(); r = self.run(s)
+        if not r[0]:        # the suite's rule: one rerun alone, recorded beside the first result
+            first = self.O / 'out' / s.name
+            if first.exists(): first.rename(first.with_name(s.name + '.first'))
+            idle(); return self.record(s, r, self.run(s, '.rerun'))
+        return self.record(s, r)
 
     def kill(self):
         with self.lock:
@@ -379,8 +376,11 @@ def main():
         phase_s['pre'] = time.monotonic() - t; t = time.monotonic()
         suite.parallel([s for s in todo if s.phase == 'par'], a.j, a.e)
         phase_s['par'] = time.monotonic() - t
-        fcntl.flock(suite.vmlock, fcntl.LOCK_UN); t = time.monotonic()
-        for s in [s for s in todo if s.phase == 'ser']: suite.serial(s)
+        t = time.monotonic()
+        serial = [s for s in todo if s.phase == 'ser']
+        if serial: suite.flock(fcntl.LOCK_EX)   # the whole serial phase: no other job takes a VM between its steps
+        for s in serial: suite.serial(s)
+        fcntl.flock(suite.vmlock, fcntl.LOCK_UN)
         phase_s['ser'] = time.monotonic() - t
     except BaseException:
         suite.kill(); raise
