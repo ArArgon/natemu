@@ -77,8 +77,10 @@ const WORKERS: usize = 4;
 const MAX_REQUESTS: usize = 32;
 const MAX_BUFFERED: usize = 4 << 20;
 /// A native call running longer abandons the workers, and the VM fails. The owner checks its workers' calls; a watchdog
-/// thread checks the owner's own (inline) call every tenth of the limit.
-const CALL_LIMIT: Duration = Duration::from_secs(10);
+/// thread checks the owner's own (inline) call every tenth of the limit. Two minutes, Linux's hung-task warning: a busy
+/// healthy Mac is slower than 10 s (an M4 with no VM: fsync of a file under 4 writers took 18.8 s), so the limit only
+/// catches a disk that has gone away. A guest waits for its request as on a slow real disk.
+pub(crate) const CALL_LIMIT: Duration = Duration::from_secs(120);
 /// A native call longer than this is logged (IO5 on a qcow2 overlay: every call under 1 s on a healthy host).
 const SLOW_CALL: Duration = Duration::from_secs(2);
 /// Bounded spins before blocking, after recent activity: the owner's on its bell after it admitted or completed work,

@@ -265,7 +265,7 @@ natemu holds, and a QEMU holder makes natemu's flock fail), so natemu and QEMU e
 progress, errors never retried; (2) safe under four workers plus the owner; (3) fsync on guest
 FLUSH, F_FULLFSYNC only at power-off; (4) sticky sync failure; (5) exclusive lock on the
 writable image, shared on read-only and backing; (6) bounds checked before the backend; (7)
-discard a hint, write-zeroes reads back as zeros; (8) every call under 10 s; (9) fixed capacity
+discard a hint, write-zeroes reads back as zeros; (8) every call under the device's call limit (2 minutes); (9) fixed capacity
 and stable id; (10) the first error's text is the request's error.
 
 **The raw backend** is today's code moved unchanged (open checks, exclusive lock, id from device
