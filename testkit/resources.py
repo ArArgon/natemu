@@ -74,6 +74,15 @@ def fetch(name: str, decl: dict | None = None) -> pathlib.Path:
 
 
 def derived(name: str, recipe: Callable[[pathlib.Path, list], None], inputs: list) -> pathlib.Path:
-    """A resource built by `recipe(out_dir, inputs)`; keyed by the recipe's source and its inputs (files or strings)."""
+    """A resource built by `recipe(out_dir, inputs)`; keyed by the recipe's source and its inputs (files or strings).
+    Pinned for the run, as artifacts are (artifacts.pin_for_run): a worker gets the entry its run prepared, even if the
+    worktree or the machine's config (the container builder) changed since, and never builds one at run time."""
+    import os
+    from testkit import artifacts
+    in_run = bool(os.environ.get('TESTKIT_RUN_DIR'))        # `natemu-test run`: the controller and its workers
+    pin = f'derived:{name}:{inputs[0] if inputs else ""}'
+    if in_run and (p := artifacts._pinned(pin)): return pathlib.Path(p)
     k = cache.key(name, inspect.getsource(recipe), *inputs)
-    return cache.get_or_build('derived', k, lambda out: recipe(out, inputs))
+    entry = cache.get_or_build('derived', k, lambda out: recipe(out, inputs))
+    if in_run: artifacts.pin_for_run(pin, str(entry))
+    return entry

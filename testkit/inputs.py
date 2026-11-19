@@ -174,7 +174,9 @@ def _in_docker_over_ssh(host: str, cname: str, recipe: pathlib.Path, work: pathl
             raise
         back = subprocess.run(['ssh', *SSH, host, f'tar -C {d}/work -cf - .'], capture_output=True)
         if back.returncode == 0:
-            subprocess.run(['tar', '-C', str(work), '-xf', '-'], input=back.stdout, check=True, capture_output=True)
+            x = subprocess.run(['tar', '-C', str(work), '-xf', '-'], input=back.stdout, capture_output=True)
+            if x.returncode:
+                raise BuildFailure(cname, 'copying the work folder back failed: ' + x.stderr.decode(errors='replace')[-1500:])
         return r
     finally:
         subprocess.run(['ssh', *SSH, host, f'docker run --rm -v {d}:/x {image} rm -rf /x/recipe /x/work; rmdir {d}'],

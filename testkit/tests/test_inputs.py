@@ -268,3 +268,17 @@ def test_builder_comes_from_the_machine_config_and_keys_the_entry(monkeypatch, t
     (tmp_path / 'wt' / '.natemu').mkdir(parents=True)
     (tmp_path / 'wt' / '.natemu' / 'config.toml').write_text('[build]\nbuilder = "local"\n')   # the worktree wins
     assert inputs.artifacts.container_builder() == 'local'
+
+
+def test_a_run_uses_the_inputs_it_prepared_even_if_the_builder_changes(monkeypatch, tmp_path):
+    """The torture part of the first campaign run rebuilt its image at run time: the machine's [build] builder changed
+    while the run went on, so the worker's key differed from the one prepared. In a run, derived inputs are pinned."""
+    from testkit import resources
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    monkeypatch.setenv('TESTKIT_RUN_DIR', str(tmp_path / 'run'))
+    monkeypatch.setenv('TESTKIT_ARTIFACTS', '{}')
+    built = []
+    def recipe(out, inputs): built.append(inputs[1]); (out / 'f').write_text(inputs[1])
+    a = resources.derived('thing', recipe, ['x', 'builder-1'])
+    b = resources.derived('thing', recipe, ['x', 'builder-2'])        # the config changed mid-run
+    assert a == b and built == ['builder-1']
