@@ -248,8 +248,9 @@ def test_container_builds_run_natively_on_the_x86_builder(monkeypatch, tmp_path)
     monkeypatch.setattr(inputs.artifacts, '_run', lambda cmd, **kw: run(cmd, text=True, **kw))
     inputs._in_container('t', recipe, work)
     remote = [c[-1] for c in seen if c[:1] == ['ssh']]
-    assert any(r.startswith('docker run --rm') and inputs.artifacts.BENCH_BUILDER in r and
+    assert any(r.startswith(inputs._slot_wait() + 'docker run --rm') and inputs.artifacts.BENCH_BUILDER in r and
                '-v /home/u/.natemu-build-1/recipe:/recipe:ro' in r and 'bash /recipe/container.sh' in r for r in remote)
+    assert 'flock -n 9' in inputs._slot_wait() and inputs.BUILD_SLOTS == 2      # waits for one of two build slots
     assert any('tar -C /home/u/.natemu-build-1/work -cf -' in r for r in remote)                 # the work folder back
     assert ['tar', '-C', str(work), '-xf', '-'] in seen
     assert remote[-1].startswith('docker run --rm -v /home/u/.natemu-build-1:/x') and 'rm -rf' in remote[-1]
