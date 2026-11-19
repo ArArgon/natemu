@@ -352,6 +352,38 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
 - [ ] **Step 4:** Run the whole campaign tier once on this Mac: `tools/natemu-test run --tier campaign`. Record times with `natemu-test times --detail`.
 - [ ] **Step 5:** Commit. Update docs/testing.md (a campaign section) and the README's one-line pointer.
 
+## Part C: QEMU answers only where nothing else knows the right value
+
+Owner, November 18: where a test's own harness, model or written expectation decides correctness, a QEMU answer is not
+needed. An audit of every answer site (11,882 faults, 8,304 smp and 1,640 system answers) sorted them into three
+groups. **Keep**: natemu compared value for value with QEMU, and nothing else knows the value. **Drop**: QEMU only
+cross-checks an expectation the test already has. **Static**: the value can be written down from the architecture.
+Each row is one task in the usual five steps:
+1. a test pinning the runner's verdict without the answer;
+2. run it, expect FAIL;
+3. remove the lookup, or add the static expectation;
+4. run the family, expect the same results;
+5. drop the lock entries with `natemu-test lock`, then commit.
+
+| Runner (family/cases) | Answers | Change |
+| --- | --- | --- |
+| slice1_faults, slice3 corpora (random corpora) | most of faults; 6,886 shared with smp | keep |
+| slice1_faults built-in probes (`/rip/*`, `/relocated`) | about 3,500 | static: a three-instruction prelude on known registers |
+| slice2_faults `#signal-context` | 405 | drop (QEMU checked against QEMU) |
+| slice2_faults (the rest) | 2,736 | keep |
+| slice2_probes loop programs | 21 | static: a small interpreter of the probes' ALU ops (`add_chain` already does it for long loops) |
+| slice3 kicks, contain control, coherence | bare + `#exit` | static, as `model_smp.py` does for `smp` |
+| slice3 sharedpt | 16 | drop: `sharedpt.judge` decides; add the data pages to the judge |
+| slice3 system, segments, events | about 610 | drop the cross-checks (`QEMU_DIFFERS`, `QEMU_HANGS`, `QEMU_EVENTS_*`); static registers |
+| i5b-faults | 261 | drop: the SDM rule decides |
+| i5b-images | 46 | static XSAVE/FXSAVE images |
+| s4, x1, x3, l4a, l4b, m3 | about 200 | drop: the models decide; add their few registers to the expectations |
+| r1a, r1b | about 60 | drop, after the judge covers r1a's variant programs (today only the QEMU compare catches them) |
+| l3 | UART | static: 16550A register values |
+| k1, m2, x4 | bare + `#exit` | static: the programs write known constants |
+
+programs and fp keep QEMU's answers: they compare final register and memory state, value for value.
+
 ## Not onboarded
 
 - `run_io_stress.py --forced`: needs scheduling-hook binaries built separately.
