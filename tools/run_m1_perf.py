@@ -110,8 +110,12 @@ def command(args, spec, out, manifest='MANIFEST'):
 def show(cmd): return ' '.join(str(c) for c in cmd)
 
 
+INCOMPLETE = 4      # `full --limit N`: this invocation's runs were ok and runs are left (testkit runs the next piece)
+
+
 def plan(args):
     p = build_plan(args.sets.split(','))
+    if args.count: print(len(p)); return 0
     m, i = sum(s['kind'] == 'matrix' for s in p), sum(s['kind'] == 'io5' for s in p)
     print(f'{len(p)} runs: {m} matrix (2 vCPUs, PCI) + {i} IO5; estimated {m * MATRIX_MIN + i * IO5_MIN:.0f} minutes '
           f'({MATRIX_MIN:.0f} min/matrix run, {IO5_MIN:.0f} min/IO5 run) plus a minute of preparation')
@@ -256,12 +260,17 @@ def execute(args, dest, plan_):
     ensure_inputs(args)
     env_record(args, dest / 'env.json')
     done = load_runs(dest)
+    limit, ran, failed = getattr(args, 'limit', None), 0, False
     for n, spec in enumerate(plan_, 1):
         old = done.get(spec['id'])
         if old and (old['ok'] or not args.retry_failed):
             print(f'[{n}/{len(plan_)}] {spec["id"]}: already recorded ({"ok" if old["ok"] else "FAILED"}), skipped', flush=True); continue
+        if limit is not None and ran >= limit:      # --limit: the rest is left for the next invocation (a test-framework piece)
+            left = sum(1 for s in plan_[n - 1:] if not (done.get(s['id']) and (done[s['id']]['ok'] or not args.retry_failed)))
+            print(f'{left} runs left for later invocations (--limit {limit})', flush=True)
+            return 1 if failed else INCOMPLETE
         print(f'[{n}/{len(plan_)}] {spec["id"]}: starting {time.strftime("%T")}', flush=True)
-        r = one_run(args, spec, dest)
+        r = one_run(args, spec, dest); ran += 1; failed |= not r['ok']; done[spec['id']] = r
         with (dest / 'runs.jsonl').open('a') as f: f.write(json.dumps(r) + '\n')
         extra = f' CONTENDED by {r["others_before"] + r["others_after"]}' if r['others_before'] or r['others_after'] else ''
         print(f'[{n}/{len(plan_)}] {spec["id"]}: {"ok" if r["ok"] else "FAILED " + str(r["problems"])} in {r["seconds"]} s{extra}', flush=True)
@@ -424,6 +433,9 @@ def main():
         s.add_argument('--final-commit', help='commit of the final binary (default: this checkout HEAD)')
         s.add_argument('--sets', default='A,BC,D', help='comma list of A, BC, D')
         s.add_argument('--dir', type=Path); s.add_argument('--retry-failed', action='store_true', help='rerun runs recorded as failed')
+        if name == 'full': s.add_argument('--limit', type=int, help=f'run at most N pending runs, then exit {INCOMPLETE} if runs are left '
+                                          '(the test framework runs the case as pieces of one run each)')
+        if name == 'plan': s.add_argument('--count', action='store_true', help='print only the number of runs')
         if name == 'smoke': s.add_argument('--with-baseline', action='store_true', help='also one baseline raw run')
     args = p.parse_args()
     if args.cmd == 'self-check': return self_check()

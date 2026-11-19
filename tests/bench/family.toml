@@ -113,6 +113,7 @@ params = { timeout = 7200 }
 
 [suite.cases.m1-perf]
 baseline = "ecec5d77"           # = run_m1_perf.py BASELINE_COMMIT; {natemu_baseline} is artifacts.natemu_at(baseline)
+pieces = true                   # one case per planned run (`m1-perf/piece-NN`, --limit 1): about 2-15 min windows, not 80
 argv = ["python3", "tools/run_m1_perf.py", "full", "--dir", "{resume_dir}", "--retry-failed", "--baseline-build", "{natemu_baseline}",
         "--final-build", "{natemu_entry}", "--fexc", "{fexc}", "--fio-prep", "{fio_prep}", "--block-inputs", "{block_inputs}",
         "--inputs", "{resume_dir}/matrix-inputs", "--io5-inputs", "{io5_inputs}"]

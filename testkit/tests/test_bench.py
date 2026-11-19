@@ -80,15 +80,16 @@ def _m1_perf_harness(monkeypatch, tmp_path):
     rd = {}
     monkeypatch.setattr(runloop, 'run_dir', lambda config: rd['dir'])
     monkeypatch.setattr('testkit.sched.pool.raw_root', lambda: None)
-    seen, real = {}, subprocess.run
+    seen, real, codes = {}, subprocess.run, {'rc': 0}
     def fake(argv, **kw):
         if 'tools/run_m1_perf.py' not in argv: return real(argv, **kw)       # the clones' cp
-        seen.update(argv=argv, env=kw['env']); return SimpleNamespace(returncode=0)
+        seen.update(argv=argv, env=kw['env']); return SimpleNamespace(returncode=codes['rc'])
     monkeypatch.setattr(subprocess, 'run', fake)
     item = SimpleNamespace(suite=suites['m1-perf'], case='m1-perf', nodeid='m1')
 
-    def run(run_dir, final_name='final', fresh=False):
+    def run(run_dir, final_name='final', fresh=False, case='m1-perf', rc=0):
         rd['dir'], final['name'] = tmp_path / run_dir, final_name
+        item.case = case; codes['rc'] = rc
         res = bench.HARNESS.run([item], SimpleNamespace(getoption=lambda o: fresh if o == 'fresh' else None))
         return seen['argv'], seen['env'], tmp_path / run_dir / 'bench' / 'M' / 'm1-perf', res['m1']
     return run
@@ -188,3 +189,23 @@ def test_clean_removes_old_resume_folders(monkeypatch, tmp_path):
     os.utime(old, (time.time() - 20 * 86400,) * 2)
     assert clean.resume_folders(14 * 86400) == [old]
     assert sorted(clean.resume_folders(None)) == [old, new]
+
+
+
+def test_m1_perf_runs_as_pieces_that_share_one_resume_folder(monkeypatch, tmp_path):
+    """Replay showed an indivisible 80-minute exclusive unit blocks every other run; as one piece per planned run
+    (--limit 1) the scheduler can interleave other work between them. All pieces resume in one folder."""
+    from testkit.harness import bench
+    fam, suites = _bench_family()
+    names = bench.HARNESS.cases(fam, suites['m1-perf'])
+    assert len(names) == 21 and names[0] == 'm1-perf/piece-00'
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    val = lambda a, opt: a[a.index(opt) + 1]
+    a1, _, _, r1 = run('run1', case='m1-perf/piece-00', rc=4)
+    a2, _, _, r2 = run('run1', case='m1-perf/piece-07', rc=0)
+    whole, *_ = run('run2', case='m1-perf')
+    assert a1[-2:] == ['--limit', '1'] and '--limit' not in whole
+    assert val(a1, '--dir') == val(a2, '--dir') == val(whole, '--dir')
+    assert r1.outcome == 'passed' and 'more left' in r1.message and r2.outcome == 'passed'
+    _, _, _, r3 = run('run1', case='m1-perf/piece-03', rc=1)
+    assert r3.outcome == 'failed'

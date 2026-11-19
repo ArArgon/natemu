@@ -83,3 +83,26 @@ class InterruptedPreparation(unittest.TestCase):
             with mock.patch.object(run_m1_perf.subprocess, 'run', fake):
                 run_m1_perf.ensure_inputs(args)
             self.assertFalse(seen['existed'])
+
+
+
+class Limit(unittest.TestCase):
+    def test_limit_runs_one_and_says_more_are_left(self):
+        import tempfile, types
+        from unittest import mock
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import run_m1_perf
+        plan = [dict(id=f'A-{i}', group='A', setup='final-raw', rep=i, kind='matrix') for i in range(3)]
+        runs = []
+        def one(args, spec, dest): runs.append(spec['id']); return dict(id=spec['id'], ok=True, problems=[], seconds=1,
+                                                                        others_before=[], others_after=[])
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(run_m1_perf, 'one_run', one), \
+                mock.patch.object(run_m1_perf, 'ensure_inputs', lambda a: None), \
+                mock.patch.object(run_m1_perf, 'env_record', lambda a, f: None), \
+                mock.patch.object(run_m1_perf, 'analyze', lambda d: 0):
+            args = types.SimpleNamespace(retry_failed=True, limit=1)
+            self.assertEqual(run_m1_perf.execute(args, t, plan), run_m1_perf.INCOMPLETE)
+            self.assertEqual(run_m1_perf.execute(args, t, plan), run_m1_perf.INCOMPLETE)
+            self.assertEqual(run_m1_perf.execute(args, t, plan), 0)          # the last one: the verdict
+            self.assertEqual(runs, ['A-0', 'A-1', 'A-2'])
+            self.assertEqual(run_m1_perf.execute(args, t, plan), 0)          # nothing left: the verdict again

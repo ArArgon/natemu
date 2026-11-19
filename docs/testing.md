@@ -175,7 +175,10 @@ qcow2 and overlay disks and in IO5, and passes only when its verdict is PASS (`s
 80 minutes and 3-4 GiB of free disk. Everything it reads is built here: the baseline is `git archive` of that commit,
 built like the current one and cached by the commit's tree (`artifacts.natemu_at`); the fio preparation and block inputs
 are built from their recipes (see the input root below); IO5's disk, kernel and CPython source come from `run_io5.py prepare` on the pinned Debian cloud
-image and CPython tarball (`inputs.io5_inputs`).
+image and CPython tarball (`inputs.io5_inputs`). It runs as 21 pieces, one per planned run (`m1-perf/piece-NN`), each
+holding the machine for only its own run, so other work runs in between; all pieces record into one results folder kept
+in the machine's state folder, a rerun measures only what is missing (`--fresh` starts over), and the piece that finds
+nothing left reports the verdict.
 
 The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
 Switching builders builds a new image rather than reusing the other one's. Not

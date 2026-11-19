@@ -18,6 +18,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import time
 
 from testkit import artifacts, cache, host, inputs, paths, resources
@@ -60,9 +61,40 @@ def resume_dir(case: str, spec: dict, ident: dict, machine: str) -> pathlib.Path
     return paths.state_dir() / 'bench-resume' / case / k[:32]
 
 
+_PIECES: dict = {}
+
+
+def _piece_count(spec) -> int:
+    """The runs the case's script plans (`plan --count` with the case's --sets), once per process."""
+    argv = spec['argv']
+    sets = argv[argv.index('--sets') + 1] if '--sets' in argv else None
+    script = next(a for a in argv if a.endswith('.py'))
+    k = (script, sets)
+    if k not in _PIECES:
+        r = subprocess.run([sys.executable, str(paths.repo_root() / script), 'plan', '--count', *(['--sets', sets] if sets else [])],
+                           capture_output=True, text=True)
+        _PIECES[k] = int(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else 0
+    return _PIECES[k]
+
+
 class Bench:
     def cases(self, fam, suite):
-        return list(suite.extra.get('cases', {}))
+        """A case with `pieces = true` (a script that resumes from its own records, run_m1_perf.py full) becomes one case
+        per run it plans, `<case>/piece-NN`, each running the next pending run (`--limit 1`): short exclusive units the
+        scheduler can interleave with other work, instead of one indivisible window of an hour or more. The piece that
+        finds nothing left reports the verdict."""
+        out = []
+        for name, spec in suite.extra.get('cases', {}).items():
+            n = _piece_count(spec) if spec.get('pieces') else 0
+            out += [f'{name}/piece-{i:02d}' for i in range(n)] if n else [name]
+        return out
+
+    def _spec(self, suite, case) -> tuple[str, dict, dict]:
+        """(base case name, the base spec that keys its resume folder, the spec this case runs)."""
+        base, _, piece = case.partition('/piece-')
+        spec = suite.extra['cases'][base]
+        if not piece: return base, spec, spec
+        return base, spec, dict(spec, argv=[*spec['argv'], '--limit', '1'])
 
     def case_needs(self, fam, suite, case):
         return Needs(exclusive=True, why='measures wall-clock time: nothing else may run')
@@ -123,11 +155,13 @@ class Bench:
         h = host.detect()
         out = {}
         for it in batch:
-            spec = it.suite.extra['cases'][it.case]
+            base, keyspec, spec = self._spec(it.suite, it.case)
             d = runloop.run_dir(config) / 'bench' / h.machine_id / it.case
             d.mkdir(parents=True, exist_ok=True)
             raw = raw_root()
-            vals = self._values(spec, d, n, fexc, raw, it.case, h.machine_id, bool(config and config.getoption('fresh')))
+            # --fresh sets the old records aside once, in the first piece (later pieces continue the new records)
+            fresh = bool(config and config.getoption('fresh')) and (spec is keyspec or it.case.endswith('/piece-00'))
+            vals = self._values(keyspec, d, n, fexc, raw, base, h.machine_id, fresh)
             where = f'{d}' + (f' (results in {vals["resume_dir"]}, kept for resuming)' if 'resume_dir' in vals else '')
             missing = [p for p in (self._subst(x, vals) for x in spec.get('needs', [])) if not pathlib.Path(p).exists()]
             if missing:
@@ -143,6 +177,9 @@ class Bench:
             tail = (d / 'log.txt').read_text(errors='replace').strip().splitlines()[-6:]
             if r.returncode == 3:
                 out[it.nodeid] = CaseResult('failed', f'contended: another VM ran during the measurement; {d}'); continue
+            if r.returncode == 4 and spec is not keyspec:              # a piece: its run was ok, others are left
+                out[it.nodeid] = CaseResult('passed', f'{took:.0f} s: one run measured, more left; {where}', 'measured')
+                continue
             if r.returncode != 0:
                 out[it.nodeid] = CaseResult('failed', f'exit {r.returncode} after {took:.0f} s; log {d / "log.txt"}; {where}\n' + '\n'.join(tail))
                 continue
