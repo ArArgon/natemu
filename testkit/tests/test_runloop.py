@@ -103,3 +103,87 @@ def test_a_unit_with_unrecorded_items_is_estimated_from_its_suite(monkeypatch, t
     got = sorted(u.req.expected for u in units if u.req.expected is not None)
     assert got == [30.0, 30.0]                          # (10 + 20) and (15 + 15): the unrecorded items take the mean
     assert [u.req.expected for u in units if u.items[0].suite.name == "t"] == [None]   # nothing recorded: still unknown
+
+
+def _alive(pid):
+    try: os.kill(pid, 0); return True
+    except ProcessLookupError: return False
+
+
+def _gone_within(pid, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if not _alive(pid): return True
+        time.sleep(0.2)
+    return False
+
+
+def test_sigterm_to_the_controller_stops_a_campaign_vm(pytester, env):
+    """Review: `kill PID` of the controller killed it outright (no handler, so its cleanup never ran); its worker then
+    SIGKILLed its own group, which natemu (its own session) is not in, and the VM ran on, holding cores and every
+    exclusive window. Now the controller turns SIGTERM into KeyboardInterrupt, stops its units, and the worker's
+    campaign handler stops the VM."""
+    pidf = env / 'hold.pid'
+    e = dict(os.environ, HOLD_PID=str(pidf))
+    c = subprocess.Popen([sys.executable, '-m', 'pytest', '-p', 'testkit.plugin', '-p', 'no:cacheprovider', '-q', '-k', 'hold',
+                          'tests'], cwd=pytester.path, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    end = time.time() + 30
+    while not pidf.exists() and time.time() < end: time.sleep(0.1)
+    assert pidf.exists(), c.communicate(timeout=60)[0]
+    vm = int(pidf.read_text())
+    try:
+        c.terminate()
+        out = c.communicate(timeout=60)[0].decode()
+        assert _gone_within(vm, 5), out
+    finally:
+        if _alive(vm): os.kill(vm, 9)
+
+
+def test_an_orphaned_worker_gives_its_handlers_time_then_kills_its_group(tmp_path):
+    """Review: a worker whose controller died SIGKILLed its group at once, so its campaign handler never stopped the
+    natemu it started (its own session). Now the group gets SIGTERM first and SIGKILL only after WORKER_GRACE."""
+    import textwrap
+    dead = subprocess.Popen(['true']); dead.wait()
+    script = tmp_path / 'worker.py'
+    script.write_text(textwrap.dedent(f'''
+        import subprocess, sys, threading, time
+        sys.path.insert(0, {str(paths.repo_root())!r})
+        from testkit import runloop
+        from testkit.harness import campaign
+        runloop.WORKER_GRACE = 2
+        vm = subprocess.Popen(['sleep', '60'], start_new_session=True)
+        campaign._LIVE.add(vm); campaign._on_term()
+        stubborn = subprocess.Popen([sys.executable, '-c',
+                                     'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])
+        print(vm.pid, stubborn.pid, flush=True)
+        time.sleep(1)                      # the stubborn child ignores SIGTERM before the controller is found dead
+        threading.Thread(target=runloop.Worker.watch, args=({dead.pid},), daemon=True).start()
+        time.sleep(60)
+    '''))
+    w = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    vm, stubborn = map(int, w.stdout.readline().split())
+    try:
+        assert _gone_within(vm, 20), 'the VM outlived its orphaned worker'
+        w.wait(20)
+        assert _gone_within(stubborn, 20), 'a child ignoring SIGTERM outlived the grace'
+    finally:
+        for p in (vm, stubborn, w.pid):
+            if _alive(p): os.kill(p, 9)
+
+
+def test_kill_waits_longer_than_a_campaign_stop(tmp_path):
+    """Review: kill() sent SIGKILL 5 s after SIGTERM, while a campaign worker's handler may take campaign.STOP_WAIT
+    (natemu's clean stop, then its SIGKILL) to stop its VM."""
+    from testkit import runloop
+    from testkit.harness import campaign
+    assert runloop.KILL_GRACE > campaign.STOP_WAIT and runloop.WORKER_GRACE > campaign.STOP_WAIT
+    mark = tmp_path / 'stopped'
+    slow = (f'import pathlib, signal, sys, time\n'
+            f'def h(*_): time.sleep(6); pathlib.Path({str(mark)!r}).write_text("x"); sys.exit(0)\n'
+            f'signal.signal(signal.SIGTERM, h)\nprint(flush=True)\ntime.sleep(60)\n')
+    p = subprocess.Popen([sys.executable, '-c', slow], start_new_session=True, stdout=subprocess.PIPE)
+    p.stdout.readline()
+
+    class U: proc, ended = p, None
+    runloop.Controller.kill(None, U())
+    assert mark.exists()

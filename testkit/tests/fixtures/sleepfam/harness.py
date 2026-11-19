@@ -1,4 +1,4 @@
-import json, os, signal, time
+import json, os, pathlib, signal, time
 
 from testkit.harness import CaseResult, Requirement
 from testkit.resources import Unpreparable
@@ -17,6 +17,12 @@ class Sleep:
         out = {}
         for it in batch:
             if it.case == it.suite.params.get('die'): os.kill(os.getpid(), signal.SIGKILL)
+            if it.suite.params.get('vm'):          # a stand-in for natemu: its own session, stopped by campaign's handler
+                import subprocess
+                from testkit.harness import campaign
+                p = subprocess.Popen(['sleep', '300'], start_new_session=True)
+                campaign._LIVE.add(p); campaign._on_term()
+                pathlib.Path(os.environ['HOLD_PID']).write_text(str(p.pid))
             t0 = time.time(); time.sleep(it.suite.params['seconds']); t1 = time.time()
             if log := os.environ.get('SLEEP_LOG'):
                 with open(log, 'a') as f:

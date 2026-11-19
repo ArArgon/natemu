@@ -27,3 +27,9 @@ name = "needsbad"
 kind = "judged"
 harness = "harness.py:Sleep"
 params = { n = 1, seconds = 0.1, resource = "bad" }
+
+[[suite]]
+name = "hold"
+kind = "judged"
+harness = "harness.py:Sleep"
+params = { n = 1, seconds = 60, vm = true }

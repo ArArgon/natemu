@@ -29,6 +29,12 @@ from testkit.sched.policy import GATE, INTERACTIVE, Request
 POLL = 0.1
 LOCK_GIVE_BACK = 10.0               # s a grant may wait for the old VM lock before it goes back to the queue
 NO_RAW_CACHES = {'NATEMU_REF_CACHE': 'off', 'NATEMU_ASM_CACHE': 'off', 'NATEMU_QEMU_CACHE': 'off'}
+# A stopped worker's group gets SIGTERM, then SIGKILL this long after (if still there): longer than a campaign worker's
+# handler may take to stop the natemu it started (testkit.harness.campaign.STOP_WAIT), which a SIGKILL to the group
+# would miss (natemu runs in its own session). KILL_GRACE: the controller stopping a unit; WORKER_GRACE: a worker
+# whose controller died stopping itself.
+KILL_GRACE = 30.0
+WORKER_GRACE = 30.0
 
 
 class Unit:
@@ -208,7 +214,7 @@ class Controller:
                 self.show_waiting(waiting, running)
                 time.sleep(POLL)
         finally:
-            for u in running: self.kill(u)
+            self.kill(*running)
             for u in waiting + running: self.pool.release(u.req.id)
             self.save_timings()
 
@@ -286,7 +292,7 @@ class Controller:
                 hook.pytest_runtest_logfinish(nodeid=rep.nodeid, location=rep.location)
 
     def finish(self, u: Unit) -> None:
-        if u.proc.poll() is None: self.kill(u, 'timed out after %.0f s' % u.timeout)
+        if u.proc.poll() is None: self.kill(u, why='timed out after %.0f s' % u.timeout)
         self.tail(u)
         u.ended = time.time()
         code = u.proc.returncode
@@ -310,14 +316,23 @@ class Controller:
                 d = ev['data']; total[d['nodeid']] = total.get(d['nodeid'], 0) + d.get('duration', 0)
         durations.record_many({k: v for k, v in total.items() if k in {i.nodeid for i in u.items}})
 
-    def kill(self, u: Unit, why: str = 'run interrupted') -> None:
-        u.killed = why
-        if u.ended is None: u.ended = time.time()
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try: os.killpg(u.proc.pid, sig)
-            except ProcessLookupError: break
-            try: u.proc.wait(5); break
-            except subprocess.TimeoutExpired: continue
+    def kill(self, *us: Unit, why: str = 'run interrupted') -> None:
+        """SIGTERM to each unit's worker group, then SIGKILL to the groups whose worker is still there after
+        KILL_GRACE (one wait for all of them)."""
+        for u in us:
+            u.killed = why
+            if u.ended is None: u.ended = time.time()
+        live = []
+        for u in us:
+            try: os.killpg(u.proc.pid, signal.SIGTERM); live.append(u)
+            except ProcessLookupError: pass
+        end = time.monotonic() + KILL_GRACE
+        for u in live:
+            try: u.proc.wait(max(0.0, end - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                try: os.killpg(u.proc.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                u.proc.wait()
 
     def show_waiting(self, waiting, running):
         """Say once, when it changes, why the next unit waits (R7.3)."""
@@ -337,11 +352,42 @@ def pytest_runtestloop(session):
     if not any(isinstance(i, CaseItem) for i in session.items): return None     # plain pytest: pytest's own loop
     if cfg.option.collectonly: return None
     c = Controller(session)
-    c.prepare_only() if cfg.getoption('testkit_prepare_only') else c.run()
+    with interrupt_on_term():
+        c.prepare_only() if cfg.getoption('testkit_prepare_only') else c.run()
     return True
 
 
+@contextlib.contextmanager
+def interrupt_on_term():
+    """SIGTERM and SIGHUP (`kill PID`, a closed terminal) raise KeyboardInterrupt, as Ctrl-C does, so the run loop's
+    cleanup runs: its workers are stopped (and the VMs they started), its claims released. Without it the controller
+    died at once and an orphaned worker's VM held cores and every exclusive window. Once one arrived, later ones are
+    ignored, so they do not cut that cleanup short (SIGKILL still ends it)."""
+    if threading.current_thread() is not threading.main_thread():
+        yield; return
+    sigs = (signal.SIGTERM, signal.SIGHUP)
+    prev = {s: signal.getsignal(s) for s in sigs}
+
+    def handler(signum, frame):
+        for s in sigs: signal.signal(s, signal.SIG_IGN)
+        raise KeyboardInterrupt
+    for s in sigs: signal.signal(s, handler)
+    try:
+        yield
+    finally:
+        for s, h in prev.items(): signal.signal(s, h)
+
+
 # --- worker side ---
+
+_REAPER = """
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pg, grace = int(sys.argv[1]), float(sys.argv[2])
+os.killpg(pg, signal.SIGTERM)
+time.sleep(grace)               # the group, this helper a member of it, cannot be reused meanwhile
+os.killpg(pg, signal.SIGKILL)   # this helper included
+"""
 
 class Worker:
     def __init__(self, config):
@@ -352,11 +398,19 @@ class Worker:
 
     @staticmethod
     def watch(pid):
+        """The controller died: its claim is gone, so this worker stops with every child, as the controller's kill()
+        would have stopped it: SIGTERM to the group (the campaign harness's handler stops the natemu it started, in its
+        own session; a runner script gets it too), then SIGKILL to whatever is left after WORKER_GRACE. A helper in the
+        group, ignoring SIGTERM, sends both, so the SIGKILL still comes once this worker has exited."""
         while True:
             try: os.kill(pid, 0)
-            except ProcessLookupError:                  # the controller died: its claim is gone, so stop with every child
-                os.killpg(0, signal.SIGKILL)
+            except ProcessLookupError: break
             time.sleep(1)
+        try:
+            subprocess.Popen([sys.executable, '-c', _REAPER, str(os.getpgrp()), str(WORKER_GRACE)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        except OSError:
+            os.killpg(0, signal.SIGKILL)
 
     def pytest_collection_modifyitems(self, session, config, items):
         want = [l for l in pathlib.Path(config.getoption('testkit_worker')).read_text().splitlines() if l]

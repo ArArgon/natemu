@@ -130,23 +130,29 @@ _LIVE: set = set()          # natemu processes this worker started (each in its 
 
 
 def _on_term() -> None:
-    """Once per process: on SIGTERM (the run loop stopping this worker: Ctrl-C, a unit timeout, the controller ending)
-    stop every natemu this worker started before exiting, so no VM outlives its unit or its cap."""
+    """Once per process: on SIGTERM (the run loop stopping this worker: Ctrl-C, a unit timeout, the controller ending
+    or dying) stop every natemu this worker started before exiting, so no VM outlives its unit or its cap. It then
+    raises KeyboardInterrupt, which ends the pytest session (a SystemExit inside a test only fails that test, and the
+    next one would boot another VM)."""
     if getattr(_on_term, 'done', False) or threading.current_thread() is not threading.main_thread(): return
     prev = signal.getsignal(signal.SIGTERM)
 
     def handler(signum, frame):
         for p in list(_LIVE): _stop(p)
         if callable(prev): prev(signum, frame)
-        raise SystemExit(128 + signum)
+        raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, handler)
     atexit.register(lambda: [_stop(p) for p in list(_LIVE)])
     _on_term.done = True
 
 
+STOPS = ((signal.SIGINT, 10), (signal.SIGKILL, 5))      # _stop's signals and the seconds it waits after each
+STOP_WAIT = sum(w for _, w in STOPS)                   # the longest a stop takes (testkit.runloop waits longer)
+
+
 def _stop(p: subprocess.Popen) -> None:
     """SIGINT first (natemu's clean stop, as boot.py does), then SIGKILL to the whole group (fexc workers included)."""
-    for sig, wait in ((signal.SIGINT, 10), (signal.SIGKILL, 5)):
+    for sig, wait in STOPS:
         if p.poll() is not None: return
         try: os.killpg(p.pid, sig)
         except ProcessLookupError: return
