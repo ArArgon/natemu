@@ -8,8 +8,9 @@
   and a #PF under TF; instruction breakpoints at a loop head, mid-block, a kept system instruction, inside an
   instruction, after MOV SS, at a REP, with LEN 11, a single-step trap landing on one; DR6/DR7 read-back, DR4/DR5
   aliases and DR7.GD; sticky DR6; SYSRET and SYSCALL with TF) at block sizes default and 1. Each event log is judged
-  against `debug.expect` (written from the SDM); registers and captured memory are compared with pinned QEMU system mode,
-  whose own log is judged too and reported (a QEMU departure from the SDM is listed, not a natemu failure).
+  against `debug.expect` and the registers a program reads its results into against `debug.expect_regs` (both written
+  from the SDM). (Pinned QEMU, once compared here, keeps DR6 bit 12 written as 1, and ends a REP OUTSB after the element
+  that met an I/O breakpoint.)
 - `cases`: natemu-only, judged by the SDM rules: HLT under TF (#DB with RIP after the HLT, no park; delivery_model A10),
   and the refusals of data and I/O breakpoints (`unsupported_system`), an instruction breakpoint with LEN 01.
 
@@ -18,39 +19,13 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import case_results, ref, run_slice1_vm as vm, run_slice3_vm as s3, smp, debug, answers  # noqa: E402
-
-
-# Where pinned QEMU departs from the SDM in a register (the SDM's value is judged by `debug.expect` or below): the
-# compare's line prefix and why.
-QEMU_DIFFERS = {'s4-dr': {'cpu0 r8:': 'QEMU keeps DR6 bit 12 written as 1; SDM Vol.3 18.2.3: bit 12 is reserved and reads 0'},
-                's4-d-io': {'cpu0 rsi:': 'QEMU ends REP OUTSB after the element that met an I/O breakpoint (RIP past it, one element moved); '
-                                         'SDM 18.3.1.2: a trap between iterations, the REP resumes'}}
-
-
-def not_compared(name, qemu_vs_sdm):
-    """What the comparison with QEMU leaves out: the registers QEMU_DIFFERS names, the log region where QEMU's log departs
-    from the SDM (a view of both states, so a hash-only locked answer compares the same fields)."""
-    regs = sorted(smp.REGS.index(k.split()[1].rstrip(':')) for k in QEMU_DIFFERS.get(name, {}))
-    if not regs and not qemu_vs_sdm: return None
-    def change(st):
-        for k in regs: st['cpus'][0] = {**st['cpus'][0], 'gpr': [0 if j == k else x for j, x in enumerate(st['cpus'][0]['gpr'])]}
-        if qemu_vs_sdm: st['memory'] = [m for m in st['memory'] if m['addr'] != debug.LOG]
-    return f"not-compared/{','.join(map(str, regs))}/{'log' if qemu_vs_sdm else ''}", change
+import case_results, ref, run_slice1_vm as vm, run_slice3_vm as s3, smp, debug  # noqa: E402
 
 
 def programs(a, report):
     failures, rows = [], []
     for name in a.programs or debug.PROGRAMS:
         prog = debug.program(name)
-        try:
-            want = s3.qemu_reference(prog, a.out / 'qemu' / name)
-            mem = lambda w: {r['addr']: r['data'] for r in w['memory']}
-            qemu_vs_sdm = answers.derive(want, 'sdm', lambda w: debug.judge(prog, debug.log_of(prog, mem(w))))
-            try: qlog = debug.log_of(prog, mem(want))
-            except answers.Unavailable: qlog = []      # (NATEMU_ANSWERS=locked, a hash-only answer: QEMU's log is not stored)
-        except RuntimeError as e:   # QEMU itself fails (recorded as its departure; natemu is judged by the SDM alone)
-            want, qlog, qemu_vs_sdm = None, [], [f'QEMU did not finish: {str(e)[:200]}']
         for block in (None, 1):
             rc, out, err = s3.driver(a.host, a.runtime, a.fexc, s3.smp_description(prog), a.out / 'vm' / f'{name}-{block}', [block] if block else [], timeout=300)
             if out is None:
@@ -60,18 +35,16 @@ def programs(a, report):
             memory = {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpu['memory']}
             log = debug.log_of(prog, memory)
             vs_sdm = debug.judge(prog, log)
-            vs_qemu = s3.judge_smp(prog, want, out, [None], view=not_compared(name, qemu_vs_sdm)) if want else []
+            end = s3.body_end(prog, smp.num(prog['cpus'][0]['rip']))
+            if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end:
+                vs_sdm.append(f"stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
+            vs_sdm += s3.per_vcpu_checks(cpu) + debug.judge_regs(prog, [smp.num(x) for x in cpu['gpr']])
             st = cpu['stats']
-            rows.append({'program': name, 'block': block, 'events': len(log), 'sdm': vs_sdm, 'qemu': vs_qemu, 'qemu_vs_sdm': qemu_vs_sdm,
-                         'log': debug.show(prog, log), 'qemu_log': debug.show(prog, qlog), 'expected': debug.show(prog, debug.expect(prog)),
+            rows.append({'program': name, 'block': block, 'events': len(log), 'sdm': vs_sdm,
+                         'log': debug.show(prog, log), 'expected': debug.show(prog, debug.expect(prog)),
                          **{k: st.get(k) for k in ('debug_steps', 'debug_traps', 'code_breaks', 'steps', 'requests', 'systems')}})
-            print(f"{name:14} block={block}: {len(log)} events, SDM {'ok' if not vs_sdm else vs_sdm}, QEMU {'ok' if not vs_qemu else vs_qemu[:3]}"
-                  f"{'' if not qemu_vs_sdm else ' (QEMU departs from the SDM: ' + '; '.join(qemu_vs_sdm[:3]) + ')'}", flush=True)
+            print(f"{name:14} block={block}: {len(log)} events, SDM {'ok' if not vs_sdm else vs_sdm}", flush=True)
             failures += [f'{name} block={block} SDM: {d}' for d in vs_sdm]
-            # Registers and memory must equal QEMU's; the log region only where QEMU's log follows the SDM, and a register
-            # only where QEMU_DIFFERS does not name it.
-            failures += [f'{name} block={block} QEMU: {d}' for d in vs_qemu
-                         if not (qemu_vs_sdm and d.startswith(f'region {debug.LOG:#x}')) and not any(d.startswith(k) for k in QEMU_DIFFERS.get(name, {}))]
     report['programs'] = {'rows': rows, 'failures': failures}
     return failures
 

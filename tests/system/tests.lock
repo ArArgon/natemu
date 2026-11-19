@@ -151,23 +151,6 @@ repro = "65d2c1f56d65 image_sha256=73f351a6a38fa0d4b7c736a7e8771437b6dc0425082bc
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers.085dda07a3d2cebf7dee04a140cb057d4537416af20c40fee4573f3efd933cec]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=aba7053a89c88bf75e103608bb7f38310d406f80f3b608d319deca80c7817f57"
-sha256 = "a6149707867a6e5779c7bffc19db1caa27a1f41b441091fea0ecbc67ed5dcf18"
-
-[answers."085dda07a3d2cebf7dee04a140cb057d4537416af20c40fee4573f3efd933cec#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=aba7053a89c88bf75e103608bb7f38310d406f80f3b608d319deca80c7817f57"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."085dda07a3d2cebf7dee04a140cb057d4537416af20c40fee4573f3efd933cec#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=aba7053a89c88bf75e103608bb7f38310d406f80f3b608d319deca80c7817f57"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
 [answers.09e6f13f85e5aae16748c7b0b8aac965d1d701c8c4688314f8604fb2c3f87111]
 aux = "{\"ncpu\":2}"
 repro = "e80825087ff0 image_sha256=0b6deafa81bafaa80f4fe4b9189a932d7c6833b8cf0755ff02b18645b6b01a17"
@@ -526,23 +509,6 @@ repro = "332505b5827a image_sha256=3d4e9b7579680000f1d1dd4b8395b1c9abec490c76793
 sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
 value = "[]"
 
-[answers.2d4b31c0a997da0dc245b5221e2fbcb22a61d44180474c057e1e5232d6e408a4]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=c93edbd0c78b20f550ec568990c2f10cc977ceed9677ce17c44c149e11f3cb55"
-sha256 = "30bd771dc4223422f25901e8cfdfa4645f271053f0e9f5613b8e11ada1d8c313"
-
-[answers."2d4b31c0a997da0dc245b5221e2fbcb22a61d44180474c057e1e5232d6e408a4#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=c93edbd0c78b20f550ec568990c2f10cc977ceed9677ce17c44c149e11f3cb55"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."2d4b31c0a997da0dc245b5221e2fbcb22a61d44180474c057e1e5232d6e408a4#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=c93edbd0c78b20f550ec568990c2f10cc977ceed9677ce17c44c149e11f3cb55"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
 [answers.2d78ae04c1381cf33db60d4d24ee1fc09ee48d400d7694cf45f794a1856c4380]
 aux = "{\"ncpu\":2}"
 repro = "e80825087ff0 image_sha256=2f27f4ae7a359ba58df96b632e71f579ef51ac383b614f963922e0b8484d66ad"
@@ -565,23 +531,6 @@ repro = "65d2c1f56d65 image_sha256=e6b81e41293766730db446e8ae3aa723bcf8d6ed33541
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers.2e591eba2c3e7698dc18c6006f0254e7d792df7439e6899df3af0bb7ac8d81bc]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=4d2f1547132bedd393ea77176788d0811a79967c8d6aa55ceacafa3843e302ac"
-sha256 = "675d1c4bf0ae0903440c961620308a90d652310fa4eae51d4e575253e908915c"
-
-[answers."2e591eba2c3e7698dc18c6006f0254e7d792df7439e6899df3af0bb7ac8d81bc#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=4d2f1547132bedd393ea77176788d0811a79967c8d6aa55ceacafa3843e302ac"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."2e591eba2c3e7698dc18c6006f0254e7d792df7439e6899df3af0bb7ac8d81bc#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=4d2f1547132bedd393ea77176788d0811a79967c8d6aa55ceacafa3843e302ac"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
 [answers.2f37f1597da5eb147f22b813e11950fff6ec373348dc18721a61923a7e55701d]
 aux = "{\"ncpu\":1}"
 repro = "cffd119a4098 image_sha256=29ff9b0cb13a1f8b042f10b656fcfe733cf07c51cded35a4268bc755a5c570ac"
@@ -597,27 +546,6 @@ value = "exit 1"
 aux = "{\"ncpu\":1}"
 repro = "4d2e079b2949 image_sha256=29ff9b0cb13a1f8b042f10b656fcfe733cf07c51cded35a4268bc755a5c570ac"
 sha256 = "7bf67803bf548bab438cb4d644f624b15c83ba9da8dd3ae2e3e02376f47e147e"
-
-[answers.3077f68c560a4e447b507626d4c29841353d5e0968fe5cd049eecaa34f17141a]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=f677163201bc8f272fcfc6bd328050754a80f766797838e9c28088e531bce0a1"
-sha256 = "9992205265537397d377f48ad588a2d0747d959d06bd4e6ae979c5ca5fe3ec42"
-
-[answers."3077f68c560a4e447b507626d4c29841353d5e0968fe5cd049eecaa34f17141a#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=f677163201bc8f272fcfc6bd328050754a80f766797838e9c28088e531bce0a1"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."3077f68c560a4e447b507626d4c29841353d5e0968fe5cd049eecaa34f17141a#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x110068 0x8 0x0 0xffff0ff1, got 0x1 0x110076 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x110076 0x8 0x0 0xffff0ff1, got 0x1 0x110084 0x8 0x0 0xffff0ff1\",\"entry 2: want 0x1 0x110084 0x8 0x0 0xffff0ff2, got 0x1 0x110092 0x8 0x0 0xffff0ff2\",\"entry 3: want 0x1 0x110092 0x8 0x0 0xffff0ff2, got 0x1 0x1100d0 0x8 0x0 0xffff0ff1\",\"entry 4: want 0x1 0x1100c0 0x8 0x0 0xffff0ff1, got 0x1 0x1100e0 0x8 0x0 0xffff0ff1\",\"entry 5: want 0x1 0x1100d0 0x8 0x0 0xffff0ff3, got 0x1 0x1100f0 0x8 0x0 0xffff0ff2\",\"entry 6: want 0x1 0x1100e0 0x8 0x0 0xffff0ff2, got 0x1 0x11012a 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x1100f0 0x8 0x0 0xffff0ff2, got 0x1 0x110138 0x8 0x0 0xffff0ff1\",\"entry 8: want 0x1 0x11011c 0x8 0x0 0xffff0ff1, got 0x1 0x110146 0x8 0x0 0xffff0ff2\",\"entry 9: want 0x1 0x11012a 0x8 0x0 0xffff0ff3, got 0x1 0x110184 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x110138 0x8 0x0 0xffff0ff2, got 0x1 0x110194 0x8 0x0 0xffff0ff1\",\"entry 11: want 0x1 0x110146 0x8 0x0 0xffff0ff2, got 0x1 0x1101a4 0x8 0x0 0xffff0ff2\",\"entry 12: want ('0x1', '0x110174'), got None\",\"entry 13: want ('0x1', '0x110184'), got None\",\"entry 14: want ('0x1', '0x110194'), got None\",\"entry 15: want ('0x1', '0x1101a4'), got None\"]}"
-repro = "f388a2de00da image_sha256=f677163201bc8f272fcfc6bd328050754a80f766797838e9c28088e531bce0a1"
-sha256 = "f95d735806c936146f5c0876236bca189d98399f09bdca7403534d869b95695a"
-
-[answers."3077f68c560a4e447b507626d4c29841353d5e0968fe5cd049eecaa34f17141a/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=f677163201bc8f272fcfc6bd328050754a80f766797838e9c28088e531bce0a1"
-sha256 = "b874ed5db3e1cc068fa2dac74653b853d4870597d33a94e944bfbac2c9ed533a"
 
 [answers.317350c3c80414f2ef0da7c4f646c830362231187251bcb08e8767d875ad13f1]
 aux = "{\"ncpu\":2}"
@@ -706,23 +634,6 @@ aux = "{\"rc\":1}"
 repro = "8b032f987b23 image_sha256=24f5c0ec47815e2efd31376417955ccdd174ba0515ccde7296d915c42c3a0c77"
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
-
-[answers.3bc1d4a9005dacf527948083b5a5f6f2aa0d104e50b342cdb785ec1a28aa88b5]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=5a2cf545a6192bb84e9a158b4adf9b673b293734c50e8429c5767affc8333993"
-sha256 = "0c1d398fbeb0bb2cfcca33c42ff5fb05921c401724c0feff69aac674b8840c22"
-
-[answers."3bc1d4a9005dacf527948083b5a5f6f2aa0d104e50b342cdb785ec1a28aa88b5#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=5a2cf545a6192bb84e9a158b4adf9b673b293734c50e8429c5767affc8333993"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."3bc1d4a9005dacf527948083b5a5f6f2aa0d104e50b342cdb785ec1a28aa88b5#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=5a2cf545a6192bb84e9a158b4adf9b673b293734c50e8429c5767affc8333993"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
 
 [answers.3d79e71a0710b96a1b1db857d6f11a49373fb2246c05140fdd3ec2cd752d11cf]
 aux = "{\"ncpu\":1}"
@@ -892,45 +803,6 @@ aux = "{\"ncpu\":1}"
 repro = "4be5ec924d3a image_sha256=91474140d3e3aba212f8c64c77a04882ceb45cf33de5a4bca40396db2d42428d"
 sha256 = "2be60fad51b7e91f6c922dc3b9ab9e69175a290f249a927ba3ace2e47681a6b9"
 
-[answers.47057cb38d96834b54f66b70efb1934129ef72f2a6a6fc4f7c754df8228b8e22]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=d32c9f9ed6bf7ed023dc3d48f0e6929d94c73a601caf11cfe3ab7b223448ef07"
-sha256 = "a4468daaeb75197b4b9ff5e962f911072813a6f17aa0ce61e02eab1abf5f74a9"
-
-[answers."47057cb38d96834b54f66b70efb1934129ef72f2a6a6fc4f7c754df8228b8e22#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=d32c9f9ed6bf7ed023dc3d48f0e6929d94c73a601caf11cfe3ab7b223448ef07"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."47057cb38d96834b54f66b70efb1934129ef72f2a6a6fc4f7c754df8228b8e22#sdm"]
-aux = "{\"value\":[\"entry 2: want 0x1 0x11004f 0x8 0x100 0xffff4ff0, got 0x1 0x11004d 0x8 0x10100 0xffff4ff0\",\"entry 3: want 0x1 0x110050 0x8 0x100 0xffff4ff0, got 0x1 0x11004f 0x8 0x100 0xffff4ff0\",\"entry 4: want 0x1 0x110058 0x8 0x100 0xffff4ff0, got 0x1 0x110050 0x8 0x100 0xffff4ff0\",\"entry 5: want 0x1 0x110059 0x8 0x0 0xffff4ff0, got 0x1 0x110058 0x8 0x100 0xffff4ff0\",\"entry 6: want None, got ('0x1', '0x110059')\"]}"
-repro = "f388a2de00da image_sha256=d32c9f9ed6bf7ed023dc3d48f0e6929d94c73a601caf11cfe3ab7b223448ef07"
-sha256 = "8ff17d1f0f2ecd6542ea833f36951cf5dd2e5484ca9062c9376ea23876c9d13a"
-value = "[\"entry 2: want 0x1 0x11004f 0x8 0x100 0xffff4ff0, got 0x1 0x11004d 0x8 0x10100 0xffff4ff0\",\"entry 3: want 0x1 0x110050 0x8 0x100 0xffff4ff0, got 0x1 0x11004f 0x8 0x100 0xffff4ff0\",\"entry 4: want 0x1 0x110058 0x8 0x100 0xffff4ff0, got 0x1 0x110050 0x8 0x100 0xffff4ff0\",\"entry 5: want 0x1 0x110059 0x8 0x0 0xffff4ff0, got 0x1 0x110058 0x8 0x100 0xffff4ff0\",\"entry 6: want None, got ('0x1', '0x110059')\"]"
-
-[answers."47057cb38d96834b54f66b70efb1934129ef72f2a6a6fc4f7c754df8228b8e22/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=d32c9f9ed6bf7ed023dc3d48f0e6929d94c73a601caf11cfe3ab7b223448ef07"
-sha256 = "3daf8926409f0f0e7cb7ff6d3d1f40d8ad71460ffb89c252b4db595eb8cacd2d"
-
-[answers.47168c43acbd574ad8cc549e9d12139d442b05b6640840c7b0377a06f60ddf2c]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=71a620dc0bbc6f44e28c10ae520368ce4638d8cc8e6bc43b2a109aaab2465020"
-sha256 = "4ddcd8a76188add4b241d6d50e352b4675bb1112239610f7370e85fa6a0ca9de"
-
-[answers."47168c43acbd574ad8cc549e9d12139d442b05b6640840c7b0377a06f60ddf2c#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=71a620dc0bbc6f44e28c10ae520368ce4638d8cc8e6bc43b2a109aaab2465020"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."47168c43acbd574ad8cc549e9d12139d442b05b6640840c7b0377a06f60ddf2c#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=71a620dc0bbc6f44e28c10ae520368ce4638d8cc8e6bc43b2a109aaab2465020"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
 [answers.47487418b81bd632171103b2b017fc975ae7c6b784b40361015cd3549d253430]
 aux = "{\"ncpu\":2}"
 repro = "e80825087ff0 image_sha256=967098a2883b33bca07405147a0ec745590a108da77f00fb7fccbd956786fee4"
@@ -968,28 +840,6 @@ value = "exit 1"
 aux = "{\"ncpu\":1}"
 repro = "de08b0050cb0 image_sha256=d2f95753a9fa17d427377ba66b58e49290aa39d3f352df8f16ec7ca068d40e97"
 sha256 = "56474fd99b8139c602ee2bb70bb8f379146d75feabc1bd14538651ed59f3bfd0"
-
-[answers.4d2ab5c038998f872ca46ea570b73de1df2206f18d826c1b681f8b9992f976ae]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=24eece7f12641d8a699be62b9382f15eef865b4c38d60846daf9d779928c8b61"
-sha256 = "5334da7a5a3c639737f118583e069bd064ba9efd304b5efc27dba9bd834ce9e3"
-
-[answers."4d2ab5c038998f872ca46ea570b73de1df2206f18d826c1b681f8b9992f976ae#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=24eece7f12641d8a699be62b9382f15eef865b4c38d60846daf9d779928c8b61"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."4d2ab5c038998f872ca46ea570b73de1df2206f18d826c1b681f8b9992f976ae#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x11005b 0x8 0x10000 0xffff0ff1, got 0x1 0x11005d 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x11005d 0x8 0x0 0xffff0ff1, got 0x1 0x11006e 0x8 0x0 0xffff0ff2\",\"entry 2: want 0x1 0x11006c 0x8 0x10000 0xffff0ff2, got 0x1 0x110074 0x8 0x0 0xffff0ff2\",\"entry 3: want 0x1 0x110074 0x8 0x0 0xffff0ff2, got 0x1 0x110085 0x8 0x0 0xffff0ff2\",\"entry 4: want 0x1 0x110085 0x8 0x0 0xffff0ff2, got 0x1 0x110087 0x8 0x0 0xffff0ff2\",\"entry 5: want 0x1 0x110085 0x8 0x10000 0xffff0ff2, got 0x1 0x110093 0x8 0x0 0xffff0ff2\",\"entry 6: want ('0x1', '0x110093'), got None\"]}"
-repro = "f388a2de00da image_sha256=24eece7f12641d8a699be62b9382f15eef865b4c38d60846daf9d779928c8b61"
-sha256 = "1b4a0406e21e83030eae7ef40e24d091e003cb2db08f41c8b8eeab00f6e7bada"
-value = "[\"entry 0: want 0x1 0x11005b 0x8 0x10000 0xffff0ff1, got 0x1 0x11005d 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x11005d 0x8 0x0 0xffff0ff1, got 0x1 0x11006e 0x8 0x0 0xffff0ff2\",\"entry 2: want 0x1 0x11006c 0x8 0x10000 0xffff0ff2, got 0x1 0x110074 0x8 0x0 0xffff0ff2\",\"entry 3: want 0x1 0x110074 0x8 0x0 0xffff0ff2, got 0x1 0x110085 0x8 0x0 0xffff0ff2\",\"entry 4: want 0x1 0x110085 0x8 0x0 0xffff0ff2, got 0x1 0x110087 0x8 0x0 0xffff0ff2\",\"entry 5: want 0x1 0x110085 0x8 0x10000 0xffff0ff2, got 0x1 0x110093 0x8 0x0 0xffff0ff2\",\"entry 6: want ('0x1', '0x110093'), got None\"]"
-
-[answers."4d2ab5c038998f872ca46ea570b73de1df2206f18d826c1b681f8b9992f976ae/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=24eece7f12641d8a699be62b9382f15eef865b4c38d60846daf9d779928c8b61"
-sha256 = "44d0d0a63f0e8dd817c3e4c1dd4cb42242a08494a7fc510b83b231bf0e78be52"
 
 [answers.4d492ec43e3046fa02551f011db1cb898e80db260500ffad11aa4fa6709f1b83]
 aux = "{\"ncpu\":1}"
@@ -1208,49 +1058,6 @@ repro = "e347344be5f6 image_sha256=1d5616dfda2d8234a0d4fa40de213cedea5fabb542dfc
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers.5b0ff4cc36f17baa9cbfd27d13734c3eec27651f2a6badf7fd1899e1a2b29750]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=7f186421ba439fe5a2c1faf8398036cf20bcdf24b4a7331667788f58adcaba8e"
-sha256 = "80c7105016ad935c08768194b097adf868ae70269484ab414fb92f72b2a2164e"
-
-[answers."5b0ff4cc36f17baa9cbfd27d13734c3eec27651f2a6badf7fd1899e1a2b29750#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=7f186421ba439fe5a2c1faf8398036cf20bcdf24b4a7331667788f58adcaba8e"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."5b0ff4cc36f17baa9cbfd27d13734c3eec27651f2a6badf7fd1899e1a2b29750#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x110246 0x8 0x0 0xffff0ff1, got 0x1 0x110159 0x8 0x0 0xffff0ff1\",\"entry 1: want ('0x21', '0x110078'), got None\",\"entry 2: want ('0x1', '0x110146'), got None\"]}"
-repro = "f388a2de00da image_sha256=7f186421ba439fe5a2c1faf8398036cf20bcdf24b4a7331667788f58adcaba8e"
-sha256 = "1fb0de848f92ddda2522a1021d1cc00e8d68506fb8cc521d0ea812eb69ca6a13"
-value = "[\"entry 0: want 0x1 0x110246 0x8 0x0 0xffff0ff1, got 0x1 0x110159 0x8 0x0 0xffff0ff1\",\"entry 1: want ('0x21', '0x110078'), got None\",\"entry 2: want ('0x1', '0x110146'), got None\"]"
-
-[answers."5b0ff4cc36f17baa9cbfd27d13734c3eec27651f2a6badf7fd1899e1a2b29750/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=7f186421ba439fe5a2c1faf8398036cf20bcdf24b4a7331667788f58adcaba8e"
-sha256 = "a62a8374ead1f11e87e31e5842e6f4beecadccf026fa691ad00bbd69ca075b40"
-
-[answers.5c825baaf24d0cf1fbd6408da0123a52b52fe71804cde6f3a34c5515a5219af2]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=bdf71d11af9605ea336c1fffc0dc5af248f7461fc25c2ca531ee312aa63c4346"
-sha256 = "c4e58b112d22cd492726a874f56e51d3425781c611fb9e7c05e063ab648d8588"
-
-[answers."5c825baaf24d0cf1fbd6408da0123a52b52fe71804cde6f3a34c5515a5219af2#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=bdf71d11af9605ea336c1fffc0dc5af248f7461fc25c2ca531ee312aa63c4346"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."5c825baaf24d0cf1fbd6408da0123a52b52fe71804cde6f3a34c5515a5219af2#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x110061 0x8 0x0 0xffff0ff1, got 0x1 0x11006f 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x110068 0x8 0x0 0xffff0ff1, got 0x1 0x110076 0x8 0x0 0xffff0ff1\",\"entry 2: want 0x1 0x11006f 0x8 0x0 0xffff0ff1, got 0x1 0x11007d 0x8 0x0 0xffff0ff1\",\"entry 3: want 0x1 0x110076 0x8 0x0 0xffff0ff1, got 0x1 0x110084 0x8 0x0 0xffff0ff1\",\"entry 4: want 0x1 0x11007d 0x8 0x0 0xffff0ff2, got 0x1 0x11008b 0x8 0x0 0xffff0ff2\",\"entry 5: want 0x1 0x110084 0x8 0x0 0xffff0ff2, got 0x1 0x110092 0x8 0x0 0xffff0ff2\",\"entry 6: want 0x1 0x11008b 0x8 0x0 0xffff0ff2, got 0x1 0x1100c8 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x110092 0x8 0x0 0xffff0ff2, got 0x1 0x1100d0 0x8 0x0 0xffff0ff1\",\"entry 8: want 0x1 0x1100b8 0x8 0x0 0xffff0ff1, got 0x1 0x1100d8 0x8 0x0 0xffff0ff1\",\"entry 9: want 0x1 0x1100c0 0x8 0x0 0xffff0ff1, got 0x1 0x1100e0 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x1100c8 0x8 0x0 0xffff0ff3, got 0x1 0x1100e8 0x8 0x0 0xffff0ff2\",\"entry 11: want 0x1 0x1100d0 0x8 0x0 0xffff0ff3, got 0x1 0x1100f0 0x8 0x0 0xffff0ff2\",\"entry 12: want 0x1 0x1100d8 0x8 0x0 0xffff0ff2, got 0x1 0x110123 0x8 0x0 0xffff0ff1\",\"entry 13: want 0x1 0x1100e0 0x8 0x0 0xffff0ff2, got 0x1 0x11012a 0x8 0x0 0xffff0ff1\",\"entry 14: want 0x1 0x1100e8 0x8 0x0 0xffff0ff2, got 0x1 0x110131 0x8 0x0 0xffff0ff1\",\"entry 15: want 0x1 0x1100f0 0x8 0x0 0xffff0ff2, got 0x1 0x110138 0x8 0x0 0xffff0ff1\",\"entry 16: want 0x1 0x110115 0x8 0x0 0xffff0ff1, got 0x1 0x11013f 0x8 0x0 0xffff0ff2\",\"entry 17: want 0x1 0x11011c 0x8 0x0 0xffff0ff1, got 0x1 0x110146 0x8 0x0 0xffff0ff2\",\"entry 18: want 0x1 0x110123 0x8 0x0 0xffff0ff3, got 0x1 0x11017c 0x8 0x0 0xffff0ff1\",\"entry 19: want 0x1 0x11012a 0x8 0x0 0xffff0ff3, got 0x1 0x110184 0x8 0x0 0xffff0ff1\",\"entry 20: want 0x1 0x110131 0x8 0x0 0xffff0ff2, got 0x1 0x11018c 0x8 0x0 0xffff0ff1\",\"entry 21: want 0x1 0x110138 0x8 0x0 0xffff0ff2, got 0x1 0x110194 0x8 0x0 0xffff0ff1\",\"entry 22: want 0x1 0x11013f 0x8 0x0 0xffff0ff2, got 0x1 0x11019c 0x8 0x0 0xffff0ff2\",\"entry 23: want 0x1 0x110146 0x8 0x0 0xffff0ff2, got 0x1 0x1101a4 0x8 0x0 0xffff0ff2\",\"entry 24: want ('0x1', '0x11016c'), got None\",\"entry 25: want ('0x1', '0x110174'), got None\",\"entry 26: want ('0x1', '0x11017c'), got None\",\"entry 27: want ('0x1', '0x110184'), got None\",\"entry 28: want ('0x1', '0x11018c'), got None\",\"entry 29: want ('0x1', '0x110194'), got None\",\"entry 30: want ('0x1', '0x11019c'), got None\",\"entry 31: want ('0x1', '0x1101a4'), got None\"]}"
-repro = "f388a2de00da image_sha256=bdf71d11af9605ea336c1fffc0dc5af248f7461fc25c2ca531ee312aa63c4346"
-sha256 = "3fefa25c0f5c1a7f7ccc730e1842b9792369e7acc6491842223ad8bfbd5057c0"
-
-[answers."5c825baaf24d0cf1fbd6408da0123a52b52fe71804cde6f3a34c5515a5219af2/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=bdf71d11af9605ea336c1fffc0dc5af248f7461fc25c2ca531ee312aa63c4346"
-sha256 = "b874ed5db3e1cc068fa2dac74653b853d4870597d33a94e944bfbac2c9ed533a"
-
 [answers.5cab0f1b7dfc36a3ebfdd01875cebf35360068ed6f529bdd0a12c89e8b9e8f78]
 aux = "{\"ncpu\":3}"
 repro = "e576bf159516 image_sha256=807ab19fba3c6322edbb3482b3ebce9989212066da32236fd25eef0e1daf1b01"
@@ -1326,23 +1133,6 @@ sha256 = "df35a7b8dca58fc3786dac6121cd136728965ac1b343e8755e25f21ae322782e"
 repro = "7c34c3f7813f image_sha256=96a96e62f31511683d0b5f8a007535876c247ec1151aac8fb60e45d270587be4"
 sha256 = "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
 value = "\"\""
-
-[answers.6050c473ed942c5f1aeea6ad394c752d9080b80d97cb653f15f7b1b5770376d0]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=714030f91b74d20e41026ff66905e4f121e4090b1150c2fddb6304a04901a070"
-sha256 = "aa2397dce9a4662f9b3976171ea29a5c40d258bf67b201508f5347ebb4d171df"
-
-[answers."6050c473ed942c5f1aeea6ad394c752d9080b80d97cb653f15f7b1b5770376d0#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=714030f91b74d20e41026ff66905e4f121e4090b1150c2fddb6304a04901a070"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."6050c473ed942c5f1aeea6ad394c752d9080b80d97cb653f15f7b1b5770376d0#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=714030f91b74d20e41026ff66905e4f121e4090b1150c2fddb6304a04901a070"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
 
 [answers.61d04fbc8932a9265d90ffbdac0944db3d72c8cecfa4bf270fcc01a1431d7b05]
 aux = "{\"ncpu\":1}"
@@ -1485,28 +1275,6 @@ aux = "{\"ncpu\":1}"
 repro = "8f94b0c2a365 image_sha256=ef4a8140090d38aa6f5fbe752e62fc3b5e96b04a79d1379427c5e6f728d0cf10"
 sha256 = "63c13fc687201f620e9e0918b70fbbb31bd7768a24f06e5d26723ed119295662"
 
-[answers.6b8c7b1d831c0c404f58a5460cadc997cfa79052f110fc7f1555c67d46ebf053]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=be23ffde5771c43b4f5deb72cba2e179f89766ff2cb5e12b604e4e6ccd42abbd"
-sha256 = "956fe1d357c73bdfc2316337925bbfb9ccebf6fd44681282c3872798014ac205"
-
-[answers."6b8c7b1d831c0c404f58a5460cadc997cfa79052f110fc7f1555c67d46ebf053#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=be23ffde5771c43b4f5deb72cba2e179f89766ff2cb5e12b604e4e6ccd42abbd"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."6b8c7b1d831c0c404f58a5460cadc997cfa79052f110fc7f1555c67d46ebf053#sdm"]
-aux = "{\"value\":[\"entry 9: want 0x1 0x110117 0x8 0x0 0xffff0ff2, got 0x1 0x110107 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x11011a 0x8 0x0 0xffff0ff4, got 0x1 0x110117 0x8 0x0 0xffff0ff2\",\"entry 11: want 0x1 0x110126 0x8 0x100 0xffff4ff8, got 0x1 0x11011a 0x8 0x0 0xffff0ff4\",\"entry 12: want 0x1 0x110127 0x8 0x100 0xffff4ff0, got 0x1 0x110126 0x8 0x100 0xffff4ff8\",\"entry 13: want 0x1 0x110128 0x8 0x100 0xffff4ff0, got 0x1 0x110127 0x8 0x100 0xffff4ff0\",\"entry 14: want 0x1 0x110130 0x8 0x100 0xffff4ff0, got 0x1 0x110128 0x8 0x100 0xffff4ff0\",\"entry 15: want 0x1 0x110131 0x8 0x0 0xffff4ff0, got 0x1 0x110130 0x8 0x100 0xffff4ff0\",\"entry 16: want None, got ('0x1', '0x110131')\"]}"
-repro = "f388a2de00da image_sha256=be23ffde5771c43b4f5deb72cba2e179f89766ff2cb5e12b604e4e6ccd42abbd"
-sha256 = "90a19527985fb41e138572ecd374b966acbeb34cf0834588258f4c6054f273c5"
-value = "[\"entry 9: want 0x1 0x110117 0x8 0x0 0xffff0ff2, got 0x1 0x110107 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x11011a 0x8 0x0 0xffff0ff4, got 0x1 0x110117 0x8 0x0 0xffff0ff2\",\"entry 11: want 0x1 0x110126 0x8 0x100 0xffff4ff8, got 0x1 0x11011a 0x8 0x0 0xffff0ff4\",\"entry 12: want 0x1 0x110127 0x8 0x100 0xffff4ff0, got 0x1 0x110126 0x8 0x100 0xffff4ff8\",\"entry 13: want 0x1 0x110128 0x8 0x100 0xffff4ff0, got 0x1 0x110127 0x8 0x100 0xffff4ff0\",\"entry 14: want 0x1 0x110130 0x8 0x100 0xffff4ff0, got 0x1 0x110128 0x8 0x100 0xffff4ff0\",\"entry 15: want 0x1 0x110131 0x8 0x0 0xffff4ff0, got 0x1 0x110130 0x8 0x100 0xffff4ff0\",\"entry 16: want None, got ('0x1', '0x110131')\"]"
-
-[answers."6b8c7b1d831c0c404f58a5460cadc997cfa79052f110fc7f1555c67d46ebf053/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=be23ffde5771c43b4f5deb72cba2e179f89766ff2cb5e12b604e4e6ccd42abbd"
-sha256 = "a364419f58a38334aade609a3dbb938638968c7457fd81fac3600eda9e615c59"
-
 [answers.6b98e3286e128a82c380223fe1e38cefee533d4f4271c6e041c769c02cc93557]
 aux = "{\"ncpu\":2}"
 repro = "e80825087ff0 image_sha256=e7a5ed91076ab28d2b7d397752467bff3f52b45a643512d5f0901e2f64b1bd21"
@@ -1638,28 +1406,6 @@ aux = "{\"ncpu\":1}"
 repro = "1b4426066780 image_sha256=1460f0dd896ab2924d762e379320bece9ed1a38d6fa023607b6314cd3c365d7c"
 sha256 = "324f7bd8ff6434b4b4001baf80f2932e21fc5e150bb9cc7500344d5cf15bf310"
 
-[answers.73737da2bb06c43eeef0eea1f92bd4e65f6ffa10b23eb1fa753d34725472b257]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=f6730109844445a4f8787a15246e0960b538077e449a926d6ae16ccdc3df318d"
-sha256 = "8a8dd909af906dee94132bf2270ea7d1036f29a9c755d97bcd7d20e1e1460c26"
-
-[answers."73737da2bb06c43eeef0eea1f92bd4e65f6ffa10b23eb1fa753d34725472b257#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=f6730109844445a4f8787a15246e0960b538077e449a926d6ae16ccdc3df318d"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."73737da2bb06c43eeef0eea1f92bd4e65f6ffa10b23eb1fa753d34725472b257#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x11007e 0x8 0x10000 0xffff2ff0, got 0x1 0x11007e 0x8 0x0 0xffff2ff0\"]}"
-repro = "f388a2de00da image_sha256=f6730109844445a4f8787a15246e0960b538077e449a926d6ae16ccdc3df318d"
-sha256 = "7a55adcf7be2e47e8368a9dda83ea95e60a285cba11aaf96eb3d1b8931e151ed"
-value = "[\"entry 0: want 0x1 0x11007e 0x8 0x10000 0xffff2ff0, got 0x1 0x11007e 0x8 0x0 0xffff2ff0\"]"
-
-[answers."73737da2bb06c43eeef0eea1f92bd4e65f6ffa10b23eb1fa753d34725472b257/not-compared/8/log"]
-aux = "{\"ncpu\":1}"
-repro = "1eb4751b0f68 image_sha256=f6730109844445a4f8787a15246e0960b538077e449a926d6ae16ccdc3df318d"
-sha256 = "044c37a3f1ea7646ff0d0a51474ccb0281b27378e973252fe62f6188faac8a21"
-
 [answers.741b3e30eafac323424229ffd55f04d1c4d70f1ba92b70abdc79685dfef9849c]
 aux = "{\"ncpu\":1}"
 repro = "be3f486a574a image_sha256=f101dfe1bc6f72423a7a7907101d617209bfd79e5e1118ef48c964eb788f7d49"
@@ -1681,23 +1427,6 @@ aux = "{\"rc\":1}"
 repro = "8b032f987b23 image_sha256=7e524549a9dab5c3915dffe7375320edc4b5dc73bf6b8abcf1163d0701bd3539"
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
-
-[answers.75b9cb3d2eb7c57e414bd46a720dc445182f29faa350fb5c7e1f42d88a8d4cfe]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=ed713d66f4751af170577ff39ab8f423d3e65b76e3a583572518ff093058bbc2"
-sha256 = "d7f45af7bfa0dd0913bb778a74c087024c13f1851ab8884c946620f5558341b8"
-
-[answers."75b9cb3d2eb7c57e414bd46a720dc445182f29faa350fb5c7e1f42d88a8d4cfe#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=ed713d66f4751af170577ff39ab8f423d3e65b76e3a583572518ff093058bbc2"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."75b9cb3d2eb7c57e414bd46a720dc445182f29faa350fb5c7e1f42d88a8d4cfe#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=ed713d66f4751af170577ff39ab8f423d3e65b76e3a583572518ff093058bbc2"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
 
 [answers.760ad9a7314561953a7ef70d005bbe9ebaba11c50783c36c333c542d15cc2da4]
 aux = "{\"ncpu\":4}"
@@ -2006,28 +1735,6 @@ aux = "{\"ncpu\":1}"
 repro = "77047f0fe8d3 image_sha256=b2574a84390f48e96b6dfaf6bbb261617496bcf6506b0bcf271451f68494b62e"
 sha256 = "a07ddabb765b2811c313f09505db7449ebdda0d35404dce790113be325f6bf86"
 
-[answers.8f7ab7e7d831d301665482d419141083008a4b280a11a953c9d98c2fb79797c7]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=6fc263612a4d40da83a2d1e3920617f72d3790e457a3ee78d8af17da99f9b173"
-sha256 = "5f54f59b6bc0312daa114bb9dce5d7a4dfac598d35bf662be7f3332592aa1fd7"
-
-[answers."8f7ab7e7d831d301665482d419141083008a4b280a11a953c9d98c2fb79797c7#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=6fc263612a4d40da83a2d1e3920617f72d3790e457a3ee78d8af17da99f9b173"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."8f7ab7e7d831d301665482d419141083008a4b280a11a953c9d98c2fb79797c7#sdm"]
-aux = "{\"value\":[\"entry 2: want 0x1 0x11008d 0x8 0x0 0xffff0ff1, got 0x1 0x11008d 0x8 0x0 0xffff0ff3\",\"entry 5: want 0x1 0x1100b5 0x8 0x0 0xffff0ff1, got 0x1 0x1100b5 0x8 0x0 0xffff0ff3\",\"entry 10: want 0x1 0x1100ef 0x8 0x0 0xffff0ff1, got 0x1 0x1100ef 0x8 0x0 0xffff0ff5\",\"entry 11: want 0x1 0x1100f6 0x8 0x0 0xffff0ff1, got 0x1 0x1100f6 0x8 0x0 0xffff0ff5\"]}"
-repro = "f388a2de00da image_sha256=6fc263612a4d40da83a2d1e3920617f72d3790e457a3ee78d8af17da99f9b173"
-sha256 = "f3b0c420b8b2ea1e13891b676265f6446225dffc29a0a0557ee0707ee6685daf"
-value = "[\"entry 2: want 0x1 0x11008d 0x8 0x0 0xffff0ff1, got 0x1 0x11008d 0x8 0x0 0xffff0ff3\",\"entry 5: want 0x1 0x1100b5 0x8 0x0 0xffff0ff1, got 0x1 0x1100b5 0x8 0x0 0xffff0ff3\",\"entry 10: want 0x1 0x1100ef 0x8 0x0 0xffff0ff1, got 0x1 0x1100ef 0x8 0x0 0xffff0ff5\",\"entry 11: want 0x1 0x1100f6 0x8 0x0 0xffff0ff1, got 0x1 0x1100f6 0x8 0x0 0xffff0ff5\"]"
-
-[answers."8f7ab7e7d831d301665482d419141083008a4b280a11a953c9d98c2fb79797c7/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=6fc263612a4d40da83a2d1e3920617f72d3790e457a3ee78d8af17da99f9b173"
-sha256 = "e3ce4654e0fb65d358e8c3a21b7e083a6c59f53e868d7181611928a9f8877418"
-
 [answers.8f9248241974b99a722c6a5bce2ed430ce75eab41cfd77b816c1d1d4d08cfad9]
 aux = "{\"ncpu\":3}"
 repro = "e576bf159516 image_sha256=9869a070e42132be12084166d53313a263416cebf6be25624bb40464acdd2f86"
@@ -2162,28 +1869,6 @@ aux = "{\"rc\":1}"
 repro = "e347344be5f6 image_sha256=c428c234dd3aff52f702a1693a7a7455f2ac158242846c35cf19c74fa17e32fe"
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
-
-[answers.98599540a68aa4ecbb37446773f2a2f97d1a8b391a65748e4180760fd631d577]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=18d55bb6ef07afe7f0ceeea4e03822d315c03b4665f826d33b316be008fb4390"
-sha256 = "297f678146f901cc98c595b591c10b4fb8f3af4f4584a59f914ca13aee4c565b"
-
-[answers."98599540a68aa4ecbb37446773f2a2f97d1a8b391a65748e4180760fd631d577#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=18d55bb6ef07afe7f0ceeea4e03822d315c03b4665f826d33b316be008fb4390"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."98599540a68aa4ecbb37446773f2a2f97d1a8b391a65748e4180760fd631d577#sdm"]
-aux = "{\"value\":[\"entry 6: want 0x1 0x1100ac 0x8 0x0 0xffff0ff3, got 0x1 0x1100ac 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x1100b4 0x8 0x0 0xffff0ff3, got 0x1 0x1100b4 0x8 0x0 0xffff0ff1\",\"entry 12: want 0x1 0x1100f7 0x8 0x0 0xffff0ff3, got 0x1 0x1100f7 0x8 0x0 0xffff0ff1\",\"entry 13: want 0x1 0x1100fe 0x8 0x0 0xffff0ff3, got 0x1 0x1100fe 0x8 0x0 0xffff0ff1\",\"entry 18: want 0x1 0x110142 0x8 0x0 0xffff0ff3, got 0x1 0x110142 0x8 0x0 0xffff0ff1\",\"entry 19: want 0x1 0x11014a 0x8 0x0 0xffff0ff3, got 0x1 0x11014a 0x8 0x0 0xffff0ff1\"]}"
-repro = "f388a2de00da image_sha256=18d55bb6ef07afe7f0ceeea4e03822d315c03b4665f826d33b316be008fb4390"
-sha256 = "bed5638cb05a4d50a045fe279af1b3de4ffd90088df5e9c6e7d9e130a86118ec"
-value = "[\"entry 6: want 0x1 0x1100ac 0x8 0x0 0xffff0ff3, got 0x1 0x1100ac 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x1100b4 0x8 0x0 0xffff0ff3, got 0x1 0x1100b4 0x8 0x0 0xffff0ff1\",\"entry 12: want 0x1 0x1100f7 0x8 0x0 0xffff0ff3, got 0x1 0x1100f7 0x8 0x0 0xffff0ff1\",\"entry 13: want 0x1 0x1100fe 0x8 0x0 0xffff0ff3, got 0x1 0x1100fe 0x8 0x0 0xffff0ff1\",\"entry 18: want 0x1 0x110142 0x8 0x0 0xffff0ff3, got 0x1 0x110142 0x8 0x0 0xffff0ff1\",\"entry 19: want 0x1 0x11014a 0x8 0x0 0xffff0ff3, got 0x1 0x11014a 0x8 0x0 0xffff0ff1\"]"
-
-[answers."98599540a68aa4ecbb37446773f2a2f97d1a8b391a65748e4180760fd631d577/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=18d55bb6ef07afe7f0ceeea4e03822d315c03b4665f826d33b316be008fb4390"
-sha256 = "8f07aa629cda45be56e823508ba9ff1274621621214caebc5d62032d809a4b57"
 
 [answers.98bfe81a808ad612f62578f2b790a1f3ac09aeb987562195c56dc30e160b772c]
 aux = "{\"ncpu\":3}"
@@ -2327,49 +2012,6 @@ repro = "e347344be5f6 image_sha256=7f7c15693bf7e954c038c88407e471cc44c2e5a950f09
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers.a446b3ee0e1390840406ba0763425df556fab38d15a0b2f3157624742cef7d1d]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=107b9425c9c5d1a796daa8139b1bfba25e5d7280623f8233bf4ccc2553f9735f"
-sha256 = "6128df59239be3580aa880c61e6ddc077e77cc4f4257d98d334e8ca5bcef2ecf"
-
-[answers."a446b3ee0e1390840406ba0763425df556fab38d15a0b2f3157624742cef7d1d#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=107b9425c9c5d1a796daa8139b1bfba25e5d7280623f8233bf4ccc2553f9735f"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."a446b3ee0e1390840406ba0763425df556fab38d15a0b2f3157624742cef7d1d#sdm"]
-aux = "{\"value\":[\"entry 13: want 0x1 0x110069 0x8 0x100 0xffff4ff0, got 0x1 0x110067 0x8 0x10100 0xffff4ff0\",\"entry 14: want 0x1 0x11006b 0x8 0x100 0xffff4ff0, got 0x1 0x110069 0x8 0x100 0xffff4ff0\",\"entry 15: want 0x1 0x11006d 0x8 0x100 0xffff4ff0, got 0x1 0x11006b 0x8 0x100 0xffff4ff0\",\"entry 16: want 0x1 0x110072 0x8 0x100 0xffff4ff0, got 0x1 0x11006d 0x8 0x100 0xffff4ff0\",\"entry 17: want 0x1 0x110077 0x8 0x100 0xffff4ff0, got 0x1 0x110072 0x8 0x100 0xffff4ff0\",\"entry 18: want 0x1 0x11007c 0x8 0x100 0xffff4ff0, got 0x1 0x110077 0x8 0x100 0xffff4ff0\",\"entry 19: want 0x1 0x11007c 0x8 0x10100 0xffff4ff0, got 0x1 0x11007c 0x8 0x100 0xffff4ff0\",\"entry 21: want 0x1 0x11007e 0x8 0x100 0xffff4ff0, got 0x1 0x11007c 0x8 0x10100 0xffff4ff0\",\"entry 22: want 0x1 0x110080 0x8 0x100 0xffff4ff0, got 0x1 0x11007e 0x8 0x100 0xffff4ff0\",\"entry 23: want 0x1 0x110082 0x8 0x100 0xffff4ff0, got 0x1 0x110080 0x8 0x100 0xffff4ff0\",\"entry 24: want 0x1 0x110084 0x8 0x100 0xffff4ff0, got 0x1 0x110082 0x8 0x100 0xffff4ff0\",\"entry 25: want 0x1 0x110086 0x8 0x100 0xffff4ff0, got 0x1 0x110084 0x8 0x100 0xffff4ff0\",\"entry 26: want 0x1 0x110088 0x8 0x100 0xffff4ff0, got 0x1 0x110086 0x8 0x100 0xffff4ff0\",\"entry 27: want 0x1 0x11008a 0x8 0x100 0xffff4ff0, got 0x1 0x110088 0x8 0x100 0xffff4ff0\",\"entry 28: want 0x1 0x11008b 0x8 0x100 0xffff4ff0, got 0x1 0x11008a 0x8 0x100 0xffff4ff0\",\"entry 29: want 0x1 0x110093 0x8 0x100 0xffff4ff0, got 0x1 0x11008b 0x8 0x100 0xffff4ff0\",\"entry 30: want 0x1 0x110094 0x8 0x0 0xffff4ff0, got 0x1 0x110093 0x8 0x100 0xffff4ff0\",\"entry 31: want None, got ('0x1', '0x110094')\"]}"
-repro = "f388a2de00da image_sha256=107b9425c9c5d1a796daa8139b1bfba25e5d7280623f8233bf4ccc2553f9735f"
-sha256 = "16771e65a0f78b9e82c0fbf7a603d32ce494f245ef4005e56f2614fa9cf0c30f"
-
-[answers."a446b3ee0e1390840406ba0763425df556fab38d15a0b2f3157624742cef7d1d/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=107b9425c9c5d1a796daa8139b1bfba25e5d7280623f8233bf4ccc2553f9735f"
-sha256 = "8f12ef7f2337618ac1a56fd49459a6df30f22455012d5e314505bb8515d25c8a"
-
-[answers.a4505e3abde118f72cc0ac3e394c08111354ddadfc050c34a5f3799a31ffd25c]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=fb7b4717de3b43a1fb018ec87d8b4e8e3ec1a426ab14023a5dd7fc736d2cd125"
-sha256 = "8c72cdef3bb6394f8bcb6045ef6009ebf901253b2f51eb9acb5373d2be50be28"
-
-[answers."a4505e3abde118f72cc0ac3e394c08111354ddadfc050c34a5f3799a31ffd25c#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=fb7b4717de3b43a1fb018ec87d8b4e8e3ec1a426ab14023a5dd7fc736d2cd125"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."a4505e3abde118f72cc0ac3e394c08111354ddadfc050c34a5f3799a31ffd25c#sdm"]
-aux = "{\"value\":[\"entry 0: want None, got ('0x1', '0x110059')\"]}"
-repro = "f388a2de00da image_sha256=fb7b4717de3b43a1fb018ec87d8b4e8e3ec1a426ab14023a5dd7fc736d2cd125"
-sha256 = "9212d4e1558c71429c68642d67c627095c98b46492f4ba8210bbda81d9e7549a"
-value = "[\"entry 0: want None, got ('0x1', '0x110059')\"]"
-
-[answers."a4505e3abde118f72cc0ac3e394c08111354ddadfc050c34a5f3799a31ffd25c/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=fb7b4717de3b43a1fb018ec87d8b4e8e3ec1a426ab14023a5dd7fc736d2cd125"
-sha256 = "f006c7ea66eaabc214e03401ae182a3c7873de3ed2f805258edb6c4e868fd60a"
-
 [answers.a509dbbb67b07f8e2835c6881bad11153b7c72ddc0d653abfe61dbc6b557f879]
 aux = "{\"ncpu\":3}"
 repro = "e576bf159516 image_sha256=fedbf6cb99fe99eaafc09a2d87b7fb71bfa1cdea0e8a8f5b535b3e7d10cea843"
@@ -2474,27 +2116,6 @@ aux = "{\"ncpu\":1}"
 repro = "4d2e079b2949 image_sha256=574c280bf0b9eff03cde4e680f146722bb499147e826bb06e2ebfb32f903afa3"
 sha256 = "d217d94456affef8fb9cf6b5333949bebf20f5599b4b3a5e1bc43ae6608b64bc"
 
-[answers.ab27103ee62984214bc08ace6222dc1f92f6223cbca045db2e4402084595a2c3]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=33eaed1c2f1d4b0b73333def8b2a0f6cb0783ae950a52702d3219311fc25b433"
-sha256 = "9992205265537397d377f48ad588a2d0747d959d06bd4e6ae979c5ca5fe3ec42"
-
-[answers."ab27103ee62984214bc08ace6222dc1f92f6223cbca045db2e4402084595a2c3#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=33eaed1c2f1d4b0b73333def8b2a0f6cb0783ae950a52702d3219311fc25b433"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."ab27103ee62984214bc08ace6222dc1f92f6223cbca045db2e4402084595a2c3#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x110068 0x8 0x0 0xffff0ff1, got 0x1 0x110076 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x110076 0x8 0x0 0xffff0ff1, got 0x1 0x110084 0x8 0x0 0xffff0ff1\",\"entry 2: want 0x1 0x110084 0x8 0x0 0xffff0ff2, got 0x1 0x110092 0x8 0x0 0xffff0ff2\",\"entry 3: want 0x1 0x110092 0x8 0x0 0xffff0ff2, got 0x1 0x1100d0 0x8 0x0 0xffff0ff1\",\"entry 4: want 0x1 0x1100c0 0x8 0x0 0xffff0ff1, got 0x1 0x1100e0 0x8 0x0 0xffff0ff1\",\"entry 5: want 0x1 0x1100d0 0x8 0x0 0xffff0ff3, got 0x1 0x1100f0 0x8 0x0 0xffff0ff2\",\"entry 6: want 0x1 0x1100e0 0x8 0x0 0xffff0ff2, got 0x1 0x11012a 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x1100f0 0x8 0x0 0xffff0ff2, got 0x1 0x110138 0x8 0x0 0xffff0ff1\",\"entry 8: want 0x1 0x11011c 0x8 0x0 0xffff0ff1, got 0x1 0x110146 0x8 0x0 0xffff0ff2\",\"entry 9: want 0x1 0x11012a 0x8 0x0 0xffff0ff3, got 0x1 0x110184 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x110138 0x8 0x0 0xffff0ff2, got 0x1 0x110194 0x8 0x0 0xffff0ff1\",\"entry 11: want 0x1 0x110146 0x8 0x0 0xffff0ff2, got 0x1 0x1101a4 0x8 0x0 0xffff0ff2\",\"entry 12: want ('0x1', '0x110174'), got None\",\"entry 13: want ('0x1', '0x110184'), got None\",\"entry 14: want ('0x1', '0x110194'), got None\",\"entry 15: want ('0x1', '0x1101a4'), got None\"]}"
-repro = "f388a2de00da image_sha256=33eaed1c2f1d4b0b73333def8b2a0f6cb0783ae950a52702d3219311fc25b433"
-sha256 = "f95d735806c936146f5c0876236bca189d98399f09bdca7403534d869b95695a"
-
-[answers."ab27103ee62984214bc08ace6222dc1f92f6223cbca045db2e4402084595a2c3/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=33eaed1c2f1d4b0b73333def8b2a0f6cb0783ae950a52702d3219311fc25b433"
-sha256 = "b874ed5db3e1cc068fa2dac74653b853d4870597d33a94e944bfbac2c9ed533a"
-
 [answers."ab791183c24cde94dc68fae24041909d7799bfd3273e29814219ab0f9744f46b#exit"]
 aux = "{\"rc\":1}"
 repro = "29597a311c3e image_sha256=2cba00e5f5a30bbded6a68da8742eee35687c97feae6d13d1313e2adc7da047e"
@@ -2585,27 +2206,6 @@ repro = "e347344be5f6 image_sha256=9c83fb634ac3f9992e2a65b1263f78f46910bcc287cdf
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers.af90c290231b703fcc648b5e3e85cec0f082cf984f2321f67ea98cff60f8b6ce]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=7464abbd6b8094188be0d18d8b3cf714fec0234ea9b3ffded0fbc103cacfaf73"
-sha256 = "9992205265537397d377f48ad588a2d0747d959d06bd4e6ae979c5ca5fe3ec42"
-
-[answers."af90c290231b703fcc648b5e3e85cec0f082cf984f2321f67ea98cff60f8b6ce#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=7464abbd6b8094188be0d18d8b3cf714fec0234ea9b3ffded0fbc103cacfaf73"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."af90c290231b703fcc648b5e3e85cec0f082cf984f2321f67ea98cff60f8b6ce#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x110068 0x8 0x0 0xffff0ff1, got 0x1 0x110076 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x110076 0x8 0x0 0xffff0ff1, got 0x1 0x110084 0x8 0x0 0xffff0ff1\",\"entry 2: want 0x1 0x110084 0x8 0x0 0xffff0ff2, got 0x1 0x110092 0x8 0x0 0xffff0ff2\",\"entry 3: want 0x1 0x110092 0x8 0x0 0xffff0ff2, got 0x1 0x1100d0 0x8 0x0 0xffff0ff1\",\"entry 4: want 0x1 0x1100c0 0x8 0x0 0xffff0ff1, got 0x1 0x1100e0 0x8 0x0 0xffff0ff1\",\"entry 5: want 0x1 0x1100d0 0x8 0x0 0xffff0ff3, got 0x1 0x1100f0 0x8 0x0 0xffff0ff2\",\"entry 6: want 0x1 0x1100e0 0x8 0x0 0xffff0ff2, got 0x1 0x11012a 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x1100f0 0x8 0x0 0xffff0ff2, got 0x1 0x110138 0x8 0x0 0xffff0ff1\",\"entry 8: want 0x1 0x11011c 0x8 0x0 0xffff0ff1, got 0x1 0x110146 0x8 0x0 0xffff0ff2\",\"entry 9: want 0x1 0x11012a 0x8 0x0 0xffff0ff3, got 0x1 0x110184 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x110138 0x8 0x0 0xffff0ff2, got 0x1 0x110194 0x8 0x0 0xffff0ff1\",\"entry 11: want 0x1 0x110146 0x8 0x0 0xffff0ff2, got 0x1 0x1101a4 0x8 0x0 0xffff0ff2\",\"entry 12: want ('0x1', '0x110174'), got None\",\"entry 13: want ('0x1', '0x110184'), got None\",\"entry 14: want ('0x1', '0x110194'), got None\",\"entry 15: want ('0x1', '0x1101a4'), got None\"]}"
-repro = "f388a2de00da image_sha256=7464abbd6b8094188be0d18d8b3cf714fec0234ea9b3ffded0fbc103cacfaf73"
-sha256 = "f95d735806c936146f5c0876236bca189d98399f09bdca7403534d869b95695a"
-
-[answers."af90c290231b703fcc648b5e3e85cec0f082cf984f2321f67ea98cff60f8b6ce/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=7464abbd6b8094188be0d18d8b3cf714fec0234ea9b3ffded0fbc103cacfaf73"
-sha256 = "b874ed5db3e1cc068fa2dac74653b853d4870597d33a94e944bfbac2c9ed533a"
-
 [answers.b232ace8f26a078eb6cacca14ee85842d9d250f749ebd8bd541f3ea49d72827a]
 aux = "{\"ncpu\":1}"
 repro = "cffd119a4098 image_sha256=c8fea907dcf7a0cd1b6111df620373a5adf1cccdfd33489f7f79b258d690610b"
@@ -2682,40 +2282,6 @@ aux = "{\"rc\":1}"
 repro = "65d2c1f56d65 image_sha256=d4479138f0569c5991f459e005c878ac204e9b927f1b878d58b64d22d850955e"
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
-
-[answers.b6f997e195de5dab2a2e4ba3053dab2ad2980cf91e38903b2d78caee6a412ae3]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=21652a85a5c5e792bf0dfb12fd6200ca67283326340cf6bcb3ea09a7c6c3e5b7"
-sha256 = "028bb22ca246a3dee8bc1abb3d79e3e6ed235aeeddaa5d695bad10c80d9cfaea"
-
-[answers."b6f997e195de5dab2a2e4ba3053dab2ad2980cf91e38903b2d78caee6a412ae3#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=21652a85a5c5e792bf0dfb12fd6200ca67283326340cf6bcb3ea09a7c6c3e5b7"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."b6f997e195de5dab2a2e4ba3053dab2ad2980cf91e38903b2d78caee6a412ae3#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=21652a85a5c5e792bf0dfb12fd6200ca67283326340cf6bcb3ea09a7c6c3e5b7"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
-[answers.b81dfc7c35ec4b20f9da33076812591e43b4457c405e0787b7e2ec3a8539f813]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=090a86bb417145eb0f8870b4d460bf506a7b3cef8c0979dab55d725fbfc8169b"
-sha256 = "bec339340ef591db7e91d197429e4e5a74272dc87876196c1d9d6f711a0fedc6"
-
-[answers."b81dfc7c35ec4b20f9da33076812591e43b4457c405e0787b7e2ec3a8539f813#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=090a86bb417145eb0f8870b4d460bf506a7b3cef8c0979dab55d725fbfc8169b"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."b81dfc7c35ec4b20f9da33076812591e43b4457c405e0787b7e2ec3a8539f813#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=090a86bb417145eb0f8870b4d460bf506a7b3cef8c0979dab55d725fbfc8169b"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
 
 [answers.b91e26358e55b701c40fb90990176892547ec302af21f8bb6592e110c423d813]
 aux = "{\"ncpu\":1}"
@@ -2798,27 +2364,6 @@ value = "exit 1"
 aux = "{\"ncpu\":1}"
 repro = "eea2f87fe3cd image_sha256=99cc2f89fa8f43aa109a5a83088fc55c6688d7e049db277bc0cae67047668477"
 sha256 = "6d0e20be92622571f2b8059ed6f2f8834e80ddbe39b22d38be680465e0136399"
-
-[answers.beafbb9576fe3eba42ff2a6bcb96385928c95a35635678a939c5ad68e2ff4ed7]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=51ba1b11754d23d692e1d1094475c28ed14a060e350c819a2664c753ccfff89c"
-sha256 = "c4e58b112d22cd492726a874f56e51d3425781c611fb9e7c05e063ab648d8588"
-
-[answers."beafbb9576fe3eba42ff2a6bcb96385928c95a35635678a939c5ad68e2ff4ed7#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=51ba1b11754d23d692e1d1094475c28ed14a060e350c819a2664c753ccfff89c"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."beafbb9576fe3eba42ff2a6bcb96385928c95a35635678a939c5ad68e2ff4ed7#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x110061 0x8 0x0 0xffff0ff1, got 0x1 0x11006f 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x110068 0x8 0x0 0xffff0ff1, got 0x1 0x110076 0x8 0x0 0xffff0ff1\",\"entry 2: want 0x1 0x11006f 0x8 0x0 0xffff0ff1, got 0x1 0x11007d 0x8 0x0 0xffff0ff1\",\"entry 3: want 0x1 0x110076 0x8 0x0 0xffff0ff1, got 0x1 0x110084 0x8 0x0 0xffff0ff1\",\"entry 4: want 0x1 0x11007d 0x8 0x0 0xffff0ff2, got 0x1 0x11008b 0x8 0x0 0xffff0ff2\",\"entry 5: want 0x1 0x110084 0x8 0x0 0xffff0ff2, got 0x1 0x110092 0x8 0x0 0xffff0ff2\",\"entry 6: want 0x1 0x11008b 0x8 0x0 0xffff0ff2, got 0x1 0x1100c8 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x110092 0x8 0x0 0xffff0ff2, got 0x1 0x1100d0 0x8 0x0 0xffff0ff1\",\"entry 8: want 0x1 0x1100b8 0x8 0x0 0xffff0ff1, got 0x1 0x1100d8 0x8 0x0 0xffff0ff1\",\"entry 9: want 0x1 0x1100c0 0x8 0x0 0xffff0ff1, got 0x1 0x1100e0 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x1100c8 0x8 0x0 0xffff0ff3, got 0x1 0x1100e8 0x8 0x0 0xffff0ff2\",\"entry 11: want 0x1 0x1100d0 0x8 0x0 0xffff0ff3, got 0x1 0x1100f0 0x8 0x0 0xffff0ff2\",\"entry 12: want 0x1 0x1100d8 0x8 0x0 0xffff0ff2, got 0x1 0x110123 0x8 0x0 0xffff0ff1\",\"entry 13: want 0x1 0x1100e0 0x8 0x0 0xffff0ff2, got 0x1 0x11012a 0x8 0x0 0xffff0ff1\",\"entry 14: want 0x1 0x1100e8 0x8 0x0 0xffff0ff2, got 0x1 0x110131 0x8 0x0 0xffff0ff1\",\"entry 15: want 0x1 0x1100f0 0x8 0x0 0xffff0ff2, got 0x1 0x110138 0x8 0x0 0xffff0ff1\",\"entry 16: want 0x1 0x110115 0x8 0x0 0xffff0ff1, got 0x1 0x11013f 0x8 0x0 0xffff0ff2\",\"entry 17: want 0x1 0x11011c 0x8 0x0 0xffff0ff1, got 0x1 0x110146 0x8 0x0 0xffff0ff2\",\"entry 18: want 0x1 0x110123 0x8 0x0 0xffff0ff3, got 0x1 0x11017c 0x8 0x0 0xffff0ff1\",\"entry 19: want 0x1 0x11012a 0x8 0x0 0xffff0ff3, got 0x1 0x110184 0x8 0x0 0xffff0ff1\",\"entry 20: want 0x1 0x110131 0x8 0x0 0xffff0ff2, got 0x1 0x11018c 0x8 0x0 0xffff0ff1\",\"entry 21: want 0x1 0x110138 0x8 0x0 0xffff0ff2, got 0x1 0x110194 0x8 0x0 0xffff0ff1\",\"entry 22: want 0x1 0x11013f 0x8 0x0 0xffff0ff2, got 0x1 0x11019c 0x8 0x0 0xffff0ff2\",\"entry 23: want 0x1 0x110146 0x8 0x0 0xffff0ff2, got 0x1 0x1101a4 0x8 0x0 0xffff0ff2\",\"entry 24: want ('0x1', '0x11016c'), got None\",\"entry 25: want ('0x1', '0x110174'), got None\",\"entry 26: want ('0x1', '0x11017c'), got None\",\"entry 27: want ('0x1', '0x110184'), got None\",\"entry 28: want ('0x1', '0x11018c'), got None\",\"entry 29: want ('0x1', '0x110194'), got None\",\"entry 30: want ('0x1', '0x11019c'), got None\",\"entry 31: want ('0x1', '0x1101a4'), got None\"]}"
-repro = "f388a2de00da image_sha256=51ba1b11754d23d692e1d1094475c28ed14a060e350c819a2664c753ccfff89c"
-sha256 = "3fefa25c0f5c1a7f7ccc730e1842b9792369e7acc6491842223ad8bfbd5057c0"
-
-[answers."beafbb9576fe3eba42ff2a6bcb96385928c95a35635678a939c5ad68e2ff4ed7/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=51ba1b11754d23d692e1d1094475c28ed14a060e350c819a2664c753ccfff89c"
-sha256 = "b874ed5db3e1cc068fa2dac74653b853d4870597d33a94e944bfbac2c9ed533a"
 
 [answers.bfb871a73ff044e86aa3f0d8e13d52dce5d96142b584a7b3715ae4c0d615fea2]
 aux = "{\"ncpu\":1}"
@@ -3055,28 +2600,6 @@ repro = "8b032f987b23 image_sha256=fe9d80362fa506ff96e451c290368b99c753a178f6a93
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers.cfca2eeb171ada6372445e0cf71f5842105443f928cde5da6e1495b821622652]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=5324e5bc9389d822ed913adc048e85e1c6d5b907b8d3e67c58292e0c5f6db595"
-sha256 = "13e8807787bd687abde5934864de644c3c760a8c89037ce396491d2132c23ecc"
-
-[answers."cfca2eeb171ada6372445e0cf71f5842105443f928cde5da6e1495b821622652#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=5324e5bc9389d822ed913adc048e85e1c6d5b907b8d3e67c58292e0c5f6db595"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."cfca2eeb171ada6372445e0cf71f5842105443f928cde5da6e1495b821622652#sdm"]
-aux = "{\"value\":[\"entry 3: want 0x1 0x1100b4 0x8 0x0 0xffff0ff3, got 0x1 0x1100b4 0x8 0x0 0xffff0ff1\",\"entry 6: want 0x1 0x1100fe 0x8 0x0 0xffff0ff3, got 0x1 0x1100fe 0x8 0x0 0xffff0ff1\",\"entry 9: want 0x1 0x11014a 0x8 0x0 0xffff0ff3, got 0x1 0x11014a 0x8 0x0 0xffff0ff1\"]}"
-repro = "f388a2de00da image_sha256=5324e5bc9389d822ed913adc048e85e1c6d5b907b8d3e67c58292e0c5f6db595"
-sha256 = "50a69bc5ebb9293bdd7f8479d5993c1110789c0f9064bd594cb21fc000903cc7"
-value = "[\"entry 3: want 0x1 0x1100b4 0x8 0x0 0xffff0ff3, got 0x1 0x1100b4 0x8 0x0 0xffff0ff1\",\"entry 6: want 0x1 0x1100fe 0x8 0x0 0xffff0ff3, got 0x1 0x1100fe 0x8 0x0 0xffff0ff1\",\"entry 9: want 0x1 0x11014a 0x8 0x0 0xffff0ff3, got 0x1 0x11014a 0x8 0x0 0xffff0ff1\"]"
-
-[answers."cfca2eeb171ada6372445e0cf71f5842105443f928cde5da6e1495b821622652/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=5324e5bc9389d822ed913adc048e85e1c6d5b907b8d3e67c58292e0c5f6db595"
-sha256 = "8f07aa629cda45be56e823508ba9ff1274621621214caebc5d62032d809a4b57"
-
 [answers.cfe0b38da2f13f5f742f0df6ea3acf1ff5dd3955665d36246e68646aa40828a9]
 aux = "{\"ncpu\":1}"
 repro = "be3f486a574a image_sha256=ef8f0702d9c4288ce740ba8e68ad08273850285a16677f5508179476f8437477"
@@ -3125,12 +2648,6 @@ aux = "{\"rc\":1}"
 repro = "dfdb36aa9df9 image_sha256=35ae114dadc0fff7979ec4f4b78fd5da3127bd03e7bb3d25e08d7a8177082840"
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
-
-[answers."d150aa9ed340ac192bb10654cee3008cf8f93192e0574a0081a7b736f97f221c#exit"]
-aux = "{\"rc\":-6}"
-repro = "dfdb36aa9df9 image_sha256=17d6cf7a32f2e71eb2cf23b7cd8dc38c12b92d3486aa538333d380bc8cee92b4"
-sha256 = "ba6d6e04c932d802d9c4ea048f2bce4e4f22a58f12fe2bb01ed6ed1ac4e43287"
-value = "exit -6"
 
 [answers.d2abee2df9cd189371c852c9e4ef51acce6450d7eda0e465607bdb2019ae9b04]
 aux = "{\"ncpu\":3}"
@@ -3369,62 +2886,6 @@ aux = "{\"rc\":1}"
 repro = "65d2c1f56d65 image_sha256=250e38349cec818774b1b01bd9fbdd2d8aaca64f0fd19aefe5cc3de83782133d"
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
-
-[answers.e126e5a53d598d7487659ca5cdb6fe8e9bbae469906cffde30628c5784e7a462]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=5e1b42ce27dd0bdca96e2cc906f5c96b0d0bf5ef69873c047913370b28172366"
-sha256 = "530e6094aced8c25bc560d8af0c3974838da711eb4e276a615e7260147e41283"
-
-[answers."e126e5a53d598d7487659ca5cdb6fe8e9bbae469906cffde30628c5784e7a462#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=5e1b42ce27dd0bdca96e2cc906f5c96b0d0bf5ef69873c047913370b28172366"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."e126e5a53d598d7487659ca5cdb6fe8e9bbae469906cffde30628c5784e7a462#sdm"]
-aux = "{\"value\":[\"entry 1: want 0x1 0x110069 0x8 0x0 0xffff0ff1, got 0x1 0x110069 0x8 0x10000 0xffff0ff1\",\"entry 2: want 0x1 0x11006f 0x8 0x0 0xffff0ff1, got 0x1 0x11006f 0x8 0x10000 0xffff0ff1\",\"entry 3: want 0x1 0x110071 0x8 0x0 0xffff0ff2, got 0x1 0x110071 0x8 0x10000 0xffff0ff2\",\"entry 5: want 0x1 0x110084 0x8 0x10000 0xffff0ff9, got 0x1 0x110162 0x8 0x0 0xffff0ff8\",\"entry 6: want 0x1 0x110086 0x8 0x0 0xffff0ff1, got 0x1 0x110086 0x8 0x10000 0xffff0ff0\",\"entry 7: want 0x1 0x110092 0x8 0x0 0xffff0ff5, got 0x1 0x110162 0x8 0x0 0xffff0ffc\",\"entry 8: want 0x1 0x11009e 0x8 0x0 0xffff0ff4, got 0x1 0x110092 0x8 0x10000 0xffff0ff0\",\"entry 9: want None, got ('0x1', '0x11009e')\"]}"
-repro = "f388a2de00da image_sha256=5e1b42ce27dd0bdca96e2cc906f5c96b0d0bf5ef69873c047913370b28172366"
-sha256 = "d1fd6f8cba1da78e0af1876d9b0b563d485298c126512c46882388cca2ab04bd"
-value = "[\"entry 1: want 0x1 0x110069 0x8 0x0 0xffff0ff1, got 0x1 0x110069 0x8 0x10000 0xffff0ff1\",\"entry 2: want 0x1 0x11006f 0x8 0x0 0xffff0ff1, got 0x1 0x11006f 0x8 0x10000 0xffff0ff1\",\"entry 3: want 0x1 0x110071 0x8 0x0 0xffff0ff2, got 0x1 0x110071 0x8 0x10000 0xffff0ff2\",\"entry 5: want 0x1 0x110084 0x8 0x10000 0xffff0ff9, got 0x1 0x110162 0x8 0x0 0xffff0ff8\",\"entry 6: want 0x1 0x110086 0x8 0x0 0xffff0ff1, got 0x1 0x110086 0x8 0x10000 0xffff0ff0\",\"entry 7: want 0x1 0x110092 0x8 0x0 0xffff0ff5, got 0x1 0x110162 0x8 0x0 0xffff0ffc\",\"entry 8: want 0x1 0x11009e 0x8 0x0 0xffff0ff4, got 0x1 0x110092 0x8 0x10000 0xffff0ff0\",\"entry 9: want None, got ('0x1', '0x11009e')\"]"
-
-[answers."e126e5a53d598d7487659ca5cdb6fe8e9bbae469906cffde30628c5784e7a462/not-compared/6/log"]
-aux = "{\"ncpu\":1}"
-repro = "0c04d8dbe196 image_sha256=5e1b42ce27dd0bdca96e2cc906f5c96b0d0bf5ef69873c047913370b28172366"
-sha256 = "26e86b17d31a607dfaa855c2c2b46b8dd024a9f6b6fe32b23766e68222b5c0e7"
-
-[answers.e265116c7d63751c3814489d4be26b552e8397e3e0bf58088e921a303ade994e]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=1d6e9f8125fa17c44562ec5ea3fa766eac1cfcd4e0ff2bca6d48c6d2b06ea84a"
-sha256 = "3fa2672b83c820397b53a506976bc1f51094c6300cb15180bad1076bb55dde79"
-
-[answers."e265116c7d63751c3814489d4be26b552e8397e3e0bf58088e921a303ade994e#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=1d6e9f8125fa17c44562ec5ea3fa766eac1cfcd4e0ff2bca6d48c6d2b06ea84a"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."e265116c7d63751c3814489d4be26b552e8397e3e0bf58088e921a303ade994e#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=1d6e9f8125fa17c44562ec5ea3fa766eac1cfcd4e0ff2bca6d48c6d2b06ea84a"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
-[answers.e28defdf2d0ae9d7a87da851f456947eb662c91f9106fb1497da0e8ff8685923]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=579d7574b5b56ce0d11d16188e51dbde585e2a5e23718bc7fe1ece91309464a5"
-sha256 = "cc9c3ba12de83b398ea51b7958cd4173d5ea42216b38bdbef95468208aaa3232"
-
-[answers."e28defdf2d0ae9d7a87da851f456947eb662c91f9106fb1497da0e8ff8685923#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=579d7574b5b56ce0d11d16188e51dbde585e2a5e23718bc7fe1ece91309464a5"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."e28defdf2d0ae9d7a87da851f456947eb662c91f9106fb1497da0e8ff8685923#sdm"]
-aux = "{\"value\":[]}"
-repro = "f388a2de00da image_sha256=579d7574b5b56ce0d11d16188e51dbde585e2a5e23718bc7fe1ece91309464a5"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
 
 [answers.e632cdf4c455c490a004eb4459ffb60a6fd34f222871c6f2ece5b31673e621df]
 aux = "{\"ncpu\":1}"
@@ -3689,27 +3150,6 @@ aux = "{\"ncpu\":1}"
 repro = "4be5ec924d3a image_sha256=1ad034104e9b4a08a8c4c21ded23c5b5e7799d63c380bb95bf1959a87695f2a3"
 sha256 = "9a4bc14c277db9dfcd633722976ee9b41500d6e0ca50e8c07702d11b1619d627"
 
-[answers.fd0e7362c94185c8f8a541d124c8341981208504364a7a6d1860071763451dac]
-aux = "{\"ncpu\":1}"
-repro = "be3f486a574a image_sha256=75ce5485674cf40bf0ddb09260f87e2f2173a07eae84e196541c1f6e65b85d60"
-sha256 = "c4e58b112d22cd492726a874f56e51d3425781c611fb9e7c05e063ab648d8588"
-
-[answers."fd0e7362c94185c8f8a541d124c8341981208504364a7a6d1860071763451dac#exit"]
-aux = "{\"rc\":1}"
-repro = "dfdb36aa9df9 image_sha256=75ce5485674cf40bf0ddb09260f87e2f2173a07eae84e196541c1f6e65b85d60"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."fd0e7362c94185c8f8a541d124c8341981208504364a7a6d1860071763451dac#sdm"]
-aux = "{\"value\":[\"entry 0: want 0x1 0x110061 0x8 0x0 0xffff0ff1, got 0x1 0x11006f 0x8 0x0 0xffff0ff1\",\"entry 1: want 0x1 0x110068 0x8 0x0 0xffff0ff1, got 0x1 0x110076 0x8 0x0 0xffff0ff1\",\"entry 2: want 0x1 0x11006f 0x8 0x0 0xffff0ff1, got 0x1 0x11007d 0x8 0x0 0xffff0ff1\",\"entry 3: want 0x1 0x110076 0x8 0x0 0xffff0ff1, got 0x1 0x110084 0x8 0x0 0xffff0ff1\",\"entry 4: want 0x1 0x11007d 0x8 0x0 0xffff0ff2, got 0x1 0x11008b 0x8 0x0 0xffff0ff2\",\"entry 5: want 0x1 0x110084 0x8 0x0 0xffff0ff2, got 0x1 0x110092 0x8 0x0 0xffff0ff2\",\"entry 6: want 0x1 0x11008b 0x8 0x0 0xffff0ff2, got 0x1 0x1100c8 0x8 0x0 0xffff0ff1\",\"entry 7: want 0x1 0x110092 0x8 0x0 0xffff0ff2, got 0x1 0x1100d0 0x8 0x0 0xffff0ff1\",\"entry 8: want 0x1 0x1100b8 0x8 0x0 0xffff0ff1, got 0x1 0x1100d8 0x8 0x0 0xffff0ff1\",\"entry 9: want 0x1 0x1100c0 0x8 0x0 0xffff0ff1, got 0x1 0x1100e0 0x8 0x0 0xffff0ff1\",\"entry 10: want 0x1 0x1100c8 0x8 0x0 0xffff0ff3, got 0x1 0x1100e8 0x8 0x0 0xffff0ff2\",\"entry 11: want 0x1 0x1100d0 0x8 0x0 0xffff0ff3, got 0x1 0x1100f0 0x8 0x0 0xffff0ff2\",\"entry 12: want 0x1 0x1100d8 0x8 0x0 0xffff0ff2, got 0x1 0x110123 0x8 0x0 0xffff0ff1\",\"entry 13: want 0x1 0x1100e0 0x8 0x0 0xffff0ff2, got 0x1 0x11012a 0x8 0x0 0xffff0ff1\",\"entry 14: want 0x1 0x1100e8 0x8 0x0 0xffff0ff2, got 0x1 0x110131 0x8 0x0 0xffff0ff1\",\"entry 15: want 0x1 0x1100f0 0x8 0x0 0xffff0ff2, got 0x1 0x110138 0x8 0x0 0xffff0ff1\",\"entry 16: want 0x1 0x110115 0x8 0x0 0xffff0ff1, got 0x1 0x11013f 0x8 0x0 0xffff0ff2\",\"entry 17: want 0x1 0x11011c 0x8 0x0 0xffff0ff1, got 0x1 0x110146 0x8 0x0 0xffff0ff2\",\"entry 18: want 0x1 0x110123 0x8 0x0 0xffff0ff3, got 0x1 0x11017c 0x8 0x0 0xffff0ff1\",\"entry 19: want 0x1 0x11012a 0x8 0x0 0xffff0ff3, got 0x1 0x110184 0x8 0x0 0xffff0ff1\",\"entry 20: want 0x1 0x110131 0x8 0x0 0xffff0ff2, got 0x1 0x11018c 0x8 0x0 0xffff0ff1\",\"entry 21: want 0x1 0x110138 0x8 0x0 0xffff0ff2, got 0x1 0x110194 0x8 0x0 0xffff0ff1\",\"entry 22: want 0x1 0x11013f 0x8 0x0 0xffff0ff2, got 0x1 0x11019c 0x8 0x0 0xffff0ff2\",\"entry 23: want 0x1 0x110146 0x8 0x0 0xffff0ff2, got 0x1 0x1101a4 0x8 0x0 0xffff0ff2\",\"entry 24: want ('0x1', '0x11016c'), got None\",\"entry 25: want ('0x1', '0x110174'), got None\",\"entry 26: want ('0x1', '0x11017c'), got None\",\"entry 27: want ('0x1', '0x110184'), got None\",\"entry 28: want ('0x1', '0x11018c'), got None\",\"entry 29: want ('0x1', '0x110194'), got None\",\"entry 30: want ('0x1', '0x11019c'), got None\",\"entry 31: want ('0x1', '0x1101a4'), got None\"]}"
-repro = "f388a2de00da image_sha256=75ce5485674cf40bf0ddb09260f87e2f2173a07eae84e196541c1f6e65b85d60"
-sha256 = "3fefa25c0f5c1a7f7ccc730e1842b9792369e7acc6491842223ad8bfbd5057c0"
-
-[answers."fd0e7362c94185c8f8a541d124c8341981208504364a7a6d1860071763451dac/not-compared//log"]
-aux = "{\"ncpu\":1}"
-repro = "4dc031ab353e image_sha256=75ce5485674cf40bf0ddb09260f87e2f2173a07eae84e196541c1f6e65b85d60"
-sha256 = "b874ed5db3e1cc068fa2dac74653b853d4870597d33a94e944bfbac2c9ed533a"
-
 [answers.fd3ba9961d893bcba5a61b6ede074cdc52e4056c402b866e85ab05b1c7d659b2]
 aux = "{\"ncpu\":3}"
 repro = "e576bf159516 image_sha256=11f20358d6af7bf6695807716911daf081cc1cb85ce6d488c2f0f4b371fa2c9a"
@@ -3779,38 +3219,6 @@ derived = [
 ]
 pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
-
-[repro.0c04d8dbe196]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-serial",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"
-view = [
-    "not-compared/6/log",
-]
 
 [repro.118d137a1772]
 args = [
@@ -3906,38 +3314,6 @@ pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
 view = [
     "masked/",
-]
-
-[repro.1eb4751b0f68]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-serial",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"
-view = [
-    "not-compared/8/log",
 ]
 
 [repro.1ecf00cdc1c2]
@@ -4162,38 +3538,6 @@ pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
 view = [
     "masked/4102+18,4138+6,4154+6,4170+6,4186+6,4202+6,4218+6,4234+6,4250+6,4120+8",
-]
-
-[repro.4dc031ab353e]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-serial",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"
-view = [
-    "not-compared//log",
 ]
 
 [repro.528a717bb75d]
@@ -5225,35 +4569,3 @@ supplier = "qemu-system"
 view = [
     "masked/5126+18,5162+6,5178+6,5194+6,5210+6,5226+6,5242+6,5258+6,5274+6",
 ]
-
-[repro.f388a2de00da]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-serial",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-]
-derived = [
-    "sdm",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"

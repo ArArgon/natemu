@@ -188,8 +188,9 @@ otherwise it does nothing. Without Docker or the pinned QEMU it still builds `pr
 ## Locked answers (`answers.py`, NATEMU_ANSWERS)
 
 The runners (`tools/run_*.py`) compare natemu with QEMU at a few comparison points: `ref.compare` (user mode),
-`smp.compare` (system mode), and the runners' own ones (`run_x3.compare_qemu`, `run_l4b`'s DATA slots, the UART output of
-l3/l4a/r1). `NATEMU_ANSWERS` chooses how:
+`smp.compare` (system mode), and the runners' own ones (the UART output of l3/r1). Where a runner's own model, SDM rule
+or written expectation decides, it asks QEMU nothing (x1, x3, l4a, l4b, m3, s4, i5b's `faults`, slice2's signal context:
+plan 2026-11-18-campaign-onboarding, Part C). `NATEMU_ANSWERS` chooses how:
 
 - `live` (default): QEMU runs as before and the comparison is field by field.
 - `seed`: as live, and each answer is appended to `NATEMU_ANSWERS_LOG` (JSON lines): its key, the sha256 of the comparison's

@@ -613,6 +613,22 @@ def judge(prog, log):
     return diffs
 
 
+def expect_regs(prog):
+    """{register: value} the SDM gives at the end of `prog` for the registers it reads its results into (s4-dr: DR6 with
+    its fixed bits, 0FFFF0FF0H, bit 12 reserved and 0, Vol.3 18.2.3; DR4/DR5 aliasing DR6/DR7 with CR4.DE = 0, 18.2.2;
+    DR7 bit 10 reads 1; GD cleared by the #DB that DR7.GD raises (BD is in its log entry; the handler then clears DR6), the
+    MOV from DR0 re-run after it: DR0 0)."""
+    if prog['name'] == 's4-dr':
+        return {'r8': DR6_FIXED | 0xe00f, 'r9': DR6_FIXED, 'r10': DR6_FIXED | 5, 'r11': DR6_FIXED | 5, 'r12': 0x0f0f0400,
+                'r13': 0x0f0f0400, 'rbx': 0, 'r14': 0x400, 'r15': DR6_FIXED}
+    return {}
+
+
+def judge_regs(prog, gpr):
+    """Differences of the final registers `gpr` (16, in P.REGS order) from `expect_regs`."""
+    return [f'{r} {gpr[P.REGS.index(r)]:#x} != SDM {v:#x}' for r, v in expect_regs(prog).items() if gpr[P.REGS.index(r)] != v]
+
+
 def show(prog, log):
     """Log entries with RIPs as labels (+offset), for reports."""
     labels = sorted((v, k) for k, v in prog['params']['labels'].items() if not k.startswith('s4_'))
