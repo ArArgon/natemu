@@ -30,16 +30,22 @@ def default_config() -> Config:
 _FIELDS = {f.name for f in dataclasses.fields(Request)}
 
 
-def _request(d: dict, runs: dict) -> Request:
+OUTSIDE = ('run', 'light')         # Request fields stored outside the request dicts
+
+
+def _request(d: dict, runs: dict, light=()) -> Request:
     """A stored request. pool.json is shared with older checkouts' code, which builds Request(**d): new fields are kept
-    outside the request dicts (`runs`), and fields this code does not know are ignored."""
-    r = Request(**{k: v for k, v in d.items() if k in _FIELDS and k != 'run'})
+    outside the request dicts (`runs`, `light`), and fields this code does not know are ignored."""
+    r = Request(**{k: v for k, v in d.items() if k in _FIELDS and k not in OUTSIDE})
     r.run = runs.get(r.id, d.get('run', ''))
+    r.light = r.id in light
     return r
 
 
 def _stored(r: Request) -> dict:
-    d = dataclasses.asdict(r); d.pop('run', None); return d
+    d = dataclasses.asdict(r)
+    for k in OUTSIDE: d.pop(k, None)
+    return d
 
 
 def _alive(pid: int) -> bool:
@@ -64,9 +70,9 @@ class Pool:
         try:
             f = self.dir / 'pool.json'
             raw = json.loads(f.read_text()) if f.exists() else {}
-            runs = raw.get('runs', {})
-            st = State(held=[Grant(_request(g['request'], runs), g['start'], g['core_class']) for g in raw.get('held', [])],
-                       waiting=[_request(r, runs) for r in raw.get('waiting', [])],
+            runs, light = raw.get('runs', {}), set(raw.get('light', []))
+            st = State(held=[Grant(_request(g['request'], runs, light), g['start'], g['core_class']) for g in raw.get('held', [])],
+                       waiting=[_request(r, runs, light) for r in raw.get('waiting', [])],
                        window_open_since=raw.get('window_open_since'), last_window_closed=raw.get('last_window_closed'),
                        served=raw.get('served', {}), last_grant=raw.get('last_grant', {}))
             for g in [g for g in st.held if not _alive(g.request.owner_pid)]:
@@ -84,6 +90,7 @@ class Pool:
                                                 for g in st.held],
                                        'waiting': [_stored(r) for r in st.waiting],
                                        'runs': {r.id: r.run for r in [g.request for g in st.held] + st.waiting if r.run},
+                                       'light': [r.id for r in [g.request for g in st.held] + st.waiting if r.light],
                                        'window_open_since': st.window_open_since,
                                        'last_window_closed': st.last_window_closed, 'served': st.served,
                                        'last_grant': st.last_grant}))
@@ -109,7 +116,8 @@ class Pool:
         with self._state() as st:
             busy = False
             if not any(g.core_class == 'X' for g in st.held) and (
-                    (window_pending(st, self.cfg, now) and not st.held) or st.window_open_since is not None):
+                    (window_pending(st, self.cfg, now) and not any(g.core_class != 'L' for g in st.held))
+                    or st.window_open_since is not None):
                 busy = bool(external_busy())         # an open window also closes while an old runner holds the lock
             self.last_external = busy
             d = decide(st, self.cfg, now, external_busy=busy)

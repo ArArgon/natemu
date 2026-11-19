@@ -40,13 +40,15 @@ class Request:
     label: str = ''
     worktree: str = ''
     run: str = ''                   # the run it belongs to (fair share); '' = the id's prefix before ':', else its own
+    light: bool = False             # waits on another machine (a remote container build): granted at once, as class 'L',
+                                    # and never blocks or waits for an exclusive window
 
 
 @dataclasses.dataclass
 class Grant:
     request: Request
     start: float
-    core_class: str             # 'P', 'E' or 'X' (the whole machine)
+    core_class: str             # 'P', 'E', 'X' (the whole machine) or 'L' (light: waits on another machine)
 
 
 @dataclasses.dataclass
@@ -122,7 +124,17 @@ def window_pending(state: State, cfg: Config, now: float) -> bool:
 
 
 def decide(state: State, cfg: Config, now: float, external_busy: bool = False) -> Decision:
-    """`external_busy`: the old runners' VM lock is held elsewhere, or VMs run outside the framework; no window opens."""
+    """`external_busy`: the old runners' VM lock is held elsewhere, or VMs run outside the framework; no window opens.
+    Light requests are granted at once and light grants are invisible to every other rule: they wait on another
+    machine, so neither an exclusive window nor shared work has to wait for them."""
+    light = [(r, 'L') for r in state.waiting if r.light]
+    view = dataclasses.replace(state, held=[g for g in state.held if g.core_class != 'L'],
+                               waiting=[r for r in state.waiting if not r.light])
+    d = _decide(view, cfg, now, external_busy)
+    return Decision(light + d.grants, d.window_open_since, d.last_window_closed)
+
+
+def _decide(state: State, cfg: Config, now: float, external_busy: bool) -> Decision:
     open_since, last_closed = state.window_open_since, state.last_window_closed
     if any(g.core_class == 'X' for g in state.held):
         return Decision([], open_since, last_closed)

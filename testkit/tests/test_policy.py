@@ -248,3 +248,18 @@ def test_the_run_survives_in_the_request_id():
     """Older pool code drops the `runs` map; ids written `<run>:<unique>` keep the run."""
     assert run_of(Request(id='20261118-x:abc', owner_pid=1)) == '20261118-x'
     assert run_of(Request(id='abc', owner_pid=1)) == 'abc'
+
+
+def test_light_grants_neither_block_nor_wait_for_an_exclusive_window():
+    """A preparation waiting on the x86 builder (light) must not keep the machine from draining, and is granted even
+    while an exclusive test runs (seen: two remote image builds held every exclusive test and all shared work for
+    15 minutes)."""
+    st_ = State(held=[Grant(req(light=True, label='prepare'), 0.0, 'L')], waiting=[req(exclusive=True, expected=10)])
+    d = decide(st_, CFG, 100.0)
+    assert [c for _, c in d.grants] == ['X']                      # the window opens despite the light grant
+    st_.waiting = [req(light=True)]
+    st_.held.append(Grant(req(exclusive=True), 100.0, 'X'))
+    d = decide(st_, CFG, 101.0)
+    assert [c for _, c in d.grants] == ['L']                      # granted while the exclusive test runs
+    st_ = State(held=[Grant(req(light=True), 0.0, 'L') for _ in range(8)], waiting=[req(cores=4, perf=True)])
+    assert [c for _, c in decide(st_, CFG, 1.0).grants] == ['P']  # light grants take no cores

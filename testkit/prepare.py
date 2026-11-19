@@ -9,6 +9,9 @@ from testkit.resources import Unpreparable
 from testkit.sched.policy import Request
 
 
+REMOTE_KINDS = ('campaign-image',)      # requirements built wholly in a container (on the x86 machine when configured)
+
+
 class BuildFailure(Exception):
     def __init__(self, name: str, reason: str):
         super().__init__(f'{name}: {reason}'); self.name, self.reason = name, reason
@@ -51,23 +54,28 @@ def prepare(items, pool, config, record: dict | None = None) -> dict:
     if not missing: return failed
     # Something must be built or fetched: that takes a shared CPU claim, never inside an exclusive window (R14.4).
     from testkit import artifacts
-    # Container builds run on the x86 machine when one is configured: then a preparation mostly waits on it and copies,
-    # so it claims one core here instead of four that would sit idle (other runs' work fits meanwhile).
-    cores = 1 if artifacts.container_builder() != 'local' else min(4, pool.cfg.p_cores)
-    req = Request(id=f"{run_id}:{uuid.uuid4().hex}", owner_pid=os.getpid(), cores=cores, label="prepare",
-                  worktree=str(config.rootpath.name), run=run_id)
-    pool.submit(req)
-    asked = time.time()
-    said = None
-    while not pool.poll(req.id):
-        w = pool.waiting_reason(req.id)
-        if w != said and tr: tr.write_line(f'testkit: preparing waits: {w}'); said = w
-        time.sleep(0.2)
-    rec['waited'] = time.time() - asked
-    try:
-        for r in missing:
-            if tr: tr.write_line(f'testkit: preparing {r.kind} {r.name}')
-            attempt(r, *needs[r], built=True)
-    finally:
-        pool.release(req.id)
+    remote = artifacts.container_builder() != 'local'
+    # Campaign images built on the x86 machine only wait on it and copy the image back: a light claim (see
+    # testkit.sched.policy) that blocks nothing here, so exclusive windows and other runs go on meanwhile. The rest is
+    # built here: one core when the other container builds are remote, else four.
+    away = [r for r in missing if remote and r.kind in REMOTE_KINDS]
+    here = [r for r in missing if r not in away]
+    for group, cores, light in ((here, 1 if remote else min(4, pool.cfg.p_cores), False), (away, 1, True)):
+        if not group: continue
+        req = Request(id=f"{run_id}:{uuid.uuid4().hex}", owner_pid=os.getpid(), cores=cores, label="prepare",
+                      worktree=str(config.rootpath.name), run=run_id, light=light)
+        pool.submit(req)
+        asked = time.time()
+        said = None
+        while not pool.poll(req.id):
+            w = pool.waiting_reason(req.id)
+            if w != said and tr: tr.write_line(f'testkit: preparing waits: {w}'); said = w
+            time.sleep(0.2)
+        rec['waited'] += time.time() - asked
+        try:
+            for r in group:
+                if tr: tr.write_line(f'testkit: preparing {r.kind} {r.name}' + (' (on the x86 builder)' if light else ''))
+                attempt(r, *needs[r], built=True)
+        finally:
+            pool.release(req.id)
     return failed

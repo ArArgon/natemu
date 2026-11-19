@@ -173,3 +173,13 @@ def test_preparation_claims_one_core_when_builds_run_on_the_x86_machine(monkeypa
         seen.clear()
         prepare.prepare([item], pool, config)
         assert seen == [want], (builder, seen)
+
+
+def test_light_requests_are_stored_outside_the_request_dicts(tmp_path):
+    from testkit.sched.policy import Request as R
+    pool = Pool(tmp_path, CFG)
+    pool.submit(R(id='a', owner_pid=os.getpid(), light=True)); pool.submit(R(id='b', owner_pid=os.getpid()))
+    raw = json.loads((tmp_path / 'pool.json').read_text())
+    assert all('light' not in d for d in raw['waiting']) and raw['light'] == ['a']
+    assert [r.light for r in pool.snapshot().waiting] == [True, False]
+    assert pool.poll('a').core_class == 'L'
