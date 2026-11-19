@@ -444,15 +444,34 @@ def litmus_image(tmp_path):
 
 def test_litmus_forbidden_state_fails(litmus_image):
     v = verdicts()
-    log = ['CT-LOG x86.SB | 499990:>0:EAX=1; 1:EAX=0;', 'CT-LOG x86.SB | 5     *>0:EAX=0; 1:EAX=0;',
-           'CT-LOG x86.SB | 5     :>0:EAX=1; 1:EAX=1;', 'CT-LOG x86.SB | 0:>0:EAX=0; 1:EAX=1;']
+    log = ['CT-LOG x86.SB | Histogram (4 states)',
+           'CT-LOG x86.SB | 499990:>0:EAX=1; 1:EAX=0;', 'CT-LOG x86.SB | 5     *>0:EAX=0; 1:EAX=0;',
+           'CT-LOG x86.SB | 5     :>0:EAX=1; 1:EAX=1;', 'CT-LOG x86.SB | 0:>0:EAX=0; 1:EAX=1;',
+           'CT-LOG x86.SB | Positive: 5, Negative: 499995']
     r = v.litmus('x86.SB', {'rc': '0', 'obs': 'Sometimes', 'sec': '3'}, log, image=litmus_image)
     assert r[0] == 'failed' and 'FORBIDDEN' in r[1] and '0:eax=0; 1:eax=0 x5' in r[1]
 
 
+def test_litmus_incomplete_histogram_fails(litmus_image):
+    """A lost or garbled histogram line could hide a forbidden state: the state lines must number litmus7's
+    `Histogram (N states)` and their counts sum to Positive + Negative."""
+    v = verdicts()
+    f = {'rc': '0', 'obs': 'Never', 'sec': '3'}
+    head, tail = 'CT-LOG x86.SB | Histogram (2 states)', 'CT-LOG x86.SB | Positive: 0, Negative: 500000'
+    good = ['CT-LOG x86.SB | 499990:>0:EAX=1; 1:EAX=0;', 'CT-LOG x86.SB | 10    :>0:EAX=1; 1:EAX=1;']
+    assert v.litmus('x86.SB', f, [head, *good, tail], image=litmus_image)[0] == 'passed'
+    r = v.litmus('x86.SB', f, [head, good[0], 'CT-LOG x86.SB | 10 :?0:EAX=0; 1:EAX', tail], image=litmus_image)
+    assert r[0] == 'failed' and '1 state lines, the histogram declares 2' in r[1] and 'sum to 499990' in r[1]
+    r = v.litmus('x86.SB', f, [head, good[0], 'CT-LOG x86.SB | 1    :>0:EAX=1; 1:EAX=1;', tail], image=litmus_image)
+    assert r[0] == 'failed' and 'sum to 499991, Positive + Negative = 500000' in r[1]
+    assert 'no "Histogram (N states)" line' in v.litmus('x86.SB', f, [*good, tail], image=litmus_image)[1]
+    assert 'no "Positive: P, Negative: Q" line' in v.litmus('x86.SB', f, [head, *good], image=litmus_image)[1]
+
+
 def test_litmus_unseen_allowed_state_passes_with_note(litmus_image):
     v = verdicts()
-    log = ['CT-LOG x86.SB | 499990:>0:EAX=1; 1:EAX=0;', 'CT-LOG x86.SB | 10    :>0:EAX=1; 1:EAX=1;']
+    log = ['CT-LOG x86.SB | Histogram (2 states)', 'CT-LOG x86.SB | 499990:>0:EAX=1; 1:EAX=0;',
+           'CT-LOG x86.SB | 10    :>0:EAX=1; 1:EAX=1;', 'CT-LOG x86.SB | Positive: 0, Negative: 500000']
     r = v.litmus('x86.SB', {'rc': '0', 'obs': 'Never', 'sec': '3'}, log, image=litmus_image)
     assert r[0] == 'passed' and '1 of 3 allowed states never observed' in r[1]
     assert v.litmus('x86.SB', {'rc': '1', 'obs': '', 'sec': '3'}, log, image=litmus_image)[0] == 'failed'
@@ -573,6 +592,17 @@ def test_correctness_family_declares_openssl_and_torture():
     t = fam.suite('torture').extra['expected']
     assert sorted(t) == sorted(f'{n}.{o}' for n in ('ieee_inf-2', 'ieee_inf-3', 'ieee_pr36332', 'pr39228') for o in ('O0', 'O2'))
     assert all('reduced precision' in why and 'docs/restructure/correctness-userspace.md' in why for why in t.values())
+
+
+def test_correctness_family_declares_litmus():
+    """litmus: two boots at 4 vCPUs (the original's), judged by herd7's states through the image folder."""
+    family.load.cache_clear()
+    s = family.load(REPO / 'tests' / 'correctness' / 'family.toml').suite('litmus')
+    assert (s.kind, s.harness, s.extra['tier'], s.extra['verdict']) == ('judged', 'campaign', 'campaign', 'verdicts:litmus')
+    assert s.extra['parts'] == 2 and s.matrix == {'machine.vcpus': [4]} and s.smoke == ['part-0']
+    assert s.extra['part_args'] == 'r=10,s=10000'           # run-litmus.sh's -r/-s: the smoke size, not the compiled one
+    assert 'image' in campaign.inspect.signature(verdicts().litmus).parameters
+    assert not s.extra.get('expected') and not s.extra.get('flaky')
 
 
 # --- how the outcomes are reported ---

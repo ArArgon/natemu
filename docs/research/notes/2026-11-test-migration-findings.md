@@ -75,6 +75,17 @@ timing-sensitive timerfd case; every disk check passed). The verdict reads FAIL 
   file offset 0, which Linux and QEMU do not (`rosetta_elf` adapts the harness ELF). Usable for quick experiments, not
   for answers.
 
+## The x86-TSO litmus campaign through the framework (November 19)
+
+The litmus image was rebuilt from pins on the x86 machine (`tools/correctness/recipes/litmus`; herdtools7 7.58 and its
+catalogue, litmus-tests-x86 a6dadce; 1,318 tests, herd7's oracle for every one). Part 0 of 2 (659 tests, the suite's
+smoke part) ran once on the M2 Max at 4 vCPUs (run 20261118-235104-6441, guest 2,213 s): every test passed, **no
+state x86-TSO forbids was observed**. Weaker evidence, as in docs/restructure/correctness-x86-litmus.md: 114 of 6,734
+allowed states never appeared (68 tests), and 42 of 166 exists-tests whose condition x86-TSO allows never showed it,
+all 4-thread ltx4 tests. Part 1 was not run. Reproduce at that full size (the compiled -r 100 -s 100000; without
+`TESTKIT_PART_ARGS=` the suite's smoke `part_args`, 1/100 of the iterations, apply):
+`TESTKIT_PART_ARGS= tools/natemu-test run --tier campaign tests/correctness/family.toml -k "litmus and part-0"`.
+
 ## QEMU and the AMD box compared (November 18)
 
 `tools/natemu-test xref tests/programs tests/fp --natemu` ran each of the 1,369 programs of both families under the pinned

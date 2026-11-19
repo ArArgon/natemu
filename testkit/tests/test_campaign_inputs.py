@@ -170,3 +170,55 @@ def test_boot_file_naming_a_kernel_not_built_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(inputs, '_in_container', _with_boot_file('0/2 kernel=openssl-kernel\n', kernel=False))
     with pytest.raises(BuildFailure, match='names kernels the recipe did not write'):
         inputs.campaign_image('openssl')
+
+
+def _litmus_build(calls):
+    """_fake_build plus the oracle folder the litmus recipe writes (herd7's states per family)."""
+    base = _fake_build(calls)
+
+    def fake(name, recipe, work, **kw):
+        base(name, recipe, work, **kw)
+        (work / 'oracle').mkdir(); (work / 'oracle' / 'cat86.txt').write_text('Test SB Allowed\nStates 1\n0:EAX=1;\nOk\n')
+    return fake
+
+
+def test_litmus_image_key_changes_with_recipe(monkeypatch, tmp_path):
+    """The litmus image is keyed by its recipe and the x86 lane's scripts it runs; the oracle stays in its folder."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    t = _tools_copy(tmp_path)
+    monkeypatch.setattr(inputs, '_tools', lambda: t)
+    calls = []
+    monkeypatch.setattr(inputs, '_in_container', _litmus_build(calls))
+    first = inputs.campaign_image('litmus')
+    assert inputs.campaign_image('litmus') == first and len(calls) == 1
+    staged = calls[0][1]
+    assert staged >= {'correctness/recipes/litmus/build.sh', 'correctness/recipes/litmus/sources.sha256',
+                      'correctness/recipes/litmus/ocaml-debs.sha256', 'correctness/recipes/common.sh', 'correctness/init',
+                      'correctness/remote.sh', 'correctness/x86-remote.sh', 'correctness/litmus-gen.py',
+                      'correctness/run-litmus.sh', 'play/rootfs.sh', 'play/mkcpio.py'}
+    assert 'correctness/litmus-check.py' not in staged          # the verdict's, read on the Mac
+    with open(t / 'correctness/litmus-check.py', 'a') as h: h.write('# not read by the recipe\n')
+    assert inputs.campaign_image('litmus') == first and len(calls) == 1
+    m = json.loads((first / 'manifest.json').read_text())
+    assert (first / 'oracle' / 'cat86.txt').is_file() and set(m['oracle']) == {'cat86.txt'} and len(m['oracle']['cat86.txt']) == 64
+    for f in ('correctness/recipes/litmus/build.sh', 'correctness/x86-remote.sh', 'correctness/litmus-gen.py',
+              'correctness/run-litmus.sh'):
+        with open(t / f, 'a') as h: h.write('# changed\n')
+        again = inputs.campaign_image('litmus')
+        assert again != first, f
+        first = again
+    assert len(calls) == 5
+
+
+def test_litmus_manifest_pins_herdtools_catalogue_and_ocaml(monkeypatch, tmp_path):
+    """Every litmus source is pinned: herdtools7 7.58's tag archive, the 51 catalogue files of its commit,
+    litmus-tests-x86 a6dadce's archive and the 14 OCaml packages, besides the common pins."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    monkeypatch.setattr(inputs, '_in_container', _litmus_build([]))
+    m = json.loads((inputs.campaign_image('litmus') / 'manifest.json').read_text())
+    files = {s['file']: s['pins'] for s in m['sources']}
+    assert files['herdtools7-7.58.tar.gz'] == ['litmus/sources.sha256']
+    assert files['litmus-tests-x86-a6dadced36343b9c21f00a173950a23e90068cd0.tar.gz'] == ['litmus/sources.sha256']
+    cat = [f for f in files if f.startswith('herdtools7-catalogue-')]
+    assert len([f for f in cat if f.startswith('herdtools7-catalogue-x86_64-')]) == 28 and len(cat) == 23 + 28
+    assert sum(p == ['litmus/ocaml-debs.sha256'] for p in files.values()) == 14 and 'ocaml_5.3.0-3_amd64.deb' in files

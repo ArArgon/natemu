@@ -388,6 +388,10 @@ def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
     boot = campaign_boot_files(name, work, suite)     # optional: per-part kernels and command-line words (public)
     for f in boot: os.replace(work / f, out / f)
     if (work / 'log').is_dir(): os.replace(work / 'log', out / 'log')
+    oracle = {}
+    if (work / 'oracle').is_dir():           # litmus: herd7's x86-TSO states per family (tests/correctness/verdicts.py)
+        os.replace(work / 'oracle', out / 'oracle')
+        oracle = {'oracle': {p.name: sha(p) for p in sorted((out / 'oracle').iterdir())}}
     (out / 'manifest.json').write_text(json.dumps({
         'suite': suite, 'builder': artifacts.build_env_described(),
         'image': {'file': image, 'sha256': sha(out / image), 'bytes': (out / image).stat().st_size},
@@ -395,7 +399,7 @@ def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
         **({'boot': {f: sha(out / f) for f in boot}} if boot else {}),
         'recipe': {rel: recipe_sha256(p) if p.is_dir() else sha(p) for rel, p in ((r, src / r) for r, _ in pairs)},
         'built': _built(out / 'log' / 'built.sha256'),
-        'sources': sources}, indent=1) + '\n')
+        'sources': sources, **oracle}, indent=1) + '\n')
     shutil.rmtree(src); shutil.rmtree(work)
 
 
@@ -409,7 +413,7 @@ def campaign_image(suite: str) -> pathlib.Path:
     """The initramfs tools/correctness boots for a campaign, built here from tools/correctness/recipes/<suite> in the
     amd64 Debian builder (common.sh): a folder with <suite>.cpio.zst, <suite>-cases.txt (`PART TEST` per test, PART the
     kernel's part= word; also /ct/<suite>-cases.txt in the image), manifest.json (every download with its URL and sha256,
-    the recipe files' hashes) and log/."""
+    the recipe files' hashes), log/ and, where the recipe writes one, oracle/ (litmus: herd7's states)."""
     t = _tools()
     pairs = [x for rel in campaign_sources(suite) for x in (rel, t / rel)]
     return resources.derived(f'campaign-{suite}', _campaign_recipe,

@@ -244,19 +244,32 @@ def litmus(name, f, extra, image=None):
     """run-litmus.sh: the litmus7 histogram as `CT-LOG FAMILY.NAME | COUNT[*:]>STATE` lines, then `CT-RESULT litmus
     FAMILY.NAME rc=EXIT obs=Never|Sometimes|Always sec=S`, or `CT-SKIP litmus FAMILY.NAME threads=T`. Judged against
     herd7's x86-TSO allowed states (the image's oracle/FAMILY.txt, read by litmus-check.py): an observed state outside
-    them fails (FORBIDDEN); allowed states never observed are only noted."""
+    them fails (FORBIDDEN); allowed states never observed are only noted. The histogram must be whole, or a garbled or
+    lost line could hide a forbidden state: its state lines must number litmus7's `Histogram (N states)` and their
+    counts sum to its `Positive: P, Negative: Q`."""
     if f.get('ct_skip'): return 'unsupported', f'needs {f.get("threads", "more")} threads: more than the guest has'
     if f.get('rc') != '0': return 'failed', _fields(f, 'rc', 'obs') + _output(extra)
     lc = _tool('litmus-check')
-    hist = {}
+    hist, lines, total, declared, witnesses = {}, 0, 0, None, None
     for ln in extra:
         m = re.match(r'CT-LOG (\S+) \| (.*)', ln)
         if not m or m.group(1) != name: continue
-        h = re.match(r'(\d+)\s*[*:]>(.*)', m.group(2))
-        if h:
+        body = m.group(2)
+        if h := re.match(r'(\d+)\s*[*:]>(.*)', body):
             s = lc.norm(h.group(2))
             hist[s] = hist.get(s, 0) + int(h.group(1))
+            lines += 1; total += int(h.group(1))
+        elif h := re.match(r'Histogram \((\d+) states?\)', body):
+            declared = int(h.group(1))
+        elif h := re.match(r'Positive: (\d+), Negative: (\d+)', body):
+            witnesses = int(h.group(1)) + int(h.group(2))
     if not hist: return 'failed', 'no histogram in the output' + _output(extra)
+    whole = []
+    if declared is None: whole.append('no "Histogram (N states)" line')
+    elif lines != declared: whole.append(f'{lines} state lines, the histogram declares {declared}')
+    if witnesses is None: whole.append('no "Positive: P, Negative: Q" line')
+    elif total != witnesses: whole.append(f'the state counts sum to {total}, Positive + Negative = {witnesses}')
+    if whole: return 'failed', 'incomplete histogram: ' + '; '.join(whole) + _output(extra)
     if image is None: return 'failed', 'no image folder: the herd7 oracle is unknown'
     allowed, cond, kind = _oracle(str(pathlib.Path(image) / 'oracle'))
     if name not in allowed: return 'failed', f'no herd7 oracle for {name} in the image (oracle/{name.split(".")[0]}.txt)'
