@@ -8,7 +8,8 @@
   selection does not depend on the CPL), IRETQ to CPL 3 after each, the normal (SWAPGS) and paranoid (RDGSBASE, LSL of
   the CPU/node descriptor, WRGSBASE) entry shapes, #DF from CPL 3 and CPL 0, NMI blocking until IRETQ. Every logged
   frame must be delivery_model's given the logged context: the vector chain and error code, RF, and the RIP slot's
-  address (the stack chosen: RSP0, IST n or the current one, aligned); which GS base a paranoid entry found; the entry's
+  address (the stack chosen: RSP0, IST n or the current one, aligned); the GS base a paranoid entry found (U at CPL 3
+  and between the CPL 0 SWAPGS pair, K otherwise); the entry's
   per-CPU values (stamp, LSL = CPU number) and the CPL 3 results (LSL, RDGSBASE, [gs:0]) as the program sets them; the
   second NMI's frame RIP equals the first's. X1c's PUSH/POP FS/GS, Reserved-NOP and BND programs: the SDM's registers.
   (Pinned QEMU, once compared here, pushes RF = 1 for INT n/INT3 after an IRETQ that loaded RF = 1 and for NMIs; the
@@ -55,9 +56,11 @@ def model_problems(prog, memory):
             if (vector, error if err is not None else None) != (v, err) or slot != at or bad:
                 out.append(f'cpu{i} event {k}: logged {[hex(x) for x in e[:8]]}, model {[hex(v), err] + [hex(w) for w in words]} slot {at:#x} (words {bad})')
             if vector in entry.PARANOID:
-                bases = {d + entry.K, d + entry.U}
-                if x1 not in bases or x2 & 0xffff != i or x2 >> 16 & 0xffff != 0x100 + i or x2 >> 32:
-                    out.append(f'cpu{i} event {k} (paranoid {vector:#x}): GS base found {x1:#x}, x2 {x2:#x}')
+                # The GS base live at the event (SDM Vol.2 SWAPGS): U at CPL 3 (the frame's CS RPL 3, #DF's written from
+                # its SS) and for the last event, the #DF between the CPL 0 SWAPGS pair; K for the other CPL 0 events.
+                base = d + (entry.U if cs & 3 == 3 or k == len(want) - 1 else entry.K)
+                if x1 != base or x2 & 0xffff != i or x2 >> 16 & 0xffff != 0x100 + i or x2 >> 32:
+                    out.append(f'cpu{i} event {k} (paranoid {vector:#x}): GS base found {x1:#x} (model {base:#x}), x2 {x2:#x}')
             elif x1 != 0x100 + i or x2 != (P.SYS_CODE(i) if vector == 14 else 0):
                 out.append(f'cpu{i} event {k} (normal {vector:#x}): x1 {x1:#x} x2 {x2:#x}')
         nmis = [e[2] for e in log if e[0] == 2]
