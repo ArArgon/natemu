@@ -78,6 +78,11 @@ def cmd_purge(args):
     return clean.clean(dry='--dry-run' in args, purge=True, all_worktrees='--all-worktrees' in args)
 
 
+def cmd_replay(args):
+    from testkit.sched import replay
+    return replay.main(args)
+
+
 def cmd_times(args):
     from testkit import timings
     return timings.main(args)

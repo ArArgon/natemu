@@ -12,7 +12,10 @@ import subprocess
 import time
 
 from testkit import host, paths
-from testkit.sched.policy import Config, Grant, Request, State, decide, unsatisfiable, window_pending
+from testkit.sched.policy import (Config, Grant, Request, State, cost, decide, granted, order_key, run_of, shares,
+                                  unsatisfiable, window_pending)
+
+KEEP_SHARE = 600.0      # s a run's share and starvation clock outlive its last request (between prepare and its units)
 
 
 def default_config() -> Config:
@@ -22,6 +25,21 @@ def default_config() -> Config:
         h = host.detect(); p, e = h.p_cores, h.e_cores
     budget, min_shared = (float(x) for x in os.environ.get('NATEMU_TEST_WINDOW', '600,120').split(','))
     return Config(p_cores=p, e_cores=e, window_budget=budget, min_shared=min_shared)
+
+
+_FIELDS = {f.name for f in dataclasses.fields(Request)}
+
+
+def _request(d: dict, runs: dict) -> Request:
+    """A stored request. pool.json is shared with older checkouts' code, which builds Request(**d): new fields are kept
+    outside the request dicts (`runs`), and fields this code does not know are ignored."""
+    r = Request(**{k: v for k, v in d.items() if k in _FIELDS and k != 'run'})
+    r.run = runs.get(r.id, d.get('run', ''))
+    return r
+
+
+def _stored(r: Request) -> dict:
+    d = dataclasses.asdict(r); d.pop('run', None); return d
 
 
 def _alive(pid: int) -> bool:
@@ -46,20 +64,35 @@ class Pool:
         try:
             f = self.dir / 'pool.json'
             raw = json.loads(f.read_text()) if f.exists() else {}
-            st = State(held=[Grant(Request(**g['request']), g['start'], g['core_class']) for g in raw.get('held', [])],
-                       waiting=[Request(**r) for r in raw.get('waiting', [])],
-                       window_open_since=raw.get('window_open_since'), last_window_closed=raw.get('last_window_closed'))
+            runs = raw.get('runs', {})
+            st = State(held=[Grant(_request(g['request'], runs), g['start'], g['core_class']) for g in raw.get('held', [])],
+                       waiting=[_request(r, runs) for r in raw.get('waiting', [])],
+                       window_open_since=raw.get('window_open_since'), last_window_closed=raw.get('last_window_closed'),
+                       served=raw.get('served', {}), last_grant=raw.get('last_grant', {}))
+            for g in [g for g in st.held if not _alive(g.request.owner_pid)]:
+                self._account(st, g)                # its owner died: the time it held still counts for its run
             st.held = [g for g in st.held if _alive(g.request.owner_pid)]
             st.waiting = [r for r in st.waiting if _alive(r.owner_pid)]
             yield st
+            live = {run_of(g.request) for g in st.held} | {run_of(r) for r in st.waiting}
+            now = time.time()                                # a finished run's share is forgotten, after a grace period
+            keep = lambda k: k in live or now - st.last_grant.get(k, 0.0) < KEEP_SHARE
+            st.served = {k: v for k, v in st.served.items() if keep(k)}
+            st.last_grant = {k: v for k, v in st.last_grant.items() if keep(k)}
             tmp = self.dir / f'pool.json.{os.getpid()}'
-            tmp.write_text(json.dumps({'held': [dataclasses.asdict(g) for g in st.held],
-                                       'waiting': [dataclasses.asdict(r) for r in st.waiting],
+            tmp.write_text(json.dumps({'held': [{'request': _stored(g.request), 'start': g.start, 'core_class': g.core_class}
+                                                for g in st.held],
+                                       'waiting': [_stored(r) for r in st.waiting],
+                                       'runs': {r.id: r.run for r in [g.request for g in st.held] + st.waiting if r.run},
                                        'window_open_since': st.window_open_since,
-                                       'last_window_closed': st.last_window_closed}))
+                                       'last_window_closed': st.last_window_closed, 'served': st.served,
+                                       'last_grant': st.last_grant}))
             os.replace(tmp, f)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+
+    def _account(self, st: State, g: Grant) -> None:
+        st.served[run_of(g.request)] = st.served.get(run_of(g.request), 0.0) + max(0.0, time.time() - g.start) * cost(g, self.cfg)
 
     def submit(self, req: Request) -> None:
         with self._state() as st:
@@ -75,18 +108,22 @@ class Pool:
         now = time.time()
         with self._state() as st:
             busy = False
-            if window_pending(st, self.cfg, now) and not st.held:
-                busy = bool(external_busy())
+            if not any(g.core_class == 'X' for g in st.held) and (
+                    (window_pending(st, self.cfg, now) and not st.held) or st.window_open_since is not None):
+                busy = bool(external_busy())         # an open window also closes while an old runner holds the lock
             self.last_external = busy
             d = decide(st, self.cfg, now, external_busy=busy)
             st.window_open_since, st.last_window_closed = d.window_open_since, d.last_window_closed
             for r, cls in d.grants:
                 st.waiting = [w for w in st.waiting if w.id != r.id]
-                st.held.append(Grant(r, now, cls))
+                st.held.append(Grant(r, now, cls)); granted(st, r, now)
             return {g.request.id: g for g in st.held if g.request.id in wanted}
 
-    def release(self, req_id: str) -> None:
+    def release(self, req_id: str, account: bool = True) -> None:
+        """Drop a request; a held grant's time counts for its run unless `account` is False (a grant given back unused)."""
         with self._state() as st:
+            if account:
+                for g in [g for g in st.held if g.request.id == req_id]: self._account(st, g)
             st.held = [g for g in st.held if g.request.id != req_id]
             st.waiting = [r for r in st.waiting if r.id != req_id]
 
@@ -108,7 +145,8 @@ class Pool:
             if x:
                 left = f', ~{max(0, x.start + x.request.expected - now):.0f} s left' if x.request.expected else ''
                 return f'exclusive {x.request.label} from {x.request.worktree or "?"} running{left}'
-            ahead = sorted((r for r in st.waiting if r.exclusive), key=lambda r: (-r.priority, r.asked))
+            share = shares(st, self.cfg, now)
+            ahead = sorted((r for r in st.waiting if r.exclusive), key=lambda r: order_key(r, share, st.last_grant, self.cfg, now))
             if me.exclusive:
                 pos = [r.id for r in ahead].index(me.id)
                 return f'exclusive queue: {pos} ahead; machine draining' if pos else 'exclusive queue: next; machine draining'

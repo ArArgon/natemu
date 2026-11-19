@@ -21,7 +21,11 @@ you can decide whether to widen the run.
 Runs from different checkouts and agents share the machine safely: each test asks the machine's queue before it
 starts. Tests that need the machine to themselves (timing bounds) run in *exclusive windows*: queued exclusive tests
 from every run go back to back once the machine is idle, then shared work gets its turn again. A quick run waits at
-most for the window in progress.
+most for the window in progress. Between runs of the same priority the queue is fair: the run that has had the least
+machine time goes first, so a one-test run is not held behind a six-thousand-test one, and a run that has had nothing
+for 30 minutes goes to the front. VMs started by older scripts through `tools/vmlock.py` queue the same way.
+`tools/natemu-test replay` replays recorded runs through these rules, without running anything: use it to check a
+scheduling change.
 
 ```sh
 tools/natemu-test submit --tier smoke     # start a run in the background; prints its id

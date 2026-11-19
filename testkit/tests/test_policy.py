@@ -3,7 +3,8 @@ import math
 
 from hypothesis import given, settings, strategies as st
 
-from testkit.sched.policy import Config, Grant, Request, State, decide, unsatisfiable, GATE, INTERACTIVE
+from testkit.sched.policy import (Config, Grant, Request, State, cost, decide, granted, run_of, shares, unsatisfiable,
+                                  GATE, INTERACTIVE)
 
 CFG = Config(p_cores=4, e_cores=2, window_budget=100, min_shared=20)
 _ids = itertools.count()
@@ -25,7 +26,7 @@ def simulate(reqs, durations, cfg=CFG, horizon=1e6):
         st_.window_open_since, st_.last_window_closed = d.window_open_since, d.last_window_closed
         for r, cls in d.grants:
             st_.waiting.remove(r)
-            g = Grant(r, now, cls); st_.held.append(g); running.append((now + durations[r.id], g))
+            g = Grant(r, now, cls); st_.held.append(g); running.append((now + durations[r.id], g)); granted(st_, r, now)
         nxt = [e for e, _ in running] + ([pending[0].asked] if pending else [])
         if d.grants: continue                  # decide again at the same instant
         if not nxt: break                      # only unsatisfiable requests left
@@ -33,6 +34,7 @@ def simulate(reqs, durations, cfg=CFG, horizon=1e6):
         if now > horizon: raise AssertionError('no progress')
         for e, g in [x for x in running if x[0] <= now]:
             running.remove((e, g)); st_.held.remove(g); done.append((g.request, g.start, e, g.core_class))
+            rid = run_of(g.request); st_.served[rid] = st_.served.get(rid, 0.0) + (e - g.start) * cost(g, cfg)
     return done, st_
 
 
@@ -164,3 +166,85 @@ def test_external_busy_does_not_starve_shared():
     st_ = State(waiting=[req(exclusive=True, expected=5), req(cores=1, expected=None), req(cores=1, expected=30)])
     g = decide(st_, CFG, 0.0, external_busy=True).grants
     assert len(g) == 2 and all(cls != 'X' for _, cls in g)
+
+
+
+# --- fair share between runs (rule 7) ------------------------------------------------------------------------------
+
+def test_small_run_is_not_held_back_by_a_large_one():
+    """A run of 100 units asked first must not make a 1-unit run asked a second later wait for all of it."""
+    big = [req(asked=0, run='big') for _ in range(100)]
+    small = req(asked=1, run='small')
+    done, _ = simulate(big + [small], {r.id: 10 for r in big + [small]})
+    start = next(s for r, s, _, _ in done if r.id == small.id)
+    assert start <= 10                              # the first slot that frees up (6 slots, 10 s units)
+
+
+def test_two_equal_runs_share_the_machine():
+    a = [req(asked=0, run='a') for _ in range(30)]
+    b = [req(asked=1, run='b') for _ in range(30)]
+    done, _ = simulate(a + b, {r.id: 10 for r in a + b})
+    end = {k: max(e for r, _, e, _ in done if r.run == k) for k in 'ab'}
+    assert abs(end['a'] - end['b']) <= 20           # interleaved: both finish near the end, not one after the other
+
+
+def test_a_stream_of_new_runs_cannot_starve_an_old_one():
+    cfg = Config(p_cores=1, e_cores=0, window_budget=100, min_shared=20, starve_after=30)
+    old = [req(asked=0, run='old') for _ in range(3)]
+    stream = [req(asked=1 + 5 * k, run=f'new{k}') for k in range(40)]
+    done, _ = simulate(old + stream, {r.id: 10 for r in old + stream}, cfg)
+    starts = sorted(s for r, s, _, _ in done if r.run == 'old')
+    assert starts[1] <= 40                          # waited past starve_after (30 s): first in line after that
+
+
+def test_exclusive_time_counts_as_the_whole_machine():
+    g = Grant(req(exclusive=True, run='x'), 0.0, 'X')
+    assert shares(State(held=[g]), CFG, 10.0)['x'] == 10.0 * (CFG.p_cores + CFG.e_cores)
+    h = Grant(req(run='y', expected=50.0), 0.0, 'P')
+    assert shares(State(held=[h]), CFG, 10.0)['y'] == 50.0          # charged at its expected length from the start
+
+
+def test_fair_share_keeps_the_invariants_on_random_runs():
+    import random
+    rng = random.Random(7)
+    reqs = [req(asked=rng.uniform(0, 200), run=f'run{rng.randint(0, 5)}', cores=rng.randint(1, 3),
+                exclusive=rng.random() < 0.1, priority=rng.choice([GATE, INTERACTIVE])) for _ in range(150)]
+    done, _ = simulate(reqs, {r.id: rng.uniform(1, 40) for r in reqs})
+    assert len(done) == len(reqs)
+    check_invariants(done)
+
+
+
+def test_a_long_run_keeps_its_fair_share_after_starve_after():
+    """Review: starvation by request age put every unit of a run older than starve_after first, ending fair share.
+    Starvation is per run, since its last grant: a large run being served stays behind a newcomer."""
+    cfg = Config(p_cores=4, e_cores=0, window_budget=100, min_shared=20, starve_after=30)
+    big = [req(asked=0, run='big') for _ in range(200)]
+    late = req(asked=300, run='late')
+    done, _ = simulate(big + [late], {**{r.id: 10 for r in big}, late.id: 10}, cfg)
+    start = next(s for r, s, _, _ in done if r.id == late.id)
+    assert start - late.asked <= 10                       # the next free slot, not behind the big run's backlog
+
+
+def test_cores_that_free_together_are_shared_between_runs():
+    """Review: one decision used to give every free core to the run with the lowest share."""
+    a = [req(asked=0, run='a', expected=10) for _ in range(10)]
+    b = [req(asked=0, run='b', expected=10) for _ in range(10)]
+    d = decide(State(waiting=a + b), CFG, 0)
+    got = [r.run for r, _ in d.grants]
+    assert len(got) == CFG.p_cores + CFG.e_cores and abs(got.count('a') - got.count('b')) <= 1
+
+
+def test_an_open_window_closes_while_the_old_lock_is_held():
+    """Review: a grant given back inside an open window was granted again at once, blocking shared work."""
+    x = [req(exclusive=True, run='x') for _ in range(2)]
+    s = req(run='s')
+    st = State(waiting=x + [s], window_open_since=0.0)
+    d = decide(st, CFG, 1.0, external_busy=True)
+    assert d.window_open_since is None and [r.id for r, _ in d.grants] == [s.id]
+
+
+def test_the_run_survives_in_the_request_id():
+    """Older pool code drops the `runs` map; ids written `<run>:<unique>` keep the run."""
+    assert run_of(Request(id='20261118-x:abc', owner_pid=1)) == '20261118-x'
+    assert run_of(Request(id='abc', owner_pid=1)) == 'abc'

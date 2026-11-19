@@ -27,6 +27,7 @@ from testkit.sched import pool as poolmod
 from testkit.sched.policy import GATE, INTERACTIVE, Request
 
 POLL = 0.1
+LOCK_GIVE_BACK = 10.0               # s a grant may wait for the old VM lock before it goes back to the queue
 NO_RAW_CACHES = {'NATEMU_REF_CACHE': 'off', 'NATEMU_ASM_CACHE': 'off', 'NATEMU_QEMU_CACHE': 'off'}
 
 
@@ -35,6 +36,7 @@ class Unit:
         self.n, self.items, self.req, self.env, self.timeout = n, items, req, env, timeout
         self.proc = self.grant = self.started = self.vmlock = None
         self.first_test = self.ended = None
+        self.lock_wait = None       # since when a granted start waits for the old runners' VM lock
         self.foreign = {}           # exclusive units: busy processes outside the run (testkit.contention), name -> peak %cpu
         self.sampled = 0.0
         self.offset = 0
@@ -42,9 +44,13 @@ class Unit:
 
 
 def run_dir(config) -> pathlib.Path:
+    """The run's folder: TESTKIT_RUN_DIR under `natemu-test run`, else one ad-hoc folder per pytest session."""
+    if (p := getattr(config, '_testkit_run_dir', None)) is not None: return p
     d = os.environ.get('TESTKIT_RUN_DIR')
     p = pathlib.Path(d) if d else paths.runs_dir() / f'adhoc-{time.strftime("%Y%m%d-%H%M%S")}-{uuid.uuid4().hex[:4]}'
     p.mkdir(parents=True, exist_ok=True)
+    try: config._testkit_run_dir = p
+    except AttributeError: pass
     return p
 
 
@@ -69,12 +75,13 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
             chunk = g[i:i + s.batch]
             exp = [table.get(it.nodeid, it.harness.expected(it.case) if hasattr(it.harness, 'expected') else None) for it in chunk]
             nd = it_needs(chunk[0])
-            req = Request(id=uuid.uuid4().hex, owner_pid=os.getpid(), cores=_cores(nd.cores, pool.cfg),
+            run = run_dir(config).name
+            req = Request(id=f'{run}:{uuid.uuid4().hex}', owner_pid=os.getpid(), cores=_cores(nd.cores, pool.cfg),
                           exclusive=nd.exclusive, perf=nd.perf or nd.dedicated, priority=prio,
                           asked=time.time(), expected=None if None in exp else sum(exp),
                           label=f'{g[0].fam.name}/{s.name}' + (f'/{chunk[0].case}' if s.kind == 'legacy' else '')
                                 + (f'[{g[0].variant.id}]' if g[0].variant.params else ''),
-                          worktree=paths.repo_root().name)
+                          worktree=paths.repo_root().name, run=run)
             if pool.unsatisfiable(req):
                 refused += [(it, 'not-runnable', f'needs {req.cores} cores; this machine has {pool.cfg.p_cores} '
                                                  f'performance and {pool.cfg.e_cores} efficiency cores') for it in chunk]
@@ -202,8 +209,16 @@ class Controller:
             try:
                 fcntl.flock(fd, (fcntl.LOCK_EX if grant.core_class == 'X' else fcntl.LOCK_SH) | fcntl.LOCK_NB)
             except BlockingIOError:
-                os.close(fd); return False          # an old runner holds it: keep the grant, try again next poll
+                os.close(fd)                        # an old runner (outside the scheduler) holds it
+                u.lock_wait = u.lock_wait or time.time()
+                if grant.core_class == 'X' and time.time() - u.lock_wait >= LOCK_GIVE_BACK:
+                    # Do not hold the machine empty for it: give the grant back unused (not charged to the run) and
+                    # queue again at the same place (the request keeps its ask time); while the old lock is held the
+                    # pool opens no window and closes an open one, so shared work runs meanwhile.
+                    self.pool.release(u.req.id, account=False); self.pool.submit(u.req); u.lock_wait = None
+                return False
             u.vmlock = fd
+            u.lock_wait = None
         u.grant = grant
         ids = self.dir / f'{u.n}.ids'
         ids.write_text('\n'.join(i.nodeid for i in u.items) + '\n')

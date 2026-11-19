@@ -50,8 +50,8 @@ def prepare(items, pool, config, record: dict | None = None) -> dict:
             except cache.Miss: missing.append(r)
     if not missing: return failed
     # Something must be built or fetched: that takes a shared CPU claim, never inside an exclusive window (R14.4).
-    req = Request(id=uuid.uuid4().hex, owner_pid=os.getpid(), cores=min(4, pool.cfg.p_cores), label='prepare',
-                  worktree=str(config.rootpath.name))
+    req = Request(id=f"{run_id}:{uuid.uuid4().hex}", owner_pid=os.getpid(), cores=min(4, pool.cfg.p_cores), label="prepare",
+                  worktree=str(config.rootpath.name), run=run_id)
     pool.submit(req)
     asked = time.time()
     said = None

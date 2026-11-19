@@ -90,3 +90,60 @@ def _no_outside_vms(monkeypatch):
     """The machine's real VM processes are not these tests' business."""
     from testkit.sched import pool as p
     monkeypatch.setattr(p, 'outside_vms', lambda: [])
+
+
+
+def test_pool_file_stays_readable_by_older_code(tmp_path):
+    """pool.json is shared with other checkouts' (older) code, which builds Request(**d) from each stored request."""
+    import json as _json
+    from testkit.sched.policy import Request as R
+    pool = Pool(tmp_path, CFG)
+    pool.submit(R(id='a', owner_pid=os.getpid(), run='run-1'))
+    raw = _json.loads((tmp_path / 'pool.json').read_text())
+    old_fields = {'id', 'owner_pid', 'cores', 'exclusive', 'perf', 'priority', 'asked', 'expected', 'label', 'worktree'}
+    for d in raw['waiting'] + [g['request'] for g in raw['held']]:
+        assert set(d) <= old_fields
+    assert raw['runs'] == {'a': 'run-1'}
+    assert pool.snapshot().waiting[0].run == 'run-1'
+
+
+def test_a_finished_grant_counts_for_its_run_until_the_run_is_done(tmp_path):
+    from testkit.sched.policy import granted  # noqa: F401
+    from testkit.sched.policy import Request as R
+    pool = Pool(tmp_path, CFG)
+    pool.submit(R(id='a', owner_pid=os.getpid(), run='r')); pool.submit(R(id='b', owner_pid=os.getpid(), run='r'))
+    assert pool.poll_many(['a', 'b'])
+    time.sleep(0.05); pool.release('a')
+    assert pool.snapshot().served.get('r', 0) > 0
+    pool.release('b')
+    assert pool.snapshot().served.get('r', 0) > 0       # kept for a grace period (a run between prepare and its units)
+    import testkit.sched.pool as poolmod
+    old = poolmod.KEEP_SHARE; poolmod.KEEP_SHARE = 0.0
+    try: assert 'r' not in pool.snapshot().served      # then forgotten
+    finally: poolmod.KEEP_SHARE = old
+
+
+def test_a_grant_blocked_on_the_old_lock_goes_back_to_the_queue(tmp_path, monkeypatch):
+    """runloop: the pool opens no window while the old lock is held, but an old runner blocked on it can take it between
+    the grant and the start. A start that cannot take natemu-raw/.vm.lock for LOCK_GIVE_BACK seconds releases the grant
+    and queues again with its ask time, instead of holding the machine empty (an exclusive grant blocks everything)."""
+    import types
+    from testkit import runloop
+    from testkit.sched.policy import Request as R
+    lock = tmp_path / '.vm.lock'; lock.touch()
+    monkeypatch.setattr(runloop.poolmod, 'vm_lock_file', lambda: lock)
+    monkeypatch.setattr('testkit.sched.pool.vm_lock_file', lambda: lock)
+    monkeypatch.setattr('testkit.sched.pool.outside_vms', lambda: [])
+    monkeypatch.setattr(runloop, 'LOCK_GIVE_BACK', 0.0)
+    pool = Pool(tmp_path, CFG)
+    req = R(id='x', owner_pid=os.getpid(), exclusive=True, asked=1.0, run='r')
+    pool.submit(req)
+    grant = pool.poll('x')
+    assert grant is not None and grant.core_class == 'X'
+    holder = os.open(lock, os.O_RDWR); fcntl.flock(holder, fcntl.LOCK_EX)       # an old runner takes it before the start
+    ctl = types.SimpleNamespace(pool=pool)
+    unit = runloop.Unit(0, [], req, {}, 60)
+    assert runloop.Controller.start(ctl, unit, grant) is False
+    st = pool.snapshot()
+    assert not st.held and [r.id for r in st.waiting] == ['x'] and st.waiting[0].asked == 1.0
+    fcntl.flock(holder, fcntl.LOCK_UN); os.close(holder)

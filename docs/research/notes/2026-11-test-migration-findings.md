@@ -24,6 +24,17 @@ so in its claims; whether either also hides a missing natemu path is open.
 - `l4b`, case `cases/frozen` (a 100 µs PIT/IRR window over 20,000 trials): "reached rbx=1, want 0" on both attempts of
   one seeding run with all 8 performance cores busy; passed in the other seeding run and in the locked run.
 
+## The M1 performance check through the framework (November 18)
+
+`m1-perf` (tests/bench, `tools/run_m1_perf.py full`, every input built on the M2 Max) ran once, 1 h 04 min. Set A
+(baseline `ecec5d77` against the current build, raw disk, 5 against 5): PASS, aim met, geometric mean 1.00 (1.02
+uncorrected), every job inside its noise. Set B (raw against preallocated qcow2): PASS, aim met, 1.00 (1.04). Set C
+(overlay, reported only): 0.995 (1.02); precondition/bw 0.949 is outside its 4.3% noise, fsync-4k-q1/fsynclat 0.769
+inside its 52%. Set D (IO5) has no numbers: the raw run failed on a framework bug (a read-only clone of the IO5
+inputs, fixed), the overlay run on the guest's CPython `test_timerfd_ns_TFD_TIMER_ABSTIME` (1.28 ms against 1 ms, the
+timing-sensitive timerfd case; every disk check passed). The verdict reads FAIL for those two runs only. Not rerun
+(30 min of exclusive machine time); the case resumes from its kept results folder, so finishing D runs only those two.
+
 ## Reference infrastructure
 
 - **Rosetta refuses the QEMU binary under load.** In Apple `container`'s amd64 containers, executing the pinned
