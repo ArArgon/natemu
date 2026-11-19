@@ -12,7 +12,8 @@ barriers; a device page goes to its device whatever its type (M3). The resident 
 (`stats.k1.memory_types`; a UC one per access) and its UC accesses (`stats.k1.uncached`: instructions run alone, its
 own accesses).
 
-- `qemu` (pinned QEMU system mode, which ignores memory types: it judges that every type behaves as RAM, i.e. the values):
+- `qemu` (the values every type gives, as RAM: tools/m2_expected.py runs the programs' accesses; equal to pinned QEMU
+  system mode's answers, which decided these before: QEMU ignores memory types):
   CPL 0 programs on each CPU's own tables (`programs.sys_text`) at N CPUs and block sizes default and 1. `pat`: Linux's
   PAT (WB WC UC- UC WB WP UC- WT); eight pages with PAT index 0..7 in their PTEs, each: load, store, LOCK XADD, XCHG,
   MOVNTI + SFENCE, CLFLUSH, REP STOSB, LODSQ, MFENCE, INC m, and code run from the page; again with PWT|PCD in the PML4E,
@@ -26,7 +27,7 @@ own accesses).
   SCASB, SSE (MOVUPS, MOVAPS, PADDD m, MOVDQU, MOVQ, MOVD), AVX (VMOVUPS ymm, VPADDD m256, VMOVDQU), x87 (FLD/FSTP m64
   and m80, FILD, FISTP, FNSTSW), PUSH/POP r and m, CALL/RET on a UC stack, loads, split stores and 16/32-byte vector
   accesses straddling UC|WB and WB|UC, MOVNTI, CLFLUSH, fences, code run from a UC page. Registers and the pages against
-  QEMU; natemu's type counts must include every non-WB type the SDM gives these pages, and each CPU must have run UC
+  the expected state; natemu's type counts must include every non-WB type the SDM gives these pages, and each CPU must have run UC
   accesses alone (`uncached.steps`).
 - `types` (natemu only, SDM Table 14-7 and the MTRR rules transcribed below): one store to each of eight fresh pages, so
   each page is one data shadow, under the reset PAT and Linux's, PWT/PCD at every upper level and in CR3 (no effect on
@@ -328,13 +329,11 @@ def program(name, n):
 
 
 def qemu_cases(a):
-    stub = smp.build_stub(a.out / 'qemu-build')
+    import m2_expected
     for n in a.cpus:
         for name in PROGRAMS:
             prog = program(name, n)
-            rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / prog['name'], 'multi', timeout=120)
-            try: want = smp.parse_dump(prog, dump)
-            except ValueError as e: yield prog['name'], False, f'QEMU run failed ({rc}): {e} {err[-200:]}'; continue
+            want = m2_expected.expected(name, n, prog)
             for extra in ([], [1]):
                 work = a.out / 'work' / f"{prog['name']}{'-1' if extra else ''}"
                 rc, out, err = s3.driver(a.host, a.runtime, a.fexc, s3.smp_description(prog), work, extra, timeout=300)

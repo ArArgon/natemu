@@ -3,10 +3,10 @@
 
     tools/with-env python3 tools/run_i5b.py --fexc FEXC --out DIR [--only NAME] [--no-qemu]
 
-`images`: CPL0 programs (natemu-smp-v1, `system`) run on QEMU system mode (the pinned Homebrew qemu-system-x86_64) with
-the CPU model QCPU, whose CPUID leaf 0DH is the profile's (EAX = 7, EBX 576/832 by XCR0, ECX 832; leaf 0DH.1 EAX = 0;
-leaf 0DH.2 = 256 bytes at 576), and on natemu at block sizes default and 1: final GPRs and the whole data region byte by
-byte. x87 values are doubles (exact under I6's reduced precision); one case loads an 80-bit value with more significand
+`images`: CPL0 programs (natemu-smp-v1, `system`) run on natemu at block sizes default and 1 against the final state
+written from the program and the SDM's save-area layouts (tools/i5b_expected.py; CPUID leaf 0DH as the profile's: EAX = 7,
+EBX 576/832 by XCR0, ECX 832): final GPRs and the whole data region byte by byte. Its states equal the answers of QEMU
+system mode with the CPU model QCPU, which decided these before (tools/test_i5b_expected.py). x87 values are doubles (exact under I6's reduced precision); one case loads an 80-bit value with more significand
 bits, where natemu's slot must be that value rounded to a double by FCW.RC (I6 deviation 2) and only there. QEMU writes
 nothing into bytes 10..15 of an FXSAVE ST slot, natemu writes zeros (the SDM's reserved bytes): those 48 bytes are
 compared only where the program pre-zeroed them (a declared difference; every other byte is compared).
@@ -82,7 +82,7 @@ def xsave_image(bv=7, comp=0, extra=b'', avx=None, **kw):
 
 def program(name, lines, d, cpl=0):
     code = ref.assemble('\n'.join(lines))
-    return {'name': name, 'ncpu': 1, 'system': True, 'bodies': [{'addr': f'{CODE:#x}', 'code': code.hex()}],
+    return {'name': name, 'ncpu': 1, 'system': True, 'asm': list(lines), 'bodies': [{'addr': f'{CODE:#x}', 'code': code.hex()}],
             'cpus': [{'rip': f'{CODE:#x}', 'rflags': '0x0', 'cpl': cpl, 'gpr': ['0x0'] * 4 + [f'{STACK:#x}', '0x0', '0x0', f'{D:#x}'] + ['0x0'] * 8}],
             'memory': [{'addr': f'{D:#x}', 'data': bytes(d).hex()}, {'addr': f'{STACK - 0x1000:#x}', 'size': 0x1000, 'fill': 'zero', 'capture': False}]}
 
@@ -454,12 +454,12 @@ def masked(state, mask, keep):
 
 
 def run_images(a, host, runtime, stub, results):
+    import i5b_expected
     bad = 0
     for prog, mask in image_cases():
         if a.only and a.only not in prog['name']: continue
         diffs = []
-        want = None if a.no_qemu else qemu(prog, stub, a.out / 'qemu' / prog['name'])
-        if want is None and not a.no_qemu: diffs.append('QEMU run failed')
+        want = i5b_expected.expected(prog, mask)      # written from the program and the SDM's layouts (equal to QEMU's answers)
         for limit in (None, 1):
             rc, out, err = natemu(a, host, runtime, description(prog), a.out / 'work' / f"{prog['name']}{'-1' if limit else ''}", limit)
             if rc: diffs.append(f'driver exit {rc}: {err.strip()[-300:]}'); continue

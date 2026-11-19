@@ -29,15 +29,15 @@
   LA57 check, the LOCK BTS trampoline lock with PAUSE, the real-mode stack, MOV SS/DS/ES/FS/GS, MOV CR3, LRETQ; then
   `secondary_startup_64`: `verify_cpu`, CR3, the CR4 PSE/PGE writes, the APIC ID from the xAPIC page, the CPU number
   lookup, the per-CPU stack, the lock release), run by every AP at N = 2..4: on natemu the BSP wakes them through the
-  mailbox, on pinned QEMU (no mailbox responder) its stub starts them at the same vector in the equivalent 64-bit state;
-  registers and memory compared (QEMU and natemu programs differ only in the BSP's wake loop; the APs' start RFLAGS.IOPL,
-  3 on QEMU's stub and 0 in the firmware's wake state, which `verify_cpu`'s PUSHF leaves in memory, is masked there).
+  mailbox; registers and memory compared with the final state written from the transcription (`trampoline_expected`;
+  equal to pinned QEMU's run of the same APs started by its stub at the same vector, the program without the wake loop),
+  the APs' start RFLAGS.IOPL (which `verify_cpu`'s PUSHF leaves in memory) masked.
 
 Writes DIR/x4.json; exit status 1 on any failure."""
 import argparse, json, pathlib, statistics, sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/bench/smp'))
-import case_results, smp, answers, run_slice1_vm as vm  # noqa: E402
+import case_results, smp, run_slice1_vm as vm  # noqa: E402
 from programs import STACK, asm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, smp_description  # noqa: E402
 from models import mailbox_model  # noqa: E402
@@ -587,16 +587,38 @@ def trampoline_program(n, natemu):
             'memory': [{**m, 'addr': f"{m['addr']:#x}"} for m in mem]}
 
 
+def trampoline_expected(q):
+    """The final state of `trampoline_program(n, False)`, written from the transcription (with RFLAGS.IOPL clear: the
+    comparison clears it on both sides). Each AP i takes the trampoline lock, runs on the real-mode stack (its pushes
+    leave `verify_cpu`'s PUSHF and its return address at rm_stack_end - 0x10 and - 8, the same bytes from every AP), finds
+    its CPU number i by its APIC ID, switches to task i's stack, records (OUT(i)) and releases the lock; the BSP waits for
+    the n - 1 arrivals. Every CPU ends at `cmp r11, r11` with rax..rdi zeroed."""
+    import expect
+    n = q['ncpu']
+    # `verify_cpu`'s PUSHF: the flags of `add esp, RM` (0x170800: PF; no CF, AF, ZF, SF, OF) and bit 1, IF = 0.
+    pushf = 0x6
+    writes = [expect.q(KD + 0x28, n - 1, 4), expect.q(RM + 0x7f0, pushf), expect.q(RM + 0x7f8, SS64 + 5)]
+    for i in range(1, n):
+        o = OUT(i)
+        writes += [expect.q(o, KSTACK(i)), expect.q(o + 8, i), expect.q(o + 0x10, PCPU(i)), expect.q(o + 0x18, PT),
+                   # CR4: the start state's PAE (no MCE, no LA57 among the kept bits), then PSE and PGE set.
+                   expect.q(o + 0x20, 0x20 | 0x10 | 0x80),
+                   expect.q(o + 0x28, 0x18, 2), expect.q(o + 0x30, 0x18, 2), expect.q(o + 0x38, 0x18, 2),
+                   (o + 0x40, (8 * 4 - 1).to_bytes(2, 'little') + (TD + 0x40).to_bytes(8, 'little')),   # SGDT: the trampoline's GDT
+                   (o + 0x50, bytes(10)),                                                                # SIDT: tr_idt, zero
+                   expect.q(o + 0x60, pushf), expect.q(o + 0x68, KSTACK(i)), expect.q(o + 0x70, 0x5a5a)]
+    return expect.state(q, [{}] + [{'rsp': KSTACK(i)} for i in range(1, n)], writes)
+
+
 def body_end_of(prog, rip):
     return next(smp.num(b['addr']) + len(b['code']) // 2 for b in prog['bodies'] if smp.num(b['addr']) <= rip < smp.num(b['addr']) + len(b['code']) // 2)
 
 
 def cmd_trampoline(a, report):
-    from run_slice3_vm import qemu_reference
     failures = []
     for n in a.cpus:
         q, m = trampoline_program(n, False), trampoline_program(n, True)
-        want = qemu_reference(q, a.out / 'qemu' / q['name'])
+        want = trampoline_expected(q)
         # As QEMU's stub leaves its CPUs: IOPL = 3, IF = 0.
         text = smp_description(m).replace('\nrflags 0x0\n', '\nrflags 0x3000\nif 0\n')
         text = '\n'.join(line + (f'\nmailbox {MB:#x}' if line == f'rip {T:#x}' else '') for line in text.splitlines()) + '\n'
@@ -630,7 +652,7 @@ def cmd_trampoline(a, report):
                                 r['data'] = r['data'][:k] + v.to_bytes(8, 'little') + r['data'][k + 8:]
                     return state
                 # The BSP's registers differ only by its wake loop (rax, rdx: none written; RIP is the stop): all compared.
-                problems += smp.compare(q, no_iopl(got), answers.view(want, 'no-iopl', lambda w: no_iopl({**w, 'memory': [dict(r) for r in w['memory']]})))
+                problems += smp.compare(q, no_iopl(got), no_iopl({**want, 'memory': [dict(r) for r in want['memory']]}))
             report.append({'name': tag, 'problems': problems})
             failures += [f'{tag}: {p}' for p in problems]
             print(tag, 'ok' if not problems else problems[:4], flush=True)

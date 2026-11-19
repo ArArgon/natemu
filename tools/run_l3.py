@@ -4,9 +4,10 @@ plan, L3; programs in tools/bench/smp/ports.py).
 
     tools/with-env python3 tools/run_l3.py --fexc FEXC --out DIR [--only qemu,stress,cases,pages] [--kicks 2000]
 
-- `qemu`: programs run unchanged by pinned QEMU (system mode, COM1 = `-serial file`) and natemu at block sizes default and
-  1; final registers, the captured memory (every IN result with RAX preloaded, the exception log, string buffers) and the
-  bytes the UART sent must be equal. `l3-uart`: every width at every UART register, divisor latch, REX.W forms, Linux's
+- `qemu`: programs run by natemu at block sizes default and 1; final registers, the captured memory (every IN result with
+  RAX preloaded, the exception log, string buffers) and the bytes the UART sent must equal the expected ones, written from
+  the programs (tools/l3_expected.py: a 16550A, unassigned ports, the I/O permission rules; equal to the answers of pinned
+  QEMU system mode, COM1 = `-serial file`, which decided these before). `l3-uart`: every width at every UART register, divisor latch, REX.W forms, Linux's
   8250 `autoconfig`/`autoconfig_16550a`/`clear_fifos` and earlyprintk sequences transcribed, LSR-polled output, THRE
   interrupt bookkeeping, loopback with a 14-byte FIFO trigger (overrun, IIR priorities, draining). `l3-unassigned`: ports
   QEMU leaves unassigned, imm8 and DX, reads and writes at 1/2/4 bytes (all-ones, writes ignored); natemu's per-port counts
@@ -63,26 +64,13 @@ def natemu(a, prog, work, extra=(), timeout=300):
     return out, problems
 
 
-def qemu(prog, work):
-    work.mkdir(parents=True, exist_ok=True)
-    serial = work / 'serial.out'
-    serial.unlink(missing_ok=True)
-    stub = smp.build_stub(work)
-    rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), work, 'multi', extra=['-serial', f'file:{serial}'])
-    if rc != 1: raise RuntimeError(f"QEMU {prog['name']}: {rc} {err}")
-    # SeaBIOS writes its banner to COM1 before the program: the program's output is what follows it.
-    # (NATEMU_ANSWERS=locked: no QEMU run, no serial file: the UART output is compared by its locked hash, answers.equal.)
-    if answers.mode() == 'locked': return smp.parse_dump(prog, dump), None
-    sent = serial.read_bytes()
-    return smp.parse_dump(prog, dump), sent.split(b'Booting from ROM..')[-1]
-
-
 def cmd_qemu(a, report):
+    import l3_expected
     progs = [ports.uart_program(), ports.unassigned_program(), ports.strings_program()] + [ports.protection_program(n) for n in ports.IO_CONFIGS]
     failures = []
     for p in progs:
         name = p['qemu']['name']
-        want, sent = qemu(p['qemu'], a.out / 'qemu' / name)
+        want, sent = l3_expected.expected(p)        # written from the program (tools/l3_expected.py; equal to QEMU's answers)
         entry = {'name': name, 'qemu_uart_bytes': len(sent) if sent is not None else None, 'runs': []}
         for block in (None, 1):
             out, problems = natemu(a, p, a.out / 'natemu' / f'{name}-{block}', [block] if block else [])
@@ -90,7 +78,7 @@ def cmd_qemu(a, report):
                 problems += smp.compare(p['qemu'], vm_state(p['natemu'], out), want)
                 got = bytes.fromhex(out.get('uart', ''))
                 if not answers.equal(want, 'uart', got.hex(), sent.hex() if sent is not None else None):
-                    problems.append(f'uart output {got!r} != QEMU {sent!r}' if sent is not None else f'uart output {got!r}: {answers.HASH_ONLY}')
+                    problems.append(f'uart output {got!r} != expected {sent!r}')
                 if name.startswith('l3-unassigned'):
                     counts = {int(e['port'], 0): (e['reads'], e['writes']) for e in out.get('ports', []) if e['unassigned']}
                     if counts != tally(ports.UNASSIGNED_ACCESSES): problems.append(f'unassigned port counts {counts} != {tally(ports.UNASSIGNED_ACCESSES)}')

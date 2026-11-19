@@ -9,9 +9,10 @@ leaf calls (`call F` ... `F: body; ret`). Two forms are generated mechanically f
 * the looping form, assembled by clang and run in the VM (`natemu-host RUNTIME run-program`);
 * its unrolling, a straight-line program with the same effects on GPRs, flags and memory: each loop becomes its trip count
   of copies of `body; dec r32` (`jnz` writes no state), each `call F` becomes `push RETURN` (the looping form's return
-  address), F's body, and `lea rsp, [rsp + 8]` (`ret` writes no flags). Pinned QEMU (tools/reference/ref.py) runs it.
+  address), F's body, and `lea rsp, [rsp + 8]` (`ret` writes no flags). tools/slice2_expected.py interprets it (its
+  instructions' SDM semantics; equal to pinned QEMU's run of it, which decided these before).
 
-The VM's final GPRs, masked RFLAGS and memory must equal QEMU's, and it must stop at the looping form's end. Counters:
+The VM's final GPRs, masked RFLAGS and memory must equal the interpreted state, and it must stop at the looping form's end. Counters:
 without a flush (only the one requested when the driver writes guest RAM), host translation requests must equal the
 distinct block RIPs (every block is compiled once and then found in the VM); a forced small code cache (`--code-cache`,
 at least the largest block) must flush repeatedly and still match; a cache smaller than that is refused. Linking (S2c): a
@@ -21,8 +22,7 @@ builds its link point's target) is refused at the reply (`bad_reply`, E2; the li
 branch or link record makes the next flush halt (`bad_link`) and is refused by the host's self-check
 (`links_check`). Self-modifying code (S2e): stores into the running block (next instruction, an already executed one in a
 loop, page-crossing), into another block's page, data on a loop's own code page, and FEX's upstream SelfModifyingCode tests
-must reach their end with QEMU's state (QEMU runs the self-modifying program itself). Nothing is keyed by probe name;
-expected values come only from QEMU. Writes DIR/probes.json; exit status 1 on any failure."""
+must reach their end with QEMU's state (QEMU runs the self-modifying program itself). Nothing is keyed by probe name. Writes DIR/probes.json; exit status 1 on any failure."""
 import argparse, json, pathlib, random, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -258,9 +258,10 @@ def main():
     built = {p['name']: build(p) for p in PROBES}
     from raw_root import RAW_ROOT      # (NATEMU_RAW_ROOT, else natemu-raw beside the main checkout, as tools/with-env)
     qemu = a.qemu or RAW_ROOT / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
-    results, _ = ref.run_programs([r for _, r, _ in built.values()], a.out / 'ref', qemu)
-    # (the results are in the programs' order; RIP is not compared here: QEMU's ends past the capture, the VM at `end`)
-    expected = {n: answers.view(r, 'rip-not-compared', lambda r: dict(r, qemu=dict(r['qemu'], rip='0x0'))) for n, r in zip(built, results)}
+    # The loop probes' expected states: their unrolled form interpreted (tools/slice2_expected.py; RIP is not compared
+    # here: the VM stops at the looping form's `end`).
+    import slice2_expected
+    expected = {p['name']: slice2_expected.expected(p) for p in PROBES}
     out, failures = [], 0
 
     def run(name, program, args):

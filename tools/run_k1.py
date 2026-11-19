@@ -18,7 +18,9 @@ frame F1 (k = 1) and table B to F2 (k = 2):
 - `cross`: an instruction crossing into a remapped page: INVLPG of its second page alone, then a third frame with a CR3
   reload (only the second page's walk tells the blocks apart).
 - `straddle`: the same at 0x1ffffe, across a 2 MiB boundary (the INVLPG region filter must see the block's last byte).
-These eight run at block sizes default and 1 and are compared with QEMU system mode (`-accel tcg,thread=multi`) at N CPUs.
+These eight run at block sizes default and 1 at N CPUs and are compared with the whole final state the program leaves
+(tools/k1_expected.py: written from the program; QEMU system mode's answers, which decided it before, are equal to it).
+"Compared with QEMU" below means compared with that expected state.
 - `no-invlpg` (natemu only, the TLB rule): the PTE changed with no invalidation: the next call may run either frame's
   bytes; after INVLPG, F2's.
 - `global` (natemu only): CR4.PGE on, A's V global: after a CR3 reload (the block found global) and two loads of B the
@@ -2006,7 +2008,7 @@ def main():
     set_link_cap(MAX_LINKS if a.full_links else LINK_CAP)
     a.out.mkdir(parents=True, exist_ok=True)
     if not (a.host and a.runtime): a.host, a.runtime = vm.build()
-    stub = smp.build_stub(a.out / 'qemu-build')
+    import k1_expected   # (the expected states: written from the programs, tools/k1_expected.py)
     report, failures = [], []
     listed = [x for x in bodies(a.k) if x not in L1_VARIANTS]
     cases = [(n, name, adv) for adv, names in ((0, listed), (1, adv_setup(0))) for n in a.cpus for name in names if (not a.programs or name in a.programs) and not (name in HOLD and n != 1)]
@@ -2014,13 +2016,7 @@ def main():
     for n in a.cpus:
         for name in [x for x in bodies(a.k) if (n, x, 0) in mine]:
             prog = program(name, n, a.k)
-            want = None
-            if name not in EITHER:
-                rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / prog['name'], 'multi', timeout=120)
-                want = smp.parse_dump(prog, dump) if rc == 1 else None
-                if want is None:
-                    failures.append(f"{prog['name']}: QEMU run failed ({rc}) {err[-200:]}")
-                    continue
+            want = None if name in EITHER else k1_expected.expected(name, n, a.k, prog)
             # (The pool's programs also without the reuse check: production's, where a pool copy is not asked of the host.)
             for extra, check in [([], True), ([1], True)] + ([([], False), ([1], False)] if name in POOL else []):
                 out, problems = run(a, prog, extra, check=check)
@@ -2109,13 +2105,7 @@ def main():
     for n in a.cpus:
         for name in [x for x in adv_setup(0) if (n, x, 1) in mine]:
             prog = adv_program(name, n)
-            want = None
-            if name not in ADV_EITHER:
-                rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / prog['name'], 'multi', timeout=120)
-                want = smp.parse_dump(prog, dump) if rc == 1 else None
-                if want is None:
-                    failures.append(f"{prog['name']}: QEMU run failed ({rc}) {err[-200:]}")
-                    continue
+            want = None if name in ADV_EITHER else k1_expected.expected('adv-' + name, n, a.k, prog)
             for extra in ([[]] if name in HOLD else [[], [1]]):
                 out, problems = run(a, prog, extra)
                 if out and want:

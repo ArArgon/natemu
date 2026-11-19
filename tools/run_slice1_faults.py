@@ -77,7 +77,9 @@ The VM must stop with exactly that exception record (vector, CR2, error code, RI
 delivered through the driver's logging IDT since X1a (the state is the one its frame saved; the frame, handler RSP and
 CPL are judged by tools/models/delivery_model.py, `delivery_check`),
 or reach the program's end when nothing faults, its GPRs, masked RFLAGS and memory equal to the QEMU prefix (or full)
-run (nothing later ran, no partial store),
+run (nothing later ran, no partial store); a built-in probe whose prefix is a known prelude (MOV, MOVABS, ADD, SUB, INC,
+CMP) and the access-form programs (`paging_programs`, every placement) take their states from tools/slice1_expected.py
+instead (equal to QEMU's runs),
 and the FEX frame intact. A stop at a declared slice limit before the expected fault (unsupported_form)
 is "unsupported". Writes DIR/faults.json; exit status 1 on any failure."""
 import argparse, json, pathlib, re, subprocess, sys
@@ -907,6 +909,7 @@ def run_case(p, offs, evs, read, mut):
     return fault, i, fetched, ad
 
 def expectations(programs, probe_specs, work, paging=True):
+    import slice1_expected
     """Every case: (name, program, mutations, expected (vector, cr2, error) or None (runs to its end), offset of the
     faulting instruction (or the end), QEMU result there, kind, expected A/D). One QEMU batch: the prefix state at every
     instruction with a data access, the full run of every program, and the prefix at each probe."""
@@ -945,6 +948,11 @@ def expectations(programs, probe_specs, work, paging=True):
         placements = [('low', (p, results))] if corpus else [(w, relocate(p, results, mine, *d)) for w, d in PLACEMENTS]
         for where, (q, rs) in placements:
             rip = ref.num(q['rip'])
+            if not corpus:      # the access-form programs' states: written from the program (tools/slice1_expected.py)
+                rs = list(rs)
+                for i, j in [*at.items(), (len(q['asm']), full)]:
+                    st_ = slice1_expected.program_state(q, i, rip + offs[i])
+                    if st_ is not None: rs[j] = st_
             # A corpus program with raw `.byte` lines (e.g. gen_i7's prefix-rule edges): the model cannot read their accesses.
             if any(l.startswith('.byte') for l in q['asm']): print(f"skip {q['name']} ({where}): raw .byte lines"); continue
             try: evs = {i: reference_events(rs[j], q['asm'][i], bases(q), rip + offs[i + 1]) for i, j in at.items()}
@@ -976,7 +984,10 @@ def expectations(programs, probe_specs, work, paging=True):
     for p, offs, k, mut, j in probing:
         rip, r = ref.num(p['rip']), results[j]
         at_rip = lambda r, a: dict(r, qemu=dict(r['qemu'], rip=ref.hx(a)))      # QEMU ran it at `here`: the case's RIP
-        r = answers.view(results[j], f'rip/{rip + offs[k]:#x}', lambda r: at_rip(r, rip + offs[k]))
+        # The prefix state: written from the probe where its prefix is a known prelude (tools/slice1_expected.py), else
+        # QEMU's answer at the case's RIP.
+        r = None if mut.get('nofault') else slice1_expected.prefix(p, p['asm'], k, rip + offs[k])
+        if r is None: r = answers.view(results[j], f'rip/{rip + offs[k]:#x}', lambda r: at_rip(r, rip + offs[k]))
         m = layout(p, mut)
         fetched = m.fetch(rip + offs[k], offs[k + 1] - offs[k])
         try: evs = reference_events(r, p['asm'][k], bases(p), rip + offs[k + 1])

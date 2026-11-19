@@ -64,13 +64,13 @@ block, re-armed after a mid-block resume; at a resident entry only with N > 1: p
 code page while vCPU 0 spins in its hot loop, so vCPU 1's resident posts the page to vCPU 0 and rings its SGI; (3)
 forged stops: the stop word over vCPU V's first block entry (a stop nobody armed) and an armed-stop record whose word
 does not hold the stop word must each halt V (bad_stop) and cancel the others. Programs are natemu-smp-v1; the reference
-is a pinned QEMU system-mode run of the same program (tools/bench/smp, `-accel tcg,thread=multi`), compared with
-smp.compare. Per vCPU: reached its end, the per-vCPU checks and the doorbell accounting (`kick_checks`: host kicks
+is the final state written from the program (tools/slice3_expected.py, equal to the pinned QEMU system mode's answers),
+compared with smp.compare. Per vCPU: reached its end, the per-vCPU checks and the doorbell accounting (`kick_checks`: host kicks
 acknowledged + still pending = issued, none lost or doubled, kicks finding it in the host included; stops + doorbells
 merged into an armed stop = doorbells; stops = the sum by place; nothing armed at the end; (hot loop) all M kicks issued
 while it ran, none merged). The resident validates every stop's place (a block's first word, the dispatcher or L1, a
 word it armed, or a resident entry at a block boundary; anything else halts bad_stop); the final state is compared with
-QEMU. Latency (ring -> the resident's stop, per vCPU, one clock) and the mean acknowledge cost are reported. `corpora
+that reference. Latency (ring -> the resident's stop, per vCPU, one clock) and the mean acknowledge cost are reported. `corpora
 --kicks M` also kicks every vCPU M times (mostly while it is in the host or the resident) and adds the same checks.
 
 `system` (S3c1, long-mode system instructions as resident transactions): see cmd_system. Each system program of
@@ -90,7 +90,8 @@ function patched in rounds and run after a CR3 load, every CPU patching in turn,
 page, a page rewritten (with its own bytes) on every fetch, CPUs translating pages the others write, CPUs ending while a
 peer translates a page they held writable; at 3 and 4 vCPUs a function called in a loop until a patch shows while peers
 store data on its page) at 2 and 4 vCPUs, each run R times at block sizes default and 1 and compared
-with pinned QEMU system mode (`-accel tcg,thread=multi`; QEMU keeps translated code coherent with stores), plus the
+with the final state written from the program (tools/slice3_expected.py: code kept coherent with stores; equal to pinned
+QEMU system mode's answers), plus the
 per-vCPU and kick accounting checks. Every vCPU must reach its end (a `bad_link` or any other halt fails). The runs'
 steps, stale links, invalidations, stops and shootdowns are reported.
 
@@ -119,7 +120,8 @@ state at a block boundary the run reached (the system, site and site-kind tamper
 shootdown (`--ignore-kicks` on vCPU k = 1..3 of 4: its doorbells are disabled and its own watchdog is off, so it never
 stops or drains, while a host kicker rings it every millisecond, unheard: its kicks issued, its doorbell pending, no IRQ
 taken): vCPU 0, waiting in the resident for k's shadow reset, is stopped by its
-watchdog, reported `resident` with k's `SHADOWS` request still pending; k is cancelled; an untampered control matches QEMU
+watchdog, reported `resident` with k's `SHADOWS` request still pending; k is cancelled; an untampered control matches its
+expected state (tools/slice3_expected.py)
 with a shootdown. (3) vCPU k's compile server (k = 1..3 of 4) killed before its 51st request: exit 1 within 2 s, stderr
 names the vCPU, the server and its signal (`--kill-reps R`: each case R times, a stress check); the same server stopped
 instead (SIGSTOP: alive, never answering): the request deadline
@@ -129,7 +131,7 @@ while the others reach their ends and match; a guest that legitimately spins pas
 stop, and reaches its end under the default budget: the watchdog bounds every span inside the VM without a host exit, so
 budget and location (guest code or resident) are what separate the two, not the stop kind. Progress: the coherence
 programs with sustained cross-vCPU code writes (`mutual`, `data`, `rewrite`, `stale`) and CPUs ending while a peer
-translates their page (`finish`, `finish-late`), as `coherence` (QEMU reference, block sizes default and 1).
+translates their page (`finish`, `finish-late`), as `coherence` (expected states, block sizes default and 1).
 
 `privilege` (U1, x86 privilege in shadows: one shadow space per CPL class): see cmd_privilege.
 
@@ -578,6 +580,13 @@ def qemu_reference(prog, work, hang_ok=False):
     return smp.parse_dump(prog, dump)
 
 
+def expected_state(prog):
+    """The final state of a `kicks`, `coherence` or `contain` program, written from the program (tools/slice3_expected.py;
+    QEMU system mode's answers, which decided these before, are equal to it)."""
+    import slice3_expected
+    return slice3_expected.expected(prog)
+
+
 def qemu_view(want, label, change):
     """QEMU's answer `want` (smp.parse_dump's shape) changed by `change` (which edits a copy in place) before it is compared:
     an answers.view (tools/reference/answers.py) under `label`; in live mode just the changed copy."""
@@ -614,7 +623,7 @@ def cmd_kicks(a, host, runtime):
     failures, report = [], {'hot': [], 'adversarial': [], 'peer': [], 'forge': []}
     for n in a.cpus:
         prog = hot_program(n, a.iterations)
-        want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+        want = expected_state(prog)
         extra = [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', a.kicks]
         groups = [(f"{prog['name']}-{r}", smp_description(prog), extra) for r in range(a.reps)]
 
@@ -637,7 +646,7 @@ def cmd_kicks(a, host, runtime):
     report['rep'] = []
     for n in a.cpus:
         prog = rep_program(n, a.rep_iterations)
-        want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+        want = expected_state(prog)
         extra = [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', a.kicks]
         groups = [(f"{prog['name']}-{r}", smp_description(prog), extra) for r in range(a.reps)]
 
@@ -658,7 +667,7 @@ def cmd_kicks(a, host, runtime):
     seen = collections.Counter()
     for n in a.cpus:
         prog = adversarial_program(n, a.adversarial_iterations)
-        want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+        want = expected_state(prog)
         extra = [x for v in range(n) for x in ('--kick-vcpu', v)] + ['--kicks', a.kicks, '--kick-jitter-us', a.jitter_us]
         groups = [(f"{prog['name']}-{r}", smp_description(prog), extra) for r in range(a.reps)]
 
@@ -686,7 +695,7 @@ def cmd_kicks(a, host, runtime):
     if missing: failures.append(f'adversarial: no stop at {missing}')
     # A peer's resident kick: no host kicker; vCPU 0 must take at least one stop and drop its blocks from the page.
     prog = peer_program(a.iterations)
-    want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+    want = expected_state(prog)
     for r in range(a.reps):
         rc, out, err = driver(host, runtime, a.fexc, smp_description(prog), a.out / 'work' / f'peer-{r}')
         diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else judge_smp(prog, want, out, [None, None])
@@ -1753,16 +1762,8 @@ def coherence_runs(a, host, runtime, names):
     """The coherence.json programs whose names contain one of `names` (all if None), as cmd_coherence: (failures, report)."""
     programs = [p for p in json.loads((ROOT / 'tools/bench/smp/coherence.json').read_text()) if not names or any(n in p['name'] for n in names)]
     failures, report = [], []
-    stub = smp.build_stub(a.out / 'qemu-build')
     for prog in programs:
-        # Pinned QEMU (MTTCG) now and then never finishes a program whose code another CPU rewrites while it runs (seen with
-        # `stale`): a run that times out is repeated; its final state, when it finishes, is deterministic by construction.
-        for attempt in range(5):
-            rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / prog['name'], 'multi', timeout=30)
-            if rc != 'timeout': break
-            print(f"{prog['name']}: QEMU run {attempt + 1} timed out", flush=True)
-        if rc != 1: raise RuntimeError(f"QEMU {prog['name']}: {rc} {err}")
-        want = smp.parse_dump(prog, dump)
+        want = expected_state(prog)
         n = prog['ncpu']
         for limit in ([], [1]):
             groups = [(f"{prog['name']}{'-1' if limit else ''}-{r}", smp_description(prog), limit) for r in range(a.reps)]
@@ -2236,7 +2237,7 @@ def cmd_contain(a, host, runtime):
         prog = unacked_program(4, k)
         kicks = ['--kick-vcpu', k, '--kicks', 100_000, '--kick-every-us', 1000, '--watchdog-ms', wd]
         if k == 1:
-            want = qemu_reference(prog, a.out / 'qemu' / prog['name'])
+            want = expected_state(prog)
             rc, out, err, secs = run('unacked-control', smp_description(prog), kicks, wd / 1000 + 5)
             diffs = [f'driver exit {rc}: {err.strip()[-300:]}'] if rc else judge_smp(prog, want, out, [None] * 4)
             if out and out['cpus'][0]['stats']['shootdowns'] < 1: diffs.append('vCPU 0 shot nothing down')
