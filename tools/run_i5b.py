@@ -17,14 +17,14 @@ reference AMD machine's (`tools/reference/gen_xsave.py`, `ref_native.py`); here 
 
 `faults`: each case is judged by the SDM rules (Vol.2 FXSAVE, FXRSTOR, XSAVE, XSAVEOPT, XSAVEC, XRSTOR, XGETBV, XSETBV; Vol.1 13.7-13.10):
 the exception (vector, error code, RIP of the instruction, CR2), and the state at it equal to natemu's own run of the
-program cut before the instruction (GPRs, XMM, MXCSR, the x87 report, the data region: no partial update). Where the
-case needs no paging mutation or CPL change QEMU runs it too and must raise the same exception (QEMU_DIFFERS lists the
-cases it does not, with the reason). Choices recorded in `crates/runtime/src/execution/xsave.rs`: misalignment is #GP,
+program cut before the instruction (GPRs, XMM, MXCSR, the x87 report, the data region: no partial update). natemu only:
+the rule decides (pinned QEMU, once a cross-check of the rule, departs from it for #NM under CR0.TS, MXCSR's reserved
+bits and #SS(0)). Choices recorded in `crates/runtime/src/execution/xsave.rs`: misalignment is #GP,
 never #AC; #UD (no CR4.OSXSAVE) before #NM (CR0.TS); FXSAVE/FXRSTOR move XMM/MXCSR whatever CR4.OSFXSR; XINUSE all ones.
 `mmio-xsave-*`: an XSAVE whose stores reach a device page stops before storing anything. `segment-*` (fexc series47-seg, owner
 decisions of November 3): CS/DS/ES/SS prefixes ignored, so the operand's default segment decides #SS(0)/#GP(0) for a
 non-canonical address; the last of several FS/GS prefixes applies; FS/GS on an instruction with no memory operand is ignored
-(`segment_cases`). QEMU never raises #SS(0); where it differs the expectation is the reference AMD machine's (probe lines).
+(`segment_cases`); where the SDM leaves it open the expectation is the reference AMD machine's (probe lines).
 """
 import argparse, json, pathlib, struct, subprocess, sys, time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -169,36 +169,23 @@ def image_cases():
 
 
 # Fault cases: (name, lines (the last is the instruction under test), expected (vector, error, cr2) or ('stop', reason) or
-# None (runs), setup (natemu description items), d (data), cpl3 (switch to CPL 3 before the instruction), qemu).
+# None (runs), setup (natemu description items), d (data), cpl3 (switch to CPL 3 before the instruction)).
 PF = lambda cr2, write, present=False, user=False: (14, (1 if present else 0) | (2 if write else 0) | (4 if user else 0), cr2)
 GP, NM, UD, SS = (13, 0, 0), (7, 0, 0), (6, 0, 0), (12, 0, 0)
 NONCANON = 0x0000_8000_0000_0000
-GP_AT = lambda rip: (13, 0, rip, 0)
-# QEMU 11.1.2 (TCG, system mode) raises #GP(0) for every non-canonical data address, never #SS(0), even for an RSP/RBP base
-# with no prefix (the controls `segment-none-*`). The #SS(0) of an RSP/RBP base under a CS/DS/ES/SS prefix is the reference
-# AMD machine's (natemu-raw/hwcheck-20261103-01/probe-output.txt lines 277-280: DS/ES on [rbp]; hwcheck-20261103-02/
-# probe2-output.txt lines 15-18 (two null prefixes on [rbp]), 23-26 (DS on [rsp + rbx], CS on [rbp]), 29-32 (PUSH/POP [rbp]
-# with DS)): the default segment decides. Its #GP(0) for an SS prefix on a DS-default operand agrees with that machine
-# (probe-output.txt lines 273-274; probe2-output.txt lines 11-14, 27-28, 33-36, 41-46).
-QEMU_NO_SS = 'QEMU 11.1.2 raises #GP(0) for every non-canonical data address, never #SS(0) (the AMD machine: #SS(0), the default segment SS)'
-# An FS/GS prefix before a null one still applies (the AMD machine: probe2-output.txt lines 49-54, 59-60; QEMU 11.1.2 agrees).
-QEMU_DIFFERS = {
-    'ts-xsave': 'QEMU 11.1.2 never raises #NM for XSAVE/XRSTOR under CR0.TS (SDM Vol.2 XSAVE, XRSTOR: #NM if CR0.TS = 1)',
-    'ts-xrstor': 'as ts-xsave',
-    'ts-xsaveopt': 'as ts-xsave',
-    'xrstor-mxcsr-reserved-sse': 'QEMU 11.1.2 loads MXCSR without the reserved-bit #GP(0) (SDM Vol.2 XRSTOR, FXRSTOR)',
-    'xrstor-mxcsr-reserved-avx': 'as xrstor-mxcsr-reserved-sse (and it does not load MXCSR for RFBM = AVX alone)',
-    'fxrstor-mxcsr-reserved': 'as xrstor-mxcsr-reserved-sse',
-}
+# The #SS(0) of an RSP/RBP base under a CS/DS/ES/SS prefix is the reference AMD machine's (natemu-raw/hwcheck-20261103-01/
+# probe-output.txt lines 277-280: DS/ES on [rbp]; hwcheck-20261103-02/probe2-output.txt lines 15-18 (two null prefixes on
+# [rbp]), 23-26 (DS on [rsp + rbx], CS on [rbp]), 29-32 (PUSH/POP [rbp] with DS)): the default segment decides. So is the
+# #GP(0) for an SS prefix on a DS-default operand (probe-output.txt lines 273-274; probe2-output.txt lines 11-14, 27-28,
+# 33-36, 41-46).
+# An FS/GS prefix before a null one still applies (the AMD machine: probe2-output.txt lines 49-54, 59-60).
 
 
 def fault_cases():
     out = []
-    def case(name, lines, want, setup=(), d=None, cpl3=False, qemu=True, prefix=None):
-        # QEMU 11.1.2's TCG has no XSAVEC and no compacted XRSTOR (it raises #UD, #GP): natemu only, by the SDM.
-        qemu = qemu and not any('xsavec' in l for l in lines) and 'compacted' not in name
+    def case(name, lines, want, setup=(), d=None, cpl3=False, prefix=None):
         out.append({'name': name, 'lines': lines, 'want': want, 'setup': list(setup), 'd': d if d is not None else data(), 'cpl3': cpl3,
-                    'qemu': qemu and not setup and not cpl3, 'prefix': prefix if prefix is not None else prelude()})
+                    'prefix': prefix if prefix is not None else prelude()})
     full = ['mov eax, 7', 'xor edx, edx']
     # Alignment: #GP(0) for FX* at 16, X* at 64 bytes, before the walk (the misaligned page is not even present).
     for insn, off in (('fxsave', 8), ('fxrstor', 8), ('fxsave64', 4), ('xsave', 0x10), ('xsave', 0x20), ('xrstor', 0x30), ('xrstor', 0x8), ('xsave64', 0x1),
@@ -253,13 +240,12 @@ def fault_cases():
     # Non-canonical operands: #GP(0), #SS(0) through RSP/RBP.
     for insn in ('fxsave', 'fxrstor', 'xsave', 'xrstor', 'xsaveopt', 'xsavec'):
         case(f'noncanonical-{insn}', full + [f'mov rbx, {NONCANON:#x}', f'{insn} [rbx]'], GP)
-        # (natemu only. RSP: QEMU's stub cannot take an exception at CPL 0 on that RSP. Straddle: QEMU maps no page below
-        # the canonical gap, so its #PF there says nothing of the order; natemu checks each accessed range's canonical form
-        # before walking it, as I6's transactions, so the range reaching into the gap is #GP(0).)
-        case(f'noncanonical-rsp-{insn}', full + [f'mov rsp, {NONCANON:#x}', f'{insn} [rsp]'], SS, qemu=False)
-        case(f'straddle-{insn}', full + [f'mov rbx, {NONCANON - 0x40:#x}', f'{insn} [rbx]'], GP, qemu=False)
+        # (Straddle: natemu checks each accessed range's canonical form before walking it, as I6's transactions, so the
+        # range reaching into the gap is #GP(0).)
+        case(f'noncanonical-rsp-{insn}', full + [f'mov rsp, {NONCANON:#x}', f'{insn} [rsp]'], SS)
+        case(f'straddle-{insn}', full + [f'mov rbx, {NONCANON - 0x40:#x}', f'{insn} [rbx]'], GP)
     # XRSTOR reads its header first, but a non-canonical base is #GP(0) even with the header at +512 canonical (and absent).
-    case('noncanonical-base-xrstor', full + [f'mov rbx, {0xffff_7fff_ffff_fe00:#x}', 'xrstor [rbx]'], GP, qemu=False)
+    case('noncanonical-base-xrstor', full + [f'mov rbx, {0xffff_7fff_ffff_fe00:#x}', 'xrstor [rbx]'], GP)
     # Gating: CR0.TS (#NM for all four), CR0.EM (#NM for FX* only: XSAVE runs), no CR4.OSXSAVE (#UD, XGETBV/XSETBV too).
     cr0 = lambda bits: ['mov rax, cr0', f'or rax, {bits}', 'mov cr0, rax']
     no_osxsave = ['mov rax, cr4', 'btr rax, 18', 'mov cr4, rax']
@@ -322,9 +308,9 @@ def fault_cases():
     # Images clearing a mask load (I5c: unmasked exceptions are built, tools/run_i5c.py).
     for tag, kw in (('fcw', {'fcw': 0x037e}), ('mxcsr', {'mxcsr': 0x1f00})):
         d = data(); d[0x1000:0x11a0] = legacy_image(**kw)
-        case(f'fxrstor-unmasked-{tag}', ['fxrstor [rdi + 0x1000]'], None, d=d, qemu=False)
+        case(f'fxrstor-unmasked-{tag}', ['fxrstor [rdi + 0x1000]'], None, d=d)
         d = data(); d[0x1000:0x1000 + 832] = xsave_image(7, **kw)
-        case(f'xrstor-unmasked-{tag}', ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], None, d=d, qemu=False)
+        case(f'xrstor-unmasked-{tag}', ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], None, d=d)
     d = data(); d[0x1000:0x1000 + 832] = xsave_image(6, fcw=0x037e)          # x87 not restored: the FCW is not loaded
     case('xrstor-unmasked-fcw-not-restored', ['mov eax, 7', 'xor edx, edx', 'xrstor [rdi + 0x1000]'], None, d=d)
     # M3: an XSAVE whose stores reach a device page stops `unsupported_mmio` before writing any byte (the RAM part included;
@@ -343,7 +329,7 @@ def fault_cases():
 # machine's rule where Intel's SDM does not define it): the operand's default segment decides a non-canonical address's
 # exception, #SS(0) for an RSP/RBP base, #GP(0) otherwise, whatever CS/DS/ES/SS prefix it has. fexc's forms (load, store, read-modify-write, LOCK, BT*, Linux's
 # `ds btr` from its SMP alternatives) and the host's (LDMXCSR, FXSAVE, XSAVE; a BT* form under alignment checking at CPL 3),
-# canonical (runs) and not. The RSP base is [rsp + rbx] with RSP itself canonical, so QEMU can deliver the exception.
+# canonical (runs) and not. The RSP base is [rsp + rbx] with RSP itself canonical.
 SEGMENT_FORMS = [('load', 'mov rax, qword ptr {s}:[{b}]'), ('store', 'mov qword ptr {s}:[{b}], rcx'), ('rmw', 'add qword ptr {s}:[{b}], 1'),
                  ('lock', 'lock add qword ptr {s}:[{b}], rcx'), ('btr', 'btr qword ptr {s}:[{b}], rdx'), ('lock-bts', 'lock bts qword ptr {s}:[{b}], 5'),
                  ('ldmxcsr', 'ldmxcsr dword ptr {s}:[{b}]'), ('fxsave', 'fxsave {s}:[{b}]'), ('xsave', 'xsave {s}:[{b}]')]
@@ -364,68 +350,68 @@ def segment_cases():
         for name, line in SEGMENT_FORMS:
             for tname, target, want in (('canonical', D + 0x1000, None), ('noncanonical', NONCANON, nc), ('straddle', NONCANON - 2, nc)):
                 # A straddle: not a split lock, not BT* (its unit), not FX*/X* (misaligned: #GP first); natemu checks the whole
-                # range's canonical form before any walk, QEMU (no page below it) takes #PF first: natemu only.
+                # range's canonical form before any walk.
                 if tname == 'straddle' and name in ('lock', 'lock-bts', 'btr', 'fxsave', 'xsave'): continue
                 lines = ['mov eax, 7', 'xor edx, edx', 'mov ecx, 0x1f80', 'mov dword ptr [rdi + 0x1000], ecx'] + setup(b, target) + \
                         (['mov edx, 0x45'] if name == 'btr' else []) + [operand(line, s, b)]
                 out.append({'name': f'segment-{s}-{b.replace(" + ", "-")}-{name}-{tname}', 'lines': lines, 'want': want, 'setup': [], 'd': data(),
-                            'cpl3': False, 'qemu': tname != 'straddle', 'prefix': prelude(), 'qemu_differs_if': QEMU_NO_SS if want == SS else None})
+                            'cpl3': False, 'prefix': prelude()})
         # BT* under alignment checking (CPL 3, the host's BT_ALIGNED cut): #AC when misaligned and canonical, the class's
         # exception when not canonical, the stepped instruction when aligned.
         if b == 'rsp + rbx': continue
         for tname, target, want in (('aligned', D + 0x1000, None), ('misaligned', D + 0x1004, (17, 0, 0)), ('noncanonical', NONCANON, nc)):
             out.append({'name': f'segment-{s}-{b.replace(" + ", "-")}-ac-bts-{tname}', 'lines': setup(b, target) + [operand('bts qword ptr {s}:[{b}], 5', s, b)],
-                        'want': want, 'setup': [], 'd': data(), 'cpl3': 'ac', 'qemu': False, 'prefix': prelude()})
+                        'want': want, 'setup': [], 'd': data(), 'cpl3': 'ac', 'prefix': prelude()})
     # Linux 6.12's `ds btr %rdx, 0x540(%rbp)` (its SMP alternatives' DS in place of LOCK on one CPU), as the kernel has it.
     for tname, rbp, want in (('canonical', D + 0x1000 - 0x540, None), ('noncanonical', NONCANON - 0x540, SS)):
         out.append({'name': f'segment-linux-ds-btr-{tname}', 'lines': [f'mov rbp, {rbp % 2 ** 64:#x}', 'mov edx, 0x45',
                     '.byte 0x3e, 0x48, 0x0f, 0xb3, 0x95, 0x40, 0x05, 0x00, 0x00'], 'want': want, 'setup': [], 'd': data(), 'cpl3': False,
-                    'qemu': True, 'prefix': prelude(), 'qemu_differs_if': QEMU_NO_SS if want == SS else None})
+                    'prefix': prelude()})
     # Forms refused before series47-seg, each canonical (runs) and not: two null prefixes, SS on moffs/XLAT/string sources,
     # PUSH/POP m with DS on RBP, several FS/GS prefixes (the bases make only the applied one's address canonical), an FS/GS
     # prefix after or before a null one, FS/GS on forms with no overridable operand (STOS/SCAS's ES:RDI, a register form).
     B = lambda *x: '.byte ' + ', '.join(f'{v:#x}' for v in x)
     top = (D + 0x1000 - NONCANON) % 2 ** 64                        # a canonical FS base taking NONCANON to D + 0x1000
     FSB = 0x7fff_ffff_f000                                         # an FS base taking any small offset past the canonical top
-    # FS.base by WRMSR (the QEMU stub's capture needs its own GS base: GS is only read, by RDMSR, never written).
+    # FS.base by WRMSR (GS is only read, by RDMSR, never written).
     def fs(v): return [f'mov ecx, {0xc0000100:#x}', f'mov eax, {v & 0xffffffff:#x}', f'mov edx, {v >> 32:#x}', 'wrmsr']
     via = {'gs': ['mov ecx, 0xc0000101', 'rdmsr', 'shl rdx, 32', 'or rax, rdx', f'mov rbx, {D + 0x1000:#x}', 'sub rbx, rax'],
            'fs': [f'mov rbx, {(D + 0x1000 - FSB) % 2 ** 64:#x}']}  # RBX = D + 0x1000 - the base that must apply
     mxcsr = ['mov ecx, 0x1f80', 'mov dword ptr [rdi + 0x1000], ecx']
     pair = lambda nc: (('canonical', D + 0x1000, None), ('noncanonical', NONCANON, nc))
     reg = (('canonical', 0, None),)
-    extra = [   # (name, register set to each variant's value, lines before, instruction, variants (name, value, want), FS.base, QEMU's difference)
-        ('ss-ds-rbx-load', 'rbx', [], B(0x36, 0x3e, 0x48, 0x8b, 0x03), pair(GP), 0, None),
-        ('ds-ss-rbp-load', 'rbp', [], B(0x3e, 0x36, 0x48, 0x8b, 0x45, 0x00), pair(SS), 0, QEMU_NO_SS),
-        ('ds-ss-rbp-fxsave', 'rbp', [], B(0x3e, 0x36, 0x0f, 0xae, 0x45, 0x00), pair(SS), 0, QEMU_NO_SS),
-        ('ss-xlat', 'rbx', ['mov eax, 3'], B(0x36, 0xd7), pair(GP), 0, None),
-        ('ss-lods', 'rsi', [], B(0x36, 0x48, 0xad), pair(GP), 0, None),
-        ('ss-movs', 'rsi', ['lea rdi, [rdi + 0x1800]'], B(0x36, 0x48, 0xa5), pair(GP), 0, None),
-        ('ss-cmps', 'rsi', ['lea rdi, [rdi + 0x1800]'], B(0x36, 0x48, 0xa7), pair(GP), 0, None),
-        ('ds-rbp-push', 'rbp', [], B(0x3e, 0xff, 0x75, 0x00), pair(SS), 0, QEMU_NO_SS),
-        ('ds-rbp-pop', 'rbp', ['push rcx'], B(0x3e, 0x8f, 0x45, 0x00), pair(SS), 0, QEMU_NO_SS),
+    extra = [   # (name, register set to each variant's value, lines before, instruction, variants (name, value, want), FS.base)
+        ('ss-ds-rbx-load', 'rbx', [], B(0x36, 0x3e, 0x48, 0x8b, 0x03), pair(GP), 0),
+        ('ds-ss-rbp-load', 'rbp', [], B(0x3e, 0x36, 0x48, 0x8b, 0x45, 0x00), pair(SS), 0),
+        ('ds-ss-rbp-fxsave', 'rbp', [], B(0x3e, 0x36, 0x0f, 0xae, 0x45, 0x00), pair(SS), 0),
+        ('ss-xlat', 'rbx', ['mov eax, 3'], B(0x36, 0xd7), pair(GP), 0),
+        ('ss-lods', 'rsi', [], B(0x36, 0x48, 0xad), pair(GP), 0),
+        ('ss-movs', 'rsi', ['lea rdi, [rdi + 0x1800]'], B(0x36, 0x48, 0xa5), pair(GP), 0),
+        ('ss-cmps', 'rsi', ['lea rdi, [rdi + 0x1800]'], B(0x36, 0x48, 0xa7), pair(GP), 0),
+        ('ds-rbp-push', 'rbp', [], B(0x3e, 0xff, 0x75, 0x00), pair(SS), 0),
+        ('ds-rbp-pop', 'rbp', ['push rcx'], B(0x3e, 0x8f, 0x45, 0x00), pair(SS), 0),
         # Several FS/GS prefixes, and one with a null prefix: RBX reaches D + 0x1000 only through the base that must apply (the
         # other takes it past the canonical top, or to an unmapped page).
-        ('fs-gs-last', None, via['gs'], B(0x64, 0x65, 0x48, 0x8b, 0x03), reg, FSB, None),
-        ('gs-fs-last', None, via['fs'], B(0x65, 0x64, 0x48, 0x8b, 0x03), reg, FSB, None),
-        ('fs-gs-fs-last', None, via['fs'], B(0x64, 0x65, 0x64, 0x48, 0x8b, 0x03), reg, FSB, None),
-        ('gs-fs-gs-last', None, via['gs'], B(0x65, 0x64, 0x65, 0x48, 0x8b, 0x03), reg, FSB, None),
-        ('ds-fs-last', None, via['fs'], B(0x3e, 0x64, 0x48, 0x8b, 0x03), reg, FSB, None),
-        ('fs-ds-last', None, via['fs'], B(0x64, 0x3e, 0x48, 0x8b, 0x03), reg, FSB, None),
-        ('gs-ss-last', None, via['gs'], B(0x65, 0x36, 0x48, 0x8b, 0x03), reg, FSB, None),
-        ('fs-gs-ldmxcsr', None, via['gs'], B(0x64, 0x65, 0x0f, 0xae, 0x13), reg, FSB, None),
-        ('gs-fs-ldmxcsr', None, via['fs'], B(0x65, 0x64, 0x0f, 0xae, 0x13), reg, FSB, None),
+        ('fs-gs-last', None, via['gs'], B(0x64, 0x65, 0x48, 0x8b, 0x03), reg, FSB),
+        ('gs-fs-last', None, via['fs'], B(0x65, 0x64, 0x48, 0x8b, 0x03), reg, FSB),
+        ('fs-gs-fs-last', None, via['fs'], B(0x64, 0x65, 0x64, 0x48, 0x8b, 0x03), reg, FSB),
+        ('gs-fs-gs-last', None, via['gs'], B(0x65, 0x64, 0x65, 0x48, 0x8b, 0x03), reg, FSB),
+        ('ds-fs-last', None, via['fs'], B(0x3e, 0x64, 0x48, 0x8b, 0x03), reg, FSB),
+        ('fs-ds-last', None, via['fs'], B(0x64, 0x3e, 0x48, 0x8b, 0x03), reg, FSB),
+        ('gs-ss-last', None, via['gs'], B(0x65, 0x36, 0x48, 0x8b, 0x03), reg, FSB),
+        ('fs-gs-ldmxcsr', None, via['gs'], B(0x64, 0x65, 0x0f, 0xae, 0x13), reg, FSB),
+        ('gs-fs-ldmxcsr', None, via['fs'], B(0x65, 0x64, 0x0f, 0xae, 0x13), reg, FSB),
         # FS on forms with no overridable operand: ignored (FS.base would take NONCANON to D + 0x1000).
-        ('fs-stos', 'rdi', [], B(0x64, 0x48, 0xab), pair(GP), top, None),
-        ('fs-scas', 'rdi', [], B(0x64, 0x48, 0xaf), pair(GP), top, None),
-        ('fs-gs-reg', None, [], B(0x64, 0x65, 0x48, 0x01, 0xc8), reg, top, None),
-        ('fs-push-reg', None, [], B(0x64, 0x50), reg, top, None),
-        ('fs-pop-reg', None, ['push rcx'], B(0x64, 0x59), reg, top, None)]
-    for name, r, before, insn, variants, fsbase, differs in extra:
+        ('fs-stos', 'rdi', [], B(0x64, 0x48, 0xab), pair(GP), top),
+        ('fs-scas', 'rdi', [], B(0x64, 0x48, 0xaf), pair(GP), top),
+        ('fs-gs-reg', None, [], B(0x64, 0x65, 0x48, 0x01, 0xc8), reg, top),
+        ('fs-push-reg', None, [], B(0x64, 0x50), reg, top),
+        ('fs-pop-reg', None, ['push rcx'], B(0x64, 0x59), reg, top)]
+    for name, r, before, insn, variants, fsbase in extra:
         for tname, target, want in variants:
             lines = fs(fsbase) + mxcsr + before + ([f'mov {r}, {target:#x}'] if r else []) + [insn]
-            out.append({'name': f'segment-{name}-{tname}', 'lines': lines, 'want': want, 'setup': [], 'd': data(), 'cpl3': False, 'qemu': True,
-                        'prefix': prelude(), 'qemu_differs_if': differs if want == SS else None})
+            out.append({'name': f'segment-{name}-{tname}', 'lines': lines, 'want': want, 'setup': [], 'd': data(), 'cpl3': False,
+                        'prefix': prelude()})
     return out
 
 
@@ -498,7 +484,7 @@ def run_images(a, host, runtime, stub, results):
     return bad
 
 
-def run_faults(a, host, runtime, stub, results):
+def run_faults(a, host, runtime, results):
     bad = 0
     for c in fault_cases():
         if a.only and a.only not in c['name']: continue
@@ -536,26 +522,9 @@ def run_faults(a, host, runtime, stub, results):
             m, m0 = (s3.vm_state(p, o)['memory'][0]['data'] for p, o in ((prog, out), (pre_prog, out0)))
             if m != m0:
                 j = next(k for k in range(len(m)) if m[k] != m0[k]); problems.append(f'memory written at +{j:#x}')
-        if c['qemu'] and not a.no_qemu and c['want'] is not None and c['want'][0] != 'stop':
-            full = qemu(prog, stub, a.out / 'qemu' / c['name'], timeout=30)
-            qf = full and s3.tupled(answers.derive(full, 'cpu0-fault', lambda f: f['cpus'][0].get('fault')))
-            exp = (c['want'][0], c['want'][1], at, c['want'][2] if c['want'][0] == 14 else 0)
-            differs = QEMU_DIFFERS.get(c['name']) or c.get('qemu_differs_if')
-            if qf != exp:
-                if differs and (c['name'] in QEMU_DIFFERS or qf == GP_AT(at)): c['qemu_differs'] = f'{qf}: {differs}'
-                else: problems.append(f'QEMU raises {qf}, the SDM rule {exp}')
-            elif differs: problems.append('QEMU_DIFFERS lists it but QEMU agrees')
-        elif c['qemu'] and not a.no_qemu and c['want'] is None:
-            full = qemu(prog, stub, a.out / 'qemu' / c['name'], timeout=30)
-            qf = full and s3.tupled(answers.derive(full, 'cpu0-fault', lambda f: f['cpus'][0].get('fault')))
-            if full is None or qf is not None:
-                if c.get('qemu_differs_if') and qf is not None: c['qemu_differs'] = f"{qf}: {c['qemu_differs_if']}"
-                else: problems.append(f"QEMU: {qf} (the rule: no fault)")
-            elif c.get('qemu_differs_if'): problems.append('qemu_differs_if set but QEMU agrees')
         bad += bool(problems)
-        results.append({'group': 'faults', 'name': c['name'], 'ok': not problems, 'problems': problems, 'qemu_differs': c.get('qemu_differs')})
-        print(f"{c['name']}: {'ok' if not problems else 'FAIL'}" + (f" (QEMU differs: {c['qemu_differs']})" if c.get('qemu_differs') else ''),
-              *problems[:6], sep='\n  ', flush=True)
+        results.append({'group': 'faults', 'name': c['name'], 'ok': not problems, 'problems': problems})
+        print(f"{c['name']}: {'ok' if not problems else 'FAIL'}", *problems[:6], sep='\n  ', flush=True)
     return bad
 
 
@@ -566,10 +535,9 @@ def main():
     ap.add_argument('--group', choices=('images', 'faults'))
     a = ap.parse_args()
     host, runtime = (ROOT / 'target/release/natemu-host', ROOT / 'target/aarch64-unknown-none/release/natemu-runtime') if a.no_build else vm1.build()
-    stub = smp.build_stub(a.out / 'qemu-build')
     results = []
-    bad = (run_images(a, host, runtime, stub, results) if a.group != 'faults' else 0) + \
-          (run_faults(a, host, runtime, stub, results) if a.group != 'images' else 0)
+    bad = (run_images(a, host, runtime, smp.build_stub(a.out / 'qemu-build'), results) if a.group != 'faults' else 0) + \
+          (run_faults(a, host, runtime, results) if a.group != 'images' else 0)
     (a.out / 'results.json').write_text(json.dumps(results, indent=1, default=str) + '\n')
     print(f'{len(results)} cases, {len(results) - bad} as expected, {bad} not')
     sys.exit(1 if bad else 0)
