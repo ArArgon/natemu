@@ -145,8 +145,8 @@ own and asks the pool; counts are per CPU, a peer may serve a first request too,
   fences share the own-template path's code, `reuse_fenced`, which no program here arms).
 Perf chunk 11 (natemu only):
 - `link-full`: more links than the record area holds. By default a test capacity of 16 Ki records (NATEMU_LINK_CAP: a
-  chain of 20,480 link points through 5 pages above 4 GiB); `--full-links`: the production 512 Ki (a chain of 573,440 link
-  points through 140 pages above 4 GiB), about 30 of the K1 run's 35 minutes. Three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
+  chain of 20,480 link points through 5 pages above 4 GiB); `--full-links`: the production 512 Ki (a chain of 688,128 link
+  points through 168 pages above 4 GiB), about 30 of the K1 run's 35 minutes. Three passes per phase: as placed; after CPU (i - 1) % N rewrote one of its pages; after a page remapped with a CR3
   reload; back with INVLPG: every pass counts exactly, the area filled without a flush, and each fill cost at most two
   passes over it (`reclaims` at most 1 + 4 links / capacity).
 - `counts`: `cr3-switch` at K and 2K rounds on 1 vCPU: the resident's translation requests and the host's compiles must
@@ -862,8 +862,10 @@ MAX_LINKS = 512 * 1024                    # natemu_abi::execution::cache::MAX_LI
 # `link-full` overflows a test-only capacity by default (the host's NATEMU_LINK_CAP -> `cache::Control::link_cap`): the
 # same linker paths (full area, local prune, unlink-all, reclaim bookkeeping), at a chain 28 times shorter. `--full-links`
 # runs the production size (cap MAX_LINKS, no env). Each of the FM pages holds 4096 link points. At MAX_LINKS FM = cap/4096
-# + 12: the first fill leaves a 12-page tail and FW lies in it, so its links are live when it is written. At a small cap
-# FM = cap/4096 + 1 (5 at 16 Ki: the chain is 1.25 x the cap, 1.09 x at full size). A link-by-link model of the linker's
+# + 40: the first fill leaves a 40-page tail (17 when extended blocks, `NATEMU_EXT_CONDS=4`, make a page yield only about 0.85 of
+# its 4096 links: the 12 pages of an earlier calibration left that chain at 484,653 links, under the capacity) and FW lies in
+# it, so its links are live when it is written. At a small cap
+# FM = cap/4096 + 1 (5 at 16 Ki: the chain is 1.25 x the cap, 1.31 x at full size). A link-by-link model of the linker's
 # fill (clear everything when links + 4 > cap; three passes) that tolerates 0-60 further links from other blocks leaves
 # pages FM-3 .. FM-1 live at the end of a phase, so FW = FM-2 is live then, as at full size (FM-10 is not, at a small cap).
 LINK_CAP = 16 * 1024
@@ -876,7 +878,7 @@ def set_link_cap(cap):
     assert cap == MAX_LINKS or (cap % 4096 == 0 and 16 * 1024 <= cap < MAX_LINKS), cap
     CAP = cap
     assert 2 * 2048 * (cap // 4096 + 1) > cap
-    FM = cap // 4096 + (12 if cap == MAX_LINKS else 1)   # 140 at 512 Ki (76 at 256 Ki): 2 * 2048 * FM records > cap
+    FM = cap // 4096 + (40 if cap == MAX_LINKS else 1)   # 168 at 512 Ki (76 at 256 Ki): 2 * 2048 * FM records > cap
     FW, FH = (FM - 10 if cap == MAX_LINKS else FM - 2), FM // 2   # FW late in the chain: a fill keeps the chain's tail
 set_link_cap(LINK_CAP)
 FC, FWC, FC2, FE = 0x9000, 0xa000, 0xb000, 0xc000

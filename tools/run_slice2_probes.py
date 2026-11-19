@@ -295,7 +295,7 @@ def main():
     # Derived from semantics (see add_chain): a forced code cache of the smallest size flushes repeatedly and still
     # matches; a straight-line program of 33,000 blocks reaches its end although its host work (one compile per block)
     # far exceeds the watchdog, which bounds guest time between host exits only.
-    for (count, trips), args, flushes in [((600, 3), ['1', '--code-cache', '32768'], True), ((600, 3), ['2', '--code-cache', '32768'], True),
+    for (count, trips), args, flushes in [((1200, 3), ['1', '--code-cache', '32768'], True), ((1200, 3), ['2', '--code-cache', '32768'], True),
                                          ((33000, None), ['1', '--watchdog-ms', '2000'], False)][a.shard[0] - 1::a.shard[1]]:
         program, result, end = add_chain(count, trips)
         state, err = run(program['name'], program, args)
@@ -319,7 +319,19 @@ def main():
     code_max = str(128 * 2**20 - (0x14000 + 4 * 65536 * 32))    # CODE_BYTES_MAX - HEAD_BYTES (perf chunk 19: 64 Ki L1 entries; the 16 KiB dispatcher area of this branch)
     for count, block, load, full in shard.take([(1_200_000, '1', None, 0), (3_600_000, '3', 0x1000_0000, 1)], a.shard):
         program, result, end = add_chain(count, 2, step=0, load=load)
-        args = [block, '--code-cache', code_max, '--watchdog-ms', '60000']
+        cache = code_max
+        if full == 0:
+            # Blocks denser than 128 bytes (data-l1/hot-cold, extended blocks) fill the 1 Mi index before the code area, so the
+            # code area could never be what fills: measure the bytes a block takes (4,000 blocks, the head being the capacity
+            # less the request) and, when the index would come first, size the cache to hold 80% of the index's blocks.
+            probe, _, _ = add_chain(4000, 1, step=0)
+            ps, _ = run('adds-size', probe, [block, '--code-cache', str(1 << 20)])
+            if ps is not None:
+                k = ps['stats']['k1']
+                per = (k['used'][0] - (k['capacity'][0] - (1 << 20))) / ps['stats']['distinct']
+                if per * (1 << 20) < int(code_max) * 1.1:
+                    cache = str(int(0.8 * per * (1 << 20)))
+        args = [block, '--code-cache', cache, '--watchdog-ms', '60000']
         state, err = run(program['name'], program, args)
         diffs = [f'host error: {err}'] if state is None else ref.compare(result, [ref.num(v) for v in state['gpr']],
                  ref.num(state['rflags']), ref.num(state['rip']), state['memory'])
