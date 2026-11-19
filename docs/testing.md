@@ -175,8 +175,7 @@ holds only a *light* claim on this Mac: it takes no cores and never holds up an 
 Everything a machine builds or downloads lives in `~/Library/Caches/natemu/testkit` (`NATEMU_TEST_CACHE` to move it),
 identified by what it was built from, and is shared by every checkout. Entries are read-only once built. After each
 run the cache is cleaned down to its cap (100 GiB; `NATEMU_TEST_CACHE_CAP`), least recently used first, keeping what
-any live checkout used last and what running runs hold. On a nearly full disk it is cleaned further, until 10 GiB stay
-free on its volume (`NATEMU_TEST_DISK_RESERVE`), as far as running runs and live checkouts allow. `tools/natemu-test gc` cleans on demand. Each checkout's own
+any live checkout used last and what running runs hold. `tools/natemu-test gc` cleans on demand. Each checkout's own
 cargo `target/` folder is not part of it.
 
 ```sh
