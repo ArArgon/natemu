@@ -251,10 +251,38 @@ BENCH_BUILDER = 'docker.io/library/debian@sha256:8f6a88feef3ed01a300dafb87f20897
 
 
 def local_config() -> dict:
-    """This machine's settings: .natemu/config.toml in the worktree (not committed; spec R9)."""
+    """This machine's settings (not committed; spec R9): config.toml in the cache folder (every checkout on the machine),
+    overridden table by table by .natemu/config.toml in the worktree."""
     import tomllib
-    f = paths.repo_root() / '.natemu' / 'config.toml'
-    return tomllib.loads(f.read_text()) if f.exists() else {}
+    out = {}
+    for f in (paths.cache_root() / 'config.toml', paths.repo_root() / '.natemu' / 'config.toml'):
+        if f.exists():
+            for k, v in tomllib.loads(f.read_text()).items():
+                out[k] = {**out.get(k, {}), **v} if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def container_builder() -> str:
+    """Where the amd64 container builds (testkit.inputs._in_container: the input recipes, the campaign images) run:
+    'local' (this Mac's Apple `container`, through Rosetta) or 'ssh:user@host' (the same pinned image, BENCH_BUILDER,
+    under Docker on an x86-64 Linux machine: native speed). NATEMU_CONTAINER_BUILDER, else [build] builder in the
+    machine's or the worktree's config.toml."""
+    b = os.environ.get('NATEMU_CONTAINER_BUILDER') or local_config().get('build', {}).get('builder', 'local')
+    if b != 'local' and not b.startswith('ssh:'):
+        raise BuildFailure('container-builder', f'unknown builder {b!r}: local or ssh:user@host')
+    return b
+
+
+def build_env_described() -> str:
+    b = container_builder()
+    return f'local: {BENCH_BUILDER} (amd64 through Rosetta)' if b == 'local' else f'{BENCH_BUILDER} under Docker on {b[4:]} (native)'
+
+
+def build_env() -> str:
+    """What a container-built input is keyed by: the image, and the machine it ran on when that is not this Mac (an
+    entry built natively there is never taken for one built here, and the other way round)."""
+    b = container_builder()
+    return BENCH_BUILDER if b == 'local' else f'{BENCH_BUILDER} on {b[4:]}'
 
 
 def bench_builder() -> str:

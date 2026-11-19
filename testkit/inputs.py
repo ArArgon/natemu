@@ -91,11 +91,9 @@ def block_inputs() -> pathlib.Path:
 
 
 def _network_recipe(out: pathlib.Path, inputs: list) -> None:
-    recipe, image = inputs[:2]
+    recipe = pathlib.Path(inputs[0])
     work = out / 'work'; work.mkdir()
-    artifacts._run(['container', 'run', '--rm', '--arch', 'amd64', '--cpus', '4', '--memory', '4g',
-                    '--volume', f'{recipe}:/recipe:ro', '--volume', f'{work}:/work', image, 'bash', '/recipe/container.sh'],
-                   timeout=3600)
+    _in_container('network-rootfs', recipe, work)
     (out / 'rootfs').mkdir()
     artifacts._run(['tar', '-C', out / 'rootfs', '-xpf', work / 'rootfs.tar'])
     for n in ('packages.txt', 'debs.sha256'): shutil.copy2(work / n, out / n)
@@ -105,26 +103,34 @@ def _network_recipe(out: pathlib.Path, inputs: list) -> None:
 def network_rootfs() -> pathlib.Path:
     """The iperf3/curl/openssl tree tools/run_net_linux.py copies into its guest: tools/io/network-rootfs, pinned Debian
     packages unpacked in an amd64 Debian container (the bench image's builder)."""
-    if not shutil.which('container'): raise BuildFailure('network-rootfs', "needs Apple's `container` (brew install container)")
     recipe = _tools() / 'io' / 'network-rootfs'
-    return resources.derived('io-network-rootfs', _network_recipe, [recipe, artifacts.BENCH_BUILDER]) / 'rootfs'
+    return resources.derived('io-network-rootfs', _network_recipe, [recipe, artifacts.build_env()]) / 'rootfs'
 
 
 def _in_container(name: str, recipe: pathlib.Path, work: pathlib.Path, memory: str = '4g', timeout: int = 3600,
                   script: str = 'container.sh', pins_to: pathlib.Path | None = None) -> None:
-    """recipe/<script> in the amd64 Debian builder (artifacts.BENCH_BUILDER, through Rosetta), /recipe read-only and
-    /work = work. A download that fails is Unpreparable (the URL is in the message), anything else a BuildFailure.
-    New pins a re-pinning build wrote (work's packages.txt, debs.sha256, sources.sha256, or a work/repin tree) are kept
-    in the state folder, to be checked and copied into `pins_to` (default: the recipe)."""
-    if not shutil.which('container'): raise BuildFailure(name, "needs Apple's `container` (brew install container)")
+    """recipe/<script> in the amd64 Debian builder (artifacts.BENCH_BUILDER), /recipe read-only and /work = work: on
+    this Mac through Rosetta, or natively under Docker on the x86 machine artifacts.container_builder() names (the
+    recipe is copied there, the work folder copied back, nothing kept there). A download that fails is Unpreparable
+    (the URL is in the message), anything else a BuildFailure. New pins a re-pinning build wrote (work's packages.txt,
+    debs.sha256, sources.sha256, or a work/repin tree) are kept in the state folder, to be checked and copied into
+    `pins_to` (default: the recipe)."""
+    builder = artifacts.container_builder()
     cname = f'natemu-build-{name}-{os.getpid()}'
-    cmd = ['container', 'run', '--rm', '--name', cname, '--arch', 'amd64', '--cpus', '4', '--memory', memory,
-           '--volume', f'{recipe}:/recipe:ro', '--volume', f'{work}:/work', artifacts.BENCH_BUILDER, 'bash', f'/recipe/{script}']
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if builder == 'local':
+            if not shutil.which('container'): raise BuildFailure(name, "needs Apple's `container` (brew install container)")
+            cmd = ['container', 'run', '--rm', '--name', cname, '--arch', 'amd64', '--cpus', '4', '--memory', memory,
+                   '--volume', f'{recipe}:/recipe:ro', '--volume', f'{work}:/work', artifacts.BENCH_BUILDER, 'bash', f'/recipe/{script}']
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try: subprocess.run(['container', 'kill', cname], capture_output=True, timeout=60)  # the client's death does not stop it
+                except (OSError, subprocess.SubprocessError): pass
+                raise
+        else:
+            r = _in_docker_over_ssh(builder[4:], cname, recipe, work, memory, timeout, script)
     except subprocess.TimeoutExpired:
-        try: subprocess.run(['container', 'kill', cname], capture_output=True, timeout=60)  # the client's death does not stop it
-        except (OSError, subprocess.SubprocessError): pass
         raise BuildFailure(name, f'{recipe}/{script} took more than {timeout} s')
     if r.returncode:
         tail = (r.stderr or r.stdout)[-1500:]
@@ -144,6 +150,37 @@ def _in_container(name: str, recipe: pathlib.Path, work: pathlib.Path, memory: s
         raise BuildFailure(name, tail)
 
 
+SSH = ['-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=60']
+
+
+def _in_docker_over_ssh(host: str, cname: str, recipe: pathlib.Path, work: pathlib.Path, memory: str, timeout: int,
+                        script: str) -> subprocess.CompletedProcess:
+    """_in_container's run on an x86-64 machine: the same pinned image under Docker, natively. The recipe and the work
+    folder go there by tar, the work folder comes back the same way (outputs, logs, new pins), and the temporary folder
+    there is removed (through the container, as its files are root's)."""
+    image = artifacts.BENCH_BUILDER
+    d = artifacts._run(['ssh', *SSH, host, 'mktemp -d "$HOME/.natemu-build-XXXXXX"']).stdout.strip()
+    try:
+        for local, there in ((recipe, 'recipe'), (work, 'work')):
+            tar = subprocess.run(['tar', '-C', str(local), '-cf', '-', '.'], capture_output=True, check=True).stdout
+            p = subprocess.run(['ssh', *SSH, host, f'mkdir -p {d}/{there} && tar -C {d}/{there} -xf -'], input=tar, capture_output=True)
+            if p.returncode: raise BuildFailure(cname, p.stderr.decode(errors='replace')[-800:])
+        run = (f'docker run --rm --name {cname} --platform linux/amd64 --cpus 8 --memory {memory} '
+               f'-v {d}/recipe:/recipe:ro -v {d}/work:/work {image} bash /recipe/{script}')
+        try:
+            r = subprocess.run(['ssh', *SSH, host, run], capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            subprocess.run(['ssh', *SSH, host, f'docker kill {cname}'], capture_output=True, timeout=60)
+            raise
+        back = subprocess.run(['ssh', *SSH, host, f'tar -C {d}/work -cf - .'], capture_output=True)
+        if back.returncode == 0:
+            subprocess.run(['tar', '-C', str(work), '-xf', '-'], input=back.stdout, check=True, capture_output=True)
+        return r
+    finally:
+        subprocess.run(['ssh', *SSH, host, f'docker run --rm -v {d}:/x {image} rm -rf /x/recipe /x/work; rmdir {d}'],
+                       capture_output=True, timeout=600)
+
+
 def _fio_recipe(out: pathlib.Path, inputs: list) -> None:
     recipe = pathlib.Path(inputs[0])
     work = out / 'work'; work.mkdir()
@@ -156,7 +193,7 @@ def fio_prep() -> pathlib.Path:
     """The fio preparation (run_io_matrix.py prepare --fio-prep): tools/io/fio-prep, Debian's fio 3.39-1 and its
     dependency closure from pinned snapshot packages, unpacked with its ELF closure and the reviewed profiles."""
     recipe = _tools() / 'io' / 'fio-prep'
-    return resources.derived('io-fio-prep', _fio_recipe, [recipe, artifacts.BENCH_BUILDER]) / 'fio-prep'
+    return resources.derived('io-fio-prep', _fio_recipe, [recipe, artifacts.build_env()]) / 'fio-prep'
 
 
 def writable_clone(src: pathlib.Path, dest: pathlib.Path) -> None:
@@ -242,14 +279,14 @@ def _stress_recipe(out: pathlib.Path, inputs: list) -> None:
                                         'the runners accept only that binary')
     (out / 'provenance.json').write_text(json.dumps({
         'binary_sha256': sha(out / 'bin/stress-ng'), 'source_sha256': sha(out / 'source.tar.xz'), 'recipe_sha256': recipe_sha256(recipe),
-        'builder': f'local: {artifacts.BENCH_BUILDER} (amd64 through Rosetta)'}, indent=1) + '\n')
+        'builder': artifacts.build_env_described()}, indent=1) + '\n')
 
 
 def stress_ng() -> pathlib.Path:
     """Debian's stress-ng 0.19.02-1, static (tools/io/stress-ng): bin/stress-ng, source.tar.xz (the orig tarball the
     runners pin) and provenance.json (run_io_soak.py / run_serial_stress.py --stress-provenance)."""
     recipe = _tools() / 'io' / 'stress-ng'
-    return resources.derived('io-stress-ng', _stress_recipe, [recipe, artifacts.BENCH_BUILDER])
+    return resources.derived('io-stress-ng', _stress_recipe, [recipe, artifacts.build_env()])
 
 
 # ---------------------------------------------------------------- campaign images (tools/correctness/recipes)
@@ -330,7 +367,7 @@ def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
     for f in (image, listing): os.replace(work / f, out / f)
     if (work / 'log').is_dir(): os.replace(work / 'log', out / 'log')
     (out / 'manifest.json').write_text(json.dumps({
-        'suite': suite, 'builder': f'local: {builder} (amd64 through Rosetta)',
+        'suite': suite, 'builder': artifacts.build_env_described(),
         'image': {'file': image, 'sha256': sha(out / image), 'bytes': (out / image).stat().st_size},
         'list': {'file': listing, 'sha256': sha(out / listing), 'tests': len(lines), 'parts': list(dict.fromkeys(w[0] for w in lines))},
         'recipe': {rel: recipe_sha256(p) if p.is_dir() else sha(p) for rel, p in ((r, src / r) for r, _ in pairs)},
@@ -346,7 +383,7 @@ def campaign_image(suite: str) -> pathlib.Path:
     t = _tools()
     pairs = [x for rel in campaign_sources(suite) for x in (rel, t / rel)]
     return resources.derived(f'campaign-{suite}', _campaign_recipe,
-                             [suite, artifacts.BENCH_BUILDER, inspect.getsource(campaign_manifest) + inspect.getsource(read_pins), *pairs])
+                             [suite, artifacts.build_env(), inspect.getsource(campaign_manifest) + inspect.getsource(read_pins), *pairs])
 
 
 def _corpus_recipe(out: pathlib.Path, inputs: list) -> None:

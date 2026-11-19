@@ -139,6 +139,21 @@ with the change. Seeding uses Apple's `container` for QEMU (`container system st
 reference is `x86` need `NATEMU_X86_HOST=user@host` and are left without an answer otherwise, so they report
 stale-lock rather than pass.
 
+## Where amd64 inputs are built
+
+Inputs built for x86-64 (the recipes' Debian packages, the campaign images, stress-ng) build in one pinned amd64
+Debian container image. By default that is this Mac's Apple `container`, through Rosetta. A machine can send them to
+a real x86-64 Linux machine instead, where the same image runs natively under Docker (several times faster):
+
+```toml
+# ~/Library/Caches/natemu/testkit/config.toml (this machine, every checkout), or .natemu/config.toml (one checkout)
+[build]
+builder = "ssh:ubuntu@x86-box"
+```
+
+Entries record and are keyed by where they were built, so a Mac-built entry and an x86-built one never stand in for
+each other. The stress-ng build gives the same binary either way (`53140a75...`).
+
 ## The cache
 
 Everything a machine builds or downloads lives in `~/Library/Caches/natemu/testkit` (`NATEMU_TEST_CACHE` to move it),

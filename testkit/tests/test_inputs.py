@@ -225,3 +225,46 @@ def test_io5_downloads_are_the_runners_pins():
     assert decl['debian-cloud-nocloud']['urls'][0].endswith('/' + val('IMAGE') + '.tar.xz')
     assert decl['cpython-src']['urls'][0].endswith('/' + val('PYTHON'))
     assert decl['cpython-src']['sha256'] == val('PYTHON_SHA')
+
+
+def test_container_builds_run_natively_on_the_x86_builder(monkeypatch, tmp_path):
+    """[build] builder = "ssh:host": the same pinned image under Docker there; recipe and work folder copied in, the
+    work folder copied back, the temporary folder removed through the container (its files are root's)."""
+    import subprocess as sp
+    from types import SimpleNamespace
+    monkeypatch.setenv('NATEMU_CONTAINER_BUILDER', 'ssh:u@x86')
+    recipe = tmp_path / 'recipe'; recipe.mkdir(); (recipe / 'container.sh').write_text('true')
+    work = tmp_path / 'work'; work.mkdir()
+    seen = []
+    def run(cmd, **kw):
+        seen.append(cmd)
+        if cmd[:1] == ['tar'] and '-cf' in cmd: return SimpleNamespace(returncode=0, stdout=b'TAR', stderr=b'')
+        if cmd[:1] == ['tar']: return SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+        last = cmd[-1]
+        if last.startswith('mktemp'): return SimpleNamespace(returncode=0, stdout='/home/u/.natemu-build-1\n', stderr='')
+        if last.startswith('tar -C /home/u/.natemu-build-1/work -cf'): return SimpleNamespace(returncode=0, stdout=b'BACK', stderr=b'')
+        return SimpleNamespace(returncode=0, stdout='' if kw.get('text') else b'', stderr='' if kw.get('text') else b'')
+    monkeypatch.setattr(inputs.subprocess, 'run', run)
+    monkeypatch.setattr(inputs.artifacts, '_run', lambda cmd, **kw: run(cmd, text=True, **kw))
+    inputs._in_container('t', recipe, work)
+    remote = [c[-1] for c in seen if c[:1] == ['ssh']]
+    assert any(r.startswith('docker run --rm') and inputs.artifacts.BENCH_BUILDER in r and
+               '-v /home/u/.natemu-build-1/recipe:/recipe:ro' in r and 'bash /recipe/container.sh' in r for r in remote)
+    assert any('tar -C /home/u/.natemu-build-1/work -cf -' in r for r in remote)                 # the work folder back
+    assert ['tar', '-C', str(work), '-xf', '-'] in seen
+    assert remote[-1].startswith('docker run --rm -v /home/u/.natemu-build-1:/x') and 'rm -rf' in remote[-1]
+
+
+def test_builder_comes_from_the_machine_config_and_keys_the_entry(monkeypatch, tmp_path):
+    monkeypatch.delenv('NATEMU_CONTAINER_BUILDER', raising=False)
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'cache'))
+    monkeypatch.setattr(inputs.artifacts.paths, 'repo_root', lambda: tmp_path / 'wt')
+    (tmp_path / 'cache').mkdir()
+    assert inputs.artifacts.container_builder() == 'local'
+    local = inputs.artifacts.build_env()
+    (tmp_path / 'cache' / 'config.toml').write_text('[build]\nbuilder = "ssh:u@x86"\n')
+    assert inputs.artifacts.container_builder() == 'ssh:u@x86'
+    assert inputs.artifacts.build_env() != local and 'u@x86' in inputs.artifacts.build_env()
+    (tmp_path / 'wt' / '.natemu').mkdir(parents=True)
+    (tmp_path / 'wt' / '.natemu' / 'config.toml').write_text('[build]\nbuilder = "local"\n')   # the worktree wins
+    assert inputs.artifacts.container_builder() == 'local'
