@@ -27,6 +27,11 @@ so in its claims; whether either also hides a missing natemu path is open.
   in every seeding attempt (4 of 4, plus 2 earlier), passed on the rerun of the locked run. The case holds an exclusive
   claim, but other agents' QEMU reference containers and builds ran outside the scheduler. The check needs a peer's
   doorbell pending exactly as a vCPU enters the resident; with `--reps 1` it gets two multi-vCPU runs.
+  On November 19 it passed in two full gates on the M2 Max (runs 20261119-010547-87de and 20261119-014037-79f5), then
+  failed in the next one (20261119-021407-57b8, with Spotlight's mds at 48%) and on three reruns on the idle machine,
+  at the head under test and at the earlier head where it had passed: stop counts 'resident' 0 and 'rearms' 0 over
+  18,459 stops. Recorded as the known bug `kicks-adversarial-no-resident-stop` (tests/smp/known-bugs.toml): it keeps
+  running and reports `known-bug-passed` when it passes.
 - `l4b`, case `cases/frozen` (a 100 µs PIT/IRR window over 20,000 trials): "reached rbx=1, want 0" on both attempts of
   one seeding run with all 8 performance cores busy; passed in the other seeding run and in the locked run.
 
