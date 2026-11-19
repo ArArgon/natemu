@@ -324,7 +324,8 @@ an out-of-process worker; that transport retired at S3i. The general path runs o
 native `fexc --serve` child per vCPU and admits its code objects
 (`crates/abi/src/code_object.rs`, `crates/host/src/admission.rs`).
 
-Ordinary local checks/builds, from the repository root. On a fresh clone, first
+Local builds, from the repository root (tests: `tools/natemu-test`, "Running the suite" below, which also runs the
+Rust and Python unit tests; the bare `cargo test` and `unittest` lines here are for debugging one of them). On a fresh clone, first
 fetch the FEX submodule (`third_party/FEX`, the owner's FEX fork, pinned) and
 fill the local Cargo cache once with network access; the `--offline` commands then work without the network:
 
@@ -336,7 +337,7 @@ cargo fetch --locked
 python3 -B -m unittest discover -s tools -p 'test_*.py'
 ```
 
-The general execution path's suites (each runner's docstring gives its options; the slice contracts give what they
+The general execution path's runners, which the test families call (run one directly only to debug it; each runner's docstring gives its options; the slice contracts give what they
 check): `tools/run_slice1_vm.py` (fixtures and seeded corpora vs QEMU), `tools/run_slice1_faults.py` (precise faults and
 paging cells), `tools/run_slice2_vm.py` (control flow), `tools/run_slice2_faults.py` (loop faults),
 `tools/run_slice2_probes.py` (code cache, linking, self-modifying code), `tools/fexc/upstream_tests/run_asm.py` (FEX's

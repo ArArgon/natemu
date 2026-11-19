@@ -187,11 +187,11 @@ slowly ([numbers](docs/benchmarks.md#cpu-vulnerability-mitigations)). Two ways t
 ## Development
 
 ```sh
-cargo test --locked
-python3 -B -m unittest discover -s tools -p 'test_*.py'
+tools/natemu-test run          # the tests your change concerns
+tools/natemu-test run --gate   # all of them
 ```
 
-`tools/natemu-test run` runs the tests your change concerns, and `tools/natemu-test run --gate` runs all of them. The
+Both include the Rust and Python unit tests, so there is no need to run `cargo test` separately. The
 tests need two more Homebrew packages: `brew install nasm container`. `nasm` assembles small x86 test programs, and
 `container` is Apple's tool for running Linux containers, which the tests use to build x86 Linux files. Start it once
 after each restart of the Mac with `container system start`. The first run on a Mac downloads and builds what the tests
