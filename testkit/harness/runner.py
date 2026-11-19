@@ -14,6 +14,7 @@ A passed case's output folder is deleted when it ends (`drop_outputs`); a failed
                           unittests/ASM at the pin)
                           needs = {...}  smoke = true  judge = "judges:name"  results = "results.json"
                           (the judge sees exit 1; judge_on_zero = true also sends it exit 0: a negative control)
+                          timeout = N  (seconds, this case only; else the suite's params.timeout, default 3600)
 """
 import fnmatch
 import json
@@ -115,6 +116,10 @@ class Runner:
 
     def _spec(self, suite, case):
         return suite.extra['cases'][case]
+
+    def case_timeout(self, fam, suite, case):
+        """The case's own `timeout` (seconds), else None: the suite's `params.timeout` applies."""
+        return self._spec(suite, case).get('timeout')
 
     def case_needs(self, fam, suite, case):
         n = dict(self._spec(suite, case).get('needs', {}))

@@ -81,7 +81,10 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
                 continue
             env = dict(g[0].place.env)
             if s.kind != 'legacy': env.update(NO_RAW_CACHES)
-            units.append(Unit(len(units), chunk, req, env, float(s.params.get('timeout', 3600))))
+            h = chunk[0].harness                            # a case may set its own timeout (runner cases: `timeout = N`)
+            own = [h.case_timeout(it.fam, it.suite, it.case) for it in chunk] if hasattr(h, 'case_timeout') else []
+            timeout = max([float(x) for x in own if x] or [float(s.params.get('timeout', 3600))])
+            units.append(Unit(len(units), chunk, req, env, timeout))
     units.sort(key=lambda u: -(u.req.expected if u.req.expected is not None else 1e9))
     return units, refused
 

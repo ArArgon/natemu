@@ -56,3 +56,23 @@ def test_migration_maps_every_step():
         f = family.load(paths.repo_root() / 'tests' / fam / 'family.toml')
         in_families |= set(f.suite(fam).extra['cases'])
     assert steps == covered | in_families and not (covered & in_families)
+
+
+def test_case_timeout_overrides_the_suite(tmp_path):
+    from testkit import family
+    d = tmp_path / 'tests' / 'f'; d.mkdir(parents=True)
+    (d / 'family.toml').write_text('''[family]
+name = "f"
+[[suite]]
+name = "s"
+kind = "judged"
+harness = "runner"
+params = { timeout = 900 }
+[suite.cases.long]
+argv = ["tools/x.py"]
+timeout = 2400
+[suite.cases.short]
+argv = ["tools/x.py"]
+''')
+    fam = family.load(d / 'family.toml'); s = fam.suite('s')
+    assert runner.HARNESS.case_timeout(fam, s, 'long') == 2400 and runner.HARNESS.case_timeout(fam, s, 'short') is None
