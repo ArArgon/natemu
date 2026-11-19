@@ -7,7 +7,7 @@
   and 1: register write/read-backs (xAPIC MMIO and x2APIC), priority/TPR/EOI order with nested interrupts and self IPIs
   (both modes), CR8 as TPR[7:4], the x2APIC fault rules, x2APIC IPIs at 2-4 CPUs (fixed physical, all-but-self, NMI,
   logical cluster, peer to CPU 0), each judged by the SDM model below (`model_problems`: the read-back values, the
-  delivery log, the #GP cases, the counts). (QEMU 11.1.2, once compared with natemu here, departs from the SDM on 20
+  delivery log (each delivery's vector, marker, PPR, ISR, IRR, TPR and frame RIP), the #GP cases, the counts). (QEMU 11.1.2, once compared with natemu here, departs from the SDM on 20
   of the x2APIC fault cases: RDMSR of write-only registers, WRMSR to read-only ones, reserved bits, TSC-deadline.)
 - `ipi`: xAPIC MMIO IPIs (Linux's path; QEMU's BSP cannot use xAPIC with peers) at 2 and 4 CPUs: physical, logical flat,
   all-including-self, NMI, lowest priority; counts exact (judged by the model).
@@ -81,8 +81,16 @@ def logs(prog, mem):
 def isr_set(*v): return sum(1 << (x - 64) for x in v)
 
 
-PRIO = [(0x71, 2, (0x71,)), (0x61, 2, (0x61,)), (0x51, 3, (0x51,)), (0x41, 4, (0x41,)), (0x42, 5, (0x42,)), (0x62, 5, (0x42, 0x62)),
-        (0x52, 5, (0x42, 0x52)), (0x43, 7, (0x43,)), (0x63, 7, (0x43, 0x63))]
+# apic-prio's deliveries in order (SDM Vol.3 11.8.3.1, 11.8.4): (vector, marker R12, ISR, IRR (requested, not yet
+# accepted), TPR, the label of the instruction the frame returns to). Pending interrupts are taken by class above PPR's:
+# after STI's one-instruction shadow (the NOP), right after the IRETQ that ends a handler, and at the boundary after the
+# TPR write, self IPI or EOI that unmasks them.
+PRIO = [(0x71, 2, (0x71,), (0x41, 0x51, 0x61), 0x50, 'p_m3'), (0x61, 2, (0x61,), (0x41, 0x51), 0x50, 'p_m3'),
+        (0x51, 3, (0x51,), (0x41,), 0x40, 'p_m4'), (0x41, 4, (0x41,), (), 0, 'p_m5'), (0x42, 5, (0x42,), (), 0, 'p_m6'),
+        (0x62, 5, (0x42, 0x62), (0x52,), 0, 'p_c42'), (0x52, 5, (0x42, 0x52), (), 0, 'p_c42'), (0x43, 7, (0x43,), (), 0, 'p_c7'),
+        (0x63, 7, (0x43, 0x63), (), 0, 'p_c43')]
+# apic-cr8's one delivery: 55H when MOV CR8 lowers TPR to 40H, at the boundary after it (11.8.6).
+CR8 = [(0x55, 2, (0x55,), (), 0x40, 'c_m3')]
 REG_NAMES = {getattr(apic, k): k for k in ('ID', 'VER', 'TPR', 'PPR', 'LDR', 'DFR', 'SVR', 'ESR', 'ICR2', 'LVT_TIMER', 'LVT_THERMAL',
                                            'LVT_PMC', 'LVT_LINT0', 'LVT_LINT1', 'LVT_ERROR', 'INIT_COUNT', 'CUR_COUNT', 'DCR')} | \
     {getattr(apic, k) + j: f'{k}+{j}' for k in ('ISR', 'TMR', 'IRR') for j in (1, 2)}
@@ -100,7 +108,16 @@ def apic_regs_labels(name):
     return [REG_NAMES[r] + ('' if v is None else f'={v:#x}') for r, v in apic.regs_reads(name.rsplit('-', 1)[1])]
 
 
-def model_problems(prog, mem):
+def deliveries(entries, want, labels):
+    """Problems of a log (apic.log entries) against `want` (PRIO's form); `labels` CPU 0's from apic.build."""
+    got = [(e[0], e[6], e[2], e[3], e[4], e[5], e[1]) for e in entries]
+    model = [(v, r12, v & 0xf0, isr_set(*isr), isr_set(*irr), tpr, labels[at]) for v, r12, isr, irr, tpr, at in want]
+    if got == model: return []
+    return [f'delivery (vector, marker, PPR, ISR, IRR, TPR, RIP) {[tuple(map(hex, g)) for g in got]} != model {[tuple(map(hex, w)) for w in model]}']
+
+
+def model_problems(prog, mem, labels=None):
+    """`labels`: CPU 0's (apic.build's), for the programs whose deliveries name the instruction they return to."""
     name, n, out = prog['name'].split('@')[0], prog['ncpu'], []
     entries = logs(prog, mem)
     if name in REGS_WANT:
@@ -109,15 +126,12 @@ def model_problems(prog, mem):
         bad = [(apic_regs_labels(name)[k], hex(g), hex(w)) for k, (g, w) in enumerate(zip(got, want)) if g != w]
         if bad: out.append(f'read-backs (register, got, model): {bad}')
     elif name.startswith('apic-prio'):
-        got = [(e[0], e[6], e[2], e[3]) for e in entries[0]]
-        want = [(v, r12, v & 0xf0, isr_set(*isr)) for v, r12, isr in PRIO]
-        if got != want: out.append(f'delivery (vector, marker, PPR, ISR) {[tuple(map(hex, g)) for g in got]} != model {[tuple(map(hex, w)) for w in want]}')
+        out += deliveries(entries[0], PRIO, labels)
         d = [mem.read(apic.DATA(0) + 8 * k) for k in range(5)]
         # End: PPR 0, ISR clear; in 0x43 after the nested 0x63's two EOIs: clear; in 0x63: 0x43 (ISR+2 holds 64..95).
         if d != [0, 0, 0, 1 << 3, 1 << 3]: out.append(f'DATA {list(map(hex, d))} != model [0, 0, 0, 0x8, 0x8]')
     elif name == 'apic-cr8':
-        got = [(e[0], e[6]) for e in entries[0]]
-        if got != [(0x55, 2)]: out.append(f'deliveries {got} != [(0x55, 2)]')
+        out += deliveries(entries[0], CR8, labels)
         d = [mem.read(apic.DATA(0) + 8 * k) for k in range(4)]
         if d != [0x50, 7, 0x7f, 0]: out.append(f'DATA {list(map(hex, d))} != model [0x50, 0x7, 0x7f, 0x0]')
     elif name == 'apic-faults':
@@ -137,13 +151,13 @@ def cmd_qemu(a, report):
     failures = []
     programs = [apic.regs_program('x'), apic.regs_program('x2'), apic.prio_program('x'), apic.prio_program('x2'), apic.cr8_program(),
                 apic.faults_program()] + [apic.ipi_program(n) for n in (2, 3, 4)]
-    for prog, _ in programs:
+    for prog, labels in programs:
         label = prog['name']
         entry = {'name': label, 'runs': []}
         for limit in (None, 1):
             out, problems = run_natemu(a, prog, a.out / 'work' / f"{label}-{limit or 'd'}", limit)
             if out is not None:
-                problems += model_problems(prog, natemu_memory(out))
+                problems += model_problems(prog, natemu_memory(out), labels[0])
             entry['runs'].append({'max_block': limit, 'problems': problems})
             failures += [f'{label} (max-block {limit}): {p}' for p in problems]
         print(f"{label}: {'FAIL' if any(r['problems'] for r in entry['runs']) else 'ok'}", *[p for r in entry['runs'] for p in r['problems']][:6], sep='\n  ', flush=True)

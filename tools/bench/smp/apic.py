@@ -255,16 +255,17 @@ def regs_program(m):
 def prio_program(m):
     """Priority, TPR and EOI order with nested interrupts (11.8.3.1, 11.8.4): self IPIs pending with IF = 0, the TPR
     masking classes, interrupts taken by class after STI and as the TPR drops, a nested delivery inside a handler that
-    re-enables interrupts, and the EOI that ends the highest in-service vector."""
+    re-enables interrupts, and the EOI that ends the highest in-service vector. Labels p_* (no code) name the
+    instruction each delivery's frame returns to (run_x3.PRIO)."""
     main = '\n'.join([
         '    mov r12, 1', self_ipi(m, 0x41), self_ipi(m, 0x51), self_ipi(m, 0x71), self_ipi(m, 0x61), wr(m, TPR, 0x50),
-        '    mov r12, 2', '    sti', '    nop', '    mov r12, 3', wr(m, TPR, 0x40), '    mov r12, 4', wr(m, TPR, 0x00),
-        '    mov r12, 5', self_ipi(m, 0x42), '    mov r12, 6', '    nop', '    cli',
+        '    mov r12, 2', '    sti', '    nop', 'p_m3:', '    mov r12, 3', wr(m, TPR, 0x40), 'p_m4:', '    mov r12, 4', wr(m, TPR, 0x00),
+        'p_m5:', '    mov r12, 5', self_ipi(m, 0x42), 'p_m6:', '    mov r12, 6', '    nop', '    cli',
         # Two in service at once (0x43 under 0x63 by nesting): each EOI ends the highest.
-        self_ipi(m, 0x43), '    mov r12, 7', '    sti', '    nop', '    cli', '    mov r12, 8',
+        self_ipi(m, 0x43), '    mov r12, 7', '    sti', '    nop', 'p_c7:', '    cli', '    mov r12, 8',
         rd(m, PPR), store(0), rd(m, ISR + 2), store(1)])
-    bodies = {0x42: '\n'.join([self_ipi(m, 0x62), self_ipi(m, 0x52), '    sti', '    nop', '    cli']),
-              0x43: '\n'.join([self_ipi(m, 0x63), '    sti', '    nop', '    cli', rd(m, ISR + 2), store(2)]),
+    bodies = {0x42: '\n'.join([self_ipi(m, 0x62), self_ipi(m, 0x52), '    sti', '    nop', 'p_c42:', '    cli']),
+              0x43: '\n'.join([self_ipi(m, 0x63), '    sti', '    nop', 'p_c43:', '    cli', rd(m, ISR + 2), store(2)]),
               0x63: '\n'.join([rd(m, ISR + 2), store(3), eoi(m), rd(m, ISR + 2), store(4)])}
     return build(f'apic-prio-{m}', m, [main], [0x41, 0x42, 0x43, 0x51, 0x52, 0x61, 0x62, 0x63, 0x71], bodies)
 
@@ -275,7 +276,7 @@ def cr8_program():
     m = 'x2'
     main = '\n'.join([
         '    mov r12, 1', self_ipi(m, 0x55), '    mov eax, 5', '    mov cr8, rax', '    sti', '    nop', '    mov r12, 2',
-        rd(m, TPR), store(0), '    mov eax, 4', '    mov cr8, rax', '    mov r12, 3', '    nop', '    cli',
+        rd(m, TPR), store(0), '    mov eax, 4', '    mov cr8, rax', 'c_m3:', '    mov r12, 3', '    nop', '    cli',
         wr(m, TPR, 0x7f), '    mov rax, cr8', store(1), rd(m, TPR), store(2), '    xor eax, eax', '    mov cr8, rax', rd(m, PPR), store(3)])
     return build('apic-cr8', m, [main], [0x55])
 
