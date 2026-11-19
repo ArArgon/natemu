@@ -201,7 +201,15 @@ def read_lock(path=None):
 
 
 def find(key):
-    """Locked mode: the lock's Entry of `key` or None; an inline value is checked against its sha256."""
+    """Locked mode: the lock's Entry of `key` or None; an inline value is checked against its sha256. With
+    NATEMU_ANSWERS_USED set, each key looked up is appended to that file (which answers a case still uses)."""
+    used = os.environ.get('NATEMU_ANSWERS_USED')
+    if used:
+        with _lock:
+            seen = _cache.setdefault(('used', used), set())
+            if key not in seen:
+                seen.add(key)
+                with open(used, 'a') as f: f.write(key + '\n')
     e = read_lock().get(key)
     if e is not None and e.value is not None and digest(e.value) != e.sha256:
         raise ValueError(f'lock entry {key}: its value does not hash to its sha256 (a corrupt lock)')

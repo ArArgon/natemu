@@ -157,6 +157,8 @@ class Runner:
                        NATEMU_REFERENCE_BACKEND='apple', NATEMU_COMPILE_CACHE=str(artifacts.compile_cache(n)),
                        **{k: str(v) for k, v in spec.get('env', {}).items()})
             if root: env['NATEMU_RAW_ROOT'] = str(root)
+            (rundir / 'answers-used').mkdir(exist_ok=True)     # the lock keys this case looked up (pruning a lock)
+            env['NATEMU_ANSWERS_USED'] = str(rundir / 'answers-used' / f'{it.case}.txt')
             env['NATEMU_FEX_ASM'] = str(extra['fex_asm'])
             if os.environ.get('TESTKIT_SEED_ANSWERS') == '1':     # seeding (`natemu-test lock FAMILY --from-run RUN`)
                 (rundir / 'answers').mkdir(exist_ok=True)
