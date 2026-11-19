@@ -8,6 +8,12 @@
     run_m1_perf.py analyze DIR                 rerun the analysis over DIR/runs.jsonl -> DIR/summary.md, DIR/summary.json
     run_m1_perf.py self-check                  the analysis math on synthetic data
 
+Inputs (plan, smoke, full) default to natemu-raw (RAW_ROOT); each can be given instead, as tools/natemu-test's bench case
+`m1-perf` does with builds and inputs it made itself: --baseline-build/--final-build DIR (a natemu build laid out like
+cargo's target folder; old names --baseline-dir/--final-dir), --fexc, --fio-prep, --block-inputs (what the matrix inputs
+are prepared from, into --inputs), --io5-inputs. Under a caller that already holds the VM lock (NATEMU_VM_LOCK_HELD) the
+driver does not take it again.
+
 Sets (full --sets, default A,BC,D):
   A   baseline raw vs final raw, 5 runs each, strictly interleaved ABBA (A B B A A B B A A B)
   BC  final raw vs final qcow2 (preallocated) vs final overlay (empty overlay on the raw base), 3 runs each, interleaved
@@ -23,6 +29,7 @@ failed guest verification, e2fsck, digest or `qemu-img check` in a run (the runn
 Overlay comparisons (C, D) measure cluster allocation: reported, not gated.
 """
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -108,14 +115,33 @@ def plan(args):
     m, i = sum(s['kind'] == 'matrix' for s in p), sum(s['kind'] == 'io5' for s in p)
     print(f'{len(p)} runs: {m} matrix (2 vCPUs, PCI) + {i} IO5; estimated {m * MATRIX_MIN + i * IO5_MIN:.0f} minutes '
           f'({MATRIX_MIN:.0f} min/matrix run, {IO5_MIN:.0f} min/IO5 run) plus a minute of preparation')
-    print('Matrix inputs prepared once (if missing):', show([sys.executable, TOOLS / 'run_io_matrix.py', 'prepare', '--fio-prep', FIO_PREP,
-          '--block-inputs', BLOCK_INPUTS, '--out', args.inputs, '--transport', 'pci']))
+    print('Matrix inputs prepared once (if missing):', show([sys.executable, TOOLS / 'run_io_matrix.py', 'prepare', '--fio-prep', args.fio_prep,
+          '--block-inputs', args.block_inputs, '--out', args.inputs, '--transport', 'pci']))
     print('Set A reuses nothing; set BC runs its own fresh raw side (3 raw + 3 qcow2 + 3 overlay, rotated order).')
     for n, s in enumerate(p, 1): print(f'{n:2d} {s["id"]:<28} {show(command(args, s, Path(args.dir or "DIR") / "runs" / s["id"]))}')
     print('Order of set A:', ' '.join('A' if s['setup'] == 'base-raw' else 'B' for s in p if s['group'] == 'A'), '(A = baseline, B = final)')
 
 
 # ---------------------------------------------------------------- machine state, runs
+def free_disk(p):
+    """Free bytes on the volume of `p` (its nearest existing folder: the results folder may not exist yet)."""
+    p = Path(p).absolute()
+    while not p.exists(): p = p.parent
+    return shutil.disk_usage(p).free
+
+
+@contextlib.contextmanager
+def vm_lock(lock):
+    """The VM lock for one run, exclusively (a blocking wait behind other runners), unless the caller already holds it
+    (NATEMU_VM_LOCK_HELD: natemu-test and run_suite hold it for the whole step; taking it again would wait forever)."""
+    if os.environ.get('NATEMU_VM_LOCK_HELD'):
+        yield; return
+    print('  waiting for the VM lock', flush=True)
+    with Path(lock).open('a') as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        yield
+
+
 def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
 
@@ -134,7 +160,7 @@ def others():
 
 def env_record(args, dest):
     rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'pgrep_natemu': [l[:150] for l in sh_out('pgrep', '-fl', 'natemu').splitlines()], 'other_vm_processes': others(),
-           'loadavg': os.getloadavg(), 'free_disk_bytes': shutil.disk_usage(PERF).free, 'repo_commit': sh_out('git', '-C', TOOLS.parent, 'rev-parse', 'HEAD'),
+           'loadavg': os.getloadavg(), 'free_disk_bytes': free_disk(dest.parent), 'repo_commit': sh_out('git', '-C', TOOLS.parent, 'rev-parse', 'HEAD'),
            'baseline_commit': BASELINE_COMMIT, 'final_commit': args.final_commit or sh_out('git', '-C', TOOLS.parent, 'rev-parse', 'HEAD'),
            'sha256': {}, 'fexc': str(args.fexc), 'matrix_input_image_sha256': None}
     for k, d in (('baseline', args.baseline_dir), ('final', args.final_dir)):
@@ -150,7 +176,7 @@ def env_record(args, dest):
 def ensure_inputs(args):
     if (Path(args.inputs) / 'inputs.json').exists(): return
     print('preparing matrix inputs (once):', args.inputs, flush=True)
-    subprocess.run([sys.executable, TOOLS / 'run_io_matrix.py', 'prepare', '--fio-prep', FIO_PREP, '--block-inputs', BLOCK_INPUTS,
+    subprocess.run([sys.executable, TOOLS / 'run_io_matrix.py', 'prepare', '--fio-prep', args.fio_prep, '--block-inputs', args.block_inputs,
                     '--out', args.inputs, '--transport', 'pci'], check=True)
 
 
@@ -194,15 +220,13 @@ def clean(out):
 def one_run(args, spec, dest):
     out = dest / 'runs' / spec['id']
     logf = dest / 'logs' / (spec['id'] + '.log')
-    if shutil.disk_usage(PERF).free < (4 if spec['kind'] == 'io5' else 3) << 30:
+    if free_disk(dest) < (4 if spec['kind'] == 'io5' else 3) << 30:
         raise SystemExit('stopping: less than 3-4 GiB free disk (rerun after freeing space; finished runs are kept)')
     mf = manifest(args, spec, dest)
     # The driver holds the real VM lock for the whole run (a blocking wait in the queue of the other agents' runners); the runner
     # itself gets a private lock file, because the matrix runner would otherwise fail at once when anyone else is queued.
     cmd = command(argparse.Namespace(**dict(vars(args), lock=dest / 'runner.lock')), spec, out, mf)
-    print('  waiting for the VM lock', flush=True)
-    with Path(args.lock).open('a') as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    with vm_lock(args.lock):
         before = others()
         began = time.time()
         if out.exists(): shutil.rmtree(out)
@@ -386,7 +410,12 @@ def main():
     a = sub.add_parser('analyze'); a.add_argument('dir', type=Path)
     for name in ('plan', 'smoke', 'full'):
         s = sub.add_parser(name)
-        s.add_argument('--baseline-dir', type=Path, default=PERF / 'baseline'); s.add_argument('--final-dir', type=Path, default=PERF / 'final')
+        # --baseline-build/--final-build: a natemu build folder laid out like cargo's target folder (release/natemu,
+        # aarch64-unknown-none/release/natemu-runtime), as testkit's artifacts.natemu_at()/natemu() entries are
+        s.add_argument('--baseline-dir', '--baseline-build', dest='baseline_dir', type=Path, default=PERF / 'baseline')
+        s.add_argument('--final-dir', '--final-build', dest='final_dir', type=Path, default=PERF / 'final')
+        s.add_argument('--fio-prep', type=Path, default=FIO_PREP, help='the fio preparation (run_io_matrix.py prepare --fio-prep)')
+        s.add_argument('--block-inputs', type=Path, default=BLOCK_INPUTS, help='the block inputs (run_io_matrix.py prepare --block-inputs)')
         s.add_argument('--fexc', type=Path, default=FEXC); s.add_argument('--inputs', type=Path, default=PERF / 'inputs')
         s.add_argument('--io5-inputs', type=Path, default=IO5_INPUTS); s.add_argument('--lock', type=Path, default=VM_LOCK)
         s.add_argument('--final-commit', help='commit of the final binary (default: this checkout HEAD)')

@@ -52,3 +52,60 @@ def test_qemu_system_pinned():
     # QEMU looks for its firmware there even though the entry was moved into place after `make install` (relocatable)
     dirs = subprocess.run([b / 'qemu-system-x86_64', '-L', 'help'], capture_output=True, text=True).stdout
     assert share.resolve() in {pathlib.Path(l.strip()).resolve() for l in dirs.splitlines() if l.strip()}, dirs
+
+
+def _repo_with_same_tree_twice(tmp_path):
+    """A repository with three commits: A, B (no change: the same tree as A) and C (a changed file)."""
+    g = lambda *a: subprocess.run(['git', '-C', str(tmp_path), '-c', 'user.email=t@t', '-c', 'user.name=t', *a],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+    g('init', '-q'); (tmp_path / 'crates').mkdir(); (tmp_path / 'crates' / 'a.rs').write_text('fn a() {}\n')
+    g('add', '.'); g('commit', '-qm', 'A'); a = g('rev-parse', 'HEAD')
+    g('commit', '-q', '--allow-empty', '-m', 'B'); b = g('rev-parse', 'HEAD')
+    (tmp_path / 'crates' / 'a.rs').write_text('fn a() { 1; }\n'); g('commit', '-qam', 'C'); c = g('rev-parse', 'HEAD')
+    return a, b, c
+
+
+def test_natemu_at_keys_by_tree(tmp_path, monkeypatch):
+    """Two revisions with the same tree are one baseline build; a changed tree is another (build steps stubbed)."""
+    repo = tmp_path / 'repo'; repo.mkdir()
+    a, b, c = _repo_with_same_tree_twice(repo)
+    monkeypatch.setattr(paths, 'repo_root', lambda: repo)
+    monkeypatch.delenv('TESTKIT_ARTIFACTS', raising=False)
+    keys = []
+    def get_or_build(kind, k, build, **kw):
+        keys.append((kind, k)); return tmp_path / 'entry' / k
+    monkeypatch.setattr(artifacts.cache, 'get_or_build', get_or_build)
+    monkeypatch.setattr(artifacts, 'pin_for_run', lambda *a: None)
+    na, nb, nc = artifacts.natemu_at(a), artifacts.natemu_at(b[:8]), artifacts.natemu_at(c)
+    assert keys[0] == keys[1] and keys[0][0] == 'natemu-at'
+    assert keys[2] != keys[0]
+    assert na == nb and isinstance(na, artifacts.Natemu) and na.stub == na.entry / 'release/natemu'
+    assert nc.key != na.key
+
+
+def test_natemu_at_builds_from_the_archive(tmp_path, monkeypatch):
+    """The build runs cargo in a scratch folder holding `git archive REV` (never the worktree), installs the binaries
+    in the target-folder layout, signs the two host binaries and removes the scratch folder."""
+    repo = tmp_path / 'repo'; repo.mkdir()
+    a, b, c = _repo_with_same_tree_twice(repo)
+    (repo / 'crates' / 'a.rs').write_text('uncommitted\n')
+    monkeypatch.setattr(paths, 'repo_root', lambda: repo)
+    monkeypatch.setattr(paths, 'cache_root', lambda: tmp_path / 'cache')
+    monkeypatch.delenv('TESTKIT_ARTIFACTS', raising=False)
+    calls = []
+    def run(cmd, **kw):
+        cmd = [str(x) for x in cmd]; calls.append((cmd, kw.get('cwd')))
+        if cmd[0] == 'cargo':
+            assert pathlib.Path(kw['cwd'], 'crates/a.rs').read_text() == 'fn a() {}\n'      # A's content, not the worktree's
+            t = pathlib.Path(kw['env']['CARGO_TARGET_DIR'])
+            for rel in artifacts.NATEMU_BINARIES:
+                (t / rel).parent.mkdir(parents=True, exist_ok=True); (t / rel).write_text(rel)
+    monkeypatch.setattr(artifacts, '_run', run)
+    n = artifacts.natemu_at(a)
+    assert n.stub.read_text() == 'release/natemu' and n.runtime.is_file() and n.host.is_file()
+    cargo = [c for c in calls if c[0][0] == 'cargo']
+    assert cargo and all(pathlib.Path(cwd) != repo for _, cwd in cargo)
+    signed = [c[0][-1] for c in calls if c[0][0] == 'codesign']
+    assert sorted(pathlib.Path(s).name for s in signed) == ['natemu', 'natemu-host']
+    assert not any((tmp_path / 'cache' / 'build-tmp').glob('natemu-at-*'))
+    assert artifacts.natemu_at(b) == n            # pinned for the run: the same build without rebuilding

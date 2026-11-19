@@ -69,6 +69,28 @@ def pin_for_run(name: str, value) -> None:
     os.environ['TESTKIT_ARTIFACTS'] = json.dumps(d)
 
 
+NATEMU_BINARIES = ('release/natemu-host', 'release/natemu', 'aarch64-unknown-none/release/natemu-runtime')
+
+
+def _cargo_build(src: pathlib.Path, target: pathlib.Path) -> None:
+    """The release host, the stub and the resident of the sources in `src`, into the cargo target folder `target`."""
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target))
+    _run(['cargo', '+1.97.0', 'fetch', '--locked'], cwd=src, env=env)      # a new machine, or new dependencies (R1.3)
+    _run(CARGO + ['-p', 'natemu-host'], cwd=src, env=env)
+    _run(CARGO + ['-p', 'natemu-cli', '--bin', 'natemu'], cwd=src, env=env)
+    _run(CARGO + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=src, env=env)
+
+
+def _install(src: pathlib.Path, target: pathlib.Path, out: pathlib.Path) -> None:
+    """The three binaries cloned from `target` into `out`, laid out like a target folder; the host's two signed with the
+    entitlements of the sources they were built from."""
+    for rel in NATEMU_BINARIES:
+        (out / rel).parent.mkdir(parents=True, exist_ok=True)
+        cache.clone(target / rel, out / rel)
+    for rel in ('release/natemu-host', 'release/natemu'):
+        _run(['codesign', '--force', '--sign', '-', '--entitlements', src / 'crates/host/entitlements.plist', out / rel])
+
+
 def natemu() -> Natemu:
     """The release host, the `natemu` stub and the resident, built in the worktree's target/ and copied, signed, into
     an entry laid out like a cargo target folder."""
@@ -79,21 +101,45 @@ def natemu() -> Natemu:
     def build(out: pathlib.Path):
         # A private target folder per worktree: never the worktree's target/, which old runners and other runs execute from.
         target = paths.cache_root() / 'build-tmp' / ('target-' + hashlib.sha256(str(root).encode()).hexdigest()[:12])
-        env = dict(os.environ, CARGO_TARGET_DIR=str(target))
-        _run(['cargo', '+1.97.0', 'fetch', '--locked'], cwd=root, env=env)      # a new machine, or new dependencies (R1.3)
-        _run(CARGO + ['-p', 'natemu-host'], cwd=root, env=env)
-        _run(CARGO + ['-p', 'natemu-cli', '--bin', 'natemu'], cwd=root, env=env)
-        _run(CARGO + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none'], cwd=root, env=env)
+        _cargo_build(root, target)
         if source_key(NATEMU_SOURCES, 'natemu-v1') != k:
             raise BuildFailure('natemu', 'the sources changed while building; run again')
-        for rel in ('release/natemu-host', 'release/natemu', 'aarch64-unknown-none/release/natemu-runtime'):
-            (out / rel).parent.mkdir(parents=True, exist_ok=True)
-            cache.clone(target / rel, out / rel)
-        for rel in ('release/natemu-host', 'release/natemu'):
-            _run(['codesign', '--force', '--sign', '-', '--entitlements', root / 'crates/host/entitlements.plist', out / rel])
+        _install(root, target, out)
 
     n = Natemu(cache.get_or_build('natemu', k, build), k)
     pin_for_run('natemu', {'entry': str(n.entry), 'key': k})
+    return n
+
+
+def natemu_at(rev: str) -> Natemu:
+    """natemu as committed at `rev` (an older build to compare with: the M1 performance check's baseline). The same three
+    binaries as natemu(), built by the same cargo commands and toolchain pin and signed the same way, from `git archive
+    REV` in a scratch folder, so the worktree is never touched. Keyed by the commit's tree (which holds the sources,
+    rust-toolchain.toml and .cargo that natemu()'s key covers), so revisions with the same tree share one build. The FEX
+    submodule is not needed: natemu's crates do not read third_party/."""
+    r = subprocess.run(['git', '-C', str(paths.repo_root()), 'rev-parse', '--verify', '--quiet', f'{rev}^{{tree}}'],
+                       capture_output=True, text=True)
+    if r.returncode: raise BuildFailure(f'natemu@{rev}', 'no such revision in this repository')
+    tree = r.stdout.strip()
+    if p := _pinned(f'natemu-at:{tree}'): return Natemu(pathlib.Path(p['entry']), p['key'])
+    k = cache.key('natemu-at-v1', tree, *CARGO)
+    root = paths.repo_root()
+
+    def build(out: pathlib.Path):
+        scratch = paths.cache_root() / 'build-tmp' / f'natemu-at-{tree[:12]}-{os.getpid()}'
+        shutil.rmtree(scratch, ignore_errors=True); (scratch / 'src').mkdir(parents=True)
+        try:
+            arc = subprocess.run(['git', '-C', str(root), 'archive', '--format=tar', tree], capture_output=True)
+            if arc.returncode: raise BuildFailure(f'natemu@{rev}', arc.stderr.decode(errors='replace')[-800:])
+            subprocess.run(['tar', '-x', '-C', str(scratch / 'src')], input=arc.stdout, check=True)
+            _cargo_build(scratch / 'src', scratch / 'target')
+            _install(scratch / 'src', scratch / 'target', out)
+            (out / 'source.txt').write_text(f'git archive of {rev} (tree {tree})\n')
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    n = Natemu(cache.get_or_build('natemu-at', k, build), k)
+    pin_for_run(f'natemu-at:{tree}', {'entry': str(n.entry), 'key': k})
     return n
 
 

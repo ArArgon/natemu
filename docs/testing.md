@@ -169,6 +169,14 @@ builder = "local"                   # default: this Mac, in an amd64 Debian cont
 # builder = "ssh:ubuntu@x86-box"    # a real x86-64 Linux machine: the recipe is copied there, built, fetched, removed
 ```
 
+`m1-perf` is the M1 performance check ([design](m1-config-and-qcow2-design.md), "Performance check"):
+`tools/run_m1_perf.py full` compares natemu at its baseline commit with this checkout's build, in fio matrix runs on raw,
+qcow2 and overlay disks and in IO5, and passes only when its verdict is PASS (`summary.md` in its folder). It takes about
+80 minutes and 3-4 GiB of free disk. Everything it reads is built here: the baseline is `git archive` of that commit,
+built like the current one and cached by the commit's tree (`artifacts.natemu_at`); the fio preparation and block inputs
+are built from their recipes (see the input root below); IO5's disk, kernel and CPython source come from `run_io5.py prepare` on the pinned Debian cloud
+image and CPython tarball (`inputs.io5_inputs`).
+
 The image's expected outputs are recorded by whichever machine builds it, and every benchmark result names the builder.
 Switching builders builds a new image rather than reusing the other one's. Not
 wrapped yet: the drift canary and stored baselines (`tools/bench/canary.py`), whose inputs still live in `natemu-raw`.

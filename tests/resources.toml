@@ -73,3 +73,16 @@ sha256 = "57303d157cffce3fa402301667fbc9b2280aa7372082b081e777375ae49da5f2"
 urls = ["https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6+b9_amd64.deb",
         "https://snapshot.debian.org/archive/debian/20261108T000000Z/pool/main/b/busybox/busybox-static_1.37.0-6+b9_amd64.deb"]
 sha256 = "598a3fd92bdafc34cd81196b2952ad36e910e47a4ecf162f8ce5e8e262598e53"
+
+[resource.debian-cloud-nocloud]
+# The Debian 13 cloud image IO5 boots (tools/run_io5.py IMAGE): nocloud, amd64, build 20260914-2601, as published. Its
+# sha512 equals the one run_io5.py pins from that build's SHA512SUMS (IMAGE_SHA512), checked when pinned; the sha256 is
+# of that same file.
+urls = ["https://cloud.debian.org/images/cloud/trixie/20260914-2601/debian-13-nocloud-amd64-20260914-2601.tar.xz",
+        "https://cdimage.debian.org/images/cloud/trixie/20260914-2601/debian-13-nocloud-amd64-20260914-2601.tar.xz"]
+sha256 = "f0da43fc318346cd2af1365b161db6bbbf650a124f8be35bd6acbd877679c290"
+
+[resource.cpython-src]
+# The CPython 3.13.18 source tarball IO5 builds in its guest (tools/run_io5.py PYTHON_SHA, the same pin).
+urls = ["https://www.python.org/ftp/python/3.13.18/Python-3.13.18.tar.xz"]
+sha256 = "abb0102e6d4ae027509bcb82327d9dd85515b44a3ba8ad538cfc5e9847029f68"

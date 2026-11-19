@@ -191,6 +191,25 @@ def matrix_inputs() -> pathlib.Path:
                                      t / 'run_virtio_block.py', t / 'run_virtio_rng.py', t / 'io_common.py']) / 'inputs'
 
 
+def _io5_recipe(out: pathlib.Path, inputs: list) -> None:
+    image, python = map(pathlib.Path, inputs[:2])
+    d = out / 'inputs'; d.mkdir()
+    for f in (image, python): cache.clone(f, d / f.name)        # where prepare looks first: it downloads nothing
+    _runner('run_io5.py', 'prepare', '--inputs', d)
+    (d / image.name).unlink()                                   # disk.raw is extracted; run never reads the tarball
+
+
+def io5_inputs() -> pathlib.Path:
+    """tools/run_io5.py prepare's folder: the Debian 13 nocloud image's disk.raw with its /boot kernel and initramfs
+    (taken out with Homebrew's debugfs) and the CPython 3.13.18 source, from the two pinned downloads
+    (debian-cloud-nocloud, cpython-src). prepare checks the image's sha512 and the kernel's sha256 itself."""
+    t = _tools()
+    prefix, version = e2fsprogs()
+    srcs = [str(resources.fetch('debian-cloud-nocloud')), str(resources.fetch('cpython-src')), str(prefix), version]   # paths: keyed by their pins
+    return resources.derived('io5-inputs', _io5_recipe,
+                             srcs + [t / 'run_io5.py', t / 'io_common.py', t / 'run_net_linux.py', t / 'raw_root.py']) / 'inputs'
+
+
 def recipe_sha256(recipe: pathlib.Path) -> str:
     """sha256 of the recipe folder's `sha256sum` listing (every file, sorted relative paths)."""
     files = sorted(p for p in recipe.rglob('*') if p.is_file() and '__pycache__' not in p.parts)

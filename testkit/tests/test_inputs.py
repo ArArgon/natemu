@@ -191,3 +191,37 @@ def test_stress_build_that_stops_reproducing_is_refused(monkeypatch, tmp_path):
     monkeypatch.setattr(inputs, '_in_container', fake)
     with pytest.raises(BuildFailure, match='no longer reproduces'):
         inputs.stress_ng()
+
+
+# ---------------------------------------------------------------- IO5 inputs (stubbed prepare)
+def test_io5_inputs_prepares_from_the_pinned_downloads(monkeypatch, tmp_path):
+    """run_io5.py prepare runs on a folder that already holds the two pinned downloads (so it downloads nothing), and
+    the entry keeps what `run` reads, not the image tarball."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    dl = tmp_path / 'dl'; dl.mkdir()
+    files = {'debian-cloud-nocloud': dl / 'debian-13-nocloud-amd64-20260914-2601.tar.xz', 'cpython-src': dl / 'Python-3.13.18.tar.xz'}
+    for f in files.values(): f.write_text(f.name); f.chmod(0o444)
+    monkeypatch.setattr(inputs.resources, 'fetch', lambda n: files[n])
+    monkeypatch.setattr(inputs, 'e2fsprogs', lambda: (tmp_path / 'e2fs', '1.47.3'))
+    calls = []
+    def runner(script, *args):
+        calls.append((script, args))
+        d = args[list(args).index('--inputs') + 1]
+        assert {p.name for p in d.iterdir()} == {f.name for f in files.values()}       # nothing left to download
+        for n in ('disk.raw', 'vmlinuz', 'initrd.img', 'inputs.json'): (d / n).write_text(n)
+    monkeypatch.setattr(inputs, '_runner', runner)
+    d = inputs.io5_inputs()
+    assert calls[0][0] == 'run_io5.py' and calls[0][1][0] == 'prepare'
+    assert {p.name for p in d.iterdir()} == {'disk.raw', 'vmlinuz', 'initrd.img', 'inputs.json', 'Python-3.13.18.tar.xz'}
+
+
+def test_io5_downloads_are_the_runners_pins():
+    """The resources io5_inputs fetches are the files run_io5.py names and pins (prepare checks the image's sha512)."""
+    import re
+    from testkit import paths
+    src = (paths.repo_root() / 'tools' / 'run_io5.py').read_text()
+    val = lambda name: re.search(rf"^{name} = '([^']+)'", src, re.M)[1]
+    decl = resources.declarations()
+    assert decl['debian-cloud-nocloud']['urls'][0].endswith('/' + val('IMAGE') + '.tar.xz')
+    assert decl['cpython-src']['urls'][0].endswith('/' + val('PYTHON'))
+    assert decl['cpython-src']['sha256'] == val('PYTHON_SHA')
