@@ -40,14 +40,23 @@ def _uses(spec, name) -> bool:
     return '{' + name + '}' in _text(spec)
 
 
+# The scripts a resumable case runs: their contents key the resume folder too (a changed job list, profile or metric
+# must not mix with old records or meet inputs prepared by the old script).
+RESUME_SCRIPTS = ('tools/run_m1_perf.py', 'tools/run_io_matrix.py', 'tools/run_fio_admission.py', 'tools/run_fio_baselines.py',
+                  'tools/run_io5.py', 'tools/io_common.py', 'tools/run_virtio_block.py')
+RESUME_KEEP_DAYS = 14         # `natemu-test clean` removes resume folders untouched this long; purge removes all
+
+
 def resume_dir(case: str, spec: dict, ident: dict, machine: str) -> pathlib.Path:
     """A results folder that outlives the run, for a case whose script resumes from its own records (run_m1_perf.py
     full --dir): the same on every run of the case on this machine while the case's command line and everything its
     placeholders name (builds and inputs, by their cache entries, which are content-addressed) stay the same, so a rerun
     finishes what is left instead of repeating finished measurements. Anything new (a new final build, a changed input
-    or command line) gets a new folder. In the machine's state folder, which clean and purge keep."""
-    k = cache.key('bench-resume-v1', case, machine, *spec['argv'], *(f'{a}={b}' for a, b in sorted(spec.get('env', {}).items())),
-                  *(f'{a}={b}' for a, b in sorted(ident.items())))
+    or command line) gets a new folder, and so does a change to the scripts it runs (RESUME_SCRIPTS). In the machine's
+    state folder; `natemu-test clean` removes folders untouched for RESUME_KEEP_DAYS, purge all of them."""
+    scripts = [paths.repo_root() / s for s in RESUME_SCRIPTS]
+    k = cache.key('bench-resume-v2', case, machine, *spec['argv'], *(f'{a}={b}' for a, b in sorted(spec.get('env', {}).items())),
+                  *(f'{a}={b}' for a, b in sorted(ident.items())), *(p for p in scripts if p.exists()))
     return paths.state_dir() / 'bench-resume' / case / k[:32]
 
 
@@ -80,7 +89,7 @@ class Bench:
     def _subst(self, s, d):
         return s.format(**d)
 
-    def _values(self, spec, d, n, fexc, raw, case='', machine='') -> dict:
+    def _values(self, spec, d, n, fexc, raw, case='', machine='', fresh=False) -> dict:
         vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host,
                 'kernel': resources.fetch('debian-kernel'), 'raw': raw or '/nonexistent-natemu-raw',
                 'bench_image': artifacts.bench_image() if _uses(spec, 'bench_image') else ''}
@@ -100,8 +109,11 @@ class Bench:
                 src = dest
             vals[p] = src
         if _uses(spec, 'resume_dir'):
-            vals['resume_dir'] = resume_dir(case, spec, ident, machine)
-            vals['resume_dir'].mkdir(parents=True, exist_ok=True)
+            r = vals['resume_dir'] = resume_dir(case, spec, ident, machine)
+            if fresh and r.exists():                 # --fresh: measure everything again; the old records are set aside
+                r.rename(r.with_name(f'{r.name}.set-aside-{int(time.time())}'))
+            r.mkdir(parents=True, exist_ok=True)
+            os.utime(r)                              # in use: clean's age counts from here
         return vals
 
     def run(self, batch, config):
@@ -115,7 +127,7 @@ class Bench:
             d = runloop.run_dir(config) / 'bench' / h.machine_id / it.case
             d.mkdir(parents=True, exist_ok=True)
             raw = raw_root()
-            vals = self._values(spec, d, n, fexc, raw, it.case, h.machine_id)
+            vals = self._values(spec, d, n, fexc, raw, it.case, h.machine_id, bool(config and config.getoption('fresh')))
             where = f'{d}' + (f' (results in {vals["resume_dir"]}, kept for resuming)' if 'resume_dir' in vals else '')
             missing = [p for p in (self._subst(x, vals) for x in spec.get('needs', [])) if not pathlib.Path(p).exists()]
             if missing:

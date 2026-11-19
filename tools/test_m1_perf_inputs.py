@@ -63,3 +63,23 @@ class M1PerfInputs(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+
+
+class InterruptedPreparation(unittest.TestCase):
+    def test_an_unfinished_matrix_preparation_is_started_again(self):
+        """Review of Task 4: run_io_matrix.py prepare refuses an existing --out; the resume folder is fixed, so a
+        preparation interrupted before inputs.json was written would block the case for good."""
+        import tempfile, types
+        from unittest import mock
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import run_m1_perf
+        with tempfile.TemporaryDirectory() as t:
+            inp = pathlib.Path(t) / 'matrix-inputs'; inp.mkdir(); (inp / 'partial').write_text('x')
+            args = types.SimpleNamespace(inputs=inp, fio_prep='F', block_inputs='B')
+            seen = {}
+            def fake(cmd, check):
+                seen['existed'] = inp.exists(); seen['cmd'] = cmd
+            with mock.patch.object(run_m1_perf.subprocess, 'run', fake):
+                run_m1_perf.ensure_inputs(args)
+            self.assertFalse(seen['existed'])

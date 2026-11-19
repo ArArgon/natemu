@@ -87,9 +87,9 @@ def _m1_perf_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, 'run', fake)
     item = SimpleNamespace(suite=suites['m1-perf'], case='m1-perf', nodeid='m1')
 
-    def run(run_dir, final_name='final'):
+    def run(run_dir, final_name='final', fresh=False):
         rd['dir'], final['name'] = tmp_path / run_dir, final_name
-        res = bench.HARNESS.run([item], None)
+        res = bench.HARNESS.run([item], SimpleNamespace(getoption=lambda o: fresh if o == 'fresh' else None))
         return seen['argv'], seen['env'], tmp_path / run_dir / 'bench' / 'M' / 'm1-perf', res['m1']
     return run
 
@@ -148,3 +148,43 @@ def test_ssh_builder_runs_recipe_and_cleans_up(tmp_path):
     assert (out / 'bench.cpio').read_text() == 'cpio\n' and (out / 'expected.txt').read_text() == 'exp\n'
     assert list(remote.iterdir()) == []                         # nothing left on the builder
     assert 'rm -rf' in log.read_text()
+
+
+
+def test_m1_perf_resume_folder_changes_with_its_scripts(monkeypatch, tmp_path):
+    """Review of Task 4: a changed run_io_matrix.py (job list, profiles) must not resume old records or meet inputs the
+    old script prepared."""
+    from testkit.harness import bench
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    val = lambda a, opt: a[a.index(opt) + 1]
+    a1, *_ = run('run1')
+    script = tmp_path / 'tools' / 'run_io_matrix.py'; script.parent.mkdir(); script.write_text('v1')
+    monkeypatch.setattr(bench, 'RESUME_SCRIPTS', ('tools/run_io_matrix.py',))
+    monkeypatch.setattr(bench.paths, 'repo_root', lambda: tmp_path)
+    a2, *_ = run('run2')
+    script.write_text('v2')
+    a3, *_ = run('run3')
+    assert len({val(a, '--dir') for a in (a1, a2, a3)}) == 3
+
+
+def test_m1_perf_fresh_sets_the_old_records_aside(monkeypatch, tmp_path):
+    """--fresh measures everything again (the records are kept beside, for `natemu-test clean`)."""
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    val = lambda a, opt: a[a.index(opt) + 1]
+    a1, *_ = run('run1')
+    d = pathlib.Path(val(a1, '--dir')); (d / 'runs.jsonl').write_text('{"id": "A-base-raw-0", "ok": true}\n')
+    a2, *_ = run('run2', fresh=True)
+    assert val(a2, '--dir') == str(d) and not (d / 'runs.jsonl').exists()
+    assert [p for p in d.parent.iterdir() if '.set-aside-' in p.name]
+
+
+def test_clean_removes_old_resume_folders(monkeypatch, tmp_path):
+    import time
+    from testkit import clean, paths
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'cache'))
+    base = paths.state_dir() / 'bench-resume' / 'm1-perf'
+    old, new = base / 'a', base / 'b'
+    for f in (old, new): f.mkdir(parents=True); (f / 'runs.jsonl').write_text('x')
+    os.utime(old, (time.time() - 20 * 86400,) * 2)
+    assert clean.resume_folders(14 * 86400) == [old]
+    assert sorted(clean.resume_folders(None)) == [old, new]

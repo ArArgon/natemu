@@ -175,6 +175,9 @@ def env_record(args, dest):
 
 def ensure_inputs(args):
     if (Path(args.inputs) / 'inputs.json').exists(): return
+    if Path(args.inputs).exists():           # an interrupted preparation (inputs.json is written last): start it again
+        print('removing an unfinished matrix-input preparation:', args.inputs, flush=True)
+        shutil.rmtree(args.inputs)
     print('preparing matrix inputs (once):', args.inputs, flush=True)
     subprocess.run([sys.executable, TOOLS / 'run_io_matrix.py', 'prepare', '--fio-prep', args.fio_prep, '--block-inputs', args.block_inputs,
                     '--out', args.inputs, '--transport', 'pci'], check=True)

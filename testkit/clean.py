@@ -79,6 +79,18 @@ def _remove(ps, dry: bool) -> int:
     return total
 
 
+def resume_folders(older_than: float | None) -> list[pathlib.Path]:
+    """Benchmark resume folders (testkit/harness/bench.py resume_dir), each with its own prepared inputs (a GiB or
+    more): those untouched for `older_than` seconds, or all with None. Set-aside ones (--fresh) count as untouched."""
+    base = paths.state_dir() / 'bench-resume'
+    out = []
+    for case in base.iterdir() if base.exists() else ():
+        for f in case.iterdir() if case.is_dir() else ():
+            if f.is_dir() and (older_than is None or '.set-aside-' in f.name or time.time() - f.stat().st_mtime > older_than):
+                out.append(f)
+    return out
+
+
 def _forget_dead_registry() -> None:
     for f in runs._registry().glob('*.json'):
         try: rec = json.loads(f.read_text())
@@ -107,6 +119,8 @@ def clean(dry: bool = False, purge: bool = False, all_worktrees: bool = False) -
     print(f'temporary folders: {len(ts)}, {verb} {_human(freed_tmp)}'
           + (' (only those untouched for a day: other natemu-test processes are running)' if busy else ''))
     if not dry: _forget_dead_registry()
+    old = resume_folders(None if purge else 14 * 86400) if not busy or not purge else []
+    print(f'bench resume folders: {len(old)}{" (all)" if purge else " untouched for 14 days"}, {verb} {_human(_remove(old, dry))}')
     if purge:
         if dry and others: print(f'(purge would refuse now: {len(others)} other natemu-test processes running)')
         held = cache.leased()
