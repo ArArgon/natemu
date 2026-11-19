@@ -154,6 +154,10 @@ builder = "ssh:ubuntu@x86-box"
 Entries record and are keyed by where they were built, so a Mac-built entry and an x86-built one never stand in for
 each other. The stress-ng build gives the same binary either way (`53140a75...`).
 
+The x86 machine runs at most two builds at once (`BUILD_SLOTS` in `testkit/inputs.py`), shared by every Mac that uses
+it, so the first images come back early instead of all of them late. While a campaign image builds there, its run
+holds only a *light* claim on this Mac: it takes no cores and never holds up an exclusive window or other runs' work.
+
 ## The cache
 
 Everything a machine builds or downloads lives in `~/Library/Caches/natemu/testkit` (`NATEMU_TEST_CACHE` to move it),
