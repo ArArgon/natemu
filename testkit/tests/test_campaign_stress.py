@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import textwrap
 
+import pytest
+
 from testkit import family, inputs, paths
 from testkit.harness import campaign
 
@@ -186,6 +188,28 @@ def test_part_args_overridden_from_the_environment(tmp_path, monkeypatch):
         monkeypatch.setenv(campaign.PART_ARGS_ENV, env)
         calls, res = _boot_one(tmp_path / (env or 'none'), monkeypatch)
         assert calls == [want] and res.outcome == 'passed', res.message
+
+
+def test_part_args_from_the_environment_can_name_their_suite(tmp_path, monkeypatch):
+    """Review: a bare TESTKIT_PART_ARGS replaced part_args for every campaign suite of the run (stress's scale= went to
+    litmus too). `SUITE:ARGS` entries, `;`-separated, apply to their suite only; a bare entry still applies to every
+    suite no entry names (docs/testing.md promised it)."""
+    for env, want in (('stress:scale=1,timeout=240', 'mem1,seed=1,n=4,scale=1,timeout=240'),
+                      ('litmus:r=100', 'mem1,seed=1,n=4,scale=0.05,timeout=20'),
+                      ('litmus:r=100;stress:scale=2', 'mem1,seed=1,n=4,scale=2'),
+                      ('stress:', 'mem1,seed=1,n=4'),
+                      ('scale=3;litmus:', 'mem1,seed=1,n=4,scale=3')):
+        monkeypatch.setenv(campaign.PART_ARGS_ENV, env)
+        calls, res = _boot_one(tmp_path / str(abs(hash(env))), monkeypatch)
+        assert calls == [want] and res.outcome == 'passed', (env, res.message)
+
+
+def test_part_args_from_the_environment_refuse_a_suite_named_twice():
+    for bad in ('stress:scale=1;stress:scale=2', 'scale=1;scale=2'):
+        with pytest.raises(ValueError, match='TESTKIT_PART_ARGS'):
+            campaign.part_args('stress', '', bad)
+    assert campaign.part_args('stress', 'a=1', None) == 'a=1'
+    assert campaign.part_args('stress', 'a=1', 'x=1:2') == 'x=1:2'        # a colon after "=" is a value, not a suite
 
 
 def test_stress_timeout_with_no_operation_fails():

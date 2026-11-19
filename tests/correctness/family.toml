@@ -555,9 +555,10 @@ tier = "campaign"
 # part's word: scale=X runs round(OPS * X) operations per stressor, timeout=T is stress-ng's --timeout (outer kill
 # T + 160 s). The original campaign is scale=1,timeout=240 over all 18 families, run on request: about 2 h 20 min of
 # boots at 4 vCPUs (its N=4 boots took 1-13 min each; 900 s cap per boot, docs/restructure/correctness-stress.md):
-#   TESTKIT_PART_ARGS=scale=1,timeout=240 tools/natemu-test run --tier campaign tests/correctness/family.toml -k stress
-# (TESTKIT_PART_ARGS replaces part_args for that run; empty: none, run-stress.sh's defaults, the same).
-# Here: a smoke setting that only proves the campaign works end to end, and only mem1 (part-0, 12 stressors) is run.
+#   TESTKIT_PART_ARGS=stress:scale=1,timeout=240 tools/natemu-test run --tier campaign tests/correctness/family.toml -k stress
+# (TESTKIT_PART_ARGS's `stress:` entry replaces this suite's part_args for that run; empty: none, run-stress.sh's
+# defaults, the same). Here: a smoke setting that only proves the campaign works end to end. --tier campaign runs all
+# 18 parts at it; the smoke list selects only mem1 (part-0, 12 stressors).
 parts = 18
 cap = 900
 part_args = "scale=0.05,timeout=20"
@@ -607,10 +608,11 @@ tier = "campaign"
 # (size), the iterations per test being their product. The original campaign is the harnesses' compiled -r 100
 # -s 100000 (10 M iterations per test): 1,825 s in two boots at 4 vCPUs there; part-0 took 2,213 s of guest time on
 # the M2 Max (run 20261118-235104-6441). Run on request:
-#   TESTKIT_PART_ARGS= tools/natemu-test run --tier campaign tests/correctness/family.toml -k litmus
-# (TESTKIT_PART_ARGS replaces part_args for that run; empty: none, the compiled values).
+#   TESTKIT_PART_ARGS=litmus: tools/natemu-test run --tier campaign tests/correctness/family.toml -k litmus
+# (TESTKIT_PART_ARGS's `litmus:` entry replaces this suite's part_args for that run; empty: none, the compiled values).
 # Here: a smoke setting, 1/100 of the iterations, that only proves the campaign works end to end (a forbidden state
-# still fails; fewer allowed relaxed outcomes show), and only part-0 (659 of the 1,318 tests) is run.
+# still fails; fewer allowed relaxed outcomes show). --tier campaign runs both parts at it; the smoke list selects only
+# part-0 (659 of the 1,318 tests).
 parts = 2
 part_args = "r=10,s=10000"
 smoke = ["part-0"]

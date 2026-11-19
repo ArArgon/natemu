@@ -82,8 +82,11 @@ A campaign (`--tier campaign`, `tests/correctness`) judges each test it runs by 
 
 A suite's `part_args` are options of the campaign's own runner, added to each part's `part=` word on the kernel command
 line; the stress suite uses them to run a small smoke size (`scale=0.05,timeout=20`). Set `TESTKIT_PART_ARGS` to
-replace them for one run, an empty value meaning none: `TESTKIT_PART_ARGS=scale=1,timeout=240 tools/natemu-test run
---tier campaign tests/correctness/family.toml -k stress` is the original full-size stress-ng campaign.
+replace them for one run: `SUITE:ARGS` for one suite, several separated by `;`, an empty ARGS meaning none (the
+runner's defaults). `TESTKIT_PART_ARGS=stress:scale=1,timeout=240 tools/natemu-test run --tier campaign
+tests/correctness/family.toml -k stress` is the original full-size stress-ng campaign, and
+`TESTKIT_PART_ARGS='stress:scale=1,timeout=240;litmus:'` runs both at full size. A value without `SUITE:` applies to
+every suite of the run that no entry names.
 
 A Mac with every feature (an M4) can pass a gate alone. On a Mac without one, combine runs of the same commit:
 `--gate --with-run .natemu/runs/<id-from-the-M4>` counts the variants this Mac cannot run as covered where they passed

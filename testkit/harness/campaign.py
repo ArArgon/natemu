@@ -23,7 +23,9 @@ run and nothing is locked: no QEMU, no x86 machine.
     part_args = "k=v,..."       optional: appended to each part's word on the kernel command line (`part=WORD,ARGS`),
                                 options of the campaign's runner (stress: scale=, timeout=); the list and the CT-END
                                 check still name the part by its WORD. The environment variable TESTKIT_PART_ARGS,
-                                when set, replaces it for the run (empty: none), e.g. a full-size run on request
+                                when set, replaces it for the run: `SUITE:ARGS` entries, `;`-separated, for their suite
+                                (`stress:scale=1,timeout=240`, a full-size run on request), a bare `ARGS` for every
+                                suite no entry names; an empty ARGS means none (part_args() below)
 
 The image is `inputs.campaign_image(suite)`: a folder holding `<suite>.cpio.zst` and `<suite>-cases.txt`, every test the
 image runs, one `PART TEST` line each, PART being the kernel's `part=` word for that boot (`0/4`, `mem1`, `7/1`). The
@@ -59,7 +61,7 @@ from testkit.harness import CaseResult, Requirement, SubResult
 
 AFTER_END = 30.0            # seconds the guest gets to power off after CT-END (boot.py's), then it is stopped
 POLL = 0.5
-PART_ARGS_ENV = 'TESTKIT_PART_ARGS'     # replaces a suite's part_args at launch (empty: none)
+PART_ARGS_ENV = 'TESTKIT_PART_ARGS'     # replaces suites' part_args at launch: SUITE:ARGS;... (part_args())
 TAIL = 40                   # serial lines shown for a part that did not reach CT-END
 
 
@@ -316,6 +318,26 @@ def adjust(name: str, verdict: str, msg: str, expected: dict) -> SubResult:
     return SubResult(name, 'failed', msg)
 
 
+def part_args(suite: str, declared: str, env: str | None) -> str:
+    """The options added to a part's word: the suite's `part_args`, or what TESTKIT_PART_ARGS (`env`) gives it.
+    `env` is `;`-separated entries: `SUITE:ARGS` for that suite only, or a bare `ARGS` for every suite no entry names
+    (an empty ARGS: none, the runner's defaults). An entry is a suite's when the text before its first `:` is a plain
+    name (no `=` or `,`), so a value holding a colon stays bare. A suite named twice, or two bare entries, is an error."""
+    if env is None: return declared.strip(',')
+    named, bare = {}, None
+    for entry in env.split(';') if env.strip() else ['']:
+        name, sep, rest = entry.partition(':')
+        if sep and name.strip() and not re.search(r'[=,\s]', name.strip()):
+            name = name.strip()
+            if name in named: raise ValueError(f'{PART_ARGS_ENV}={env!r} names suite {name} twice')
+            named[name] = rest.strip()
+        else:
+            if bare is not None: raise ValueError(f'{PART_ARGS_ENV}={env!r} has two entries for every suite')
+            bare = entry.strip()
+    got = named.get(suite, bare)
+    return (declared if got is None else got).strip(',')
+
+
 class Campaign:
     def cases(self, fam, suite):
         return [f'part-{k}' for k in range(int(suite.extra.get('parts', 1)))]
@@ -365,7 +387,7 @@ class Campaign:
         cpio = img / f'{suite.name}.cpio.zst'
         how = read_boot(img, suite.name).get(part, {})      # the part's own kernel and command-line words, if any
 
-        args = os.environ.get(PART_ARGS_ENV, str(ex.get('part_args', ''))).strip(',')
+        args = part_args(suite.name, str(ex.get('part_args', '')), os.environ.get(PART_ARGS_ENV))
         booted = f'{part},{args}' if args else part         # the kernel's part= word: the list's, plus the suite's options
 
         def results(br: BootResult) -> dict[str, tuple[str, str]]:
