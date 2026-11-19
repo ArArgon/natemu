@@ -1884,6 +1884,10 @@ pub fn moved_word(w: u32, from: u64, to: u64, map: impl Fn(u64) -> u64) -> Optio
     }
     Some(w & !(mask << shift) | (d as u32 & mask) << shift)
 }
+/// Hot/cold experiment: the word `w` can be followed by the next (not `b`, `brk` or a zero word: [`body_end`]'s rule).
+pub fn falls_through(w: u32) -> bool {
+    !(w & 0xfc00_0000 == 0x1400_0000 || w & 0xffe0_001f == 0xd420_0000 || w >> 16 == 0)
+}
 /// Hot/cold experiment: the end of a block's body (`size` bytes of code, words read by `word`): past the last word reached
 /// from its entry by falling through or branching (branches go forward, admission; a back edge's target was reached already)
 /// without passing a `stop` word (an exit word or a check stub's first word, which stay cold or become trampolines). `None`

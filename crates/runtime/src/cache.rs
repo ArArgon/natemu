@@ -146,6 +146,11 @@ fn split(b: &mut Block) -> bool {
         }
         b.trampolines().find(|&(e, _)| e == t).map_or(t, |(_, at)| at)
     };
+    // (The word before `h` falling through into a word that is no exit would run what the hot zone held before: a stub's first
+    // word reached by falling through is a malformed block, so it is placed whole and its code stays as admitted.)
+    if !exit_at_h && natemu_abi::execution::falls_through(word(code + h - 4)) {
+        return false;
+    }
     for o in (u64::from(natemu_abi::execution::ENTRY_OFFSET)..h).step_by(4) {
         let Some(w) = natemu_abi::execution::moved_word(word(code + o), code + o, body + o, map) else {
             return false;
