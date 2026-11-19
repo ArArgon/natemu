@@ -1,0 +1,6 @@
+# Known natemu bugs these tests catch (testkit/known_bugs.py): reported as `known-bug`, never a gate failure.
+# Recorded in docs/research/notes/2026-11-test-migration-findings.md ("natemu: suspected bugs").
+
+[bug.block-abandoned-worker-retire-timeout]
+note = "virtio::block test: the abandoned worker's retirement exceeded the test's 1 s wait (crates/host/src/virtio/block.rs:2158, recv_timeout Timeout) under gate load in run 20261119-031719-c15f; the suite passed alone on the same machine (786 passed, twice) and in three earlier gates (docs/research/notes/2026-11-test-migration-findings.md)"
+cases = ["rust*/all::natemu::natemu::virtio::block::tests::abandoned_blocked_worker_retains_only_owned_resources_until_it_retires"]

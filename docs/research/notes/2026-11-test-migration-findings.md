@@ -32,6 +32,11 @@ so in its claims; whether either also hides a missing natemu path is open.
   at the head under test and at the earlier head where it had passed: stop counts 'resident' 0 and 'rearms' 0 over
   18,459 stops. Recorded as the known bug `kicks-adversarial-no-resident-stop` (tests/smp/known-bugs.toml): it keeps
   running and reports `known-bug-passed` when it passes.
+- `rust` unit tests, `virtio::block::tests::abandoned_blocked_worker_retains_only_owned_resources_until_it_retires`:
+  "called `Result::unwrap()` on an `Err` value: Timeout" at crates/host/src/virtio/block.rs:2158, the test's 1 s wait
+  for the abandoned worker to retire, in the gate of run 20261119-031719-c15f (M2 Max, 4.2 units at once). The suite
+  passed alone twice right after (786 passed) and in the three gates before. Known bug
+  `block-abandoned-worker-retire-timeout` (tests/unit/known-bugs.toml).
 - `l4b`, case `cases/frozen` (a 100 µs PIT/IRR window over 20,000 trials): "reached rbx=1, want 0" on both attempts of
   one seeding run with all 8 performance cores busy; passed in the other seeding run and in the locked run.
 

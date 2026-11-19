@@ -3,4 +3,4 @@
 
 [bug.kicks-adversarial-no-resident-stop]
 note = "kicks adversarial: no stop at the 'resident' place (nor 'rearms') in any adversarial run; a peer's doorbell must be pending exactly as a vCPU enters the resident, so whether it is seen depends on timing. Passed in the gates of runs 20261119-010547-87de and -014037-79f5, failed in 20261119-021407-57b8 and on reruns of both 9cf60b4e and 158f16ad on the idle M2 (docs/research/notes/2026-11-test-migration-findings.md, kicks)"
-cases = ["smp/kicks::adversarial", "smp/kicks"]
+cases = ["smp/kicks::adversarial"]          # the case itself, failing only through this, follows (known-bugs-only)

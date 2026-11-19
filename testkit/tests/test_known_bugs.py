@@ -55,3 +55,19 @@ def test_one_real_sub_result_failure_keeps_the_case_failed(tmp_path):
 def test_unrelated_failure_untouched(tmp_path):
     r = tracker(tmp_path).adjust(rep('tests/f/family.toml::s/c9', 'failed'))
     assert r.failed and cat(r) is None
+
+
+def test_a_sub_result_whose_name_holds_colons_counts_for_its_case(tmp_path):
+    """A cargo test's sub-result is `rust/all::crate::module::tests::name`: its case is the node id's first two parts
+    (family file and case), not everything before the last `::` (run 20261119-031719-c15f: rust/all stayed failed)."""
+    (tmp_path / 'tests' / 'f').mkdir(parents=True)
+    (tmp_path / 'tests' / 'f' / 'known-bugs.toml').write_text(
+        '[bug.b2]\nnote = "timing"\ncases = ["u/all::natemu::virtio::block::tests::slow"]\n')
+    known_bugs._bugs.cache_clear()
+    t = known_bugs.Tracker(tmp_path)
+    t.adjust(rep('tests/f/family.toml::u/all::natemu::virtio::block::tests::slow', 'failed'))
+    t.adjust(rep('tests/f/family.toml::u/all::natemu::virtio::block::tests::fast', 'passed'))
+    r = t.adjust(rep('tests/f/family.toml::u/all', 'failed', '1 failed: natemu::virtio::block::tests::slow'))
+    assert r.skipped and cat(r) == 'known-bug'
+    t.adjust(rep('tests/f/family.toml::u/all::natemu::other::tests::real', 'failed'))
+    assert t.adjust(rep('tests/f/family.toml::u/all', 'failed', 'exit 1')).failed       # a real one keeps it failed

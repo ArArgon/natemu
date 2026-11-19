@@ -51,7 +51,9 @@ class Tracker:
 
     def adjust(self, rep):
         if rep.when != 'call' and not (rep.when == 'setup' and rep.failed): return rep
-        parent = rep.nodeid.rsplit('::', 1)[0] if rep.nodeid.count('::') >= 2 else None
+        parts = rep.nodeid.split('::')
+        parent = '::'.join(parts[:2]) if len(parts) >= 3 else None     # family file and case: a sub-result's name may
+                                                                        # hold `::` itself (a cargo test's path)
         m = match(rep.nodeid, self.root)
         own = dict(rep.user_properties).get('testkit-own-failure')      # e.g. a campaign part without CT-END
         if m is None and rep.failed and parent is None and not own and self.subs.get(rep.nodeid, [0, 0])[0] and \
