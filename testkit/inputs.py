@@ -173,7 +173,10 @@ def _in_docker_over_ssh(host: str, cname: str, recipe: pathlib.Path, work: pathl
     d = artifacts._run(['ssh', *SSH, host, 'mktemp -d "$HOME/.natemu-build-XXXXXX"']).stdout.strip()
     try:
         for local, there in ((recipe, 'recipe'), (work, 'work')):
-            tar = subprocess.run(['tar', '-C', str(local), '-cf', '-', '.'], capture_output=True, check=True).stdout
+            # COPYFILE_DISABLE: macOS tar would add an AppleDouble `._NAME` file for every file with extended attributes;
+            # they come back as plain files that the Mac's tar then fails to unpack ("./._.: Truncated tar archive")
+            tar = subprocess.run(['tar', '-C', str(local), '-cf', '-', '.'], capture_output=True, check=True,
+                                 env={**os.environ, 'COPYFILE_DISABLE': '1'}).stdout
             p = subprocess.run(['ssh', *SSH, host, f'mkdir -p {d}/{there} && tar -C {d}/{there} -xf -'], input=tar, capture_output=True)
             if p.returncode: raise BuildFailure(cname, p.stderr.decode(errors='replace')[-800:])
         run = (f'{_slot_wait()}docker run --rm --name {cname} --platform linux/amd64 --cpus 8 --memory {memory} '
@@ -183,7 +186,7 @@ def _in_docker_over_ssh(host: str, cname: str, recipe: pathlib.Path, work: pathl
         except subprocess.TimeoutExpired:
             subprocess.run(['ssh', *SSH, host, f'docker kill {cname}'], capture_output=True, timeout=60)
             raise
-        back = subprocess.run(['ssh', *SSH, host, f'tar -C {d}/work -cf - .'], capture_output=True)
+        back = subprocess.run(['ssh', *SSH, host, f"tar -C {d}/work --exclude='._*' -cf - ."], capture_output=True)
         if back.returncode == 0:
             x = subprocess.run(['tar', '-C', str(work), '-xf', '-'], input=back.stdout, capture_output=True)
             if x.returncode:

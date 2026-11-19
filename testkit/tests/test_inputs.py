@@ -214,14 +214,15 @@ def test_container_builds_run_natively_on_the_x86_builder(monkeypatch, tmp_path)
     monkeypatch.setenv('NATEMU_CONTAINER_BUILDER', 'ssh:u@x86')
     recipe = tmp_path / 'recipe'; recipe.mkdir(); (recipe / 'container.sh').write_text('true')
     work = tmp_path / 'work'; work.mkdir()
-    seen = []
+    seen = []; tar_envs = []
     def run(cmd, **kw):
         seen.append(cmd)
+        if cmd[:1] == ['tar'] and '-cf' in cmd: tar_envs.append(kw.get('env') or {})
         if cmd[:1] == ['tar'] and '-cf' in cmd: return SimpleNamespace(returncode=0, stdout=b'TAR', stderr=b'')
         if cmd[:1] == ['tar']: return SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
         last = cmd[-1]
         if last.startswith('mktemp'): return SimpleNamespace(returncode=0, stdout='/home/u/.natemu-build-1\n', stderr='')
-        if last.startswith('tar -C /home/u/.natemu-build-1/work -cf'): return SimpleNamespace(returncode=0, stdout=b'BACK', stderr=b'')
+        if last.startswith('tar -C /home/u/.natemu-build-1/work '): return SimpleNamespace(returncode=0, stdout=b'BACK', stderr=b'')
         return SimpleNamespace(returncode=0, stdout='' if kw.get('text') else b'', stderr='' if kw.get('text') else b'')
     monkeypatch.setattr(inputs.subprocess, 'run', run)
     monkeypatch.setattr(inputs.artifacts, '_run', lambda cmd, **kw: run(cmd, text=True, **kw))
@@ -230,7 +231,9 @@ def test_container_builds_run_natively_on_the_x86_builder(monkeypatch, tmp_path)
     assert any(r.startswith(inputs._slot_wait() + 'docker run --rm') and inputs.artifacts.BENCH_BUILDER in r and
                '-v /home/u/.natemu-build-1/recipe:/recipe:ro' in r and 'bash /recipe/container.sh' in r for r in remote)
     assert 'flock -n 9' in inputs._slot_wait() and inputs.BUILD_SLOTS == 2      # waits for one of two build slots
-    assert any('tar -C /home/u/.natemu-build-1/work -cf -' in r for r in remote)                 # the work folder back
+    assert any("tar -C /home/u/.natemu-build-1/work --exclude='._*' -cf -" in r for r in remote)  # the work folder back
+    # no AppleDouble ._NAME files either way: the Mac's tar runs with COPYFILE_DISABLE, the builder's excludes them
+    assert tar_envs and all(e.get('COPYFILE_DISABLE') == '1' for e in tar_envs)
     assert ['tar', '-C', str(work), '-xf', '-'] in seen
     assert remote[-1].startswith('docker run --rm -v /home/u/.natemu-build-1:/x') and 'rm -rf' in remote[-1]
 
