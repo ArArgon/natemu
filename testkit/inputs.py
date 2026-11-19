@@ -350,6 +350,17 @@ def campaign_manifest(name: str, downloads: pathlib.Path, pins: dict) -> list[di
     return sorted(sources, key=lambda s: s['file'])
 
 
+def campaign_boot_files(name: str, work: pathlib.Path, suite: str) -> list[str]:
+    """`<suite>-boot.txt` (`PART [kernel=FILE] WORD...`: testkit/harness/campaign.py's per-part boot) and every kernel
+    FILE it names, when the recipe wrote one; [] otherwise. A named kernel the recipe did not write fails the build."""
+    f = work / f'{suite}-boot.txt'
+    if not f.is_file(): return []
+    kernels = sorted({w.split('=', 1)[1] for line in f.read_text().splitlines() for w in line.split()[1:] if w.startswith('kernel=')})
+    if bad := [k for k in kernels if '/' in k or not (work / k).is_file()]:
+        raise BuildFailure(name, f'{f.name} names kernels the recipe did not write: {bad}')
+    return [f.name, *kernels]
+
+
 def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
     suite, builder = inputs[:2]
     pairs = list(zip(inputs[3::2], inputs[4::2]))
@@ -378,11 +389,14 @@ def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
     sources = campaign_manifest(name, work / 'downloads.txt', read_pins(src / CAMPAIGN_RECIPES))
     sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
     for f in (image, listing): os.replace(work / f, out / f)
+    boot = campaign_boot_files(name, work, suite)     # optional: per-part kernels and command-line words (public)
+    for f in boot: os.replace(work / f, out / f)
     if (work / 'log').is_dir(): os.replace(work / 'log', out / 'log')
     (out / 'manifest.json').write_text(json.dumps({
         'suite': suite, 'builder': artifacts.build_env_described(),
         'image': {'file': image, 'sha256': sha(out / image), 'bytes': (out / image).stat().st_size},
         'list': {'file': listing, 'sha256': sha(out / listing), 'tests': len(lines), 'parts': list(dict.fromkeys(w[0] for w in lines))},
+        **({'boot': {f: sha(out / f) for f in boot}} if boot else {}),
         'recipe': {rel: recipe_sha256(p) if p.is_dir() else sha(p) for rel, p in ((r, src / r) for r, _ in pairs)},
         'sources': sources}, indent=1) + '\n')
     shutil.rmtree(src); shutil.rmtree(work)

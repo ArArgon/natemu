@@ -80,6 +80,7 @@ root_phase() {
     debsums /var/cache/apt/archives > "$H/tools.lst"; pins "$H/tools.lst" common/tools-debs.sha256
     uris /var/cache/apt/archives/*.deb > "$W/out/downloads.txt"
     apt-get -y -qq install --no-install-recommends $TOOLS >/dev/null
+    [ -z "${ROOT_DEBS:-}" ] || root_debs "$suite/root-debs.sha256" $ROOT_DEBS
     # The apt keyring of the private apts remote.sh and rootfs.sh run (they would download debian-archive-keyring with
     # an apt that has no configuration yet): the builder image's, the anchor the pinned image carries.
     for d in "$W/kr" "$W/pb/kr"; do cp /usr/share/keyrings/debian-archive-keyring.pgp "$d/usr/share/keyrings/"; done
@@ -94,6 +95,18 @@ root_phase() {
         *) echo "the build as ubuntu failed (exit $rc)" >&2; exit "$rc";;   # a failure, even while re-pinning
     esac
     cp "$W/out/$suite.cpio.zst" "$W/out/$suite-cases.txt" "$W/out/downloads.txt" /work/
+}
+
+# root_debs PIN PKG...: what a suite builds with natively (ROOT_DEBS, set by its build.sh before root_phase; for
+# example a kernel build's libelf-dev and libssl-dev), installed as root after the tools, checked against PIN.
+root_debs() {
+    local pin=$1; shift
+    say "build packages: $*"
+    rm -f /var/cache/apt/archives/*.deb
+    apt-get -o Acquire::Retries=5 -y -qq -d install --no-install-recommends "$@" >/dev/null
+    debsums /var/cache/apt/archives > "$H/root-debs.lst"; pins "$H/root-debs.lst" "$pin"
+    uris /var/cache/apt/archives/*.deb >> "$W/out/downloads.txt"
+    apt-get -y -qq install --no-install-recommends "$@" >/dev/null
 }
 
 # mkcpio_epoch: a mkcpio.py that runs tools/play/mkcpio.py, then sets each entry's mtime to SOURCE_DATE_EPOCH.

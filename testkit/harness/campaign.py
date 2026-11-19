@@ -14,7 +14,9 @@ run and nothing is locked: no QEMU, no x86 machine.
 
 The image is `inputs.campaign_image(suite)`: a folder holding `<suite>.cpio.zst` and `<suite>-cases.txt`, every test the
 image runs, one `PART TEST` line each, PART being the kernel's `part=` word for that boot (`0/4`, `mem1`, `7/1`). The
-distinct PARTs, in the order the list first names them, are the parts; their number must equal `parts`.
+distinct PARTs, in the order the list first names them, are the parts; their number must equal `parts`. An image may
+also hold `<suite>-boot.txt`, `PART [kernel=FILE] WORD...` per part: the kernel that part boots (FILE in the image's
+folder, instead of the stock Debian kernel) and words added to its command line (public: `pubcap=300`, the guest cap).
 
 Per listed test, one sub-result: its verdict, then adjusted (testkit/report.py's categories):
   - listed but not in the output (crashed or hung mid-part): `missing`, a failure;
@@ -68,16 +70,18 @@ def _read(f: pathlib.Path) -> str:
     except FileNotFoundError: return ''
 
 
-def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.Path, cap: float) -> BootResult:
+def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.Path, cap: float,
+         kernel: pathlib.Path | None = None, args: tuple = ()) -> BootResult:
     """One boot of `image` under natemu, as tools/correctness/boot.py runs it (the netboot 6.12.107 kernel, its command
     line, compile cache off), with the serial console and natemu's output in `work`, a folder no other boot uses. The
-    image is only read. Ends AFTER_END seconds after CT-END, when natemu exits, or at `cap` seconds."""
+    image is only read. Ends AFTER_END seconds after CT-END, when natemu exits, or at `cap` seconds. `kernel` replaces
+    the netboot kernel and `args` are added to the command line (the image's <suite>-boot.txt)."""
     n, fexc = artifacts.natemu(), artifacts.fexc()
-    kernel = resources.fetch('debian-netboot-linux')
+    kernel = kernel or resources.fetch('debian-netboot-linux')
     work.mkdir(parents=True, exist_ok=True)
     serial = work / 'serial.txt'
     serial.unlink(missing_ok=True)
-    cmdline = f'console=ttyS0 mitigations=off nokaslr ct={suite} part={part}'
+    cmdline = ' '.join([f'console=ttyS0 mitigations=off nokaslr ct={suite} part={part}', *args])
     cmd = [str(n.stub), '--runtime', str(n.runtime), '--fexc', str(fexc), '--kernel', str(kernel), '--initrd', str(image),
            '--cmdline', cmdline, '--vcpus', str(vcpus), '--serial', str(serial)]
     (work / 'cmd.json').write_text(json.dumps(cmd) + '\n')
@@ -213,6 +217,25 @@ def read_list(img: pathlib.Path, suite: str) -> list[tuple[str, list[str]]]:
     return list(parts.items())
 
 
+def read_boot(img: pathlib.Path, suite: str) -> dict[str, dict]:
+    """The image's optional `<suite>-boot.txt`: part word -> {'kernel': the image's kernel file (absent: the stock
+    kernel), 'args': the other words, for the command line}. No file: {}."""
+    f = img / f'{suite}-boot.txt'
+    if not f.is_file(): return {}
+    out = {}
+    for line in f.read_text().splitlines():
+        w = line.split()
+        if not w or w[0].startswith('#'): continue
+        opts = {'args': tuple(x for x in w[1:] if not x.startswith('kernel='))}
+        for x in w[1:]:
+            if x.startswith('kernel='):
+                k = img / x.split('=', 1)[1]
+                if k.parent != img or not k.is_file(): raise ValueError(f'{f}: {line!r}: no kernel {k.name} in the image')
+                opts['kernel'] = k
+        out[w[0]] = opts
+    return out
+
+
 # --- verdicts ---
 
 RANK = {'passed': 0, 'unsupported': 1, 'unverified': 2, 'failed': 3}
@@ -301,8 +324,9 @@ class Campaign:
         fn = _verdict(str(fam.dir), fam.name, ex['verdict'])
         work = rundir / 'campaign' / fam.name / suite.name / (variant.id or 'default') / case
         cpio = img / f'{suite.name}.cpio.zst'
+        how = read_boot(img, suite.name).get(part, {})      # the part's own kernel and command-line words, if any
 
-        first = boot(cpio, suite.name, part, vcpus, work / 'boot-1', cap)
+        first = boot(cpio, suite.name, part, vcpus, work / 'boot-1', cap, **how)
         got = judge(first, fn, img)
         listed = set(tests)
         missing = 'listed in the image for part ' + part + ' but not in the output' + \
@@ -312,7 +336,7 @@ class Campaign:
         notes = []
         retry = [t for t in tests if t in flaky and verdicts[t][0] in ('failed', 'missing')]
         if retry:
-            second = boot(cpio, suite.name, part, vcpus, work / 'boot-2', cap)
+            second = boot(cpio, suite.name, part, vcpus, work / 'boot-2', cap, **how)
             again = judge(second, fn, img)
             notes.append(f'rerun for {len(retry)} flaky test(s): {second.note or ("CT-END" if second.reached else "no CT-END")}')
             for t in retry:

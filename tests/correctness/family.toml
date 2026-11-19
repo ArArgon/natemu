@@ -41,3 +41,24 @@ needs = { cores = 4, perf = true }
 "ieee_pr36332.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1)"
 "pr39228.O0" = "natemu runs x87 in reduced precision (FEX): isinfl misjudges LDBL_MAX (docs/restructure/correctness-userspace.md, finding 1)"
 "pr39228.O2" = "natemu runs x87 in reduced precision (FEX): isinfl misjudges LDBL_MAX (docs/restructure/correctness-userspace.md, finding 1)"
+
+[[suite]]
+name = "public"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# docs/restructure/correctness-public-kernel.md: Linux 6.12.107 selftests, QEMU tests/tcg x86-64 programs and LTP tests
+# on the stock Debian kernel, kernel test modules on a test kernel the recipe builds; one boot per row (88 rows; the
+# image's public-boot.txt gives each row's kernel and guest cap, pubcap=300). The LKMM corpus is not built yet.
+# public-campaign.py's classify judges each row: one that ran to the end with nothing checking its output is
+# `unverified`, never passed (plan Decision 2).
+parts = 88
+cap = 450
+verdict = "verdicts:public"
+matrix = { "machine.vcpus" = [1, 4] }
+needs = { cores = 4 }
+
+[suite.expected]
+"ptrace-vmaccess" = "global.attach hits its 30 s internal timeout: a Linux 6.12.107 ptrace/exec wait cycle in the guest kernel, on QEMU too (docs/restructure/correctness-public-kernel.md, ptrace follow-up)"
+"mm-mremap_test" = "the default guest fixture rejects the 2 GiB mappings (commit accounting) and the 40 MiB preamble (EEXIST); mm-mremap_test-overcommit-noaslr is the passing fixture (docs/restructure/correctness-public-kernel.md, defect list)"
+"vmalloc-normal-cases" = "test_vmalloc returns -EAGAIN after printing its results by design, so modprobe exits non-zero (docs/restructure/correctness-public-kernel.md, resolved interpretation issue)"
