@@ -29,7 +29,9 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
   is clean on the M2 Max (1,452 passed, 354 expected-fail) and on the M3 with AFP (1,474 passed, 332 expected-fail).
   Full-size stress-ng: every stressor run passed or was expected (cap 1,800 s; runs 20261119-043949-c2b0 and
   20261119-075513-6fa7). Other results: docs/research/notes/2026-11-test-migration-findings.md.
-- Open: public's LKMM corpus (Task 5's last input); m1-perf set D (IO5), not rerun since November 18.
+- public's LKMM corpus (Task 5's last input) is in since 31e059d9: 35 klitmus7 modules judged by herd7.
+- Open: m1-perf set D (IO5), not rerun since November 18; CPython's timerfd cases on the M3 (they fail on both boots
+  there, so the flaky entry does not cover them; docs/research/notes/2026-11-test-migration-findings.md).
 
 ## Format decisions (November 18, from Task 6)
 

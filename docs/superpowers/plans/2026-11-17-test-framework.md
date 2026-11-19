@@ -575,6 +575,17 @@ Full gate at 64370f68 on the M2 Max, combined with the M3's AFP half at the same
 outright no longer leaves its campaign VM running (the controller stops it), and `run --diff` shows what differs for a
 case whose locked answer is stored as a hash only. Task 17 (remote execution) stays unbuilt.
 
+Later the same day: the gate passed again at 743a9f5b (run 20261119-121736-5b8a with the M3's m3-afp-743a: 83,659
+passed, 0 failed), after one attempt at that commit failed once on the Rust unit test
+`disk::qcow::tests::other_container_formats_made_by_qemu_img_are_refused_by_name` (its DMG check; passed on the rerun,
+cause not looked into). On the M4 at 743a9f5b the FP family in both AFP variants and the AFP Rust tests passed (5,101),
+and the smoke tier passed but `io/net-linux` and `io/net-linux-pci`: on that Mac a connection to a new listener on
+127.0.0.1 times out, also for a plain Python web server with no natemu involved. Two smp cases ask for 8 performance
+cores and are not runnable on the M4's 4. `AGENTS.md`, the README and `docs/implementation.md` now send every test
+through `tools/natemu-test`; nine scripts nothing reached are removed; four program-driver runners no suite ran
+(`run_virtio_net.py`, `run_io_windows.py`, `run_io_window_cases.py`, `run_io_pending_compiler.py`) are the io family's
+`io-program` suite. `tools/run_suite.py` stays as the step list `testkit.migrate` reads; removing it is open.
+
 ## Status (November 18)
 
 Tasks 1–16 are implemented on branch `test-framework`; an independent code review's twelve findings are fixed. Task 17
