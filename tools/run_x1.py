@@ -56,9 +56,10 @@ def model_problems(prog, memory):
             if (vector, error if err is not None else None) != (v, err) or slot != at or bad:
                 out.append(f'cpu{i} event {k}: logged {[hex(x) for x in e[:8]]}, model {[hex(v), err] + [hex(w) for w in words]} slot {at:#x} (words {bad})')
             if vector in entry.PARANOID:
-                # The GS base live at the event (SDM Vol.2 SWAPGS): U at CPL 3 (the frame's CS RPL 3, #DF's written from
-                # its SS) and for the last event, the #DF between the CPL 0 SWAPGS pair; K for the other CPL 0 events.
-                base = d + (entry.U if cs & 3 == 3 or k == len(want) - 1 else entry.K)
+                # The GS base live at the event (SDM Vol.2 SWAPGS): U at CPL 3 and for the last event, the #DF between
+                # the CPL 0 SWAPGS pair; K for the other CPL 0 events. CPL 3 is read from the frame's SS RPL: #DF's
+                # saved CS is undefined (SDM Vol.3 7.15, interrupt 8), and the handler logs it before rewriting it.
+                base = d + (entry.U if ss & 3 == 3 or k == len(want) - 1 else entry.K)
                 if x1 != base or x2 & 0xffff != i or x2 >> 16 & 0xffff != 0x100 + i or x2 >> 32:
                     out.append(f'cpu{i} event {k} (paranoid {vector:#x}): GS base found {x1:#x} (model {base:#x}), x2 {x2:#x}')
             elif x1 != 0x100 + i or x2 != (P.SYS_CODE(i) if vector == 14 else 0):
