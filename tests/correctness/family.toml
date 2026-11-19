@@ -43,6 +43,102 @@ needs = { cores = 4, perf = true }
 "pr39228.O2" = "natemu runs x87 in reduced precision (FEX): isinfl misjudges LDBL_MAX (docs/restructure/correctness-userspace.md, finding 1)"
 
 [[suite]]
+name = "ltp"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# 1,446 LTP entries (runtest files syscalls, math, sched, nptl, pty, mm, cve, crypto, fs, fcntl-locktests, capability,
+# watchqueue; 256 excluded with reasons, tools/correctness/ltp-list.py): about 1,050 s in four parts at 4 vCPUs
+# (docs/restructure/correctness-userspace.md). Exit 0 passes, 32 (TCONF) is unsupported, anything else fails.
+# getcwd04 needs two CPUs (`.min_cpus = 2`): TCONF (unsupported, not a failure) at 1 vCPU, a pass at 4, so it has no
+# `expected` entry; only 4 vCPUs run here.
+parts = 4
+cap = 3600
+verdict = "verdicts:ltp"
+matrix = { "machine.vcpus" = [4] }
+needs = { cores = 4, perf = true }
+# The end-to-end check (image, boot, results, verdicts, categories): part 3, 361 entries, 7 of them expected, no flaky
+# entry (no rerun boot). Run alone with `--tier campaign -k "ltp and part-3"`.
+smoke = ["part-3"]
+
+[suite.flaky]
+# docs/restructure/correctness-userspace.md, "Retained-result audit": the two QEMU-only TFAILs have explicit timing
+# assertions, and kill11 hit its internal 120 s timeout natively; all three pass on natemu.
+"syscalls:getrusage04" = "timing assertion: system time must stay under 5,000 us (QEMU failed it, too slow; docs/restructure/correctness-userspace.md)"
+"syscalls:pselect01_64" = "timing assertion: fails when the sleep overshoots (QEMU failed it, too slow; docs/restructure/correctness-userspace.md)"
+"syscalls:kill11" = "internal 120 s timeout: TBROK natively for lack of progress, passed on natemu and QEMU (docs/restructure/correctness-userspace.md)"
+
+[suite.expected]
+# docs/restructure/correctness-userspace.md, "Retained-result audit": all 34 LTP results other than pass/TCONF at 4
+# vCPUs, each the same on QEMU (same kernel and image) and explained by the machine, image or harness, not the CPU.
+# The smoke run of part 3 (run 20261118-235255-80fa, this recipe's image) saw the five module-metadata entries of that
+# part exit 32 (TCONF, unsupported) rather than the document's 36 (TWARN + TCONF): reported as unsupported, not as a
+# failure. The entries stay until a full run shows what the other five do.
+"syscalls:fgetxattr02" = "no usable block device in an initramfs-only machine: TBROK, ENXIO (docs/restructure/correctness-userspace.md)"
+"syscalls:fstatfs01_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:lchown03" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:lchown03_16" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:linkat02" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:lstat03_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:mknod07" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:mknodat02" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:open12" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:preadv03_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:preadv203_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:pwritev03_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:rename11" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:renameat01" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:stat04_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:statfs01_64" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:umount2_01" = "no usable block device in an initramfs-only machine: TBROK, cannot acquire a device (docs/restructure/correctness-userspace.md)"
+"syscalls:ioctl_loop01" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:ioctl_loop02" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:ioctl_loop03" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:ioctl_loop04" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:ioctl_loop05" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:ioctl_loop06" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:ioctl_loop07" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:fsetxattr02" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:madvise11" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"cve:cve-2021-3609" = "no kernel modules in the image: TWARN + TCONF for missing module metadata (docs/restructure/correctness-userspace.md)"
+"syscalls:keyctl05" = "no kernel modules in the image: TBROK from modprobe (docs/restructure/correctness-userspace.md)"
+"syscalls:accept02" = "no network prerequisites: TBROK, multicast setsockopt ENODEV (docs/restructure/correctness-userspace.md)"
+"cve:cve-2020-25705" = "no network prerequisites: TBROK, veth creation EOPNOTSUPP (docs/restructure/correctness-userspace.md)"
+"syscalls:nice05" = "TBROK \"Runtime not set!\" under run-ltp.sh's LTP_RUNTIME_MUL (docs/restructure/correctness-userspace.md)"
+"syscalls:epoll_ctl04" = "TFAIL: kernel 6.12 returns ELOOP where this LTP expects EINVAL at nesting depth 5 (docs/restructure/correctness-userspace.md)"
+"syscalls:listmount04" = "exit 127: not built, its headers are newer than trixie's linux-libc-dev 6.12 (docs/restructure/correctness-userspace.md)"
+"syscalls:prot_hsymlinks" = "exit 134: useradd and userdel are not in the image (docs/restructure/correctness-userspace.md)"
+
+[[suite]]
+name = "stress"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# stress-ng 0.19.02 with --verify, one boot per family of tools/correctness/stress-list.txt (recipes/stress/cases.py:
+# seed 1, 4 instances per stressor, mix one each; the N=2 tails ipc1t and code1t left out): 18 parts, 153 stressor
+# runs, each stopped by its op count or stress-ng's timeout. part_args are run-stress.sh's own options, appended to each
+# part's word: scale=X runs round(OPS * X) operations per stressor, timeout=T is stress-ng's --timeout (outer kill
+# T + 160 s). The original campaign is scale=1,timeout=240 over all 18 families, run on request: about 2 h 20 min of
+# boots at 4 vCPUs (its N=4 boots took 1-13 min each; 900 s cap per boot, docs/restructure/correctness-stress.md):
+#   TESTKIT_PART_ARGS=scale=1,timeout=240 tools/natemu-test run --tier campaign tests/correctness/family.toml -k stress
+# (TESTKIT_PART_ARGS replaces part_args for that run; empty: none, run-stress.sh's defaults, the same).
+# Here: a smoke setting that only proves the campaign works end to end, and only mem1 (part-0, 12 stressors) is run.
+parts = 18
+cap = 900
+part_args = "scale=0.05,timeout=20"
+smoke = ["part-0"]
+verdict = "verdicts:stress"
+matrix = { "machine.vcpus" = [4] }
+needs = { cores = 4, perf = true }
+
+[suite.expected]
+# docs/restructure/correctness-stress.md ("shm-sysv as root"): as root, stress-ng's shm-sysv does no bogo op before its
+# timeout on this kernel, under natemu and QEMU alike (as nobody it does its ops in under a second); a run to the
+# timeout with no operation fails the verdict, so these two root runs are expected to.
+"shm-sysv.r1" = "stress-ng 0.19.02's shm-sysv as root does no operation on Linux 6.12.107, on natemu and QEMU alike (docs/restructure/correctness-stress.md, shm-sysv as root)"
+"shm-sysv:root.r1" = "stress-ng 0.19.02's shm-sysv as root does no operation on Linux 6.12.107, on natemu and QEMU alike (docs/restructure/correctness-stress.md, shm-sysv as root)"
+
+[[suite]]
 name = "public"
 kind = "judged"
 harness = "campaign"
@@ -50,8 +146,8 @@ tier = "campaign"
 # docs/restructure/correctness-public-kernel.md: Linux 6.12.107 selftests, QEMU tests/tcg x86-64 programs and LTP tests
 # on the stock Debian kernel, kernel test modules on a test kernel the recipe builds; one boot per row (88 rows; the
 # image's public-boot.txt gives each row's kernel and guest cap, pubcap=300). The LKMM corpus is not built yet.
-# public-campaign.py's classify judges each row: one that ran to the end with nothing checking its output is
-# `unverified`, never passed (plan Decision 2).
+# verdicts.py's public judges each row: passed on the program's own success signal, failed on a failure or a kernel
+# splat, `unverified` when it ran to the end with nothing to say its output is right.
 parts = 88
 cap = 450
 verdict = "verdicts:public"
@@ -65,4 +161,3 @@ smoke = ["part-0", "part-24", "part-62", "part-72", "part-75", "part-77"]
 [suite.expected]
 "ptrace-vmaccess" = "global.attach hits its 30 s internal timeout: a Linux 6.12.107 ptrace/exec wait cycle in the guest kernel, on QEMU too (docs/restructure/correctness-public-kernel.md, ptrace follow-up)"
 "mm-mremap_test" = "the default guest fixture rejects the 2 GiB mappings (commit accounting) and the 40 MiB preamble (EEXIST); mm-mremap_test-overcommit-noaslr is the passing fixture (docs/restructure/correctness-public-kernel.md, defect list)"
-"vmalloc-normal-cases" = "test_vmalloc returns -EAGAIN after printing its results by design, so modprobe exits non-zero (docs/restructure/correctness-public-kernel.md, resolved interpretation issue)"

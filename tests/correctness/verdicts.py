@@ -108,19 +108,29 @@ def cpyb(name, f, extra):
     return 'failed', _fields(f, 'rc', 'sec')
 
 
-# stress-ng stressors that run to the 240 s timeout natively too (docs/restructure/correctness-stress.md): for them the
-# timeout, not the op count, ends the run.
-TIMEOUT_OK = frozenset({'mutex', 'mtx', 'pipeherd', 'sem', 'schedmix', 'yield', 'vforkmany'})
-TIMEOUT = 240
+TIMEOUT = 240           # run-stress.sh's default; its `to=` field gives the run's own (part option timeout=T)
+
+
+def _hogs(extra) -> int | None:
+    """The number of instances stress-ng started, from its first `dispatching hogs: 4 vm, 1 fork, ...` line (CT-LOG),
+    or None without one. A list line naming other stressors besides its own (family mix: `--fork 1 ...`) starts more
+    instances than its n, and its `passed:` count covers them all."""
+    for ln in extra:
+        if ln.startswith('CT-LOG ') and 'dispatching hogs:' in ln:
+            got = re.findall(r'(\d+) [A-Za-z0-9_-]+', ln.split('dispatching hogs:', 1)[1])
+            return sum(map(int, got)) if got else None
+    return None
 
 
 def stress(name, f, extra):
-    """run-stress.sh: `CT-RESULT stress STRESSOR[:LABEL].rI rc=EXIT n=N pass=N skip=N fail=#fail-lines bogo=OPS sec=S`,
-    with the boot's kernel log as CT-DMESG lines. Passes with rc 0, no `fail:` lines and nothing in the kernel log that
-    stress-check.py's scan flags (Oops, BUG, WARNING, lockups, stalls, ...; stress-ng's own OOM kills are expected).
+    """run-stress.sh: `CT-RESULT stress STRESSOR[:LABEL].rI rc=EXIT n=N pass=N skip=N fail=#fail-lines bogo=OPS sec=S
+    to=T`, with the boot's kernel log as CT-DMESG lines. Passes with rc 0, no `fail:` lines and nothing in the kernel
+    log that stress-check.py's scan flags (Oops, BUG, WARNING, lockups, stalls, ...; stress-ng's own OOM kills are expected).
     Every field must be there and pass + skip must account for all n instances (a line without stress-ng's summary
-    fails). A stressor that ran to the 240 s timeout passes on its own verification; the timeout is noted (plan,
-    format decision 2). The kernel log covers the whole boot, so a flagged line fails every stressor of the part."""
+    fails), or for a line that starts several stressors at once, for every instance stress-ng dispatched. A stressor
+    that ran to its timeout (T, 240 s by default) passes on its own verification; the timeout is noted (plan, format
+    decision 2), unless it did no operation at all (bogo 0 or none reported): that run livelocked or never got going,
+    and fails. The kernel log covers the whole boot, so a flagged line fails every stressor of the part."""
     why = []
     nums = {}
     for k in ('rc', 'n', 'pass', 'skip', 'fail'):
@@ -129,9 +139,13 @@ def stress(name, f, extra):
     if why: return 'failed', 'incomplete result line (' + ', '.join(why) + ')' + _output(extra, 4)
     if nums['rc'] != 0: why.append(f'rc={nums["rc"]}')
     if nums['fail']: why.append(f'{nums["fail"]} fail: line(s)')
-    if nums['pass'] + nums['skip'] != nums['n']: why.append(f'pass {nums["pass"]} + skip {nums["skip"]} != n {nums["n"]}')
-    try: sec = float(f.get('sec', '0'))
-    except ValueError: sec = 0.0
+    want, what = nums['n'], 'n'
+    if hogs := _hogs(extra): want, what = hogs, 'the instances stress-ng dispatched'   # a run of several stressors (mix)
+    if nums['pass'] + nums['skip'] != want: why.append(f'pass {nums["pass"]} + skip {nums["skip"]} != {what} {want}')
+    try: sec, timeout = float(f.get('sec', '0')), float(f.get('to', TIMEOUT))
+    except ValueError: sec, timeout = 0.0, float(TIMEOUT)
+    if sec >= timeout and nums['pass'] and f.get('bogo', '-') in ('0', '-'):
+        why.append(f'ran to its {timeout:g} s timeout with no operation done (bogo={f.get("bogo", "-")})')
     bad = _tool('stress-check').BAD
     kernel = [ln for ln in extra if ln.startswith('CT-DMESG') and bad.search(ln)]
     if kernel: why.append(f'{len(kernel)} kernel log line(s) of note in this boot:\n' + '\n'.join(kernel[:SHOWN]))
@@ -140,7 +154,7 @@ def stress(name, f, extra):
         return 'failed', '; '.join(why) + ('\n' + '\n'.join(fails[:SHOWN]) if fails else '')
     if f.get('pass') == '0' and f.get('skip', '0') not in ('0', '-'):
         return 'unsupported', f'stress-ng skipped it ({_fields(f, "pass", "skip")})' + _output(extra, 4)
-    return 'passed', _fields(f, 'bogo', 'sec') + (f' (ran to the {TIMEOUT} s timeout)' if sec >= TIMEOUT else '')
+    return 'passed', _fields(f, 'bogo', 'sec') + (f' (ran to the {timeout:g} s timeout)' if sec >= timeout else '')
 
 
 @functools.cache

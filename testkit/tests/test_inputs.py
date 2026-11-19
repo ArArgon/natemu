@@ -98,7 +98,6 @@ def test_stress_ng_entry_has_binary_source_and_provenance(monkeypatch, tmp_path)
         seen.append(recipe); (work / 'bin').mkdir(); (work / 'bin/stress-ng').write_bytes(_static_elf())
         (work / 'source.tar.xz').write_bytes(b'orig')
     monkeypatch.setattr(inputs, '_in_container', fake)
-    monkeypatch.setattr(inputs, 'STRESS_BUILD_SHA', hashlib.sha256(_static_elf()).hexdigest())   # the fake build's
     d = inputs.stress_ng()
     prov = json.loads((d / 'provenance.json').read_text())
     assert set(prov) == {'binary_sha256', 'source_sha256', 'recipe_sha256', 'builder'}
@@ -171,26 +170,6 @@ def test_new_paths_are_components(monkeypatch, tmp_path):
     assert set(parts) == set(inputs.PATHS)
     assert parts[inputs.FIO_PREP] == stub['fio_prep'] and parts[inputs.STRESS] == stub['stress_ng']
     assert parts[inputs.MATRIX] == stub['matrix_inputs']
-
-
-def test_stress_build_pin_is_the_same_everywhere():
-    import importlib.util, sys
-    from testkit import inputs, paths
-    sys.path.insert(0, str(paths.repo_root() / 'tools'))
-    pins = set()
-    for name in ('run_io_soak', 'run_serial_stress'):
-        src = (paths.repo_root() / 'tools' / f'{name}.py').read_text()
-        pins |= {line.split('=', 1)[1].split('#')[0].strip().strip("'") for line in src.splitlines() if line.startswith('BUILD_SHA')}
-    assert pins == {inputs.STRESS_BUILD_SHA}
-
-
-def test_stress_build_that_stops_reproducing_is_refused(monkeypatch, tmp_path):
-    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
-    def fake(name, recipe, work, **kw):
-        (work / 'bin').mkdir(); (work / 'bin/stress-ng').write_bytes(_static_elf()); (work / 'source.tar.xz').write_bytes(b'orig')
-    monkeypatch.setattr(inputs, '_in_container', fake)
-    with pytest.raises(BuildFailure, match='no longer reproduces'):
-        inputs.stress_ng()
 
 
 # ---------------------------------------------------------------- IO5 inputs (stubbed prepare)

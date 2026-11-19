@@ -77,6 +77,11 @@ A campaign (`--tier campaign`, `tests/correctness`) judges each test it runs by 
 | stale-entry | an `expected` or `flaky` entry names a test the image does not have (renamed or removed?) | yes |
 | unverified | the test ran to the end, but nothing checks that its output is right | no, and never a pass |
 
+A suite's `part_args` are options of the campaign's own runner, added to each part's `part=` word on the kernel command
+line; the stress suite uses them to run a small smoke size (`scale=0.05,timeout=20`). Set `TESTKIT_PART_ARGS` to
+replace them for one run, an empty value meaning none: `TESTKIT_PART_ARGS=scale=1,timeout=240 tools/natemu-test run
+--tier campaign tests/correctness/family.toml -k stress` is the original full-size stress-ng campaign.
+
 A Mac with every feature (an M4) can pass a gate alone. On a Mac without one, combine runs of the same commit:
 `--gate --with-run .natemu/runs/<id-from-the-M4>` counts the variants this Mac cannot run as covered where they passed
 in that run. `--require-real afp` places "AFP absent" variants only on a Mac that really lacks AFP instead of hiding it
@@ -152,7 +157,8 @@ builder = "ssh:ubuntu@x86-box"
 ```
 
 Entries record and are keyed by where they were built, so a Mac-built entry and an x86-built one never stand in for
-each other. The stress-ng build gives the same binary either way (`53140a75...`).
+each other. Only upstream inputs (sources, packages, the builder image) are pinned; what a build produces is
+recorded (its hash, in the entry's provenance), never required to match an earlier build.
 
 The x86 machine runs at most two builds at once (`BUILD_SLOTS` in `testkit/inputs.py`), shared by every Mac that uses
 it, so the first images come back early instead of all of them late. While a campaign image builds there, its run

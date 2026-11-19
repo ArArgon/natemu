@@ -146,9 +146,15 @@ Anti-goals (would make the refactor a failure even if it technically works):
     local tool versions) and never have an output hash in the lock. An answer that depends on one (a campaign's
     per-case exit codes) is keyed by the recipe and its pinned inputs only, never by a machine's local tools, so it
     holds on every machine.
-  - Guest programs that a reference ran (the campaigns' test binaries) are answer-bearing even inside an image: their
-    bytes are locked, or they are built with a toolchain pinned by digest, so two Macs cannot produce different
-    programs under one shared answer. **[review call]**
+  - Guest programs that a reference ran (the campaigns' test binaries, such as stress-ng) are built software, not
+    corpora: they are built from pinned upstream inputs with a toolchain pinned by digest, and cached per machine like
+    environment inputs. Their hash is recorded in the cache entry on that machine, never committed to the repo and
+    never required to match an earlier build. **[owner]** (revised November 19, 2026; it read "their bytes are locked,
+    or they are built with a toolchain pinned by digest", which was taken to mean a hash in the repo)
+  - *Locked* means recorded in a family's `tests.lock`, committed and reviewed: answers, input fingerprints and the
+    corpora's program hashes. *Cached* means kept per machine and rebuildable at any time: everything built from a
+    recipe, with its hash recorded for diagnosis only. Upstream downloads carry a pin (R14.1); built software and
+    images never do. **[owner]**
 - R2.16 A corpus whose generator no longer reproduces it is regenerated with the current generator and reseeded, and
   the lists tied to its cases (known QEMU departures, FP deviation tags) are re-derived. Old corpora are not kept as
   stored data (R1.2). **[review call]** No new input or answer needs to match any existing corpus in `natemu-raw`; the

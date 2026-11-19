@@ -484,7 +484,7 @@ def test_public_needs_review_is_unverified():
 def test_correctness_family_declares_openssl_and_torture():
     family.load.cache_clear()
     fam = family.load(REPO / 'tests' / 'correctness' / 'family.toml')
-    assert {s.name for s in fam.suites} >= {'openssl', 'torture'}
+    assert {s.name for s in fam.suites} >= {'openssl', 'torture'}       # the other campaigns join (plan Tasks 8-10)
     v = verdicts()
     for s in fam.suites:
         assert (s.kind, s.harness, s.extra['tier']) == ('judged', 'campaign', 'campaign')

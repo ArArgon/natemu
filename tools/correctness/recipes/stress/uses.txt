@@ -1,0 +1,10 @@
+# The tools/ files this recipe reads besides correctness/recipes/{common.sh,common/,stress/} and correctness/init
+# (testkit/inputs.py stages exactly these into the container and keys the image by them).
+correctness/remote.sh
+correctness/stress-remote.sh
+correctness/run-stress.sh
+correctness/run-repro.sh
+correctness/stress-list.txt
+play/rootfs.sh
+play/mkcpio.py
+play/init

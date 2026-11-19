@@ -199,7 +199,9 @@ VM_CHECKS = (['pgrep', '-x', 'natemu-host'], ['pgrep', '-x', 'natemu'], ['pgrep'
 
 
 def outside_vms() -> list[str]:
-    """natemu and QEMU VM processes running now (by process name, as tools/run_suite.py:idle checks)."""
+    """natemu and QEMU VM processes running now (by process name, as tools/run_suite.py:idle checks). The framework's own
+    tests set TESTKIT_IGNORE_OUTSIDE_VMS: their private pools must not wait for the machine's real VMs."""
+    if os.environ.get('TESTKIT_IGNORE_OUTSIDE_VMS'): return []
     found = []
     for c in VM_CHECKS:
         r = subprocess.run(c, capture_output=True, text=True)

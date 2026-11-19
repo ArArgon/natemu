@@ -276,7 +276,6 @@ def recipe_sha256(recipe: pathlib.Path) -> str:
     return hashlib.sha256(listing.encode()).hexdigest()
 
 
-STRESS_BUILD_SHA = '53140a759e4194faad69a11e1a95c0c868959cb3b93eb38e7dbac0bb8ed1a7cf'   # = run_io_soak.BUILD_SHA = run_serial_stress.BUILD_SHA
 
 
 def _stress_recipe(out: pathlib.Path, inputs: list) -> None:
@@ -287,9 +286,6 @@ def _stress_recipe(out: pathlib.Path, inputs: list) -> None:
     ph, size, count = struct.unpack_from('<Q', b, 32)[0], *struct.unpack_from('<HH', b, 54)
     if any(struct.unpack_from('<I', b, ph + i * size)[0] in (2, 3) for i in range(count)): raise BuildFailure('stress-ng', 'not fully static')
     sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
-    if sha(out / 'bin/stress-ng') != STRESS_BUILD_SHA:
-        raise BuildFailure('stress-ng', f'the build no longer reproduces {STRESS_BUILD_SHA} (got {sha(out / "bin/stress-ng")}): '
-                                        'the runners accept only that binary')
     (out / 'provenance.json').write_text(json.dumps({
         'binary_sha256': sha(out / 'bin/stress-ng'), 'source_sha256': sha(out / 'source.tar.xz'), 'recipe_sha256': recipe_sha256(recipe),
         'builder': artifacts.build_env_described()}, indent=1) + '\n')
@@ -398,8 +394,15 @@ def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
         'list': {'file': listing, 'sha256': sha(out / listing), 'tests': len(lines), 'parts': list(dict.fromkeys(w[0] for w in lines))},
         **({'boot': {f: sha(out / f) for f in boot}} if boot else {}),
         'recipe': {rel: recipe_sha256(p) if p.is_dir() else sha(p) for rel, p in ((r, src / r) for r, _ in pairs)},
+        'built': _built(out / 'log' / 'built.sha256'),
         'sources': sources}, indent=1) + '\n')
     shutil.rmtree(src); shutil.rmtree(work)
+
+
+def _built(listing: pathlib.Path) -> list[dict]:
+    """What a recipe built, as it recorded it (log/built.sha256, `SHA256  FILE` lines): recorded, never pinned."""
+    if not listing.is_file(): return []
+    return [{'file': m[2], 'sha256': m[1]} for m in map(PIN_LINE.fullmatch, listing.read_text().splitlines()) if m]
 
 
 def campaign_image(suite: str) -> pathlib.Path:

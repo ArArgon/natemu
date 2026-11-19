@@ -11,6 +11,10 @@ run and nothing is locked: no QEMU, no x86 machine.
     expected = { test = "why (the document that records it)" }    known non-passes
     flaky = { test = "why" }    timing-sensitive tests: a failure reruns the part once
     matrix = { "machine.vcpus" = [4] }
+    part_args = "k=v,..."       optional: appended to each part's word on the kernel command line (`part=WORD,ARGS`),
+                                options of the campaign's runner (stress: scale=, timeout=); the list and the CT-END
+                                check still name the part by its WORD. The environment variable TESTKIT_PART_ARGS,
+                                when set, replaces it for the run (empty: none), e.g. a full-size run on request
 
 The image is `inputs.campaign_image(suite)`: a folder holding `<suite>.cpio.zst` and `<suite>-cases.txt`, every test the
 image runs, one `PART TEST` line each, PART being the kernel's `part=` word for that boot (`0/4`, `mem1`, `7/1`). The
@@ -46,6 +50,7 @@ from testkit.harness import CaseResult, Requirement, SubResult
 
 AFTER_END = 30.0            # seconds the guest gets to power off after CT-END (boot.py's), then it is stopped
 POLL = 0.5
+PART_ARGS_ENV = 'TESTKIT_PART_ARGS'     # replaces a suite's part_args at launch (empty: none)
 TAIL = 40                   # serial lines shown for a part that did not reach CT-END
 
 
@@ -326,7 +331,9 @@ class Campaign:
         cpio = img / f'{suite.name}.cpio.zst'
         how = read_boot(img, suite.name).get(part, {})      # the part's own kernel and command-line words, if any
 
-        first = boot(cpio, suite.name, part, vcpus, work / 'boot-1', cap, **how)
+        args = os.environ.get(PART_ARGS_ENV, str(ex.get('part_args', ''))).strip(',')
+        booted = f'{part},{args}' if args else part         # the kernel's part= word: the list's, plus the suite's options
+        first = boot(cpio, suite.name, booted, vcpus, work / 'boot-1', cap, **how)
         got = judge(first, fn, img)
         listed = set(tests)
         missing = 'listed in the image for part ' + part + ' but not in the output' + \
@@ -336,7 +343,7 @@ class Campaign:
         notes = []
         retry = [t for t in tests if t in flaky and verdicts[t][0] in ('failed', 'missing')]
         if retry:
-            second = boot(cpio, suite.name, part, vcpus, work / 'boot-2', cap, **how)
+            second = boot(cpio, suite.name, booted, vcpus, work / 'boot-2', cap, **how)
             again = judge(second, fn, img)
             notes.append(f'rerun for {len(retry)} flaky test(s): {second.note or ("CT-END" if second.reached else "no CT-END")}')
             for t in retry:
@@ -363,13 +370,14 @@ class Campaign:
         if not first.reached or end is None:
             tail = '\n'.join(first.serial.splitlines()[-TAIL:])
             problems.append(f'no CT-END: {first.note or "the boot ended without it"}; the last {TAIL} serial lines:\n{tail}')
-        elif end.get('part') != part or end.get('suite') != suite.name:
+        elif end.get('part') not in (part, booted) or end.get('suite') != suite.name:
             problems.append(f'CT-END is for suite={end.get("suite")} part={end.get("part")}, not suite={suite.name} part={part}')
         counts = {}
         for s in sub:
             c = s.category or s.outcome
             counts[c] = counts.get(c, 0) + 1
-        summary = f'part {part} at {vcpus} vCPUs: ' + ', '.join(f'{n} {c}' for c, n in sorted(counts.items())) + \
+        summary = f'part {part}' + (f' ({args})' if args else '') + f' at {vcpus} vCPUs: ' + \
+                  ', '.join(f'{n} {c}' for c, n in sorted(counts.items())) + \
                   (f'; {first.note}' if first.note else '') + ''.join(f'; {n}' for n in notes)
         failed = [s for s in sub if s.outcome == 'failed']
         if failed: problems.insert(0, f'{len(failed)} test(s) failed: ' + ', '.join(s.name for s in failed[:10]) +

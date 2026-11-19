@@ -12,10 +12,6 @@ from unittest import mock
 import run_serial_stress
 
 
-def sha_of(p):
-    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
-
-
 def fixture(d: pathlib.Path, binary_sha=None):
     (d / 'bin').mkdir()
     stress, source, prov = d / 'bin/stress-ng', d / 'source.tar.xz', d / 'provenance.json'
@@ -30,7 +26,7 @@ class SerialStressProvenance(unittest.TestCase):
     def test_serial_stress_accepts_matching_provenance(self):
         with tempfile.TemporaryDirectory() as t:
             args, source_sha = fixture(pathlib.Path(t))
-            with mock.patch.object(run_serial_stress, 'STRESS_SOURCE_SHA', source_sha), mock.patch.object(run_serial_stress, 'BUILD_SHA', sha_of(args.stress)):
+            with mock.patch.object(run_serial_stress, 'STRESS_SOURCE_SHA', source_sha):
                 record = run_serial_stress.stress_pin(args)
             self.assertEqual(record['binary_sha256'], hashlib.sha256(args.stress.read_bytes()).hexdigest())
             self.assertEqual(record['source_sha256'], source_sha)
@@ -39,7 +35,7 @@ class SerialStressProvenance(unittest.TestCase):
     def test_serial_stress_refuses_mismatched_provenance(self):
         with tempfile.TemporaryDirectory() as t:
             args, source_sha = fixture(pathlib.Path(t), binary_sha='1' * 64)
-            with mock.patch.object(run_serial_stress, 'STRESS_SOURCE_SHA', source_sha), mock.patch.object(run_serial_stress, 'BUILD_SHA', sha_of(args.stress)), self.assertRaises(ValueError) as e:
+            with mock.patch.object(run_serial_stress, 'STRESS_SOURCE_SHA', source_sha), self.assertRaises(ValueError) as e:
                 run_serial_stress.stress_pin(args)
             self.assertEqual(str(e.exception), 'stress binary/source pin')
 
@@ -54,18 +50,9 @@ class SerialStressProvenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             args, source_sha = fixture(pathlib.Path(t))
             args.stress_provenance = None
-            with mock.patch.object(run_serial_stress, 'STRESS_SOURCE_SHA', source_sha), mock.patch.object(run_serial_stress, 'BUILD_SHA', sha_of(args.stress)), self.assertRaises(ValueError) as e:
+            with mock.patch.object(run_serial_stress, 'STRESS_SOURCE_SHA', source_sha), self.assertRaises(ValueError) as e:
                 run_serial_stress.stress_pin(args)
             self.assertEqual(str(e.exception), 'pinned stress binary/source mismatch')    # the old message, unchanged
-
-
-    def test_any_binary_with_its_own_provenance_is_refused(self):
-        """Review of Task 2: the provenance file cannot vouch for a binary; only BUILD_SHA (fixed in the repo) passes."""
-        with tempfile.TemporaryDirectory() as t:
-            args, source_sha = fixture(pathlib.Path(t))                       # provenance names this binary's own hash
-            with mock.patch.object(run_serial_stress, 'STRESS_SOURCE_SHA', source_sha), self.assertRaises(ValueError) as e:
-                run_serial_stress.stress_pin(args)                                        # BUILD_SHA left as pinned
-            self.assertEqual(str(e.exception), 'stress binary/source pin')
 
 
 if __name__ == '__main__': unittest.main()

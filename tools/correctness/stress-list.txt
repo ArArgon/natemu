@@ -166,8 +166,9 @@ splitx misaligned:int64atomic 64679 --misaligned-method int64atomic
 splitx misaligned:int128atomic 62219 --misaligned-method int128atomic
 splitx lockbus:split 124056
 splitx misaligned:all 14600
-# shmx: shm-sysv alone, as root and as nobody (ipc1's shm-sysv did no bogo op in 240 s in natemu at N=4)
-shmx shm-sysv 112
+# shmx: shm-sysv alone, as root and as nobody (ipc1's shm-sysv did no bogo op in 240 s in natemu at N=4). The root
+# run is labelled `root` (any label but `user` runs as root) so its CT-RESULT name differs from ipc1's shm-sysv.
+shmx shm-sysv:root 112
 shmx shm-sysv:user 112
 # mix: one stress-ng run of many stressors at once (part n=1: one instance each), each to the 240 s timeout (op count
 # 1e8, not reached): page-table copies (fork, mmapfork, clone, ptrace), code written and run (icache, far-branch,

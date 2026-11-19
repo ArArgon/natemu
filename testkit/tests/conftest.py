@@ -25,6 +25,9 @@ def _isolated_raw_root(monkeypatch, tmp_path_factory):
     """Never touch the machine's real natemu-raw (its .vm.lock) from the framework's own tests."""
     monkeypatch.setenv('NATEMU_RAW_ROOT', str(tmp_path_factory.mktemp('raw')))
     monkeypatch.delenv('NATEMU_STATE_ROOT', raising=False)
+    # Nor wait for the machine's real VMs: a private pool's exclusive window would never open while other runs boot VMs
+    # (seen: test_two_runs_share_machine hung for 15 minutes in four checkouts at once).
+    monkeypatch.setenv('TESTKIT_IGNORE_OUTSIDE_VMS', '1')
 
 
 @pytest.fixture(autouse=True)

@@ -11,10 +11,6 @@ from unittest import mock
 import run_io_soak
 
 
-def sha_of(p):
-    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
-
-
 def fixture(d: pathlib.Path, binary_sha=None):
     """A stress binary, a source tarball and a provenance file; SOURCE_SHA is patched to the fake source's hash."""
     (d / 'bin').mkdir()
@@ -30,7 +26,7 @@ class SoakProvenance(unittest.TestCase):
     def test_soak_accepts_matching_provenance(self):
         with tempfile.TemporaryDirectory() as t:
             args, source_sha = fixture(pathlib.Path(t))
-            with mock.patch.object(run_io_soak, 'SOURCE_SHA', source_sha), mock.patch.object(run_io_soak, 'BUILD_SHA', sha_of(args.stress)):
+            with mock.patch.object(run_io_soak, 'SOURCE_SHA', source_sha):
                 record = run_io_soak.stress_pin(args)
             self.assertEqual(record['sha256'], hashlib.sha256(args.stress.read_bytes()).hexdigest())
             self.assertEqual(record['source_sha256'], source_sha)
@@ -40,7 +36,7 @@ class SoakProvenance(unittest.TestCase):
     def test_soak_refuses_mismatched_provenance(self):
         with tempfile.TemporaryDirectory() as t:
             args, source_sha = fixture(pathlib.Path(t), binary_sha='1' * 64)
-            with mock.patch.object(run_io_soak, 'SOURCE_SHA', source_sha), mock.patch.object(run_io_soak, 'BUILD_SHA', sha_of(args.stress)), self.assertRaises(ValueError) as e:
+            with mock.patch.object(run_io_soak, 'SOURCE_SHA', source_sha), self.assertRaises(ValueError) as e:
                 run_io_soak.stress_pin(args)
             self.assertEqual(str(e.exception), 'stress binary/source pin')
 
@@ -55,17 +51,8 @@ class SoakProvenance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             args, source_sha = fixture(pathlib.Path(t))
             args.stress_provenance = None
-            with mock.patch.object(run_io_soak, 'SOURCE_SHA', source_sha), mock.patch.object(run_io_soak, 'BUILD_SHA', sha_of(args.stress)), self.assertRaises(ValueError) as e:
-                run_io_soak.stress_pin(args)                                  # not STRESS_SHA: refused as before
-            self.assertEqual(str(e.exception), 'stress binary/source pin')
-
-
-    def test_any_binary_with_its_own_provenance_is_refused(self):
-        """Review of Task 2: the provenance file cannot vouch for a binary; only BUILD_SHA (fixed in the repo) passes."""
-        with tempfile.TemporaryDirectory() as t:
-            args, source_sha = fixture(pathlib.Path(t))                       # provenance names this binary's own hash
             with mock.patch.object(run_io_soak, 'SOURCE_SHA', source_sha), self.assertRaises(ValueError) as e:
-                run_io_soak.stress_pin(args)                                        # BUILD_SHA left as pinned
+                run_io_soak.stress_pin(args)                                  # not STRESS_SHA: refused as before
             self.assertEqual(str(e.exception), 'stress binary/source pin')
 
 
