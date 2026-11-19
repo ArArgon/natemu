@@ -102,7 +102,8 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--
 # The M1 performance check (docs/m1-config-and-qcow2-design.md, "Performance check"; tools/run_m1_perf.py): natemu at
 # the baseline commit against this checkout's build, in fio matrix runs on raw, qcow2 and overlay disks plus IO5, judged
 # by the driver (exit 0 only on PASS). About 80 minutes and 3-4 GiB of free disk. A suite of its own, so that preparing
-# the other benchmarks never builds the baseline or the IO5 image.
+# the other benchmarks never builds the baseline or the IO5 image. Its results folder ({resume_dir}) is kept per machine
+# for these builds and inputs: running the case again resumes (finished runs are kept, failed ones are run again).
 [[suite]]
 name = "m1-perf"
 kind = "legacy"
@@ -112,7 +113,7 @@ params = { timeout = 7200 }
 
 [suite.cases.m1-perf]
 baseline = "ecec5d77"           # = run_m1_perf.py BASELINE_COMMIT; {natemu_baseline} is artifacts.natemu_at(baseline)
-argv = ["python3", "tools/run_m1_perf.py", "full", "--dir", "{out}", "--baseline-build", "{natemu_baseline}",
+argv = ["python3", "tools/run_m1_perf.py", "full", "--dir", "{resume_dir}", "--retry-failed", "--baseline-build", "{natemu_baseline}",
         "--final-build", "{natemu_entry}", "--fexc", "{fexc}", "--fio-prep", "{fio_prep}", "--block-inputs", "{block_inputs}",
-        "--inputs", "{out}/matrix-inputs", "--io5-inputs", "{io5_inputs}"]
+        "--inputs", "{resume_dir}/matrix-inputs", "--io5-inputs", "{io5_inputs}"]
 env = { NATEMU_QEMU_IMG = "{qemu_img}" }

@@ -40,7 +40,10 @@ def test_m1_perf_requires_its_builds_and_inputs():
     assert {Requirement('natemu-at', 'ecec5d77'), Requirement('input', 'fio-prep'), Requirement('input', 'block-inputs'),
             Requirement('input', 'io5-inputs'), Requirement('artifact', 'qemu-system'), Requirement('artifact', 'natemu'),
             Requirement('artifact', 'fexc')} <= reqs
-    assert not {r for r in HARNESS.requirements(fam, suites['bench'], None) if r.kind in ('natemu-at', 'input')}
+    assert Requirement('artifact', 'bench-image') not in reqs           # no guest benchmark in it
+    other = HARNESS.requirements(fam, suites['bench'], None)
+    assert Requirement('artifact', 'bench-image') in other
+    assert not {r for r in other if r.kind in ('natemu-at', 'input')}
 
 
 def test_m1_perf_baseline_is_the_runners():
@@ -52,49 +55,78 @@ def test_m1_perf_baseline_is_the_runners():
     assert suites['m1-perf'].extra['cases']['m1-perf']['baseline'] == re.search(r"^BASELINE_COMMIT = '(\w+)'", src, re.M)[1]
 
 
-def test_m1_perf_argv_gets_framework_builds_and_inputs(monkeypatch, tmp_path):
-    """Every input placeholder is filled from artifacts/inputs: nothing points into natemu-raw. The matrix preparation's
-    sources are writable clones in the case folder (run_io_matrix.py prepare writes into what it copies)."""
+def _m1_perf_harness(monkeypatch, tmp_path):
+    """The bench harness with every build, input and the script itself stubbed; returns run(run_dir, final=...) ->
+    (the case's argv, its env, the case folder, the result)."""
     from types import SimpleNamespace
     from testkit import host, inputs, resources, runloop
     from testkit.harness import bench
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'cache'))
     fam, suites = _bench_family()
     entry = lambda name: artifacts.Natemu(tmp_path / name, name)
     ro = {}
-    for n in ('fio-prep', 'block-inputs'):
-        ro[n] = tmp_path / 'cache' / n; ro[n].mkdir(parents=True); (ro[n] / 'f').write_text(n); (ro[n] / 'f').chmod(0o444)
-    monkeypatch.setattr(artifacts, 'natemu', lambda: entry('final'))
+    for n in ('fio-prep', 'block-inputs', 'io5-inputs'):
+        ro[n] = tmp_path / 'entries' / n; ro[n].mkdir(parents=True); (ro[n] / 'f').write_text(n); (ro[n] / 'f').chmod(0o444)
+    final = {'name': 'final'}
+    monkeypatch.setattr(artifacts, 'natemu', lambda: entry(final['name']))
     monkeypatch.setattr(artifacts, 'natemu_at', lambda rev: entry('base-' + rev))
     monkeypatch.setattr(artifacts, 'fexc', lambda: tmp_path / 'fexc')
     monkeypatch.setattr(artifacts, 'qemu_system', lambda: tmp_path / 'qemu' / 'bin')
     monkeypatch.setattr(inputs, 'fio_prep', lambda: ro['fio-prep'])
     monkeypatch.setattr(inputs, 'block_inputs', lambda: ro['block-inputs'])
-    monkeypatch.setattr(inputs, 'io5_inputs', lambda: tmp_path / 'io5')
+    monkeypatch.setattr(inputs, 'io5_inputs', lambda: ro['io5-inputs'])
     monkeypatch.setattr(resources, 'fetch', lambda n: tmp_path / n)
     monkeypatch.setattr(host, 'detect', lambda: SimpleNamespace(machine_id='M', chip='Apple M1'))
-    monkeypatch.setattr(runloop, 'run_dir', lambda config: tmp_path / 'run')
+    rd = {}
+    monkeypatch.setattr(runloop, 'run_dir', lambda config: rd['dir'])
     monkeypatch.setattr('testkit.sched.pool.raw_root', lambda: None)
     seen, real = {}, subprocess.run
-    def run(argv, **kw):
+    def fake(argv, **kw):
         if 'tools/run_m1_perf.py' not in argv: return real(argv, **kw)       # the clones' cp
         seen.update(argv=argv, env=kw['env']); return SimpleNamespace(returncode=0)
-    monkeypatch.setattr(subprocess, 'run', run)
+    monkeypatch.setattr(subprocess, 'run', fake)
     item = SimpleNamespace(suite=suites['m1-perf'], case='m1-perf', nodeid='m1')
-    res = bench.HARNESS.run([item], None)
-    assert res['m1'].outcome == 'passed', res['m1']
-    out = tmp_path / 'run' / 'bench' / 'M' / 'm1-perf'
-    a = seen['argv']
+
+    def run(run_dir, final_name='final'):
+        rd['dir'], final['name'] = tmp_path / run_dir, final_name
+        res = bench.HARNESS.run([item], None)
+        return seen['argv'], seen['env'], tmp_path / run_dir / 'bench' / 'M' / 'm1-perf', res['m1']
+    return run
+
+
+def test_m1_perf_argv_gets_framework_builds_and_inputs(monkeypatch, tmp_path):
+    """Every input placeholder is filled from artifacts/inputs: nothing points into natemu-raw. The matrix preparation's
+    sources and the IO5 inputs are writable clones in the case folder (run_io_matrix.py prepare writes into what it
+    copies; run_io5.py grows its clone of disk.raw, which keeps the read-only mode of the cache entry)."""
+    a, env, out, res = _m1_perf_harness(monkeypatch, tmp_path)('run1')
+    assert res.outcome == 'passed', res
     val = lambda opt: a[a.index(opt) + 1]
-    assert a[1:4] == ['tools/run_m1_perf.py', 'full', '--dir'] and val('--dir') == str(out)
+    assert a[1:3] == ['tools/run_m1_perf.py', 'full'] and '--retry-failed' in a
     assert val('--baseline-build') == str(tmp_path / 'base-ecec5d77') and val('--final-build') == str(tmp_path / 'final')
-    assert val('--fexc') == str(tmp_path / 'fexc') and val('--io5-inputs') == str(tmp_path / 'io5')
-    assert val('--inputs').startswith(str(out))
-    for opt, n in (('--fio-prep', 'fio-prep'), ('--block-inputs', 'block-inputs')):
+    assert val('--fexc') == str(tmp_path / 'fexc')
+    assert val('--inputs') == val('--dir') + '/matrix-inputs'
+    for opt, n in (('--fio-prep', 'fio-prep'), ('--block-inputs', 'block-inputs'), ('--io5-inputs', 'io5-inputs')):
         p = pathlib.Path(val(opt))
         assert p.is_relative_to(out) and (p / 'f').read_text() == n and os.access(p / 'f', os.W_OK)
-    assert seen['env']['NATEMU_QEMU_IMG'] == str(tmp_path / 'qemu' / 'bin' / 'qemu-img')
-    assert seen['env']['NATEMU_VM_LOCK_HELD'] == '1'
+    assert env['NATEMU_QEMU_IMG'] == str(tmp_path / 'qemu' / 'bin' / 'qemu-img')
+    assert env['NATEMU_VM_LOCK_HELD'] == '1'
     assert 'natemu-raw' not in ' '.join(a)
+
+
+def test_m1_perf_rerun_resumes_in_the_same_folder(monkeypatch, tmp_path):
+    """The results folder (--dir) outlives the run: a second run of the case with the same builds and inputs gets the
+    same folder (so run_m1_perf.py resumes there), and a new final build gets a new one."""
+    from testkit import paths
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    val = lambda a, opt: a[a.index(opt) + 1]
+    a1, _, out1, r1 = run('run1')
+    a2, _, out2, _ = run('run2')
+    d = pathlib.Path(val(a1, '--dir'))
+    assert out1 != out2 and val(a2, '--dir') == str(d)
+    assert d.is_dir() and d.is_relative_to(paths.state_dir()) and not d.is_relative_to(out1)
+    assert str(d) in r1.message                      # the result says where the summary is
+    a3, *_ = run('run3', final_name='final-changed')
+    assert val(a3, '--dir') != str(d)
 
 
 def test_ssh_builder_runs_recipe_and_cleans_up(tmp_path):

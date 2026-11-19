@@ -9,9 +9,10 @@ when a case of the suite uses it (and then prepared before the run starts):
     {bench_image}       the benchmark initramfs (artifacts.bench_image)
     {natemu_entry}      this checkout's natemu build folder, laid out like cargo's target folder (artifacts.natemu)
     {natemu_baseline}   the same for the case's `baseline` revision (artifacts.natemu_at)
-    {fio_prep} {block_inputs}   writable clones, in the case folder, of inputs.fio_prep() / inputs.block_inputs()
-    {io5_inputs}        inputs.io5_inputs()
+    {fio_prep} {block_inputs} {io5_inputs}   writable clones, in the case folder, of inputs.fio_prep(),
+                        inputs.block_inputs() and inputs.io5_inputs() (APFS clones: no space until written)
     {qemu_img}          the pinned QEMU build's qemu-img (artifacts.qemu_system)
+    {resume_dir}        a results folder kept across runs, the same while the case and what it names are (resume_dir())
 """
 import os
 import pathlib
@@ -19,14 +20,16 @@ import shutil
 import subprocess
 import time
 
-from testkit import artifacts, host, inputs, paths, resources
+from testkit import artifacts, cache, host, inputs, paths, resources
 from testkit.family import Needs
 from testkit.harness import CaseResult, Requirement
 
 INPUTS = {'fio_prep': 'fio-prep', 'block_inputs': 'block-inputs', 'io5_inputs': 'io5-inputs'}     # placeholder -> input name
 INPUT_FNS = {'fio-prep': lambda: inputs.fio_prep(), 'block-inputs': lambda: inputs.block_inputs(),
              'io5-inputs': lambda: inputs.io5_inputs()}
-WRITABLE = {'fio_prep', 'block_inputs'}         # run_io_matrix.py prepare writes into the folders it copies from these
+# Given as writable clones: run_io_matrix.py prepare writes into the folders it copies from fio_prep and block_inputs;
+# run_io5.py run clones disk.raw (keeping its mode) and grows the clone to 16 GiB.
+WRITABLE = {'fio_prep', 'block_inputs', 'io5_inputs'}
 
 
 def _text(spec) -> str:
@@ -35,6 +38,17 @@ def _text(spec) -> str:
 
 def _uses(spec, name) -> bool:
     return '{' + name + '}' in _text(spec)
+
+
+def resume_dir(case: str, spec: dict, ident: dict, machine: str) -> pathlib.Path:
+    """A results folder that outlives the run, for a case whose script resumes from its own records (run_m1_perf.py
+    full --dir): the same on every run of the case on this machine while the case's command line and everything its
+    placeholders name (builds and inputs, by their cache entries, which are content-addressed) stay the same, so a rerun
+    finishes what is left instead of repeating finished measurements. Anything new (a new final build, a changed input
+    or command line) gets a new folder. In the machine's state folder, which clean and purge keep."""
+    k = cache.key('bench-resume-v1', case, machine, *spec['argv'], *(f'{a}={b}' for a, b in sorted(spec.get('env', {}).items())),
+                  *(f'{a}={b}' for a, b in sorted(ident.items())))
+    return paths.state_dir() / 'bench-resume' / case / k[:32]
 
 
 class Bench:
@@ -46,8 +60,9 @@ class Bench:
 
     def requirements(self, fam, suite, variant):
         reqs = [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'), Requirement('resource', 'debian-kernel'),
-                Requirement('legacy', 'target'), Requirement('artifact', 'bench-image')]
+                Requirement('legacy', 'target')]
         for spec in suite.extra.get('cases', {}).values():
+            if _uses(spec, 'bench_image'): reqs.append(Requirement('artifact', 'bench-image'))
             if _uses(spec, 'natemu_baseline'): reqs.append(Requirement('natemu-at', spec['baseline']))
             reqs += [Requirement('input', n) for p, n in INPUTS.items() if _uses(spec, p)]
             if _uses(spec, 'qemu_img'): reqs.append(Requirement('artifact', 'qemu-system'))
@@ -65,16 +80,18 @@ class Bench:
     def _subst(self, s, d):
         return s.format(**d)
 
-    def _values(self, spec, d, n, fexc, raw) -> dict:
+    def _values(self, spec, d, n, fexc, raw, case='', machine='') -> dict:
         vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host,
                 'kernel': resources.fetch('debian-kernel'), 'raw': raw or '/nonexistent-natemu-raw',
                 'bench_image': artifacts.bench_image() if _uses(spec, 'bench_image') else ''}
         if _uses(spec, 'natemu_entry'): vals['natemu_entry'] = n.entry
         if _uses(spec, 'natemu_baseline'): vals['natemu_baseline'] = artifacts.natemu_at(spec['baseline']).entry
         if _uses(spec, 'qemu_img'): vals['qemu_img'] = artifacts.qemu_system() / 'qemu-img'
+        ident = {k: str(v) for k, v in vals.items() if k not in ('out', 'raw') and _uses(spec, k)}
         for p, name in INPUTS.items():
             if not _uses(spec, p): continue
             src = INPUT_FNS[name]()
+            ident[p] = str(src)                      # the cache entry, not this run's clone of it
             if p in WRITABLE:
                 dest = d / 'inputs-src' / name
                 if dest.exists(): shutil.rmtree(dest)
@@ -82,6 +99,9 @@ class Bench:
                 inputs.writable_clone(src, dest)
                 src = dest
             vals[p] = src
+        if _uses(spec, 'resume_dir'):
+            vals['resume_dir'] = resume_dir(case, spec, ident, machine)
+            vals['resume_dir'].mkdir(parents=True, exist_ok=True)
         return vals
 
     def run(self, batch, config):
@@ -95,7 +115,8 @@ class Bench:
             d = runloop.run_dir(config) / 'bench' / h.machine_id / it.case
             d.mkdir(parents=True, exist_ok=True)
             raw = raw_root()
-            vals = self._values(spec, d, n, fexc, raw)
+            vals = self._values(spec, d, n, fexc, raw, it.case, h.machine_id)
+            where = f'{d}' + (f' (results in {vals["resume_dir"]}, kept for resuming)' if 'resume_dir' in vals else '')
             missing = [p for p in (self._subst(x, vals) for x in spec.get('needs', [])) if not pathlib.Path(p).exists()]
             if missing:
                 out[it.nodeid] = CaseResult('skipped', f'needs {missing[0]} (not on this machine)', 'not-runnable'); continue
@@ -111,13 +132,13 @@ class Bench:
             if r.returncode == 3:
                 out[it.nodeid] = CaseResult('failed', f'contended: another VM ran during the measurement; {d}'); continue
             if r.returncode != 0:
-                out[it.nodeid] = CaseResult('failed', f'exit {r.returncode} after {took:.0f} s; log {d / "log.txt"}\n' + '\n'.join(tail))
+                out[it.nodeid] = CaseResult('failed', f'exit {r.returncode} after {took:.0f} s; log {d / "log.txt"}; {where}\n' + '\n'.join(tail))
                 continue
             built = ''
             if vals['bench_image']:
                 bt = pathlib.Path(vals['bench_image']).parent / 'builder.txt'
                 built = f'; image built by {bt.read_text().strip()}' if bt.exists() else ''
-            out[it.nodeid] = CaseResult('passed', f'{took:.0f} s on {h.chip}{built}; numbers in {d}', 'measured')
+            out[it.nodeid] = CaseResult('passed', f'{took:.0f} s on {h.chip}{built}; numbers in {where}', 'measured')
         return out
 
 
