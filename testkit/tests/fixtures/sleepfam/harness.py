@@ -21,7 +21,7 @@ class Sleep:
                 import subprocess
                 from testkit.harness import campaign
                 p = subprocess.Popen(['sleep', '300'], start_new_session=True)
-                campaign._LIVE.add(p); campaign._on_term()
+                campaign._LIVE.add(p); campaign._on_term(); campaign._record_group(p, 'sleep')
                 pathlib.Path(os.environ['HOLD_PID']).write_text(str(p.pid))
             t0 = time.time(); time.sleep(it.suite.params['seconds']); t1 = time.time()
             if log := os.environ.get('SLEEP_LOG'):

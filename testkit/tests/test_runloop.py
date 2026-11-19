@@ -153,6 +153,45 @@ def test_sigterm_to_the_controller_stops_a_campaign_vm(pytester, env):
         if _alive(vm): os.kill(vm, 9)
 
 
+def test_a_sigkilled_workers_vm_is_stopped_by_the_controller(pytester, env):
+    """Review: a worker killed outright (SIGKILL: no handler runs) left the natemu it started running in its own session,
+    holding cores with no cap. The worker records each VM's group in its unit folder; the controller ending the unit
+    SIGKILLs a recorded group that is still there."""
+    pidf = env / 'hold.pid'
+    e = dict(os.environ, HOLD_PID=str(pidf))
+    c = subprocess.Popen([sys.executable, '-m', 'pytest', '-p', 'testkit.plugin', '-p', 'no:cacheprovider', '-q', '-k', 'hold',
+                          'tests'], cwd=pytester.path, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    end = time.time() + 30
+    while not pidf.exists() and time.time() < end: time.sleep(0.1)
+    assert pidf.exists(), c.communicate(timeout=60)[0]
+    vm = int(pidf.read_text())
+    worker = int(subprocess.run(['ps', '-o', 'ppid=', '-p', str(vm)], capture_output=True, text=True).stdout)
+    try:
+        os.kill(worker, 9)
+        out = c.communicate(timeout=60)[0].decode()
+        assert 'worker died (signal 9)' in out, out
+        assert _gone_within(vm, 5), out
+    finally:
+        if _alive(vm): os.kill(vm, 9)
+
+
+def test_reaping_kills_only_recorded_groups_still_running_their_program(tmp_path):
+    from testkit import runloop
+    vm = subprocess.Popen(['sleep', '60'], start_new_session=True)
+    other = subprocess.Popen(['sleep', '61'], start_new_session=True)      # recorded with another program: a reused pid
+    dead = subprocess.Popen(['true'], start_new_session=True); dead.wait()
+    f = tmp_path / '0.vms'
+    f.write_text(f'{vm.pid}\tsleep\n{other.pid}\t/opt/natemu/stub\n{dead.pid}\tsleep\n')
+    try:
+        assert runloop.reap_vm_groups(f) == [vm.pid]
+        vm.wait(5)
+        assert other.poll() is None
+        assert runloop.reap_vm_groups(tmp_path / 'none.vms') == []
+    finally:
+        for p in (vm, other):
+            if p.poll() is None: p.kill()
+
+
 def test_an_orphaned_worker_gives_its_handlers_time_then_kills_its_group(tmp_path):
     """Review: a worker whose controller died SIGKILLed its group at once, so its campaign handler never stopped the
     natemu it started (its own session). Now the group gets SIGTERM first and SIGKILL only after WORKER_GRACE."""

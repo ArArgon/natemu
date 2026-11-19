@@ -245,7 +245,8 @@ class Controller:
                + (['-c', str(self.config.inipath)] if self.config.inipath else ['-p', 'testkit.plugin'])
                + ['--testkit-worker', str(ids), '--testkit-report', str(self.dir / f'{u.n}.jsonl')] + passthrough + files)
         if grant.core_class == 'E': cmd = ['taskpolicy', '-c', 'background'] + cmd
-        env = dict(os.environ, **u.env, TESTKIT_CONTROLLER_PID=str(os.getpid()), TESTKIT_CORE_CLASS=grant.core_class)
+        env = dict(os.environ, **u.env, TESTKIT_CONTROLLER_PID=str(os.getpid()), TESTKIT_CORE_CLASS=grant.core_class,
+                   TESTKIT_VM_GROUPS=str(self.dir / f'{u.n}.vms'))
         log = open(self.dir / f'{u.n}.log', 'wb')
         try:
             u.proc = subprocess.Popen(cmd, cwd=self.config.rootpath, env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -296,11 +297,13 @@ class Controller:
 
     def finish(self, u: Unit) -> None:
         if u.proc.poll() is None: self.kill(u, why='timed out after %.0f s' % u.timeout)
+        left = reap_vm_groups(self.dir / f'{u.n}.vms')      # VMs a worker killed outright could not stop
         self.tail(u)
         u.ended = time.time()
         code = u.proc.returncode
         why = f'worker died (signal {-code})' if code is not None and code < 0 else f'worker ended with status {code}'
         if getattr(u, 'killed', None): why = u.killed
+        if left: why += f'; stopped {len(left)} VM(s) it left running'
         for it in u.items:
             if it.nodeid not in u.done:
                 rep = TestReport(it.nodeid, it.location, {}, 'failed', f'{why}; see {self.dir / f"{u.n}.log"}', 'call')
@@ -391,6 +394,25 @@ os.killpg(pg, signal.SIGTERM)
 time.sleep(grace)               # the group, this helper a member of it, cannot be reused meanwhile
 os.killpg(pg, signal.SIGKILL)   # this helper included
 """
+
+
+def reap_vm_groups(f: pathlib.Path) -> list[int]:
+    """SIGKILL each VM group recorded in `f` (testkit.harness.campaign._record_group: `PID<TAB>PROGRAM` lines) whose
+    leader is still alive, still leads its group and still runs PROGRAM (a reused pid is left alone)."""
+    try: lines = f.read_text().splitlines()
+    except FileNotFoundError: return []
+    killed = []
+    for line in lines:
+        pid, _, prog = line.partition('\t')
+        try:
+            if not prog or os.getpgid(int(pid)) != int(pid): continue
+        except (ValueError, ProcessLookupError, PermissionError): continue
+        cmd = subprocess.run(['ps', '-o', 'command=', '-p', pid], capture_output=True, text=True).stdout.strip()
+        if cmd != prog and not cmd.startswith(prog + ' '): continue
+        try: os.killpg(int(pid), signal.SIGKILL); killed.append(int(pid))
+        except (ProcessLookupError, PermissionError): pass
+    return killed
+
 
 class Worker:
     def __init__(self, config):

@@ -113,7 +113,7 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
     with open(work / 'stdout.txt', 'wb') as out, open(work / 'stderr.txt', 'wb') as err:
         _on_term()                      # before the VM starts: a SIGTERM right after Popen still stops it
         p = subprocess.Popen(cmd, env=env, stdout=out, stderr=err, start_new_session=True)
-        _LIVE.add(p)
+        _LIVE.add(p); _record_group(p, cmd[0])
         try:
             while p.poll() is None:
                 now = time.monotonic()
@@ -135,6 +135,14 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
 
 
 _LIVE: set = set()          # natemu processes this worker started (each in its own session: a worker's group kill misses them)
+VM_GROUPS_ENV = 'TESTKIT_VM_GROUPS'
+
+
+def _record_group(p: subprocess.Popen, program: str) -> None:
+    """Note a VM's group (its own session) in the unit's file (VM_GROUPS_ENV, set by the run loop), which stops a group
+    still there when the unit ends: a worker killed outright runs no handler (testkit.runloop.reap_vm_groups)."""
+    if f := os.environ.get(VM_GROUPS_ENV):
+        with open(f, 'a') as out: out.write(f'{p.pid}\t{program}\n')
 
 
 def _on_term() -> None:
