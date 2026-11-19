@@ -153,6 +153,17 @@ def _in_container(name: str, recipe: pathlib.Path, work: pathlib.Path, memory: s
 SSH = ['-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=60']
 
 
+BUILD_SLOTS = 2             # builds at once on the x86 machine (8 cores each): five at once ran at load 27, all late
+
+
+def _slot_wait() -> str:
+    """Shell prefix that waits for one of BUILD_SLOTS flock slots on the builder (shared by every Mac using it) and
+    holds it, on fd 9, until the build's shell exits."""
+    slots = ' '.join(str(i) for i in range(BUILD_SLOTS))
+    return (f'got=; while [ -z "$got" ]; do for i in {slots}; do exec 9>/tmp/natemu-build-slot-$i; '
+            f'if flock -n 9; then got=$i; break; fi; done; [ -n "$got" ] || sleep 5; done; ')
+
+
 def _in_docker_over_ssh(host: str, cname: str, recipe: pathlib.Path, work: pathlib.Path, memory: str, timeout: int,
                         script: str) -> subprocess.CompletedProcess:
     """_in_container's run on an x86-64 machine: the same pinned image under Docker, natively. The recipe and the work
@@ -165,7 +176,7 @@ def _in_docker_over_ssh(host: str, cname: str, recipe: pathlib.Path, work: pathl
             tar = subprocess.run(['tar', '-C', str(local), '-cf', '-', '.'], capture_output=True, check=True).stdout
             p = subprocess.run(['ssh', *SSH, host, f'mkdir -p {d}/{there} && tar -C {d}/{there} -xf -'], input=tar, capture_output=True)
             if p.returncode: raise BuildFailure(cname, p.stderr.decode(errors='replace')[-800:])
-        run = (f'docker run --rm --name {cname} --platform linux/amd64 --cpus 8 --memory {memory} '
+        run = (f'{_slot_wait()}docker run --rm --name {cname} --platform linux/amd64 --cpus 8 --memory {memory} '
                f'-v {d}/recipe:/recipe:ro -v {d}/work:/work {image} bash /recipe/{script}')
         try:
             r = subprocess.run(['ssh', *SSH, host, run], capture_output=True, text=True, timeout=timeout)
