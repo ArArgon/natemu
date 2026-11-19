@@ -184,8 +184,12 @@ that reproduce it (supplier, pin, program or image hash, arguments).
 
 The inputs those runners read can also be built on any machine instead of copied: `testkit.inputs.root()` makes a cache
 entry laid out like `natemu-raw` (the netboot kernel and initrd, the QEMU reference binary, the virtio block inputs and
-kernel package, the network tools' root, the i7 and s2d program corpora; no expected answers) from pinned downloads and
-recipes in the repo (`tools/io/network-rootfs` for the network tools). Point a runner at it with
+kernel package, the network tools' root, the i7 and s2d program corpora, the fio preparation and a static stress-ng; no
+expected answers) from pinned downloads and recipes in the repo (`tools/io/network-rootfs` for the network tools,
+`tools/io/fio-prep` for Debian's fio and its libraries, `tools/io/stress-ng` for stress-ng; each runs in the amd64 Debian
+container through Rosetta and needs Apple's `container`). `testkit.inputs.matrix_inputs()` is `run_io_matrix.py
+prepare`'s folder built from them, which `run_serial_stress.py` and `run_io_soak.py` read; they take the framework's
+stress-ng with `--stress-provenance <its provenance.json>`. Point a runner at it with
 `NATEMU_RAW_ROOT=<that folder>` and `NATEMU_STATE_ROOT=<a writable folder>`: the entry is read-only, and the runners'
 VM and port locks, result caches and reference work folder go to the state root (by default the raw root, as before).
 Every runner on the machine must use the same state root, since the VM lock only excludes runners that share its file.
