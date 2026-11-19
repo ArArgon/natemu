@@ -627,6 +627,7 @@ class AfpFlush(unittest.TestCase):
     def test_no_keys_no_change_without_afp(self):
         # (the common mode: the replay of the recorded streams with afp=0 added, against the previous compiler, pins the rest)
         for name, h in AFP_FP.items():
+            if name in ('rcpps', 'rsqrtss'): continue   # their SDM fix-up (ApproxSdm) has compares of its own
             mn, _ = self.words(h, *self.AFP0)
             self.assertFalse({'cmeq'} & set(mn), name)
 
@@ -662,13 +663,13 @@ class AfpFlush(unittest.TestCase):
         self.assertEqual(mn[mn.index('shl'):][:7], FLUSH_OUT)
         self.assertLess(mn.index('fmul'), mn.index('shl'))
         self.assertEqual(after('vfmadd231ps', 'fmla')[:7], FLUSH_OUT)
-        for name in ('minps', 'maxsd', 'sqrtps', 'cmpltps', 'comiss', 'cvtps2dq', 'cvttsd2si', 'roundps', 'vcvtps2ph', 'cvtss2sd', 'rsqrtss'):
+        for name in ('minps', 'maxsd', 'sqrtps', 'cmpltps', 'comiss', 'cvtps2dq', 'cvttsd2si', 'roundps', 'vcvtps2ph', 'cvtss2sd'):
             self.assertNotIn('cmeq', self.words(AFP_FP[name], *self.AFP0, '--ftz')[0], name)   # no FTZ on them
         for name in ('cvtpd2ps', 'cvtsd2ss'):   # the narrowing converts to single
             self.assertEqual(self.words(AFP_FP[name], *self.AFP0, '--ftz')[0].count('fmul'), 1, name)
-        mn, _ = self.words(AFP_FP['rcpps'], *self.AFP0, '--ftz')   # RCP's flags are restored: a flush without them
-        self.assertEqual(mn[mn.index('msr') + 1:][:5], FLUSH_IN)
-        self.assertNotIn('fmul', mn)
+        for name in ('rcpps', 'rsqrtss'):   # neither flush: their SDM fix-up gives x86's result under any key (ApproxSdm)
+            for keys in (['--daz'], ['--ftz'], ['--daz', '--ftz']):
+                self.assertEqual(self.words(AFP_FP[name], *self.AFP0, *keys)[0], self.words(AFP_FP[name], *self.AFP0)[0], (name, keys))
         self.assertEqual(self.words(AFP_FP['dpps'], *self.AFP0, '--ftz')[0].count('fmul'), 4)   # products and both add levels
 
     def test_daz_and_ftz_together_use_fz_and_flush_only_what_min_max_select(self):
@@ -2284,6 +2285,74 @@ class Slice1SelfLoopsAndStop(unittest.TestCase):
                 mutate(bad)
                 problems = vp.entry_and_branches(d, bad, sorted(bad))
                 self.assertTrue(any(why in m for m in problems), (what, problems))
+
+
+@unittest.skipUnless(os.access(FEXC, os.X_OK), f'fexc not built: {FEXC} (set $FEXC)')
+class ApproxSdm(unittest.TestCase):
+    """RCPPS/RCPSS/RSQRTPS/RSQRTSS and their VEX forms get the Intel SDM's fixed results (a denormal source counts as 0.0, RCP's tiny
+    results are 0.0) from integer words around FEX's exact op (shim/fexc_sites.inc, FexcApproxScalar), the same with and without AFP, in
+    both FP modes and under every DAZ/FTZ key. The values are tools/run_approx_special.py's (also under DAZ, FTZ and every rounding
+    mode); here the shape: which words go where (a source the result overwrites, a source that survives), that they are integer words
+    inside the FPSR save/restore, and that only one or two of them wait for the op's result."""
+    H = ['shl', 'movi', 'add', 'ushr', 'cmeq', 'ushr']                          # RCP: the source lanes whose result is 0.0 (v1)
+    H_S = ['shl', 'movi', 'add', 'ushr', 'cmeq', 'movi', 'mov', 'ushr']        # (lane 0 only)
+    DIES = ['movi', 'ushr', 'cmtst', 'orr', 'and']                              # a dying source's denormal lanes become zeros
+    DIES_S = ['movi', 'ushr', 'cmtst', 'orr', 'movi', 'mov', 'and']
+    KEPT = ['shl', 'ushr', 'cmeq', 'cmeq', 'bic', 'shl', 'mov', 'sri', 'sshr', 'bit']   # a kept source's denormal lanes: infinity
+    KEPT_S = ['shl', 'ushr', 'cmeq', 'cmeq', 'bic', 'movi', 'mov', 'shl', 'mov', 'sri', 'sshr', 'bit']
+    # name -> (hex, RCP, scalar, the source is the destination)
+    FORMS = {
+        'rcpps xmm1, xmm2': ('0f53ca', True, False, False), 'rcpps xmm0, xmm0': ('0f53c0', True, False, True),
+        'rcpss xmm1, xmm2': ('f30f53ca', True, True, False), 'rcpss xmm0, xmm0': ('f30f53c0', True, True, True),
+        'rsqrtps xmm1, xmm2': ('0f52ca', False, False, False), 'rsqrtps xmm0, xmm0': ('0f52c0', False, False, True),
+        'rsqrtss xmm1, xmm2': ('f30f52ca', False, True, False), 'rsqrtss xmm0, xmm0': ('f30f52c0', False, True, True),
+        'vrcpps xmm1, xmm2': ('c5f853ca', True, False, False), 'vrsqrtss xmm1, xmm2, xmm3': ('c5ea52cb', False, True, False),
+    }
+
+    def mnemonics(self, hexs, *extra):
+        d, rc = run(hexs, RIP, *extra)
+        self.assertEqual(rc, 0, (hexs, extra))
+        lay = d['code']['layout']
+        code = bytes.fromhex(d['code']['hex'])
+        lits = [(r['offset'], r['size']) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_literal']
+        with tempfile.TemporaryDirectory() as t:
+            dis = check_sites.disassemble(code, lay['code_region_end'], Path(t), lits)
+        return [re.split(r'[. ]', x.strip())[0] for o, x in sorted(dis.items()) if o >= lay['code_region_begin']]
+
+    def expected(self, recp, scalar, dies):
+        if recp:
+            pre = (self.H_S + FLUSH_IN if dies else self.H_S) if scalar else ((self.DIES if dies else []) + self.H)
+            post = ['bic'] + ([] if dies else self.KEPT_S if scalar else self.KEPT)
+        else:
+            pre = (self.DIES_S if scalar else self.DIES) if dies else []
+            post = [] if dies else self.KEPT_S if scalar else self.KEPT
+        op = ['fmov'] + ([] if recp else ['fsqrt']) + ['fdiv'] + (['mov'] if scalar else [])   # FEX's exact op (scalar: inserted)
+        return pre, op, post
+
+    def span_ok(self, span, recp, scalar, dies):
+        pre, op, post = self.expected(recp, scalar, dies)
+        if scalar and span[len(pre):len(pre) + 1] == ['mov']:   # a VEX scalar with another first source: FEX copies it first
+            op = ['mov'] + op
+        return span == pre + op + post
+
+    def test_the_words_around_the_op(self):
+        keys = [['--feature', 'afp=0', *k] for k in ([], ['--accurate'], ['--daz'], ['--ftz'], ['--daz', '--ftz'], ['--accurate', '--daz'])]
+        for name, (h, recp, scalar, dies) in self.FORMS.items():
+            pre, op, post = self.expected(recp, scalar, dies)
+            for extra in [[]] + keys:
+                mn = self.mnemonics(h, *extra)
+                i, j = mn.index('mrs'), mn.index('msr')
+                self.assertTrue(self.span_ok(mn[i + 1:j], recp, scalar, dies), (name, extra, mn[i + 1:j]))
+                self.assertFalse([m for m in pre + post if m.startswith('f')], name)   # integer words: no flag, no FPCR
+
+    def test_a_ymm_form_fixes_both_halves(self):
+        mn = self.mnemonics('c5fc53ca', '--feature', 'afp=0')   # vrcpps ymm1, ymm2: AVX128 emits two 128-bit ops
+        spans, at = [], 0
+        while 'mrs' in mn[at:]:
+            i = mn.index('mrs', at); j = mn.index('msr', i); spans.append(mn[i + 1:j]); at = j + 1
+        self.assertEqual(len(spans), 2, mn)
+        for sp in spans:   # (the upper half is loaded into a temporary the result reuses: the dying-source form)
+            self.assertTrue(self.span_ok(sp, True, False, False) or self.span_ok(sp, True, False, True), sp)
 
 
 if __name__ == '__main__':

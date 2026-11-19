@@ -785,7 +785,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
 //   FTZ alone       every FP result of the ops where x86 flushes (arithmetic, FMA, HADD/HSUB/ADDSUB, the narrowing converts to
 //                   single; not conversions to integer, ROUND, VCVTPS2PH, the compares, MIN/MAX, SQRT, RSQRT) is flushed after,
 //                   raising UFC and IXC for each lane flushed (x86 sets UE and PE; an op that rounded a tiny result raised both).
-//                   RCP's fdiv result is flushed too (as FZ does it on the M4) but raises nothing: its flags are restored after it.
+//                   RCP and RSQRT take neither flush: their SDM fix-up (shim/fexc_sites.inc) already gives x86's result.
 //   DAZ and FTZ     FZ = 1 flushes inputs and results in hardware (UFC alone: PE comes from UFC in `mxcsr_flags`), but MIN/MAX
 //                   return a raw operand, so their result is flushed (no flag).
 // x87 instructions (their own FPCR) are left alone. DPPS's first
@@ -793,7 +793,7 @@ template<class Emitter> inline void PlaceFPChecks(Emitter* IREmit) {   // (a tem
 // rounds up to it) stays the declared deviation of decision C.
 struct FlushRule {
   uint8_t In[4] = {0xff, 0xff, 0xff, 0xff};   // the arguments flushed under DAZ, 0xff ends
-  uint8_t Out = 0;                            // the result is flushed: 1 under FTZ alone, with flags; 2 under DAZ and FTZ (MIN/MAX), 3 under FTZ alone (RCP), without
+  uint8_t Out = 0;                            // the result is flushed: 1 under FTZ alone, with flags; 2 under DAZ and FTZ (MIN/MAX)
   bool InScalar = false, OutScalar = false;   // element 0 only (the other bits are kept)
   uint32_t InElem = 0, OutElem = 0;           // bytes of the operands' and the result's elements
 };
@@ -812,8 +812,10 @@ inline bool FlushRuleOf(const FEXCore::IR::IROp_Header* Op, FlushRule& R) {
     In({0, 1}, E, S == E); Out(1, E, S == E); break;
   case OP_VFMIN: case OP_VFMAX: In({0, 1}, E, S == E); Out(2, E, S == E); break;
   case OP_VFMLA: case OP_VFMLS: case OP_VFNMLA: case OP_VFNMLS: In({0, 1, 2}, E, S == E); Out(1, E, S == E); break;
-  case OP_VFRECP: In({0}, E, S == E); Out(3, E, S == E); break;
-  case OP_VFSQRT: case OP_VFRSQRT: case OP_VECTOR_FTOS: case OP_VECTOR_FTOZS: case OP_VECTOR_FTOI:
+  // RCP and RSQRT: none. Their SDM fix-up (shim/fexc_sites.inc, FexcApproxScalar) gives x86's result whatever DAZ and FTZ say: a
+  // denormal source counts as 0.0, RCP's tiny results are 0.0; flushes would only add words.
+  case OP_VFRECP: case OP_VFRSQRT: case OP_VFRECPSCALARINSERT: case OP_VFRSQRTSCALARINSERT: return false;
+  case OP_VFSQRT: case OP_VECTOR_FTOS: case OP_VECTOR_FTOZS: case OP_VECTOR_FTOI:
   case OP_VECTOR_FTOISIZED: In({0}, E, S == E); break;
   case OP_VFCMPEQ: case OP_VFCMPNEQ: case OP_VFCMPLT: case OP_VFCMPGT: case OP_VFCMPLE: case OP_VFCMPORD: case OP_VFCMPUNO:
     In({0, 1}, E, S == E); break;
@@ -823,8 +825,7 @@ inline bool FlushRuleOf(const FEXCore::IR::IROp_Header* Op, FlushRule& R) {
   case OP_VFMINSCALARINSERT: case OP_VFMAXSCALARINSERT: In({0, 1}, E, true); Out(2, E, true); break;
   case OP_VFMLASCALARINSERT: case OP_VFMLSSCALARINSERT: case OP_VFNMLASCALARINSERT: case OP_VFNMLSSCALARINSERT:
     In({1, 2, 3}, E, true); Out(1, E, true); break;   // (argument 0 only supplies the upper elements)
-  case OP_VFRECPSCALARINSERT: In({1}, E, true); Out(3, E, true); break;
-  case OP_VFSQRTSCALARINSERT: case OP_VFRSQRTSCALARINSERT: case OP_VFTOISCALARINSERT: In({1}, E, true); break;
+  case OP_VFSQRTSCALARINSERT: case OP_VFTOISCALARINSERT: In({1}, E, true); break;
   case OP_VFCMPSCALARINSERT: In({0, 1}, E, true); break;
   case OP_VFTOFSCALARINSERT: {
     const uint32_t Src = OpSizeToSize(Op->C<IROp_VFToFScalarInsert>()->SrcElementSize);
@@ -1001,7 +1002,7 @@ template<class Emitter> inline void PlaceFlushes(Emitter* IREmit) {
         IREmit->ReplaceNodeArgument(F.Node, R.In[i], Flushed);
         Seen[i] = Src; Made[i] = Flushed;
       }
-    } else if (R.Out == (Daz && Ftz ? 2 : Ftz ? 1 : 0) || (R.Out == 3 && Ftz && !Daz)) {   // the result (3: RCP's, flushed without a flag under FTZ alone)
+    } else if (R.Out == (Daz && Ftz ? 2 : Ftz ? 1 : 0)) {   // the result
       IREmit->SetWriteCursor(F.Node);
       Ref Flushed = IREmit->_FexcFlush(Op->Size, R.OutElem == 4 ? OpSize::i32Bit : OpSize::i64Bit, F.Node, (R.OutScalar ? 1 : 0) | (R.Out == 1 ? 2 : 0));
       IREmit->ReplaceUsesWithAfter(F.Node, Flushed, Flushed);

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """RCPPS/RCPSS/RSQRTPS/RSQRTSS and their VEX forms on the inputs whose result the Intel SDM fixes, with the expected
-bits written here (no reference machine). One natemu `run-program` per instruction form; each input is a case in
+bits written here (no reference machine). One natemu `run-program` per instruction form (each also with one register as
+source and destination, `FORM-same`); each input is a case in
 OUT/results.json.
 
     run_approx_special.py --host H --runtime R --fexc F --out OUT
@@ -82,9 +83,11 @@ IN, OUT, SCALAR_DEST = 0x200000, 0x200400, 0x200800
 FILL = 0x5a5a5a5a      # the upper lanes a scalar form keeps
 
 
-def program(form: str, table) -> tuple[dict, list]:
-    """A straight-line program applying `form` to every source of `table` (four lanes per packed operation, one per
-    scalar), storing each result at OUT + 16 * i; also returns, per store, which inputs its lanes hold."""
+def program(name: str, table) -> tuple[dict, list]:
+    """A straight-line program applying the form `name` to every source of `table` (four lanes per packed operation, one per
+    scalar), storing each result at OUT + 16 * i; also returns, per store, which inputs its lanes hold. A name ending in
+    `-same` uses one register as source and destination (natemu's code differs: the source dies in the instruction)."""
+    form, same = name.removesuffix('-same'), name.endswith('-same')
     srcs = [x for x, _ in table]
     asm, lanes = [], []
     scalar = form.endswith('ss')
@@ -95,7 +98,13 @@ def program(form: str, table) -> tuple[dict, list]:
     for i, g in enumerate(groups):
         src, dst = IN + 16 * i, OUT + 16 * i
         asm.append(f'movdqu xmm0, xmmword ptr [{src}]')
-        if scalar:
+        if same:
+            if scalar:   # lane 0 the source, the upper lanes FILL
+                asm += [f'movdqu xmm1, xmmword ptr [{SCALAR_DEST}]', 'insertps xmm1, xmm0, 0']
+                asm.append(f'{form} xmm1, xmm1, xmm1' if form.startswith('v') else f'{form} xmm1, xmm1')
+            else:
+                asm += [f'{form} xmm0, xmm0', 'movdqa xmm1, xmm0']
+        elif scalar:
             asm.append(f'movdqu xmm1, xmmword ptr [{SCALAR_DEST}]')
             # the upper lanes come from the destination (SSE) or the first source (VEX): both are xmm1 here
             asm.append(f'{form} xmm1, xmm1, xmm0' if form.startswith('v') else f'{form} xmm1, xmm0')
@@ -107,7 +116,7 @@ def program(form: str, table) -> tuple[dict, list]:
     memory = [{'addr': hex(IN), 'data': bytes(data_in).ljust(0x400, b'\0').hex()},
               {'addr': hex(OUT), 'data': bytes(16 * len(groups)).hex()},
               {'addr': hex(SCALAR_DEST), 'data': (FILL.to_bytes(4, 'little') * 4).hex()}]
-    p = {'name': f'approx-special-{form}', 'code': code, 'rip': '0x100000', 'gpr': ['0x0'] * 16, 'rflags': '0x2',
+    p = {'name': f'approx-special-{name}', 'code': code, 'rip': '0x100000', 'gpr': ['0x0'] * 16, 'rflags': '0x2',
          'memory': memory, 'insns': [{'op': a.split()[0], 'sse': True} for a in asm], 'sse': True,
          'avx': form.startswith('v')}
     return p, lanes
@@ -139,7 +148,7 @@ def run(args, form, kind, table, work: pathlib.Path) -> list[dict]:
                 # documented: fast mode without AFP gives NaNs Arm's sign and choice (afp-fallback-plan.md, nan-results)
                 r.update(outcome='deviated', problems=[why + ' (documented deviation nan-results: fast mode, no AFP)'])
             res.append(r)
-        if form.endswith('ss') and words[1:] != [FILL] * 3:
+        if form.removesuffix('-same').endswith('ss') and words[1:] != [FILL] * 3:
             res.append({'name': f'{form}/{g[0]:#010x}/upper', 'ok': False,
                         'problems': [f'upper lanes {[hex(w) for w in words[1:]]}, the destination kept {FILL:#x}']})
     return res
@@ -147,6 +156,7 @@ def run(args, form, kind, table, work: pathlib.Path) -> list[dict]:
 
 FORMS = [('rcpps', 'rcp', RCP), ('vrcpps', 'rcp', RCP), ('rcpss', 'rcp', RCP), ('vrcpss', 'rcp', RCP),
          ('rsqrtps', 'rsqrt', RSQRT), ('vrsqrtps', 'rsqrt', RSQRT), ('rsqrtss', 'rsqrt', RSQRT), ('vrsqrtss', 'rsqrt', RSQRT)]
+FORMS += [(f + '-same', k, t) for f, k, t in FORMS]
 
 
 def self_check() -> None:

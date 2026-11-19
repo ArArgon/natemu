@@ -70,6 +70,36 @@ bool Arm64JITCore::FexcQuietOp(const IR::IROp_Header* IROp) {
          (IROp->Op == IROps::OP_VFRECP || IROp->Op == IROps::OP_VFRSQRT || IROp->Op == IROps::OP_VFRECPSCALARINSERT ||
           IROp->Op == IROps::OP_VFRSQRTSCALARINSERT);
 }
+// The same instructions' fixed results (Intel SDM, RCPPS/RSQRTPS; tools/run_approx_special.py): FEX computes 1/x and 1/sqrt(x)
+// exactly, but x86 treats a denormal source as 0.0 of its sign (RCP and RSQRT give the infinity of that sign) and RCP flushes a tiny
+// result to 0.0 of its sign, whatever MXCSR's DAZ, FTZ and rounding control say. The results in between stay correctly rounded.
+// Integer words only (no FP flag, no FPCR use), computed from the source so that they overlap the divide: one or two words wait
+// for its result (the FPSR restore follows them). Each op is a 128-bit vector of singles or a scalar insert (lane 0 only; AVX128
+// splits a ymm form in two halves). S is the source register, D the destination, v0/v1 FEX's VTMP1/VTMP2.
+//   RCP, before the op: H = the lanes whose source exponent field is 253 or 254 (2^126 <= |x| < 2^128), as 0x7fffffff, in v1,
+//       which FEX's RCP lowering leaves alone (a hard check after it). From 1.00000000000110000000001b * 2^126 up the SDM fixes 0.0;
+//       below it, from 2^126, the SDM's band allows 0.0 or the approximation; the exact result there is a denormal or 2^-126.
+//         shl v1, S, #1; movi v0, #3, lsl #24; add v1, v1, v0; ushr v1, v1, #25; cmeq v1, v1, #0;
+//         [scalar: movi v0, #0; ins v0.s[0], v1.s[0]; ushr v1, v0, #1 | vector: ushr v1, v1, #1]
+//     after the op: bic D, D, v1                                                                       (0.0 of the result's sign)
+//   S is D (the source dies here), before the op (and before RCP's H, which it leaves unchanged; RCP's scalar form after H, with
+//       v1 taken: FexcFlushWords, five words): S's denormal lanes become zeros of their sign, and the op gives the infinity of that
+//       sign (three words wait for S):
+//         movi v0, #0xff, lsl #24; ushr v0, v0, #1; cmtst v0, S, v0; orr v0, #0x80, lsl #24;
+//         [scalar: movi v1, #-1; ins v1.s[0], v0.s[0]; and S, S, v1 | vector: and S, S, v0]
+//   else, after the op: M = S's denormal lanes (exponent field zero, not a zero), V = S's sign | (M ? 0x7f800000 : 0):
+//     shl v0, S, #1; ushr v1, v0, #24; cmeq v1, v1, #0; cmeq v0, v0, #0; bic A, v1, v0;   (scalar: A = v0, then movi v1, #0;
+//     ins v1.s[0], v0.s[0], so M is in B = v1, A = v0; vector: M in A = v0, B = v1)
+//     shl B, M, #24; mov A, S; sri A, B, #1; sshr B, B, #31; bit D, A, B
+static bool FexcApproxScalar(const IR::IROp_Header* IROp) {
+  using IR::IROps;
+  const bool Scalar = IROp->Op == IROps::OP_VFRECPSCALARINSERT || IROp->Op == IROps::OP_VFRSQRTSCALARINSERT;
+  if (IROp->ElementSize != IR::OpSize::i32Bit || IROp->Size != IR::OpSize::i128Bit) std::abort();   // a hard check
+  return Scalar;
+}
+static bool FexcApproxRecp(const IR::IROp_Header* IROp) {
+  return IROp->Op == IR::IROps::OP_VFRECP || IROp->Op == IR::IROps::OP_VFRECPSCALARINSERT;
+}
 // I5a: ROUND* with imm8 bit 3 clear (PE when inexact): `frintx`, under the instruction's own rounding mode when it names one
 // (FPCR.RMode switched around it: x2 keeps FPCR, x3 the temporary value). Returns whether to emit frintx.
 bool Arm64JITCore::FexcRoundBegin(IR::RoundMode Mode) {
@@ -721,7 +751,39 @@ bool Arm64JITCore::FexcX87NanOp(const IR::IROp_Header* IROp) {
 // operand takes precedence over IDC on the M4, verified by the AfpX87 oracle). Hosts without AFP have the software test instead.
 //   tbz w2, #7, done; tbnz w1, #1, clear; [fmov x3, Dd; ubfx; movz; sub; tbnz x3, #63, clear]...; b done; clear: and w2, w2, #~0x80; strb w2
 void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
-  if (FexcQuietOp(IROp)) msr(ARMEmitter::SystemRegister::FPSR, TMP4);
+  if (FexcQuietOp(IROp)) {   // the SDM's fixed results (above FexcApproxScalar), then FPSR back
+    const bool Scalar = FexcApproxScalar(IROp), Recp = FexcApproxRecp(IROp);
+    const auto Dst = GetVReg(Node), Src = GetVReg(IROp->Args[Scalar ? 1 : 0]);
+    constexpr auto S = ARMEmitter::SubRegSize::i32Bit;
+    if (Recp) {
+      // H lives in VTMP2 across the op: no word FEX emitted for it may write v1 (an SIMD/FP data-processing word with Rd = 1;
+      // RCP's lowering writes VTMP1, the destination and nothing else).
+      for (auto* w = reinterpret_cast<const uint32_t*>(CodeData.BlockBegin + Begin); w < GetCursorAddress<const uint32_t*>(); ++w)
+        if ((*w & 0x0e00'0000) == 0x0e00'0000 && (*w & 31) == VTMP2.Idx()) std::abort();   // a hard check
+      bic(Dst.Q(), Dst.Q(), VTMP2.Q());
+    }
+    if (Dst != Src) {
+      shl(S, VTMP1.Q(), Src.Q(), 1);
+      ushr(S, VTMP2.Q(), VTMP1.Q(), 24);
+      cmeq(S, VTMP2.Q(), VTMP2.Q());
+      cmeq(S, VTMP1.Q(), VTMP1.Q());
+      auto A = VTMP1, B = VTMP2;
+      if (Scalar) {
+        bic(VTMP1.Q(), VTMP2.Q(), VTMP1.Q());
+        movi(ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), 0);
+        ins(S, VTMP2, 0, VTMP1, 0);
+        shl(S, VTMP2.Q(), VTMP2.Q(), 24);
+      } else {
+        bic(VTMP1.Q(), VTMP2.Q(), VTMP1.Q());
+        shl(S, VTMP2.Q(), VTMP1.Q(), 24);
+      }
+      mov(A.Q(), Src.Q());
+      sri(S, A.Q(), B.Q(), 1);
+      sshr(S, B.Q(), B.Q(), 31);
+      bit(Dst.Q(), A.Q(), B.Q());
+    }
+    msr(ARMEmitter::SystemRegister::FPSR, TMP4);
+  }
   if (fexc_slice1) FexcTinyCheck(IROp, Node);
   if (FexcX87Op(IROp)) FexcX87End();
   if (FexcX87Op(IROp) && !fexc_no_afp) {
@@ -1049,7 +1111,41 @@ void Arm64JITCore::FexcCheckTarget(IR::Ref Node) {
 
 void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   using IR::IROps;
-  if (FexcQuietOp(IROp)) mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
+  if (FexcQuietOp(IROp)) {
+    mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
+    const bool Scalar = FexcApproxScalar(IROp), Recp = FexcApproxRecp(IROp);   // the SDM's fixed results (above FexcApproxScalar)
+    const auto Src = GetVReg(IROp->Args[Scalar ? 1 : 0]);
+    constexpr auto S = ARMEmitter::SubRegSize::i32Bit;
+    const bool Dies = GetVReg(Node) == Src;
+    if (Dies && !(Recp && Scalar)) {   // the dying source's flush (first: the op waits for it; H does not change)
+      movi(S, VTMP1.Q(), 0xff, 24);
+      ushr(S, VTMP1.Q(), VTMP1.Q(), 1);
+      cmtst(S, VTMP1.Q(), Src.Q(), VTMP1.Q());
+      dc32(0x4f04'7400 | VTMP1.Idx());   // orr v0.4s, #0x80, lsl #24 (the emitter has no vector ORR immediate)
+      if (Scalar) {
+        movi(ARMEmitter::SubRegSize::i64Bit, VTMP2.Q(), ~0ULL);
+        ins(S, VTMP2, 0, VTMP1, 0);
+        and_(Src.Q(), Src.Q(), VTMP2.Q());
+      } else {
+        and_(Src.Q(), Src.Q(), VTMP1.Q());
+      }
+    }
+    if (Recp) {   // H, into VTMP2
+      shl(S, VTMP2.Q(), Src.Q(), 1);
+      movi(S, VTMP1.Q(), 3, 24);
+      add(S, VTMP2.Q(), VTMP2.Q(), VTMP1.Q());
+      ushr(S, VTMP2.Q(), VTMP2.Q(), 25);
+      cmeq(S, VTMP2.Q(), VTMP2.Q());
+      if (Scalar) {
+        movi(ARMEmitter::SubRegSize::i64Bit, VTMP1.Q(), 0);
+        ins(S, VTMP1, 0, VTMP2, 0);
+        ushr(S, VTMP2.Q(), VTMP1.Q(), 1);
+      } else {
+        ushr(S, VTMP2.Q(), VTMP2.Q(), 1);
+      }
+    }
+    if (Dies && Recp && Scalar) FexcFlushWords(Src, Src, 4, true, true, false);   // VTMP1 only: VTMP2 holds H
+  }
   if (FexcX87Op(IROp)) FexcX87Begin();
   if (FexcX87NanOp(IROp)) {   // the sources the op overwrites, for the NaN fix-up (FexcAfterOp)
     const auto Dst = GetVReg(Node), A = GetVReg(IROp->Args[0]), B = GetVReg(IROp->Args[IROp->Op == IROps::OP_VFSQRT ? 0 : 1]);

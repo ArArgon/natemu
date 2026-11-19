@@ -211,7 +211,8 @@ inline std::set<uint64_t> fexc_align32;
 inline FexcArg<bool, FEXC_ARG_AVX_GATED> fexc_avx_gated;
 // Profile slice1 (I5a), recorded by the allowlist so the JIT raises the MXCSR exception flags x86 does (FPSR is MXCSR's flags):
 // COMISS/COMISD compare signalling (`fcmpe`: IE for a QNaN too; FEX emits UCOMIS's quiet `fcmp` for both); RCPPS/RCPSS/
-// RSQRTPS/RSQRTSS raise none (FEX divides exactly: FPSR is saved and restored around the op); ROUNDPS/PD/SS/SD with imm8
+// RSQRTPS/RSQRTSS raise none (FEX divides exactly: FPSR is saved and restored around the op) and get the SDM's fixed results for
+// denormal sources and RCP's tiny results (integer words around the op, shim/fexc_sites.inc FexcApproxScalar); ROUNDPS/PD/SS/SD with imm8
 // bit 3 clear raise PE when inexact (`frintx`, under the instruction's rounding mode when imm8 bit 2 is clear).
 inline std::set<uint64_t> fexc_fp_signal, fexc_fp_quiet, fexc_round_inexact;
 // Profile slice1 (M3), recorded by the allowlist: guest RIP of each MOV-family instruction -> its completion record for a
@@ -245,7 +246,7 @@ inline FexcArg<uint64_t, FEXC_ARG_X87_UNMASKED> fexc_x87_unmasked;
 // (FexcPrecision::PlaceFlushes and the PE check mask), and only when `fexc_no_afp`, so no answer of a host with AFP reads them.
 // FPCR.FZ is then 1 with DAZ and FTZ both (hardware flush, as the M4's FIZ and FZ), else 0: DAZ alone is a software input flush
 // per FP source (behind an exact exponent screen, `FexcFlush` mode bit 2: AFP accurate plan chunk 6b), FTZ alone a software output flush with UFC and IXC for each flushed lane (FexcFlush); DAZ and FTZ both flush
-// only the raw result MIN/MAX select. x87 and the quiet RCP/RSQRT results are left alone.
+// only the raw result MIN/MAX select. x87 is left alone; RCP/RSQRT fix their SDM results themselves, whatever DAZ and FTZ say.
 inline bool fexc_no_afp = false;
 inline FexcArg<bool, FEXC_ARG_DAZ> fexc_daz;
 inline FexcArg<bool, FEXC_ARG_FTZ> fexc_ftz;
