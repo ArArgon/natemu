@@ -1841,6 +1841,23 @@ impl<'a> Verifier<'a> {
                     "exit at {at:#x}: literal {target:#x} is neither the block end nor its branch target"
                 ));
             }
+            // An exit a branch inside the unit reaches (a conditional's taken exit) is that guest instruction's own target:
+            // only the unit's last instruction may use the whole set (end, own RIP, ...).
+            let last = (self.c.pcs.iter().map(|p| p.guest_offset))
+                .filter(|&g| g < self.c.guest_bytes)
+                .max();
+            for &(src, _) in self.branches.iter().filter(|&&(_, t)| t == offset) {
+                let Some((g, _)) = self.instruction(src) else {
+                    return Err(format!("exit at {at:#x}: its branch is outside the PC table"));
+                };
+                let insn = self.guest_insn(g);
+                let end = self.c.rip.wrapping_add(g as u64 + insn.len() as u64);
+                if Some(g) != last && super::branch_target(insn, end) != Some(target) {
+                    return Err(format!(
+                        "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it"
+                    ));
+                }
+            }
             self.links.push(LinkPoint {
                 offset,
                 word: self.word(offset),
@@ -2473,7 +2490,7 @@ mod tests {
             )
         };
     }
-    const FIXTURES: [(&[u8], &[u8]); 11] = [
+    const FIXTURES: [(&[u8], &[u8]); 12] = [
         fixture!("address-forms"),
         fixture!("division-forms"),
         fixture!("call-rsp"),
@@ -2490,6 +2507,9 @@ mod tests {
         // vpcmpistrm xmm2, xmm3, 0x40; fstp qword [rax]. `movz w0, #fn; svc #X87` at 0x98 (FSIN) and 0xa0 (FPREM); `movz w0,
         // #control; svc #STRING` at 0xb4 (0x12), 0xf0 (0x34c: explicit, REX.W) and 0x11c (0x40).
         fixture!("helper-forms"),
+        // Extended block (--ext-conds 4): `cmp rax, rcx; jnz +0x10; inc rax; jz +0x20; dec rcx; jnz +0x1e` at RIP 0x401000;
+        // exits: the fall-through's 0x40100e at 0x40, the taken 0x401015, 0x40102a, 0x40102c at 0x4c, 0x58, 0x64.
+        fixture!("ext-jcc"),
     ];
     /// Admission with the code-shape check (as in the test suites).
     fn admit(fixture: (&[u8], &[u8])) -> Result<(), String> {
@@ -3407,6 +3427,71 @@ mod tests {
             !e.contains(&format!("literal {:#x}", h.guest_rip + 3)),
             "{e}"
         );
+    }
+
+    /// Extended blocks: a conditional branch inside the unit exits only to its own taken target, not to another branch's
+    /// target or the unit's end; the last instruction keeps the whole set.
+    #[test]
+    fn inner_exits_are_their_own_branch_targets() {
+        const EXT: (&[u8], &[u8]) = FIXTURES[11];
+        admit(EXT).unwrap();
+        let h: Header = super::super::record(EXT.0, 0);
+        let with = |exits: [(u32, u64); 2]| {
+            let mut object = EXT.0.to_vec();
+            for (at, value) in exits {
+                let reloc = (0..h.relocs_count as usize)
+                    .map(|i| h.relocs_offset as usize + i * size_of::<Reloc>())
+                    .find(|&r| u32::from_le_bytes(object[r..r + 4].try_into().unwrap()) == at)
+                    .unwrap();
+                object[reloc + 8..reloc + 16].copy_from_slice(&value.to_le_bytes());
+                let code = (h.code_offset + at) as usize;
+                let (lo, hi) = (value as u32 & 0xffff, (value >> 16) as u32);
+                object[code..code + 4].copy_from_slice(&(0x5280_0000 | lo << 5).to_le_bytes());
+                object[code + 4..code + 8].copy_from_slice(&(0x72a0_0000 | hi << 5).to_le_bytes());
+            }
+            admit((&object, EXT.1))
+        };
+        // The first two taken exits swapped: both targets are in the unit's set, neither is its own branch's.
+        let e = with([(0x4c, 0x40_102a), (0x58, 0x40_1015)]).expect_err("swapped targets admitted");
+        assert!(e.contains("direct target of the branch"), "{e}");
+        // A taken exit naming the unit's end.
+        let e = with([(0x4c, 0x40_100e), (0x58, 0x40_102a)]).expect_err("exit to the end admitted");
+        assert!(e.contains("direct target of the branch"), "{e}");
+        // The last instruction's taken exit may name the unit's end (the whole set).
+        with([(0x64, 0x40_100e), (0x4c, 0x40_1015)]).unwrap();
+    }
+
+    /// With `FEXC` set: extended blocks of every conditional form (jcc rel8 and rel32, loop*, jrcxz, with prefixes) as the host
+    /// asks for them are admitted, in the middle of a unit and ending it.
+    #[test]
+    fn real_extended_blocks_are_admitted() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("natemu-ext-admit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut forms: Vec<Vec<u8>> = (0x70..=0x7f).chain(0xe0..=0xe3).map(|op| vec![op, 5]).collect();
+        forms.extend((0x80..=0x8f).map(|op| vec![0x0f, op, 5, 0, 0, 0]));
+        forms.extend([vec![0x67, 0xe2, 5], vec![0x66, 0x75, 5], vec![0x3e, 0x74, 5], vec![0x64, 0x66, 0x0f, 0x82, 5, 0, 0, 0]]);
+        for f in forms {
+            for n in 1..=4 {
+                let source: Vec<u8> = (0..n).flat_map(|_| [&[0x48, 0x39, 0xc8][..], &f, &[0x48, 0xff, 0xc0]].concat()).collect();
+                let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
+                let object = dir.join("o");
+                let out = std::process::Command::new(&fexc)
+                    .args(["--hex", &hex, "--rip", "0x401000", "--profile", "slice1", "--ext-conds", "4", "--push-run", "--narrow-cmp"])
+                    .arg("--object")
+                    .arg(&object)
+                    .arg("--out")
+                    .arg("/dev/null")
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{hex}");
+                let object = std::fs::read(&object).unwrap();
+                admit((&object, &source)).unwrap_or_else(|e| panic!("{hex}: {e}"));
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
