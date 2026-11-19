@@ -100,3 +100,16 @@ def test_diff_rerun_only_for_hash_only_answers():
     assert runner.needs_diff(f'step 3: {answers.HASH_ONLY}: qemu-system/abc')
     assert not runner.needs_diff('x differs: 1 != 2 (QEMU 2)')
     assert 'natemu-test run --diff' in answers.HASH_ONLY
+
+
+def test_hand_written_io_suites_survive_regeneration():
+    """testkit.migrate rewrites tests/io/family.toml with the generated `io` suite only; these suites are added by hand."""
+    from testkit import paths, family
+    f = family.load(paths.repo_root() / 'tests' / 'io' / 'family.toml')
+    want = {'io-selfcheck': {'io-stress-selfcheck', 'lifecycle-stress-selfcheck', 'virtio-net-selfcheck', 'io-pending-compiler-selfcheck'},
+            'io-program': {'virtio-net', 'io-windows', 'io-window-cases', 'io-pending-compiler'},
+            'io-campaign': {'io-stress-n2', 'io-stress-n4', 'lifecycle-reset', 'lifecycle-disable', 'lifecycle-corrupt-control',
+                            'serial-unpaced', 'serial-paced', 'serial-loaded', 'soak'}}
+    for suite, cases in want.items():
+        assert cases <= set(f.suite(suite).extra['cases']), suite
+
