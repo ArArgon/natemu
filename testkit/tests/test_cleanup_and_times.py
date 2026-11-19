@@ -68,3 +68,18 @@ def test_phases_split_a_run():
     assert timings.brief(d)[0] == 'total 1 min 14 s'
     assert any('slowest' in l for l in timings.detail(d))
     del d['prepare']['end']; timings.brief(d)            # interrupted during preparation: still summarized
+
+
+def test_clean_all_worktrees_reaches_other_checkouts(tmp_path, monkeypatch):
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'cache'))
+    monkeypatch.setattr(paths, 'repo_root', lambda: tmp_path / 'wt')
+    (tmp_path / 'wt' / 'testkit').mkdir(parents=True); (tmp_path / 'wt' / 'testkit' / 'requirements.lock').write_text('x')
+    monkeypatch.setattr(clean.tempfile, 'gettempdir', lambda: str(tmp_path / 'tmp')); (tmp_path / 'tmp').mkdir()
+    monkeypatch.setattr(clean, 'other_testkit_processes', lambda: [])
+    other = tmp_path / 'other'; (other / 'testkit').mkdir(parents=True)
+    cache.register_worktree(other)
+    old = _run(other, 'x')
+    clean.clean()
+    assert old.exists()                                  # another checkout's runs are kept by default
+    clean.clean(all_worktrees=True)
+    assert not old.exists()

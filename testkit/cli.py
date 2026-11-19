@@ -70,12 +70,12 @@ def cmd_gc(args):
 
 def cmd_clean(args):
     from testkit import clean
-    return clean.clean(dry='--dry-run' in args)
+    return clean.clean(dry='--dry-run' in args, all_worktrees='--all-worktrees' in args)
 
 
 def cmd_purge(args):
     from testkit import clean
-    return clean.clean(dry='--dry-run' in args, purge=True)
+    return clean.clean(dry='--dry-run' in args, purge=True, all_worktrees='--all-worktrees' in args)
 
 
 def cmd_times(args):

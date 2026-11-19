@@ -137,7 +137,8 @@ tools/natemu-test clean      # this checkout's finished run folders and leftover
 tools/natemu-test purge      # the same, and every cache entry no running run uses: the next run rebuilds what it needs
 ```
 
-Both take `--dry-run` to say what would go and how much. Neither touches a running run, a run folder with a `keep`
+Both take `--dry-run` to say what would go and how much, and `--all-worktrees` to include every checkout that has
+run tests on this machine (other worktrees' run folders are otherwise kept). Neither touches a running run, a run folder with a `keep`
 file, the current Python environment or the machine's scheduler state and recorded durations.
 
 Downloads are declared once in `tests/resources.toml` with their URLs and pinned sha256; nothing is used unverified.

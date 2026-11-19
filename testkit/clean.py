@@ -86,7 +86,7 @@ def _forget_dead_registry() -> None:
         if not runs._alive(rec['pid']) and not pathlib.Path(rec['dir']).exists(): f.unlink(missing_ok=True)
 
 
-def clean(dry: bool = False, purge: bool = False) -> int:
+def clean(dry: bool = False, purge: bool = False, all_worktrees: bool = False) -> int:
     others = other_testkit_processes()
     if purge and others and not dry:
         print('purge: other natemu-test processes are running on this machine; purge needs it idle:')
@@ -94,10 +94,16 @@ def clean(dry: bool = False, purge: bool = False) -> int:
         return 1
     busy = bool(others)
     worktree = paths.repo_root()
-    rs, ts = finished_runs(worktree, busy), temp_leftovers(busy)
+    trees = [worktree] + ([w for w in cache.worktrees() if w.resolve() != worktree.resolve()] if all_worktrees else [])
+    rs = [r for w in trees for r in finished_runs(w, busy)]
+    ts = temp_leftovers(busy)
     freed_runs, freed_tmp = _remove(rs, dry), _remove(ts, dry)
     verb = 'would free' if dry else 'freed'
-    print(f'run folders: {len(rs)} of this worktree, {verb} {_human(freed_runs)}')
+    print(f'run folders: {len(rs)} of {len(trees)} worktree{"s" if len(trees) > 1 else ""}, {verb} {_human(freed_runs)}')
+    if not all_worktrees:
+        others = [w for w in cache.worktrees() if w.resolve() != worktree.resolve()]
+        held = sum(_size(r) for w in others for r in finished_runs(w, True))
+        if held: print(f'  other worktrees\' finished runs hold {_human(held)} (--all-worktrees cleans them)')
     print(f'temporary folders: {len(ts)}, {verb} {_human(freed_tmp)}'
           + (' (only those untouched for a day: other natemu-test processes are running)' if busy else ''))
     if not dry: _forget_dead_registry()
