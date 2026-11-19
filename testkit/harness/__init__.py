@@ -22,6 +22,7 @@ class SubResult:
     outcome: str
     longrepr: str = ''
     duration: float = 0.0
+    category: str | None = None     # a testkit category (expected-fail, missing, ...: testkit/report.py); longrepr its note
 
 
 @dataclasses.dataclass(frozen=True)

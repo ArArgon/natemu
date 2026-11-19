@@ -66,6 +66,17 @@ Besides passed and failed:
 | reused | an identical earlier run's output, checked again against the current lock | no |
 | wrapped | a step of the old `tools/run_suite.py` run unchanged (it still uses `natemu-raw`) | if it failed |
 
+A campaign (`--tier campaign`, `tests/correctness`) judges each test it runs by that test's own verdict, and adds:
+
+| Result | Meaning | Fails the run |
+| --- | --- | --- |
+| expected-fail | the test failed and its suite lists it in `expected`, with the reason | no |
+| unexpected-pass | the test passed although `expected` lists it: remove the entry | yes |
+| flaky | the test is listed in `flaky` and failed again when its part was rerun | no |
+| missing | the image lists the test, but the run never reported it (the guest crashed or hung) | yes |
+| stale-entry | an `expected` or `flaky` entry names a test the image does not have (renamed or removed?) | yes |
+| unverified | the test ran to the end, but nothing checks that its output is right | no, and never a pass |
+
 A Mac with every feature (an M4) can pass a gate alone. On a Mac without one, combine runs of the same commit:
 `--gate --with-run .natemu/runs/<id-from-the-M4>` counts the variants this Mac cannot run as covered where they passed
 in that run. `--require-real afp` places "AFP absent" variants only on a Mac that really lacks AFP instead of hiding it

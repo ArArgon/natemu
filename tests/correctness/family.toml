@@ -1,0 +1,43 @@
+# The Linux workload campaigns (plan docs/superpowers/plans/2026-11-18-campaign-onboarding.md, Part B): each case boots
+# one part of a campaign image under natemu and judges every test the image lists by the campaign's own verdict
+# (verdicts.py). No reference run, no lock. testkit/harness/campaign.py describes the suite keys. The other campaigns
+# (libm, gstr, x86st, ltp, cpyt, cpyb, stress, litmus, public) join with their recipes (plan Tasks 8-10).
+[family]
+name = "correctness"
+covers = ["tools/correctness/**", "tests/correctness/**", "testkit/harness/campaign.py"]
+
+[[suite]]
+name = "openssl"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# 41 recipes x 6 capability masks = 246 runs, single-threaded: about 1,000 s at 4 vCPUs (correctness-userspace.md)
+parts = 2
+cap = 3600
+verdict = "verdicts:openssl"
+matrix = { "machine.vcpus" = [4] }
+needs = { cores = 4 }
+
+[[suite]]
+name = "torture"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# 3,448 programs (1,724 tests at -O0 and -O2): about 170 s at 4 vCPUs (correctness-userspace.md)
+parts = 1
+cap = 3600
+verdict = "verdicts:torture"
+matrix = { "machine.vcpus" = [4] }
+needs = { cores = 4 }
+
+[suite.expected]
+# docs/restructure/correctness-userspace.md, finding 1: an x87 register is a double, so FLD m80 of LDBL_MAX rounds to
+# +inf and GCC's isinfl / x != inf / x == inf misjudge; these abort under natemu and pass natively and on QEMU.
+"ieee_inf-2.O0" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1)"
+"ieee_inf-2.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1)"
+"ieee_inf-3.O0" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1)"
+"ieee_inf-3.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1)"
+"ieee_pr36332.O0" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1)"
+"ieee_pr36332.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1)"
+"pr39228.O0" = "natemu runs x87 in reduced precision (FEX): isinfl misjudges LDBL_MAX (docs/restructure/correctness-userspace.md, finding 1)"
+"pr39228.O2" = "natemu runs x87 in reduced precision (FEX): isinfl misjudges LDBL_MAX (docs/restructure/correctness-userspace.md, finding 1)"

@@ -96,10 +96,13 @@ class CaseFailure(Exception):
 
 
 def emit_sub(item, s):
-    """A per-test result of a units suite, reported under its own node id."""
+    """A per-test result of a units or campaign suite, reported under its own node id (with its category, if any)."""
     from _pytest.reports import TestReport
     nodeid = f'{item.nodeid}::{s.name}'
     longrepr = None if s.outcome == 'passed' else ((str(item.path), 0, s.longrepr or s.outcome) if s.outcome == 'skipped'
                                                    else s.longrepr or 'failed')
-    rep = TestReport(nodeid, (str(item.path), None, nodeid), {}, s.outcome, longrepr, 'call', duration=s.duration)
+    cat = getattr(s, 'category', None)
+    props = ([('testkit', cat)] if cat else []) + ([('testkit-note', s.longrepr)] if s.longrepr and (cat or s.outcome == 'passed') else [])
+    rep = TestReport(nodeid, (str(item.path), None, nodeid), {}, s.outcome, longrepr, 'call', duration=s.duration,
+                     user_properties=props)
     item.ihook.pytest_runtest_logreport(report=rep)
