@@ -1,5 +1,6 @@
 import copy
 import json
+import pathlib
 import types
 
 from testkit import paths
@@ -8,8 +9,17 @@ from testkit.harness import programs
 FIX = paths.repo_root() / 'fixtures' / 'slice1'
 
 
+def programs_json() -> pathlib.Path:
+    """fixtures/slice1/programs.json is generated and git-ignored: a fresh checkout has none, so take the framework's
+    build of the same corpus (gen_slice1.py at its default seed, the manifest's 20261026)."""
+    f = FIX / 'programs.json'
+    if f.exists(): return f
+    from testkit import inputs
+    return inputs.corpus('gen_slice1.py')
+
+
 def load():
-    ps = json.loads((FIX / 'programs.json').read_text())['programs']
+    ps = json.loads(programs_json().read_text())['programs']
     ex = {r['name']: r for r in json.loads((FIX / 'expected.json').read_text())['results']}
     return [(p, ex[p['name']]) for p in ps if p['name'] in ex]
 
@@ -21,6 +31,9 @@ def as_vm(result):
 
 
 def test_normalize_matches_compare():
+    import pytest
+    if not (FIX / 'expected.json').exists():
+        pytest.skip('needs fixtures/slice1/expected.json: QEMU results kept only where they were generated (git-ignored)')
     ref, _ = programs._ref()
     pairs = load()
     assert len(pairs) > 40
@@ -41,7 +54,7 @@ def test_normalize_matches_compare():
 
 
 def test_corpus_hash_ignores_header():
-    ps = json.loads((FIX / 'programs.json').read_text())['programs']
+    ps = json.loads(programs_json().read_text())['programs']
     assert programs.corpus_hash(ps) == programs.corpus_hash(copy.deepcopy(ps))
     ps2 = copy.deepcopy(ps); ps2[0]['code'] = ps2[0]['code'][:-2] + '90'
     assert programs.corpus_hash(ps2) != programs.corpus_hash(ps)
