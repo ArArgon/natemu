@@ -4,16 +4,15 @@ tools/bench/smp/irqs.py).
 
     tools/with-env python3 tools/run_l4a.py --fexc FEXC --out DIR [--only qemu,xapic,stress,halt] [--stress-rounds K]
 
-- `qemu`: programs run unchanged by pinned QEMU (system mode, COM1 = `-serial file:`) and natemu at block sizes default
+- `qemu` (the name kept from when pinned QEMU ran these programs too; natemu only now): natemu at block sizes default
   and 1, one CPU in xAPIC and x2APIC mode: I/O APIC register read-backs; IRQ4 (the UART's THRE interrupt) edge through
   pin 4 (each rise once, a rise while masked lost); level (Remote IRR, TMR, the EOI broadcast redelivering while the line
   is high, masked -> unmasked delivering at the unmask, the EOI register); the 8259 pair (Linux's probe_8259A and
   init_8259A, OCW3 reads, the ELCR, ExtINT through LINT0 with the I/O APIC masked, poll, ELCR level mode, auto-EOI,
   rotation and special mask); the TMR following each acceptance's trigger (54H level from pin 4, then as a self IPI:
   TMR 1 then 0, the second EOI broadcasting nothing). Destinations at 2, 3, 4 CPUs in x2APIC mode (QEMU's BSP mode with peers): physical each,
-  logical (two sets), lowest priority, NMI, level to a peer whose handler lowers the line (its EOI broadcast). natemu must
-  equal QEMU (registers, captured memory, logs without their TSC at one CPU; counts at several), the UART bytes too, and
-  both the datasheet/SDM model below (`model_problems`).
+  logical (two sets), lowest priority, NMI, level to a peer whose handler lowers the line (its EOI broadcast). Judged by
+  the datasheet/SDM model below (`model_problems`) and the bytes each program sends to the UART (`UART_WANT`).
 - `xapic` (natemu only, Linux's path; QEMU's BSP cannot be xAPIC with peers): the destination program at 2, 3, 4 CPUs
   with flat logical IDs, counts by the model; LVT LINT0 fixed (edge, 45H): each rise of the 8259's output one 45H with no
   INTA (QEMU passes the 8259 through in any mode, so not compared), then the APIC hardware disabled: the 8259 wired
@@ -28,9 +27,9 @@ tools/bench/smp/irqs.py).
 - `lint1` (natemu only): the board's NMI input (LINT1) pulsed by the test source: an NMI with LVT LINT1 unmasked in NMI
   mode, none while it is masked (2 NMIs of 3 pulses).
 
-QEMU departures (not compared; `ioapic.rs`, `irq.rs`): an edge input raised again while high (QEMU delivers; the
-programs make no such raise); the storm delay after 10,000 EOIs; an INTA cycle for a masked ExtINT entry; 8-byte
-accesses. Writes DIR/l4a.json; exit status 1 on any failure."""
+Where pinned QEMU (once compared here) departs (`ioapic.rs`, `irq.rs`): an edge input raised again while high (QEMU
+delivers; the programs make no such raise); the storm delay after 10,000 EOIs; an INTA cycle for a masked ExtINT entry;
+8-byte accesses. Writes DIR/l4a.json; exit status 1 on any failure."""
 import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -38,7 +37,7 @@ sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT
 import smp, answers, apic, irqs, events, run_slice1_vm as vm  # noqa: E402
 import case_results  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end  # noqa: E402
-from run_x3 import compare_qemu, natemu_memory, qemu_memory  # noqa: E402
+from run_x3 import natemu_memory  # noqa: E402
 
 
 def run_natemu(a, prog, work, extra=(), timeout=300, reached=True):
@@ -57,6 +56,7 @@ def run_natemu(a, prog, work, extra=(), timeout=300, reached=True):
     return out, problems
 
 
+# ---- pinned QEMU, for run_r1 (r1 still compares with QEMU's answers; nothing here does) --------------------------
 def qemu(prog, work):
     work.mkdir(parents=True, exist_ok=True)
     serial = work / 'serial.out'
@@ -77,6 +77,11 @@ def uart_problems(want, mine, sent):
 
 
 # ---- the model: what the datasheets and the SDM give for each program ------------------------------------------
+# The bytes each `qemu` program sends to COM1: the edge program's one THR write ('E'); the others none.
+UART_WANT = {f'l4a-{k}-{m}': b'E' if k == 'edge' else b'' for m in ('x', 'x2') for k in ('ioapic-regs', 'edge', 'level', 'pic', 'tmr')} | \
+    {'l4a-dest-x2': b''}
+
+
 def q(mem, at): return mem.read(at)
 
 
@@ -132,21 +137,20 @@ def model_problems(prog, mem):
     return out
 
 
-def check_program(a, prog, label, compare=True, modes=(None, 1)):
-    """QEMU (when `compare`) and natemu at each block size: the model on both, natemu equal to QEMU."""
-    problems, want, sent = [], None, None
-    if compare:
-        want, sent, err = qemu(prog, a.out / 'qemu' / label)
-        if want is None:
-            return [f'QEMU run failed ({err})']
-        problems += [f'QEMU vs model: {d}' for d in answers.derive(want, 'model_problems', lambda w: model_problems(prog, qemu_memory(prog, w)))]
+def uart_model_problems(prog, mine):
+    """The bytes a `qemu` program sends to COM1 (`UART_WANT`; the others' are not judged)."""
+    want = UART_WANT.get(prog['name'].split('@')[0])
+    return [] if want is None or mine == want else [f'UART bytes {mine!r} != {want!r}']
+
+
+def check_program(a, prog, label, modes=(None, 1)):
+    """natemu at each block size: the model, and the UART bytes."""
+    problems = []
     for limit in modes:
         out, p = run_natemu(a, prog, a.out / 'work' / f"{label}-{limit or 'd'}", [limit] if limit else [])
         if out is not None:
             p += model_problems(prog, natemu_memory(out))
-            if want is not None:
-                p += compare_qemu(prog, out, want)
-                p += uart_problems(want, bytes.fromhex(out.get('uart', '')), sent)
+            p += uart_model_problems(prog, bytes.fromhex(out.get('uart', '')))
         problems += [f'max-block {limit}: {x}' for x in p]
     return problems
 
@@ -154,18 +158,18 @@ def check_program(a, prog, label, compare=True, modes=(None, 1)):
 def cmd_qemu(a, report):
     progs = [f(m) for m in ('x', 'x2') for f in (irqs.regs_program, irqs.edge_program, irqs.level_program, irqs.pic_program, irqs.tmr_program)]
     progs += [irqs.dest_program(n) for n in (2, 3, 4)]
-    return run_all(a, report, progs, compare=True)
+    return run_all(a, report, progs)
 
 
 def cmd_xapic(a, report):
-    return run_all(a, report, [irqs.dest_program(n, 'x') for n in (2, 3, 4)] + [irqs.lint0_program()], compare=False)
+    return run_all(a, report, [irqs.dest_program(n, 'x') for n in (2, 3, 4)] + [irqs.lint0_program()])
 
 
-def run_all(a, report, progs, compare):
+def run_all(a, report, progs):
     failures = []
     for prog, _ in progs:
         label = prog['name']
-        problems = check_program(a, prog, label, compare)
+        problems = check_program(a, prog, label)
         report.append({'name': label, 'problems': problems})
         failures += [f'{label}: {p}' for p in problems]
         print(f"{label}: {'FAIL' if problems else 'ok'}", *problems[:6], sep='\n  ', flush=True)
