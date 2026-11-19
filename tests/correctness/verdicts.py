@@ -156,6 +156,14 @@ def cpyt_unreported(name, serial):
 
 
 CPYB_BUILD_FAILED = re.compile(r'Could not build|failed to build|failed on import|could not be imported', re.I)
+# make's closing summary, "Checked 112 modules (... 1 missing, 0 failed on import)": fails only on a nonzero count
+# ("missing" is a module whose dependency configure did not find, as natively)
+CPYB_SUMMARY = re.compile(r'Checked \d+ modules \(.*\b(\d+) failed on import\)')
+
+
+def _cpyb_build_failed(line):
+    m = CPYB_SUMMARY.search(line)
+    return int(m.group(1)) > 0 if m else bool(CPYB_BUILD_FAILED.search(line))
 
 
 def cpyb(name, f, extra):
@@ -169,7 +177,7 @@ def cpyb(name, f, extra):
         if v == 'unsupported': return 'failed', f'smoke module not exercised: {msg}'
         return v, msg
     if f.get('rc') != '0': return 'failed', _fields(f, 'rc', 'sec')
-    bad = [ln for ln in extra if ln.startswith('CT-LOG make | ') and CPYB_BUILD_FAILED.search(ln)]
+    bad = [ln for ln in extra if ln.startswith('CT-LOG make | ') and _cpyb_build_failed(ln)]
     if name == 'make' and bad: return 'failed', 'rc=0, but:\n' + '\n'.join(bad[:SHOWN])
     return 'passed', ''
 

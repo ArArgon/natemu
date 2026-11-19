@@ -889,6 +889,10 @@ def test_cpyb_smoke_module_not_exercised_fails():
     r = v.cpyb('make', make, ['CT-LOG make | Could not build the ssl module!'])
     assert r[0] == 'failed' and 'Could not build the ssl module' in r[1]
     assert v.cpyb('make', make, ['CT-LOG make | Failed to build these modules:'])[0] == 'failed'
+    # make's own summary names the counts: a module missing its dependency is not a failed build (run 20261119-012841-3c3e)
+    summary = 'CT-LOG make | Checked 112 modules (33 built-in, 77 shared, 1 n/a on linux-x86_64, 0 disabled, 1 missing, {} failed on import)'
+    assert v.cpyb('make', make, [summary.format(0)])[0] == 'passed'
+    assert v.cpyb('make', make, [summary.format(2)])[0] == 'failed'
 
 
 TFD = 'CT-CASE test.test_os.TimerfdTests.test_timerfd_TFD_TIMER_ABSTIME fail'
