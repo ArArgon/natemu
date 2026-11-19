@@ -117,10 +117,10 @@ def reference(jobs, work):
     executed path and the context. QEMU's signal context is exact for registers and memory but not always for flags a `cmp`
     left lazily computed (a faulting `setcc` store after a `cmp` reports stale AF or CF, even single-stepped), so phase 2 runs
     the straight-line program with the effects of the executed path up to the fault (gen_slice2.unrolled) to its end, where the
-    capture is exact; its state is the expected one. A phase-1 context that differs from it in more than flags would be a QEMU
-    defect and is returned. Returns ([(result, summary)], [(case, differing parts)]): `summary` {unroll, path_ix, fault,
+    capture is exact; its state is the expected one. Returns [(result, summary)]: `summary` {unroll, path_ix, fault,
     executed_insns} is derived from phase 1's answer (tools/reference/answers.py: kept in the lock's aux), the result is
-    a view of the answers (phase 2's state at phase 1's RIP)."""
+    a view of the answers (phase 2's state at phase 1's RIP). (Phase 1's context against phase 2's state, QEMU against
+    QEMU, was a check of QEMU and is gone: it judged nothing of natemu's.)"""
     first, second = [], []
     for i in range(0, len(jobs), 200):      # batches bound the disk the QEMU logs take
         first += ref.run_programs(jobs[i:i + 200], work, qemu_path())[0]
@@ -131,20 +131,14 @@ def reference(jobs, work):
     for i in range(0, len(exact), 200):
         second += ref.run_programs(exact[i:i + 200], work, qemu_path())[0]
         shutil.rmtree(work / 'jobs', ignore_errors=True)
-    second, results, diffs = iter(second), [], []
+    second, results = iter(second), []
     for j, r, f in zip(jobs, first, info):
         if f['unroll']:
             t = next(second)
-            def wrong_parts(r, t=t):     # QEMU's signal context against its exact path state (QEMU against QEMU)
-                q1, q2 = r['qemu'], dict(t['qemu'], rip=r['qemu']['rip'])
-                changed = (ref.num(q1['rflags']) ^ ref.num(q2['rflags'])) & ref.num(t['rflags_compare_mask'])
-                return [k for k in ('gpr', 'memory') if q1[k] != q2[k]] + ['rflags'] * (changed != 0)
-            wrong = answers.derive(r, f'signal-context/{answers.key_of(t)}', wrong_parts)
-            if wrong: diffs.append((j['name'], wrong))
             r = answers.view(r, f'exact-path/{answers.key_of(t)}', lambda r, t=t: dict(
                 r, qemu=dict(t['qemu'], rip=r['qemu']['rip']), rflags_compare_mask=t['rflags_compare_mask'], undefined_flags=t['undefined_flags']))
         results.append((r, f))
-    return results, diffs
+    return results
 
 
 def main():
@@ -162,11 +156,9 @@ def main():
         gen.corpus(a.seed, a.count) + gen.stride_corpus(a.seed)
     plan = shard.take(cases(programs), a.shard)
     jobs = [dict(p, name=name, faults={'protect': [{'addr': pg, 'mode': mode} for mode, pg in muts]}) for name, p, muts in plan]
-    results, signal_diffs = reference(jobs, a.out / 'ref')
+    results = reference(jobs, a.out / 'ref')
     faulted = sum(1 for _, f in results if f['fault'])
     print(f'{len(plan)} cases ({len(programs)} programs); QEMU faulted in {faulted}, ran to the end in {len(plan) - faulted}', flush=True)
-    print(f'QEMU signal context differs from the exact path state in {len(signal_diffs)} cases (flags only): {signal_diffs[:12]}', flush=True)
-    assert all(set(d) <= {'rflags'} for _, d in signal_diffs), 'QEMU signal context differs from the exact path state in more than flags'
     host, runtime = vm.build()
     report, failures = [], 0
     for size in a.sizes:
