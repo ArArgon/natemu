@@ -880,7 +880,7 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
   FexcRecordOp(IROp, Node, Begin);
   if (fexc_slice1) FexcCheckTarget(Node);
   // FEXC_PUSH_RUN: the aligned registers through the op's words (FexcAlignedAfter). A forward branch inside the op meets its
-  // target with the intersection; one beyond the op leaves for an exit, a stub or a later IR block (whose start clears the set);
+  // target with the intersection (its end included); one beyond leaves for an exit, a stub or a later IR block (FexcCarried);
   // a backward branch (a bulk REP STOS loop) clears every register its loop names.
   if (FexcAlignedMask) {
     const uint32_t End = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
@@ -895,7 +895,7 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
       std::memcpy(&w, CodeData.BlockBegin + off, 4);
       const int64_t T = FexcBranchTarget(w, off);
       if (T >= 0 && (w & 0xfc000000u) != 0x94000000u) {
-        if (T > off && T < End) { auto [it, fresh] = At.try_emplace(uint32_t(T), m); if (!fresh) it->second &= m; }
+        if (T > off && T <= End) { auto [it, fresh] = At.try_emplace(uint32_t(T), m); if (!fresh) it->second &= m; }
         for (int64_t o = T; o >= Begin && o < off; o += 4) {
           uint32_t x;
           std::memcpy(&x, CodeData.BlockBegin + o, 4);
@@ -907,7 +907,10 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
       }
       m = FexcAlignedAfter(w, m);
     }
-    FexcAlignedMask = Dead ? 0 : m;
+    // A branch to the op's end (the next op's first word) meets the fall-through there.
+    if (const auto it = At.find(End); it != At.end()) m = Dead ? it->second : m & it->second;
+    else if (Dead) m = 0;
+    FexcAlignedMask = m;
   }
 }
 

@@ -3123,6 +3123,12 @@ mod tests {
         refused(FRAME, 0x10, 0xaa08_03e9, 0xaa0a_03e9, "covering its base"); // mov x9, x10: RBP not known aligned
         refused(FRAME, 0x1c, 0xf100_611a, 0xf100_511a, "covering its base"); // subs x26, x8, #0x14: RSP - 20
         refused(FRAME, 0x8, 0xb500_0440, 0xb500_0480, "reached by"); // the cbnz no longer reaches the stub
+        // fixtures random-07 with --push-run --narrow-cmp --ext-conds 4: a 64-bit div's helper path (`svc #DIV_U`, which clears
+        // every register's alignment) and its inline path meet after the op. A fexc that dropped the helper path's set kept RSP
+        // aligned and left the push at 0x184 unchecked (refused); the fixed one checks it again.
+        let e = admit(fixture!("push-run-div-merge")).unwrap_err();
+        assert!(e.contains("access at 0x184") && e.contains("covering its base"), "{e}");
+        admit(fixture!("push-run-div-fixed")).unwrap();
     }
 
     #[test]
