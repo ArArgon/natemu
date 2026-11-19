@@ -7,7 +7,9 @@ import pytest
 from testkit import inputs
 from testkit.prepare import BuildFailure
 
-SUITES = ('openssl', 'torture')
+SUITES = ('openssl', 'torture', 'libm', 'gstr', 'x86st')
+ORIG = {'openssl': 'openssl_3.5.7.orig.tar', 'torture': 'gcc-14_14.2.0.orig.tar', 'libm': 'glibc_2.41.orig.tar',
+        'gstr': 'glibc_2.41.orig.tar', 'x86st': 'linux_6.12.107.orig.tar'}
 
 
 def _fake_build(calls, extra=(), drop=()):
@@ -56,6 +58,48 @@ def test_campaign_image_key_changes_with_recipe(monkeypatch, tmp_path):
     assert inputs.campaign_image('openssl') != first
 
 
+# What each Task 8 recipe reads besides remote.sh and its own folder (its uses.txt), and a file it must not be keyed by.
+OWN = {'libm': (['correctness/libm.py', 'correctness/run-libm.sh'], 'correctness/gstr.py'),
+       'gstr': (['correctness/gstr.py', 'correctness/cpy-remote.sh', 'correctness/run-gstr.sh'], 'correctness/libm.py'),
+       'x86st': (['correctness/x86-remote.sh', 'correctness/run-x86st.sh', 'correctness/x86st-skip.txt'], 'correctness/libm.py')}
+
+
+@pytest.mark.parametrize('suite', sorted(OWN))
+def test_new_recipe_key_follows_its_files(monkeypatch, tmp_path, suite):
+    """Stubbed build: the image is keyed by the recipe's build.sh, its pins and the files its uses.txt names (the
+    scripts its build runs and the files its image carries), and not by another suite's."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    t = _tools_copy(tmp_path)
+    monkeypatch.setattr(inputs, '_tools', lambda: t)
+    calls = []
+    monkeypatch.setattr(inputs, '_in_container', _fake_build(calls))
+    own, other = OWN[suite]
+    first = inputs.campaign_image(suite)
+    staged = calls[0][1]
+    assert staged >= {f'correctness/recipes/{suite}/build.sh', f'correctness/recipes/{suite}/sources.sha256',
+                      'correctness/recipes/common.sh', 'correctness/remote.sh', 'correctness/run-repro.sh', *own}
+    assert other not in staged and not any(f.startswith('correctness/recipes/openssl/') for f in staged)
+    with open(t / other, 'a') as h: h.write('# not read by this recipe\n')
+    assert inputs.campaign_image(suite) == first and len(calls) == 1
+    for f in (f'correctness/recipes/{suite}/build.sh', f'correctness/recipes/{suite}/sources.sha256', *own):
+        text = (t / f).read_text()          # a pin file changes by a pin (it has no comments), the rest by a comment
+        (t / f).write_text('0' * 64 + text[64:] if f.endswith('.sha256') else text + '# changed\n')
+        again = inputs.campaign_image(suite)
+        assert again != first, f
+        first = again
+
+
+def test_x86st_skip_list_is_names_with_reasons():
+    """run-x86st.sh matches x86st-skip.txt's lines whole (grep -qx): an entry is a bare program name, with its reason in
+    the comment right above it, and names a program the image has (x86st-cases.txt, checked at run time as stale)."""
+    lines = (inputs._tools() / 'correctness' / 'x86st-skip.txt').read_text().splitlines()
+    assert lines and lines[0].startswith('#')
+    for i, line in enumerate(lines):
+        if not line.strip() or line.startswith('#'): continue
+        assert line.strip() == line and ' ' not in line and line.endswith('_64'), line
+        assert lines[i - 1].startswith('# ') and len(lines[i - 1]) > 4, f'{line}: no reason above it'
+
+
 def test_unknown_suite_has_no_recipe():
     with pytest.raises(BuildFailure, match='no recipe'):
         inputs.campaign_image('no-such-suite')
@@ -84,8 +128,7 @@ def test_manifest_lists_every_download_with_sha256(monkeypatch, tmp_path, suite)
     assert m['image']['file'] == f'{suite}.cpio.zst' and m['list'] == dict(m['list'], tests=2, parts=['0/2', '1/2'])
     assert (d / f'{suite}.cpio.zst').is_file() and (d / f'{suite}-cases.txt').is_file() and (d / 'log/build.log').is_file()
     assert not (d / 'src').exists() and not (d / 'work').exists()
-    if suite == 'openssl': assert any(f.startswith('openssl_3.5.7.orig.tar') for f in pinned)
-    else: assert any(f.startswith('gcc-14_14.2.0.orig.tar') for f in pinned)
+    assert any(f.startswith(ORIG[suite]) for f in pinned)
 
 
 def test_cpython_suites_are_built_by_the_cpy_recipe(monkeypatch, tmp_path):

@@ -1,6 +1,7 @@
 """The campaign harness (testkit/harness/campaign.py) and the campaigns' verdicts (tests/correctness/verdicts.py). `boot` is
 replaced by a fake that returns canned serial text: nothing here starts a VM or builds an image."""
 import pathlib
+import re
 import shutil
 import textwrap
 
@@ -579,10 +580,19 @@ def test_public_smoke_run_serials_pass(tmp_path):
 
 # --- the committed family ---
 
-def test_correctness_family_declares_openssl_and_torture():
+def test_correctness_family_declares_its_campaigns():
     family.load.cache_clear()
     fam = family.load(REPO / 'tests' / 'correctness' / 'family.toml')
-    assert {s.name for s in fam.suites} >= {'openssl', 'torture'}       # the other campaigns join (plan Tasks 8-10)
+    assert {s.name for s in fam.suites} >= {'openssl', 'torture', 'libm', 'gstr', 'x86st', 'litmus'}
+    for name in ('torture', 'libm', 'gstr', 'x86st'):   # every known non-pass names the document that records it
+        assert all(re.search(r'docs/\S+\.md', why) for why in fam.suite(name).extra['expected'].values()), name
+    assert fam.suite('x86st').extra['parts'] == 25
+    assert sorted(fam.suite('x86st').extra['expected']) == ['sigreturn_64', 'sysret_ss_attrs_64', 'test_shadow_stack_64']
+    assert list(fam.suite('gstr').extra['expected']) == ['wcsmbs/tst-wcstod-round']
+    libm = fam.suite('libm').extra['expected']      # correctness-userspace.md, finding 1: 320 by family + 12 named
+    fams = re.compile(r'math/test-(ldouble|float64x|(float|double|float32|float32x|float64)-(ldouble|float64x))-')
+    assert len(libm) == 332 and sum(map(bool, map(fams.match, libm))) == 320
+    assert all('reduced precision' in why and 'correctness-userspace.md' in why for why in libm.values())
     v = verdicts()
     for s in fam.suites:
         assert (s.kind, s.harness, s.extra['tier']) == ('judged', 'campaign', 'campaign')

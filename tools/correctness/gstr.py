@@ -30,6 +30,16 @@ for d, _, fs in os.walk(gb):
 out = os.path.join(W, 'gb-min'); shutil.rmtree(out, ignore_errors=True)
 for p in sorted(files):
     q = os.path.join(out, os.path.relpath(p, gb)); os.makedirs(os.path.dirname(q), exist_ok=True); shutil.copy2(p, q)
+# string/tst-svc reads a corpus on stdin and make's tst-svc-cmp compares its stdout with tst-svc.expect; the wrapper
+# records neither, so both are put back into tst-svc's own command (correctness-cpython-string.md, "tst-svc-cmp is an
+# output assertion"): it passes only if the program exits 0 and its output is the expected one.
+svc = [i for i, e in enumerate(lst) if e[0] == 'string/tst-svc']
+if len(svc) != 1: sys.exit(f'string/tst-svc: {len(svc)} recorded commands, want 1')
+for x in ('input', 'expect'):
+    q = os.path.join(out, 'string', 'tst-svc.' + x); os.makedirs(os.path.dirname(q), exist_ok=True)
+    shutil.copy2(os.path.join(W, 'glibc-src', 'string', 'tst-svc.' + x), q); files.add(q)
+name, cwd, cmd = lst[svc[0]]; f = os.path.join(gb, 'string', 'tst-svc.')
+lst[svc[0]] = (name, cwd, 'sh -c ' + shlex.quote(f'{cmd} < {f}input > {f}out && cmp {f}expect {f}out'))
 lst.sort()
 open(os.path.join(W, 'out', 'gstr-cmds.txt'), 'w').write(''.join('\t'.join(e) + '\n' for e in lst))
 print(f'{len(lst)} commands, {len(files)} files')

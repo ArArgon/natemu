@@ -13,7 +13,8 @@
 #             WORKDIR/py + /ct/run-cpy.sh, /ct/cpy-tests.txt (the guest runs the native build's test suite).
 #   glibc     Debian's glibc 2.41 built in WORKDIR/gb as remote.sh's glibc stage, then `make check subdirs=string` and
 #             `subdirs=wcsmbs` natively through a logging test-wrapper; gstr.py then writes out/gstr-cmds.txt, gb-min.
-#   imgg      out/gstr.cpio.zst: play rootfs + gb-min at WORKDIR/gb + /ct/run-gstr.sh, /ct/gstr-cmds.txt.
+#   imgg      out/gstr.cpio.zst: play rootfs + gb-min at WORKDIR/gb + /ct/run-gstr.sh, /ct/gstr-cmds.txt (and
+#             /ct/gstr-cases.txt when out/ has it: tools/correctness/recipes/gstr/build.sh).
 #   gnative [TAG]  run-gstr.sh natively (the build tree in WORKDIR/gb) into out/native-gstr[-TAG].txt.
 set -euo pipefail
 W=$(realpath "$1"); shift; here=$(dirname "$(realpath "$0")"); S=$W/sysroot
@@ -120,6 +121,7 @@ imgg() {
     R=$W/img-gstr; base "$R"
     mkdir -p "$R$W"; (cd "$W" && tar cf - gb-min) | tar xf - -C "$R$W"; mv "$R$W/gb-min" "$R$W/gb"
     cp "$here/run-gstr.sh" "$W/out/gstr-cmds.txt" "$R/ct/"; chmod 755 "$R"/ct/*.sh
+    [ ! -f "$W/out/gstr-cases.txt" ] || cp "$W/out/gstr-cases.txt" "$R/ct/"   # every test, by part (recipes/gstr/build.sh)
     pack "$R" gstr
 }
 

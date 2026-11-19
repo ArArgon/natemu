@@ -7,7 +7,8 @@
 #   herd       herdtools7 7.58 (src/herdtools7-7.58.tar.gz) with Debian trixie's OCaml 5.3 / dune / menhir / zarith
 #              unpacked in WORKDIR/oc (ocenv.sh), installed into WORKDIR/herd.
 #   image S..  WORKDIR/out/S.cpio.zst: the play rootfs + the correctness /init + /ct/run-S.sh + the payload
-#              (x86st: WORKDIR/x86st; litmus: WORKDIR/lit, the compiled litmus7 harnesses).
+#              (x86st: WORKDIR/x86st and tools/correctness/x86st-skip.txt; litmus: WORKDIR/lit, the compiled litmus7
+#              harnesses), and /ct/S-cases.txt when out/ has it (tools/correctness/recipes/S/build.sh).
 set -euo pipefail
 W=$(realpath "$1"); shift; here=$(dirname "$(realpath "$0")"); S=$W/sysroot
 CC="$S/usr/bin/x86_64-linux-gnu-gcc-14 --sysroot=$S"
@@ -79,8 +80,9 @@ image() {
     for s in "$@"; do
         R=$W/img-$s; rm -rf "$R"; cp -a "$W/pb/rootfs" "$R"; mkdir -p "$R/ct"
         cp "$here/init" "$R/init"; cp "$here/run-$s.sh" "$here/run-repro.sh" "$R/ct/"; chmod 755 "$R/init" "$R"/ct/run-*.sh
+        [ ! -f "$W/out/$s-cases.txt" ] || cp "$W/out/$s-cases.txt" "$R/ct/"   # every test, by part (recipes/$s/build.sh)
         case $s in
-            x86st) mkdir "$R/ct/x86st"; cp "$W"/x86st/*_64 "$R/ct/x86st/";;
+            x86st) mkdir "$R/ct/x86st"; cp "$W"/x86st/*_64 "$R/ct/x86st/"; cp "$here/x86st-skip.txt" "$R/ct/";;
             litmus) mkdir "$R/ct/lit"; cp "$W"/lit/* "$R/ct/lit/";;
         esac
         python3 "$here/play/mkcpio.py" "$R" "$W/out/$s.cpio"

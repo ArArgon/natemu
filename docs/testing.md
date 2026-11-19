@@ -251,7 +251,11 @@ paths baked into the image match the reference builds) and gives a folder with `
 (one `PART TEST` line per test, PART being the kernel's `part=` word) and `manifest.json` (every download with its URL
 and sha256). Every downloaded file is checked against a pin file in `tools/correctness/recipes` (`common/` for what all
 suites share). A build that finds no pin file writes the hashes it saw to the state folder's `repin/` and stops
-before building; check them and copy them into the recipes. Recipes so far: openssl, torture, ltp, stress, litmus, cpyt/cpyb and public (libm, gstr and x86st as they land).
+before building; check them and copy them into the recipes. Recipes: openssl, torture, ltp, stress, litmus, cpyt/cpyb,
+public, libm, gstr and x86st. The glibc math (`libm`) and string (`gstr`) recipes run
+glibc's own `make check` once in the container, only to record each test's exact command, which the guest then runs;
+the kernel x86 selftests' (`x86st`) list of tests not run (those that would stop the VM) is
+`tools/correctness/x86st-skip.txt`.
 
 A recipe may also write `<suite>-boot.txt`, one `PART [kernel=FILE] WORD...` line per part: the kernel that part boots
 (a file it built into the image folder, instead of the stock Debian kernel) and words added to its kernel command line.

@@ -1,0 +1,15 @@
+# x86st-skip.txt: the kernel x86 selftests run-x86st.sh does not run. It prints `CT-SKIP x86st NAME` for each, which the
+# campaign reports as unsupported (plan docs/superpowers/plans/2026-11-18-campaign-onboarding.md, format decision 5).
+# Only a test that stops the whole VM belongs here, since its part would never reach CT-END. A test that merely fails
+# is run and reported; a documented deviation gets an `expected` entry in tests/correctness/family.toml instead.
+# run-x86st.sh matches whole lines (grep -qx): one name per line, its reason in the comment lines above it.
+#
+# No entry at present. The five tests that stopped the VM in the November 6 campaign
+# (docs/restructure/correctness-x86-litmus.md, "Machine stops" and findings 1-2) no longer do in this tree:
+#   mov_ss_trap_64          ICEBP right after MOV SS with a data breakpoint pending: fixed (correctness-x86-litmus.md,
+#                           "ICEBP fix and validation": the full test passes at N=1 and N=4 with the containment below);
+#   sigreturn_64, sysret_ss_attrs_64, single_step_syscall_64, syscall_arg_fault_64
+#                           entering compatibility mode at CPL 3 is contained (docs/restructure/correctness-nostop.md,
+#                           section 1; runtime segments.rs refuse_compatibility): the transfer takes #GP and the process
+#                           gets SIGSEGV, the machine keeps running. sigreturn_64 and sysret_ss_attrs_64 then fail
+#                           (exit 139) and are `expected`; the other two recover in their signal handlers and pass.
