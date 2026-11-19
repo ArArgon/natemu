@@ -29,6 +29,8 @@ entry naming no test of the image is a `stale-entry` failure, reported once, on 
 import dataclasses
 import functools
 import inspect
+import atexit
+import threading
 import json
 import os
 import pathlib
@@ -85,17 +87,18 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
     end_at, how = None, None
     with open(work / 'stdout.txt', 'wb') as out, open(work / 'stderr.txt', 'wb') as err:
         p = subprocess.Popen(cmd, env=env, stdout=out, stderr=err, start_new_session=True)
+        _LIVE.add(p); _on_term()
         try:
             while p.poll() is None:
                 now = time.monotonic()
                 if now - t0 >= cap:
                     how = f'stopped at the cap of {cap:.0f} s'; break
-                if end_at is None and 'CT-END' in _read(serial): end_at = now
+                if end_at is None and end_of(_read(serial)) is not None: end_at = now
                 if end_at is not None and now - end_at > AFTER_END:
                     how = f'stopped {AFTER_END:.0f} s after CT-END'; break
                 time.sleep(POLL)
         finally:
-            _stop(p)
+            _stop(p); _LIVE.discard(p)
     took = time.monotonic() - t0
     text = _read(serial)
     note = f'{how or f"natemu exited with status {p.returncode}"} after {took:.0f} s'
@@ -103,6 +106,24 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
         tail = _read(work / 'stderr.txt').strip()[-400:]
         if tail: note += f'; natemu stderr: {tail}'
     return BootResult(end_of(text) is not None, text, note)
+
+
+_LIVE: set = set()          # natemu processes this worker started (each in its own session: a worker's group kill misses them)
+
+
+def _on_term() -> None:
+    """Once per process: on SIGTERM (the run loop stopping this worker: Ctrl-C, a unit timeout, the controller ending)
+    stop every natemu this worker started before exiting, so no VM outlives its unit or its cap."""
+    if getattr(_on_term, 'done', False) or threading.current_thread() is not threading.main_thread(): return
+    prev = signal.getsignal(signal.SIGTERM)
+
+    def handler(signum, frame):
+        for p in list(_LIVE): _stop(p)
+        if callable(prev): prev(signum, frame)
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, handler)
+    atexit.register(lambda: [_stop(p) for p in list(_LIVE)])
+    _on_term.done = True
 
 
 def _stop(p: subprocess.Popen) -> None:
@@ -169,11 +190,14 @@ def parse(serial: str) -> list[tuple[str, dict]]:
     return out
 
 
+END = re.compile(r'^[^A-Za-z0-9]*CT-END (.*)$')      # at the start of a line (console noise before it allowed)
+
+
 def end_of(serial: str) -> dict | None:
-    """The fields of the boot's last `CT-END k=v ...` line, or None when it has none."""
+    """The fields of the boot's last line starting `CT-END k=v ...`, or None when it has none. A `CT-END` inside
+    another line (a test's own output, a CT-LOG line) is not the end."""
     for raw in reversed(serial.splitlines()):
-        i = raw.find('CT-END ')
-        if i >= 0: return _kv(raw[i:].split()[1:])
+        if m := END.match(raw): return _kv(m.group(1).split())
     return None
 
 
@@ -326,8 +350,9 @@ class Campaign:
         failed = [s for s in sub if s.outcome == 'failed']
         if failed: problems.insert(0, f'{len(failed)} test(s) failed: ' + ', '.join(s.name for s in failed[:10]) +
                                    (' ...' if len(failed) > 10 else ''))
-        if problems:
-            return CaseResult('failed', summary + '\n' + '\n'.join(problems) + f'\n(serial output: {work})', sub=sub)
+        if problems:   # own: the part failed for more than its tests (no CT-END, another part's), which no known bug covers
+            return CaseResult('failed', summary + '\n' + '\n'.join(problems) + f'\n(serial output: {work})', sub=sub,
+                              own=len(problems) > (1 if failed else 0))
         return CaseResult('passed', summary, sub=sub)
 
 

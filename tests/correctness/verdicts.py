@@ -93,7 +93,9 @@ def cpyt(name, f, extra):
     `CT-CASE ID STATUS` line per case not passed. Fails on any failed or erroring case (named in the message); a module
     whose every case skipped is unsupported."""
     bad = [ln[len('CT-CASE '):] for ln in extra if ln.startswith('CT-CASE ') and ln.rsplit(None, 1)[-1] in ('fail', 'error')]
-    if f.get('fail', '0') != '0' or f.get('error', '0') != '0':
+    missing = [k for k in ('cases', 'fail', 'error') if not str(f.get(k, '')).isdigit()]
+    if missing: return 'failed', 'incomplete result line (' + ', '.join(f'{k}={f.get(k, "missing")}' for k in missing) + ')'
+    if f.get('fail') != '0' or f.get('error') != '0':
         return 'failed', _fields(f, 'cases', 'fail', 'error') + ('\n' + '\n'.join(bad[:SHOWN]) if bad else '')
     if f.get('cases') not in (None, '0') and f.get('skip') == f.get('cases'):
         return 'unsupported', f'every case skipped ({f.get("skip")})'
@@ -115,17 +117,21 @@ TIMEOUT = 240
 def stress(name, f, extra):
     """run-stress.sh: `CT-RESULT stress STRESSOR[:LABEL].rI rc=EXIT n=N pass=N skip=N fail=#fail-lines bogo=OPS sec=S`,
     with the boot's kernel log as CT-DMESG lines. Passes with rc 0, no `fail:` lines and nothing in the kernel log that
-    stress-check.py's scan flags (Oops, BUG, WARNING, lockups, stalls, ...; stress-ng's own OOM kills are expected). A
-    stressor that ran to the 240 s timeout without finishing its op count fails unless it is in TIMEOUT_OK. The kernel
-    log covers the whole boot, so a flagged line fails every stressor of the part."""
+    stress-check.py's scan flags (Oops, BUG, WARNING, lockups, stalls, ...; stress-ng's own OOM kills are expected).
+    Every field must be there and pass + skip must account for all n instances (a line without stress-ng's summary
+    fails). A stressor that ran to the 240 s timeout passes on its own verification; the timeout is noted (plan,
+    format decision 2). The kernel log covers the whole boot, so a flagged line fails every stressor of the part."""
     why = []
-    if f.get('rc') != '0': why.append(f'rc={f.get("rc")}')
-    if f.get('fail', '0') != '0': why.append(f'{f.get("fail")} fail: line(s)')
-    stressor = re.sub(r'\.r\d+$', '', name).split(':')[0]
+    nums = {}
+    for k in ('rc', 'n', 'pass', 'skip', 'fail'):
+        try: nums[k] = int(f[k])
+        except (KeyError, ValueError): why.append(f'{k}={f.get(k, "missing")}')
+    if why: return 'failed', 'incomplete result line (' + ', '.join(why) + ')' + _output(extra, 4)
+    if nums['rc'] != 0: why.append(f'rc={nums["rc"]}')
+    if nums['fail']: why.append(f'{nums["fail"]} fail: line(s)')
+    if nums['pass'] + nums['skip'] != nums['n']: why.append(f'pass {nums["pass"]} + skip {nums["skip"]} != n {nums["n"]}')
     try: sec = float(f.get('sec', '0'))
     except ValueError: sec = 0.0
-    if sec >= TIMEOUT and stressor not in TIMEOUT_OK:
-        why.append(f'ran to the {TIMEOUT} s timeout (sec={f.get("sec")}) before its op count')
     bad = _tool('stress-check').BAD
     kernel = [ln for ln in extra if ln.startswith('CT-DMESG') and bad.search(ln)]
     if kernel: why.append(f'{len(kernel)} kernel log line(s) of note in this boot:\n' + '\n'.join(kernel[:SHOWN]))
@@ -134,7 +140,7 @@ def stress(name, f, extra):
         return 'failed', '; '.join(why) + ('\n' + '\n'.join(fails[:SHOWN]) if fails else '')
     if f.get('pass') == '0' and f.get('skip', '0') not in ('0', '-'):
         return 'unsupported', f'stress-ng skipped it ({_fields(f, "pass", "skip")})' + _output(extra, 4)
-    return 'passed', _fields(f, 'bogo', 'sec')
+    return 'passed', _fields(f, 'bogo', 'sec') + (f' (ran to the {TIMEOUT} s timeout)' if sec >= TIMEOUT else '')
 
 
 @functools.cache

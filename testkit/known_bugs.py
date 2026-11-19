@@ -53,7 +53,8 @@ class Tracker:
         if rep.when != 'call' and not (rep.when == 'setup' and rep.failed): return rep
         parent = rep.nodeid.rsplit('::', 1)[0] if rep.nodeid.count('::') >= 2 else None
         m = match(rep.nodeid, self.root)
-        if m is None and rep.failed and parent is None and self.subs.get(rep.nodeid, [0, 0]) [0] and \
+        own = dict(rep.user_properties).get('testkit-own-failure')      # e.g. a campaign part without CT-END
+        if m is None and rep.failed and parent is None and not own and self.subs.get(rep.nodeid, [0, 0])[0] and \
                 not self.subs[rep.nodeid][1]:
             m = ('known-bugs-only', 'every failed sub-result of this case is a known bug')
         if m is not None and not rep.skipped:

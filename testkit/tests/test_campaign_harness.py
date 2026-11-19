@@ -411,9 +411,13 @@ def test_stress_dmesg_oops_fails():
     assert r[0] == 'failed' and 'Oops' in r[1]
     assert v.stress('vm.r1', dict(ok, fail='2'), [])[0] == 'failed'
     assert v.stress('vm.r1', dict(ok, rc='2'), [])[0] == 'failed'
-    assert v.stress('vm.r1', dict(ok, sec='240'), [])[0] == 'failed'               # ran to the timeout
-    assert v.stress('mutex.r1', dict(ok, sec='240'), [])[0] == 'passed'            # timeout_ok
-    assert v.stress('vm-rw:user.r2', dict(ok, sec='241'), [])[0] == 'failed'
+    r = v.stress('vm.r1', dict(ok, sec='240'), [])                                  # ran to the timeout: noted, not failed
+    assert r[0] == 'passed' and 'timeout' in r[1]                                   # (plan, format decision 2)
+    # review: incomplete lines failed (stress-check.py compared pass/skip with a reference run; nothing does now)
+    assert v.stress('vm.r1', {'rc': '0'}, [])[0] == 'failed'
+    assert v.stress('vm.r1', dict(ok, **{'pass': '-', 'skip': '-'}), [])[0] == 'failed'
+    assert v.stress('vm.r1', dict(ok, n='4', **{'pass': '2', 'skip': '1'}), [])[0] == 'failed'
+    assert v.cpyt('test_os', {'cases': '5'}, [])[0] == 'failed'
     oom = 'CT-DMESG [ 5.0] Out of memory: Killed process 77 (stress-ng-vm)'
     assert v.stress('vm.r1', ok, [oom])[0] == 'passed'                             # what the stressor asks for
 
@@ -535,3 +539,54 @@ def test_a_bad_list_fails_only_its_part(tmp_path, monkeypatch):
     it = types.SimpleNamespace(nodeid='n0', fam=fam, suite=suite, case='part-0', variant=family.expand(suite)[0])
     r = campaign.HARNESS.run([it], None)['n0']
     assert r.outcome == 'failed' and 'not "PART TEST"' in r.message
+
+
+
+def test_ct_end_only_at_the_start_of_a_line():
+    """Review: a CT-END inside another line (a test's output, a CT-LOG line) was taken as the part's end."""
+    from testkit.harness import campaign
+    assert campaign.end_of('CT-LOG t | echo CT-END suite=x part=0/1\n') is None
+    assert campaign.end_of('\rCT-END suite=x part=0/1 rc=0\n') == {'suite': 'x', 'part': '0/1', 'rc': '0'}
+
+
+def test_a_part_failing_on_its_own_is_not_masked_by_a_known_bug(tmp_path):
+    """Review: known_bugs reclassified a failed case whose failed sub-results were all known bugs, even when the part
+    itself failed (no CT-END): such a CaseResult is `own` and stays failed."""
+    from _pytest.reports import TestReport
+    from testkit import known_bugs
+    (tmp_path / 'tests' / 'f').mkdir(parents=True)
+    (tmp_path / 'tests' / 'f' / 'known-bugs.toml').write_text('[bug.b]\nnote = "n"\ncases = ["s/part-0::t1"]\n')
+    known_bugs._bugs.cache_clear()
+    t = known_bugs.Tracker(tmp_path)
+    mk = lambda nid, out, props=(): TestReport(nid, ('tests/f/family.toml', 0, nid), {}, out, None if out == 'passed' else 'x',
+                                               'call', user_properties=list(props))
+    t.adjust(mk('tests/f/family.toml::s/part-0::t1', 'failed'))
+    r = t.adjust(mk('tests/f/family.toml::s/part-0', 'failed', [('testkit-own-failure', '1')]))
+    assert r.failed
+
+
+def test_a_terminated_worker_stops_its_natemu(tmp_path):
+    """Review: natemu runs in its own session, so the run loop's SIGTERM/SIGKILL to the worker's group missed it and a
+    VM outlived its unit (and its cap). A worker that gets SIGTERM now stops every natemu it started."""
+    import subprocess, sys, textwrap, time
+    script = tmp_path / 'worker.py'
+    script.write_text(textwrap.dedent(f'''
+        import subprocess, sys, time
+        sys.path.insert(0, {str(paths_root())!r})
+        from testkit.harness import campaign
+        p = subprocess.Popen(['sleep', '60'], start_new_session=True)
+        campaign._LIVE.add(p); campaign._on_term()
+        print(p.pid, flush=True)
+        time.sleep(60)
+    '''))
+    w = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+    child = int(w.stdout.readline())
+    w.terminate(); w.wait(20)
+    time.sleep(0.5)
+    alive = subprocess.run(['kill', '-0', str(child)], capture_output=True).returncode == 0
+    assert not alive
+
+
+def paths_root():
+    from testkit import paths
+    return paths.repo_root()
