@@ -210,16 +210,33 @@ def entries() -> list[pathlib.Path]:
             for e in kind.iterdir() if e.is_dir() and not e.name.startswith('.')]
 
 
-def cap_bytes() -> int:
-    v = os.environ.get('NATEMU_TEST_CACHE_CAP', '100G')
+def _parse_bytes(v: str) -> int:
     return int(v[:-1]) << 30 if v[-1:] in 'Gg' else int(v)
 
 
-def gc(cap_bytes: int, roots: set[pathlib.Path]) -> list[pathlib.Path]:
-    """Delete least-recently-used entries that no live lease and no root protects, until the cache is under the cap."""
+def cap_bytes() -> int:
+    return _parse_bytes(os.environ.get('NATEMU_TEST_CACHE_CAP', '100G'))
+
+
+def reserve_bytes() -> int:
+    """Free disk the cache leaves on its volume (NATEMU_TEST_DISK_RESERVE, default 10G): on a nearly full disk the
+    cache is cleaned below its cap rather than filling the disk."""
+    return _parse_bytes(os.environ.get('NATEMU_TEST_DISK_RESERVE', '10G'))
+
+
+def free_bytes(p: pathlib.Path) -> int:
+    return shutil.disk_usage(p).free
+
+
+def gc(cap_bytes: int, roots: set[pathlib.Path], reserve: int | None = None) -> list[pathlib.Path]:
+    """Delete least-recently-used entries that no live lease and no root protects, until the cache is under the cap
+    and at least `reserve` bytes (reserve_bytes()) are free on its volume, whichever asks for less cache."""
     es = entries()
     sizes = {e: size_of(e) for e in es}
     total = sum(sizes.values())
+    if es:
+        reserve = reserve_bytes() if reserve is None else reserve
+        cap_bytes = min(cap_bytes, total + free_bytes(paths.cache_root()) - reserve)
     keep = leased() | {pathlib.Path(r) for r in roots}
     deleted = []
     import time as _t

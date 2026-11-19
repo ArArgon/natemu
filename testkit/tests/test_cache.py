@@ -80,6 +80,28 @@ def test_gc_respects_leases_and_roots(root):
         holder.kill(); holder.join()
 
 
+def test_gc_keeps_the_disk_reserve_free_under_a_large_cap(root, monkeypatch):
+    big = b'0' * 100_000
+    es = [cache.get_or_build('x', f'e{i}', lambda d: (d / 'f').write_bytes(big)) for i in range(4)]
+    monkeypatch.setattr(cache, 'free_bytes', lambda p: 50_000)
+    deleted = cache.gc(cap_bytes=100 << 30, roots={es[3]}, reserve=200_000)
+    assert len(deleted) >= 2 and es[3].exists()                 # 150 kB had to go so that 200 kB stays free
+    assert not any(e.exists() for e in deleted)
+
+
+def test_gc_deletes_nothing_with_room_on_disk_and_under_the_cap(root, monkeypatch):
+    es = [cache.get_or_build('x', f'e{i}', lambda d: (d / 'f').write_bytes(b'0' * 100_000)) for i in range(2)]
+    monkeypatch.setattr(cache, 'free_bytes', lambda p: 50 << 30)
+    assert cache.gc(cap_bytes=100 << 30, roots=set(), reserve=10 << 30) == [] and all(e.exists() for e in es)
+
+
+def test_reserve_parse(monkeypatch):
+    monkeypatch.setenv('NATEMU_TEST_DISK_RESERVE', '3G')
+    assert cache.reserve_bytes() == 3 << 30
+    monkeypatch.delenv('NATEMU_TEST_DISK_RESERVE')
+    assert cache.reserve_bytes() == 10 << 30
+
+
 def test_key_directory_stable(tmp_path):
     for top in ('a', 'b'):
         (tmp_path / top / 'sub').mkdir(parents=True)
