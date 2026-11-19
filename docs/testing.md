@@ -246,3 +246,9 @@ paths baked into the image match the reference builds) and gives a folder with `
 and sha256). Every downloaded file is checked against a pin file in `tools/correctness/recipes` (`common/` for what all
 suites share). A build that finds no pin file writes the hashes it saw to the state folder's `repin/` and stops
 before building; check them and copy them into the recipes. OpenSSL and torture have recipes so far.
+
+A recipe may also write `<suite>-boot.txt`, one `PART [kernel=FILE] WORD...` line per part: the kernel that part boots
+(a file it built into the image folder, instead of the stock Debian kernel) and words added to its kernel command line.
+The public campaign (`recipes/public`) uses it: its kernel test modules (KUnit, atomic64, bitmap, vmalloc, lock and RCU
+torture) run on a 6.12.107 kernel it builds, since Debian's kernel ships none of them, and every row gets its guest
+time limit as `pubcap=300`.

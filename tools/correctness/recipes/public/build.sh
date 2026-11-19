@@ -82,16 +82,16 @@ done
 cp "$KS/arch/x86/boot/bzImage" "$W/out/$SUITE-kernel"
 
 say "selftests"
-(cd "$KS" && make headers_install INSTALL_HDR_PATH="$W/uapi" > "$W/log/headers.log" 2>&1)
+(cd "$KS" && make headers > "$W/log/headers.log" 2>&1) || { tail -20 "$W/log/headers.log" >&2; exit 1; }   # usr/include (headers_install needs rsync)
 S=$KS/tools/testing/selftests
 for family in rseq futex/functional membarrier ptrace; do
     name=${family//\//-}; o=$P/opt/public/$name; mkdir -p "$o"
-    make -C "$S/$family" -j"$J" OUTPUT="$o" KHDR_INCLUDES=-I"$W/uapi/include" > "$W/log/$name-build.log" 2>&1 \
+    make -C "$S/$family" -j"$J" OUTPUT="$o" KHDR_INCLUDES=-I"$KS/usr/include" > "$W/log/$name-build.log" 2>&1 \
         || { tail -20 "$W/log/$name-build.log" >&2; exit 1; }
 done
 o=$P/opt/public/mm; mkdir -p "$o"
 for t in mremap_dontunmap mremap_test madv_populate cow map_fixed_noreplace; do
-    make -C "$S/mm" OUTPUT="$o" KHDR_INCLUDES=-I"$W/uapi/include" "$o/$t" >> "$W/log/mm-build.log" 2>&1 \
+    make -C "$S/mm" OUTPUT="$o" KHDR_INCLUDES=-I"$KS/usr/include" "$o/$t" >> "$W/log/mm-build.log" 2>&1 \
         || { tail -20 "$W/log/mm-build.log" >&2; exit 1; }
 done
 find "$P/opt/public" -name '*.o' -delete
