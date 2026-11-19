@@ -55,3 +55,53 @@ def test_judge_accepts_any_valid_approximation_and_reads_consumed_ones_from_a_pr
     _, problems = approx.judge(p, fp.Q, list(st2[2]),
                                approx.prefix_reader(p, fp.Q, lambda q: list(approx.run(q, fp.Q, bad)[0][2])))
     assert any('over 1.5 * 2^-12' in x for x in problems)
+
+
+def _bits(f):
+    import struct
+    return struct.unpack('<I', struct.pack('<f', f))[0]
+
+
+def _value(b):
+    import struct
+    return struct.unpack('<f', struct.pack('<I', b))[0]
+
+
+def _processor(err):
+    """A processor whose approximations err by `err(kind, x)` (a relative error) from the true value of their own source."""
+    import math
+
+    def choose(i, kind, x, r):
+        ru = approx.rule(kind, x)
+        if ru[0] == 'exact': return ru[1]
+        t = 1 / abs(_value(x)) if kind == 'rcp' else 1 / math.sqrt(_value(x))
+        return _bits(t * (1 + err(kind, x))) | (x & 0x80000000 if kind == 'rcp' else 0)
+    return choose
+
+
+def _judge(p, choose):
+    st, _ = approx.run(p, fp.Q, choose)
+    return approx.judge(p, fp.Q, list(st[2]),
+                        approx.prefix_reader(p, fp.Q, lambda q: list(approx.run(q, fp.Q, choose)[0][2]))), st
+
+
+def test_chained_approximations_are_judged_against_their_real_source():
+    """i8-forms-014: `vrcpps xmm13, xmm11` reads `vrcpps xmm11, xmm3`'s result (review of 3ef8cff8, finding 1)."""
+    import zlib
+    p = _program('i8', 'i8-forms-014')
+    mixed = lambda kind, x: (1 if zlib.crc32(x.to_bytes(4, 'little')) & 1 else -1) * 0.9 * 1.5 * 2 ** -12   # a mixed-sign table
+    (got, problems), st = _judge(p, _processor(mixed))
+    assert problems == [] and got == st
+    # each value 0.97 * bound away from the true value of the *model's* source: chained ones are ~1.9 * bound off theirs
+    kinds, ev = approx.sinks(p, fp.Q)
+    import math
+    nominal = {i: x for i, (_, _, x, _) in enumerate(ev)}
+
+    def off(i, kind, x, r):
+        ru = approx.rule(kind, x)
+        if ru[0] == 'exact': return ru[1]
+        x0 = nominal[i]
+        t = 1 / abs(_value(x0)) if kind == 'rcp' else 1 / math.sqrt(_value(x0))
+        return _bits(t * (1 + 0.97 * 1.5 * 2 ** -12)) | (x0 & 0x80000000 if kind == 'rcp' else 0)
+    (_, problems), _ = _judge(p, off)
+    assert any('over 1.5 * 2^-12' in x for x in problems)

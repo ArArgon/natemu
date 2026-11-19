@@ -91,36 +91,42 @@ def run(program, mode, choose):
 
 
 def sdm_or(values):
-    """A chooser: the SDM's fixed results, else values[i], else the model's (correctly rounded) value."""
+    """A chooser: the SDM's fixed results, else values[i], else the model's value when the SDM allows it (in RCP's tiny
+    band QEMU's denormal is not allowed: 0.0 of the source's sign stands in)."""
     def c(i, kind, x, r):
         ru = rule(kind, x)
-        return ru[1] if ru[0] == 'exact' else values.get(i, r)
+        if ru[0] == 'exact': return ru[1]
+        if i in values: return values[i]
+        return r if valid(kind, x, r) is None else (x >> 31) << 31
     return c
 
 
-PERTURB = (0x1, 0x7ff, 0x400000, 0x7fffff)      # changes to the result's mantissa: a low bit hides behind a rounding or a
-                                               # high-bits extract, a high one behind a low-bits use; any of them shows a use
+# Changes to a result when looking for its uses: both directions in magnitude (bits + / -), a low bit (hides behind a
+# rounding or a high-bits extract) and high bits (hide behind a low-bits use). A use any of them shows is a use.
+PERTURB = (lambda r: r ^ 0x1, lambda r: r + 0x7ff, lambda r: r - 0x7ff, lambda r: r ^ 0x400000, lambda r: r ^ 0x7fffff)
 
 
 def sinks(program, mode):
     """Per event: (class, [(addr, off)]) where the list holds the final memory words that keep the result unchanged and
-    the class is 'fixed' (the SDM fixes the result), 'dead' (nothing final depends on it), 'copies' (only those words
-    do) or 'consumed' (later instructions compute with it)."""
+    the class is 'fixed' (the SDM fixes the result for the model's source), 'dead' (nothing final depends on it),
+    'copies' (only those words do) or 'consumed' (later instructions compute with it). Locations depend on the
+    program's data flow, not on the values, so the judge uses them with natemu's values too."""
     default = sdm_or({})
     base, ev = run(program, mode, default)
     out = []
     for i, (_, kind, x, r) in enumerate(ev):
         r = default(i, kind, x, r)
         copies, other = None, False
-        for d in PERTURB:
-            st, _ = run(program, mode, lambda j, k, y, q, i=i, d=d, r=r: (r ^ d) if j == i else default(j, k, y, q))
+        for f in PERTURB:
+            q = f(r) & 0xffffffff
+            st, _ = run(program, mode, lambda j, k, y, z, i=i, q=q: q if j == i else default(j, k, y, z))
             here = set()
             other |= st[0] != base[0] or st[1] != base[1]
             mb, ms = dict(base[2]), dict(st[2])
             for a in mb:
                 d0, d1 = mb[a], ms[a]
                 for w in sorted({k - k % 4 for k in range(len(d0)) if d0[k] != d1[k]}):
-                    if int.from_bytes(d0[w:w + 4], 'little') == r and int.from_bytes(d1[w:w + 4], 'little') == r ^ d:
+                    if int.from_bytes(d0[w:w + 4], 'little') == r and int.from_bytes(d1[w:w + 4], 'little') == q:
                         here.add((a, w))
                     else: other = True
             if copies is not None and here != copies: other = True
@@ -153,25 +159,30 @@ def word_diffs(expected, got, limit=6) -> list[str]:
 def judge(program, mode, mem, prefix_value):
     """(expected final state as the model gives it with natemu's approximations, [problems]). `mem` is natemu's final
     memory as [(addr, bytes)]; `prefix_value(event index, instruction index)` returns natemu's result of that event from
-    a prefix run, or None."""
+    a prefix run, or None. Each value is checked against its source as the replay computes it with natemu's earlier
+    values, so an approximation of an approximation is judged against what natemu really fed it."""
     kinds, ev = sinks(program, mode)
-    values, problems = {}, []
+    where = lambda i: f"`{program['asm'][ev[i][0]]}` (instruction {ev[i][0]})"
+    seen, problems = {}, []
     for i, ((n, kind, x, r), (cls, at)) in enumerate(zip(ev, kinds)):
         if cls == 'dead': continue
-        where = f"`{program['asm'][n]}` (instruction {n})"
         got = {word(mem, a, o) for a, o in at}
+        if None in got: problems.append(f'{where(i)}: its result is missing from the final memory'); continue
         if len(got) > 1:
-            problems.append(f'{where}: copies of one result differ ({", ".join(sorted(map(hex, got)))})'); continue
-        v = got.pop() if got else None
-        if cls == 'fixed':
-            if v is not None and (why := valid(kind, x, v)): problems.append(f'{where}: {why}')
-            continue
-        if v is None: v = prefix_value(i, n)
-        if v is None:
-            problems.append(f'{where}: its result is consumed and could not be read'); continue
-        if why := valid(kind, x, v): problems.append(f'{where}: {why}')
-        values[i] = v
-    st, _ = run(program, mode, sdm_or(values))
+            problems.append(f'{where(i)}: copies of one result differ ({", ".join(sorted(map(hex, got)))})'); continue
+        if got: seen[i] = got.pop()
+        elif cls == 'consumed':
+            v = prefix_value(i, n)
+            if v is None: problems.append(f'{where(i)}: its result is consumed and could not be read')
+            else: seen[i] = v
+
+    def choose(i, kind, x, r):
+        ru, v = rule(kind, x), seen.get(i)
+        if v is not None and (why := valid(kind, x, v)): problems.append(f'{where(i)}: {why}')
+        if ru[0] == 'exact': return ru[1]
+        if v is None: return r if valid(kind, x, r) is None else (x >> 31) << 31
+        return v
+    st, _ = run(program, mode, choose)
     return st, problems
 
 

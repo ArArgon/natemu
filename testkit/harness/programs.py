@@ -211,7 +211,9 @@ class Programs:
                 got = normalize(p, vm, int(m, 16) if m else None)
                 if judged:
                     run_prefix = lambda q, it=it, e=e: self._prefix_memory(n, fexc, q, e, pathlib.Path(td) / 'prefix' / q['name'], it)
-                    problems += self._judge_approx(suite, p, vm, want, int(m, 16) if m else None, got, run_prefix)
+                    try: problems += self._judge_approx(suite, p, vm, want, int(m, 16) if m else None, got, run_prefix)
+                    except Exception as ex:                    # this case fails, never the whole batch
+                        problems.append(f'approx judge failed: {type(ex).__name__}: {ex}')
                 elif hashlib.sha256(got).hexdigest() != want:
                     problems.append('final state differs from the locked answer'
                                     + ('' if not config.getoption('diff') else ': ' + self._diff(p, vm)))
