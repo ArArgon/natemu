@@ -73,7 +73,7 @@ def blocks(p):
     """I2: a REP string instruction ends its block, so a program with one is checked as one sub-program per block: the
     bytes and `asm`/`insns` from each block's start through its REP (the last one through the end)."""
     import ref   # tools/reference (on the path of the callers that pass programs with `asm`)
-    asm = p['asm']
+    asm = [l for l in p['asm'] if not l.endswith(':')]   # (the flow corpora list their label lines `L1:`, `Lend:` in `asm` too; `insns` has none)
     cuts = [i + 1 for i, a in enumerate(asm) if re.match(r'(rep|repe|repne)\s|lock neg\s', a)]   # (I3: LOCK NEG ends its block too)
     # I5a: LDMXCSR/STMXCSR are system instructions (a block ends before one; the resident executes it): skipped.
     system = {i for i, a in enumerate(asm) if re.match(r'(ld|st)mxcsr\s', a)}
@@ -122,6 +122,14 @@ def expected(asm):
         if mem:
             return [('pop', ptr(ops[0])), ('store', ptr(ops[0]))]
         return [('pop', 2 if ops[0] in WORD_REGS else 8)]
+    # Flow corpora (gen_slice2): a direct call pushes its return address, a ret loads it from the stack, a jmp/call through
+    # memory loads its qword target (and the call pushes).
+    if mn == 'call':
+        return [('load', 8), ('push', 8)] if mem else [('push', 8)]
+    if mn == 'ret':
+        return [('load', 8)]
+    if mn == 'jmp' and mem:
+        return [('load', 8)]
     if not mem or mn == 'lea':
         return []
     assert len(mem) == 1, asm
@@ -308,13 +316,24 @@ def check_program(p, tmp):
         return ([] if ok else [('ERROR', f"no code: {d.get('error')} {d.get('guest')}")]), 0
     sites = d['sites']
     insts = [i for i in d['guest']['instructions'] if i['translated']]
-    asm = p['asm']
+    asm = [l for l in p['asm'] if not l.endswith(':')]   # the flow corpora's `asm` lists label lines (`L1:`, `Lend:`) too
     want_end = 'end_of_input'
     if PROFILE:
         cut = first_cut(asm)
         if cut is not None:
             asm, want_end = asm[:cut], 'unsupported_form'
     if asm and re.match(r'(rep|repe|repne)\s|lock neg\s', asm[-1]): want_end = 'block_ending_instruction'   # I2/I3: a REP or LOCK NEG ends its block
+    branch = re.compile(r'(j\w+|loop\w*|call|ret)\b')
+    reason = d['guest']['end']['reason']
+    if PROFILE and 0 < len(insts) < len(asm) and reason == 'block_ending_instruction' and branch.match(asm[len(insts) - 1]):
+        # A flow program (gen_slice2): the unit ends at a branch it translated. Check it, then the rest as the next unit(s).
+        lo = sum(i['size'] for i in insts)
+        head = dict(p, asm=asm[:len(insts)], code=p['code'][:2 * lo])
+        tail = dict(p, name=f"{p['name']}/{len(insts)}", asm=asm[len(insts):], code=p['code'][2 * lo:], rip=hex(int(p['rip'], 16) + lo))
+        (a, x), (b, y) = check_program(head, tmp), check_program(tail, tmp)
+        return a + b, x + y
+    if branch.match(asm[-1]) if asm else False:
+        want_end = reason if reason in (want_end, 'block_ending_instruction') else want_end   # a unit may end at its branch
     if len(insts) != len(asm) or d['guest']['end']['reason'] != want_end:
         return [('ERROR', f"translated {len(insts)} of {len(asm)} instructions, end={d['guest']['end']['reason']} (want {want_end})")], 0
     if want_end == 'unsupported_form' and int(d['guest']['end']['rip'], 16) != int(p['rip'], 16) + sum(i['size'] for i in insts):
@@ -362,7 +381,7 @@ def check_program(p, tmp):
         seg = seg and seg[1]
         ss = s['kind'] in ('push', 'pop', 'push_pair', 'pop_pair') or \
             bool((seg not in ('fs', 'gs') and re.search(r'\[(rsp|rbp)\b', a)) and s['kind'] in ('load', 'store', 'swap', 'atomic', 'load_pair', 'store_pair')) or \
-            (mn == 'leave' and s['kind'] == 'load')
+            (mn in ('leave', 'ret') and s['kind'] == 'load')
         if (s['segment'] == 'ss') != ss:
             problems.append(('ERROR', f'guest +{s["guest_offset"]} "{a}": segment {s["segment"]}'))
         if not s['located']:
