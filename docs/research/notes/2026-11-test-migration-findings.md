@@ -155,3 +155,12 @@ What each kind means for the references:
 - The FP deviation tags (tools/models/afp_fp/predictions.json) predated the current i8 corpus: regenerated from the model
   alone (38 tags in -01, 63 in -02); all fast-mode failures on the M2 Max are documented NaN deviations.
 - `test_fp_deviations` and `run_slice1_vm` resolved the corpus folder's symlink and looked up the wrong tags.
+- glibc math expected only an AFP host's results: on the M2 Max (fast mode, no FEAT_AFP; run 20261119-074340-e04f) 22
+  fma and narrowing add/sub/mul/div tests fail, every failure line a spurious `Exception "Underflow" set`, the
+  documented `band-ue-flag` deviation (docs/floating-point.md). They pass on the M3 and must there: the campaign harness
+  now has `expected_without.<feature>` (expected only on a host lacking that FEAT), and libm lists the 22 under `afp`.
+  The rerun gives 1,452 passed, 354 expected-fail, 54 unsupported, 0 failed.
+- The stress-ng suite's 900 s cap per boot was the original campaign's, set on the M2, where ipc1 already took about
+  15 min per boot. At full size (scale=1, timeout=240) on the M3 (4 performance cores; run 20261119-043949-c2b0) ipc1,
+  code1, split and split2 passed it: 151 of 153 stressor runs passed, 1 expected-fail, 5 never reached. The cap only
+  guards against a hang and is now 1,800 s.

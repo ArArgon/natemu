@@ -55,7 +55,7 @@ def test_stress_suite_parts_match_the_cases():
     got = _cases_module().cases(LIST.read_text())
     assert s.extra['parts'] == len(dict.fromkeys(p for p, _ in got)) == 18
     assert (s.kind, s.harness, s.extra['tier'], s.extra['cap'], s.extra['verdict']) == \
-        ('judged', 'campaign', 'campaign', 900, 'verdicts:stress')
+        ('judged', 'campaign', 'campaign', 1800, 'verdicts:stress')
     build = (CT / 'recipes' / 'stress' / 'build.sh').read_text()
     assert re.search(r'^PARTS=18\b', build, re.M)
     assert 'built.sha256' in build and not re.search(r'^[^#]*53140a75', build, re.M)   # recorded, never pinned

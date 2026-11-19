@@ -392,6 +392,33 @@ smoke = ["part-0"]    # its only part
 "math/test-nan-payload" = "natemu runs x87 in reduced precision: an 80-bit NaN payload in the low 11 significand bits, which a double does not hold (finding 4) (docs/restructure/correctness-userspace.md:149, finding 1)"
 "math/basic-test" = "natemu runs x87 in reduced precision: isinf of a long double is |x| > LDBL_MAX, and LDBL_MAX loads as +inf (finding 4) (docs/restructure/correctness-userspace.md:149, finding 1)"
 
+[suite.expected_without.afp]
+# Only on a Mac without FEAT_AFP (M1, M2), whose fast mode has the documented band-ue-flag deviation: these 22 fail
+# only on spurious "Underflow" flags in fma and narrowing add/sub/mul/div tests (M2 Max, run 20261119-074340-e04f).
+# On a host with AFP (M3, M4) they pass and must (docs/research/notes/2026-11-test-migration-findings.md).
+"math/test-double-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float-double-add" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float-double-div" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float-double-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float-double-mul" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float-double-sub" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float32x-add" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float32x-div" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float32x-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float32x-mul" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float32x-sub" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float64-add" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float64-div" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float64-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float64-mul" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-float64-sub" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32x-float64-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32x-float64-mul" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float32x-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+"math/test-float64-fma" = "band-ue-flag: fast mode on a host without FEAT_AFP sets Underflow for a result that rounds up to the smallest normal (x86 judges tininess after rounding; docs/floating-point.md)"
+
 [[suite]]
 name = "gstr"
 kind = "judged"
@@ -554,13 +581,15 @@ tier = "campaign"
 # runs, each stopped by its op count or stress-ng's timeout. part_args are run-stress.sh's own options, appended to each
 # part's word: scale=X runs round(OPS * X) operations per stressor, timeout=T is stress-ng's --timeout (outer kill
 # T + 160 s). The original campaign is scale=1,timeout=240 over all 18 families, run on request: about 2 h 20 min of
-# boots at 4 vCPUs (its N=4 boots took 1-13 min each; 900 s cap per boot, docs/restructure/correctness-stress.md):
+# boots at 4 vCPUs (its N=4 boots took 1-13 min each on the M2; a 900 s cap per boot there,
+# docs/restructure/correctness-stress.md). The cap here is 1,800 s: at full size ipc1, code1, split and split2 passed
+# 900 s on the M3 (4 performance cores; run 20261119-043949-c2b0), and the cap only guards against a hang:
 #   TESTKIT_PART_ARGS=stress:scale=1,timeout=240 tools/natemu-test run --tier campaign tests/correctness/family.toml -k stress
 # (TESTKIT_PART_ARGS's `stress:` entry replaces this suite's part_args for that run; empty: none, run-stress.sh's
 # defaults, the same). Here: a smoke setting that only proves the campaign works end to end. --tier campaign runs all
 # 18 parts at it; the smoke list selects only mem1 (part-0, 12 stressors).
 parts = 18
-cap = 900
+cap = 1800
 part_args = "scale=0.05,timeout=20"
 smoke = ["part-0"]
 verdict = "verdicts:stress"

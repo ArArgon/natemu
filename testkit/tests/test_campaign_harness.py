@@ -304,6 +304,39 @@ def test_expected_entry_for_unknown_test_is_reported(setup):
     assert r1.outcome == 'passed' and not any(c == 'stale-entry' for _, c in subs(r1).values())   # once per suite
 
 
+WITHOUT_AFP = '''
+    expected_without.afp = { "default:test_a" = "band-ue-flag: fast mode without FEAT_AFP (docs/x.md)" }
+    '''
+BAD_A = 'CT-RESULT openssl default:test_a rc=1 ok=2 notok=1', 'CT-RESULT openssl generic:test_a rc=0 ok=3 notok=0'
+
+
+def test_expected_without_a_feature_applies_on_a_host_lacking_it(setup, monkeypatch):
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=0')
+    run, _, _ = setup(OSSL_LIST, {'0/2': serial('0/2', *BAD_A)}, extra=WITHOUT_AFP)
+    res = run('part-0')
+    assert res.outcome == 'passed', res.message
+    assert subs(res)['default:test_a'] == ('skipped', 'expected-fail')
+    assert 'band-ue-flag' in next(s.longrepr for s in res.sub if s.name == 'default:test_a')
+
+
+def test_expected_without_a_feature_must_pass_on_a_host_with_it(setup, monkeypatch):
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=1')
+    run, _, _ = setup(OSSL_LIST, {'0/2': serial('0/2', *BAD_A)}, extra=WITHOUT_AFP)
+    res = run('part-0')
+    assert res.outcome == 'failed' and subs(res)['default:test_a'] == ('failed', None)
+
+
+@pytest.mark.parametrize('features', ['afp=0', 'afp=1'])
+def test_expected_without_entry_for_unknown_test_is_reported_on_any_host(setup, monkeypatch, features):
+    extra = '''
+        expected_without.afp = { "default:test_renamed" = "band-ue-flag (docs/x.md)" }
+        '''
+    ok0 = serial('0/2', 'CT-RESULT openssl default:test_a rc=0 ok=3 notok=0', 'CT-RESULT openssl generic:test_a rc=0 ok=3 notok=0')
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', features)
+    run, _, _ = setup(OSSL_LIST, {'0/2': ok0}, extra=extra)
+    assert subs(run('part-0'))['expected_without.afp:default:test_renamed'] == ('failed', 'stale-entry')
+
+
 def test_unsupported_and_expected_is_neither_pass_nor_fail(setup):
     listing = '0/1 test-a\n0/1 test-b\n'
     text = serial('0/1', 'CT-RESULT libm test-a rc=77', 'CT-RESULT libm test-b rc=0', suite='libm')

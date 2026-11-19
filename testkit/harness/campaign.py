@@ -9,6 +9,9 @@ run and nothing is locked: no QEMU, no x86 machine.
     verdict = "verdicts:fn"     fn(name, fields, extra) -> (passed | failed | unsupported | unverified, message), from a
                                 file in the family folder; a verdict that takes `image` also gets the image's folder
     expected = { test = "why (the document that records it)" }    known non-passes
+    expected_without.FEAT = { test = "why" }    known non-passes only on a host lacking FEAT_<FEAT> (lowercased, as
+                                testkit/host.py reads hw.optional.arm: libm's band-ue-flag tests without afp); on a
+                                host with it they are judged as any other test and must pass
     flaky = { test = "why" }    timing-sensitive tests: a failure reruns the part once
     verdict_flaky = true        the verdict may itself return `flaky` (a test whose only failures are known
                                 timing-sensitive cases, as CPython's TimerfdTests): the part is rerun once, as for a
@@ -56,7 +59,7 @@ import signal
 import subprocess
 import time
 
-from testkit import artifacts, family, resources
+from testkit import artifacts, family, host, resources
 from testkit.harness import CaseResult, Requirement, SubResult
 
 AFTER_END = 30.0            # seconds the guest gets to power off after CT-END (boot.py's), then it is stopped
@@ -374,6 +377,10 @@ class Campaign:
         cap = float(ex.get('cap', 3600))
         vcpus = int(variant.get('machine.vcpus', 4))
         expected, flaky = dict(ex.get('expected', {})), dict(ex.get('flaky', {}))
+        without = {f: dict(d) for f, d in ex.get('expected_without', {}).items()}
+        have = host.detect().features
+        for f, d in without.items():
+            if not have.get(f): expected.update(d)
         img = image(suite.name)
         parts = read_list(img, suite.name)
         declared = int(ex.get('parts', 1))
@@ -427,7 +434,8 @@ class Campaign:
                 sub.append(SubResult(name, 'failed', f'not in the image\'s list for part {part} ({v}: {msg})'))
         if k == 0:
             every = {t for _, ts in parts for t in ts}
-            for kind, d in (('expected', expected), ('flaky', flaky)):
+            for kind, d in (('expected', dict(ex.get('expected', {}))), ('flaky', flaky),
+                            *((f'expected_without.{f}', d) for f, d in without.items())):
                 for name, why in d.items():
                     if name not in every:
                         sub.append(SubResult(f'{kind}:{name}', 'failed', f'the {kind} entry names no test the image '
