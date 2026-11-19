@@ -12,7 +12,9 @@ tools/bench/smp/irqs.py).
   rotation and special mask); the TMR following each acceptance's trigger (54H level from pin 4, then as a self IPI:
   TMR 1 then 0, the second EOI broadcasting nothing). Destinations at 2, 3, 4 CPUs in x2APIC mode (QEMU's BSP mode with peers): physical each,
   logical (two sets), lowest priority, NMI, level to a peer whose handler lowers the line (its EOI broadcast). Judged by
-  the datasheet/SDM model below (`model_problems`) and the bytes each program sends to the UART (`UART_WANT`).
+  the datasheet/SDM model below (`model_problems`) and the bytes each program sends to the UART (`UART_WANT`). The
+  model judges counts, the DATA slots and the per-handler slots; the per-delivery log (frame RIP, marker R12, PPR, ISR,
+  IRR, TPR), which pinned QEMU's comparison covered, is not judged.
 - `xapic` (natemu only, Linux's path; QEMU's BSP cannot be xAPIC with peers): the destination program at 2, 3, 4 CPUs
   with flat logical IDs, counts by the model; LVT LINT0 fixed (edge, 45H): each rise of the 8259's output one 45H with no
   INTA (QEMU passes the 8259 through in any mode, so not compared), then the APIC hardware disabled: the 8259 wired
