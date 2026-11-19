@@ -1842,16 +1842,25 @@ impl<'a> Verifier<'a> {
                 ));
             }
             // An exit a branch inside the unit reaches is the exit of one guest instruction: the one whose code starts at the
-            // exit (a skip branch of the instruction before it lands there), else the branch's own (a conditional's taken
+            // exit if the branch comes from the instruction right before it (its skip branch), else the branch's own (a conditional's taken
             // exit, placed after the last instruction). Only the unit's last instruction may exit to the whole set (end,
             // ...); another goes to its own direct target (or retries at its own RIP: CLI, STI, SWAPGS, VERW).
             let last = (self.c.pcs.iter().map(|p| p.guest_offset))
                 .filter(|&g| g < self.c.guest_bytes)
                 .max();
             for &(src, _) in self.branches.iter().filter(|&&(_, t)| t == offset) {
-                let owner = match self.instruction(offset) {
-                    Some((g, start)) if start == offset => Some(g),
-                    _ => self.instruction(src).map(|(g, _)| g),
+                let before = (self.c.pcs.iter().map(|p| p.guest_offset))
+                    .filter(|&o| self.instruction(offset).is_some_and(|(g, _)| o < g))
+                    .max();
+                let owner = match (self.instruction(offset), self.instruction(src)) {
+                    (Some((g, start)), Some((s, _)))
+                        if start == offset
+                            && Some(s) == before
+                            && super::branch_target(self.guest_insn(s), 0).is_none() =>
+                    {
+                        Some(g)
+                    }
+                    (_, s) => s.map(|(g, _)| g),
                 };
                 let Some(g) = owner else {
                     return Err(format!("exit at {at:#x}: its branch is outside the PC table"));
@@ -3466,6 +3475,41 @@ mod tests {
         assert!(e.contains("direct target of the branch"), "{e}");
         // The last instruction's taken exit may name the unit's end (the whole set).
         with([(0x64, 0x40_100e), (0x4c, 0x40_1015)]).unwrap();
+    }
+
+    /// With `FEXC` set: a conditional's taken branch aimed at the start of the last instruction's code (the `jmp`'s exit, not its
+    /// own) is refused: only the instruction right before may skip to the start of an instruction's code (the `ror rax, cl` test
+    /// below). A branch instruction before the last one does not count as such a skip.
+    #[test]
+    fn a_branch_to_the_start_of_the_last_instructions_code_is_not_a_skip() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("natemu-skip-admit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // jz +0x20; inc rax; jmp +0x30: the jz's `b.eq` at 4 goes to its taken exit (40); forged, to the jmp's code (28).
+        let source = [0x74, 0x20, 0x48, 0xff, 0xc0, 0xeb, 0x30];
+        let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
+        let path = dir.join("o");
+        let out = std::process::Command::new(&fexc)
+            .args(["--hex", &hex, "--rip", "0x401000", "--profile", "slice1", "--ext-conds", "4", "--push-run", "--narrow-cmp"])
+            .arg("--object")
+            .arg(&path)
+            .arg("--out")
+            .arg("/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{hex}");
+        let mut object = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let h: Header = super::super::record(&object, 0);
+        let at = (h.code_offset + 4) as usize;
+        let eq_taken = u32::from_le_bytes(object[at..at + 4].try_into().unwrap());
+        assert_eq!(eq_taken, 0x5400_0120, "b.eq to the taken exit at 40");
+        admit((&object, &source)).unwrap();
+        object[at..at + 4].copy_from_slice(&0x5400_00c0u32.to_le_bytes()); // b.eq 28
+        let e = admit((&object, &source)).expect_err("a jz skipping to the jmp's code admitted");
+        assert!(e.contains("direct target of the branch"), "{e}");
     }
 
     /// With `FEXC` set: extended blocks of every conditional form (jcc rel8 and rel32, loop*, jrcxz, with prefixes) as the host
