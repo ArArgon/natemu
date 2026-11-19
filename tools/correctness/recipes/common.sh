@@ -2,7 +2,7 @@
 # common.sh: sourced by tools/correctness/recipes/SUITE/build.sh. testkit/inputs.py:campaign_image runs build.sh in the
 # amd64 Debian builder container (artifacts.BENCH_BUILDER, through Rosetta) as root, with /recipe holding the tools/
 # files the recipe reads (its uses.txt, this file, the pins in common/ and the suite's folder; read-only) and /work
-# the output: SUITE.cpio.zst, SUITE-list.txt, downloads.txt (URL SHA256 FILE of every download) and log/.
+# the output: SUITE.cpio.zst, SUITE-cases.txt, downloads.txt (URL SHA256 FILE of every download) and log/.
 #
 # The build is tools/correctness/remote.sh's stages, unchanged, run as the user `ubuntu` with W=/home/ubuntu/ct (the
 # reference machine's layout: the paths the campaigns bake in, such as OpenSSL's OB=/home/ubuntu/ct/ob, stay the same).
@@ -93,7 +93,7 @@ root_phase() {
         3) cp -r "$REPIN" /work/repin; echo "new pins in /work/repin: build stopped" >&2; exit 1;;
         *) echo "the build as ubuntu failed (exit $rc)" >&2; exit "$rc";;   # a failure, even while re-pinning
     esac
-    cp "$W/out/$suite.cpio.zst" "$W/out/$suite-list.txt" "$W/out/downloads.txt" /work/
+    cp "$W/out/$suite.cpio.zst" "$W/out/$suite-cases.txt" "$W/out/downloads.txt" /work/
 }
 
 # mkcpio_epoch: a mkcpio.py that runs tools/play/mkcpio.py, then sets each entry's mtime to SOURCE_DATE_EPOCH.

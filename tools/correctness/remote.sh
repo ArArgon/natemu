@@ -136,17 +136,18 @@ play() {
 image() {   # image SUITE...: base rootfs + suite payload + /init (+ the kernel's config in /boot, for LTP's kconfig checks)
     K=linux-image-6.12.107+deb13-amd64_6.12.107-1_amd64.deb   # the play kernel's package (SHA-256 pinned in tools/play/build.sh)
     if [ ! -f "$W/kconfig" ]; then
-        for base in https://deb.debian.org/debian https://snapshot.debian.org/archive/debian/20260915T000000Z; do
+        # the snapshot first (what the recipes record); its hash is KDEB_SHA when the caller pins it (recipes/common.sh)
+        for base in https://snapshot.debian.org/archive/debian/20260915T000000Z https://deb.debian.org/debian; do
             curl -fsSL -o "$W/k.deb" "$base/pool/main/l/linux-signed-amd64/$K" && break
         done
-        echo "7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e99  $W/k.deb" | sha256sum -c --quiet
+        echo "${KDEB_SHA:-7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e99}  $W/k.deb" | sha256sum -c --quiet
         (cd "$W" && rm -rf kx && mkdir kx && dpkg -x k.deb kx && cp kx/boot/config-6.12.107+deb13-amd64 kconfig && rm -rf kx k.deb)
     fi
     for s in "$@"; do
         R=$W/img-$s; rm -rf "$R"; cp -a "$W/pb/rootfs" "$R"; mkdir -p "$R/ct" "$R/boot"
         cp "$W/kconfig" "$R/boot/config-6.12.107+deb13-amd64"
         cp "$here/init" "$R/init"; cp "$here/run-$s.sh" "$here/run-repro.sh" "$R/ct/"; chmod 755 "$R/init" "$R"/ct/run-*.sh
-        [ ! -f "$W/out/$s-list.txt" ] || cp "$W/out/$s-list.txt" "$R/ct/"   # every test, by part (recipes/$s/build.sh)
+        [ ! -f "$W/out/$s-cases.txt" ] || cp "$W/out/$s-cases.txt" "$R/ct/"   # every test, by part (recipes/$s/build.sh)
         case $s in
             ltp) L=$W/ltp-inst/opt/ltp; mkdir -p "$R/opt/ltp/testcases/bin"   # the kept programs (ltp-list.py), stripped
                  (cd "$L" && tar cf - --exclude=./testcases/bin .) | tar xf - -C "$R/opt/ltp"

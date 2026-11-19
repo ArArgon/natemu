@@ -17,7 +17,7 @@ def _fake_build(calls, extra=(), drop=()):
         calls.append((name, {p.relative_to(recipe).as_posix() for p in recipe.rglob('*') if p.is_file()}, kw))
         assert (recipe / kw['script']).is_file() and kw['timeout'] == inputs.CAMPAIGN_TIMEOUT
         (work / f'{suite}.cpio.zst').write_bytes(b'image')
-        (work / f'{suite}-list.txt').write_text('0/2 default:test_a\n1/2 default:test_b\n')
+        (work / f'{suite}-cases.txt').write_text('0/2 default:test_a\n1/2 default:test_b\n')
         pins = inputs.read_pins(recipe / inputs.CAMPAIGN_RECIPES)
         lines = [f'http://snapshot.example/{f} {sha} {f}' for f, (sha, _) in sorted(pins.items()) if f not in drop]
         (work / 'downloads.txt').write_text(''.join(l + '\n' for l in [*lines, *extra]))
@@ -82,7 +82,7 @@ def test_manifest_lists_every_download_with_sha256(monkeypatch, tmp_path, suite)
     assert {s['file']: s['sha256'] for s in m['sources']} == pinned
     assert all(s['url'].startswith('http') and len(s['sha256']) == 64 and s['pins'] for s in m['sources'])
     assert m['image']['file'] == f'{suite}.cpio.zst' and m['list'] == dict(m['list'], tests=2, parts=['0/2', '1/2'])
-    assert (d / f'{suite}.cpio.zst').is_file() and (d / f'{suite}-list.txt').is_file() and (d / 'log/build.log').is_file()
+    assert (d / f'{suite}.cpio.zst').is_file() and (d / f'{suite}-cases.txt').is_file() and (d / 'log/build.log').is_file()
     assert not (d / 'src').exists() and not (d / 'work').exists()
     if suite == 'openssl': assert any(f.startswith('openssl_3.5.7.orig.tar') for f in pinned)
     else: assert any(f.startswith('gcc-14_14.2.0.orig.tar') for f in pinned)

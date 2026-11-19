@@ -35,7 +35,7 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
 
 ## Format decisions (November 18, from Task 6)
 
-1. `<suite>-list.txt`: one line per test, `PART TEST`. PART is the boot's exact `part=` word, and TEST is the name
+1. `<suite>-cases.txt`: one line per test, `PART TEST`. PART is the boot's exact `part=` word, and TEST is the name
    its CT-RESULT line carries. Parts are the distinct PARTs in first-seen order, and their count is the suite's
    `parts`. Each recipe builds the list from the same files its run-S.sh reads, so the two cannot disagree.
 2. stress-ng: a stressor that runs to its 240 s timeout passes when stress-ng's own result is rc 0 with no `fail:`
@@ -112,7 +112,7 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
 - A guest that never prints `CT-END` (hang, kernel panic, watchdog) must fail the case with the last 40 serial lines,
   not pass with zero results. Task 6 test: `test_part_without_ct_end_fails_with_serial_tail`.
 - A test in the part's list but missing from a run's output (crashed mid-part) must fail as `missing`, not be
-  skipped. The list comes from the image (`/ct/<suite>-list.txt`). Task 6 test: `test_listed_test_missing_from_output_fails`.
+  skipped. The list comes from the image (`/ct/<suite>-cases.txt`). Task 6 test: `test_listed_test_missing_from_output_fails`.
 - Two campaign parts must never write the same output folder or share an image copy that one of them modifies. Task 6
   test: `test_parts_use_private_work_folders`.
 - An `expected` entry whose test now passes must not stay silently listed. Task 7 test:
@@ -236,7 +236,7 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
 **Files:**
 - Create: `tools/correctness/recipes/<suite>/build.sh` for `openssl`, `torture`, `libm`, `gstr`, `x86st`, `ltp`, `cpy` (cpyt and cpyb), `stress`, `litmus` and `public`.
   - Each script runs the matching `remote.sh` / `*-remote.sh` stages inside the container as user `ubuntu`, with `W=/home/ubuntu/ct`, so the absolute paths the campaigns bake in stay the same.
-  - It writes `/work/<suite>.cpio.zst`, `/work/<suite>-list.txt` (every test the image runs, by part) and `/work/manifest.json` (sources and their sha256).
+  - It writes `/work/<suite>.cpio.zst`, `/work/<suite>-cases.txt` (every test the image runs, by part) and `/work/manifest.json` (sources and their sha256).
 - Create: `tools/correctness/recipes/common.sh`. It holds the snapshot apt setup and the play rootfs (`tools/play/rootfs.sh`'s package set). It also folds in the fixes that were only overlays: `/dev/stdin` and `/dev/fd` links in `init`, `mkcpio.py` mtimes set to `SOURCE_DATE_EPOCH`, and GNU `stat -c %s`.
 - Create: the missing glue, as committed files:
   - the OpenSSL orig and Debian tarball pins (from the Debian `.dsc`);
@@ -249,7 +249,7 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
 - Test: `testkit/tests/test_campaign_inputs.py`
 
 **Interfaces:**
-- Produces: `inputs.campaign_image(suite) -> Path`, a folder with `<suite>.cpio.zst`, `<suite>-list.txt` and `manifest.json`.
+- Produces: `inputs.campaign_image(suite) -> Path`, a folder with `<suite>.cpio.zst`, `<suite>-cases.txt` and `manifest.json`.
 
 - [ ] **Step 1:** Write `test_campaign_image_key_changes_with_recipe` (stubbed build: editing `recipes/openssl/build.sh` changes the key) and `test_manifest_lists_every_download_with_sha256` (it parses each recipe's pin file).
 - [ ] **Step 2:** Run them. Expect FAIL.

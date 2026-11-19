@@ -12,7 +12,7 @@ run and nothing is locked: no QEMU, no x86 machine.
     flaky = { test = "why" }    timing-sensitive tests: a failure reruns the part once
     matrix = { "machine.vcpus" = [4] }
 
-The image is `inputs.campaign_image(suite)`: a folder holding `<suite>.cpio.zst` and `<suite>-list.txt`, every test the
+The image is `inputs.campaign_image(suite)`: a folder holding `<suite>.cpio.zst` and `<suite>-cases.txt`, every test the
 image runs, one `PART TEST` line each, PART being the kernel's `part=` word for that boot (`0/4`, `mem1`, `7/1`). The
 distinct PARTs, in the order the list first names them, are the parts; their number must equal `parts`.
 
@@ -202,13 +202,13 @@ def end_of(serial: str) -> dict | None:
 
 
 def read_list(img: pathlib.Path, suite: str) -> list[tuple[str, list[str]]]:
-    """The image's `<suite>-list.txt`: [(part word, [tests])] in the order the list first names each part."""
+    """The image's `<suite>-cases.txt`: [(part word, [tests])] in the order the list first names each part."""
     parts = {}
-    for line in (img / f'{suite}-list.txt').read_text().splitlines():
+    for line in (img / f'{suite}-cases.txt').read_text().splitlines():
         line = line.strip()
         if not line or line.startswith('#'): continue
         w = line.split(None, 1)
-        if len(w) != 2: raise ValueError(f'{img / f"{suite}-list.txt"}: not "PART TEST": {line!r}')
+        if len(w) != 2: raise ValueError(f'{img / f"{suite}-cases.txt"}: not "PART TEST": {line!r}')
         parts.setdefault(w[0], []).append(w[1].strip())
     return list(parts.items())
 
@@ -295,7 +295,7 @@ class Campaign:
         parts = read_list(img, suite.name)
         declared = int(ex.get('parts', 1))
         if len(parts) != declared:
-            return CaseResult('failed', f'{img / f"{suite.name}-list.txt"} has {len(parts)} parts '
+            return CaseResult('failed', f'{img / f"{suite.name}-cases.txt"} has {len(parts)} parts '
                                         f'({", ".join(p for p, _ in parts[:8])}), the suite declares parts = {declared}')
         part, tests = parts[k]
         fn = _verdict(str(fam.dir), fam.name, ex['verdict'])

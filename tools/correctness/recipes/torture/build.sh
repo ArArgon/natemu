@@ -6,7 +6,7 @@
 # each test at -O0 and -O2 (tools/correctness/torture.py). A test that does not compile fails the build: every test
 # of this gcc version compiles (correctness-userspace.md), so a missing one is a broken build, not a smaller campaign.
 #
-# torture-list.txt: `PART TEST` per program, TEST = NAME.OPT as run-torture.sh's CT-RESULT lines name it and PART the
+# torture-cases.txt: `PART TEST` per program, TEST = NAME.OPT as run-torture.sh's CT-RESULT lines name it and PART the
 # kernel's part= word. run-torture.sh K/N runs chunks K, K+N, ... of tests-*.tar.zst (200 programs each), so the list
 # is read from the chunks the image's /ct holds, in run-torture.sh's order.
 set -euo pipefail
@@ -29,7 +29,7 @@ cp "$W/torture/commands.txt" "$W/log/torture-commands.txt"
 i=0
 for c in "$W"/torture/tests-*.tar.zst; do
     zstd -q -dc --long=27 "$c" | tar -t | sort | sed "s|^|$((i % PARTS))/$PARTS |"; i=$((i + 1))
-done > "$W/out/$SUITE-list.txt"
-[ "$(wc -l < "$W/out/$SUITE-list.txt")" = "$(wc -l < "$W/torture/list.txt")" ] || { echo "the chunks do not hold list.txt's tests" >&2; exit 1; }
-say "$(wc -l < "$W/out/$SUITE-list.txt") programs listed"
+done > "$W/out/$SUITE-cases.txt"
+[ "$(wc -l < "$W/out/$SUITE-cases.txt")" = "$(wc -l < "$W/torture/list.txt")" ] || { echo "the chunks do not hold list.txt's tests" >&2; exit 1; }
+say "$(wc -l < "$W/out/$SUITE-cases.txt") programs listed"
 stage image "$SUITE" > "$W/log/image.log" 2>&1 || { tail -20 "$W/log/image.log" >&2; exit 1; }

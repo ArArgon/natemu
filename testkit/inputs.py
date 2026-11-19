@@ -13,6 +13,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 
 from testkit import artifacts, cache, paths, resources
 from testkit.prepare import BuildFailure
@@ -308,9 +309,17 @@ def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
         if p.is_dir(): shutil.copytree(p, dest, ignore=shutil.ignore_patterns('__pycache__'))
         else: shutil.copy2(p, dest)
     work.mkdir()
-    _in_container(name, src, work, memory='8g', timeout=CAMPAIGN_TIMEOUT, script=f'{CAMPAIGN_RECIPES}/{suite}/build.sh',
-                  pins_to=_tools() / CAMPAIGN_RECIPES)
-    image, listing = f'{suite}.cpio.zst', f'{suite}-list.txt'
+    try:
+        _in_container(name, src, work, memory='8g', timeout=CAMPAIGN_TIMEOUT, script=f'{CAMPAIGN_RECIPES}/{suite}/build.sh',
+                      pins_to=_tools() / CAMPAIGN_RECIPES)
+    except (BuildFailure, resources.Unpreparable) as e:
+        if (work / 'log').is_dir():          # the failed entry is deleted: keep its logs where the message says
+            keep = paths.state_dir() / 'build-logs' / f'{name}-{time.strftime("%Y%m%d-%H%M%S")}'
+            keep.parent.mkdir(parents=True, exist_ok=True); shutil.copytree(work / 'log', keep)
+            e.args = (f'{e.args[0]} (logs kept in {keep})',) + tuple(e.args[1:])
+            if hasattr(e, 'reason'): e.reason = f'{e.reason} (logs kept in {keep})'
+        raise
+    image, listing = f'{suite}.cpio.zst', f'{suite}-cases.txt'
     for f in (image, listing, 'downloads.txt'):
         if not (work / f).is_file(): raise BuildFailure(name, f'the recipe wrote no {f}')
     lines = [l.split() for l in (work / listing).read_text().splitlines() if l.strip()]
@@ -331,8 +340,8 @@ def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
 
 def campaign_image(suite: str) -> pathlib.Path:
     """The initramfs tools/correctness boots for a campaign, built here from tools/correctness/recipes/<suite> in the
-    amd64 Debian builder (common.sh): a folder with <suite>.cpio.zst, <suite>-list.txt (`PART TEST` per test, PART the
-    kernel's part= word; also /ct/<suite>-list.txt in the image), manifest.json (every download with its URL and sha256,
+    amd64 Debian builder (common.sh): a folder with <suite>.cpio.zst, <suite>-cases.txt (`PART TEST` per test, PART the
+    kernel's part= word; also /ct/<suite>-cases.txt in the image), manifest.json (every download with its URL and sha256,
     the recipe files' hashes) and log/."""
     t = _tools()
     pairs = [x for rel in campaign_sources(suite) for x in (rel, t / rel)]

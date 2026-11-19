@@ -45,7 +45,7 @@ def make_image(tmp_path, suite, listing):
     img = tmp_path / 'image'
     img.mkdir()
     (img / f'{suite}.cpio.zst').write_bytes(b'not a real image')
-    (img / f'{suite}-list.txt').write_text(textwrap.dedent(listing))
+    (img / f'{suite}-cases.txt').write_text(textwrap.dedent(listing))
     return img
 
 
@@ -532,7 +532,7 @@ def test_a_bad_list_fails_only_its_part(tmp_path, monkeypatch):
     import types
     fam, suite = make_family(tmp_path, parts=1)
     img = tmp_path / 'image'; img.mkdir()
-    (img / 'openssl-list.txt').write_text('just-a-name\n')
+    (img / 'openssl-cases.txt').write_text('just-a-name\n')
     monkeypatch.setattr(campaign, 'image', lambda name: img)
     from testkit import runloop
     monkeypatch.setattr(runloop, 'run_dir', lambda config: tmp_path / 'run')
