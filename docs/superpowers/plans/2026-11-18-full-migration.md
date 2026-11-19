@@ -189,6 +189,15 @@ answer is never stored; a run never needs QEMU). These revisions replace the tas
   steps. A check that needs no VM (a rule table, the decoder, the FP model, a parser) belongs in a unit test (cargo test or
   pytest); one that judges what natemu does when it runs guest code is an integration test, even with a static expectation.
 
+## Status (November 19)
+
+- Every check runs through testkit: the gate at 64370f68 (run 20261119-090704-89a7, M2 Max plus the M3's AFP half)
+  passed with 80,184 passed and 0 failed. The campaigns are in the campaign tier (campaign-onboarding plan).
+- Measured: the gate takes 32 min on an idle M2 Max. A run started beside it (a 151 s libm run) pushed four two-minute
+  units onto efficiency cores, where each took 7 min, and the gate took 38 min. Replay shows that holding long units
+  back for performance cores does not help a gate-sized queue (mean gate delay 96 s with today's rule, 108 s holding
+  them back), so the rule stays and gates run on an otherwise idle machine.
+
 ## Status (November 18)
 
 - **Migrated:** every `tools/run_suite.py` step runs in a family: unit, fp and programs in their own harnesses; the 148

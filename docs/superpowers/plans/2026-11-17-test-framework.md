@@ -568,6 +568,13 @@ An independent review found these; each overrides the task text above where they
   signed binaries are copied back after each. A step whose `natemu-raw` inputs are absent is `not-runnable: needs
   natemu-raw (PATH)`; a `Step.skip` maps to `not-runnable`.
 
+## Status (November 19)
+
+Full gate at 64370f68 on the M2 Max, combined with the M3's AFP half at the same commit (`--gate --with-run`, run
+20261119-090704-89a7 with m3-afp-6437): 80,184 passed, 0 failed, exit 0. Later on November 19: a worker killed
+outright no longer leaves its campaign VM running (the controller stops it), and `run --diff` shows what differs for a
+case whose locked answer is stored as a hash only. Task 17 (remote execution) stays unbuilt.
+
 ## Status (November 18)
 
 Tasks 1–16 are implemented on branch `test-framework`; an independent code review's twelve findings are fixed. Task 17

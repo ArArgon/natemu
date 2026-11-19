@@ -19,19 +19,17 @@ natemu's stub/runtime builds (`artifacts.natemu()`).
 **Spec:** docs/superpowers/specs/2026-11-17-test-framework-design.md (R1.4, R2, R3.6-R3.8, R12, R13, R14); campaign
 behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/io-plan.md.
 
-## Status (November 18, evening)
+## Status (November 19)
 
-- Done and merged on `test-framework`, each independently reviewed:
-  - Task 0: clones instead of copies;
-  - Tasks 1-3: the io campaign tier, 9 cases, all passing in one run of 13 min 49 s;
-  - Task 4: `m1-perf` in the bench tier.
+- Done on `test-framework`, each task independently reviewed: Part 0, Part A (Tasks 1-4), Part B (Tasks 5-10, all ten
+  Linux campaigns with their recipes, harness and expected lists) and Part C.
 - Scheduler (owner, November 18): fair share between runs, `vmlock.py` queuing in the same queue, no idle exclusive
-  grant, and `natemu-test replay`.
-- Open:
-  - Benchmarks as short resumable units. Replay showed an indivisible 80-minute exclusive job blocks everything
-    whatever the ordering; split, small runs' wait fell from about an hour to about 7 minutes.
-  - m1-perf set D (IO5): two runs, not rerun.
-  - Part B (Linux campaigns): Task 6's harness in progress; Task 5's images wait for the machine.
+  grant, `natemu-test replay`, light claims for remote image builds; m1-perf as 21 resumable pieces.
+- Host-dependent expectations: `expected_without.<feature>` (libm's 22 band-ue-flag tests on a Mac without AFP). libm
+  is clean on the M2 Max (1,452 passed, 354 expected-fail) and on the M3 with AFP (1,474 passed, 332 expected-fail).
+  Full-size stress-ng: every stressor run passed or was expected (cap 1,800 s; runs 20261119-043949-c2b0 and
+  20261119-075513-6fa7). Other results: docs/research/notes/2026-11-test-migration-findings.md.
+- Open: public's LKMM corpus (Task 5's last input); m1-perf set D (IO5), not rerun since November 18.
 
 ## Format decisions (November 18, from Task 6)
 
