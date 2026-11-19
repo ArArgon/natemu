@@ -263,3 +263,14 @@ def test_light_grants_neither_block_nor_wait_for_an_exclusive_window():
     assert [c for _, c in d.grants] == ['L']                      # granted while the exclusive test runs
     st_ = State(held=[Grant(req(light=True), 0.0, 'L') for _ in range(8)], waiting=[req(cores=4, perf=True)])
     assert [c for _, c in decide(st_, CFG, 1.0).grants] == ['P']  # light grants take no cores
+
+
+def test_a_starved_request_is_not_held_back_by_a_pending_window():
+    """A campaign part (no recorded duration) waited 48 minutes: a stream of exclusive tests kept a window pending, and
+    rule 3 refused it every time. Once its run is starved (rule 7) it is granted and the window waits for it."""
+    cfg = Config(p_cores=8, e_cores=4, window_budget=100, min_shared=20, starve_after=1800)
+    part = req(cores=4, perf=True, asked=0.0, run='campaign')
+    st_ = State(held=[Grant(req(cores=1, expected=30, run='gate'), 1000.0, 'P')],
+                waiting=[req(exclusive=True, expected=10, asked=900.0, run='partc'), part])
+    assert decide(st_, cfg, 1010.0).grants == []                                   # not starved yet: it waits
+    assert [(r.id, c) for r, c in decide(st_, cfg, 1900.0).grants] == [(part.id, 'P')]   # starved: granted anyway

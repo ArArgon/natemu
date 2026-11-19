@@ -10,6 +10,8 @@ blocks and keeps no hidden state, so it is tested with a fake clock (testkit/tes
    next window may become pending (unless no shared work is waiting).
 3. While a window is pending (exclusive work queued, the machine draining), a shared request is granted only if its
    expected duration is known and it ends by the drain horizon: the latest expected end of the shared work running.
+   A starved request (7) is the exception: it is granted anyway, and the window waits for it (seen: a campaign part
+   with no recorded duration waited 48 minutes while a stream of exclusive tests kept a window pending).
 4. Shared requests by priority, then the fair-share order (7); strict: one that cannot be granted now blocks those after it of the same or
    lower priority, so a large claim is not starved by small ones.
 5. `perf` requests use performance cores only; others use performance cores if free, else efficiency cores.
@@ -161,10 +163,11 @@ def _decide(state: State, cfg: Config, now: float, external_busy: bool) -> Decis
     cap = {'P': cfg.p_cores, 'E': cfg.e_cores}
     grants, blocked_at = [], None
     cands = [r for r in state.waiting if not r.exclusive and not unsatisfiable(r, cfg)]
+    starved = lambda r: now - state.last_grant.get(run_of(r), r.asked) >= cfg.starve_after
     while cands:
         r = min(cands, key=key); cands.remove(r)            # re-ranked after every grant: shares grow as cores go out
         if blocked_at is not None and r.priority <= blocked_at: break
-        if pending and (r.expected is None or now + r.expected > horizon):
+        if pending and not starved(r) and (r.expected is None or now + r.expected > horizon):
             blocked_at = r.priority; continue
         cls = next((c for c in (('P',) if r.perf else ('P', 'E')) if used[c] + r.cores <= cap[c]), None)
         if cls is None:
