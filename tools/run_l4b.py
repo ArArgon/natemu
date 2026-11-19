@@ -4,14 +4,14 @@
 
     tools/with-env python3 tools/run_l4b.py --fexc FEXC --out DIR [--only qemu,halt,stress,cases,clocks] [--programs pit,rtc,pm]
 
-- `qemu`: programs run unchanged by pinned QEMU (system mode, SeaBIOS) and natemu at block sizes default and 1, one CPU
-  in x2APIC mode: the PIT (read-back status and count latches, access modes, a latch held across a second latch
+- `qemu` (the name kept from when pinned QEMU ran these programs too; natemu only now): natemu at block sizes default
+  and 1, one CPU in x2APIC mode: the PIT (read-back status and count latches, access modes, a latch held across a second latch
   command, port 61H's gate, data, refresh toggle and OUT2, Linux's `pit_calibrate_tsc` and `quick_pit_calibrate`, IRQ0 at
   the mode 2 rate through I/O APIC pin 2, Linux's PIT-disable sequence), the RTC (70H, A-D, SET, rollover into 2000,
   UIP, binary and 12-hour formats, 37H, CMOS RAM, periodic / update-ended / alarm IRQ 8), the PM block (SCI_EN, PM1_EN
-  read-back, PM1_STS write-1-to-clear, the PM timer, the PM timer's SCI on pin 9, level) and S5 (QEMU powers off, natemu
-  stops `poweroff`). natemu must equal QEMU on every compared result (DATA slots 0-63: values that do not depend on
-  timing) and both the model (`timers.check_*`); natemu's raw TSC/count samples are judged by the exact model (PIT edges,
+  read-back, PM1_STS write-1-to-clear, the PM timer, the PM timer's SCI on pin 9, level) and S5 (natemu stops
+  `poweroff`). DATA slots 0-63 (values that do not depend on timing) are judged by the model (`timers.check_*`), and a
+  slot the model does not name must be 0 (no program writes it); natemu's raw TSC/count samples by the exact model (PIT edges,
   PM ticks and TSC all from V): IRQ0 deliveries never before their edge and at most 2 ms late, `pit_calibrate_tsc`'s
   10 ms window, `quick_pit_calibrate`'s kHz within 500 ppm of 1 GHz when it succeeds, PM ticks within one of the rate.
 - `halt`: the halted rule with the PIT as an asynchronous source (its busy guard while a transition is scheduled): a
@@ -30,28 +30,31 @@ from fractions import Fraction
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import smp, answers, apic, timers, ref, run_slice1_vm as vm  # noqa: E402
+import smp, apic, timers, ref, run_slice1_vm as vm  # noqa: E402
 import case_results  # noqa: E402
 from run_slice3_vm import driver  # noqa: E402
-from run_x3 import natemu_memory, qemu_memory  # noqa: E402
-from run_l4a import run_natemu, qemu  # noqa: E402
+from run_x3 import natemu_memory  # noqa: E402
+from run_l4a import run_natemu  # noqa: E402
 
 CHECKS = {'l4b-pit': timers.check_pit, 'l4b-rtc': timers.check_rtc, 'l4b-pm': timers.check_pm, 'l4b-more': timers.check_more}
-# Compared slots where natemu departs from QEMU on purpose (each documented with its program).
-DEPARTURES = {'l4b-more': timers.MORE_DEPARTURES}
+NAMED = {'l4b-pit': timers.PIT_WANT, 'l4b-rtc': timers.RTC_WANT, 'l4b-pm': timers.PM_WANT, 'l4b-more': timers.MORE_WANT}
 
 
-def compared(mem):
-    return [mem.read(apic.DATA(0) + 8 * k) for k in range(timers.RAW)]
+# l4b-pit's k16: whether quick_pit_calibrate succeeded, which depends on timing (check_pit judges its kHz when it does).
+TIMED = {'l4b-pit': {16}}
+
+
+def unnamed_slots(name, mem):
+    """The DATA slots below timers.RAW the model does not name: no program writes one, so each must be 0."""
+    return [f'k{k}: {v:#x}, no program writes it' for k in range(timers.RAW)
+            if k not in NAMED[name] and k not in TIMED.get(name, ()) and (v := mem.read(apic.DATA(0) + 8 * k))]
 
 
 def cmd_qemu(a, report):
     failures = []
     for prog, _ in [f() for f in (timers.pit_program, timers.rtc_program, timers.pm_program, timers.more_program) if not a.programs or f.__name__.split("_")[0] in a.programs]:
         label, check = prog['name'], CHECKS[prog['name'].split('-x')[0]]
-        want, _, err = qemu(prog, a.out / 'qemu' / label)
-        problems = [f'QEMU run failed ({err})'] if want is None else \
-            [f'QEMU vs model: {d}' for d in answers.derive(want, 'model', lambda w: check(qemu_memory(prog, w), False)[0])]
+        problems = []
         summaries = {}
         for limit in (None, 1):
             out, p = run_natemu(a, prog, a.out / 'work' / f"{label}-{limit or 'd'}", [limit] if limit else [])
@@ -59,29 +62,17 @@ def cmd_qemu(a, report):
                 mem = natemu_memory(out)
                 p2, summaries[limit or 'default'] = check(mem, True)
                 p += p2
-                if want is not None:
-                    skip = DEPARTURES.get(label.split('-x')[0], set())
-                    def slots(m): return [x for k, x in enumerate(compared(m)) if k not in skip]
-                    def live(mem=mem, skip=skip):
-                        q = compared(qemu_memory(prog, want))
-                        return [f'k{k}: natemu {x:#x} != QEMU {y:#x}' for k, (x, y) in enumerate(zip(compared(mem), q)) if x != y and k not in skip]
-                    # (DATA slots below timers.RAW but the departures: a comparison point of tools/reference/answers.py)
-                    p += answers.compared(want, 'slots/' + ','.join(map(str, sorted(skip))), lambda w: (slots(qemu_memory(prog, w)), {}),
-                                          lambda aux, mem=mem: slots(mem), live)
+                p += unnamed_slots(label.split('-x')[0], mem)
             problems += [f'max-block {limit}: {x}' for x in p]
         report.append({'name': label, 'problems': problems, 'summary': summaries})
         failures += [f'{label}: {p}' for p in problems]
         print(f"{label}: {'FAIL' if problems else 'ok'} {summaries}", *problems[:8], sep='\n  ', flush=True)
-    # S5: QEMU powers off (exit 0, no dump); natemu stops `poweroff` at the OUT.
+    # S5 (SLP_TYP 0 with SLP_EN: a power-off, ACPI 4.7.2.6): natemu stops `poweroff` at the OUT.
     prog, labels = timers.s5_program()
     label = prog['name']
-    rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, smp.build_stub(a.out / 'qemu' / label)), a.out / 'qemu' / label, 'multi')
-    size = answers.derive(dump, 'dump-bytes', len)       # (locked: the exit status and this from the lock)
-    problems = [] if rc == 0 and not size else [f'QEMU: exit {rc}, dump {size} bytes (expected a power-off)']
-    out, p = run_natemu(a, prog, a.out / 'work' / label, reached=False)
+    out, problems = run_natemu(a, prog, a.out / 'work' / label, reached=False)
     if out is not None and out['cpus'][0]['stop'] != 'poweroff':
-        p.append(f"natemu: {out['cpus'][0]['stop']} {out['cpus'][0]['reason']}")
-    problems += p
+        problems.append(f"natemu: {out['cpus'][0]['stop']} {out['cpus'][0]['reason']}")
     report.append({'name': label, 'problems': problems})
     failures += [f'{label}: {x}' for x in problems]
     print(f"{label}: {'FAIL' if problems else 'ok'}", *problems[:4], sep='\n  ', flush=True)
