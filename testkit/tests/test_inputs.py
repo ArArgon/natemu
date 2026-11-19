@@ -162,14 +162,15 @@ def test_matrix_inputs_prepares_from_writable_clones(monkeypatch, tmp_path):
 
 
 def test_new_paths_are_components(monkeypatch, tmp_path):
-    stub = {n: tmp_path / n for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs', 'qemu_user', 'corpus', 'fetch')}
-    for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs'): monkeypatch.setattr(inputs, n, lambda n=n: stub[n])
+    stub = {n: tmp_path / n for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs', 'qemu_user', 'corpus', 'fetch', 'matrix_inputs')}
+    for n in ('fio_prep', 'stress_ng', 'block_inputs', 'network_rootfs', 'matrix_inputs'): monkeypatch.setattr(inputs, n, lambda n=n: stub[n])
     monkeypatch.setattr(inputs, 'corpus', lambda g: stub['corpus'])
     monkeypatch.setattr(inputs.artifacts, 'qemu_user', lambda: stub['qemu_user'])
     monkeypatch.setattr(inputs.resources, 'fetch', lambda n: stub['fetch'])
     parts = inputs.components()
     assert set(parts) == set(inputs.PATHS)
     assert parts[inputs.FIO_PREP] == stub['fio_prep'] and parts[inputs.STRESS] == stub['stress_ng']
+    assert parts[inputs.MATRIX] == stub['matrix_inputs']
 
 
 def test_stress_build_pin_is_the_same_everywhere():

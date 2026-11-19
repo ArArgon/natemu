@@ -10,7 +10,7 @@ A passed case's output folder is deleted when it ends (`drop_outputs`); a failed
 
     [[suite]] kind = "judged"  harness = "runner"
     [suite.cases.<name>]  argv = ["tools/run_x.py", "--fexc", "{fexc}", "--out", "{out}", ...]   (also {raw},
-                          {natemu_entry}, {natemu_host}, {natemu_runtime}: the framework's builds; {fex_asm}: FEX's
+                          {natemu_entry}, {natemu_host}, {natemu_stub}, {natemu_runtime}: the framework's builds; {fex_asm}: FEX's
                           unittests/ASM at the pin)
                           needs = {...}  smoke = true  judge = "judges:name"  results = "results.json"
                           (the judge sees exit 1; judge_on_zero = true also sends it exit 0: a negative control)
@@ -144,7 +144,7 @@ class Runner:
             spec = self._spec(it.suite, it.case)
             o = rundir / 'out' / it.case
             extra = {'fex_asm': artifacts.fex_asm()}        # FEX's unittests/ASM at the pin ({fex_asm}, NATEMU_FEX_ASM)
-            argv = [a.format(fexc=fexc, out=o, natemu_entry=n.entry, natemu_host=n.host, natemu_runtime=n.runtime,
+            argv = [a.format(fexc=fexc, out=o, natemu_entry=n.entry, natemu_host=n.host, natemu_stub=n.stub, natemu_runtime=n.runtime,
                              raw=root or legacy_raw(), **extra) for a in spec['argv']]
             if argv[0].endswith('.py'): argv = [sys.executable, *argv]
             env = dict(os.environ, NATEMU_PREBUILT='1', NATEMU_VM_LOCK_HELD='1', NATEMU_STATE_ROOT=str(_state_root()),

@@ -109,3 +109,33 @@ results = "result.json"
 argv = ["tools/run_io_lifecycle_stress.py", "--case", "reset", "--corrupt-cycle", "17", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
 judge = "judges:must_fail"
 judge_on_zero = true
+
+# Serial stress and the I/O soak: tools/run_io_campaign.py prepares inputs from the input root's matrix inputs and the pinned
+# stress-ng, runs, and writes {"results": [...]} from the runner's own result files.
+[suite.cases."serial-unpaced"]
+argv = ["tools/run_io_campaign.py", "serial-unpaced", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--natemu", "{natemu_stub}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { exclusive = true, why = "heartbeat gaps of at most 2 s; 5-minute loaded soak" }
+results = "results.json"
+
+[suite.cases."serial-paced"]
+argv = ["tools/run_io_campaign.py", "serial-paced", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--natemu", "{natemu_stub}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { exclusive = true, why = "heartbeat gaps of at most 2 s; 5-minute loaded soak" }
+results = "results.json"
+
+[suite.cases."serial-loaded"]
+argv = ["tools/run_io_campaign.py", "serial-loaded", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--natemu", "{natemu_stub}", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { exclusive = true, why = "heartbeat gaps of at most 2 s; 5-minute loaded soak" }
+results = "results.json"
+
+# The soak's own suite: the timeout is per suite (about 15 minutes of VM time, 2400 s allowed).
+[[suite]]
+name = "io-campaign-soak"
+tier = "campaign"
+kind = "judged"
+harness = "runner"
+needs = { exclusive = true, why = "heartbeat gaps of at most 2 s; 5-minute loaded soak" }
+params = { timeout = 2400 }
+
+[suite.cases."soak"]
+argv = ["tools/run_io_campaign.py", "soak", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--natemu", "{natemu_stub}", "--fexc", "{fexc}", "--out", "{out}"]
+results = "results.json"

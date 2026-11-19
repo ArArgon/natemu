@@ -29,8 +29,9 @@ I7_PROGRAMS = 'i7-corpus-20261103-01/programs.json'
 S2D_PROGRAMS = 's2d/corpus/programs.json'
 FIO_PREP = 'io-benchmark-prep-20261108-01'                  # run_io_matrix.py / run_fio_admission.py --fio-prep
 STRESS = 'io-safety-stress-20261108-01'                     # bin/stress-ng, source.tar.xz, provenance.json
+MATRIX = 'io-matrix-inputs-20261118-01'                     # run_io_matrix.py prepare's folder (the serial-stress and soak campaigns)
 PATHS = (NETBOOT_LINUX, NETBOOT_INITRD, QEMU_USER, BLOCK_INPUTS, BLOCK_KERNEL_DEB, NETWORK_ROOTFS, I7_PROGRAMS, S2D_PROGRAMS,
-         FIO_PREP, STRESS)
+         FIO_PREP, STRESS, MATRIX)
 E2FSPROGS = pathlib.Path('/opt/homebrew/opt/e2fsprogs')     # Homebrew's: a host tool, checked (version and hashes key the image), not pinned
 
 
@@ -237,7 +238,7 @@ def components() -> dict[str, pathlib.Path]:
     return {NETBOOT_LINUX: resources.fetch('debian-netboot-linux'), NETBOOT_INITRD: resources.fetch('debian-netboot-initrd'),
             QEMU_USER: artifacts.qemu_user(), BLOCK_INPUTS: block_inputs(), BLOCK_KERNEL_DEB: resources.fetch('debian-kernel-deb'),
             NETWORK_ROOTFS: network_rootfs(), I7_PROGRAMS: corpus('gen_i7.py'), S2D_PROGRAMS: corpus('gen_slice2.py'),
-            FIO_PREP: fio_prep(), STRESS: stress_ng()}
+            FIO_PREP: fio_prep(), STRESS: stress_ng(), MATRIX: matrix_inputs()}
 
 
 def root() -> pathlib.Path:

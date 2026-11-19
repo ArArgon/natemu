@@ -228,3 +228,20 @@ def raw_of(image, qcow, scratch):
     qcow2_convert(image, scratch, 'raw')
     try: yield scratch
     finally: scratch.unlink(missing_ok=True)
+
+
+def writable_clone(src, dest):
+    """Same as testkit.inputs.writable_clone (the runners do not import testkit): a clone (APFS clonefile, else a copy) of an
+    input folder with the write permission a cache entry takes away given back, every other mode taken from the source (a
+    clone drops setuid bits), and a rootfs manifest's modes in inputs.json restored exactly."""
+    src, dest = pathlib.Path(src), pathlib.Path(dest)
+    if subprocess.run(['cp', '-c', '-R', '-p', str(src), str(dest)], capture_output=True).returncode:
+        shutil.rmtree(dest, ignore_errors=True)
+        subprocess.run(['cp', '-R', '-p', str(src), str(dest)], check=True, capture_output=True)
+    for p in src.rglob('*'):
+        if p.is_file() and not p.is_symlink(): (dest / p.relative_to(src)).chmod((p.stat().st_mode & 0o7777) | 0o200)
+    pin = dest / 'inputs.json'
+    if pin.is_file():
+        for rel, e in json.loads(pin.read_text()).get('rootfs', {}).items():
+            p = dest / 'rootfs' / rel
+            if 'mode' in e and not p.is_symlink() and p.exists(): p.chmod(int(e['mode'], 8) & 0o7777)
