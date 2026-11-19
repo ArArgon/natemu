@@ -196,6 +196,3 @@ tests need two more Homebrew packages: `brew install nasm container`. `nasm` ass
 `container` is Apple's tool for running Linux containers, which the tests use to build x86 Linux files. Start it once
 after each restart of the Mac with `container system start`. The first run on a Mac downloads and builds what the tests
 need, which takes a few minutes. [Testing](docs/testing.md) explains the rest.
-
-The older correctness suite (`tools/run_suite.py`) compares natemu against QEMU and needs a local QEMU install. Its
-docstring lists the options.

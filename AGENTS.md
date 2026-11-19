@@ -17,6 +17,15 @@ Do not read or search git history for archived Track01 material unless the task
 names it. Before creating or revising error or learning records, read
 [the error documentation guidance](docs/retrospectives/README.md).
 
+## Testing
+
+Run tests only through `tools/natemu-test`; read [the testing page](docs/testing.md) first. `tools/natemu-test run`
+runs what your change concerns, `--tier smoke` one small case of everything, `--gate` everything; a push or merge needs
+a passing gate at that exact commit. A new test is a case in a family under `tests/`, not a new script. Do not run
+`tools/run_suite.py` or start VMs outside the framework's queue, and do not read test inputs from `natemu-raw`: the
+framework builds or downloads them into its cache. Older pages under `docs/restructure/` that say to run
+`run_suite.py` predate this.
+
 ## README
 
 `README.md` is for a newcomer who wants to run natemu: plain prose, what to do and what they will see, hardware named by chip

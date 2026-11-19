@@ -706,6 +706,8 @@ the default only). Everything passed but the 7 known i8b departures (they flag `
 | `tools/check_resident_stack.py` | resident stack bound and gate/ERET binary shape of the built runtime |
 | `tools/models/` | independent ordering, coherence, PAE and modes models (used by the runners) |
 
+*Superseded on November 19: tests run through `tools/natemu-test` ([testing](../testing.md)); the rest of this section is history.*
+
 **Runner** (`tools/run_suite.py`, November 5): runs every command of the block below, plus I7 at CPL 0 at both block
 sizes, with the same arguments and the same pass/fail rule (exit status 0; `i8b` passes when it fails exactly the 7 known
 departures), in three phases:

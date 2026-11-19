@@ -343,17 +343,14 @@ paging cells), `tools/run_slice2_vm.py` (control flow), `tools/run_slice2_faults
 ASM suite) and `tools/run_slice3_vm.py` (N vCPUs: corpora, smp, limits, kicks, system, coherence, sharedpt, litmus,
 contain). Each takes `--fexc FEXC --out DIR` and runs under `./tools/with-env`.
 
-**Running the suite.** The new runner is `tools/natemu-test` ([docs/testing.md](testing.md)): it runs the unit tests, the
-migrated families and every remaining `run_suite.py` step (wrapped) on any Mac. Until every step has moved,
-`tools/run_suite.py` (its docstring has the options) stays the reference for a push or merge. The full suite is what must pass before a push
-or merge; `--quick` (one small member of every runner family, about ten minutes, the same pass rules) is the development loop
-and never replaces it. Speed levers, all keeping every case: long runners are split (`--shard I/N` of faults, loop faults,
-probes and k1: the independent cases dealt round-robin, the union is the unsplit run; corpora per vCPU count); a step far from
-its `est` is listed at the end of a run (update the table in `steps()`; a new step starts last until it has one); steps in
-`E_OK` (single-VM runners checked against QEMU, no timing bound) also run on the efficiency cores under `taskpolicy -c
-background` (`-e N`, about 4x slower per step, started only while they can finish before the queue drains); everything
-with a wall-clock, watchdog, kicker or run-timeout bound, and every multi-vCPU step, stays on the performance cores, and
-`ser` steps run alone. QEMU reference results are cached per program (`NATEMU_RAW_ROOT/ref-cache.sqlite`, keyed by program,
+**Running the suite.** Every test runs through `tools/natemu-test` ([docs/testing.md](testing.md)), on any Apple Silicon
+Mac: `tools/natemu-test run` for the tests a change concerns, `--tier smoke` for one small case of everything, and
+`tools/natemu-test run --gate` for everything. A passing gate at the exact commit is what a push or merge needs. Do not
+run `tools/run_suite.py`: nothing is judged by it any more. The file stays only because its step list is what
+`python3 -m testkit.migrate` generates the runner families from, and the benchmark family and a few `tools/test_*.py`
+tests still import it. The single runners above can still be run directly while debugging one of them. The framework
+schedules the work (cores, exclusive windows, several runs on one machine); none of the old `-j`, `-e`, `--quick`
+or `--shard` handling is needed. The runners keep their own caches: QEMU reference results are cached per program (`NATEMU_RAW_ROOT/ref-cache.sqlite`, keyed by program,
 pinned QEMU hash and the `tools/reference` sources; `NATEMU_REF_CACHE=off` forces fresh references, e.g. for a final gate). Two more caches live
 beside it: `asm-cache.sqlite` (`tools/asmcache.py`: clang's bytes per assembly text; the fault runners assemble thousands of
 one-line programs and every shard repeated it; `NATEMU_ASM_CACHE=off`) and `qemu-cache.sqlite` (`tools/qemucache.py`: QEMU
