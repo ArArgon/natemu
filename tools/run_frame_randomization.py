@@ -139,15 +139,20 @@ TABLE_ALIASES = [('after', strict.FRAME, 0xffff400000200000, [0xffff400000400000
 
 def table_program(block):
     """CPL 0 enters K by `jmp rax` (the supervisor table gets K), CPL 3 then enters U the same way (the user table gets U),
-    scans the tables' 2 MiB for K (r12) and U (r13), returns to CPL 0 and scans the same addresses again (r14, r15)."""
+    scans the tables' 2 MiB for K (r12) and U (r13), returns to CPL 0 and scans the same addresses again (r14, r15). Then an
+    `ldmxcsr` that unmasks a SIMD exception gives the vCPU a second code context, with its own tables of both classes: the same
+    again with K2, U2 into r8..r11."""
     scan = lambda n, k, u: (f'mov rsi, {block:#x}\nmov ecx, 0x40000\nscan{n}: mov rax, [rsi]\nxor ebx, ebx\n'
                             f'cmp rax, rdx\nsete bl\nadd {k}, rbx\nxor ebx, ebx\ncmp rax, rdi\nsete bl\nadd {u}, rbx\n'
                             f'add rsi, 8\ndec ecx\njnz scan{n}\n')
     body = ('lea rdx, [rip + kt]\nlea rdi, [rip + ut]\njmp rdx\nkt: nop\nsw3: nop\nlea rax, [rip + ut]\njmp rax\nut: nop\n'
-            + scan(3, 'r12', 'r13') + 'sw0: nop\n' + scan(0, 'r14', 'r15'))
+            + scan(3, 'r12', 'r13') + 'sw0: nop\n' + scan(0, 'r14', 'r15')
+            + 'mov dword ptr [rsp - 8], 0x1f00\nldmxcsr [rsp - 8]\n'
+            + 'lea rdx, [rip + kt2]\nlea rdi, [rip + ut2]\njmp rdx\nkt2: nop\nsw3b: nop\nlea rax, [rip + ut2]\njmp rax\nut2: nop\n'
+            + scan(4, 'r8', 'r9') + 'sw0b: nop\n' + scan(5, 'r10', 'r11'))
     code, labels = strict.ref.assemble(body, labels=True)
     return '\n'.join([f'body {strict.CODE:#x} {code.hex()}', 'cpu', f'rip {strict.CODE:#x}', 'cpl 0', 'rflags 0x202', 'sse 1',
-                      f'switch {strict.CODE + labels["sw3"]:#x} 3', f'switch {strict.CODE + labels["sw0"]:#x} 0',
+                      *[f'switch {strict.CODE + labels[n]:#x} {c}' for n, c in (('sw3', 3), ('sw0', 0), ('sw3b', 3), ('sw0b', 0))],
                       'gpr ' + ' '.join(['0x0'] * 4 + [hex(strict.DATA + 0x1f00)] + ['0x0'] * 11)]) + '\n'
 
 
@@ -156,15 +161,16 @@ def table_judge(got, alias):
     got = got.get('cpus', [got])[0]
     if got['stop'] != 'reached':
         return errors + [f'table scan stopped: {got["stop"]} {got.get("fault")}']
-    k3, u3, k0, u0 = (strict.ref.num(got['gpr'][r]) for r in (12, 13, 14, 15))
-    if k3:
-        errors.append(f'CPL 3 read a supervisor entry ({k3} words)')
-    if not u3:
-        errors.append('CPL 3 did not see its own entry (the scan reads the wrong place)')
-    if not k0:
-        errors.append('CPL 0 did not see its own entry (the scan reads the wrong place)')
-    if u0:
-        errors.append(f'CPL 0 table holds a user entry ({u0} words)')
+    for which, regs in (('first', (12, 13, 14, 15)), ('second', (8, 9, 10, 11))):
+        k3, u3, k0, u0 = (strict.ref.num(got['gpr'][r]) for r in regs)
+        if k3:
+            errors.append(f'CPL 3 read a supervisor entry in the {which} context ({k3} words)')
+        if not u3:
+            errors.append(f'CPL 3 did not see its own entry in the {which} context (the scan reads the wrong place)')
+        if not k0:
+            errors.append(f'CPL 0 did not see its own entry in the {which} context (the scan reads the wrong place)')
+        if u0:
+            errors.append(f'CPL 0 table holds a user entry in the {which} context ({u0} words)')
     return errors
 
 
