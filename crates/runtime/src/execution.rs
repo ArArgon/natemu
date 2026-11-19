@@ -2284,11 +2284,7 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
     if (cache::DISPATCH_VA..cache::CODE_VA + cache::HEAD_BYTES as u64).contains(&elr) {
         let mut s = at_once(s, frame.x[0]);
         completed(&mut s); // a block exited into the dispatcher
-        if elr < cache::L1_VA {
-            s.stops_dispatch += 1;
-        } else {
-            s.stops_l1 += 1;
-        }
+        s.stops_dispatch += 1;
         unsafe { dispatch(&mut s) }
     }
     // PIC study (`pic-count` builds): in a link's counting stub, the exit's state: the vCPU stops at the target's start.

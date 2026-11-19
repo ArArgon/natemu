@@ -123,6 +123,12 @@ pub const GUEST_STATE_TABLES: [usize; 3] = [
     GUEST_STATE_TABLES_START + 4096,
     GUEST_STATE_TABLES_START + 8192,
 ];
+/// The user (CPL 3) space's own level-1 and level-2 tables of the alias's slot (window pages after the user roots): its
+/// level 2 links the shared leaf table but maps the user block of data tables, so each space's slot holds only its own
+/// class's ([`cache::DL1`]). Written by the host, never mapped in the window.
+pub const GUEST_STATE_USER_TABLES: [usize; 2] =
+    [crate::shadow::USER_UPPER_ROOT + 4096, crate::shadow::USER_UPPER_ROOT + 8192];
+const _: () = assert!(GUEST_STATE_USER_TABLES[1] + 4096 <= crate::SHARED_OFFSET);
 /// The alias's top-level slot (512 GiB, 2^27 pages, one upper-root entry): every address walks only the owner's tables.
 pub const GUEST_STATE_SLOT: core::ops::Range<u64> =
     (GUEST_STATE_VA & !((1 << 39) - 1))..(GUEST_STATE_VA & !((1 << 39) - 1)) + (1 << 39);
@@ -217,7 +223,7 @@ pub mod cache {
     use crate::PRIVATE;
     const MIB: usize = 1 << 20;
     /// Code area: executable alias (blocks run here) and writable alias (the resident places them there). It starts
-    /// with a head the resident fills ([`SLOT`], [`DISPATCH`], [`L1_CODE`]); blocks follow from [`HEAD_BYTES`].
+    /// with a head the resident fills ([`SLOT`], [`DISPATCH`]); blocks follow from [`HEAD_BYTES`].
     pub const CODE_VA: u64 = PRIVATE + 0x1000_0000;
     pub const CODE_WRITE_VA: u64 = PRIVATE + 0x2000_0000;
     /// Default capacity for blocks (after the head).
@@ -229,7 +235,7 @@ pub mod cache {
     pub const SLOT_BYTES: usize = 0x10000;
     pub const SLOT_VA: u64 = CODE_VA + SLOT as u64;
     pub const SLOT_WRITE_VA: u64 = CODE_WRITE_VA + SLOT as u64;
-    /// The dispatcher, copied from the resident: it branches to the RIP's L1 entry ([`L1_CODE`]) with the next RIP in x0.
+    /// The dispatcher, copied from the resident: slot 0's words fall through to its `svc #MISS` with the next RIP in x0.
     /// Its `svc #MISS` at [`DISPATCH_MISS`] enters the resident. Perf chunk 12: copies of its first four words follow in
     /// [`DISPATCH_SLOTS`] - 1 slots of [`DISPATCH_SLOT_BYTES`] (slot k at `DISPATCH + k * DISPATCH_SLOT_BYTES`, k >= 1), one
     /// per code context seen since the last flush ([`Control::slot_contexts`]): a block's computed exit branches to its
@@ -241,35 +247,30 @@ pub mod cache {
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
     pub const DISPATCH_SLOT_BYTES: usize = 128;
-    /// A reserved third 2 MiB block after the data tables ([`DL1`]) in the lookup area, mapped EL0 read-only with them. Nothing
-    /// uses it now (a removed study's validity tables lived here); the mapping stays as it is.
-    pub const VT_ENTRIES: usize = 1 << 16;
-    pub const VT: usize = DL1 + DL1_BYTES;
-    pub const VT_BYTES: usize = L1_TABLES * VT_ENTRIES * 8;
     pub const DISPATCH_SLOTS: usize = DISPATCH_BYTES / DISPATCH_SLOT_BYTES;
-    /// L1 as code: [`L1_TABLES`] tables of two-way sets (FEX `L1Pointer/L1Mask`), so the dispatcher reads no data. A set is
-    /// [`L1_WAYS`] entries of [`L1_ENTRY_BYTES`], indexed by `rip & L1_SET_MASK` ([`L1_SET_BITS`] RIP bits; the L1 two-way
-    /// plan: the same 2 MiB per table as 2^16 direct-mapped entries). A filled entry is `movz/movk x2, #rip` (4 words);
-    /// `sub x2, x2, x0`; `cbnz x2, +8` (way 0: `+12`, to way 1); `b entry`; `b miss` (way 0: `b way 1`); an empty way 1
-    /// starts with `b miss`, an empty way 0 with `b way 1`. Only the resident writes them. Each table holds entries of one
-    /// code context ([`Control::l1_contexts`]); the dispatcher's `adrp` names the current one (perf chunk 5: a CPL change
-    /// switches tables instead of clearing one). Perf chunk 19: 16 RIP bits indexed a direct-mapped table (12 before: most
-    /// misses were two hot RIPs at the same page offset); now 15 index a set of two.
-    pub const L1_CODE: usize = DISPATCH + DISPATCH_BYTES;
+    /// L1: [`L1_TABLES`] tables of two-way sets, kept as data ([`DL1`]). A set is [`L1_WAYS`] entries, indexed by
+    /// `rip & L1_SET_MASK` ([`L1_SET_BITS`] RIP bits). Each table holds entries of one code context
+    /// ([`Control::l1_contexts`]); a context's dispatcher slot names its table (perf chunk 5: a CPL change switches tables
+    /// instead of clearing one). Perf chunk 19: 16 RIP bits indexed a direct-mapped table (12 before: most misses were two
+    /// hot RIPs at the same page offset); now 15 index a set of two. Tables `0..L1_SPACE_TABLES` serve supervisor (CPL 0-2)
+    /// contexts, the others user (CPL 3) contexts ([`l1_user_table`]): each shadow space maps only its own class's.
     pub const L1_SET_BITS: u32 = 15;
     pub const L1_WAYS: usize = 2;
     pub const L1_SETS: usize = 1 << L1_SET_BITS;
     pub const L1_SET_MASK: u64 = L1_SETS as u64 - 1;
     /// Slots (entries) per table: slot `2 * set + way`; the owner and list arrays are indexed by slot.
     pub const L1_ENTRIES: usize = L1_SETS * L1_WAYS;
-    pub const L1_ENTRY_BYTES: usize = 32;
-    pub const L1_SET_BYTES: usize = L1_WAYS * L1_ENTRY_BYTES;
     pub const L1_TABLES: usize = 4;
-    pub const L1_TABLE_BYTES: usize = L1_ENTRIES * L1_ENTRY_BYTES;
+    /// Tables per shadow space (privilege class): one 2 MiB block of data tables.
+    pub const L1_SPACE_TABLES: usize = 2;
+    /// Whether table `t` serves user (CPL 3) contexts.
+    pub const fn l1_user_table(t: usize) -> bool {
+        t >= L1_SPACE_TABLES
+    }
     /// [`Control::l1_contexts`]: a table that holds no context's entries (it is cleared before it takes one).
     pub const NO_CONTEXT: u64 = u64::MAX;
     /// Blocks are placed from here.
-    pub const HEAD_BYTES: usize = L1_CODE + L1_TABLES * L1_TABLE_BYTES;
+    pub const HEAD_BYTES: usize = DISPATCH + DISPATCH_BYTES;
     /// The largest block admitted; the code area holds at least one.
     pub const MAX_BLOCK_BYTES: usize = 32 * 1024;
     /// Pool sizes: the Debian kernel's early boot averaged 261 code and 230 metadata bytes per block (M1), so the arena
@@ -286,21 +287,21 @@ pub mod cache {
     pub const META_VA: u64 = PRIVATE + 0x2800_0000;
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
-    pub const LOOKUP_BYTES: usize = (VT + VT_BYTES).next_multiple_of(BLOCK);
-    /// The dispatcher's data tables: the dispatcher's tables as
-    /// data, table t's entry i two words at `DL1 + 16 (t L1_ENTRIES + i)`: the RIP it serves ([`DL1_EMPTY`]: none) and the
-    /// address to branch to. Filling or emptying one is two stores: no code is written, nothing is synchronized. The host
-    /// maps them and the reserved block ([`VT`]) EL0 read-only as three 2 MiB blocks in the guest-state alias's level-2
-    /// table, after the alias's own 2 MiB when they fit there ([`dl1_after`]), else before it; a slot reaches table t from x28 by a page count.
+    pub const LOOKUP_BYTES: usize = (DL1 + DL1_BYTES).next_multiple_of(BLOCK);
+    /// The dispatcher's data tables: table t's entry i two words at `DL1 + 16 (t L1_ENTRIES + i)`: the RIP it serves
+    /// ([`DL1_EMPTY`]: none) and the address to branch to. Filling or emptying one is two stores: no code is written,
+    /// nothing is synchronized. Each shadow space's upper root maps its own class's block of [`L1_SPACE_TABLES`] tables
+    /// (the supervisor space block 0, the user space block 1: [`l1_user_table`]) EL0 read-only at the same address, beside
+    /// the guest-state alias in that space's own level-2 table, after the alias's 2 MiB when it fits there
+    /// ([`dl1_after`]), else before it; a slot reaches table t from x28 by a page count. So user code can read no
+    /// supervisor context's entries.
     pub const DL1: usize = (PCID_STUDY + PCID_STUDY_BYTES).next_multiple_of(BLOCK);
     pub const DL1_BYTES: usize = L1_TABLES * L1_ENTRIES * 16;
     pub const DL1_EMPTY: u64 = 1 << 62;
     pub const fn dl1_after(guest_state_va: u64) -> bool {
-        (guest_state_va >> 21 & 511) as usize + DL1_BLOCKS <= 511
+        (guest_state_va >> 21 & 511) as usize + 1 <= 511
     }
-    /// The 2 MiB blocks of that mapping: the data tables', then the validity tables' one.
-    pub const DL1_BLOCKS: usize = DL1_BYTES / BLOCK + 1;
-    const _: () = assert!(DL1_BYTES % BLOCK == 0 && DL1 % BLOCK == 0 && VT_BYTES == BLOCK && DL1_BLOCKS * 512 < 4096);
+    const _: () = assert!(DL1_BYTES == 2 * BLOCK && L1_SPACE_TABLES * L1_ENTRIES * 16 == BLOCK && DL1 % BLOCK == 0);
     /// PCID gain study (`pcid-study` resident builds only; untouched, so unbacked, otherwise): the modelled sets, after the
     /// page record.
     pub const PCID_STUDY: usize = (PAGE_STAMPS + crate::page_study::BYTES).next_multiple_of(4096);
@@ -408,7 +409,7 @@ pub mod cache {
     pub const META_OFFSET: usize = GLOBAL_OFFSET + GLOBAL_BYTES;
     pub const CODE_OFFSET: usize = META_OFFSET + META_BYTES;
 
-    /// Lookup area layout: [`Control`], L1's owners, L2, block index (L1 is code, [`L1_CODE`]).
+    /// Lookup area layout: [`Control`], L1's owners, L2, block index (L1's entries are at [`DL1`]).
     pub const CONTROL: usize = 0;
     /// K1: the block each L1 entry enters (u32 block number + 1; 0: empty; table t's at `L1_OWNERS + 4 * L1_ENTRIES * t`),
     /// so a CR3 load empties only the entries of blocks it makes stale.
@@ -1396,18 +1397,15 @@ pub mod cache {
             && PAGE_STAMPS % 64 == 0
             && PAGE_STAMPS + crate::page_study::BYTES <= LOOKUP_BYTES
     );
-    // The dispatcher's form: its `and` takes the mask as a logical immediate, its `adrp` names a table by its page, and
-    // each entry's `b` to the miss reaches ±128 MiB.
+    // The dispatcher's form: its `and` takes the mask as a logical immediate.
     const _: () = assert!(
         L1_SET_MASK == (1 << L1_SET_BITS) - 1
             && L1_WAYS == 2
             && L1_ENTRIES == L1_SETS * L1_WAYS
             && L1_SET_BITS <= 16
-            && L1_ENTRY_BYTES == 32
-            && L1_SET_BYTES == 64
     );
     const _: () =
-        assert!(L1_CODE % 4096 == 0 && L1_TABLE_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
+        assert!(HEAD_BYTES % 4096 == 0 && HEAD_BYTES < 1 << 27);
     const _: () = assert!(INDEX + MAX_BLOCKS * 4 <= LINKS);
     const _: () = assert!(LINKS + MAX_LINKS * core::mem::size_of::<LinkRecord>() <= STEP_RECORD);
     const _: () = assert!(
@@ -3272,6 +3270,7 @@ pub struct State {
     pub stops: u64,
     pub stops_entry: u64,
     pub stops_dispatch: u64,
+    /// Stops inside the L1 code tables, which are gone (always 0; kept for the record's layout).
     pub stops_l1: u64,
     pub stops_exit: u64,
     pub stops_resident: u64,
@@ -3808,8 +3807,6 @@ mod tests {
     fn l1_two_way_layout_and_words() {
         use super::cache::*;
         assert_eq!((L1_SETS, L1_WAYS, L1_ENTRIES), (1 << 15, 2, 1 << 16));
-        assert_eq!(L1_TABLE_BYTES, 2 << 20, "the same memory as 2^16 direct-mapped entries");
-        assert_eq!(L1_SET_BYTES, 64);
         // The set is RIP bits 14:0, whatever the others; slots are 2 * set + way.
         for rip in [0, 0x1234, 0x7fff, 0x8000, 0xdead_beef_cafe, u64::MAX] {
             let (w0, w1) = l1_slots_of(rip);
@@ -3821,11 +3818,12 @@ mod tests {
         // The flags and the block number do not overlap.
         assert_eq!(L1_FLAGS, L1_LISTED | L1_NEXT);
         assert!((MAX_BLOCKS as u32 + 1) & L1_FLAGS == 0);
-        // The data tables: two words (the RIP, the address to branch to) per slot, a set's two ways 32 bytes, in whole 2 MiB
-        // blocks, the reserved block after them.
+        // The data tables: two words (the RIP, the address to branch to) per slot, a set's two ways 32 bytes, one 2 MiB
+        // block per privilege class: tables 0 and 1 supervisor, 2 and 3 user.
         assert_eq!(DL1_BYTES, L1_TABLES * L1_ENTRIES * 16);
         assert_eq!(L1_WAYS * 16 * L1_SETS, DL1_BYTES / L1_TABLES);
-        assert_eq!((DL1_BYTES % BLOCK, DL1 % BLOCK, DL1_BLOCKS), (0, 0, DL1_BYTES / BLOCK + 1));
+        assert_eq!((DL1_BYTES, DL1 % BLOCK), (2 * BLOCK, 0));
+        assert_eq!([0, 1, 2, 3].map(l1_user_table), [false, false, true, true]);
         assert_eq!(DL1_EMPTY >> 63, DL1_EMPTY >> 47 & 1, "the empty marker passes the computed exit's canonical check (bits 63 and 47)");
     }
 

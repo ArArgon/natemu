@@ -247,18 +247,16 @@ enter_allocated:
     b resume_exception
 
 // The dispatcher, copied by the resident into the code area (`cache::DISPATCH`) so that computed exits reach it with
-// one `b`; it runs from there, never here. Data-free; its `adrp` is only the form: the resident writes the copy's own
-// (`cache::fill_head`, to L1 table 0; each dispatcher slot's names its table). x0 = the next guest RIP, guest state in
-// the static registers. It branches to the RIP's L1 set (64 bytes: two ways of 32, `cache::L1_SET_BYTES`), code the
-// resident writes (`cache::L1_CODE`): way 0 compares and enters, else falls to way 1, which does the same: a hit enters
-// the cached block, a miss comes back to the `svc #MISS` here (`cache::DISPATCH_MISS`, the last word), which enters
-// the resident. Uses only x0-x2 (FEX's temporaries at a block boundary) and keeps NZCV: no flag-setting instruction.
+// one `b`; it runs from there, never here. Its `and` is the form the bound dispatcher slots copy (`cache::write_slot`:
+// each probes its context's data table, `cache::DL1`); entered itself, it falls through to the `svc #MISS`
+// (`cache::DISPATCH_MISS`, the last word), which enters the resident with x0 = the next guest RIP. Uses only x0-x2
+// (FEX's temporaries at a block boundary) and keeps NZCV: no flag-setting instruction.
 .global dispatch_template
 .global dispatch_template_end
 dispatch_template:
     and x1, x0, #{l1_mask}
-    adrp x2, .
-    add x2, x2, x1, lsl #6
-    br x2
+    nop
+    nop
+    nop
     svc #{svc_miss}
 dispatch_template_end:

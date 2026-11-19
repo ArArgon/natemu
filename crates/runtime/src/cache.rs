@@ -32,8 +32,6 @@ use natemu_abi::execution::{
     },
 };
 use natemu_abi::pic::{self, count};
-/// L1's code (the dispatcher's head ends there).
-pub const L1_VA: u64 = CODE_VA + area::L1_CODE as u64;
 
 /// This vCPU's number (its state record's; checked below `MAX_VCPUS` at start).
 fn vcpu() -> usize {
@@ -440,10 +438,6 @@ fn on_linear_page(page: u64, mut f: impl FnMut(usize)) {
 fn head(page: usize) -> *mut u32 {
     lookup_area::<u32>(area::PAGE_BLOCKS).wrapping_add(page)
 }
-/// Code-area offset of slot `i` (`2 * set + way`) of L1 table `t`: way 0 at the set's start, way 1 32 bytes on.
-fn l1_entry(t: usize, i: usize) -> u64 {
-    (area::L1_CODE + t * area::L1_TABLE_BYTES + i * area::L1_ENTRY_BYTES) as u64
-}
 /// Slot `i` of L1 table `t`'s owner: the block it enters, number + 1 (0: empty), and the flags [`area::L1_FLAGS`]
 /// ([`area::L1_LISTED`]; [`area::L1_NEXT`] in way 0's word only): every raw read of it masks or keeps them.
 fn l1_owner(t: usize, i: usize) -> *mut u32 {
@@ -457,7 +451,7 @@ fn l1_block(t: usize, i: usize) -> u32 {
 fn l1_list(t: usize, k: usize) -> *mut u32 {
     lookup_area::<u32>(area::L1_LISTS).wrapping_add(t * area::L1_ENTRIES + k)
 }
-/// Data tables: the dispatcher reads its tables as data ([`area::DL1`]); the code tables are left unused. An empty
+/// Data tables: the dispatcher reads its tables as data ([`area::DL1`]). An empty
 /// entry's target is the dispatcher's miss: [`area::DL1_EMPTY`] passes the computed exit's canonical check (it compares bits
 /// 63 and 47 only), so a guest jump to that very address matches the marker and must miss like any other (review, defect 1).
 fn dl1(t: usize, i: usize) -> *mut [u64; 2] {
@@ -480,16 +474,9 @@ fn clear_l1(t: usize) {
 fn slot_at(k: usize) -> u64 {
     (area::DISPATCH + k * area::DISPATCH_SLOT_BYTES) as u64
 }
-/// The `adrp x2` at code-area offset `at` (a dispatcher's second word) to L1 table `t` (page aligned; the code area is).
-fn dispatch_adr(at: u64, t: usize) -> u32 {
-    let imm = (l1_entry(t, 0) >> 12).wrapping_sub(at >> 12) as u32;
-    0x9000_0002 | (imm & 3) << 29 | (imm >> 2 & 0x7_ffff) << 5
-}
-
-/// Fills the code area's head once, before any block runs: the dispatcher's code (slot 0, its `adrp` written here to L1
-/// table 0: the template's page offset in the resident is not the copy's) and every other slot unbound (`b` to the
-/// miss). False if the dispatcher's second word is not an `adrp x2`, or if any slot's `adrp` to any table does not
-/// decode to that table.
+/// Fills the code area's head once, before any block runs: the dispatcher's code (slot 0, whose `and` the bound slots
+/// copy and which falls through to the miss) and every other slot unbound (`b` to the miss). False if the dispatcher is
+/// not of that form.
 pub fn fill_head(dispatcher: &[u8]) -> bool {
     unsafe {
         copy_record(
@@ -498,14 +485,10 @@ pub fn fill_head(dispatcher: &[u8]) -> bool {
             dispatcher.len(),
         )
     };
-    // The dispatcher's form: `and x1, x0, #L1_SET_MASK`, an `adrp x2`, `add x2, x2, x1, lsl #6` (the set size).
+    // The dispatcher's form: `and x1, x0, #L1_SET_MASK`, three `nop`s, the miss's `svc`.
     let form = word(slot_at(0)) == 0x9240_0001 | (area::L1_SET_BITS - 1) << 10
-        && word(slot_at(0) + 4) & 0x9f00_001f == 0x9000_0002
-        && word(slot_at(0) + 8) == 0x8b01_0042 | area::L1_SET_BYTES.trailing_zeros() << 10;
-    unsafe {
-        ((area::CODE_WRITE_VA + slot_at(0) + 4) as *mut u32)
-            .write_volatile(dispatch_adr(slot_at(0) + 4, 0))
-    };
+        && (1..4).all(|k| word(slot_at(0) + 4 * k) == 0xd503_201f)
+        && dispatcher.len() == 20;
     let c = control();
     for k in 1..area::DISPATCH_SLOTS {
         let mut words = [0u32; area::DISPATCH_SLOT_BYTES / 4];
@@ -530,21 +513,7 @@ pub fn fill_head(dispatcher: &[u8]) -> bool {
         area::DISPATCH_VA,
         area::DISPATCH_BYTES,
     );
-    // ADRP: immlo bits 30:29, immhi bits 23:5, a signed 21-bit count of 4 KiB pages from the instruction's page.
-    let target = |at: u64, w: u32| {
-        (at & !0xfff).wrapping_add(
-            (((((w >> 29 & 3) | (w >> 5 & 0x7_ffff) << 2) << 11) as i32 >> 11) as i64 as u64) << 12,
-        )
-    };
-    let adr = |k: usize, t: usize| (slot_at(k) + 4, dispatch_adr(slot_at(k) + 4, t));
-    c.l1_table == 0
-        && form
-        && (0..area::DISPATCH_SLOTS).all(|k| {
-            (0..area::L1_TABLES).all(|t| {
-                let (at, w) = adr(k, t);
-                w & 0x9f00_001f == 0x9000_0002 && target(at, w) == l1_entry(t, 0)
-            })
-        })
+    c.l1_table == 0 && form
 }
 /// Perf chunk 12: slot `k` names L1 table `t` (the dispatcher's words with its own `adrp`), or misses (`None`).
 fn write_slot(k: usize, t: Option<usize>) {
@@ -553,8 +522,8 @@ fn write_slot(k: usize, t: Option<usize>) {
     match t {
         None => words[0] = branch(at, area::DISPATCH_MISS as u64),
         Some(t) => {
-            // The tables lie a whole number of pages from x28, after its 2 MiB or before it ([`area::dl1_after`]): `add x2,
-            // x28, #pages, lsl #12`, or `sub`.
+            // The tables of `t`'s class lie a whole number of pages from x28, after its 2 MiB or before it
+            // ([`area::dl1_after`]): `add x2, x28, #pages, lsl #12`, or `sub`.
             let va = control().guest_state_va;
             let page = (va >> 12 & 511) as u32;
             // (One data table's pages.)
@@ -568,7 +537,10 @@ fn write_slot(k: usize, t: Option<usize>) {
             // [x2, #24]; br x1`.
             words[..13].copy_from_slice(&[
                 word(slot_at(0)),
-                reach(TABLE_PAGES * t as u32, 512 * area::DL1_BLOCKS as u32 - TABLE_PAGES * t as u32),
+                {
+                    let k = (t % area::L1_SPACE_TABLES) as u32;
+                    reach(TABLE_PAGES * k, 512 - TABLE_PAGES * k)
+                },
                 0x8b01_1442,
                 0xf940_0041,
                 0xca00_0021,
@@ -634,7 +606,9 @@ pub fn dispatcher_for(context: u64) -> u64 {
 /// with no code written (before, the one dispatcher's `adr` was rewritten at every change, about 90 ns). A context
 /// with no table takes the least recently left one, cleared first: the old context's slot then misses (its blocks exit
 /// to the resident until it takes a table again) and the new one's names the table. Every table's entries are kept as
-/// exact as the current one's: a TLB flush, an invalidation or a reset reaches them all.
+/// exact as the current one's: a TLB flush, an invalidation or a reset reaches them all. A context takes only a table of
+/// its privilege class ([`area::l1_user_table`]): each shadow space maps only its class's tables, so a slot's table is
+/// always mapped where its blocks run and user code can read no supervisor context's entries.
 pub fn select_l1(context: u64) {
     let c = control();
     let now = c.l1_table as usize;
@@ -647,7 +621,9 @@ pub fn select_l1(context: u64) {
         Some(t) => t,
         None => {
             let p = crate::perf::enter(crate::perf::L1);
+            let user = context & 3 == 3;
             let t = (0..area::L1_TABLES)
+                .filter(|&t| area::l1_user_table(t) == user)
                 .min_by_key(|&t| c.l1_used[t])
                 .unwrap_or(0);
             // Before the table changes hands: the old context's blocks reach no entry of the new one.

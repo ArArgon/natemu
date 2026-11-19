@@ -344,34 +344,39 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
 
 /// G1: the guest-state page's EL0 alias (the host-selected `va`, x28 of generated code), EL0 and EL1 read/write,
 /// never executable, backed by window `window`'s page at backing offset `target` (its frame page): one upper-root entry of
-/// both shadow spaces (an entry below 256, which no shadow uses) links the owner's own tables
-/// (`execution::GUEST_STATE_TABLES`, never mapped in the window), whose only leaf is this page.
+/// each shadow space (an entry below 256, which no shadow uses) links that space's own level-1 and level-2 tables
+/// (`execution::GUEST_STATE_TABLES` for the supervisor space, `GUEST_STATE_USER_TABLES` for the user one, never mapped in
+/// the window), which share the leaf table whose only entry is this page. With `dl1` (the backing offset of the
+/// dispatcher's data tables), each space's level 2 also maps its own class's 2 MiB block of them (`cache::DL1`: block 0
+/// supervisor, block 1 user), EL0 and EL1 read-only, at the same address beside the alias: user code reads no
+/// supervisor context's entries.
 pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, va: u64, dl1: Option<usize>) {
+    use natemu_abi::execution::{GUEST_STATE_TABLES, GUEST_STATE_USER_TABLES, cache};
     assert!(natemu_abi::execution::guest_state_alias_valid(va));
-    let [l1, l2, leaf] = natemu_abi::execution::GUEST_STATE_TABLES;
+    let [l1, l2, leaf] = GUEST_STATE_TABLES;
+    let [user_l1, user_l2] = GUEST_STATE_USER_TABLES;
     let index = |level: u32| (va >> (39 - 9 * level) & 511) as usize * 8;
     let word = |at: usize, value| memory.word(window + at, value);
     let table = |offset: usize| IPA + (window + offset) as u64 + 3;
-    for root in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT] {
+    let i = (va >> 21 & 511) as usize;
+    let at = if cache::dl1_after(va) { i + 1 } else { i - 1 };
+    for (k, (root, l1, l2)) in [(shadow::UPPER_ROOT, l1, l2), (shadow::USER_UPPER_ROOT, user_l1, user_l2)]
+        .into_iter()
+        .enumerate()
+    {
         word(root + index(0), table(l1));
+        word(l1 + index(1), table(l2));
+        word(l2 + index(2), table(leaf));
+        if let Some(dl1) = dl1 {
+            let ipa = IPA + (dl1 + k * cache::BLOCK) as u64;
+            assert_eq!(ipa % cache::BLOCK as u64, 0);
+            word(l2 + at * 8, ipa | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN);
+        }
     }
-    word(l1 + index(1), table(l2));
-    word(l2 + index(2), table(leaf));
     word(
         leaf + index(3),
         (IPA + target as u64) | PAGE | EL0_DATA | PXN | UXN,
     );
-    // The dispatcher's data tables (backing offset `dl1`) and the reserved block after them, three 2 MiB blocks, EL0 and EL1 read-only.
-    if let Some(dl1) = dl1 {
-        let i = (va >> 21 & 511) as usize;
-        let blocks = natemu_abi::execution::cache::DL1_BLOCKS;
-        let first = if natemu_abi::execution::cache::dl1_after(va) { i + 1 } else { i - blocks };
-        for k in 0..blocks {
-            let ipa = IPA + (dl1 + k * 0x20_0000) as u64;
-            assert_eq!(ipa % 0x20_0000, 0);
-            word(l2 + (first + k) * 8, ipa | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN);
-        }
-    }
 }
 
 /// The resident's boot and extended text in window `window`.
@@ -561,6 +566,44 @@ pub(crate) mod tests {
                 }
                 assert_eq!(word(PRIVATE_LEAF + 0x24000 / 4096 * 8), 0);
             }
+        }
+    }
+
+    /// Each shadow space's slot of the alias maps exactly the alias page and its own class's 2 MiB block of the
+    /// dispatcher's data tables (supervisor block 0, user block 1), EL0 read-only, at the same address, after the alias's
+    /// 2 MiB or (at the slot's last 2 MiB of a GiB) before it; nothing else in the slot is valid.
+    #[test]
+    fn dispatcher_tables_each_space_maps_only_its_own() {
+        use natemu_abi::execution::{FRAME_OFFSET, GUEST_STATE_SLOT, cache::BLOCK as MIB2};
+        let dl1 = 4 * RAM_SIZE;
+        for offset in [0, 4096, (1 << 30) - 4096, 300 << 30] {
+            let va = GUEST_STATE_SLOT.start + offset;
+            let memory = Memory::with_size(dl1 + 2 * MIB2).unwrap();
+            private_space(&memory, 0, &resident_text(0), true);
+            guest_state_alias(&memory, 0, FRAME_OFFSET, va, Some(dl1));
+            let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(offset));
+            let next = |entry: u64| (entry & 0x0000_ffff_ffff_f000) as usize - IPA as usize;
+            let valid = |table: usize| (0..512).filter(|&i| word(table + i * 8) & 1 != 0).collect::<Vec<_>>();
+            let i = (va >> 21 & 511) as usize;
+            let at = if i < 511 { i + 1 } else { i - 1 };
+            let mut l2s = vec![];
+            for (k, root) in [shadow::UPPER_ROOT, shadow::USER_UPPER_ROOT].into_iter().enumerate() {
+                let slot = (va >> 39 & 511) as usize;
+                assert_eq!(valid(root).into_iter().filter(|&e| e < 256).collect::<Vec<_>>(), [slot]);
+                let l1 = next(word(root + slot * 8));
+                assert_eq!(valid(l1), [(va >> 30 & 511) as usize]);
+                let l2 = next(word(l1 + (va >> 30 & 511) as usize * 8));
+                assert_eq!(valid(l2), { let mut v = vec![i, at]; v.sort(); v });
+                assert_eq!(
+                    word(l2 + at * 8),
+                    (IPA + (dl1 + k * MIB2) as u64) | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN
+                );
+                let leaf = next(word(l2 + i * 8));
+                assert_eq!(valid(leaf), [(va >> 12 & 511) as usize]);
+                assert_eq!(word(leaf + (va >> 12 & 511) as usize * 8), (IPA + FRAME_OFFSET as u64) | PAGE | EL0_DATA | PXN | UXN);
+                l2s.push(l2);
+            }
+            assert_ne!(l2s[0], l2s[1], "each space has its own level-2 table");
         }
     }
 

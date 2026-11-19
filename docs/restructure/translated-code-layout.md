@@ -21,16 +21,23 @@ masks the RIP, loads the first way's RIP, compares, and on a match loads its add
 second way, and otherwise branches to the miss path. Filling or emptying an entry is two stores and nothing is
 synchronized.
 
-- Where: the tables sit in the resident's lookup area (`area::DL1`), 2 MiB blocks mapped read-only for guest code in the
-  same second-level table as the guest-state alias, after it when they fit, else before it (`dl1_after`). The slot reaches
-  table t from the guest-state register by a page count.
+- Where: the tables sit in the resident's lookup area (`area::DL1`), two 2 MiB blocks of two tables each: tables 0 and 1
+  serve supervisor (CPL 0-2) code contexts, tables 2 and 3 user (CPL 3) ones, and a context only ever takes a table of
+  its own class. Each of a vCPU's two shadow spaces (supervisor and user, switched at every CPL change) has its own
+  level-1 and level-2 table for the guest-state alias's slot; each maps the alias page and only its own class's block,
+  read-only, at the same address beside the alias (after it when it fits, else before it: `dl1_after`). The slot reaches
+  its table from the guest-state register by a page count, as before; nothing in the slot code depends on the class.
 - The empty marker: an empty way holds `DL1_EMPTY` (bit 62) as its RIP and the dispatcher's miss path as its address. The
   marker passes the computed-exit canonical check (which compares bits 63 and 47 only), so a guest jump to exactly that
   address matches the marker and must, and does, miss like any other target.
-- Known limitation: the tables are readable by guest user code, in a region that x86 treats as non-canonical (so no x86
-  access can name it, but the guest's own translated code runs at EL0 and the mapping is what it is). Making them
-  kernel-only, or randomizing their place, is deferred by the owner.
-
+- What guest code can read (a documented deviation like the alias page itself: translated loads are not address-guarded,
+  and these addresses are non-canonical on x86, so no x86 access should reach them): supervisor code reads the two
+  supervisor tables, user code the two user tables, nothing else in the slot. User code thus learns no kernel address.
+  The user tables hold the jump targets of user code in the current address space only: a CR3 load empties every entry of
+  a non-global block (the TLB rule), so another process's entries are gone before this one runs; what survives are
+  entries of global user pages, translations x86 itself shares across address spaces. Both user tables are readable, so
+  one user context (CPL 3 with given FP and SIMD controls) can read another's entries, which are of the same address
+  space too. The guest test is `tables-*` in `tools/run_frame_randomization.py` (suite step `frame-randomization`).
 
 ## 3. Extended blocks
 

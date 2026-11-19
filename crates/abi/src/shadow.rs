@@ -121,9 +121,10 @@ const UPPER_TABLES: [usize; 3] = [UPPER_L1, UPPER_L2, UPPER_LEAF];
 /// Window pages holding the owner's tables and shadow state: never a target.
 const PRIVATE_TABLES: core::ops::Range<usize> = LOWER_ROOT..USER_UPPER_ROOT + 4096;
 /// G1: the frame page (the guest-state page, also reached by its EL0 alias) and the alias's tables: never a target.
-const GUEST_STATE: [core::ops::Range<usize>; 2] = [
+const GUEST_STATE: [core::ops::Range<usize>; 3] = [
     crate::execution::FRAME_OFFSET..crate::execution::FRAME_OFFSET + 4096,
     crate::execution::GUEST_STATE_TABLES[0]..crate::execution::GUEST_STATE_TABLES[2] + 4096,
+    crate::execution::GUEST_STATE_USER_TABLES[0]..crate::execution::GUEST_STATE_USER_TABLES[1] + 4096,
 ];
 
 impl<M: Maintenance> Space<M> {
@@ -678,6 +679,7 @@ mod tests {
             crate::execution::FRAME_OFFSET,
             l1,
             leaf,
+            crate::execution::GUEST_STATE_USER_TABLES[1],
         ] {
             let target = IPA + own as u64;
             assert_eq!(s.map(0x20_0000, target, false), Err(Error::Private));

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Test per-VM frame randomization, including its deliberately retained selected-page hole.
+"""Test per-VM frame randomization, including its deliberately retained selected-page hole, and that each privilege
+class reads only its own dispatcher tables beside it (`tables-*`).
 
 Caller holds the VM lock. Selected-page successes are documented deviations, not
 architectural passes. Neighbor pages must #GP without effects. The strict guard
@@ -128,6 +129,45 @@ def transition_judge(got, n, alias=None):
     return errors
 
 
+# The dispatcher's data tables beside the alias: each shadow space maps only its own class's 2 MiB block (supervisor
+# tables at CPL 0, user tables at CPL 3) in the 2 MiB after the alias's, or before it when the alias is in its GiB's
+# last 2 MiB. Aliases: (selected, the tables' block, addresses that must #GP at both CPLs: the rest of that GiB's blocks
+# where the tables and a removed study's block used to be, and the neighbouring GiB).
+TABLE_ALIASES = [('after', strict.FRAME, 0xffff400000200000, [0xffff400000400000, 0xffff400000600000, 0xffff400000a00000]),
+                 ('before', 0xffff40003fe01000, 0xffff40003fc00000, [0xffff40003fa00000, 0xffff400040000000])]
+
+
+def table_program(block):
+    """CPL 0 enters K by `jmp rax` (the supervisor table gets K), CPL 3 then enters U the same way (the user table gets U),
+    scans the tables' 2 MiB for K (r12) and U (r13), returns to CPL 0 and scans the same addresses again (r14, r15)."""
+    scan = lambda n, k, u: (f'mov rsi, {block:#x}\nmov ecx, 0x40000\nscan{n}: mov rax, [rsi]\nxor ebx, ebx\n'
+                            f'cmp rax, rdx\nsete bl\nadd {k}, rbx\nxor ebx, ebx\ncmp rax, rdi\nsete bl\nadd {u}, rbx\n'
+                            f'add rsi, 8\ndec ecx\njnz scan{n}\n')
+    body = ('lea rdx, [rip + kt]\nlea rdi, [rip + ut]\njmp rdx\nkt: nop\nsw3: nop\nlea rax, [rip + ut]\njmp rax\nut: nop\n'
+            + scan(3, 'r12', 'r13') + 'sw0: nop\n' + scan(0, 'r14', 'r15'))
+    code, labels = strict.ref.assemble(body, labels=True)
+    return '\n'.join([f'body {strict.CODE:#x} {code.hex()}', 'cpu', f'rip {strict.CODE:#x}', 'cpl 0', 'rflags 0x202', 'sse 1',
+                      f'switch {strict.CODE + labels["sw3"]:#x} 3', f'switch {strict.CODE + labels["sw0"]:#x} 0',
+                      'gpr ' + ' '.join(['0x0'] * 4 + [hex(strict.DATA + 0x1f00)] + ['0x0'] * 11)]) + '\n'
+
+
+def table_judge(got, alias):
+    errors = alias_errors(got, alias)
+    got = got.get('cpus', [got])[0]
+    if got['stop'] != 'reached':
+        return errors + [f'table scan stopped: {got["stop"]} {got.get("fault")}']
+    k3, u3, k0, u0 = (strict.ref.num(got['gpr'][r]) for r in (12, 13, 14, 15))
+    if k3:
+        errors.append(f'CPL 3 read a supervisor entry ({k3} words)')
+    if not u3:
+        errors.append('CPL 3 did not see its own entry (the scan reads the wrong place)')
+    if not k0:
+        errors.append('CPL 0 did not see its own entry (the scan reads the wrong place)')
+    if u0:
+        errors.append(f'CPL 0 table holds a user entry ({u0} words)')
+    return errors
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ('host', 'runtime', 'fexc', 'out'):
@@ -178,6 +218,24 @@ def main():
                 got, rc = execute(a, transition_program(n, cpl, alias), a.out / name, alias)
                 record(name, transition_judge(got, n, alias) if got else [f'driver failed: {rc}'],
                        classification='known selected-page deviation plus private-frame and transition checks')
+    for tag, alias, block, holes in TABLE_ALIASES:
+        name = f'tables-{tag}-own-class-only'
+        if a.only in name:
+            got, rc = execute(a, table_program(block), a.out / name, alias)
+            record(name, table_judge(got, alias) if got else [f'driver failed: {rc}'],
+                   classification='known deviation: a space reads its own class\'s dispatcher tables')
+        for hole in holes:
+            for cpl in (0, 3):
+                name = f'tables-{tag}-hole-{hole:#x}-cpl{cpl}'
+                if a.only not in name:
+                    continue
+                c = dict(name=name, regs={7: hole + 0x800}, fault=13, insn='mov rax, [rdi]')
+                text, at, end = strict.description(c, cpl)
+                before, rc0 = execute(a, strict.description(c, cpl, True)[0], a.out / name / 'prefix', alias)
+                got, rc = execute(a, text, a.out / name / 'probe', alias)
+                errors = ([f'prefix/probe failed: {rc0}/{rc}'] if not before or before['stop'] != 'reached' or not got
+                          else alias_errors(got, alias) + strict.judge(c, before, got, at, end))
+                record(name, errors, classification='architectural GP')
     for i in range(a.samples):
         n = 1 if i % 2 == 0 else 4
         name = f'random-transitions-{i}-n{n}'
