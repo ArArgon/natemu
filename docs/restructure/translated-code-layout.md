@@ -53,10 +53,18 @@ Only the body is hot. In the resident:
 
 - Without FEX's tail (its data words after the code) blocks are placed at 16-byte alignment instead of 64, so word 0 of an
   admitted object is the placed length.
-- The words of a block up to its first exit are copied into a dense hot stream, one hot zone (12 KiB) at the start of each
-  32 KiB segment, and the block is entered there. Branches out of the copy are re-encoded, and each exit's trampoline
-  follows the body, so the exit still reaches the block's whole code, which stays in the segment's cold part; every exit,
-  link, stop, site and resume names that cold copy.
+- The words of a block up to its first exit are copied into a dense hot stream, the hot zone at the start of a 32 KiB
+  segment (a `tbz` reaches 32 KiB, so a hot copy's branches reach every code word of its segment), and the block is entered
+  there. Branches out of the copy are re-encoded, and each exit's trampoline follows the body, so the exit still reaches the
+  block's whole code, which stays in the segment's cold part; every exit, link, stop, site and resume names that cold copy.
+- Segments: both sides are filled upward (the resident finds a block from a PC by binary search over the records, which
+  need code addresses and hot addresses each in placement order), so the zone's size is fixed when a segment opens. A segment
+  closes when the next block's hot copy or code does not fit its side, and the next one opens at the code side's fill point,
+  on top of whatever code space the old one had left: only a hot zone's unused rest is lost. A zone as large as the hot
+  share of the placed bytes (12 KiB of 32 at first) lost 6% of the code area on a CPython build (measured; the cold side
+  filled first in 1 segment of 7). The zone is now half that share (6 KiB or so; `SegFill::zone` in `crates/abi`, from the hot
+  and code bytes placed lately), which leaves 2% (the code side still ends 6% of the segments). Growing the code side
+  downward from the segment's end would make it zero, but needs the record order searched by segment; not done.
 - A block is placed whole, with no hot copy, when it has no exit to split at, when its body already reaches the end, or
   when its last word falls through into a word that is not an exit (such a block had a forged guard-stub site record that ran
   the hot zone's old content).

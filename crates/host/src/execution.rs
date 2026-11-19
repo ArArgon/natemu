@@ -756,6 +756,8 @@ pub struct K1 {
     flushes: u64,
     flush_us: u64,
     full: [u64; 3],
+    /// [`Control::seg_stats`]: segments opened, hot bytes abandoned, cold bytes abandoned, bytes placed.
+    segments: [u64; 4],
     used: [u64; 3],
     peak: [u64; 3],
     capacity: [u64; 3],
@@ -996,6 +998,7 @@ impl K1 {
             flushes: c.flushes,
             flush_us: us(c.flush_ticks),
             full: c.full,
+            segments: c.seg.stats,
             used: [c.code_used, c.meta_used, c.blocks],
             peak: [
                 c.peak[0].max(c.code_used),
@@ -4486,6 +4489,7 @@ mod tests {
         // The code-size study's record is newer than the reference formatter: it counts live blocks with code of their own,
         // and no block exists here.
         assert_eq!(now.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
+        now.as_object_mut().unwrap().remove("segments");
         assert_eq!(empty, now);
         let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
         let mut c: cache::Control = area.read_record(offset);
@@ -4546,6 +4550,7 @@ mod tests {
         assert_eq!(new.as_object_mut().unwrap().remove("pool").unwrap()["probes"], 0);
         // (So is the code-size record: no block record exists here, so every count is 0.)
         assert_eq!(new.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
+        new.as_object_mut().unwrap().remove("segments");
         assert_eq!(old, new);
     }
 

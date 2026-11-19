@@ -69,10 +69,6 @@ pub fn pack_placed(r: &Reloc, size: u32) -> Option<Option<u32>> {
 /// is what every exit, link, stop, site and resume names ([`split`]).
 #[cfg(feature = "pic-count")]
 compile_error!("pic-count is not available: the hot/cold layout does not mirror its counting stubs (the study's stubs would have to be placed in the hot stream as well)");
-/// A segment of the code area while splitting: its hot zone, then the whole code of its blocks; every word of one is within
-/// a `tbz`'s reach (32 KiB) of every other.
-const SEG_BYTES: u64 = 32 * 1024;
-const HOT_ZONE: u64 = 12 * 1024;
 /// Hot/cold: where block's hot copy ends ([`natemu_abi::execution::body_end`]: its body's end, its exit words and check
 /// stubs' first words being where it stops; `word` reads its code as admitted, `stub` says whether a word is a check stub's
 /// first) and the bytes it takes in the hot zone past its first word (which is the block before's last): the trampolines of
@@ -98,31 +94,15 @@ fn split_point(
     let after = e[..n].iter().filter(|&&x| u64::from(x) > h).count() as u64;
     (h as u32, 4 * after + h)
 }
-/// Where a block of `size` bytes goes (its whole code, 16-byte aligned) and, when its hot copy takes `hot` bytes (0: not
-/// split), that copy (`u64::MAX`: none): a new segment opens when this one's hot zone or its end is reached. `None`: the
+/// Where a block of `size` bytes goes and where its hot copy ([`natemu_abi::execution::cache::SegFill::reserve`]); `None`: the
 /// area is full.
 fn reserve(size: u64, hot: u64) -> Option<(u64, u64)> {
     let c = control();
-    let mut code = c.code_used.next_multiple_of(CODE_ALIGN);
-    let mut at = u64::MAX;
-    if hot != 0 {
-        let fits = |c: &Control, code: u64| c.hot_used + hot + 4 <= c.hot_end && code + size <= c.seg_end;
-        // (Only for a block it can hold: one whose hot copy or code does not fit an empty segment is placed whole.)
-        if !fits(c, code) && hot + 4 <= HOT_ZONE && HOT_ZONE + size <= SEG_BYTES && code + SEG_BYTES <= c.code_bytes {
-            (c.hot_used, c.hot_end, c.seg_end) = (code, code + HOT_ZONE, code + SEG_BYTES);
-            code += HOT_ZONE;
-            // (Nothing else is placed in the hot zone.)
-            c.code_used = code;
-        }
-        if fits(c, code) {
-            at = c.hot_used;
-        }
-    }
-    if code + size > c.code_bytes {
+    let r = c.seg.reserve(&mut c.code_used, c.code_bytes, size, hot);
+    if r.is_none() {
         c.full[0] += 1;
-        return None;
     }
-    Some((code, at))
+    r
 }
 /// Hot/cold: makes the hot copy of the block `b` (its record as it will be filed: `code`, `hot`, `hot_size`, links and
 /// computed exit; its code placed and relocated), each branch going where its target is now (a word of its body or its first
@@ -343,6 +323,7 @@ fn hash(rip: u64, context: u64) -> usize {
 /// Called with no generated code live and the state banked (links already undone, see [`unlink_all`]).
 pub fn reset() {
     let c = control();
+    c.seg.reset(area::HEAD_BYTES as u64);
     for (p, used) in c.peak.iter_mut().zip([c.code_used, c.meta_used, c.blocks]) {
         *p = (*p).max(used);
     }
@@ -356,7 +337,6 @@ pub fn reset() {
         c.links_tlb,
         c.links_local,
     ) = (area::HEAD_BYTES as u64, 0, 0, 0, 0, 0, 0, 0);
-    (c.hot_used, c.hot_end, c.seg_end) = (area::HEAD_BYTES as u64, area::HEAD_BYTES as u64, area::HEAD_BYTES as u64);
     // A `checked` of 0 is never current.
     (c.epoch, c.global_epoch) = (c.epoch.max(1), c.global_epoch.max(1));
     (c.regions, c.large_regions, c.large_count) = ([0; 16], [0; 16], 0);
@@ -1078,7 +1058,7 @@ pub fn place(
         synchronize_code(area::CODE_WRITE_VA + code, area::CODE_VA + code, size as usize);
         c.code_used = code_end;
         if placed.hot_size != 0 {
-            c.hot_used = placed.hot_body() + u64::from(placed.hot_size);
+            c.seg.hot_used = placed.hot_body() + u64::from(placed.hot_size);
         }
         Some(placed)
     }
@@ -1472,7 +1452,7 @@ pub fn copy(
     if placed.is_some() {
         c.code_used = code_end;
         if let Some(p) = placed.filter(|p| p.hot_size != 0) {
-            c.hot_used = p.hot_body() + u64::from(p.hot_size);
+            c.seg.hot_used = p.hot_body() + u64::from(p.hot_size);
         }
     }
     #[cfg(feature = "pic-count")]
@@ -1585,7 +1565,7 @@ pub fn copy_pooled(
     if placed.is_some() {
         c.code_used = code_end;
         if let Some(p) = placed.filter(|p| p.hot_size != 0) {
-            c.hot_used = p.hot_body() + u64::from(p.hot_size);
+            c.seg.hot_used = p.hot_body() + u64::from(p.hot_size);
         }
     }
     Ok(placed)
@@ -1686,7 +1666,7 @@ unsafe fn file(
             number: n as u32,
             next,
             lnext,
-            hot: if record.hot_size != 0 { record.hot } else { c.hot_used as u32 },
+            hot: if record.hot_size != 0 { record.hot } else { c.seg.hot_used as u32 },
             ..record
         });
         if current {

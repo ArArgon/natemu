@@ -901,11 +901,85 @@ pub mod cache {
         pub relink_dropped: u64,
         /// PCID gain study ([`pcid_study`]; `pcid-study` resident builds only, zero otherwise). Appended.
         pub pcid_study: [u64; pcid_study::COUNT],
-        /// Hot/cold layout: the hot fill point, the end of the current segment's hot zone and the segment's end (blocks'
-        /// full code goes above the hot zone, below the segment's end, so the hot copy's branches reach it). Appended.
+        /// Hot/cold layout: where the current segment's hot copies and code are filled ([`SegFill`]). Appended.
+        pub seg: SegFill,
+    }
+    /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
+    /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
+    /// KiB) of every other. Blocks and hot copies are both placed upward (placement order is address order, which the
+    /// resident's PC lookup searches by), so the cut between the zone and the code is fixed when the segment opens.
+    ///
+    /// A new segment opens at the code side's fill point as soon as either side cannot take the next block. Code left in the
+    /// old segment's end is then not lost (the new segment's hot zone begins on it); only a hot zone the code side outran
+    /// leaves its unused rest behind. So the zone is cut smaller than the mix of what was placed lately says
+    /// ([`SegFill::zone`]), and the hot zone is the side that fills first.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct SegFill {
+        /// The hot fill point, the end of the segment's hot zone and the segment's end (code-area offsets).
         pub hot_used: u64,
         pub hot_end: u64,
         pub seg_end: u64,
+        /// Hot-copy bytes and code bytes placed lately (halved from time to time): the next zone's share.
+        pub mix: [u64; 2],
+        /// Segments opened, bytes of hot zones left unused when their segment was left, segments left because their code side
+        /// ended (the zone was too big), and bytes placed (hot copies and code). Counters only; they survive flushes.
+        pub stats: [u64; 4],
+    }
+    pub const SEG_BYTES: u64 = 32 * 1024;
+    /// The hot zone of a segment opened before enough has been placed to know the mix.
+    pub const HOT_ZONE: u64 = 12 * 1024;
+    impl SegFill {
+        /// A flush: the zone's unused rest is counted, and the next block opens a segment at the new fill point.
+        pub fn reset(&mut self, head: u64) {
+            self.stats[1] += self.hot_end.saturating_sub(self.hot_used);
+            (self.hot_used, self.hot_end, self.seg_end) = (head, head, head);
+        }
+        /// The size of the hot zone of a segment opened for a block of `size` code bytes whose hot copy takes `hot`: half
+        /// the share of hot-copy bytes in what was placed lately (so the code side, which has the segment's rest, seldom ends
+        /// first; measured on a CPython build, three quarters left the code side ending 14% of the segments, half 6%), within what holds this block (`None`: none does, the block is placed whole).
+        fn zone(&self, hot: u64, size: u64) -> Option<u64> {
+            let lo = (hot + 4).next_multiple_of(16);
+            let hi = SEG_BYTES.checked_sub(size)? & !15;
+            let total = self.mix[0] + self.mix[1];
+            let want = if total < 64 * 1024 { HOT_ZONE } else { (SEG_BYTES * self.mix[0] / total / 2) & !15 };
+            (lo <= hi).then(|| want.clamp(lo, hi))
+        }
+        /// Where a block of `size` bytes goes (its whole code, 16-byte aligned, from `*code_used` up) and, when its hot copy
+        /// takes `hot` bytes (0: not split), that copy (`u64::MAX`: none). A new segment opens (`*code_used` moves to its code
+        /// side) when this one's hot zone or its end is reached. `None`: the area (`code_bytes`) is full.
+        pub fn reserve(&mut self, code_used: &mut u64, code_bytes: u64, size: u64, hot: u64) -> Option<(u64, u64)> {
+            let mut code = code_used.next_multiple_of(16);
+            let mut at = u64::MAX;
+            if hot != 0 {
+                let fits = |s: &Self, code: u64| s.hot_used + hot + 4 <= s.hot_end && code + size <= s.seg_end;
+                if !fits(self, code) && code + SEG_BYTES <= code_bytes {
+                    // (Only for a block a segment can hold: else it is placed whole.)
+                    if let Some(z) = self.zone(hot, size) {
+                        self.stats[0] += 1;
+                        self.stats[1] += self.hot_end.saturating_sub(self.hot_used);
+                        self.stats[2] += u64::from(code + size > self.seg_end && self.hot_used + hot + 4 <= self.hot_end);
+                        (self.hot_used, self.hot_end, self.seg_end) = (code, code + z, code + SEG_BYTES);
+                        // (Nothing else is placed in the hot zone.)
+                        code += z;
+                        *code_used = code;
+                    }
+                }
+                if fits(self, code) {
+                    at = self.hot_used;
+                }
+            }
+            if code + size > code_bytes {
+                return None;
+            }
+            let h = if at == u64::MAX { 0 } else { hot };
+            (self.mix[0], self.mix[1]) = (self.mix[0] + h, self.mix[1] + size);
+            if self.mix[0] + self.mix[1] > 8 << 20 {
+                self.mix = [self.mix[0] / 2, self.mix[1] / 2];
+            }
+            self.stats[3] += size + h;
+            Some((code, at))
+        }
     }
     /// Why the placement re-check of a pool entry refused ([`Control::pool_recheck`]).
     pub mod pool_recheck {
@@ -3719,6 +3793,39 @@ pub mod perf {
 
 #[cfg(test)]
 mod tests {
+    /// Segments of the hot/cold layout leave little unused whatever the hot:code mix ([`cache::SegFill`]): blocks of varying
+    /// sizes (hot copy bytes : code bytes of 1:2, 2:1, and a third of the blocks placed whole) fill an area; the bytes the
+    /// code side passed that no hot copy or code holds stay under 3% of what was placed.
+    #[test]
+    fn segments_leave_little_unused_whatever_the_mix() {
+        use super::cache::{SegFill, SEG_BYTES};
+        const HEAD: u64 = 4096;
+        for (name, code, hot, whole_every) in [("1:2", 192u64, 96u64, 0u64), ("2:1", 96, 192, 0), ("whole", 160, 64, 3)] {
+            let (mut f, mut used, bytes) = (SegFill::default(), HEAD, 64 << 20);
+            f.reset(HEAD);
+            let mut x = 12345u64;
+            let mut n = 0u64;
+            loop {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                // Sizes vary by a factor of about two around the mean.
+                let k = 64 + (x >> 33) % 128;
+                let (size, h) = ((code * k / 128 + 15) & !15, hot * k / 128 & !3);
+                n += 1;
+                let whole = whole_every != 0 && n % whole_every == 0;
+                let Some((at, hot_at)) = f.reserve(&mut used, bytes, size, if whole { 0 } else { h }) else { break };
+                assert!(at % 16 == 0 && at >= HEAD && at + size <= bytes);
+                // (A hot copy lies inside the segment's hot zone, below the code; a block with none is placed whole.)
+                if hot_at != u64::MAX {
+                    assert!(!whole && hot_at >= f.seg_end - SEG_BYTES && hot_at + h + 4 <= f.hot_end && f.hot_end <= at);
+                    f.hot_used = hot_at + h;
+                }
+                used = at + size;
+            }
+            // (The code side's fill point has passed every zone and block: what it passed and nothing held is the waste.)
+            let (lost, placed) = (used - HEAD - f.stats[3], f.stats[3]);
+            assert!(lost * 100 < placed * 3, "{name}: {lost} bytes unused of {placed} placed in {} segments", f.stats[0]);
+        }
+    }
     /// A link record's `offset` carries its link point's index above the native offset, for every point of a block.
     #[test]
     fn a_link_record_names_its_point() {
