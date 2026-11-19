@@ -1848,19 +1848,26 @@ impl<'a> Verifier<'a> {
             let last = (self.c.pcs.iter().map(|p| p.guest_offset))
                 .filter(|&g| g < self.c.guest_bytes)
                 .max();
-            for &(src, _) in self.branches.iter().filter(|&&(_, t)| t == offset) {
+            let at_exit = self.instruction(offset);
+            let srcs: Vec<u32> = (self.branches.iter())
+                .filter(|&&(_, t)| t == offset)
+                .map(|&(src, _)| src)
+                .collect();
+            // An exit no branch reaches is entered by falling through: it belongs to the instruction holding it.
+            for src in srcs.iter().map(|&s| Some(s)).chain(srcs.is_empty().then_some(None)) {
                 let before = (self.c.pcs.iter().map(|p| p.guest_offset))
-                    .filter(|&o| self.instruction(offset).is_some_and(|(g, _)| o < g))
+                    .filter(|&o| at_exit.is_some_and(|(g, _)| o < g))
                     .max();
-                let owner = match (self.instruction(offset), self.instruction(src)) {
-                    (Some((g, start)), Some((s, _)))
+                let owner = match (at_exit, src.map(|s| self.instruction(s))) {
+                    (Some((g, start)), Some(Some((s, _))))
                         if start == offset
                             && Some(s) == before
                             && super::branch_target(self.guest_insn(s), 0).is_none() =>
                     {
                         Some(g)
                     }
-                    (_, s) => s.map(|(g, _)| g),
+                    (_, Some(s)) => s.map(|(g, _)| g),
+                    (at_exit, None) => at_exit.map(|(g, _)| g),
                 };
                 let Some(g) = owner else {
                     return Err(format!("exit at {at:#x}: its branch is outside the PC table"));
@@ -1870,7 +1877,8 @@ impl<'a> Verifier<'a> {
                 let own = self.c.rip.wrapping_add(g as u64);
                 if Some(g) != last && target != own && super::branch_target(insn, end) != Some(target) {
                     return Err(format!(
-                        "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it (guest {insn:02x?} at {own:#x}, branch at {src:#x})"
+                        "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it (guest {insn:02x?} at {own:#x}, branch at {})",
+                        src.map_or("none: reached by falling through".into(), |s| format!("{s:#x}"))
                     ));
                 }
             }
@@ -3479,9 +3487,10 @@ mod tests {
 
     /// With `FEXC` set: a conditional's taken branch aimed at the start of the last instruction's code (the `jmp`'s exit, not its
     /// own) is refused: only the instruction right before may skip to the start of an instruction's code (the `ror rax, cl` test
-    /// below). A branch instruction before the last one does not count as such a skip.
+    /// below). A branch instruction before the last one does not count as such a skip. And an exit no branch reaches (entered by
+    /// falling through) belongs to the instruction holding it: the jmp's exit inside the `inc`'s code is refused.
     #[test]
-    fn a_branch_to_the_start_of_the_last_instructions_code_is_not_a_skip() {
+    fn forged_exits_of_middle_instructions_are_refused() {
         let Some(fexc) = std::env::var_os("FEXC") else {
             return;
         };
@@ -3510,6 +3519,17 @@ mod tests {
         object[at..at + 4].copy_from_slice(&0x5400_00c0u32.to_le_bytes()); // b.eq 28
         let e = admit((&object, &source)).expect_err("a jz skipping to the jmp's code admitted");
         assert!(e.contains("direct target of the branch"), "{e}");
+        // The jmp's PC entry moved to its taken exit's offset (40): its own exit (28) lies in the `inc`'s code, entered by falling through.
+        object[at..at + 4].copy_from_slice(&eq_taken.to_le_bytes());
+        let pcs = h.pcs_offset as usize;
+        let last = (0..h.pcs_count as usize).map(|i| pcs + i * size_of::<PcEntry>()).find(|&p| {
+            u32::from_le_bytes(object[p + 4..p + 8].try_into().unwrap()) == 5
+        });
+        let last = last.expect("the jmp's PC entry");
+        assert_eq!(u32::from_le_bytes(object[last..last + 4].try_into().unwrap()), 28);
+        object[last..last + 4].copy_from_slice(&40u32.to_le_bytes());
+        let e = admit((&object, &source)).expect_err("a fall-through exit of a middle instruction admitted");
+        assert!(e.contains("reached by falling through"), "{e}");
     }
 
     /// With `FEXC` set: extended blocks of every conditional form (jcc rel8 and rel32, loop*, jrcxz, with prefixes) as the host
