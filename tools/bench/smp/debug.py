@@ -5,6 +5,7 @@
 and #GP skip 2 bytes (UD2, WRMSR); #PF maps the page again. Expected logs (`expect`) are written from the SDM (Vol.3
 18.3.1, 7.8.3, Table 7-2; tools/models/delivery_model.py), not from either implementation."""
 import pathlib
+import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -488,13 +489,24 @@ PROGRAMS = {'s4-step': (STEP, None, 0), 's4-popf-iret': (POPF_IRET, None, 0), 's
             's4-sysret': (SYSRET, USER, 0), 's4-nops': (NOPS, None, 0)}
 
 
-def program(name):
+def quiet(src):
+    """`src` with debugging off and every instruction the same length: each DR7 write goes to DR0 instead (DR7 keeps its
+    reset 400H, so DR0-3 match nothing) and the TF_ON / IRET-frame OR of TF becomes an AND clearing it."""
+    return re.sub(r'mov dr7, (\w+)', r'mov dr0, \1', src.replace('or qword [rsp], 0x100', 'and qword [rsp], ~0x100'))
+
+
+
+def program(name, quiet_twin=False):
     body, user, keep = PROGRAMS[name]
     want = None
     if name in DATA_PROGRAMS:
         body, want = data_body(body)
     src = P.sys_text(0, (('' if name == 's4-sysret' else HEAD) + body + TAIL + HANDLERS).format(**F))
     code, labels = P.ref_assemble(src)
+    if quiet_twin:
+        code2, labels2 = P.ref_assemble(quiet(src))
+        assert len(code2) == len(code) and labels2 == labels and code2 != code, name
+        code = code2
     gates = b''
     for v in range(0x22):
         off = P.SYS_CODE(0) + labels[f's4_v{v}'] if v in VECTORS else 0
@@ -1013,3 +1025,30 @@ n_l:
 DATA_PROGRAMS.update({'s4-d-ext-frame': EXT_FRAME, 's4-d-noncanon': NONCANON})
 PROGRAMS['s4-d-ext-frame'] = (EXT_FRAME, None, 0)
 PROGRAMS['s4-d-noncanon'] = (NONCANON, None, 0)
+
+
+# The programs whose end registers and captured memory must equal their quiet twin's (`program(name, quiet_twin=True)`): the
+# #DB handler changes nothing architectural besides DR6 and the frame's RF, so with debugging off the same instructions
+# leave the same results. s4-dr reads the debug registers themselves (`expect_regs`).
+QUIET = ['s4-step'] + list(DATA_PROGRAMS)
+# Bytes that may differ: the log cursor (PTRS + 20H), and the handler frames a #DB leaves on dead stack in a captured page
+# (the 48H bytes below the 16-byte aligned RSP it was delivered at: s4-d-stack's at d_t (RSP Z + 8) and at s4_v3 (the INT3
+# frame's, Z2 + 10H - 28H); s4-d-sys's at f_t (FS, after the far CALL)).
+_frame = lambda rsp: ((rsp & ~0xf) - 0x48, rsp & ~0xf)
+QUIET_SKIP = {'': [(PTRS + 0x20, PTRS + 0x28)], 's4-d-stack': [_frame(Z + 8), _frame(Z2 + 0x10 - 0x28)], 's4-d-sys': [_frame(FS)]}
+
+
+def quiet_problems(name, loud, quiet):
+    """Differences of a run's end registers and captured memory from its quiet twin's; each run {'gpr': [16], 'memory':
+    {address: bytes}}, the log page left out."""
+    out = [f'{r} {a:#x} != quiet twin {b:#x}' for r, a, b in zip(P.REGS, loud['gpr'], quiet['gpr']) if a != b]
+    skip = QUIET_SKIP[''] + QUIET_SKIP.get(name, [])
+    for addr, data in loud['memory'].items():
+        if addr == LOG:
+            continue
+        other = quiet['memory'].get(addr, b'')
+        diff = [addr + k for k in range(len(data)) if (k >= len(other) or data[k] != other[k])
+                and not any(lo <= addr + k < hi for lo, hi in skip)]
+        if diff:
+            out.append(f'memory at {addr:#x}: {len(diff)} bytes differ from the quiet twin, {diff[0]:#x}..{diff[-1]:#x}')
+    return out

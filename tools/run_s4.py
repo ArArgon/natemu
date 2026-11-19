@@ -9,7 +9,9 @@
   instruction, after MOV SS, at a REP, with LEN 11, a single-step trap landing on one; DR6/DR7 read-back, DR4/DR5
   aliases and DR7.GD; sticky DR6; SYSRET and SYSCALL with TF) at block sizes default and 1. Each event log is judged
   against `debug.expect` and the registers a program reads its results into against `debug.expect_regs` (both written
-  from the SDM). (Pinned QEMU, once compared here, keeps DR6 bit 12 written as 1, and ends a REP OUTSB after the element
+  from the SDM). s4-step and the data-breakpoint programs (`debug.QUIET`) end with the registers and captured memory of
+  their quiet twin, the same instructions run once with DR7 = 0 and TF off (`debug.quiet`; the #DB handler changes
+  nothing architectural but DR6 and RF; the log cursor and the frames left on dead stack excepted). (Pinned QEMU, once compared here, keeps DR6 bit 12 written as 1, and ends a REP OUTSB after the element
   that met an I/O breakpoint.)
 - `cases`: natemu-only, judged by the SDM rules: HLT under TF (#DB with RIP after the HLT, no park; delivery_model A10),
   and the refusals of data and I/O breakpoints (`unsupported_system`), an instruction breakpoint with LEN 01.
@@ -26,6 +28,22 @@ def programs(a, report):
     failures, rows = [], []
     for name in a.programs or debug.PROGRAMS:
         prog = debug.program(name)
+        quiet = None
+        if name in debug.QUIET:
+            # the same program with debugging off (debug.quiet): its end state is what the instructions leave
+            q = debug.program(name, quiet_twin=True)
+            rc, out, err = s3.driver(a.host, a.runtime, a.fexc, s3.smp_description(q), a.out / 'vm' / f'{name}-quiet', [], timeout=300)
+            if out is None:
+                failures.append(f'{name} quiet twin: driver {rc} {err[-600:]}')
+                continue
+            cpu = out['cpus'][0]
+            quiet = {'gpr': [smp.num(x) for x in cpu['gpr']], 'memory': {smp.num(m['addr']): bytes.fromhex(m['data']) for m in cpu['memory']}}
+            end = s3.body_end(q, smp.num(q['cpus'][0]['rip']))
+            bad = [f"stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})"] if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end else []
+            bad += [f'#DB at {e[1]:#x}' for e in debug.log_of(q, quiet['memory']) if e[0] == 1]
+            if bad:
+                failures += [f'{name} quiet twin: {d}' for d in bad]
+                continue
         for block in (None, 1):
             rc, out, err = s3.driver(a.host, a.runtime, a.fexc, s3.smp_description(prog), a.out / 'vm' / f'{name}-{block}', [block] if block else [], timeout=300)
             if out is None:
@@ -39,6 +57,8 @@ def programs(a, report):
             if cpu['stop'] != 'reached' or smp.num(cpu['rip']) != end:
                 vs_sdm.append(f"stopped {cpu['stop']} {cpu['reason']} at {cpu['rip']} (end {end:#x})")
             vs_sdm += s3.per_vcpu_checks(cpu) + debug.judge_regs(prog, [smp.num(x) for x in cpu['gpr']])
+            if quiet is not None:
+                vs_sdm += debug.quiet_problems(name, {'gpr': [smp.num(x) for x in cpu['gpr']], 'memory': memory}, quiet)
             st = cpu['stats']
             rows.append({'program': name, 'block': block, 'events': len(log), 'sdm': vs_sdm,
                          'log': debug.show(prog, log), 'expected': debug.show(prog, debug.expect(prog)),
