@@ -16,7 +16,7 @@ parts = 2
 cap = 3600
 verdict = "verdicts:openssl"
 matrix = { "machine.vcpus" = [4] }
-needs = { cores = 4 }
+needs = { cores = 4, perf = true }
 
 [[suite]]
 name = "torture"
@@ -28,7 +28,7 @@ parts = 1
 cap = 3600
 verdict = "verdicts:torture"
 matrix = { "machine.vcpus" = [4] }
-needs = { cores = 4 }
+needs = { cores = 4, perf = true }
 
 [suite.expected]
 # docs/restructure/correctness-userspace.md, finding 1: an x87 register is a double, so FLD m80 of LDBL_MAX rounds to
