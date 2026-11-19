@@ -102,6 +102,11 @@ Where x86 leaves a result to the processor, a locked answer would pin one proces
 (tools/models/afp_fp/approx.py): any result within the SDM's error bound passes, the results the SDM fixes are
 required, and the rest of the program is still checked against the locked answer.
 
+A natemu bug a test catches never blocks a run: list it in the family's `known-bugs.toml` (`[bug.<id>]` with a
+`note` and `cases` patterns over the node id, `*` and `?` wildcards). The test keeps running; a failure is reported as
+`known-bug`, grouped by bug, and a pass as `known-bug-passed` (remove the entry). Neither fails the gate
+(testkit/known_bugs.py).
+
 A family's `rules.py` may define `applies(suite, case, variant, met)` returning a reason to exclude a case from a
 variant. A variant only ever checks correct behavior; testing a documented wrong behavior belongs in its own test.
 

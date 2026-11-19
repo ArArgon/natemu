@@ -21,7 +21,7 @@ import uuid
 import pytest
 from _pytest.reports import TestReport
 
-from testkit import durations, paths
+from testkit import durations, known_bugs, paths
 from testkit.collect import CaseItem
 from testkit.sched import pool as poolmod
 from testkit.sched.policy import GATE, INTERACTIVE, Request
@@ -103,6 +103,7 @@ class Controller:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.pool = poolmod.Pool()
         self.reasons = {}
+        self.known = known_bugs.Tracker(self.config.rootpath)
         rd = self.dir.parent
         try: t0 = json.loads((rd / 'run.json').read_text())['started']
         except (OSError, ValueError, KeyError): t0 = time.time()
@@ -231,6 +232,7 @@ class Controller:
             st = ev['data'].get('start') or 0
             if st and (u.first_test is None or st < u.first_test): u.first_test = st
             if isinstance(rep.longrepr, list): rep.longrepr = tuple(rep.longrepr)       # JSON turned the skip tuple into a list
+            rep = self.known.adjust(rep)
             hook.pytest_runtest_logreport(report=rep)
             if rep.when == 'teardown' or (rep.when == 'setup' and not rep.passed):
                 u.done.add(rep.nodeid)

@@ -1,0 +1,21 @@
+# Known natemu bugs these tests catch (testkit/known_bugs.py): reported as `known-bug`, never a gate failure.
+# Recorded in docs/research/notes/2026-11-test-migration-findings.md ("natemu: suspected bugs").
+
+[bug.rcp-rsqrt-sdm-fixed-results]
+note = "RCP/RSQRT return QEMU's value where the SDM fixes the result: a denormal source must count as 0.0 (infinity of its sign), RCP's tiny results must flush to 0.0"
+cases = [
+    "i8/i8-forms-057[*]",
+    "i8b/i8-forms-031[*]",
+    "i8b/i8-random-097[*]",
+    "i8b/i8-random-103[*]",
+    "i8b/i8-random-111[*]",
+    "approx-special/approx-special-*::*rcp*/0x00400000",
+    "approx-special/approx-special-*::*rcp*/0x807fffff",
+    "approx-special/approx-special-*::*rcp*/0x7f7fffff",
+    "approx-special/approx-special-*::*rcp*/0xff7fffff",
+    "approx-special/approx-special-*::*rcp*/0x7f000000",
+    "approx-special/approx-special-*::*rcp*/0x7e801000",
+    "approx-special/approx-special-*::*rsqrt*/0x00000001",
+    "approx-special/approx-special-*::*rsqrt*/0x80000001",
+    "approx-special/approx-special-*::*rsqrt*/0x007fffff",
+]

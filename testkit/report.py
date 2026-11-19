@@ -12,6 +12,8 @@ CATEGORIES = {
     'wrapped': ('W', 'WRAPPED'),
     'measured': ('M', 'MEASURED'),
     'exclusion-changed': ('C', 'EXCLUSION CHANGED'),
+    'known-bug': ('k', 'KNOWN BUG'),                    # testkit/known_bugs.py: reported, never a gate failure
+    'known-bug-passed': ('K', 'KNOWN BUG PASSED'),
 }
 GATE_FAILS = ('failed', 'error', 'stale-lock', 'build-failure', 'unpreparable', 'not-runnable', 'exclusion-changed')
 

@@ -43,3 +43,20 @@ smoke = ["i8-forms-000"]
 # real x86 where AMD and Intel agree; the Intel-SDM model (tools/models/afp_fp) for the three where the AMD box returns
 # another NaN than the SDM's (HADDPS, MAXPD and FMA two-NaN choices; natemu and the model agree there).
 reference_overrides = { "i8-forms-001" = "x86", "i8-random-067" = "x86", "i8-random-077" = "x86", "i8-random-126" = "x86", "i8-forms-045" = "model", "i8-random-097" = "model", "i8-random-111" = "model" }
+
+# RCP/RSQRT on the inputs whose result the Intel SDM fixes, with the expected bits written in the runner
+# (tools/run_approx_special.py): no reference machine. The approximations themselves are checked against the bound.
+[[suite]]
+name = "approx-special"
+kind = "judged"
+harness = "runner"
+needs = { cores = 1 }
+
+[suite.cases.approx-special-accurate]
+argv = ["tools/run_approx_special.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+env = { NATEMU_FP = "accurate" }
+smoke = true
+
+[suite.cases.approx-special-fast]
+argv = ["tools/run_approx_special.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+env = { NATEMU_FP = "fast" }
