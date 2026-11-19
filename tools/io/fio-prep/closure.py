@@ -121,7 +121,7 @@ def unpack(debs: list, root: pathlib.Path) -> None:
                 rel = pathlib.PurePosixPath(m.name)
                 if rel.is_absolute() or '..' in rel.parts: raise ValueError(f'package path {m.name} in {deb}')
                 p = root / str(rel)
-                if m.isdir(): p.mkdir(parents=True, exist_ok=True)
+                if m.isdir(): p.mkdir(parents=True, exist_ok=True); p.chmod(m.mode & 0o7777)
                 elif m.isfile():
                     p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(archive.extractfile(m).read()); p.chmod(m.mode)
                     links.pop(str(rel), None)
@@ -200,6 +200,7 @@ def elf_closure(root: pathlib.Path, entry: str = ENTRY) -> dict:
 
 # ---------------------------------------------------------------- the folder
 def main(work: pathlib.Path, recipe: pathlib.Path, out: pathlib.Path) -> None:
+    os.umask(0o022)                     # folder modes must not depend on the caller's umask (not part of the cache key)
     index = index_records(work / 'Packages.trixie.xz')
     wanted = [tuple(line.split('=', 1)) for line in (recipe / 'packages.txt').read_text().split()]
     debs = {(n, v): work / 'debs' / f"{n}_{v.replace(':', '%3a')}_{index[(n, v)]['Architecture']}.deb" for n, v in wanted}

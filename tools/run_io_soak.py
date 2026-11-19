@@ -27,6 +27,7 @@ digest, checked, write_json = matrix.digest, matrix.checked, matrix.write_json
 DISK_BYTES, FILE_BYTES = 512 << 20, 64 << 20
 STRESS_SHA = '8de2f3cf5a0c0856b59e54fed9f035fac6ec752820ad6d5df8bd2dc5440814e0'
 SOURCE_SHA = 'ffe8907154cc3b65cc66cde8663106355f88c948b58169cee1badbde9e0f52bd'
+BUILD_SHA = '53140a759e4194faad69a11e1a95c0c868959cb3b93eb38e7dbac0bb8ed1a7cf'   # tools/io/stress-ng's reproducible build (= the correctness lane's binary)
 PROFILES = ('precondition0', 'unloaded', 'verify-before', 'precondition1', 'loaded', 'verify-all')
 WORKERS = ('cpu0', 'cpu1', 'vm0')
 MAX_LOG_BYTES, MAX_TOTAL_LOG_BYTES = 8 << 20, 16 << 20
@@ -191,14 +192,16 @@ INIT = INIT.replace(' | sed ', ' | /bin/busybox sed ').replace(' | tr ', ' | /bi
 
 def stress_pin(args):
     """The stress-ng binary's and source's pins, as recorded in inputs.json. With --stress-provenance (the framework's
-    build, tools/io/stress-ng) the binary must hash to that file's binary_sha256 and the source to SOURCE_SHA, and the
-    provenance is recorded; without it, the retained build: STRESS_SHA, its bin.sha256 and build.log beside it."""
+    build, tools/io/stress-ng) the binary must hash to BUILD_SHA (fixed here: the recipe reproduces it) and the source to
+    SOURCE_SHA, and the provenance file is recorded beside them; without it, the retained build: STRESS_SHA, its bin.sha256
+    and build.log beside it."""
     if args.stress_provenance is not None:
         prov = json.loads(args.stress_provenance.read_text())
-        if digest(args.stress) != prov['binary_sha256'] or digest(args.stress_source) != SOURCE_SHA or prov['source_sha256'] != SOURCE_SHA:
+        if digest(args.stress) != BUILD_SHA or prov.get('binary_sha256') != BUILD_SHA or digest(args.stress_source) != SOURCE_SHA \
+                or prov.get('source_sha256') != SOURCE_SHA:
             raise ValueError('stress binary/source pin')
-        return {'binary': str(args.stress), 'sha256': prov['binary_sha256'], 'source': str(args.stress_source), 'source_sha256': SOURCE_SHA,
-                'provenance': {'path': str(args.stress_provenance), 'sha256': digest(args.stress_provenance), **prov}}
+        return {'binary': str(args.stress), 'sha256': BUILD_SHA, 'source': str(args.stress_source), 'source_sha256': SOURCE_SHA,
+                'provenance': {'file': str(args.stress_provenance), 'file_sha256': digest(args.stress_provenance), 'content': prov}}
     if digest(args.stress) != STRESS_SHA or digest(args.stress_source) != SOURCE_SHA: raise ValueError('stress binary/source pin')
     prior_manifest = args.stress.parent.parent / 'bin.sha256'
     if not any(line.startswith(STRESS_SHA + ' ') and line.endswith('/stress-ng') for line in prior_manifest.read_text().splitlines()): raise ValueError('retained stress build provenance')

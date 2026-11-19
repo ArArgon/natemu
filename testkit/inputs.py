@@ -112,14 +112,23 @@ def _in_container(name: str, recipe: pathlib.Path, work: pathlib.Path, memory: s
     """recipe/container.sh in the amd64 Debian builder (artifacts.BENCH_BUILDER, through Rosetta), /recipe read-only and
     /work = work. A download that fails is Unpreparable (the URL is in the message), anything else a BuildFailure."""
     if not shutil.which('container'): raise BuildFailure(name, "needs Apple's `container` (brew install container)")
-    cmd = ['container', 'run', '--rm', '--arch', 'amd64', '--cpus', '4', '--memory', memory,
+    cname = f'natemu-build-{name}-{os.getpid()}'
+    cmd = ['container', 'run', '--rm', '--name', cname, '--arch', 'amd64', '--cpus', '4', '--memory', memory,
            '--volume', f'{recipe}:/recipe:ro', '--volume', f'{work}:/work', artifacts.BENCH_BUILDER, 'bash', '/recipe/container.sh']
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
+        try: subprocess.run(['container', 'kill', cname], capture_output=True, timeout=60)  # the client's death does not stop it
+        except (OSError, subprocess.SubprocessError): pass
         raise BuildFailure(name, f'{recipe}/container.sh took more than {timeout} s')
     if r.returncode:
         tail = (r.stderr or r.stdout)[-1500:]
+        repin = [f for f in ('packages.txt', 'debs.sha256', 'sources.sha256') if (work / f).is_file()]
+        if repin:                    # re-pinning: keep the new pins before the failed entry is deleted
+            keep = paths.state_dir() / 'repin' / name; keep.mkdir(parents=True, exist_ok=True)
+            for f in repin: shutil.copy2(work / f, keep / f)
+            raise BuildFailure(name, f'no pins in {recipe}: new ones written to {keep} ({", ".join(repin)}); check them, '
+                                     f'copy them into {recipe} and build again')
         if re.search(r'Failed to fetch|Could not resolve|Temporary failure resolving|Unable to connect|Unable to fetch', tail):
             raise resources.Unpreparable(name, tail)
         raise BuildFailure(name, tail)
@@ -163,6 +172,12 @@ def _matrix_recipe(out: pathlib.Path, inputs: list) -> None:
     writable_clone(fio, work / 'fio-prep'); writable_clone(block, work / 'block-inputs')
     _runner('run_io_matrix.py', 'prepare', '--fio-prep', work / 'fio-prep', '--block-inputs', work / 'block-inputs', '--out', out / 'inputs')
     shutil.rmtree(work)
+    # run_io_matrix records the folders it read, here this build's temporary clones (gone, and named after the process):
+    # record the cache entries they were cloned from instead, so the file is the same on every build.
+    pin = out / 'inputs' / 'inputs.json'
+    d = json.loads(pin.read_text())
+    d.update(block_inputs=str(block), fio_preparation=str(fio))
+    pin.write_text(json.dumps(d, indent=1, sort_keys=True) + '\n')
 
 
 def matrix_inputs() -> pathlib.Path:
@@ -182,6 +197,9 @@ def recipe_sha256(recipe: pathlib.Path) -> str:
     return hashlib.sha256(listing.encode()).hexdigest()
 
 
+STRESS_BUILD_SHA = '53140a759e4194faad69a11e1a95c0c868959cb3b93eb38e7dbac0bb8ed1a7cf'   # = run_io_soak.BUILD_SHA = run_serial_stress.BUILD_SHA
+
+
 def _stress_recipe(out: pathlib.Path, inputs: list) -> None:
     recipe = pathlib.Path(inputs[0])
     _in_container('stress-ng', recipe, out, memory='8g')
@@ -190,6 +208,9 @@ def _stress_recipe(out: pathlib.Path, inputs: list) -> None:
     ph, size, count = struct.unpack_from('<Q', b, 32)[0], *struct.unpack_from('<HH', b, 54)
     if any(struct.unpack_from('<I', b, ph + i * size)[0] in (2, 3) for i in range(count)): raise BuildFailure('stress-ng', 'not fully static')
     sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    if sha(out / 'bin/stress-ng') != STRESS_BUILD_SHA:
+        raise BuildFailure('stress-ng', f'the build no longer reproduces {STRESS_BUILD_SHA} (got {sha(out / "bin/stress-ng")}): '
+                                        'the runners accept only that binary')
     (out / 'provenance.json').write_text(json.dumps({
         'binary_sha256': sha(out / 'bin/stress-ng'), 'source_sha256': sha(out / 'source.tar.xz'), 'recipe_sha256': recipe_sha256(recipe),
         'builder': f'local: {artifacts.BENCH_BUILDER} (amd64 through Rosetta)'}, indent=1) + '\n')

@@ -29,6 +29,7 @@ LOG_BOUND=16<<20
 MAX_HEARTBEAT_GAP=2.0
 STRESS_SHA='8de2f3cf5a0c0856b59e54fed9f035fac6ec752820ad6d5df8bd2dc5440814e0'
 STRESS_SOURCE_SHA='ffe8907154cc3b65cc66cde8663106355f88c948b58169cee1badbde9e0f52bd'
+BUILD_SHA='53140a759e4194faad69a11e1a95c0c868959cb3b93eb38e7dbac0bb8ed1a7cf'  # tools/io/stress-ng's reproducible build (= the correctness lane's binary)
 LOAD_NAMES=('cpu0','cpu1','cpu2')
 LOAD_RECORDS=('load-version','load-status','load-live',*LOAD_NAMES)
 LOAD_LOG_BOUND=128<<10
@@ -185,14 +186,14 @@ def init(data,cpu_load=False):
 
 def stress_pin(a):
     """The --cpu-load stress-ng pins, as recorded in inputs.json. With --stress-provenance (the framework's build,
-    tools/io/stress-ng) the binary must hash to that file's binary_sha256 and the source to STRESS_SOURCE_SHA, and the
-    provenance is recorded; without it, the retained build's STRESS_SHA."""
+    tools/io/stress-ng) the binary must hash to BUILD_SHA (fixed here: the recipe reproduces it) and the source to
+    STRESS_SOURCE_SHA, and the provenance file is recorded; without it, the retained build's STRESS_SHA."""
     if a.factor!=3 or a.stress is None or a.stress_source is None:raise ValueError('CPU load requires factor3 and pinned stress binary/source')
     record={'binary':str(a.stress.resolve()),'binary_sha256':STRESS_SHA,'source':str(a.stress_source.resolve()),'source_sha256':STRESS_SOURCE_SHA,'workers':3,'seconds':180,'method':'int64','seeds':[20261108,20261109,20261110]}
     if a.stress_provenance is not None:
         prov=json.loads(a.stress_provenance.read_text())
-        if digest(a.stress)!=prov['binary_sha256'] or digest(a.stress_source)!=STRESS_SOURCE_SHA or prov['source_sha256']!=STRESS_SOURCE_SHA:raise ValueError('stress binary/source pin')
-        return {**record,'binary_sha256':prov['binary_sha256'],'provenance':{'path':str(a.stress_provenance.resolve()),'sha256':digest(a.stress_provenance),**prov}}
+        if digest(a.stress)!=BUILD_SHA or prov.get('binary_sha256')!=BUILD_SHA or digest(a.stress_source)!=STRESS_SOURCE_SHA or prov.get('source_sha256')!=STRESS_SOURCE_SHA:raise ValueError('stress binary/source pin')
+        return {**record,'binary_sha256':BUILD_SHA,'provenance':{'file':str(a.stress_provenance.resolve()),'file_sha256':digest(a.stress_provenance),'content':prov}}
     if digest(a.stress)!=STRESS_SHA or digest(a.stress_source)!=STRESS_SOURCE_SHA:raise ValueError('pinned stress binary/source mismatch')
     return record
 
