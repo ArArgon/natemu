@@ -367,6 +367,8 @@ most) and each vCPU's resident looks in it, by content, before asking the host; 
 publication only; `--check-reuse` (`NATEMU_CHECK_REUSE=1`) also asks the host for every copy and compares. The program driver
 (K1) stays opt-in (`run-program --pool`).
 
+**Translated code.** The dispatcher's data tables, extended blocks, the hot/cold layout, one stack check per run of stack stores and narrow compares are how natemu translates and runs code; see `docs/restructure/translated-code-layout.md`.
+
 **The VM lock.** `NATEMU_RAW_ROOT/.vm.lock` is taken with BSD `flock(2)` and nothing else: Python `fcntl.flock`, the suite and
 the I/O runners, `/usr/bin/lockf -k` (macOS `lockf` is flock-based and has no shared mode) and `tools/vmlock.py` all exclude
 each other (`tools/test_vm_lock.py`). Never use `fcntl.lockf` or `F_SETLK` on it: on macOS record locks and flock do not

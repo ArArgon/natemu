@@ -103,7 +103,7 @@ weeks before adoption).
 
 ```sh
 R=target/aarch64-unknown-none/release/natemu-runtime
-F=../natemu-raw/fexc-daa67e4-20261117/obj/fexc
+F=../natemu-raw/fexc-ac479dd-20261119/obj/fexc
 K=../natemu-raw/kernel-census-20261028-01/dl/linux               # Debian 6.12.107 bzImage
 I=../natemu-raw/kernel-census-20261028-01/dl/initrd.gz           # Debian installer initrd
 target/release/natemu --runtime "$R" --fexc "$F" --kernel "$K" --cmdline 'console=ttyS0 earlyprintk=serial mitigations=off nokaslr' --vcpus 4
@@ -775,7 +775,7 @@ Full suite (about 25 minutes of runner time per pass on the M4 at R2, waits for 
 # From the repository root; zsh or bash. Wait until no other natemu-host runs (timing-sensitive cases: kicks, l4b,
 # x3 stress). A timing failure may be rerun alone once, never more: the results record the first run's result and the
 # rerun's beside it; a failed rerun is a failure.
-F=../natemu-raw/fexc-daa67e4-20261117/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
+F=../natemu-raw/fexc-ac479dd-20261119/obj/fexc  # tools/fexc/build.sh rebuilds it from the fork pin
 SEED=../natemu-raw/s1d1-seed4242
 FLOW=../natemu-raw/s2d/corpus
 I8=../natemu-raw/i8-corpus-20261030-01      # gen_i8.py programs and their QEMU 7.2 results

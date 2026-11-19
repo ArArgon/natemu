@@ -689,9 +689,9 @@ def cmd_kicks(a, host, runtime):
             failures += [f"{e['name']} rep{e['rep']}: {d}" for d in e['diffs']]
             report['adversarial'].append(e)
     # A resident-entry stop needs a doorbell pending when the vCPU enters the resident: peers' SGIs (N > 1).
-    # (A `data-l1` resident has no L1 code: its slots probe the data tables, so a stop during that probe lands in the dispatcher
-    # slot, counted under `dispatch`; `l1` is required only of a resident built without the feature: `--data-l1`.)
-    wanted = ('entry', 'dispatch') + (() if a.data_l1 else ('l1',)) + ('exit', 'irqs_step', 'rearms') + (('resident',) if max(a.cpus) > 1 else ())
+    # (The default resident has no L1 code: its slots probe the data tables, so a stop during that probe lands in the dispatcher
+    # slot, counted under `dispatch`; `l1` is required only of a resident built with `--no-default-features`: `--code-l1`.)
+    wanted = ('entry', 'dispatch') + (('l1',) if a.code_l1 else ()) + ('exit', 'irqs_step', 'rearms') + (('resident',) if max(a.cpus) > 1 else ())
     missing = [p for p in wanted if not seen[p]]
     print(f'adversarial places: {dict(seen)}', flush=True)
     if missing: failures.append(f'adversarial: no stop at {missing}')
@@ -2354,7 +2354,7 @@ def main():
     ap.add_argument('--control', choices=['drop-fence', 'drop-lock'])
     ap.add_argument('--programs', type=lambda s: s.split(','))
     ap.add_argument('--reps', type=int, default=1)
-    ap.add_argument('--data-l1', action='store_true', help='kicks: the resident is built with data-l1 (stops in the L1 probe are counted as dispatcher stops)')
+    ap.add_argument('--code-l1', action='store_true', help='kicks: the resident is built with --no-default-features (dispatcher tables as code: stops in the L1 probe are expected)')
     ap.add_argument('--kicks', type=int, help='kicks per vCPU (kicks: default 10000; corpora: off unless given)')
     ap.add_argument('--iterations', type=int, default=400_000_000, help='hot-loop iterations per vCPU (kicks)')
     ap.add_argument('--rep-iterations', type=int, default=3000, help='REP-string rounds per vCPU (kicks, I2)')

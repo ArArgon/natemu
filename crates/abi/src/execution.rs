@@ -241,7 +241,7 @@ pub mod cache {
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
     pub const DISPATCH_SLOT_BYTES: usize = 128;
-    /// Jump-check experiment (`jump-check` resident builds, with `data-l1`): per L1 table a direct-mapped table of the linear
+    /// Jump-check study (`jump-check` resident builds, with `data-l1`): per L1 table a direct-mapped table of the linear
     /// code pages valid now ([`VT_ENTRIES`] words indexed by the page number's low bits, each the page number or all ones),
     /// which a slot's code checks before it probes the table. The words follow the data tables ([`DL1`]) in the lookup
     /// area, in a third 2 MiB block of the same EL0 read-only mapping.
@@ -289,7 +289,7 @@ pub mod cache {
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
     pub const LOOKUP_BYTES: usize = (VT + VT_BYTES).next_multiple_of(BLOCK);
-    /// Data-L1 experiment (`data-l1` resident builds; mapped in every build of this branch): the dispatcher's tables as
+    /// The dispatcher's data tables (`data-l1` resident builds, the default; mapped in every build): the dispatcher's tables as
     /// data, table t's entry i two words at `DL1 + 16 (t L1_ENTRIES + i)`: the RIP it serves ([`DL1_EMPTY`]: none) and the
     /// address to branch to. Filling or emptying one is two stores: no code is written, nothing is synchronized. The host
     /// maps them and the validity tables ([`VT`]) EL0 read-only as three 2 MiB blocks in the guest-state alias's level-2
@@ -1160,7 +1160,7 @@ pub mod cache {
         /// not. A record names its point ([`LinkRecord::point`]), so a record that moves updates exactly one slot. Killing
         /// the block undoes its links out by these, with no scan of the records.
         pub out: [u32; super::MAX_LINK_POINTS],
-        /// Hot/cold experiment (runtime feature `hot-cold`): when `hot_size` is not 0, a copy of its words
+        /// Hot/cold layout (runtime feature `hot-cold`, a default): when `hot_size` is not 0, a copy of its words
         /// `[ENTRY_OFFSET, hot_size)` at code-area offset `hot + ENTRY_OFFSET` (branches out of them re-encoded to the code
         /// at `code`), then one trampoline word standing for its word at `hot_size` (its first exit), is where it is entered.
         /// `hot` is the code area's hot fill point at its placement otherwise (records stay in hot address order).

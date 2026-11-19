@@ -97,7 +97,7 @@ struct Settings {
   bool dense_pc = true;        // guest-PC table entry for every guest instruction (sites need it: see --sparse-pc)
   bool end_marker = true;      // FEX's InstCount marker (udf #0x420f) after the block body
   int64_t max_insts = 0;       // 0 = FEX default
-  int ext_conds = 0;           // experiment (slice1): extended blocks, up to N conditional branches per unit (fexc_hook.h)
+  int ext_conds = 0;           // extended blocks, up to N conditional branches per unit (fexc_hook.h)
   uint32_t dcache_line_log2 = 4;
 };
 
@@ -423,7 +423,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
       else if (st.profile != "default") return Fail("--profile must be default or slice1");
     }
     else if (a == "--multiblock") st.multiblock = true;
-    else if (a == "--ext-conds") st.ext_conds = int(strtol(next(), nullptr, 0));   // experiment: extended blocks (slice1 only)
+    else if (a == "--ext-conds") st.ext_conds = int(strtol(next(), nullptr, 0));   // extended blocks (slice1 only; the host always asks for 4)
     else if (a == "--dense-pc") st.dense_pc = true; // default since v2
     else if (a == "--sparse-pc") { st.dense_pc = false; s.sparse_flag = true; } // diagnostic only: an instruction without a GuestOpcode (e.g. moffs movabs) is then attributed to the previous one
     else if (a == "--no-end-marker") st.end_marker = false;
@@ -434,8 +434,8 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--x87-gated") s.x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
     else if (a == "--cpl0") s.cpl0 = true;             // slice1 (perf chunk 15): a CPL-0 request: CLI/STI inline (Cut)
     else if (a == "--bulk") s.bulk = true;             // slice1 (perf chunk 26): not a step, no alignment gating: bulk REP STOS
-    else if (a == "--push-run") s.push_run = true;     // experiment (slice1): one RSP alignment check covers aligned stack stores (fexc_hook.h)
-    else if (a == "--narrow-cmp") s.narrow_cmp = true; // experiment (slice1): 8/16-bit compares with an inline constant (fexc_hook.h)
+    else if (a == "--push-run") s.push_run = true;     // (slice1; the host always asks) one RSP alignment check covers aligned stack stores (fexc_hook.h)
+    else if (a == "--narrow-cmp") s.narrow_cmp = true; // (slice1; the host always asks) 8/16-bit compares with an inline constant (fexc_hook.h)
     else if (a == "--tsc") s.tsc = true;               // slice1 (perf chunk 15): CPL 0, a 24 MHz counter: RDTSC inline
     else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs

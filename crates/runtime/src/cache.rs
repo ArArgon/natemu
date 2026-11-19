@@ -54,7 +54,7 @@ fn pages() -> usize {
 /// Code placement alignment (a cache line).
 /// (Density test: NATEMU_CODE_ALIGN=16 at build time packs blocks to 16 bytes.)
 const CODE_ALIGN: u64 = if NO_TAIL || option_env!("NATEMU_CODE_ALIGN").is_some() { 16 } else { 64 };
-/// Density experiment (`no-tail`): a block's code is placed without FEX's tail (its `JITCodeTail` data words after
+/// Density (`no-tail`, a default feature): a block's code is placed without FEX's tail (its `JITCodeTail` data words after
 /// `code_region_end`), which no generated code and no resident path reads; blocks pack at 16 bytes.
 const NO_TAIL: bool = cfg!(feature = "no-tail");
 /// The bytes of an admitted object's code that are placed: all of them, or with `no-tail` those before its tail.
@@ -69,12 +69,12 @@ pub fn pack_placed(r: &Reloc, size: u32) -> Option<Option<u32>> {
     }
     natemu_abi::execution::pack_reloc(r, size)
 }
-/// Hot/cold experiment (`hot-cold`, on `no-tail`): a block's words up to its first exit are copied, their branches out
+/// Hot/cold layout (`hot-cold`, a default feature, on `no-tail`): a block's words up to its first exit are copied, their branches out
 /// re-encoded, into a dense hot stream where it is entered; its whole code (`Block::code`) stays below in its segment and
 /// is what every exit, link, stop, site and resume names ([`split`]).
 const HOT_COLD: bool = cfg!(feature = "hot-cold");
 #[cfg(all(feature = "hot-cold", feature = "pic-count"))]
-compile_error!("hot-cold does not mirror the counting stubs of pic-count");
+compile_error!("hot-cold (a default feature) does not mirror the counting stubs of pic-count: build it with --no-default-features");
 /// A segment of the code area while splitting: its hot zone, then the whole code of its blocks; every word of one is within
 /// a `tbz`'s reach (32 KiB) of every other.
 const SEG_BYTES: u64 = 32 * 1024;
@@ -461,12 +461,12 @@ fn l1_block(t: usize, i: usize) -> u32 {
 fn l1_list(t: usize, k: usize) -> *mut u32 {
     lookup_area::<u32>(area::L1_LISTS).wrapping_add(t * area::L1_ENTRIES + k)
 }
-/// Data-L1 experiment: the dispatcher reads its tables as data ([`area::DL1`]); the code tables are left unused. An empty
+/// Data tables (`data-l1`, a default feature): the dispatcher reads its tables as data ([`area::DL1`]); the code tables are left unused. An empty
 /// entry's target is the dispatcher's miss: [`area::DL1_EMPTY`] passes the computed exit's canonical check (it compares bits
 /// 63 and 47 only), so a guest jump to that very address matches the marker and must miss like any other (review, defect 1).
 const DATA_L1: bool = cfg!(feature = "data-l1");
 #[cfg(all(feature = "jump-check", not(feature = "data-l1")))]
-compile_error!("jump-check builds on data-l1 (the slot's check precedes the data probe)");
+compile_error!("jump-check builds on data-l1 (the slot's check precedes the data probe): with --no-default-features add it");
 fn dl1(t: usize, i: usize) -> *mut [u64; 2] {
     lookup_area::<[u64; 2]>(area::DL1).wrapping_add(t * area::L1_ENTRIES + i)
 }
@@ -602,7 +602,7 @@ fn write_slot(k: usize, t: Option<usize>) {
             };
             let miss = |k: usize| 0xb500_0001 | ((area::DISPATCH_MISS as u64).wrapping_sub(at + 4 * k as u64) as u32 >> 2 & 0x7_ffff) << 5;
             let mut n = 0;
-            // Jump-check experiment: first the target page's word of the table's validity table against the page: `ubfx x1,
+            // Jump-check study: first the target page's word of the table's validity table against the page: `ubfx x1,
             // x0, #12, #16; add x2, x28, #table; ldr x1, [x2, x1, lsl #3]; eor x1, x1, x0, lsr #12; cbnz x1, miss`.
             if vt::ON {
                 words[..5].copy_from_slice(&[
@@ -614,7 +614,7 @@ fn write_slot(k: usize, t: Option<usize>) {
                 ]);
                 n = 5;
             }
-            // Data-L1 experiment: `and x1, x0, #mask; add x2, x28, #table; add x2, x2, x1, lsl #5; ldr x1, [x2]; eor x1, x1,
+            // Data tables: `and x1, x0, #mask; add x2, x28, #table; add x2, x2, x1, lsl #5; ldr x1, [x2]; eor x1, x1,
             // x0; cbnz x1, way 1; ldr x1, [x2, #8]; br x1; way 1: ldr x1, [x2, #16]; eor x1, x1, x0; cbnz x1, miss; ldr x1,
             // [x2, #24]; br x1`.
             words[n..n + 13].copy_from_slice(&[
@@ -749,7 +749,7 @@ pub fn fill_l1(rip: u64, block: &Block) {
     }
     let flip = if f.victim { area::L1_NEXT } else { 0 };
     let mut listed = [o0, o1][f.way] & area::L1_LISTED;
-    // (Jump-check experiment: a one-page block's entry outlives a CR3 load, its slot's check standing for it.)
+    // (Jump-check study: a one-page block's entry outlives a CR3 load, its slot's check standing for it.)
     if listed == 0 && block.flags & GLOBAL == 0 && (!vt::ON || block.source_gpa[1] != u64::MAX) {
         let c = control();
         unsafe { l1_list(t, c.l1_listed[t] as usize).write(i as u32) };
@@ -807,7 +807,7 @@ pub fn count_miss(rip: u64, context: u64) {
     }] += 1;
 }
 
-/// Jump-check experiment (`jump-check` builds): per L1 table, which linear code pages are valid now, as a TLB holds fetch
+/// Jump-check study (`jump-check` builds): per L1 table, which linear code pages are valid now, as a TLB holds fetch
 /// entries, in words the dispatcher slots read ([`area::VT`]). A word is set when a block starting on the page is entered
 /// in L1 ([`fill_l1`]: a lookup just found it mapped so), and cleared by what ends a fetch entry: a CR3 load (not the
 /// global ones), a global flush, INVLPG and #PF (its 2 MiB region), a table changing hands, a reset. While a page's word
@@ -2378,7 +2378,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     let code = now.unwrap_or_else(|| code_of(target));
     let local_shared =
         local_ok && (target.flags & INSTANCE != 0 || now.is_some()) && same_frames(code, source);
-    // Jump-check experiment: so is every link into a block of another page (the slot's check stands for the
+    // Jump-check study: so is every link into a block of another page (the slot's check stands for the
     // target's currency: no CR3 load suspends it, no revalidation patches it again).
     let checked = !local_shared
         && (shared
@@ -2447,7 +2447,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     // ([`stub`]).
     #[cfg(feature = "pic-count")]
     let class = pic::class(shared, at, code.flags & PIC != 0, target.rip);
-    // Jump-check experiment: an absolute link that is not local counts with the cross-page ones (every link a flush undoes).
+    // Jump-check study: an absolute link that is not local counts with the cross-page ones (every link a flush undoes).
     #[cfg(feature = "pic-count")]
     let class = if class == pic::Class::Absolute && segment != LOCAL { pic::Class::CrossPage } else { class };
     #[cfg(feature = "pic-count")]

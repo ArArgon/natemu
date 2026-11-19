@@ -321,7 +321,7 @@ def main():
         program, result, end = add_chain(count, 2, step=0, load=load)
         cache = code_max
         if full == 0:
-            # Blocks denser than 128 bytes (data-l1/hot-cold, extended blocks) fill the 1 Mi index before the code area, so the
+            # Blocks denser than 128 bytes (data tables, hot/cold layout, extended blocks) fill the 1 Mi index before the code area, so the
             # code area could never be what fills: measure the bytes a block takes (4,000 blocks, the head being the capacity
             # less the request) and, when the index would come first, size the cache to hold 80% of the index's blocks.
             probe, _, _ = add_chain(4000, 1, step=0)

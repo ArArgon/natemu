@@ -862,7 +862,7 @@ MAX_LINKS = 512 * 1024                    # natemu_abi::execution::cache::MAX_LI
 # `link-full` overflows a test-only capacity by default (the host's NATEMU_LINK_CAP -> `cache::Control::link_cap`): the
 # same linker paths (full area, local prune, unlink-all, reclaim bookkeeping), at a chain 28 times shorter. `--full-links`
 # runs the production size (cap MAX_LINKS, no env). Each of the FM pages holds 4096 link points. At MAX_LINKS FM = cap/4096
-# + 40: the first fill leaves a 40-page tail (17 when extended blocks, `NATEMU_EXT_CONDS=4`, make a page yield only about 0.85 of
+# + 40: the first fill leaves a 40-page tail (17 with extended blocks, the default, which make a page yield only about 0.85 of
 # its 4096 links: the 12 pages of an earlier calibration left that chain at 484,653 links, under the capacity) and FW lies in
 # it, so its links are live when it is written. At a small cap
 # FM = cap/4096 + 1 (5 at 16 Ki: the chain is 1.25 x the cap, 1.31 x at full size). A link-by-link model of the linker's
