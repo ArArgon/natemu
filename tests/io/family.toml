@@ -60,3 +60,52 @@ smoke = true
 argv = ["tools/run_net_linux.py", "run", "--offline", "--transport", "pci", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }
 smoke = true
+
+# The two stress runners' --self-check: assembly and the oracles' negative controls, no VM. (Its own suite: the
+# migration test compares the `io` suite's cases with tools/run_suite.py's steps.)
+[[suite]]
+name = "io-selfcheck"
+kind = "judged"
+harness = "runner"
+params = { timeout = 300 }
+
+[suite.cases."io-stress-selfcheck"]
+argv = ["tools/run_io_stress.py", "--self-check"]
+smoke = true
+
+[suite.cases."lifecycle-stress-selfcheck"]
+argv = ["tools/run_io_lifecycle_stress.py", "--self-check"]
+smoke = true
+
+# Campaign tier: long VM runs (about 120 s each), never in the gate (`natemu-test run --tier campaign tests/io/family.toml`).
+# Both runners write out/result.json = {"pass": bool, "errors": [...]}. --forced io-stress needs separately built
+# scheduling-hook binaries and is not onboarded.
+[[suite]]
+name = "io-campaign"
+tier = "campaign"
+kind = "judged"
+harness = "runner"
+needs = { exclusive = true, why = "120 s VM with a watchdog: timing-sensitive" }
+params = { timeout = 900 }
+
+[suite.cases."io-stress-n2"]
+argv = ["tools/run_io_stress.py", "--cpus", "2", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+results = "result.json"
+
+[suite.cases."io-stress-n4"]
+argv = ["tools/run_io_stress.py", "--cpus", "4", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+results = "result.json"
+
+[suite.cases."lifecycle-reset"]
+argv = ["tools/run_io_lifecycle_stress.py", "--case", "reset", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+results = "result.json"
+
+[suite.cases."lifecycle-disable"]
+argv = ["tools/run_io_lifecycle_stress.py", "--case", "disable", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+results = "result.json"
+
+# Negative control: a deliberately corrupted cycle must be caught, so the case passes only when the run fails.
+[suite.cases."lifecycle-corrupt-control"]
+argv = ["tools/run_io_lifecycle_stress.py", "--case", "reset", "--corrupt-cycle", "17", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+judge = "judges:must_fail"
+judge_on_zero = true

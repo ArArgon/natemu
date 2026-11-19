@@ -13,6 +13,7 @@ A passed case's output folder is deleted when it ends (`drop_outputs`); a failed
                           {natemu_entry}, {natemu_host}, {natemu_runtime}: the framework's builds; {fex_asm}: FEX's
                           unittests/ASM at the pin)
                           needs = {...}  smoke = true  judge = "judges:name"  results = "results.json"
+                          (the judge sees exit 1; judge_on_zero = true also sends it exit 0: a negative control)
 """
 import fnmatch
 import json
@@ -75,7 +76,14 @@ def _shape_pass_map(d):
     return None
 
 
-ADAPTERS = (_shape_results_list, _shape_top_list, _shape_pass_map)
+def _shape_single(d):
+    """One whole-run result, {"pass": bool, "errors": [...]} (run_io_stress, run_io_lifecycle_stress): a single entry."""
+    if isinstance(d, dict) and isinstance(d.get('pass'), bool):
+        return [('result', 'passed' if d['pass'] else 'failed', '; '.join(map(str, d.get('errors') or [])))]
+    return None
+
+
+ADAPTERS = (_shape_results_list, _shape_top_list, _shape_pass_map, _shape_single)
 
 
 def per_case(out_dir: pathlib.Path, name: str) -> list | None:
@@ -181,8 +189,9 @@ class Runner:
         text = log.read_text(errors='replace')
         if 'ANSWER-MISSING' in text:
             return False, f'answers not seeded for this runner (ANSWER-MISSING); log {log}'
-        if r.returncode == 0: return True, f'exit 0 ({took})'
-        if r.returncode == 1 and spec.get('judge'):
+        judged_zero = r.returncode == 0 and spec.get('judge') and spec.get('judge_on_zero')
+        if r.returncode == 0 and not judged_zero: return True, f'exit 0 ({took})'
+        if (r.returncode == 1 or judged_zero) and spec.get('judge'):
             from testkit import family as fammod
             mod, fn = spec['judge'].split(':')
             j = getattr(fammod._load_module(it.fam.dir / f'{mod}.py', f'testkit_judges_{it.fam.name}'), fn)

@@ -21,6 +21,24 @@ def test_top_level_list_shape(tmp_path):
     assert r == [('x', 'passed', ''), ('y', 'failed', 'bad'), ('z', 'failed', 'boom')]
 
 
+def test_single_result_shape(tmp_path):
+    assert write(tmp_path, {'pass': True, 'errors': []}) == [('result', 'passed', '')]
+    assert write(tmp_path, {'pass': False, 'errors': ['x', 2]}) == [('result', 'failed', 'x; 2')]
+    assert write(tmp_path, {'pass': {'a': True}}) == [('a', 'passed', '')]       # a pass map still matches first
+
+
+def test_judge_runs_on_exit_zero_only_when_asked(tmp_path):
+    (tmp_path / 'result.json').write_text(json.dumps({'pass': True, 'errors': []}))
+    import importlib.util, pathlib
+    spec = importlib.util.spec_from_file_location('j', pathlib.Path(__file__).parents[2] / 'tests/io/judges.py')
+    j = importlib.util.module_from_spec(spec); spec.loader.exec_module(j)
+    assert j.must_fail(tmp_path)[0] is False
+    (tmp_path / 'result.json').write_text(json.dumps({'pass': False, 'errors': ['e']}))
+    assert j.must_fail(tmp_path) == (True, 'negative control failed as required')
+    (tmp_path / 'result.json').write_text(json.dumps({'pass': False, 'errors': []}))
+    assert j.must_fail(tmp_path)[0] is False
+
+
 def test_missing_or_unknown_gives_none(tmp_path):
     assert runner.per_case(tmp_path, 'results.json') is None
     assert write(tmp_path, {'something': 'else'}) is None
