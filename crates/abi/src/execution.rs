@@ -241,10 +241,8 @@ pub mod cache {
     pub const DISPATCH_VA: u64 = CODE_VA + DISPATCH as u64;
     pub const DISPATCH_MISS: usize = DISPATCH + 16;
     pub const DISPATCH_SLOT_BYTES: usize = 128;
-    /// Jump-check study (`jump-check` resident builds, with `data-l1`): per L1 table a direct-mapped table of the linear
-    /// code pages valid now ([`VT_ENTRIES`] words indexed by the page number's low bits, each the page number or all ones),
-    /// which a slot's code checks before it probes the table. The words follow the data tables ([`DL1`]) in the lookup
-    /// area, in a third 2 MiB block of the same EL0 read-only mapping.
+    /// A reserved third 2 MiB block after the data tables ([`DL1`]) in the lookup area, mapped EL0 read-only with them. Nothing
+    /// uses it now (a removed study's validity tables lived here); the mapping stays as it is.
     pub const VT_ENTRIES: usize = 1 << 16;
     pub const VT: usize = DL1 + DL1_BYTES;
     pub const VT_BYTES: usize = L1_TABLES * VT_ENTRIES * 8;
@@ -289,10 +287,10 @@ pub mod cache {
     pub const META_BYTES: usize = 256 * MIB;
     pub const LOOKUP_VA: u64 = PRIVATE + 0x3800_0000;
     pub const LOOKUP_BYTES: usize = (VT + VT_BYTES).next_multiple_of(BLOCK);
-    /// The dispatcher's data tables (`data-l1` resident builds, the default; mapped in every build): the dispatcher's tables as
+    /// The dispatcher's data tables: the dispatcher's tables as
     /// data, table t's entry i two words at `DL1 + 16 (t L1_ENTRIES + i)`: the RIP it serves ([`DL1_EMPTY`]: none) and the
     /// address to branch to. Filling or emptying one is two stores: no code is written, nothing is synchronized. The host
-    /// maps them and the validity tables ([`VT`]) EL0 read-only as three 2 MiB blocks in the guest-state alias's level-2
+    /// maps them and the reserved block ([`VT`]) EL0 read-only as three 2 MiB blocks in the guest-state alias's level-2
     /// table, after the alias's own 2 MiB when they fit there ([`dl1_after`]), else before it; a slot reaches table t from x28 by a page count.
     pub const DL1: usize = (PCID_STUDY + PCID_STUDY_BYTES).next_multiple_of(BLOCK);
     pub const DL1_BYTES: usize = L1_TABLES * L1_ENTRIES * 16;
@@ -338,7 +336,7 @@ pub mod cache {
         /// was entered through the dispatcher), or does not (through a patched link).
         pub const ENTRY_DISPATCHED: usize = 52;
         pub const ENTRY_LINKED: usize = 53;
-        /// Hot/cold experiment: block samples in a split block's hot copy, and in its whole code (cold: an exit stub, or
+        /// Hot/cold layout: block samples in a split block's hot copy, and in its whole code (cold: an exit stub, or
         /// code resumed there).
         pub const SPLIT_HOT: usize = 54;
         pub const SPLIT_COLD: usize = 55;
@@ -388,8 +386,8 @@ pub mod cache {
         pub const ENTRY_CODE_FIRST: usize = 21;
         pub const FULL: usize = 24;
         pub const PEAK: usize = 25;
-        /// Page-validity experiment (`page-valid` resident builds): blocks made current with a sibling on their page, and
-        /// the revalidations that looked for siblings.
+        /// Bulk revalidation counters of the PCID study (`pcid-study` resident builds): blocks made current with a sibling on
+        /// their page, and the revalidations that looked for siblings.
         pub const BULK: usize = 26;
         pub const BULK_PAGES: usize = 27;
         pub const COUNT: usize = 28;
@@ -429,42 +427,6 @@ pub mod cache {
     pub const fn l1_slots_of(rip: u64) -> (usize, usize) {
         let set = (rip & L1_SET_MASK) as usize;
         (set * L1_WAYS, set * L1_WAYS + 1)
-    }
-    /// An L1 entry's `b` from `from` to `to` (code-area offsets).
-    const fn l1_branch(from: u64, to: u64) -> u32 {
-        0x1400_0000 | (to.wrapping_sub(from) >> 2) as u32 & 0x03ff_ffff
-    }
-    /// The words of slot `slot`'s entry at code-area offset `at` for `rip`, entering `entry`: `movz/movk x2, #rip; sub x2,
-    /// x2, x0; cbnz x2, next; b entry; b next` where way 1's `next` is the dispatcher's miss (`miss`: a `b`, as the tables
-    /// lie beyond `cbnz`'s +-1 MiB) and way 0's is way 1, the entry 32 bytes on (so `cbnz` is `+12`, and word 7 is a landing
-    /// never reached).
-    pub const fn l1_words(slot: usize, at: u64, rip: u64, entry: u64, miss: u64) -> [u32; 8] {
-        const fn half(rip: u64, k: u32) -> u32 {
-            ((rip >> (16 * k)) & 0xffff) as u32
-        }
-        let way0 = slot % L1_WAYS == 0;
-        [
-            0xd280_0002 | half(rip, 0) << 5,
-            0xf2a0_0002 | half(rip, 1) << 5,
-            0xf2c0_0002 | half(rip, 2) << 5,
-            0xf2e0_0002 | half(rip, 3) << 5,
-            0xcb00_0042,
-            0xb500_0002 | (if way0 { 3 } else { 2 }) << 5,
-            l1_branch(at + 24, entry),
-            if way0 {
-                l1_branch(at + 28, at + L1_ENTRY_BYTES as u64)
-            } else {
-                l1_branch(at + 28, miss)
-            },
-        ]
-    }
-    /// The first word of an empty slot: way 0 chains to way 1, way 1 branches to the dispatcher's miss.
-    pub const fn l1_empty_word(slot: usize, at: u64, miss: u64) -> u32 {
-        l1_branch(at, if slot % L1_WAYS == 0 { at + L1_ENTRY_BYTES as u64 } else { miss })
-    }
-    /// RIP bit 15 of a filled entry from its first word, `movz x2, #rip[15:0]` (imm16 in bits 20:5).
-    pub const fn l1_word_rip15(first: u32) -> bool {
-        first >> 20 & 1 != 0
     }
     /// What [`l1_fill`] decided: the way to write, whether the block is there already (no write but the code check), and
     /// whether the set's [`L1_NEXT`] flips.
@@ -938,7 +900,7 @@ pub mod cache {
         pub relink_dropped: u64,
         /// PCID gain study ([`pcid_study`]; `pcid-study` resident builds only, zero otherwise). Appended.
         pub pcid_study: [u64; pcid_study::COUNT],
-        /// Hot/cold experiment: the hot fill point, the end of the current segment's hot zone and the segment's end (blocks'
+        /// Hot/cold layout: the hot fill point, the end of the current segment's hot zone and the segment's end (blocks'
         /// full code goes above the hot zone, below the segment's end, so the hot copy's branches reach it). Appended.
         pub hot_used: u64,
         pub hot_end: u64,
@@ -1069,7 +1031,7 @@ pub mod cache {
     /// As [`PIC_TEST_FORGE`], bits 47-63 flipped (a base in the other half).
     pub const PIC_TEST_FORGE_HALF: u64 = 7;
     /// [`Control::armed_words`]: two words per link point and the computed exit.
-    /// (Hot/cold experiment: a split block's trampolines too.)
+    /// (Hot/cold layout: a split block's trampolines too.)
     pub const ARMED: usize = 3 * super::MAX_LINK_POINTS + 2;
     /// PIC study stage 3: a checked link's record ([`LinkRecord::target`]): its `svc` word branches to its source context's
     /// dispatcher slot (an L1 probe at the address the exit built).
@@ -1160,7 +1122,7 @@ pub mod cache {
         /// not. A record names its point ([`LinkRecord::point`]), so a record that moves updates exactly one slot. Killing
         /// the block undoes its links out by these, with no scan of the records.
         pub out: [u32; super::MAX_LINK_POINTS],
-        /// Hot/cold layout (runtime feature `hot-cold`, a default): when `hot_size` is not 0, a copy of its words
+        /// Hot/cold layout: when `hot_size` is not 0, a copy of its words
         /// `[ENTRY_OFFSET, hot_size)` at code-area offset `hot + ENTRY_OFFSET` (branches out of them re-encoded to the code
         /// at `code`), then one trampoline word standing for its word at `hot_size` (its first exit), is where it is entered.
         /// `hot` is the code area's hot fill point at its placement otherwise (records stay in hot address order).
@@ -1884,11 +1846,11 @@ pub fn moved_word(w: u32, from: u64, to: u64, map: impl Fn(u64) -> u64) -> Optio
     }
     Some(w & !(mask << shift) | (d as u32 & mask) << shift)
 }
-/// Hot/cold experiment: the word `w` can be followed by the next (not `b`, `brk` or a zero word: [`body_end`]'s rule).
+/// Hot/cold layout: the word `w` can be followed by the next (not `b`, `brk` or a zero word: [`body_end`]'s rule).
 pub fn falls_through(w: u32) -> bool {
     !(w & 0xfc00_0000 == 0x1400_0000 || w & 0xffe0_001f == 0xd420_0000 || w >> 16 == 0)
 }
-/// Hot/cold experiment: the end of a block's body (`size` bytes of code, words read by `word`): past the last word reached
+/// Hot/cold layout: the end of a block's body (`size` bytes of code, words read by `word`): past the last word reached
 /// from its entry by falling through or branching (branches go forward, admission; a back edge's target was reached already)
 /// without passing a `stop` word (an exit word or a check stub's first word, which stay cold or become trampolines). `None`
 /// when it has more than 64 forward targets pending at once.
@@ -1935,7 +1897,7 @@ pub fn body_end(word: impl Fn(u64) -> u32, size: u64, stop: impl Fn(u64) -> bool
     }
     Some(end)
 }
-/// Hot/cold experiment: a block's exit words (each link point's first word and the computed exit's `b`), ascending, and
+/// Hot/cold layout: a block's exit words (each link point's first word and the computed exit's `b`), ascending, and
 /// how many.
 pub fn exit_offsets(links: &[LinkPoint; MAX_LINK_POINTS], dispatch_exit: u32) -> ([u32; MAX_LINK_POINTS + 1], usize) {
     let mut e = [0u32; MAX_LINK_POINTS + 1];
@@ -1951,7 +1913,7 @@ pub fn exit_offsets(links: &[LinkPoint; MAX_LINK_POINTS], dispatch_exit: u32) ->
     }
     (e, n)
 }
-/// Hot/cold experiment: the trampoline word at code-area offset `at` standing for the word `w` at offset `from` (a split
+/// Hot/cold layout: the trampoline word at code-area offset `at` standing for the word `w` at offset `from` (a split
 /// block's first exit word): `w` re-encoded when it is a `b` (`nop` when that enters the very next word, the target's hot
 /// copy following), else `b` to `from`.
 pub fn trampoline_word(w: u32, from: u64, at: u64) -> u32 {
@@ -3777,7 +3739,7 @@ mod tests {
         assert!(!links_full(0, MIN_LINK_CAP));
     }
 
-    /// Hot/cold experiment: a branch out of the moved words is re-encoded to reach the same target, one inside (or to the
+    /// Hot/cold layout: a branch out of the moved words is re-encoded to reach the same target, one inside (or to the
     /// first exit word) stays, forms naming their own address are refused, and an out-of-reach `tbz` is refused.
     #[test]
     fn moved_word_reencodes_branches_out() {
@@ -3829,8 +3791,8 @@ mod tests {
         assert_eq!(&e[..n], &[0x30, 0x34, 0x40, 0x4c]);
     }
 
-    /// The two-way L1 (l1-two-way plan): slot, set and way arithmetic, the memory the tables take, the entry words (way
-    /// 0's `cbnz` lands on way 1, way 1's on its own word 7), the empty words, and the owner flags.
+    /// The two-way L1 (l1-two-way plan): slot, set and way arithmetic, the memory the tables take, the data tables'
+    /// layout, and the owner flags.
     #[test]
     fn l1_two_way_layout_and_words() {
         use super::cache::*;
@@ -3848,37 +3810,12 @@ mod tests {
         // The flags and the block number do not overlap.
         assert_eq!(L1_FLAGS, L1_LISTED | L1_NEXT);
         assert!((MAX_BLOCKS as u32 + 1) & L1_FLAGS == 0);
-        // Words: `movz/movk` x4 (rip), `sub`, `cbnz`, `b entry`, then the last.
-        let (at0, miss, entry) = (0x4_0000u64, 0x1010u64, 0x9_0000u64);
-        let rip = 0x7f12_3456_9abc_8def_u64;
-        let way0 = l1_words(0, at0, rip, entry, miss);
-        let way1 = l1_words(1, at0 + 32, rip, entry, miss);
-        let imm = |w: u32| (w >> 5) & 0xffff;
-        for w in [way0, way1] {
-            assert_eq!([0, 1, 2, 3].map(|k| imm(w[k]) as u64), [0x8def, 0x9abc, 0x3456, 0x7f12]);
-            assert_eq!(w[4], 0xcb00_0042, "sub x2, x2, x0");
-        }
-        // The `cbnz x2, +imm19 words`: way 0's goes to the set's second way (+12 from the cbnz at word 5: 32 - 20), way 1's to
-        // its own word 7 (+8).
-        let target = |w: u32, from: u64| from.wrapping_add(((((((w >> 5) & 0x7_ffff) << 13) as i32 >> 13) as i64) * 4) as u64);
-        assert_eq!(way0[5] & 0xff00_001f, 0xb500_0002);
-        assert_eq!(target(way0[5], at0 + 20), at0 + 32);
-        assert_eq!(target(way1[5], at0 + 32 + 20), at0 + 32 + 28);
-        let b = |w: u32, from: u64| from.wrapping_add(((((((w & 0x03ff_ffff) << 6) as i32 >> 6) as i64) * 4) as u64));
-        assert_eq!(way0[6] >> 26, 0b000101);
-        assert_eq!(b(way0[6], at0 + 24), entry);
-        assert_eq!(b(way1[6], at0 + 32 + 24), entry);
-        assert_eq!(b(way0[7], at0 + 28), at0 + 32, "way 0's landing is way 1");
-        assert_eq!(b(way1[7], at0 + 32 + 28), miss, "way 1's is the dispatcher's miss");
-        // Empty words: way 0 to way 1, way 1 to the miss.
-        assert_eq!(b(l1_empty_word(0, at0, miss), at0), at0 + 32);
-        assert_eq!(b(l1_empty_word(1, at0 + 32, miss), at0 + 32), miss);
-        assert_eq!(b(l1_empty_word(2 * 77, at0, miss), at0), at0 + 32);
-        assert_eq!(b(l1_empty_word(2 * 77 + 1, at0, miss), at0), miss);
-        // The victim's RIP bit 15 is in its first word.
-        for rip in [0u64, 0x8000, 0x7fff, 0xffff, 0x1_0000, 0x1_8000] {
-            assert_eq!(l1_word_rip15(l1_words(0, 0, rip, 0, 0)[0]), rip & 0x8000 != 0, "{rip:#x}");
-        }
+        // The data tables: two words (the RIP, the address to branch to) per slot, a set's two ways 32 bytes, in whole 2 MiB
+        // blocks, the reserved block after them.
+        assert_eq!(DL1_BYTES, L1_TABLES * L1_ENTRIES * 16);
+        assert_eq!(L1_WAYS * 16 * L1_SETS, DL1_BYTES / L1_TABLES);
+        assert_eq!((DL1_BYTES % BLOCK, DL1 % BLOCK, DL1_BLOCKS), (0, 0, DL1_BYTES / BLOCK + 1));
+        assert_eq!(DL1_EMPTY >> 63, DL1_EMPTY >> 47 & 1, "the empty marker passes the computed exit's canonical check (bits 63 and 47)");
     }
 
     /// `l1_fill` modelled as the resident drives it (owner words with the flags, the set's next-victim bit in way 0's

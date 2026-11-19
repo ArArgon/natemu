@@ -658,7 +658,7 @@ pub fn k1_stats(area: Area) -> K1 {
             );
         }
     }
-    // Hot/cold experiment (NATEMU_CHECK_LINKS set): the cache self-check after the run, trampolines included, on stderr.
+    // Hot/cold layout (NATEMU_CHECK_LINKS set): the cache self-check after the run, trampolines included, on stderr.
     if std::env::var_os("NATEMU_CHECK_LINKS").is_some() {
         match check_links(area) {
             Ok((points, linked)) => eprintln!("natemu: vCPU {} check_links ok: {points} link points, {linked} linked", area.vcpu),
@@ -705,7 +705,7 @@ pub fn k1_stats(area: Area) -> K1 {
         }
     }
     // Code-size study: the live translations with code of their own at the end (blocks, guest bytes, native bytes; hot/cold
-    // experiment: bytes entered, a split block's hot copy or the whole code, and blocks split).
+    // layout: bytes entered, a split block's hot copy or the whole code, and blocks split).
     for b in placed_blocks(area) {
         if b.flags & (cache::INSTANCE | cache::SYSTEM | cache::STEP | cache::DEAD) == 0 && b.code_size != 0 {
             k.code_size[0] += 1;
@@ -1256,7 +1256,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         .iter()
         .filter(|b| b.flags & (cache::INSTANCE | cache::SYSTEM) == 0)
     {
-        // Hot/cold experiment: a split block's links patch its trampolines (below, as link points); its computed exit's
+        // Hot/cold layout: a split block's links patch its trampolines (below, as link points); its computed exit's
         // trampoline is `b` where the exit's `b` goes, and its exit words in its code stay as admitted (armed: by their words
         // before the stop).
         for (from, at) in b.trampolines() {

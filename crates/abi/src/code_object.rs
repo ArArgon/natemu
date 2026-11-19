@@ -75,7 +75,7 @@ pub mod kind {
     /// results of earlier FP ops in the block. The resident's FP trap handler sets the byte when it writes a result that may be a denormal;
     /// at the stub it clears the byte and exits to the dispatcher at the stub's instruction, the state before it, as at any site.
     pub const DENORM: u8 = 19;
-    /// Experiment (fexc `FEXC_PUSH_RUN`): the 8-byte alignment check (`brk #10`) of a run of naturally aligned 2-, 4- or 8-byte stores (pushes, frame stores) on one base register, `and x0, xS, #7; cbnz x0` (S is x2 or above)
+    /// Stack check runs (fexc --push-run): the 8-byte alignment check (`brk #10`) of a run of naturally aligned 2-, 4- or 8-byte stores (pushes, frame stores) on one base register, `and x0, xS, #7; cbnz x0` (S is x2 or above)
     /// before the first push of a run, recorded like a split stub of that push (address `base_reg` = S, `imm` 0). While S stays
     /// 8-byte aligned no store of the run can cross a page, so the run's pushes carry no split check. At the stub (S not aligned)
     /// the state is the state before the push: the resident steps the push alone (its one-instruction block has the split check).

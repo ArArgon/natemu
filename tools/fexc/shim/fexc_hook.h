@@ -96,13 +96,13 @@ inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue su
 // global constant, which would also force one instruction per block).
 // ---------------------------------------------------------------------------------------------
 inline bool fexc_slice1 = false;
-// Experiment (extended blocks, --ext-conds N): after a conditional branch (jcc, loop, jrcxz) the decoder goes on with the
+// Extended blocks (--ext-conds N): after a conditional branch (jcc, loop, jrcxz) the decoder goes on with the
 // fall-through instructions in the same unit while the unit has fewer than N conditional branches and the fall-through
 // starts in the unit's first page; the taken edge stays an ordinary exit. 0: off (FEX's single basic block).
 // fexc_ext_stop: set by GenerateIR to the last decoded block a retry may keep (a cut or early end inside a non-final one).
 inline int fexc_ext_conds = 0;
 inline int fexc_ext_stop = -1;
-// Experiments (request arguments, default off): --push-run drops the split check of 2/4/8-byte stores at an 8-byte aligned base +
+// Request arguments (the host always sends them; fexc's own default is off): --push-run drops the split check of 2/4/8-byte stores at an 8-byte aligned base +
 // 8k, the guest RSP's alignment checked once (shim/fexc_sites.inc FexcBeforeOp, FexcAlignedAfter); --narrow-cmp compares 8/16-bit
 // operands with a constant without materialising it (FEX Flags.cpp CalculateFlags_SUB, JIT ALUOps.cpp SubNZCV). fexc_step_unit:
 // the request is a step (--max-insts 1), whose split checks stay (the resident steps an instruction whose alignment check fails).

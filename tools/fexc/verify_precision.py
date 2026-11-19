@@ -418,7 +418,7 @@ def guards(d, dis, order):
         # P8: no address guard
         if gs:
             out.append(f'{tag}: {len(gs)} address guard stubs')
-        # Experiment FEXC_PUSH_RUN: an 8-byte push `str xV, [xS, #-0x8]!` may have the stack alignment check `and x0, xS, #0x7;
+        # Stack check runs (--push-run): an 8-byte push `str xV, [xS, #-0x8]!` may have the stack alignment check `and x0, xS, #0x7;
         # cbnz x0, stub` (then only x0/x1 written) instead of a split check, or none while the nearest such check on S before it
         # dominates and every word since writes S only by a writeback of a multiple of 8.
         st = [x for x in mine if x['kind'] == 'stack']

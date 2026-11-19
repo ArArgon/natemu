@@ -361,7 +361,7 @@ pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, v
         leaf + index(3),
         (IPA + target as u64) | PAGE | EL0_DATA | PXN | UXN,
     );
-    // Data-L1 experiment: the dispatcher's data tables (backing offset `dl1`) and the validity tables, three 2 MiB blocks, EL0 and EL1 read-only.
+    // The dispatcher's data tables (backing offset `dl1`) and the reserved block after them, three 2 MiB blocks, EL0 and EL1 read-only.
     if let Some(dl1) = dl1 {
         let i = (va >> 21 & 511) as usize;
         let blocks = natemu_abi::execution::cache::DL1_BLOCKS;

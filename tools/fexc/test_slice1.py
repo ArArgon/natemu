@@ -439,7 +439,7 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual(g['end']['rip'], hex(RIP + (len(PRE) + len(x)) // 2))
 
     def test_extended_blocks_continue_past_conditional_branches_only(self):
-        # Experiment (--ext-conds N): a conditional branch (jcc, loop, jrcxz) no longer ends the block; the translation goes on
+        # Extended blocks (--ext-conds N): a conditional branch (jcc, loop, jrcxz) no longer ends the block; the translation goes on
         # with the fall-through instructions, the taken edge stays an exit (a literal exit to the target) and the block ends where
         # the input does. Every other branch (jmp, call, ret, indirect) still ends it. The default keeps the rule above.
         conditional = re.compile(r'\b(j(?!mp)[a-z]+|loop[a-z]*)\b')

@@ -676,7 +676,7 @@ struct Verifier<'a> {
     dispatch: Option<u32>,
     /// Perf chunk 26: the bulk REP STOS loops, as the native range of each one's words ([`Verifier::bulk_loop`]).
     bulk: Vec<Range<u32>>,
-    /// Experiment (fexc --push-run): [`Verifier::aligned`], computed with the code shape (after `stub_checks`).
+    /// Stack check runs (fexc --push-run): [`Verifier::aligned`], computed with the code shape (after `stub_checks`).
     aligned_before: Vec<u32>,
 }
 
@@ -1643,7 +1643,7 @@ impl<'a> Verifier<'a> {
             }
             // Split check on every store wider than a byte (perf chunk 26: but a bulk REP STOS loop's, inside its page).
             let bulk = self.bulk.iter().any(|r| r.contains(&at));
-            // Experiment (fexc --push-run): a store of 2, 4 or 8 bytes at base + k*width, its base known 8-byte aligned
+            // Stack check runs (fexc --push-run): a store of 2, 4 or 8 bytes at base + k*width, its base known 8-byte aligned
             // ([`Verifier::aligned`]), is naturally aligned and stays inside its page: it may have instead of the split check
             // its own stack alignment check, or none.
             let natural = store
@@ -1708,7 +1708,7 @@ impl<'a> Verifier<'a> {
             && self.word(and) == 0x9240_0800 | u32::from(st.base_reg) << 5)
             .then_some(and)
     }
-    /// Experiment (fexc --push-run): per word, the registers known 8-byte aligned before it (bit 31 and x0/x1 never). A forward
+    /// Stack check runs (fexc --push-run): per word, the registers known 8-byte aligned before it (bit 31 and x0/x1 never). A forward
     /// dataflow from the entry (nothing aligned): a stack alignment check's fall-through adds its register; a load/store
     /// writeback of a multiple of 8 keeps its base; `add|sub{s} xD, xN, #imm` (64-bit) of a multiple of 8 and `mov xD, xN` (orr
     /// with xzr) set D from an aligned N; every other write clears its registers ([`Insn::writes`]), an `svc` all. A branch
@@ -1784,7 +1784,7 @@ impl<'a> Verifier<'a> {
         }
         before
     }
-    /// Experiment (fexc --push-run): the naturally aligned store at `at` on base B has its stack alignment check
+    /// Stack check runs (fexc --push-run): the naturally aligned store at `at` on base B has its stack alignment check
     /// `and x0, xB, #7; cbnz x0, K` (K its `STACK` stub) with only x0/x1 written between it and the store and no branch entering;
     /// or none, and B is known aligned there ([`Verifier::aligned`]). So the store stays inside one page.
     fn stack_aligned(&mut self, at: u32, lo: u32, base: u8) -> Result<(), String> {
@@ -3106,7 +3106,7 @@ mod tests {
         validated(ADDRESS, 0x1c, 0x9100_1c20, 0x9100_0c20, None);
     }
 
-    /// Experiment FEXC_PUSH_RUN (fexc FEXC_PUSH_RUN=1): push r15; push r14; mov eax, esi; push r13; ret. One stack alignment check
+    /// Stack check runs (fexc --push-run): push r15; push r14; mov eax, esi; push r13; ret. One stack alignment check
     /// `and x0, x8, #7` (0x4) `cbnz x0` (0x8) before the first push (0xc), no check on the pushes at 0x10 and 0x18; `mov w4, w10` at 0x14.
     #[test]
     fn push_run_alignment_checks_are_verified() {

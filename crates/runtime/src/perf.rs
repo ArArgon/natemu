@@ -18,8 +18,8 @@ fn charge(to: u64) -> u64 {
     let from = p.current;
     #[cfg(feature = "pcid-study")]
     crate::study::switched(from, to, t, t.wrapping_sub(p.since));
-    // Jump-check experiment (`pic-count` builds): the computed exits' 32-bit counter, gathered into 64 bits here (every
-    // resident entry: it cannot wrap unseen), in the page-validity experiment's two slots.
+    // `pic-count` builds: the computed exits' 32-bit counter, gathered into 64 bits here (every
+    // resident entry: it cannot wrap unseen), in the PCID study counters.
     #[cfg(feature = "pic-count")]
     {
         use natemu_abi::execution::{cache::pcid_study::{BULK, BULK_PAGES}, frame::FLAGS, FRAME_VA};

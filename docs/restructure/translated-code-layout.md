@@ -1,17 +1,14 @@
 # Translated-code layout and the five speed changes
 
-Status: built and on by default (November 19, 2026), after the November 18 experiments on branch `exp-all`. This page says
-what the translated code and the dispatcher now look like and why; the measurements are in section 7. The compiler side
-(FEX fork commit `ac479dd`) is pinned in `tools/fexc/build.sh`; the resident side is the default feature set of
-`crates/runtime`.
+Status: built (November 19, 2026). This page says what the translated code and the dispatcher look like and why; the
+measurements are in section 7. The compiler side (FEX fork commit `ac479dd`) is pinned in `tools/fexc/build.sh`.
 
 ## 1. Why
 
 A CPython build in a guest (`make -j4`, 4 vCPUs) spent about a tenth of its translated-code samples inside the dispatcher
 and half of the samples inside a block on the block's first instruction, a fetch stall at a block boundary. Blocks were
 single basic blocks of about 17 guest bytes, each carrying exits, metadata words and padding. Every `push` carried a
-page-crossing check, and every 8-bit compare spent several instructions on the flags bookkeeping. Five changes address these;
-the owner decided that, being correct and fast, none needs a switch.
+page-crossing check, and every 8-bit compare spent several instructions on the flags bookkeeping. Five changes address these.
 
 ## 2. The dispatcher's tables are data
 
@@ -34,7 +31,6 @@ synchronized.
   access can name it, but the guest's own translated code runs at EL0 and the mapping is what it is). Making them
   kernel-only, or randomizing their place, is deferred by the owner.
 
-Resident feature `data-l1` (default). `--no-default-features` brings back the table-as-code form, for comparison runs.
 
 ## 3. Extended blocks
 
@@ -46,10 +42,10 @@ of link points a block may carry. So there are fewer block boundaries, fewer fet
 ## 4. Hot/cold layout
 
 A block's native code is its body followed by exits (`mov x0, #rip; movk; svc` per exit), metadata words and padding.
-Only the body is hot. In the resident (`hot-cold`, on `no-tail`):
+Only the body is hot. In the resident:
 
-- Without FEX's tail (its data words after the code) blocks are placed at 16-byte alignment instead of 64. This is
-  `no-tail`; word 0 of an admitted object is then the placed length.
+- Without FEX's tail (its data words after the code) blocks are placed at 16-byte alignment instead of 64, so word 0 of an
+  admitted object is the placed length.
 - The words of a block up to its first exit are copied into a dense hot stream, one hot zone (12 KiB) at the start of each
   32 KiB segment, and the block is entered there. Branches out of the copy are re-encoded, and each exit's trampoline
   follows the body, so the exit still reaches the block's whole code, which stays in the segment's cold part; every exit,
@@ -98,9 +94,8 @@ Geometric mean: 0.92 cold, 0.88 warm.
 
 Known open cost: returns still go through the dispatcher, about 9 ns more than a jump-linked block.
 
-## 8. Building the old forms
+## 8. Build notes
 
-For comparison only: `cargo ... build -p natemu-runtime --no-default-features` gives the old resident (add `perf` and the
-like with `--features`). `jump-check` needs `data-l1`; `pic-count` cannot be combined with `hot-cold` (the build fails with a
-message naming both): use `--no-default-features` for it. The suite's `kicks` step expects data-table stops;
-`tools/run_slice3_vm.py kicks --code-l1` expects the old form.
+These are fixed behaviour of the resident, not options: `cargo build -p natemu-runtime --target aarch64-unknown-none` builds
+them, with or without `perf` and the other study features. The counting-stub study `pic-count` no longer builds (a
+`compile_error!` says so): its stubs would have to be mirrored in the hot stream by `split`.

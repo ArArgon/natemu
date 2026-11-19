@@ -51,30 +51,26 @@ fn own_all() -> u64 {
 fn pages() -> usize {
     (natemu_abi::execution::ram_end(control().ram_bytes) / 4096) as usize
 }
-/// Code placement alignment (a cache line).
-/// (Density test: NATEMU_CODE_ALIGN=16 at build time packs blocks to 16 bytes.)
-const CODE_ALIGN: u64 = if NO_TAIL || option_env!("NATEMU_CODE_ALIGN").is_some() { 16 } else { 64 };
-/// Density (`no-tail`, a default feature): a block's code is placed without FEX's tail (its `JITCodeTail` data words after
-/// `code_region_end`), which no generated code and no resident path reads; blocks pack at 16 bytes.
-const NO_TAIL: bool = cfg!(feature = "no-tail");
-/// The bytes of an admitted object's code that are placed: all of them, or with `no-tail` those before its tail.
+/// Code placement alignment.
+const CODE_ALIGN: u64 = 16;
+/// The bytes of an admitted object's code that are placed: those before FEX's tail (its `JITCodeTail` data words after
+/// `code_region_end`, which no generated code and no resident path reads).
 pub fn placed_size(h: &Header) -> u32 {
-    if NO_TAIL { h.code_region_end.min(h.code_size) & !3 } else { h.code_size }
+    h.code_region_end.min(h.code_size) & !3
 }
-/// `r` packed for a block of `size` placed bytes ([`natemu_abi::execution::pack_reloc`]); with `no-tail`, a literal in the
+/// `r` packed for a block of `size` placed bytes ([`natemu_abi::execution::pack_reloc`]); a literal in the
 /// dropped tail (the tail's RIP) is not placed, so nothing relocates it (`Some(None)`).
 pub fn pack_placed(r: &Reloc, size: u32) -> Option<Option<u32>> {
-    if NO_TAIL && r.offset >= size && r.kind == natemu_abi::code_object::RELOC_GUEST_RIP_LITERAL {
+    if r.offset >= size && r.kind == natemu_abi::code_object::RELOC_GUEST_RIP_LITERAL {
         return Some(None);
     }
     natemu_abi::execution::pack_reloc(r, size)
 }
-/// Hot/cold layout (`hot-cold`, a default feature, on `no-tail`): a block's words up to its first exit are copied, their branches out
+/// Hot/cold layout: a block's words up to its first exit are copied, their branches out
 /// re-encoded, into a dense hot stream where it is entered; its whole code (`Block::code`) stays below in its segment and
 /// is what every exit, link, stop, site and resume names ([`split`]).
-const HOT_COLD: bool = cfg!(feature = "hot-cold");
-#[cfg(all(feature = "hot-cold", feature = "pic-count"))]
-compile_error!("hot-cold (a default feature) does not mirror the counting stubs of pic-count: build it with --no-default-features");
+#[cfg(feature = "pic-count")]
+compile_error!("pic-count is not available: the hot/cold layout does not mirror its counting stubs (the study's stubs would have to be placed in the hot stream as well)");
 /// A segment of the code area while splitting: its hot zone, then the whole code of its blocks; every word of one is within
 /// a `tbz`'s reach (32 KiB) of every other.
 const SEG_BYTES: u64 = 32 * 1024;
@@ -91,7 +87,7 @@ fn split_point(
     stub: impl Fn(u64) -> bool,
 ) -> (u32, u64) {
     let (e, n) = natemu_abi::execution::exit_offsets(links, dispatch_exit);
-    if !HOT_COLD || n == 0 {
+    if n == 0 {
         return (0, 0);
     }
     let exit = |o: u64| e[..n].contains(&(o as u32));
@@ -178,7 +174,7 @@ fn link_at(b: &Block, offset: u64) -> u64 {
 /// The word a link from code-area offset `at` to `to` writes: `b`, or `nop` when `to` is the next word (a split block's
 /// trampoline with its target's hot copy right after it).
 fn link_word(at: u64, to: u64) -> u32 {
-    if HOT_COLD && to == at + 4 { NOP } else { branch(at, to) }
+    if to == at + 4 { NOP } else { branch(at, to) }
 }
 const NOP: u32 = 0xd503_201f;
 fn admitted_at(b: &Block, p: &LinkPoint) -> u32 {
@@ -370,7 +366,6 @@ pub fn reset() {
     // table's context takes one.
     let now = c.l1_table as usize;
     clear_l1(now);
-    vt::reset_all();
     for t in (0..area::L1_TABLES).filter(|&t| t != now) {
         (c.l1_contexts[t], c.l1_used[t]) = (area::NO_CONTEXT, 0);
     }
@@ -461,28 +456,16 @@ fn l1_block(t: usize, i: usize) -> u32 {
 fn l1_list(t: usize, k: usize) -> *mut u32 {
     lookup_area::<u32>(area::L1_LISTS).wrapping_add(t * area::L1_ENTRIES + k)
 }
-/// Data tables (`data-l1`, a default feature): the dispatcher reads its tables as data ([`area::DL1`]); the code tables are left unused. An empty
+/// Data tables: the dispatcher reads its tables as data ([`area::DL1`]); the code tables are left unused. An empty
 /// entry's target is the dispatcher's miss: [`area::DL1_EMPTY`] passes the computed exit's canonical check (it compares bits
 /// 63 and 47 only), so a guest jump to that very address matches the marker and must miss like any other (review, defect 1).
-const DATA_L1: bool = cfg!(feature = "data-l1");
-#[cfg(all(feature = "jump-check", not(feature = "data-l1")))]
-compile_error!("jump-check builds on data-l1 (the slot's check precedes the data probe): with --no-default-features add it");
 fn dl1(t: usize, i: usize) -> *mut [u64; 2] {
     lookup_area::<[u64; 2]>(area::DL1).wrapping_add(t * area::L1_ENTRIES + i)
 }
-/// Empties slot `i` of L1 table `t` (its first word branches on: way 0 to way 1, way 1 to the dispatcher's miss; it
-/// stays on its table's list if it was, and keeps the set's next-victim bit); the caller synchronizes the code.
+/// Empties slot `i` of L1 table `t` (it stays on its table's list if it was, and keeps the set's next-victim bit).
 fn empty_l1(t: usize, i: usize) {
     unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_FLAGS) };
-    if DATA_L1 {
-        unsafe { dl1(t, i).write([area::DL1_EMPTY, area::CODE_VA + area::DISPATCH_MISS as u64]) };
-        return;
-    }
-    let at = l1_entry(t, i);
-    unsafe {
-        ((area::CODE_WRITE_VA + at) as *mut u32)
-            .write_volatile(area::l1_empty_word(i, at, area::DISPATCH_MISS as u64))
-    };
+    unsafe { dl1(t, i).write([area::DL1_EMPTY, area::CODE_VA + area::DISPATCH_MISS as u64]) };
 }
 /// Empties every entry of L1 table `t` and its list.
 fn clear_l1(t: usize) {
@@ -491,17 +474,6 @@ fn clear_l1(t: usize) {
         unsafe { l1_owner(t, i).write(0) };
     }
     control().l1_listed[t] = 0;
-    vt::reset_table(t);
-    if !DATA_L1 {
-        synchronize_l1(t);
-    }
-}
-fn synchronize_l1(t: usize) {
-    synchronize_code(
-        area::CODE_WRITE_VA + l1_entry(t, 0),
-        area::CODE_VA + l1_entry(t, 0),
-        area::L1_TABLE_BYTES,
-    );
 }
 /// Code-area offset of dispatcher slot `k` ([`area::DISPATCH`]; slot 0 is the dispatcher itself).
 fn slot_at(k: usize) -> u64 {
@@ -547,12 +519,9 @@ pub fn fill_head(dispatcher: &[u8]) -> bool {
         c.slot_contexts[k] = area::NO_CONTEXT;
     }
     (c.slot_contexts[0], c.l1_slots) = (area::NO_CONTEXT, [0; area::L1_TABLES]);
-    vt::init();
-    if DATA_L1 {
-        for t in 0..area::L1_TABLES {
-            for i in 0..area::L1_ENTRIES {
-                unsafe { dl1(t, i).write([area::DL1_EMPTY, area::CODE_VA + area::DISPATCH_MISS as u64]) };
-            }
+    for t in 0..area::L1_TABLES {
+        for i in 0..area::L1_ENTRIES {
+            unsafe { dl1(t, i).write([area::DL1_EMPTY, area::CODE_VA + area::DISPATCH_MISS as u64]) };
         }
     }
     synchronize_code(
@@ -582,14 +551,6 @@ fn write_slot(k: usize, t: Option<usize>) {
     let mut words = [0u32; area::DISPATCH_SLOT_BYTES / 4];
     match t {
         None => words[0] = branch(at, area::DISPATCH_MISS as u64),
-        Some(t) if !DATA_L1 => {
-            words[..4].copy_from_slice(&[
-                word(slot_at(0)),
-                dispatch_adr(at + 4, t),
-                word(slot_at(0) + 8),
-                word(slot_at(0) + 12),
-            ]);
-        }
         Some(t) => {
             // The tables lie a whole number of pages from x28, after its 2 MiB or before it ([`area::dl1_after`]): `add x2,
             // x28, #pages, lsl #12`, or `sub`.
@@ -601,23 +562,10 @@ fn write_slot(k: usize, t: Option<usize>) {
                 (if area::dl1_after(va) { 0x9140_0000 | (512 - page + after) << 10 } else { 0xd140_0000 | (page + before) << 10 }) | 28 << 5 | 2
             };
             let miss = |k: usize| 0xb500_0001 | ((area::DISPATCH_MISS as u64).wrapping_sub(at + 4 * k as u64) as u32 >> 2 & 0x7_ffff) << 5;
-            let mut n = 0;
-            // Jump-check study: first the target page's word of the table's validity table against the page: `ubfx x1,
-            // x0, #12, #16; add x2, x28, #table; ldr x1, [x2, x1, lsl #3]; eor x1, x1, x0, lsr #12; cbnz x1, miss`.
-            if vt::ON {
-                words[..5].copy_from_slice(&[
-                    0xd34c_6c01,
-                    reach(TABLE_PAGES * area::L1_TABLES as u32 + 128 * t as u32, 512 - 128 * t as u32),
-                    0xf861_7841,
-                    0xca40_3021,
-                    miss(4),
-                ]);
-                n = 5;
-            }
             // Data tables: `and x1, x0, #mask; add x2, x28, #table; add x2, x2, x1, lsl #5; ldr x1, [x2]; eor x1, x1,
             // x0; cbnz x1, way 1; ldr x1, [x2, #8]; br x1; way 1: ldr x1, [x2, #16]; eor x1, x1, x0; cbnz x1, miss; ldr x1,
             // [x2, #24]; br x1`.
-            words[n..n + 13].copy_from_slice(&[
+            words[..13].copy_from_slice(&[
                 word(slot_at(0)),
                 reach(TABLE_PAGES * t as u32, 512 * area::DL1_BLOCKS as u32 - TABLE_PAGES * t as u32),
                 0x8b01_1442,
@@ -628,7 +576,7 @@ fn write_slot(k: usize, t: Option<usize>) {
                 0xd61f_0020,
                 0xf940_0841,
                 0xca00_0021,
-                miss(n + 10),
+                miss(10),
                 0xf940_0c41,
                 0xd61f_0020,
             ]);
@@ -728,7 +676,6 @@ pub fn fill_l1(rip: u64, block: &Block) {
         }
         return;
     }
-    vt::set(t, rip >> 12, block.source_gpa[0], block.flags & GLOBAL != 0, block.flags & LARGE != 0);
     let (w0, w1) = area::l1_slots_of(rip);
     let (o0, o1) = unsafe { (l1_owner(t, w0).read(), l1_owner(t, w1).read()) };
     let want = block.number + 1;
@@ -736,21 +683,19 @@ pub fn fill_l1(rip: u64, block: &Block) {
     // fill order. Which one is a hint for performance; the written slot's owner precedes its words, as ever.
     let f = area::l1_fill(o0, o1, want);
     let i = [w0, w1][f.way];
-    let at = l1_entry(t, i);
     #[cfg(feature = "dispatch-study")]
     if f.victim {
         control().l1_counts[area::L1_EVICTED] += 1;
     }
     // A conflict the 16-bit direct-mapped index did not have: the victim's RIP differs from this one in bit 15 alone, read
-    // from its first word (`movz x2, #rip[15:0]`: a line written below anyway), not through its block.
+    // from its table entry, not through its block.
     #[cfg(feature = "perf")]
-    if f.victim && area::l1_word_rip15(word(at)) != (rip >> 15 & 1 != 0) {
+    if f.victim && (unsafe { dl1(t, i).read()[0] } >> 15 & 1 != 0) != (rip >> 15 & 1 != 0) {
         control().l1_counts[area::L1_NEW_CONFLICT] += 1;
     }
     let flip = if f.victim { area::L1_NEXT } else { 0 };
     let mut listed = [o0, o1][f.way] & area::L1_LISTED;
-    // (Jump-check study: a one-page block's entry outlives a CR3 load, its slot's check standing for it.)
-    if listed == 0 && block.flags & GLOBAL == 0 && (!vt::ON || block.source_gpa[1] != u64::MAX) {
+    if listed == 0 && block.flags & GLOBAL == 0 {
         let c = control();
         unsafe { l1_list(t, c.l1_listed[t] as usize).write(i as u32) };
         (c.l1_listed[t], listed) = (c.l1_listed[t] + 1, area::L1_LISTED);
@@ -764,27 +709,7 @@ pub fn fill_l1(rip: u64, block: &Block) {
             unsafe { l1_owner(t, w0).write(o0 ^ area::L1_NEXT) };
         }
     }
-    if DATA_L1 {
-        unsafe { dl1(t, i).write([rip, code_of(block).full_entry()]) };
-        return;
-    }
-    let words = area::l1_words(i, at, rip, code_of(block).full_entry() - area::CODE_VA, area::DISPATCH_MISS as u64);
-    // Already there (a resident entry that ends at the same block again, e.g. after a system instruction): no code change.
-    if (0..words.len()).all(|k| unsafe { ((area::CODE_WRITE_VA + at) as *const u32).add(k).read_volatile() } == words[k]) {
-        return;
-    }
-    unsafe {
-        copy_record(
-            (area::CODE_WRITE_VA + at) as *mut u8,
-            words.as_ptr().cast(),
-            size_of_val(&words),
-        )
-    };
-    synchronize_code(
-        area::CODE_WRITE_VA + at,
-        area::CODE_VA + at,
-        area::L1_ENTRY_BYTES,
-    );
+    unsafe { dl1(t, i).write([rip, code_of(block).full_entry()]) };
 }
 
 /// Dispatch study (`dispatch-study` builds only: its loads and stores cost measurable time in the `perf` gate builds):
@@ -807,183 +732,10 @@ pub fn count_miss(rip: u64, context: u64) {
     }] += 1;
 }
 
-/// Jump-check study (`jump-check` builds): per L1 table, which linear code pages are valid now, as a TLB holds fetch
-/// entries, in words the dispatcher slots read ([`area::VT`]). A word is set when a block starting on the page is entered
-/// in L1 ([`fill_l1`]: a lookup just found it mapped so), and cleared by what ends a fetch entry: a CR3 load (not the
-/// global ones), a global flush, INVLPG and #PF (its 2 MiB region), a table changing hands, a reset. While a page's word
-/// is set, every L1 entry of the table for a block starting on that page is of the frame the word was set for (`set`
-/// empties the others), so the slot's check stands for each one-page block's own currency: a CR3 load leaves their
-/// entries. Blocks over two pages keep the old rule (listed, emptied). The words and the resident's side (page, frame and
-/// flags by index, and the indices set) are in the lookup area's study part; the host maps the words for EL0 to read.
-#[cfg(feature = "jump-check")]
-mod vt {
-    use super::*;
-    use natemu_abi::execution::cache::{PCID_STUDY, VT, VT_ENTRIES, pcid_study::{BULK, BULK_PAGES}};
-    const SIDE: usize = PCID_STUDY;
-    pub const ON: bool = true;
-    const N: usize = area::L1_TABLES * VT_ENTRIES;
-    const LARGE_PAGE: u64 = 1 << 60;
-    const SET: u64 = 1 << 61;
-    const LISTED: u64 = 1 << 62;
-    const GLOBAL_PAGE: u64 = 1 << 63;
-    const NONE: u64 = u64::MAX;
-    fn word(t: usize, i: usize) -> *mut u64 {
-        lookup_area::<u64>(VT).wrapping_add(t * VT_ENTRIES + i)
-    }
-    fn page(t: usize, i: usize) -> *mut u64 {
-        lookup_area::<u64>(SIDE).wrapping_add(t * VT_ENTRIES + i)
-    }
-    fn frame(t: usize, i: usize) -> *mut u64 {
-        lookup_area::<u64>(SIDE + 8 * N).wrapping_add(t * VT_ENTRIES + i)
-    }
-    fn list(t: usize, k: usize) -> *mut u16 {
-        lookup_area::<u16>(SIDE + 16 * N).wrapping_add(t * VT_ENTRIES + k)
-    }
-    fn listed(t: usize) -> *mut u64 {
-        lookup_area::<u64>(SIDE + 18 * N).wrapping_add(t)
-    }
-    /// Linear page `p` maps to `gpa`'s frame now, for table `t`'s context.
-    pub fn set(t: usize, p: u64, gpa: u64, global: bool, large: bool) {
-        let i = p as usize & (VT_ENTRIES - 1);
-        let f = gpa >> 12 | SET | if global { GLOBAL_PAGE } else { 0 } | if large { LARGE_PAGE } else { 0 };
-        unsafe {
-            let old = frame(t, i).read();
-            if page(t, i).read() != p || old & !LISTED != f {
-                purge(t, p, gpa);
-                page(t, i).write(p);
-                frame(t, i).write(f | old & LISTED);
-                control().pcid_study[BULK_PAGES] += 1;
-            }
-            if word(t, i).read_volatile() != p {
-                word(t, i).write_volatile(p);
-                control().pcid_study[BULK] += 1;
-                if frame(t, i).read() & LISTED == 0 {
-                    frame(t, i).write(frame(t, i).read() | LISTED);
-                    list(t, listed(t).read() as usize).write(i as u16);
-                    listed(t).write(listed(t).read() + 1);
-                }
-            }
-        }
-    }
-    /// Table `t`'s L1 entries for blocks starting on page `p` from another frame go.
-    fn purge(t: usize, p: u64, gpa: u64) {
-        let context = control().l1_contexts[t];
-        on_linear_page(p, |n| {
-            let b = block(n);
-            if b.context == context && b.rip >> 12 == p && b.source_gpa[0] != gpa {
-                let (w0, w1) = area::l1_slots_of(b.rip);
-                for i in [w0, w1] {
-                    if l1_block(t, i) == b.number + 1 {
-                        empty_l1(t, i);
-                        let at = l1_entry(t, i);
-                        if !DATA_L1 {
-                            synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
-                        }
-                    }
-                }
-            }
-        });
-    }
-    pub fn clear_nonglobal() {
-        for t in 0..area::L1_TABLES {
-            unsafe {
-                let mut kept = 0;
-                for k in 0..listed(t).read() as usize {
-                    let i = list(t, k).read() as usize;
-                    if frame(t, i).read() & GLOBAL_PAGE != 0 {
-                        list(t, kept).write(i as u16);
-                        kept += 1;
-                    } else {
-                        word(t, i).write_volatile(NONE);
-                        frame(t, i).write(frame(t, i).read() & !LISTED);
-                    }
-                }
-                listed(t).write(kept as u64);
-            }
-        }
-    }
-    /// The table holds no context's entries any more: every word goes. What the table remembers of each index (page and
-    /// frame) may stay: with no entry left, none is of another frame, and every later entry comes through [`set`].
-    pub fn reset_table(t: usize) {
-        unsafe {
-            for k in 0..listed(t).read() as usize {
-                let i = list(t, k).read() as usize;
-                word(t, i).write_volatile(NONE);
-                frame(t, i).write(frame(t, i).read() & !LISTED);
-            }
-            listed(t).write(0);
-        }
-    }
-    /// Start-up: every word of every table (the area starts zeroed, and 0 is a page number).
-    pub fn init() {
-        for t in 0..area::L1_TABLES {
-            for i in 0..VT_ENTRIES {
-                unsafe { word(t, i).write_volatile(NONE) };
-            }
-        }
-    }
-    pub fn reset_all() {
-        (0..area::L1_TABLES).for_each(reset_table);
-    }
-    /// INVLPG or #PF at `address`: its page, and the pages of its 2 MiB region that a large leaf translated.
-    pub fn clear_region(address: u64) {
-        let p = address >> 12;
-        let i = p as usize & (VT_ENTRIES - 1);
-        for t in 0..area::L1_TABLES {
-            unsafe {
-                if word(t, i).read_volatile() == p {
-                    word(t, i).write_volatile(NONE);
-                }
-                if !large_held(control(), p >> 9) {
-                    continue;
-                }
-                for k in 0..listed(t).read() as usize {
-                    let i = list(t, k).read() as usize;
-                    if frame(t, i).read() & LARGE_PAGE != 0 && page(t, i).read() >> 9 == p >> 9 {
-                        word(t, i).write_volatile(NONE);
-                    }
-                }
-            }
-        }
-    }
-    /// A one-page block not cut whose page's word is set for its frame, in a table of its context.
-    pub fn current(b: &Block) -> bool {
-        if b.checked == 0 || b.source_gpa[1] != u64::MAX || b.flags & DEAD != 0 {
-            return false;
-        }
-        let (p, c) = (b.rip >> 12, control());
-        let i = p as usize & (VT_ENTRIES - 1);
-        (0..area::L1_TABLES).any(|t| {
-            c.l1_contexts[t] == b.context
-                && unsafe { word(t, i).read_volatile() == p && frame(t, i).read() & (LARGE_PAGE - 1) == b.source_gpa[0] >> 12 }
-        })
-    }
-}
-#[cfg(not(feature = "jump-check"))]
-mod vt {
-    use super::*;
-    pub const ON: bool = false;
-    #[inline(always)]
-    pub fn set(_: usize, _: u64, _: u64, _: bool, _: bool) {}
-    #[inline(always)]
-    pub fn clear_nonglobal() {}
-    #[inline(always)]
-    pub fn init() {}
-    #[inline(always)]
-    pub fn reset_table(_: usize) {}
-    #[inline(always)]
-    pub fn reset_all() {}
-    #[inline(always)]
-    pub fn clear_region(_: u64) {}
-    #[inline(always)]
-    pub fn current(_: &Block) -> bool {
-        false
-    }
-}
 /// K1: `b`'s source mapping may be used now, as a TLB entry ([`Control::epoch`]).
 pub fn current(b: &Block) -> bool {
     let c = control();
-    b.checked == c.epoch || (b.flags & GLOBAL != 0 && b.checked >= c.global_epoch) || vt::current(b)
+    b.checked == c.epoch || (b.flags & GLOBAL != 0 && b.checked >= c.global_epoch)
 }
 /// Perf chunk 22: the live block cached for (`rip`, `context`) that is current now ([`current`]), looked up with no walk:
 /// a TLB entry in use, as the CPU fetches through one without walking (never one of another address space: it is not
@@ -1080,8 +832,6 @@ pub fn lookup(
                 if block(n).inbound != 0 && c.links_susp != 0 {
                     relink(n);
                 }
-                #[cfg(feature = "page-valid")]
-                page_valid(n, b.checked, walked);
                 #[cfg(feature = "pic-count")]
                 if user(b.context) {
                     frame_met(block(n));
@@ -1092,56 +842,6 @@ pub fn lookup(
         }
         i = (i + 1) & (area::L2_ENTRIES - 1);
     }
-}
-/// Page-validity experiment (`page-valid` builds only): block `n` (last current in epoch `was`) was just found mapped as
-/// before, `walked` its translation's flags. Every other block wholly on its linear page, of its context and frame, has the
-/// same answer to the same question (one page, one translation), so those not current are made current too, as their own
-/// revalidation would: relinked and entered in L1. Which ones: those last current in the same epoch as `n` (used together
-/// the last time), or with `NATEMU_PAGE_VALID_ALL` every one. Up to 128 a page; global mappings and blocks over two pages
-/// are left to their own revalidation.
-#[cfg(feature = "page-valid")]
-fn page_valid(n: usize, was: u64, walked: u32) {
-    const ALL: bool = option_env!("NATEMU_PAGE_VALID_ALL").is_some();
-    let b = *block(n);
-    let page = b.rip >> 12;
-    if walked & GLOBAL != 0 || lpages(&b) != [page; 2] {
-        return;
-    }
-    let c = control();
-    let (mut found, mut k) = ([0u32; 128], 0);
-    on_linear_page(page, |m| {
-        let o = block(m);
-        if m != n
-            && k < found.len()
-            && o.context == b.context
-            && o.source_gpa == b.source_gpa
-            && lpages(o) == [page; 2]
-            && o.flags & (GLOBAL | SYSTEM | STEP | DEAD) == 0
-            && o.checked != 0
-            && !current(o)
-            && (ALL || o.checked == was)
-        {
-            found[k] = m as u32;
-            k += 1;
-        }
-    });
-    for &m in &found[..k] {
-        let m = m as usize;
-        unsafe {
-            (*block_ptr(m)).checked = c.epoch;
-            (*block_ptr(m)).flags = (*block_ptr(m)).flags & !LARGE | walked & LARGE;
-        }
-        if walked & LARGE != 0 {
-            mark_large(block(m));
-        }
-        #[cfg(not(feature = "pic-count"))]
-        if block(m).inbound != 0 && c.links_susp != 0 {
-            relink(m);
-        }
-        fill_l1(block(m).rip, block(m));
-    }
-    c.pcid_study[natemu_abi::execution::cache::pcid_study::BULK] += k as u64;
-    c.pcid_study[natemu_abi::execution::cache::pcid_study::BULK_PAGES] += 1;
 }
 /// K1: a TLB flush of this vCPU (`global`: global entries too): the epoch moves, and every L1 entry (of every table) and link into a block
 /// no longer current goes but local ones (the blocks stay, found again by [`lookup`] after a fetch walk). Returns the
@@ -1154,11 +854,6 @@ pub fn tlb(global: bool) -> Option<u64> {
     }
     let c = control();
     c.epoch += 1;
-    if global {
-        vt::reset_all();
-    } else {
-        vt::clear_nonglobal();
-    }
     if global {
         c.global_epoch = c.epoch;
         c.global_flushes += 1;
@@ -1179,7 +874,6 @@ pub fn tlb(global: bool) -> Option<u64> {
         // listed entries (filled with a non-global block) are looked at. Each one emptied is cleaned to the point of
         // unification; after one barrier its instructions are invalidated as the list is compacted (an entry still
         // filled stays listed, the rest leave it).
-        let ctr = c.ctr_el0;
         for t in 0..area::L1_TABLES {
             let listed = c.l1_listed[t] as usize;
             if c.l1_contexts[t] == area::NO_CONTEXT || listed == 0 {
@@ -1190,13 +884,7 @@ pub fn tlb(global: bool) -> Option<u64> {
                 let owner = l1_block(t, i);
                 if owner != 0 && !current(block(owner as usize - 1)) {
                     empty_l1(t, i);
-                    if !DATA_L1 {
-                        clean_pou(ctr, area::CODE_WRITE_VA + l1_entry(t, i));
-                    }
                 }
-            }
-            if !DATA_L1 {
-                clean_barrier(ctr);
             }
             let mut kept = 0;
             for k in 0..listed {
@@ -1206,13 +894,7 @@ pub fn tlb(global: bool) -> Option<u64> {
                     kept += 1;
                 } else {
                     unsafe { l1_owner(t, i).write(l1_owner(t, i).read() & area::L1_NEXT) };
-                    if !DATA_L1 {
-                        invalidate_pou(ctr, area::CODE_VA + l1_entry(t, i));
-                    }
                 }
-            }
-            if !DATA_L1 {
-                unsafe { asm!("dsb ish", "isb") };
             }
             c.l1_listed[t] = kept as u64;
         }
@@ -1844,9 +1526,9 @@ pub fn copy_pooled(
     walked: u32,
 ) -> Result<Option<&'static Block>, usize> {
     let c = control();
-    // (`no-tail`: the code as admitted starts with its header word, `udf #tail offset`; up to there.)
+    // (The code as admitted starts with its header word, `udf #tail offset`; up to there.)
     let head = e.code.get(..4).map_or(u32::MAX, |w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
-    let len = if NO_TAIL && head % 4 == 0 && (head as usize) <= e.code.len() {
+    let len = if head % 4 == 0 && (head as usize) <= e.code.len() {
         head as usize
     } else {
         e.code.len()
@@ -2119,12 +1801,6 @@ pub fn place_step(
 /// `bytes` of code written at `write` (a writable alias) become visible to instruction fetch at `exec` (its executable alias).
 fn synchronize_code(write: u64, exec: u64, bytes: usize) {
     let ctr = control().ctr_el0;
-    #[cfg(feature = "sync-time")]
-    let t0: u64;
-    #[cfg(feature = "sync-time")]
-    unsafe {
-        asm!("mrs {0}, cntvct_el0", out(reg) t0)
-    };
     unsafe {
         if ctr & CTR_IDC == 0 {
             let dline = 4u64 << ((ctr >> 16) & 15);
@@ -2146,16 +1822,6 @@ fn synchronize_code(write: u64, exec: u64, bytes: usize) {
             }
         }
         asm!("dsb ish", "isb");
-    }
-    #[cfg(feature = "sync-time")]
-    {
-        use natemu_abi::execution::cache::pcid_study::{BULK, BULK_PAGES};
-        let t1: u64;
-        unsafe { asm!("mrs {0}, cntvct_el0", out(reg) t1) };
-        let c = control();
-        c.pcid_study[BULK] += 1;
-        c.pcid_study[BULK_PAGES] += t1 - t0;
-        c.pcid_study[natemu_abi::execution::cache::pcid_study::PEAK] = ctr;
     }
 }
 /// Reads CTR_EL0 once into [`Control::ctr_el0`] (resident start-up): every later code synchronization uses that copy, as a
@@ -2378,12 +2044,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     let code = now.unwrap_or_else(|| code_of(target));
     let local_shared =
         local_ok && (target.flags & INSTANCE != 0 || now.is_some()) && same_frames(code, source);
-    // Jump-check study: so is every link into a block of another page (the slot's check stands for the
-    // target's currency: no CR3 load suspends it, no revalidation patches it again).
-    let checked = !local_shared
-        && (shared
-            || target.flags & INSTANCE != 0
-            || vt::ON && target.flags & GLOBAL == 0 && !local(target, source));
+    let checked = !local_shared && (shared || target.flags & INSTANCE != 0);
     // (Review of stage 3, finding 2: a REP string's self-exit is never checked-linked; a stop or interrupt at its `svc`
     // word would not see the REP boundary, which the resident finds by the link point's offset.)
     if checked && points().any(|p| source.rep_exit(u64::from(p.offset))) {
@@ -2447,7 +2108,7 @@ pub fn link(source: &Block, target: &Block, at: u64) -> Link {
     // ([`stub`]).
     #[cfg(feature = "pic-count")]
     let class = pic::class(shared, at, code.flags & PIC != 0, target.rip);
-    // Jump-check study: an absolute link that is not local counts with the cross-page ones (every link a flush undoes).
+    // an absolute link that is not local counts with the cross-page ones (every link a flush undoes).
     #[cfg(feature = "pic-count")]
     let class = if class == pic::Class::Absolute && segment != LOCAL { pic::Class::CrossPage } else { class };
     #[cfg(feature = "pic-count")]
@@ -3072,7 +2733,6 @@ pub fn invlpg(address: u64) -> Option<u64> {
             });
         }
     }
-    vt::clear_region(address);
     undone
 }
 /// Takes block `n`'s entry out of L2 (linear probing's backward-shift deletion), so probes never pass dead blocks: a
@@ -3207,10 +2867,6 @@ fn cut_one(n: usize, dead: bool) -> Option<()> {
         for i in [w0, w1] {
             if l1_block(t, i) == b.number + 1 {
                 empty_l1(t, i);
-                let at = l1_entry(t, i);
-                if !DATA_L1 {
-                    synchronize_code(area::CODE_WRITE_VA + at, area::CODE_VA + at, 4);
-                }
             }
         }
     }
@@ -3534,7 +3190,7 @@ pub fn block_at(pc: u64) -> Option<&'static Block> {
     };
     let n = [last(offset), last(offset + 4)]
         .into_iter()
-        .chain([HOT_COLD.then(|| last_hot(offset.wrapping_sub(4))).flatten()])
+        .chain([last_hot(offset.wrapping_sub(4))])
         .flatten()
         .find(|&n| holds(block(n)))?;
     let b = block(n);

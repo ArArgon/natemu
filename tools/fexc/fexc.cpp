@@ -596,7 +596,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     // has copied the code), so the context holds nothing of this request afterwards.
     auto* impl = static_cast<Context::ContextImpl*>(kc->ctx.get());
     const uint64_t max = st.max_insts > 0 ? uint64_t(st.max_insts) : 0;
-    // Experiment (extended blocks): compiled again with fewer conditional branches per unit while a cut or early end fell
+    // Extended blocks: compiled again with fewer conditional branches per unit while a cut or early end fell
     // inside a non-final decoded block (fexc_ext_stop) or the unit has more literal exits than the resident's link points
     // (4, crates/abi MAX_LINK_POINTS). Each attempt has fewer, so this ends; 0 is the plain block. The guest bytes read
     // (Extent) and gating arguments read accumulate over the attempts.

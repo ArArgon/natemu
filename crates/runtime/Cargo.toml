@@ -9,10 +9,6 @@ natemu-abi = { path = "../abi" }
 
 # Performance phase, first chunk: the resident's time accounting (`src/perf.rs`); off by default (no code).
 [features]
-# What the resident does by default: the dispatcher's data tables (`data-l1`) and the hot/cold block layout (`hot-cold`, on
-# `no-tail`). The old forms (dispatcher tables as code, whole blocks with FEX's tail) remain buildable with
-# `--no-default-features`, for comparison runs only.
-default = ["data-l1", "no-tail", "hot-cold"]
 perf = []
 # Dispatch study, measurement builds only: counts L1 evictions, skipped fills and misses by the L1 entry they found
 # (`Control::l1_counts`). Kept out of plain `perf`: the extra loads and stores in the lookup and miss paths showed in the gates.
@@ -25,34 +21,14 @@ page-study = ["perf"]
 # PCID gain study, measurement builds only (`src/study.rs`): models the TLB a PCID guest would keep across CR3 loads and counts
 # the shadow misses and block revalidations that were refills (`Control::pcid_study`).
 pcid-study = ["perf"]
-# Page-validity experiment, measurement builds only (`cache::page_valid`): a revalidation makes current the other blocks on
-# its page too (those last current in the same epoch; all of them with NATEMU_PAGE_VALID_ALL set at build time).
-page-valid = []
-# Jump-check experiment, measurement builds only (`cache::vt`): a dispatcher slot checks its target's code page in a
-# per-table validity table before probing L1, so a CR3 load clears that table and leaves L1 entries of one-page blocks.
-# Builds on `data-l1` (a default feature; with `--no-default-features` add it).
-jump-check = []
-# Trap-cost study, measurement builds only: counts and times every code synchronization (`cache::synchronize_code`) in the
-# page-validity experiment's two counter slots.
-sync-time = []
-# The dispatcher's tables are data the slots load from (`cache::dl1`), not code, so filling or emptying an entry writes and
-# synchronizes no code. On by default; without it (`--no-default-features`) the tables are code, kept for comparison.
-data-l1 = []
 # Translated-code profile, measurement builds only (`study::prof`): at every interrupt taken in generated code, where the
 # vCPU was (dispatcher, a block's header, body or exits), in whose code (user or kernel), on what kind of instruction, and
 # a table of the blocks hit most (the host rings each vCPU's doorbell every NATEMU_SAMPLE_US microseconds to sample).
 profile = []
-# Blocks are placed without FEX's tail (its data words after the code) and packed at 16 bytes (`cache::placed_size`); word 0 of
-# an admitted object is then the placed length. On by default.
-no-tail = []
-# Hot/cold layout (`cache::split`): a block's words up to its first exit are copied into a dense hot stream where it is entered;
-# its whole code stays in the segment's cold part. On by default; `pic-count` cannot be combined with it (use
-# `--no-default-features`).
-hot-cold = ["no-tail"]
 # Isolated scheduling fixtures; no calls or metadata accesses when disabled.
 io-test-hooks = []
 # PIC study stage 1, measurement builds only: links enter their targets through counting stubs (`cache::stub`), for linked
-# transitions by class. The stubs use guest-state fields and links the program driver's checks refuse: no suite runs them.
+# transitions by class. Does not build (`compile_error!`): the hot/cold layout would have to mirror the stubs in its hot stream.
 pic-count = []
 # Chunk 1b, check builds only: after an INVLPG cut no non-local link is left into the block, after a death none at all
 # (`cache::check_inbound`; stop `link_check`).

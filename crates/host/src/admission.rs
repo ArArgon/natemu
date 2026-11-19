@@ -548,7 +548,7 @@ fn admit_records(
         return fail("code layout");
     }
     let code_end = code_end.unwrap();
-    // (Word 0 is FEX's tail offset; the resident (`no-tail`, pool copies) takes it as the placed length, so it must be the
+    // (Word 0 is FEX's tail offset; the resident (pool copies too) takes it as the placed length, so it must be the
     // validated `code_region_end`.)
     if region < 4 || bytes[code..code + 4] != region.to_le_bytes() {
         return fail("code layout: head word is not the code region end");
@@ -728,7 +728,7 @@ fn admit_records(
         sti_first: sti.first() == Some(&rip),
         ..admitted
     };
-    // Experiment (extended blocks, fexc --ext-conds): the direct target of a branch inside the block (a conditional branch
+    // Extended blocks (fexc --ext-conds): the direct target of a branch inside the block (a conditional branch
     // whose fall-through the unit goes on with) is proven like the last instruction's. A plain block has none.
     let inner = starts.iter().enumerate().filter_map(|(i, &g)| {
         // (the last instruction too: a unit whose last branch's fall-through is a cut ends `system_instruction`)
@@ -910,7 +910,7 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
             let align_ok = s.kind == ALIGN
                 && ((matches!(a.kind, LOAD | STORE) && a.data_class == object::CLASS_FPR)
                     || matches!(a.kind, LOAD_PAIR | STORE_PAIR));
-            // Experiment (fexc --push-run): a stack alignment stub covers a store or push of 2, 4 or 8 bytes; its address is
+            // Stack check runs (fexc --push-run): a stack alignment stub covers a store or push of 2, 4 or 8 bytes; its address is
             // the checked register (the resident steps the instruction, it completes nothing from the record).
             let stack_ok = s.kind == STACK
                 && matches!(a.kind, PUSH | STORE)
