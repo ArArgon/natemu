@@ -144,7 +144,8 @@ fn split(b: &mut Block) -> bool {
     };
     // (The word before `h` falling through into a word that is no exit would run what the hot zone held before: a stub's first
     // word reached by falling through is a malformed block, so it is placed whole and its code stays as admitted.)
-    if !exit_at_h && natemu_abi::execution::falls_through(word(code + h - 4)) {
+    // (An empty body — no word copied, no exit at its end — has nothing to enter: placed whole as well.)
+    if !exit_at_h && (h == u64::from(natemu_abi::execution::ENTRY_OFFSET) || natemu_abi::execution::falls_through(word(code + h - 4))) {
         return false;
     }
     for o in (u64::from(natemu_abi::execution::ENTRY_OFFSET)..h).step_by(4) {
