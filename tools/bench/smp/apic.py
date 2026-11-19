@@ -229,31 +229,26 @@ def store(k, reg='rax'):
     return f'    mov [{{data}} + {8 * k}], {reg}'
 
 
+def regs_reads(m):
+    """regs_program's read-backs in order (the k-th stored at DATA + 8 k): (register, the value written just before or
+    None)."""
+    out = [(ID, None), (VER, None), (TPR, 0x5a), (PPR, None), (TPR, 0)]
+    out += [(LDR, 0x12345678), (DFR, 0x0fffffff), (DFR, 0xffffffff), (LDR, 0x01000000)] if m == 'x' else [(LDR, None)]
+    out += [(SVR, 0x13f), (SVR, 0x1ff), (LVT_TIMER, 0x20045), (LVT_TIMER, 0x10045), (LVT_THERMAL, 0x10233), (LVT_PMC, 0x10444),
+            (LVT_LINT0, 0x1a755), (LVT_LINT1, 0x10400), (LVT_ERROR, 0x10066)]
+    out += [(ICR2, 0x03000000)] if m == 'x' else []
+    out += [(DCR, 0xb), (DCR, 0x9), (INIT_COUNT, 0), (CUR_COUNT, None)] + [(r, None) for r in (ISR + 1, ISR + 2, TMR + 2, IRR + 2)]
+    return out + [(ESR, 0)]
+
+
 def regs_program(m):
     """Register write/read-back sequences Linux's set-up uses (each read stored at DATA + 8 k)."""
-    seq, k = [], 0
-    def rw(reg, value=None, high=0):
-        nonlocal k
+    seq = []
+    for k, (reg, value) in enumerate(regs_reads(m)):
         if value is not None:
-            seq.append(wr(m, reg, value, high))
+            seq.append(wr(m, reg, value))
         seq.append(rd(m, reg) + ('\n    shl rdx, 32\n    or rax, rdx' if m == 'x2' and reg == ICR else ''))
-        seq.append(store(k)); k += 1
-    rw(ID); rw(VER)
-    rw(TPR, 0x5a); rw(PPR); rw(TPR, 0)
-    if m == 'x':
-        rw(LDR, 0x12345678); rw(DFR, 0x0fffffff); rw(DFR, 0xffffffff); rw(LDR, 0x01000000)
-    else:
-        rw(LDR)
-    rw(SVR, 0x13f); rw(SVR, 0x1ff)
-    rw(LVT_TIMER, 0x20045); rw(LVT_TIMER, 0x10045)
-    rw(LVT_THERMAL, 0x10233); rw(LVT_PMC, 0x10444)
-    rw(LVT_LINT0, 0x1a755); rw(LVT_LINT1, 0x10400); rw(LVT_ERROR, 0x10066)
-    if m == 'x':
-        rw(ICR2, 0x03000000)
-    rw(DCR, 0xb); rw(DCR, 0x9); rw(INIT_COUNT, 0); rw(CUR_COUNT)
-    for r in (ISR + 1, ISR + 2, TMR + 2, IRR + 2):
-        rw(r)
-    seq.append(wr(m, ESR, 0)); rw(ESR)
+        seq.append(store(k))
     return build(f'apic-regs-{m}', m, ['\n'.join(seq)], [])
 
 

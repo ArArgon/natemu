@@ -3,11 +3,12 @@
 
     tools/with-env python3 tools/run_x3.py --fexc FEXC --out DIR [--only qemu,ipi,timers,stress,cases] [--stress-iterations N]
 
-- `qemu`: programs run unchanged by pinned QEMU (system mode) and natemu at block sizes default and 1: register
-  write/read-backs (xAPIC MMIO and x2APIC), priority/TPR/EOI order with nested interrupts and self IPIs (both modes),
-  CR8 as TPR[7:4], the x2APIC fault rules, x2APIC IPIs at 2-4 CPUs (fixed physical, all-but-self, NMI, logical
-  cluster, peer to CPU 0). natemu must equal QEMU (registers, logs without their TSC field, counters) except where an
-  entry of QEMU_DEVIATIONS gives QEMU's departure from the SDM, and both are judged by the SDM model below.
+- `qemu` (the name kept from when pinned QEMU ran these programs too; natemu only now): natemu at block sizes default
+  and 1: register write/read-backs (xAPIC MMIO and x2APIC), priority/TPR/EOI order with nested interrupts and self IPIs
+  (both modes), CR8 as TPR[7:4], the x2APIC fault rules, x2APIC IPIs at 2-4 CPUs (fixed physical, all-but-self, NMI,
+  logical cluster, peer to CPU 0), each judged by the SDM model below (`model_problems`: the read-back values, the
+  delivery log, the #GP cases, the counts). (QEMU 11.1.2, once compared with natemu here, departs from the SDM on 20
+  of the x2APIC fault cases: RDMSR of write-only registers, WRMSR to read-only ones, reserved bits, TSC-deadline.)
 - `ipi`: xAPIC MMIO IPIs (Linux's path; QEMU's BSP cannot use xAPIC with peers) at 2 and 4 CPUs: physical, logical flat,
   all-including-self, NMI, lowest priority; counts exact (judged by the model).
 - `timers`: one-shot, periodic (two dividers), masked, and HLT-woken timers in both modes, judged from the TSC and the
@@ -30,23 +31,11 @@ from fractions import Fraction
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import case_results, ref, smp, answers, apic, events, run_slice1_vm as vm  # noqa: E402
+import case_results, ref, smp, apic, events, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end  # noqa: E402
 
 R = Fraction(125, 3)              # TSC ticks per crystal tick (CPUID.15H: 1 GHz / 24 MHz)
 LATE_TSC = 2_000_000              # 2 ms: the bound on a timer interrupt's lateness (doorbell + stop + HLT wake)
-
-# QEMU 11.1.2 departures from the SDM met by these programs: {program: {case: why}}; judged by the SDM instead, and
-# natemu is not compared with QEMU there.
-_RO, _WO, _RSV = 'WRMSR to a read-only x2APIC register (Table 11-6: #GP)', 'RDMSR of a write-only x2APIC register (Table 11-6: #GP)', \
-    'a reserved bit set in an x2APIC write (11.12.1.3: #GP)'
-QEMU_DEVIATIONS = {'apic-faults': {
-    1: _WO, 4: _RO, 5: _RO, 9: 'APR is not an x2APIC register (Table 11-6: #GP); QEMU reads one', 14: 'ICR high is not an x2APIC register (#GP)',
-    15: 'a nonzero write to x2APIC EOI (Table 11-6: #GP)', 16: 'a nonzero write to x2APIC ESR (Table 11-6: #GP)', 17: _RSV, 18: _RSV, 19: _RSV,
-    20: _RSV + ': TSC-deadline mode with CPUID.1:ECX.24 clear', 21: _RSV, 22: _RSV, 23: _RO, 24: _RO, 25: _RSV + ': EOI-broadcast suppression not enumerated',
-    26: _RSV + ': ICR delivery status', 27: _RSV, 35: "IA32_TSC_DEADLINE: QEMU's CPU advertises TSC-deadline, the profile does not",
-    40: 'x2APIC MSRs with the APIC disabled (11.12.5: #GP)'}}
-
 
 def run_natemu(a, prog, work, limit, timeout=300):
     text = events.description(prog, [[] for _ in range(prog['ncpu'])])
@@ -84,39 +73,42 @@ def natemu_memory(out):
     return Memory({smp.num(m['addr']): bytes.fromhex(m['data']) for m in out['cpus'][0]['memory']})
 
 
-def qemu_memory(prog, want):
-    return Memory({r['addr']: r['data'] for r in want['memory']})
-
-
-def masked_logs(prog, data_by_addr):
-    """Captured regions with each log entry's TSC field (bytes 56..63) cleared."""
-    out = {}
-    for base, data in data_by_addr.items():
-        if any(base == apic.LOG(i) for i in range(prog['ncpu'])):
-            data = bytearray(data)
-            for k in range(0, len(data), 0x40):
-                data[k + 56:k + 64] = bytes(8)
-            data = bytes(data)
-        out[base] = data
-    return out
-
-
 def logs(prog, mem):
     return [apic.log(mem.bytes(apic.LOG(i), apic.LOG_BYTES)) for i in range(prog['ncpu'])]
 
 
-# ---- the SDM model's expectations for the QEMU-compared programs -----------------------------------------------
+# ---- the SDM model's expectations for the `qemu` programs ---------------------------------------------------------
 def isr_set(*v): return sum(1 << (x - 64) for x in v)
 
 
 PRIO = [(0x71, 2, (0x71,)), (0x61, 2, (0x61,)), (0x51, 3, (0x51,)), (0x41, 4, (0x41,)), (0x42, 5, (0x42,)), (0x62, 5, (0x42, 0x62)),
         (0x52, 5, (0x42, 0x52)), (0x43, 7, (0x43,)), (0x63, 7, (0x43, 0x63))]
+REG_NAMES = {getattr(apic, k): k for k in ('ID', 'VER', 'TPR', 'PPR', 'LDR', 'DFR', 'SVR', 'ESR', 'ICR2', 'LVT_TIMER', 'LVT_THERMAL',
+                                           'LVT_PMC', 'LVT_LINT0', 'LVT_LINT1', 'LVT_ERROR', 'INIT_COUNT', 'CUR_COUNT', 'DCR')} | \
+    {getattr(apic, k) + j: f'{k}+{j}' for k in ('ISR', 'TMR', 'IRR') for j in (1, 2)}
+# apic-regs-x/x2's read-backs (SDM Vol.3 11.4-11.6, 11.12): ID 0 (CPU 0); VER 50014H (the profile's: version 14H, six LVT
+# entries); TPR as written; PPR = TPR with nothing in service (11.8.3.1); LDR bits 31:24 only (xAPIC; x2APIC: cluster 0,
+# bit 0 for ID 0, read-only); DFR bits 27:0 read 1s; SVR, the LVTs (timer mode in bits 18:17), ICR high, DCR as written;
+# initial and current count 0 (no timer started); ISR, TMR, IRR, ESR 0.
+_LVT = [0x13f, 0x1ff, 0x20045, 0x10045, 0x10233, 0x10444, 0x1a755, 0x10400, 0x10066]
+REGS_WANT = {'apic-regs-x': [0, 0x50014, 0x5a, 0x5a, 0, 0x12000000, 0x0fffffff, 0xffffffff, 0x01000000] + _LVT + [0x03000000, 0xb, 0x9, 0, 0] + [0] * 5,
+             'apic-regs-x2': [0, 0x50014, 0x5a, 0x5a, 0, 1] + _LVT + [0xb, 0x9, 0, 0] + [0] * 5}
 
 
-def model_problems(prog, mem, qemu=False):
+def apic_regs_labels(name):
+    """apic-regs-x/x2's read-backs by name, in order (`apic.regs_reads`)."""
+    return [REG_NAMES[r] + ('' if v is None else f'={v:#x}') for r, v in apic.regs_reads(name.rsplit('-', 1)[1])]
+
+
+def model_problems(prog, mem):
     name, n, out = prog['name'].split('@')[0], prog['ncpu'], []
     entries = logs(prog, mem)
-    if name.startswith('apic-prio'):
+    if name in REGS_WANT:
+        want = REGS_WANT[name]
+        got = [mem.read(apic.DATA(0) + 8 * k) for k in range(len(want))]
+        bad = [(apic_regs_labels(name)[k], hex(g), hex(w)) for k, (g, w) in enumerate(zip(got, want)) if g != w]
+        if bad: out.append(f'read-backs (register, got, model): {bad}')
+    elif name.startswith('apic-prio'):
         got = [(e[0], e[6], e[2], e[3]) for e in entries[0]]
         want = [(v, r12, v & 0xf0, isr_set(*isr)) for v, r12, isr in PRIO]
         if got != want: out.append(f'delivery (vector, marker, PPR, ISR) {[tuple(map(hex, g)) for g in got]} != model {[tuple(map(hex, w)) for w in want]}')
@@ -131,9 +123,6 @@ def model_problems(prog, mem, qemu=False):
     elif name == 'apic-faults':
         got = sorted(e[6] for e in entries[0] if e[0] == 13)
         want = [k + 1 for k, (_, gp) in enumerate(apic.FAULT_CASES) if gp]
-        if qemu:
-            known = QEMU_DEVIATIONS['apic-faults']
-            got, want = [c for c in got if c not in known], [c for c in want if c not in known]
         if got != want:
             out.append(f'#GP at cases {sorted(set(got) ^ set(want))} differ from the SDM model ({[apic.FAULT_CASES[c - 1][0].split()[-1] for c in sorted(set(got) ^ set(want))]})')
     elif name.startswith('apic-ipi'):
@@ -144,85 +133,17 @@ def model_problems(prog, mem, qemu=False):
     return out
 
 
-def qemu_projection(prog, gprs, regions, bases):
-    """What compare_qemu compares (tools/reference/answers.py): each CPU's GPRs; QEMU's captured regions `bases` (logs
-    with their TSC fields cleared; with peers not the logs) as natemu's `regions` or QEMU's hold them."""
-    data = masked_logs(prog, regions)
-    keep = [b for b in bases if not (prog['ncpu'] > 1 and any(b == apic.LOG(i) for i in range(prog['ncpu'])))]
-    return {'gpr': gprs, 'regions': [[b, data[b].hex() if data.get(b) is not None else None] for b in keep]}
-
-
-def compare_qemu(prog, out, want):
-    """natemu vs QEMU: GPRs and flags, and every captured region (logs without TSC). A comparison point of
-    tools/reference/answers.py (NATEMU_ANSWERS seed/locked)."""
-    def project_want(w):
-        n = len(w['cpus'])          # (natemu's are cut to these, as the zip does)
-        bases = [r['addr'] for r in w['memory']]
-        return qemu_projection(prog, [list(c['gpr']) for c in w['cpus'][:n]], qemu_memory(prog, w).regions, bases), {'ncpu': n, 'bases': bases}
-    def project_got(aux):
-        return qemu_projection(prog, [[smp.num(v) for v in c['gpr']] for c in out['cpus'][:aux['ncpu']]], natemu_memory(out).regions, aux['bases'])
-    return answers.compared(want, 'compare_qemu', project_want, project_got, lambda: _compare_qemu(prog, out, want))
-
-
-def _compare_qemu(prog, out, want):
-    diffs = []
-    for i, (c, w) in enumerate(zip(out['cpus'], want['cpus'])):
-        for k, (x, y) in enumerate(zip([smp.num(v) for v in c['gpr']], w['gpr'])):
-            if x != y: diffs.append(f'cpu{i} {smp.REGS[k]} {x:#x} != QEMU {y:#x}')
-    nat = masked_logs(prog, natemu_memory(out).regions)
-    qem = masked_logs(prog, qemu_memory(prog, want).regions)
-    for base, data in qem.items():
-        # With peers, where an IPI lands in a spinning receiver depends on timing: the counts are compared, not the logs.
-        if prog['ncpu'] > 1 and any(base == apic.LOG(i) for i in range(prog['ncpu'])):
-            continue
-        mine = nat.get(base)
-        if mine != data:
-            if any(base == apic.LOG(i) for i in range(prog['ncpu'])):
-                a, b = apic.log(mine or b''), apic.log(data)
-                k = next((j for j in range(max(len(a), len(b))) if a[j:j + 1] != b[j:j + 1]), None)
-                diffs.append(f'log {base:#x} entry {k}: natemu {[hex(x) for x in a[k]] if k is not None and k < len(a) else None} QEMU {[hex(x) for x in b[k]] if k is not None and k < len(b) else None}')
-            else:
-                j = next(j for j in range(len(data)) if mine is None or mine[j] != data[j])
-                diffs.append(f'region {base:#x} +{j:#x}: natemu {mine[j:j + 8].hex() if mine else None} QEMU {data[j:j + 8].hex()}')
-    return diffs
-
-
-def compare_fault_cases(prog, out, want):
-    """apic-faults: natemu vs QEMU on every case outside QEMU_DEVIATIONS: #GP or not, and the faulting RIP."""
-    known = QEMU_DEVIATIONS[prog['name'].split('@')[0]]
-    gp = lambda mem: {e[6]: e[1] for e in logs(prog, mem)[0] if e[0] == 13 and e[6] not in known}
-    agreeing = len(apic.FAULT_CASES) - len(known)
-    def live():
-        mine, theirs = gp(natemu_memory(out)), gp(qemu_memory(prog, want))
-        return [] if mine == theirs else [f'#GP (case: RIP) on the {agreeing} agreeing cases: natemu {mine} != QEMU {theirs}']
-    pairs = lambda mem: sorted(gp(mem).items())
-    return answers.compared(want, 'fault_cases', lambda w: (pairs(qemu_memory(prog, w)), {}), lambda aux: pairs(natemu_memory(out)), live)
-
-
 def cmd_qemu(a, report):
-    stub = smp.build_stub(a.out / 'qemu-build')
     failures = []
     programs = [apic.regs_program('x'), apic.regs_program('x2'), apic.prio_program('x'), apic.prio_program('x2'), apic.cr8_program(),
                 apic.faults_program()] + [apic.ipi_program(n) for n in (2, 3, 4)]
     for prog, _ in programs:
         label = prog['name']
-        rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=120)
-        want = smp.parse_dump(prog, dump) if rc == 1 else None
         entry = {'name': label, 'runs': []}
-        if want is None:
-            failures.append(f'{label}: QEMU run failed ({rc} {err})')
-        else:
-            q = answers.derive(want, 'model_problems', lambda w: model_problems(prog, qemu_memory(prog, w), qemu=True))
-            entry['qemu_vs_model'] = q
-            failures += [f'{label}: QEMU vs model: {d}' for d in q]
         for limit in (None, 1):
             out, problems = run_natemu(a, prog, a.out / 'work' / f"{label}-{limit or 'd'}", limit)
             if out is not None:
                 problems += model_problems(prog, natemu_memory(out))
-                if want is not None and label.split('@')[0] not in QEMU_DEVIATIONS:
-                    problems += compare_qemu(prog, out, want)
-                elif want is not None:
-                    problems += compare_fault_cases(prog, out, want)
             entry['runs'].append({'max_block': limit, 'problems': problems})
             failures += [f'{label} (max-block {limit}): {p}' for p in problems]
         print(f"{label}: {'FAIL' if any(r['problems'] for r in entry['runs']) else 'ok'}", *[p for r in entry['runs'] for p in r['problems']][:6], sep='\n  ', flush=True)
@@ -575,7 +496,7 @@ def main():
         if mode in a.only:
             report[mode] = []
             failures += fn(a, report[mode])
-    (a.out / 'x3.json').write_text(json.dumps({'report': report, 'failures': failures, 'qemu_deviations': QEMU_DEVIATIONS}, indent=1, default=str) + '\n')
+    (a.out / 'x3.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
     case_results.write(a.out, [c for m, v in report.items() if m != 'cost' for c in case_results.program_cases(m, v)], failures)
     for f in failures: print('FAIL', f)
     print({k: f'{sum(1 for r in v if not (r.get("problems") or any(x["problems"] for x in r.get("runs", []))))}/{len(v)} ok' for k, v in report.items()})
