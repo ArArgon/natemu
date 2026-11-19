@@ -8,6 +8,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 
 from raw_root import RAW_ROOT, STATE_ROOT
 
@@ -17,6 +18,33 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 STARTUP_TOPICS = ('cpu', 'fp', 'acceleration', 'meltdown', 'code cache')
 STARTUP_LINE = re.compile(r'^natemu: (?:%s): ' % '|'.join(STARTUP_TOPICS))
 VM_LOCK = STATE_ROOT / '.vm.lock'   # default --lock: one VM-running agent at a time (flock on this file)
+
+
+_clone_warned = False
+
+
+def clone(src, dest):
+    """Copy a file or folder as an APFS clone (clonefile(2), through `cp -c`): blocks are shared until a side writes, so a
+    per-run copy of a kernel, disk image or rootfs tree costs no space and no time. Symlinks stay symlinks. Where the volume
+    cannot clone it copies and says so once. `dest` must not exist. Same behaviour as testkit.cache.clone (the runners do not
+    import testkit)."""
+    global _clone_warned
+    src, dest = pathlib.Path(src), pathlib.Path(dest)
+    is_dir = src.is_dir() and not src.is_symlink()
+    try:
+        subprocess.run(['cp', '-cR' if is_dir else '-cP', str(src), str(dest)], check=True, capture_output=True)
+        if not is_dir and not dest.is_symlink(): dest.chmod(dest.stat().st_mode | 0o200)
+        return
+    except (subprocess.CalledProcessError, OSError):
+        if dest.is_symlink() or dest.is_file(): dest.unlink()
+        elif dest.is_dir(): shutil.rmtree(dest, ignore_errors=True)
+    if not _clone_warned:
+        _clone_warned = True
+        print(f'io_common: copied {src.name} (this volume cannot clone files; copies use space)', file=sys.stderr)
+    if is_dir: shutil.copytree(src, dest, symlinks=True)
+    else:
+        shutil.copy2(src, dest, follow_symlinks=False)
+        if not dest.is_symlink(): dest.chmod(dest.stat().st_mode | 0o200)
 
 
 def digest(path):

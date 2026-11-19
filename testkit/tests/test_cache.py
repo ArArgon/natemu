@@ -1,6 +1,8 @@
 import multiprocessing as mp
 import os
 import signal
+import subprocess
+import sys
 import time
 
 import pytest
@@ -104,3 +106,46 @@ def test_peek_raises_instead_of_building():
     e = cache.get_or_build('x', 'p1', lambda d: (d / 'f').write_text('built'))
     with cache.peek():
         assert cache.get_or_build('x', 'p1', lambda d: None) == e
+
+
+def _is_apfs(path) -> bool:
+    df = subprocess.run(['df', '-P', str(path)], capture_output=True, text=True).stdout.strip().splitlines()
+    if len(df) < 2: return False
+    mount = df[-1].split(None, 5)[-1]
+    out = subprocess.run(['diskutil', 'info', '-plist', mount], capture_output=True, text=True)
+    return 'apfs' in out.stdout.lower()
+
+
+def test_clone_shares_blocks_on_apfs(tmp_path):
+    if not _is_apfs(tmp_path): pytest.skip('not an APFS volume')
+    src = tmp_path / 'big'
+    src.write_bytes(os.urandom(1 << 20) * 64)
+    os.sync()
+    before = os.statvfs(tmp_path).f_bavail * os.statvfs(tmp_path).f_frsize
+    cache.clone(src, tmp_path / 'copy')
+    os.sync()
+    after = os.statvfs(tmp_path).f_bavail * os.statvfs(tmp_path).f_frsize
+    assert (tmp_path / 'copy').read_bytes() == src.read_bytes()
+    assert before - after < (1 << 20)
+
+
+def test_clone_falls_back_to_copy(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cache, '_clone_warned', False)
+    def fail(cmd, *a, **k): raise subprocess.CalledProcessError(1, cmd)
+    monkeypatch.setattr(cache.subprocess, 'run', fail)
+    src = tmp_path / 'f'; src.write_bytes(b'abc' * 1000)
+    cache.clone(src, tmp_path / 'g')
+    assert (tmp_path / 'g').read_bytes() == src.read_bytes()
+    d = tmp_path / 'd'; (d / 'sub').mkdir(parents=True); (d / 'sub/x').write_text('x'); os.symlink('sub/x', d / 'link')
+    cache.clone(d, tmp_path / 'e')
+    assert os.readlink(tmp_path / 'e/link') == 'sub/x'
+    assert capsys.readouterr().err.count('copied') == 1      # said once per process
+
+
+def test_clone_folder_keeps_symlinks(tmp_path):
+    d = tmp_path / 'd'; (d / 'sub').mkdir(parents=True); (d / 'sub/x').write_text('x')
+    os.symlink('sub/x', d / 'link'); os.symlink('/nonexistent', d / 'dangling')
+    cache.clone(d, tmp_path / 'e')
+    assert os.path.islink(tmp_path / 'e/link') and os.readlink(tmp_path / 'e/link') == 'sub/x'
+    assert os.path.islink(tmp_path / 'e/dangling')
+    assert (tmp_path / 'e/sub/x').read_text() == 'x'

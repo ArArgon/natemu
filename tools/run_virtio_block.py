@@ -25,7 +25,7 @@ import tarfile
 import time
 
 from run_virtio_rng import KVER, KERNEL_SHA, ROOT, stop_group
-from io_common import PCI_PROBE, digest, patch, pci_errors, pci_self_test, write_json
+from io_common import clone, PCI_PROBE, digest, patch, pci_errors, pci_self_test, write_json
 
 KERNEL_DEB_SHA = '7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e99'
 DISK_BYTES = 512 << 20
@@ -240,7 +240,7 @@ def checked(command, log, env=None):
 def install_busybox(root, binary):
     for name in ('bin', 'sbin', 'dev', 'proc', 'sys', 'tmp'):
         (root / name).mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(binary, root / 'bin/busybox')
+    clone(binary, root / 'bin/busybox')
     (root / 'bin/busybox').chmod(0o755)
     for name in APPLETS: (root / 'bin' / name).symlink_to('busybox')
 
@@ -253,7 +253,7 @@ def prepare(args):
         assert digest(args.rng_inputs / name) == rng['outputs'][name], name
     assert digest(args.kernel_deb) == KERNEL_DEB_SHA, 'kernel package pin mismatch'
     assert digest(args.rng_inputs / 'linux') == KERNEL_SHA
-    shutil.copyfile(args.rng_inputs / 'linux', args.out / 'linux')
+    clone(args.rng_inputs / 'linux', args.out / 'linux')
     root, boot = args.out / 'rootfs', args.out / 'bootstrap'
     for tree in (root, boot): install_busybox(tree, args.rng_inputs / 'rootfs/bin/busybox')
     (boot / 'newroot').mkdir()

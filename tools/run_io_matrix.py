@@ -34,7 +34,7 @@ import time
 
 import run_fio_admission as admission
 import run_fio_baselines as baselines
-from io_common import PCI_PROBE, IMAGE_FORMATS, check_image_format, overlay_create, overlay_set, patch, pci_errors, pci_self_test, qcow2_input, qcow2_problems, raw_of
+from io_common import clone, PCI_PROBE, IMAGE_FORMATS, check_image_format, overlay_create, overlay_set, patch, pci_errors, pci_self_test, qcow2_input, qcow2_problems, raw_of
 
 block = admission.block
 digest, write_json, checked = admission.digest, admission.write_json, admission.checked
@@ -207,7 +207,7 @@ def prepare(args):
     pin, verified = admission.verify_inputs(args)
     args.out.mkdir(parents=True, exist_ok=False)
     root = args.out / 'rootfs'
-    shutil.copytree(args.block_inputs / 'rootfs', root, symlinks=True)
+    clone(args.block_inputs / 'rootfs', root)
     shutil.copytree(args.fio_prep / 'rootfs', root, symlinks=True, dirs_exist_ok=True)
     if digest(root / 'bin/busybox') != pin['rootfs']['bin/busybox']['sha256']: raise ValueError('BusyBox overwritten')
     (root / 'sbin/init').write_text(INIT_PCI if args.transport == 'pci' else INIT); (root / 'sbin/init').chmod(0o755)
@@ -218,7 +218,7 @@ def prepare(args):
     hashes.update({'/fio/profiles/' + p.name: digest(p) for p in (root / 'fio/profiles').glob('*.fio')})
     hashes['/sbin/init'] = digest(root / 'sbin/init')
     (root / 'fio/inputs.sha256').write_text(''.join(f'{h}  {n}\n' for n, h in sorted(hashes.items())))
-    for name in ('linux', 'bootstrap.cpio', 'mke2fs.conf'): shutil.copyfile(args.block_inputs / name, args.out / name)
+    for name in ('linux', 'bootstrap.cpio', 'mke2fs.conf'): clone(args.block_inputs / name, args.out / name)
     tools = pin['tools']
     for info in tools.values():
         if digest(info['path']) != info['sha256']: raise ValueError('native tool changed')

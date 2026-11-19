@@ -21,6 +21,7 @@ import subprocess
 import zlib
 
 import run_io_matrix as matrix
+from io_common import clone
 admission, block = matrix.admission, matrix.block
 digest, checked, write_json = matrix.digest, matrix.checked, matrix.write_json
 DISK_BYTES, FILE_BYTES = 512 << 20, 64 << 20
@@ -202,9 +203,9 @@ def prepare(args):
     ph, size, count = struct.unpack_from('<Q', b, 32)[0], *struct.unpack_from('<HH', b, 54)
     if any(struct.unpack_from('<I', b, ph + i * size)[0] in (2, 3) for i in range(count)): raise ValueError('not fully static stress binary')
     args.out.mkdir(parents=True, exist_ok=False); root = args.out / 'rootfs'
-    shutil.copytree(args.matrix_inputs / 'rootfs', root, symlinks=True)
+    clone(args.matrix_inputs / 'rootfs', root)
     shutil.rmtree(root / 'fio/profiles'); (root / 'fio/profiles').mkdir()
-    shutil.copyfile(args.stress, root / 'usr/bin/stress-ng'); (root / 'usr/bin/stress-ng').chmod(0o755)
+    clone(args.stress, root / 'usr/bin/stress-ng'); (root / 'usr/bin/stress-ng').chmod(0o755)
     (root / 'sbin/init').write_text(INIT)
     for name in PROFILES:
         (root / 'fio/profiles' / (name + '.fio')).write_text('\n'.join('[' + n + ']\n' + ''.join(f'{k}={v}\n' for k, v in o.items()) for n, o in jobs(name)))
@@ -212,7 +213,7 @@ def prepare(args):
     hashes = [line for line in old_hashes if '/fio/profiles/' not in line and '/sbin/init' not in line]
     hashes += [digest(p) + '  /' + str(p.relative_to(root)) for p in [root / 'sbin/init', root / 'usr/bin/stress-ng', *sorted((root / 'fio/profiles').glob('*'))]]
     (root / 'fio/inputs.sha256').write_text('\n'.join(hashes) + '\n')
-    for name in ('linux', 'bootstrap.cpio', 'mke2fs.conf'): shutil.copyfile(args.matrix_inputs / name, args.out / name)
+    for name in ('linux', 'bootstrap.cpio', 'mke2fs.conf'): clone(args.matrix_inputs / name, args.out / name)
     tools = pin['tools']
     for info in tools.values():
         if digest(info['path']) != info['sha256']: raise ValueError('native tool changed')

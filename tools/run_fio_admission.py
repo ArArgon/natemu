@@ -22,6 +22,7 @@ import time
 import fcntl
 
 import run_virtio_block as block
+from io_common import clone
 
 ROOT = block.ROOT
 DISK_BYTES = 512 << 20
@@ -197,7 +198,7 @@ def prepare(args):
     pin, verified = verify_inputs(args)
     args.out.mkdir(parents=True, exist_ok=False)
     root = args.out / 'rootfs'
-    shutil.copytree(args.block_inputs / 'rootfs', root, symlinks=True)
+    clone(args.block_inputs / 'rootfs', root)
     shutil.copytree(args.fio_prep / 'rootfs', root, symlinks=True, dirs_exist_ok=True)
     if digest(root / 'bin/busybox') != pin['rootfs']['bin/busybox']['sha256']: raise ValueError('BusyBox overwritten')
     (root / 'sbin/init').write_text(INIT); (root / 'sbin/init').chmod(0o755)
@@ -207,7 +208,7 @@ def prepare(args):
     hashes = {name: obj['sha256'] for name, obj in elf['objects'].items()}
     hashes.update({'/fio/profiles/' + p.name: digest(p) for p in (root / 'fio/profiles').glob('*.fio')})
     (root / 'fio/inputs.sha256').write_text(''.join(f'{sha}  {name}\n' for name, sha in sorted(hashes.items())))
-    for name in ('linux', 'bootstrap.cpio', 'mke2fs.conf'): shutil.copyfile(args.block_inputs / name, args.out / name)
+    for name in ('linux', 'bootstrap.cpio', 'mke2fs.conf'): clone(args.block_inputs / name, args.out / name)
     tools = pin['tools']
     for info in tools.values():
         if digest(info['path']) != info['sha256']: raise ValueError('native tool changed')

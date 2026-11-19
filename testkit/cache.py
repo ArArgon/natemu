@@ -7,6 +7,8 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
+import sys
 from typing import Callable, Iterable
 
 from testkit import paths
@@ -32,6 +34,32 @@ def key(*parts) -> str:
         else:
             feed(p if isinstance(p, bytes) else str(p).encode())
     return h.hexdigest()
+
+
+_clone_warned = False
+
+
+def clone(src: pathlib.Path, dest: pathlib.Path) -> None:
+    """Copy `src` (a file or a folder) to `dest` as an APFS clone (`clonefile(2)`): the blocks are shared until one side
+    writes, so a per-run image costs no space and no time. Symlinks stay symlinks. Where the volume cannot clone (not APFS,
+    or `dest` on another volume) it copies, and says so once per process. `dest` must not exist."""
+    global _clone_warned
+    src, dest = pathlib.Path(src), pathlib.Path(dest)
+    is_dir = src.is_dir() and not src.is_symlink()
+    try:
+        subprocess.run(['cp', '-cR' if is_dir else '-cP', str(src), str(dest)], check=True, capture_output=True)
+        if not is_dir and not dest.is_symlink(): dest.chmod(dest.stat().st_mode | 0o200)
+        return
+    except (subprocess.CalledProcessError, OSError):
+        if dest.is_symlink() or dest.is_file(): dest.unlink()
+        elif dest.is_dir(): shutil.rmtree(dest, ignore_errors=True)
+    if not _clone_warned:
+        _clone_warned = True
+        print(f'testkit: copied {src.name} (this volume cannot clone files; copies use space)', file=sys.stderr)
+    if is_dir: shutil.copytree(src, dest, symlinks=True)
+    else:
+        shutil.copy2(src, dest, follow_symlinks=False)
+        if not dest.is_symlink(): dest.chmod(dest.stat().st_mode | 0o200)
 
 
 def entry_path(kind: str, k: str) -> pathlib.Path:

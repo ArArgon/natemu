@@ -51,7 +51,7 @@ import time
 import tempfile
 
 from io_common import PCI_PROBE, ROOT, VM_LOCK, digest, patch, pci_errors, pci_self_test, stop_group, write_json
-from io_common import STARTUP_LINE
+from io_common import STARTUP_LINE, clone
 from raw_root import RAW_ROOT, STATE_ROOT
 from run_virtio_rng import KVER
 
@@ -192,9 +192,9 @@ def prepare(out, transport='mmio'):
     pci = transport == 'pci'
     out.mkdir(parents=True)
     tree = out / 'initramfs'
-    shutil.copytree(TOOLS_ROOTFS, tree, symlinks=True)     # Debian layout: lib -> usr/lib
+    clone(TOOLS_ROOTFS, tree)     # Debian layout: lib -> usr/lib
     (tree / 'bin').mkdir()
-    shutil.copy2(BLOCK_INPUTS / 'bootstrap/bin/busybox', tree / 'bin/busybox')
+    clone(BLOCK_INPUTS / 'bootstrap/bin/busybox', tree / 'bin/busybox')
     for name in APPLETS_PCI if pci else APPLETS: (tree / 'bin' / name).symlink_to('busybox')
     for d in ('proc', 'sys', 'dev', 'tmp'): (tree / d).mkdir(exist_ok=True)
     modules, archive = {}, subprocess.check_output(['ar', 'p', str(KERNEL_DEB), 'data.tar.xz'], timeout=60)
@@ -217,7 +217,7 @@ def prepare(out, transport='mmio'):
     spec = importlib.util.spec_from_file_location('mkcpio', ROOT / 'tools/play/mkcpio.py')
     mkcpio = importlib.util.module_from_spec(spec); spec.loader.exec_module(mkcpio)
     mkcpio.main(str(tree), str(out / 'initramfs.cpio'))
-    shutil.copyfile(BLOCK_INPUTS / 'linux', out / 'linux')
+    clone(BLOCK_INPUTS / 'linux', out / 'linux')
     (out / 'serve').mkdir(); (out / 'serve/blob').write_bytes(os.urandom(BLOB))   # its sha256 is the check
     (out / 'serve/small').write_bytes(os.urandom(4096))
     manifest = {'purpose': 'stock Linux networking check (user-mode NAT); not a performance claim', 'kernel_version': KVER,

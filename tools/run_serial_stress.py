@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import time
 import run_virtio_rng as rng
-from io_common import digest, write_json, ROOT, VM_LOCK
+from io_common import clone, digest, write_json, ROOT, VM_LOCK
 
 BUSYBOX_SHA='7ae95c260622412ceba6eb9f45d68f616cdc091a1d71d6c0a08b5875bb2c31dd'
 PAYLOAD_BYTES=4_656_640
@@ -193,13 +193,13 @@ def prepare(a):
         if digest(a.stress)!=STRESS_SHA or digest(a.stress_source)!=STRESS_SOURCE_SHA:raise ValueError('pinned stress binary/source mismatch')
     a.out=a.out.resolve();a.out.mkdir(parents=True,exist_ok=False);root=a.out/'rootfs'
     for name in ('bin','dev','proc','sys','tmp'):(root/name).mkdir(parents=True)
-    shutil.copyfile(kernel,a.out/'linux');shutil.copyfile(busybox,root/'bin/busybox');(root/'bin/busybox').chmod(0o755)
+    clone(kernel,a.out/'linux');clone(busybox,root/'bin/busybox');(root/'bin/busybox').chmod(0o755)
     for name in ('sh','mount','cat','nproc','uname','sha256sum','sleep','dd','stty','taskset','dmesg','poweroff'):(root/'bin'/name).symlink_to('busybox')
     data=payload(a.factor);(root/'payload').write_bytes(data);(root/'heartbeat').write_text(HEARTBEAT);(root/'init').write_text(init(data,a.cpu_load))
     for name in ('heartbeat','init'):(root/name).chmod(0o755)
     names=['payload','heartbeat','init','bin/busybox']
     if a.cpu_load:
-        shutil.copyfile(a.stress,root/'bin/stress-ng');(root/'bin/stress-ng').chmod(0o755)
+        clone(a.stress,root/'bin/stress-ng');(root/'bin/stress-ng').chmod(0o755)
         (root/'load-worker').write_text(LOAD_WORKER);(root/'load-observer').write_text(LOAD_OBSERVER)
         names+=['bin/stress-ng','load-worker','load-observer']
     (root/'inputs.sha256').write_text(''.join(digest(root/name)+'  /'+name+'\n' for name in names))

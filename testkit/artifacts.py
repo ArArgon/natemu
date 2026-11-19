@@ -88,7 +88,7 @@ def natemu() -> Natemu:
             raise BuildFailure('natemu', 'the sources changed while building; run again')
         for rel in ('release/natemu-host', 'release/natemu', 'aarch64-unknown-none/release/natemu-runtime'):
             (out / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target / rel, out / rel)
+            cache.clone(target / rel, out / rel)
         for rel in ('release/natemu-host', 'release/natemu'):
             _run(['codesign', '--force', '--sign', '-', '--entitlements', root / 'crates/host/entitlements.plist', out / rel])
 
@@ -110,7 +110,7 @@ def fexc() -> pathlib.Path:
         shutil.rmtree(scratch, ignore_errors=True); scratch.parent.mkdir(parents=True, exist_ok=True)
         try:
             _run(['sh', root / 'tools/fexc/build.sh', scratch], cwd=root)
-            shutil.copy2(scratch / 'obj/fexc', out / 'fexc')
+            cache.clone(scratch / 'obj/fexc', out / 'fexc')
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
             subprocess.run(['git', '-C', str(root / 'third_party/FEX'), 'worktree', 'prune'], capture_output=True)

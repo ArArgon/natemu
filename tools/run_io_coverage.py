@@ -109,7 +109,7 @@ import zlib
 
 from io_common import STARTUP_LINE, ROOT, VM_LOCK, digest, stop_group, write_json
 from raw_root import RAW_ROOT
-from io_common import PCI_PROBE, patch, pci_errors, pci_self_test, qcow2_convert, qcow2_problems, raw_of, need_qemu_img
+from io_common import clone, PCI_PROBE, patch, pci_errors, pci_self_test, qcow2_convert, qcow2_problems, raw_of, need_qemu_img
 from run_virtio_block import checked, KERNEL_DEB_SHA
 from run_virtio_rng import KVER
 
@@ -502,9 +502,9 @@ def prepare(out, inputs, transport='mmio', kernel_deb=None):
     out.mkdir(parents=True)
     manifest = json.loads((inputs / 'inputs.json').read_text())
     for name in ('linux', 'bootstrap/init', 'mke2fs.conf'): assert digest(inputs / name) == manifest['outputs'][name], name
-    shutil.copyfile(inputs / 'linux', out / 'linux')
+    clone(inputs / 'linux', out / 'linux')
     tree = out / 'initramfs'
-    shutil.copytree(inputs / 'bootstrap', tree, symlinks=True)
+    clone(inputs / 'bootstrap', tree)
     shutil.rmtree(tree / 'newroot'); (tree / 'init').unlink()
     for name in APPLETS:
         if not (tree / 'bin' / name).is_symlink(): (tree / 'bin' / name).symlink_to('busybox')

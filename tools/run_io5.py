@@ -51,7 +51,7 @@ import subprocess
 import sys
 import time
 
-from io_common import IMAGE_FORMATS, ROOT, VM_LOCK, check_image_format, overlay_create, overlay_set, digest, qcow2_input, qcow2_problems, raw_of, raw_shortfall, stop_group, write_json
+from io_common import clone, IMAGE_FORMATS, ROOT, VM_LOCK, check_image_format, overlay_create, overlay_set, digest, qcow2_input, qcow2_problems, raw_of, raw_shortfall, stop_group, write_json
 from raw_root import RAW_ROOT
 from run_net_linux import lan_address
 
@@ -328,7 +328,7 @@ def run(args):
     (serve / 'io5.sh').write_text(GUEST.replace('@PYSHA@', PYTHON_SHA).replace('@KSHA@', LINUX_SHA)
                                   .replace('@PYTESTS@', PYTESTS).replace('@SNAP@', SNAPSHOT)
                                   .replace('@SOLO@', '1' if args.solo_build else '0'))
-    shutil.copy(args.inputs / PYTHON, serve / 'py.tar.xz')
+    clone(args.inputs / PYTHON, serve / 'py.tar.xz')
     server, host = serve_files(serve)
     result = {'image_format': args.image_format, 'qcow2_prep_seconds': prep if qcow and not overlay else None, 'backend': args.backend, 'vcpus': args.vcpus, 'ram_gib': args.ram, 'host': host, 'inputs': recorded,
               'speculation_barriers': args.speculation_barriers, 'mitigations_off': args.mitigations_off, 'solo_build': args.solo_build, 'perf_log': args.perf_log, 'command': [str(c) for c in command(args, disk, 'CACHE')],
