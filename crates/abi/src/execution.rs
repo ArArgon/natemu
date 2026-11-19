@@ -2220,11 +2220,13 @@ pub struct Cpu {
     /// the guest's stack pointer misaligned: each costs a host-sized round trip (the instruction runs alone in a step block).
     /// From [`STACK_TRAP_LIMIT`] on the vCPU's code is requested without the check (every store checked on its own, which
     /// takes a misaligned stack in line): [`Cpu::code_context`] bit 33 and the host's `--push-run`. Written only by the
-    /// resident; 0 for every `Cpu` built by the host.
+    /// resident (cleared by a guest CR3 load); 0 for every `Cpu` built by the host.
     pub stack_traps: u64,
 }
-/// Stack alignment check firings after which a vCPU's code is translated without the run check (sticky: a guest that keeps a
-/// misaligned stack pointer pays about 12 us a push per run, forever, otherwise; ponytail: per vCPU, not per block).
+/// Stack alignment check firings after which a vCPU's code is translated without the run check (a guest that keeps a
+/// misaligned stack pointer pays about 12 us a push per run otherwise; ponytail: per vCPU and address space, not per block:
+/// the count clears at every guest CR3 load, so the next space starts with the shared check; a guest that reloads CR3 at
+/// every syscall, as with page-table isolation, trips it again after each).
 pub const STACK_TRAP_LIMIT: u64 = 16;
 /// The first native vector register of XMM0 (FEX's x64 `SRAFPR`: XMM0..XMM15 in v16..v31).
 pub const XMM_VREG: usize = 16;
@@ -4502,6 +4504,24 @@ mod tests {
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15 | 1 << 6, true, 0), X87_FPCR_EXPLICIT); // both: FZ = 1 (hardware flush)
         assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 13, true, 0), X87_FPCR_EXPLICIT);
         assert_eq!(x87_fpcr(FCW_INIT | 3 << 10, MXCSR_RESET, true, 0), X87_FPCR_EXPLICIT | 3 << 22);
+    }
+
+    /// `code_context` bit 33 is the stack check's state alone: set from [`STACK_TRAP_LIMIT`] firings, and clearing the count (what a
+    /// guest CR3 load does) gives back exactly the word the vCPU had before, so the shared-check code and its table are found again.
+    #[test]
+    fn clearing_the_stack_trap_count_restores_the_context() {
+        let mut c = Cpu {
+            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 0, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
+            dr: DR_RESET, seg: flat_segments(0), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
+            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1, accurate_fp: 0, stack_traps: 0,
+        };
+        let shared = c.code_context();
+        c.stack_traps = STACK_TRAP_LIMIT - 1;
+        assert_eq!(c.code_context(), shared);
+        c.stack_traps = STACK_TRAP_LIMIT;
+        assert_eq!(c.code_context(), shared | 1 << 33);
+        c.stack_traps = 0;
+        assert_eq!(c.code_context(), shared);
     }
 
     /// AFP accurate plan chunk 1: `code_context` bit 32 is accurate mode AND no AFP, and nothing else moves: accurate mode on an AFP

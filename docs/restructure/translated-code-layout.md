@@ -81,8 +81,9 @@ paths into an IR block (nothing at an entry or at a backward target). Anything t
 The check tests 8-byte alignment of the stack pointer. When it fires, the instruction runs alone in a step block (about 12 us
 with the host round trip). After 16 firings on a vCPU (`STACK_TRAP_LIMIT`, `Cpu::stack_traps`) the vCPU's code context
 (bit 33) changes and the host asks fexc without `--push-run` (a gating argument, so answers do not alias): every store keeps
-its own check, which takes a misaligned stack in line. The change is per vCPU and permanent; code translated before it stays
-in the cache under the old context.
+its own check, which takes a misaligned stack in line. The count clears at every guest CR3 load, so the next address space starts with the shared check again (both variants stay
+in the cache and the pool, so switching recompiles nothing); a guest that reloads CR3 at every syscall (page-table isolation)
+trips it again after each. Code translated before the change stays in the cache under the old context.
 
 ## 6. Narrow compares, and the admission rules added
 

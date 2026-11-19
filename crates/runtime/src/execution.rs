@@ -2769,6 +2769,10 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                         })
                     });
                     s.cpu.cr3 = v;
+                    // A new address space starts with the shared stack check again: the count and so code context bit 33 clear (the
+                    // next dispatch recomputes the context and selects its table; both variants stay in the pool). A process that
+                    // trips the check `STACK_TRAP_LIMIT` times costs only its own space, not the vCPU's later code, kernel included.
+                    s.cpu.stack_traps = 0;
                     tlb(s, false); // a load of the same value too
                     return Ok(commit(s, i, false));
                 }
