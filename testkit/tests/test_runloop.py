@@ -80,3 +80,26 @@ def test_prepare_only_runs_nothing(pytester, env):
     r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-prepare-only', '-k', 'needsbad', 'tests')
     out = r.stdout.str()
     assert r.ret == 1 and '1 unpreparable' in out and 'connection refused' in out, out
+
+
+def test_a_unit_with_unrecorded_items_is_estimated_from_its_suite(monkeypatch, tmp_path):
+    """Units must have an expected length to backfill a draining machine: an item with no recorded duration takes the
+    mean of its suite's recorded items (9 of 12 cores sat idle while a window drained, every gate unit unknown)."""
+    from types import SimpleNamespace as NS
+    from testkit import runloop
+    from testkit.sched.policy import Config
+    suite = NS(name='s', batch=2, kind='runner', params={})
+    fam, var = NS(name='f'), NS(id='', params={})
+    items = [NS(nodeid=f'n{i}', unit_key=('f', 's', ''), suite=suite, fam=fam, variant=var, case=f'c{i}',
+                harness=object(), place=NS(env={})) for i in range(4)]
+    other = NS(nodeid='m0', unit_key=('f', 't', ''), suite=NS(name='t', batch=1, kind='runner', params={}), fam=fam,
+               variant=var, case='m0', harness=object(), place=NS(env={}))
+    monkeypatch.setattr(runloop.durations, 'load', lambda: {'n0': 10.0, 'n1': 20.0})
+    monkeypatch.setattr(runloop, 'run_dir', lambda c: tmp_path)
+    monkeypatch.setattr(runloop, 'it_needs', lambda it: NS(cores=1, exclusive=False, perf=False, dedicated=False))
+    pool = NS(cfg=Config(p_cores=8, e_cores=4), unsatisfiable=lambda r: False)
+    config = NS(getoption=lambda k: None)
+    units, _ = runloop.build_units(items + [other], config, pool)
+    got = sorted(u.req.expected for u in units if u.req.expected is not None)
+    assert got == [30.0, 30.0]                          # (10 + 20) and (15 + 15): the unrecorded items take the mean
+    assert [u.req.expected for u in units if u.items[0].suite.name == "t"] == [None]   # nothing recorded: still unknown

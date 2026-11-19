@@ -68,12 +68,22 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
     prio = GATE if (config.getoption('priority') == 'gate' or (config.getoption('gate') and not config.getoption('priority'))) \
         else INTERACTIVE
     units, refused = [], []
+    # An item with no recorded duration is estimated from its suite's recorded items (their mean), so one new case does
+    # not make its whole unit unknown, which keeps it out of every drain backfill (rule 3; seen: 9 of 12 cores idle while
+    # a window drained, the gate's 220 units all unknown because 45 of its thousands of fault cases had a duration).
+    known = {}
+    for it in items:
+        t = table.get(it.nodeid)
+        if t is not None: known.setdefault(it.unit_key, []).append(t)
     for k in order:
         g = groups[k]
         s = g[0].suite
         for i in range(0, len(g), max(1, s.batch)):
             chunk = g[i:i + s.batch]
             exp = [table.get(it.nodeid, it.harness.expected(it.case) if hasattr(it.harness, 'expected') else None) for it in chunk]
+            if None in exp and known.get(k):
+                mean = sum(known[k]) / len(known[k])
+                exp = [mean if e is None else e for e in exp]
             nd = it_needs(chunk[0])
             run = run_dir(config).name
             req = Request(id=f'{run}:{uuid.uuid4().hex}', owner_pid=os.getpid(), cores=_cores(nd.cores, pool.cfg),
