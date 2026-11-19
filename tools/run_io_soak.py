@@ -189,15 +189,31 @@ INIT = INIT.replace('@START_WORKERS@', '\n'.join(START))
 INIT = INIT.replace(' | sed ', ' | /bin/busybox sed ').replace(' | tr ', ' | /bin/busybox tr ')
 
 
+def stress_pin(args):
+    """The stress-ng binary's and source's pins, as recorded in inputs.json. With --stress-provenance (the framework's
+    build, tools/io/stress-ng) the binary must hash to that file's binary_sha256 and the source to SOURCE_SHA, and the
+    provenance is recorded; without it, the retained build: STRESS_SHA, its bin.sha256 and build.log beside it."""
+    if args.stress_provenance is not None:
+        prov = json.loads(args.stress_provenance.read_text())
+        if digest(args.stress) != prov['binary_sha256'] or digest(args.stress_source) != SOURCE_SHA or prov['source_sha256'] != SOURCE_SHA:
+            raise ValueError('stress binary/source pin')
+        return {'binary': str(args.stress), 'sha256': prov['binary_sha256'], 'source': str(args.stress_source), 'source_sha256': SOURCE_SHA,
+                'provenance': {'path': str(args.stress_provenance), 'sha256': digest(args.stress_provenance), **prov}}
+    if digest(args.stress) != STRESS_SHA or digest(args.stress_source) != SOURCE_SHA: raise ValueError('stress binary/source pin')
+    prior_manifest = args.stress.parent.parent / 'bin.sha256'
+    if not any(line.startswith(STRESS_SHA + ' ') and line.endswith('/stress-ng') for line in prior_manifest.read_text().splitlines()): raise ValueError('retained stress build provenance')
+    build_log = args.stress.parent.parent.parent / 'build.log'
+    return {'binary': str(args.stress), 'sha256': STRESS_SHA, 'source': str(args.stress_source), 'source_sha256': SOURCE_SHA,
+            'prior_binary_manifest': {'path': str(prior_manifest), 'sha256': digest(prior_manifest)},
+            'prior_build_log': {'path': str(build_log), 'sha256': digest(build_log)}}
+
+
 def prepare(args):
     pin = json.loads((args.matrix_inputs / 'inputs.json').read_text())
     for name, sha in pin['outputs'].items():
         if digest(args.matrix_inputs / name) != sha: raise ValueError('matrix input changed: ' + name)
     if admission.tree_manifest(args.matrix_inputs / 'rootfs') != pin['rootfs']: raise ValueError('matrix root tree changed')
-    if digest(args.stress) != STRESS_SHA or digest(args.stress_source) != SOURCE_SHA: raise ValueError('stress binary/source pin')
-    prior_manifest = args.stress.parent.parent / 'bin.sha256'
-    if not any(line.startswith(STRESS_SHA + ' ') and line.endswith('/stress-ng') for line in prior_manifest.read_text().splitlines()): raise ValueError('retained stress build provenance')
-    build_log = args.stress.parent.parent.parent / 'build.log'
+    stress = stress_pin(args)
     b = args.stress.read_bytes()
     if b[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', b, 18)[0] != 62: raise ValueError('not x86_64 ELF')
     ph, size, count = struct.unpack_from('<Q', b, 32)[0], *struct.unpack_from('<HH', b, 54)
@@ -231,9 +247,7 @@ def prepare(args):
     for p in SOURCES: shutil.copyfile(p, oracle / p.name)
     write_json(args.out / 'inputs.json', {'purpose': 'five-minute verified CPU/memory and disk overlap; separate60s control',
         'matrix_inputs': {'path': str(args.matrix_inputs), 'sha256': digest(args.matrix_inputs / 'inputs.json')},
-        'stress': {'binary': str(args.stress), 'sha256': STRESS_SHA, 'source': str(args.stress_source), 'source_sha256': SOURCE_SHA,
-                   'prior_binary_manifest': {'path': str(prior_manifest), 'sha256': digest(prior_manifest)},
-                   'prior_build_log': {'path': str(build_log), 'sha256': digest(build_log)}},
+        'stress': stress,
         'disk_bytes': DISK_BYTES, 'file_bytes': FILE_BYTES, 'free_bytes': free, 'tools': tools,
         'producer': {p.name: digest(p) for p in SOURCES}, 'profiles': {n: dict(jobs(n)) for n in PROFILES},
         'rootfs': admission.tree_manifest(root), 'outputs': {n: digest(args.out / n) for n in ('linux', 'bootstrap.cpio', 'root.raw', 'mke2fs.conf', 'rootfs/sbin/init')}})
@@ -616,6 +630,8 @@ def main():
     sub.add_parser('self-check')
     a = sub.add_parser('prepare')
     for n in ('matrix-inputs', 'stress', 'stress-source', 'out'): a.add_argument('--' + n, type=Path, required=True)
+    a.add_argument('--stress-provenance', type=Path,
+                   help="the framework's stress-ng build (tools/io/stress-ng's provenance.json): its binary_sha256 replaces the retained build's pin")
     a = sub.add_parser('run')
     a.add_argument('--backend', choices=('natemu', 'qemu'), default='natemu')
     for n in ('executable', 'inputs', 'out', 'lock'): a.add_argument('--' + n, type=Path, required=True)

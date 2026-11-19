@@ -183,14 +183,26 @@ def init(data,cpu_load=False):
     for key,value in {'KVER':rng.KVER,'BYTES':len(data),'SHA':hashlib.sha256(data).hexdigest(),'CHUNKS':(len(data)+CHUNK-1)//CHUNK,'CHUNK':CHUNK}.items():text=text.replace('@'+key+'@',str(value))
     return text
 
+def stress_pin(a):
+    """The --cpu-load stress-ng pins, as recorded in inputs.json. With --stress-provenance (the framework's build,
+    tools/io/stress-ng) the binary must hash to that file's binary_sha256 and the source to STRESS_SOURCE_SHA, and the
+    provenance is recorded; without it, the retained build's STRESS_SHA."""
+    if a.factor!=3 or a.stress is None or a.stress_source is None:raise ValueError('CPU load requires factor3 and pinned stress binary/source')
+    record={'binary':str(a.stress.resolve()),'binary_sha256':STRESS_SHA,'source':str(a.stress_source.resolve()),'source_sha256':STRESS_SOURCE_SHA,'workers':3,'seconds':180,'method':'int64','seeds':[20261108,20261109,20261110]}
+    if a.stress_provenance is not None:
+        prov=json.loads(a.stress_provenance.read_text())
+        if digest(a.stress)!=prov['binary_sha256'] or digest(a.stress_source)!=STRESS_SOURCE_SHA or prov['source_sha256']!=STRESS_SOURCE_SHA:raise ValueError('stress binary/source pin')
+        return {**record,'binary_sha256':prov['binary_sha256'],'provenance':{'path':str(a.stress_provenance.resolve()),'sha256':digest(a.stress_provenance),**prov}}
+    if digest(a.stress)!=STRESS_SHA or digest(a.stress_source)!=STRESS_SOURCE_SHA:raise ValueError('pinned stress binary/source mismatch')
+    return record
+
 def prepare(a):
     origin=a.matrix_inputs.resolve(strict=True);pin=json.loads((origin/'inputs.json').read_text())
     kernel=origin/'linux';busybox=origin/'rootfs/bin/busybox'
     if digest(kernel)!=rng.KERNEL_SHA or pin['outputs']['linux']!=rng.KERNEL_SHA:raise ValueError('pinned kernel mismatch')
     if digest(busybox)!=BUSYBOX_SHA or pin['rootfs']['bin/busybox']['sha256']!=BUSYBOX_SHA:raise ValueError('pinned BusyBox mismatch')
-    if a.cpu_load:
-        if a.factor!=3 or a.stress is None or a.stress_source is None:raise ValueError('CPU load requires factor3 and pinned stress binary/source')
-        if digest(a.stress)!=STRESS_SHA or digest(a.stress_source)!=STRESS_SOURCE_SHA:raise ValueError('pinned stress binary/source mismatch')
+    stress=stress_pin(a) if a.cpu_load else None
+    if a.stress_provenance is not None and not a.cpu_load:raise ValueError('--stress-provenance needs --cpu-load')
     a.out=a.out.resolve();a.out.mkdir(parents=True,exist_ok=False);root=a.out/'rootfs'
     for name in ('bin','dev','proc','sys','tmp'):(root/name).mkdir(parents=True)
     clone(kernel,a.out/'linux');clone(busybox,root/'bin/busybox');(root/'bin/busybox').chmod(0o755)
@@ -212,7 +224,7 @@ def prepare(a):
     for p in sources:shutil.copyfile(p,oracle/p.name)
     shutil.copyfile(origin/'inputs.json',a.out/'prior-inputs.json')
     wire=data.replace(b'\n',b'\r\n')
-    write_json(a.out/'inputs.json',{'purpose':__doc__,'kernel':rng.KVER,'cpus':4,'cpu_load':a.cpu_load,'stress':({'binary':str(a.stress.resolve()),'binary_sha256':STRESS_SHA,'source':str(a.stress_source.resolve()),'source_sha256':STRESS_SOURCE_SHA,'workers':3,'seconds':180,'method':'int64','seeds':[20261108,20261109,20261110]} if a.cpu_load else None),'payload_factor':a.factor,'payload_bytes':len(data),'payload_sha256':hashlib.sha256(data).hexdigest(),'wire_bytes':len(wire),'wire_sha256':hashlib.sha256(wire).hexdigest(),
+    write_json(a.out/'inputs.json',{'purpose':__doc__,'kernel':rng.KVER,'cpus':4,'cpu_load':a.cpu_load,'stress':stress,'payload_factor':a.factor,'payload_bytes':len(data),'payload_sha256':hashlib.sha256(data).hexdigest(),'wire_bytes':len(wire),'wire_sha256':hashlib.sha256(wire).hexdigest(),
         'paced':{'chunk_bytes':CHUNK,'sleep_seconds':0.05},'origin':{'path':str(origin),'manifest_sha256':digest(origin/'inputs.json')},
         'sources':{str(p):digest(p) for p in sources},'outputs':{name:digest(a.out/name) for name in ('linux','serial.cpio','rootfs/payload','rootfs/init','rootfs/heartbeat','rootfs/bin/busybox','rootfs/inputs.sha256','prior-inputs.json',*(['rootfs/bin/stress-ng','rootfs/load-worker','rootfs/load-observer'] if a.cpu_load else []))}})
 
@@ -472,6 +484,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='command',required=True)
     sub.add_parser('self-check')
     prep=sub.add_parser('prepare');prep.add_argument('--matrix-inputs',type=Path,required=True);prep.add_argument('--out',type=Path,required=True);prep.add_argument('--factor',type=int,choices=(1,3),default=1);prep.add_argument('--cpu-load',action='store_true');prep.add_argument('--stress',type=Path);prep.add_argument('--stress-source',type=Path)
+    prep.add_argument('--stress-provenance',type=Path,help="the framework's stress-ng build (tools/io/stress-ng's provenance.json): its binary_sha256 replaces STRESS_SHA")
     runp=sub.add_parser('run');runp.add_argument('--mode',choices=('unpaced','paced'),required=True)
     for name in ('inputs','natemu','runtime','fexc','out'):runp.add_argument('--'+name,type=Path,required=True)
     runp.add_argument('--lock',type=Path,default=VM_LOCK)
