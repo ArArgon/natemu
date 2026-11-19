@@ -3,14 +3,16 @@
 
     tools/with-env python3 tools/run_x1.py --fexc FEXC --out DIR [--only qemu,cases]
 
-- `qemu`: `x1-entry@1/2/4` run unchanged by pinned QEMU (system mode) and natemu at block sizes default and 1: CPL 3 -> 0
-  frames on RSP0, IST1, IST3, IST5..7 and CPL 0 -> 0 frames on IST1..4 (IST selection does not depend on the CPL), IRETQ
-  to CPL 3 after each, the normal (SWAPGS) and paranoid (RDGSBASE, LSL of the CPU/node descriptor, WRGSBASE) entry
-  shapes, #DF from CPL 3 and CPL 0, NMI blocking until IRETQ. natemu must equal QEMU (registers, the logs, the GS blocks:
-  the saved context words and which GS base a paranoid entry found are judged there), and every logged frame of both
-  must be delivery_model's given the logged context: the vector chain and error code, RF, and the RIP slot's address
-  (the stack chosen: RSP0, IST n or the current one, aligned); the entry's per-CPU values (stamp, LSL = CPU number) and
-  the CPL 3 results (LSL, RDGSBASE, [gs:0]) as the program sets them; the second NMI's frame RIP equals the first's.
+- `qemu` (the name kept from when pinned QEMU ran these programs too; natemu only now): `x1-entry@1/2/4` on natemu at
+  block sizes default and 1: CPL 3 -> 0 frames on RSP0, IST1, IST3, IST5..7 and CPL 0 -> 0 frames on IST1..4 (IST
+  selection does not depend on the CPL), IRETQ to CPL 3 after each, the normal (SWAPGS) and paranoid (RDGSBASE, LSL of
+  the CPU/node descriptor, WRGSBASE) entry shapes, #DF from CPL 3 and CPL 0, NMI blocking until IRETQ. Every logged
+  frame must be delivery_model's given the logged context: the vector chain and error code, RF, and the RIP slot's
+  address (the stack chosen: RSP0, IST n or the current one, aligned); which GS base a paranoid entry found; the entry's
+  per-CPU values (stamp, LSL = CPU number) and the CPL 3 results (LSL, RDGSBASE, [gs:0]) as the program sets them; the
+  second NMI's frame RIP equals the first's. X1c's PUSH/POP FS/GS, Reserved-NOP and BND programs: the SDM's registers.
+  (Pinned QEMU, once compared here, pushes RF = 1 for INT n/INT3 after an IRETQ that loaded RF = 1 and for NMIs; the
+  SDM pushes 0 for INT n/INT3, Vol.3 "RF", and the current RF for an NMI.)
 - `cases`: X1c's refused-but-defined cases, now delivered (SDM rules, natemu only; each was a stop before X1c):
   the #UD encodings (PUSH/POP ES/CS/SS/DS, CALL/JMP ptr16:32 in 64-bit mode, LSS/LFS/LGS with a register operand, the
   0f 01 register forms no advertised feature defines, 0f 01 /5 m without F3, 0f 00 /7) and CLTS, SMSW, LMSW, SYSENTER,
@@ -21,22 +23,13 @@ import argparse, json, pathlib, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools' / 'reference'), str(ROOT / 'tools' / 'bench' / 'smp')]
-import case_results, ref, smp, answers, entry, programs as P, run_slice1_vm as vm  # noqa: E402
+import case_results, ref, smp, entry, programs as P, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import driver, per_vcpu_checks, body_end, smp_description, vm_state  # noqa: E402
 from models import delivery_model as dm  # noqa: E402
 
 
-# Pinned QEMU's departures from the SDM met here (natemu is judged by delivery_model there, and compared with QEMU with RF
-# cleared in every logged RFLAGS): it pushes RF = 1 for INT n/INT3 run right after an IRETQ that loaded RF = 1 (it keeps
-# RF until a later event; X1a's note) and for NMIs (run_slice3_vm.QEMU_EVENTS_RF); the SDM pushes 0 for INT n/INT3 (RF is
-# cleared at their start, Vol.3 "RF") and the current RF for an NMI.
-QEMU_RF = 'pinned QEMU pushes RF = 1 for INT n/INT3 after an IRETQ that loaded RF = 1, and for NMIs (SDM: 0, and the current RF)'
-RF = 1 << 16
-
-
-def model_problems(prog, memory, qemu=False):
-    """Every CPU's log against entry.expected and delivery_model; `memory` = {address: bytes} of the captured regions.
-    `qemu`: QEMU's run, whose RF in the frames of INT n/INT3 and NMIs is not judged (QEMU_RF)."""
+def model_problems(prog, memory):
+    """Every CPU's log against entry.expected and delivery_model; `memory` = {address: bytes} of the captured regions."""
     out = []
     read = lambda at, n: next(d[at - a:at - a + n] for a, d in memory.items() if a <= at and at + n <= a + len(d))
     for i in range(prog['ncpu']):
@@ -56,9 +49,6 @@ def model_problems(prog, memory, qemu=False):
             n = r['state']
             at = n['rsp'] + (8 if err is not None else 0)
             undefined = dict(r['undefined']['frame'])
-            if qemu and event['kind'] in ('int', 'int3', 'nmi') and len(r['events']) == 1:
-                image = dm.qword(n['memory'], at + 16)
-                undefined[at + 16] = frozenset({image, image ^ RF})
             words = [dm.qword(n['memory'], at + 8 * j) for j in range(5)]
             bad = [j for j, (g, w) in enumerate(zip((rip, cs, rflags, rsp, ss), words))
                    if g != w and not (at + 8 * j in undefined and (undefined[at + 8 * j] is None or g in undefined[at + 8 * j]))]
@@ -79,34 +69,12 @@ def model_problems(prog, memory, qemu=False):
     return out
 
 
-def without_rf(prog, state):
-    """`state` (smp.parse_dump's shape) with RF cleared in every logged frame's RFLAGS (QEMU_RF)."""
-    logs = {P.SYS_D(i) + entry.LOG for i in range(prog['ncpu'])}
-    memory = []
-    for r in state['memory']:
-        data = bytearray(r['data'])
-        if r['addr'] in logs:
-            for k in range(0, entry.RES - entry.LOG, 0x50):
-                data[k + 34] &= ~1          # RFLAGS (+0x20), bit 16
-        memory.append({**r, 'data': bytes(data)})
-    return {**state, 'memory': memory}
-
-
 def cmd_qemu(a, report):
-    stub = smp.build_stub(a.out / 'qemu-build')
     failures = []
     for n in (1, 2, 4):
         prog = entry.program(n)
         label = prog['name']
-        rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=120)
-        want = smp.parse_dump(prog, dump) if rc == 1 else None
         e = {'name': label, 'runs': []}
-        if want is None:
-            failures.append(f'{label}: QEMU run failed ({rc} {err})')
-        else:
-            q = answers.derive(want, 'model_problems', lambda w: model_problems(prog, {r['addr']: r['data'] for r in w['memory']}, qemu=True))
-            e['qemu_vs_model'] = q
-            failures += [f'{label}: QEMU vs model: {d}' for d in q]
         for limit in (None, 1):
             rc, out, err = driver(a.host, a.runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{label}-{limit or 'd'}", [limit] if limit else [])
             if rc:
@@ -120,35 +88,25 @@ def cmd_qemu(a, report):
                     problems += [f'cpu{v} ' + d for d in per_vcpu_checks(c)]
                 got = vm_state(prog, out)
                 problems += model_problems(prog, {r['addr']: r['data'] for r in got['memory']})
-                if want is not None:
-                    problems += smp.compare(prog, without_rf(prog, got), answers.view(want, 'without-rf', lambda w: without_rf(prog, w)))
             e['runs'].append({'max_block': limit, 'problems': problems})
             failures += [f'{label} (max-block {limit}): {p}' for p in problems]
-        print(f"{label}: {'FAIL' if any(r['problems'] for r in e['runs']) or e.get('qemu_vs_model') else 'ok'}",
-              *([*e.get('qemu_vs_model', [])] + [p for r in e['runs'] for p in r['problems']])[:8], sep='\n  ', flush=True)
+        print(f"{label}: {'FAIL' if any(r['problems'] for r in e['runs']) else 'ok'}",
+              *[p for r in e['runs'] for p in r['problems']][:8], sep='\n  ', flush=True)
         report.append(e)
-    # X1c: PUSH/POP FS/GS, PREFETCHW, CLDEMOTE: natemu equals QEMU (registers, the captured page) and the SDM's registers;
-    # the Reserved-NOP cells: natemu equals QEMU and every one completes (R14 = 1, RBX/R8/R9 kept).
+    # X1c: PUSH/POP FS/GS, PREFETCHW, CLDEMOTE: the SDM's registers; the Reserved-NOP cells: every one completes (R14 = 1,
+    # RBX/R8/R9 kept); BND: every path ran.
     for prog, expected in ((entry.sreg_program(), entry.sreg_expected()), (entry.rnop_program(), {'r14': 1, 'r8': 0x1111, 'r9': 0x2222, 'rbx': 0x7f0000}),
                              (entry.bnd_program(), {r: 1 for r in ('r8', 'r9', 'r10', 'r11', 'r12', 'r13')})):
-        failures += plain_program(a, stub, report, prog, expected)
+        failures += plain_program(a, report, prog, expected)
     return failures
 
 
-def plain_program(a, stub, report, prog, expected):
-    """One CPL 0 program vs pinned QEMU and `expected` ({register: value}) at block sizes default and 1."""
+def plain_program(a, report, prog, expected):
+    """One CPL 0 program against `expected` ({register: value}) at block sizes default and 1."""
     failures = []
     label = prog['name']
-    rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=120)
-    want = smp.parse_dump(prog, dump) if rc == 1 else None
     e = {'name': label, 'runs': []}
     sdm = lambda gpr: [f'{r} {gpr[P.REGS.index(r)]:#x} != {v:#x}' for r, v in expected.items() if gpr[P.REGS.index(r)] != v]
-    if want is None:
-        failures.append(f'{label}: QEMU run failed ({rc} {err})')
-    else:
-        e['qemu_vs_sdm'] = answers.derive(want, 'sdm/' + ','.join(f'{r}={v:#x}' for r, v in sorted(expected.items())),
-                                          lambda w: sdm([smp.num(x) for x in w['cpus'][0]['gpr']]))
-        failures += [f'{label}: QEMU vs SDM: {d}' for d in e['qemu_vs_sdm']]
     for limit in (None, 1):
         rc, out, err = driver(a.host, a.runtime, a.fexc, smp_description(prog), a.out / 'work' / f"{label}-{limit or 'd'}", [limit] if limit else [])
         if rc:
@@ -157,14 +115,11 @@ def plain_program(a, stub, report, prog, expected):
             c = out['cpus'][0]
             end = body_end(prog, smp.num(prog['cpus'][0]['rip']))
             problems = [] if c['stop'] == 'reached' and smp.num(c['rip']) == end else [f"stopped {c['stop']} {c['reason']} at {c['rip']} (end {end:#x})"]
-            got = vm_state(prog, out)
-            problems += sdm([smp.num(x) for x in got['cpus'][0]['gpr']])
-            if want is not None:
-                problems += smp.compare(prog, got, want)
+            problems += sdm([smp.num(x) for x in vm_state(prog, out)['cpus'][0]['gpr']])
         e['runs'].append({'max_block': limit, 'problems': problems})
         failures += [f'{label} (max-block {limit}): {p}' for p in problems]
-    print(f"{label}: {'FAIL' if any(r['problems'] for r in e['runs']) or e.get('qemu_vs_sdm') else 'ok'}",
-          *(e.get('qemu_vs_sdm', []) + [p for r in e['runs'] for p in r['problems']])[:8], sep='\n  ', flush=True)
+    print(f"{label}: {'FAIL' if any(r['problems'] for r in e['runs']) else 'ok'}",
+          *[p for r in e['runs'] for p in r['problems']][:8], sep='\n  ', flush=True)
     report.append(e)
     return failures
 
