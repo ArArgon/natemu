@@ -2438,6 +2438,25 @@ pub(crate) enum Code {
     None(String),
 }
 
+/// The experiment switches' request arguments, read from the environment once, where a `Compiler` is made ([`Compiler::new`]);
+/// they are request arguments, so part of every request body and so of the persistent cache's key.
+/// `NATEMU_EXT_CONDS=N` asks fexc for units of up to N conditional branches (extended blocks);
+/// `NATEMU_FEXC_PUSH_RUN=1` / `NATEMU_FEXC_NARROW_CMP=1` ask for `--push-run` / `--narrow-cmp`.
+fn experiment_args(get: impl Fn(&str) -> Option<String>) -> Vec<u8> {
+    get("NATEMU_EXT_CONDS")
+        .filter(|n| n.parse::<u8>().is_ok_and(|n| n > 1))
+        .map(|n| format!("--ext-conds\0{n}\0").into_bytes())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            [("NATEMU_FEXC_PUSH_RUN", &b"--push-run\0"[..]), ("NATEMU_FEXC_NARROW_CMP", b"--narrow-cmp\0")]
+                .into_iter()
+                .filter(|(v, _)| get(v).is_some_and(|x| x == "1"))
+                .flat_map(|(_, a)| a.iter().copied()),
+        )
+        .collect()
+}
+
 /// fexc for one vCPU's feature set: one persistent `fexc --serve` process (started at the first compile), a cache of its
 /// answers in memory and, when set, the persistent one on disk. Objects are byte-identical to the one-shot CLI's.
 /// In memory an answer is kept by block limit, the RIP's half and page offset and its leading bytes (the profile and
@@ -2681,7 +2700,9 @@ impl Compiler {
     pub fn new(fexc: &Path, cpu: &Vcpu, max_instructions: Option<u32>) -> Result<Self> {
         // `NATEMU_FEXC_FEATURE_OFF` is applied inside the probe, so its line and this set agree ([`crate::probe::Probe`]).
         let supported = crate::probe::Probe::read(cpu)?.supported();
-        Ok(Self::with_features(fexc, supported, max_instructions))
+        let mut c = Self::with_features(fexc, supported, max_instructions);
+        c.feature_args.extend(experiment_args(|v| std::env::var(v).ok()));
+        Ok(c)
     }
     fn with_features(fexc: &Path, supported: u64, max_instructions: Option<u32>) -> Self {
         Self {
@@ -2691,22 +2712,6 @@ impl Compiler {
             feature_args: admission::feature_overrides(supported)
                 .iter()
                 .flat_map(|f| b"--feature\0".iter().copied().chain(f.bytes()).chain([0]))
-                // Experiment (extended blocks): `NATEMU_EXT_CONDS=N` asks fexc for units of up to N conditional branches.
-                .chain(
-                    std::env::var("NATEMU_EXT_CONDS")
-                        .ok()
-                        .filter(|n| n.parse::<u8>().is_ok_and(|n| n > 1))
-                        .map(|n| format!("--ext-conds\0{n}\0").into_bytes())
-                        .unwrap_or_default(),
-                )
-                // Experiments: `NATEMU_FEXC_PUSH_RUN=1` / `NATEMU_FEXC_NARROW_CMP=1` ask fexc for `--push-run` / `--narrow-cmp`.
-                // They are request arguments, so part of every request body and so of the persistent cache's key.
-                .chain(
-                    [("NATEMU_FEXC_PUSH_RUN", &b"--push-run\0"[..]), ("NATEMU_FEXC_NARROW_CMP", b"--narrow-cmp\0")]
-                        .into_iter()
-                        .filter(|(v, _)| std::env::var(v).is_ok_and(|x| x == "1"))
-                        .flat_map(|(_, a)| a.iter().copied()),
-                )
                 .collect(),
             max_instructions,
             answers: Answers::new(supported),
@@ -5092,6 +5097,18 @@ mod tests {
         };
         let ((old, bytes), (new, bytes2)) = (args(&body), args(&added));
         assert_eq!((bytes, new), (bytes2, [&old[..], b"--feature\0afp=0\0"].concat()));
+    }
+    #[test]
+    fn experiment_switches_reach_the_body_only_when_set() {
+        let on = |v: &str| Some(if v == "NATEMU_EXT_CONDS" { "4" } else { "1" }.to_string());
+        assert_eq!(experiment_args(|_| None), b"");
+        assert_eq!(experiment_args(on), b"--ext-conds\x004\0--push-run\0--narrow-cmp\0");
+        let mut c = Compiler::with_features(Path::new("/nonexistent"), u64::MAX, None);
+        let off = c.body_with(&[0x90], "0x1234".into(), None);
+        c.feature_args.extend(experiment_args(on));
+        let body = c.body_with(&[0x90], "0x1234".into(), None);
+        assert!(body.windows(12).any(|w| w == b"--narrow-cmp"));
+        assert!(!off.windows(12).any(|w| w == b"--narrow-cmp"));
     }
     #[test]
     fn body_bytes_are_unchanged() {

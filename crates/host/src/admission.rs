@@ -533,6 +533,7 @@ fn admit_records(
         || h.code_size as usize > MAX_BLOCK_BYTES
         || h.code_size % 4 != 0
         || region > h.code_size
+        || region % 4 != 0
         || h.body_offset < ENTRY_OFFSET
         || h.body_offset > region
         || h.end_marker_offset != object::NONE32
@@ -1221,6 +1222,7 @@ mod tests {
             header(|h| h.relocs_offset = 128), // inside the code
             header(|h| h.code_region_end = 64),
             header(|h| h.code_region_end = 28), // word 0 still says 24
+            with(header(|h| h.code_region_end = 26), 128, |w: &mut u32| *w = 26), // head word agrees, not a multiple of 4
             with(object(), 128, |w: &mut u32| *w = 4), // a short head word
             header(|h| h.body_offset = 0),
             header(|h| h.spill_bytes = 16),
