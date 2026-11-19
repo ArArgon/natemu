@@ -484,13 +484,13 @@ def test_public_needs_review_is_unverified():
 def test_correctness_family_declares_openssl_and_torture():
     family.load.cache_clear()
     fam = family.load(REPO / 'tests' / 'correctness' / 'family.toml')
-    assert {s.name for s in fam.suites} == {'openssl', 'torture'}
+    assert {s.name for s in fam.suites} >= {'openssl', 'torture'}
     v = verdicts()
     for s in fam.suites:
         assert (s.kind, s.harness, s.extra['tier']) == ('judged', 'campaign', 'campaign')
         mod, fn = s.extra['verdict'].split(':')
         assert mod == 'verdicts' and callable(getattr(v, fn))
-        assert s.matrix == {'machine.vcpus': [4]}
+        if s.name in ('openssl', 'torture'): assert s.matrix == {'machine.vcpus': [4]}
     t = fam.suite('torture').extra['expected']
     assert sorted(t) == sorted(f'{n}.{o}' for n in ('ieee_inf-2', 'ieee_inf-3', 'ieee_pr36332', 'pr39228') for o in ('O0', 'O2'))
     assert all('reduced precision' in why and 'docs/restructure/correctness-userspace.md' in why for why in t.values())
@@ -590,3 +590,72 @@ def test_a_terminated_worker_stops_its_natemu(tmp_path):
 def paths_root():
     from testkit import paths
     return paths.repo_root()
+
+
+# --- per-part kernels and command-line words (<suite>-boot.txt: the public campaign) ---
+
+def test_boot_file_gives_each_part_its_kernel_and_words(setup, monkeypatch):
+    """public: a part names its kernel (a file of the image folder) and its guest cap (pubcap=), which reach boot()."""
+    run, fake, img = setup('0/2 default:test_a\n1/2 default:test_b\n',
+                           {'0/2': serial('0/2', 'CT-RESULT openssl default:test_a rc=0 ok=1 notok=0'),
+                            '1/2': serial('1/2', 'CT-RESULT openssl default:test_b rc=0 ok=1 notok=0')})
+    (img / 'test-kernel').write_bytes(b'bzImage')
+    (img / 'openssl-boot.txt').write_text('0/2 pubcap=300\n1/2 kernel=test-kernel pubcap=90 x=1\n')
+    got = []
+
+    def fake_kw(image, suite, part, vcpus, work, cap, **kw):
+        got.append((part, kw))
+        return fake(image, suite, part, vcpus, work, cap)
+    monkeypatch.setattr(campaign, 'boot', fake_kw)
+    assert run('part-0').outcome == 'passed' and run('part-1').outcome == 'passed'
+    assert got == [('0/2', {'args': ('pubcap=300',)}), ('1/2', {'args': ('pubcap=90', 'x=1'), 'kernel': img / 'test-kernel'})]
+
+
+def test_boot_file_naming_a_missing_kernel_fails_the_part(setup):
+    run, fake, img = setup('0/1 default:test_a\n', {'0/1': serial('0/1', 'CT-RESULT openssl default:test_a rc=0 ok=1 notok=0')},
+                           parts=1)
+    (img / 'openssl-boot.txt').write_text('0/1 kernel=../elsewhere\n')
+    with pytest.raises(ValueError, match='no kernel'):
+        run('part-0')
+    assert not fake.calls
+
+
+def test_boot_uses_the_parts_kernel_and_words(tmp_path, monkeypatch):
+    """boot() with a part's kernel and words: --kernel is that file, the words end the command line."""
+    import types
+    stub = tmp_path / 'natemu'
+    stub.write_text('#!/bin/sh\nall="$0 $*"\nwhile [ $# -gt 0 ]; do case $1 in --serial) s=$2;; esac; shift; done\n'
+                    'printf "CT-END suite=public part=3/1 rc=0 guest_s=1\\n" > "$s"\necho "$all" > "$(dirname "$s")/argv"\n')
+    stub.chmod(0o755)
+    monkeypatch.setattr(campaign.artifacts, 'natemu', lambda: types.SimpleNamespace(stub=stub, runtime=tmp_path / 'rt'))
+    monkeypatch.setattr(campaign.artifacts, 'fexc', lambda: tmp_path / 'fexc')
+    monkeypatch.setattr(campaign.resources, 'fetch', lambda name: tmp_path / name)
+    work = tmp_path / 'w'
+    campaign.boot(tmp_path / 'public.cpio.zst', 'public', '3/1', 1, work, 30, kernel=tmp_path / 'public-kernel',
+                  args=('pubcap=300',))
+    argv = (work / 'argv').read_text().split()
+    assert argv[argv.index('--kernel') + 1] == str(tmp_path / 'public-kernel')
+    assert argv[argv.index('--cmdline') + 1:argv.index('--vcpus')] == ['console=ttyS0', 'mitigations=off', 'nokaslr',
+                                                                       'ct=public', 'part=3/1', 'pubcap=300']
+
+
+def test_public_rows_list_boot_and_suite_agree(tmp_path):
+    """recipes/public/cases.py: the guest's table (line K+1 for part K/1), the list, the boot file and the suite agree:
+    every row has its part, its kernel and pubcap=; the expected entries name rows; parts = the row count."""
+    import subprocess, sys
+    subprocess.run([sys.executable, '-I', str(REPO / 'tools/correctness/recipes/public/cases.py'), str(tmp_path)],
+                   check=True, capture_output=True)
+    rows = [l.split('\t', 1) for l in (tmp_path / 'public-cases.tsv').read_text().splitlines()]
+    listed = campaign.read_list(tmp_path, 'public')
+    assert listed == [(f'{k}/1', [r[0]]) for k, r in enumerate(rows)]
+    (tmp_path / 'public-kernel').write_bytes(b'bzImage')
+    boot = campaign.read_boot(tmp_path, 'public')
+    assert list(boot) == [p for p, _ in listed]
+    assert all(o['args'] == ('pubcap=300',) for o in boot.values())
+    on_kernel = {r[0] for k, r in enumerate(rows) if 'kernel' in boot[f'{k}/1']}
+    assert on_kernel == {r[0] for r in rows if 'modprobe' in r[1] or r[0] == 'mm-cow-gup'}
+    family.load.cache_clear()
+    s = family.load(REPO / 'tests' / 'correctness' / 'family.toml').suite('public')
+    assert int(s.extra['parts']) == len(rows) and s.matrix == {'machine.vcpus': [1, 4]}
+    assert set(s.extra['expected']) <= {r[0] for r in rows}
+    assert all('docs/restructure/correctness-public-kernel.md' in why for why in s.extra['expected'].values())

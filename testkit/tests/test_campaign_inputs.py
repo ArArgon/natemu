@@ -114,3 +114,29 @@ def test_repin_tree_is_kept_and_named(monkeypatch, tmp_path):
     with pytest.raises(BuildFailure, match='openssl/sources.sha256'):
         inputs._in_container('campaign-openssl', tmp_path, work, script='b.sh', pins_to=tmp_path / 'recipes')
     assert (tmp_path / 'state/repin/campaign-openssl/openssl/sources.sha256').read_text() == 'x\n'
+
+
+def _with_boot_file(boot, kernel=True):
+    inner = _fake_build([])
+
+    def fake(name, recipe, work, **kw):
+        inner(name, recipe, work, **kw)
+        (work / 'openssl-boot.txt').write_text(boot)
+        if kernel: (work / 'openssl-kernel').write_bytes(b'bzImage')
+    return fake
+
+
+def test_boot_file_and_its_kernels_are_kept(monkeypatch, tmp_path):
+    """A recipe's <suite>-boot.txt (per-part kernels, public) and the kernels it names reach the entry and its manifest."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    monkeypatch.setattr(inputs, '_in_container', _with_boot_file('0/2 pubcap=300\n1/2 kernel=openssl-kernel pubcap=300\n'))
+    d = inputs.campaign_image('openssl')
+    m = json.loads((d / 'manifest.json').read_text())
+    assert set(m['boot']) == {'openssl-boot.txt', 'openssl-kernel'} and (d / 'openssl-kernel').read_bytes() == b'bzImage'
+
+
+def test_boot_file_naming_a_kernel_not_built_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    monkeypatch.setattr(inputs, '_in_container', _with_boot_file('0/2 kernel=openssl-kernel\n', kernel=False))
+    with pytest.raises(BuildFailure, match='names kernels the recipe did not write'):
+        inputs.campaign_image('openssl')
