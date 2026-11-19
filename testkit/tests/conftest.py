@@ -25,3 +25,10 @@ def _isolated_raw_root(monkeypatch, tmp_path_factory):
     """Never touch the machine's real natemu-raw (its .vm.lock) from the framework's own tests."""
     monkeypatch.setenv('NATEMU_RAW_ROOT', str(tmp_path_factory.mktemp('raw')))
     monkeypatch.delenv('NATEMU_STATE_ROOT', raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _local_builder(monkeypatch):
+    """The machine's own config.toml may send container builds to an x86 box ([build] builder): the framework's own
+    tests stub `container`, so they build 'local' unless a test chooses otherwise."""
+    monkeypatch.setenv('NATEMU_CONTAINER_BUILDER', 'local')
