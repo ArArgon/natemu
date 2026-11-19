@@ -1029,8 +1029,9 @@ PROGRAMS['s4-d-noncanon'] = (NONCANON, None, 0)
 
 # The programs whose end registers and captured memory must equal their quiet twin's (`program(name, quiet_twin=True)`): the
 # #DB handler changes nothing architectural besides DR6 and the frame's RF, so with debugging off the same instructions
-# leave the same results. s4-dr reads the debug registers themselves (`expect_regs`).
-QUIET = ['s4-step'] + list(DATA_PROGRAMS)
+# leave the same results. Not here: s4-dr reads the debug registers themselves (`expect_regs`); s4-soft (INT1), s4-sticky
+# and s4-sysret (TF through R11 and SFMASK) raise #DB without DR7 or TF_ON, so their twins are not quiet.
+QUIET = [n for n in PROGRAMS if n not in ('s4-dr', 's4-soft', 's4-sticky', 's4-sysret')]
 # Bytes that may differ: the log cursor (PTRS + 20H), and the handler frames a #DB leaves on dead stack in a captured page
 # (the 48H bytes below the 16-byte aligned RSP it was delivered at: s4-d-stack's at d_t (RSP Z + 8) and at s4_v3 (the INT3
 # frame's, Z2 + 10H - 28H); s4-d-sys's at f_t (FS, after the far CALL)).

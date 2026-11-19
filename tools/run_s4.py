@@ -9,9 +9,10 @@
   instruction, after MOV SS, at a REP, with LEN 11, a single-step trap landing on one; DR6/DR7 read-back, DR4/DR5
   aliases and DR7.GD; sticky DR6; SYSRET and SYSCALL with TF) at block sizes default and 1. Each event log is judged
   against `debug.expect` and the registers a program reads its results into against `debug.expect_regs` (both written
-  from the SDM). s4-step and the data-breakpoint programs (`debug.QUIET`) end with the registers and captured memory of
-  their quiet twin, the same instructions run once with DR7 = 0 and TF off (`debug.quiet`; the #DB handler changes
-  nothing architectural but DR6 and RF; the log cursor and the frames left on dead stack excepted). (Pinned QEMU, once compared here, keeps DR6 bit 12 written as 1, and ends a REP OUTSB after the element
+  from the SDM). Every program but s4-dr, s4-soft, s4-sticky and s4-sysret (`debug.QUIET`) ends with the registers and
+  captured memory of its quiet twin, the same instructions run once with DR7 = 0 and TF off (`debug.quiet`; the #DB
+  handler changes nothing architectural but DR6 and RF; the log cursor and the frames left on dead stack excepted).
+  (Pinned QEMU, once compared here, keeps DR6 bit 12 written as 1, and ends a REP OUTSB after the element
   that met an I/O breakpoint.)
 - `cases`: natemu-only, judged by the SDM rules: HLT under TF (#DB with RIP after the HLT, no park; delivery_model A10),
   and the refusals of data and I/O breakpoints (`unsupported_system`), an instruction breakpoint with LEN 01.
