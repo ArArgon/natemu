@@ -22,6 +22,9 @@ CATEGORIES = {
     'unexpected-pass': ('X', 'UNEXPECTED PASS'),        # listed in `expected` but passed: fails until the entry goes
     'stale-entry': ('!', 'STALE ENTRY'),                # an `expected`/`flaky` entry naming no test of the image: fails
 }
+# Fail every run, gate or not: something the selection asked for could not run here, and no other run is to blame
+# (not-runnable, the machine being too small, fails only the gate, which may cover it with another machine's run).
+RUN_FAILS = ('stale-lock', 'build-failure', 'unpreparable', 'exclusion-changed')
 GATE_FAILS = ('failed', 'error', 'stale-lock', 'build-failure', 'unpreparable', 'not-runnable', 'exclusion-changed',
               'missing', 'unexpected-pass', 'stale-entry')
 
@@ -38,6 +41,10 @@ def teststatus(report):
         letter, word = CATEGORIES[c]
         return c, letter, word
     return None
+
+
+def run_failures(stats: dict) -> list[str]:
+    return [f'{len(stats[k])} {k}' for k in RUN_FAILS if stats.get(k)]
 
 
 def gate_verdict(stats: dict) -> tuple[bool, list[str]]:

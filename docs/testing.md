@@ -52,12 +52,12 @@ into queue, start-up and test time, and the slowest requirements to prepare.
 
 ## What a result means
 
-Besides passed and failed:
+Besides passed and failed (a failure fails every run, exit status 1):
 
-| Result | Meaning | Fails a gate |
+| Result | Meaning | Fails the run |
 | --- | --- | --- |
 | excluded | the family's rule says this case does not apply to this variant (the reason is shown) | no |
-| not-runnable | this machine cannot run it, for example a variant that needs AFP on a Mac without it | yes, unless covered (below) |
+| not-runnable | this machine cannot run it, for example a variant that needs AFP on a Mac without it | only a gate (`--gate`), unless covered (below) |
 | stale-lock | the test's locked answer no longer fits its inputs, or the case has no answer yet: re-seed | yes |
 | build-failure | an input built here differs from the locked one, or a build failed | yes |
 | unpreparable | a download or other preparation failed (no network, upstream gone) | yes |
@@ -65,6 +65,9 @@ Besides passed and failed:
 | unsupported | natemu stopped at a declared limit of the program harness | no |
 | reused | an identical earlier run's output, checked again against the current lock | no |
 | wrapped | a step of the old `tools/run_suite.py` run unchanged (it still uses `natemu-raw`) | if it failed |
+
+A run that fails exits with status 1, and so does `tools/natemu-test wait RUN` for it; a gate also fails when it
+selected nothing.
 
 A campaign (`--tier campaign`, `tests/correctness`) judges each test it runs by that test's own verdict, and adds:
 

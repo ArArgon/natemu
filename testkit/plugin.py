@@ -131,9 +131,13 @@ def covered_elsewhere(session) -> set:
 def pytest_sessionfinish(session, exitstatus):
     if session.config.getoption('testkit_worker'): return
     write_coverage(session)
-    if not session.config.getoption('gate', False): return
     tr = session.config.pluginmanager.get_plugin('terminalreporter')
     stats = dict(tr.stats) if tr else {}
+    if not session.config.getoption('gate', False):
+        if (bad := report.run_failures(stats)) and session.exitstatus == 0:
+            session.exitstatus = 1
+            if tr: tr.write_line('testkit: not everything could run: ' + ', '.join(bad), red=True)
+        return
     if stats.get('not-runnable'):
         elsewhere = covered_elsewhere(session)
         stats['not-runnable'] = [r for r in stats['not-runnable'] if r.nodeid not in elsewhere]

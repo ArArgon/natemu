@@ -39,6 +39,7 @@ def test_unpreparable_resource(pytester, env):
     r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '-k', 'needsbad or shared', 'tests')
     out = r.stdout.str()
     assert '6 passed' in out and '1 unpreparable' in out and 'connection refused' in out, out
+    assert r.ret == 1, out          # review: a run where something could not be prepared exited 0 without --gate
 
 
 def test_two_runs_share_machine(pytester, env):
@@ -71,6 +72,19 @@ def test_submit_wait_status(env, monkeypatch, tmp_path):
     assert 'machine:' in st.stdout
     w = subprocess.run([sys.executable, '-m', 'testkit', 'wait', rid], capture_output=True, text=True, env=e, timeout=60)
     assert w.returncode == 0 and 'exit status 0' in w.stdout, w.stdout + w.stderr
+
+
+def test_wait_returns_a_runs_unpreparable_status(env, monkeypatch):
+    """Review: `wait RUN` returned 0 for a run whose image could not be built (reported as a skip), while `prepare`
+    returned 1."""
+    monkeypatch.delenv('TESTKIT_RUN_DIR')
+    fam = paths.repo_root() / 'testkit' / 'tests' / 'fixtures' / 'sleepfam' / 'family.toml'
+    e = dict(os.environ, PYTHONPATH=str(paths.repo_root()))
+    out = subprocess.run([sys.executable, '-m', 'testkit', 'submit', '-p', 'no:cacheprovider', '-k', 'needsbad', str(fam)],
+                         capture_output=True, text=True, env=e, cwd=paths.repo_root())
+    rid = out.stdout.strip()
+    w = subprocess.run([sys.executable, '-m', 'testkit', 'wait', rid], capture_output=True, text=True, env=e, timeout=60)
+    assert w.returncode == 1 and 'exit status 1' in w.stdout, w.stdout + w.stderr
 
 
 def test_prepare_only_runs_nothing(pytester, env):
