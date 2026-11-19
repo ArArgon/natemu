@@ -92,7 +92,7 @@ def test_diff_rerun_uses_live_answers_and_its_own_output_folder(tmp_path):
     assert env['NATEMU_ANSWERS'] == 'locked'                    # the case's own environment is untouched
     script.write_text('import sys\nprint("all fine")\n')
     note = runner.HARNESS.diff_rerun([sys.executable, str(script), '--out', str(o)], env, o, tmp_path / 'run', 'c')
-    assert 'natemu matches QEMU and the locked answer is wrong or stale' in note and 'all fine' not in note
+    assert 'the locked answer is stale' in note and 'fails only sometimes' in note and 'all fine' not in note
 
 
 def test_diff_rerun_only_for_hash_only_answers():

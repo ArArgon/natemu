@@ -215,6 +215,7 @@ class Controller:
                 time.sleep(POLL)
         finally:
             self.kill(*running)
+            for u in running: reap_vm_groups(self.dir / f'{u.n}.vms')    # a worker that did not stop its VM in time
             for u in waiting + running: self.pool.release(u.req.id)
             self.save_timings()
 
@@ -398,14 +399,19 @@ os.killpg(pg, signal.SIGKILL)   # this helper included
 
 def reap_vm_groups(f: pathlib.Path) -> list[int]:
     """SIGKILL each VM group recorded in `f` (testkit.harness.campaign._record_group: `PID<TAB>PROGRAM` lines) whose
-    leader is still alive, still leads its group and still runs PROGRAM (a reused pid is left alone)."""
+    leader is still alive, still leads its group and still runs PROGRAM (a reused pid is left alone), unless a later
+    `PID<TAB>` line says the harness stopped it."""
     try: lines = f.read_text().splitlines()
     except FileNotFoundError: return []
-    killed = []
-    for line in lines:
+    live = {}
+    for line in lines:                  # a `PID<TAB>` line: the harness stopped that VM itself, so its pid may be reused
         pid, _, prog = line.partition('\t')
+        if prog: live[pid] = prog
+        else: live.pop(pid, None)
+    killed = []
+    for pid, prog in live.items():
         try:
-            if not prog or os.getpgid(int(pid)) != int(pid): continue
+            if os.getpgid(int(pid)) != int(pid): continue
         except (ValueError, ProcessLookupError, PermissionError): continue
         cmd = subprocess.run(['ps', '-o', 'command=', '-p', pid], capture_output=True, text=True).stdout.strip()
         if cmd != prog and not cmd.startswith(prog + ' '): continue

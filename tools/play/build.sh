@@ -1,12 +1,12 @@
 #!/bin/bash
-# build.sh [HOST] [OUTDIR]: build the play initramfs (a minimal Debian trixie that runs from RAM) and fetch its kernel.
-#   HOST    any x86-64 Linux machine reachable by ssh, no root needed (default ubuntu@192.168.12.11); it needs apt-get,
+# build.sh HOST [OUTDIR]: build the play initramfs (a minimal Debian trixie that runs from RAM) and fetch its kernel.
+#   HOST    any x86-64 Linux machine reachable by ssh, no root needed; it needs apt-get,
 #           dpkg, curl, python3, zstd and internet access to snapshot.debian.org. It builds in a temp dir it deletes.
 #   OUTDIR  default ~/Library/Caches/natemu/play; receives bzImage, play.cpio.zst, packages.txt, SHA256SUMS.
 # Reproducible: the kernel is the exact Debian package below, checked against pinned SHA-256s; the rootfs packages come
 # from the snapshot.debian.org archive date SNAP in rootfs.sh. Re-running replaces the outputs.
 set -euo pipefail
-here=$(dirname "$(realpath "$0")"); HOST=${1:-ubuntu@192.168.12.11}; OUT=${2:-$HOME/Library/Caches/natemu/play}
+here=$(dirname "$(realpath "$0")"); HOST=${1:?usage: build.sh USER@X86HOST [OUTDIR]}; OUT=${2:-$HOME/Library/Caches/natemu/play}
 KVER=6.12.107; DEB=linux-image-$KVER+deb13-amd64_$KVER-1_amd64.deb
 DEB_SHA=7794643cf4560de2a7e3b069e8ca8511ad2a568d652ea285f0fe051f79bc9e99     # the .deb
 BZ_SHA=2b2358b37674d2505350528875bb17afae2a36522a9e8a9417eaca65a7da0e08      # its boot/vmlinuz-* (Debian 6.12.107-1)

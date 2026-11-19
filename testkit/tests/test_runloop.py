@@ -192,6 +192,21 @@ def test_reaping_kills_only_recorded_groups_still_running_their_program(tmp_path
             if p.poll() is None: p.kill()
 
 
+def test_a_vm_the_harness_stopped_is_not_reaped_when_its_pid_is_reused(tmp_path):
+    """Review: a pid recorded for a VM the harness stopped itself can come back as another unit's VM of the same
+    program; the harness's `PID<TAB>` line after the stop keeps the reaper away from it."""
+    from testkit import runloop
+    reused = subprocess.Popen(['sleep', '60'], start_new_session=True)
+    f = tmp_path / '0.vms'
+    f.write_text(f'{reused.pid}\tsleep\n{reused.pid}\t\n')
+    try:
+        assert runloop.reap_vm_groups(f) == [] and reused.poll() is None
+        f.write_text(f.read_text() + f'{reused.pid}\tsleep\n')     # booted again under that pid: ours once more
+        assert runloop.reap_vm_groups(f) == [reused.pid]
+    finally:
+        if reused.poll() is None: reused.kill()
+
+
 def test_an_orphaned_worker_gives_its_handlers_time_then_kills_its_group(tmp_path):
     """Review: a worker whose controller died SIGKILLed its group at once, so its campaign handler never stopped the
     natemu it started (its own session). Now the group gets SIGTERM first and SIGKILL only after WORKER_GRACE."""

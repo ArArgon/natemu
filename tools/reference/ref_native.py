@@ -2,13 +2,13 @@
 """Reference results from real x86 hardware: each program's ELF (ref.py's, the same harness QEMU runs) executed natively
 on a Linux x86-64 machine over ssh, written in ref.py's results format so `run_slice1_vm.py` compares natemu with it.
 
-    python3 tools/reference/ref_native.py PROGRAMS.json -o EXPECTED.json [--host ubuntu@192.168.12.11] [--require-flag sha_ni]
+    python3 tools/reference/ref_native.py PROGRAMS.json -o EXPECTED.json [--host USER@X86HOST] [--require-flag sha_ni]
 
 For instructions pinned QEMU 7.2 does not implement (SHA: `gen_sha.py`). Only non-flow programs without fault mode. The
 RFLAGS compare mask comes from the programs' annotations (flags.py), as in ref.py; the disassembly cross-check is QEMU's
 log and is not made. The machine's `uname -a` and CPU model are recorded.
 """
-import argparse, io, json, pathlib, struct, subprocess, sys, tarfile
+import argparse, io, json, os, pathlib, struct, subprocess, sys, tarfile
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ref, flags
@@ -57,12 +57,14 @@ def execute(progs, host=None, rosetta=None, require_flag=None, timeout=600):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('programs', type=pathlib.Path); ap.add_argument('-o', '--output', type=pathlib.Path, required=True)
-    ap.add_argument('--host', default='ubuntu@192.168.12.11')
+    ap.add_argument('--host', default=os.environ.get('NATEMU_X86_HOST'),
+                    help='the x86-64 Linux machine (user@host) to run on over ssh (default: NATEMU_X86_HOST)')
     ap.add_argument('--require-flag', default='sha_ni', help='a /proc/cpuinfo flag the machine must report (default sha_ni; '
                     "'' for none)")
     ap.add_argument('--rosetta', metavar='IMAGE', help='run the ELFs here, in an amd64 Linux container through Rosetta '
                     '(Apple `container`, pinned IMAGE by digest), instead of over ssh')
     a = ap.parse_args()
+    if not a.host and not a.rosetta: ap.error('needs an x86-64 Linux machine: --host USER@HOST or NATEMU_X86_HOST (or --rosetta IMAGE)')
     programs = json.loads(a.programs.read_text())['programs']
     progs = [ref.norm(p) for p in programs]
     ref.require(not any(p['flow'] or p['faults'] is not None or p['prefix'] is not None for p in progs), 'plain programs only')

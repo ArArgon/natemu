@@ -16,7 +16,9 @@ reached or not verified, 3 verified but contended. Appends one JSON line to OUT/
 """
 import json, os, re, signal, subprocess, sys, time
 
-RAW = '/Users/liaozping/orca/natemu-raw'
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
+from raw_root import RAW_ROOT                                       # tools/raw_root.py: NATEMU_RAW_ROOT, else beside the checkout
+RAW = str(RAW_ROOT)
 K = f'{RAW}/kernel-census-20261028-01/dl/linux'                     # Debian 6.12.107 bzImage
 I = os.environ.get('BENCH_INITRD', f'{RAW}/bench-20261105-03/out/bench.cpio')
 QEMU = '/opt/homebrew/bin/qemu-system-x86_64'

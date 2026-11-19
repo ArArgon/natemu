@@ -202,8 +202,9 @@ class Runner:
         with open(log, 'wb') as f:
             r = subprocess.run(argv, cwd=paths.repo_root(), env=live, stdout=f, stderr=subprocess.STDOUT)
         if r.returncode == 0:
-            return (f'--diff: with live QEMU answers the case passes, so natemu matches QEMU and the locked answer is '
-                    f'wrong or stale (reseed it: natemu-test lock); log {log}')
+            return (f'--diff: rerun with live QEMU answers, the case passes. Either the locked answer is stale (natemu and '
+                    f'QEMU agree now; reseed it with natemu-test lock) or natemu fails only sometimes (rerun the case '
+                    f'without --diff to tell); log {log}')
         tail = [l for l in log.read_text(errors='replace').splitlines() if l.strip()][-DIFF_LINES:]
         return f'--diff, rerun with live QEMU answers (exit {r.returncode}; log {log}), what differs:\n' + '\n'.join(tail)
 

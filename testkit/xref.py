@@ -4,7 +4,7 @@ case where their normalized final states differ is reported field by field (GPRs
 RIP, memory bytes, the fault taken), with which side the locked answer agrees with and, with --natemu, natemu's own
 result. A study tool: it changes no lock and decides nothing.
 
-    tools/natemu-test xref tests/programs tests/fp [--suite i8b] [--host ubuntu@192.168.12.10] [--natemu] -o report.json
+    tools/natemu-test xref tests/programs tests/fp [--suite i8b] [--host USER@X86HOST] [--natemu] -o report.json
 """
 import argparse
 import json
@@ -107,10 +107,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('families', nargs='+', type=pathlib.Path)
     ap.add_argument('--suite', action='append', help='only these suites (repeatable)')
-    ap.add_argument('--host', default=os.environ.get('NATEMU_X86_HOST', 'ubuntu@192.168.12.10'))
+    ap.add_argument('--host', default=os.environ.get('NATEMU_X86_HOST'),
+                    help='the x86-64 Linux machine (user@host) that runs the programs natively (default: NATEMU_X86_HOST)')
     ap.add_argument('--natemu', action='store_true', help="also run natemu (accurate and fast FP) on each differing case and say whom it agrees with")
     ap.add_argument('-o', '--output', type=pathlib.Path, required=True)
     a = ap.parse_args(argv)
+    if not a.host: ap.error('needs an x86-64 Linux machine: --host USER@HOST or NATEMU_X86_HOST')
     work = pathlib.Path(tempfile.mkdtemp(prefix='testkit-xref-'))
     report = []
     for d in a.families:

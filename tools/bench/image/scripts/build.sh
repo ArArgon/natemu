@@ -1,5 +1,5 @@
 #!/bin/bash
-# build.sh BENCHDIR: on an x86-64 Linux machine without root (the reference ubuntu@192.168.12.11), fetch the pinned
+# build.sh BENCHDIR: on an x86-64 Linux machine without root (the reference x86 machine), fetch the pinned
 # Debian trixie packages and sources, build the static benchmarks with Debian's gcc 14, make the input, and stage the
 # initramfs (mkroot.sh). Needs apt-get/apt-cache, dpkg, curl, python3, readelf (binutils). The host's own compiler is
 # not used: every binary in the guest is either a Debian package file or built by Debian gcc against Debian libc.a.

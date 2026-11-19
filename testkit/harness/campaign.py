@@ -124,7 +124,7 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
                     how = f'stopped {AFTER_END:.0f} s after CT-END'; break
                 time.sleep(POLL)
         finally:
-            _stop(p); _LIVE.discard(p)
+            _stop(p); _LIVE.discard(p); _record_group(p, '')     # stopped: its pid may be reused
     took = time.monotonic() - t0
     text = _read(serial)
     note = f'{how or f"natemu exited with status {p.returncode}"} after {took:.0f} s'

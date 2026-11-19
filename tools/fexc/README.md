@@ -400,7 +400,7 @@ boot ran against). Record at N = 1 so the stream is one boot's single sequence.
 
 Record (one VM at a time, under the VM lock; `NATEMU_RAW_ROOT` set in a worktree):
 
-    export NATEMU_RAW_ROOT=/Users/liaozping/orca/natemu-raw
+    export NATEMU_RAW_ROOT=/path/to/natemu-raw
     RAW=$NATEMU_RAW_ROOT; K=$RAW/kernel-census-20261028-01/dl; D=$RAW/DATED-DIR; mkdir -p $D
     # installer boot (the Debian installer to "Select a language"):
     NATEMU_FEXC_RECORD=$D/installer.stream /usr/bin/lockf -k $RAW/.vm.lock python3 tools/bench/boot.py --out $D/rec --name installer \

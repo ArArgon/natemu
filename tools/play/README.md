@@ -19,7 +19,7 @@ virtio_blk, virtio-rng and ext4 modules (and their dependencies), and `/init` lo
 ## Build
 
 ```sh
-tools/play/build.sh [HOST] [OUTDIR]     # defaults: ubuntu@192.168.12.11, ~/Library/Caches/natemu/play
+tools/play/build.sh HOST [OUTDIR]       # HOST: user@ an x86-64 Linux machine; OUTDIR default ~/Library/Caches/natemu/play
 ```
 
 HOST is any x86-64 Linux machine reachable by ssh (no root; needs apt-get, dpkg, curl, python3, zstd, and kmod's
