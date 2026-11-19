@@ -50,7 +50,11 @@ def prepare(items, pool, config, record: dict | None = None) -> dict:
             except cache.Miss: missing.append(r)
     if not missing: return failed
     # Something must be built or fetched: that takes a shared CPU claim, never inside an exclusive window (R14.4).
-    req = Request(id=f"{run_id}:{uuid.uuid4().hex}", owner_pid=os.getpid(), cores=min(4, pool.cfg.p_cores), label="prepare",
+    from testkit import artifacts
+    # Container builds run on the x86 machine when one is configured: then a preparation mostly waits on it and copies,
+    # so it claims one core here instead of four that would sit idle (other runs' work fits meanwhile).
+    cores = 1 if artifacts.container_builder() != 'local' else min(4, pool.cfg.p_cores)
+    req = Request(id=f"{run_id}:{uuid.uuid4().hex}", owner_pid=os.getpid(), cores=cores, label="prepare",
                   worktree=str(config.rootpath.name), run=run_id)
     pool.submit(req)
     asked = time.time()

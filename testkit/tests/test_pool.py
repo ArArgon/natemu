@@ -147,3 +147,29 @@ def test_a_grant_blocked_on_the_old_lock_goes_back_to_the_queue(tmp_path, monkey
     st = pool.snapshot()
     assert not st.held and [r.id for r in st.waiting] == ['x'] and st.waiting[0].asked == 1.0
     fcntl.flock(holder, fcntl.LOCK_UN); os.close(holder)
+
+
+def test_preparation_claims_one_core_when_builds_run_on_the_x86_machine(monkeypatch, tmp_path):
+    """With [build] builder = "ssh:..." the container builds run remotely: a preparation holding four local cores left
+    other runs' preparations and units waiting for cores nothing used."""
+    from types import SimpleNamespace
+    from testkit import artifacts, cache, prepare
+    from testkit.harness import Requirement
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'cache'))
+    pool = Pool(tmp_path, CFG)
+    seen = []
+    real_submit = pool.submit
+    pool.submit = lambda r: (seen.append(r.cores), real_submit(r))
+    class H:
+        def requirements(self, fam, suite, variant): return [Requirement('artifact', 'x')]
+        def resolve(self, req):
+            if cache._peeking: raise cache.Miss()
+            return []
+    item = SimpleNamespace(harness=H(), fam=None, suite=None, variant=None, nodeid='n')
+    config = SimpleNamespace(pluginmanager=SimpleNamespace(get_plugin=lambda n: None), rootpath=tmp_path)
+    monkeypatch.setattr('testkit.runloop.run_dir', lambda c: tmp_path / 'run')
+    for builder, want in (('ssh:u@x86', 1), ('local', min(4, CFG.p_cores))):
+        monkeypatch.setenv('NATEMU_CONTAINER_BUILDER', builder)
+        seen.clear()
+        prepare.prepare([item], pool, config)
+        assert seen == [want], (builder, seen)
