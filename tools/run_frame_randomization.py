@@ -151,7 +151,8 @@ def table_program(block):
             + 'lea rdx, [rip + kt2]\nlea rdi, [rip + ut2]\njmp rdx\nkt2: nop\nsw3b: nop\nlea rax, [rip + ut2]\njmp rax\nut2: nop\n'
             + scan(4, 'r8', 'r9') + 'sw0b: nop\n' + scan(5, 'r10', 'r11'))
     code, labels = strict.ref.assemble(body, labels=True)
-    return '\n'.join([f'body {strict.CODE:#x} {code.hex()}', 'cpu', f'rip {strict.CODE:#x}', 'cpl 0', 'rflags 0x202', 'sse 1',
+    return '\n'.join([f'body {strict.CODE:#x} {code.hex()}', f'memory {strict.DATA:#x} {bytes(0x2000).hex()}', 'cpu',
+                      f'rip {strict.CODE:#x}', 'cpl 0', 'rflags 0x202', 'sse 1',
                       *[f'switch {strict.CODE + labels[n]:#x} {c}' for n, c in (('sw3', 3), ('sw0', 0), ('sw3b', 3), ('sw0b', 0))],
                       'gpr ' + ' '.join(['0x0'] * 4 + [hex(strict.DATA + 0x1f00)] + ['0x0'] * 11)]) + '\n'
 
