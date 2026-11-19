@@ -1138,6 +1138,11 @@ constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBr
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
 // segment and data registers are copied from the linked access by fexc; the caller sets the address). Returns its label.
+void Arm64JITCore::FexcCarryJump(IR::OrderedNodeWrapper Target) {
+  auto& C = FexcCarried[IR->GetOp<IR::IROp_CodeBlock>(Target)->ID];
+  C.Mask = C.Seen ? C.Mask & FexcAlignedMask : FexcAlignedMask;
+  C.Seen = true;
+}
 ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   FexcSiteInfo S {};
   S.kind = Kind;
@@ -1180,6 +1185,13 @@ void Arm64JITCore::FexcCheckTarget(IR::Ref Node) {
 
 void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   using IR::IROps;
+  if (fexc_push_run) {   // the aligned registers each jump carries to its target block (JIT.cpp FexcCarried)
+    if (IROp->Op == IROps::OP_JUMP) FexcCarryJump(IROp->C<IR::IROp_Jump>()->TargetBlock);
+    if (IROp->Op == IROps::OP_CONDJUMP) {
+      FexcCarryJump(IROp->C<IR::IROp_CondJump>()->TrueBlock);
+      FexcCarryJump(IROp->C<IR::IROp_CondJump>()->FalseBlock);
+    }
+  }
   if (FexcQuietOp(IROp)) {
     mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
     const bool Scalar = FexcApproxScalar(IROp), Recp = FexcApproxRecp(IROp);   // the SDM's fixed results (above FexcApproxScalar)

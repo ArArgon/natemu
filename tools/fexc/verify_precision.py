@@ -327,6 +327,45 @@ def guards(d, dis, order):
             return t - 4
         return None
 
+    def stack_check(x):
+        t = check_at.get(x['native_offset'])
+        B = x['base_reg']
+        return t if t is not None and x['imm'] == 0 and dis.get(t) == f'cbnz x0, {x["native_offset"]:#x}' and \
+            dis.get(t - 4) == f'and x0, x{B}, #0x7' else None
+    # --push-run: the registers known 8-byte aligned before each word (admission's Verifier::aligned): the entry has none; a
+    # stack check's fall-through adds its base; writebacks of 8n keep a base; add/sub #8n and mov copy it; other writes clear;
+    # branch targets meet their sources; svc clears all; a back edge clears what its loop writes.
+    aligned_at = {}
+    est = {tx: x['base_reg'] for x in stubs.values() if x['kind'] == 'stack' for tx in [stack_check(x)] if tx is not None}
+    pend, mm, dead = {}, 0, False
+    for o in order:
+        if o in pend: mm = pend.pop(o) if dead else mm & pend.pop(o)
+        elif dead: mm = 0
+        dead = False
+        aligned_at[o] = mm
+        tx = dis[o]
+        bit = lambda r: 1 << r if r < 31 else 0
+        nxt = mm
+        for k, r in writes(tx):
+            if k == 'x': nxt &= ~bit(r)
+        if tx.startswith('svc'): nxt = 0
+        if (ww := re.search(r'\[x(\d+)(?:, #(-?(?:0x)?[0-9a-f]+))?\]!$', tx)) or (ww := re.search(r'\[x(\d+)\], #(-?(?:0x)?[0-9a-f]+)$', tx)):
+            R, dd = int(ww[1]), int(ww[2] or '0', 0)
+            loads_base = tx.startswith('ld') and re.match(rf'ld\w* (?:x{R}|[wx]\d+, x{R}),', tx)
+            if mm >> R & 1 and dd % 8 == 0 and not loads_base: nxt |= bit(R)
+            elif mm >> R & 1: nxt &= ~bit(R)
+        if (aa := re.fullmatch(r'(?:add|sub)s? x(\d+), x(\d+), #((?:0x)?[0-9a-f]+)(, lsl #12)?', tx)) and mm >> int(aa[2]) & 1 and (aa[4] or int(aa[3], 0) % 8 == 0):
+            nxt |= bit(int(aa[1]))
+        if (aa := re.fullmatch(r'mov x(\d+), x(\d+)', tx)) and mm >> int(aa[2]) & 1:
+            nxt |= bit(int(aa[1]))
+        if o in est: nxt |= bit(est[o])
+        if (br := BRANCH.match(tx)):
+            T = int(br[4], 16)
+            if T > o: pend[T] = pend[T] & mm if T in pend else mm
+            else: nxt &= ~sum(bit(r) for q in order if T <= q < o for k, r in writes(dis[q]) if k == 'x')
+            dead = br[1] == 'b'
+        if tx.startswith('udf') or tx.startswith('brk') or tx == 'svc #0x1' or re.fullmatch(r'b 0x[0-9a-f]+', tx): dead = True
+        mm = nxt & ~3 & ~(1 << 31)
     for s in sorted(by_off.values(), key=lambda s: s['native_offset']):
         at, lo = s['native_offset'], s['insn_native_offset']
         tag = f'site +{at} ({s["kind"]}, guest +{s["guest_offset"]})'
@@ -384,26 +423,22 @@ def guards(d, dis, order):
         # dominates and every word since writes S only by a writeback of a multiple of 8.
         st = [x for x in mine if x['kind'] == 'stack']
         S = s['base_reg']
-        push8 = s['kind'] == 'push' and s['width'] == 8 and re.fullmatch(rf'str x\d+, \[x{S}, #-0x8\]!', dis.get(at, ''))
-        if pure and push8 and not sp:
-            def stack_check(x):
-                t = check_at.get(x['native_offset'])
-                return t if t is not None and t < at and x['base_reg'] == S and x['imm'] == 0 and \
-                    dis.get(t) == f'cbnz x0, {x["native_offset"]:#x}' and dis.get(t - 4) == f'and x0, x{S}, #0x7' else None
+        # (--push-run: a store of 2/4/8 bytes at an aligned base + k*width, no index, may have the stack alignment check
+        # `and x0, xB, #0x7; cbnz x0, stub` (then only x0/x1 written) or none while B is known aligned there (aligned_at).)
+        natural = pure and not sp and ix is None and s['width'] in (2, 4, 8) and s['imm'] % s['width'] == 0 and \
+            s['kind'] in ('store', 'push') and not re.match(r'st[np]', dis.get(at, ''))
+        if natural:
             if len(st) > 1:
                 out.append(f'{tag}: {len(st)} stack alignment stubs')
             elif st:
                 t = stack_check(st[0])
-                if t is None or t - 4 < lo or any(writes(dis[o]) - {('x', 0), ('x', 1)} or check_sites.native_access(dis[o]) for o in order if t < o < at):
-                    out.append(f'{tag}: stack stub +{st[0]["native_offset"]} is not `and x0, xS, #0x7; cbnz x0` then only x0/x1 written')
+                if t is None or t - 4 < lo or st[0]['base_reg'] != b or \
+                        any(writes(dis[o]) - {('x', 0), ('x', 1)} or check_sites.native_access(dis[o]) for o in order if t < o < at):
+                    out.append(f'{tag}: stack stub +{st[0]["native_offset"]} is not `and x0, xB, #0x7; cbnz x0` then only x0/x1 written')
                 else:
                     ok.add(t)
-            else:
-                prev = [t for t in (stack_check(x) for x in stubs.values() if x['kind'] == 'stack') if t is not None]
-                aligned = re.compile(rf'(?:str|ldr) x\d+, \[x{S}(?:, #-0x8\]!|\], #0x8)')
-                if not prev or any(('x', S) in writes(dis[o]) and not (aligned.fullmatch(dis[o]) and not dis[o].startswith(f'ldr x{S},'))
-                                   for o in order if max(prev) < o < at):
-                    out.append(f'{tag}: push with neither a split check nor a stack alignment check that covers it')
+            elif not (aligned_at.get(at, 0) >> b & 1):
+                out.append(f'{tag}: store with neither a split check nor a stack alignment check covering its base')
         # P8 split check
         elif pure:
             if len(sp) != 1:
