@@ -74,7 +74,11 @@ class CaseItem(pytest.Item):
 
     def repr_failure(self, excinfo):
         if isinstance(excinfo.value, CaseFailure): return str(excinfo.value)
-        return super().repr_failure(excinfo)
+        # pytest's own repr lists each frame's arguments; under subprocess.run(..., env=...) that is the environment
+        # (tokens), so a harness error is shown without them, and without locals even under --showlocals
+        style = self.config.getoption('tbstyle', 'auto')
+        return excinfo.getrepr(funcargs=False, showlocals=False, style='long' if style == 'auto' else style,
+                               tbfilter=True)
 
     def reportinfo(self):
         return self.path, 0, self.name

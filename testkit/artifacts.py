@@ -49,7 +49,15 @@ class Natemu:
 
 
 def _run(cmd, **kw):
-    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    """A build step. A tool that cannot be started, a timeout and a failure are all BuildFailures naming the command,
+    raised `from None`: the OSError's or TimeoutExpired's traceback would list subprocess's arguments, the environment
+    (tokens) among them."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    except OSError as e:
+        raise BuildFailure(' '.join(map(str, cmd[:6])), f'could not start: {e.strerror or e}') from None
+    except subprocess.TimeoutExpired as e:
+        raise BuildFailure(' '.join(map(str, cmd[:6])), f'timed out after {e.timeout:g} s') from None
     if r.returncode != 0:
         raise BuildFailure(' '.join(map(str, cmd[:6])), (r.stderr or r.stdout)[-1500:])
     return r

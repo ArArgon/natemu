@@ -43,6 +43,11 @@ def prepare(items, pool, config, record: dict | None = None) -> dict:
             for it in its: failed[it.nodeid] = ('unpreparable', str(e))
         except BuildFailure as e:
             for it in its: failed[it.nodeid] = ('build-failure', str(e))
+        except cache.Miss:
+            raise
+        except Exception as e:      # anything else (a tool missing, a subprocess error) fails this requirement only,
+            # by its message alone: a traceback would list each frame's arguments, the build's environment among them
+            for it in its: failed[it.nodeid] = ('build-failure', f'{r.kind} {r.name}: {type(e).__name__}: {e}')
         rec['reqs'].append({'kind': r.kind, 'name': str(r.name), 's': time.time() - t0, 'built': built, 'ok': ok})
 
     # First pass, no claim: everything already in the cache is only looked up (and leased).

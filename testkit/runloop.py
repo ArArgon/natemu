@@ -247,8 +247,11 @@ class Controller:
         if grant.core_class == 'E': cmd = ['taskpolicy', '-c', 'background'] + cmd
         env = dict(os.environ, **u.env, TESTKIT_CONTROLLER_PID=str(os.getpid()), TESTKIT_CORE_CLASS=grant.core_class)
         log = open(self.dir / f'{u.n}.log', 'wb')
-        u.proc = subprocess.Popen(cmd, cwd=self.config.rootpath, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                  start_new_session=True)
+        try:
+            u.proc = subprocess.Popen(cmd, cwd=self.config.rootpath, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                      start_new_session=True)
+        except OSError as e:        # from None: Popen's frames in the traceback would show the environment
+            raise RuntimeError(f'could not start a worker for {u.req.label}: {e}') from None
         u.started = time.time()
         return True
 

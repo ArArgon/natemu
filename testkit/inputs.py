@@ -175,8 +175,12 @@ def _in_docker_over_ssh(host: str, cname: str, recipe: pathlib.Path, work: pathl
         for local, there in ((recipe, 'recipe'), (work, 'work')):
             # COPYFILE_DISABLE: macOS tar would add an AppleDouble `._NAME` file for every file with extended attributes;
             # they come back as plain files that the Mac's tar then fails to unpack ("./._.: Truncated tar archive")
-            tar = subprocess.run(['tar', '-C', str(local), '-cf', '-', '.'], capture_output=True, check=True,
-                                 env={**os.environ, 'COPYFILE_DISABLE': '1'}).stdout
+            try:            # a failure is a BuildFailure from None: its traceback would show the environment
+                tar = subprocess.run(['tar', '-C', str(local), '-cf', '-', '.'], capture_output=True, check=True,
+                                     env={**os.environ, 'COPYFILE_DISABLE': '1'}).stdout
+            except (OSError, subprocess.CalledProcessError) as e:
+                err = e.stderr.decode(errors='replace')[-800:] if isinstance(e, subprocess.CalledProcessError) else str(e)
+                raise BuildFailure(cname, f'packing {local} failed: {err}') from None
             p = subprocess.run(['ssh', *SSH, host, f'mkdir -p {d}/{there} && tar -C {d}/{there} -xf -'], input=tar, capture_output=True)
             if p.returncode: raise BuildFailure(cname, p.stderr.decode(errors='replace')[-800:])
         run = (f'{_slot_wait()}docker run --rm --name {cname} --platform linux/amd64 --cpus 8 --memory {memory} '

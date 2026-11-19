@@ -109,3 +109,59 @@ def test_natemu_at_builds_from_the_archive(tmp_path, monkeypatch):
     assert sorted(pathlib.Path(s).name for s in signed) == ['natemu', 'natemu-host']
     assert not any((tmp_path / 'cache' / 'build-tmp').glob('natemu-at-*'))
     assert artifacts.natemu_at(b) == n            # pinned for the run: the same build without rebuilding
+
+
+SECRET = 's3cr3t-token-value'
+
+
+def test_a_missing_build_tool_is_a_build_failure_without_the_environment(tmp_path):
+    """Review: an OSError (tool missing) or a timeout escaped _run(cmd, env=...) and preparation as a pytest
+    INTERNALERROR, whose traceback lists each frame's arguments: the environment, tokens included."""
+    from testkit.prepare import BuildFailure
+    env = dict(__import__('os').environ, TESTKIT_SECRET=SECRET)
+    with pytest.raises(BuildFailure) as e:
+        artifacts._run([str(tmp_path / 'no-such-tool'), 'build'], env=env)
+    assert 'no-such-tool' in str(e.value) and SECRET not in str(e.value)
+    assert e.value.__suppress_context__ and e.value.__cause__ is None
+    with pytest.raises(BuildFailure) as e:
+        artifacts._run(['sleep', '5'], env=env, timeout=0.2)
+    assert 'sleep' in str(e.value) and 'timed out' in str(e.value) and SECRET not in str(e.value)
+
+
+def test_preparation_turns_any_error_into_a_build_failure(monkeypatch, tmp_path):
+    import os, subprocess
+    from types import SimpleNamespace
+    from testkit import prepare
+    from testkit.harness import Requirement
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'cache'))
+
+    class H:
+        def requirements(self, fam, suite, variant): return [Requirement('artifact', 'x')]
+        def resolve(self, req):
+            subprocess.run(['true'], env=dict(os.environ, TESTKIT_SECRET=SECRET), check=True, cwd=tmp_path / 'missing')
+    item = SimpleNamespace(harness=H(), fam=None, suite=None, variant=None, nodeid='n')
+    config = SimpleNamespace(pluginmanager=SimpleNamespace(get_plugin=lambda n: None), rootpath=tmp_path)
+    monkeypatch.setattr('testkit.runloop.run_dir', lambda c: tmp_path / 'run')
+    failed = prepare.prepare([item], SimpleNamespace(), config)
+    cat, why = failed['n']
+    assert cat == 'build-failure' and 'FileNotFoundError' in why and SECRET not in why, why
+
+
+def test_a_harness_error_is_reported_without_frame_arguments(pytester):
+    """A harness exception raised under a frame that holds the environment (subprocess.run(..., env=...)) is reported
+    without each frame's arguments, so the environment stays out of the report and the JUnit file. (The secret comes
+    first: a frame argument's repr is cut in the middle.)"""
+    d = pytester.path / 'tests' / 'leak'; d.mkdir(parents=True)
+    (d / 'family.toml').write_text('[family]\nname = "leak"\n[[suite]]\nname = "s"\nkind = "judged"\n'
+                                   'harness = "harness.py:H"\n')
+    (d / 'harness.py').write_text(
+        'import os, subprocess\n'
+        'class H:\n'
+        '    def cases(self, fam, suite): return ["c"]\n'
+        '    def run(self, batch, config):\n'
+        f'        subprocess.run(["/no/such/tool"], env={{"TESTKIT_SECRET": "{SECRET[:4]}" + "{SECRET[4:]}", **os.environ}})\n')
+    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', f'--junitxml={pytester.path / "j.xml"}',
+                                      'tests')
+    out = r.stdout.str() + r.stderr.str()
+    assert r.ret == 1 and 'FileNotFoundError' in out, out
+    assert SECRET not in out and SECRET not in (pytester.path / 'j.xml').read_text()
