@@ -1841,8 +1841,8 @@ impl<'a> Verifier<'a> {
                     "exit at {at:#x}: literal {target:#x} is neither the block end nor its branch target"
                 ));
             }
-            // An exit a branch inside the unit reaches (a conditional's taken exit) is that guest instruction's own target:
-            // only the unit's last instruction may use the whole set (end, own RIP, ...).
+            // An exit a branch inside the unit reaches (a conditional's taken exit) is that guest instruction's own target (or its
+            // own RIP, a retry): only the unit's last instruction may use the whole set (end, ...).
             let last = (self.c.pcs.iter().map(|p| p.guest_offset))
                 .filter(|&g| g < self.c.guest_bytes)
                 .max();
@@ -1852,7 +1852,8 @@ impl<'a> Verifier<'a> {
                 };
                 let insn = self.guest_insn(g);
                 let end = self.c.rip.wrapping_add(g as u64 + insn.len() as u64);
-                if Some(g) != last && super::branch_target(insn, end) != Some(target) {
+                let own = self.c.rip.wrapping_add(g as u64); // (CLI, STI, SWAPGS, VERW: a retry exit to their own RIP, proven by `targets`)
+                if Some(g) != last && target != own && super::branch_target(insn, end) != Some(target) {
                     return Err(format!(
                         "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it"
                     ));
