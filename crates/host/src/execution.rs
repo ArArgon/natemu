@@ -6618,7 +6618,9 @@ mod tests {
                     let (cf, ca) = (compiler(f), compiler(a));
                     assert_ne!(cf.body_with(&[0x90], "0x1000".into(), None), ca.body_with(&[0x90], "0x1000".into(), None));
                     assert_ne!(cf.gating(), ca.gating());
-                    assert_eq!(ca.gating()[GATING - 1..], [1]);
+                    // The accurate-mode flag is the gating argument before the last (`--push-run`).
+                    assert_eq!(ca.gating()[GATING - 2], 1);
+                    assert_eq!(cf.gating()[GATING - 2], 0);
                 }
                 // The pool's key and the publication tag hash the whole 64-bit word.
                 let key = |c: &Cpu| natemu_abi::pool::Key::new(c.code_context(), 0x1000, &[0x90], 1);
