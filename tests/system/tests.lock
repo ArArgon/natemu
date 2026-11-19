@@ -1631,18 +1631,6 @@ repro = "65d2c1f56d65 image_sha256=1b66e0a74691a7fad7d24824f9618f177562f39ea5850
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers."86d3b64ba5e7b1ba5e90c522bf42c25fe554b61ca15b4cbad92d6cd40d4b2199#dump-bytes"]
-aux = "{\"value\":0}"
-repro = "03f9ba3bec8c image_sha256=441d987baffe7764e0efbcc27bf57d9749b56bdf1e097baa00f008d1d0ee2b46"
-sha256 = "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
-value = "0"
-
-[answers."86d3b64ba5e7b1ba5e90c522bf42c25fe554b61ca15b4cbad92d6cd40d4b2199#exit"]
-aux = "{\"rc\":0}"
-repro = "dfdb36aa9df9 image_sha256=441d987baffe7764e0efbcc27bf57d9749b56bdf1e097baa00f008d1d0ee2b46"
-sha256 = "c22995adc29757a99bc9242926a5d5b5a8007ecc78f30943161cf072af42d9d2"
-value = "exit 0"
-
 [answers.883a101164754db796b9558c54d3567f1d0f41041513f1df2244f41bdcc921b4]
 aux = "{\"ncpu\":3}"
 repro = "e576bf159516 image_sha256=1f45e71e119ffcf54b0211e9d3cd25079fefa0eda68d86cf922c27ef4b885e31"
@@ -1908,23 +1896,6 @@ repro = "dfdb36aa9df9 image_sha256=4fbe3144c99117782b98e0a665a03490eae330d68f450
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers."9cb4432c06039e7df71cfa86e9abdb8cfef5a98f892726f76cf154c7b539c93c#exit"]
-aux = "{\"rc\":1}"
-repro = "29597a311c3e image_sha256=ba381291dca4de5751e8f24cd56c1e38b571f51d3593b2138dd68517e2bb4087"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."9cb4432c06039e7df71cfa86e9abdb8cfef5a98f892726f76cf154c7b539c93c#model"]
-aux = "{\"value\":[]}"
-repro = "6edfb100c719 image_sha256=ba381291dca4de5751e8f24cd56c1e38b571f51d3593b2138dd68517e2bb4087"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
-[answers."9cb4432c06039e7df71cfa86e9abdb8cfef5a98f892726f76cf154c7b539c93c/slots/"]
-repro = "917ef4194184 image_sha256=ba381291dca4de5751e8f24cd56c1e38b571f51d3593b2138dd68517e2bb4087"
-sha256 = "0982fd5c8cb2f88b75821ba52bc62b8fca54a3ec7bafe7358d72872fe7311455"
-value = "[1,1313,65535,0,0,1,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"
-
 [answers.9e4c72e04b8f5d0097c595672c550d469290bb864c4bba3edf361e6ddd91076d]
 aux = "{\"ncpu\":3}"
 repro = "e576bf159516 image_sha256=c6e5ae64a83cbc134ec24945f1943a19b25ce54d48480a9ff1a48653cafc9ca9"
@@ -2072,23 +2043,6 @@ repro = "dfdb36aa9df9 image_sha256=c645bc52e8bb99409772769343a32d181550ef274ffb4
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
 
-[answers."a7bfa183051157412d81483c0653a67c1785498b09a5085a6035569bd241a3d3#exit"]
-aux = "{\"rc\":1}"
-repro = "29597a311c3e image_sha256=fa12726246acfe6ccbc9eb84160dee0f9935600da02dff28644e76e9df478fa9"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."a7bfa183051157412d81483c0653a67c1785498b09a5085a6035569bd241a3d3#model"]
-aux = "{\"value\":[]}"
-repro = "6edfb100c719 image_sha256=fa12726246acfe6ccbc9eb84160dee0f9935600da02dff28644e76e9df478fa9"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
-[answers."a7bfa183051157412d81483c0653a67c1785498b09a5085a6035569bd241a3d3/slots/"]
-repro = "917ef4194184 image_sha256=fa12726246acfe6ccbc9eb84160dee0f9935600da02dff28644e76e9df478fa9"
-sha256 = "6b6b7ab657f9a5f46984b1fa1467c0822d2131815592b70ae5a45d8ad7487770"
-value = "[48,48,1,182,52,1,1,1,52,0,16,3,0,1,1,1,1,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"
-
 [answers.a7f876a7bca92b20b5501fd81c9ea1cda1ed1a38f524b259e779eb66cb55af5d]
 aux = "{\"ncpu\":2}"
 repro = "e80825087ff0 image_sha256=e713f5e31e916dd6cadebba14dcde5df2fb2231e3677efbc387f0916228947b8"
@@ -2115,23 +2069,6 @@ value = "exit 1"
 aux = "{\"ncpu\":1}"
 repro = "4d2e079b2949 image_sha256=574c280bf0b9eff03cde4e680f146722bb499147e826bb06e2ebfb32f903afa3"
 sha256 = "d217d94456affef8fb9cf6b5333949bebf20f5599b4b3a5e1bc43ae6608b64bc"
-
-[answers."ab791183c24cde94dc68fae24041909d7799bfd3273e29814219ab0f9744f46b#exit"]
-aux = "{\"rc\":1}"
-repro = "29597a311c3e image_sha256=2cba00e5f5a30bbded6a68da8742eee35687c97feae6d13d1313e2adc7da047e"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."ab791183c24cde94dc68fae24041909d7799bfd3273e29814219ab0f9744f46b#model"]
-aux = "{\"value\":[]}"
-repro = "6edfb100c719 image_sha256=2cba00e5f5a30bbded6a68da8742eee35687c97feae6d13d1313e2adc7da047e"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
-[answers."ab791183c24cde94dc68fae24041909d7799bfd3273e29814219ab0f9744f46b/slots/"]
-repro = "917ef4194184 image_sha256=2cba00e5f5a30bbded6a68da8742eee35687c97feae6d13d1313e2adc7da047e"
-sha256 = "32d97558fe57d62cacbb2a07349109c1b5c7deb17d16b1514e6eef35c9536c5e"
-value = "[255,128,38,2,0,88,89,35,49,18,153,25,0,0,1,1,0,32,7,1,0,129,30,13,19,50,90,16,192,2,144,1,176,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"
 
 [answers."ac221a821a613d5dd2338cde3b80351461ae4e3157271c71a12e4c34094e5e18#exit"]
 aux = "{\"rc\":1}"
@@ -2232,23 +2169,6 @@ aux = "{\"rc\":1}"
 repro = "8b032f987b23 image_sha256=6371c61f8d5839391624ea919829cbb31503cf337fa6cb040e21febb6bb12512"
 sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
 value = "exit 1"
-
-[answers."b49b75ac4091687d827ce34b29f6ff397510395579b9cb1df085c96521d1beea#exit"]
-aux = "{\"rc\":1}"
-repro = "29597a311c3e image_sha256=0abc4cfa72b24ee5a8ca6f832524fa02f7b646496203a25a6ddc79f2e8f7af90"
-sha256 = "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824"
-value = "exit 1"
-
-[answers."b49b75ac4091687d827ce34b29f6ff397510395579b9cb1df085c96521d1beea#model"]
-aux = "{\"value\":[]}"
-repro = "6edfb100c719 image_sha256=0abc4cfa72b24ee5a8ca6f832524fa02f7b646496203a25a6ddc79f2e8f7af90"
-sha256 = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-value = "[]"
-
-[answers."b49b75ac4091687d827ce34b29f6ff397510395579b9cb1df085c96521d1beea/slots/9"]
-repro = "a84e648cea31 image_sha256=0abc4cfa72b24ee5a8ca6f832524fa02f7b646496203a25a6ddc79f2e8f7af90"
-sha256 = "ed2127e2e890184cf669bf3c37e95c2006d778e86f72094b52df3cadd32acfed"
-value = "[56,1,56,50,1,58,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"
 
 [answers.b514a3dc5389d366b80d5cbb07e08300f076547b3f3e838421e9bbb627934f14]
 aux = "{\"ncpu\":2}"
@@ -3188,38 +3108,6 @@ aux = "{\"ncpu\":1}"
 repro = "4be5ec924d3a image_sha256=c74b23b8a6b53071b4158b154a4e93b40ccc509acdcc638aba67bc306d3c0931"
 sha256 = "84d868fffe1e1989591c42f50175d258e7e141633cd8a7dfdcd5d9ab9eeda68f"
 
-[repro.03f9ba3bec8c]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-serial",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-]
-derived = [
-    "dump-bytes",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"
-
 [repro.118d137a1772]
 args = [
     "-accel",
@@ -3633,38 +3521,6 @@ derived = [
 pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
 
-[repro.6edfb100c719]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-    "-serial",
-    "file:PATH",
-]
-derived = [
-    "model",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"
-
 [repro.75c8b80d33fe]
 args = [
     "-accel",
@@ -3919,38 +3775,6 @@ view = [
     "masked/5126+18,5162+6,5178+6,5194+6,5210+6,5226+6,5242+6,5258+6,5274+6,5152+10",
 ]
 
-[repro.917ef4194184]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-    "-serial",
-    "file:PATH",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"
-view = [
-    "slots/",
-]
-
 [repro.a55c8d3d86c1]
 args = [
     "-accel",
@@ -4008,38 +3832,6 @@ args = [
 ]
 pin = "qemu-system 11.1.2 src"
 supplier = "qemu-system"
-
-[repro.a84e648cea31]
-args = [
-    "-accel",
-    "tcg,thread=multi",
-    "-cpu",
-    "max,-pcid,-smap",
-    "-smp",
-    "1",
-    "-m",
-    "64",
-    "-machine",
-    "pc",
-    "-nographic",
-    "-nodefaults",
-    "-monitor",
-    "none",
-    "-device",
-    "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-no-reboot",
-    "-debugcon",
-    "file:PATH",
-    "-kernel",
-    "IMG",
-    "-serial",
-    "file:PATH",
-]
-pin = "qemu-system 11.1.2 src"
-supplier = "qemu-system"
-view = [
-    "slots/9",
-]
 
 [repro.b64a4c0a94c2]
 args = [
