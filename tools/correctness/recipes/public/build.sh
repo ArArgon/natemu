@@ -101,7 +101,7 @@ rm -rf "$W/qemu"; mkdir "$W/qemu"
 tar xf "$W"/src/qemu_*.orig.tar.* -C "$W/qemu" --strip-components=1 --wildcards '*/tests/tcg/*'
 o=$P/opt/public/qemu; mkdir -p "$o"
 for t in cmpxchg adox noexec test-1648 test-2175 test-2413 fma cross-modifying-code; do
-    f=$(ls "$W/qemu/tests/tcg/x86_64/$t.c" "$W/qemu/tests/tcg/i386/$t.c" 2>/dev/null | head -1)
+    f=$(ls "$W/qemu/tests/tcg/x86_64/$t.c" "$W/qemu/tests/tcg/i386/$t.c" 2>/dev/null | head -1 || true)
     [ -n "$f" ] || { echo "qemu tests/tcg has no $t.c" >&2; exit 1; }
     echo "$f" >> "$W/log/qemu-tests.log"
     # tests/tcg/Makefile.target's flags (-Wall -O0 -g -fno-strict-aliasing, static), without -Werror (another gcc)
