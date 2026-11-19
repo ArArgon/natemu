@@ -1,0 +1,6 @@
+# Known natemu bugs these tests catch (testkit/known_bugs.py): reported as `known-bug`, never a gate failure.
+# Recorded in docs/research/notes/2026-11-test-migration-findings.md ("natemu: suspected bugs", `r1a`).
+
+[bug.r1-serial-intermittent]
+note = "r1a r1-serial: the serial program's TSC-masked answer now and then differs from the locked one (run 20261119-040602-88e4, the gate; run 20261119-045238-dc5d, alone on the idle M2, 1 of 17 runs); the other r1 programs and the other repetitions pass (docs/research/notes/2026-11-test-migration-findings.md, r1a)"
+cases = ["system/r1a::r1-serial*"]

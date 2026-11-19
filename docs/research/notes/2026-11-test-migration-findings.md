@@ -37,6 +37,11 @@ so in its claims; whether either also hides a missing natemu path is open.
   for the abandoned worker to retire, in the gate of run 20261119-031719-c15f (M2 Max, 4.2 units at once). The suite
   passed alone twice right after (786 passed) and in the three gates before. Known bug
   `block-abandoned-worker-retire-timeout` (tests/unit/known-bugs.toml).
+- `r1a`, program `r1-serial`: its TSC-masked answer differed from the locked one in the gate of run
+  20261119-040602-88e4 (repetition 2 at block size None, and at max-block 1) and once in 17 runs of r1a alone on the
+  idle M2 Max (run 20261119-045238-dc5d, block size None); every other r1 program and repetition passed. r1a runs in an
+  exclusive window, so other VMs do not explain it. What differs is not known: the lock keeps only the hash, and
+  `--diff` reseeds only programs-harness cases. Known bug `r1-serial-intermittent` (tests/system/known-bugs.toml).
 - `l4b`, case `cases/frozen` (a 100 µs PIT/IRR window over 20,000 trials): "reached rbx=1, want 0" on both attempts of
   one seeding run with all 8 performance cores busy; passed in the other seeding run and in the locked run.
 
