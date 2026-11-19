@@ -50,6 +50,15 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
 6. public: the case's index comes from the boot's own CT-BEGIN part. The id check (PUB-START/PUB-RESULT) still
    guards identity.
 
+## Carried into Tasks 9-10 (review of the harness, November 18)
+
+- cpyt: a module skipped as a whole has no `CT-RESULT cpy` line, so it would show as `missing`. Use regrtest's own
+  per-module verdict (`CT-LOG |` and `CT-LOG rc=` lines, as cpy-check.py reads them) for modules without a line.
+- public: pass the manifest row's guest cap as `pubcap=` on the kernel command line (run-public.sh otherwise falls
+  back to 300 s).
+- A flaky test that hangs the guest: the part fails for no CT-END whatever the rerun shows. Decide in Task 9 whether
+  the rerun's results replace the first boot's for a part without CT-END.
+
 ## Decisions for the owner to review
 
 1. **Campaign is a tier, not a kind** (owner, November 18): `tier = "campaign"`, `kind = "judged"`.
