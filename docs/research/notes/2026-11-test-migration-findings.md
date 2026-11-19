@@ -165,3 +165,12 @@ What each kind means for the references:
   code1, split and split2 passed it: 151 of 153 stressor runs passed, 1 expected-fail, 5 never reached. The cap only
   guards against a hang and is now 1,800 s. Rerun at 1,800 s (run 20261119-075513-6fa7) the four parts passed: 34 passed,
   1 expected-fail; split took 18 min 27 s. With the first run's other 14 parts, every stressor run passed or was expected.
+- Campaign guests powered off without waiting for the serial line: in the M3's smoke (run 20261119-103839-7012) the
+  stress part's last burst (its kernel log as CT-DMESG lines) was still being sent when `poweroff -f` ran 8.3 s into
+  the boot, so its tail and CT-END were lost and the part failed for no CT-END after all 12 stressors passed.
+  `tools/correctness/init` now waits until ttyS0's transmit count stops growing (at most 5 s) before powering off.
+- CPython's timerfd cases on the M3 (same smoke run, cpyb part-0 at 4 vCPUs): `test_timerfd_TFD_TIMER_ABSTIME`,
+  `_initval` and `_ns_TFD_TIMER_ABSTIME` failed on both boots (the second also `_interval`), so the flaky entry does
+  not cover it and the case fails. The assertion allows under 1 ms between arming and reading the timer; on the
+  M3's four performance cores, with four vCPUs, that margin is not met. Timing of natemu under load, not settled as a
+  bug; the flaky entry came from M2 Max runs where a timerfd case failed on one boot only (e905c405).

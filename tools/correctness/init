@@ -16,4 +16,9 @@ echo "CT-BEGIN suite=$suite part=$part cpus=$(nproc) kernel=$(uname -r)"
 t0=$(cut -d' ' -f1 /proc/uptime)
 /ct/run-$suite.sh /ct "$part"; rc=$?
 echo "CT-END suite=$suite part=$part rc=$rc guest_s=$(awk -v a=$t0 '{print $1-a}' /proc/uptime)"
+# poweroff -f does not wait for the serial line, so the tail of a long last burst (stress's CT-DMESG) and CT-END could
+# be lost (seen: stress smoke on the M3, November 19). Wait until ttyS0's transmit count stops growing (at most 5 s).
+tx() { sed -n 's/^0:.* tx:\([0-9]*\).*/\1/p' /proc/tty/driver/serial 2>/dev/null; }
+a=$(tx); i=0
+while [ $i -lt 50 ]; do sleep 0.1; b=$(tx); [ -n "$b" ] && [ "$a" = "$b" ] && break; a=$b; i=$((i + 1)); done
 sync; poweroff -f
