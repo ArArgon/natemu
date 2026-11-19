@@ -76,3 +76,27 @@ argv = ["tools/x.py"]
 ''')
     fam = family.load(d / 'family.toml'); s = fam.suite('s')
     assert runner.HARNESS.case_timeout(fam, s, 'long') == 2400 and runner.HARNESS.case_timeout(fam, s, 'short') is None
+
+
+def test_diff_rerun_uses_live_answers_and_its_own_output_folder(tmp_path):
+    """--diff: a case that failed on a hash-only answer runs once more with live QEMU answers, into its own folder."""
+    import sys
+    script = tmp_path / 'r.py'
+    script.write_text('import os, sys\nprint("answers", os.environ["NATEMU_ANSWERS"], "NATEMU_ANSWERS_LOCK" in os.environ)\n'
+                      'print("out", sys.argv[sys.argv.index("--out") + 1])\nprint("x differs: 1 != 2")\nsys.exit(1)\n')
+    o = tmp_path / 'run' / 'out' / 'c'
+    env = {'PATH': '/usr/bin:/bin', 'NATEMU_ANSWERS': 'locked', 'NATEMU_ANSWERS_LOCK': 'x.lock', 'NATEMU_ANSWERS_USED': 'u'}
+    note = runner.HARNESS.diff_rerun([sys.executable, str(script), '--out', str(o)], env, o, tmp_path / 'run', 'c')
+    assert 'answers live False' in note and f'out {o}.diff' in note and 'x differs: 1 != 2' in note
+    assert 'exit 1' in note and str(tmp_path / 'run' / 'runner' / 'c.diff.log') in note
+    assert env['NATEMU_ANSWERS'] == 'locked'                    # the case's own environment is untouched
+    script.write_text('import sys\nprint("all fine")\n')
+    note = runner.HARNESS.diff_rerun([sys.executable, str(script), '--out', str(o)], env, o, tmp_path / 'run', 'c')
+    assert 'natemu matches QEMU and the locked answer is wrong or stale' in note and 'all fine' not in note
+
+
+def test_diff_rerun_only_for_hash_only_answers():
+    from tools.reference import answers
+    assert runner.needs_diff(f'step 3: {answers.HASH_ONLY}: qemu-system/abc')
+    assert not runner.needs_diff('x differs: 1 != 2 (QEMU 2)')
+    assert 'natemu-test run --diff' in answers.HASH_ONLY

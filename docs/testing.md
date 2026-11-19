@@ -239,6 +239,11 @@ Answers that differ between the two runs are dropped where no comparison uses th
 locked one is refused rather than overwritten. Each answer is a hash, with the value inline when it is short, and the steps
 that reproduce it (supplier, pin, program or image hash, arguments).
 
+When an answer kept only as a hash differs, the failure can say only that it differs. Run the case again with
+`tools/natemu-test run ... --diff`: a case that failed that way runs once more with live QEMU answers, and the message
+adds what the runner's own field-by-field comparison reports, or, when the case then passes, that natemu matches QEMU and
+the locked answer is wrong or stale. That rerun's result is not counted.
+
 The inputs those runners read can also be built on any machine instead of copied: `testkit.inputs.root()` makes a cache
 entry laid out like `natemu-raw` (the netboot kernel and initrd, the QEMU reference binary, the virtio block inputs and
 kernel package, the network tools' root, the i7 and s2d program corpora, the fio preparation and a static stress-ng; no

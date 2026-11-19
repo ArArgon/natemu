@@ -15,6 +15,10 @@ A passed case's output folder is deleted when it ends (`drop_outputs`); a failed
                           needs = {...}  smoke = true  judge = "judges:name"  results = "results.json"
                           (the judge sees exit 1; judge_on_zero = true also sends it exit 0: a negative control)
                           timeout = N  (seconds, this case only; else the suite's params.timeout, default 3600)
+
+With --diff, a case that failed on an answer locked as a hash only (answers.HASH_ONLY: too large to keep inline, so
+locked mode can say only that it differs) runs once more with live QEMU answers (NATEMU_ANSWERS=live), whose
+field-by-field comparison says what differs; that rerun's log is added to the message and its verdict is not counted.
 """
 import fnmatch
 import json
@@ -176,6 +180,9 @@ class Runner:
                     if builder: legacy.install_signed(n)
                 notes.append(note)
                 if ok: break
+            last = rundir / 'runner' / (it.case + ('.rerun' if k else '') + '.log')
+            if not ok and config.getoption('diff', False) and last.exists() and needs_diff(last.read_text(errors='replace')):
+                notes.append(self.diff_rerun(argv, env, o, rundir, it.case))
             subs = per_case(o, spec.get('results', 'results.json'))
             if subs is None:
                 notes.append('no per-case results')
@@ -184,6 +191,21 @@ class Runner:
             out[it.nodeid] = res
             if ok and all(oc != 'failed' for _, oc, _ in subs or []): drop_outputs(o)
         return out
+
+    def diff_rerun(self, argv, env, o, rundir, case) -> str:
+        """--diff: run the case once more with live QEMU answers, into `<out>.diff`; the log's last lines say what differs."""
+        log = rundir / 'runner' / f'{case}.diff.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        live = {k: v for k, v in env.items() if k not in ('NATEMU_ANSWERS_LOCK', 'NATEMU_ANSWERS_USED')}
+        live['NATEMU_ANSWERS'] = 'live'
+        argv = [a.replace(str(o), str(o) + '.diff') for a in argv]
+        with open(log, 'wb') as f:
+            r = subprocess.run(argv, cwd=paths.repo_root(), env=live, stdout=f, stderr=subprocess.STDOUT)
+        if r.returncode == 0:
+            return (f'--diff: with live QEMU answers the case passes, so natemu matches QEMU and the locked answer is '
+                    f'wrong or stale (reseed it: natemu-test lock); log {log}')
+        tail = [l for l in log.read_text(errors='replace').splitlines() if l.strip()][-DIFF_LINES:]
+        return f'--diff, rerun with live QEMU answers (exit {r.returncode}; log {log}), what differs:\n' + '\n'.join(tail)
 
     def once(self, argv, env, o, rundir, case, attempt, spec, it):
         log = rundir / 'runner' / (case + ('.rerun' if attempt else '') + '.log')
@@ -205,6 +227,14 @@ class Runner:
             ok, why = j(o)
             return ok, (f'judged: {why} ({took})' if ok else f'judge: {why}; log {log}')
         return False, f'exit {r.returncode} after {took}; log {log}'
+
+
+DIFF_LINES = 40
+
+
+def needs_diff(log_text: str) -> bool:
+    """The runner's log says an answer locked as a hash only differed (answers.HASH_ONLY)."""
+    return 'differs from the locked answer (hash only' in log_text
 
 
 HARNESS = Runner()
