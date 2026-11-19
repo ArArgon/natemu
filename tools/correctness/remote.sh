@@ -146,6 +146,7 @@ image() {   # image SUITE...: base rootfs + suite payload + /init (+ the kernel'
         R=$W/img-$s; rm -rf "$R"; cp -a "$W/pb/rootfs" "$R"; mkdir -p "$R/ct" "$R/boot"
         cp "$W/kconfig" "$R/boot/config-6.12.107+deb13-amd64"
         cp "$here/init" "$R/init"; cp "$here/run-$s.sh" "$here/run-repro.sh" "$R/ct/"; chmod 755 "$R/init" "$R"/ct/run-*.sh
+        [ ! -f "$W/out/$s-list.txt" ] || cp "$W/out/$s-list.txt" "$R/ct/"   # every test, by part (recipes/$s/build.sh)
         case $s in
             ltp) L=$W/ltp-inst/opt/ltp; mkdir -p "$R/opt/ltp/testcases/bin"   # the kept programs (ltp-list.py), stripped
                  (cd "$L" && tar cf - --exclude=./testcases/bin .) | tar xf - -C "$R/opt/ltp"

@@ -219,3 +219,11 @@ stress-ng with `--stress-provenance <its provenance.json>`. Point a runner at it
 `NATEMU_RAW_ROOT=<that folder>` and `NATEMU_STATE_ROOT=<a writable folder>`: the entry is read-only, and the runners'
 VM and port locks, result caches and reference work folder go to the state root (by default the raw root, as before).
 Every runner on the machine must use the same state root, since the VM lock only excludes runners that share its file.
+
+The Linux workload campaigns' images are built the same way: `testkit.inputs.campaign_image(suite)` runs
+`tools/correctness/recipes/<suite>/build.sh` in that container (`remote.sh`'s stages as the user `ubuntu`, so the
+paths baked into the image match the reference builds) and gives a folder with `<suite>.cpio.zst`, `<suite>-list.txt`
+(one `PART TEST` line per test, PART being the kernel's `part=` word) and `manifest.json` (every download with its URL
+and sha256). Every downloaded file is checked against a pin file in `tools/correctness/recipes` (`common/` for what all
+suites share). A build that finds no pin file writes the hashes it saw to the state folder's `repin/` and stops
+before building; check them and copy them into the recipes. OpenSSL and torture have recipes so far.

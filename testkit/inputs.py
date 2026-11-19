@@ -109,27 +109,35 @@ def network_rootfs() -> pathlib.Path:
     return resources.derived('io-network-rootfs', _network_recipe, [recipe, artifacts.BENCH_BUILDER]) / 'rootfs'
 
 
-def _in_container(name: str, recipe: pathlib.Path, work: pathlib.Path, memory: str = '4g', timeout: int = 3600) -> None:
-    """recipe/container.sh in the amd64 Debian builder (artifacts.BENCH_BUILDER, through Rosetta), /recipe read-only and
-    /work = work. A download that fails is Unpreparable (the URL is in the message), anything else a BuildFailure."""
+def _in_container(name: str, recipe: pathlib.Path, work: pathlib.Path, memory: str = '4g', timeout: int = 3600,
+                  script: str = 'container.sh', pins_to: pathlib.Path | None = None) -> None:
+    """recipe/<script> in the amd64 Debian builder (artifacts.BENCH_BUILDER, through Rosetta), /recipe read-only and
+    /work = work. A download that fails is Unpreparable (the URL is in the message), anything else a BuildFailure.
+    New pins a re-pinning build wrote (work's packages.txt, debs.sha256, sources.sha256, or a work/repin tree) are kept
+    in the state folder, to be checked and copied into `pins_to` (default: the recipe)."""
     if not shutil.which('container'): raise BuildFailure(name, "needs Apple's `container` (brew install container)")
     cname = f'natemu-build-{name}-{os.getpid()}'
     cmd = ['container', 'run', '--rm', '--name', cname, '--arch', 'amd64', '--cpus', '4', '--memory', memory,
-           '--volume', f'{recipe}:/recipe:ro', '--volume', f'{work}:/work', artifacts.BENCH_BUILDER, 'bash', '/recipe/container.sh']
+           '--volume', f'{recipe}:/recipe:ro', '--volume', f'{work}:/work', artifacts.BENCH_BUILDER, 'bash', f'/recipe/{script}']
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         try: subprocess.run(['container', 'kill', cname], capture_output=True, timeout=60)  # the client's death does not stop it
         except (OSError, subprocess.SubprocessError): pass
-        raise BuildFailure(name, f'{recipe}/container.sh took more than {timeout} s')
+        raise BuildFailure(name, f'{recipe}/{script} took more than {timeout} s')
     if r.returncode:
         tail = (r.stderr or r.stdout)[-1500:]
         repin = [f for f in ('packages.txt', 'debs.sha256', 'sources.sha256') if (work / f).is_file()]
+        tree = work / 'repin'
+        repin += sorted(f'repin/{p.relative_to(tree).as_posix()}' for p in tree.rglob('*') if p.is_file()) if tree.is_dir() else []
         if repin:                    # re-pinning: keep the new pins before the failed entry is deleted
             keep = paths.state_dir() / 'repin' / name; keep.mkdir(parents=True, exist_ok=True)
-            for f in repin: shutil.copy2(work / f, keep / f)
-            raise BuildFailure(name, f'no pins in {recipe}: new ones written to {keep} ({", ".join(repin)}); check them, '
-                                     f'copy them into {recipe} and build again')
+            for f in repin:
+                dest = keep / f.removeprefix('repin/'); dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(work / f, dest)
+            shown = [f.removeprefix('repin/') for f in repin]
+            raise BuildFailure(name, f'no pins in {pins_to or recipe}: new ones written to {keep} ({", ".join(shown)}); check '
+                                     f'them, copy them into {pins_to or recipe} and build again')
         if re.search(r'Failed to fetch|Could not resolve|Temporary failure resolving|Unable to connect|Unable to fetch', tail):
             raise resources.Unpreparable(name, tail)
         raise BuildFailure(name, tail)
@@ -241,6 +249,95 @@ def stress_ng() -> pathlib.Path:
     runners pin) and provenance.json (run_io_soak.py / run_serial_stress.py --stress-provenance)."""
     recipe = _tools() / 'io' / 'stress-ng'
     return resources.derived('io-stress-ng', _stress_recipe, [recipe, artifacts.BENCH_BUILDER])
+
+
+# ---------------------------------------------------------------- campaign images (tools/correctness/recipes)
+CAMPAIGN_RECIPES = 'correctness/recipes'
+CAMPAIGN_COMMON = ('correctness/recipes/common.sh', 'correctness/recipes/common', 'correctness/init')
+CAMPAIGN_TIMEOUT = 4 * 3600
+PIN_LINE = re.compile(r'([0-9a-f]{64})  (\S+)')
+
+
+def campaign_sources(suite: str) -> list[str]:
+    """The tools/-relative files and folders the suite's recipe reads: its folder, common.sh, the common pins, the
+    guest's /init and the files its uses.txt names. They are all the container sees, and they key the image."""
+    t, name = _tools(), f'campaign-{suite}'
+    d = t / CAMPAIGN_RECIPES / suite
+    if not (d / 'build.sh').is_file(): raise BuildFailure(name, f'no recipe {d}/build.sh')
+    uses = [l.split('#')[0].strip() for l in (d / 'uses.txt').read_text().splitlines()] if (d / 'uses.txt').is_file() else []
+    rels = sorted({f'{CAMPAIGN_RECIPES}/{suite}', *CAMPAIGN_COMMON, *filter(None, uses)})
+    if missing := [r for r in rels if not (t / r).exists()]: raise BuildFailure(name, f'{d}/uses.txt names missing files: {missing}')
+    return rels
+
+
+def read_pins(folder: pathlib.Path) -> dict[str, tuple[str, list[str]]]:
+    """FILE -> (sha256, [pin files]) over every *.sha256 under `folder` (`SHA256  FILE` lines, sha256sum's format)."""
+    pins: dict[str, tuple[str, list[str]]] = {}
+    for pf in sorted(folder.rglob('*.sha256')):
+        rel = pf.relative_to(folder).as_posix()
+        for n, line in enumerate(pf.read_text().splitlines(), 1):
+            m = PIN_LINE.fullmatch(line)
+            if not m: raise BuildFailure('campaign', f'{pf}:{n}: not "SHA256  FILE": {line!r}')
+            sha, files = pins.get(m[2], (m[1], []))
+            if sha != m[1]: raise BuildFailure('campaign', f'{m[2]} is pinned twice, differently: {files[0]} and {rel}')
+            pins[m[2]] = (sha, files + [rel])
+    return pins
+
+
+def campaign_manifest(name: str, downloads: pathlib.Path, pins: dict) -> list[dict]:
+    """The manifest's sources: every download of the build (downloads.txt, `URL SHA256 FILE` lines) with its URL, sha256
+    and pin files. A download no pin names or with another hash, or a pin nothing downloaded, fails the build."""
+    sources, seen = [], set()
+    for n, line in enumerate(downloads.read_text().splitlines(), 1):
+        w = line.split()
+        if len(w) != 3: raise BuildFailure(name, f'downloads.txt:{n}: not "URL SHA256 FILE": {line!r}')
+        url, sha, f = w
+        if f not in pins: raise BuildFailure(name, f'{f} ({url}) was downloaded, but no pin file names it')
+        if pins[f][0] != sha: raise BuildFailure(name, f'{f} ({url}) has sha256 {sha}, pinned {pins[f][0]} in {pins[f][1]}')
+        if f not in seen: seen.add(f); sources.append({'file': f, 'url': url, 'sha256': sha, 'pins': pins[f][1]})
+    if unused := sorted(set(pins) - seen): raise BuildFailure(name, f'pinned but not downloaded (stale pins?): {unused}')
+    return sorted(sources, key=lambda s: s['file'])
+
+
+def _campaign_recipe(out: pathlib.Path, inputs: list) -> None:
+    suite, builder = inputs[:2]
+    pairs = list(zip(inputs[3::2], inputs[4::2]))
+    name, src, work = f'campaign-{suite}', out / 'src', out / 'work'
+    for rel, p in pairs:                    # exactly the keyed files, laid out as in tools/: the container's /recipe
+        dest = src / rel; dest.parent.mkdir(parents=True, exist_ok=True)
+        if p.is_dir(): shutil.copytree(p, dest, ignore=shutil.ignore_patterns('__pycache__'))
+        else: shutil.copy2(p, dest)
+    work.mkdir()
+    _in_container(name, src, work, memory='8g', timeout=CAMPAIGN_TIMEOUT, script=f'{CAMPAIGN_RECIPES}/{suite}/build.sh',
+                  pins_to=_tools() / CAMPAIGN_RECIPES)
+    image, listing = f'{suite}.cpio.zst', f'{suite}-list.txt'
+    for f in (image, listing, 'downloads.txt'):
+        if not (work / f).is_file(): raise BuildFailure(name, f'the recipe wrote no {f}')
+    lines = [l.split() for l in (work / listing).read_text().splitlines() if l.strip()]
+    if not lines or any(len(w) != 2 for w in lines): raise BuildFailure(name, f'{listing} is not "PART TEST" lines')
+    if len({w[1] for w in lines}) != len(lines): raise BuildFailure(name, f'{listing} names a test twice')
+    sources = campaign_manifest(name, work / 'downloads.txt', read_pins(src / CAMPAIGN_RECIPES))
+    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    for f in (image, listing): os.replace(work / f, out / f)
+    if (work / 'log').is_dir(): os.replace(work / 'log', out / 'log')
+    (out / 'manifest.json').write_text(json.dumps({
+        'suite': suite, 'builder': f'local: {builder} (amd64 through Rosetta)',
+        'image': {'file': image, 'sha256': sha(out / image), 'bytes': (out / image).stat().st_size},
+        'list': {'file': listing, 'sha256': sha(out / listing), 'tests': len(lines), 'parts': list(dict.fromkeys(w[0] for w in lines))},
+        'recipe': {rel: recipe_sha256(p) if p.is_dir() else sha(p) for rel, p in ((r, src / r) for r, _ in pairs)},
+        'sources': sources}, indent=1) + '\n')
+    shutil.rmtree(src); shutil.rmtree(work)
+
+
+def campaign_image(suite: str) -> pathlib.Path:
+    """The initramfs tools/correctness boots for a campaign, built here from tools/correctness/recipes/<suite> in the
+    amd64 Debian builder (common.sh): a folder with <suite>.cpio.zst, <suite>-list.txt (`PART TEST` per test, PART the
+    kernel's part= word; also /ct/<suite>-list.txt in the image), manifest.json (every download with its URL and sha256,
+    the recipe files' hashes) and log/."""
+    t = _tools()
+    pairs = [x for rel in campaign_sources(suite) for x in (rel, t / rel)]
+    return resources.derived(f'campaign-{suite}', _campaign_recipe,
+                             [suite, artifacts.BENCH_BUILDER, inspect.getsource(campaign_manifest) + inspect.getsource(read_pins), *pairs])
 
 
 def _corpus_recipe(out: pathlib.Path, inputs: list) -> None:

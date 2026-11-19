@@ -6,6 +6,8 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C TZ=UTC
 mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
 mkdir -p /dev/pts /dev/shm; mount -t devpts devpts /dev/pts; mount -t tmpfs shm /dev/shm
 mount -t tmpfs tmp /tmp; mount -t tmpfs run /run; chmod 1777 /tmp
+# The links udev would make (devtmpfs has none): tests open /dev/stdin and run scripts as /dev/fd/N.
+ln -sfn /proc/self/fd /dev/fd; ln -sf /proc/self/fd/0 /dev/stdin; ln -sf /proc/self/fd/1 /dev/stdout; ln -sf /proc/self/fd/2 /dev/stderr
 echo 1 > /proc/sys/kernel/printk; hostname natemu-ct; ip link set lo up 2>/dev/null
 suite=none; part=0/1
 for a in $(cat /proc/cmdline); do case $a in ct=*) suite=${a#ct=};; part=*) part=${a#part=};; esac; done
