@@ -258,7 +258,7 @@ pub mod cache {
     /// switches tables instead of clearing one). Perf chunk 19: 16 RIP bits indexed a direct-mapped table (12 before: most
     /// misses were two hot RIPs at the same page offset); now 15 index a set of two.
     pub const L1_CODE: usize = DISPATCH + DISPATCH_BYTES;
-    pub const L1_SET_BITS: u32 = 16;
+    pub const L1_SET_BITS: u32 = 15;
     pub const L1_WAYS: usize = 2;
     pub const L1_SETS: usize = 1 << L1_SET_BITS;
     pub const L1_SET_MASK: u64 = L1_SETS as u64 - 1;

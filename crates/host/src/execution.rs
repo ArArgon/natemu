@@ -4481,6 +4481,9 @@ mod tests {
         let empty: serde_json::Value = serde_json::from_str(&old_k1_stats(area)).unwrap();
         let mut now = serde_json::to_value(k1_stats(area)).unwrap();
         now.as_object_mut().unwrap().remove("pool");
+        // The code-size study's record is newer than the reference formatter: it counts live blocks with code of their own,
+        // and no block exists here.
+        assert_eq!(now.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
         assert_eq!(empty, now);
         let offset = cache::LOOKUP_OFFSET + cache::CONTROL;
         let mut c: cache::Control = area.read_record(offset);
@@ -4539,6 +4542,8 @@ mod tests {
         let mut new = serde_json::to_value(k1_stats(area)).unwrap();
         // (The pool's counters are newer than the reference formatter.)
         assert_eq!(new.as_object_mut().unwrap().remove("pool").unwrap()["probes"], 0);
+        // (So is the code-size record: no block record exists here, so every count is 0.)
+        assert_eq!(new.as_object_mut().unwrap().remove("code_size").unwrap(), serde_json::json!([0, 0, 0, 0, 0]));
         assert_eq!(old, new);
     }
 

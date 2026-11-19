@@ -438,6 +438,40 @@ class Slice1Cutting(unittest.TestCase):
                 self.assertEqual((g['instructions_translated'], g['end']['reason']), (3, 'block_ending_instruction'), (name, g['end']))
                 self.assertEqual(g['end']['rip'], hex(RIP + (len(PRE) + len(x)) // 2))
 
+    def test_extended_blocks_continue_past_conditional_branches_only(self):
+        # Experiment (--ext-conds N): a conditional branch (jcc, loop, jrcxz) no longer ends the block; the translation goes on
+        # with the fall-through instructions, the taken edge stays an exit (a literal exit to the target) and the block ends where
+        # the input does. Every other branch (jmp, call, ret, indirect) still ends it. The default keeps the rule above.
+        conditional = re.compile(r'\b(j(?!mp)[a-z]+|loop[a-z]*)\b')
+        for name, x in BRANCHES.items():
+            with self.subTest(name):
+                d, rc = run(PRE + x + PRE, RIP, '--ext-conds', '4')
+                g = d['guest']
+                self.assertEqual(rc, 0, name)
+                end = RIP + (len(PRE) * 2 + len(x)) // 2
+                if conditional.search(name):
+                    self.assertEqual((g['instructions_translated'], g['end']['reason']), (5, 'end_of_input'), (name, g['end']))
+                    self.assertEqual(g['end']['rip'], hex(end))
+                    # taken edge: every conditional here has displacement 5 from its own end; fall-through exit: the input's end
+                    moves = {int(r['guest_rip'], 16) for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move'}
+                    self.assertEqual(moves, {end, end - len(PRE) // 2 + 5}, (name, moves))
+                else:
+                    self.assertEqual((g['instructions_translated'], g['end']['reason']), (3, 'block_ending_instruction'), (name, g['end']))
+                    self.assertEqual(g['end']['rip'], hex(RIP + (len(PRE) + len(x)) // 2))
+
+    def test_extended_blocks_are_limited_by_the_resident_link_points(self):
+        # Five conditional branches would make five taken exits plus the final one; a block has 4 link points (crates/abi
+        # MAX_LINK_POINTS), so the unit is cut after the third (3 taken exits + the fall-through exit) at --ext-conds 4,
+        # and --ext-conds 2 allows two conditional branches per unit.
+        unit = PRE + '7505'
+        for n, branches in ((4, 3), (2, 2)):
+            with self.subTest(n):
+                d, rc = run(unit * 5, RIP, '--ext-conds', str(n))
+                g = d['guest']
+                self.assertEqual(rc, 0)
+                self.assertEqual((g['instructions_translated'], g['end']['reason']), (3 * branches, 'block_ending_instruction'), g['end'])
+                self.assertEqual(g['end']['rip'], hex(RIP + len(unit) // 2 * branches))
+
     def test_o16_call_rel32_pushes_its_own_end_and_targets_rel32(self):
         # patch 0029: 66 e8 rel32 is 6 bytes; it pushes RIP + 6 (8 bytes) and exits to RIP + 6 + rel32
         d, rc = run('66e8fb000000', 0x1000)
