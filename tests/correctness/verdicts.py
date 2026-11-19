@@ -197,15 +197,47 @@ def litmus(name, f, extra, image=None):
     return 'passed', note
 
 
+PUB_PROGRAMS = {'rseq', 'futex', 'membarrier', 'mm', 'ptrace', 'qemu'}     # kselftest and QEMU tests/tcg programs
+PUB_SUCCESS = {   # the row family's own success signal, beyond rc 0 and no failing TAP line
+    'ltp': (re.compile(r'^failed\s+0\s*$', re.M), re.compile(r'^broken\s+0\s*$', re.M)),     # tst_test's summary
+    'kunit': (re.compile(r'^(?:\[[^\]]*\] )?ok \d+ \S+\s*$', re.M),),     # a top-level (unindented) suite result
+    'locktorture': (re.compile(r'End of test: SUCCESS'),),
+    'rcutorture': (re.compile(r'End of test: SUCCESS'),),
+}
+PUB_MODULE_SUCCESS = {'kernel-atomic64_test': re.compile(r'atomic64_test: passed'),
+                      'kernel-test_bitmap': re.compile(r'test_bitmap: all \d+ tests passed')}
+PUB_UNRUN = {'incomplete', 'identity-error', 'host-cap', 'guest-cap', 'killed-or-cap'}
+
+
 def public(name, f, extra):
     """run-public.sh, one test per boot: `PUB-START id=ID cap=S` ... `PUB-RESULT id=ID rc=N`; `extra` is the boot's
-    whole serial output, judged by public-campaign.py's classify. Its "completed-needs-oracle-review" (ran to the end,
-    nothing checked its output) is unverified, never passed; skip is unsupported; everything else (failure, broken,
-    warning, identity-error, the caps, incomplete) fails."""
+    whole serial output, judged by public-campaign.py's classify, then by the row's own success signal:
+      - a kernel splat anywhere in the boot (public-campaign.py's SPLAT: Oops, BUG, WARNING, panic, RCU stall,
+        `End of test: FAILURE`, Call Trace) fails, whatever the exit status;
+      - skip is unsupported; failure, broken, warning, identity-error, the caps and incomplete fail;
+      - a row that ran to the end passes on its program's own success signal: rc 0 and no failing TAP line for the
+        selftests and QEMU's tests (PUB_PROGRAMS); LTP's `failed 0` and `broken 0`; a top-level KUnit `ok N SUITE`;
+        `atomic64_test: passed`; `test_bitmap: all N tests passed`; torture's `End of test: SUCCESS`. Without it the
+        row is `unverified`, never passed;
+      - vmalloc-*: test_vmalloc returns -EAGAIN after its results by design, so modprobe's status says nothing; it
+        passes with at least one `Summary: ...` line and every one `failed: 0`, and fails otherwise."""
     text = '\n'.join(extra) + '\n'
+    rc = f.get('rc')
     m = re.search(r'^CT-BEGIN suite=public part=(\d+)/1 ', text, re.M)
-    case = dict(id=name, index=int(m.group(1)) if m else -1, family='ltp' if name.startswith('ltp-') else name.split('-')[0])
-    c = _tool('public-campaign').classify(text, case)
-    if c == 'completed-needs-oracle-review': return 'unverified', f'{c} (rc={f.get("rc")})'
-    if c == 'skip': return 'unsupported', f'skip (rc={f.get("rc")})'
-    return 'failed', f'{c} (rc={f.get("rc")})'
+    family = name.split('-')[0]
+    pc = _tool('public-campaign')
+    c = pc.classify(text, dict(id=name, index=int(m.group(1)) if m else -1, family=family))
+    splat = [ln for ln in text.splitlines() if pc.SPLAT.search(ln)]
+    if splat: return 'failed', f'{c} (rc={rc}); the kernel log:\n' + '\n'.join(splat[:SHOWN])
+    if family == 'vmalloc' and c not in PUB_UNRUN:
+        sums = re.findall(r'Summary: (\S+) .*?failed: (\d+)', text)
+        bad = [t for t, n in sums if n != '0']
+        if sums and not bad: return 'passed', f'{len(sums)} test_vmalloc summaries, none failed (rc={rc}: -EAGAIN by design)'
+        return 'failed', (f'test_vmalloc failed: {", ".join(bad)}' if bad else 'no test_vmalloc Summary: line') + f' (rc={rc})'
+    if c == 'skip': return 'unsupported', f'skip (rc={rc})'
+    if c != 'completed-needs-oracle-review': return 'failed', f'{c} (rc={rc})'
+    if family in PUB_PROGRAMS: return 'passed', 'rc 0, no failing TAP line'
+    signals = PUB_SUCCESS.get(family) or ((PUB_MODULE_SUCCESS[name],) if name in PUB_MODULE_SUCCESS else ())
+    if signals and all(s.search(text) for s in signals):
+        return 'passed', 'rc 0 and the success line: ' + ' / '.join(s.search(text).group(0).strip() for s in signals)
+    return 'unverified', f'{c} (rc={rc})' + ('; its success line is missing' if signals else '')

@@ -12,6 +12,12 @@ import sys
 import time
 
 
+# What the kernel prints when something went wrong, whatever the test's exit status: an Oops (in a kthread too), a BUG,
+# a warning, a panic, an RCU stall, a failed torture run, a stack trace.
+SPLAT = re.compile(r'BUG:|kernel BUG at |Oops: |general protection fault|WARNING: CPU:|Kernel panic|detected stall'
+                   r'|End of test: FAILURE|Call Trace:')
+
+
 def classify(text, case, capped=False):
     begins = re.findall(r'^CT-BEGIN suite=public part=(\S+) cpus=(\d+) kernel=(\S+)\r?$', text, re.M)
     starts = re.findall(r'^PUB-START id=(\S+) cap=(\d+)\r?$', text, re.M)
@@ -32,7 +38,7 @@ def classify(text, case, capped=False):
         return 'killed-or-cap'
     failures = [s for s in text.splitlines() if re.match(r'^\s*(?:\[[^\]]+\]\s*)?not ok\b', s)
                 and not re.search(r'#\s*(SKIP|TODO)\b', s, re.I)]
-    if failures or re.search(r'BUG:|WARNING: CPU:|Kernel panic', text):
+    if failures or SPLAT.search(text):
         return 'failure'
     if case['family'] == 'ltp':
         if rc & 1:
@@ -64,7 +70,11 @@ def selftest():
     assert classify(good.replace('rc=0', 'rc=2'), dict(c, family='ltp')) == 'broken'
     assert classify(good.replace('rc=0', 'rc=137'), c) == 'killed-or-cap'
     assert classify('not ok 1 # SKIP unavailable\n' + good, c) == 'completed-needs-oracle-review'
-    print('11 result-classification checks passed')
+    for splat in ('[ 9.1] Oops: general protection fault, probably for non-canonical address',
+                  '[ 9.1] kernel BUG at mm/vmalloc.c:3125!', '[ 9.1] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:',
+                  '[ 9.1] rcu-torture:--- End of test: FAILURE: nreaders=1', '[ 9.1] Call Trace:'):
+        assert classify(splat + '\n' + good, c) == 'failure', splat
+    print('16 result-classification checks passed')
 
 
 def digest(path):

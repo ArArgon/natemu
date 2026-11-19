@@ -467,8 +467,11 @@ def pub(id_, rc, part='3/1', body=()):
 
 
 def test_public_needs_review_is_unverified():
+    """A row that ran to the end without its program's success signal is unverified, never passed."""
     v = verdicts()
-    assert v.public('rseq-basic_test', {'rc': '0'}, pub('rseq-basic_test', 0))[0] == 'unverified'
+    for name in ('ltp-mmap01', 'kunit-memcpy_kunit', 'kernel-test_bitmap', 'locktorture-spin_lock', 'rcutorture-rcu',
+                 'kernel-unknown_module'):
+        assert v.public(name, {'rc': '0'}, pub(name, 0))[0] == 'unverified', name
     assert v.public('rseq-basic_test', {'rc': '4'}, pub('rseq-basic_test', 4))[0] == 'unsupported'
     assert v.public('rseq-basic_test', {'rc': '1'}, pub('rseq-basic_test', 1))[0] == 'failed'
     assert v.public('rseq-basic_test', {'rc': '124'}, pub('rseq-basic_test', 124))[0] == 'failed'     # guest cap
@@ -477,6 +480,82 @@ def test_public_needs_review_is_unverified():
     assert v.public('ltp-mmap01', {'rc': '2'}, pub('ltp-mmap01', 2))[0] == 'failed'                  # broken
     r = v.public('mm-cow', {'rc': '0'}, pub('mm-cow', 0, body=['not ok 3 cow on fork']))
     assert r[0] == 'failed' and 'failure' in r[1]
+
+
+def test_public_success_signal_passes():
+    """Review: a row passes on its program's own success signal (and only then)."""
+    v = verdicts()
+    ok = {
+        'rseq-basic_test': [], 'qemu-cmpxchg': [], 'ptrace-get_syscall_info': ['ok 1 global.get_syscall_info'],
+        'ltp-mmap01': ['Summary:', 'passed   1', 'failed   0', 'broken   0', 'skipped  0', 'warnings 0'],
+        'kunit-memcpy_kunit': ['[   11.99]     ok 2 memcpy_test', '[   15.87] # memcpy: pass:6 fail:0 skip:0 total:6',
+                               '[   15.88] ok 1 memcpy'],
+        'kernel-atomic64_test': ['[    3.10] atomic64_test: passed for x86_64 platform with CX8 and with SSE'],
+        'kernel-test_bitmap': ['[   12.84] test_bitmap: all 390447 tests passed'],
+        'locktorture-spin_lock': ['[   42.69] spin_lock-torture:--- End of test: SUCCESS: nwriters_stress=2'],
+        'rcutorture-srcu-fwd': ['[  100.1] srcu-torture:--- End of test: SUCCESS: nreaders=3'],
+    }
+    for name, body in ok.items():
+        assert v.public(name, {'rc': '0'}, pub(name, 0, body=body))[0] == 'passed', name
+    # only an indented (subtest) ok: not the suite's result
+    assert v.public('kunit-memcpy_kunit', {'rc': '0'}, pub('kunit-memcpy_kunit', 0, body=['[ 1.0]     ok 2 memcpy_test']))[0] == 'unverified'
+    # LTP with a failed count: rc says it too, but the summary alone must not pass it
+    assert v.public('ltp-mmap01', {'rc': '0'}, pub('ltp-mmap01', 0, body=['failed   1', 'broken   0']))[0] == 'unverified'
+
+
+def test_public_kernel_splat_fails_whatever_rc():
+    """Review D1: a kernel failure shown only as text (an Oops in a kthread, a BUG, an RCU stall, a failed torture run,
+    a stack trace) fails the row, although the test exited 0 and printed its success line."""
+    v = verdicts()
+    for splat in ('[ 31.2] Oops: general protection fault, probably for non-canonical address 0xdead: 0000 [#1] SMP',
+                  '[ 31.2] kernel BUG at kernel/locking/locktorture.c:123!',
+                  '[ 31.2] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:',
+                  '[ 31.2] rcu: INFO: rcu_preempt self-detected stall on CPU',
+                  '[ 31.2] rcu-torture:--- End of test: FAILURE: nreaders=3',
+                  '[ 31.2] Call Trace:'):
+        body = [splat, '[ 42.69] spin_lock-torture:--- End of test: SUCCESS: nwriters_stress=2']
+        r = v.public('locktorture-spin_lock', {'rc': '0'}, pub('locktorture-spin_lock', 0, body=body))
+        assert r[0] == 'failed' and splat in r[1], splat
+        assert v.public('rseq-basic_test', {'rc': '0'}, pub('rseq-basic_test', 0, body=[splat]))[0] == 'failed', splat
+
+
+def test_public_vmalloc_judged_by_its_summaries():
+    """Review D2: test_vmalloc always ends -EAGAIN (modprobe exits 1), so its row is judged by its Summary: lines."""
+    v = verdicts()
+    good = ['[ 5.1] Summary: fix_size_alloc_test passed: 1 failed: 0 repeat: 1 loops: 100 avg: 120 usec',
+            '[ 5.2] Summary: full_fit_alloc_test passed: 1 failed: 0 repeat: 1 loops: 100 avg: 99 usec']
+    name = 'vmalloc-normal-cases'
+    assert v.public(name, {'rc': '1'}, pub(name, 1, body=good))[0] == 'passed'
+    bad = good + ['[ 5.3] Summary: long_busy_list_alloc_test passed: 0 failed: 1 repeat: 1 loops: 100 avg: 9 usec']
+    r = v.public(name, {'rc': '1'}, pub(name, 1, body=bad))
+    assert r[0] == 'failed' and 'long_busy_list_alloc_test' in r[1]
+    assert v.public(name, {'rc': '1'}, pub(name, 1))[0] == 'failed'                                   # no summary
+    assert v.public(name, {'rc': '1'}, pub(name, 1, body=good + ['[ 5.4] Call Trace:']))[0] == 'failed'
+    assert v.public(name, {'rc': '124'}, pub(name, 124, body=good))[0] == 'failed'                  # guest cap
+    assert v.public(name, {'rc': '1'}, pub('vmalloc-other', 1, body=good))[0] == 'failed'           # identity
+    family.load.cache_clear()
+    assert name not in family.load(REPO / 'tests' / 'correctness' / 'family.toml').suite('public').extra.get('expected', {})
+
+
+def test_public_smoke_run_serials_pass(tmp_path):
+    """The six smoke rows as they printed on the M3 (run 20261119-000536-6f13), cut to the lines the verdict reads:
+    each passes on its own success signal."""
+    v = verdicts()
+    boot = ['[    0.0] Linux version 6.12.107-natemu-public', '[    1.0] Run /init as init process']
+    rows = {
+        ('0/1', 'rseq-basic_test'): ['testing current cpu', 'testing thread-local'],
+        ('24/1', 'qemu-cmpxchg'): [],
+        ('62/1', 'ltp-mmap01'): ['mmap01.c:84: TPASS: Functionality of mmap() successful', 'Summary:', 'passed   1',
+                                 'failed   0', 'broken   0', 'skipped  0', 'warnings 0'],
+        ('72/1', 'kunit-memcpy_kunit'): ['[    3.0] KTAP version 1', '[    3.0] 1..1', '[    4.4]     ok 3 memcpy_large_test',
+                                         '[    4.4] # memcpy: pass:6 fail:0 skip:0 total:6', '[    4.478105] ok 1 memcpy'],
+        ('75/1', 'kernel-test_bitmap'): ['[   12.846749] test_bitmap: all 390447 tests passed'],
+        ('77/1', 'locktorture-spin_lock'): ['[   42.693534] Writes:  Total: 4894361  Max/Min: 2449401/2444960   Fail: 0 ',
+                                            '[   42.696749] spin_lock-torture:--- End of test: SUCCESS: acq_writer_lim=0'],
+    }
+    for (part, name), body in rows.items():
+        lines = boot + pub(name, 0, part=part, body=body)
+        assert v.public(name, {'rc': '0'}, lines)[0] == 'passed', name
 
 
 # --- the committed family ---
