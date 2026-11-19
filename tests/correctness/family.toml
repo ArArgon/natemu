@@ -609,19 +609,23 @@ kind = "judged"
 harness = "campaign"
 tier = "campaign"
 # docs/restructure/correctness-public-kernel.md: Linux 6.12.107 selftests, QEMU tests/tcg x86-64 programs and LTP tests
-# on the stock Debian kernel, kernel test modules on a test kernel the recipe builds; one boot per row (88 rows; the
-# image's public-boot.txt gives each row's kernel and guest cap, pubcap=300). The LKMM corpus is not built yet.
+# on the stock Debian kernel, kernel test modules on a test kernel the recipe builds, and the LKMM corpus (35 klitmus7
+# modules, part-88 to part-122, judged by herd7's Linux-kernel memory model); one boot per row (123 rows; the image's
+# public-boot.txt gives each row's kernel and guest cap, pubcap=300).
 # verdicts.py's public judges each row: passed on the program's own success signal, failed on a failure or a kernel
-# splat, `unverified` when it ran to the end with nothing to say its output is right.
-parts = 88
+# splat, `unverified` when it ran to the end with nothing to say its output is right; an LKMM row passes when its
+# histogram is whole and every observed state is one herd7 allows. At 1 vCPU, the 34 LKMM tests of two or more threads
+# run no instance (klitmus7's `skipped`): unsupported, as the original campaign's ineligible N1 runs, never passed.
+parts = 123
 cap = 450
 verdict = "verdicts:public"
 matrix = { "machine.vcpus" = [1, 4] }
 needs = { cores = 4 }
 # One part per kind, to show the campaign works end to end (`run --tier campaign ... -k "public and smoke"`):
 # rseq-basic_test (selftest), qemu-cmpxchg (QEMU tests/tcg), ltp-mmap01 (LTP), kunit-memcpy_kunit (KUnit on the test
-# kernel), kernel-test_bitmap (a test module), locktorture-spin_lock (a torture module).
-smoke = ["part-0", "part-24", "part-62", "part-72", "part-75", "part-77"]
+# kernel), kernel-test_bitmap (a test module), locktorture-spin_lock (a torture module), lkmm-SB+poonceonces (an LKMM
+# test: unsupported at 1 vCPU).
+smoke = ["part-0", "part-24", "part-62", "part-72", "part-75", "part-77", "part-115"]
 
 [suite.expected]
 "ptrace-vmaccess" = "global.attach hits its 30 s internal timeout: a Linux 6.12.107 ptrace/exec wait cycle in the guest kernel, on QEMU too (docs/restructure/correctness-public-kernel.md, ptrace follow-up)"

@@ -629,6 +629,160 @@ def test_public_smoke_run_serials_pass(tmp_path):
         assert v.public(name, {'rc': '0'}, lines)[0] == 'passed', name
 
 
+LKMM_ORACLE = '''Test SB+poonceonces Allowed
+States 4
+0:r0=0; 1:r0=0;
+0:r0=0; 1:r0=1;
+0:r0=1; 1:r0=0;
+0:r0=1; 1:r0=1;
+Ok
+Witnesses
+Positive: 1 Negative: 3
+Condition exists (0:r0=0 /\\ 1:r0=0)
+Observation SB+poonceonces Sometimes 1 3
+Time SB+poonceonces 0.01
+Hash=d1ed1c3c4ecd4ec6c1bf7e1a1e6b2c54
+
+Test SB+fencembonceonces Allowed
+States 3
+0:r0=0; 1:r0=1;
+0:r0=1; 1:r0=0;
+0:r0=1; 1:r0=1;
+No
+Witnesses
+Positive: 0 Negative: 3
+Condition exists (0:r0=0 /\\ 1:r0=0)
+Observation SB+fencembonceonces Never 0 3
+Time SB+fencembonceonces 0.01
+
+Test CoWW+poonceonce Allowed
+States 1
+[x]=2;
+No
+Witnesses
+Positive: 0 Negative: 1
+Condition exists ([x]=1)
+Observation CoWW+poonceonce Never 0 1
+
+Test MP+onceassign+derefonce Allowed
+States 2
+1:r0=x; 1:r1=1;
+1:r0=y; 1:r1=0;
+No
+Witnesses
+Positive: 0 Negative: 2
+Condition exists (1:r0=x /\\ 1:r1=0)
+Observation MP+onceassign+derefonce Never 0 2
+'''
+LKMM_TESTS = '''litmus003 1 1000 10 CoWW+poonceonce
+litmus014 2 1000 10 MP+onceassign+derefonce
+litmus026 2 1000 10 SB+fencembonceonces
+litmus027 2 1000 10 SB+poonceonces
+'''
+
+
+@pytest.fixture
+def lkmm_image(tmp_path):
+    (tmp_path / 'oracle').mkdir()
+    (tmp_path / 'oracle' / 'lkmm.txt').write_text(LKMM_ORACLE)
+    (tmp_path / 'oracle' / 'lkmm-tests.txt').write_text(LKMM_TESTS)
+    return tmp_path
+
+
+def lkmm(test, histogram, cpus=4, positive=None, total=None, kind='Allowed'):
+    """klitmus7's /proc/litmus output for `test` (histogram: [(count, '*' or ':', state)]) in one public boot."""
+    pos = sum(c for c, s, _ in histogram if s == '*') if positive is None else positive
+    tot = sum(c for c, _, _ in histogram) if total is None else total
+    body = ['[    4.1] litmus027: loading out-of-tree module taints kernel.', f'Test {test} {kind}',
+            f'Histogram ({len(histogram)} states)', *(f'{c:<8}{s}>{st}' for c, s, st in histogram),
+            'Ok' if pos else 'No', '', 'Witnesses', f'Positive: {pos}, Negative: {tot - pos}',
+            f'Condition exists (0:r0=0 /\\ 1:r0=0) is {"" if pos else "NOT "}validated',
+            f'Observation {test} {"Sometimes" if pos else "Never"} {pos} {tot - pos}', f'Time {test} 0.02', '']
+    lines = pub('lkmm-' + test, 0, part='115/1', body=body)
+    lines[0] = lines[0].replace('cpus=4', f'cpus={cpus}')
+    return lines
+
+
+def test_public_lkmm_allowed_states_pass(lkmm_image):
+    """An LKMM row passes when its histogram is whole, its samples are the module's (instances x size x runs) and every
+    observed state is one herd7 allows; the relaxed SB outcome is allowed under the LKMM, an unseen state only noted."""
+    v = verdicts()
+    sb = [(30, '*', '0:r0=0; 1:r0=0;'), (9970, ':', '0:r0=0; 1:r0=1;'), (10000, ':', '0:r0=1; 1:r0=0;')]
+    r = v.public('lkmm-SB+poonceonces', {'rc': '0'}, lkmm('SB+poonceonces', sb), image=lkmm_image)
+    assert r[0] == 'passed', r
+    assert '20000 samples (2 x 1000 x 10), 3 states' in r[1] and '1 of 4 allowed states never observed' in r[1]
+    assert 'herd7 Ok, observed Sometimes' in r[1]
+    mp = [(19990, ':', '1:r0=x; 1:r1=1;'), (10, ':', '1:r0=y; 1:r1=0;')]          # pointer values: location names
+    assert v.public('lkmm-MP+onceassign+derefonce', {'rc': '0'}, lkmm('MP+onceassign+derefonce', mp),
+                    image=lkmm_image)[0] == 'passed'
+    coww = [(40000, ':', 'x=2;')]                       # one thread: four instances at 4 vCPUs, one at 1
+    assert v.public('lkmm-CoWW+poonceonce', {'rc': '0'}, lkmm('CoWW+poonceonce', coww), image=lkmm_image)[0] == 'passed'
+    assert v.public('lkmm-CoWW+poonceonce', {'rc': '0'}, lkmm('CoWW+poonceonce', [(10000, ':', 'x=2;')], cpus=1),
+                    image=lkmm_image)[0] == 'passed'
+
+
+def test_public_lkmm_forbidden_state_fails(lkmm_image):
+    """A state herd7's LKMM forbids fails the row, however rarely it was seen (the judge is never weakened)."""
+    v = verdicts()
+    sb = [(1, '*', '0:r0=0; 1:r0=0;'), (9999, ':', '0:r0=0; 1:r0=1;'), (10000, ':', '0:r0=1; 1:r0=0;')]
+    r = v.public('lkmm-SB+fencembonceonces', {'rc': '0'}, lkmm('SB+fencembonceonces', sb), image=lkmm_image)
+    assert r[0] == 'failed' and 'FORBIDDEN under the LKMM' in r[1] and '0:r0=0; 1:r0=0 x1' in r[1]
+    mp = [(19999, ':', '1:r0=x; 1:r1=1;'), (1, '*', '1:r0=x; 1:r1=0;')]
+    r = v.public('lkmm-MP+onceassign+derefonce', {'rc': '0'}, lkmm('MP+onceassign+derefonce', mp), image=lkmm_image)
+    assert r[0] == 'failed' and '1:r0=x; 1:r1=0 x1' in r[1]
+    r = v.public('lkmm-CoWW+poonceonce', {'rc': '0'}, lkmm('CoWW+poonceonce', [(39999, ':', 'x=2;'), (1, '*', 'x=1;')]),
+                 image=lkmm_image)
+    assert r[0] == 'failed' and 'x=1 x1' in r[1]
+
+
+def test_public_lkmm_incomplete_output_fails(lkmm_image):
+    """A lost or garbled line could hide a forbidden state, a cut-short run (a thread not created) takes fewer samples:
+    the state lines must number the histogram's, sum to Positive + Negative and to instances x size x runs."""
+    v = verdicts()
+    name, test = 'lkmm-SB+fencembonceonces', 'SB+fencembonceonces'
+    good = [(10000, ':', '0:r0=0; 1:r0=1;'), (10000, ':', '0:r0=1; 1:r0=0;')]
+    judge = lambda lines: v.public(name, {'rc': '0'}, lines, image=lkmm_image)
+    assert judge(lkmm(test, good))[0] == 'passed'
+    lines = lkmm(test, good); lines.remove('10000   :>0:r0=1; 1:r0=0;')
+    r = judge(lines)
+    assert r[0] == 'failed' and '1 state lines, the histogram declares 2' in r[1] and 'sum to 10000' in r[1]
+    lines = lkmm(test, good); lines[lines.index('10000   :>0:r0=1; 1:r0=0;')] = '10000   :>0:r0=1; 1:r'
+    r = judge(lines)
+    assert r[0] == 'failed' and 'not states' in r[1]
+    r = judge(lkmm(test, [(5000, ':', '0:r0=0; 1:r0=1;'), (5000, ':', '0:r0=1; 1:r0=0;')]))   # one instance of two
+    assert r[0] == 'failed' and '10000 samples, the module takes 20000 (2 instances x 1000 x 10)' in r[1]
+    r = judge(lkmm(test, good, total=20001))
+    assert r[0] == 'failed' and 'Positive + Negative = 20001' in r[1]
+    lines = [ln for ln in lkmm(test, good) if not ln.startswith('Positive:')]
+    assert 'no "Positive: P, Negative: Q" line' in judge(lines)[1]
+    lines = [ln for ln in lkmm(test, good) if not ln.startswith(('Test ', 'Histogram', '10000'))]
+    assert judge(lines) == ('failed', '0 "Test SB+fencembonceonces" blocks in the output, not 1')
+    lines = lkmm(test, good); i = lines.index('PUB-RESULT id=lkmm-SB+fencembonceonces rc=0')
+    assert '2 "Test' in judge(lines[:i] + lkmm(test, good)[2:-3] + lines[i:])[1]            # the output twice
+    assert judge(pub(name, 0, part='115/1'))[0] == 'failed'                                   # no output at all
+    assert v.public(name, {'rc': '0'}, lkmm(test, good), image=None)[0] == 'failed'          # no oracle
+    assert v.public('lkmm-LB+poonceonces', {'rc': '0'}, lkmm('LB+poonceonces', good), image=lkmm_image)[0] == 'failed'
+    assert v.public(name, {'rc': '124'}, pub(name, 124, part='115/1'), image=lkmm_image)[0] == 'failed'   # guest cap
+
+
+def test_public_lkmm_skipped_is_unsupported_only_when_threads_exceed_cpus(lkmm_image):
+    """At 1 vCPU klitmus7 runs no instance of a two-thread test (`NAME: skipped`): unsupported, never passed; a skip
+    where the threads fit (the one-thread CoWW at 1 vCPU, any test at 4) fails."""
+    v = verdicts()
+    skipped = lambda test, cpus: [ln.replace('cpus=4', f'cpus={cpus}') for ln in
+                                  pub('lkmm-' + test, 0, part='115/1', body=[f'{test}: skipped'])]
+    r = v.public('lkmm-SB+poonceonces', {'rc': '0'}, skipped('SB+poonceonces', 1), image=lkmm_image)
+    assert r[0] == 'unsupported' and '2 threads, the guest has 1 CPUs' in r[1]
+    assert v.public('lkmm-SB+poonceonces', {'rc': '0'}, skipped('SB+poonceonces', 4), image=lkmm_image)[0] == 'failed'
+    assert v.public('lkmm-CoWW+poonceonce', {'rc': '0'}, skipped('CoWW+poonceonce', 1), image=lkmm_image)[0] == 'failed'
+    empty = lkmm('SB+poonceonces', [], cpus=1)          # a block with no samples where no instance fits: never a pass
+    r = v.public('lkmm-SB+poonceonces', {'rc': '0'}, empty, image=lkmm_image)
+    assert r[0] == 'failed' and 'yet no `SB+poonceonces: skipped` line' in r[1]
+    crlf = [ln + '\r' for ln in skipped('SB+poonceonces', 1)]       # the serial console's line ends
+    assert v.public('lkmm-SB+poonceonces', {'rc': '0'}, crlf, image=lkmm_image)[0] == 'unsupported'
+    assert 'image' in campaign.inspect.signature(v.public).parameters
+
+
 # --- the committed family ---
 
 def test_correctness_family_declares_its_campaigns():
@@ -1126,9 +1280,37 @@ def test_public_rows_list_boot_and_suite_agree(tmp_path):
     assert list(boot) == [p for p, _ in listed]
     assert all(o['args'] == ('pubcap=300',) for o in boot.values())
     on_kernel = {r[0] for k, r in enumerate(rows) if 'kernel' in boot[f'{k}/1']}
-    assert on_kernel == {r[0] for r in rows if 'modprobe' in r[1] or r[0] == 'mm-cow-gup'}
+    assert on_kernel == {r[0] for r in rows if 'modprobe' in r[1] or 'insmod' in r[1] or r[0] == 'mm-cow-gup'}
     family.load.cache_clear()
     s = family.load(REPO / 'tests' / 'correctness' / 'family.toml').suite('public')
     assert int(s.extra['parts']) == len(rows) and s.matrix == {'machine.vcpus': [1, 4]}
     assert set(s.extra['expected']) <= {r[0] for r in rows}
     assert all('docs/restructure/correctness-public-kernel.md' in why for why in s.extra['expected'].values())
+
+
+def test_public_lkmm_rows(tmp_path):
+    """cases.py's LKMM rows: the original campaign's 35 tests (Linux 6.12.107's tools/memory-model/litmus-tests, sorted
+    bytewise as klitmus7 numbers them: CoWW+poonceonce is litmus003), after the 88 others so their parts keep their
+    numbers, each loading its own module on the test kernel; the smoke list has one."""
+    import subprocess, sys
+    subprocess.run([sys.executable, '-I', str(REPO / 'tools/correctness/recipes/public/cases.py'), str(tmp_path)],
+                   check=True, capture_output=True)
+    rows = [l.split('\t', 1) for l in (tmp_path / 'public-cases.tsv').read_text().splitlines()]
+    names = [n for n in (REPO / 'tools/correctness/recipes/public/lkmm-tests.txt').read_text().splitlines()
+             if n and not n.startswith('#')]
+    assert len(names) == 35 and names == sorted(names) and names[3] == 'CoWW+poonceonce'
+    assert len({n.lower() for n in names}) == 34     # the two Z6.0 lock tests differ only in case: both are listed
+    lkmm = [(k, r) for k, r in enumerate(rows) if r[0].startswith('lkmm-')]
+    assert [k for k, _ in lkmm] == list(range(88, 123))
+    for i, (k, (test, command)) in enumerate(lkmm):
+        assert test == 'lkmm-' + names[i]
+        assert command == f'insmod /opt/public/lkmm/litmus{i:03d}.ko && cat /proc/litmus && rmmod litmus{i:03d}'
+    (tmp_path / 'public-kernel').write_bytes(b'bzImage')
+    boot = campaign.read_boot(tmp_path, 'public')
+    assert all(boot[f'{k}/1'].get('kernel') == tmp_path / 'public-kernel' for k, _ in lkmm)
+    family.load.cache_clear()
+    s = family.load(REPO / 'tests' / 'correctness' / 'family.toml').suite('public')
+    smoke = [rows[int(p.removeprefix('part-'))][0] for p in s.smoke]
+    assert [t for t in smoke if t.startswith('lkmm-')] == ['lkmm-SB+poonceonces']
+    assert smoke[:6] == ['rseq-basic_test', 'qemu-cmpxchg', 'ltp-mmap01', 'kunit-memcpy_kunit', 'kernel-test_bitmap',
+                         'locktorture-spin_lock']

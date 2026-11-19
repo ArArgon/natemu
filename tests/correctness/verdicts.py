@@ -304,7 +304,94 @@ PUB_MODULE_SUCCESS = {'kernel-atomic64_test': re.compile(r'atomic64_test: passed
 PUB_UNRUN = {'incomplete', 'identity-error', 'host-cap', 'guest-cap', 'killed-or-cap'}
 
 
-def public(name, f, extra):
+LKMM_STATE = re.compile(r'(\d+)\s*([*:])>(.*)$')      # klitmus7's histogram line: COUNT, * (condition holds) or :, STATE
+
+
+def _lkmm_norm(s: str) -> tuple:
+    """A final state as klitmus7's histogram and herd7's States print it (`0:r0=1; 1:r1=0; x=2;`): its (location,
+    value) pairs, sorted; a value is a number, or a location's name (a pointer: `1:r0=x`)."""
+    kv = []
+    for x in s.split(';'):
+        x = x.strip()
+        if not x: continue
+        k, v = (w.strip() for w in x.split('=', 1))
+        try: v = int(v, 0)
+        except ValueError: pass
+        kv.append((k.strip('[]'), v))
+    return tuple(sorted(kv, key=lambda p: p[0]))
+
+
+@functools.cache
+def _lkmm_oracle(d: str):
+    """The image's LKMM oracle (recipes/public/build.sh): oracle/lkmm.txt, herd7's output, gives NAME -> (allowed final
+    states, Ok | No: whether the exists-condition is reachable); oracle/lkmm-tests.txt, `MODULE THREADS SIZE RUNS NAME`
+    lines, gives NAME -> (threads, size, runs)."""
+    lines, states = (pathlib.Path(d) / 'lkmm.txt').read_text().splitlines(), {}
+    for i, ln in enumerate(lines):
+        if m := re.match(r'Test (\S+) \S+$', ln):
+            n = int(re.fullmatch(r'States (\d+)', lines[i + 1]).group(1))
+            states[m.group(1)] = ({_lkmm_norm(s) for s in lines[i + 2:i + 2 + n]}, lines[i + 2 + n].strip())
+    meta = {w[4]: tuple(map(int, w[1:4])) for w in map(str.split, (pathlib.Path(d) / 'lkmm-tests.txt').read_text().splitlines())}
+    return states, meta
+
+
+def _lkmm(name, text, image):
+    """One LKMM row (`lkmm-NAME`): klitmus7's /proc/litmus output for NAME, judged by herd7's LKMM states. It passes
+    when the run is whole and every observed final state is one herd7 allows: one `Test NAME` block whose histogram
+    lines number its `Histogram (N states)`, whose counts sum to Positive + Negative, and that sum is the samples the
+    module takes, instances x size x runs (an instance per `threads` online CPUs, from CT-BEGIN's cpus=). A state herd7
+    does not allow fails (FORBIDDEN), whatever the count; allowed states never observed are only noted. `NAME:
+    skipped` (no instance fits) is unsupported when the test has more threads than the guest has CPUs, else failed."""
+    test = name.removeprefix('lkmm-')
+    if image is None: return 'failed', 'no image folder: the herd7 oracle is unknown'
+    states, meta = _lkmm_oracle(str(pathlib.Path(image) / 'oracle'))
+    if test not in states or test not in meta: return 'failed', f'no herd7 oracle for {test} in the image (oracle/lkmm.txt)'
+    (allowed, cond), (threads, size, runs) = states[test], meta[test]
+    m = re.search(r'^CT-BEGIN suite=public part=\S+ cpus=(\d+) ', text, re.M)
+    if not m: return 'failed', 'no CT-BEGIN cpus= line: the online CPUs are unknown'
+    cpus = int(m.group(1))
+    lines = [ln.rstrip('\r') for ln in text.splitlines()]
+    if f'{test}: skipped' in lines:
+        if threads > cpus: return 'unsupported', f'{threads} threads, the guest has {cpus} CPUs: klitmus7 runs no instance (skipped)'
+        return 'failed', f'klitmus7 skipped the test, yet its {threads} threads fit {cpus} CPUs'
+    if threads > cpus: return 'failed', f'{threads} threads, the guest has {cpus} CPUs, yet no `{test}: skipped` line'
+    starts = [i for i, ln in enumerate(lines) if re.fullmatch(rf'Test {re.escape(test)} \S+', ln)]
+    if len(starts) != 1: return 'failed', f'{len(starts)} "Test {test}" blocks in the output, not 1'
+    rest = iter(lines[starts[0] + 1:])
+    h = re.fullmatch(r'Histogram \((\d+) states?\)', next(rest, ''))
+    if not h: return 'failed', 'no "Histogram (N states)" line after the Test line'
+    hist, nlines, garbled, ln = {}, 0, [], ''
+    for ln in rest:
+        if s := LKMM_STATE.fullmatch(ln):
+            try: st = _lkmm_norm(s.group(3))
+            except ValueError: garbled.append(ln); continue
+            hist[st] = hist.get(st, 0) + int(s.group(1)); nlines += 1
+        elif re.match(r'\[\s*\d+\.\d+\]', ln) or not ln.strip(): continue      # the kernel's log, between lines
+        elif ln in ('Ok', 'No'): break
+        else: garbled.append(ln)
+    w = re.search(r'^Positive: (\d+), Negative: (\d+)$', '\n'.join(lines[starts[0]:]), re.M)
+    total, want = sum(hist.values()), (cpus // threads) * size * runs
+    whole = []
+    if garbled: whole.append(f'{len(garbled)} lines in the histogram are not states ({garbled[0]!r})')
+    if nlines != int(h.group(1)): whole.append(f'{nlines} state lines, the histogram declares {h.group(1)}')
+    if w is None: whole.append('no "Positive: P, Negative: Q" line')
+    elif total != int(w.group(1)) + int(w.group(2)): whole.append(f'the state counts sum to {total}, Positive + Negative = '
+                                                                  f'{int(w.group(1)) + int(w.group(2))}')
+    if total != want: whole.append(f'{total} samples, the module takes {want} ({cpus // threads} instances x {size} x {runs})')
+    if whole: return 'failed', 'incomplete klitmus7 output: ' + '; '.join(whole)
+    forbidden = [(s, c) for s, c in sorted(hist.items(), key=str) if s not in allowed]
+    if forbidden:
+        return 'failed', 'FORBIDDEN under the LKMM (herd7): ' + ' | '.join(f'{_state(s)} x{c}' for s, c in forbidden)
+    unseen = allowed - set(hist)
+    shown = re.search(rf'^Observation {re.escape(test)} (\S+) ', text, re.M)
+    note = (f'{total} samples ({cpus // threads} x {size} x {runs}), {len(hist)} states, all allowed by herd7\'s LKMM; '
+            f'{len(unseen)} of {len(allowed)} allowed states never observed; the condition: herd7 {cond}, observed '
+            f'{shown.group(1) if shown else "?"}')
+    if unseen: note += ' (unseen: ' + ' | '.join(_state(s) for s in sorted(unseen, key=str)) + ')'
+    return 'passed', note
+
+
+def public(name, f, extra, image=None):
     """run-public.sh, one test per boot: `PUB-START id=ID cap=S` ... `PUB-RESULT id=ID rc=N`; `extra` is the boot's
     whole serial output, judged by public-campaign.py's classify, then by the row's own success signal:
       - a kernel splat anywhere in the boot (public-campaign.py's SPLAT: Oops, BUG, WARNING, panic, RCU stall,
@@ -315,7 +402,8 @@ def public(name, f, extra):
         `atomic64_test: passed`; `test_bitmap: all N tests passed`; torture's `End of test: SUCCESS`. Without it the
         row is `unverified`, never passed;
       - vmalloc-*: test_vmalloc returns -EAGAIN after its results by design, so modprobe's status says nothing; it
-        passes with at least one `Summary: ...` line and every one `failed: 0`, and fails otherwise."""
+        passes with at least one `Summary: ...` line and every one `failed: 0`, and fails otherwise;
+      - lkmm-*: a row that ran to the end is judged by herd7's LKMM states in the image folder (_lkmm)."""
     text = '\n'.join(extra) + '\n'
     rc = f.get('rc')
     m = re.search(r'^CT-BEGIN suite=public part=(\d+)/1 ', text, re.M)
@@ -331,6 +419,7 @@ def public(name, f, extra):
         return 'failed', (f'test_vmalloc failed: {", ".join(bad)}' if bad else 'no test_vmalloc Summary: line') + f' (rc={rc})'
     if c == 'skip': return 'unsupported', f'skip (rc={rc})'
     if c != 'completed-needs-oracle-review': return 'failed', f'{c} (rc={rc})'
+    if family == 'lkmm': return _lkmm(name, text, image)
     if family in PUB_PROGRAMS: return 'passed', 'rc 0, no failing TAP line'
     signals = PUB_SUCCESS.get(family) or ((PUB_MODULE_SUCCESS[name],) if name in PUB_MODULE_SUCCESS else ())
     if signals and all(s.search(text) for s in signals):

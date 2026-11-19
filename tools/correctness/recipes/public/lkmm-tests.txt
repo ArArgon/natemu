@@ -1,0 +1,38 @@
+# The LKMM corpus (build.sh, cases.py): every tools/memory-model/litmus-tests/*.litmus of Linux 6.12.107, in klitmus7's
+# order, the file names sorted bytewise (litmusNNN.ko is the NNN-th name, from 000). build.sh fails when the source's
+# list differs. Two names differ only in case (the Z6.0 lock tests): a case-insensitive file system holds only one.
+CoRR+poonceonce+Once
+CoRW+poonceonce+Once
+CoWR+poonceonce+Once
+CoWW+poonceonce
+IRIW+fencembonceonces+OnceOnce
+IRIW+poonceonces+OnceOnce
+ISA2+pooncelock+pooncelock+pombonce
+ISA2+poonceonces
+ISA2+pooncerelease+poacquirerelease+poacquireonce
+LB+fencembonceonce+ctrlonceonce
+LB+poacquireonce+pooncerelease
+LB+poonceonces
+LB+unlocklockonceonce+poacquireonce
+MP+fencewmbonceonce+fencermbonceonce
+MP+onceassign+derefonce
+MP+polockmbonce+poacquiresilsil
+MP+polockonce+poacquiresilsil
+MP+polocks
+MP+poonceonces
+MP+pooncerelease+poacquireonce
+MP+porevlocks
+MP+unlocklockonceonce+fencermbonceonce
+R+fencembonceonces
+R+poonceonces
+S+fencewmbonceonce+poacquireonce
+S+poonceonces
+SB+fencembonceonces
+SB+poonceonces
+SB+rfionceonce-poonceonces
+WRC+poonceonces+Once
+WRC+pooncerelease+fencermbonceonce+Once
+Z6.0+pooncelock+poonceLock+pombonce
+Z6.0+pooncelock+pooncelock+pombonce
+Z6.0+pooncerelease+poacquirerelease+fencembonceonce
+dep+plain

@@ -6,3 +6,5 @@ correctness/run-public.sh
 play/rootfs.sh
 play/mkcpio.py
 play/init
+correctness/x86-remote.sh
+correctness/recipes/litmus/ocaml-debs.sha256

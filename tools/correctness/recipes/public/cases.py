@@ -4,11 +4,16 @@
   OUT/public-cases.txt   `PART TEST` per row (testkit/harness/campaign.py's list): PART = K/1, TEST = ID
   OUT/public-boot.txt    `PART [kernel=FILE] WORD...` per row: the kernel the part boots (a file of the image folder;
                          none: the stock Debian kernel) and the words added to its command line (pubcap=, the guest cap)
-The rows are tools/correctness/public-prepare.py's users-01 and kernel batches (without the LKMM corpus, not built
-yet), then the follow-ups that changed a fixture: mremap_test with overcommit and no ASLR (fixtures-01, layout-01),
-COW on the GUP_TEST kernel (gup-cow-01) and the IRQ locking and 90 s RCU/SRCU forward-progress torture (torture-01)."""
+The rows are tools/correctness/public-prepare.py's users-01 and kernel batches, then the follow-ups that changed a
+fixture: mremap_test with overcommit and no ASLR (fixtures-01, layout-01), COW on the GUP_TEST kernel (gup-cow-01) and
+the IRQ locking and 90 s RCU/SRCU forward-progress torture (torture-01), then the kernel batches' LKMM corpus: one row
+lkmm-NAME per lkmm-tests.txt name, its klitmus7 module litmusNNN.ko (NNN: its line, from 000) loaded, run through
+/proc/litmus and unloaded, on the test kernel. A row is listed at every vCPU count: the verdict calls a module that
+ran no instance (more threads than CPUs, `NAME: skipped`) unsupported, as the original campaign's ineligible N1 runs."""
 import pathlib
 import sys
+
+LKMM = [n for n in (pathlib.Path(__file__).parent / 'lkmm-tests.txt').read_text().splitlines() if n and not n.startswith('#')]
 
 KERNEL = 'public-kernel'        # the test kernel build.sh builds (Debian's config + the test modules + GUP_TEST)
 CAP = 300                       # guest seconds per command (the campaign's default bound)
@@ -67,6 +72,10 @@ for name in ('rcu', 'srcu'):                                                    
 # gup-cow-01: COW with GUP_TEST (debugfs) and eight 2 MiB huge pages.
 add('mm', 'cow-gup', 'mount -t debugfs none /sys/kernel/debug && echo 8 > /proc/sys/vm/nr_hugepages '
                      '&& cd /opt/public/mm && ./cow', KERNEL)
+# kernel-*'s LKMM corpus (public-prepare.py: insmod, cat /proc/litmus, rmmod), the modules' compiled defaults.
+for k, name in enumerate(LKMM):
+    m = f'litmus{k:03d}'
+    add('lkmm', name, f'insmod /opt/public/lkmm/{m}.ko && cat /proc/litmus && rmmod {m}', KERNEL)
 
 out = pathlib.Path(sys.argv[1])
 assert len({r[0] for r in rows}) == len(rows), 'a test id twice'
