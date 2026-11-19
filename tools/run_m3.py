@@ -12,11 +12,12 @@ every access counted and logged). Needs fexc series23-m3 (completion records on 
 
 - `corpus`: seeded straight-line MOV-family programs (MOV loads and stores of 1/2/4/8 bytes incl. AH..BH and REX byte
   registers, MOV of an immediate, MOVZX, MOVSX, MOVSXD, moffs, absolute, RIP-relative, base+index*scale+disp, FS/GS) on
-  the device page. Registers, RFLAGS, RIP and the page's final bytes against pinned QEMU running the same program on RAM
-  (`tools/reference/ref.py`: a RAM-like device must give RAM's results), and the device's access log (offset, size,
-  direction, value, in order: each instruction exactly once) against `tools/models/mmio_model.py` (independent author),
-  which also rederives the registers. Also 6 fixed encodings (REX before 66, judged by the SDM where pinned QEMU differs;
-  66 before REX.W, BPL/CH stores, imm16, a 16-bit moffs). Block sizes default and 1, CPL 3 and 0.
+  the device page. The device's access log (offset, size, direction, value, in order: each instruction exactly once),
+  the registers, RIP and the page's final bytes against `tools/models/mmio_model.py` (independent author: a RAM-like
+  device must give RAM's results), RFLAGS unchanged (no MOV-family instruction writes a flag). Also 6 fixed encodings
+  (REX before 66, which the model refuses: judged by the SDM's registers, Vol.2 2.2.1; 66 before REX.W, BPL/CH stores,
+  imm16, a 16-bit moffs). Block sizes default and 1, CPL 3 and 0. (Pinned QEMU, once compared here, keeps REX.W in
+  `48 66 8b 03` and loads 8 bytes.)
 - `faults`: the guest tables' faults come before the device (#PF not present / user-supervisor / read-only / reserved bit /
   an upper level not present / the second page of a crossing access, #GP and #SS non-canonical, #AC under alignment
   checking), each delivered with its vector, error code and CR2 at the instruction, the device untouched; the passing
@@ -44,15 +45,15 @@ every access counted and logged). Needs fexc series23-m3 (completion records on 
 
 Writes DIR/m3.json; exit status 1 on any failure."""
 import argparse, concurrent.futures as cf, json, pathlib, random, subprocess, sys
-from raw_root import RAW_ROOT
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools' / 'reference')); sys.path.insert(0, str(ROOT / 'tools' / 'models'))
-import case_results, ref, answers, run_slice1_vm as vm  # noqa: E402
+import case_results, ref, run_slice1_vm as vm  # noqa: E402
 from run_slice3_vm import kick_checks  # noqa: E402
 
 CODE, DEV, GPA, PREV, NEXT = 0x100000, 0x200000, 0xfeb0_0000, 0x1ff000, 0x201000
 M64 = 2**64 - 1
+FLAGS = 0x8d5                                        # CF PF AF ZF SF OF
 REGS = ['rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi'] + [f'r{i}' for i in range(8, 16)]
 R32 = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi'] + [f'r{i}d' for i in range(8, 16)]
 R16 = ['ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'] + [f'r{i}w' for i in range(8, 16)]
@@ -157,8 +158,8 @@ def corpus_programs(n, seed):
                               ('ch-store', '882b', 8), ('imm16', '66c7037856', 16), ('moffs16', '66a11002200000000000', 16)):
         gpr = [0x1111_1111_1111_1111 * (i + 1) & M64 for i in range(16)]
         gpr[BASE], gpr[4] = DEV + 0x10, 0x7f0000
-        # SDM Vol.2 2.2.1: a REX prefix not immediately before the opcode is ignored (`48 66 8b 03` is MOV AX, [RBX]); pinned
-        # QEMU 7.2 keeps REX.W and loads 8 bytes.
+        # SDM Vol.2 2.2.1: a REX prefix not immediately before the opcode is ignored (`48 66 8b 03` is MOV AX, [RBX]: the
+        # device bytes 10H, 11H into AX, the rest of RAX kept).
         sdm = {'sdm_rax': gpr[0] & ~0xffff | 0x1110, 'sdm_width': 2} if name == 'rex-before-66' else {}
         out.append(sdm | {'name': f'm3-{name}', 'code': code, 'rip': hex(CODE), 'gpr': [hex(x) for x in gpr], 'rflags': '0x0',
                     'memory': [{'addr': hex(DEV), 'data': (bytes(range(256)) * 8).hex()}], 'insns': [{'op': 'mov', 'width': width}],
@@ -169,40 +170,32 @@ def corpus_programs(n, seed):
 def corpus(a, host, runtime, report):
     import mmio_model
     progs = corpus_programs(a.programs, a.seed)
-    raw = RAW_ROOT
-    qemu = raw / 'reference-slice1-20261026-01' / 'pin' / 'qemu-x86_64-static'
-    expected_path = a.out / 'qemu.json'
-    if answers.active():        # (NATEMU_ANSWERS seed/locked: the answers carry their keys, no local file of them)
-        expected = {p['name']: r for p, r in zip(progs, ref.run_programs(progs, a.out / 'qemu-work', qemu)[0])}
-    else:
-        if not expected_path.exists():
-            results, _ = ref.run_programs(progs, a.out / 'qemu-work', qemu)
-            expected_path.write_text(json.dumps(results))
-        expected = {r['name']: r for r in json.loads(expected_path.read_text())}
     failures = []
     def one(job):
         p, block, cpl = job
         text = vm.description(dict(p, memory=[]) | ({'cpl': cpl})) + mmio_lines(bytes.fromhex(p['memory'][0]['data']))
         rc, out, err = driver(host, runtime, a.fexc, text, a.out / 'corpus' / f"{p['name']}-{block}-{cpl}", [block] if block else [])
         if out is None: return [f'driver {rc}: {err}']
-        want, gpr = expected[p['name']], [int(x, 0) for x in out['gpr']]
-        if 'sdm_rax' in p:      # QEMU differs from the SDM here (judged by the SDM's value instead): RAX is not compared with QEMU
-            want, gpr = answers.view(want, 'rax-not-compared', lambda r: dict(r, qemu=dict(r['qemu'], gpr=['0x0'] + r['qemu']['gpr'][1:]))), [0] + gpr[1:]
-        diffs = ref.compare(want, gpr, int(out['rflags'], 0), int(out['rip'], 0), out['memory'])
-        if 'sdm_rax' in p:
-            diffs = [d for d in diffs if not d.startswith('rax:')] + ([] if int(out['gpr'][0], 0) == p['sdm_rax'] else [f"rax {out['gpr'][0]} != SDM {p['sdm_rax']:#x}"])
-        if out['stop'] != 'reached': diffs.insert(0, f"stopped {out['stop']} {out['reason']}")
+        diffs = [] if out['stop'] == 'reached' else [f"stopped {out['stop']} {out['reason']}"]
+        got = [int(x, 0) for x in out['gpr']]
+        # No MOV-family instruction writes a flag: the status flags are the program's own.
+        if int(out['rflags'], 0) & FLAGS != int(p['rflags'], 0) & FLAGS: diffs.append(f"rflags {out['rflags']} != {p['rflags']} (status flags kept)")
         gpr = [int(x, 0) for x in p['gpr']]
         log = [(e[1], e[2], e[3], int(e[4], 0)) for e in out['devices'][0]['log']]
         try:
             model = mmio_model.run(bytes.fromhex(p['code']), CODE, gpr, int(p['fsbase'], 0), int(p['gsbase'], 0), DEV,
                                    bytes.fromhex(p['memory'][0]['data']) + bytes(0x800))
-        except ValueError:      # the model refuses a prefix after REX (its documented choice): QEMU/SDM alone, one access
-            width = p.get('sdm_width')
-            ok = len(log) == 1 and out['mmio']['completed'] == 1 and (width is None or log[0][1] == width)
-            return diffs + ([] if ok else [f'device log {log} (SDM width {width})'])
+        except ValueError:      # the model refuses a prefix after REX (its documented choice): the SDM's result, one 2-byte load
+            want = dict(enumerate(gpr)) | {0: p['sdm_rax']}
+            diffs += [f'{REGS[k]} {got[k]:#x} != SDM {v:#x}' for k, v in want.items() if got[k] != v]
+            if int(out['rip'], 0) != CODE + len(bytes.fromhex(p['code'])): diffs.append(f"rip {out['rip']} != the instruction's end")
+            if out['memory'][0]['data'] != p['memory'][0]['data']: diffs.append('device bytes changed by a load')
+            one = (0x10, p['sdm_width'], 0, p['sdm_rax'] & 0xffff)
+            ok = log == [one] and out['mmio']['completed'] == 1
+            return diffs + ([] if ok else [f'device log {log} != [{one}] (SDM)'])
         if log != [tuple(x) for x in model['accesses']]: diffs.append(f"device log {log} != model {model['accesses']}")
-        if model['gpr'] != [int(x, 0) for x in out['gpr']]: diffs.append('model registers differ')
+        if model['gpr'] != got: diffs.append(f"model registers differ: {[(REGS[k], hex(g), hex(w)) for k, (g, w) in enumerate(zip(got, model['gpr'])) if g != w]}")
+        if model['rip'] != int(out['rip'], 0): diffs.append(f"rip {out['rip']} != model {model['rip']:#x}")
         if model['device_bytes'][:0x800].hex() != out['memory'][0]['data']: diffs.append('model device bytes differ')
         if out['mmio']['completed'] != len(model['accesses']): diffs.append(f"completed {out['mmio']['completed']} != {len(model['accesses'])}")
         return diffs
