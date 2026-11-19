@@ -4,6 +4,7 @@
 The real unmodified compiler receives each request; only host response consumption
 is held. This does not assert the compiler process remains busy. All guest RAM
 observations use production copy windows or the final post-VM driver report.
+Run by the io family (tests/io/family.toml, suite io-program) with --no-lock; alone it takes the VM lock itself.
 """
 import argparse
 import copy
@@ -218,6 +219,7 @@ def main():
     run = sub.add_parser('run')
     for key in ('host', 'runtime', 'fexc', 'out'): run.add_argument('--' + key, type=pathlib.Path, required=True)
     run.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
+    run.add_argument('--no-lock', action='store_true', help='the caller holds the machine (the test framework queues the case)')
     args = parser.parse_args()
     if args.action == 'self-check': self_check(); return 0
     args.out = args.out.resolve(); args.out.mkdir(parents=True, exist_ok=False); meta = fixture(args.out)
@@ -235,7 +237,7 @@ def main():
     (args.out / 'command.json').write_text(json.dumps(command, indent=2) + '\n')
     started, timeout = time.monotonic(), False
     with args.lock.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not args.no_lock: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with (args.out / 'stdout.log').open('wb') as stdout, (args.out / 'stderr.log').open('wb') as stderr:
             process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
             try: process.wait(timeout=120)

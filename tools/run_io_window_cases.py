@@ -6,6 +6,7 @@ in --prepare-only mode. High RAM and PTE alias cases check concrete addressing /
 translation outcomes. HLT and AP cases check native waiting plus successful window
 interleavings, not which individual grant was acknowledged in a waiting state.
 This script shares authorship with run_io_windows.py and is not independent evidence.
+Run by the io family (tests/io/family.toml, suite io-program) with --no-lock; alone it takes the VM lock itself.
 """
 import argparse
 import fcntl
@@ -220,6 +221,7 @@ def main():
     parser.add_argument('--prepare-only', action='store_true')
     for name in ('host', 'runtime', 'fexc'): parser.add_argument('--' + name, type=pathlib.Path)
     parser.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
+    parser.add_argument('--no-lock', action='store_true', help='the caller holds the machine (the test framework queues the case)')
     args = parser.parse_args()
     if len(set(args.cases)) != len(args.cases): parser.error('duplicate cases')
     if not args.prepare_only:
@@ -243,11 +245,12 @@ def main():
     if args.prepare_only: return 0
     results = []
     with args.lock.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not args.no_lock: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for case, work, config in prepared:
             results.append(run(args, case, work, config))
             if not results[-1]['pass']: break
-    (args.out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+    rows = [dict(r, name=r['case'], outcome='match' if r['pass'] else 'fail', diffs=r['errors']) for r in results]   # per-case rows for the framework
+    (args.out / 'results.json').write_text(json.dumps({'results': rows}, indent=2) + '\n')
     return 0 if len(results) == len(args.cases) and all(r['pass'] for r in results) else 1
 
 

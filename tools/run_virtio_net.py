@@ -4,6 +4,7 @@
 The independent owned-packet endpoint echoes each TX once, with no native network
 or guest-memory access. These are frontend development checks, not native backend
 acceptance or performance evidence. No builds, retries, privileges or network calls.
+Run by the io family (tests/io/family.toml, suite io-program) with --no-lock; alone it takes the VM lock itself.
 """
 import argparse
 import copy
@@ -427,6 +428,7 @@ def main():
     run.add_argument('--cases', nargs='+', choices=CASES, default=list(CASES))
     run.add_argument('--expect-idle-end', action='store_true', help='isolated missing-guard control only: require Halted without RX/IRQ effects')
     run.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
+    run.add_argument('--no-lock', action='store_true', help='the caller holds the machine (the test framework queues the case)')
     args = parser.parse_args()
     if args.action == 'self-check': self_check(); return 0
     args.out = args.out.resolve(); args.out.mkdir(parents=True, exist_ok=False)
@@ -446,10 +448,11 @@ def main():
     (args.out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     results = []
     with args.lock.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not args.no_lock: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for case in args.cases:
             result = run_case(args, case); results.append(result)
-            (args.out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+            rows = [dict(r, name=r['case'], outcome='match' if r['pass'] else 'fail', diffs=r['errors']) for r in results]   # per-case rows for the framework
+            (args.out / 'results.json').write_text(json.dumps({'results': rows}, indent=2) + '\n')
             if not result['pass']: break
     return 0 if len(results) == len(args.cases) and all(r['pass'] for r in results) else 1
 

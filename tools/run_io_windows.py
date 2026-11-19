@@ -5,6 +5,7 @@ Run from the retained source used to build HOST/RUNTIME. No builds or automatic 
 Three serial VMs (N=1,2,4), at most 120 seconds each. Full inputs, logs, artifact/source
 hashes and verdicts are retained. These are exploratory checks, not performance evidence.
 HLT/AP, high RAM, device reset/IRQ and compiler-timeout cases are outside this first slice.
+Run by the io family (tests/io/family.toml, suite io-program) with --no-lock; alone it takes the VM lock itself.
 """
 import argparse
 import fcntl
@@ -119,6 +120,7 @@ def main():
     for option in ('host', 'runtime', 'fexc', 'out'):
         parser.add_argument('--' + option, type=pathlib.Path, required=True)
     parser.add_argument('--lock', type=pathlib.Path, default=VM_LOCK)
+    parser.add_argument('--no-lock', action='store_true', help='the caller holds the machine (the test framework queues the case)')
     parser.add_argument('--cpus', type=int, nargs='+', choices=(1, 2, 4), default=[1, 2, 4])
     parser.add_argument('--preserve-code', action='store_true', help='also require unrelated compiled code to survive I/O writes')
     args = parser.parse_args()
@@ -140,13 +142,14 @@ def main():
     (args.out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     results = []
     with args.lock.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not args.no_lock: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for n in args.cpus:
             result = run_case(args, n)
             results.append(result)
             # Retain the first failure; do not spend further launches or hide it with retries.
             if not result['pass']: break
-    (args.out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+    rows = [dict(r, name=f"n{r['n']}", outcome='match' if r['pass'] else 'fail', diffs=r['errors']) for r in results]   # per-case rows for the framework
+    (args.out / 'results.json').write_text(json.dumps({'results': rows}, indent=2) + '\n')
     return 0 if len(results) == len(args.cpus) and all(r['pass'] for r in results) else 1
 
 
