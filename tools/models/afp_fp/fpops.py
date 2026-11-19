@@ -104,10 +104,20 @@ def H_sqrt(S, base, ops, vex):
         d, a = ops; size = d['size']
         S.wv(d, P([fp.sqrt(f, v, S.mode, S.mx, S.st) for v in L(S.read(a, size), w, size // w)], w), size, vex)
 reg('sqrtps sqrtpd sqrtss sqrtsd', H_sqrt)
-def rcp_fn(S, f, v): return fp.div(f, 0x3f800000, v, S.mode, S.mx, set())
-def rsq_fn(S, f, v):
+# RCPPS/RCPSS/RSQRTPS/RSQRTSS: the model's value is QEMU's (1/x, 1/sqrt(x) correctly rounded). APPROX, when set,
+# is called with (simulator, kind 'rcp'|'rsqrt', input bits, that value) for every lane in program order and returns the lane's
+# result instead (tools/models/afp_fp/approx.py: the SDM's rules, and the judge's perturbations).
+APPROX = None
+def _rcp(S, f, v): return fp.div(f, 0x3f800000, v, S.mode, S.mx, set())
+def _rsq(S, f, v):
     t = fp.sqrt(f, v, S.mode, S.mx, set())
     return fp.div(f, 0x3f800000, t, S.mode, S.mx, set())
+def rcp_fn(S, f, v):
+    r = _rcp(S, f, v)
+    return APPROX(S, 'rcp', v, r) if APPROX else r
+def rsq_fn(S, f, v):
+    r = _rsq(S, f, v)
+    return APPROX(S, 'rsqrt', v, r) if APPROX else r
 def H_rcp(fn):
     def h(S, base, ops, vex):
         f = F32; w = 32

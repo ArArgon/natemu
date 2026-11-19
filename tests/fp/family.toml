@@ -20,6 +20,8 @@ kind = "deterministic"
 harness = "programs"
 input = "i8"
 reference = "qemu"
+# RCPPS/RSQRTPS and scalar forms: any result the Intel SDM allows passes (tools/models/afp_fp/approx.py)
+judge = "approx"
 matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false], "engine.max_block" = [0, 1] }
 batch = 64
 smoke = ["i8-forms-000"]
@@ -32,6 +34,8 @@ kind = "deterministic"
 harness = "programs"
 input = "i8b"
 reference = "qemu"
+# RCPPS/RSQRTPS and scalar forms: any result the Intel SDM allows passes (tools/models/afp_fp/approx.py)
+judge = "approx"
 matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false], "engine.max_block" = [0, 1] }
 batch = 64
 smoke = ["i8-forms-000"]

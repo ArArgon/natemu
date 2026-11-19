@@ -9,6 +9,7 @@ listed last; natemu bugs are recorded here, not fixed.
 
 | Step / case | Host | Observed | Reproduce |
 | --- | --- | --- | --- |
+| RCPPS/RCPSS/RSQRTPS/RSQRTSS on SDM-fixed inputs: i8 `i8-forms-057`; i8b `i8-forms-031`, `i8-random-097`, `-103`, `-111` (fp family, both FP modes where not excluded) | M2 Max | natemu returns QEMU's correctly rounded value where the SDM fixes the result: a denormal source gives a finite number (RSQRT of 0x00000001 gives 0x64b504f3, RCP of 0x0000004e gives 0x7f7fffff) where the SDM treats it as 0.0 and gives infinity, and RCP of 0x7f7fffff gives the denormal 0x00200001 where the SDM flushes the tiny result to 0.0. The Ryzen follows the SDM in all of them. Found by the approximation judge (tools/models/afp_fp/approx.py). | `tools/natemu-test run tests/fp --fresh -k "i8-forms-057 or i8-forms-031 or i8-random-097 or i8-random-103 or i8-random-111"` |
 | `i8-faults-m2a`, case `chain3-movaps-mis` | M2 Max (no AFP), accurate FP | "cut run did not reach its hlt: watchdog resident pc=0x8000400cf210 shadows_asked=[] retries=0"; xmm and ymmh changed at the fault. 845 of 846 cases pass. | `NATEMU_FP=accurate tools/with-env python3 tools/run_i8_faults.py --fexc FEXC --out OUT` (the step's argv in tools/run_suite.py) |
 
 Load-sensitive, not settled as bugs: both failed only while several agents loaded the M2 Max, and both passed on the first
@@ -86,7 +87,14 @@ What each kind means for the references:
   the exact bits are each processor's own table. QEMU returns the correctly rounded 1/x and 1/√x, the Ryzen its own
   approximation (low mantissa bits differ), and Intel parts have yet another. The locks take QEMU's value, which natemu
   reproduces in accurate mode: valid under the SDM but bit-identical to no real processor. Each processor's table is
-  fixed: the 24 programs gave the same bits in three runs on the Ryzen (November 18).
+  fixed: the 24 programs gave the same bits in three runs on the Ryzen (November 18). Since November 18 the 60 i8/i8b
+  programs that use these instructions are judged by the SDM's rules (`judge = "approx"`, tools/models/afp_fp/approx.py)
+  instead of the locked bits: any result within the bound passes (ready for an Arm reciprocal-estimate lowering), and
+  the SDM's fixed results (infinity for 0.0 and denormal sources, the default NaN for negative RSQRT sources, 0.0 for
+  tiny RCP results) are required. The Ryzen's results pass all 60 but `i8-random-097`, its known NaN-choice departure.
+  The SDM prints the tiny-result thresholds with the directions reversed; the judge reads them as the arithmetic
+  requires (sources up to 1.11111111110100000000000b * 2^125 give a normal result, from
+  1.00000000000110000000001b * 2^126 the result is 0.0, either in between).
 - **Two-NaN choices.** QEMU departs from the SDM's rule in the four i8b cases above and in `i8-forms-044` (already from
   x86); the Ryzen departs from it in `i8-random-058` (HADDPD keeps the other NaN), where the SDM model gives QEMU's answer,
   as for the three i8b cases already on the model.

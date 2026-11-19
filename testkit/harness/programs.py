@@ -45,6 +45,13 @@ def qemu_pin() -> str:
     return ref.PINS['qemu-x86_64-static']
 
 
+def _approx():
+    md = str(paths.repo_root() / 'tools' / 'models' / 'afp_fp')
+    if md not in sys.path: sys.path.insert(0, md)
+    import approx
+    return approx
+
+
 def sources() -> list[pathlib.Path]:
     """What decides an answer besides the input (R2.7): this normalizer and the reference tool's sources."""
     from testkit.harness import normalize_programs
@@ -186,7 +193,8 @@ class Programs:
                 fp = it.variant.get('engine.fp')
                 e = dict(env, **({'NATEMU_FP': fp} if fp else {}))
                 key = self._reuse_key(n, locked, it)
-                if not config.getoption('fresh') and (hit := self._reused(key)):
+                judged = suite.judge == 'approx' and _approx().uses_approx(p)
+                if not judged and not config.getoption('fresh') and (hit := self._reused(key)):
                     ok = hashlib.sha256(hit).hexdigest() == want
                     out[it.nodeid] = CaseResult('passed' if ok else 'failed', '' if ok else 'reused output differs from the lock',
                                                 'reused' if ok else None); continue
@@ -201,7 +209,10 @@ class Programs:
                 problems += v1.page_checks(p, vm)
                 m = locked.get('masks', {}).get(it.case)
                 got = normalize(p, vm, int(m, 16) if m else None)
-                if hashlib.sha256(got).hexdigest() != want:
+                if judged:
+                    run_prefix = lambda q, it=it, e=e: self._prefix_memory(n, fexc, q, e, pathlib.Path(td) / 'prefix' / q['name'], it)
+                    problems += self._judge_approx(suite, p, vm, want, int(m, 16) if m else None, got, run_prefix)
+                elif hashlib.sha256(got).hexdigest() != want:
                     problems.append('final state differs from the locked answer'
                                     + ('' if not config.getoption('diff') else ': ' + self._diff(p, vm)))
                 if problems:
@@ -210,6 +221,36 @@ class Programs:
                     self._store(key, got)
                     out[it.nodeid] = CaseResult('passed', output=got)
         return out
+
+    def _judge_approx(self, suite, p, vm, want, mask, got, run_prefix) -> list[str]:
+        """RCP/RSQRT programs (suite `judge = "approx"`): judged by the Intel SDM's rules (tools/models/afp_fp/approx.py)
+        instead of the locked bits, which are one processor's approximations. The model must first reproduce the
+        locked answer, so everything but the approximations is still checked against the reference."""
+        ap = _approx()
+        import fp as fpmodel, predict
+        r = self.reference_of(suite, p['name'])
+        if r not in ('qemu', 'model'): return [f'approx judge: no model rules for reference {r}']
+        mode = fpmodel.Q if r == 'qemu' else fpmodel.BASE
+        if answer(p, predict.model_result(p, mode)['qemu'], mask) != want:
+            return ['approx judge: the model does not reproduce the locked answer, so it cannot judge this program']
+        mem = [(int(x['addr'], 16) if isinstance(x['addr'], str) else x['addr'], bytes.fromhex(x['data'])) for x in vm['memory']]
+        st, problems = ap.judge(p, mode, mem, ap.prefix_reader(p, mode, run_prefix))
+        shape = predict.model_result(p, mode)
+        exp = predict.as_expected(st, shape)
+        if normalize(p, exp['qemu'], mask) != got:
+            ref, _ = _ref()
+            d = ref.compare(exp, [ref.num(x) for x in vm['gpr']], ref.num(vm['rflags']), ref.num(vm['rip']), vm['memory'])
+            words = ap.word_diffs(list(st[2]), mem)
+            problems.append('final state differs from the SDM-judged expectation'
+                            + (f" (memory words: {'; '.join(words)})" if words else f": {'; '.join(d)[:800] or 'masked bits'}"))
+        return problems
+
+    def _prefix_memory(self, n, fexc, q, env, work, it):
+        """natemu's final memory for a prefix program (the judge reads a consumed approximation from it), or None."""
+        if (cpl := it.variant.get('program.cpl')) is not None: q = dict(q, cpl=cpl)
+        vm = self._run_natemu(n, fexc, q, env, work, it.variant.get('engine.max_block') or None)
+        if isinstance(vm, str) or vm.get('stop') != 'reached': return None
+        return [(int(x['addr'], 16) if isinstance(x['addr'], str) else x['addr'], bytes.fromhex(x['data'])) for x in vm['memory']]
 
     @staticmethod
     def _tools():

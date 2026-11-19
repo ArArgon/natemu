@@ -97,6 +97,11 @@ Each combination of matrix values is its own test, named like `i8-forms-000[afp=
 `machine.*` keys are natemu settings; `host.<feature>` keys are requirements on the Mac (features are listed in
 `tests/features.toml`). A machine with a feature also runs the variants that need it absent by hiding it.
 
+Where x86 leaves a result to the processor, a locked answer would pin one processor's choice. A programs suite with
+`judge = "approx"` judges RCPPS, RCPSS, RSQRTPS and RSQRTSS by the Intel SDM's rules instead
+(tools/models/afp_fp/approx.py): any result within the SDM's error bound passes, the results the SDM fixes are
+required, and the rest of the program is still checked against the locked answer.
+
 A family's `rules.py` may define `applies(suite, case, variant, met)` returning a reason to exclude a case from a
 variant. A variant only ever checks correct behavior; testing a documented wrong behavior belongs in its own test.
 
