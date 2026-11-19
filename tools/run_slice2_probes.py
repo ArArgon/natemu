@@ -151,6 +151,11 @@ PROBES = [
     {'name': 'call-loop', 'gpr': gprs(rsp=STACK + 0x800), 'memory': [{'addr': STACK, 'data': '00' * 0x1000}],
      'functions': {'f': ['add rax, rcx', 'xor rbx, rax'], 'g': ['imul rdx, rbx', 'sub rdx, 3']},
      'main': [('loop', 'ecx', 30, [('call', 'f'), 'add rdi, 1', ('call', 'g'), ('call', 'f')])]},
+    # A misaligned stack pointer (RSP = 4 mod 8): each run's stack alignment check (fexc --push-run) fires and the push runs alone
+    # in a step block, until the vCPU's code is requested without the check (`Cpu::stack_traps`, STACK_TRAP_LIMIT = 16 firings):
+    # the steps stay bounded (`steps_max`) instead of one per iteration, and the result is QEMU's.
+    {'name': 'misaligned-stack', 'gpr': gprs(rsp=STACK + 0x804), 'memory': [{'addr': STACK, 'data': '00' * 0x1000}], 'steps_max': 40,
+     'main': [('loop', 'ecx', 100, ['push rax', 'push rbx', 'add rbx, rcx', 'pop rdx', 'pop rsi'])]},
     # Two blocks 4 KiB apart share an L1 slot: every dispatch between them is an L1 miss found in L2
     # (`add` 3 bytes and a 5-byte `jmp` precede the gap).
     {'name': 'l1-conflict', 'gpr': gprs(), 'memory': [],
@@ -284,7 +289,11 @@ def main():
                 diffs.insert(0, f"stopped {state['stop']} {state['reason']} at {state['rip']}, end {end:#x}")
             if flushes and s['flushes'] < 3:
                 diffs.append(f"expected repeated flushes, got {s['flushes']}")
-            if flushes is False and (s['flushes'] != 1 or s['host_requests'] != s['distinct'] or s['requests'] != s['host_requests']):
+            steps_max = next(p for p in PROBES if p['name'] == name).get('steps_max')
+            if steps_max is not None:    # the code context changes once (blocks are requested again under it): no request-count check
+                if s['steps'] > steps_max:
+                    diffs.append(f"{s['steps']} steps, at most {steps_max}")
+            elif flushes is False and (s['flushes'] != 1 or s['host_requests'] != s['distinct'] or s['requests'] != s['host_requests']):
                 diffs.append(f"requests {s['requests']}/{s['host_requests']} vs distinct blocks {s['distinct']}, flushes {s['flushes']}")
             entry['stats'] = s
         entry['diffs'] = diffs

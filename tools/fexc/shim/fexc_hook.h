@@ -106,7 +106,7 @@ inline int fexc_ext_stop = -1;
 // 8k, the guest RSP's alignment checked once (shim/fexc_sites.inc FexcBeforeOp, FexcAlignedAfter); --narrow-cmp compares 8/16-bit
 // operands with a constant without materialising it (FEX Flags.cpp CalculateFlags_SUB, JIT ALUOps.cpp SubNZCV). fexc_step_unit:
 // the request is a step (--max-insts 1), whose split checks stay (the resident steps an instruction whose alignment check fails).
-inline bool fexc_push_run = false, fexc_narrow_cmp = false, fexc_step_unit = false;
+inline bool fexc_narrow_cmp = false, fexc_step_unit = false;
 // Profile slice1: the guest bytes [Address, Address + Size) the compile was given, or nullptr (set by fexc). The allowlist
 // reads an instruction's prefix bytes with it (FEX's decode keeps only the last segment prefix).
 inline const uint8_t* (*fexc_guest_bytes)(uint64_t Address, uint64_t Size) = nullptr;
@@ -170,7 +170,10 @@ struct FexcArg {
 };
 enum : int { FEXC_ARG_SSE_GATED, FEXC_ARG_AVX_GATED, FEXC_ARG_ALIGNMENT_GATED, FEXC_ARG_X87_GATED, FEXC_ARG_WAIT_GATED, FEXC_ARG_X87_FPCR,
              FEXC_ARG_SIMD_UNMASKED, FEXC_ARG_X87_UNMASKED, FEXC_ARG_CPL0, FEXC_ARG_TSC, FEXC_ARG_BULK, FEXC_ARG_DAZ, FEXC_ARG_FTZ,
-             FEXC_ARG_ACCURATE };
+             FEXC_ARG_ACCURATE, FEXC_ARG_PUSH_RUN };
+// `--push-run` (the host asks for it unless the vCPU's stack pointer keeps tripping the run check): a gating argument, so an answer
+// compiled with it is not reused for a request without it.
+inline FexcArg<bool, FEXC_ARG_PUSH_RUN> fexc_push_run;
 // Profile slice1 (perf chunk 26): the host asks for bulk REP STOS (`--bulk`: never for a single-instruction step, nor while
 // alignment checking or a data breakpoint gates the block): FexcStringOp stores the part of the string inside RDI's page
 // first (FEX's `FexcRepStos`, JIT form in fexc_sites.inc).

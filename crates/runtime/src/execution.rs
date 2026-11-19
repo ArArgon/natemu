@@ -3547,7 +3547,11 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             object::kind::SPLIT => split(s, f, b, all, &site, spsr),
             // An 8-byte push found its stack pointer misaligned (fexc --push-run): the push runs alone, in a step block
             // whose split check completes or faults it exactly; the block after it starts at the next instruction.
-            object::kind::STACK if b.flags & cache::STEP == 0 => step_from(s, f, b, &site),
+            // (Each firing counts: from [`natemu_abi::execution::STACK_TRAP_LIMIT`] on this vCPU's code context asks for code without the run check.)
+            object::kind::STACK if b.flags & cache::STEP == 0 => {
+                s.cpu.stack_traps += 1;
+                step_from(s, f, b, &site)
+            }
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }

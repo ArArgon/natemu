@@ -1858,6 +1858,7 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 },
                 no_afp: 0,
                 accurate_fp: 0,
+                stack_traps: 0,
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,
@@ -3307,6 +3308,7 @@ mod tests {
                 xcr0: 1,
                 no_afp: 0,
                 accurate_fp: 0,
+                stack_traps: 0,
             },
         );
         s.fetch = [0x5000, u64::MAX];

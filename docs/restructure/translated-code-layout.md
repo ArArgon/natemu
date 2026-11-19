@@ -63,12 +63,18 @@ of registers known to be aligned and checks once for a run of stack stores (and 
 the base is register x2 or above, and the set is the intersection over the
 paths into an IR block (nothing at an entry or at a backward target). Anything the dataflow cannot show keeps its own check.
 
+The check tests 8-byte alignment of the stack pointer. When it fires, the instruction runs alone in a step block (about 12 us
+with the host round trip). After 16 firings on a vCPU (`STACK_TRAP_LIMIT`, `Cpu::stack_traps`) the vCPU's code context
+(bit 33) changes and the host asks fexc without `--push-run` (a gating argument, so answers do not alias): every store keeps
+its own check, which takes a misaligned stack in line. The change is per vCPU and permanent; code translated before it stays
+in the cache under the old context.
+
 ## 6. Narrow compares, and the admission rules added
 
 With `--narrow-cmp` an 8- or 16-bit compare with a constant is translated with the constant inline, saving the move, the
 shift and the flag bookkeeping.
 
-The host requests the three options with every compile (`--ext-conds 4 --push-run --narrow-cmp`, `TRANSLATION_ARGS` in
+The host requests the three options with every compile (`--ext-conds 4 --push-run --narrow-cmp`, `--push-run` only until the stack check has fired 16 times on the vCPU; `TRANSLATION_ARGS` in
 `crates/host/src/execution.rs`); they are part of every request body and so of the persistent cache's key. In fexc itself
 they are command-line flags.
 

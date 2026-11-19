@@ -629,6 +629,7 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
         xcr0: natemu_abi::cpu_profile::XCR0_RESET,
         no_afp: 0, // the host sets it in `execution::run`, once the probe has read the vCPU
         accurate_fp: 0,
+        stack_traps: 0,
     };
     // X4: an AP woken by the mailbox (ACPI 6.5 Table 5.44, Intel processors): long mode, paging with the vector's page
     // identity mapped (the loader's map of [0, L), reserved memory: it covers both places a vector may lie, the mailbox's

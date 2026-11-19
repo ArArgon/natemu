@@ -2048,7 +2048,7 @@ impl Answer {
     }
 }
 /// The number of fexc's gating arguments (`FEXC_ARG_*`, [`Compiler::gating`]).
-pub(crate) const GATING: usize = 14;
+pub(crate) const GATING: usize = 15;
 /// The memory cache's key (perf chunk 4): the block limit, the RIP's half (bit 63) and page offset, and the first bytes the
 /// answer read (at most [`LEAD`], with their count): an answer is found at every RIP of that half and offset. As words
 /// ([`Universal`]); no limit is `1 << 32`.
@@ -2438,10 +2438,11 @@ pub(crate) enum Code {
     None(String),
 }
 
-/// The compiler options every request carries: extended blocks of up to 4 conditional branches, one stack check per run of
-/// stack stores, and narrow compares. They are request arguments, so part of every request body and so of the persistent
-/// cache's key (docs/restructure/translated-code-layout.md).
-const TRANSLATION_ARGS: &[u8] = b"--ext-conds\x004\0--push-run\0--narrow-cmp\0";
+/// The compiler options every request carries: extended blocks of up to 4 conditional branches (here), one stack check per
+/// run of stack stores (`--push-run`, [`Compiler::push_run`]: left out for a vCPU whose stack pointer keeps tripping it,
+/// `Cpu::stack_traps`) and narrow compares. They are request arguments, so part of every request body and so of the
+/// persistent cache's key (docs/restructure/translated-code-layout.md).
+const TRANSLATION_ARGS: &[u8] = b"--ext-conds\x004\0";
 
 /// fexc for one vCPU's feature set: one persistent `fexc --serve` process (started at the first compile), a cache of its
 /// answers in memory and, when set, the persistent one on disk. Objects are byte-identical to the one-shot CLI's.
@@ -2545,6 +2546,9 @@ pub struct Compiler {
     /// RDI's page in bulk (each store a site at an iteration boundary). A step runs one element: TF traps after each
     /// iteration, and the watchpoint, UC and code-write paths step the element that met them.
     pub(crate) bulk: bool,
+    /// fexc's `--push-run` (the default; false for a vCPU past [`exec::STACK_TRAP_LIMIT`] stack-check firings: part of the
+    /// code context, bit 33, and the last gating argument).
+    pub(crate) push_run: bool,
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
@@ -2731,6 +2735,7 @@ impl Compiler {
             tsc: false,
             cpl3: false,
             bulk: false,
+            push_run: true,
             perf: None,
             read: 0,
             halved: false,
@@ -2772,7 +2777,7 @@ impl Compiler {
     }
     /// The gating arguments' values, in fexc's `FEXC_ARG_*` order: SSE, AVX, alignment, x87, WAIT, x87 FPCR, (I5c) the
     /// unmasked SIMD and x87 exceptions, (perf chunk 15) CPL 0 and the inline TSC, (perf chunk 26) bulk REP STOS, and
-    /// (AFP fallback chunk 3a) DAZ and effective FTZ, and (AFP accurate plan chunk 1) accurate mode.
+    /// (AFP fallback chunk 3a) DAZ and effective FTZ, (AFP accurate plan chunk 1) accurate mode, and `--push-run`.
     fn gating(&self) -> [u64; GATING] {
         let flag = |a: &str| u64::from(self.x87.iter().any(|x| x == a));
         let value = |a: &str| {
@@ -2799,6 +2804,7 @@ impl Compiler {
             flag("--daz"),
             flag("--ftz"),
             flag("--accurate"),
+            self.push_run.into(),
         ]
     }
     /// [`Compiler::compile`] with an instruction limit; `Err((n, why))`: the object must be translated again with fewer
@@ -3263,6 +3269,10 @@ impl Compiler {
             arg(&mut body, n.to_string().as_bytes());
         }
         body.extend_from_slice(&self.feature_args);
+        if self.push_run {
+            arg(&mut body, b"--push-run");
+        }
+        arg(&mut body, b"--narrow-cmp");
         for (on, a) in [
             (self.sse_gated, &b"--sse-gated"[..]),
             (self.avx_gated, b"--avx-gated"),
@@ -4111,6 +4121,7 @@ fn translation(
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
         compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
+        compiler.push_run = state.cpu.stack_traps < exec::STACK_TRAP_LIMIT;
         if !step {
             compiler.note_gating(state.cpu.code_context())?;
         }
@@ -5101,7 +5112,11 @@ mod tests {
             for feature in admission::feature_overrides(c.supported) {
                 args.extend(["--feature".into(), feature]);
             }
-            args.extend(["--ext-conds", "4", "--push-run", "--narrow-cmp"].map(String::from));
+            args.extend(["--ext-conds", "4"].map(String::from));
+            if c.push_run {
+                args.push("--push-run".into());
+            }
+            args.push("--narrow-cmp".into());
             for (on, a) in [(c.sse_gated, "--sse-gated"), (c.avx_gated, "--avx-gated"), (c.alignment_gated, "--alignment-gated")] {
                 if on {
                     args.push(a.into());
@@ -5124,6 +5139,7 @@ mod tests {
             for flags in 0..64u32 {
                 (c.sse_gated, c.avx_gated, c.alignment_gated) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
                 (c.cpl0, c.tsc, c.bulk) = (flags & 8 != 0, flags & 16 != 0, flags & 32 != 0);
+                c.push_run = flags % 5 != 0;
                 c.x87 = if flags % 3 == 0 { vec![] } else { vec!["--x87".into(), "mode".into()] };
                 for limit in [None, Some(1), Some(64)] {
                     let bytes = [0x90, 0xc3, flags as u8];
@@ -6639,6 +6655,7 @@ mod tests {
             xcr0: 1,
             no_afp: 0,
             accurate_fp: 0,
+            stack_traps: 0,
         }
     }
 
@@ -6935,6 +6952,7 @@ mod tests {
                 xcr0: 1,
                 no_afp: 0,
                 accurate_fp: 0,
+                stack_traps: 0,
             },
         );
         s.fetch = [0x5000, u64::MAX];

@@ -2144,7 +2144,16 @@ pub struct Cpu {
     /// bank. The code differs only where the mode meets a host without AFP ([`accurate_key`], `code_context` bit 32), and the
     /// program driver reports it as `fp`.
     pub accurate_fp: u64,
+    /// Times a block's stack alignment check (fexc `--push-run`: one `and x0, xS, #7; cbnz` for a run of stack stores) found
+    /// the guest's stack pointer misaligned: each costs a host-sized round trip (the instruction runs alone in a step block).
+    /// From [`STACK_TRAP_LIMIT`] on the vCPU's code is requested without the check (every store checked on its own, which
+    /// takes a misaligned stack in line): [`Cpu::code_context`] bit 33 and the host's `--push-run`. Written only by the
+    /// resident; 0 for every `Cpu` built by the host.
+    pub stack_traps: u64,
 }
+/// Stack alignment check firings after which a vCPU's code is translated without the run check (sticky: a guest that keeps a
+/// misaligned stack pointer pays about 12 us a push per run, forever, otherwise; ponytail: per vCPU, not per block).
+pub const STACK_TRAP_LIMIT: u64 = 16;
 /// The first native vector register of XMM0 (FEX's x64 `SRAFPR`: XMM0..XMM15 in v16..v31).
 pub const XMM_VREG: usize = 16;
 /// MXCSR at reset and as Linux sets it (SDM Vol.1 10.2.3.4: all exceptions masked, round to nearest).
@@ -2565,7 +2574,9 @@ impl Cpu {
             | daz_key(self.mxcsr, self.no_afp != 0) << 30
             | ftz_key(self.mxcsr, self.no_afp != 0) << 31
             // AFP accurate plan chunk 1: accurate mode without AFP only; on an AFP host accurate mode changes no code, so no bit.
-            | accurate_key(self.accurate_fp, self.no_afp) << 32;
+            | accurate_key(self.accurate_fp, self.no_afp) << 32
+            // Misaligned stack pointers keep tripping the run check: code without it (`--push-run` not asked).
+            | u64::from(self.stack_traps >= STACK_TRAP_LIMIT) << 33;
         word
     }
 }
@@ -4395,7 +4406,7 @@ mod tests {
         let c = |no_afp, accurate_fp| Cpu {
             gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
             dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
-            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp, accurate_fp,
+            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp, accurate_fp, stack_traps: 0,
         };
         let base = c(0, 0).code_context();
         assert_eq!([c(0, 1), c(1, 0)].map(|c| c.code_context()), [base, base]);
@@ -4413,7 +4424,7 @@ mod tests {
         let mut c = Cpu {
             gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
             dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
-            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1, accurate_fp: 0,
+            xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1, accurate_fp: 0, stack_traps: 0,
         };
         let plain = c.code_context();
         assert_eq!(plain >> 30, 0, "the default MXCSR keys nothing");
@@ -4514,6 +4525,7 @@ mod tests {
             xcr0: 1,
             no_afp: 0,
             accurate_fp: 0,
+            stack_traps: 0,
         };
         let masked = c.code_context();
         c.mxcsr &= !(1 << 12);
@@ -4736,6 +4748,7 @@ mod tests {
             xcr0: crate::cpu_profile::XCR0_RESET,
             no_afp: 0,
             accurate_fp: 0,
+            stack_traps: 0,
         };
         let c = cpu.control().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));
