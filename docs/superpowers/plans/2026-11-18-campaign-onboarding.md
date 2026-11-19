@@ -33,6 +33,23 @@ behaviour as recorded in docs/restructure/correctness-*.md and docs/restructure/
   - m1-perf set D (IO5): two runs, not rerun.
   - Part B (Linux campaigns): Task 6's harness in progress; Task 5's images wait for the machine.
 
+## Format decisions (November 18, from Task 6)
+
+1. `<suite>-list.txt`: one line per test, `PART TEST`. PART is the boot's exact `part=` word, and TEST is the name
+   its CT-RESULT line carries. Parts are the distinct PARTs in first-seen order, and their count is the suite's
+   `parts`. Each recipe builds the list from the same files its run-S.sh reads, so the two cannot disagree.
+2. stress-ng: a stressor that runs to its 240 s timeout passes when stress-ng's own result is rc 0 with no `fail:`
+   lines. The timeout is noted, not failed (correctness-stress.md treats such runs as verified), so the plan's
+   `timeout_ok` list is dropped.
+3. CPython (cpyt): judged per module, as run-cpy.sh reports, with the failing cases named in the message.
+   `expected`/`flaky` entries name the module, and their reason names the case: VSOCK; the timerfd cases in test_os.
+4. A suite key `ct` (default: the suite's name) is the `ct=` word booted, for cpyt/cpyb, whose scripts are
+   run-cpy.sh/run-cpyb.sh.
+5. x86st tests that stop the VM (mov_ss_trap, the four compat-mode tests) go in x86st-skip.txt with their reason
+   and report `unsupported`, not `expected`: a part that stops never reaches CT-END.
+6. public: the case's index comes from the boot's own CT-BEGIN part. The id check (PUB-START/PUB-RESULT) still
+   guards identity.
+
 ## Decisions for the owner to review
 
 1. **Campaign is a tier, not a kind** (owner, November 18): `tier = "campaign"`, `kind = "judged"`.
