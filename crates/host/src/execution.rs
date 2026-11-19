@@ -344,7 +344,7 @@ fn prepare_at_alias(
         }
         private_space(&memory, base, &spans, true);
         // The guest-state page's EL0 alias (x28 of generated code), backed by the frame page (G1).
-        guest_state_alias(&memory, base, base + exec::FRAME_OFFSET, va, Some(base + cache::LOOKUP_OFFSET + cache::PCID_STUDY), Some(base + cache::LOOKUP_OFFSET + cache::DL1));
+        guest_state_alias(&memory, base, base + exec::FRAME_OFFSET, va, Some(base + cache::LOOKUP_OFFSET + cache::DL1));
         // SAFETY: Control is plain integers; the resident owns everything but the capacity.
         let mut control: cache::Control = unsafe { std::mem::zeroed() };
         control.code_bytes = (cache::HEAD_BYTES + code_bytes) as u64;
@@ -717,13 +717,14 @@ pub fn k1_stats(area: Area) -> K1 {
     }
     k
 }
+/// PCID gain study counters are all zero (a resident without `pcid-study`).
+fn pcid_study_empty(c: &[u64; natemu_abi::execution::cache::pcid_study::COUNT]) -> bool {
+    c.iter().all(|&v| v == 0)
+}
 /// PIC study: a `pic-count` resident's linked transitions by class (same page, cross-page, position-independent into
 /// absolute, absolute into position-independent), counted in four guest-state fields no generated code uses (the
 /// resident's `cache::stub`), then its computed exits (32 bits, wrapping: FEX's flag bytes 28-31, `cache::computed`); zero
 /// from other residents.
-fn pcid_study_empty(c: &[u64; natemu_abi::execution::cache::pcid_study::COUNT]) -> bool {
-    c.iter().all(|&v| v == 0)
-}
 fn pic_transitions(area: Area) -> [u64; 5] {
     let mut t = [0x0, 0x8, 0x10, 0xb0, 0]
         .map(|at| u64::from_le_bytes(area.read::<8>(exec::FRAME_OFFSET + at)));

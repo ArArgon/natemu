@@ -137,8 +137,11 @@ fn reserve(size: u64, hot: u64) -> Option<(u64, u64)> {
 fn split(b: &mut Block) -> bool {
     b.hot_body = b.hot_body_for();
     let (code, h, body) = (u64::from(b.code), u64::from(b.hot_size), b.hot_body());
+    // (Word `h` of the body is written only by an exit's trampoline: a branch to a non-exit word there has no moved form.)
+    let (lost, exit_at_h) = (core::cell::Cell::new(false), b.trampolines().any(|(e, _)| e == code + h));
     let map = |t: u64| {
         if t >= code + 4 && t <= code + h {
+            lost.set(lost.get() || (t == code + h && !exit_at_h));
             return body + (t - code);
         }
         b.trampolines().find(|&(e, _)| e == t).map_or(t, |(_, at)| at)
@@ -148,6 +151,9 @@ fn split(b: &mut Block) -> bool {
             return false;
         };
         unsafe { ((area::CODE_WRITE_VA + body + o) as *mut u32).write_volatile(w) };
+    }
+    if lost.get() {
+        return false;
     }
     let mut patch = [0; MAX_LINK_POINTS];
     for (e, at) in b.trampolines() {
@@ -1163,9 +1169,7 @@ pub fn tlb(global: bool) -> Option<u64> {
             }
         }
     } else {
-        if !global {
-            c.cr3_loads += 1;
-        }
+        c.cr3_loads += 1;
         // Perf chunk 19: a CR3 load moves `epoch`, not `global_epoch`, so every global block stays current: only the
         // listed entries (filled with a non-global block) are looked at. Each one emptied is cleaned to the point of
         // unification; after one barrier its instructions are invalidated as the list is compacted (an entry still

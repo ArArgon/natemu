@@ -1699,7 +1699,9 @@ impl<'a> Verifier<'a> {
     fn stack_check(&self, i: usize) -> Option<u32> {
         let (st, c) = (self.c.stubs[i], self.checks.get(i)?);
         let and = c.start.checked_sub(4)?;
+        // (B is x2 or above: x0 is the check's own result and x1 may be written before the store.)
         (st.kind == object::kind::STACK
+            && st.base_reg >= 2
             && st.imm == 0
             && c.cond == Some(CBNZ_X)
             && c.start == c.end
@@ -3115,6 +3117,21 @@ mod tests {
         refused(RUN, 0x14, 0x2a0a_03e4, 0xaa0a_03e8, "covering its base"); // mov x8, x10 between the second and third push
         refused(RUN, 0x14, 0x2a0a_03e4, 0xd100_1108, "covering its base"); // sub x8, x8, #4: misaligns it
         validated(RUN, 0x4, 0x9240_0900, NOP, None); // a producer bug, confined to the guest: object validation admits it
+        // The check's base is x2 or above (x0 is the check's result; x1 may be written before the store): the same run with
+        // the first push on base x0 (the `and` destroys it; object validation refuses) or x1 is refused at that push (0xc).
+        for base in [0u32, 1] {
+            let mut o = patched(RUN, 0x4, 0x9240_0900, 0x9240_0800 | base << 5);
+            let h: Header = super::super::record(&o, 0);
+            let code = h.code_offset as usize;
+            o[code + 0xc..][..4].copy_from_slice(&(0xf81f_8d1d_u32 & !(31 << 5) | base << 5).to_le_bytes());
+            for i in [0, 4] {
+                o[h.sites_offset as usize + 40 * i + 25] = base as u8; // the access's and the stub's base_reg
+            }
+            let e = admit((&o, RUN.1)).unwrap_err();
+            // (Object validation already refuses a stub on x0.)
+            let want = if base == 0 { "check stub at native offset 0x34" } else { "stack alignment check" };
+            assert!(e.contains(want) && (base == 0 || e.contains("access at 0xc")), "base x{base}: {e}");
+        }
         // push rbp; mov rbp, rsp; push rbx; sub rsp, 0x18; mov [rsp+8], rax; mov [rbp-16], rcx; mov dword [rsp+4], 7;
         // mov [rsp+3], rax (split-checked); add rsp, 0x18; pop rbx; pop rbp; cmp al, 13; ret. `mov x9, x8` at 0x10 (RBP = RSP),
         // `subs x26, x8, #0x18; mov x8, x26` at 0x1c (RSP - 24), unchecked stores at 0x24 [x8, #8], 0x28 [x9, #-16], 0x30 [x8, #4].

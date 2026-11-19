@@ -547,6 +547,11 @@ fn admit_records(
         return fail("code layout");
     }
     let code_end = code_end.unwrap();
+    // (Word 0 is FEX's tail offset; the resident (`no-tail`, pool copies) takes it as the placed length, so it must be the
+    // validated `code_region_end`.)
+    if region < 4 || bytes[code..code + 4] != region.to_le_bytes() {
+        return fail("code layout: head word is not the code region end");
+    }
     if h.sra_gpr[..h.sra_count as usize] != SRA {
         return fail("static register map");
     }
@@ -959,7 +964,7 @@ mod tests {
     }
     fn object_with(sites: &[Site]) -> Vec<u8> {
         let words: [u32; 8] = [
-            0, 0xf9000380, 0xf9400280, 0xf9000f80, 0xf945b781, 0xd61f0020, 0, 0,
+            24, 0xf9000380, 0xf9400280, 0xf9000f80, 0xf945b781, 0xd61f0020, 0, 0,
         ];
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let pc = |native_offset| PcEntry {
@@ -1215,6 +1220,8 @@ mod tests {
             header(|h| h.sites_offset = u32::MAX - 3),
             header(|h| h.relocs_offset = 128), // inside the code
             header(|h| h.code_region_end = 64),
+            header(|h| h.code_region_end = 28), // word 0 still says 24
+            with(object(), 128, |w: &mut u32| *w = 4), // a short head word
             header(|h| h.body_offset = 0),
             header(|h| h.spill_bytes = 16),
             header(|h| h.sra_gpr[3] = 4),
