@@ -243,7 +243,7 @@ def one_run(args, spec, dest):
     try: m, problems = (metrics_matrix if spec['kind'] == 'matrix' else metrics_io5)(out)
     except (OSError, KeyError, ValueError, IndexError) as e: m, problems = None, [f'no usable result: {e!r} (rc {rc})']
     clean(out)
-    return dict(spec, ok=m is not None and rc == 0, problems=problems, rc=rc, seconds=round(time.time() - began), metrics=m or {},
+    return dict(spec, ok=m is not None and rc == 0, problems=problems, rc=rc, seconds=round(time.time() - began), finished=time.time(), metrics=m or {},
                 others_before=before, others_after=after, dir=str(out), command=show(cmd), time=time.strftime('%F %T'))
 
 
@@ -261,12 +261,16 @@ def execute(args, dest, plan_):
     env_record(args, dest / 'env.json')
     done = load_runs(dest)
     limit, ran, failed = getattr(args, 'limit', None), 0, False
+    before = getattr(args, 'retry_failed_before', None)
+    # a failed record is run again with --retry-failed, or with --retry-failed-before T if it was recorded before T
+    # (a test-framework session's start: what failed in this session is not retried by each later piece)
+    retry = lambda r: not r['ok'] and (args.retry_failed or (before is not None and r.get('finished', 0) < before))
     for n, spec in enumerate(plan_, 1):
         old = done.get(spec['id'])
-        if old and (old['ok'] or not args.retry_failed):
+        if old and not retry(old):
             print(f'[{n}/{len(plan_)}] {spec["id"]}: already recorded ({"ok" if old["ok"] else "FAILED"}), skipped', flush=True); continue
         if limit is not None and ran >= limit:      # --limit: the rest is left for the next invocation (a test-framework piece)
-            left = sum(1 for s in plan_[n - 1:] if not (done.get(s['id']) and (done[s['id']]['ok'] or not args.retry_failed)))
+            left = sum(1 for s in plan_[n - 1:] if not done.get(s['id']) or retry(done[s['id']]))
             print(f'{left} runs left for later invocations (--limit {limit})', flush=True)
             return 1 if failed else INCOMPLETE
         print(f'[{n}/{len(plan_)}] {spec["id"]}: starting {time.strftime("%T")}', flush=True)
@@ -433,8 +437,11 @@ def main():
         s.add_argument('--final-commit', help='commit of the final binary (default: this checkout HEAD)')
         s.add_argument('--sets', default='A,BC,D', help='comma list of A, BC, D')
         s.add_argument('--dir', type=Path); s.add_argument('--retry-failed', action='store_true', help='rerun runs recorded as failed')
-        if name == 'full': s.add_argument('--limit', type=int, help=f'run at most N pending runs, then exit {INCOMPLETE} if runs are left '
-                                          '(the test framework runs the case as pieces of one run each)')
+        if name == 'full':
+            s.add_argument('--limit', type=int, help=f'run at most N pending runs, then exit {INCOMPLETE} if runs are left '
+                           '(the test framework runs the case as pieces of one run each)')
+            s.add_argument('--retry-failed-before', type=float, metavar='EPOCH',
+                           help='rerun runs recorded as failed before this time (records without a time count as older)')
         if name == 'plan': s.add_argument('--count', action='store_true', help='print only the number of runs')
         if name == 'smoke': s.add_argument('--with-baseline', action='store_true', help='also one baseline raw run')
     args = p.parse_args()

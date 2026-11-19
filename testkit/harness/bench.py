@@ -14,6 +14,7 @@ when a case of the suite uses it (and then prepared before the run starts):
     {qemu_img}          the pinned QEMU build's qemu-img (artifacts.qemu_system)
     {resume_dir}        a results folder kept across runs, the same while the case and what it names are (resume_dir())
 """
+import json
 import os
 import pathlib
 import shutil
@@ -73,8 +74,17 @@ def _piece_count(spec) -> int:
     if k not in _PIECES:
         r = subprocess.run([sys.executable, str(paths.repo_root() / script), 'plan', '--count', *(['--sets', sets] if sets else [])],
                            capture_output=True, text=True)
-        _PIECES[k] = int(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else 0
+        try: _PIECES[k] = int(r.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError): _PIECES[k] = 0
+        if r.returncode != 0 or _PIECES[k] <= 0:       # loud: never fall back to one unit of the whole case
+            raise RuntimeError(f'{script} plan --count gave no piece count (exit {r.returncode}): {(r.stderr or r.stdout)[-300:]}')
     return _PIECES[k]
+
+
+def _session(path: pathlib.Path) -> dict:
+    """A pieced case's state in this run: when it started, whether --fresh was applied, how many pieces ended."""
+    try: return json.loads(path.read_text())
+    except (OSError, ValueError): return {'started': time.time(), 'fresh_done': False, 'done': 0}
 
 
 class Bench:
@@ -159,8 +169,16 @@ class Bench:
             d = runloop.run_dir(config) / 'bench' / h.machine_id / it.case
             d.mkdir(parents=True, exist_ok=True)
             raw = raw_root()
-            # --fresh sets the old records aside once, in the first piece (later pieces continue the new records)
-            fresh = bool(config and config.getoption('fresh')) and (spec is keyspec or it.case.endswith('/piece-00'))
+            piece = spec is not keyspec
+            if piece:            # one session file per case and run: pieces run in any order
+                sf = d.parent / f'{base}.session.json'; sess = _session(sf)
+                fresh = bool(config and config.getoption('fresh')) and not sess['fresh_done']     # once, whichever piece is first
+                sess['fresh_done'] = sess['fresh_done'] or fresh
+                spec = dict(spec, argv=[x for a in spec['argv'] for x in
+                                        (['--retry-failed-before', str(sess['started'])] if a == '--retry-failed' else [a])])
+                sf.write_text(json.dumps(sess))
+            else:
+                fresh = bool(config and config.getoption('fresh'))
             vals = self._values(keyspec, d, n, fexc, raw, base, h.machine_id, fresh)
             where = f'{d}' + (f' (results in {vals["resume_dir"]}, kept for resuming)' if 'resume_dir' in vals else '')
             missing = [p for p in (self._subst(x, vals) for x in spec.get('needs', [])) if not pathlib.Path(p).exists()]
@@ -177,8 +195,15 @@ class Bench:
             tail = (d / 'log.txt').read_text(errors='replace').strip().splitlines()[-6:]
             if r.returncode == 3:
                 out[it.nodeid] = CaseResult('failed', f'contended: another VM ran during the measurement; {d}'); continue
-            if r.returncode == 4 and spec is not keyspec:              # a piece: its run was ok, others are left
-                out[it.nodeid] = CaseResult('passed', f'{took:.0f} s: one run measured, more left; {where}', 'measured')
+            if piece:
+                sess = _session(sf); sess['done'] += 1; sf.write_text(json.dumps(sess))
+            if r.returncode == 4 and piece:                            # its run was ok and runs are left
+                total = len([c for c in self.cases(None, it.suite) if c.startswith(base + '/piece-')])
+                if sess['done'] >= total:       # every piece of the case has run in this session and runs are still left
+                    out[it.nodeid] = CaseResult('failed', f'runs left after all {total} pieces (a crash or retry shifted them): '
+                                                          f'run the case again to finish them; {where}\n' + '\n'.join(tail))
+                else:
+                    out[it.nodeid] = CaseResult('passed', f'{took:.0f} s: one run measured, more left; {where}', 'measured')
                 continue
             if r.returncode != 0:
                 out[it.nodeid] = CaseResult('failed', f'exit {r.returncode} after {took:.0f} s; log {d / "log.txt"}; {where}\n' + '\n'.join(tail))

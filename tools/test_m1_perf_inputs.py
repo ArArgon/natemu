@@ -106,3 +106,27 @@ class Limit(unittest.TestCase):
             self.assertEqual(run_m1_perf.execute(args, t, plan), 0)          # the last one: the verdict
             self.assertEqual(runs, ['A-0', 'A-1', 'A-2'])
             self.assertEqual(run_m1_perf.execute(args, t, plan), 0)          # nothing left: the verdict again
+
+
+
+class RetryBefore(unittest.TestCase):
+    def test_only_failures_from_before_the_session_are_retried(self):
+        """Review: a run failing in this session must not be rerun by every later piece."""
+        import tempfile, types, json as _json
+        from unittest import mock
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import run_m1_perf
+        plan = [dict(id=f'A-{i}', group='A', setup='final-raw', rep=i, kind='matrix') for i in range(2)]
+        runs = []
+        def one(args, spec, dest): runs.append(spec['id']); return dict(id=spec['id'], ok=False, problems=['x'], seconds=1,
+                                                                        finished=2000.0, others_before=[], others_after=[])
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(run_m1_perf, 'one_run', one), \
+                mock.patch.object(run_m1_perf, 'ensure_inputs', lambda a: None), \
+                mock.patch.object(run_m1_perf, 'env_record', lambda a, f: None), \
+                mock.patch.object(run_m1_perf, 'analyze', lambda d: 1):
+            pathlib.Path(t, 'runs.jsonl').write_text(_json.dumps(dict(plan[0], ok=False, finished=500.0)) + '\n')
+            args = types.SimpleNamespace(retry_failed=False, retry_failed_before=1000.0, limit=1)
+            run_m1_perf.execute(args, t, plan)        # A-0 failed before the session (500 < 1000): retried
+            run_m1_perf.execute(args, t, plan)        # A-0 failed again now (2000): not retried; A-1 runs
+            run_m1_perf.execute(args, t, plan)        # nothing left to run: the verdict
+            self.assertEqual(runs, ['A-0', 'A-1'])

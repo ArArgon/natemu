@@ -205,7 +205,41 @@ def test_m1_perf_runs_as_pieces_that_share_one_resume_folder(monkeypatch, tmp_pa
     a2, _, _, r2 = run('run1', case='m1-perf/piece-07', rc=0)
     whole, *_ = run('run2', case='m1-perf')
     assert a1[-2:] == ['--limit', '1'] and '--limit' not in whole
+    assert '--retry-failed' not in a1 and '--retry-failed-before' in a1 and '--retry-failed' in whole
     assert val(a1, '--dir') == val(a2, '--dir') == val(whole, '--dir')
     assert r1.outcome == 'passed' and 'more left' in r1.message and r2.outcome == 'passed'
     _, _, _, r3 = run('run1', case='m1-perf/piece-03', rc=1)
     assert r3.outcome == 'failed'
+
+
+
+def test_m1_perf_pieces_fresh_once_whatever_piece_runs_first(monkeypatch, tmp_path):
+    """Review: pieces run in any order (longest first); --fresh must set the old records aside once per run, not when
+    piece-00 happens to run (possibly last, discarding the run's own measurements)."""
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    val = lambda a, opt: a[a.index(opt) + 1]
+    a0, *_ = run('run0', case='m1-perf/piece-00', rc=4)
+    d = pathlib.Path(val(a0, '--dir')); (d / 'runs.jsonl').write_text('old\n')
+    run('run1', case='m1-perf/piece-09', fresh=True, rc=4)            # first in this run: sets the old records aside
+    assert not (d / 'runs.jsonl').exists()
+    (d / 'runs.jsonl').write_text('new\n')
+    run('run1', case='m1-perf/piece-00', fresh=True, rc=4)            # later in the same run: keeps the new ones
+    assert (d / 'runs.jsonl').read_text() == 'new\n'
+
+
+def test_m1_perf_runs_left_after_every_piece_fail_loudly(monkeypatch, tmp_path):
+    """Review: a retry or a crash shifts pieces against runs; the last piece then still sees runs left. That must fail,
+    not pass with no verdict."""
+    run = _m1_perf_harness(monkeypatch, tmp_path)
+    for i in range(20): run('run1', case=f'm1-perf/piece-{i:02d}', rc=4)
+    *_, last = run('run1', case='m1-perf/piece-20', rc=4)
+    assert last.outcome == 'failed' and 'runs left after all 21 pieces' in last.message
+
+
+def test_a_failing_piece_count_is_loud(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from testkit.harness import bench
+    monkeypatch.setattr(bench, '_PIECES', {})
+    monkeypatch.setattr(bench.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=1, stdout='', stderr='boom'))
+    with pytest.raises(RuntimeError, match='no piece count'):
+        bench._piece_count({'argv': ['python3', 'tools/run_m1_perf.py', 'full']})
