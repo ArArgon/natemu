@@ -106,8 +106,9 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
     t0 = time.monotonic()
     end_at, how = None, None
     with open(work / 'stdout.txt', 'wb') as out, open(work / 'stderr.txt', 'wb') as err:
+        _on_term()                      # before the VM starts: a SIGTERM right after Popen still stops it
         p = subprocess.Popen(cmd, env=env, stdout=out, stderr=err, start_new_session=True)
-        _LIVE.add(p); _on_term()
+        _LIVE.add(p)
         try:
             while p.poll() is None:
                 now = time.monotonic()
@@ -325,7 +326,7 @@ def part_args(suite: str, declared: str, env: str | None) -> str:
     name (no `=` or `,`), so a value holding a colon stays bare. A suite named twice, or two bare entries, is an error."""
     if env is None: return declared.strip(',')
     named, bare = {}, None
-    for entry in env.split(';') if env.strip() else ['']:
+    for entry in [e for e in env.split(';') if e.strip()] or ['']:     # empty entries (a trailing `;`) name nothing
         name, sep, rest = entry.partition(':')
         if sep and name.strip() and not re.search(r'[=,\s]', name.strip()):
             name = name.strip()

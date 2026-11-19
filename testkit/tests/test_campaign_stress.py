@@ -210,6 +210,11 @@ def test_part_args_from_the_environment_refuse_a_suite_named_twice():
             campaign.part_args('stress', '', bad)
     assert campaign.part_args('stress', 'a=1', None) == 'a=1'
     assert campaign.part_args('stress', 'a=1', 'x=1:2') == 'x=1:2'        # a colon after "=" is a value, not a suite
+    # a trailing or doubled `;` names nothing: litmus keeps its own part_args (review: it lost its smoke size)
+    for env in ('stress:scale=1;', 'stress:scale=1;;', ';stress:scale=1'):
+        assert campaign.part_args('litmus', 'r=10,s=10000', env) == 'r=10,s=10000', env
+        assert campaign.part_args('stress', '', env) == 'scale=1', env
+    assert campaign.part_args('litmus', 'r=10', '') == '' and campaign.part_args('litmus', 'r=10', ' ; ') == ''
 
 
 def test_stress_timeout_with_no_operation_fails():
