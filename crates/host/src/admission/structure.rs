@@ -1841,21 +1841,27 @@ impl<'a> Verifier<'a> {
                     "exit at {at:#x}: literal {target:#x} is neither the block end nor its branch target"
                 ));
             }
-            // An exit a branch inside the unit reaches (a conditional's taken exit) is that guest instruction's own target (or its
-            // own RIP, a retry): only the unit's last instruction may use the whole set (end, ...).
+            // An exit a branch inside the unit reaches is the exit of one guest instruction: the one whose code starts at the
+            // exit (a skip branch of the instruction before it lands there), else the branch's own (a conditional's taken
+            // exit, placed after the last instruction). Only the unit's last instruction may exit to the whole set (end,
+            // ...); another goes to its own direct target (or retries at its own RIP: CLI, STI, SWAPGS, VERW).
             let last = (self.c.pcs.iter().map(|p| p.guest_offset))
                 .filter(|&g| g < self.c.guest_bytes)
                 .max();
             for &(src, _) in self.branches.iter().filter(|&&(_, t)| t == offset) {
-                let Some((g, _)) = self.instruction(src) else {
+                let owner = match self.instruction(offset) {
+                    Some((g, start)) if start == offset => Some(g),
+                    _ => self.instruction(src).map(|(g, _)| g),
+                };
+                let Some(g) = owner else {
                     return Err(format!("exit at {at:#x}: its branch is outside the PC table"));
                 };
                 let insn = self.guest_insn(g);
                 let end = self.c.rip.wrapping_add(g as u64 + insn.len() as u64);
-                let own = self.c.rip.wrapping_add(g as u64); // (CLI, STI, SWAPGS, VERW: a retry exit to their own RIP, proven by `targets`)
+                let own = self.c.rip.wrapping_add(g as u64);
                 if Some(g) != last && target != own && super::branch_target(insn, end) != Some(target) {
                     return Err(format!(
-                        "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it"
+                        "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it (guest {insn:02x?} at {own:#x}, branch at {src:#x})"
                     ));
                 }
             }
@@ -3491,6 +3497,22 @@ mod tests {
                 let object = std::fs::read(&object).unwrap();
                 admit((&object, &source)).unwrap_or_else(|e| panic!("{hex}: {e}"));
             }
+        }
+        // A skip branch of the instruction before the last (`ror rax, cl` with a zero count jumps to the `jmp`'s exit): the corpora's flow-33.
+        for source in [&[0xb1, 0x40, 0x48, 0xd3, 0xc8, 0xeb, 0x61][..], &[0x48, 0x39, 0xc8, 0x75, 0x10, 0xb1, 0x40, 0x48, 0xd3, 0xc8, 0xeb, 0x61]] {
+            let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
+            let object = dir.join("o");
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", &hex, "--rip", "0x401000", "--profile", "slice1", "--ext-conds", "4", "--push-run", "--narrow-cmp"])
+                .arg("--object")
+                .arg(&object)
+                .arg("--out")
+                .arg("/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex}");
+            let object = std::fs::read(&object).unwrap();
+            admit((&object, source)).unwrap_or_else(|e| panic!("{hex}: {e}"));
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
