@@ -21,7 +21,7 @@ import uuid
 import pytest
 from _pytest.reports import TestReport
 
-from testkit import durations, known_bugs, paths
+from testkit import contention, durations, known_bugs, paths
 from testkit.collect import CaseItem
 from testkit.sched import pool as poolmod
 from testkit.sched.policy import GATE, INTERACTIVE, Request
@@ -35,6 +35,8 @@ class Unit:
         self.n, self.items, self.req, self.env, self.timeout = n, items, req, env, timeout
         self.proc = self.grant = self.started = self.vmlock = None
         self.first_test = self.ended = None
+        self.foreign = {}           # exclusive units: busy processes outside the run (testkit.contention), name -> peak %cpu
+        self.sampled = 0.0
         self.offset = 0
         self.done = set()
 
@@ -125,7 +127,8 @@ class Controller:
         label = u.req.label if len(u.items) > 1 else f'{it.fam.name}/{it.suite.name}/{it.case}'
         return {'label': label, 'family': it.fam.name, 'suite': it.suite.name, 'items': len(u.items),
                 'cores': u.req.cores, 'core_class': u.grant.core_class if u.grant else '', 'asked': u.req.asked,
-                'granted': u.started, 'first_test': u.first_test, 'ended': u.ended}
+                'granted': u.started, 'first_test': u.first_test, 'ended': u.ended,
+                **({'foreign_load': contention.summary(u.foreign)} if u.foreign else {})}
 
     def prepare_only(self) -> None:
         """`natemu-test prepare` (spec R14.4): build and fetch what the selected items need, under the same shared claim and
@@ -179,6 +182,7 @@ class Controller:
                             waiting.remove(u); running.append(u)
                 for u in list(running):
                     self.tail(u)
+                    self.watch(u)
                     if u.proc.poll() is not None or time.time() - u.started > u.timeout:
                         self.finish(u); running.remove(u)
                 self.show_waiting(waiting, running)
@@ -214,6 +218,16 @@ class Controller:
         u.started = time.time()
         return True
 
+    def watch(self, u: Unit) -> None:
+        """An exclusive unit: sample foreign load every 5 s (testkit.contention)."""
+        if not u.grant or u.grant.core_class != 'X' or time.time() - u.sampled < 5: return
+        u.sampled = time.time()
+        try:
+            for _, cpu, name in contention.sample():
+                u.foreign[name] = max(cpu, u.foreign.get(name, 0.0))
+        except OSError:
+            pass
+
     def tail(self, u: Unit) -> None:
         f = self.dir / f'{u.n}.jsonl'
         if not f.exists(): return
@@ -232,6 +246,10 @@ class Controller:
             st = ev['data'].get('start') or 0
             if st and (u.first_test is None or st < u.first_test): u.first_test = st
             if isinstance(rep.longrepr, list): rep.longrepr = tuple(rep.longrepr)       # JSON turned the skip tuple into a list
+            if rep.failed and u.foreign:
+                note = f'machine not idle during this exclusive run: {contention.summary(u.foreign)}'
+                rep.user_properties.append(('testkit-contended', note))
+                if isinstance(rep.longrepr, str): rep.longrepr += f'\n[{note}]'
             rep = self.known.adjust(rep)
             hook.pytest_runtest_logreport(report=rep)
             if rep.when == 'teardown' or (rep.when == 'setup' and not rep.passed):
