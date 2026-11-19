@@ -1,0 +1,38 @@
+# The modules tagged `smoke` in cpy-tests.txt: run-cpyb.sh runs them with the interpreter the guest built (the cpyb
+# suite), after the build. Core language, the C extension modules the build compiles against Debian's libraries
+# (ssl, sqlite3, zlib, bz2, lzma, ctypes/ffi, dbm/gdbm, readline, expat, uuid, decimal) and process handling.
+test_grammar
+test_builtin
+test_types
+test_dict
+test_list
+test_set
+test_unicode_identifiers
+test_str
+test_long
+test_float
+test_math
+test_struct
+test_re
+test_json
+test_datetime
+test_ssl
+test_hashlib
+test_sqlite3
+test_zlib
+test_bz2
+test_lzma
+test_ctypes
+test_dbm
+test_readline
+test_xml_etree_c
+test_pyexpat
+test_uuid
+test_decimal
+test_subprocess
+test_os
+test_sys
+test_threading
+test_signal
+test_select
+test_socket

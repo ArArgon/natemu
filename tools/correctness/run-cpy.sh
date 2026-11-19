@@ -6,7 +6,8 @@
 # natively they run as a normal user. Serial output:
 #   CT-LOG | LINE          regrtest's output (its per-test lines and closing summary are the per-test results)
 #   CT-CASE ID STATUS      a test case not passed (fail, error, skip), from the JUnit file
-#   CT-RESULT cpy TEST cases=C pass=P fail=F error=E skip=S sec=T   per test module that reported cases (T: its cases' time)
+#   CT-RESULT cpy TEST cases=C pass=P fail=F error=E skip=S sec=T   per test module that reported cases (T: its cases' time;
+#                          DIR/cpy-junit.py says which module a case belongs to)
 D=$1; k=${2%/*}; PY=${PY:-/home/ubuntu/cp/py}; T=${TMPDIR:-/tmp}/cpy.$$; mkdir -p "$T"; chmod 777 "$T"
 awk -v k="$k" '{for (i = 2; i <= NF; i++) if (k == "all" || $i == k) {print $1; next}}' "$D/cpy-tests.txt" > "$T/list"
 run=; if [ "$(id -u)" = 0 ]; then
@@ -17,17 +18,5 @@ cd "$PY" && $run ./python -m test -j "$(nproc)" -u subprocess --timeout 3600 -W 
     < /dev/null > "$T/out" 2>&1
 echo "CT-LOG rc=$?"
 sed 's/^/CT-LOG | /' "$T/out"
-[ -f "$T/junit.xml" ] && ./python -I -c '
-import sys, xml.etree.ElementTree as ET
-from collections import defaultdict
-n = defaultdict(lambda: [0, 0, 0, 0, 0]); sec = defaultdict(float)
-keys = sorted(((t if t.startswith("test.") else "test." + t) + ".", t) for t in open(sys.argv[2]).read().split())
-for c in ET.parse(sys.argv[1]).iter("testcase"):
-    i = c.get("name"); p = i.split(".")
-    m = max(((len(k), t) for k, t in keys if i.startswith(k)), default=(0, p[1] if p[0] == "test" and len(p) > 1 else p[0]))[1]
-    s = "error" if c.find("error") is not None else "fail" if c.find("failure") is not None else "skip" if c.find("skipped") is not None or c.get("status") == "skipped" else "pass"
-    sec[m] += float(c.get("time") or 0); r = n[m]; r[0] += 1; r[("pass", "fail", "error", "skip").index(s) + 1] += 1
-    if s != "pass": print("CT-CASE", i, s)
-for m in sorted(n): print("CT-RESULT cpy %s cases=%d pass=%d fail=%d error=%d skip=%d sec=%.1f" % ((m,) + tuple(n[m]) + (sec[m],)))
-' "$T/junit.xml" "$T/list"
+[ -f "$T/junit.xml" ] && ./python -I "$D/cpy-junit.py" "$T/junit.xml" "$T/list" "$T/out"   # CT-CASE, CT-RESULT lines
 rm -rf "$T"

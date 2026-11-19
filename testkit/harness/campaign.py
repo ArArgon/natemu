@@ -10,7 +10,16 @@ run and nothing is locked: no QEMU, no x86 machine.
                                 file in the family folder; a verdict that takes `image` also gets the image's folder
     expected = { test = "why (the document that records it)" }    known non-passes
     flaky = { test = "why" }    timing-sensitive tests: a failure reruns the part once
+    verdict_flaky = true        the verdict may itself return `flaky` (a test whose only failures are known
+                                timing-sensitive cases, as CPython's TimerfdTests): the part is rerun once, as for a
+                                `flaky` entry; the rerun's verdict counts if it passes, a second `flaky` stays flaky and
+                                any other failure fails
     matrix = { "machine.vcpus" = [4] }
+    ct = "word"                 the kernel's ct= word, which picks the guest's /ct/run-<word>.sh and is CT-END's suite=
+                                (default: the suite's name; cpyt's is cpy)
+    unreported = "verdicts:fn"  fn(name, serial) -> (verdict, message) | None, for a listed test with no result line:
+                                the campaign's own record of it elsewhere in the boot's output (CPython: regrtest's
+                                verdict for a module it skipped whole); None leaves it missing
     part_args = "k=v,..."       optional: appended to each part's word on the kernel command line (`part=WORD,ARGS`),
                                 options of the campaign's runner (stress: scale=, timeout=); the list and the CT-END
                                 check still name the part by its WORD. The environment variable TESTKIT_PART_ARGS,
@@ -243,7 +252,7 @@ def read_boot(img: pathlib.Path, suite: str) -> dict[str, dict]:
 
 # --- verdicts ---
 
-RANK = {'passed': 0, 'unsupported': 1, 'unverified': 2, 'failed': 3}
+RANK = {'passed': 0, 'unsupported': 1, 'unverified': 2, 'flaky': 3, 'failed': 4}
 
 
 @functools.lru_cache(maxsize=None)
@@ -265,6 +274,23 @@ def judge(br: BootResult, fn, img: pathlib.Path) -> dict[str, tuple[str, str]]:
         if v not in RANK: v, msg = 'failed', f'the verdict returned {v!r}: {msg}'
         if name in out and RANK[out[name][0]] >= RANK[v]: continue
         out[name] = (v, msg)
+    return out
+
+
+def unreported(br: BootResult, fill, tests, got: dict) -> dict[str, tuple[str, str]]:
+    """name -> (verdict, message) from the suite's `unreported` function, for the listed tests of this part that no
+    result line reported (`got` lacks them). A test it returns None for stays missing."""
+    out = {}
+    for t in tests:
+        if t in got: continue
+        try:
+            r = fill(t, br.serial)
+        except Exception as e:          # as judge(): a record that cannot be read does not pass the test
+            r = ('failed', f'the unreported verdict raised {e!r}')
+        if r is None: continue
+        v, msg = r
+        if v not in RANK: v, msg = 'failed', f'the unreported verdict returned {v!r}: {msg}'
+        out[t] = (v, msg)
     return out
 
 
@@ -290,7 +316,7 @@ class Campaign:
 
     def case_timeout(self, fam, suite, case):
         """Room for every boot a part may take (a flaky rerun is a second one)."""
-        boots = 2 if suite.extra.get('flaky') else 1
+        boots = 2 if suite.extra.get('flaky') or suite.extra.get('verdict_flaky') else 1
         return boots * (float(suite.extra.get('cap', 3600)) + AFTER_END + 30) + 120
 
     def requirements(self, fam, suite, variant):
@@ -327,29 +353,42 @@ class Campaign:
                                         f'({", ".join(p for p, _ in parts[:8])}), the suite declares parts = {declared}')
         part, tests = parts[k]
         fn = _verdict(str(fam.dir), fam.name, ex['verdict'])
+        fill = _verdict(str(fam.dir), fam.name, ex['unreported']) if ex.get('unreported') else None
+        ct = str(ex.get('ct', suite.name))
         work = rundir / 'campaign' / fam.name / suite.name / (variant.id or 'default') / case
         cpio = img / f'{suite.name}.cpio.zst'
         how = read_boot(img, suite.name).get(part, {})      # the part's own kernel and command-line words, if any
 
         args = os.environ.get(PART_ARGS_ENV, str(ex.get('part_args', ''))).strip(',')
         booted = f'{part},{args}' if args else part         # the kernel's part= word: the list's, plus the suite's options
-        first = boot(cpio, suite.name, booted, vcpus, work / 'boot-1', cap, **how)
-        got = judge(first, fn, img)
+
+        def results(br: BootResult) -> dict[str, tuple[str, str]]:
+            got = judge(br, fn, img)
+            return got if fill is None else {**unreported(br, fill, tests, got), **got}
+
+        first = boot(cpio, ct, booted, vcpus, work / 'boot-1', cap, **how)
+        got = results(first)
         listed = set(tests)
         missing = 'listed in the image for part ' + part + ' but not in the output' + \
                   ('' if first.reached else ' (the boot did not reach CT-END)')
         verdicts = {t: got.get(t, ('missing', missing)) for t in tests}
 
         notes = []
-        retry = [t for t in tests if t in flaky and verdicts[t][0] in ('failed', 'missing')]
+        if not ex.get('verdict_flaky'):     # a verdict's own flaky counts only where the suite allows it
+            verdicts = {t: ('failed', f'{m} (the verdict said flaky; the suite has no verdict_flaky)') if v == 'flaky'
+                        else (v, m) for t, (v, m) in verdicts.items()}
+        retry = [t for t in tests if (t in flaky and verdicts[t][0] in ('failed', 'missing')) or verdicts[t][0] == 'flaky']
         if retry:
-            second = boot(cpio, suite.name, booted, vcpus, work / 'boot-2', cap, **how)
-            again = judge(second, fn, img)
+            second = boot(cpio, ct, booted, vcpus, work / 'boot-2', cap, **how)
+            again = results(second)
             notes.append(f'rerun for {len(retry)} flaky test(s): {second.note or ("CT-END" if second.reached else "no CT-END")}')
             for t in retry:
                 v2 = again.get(t, ('missing', 'not in the rerun\'s output'))
                 if v2[0] in ('passed', 'unsupported', 'unverified'):
                     verdicts[t] = (v2[0], f'{v2[1]} (on the rerun; the first boot: {verdicts[t][1]})'.strip())
+                elif t not in flaky:        # the verdict's own flaky: only a second flaky stays flaky
+                    verdicts[t] = (v2[0] if v2[0] == 'flaky' else 'failed',
+                                   f'first boot: {verdicts[t][1]} | rerun: {v2[1]}')
                 else:
                     verdicts[t] = ('flaky', f'{flaky[t]}; failed on both boots: {verdicts[t][1]} | rerun: {v2[1]}')
 
@@ -370,8 +409,8 @@ class Campaign:
         if not first.reached or end is None:
             tail = '\n'.join(first.serial.splitlines()[-TAIL:])
             problems.append(f'no CT-END: {first.note or "the boot ended without it"}; the last {TAIL} serial lines:\n{tail}')
-        elif end.get('part') not in (part, booted) or end.get('suite') != suite.name:
-            problems.append(f'CT-END is for suite={end.get("suite")} part={end.get("part")}, not suite={suite.name} part={part}')
+        elif end.get('part') not in (part, booted) or end.get('suite') != ct:
+            problems.append(f'CT-END is for suite={end.get("suite")} part={end.get("part")}, not suite={ct} part={part}')
         counts = {}
         for s in sub:
             c = s.category or s.outcome

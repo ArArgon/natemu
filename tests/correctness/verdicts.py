@@ -88,24 +88,98 @@ def x86st(name, f, extra):
     return 'failed', _fields(f, 'rc', 'ok', 'fail', 'skip') + _output(extra)
 
 
+# Timing-sensitive cases (plan, format decision 3; Decision 4): exempt one by one, never their module. Each requires
+# timerfd_gettime's remaining time to equal the requested one to 1 ms (or three decimals) without subtracting the
+# execution before the call; the deficit is that execution (docs/restructure/correctness-cpython-string.md, "Every
+# failed or errored case", and its targeted follow-up's clock brackets); QEMU fails the first one too.
+CPY_FLAKY_CASES = {
+    f'test.test_os.TimerfdTests.{c}': 'timerfd remaining-time assertion with under 1 ms for the execution before '
+                                      'timerfd_gettime (docs/restructure/correctness-cpython-string.md, Every failed or errored case)'
+    for c in ('test_timerfd_TFD_TIMER_ABSTIME', 'test_timerfd_ns_TFD_TIMER_ABSTIME', 'test_timerfd_initval')}
+
+
 def cpyt(name, f, extra):
     """run-cpy.sh: `CT-RESULT cpy MODULE cases=C pass=P fail=F error=E skip=S sec=T` per regrtest module, with a
     `CT-CASE ID STATUS` line per case not passed. Fails on any failed or erroring case (named in the message); a module
-    whose every case skipped is unsupported."""
+    whose every case skipped is unsupported. A module whose only failures are assertion failures (status fail, never
+    error: an error is the API itself failing) of cases in CPY_FLAKY_CASES, each named by a CT-CASE line and as many
+    as the line's fail, with error=0, is `flaky`: the harness reruns the part once
+    (verdict_flaky)."""
     bad = [ln[len('CT-CASE '):] for ln in extra if ln.startswith('CT-CASE ') and ln.rsplit(None, 1)[-1] in ('fail', 'error')]
     missing = [k for k in ('cases', 'fail', 'error') if not str(f.get(k, '')).isdigit()]
     if missing: return 'failed', 'incomplete result line (' + ', '.join(f'{k}={f.get(k, "missing")}' for k in missing) + ')'
     if f.get('fail') != '0' or f.get('error') != '0':
-        return 'failed', _fields(f, 'cases', 'fail', 'error') + ('\n' + '\n'.join(bad[:SHOWN]) if bad else '')
+        shown = _fields(f, 'cases', 'fail', 'error') + ('\n' + '\n'.join(bad[:SHOWN]) if bad else '')
+        fails = [b.rsplit(None, 1) for b in bad]           # (id, fail | error)
+        if (f['error'] == '0' and fails and len(fails) == int(f['fail'])
+                and all(st == 'fail' and i in CPY_FLAKY_CASES for i, st in fails)):
+            return 'flaky', f'only timing-sensitive cases failed: {CPY_FLAKY_CASES[fails[0][0]]}; ' + shown
+        return 'failed', shown
     if f.get('cases') not in (None, '0') and f.get('skip') == f.get('cases'):
         return 'unsupported', f'every case skipped ({f.get("skip")})'
     return 'passed', _fields(f, 'cases', 'skip')
 
 
+# regrtest's closing verdicts (cpy-check.py's names) for a module that ran no case: skipped whole (the platform, a
+# missing extension such as Tk, a resource run-cpy.sh does not enable) or with nothing to run.
+CPY_UNSUPPORTED = {'skipped', 'skipped (resource denied)', 'run no tests'}
+_PROGRESS = re.compile(r'\[\s*\d+/\d+(?:/\d+)?\] (\S+)(.*)$')
+
+
+def cpyt_unreported(name, serial):
+    """A listed module with no `CT-RESULT cpy` line (it reported no JUnit case): regrtest's own verdict for it, from
+    the boot's `CT-LOG |` lines. When regrtest finished (its `== Tests result:` line), its closing summary decides, as
+    cpy-check.py reads it: skipped whole (or "run no tests") is unsupported, ok passes, anything else (failed, env
+    changed, ...) fails. Without that line (regrtest died) only the module's own progress line counts: `passed`
+    passes, `skipped`/`run no tests` is unsupported, anything else fails. A progress line saying failed or crashed
+    fails whatever the summary says. None (left missing) when regrtest named the module nowhere."""
+    lines = serial.splitlines()
+    log = [ln[ln.find('CT-LOG | ') + 9:] for ln in lines if 'CT-LOG | ' in ln]
+    prog = [m.group(2).strip() for m in (_PROGRESS.search(b) for b in log if not b.startswith(' ')) if m and m.group(1) == name]
+    said = [ln.strip() for ln in log if re.search(r'\] ' + re.escape(name) + r'(\s|$)', ln)][:2]
+    finished = any(b.startswith('== Tests result:') for b in log)
+    own = prog[-1] if prog else ''
+    if finished:
+        v = _tool('cpy-check').load_lines([lines])['verdict'].get(name)
+        if v is None: return None
+    elif prog:
+        v = 'ok' if own.startswith('passed') else next((u for u in sorted(CPY_UNSUPPORTED, key=len, reverse=True)
+                                                       if own.startswith(u)), own or 'no result')
+    else:
+        return None
+    msg = f'regrtest: {v}, no JUnit case' + ('' if finished else ' (regrtest did not finish: no closing summary)') + \
+          ''.join(f'\n{s}' for s in said)
+    if own.startswith(('failed', 'crashed')): return 'failed', msg
+    if v in CPY_UNSUPPORTED: return 'unsupported', msg
+    if v == 'ok': return 'passed', msg
+    return 'failed', msg
+
+
+CPYB_BUILD_FAILED = re.compile(r'Could not build|failed to build|failed on import|could not be imported', re.I)
+
+
 def cpyb(name, f, extra):
-    """cpy-build.sh (run-cpyb.sh): `CT-RESULT cpyb STEP rc=RC sec=S` per build step. Every step must exit 0."""
-    if f.get('rc') == '0': return 'passed', ''
-    return 'failed', _fields(f, 'rc', 'sec')
+    """cpy-build.sh (run-cpyb.sh): `CT-RESULT cpyb STEP rc=RC sec=S` per build step. Every step must exit 0, and make
+    fails when its log names an extension module that could not be built (run-cpyb.sh's `CT-LOG make | ` lines). The
+    smoke modules the built interpreter then runs (run-cpy.sh's `CT-RESULT cpy MODULE ...` lines) are judged as
+    cpyt's, except that a smoke module whose every case skipped fails: they are there to exercise what the guest
+    built."""
+    if f.get('kind') == 'cpy':
+        v, msg = cpyt(name, f, extra)
+        if v == 'unsupported': return 'failed', f'smoke module not exercised: {msg}'
+        return v, msg
+    if f.get('rc') != '0': return 'failed', _fields(f, 'rc', 'sec')
+    bad = [ln for ln in extra if ln.startswith('CT-LOG make | ') and CPYB_BUILD_FAILED.search(ln)]
+    if name == 'make' and bad: return 'failed', 'rc=0, but:\n' + '\n'.join(bad[:SHOWN])
+    return 'passed', ''
+
+
+def cpyb_unreported(name, serial):
+    """cpyt_unreported for a smoke module, except that skipped whole or "run no tests" fails (an extension the guest
+    build lacks, test_ssl's "No module named '_ssl'", must not pass the part)."""
+    r = cpyt_unreported(name, serial)
+    if r and r[0] == 'unsupported': return 'failed', f'smoke module not exercised: {r[1]}'
+    return r
 
 
 TIMEOUT = 240           # run-stress.sh's default; its `to=` field gives the run's own (part option timeout=T)

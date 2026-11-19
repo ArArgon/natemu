@@ -43,6 +43,55 @@ needs = { cores = 4, perf = true }
 "pr39228.O2" = "natemu runs x87 in reduced precision (FEX): isinfl misjudges LDBL_MAX (docs/restructure/correctness-userspace.md, finding 1)"
 
 [[suite]]
+name = "cpyt"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# CPython 3.13.5's regression tests (Debian's 3.13.5-2+deb13u5, built natively by recipes/cpy), judged per module as
+# run-cpy.sh reports them (plan, format decision 3): 480 modules here (regrtest --list-tests, its package tests split;
+# correctness-cpython-string.md's run listed 473, 44,433 cases at 4 vCPUs) in 12 parts. The boot's ct= word is cpy:
+# the guest runs /ct/run-cpy.sh. A module regrtest skipped whole (platform, missing Tk, a resource not enabled)
+# reports no case: regrtest's own verdict for it decides (verdicts.cpyt_unreported).
+# VSOCK (correctness-cpython-string.md, Every failed or errored case): ThreadedVSOCKSocketStreamTest errors natively
+# only; the guest has no vsock device and test_socket skips the VSOCK classes, so test_socket is not `expected`
+# (an entry would report unexpected-pass).
+# smoke: part-6 (40 modules, among them test_zipfile, whose 1980 date check the image's mtimes now pass, and two
+# modules skipped whole); its multiprocessing module is the light test_manager.
+ct = "cpy"
+parts = 12
+cap = 3600
+verdict = "verdicts:cpyt"
+unreported = "verdicts:cpyt_unreported"
+smoke = ["part-6"]
+# Flaky at case level, not per module: verdicts.CPY_FLAKY_CASES, test_os's three TimerfdTests remaining-time cases
+# (docs/restructure/correctness-cpython-string.md, Every failed or errored case). A module whose only failures are
+# those is `flaky` and its part is rerun once; any other failure in it fails.
+verdict_flaky = true
+matrix = { "machine.vcpus" = [4] }
+needs = { cores = 4, perf = true }
+
+[[suite]]
+name = "cpyb"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# CPython built in the guest from the pristine source with cpy-build.sh (configure, make -j NPROC), then the built
+# interpreter runs the smoke modules of recipes/cpy/smoke.txt (run-cpyb.sh). Each build step must exit 0 and make must
+# name no extension it could not build; each smoke module is judged as cpyt's, except that one skipped whole or in
+# every case fails (verdicts.cpyb, cpyb_unreported: the smoke modules exercise what the guest built). The CT-HASH lines
+# (compared with a native build in correctness-cpython-string.md) are a diagnostic: no reference build is compared
+# here. test_os's TimerfdTests cases are flaky at case level as in cpyt (the first cpyb run, November 19:
+# test_timerfd_TFD_TIMER_ABSTIME, 0.99753 != 1 within 3 places).
+parts = 1
+cap = 7200
+verdict = "verdicts:cpyb"
+unreported = "verdicts:cpyb_unreported"
+smoke = ["part-0"]
+verdict_flaky = true
+matrix = { "machine.vcpus" = [4] }
+needs = { cores = 4, perf = true }
+
+[[suite]]
 name = "ltp"
 kind = "judged"
 harness = "campaign"

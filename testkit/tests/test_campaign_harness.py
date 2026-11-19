@@ -671,6 +671,305 @@ def paths_root():
     return paths.repo_root()
 
 
+# --- CPython (cpyt, cpyb): the ct= word and modules without a result line ---
+
+CPY_LIST = '''\
+    0/2 test_a
+    0/2 test_b
+    0/2 test_winreg
+    0/2 test_curses
+    0/2 test_gone
+    1/2 test_c
+    '''
+
+# run-cpy.sh's output: regrtest's (CT-LOG |) with its progress lines and closing summary, then the JUnit results.
+CPY_LOG = ['CT-LOG rc=2',
+           'CT-LOG | 0:00:00 load avg: 0.00 Run 5 tests in parallel using 4 worker processes',
+           "CT-LOG | 0:00:01 load avg: 0.00 [1/5] test_winreg skipped -- No module named 'winreg'",
+           'CT-LOG | 0:00:01 load avg: 0.00 [2/5] test_curses skipped (resource denied) -- Use of the `curses` resource not enabled',
+           'CT-LOG | 0:00:02 load avg: 0.00 [3/5] test_a passed',
+           'CT-LOG | 0:00:03 load avg: 0.00 [4/5/1] test_b failed (1 failure)',
+           'CT-LOG | ',
+           'CT-LOG | == Tests result: FAILURE ==',
+           'CT-LOG | ',
+           'CT-LOG | 1 test skipped:',
+           'CT-LOG |     test_winreg',
+           'CT-LOG | ',
+           'CT-LOG | 1 test skipped (resource denied):',
+           'CT-LOG |     test_curses',
+           'CT-LOG | ',
+           'CT-LOG | 1 test failed:',
+           'CT-LOG |     test_b',
+           'CT-LOG | ',
+           'CT-LOG | 1 test OK.',
+           'CT-CASE test.test_b.T.test_x fail',
+           'CT-RESULT cpy test_a cases=4 pass=4 fail=0 error=0 skip=0 sec=1.0',
+           'CT-RESULT cpy test_b cases=2 pass=1 fail=1 error=0 skip=0 sec=1.0']
+CPYT = '''\
+    ct = "cpy"
+    unreported = "verdicts:cpyt_unreported"
+    '''
+
+
+def test_ct_key_is_the_boot_word_and_ct_end_suite(setup):
+    run, fake, _ = setup(CPY_LIST, {'1/2': serial('1/2', 'CT-RESULT cpy test_c cases=1 pass=1 fail=0 error=0 skip=0 sec=1',
+                                                  suite='cpy')},
+                         suite='cpyt', verdict='cpyt', extra=CPYT)
+    res = run('part-1')
+    assert res.outcome == 'passed', res.message
+    assert fake.calls[0]['suite'] == 'cpy' and fake.calls[0]['image'].name == 'cpyt.cpio.zst'
+
+
+def test_ct_end_of_another_suite_word_fails(setup):
+    run, _, _ = setup(CPY_LIST, {'1/2': serial('1/2', 'CT-RESULT cpy test_c cases=1 pass=1 fail=0 error=0 skip=0 sec=1',
+                                               suite='cpyt')},
+                      suite='cpyt', verdict='cpyt', extra=CPYT)
+    res = run('part-1')
+    assert res.outcome == 'failed' and 'not suite=cpy part=1/2' in res.message
+
+
+def test_ct_defaults_to_the_suite_name(setup):
+    run, fake, _ = setup(OSSL_LIST, {'0/2': serial('0/2', 'CT-RESULT openssl default:test_a rc=0 ok=3 notok=0',
+                                                   'CT-RESULT openssl generic:test_a rc=0 ok=3 notok=0')})
+    assert run('part-0').outcome == 'passed' and fake.calls[0]['suite'] == 'openssl'
+
+
+def test_cpy_module_without_a_result_line_takes_regrtests_verdict(setup):
+    """A module regrtest skipped whole reports no JUnit case, so no CT-RESULT line: its verdict comes from regrtest's
+    own output (cpy-check.py's reading), and a module regrtest never named stays missing."""
+    run, _, _ = setup(CPY_LIST, {'0/2': serial('0/2', *CPY_LOG, suite='cpy')}, suite='cpyt', verdict='cpyt', extra=CPYT)
+    res = run('part-0')
+    got = subs(res)
+    assert got == {'test_a': ('passed', None), 'test_b': ('failed', None), 'test_winreg': ('skipped', 'unsupported'),
+                   'test_curses': ('skipped', 'unsupported'), 'test_gone': ('failed', 'missing')}, res.message
+    msg = {s.name: s.longrepr for s in res.sub}
+    assert 'regrtest: skipped' in msg['test_winreg'] and "No module named 'winreg'" in msg['test_winreg']
+    assert 'regrtest: skipped (resource denied)' in msg['test_curses']
+    assert 'test.test_b.T.test_x fail' in msg['test_b']
+
+
+def test_without_the_unreported_key_such_modules_are_missing(setup):
+    run, _, _ = setup(CPY_LIST, {'0/2': serial('0/2', *CPY_LOG, suite='cpy')}, suite='cpyt', verdict='cpyt',
+                      extra='ct = "cpy"\n')
+    got = subs(run('part-0'))
+    assert got['test_winreg'] == ('failed', 'missing') and got['test_a'] == ('passed', None)
+
+
+def test_cpyt_unreported_verdicts():
+    v = verdicts()
+    text = '\n'.join(CPY_LOG + ['CT-LOG | 0:00:04 load avg: 0.00 [5/5/2] test_d failed (env changed)', 'CT-LOG | ',
+                                'CT-LOG | 1 test altered the execution environment (env changed):', 'CT-LOG |     test_d',
+                                'CT-LOG | ', 'CT-LOG | 1 test run no tests:', 'CT-LOG |     test_e']) + '\n'
+    assert v.cpyt_unreported('test_winreg', text)[0] == 'unsupported'
+    assert v.cpyt_unreported('test_curses', text)[0] == 'unsupported'
+    assert v.cpyt_unreported('test_e', text)[0] == 'unsupported'
+    assert v.cpyt_unreported('test_d', text)[0] == 'failed'
+    assert v.cpyt_unreported('test_b', text)[0] == 'failed'
+    assert v.cpyt_unreported('test_a', text)[0] == 'passed'          # listed as run, no case recorded
+    assert v.cpyt_unreported('test_gone', text) is None
+    crlf = text.replace('\n', '\r\n')                                   # the serial console's line ends
+    assert v.cpyt_unreported('test_winreg', crlf)[0] == 'unsupported'
+
+
+def test_an_unreported_verdict_that_raises_fails_the_test(setup, monkeypatch):
+    run, _, _ = setup(CPY_LIST, {'0/2': serial('0/2', *CPY_LOG, suite='cpy')}, suite='cpyt', verdict='cpyt', extra=CPYT)
+    real = campaign._verdict
+
+    def boom(name, serial):
+        raise ValueError('unreadable')
+    monkeypatch.setattr(campaign, '_verdict', lambda d, n, spec: boom if spec.endswith('unreported') else real(d, n, spec))
+    got = subs(run('part-0'))
+    assert got['test_winreg'] == ('failed', None) and got['test_a'] == ('passed', None)
+
+
+def test_cpyb_judges_its_smoke_modules_as_cpyt():
+    v = verdicts()
+    assert v.cpyb('test_os', {'kind': 'cpy', 'cases': '5', 'pass': '4', 'fail': '1', 'error': '0', 'skip': '0'}, [])[0] == 'failed'
+    assert v.cpyb('test_os', {'kind': 'cpy', 'cases': '5', 'pass': '5', 'fail': '0', 'error': '0', 'skip': '0'}, [])[0] == 'passed'
+    assert v.cpyb('make', {'kind': 'cpyb', 'rc': '0', 'sec': '1'}, [])[0] == 'passed'
+
+
+def test_correctness_family_declares_cpython():
+    family.load.cache_clear()
+    fam = family.load(REPO / 'tests' / 'correctness' / 'family.toml')
+    t, b = fam.suite('cpyt'), fam.suite('cpyb')
+    assert (t.extra['ct'], t.extra['parts'], t.extra['verdict']) == ('cpy', 12, 'verdicts:cpyt')
+    assert b.extra['parts'] == 1 and b.extra.get('ct', 'cpyb') == 'cpyb'
+    v = verdicts()
+    for s in (t, b):
+        assert callable(getattr(v, s.extra['unreported'].split(':')[1]))
+    # flaky at case level only (verdicts.CPY_FLAKY_CASES), never a whole module
+    assert 'flaky' not in t.extra and 'flaky' not in b.extra and t.extra['verdict_flaky'] is b.extra['verdict_flaky'] is True
+    assert sorted(c.rsplit('.', 1)[1] for c in v.CPY_FLAKY_CASES) == [
+        'test_timerfd_TFD_TIMER_ABSTIME', 'test_timerfd_initval', 'test_timerfd_ns_TFD_TIMER_ABSTIME']
+    assert all('docs/restructure/correctness-cpython-string.md' in why for why in v.CPY_FLAKY_CASES.values())
+    assert (t.extra['unreported'], b.extra['unreported']) == ('verdicts:cpyt_unreported', 'verdicts:cpyb_unreported')
+    # the /dev/stdin and ZIP-mtime failures are fixed in the image (recipes/common.sh): never expected
+    assert not {'test_asyncio.test_subprocess', 'test_zipfile', 'test_cmd_line_script'} & set(t.extra.get('expected', {}))
+
+
+# --- review fixes: a regrtest that died, cpyb's smoke modules, flaky cases not modules ---
+
+DIED = ['CT-LOG rc=137',
+        'CT-LOG | 0:00:01 load avg: 0.00 [1/4] test_a passed',
+        'CT-LOG | 0:00:02 load avg: 0.00 [2/4/1] test_b failed (1 failure)',
+        'CT-LOG | 0:00:03 load avg: 0.00 [3/4/2] test_c crashed (Exit code -11)',
+        "CT-LOG | 0:00:03 load avg: 0.00 [4/4/2] test_d skipped -- No module named '_ssl'"]
+
+
+def test_unreported_without_regrtests_summary_trusts_only_progress_lines():
+    """regrtest died before its closing summary: a module passes only on its own `passed` line."""
+    v = verdicts()
+    text = '\n'.join(DIED) + '\n'
+    assert v.cpyt_unreported('test_a', text)[0] == 'passed'
+    b, c = v.cpyt_unreported('test_b', text), v.cpyt_unreported('test_c', text)
+    assert b[0] == 'failed' and 'did not finish' in b[1]
+    assert c[0] == 'failed' and 'crashed (Exit code -11)' in c[1]
+    assert v.cpyt_unreported('test_d', text)[0] == 'unsupported'
+    assert v.cpyt_unreported('test_e', text) is None
+
+
+def test_a_crashed_progress_line_fails_whatever_the_summary_says():
+    v = verdicts()
+    text = '\n'.join(DIED + ['CT-LOG | ', 'CT-LOG | == Tests result: FAILURE ==', 'CT-LOG | ', 'CT-LOG | 2 tests OK.']) + '\n'
+    assert v.cpyt_unreported('test_c', text)[0] == 'failed'
+    assert v.cpyt_unreported('test_a', text)[0] == 'passed'
+
+
+def test_cpyb_smoke_module_not_exercised_fails():
+    v = verdicts()
+    text = '\n'.join(CPY_LOG) + '\n'
+    assert v.cpyb_unreported('test_winreg', text)[0] == 'failed'          # skipped whole: the build lacks it
+    assert v.cpyb_unreported('test_curses', text)[0] == 'failed'
+    assert v.cpyb_unreported('test_a', text)[0] == 'passed' and v.cpyb_unreported('test_gone', text) is None
+    allskip = {'kind': 'cpy', 'cases': '3', 'pass': '0', 'fail': '0', 'error': '0', 'skip': '3'}
+    assert v.cpyb('test_ssl', allskip, [])[0] == 'failed' and v.cpyt('test_ssl', allskip, [])[0] == 'unsupported'
+    make = {'kind': 'cpyb', 'rc': '0', 'sec': '100'}
+    assert v.cpyb('make', make, ['CT-LOG make | ./x.c:1: warning: unused'])[0] == 'passed'
+    r = v.cpyb('make', make, ['CT-LOG make | Could not build the ssl module!'])
+    assert r[0] == 'failed' and 'Could not build the ssl module' in r[1]
+    assert v.cpyb('make', make, ['CT-LOG make | Failed to build these modules:'])[0] == 'failed'
+
+
+TFD = 'CT-CASE test.test_os.TimerfdTests.test_timerfd_TFD_TIMER_ABSTIME fail'
+
+
+def test_only_the_timerfd_cases_are_flaky():
+    v = verdicts()
+    f = lambda fail, error='0': {'cases': '300', 'pass': '299', 'fail': fail, 'error': error, 'skip': '0'}
+    r = v.cpyt('test_os', f('1'), [TFD])
+    assert r[0] == 'flaky' and 'docs/restructure/correctness-cpython-string.md' in r[1]
+    assert v.cpyt('test_os', f('2'), [TFD, 'CT-CASE test.test_os.FileTests.test_write fail'])[0] == 'failed'
+    assert v.cpyt('test_os', f('2'), [TFD])[0] == 'failed'               # a failure no CT-CASE line names
+    assert v.cpyt('test_os', f('1'), ['CT-CASE test.test_os.FileTests.test_write fail'])[0] == 'failed'
+    assert v.cpyt('test_time', f('1'), ['CT-CASE test.test_time.T.test_timerfd_initval fail'])[0] == 'failed'
+    # an error is the timerfd API itself failing (EINVAL from timerfd_settime, say), never a timing budget
+    errs = [f'CT-CASE {c} error' for c in v.CPY_FLAKY_CASES]
+    assert v.cpyt('test_os', f('0', '3'), errs)[0] == 'failed'
+    assert v.cpyt('test_os', f('1', '1'), [TFD, errs[1]])[0] == 'failed'
+
+
+def test_make_fails_on_a_failed_extension_line_in_any_case():
+    v = verdicts()
+    make = {'kind': 'cpyb', 'rc': '0', 'sec': '100'}
+    for line in ('Failed to build these modules:', 'Following modules built successfully but were removed because '
+                 'they could not be imported:', '*** WARNING: renaming "_ssl" since importing it failed on import'):
+        assert v.cpyb('make', make, [f'CT-LOG make | {line}'])[0] == 'failed', line
+
+
+def test_run_cpyb_prints_every_failed_extension_line_after_the_warnings(tmp_path):
+    """run-cpyb.sh's make-log lines: warnings capped at 40, failed extensions all, whatever their case."""
+    import subprocess
+    src = (REPO / 'tools/correctness/run-cpyb.sh').read_text()
+    cmds = [l for l in src.splitlines() if 'make.log' in l and l.startswith('grep')]
+    assert len(cmds) == 2
+    log = tmp_path / 'make.log'
+    log.write_text(''.join(f'x.c:{i}: warning: w\n' for i in range(60)) +
+                   'Failed to build these modules:\n_ssl\nthey could not be imported: _x\n')
+    out = subprocess.run(['sh', '-c', '\n'.join(cmds)], env={'L': str(tmp_path), 'PATH': '/usr/bin:/bin'},
+                         capture_output=True, text=True).stdout.splitlines()
+    assert sum(' warning: ' in l for l in out) == 40
+    assert 'CT-LOG make | Failed to build these modules:' in out and 'CT-LOG make | they could not be imported: _x' in out
+
+
+OS_LIST = '''\
+    0/1 test_os
+    0/1 test_a
+    '''
+
+
+def _os(fail, *cases):
+    return serial('0/1', *cases, f'CT-RESULT cpy test_os cases=300 pass={300 - fail} fail={fail} error=0 skip=0 sec=1',
+                  'CT-RESULT cpy test_a cases=1 pass=1 fail=0 error=0 skip=0 sec=1', suite='cpy')
+
+
+VFLAKY = '''\
+    ct = "cpy"
+    verdict_flaky = true
+    '''
+
+
+def test_flaky_verdict_reruns_once_and_a_pass_counts(setup):
+    run, fake, _ = setup(OS_LIST, {'0/1': [_os(1, TFD), _os(0)]}, suite='cpyt', verdict='cpyt', parts=1, extra=VFLAKY)
+    res = run('part-0')
+    assert len(fake.calls) == 2 and res.outcome == 'passed', res.message
+    assert subs(res)['test_os'] == ('passed', None)
+
+
+def test_flaky_verdict_twice_is_flaky(setup):
+    run, fake, _ = setup(OS_LIST, {'0/1': [_os(1, TFD), _os(1, TFD)]}, suite='cpyt', verdict='cpyt', parts=1, extra=VFLAKY)
+    res = run('part-0')
+    assert len(fake.calls) == 2 and res.outcome == 'passed' and subs(res)['test_os'] == ('skipped', 'flaky'), res.message
+
+
+def test_flaky_verdict_then_a_real_failure_fails(setup):
+    other = 'CT-CASE test.test_os.FileTests.test_write fail'
+    run, fake, _ = setup(OS_LIST, {'0/1': [_os(1, TFD), _os(1, other)]}, suite='cpyt', verdict='cpyt', parts=1, extra=VFLAKY)
+    res = run('part-0')
+    assert res.outcome == 'failed' and subs(res)['test_os'] == ('failed', None)
+
+
+def test_a_module_failing_beyond_the_timerfd_cases_is_not_rerun(setup):
+    other = 'CT-CASE test.test_os.FileTests.test_write fail'
+    run, fake, _ = setup(OS_LIST, {'0/1': _os(2, TFD, other)}, suite='cpyt', verdict='cpyt', parts=1, extra=VFLAKY)
+    res = run('part-0')
+    assert len(fake.calls) == 1 and subs(res)['test_os'] == ('failed', None)
+
+
+def test_verdict_flaky_leaves_room_for_the_rerun(tmp_path):
+    fam, suite = make_family(tmp_path / 'a', suite='cpyt', verdict='cpyt', extra=VFLAKY)
+    plain_fam, plain = make_family(tmp_path / 'b', suite='cpyt', verdict='cpyt', extra='ct = "cpy"\n')
+    one = 60 + campaign.AFTER_END + 30
+    assert campaign.HARNESS.case_timeout(plain_fam, plain, 'part-0') == one + 120
+    assert campaign.HARNESS.case_timeout(fam, suite, 'part-0') == 2 * one + 120
+
+
+def test_a_flaky_verdict_without_verdict_flaky_fails_and_is_not_rerun(setup):
+    run, fake, _ = setup(OS_LIST, {'0/1': [_os(1, TFD), _os(0)]}, suite='cpyt', verdict='cpyt', parts=1,
+                         extra='ct = "cpy"\n')
+    res = run('part-0')
+    assert len(fake.calls) == 1 and subs(res)['test_os'] == ('failed', None) and 'no verdict_flaky' in res.sub[0].longrepr
+
+
+def test_every_boot_gets_the_ct_word_part_options_and_boot_file(setup, monkeypatch):
+    """The first boot and the verdict-flaky rerun alike: ct= word, the part word with part_args, the part's
+    <suite>-boot.txt kernel and words."""
+    run, fake, img = setup(OS_LIST, {'0/1,scale=2': [_os(1, TFD), _os(0)]}, suite='cpyt', verdict='cpyt', parts=1,
+                           extra=VFLAKY + 'part_args = "scale=2"\n')
+    (img / 'k').write_bytes(b'bzImage')
+    (img / 'cpyt-boot.txt').write_text('0/1 kernel=k x=1\n')
+    monkeypatch.delenv(campaign.PART_ARGS_ENV, raising=False)
+    got = []
+
+    def fake_kw(image, suite, part, vcpus, work, cap, **kw):
+        got.append((suite, part, kw))
+        return fake(image, suite, part, vcpus, work, cap)
+    monkeypatch.setattr(campaign, 'boot', fake_kw)
+    res = run('part-0')
+    assert res.outcome == 'passed', res.message
+    assert got == [('cpy', '0/1,scale=2', {'kernel': img / 'k', 'args': ('x=1',)})] * 2
+
+
 # --- per-part kernels and command-line words (<suite>-boot.txt: the public campaign) ---
 
 def test_boot_file_gives_each_part_its_kernel_and_words(setup, monkeypatch):

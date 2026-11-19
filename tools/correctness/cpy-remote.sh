@@ -77,14 +77,14 @@ pack() { python3 "$here/play/mkcpio.py" "$1" "$W/out/$2.cpio"; zstd -q -19 -T0 -
 imgb() {
     R=$W/img-cpyb; base "$R" "$W/debs" "$W/debs-deps"
     mkdir -p "$R$W"; cp -a "$W/pysrc" "$R$W/py"; ln -s / "$R$S"
-    cp "$here/run-cpyb.sh" "$here/cpy-build.sh" "$here/run-cpy.sh" "$W/out/cpy-tests.txt" "$R/ct/"; chmod 755 "$R"/ct/*.sh
+    cp "$here/run-cpyb.sh" "$here/cpy-build.sh" "$here/run-cpy.sh" "$here/cpy-junit.py" "$W/out/cpy-tests.txt" "$R/ct/"; chmod 755 "$R"/ct/*.sh
     pack "$R" cpyb
 }
 
 imgt() {
     R=$W/img-cpyt; base "$R" "$W/debs-deps"
     mkdir -p "$R$W"; (cd "$W" && tar cf - --exclude='*.o' --exclude='*.a' py) | tar xf - -C "$R$W"
-    cp "$here/run-cpy.sh" "$W/out/cpy-tests.txt" "$R/ct/"; chmod 755 "$R"/ct/*.sh
+    cp "$here/run-cpy.sh" "$here/cpy-junit.py" "$W/out/cpy-tests.txt" "$R/ct/"; chmod 755 "$R"/ct/*.sh
     pack "$R" cpyt
 }
 

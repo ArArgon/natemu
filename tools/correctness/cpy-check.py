@@ -11,10 +11,20 @@ PROG = re.compile(r'\[\s*\d+/\d+(?:/\d+)?\] (\S+)')
 HEAD = re.compile(r'^(?:All )?(\d+) tests? (.*?):?$')
 
 def load(spec):
+    """The results of the run-cpy.sh outputs SPEC names (files joined with commas)."""
+    def files():
+        for f in spec.split(','):
+            with open(f, errors='replace') as h: yield h
+    return load_lines(files())
+
+
+def load_lines(outputs):
+    """The results of run-cpy.sh outputs, each an iterable of lines: verdict (module -> regrtest's verdict: ok, failed,
+    skipped, skipped (resource denied), env changed, ...), counts, cases (case id -> status) and ends (CT-END lines)."""
     mods, verdict, counts, cases, ends = set(), {}, {}, {}, 0
-    for f in spec.split(','):
+    for out in outputs:
         sect = None
-        for line in open(f, errors='replace'):
+        for line in out:
             line = line.rstrip('\n')
             i = line.find('CT-')
             if i < 0: continue

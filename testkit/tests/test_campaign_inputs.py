@@ -88,6 +88,36 @@ def test_manifest_lists_every_download_with_sha256(monkeypatch, tmp_path, suite)
     else: assert any(f.startswith('gcc-14_14.2.0.orig.tar') for f in pinned)
 
 
+def test_cpython_suites_are_built_by_the_cpy_recipe(monkeypatch, tmp_path):
+    """cpyt and cpyb are built by recipes/cpy (their own folders only name the suite and source it): each image stages
+    that recipe and is keyed by it, and each is its own entry with its own image and list."""
+    monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
+    t = _tools_copy(tmp_path)
+    monkeypatch.setattr(inputs, '_tools', lambda: t)
+    calls = []
+    monkeypatch.setattr(inputs, '_in_container', _fake_build(calls))
+    first = {s: inputs.campaign_image(s) for s in ('cpyt', 'cpyb')}
+    assert first['cpyt'] != first['cpyb'] and len(calls) == 2
+    for (name, staged, kw), suite in zip(calls, ('cpyt', 'cpyb')):
+        assert name == f'campaign-{suite}' and kw['script'] == f'correctness/recipes/{suite}/build.sh'
+        assert staged >= {f'correctness/recipes/{suite}/build.sh', 'correctness/recipes/cpy/build.sh',
+                          'correctness/recipes/cpy/smoke.txt', 'correctness/recipes/common.sh', 'correctness/init',
+                          'correctness/remote.sh', 'correctness/cpy-remote.sh', 'correctness/cpy-build.sh',
+                          'correctness/run-cpy.sh', 'correctness/run-cpyb.sh', 'correctness/run-repro.sh',
+                          'play/rootfs.sh', 'play/mkcpio.py'}, suite
+        assert not any(f.startswith(('correctness/recipes/openssl/', 'correctness/recipes/torture/')) for f in staged)
+        wrapper = (t / f'correctness/recipes/{suite}/build.sh').read_text()
+        assert f'SUITE={suite}\n' in wrapper and '. /recipe/correctness/recipes/cpy/build.sh' in wrapper
+        assert (first[suite] / f'{suite}.cpio.zst').is_file() and (first[suite] / f'{suite}-cases.txt').is_file()
+    for f in ('correctness/recipes/cpy/build.sh', 'correctness/recipes/cpy/smoke.txt', 'correctness/cpy-remote.sh'):
+        with open(t / f, 'a') as h: h.write('# changed\n')
+        again = {s: inputs.campaign_image(s) for s in ('cpyt', 'cpyb')}
+        assert again['cpyt'] != first['cpyt'] and again['cpyb'] != first['cpyb'], f
+        first = again
+    with open(t / 'correctness/recipes/cpyb/build.sh', 'a') as h: h.write('# changed\n')
+    assert inputs.campaign_image('cpyt') == first['cpyt'] and inputs.campaign_image('cpyb') != first['cpyb']
+
+
 def test_unpinned_download_fails(monkeypatch, tmp_path):
     monkeypatch.setenv('NATEMU_TEST_CACHE', str(tmp_path / 'c'))
     monkeypatch.setattr(inputs, '_in_container', _fake_build([], extra=['http://x/evil.deb ' + 'a' * 64 + ' evil.deb']))
