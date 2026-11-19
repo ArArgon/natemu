@@ -29,7 +29,7 @@ from testkit.harness.normalize_programs import _ref, answer, corpus_hash, mask_o
 
 def build_input(fam, name: str) -> tuple[pathlib.Path, list]:
     d = fam.inputs[name]
-    k = lock.fingerprint_input(fam, name)
+    k = lock.input_cache_key(fam, name)     # the fingerprint plus the generator's imports
 
     def build(out):
         r = subprocess.run([sys.executable, str(paths.repo_root() / d.generator), '-o', str(out / 'programs.json'), *d.args],
