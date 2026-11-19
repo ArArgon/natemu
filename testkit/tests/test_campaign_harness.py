@@ -326,6 +326,24 @@ def test_expected_without_a_feature_must_pass_on_a_host_with_it(setup, monkeypat
     assert res.outcome == 'failed' and subs(res)['default:test_a'] == ('failed', None)
 
 
+def test_expected_without_afp_does_not_apply_in_accurate_mode(setup, monkeypatch):
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=0')
+    monkeypatch.setenv('NATEMU_FP', 'accurate')
+    run, _, _ = setup(OSSL_LIST, {'0/2': serial('0/2', *BAD_A)}, extra=WITHOUT_AFP)
+    res = run('part-0')
+    assert res.outcome == 'failed' and subs(res)['default:test_a'] == ('failed', None)
+
+
+def test_expected_without_an_unknown_feature_fails_and_is_not_applied(setup, monkeypatch):
+    extra = '''
+        expected_without.apf = { "default:test_a" = "misspelt (docs/x.md)" }
+        '''
+    run, _, _ = setup(OSSL_LIST, {'0/2': serial('0/2', *BAD_A)}, extra=extra)
+    s = subs(run('part-0'))
+    assert s['expected_without.apf'] == ('failed', 'stale-entry')
+    assert s['default:test_a'] == ('failed', None)
+
+
 @pytest.mark.parametrize('features', ['afp=0', 'afp=1'])
 def test_expected_without_entry_for_unknown_test_is_reported_on_any_host(setup, monkeypatch, features):
     extra = '''

@@ -11,7 +11,9 @@ run and nothing is locked: no QEMU, no x86 machine.
     expected = { test = "why (the document that records it)" }    known non-passes
     expected_without.FEAT = { test = "why" }    known non-passes only on a host lacking FEAT_<FEAT> (lowercased, as
                                 testkit/host.py reads hw.optional.arm: libm's band-ue-flag tests without afp); on a
-                                host with it they are judged as any other test and must pass
+                                host with it they are judged as any other test and must pass; `afp` entries also
+                                not under NATEMU_FP=accurate, which makes those deviations exact (docs/floating-point.md).
+                                A FEAT the host does not report at all fails part-0 (a misspelt name), unapplied
     flaky = { test = "why" }    timing-sensitive tests: a failure reruns the part once
     verdict_flaky = true        the verdict may itself return `flaky` (a test whose only failures are known
                                 timing-sensitive cases, as CPython's TimerfdTests): the part is rerun once, as for a
@@ -378,9 +380,10 @@ class Campaign:
         vcpus = int(variant.get('machine.vcpus', 4))
         expected, flaky = dict(ex.get('expected', {})), dict(ex.get('flaky', {}))
         without = {f: dict(d) for f, d in ex.get('expected_without', {}).items()}
-        have = host.detect().features
+        have = host.detect().features if without else {}
+        accurate = os.environ.get('NATEMU_FP') == 'accurate'
         for f, d in without.items():
-            if not have.get(f): expected.update(d)
+            if f in have and not have[f] and not (f == 'afp' and accurate): expected.update(d)
         img = image(suite.name)
         parts = read_list(img, suite.name)
         declared = int(ex.get('parts', 1))
@@ -440,6 +443,10 @@ class Campaign:
                     if name not in every:
                         sub.append(SubResult(f'{kind}:{name}', 'failed', f'the {kind} entry names no test the image '
                                              f'lists (renamed or removed?): {why}', category='stale-entry'))
+            for f in without:
+                if f not in have:
+                    sub.append(SubResult(f'expected_without.{f}', 'failed', f'this host reports no FEAT_{f.upper()} '
+                                         f'(hw.optional.arm; misspelt?): its entries are not applied', category='stale-entry'))
 
         problems = []
         end = end_of(first.serial)

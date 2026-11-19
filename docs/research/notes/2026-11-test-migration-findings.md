@@ -163,4 +163,5 @@ What each kind means for the references:
 - The stress-ng suite's 900 s cap per boot was the original campaign's, set on the M2, where ipc1 already took about
   15 min per boot. At full size (scale=1, timeout=240) on the M3 (4 performance cores; run 20261119-043949-c2b0) ipc1,
   code1, split and split2 passed it: 151 of 153 stressor runs passed, 1 expected-fail, 5 never reached. The cap only
-  guards against a hang and is now 1,800 s.
+  guards against a hang and is now 1,800 s. Rerun at 1,800 s (run 20261119-075513-6fa7) the four parts passed: 34 passed,
+  1 expected-fail; split took 18 min 27 s. With the first run's other 14 parts, every stressor run passed or was expected.
