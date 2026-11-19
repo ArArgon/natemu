@@ -1844,7 +1844,8 @@ impl<'a> Verifier<'a> {
             // An exit a branch inside the unit reaches is the exit of one guest instruction: the one whose code starts at the
             // exit if the branch comes from the instruction right before it (its skip branch), else the branch's own (a conditional's taken
             // exit, placed after the last instruction). Only the unit's last instruction may exit to the whole set (end,
-            // ...); another goes to its own direct target (or retries at its own RIP: CLI, STI, SWAPGS, VERW).
+            // ...); another goes to its own direct target (or retries at its own RIP: only an STI and a VERW, [`super::retries_own_rip`]; CLI and
+            // SWAPGS never exit).
             let last = (self.c.pcs.iter().map(|p| p.guest_offset))
                 .filter(|&g| g < self.c.guest_bytes)
                 .max();
@@ -1875,7 +1876,9 @@ impl<'a> Verifier<'a> {
                 let insn = self.guest_insn(g);
                 let end = self.c.rip.wrapping_add(g as u64 + insn.len() as u64);
                 let own = self.c.rip.wrapping_add(g as u64);
-                if Some(g) != last && target != own && super::branch_target(insn, end) != Some(target) {
+                // (An exit owned by the unit's end, past the last instruction, goes to the end RIP: `own` there.)
+                let retry = target == own && (g >= self.c.guest_bytes || super::retries_own_rip(insn));
+                if Some(g) != last && !retry && super::branch_target(insn, end) != Some(target) {
                     return Err(format!(
                         "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it (guest {insn:02x?} at {own:#x}, branch at {})",
                         src.map_or("none: reached by falling through".into(), |s| format!("{s:#x}"))
@@ -3530,6 +3533,58 @@ mod tests {
         object[last..last + 4].copy_from_slice(&40u32.to_le_bytes());
         let e = admit((&object, &source)).expect_err("a fall-through exit of a middle instruction admitted");
         assert!(e.contains("reached by falling through"), "{e}");
+    }
+
+    /// With `FEXC` set, CPL-0 requests: the STI and VERW of a unit, mid-unit, exit to their own RIPs and are admitted (they and the
+    /// unit's own end are the only instructions that retry at their own RIP: CLI and SWAPGS never exit), but a jz that exits to
+    /// its own RIP is refused although another instruction branching there (the last `jmp`) puts that RIP in the unit's set.
+    #[test]
+    fn only_sti_and_verw_retry_at_their_own_rip() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("natemu-retry-admit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compile = |source: &[u8]| {
+            let hex: String = source.iter().map(|b| format!("{b:02x}")).collect();
+            let path = dir.join("o");
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", &hex, "--rip", "0x401000", "--profile", "slice1", "--ext-conds", "4", "--push-run", "--narrow-cmp", "--cpl0"])
+                .arg("--object")
+                .arg(&path)
+                .arg("--out")
+                .arg("/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex}");
+            std::fs::read(&path).unwrap()
+        };
+        let inc_jmp = [0x48, 0xff, 0xc0, 0xeb, 0x10];
+        for source in [
+            [&[0xfb][..], &inc_jmp].concat(),                                      // sti; inc rax; jmp
+            [&[0x48, 0xff, 0xc0, 0x0f, 0x00, 0x2f][..], &inc_jmp].concat(),        // inc rax; verw [rdi]; inc rax; jmp
+            [&[0xfb, 0x48, 0xff, 0xc0, 0x0f, 0x00, 0x2f][..], &inc_jmp].concat(), // sti; inc rax; verw [rdi]; inc rax; jmp
+            [&[0xfa, 0x0f, 0x01, 0xf8][..], &inc_jmp].concat(),                    // cli; swapgs; inc rax; jmp
+        ] {
+            let object = compile(&source);
+            admit_at((&object, &source), true, true).unwrap_or_else(|e| panic!("{source:02x?}: {e}"));
+        }
+        // jz +5; inc rax; jmp -7 (to the unit's start): the jz's taken exit (at 40) forged to the jz's own RIP.
+        let source = [0x74, 0x05, 0x48, 0xff, 0xc0, 0xeb, 0xf9];
+        let mut object = compile(&source);
+        admit_at((&object, &source), true, true).unwrap();
+        let h: Header = super::super::record(&object, 0);
+        let reloc = (0..h.relocs_count as usize)
+            .map(|i| h.relocs_offset as usize + i * size_of::<Reloc>())
+            .find(|&r| u32::from_le_bytes(object[r..r + 4].try_into().unwrap()) == 40)
+            .unwrap();
+        object[reloc + 8..reloc + 16].copy_from_slice(&0x40_1000u64.to_le_bytes());
+        let code = (h.code_offset + 40) as usize;
+        object[code..code + 4].copy_from_slice(&(0x5280_0000u32 | 0x1000 << 5).to_le_bytes()); // mov w0, #0x1000
+        object[code + 4..code + 8].copy_from_slice(&(0x72a0_0000u32 | 0x40 << 5).to_le_bytes()); // movk w0, #0x40, lsl #16
+        let e = admit_at((&object, &source), true, true).expect_err("a jz exiting to its own RIP admitted");
+        assert!(e.contains("direct target of the branch"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// With `FEXC` set: extended blocks of every conditional form (jcc rel8 and rel32, loop*, jrcxz, with prefixes) as the host

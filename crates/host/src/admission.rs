@@ -487,6 +487,13 @@ fn interrupt_flag(
     Ok(sti)
 }
 
+/// Whether a translated instruction retries at its own RIP: an STI (an exit taken when an event is pending) or a VERW (when the
+/// resident must decide), the two [`interrupt_flag`] returns RIPs for. CLI and SWAPGS never exit.
+fn retries_own_rip(insn: &[u8]) -> bool {
+    let (o, _) = crate::system::opcode_at(insn);
+    insn == [0xfb] || insn.get(o..o + 2) == Some(&[0x0f, 0x00]) && insn.get(o + 2).is_some_and(|m| m >> 3 & 7 == 5)
+}
+
 /// Everything but the code: header, tables, site records, relocations.
 fn admit_records(
     bytes: &[u8],
