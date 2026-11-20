@@ -3203,9 +3203,20 @@ impl Compiler {
                     } else {
                         exec::system::SSE_GATED
                     };
+                    // A REP string instruction through a null segment makes no access when its count is 0: the resident
+                    // then completes it, so it gets the instruction's length (its prefixes and the one opcode byte).
+                    let prefixes = bytes
+                        .iter()
+                        .take_while(|b| matches!(b, 0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3))
+                        .count();
+                    let rep = gate == "null_segment"
+                        && map == 0
+                        && matches!(op, 0xa4..=0xa7 | 0xaa..=0xaf)
+                        && bytes[..prefixes].iter().any(|b| matches!(b, 0xf2 | 0xf3));
                     Some(exec::System {
                         kind,
-                        length: 1,
+                        length: if rep { prefixes as u32 + 1 } else { 1 },
+                        cr: rep.into(),
                         ..exec::System::NONE
                     })
                 };
@@ -5343,6 +5354,12 @@ mod tests {
         c.null_segments = [false, true, true, true];
         assert_eq!(kind(&mut c, &load), None);
         assert_eq!(kind(&mut c, &load[1..]), Some((exec::system::NULL_SEGMENT, 0))); // mov eax, [ebx]: DS
+        // (A REP string instruction is marked, with its length: it completes when ECX is 0.)
+        match c.compile(&[0x65, 0xf3, 0xa5, 0x90], 0x1000, false, &mut ()).unwrap() {
+            Code::System(s) => assert_eq!((s.kind, s.cr, s.length), (exec::system::NULL_SEGMENT, 1, 3)),
+            _ => panic!("rep movsd through a null ES"),
+        }
+        assert_eq!(kind(&mut c, &[0xa5, 0x90]), Some((exec::system::NULL_SEGMENT, 0)));
         c.null_segments = [true, false, false, false];
         let args = String::from_utf8_lossy(&c.body(&load, 0x1000, None)).replace('\0', " ");
         assert!(args.contains("--fs-null") && !args.contains("--gs-null") && !args.contains("--ds-null"), "{args}");

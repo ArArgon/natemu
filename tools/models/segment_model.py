@@ -35,9 +35,9 @@ load here records it; a state without the key has flat segments). Every operatio
 'fault': (vector, error, cr2) or None, 'reason': text for 'refused', 'permitted': frozenset of (outcome, fault)}; a fault
 leaves the state as it was (the SDM lets a failed segment load set the accessed bit; the model commits no write: B1).
 `outcome`/`fault` are the model's single choice; `permitted` is every result the SDM allows (it differs from
-{(outcome, fault)} only at B2, B8 and B9), and a checker must accept any member.
+{(outcome, fault)} only at B2, B8, B9 and B10), and a checker must accept any member.
 
-AMBIGUITIES (the model's choice; `permitted` widens B2, B8 and B9, and runners build no case on the others):
+AMBIGUITIES (the model's choice; `permitted` widens B2, B8, B9 and B10, and runners build no case on the others):
 B1 A failed instruction commits no write (delivery_model A2).
 B2 LGDT/LIDT with a non-canonical base: AMD APM Vol. 3 LGDT/LIDT lists #GP(0); Intel's exception list (recalled) does not;
    KVM raises it, QEMU loads the base. Model: #GP(0); permitted: #GP(0) or the load.
@@ -55,6 +55,9 @@ B7 Loading a null selector into FS or GS clears its base (Intel's behaviour, the
 B8 The accessed-bit and LTR busy-bit writes: the SDM gives no access width (a locked read-modify-write; QEMU writes the
    descriptor's high dword, KVM the whole descriptor). Model: byte 5 (CR2 = descriptor + 5 on a read-only GDT page);
    permitted CR2: descriptor + 0, + 4 or + 5.
+B10 An access that runs across the 4 GiB end of a segment whose effective limit is FFFFFFFFH (`flat_access`): Vol. 3A
+   "Limit Checking" says such accesses "may or may not" raise #GP/#SS, implementation-specific. Model: the fault;
+   permitted: the fault or completion.
 B9 A not-present SS on IRET or an outer RET: the pseudocode gives #SS(selector) (delivery_model's choice, the model's),
    the exception lists #NP(selector) for "the return code or stack segment" (QEMU's); permitted: either.
 """
@@ -303,11 +306,14 @@ def null_access(state, sreg):
 
 
 def flat_access(state, addr, n, stack=False):
-    """An `n`-byte access at offset `addr` of a flat 4 GiB segment in compatibility mode: #GP(0), or #SS(0) through SS,
-    when it would run past the limit (Vol. 3A "Limit Checking": a doubleword at an offset above the limit - 3)."""
+    """An `n`-byte access at offset `addr` of a flat 4 GiB segment in compatibility mode that would run past the limit
+    (Vol. 3A "Limit Checking": a doubleword at an offset above the limit - 3): #GP(0), or #SS(0) through SS; but with an
+    effective limit of FFFFFFFFH the SDM lets such an access fault or not, implementation-specific (B10). Model: the
+    fault (natemu's choice, and the reference AMD machine's: m2-task3a-findings); permitted: also completion, the
+    access made wrapped (its own page faults are then not this model's)."""
     def body(s, bus):
         if addr + n > 1 << 32:
-            raise Fault(SS if stack else GP, 0)
+            raise _widen(Fault(SS if stack else GP, 0), may_complete=True)
     return _run(state, body)
 
 

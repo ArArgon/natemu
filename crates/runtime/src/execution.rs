@@ -209,13 +209,6 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
             // half included (nonzero after a POP at FFFF_FFFCH, or an access made again at a wrapped address,
             // [`access_aborted`]), and a system instruction's end may pass 4 GiB ([`commit`]).
             s.cpu.rip &= 0xffff_ffff;
-            // Compatibility-mode code this boundary would run that translated code cannot run right (a 16-bit or
-            // non-flat segment, not a null one, [`Cpu::compat_refused`]): #GP(that selector) here, where the code identity is chosen,
-            // whatever loaded the segments (IRET, SYSRET, a segment load in 32-bit code). The recorded deviation.
-            if let Some(selector) = s.cpu.compat_refused() {
-                deliver(s, Event::Exception([13, u64::from(selector & 0xfffc), 0]));
-                continue;
-            }
         }
         io_checkpoint(s);
         take_invalidations(s);
@@ -239,6 +232,17 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
         }
         // S4: an armed instruction breakpoint at RIP (Table 7-2 class 7).
         if debugging && code_break(s) {
+            continue;
+        }
+        // M2 task 3a: compatibility-mode code this boundary would run that translated code cannot run right (a 16-bit or
+        // non-flat segment, not a null one, [`Cpu::compat_refused`]): #GP(that selector) here, where the code identity is
+        // chosen, whatever loaded the segments (IRET, SYSRET, a segment load in 32-bit code): the recorded deviation.
+        // After the traps the last instruction owes and the events this boundary takes (they come before the next
+        // instruction's faults), before anything is fetched or compiled for it.
+        if s.cpu.seg[SREG_CS].attributes & ATTR_L == 0
+            && let Some(selector) = s.cpu.compat_refused()
+        {
+            deliver(s, Event::Exception([13, u64::from(selector & 0xfffc), 0]));
             continue;
         }
         // S4: under TF the instruction runs alone and owes a single-step trap when it completes (SDM Vol.3 18.3.1.4).
@@ -2646,7 +2650,10 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         system::RESERVED_NOP => return Ok(commit(s, i, false)),
         // Perf chunk 12: no-operation instructions before a system instruction, completed at once (`find` goes on at it).
         system::NOP_RUN => return Ok(commit(s, i, false)),
-        system::TOO_LONG | system::NULL_SEGMENT => return Err(GP),
+        system::TOO_LONG => return Err(GP),
+        // A REP string instruction (`cr` 1) with a zero count makes no access: it completes.
+        system::NULL_SEGMENT if i.cr == 1 && s.cpu.gpr[1] as u32 == 0 => return Ok(commit(s, i, false)),
+        system::NULL_SEGMENT => return Err(GP),
         // X1c: a direct branch to a non-canonical target (host `system::branch`): #GP(0) when taken, with nothing changed
         // (a fault, SDM Vol.3 7.5: LOOP's count is not decremented; CALL checks before its push); not taken, it completes
         // (LOOPcc decrements its count; with 0x67 ECX, written zero-extended as every 32-bit register result).
