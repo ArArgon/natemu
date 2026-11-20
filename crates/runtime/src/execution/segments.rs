@@ -54,11 +54,14 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         Ok(u16::from_le_bytes(b))
     };
     match i.kind {
+        // The 10-byte image in 64-bit mode (`size` 8), else 6 bytes; a 16-bit LGDT/LIDT keeps 24 bits of the base.
         system::LGDT..=system::LIDT => {
             let mut b = [0u8; 10];
-            linear(s, address(&c, &i), &mut b, false, false, noncanonical(&i))?;
+            let n = if i.size == 8 { 10 } else { 6 };
+            linear(s, address(&c, &i), &mut b[..n], false, false, noncanonical(&i))?;
+            let base = u64::from_le_bytes(b[2..].try_into().unwrap());
             let table = Table {
-                base: u64::from_le_bytes(b[2..].try_into().unwrap()),
+                base: if i.size == 2 { base & 0xff_ffff } else { base },
                 limit: u64::from(u16::from_le_bytes([b[0], b[1]])),
             };
             // The base must be canonical (AMD APM Vol.3 LGDT/LIDT; KVM checks it; the Intel SDM lists no such #GP).
@@ -80,7 +83,8 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             let mut b = [0u8; 10];
             b[..2].copy_from_slice(&(t.limit as u16).to_le_bytes());
             b[2..].copy_from_slice(&t.base.to_le_bytes());
-            linear(s, address(&c, &i), &mut b, true, false, noncanonical(&i))?;
+            let n = if i.size == 8 { 10 } else { 6 };
+            linear(s, address(&c, &i), &mut b[..n], true, false, noncanonical(&i))?;
         }
         system::SLDT..=system::MOV_FROM_SREG => {
             let v = match i.kind {
