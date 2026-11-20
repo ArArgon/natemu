@@ -10,8 +10,9 @@
                host's write. SIGINFO until an inspection finds it there, then the host-side progress check ends the run.
 Each passes with exit status 2 and the lines it expects; writes OUT/results.json, OUT/stderr.txt.
 
-    python3 tests/diag/diag.py --stub NATEMU --runtime RESIDENT --fexc FEXC --out DIR --case NAME
+    python3 tests/diag/run_diag.py --stub NATEMU --runtime RESIDENT --fexc FEXC --out DIR --case NAME
 """
+import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E401,E402 (tests/README.md)
 import argparse, json, os, pathlib, signal, struct, subprocess, sys, time
 
 MARK = 0x1234abcd
@@ -126,4 +127,5 @@ def reports(text: str) -> list:
 
 
 if __name__ == '__main__':
+    testenv.require_framework(__file__)
     main()
