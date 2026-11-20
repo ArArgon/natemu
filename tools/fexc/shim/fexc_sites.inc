@@ -349,6 +349,12 @@ void Arm64JITCore::FexcHoistPlan() {
       FallbackInfo Info;
       if (InterpreterOps::GetFallbackHandler(IROp, &Info)) return;   // a call (conservative: also ops the JIT has its own code for)
       if (GetHasDest(IROp->Op) && GetRegClass(Node) == IR::RegClass::FPR) Used |= 1u << IR::PhysicalRegister(Node).Reg;
+      // a pair load has no dest of its own: its two outputs are AllocateFPR nodes outside the block's code list
+      if (IROp->Op == IR::OP_LOADMEMPAIR || IROp->Op == IR::OP_LOADCONTEXTPAIR) {
+        const auto P = IROp->Op == IR::OP_LOADMEMPAIR ? IR::PhysicalRegister(IROp->C<IR::IROp_LoadMemPair>()->OutValue1) : IR::PhysicalRegister(IROp->C<IR::IROp_LoadContextPair>()->OutValue1);
+        const auto Q = IROp->Op == IR::OP_LOADMEMPAIR ? IR::PhysicalRegister(IROp->C<IR::IROp_LoadMemPair>()->OutValue2) : IR::PhysicalRegister(IROp->C<IR::IROp_LoadContextPair>()->OutValue2);
+        if (P.AsRegClass() == IR::RegClass::FPR) Used |= 1u << P.Reg | 1u << Q.Reg;
+      }
     }
   }
   uint32_t Free = 0;

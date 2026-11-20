@@ -1670,7 +1670,7 @@ class AfpDazFree(unittest.TestCase):
     def test_the_flushing_producers_free_their_result(self):
         cases = {   # producer: (consumer, saved)
             'mulsd': ('f20f59c2', self.ADDSD, 1), 'subsd': ('f20f5cc2', self.ADDSD, 1), 'divsd': ('f20f5ec2', self.ADDSD, 1),
-            'addsd': (self.ADDSD, self.ADDSD, 1), 'sqrtsd': ('f20f51c2', self.ADDSD, 1), 'mulss': ('f30f59c2', self.ADDSS, 1),
+            'addsd': ('f20f58c2', self.ADDSD, 1),   # (xmm0 += xmm2: a producer that reads the consumer's own xmm1 shares that source's flush too) 'sqrtsd': ('f20f51c2', self.ADDSD, 1), 'mulss': ('f30f59c2', self.ADDSS, 1),
             'mulpd': ('660f59c2', self.ADDPD, 1), 'subps': ('0f5cc2', self.ADDPS, 1), 'sqrtpd': ('660f51c2', self.ADDPD, 1),
             'divps': ('0f5ec2', self.ADDPS, 1), 'haddps': ('f20f7cc2', self.ADDPS, 1),
             'mulpd -> scalar use (element 0 of a full result)': ('660f59c2', self.ADDSD, 1),
