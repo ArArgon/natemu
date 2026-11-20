@@ -3154,11 +3154,6 @@ impl Compiler {
                 gated,
                 ud,
             } => {
-                let decoded = |(map, opcode)| {
-                    crate::system::decode(bytes, map, opcode)
-                        .or_else(|| crate::system::lock_ud(bytes))
-                        .or_else(|| crate::system::vex_ud(bytes))
-                };
                 // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
                 // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
                 // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone.
@@ -3188,7 +3183,8 @@ impl Compiler {
                 match ud.or_else(|| {
                     cut.and_then(|cut| match gated {
                         Some(mmx) => gated_kind(cut, *mmx),
-                        None => decoded(cut),
+                        // 64-bit code only: the resident runs no other mode yet (`Cpu::control`).
+                        None => crate::system::decode(bytes, 64),
                     })
                 }) {
                     Some(s) if reason == "system_instruction" => Ok(Code::System(s)),

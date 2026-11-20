@@ -2798,7 +2798,8 @@ pub struct System {
     pub reg: u32,
     /// A memory operand (INVLPG, descriptor-table and segment forms, far JMP/CALL): base register ([`system::RIP`] for
     /// RIP-relative, [`system::NO_REG`] for none), index register ([`system::NO_REG`]: none), scale (a shift, 0..3) and
-    /// displacement; 64-bit address size. RET far: `disp` is the imm16 released.
+    /// displacement, sign-extended; the address size in `prefixes` (16-bit forms name BX, BP, SI and DI as base and
+    /// index). RET far: `disp` is the imm16 released.
     pub base: u32,
     pub index: u32,
     pub scale: u32,
@@ -2808,11 +2809,13 @@ pub struct System {
     /// Operand size in bytes where the form has one: a register written by MOV r, Sreg / SLDT / STR (2: its low 16 bits;
     /// 4, 8: the selector zero-extended), the offset of a far pointer and the width of RET far / IRET pops (4 or 8).
     pub size: u32,
-    /// A segment override on the memory operand: [`SREG_FS`], [`SREG_GS`] (its base is added; the last FS/GS prefix);
-    /// else 0, the operand's default (SS for an RSP or RBP base, else DS), which decides #SS(0) or #GP(0) for a non-canonical
-    /// address: CS/DS/ES/SS prefixes are ignored in 64-bit mode (owner decision of November 3, the reference AMD machine).
+    /// The memory operand's segment register ([`SREG_ES`] ..): its override, else its default (SS for an rSP or rBP base,
+    /// else DS), which decides #SS(0) or #GP(0) for a non-canonical address; INS's is ES, OUTS's its source's. In 64-bit
+    /// mode CS/DS/ES/SS prefixes are ignored (owner decision of November 3, the reference AMD machine) and only FS and GS
+    /// add a base (the last FS/GS prefix). 0 without a memory operand.
     pub segment: u32,
-    /// L3, INS/OUTS: [`system::REP`] (an F3 prefix) and [`system::ADDRESS32`] (a 0x67 prefix: ESI/EDI and ECX); else 0.
+    /// [`system::REP`] (INS/OUTS: an F3 prefix) and the address size of a memory operand or of INS/OUTS
+    /// ([`system::ADDRESS32`], [`system::ADDRESS16`]: rSI/rDI and rCX for INS/OUTS); else 0.
     pub prefixes: u32,
 }
 pub mod system {
@@ -2909,7 +2912,7 @@ pub mod system {
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
     /// X2 (numbered apart from the other chunks' kinds): CLI (`fa`), STI (`fb`), POPF (`9d`; `size` 8, or 2 with a 66
-    /// prefix: 64-bit mode has no 32-bit form) and HLT (`f4`).
+    /// prefix: 64-bit mode has no 32-bit form; 4 from 32- and 16-bit code) and HLT (`f4`).
     pub const CLI: u32 = 0x40;
     pub const STI: u32 = 0x41;
     pub const POPF: u32 = 0x42;
@@ -2977,7 +2980,8 @@ pub mod system {
     /// decremented; CALL checks before its push); not taken: RIP past it, LOOPcc's count decremented.
     pub const BRANCH: u32 = 0x75;
     /// X1c: PUSH FS/GS and POP FS/GS (`0f a0`, `0f a8`, `0f a1`, `0f a9`): `cr` the segment register ([`super::SREG_FS`],
-    /// [`super::SREG_GS`]), `size` the operand size (8, or 2 with 66; REX.W wins). PUSH stores the selector zero-extended
+    /// [`super::SREG_GS`]; ES, CS, SS and DS from 32- and 16-bit code), `size` the operand size (8, or 2 with 66; REX.W
+    /// wins; 4 or 2 from 32- and 16-bit code). PUSH stores the selector zero-extended
     /// (SDM Vol.2 PUSH: "a zero-extended value"); POP loads the popped selector as MOV Sreg does, then releases the slot.
     pub const PUSH_SREG: u32 = 0x76;
     pub const POP_SREG: u32 = 0x77;
@@ -3018,13 +3022,15 @@ pub mod system {
     /// SHLD/SHRD r/m16, r16, CL: `cr` bits3:0 source, bit4 SHRD; `reg` is the destination for a register operand.
     /// Defined masked counts0..16 execute; larger counts retain the profile's undefined-result refusal.
     pub const DOUBLE_SHIFT16: u32 = 0x7e;
-    /// ENTER: `size` the pushed operand width (2 or 8), `cr` the nesting level modulo 32,
+    /// ENTER: `size` the pushed operand width (2 or 8; 4 from 32- and 16-bit code), `cr` the nesting level modulo 32,
     /// `disp` the unsigned 16-bit allocation. Stack addresses remain 64-bit.
     pub const ENTER: u32 = 0x7f;
-    /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand (0x67): the effective address is truncated
-    /// to 32 bits and zero-extended before the FS/GS base.
+    /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand of 32-bit address size (0x67 in 64-bit
+    /// mode): the effective address is truncated to 32 bits and zero-extended before the segment base; [`ADDRESS16`]
+    /// likewise to 16 bits (16-bit address size: 32-bit code with 0x67, 16-bit code).
     pub const REP: u32 = 1;
     pub const ADDRESS32: u32 = 2;
+    pub const ADDRESS16: u32 = 4;
     impl super::System {
         pub const NONE: Self = Self {
             kind: 0,
@@ -3048,7 +3054,7 @@ pub mod system {
                 && (reg(self.index) || self.index == NO_REG)
                 && self.scale <= 3
                 && (self.base != RIP || self.index == NO_REG)
-                && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS);
+                && self.segment as usize <= super::SREG_GS;
             let rm = if self.memory == 1 {
                 address
             } else {
@@ -3059,12 +3065,14 @@ pub mod system {
                 && self.lock <= 1
                 && (self.prefixes == 0
                     || matches!(self.kind, INS | OUTS)
-                    || (self.memory == 1 && self.prefixes == ADDRESS32))
+                    || (self.memory == 1 && matches!(self.prefixes, ADDRESS32 | ADDRESS16)))
                 && match self.kind {
                     MOV_TO_CR | MOV_FROM_CR | MOV_TO_DR | MOV_FROM_DR => {
                         reg(self.cr) && reg(self.reg)
                     }
-                    INVLPG => address && self.segment == 0,
+                    INVLPG => {
+                        address && !matches!(self.segment as usize, super::SREG_FS | super::SREG_GS)
+                    }
                     RDMSR | WRMSR | CPUID | RDTSC | RDTSCP | RDPMC => true,
                     SET_CPL => matches!(self.cr, 0 | 3),
                     LGDT..=SIDT => self.memory == 1 && address,
@@ -3119,7 +3127,7 @@ pub mod system {
                     DOUBLE_SHIFT16 => rm && self.cr < 32 && self.size == 2,
                     ENTER => {
                         self.memory == 0
-                            && matches!(self.size, 2 | 8)
+                            && matches!(self.size, 2 | 4 | 8)
                             && self.cr < 32
                             && (0..=0xffff).contains(&self.disp)
                     }
@@ -3132,9 +3140,11 @@ pub mod system {
                     BRANCH => self.cr <= 21 && matches!(self.size, 4 | 8),
                     RESERVED_NOP => true,
                     NOP_RUN => self.lock == 0,
+                    // ES, CS, SS and DS from 32- and 16-bit code only (no POP CS).
                     PUSH_SREG | POP_SREG => {
-                        matches!(self.cr as usize, super::SREG_FS | super::SREG_GS)
-                            && matches!(self.size, 2 | 8)
+                        self.cr as usize <= super::SREG_GS
+                            && (self.kind == PUSH_SREG || self.cr as usize != super::SREG_CS)
+                            && matches!(self.size, 2 | 4 | 8)
                     }
                     SYSRET => matches!(self.size, 4 | 8),
                     RDFSBASE..=WRGSBASE => {
@@ -3153,7 +3163,7 @@ pub mod system {
                     }
                     CLFLUSH => self.memory == 1 && address,
                     CLI | STI | HLT => true,
-                    POPF => matches!(self.size, 2 | 8),
+                    POPF => matches!(self.size, 2 | 4 | 8),
                     EVENT_HOOK => self.length == 1,
                     BT_ALIGNED => {
                         self.memory == 1
@@ -3175,14 +3185,14 @@ pub mod system {
                     INS => {
                         self.memory == 0
                             && matches!(self.size, 1 | 2 | 4)
-                            && self.prefixes < 4
-                            && self.segment == 0
+                            && self.prefixes < 8
+                            && self.segment as usize == super::SREG_ES
                     }
                     OUTS => {
                         self.memory == 0
                             && matches!(self.size, 1 | 2 | 4)
-                            && self.prefixes < 4
-                            && matches!(self.segment as usize, 0 | super::SREG_FS | super::SREG_GS)
+                            && self.prefixes < 8
+                            && self.segment as usize <= super::SREG_GS
                     }
                     _ => false,
                 }
@@ -4839,16 +4849,16 @@ mod tests {
                 kind: system::JMP_FAR,
                 size: 8,
                 memory: 1,
-                segment: 1,
+                segment: 6,
                 ..mov
-            }, // CS: never decoded (ignored)
+            }, // no such segment register
             System {
                 kind: system::JMP_FAR,
                 size: 8,
                 memory: 1,
-                segment: SREG_SS as u32,
+                prefixes: system::ADDRESS32 | system::ADDRESS16,
                 ..mov
-            }, // SS: never decoded (ignored)
+            }, // two address sizes
             System {
                 kind: system::MOV_FROM_DR,
                 cr: 16,

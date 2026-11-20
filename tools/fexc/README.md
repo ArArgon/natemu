@@ -149,7 +149,7 @@ and shim changes: the VEX AVX, AVX2, FMA and F16C forms through FEX's AVX128 low
 LDP/STP of two Q registers). The allowlist's `Avx` table (`shim/fexc_slice1.inc`, VEX fields parsed from the bytes: map, pp,
 L, W, vvvv) admits the forms by VEX.L, VEX.W, reserved VEX.vvvv and operand kind and refuses the rest with a reason
 (gathers, VMASKMOV/VPMASKMOV/VMASKMOVDQU, VLDMXCSR/VSTMXCSR, VCVTPS2PH to memory, VPCMPxSTRx, VEX AES/PCLMULQDQ, scalar forms
-with VEX.L = 1); a 66/F2/F3 prefix or an adjacent REX before VEX is a system cut (the host's `vex_ud`: #UD); `--avx-gated`
+with VEX.L = 1); a 66/F2/F3 prefix or an adjacent REX before VEX is a system cut (the host's decode: #UD); `--avx-gated`
 (the host's: no CR4.OSXSAVE, XCR0[2:1] != 11b or CR0.TS) cuts every AVX form as gated (`cut_gated`, the host's
 `AVX_GATED`); VMOVAPS/VMOVAPD/VMOVDQA/VMOVNT*/VMOVNTDQA get the alignment check `and x0, xA, #15|#31` (`fexc_align16`/
 `fexc_align32`). Patch 0021: the YMM upper halves flushed per instruction (`FlushRegisterCache(true)`), FS/GS-based 32-byte

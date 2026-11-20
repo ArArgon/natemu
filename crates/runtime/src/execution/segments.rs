@@ -163,7 +163,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
 }
 
 /// The linear address of `i`'s memory operand: base + index * scale + displacement (I10: truncated to 32 bits with 0x67,
-/// RIP-relative included), plus the FS/GS base of an override.
+/// RIP-relative included) at its address size, plus the FS/GS base of an override.
 pub(super) fn address(c: &Cpu, i: &System) -> u64 {
     let base = match i.base {
         system::RIP => c.rip.wrapping_add(u64::from(i.length)),
@@ -180,17 +180,17 @@ pub(super) fn address(c: &Cpu, i: &System) -> u64 {
         _ => 0,
     };
     let ea = base.wrapping_add(index).wrapping_add(i.disp as u64);
-    let ea = if i.prefixes & system::ADDRESS32 != 0 {
-        ea as u32 as u64
-    } else {
-        ea
+    let ea = match i.prefixes & (system::ADDRESS32 | system::ADDRESS16) {
+        system::ADDRESS32 => ea as u32 as u64,
+        system::ADDRESS16 => ea as u16 as u64,
+        _ => ea,
     };
     ea.wrapping_add(segment)
 }
-/// A non-canonical memory operand: #SS(0) for an SS-class reference (an RSP or RBP base with no FS/GS override: the
-/// host ignores CS/DS/ES/SS prefixes, owner decision of November 3), else #GP(0) (FS/GS, I7).
+/// A non-canonical memory operand: #SS(0) for an SS reference (the host gives an RSP or RBP base with no FS/GS override
+/// SS: it ignores CS/DS/ES/SS prefixes, owner decision of November 3), else #GP(0) (FS/GS, I7).
 pub(super) fn noncanonical(i: &System) -> Exception {
-    if i.segment == 0 && matches!(i.base, 4 | 5) {
+    if i.segment as usize == SREG_SS {
         SS0
     } else {
         GP0
