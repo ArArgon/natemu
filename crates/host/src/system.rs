@@ -1255,7 +1255,7 @@ mod lock_tests {
 /// NOP) after 66, CS/DS/ES/SS (ignored in 64-bit mode) and REX prefixes, and ENDBR64/ENDBR32 (`f3 0f 1e fa`/`fb`; the
 /// profile has no CET, so they execute as NOPs, SDM Vol.1 18.3.3), each at most 15 bytes. Anything else (LOCK, F2/F3,
 /// 0x67, FS/GS, PAUSE, `41 90` = XCHG R8, EAX, a ModRM.reg other than 0) is `None`. 64-bit mode only (REX bytes are REX:
-/// the resident runs no other mode, `Cpu::control`).
+/// the resident runs no other mode, `Cpu::code_mode`).
 pub(crate) fn nops(bytes: &[u8]) -> Option<u32> {
     let (mut at, mut n) = (0, 0);
     while at < bytes.len() {
