@@ -392,11 +392,9 @@ def cases():
     c.append(('jmp-far-call-gate',) + far(0xb0) + (lambda s: sm.far(_ptr(s, 0x110000, 0xb0), 'jmp', d + PTR + 0x90), {}))
     c.append(('lret-compat',) + ret([0x110000, 0x38]))
     # Compatibility-mode code at CPL 3 that natemu does not run is its recorded deviation, judged by segment_model alone
-    # (x86 runs the code). From CPL 0: IRETQ to the 32-bit DPL 3 code segment (0xdb) with DS and ES nulled by the return
-    # (DPL 0 segments), and to the 16-bit one (0xd3), complete and take #GP (0, the null DS; 0xd0) at their target (M2 task
-    # 3a; with flat DS and ES the 32-bit code runs: compat.py); an outer RET to it is #GP(selector) at the RET with nothing
-    # changed (owner decision, November 6; far transfers are task 5).
-    c.append(('iret-compat-cpl3',) + iret([0x110000, 0xdb, 2, d + USTACK, 0x1b]))
+    # (x86 runs the code). From CPL 0: IRETQ to the 16-bit DPL 3 code segment (0xd3) completes and takes #GP(0xd0) at its
+    # target (M2 task 3a; IRETQ to the 32-bit one runs the code: compat.py); an outer RET to the 32-bit one (0xdb) is
+    # #GP(selector) at the RET with nothing changed (owner decision, November 6; far transfers are task 5).
     c.append(('iret-compat16-cpl3',) + iret([0x110000, 0xd3, 2, d + USTACK, 0x1b]))
     # The frame's RIP beyond the 4 GiB limit of the 32-bit code segment: #GP(0) at the IRETQ.
     c.append(('iret-compat-rip',) + iret([1 << 32 | 0x110000, 0xdb, 2, d + USTACK, 0x1b]))
@@ -413,14 +411,12 @@ def cases():
                              ('ltr', '    mov eax, 0x70\n    ltr ax\n', lambda s: sm.ltr(s, 0x70)),
                              ('lret-to-cpl0', '    push 0x08\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0x08]))),
                              # The compatibility-mode deviation at CPL 3 (above): far JMP and CALL and RET far at the
-                             # instruction, IRETQ at its target (DS and ES are null there); a call gate.
+                             # instruction (IRETQ to 32-bit code runs it: compat.py's c32-null-ds); a call gate.
                              ('jmp-far-compat', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    jmp far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xdb), 'jmp', s['rsp'] - 16, stack=True)),
                              ('call-far-compat16', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xd3\n    call far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xd3), 'call', s['rsp'] - 16, stack=True)),
                              ('lret-compat', '    push 0xdb\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0xdb]))),
-                             ('iret-compat', '    mov rax, rsp\n    push 0x1b\n    push rax\n    push 2\n    push 0xdb\n    push 0x110000\n    iretq\n',
-                              lambda s: sm.iret(_stack(s, [0x110000, 0xdb, 2, s['rsp'], 0x1b]))),
                              ('jmp-far-call-gate', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xb3\n    jmp far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xb3), 'jmp', s['rsp'] - 16, stack=True))):
         c.append((f'cpl3-{name}', None, insn, call, {'cpl': 3}))

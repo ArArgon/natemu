@@ -21,7 +21,7 @@ transfers to compatibility mode are not built (task 5): a far JMP, CALL or RET w
 is a 64-bit call gate (not built). Owner decision of November 6: where that code would run at CPL 3 (JMP/CALL far at CPL
 3, RET far to RPL 3; a call gate at CPL 3) it is instead the deviation #GP(selector) with nothing changed (a `Deviation`
 fault: the result's `deviation` is True). `null_access` and `flat_access` are the two faults of a 32-bit access that
-translated code must still raise (a null FS or GS, the 4 GiB limit). An IRET loading TF is
+translated code must still raise (a null FS, GS, DS or ES; the 4 GiB limit). An IRET loading TF is
 done (its single-step trap after the next instruction is natemu's S4). Paging is delivery_model's abstraction (`memory`: page number -> {'data', 'write',
 'user'}); descriptor-table and TSS-descriptor accesses are implicit supervisor accesses (CPL 0 rights, U/S = 0 in a #PF),
 operand and stack accesses are made at the CPL.
@@ -84,16 +84,17 @@ class Deviation(Fault):
 def refused_shape(s):
     """The selector natemu's deviation names when compatibility-mode code at CPL 3 cannot run under `s` (None: it runs):
     natemu's `Cpu::compat_refused`. 32-bit code (CS.D = 1) on a 32-bit stack (SS.B = 1), CS/SS/DS/ES with base 0 and a 4
-    GiB limit, SS/DS/ES present writable expand-up data (so not null)."""
+    GiB limit, SS/DS/ES writable expand-up data; a null DS or ES runs (x86's fault at its first use: `null_access`)."""
     shape = s.get('shape', {})
     flat = lambda r: shape.get(r, (0, 0xFFFFFFFF)) == (0, 0xFFFFFFFF)
     data = lambda r: flat(r) and s['seg'][r][1] & 0x9E == 0x92
+    null = lambda r: not s['seg'][r][1] & 0x80
     cs, ss = s['seg']['cs'], s['seg']['ss']
     if cs[1] >> 13 & 3 != 2 or not flat('cs'):
         return cs[0]
     if not data('ss') or not ss[1] >> 14 & 1:
         return ss[0]
-    return next((s['seg'][r][0] for r in ('ds', 'es') if not data(r)), None)
+    return next((s['seg'][r][0] for r in ('ds', 'es') if not null(r) and not data(r)), None)
 
 
 def _loaded(s, sreg, sel, raw):
@@ -293,7 +294,7 @@ def load(state, sreg, sel):
 
 
 def null_access(state, sreg):
-    """A memory access through FS or GS (`sreg`) in compatibility mode: #GP(0) while it holds a null selector (Vol. 3A
+    """A memory access through FS, GS, DS or ES (`sreg`) in compatibility mode: #GP(0) while it holds a null selector (Vol. 3A
     "Segment Loading Instructions in IA-32e Mode": a null selector's segment faults on use outside 64-bit mode)."""
     def body(s, bus):
         if not s['seg']['cs'][1] >> 13 & 1 and not s['seg'][sreg][1] & 0x80:

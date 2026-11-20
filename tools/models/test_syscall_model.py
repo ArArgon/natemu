@@ -25,10 +25,11 @@ def machine(cpl=0, ro=False):
     return s
 
 
-def machine_null_ds():
+def machine_shaped(seg, **shape):
     s = machine()
     s['gpr'].update(rcx=0x40_0000, r11=0x202)
-    s['seg']['ds'] = (0, 0)
+    s['seg'].update(seg)
+    s['shape'] = shape
     return s
 
 
@@ -87,8 +88,9 @@ class FastCalls(unittest.TestCase):
         r = m.sysret(s, width=4)                # SYSRETL with DS = ES = a DPL 0 flat data segment: 32-bit code runs
         self.assertEqual((r['outcome'], r['state']['rip'], r['state']['seg']['cs'], r['state']['seg']['ss']),
                          ('done', 0x40_0000, (0x23, 0xC0FB), (0x2B, 0xC0F3)))
-        r = m.sysret(machine_null_ds(), width=4)                                        # a null DS: natemu's deviation
-        self.assertEqual((r['fault'][:2], r['deviation'], r['fault_rip'], r['state']['cpl']), ((GP[0], 0), True, 0x40_0000, 3))
+        self.assertEqual(m.sysret(machine_shaped({'ds': (0, 0)}), width=4)['outcome'], 'done')   # a null DS runs
+        r = m.sysret(machine_shaped({}, ds=(0x1000, 0xFFFFFFFF)), width=4)             # a DS with a base: natemu's deviation
+        self.assertEqual((r['fault'][:2], r['deviation'], r['fault_rip'], r['state']['cpl']), ((GP[0], 0x10), True, 0x40_0000, 3))
         bad = machine()
         bad['gpr'].update(rcx=0x0000_8000_0000_0000, r11=0x302)
         self.assertEqual(m.sysret(bad)['fault'], GP)                                    # non-canonical before TF

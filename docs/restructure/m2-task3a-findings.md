@@ -28,8 +28,9 @@ end.
   - An instruction that runs past 4 GiB raises #GP(0); the host's fetch window never crosses 4 GiB.
 - **The host** (`crates/host`): system instructions cut from 32-bit code are decoded in 32-bit mode (task 1's decoder);
   the two "FS null" and "GS null" request flags; the stop report reads only the eight registers 32-bit code holds.
-- **The compiler** (`tools/fexc`): `--fs-null` and `--gs-null`. No change to the FEX fork.
-- **The code identity** gained two bits (5 and 6): FS null, GS null, in 32-bit code only.
+- **The compiler** (`tools/fexc`): `--fs-null`, `--gs-null`, `--ds-null`, `--es-null`. No change to the FEX fork.
+- **The code identity** gained four bits (5 to 8): FS, GS, DS, ES null, in 32-bit code only. Bits 3 to 8 are now all
+  used.
 
 ## Decisions
 
@@ -42,16 +43,16 @@ Each is the session's unless marked; all are reversible.
    completes and the next instruction takes #GP with the offending selector as error code (0 for a null one). Before,
    IRET to 32-bit code faulted at the IRET itself, in the kernel. Linux turns both into a SIGSEGV for the program.
 2. **What counts as flat.** CS: 32-bit, base 0, limit 4 GiB. SS: the same, a writable expand-up data segment, 32-bit
-   stack. DS and ES: base 0, limit 4 GiB, present, writable, expand-up data. A read-only or expand-down DS is refused
+   stack. DS and ES: null, or base 0, limit 4 GiB, writable, expand-up data. A read-only or expand-down DS is refused
    too, because translated code checks neither.
-3. **A null DS or ES is refused, eagerly.** On hardware 32-bit code with a null DS runs until it first uses DS. Here
-   it faults before its first instruction. Linux gives every 32-bit process a real DS and ES, so this does not affect
-   them. It does affect a 64-bit process that jumps into 32-bit code without loading DS (the kernel's `sigreturn_64`
-   self-test does; task 5's far jumps will). **For the owner or task 5:** the exact alternative is the same gate as
-   for FS and GS: two more identity bits ("DS null", "ES null"; bits 7 and 8 are the last free ones below bit 9) and
-   the compiler cutting every access whose segment is DS or ES. About 20 lines in the compiler; not done here because
-   the plan names only FS and GS.
-4. **The null FS/GS gate is a cut, not a new stub.** Under `--fs-null` the compiler ends the block before any
+3. **A null DS or ES is exact (the orchestrator's direction, from the owner's rule "exact first").** 32-bit code with a
+   null DS runs until the first access through DS, which raises #GP(0), as on hardware. It is the same gate as for FS
+   and GS: two more identity bits, and the compiler cuts every access whose segment is the null one. For DS that is
+   every memory operand without a prefix whose base is not EBP or ESP, plus the string source; for ES every string
+   destination. The first version of this task refused a null DS or ES before the first instruction; that is gone.
+   Cost: none in 32-bit Linux processes (DS and ES are never null there); under a null DS nearly every block is one
+   instruction long, which is right for code about to fault.
+4. **The null-segment gate is a cut, not a new stub.** Under `--fs-null` the compiler ends the block before any
    instruction that accesses memory through FS, exactly as it does for an SSE instruction when SSE is switched off, and
    the resident raises #GP(0) there. This reuses the existing "gated instruction" path end to end: nothing new in
    generated code, in admission or in the fork. A prefix on an instruction that accesses nothing through the segment
@@ -93,23 +94,26 @@ All through the framework. New case `system/compat32` (`tests/smp/run_slice3_vm.
 | `c32-sysenter` | SYSENTER out of 32-bit code, SYSRETL back, INT 0x80 with the SYSRETL selectors in its frame | QEMU |
 | `c32-wrap` | `%gs:` with negative offsets (immediate and register); a GS base just below 4 GiB with offsets past it; `[ebp-12]` with EBP = 4; EBX = FFFF_FFF0H plus 40H; PUSH at ESP = 0; POP at ESP = FFFF_FFFCH and stores above the wrapped ESP, one across a page | QEMU |
 | `c32-syscall-ud` | SYSCALL from 32-bit code with SYSCALL enabled: #UD | model and QEMU |
+| `c32-null-ds` | IRETQ into 32-bit code with DS and ES null that never uses them: registers, the stack (ESP and EBP bases, an SS override), a call, LEA, a DS prefix on a register form, INT 0x80 | QEMU |
 | `c32-fs-null`, `c32-gs-null`, `c32-gs-null-string` | a load, a read-modify-write and a string source through a null FS or GS: #GP(0) | model (QEMU does not check) |
+| `c32-ds-null`, `c32-es-null` | DS, ES loaded with null inside 32-bit code, which runs on (stack use; a DS access while only ES is null) until a load through DS, a string store through ES: #GP(0) there | model (QEMU does not check) |
 | `c32-limit`, `c32-limit-ss`, `c32-limit-fetch` | a load, a stack-segment store and an instruction that run across 4 GiB: #GP(0), #SS(0), #GP(0) | model (QEMU does not check) |
-| `c32-ds-based`, `c32-es-null` | natemu's deviation: DS loaded with a based segment, ES with null, inside 32-bit code: #GP before the next instruction | model (natemu only) |
+| `c32-ds-based` | natemu's deviation: DS loaded with a based segment inside 32-bit code: #GP before the next instruction | model (natemu only) |
 
 QEMU runs these as an Intel processor (`vendor=GenuineIntel`; a program may now name its QEMU CPU model), because its
 default model follows AMD for SYSCALL and SYSENTER.
 
-Existing cases that changed (`smp/system`): `seg-iret-compat-cpl3`, `seg-iret-compat16-cpl3` and `seg-cpl3-iret-compat`
-now expect the IRET to complete and the fault at its target; new `seg-iret-compat-rip` (a return address above 4 GiB:
+Existing cases that changed (`smp/system`): `seg-iret-compat16-cpl3` now expects the IRET to complete and the fault at
+its target; `seg-iret-compat-cpl3` and `seg-cpl3-iret-compat` are gone (an IRET into 32-bit code with a null DS now
+runs it, which `c32-null-ds` covers); new `seg-iret-compat-rip` (a return address above 4 GiB:
 #GP(0) at the IRET by the manual; QEMU loads it and faults at the fetch, so the model judges);
-`sc-sysretl` became `sc-sysretl-null-ds` (SYSRETL with a null DS: the fault at its target; SYSRETL itself is in
-`c32-sysenter`).
+`sc-sysretl` is gone (SYSRETL is in `c32-sysenter`).
 
 Unit tests: the model's own (`tools/models/test_segment_model.py`, `test_syscall_model.py`); `compat_segments_that_run`
-in the ABI crate (every refused shape, the two identity bits); the host's 32-bit request test (32-bit decode of a cut, the
+in the ABI crate (every refused shape, the four identity bits); the host's 32-bit request test (32-bit decode of a cut, the
 null-segment cut and its arguments); the compiler's `test_32_bit_null_fs_gs` (19 accessing
-forms cut, 9 non-accessing forms untouched, the other segment, 64-bit code, prefix order, SSE gating first) and four new
+forms cut, 9 non-accessing forms untouched, the other segment, 64-bit code, the DS default and the EBP/ESP bases that
+are SS, ES string destinations, prefix order, SSE gating first) and four new
 argument sets in its serve test.
 
 Task 2 asked for a replay check that mixes both modes. The compiler's serve test already answers 64-bit and 32-bit
@@ -128,7 +132,8 @@ Results are in the task's report (commands and counts); the gate has not run (th
 - **Non-flat and 16-bit segments** (tasks 5 and 6), **SYSEXIT to 32-bit code**, **far JMP/CALL/RET into 32-bit code**
   (task 5).
 - **The kernel self-test expectations** (`sigreturn_64`, `sysret_ss_attrs_64` in the campaign's expected list) were not
-  rerun; their 32-bit parts now get further before they fail (decision 3) and the entries' wording may need an update.
+  rerun. `sigreturn_64`'s 32-bit part (a sigreturn into 32-bit code with a null DS) should now run as on hardware, so
+  its entry may become an unexpected pass; `sysret_ss_attrs_64` uses a far return, which still faults (task 5).
 
 ## For task 3b
 
@@ -136,9 +141,9 @@ The shim executes these with 64-bit rules today; in 32-bit code each needs its 3
 task 3a's tests, which use register forms and the kernel side's 64-bit instructions.
 
 - **The effective address of a memory operand** of any instruction the shim executes: 32-bit wrap of base + index +
-  displacement and then of segment base + offset; the CS/DS/ES/SS base (0 while flat); **#GP(0) through a null FS or
-  GS** (the compiler's gate covers translated instructions only; a shim-executed instruction with an FS or GS prefix
-  is cut earlier and still uses the base); #GP/#SS at the 4 GiB limit instead of the canonical check.
+  displacement and then of segment base + offset; the CS/DS/ES/SS base (0 while flat); **#GP(0) through a null FS,
+  GS, DS or ES** (the compiler's gate covers translated instructions only; a shim-executed instruction with a memory
+  operand is cut earlier, as a system instruction, and does not check); #GP/#SS at the 4 GiB limit instead of the canonical check.
 - **Stack width:** PUSH/POP of segment registers, PUSHF/POPF, ENTER, far CALL, INT's frame are 4-byte and move ESP with
   a 32-bit wrap.
 - **IRET executed in 32-bit code** (IRETD): 32-bit frame, and SS:ESP popped only on a privilege change. Today it uses
