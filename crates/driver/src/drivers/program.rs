@@ -1846,8 +1846,6 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                     | bit(c.xcr0 != 0, exec::CR4_OSXSAVE),
                 efer: exec::EFER_LME | exec::EFER_LMA | bit(c.nxe, exec::EFER_NXE),
                 cpl: c.cpl,
-                fs_base: c.fs_base,
-                gs_base: c.gs_base,
                 xmm: c.xmm,
                 mxcsr: c.mxcsr,
                 fcw: exec::FCW_INIT,
@@ -1862,7 +1860,11 @@ pub(crate) fn run(resident: &str, args: Args) -> Result<()> {
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,
-                seg: exec::flat_segments(c.cpl),
+                seg: {
+                    let mut seg = exec::flat_segments(c.cpl);
+                    (seg[exec::SREG_FS].base, seg[exec::SREG_GS].base) = (c.fs_base, c.gs_base);
+                    seg
+                },
                 ldtr: exec::LDTR_RESET,
                 tr: exec::Segment {
                     selector: 0x30 + 16 * v as u16,
@@ -2795,7 +2797,7 @@ fn report(
         ymmh: hexes(&ymmh),
         // Test output only: lets probes verify which page is actually mapped rather than testing a stale fixed address.
         guest_state_alias: Hex(control.guest_state_va),
-        gs_base: Hex(s.cpu.gs_base),
+        gs_base: Hex(s.cpu.seg[exec::SREG_GS].base),
         kernel_gs_base: Hex(
             msrs[natemu_abi::cpu::msr(natemu_abi::cpu::MSR_KERNEL_GS_BASE).unwrap()]
         ),
@@ -3291,8 +3293,6 @@ mod tests {
                 cr4: 0,
                 efer: 0,
                 cpl: 3,
-                fs_base: 0,
-                gs_base: 0,
                 cr2: 0,
                 cr8: 0,
                 dr: exec::DR_RESET,

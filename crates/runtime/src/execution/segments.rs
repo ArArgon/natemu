@@ -3,18 +3,19 @@
 //! "Protection", 8.2.3 and 8.7 (64-bit TSS)), executed as system transactions: every check raises its exception before
 //! any architectural change. Descriptor-table and TSS-descriptor reads and writes are implicit supervisor accesses
 //! through the guest walker (never a shadow: the walk is made at CPL 0 whatever the CPL, so a #PF has U/S = 0 and
-//! CR0.WP decides writes to read-only pages); operand and stack accesses are explicit, at the CPL. The SDM's accessed-bit
-//! write on a segment load and LTR's busy-bit write are real guest writes: a clear A bit in a read-only GDT page faults,
-//! as on hardware. Flat 64-bit only (plan D1, owner decision 3): bases and limits of CS/SS/DS/ES are not used, FS/GS
-//! loads set the bank's bases. Compatibility mode is not built (owner decision 3): a transfer to a compatibility-mode code
-//! segment (CS.L = 0, or L = D = 1) that would run CPL 3 code (JMP/CALL far at CPL 3, RET far or IRET whose new CS has
-//! RPL 3, from any CPL) raises #GP(that selector) at the instruction before any change (owner decision, November 6: a
-//! recorded deviation, x86 would run the code; the OS sees a bad transfer and ends the program: an IRET from CPL 0 faults in
-//! the kernel, where Linux's bad-IRET fixup turns it into the user's #GP); one that would run CPL 0 code stops
-//! `unsupported_mode` with that CS in the record and RIP at the instruction, nothing else changed. A call gate stops
-//! `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no CPL-3 transfer stops the
-//! machine). `tools/models/segment_model.py` (and `delivery_model.py`'s IRETQ) is the oracle; the check order
-//! follows it where the SDM lists several conditions without a priority.
+//! CR0.WP decides writes to read-only pages); operand and stack accesses are explicit, at the CPL. The SDM's
+//! accessed-bit write on a segment load and LTR's busy-bit write are real guest writes: a clear A bit in a read-only
+//! GDT page faults, as on hardware. Flat 64-bit only (plan D1, owner decision 3): every load keeps the descriptor's
+//! base and limit (M2 task 1), of which 64-bit mode uses the FS and GS bases alone. Compatibility mode is not built
+//! (owner decision 3): a transfer to a compatibility-mode code segment (CS.L = 0, or L = D = 1) that would run CPL 3
+//! code (JMP/CALL far at CPL 3, RET far or IRET whose new CS has RPL 3, from any CPL) raises #GP(that selector) at the
+//! instruction before any change (owner decision, November 6: a recorded deviation, x86 would run the code; the OS sees
+//! a bad transfer and ends the program: an IRET from CPL 0 faults in the kernel, where Linux's bad-IRET fixup turns it
+//! into the user's #GP); one that would run CPL 0 code stops `unsupported_code_mode` with that CS in the record and RIP
+//! at the instruction, nothing else changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector)
+//! at CPL 3 (the same deviation: no CPL-3 transfer stops the machine). `tools/models/segment_model.py` (and
+//! `delivery_model.py`'s IRETQ) is the oracle; the check order follows it where the SDM lists several conditions
+//! without a priority.
 use super::*;
 
 /// An exception a transaction raises: vector, error code, CR2.
@@ -175,8 +176,7 @@ pub(super) fn address(c: &Cpu, i: &System) -> u64 {
         c.gpr[i.index as usize] << i.scale
     };
     let segment = match i.segment as usize {
-        SREG_FS => c.fs_base,
-        SREG_GS => c.gs_base,
+        sreg @ (SREG_FS | SREG_GS) => c.seg[sreg].base,
         _ => 0,
     };
     let ea = base.wrapping_add(index).wrapping_add(i.disp as u64);
@@ -291,9 +291,7 @@ pub(super) fn pages(
     if !paging::canonical(va) || !paging::canonical(last) || last < va {
         return Err(noncanonical);
     }
-    let Some(mut control) = s.cpu.control() else {
-        halt(s, stop::UNSUPPORTED_MODE)
-    };
+    let mut control = controls(s);
     if supervisor {
         control.cpl = 0;
     }
@@ -484,12 +482,7 @@ pub(super) fn load_data(s: &mut State, sreg: usize, selector: u16) -> Result<(),
         accessed(s, va, raw)?;
         Segment::loaded(selector, raw | 1 << 40)
     };
-    match sreg {
-        SREG_FS => s.cpu.fs_base = loaded.base,
-        SREG_GS => s.cpu.gs_base = loaded.base,
-        _ => {}
-    }
-    s.cpu.seg[sreg] = Segment { base: 0, ..loaded };
+    s.cpu.seg[sreg] = loaded;
     Ok(())
 }
 
@@ -532,27 +525,19 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
 /// Loads CS with `selector` (RPL as given) from `raw`, refusing a compatibility-mode segment: the record then holds
 /// that CS (the stop's cause) with RIP still at the instruction.
 fn load_cs(s: &mut State, selector: u16, raw: u64) {
-    s.cpu.seg[SREG_CS] = Segment {
-        base: 0,
-        ..Segment::loaded(selector, raw | 1 << 40)
-    };
-    if s.cpu.control().is_none() {
-        halt(s, stop::UNSUPPORTED_MODE)
-    }
+    s.cpu.seg[SREG_CS] = Segment::loaded(selector, raw | 1 << 40);
+    controls(s);
 }
 /// When `raw` is not a 64-bit code segment (L = 1, D = 0), before any effect: #GP(`selector`) when the code it would run is
-/// at CPL 3 (`cpl`, the new CPL), else halts `unsupported_mode` (module doc).
+/// at CPL 3 (`cpl`, the new CPL), else halts `unsupported_code_mode` (module doc).
 fn refuse_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
     if raw >> 53 & 3 != 1 {
         if cpl == 3 {
             return Err(gp(selector));
         }
         let mut refused = *s;
-        refused.cpu.seg[SREG_CS] = Segment {
-            base: 0,
-            ..Segment::loaded(selector, raw)
-        };
-        halt(&refused, stop::UNSUPPORTED_MODE)
+        refused.cpu.seg[SREG_CS] = Segment::loaded(selector, raw);
+        halt(&refused, stop::UNSUPPORTED_CODE_MODE)
     }
     Ok(())
 }
@@ -686,7 +671,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     if !iret && !paging::canonical(rip) {
         return Err(GP0);
     }
-    // CPL 1 and 2 are not built ([`Cpu::control`]): refused with nothing changed.
+    // CPL 1 and 2 are not built ([`Cpu::paging`]): refused with nothing changed.
     if matches!(rpl, 1 | 2) {
         halt(s, stop::UNSUPPORTED_MODE)
     }
@@ -713,10 +698,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     match stack {
         Some((rsp, ss_selector, segment)) => {
             s.cpu.seg[SREG_SS] = match segment {
-                Some((_, ss_raw)) => Segment {
-                    base: 0,
-                    ..Segment::loaded(ss_selector, ss_raw | 1 << 40)
-                },
+                Some((_, ss_raw)) => Segment::loaded(ss_selector, ss_raw | 1 << 40),
                 None => Segment {
                     selector: ss_selector,
                     ..Segment::NULL
@@ -731,7 +713,8 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
             let a = s.cpu.seg[sreg].attributes;
             let (kind, dpl) = (u64::from(a & 15), u64::from(a >> 5 & 3));
             if a & ATTR_P == 0 || ((kind & 8 == 0 || kind & 4 == 0) && dpl < rpl) {
-                s.cpu.seg[sreg] = Segment::NULL;
+                // The FS/GS bases stay (segment_model B5).
+                (s.cpu.seg[sreg].selector, s.cpu.seg[sreg].attributes) = (0, 0);
             }
         }
         set_cpl(s, rpl);

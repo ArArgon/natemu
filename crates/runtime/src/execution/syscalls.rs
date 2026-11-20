@@ -80,8 +80,8 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 return Err(GP0);
             }
             let at = slot(cpu::MSR_KERNEL_GS_BASE);
-            let gs_base = s.cpu.gs_base;
-            s.cpu.gs_base = msr_get(at);
+            let gs_base = s.cpu.seg[SREG_GS].base;
+            s.cpu.seg[SREG_GS].base = msr_get(at);
             msr_set(at, gs_base);
         }
         system::SYSCALL => {
@@ -174,19 +174,19 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
                 return Err(UD);
             }
             let mask = if i.size == 8 { u64::MAX } else { 0xffff_ffff };
-            let fs = matches!(i.kind, system::RDFSBASE | system::WRFSBASE);
+            let sreg = if matches!(i.kind, system::RDFSBASE | system::WRFSBASE) {
+                SREG_FS
+            } else {
+                SREG_GS
+            };
             if i.kind <= system::RDGSBASE {
-                s.cpu.gpr[i.reg as usize] = if fs { s.cpu.fs_base } else { s.cpu.gs_base } & mask;
+                s.cpu.gpr[i.reg as usize] = s.cpu.seg[sreg].base & mask;
             } else {
                 let v = s.cpu.gpr[i.reg as usize] & mask;
                 if !paging::canonical(v) {
                     return Err(GP0);
                 }
-                *if fs {
-                    &mut s.cpu.fs_base
-                } else {
-                    &mut s.cpu.gs_base
-                } = v;
+                s.cpu.seg[sreg].base = v;
             }
         }
         system::LAR..=system::VERW => segments::inspect(s, i)?,

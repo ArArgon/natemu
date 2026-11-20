@@ -2166,21 +2166,21 @@ pub struct Cpu {
     pub efer: u64,
     /// Current privilege level (CS.RPL in a full segment model).
     pub cpl: u64,
-    /// FS.base and GS.base (64-bit mode: the only segment bases that apply, I7). Authoritative here: the resident writes
-    /// them into the guest-state page ([`frame::FS_BASE`], [`frame::GS_BASE`]) at every block entry and never reads
-    /// them back, so a guest store into the page changes what that vCPU's prefixed accesses use only until the next
-    /// `enter`; only the resident changes them (WRFSBASE/WRGSBASE, the MSRs and SWAPGS are its transactions, S3).
-    pub fs_base: u64,
-    pub gs_base: u64,
     /// CR2 (the page-fault linear address: any 64-bit value; #PF delivery writes it, X1) and, in the field `cr8`, the
     /// local APIC's whole TPR (bits 7:0, X3): CR8 reads and writes its bits 7:4 (SDM Vol.3 11.8.6.1).
     pub cr2: u64,
     pub cr8: u64,
     /// DR0..DR3, DR6, DR7 (MOV DR4/DR5 reach DR6/DR7 while CR4.DE = 0). State only: no breakpoint is armed (S4).
     pub dr: [u64; 6],
-    /// ES, CS, SS, DS, FS, GS in the x86 Sreg order ([`SREG_ES`] ..): selector and hidden attributes. 64-bit mode ignores
-    /// their bases and limits (flat 64-bit only, plan D1): FS/GS bases are [`Cpu::fs_base`]/[`Cpu::gs_base`], so `base`
-    /// stays 0 here; `limit` is recorded. CS.RPL is [`Cpu::cpl`]; CS is a 64-bit code segment ([`Cpu::control`]).
+    /// ES, CS, SS, DS, FS, GS in the x86 Sreg order ([`SREG_ES`] ..): selector and hidden attributes, limit and base,
+    /// as every load leaves them (M2 task 1: the real base and limit of all six). 64-bit mode ignores the bases and
+    /// limits but FS's and GS's (flat 64-bit only, plan D1); translated code uses no other base yet. FS.base and
+    /// GS.base are the one value x86 keeps (I7): the IA32_FS_BASE/IA32_GS_BASE MSRs, WRFSBASE/WRGSBASE and SWAPGS read
+    /// and write `seg[SREG_FS].base`/`seg[SREG_GS].base`, as a segment load does. Authoritative here: the resident
+    /// writes them into the guest-state page ([`frame::FS_BASE`], [`frame::GS_BASE`]) at every block entry and never
+    /// reads them back (but GS's after CPL-0 code, whose inline SWAPGS exchanges it), so a guest store into the page
+    /// changes what that vCPU's prefixed accesses use only until the next `enter`; only the resident changes them (S3).
+    /// CS.RPL is [`Cpu::cpl`]; CS's mode is [`Cpu::code_mode`].
     pub seg: [Segment; 6],
     /// LDTR and TR: selector and the hidden base, limit and attributes LLDT/LTR loaded (from 16-byte descriptors).
     pub ldtr: Segment,
@@ -2492,7 +2492,7 @@ pub const CR0_TS: u64 = 1 << 3;
 /// CR0.NE (I5c): x87 errors through #MF (native mode); clear, through the FERR# pin (MS-DOS compatibility), which this board
 /// does not wire (SDM Vol.1 8.7.2; a pending x87 exception there stops `unsupported_ferr`).
 pub const CR0_NE: u64 = 1 << 5;
-/// Alignment mask: with RFLAGS.AC at CPL 3, alignment checking (#AC), which is not built: [`Cpu::control`] refuses it.
+/// Alignment mask: with RFLAGS.AC at CPL 3, alignment checking (#AC, X2: [`Cpu::alignment_check`]).
 pub const CR0_AM: u64 = 1 << 18;
 pub const RFLAGS_AC: u64 = 1 << 18;
 /// Hard-wired to 1 (SDM vol. 3 §2.5); writes are ignored.
@@ -2566,23 +2566,34 @@ pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_LMA: u64 = 1 << 10;
 pub const EFER_NXE: u64 = 1 << 11;
 
+/// The mode the code segment runs in (SDM Vol.3 5.2.1, 3.4.5.1: CS.L and CS.D in IA-32e mode), [`Cpu::code_mode`]. Its
+/// value is the code identity's field in bits 4:2 ([`Cpu::code_context`]): 64-bit keeps the 1 that bit 2 always held.
+/// Values 4-7 are free for the modes outside IA-32e mode that M2 Part 2 may add (protected, real, virtual-8086); none
+/// is built.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeMode {
+    /// 64-bit mode: CS.L = 1, CS.D = 0.
+    Bits64 = 1,
+    /// Compatibility mode, CS.L = 0, with CS.D = 1 (32-bit) or 0 (16-bit). Not run yet (M2): every place that needs a
+    /// 64-bit CS stops `unsupported_code_mode` ([`stop::UNSUPPORTED_CODE_MODE`]) on these.
+    Compat32 = 2,
+    Compat16 = 3,
+}
+
 impl Cpu {
-    /// Walk controls for 4-level long-mode paging; `None` for any other mode
-    /// (paging off, legacy/PAE, LA57, SMAP: not supported by this slice), and
-    /// for a CR3 with bits above the physical-address width set. [`CR3_IGNORED`] bits are ignored.
-    /// Alignment checking (CR0.AM, RFLAGS.AC, CPL 3; SDM Vol.3 7.15 #AC) runs since X2: generated code then runs with
-    /// SCTLR_EL1.A, and the resident's explicit CPL 3 accesses check it.
-    pub fn control(&self) -> Option<Control> {
+    /// Walk controls for 4-level long-mode paging at CPL 0 or 3; `None` for any other paging mode (paging off,
+    /// legacy/PAE, LA57, SMAP: not supported by this slice), CPL 1 or 2, and for a CR3 with bits above the
+    /// physical-address width set. [`CR3_IGNORED`] bits are ignored. The code segment's mode is [`Self::code_mode`] (M2
+    /// task 1 split the two; no caller runs other than 64-bit code yet). Alignment checking (CR0.AM, RFLAGS.AC, CPL 3;
+    /// SDM Vol.3 7.15 #AC) runs since X2: generated code then runs with SCTLR_EL1.A, and the resident's explicit CPL 3
+    /// accesses check it.
+    pub fn paging(&self) -> Option<Control> {
         let long = self.cr0 & (CR0_PE | CR0_PG) == CR0_PE | CR0_PG
             && self.cr4 & CR4_PAE != 0
             && self.cr4 & (CR4_LA57 | CR4_SMAP) == 0
             && self.efer & (EFER_LME | EFER_LMA) == EFER_LME | EFER_LMA;
-        // 64-bit mode: CS.L = 1, CS.D = 0 (compatibility mode is not built, owner decision 3).
-        let bits64 = self.seg[SREG_CS].attributes & (ATTR_L | ATTR_D) == ATTR_L;
-        (long
-            && bits64
-            && matches!(self.cpl, 0 | 3)
-            && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0)
+        (long && matches!(self.cpl, 0 | 3) && self.cr3 & !(paging::PA_MASK | CR3_IGNORED) == 0)
             .then_some(Control {
                 cr3: self.cr3 & paging::PA_MASK,
                 cpl: self.cpl,
@@ -2590,6 +2601,17 @@ impl Cpu {
                 nxe: u64::from(self.efer & EFER_NXE != 0),
                 smep: u64::from(self.cr4 & CR4_SMEP != 0),
             })
+    }
+    /// The code segment's mode from CS.L and CS.D; `None` for L = D = 1 (reserved: a load of it is #GP, SDM Vol.3
+    /// 5.2.1). IA-32e mode is taken as given: every place that runs code requires [`Self::paging`] (EFER.LMA) too, and
+    /// the modes outside it (M2 Part 2, not built) would be told apart here.
+    pub fn code_mode(&self) -> Option<CodeMode> {
+        match self.seg[SREG_CS].attributes & (ATTR_L | ATTR_D) {
+            ATTR_L => Some(CodeMode::Bits64),
+            ATTR_D => Some(CodeMode::Compat32),
+            0 => Some(CodeMode::Compat16),
+            _ => None,
+        }
     }
     /// x86 alignment checking is on (SDM Vol.3 7.15 #AC: CR0.AM, RFLAGS.AC and CPL 3; X2).
     pub fn alignment_check(&self) -> bool {
@@ -2616,12 +2638,12 @@ impl Cpu {
     }
     /// What code at a RIP is compiled and cached under besides the RIP and its source bytes (K1: not CR3; a block's
     /// guest-physical source pages are checked against the current tables instead): a word of the CPL, the code mode
-    /// (bit 2: 64-bit, the only mode yet), and the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every
-    /// SSE form when they gate it, so a block is never entered under other gating than it was made for, even should a
-    /// control change ever keep the code), CR0.MP (I6: WAIT's gating with TS), the x87 rounding when it differs from MXCSR's
-    /// (bit 14 and FCW.RC in 16:15: a translation runs x87 arithmetic under that FPCR), and alignment checking (X2: a
-    /// translation under it cuts every BT* memory form,
-    /// and RFLAGS.AC changes without dropping code).
+    /// (bits 4:2, [`CodeMode`]: 64-bit is 1, the bit 2 every identity had before the field; 0 when there is none), and
+    /// the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every SSE form when they gate it, so a
+    /// block is never entered under other gating than it was made for, even should a control change ever keep the
+    /// code), CR0.MP (I6: WAIT's gating with TS), the x87 rounding when it differs from MXCSR's (bit 14 and FCW.RC in
+    /// 16:15: a translation runs x87 arithmetic under that FPCR), and alignment checking (X2: a translation under it
+    /// cuts every BT* memory form, and RFLAGS.AC changes without dropping code).
     /// I8: the VEX AVX forms run (SDM Vol.1 13.2, Vol.2 2.8: no #UD) only with CR4.OSXSAVE and XCR0[2:1] = 11b; CR0.TS still
     /// makes them #NM. Part of [`Self::code_context`] (XSETBV changes XCR0 without a flush).
     pub fn avx_enabled(&self) -> bool {
@@ -2630,9 +2652,9 @@ impl Cpu {
     pub fn code_context(&self) -> u64 {
         let bit = |on: bool, n: u32| u64::from(on) << n;
         let word = self.cpl & 3
-            | bit(true, 2)
-            // (Bits 3-8 held CR0.PG/WP, CR4.PGE/PCIDE/SMEP and EFER.NXE before K1: a change of one is a global TLB flush,
-            // after which a block's fetch is walked again under the new controls before it runs.)
+            | self.code_mode().map_or(0, |m| m as u64) << 2
+            // (Bits 5-8 are free. Bits 3-8 held CR0.PG/WP, CR4.PGE/PCIDE/SMEP and EFER.NXE before K1: a change of one is
+            // a global TLB flush, after which a block's fetch is walked again under the new controls before it runs.)
             | bit(self.cr0 & CR0_EM != 0, 9)
             | bit(self.cr0 & CR0_TS != 0, 10)
             | bit(self.cr4 & CR4_OSFXSR != 0, 11)
@@ -3170,9 +3192,9 @@ pub mod system {
 
 /// `State::stop`: why the resident stopped the VM (`hvc #0x49`).
 pub mod stop {
-    /// The bank does not describe a supported mode ([`super::Cpu::control`] is `None`). When a transaction's change
-    /// caused it (e.g. alignment checking: CR0.AM with RFLAGS.AC at CPL 3), the record holds the new CR0/CPL and the old
-    /// RIP (the instruction that made the change).
+    /// The bank does not describe a supported paging mode or CPL ([`super::Cpu::paging`] is `None`). When a
+    /// transaction's change caused it, the record holds the new control registers or CPL and the old RIP (the
+    /// instruction that made the change).
     pub const UNSUPPORTED_MODE: u64 = 1;
     /// The host reply or staged object is unusable.
     pub const BAD_REPLY: u64 = 2;
@@ -3219,6 +3241,11 @@ pub mod stop {
     /// whether FERR# asserts at the faulting or the waiting instruction is processor-specific). The board has neither, so the
     /// processor would freeze there for ever: a precise stop with the state at the waiting instruction instead.
     pub const UNSUPPORTED_FERR: u64 = 17;
+    /// (M2 task 1.) The code segment is not a 64-bit one ([`super::Cpu::code_mode`] is not `Bits64`: compatibility
+    /// mode, or L = D = 1), where only 64-bit code runs yet; paging and CPL are supported ([`UNSUPPORTED_MODE`]
+    /// otherwise, which is checked first). The record is as for [`UNSUPPORTED_MODE`]: the CS that caused it, RIP at the
+    /// instruction.
+    pub const UNSUPPORTED_CODE_MODE: u64 = 18;
     /// (X2, numbered apart from the other chunks' reasons.) The vCPU was halted (HLT) with no event it could take, and the
     /// host ended its run ([`super::cache::Events::end`]: no source could wake it). The bank holds the state after the
     /// HLT.
@@ -3265,6 +3292,7 @@ pub mod stop {
             TRAPPED => "trapped",
             SHUTDOWN => "shutdown",
             UNSUPPORTED_FERR => "unsupported_ferr",
+            UNSUPPORTED_CODE_MODE => "unsupported_code_mode",
             HALTED => "halted",
             UNSUPPORTED_MMIO => "unsupported_mmio",
             UNSUPPORTED_PORT => "unsupported_port",
@@ -4511,7 +4539,7 @@ mod tests {
     #[test]
     fn clearing_the_stack_trap_count_restores_the_context() {
         let mut c = Cpu {
-            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 0, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
+            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 0, cr2: 0, cr8: 0,
             dr: DR_RESET, seg: flat_segments(0), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
             xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1, accurate_fp: 0, stack_traps: 0,
         };
@@ -4529,7 +4557,7 @@ mod tests {
     #[test]
     fn accurate_mode_keys_bit_32_only_without_afp() {
         let c = |no_afp, accurate_fp| Cpu {
-            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
+            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, cr2: 0, cr8: 0,
             dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
             xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp, accurate_fp, stack_traps: 0,
         };
@@ -4547,7 +4575,7 @@ mod tests {
     #[test]
     fn without_afp_code_is_keyed_on_daz_and_effective_ftz() {
         let mut c = Cpu {
-            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, fs_base: 0, gs_base: 0, cr2: 0, cr8: 0,
+            gpr: [0; 16], rip: 0, rflags: 2, cr0: 0, cr3: 0, cr4: 0, efer: 0, cpl: 3, cr2: 0, cr8: 0,
             dr: DR_RESET, seg: flat_segments(3), ldtr: LDTR_RESET, tr: TR_RESET, gdtr: TABLE_RESET, idtr: TABLE_RESET, mov_ss: 0,
             xmm: [[0; 2]; 16], mxcsr: MXCSR_RESET, fcw: FCW_INIT, xcr0: 1, no_afp: 1, accurate_fp: 0, stack_traps: 0,
         };
@@ -4633,8 +4661,6 @@ mod tests {
             cr4: 0,
             efer: 0,
             cpl: 3,
-            fs_base: 0,
-            gs_base: 0,
             cr2: 0,
             cr8: 0,
             dr: DR_RESET,
@@ -4856,8 +4882,6 @@ mod tests {
             cr4: CR4_PAE,
             efer: EFER_LME | EFER_LMA | EFER_NXE,
             cpl: 3,
-            fs_base: 0,
-            gs_base: 0,
             cr2: 0,
             cr8: 0,
             dr: DR_RESET,
@@ -4875,7 +4899,7 @@ mod tests {
             accurate_fp: 0,
             stack_traps: 0,
         };
-        let c = cpu.control().unwrap();
+        let c = cpu.paging().unwrap();
         assert_eq!((c.cr3, c.cpl, c.wp, c.nxe, c.smep), (0x1000, 3, 1, 1, 0));
         // The driver's flat segments (QEMU stub's selectors) and a descriptor's hidden part.
         assert_eq!(
@@ -4923,26 +4947,12 @@ mod tests {
                 cr3: 0x1000 | 1 << 40,
                 ..cpu
             },
-            Cpu {
-                seg: [Segment {
-                    attributes: 0xc0fb,
-                    ..cpu.seg[1]
-                }; 6],
-                ..cpu
-            }, // compatibility mode (CS.L = 0)
-            Cpu {
-                seg: [Segment {
-                    attributes: 0xe0fb,
-                    ..cpu.seg[1]
-                }; 6],
-                ..cpu
-            }, // CS.L = CS.D = 1
         ] {
-            assert_eq!(bad.control(), None);
+            assert_eq!(bad.paging(), None);
         }
         // Ignored CR3 bits stay in CR3 (and in the code context) but not in the walk's root.
         // M2: PWT/PCD (4:3) too: they select the PML4 read's PAT entry, and tables are read from coherent RAM.
-        assert_eq!(Cpu { cr3: 0x1fff, ..cpu }.control().unwrap().cr3, 0x1000);
+        assert_eq!(Cpu { cr3: 0x1fff, ..cpu }.paging().unwrap().cr3, 0x1000);
         // AM or AC alone, or both at CPL 0, check nothing; both at CPL 3 run with alignment checking (X2).
         for fine in [
             Cpu {
@@ -4965,7 +4975,53 @@ mod tests {
                 ..cpu
             },
         ] {
-            assert!(fine.control().is_some());
+            assert!(fine.paging().is_some());
         }
+    }
+
+    /// M2 task 1: the code mode comes from CS.L and CS.D alone (paging does not depend on it), and is the code
+    /// identity's field in bits 4:2, 64-bit's value the bit 2 every identity had before.
+    #[test]
+    fn code_mode_from_cs_l_and_d() {
+        // SAFETY: `Cpu` is plain integers.
+        let mut cpu: Cpu = unsafe { core::mem::zeroed() };
+        (cpu.cr0, cpu.cr3, cpu.cr4, cpu.efer, cpu.cpl) =
+            (CR0_PE | CR0_PG, 0x1000, CR4_PAE, EFER_LME | EFER_LMA, 3);
+        cpu.seg = flat_segments(3);
+        let with_cs = |attributes: u16| {
+            let mut c = cpu;
+            c.seg[SREG_CS].attributes = attributes;
+            c
+        };
+        for (attributes, mode) in [
+            (0xa0fb, Some(CodeMode::Bits64)),   // L = 1, D = 0
+            (0xc0fb, Some(CodeMode::Compat32)), // L = 0, D = 1
+            (0x00fb, Some(CodeMode::Compat16)), // L = 0, D = 0
+            (0xe0fb, None),                     // L = D = 1: reserved
+        ] {
+            let c = with_cs(attributes);
+            assert_eq!(c.code_mode(), mode, "{attributes:#x}");
+            assert_eq!(c.paging(), cpu.paging(), "{attributes:#x}");
+            assert_eq!(c.code_context() >> 2 & 7, mode.map_or(0, |m| m as u64));
+            assert_eq!(c.code_context() & !(7 << 2), cpu.code_context() & !(7 << 2));
+        }
+        assert_eq!(cpu.code_context() & 0x1ff, 3 | 1 << 2); // CPL 3, 64-bit: unchanged by the field
+    }
+
+    /// M2 task 1: a segment load keeps the descriptor's base and limit for every register (the resident stores
+    /// `Segment::loaded` whole; FS.base and GS.base are those segments' `base`, with no second copy in [`Cpu`]).
+    #[test]
+    fn loaded_segments_keep_base_and_limit() {
+        // Code (L = 0, D = 1, G = 1) at 0x8040_2010, limit 0xbbcde pages; data (G = 0) at 0xff00_0001, limit 0x1234.
+        let code = Segment::loaded(0x23, 0x80cb_fa40_2010_bcde);
+        assert_eq!(
+            (code.attributes, code.limit, code.base),
+            (0xc0fa, 0xbbcd_efff, 0x8040_2010)
+        );
+        let data = Segment::loaded(0x2b, 0xff00_f300_0001_1234);
+        assert_eq!(
+            (data.attributes, data.limit, data.base),
+            (0x00f3, 0x1234, 0xff00_0001)
+        );
     }
 }

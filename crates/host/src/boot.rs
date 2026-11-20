@@ -608,8 +608,6 @@ pub fn load(ram: &GuestRam, layout: &Layout, inputs: &Inputs) -> Result<Loaded, 
         cr4: exec::CR4_PAE,
         efer: exec::EFER_LME | exec::EFER_LMA,
         cpl: 0,
-        fs_base: 0,
-        gs_base: 0,
         cr2: 0,
         cr8: 0,
         dr: exec::DR_RESET,
@@ -1203,7 +1201,8 @@ pub(crate) mod tests {
             cpu.seg[exec::SREG_CS].attributes & (exec::ATTR_L | exec::ATTR_D),
             exec::ATTR_L
         );
-        assert!(cpu.control().is_some(), "a mode the resident runs");
+        assert!(cpu.paging().is_some(), "a mode the resident runs");
+        assert_eq!(cpu.code_mode(), Some(exec::CodeMode::Bits64));
         // X4: the AP wake state (ACPI 6.5 Table 5.44): long mode, paging through the identity map, IF = 0, flat selectors
         // from the GDT in the NVS scratch (written there), NXE; no IDT.
         let ap = l.ap;
@@ -1223,6 +1222,7 @@ pub(crate) mod tests {
             [0x18, 0x10, 0x18, 0x18, 0x18, 0x18]
         );
         assert_eq!(r.read::<u64>(AP_GDT + 16), Some(GDT_ENTRIES[2]));
-        assert!(ap.control().is_some());
+        assert!(ap.paging().is_some());
+        assert_eq!(ap.code_mode(), Some(exec::CodeMode::Bits64));
     }
 }
