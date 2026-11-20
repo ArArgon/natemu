@@ -138,17 +138,18 @@ pub(crate) fn report(area: Area, what: &str, at: At) -> String {
 
 /// The processor mode the bank describes.
 fn mode(c: &Cpu) -> &'static str {
-    let cs = c.seg[exec::SREG_CS].attributes;
     if c.cr0 & exec::CR0_PE == 0 {
         "real mode"
     } else if c.efer & exec::EFER_LMA == 0 {
-        if cs & exec::ATTR_D != 0 { "32-bit protected mode" } else { "16-bit protected mode" }
-    } else if cs & (exec::ATTR_L | exec::ATTR_D) == exec::ATTR_L {
-        "64-bit mode"
-    } else if cs & exec::ATTR_D != 0 {
-        "compatibility mode, 32-bit"
+        let d = c.seg[exec::SREG_CS].attributes & exec::ATTR_D != 0;
+        if d { "32-bit protected mode" } else { "16-bit protected mode" }
     } else {
-        "compatibility mode, 16-bit"
+        match c.code_mode() {
+            Some(exec::CodeMode::Bits64) => "64-bit mode",
+            Some(exec::CodeMode::Compat32) => "compatibility mode, 32-bit",
+            Some(exec::CodeMode::Compat16) => "compatibility mode, 16-bit",
+            None => "IA-32e mode with a reserved CS (L = D = 1)",
+        }
     }
 }
 
@@ -156,7 +157,7 @@ fn mode(c: &Cpu) -> &'static str {
 /// 32-bit wrap outside 64-bit mode.
 fn bytes(area: Area, c: &Cpu) -> String {
     let cs = c.seg[exec::SREG_CS];
-    let long = c.efer & exec::EFER_LMA != 0 && cs.attributes & (exec::ATTR_L | exec::ATTR_D) == exec::ATTR_L;
+    let long = c.efer & exec::EFER_LMA != 0 && c.code_mode() == Some(exec::CodeMode::Bits64);
     let mut out = Vec::new();
     for i in 0..15u64 {
         let va = if long { c.rip.wrapping_add(i) } else { cs.base.wrapping_add(c.rip).wrapping_add(i) & 0xffff_ffff };
@@ -168,7 +169,8 @@ fn bytes(area: Area, c: &Cpu) -> String {
     if out.is_empty() { "(not readable: unmapped or not guest RAM)".into() } else { out.join(" ") }
 }
 
-/// The guest-physical address of linear `va` (4-level paging, or none), read only.
+/// The guest-physical address of linear `va` (4-level paging, or none), read only. Not through [`Cpu::paging`]: a report
+/// still wants the bytes at CPL 1 or 2, under SMAP or with a CR3 the resident refuses.
 fn physical(area: Area, c: &Cpu, va: u64) -> Option<u64> {
     if c.cr0 & exec::CR0_PG == 0 {
         return Some(va);
