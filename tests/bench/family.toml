@@ -95,6 +95,55 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "avx", "--e
         "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
         "--compile-cache", "off"]
 
+# M2: 32-bit builds (i686, x87) of hackbench, c-ray and speedtest1 under the 64-bit kernel. `-int80`: the kernel's 32-bit vDSO
+# off (vdso32=0), so glibc makes every system call by INT 0x80 instead of the vDSO's SYSENTER.
+[suite.cases.guest-hackbench32]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-hackbench32-int80]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32-int80", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off", "--append", "vdso32=0"]
+
+[suite.cases.guest-cray32]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32", "--emu", "natemu", "--vcpus", "1", "--bench", "cray32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off", "--cap", "1800"]
+
+[suite.cases.guest-sqlite32]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "sqlite32", "--emu", "natemu", "--vcpus", "1", "--bench", "sqlite32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-cray32-small]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-small", "--emu", "natemu", "--vcpus", "1", "--bench", "cray32-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+[suite.cases.guest-startup32]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "startup32", "--emu", "natemu", "--vcpus", "1", "--bench", "startup32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime}",
+        "--compile-cache", "off"]
+
+# Profiles, not timings: the resident built with its `perf` feature and natemu's timing log (OUT/NAME.perf: time by bucket,
+# system instructions by kind, requests and compile time; docs/restructure/perf-plan.md section 2).
+[suite.cases.guest-cray32-small-profile]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "cray32-small-profile", "--emu", "natemu", "--vcpus", "1", "--bench", "cray32-small",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--compile-cache", "off", "--perf-log"]
+
+[suite.cases.guest-startup32-profile]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "startup32-profile", "--emu", "natemu", "--vcpus", "1", "--bench", "startup32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--compile-cache", "off", "--perf-log"]
+
+[suite.cases.guest-hackbench32-profile]
+argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "hackbench32-profile", "--emu", "natemu", "--vcpus", "1", "--bench", "hackbench32",
+        "--kernel", "{kernel}", "--initrd", "{bench_image}", "--fexc", "{fexc}", "--natemu", "{natemu}", "--runtime", "{runtime_perf}",
+        "--compile-cache", "off", "--perf-log"]
+
 [suite.cases.guest-zstd-qemu]
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "{vcpus}", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]

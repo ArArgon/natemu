@@ -4,7 +4,7 @@ measurement, verification and record are that script's, natemu now runs as the `
 
     python3 tools/bench/run.py --out DIR --name NAME --emu natemu|qemu-multi|qemu-single|qemu-multi-max --vcpus N
         --bench BENCH --kernel BZIMAGE --initrd CPIO [--jobs J] [--fexc FEXC] [--natemu STUB] [--runtime FILE]
-        [--compile-cache DIR|off] [--cap SECONDS] [--qemu QEMU]
+        [--compile-cache DIR|off] [--cap SECONDS] [--qemu QEMU] [--append WORDS] [--perf-log]
 
 The guest runs the benchmark twice (run 1 cold, run 2 warm), each timed on the host from its NATEMU-BENCH-START line to its
 NATEMU-BENCH-END line on the serial console (START2/END2 for run 2; boot excluded) and verified (VERIFY / VERIFY2). A
@@ -50,6 +50,18 @@ def fp_traps(stderr):
                 by={names[c]: {classes[i % 8]: hist[i] for i in range(8 * c, 8 * c + 8) if hist[i]} for c in range(4)})
 
 
+def system_counts(stderr):
+    """Summed over vCPUs: the system instructions the resident ran, by kind (hex, natemu_abi::execution::system), and the stack
+    alignment check's firings (`stack`); None if natemu printed no line."""
+    lines = re.findall(r'natemu-system-counts vcpu \d+ stack (\d+) kinds (\S*)', stderr)
+    if not lines: return None
+    kinds = {}
+    for _, ks in lines:
+        for kv in filter(None, ks.split(',')):
+            k, v = kv.split(':'); kinds[k] = kinds.get(k, 0) + int(v)
+    return dict(stack=sum(int(l[0]) for l in lines), kinds=kinds)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     for name in ('--out', '--name', '--emu', '--vcpus', '--bench', '--kernel', '--initrd'): ap.add_argument(name, required=True)
@@ -60,12 +72,14 @@ def main():
     ap.add_argument('--runtime')
     ap.add_argument('--compile-cache')
     ap.add_argument('--cap', type=float, default=600)
+    ap.add_argument('--perf-log', action='store_true', help='natemu: write its timing log to OUT/NAME.perf (a profile, not a timing: pass a `perf` resident as --runtime)')
+    ap.add_argument('--append', default='', help='more words for the kernel command line (e.g. vdso32=0: 32-bit programs then make their system calls by INT 0x80)')
     ap.add_argument('--qemu', default='/opt/homebrew/bin/qemu-system-x86_64')
     a = ap.parse_args()
     if a.ram < 2 or a.ram % 2: ap.error('--ram must be a positive multiple of 2 MiB')
     out, name, emu, n, bench, cap = a.out, a.name, a.emu, a.vcpus, a.bench, a.cap
     jobs = a.jobs or n
-    cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr bench={bench} jobs={jobs}'
+    cmdline = f'console=ttyS0 earlyprintk=serial mitigations=off nokaslr bench={bench} jobs={jobs}' + (' ' + a.append if a.append else '')
     os.makedirs(out, exist_ok=True)
     serial = f'{out}/{name}.serial'
     if os.path.exists(serial): os.remove(serial)
@@ -75,7 +89,7 @@ def main():
     if emu == 'natemu':
         if not a.fexc: ap.error('--emu natemu needs --fexc')
         cmd = [a.natemu, *(['--runtime', a.runtime] if a.runtime else []), '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', a.initrd,
-               '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else [])]
+               '--cmdline', cmdline, '--vcpus', n, '--ram', str(a.ram << 20), '--serial', serial, *(['--compile-cache', a.compile_cache] if a.compile_cache else []), *(['--perf-log', f'{out}/{name}.perf'] if a.perf_log else [])]
     else:
         cmd = [a.qemu, '-nodefaults', '-machine', 'pc,hpet=off,i8042=off,vmport=off', '-accel', f"tcg,thread={emu.split('-')[1]}",
                '-cpu', 'max' if emu.endswith('-max') else QCPU, '-m', str(a.ram), '-smp', n, '-kernel', a.kernel, '-initrd', a.initrd, '-append', cmdline,
@@ -145,6 +159,8 @@ def main():
                total_s=round(total, 3), cpus=re.findall(r'cpus=(\d+)', text)[:1], contended=sorted(others), rc=p.returncode,
                cmd=[str(c) for c in cmd], stderr=pathlib.Path(f'{out}/{name}.stderr').read_text()[-300:])
     rec['fp_traps'] = fp_traps(pathlib.Path(f'{out}/{name}.stderr').read_text())
+    rec['system_counts'] = system_counts(pathlib.Path(f'{out}/{name}.stderr').read_text())
+    rec['outputs'] = re.findall(r'NATEMU-BENCH-OUTPUT\S* (.*)', text)    # what a benchmark without a pinned hash printed
     with open(f'{out}/bench.jsonl', 'a') as f: f.write(json.dumps(rec) + '\n')
     print(json.dumps({k: rec[k] for k in ('name', 'verified', 'wall_s', 'wall2_s', 'guest_s', 'guest2_s', 'phases', 'phases2', 'boot_to_start_s', 'total_s', 'contended')}))
     sys.exit(1 if not verified else 3 if others else 0)

@@ -119,6 +119,25 @@ def natemu() -> Natemu:
     return n
 
 
+def perf_runtime() -> pathlib.Path:
+    """The resident built with its `perf` feature (it accounts its time by bucket and its system instructions by kind,
+    crates/runtime/src/perf.rs): a profile run passes it as `--runtime` with a performance log. Never a timing build."""
+    if p := _pinned('perf-runtime'): return pathlib.Path(p)
+    k = source_key(NATEMU_SOURCES, 'natemu-perf-runtime-v1')
+    root = paths.repo_root()
+    rel = 'aarch64-unknown-none/release/natemu-runtime'
+
+    def build(out: pathlib.Path):
+        target = paths.cache_root() / 'build-tmp' / ('target-' + hashlib.sha256(str(root).encode()).hexdigest()[:12] + '-perf')
+        _run(CARGO + ['-p', 'natemu-runtime', '--target', 'aarch64-unknown-none', '--features', 'perf'], cwd=root,
+             env=dict(os.environ, CARGO_TARGET_DIR=str(target)))
+        cache.clone(target / rel, out / 'natemu-runtime')
+
+    f = cache.get_or_build('natemu-perf-runtime', k, build) / 'natemu-runtime'
+    pin_for_run('perf-runtime', str(f))
+    return f
+
+
 def natemu_at(rev: str) -> Natemu:
     """natemu as committed at `rev` (an older build to compare with: the M1 performance check's baseline). The same three
     binaries as natemu(), built by the same cargo commands and toolchain pin and signed the same way, from `git archive
@@ -411,7 +430,8 @@ def _fex_asm() -> pathlib.Path:
 
 RESOLVERS = {'natemu': lambda: [natemu().entry], 'fexc': lambda: [fexc()], 'nextest': lambda: [nextest()],
              'qemu-user': lambda: [qemu_user()], 'bench-image': lambda: [bench_image()],
-             'qemu-system': lambda: [qemu_system()], 'fex-asm': lambda: [fex_asm()]}
+             'qemu-system': lambda: [qemu_system()], 'fex-asm': lambda: [fex_asm()],
+             'perf-runtime': lambda: [perf_runtime()]}
 
 
 def resolve(name: str) -> list[pathlib.Path]:

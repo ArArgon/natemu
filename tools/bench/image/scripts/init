@@ -1,6 +1,6 @@
 #!/bin/sh
 # Benchmark initramfs /init (busybox sh). Kernel command line:
-# bench=build|zstd|hackbench|locks|luajit|luajit-interp|mem|cray|cray-strict|7zip|sqlite|avx|shell [jobs=N]
+# bench=build|zstd|hackbench|locks|luajit|luajit-interp|mem|cray|cray-strict|7zip|sqlite|avx|hackbench32|cray32|cray32-small|sqlite32|startup32|shell [jobs=N]
 # (jobs defaults to the online CPU count). The benchmark runs twice in the one boot: run 1 (cold) and run 2 (warm; same
 # command, outputs removed or overwritten). Each run prints NATEMU-BENCH-START (run 2: START2), the benchmark's own output and
 # timing (busybox time per phase; a NATEMU-BENCH-PHASE / PHASE2 line after each named phase), NATEMU-BENCH-END (END2) with the
@@ -66,6 +66,17 @@ sqlite)    run() { phase - "speedtest1 --memdb --verify --size 160 :memory: > /t
 # crf 23, --threads jobs; the bitstream's md5 is checked after END (it depends on the thread count, not on the CPU model
 # unless AVX-512 or no SIMD is present).
 avx)       run() { phase - "x264 --preset slower --crf 23 --threads $jobs -o /tmp/x.264 $B/foreman_cif.y4m 2> /tmp/x264.log"; } ;;
+# M2, 32-bit builds (i686, x87 floating point) of hackbench, c-ray and speedtest1, the same commands as the 64-bit ones. Their
+# outputs are printed, not checked against a pinned hash (the image's builder may be unable to run 32-bit code, and x87 results
+# under natemu are doubles): compare them between runs.
+hackbench32) run() { phase - "hackbench32 -p -g 4 -l 5000"; } ;;
+cray32)    run() { phase - "$B/c-ray-mt32 -t $jobs -s 1280x960 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+# cray32-small: the same renderer at 320x240 (1/16 of the pixels), for iteration: cray32 itself takes many minutes while x87
+# control-word loads trap. startup32: speedtest1-32 at --size 5 run 40 times, one process each: mostly program start (32-bit
+# code is compiled again in every process).
+cray32-small) run() { phase - "$B/c-ray-mt32 -t $jobs -s 320x240 -r 1 < $B/sphfract > /tmp/cray.ppm 2> /tmp/cray.err"; } ;;
+startup32) run() { phase - "i=0; while [ \$i -lt 40 ]; do speedtest1-32 --memdb --size 5 :memory: > /tmp/st.out || exit 1; i=\$((i+1)); done"; } ;;
+sqlite32)  run() { phase - "speedtest1-32 --memdb --verify --size 160 :memory: > /tmp/st.out"; } ;;
 shell)     exec setsid cttyhack sh ;;
 *)         echo "NATEMU-BENCH-ERROR unknown bench=$bench"; poweroff -f ;;
 esac
@@ -97,6 +108,9 @@ verify() {
                          5) xw=@X264_MD5_5@;; 6) xw=@X264_MD5_6@;; 7) xw=@X264_MD5_7@;; 8) xw=@X264_MD5_8@;; *) xw=no-hash-for-jobs;; esac
            got=$rc:$(md5sum /tmp/x.264 | cut -d' ' -f1); want=0:$xw
            grep -E 'cpu capabilities' /tmp/x264.log ;;
+    cray32-small) got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx cray32-small md5=$(md5sum /tmp/cray.ppm | cut -d' ' -f1)" ;;
+    cray32) got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx cray32 md5=$(md5sum /tmp/cray.ppm | cut -d' ' -f1)" ;;
+    sqlite32) got=$rc; want=0; echo "NATEMU-BENCH-OUTPUT$sfx sqlite32 hash=$(sed -n 's/^Verification Hash: //p' /tmp/st.out | tr -d ' ')" ;;
     *)     got=$rc; want=0 ;;
     esac
     [ "$got" = "$want" ] && echo "NATEMU-BENCH-VERIFY$sfx ok" || echo "NATEMU-BENCH-VERIFY$sfx FAIL got=$got want=$want"
