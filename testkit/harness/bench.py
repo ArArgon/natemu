@@ -89,6 +89,10 @@ def _session(path: pathlib.Path) -> dict:
     except (OSError, ValueError): return {'started': time.time(), 'fresh_done': False, 'done': 0}
 
 
+VCPUS_ENV = 'TESTKIT_BENCH_VCPUS'  # {vcpus} in a case's argv (the guest benchmarks): 1 unless set
+AT_ENV = 'TESTKIT_BENCH_AT'      # a revision: the run measures natemu and fexc as committed there (the same cases and inputs)
+
+
 class Bench:
     def cases(self, fam, suite):
         """A case with `pieces = true` (a script that resumes from its own records, run_m1_perf.py full) becomes one case
@@ -132,7 +136,7 @@ class Bench:
         return s.format(**d)
 
     def _values(self, spec, d, n, fexc, raw, case='', machine='', fresh=False) -> dict:
-        vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host,
+        vals = {'out': d, 'fexc': fexc, 'natemu': n.stub, 'runtime': n.runtime, 'host': n.host, 'vcpus': os.environ.get(VCPUS_ENV, '1'),
                 'kernel': resources.fetch('debian-kernel'), 'raw': raw or '/nonexistent-natemu-raw',
                 'bench_image': artifacts.bench_image() if _uses(spec, 'bench_image') else ''}
         if _uses(spec, 'natemu_entry'): vals['natemu_entry'] = n.entry
@@ -162,6 +166,7 @@ class Bench:
         from testkit import runloop
         from testkit.sched.pool import raw_root
         n, fexc = artifacts.natemu(), artifacts.fexc()
+        if rev := os.environ.get(AT_ENV): n, fexc = artifacts.natemu_at(rev), artifacts.fexc_at(rev)     # a baseline round
         h = host.detect()
         out = {}
         for it in batch:

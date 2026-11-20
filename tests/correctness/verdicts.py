@@ -115,12 +115,13 @@ def torture32(name, f, extra):
 
 
 I386 = pathlib.Path(__file__).parent / 'i386'
+I386_SEEDED = set()         # the programs this seeding process has recorded: their other builds must print the same
 
 
 def i386(name, f, extra):
     """run-i386.sh: `CT-RESULT i386 NAME rc=EXIT out=MD5` after the test's output as `CT-LOG NAME | LINE` lines. Passes
     with rc 0 and exactly the output in tests/correctness/i386/PROGRAM.txt, which the x86 reference machine printed
-    (NAME.static and NAME.dyn are one PROGRAM and share the file). Under TESTKIT_SEED_ANSWERS=1 the output is the
+    (NAME.static, NAME.dyn and NAME.64 are one PROGRAM and share the file). Under TESTKIT_SEED_ANSWERS=1 the output is the
     reference machine's (testkit/harness/campaign.py, native): it is recorded instead, and the result is unverified."""
     import difflib, os
     head = f'CT-LOG {name} | '
@@ -130,9 +131,9 @@ def i386(name, f, extra):
     if f.get('rc') != '0': return 'failed', _fields(f, 'rc', 'out') + _output(extra)
     if os.environ.get('TESTKIT_SEED_ANSWERS'):
         text = '\n'.join(got) + '\n'
-        if link == 'static' and want.is_file() and want.read_text() != text:
-            return 'failed', f'{name} and its dynamic build print different output on the reference machine'
-        want.parent.mkdir(exist_ok=True); want.write_text(text)
+        if program in I386_SEEDED and want.read_text() != text:
+            return 'failed', f'{name} and another build of {program} print different output on the reference machine'
+        want.parent.mkdir(exist_ok=True); want.write_text(text); I386_SEEDED.add(program)
         return 'unverified', f'recorded {want.name}'
     if not want.is_file(): return 'failed', f'no expected output {want} (seed it: docs/testing.md)'
     exp = want.read_text().splitlines()

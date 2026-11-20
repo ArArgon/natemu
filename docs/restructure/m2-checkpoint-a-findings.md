@@ -13,8 +13,9 @@ its forms is the plan's open item and needs the owner's decision: 64-bit integer
 
 All of it is tests, through the framework.
 
-- **Suite `correctness/i386`** (in the gate; one boot per vCPU count, about 2 minutes each). 38 tests in one image:
-  - eight C programs (`tools/correctness/recipes/i386/progs/`), each built twice, static (no PIE) and dynamic (PIE,
+- **Suite `correctness/i386`** (in the gate; two boots per vCPU count, about 2 minutes together). 46 tests in one image (`hello.static` alone is
+  the smoke part):
+  - ten C programs (`tools/correctness/recipes/i386/progs/`), each built twice, static (no PIE) and dynamic (PIE,
     through `ld.so`):
 
     | Program | What it runs |
@@ -26,16 +27,19 @@ All of it is tests, through the framework.
     | `sys` | fork, vfork, exec of a 64-bit and of a 32-bit program, pipes, mmap/mremap/mprotect/brk, files with 64-bit offsets, directories, sockets, a process-shared semaphore (futex), select, the vDSO's clocks |
     | `x87` | casts to integers (the FNSTCW, FLDCW, FISTP, FLDCW sequence), 64-bit FILD and FISTP below 2^53, the four rounding modes, comparisons with NaN, the register stack eight deep, constants, integer operands, exception flags, libm |
     | `segs` | DS, ES, FS and GS loaded with a thread-area segment whose descriptor is then cleared: the kernel's reload faults inside the kernel and leaves the register null (the last test of the kernel's `ldt_gdt` selftest, with a flat segment) |
+    | `cpuint`, `cpufp` | an integer and a floating-point workload with fixed answers, also built for x86-64 (`NAME.64`): the same program in both modes, timed by the runner |
     | `x87ext`, `atomic64` | what natemu's x87 does not do (expected failures, below) |
 
   - Debian's i386 BusyBox (`busybox-static`: its shell, pipes, awk, hashes, gzip) and CPython 3.13
     (`python3.13-minimal`: big integers, floats and their printing, threads, lock timeouts);
   - 17 modules of CPython's own regression tests (`pytests.txt`: int, long, float, math, cmath, struct, array, thread,
-    threading, signal, time, fork1, posix, mmap, select, json, re);
+    threading, signal, time, fork1, posix, mmap, select, json, re). `test_math` and `test_cmath` run without the three
+    cases that meet the x87 deviation and must pass; those cases run alone as two expected failures;
   - `mix`: three 32-bit programs, a 64-bit Python and a 64-bit `sha256sum` at once, three rounds, each output equal
     to the program's output alone.
 - **Suite `correctness/torture32`** (campaign tier, 4 vCPUs, about 2 minutes): the existing torture suite's 1,721 C
-  programs that compile for i686, at -O0 and -O2: 3,442 programs.
+  programs that compile for i686, at -O0 and -O2: 3,442 programs (the ieee ones with `-ffloat-store`, as gcc's own
+  harness builds them on ia32).
 - **The kernel's x86 selftests' 24 32-bit programs** in the existing `x86st` campaign (49 parts now).
 - **The replay check** (`static/fexc/fexc-replay`) now records a boot that also runs `boot-i386`'s 32-bit program, so
   its stream mixes both modes. The new compiler answers all of it; the compiler of `main` answers the 64-bit requests
@@ -66,8 +70,8 @@ All of it is tests, through the framework.
 
 | Suite | Result |
 | --- | --- |
-| `i386` at 1, 2 and 4 vCPUs | each: 32 of 38 tests print the reference machine's output; 6 are expected failures (the x87 deviation) |
-| `torture32` at 4 vCPUs | 3,431 of 3,442 programs end as on the reference machine (3 of them fail there too); 11 are expected failures (the x87 deviation) |
+| `i386` at 1, 2 and 4 vCPUs | each: 40 of 46 tests print the reference machine's output; 6 are expected failures (the x87 deviation) |
+| `torture32` at 4 vCPUs | 3,432 of 3,442 programs end as on the reference machine, where all pass; 10 are expected failures (the x87 deviation) |
 | `x86st` at 4 vCPUs | of the 24 32-bit programs 20 pass, 1 reports unsupported and 3 are expected failures (recorded segment deviations, below); the 25 64-bit programs are as before |
 | `fexc-replay` with the 32-bit program | 54,839 requests, 82 of them for 32-bit code, no 64-bit reply differs |
 
@@ -80,11 +84,10 @@ on [the floating-point page](../../floating-point.md), which had no x87 entry.
 | --- | --- | --- |
 | `atomic64`: gcc's 64-bit atomic load and store on i686 (FILD m64, FISTP m64) | 8 bytes copied exactly | a value above 2^53 loses its low bits: `0x123456789abcdef1` becomes `0x123456789abcdf00`, `0x7fffffffffffffff` becomes `0x8000000000000000` |
 | `x87ext` | `1 + LDBL_EPSILON > 1`; 2^62+1 survives `long double`; FLDPI's 64-bit significand | equal to 1; 2^62; pi rounded to 53 bits |
-| CPython `test_math` (2 of 86 cases) | passes | `exp`, `sinh`, `cosh` near 709.78, `expm1` from 27 up and `gamma` near its limits are 17 to 324 units in the last place off; `expm1(1.79e308)` reports a domain error instead of an overflow |
-| CPython `test_cmath` (1 of 33 cases) | passes | `acos(-1e299)` has an infinite imaginary part: glibc's i386 `hypot` squares in the x87's exponent range |
+| CPython `test_math` (2 of 86 cases, run alone as `py-test_math-files`) | passes | `exp`, `sinh`, `cosh` near 709.78, `expm1` from 27 up and `gamma` near its limits are 17 to 324 units in the last place off; `expm1(1.79e308)` reports a domain error instead of an overflow |
+| CPython `test_cmath` (1 of 33 cases, run alone as `py-test_cmath-values`) | passes | `acos(-1e299)` has an infinite imaginary part: glibc's i386 `hypot` squares in the x87's exponent range |
 | torture `ieee/rbug` | passes | an unsigned 64-bit integer above 2^63 converted to double is rounded twice and is one unit off |
 | torture `ieee/inf-2`, `inf-3`, `pr36332`, `pr39228` | pass | `LDBL_MAX` loads as infinity (already known from the 64-bit suite) |
-| torture `ieee/pr109008` at -O2 | fails (built without `-ffloat-store`, it trips over excess precision) | passes |
 
 The design's statement that Debian's 32-bit math library "loses many units in the last place for large arguments" was
 marked inferred; it is now measured, and it is confined to large arguments: CPython's `test_float` and the other 84
@@ -133,15 +136,15 @@ unsupported (a 64-bit kernel has no vm86 mode). Three fail, each at a deviation 
 | --- | --- | --- |
 | `sigreturn_32` (and `sigreturn_64`) | the sigreturns into 64-bit and into 32-bit code pass; the third, into a 16-bit code segment, takes #GP(34H) | no 16-bit code segments until Part 2 |
 | `test_syscall_vdso_32` | its far jump from 32-bit code to the 64-bit code segment takes #GP(30H) | no far transfers between the modes until task 5 |
-| `ldt_gdt_32` | its last test loads DS with a read-only, expand-down thread-area segment (what an earlier test left in the descriptor) and takes #GP(6BH) at the next instruction; a SIGSEGV handler left from an earlier test then jumps back for ever, and the 300 s timeout ends it | 32-bit code runs only with flat DS and ES until task 6 |
+| `ldt_gdt_32` | its last test loads DS with a read-only, expand-down thread-area segment (what an earlier test left in the descriptor) and takes #GP(6BH) at the next instruction; a SIGSEGV handler left from an earlier test then jumps back for ever, and the runner's 60 s timeout for this program ends it | 32-bit code runs only with flat DS and ES until task 6 |
 
 Task 3a's two notes, rechecked: `sigreturn_64` does run its 32-bit part now, as predicted, but still fails, at the
 16-bit segment; `sysret_ss_attrs_64` still needs task 5's far return. Both stay expected failures, with those reasons.
 
 `ldt_gdt_32` was the one case that looked like a defect (a hang, and a kernel running on a user GS base in the
 inspection report, which was only an interrupt arriving in the entry code). A ptrace tracer in the guest gave the
-faulting instruction and DS = 6BH; the `segs` program is that test with a flat segment, and passes. The cost of the
-deviation here is 300 s of campaign time; the program is not on the skip list because it does not stop the VM.
+faulting instruction and DS = 6BH; the `segs` program is that test with a flat segment, and passes. The program
+is not on the skip list because it does not stop the VM; the runner gives it 60 s instead of 300.
 
 ## Not done
 

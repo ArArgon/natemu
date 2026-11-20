@@ -136,11 +136,16 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
     return BootResult(end_of(text) is not None, text, note)
 
 
-def native(image: pathlib.Path, suite: str, part: str, host: str, cap: float) -> BootResult:
+def native(image: pathlib.Path, suite: str, part: str, host: str, cap: float, work: pathlib.Path) -> BootResult:
     """One part run on the x86 machine `host` (ssh, passwordless sudo) instead of under natemu: the image unpacked into
     a temporary folder there, the guest's runner run in it as root (chroot, with /proc and /dev), the folder removed.
-    The output has the lines a boot's serial console has."""
-    script = ('set -e; d=$(mktemp -d); trap \'sudo umount "$d/r/proc" "$d/r/dev" 2>/dev/null; sudo rm -rf "$d"\' EXIT; '
+    The output has the lines a boot's serial console has, and is kept as `work`/native.txt."""
+    # The folder is removed only once /proc and /dev are unmounted, and never across a mount: rm would otherwise follow
+    # a /dev bind mount that failed to unmount into the machine's own /dev.
+    clean = ('for m in proc dev; do ! mountpoint -q "$d/r/$m" || sudo umount "$d/r/$m" || sudo umount -l "$d/r/$m"; done; '
+             'if mountpoint -q "$d/r/proc" || mountpoint -q "$d/r/dev"; then echo "left $d: still mounted" >&2; '
+             'else sudo rm -rf --one-file-system "$d"; fi')
+    script = (f"set -e; d=$(mktemp -d); trap '{clean}' EXIT; "
               'mkdir "$d/r"; zstd -dc | (cd "$d/r" && sudo cpio -idm --quiet); '
               'sudo mount -t proc proc "$d/r/proc"; sudo mount --bind /dev "$d/r/dev"; '
               f'echo "CT-BEGIN suite={suite} part={part} native kernel=$(uname -r)"; '
@@ -149,6 +154,7 @@ def native(image: pathlib.Path, suite: str, part: str, host: str, cap: float) ->
     with open(image, 'rb') as f:
         r = subprocess.run(['ssh', '-o', 'BatchMode=yes', host, script], stdin=f, capture_output=True, timeout=cap)
     text = r.stdout.decode(errors='replace')
+    work.mkdir(parents=True, exist_ok=True); (work / 'native.txt').write_text(text)
     return BootResult(end_of(text) is not None, text, f'run natively on {host}' + (f': {r.stderr.decode(errors="replace")[-400:]}' if r.returncode else ''))
 
 
@@ -433,7 +439,7 @@ class Campaign:
 
         if suite.reference == 'x86' and os.environ.get('TESTKIT_SEED_ANSWERS'):     # record, on the reference machine
             if not os.environ.get('NATEMU_X86_HOST'): return CaseResult('failed', 'seeding needs NATEMU_X86_HOST=user@host')
-            first = native(cpio, ct, booted, os.environ['NATEMU_X86_HOST'], cap)
+            first = native(cpio, ct, booted, os.environ['NATEMU_X86_HOST'], cap, work / 'boot-1')
         else:
             first = boot(cpio, ct, booted, vcpus, work / 'boot-1', cap, **how)
         got = results(first)

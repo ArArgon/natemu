@@ -6,8 +6,9 @@ execute.exp's default flag -w (replaced by dg-options), plus dg-additional-optio
 selector names x86_64 (and not ia32) or fpic; dg-skip-if and the effective-target requirements hold on x86_64-linux for
 every test of this version (checked by hand: the only *-*-* skips are for -O1 and -fomit-frame-pointer in the option
 string), so none is skipped. A test that does not compile or link is listed in DIR/compile-failed.txt and left out.
-With `ia32` (CC builds 32-bit programs: the torture32 campaign) a selector applies when it names i?86, ia32 or ilp32
-without negating it; that campaign compares every program with a native run, so a test wrongly built fails there too.
+With `ia32` (CC builds 32-bit programs: the torture32 campaign) the ieee tests also get -ffloat-store, as ieee.exp gives
+them on ia32 (without it they trip over the x87's excess precision), and a selector applies when it names i?86, ia32 or
+ilp32 without negating it; that campaign compares every program with a native run, so a test wrongly built fails there too.
 Then DIR/list.txt (the tests built, sorted) and DIR/tests-K.tar.zst chunks of CHUNK tests (the guest unpacks one at a
 time; static binaries are about 800 kB each)."""
 import concurrent.futures as cf, os, re, shlex, subprocess, sys
@@ -46,7 +47,7 @@ def jobs(d):
             if not f.endswith('.c'): continue
             src = os.path.join(sd, f); opts, add = directives(src)
             flags = (opts if opts is not None else ['-w']) + add
-            if sub: flags = ['-fno-inline'] + flags + xflags(src)
+            if sub: flags = ['-fno-inline'] + (['-ffloat-store'] if IA32 else []) + flags + xflags(src)
             name = (sub + '_' if sub else '') + f[:-2]
             for o in OPTS:
                 yield name + '.' + o, src, ['-' + o] + flags

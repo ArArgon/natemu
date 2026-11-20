@@ -8,10 +8,12 @@
 #     /lib/ld-linux.so.2), busybox-static's binary as /ct/i386/bin/busybox, python3.13-minimal's as
 #     /usr/bin/python3.13-i386 beside the amd64 one (its library unpacked over the amd64 package's: the same files
 #     plus the i386 extension modules);
+#     cpuint and cpufp are also built for x86-64 (NAME.64), the same program in both modes for a timing comparison;
 #   - the scripts progs/busybox, progs/python and progs/mix, which run those;
 #   - CPython's own regression tests for the modules pytests.txt names (libpython3.13-stdlib:i386 and the
-#     architecture-independent libpython3.13-testsuite), one test py-MODULE each, run by pytest.sh.
-# Every file of /ct/i386/tests is one test, listed in i386-cases.txt (`0/1 NAME`: one part). run-i386.sh prints each
+#     architecture-independent libpython3.13-testsuite), one test each (py-MODULE, or the name the line gives), run by pytest.sh.
+# Every file of /ct/i386/tests is one test, listed in i386-cases.txt in two parts: `smoke` is hello.static alone (the
+# suite's smoke case), `rest` the others. run-i386.sh prints each
 # test's output; tests/correctness/verdicts.py compares it with tests/correctness/i386/, recorded on the x86 reference
 # machine. A builder cannot run the programs itself: the Mac's (Rosetta) runs no 32-bit code.
 set -euo pipefail
@@ -37,6 +39,9 @@ for c in "$src"/progs/*.c; do
     $CC32 $FLAGS -fno-pie -no-pie -static -pthread -o "$D/tests/$n.static" "$c" -lm 2>> "$W/log/i386-cc.log" || { tail -30 "$W/log/i386-cc.log" >&2; exit 1; }
     $CC32 $FLAGS -fPIE -pie -pthread -o "$D/tests/$n.dyn" "$c" -lm 2>> "$W/log/i386-cc.log" || { tail -30 "$W/log/i386-cc.log" >&2; exit 1; }
 done
+for n in cpuint cpufp; do                             # the same program for x86-64, to time the two modes side by side
+    $W/sysroot/usr/bin/x86_64-linux-gnu-gcc-14 --sysroot=$W/sysroot -O2 -static -o "$D/tests/$n.64" "$src/progs/$n.c" -lm 2>> "$W/log/i386-cc.log"
+done
 for d in "$A"/*.deb; do
     case $(dpkg-deb -f "$d" Package) in
         busybox-static) dpkg -x "$d" "$W/x32/bb"; cp "$W/x32/bb/usr/bin/busybox" "$D/bin/busybox";;
@@ -50,9 +55,12 @@ for l in lib bin sbin; do                             # as rootfs.sh: the root's
 done
 [ -e "$P/usr/lib/ld-linux.so.2" ] || { echo "no /lib/ld-linux.so.2 in libc6:i386" >&2; exit 1; }
 for s in busybox python mix; do cp "$src/progs/$s" "$D/tests/$s"; done
-for m in $(grep -v '^#' "$src/pytests.txt"); do printf '#!/bin/sh\nexec "${0%%/*}/../pytest.sh" %s\n' "$m" > "$D/tests/py-$m"; done
+grep -v '^#' "$src/pytests.txt" | while read -r n rest; do
+    case $n in *:) n=${n%:};; *) rest="$n $rest";; esac
+    printf '#!/bin/sh\nexec "${0%%/*}/../pytest.sh" %s\n' "$rest" > "$D/tests/py-$n"
+done
 cp "$src/python.py" "$src/pytest.sh" "$D/"; chmod 755 "$D/pytest.sh"; chmod 755 "$D"/tests/* "$D/bin/busybox" "$P/usr/bin/python3.13-i386"
 (cd "$D/tests" && sha256sum -- *) > "$W/log/built.sha256"
-ls "$D/tests" | sort | sed 's|^|0/1 |' > "$W/out/$SUITE-cases.txt"
+{ echo 'smoke hello.static'; ls "$D/tests" | sort | grep -vx hello.static | sed 's|^|rest |'; } > "$W/out/$SUITE-cases.txt"
 say "$(wc -l < "$W/out/$SUITE-cases.txt") tests listed"
 image32 "$SUITE" > "$W/log/image.log" 2>&1 || { tail -20 "$W/log/image.log" >&2; exit 1; }
