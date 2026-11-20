@@ -472,7 +472,7 @@ def compile32(fexc, src, out, path, objects):
         seen.add(at)
         stem = f"{name.replace('/', '__')}-{at:05x}"
         (objects / f'{stem}.src').write_bytes(binary[at:at + 4096])
-        r = subprocess.run([fexc, '--file', objects / f'{stem}.src', '--rip', hex(CODE + at), '--bitness', '32', '--profile', 'slice1', '--narrow-cmp',
+        r = subprocess.run([fexc, '--file', objects / f'{stem}.src', '--rip', hex(CODE + at), '--bitness', '32', '--profile', 'slice1', '--narrow-cmp', '--push-run',
                             '--ext-conds', '4', '--object', objects / f'{stem}.obj', '--out', work / 'j'], capture_output=True, text=True, timeout=60)
         if r.returncode not in (0, 1): return fail('fexc crashed', f'at {CODE + at:#x} ({binary[at:at + 15].hex()}): exit {r.returncode} {r.stderr[-300:]}')
         d = json.loads((work / 'j').read_text())

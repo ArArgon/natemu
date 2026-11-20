@@ -2573,7 +2573,8 @@ pub struct Compiler {
     pub(crate) push_run: bool,
     /// M2: a request for 32-bit code (the code segment's mode): fexc's `--bitness 32` and admission's 32-bit rules
     /// ([`admission::admit_mode`]). Such a request is always compiled: no kept answer (so none relocated to another RIP), no
-    /// persistent cache, no template for the pool or the resident, and no `--push-run` (it assumes 8-byte stack slots).
+    /// persistent cache, no template for the pool or the resident. (`--push-run` is sent as for 64-bit code since M2 task 4: fexc
+    /// and admission take the stack slot as 4 bytes there.)
     /// The answers kept in memory are keyed without the mode, which is why 32-bit requests stay out of them.
     pub(crate) bits32: bool,
     /// M2 task 3a, 32-bit requests only: FS, GS, DS, ES hold a null selector ([`exec::NULL_SREGS`], code identity bits
@@ -3342,7 +3343,7 @@ impl Compiler {
             arg(&mut body, n.to_string().as_bytes());
         }
         body.extend_from_slice(&self.feature_args);
-        if self.push_run && !self.bits32 {
+        if self.push_run {
             arg(&mut body, b"--push-run");
         }
         arg(&mut body, b"--narrow-cmp");
@@ -5312,7 +5313,7 @@ mod tests {
             }
         }
     }
-    /// M2, with `FEXC` set: a request for 32-bit code asks fexc for `--bitness 32` without `--push-run`, is admitted under
+    /// M2, with `FEXC` set: a request for 32-bit code asks fexc for `--bitness 32` (with `--push-run`, task 4), is admitted under
     /// the 32-bit rules, and is compiled every time: its answer is not kept, so it is neither found again nor moved to
     /// another RIP, and a 64-bit request for the same bytes at the same RIP gets its own compile.
     #[test]
@@ -5325,7 +5326,7 @@ mod tests {
         c.bits32 = true;
         let body = c.body(&[0x90], 0x1000, None);
         let args = String::from_utf8_lossy(&body[4..body.len() - 1]).replace('\0', " ");
-        assert!(args.contains("--bitness 32") && !args.contains("--push-run"), "{args}");
+        assert!(args.contains("--bitness 32") && args.contains("--push-run"), "{args}");
         let code = [0x40, 0x01, 0xd8, 0xc3]; // inc eax; add eax, ebx; ret (64-bit code: REX add; ret)
         let mut insns = |c: &mut super::Compiler, rip| match c.compile(&code, rip, false, &mut ()).unwrap() {
             Code::Block(b) => b.guest_insns,
