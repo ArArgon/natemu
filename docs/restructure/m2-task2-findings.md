@@ -68,7 +68,7 @@ register as an address (`ldr w20, [x9, #8]` for `[ebp+8]`, `str w9, [x8, #-4]!` 
 registers zero-extended.
 
 **What real hardware does** (AMD Ryzen 7 8845HS, Linux 7.0, a user program that far-jumps to the 32-bit code segment
-0x23 and back to 0x33; the program is in this page's appendix):
+0x23 and back to 0x33; method and output in this page's appendix):
 
 - A register the 32-bit code does not write keeps its upper half, R8-R15 included.
 - A 32-bit write (`mov eax, eax`, `inc ecx`, `pop edi`) zeroes the upper half; 8- and 16-bit writes keep it.
@@ -146,9 +146,17 @@ state save in task 3a.
 
 ## Appendix: the upper-half measurement
 
-Built with `gcc -O1 -static -no-pie` on the x86-64 reference machine. It sets every register to a value with a
-distinctive upper half, far-jumps to 32-bit code that does nothing, or writes registers at 8, 16 and 32 bits, or uses the
-stack, far-jumps back and prints all sixteen. The control far-jumps to 64-bit code instead.
+A static, non-PIE 64-bit program on the x86-64 reference machine (`gcc -O1 -static -no-pie`, the far jumps in
+assembly). It sets RAX..R15 to values with a distinctive upper half (`0x1111111100000001` and so on), points RSP at a
+`MAP_32BIT` stack and ORs `0x55555555` into its upper half, then `ljmp *m16:32` to selector 0x23 and one of three 32-bit
+bodies, each ending `ljmp $0x33, $back`, where 64-bit code stores all sixteen registers:
+
+- nothing (`nop`);
+- `mov eax, eax; inc ecx; xor edx, 0; lea ebx, [ebx]; movzx ebp, bp; add si, 0; mov dl, dl`;
+- `push eax; pop edi; mov esi, esp`.
+
+The control jumps through the same far pointer form to selector 0x33 instead. Task 3a's round-trip test is the place
+for this sequence as a framework case; it cannot run in natemu before 32-bit code does.
 
 ```
 nop only:                  rax 1111111100000001 ... rdi 8888888800000008   rsp 0000000041700000   r8-r15 unchanged
