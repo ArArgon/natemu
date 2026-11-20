@@ -82,3 +82,19 @@ def test_covers_name_every_tests_folder_a_family_reaches():
         missing = sorted({p.relative_to(ROOT).as_posix() for p in reached if p.is_relative_to(ROOT / 'tests')
                           and not select.matches(p.relative_to(ROOT).as_posix(), covers)})
         assert not missing, f'{fam.parent.name}: covers miss {missing}'
+
+
+def test_every_unittest_class_a_case_names_is_one_of_the_file_and_every_class_has_a_case():
+    """A unittest file split into one case per class (tests/static's fexc-slice1-*): a class added to the file runs too."""
+    pat = re.compile(r'^tools\.fexc\.(test_\w+)\.(\w+)$')
+    named = {}
+    for f in (ROOT / 'tests').glob('*/family.toml'):
+        for s in tomllib.loads(f.read_text()).get('suite', []):
+            for c in s.get('cases', {}).values():
+                for a in c.get('argv', []):
+                    if m := pat.match(a): named.setdefault(m[1], set()).add(m[2])
+    assert named, 'no case runs a single unittest class'
+    for mod, classes in named.items():
+        src = (ROOT / 'tools' / 'fexc' / f'{mod}.py').read_text()
+        have = set(re.findall(r'^class (\w+)\(unittest\.TestCase\)', src, re.M))
+        assert classes == have, (mod, sorted(have - classes), sorted(classes - have))

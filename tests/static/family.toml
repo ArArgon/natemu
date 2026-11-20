@@ -57,5 +57,53 @@ smoke = true
 argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools/fexc/test_fexc.py"]
 smoke = true
 
-[suite.cases."fexc-slice1"]
-argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools/fexc/test_slice1.py"]
+# test_slice1.py, one case per test class: the classes are independent (each process builds its own native helper and
+# keeps its own compile cache), and as one case its 92 tests ran 8 to 9 minutes on one core. testkit/tests/test_layout.py
+# checks that the cases name every class of the file.
+[suite.cases."fexc-slice1-cutting"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.Slice1Cutting"]
+
+[suite.cases."fexc-slice1-afp-flush"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpFlush"]
+
+[suite.cases."fexc-slice1-afp-denormal"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpDenormal"]
+
+[suite.cases."fexc-slice1-afp-x87"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpX87"]
+
+[suite.cases."fexc-slice1-afp-accurate-de"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpAccurateDe"]
+
+[suite.cases."fexc-slice1-afp-daz-screen"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpDazScreen"]
+
+[suite.cases."fexc-slice1-afp-daz-free"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpDazFree"]
+
+[suite.cases."fexc-slice1-afp-accurate-fma"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpAccurateFma"]
+
+[suite.cases."fexc-slice1-afp-negation"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpNegation"]
+
+[suite.cases."fexc-slice1-afp-upper-zero"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpUpperZero"]
+
+[suite.cases."fexc-slice1-afp-tiny"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.AfpTiny"]
+
+[suite.cases."fexc-slice1-exits"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.Slice1Exits"]
+
+[suite.cases."fexc-slice1-x87-commit"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.Slice1X87Commit"]
+
+[suite.cases."fexc-slice1-division-checks"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.Slice1DivisionChecks"]
+
+[suite.cases."fexc-slice1-self-loops-and-stop"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.Slice1SelfLoopsAndStop"]
+
+[suite.cases."fexc-slice1-approx-sdm"]
+argv = ["env", "FEXC={fexc}", "python3", "-B", "-m", "unittest", "tools.fexc.test_slice1.ApproxSdm"]
