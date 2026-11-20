@@ -96,7 +96,7 @@ Accepted (FEX's behaviour, or ours already):
 
 - **x87 values are doubles** (53 bits, not 64), as today in fast mode. `long double` overflows and underflows at the
   double's range; Debian's 32-bit math library loses many units in the last place for large arguments of power,
-  exponent and logarithm (**inferred**, from memory); the precision-control setting does nothing; bit-exact output tests and lockstep games may
+  exponent and logarithm (measured at checkpoint A: tens to hundreds of units, for large arguments only); the precision-control setting does nothing; bit-exact output tests and lockstep games may
   differ. Ordinary double code compiled for x87 is fine, and saving and restoring x87 state is lossless.
 - **Decimal x87 instructions** (FBLD/FBSTP) stay refused. Today a refused or unlisted form stops the VM, even from user
   code. **Decided (owner): whatever works best for development**, which is keeping that stop: it is loud, records the
@@ -413,7 +413,8 @@ D. **Diagnostics first (owner: yes, better for diagnostics).** Today a Linux boo
      static 32-bit program under the Debian guest. Built: [findings](m2-task3b-findings.md).
 
    **Checkpoint A, flat 32-bit Linux programs:** static, then dynamic with thread-local data, signals, threads and x87,
-   at 1, 2 and 4 vCPUs. Correct but not yet fast.
+   at 1, 2 and 4 vCPUs. Correct but not yet fast. Reached: [findings](m2-checkpoint-a-findings.md) (no emulator change
+   was needed; the x87 deviation measured; the 64-bit-integers question below is the owner's).
 4. **Speed, one change at a time, each measured:** the stack-check width; the cast fix (with x87 arithmetic rounding
    kept through the existing bracket); the SYSENTER/SYSRETL fast path. INT 0x80 only if a measurement asks for it.
 

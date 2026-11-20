@@ -1,0 +1,4 @@
+ds after its descriptor was cleared: 0, set_thread_area 0, memory 42
+es after its descriptor was cleared: 0, set_thread_area 0, memory 42
+fs after its descriptor was cleared: 0, set_thread_area 0, memory 42
+gs after its descriptor was cleared: 0, set_thread_area 0, memory 42

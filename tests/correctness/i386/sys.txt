@@ -1,0 +1,14 @@
+fork: read 10 'from child' exit 3
+exec of a 64-bit program
+vfork exec exit 0
+child again
+self exec exit 9
+killed 1 sig 9
+mmap 1 mremap 1 255 mprotect 0 munmap 0
+brk 65536
+lseek 5000000000 size 5000000004 mode 644 'tail' truncate 0
+dir entries 4 rename 0 unlink 0 cwd-abs 1
+socketpair 'socket' select-empty 0 select-ready 1
+sem_wait 0 child 0
+slept 1 clocks-agree 1 after-2026 1
+bad fd -1 errno 9

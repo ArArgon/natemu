@@ -18,6 +18,31 @@ documented deviations (the M4 has none; the names are the ones `tests/lib/fp_dev
 - `daz-ftz-band`: with DAZ and FTZ both set, a result just below the smallest normal number that rounds up to it is 0 instead of the smallest normal.
 - `ftz-band`: with FTZ set and DAZ clear, a result whose exact value lies just below the smallest normal number, which x86 flushes to 0 (tiny after rounding to the destination precision) but Arm's denormal rounding carries up to the smallest normal, is the smallest normal instead of 0 (the flags are right).
 
+## x87 registers hold doubles (every Mac, both modes)
+
+natemu's x87 registers are 64-bit doubles, not the x87's 80-bit format: 53 bits of precision instead of 64, and the
+double's exponent range. 64-bit programs rarely notice (their floating point is SSE). 32-bit programs use the x87 for
+everything, and these are the differences from hardware measured with Debian's i386 programs (M2 checkpoint A,
+[findings](restructure/m2-checkpoint-a-findings.md)):
+
+- `long double` has the precision and range of `double`: `1 + LDBL_EPSILON == 1`, and `LDBL_MAX` loads as infinity.
+- A 64-bit integer does not survive a trip through an x87 register above 2^53: `(long long)(long double)x`, and gcc's
+  64-bit atomic load and store on a 32-bit target without SSE (FILD m64 then FISTP m64), which moves 8 bytes through
+  the x87 and loses the low bits.
+- An unsigned 64-bit integer above 2^63 converted to `double` can be one unit in the last place off (it is rounded
+  twice).
+- Double code that relies on the extended exponent range overflows early: glibc's i386 `hypot` squares its arguments
+  in the x87, so `hypot(5e298, 0)` is infinite.
+- glibc's i386 `exp`, `expm1`, `sinh`, `cosh` and `tgamma` are off by tens to hundreds of units in the last place for
+  large arguments; for ordinary arguments results agree with hardware to ten digits and more.
+- The precision-control field of the x87 control word does nothing. A program that sets it to double (CPython does,
+  around float formatting) gets the same results as on hardware.
+- A program that only passes on hardware through the x87's excess precision, or only fails through it, can behave
+  the other way round.
+
+Ordinary double arithmetic, casts to integers, the four rounding modes, comparisons, exception flags, and saving and
+restoring the x87 state (signal frames included) match hardware.
+
 ## Accurate mode
 
 `--fp accurate` (or `NATEMU_FP=accurate`; the flag wins) makes every item in the list above exact on a Mac without AFP, so x86 floating-point

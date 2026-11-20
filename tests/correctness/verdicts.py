@@ -88,6 +88,59 @@ def x86st(name, f, extra):
     return 'failed', _fields(f, 'rc', 'ok', 'fail', 'skip') + _output(extra)
 
 
+TORTURE32 = pathlib.Path(__file__).parent / 'torture32.txt'
+
+
+def torture32(name, f, extra):
+    """run-torture.sh on the i686 build of the torture tests: `CT-RESULT torture NAME.OPT rc=EXIT out=MD5`. Passes with
+    the exit status and output hash of the x86 reference machine's native run (tests/correctness/torture32.txt, `NAME rc
+    out` lines; a test that fails there, built with flags that do not suit i686, must fail the same way; for a test a
+    signal ended only the status is compared, as for one whose output differed between two seeding runs, recorded as
+    `rc *`). Under
+    TESTKIT_SEED_ANSWERS=1 the result is the reference machine's and is recorded (testkit/harness/campaign.py, native)."""
+    import os
+    file = TORTURE32
+    known = dict(ln.split(None, 1) for ln in file.read_text().splitlines()) if file.is_file() else {}
+    rc = f.get('rc', '')
+    mine = f'{rc} {f.get("out")}' if rc.isdigit() and int(rc) < 128 else rc    # killed by a signal: timeout's own message varies
+    if os.environ.get('TESTKIT_SEED_ANSWERS'):          # a second seeding run finds output that varies (an address printed)
+        known[name] = f'{rc} *' if known.get(name, mine) != mine and known[name].split()[0] == rc else mine
+        file.write_text(''.join(f'{k} {v}\n' for k, v in sorted(known.items())))
+        return 'unverified', 'recorded'
+    if name not in known: return 'failed', f'no answer in {file.name} (seed it: docs/testing.md)'
+    want = known[name].split()
+    if want[:1] == [rc] and (len(mine.split()) == 1 or want[1:] in (['*'], mine.split()[1:])):
+        return 'passed', '' if mine.startswith('0 ') else f'fails on the reference machine too (rc {rc})'
+    return 'failed', f'rc and output {mine}, the x86 reference machine\'s {known[name]}'
+
+
+I386 = pathlib.Path(__file__).parent / 'i386'
+
+
+def i386(name, f, extra):
+    """run-i386.sh: `CT-RESULT i386 NAME rc=EXIT out=MD5` after the test's output as `CT-LOG NAME | LINE` lines. Passes
+    with rc 0 and exactly the output in tests/correctness/i386/PROGRAM.txt, which the x86 reference machine printed
+    (NAME.static and NAME.dyn are one PROGRAM and share the file). Under TESTKIT_SEED_ANSWERS=1 the output is the
+    reference machine's (testkit/harness/campaign.py, native): it is recorded instead, and the result is unverified."""
+    import difflib, os
+    head = f'CT-LOG {name} | '
+    got = [ln[len(head):].rstrip() for ln in extra if ln.startswith(head.rstrip())]
+    program, _, link = name.partition('.')
+    want = I386 / f'{program}.txt'
+    if f.get('rc') != '0': return 'failed', _fields(f, 'rc', 'out') + _output(extra)
+    if os.environ.get('TESTKIT_SEED_ANSWERS'):
+        text = '\n'.join(got) + '\n'
+        if link == 'static' and want.is_file() and want.read_text() != text:
+            return 'failed', f'{name} and its dynamic build print different output on the reference machine'
+        want.parent.mkdir(exist_ok=True); want.write_text(text)
+        return 'unverified', f'recorded {want.name}'
+    if not want.is_file(): return 'failed', f'no expected output {want} (seed it: docs/testing.md)'
+    exp = want.read_text().splitlines()
+    if got == exp: return 'passed', ''
+    diff = list(difflib.unified_diff(exp, got, 'x86 reference', 'natemu', lineterm='', n=0))
+    return 'failed', 'output differs from the x86 reference machine\'s:\n' + '\n'.join(diff[:3 * SHOWN])
+
+
 # Timing-sensitive cases (plan, format decision 3; Decision 4): exempt one by one, never their module. Each requires
 # timerfd_gettime's remaining time to equal the requested one to 1 ms (or three decimals) without subtracting the
 # execution before the call; the deficit is that execution (docs/restructure/correctness-cpython-string.md, "Every

@@ -1,0 +1,6 @@
+a=11223344 name=tdata big=0 below-tp=yes through-gs=11223344
+a=11223345 name=changed big=1122334455667788 through-gs=11223344
+arr 1498500
+open -1 errno 2
+guarded 15 gd 77
+gd 78

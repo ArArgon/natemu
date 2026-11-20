@@ -1,0 +1,4 @@
+#!/bin/sh
+# python: Debian's i386 CPython 3.13 (python3.13-minimal:i386): big integers, floats and their printing (x87 code that
+# sets the precision control), threads and lock timeouts (64-bit times; 64-bit atomics moved through the x87).
+exec /usr/bin/python3.13-i386 -I "${0%/*}/../python.py"

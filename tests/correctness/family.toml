@@ -441,19 +441,75 @@ name = "x86st"
 kind = "judged"
 harness = "campaign"
 tier = "campaign"
-# 25 kernel x86 selftests, one per boot, so a test that stops the VM ends only its own part
-# (docs/restructure/correctness-x86-litmus.md:38); each test has a 300 s kill timeout in the guest
-parts = 25
+# 49 kernel x86 selftests (25 64-bit programs and, since M2 checkpoint A, the 24 32-bit ones, `*_32`), one per boot,
+# so a test that stops the VM ends only its own part (docs/restructure/correctness-x86-litmus.md:38); each test has
+# a 300 s kill timeout in the guest
+parts = 49
 cap = 900
 verdict = "verdicts:x86st"
 matrix = { "machine.vcpus" = [4] }
 needs = { cores = 4, perf = true }
-smoke = ["part-19"]    # sysret_rip_64: one quick program that passes
+smoke = ["part-34"]    # sysret_rip_64: one quick program that passes
 
 [suite.expected]
-"sigreturn_64" = "natemu has no compatibility mode (owner decision 3): the first sigreturn into a 32-bit CS takes #GP and the process gets SIGSEGV, exit 139 (docs/restructure/correctness-x86-litmus.md:193; docs/restructure/correctness-nostop.md, section 1)"
-"sysret_ss_attrs_64" = "natemu has no compatibility mode (owner decision 3): call32_from_64's far return to a 32-bit CS takes #GP and the process gets SIGSEGV, exit 139 (docs/restructure/correctness-x86-litmus.md:193; docs/restructure/correctness-nostop.md, section 1)"
+"ldt_gdt_32" = "natemu runs 32-bit code only with flat DS and ES (M2 design, Segments; task 6): the last test loads DS with a read-only expand-down thread-area segment, which takes #GP(selector) at the next instruction; the test's SIGSEGV handler, left from an earlier test, then jumps back there for ever and the 300 s timeout ends it, exit 137 (docs/restructure/m2-checkpoint-a-findings.md)"
+"sigreturn_32" = "natemu runs no 16-bit code segment (M2 design, Part 2): the sigreturns into 64-bit and 32-bit code pass, the third, into a 16-bit code segment, takes #GP(selector) and the process gets SIGSEGV, exit 139 (docs/restructure/m2-checkpoint-a-findings.md)"
+"sigreturn_64" = "natemu runs no 16-bit code segment (M2 design, Part 2): the sigreturns into 64-bit and 32-bit code pass, the third, into a 16-bit code segment, takes #GP(selector) and the process gets SIGSEGV, exit 139 (docs/restructure/m2-checkpoint-a-findings.md)"
+"sysret_ss_attrs_64" = "no far transfer between 32-bit and 64-bit code until M2 task 5: call32_from_64's far return to a 32-bit CS takes #GP and the process gets SIGSEGV, exit 139 (docs/restructure/correctness-x86-litmus.md:193; docs/restructure/m2-task3b-findings.md)"
+"test_syscall_vdso_32" = "no far transfer between 32-bit and 64-bit code until M2 task 5: the test's far jump from 32-bit code to the 64-bit code segment takes #GP(30H) and the process gets SIGSEGV, exit 139 (docs/restructure/m2-checkpoint-a-findings.md)"
 "test_shadow_stack_64" = "natemu's CPU profile has no CET shadow stacks: exit 1 after [SKIP] Could not enable Shadow stack, as on QEMU (docs/restructure/correctness-x86-litmus.md:61)"
+
+[[suite]]
+name = "torture32"
+kind = "judged"
+harness = "campaign"
+tier = "campaign"
+# M2 checkpoint A: the torture suite's programs built for i686 (x87 floating point), each compared with its native
+# run on the x86 reference machine (exit status and output hash, tests/correctness/torture32.txt).
+reference = "x86"
+ct = "torture"
+parts = 1
+cap = 3600
+verdict = "verdicts:torture32"
+matrix = { "machine.vcpus" = [4] }
+needs = { cores = 4, perf = true }
+
+[suite.expected]
+"ieee_inf-2.O0" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"ieee_inf-2.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"ieee_inf-3.O0" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"ieee_inf-3.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"ieee_pr36332.O0" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"ieee_pr36332.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"pr39228.O0" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"pr39228.O2" = "natemu runs x87 in reduced precision (FEX): LDBL_MAX loads as +inf (docs/restructure/correctness-userspace.md, finding 1), as in the 64-bit torture suite"
+"ieee_rbug.O0" = "natemu's x87 registers are doubles: an unsigned 64-bit integer above 2^63 converted to double (FILD m64, then adding 2^64) is rounded twice and can be one unit off (docs/restructure/m2-checkpoint-a-findings.md)"
+"ieee_rbug.O2" = "natemu's x87 registers are doubles: an unsigned 64-bit integer above 2^63 converted to double (FILD m64, then adding 2^64) is rounded twice and can be one unit off (docs/restructure/m2-checkpoint-a-findings.md)"
+"ieee_pr109008.O2" = "natemu's x87 registers are doubles: the test needs double results and fails on hardware, built without -ffloat-store, through the x87's excess precision; under natemu it passes (docs/restructure/m2-checkpoint-a-findings.md)"
+
+[[suite]]
+name = "i386"
+kind = "judged"
+harness = "campaign"
+# M2 checkpoint A (docs/restructure/m2-checkpoint-a-findings.md): 32-bit Linux programs under the 64-bit Debian kernel,
+# each built static and dynamic (start-up, TLS through GS, threads, signal frames and sigreturn, system calls, x87),
+# Debian's i386 BusyBox and CPython, and 32- and 64-bit programs at once; one boot runs them all. Each test's output
+# must be what the x86 reference machine printed (tests/correctness/i386/; seeding: docs/testing.md). No tier: the
+# suite is in the gate.
+reference = "x86"
+parts = 1
+cap = 3600
+verdict = "verdicts:i386"
+matrix = { "machine.vcpus" = [1, 2, 4] }
+needs = { cores = 4, perf = true }
+
+[suite.expected]
+"atomic64.dyn" = "natemu's x87 registers are doubles: gcc's 64-bit atomic load and store on i686 (FILD m64, FISTP m64) loses the low bits of a value above 2^53; the special handling is the owner's open decision (M2 design, Accuracy, To investigate; docs/restructure/m2-checkpoint-a-findings.md)"
+"atomic64.static" = "natemu's x87 registers are doubles: gcc's 64-bit atomic load and store on i686 (FILD m64, FISTP m64) loses the low bits of a value above 2^53; the special handling is the owner's open decision (M2 design, Accuracy, To investigate; docs/restructure/m2-checkpoint-a-findings.md)"
+"py-test_cmath" = "natemu's x87 registers are doubles: glibc's i386 hypot squares in the x87's extended exponent range, so cmath.acos(-1e299) is -inf (acos0046), the only failing case (docs/restructure/m2-checkpoint-a-findings.md)"
+"py-test_math" = "natemu's x87 registers are doubles: glibc's i386 exp, expm1, sinh, cosh and tgamma lose 17 to 324 ulps for large arguments, and expm1(1.79e308) reports a domain error for an overflow; test_mtestfile and test_testfile fail, 84 other cases pass (docs/restructure/m2-checkpoint-a-findings.md)"
+"x87ext.dyn" = "natemu's x87 registers are doubles (M2 design, Accuracy; docs/floating-point.md): no 64-bit significand, no long double range"
+"x87ext.static" = "natemu's x87 registers are doubles (M2 design, Accuracy; docs/floating-point.md): no 64-bit significand, no long double range"
 
 [[suite]]
 name = "cpyt"
@@ -589,7 +645,7 @@ tier = "campaign"
 # defaults, the same). Here: a smoke setting that only proves the campaign works end to end. --tier campaign runs all
 # 18 parts at it; the smoke list selects only mem1 (part-0, 12 stressors).
 parts = 18
-cap = 1800
+cap = 3600
 part_args = "scale=0.05,timeout=20"
 smoke = ["part-0"]
 verdict = "verdicts:stress"
