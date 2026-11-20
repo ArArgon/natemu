@@ -837,9 +837,12 @@ QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimple
                 'c32-gs-null-string@1': 'QEMU reads the string source through the null GS at base 0; SDM: #GP(0)',
                 'c32-ds-null@1': 'QEMU reads through the null DS at base 0 (a #PF there); SDM: #GP(0)',
                 'c32-es-null@1': 'QEMU stores the string element through the null ES at base 0 (a #PF there); SDM: #GP(0)',
-                'c32-limit@1': 'QEMU checks no segment limit (the load runs past 4 GiB into a page fault); SDM Vol.3 5.3: #GP(0) for a doubleword at an offset above the limit - 3',
-                'c32-limit-ss@1': 'QEMU checks no segment limit (the store runs past 4 GiB into a page fault); SDM Vol.3 5.3: #SS(0) through SS',
-                'c32-limit-fetch@1': 'QEMU checks no segment limit (the fetch runs past 4 GiB into a page fault); SDM Vol.3 5.3: #GP(0)'}
+                # (An access across 4 GiB with a limit of FFFFFFFFH may fault or not, SDM Vol.3 5.3, segment_model B10: natemu
+                # and the reference AMD machine raise #GP(0)/#SS(0); QEMU makes it, and its page fault on what it reaches
+                # here is not an outcome the model lists.)
+                'c32-limit@1': 'QEMU checks no segment limit: it makes the load, which page-faults on what lies past 4 GiB here (nothing is mapped there); the model permits #GP(0) or the completed access',
+                'c32-limit-ss@1': 'QEMU checks no segment limit: it makes the store, which page-faults past 4 GiB here; the model permits #SS(0) or the completed access',
+                'c32-limit-fetch@1': 'QEMU checks no segment limit: its fetch page-faults past 4 GiB here; the model permits #GP(0) or the instruction fetched wrapped'}
 
 
 # ---- S1: the presented CPU, judged by tools/models/cpu_profile.py (QEMU presents its own CPU) --------------------------------
