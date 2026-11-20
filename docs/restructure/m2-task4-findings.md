@@ -193,3 +193,87 @@ everything pays (Go's 386 runtime). Ordinary glibc programs barely use it: `star
 program start (static glibc's start-up) against 44 SYSENTER calls, about 30 microseconds of a start that takes 190 ms;
 `cray32-small` makes 135 in all. A dynamically linked start adds the loader's calls (54 call sites, each used once or
 a few times per library): a few hundred calls, still under a millisecond.
+
+## 64-bit integers through the x87: two prototypes for the owner's choice
+
+Compilers copy a 64-bit integer on i686 with FILD m64 then FISTP m64 (atomic loads and stores); natemu's x87 registers
+are doubles, so a value above 2^53 lost its low bits ([checkpoint A](m2-checkpoint-a-findings.md)). The survey
+(`m2-x87-int64-survey.md` on the integration branch) found the pair in 27 of 640 Debian packages, 81% of the places
+adjacent and 19% with plain integer instructions between, none through x87 stack shuffles. Both ways to fix it are
+built as prototypes, each on its own branch off this one (and its own branch of the FEX fork), so either can be dropped:
+
+| | (b) the pair, found when compiling | (c) the integer kept beside the register |
+| --- | --- | --- |
+| Branch (natemu / FEX fork) | `m2-speed-int64-b` / `natemu-m2-int64-b` (2cd8c37) | `m2-speed-int64-c` / `natemu-m2-int64-c` (ddd4103) |
+| How | The compiler remembers the last FILD m64 of the block it is translating. A FISTP m64 in the same block with no x87 or MMX instruction between stores that loaded integer; no conversion is emitted for it. | FILD m64 also writes the integer into the unused upper half of the register's 16-byte slot; every other write of an x87 register writes 0 there; FISTP m64 stores the integer when it is not 0, else converts as before. |
+| Catches | The adjacent pair and the pair with any non-x87 instructions between: all the survey's places. Not a pair split across blocks (a branch or call between), nor one through FXCH or FLD ST(i) (the survey found none). | Those, and a pair split across blocks, a FISTP restarted after a page fault, and any order of other instructions that do not write the register. Not through FXCH or FLD ST(i) (they write the register: the integer is dropped, as in Box64), and not across FXSAVE/FXRSTOR (the shim's writes clear it) unless the 80-bit image is made to carry the exact integer, which is not built. |
+| When the FISTP's store faults (first touch, copy-on-write) | The kernel restarts at the FISTP alone, in a new block that knows nothing of the FILD: the value is converted from the double, so it is rounded. A gap. It could be closed for adjacent pairs by probing the destination for writing before the FILD commits (the fault would then be reported at the FILD), not for separated ones. | Exact: the integer is still beside the register. |
+| x87 stack overflow at the FILD | The loaded integer is stored although hardware would store the indefinite value (a broken program). | As hardware: the register holds the indefinite value and the conversion path stores it. |
+| Cost in translated code | None outside the pair; the pair itself gets shorter (the FISTP is a plain 8-byte store). | Three Arm instructions for every write of an x87 register (a zero, an address, a store), plus one more store per FILD m64 and about 12 instructions per FISTP m64. On c-ray's main block (85 x87 instructions): 17,680 bytes of code against 16,496, 7% more. |
+| Other code changed | The FEX fork only (about 25 lines in the x87 dispatcher). | The FEX fork (about 40 lines in the dispatcher and the x87 stack pass), admission and the site checker (the slot's upper half may be accessed), the shim (its register writes clear the upper half). |
+| 64-bit code | The same change applies (the pair is an 8-byte copy there too, rare). | The extra store on every x87 register write applies there too. |
+
+Neither changes the flags of the FILD itself: converting a 64-bit integer above 2^53 to a double sets the x87
+precision flag, which hardware (where the load is exact) does not; that is part of the recorded "x87 registers are
+doubles" deviation.
+
+## Paused (November 20, about 14:50)
+
+The work was paused on the owner's order while checkpoint A, which this branch sits on, investigates a 64-bit slowdown;
+its result may change the baseline here. State at the pause:
+
+**Built and committed on `m2-speed`:** the benchmark cases and counters; the stack check in 4-byte slots; SYSENTER and
+SYSRETL on the fast path; x87 runs; the cast fix (FEX fork 9b270ad on 0e96493, local branch `natemu-m2-speed` of the
+fork, not pushed); the compiler fix for hosts without AFP. The two 64-bit-integer prototypes are on their own branches
+(table above).
+
+**Tests that passed at the last code commit (a31c6bac):** `tools/natemu-test run tests/unit tests/static tests/faults
+tests/programs -k 'rust or fexc or i6 or i5c'`: 4,846 passed (the Rust unit tests, the compiler's checks with the
+replay check, the x87 reference corpora, the x87 and FP fault cases with the two new mid-run cases, on the M4 and on
+the emulated Mac without AFP). `tools/natemu-test run tests/correctness/family.toml -k i386` passed at the commit
+before it (de4dcfaf, which differs only in the no-AFP fix and tests): 99 passed, 18 expected failures, at 1, 2 and 4
+vCPUs. The kernel's 32-bit selftests (`--tier campaign -k x86st`) passed at the fast-path commit and were not rerun
+after x87 runs and the cast fix. `tools/natemu-test run` (the affected tier) and the gate were not run: they wait for
+the review.
+
+**Measurements complete** (the tables above): the baseline and each change's A/B for `hackbench32`,
+`hackbench32-int80`, `sqlite32`, `startup32` and `cray32-small`; the profile; one full-size `cray32` at the head of
+the branch: **526.9 / 523.2 s**, against "more than 1,800 s" before (run 1 alone did not finish in 1,800 s; the
+estimate from the small scene was 1,970 s). So at least 3.4 times faster, about 3.7 by the estimate.
+
+**Measurements cut off by the pause, to rerun:**
+
+- the final rows at the head for `hackbench`, `hackbench32`, `hackbench32-int80`, `sqlite32`, `startup32`,
+  `cray32-small` in one round (each was measured after its own change, but not all together at the head);
+- 64-bit code before and after, which x87 runs and the cast fix may touch where 64-bit programs use the x87: only the
+  baseline's `sqlite` was measured (6.28 / 6.06 s); `cray`, `hackbench` and the head's `sqlite` were not;
+- both prototypes: nothing was measured in the VM (their benchmark rounds and the i386 campaign with `atomic64`
+  expected to pass were queued and stopped). Only the static numbers in the table above exist, and neither prototype
+  has run a guest program yet;
+- the x86 selftests' campaign at the head.
+
+## Not done, and leads
+
+- **INT 0x80 fast path:** not built; the numbers are above. It matters for programs that make every call that way
+  (Go's 386 runtime: about 0.55 microseconds more per call), not for glibc programs.
+- **Macs without AFP (M1, M2)** keep the per-operation x87 wrapper and FLDCW in the shim: x87-heavy 32-bit code is as
+  slow there as it was here before. Their NaN and denormal fix-ups read each operation's own flags, which a run does
+  not separate. A lead, not started.
+- **x87 instructions cost about 48 Arm instructions each** (the register stack, its top and its tag bits live in memory
+  and are updated by every instruction). After the changes above this is all of `cray32`'s time: 525 s against 3.2 s
+  for the 64-bit SSE build. FEX's x87 stack pass can keep the stack in registers across a block; natemu flushes it
+  at every instruction so that a fault finds exact state. The next lead for x87-heavy code.
+- **PCMPxSTRx through the shim** is 12% of `startup32` (glibc's i386 string functions with SSE4.2; 57 ns a call).
+- **32-bit code is compiled again in every process** (about 850 compiles per start of a small static program, 5% of
+  `startup32`): relocation and the persistent cache are still refused for it. For checkpoint B.
+- **A FLDCW ends its run** with a status-register write although the run could stay open; about 20 ns per cast could
+  go. Not measured as worth it.
+- The stack check's per-mode trap counter: not needed (0 firings).
+
+## Effort
+
+Approximate, from the session that did the work (it has no clock): reading the plan, the findings and the code about
+2 agent hours; benchmark cases, counters and profiles about 2; the stack check 1; the fast path 0.5; x87 runs, with
+the experiments that explained the remaining time, about 4; the cast fix, with the no-AFP compiler defect, about 3;
+the two prototypes about 2; this page 1. About 15 in all, against the plan's 16 to 30 for a narrower list. Most of
+the wall time was the test queue.
