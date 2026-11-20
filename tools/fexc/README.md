@@ -387,6 +387,11 @@ series47-seg and series48-lean none in code, object, extent, args_read or `guest
 
 ### Replay gate (CPU-features plan, chunk 0)
 
+Since M2 task 2 the gate is also one framework case, `static/fexc/fexc-replay` (`tools/fexc/replay.py`): it records a
+stream itself (a 1-vCPU boot to a busybox power-off, about 54,000 requests) and compares the compiler at the checkout's
+merge base with `main` with the checkout's own, over the pipe. The recorded-stream procedure below remains for larger
+streams (an installer boot, a `build` boot) and for the channel transport.
+
 A change to fexc, the shim or the feature tables that must not change any reply is proved by replaying a recorded request
 stream through the old and the new compiler and comparing every reply (status, code, JSON, object, extent, args_read: the
 whole payload). The streams are the requests the host sent, recorded by the host itself: `NATEMU_FEXC_RECORD=PATH` makes
@@ -1040,8 +1045,37 @@ target of the block's branch and no branch into its words 2-4, and returns it as
 (`crates/runtime/src/execution.rs` `linker`) rewrites the first word into `b` to the target block's entry. Same code size and
 layout as series7: only that one load word per literal exit differs.
 
+## 32-bit code (M2 task 2)
+
+`--profile slice1 --bitness 32` compiles 32-bit code through FEX's own 32-bit path, in its own FEX context, with FEX's
+compact register plan: EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI in x4, x7, x5, x6, x8, x9, x10, x11, PF and AF in x26 and x27,
+XMM0-7 in v16-v23; x12-x17, x19, x29 and v24-v31 (R8-R15 and XMM8-15 in 64-bit code) are scratch registers. The object's
+header carries the map and the mode; admission pins both (`natemu_abi::execution::SRA32`, `admission::admit_mode`).
+The shim sets `fexc_bits32` for the request (not a gating argument: the host's code identity holds the mode).
+
+- Allowed-instruction rows (`shim/fexc_slice1.inc`, each with its reason; the decisions are tabled in
+  [the task's findings](../../docs/restructure/m2-task2-findings.md)): INC/DEC r32 (40-4F), DAA, DAS, AAA, AAS, AAD and
+  SALC are translated; ARPL, LES/LDS, BOUND (found from the bytes: FEX knows 63 as MOVSXD and C4, C5, 62 as VEX and EVEX
+  prefixes), PUSHA/POPA and AAM are system cuts, beside the segment loads, INT, INTO and far transfers the 64-bit rows
+  already mark; 0x67 (16-bit addressing), 66 on a near branch (a 16-bit EIP) and the group 1 alias 82 are refused.
+- A direct branch's target wraps at 4 GiB (FEX's truncation), so the non-canonical-target cut does not apply.
+- CS/DS/ES/SS prefixes apply in 32-bit code: FEX adds the named segment's base, a 4-byte load from the guest-state page
+  (`es_cached`..`ds_cached` at 976..991, `frame::LEGACY_BASES`; 0 while only flat segments run), and ES's base to every
+  string destination (the fork's `FexcStringOp`, which also steps ESI, EDI and ECX in 32 bits there). A site's segment is SS
+  for an explicit SS prefix or an EBP/ESP base without a prefix, as before; the report names all six overrides.
+- `--push-run` with `--bitness 32` is refused (the option assumes 8-byte stack slots).
+- FEX's 32-bit code takes the upper halves of the eight registers as zero (it addresses memory with the whole Arm
+  register), and adds a small displacement and moves ESP in PUSH and POP with 64-bit arithmetic: an address or an ESP
+  that should wrap at 4 GiB does not. Both are the shim's to handle when 32-bit code runs (findings, "What task 3a needs").
+
 ## Checks
 
+- `python3 tools/fexc/replay.py`: the replay gate above as one check (the framework's `static/fexc/fexc-replay`): it
+  records the compile requests of one boot and compares an old compiler's answers with this one's.
+- `python3 tools/fexc/verify_precision.py --bits32`: the precision and site checks below on 32-bit code (its own forms
+  and programs, `PROGRAMS32`).
+- `python3 tools/fexc/upstream_tests/run_asm.py --compile32 ...`: FEX's 245 32-bit ASM tests, each reachable block
+  compiled for 32-bit code and admitted by the host (`natemu-host unused admit-corpus DIR`), offline.
 - `python3 -m unittest tools/fexc/test_fexc.py`: structure, exact sites for hand-checked instructions, object file,
   identity of the 53 pinned old-producer bodies.
 - `python3 -m unittest tools/fexc/test_slice1.py`: profile slice1. Every system class and unsupported form placed after two

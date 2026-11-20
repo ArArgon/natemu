@@ -36,8 +36,8 @@ a new script wherever the framework allows. No standalone runners, and no VMs st
 - 64-bit speed between checkpoints: task 1 is host-side, so the gate and checkpoint A's benchmark cover it. For the
   compiler-side changes of tasks 2-4 (the fork, fexc's shim code), the compiler's replay check (`tools/fexc/README.md`,
   the replay gate) shows in minutes whether 64-bit output changed. It only feeds recorded requests to the old and new
-  compiler, so it says nothing about host-side changes, and today it is a direct `cargo test` outside the framework:
-  wrap it as a framework case before relying on it.
+  compiler, so it says nothing about host-side changes. Since task 2 it is a framework case, `static/fexc/fexc-replay`
+  (one recorded boot; the old compiler is the one of the checkout's merge base with `main`).
 
 **Reference answers:** for prototyping, prefer the real x86 machine (owner), which the framework already supports per
 suite (`reference = "x86"`, `NATEMU_X86_HOST`; `tools/natemu-test xref` compares it with QEMU). It runs 32-bit user
@@ -154,8 +154,9 @@ the combination FEX tests upstream.
 - Cost: about 8-15 agent hours (it touches the admission register-map check, the shim's state save and hooks with
   hard-coded registers), plus keeping two maps in step. Mode switches cost nothing extra: each already goes through a full
   state save and restore.
-- To check in task 0 or 2: whether FEX's 32-bit code assumes the upper halves of the general registers are zero after
-  a switch into 32-bit mode. The manual leaves them undefined; real x86 hardware is the tiebreaker.
+- Checked in task 2 ([findings](m2-task2-findings.md)): FEX's 32-bit code does assume the upper halves of the general
+  registers are zero. Real hardware keeps the upper half of a register 32-bit code does not write and zeroes it on a
+  32-bit write. **Open (owner):** what the shim saves for them after 32-bit code (the findings give the options).
 
 ## Segments
 
@@ -441,7 +442,7 @@ waiting for the VM test queue comes on top. "Bugs" rows are the least certain: t
 | D. Diagnostics (stop report 2-4; hang to exit 2-4; inspect without stopping 3-6) | 7-14 | 7-14 |
 | 0. First check | 2-3 | 9-17 |
 | 1. Plumbing (control split, mode field, hidden bases 3-5; iced-x86 mapping and comparison 5-12; other 3-5) | 11-22 | 20-39 |
-| 2. Translate 32-bit code (register plan 8-15; allowed-instruction rows 4-8; admission, bases, wrap, checkers 6-11) | 18-34 | 38-73 |
+| 2. Translate 32-bit code (register plan 8-15; allowed-instruction rows 4-8; admission, bases, wrap, checkers 6-11). **Done: about 9** ([findings](m2-task2-findings.md)); the register plan cost nothing in the compiler and moves to task 3a's state save | 18-34 | 38-73 |
 | 3a. Mode-switch mechanism (segment model and IRET/SYSRETL 6-10; register save 3-5; rest and tests 9-15) | 18-30 | 56-103 |
 | 3b. Shim instructions with 32-bit semantics | 11-20 | 67-123 |
 | Checkpoint A: bugs from real programs (static, dynamic, threads, signals, x87) | 10-25 | **77-148** |
@@ -452,7 +453,8 @@ waiting for the VM test queue comes on top. "Bugs" rows are the least certain: t
 | Part 2 (not pinned) | 60-90, probably optimistic | |
 
 The roadmap's 4-8 engineer-weeks (about 30-60 agent hours) covered flat segments only, before the far-transfer path,
-the decoder and the cast fix were added. After task 2, replace these figures with ones measured on tasks 0-2.
+the decoder and the cast fix were added. After task 2, replace these figures with ones measured on tasks 0-2 (task 2's
+is in its row; tasks D, 0 and 1 are reported by their own sessions).
 
 # Part 2: boot-time 16-bit and 32-bit code (not pinned)
 
