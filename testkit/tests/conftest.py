@@ -28,6 +28,8 @@ def _isolated_raw_root(monkeypatch, tmp_path_factory):
     # Nor wait for the machine's real VMs: a private pool's exclusive window would never open while other runs boot VMs
     # (seen: test_two_runs_share_machine hung for 15 minutes in four checkouts at once).
     monkeypatch.setenv('TESTKIT_IGNORE_OUTSIDE_VMS', '1')
+    # Nor measure the efficiency cores' slowdown for every private state folder (testkit.sched.speed; test_speed.py unsets it)
+    monkeypatch.setenv('NATEMU_TEST_E_SLOWDOWN', '3')
 
 
 @pytest.fixture(autouse=True)

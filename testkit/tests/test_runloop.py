@@ -255,3 +255,18 @@ def test_kill_waits_longer_than_a_campaign_stop(tmp_path):
     class U: proc, ended = p, None
     runloop.Controller.kill(None, U())
     assert mark.exists()
+
+
+def test_a_unit_on_an_efficiency_core_records_performance_core_durations(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from testkit import durations, runloop
+    from testkit.sched.policy import Config
+    got = []
+    monkeypatch.setattr(durations, 'record_many', lambda d: got.append(d))
+    (tmp_path / '0.jsonl').write_text('\n'.join(json.dumps({'kind': 'report', 'data': {'nodeid': n, 'duration': t}})
+                                                for n, t in (('a', 30.0), ('a', 6.0), ('b', 9.0), ('other', 1.0))))
+    ctl = NS(dir=tmp_path, pool=NS(cfg=Config(p_cores=8, e_cores=4, e_slowdown=3.0)))
+    for cls, want in (('E', {'a': 12.0, 'b': 3.0}), ('P', {'a': 36.0, 'b': 9.0})):
+        u = NS(n=0, items=[NS(nodeid='a'), NS(nodeid='b')], grant=NS(core_class=cls))
+        runloop.Controller.record_durations(ctl, u)
+        assert got.pop() == want

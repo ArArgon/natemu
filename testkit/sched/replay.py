@@ -32,19 +32,22 @@ def load(roots) -> list[dict]:
             if not us: continue
             runs.append({'id': pathlib.Path(f).parent.name, 'gate': '--gate' in args, 'units': [
                 {'ask': u['asked'], 'dur': max(0.1, u['ended'] - u['granted']),
-                 'cores': 1 if u['core_class'] == 'X' else u['cores'], 'excl': u['core_class'] == 'X'} for u in us]})
+                 'cores': 1 if u['core_class'] == 'X' else u['cores'], 'excl': u['core_class'] == 'X',
+                 'cls': u['core_class']} for u in us]})
     return runs
 
 
 def simulate(runs: list[dict], cfg: Config) -> dict:
     """run id -> {'turnaround', 'units', 'gate', 'waits'} under the scheduling rules, event by event."""
     reqs, unit = [], {}
+    slow = getattr(cfg, 'e_slowdown', 1.0)      # a unit recorded on an efficiency core took that many times as long
     for r in runs:
         for i, u in enumerate(r['units']):
+            dur = u['dur'] / slow if u.get('cls') == 'E' else u['dur']
             q = Request(id=f"{r['id']}#{i}", owner_pid=0, cores=u['cores'], exclusive=u['excl'],
-                        priority=policy.GATE if r['gate'] else policy.INTERACTIVE, asked=u['ask'], expected=u['dur'])
+                        priority=policy.GATE if r['gate'] else policy.INTERACTIVE, asked=u['ask'], expected=dur)
             if 'run' in Request.__dataclass_fields__: q.run = r['id']     # fair share (rule 7), where the rules have it
-            reqs.append(q); unit[q.id] = (r['id'], u['dur'])
+            reqs.append(q); unit[q.id] = (r['id'], dur)
     reqs.sort(key=lambda q: q.asked)
     st, pending, running, done = State(), list(reqs), {}, {}
     now = reqs[0].asked if reqs else 0.0
@@ -54,7 +57,7 @@ def simulate(runs: list[dict], cfg: Config) -> dict:
         st.window_open_since, st.last_window_closed = d.window_open_since, d.last_window_closed
         for q, cls in d.grants:
             st.waiting.remove(q)
-            g = Grant(q, now, cls); st.held.append(g); running[q.id] = (g, now + unit[q.id][1])
+            g = Grant(q, now, cls); st.held.append(g); running[q.id] = (g, now + unit[q.id][1] * (slow if cls == 'E' else 1.0))
             if hasattr(policy, 'granted'): policy.granted(st, q, now)
         if d.grants: continue
         nxt = min([e for _, e in running.values()] + ([pending[0].asked] if pending else []), default=None)
@@ -100,7 +103,7 @@ def main(argv=None) -> int:
     cfg = default_config()
     if a.cores:
         p, e = map(int, a.cores.split(',')); cfg = Config(p_cores=p, e_cores=e, window_budget=cfg.window_budget,
-                                                           min_shared=cfg.min_shared)
+                                                           min_shared=cfg.min_shared, e_slowdown=cfg.e_slowdown)
     runs = load(a.roots)
     if not runs: print('no recorded runs (timings.json) to replay'); return 2
     out = simulate(runs, cfg); delays(runs, cfg, out)

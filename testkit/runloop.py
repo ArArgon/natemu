@@ -112,7 +112,14 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
             own = [h.case_timeout(it.fam, it.suite, it.case) for it in chunk] if hasattr(h, 'case_timeout') else []
             timeout = max([float(x) for x in own if x] or [float(s.params.get('timeout', 3600))])
             units.append(Unit(len(units), chunk, req, env, timeout))
-    units.sort(key=lambda u: -(u.req.expected if u.req.expected is not None else 1e9))
+    # The queue grants in ask order (testkit.sched.policy rule 7), so the order is stamped after sorting: claims of a whole
+    # core class first, while the machine is still empty (later they wait for every core of it to free), then longest
+    # first. (Stamped at creation, the units were granted in collection order: the unit family, last alphabetically,
+    # started its longest units at the end of every gate.)
+    whole = lambda u: u.req.cores >= (pool.cfg.p_cores if u.req.perf else max(pool.cfg.p_cores, pool.cfg.e_cores))
+    units.sort(key=lambda u: (0 if whole(u) else 1, -(u.req.expected if u.req.expected is not None else 1e9)))
+    t0 = time.time()
+    for i, u in enumerate(units): u.req = dataclasses.replace(u.req, asked=t0 + i * 1e-6)
     return units, refused
 
 
@@ -325,7 +332,9 @@ class Controller:
             ev = json.loads(line)
             if ev['kind'] == 'report':
                 d = ev['data']; total[d['nodeid']] = total.get(d['nodeid'], 0) + d.get('duration', 0)
-        durations.record_many({k: v for k, v in total.items() if k in {i.nodeid for i in u.items}})
+        # performance-core seconds (testkit.sched.policy rule 5): a unit on an efficiency core ran e_slowdown times as long
+        scale = 1 / self.pool.cfg.e_slowdown if u.grant and u.grant.core_class == 'E' else 1.0
+        durations.record_many({k: v * scale for k, v in total.items() if k in {i.nodeid for i in u.items}})
 
     def kill(self, *us: Unit, why: str = 'run interrupted') -> None:
         """SIGTERM to each unit's worker group, then SIGKILL to the groups whose worker is still there after

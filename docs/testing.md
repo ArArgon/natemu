@@ -173,6 +173,12 @@ batch = 64
 machine instead, so its vCPU threads also run on efficiency cores (`smp` and `litmus`: two 4-vCPU VMs at once). Not on an
 M1, whose efficiency cores have no TSO: there such a case is not-runnable unless the Mac has that many performance cores.
 
+A unit without `perf` runs on an efficiency core when no performance core is free, but only if it ends sooner there than by
+waiting for one. How much slower efficiency cores are (about 3x on an M2 Max) is measured once per Mac and macOS version,
+in about 6 s at the first `natemu-test` start with nothing else running, and cached; `tools/natemu-test status` shows it.
+`NATEMU_TEST_E_SLOWDOWN` overrides the factor (1 turns this off). So a long unit is not started on a slow core near the
+end of a run, and recorded durations are kept in performance-core time.
+
 Each combination of matrix values is its own test, named like `i8-forms-000[afp=False,fp=fast]`. `engine.*` and
 `machine.*` keys are natemu settings; `host.<feature>` keys are requirements on the Mac (features are listed in
 `tests/features.toml`). A machine with a feature also runs the variants that need it absent by hiding it.
