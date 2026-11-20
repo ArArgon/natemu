@@ -11,7 +11,12 @@ case $build in /*) ;; *) build=$PWD/$build ;; esac   # git -C below would resolv
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 fex=$root/third_party/FEX
-pin=dba049bca8417a3b18cf5275d9362270a04a0625   # == third_party/FEX gitlink: ac479dd + fexc_ext_abandon (an over-long extended unit stops before the passes) and PoolBufferKeepClaimed; ac479dd is daa67e4 + the translated-code options (--ext-conds extended blocks, --push-run, --narrow-cmp; fexc_hook.h); daa67e4 is 6d2f5d8 + the SIMD DE screen's hoist hooks (FexcHoistPlan/FexcHoistEmit; the shim does the rest); 6d2f5d8 is 275de77 + FexcFmaCheck (AFP accurate chunk 4); 275de77 is 93350e2 + the NaN-sign-keeping negations; 93350e2 (720fe1c (807033d (791857f (726f3c0 (8254266 (7e8f5ed (13e80cf (1df70f0 + non-AFP MINSS/MAXSS signalling compare) + FexcFlush) + FexcSimdCheckDe/FexcX87CheckDe (AFP fallback 3b)) + non-AFP scalar direct write (MarkUpperZero)) + FexcKeep (unmasked UE tininess) + the FexcX87NanOp declaration (x87 NaN fix-up)) + FexcSimdDe (accurate masked SSE/AVX DE)) + FexcSimdSkip/FexcSimdSkipEnd (its screen)) + FexcSimdSkip without a result register) + NaN-sign-keeping negations without AFP (cached multipliers for the packed FMA addend negations, ADDSUB as fmul and fadd)
+pin=2c5835344cf9feb070e02ec92d2054a41fb5e43d   # == third_party/FEX gitlink: dba049b + the 32-bit string step (ESI/EDI/ECX in 32 bits, ES:EDI; M2 task 2); dba049b is ac479dd + fexc_ext_abandon (an over-long extended unit stops before the passes) and PoolBufferKeepClaimed; ac479dd is daa67e4 + the translated-code options (--ext-conds extended blocks, --push-run, --narrow-cmp; fexc_hook.h); daa67e4 is 6d2f5d8 + the SIMD DE screen's hoist hooks (FexcHoistPlan/FexcHoistEmit; the shim does the rest); 6d2f5d8 is 275de77 + FexcFmaCheck (AFP accurate chunk 4); 275de77 is 93350e2 + the NaN-sign-keeping negations; 93350e2 (720fe1c (807033d (791857f (726f3c0 (8254266 (7e8f5ed (13e80cf (1df70f0 + non-AFP MINSS/MAXSS signalling compare) + FexcFlush) + FexcSimdCheckDe/FexcX87CheckDe (AFP fallback 3b)) + non-AFP scalar direct write (MarkUpperZero)) + FexcKeep (unmasked UE tininess) + the FexcX87NanOp declaration (x87 NaN fix-up)) + FexcSimdDe (accurate masked SSE/AVX DE)) + FexcSimdSkip/FexcSimdSkipEnd (its screen)) + FexcSimdSkip without a result register) + NaN-sign-keeping negations without AFP (cached multipliers for the packed FMA addend negations, ADDSUB as fmul and fadd)
+# FEXC_PIN and FEXC_TOOLS (testkit's fexc_at): another revision's compiler, from its FEX pin and a copy of its tools/fexc;
+# the pin is then not this checkout's gitlink, and that copy's smoke check (which reads the checkout around it) is not run.
+other=${FEXC_PIN:+1}
+pin=${FEXC_PIN:-$pin}
+tools=${FEXC_TOOLS:-$here}
 externals="fmt xxhash unordered_dense"
 # A symlinked third_party/FEX (a git worktree sharing the main checkout's initialised submodule) is used as it is: git refuses to
 # update a submodule path that is a symlink. The pin check below still applies.
@@ -20,10 +25,10 @@ if [ ! -L "$root/third_party/FEX" ]; then
   for e in $externals; do git -C "$fex" submodule update --init --depth 1 External/$e; done
 fi
 # A shared checkout may sit on another branch: the pin only has to exist in it (the build is a detached worktree at the pin).
-{ [ -L "$root/third_party/FEX" ] || [ "$(git -C "$fex" rev-parse HEAD)" = "$pin" ]; } && git -C "$fex" cat-file -e "$pin^{commit}" ||
+{ [ -L "$root/third_party/FEX" ] || [ -n "$other" ] || [ "$(git -C "$fex" rev-parse HEAD)" = "$pin" ]; } && git -C "$fex" cat-file -e "$pin^{commit}" ||
   { echo "third_party/FEX is not at the pinned commit $pin" >&2; exit 1; }
 # The pin is the superproject's gitlink (a bump of one without the other would build a compiler the tree does not name).
-[ "$(git -C "$root" rev-parse HEAD:third_party/FEX)" = "$pin" ] || { echo "pin $pin is not the committed gitlink of third_party/FEX" >&2; exit 1; }
+[ -n "$other" ] || [ "$(git -C "$root" rev-parse HEAD:third_party/FEX)" = "$pin" ] || { echo "pin $pin is not the committed gitlink of third_party/FEX" >&2; exit 1; }
 git -C "$fex" worktree prune
 mkdir "$build"
 git -C "$fex" worktree add -q --detach "$build/src" "$pin"
@@ -31,8 +36,8 @@ for e in $externals; do
   mkdir -p "$build/src/External/$e"
   git -C "$fex/External/$e" archive "$(git -C "$fex" rev-parse "$pin:External/$e")" | tar x -C "$build/src/External/$e"   # as the pin records it
 done
-cmake -S "$here" -B "$build/obj" -G Ninja -DFEXC_SRC="$build/src" -DCMAKE_BUILD_TYPE=Release \
+cmake -S "$tools" -B "$build/obj" -G Ninja -DFEXC_SRC="$build/src" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build "$build/obj" --parallel 4
 "$build/obj/fexc_linktest" --init
-python3 "$here/smoke.py" "$build/obj/fexc" "$build/smoke"
+[ -n "$other" ] || python3 "$here/smoke.py" "$build/obj/fexc" "$build/smoke"

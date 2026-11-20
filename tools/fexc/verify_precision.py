@@ -2,6 +2,7 @@
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
 usage: verify_precision.py [--before FEXC0] [--shard I/N] [CORPUS.json ...]      (fexc from $FEXC, else the series20 build)
+       verify_precision.py --bits32                                               (32-bit code: see PROGRAMS32)
 
 --shard I/N checks every N-th program of each corpus from the I-th (0-based), so N cases can run the check in parallel
 (tests/static: fexc-precision-0..3); each program is checked on its own, so the N shards together check what one run does.
@@ -711,7 +712,7 @@ def entry_and_branches(d, dis, order):
         guest_state = acc and acc[2] == 'x28' and acc[1] == 1 and acc[3] is None and acc[5] == 'none' and \
             acc[4] in (GUEST_STATE_DF if acc[0] == 'store' else GUEST_STATE_FLAGS)
         guest_state = guest_state or (acc and acc[2] == 'x28' and acc[0] == 'load' and acc[3] is None and acc[5] == 'none' and
-                                      any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES))
+                                      any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES + (((976, 16),) if BITS else ())))   # M2: 32-bit code also loads es/cs/ss/ds_cached (frame::LEGACY_BASES)
         inside = lambda fields: acc and acc[3] is None and acc[5] == 'none' and any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in fields)
         guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or inside(AVX_HIGH) or (acc[0] == 'load' and inside((X87_FCW,)))))
         if acc and acc[2] in ('x28', 'sp') and not guest_state:
@@ -830,8 +831,11 @@ def cost(d, tmp):
     return (end - lits) // 4, end
 
 
+BITS = []          # ['--bitness', '32'] under --bits32
+
+
 def compile_(fexc, hexs, rip):
-    r = subprocess.run([fexc, '--profile', 'slice1', '--hex', hexs, '--rip', rip], capture_output=True, text=True, timeout=120)
+    r = subprocess.run([fexc, '--profile', 'slice1', '--hex', hexs, '--rip', rip, *BITS], capture_output=True, text=True, timeout=120)
     return json.loads(r.stdout)
 
 
@@ -906,6 +910,60 @@ GUARDED = {   # P8-P10: name -> (rip, asm, compare with the fixture rules); the 
 }
 
 
+# M2 (--bits32): 32-bit code. The single-instruction matrix's forms that are 32-bit encodings too (no REX, no 64-bit
+# operand), each memory form also under the six segment prefixes (32-bit code adds ES/CS/SS/DS bases as well), the 32-bit-
+# only INC/DEC r32 and moffs32 forms, and the programs below (assembled with `.code32`; flags annotated like ADVERSARIAL
+# where `True`). Only the checks made on the emitted code apply (P1-P5, P7a, P8-P13, P6 where annotated): check_sites'
+# expected accesses (P7b) model 64-bit instructions.
+PROGRAMS32 = {
+    'stack': (['push eax', 'push ebx', 'pop ecx', 'pop edx', 'push 7', 'push esp', 'pop esp', 'push dword ptr [esi]', 'pop dword ptr [ebx]',
+               'pushfd', 'leave'], False),
+    'frame': (['push ebp', 'mov ebp, esp', 'sub esp, 24', 'mov eax, dword ptr [ebp+8]', 'mov dword ptr [esp+4], eax', 'fld qword ptr [ebp+12]',
+               'fstp qword ptr [esp+8]', 'mov dword ptr [ebp-4], 5', 'add eax, dword ptr [ebp-4]', 'leave'], False),
+    'rmw-carry': (['sub eax, ecx', 'add dword ptr [ebx], ecx', 'adc edx, 0', 'inc eax', 'dec dword ptr [esi]', 'sbb dword ptr [ebx], eax'], True),
+    'address-forms': (['mov eax, dword ptr [ebx+ecx*8+0x10]', 'mov dword ptr [ebx+0x12345], eax', 'mov ecx, dword ptr [esi-8]',
+                       'mov word ptr [edi+eax*2], cx', 'mov byte ptr [ebx], al', 'add dword ptr [ebx+ecx*4], eax', 'mov eax, dword ptr [0xfffffffc]',
+                       'inc dword ptr [esi+0x7fffffff]', 'movzx eax, word ptr [esp+6]', 'mov dword ptr [ebp-0x10], eax', 'mov dword ptr [0x1000], eax'], False),
+    'segments': (['mov eax, dword ptr gs:[0x10]', 'mov eax, dword ptr gs:[0xfffffffc]', 'mov dword ptr fs:[esi+ecx*4+0xffc], eax',
+                  'add dword ptr es:[ebx], 1', 'mov ecx, dword ptr cs:[ebp-8]', 'mov eax, dword ptr ss:[ebx]', 'mov eax, dword ptr ds:[ebp+4]',
+                  'push dword ptr gs:[ebx]', 'xchg dword ptr es:[edi], edx', 'cmpxchg dword ptr gs:[ebx], ecx'], False),
+    'strings': (['movsd', 'stosb', 'lodsw', 'scasd', 'cmpsb'], False),
+    'rep-movs': (['rep movsd'], False), 'rep-stos': (['rep stosb'], False), 'repe-cmps': (['repe cmpsb'], False), 'repne-scas': (['repne scasb'], False),
+    'rep-movs-fs': (['rep movs dword ptr es:[edi], dword ptr fs:[esi]'], False),
+    'lock-forms': (['sub eax, ecx', 'lock add dword ptr [ebx], ecx', 'lock xadd dword ptr [edi], eax', 'lock cmpxchg dword ptr [ebx], edx',
+                    'lock inc word ptr [esi]', 'xchg dword ptr [esi], edx', 'lock cmpxchg8b qword ptr [ebx]', 'lock dec dword ptr [edi]'], True),
+    'division': (['sub eax, ecx', 'div dword ptr [ebx]', 'mov dword ptr [esi], edx', 'idiv ecx', 'div cl', 'idiv word ptr [esi]'], True),
+    'bcd': (['daa', 'das', 'aaa', 'aas', 'aad', 'salc', 'mov dword ptr [ebx], eax'], False),
+    'x87': (['fld dword ptr [eax]', 'fadd qword ptr [ebx]', 'fild dword ptr [esi]', 'fistp dword ptr [edi]', 'fild qword ptr [ecx]', 'fistp qword ptr [esp+0x38]',
+             'fnstcw word ptr [esp]', 'fstp qword ptr [ebx]'], False),
+    'sse': (['movaps xmm0, xmmword ptr [eax]', 'addps xmm1, xmmword ptr [ebx]', 'movdqu xmmword ptr [esi], xmm7', 'cvtsi2sd xmm2, dword ptr [edi]',
+             'movq qword ptr [esp], xmm3', 'pshufb xmm4, xmmword ptr [ecx]'], False),
+    'ret': (['add eax, ecx', 'ret'], False), 'ret-imm': (['ret 8'], False), 'call-reg': (['call eax'], False), 'call-esp': (['call esp'], False),
+    'call-mem': (['call dword ptr [eax+8]'], False), 'call-mem-gs': (['call dword ptr gs:[0x10]'], False), 'jmp-reg': (['jmp eax'], False),
+    'jmp-mem-index': (['jmp dword ptr [ebx+ecx*4]'], False), 'jcc': (['cmp eax, ecx', '.byte 0x75, 0x40'], False),
+    'call-rel': (['.byte 0xe8, 0x00, 0x00, 0x00, 0x00'], False),   # call +0: the i386 position-independent idiom (the pushed address)
+    'pic-thunk': (['mov ebx, dword ptr [esp]', 'ret'], False),
+}
+
+
+def corpora32():
+    import ref, gen_slice1
+    sized = re.compile(r'[a-z0-9]+?(8|16|32|64) ')
+    keep = {'push [rax]', 'pop [rax]', 'call [rax]', 'jmp [rax]', 'push rax', 'pop rax', 'push ax', 'pop ax', 'leave [rbp]', 'pushf [rsp]',
+            'prefetcht0 [rax]', 'prefetchnta [rax]'}
+    forms = {n: h for n, h in scan_skips.matrix().items()
+             if (sized.match(n).group(1) != '64' if sized.match(n) else n in keep or n.startswith('set'))}
+    forms.update({'inc eax': '40', 'dec edi': '4f', 'mov al,[moffs]': 'a001020304', 'mov [moffs],eax': 'a301020304', 'mov ax,[moffs]': '66a101020304'})
+    matrix = [{'name': n, 'code': h, 'rip': '0x8048000'} for n, h in forms.items()]
+    matrix += [{'name': f'{seg} {n}', 'code': pre + h, 'rip': '0x8048000'} for n, h in forms.items() if '[' in n
+               for seg, pre in (('es', '26'), ('cs', '2e'), ('ss', '36'), ('ds', '3e'), ('fs', '64'), ('gs', '65'))]
+    progs = []
+    for name, (asm, annotated) in PROGRAMS32.items():   # (a REP ends its block: each is a program of its own)
+        progs.append({'name': name, 'code': ref.assemble('.code32\n' + '\n'.join(asm)).hex(), 'rip': '0xfffff000' if name == 'call-rel' else '0x8048000'}
+                     | ({'insns': [gen_slice1.annotate(a) for a in asm]} if annotated else {}))
+    return [('matrix32', matrix), ('programs32', progs)]
+
+
 def adversarial():
     import ref, gen_slice1
     progs = []
@@ -973,6 +1031,14 @@ def main():
         if not 0 <= i < n: sys.exit(f'--shard {i}/{n}: I must be in 0..N-1')
         SHARD = (i, n)
     scan_skips.FEXC = FEXC
+    if '--bits32' in args:
+        BITS[:] = ['--bitness', '32']
+        bad = 0
+        with tempfile.TemporaryDirectory() as t:
+            for label, progs in corpora32():
+                bad += run_corpus(label, progs, Path(t))
+        print('PASS' if not bad else f'FAIL: {bad} programs with violations')
+        return 1 if bad else 0
     fixtures = check_sites.fixture_programs()
     matrix = [{'name': n, 'code': h, 'rip': '0x102000'} for n, h in scan_skips.matrix().items()]
     # I7: every memory form of the matrix again with an FS and a GS override (implicit-stack forms are cut: no operand).

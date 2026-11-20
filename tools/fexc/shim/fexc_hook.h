@@ -107,6 +107,8 @@ inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue su
 // global constant, which would also force one instruction per block).
 // ---------------------------------------------------------------------------------------------
 inline bool fexc_slice1 = false;
+// M2: the request is for 32-bit code (--bitness 32; its own FEX context). Not a FexcArg: the host's code identity holds the mode.
+inline bool fexc_bits32 = false;
 // Extended blocks (--ext-conds N): after a conditional branch (jcc, loop, jrcxz) the decoder goes on with the
 // fall-through instructions in the same unit while the unit has fewer than N conditional branches and the fall-through
 // starts in the unit's first page; the taken edge stays an ordinary exit. 0: off (FEX's single basic block).
