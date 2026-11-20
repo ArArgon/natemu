@@ -722,10 +722,18 @@ fn admit_records(
         sti_first: sti.first() == Some(&rip),
         ..admitted
     };
+    // Experiment (extended blocks, fexc --ext-conds): the direct target of a branch inside the block (a conditional branch
+    // whose fall-through the unit goes on with) is proven like the last instruction's. A plain block has none.
+    let inner = starts.iter().enumerate().filter_map(|(i, &g)| {
+        // (the last instruction too: a unit whose last branch's fall-through is a cut ends `system_instruction`)
+        let next = starts.get(i + 1).copied().unwrap_or(h.guest_bytes);
+        branch_target(&source[g as usize..next as usize], rip.wrapping_add(u64::from(next)))
+    });
     let targets = [Some(end), target, own]
         .into_iter()
         .flatten()
         .chain(sti)
+        .chain(inner)
         .collect();
     Ok((
         admitted,
@@ -796,7 +804,11 @@ fn fma_site_ok(s: &Site) -> bool {
 fn is_stub(s: &Site) -> bool {
     matches!(
         s.kind,
-        object::kind::GUARD | object::kind::SPLIT | object::kind::DIVIDE | object::kind::ALIGN
+        object::kind::GUARD
+            | object::kind::SPLIT
+            | object::kind::DIVIDE
+            | object::kind::ALIGN
+            | object::kind::STACK
     ) || addressless(s)
 }
 /// A stub with no access and no address: divide (#DE), (I5c) the floating-point exception checks and the denormal-result check.
@@ -818,6 +830,7 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
         object::kind::X87 => 7,
         object::kind::PENDING => 8,
         object::kind::DENORM => 9,
+        object::kind::STACK => 10,
         _ => 3,
     };
     0xd420_0000 | imm << 5
@@ -891,7 +904,13 @@ fn stub_matches(s: &Site, access: Option<&Site>) -> bool {
             let align_ok = s.kind == ALIGN
                 && ((matches!(a.kind, LOAD | STORE) && a.data_class == object::CLASS_FPR)
                     || matches!(a.kind, LOAD_PAIR | STORE_PAIR));
-            address_only && same && (split_ok || align_ok)
+            // Experiment (fexc --push-run): a stack alignment stub covers a store or push of 2, 4 or 8 bytes; its address is
+            // the checked register (the resident steps the instruction, it completes nothing from the record).
+            let stack_ok = s.kind == STACK
+                && matches!(a.kind, PUSH | STORE)
+                && matches!(a.width, 2 | 4 | 8)
+                && s.imm == 0;
+            address_only && same && (split_ok || align_ok || stack_ok)
         }
     }
 }

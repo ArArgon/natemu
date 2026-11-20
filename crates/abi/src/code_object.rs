@@ -37,6 +37,10 @@ pub const NO_REG: u8 = 0xff;
 /// operand must be 16-byte aligned: reached when `base_reg + imm` is not (#GP(0); access site in `guest_offset2`). A
 /// `LOAD`/`STORE` site of [`CLASS_FPR`] (I5a) transfers the low `width` bytes of vector register `data_reg[0]`.
 pub mod kind {
+    /// A check stub's site (its native offset is the stub's first word): the kinds admission takes as stubs.
+    pub const fn is_stub_kind(k: u8) -> bool {
+        matches!(k, GUARD | SPLIT | DIVIDE | ALIGN | SIMD | X87 | PENDING | DENORM | STACK)
+    }
     pub const LOAD: u8 = 0;
     pub const STORE: u8 = 1;
     pub const LOAD_PAIR: u8 = 2;
@@ -71,6 +75,11 @@ pub mod kind {
     /// results of earlier FP ops in the block. The resident's FP trap handler sets the byte when it writes a result that may be a denormal;
     /// at the stub it clears the byte and exits to the dispatcher at the stub's instruction, the state before it, as at any site.
     pub const DENORM: u8 = 19;
+    /// Experiment (fexc `FEXC_PUSH_RUN`): an 8-byte push's stack-pointer alignment check (`brk #10`), `and x0, xS, #7; cbnz x0`
+    /// before the first push of a run, recorded like a split stub of that push (address `base_reg` = S, `imm` 0). While S stays
+    /// 8-byte aligned no push of the run can cross a page, so the run's pushes carry no split check. At the stub (S not aligned)
+    /// the state is the state before the push: the resident steps the push alone (its one-instruction block has the split check).
+    pub const STACK: u8 = 20;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

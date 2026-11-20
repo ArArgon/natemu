@@ -676,6 +676,8 @@ struct Verifier<'a> {
     dispatch: Option<u32>,
     /// Perf chunk 26: the bulk REP STOS loops, as the native range of each one's words ([`Verifier::bulk_loop`]).
     bulk: Vec<Range<u32>>,
+    /// Experiment (fexc --push-run): [`Verifier::aligned`], computed with the code shape (after `stub_checks`).
+    aligned_before: Vec<u32>,
 }
 
 /// Verifies the code (object validation, and the code-shape check when `c.shape`); returns its link points, its computed
@@ -686,6 +688,7 @@ pub(super) fn check(c: &Code) -> Result<(Vec<LinkPoint>, Option<u32>, bool), Str
     v.exits()?;
     if c.shape {
         v.stub_checks()?;
+        v.aligned_before = v.aligned();
         v.sites()?;
         v.branch_target()?;
         v.divisions()?;
@@ -772,6 +775,7 @@ impl<'a> Verifier<'a> {
             links: Vec::new(),
             dispatch,
             bulk: Vec::new(),
+            aligned_before: Vec::new(),
         };
         for (at, t) in back {
             let words = v.bulk_loop(at, t).ok_or(format!(
@@ -1639,6 +1643,22 @@ impl<'a> Verifier<'a> {
             }
             // Split check on every store wider than a byte (perf chunk 26: but a bulk REP STOS loop's, inside its page).
             let bulk = self.bulk.iter().any(|r| r.contains(&at));
+            // Experiment (fexc --push-run): a store of 2, 4 or 8 bytes at base + k*width, its base known 8-byte aligned
+            // ([`Verifier::aligned`]), is naturally aligned and stays inside its page: it may have instead of the split check
+            // its own stack alignment check, or none.
+            let natural = store
+                && (2..=8).contains(&size)
+                && !bulk
+                && splits.is_empty()
+                && addr.index.is_none()
+                && addr.imm % i64::from(size) == 0
+                && matches!(self.insn(at), Some(Insn::Mem(m)) if m.form != Form::Pair);
+            if natural {
+                if let Err(e) = self.stack_aligned(at, lo, addr.base) {
+                    return fail(&e);
+                }
+                continue;
+            }
             match (store && size > 1 && !bulk, &splits[..]) {
                 (false, []) => {}
                 (true, &[x]) => {
@@ -1672,6 +1692,127 @@ impl<'a> Verifier<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The `and x0, xB, #7` word of stub `i`'s stack alignment check `and x0, xB, #7; cbnz x0, K` (K that `STACK` stub, B its
+    /// base register), if it has exactly that form.
+    fn stack_check(&self, i: usize) -> Option<u32> {
+        let (st, c) = (self.c.stubs[i], self.checks.get(i)?);
+        let and = c.start.checked_sub(4)?;
+        (st.kind == object::kind::STACK
+            && st.imm == 0
+            && c.cond == Some(CBNZ_X)
+            && c.start == c.end
+            && self.word(and) == 0x9240_0800 | u32::from(st.base_reg) << 5)
+            .then_some(and)
+    }
+    /// Experiment (fexc --push-run): per word, the registers known 8-byte aligned before it (bit 31 and x0/x1 never). A forward
+    /// dataflow from the entry (nothing aligned): a stack alignment check's fall-through adds its register; a load/store
+    /// writeback of a multiple of 8 keeps its base; `add|sub{s} xD, xN, #imm` (64-bit) of a multiple of 8 and `mov xD, xN` (orr
+    /// with xzr) set D from an aligned N; every other write clears its registers ([`Insn::writes`]), an `svc` all. A branch
+    /// target meets the intersection of its sources; a bulk REP STOS loop's back edge clears what the loop writes.
+    fn aligned(&self) -> Vec<u32> {
+        let n = self.c.code.len() / 4;
+        let mut before = vec![0u32; n];
+        let mut pending: Vec<Option<u32>> = vec![None; n + 1];
+        let checks: Vec<(u32, u8)> = (0..self.c.stubs.len())
+            .filter(|&i| self.stack_check(i).is_some())
+            .map(|i| (self.checks[i].end, self.c.stubs[i].base_reg))
+            .collect();
+        let (mut m, mut dead) = (0u32, false);
+        for i in ENTRY_OFFSET as usize / 4..n {
+            let at = i as u32 * 4;
+            m = match (pending[i], dead) {
+                (Some(p), true) => p,
+                (Some(p), false) => m & p,
+                (None, true) => 0,
+                (None, false) => m,
+            };
+            dead = false;
+            before[i] = m;
+            let w = self.word(at);
+            let Some(insn) = self.insn(at) else {
+                m = 0;
+                continue;
+            };
+            let bit = |r: u32| if r < 31 { 1u32 << r } else { 0 };
+            let mut next = m & !insn.writes();
+            match insn {
+                Insn::Mem(x) if matches!(x.form, Form::Pre | Form::Post) => {
+                    if m & bit(u32::from(x.addr.base)) != 0
+                        && x.delta % 8 == 0
+                        && !(x.load && !x.vector && (x.rt == x.addr.base || x.rt2 == Some(x.addr.base)))
+                    {
+                        next |= bit(u32::from(x.addr.base));
+                    }
+                }
+                Insn::Data(Some(d)) => {
+                    let (rn, rm) = (w >> 5 & 31, w >> 16 & 31);
+                    let imm = (w >> 10 & 0xfff) << (12 * (w >> 22 & 1));
+                    if (w & 0x9f80_0000 == 0x9100_0000 && m & bit(rn) != 0 && imm % 8 == 0)
+                        || (w & 0xffe0_ffe0 == 0xaa00_03e0 && m & bit(rm) != 0)
+                    {
+                        next |= bit(u32::from(d));
+                    }
+                }
+                Insn::Svc(_) => next = 0,
+                _ => {}
+            }
+            for &(end, r) in &checks {
+                if end == at {
+                    next |= bit(u32::from(r));
+                }
+            }
+            match insn {
+                Insn::B(t) | Insn::Cond(t) => {
+                    if let Ok(t) = u32::try_from(t) {
+                        if t > at && ((t / 4) as usize) < n {
+                            let p = &mut pending[(t / 4) as usize];
+                            *p = Some(p.map_or(m, |p| p & m));
+                        } else if t <= at {
+                            let loop_writes = (t..at).step_by(4).fold(0, |a, o| a | self.insn(o).map_or(!0, |x| x.writes()));
+                            next &= !loop_writes;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            dead = !insn.falls_through() || matches!(insn, Insn::B(_));
+            m = next & !3 & !(1 << 31);
+        }
+        before
+    }
+    /// Experiment (fexc --push-run): the naturally aligned store at `at` on base B has its stack alignment check
+    /// `and x0, xB, #7; cbnz x0, K` (K its `STACK` stub) with only x0/x1 written between it and the store and no branch entering;
+    /// or none, and B is known aligned there ([`Verifier::aligned`]). So the store stays inside one page.
+    fn stack_aligned(&mut self, at: u32, lo: u32, base: u8) -> Result<(), String> {
+        match self.linked(at, object::kind::STACK)[..] {
+            [i] => {
+                let end = self.checks[i].end;
+                let ok = self.stack_check(i).filter(|&and| {
+                    and >= lo
+                        && end < at
+                        && self.c.stubs[i].base_reg == base
+                        && self.sealed(and, end, at)
+                        && (end + 4..at)
+                            .step_by(4)
+                            .all(|o| matches!(self.insn(o), Some(Insn::Data(d)) if d.is_none_or(|r| r < 2)))
+                });
+                if ok.is_none() {
+                    return Err("no stack alignment check `and x0, xB, #7; cbnz x0` on its base, then only x0/x1 written".into());
+                }
+                self.claim(self.c.stubs[i].native_offset);
+                Ok(())
+            }
+            [] => {
+                if self.aligned_before[at as usize / 4] & 1 << base != 0 {
+                    Ok(())
+                } else {
+                    Err("store with neither a split check nor a stack alignment check covering its base".into())
+                }
+            }
+            _ => Err("several stack alignment stubs".into()),
+        }
     }
 
     /// Every exit: each `svc #LINK` ends a link point to a proven RIP; the dispatch branch follows `mov x0, xR`.
@@ -2961,6 +3102,27 @@ mod tests {
         // effect (a page-crossing store committed in part) stays in the guest.
         validated(ADDRESS, 0x24, 0x3760_0580, NOP, None);
         validated(ADDRESS, 0x1c, 0x9100_1c20, 0x9100_0c20, None);
+    }
+
+    /// Experiment FEXC_PUSH_RUN (fexc FEXC_PUSH_RUN=1): push r15; push r14; mov eax, esi; push r13; ret. One stack alignment check
+    /// `and x0, x8, #7` (0x4) `cbnz x0` (0x8) before the first push (0xc), no check on the pushes at 0x10 and 0x18; `mov w4, w10` at 0x14.
+    #[test]
+    fn push_run_alignment_checks_are_verified() {
+        const RUN: (&[u8], &[u8]) = fixture!("push-run");
+        admit(RUN).unwrap();
+        refused(RUN, 0x4, 0x9240_0900, NOP, "stack alignment check"); // the check's `and` removed
+        refused(RUN, 0x4, 0x9240_0900, 0x9240_0d00, "stack alignment check"); // and x0, x8, #15: not the alignment of an 8-byte push
+        refused(RUN, 0x14, 0x2a0a_03e4, 0xaa0a_03e8, "covering its base"); // mov x8, x10 between the second and third push
+        refused(RUN, 0x14, 0x2a0a_03e4, 0xd100_1108, "covering its base"); // sub x8, x8, #4: misaligns it
+        validated(RUN, 0x4, 0x9240_0900, NOP, None); // a producer bug, confined to the guest: object validation admits it
+        // push rbp; mov rbp, rsp; push rbx; sub rsp, 0x18; mov [rsp+8], rax; mov [rbp-16], rcx; mov dword [rsp+4], 7;
+        // mov [rsp+3], rax (split-checked); add rsp, 0x18; pop rbx; pop rbp; cmp al, 13; ret. `mov x9, x8` at 0x10 (RBP = RSP),
+        // `subs x26, x8, #0x18; mov x8, x26` at 0x1c (RSP - 24), unchecked stores at 0x24 [x8, #8], 0x28 [x9, #-16], 0x30 [x8, #4].
+        const FRAME: (&[u8], &[u8]) = fixture!("stack-frame");
+        admit(FRAME).unwrap();
+        refused(FRAME, 0x10, 0xaa08_03e9, 0xaa0a_03e9, "covering its base"); // mov x9, x10: RBP not known aligned
+        refused(FRAME, 0x1c, 0xf100_611a, 0xf100_511a, "covering its base"); // subs x26, x8, #0x14: RSP - 20
+        refused(FRAME, 0x8, 0xb500_0440, 0xb500_0480, "reached by"); // the cbnz no longer reaches the stub
     }
 
     #[test]

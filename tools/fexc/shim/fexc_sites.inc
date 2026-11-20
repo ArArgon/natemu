@@ -43,6 +43,45 @@ FexcAddr FexcDecodeAddr(uint32_t w) {
   }
   return a;
 }
+// FEXC_PUSH_RUN: the registers known 8-byte aligned after word `w` (a bit per register; x0/x1 and sp never), given `m` before it.
+// Kept: a load/store writeback of a multiple of 8 on an aligned base. Set: `add|sub{s} xD, xN, #imm{, lsl #12}` (64-bit) of a
+// multiple of 8 on an aligned xN, `mov xD, xN` of an aligned xN. Every other write clears its register, conservatively: a
+// non-memory word naming it as Rd (bits 0-4: every A64 general-register write but loads, branch with link and the exclusive and
+// atomic status registers names Rd there), a load/store naming it as Rt, Rt2 or Rs/Rm, a branch with link x30; `svc` clears all.
+// (Branches are the caller's: FexcAfterOp.)
+uint32_t FexcAlignedAfter(uint32_t w, uint32_t m) {
+  const auto bit = [](uint32_t r) { return r < 31 ? 1u << r : 0u; };
+  if ((w & 0xffe0001fu) == 0xd4000001u) return 0;
+  if ((w & 0xfc000000u) == 0x94000000u || (w & 0xfffffc1fu) == 0xd63f0000u) return m & ~bit(30);
+  const uint32_t rd = w & 31, rn = (w >> 5) & 31;
+  if (FexcIsMemWord(w)) {
+    const FexcAddr A = FexcDecodeAddr(w);
+    if (A.wb && !((m >> rn & 1) && A.delta % 8 == 0)) m &= ~bit(rn);   // (delta: the amount's low 8 bits, the same residue mod 8)
+    m &= ~bit(rd);
+    if (((w >> 27) & 7) == 5) m &= ~bit((w >> 10) & 31);
+    if (!A.imm_form) m &= ~bit((w >> 16) & 31);
+    return m & ~3u;
+  }
+  bool set = false;
+  if ((w & 0x9f800000u) == 0x91000000u) {   // add/adds/sub/subs xD, xN, #imm{, lsl #12}
+    const uint32_t imm = ((w >> 10) & 0xfff) << (12 * ((w >> 22) & 1));
+    set = (m >> rn & 1) && imm % 8 == 0;
+  } else if ((w & 0xffe0ffe0u) == 0xaa0003e0u) {   // mov xD, xM (orr xD, xzr, xM)
+    set = m >> ((w >> 16) & 31) & 1;
+  }
+  m &= ~bit(rd);
+  if (set) m |= bit(rd);
+  return m & ~3u;
+}
+// The target of a direct branch word at `at` (b, bl, b.cond, cbz/cbnz, tbz/tbnz), or -1.
+int64_t FexcBranchTarget(uint32_t w, uint32_t at) {
+  const auto sext = [](uint32_t v, int bits) { return int64_t(int32_t(v << (32 - bits)) >> (32 - bits)); };
+  if ((w & 0x7c000000u) == 0x14000000u) return at + 4 * sext(w & 0x3ffffff, 26);
+  if ((w & 0xff000010u) == 0x54000000u) return at + 4 * sext((w >> 5) & 0x7ffff, 19);
+  if ((w & 0x7e000000u) == 0x34000000u) return at + 4 * sext((w >> 5) & 0x7ffff, 19);
+  if ((w & 0x7e000000u) == 0x36000000u) return at + 4 * sext((w >> 5) & 0x3fff, 14);
+  return -1;
+}
 bool FexcIsNzcvWriter(std::string_view n) {
   // IR ops that write PSTATE NZCV by contract (IR.json). Ops that clobber it only inside their expansion
   // (e.g. a Select with an inline compare) are not listed; the precision verifier (S1b) must cover those.
@@ -840,6 +879,36 @@ void Arm64JITCore::FexcAfterOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32
   }
   FexcRecordOp(IROp, Node, Begin);
   if (fexc_slice1) FexcCheckTarget(Node);
+  // FEXC_PUSH_RUN: the aligned registers through the op's words (FexcAlignedAfter). A forward branch inside the op meets its
+  // target with the intersection; one beyond the op leaves for an exit, a stub or a later IR block (whose start clears the set);
+  // a backward branch (a bulk REP STOS loop) clears every register its loop names.
+  if (FexcAlignedMask) {
+    const uint32_t End = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
+    std::map<uint32_t, uint32_t> At;
+    uint32_t m = FexcAlignedMask;
+    bool Dead = false;
+    for (uint32_t off = Begin; off < End; off += 4) {
+      if (const auto it = At.find(off); it != At.end()) m = Dead ? it->second : m & it->second;
+      else if (Dead) m = 0;
+      Dead = false;
+      uint32_t w;
+      std::memcpy(&w, CodeData.BlockBegin + off, 4);
+      const int64_t T = FexcBranchTarget(w, off);
+      if (T >= 0 && (w & 0xfc000000u) != 0x94000000u) {
+        if (T > off && T < End) { auto [it, fresh] = At.try_emplace(uint32_t(T), m); if (!fresh) it->second &= m; }
+        for (int64_t o = T; o >= Begin && o < off; o += 4) {
+          uint32_t x;
+          std::memcpy(&x, CodeData.BlockBegin + o, 4);
+          m &= ~((1u << (x & 31)) | (1u << ((x >> 5) & 31)) | (1u << ((x >> 10) & 31)) | (1u << ((x >> 16) & 31)));
+        }
+        if (T < Begin) m = 0;
+        Dead = (w & 0xfc000000u) == 0x14000000u;
+        continue;
+      }
+      m = FexcAlignedAfter(w, m);
+    }
+    FexcAlignedMask = Dead ? 0 : m;
+  }
 }
 
 void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint32_t Begin) {
@@ -1064,7 +1133,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -1083,7 +1152,7 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
   S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
-            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : "guard";
+            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : "guard";
   const size_t Index = fexc_sites.size();
   fexc_sites.push_back(S);
   if (Link) FexcPendingLink.push_back(Index);
@@ -1222,6 +1291,23 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     if (Split && ((A ^ (A + W - 1)) & 0x1000)) b_OrRestart(Stub(Base, Imm));
     return;
   }
+  // --push-run: a store of 2, 4 or 8 bytes (push, call's push, `mov [rsp + k], r`, a spill or argument save) at base + k*width, its
+  // base 8-byte aligned, is naturally aligned and stays inside its page: no split check. The base is known aligned after
+  // `and x0, xB, #7; cbnz x0, stub` (emitted here for the guest RSP only, whose alignment the ABIs keep) and through words that keep
+  // it so (FexcAlignedAfter: pushes, pops, `add/sub rsp, 8n`, `mov rbp, rsp`). At the stub (B not aligned) the state is the state
+  // before the instruction, as at a split stub; the resident steps it alone, in a max-insts 1 unit, which has the split check as
+  // before (fexc_step_unit); so each store of a misaligned run faults at its own instruction with the earlier ones done.
+  if (fexc_push_run && !fexc_step_unit && Split && !Index && !Pair && !Align && W <= 8 && Imm % int64_t(W) == 0) {
+    const uint32_t R = Base.Idx();
+    if (R > 1 && R < 31 && (FexcAlignedMask >> R & 1)) return;
+    if (StaticRegisters.size() > 4 && Base == StaticRegisters[4]) {   // the guest RSP
+      auto* L = Stub(Base, 0, FEXC_SITE_STACK);
+      and_(ARMEmitter::Size::i64Bit, TMP1, Base, 7);
+      cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, L);
+      FexcAlignedMask |= 1u << R;
+      return;
+    }
+  }
   ARMEmitter::Register A = Base;
   if (Index) {
     const auto Ext = Type == IR::MemOffsetType::UXTW ? ARMEmitter::ExtendedType::UXTW :
@@ -1255,7 +1341,7 @@ void Arm64JITCore::FexcEmitStubs() {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     const uint8_t K = fexc_sites[Index].kind;
-    brk(K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
+    brk(K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
         K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : K == FEXC_SITE_DENORM ? FexcBrkDenorm : FexcBrkGuard);
   }
 }

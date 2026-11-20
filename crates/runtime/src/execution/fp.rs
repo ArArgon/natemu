@@ -90,7 +90,7 @@ pub(super) unsafe fn trap(f: *mut NativeFrame, esr: u64, elr: u64, spsr: u64) ->
         let Some(b) = cache::block_at(elr) else {
             stop_at(0, elr, stop::FP_TRAP)
         };
-        let at = elr - b.code_va();
+        let at = cache::native_offset(b, elr);
         let s = &*record();
         // The FMA NaN check: a site of kind FMA at this very word (the compare itself is skipped, no flag is added).
         let sites = cache::sites(b);

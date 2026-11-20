@@ -344,7 +344,7 @@ fn prepare_at_alias(
         }
         private_space(&memory, base, &spans, true);
         // The guest-state page's EL0 alias (x28 of generated code), backed by the frame page (G1).
-        guest_state_alias(&memory, base, base + exec::FRAME_OFFSET, va);
+        guest_state_alias(&memory, base, base + exec::FRAME_OFFSET, va, Some(base + cache::LOOKUP_OFFSET + cache::PCID_STUDY), Some(base + cache::LOOKUP_OFFSET + cache::DL1));
         // SAFETY: Control is plain integers; the resident owns everything but the capacity.
         let mut control: cache::Control = unsafe { std::mem::zeroed() };
         control.code_bytes = (cache::HEAD_BYTES + code_bytes) as u64;
@@ -658,18 +658,72 @@ pub fn k1_stats(area: Area) -> K1 {
             );
         }
     }
+    // Hot/cold experiment (NATEMU_CHECK_LINKS set): the cache self-check after the run, trampolines included, on stderr.
+    if std::env::var_os("NATEMU_CHECK_LINKS").is_some() {
+        match check_links(area) {
+            Ok((points, linked)) => eprintln!("natemu: vCPU {} check_links ok: {points} link points, {linked} linked", area.vcpu),
+            Err(e) => eprintln!("natemu: vCPU {} check_links FAILED: {e}", area.vcpu),
+        }
+    }
     let mut k = K1::new(&control);
     let perf: exec::perf::Perf = area.read_record(exec::perf::OFFSET);
     if perf.magic == exec::perf::MAGIC {
         k.dispatch_misses = perf.count[exec::perf::MISS as usize];
     }
     k.pic_transitions = pic_transitions(area);
+    // Translated-code profile (`profile` residents): the counters and the 80 blocks hit most, each with its guest bytes and,
+    // when its code is still where its last sample found it, its native code.
+    {
+        use cache::profile as pr;
+        let at = cache::LOOKUP_OFFSET + cache::PCID_STUDY;
+        let counters: [u64; pr::COUNTERS] = area.read_record(at);
+        if counters[pr::TOTAL] != 0 && control.pcid_study.iter().all(|&v| v == 0) {
+            let mut hot: Vec<pr::Hot> = (0..pr::HOT_ENTRIES)
+                .map(|i| area.read_record::<pr::Hot>(at + 4096 + i * size_of::<pr::Hot>()))
+                .filter(|e| e.key != 0)
+                .collect();
+            hot.sort_by_key(|e| std::cmp::Reverse(e.count));
+            let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            let cumulative = [10usize, 100, 1000, 10000]
+                .map(|n| hot.iter().take(n).map(|e| u64::from(e.count)).sum::<u64>());
+            let top = hot
+                .iter()
+                .take(80)
+                .map(|e| {
+                    let native = if u64::from(e.flushes) == control.flushes {
+                        (0..(e.code_size as usize).min(4096) / 4)
+                            .map(|k| hex(&area.read::<4>(cache::CODE_OFFSET + e.code as usize + 4 * k)))
+                            .collect::<String>()
+                    } else {
+                        String::new()
+                    };
+                    serde_json::json!({"rip": e.rip, "user": e.key >> 63, "count": e.count, "guest_bytes": e.guest_bytes,
+                        "code_size": e.code_size, "guest": hex(&e.bytes[..(e.guest_bytes as usize).min(24)]), "native": native})
+                })
+                .collect::<Vec<_>>();
+            k.profile = Some(serde_json::json!({"counters": counters.to_vec(), "blocks": hot.len(), "cumulative": cumulative, "top": top}));
+        }
+    }
+    // Code-size study: the live translations with code of their own at the end (blocks, guest bytes, native bytes; hot/cold
+    // experiment: bytes entered, a split block's hot copy or the whole code, and blocks split).
+    for b in placed_blocks(area) {
+        if b.flags & (cache::INSTANCE | cache::SYSTEM | cache::STEP | cache::DEAD) == 0 && b.code_size != 0 {
+            k.code_size[0] += 1;
+            k.code_size[1] += u64::from(b.guest_bytes);
+            k.code_size[2] += u64::from(b.code_size);
+            k.code_size[3] += u64::from(if b.hot_size != 0 { b.hot_size } else { b.code_size });
+            k.code_size[4] += u64::from(b.hot_size != 0);
+        }
+    }
     k
 }
 /// PIC study: a `pic-count` resident's linked transitions by class (same page, cross-page, position-independent into
 /// absolute, absolute into position-independent), counted in four guest-state fields no generated code uses (the
 /// resident's `cache::stub`), then its computed exits (32 bits, wrapping: FEX's flag bytes 28-31, `cache::computed`); zero
 /// from other residents.
+fn pcid_study_empty(c: &[u64; natemu_abi::execution::cache::pcid_study::COUNT]) -> bool {
+    c.iter().all(|&v| v == 0)
+}
 fn pic_transitions(area: Area) -> [u64; 5] {
     let mut t = [0x0, 0x8, 0x10, 0xb0, 0]
         .map(|at| u64::from_le_bytes(area.read::<8>(exec::FRAME_OFFSET + at)));
@@ -721,6 +775,14 @@ pub struct K1 {
     /// Page-currency chunk 0 (`page-study` resident builds only: absent when every counter is zero).
     #[serde(skip_serializing_if = "K1PageStudy::is_empty")]
     page_study: K1PageStudy,
+    /// Code-size study: live translations with their own code at the vCPU's end: count, guest bytes, native bytes.
+    code_size: [u64; 5],
+    /// Translated-code profile (`profile` resident builds only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<serde_json::Value>,
+    /// PCID gain study (`natemu_abi::execution::cache::pcid_study`; `pcid-study` resident builds only).
+    #[serde(skip_serializing_if = "pcid_study_empty")]
+    pcid_study: [u64; natemu_abi::execution::cache::pcid_study::COUNT],
     /// Page-currency plan chunk 1 (the page record, `Control::pages`) and the fast miss path (fast-miss plan): absent while every
     /// counter is zero.
     #[serde(skip_serializing_if = "K1Page::is_empty")]
@@ -978,6 +1040,9 @@ impl K1 {
             pic: c.pic_counts,
             pic_transitions: [0; 5],
             page_study: K1PageStudy::new(&c.page_study),
+            pcid_study: c.pcid_study,
+            code_size: [0; 5],
+            profile: None,
             page: K1Page {
                 mode: c.pages,
                 walks: c.page_walks,
@@ -1176,6 +1241,11 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         _ => u32::from_le_bytes(area.read::<4>(cache::CODE_OFFSET + offset as usize)),
     };
     let blocks = placed_blocks(area);
+    // Each block's entry (the first in placement order, as a scan would find it).
+    let mut entries = HashMap::new();
+    for (i, t) in blocks.iter().enumerate().filter(|(_, t)| t.flags & (cache::SYSTEM | cache::INSTANCE) == 0) {
+        entries.entry(t.entry() - cache::CODE_VA).or_insert(i);
+    }
     let mut linked = HashMap::new();
     let mut points = 0;
     // PIC study stage 3: an instance's link points are its translation's (which holds the words); the dispatcher slots.
@@ -1185,9 +1255,22 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
         .iter()
         .filter(|b| b.flags & (cache::INSTANCE | cache::SYSTEM) == 0)
     {
+        // Hot/cold experiment: a split block's links patch its trampolines (below, as link points); its computed exit's
+        // trampoline is `b` where the exit's `b` goes, and its exit words in its code stay as admitted (armed: by their words
+        // before the stop).
+        for (from, at) in b.trampolines() {
+            let point = b.links.iter().find(|p| p.offset != 0 && u64::from(b.code) + u64::from(p.offset) == from);
+            let ok = match point {
+                Some(p) => word(from) == p.word,
+                None => word(at) == exec::trampoline_word(word(from), from, at),
+            };
+            if !ok {
+                return Err(format!("trampoline of the block at {:#x}: word {:#010x}, its exit word {:#010x}", b.rip, word(at), word(from)));
+            }
+        }
         for p in b.links.iter().filter(|p| p.offset != 0) {
             points += 1;
-            let at = u64::from(b.code) + u64::from(p.offset);
+            let at = b.link_at(p.offset);
             let w = word(at);
             let bad = || {
                 format!(
@@ -1195,11 +1278,13 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     p.offset, b.rip
                 )
             };
+            // (A trampoline linked to the block right after it: `nop`.)
             let branch = |at: u64, w: u32| {
                 (w & 0xfc00_0000 == 0x1400_0000)
                     .then(|| at.wrapping_add((((w << 6) as i32 >> 6) as i64 * 4) as u64))
+                    .or((b.hot_size != 0 && w == 0xd503_201f).then_some(at + 4))
             };
-            if w == p.word {
+            if w == b.admitted_at(p) {
                 // Its `svc` word: as admitted, or a checked link's `b`.
                 let svc = u64::from(b.code)
                     + natemu_abi::pic::svc_slot(|o| word(u64::from(b.code) + o), p);
@@ -1230,12 +1315,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                         !pic(t) && t.rip == p.target
                     }
             };
-            match branch(at, w).and_then(|to| {
-                blocks.iter().position(|t| {
-                    t.flags & (cache::SYSTEM | cache::INSTANCE) == 0
-                        && u64::from(t.code) + u64::from(exec::ENTRY_OFFSET) == to
-                })
-            }) {
+            match branch(at, w).and_then(|to| entries.get(&to).copied()) {
                 Some(t) if fits(&blocks[t]) => linked.insert((b.number, p.offset), t as u32),
                 _ => return Err(bad()),
             };
@@ -1275,7 +1355,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                     == if checked {
                         natemu_abi::pic::SVC_LINK
                     } else {
-                        p.word
+                        b.admitted_at(p)
                     }
             })
     });
@@ -1326,7 +1406,8 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
             // and a target that is not an instance (shared and instance links are checked or local: never suspended).
             let point = source.links.get(r.point()).filter(|p| p.offset != 0 && p.offset == r.offset());
             let admitted = point.is_some_and(|p| {
-                r.original == p.word
+                r.original == source.admitted_at(p)
+                    && word(source.link_at(p.offset)) == source.admitted_at(p)
                     && word(u64::from(source.code) + u64::from(p.offset)) == p.word
                     && word(u64::from(source.code) + natemu_abi::pic::svc_slot(|o| word(u64::from(source.code) + o), p))
                         == natemu_abi::pic::SVC_LINK
@@ -1345,7 +1426,7 @@ pub fn check_links(area: Area) -> Result<(u64, u64)> {
                 why = Some("a current target");
             } else if t.flags & cache::INBOUND == 0 {
                 why = Some("no INBOUND on the target");
-            } else if point.is_none() || r.original != point.map_or(0, |p| p.word) {
+            } else if point.is_none() || r.original != point.map_or(0, |p| source.admitted_at(p)) {
                 why = Some("no such link point, or another original word");
             } else if !paired {
                 why = Some("a source and target that `link` would not pair (RIP, context, shared or instance)");
@@ -2609,6 +2690,22 @@ impl Compiler {
             feature_args: admission::feature_overrides(supported)
                 .iter()
                 .flat_map(|f| b"--feature\0".iter().copied().chain(f.bytes()).chain([0]))
+                // Experiment (extended blocks): `NATEMU_EXT_CONDS=N` asks fexc for units of up to N conditional branches.
+                .chain(
+                    std::env::var("NATEMU_EXT_CONDS")
+                        .ok()
+                        .filter(|n| n.parse::<u8>().is_ok_and(|n| n > 1))
+                        .map(|n| format!("--ext-conds\0{n}\0").into_bytes())
+                        .unwrap_or_default(),
+                )
+                // Experiments: `NATEMU_FEXC_PUSH_RUN=1` / `NATEMU_FEXC_NARROW_CMP=1` ask fexc for `--push-run` / `--narrow-cmp`.
+                // They are request arguments, so part of every request body and so of the persistent cache's key.
+                .chain(
+                    [("NATEMU_FEXC_PUSH_RUN", &b"--push-run\0"[..]), ("NATEMU_FEXC_NARROW_CMP", b"--narrow-cmp\0")]
+                        .into_iter()
+                        .filter(|(v, _)| std::env::var(v).is_ok_and(|x| x == "1"))
+                        .flat_map(|(_, a)| a.iter().copied()),
+                )
                 .collect(),
             max_instructions,
             answers: Answers::new(supported),

@@ -18,6 +18,30 @@ dispatch-study = ["perf"]
 # answer compared with it, a miss recorded), with counters and walk timings (`Control::page_study`). Never part of `perf`: its
 # loads and timestamps would show in the gates (decision 16).
 page-study = ["perf"]
+# PCID gain study, measurement builds only (`src/study.rs`): models the TLB a PCID guest would keep across CR3 loads and counts
+# the shadow misses and block revalidations that were refills (`Control::pcid_study`).
+pcid-study = ["perf"]
+# Page-validity experiment, measurement builds only (`cache::page_valid`): a revalidation makes current the other blocks on
+# its page too (those last current in the same epoch; all of them with NATEMU_PAGE_VALID_ALL set at build time).
+page-valid = []
+# Jump-check experiment, measurement builds only (`cache::vt`): a dispatcher slot checks its target's code page in a
+# per-table validity table before probing L1, so a CR3 load clears that table and leaves L1 entries of one-page blocks.
+jump-check = []
+# Trap-cost study, measurement builds only: counts and times every code synchronization (`cache::synchronize_code`) in the
+# page-validity experiment's two counter slots.
+sync-time = []
+# Data-L1 experiment, measurement builds only: the dispatcher's tables are data the slots load from (`cache::dl1`), not
+# code, so filling or emptying an entry writes and synchronizes no code. Not with `jump-check` (a slot holds one form).
+data-l1 = []
+# Translated-code profile, measurement builds only (`study::prof`): at every interrupt taken in generated code, where the
+# vCPU was (dispatcher, a block's header, body or exits), in whose code (user or kernel), on what kind of instruction, and
+# a table of the blocks hit most (the host rings each vCPU's doorbell every NATEMU_SAMPLE_US microseconds to sample).
+profile = []
+# Density experiment, measurement builds only (`cache::placed_size`): blocks are placed without FEX's tail and packed at 16 bytes.
+no-tail = []
+# Hot/cold experiment, measurement builds only (`cache::split`): a block's words up to its first exit are copied into a dense hot
+# stream where it is entered; its whole code stays in the segment's cold part.
+hot-cold = ["no-tail"]
 # Isolated scheduling fixtures; no calls or metadata accesses when disabled.
 io-test-hooks = []
 # PIC study stage 1, measurement builds only: links enter their targets through counting stubs (`cache::stub`), for linked

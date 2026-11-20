@@ -70,7 +70,7 @@ fn dispatcher() -> &'static [u8] {
 
 /// Guest-physical RAM `[0, R)` less the legacy hole (`LEGACY_HOLE`), through the resident's alias (M1: R is the VM's,
 /// `Control::ram_bytes`, set by the host).
-fn guest_ram() -> GuestRam {
+pub(crate) fn guest_ram() -> GuestRam {
     unsafe { natemu_abi::execution::guest_ram(cache::control().ram_bytes, GUEST_RAM_VA) }
 }
 /// EL0t, IRQs unmasked (the doorbell), D, A and F masked; NZCV is or-ed in. The resident itself runs with DAIF masked.
@@ -402,7 +402,10 @@ fn uncached_end(s: &mut State) {
     unsafe { asm!("dmb ish") };
     if n > pages.len() {
         reset_shadows(s);
-    } else if pages[..n].iter().any(|&va| tables::unmap(va).is_err()) {
+    } else if pages[..n].iter().any(|&va| {
+        crate::study::invalidated(va, false);
+        tables::unmap(va).is_err()
+    }) {
         halt(s, stop::SHADOW)
     }
     let c = cache::control();
@@ -1031,7 +1034,7 @@ unsafe fn ask(s: &mut State, kind: u64) -> Reply {
         // The placeholder the resident relocates ([`cache::place`]).
         || (s.dispatch_exit != 0
             && (s.dispatch_exit % 4 != 0
-                || s.dispatch_exit + 4 > u64::from(h.code_size)
+                || s.dispatch_exit + 4 > u64::from(cache::placed_size(&h))
                 || staged_word(&h, s.dispatch_exit) != DISPATCH_PLACEHOLDER))
     {
         halt(s, stop::BAD_REPLY)
@@ -1381,7 +1384,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                     .read_unaligned()
             };
             let packed = (0..h.relocs_count).filter_map(|i| {
-                natemu_abi::execution::pack_reloc(&reloc(i), h.code_size).flatten()
+                cache::pack_placed(&reloc(i), cache::placed_size(&h)).flatten()
             });
             let relocs = cache::relocs(t);
             let inherited = s.relocatable == 1
@@ -1405,7 +1408,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             let same_shape = || {
                 let staged_at = |o: u64| staged_word(&h, o);
                 let copy_at = |o: u64| code(o / 4);
-                h.code_size == t.code_size
+                cache::placed_size(&h) == t.code_size
                     && inherited
                     && sites.iter().zip(staged_sites).all(|(a, b)| {
                         (a.native_offset, a.insn_native_offset)
@@ -1444,7 +1447,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                 && invariant()
                 && natemu_abi::pic::moves_agree(
                     |o| staged_word(&h, o as u64),
-                    h.code_size as usize,
+                    cache::placed_size(&h) as usize,
                     packed.clone(),
                     |o| cache::unlinked_word(t, o),
                     t.code_size as usize,
@@ -1461,7 +1464,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                 let at = natemu_abi::execution::cache::CODE_WRITE_VA + u64::from(t.code);
                 let and = unsafe { ((at - 4) as *const u32).read_volatile() };
                 and == natemu_abi::pic::AND_PAGE
-                    && h.code_size == t.code_size
+                    && cache::placed_size(&h) == t.code_size
                     && natemu_abi::pic::proved(
                         |o| staged_word(&h, o as u64),
                         |o| cache::unlinked_word(t, o),
@@ -1472,7 +1475,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
                         t.dispatch_exit,
                     )
             } else {
-                (0..u64::from(h.code_size) / 4).all(|k| {
+                (0..u64::from(cache::placed_size(&h)) / 4).all(|k| {
                     (t.dispatch_exit != 0 && 4 * k == u64::from(t.dispatch_exit))
                         || code(k) == staged(k)
                 })
@@ -1484,7 +1487,7 @@ unsafe fn checked(s: &mut State, copy: &Block) -> bool {
             });
             // Each failed condition's bit, for the halt's record.
             [
-                (h.code_size, h.sites_count, h.guest_bytes)
+                (cache::placed_size(&h), h.sites_count, h.guest_bytes)
                     == (t.code_size, t.sites_count, copy.guest_bytes),
                 code_same,
                 sites == staged_sites,
@@ -1518,7 +1521,7 @@ fn staged_word(h: &Header, offset: u64) -> u32 {
 }
 /// `p` names an exit of the staged block as admission returns it ([`natemu_abi::execution::link_point`]).
 fn link_point(h: &Header, p: &LinkPoint) -> bool {
-    natemu_abi::execution::link_point(|at| staged_word(h, at), h.code_size, p)
+    natemu_abi::execution::link_point(|at| staged_word(h, at), cache::placed_size(h), p)
 }
 /// Walks the fetch of `va` (its page) for a request into `s.fetch[i]` and its leaf's flags into byte i of
 /// `Control::fetched` (or its failure into `s.fetch_fault`); for a block, marks it ([`mark`]).
@@ -1722,12 +1725,15 @@ fn tlb(s: &mut State, global: bool) {
         None => halt(s, stop::BAD_LINK),
     }
     if global || tables::reset_cr3() {
+        crate::study::holding(!global); // a CR3 load's own full reset is what the study asks about
         reset_shadows(s);
+        crate::study::holding(false);
     } else {
         cache::control().kept_resets += 1;
         s.shadow_generation += 1;
     }
     cache::control().tlb_ticks += ticks() - t0;
+    crate::study::flushed(global, ticks() - t0);
     crate::perf::leave(p);
 }
 fn ticks() -> u64 {
@@ -1740,6 +1746,7 @@ fn ticks() -> u64 {
 /// spaces (perf chunk 14: a read-only shadow a write faulted through; a kept global one outlives CR3 loads).
 pub(super) fn page_faulted(s: &mut State, cr2: u64) {
     let t0 = ticks();
+    crate::study::invalidated(cr2, false);
     match cache::invlpg(cr2) {
         Some(n) => s.unlinks += n,
         None => halt(s, stop::BAD_LINK),
@@ -1753,6 +1760,7 @@ pub(super) fn page_faulted(s: &mut State, cr2: u64) {
 }
 /// Removes every shadow of this vCPU (both spaces) and its writable bits, and counts the reset.
 fn reset_shadows(s: &mut State) {
+    crate::study::reset();
     tables::reset();
     cache::shadows_reset();
     s.shadow_generation += 1;
@@ -2240,6 +2248,10 @@ unsafe fn interrupted(frame: &NativeFrame) -> ! {
              i = out(reg) intid, t0 = out(reg) t0, elr = out(reg) elr, spsr = out(reg) spsr);
     }
     let mut s = unsafe { load() };
+    #[cfg(feature = "profile")]
+    if from_el0(spsr) {
+        crate::study::prof::sample(elr, frame.x[1]);
+    }
     // A spurious INTID (1020-1023) is neither ended nor counted: generated code resumes (a stop still wanted is armed again).
     if intid >= 1020 {
         unsafe { resume(&s, &raw const (*shared()).captured, elr, spsr) }
@@ -2376,7 +2388,7 @@ unsafe fn stopped(
     let rip = block
         .filter(|_| armed[..n].iter().any(|&o| u64::from(o) == at))
         .and_then(|b| {
-            let offset = at - u64::from(b.code);
+            let offset = cache::native_offset(b, elr);
             // (PIC study: at a link point's first word, its target moved to the address the code runs for; at the armed
             // `svc` word of one linked there (checked), the move ran: x0.)
             let first = b
@@ -2408,7 +2420,7 @@ unsafe fn stopped(
     bank(&mut s.cpu, frame, frame.nzcv, true);
     s.cpu.rip = rip;
     // At a REP string's self-exit (X2): between two of its iterations.
-    let offset = at.wrapping_sub(block.map_or(0, |b| u64::from(b.code)));
+    let offset = block.map_or(at, |b| cache::native_offset(b, elr));
     if let Some(b) = block.filter(|b| b.rep_exit(offset)) {
         rep_exited(&mut s, b);
     }
@@ -2754,6 +2766,12 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     if v & !(paging::PA_MASK | CR3_IGNORED) != 0 {
                         return Err(GP);
                     }
+                    crate::study::cr3(s.cpu.cr3 & paging::PA_MASK, v & paging::PA_MASK, || {
+                        // No user half: a kernel-only root (Linux's init_mm).
+                        guest_ram().range(v & paging::PA_MASK, 2048).is_some_and(|p| {
+                            (0..256).all(|i| unsafe { p.cast::<u64>().add(i).read() } == 0)
+                        })
+                    });
                     s.cpu.cr3 = v;
                     tlb(s, false); // a load of the same value too
                     return Ok(commit(s, i, false));
@@ -2885,6 +2903,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                     halt(s, stop::SHADOW)
                 }
                 cache::control().invlpgs += 1;
+                crate::study::invalidated(address, true);
                 match cache::invlpg(address) {
                     Some(n) => s.unlinks += n,
                     None => halt(s, stop::BAD_LINK),
@@ -3411,6 +3430,8 @@ fn translate(
             }
             cache::control().memory_types[kind as usize] += 1;
             let old = tables::descriptor(s.cpu.cpl, va);
+            let global = t.global && s.cpu.cr4 & CR4_PGE != 0;
+            crate::study::missed(s.cpu.cpl == 3, va, access == Access::Write, global, old);
             let writable = writable || on_read;
             if writable && old & 1 != 0 && old & READ_ONLY != 0 {
                 s.upgrades += 1;
@@ -3450,7 +3471,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
         let block = cache::block_at(elr);
         let all = block.map_or(&[][..], cache::sites);
         // `native` for every outcome: ESR, FAR, and ELR as an offset in its block when it is in one, else absolute.
-        let at = block.map_or(elr, |b| elr - b.code_va());
+        let at = block.map_or(elr, |b| cache::native_offset(b, elr));
         s.native = [esr, far, at];
         let found = all
             .binary_search_by_key(&at, |site| site.native_offset as u64)
@@ -3471,6 +3492,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     object::kind::X87 => brk(7),
                     object::kind::PENDING => brk(8),
                     object::kind::DENORM => brk(9),
+                    object::kind::STACK => brk(10),
                     // S4: a watchpoint (EC 0x34, from EL0) at an access site: FAR names a watched byte, not necessarily the access's.
                     _ if esr >> 26 == 0x34 => !matches!(site.kind, object::kind::OTHER),
                     _ => {
@@ -3523,6 +3545,9 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             }
             object::kind::DENORM => denormal_exit(s, f, b, &site),
             object::kind::SPLIT => split(s, f, b, all, &site, spsr),
+            // An 8-byte push found its stack pointer misaligned (experiment FEXC_PUSH_RUN): the push runs alone, in a step block
+            // whose split check completes or faults it exactly; the block after it starts at the next instruction.
+            object::kind::STACK if b.flags & cache::STEP == 0 => step_from(s, f, b, &site),
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }
@@ -4176,7 +4201,7 @@ fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
         }
     };
     match tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global) {
-        Ok(()) => {}
+        Ok(()) => crate::study::installed(s.cpu.cpl == 3, va, writable, global),
         Err(shadow::Error::Capacity) => {
             reset_shadows(s);
             split_wait(s, &[gpa]); // the reset cleared this vCPU's shadow flag: set again before the install
@@ -4188,6 +4213,7 @@ fn install(s: &mut State, va: u64, gpa: u64, writable: bool, global: bool) {
             if tables::install(s.cpu.cpl, va, &guest_ram(), gpa, writable, global).is_err() {
                 halt(s, stop::SHADOW)
             }
+            crate::study::installed(s.cpu.cpl == 3, va, writable, global);
         }
         Err(_) => halt(s, stop::SHADOW),
     }

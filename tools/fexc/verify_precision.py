@@ -209,7 +209,7 @@ def df_stores(d, insns, dis, order):
 
 STUBS = check_sites.STUBS
 BRANCH = re.compile(r'(b|b\.\w+|cbz|cbnz|tbz|tbnz)\s+(?:([wx]\d+),\s+)?(?:#(0x[0-9a-f]+|\d+),\s+)?0x([0-9a-f]+)$')
-STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4'}
+STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa'}
 M64 = (1 << 64) - 1
 
 
@@ -379,8 +379,33 @@ def guards(d, dis, order):
         # P8: no address guard
         if gs:
             out.append(f'{tag}: {len(gs)} address guard stubs')
+        # Experiment FEXC_PUSH_RUN: an 8-byte push `str xV, [xS, #-0x8]!` may have the stack alignment check `and x0, xS, #0x7;
+        # cbnz x0, stub` (then only x0/x1 written) instead of a split check, or none while the nearest such check on S before it
+        # dominates and every word since writes S only by a writeback of a multiple of 8.
+        st = [x for x in mine if x['kind'] == 'stack']
+        S = s['base_reg']
+        push8 = s['kind'] == 'push' and s['width'] == 8 and re.fullmatch(rf'str x\d+, \[x{S}, #-0x8\]!', dis.get(at, ''))
+        if pure and push8 and not sp:
+            def stack_check(x):
+                t = check_at.get(x['native_offset'])
+                return t if t is not None and t < at and x['base_reg'] == S and x['imm'] == 0 and \
+                    dis.get(t) == f'cbnz x0, {x["native_offset"]:#x}' and dis.get(t - 4) == f'and x0, x{S}, #0x7' else None
+            if len(st) > 1:
+                out.append(f'{tag}: {len(st)} stack alignment stubs')
+            elif st:
+                t = stack_check(st[0])
+                if t is None or t - 4 < lo or any(writes(dis[o]) - {('x', 0), ('x', 1)} or check_sites.native_access(dis[o]) for o in order if t < o < at):
+                    out.append(f'{tag}: stack stub +{st[0]["native_offset"]} is not `and x0, xS, #0x7; cbnz x0` then only x0/x1 written')
+                else:
+                    ok.add(t)
+            else:
+                prev = [t for t in (stack_check(x) for x in stubs.values() if x['kind'] == 'stack') if t is not None]
+                aligned = re.compile(rf'(?:str|ldr) x\d+, \[x{S}(?:, #-0x8\]!|\], #0x8)')
+                if not prev or any(('x', S) in writes(dis[o]) and not (aligned.fullmatch(dis[o]) and not dis[o].startswith(f'ldr x{S},'))
+                                   for o in order if max(prev) < o < at):
+                    out.append(f'{tag}: push with neither a split check nor a stack alignment check that covers it')
         # P8 split check
-        if pure:
+        elif pure:
             if len(sp) != 1:
                 out.append(f'{tag}: store of {s["width"]} bytes with {len(sp)} split stubs')
             else:

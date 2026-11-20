@@ -847,6 +847,7 @@ impl Prepared {
         // Perf chunk 14: with the log on, every 5 ms each vCPU's resident time so far by bucket (the current one counted to
         // now; zero without a `perf` resident): `snap NS` and `perf::BUCKETS` ns values per vCPU.
         let sampling = AtomicBool::new(crate::perf::on());
+        let sampling_profile = AtomicBool::new(true);
         let (supervision, io_result) = std::thread::scope(|scope| {
             let io: Vec<_> = self
                 .virtio
@@ -876,6 +877,19 @@ impl Prepared {
                     result
                 })
             });
+            // Translated-code profile: every NATEMU_SAMPLE_US microseconds each vCPU's doorbell is rung, so a `profile`
+            // resident samples where its generated code was.
+            if let Some(us) = std::env::var("NATEMU_SAMPLE_US").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&us| us != 0) {
+                let (doorbell, sampling) = (machine.doorbell(), &sampling_profile);
+                scope.spawn(move || {
+                    while sampling.load(SeqCst) {
+                        for v in 0..vcpus {
+                            let _ = doorbell.ring(v);
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(us));
+                    }
+                });
+            }
             if sampling.load(SeqCst) {
                 scope.spawn(|| {
                     use exec::perf as rp;
@@ -900,6 +914,7 @@ impl Prepared {
             }
             let supervision = owners::supervise(vcpus, &prepare, &body, &self.cancel);
             sampling.store(false, SeqCst);
+            sampling_profile.store(false, SeqCst);
             for device in &self.virtio {
                 device.stop();
             }

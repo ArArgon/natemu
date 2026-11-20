@@ -346,7 +346,7 @@ pub(crate) fn map_private(memory: &Memory, window: usize, spans: &[Span]) {
 /// never executable, backed by window `window`'s page at backing offset `target` (its frame page): one upper-root entry of
 /// both shadow spaces (an entry below 256, which no shadow uses) links the owner's own tables
 /// (`execution::GUEST_STATE_TABLES`, never mapped in the window), whose only leaf is this page.
-pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, va: u64) {
+pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, va: u64, vt: Option<usize>, dl1: Option<usize>) {
     assert!(natemu_abi::execution::guest_state_alias_valid(va));
     let [l1, l2, leaf] = natemu_abi::execution::GUEST_STATE_TABLES;
     let index = |level: u32| (va >> (39 - 9 * level) & 511) as usize * 8;
@@ -361,6 +361,18 @@ pub(crate) fn guest_state_alias(memory: &Memory, window: usize, target: usize, v
         leaf + index(3),
         (IPA + target as u64) | PAGE | EL0_DATA | PXN | UXN,
     );
+    // Data-L1 experiment: the dispatcher's data tables (backing offset `dl1`), two 2 MiB blocks, EL0 and EL1 read-only.
+    if let Some(dl1) = dl1 {
+        let i = (va >> 21 & 511) as usize;
+        let blocks = natemu_abi::execution::cache::DL1_BLOCKS;
+        let first = if natemu_abi::execution::cache::dl1_after(va) { i + 1 } else { i - blocks };
+        for k in 0..blocks {
+            let ipa = IPA + (dl1 + k * 0x20_0000) as u64;
+            assert_eq!(ipa % 0x20_0000, 0);
+            word(l2 + (first + k) * 8, ipa | BLOCK | READ_ONLY | EL0_DATA | PXN | UXN);
+        }
+    }
+    let _ = vt;
 }
 
 /// The resident's boot and extended text in window `window`.
@@ -520,7 +532,7 @@ pub(crate) mod tests {
                 let mut spans = resident_text(window);
                 spans.push(Span::data(FRAME_OFFSET, 4096, window + FRAME_OFFSET));
                 private_space(&memory, window, &spans, true);
-                guest_state_alias(&memory, window, window + FRAME_OFFSET, va);
+                guest_state_alias(&memory, window, window + FRAME_OFFSET, va, None, None);
                 let word = |offset: usize| u64::from_le_bytes(memory.read::<8>(window + offset));
                 let walk = |root: usize, va: u64| {
                     let mut table = root;

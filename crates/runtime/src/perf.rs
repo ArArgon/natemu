@@ -16,6 +16,19 @@ fn charge(to: u64) -> u64 {
     unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack)) };
     let p = record();
     let from = p.current;
+    #[cfg(feature = "pcid-study")]
+    crate::study::switched(from, to, t, t.wrapping_sub(p.since));
+    // Jump-check experiment (`pic-count` builds): the computed exits' 32-bit counter, gathered into 64 bits here (every
+    // resident entry: it cannot wrap unseen), in the page-validity experiment's two slots.
+    #[cfg(feature = "pic-count")]
+    {
+        use natemu_abi::execution::{cache::pcid_study::{BULK, BULK_PAGES}, frame::FLAGS, FRAME_VA};
+        // SAFETY: this vCPU's guest-state frame, mapped for the resident.
+        let now = unsafe { ((FRAME_VA + u64::from(FLAGS) + 28) as *const u32).read_volatile() };
+        let c = crate::cache::control();
+        c.pcid_study[BULK] += u64::from(now.wrapping_sub(c.pcid_study[BULK_PAGES] as u32));
+        c.pcid_study[BULK_PAGES] = u64::from(now);
+    }
     p.ticks[(from as usize).min(BUCKETS - 1)] += t.wrapping_sub(p.since);
     (p.since, p.current) = (t, to);
     from

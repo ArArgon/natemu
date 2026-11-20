@@ -97,6 +97,7 @@ struct Settings {
   bool dense_pc = true;        // guest-PC table entry for every guest instruction (sites need it: see --sparse-pc)
   bool end_marker = true;      // FEX's InstCount marker (udf #0x420f) after the block body
   int64_t max_insts = 0;       // 0 = FEX default
+  int ext_conds = 0;           // experiment (slice1): extended blocks, up to N conditional branches per unit (fexc_hook.h)
   uint32_t dcache_line_log2 = 4;
 };
 
@@ -244,7 +245,7 @@ void JoinSites(uint64_t rip) {
       }
   }
   for (auto& s : Cap.sites) {
-    const auto stub = [](uint8_t k) { return k == FEXC_SITE_GUARD || k == FEXC_SITE_SPLIT || k == FEXC_SITE_ALIGN; };
+    const auto stub = [](uint8_t k) { return k == FEXC_SITE_GUARD || k == FEXC_SITE_SPLIT || k == FEXC_SITE_ALIGN || k == FEXC_SITE_STACK; };
     if (!stub(s.kind) || s.access_native_offset == FEXC_NONE32) continue;
     for (auto& a : Cap.sites) {
       if (a.native_offset != s.access_native_offset || stub(a.kind)) continue;
@@ -262,13 +263,13 @@ uint32_t MmioRecord(const FexcSiteInfo& s, uint64_t rip) {
   const auto it = fexc_mmio.find(rip + s.guest_offset);
   if (it == fexc_mmio.end()) return 0;
   int accesses = 0;
-  for (auto& a : Cap.sites) accesses += a.guest_offset == s.guest_offset && a.kind != FEXC_SITE_GUARD && a.kind != FEXC_SITE_SPLIT && a.kind != FEXC_SITE_ALIGN && a.kind != FEXC_SITE_DIVIDE &&
+  for (auto& a : Cap.sites) accesses += a.guest_offset == s.guest_offset && a.kind != FEXC_SITE_GUARD && a.kind != FEXC_SITE_SPLIT && a.kind != FEXC_SITE_ALIGN && a.kind != FEXC_SITE_STACK && a.kind != FEXC_SITE_DIVIDE &&
                                                        a.kind < FEXC_SITE_SIMD;
   const uint32_t r = it->second;
   return accesses == 1 && (1u << ((r >> 12) & 3)) == s.width && ((r >> 4) & 1) == uint32_t(s.kind == FEXC_SITE_STORE) ? r : 0;
 }
 const char* const KindName[] = {"load", "store", "load_pair", "store_pair", "push", "pop", "guard", "split", "push_pair", "pop_pair", "other", "divide", "swap", "atomic", "align",
-                                "simd", "x87", "pending", "fma", "denorm"};
+                                "simd", "x87", "pending", "fma", "denorm", "stack"};
 const char* const ExtendName[] = {"none", "uxtw", "sxtw", "sxtx"};
 const char* const RmwName[] = {"none", "load", "store"};
 const char* const OrderingName[] = {"plain", "acquire", "release"};
@@ -395,7 +396,7 @@ struct Setup {
   std::vector<std::pair<std::string, bool>> overrides;
   std::vector<std::pair<std::string, std::string>> configs;   // --config NAME=VALUE, applied after fexc's own Config::Set calls
   // The gating arguments (shim FexcArg values; Arm sets them for each request).
-  bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, daz = false, ftz = false, accurate = false;
+  bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, daz = false, ftz = false, accurate = false, push_run = false, narrow_cmp = false;
   uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0;
   std::vector<std::pair<Config::ConfigOption, std::string>> sets;   // the Config values (ParseArgs)
   // Configure:
@@ -422,6 +423,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
       else if (st.profile != "default") return Fail("--profile must be default or slice1");
     }
     else if (a == "--multiblock") st.multiblock = true;
+    else if (a == "--ext-conds") st.ext_conds = int(strtol(next(), nullptr, 0));   // experiment: extended blocks (slice1 only)
     else if (a == "--dense-pc") st.dense_pc = true; // default since v2
     else if (a == "--sparse-pc") { st.dense_pc = false; s.sparse_flag = true; } // diagnostic only: an instruction without a GuestOpcode (e.g. moffs movabs) is then attributed to the previous one
     else if (a == "--no-end-marker") st.end_marker = false;
@@ -432,6 +434,8 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--x87-gated") s.x87_gated = true;   // slice1 (I6): CR0.EM or CR0.TS: x87 forms are system cuts (#NM)
     else if (a == "--cpl0") s.cpl0 = true;             // slice1 (perf chunk 15): a CPL-0 request: CLI/STI inline (Cut)
     else if (a == "--bulk") s.bulk = true;             // slice1 (perf chunk 26): not a step, no alignment gating: bulk REP STOS
+    else if (a == "--push-run") s.push_run = true;     // experiment (slice1): one RSP alignment check covers aligned stack stores (fexc_hook.h)
+    else if (a == "--narrow-cmp") s.narrow_cmp = true; // experiment (slice1): 8/16-bit compares with an inline constant (fexc_hook.h)
     else if (a == "--tsc") s.tsc = true;               // slice1 (perf chunk 15): CPL 0, a 24 MHz counter: RDTSC inline
     else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
@@ -451,6 +455,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
   if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
   s.slice1 = st.profile == "slice1";
   if (s.slice1 && s.bitness != 64) return Fail("profile slice1 is 64-bit only");
+  if (st.ext_conds && (!s.slice1 || st.ext_conds < 0 || st.ext_conds > 8)) return Fail("--ext-conds needs profile slice1 and N in 0..8");
   if (s.slice1 && s.sparse_flag) return Fail("profile slice1 needs the dense PC table (sites would be attributed to the previous instruction)");
   if (s.slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");
   for (auto& c : s.configs) {   // slice1 (I6): x87 runs in reduced precision only (the resident's state model is doubles)
@@ -486,6 +491,7 @@ static void Arm(const Setup& s) {
   fexc_x87_unmasked = s.x87_unmasked; fexc_daz = s.daz; fexc_ftz = s.ftz; fexc_accurate = s.accurate;
   LogMan::Throw::InstallHandler(AssertHandler);
   LogMan::Msg::InstallHandler(MsgHandler);
+  fexc_push_run = s.push_run && s.slice1; fexc_narrow_cmp = s.narrow_cmp && s.slice1; fexc_step_unit = s.st.max_insts == 1;
   fexc_compile_hook = Hook;
   fexc_guest_bytes = [](uint64_t a, uint64_t n) -> const uint8_t* { return InWindow(a, n) ? W.bytes + (a - W.base) : nullptr; };
   fexc_dense_pc_table = s.st.dense_pc;
@@ -590,10 +596,33 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     // has copied the code), so the context holds nothing of this request afterwards.
     auto* impl = static_cast<Context::ContextImpl*>(kc->ctx.get());
     const uint64_t max = st.max_insts > 0 ? uint64_t(st.max_insts) : 0;
-    thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(thread, rip, max);
-    (void)impl->CompileCode(thread, rip, max);
-    thread->CPUBackend->ClearRelocations();
-    impl->GetLatest()->Reset();
+    // Experiment (extended blocks): compiled again with fewer conditional branches per unit while a cut or early end fell
+    // inside a non-final decoded block (fexc_ext_stop) or the unit has more literal exits than the resident's link points
+    // (4, crates/abi MAX_LINK_POINTS). Each attempt has fewer, so this ends; 0 is the plain block. The guest bytes read
+    // (Extent) and gating arguments read accumulate over the attempts.
+    for (int ext = st.ext_conds;;) {
+      fexc_ext_conds = ext; fexc_ext_stop = -1;
+      thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(thread, rip, max);
+      (void)impl->CompileCode(thread, rip, max);
+      thread->CPUBackend->ClearRelocations();
+      impl->GetLatest()->Reset();
+      if (ext <= 1) break;   // (1 keeps one decoded block: the plain block)
+      const int blocks = int(Cap.blocks.size());
+      int links = 0;
+      for (size_t o = 4; o + 4 <= Cap.code.size(); o += 4) {
+        uint32_t w; std::memcpy(&w, Cap.code.data() + o, 4);
+        links += w == (0xd4000001u | uint32_t(FEXC_SVC_LINK) << 5);
+      }
+      // The decoded blocks to keep: through the one that ended early, or one fewer.
+      const int keep = fexc_ext_stop >= 0 && fexc_ext_stop + 1 < blocks ? fexc_ext_stop + 1 : links > 4 ? blocks - 1 : 0;
+      if (keep <= 0) break;
+      ext = std::max(1, std::min(keep, ext - 1));
+      const Window w = W; const uint64_t extent = Extent; const uint32_t read = fexc_args_read;
+      ResetGlobals();
+      W = w; Extent = extent; fexc_args_read = read;
+      Arm(s);
+    }
+    fexc_ext_conds = 0;
   }
 
   // ---- describe
@@ -924,7 +953,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     pad(8);
     put(64, f.size(), 4); put(68, Cap.sites.size(), 4);
     for (auto& s : Cap.sites) {
-      const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN;   // a stub's guest_offset2 is its access site
+      const bool stub = s.kind == FEXC_SITE_GUARD || s.kind == FEXC_SITE_SPLIT || s.kind == FEXC_SITE_ALIGN || s.kind == FEXC_SITE_STACK;   // a stub's guest_offset2 is its access site
       push(s.native_offset, 4); push(s.guest_offset, 4); push(stub ? s.access_native_offset : MmioRecord(s, rip) ? MmioRecord(s, rip) : s.guest_offset2, 4); push(s.insn_native_offset, 4); push(uint32_t(s.imm), 4);
       for (uint8_t b : {s.kind, s.width, s.intent, s.rmw, s.segment, s.base_reg, s.index_reg, s.extend, s.shift, s.writeback,
                         uint8_t(s.writeback_delta), s.data_reg[0], s.data_reg[1], s.data_class, s.nzcv, s.cf_inverted,

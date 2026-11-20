@@ -50,6 +50,8 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_FMA = 18,                       // slice1 (AFP accurate plan, chunk 4): the NaN check of a fused multiply-add, in the body (FexcFmaCheck)
   FEXC_SITE_DENORM = 19,                    // slice1 stub (in-block DE screen skip): the resident's FP trap handler left a denormal result since the
                                             // last check; exit to the dispatcher at this instruction (no access, no address, the state before it)
+  FEXC_SITE_STACK = 20,                     // slice1 stub (--push-run): the guest RSP is not 8-byte aligned at a store it would cover; the
+                                            // resident steps the instruction alone (its step unit has the split check)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
 struct FexcSiteInfo {
@@ -94,6 +96,17 @@ inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue su
 // global constant, which would also force one instruction per block).
 // ---------------------------------------------------------------------------------------------
 inline bool fexc_slice1 = false;
+// Experiment (extended blocks, --ext-conds N): after a conditional branch (jcc, loop, jrcxz) the decoder goes on with the
+// fall-through instructions in the same unit while the unit has fewer than N conditional branches and the fall-through
+// starts in the unit's first page; the taken edge stays an ordinary exit. 0: off (FEX's single basic block).
+// fexc_ext_stop: set by GenerateIR to the last decoded block a retry may keep (a cut or early end inside a non-final one).
+inline int fexc_ext_conds = 0;
+inline int fexc_ext_stop = -1;
+// Experiments (request arguments, default off): --push-run drops the split check of 2/4/8-byte stores at an 8-byte aligned base +
+// 8k, the guest RSP's alignment checked once (shim/fexc_sites.inc FexcBeforeOp, FexcAlignedAfter); --narrow-cmp compares 8/16-bit
+// operands with a constant without materialising it (FEX Flags.cpp CalculateFlags_SUB, JIT ALUOps.cpp SubNZCV). fexc_step_unit:
+// the request is a step (--max-insts 1), whose split checks stay (the resident steps an instruction whose alignment check fails).
+inline bool fexc_push_run = false, fexc_narrow_cmp = false, fexc_step_unit = false;
 // Profile slice1: the guest bytes [Address, Address + Size) the compile was given, or nullptr (set by fexc). The allowlist
 // reads an instruction's prefix bytes with it (FEX's decode keeps only the last segment prefix).
 inline const uint8_t* (*fexc_guest_bytes)(uint64_t Address, uint64_t Size) = nullptr;

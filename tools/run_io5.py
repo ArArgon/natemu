@@ -385,6 +385,23 @@ systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-dai
 case $S in
 boot) span idle 'sleep 10';;
 configure) span prep 'rm -rf /p && mkdir /p && tar -C /p -xf /root/py.tar.xz'; span configure 'cd /p/Python-3.13.18 && ./configure';;
+micro)   # cost per trapping event (tools/io5_micro.c, served by the host)
+  span micro "curl -fsS http://$2/m.c -o /root/m.c && gcc -O2 -msse4.2 /root/m.c -o /root/m && /root/m"
+  while read l; do say micro $l; done < $L/micro.log;;
+trap-pcmp|trap-rdtsc|trap-seg|trap-loop|trap-none)   # 30 M iterations of one trapping instruction (none: the same boot without)
+  curl -fsS http://$2/m.c -o /root/m.c && gcc -O2 -msse4.2 /root/m.c -o /root/m
+  N=10; case $S in trap-pcmp) T=pcmpistri;; trap-rdtsc) T=rdtscp;; trap-seg) T=seg_read;; trap-loop) T=empty; N=100;; *) T=zzz;; esac
+  span $S "/root/m $T $N"; say micro $(cat $L/$S.log);;
+cfile)   # a C file the host serves as x.c (NATEMU_PROFILE_C), compiled -O1 and run; its lines are printed as markers
+  curl -fsS http://$2/x.c -o /root/x.c && gcc -O1 /root/x.c -o /root/x
+  span cfile "/root/x"; while read l; do say micro $l; done < $L/cfile.log;;
+forkexec|forkexit)   # one micro test alone, long enough for the timing log: process creation
+  T=fork_exec_true; [ $S = forkexit ] && T=fork_exit_wait
+  curl -fsS http://$2/m.c -o /root/m.c && gcc -O2 -msse4.2 /root/m.c -o /root/m
+  span $S "/root/m $T 6"; say micro $(cat $L/$S.log);;
+configure2)   # configure twice in one boot: the second finds every translation already compiled
+  span prep 'rm -rf /p && mkdir /p && tar -C /p -xf /root/py.tar.xz'; span configure 'cd /p/Python-3.13.18 && ./configure'
+  span prep2 'rm -rf /p && mkdir /p && tar -C /p -xf /root/py.tar.xz'; span configure-again 'cd /p/Python-3.13.18 && ./configure';;
 make) span prep 'cd /solo/Python-3.13.18 && make clean'; span make 'cd /solo/Python-3.13.18 && make -j$(nproc)';;
 make-net|make-disk|make-rng)   # the build beside one of the run's loops, until make ends (the loop's rounds are printed)
   case $S in
@@ -414,6 +431,8 @@ def profile(args):
     args.out.mkdir(parents=True)
     serve = args.out / 'serve'; serve.mkdir()
     (serve / 'io5.sh').write_text(PROFILE.replace('@PYTESTS@', PYTESTS).replace('@KSHA@', LINUX_SHA))
+    shutil.copy(ROOT / 'tools/io5_micro.c', serve / 'm.c')
+    if os.environ.get('NATEMU_PROFILE_C'): shutil.copy(os.environ['NATEMU_PROFILE_C'], serve / 'x.c')
     server, host = serve_files(serve)
     windows, ok, allocated, contended = {}, True, {}, {}
     try:
@@ -422,7 +441,8 @@ def profile(args):
             fcntl.flock(lock, fcntl.LOCK_EX)
             for step in args.steps:
                 disk = args.out / f'disk-{step}.raw'; sh('cp', '-c', args.snapshot, disk); disk.chmod(0o644)   # the snapshot is read-only
-                cache = args.out / f'compile-cache-{step}'          # cold: a new cache per boot
+                kept = os.environ.get('NATEMU_PROFILE_CACHE')       # a cache kept between launches (warm from the second)
+                cache = Path(kept) if kept else args.out / f'compile-cache-{step}'          # cold: a new cache per boot
                 before = others()
                 code, timed_out, seconds = launch(command(args, disk, cache, step), args.out, step, host, args.limit)
                 if before or others():
@@ -434,7 +454,8 @@ def profile(args):
                 if step == 'trim':
                     fsck = subprocess.run([E2 / 'e2fsck', '-fn', f'{disk}?offset={ROOT_OFFSET}'], capture_output=True, text=True)
                     (args.out / 'fsck-trim.log').write_text(fsck.stdout + fsck.stderr); ok &= fsck.returncode == 0
-                disk.unlink(); shutil.rmtree(cache, ignore_errors=True)
+                disk.unlink()
+                if not kept: shutil.rmtree(cache, ignore_errors=True)
                 if not args.keep_request_logs:   # ~0.4 GiB per vCPU per step; the summary (`vcpu {...}` lines) stays in perf-STEP.log
                     for raw in args.out.glob(f'perf-{step}.log.v[0-9]*'): raw.unlink()
                 for line in (args.out / f'markers-{step}.tsv').read_text().splitlines():
@@ -476,7 +497,7 @@ def main():
     f = sub.add_parser('profile', help='one step per boot from a snapshot disk, with the timing log')
     f.add_argument('--snapshot', type=Path, required=True); f.add_argument('--inputs', type=Path, required=True)
     f.add_argument('--out', type=Path, required=True); f.add_argument('--steps', nargs='+', required=True,
-                   choices=('boot', 'configure', 'make', 'make-net', 'make-disk', 'make-rng', 'pytest', 'timerfd', 'trim'))
+                   choices=('boot', 'configure', 'configure2', 'micro', 'cfile', 'forkexec', 'forkexit', 'trap-pcmp', 'trap-rdtsc', 'trap-seg', 'trap-loop', 'trap-none', 'make', 'make-net', 'make-disk', 'make-rng', 'pytest', 'timerfd', 'trim'))
     f.add_argument('--runtime', type=Path, help='the resident (a `perf` build for 5 ms bucket snapshots)')
     f.add_argument('--natemu', type=Path, help='the natemu binary (default: target/release/natemu)')
     f.add_argument('--fexc', type=Path, default=FEXC); f.add_argument('--vcpus', type=int, default=4)

@@ -175,6 +175,11 @@ resume_exception:
 1:
     msr elr_el1, x1
     msr spsr_el1, x2
+.if {profile}
+    // Translated-code profile: where generated code resumes (`study::prof::sample` discards interrupts taken there).
+    ldr x9, ={resume_pc}
+    str x1, [x9]
+.endif
     mov x16, x0
     ldr x9, [x16, #{sp_offset}]
     msr sp_el0, x9
