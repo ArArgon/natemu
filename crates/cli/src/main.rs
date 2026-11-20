@@ -28,7 +28,8 @@
 //! (`natemu::execution`'s diagnostics: guest RIP, mode, CPL, instruction bytes, registers, code identity; none at a power-off,
 //! a reset or a cancel).
 //! SIGINFO (Ctrl-T) prints every vCPU's report while the run goes on (`debug.inspect`, on by default); `debug.watchdog`
-//! (seconds, default 60) bounds a vCPU's stay in guest code without a host exit and in the host outside a compile.
+//! (seconds, default 60) bounds a vCPU's stay in guest code without a host exit (the run ends with its report); a vCPU that
+//! long in the host outside a compile (a blocked serial write, say) is reported once and the run goes on.
 //!
 //! **Environment variables (deprecated).** Ten flags still fall back to a variable: `NATEMU_SERIAL_STDIN`,
 //! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_FP`, `NATEMU_PAGE_CURRENCY`, `NATEMU_WRITABLE_ON_READ`, `NATEMU_POOL`,

@@ -162,7 +162,9 @@ read-only disks; see [docs/configuration.md](docs/configuration.md).
 When natemu stops for any reason other than a power-off, a reboot or Ctrl-C, it prints on standard error where the processor was: the
 address of the guest instruction, its bytes and the registers. If the guest seems stuck, press Ctrl-T in the terminal
 (with `--serial-stdin` the keys go to the guest: run `kill -INFO` on natemu's process instead) to print the same for every processor while the guest keeps running. A guest
-that loops forever without natemu's involvement, or natemu itself stuck for a minute, ends the run with that report.
+that loops forever without natemu's involvement for a minute ends the run with that report. If natemu itself waits that
+long (for example because its output is paused with Ctrl-S or piped into a program that stopped reading), it prints the
+report once and keeps running.
 
 ### Host–guest networking
 
