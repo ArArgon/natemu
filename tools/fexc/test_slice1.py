@@ -393,6 +393,50 @@ class Slice1Cutting(unittest.TestCase):
         self.assertEqual({k: leaf['fields']['ebx']['29'][k] for k in ('name', 'state')}, {'name': 'SHA', 'state': 'advertised'})
         self.assertIn('sha1rnds4 xmm1,xmm2,0', ALLOWED)
 
+    def test_32_bit_code_rows(self):
+        """M2: --bitness 32. Each form after `add eax, ebx; xor ecx, ecx` and before `inc eax` (40: a REX prefix in 64-bit
+        code): the resident's forms and the refused ones end the block at their RIP with nothing of them in it, the rest
+        translate; direct branch targets and a pushed return address wrap at 4 GiB."""
+        pre, post = '01d8' + '31c9', '40'
+        run32 = lambda hexs, rip=0x8048000: run(hexs, rip, '--bitness', '32')
+        ref, _ = run32(pre)
+        system = {'arpl': '63c8', 'les': 'c403', 'lds': 'c503', 'bound': '6208', 'pusha': '60', 'popa': '61', 'aam': 'd40a', 'aam 0': 'd400',
+                  'pop ds': '1f', 'pop es': '07', 'pop ss': '17', 'push cs': '0e', 'mov ds,ax': '8ed8', 'mov ax,es': '8cc0', 'int 0x80': 'cd80', 'into': 'ce',
+                  'sysenter': '0f34', 'syscall': '0f05', 'call far m': 'ff18', 'call far ptr': '9a000000001000', 'jmp far ptr': 'ea000000001000',
+                  'push fs': '0fa0', 'pop gs': '0fa9', 'lss': '0fb203', 'iret': 'cf', 'retf': 'cb'}
+        refused = {'a16 mov': '678b07', 'jcxz': '67e300', 'a16 movs': '67a5', 'o16 call': '66e80000', 'o16 jmp': '66e90000', 'o16 ret': '66c3',
+                   'o16 jz': '667400', '82 alias': '8200ff', 'vex vvvv[3]': 'c4e23900c1'}
+        for reason, forms in (('system_instruction', system), ('unsupported_form', refused)):
+            for name, x in forms.items():
+                with self.subTest(name):
+                    d, rc = run32(pre + x + post)
+                    g = d['guest']
+                    self.assertEqual((rc, g['instructions_translated'], g['end']['rip'], g['end']['reason']), (0, 2, hex(0x8048004), reason), (name, g['end']))
+                    self.assertEqual(region(d), region(ref), name)
+                    d, rc = run32(x + post)
+                    self.assertEqual((rc, d['status'], d['guest']['end']['reason']), (1, 'no_code', reason), name)
+        allowed = {'inc eax': '40', 'dec edi': '4f', 'daa': '27', 'das': '2f', 'aaa': '37', 'aas': '3f', 'aad': 'd50a', 'salc': 'd6',
+                   'mov eax,[moffs32]': 'a100100000', 'es: mov': '268b03', 'cs: mov': '2e8b03', 'ss: mov': '368b03', 'ds: mov [ebp]': '3e8b4500',
+                   'gs: mov [disp32]': '65a110000000', 'movsd': 'a5', 'stosb': 'aa', 'vex c5': 'c5f877', 'vex c4': 'c4e27900c1', 'push eax': '50',
+                   'pushfd': '9c', 'leave': 'c9', 'lock inc [eax]': 'f0ff00', 'fild m64': 'df28', 'cmpxchg8b': '0fc708'}
+        for name, x in allowed.items():
+            with self.subTest(name):
+                d, rc = run32(pre + x + post)
+                g = d['guest']
+                self.assertEqual((rc, g['instructions_translated'], g['end']['reason']), (0, 4, 'end_of_input'), (name, g['end']))
+        # The static register map of FEX's compact plan, and the base fields the segment prefixes load (es, cs, ss, ds: 976..988).
+        d, _ = run32(pre + '268b032e8b03368b033e8b03')
+        self.assertEqual(d['state_abi']['static_registers_gpr_order_rax_rcx_rdx_rbx_rsp_rbp_rsi_rdi_r8_to_r15_then_pf_af'], [4, 7, 5, 6, 8, 9, 10, 11, 26, 27])
+        self.assertEqual(d['state_abi']['static_registers_xmm0_up'], list(range(16, 24)))
+        words = [int.from_bytes(region(d)[i:i + 4], 'little') for i in range(0, len(region(d)), 4)]
+        loads = [w >> 10 & 0xfff for w in words if w & 0xffc003e0 == 0xb9400380]   # ldr wT, [x28, #imm12 * 4]
+        self.assertEqual([4 * o for o in loads], [976, 980, 984, 988])
+        # Targets wrap: jz +2 at 0xfffffffc falls through to 0xfffffffe and jumps to 0; call +0 ending at 4 GiB pushes 0.
+        d, _ = run32('7402', 0xfffffffc)
+        self.assertEqual(sorted(r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move'), ['0x0', '0xfffffffe'])
+        d, _ = run32('e800000000', 0xfffffffb)
+        self.assertEqual({r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move'}, {'0x0'})
+
     def test_unsupported_forms(self):
         for name, x in UNSUPPORTED.items():
             with self.subTest(name):
@@ -586,8 +630,10 @@ class Slice1Cutting(unittest.TestCase):
         self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end']['reason']), (0, 2, 'partial_decode'))
 
     def test_profile_rules(self):
-        r = subprocess.run([FEXC, '--profile', 'slice1', '--bitness', '32', '--hex', '90', '--rip', '0x1000'], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 2)
+        # M2: 32-bit code is accepted, but not with the push-run stack option (8-byte stack slots)
+        for flag, rc in (([], 0), (['--push-run'], 2)):
+            r = subprocess.run([FEXC, '--profile', 'slice1', '--bitness', '32', *flag, '--hex', '90', '--rip', '0x1000'], capture_output=True, text=True)
+            self.assertEqual(r.returncode, rc, flag)
         for flag in ('--multiblock', '--no-end-marker'):   # --no-end-marker is a no-op, but --multiblock must be refused
             r = subprocess.run([FEXC, '--profile', 'slice1', flag, '--hex', '90', '--rip', '0x1000'], capture_output=True, text=True)
             self.assertEqual(r.returncode, 2 if flag == '--multiblock' else 0, flag)
