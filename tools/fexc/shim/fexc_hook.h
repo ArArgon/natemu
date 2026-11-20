@@ -63,6 +63,8 @@ enum FexcSiteKind : uint8_t {
                                             // last check; exit to the dispatcher at this instruction (no access, no address, the state before it)
   FEXC_SITE_STACK = 20,                     // slice1 stub (--push-run): the guest RSP is not 8-byte aligned (32-bit code: ESP not 4-byte aligned) at a store it would cover; the
                                             // resident steps the instruction alone (its step unit has the split check)
+  FEXC_SITE_FLDCW = 21,                     // slice1 stub (M2 task 4): an inline FLDCW's control word has other exception masks than the one
+                                            // in the guest state: the resident runs the instruction (it steps it alone; in a step unit FLDCW is cut)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
 struct FexcSiteInfo {
@@ -324,7 +326,11 @@ constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
 // the resident starts closed (FPSR clear, MXCSR's FPCR, the byte 0), and every change of mode or identity is one.
 // ponytail: 64-bit code pays two FPSR writes per block with x87; the 32-bit scheme there would put the load and branch in
 // every block of SSE code.
+// The cast fix (M2 task 4): a run's FPCR is made from FCW.RC when the run starts (AH and NEP, RMode from RC, no flush to
+// zero), so x87 rounding is honoured per run whatever MXCSR says and the rounding control is no part of the code identity;
+// FLDCW is translated when it keeps the exception masks (`FexcFldcwInline`): it ends the run and stores the word.
 constexpr uint32_t FEXC_X87_RUN = 0x3f0 + 36, FEXC_X87_FPCR = 0xb0;
+inline bool FexcFldcwInline() { return fexc_slice1 && !fexc_step_unit && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
 enum : int { FEXC_RUN_CLOSED, FEXC_RUN_OPEN, FEXC_RUN_UNKNOWN };
 inline int fexc_x87_run = FEXC_RUN_CLOSED;     // whether an x87 run is open at the emit cursor (unknown: 32-bit code, at an IR block's start)
 inline bool fexc_x87_m32_convert = false;      // the op being emitted is an x87 instruction's m32 convert (FexcX87Begin)

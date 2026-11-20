@@ -3238,6 +3238,11 @@ fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
             base(frame::KERNEL_GS_BASE),
         );
     }
+    // M2 task 4: FCW's rounding and precision controls, which a translated FLDCW writes in the page; the exception masks
+    // are the bank's (a FLDCW changing them is the resident's, and a CPL-3 store into the page must not change the identity).
+    // SAFETY: as `byte`.
+    let fcw = unsafe { (FRAME_VA as *const u16).byte_add(frame::X87_FCW as usize).read_volatile() };
+    cpu.fcw = cpu.fcw & FCW_MASKS | u64::from(fcw) & !FCW_MASKS;
     sse::bank(cpu, f);
 }
 const RFLAGS_DF: u64 = 1 << 10;
@@ -3617,6 +3622,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                     object::kind::PENDING => brk(8),
                     object::kind::DENORM => brk(9),
                     object::kind::STACK => brk(10),
+                    object::kind::FLDCW => brk(11),
                     // S4: a watchpoint (EC 0x34, from EL0) at an access site: FAR names a watched byte, not necessarily the access's.
                     _ if esr >> 26 == 0x34 => !matches!(site.kind, object::kind::OTHER),
                     _ => {
@@ -3677,6 +3683,9 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
                 cache::control().stack_checks += 1;
                 step_from(s, f, b, &site)
             }
+            // M2 task 4: a translated FLDCW whose word changes the exception masks: the instruction runs alone, as the
+            // resident's transaction (a one-instruction unit cuts it).
+            object::kind::FLDCW if b.flags & cache::STEP == 0 => step_from(s, f, b, &site),
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),
         }
     }

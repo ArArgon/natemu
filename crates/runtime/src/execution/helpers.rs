@@ -11,7 +11,9 @@ use super::*;
 pub(super) unsafe fn x87(f: &NativeFrame, elr: u64, spsr: u64) -> ! {
     unsafe {
         let mut s = load();
-        if cache::block_at(elr.wrapping_sub(4)).is_none() || !x87::helper(f.x[0], s.cpu.fcw) {
+        // (FCW from the page: a translated FLDCW may have changed the rounding control since the last bank.)
+        let fcw = u64::from((FRAME_VA as *const u16).byte_add(frame::X87_FCW as usize).read_volatile());
+        if cache::block_at(elr.wrapping_sub(4)).is_none() || !x87::helper(f.x[0], s.cpu.fcw & FCW_MASKS | fcw & !FCW_MASKS) {
             s.native = [0, f.x[0], elr];
             halt(&s, stop::UNKNOWN_ABORT)
         }

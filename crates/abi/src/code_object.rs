@@ -81,6 +81,10 @@ pub mod kind {
     /// 8-byte aligned no store of the run can cross a page, so the run's pushes carry no split check. At the stub (S not aligned)
     /// the state is the state before the push: the resident steps the push alone (its one-instruction block has the split check).
     pub const STACK: u8 = 20;
+    /// M2 task 4: a translated FLDCW's check `ldrh w0, [x28, #FCW]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0` (`brk #11`): the
+    /// loaded word has other exception masks than the control word in the guest state. At the stub the state is the state
+    /// before the instruction: the resident steps it alone (in a one-instruction unit FLDCW is the resident's transaction).
+    pub const FLDCW: u8 = 21;
 }
 /// [`Site::intent`].
 pub const INTENT_READ: u8 = 0;

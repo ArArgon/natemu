@@ -51,7 +51,7 @@ inline bool LoadsInto(FEXCore::IR::IROps Op) {
 // state before the instruction.
 inline bool CheckOp(FEXCore::IR::IROps Op) {
   return Op == FEXCore::IR::OP_FEXCSIMDCHECK || Op == FEXCore::IR::OP_FEXCX87CHECK || Op == FEXCore::IR::OP_FEXCSIMDCHECKDE ||
-         Op == FEXCore::IR::OP_FEXCX87CHECKDE;
+         Op == FEXCore::IR::OP_FEXCX87CHECKDE || Op == FEXCore::IR::OP_FEXCFLDCW;   // (FLDCW's stub: M2 task 4)
 }
 // AFP accurate plan, chunk 4: the FMA NaN check is no fault point (the resident resumes after it, no guest exception comes of it), but for
 // register allocation it is as a check: no value is coalesced into its static register across it (the guest register is written only after

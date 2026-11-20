@@ -483,7 +483,7 @@ inline Verdict X87(uint8_t op, uint8_t modrm) {
   if (mod != 3) {
     switch (op) {
     case 0xD8: case 0xDA: case 0xDC: case 0xDE: return ok;                       // arithmetic/compare with m32fp, m32int, m64fp, m16int
-    case 0xD9: return reg == 1 ? alias : (reg >= 4 && reg <= 6) ? res : ok;      // fld/fst/fstp m32, fnstcw; fldenv, fldcw, fnstenv
+    case 0xD9: return reg == 1 ? alias : (reg == 5 && FexcFldcwInline()) ? ok : (reg >= 4 && reg <= 6) ? res : ok;   // fld/fst/fstp m32, fnstcw; fldenv, fldcw (M2 task 4: translated while every x87 exception is masked), fnstenv
     case 0xDB: return (reg == 4 || reg == 6) ? alias : (reg == 5 || reg == 7) ? res : ok;   // fild/fisttp/fist/fistp m32; fld/fstp m80
     case 0xDD: return reg == 5 ? alias : (reg == 4 || reg == 6) ? res : ok;      // fld/fisttp/fst/fstp m64, fnstsw m16; frstor, fnsave
     default: return (reg == 4 || reg == 6) ? Uns("fbld/fbstp (FEX calls a host helper for BCD)") : ok;   // df: fild/fisttp/fist/fistp m16, fild/fistp m64
