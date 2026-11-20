@@ -3183,7 +3183,7 @@ impl Compiler {
                     })
                 };
                 // A system cut: the host's decode of it, in 64-bit code only (the resident runs no other mode yet,
-                // `Cpu::control`). FEX and iced reading different instructions there is refused (logged); one that reads
+                // `Cpu::code_mode`). FEX and iced reading different instructions there is refused (logged); one that reads
                 // past the bytes waits for the next page (its fetch fault comes before any #UD).
                 let decoded = match cut {
                     Some(c) if gated.is_none() && !*ud => {
