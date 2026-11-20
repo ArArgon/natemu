@@ -391,11 +391,15 @@ def cases():
     c.append(('jmp-far-compat',) + far(0x38) + (lambda s: sm.far(_ptr(s, 0x110000, 0x38), 'jmp', d + PTR + 0x90), {}))
     c.append(('jmp-far-call-gate',) + far(0xb0) + (lambda s: sm.far(_ptr(s, 0x110000, 0xb0), 'jmp', d + PTR + 0x90), {}))
     c.append(('lret-compat',) + ret([0x110000, 0x38]))
-    # Owner decision (November 6): a transfer to compatibility-mode code at CPL 3 is #GP(selector) with nothing changed (a
-    # recorded deviation, judged by segment_model alone: x86 runs the code). From CPL 0: IRETQ and an outer RET to the 32-bit
-    # (0xdb) and 16-bit (0xd3) DPL 3 code segments.
+    # Compatibility-mode code at CPL 3 that natemu does not run is its recorded deviation, judged by segment_model alone
+    # (x86 runs the code). From CPL 0: IRETQ to the 32-bit DPL 3 code segment (0xdb) with DS and ES nulled by the return
+    # (DPL 0 segments), and to the 16-bit one (0xd3), complete and take #GP (0, the null DS; 0xd0) at their target (M2 task
+    # 3a; with flat DS and ES the 32-bit code runs: compat.py); an outer RET to it is #GP(selector) at the RET with nothing
+    # changed (owner decision, November 6; far transfers are task 5).
     c.append(('iret-compat-cpl3',) + iret([0x110000, 0xdb, 2, d + USTACK, 0x1b]))
     c.append(('iret-compat16-cpl3',) + iret([0x110000, 0xd3, 2, d + USTACK, 0x1b]))
+    # The frame's RIP beyond the 4 GiB limit of the 32-bit code segment: #GP(0) at the IRETQ.
+    c.append(('iret-compat-rip',) + iret([1 << 32 | 0x110000, 0xdb, 2, d + USTACK, 0x1b]))
     c.append(('lret-compat-cpl3',) + ret([0x110000, 0xdb, d + USTACK, 0x1b]))
     # (An IRETQ loading TF is no longer a refusal: its single-step trap is S4's, tests/system/run_s4.py `s4-popf-iret`.)
     c.append(('iret-null-ss-rpl',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x1]))
@@ -408,7 +412,8 @@ def cases():
                              ('lgdt', '    lgdt [rsp]\n', lambda s: sm.lgdt(s, d + USTACK)),
                              ('ltr', '    mov eax, 0x70\n    ltr ax\n', lambda s: sm.ltr(s, 0x70)),
                              ('lret-to-cpl0', '    push 0x08\n    push 0x110000\n    o64 retf\n', lambda s: sm.ret(_stack(s, [0x110000, 0x08]))),
-                             # The compatibility-mode deviation at CPL 3 (above): far JMP and CALL, RET far, IRETQ; a call gate.
+                             # The compatibility-mode deviation at CPL 3 (above): far JMP and CALL and RET far at the
+                             # instruction, IRETQ at its target (DS and ES are null there); a call gate.
                              ('jmp-far-compat', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xdb\n    jmp far [rsp-16]\n',
                               lambda s: sm.far(_ptr_at(s, s['rsp'] - 16, 0x110000, 0xdb), 'jmp', s['rsp'] - 16, stack=True)),
                              ('call-far-compat16', '    mov rax, 0x110000\n    mov [rsp-16], rax\n    mov word [rsp-8], 0xd3\n    call far [rsp-16]\n',
@@ -458,7 +463,7 @@ def fault_programs():
             tail = P.asm((insn + P.RESTORE + '\n    cmp r11, r11').format(**f))
             at = P.SYS_CODE(0) + len(P.asm(full)) - len(tail)
         r = call(state)
-        prog['params'] = {'model': {'outcome': r['outcome'], 'fault': r['fault'], 'at': at, 'reason': r['reason'],
+        prog['params'] = {'model': {'outcome': r['outcome'], 'fault': r['fault'], 'at': r.get('fault_rip') or at, 'reason': r['reason'],
                                     'deviation': r.get('deviation', False), 'rsp': r['state']['rsp'],
                                     'permitted': sorted(([o, list(f) if f else None] for o, f in r['permitted']), key=str)}}
         out.append(prog)

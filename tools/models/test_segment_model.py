@@ -159,6 +159,59 @@ class Transfers(unittest.TestCase):
         self.assertEqual((r['fault'][:2], r['deviation']), ((dm.GP, 0x48), True))
         self.assertEqual(m.ret(push(machine(), 1 << 47, 0x08))['fault'][:2], (dm.GP, 0))
 
+    def compat(self, cs=None, **over):
+        """A CPL 0 machine with DPL 3 code at 0x48 (32-bit unless `cs`), DS = ES = the flat DPL 3 data segment 0x1B."""
+        s = machine()
+        dm.place(s['memory'], GDT + 0x48, (cs or m.code(3, l=0, d=1)).to_bytes(8, 'little'))
+        s['seg'].update(ds=(0x1B, 0xC0F3), es=(0x1B, 0xC0F3))
+        s['seg'].update(over)
+        return s
+
+    def test_iret_into_32_bit_code(self):
+        # M2 task 3a: IRETQ to a 32-bit code segment with RPL 3 is a real load; RSP is zero-extended from ESP.
+        frame = (0x40_2000, 0x4B, 0x202, 0x1_0000_7000, 0x1B)
+        r = m.iret(push(self.compat(), *frame))
+        s = r['state']
+        self.assertEqual((r['outcome'], s['rip'], s['cpl'], s['seg']['cs'], s['seg']['ss'], s['rsp'], s['seg']['ds']),
+                         ('done', 0x40_2000, 3, (0x4B, 0xC0FB), (0x1B, 0xC0F3), 0x7000, (0x1B, 0xC0F3)))
+        # The frame's RIP against the 4 GiB limit: #GP(0) at the IRET, nothing changed.
+        r = m.iret(push(self.compat(), 1 << 32, 0x4B, 0x202, 0x7000, 0x1B))
+        self.assertEqual((r['fault'][:2], r['deviation'], r['state']['cpl']), ((dm.GP, 0), False, 0))
+        # Segments natemu does not run 32-bit code with: the deviation, #GP(selector) at the target after the IRET.
+        deviation = lambda r: (r['fault'][:2], r['deviation'], r['fault_rip'], r['state']['cpl'], r['state']['rsp'])
+        for state, selector in ((self.compat(ds=(0x10, 0xC093)), 0),                    # DS (DPL 0) nulled by the return
+                                (self.compat(cs=m.code(3, l=0, d=0)), 0x48),              # a 16-bit code segment
+                                (self.compat(es=(0x1B, 0xC0F1)), 0x18),                   # ES read-only
+                                (dict(self.compat(), shape={'ds': (0x1000, 0xFFFFFFFF)}), 0x18)):   # DS with a base
+            self.assertEqual(deviation(m.iret(push(state, 0x40_2000, 0x4B, 0x202, 0x7000, 0x1B))),
+                             ((dm.GP, selector), True, 0x40_2000, 3, 0x7000))
+        # A stack segment with a base (0x50 at DPL 3): the same, naming SS.
+        s = self.compat()
+        dm.place(s['memory'], GDT + 0x50, m.data(3, base=0x1234_5678).to_bytes(8, 'little'))
+        self.assertEqual(deviation(m.iret(push(s, 0x40_2000, 0x4B, 0x202, 0x7000, 0x53)))[:3], ((dm.GP, 0x50), True, 0x40_2000))
+        # RET far to it is still not built (task 5), and L = D = 1 is never loaded.
+        self.assertEqual(m.ret(push(self.compat(), 0x40_2000, 0x4B, 0x7000, 0x1B))['fault'][:2], (dm.GP, 0x48))
+        self.assertEqual(m.iret(push(self.compat(cs=m.code(3, l=1, d=1)), *frame))['fault'][:2], (dm.GP, 0x48))
+
+    def test_32_bit_code(self):
+        # In 32-bit code at CPL 3: a load that leaves a segment natemu does not run is its deviation at the next instruction.
+        s = self.compat()
+        s.update(cpl=3, cs=0x4B, ss=0x1B)
+        s['seg'].update(cs=(0x4B, 0xC0FB), ss=(0x1B, 0xC0F3))
+        dm.place(s['memory'], GDT + 0x50, m.data(3, base=0x1234_5678).to_bytes(8, 'little'))
+        r = m.load(s, 'ds', 0x53)
+        self.assertEqual((r['fault'][:2], r['deviation'], r['fault_rip'], r['state']['seg']['ds']),
+                         ((dm.GP, 0x50), True, 0x40_0003, (0x53, 0xC0F3)))
+        self.assertEqual(m.load(s, 'gs', 0x53)['outcome'], 'done')                       # FS and GS may have a base
+        self.assertEqual(m.load(s, 'ds', 0x1B)['outcome'], 'done')
+        # A null FS or GS faults on use there, not in 64-bit mode; an access may not run past 4 GiB.
+        self.assertEqual(m.null_access(s, 'fs')['fault'][:2], (dm.GP, 0))
+        self.assertEqual(m.null_access(m.load(s, 'gs', 0x53)['state'], 'gs')['outcome'], 'done')
+        self.assertEqual(m.null_access(machine(3), 'fs')['outcome'], 'done')
+        self.assertEqual(m.flat_access(s, 0xFFFF_FFFC, 4)['outcome'], 'done')
+        self.assertEqual(m.flat_access(s, 0xFFFF_FFFE, 4)['fault'][:2], (dm.GP, 0))
+        self.assertEqual(m.flat_access(s, 0xFFFF_FFFD, 4, stack=True)['fault'][:2], (dm.SS, 0))
+
     def test_iretq_agrees_with_the_delivery_model(self):
         frames = [(0x40_2000, 0x08, 0x246, STACK + 0x100, 0x10), (0x40_2000, 0x23, 0x3246, 0x7000, 0x1B),
                   (0x40_2000, 0x08, 0x202, STACK, 0), (0x40_2000, 0x23, 0x202, 0x7000, 3), (0x40_2000, 0x10, 2, 0, 0x10),

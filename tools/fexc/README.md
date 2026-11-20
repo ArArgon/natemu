@@ -1067,7 +1067,14 @@ The shim sets `fexc_bits32` for the request (not a gating argument: the host's c
   (the inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode, MOV r64, CR2 is a 64-bit load).
 - FEX's 32-bit code takes the upper halves of the eight registers as zero (it addresses memory with the whole Arm
   register), and adds a small displacement and moves ESP in PUSH and POP with 64-bit arithmetic: an address or an ESP
-  that should wrap at 4 GiB does not. Both are the shim's to handle when 32-bit code runs (findings, "What task 3a needs").
+  that should wrap at 4 GiB does not. The shim handles both since task 3a (it enters 32-bit code with the registers
+  zero-extended and makes an access that aborted above 4 GiB again at the wrapped address:
+  [task 3a's findings](../../docs/restructure/m2-task3a-findings.md)).
+- `--fs-null` and `--gs-null` (task 3a; 32-bit code only, from the host's code identity): FS, GS holds a null selector, so
+  an access through it is #GP(0). Such an instruction is a system cut reported as `cut_gated: "null_segment"`, which the
+  resident raises. The access is the explicit memory operand the prefix overrides (a ModRM memory operand but LEA's, a
+  prefetch's or a multi-byte NOP's; moffs; XLAT; the DS:ESI source of MOVS, CMPS and LODS); a prefix on anything else
+  is ignored as before. Not `FexcArg`s: the host keeps no answer of a 32-bit request.
 
 ## Checks
 

@@ -295,6 +295,12 @@ argv = ["tests/system/run_m2.py", "--only", "litmus,cost", "--fexc", "{fexc}", "
 needs = { exclusive = true, why = "the WB store-buffering control must show the non-SC outcome (vCPUs truly concurrent); cost in ns" }
 rerun = true
 
+# M2 task 3a: 32-bit code at CPL 3 (tools/bench/smp/compat.py).
+[suite.cases."compat32"]
+argv = ["tests/smp/run_slice3_vm.py", "compat", "--fexc", "{fexc}", "--out", "{out}"]
+needs = { perf = true }
+smoke = true
+
 [suite.cases."x1"]
 argv = ["tests/system/run_x1.py", "--fexc", "{fexc}", "--out", "{out}"]
 needs = { perf = true }

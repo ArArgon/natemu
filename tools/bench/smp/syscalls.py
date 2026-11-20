@@ -314,8 +314,10 @@ def cases():
         ('sysret-sce0', '', None, 'o64 sysret', lambda: sc.sysret(state(0, gpr={'rcx': u, 'r11': 2})), 0),
         ('sysret-noncanonical', SCE + f'    mov rcx, {NONCANONICAL:#x}\n    mov r11d, 2\n', None, 'o64 sysret',
          lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': NONCANONICAL, 'r11': 2})), 0),
-        ('sysretl', SCE + wrmsr(0xc0000081, STAR) + f'    mov ecx, {u:#x}\n    mov r11d, 2\n', None, 'sysret',
-         lambda: sc.sysret(state(0, efer=0xd01, gpr={'rcx': u, 'r11': 2}), width=4), 0),
+        # SYSRETL to 32-bit code that natemu does not run (a null DS): its deviation, #GP(0) at the target (M2 task 3a; the
+        # return itself is compat.py's c32-sysenter).
+        ('sysretl-null-ds', SCE + wrmsr(0xc0000081, STAR) + f'    xor eax, eax\n    mov ds, eax\n    mov ecx, {u:#x}\n    mov r11d, 2\n', None, 'sysret',
+         lambda: sc.sysret(_null_ds(state(0, efer=0xd01, gpr={'rcx': u, 'r11': 2})), width=4), 0),
         ('swapgs-cpl3', '', '', 'swapgs', lambda: sc.swapgs(state(3)), 3),
         ('rdfsbase-disabled', '', None, 'rdfsbase rax', lambda: sc.fsgsbase(state(0), 'rdfsbase', 'rax'), 0),
         ('wrgsbase-disabled-cpl3', '', '', 'wrgsbase rax', lambda: sc.fsgsbase(state(3, gpr={'rax': 0}), 'wrgsbase', 'rax'), 3),
@@ -340,6 +342,11 @@ def cases():
         ('clflush-noncanonical-rbp', f'    mov rbp, {NONCANONICAL:#x}\n', None, 'clflush [rbp]', lambda: sc.clflush(state(0), NONCANONICAL, stack=True), 0),
     ]
     return [x if len(x) == 7 else x + (None,) for x in c]
+
+
+def _null_ds(s):
+    s['seg']['ds'] = (0, 0)
+    return s
 
 
 def _code_page(s):

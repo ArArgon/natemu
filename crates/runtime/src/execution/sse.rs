@@ -16,10 +16,15 @@ use super::*;
 
 const NM: Exception = [7, 0, 0];
 
+/// The XMM registers generated code holds: all 16, or XMM0..XMM7 in 32-bit code (M2 task 3a: v24..v31 are its
+/// compiler's scratch registers, entered zero and never banked).
+fn held(c: &Cpu) -> usize {
+    if c.code_mode() == Some(CodeMode::Bits64) { 16 } else { 8 }
+}
 /// XMM and MXCSR into the frame generated code is entered with: v16..v31, FPCR from MXCSR, FPSR clear.
 pub(super) fn fill(f: &mut NativeFrame, c: &Cpu) {
-    for (q, x) in f.q[XMM_VREG..].iter_mut().zip(&c.xmm) {
-        *q = (u128::from(x[0]) | u128::from(x[1]) << 64).to_le_bytes();
+    for (i, (q, x)) in f.q[XMM_VREG..].iter_mut().zip(&c.xmm).enumerate() {
+        *q = if i < held(c) { (u128::from(x[0]) | u128::from(x[1]) << 64).to_le_bytes() } else { [0; 16] };
     }
     f.fpcr = fpcr_run(c.mxcsr, c.no_afp != 0, c.accurate_fp);
     f.fpsr = 0;
@@ -27,7 +32,8 @@ pub(super) fn fill(f: &mut NativeFrame, c: &Cpu) {
 /// XMM from v16..v31 and the exception flags FPSR accumulated since the entry into the bank, with (I5c) those checked
 /// instructions moved into the SIMD flag byte.
 pub(super) fn bank(c: &mut Cpu, f: &NativeFrame) {
-    for (x, q) in c.xmm.iter_mut().zip(&f.q[XMM_VREG..]) {
+    let held = held(c);
+    for (x, q) in c.xmm.iter_mut().zip(&f.q[XMM_VREG..]).take(held) {
         let v = u128::from_le_bytes(*q);
         *x = [v as u64, (v >> 64) as u64];
     }

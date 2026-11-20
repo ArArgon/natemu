@@ -11,6 +11,7 @@
     tests/smp/run_slice3_vm.py --fexc FEXC --out DIR kicks [--cpus 1 2 4] [--kicks M] [--iterations I]
         [--parallel P] [--reps R]
     tests/smp/run_slice3_vm.py --fexc FEXC --out DIR system [--programs SUBSTR,...]
+    tests/smp/run_slice3_vm.py --fexc FEXC --out DIR compat [--programs SUBSTR,...]
     tests/smp/run_slice3_vm.py --fexc FEXC --out DIR coherence [--programs SUBSTR,...] [--reps R]
         [--parallel P]
     tests/smp/run_slice3_vm.py --fexc FEXC --out DIR sharedpt [--programs SUBSTR,...] [--reps R]
@@ -828,7 +829,15 @@ QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimple
                 'sc-invd-cpl3@1': 'QEMU executes INVD at CPL 3; SDM INVD: #GP(0) if CPL > 0',
                 'sc-clflush-noncanonical@1': 'QEMU makes no access for CLFLUSH; SDM CLFLUSH (faults of a byte load): #GP(0) for a non-canonical address',
                 'sc-clflush-noncanonical-rbp@1': 'QEMU makes no access for CLFLUSH; SDM CLFLUSH: #SS(0) for a non-canonical address through RBP',
-                'sc-clflush-supervisor-cpl3@1': 'QEMU makes no access for CLFLUSH; SDM CLFLUSH: #PF(5) for a CPL 3 byte load of a supervisor page'}
+                'sc-clflush-supervisor-cpl3@1': 'QEMU makes no access for CLFLUSH; SDM CLFLUSH: #PF(5) for a CPL 3 byte load of a supervisor page',
+                'seg-iret-compat-rip@1': 'QEMU loads a return address above 4 GiB into 32-bit code and faults at the fetch; SDM IRET: #GP(0) for a return instruction pointer outside the code segment limit',
+                # M2 task 3a (compat.py, 32-bit code): QEMU checks neither a null segment nor a segment limit on an access.
+                'c32-fs-null@1': 'QEMU reads through the null FS at base 0 (a #PF there); SDM Vol.3 3.4.4: #GP(0) for an access through a null segment outside 64-bit mode',
+                'c32-gs-null@1': 'QEMU accesses memory through the null GS at base 0 (a #PF there); SDM: #GP(0)',
+                'c32-gs-null-string@1': 'QEMU reads the string source through the null GS at base 0; SDM: #GP(0)',
+                'c32-limit@1': 'QEMU checks no segment limit (the load runs past 4 GiB into a page fault); SDM Vol.3 5.3: #GP(0) for a doubleword at an offset above the limit - 3',
+                'c32-limit-ss@1': 'QEMU checks no segment limit (the store runs past 4 GiB into a page fault); SDM Vol.3 5.3: #SS(0) through SS',
+                'c32-limit-fetch@1': 'QEMU checks no segment limit (the fetch runs past 4 GiB into a page fault); SDM Vol.3 5.3: #GP(0)'}
 
 
 # ---- S1: the presented CPU, judged by tools/models/cpu_profile.py (QEMU presents its own CPU) --------------------------------
@@ -1614,6 +1623,31 @@ def segment_runs(a, host, runtime, qemu, report, failures, progs=None):
         report.append(entry)
 
 
+def system_qemu(a):
+    """QEMU system mode's answer for a `system` program: (its parsed dump or None, the exit status)."""
+    stub = smp.build_stub(a.out / 'qemu-build')
+
+    def qemu(prog, label, timeout=120, hang_ok=False):      # hang_ok: a timeout is this case's expected answer
+        rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=timeout, hang_ok=hang_ok)
+        return (smp.parse_dump(prog, dump) if rc == 1 else None), rc
+    return qemu
+
+
+def cmd_compat(a, host, runtime):
+    """M2 task 3a (tools/bench/smp/compat.py): 32-bit code at CPL 3 under a 64-bit kernel body, judged as S2b's programs
+    are (`segment_runs`): the positive programs against QEMU system mode run as an Intel processor (IRETQ into 32-bit
+    code and the 64 -> 32 -> 64 round trip of R8..R15 and XMM8..15, exact page faults, SYSENTER/SYSRETL and INT 0x80,
+    addresses that wrap at 4 GiB), single instructions against segment_model and syscall_model (SYSCALL's #UD, a null FS
+    or GS, the 4 GiB limit, natemu's deviation for a segment it does not run)."""
+    import compat
+    report, failures = [], []
+    segment_runs(a, host, runtime, system_qemu(a), report, failures, compat.programs())
+    for f in failures: print(f)
+    write_failure_results(a.out, report_names(report), failures)
+    (a.out / 'compat.json').write_text(json.dumps({'report': report, 'failures': failures}, indent=1, default=str) + '\n')
+    return len(failures)
+
+
 def cmd_system(a, host, runtime):
     """S3c1: system programs (tools/bench/smp/system.json) against QEMU system mode; fault cases against
     tests/lib/system_fault_model.py at the state QEMU reaches just before the instruction (and modes_model where it covers
@@ -1621,12 +1655,8 @@ def cmd_system(a, host, runtime):
     import system_fault_model as sfm
     from models import modes_model as modes
     programs = [p for p in json.loads((ROOT / 'tools/bench/smp/system.json').read_text()) if not a.programs or any(n in p['name'] for n in a.programs)]
-    stub = smp.build_stub(a.out / 'qemu-build')
     report, failures, gaps = [], [], []
-
-    def qemu(prog, label, timeout=120, hang_ok=False):      # hang_ok: a timeout is this case's expected answer
-        rc, err, dump, _ = smp.run_image(prog, smp.build_image(prog, stub), a.out / 'qemu' / label, 'multi', timeout=timeout, hang_ok=hang_ok)
-        return (smp.parse_dump(prog, dump) if rc == 1 else None), rc
+    qemu = system_qemu(a)
     for prog in programs:
         name, fault_at = prog['name'], prog['params'].get('fault_at')
         entry = {'name': name, 'runs': []}
@@ -2336,7 +2366,7 @@ def cmd_contain(a, host, runtime):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery', 'events'])
+    ap.add_argument('mode', choices=['corpora', 'smp', 'litmus', 'limits', 'kicks', 'system', 'compat', 'coherence', 'sharedpt', 'contain', 'privilege', 'delivery', 'events'])
     ap.add_argument('--fexc', type=pathlib.Path, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
     ap.add_argument('--cpus', type=int, nargs='+', default=[2, 3, 4])
@@ -2374,7 +2404,7 @@ def main():
         global CODE_SHAPE
         CODE_SHAPE = []   # containment holds with object validation alone (the host's default)
     if a.mode == 'kicks' and a.kicks is None: a.kicks = 10_000
-    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery, 'events': cmd_events}[a.mode](a, host, runtime)
+    failed = {'corpora': cmd_corpora, 'smp': cmd_smp, 'litmus': cmd_litmus, 'limits': cmd_limits, 'kicks': cmd_kicks, 'system': cmd_system, 'compat': cmd_compat, 'coherence': cmd_coherence, 'sharedpt': cmd_sharedpt, 'contain': cmd_contain, 'privilege': cmd_privilege, 'delivery': cmd_delivery, 'events': cmd_events}[a.mode](a, host, runtime)
     print('failures:', failed)
     sys.exit(1 if failed else 0)
 

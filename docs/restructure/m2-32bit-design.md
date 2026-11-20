@@ -406,7 +406,8 @@ D. **Diagnostics first (owner: yes, better for diagnostics).** Today a Linux boo
      the shim's state save after 32-bit code skipping the upper eight general and vector registers; the 32-bit wrap of
      base plus offset and a 32-bit fault address. Test: system-family cases for IRET into 32-bit code, an exact page
      fault, the 64 -> 32 -> 64 round trip of the upper registers (otherwise 64-bit processes lose r8-r15 and xmm8-15 at
-     the first context switch), answers locked against QEMU.
+     the first context switch), answers locked against QEMU. Built: [findings](m2-task3a-findings.md) (its decisions,
+     and the list it leaves for 3b).
    - **3b, shim-executed instructions with 32-bit semantics:** EIP and ESP truncation, 32-bit addressing, 32-bit
      PUSHF/POPF/IRET sizes, the x87 state-save formats. Test: 32-bit cases of each in the system family, then a small
      static 32-bit program under the Debian guest.
@@ -444,7 +445,7 @@ waiting for the VM test queue comes on top. "Bugs" rows are the least certain: t
 | 0. First check | 2-3 | 9-17 |
 | 1. Plumbing (control split, mode field, hidden bases 3-5; iced-x86 mapping and comparison 5-12; other 3-5) | 11-22 | 20-39 |
 | 2. Translate 32-bit code (register plan 8-15; allowed-instruction rows 4-8; admission, bases, wrap, checkers 6-11). **Done: about 9** ([findings](m2-task2-findings.md)); the register plan cost nothing in the compiler and moves to task 3a's state save | 18-34 | 38-73 |
-| 3a. Mode-switch mechanism (segment model and IRET/SYSRETL 6-10; register save 3-5; rest and tests 9-15) | 18-30 | 56-103 |
+| 3a. Mode-switch mechanism (segment model and IRET/SYSRETL 6-10; register save 3-5; rest and tests 9-15). **Done: about 8** ([findings](m2-task3a-findings.md)) | 18-30 | 56-103 |
 | 3b. Shim instructions with 32-bit semantics | 11-20 | 67-123 |
 | Checkpoint A: bugs from real programs (static, dynamic, threads, signals, x87) | 10-25 | **77-148** |
 | 4. Speed (stack check 3-6; cast fix 5-11; SYSENTER fast path 5-8; measuring 3-5) | 16-30 | 93-178 |

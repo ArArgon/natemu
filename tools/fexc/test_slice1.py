@@ -437,6 +437,49 @@ class Slice1Cutting(unittest.TestCase):
         d, _ = run32('e800000000', 0xfffffffb)
         self.assertEqual({r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move'}, {'0x0'})
 
+    def test_32_bit_null_fs_gs(self):
+        """M2 task 3a: with --fs-null (--gs-null) an access through FS (GS) in 32-bit code is a system cut, which the host
+        reads at the instruction's own RIP as cut_gated "null_segment" (#GP in the resident); a prefix on an instruction that makes no access through the
+        segment is not, nor the other segment's, nor anything in 64-bit code or without the argument."""
+        pre, post = '01d8' + '31c9', '40'
+        run32 = lambda hexs, *extra: run(hexs, 0x8048000, '--bitness', '32', *extra)
+        access = {'mov r, m': '8b03', 'mov m, r': '8903', 'moffs load': 'a110000000', 'moffs store': 'a310000000', 'add m, imm': '830301',
+                  'push m': 'ff33', 'pop m': '8f03', 'call m': 'ff13', 'movsd': 'a5', 'cmpsb': 'a6', 'lodsd': 'ad', 'xlat': 'd7', 'rep movsb': 'f3a4',
+                  'movzx': '0fb603', 'cmpxchg8b': '0fc70b', 'movups': '0f1003', 'fld m32': 'd903', 'lock inc': 'f0ff03', 'bt m, r': '0fa303'}
+        none = {'lea': '8d03', 'mov r, r': '89c8', 'stosd': 'ab', 'scasb': 'ae', 'push r': '50', 'ret': 'c3', 'prefetcht0': '0f180b', 'nop m': '0f1f00',
+                'inc r': '40'}
+        for prefix, arg, other in (('64', '--fs-null', '--gs-null'), ('65', '--gs-null', '--fs-null')):
+            for name, x in access.items():
+                with self.subTest(name=name, prefix=prefix):
+                    lock, x = ('f0', x[2:]) if x.startswith('f0') else ('', x)
+                    rep, x = ('f3', x[2:]) if x.startswith('f3') else ('', x)
+                    code = lock + rep + prefix + x
+                    d, rc = run32(pre + code + post, arg)
+                    e = d['guest']['end']
+                    self.assertEqual((rc, d['guest']['instructions_translated'], e['rip'], e['reason']),
+                                     (0, 2, hex(0x8048004), 'system_instruction'), (name, e))
+                    d, rc = run32(code + post, arg)   # at the block's RIP: no code, the cut the host answers
+                    self.assertEqual((rc, d['status'], d['guest']['end'].get('cut_gated')), (1, 'no_code', 'null_segment'), name)
+                    for extra in ((), (other,)):      # not null: translated as before
+                        d, rc = run32(pre + code, *extra)
+                        self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end'].get('cut_gated')), (0, 3, None), (name, extra))
+            for name, x in none.items():
+                with self.subTest(name=name, prefix=prefix):
+                    plain, _ = run32(pre + prefix + x)
+                    d, rc = run32(pre + prefix + x, arg)
+                    self.assertEqual((rc, d['guest']['end'].get('cut_gated'), region(d)), (0, None, region(plain)), name)
+            # 64-bit code: a null FS or GS has a base; the argument changes nothing.
+            plain, _ = run(pre + prefix + '8b03')
+            d, rc = run(pre + prefix + '8b03', RIP, arg)
+            self.assertEqual((rc, region(d)), (0, region(plain)))
+        # Of several segment prefixes the last applies; an SSE form gated by CR0/CR4 keeps its #UD/#NM.
+        d, _ = run32('6465' + '8b03', '--gs-null')
+        self.assertEqual(d['guest']['end'].get('cut_gated'), 'null_segment')
+        d, rc = run32('6564' + '8b03', '--gs-null')
+        self.assertEqual((rc, d['guest']['end'].get('cut_gated')), (0, None))
+        d, _ = run32('64' + '0f1003', '--fs-null', '--sse-gated')
+        self.assertEqual(d['guest']['end'].get('cut_gated'), True)
+
     def test_unsupported_forms(self):
         for name, x in UNSUPPORTED.items():
             with self.subTest(name):

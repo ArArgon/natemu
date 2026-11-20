@@ -358,7 +358,8 @@ static std::string CutDetail() {
 static void CutJson(Json& j) {
   j.obj("end").kv("rip", Hex64(fexc_cut.rip)).kv("reason", CutReasonName()).kv("detail", CutDetail());
   if (fexc_cut.reason != FEXC_CUT_DECODER && fexc_cut.reason != FEXC_CUT_STRING) j.kv("cut_opcode_map", int(fexc_cut.map)).kv("cut_opcode", int(fexc_cut.opcode)).kv("cut_fex_name", fexc_cut.name);
-  if (fexc_cut.gated_mmx) j.kv("cut_gated", "mmx");
+  if (fexc_cut.gated_null) j.kv("cut_gated", "null_segment");
+  else if (fexc_cut.gated_mmx) j.kv("cut_gated", "mmx");
   else if (fexc_cut.gated) j.kv("cut_gated", true);
   if (fexc_cut.ud) j.kv("cut_ud", true);
   j.end_obj();
@@ -386,7 +387,7 @@ static void ResetGlobals() {
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
   fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
-  fexc_args_read = 0; Extent = 0;
+  fexc_args_read = 0; Extent = 0; fexc_null_segments = 0;
   fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
 }
 
@@ -409,6 +410,7 @@ struct Setup {
   // The gating arguments (shim FexcArg values; Arm sets them for each request).
   bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, daz = false, ftz = false, accurate = false, push_run = false, narrow_cmp = false;
   uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0;
+  uint8_t null_segments = 0;   // M2 task 3a (--fs-null 1, --gs-null 2): 32-bit code only
   std::vector<std::pair<Config::ConfigOption, std::string>> sets;   // the Config values (ParseArgs)
   // Configure:
   HostFeatures hf {};
@@ -448,6 +450,8 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--push-run") s.push_run = true;     // (slice1; the host always asks) one RSP alignment check covers aligned stack stores (fexc_hook.h)
     else if (a == "--narrow-cmp") s.narrow_cmp = true; // (slice1; the host always asks) 8/16-bit compares with an inline constant (fexc_hook.h)
     else if (a == "--tsc") s.tsc = true;               // slice1 (perf chunk 15): CPL 0, a 24 MHz counter: RDTSC inline
+    else if (a == "--fs-null") s.null_segments |= 1;   // slice1 (M2 task 3a), 32-bit code: FS is null: an access through it is a system cut (#GP)
+    else if (a == "--gs-null") s.null_segments |= 2;   // the same for GS
     else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
     else if (a == "--simd-unmasked") s.simd_unmasked = strtoull(next(), nullptr, 0) & 0x3f;   // slice1 (I5c): MXCSR's unmasked exceptions
@@ -462,7 +466,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--fs-null] [--gs-null] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
   s.slice1 = st.profile == "slice1";
   // M2: the push-run stack option assumes 8-byte stack slots (fexc_hook.h); the host does not ask for it in 32-bit code.
@@ -515,6 +519,7 @@ static void Arm(const Setup& s) {
   fexc_dense_pc_table = s.st.dense_pc;
   fexc_slice1 = s.slice1;
   fexc_bits32 = s.bitness == 32;
+  fexc_null_segments = fexc_bits32 ? s.null_segments : 0;
 }
 
 // FEX's Config is process-global: rebuilt from nothing (Shutdown, Initialize, then `sets`) whenever a request needs other values
