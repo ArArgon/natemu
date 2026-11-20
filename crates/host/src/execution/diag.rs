@@ -1,15 +1,16 @@
 //! M2 task D, diagnostics: a vCPU's report (where it was, the guest RIP, mode and CPL, the instruction bytes, the
-//! registers and the code identity), printed on standard error at a Linux boot's stops ([`Compiler::report`]), when a hang
-//! ends the run (the watchdog forcing a vCPU out of the guest, or the host-side progress check finding one stuck in the
-//! host), and when the process is asked to inspect the VM ([`inspect_on_signal`]: SIGINFO, Ctrl-T on a terminal), after
+//! registers and the code identity), printed on standard error at a Linux boot's stops ([`Compiler::report`]), when a guest
+//! hang ends the run (the watchdog forcing a vCPU out of the guest), when the host-side progress check finds a vCPU waiting
+//! in the host (reported, the run goes on), and when the process is asked to inspect the VM ([`inspect_on_signal`]: SIGINFO, Ctrl-T on a terminal), after
 //! which the vCPUs run on. Nothing here is on a vCPU's path between exits.
 use super::*;
 use natemu_abi::code_object::Site;
 
 /// Where the vCPU was when its report was taken.
 pub(crate) enum At<'a> {
-    /// At an instruction boundary (a stop at a host exit or a resident stop): the bank is the guest state.
-    Stopped,
+    /// At an instruction boundary (a stop at a host exit or a resident stop): the bank is the guest state; not `exact` for a
+    /// resident stop outside execution (stop 0: the bank is as the resident last wrote it).
+    Stopped { exact: bool },
     /// Forced out of the VM (watchdog, cancel or inspection), read on the vCPU's own thread: in translated code (EL0; the
     /// guest registers are in the Arm registers, the RIP is mapped back through the block's access sites) or in the resident
     /// (EL1; the bank is as of its last entry).
@@ -34,9 +35,19 @@ pub fn inspect_on_signal() {
     unsafe extern "C" {
         fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
     }
-    const SIGINFO: i32 = 29;
     unsafe { signal(SIGINFO, asked) };
     INSPECTING.store(true, SeqCst);
+}
+const SIGINFO: i32 = 29;
+/// Blocks SIGINFO on the calling thread (a vCPU's, and the watchdog thread it starts), so the signal never lands during
+/// `hv_vcpu_run`; the process's other threads take it.
+pub(crate) fn block_inspect_signal() {
+    unsafe extern "C" {
+        fn pthread_sigmask(how: i32, set: *const u32, old: *mut u32) -> i32;
+    }
+    const SIG_BLOCK: i32 = 1;
+    let set: u32 = 1 << (SIGINFO - 1); // Darwin's sigset_t: one bit per signal
+    unsafe { pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut()) };
 }
 
 /// The request word's name.
@@ -61,7 +72,8 @@ pub(crate) fn report(area: Area, what: &str, at: At) -> String {
     let mut cpu = state.cpu;
     let v = area.vcpu;
     let (place, rip_note) = match at {
-        At::Stopped => ("stopped at an instruction boundary".to_string(), "exact".to_string()),
+        At::Stopped { exact: true } => ("stopped at an instruction boundary".to_string(), "exact".to_string()),
+        At::Stopped { exact: false } => ("stopped outside execution".to_string(), "as of the bank".to_string()),
         At::Host { request: r, secs } => (
             format!("in the host for {secs:.1} s, serving {} (request {r:#x})", request(r)),
             "exact, as of that exit".to_string(),
@@ -140,10 +152,14 @@ fn mode(c: &Cpu) -> &'static str {
     }
 }
 
-/// Up to 15 bytes at the bank's RIP, through a read-only walk of its page tables (A/D bits untouched).
+/// Up to 15 bytes at the bank's RIP, through a read-only walk of its page tables (A/D bits untouched): CS.base + EIP with the
+/// 32-bit wrap outside 64-bit mode.
 fn bytes(area: Area, c: &Cpu) -> String {
+    let cs = c.seg[exec::SREG_CS];
+    let long = c.efer & exec::EFER_LMA != 0 && cs.attributes & (exec::ATTR_L | exec::ATTR_D) == exec::ATTR_L;
     let mut out = Vec::new();
-    for va in c.rip..c.rip.wrapping_add(15) {
+    for i in 0..15u64 {
+        let va = if long { c.rip.wrapping_add(i) } else { cs.base.wrapping_add(c.rip).wrapping_add(i) & 0xffff_ffff };
         match physical(area, c, va).and_then(|gpa| area.ram.read::<u8>(gpa)) {
             Some(b) => out.push(format!("{b:02x}")),
             None => break,
@@ -211,18 +227,26 @@ fn locate(area: Area, pc: u64) -> Option<(u64, String)> {
         (0..b.sites_count as usize).map(|i| area.read_record(sites_at + i * size_of::<Site>())).collect();
     let end = base.wrapping_add(u64::from(b.guest_bytes));
     let block = format!("in the block at {base:#x} ({} guest bytes)", b.guest_bytes);
-    if let Some(s) = sites
-        .iter()
-        .find(|s| u64::from(s.insn_native_offset) <= native && native <= u64::from(s.native_offset))
-    {
-        let rip = base.wrapping_add(u64::from(s.guest_offset));
-        return Some((rip, format!("exact: at this instruction's memory access, {block}")));
+    let at = |s: &Site| base.wrapping_add(u64::from(s.guest_offset));
+    // Check stubs sit after the body (their native offset in the cold tail, their instruction's start in the body): a PC at
+    // or past the first one is in the stub it follows, which stands for its instruction with the state before it.
+    let (stubs, inline): (Vec<&Site>, Vec<&Site>) =
+        sites.iter().partition(|s| natemu_abi::code_object::kind::is_stub_kind(s.kind));
+    if let Some(s) = stubs.iter().filter(|s| u64::from(s.native_offset) <= native).max_by_key(|s| s.native_offset) {
+        return Some((at(s), format!("exact: in the check stub of this instruction, {block}")));
     }
-    // Between sites: after the last one whose translation starts at or before the PC, before the next one's instruction.
-    let from = sites.iter().rev().find(|s| u64::from(s.insn_native_offset) <= native);
-    let to = sites.iter().find(|s| u64::from(s.insn_native_offset) > native);
-    let low = from.map_or(base, |s| base.wrapping_add(u64::from(s.guest_offset)));
-    let high = to.map_or(end, |s| base.wrapping_add(u64::from(s.guest_offset)));
+    // In the body: the instruction is the one with the latest translation start at or before the PC; exact when one of its
+    // inline sites is at or after the PC (it is still before that access).
+    let from = inline.iter().filter(|s| u64::from(s.insn_native_offset) <= native).max_by_key(|s| s.insn_native_offset);
+    if let Some(f) = from
+        && inline
+            .iter()
+            .any(|s| s.insn_native_offset == f.insn_native_offset && native <= u64::from(s.native_offset))
+    {
+        return Some((at(f), format!("exact: in this instruction, before its memory access, {block}")));
+    }
+    let to = inline.iter().filter(|s| u64::from(s.insn_native_offset) > native).min_by_key(|s| s.insn_native_offset);
+    let (low, high) = (from.map_or(base, |s| at(s)), to.map_or(end, |s| at(s)));
     let between = if sites.is_empty() { "the block has no access sites" } else { "between access sites" };
     Some((low, format!("approximate: an instruction in [{low:#x}, {high:#x}), {between}, {block}")))
 }
@@ -249,16 +273,21 @@ mod tests {
         area.write_record(at, control);
         area.write_record(cache::LOOKUP_OFFSET + cache::INDEX, 0u32);
         let mut b: cache::Block = unsafe { std::mem::zeroed() };
-        (b.rip, b.code, b.code_size, b.sites_count, b.guest_bytes) = (0x5000, 0x2_0000, 0x100, 2, 12);
+        (b.rip, b.code, b.code_size, b.sites_count, b.guest_bytes) = (0x5000, 0x2_0000, 0x100, 3, 12);
         area.write_record(cache::META_OFFSET, b);
-        for (i, (insn, native, guest)) in [(0x10, 0x18, 2), (0x40, 0x48, 7)].into_iter().enumerate() {
+        // Two inline sites, and the check stub of the first instruction in the tail (sorted by native offset).
+        let stub = natemu_abi::code_object::kind::GUARD;
+        for (i, (insn, native, guest, kind)) in [(0x10, 0x18, 2, 0), (0x40, 0x48, 7, 0), (0x10, 0xc0, 2, stub)].into_iter().enumerate() {
             let mut s: Site = unsafe { std::mem::zeroed() };
-            (s.insn_native_offset, s.native_offset, s.guest_offset) = (insn, native, guest);
+            (s.insn_native_offset, s.native_offset, s.guest_offset, s.kind) = (insn, native, guest, kind);
             area.write_record(cache::META_OFFSET + size_of::<cache::Block>() + i * size_of::<Site>(), s);
         }
         let pc = |o: u64| cache::CODE_VA + 0x2_0000 + o;
-        let (rip, note) = locate(area, pc(0x14)).unwrap();
-        assert!(rip == 0x5002 && note.starts_with("exact"), "{note}");
+        for (o, rip) in [(0x14, 0x5002), (0x44, 0x5007), (0xc0, 0x5002), (0xc8, 0x5002)] {
+            let (r, note) = locate(area, pc(o)).unwrap();
+            assert!(r == rip && note.starts_with("exact"), "{o:#x}: {note}");
+        }
+        // (0x60: past the second instruction's access, before the stub: not exact, though the stub's instruction starts before.)
         for (o, low, high) in [(0x8, 0x5000, 0x5002), (0x30, 0x5002, 0x5007), (0x60, 0x5007, 0x500c)] {
             let (rip, note) = locate(area, pc(o)).unwrap();
             assert!(rip == low && note.contains(&format!("[{low:#x}, {high:#x})")), "{o:#x}: {note}");
