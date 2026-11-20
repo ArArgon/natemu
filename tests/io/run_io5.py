@@ -22,7 +22,8 @@ root (first-boot answers come as systemd credentials on the kernel command line;
 Each launch passes only with: every step ok; exit status 0 and "reboot: Power down" on the console; offline (on the
 Mac) e2fsck -fn clean with no journal left to recover and the superblock state "clean"; the guest's dmesg and journal error
 lines (copied out with debugfs) all in EXPECTED; no natemu network guest-error lines. Every step's start and duration
-are recorded; times are not judged (the QEMU run is the matched comparison; compare first boots: natemu's
+are recorded (apt-update and apt-install depend on Debian's servers: they must pass, but each launch's `seconds_compared`
+leaves them out and their times are not compared); times are not judged (the QEMU run is the matched comparison; compare first boots: natemu's
 second boot reuses the first boot's compile cache). --mitigations-off adds mitigations=off on both backends, so both
 guests do the same kernel work; the stock line leaves PTI on, which QEMU TCG's guest also chooses. The download and
 generate loops run for as long as make does, so their work differs between backends; --solo-build times the build alone. The VM lock is held exclusively (a timed comparison).
@@ -82,6 +83,9 @@ PYTESTS = ('test_os test_io test_fileio test_shutil test_tempfile test_subproces
 REQUIRED = {'use': ('apt-update', 'apt-install', 'grow', 'fetch-python', 'configure', 'make', 'download', 'generate',
                     'pytest', 'manifest'),
             'verify': ('check', 'python', 'net')}
+# Steps whose time is Debian's servers' as much as the machine's: they must pass, but their seconds are left out of the
+# launch's compared time (`seconds_compared`) and are not to be compared between runs or backends.
+UNTIMED = ('apt-update', 'apt-install')
 # Kernel lines the guest may log (journal priority err, and dmesg lines matching BAD), each explained:
 EXPECTED = (
     # natemu: devices are virtio-MMIO, no PCI host bridge; with 8 GiB of RAM no hole below 4 GiB is left for PCI BARs.
@@ -117,7 +121,8 @@ if [ $P = use ]; then
   echo https://snapshot.debian.org/archive/debian/@SNAP@/ > /etc/apt/mirrors/debian.list
   echo https://snapshot.debian.org/archive/debian-security/@SNAP@/ > /etc/apt/mirrors/debian-security.list
   sed -i 's/^Types: deb deb-src$/Types: deb/' /etc/apt/sources.list.d/debian.sources
-  echo 'Acquire::Check-Valid-Until "false"; Acquire::Retries "5";' > /etc/apt/apt.conf.d/99io5
+  # One request at a time: Debian's servers sometimes stop answering pipelined HTTPS requests for 30 s (io-plan, November 18).
+  echo 'Acquire::Check-Valid-Until "false"; Acquire::Retries "5"; Acquire::http::Pipeline-Depth "0";' > /etc/apt/apt.conf.d/99io5
   span apt-update apt-get update
   span apt-install apt-get install -y --no-install-recommends cloud-guest-utils fdisk build-essential pkg-config xz-utils \
       curl ca-certificates libssl-dev zlib1g-dev libffi-dev libbz2-dev liblzma-dev libsqlite3-dev libreadline-dev \
@@ -356,8 +361,9 @@ def run(args):
                     with raw_of(disk, qcow, args.out / 'view.raw') as raw: r['problems'] += offline(raw, args.out, phase)
                 if qcow: found, report = qcow2_problems(disk); write_json(args.out / f'qemu-img-check-{phase}.json', report); r['problems'] += found
                 if overlay and digest(args.inputs / 'disk.raw') != recorded['disk.raw']: r['problems'].append('the overlay\'s base disk.raw changed')
-                r.update(exit=code, seconds=seconds, contended=contended); result['phases'][phase] = r
-                print(f'{phase}: exit {code} in {seconds}s, problems {r["problems"]}', flush=True)
+                untimed = sum(float(v[1]) for s, v in r['steps'].items() if s in UNTIMED and len(v) > 1)
+                r.update(exit=code, seconds=seconds, seconds_compared=round(seconds - untimed, 1), untimed=list(UNTIMED), contended=contended); result['phases'][phase] = r
+                print(f'{phase}: exit {code} in {seconds}s ({r["seconds_compared"]}s without {"/".join(UNTIMED)}), problems {r["problems"]}', flush=True)
                 if code != 0 or timed_out: break
     finally:
         stop_group(server)
