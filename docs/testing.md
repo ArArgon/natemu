@@ -263,6 +263,10 @@ Answers that differ between the two runs are dropped where no comparison uses th
 locked one is refused rather than overwritten. Each answer is a hash, with the value inline when it is short, and the steps
 that reproduce it (supplier, pin, program or image hash, arguments).
 
+The compiler's own checks under `tools/fexc` (the smoke check, `check_sites.py`, `verify_precision.py`, `scan_skips.py`,
+the serve and channel tests and the unittest files `test_fexc.py` and `test_slice1.py`) were never steps of
+`run_suite.py`: they are the hand-written `fexc` suite of `tests/static`, each case one script judged by its exit status.
+
 When an answer kept only as a hash differs, the failure can say only that it differs. Run the case again with
 `tools/natemu-test run ... --diff`: a case that failed that way runs once more with live QEMU answers, and the message
 adds what the runner's own field-by-field comparison reports. When the case then passes, either the locked answer is

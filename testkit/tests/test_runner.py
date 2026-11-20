@@ -112,6 +112,9 @@ def test_hand_written_io_suites_survive_regeneration():
                             'serial-unpaced', 'serial-paced', 'serial-loaded', 'soak'}}
     for suite, cases in want.items():
         assert cases <= set(f.suite(suite).extra['cases']), suite
+    f = family.load(paths.repo_root() / 'tests' / 'static' / 'family.toml')
+    assert {'fexc-smoke', 'fexc-sites', 'fexc-sites-slice1', 'fexc-precision', 'fexc-skips', 'fexc-serve',
+            'fexc-channel', 'fexc-unit', 'fexc-slice1'} <= set(f.suite('fexc').extra['cases'])
     f = family.load(paths.repo_root() / 'tests' / 'smp' / 'family.toml')
     assert 'capacity-apic-selfcheck' in f.suite('capacity-selfcheck').extra['cases']
     assert {'capacity', 'capacity-apic'} <= set(f.suite('capacity').extra['cases'])

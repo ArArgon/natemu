@@ -1,5 +1,5 @@
 """The expected final state of run_slice2_probes.PROBES (the loop programs), from a small interpreter of their unrolled
-form's instructions (SDM Vol.2: MOV, ADD, SUB, XOR, two-operand IMUL, ROL by an immediate, LEA, DEC, PUSH imm32, and ADD
+form's instructions (SDM Vol.2: MOV, ADD, SUB, XOR, two-operand IMUL, ROL by an immediate, LEA, DEC, PUSH (imm32 or a 64-bit register), POP to a 64-bit register, and ADD
 to a qword in memory): `expected(probe)` -> a result in ref.py's format, as add_chain gives for the long loops. Every
 probe ends with a `dec` to 0 after a CF-defining instruction, so all the compared flags are defined. Equal to the answers
 QEMU 11.1.2 gave (tools/test_slice2_expected.py, tools/reference/crosscheck/slice2.json)."""
@@ -72,7 +72,11 @@ class Machine:
             self.set(args[0], self.addr(args[1].strip('[]')))
         elif op == 'push':
             self.g[R64['rsp']] = (self.g[R64['rsp']] - 8) & M
-            self.store(self.g[R64['rsp']], int(args[0], 0) & M)
+            self.store(self.g[R64['rsp']], self.read(self.operand(args[0])) & M)
+        elif op == 'pop':
+            v = self.load(self.g[R64['rsp']])
+            self.g[R64['rsp']] = (self.g[R64['rsp']] + 8) & M
+            self.set(args[0], v)
         elif op in ('add', 'sub'):
             d, s = self.operand(args[0]), self.operand(args[1])
             n, a, b = self.bits(d), self.read(d), self.read(s) & ((1 << self.bits(d)) - 1)
