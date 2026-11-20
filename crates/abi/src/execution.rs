@@ -2852,8 +2852,10 @@ pub mod system {
     pub const MOV_FROM_DR: u32 = 11;
     /// RDPMC (the profile has no performance counters: always #GP(0) or #UD).
     pub const RDPMC: u32 = 12;
-    /// LGDT/LIDT m16&64, SGDT/SIDT m (memory operand). The resident dispatches these by ranges of kinds (the runtime
-    /// may not use jump tables, `tests/static/check_resident_stack.py`): keep each group contiguous.
+    /// LGDT/LIDT m16&64, SGDT/SIDT m (memory operand); `size` the operand size: 8 in 64-bit mode (a 10-byte image), else 4
+    /// or 2 (a 6-byte image: LGDT/LIDT keep 24 bits of the base at 2, SGDT/SIDT store 32). The resident dispatches these
+    /// by ranges of kinds (the runtime may not use jump tables, `tests/static/check_resident_stack.py`): keep each group
+    /// contiguous.
     pub const LGDT: u32 = 13;
     pub const LIDT: u32 = 14;
     pub const SGDT: u32 = 15;
@@ -3045,6 +3047,15 @@ pub mod system {
     pub const REP: u32 = 1;
     pub const ADDRESS32: u32 = 2;
     pub const ADDRESS16: u32 = 4;
+    /// rSI, rDI or rCX as INS/OUTS write them at the address size of `prefixes`: 16 bits merged into `old`, 32 bits
+    /// zero-extended (a 32-bit register write), 64 bits whole.
+    pub fn address_register(prefixes: u32, old: u64, new: u64) -> u64 {
+        match prefixes & (ADDRESS32 | ADDRESS16) {
+            ADDRESS16 => old & !0xffff | new & 0xffff,
+            ADDRESS32 => new & 0xffff_ffff,
+            _ => new,
+        }
+    }
     impl super::System {
         pub const NONE: Self = Self {
             kind: 0,
@@ -3089,7 +3100,7 @@ pub mod system {
                     }
                     RDMSR | WRMSR | CPUID | RDTSC | RDTSCP | RDPMC => true,
                     SET_CPL => matches!(self.cr, 0 | 3),
-                    LGDT..=SIDT => self.memory == 1 && address,
+                    LGDT..=SIDT => self.memory == 1 && address && matches!(self.size, 2 | 4 | 8),
                     SLDT..=MOV_FROM_SREG => rm && self.cr < 8 && matches!(self.size, 2 | 4 | 8),
                     LLDT..=MOV_TO_SREG => rm && self.cr < 8,
                     JMP_FAR..=CALL_FAR => {
@@ -3200,12 +3211,14 @@ pub mod system {
                         self.memory == 0
                             && matches!(self.size, 1 | 2 | 4)
                             && self.prefixes < 8
+                            && self.prefixes & (ADDRESS32 | ADDRESS16) != ADDRESS32 | ADDRESS16
                             && self.segment as usize == super::SREG_ES
                     }
                     OUTS => {
                         self.memory == 0
                             && matches!(self.size, 1 | 2 | 4)
                             && self.prefixes < 8
+                            && self.prefixes & (ADDRESS32 | ADDRESS16) != ADDRESS32 | ADDRESS16
                             && self.segment as usize <= super::SREG_GS
                     }
                     _ => false,
@@ -4777,6 +4790,17 @@ mod tests {
         assert_eq!(divide(true, 0, 5, 0), None);
     }
 
+    /// INS/OUTS write rSI/rDI/rCX at their address size: 16 bits keep 63:16, 32 bits zero-extend, 64 bits whole.
+    #[test]
+    fn string_registers_follow_the_address_size() {
+        use system::{ADDRESS16, ADDRESS32, address_register};
+        let (old, new) = (0x1234_5678_9abc_def0, 0xffff_ffff_0000_0001);
+        assert_eq!(address_register(ADDRESS16, old, new), 0x1234_5678_9abc_0001);
+        assert_eq!(address_register(ADDRESS32, old, new), 0x0000_0001);
+        assert_eq!(address_register(system::REP, old, new), new);
+        assert_eq!(address_register(system::REP | ADDRESS16, old, 0xffff), 0x1234_5678_9abc_ffff);
+    }
+
     #[test]
     fn system_replies_are_range_checked() {
         let mov = System {
@@ -4815,6 +4839,15 @@ mod tests {
             ..System::NONE
         };
         assert!(ltr.well_formed() && far.well_formed() && ret.well_formed());
+        let outs = System {
+            kind: system::OUTS,
+            length: 1,
+            size: 1,
+            segment: 3,
+            prefixes: system::REP | system::ADDRESS16,
+            ..System::NONE
+        };
+        assert!(outs.well_formed());
         assert!(
             System {
                 kind: system::IRET,
@@ -4873,6 +4906,14 @@ mod tests {
                 prefixes: system::ADDRESS32 | system::ADDRESS16,
                 ..mov
             }, // two address sizes
+            System {
+                kind: system::OUTS,
+                length: 1,
+                size: 1,
+                segment: 3,
+                prefixes: system::REP | system::ADDRESS32 | system::ADDRESS16,
+                ..System::NONE
+            }, // likewise on OUTS
             System {
                 kind: system::MOV_FROM_DR,
                 cr: 16,

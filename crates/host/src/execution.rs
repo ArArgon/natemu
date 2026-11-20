@@ -3182,6 +3182,24 @@ impl Compiler {
                         ..exec::System::NONE
                     })
                 };
+                // A system cut: the host's decode of it, in 64-bit code only (the resident runs no other mode yet,
+                // `Cpu::control`). FEX and iced reading different instructions there is refused (logged); one that reads
+                // past the bytes waits for the next page (its fetch fault comes before any #UD).
+                let decoded = match cut {
+                    Some(c) if gated.is_none() && !*ud => {
+                        let decoded = crate::system::decode(bytes, 64);
+                        if reason == "system_instruction" {
+                            if !crate::system::cut_matches(bytes, 64, *c) {
+                                return Ok(Ok(Self::refused("system_opcode_mismatch", bytes, rip)));
+                            }
+                            if decoded.is_err() {
+                                return Ok(Ok(Self::refused("partial_decode", bytes, rip)));
+                            }
+                        }
+                        decoded.ok().flatten()
+                    }
+                    _ => None,
+                };
                 // I10: an encoding fexc found reserved or unadvertised: #UD whatever its operands (RIP stays at it).
                 let ud = ud.then_some(exec::System {
                     kind: exec::system::UD,
@@ -3191,8 +3209,7 @@ impl Compiler {
                 match ud.or_else(|| {
                     cut.and_then(|cut| match gated {
                         Some(mmx) => gated_kind(cut, *mmx),
-                        // 64-bit code only: the resident runs no other mode yet (`Cpu::control`).
-                        None => crate::system::decode(bytes, 64),
+                        None => decoded,
                     })
                 }) {
                     Some(s) if reason == "system_instruction" => Ok(Code::System(s)),

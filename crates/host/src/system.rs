@@ -28,29 +28,62 @@ pub(crate) fn opcode_at(insn: &[u8]) -> (usize, u8) {
     (insn.len(), rex)
 }
 
+/// Whether fexc's opcode map and opcode (`FEXC_MAP_*`: 0 primary, 1..4 two-byte with no or an F3, F2, 66 overlay, 5 0f
+/// 38, 6 0f 3a, 8 the opcode after a VEX prefix) name the opcode at the start of `bytes` in a `bitness`-bit code segment,
+/// past its prefixes (REX bytes among them in 64-bit mode only). Outside 64-bit mode C4/C5 is VEX only with ModRM.mod
+/// 11b, else LES/LDS. A disagreement is FEX and iced reading different instructions there.
+pub(crate) fn cut_matches(bytes: &[u8], bitness: u32, (map, opcode): (u8, u8)) -> bool {
+    let at = if bitness == 64 {
+        opcode_at(bytes).0
+    } else {
+        let legacy = |b: &&u8| {
+            matches!(
+                b,
+                0xf0 | 0xf2 | 0xf3 | 0x66 | 0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65
+            )
+        };
+        bytes.iter().take_while(legacy).count()
+    };
+    let b = &bytes[at..];
+    let vex = matches!(b, [0xc4 | 0xc5, m, ..] if bitness == 64 || m >> 6 == 3);
+    match (map, b) {
+        (8, [0xc5, _, op, ..] | [0xc4, _, _, op, ..]) => vex && *op == opcode,
+        (5, [0x0f, 0x38, op, ..]) | (6, [0x0f, 0x3a, op, ..]) => *op == opcode,
+        // An escape byte is no opcode of these maps.
+        (1..=4, [0x0f, op, ..]) => !matches!(op, 0x38 | 0x3a) && *op == opcode,
+        (0, [op, ..]) => !vex && *op != 0x0f && *op == opcode,
+        _ => false,
+    }
+}
+
+/// An instruction that reads past the bytes supplied, or whose verdict depends on bytes past them: the caller fetches the
+/// next page first (its fetch fault comes before any #UD).
+#[derive(Debug, PartialEq)]
+pub(crate) struct Truncated;
+
 /// Decodes the instruction at the start of `bytes`, which fexc cut as a system instruction, in a `bitness`-bit code
-/// segment (64, 32 or 16). `None` for a truncated instruction or a form with no record.
-pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Option<System> {
+/// segment (64, 32 or 16). `None` for a form with no record.
+pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Result<Option<System>, Truncated> {
     use Code::*;
     use system::*;
-    // fexc cut a whole instruction, but `bytes` may end with it: iced calls an encoding it finds no instruction in "no
-    // more bytes" unless 15 are there, so it decodes them padded; a longer instruction than `bytes` is truncated.
+    // `bytes` may end with the instruction: iced calls an encoding it finds no instruction in "no more bytes" unless 15 are
+    // there, so it decodes them padded; whatever iced read of the padding (an instruction or no instruction) is truncated.
     let mut padded = [0; 15];
     padded[..bytes.len().min(15)].copy_from_slice(&bytes[..bytes.len().min(15)]);
     // The Reserved-NOP cells (0f 0d, 0f 18..1f) decode as such whatever prefetch, CET or MPX form they also are.
     let i = Decoder::new(bitness, &padded, DecoderOptions::FORCE_RESERVED_NOP).decode();
-    if !i.is_invalid() && i.len() > bytes.len() {
-        return None;
+    if i.len() > bytes.len() {
+        return Err(Truncated);
     }
-    // #UD leaves RIP at the instruction: no operand is used, nor the length (iced's, at most `bytes`, for no instruction).
-    let length = i.len().min(bytes.len()) as u32;
+    // #UD leaves RIP at the instruction: no operand is used.
+    let length = i.len() as u32;
     let ud = Some(System {
         kind: UD,
         length,
         ..System::NONE
     });
     if i.is_invalid() || !available(&i) {
-        return ud;
+        return Ok(ud);
     }
     let mut s = System {
         length,
@@ -87,7 +120,7 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Option<System> {
             (MOV_FROM_DR, 0)
         }
         // An FS/GS override on INVLPG: not decoded.
-        Invlpg_m if matches!(i.segment_prefix(), Register::FS | Register::GS) => return None,
+        Invlpg_m if matches!(i.segment_prefix(), Register::FS | Register::GS) => return Ok(None),
         Invlpg_m => (INVLPG, 0),
         Rdmsr => (RDMSR, 0),
         Wrmsr => (WRMSR, 0),
@@ -104,7 +137,7 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Option<System> {
         | Wrfsbase_r64 | Wrgsbase_r32 | Wrgsbase_r64
             if bytes[..opcode_at(bytes).0].contains(&0x66) =>
         {
-            return None;
+            return Ok(None);
         }
         Clts => (CLTS, 0),
         Sysenter => (SYSENTER, 0),
@@ -123,11 +156,13 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Option<System> {
         Fninit => (FNINIT, 0),
         Fnclex => (FNCLEX, 0),
         Ud0 | Ud0_r16_rm16 | Ud0_r32_rm32 | Ud0_r64_rm64 | Ud1_r16_rm16 | Ud1_r32_rm32
-        | Ud1_r64_rm64 | Ud2 => return ud,
-        Sgdt_m1632_16 | Sgdt_m1632 | Sgdt_m1664 => (SGDT, 0),
-        Sidt_m1632_16 | Sidt_m1632 | Sidt_m1664 => (SIDT, 0),
-        Lgdt_m1632_16 | Lgdt_m1632 | Lgdt_m1664 => (LGDT, 0),
-        Lidt_m1632_16 | Lidt_m1632 | Lidt_m1664 => (LIDT, 0),
+        | Ud1_r64_rm64 | Ud2 => return Ok(ud),
+        // The descriptor-table forms: `size` the operand size, 8 (64-bit mode: the 10-byte image), else 4 or 2 (the 6-byte
+        // image; LGDT/LIDT keep 24 bits of the base at 2).
+        Sgdt_m1632_16 | Sgdt_m1632 | Sgdt_m1664 => (SGDT, operand_size(i.code())),
+        Sidt_m1632_16 | Sidt_m1632 | Sidt_m1664 => (SIDT, operand_size(i.code())),
+        Lgdt_m1632_16 | Lgdt_m1632 | Lgdt_m1664 => (LGDT, operand_size(i.code())),
+        Lidt_m1632_16 | Lidt_m1632 | Lidt_m1664 => (LIDT, operand_size(i.code())),
         // SMSW r/m16, r32, r64 (a memory destination is always 16 bits) and LMSW r/m16. F2/F3 on SMSW (reserved) are ignored,
         // as on the reference AMD machine (owner rule; user-mode probe, November 3: every F2/F3 form took the UMIP #GP of
         // plain SMSW, none #UD; plan §5).
@@ -236,7 +271,7 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Option<System> {
         Insb_m8_DX | Insw_m16_DX | Insd_m32_DX | Outsb_DX_m8 | Outsw_DX_m16 | Outsd_DX_m32 => {
             let ins = matches!(i.code(), Insb_m8_DX | Insw_m16_DX | Insd_m32_DX);
             if i.has_repne_prefix() {
-                return None;
+                return Ok(None);
             }
             rep = true;
             s.prefixes = u32::from(i.has_rep_prefix()) * REP | address_size(&i);
@@ -427,10 +462,10 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Option<System> {
             (s.reg, s.cr) = (gpr(1), u32::from(i.immediate8()));
             (CVTPS2PH, i.memory_size().size() as u32)
         }
-        _ => return None,
+        _ => return Ok(None),
     };
     if !rep && (i.has_rep_prefix() || i.has_repne_prefix()) {
-        return None;
+        return Ok(None);
     }
     (s.kind, s.size) = (kind, size);
     let memory = (0..i.op_count()).map(|k| i.op_kind(k)).find(|&k| {
@@ -470,7 +505,7 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Option<System> {
         }
         _ => {}
     }
-    s.well_formed().then_some(s)
+    Ok(s.well_formed().then_some(s))
 }
 
 /// The operand size (bytes) of the forms [`decode`] takes it from iced's name of: `_rm16`/`w` 2, `_r64m16`/`q` 8, else 4.
@@ -480,10 +515,11 @@ fn operand_size(c: Code) -> u32 {
         Smsw_rm16 | Sldt_rm16 | Str_rm16 | Lldt_rm16 | Ltr_rm16 | Verr_rm16 | Verw_rm16
         | Mov_rm16_Sreg | Mov_Sreg_rm16 | Pushw_ES | Pushw_CS | Pushw_SS | Pushw_DS | Pushw_FS
         | Pushw_GS | Popw_ES | Popw_SS | Popw_DS | Popw_FS | Popw_GS | Enterw_imm16_imm8
-        | Retfw | Retfw_imm16 => 2,
+        | Retfw | Retfw_imm16 | Sgdt_m1632_16 | Sidt_m1632_16 | Lgdt_m1632_16 | Lidt_m1632_16 => 2,
         Smsw_r64m16 | Sldt_r64m16 | Str_r64m16 | Lldt_r64m16 | Ltr_r64m16 | Verr_r64m16
         | Verw_r64m16 | Mov_r64m16_Sreg | Mov_Sreg_r64m16 | Pushq_FS | Pushq_GS | Popq_FS
-        | Popq_GS | Enterq_imm16_imm8 | Retfq | Retfq_imm16 => 8,
+        | Popq_GS | Enterq_imm16_imm8 | Retfq | Retfq_imm16 | Sgdt_m1664 | Sidt_m1664
+        | Lgdt_m1664 | Lidt_m1664 => 8,
         _ => 4,
     }
 }
@@ -526,24 +562,16 @@ fn segment(i: &Instruction, bitness: u32) -> u32 {
     segment.number() as u32
 }
 
-/// Whether the presented CPU has the instruction: any of iced's CPUID features for it that the catalogue (generated
-/// `natemu_abi::cpu_gates`) advertises; while all of the catalogue's are clear, or it is a feature no profile has
-/// ([`NEVER`]), the instruction is #UD (SDM Vol.2 each: "#UD If CPUID ... = 0", or "not in VMX operation"). Features
+/// Whether the presented CPU has the instruction: every one of iced's CPUID features for it (XTEST's either of HLE and
+/// RTM) that the catalogue (generated `natemu_abi::cpu_gates`) lists is advertised, and none is one no profile has
+/// ([`NEVER`]); else the instruction is #UD (SDM Vol.2 each: "#UD If CPUID ... = 0", or "not in VMX operation"). Features
 /// outside both (X64, INTEL386, MSR ..) are every 64-bit processor's.
 fn available(i: &Instruction) -> bool {
-    let mut base = true;
-    let features = i.cpuid_features().iter().flat_map(|&f| match f {
-        CpuidFeature::HLE_or_RTM => vec![CpuidFeature::HLE, CpuidFeature::RTM],
-        f => vec![f],
-    });
-    for f in features {
-        match catalogue(f) {
-            Some(g) if advertised(g) => return true,
-            Some(_) => base = false,
-            None => base &= !NEVER.contains(&f),
-        }
-    }
-    base
+    let has = |f| catalogue(f).map_or(!NEVER.contains(&f), advertised);
+    i.cpuid_features().iter().all(|&f| match f {
+        CpuidFeature::HLE_or_RTM => has(CpuidFeature::HLE) || has(CpuidFeature::RTM),
+        f => has(f),
+    })
 }
 /// The features of the system instructions the catalogue does not list, which the presented CPU has none of: ENCLV
 /// (OSS), the SVM group, PCONFIG, WRMSRNS, MONITORX/MWAITX, CLZERO, RDPRU, the SEV-SNP and INVLPGB groups, TDX's SEAM
@@ -871,6 +899,12 @@ pub(crate) fn branch(bytes: &[u8], rip: u64) -> Option<System> {
     })
 }
 
+/// [`decode`]'s record, `None` for a truncated instruction too.
+#[cfg(test)]
+fn dec(bytes: &[u8], bitness: u32) -> Option<System> {
+    decode(bytes, bitness).ok().flatten()
+}
+
 #[cfg(test)]
 mod x1c_tests {
     fn b(hex: &str) -> Vec<u8> {
@@ -1052,7 +1086,7 @@ mod x1c_tests {
     fn unadvertised_forms_follow_the_catalogue() {
         use super::gf::*;
         use super::system;
-        let kind = |hex: &str| super::decode(&b(hex), 64).map(|s| s.kind);
+        let kind = |hex: &str| super::dec(&b(hex), 64).map(|s| s.kind);
         let mut checked = 0;
         for (hex, features) in [
             ("0fc7f8", &[GF_RDSEED][..]),
@@ -1113,7 +1147,7 @@ mod x1c_tests {
     #[test]
     fn reserved_nops() {
         use super::system::RESERVED_NOP;
-        let d = |hex: &str| super::decode(&b(hex), 64).map(|s| (s.kind, s.length));
+        let d = |hex: &str| super::dec(&b(hex), 64).map(|s| (s.kind, s.length));
         for (hex, length) in [
             ("0f1820", 3),
             ("0f18c0", 3),
@@ -1134,7 +1168,7 @@ mod x1c_tests {
     #[test]
     fn push_pop_fs_gs() {
         use super::system::{POP_SREG, PUSH_SREG};
-        let d = |hex: &str| super::decode(&b(hex), 64).map(|s| (s.kind, s.cr, s.size, s.length));
+        let d = |hex: &str| super::dec(&b(hex), 64).map(|s| (s.kind, s.cr, s.size, s.length));
         let (fs, gs) = (
             natemu_abi::execution::SREG_FS as u32,
             natemu_abi::execution::SREG_GS as u32,
@@ -1185,7 +1219,7 @@ mod lock_tests {
             &[0x48, 0xc5, 0xf8, 0x77],
         ] {
             assert!(
-                super::decode(bytes, 64)
+                super::dec(&[bytes, &[0x90; 4]].concat(), 64)
                     .is_some_and(|s| s.well_formed() && s.kind == super::system::UD),
                 "{bytes:x?}"
             );
@@ -1203,12 +1237,15 @@ mod lock_tests {
             &[0x48, 0xf0, 0x89, 0x03],
             &[0x48, 0xf0, 0x0f, 0x22, 0xd8],
         ] {
-            let s = super::decode(bytes, 64).unwrap();
+            let s = super::dec(&[bytes, &[0x90; 4]].concat(), 64).unwrap();
             assert!(s.well_formed() && s.kind == super::system::UD, "{bytes:x?}");
         }
         // No LOCK, or an f0 byte after the opcode (a ModRM or immediate) is no prefix: no system instruction.
         for bytes in [&[0x89, 0x03][..], &[0x48, 0x89, 0xf0], &[0xb0, 0xf0], &[]] {
-            assert!(super::decode(bytes, 64).is_none(), "{bytes:x?}");
+            assert!(
+                super::dec(&[bytes, &[0x90; 4]].concat(), 64).is_none(),
+                "{bytes:x?}"
+            );
         }
     }
 }
@@ -1323,6 +1360,76 @@ mod tests {
         s.is_none_or(|s| s.kind == UD)
     }
 
+    /// LGDT/LIDT/SGDT/SIDT: the operand size per mode (8 in 64-bit mode whatever 66 says; 4, or 2 with 66, in 32-bit
+    /// code; 2, or 4 with 66, in 16-bit code).
+    #[test]
+    fn descriptor_table_sizes() {
+        let size = |bits, b: &[u8]| dec(&[b, &[0x90; 4]].concat(), bits).map(|s| (s.kind, s.size));
+        for (bits, plain, o16) in [(64, 8, 8), (32, 4, 2), (16, 2, 4)] {
+            for (modrm, kind) in [(0x10, LGDT), (0x18, LIDT), (0x00, SGDT), (0x08, SIDT)] {
+                assert_eq!(
+                    size(bits, &[0x0f, 0x01, modrm]),
+                    Some((kind, plain)),
+                    "{bits} {modrm:x}"
+                );
+                assert_eq!(
+                    size(bits, &[0x66, 0x0f, 0x01, modrm]),
+                    Some((kind, o16)),
+                    "{bits} 66 {modrm:x}"
+                );
+            }
+        }
+    }
+
+    /// fexc's opcode map and opcode must be the bytes' (the prefixes, REX in 64-bit mode only, skipped).
+    #[test]
+    fn cut_matches_the_bytes() {
+        let h = |hex: &str| -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        for (hex, bits, cut, ok) in [
+            ("0f22d8", 64, (1, 0x22), true),
+            ("0f22d8", 64, (1, 0x20), false),
+            ("0f22d8", 64, (6, 0x22), false),
+            ("0f22d8", 64, (0, 0x0f), false),
+            ("f3480faec0", 64, (2, 0xae), true),
+            ("660f388200", 64, (5, 0x82), true),
+            ("660f388200", 64, (1, 0x38), false),
+            ("48cf", 64, (0, 0xcf), true),
+            ("48cf", 32, (0, 0xcf), false), // 48 is DEC EAX outside 64-bit mode
+            ("48c5f877", 64, (8, 0x77), true),
+            ("c4e26d90048f", 64, (8, 0x90), true),
+            ("c51e", 32, (0, 0xc5), true), // LDS ebx, [esi]: mod 00
+            ("c51e", 32, (8, 0x1e), false),
+            ("c5f877", 32, (8, 0x77), true), // mod 11: VEX
+            ("c5f877", 32, (0, 0xc5), false),
+        ] {
+            assert_eq!(cut_matches(&h(hex), bits, cut), ok, "{hex} {bits} {cut:x?}");
+        }
+    }
+
+    /// An instruction iced decodes from the padding, or no instruction it found only by reading the padding, waits for the
+    /// next page: neither a record nor #UD.
+    #[test]
+    fn truncated_instructions_wait_for_the_next_page() {
+        for b in [
+            &[0x0f, 0x01][..],
+            &[0xcd],
+            &[0xf0, 0x0f],
+            &[0x0f, 0x01, 0x3c],
+            &[0xc4, 0xe2],
+        ] {
+            assert_eq!(decode(b, 64), Err(Truncated), "{b:x?}");
+        }
+        assert_eq!(
+            decode(&[0xcd, 0x80], 64).map(|s| s.map(|s| s.kind)),
+            Ok(Some(INT))
+        );
+    }
+
     /// The 32- and 16-bit decode (nothing runs it yet): operand and address sizes, the segment an override names (not
     /// ignored outside 64-bit mode) and 16-bit address forms, the segment loads only those modes have.
     #[test]
@@ -1332,7 +1439,7 @@ mod tests {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
-            decode(&[bytes, vec![0x90; 4]].concat(), bits)
+            dec(&[bytes, vec![0x90; 4]].concat(), bits)
         };
         let ds = SREG_DS as u32;
         let m32 = |kind, base, disp, length| System {
@@ -1366,7 +1473,13 @@ mod tests {
                 ..m32(CALL_FAR, NO_REG, 0x1000, 6)
             })
         );
-        assert_eq!(at(32, "0f0110"), Some(m32(LGDT, 0, 0, 3)));
+        assert_eq!(
+            at(32, "0f0110"),
+            Some(System {
+                size: 4,
+                ..m32(LGDT, 0, 0, 3)
+            })
+        );
         // 16-bit address forms: mov ds, [bx+si]; mov ds, [bp-8] (SS by default)
         assert_eq!(
             at(32, "678e18"),
@@ -1489,7 +1602,7 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
-        decode(&[bytes, vec![0x90; 4]].concat(), 64)
+        dec(&[bytes, vec![0x90; 4]].concat(), 64)
     }
     fn mov(kind: u32, cr: u32, reg: u32, length: u32, lock: u32) -> System {
         System {
@@ -1523,9 +1636,10 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
-        decode(&[bytes, vec![0x90; 4]].concat(), 64)
+        dec(&[bytes, vec![0x90; 4]].concat(), 64)
     }
-    /// A memory operand in its default segment (SS for an RSP or RBP base, else DS).
+    /// A memory operand in its default segment (SS for an RSP or RBP base, else DS); the descriptor-table forms at their
+    /// 64-bit operand size.
     fn mem(kind: u32, base: u32, disp: i64, length: u32) -> System {
         System {
             kind,
@@ -1533,6 +1647,7 @@ mod tests {
             disp,
             length,
             memory: 1,
+            size: if (LGDT..=SIDT).contains(&kind) { 8 } else { 0 },
             segment: if matches!(base, 4 | 5) {
                 SREG_SS
             } else {
@@ -1774,7 +1889,7 @@ mod tests {
                 .step_by(2)
                 .map(|k| u8::from_str_radix(&hex[k..k + 2], 16).unwrap())
                 .collect();
-            let i = decode(&bytes, 64).unwrap();
+            let i = dec(&bytes, 64).unwrap();
             assert_eq!(
                 (i.kind, i.reg, i.size, i.length),
                 (CVTPS2PH, reg, size, length)
@@ -1785,7 +1900,7 @@ mod tests {
             [0xc4, 0xe3, 0xf9, 0x1d, 7, 0],
             [0xc4, 0xe3, 0x71, 0x1d, 7, 0],
         ] {
-            assert!(refused(decode(&bytes, 64)));
+            assert!(refused(dec(&bytes, 64)));
         }
     }
 
@@ -1798,7 +1913,7 @@ mod tests {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
-            decode(&[bytes, vec![0x90; 4]].concat(), 64)
+            dec(&[bytes, vec![0x90; 4]].concat(), 64)
         };
         let g = |reg, cr, index, base, scale, disp, size, length| {
             Some(System {
@@ -1927,15 +2042,15 @@ mod tests {
                 ..System::NONE
             })
         };
-        assert_eq!(super::decode(&[0xcc], 64), s(INT3, 0, 1));
-        assert_eq!(super::decode(&[0xf1], 64), s(INT1, 0, 1));
-        assert_eq!(super::decode(&[0xcd, 0x80], 64), s(INT, 0x80, 2));
-        assert_eq!(super::decode(&[0xcd], 64), None); // truncated immediate
-        assert_eq!(super::decode(&[0xce], 64), s(UD, 0, 1)); // INTO: no 64-bit form
-        assert_eq!(super::decode(&[0x0f, 0x0b], 64), s(UD, 0, 2));
-        assert_eq!(super::decode(&[0x0f, 0xb9, 0xc0], 64), s(UD, 0, 3));
+        assert_eq!(super::dec(&[0xcc], 64), s(INT3, 0, 1));
+        assert_eq!(super::dec(&[0xf1], 64), s(INT1, 0, 1));
+        assert_eq!(super::dec(&[0xcd, 0x80], 64), s(INT, 0x80, 2));
+        assert_eq!(super::dec(&[0xcd], 64), None); // truncated immediate
+        assert_eq!(super::dec(&[0xce, 0x90], 64).map(|s| s.kind), Some(UD)); // INTO: no 64-bit form
+        assert_eq!(super::dec(&[0x0f, 0x0b], 64), s(UD, 0, 2));
+        assert_eq!(super::dec(&[0x0f, 0xb9, 0xc0], 64), s(UD, 0, 3));
         assert_eq!(
-            super::decode(&[0xf0, 0xcc], 64).map(|s| (s.kind, s.lock)),
+            super::dec(&[0xf0, 0xcc, 0x90, 0x90, 0x90, 0x90], 64).map(|s| (s.kind, s.lock)),
             Some((UD, 0))
         ); // #UD by LOCK
     }
@@ -1950,15 +2065,15 @@ mod tests {
                 ..System::NONE
             })
         };
-        assert_eq!(super::decode(&[0xfa], 64), s(CLI, 0, 1));
-        assert_eq!(super::decode(&[0xfb], 64), s(STI, 0, 1));
-        assert_eq!(super::decode(&[0xf4], 64), s(HLT, 0, 1));
-        assert_eq!(super::decode(&[0x9d], 64), s(POPF, 8, 1));
-        assert_eq!(super::decode(&[0x48, 0x9d], 64), s(POPF, 8, 2));
-        assert_eq!(super::decode(&[0x66, 0x9d], 64), s(POPF, 2, 2));
-        assert_eq!(super::decode(&[0x66, 0x48, 0x9d], 64), s(POPF, 8, 3)); // REX.W wins
+        assert_eq!(super::dec(&[0xfa], 64), s(CLI, 0, 1));
+        assert_eq!(super::dec(&[0xfb], 64), s(STI, 0, 1));
+        assert_eq!(super::dec(&[0xf4], 64), s(HLT, 0, 1));
+        assert_eq!(super::dec(&[0x9d], 64), s(POPF, 8, 1));
+        assert_eq!(super::dec(&[0x48, 0x9d], 64), s(POPF, 8, 2));
+        assert_eq!(super::dec(&[0x66, 0x9d], 64), s(POPF, 2, 2));
+        assert_eq!(super::dec(&[0x66, 0x48, 0x9d], 64), s(POPF, 8, 3)); // REX.W wins
         assert_eq!(
-            super::decode(&[0xf0, 0xfa], 64).map(|s| (s.kind, s.lock)),
+            super::dec(&[0xf0, 0xfa, 0x90, 0x90, 0x90, 0x90], 64).map(|s| (s.kind, s.lock)),
             Some((UD, 0))
         ); // #UD by LOCK
         assert!(
@@ -1978,7 +2093,7 @@ mod tests {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
-            decode(&bytes, 64)
+            dec(&bytes, 64)
         };
         for (hex, size, cr, reg) in [
             ("d210", 1, 0, 1),
@@ -2026,8 +2141,8 @@ mod tests {
         assert_eq!(bt("0fbb0b"), Some((BT_ALIGNED, 3, 1, 4, 1, 3, 3))); // btc
         assert_eq!(bt("0fba2b05"), Some((BT_ALIGNED, 1, NO_REG, 4, 1, 3, 4))); // bts dword [rbx], 5
         assert_eq!(bt("0fa3cb"), None); // register operand: never cut
-        let w = super::decode(&[0x48, 0x0f, 0xab, 0x0b], 64).unwrap();
-        let h = super::decode(&[0x66, 0x0f, 0xab, 0x0b], 64).unwrap();
+        let w = super::dec(&[0x48, 0x0f, 0xab, 0x0b], 64).unwrap();
+        let h = super::dec(&[0x66, 0x0f, 0xab, 0x0b], 64).unwrap();
         assert_eq!(
             (w.size, h.size, w.well_formed(), h.well_formed()),
             (8, 2, true, true)
@@ -2035,14 +2150,14 @@ mod tests {
         // CS/DS/ES/SS overrides are ignored in 64-bit mode (the default segment decides the class); FS/GS add their base,
         // the last of several applies, a null prefix before or after it changes nothing (owner decisions, November 3).
         for prefix in [0x26, 0x2e, 0x36, 0x3e] {
-            let p = super::decode(&[prefix, 0x0f, 0xa3, 0x4b, 0x01], 64).unwrap();
+            let p = super::dec(&[prefix, 0x0f, 0xa3, 0x4b, 0x01], 64).unwrap();
             assert_eq!(
                 (p.kind, p.segment, p.disp, p.length),
                 (BT_ALIGNED, SREG_DS as u32, 1, 5)
             );
         }
         assert_eq!(
-            super::decode(&[0x64, 0x0f, 0xa3, 0x4b, 0x01], 64)
+            super::dec(&[0x64, 0x0f, 0xa3, 0x4b, 0x01], 64)
                 .unwrap()
                 .segment,
             SREG_FS as u32
@@ -2131,7 +2246,7 @@ mod tests {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
                 .collect();
-            decode(&[bytes, vec![0x90; 4]].concat(), 64)
+            dec(&[bytes, vec![0x90; 4]].concat(), 64)
         };
         assert_eq!(
             v("c5f8ae10").map(|s| (s.kind, s.base, s.memory, s.length)),
@@ -2301,7 +2416,7 @@ mod tests {
             "0f017810", // fine, but see below: complete
             "f30fa2",   // F3 cpuid
         ] {
-            let got = decode(&bytes(hex), 64);
+            let got = dec(&bytes(hex), 64);
             assert_eq!(got.is_some(), hex == "0f017810", "{hex}");
         }
     }
@@ -2327,7 +2442,7 @@ mod tests {
             ("0ff7ca", 1, 2 | 32 | 128, 1, 7),
             ("4f0ff7ca", 1, 2 | 32 | 128, 1, 7), // maskmovq mm1, mm2; REX ignored
         ] {
-            let s = decode(&bytes(hex), 64).unwrap_or_else(|| panic!("{hex}"));
+            let s = dec(&bytes(hex), 64).unwrap_or_else(|| panic!("{hex}"));
             assert_eq!(
                 (
                     s.kind,
@@ -2342,7 +2457,7 @@ mod tests {
                 "{hex}"
             );
         }
-        let mm = decode(&bytes("0ff7ca"), 64).unwrap();
+        let mm = dec(&bytes("0ff7ca"), 64).unwrap();
         assert!(mm.well_formed());
         for cr in [128, 160 | 8, 160 | 16, 160 | 64, 160 | 256] {
             assert!(!System { cr, ..mm }.well_formed());
@@ -2351,7 +2466,7 @@ mod tests {
         assert!(!System { size: 8, ..mm }.well_formed());
         // A register operand of the VEX.0F38 forms, a memory one of MASKMOVDQU, VMASKMOVDQU with VEX.L = 1: not decoded.
         for hex in ["0ff700", "c4e2752cc0", "660ff700", "c5fdf7ca"] {
-            assert!(refused(decode(&bytes(hex), 64)), "{hex}");
+            assert!(refused(dec(&bytes(hex), 64)), "{hex}");
         }
     }
 
@@ -2363,7 +2478,7 @@ mod tests {
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect()
         };
-        let kind = |hex: &str| decode(&bytes(hex), 64).map(|s| s.kind);
+        let kind = |hex: &str| dec(&[bytes(hex), vec![0x90; 4]].concat(), 64).map(|s| s.kind);
         for hex in [
             "06",
             "1f",
@@ -2383,9 +2498,8 @@ mod tests {
         }
         assert_eq!(kind("0f06"), Some(CLTS));
         assert_eq!(kind("0f34"), Some(SYSENTER));
-        let sys = |hex: &str| {
-            decode(&bytes(hex), 64).map(|s| (s.kind, s.size, s.memory, s.reg, s.length))
-        };
+        let sys =
+            |hex: &str| dec(&bytes(hex), 64).map(|s| (s.kind, s.size, s.memory, s.reg, s.length));
         assert_eq!(sys("0f35"), Some((SYSEXIT, 4, 0, 0, 2)));
         assert_eq!(sys("480f35"), Some((SYSEXIT, 8, 0, 0, 3)));
         assert_eq!(sys("0f01e0"), Some((SMSW, 4, 0, 0, 3))); // smsw eax
@@ -2452,7 +2566,7 @@ mod tests {
         for hex in ["f26c", "f3ec", "f2e480"] {
             assert!(refused(p(hex)), "{hex}"); // REPNE, F3 on IN
         }
-        assert_eq!(super::decode(&[0xe4], 64), None); // truncated imm8
+        assert_eq!(super::dec(&[0xe4], 64), None); // truncated imm8
     }
 
     #[test]
@@ -2585,72 +2699,88 @@ mod tests {
         assert_eq!(d("0f78c0"), k(UD, 3));
         // SSE4a EXTRQ (66, FEX's 66 overlay) and INSERTQ (F2, its F2 overlay, map 3): not advertised, #UD.
         assert_eq!(
-            super::decode(&[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x00], 64).map(|s| s.kind),
+            super::dec(
+                &[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90],
+                64
+            )
+            .map(|s| s.kind),
             Some(UD)
         );
         assert_eq!(
-            super::decode(&[0x66, 0x41, 0x0f, 0x79, 0xc0], 64).map(|s| s.kind),
+            super::dec(&[0x66, 0x41, 0x0f, 0x79, 0xc0, 0x90, 0x90, 0x90, 0x90], 64).map(|s| s.kind),
             Some(UD)
         );
         assert_eq!(
-            super::decode(&[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x3f], 64).map(|s| s.kind),
+            super::dec(
+                &[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x3f, 0x90, 0x90, 0x90, 0x90],
+                64
+            )
+            .map(|s| s.kind),
             Some(UD)
         );
         assert_eq!(
-            super::decode(&[0xf2, 0x41, 0x0f, 0x79, 0xc0], 64).map(|s| s.kind),
+            super::dec(&[0xf2, 0x41, 0x0f, 0x79, 0xc0, 0x90, 0x90, 0x90, 0x90], 64).map(|s| s.kind),
             Some(UD)
         );
         assert_eq!(
-            super::decode(&[0x66, 0x0f, 0x38, 0x82, 0x00, 0x90], 64).map(|s| s.kind),
+            super::dec(
+                &[0x66, 0x0f, 0x38, 0x82, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90],
+                64
+            )
+            .map(|s| s.kind),
             Some(UD)
         ); // invpcid
         // I9: MOVBE register forms, WRUSS: #UD; a memory MOVBE and CRC32 are never decoded here. ADCX/ADOX and SHA: #UD
         // exactly while the profile does not advertise them.
         assert_eq!(
-            super::decode(&[0x48, 0x0f, 0x38, 0xf0, 0xc1], 64).map(|s| s.kind),
+            super::dec(&[0x48, 0x0f, 0x38, 0xf0, 0xc1, 0x90, 0x90, 0x90, 0x90], 64).map(|s| s.kind),
             Some(UD)
         );
         assert_eq!(
-            super::decode(&[0x66, 0x0f, 0x38, 0xf1, 0xc8], 64).map(|s| s.kind),
+            super::dec(&[0x66, 0x0f, 0x38, 0xf1, 0xc8, 0x90, 0x90, 0x90, 0x90], 64).map(|s| s.kind),
             Some(UD)
         );
-        assert_eq!(super::decode(&[0x0f, 0x38, 0xf0, 0x07], 64), None);
-        assert_eq!(super::decode(&[0xf2, 0x0f, 0x38, 0xf0, 0xc1], 64), None);
+        assert_eq!(super::dec(&[0x0f, 0x38, 0xf0, 0x07], 64), None);
+        assert_eq!(super::dec(&[0xf2, 0x0f, 0x38, 0xf0, 0xc1], 64), None);
         let adx = (!super::advertised(super::gf::GF_ADX)).then_some(UD);
         assert_eq!(
-            super::decode(&[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc1], 64).map(|s| s.kind),
+            super::dec(&[0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc1], 64).map(|s| s.kind),
             adx
         );
         assert_eq!(
-            super::decode(&[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x07], 64).map(|s| s.kind),
+            super::dec(&[0xf3, 0x48, 0x0f, 0x38, 0xf6, 0x07], 64).map(|s| s.kind),
             adx
         );
         assert_eq!(
-            super::decode(&[0x66, 0xf3, 0x0f, 0x38, 0xf6, 0xc1], 64).map(|s| s.kind),
+            super::dec(&[0x66, 0xf3, 0x0f, 0x38, 0xf6, 0xc1], 64).map(|s| s.kind),
             adx
         );
         assert_eq!(
-            super::decode(&[0x0f, 0x38, 0xf6, 0xc1], 64).map(|s| s.kind),
+            super::dec(&[0x0f, 0x38, 0xf6, 0xc1, 0x90, 0x90, 0x90, 0x90], 64).map(|s| s.kind),
             Some(UD)
         ); // wrss (NP; CET_SS not advertised)
         assert_eq!(
-            super::decode(&[0xf2, 0x0f, 0x38, 0xf6, 0xc1], 64).map(|s| s.kind),
+            super::dec(&[0xf2, 0x0f, 0x38, 0xf6, 0xc1, 0x90, 0x90, 0x90, 0x90], 64).map(|s| s.kind),
             Some(UD)
         ); // a blank cell
         assert_eq!(
-            super::decode(&[0x66, 0xf2, 0x0f, 0x38, 0xf6, 0xc1], 64).map(|s| s.kind),
+            super::dec(
+                &[0x66, 0xf2, 0x0f, 0x38, 0xf6, 0xc1, 0x90, 0x90, 0x90, 0x90],
+                64
+            )
+            .map(|s| s.kind),
             Some(UD)
         ); // #UD on the AMD machine too
         let sha = (!super::advertised(super::gf::GF_SHA)).then_some(UD);
         assert_eq!(
-            super::decode(&[0x0f, 0x38, 0xcb, 0xc1], 64).map(|s| s.kind),
+            super::dec(&[0x0f, 0x38, 0xcb, 0xc1], 64).map(|s| s.kind),
             sha
         );
         assert_eq!(
-            super::decode(&[0x0f, 0x3a, 0xcc, 0xc1, 0x01], 64).map(|s| s.kind),
+            super::dec(&[0x0f, 0x3a, 0xcc, 0xc1, 0x01], 64).map(|s| s.kind),
             sha
         );
-        assert!(refused(super::decode(
+        assert!(refused(super::dec(
             &[0x66, 0x0f, 0x3a, 0xcc, 0xc1, 0x01],
             64
         )));

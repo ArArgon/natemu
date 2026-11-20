@@ -195,10 +195,10 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     } else {
         size
     };
-    s.cpu.gpr[reg] = offset.wrapping_add(step) & wide;
+    s.cpu.gpr[reg] = system::address_register(i.prefixes, c.gpr[reg], offset.wrapping_add(step));
     if rep {
         let count = (c.gpr[1] & wide) - 1;
-        s.cpu.gpr[1] = count;
+        s.cpu.gpr[1] = system::address_register(i.prefixes, c.gpr[1], count);
         if count != 0 {
             // Between two elements: RIP stays at the instruction (its kept decode runs the next element); RF stays (S4).
             s.mid_string = 1;
