@@ -1179,9 +1179,18 @@ fixed on branch `disk-io-stalls`, and one host constraint:
 The full suite passed (190/190) on the branch. A qcow2 test harness race found on the way (a child another test spawns
 holds an image's lock briefly: 7 of 40 stressed runs failed on main) is fixed in the tests.
 
+**Closed, not a natemu defect: the guest package download that stalled (November 18).** apt sends up to 10 requests at a time
+on one kept-open HTTPS connection (HTTP pipelining). deb.debian.org (served by Fastly) sometimes stops answering the
+queued ones; after 30 s apt gives up on that connection, reconnects and continues. Over a fresh qcow2 overlay of the
+stock image, 4 boots of repeated `apt-get update`, download, install and purge rounds had 6 such 30 s stalls in about
+24 download steps. At each stall the Mac's socket had sent every byte the guest sent, the guest had received every byte the Mac's
+socket received, and the connection was still open. A Python script on the Mac alone, with no VM, sending the same
+requests 10 at a time stalled 30 s in 5 of 6 rounds; one request at a time, 0 of 4; 10 at a time over plain HTTP to the
+same server, 0 of 4. The stock cloud image points apt at HTTPS; a usual Debian install uses plain HTTP. A boot with the
+network device on PCI and apt's default retries stalled the same way (2 stalls of 30 s in 8 rounds). With
+`Acquire::http::Pipeline-Depth "0"` in the guest, a boot with 6 rounds had no stall. Installs never stalled.
+
 Open, not investigated:
-- **A guest package download stalled once** (1 of 5 `apt-get install fio` runs over slirp, mid-transfer; the retry
-  passed). A networking case of its own if it recurs.
 - **A long locked qcow2 flush is still possible:** when the unlocked barrier is long and the guest keeps writing, the
   locked one has that much more (seen once, 4.75 s, at unmount with no write waiting). Removing it means copying the
   dirty tables under the lock and writing them outside it, a larger change to the vendored code.
