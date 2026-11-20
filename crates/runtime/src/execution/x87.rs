@@ -255,7 +255,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     ) {
         pending(s)?;
     }
-    let va = address(&s.cpu, &i);
+    let va = address(&s.cpu, &i)?;
     let fault = noncanonical(&i);
     // The environment image: FCW, FSW, FTW at 2- or 4-byte strides (the rest: instruction and data pointers, 0 here).
     let (env, stride) = if i.size == 2 { (14, 2) } else { (28, 4) };

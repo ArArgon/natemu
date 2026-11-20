@@ -1,4 +1,4 @@
-"""M2 task 3a programs: 32-bit code at CPL 3 under a 64-bit kernel body (natemu-smp-v1, `system`, one CPU, the tables and
+"""M2 task 3a and 3b programs (3b: `positive32`, and the later `cases`): 32-bit code at CPL 3 under a 64-bit kernel body (natemu-smp-v1, `system`, one CPU, the tables and
 descriptors of segments.py). The body loads its own IDT, whose handlers log each event from the 32-bit code (the frame,
 CR2, the general registers and segment selectors as the handler found them, on request XMM0-15) into a captured page,
 and either return to the 32-bit code (IRETQ, SYSRETL) or end the run from CPL 0. Positive programs are compared with
@@ -80,14 +80,14 @@ ENTER = lambda regs='', cs=0xdb, rsp=US, data=0x1b: f"""    mov eax, {data:#x}
 """
 
 
-def handlers(dispatch='    jmp .fin\n', xmm=False):
+def handlers(dispatch='    jmp .fin\n', xmm=False, vectors=(6, 13, 14, 128)):
     """The entry stubs and the common handler: the event's record (+0 vector, error code, RIP, CS, RFLAGS under 10ED5H,
     RSP, SS, CR2 for a #PF; +0x40 the 16 general registers, RSP's the frame's; +0xC0 DS, ES, FS, GS; +0x100 XMM0..15
     with `xmm`), then `dispatch` (RBX the record's offset, the frame at RSP; RAX free): `.resume` returns by IRETQ,
     `.fin` ends the run. SYSENTER (`.sysenter`, vector 100H) builds the same frame by hand: RIP its own entry, RSP the
     user's EBP."""
     rec = lambda at: f'[{REC + at:#x} + rbx]'
-    text = ''.join(f".v{v}:\n{'' if v in (13, 14) else '    push 0' + chr(10)}    push {v}\n    jmp .common\n" for v in (6, 13, 14, 128))
+    text = ''.join(f".v{v}:\n{'' if v in (10, 11, 12, 13, 14, 17) else '    push 0' + chr(10)}    push {v}\n    jmp .common\n" for v in vectors)
     text += f""".sysenter:
     push rax
     sub rsp, 56
@@ -150,15 +150,16 @@ NOT_MAPPED = [entry(TA + 0x1018, 0), entry(TA + 0x1020, 0), entry(TA + 0x3000, 0
 TOP_ONLY = WRAP[:3] + [entry(TA + 0x1020, 0), entry(TA + 0x3000, 0), P.zero(HIGH, 0x1000)]
 
 
-def program(name, body, user, memory=(), params=None):
-    """`body`: CPL 0 text after HEAD (it enters the 32-bit code `user` at U); the handlers follow it."""
+def program(name, body, user, memory=(), params=None, log=0x900):
+    """`body`: CPL 0 text after HEAD (it enters the 32-bit code `user` at U); the handlers follow it. `log`: the size of
+    the captured event log (0x900: four records; 0x1000: seven)."""
     idtr = (0x80 * 16 + 15).to_bytes(2, 'little') + IDT.to_bytes(8, 'little')
     pattern = b''.join(bytes([0x10 * k + j for j in range(16)]) for k in range(16))
     mem = S.memory(0, 1, gdt=gdt()) + [
         {'addr': f'0x{U:x}', 'data': user32(user).hex()}, dict(P.zero(IDT, 0x810), capture=False),
         # The IDTR to load, room for the start-up one (QEMU's stub's, natemu's driver's: they differ), XMM patterns.
         {'addr': f'0x{IDTR:x}', 'data': (idtr + bytes(0x26)).hex(), 'capture': False},
-        {'addr': f'0x{XMM:x}', 'data': pattern.hex(), 'capture': False}, P.zero(LOG, 0x900)] + list(memory)
+        {'addr': f'0x{XMM:x}', 'data': pattern.hex(), 'capture': False}, P.zero(LOG, log)] + list(memory)
     return {'format': 'natemu-smp-v1', 'name': name, 'ncpu': 1, 'system': True, 'cpu': CPU,
             'bodies': [P.body(P.SYS_CODE(0), P.sys_text(0, HEAD + body))], 'cpus': [dict(P.cpu(0, P.SYS_CODE(0)), cpl=0)],
             'memory': mem, 'params': params or {}}
@@ -378,6 +379,502 @@ NULL_USER = """    mov eax, 0x11
     ret
 """
 
+# ==== M2 task 3b: instructions the resident executes in 32-bit code ========================================================
+# Each program's 32-bit code runs the resident's forms with their 32-bit sizes and ends with INT 0x80 (the record holds the
+# registers); results go to R (the X page, captured) and W. Against QEMU as an Intel processor, which models these exactly
+# (its faults through a null segment and at the 4 GiB limit are the exception: those are `cases`, judged by the models).
+R = XPAGE
+NEXT = W + 0xfc                                  # the fault handlers resume at [NEXT] when it is set (then clear it)
+SAVED = W + 0xf8                                 # an ESP to come back to
+VECTORS = (0, 1, 3, 4, 5, 6, 12, 13, 14, 128)
+GATES = ''.join(gate(v, f'.v{v}', 3 if v in (3, 4) else 0) for v in (0, 1, 3, 4, 5, 12))
+# (Resumed with RF clear: pinned QEMU clears an RF the IRETQ loads only at the end of its translation block, so a software
+# interrupt soon after would carry it in its frame; x86 clears it after the first instruction.)
+RESUME = f"""    and qword [rsp+32], ~0x10000
+    mov eax, [{NEXT:#x}]
+    test eax, eax
+    jz .resume
+    mov [rsp+16], rax
+    mov dword [{NEXT:#x}], 0
+    jmp .resume
+"""
+END = '    cmp qword [rsp], 0x80\n    je .fin\n'
+# #DB: DR6 in the record's CR2 slot, DR6 cleared; resumed with RF set after an instruction breakpoint (B0: it would hit
+# again), else clear (as RESUME).
+DB = f"""    cmp qword [rsp], 1
+    jne .not_db
+    mov rax, dr6
+    mov [{REC + 0x38:#x} + rbx], rax
+    and qword [rsp+32], ~0x10000
+    test al, 1
+    jz .db_trap
+    or qword [rsp+32], 0x10000
+.db_trap:
+    mov eax, 0xffff0ff0
+    mov dr6, rax
+    jmp .resume
+.not_db:
+"""
+# #PF below 4 MiB: the page made present and writable, the instruction run again.
+MAP = f"""    cmp qword [rsp], 14
+    jne .not_pf
+    and qword [rsp+32], ~0x10000
+    mov rax, cr2
+    invlpg [rax]
+    shr rax, 12
+    or qword [{PTE(0):#x} + rax*8], 3
+    jmp .resume
+.not_pf:
+"""
+REGS32 = ''.join(f'    mov {r}, {0x11 * (k + 1):#x}\n' for k, r in enumerate(('eax', 'ecx', 'edx', 'ebx', 'ebp', 'esi', 'edi')))
+COPY = lambda src, dst, n: f'    mov esi, {src}\n    mov edi, {dst:#x}\n    mov ecx, {n}\n    rep movsd\n'
+FLAGS = 0x3F7ED5                                 # every flag POPF may name but TF: CF PF AF ZF SF IF DF OF IOPL NT RF VM AC VIF VIP ID
+
+# ---- the stack at 32 bits: PUSH/POP of segment registers, PUSHFD/POPFD, ENTER, PUSHAD/POPAD, and ESP wrapping ------------
+# Segment pushes over slots of all ones (4-byte slots zero-extended, the 66 form 2 bytes), POP of each data segment register
+# (POP SS too, and the 66 form loading GS with the TLS segment, then read through it); POPFD of every flag and POPF (66) at
+# CPL 3 (IOPL, IF, VM, RF, VIF, VIP unchanged); ESP wrapping at 4 GiB for PUSH/POP of a segment register and POPFD; ENTER
+# at ESP = 4 (EBP 0, ESP FFFF_FFF0H), with nesting levels 3 and 1 and the 66 form at level 2; PUSHAD/POPAD (and the 66
+# forms, which keep the upper halves) at ESP, and at ESP = 0 (FFFF_FFE0H).
+STACK_USER = REGS32 + f"""    mov [{SAVED:#x}], esp
+    mov dword [{W + 0x80:#x}], 0x7175
+    push -1
+    push -1
+    push -1
+    push -1
+    push -1
+    push -1
+    add esp, 24
+    push es
+    push cs
+    push ss
+    push ds
+    push fs
+    push gs
+    o16 push ds
+    mov ax, [esp]
+    mov [{R:#x}], ax
+    lea esi, [esp+2]
+    mov edi, {R + 4:#x}
+    mov ecx, 6
+    rep movsd
+    add esp, 2
+    pop gs
+    pop fs
+    pop ds
+    pop ss
+    pop eax
+    mov [{R + 0x1c:#x}], eax
+    pop es
+    push 0x2b
+    o16 pop gs
+    add esp, 2
+    mov eax, [gs:0]
+    mov [{R + 0x20:#x}], eax
+    mov [gs:4], esp
+    push {FLAGS:#x}
+    popfd
+    pushfd
+    pop dword [{R + 0x24:#x}]
+    o16 push 0x0cd5
+    o16 popf
+    pushfd
+    pop dword [{R + 0x28:#x}]
+    push 2
+    popfd
+    xor esp, esp
+    push ds
+    pushfd
+    pop dword [{R + 0x2c:#x}]
+    pop es
+    mov [{R + 0x30:#x}], esp
+    push 0x8c5
+    popfd
+    mov [{R + 0x34:#x}], esp
+    pushfd
+    pop dword [{R + 0x38:#x}]
+    push 2
+    popfd
+    mov esp, 4
+    mov ebp, 0x1234
+    enter 0x10, 0
+    mov [{R + 0x3c:#x}], esp
+    mov [{R + 0x40:#x}], ebp
+    leave
+    mov [{R + 0x44:#x}], ebp
+    mov [{R + 0x48:#x}], esp
+    mov esp, [{SAVED:#x}]
+    push 0xa1a1a1a1
+    push 0xa2a2a2a2
+    lea ebp, [esp+8]
+    enter 8, 3
+    mov [{R + 0x4c:#x}], esp
+    mov [{R + 0x50:#x}], ebp
+""" + COPY('esp', R + 0x54, 6) + f"""    enter 4, 1
+    mov [{R + 0x6c:#x}], esp
+    mov [{R + 0x70:#x}], ebp
+""" + COPY('esp', R + 0x74, 3) + f"""    mov ebp, esp
+    db 0x66
+    enter 6, 2
+    mov [{R + 0x80:#x}], esp
+    mov [{R + 0x84:#x}], ebp
+""" + COPY('esp', R + 0x88, 4) + f"""    mov esp, [{SAVED:#x}]
+""" + REGS32 + """    pushad
+""" + COPY('esp', R + 0x98, 8) + """    mov eax, 0xa0
+    mov ecx, 0xa1
+    mov edx, 0xa2
+    mov ebx, 0xa3
+    mov ebp, 0xa5
+    mov esi, 0xa6
+    mov edi, 0xa7
+    popad
+    mov eax, 0xaaaa0001
+    mov ebx, 0xbbbb0002
+    pushaw
+""" + f"""    mov esi, esp
+    mov edi, {R + 0xb8:#x}
+    mov ecx, 4
+    rep movsd
+    mov eax, 0xcccc0000
+    mov ebx, 0xdddd0000
+    popaw
+    mov [{R + 0xc8:#x}], eax
+    mov [{R + 0xcc:#x}], ebx
+    mov [{R + 0xd0:#x}], esp
+    xor esp, esp
+    pushad
+    mov [{R + 0xd4:#x}], esp
+""" + COPY('esp', R + 0xd8, 8) + f"""    popad
+    mov [{R + 0xf8:#x}], esp
+    mov esp, [{SAVED:#x}]
+    int 0x80
+"""
+
+# ---- the 32-bit-only forms and far transfers within 32-bit code ------------------------------------------------------------
+# ARPL (memory and register, raised and not), LDS/LES/LFS/LGS/LSS (LFS loads the TLS segment, read through after; LGS the
+# 66 form), BOUND in bounds (32 and 16 bits), AAM (its flags), INTO with OF = 0, the selector stores and loads through
+# memory (MOV, STR, SLDT, SMSW, LAR, LSL, VERR, VERW); CALL/JMP far through an immediate pointer and through m16:32, RET
+# far with an immediate, a far call at ESP = 0 (its frame at FFFF_FFF8H), IRETD within 32-bit code (three pops), IRETW (66:
+# three 2-byte pops) to IP 10H (linear 10H holds JMP ESI back), then IRETD to 64-bit code at CPL 3 (three pops: no stack
+# switch from 32-bit code), whose INT 0x80 ends the run.
+FORMS_USER = REGS32 + f"""    mov dword [{W + 0x80:#x}], 0x7175
+    mov word [{R:#x}], 0x18
+    mov edx, 3
+    arpl [{R:#x}], dx
+    setz byte [{R + 2:#x}]
+    arpl [{R:#x}], dx
+    setz byte [{R + 3:#x}]
+    mov ecx, 0xabcd0019
+    mov ebx, 2
+    arpl cx, bx
+    setz byte [{R + 4:#x}]
+    mov [{R + 8:#x}], ecx
+    lds esi, [.p1]
+    mov [{R + 0x10:#x}], esi
+    les edi, [.p1]
+    mov [{R + 0x14:#x}], edi
+    lfs eax, [.p2]
+    mov [{R + 0x18:#x}], eax
+    mov eax, [fs:0]
+    mov [{R + 0x1c:#x}], eax
+    mov ecx, 0x55550000
+    lgs cx, [.p3]
+    mov [{R + 0x20:#x}], ecx
+    mov [{SAVED:#x}], esp
+    lss esp, [.p4]
+    mov [{R + 0x24:#x}], esp
+    mov esp, [{SAVED:#x}]
+    mov dword [{R + 0x30:#x}], -10
+    mov dword [{R + 0x34:#x}], 10
+    mov eax, -10
+    bound eax, [{R + 0x30:#x}]
+    mov eax, 10
+    bound eax, [{R + 0x30:#x}]
+    mov word [{R + 0x38:#x}], 5
+    mov word [{R + 0x3a:#x}], 7
+    mov eax, 0x12340006
+    bound ax, [{R + 0x38:#x}]
+    mov eax, 0x1234567f
+    aam
+    pushfd
+    pop dword [{R + 0x40:#x}]
+    mov [{R + 0x44:#x}], eax
+    mov eax, 0x50
+    aam 0x10
+    pushfd
+    pop dword [{R + 0x48:#x}]
+    mov [{R + 0x4c:#x}], eax
+    mov eax, 0x8f
+    aam 0xff
+    pushfd
+    pop dword [{R + 0x50:#x}]
+    mov [{R + 0x54:#x}], eax
+    xor eax, eax
+    into
+    mov dword [{R + 0x58:#x}], -1
+    mov [{R + 0x58:#x}], ds
+    mov dword [{R + 0x5c:#x}], -1
+    mov [{R + 0x5c:#x}], fs
+    mov word [{R + 0x60:#x}], 0x1b
+    mov es, [{R + 0x60:#x}]
+    str [{R + 0x62:#x}]
+    sldt [{R + 0x64:#x}]
+    smsw [{R + 0x66:#x}]
+    lar eax, [{R + 0x60:#x}]
+    mov [{R + 0x68:#x}], eax
+    lsl ecx, [{R + 0x60:#x}]
+    mov [{R + 0x6c:#x}], ecx
+    verr [{R + 0x60:#x}]
+    setz byte [{R + 0x6e:#x}]
+    verw [{R + 0x60:#x}]
+    setz byte [{R + 0x6f:#x}]
+    call 0xdb:.f1
+    mov [{R + 0x70:#x}], eax
+    call far [.p5]
+    mov [{R + 0x74:#x}], eax
+    jmp 0xdb:.j1
+.j1:
+    jmp far [.p6]
+.j2:
+    push 7
+    push 8
+    call 0xdb:.f3
+    mov [{R + 0x78:#x}], eax
+    mov [{R + 0x7c:#x}], esp
+    mov [{SAVED:#x}], esp
+    xor esp, esp
+    call 0xdb:.f4
+    mov [{R + 0x80:#x}], eax
+    mov [{R + 0x84:#x}], esp
+    mov esp, [{SAVED:#x}]
+    pushfd
+    push 0xdb
+    push .i1
+    iretd
+.i1:
+    mov [{R + 0x88:#x}], esp
+    mov esi, .w1
+    pushfw
+    o16 push cs
+    push word 0x10
+    iretw
+.w1:
+    mov [{R + 0x8c:#x}], esp
+    pushfd
+    push 0x23
+    push .k64
+    iretd
+.f1:
+    mov eax, 0x1111
+    retf
+.f2:
+    mov eax, 0x2222
+    retf
+.f3:
+    mov eax, [esp+8]
+    add eax, [esp+12]
+    retf 8
+.f4:
+    mov eax, esp
+    retf
+.p1: dd 0x12345678
+    dw 0x1b
+.p2: dd 0x87654321
+    dw 0x2b
+.p3: dw 0x4321, 0x2b
+.p4: dd {US - 0x40:#x}
+    dw 0x1b
+.p5: dd .f2
+    dw 0xdb
+.p6: dd .j2
+    dw 0xdb
+bits 64
+.k64:
+    mov [{R + 0x90:#x}], rsp
+    lea rcx, [rel .k64]
+    mov [{R + 0x98:#x}], rcx
+    mov ebx, cs
+    int 0x80
+"""
+
+# ---- x87 and SSE state images at 32 bits --------------------------------------------------------------------------------
+# FNSTENV/FLDENV (28 bytes, and 66's 14), FNSAVE/FRSTOR (108 bytes), FLD/FSTP m80; FXSAVE/FXRSTOR and XSAVE/XRSTOR (x87,
+# SSE, AVX) store and load XMM0..7 only: the fields of XMM8..15 (and YMM8..15's upper halves) keep the bytes they had
+# (A5H), and XMM8..15 keep the body's values (the record logs XMM0..15). The pointer fields (FIP, FCS, FOP, FDP, FDS) are
+# zeroed after each store: QEMU tracks them, natemu stores 0 (I6 deviation 8).
+def _zero(at, n):
+    return ''.join(f'    mov dword [{at + k:#x}], 0\n' for k in range(0, n - n % 4, 4)) + (f'    mov word [{at + n - 2:#x}], 0\n' if n % 4 else '')
+
+
+X87_BODY = """    mov rax, cr4
+    bts rax, 9
+    bts rax, 18
+    mov cr4, rax
+    xor ecx, ecx
+    mov eax, 7
+    xor edx, edx
+    xsetbv
+""" + ''.join(f'    movdqu xmm{k}, [{XMM + 16 * k:#x}]\n' for k in range(16)) + ENTER() + handlers(xmm=True)
+X87_USER = REGS32 + f"""    fninit
+    mov word [{W:#x}], 0x027f
+    fldcw [{W:#x}]
+    fld1
+    fldz
+    fild dword [.three]
+    fnstenv [{R:#x}]
+""" + _zero(R + 12, 16) + f"""    mov word [{R:#x}], 0x037f
+    fldenv [{R:#x}]
+    fnstenv [{R + 0x20:#x}]
+""" + _zero(R + 0x20 + 12, 16) + f"""    o16 fnstenv [{R + 0x40:#x}]
+""" + _zero(R + 0x40 + 6, 8) + f"""    fnsave [{R + 0x60:#x}]
+""" + _zero(R + 0x60 + 12, 16) + f"""    fnstcw [{W + 2:#x}]
+    frstor [{R + 0x60:#x}]
+    fnsave [{R + 0xd0:#x}]
+""" + _zero(R + 0xd0 + 12, 16) + f"""    frstor [{R + 0xd0:#x}]
+    fstp tword [{R + 0x140:#x}]
+    fstp tword [{R + 0x150:#x}]
+    fld tword [{R + 0x140:#x}]
+    fistp dword [{R + 0x160:#x}]
+    fxsave [{R + 0x200:#x}]
+""" + _zero(R + 0x200 + 6, 18) + f"""    mov dword [{R + 0x200 + 176:#x}], 0x13579bdf
+    fxrstor [{R + 0x200:#x}]
+    mov eax, 7
+    xor edx, edx
+    xsave [{R + 0x400:#x}]
+""" + _zero(R + 0x400 + 6, 18) + f"""    mov dword [{R + 0x400 + 192:#x}], 0x2468ace0
+    xrstor [{R + 0x400:#x}]
+    int 0x80
+.three: dd 3
+"""
+A5 = lambda at, n: {'addr': f'0x{at:x}', 'data': (b'\xa5' * n).hex()}
+X87_MEMORY = [P.zero(R, 0x320), A5(R + 0x320, 0x80), P.zero(R + 0x3a0, 0x180), A5(R + 0x520, 0x80), P.zero(R + 0x5a0, 0x120),
+              A5(R + 0x6c0, 0x80), P.zero(R + 0x740, 0x8c0)]
+
+# ---- faults of the resident's 32-bit forms ---------------------------------------------------------------------------------
+# #BR from BOUND (32 and 16 bits; one in bounds between), #DE from AAM 0, #OF from INTO with OF = 1 and #BP from INT3 (both
+# traps); then precise memory faults: PUSHAD onto a page not present and POPAD from one (ESP unchanged, each retried once
+# the handler maps the page), ARPL on a read-only page (retried once writable), POP DS and LDS of the kernel's code segment
+# (#GP(08H), ESP and ESI unchanged).
+FAULT_USER32 = REGS32 + f"""    mov dword [{W:#x}], 10
+    mov dword [{W + 4:#x}], 20
+    mov ecx, 25
+    mov dword [{NEXT:#x}], .b1
+    bound ecx, [{W:#x}]
+.b1:
+    mov ecx, 15
+    bound ecx, [{W:#x}]
+    mov word [{W + 8:#x}], -5
+    mov word [{W + 10:#x}], 5
+    mov ecx, 0x1234fffa
+    mov dword [{NEXT:#x}], .b2
+    bound cx, [{W + 8:#x}]
+.b2:
+    mov eax, 0x1234
+    mov dword [{NEXT:#x}], .a1
+    aam 0
+.a1:
+    mov eax, 0x7fffffff
+    add eax, 1
+    into
+    mov ebx, 0x99
+    int3
+    mov ecx, 0x77
+    int 0x80
+"""
+MEMFAULT_USER = REGS32 + f"""    mov [{SAVED:#x}], esp
+    mov esp, {XPAGE + 0x100:#x}
+    pushad
+    mov esp, {VPAGE + 0x100:#x}
+    popad
+    mov esp, [{SAVED:#x}]
+    mov edx, 3
+    arpl [{D + S.RO:#x}], dx
+    push 0x08
+    mov dword [{NEXT:#x}], .p1
+    pop ds
+.p1:
+    mov [{W + 0x10:#x}], esp
+    add esp, 4
+    mov esi, 0x5555
+    mov dword [{NEXT:#x}], .l1
+    lds esi, [.bad]
+.l1:
+    int 0x80
+.bad: dd 0x1234
+    dw 0x08
+"""
+UNMAP = f"""    and qword [{PTE(VPAGE):#x}], -2
+    invlpg [{VPAGE:#x}]
+    and qword [{PTE(XPAGE):#x}], -2
+    invlpg [{XPAGE:#x}]
+"""
+
+# ---- single-step and breakpoints in 32-bit code ----------------------------------------------------------------------------
+# TF set by POPFD: a #DB after each instruction (the resident's POP ES and PUSH SS, translated ones, PUSHFD, POPFD), none
+# after POP SS (its shadow holds the trap to the next instruction). Then INT3; an instruction breakpoint (DR0) on the
+# resident's PUSH DS at U + 100H (a fault: the handler resumes with RF); data breakpoints on the resident's store of DS
+# (DR1) and a translated store (DR2), traps after them. DR6 is in the record's CR2 slot.
+STEP_USER = REGS32 + """    push ds
+    pushfd
+    or dword [esp], 0x100
+    popfd
+    pop es
+    push ss
+    pop ss
+    mov eax, ebx
+    pushfd
+    and dword [esp], ~0x100
+    popfd
+    int 0x80
+"""
+BP = U + 0x100
+DR7 = 0x0DD00315                                 # L0 L1 L2 LE GE; DR0 execute, DR1 and DR2 writes of 4 bytes
+BREAK_BODY = f"""    mov rax, {BP:#x}
+    mov dr0, rax
+    mov rax, {W + 0x40:#x}
+    mov dr1, rax
+    mov rax, {W + 0x48:#x}
+    mov dr2, rax
+    mov eax, {DR7:#x}
+    mov dr7, rax
+"""
+BREAK_USER = REGS32 + f"""    int3
+    jmp .bp
+    times {BP - U}-($-$$) nop
+.bp:
+    push ds
+    mov [{W + 0x40:#x}], ds
+    mov [{W + 0x48:#x}], eax
+    pop es
+    int 0x80
+"""
+
+# ---- INT n at the top of 4 GiB: the pushed EIP wraps to 0 -----------------------------------------------------------------
+# The resident's PUSH DS at FFFF_FFFDH, then INT 0x80 at FFFF_FFFEH: the frame's RIP is 0 (EIP wraps: the code segment's
+# 4 GiB limit holds the instruction; Vol.3 "Limit Checking"). Pinned QEMU pushes 1_0000_0000H: the SDM's byte is compared.
+TOP_USER = REGS32 + '    mov eax, 0xfffffffd\n    jmp eax\n'
+TOP_MEMORY = WRAP[:-1] + [P.zero(HIGH, 0xffd), {'addr': f'0x{HIGH + 0xffd:x}', 'data': '1ecd80'}]
+TOP_SDM = {f'{REC + 0x14:#x}': 0}
+
+
+FORMS_MEMORY = WRAP[:5] + [P.zero(LOW0, 0x10), {'addr': f'0x{LOW0 + 0x10:x}', 'data': 'ffe6'}, P.zero(LOW0 + 0x12, 0xfee)] + \
+    WRAP[6:] + [P.zero(R, 0x100)]
+
+
+def positive32():
+    vec = dict(vectors=VECTORS)
+    return [program('c32-stack@1', ENTER() + handlers(), STACK_USER, WRAP + [P.zero(R, 0x100)]),
+            program('c32-forms@1', ENTER() + handlers(), FORMS_USER, FORMS_MEMORY),
+            program('c32-x87@1', X87_BODY, X87_USER, X87_MEMORY),
+            program('c32-faults@1', GATES + ENTER() + handlers(END + RESUME, **vec), FAULT_USER32, log=0x1000),
+            program('c32-memfaults@1', GATES + UNMAP + ENTER() + handlers(END + MAP + RESUME, **vec), MEMFAULT_USER,
+                    [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)], log=0x1000),
+            program('c32-step@1', GATES + ENTER() + handlers(END + DB + RESUME, **vec), STEP_USER, log=0x1000),
+            program('c32-breakpoints@1', GATES + BREAK_BODY + ENTER() +
+                    handlers('    cmp qword [rsp], 0x80\n    jne .go\n    xor eax, eax\n    mov dr7, rax\n    jmp .fin\n.go:\n' + DB + RESUME, **vec),
+                    BREAK_USER, log=0x1000),
+            program('c32-int-top@1', ENTER() + handlers(), TOP_USER, TOP_MEMORY, {'sdm_bytes': TOP_SDM})]
+
 
 # ---- IRETQ from 64-bit code at CPL 3 into 32-bit code --------------------------------------------------------------------
 # The body enters 64-bit user code (CS 0x23), which builds the frame itself; the 32-bit code then leaves by INT 0x80.
@@ -451,7 +948,30 @@ def cases():
          TOP_ONLY[:-1] + [P.zero(HIGH, 0xff8), last], 0xFFFF_FFFF),
         # natemu's deviation: DS loaded with a segment that has a base, in 32-bit code: #GP(0x28) before the next instruction.
         ('ds-based', '    mov eax, 0x2b\n', 'mov ds, eax', lambda s: sm.load(s, 'ds', 0x2b), []),
+        # M2 task 3b: the resident's forms through a null FS or GS (#GP(0)) and across the 4 GiB limit (#GP(0), #SS(0)).
+        ('fldcw-fs-null', '', 'fldcw [fs:0x10]', lambda s: sm.null_access(s, 'fs'), NOT_MAPPED),
+        ('movsreg-gs-null', '', 'mov [gs:0x10], ds', lambda s: sm.null_access(s, 'gs'), NOT_MAPPED),
+        ('lds-fs-null', '', 'lds eax, [fs:0x10]', lambda s: sm.null_access(s, 'fs'), NOT_MAPPED),
+        ('fldcw-limit', '    mov ebx, 0xffffffff\n', 'fldcw [ebx]', lambda s: sm.flat_access(s, 0xFFFF_FFFF, 2), TOP_ONLY),
+        ('fxsave-limit', '    mov ebx, 0xffffff00\n', 'fxsave [ebx]', lambda s: sm.flat_access(s, 0xFFFF_FF00, 512), TOP_ONLY),
+        ('popfd-limit', '    mov esp, 0xfffffffe\n', 'popfd', lambda s: sm.flat_access(s, 0xFFFF_FFFE, 4, stack=True), TOP_ONLY),
+        ('pop-ds-limit', '    mov esp, 0xfffffffe\n', 'pop ds', lambda s: sm.flat_access(s, 0xFFFF_FFFE, 4, stack=True), TOP_ONLY),
+        # natemu's deviation until task 5: a far jump and a far return from 32-bit to 64-bit code: #GP(20H) at it.
+        ('jmp-far-64', f'    mov ebx, {XPAGE:#x}\n', 'jmp far [ebx]', lambda s: sm.far(_at(s, XPAGE, FAR64), 'jmp', XPAGE, width=4),
+         [{'addr': f'0x{XPAGE:x}', 'data': FAR64.hex()}]),
+        ('retf-64', '    push 0x23\n    push 0x1000\n', 'retf',
+         lambda s: sm.ret(_at(dict(s, rsp=US - 8), US - 8, FAR64[:4] + bytes([0x23, 0, 0, 0])), width=4), []),
     ]
+
+
+FAR64 = (0x1000).to_bytes(4, 'little') + (0x23).to_bytes(2, 'little')     # m16:32 pointer to 23H:1000H, 64-bit user code
+
+
+def _at(s, addr, data):
+    """`s` with `data` at `addr` in the model's memory."""
+    s['memory'].setdefault(addr >> 12, dm.page(user=True))
+    dm.place(s['memory'], addr, data)
+    return s
 
 
 def _null(s, sreg):
@@ -484,4 +1004,4 @@ def fault_programs():
 
 
 def programs():
-    return positive() + fault_programs()
+    return positive() + positive32() + fault_programs()

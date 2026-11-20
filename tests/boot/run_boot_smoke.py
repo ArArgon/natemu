@@ -14,9 +14,14 @@ Ctrl-C (the fexc servers run in their own groups); pass: the stub ends within 5 
 pass: a serial line ending in `hello-42` (the echoed input reads `hello-$((6*7))`) and exit 0.
 `stdin-quit` (review of b55a0f4): the bzImage alone, 64 bytes piped at once (the kernel is booting: nothing reads COM1,
 so they wait), Ctrl-A x 1.5 s in with the pipe still open; pass: the stub ends within 5 s of it with exit 2 and `Cancelled`.
+`i386` (`--only i386`, M2 task 3b, not part of the default run): tests/boot/i386_static.asm, a small static 32-bit
+program (built here with nasm), appended to the initrd as /natemu-i386 and run by busybox at 1 vCPU; it checks its own
+results (INT 0x80 and SYSENTER system calls, thread-local data through GS, segment pushes and pops, PUSHAD/POPAD, ARPL,
+BOUND, LDS, x87, signals from #BR, #OF and #DE and from kill, sigreturn, a far call); pass: its lines on serial, exit
+status 42 and natemu's exit 0.
 
     tests/boot/run_boot_smoke.py --fexc FEXC --out DIR [--vcpus 1 4] [--kernel BZIMAGE] [--initrd FILE]
-        [--timeout SECONDS]
+        [--timeout SECONDS] [--only i386]
 
 The compile cache is off unless NATEMU_COMPILE_CACHE is set (hermetic). Writes DIR/smoke-N.serial, DIR/smoke.json;
 exit 1 on a failure."""
@@ -128,6 +133,41 @@ def stdin(stub, runtime, a):
                 wall_s=round(time.monotonic() - t0, 2), stop=err.strip().splitlines()[-1:] if err else [])
 
 
+def newc(files):
+    """An uncompressed initramfs (cpio newc) of `files`: (name, mode, bytes)."""
+    out = b''
+    for k, (name, mode, data) in enumerate(list(files) + [('TRAILER!!!', 0, b'')]):
+        fields = [k + 1, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(name) + 1, 0]
+        head = b'070701' + b''.join(b'%08X' % f for f in fields) + name.encode() + b'\0'
+        out += head + bytes(-len(head) % 4) + data + bytes(-len(data) % 4)
+    return out
+
+
+def i386(stub, runtime, a):
+    prog = a.out / 'natemu-i386'
+    subprocess.run(['nasm', '-f', 'bin', '-o', prog, ROOT / 'tests/boot/i386_static.asm'], check=True)
+    initrd = a.out / 'initrd-i386'
+    base = pathlib.Path(a.initrd).read_bytes()
+    initrd.write_bytes(base + bytes(-len(base) % 4) + newc([('natemu-i386', 0o100755, prog.read_bytes())]))
+    serial = a.out / 'i386.serial'
+    cmdline = ('console=ttyS0 earlyprintk=serial mitigations=off nokaslr rdinit=/bin/busybox -- sh -c '
+               '"/natemu-i386; echo natemu-i386-rc=$?; poweroff -f"')
+    cmd = [stub, '--runtime', runtime, '--fexc', a.fexc, '--kernel', a.kernel, '--initrd', initrd, '--cmdline', cmdline, '--serial', serial]
+    t0 = time.monotonic()
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        _, err = p.communicate(timeout=a.timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        _, err = p.communicate()
+    lines = [line.strip() for line in (serial.read_text(errors='replace') if serial.exists() else '').splitlines()]
+    want = ['natemu-i386: int80', 'natemu-i386: sysenter', 'natemu-i386-ok', 'natemu-i386-rc=42']
+    seen = [w for w in want if w in lines]
+    return dict(case='i386', vcpus=1, rc=p.returncode, seen=seen, ok=seen == want and p.returncode == 0,
+                wall_s=round(time.monotonic() - t0, 2), stop=err.strip().splitlines()[-1:] if err else [],
+                last=[line for line in lines if line][-3:])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--fexc', required=True)
@@ -136,20 +176,21 @@ def main():
     ap.add_argument('--kernel', default=RAW / 'linux')
     ap.add_argument('--initrd', default=RAW / 'initrd.gz')
     ap.add_argument('--timeout', type=float, default=120)
+    ap.add_argument('--only', choices=['i386'])
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault('NATEMU_COMPILE_CACHE', 'off')
     stub, runtime = build()
     results = []
-    for n in a.vcpus:
+    for n in a.vcpus if not a.only else []:
         r = boot(stub, runtime, a, n)
         print(json.dumps(r), flush=True)
         results.append(r)
-    for group in (False, True):
+    for group in (False, True) if not a.only else ():
         r = cancel(stub, runtime, a, group)
         print(json.dumps(r), flush=True)
         results.append(r)
-    for case in (stdin, stdin_quit):
+    for case in (stdin, stdin_quit) if not a.only else (i386,):
         r = case(stub, runtime, a)
         print(json.dumps(r), flush=True)
         results.append(r)

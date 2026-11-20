@@ -2903,7 +2903,8 @@ pub mod system {
     pub const LLDT: u32 = 20;
     pub const LTR: u32 = 21;
     pub const MOV_TO_SREG: u32 = 22;
-    /// JMP/CALL far through a memory m16:`size` pointer.
+    /// JMP/CALL far through a memory m16:`size` pointer; M2 task 3b, 32- and 16-bit code: through an immediate pointer
+    /// (`ea`, `9a`; `memory` 0) whose offset is `disp` and selector `cr`.
     pub const JMP_FAR: u32 = 23;
     pub const CALL_FAR: u32 = 24;
     /// RET far (`size`-byte pops, `disp` released) and IRET (`size`-byte pops).
@@ -2913,7 +2914,7 @@ pub mod system {
     /// cuts it as a system instruction; `lock` is 1, `length` is not used: the fault leaves RIP at the instruction).
     pub const LOCK_UD: u32 = 0xf0;
     /// Software interrupts and #UD instructions (X1a), delivered through the IDT by the resident: INT n (`cr` = n,
-    /// `length` past the immediate), INT3 (`cc`), INTO (`ce`: #UD in 64-bit mode) and UD0/UD1/UD2 (`0f ff`, `0f b9`,
+    /// `length` past the immediate), INT3 (`cc`), INTO (`ce`, 32- and 16-bit code: #OF when OF = 1, M2 task 3b) and UD0/UD1/UD2 (`0f ff`, `0f b9`,
     /// `0f 0b`: #UD; their ModRM is not decoded, `length` is not used: the fault leaves RIP at the instruction).
     pub const INT: u32 = 27;
     pub const INT3: u32 = 28;
@@ -2963,6 +2964,18 @@ pub mod system {
     /// `--fs-null` .. `--es-null`): #GP(0) (SDM Vol.3 3.4.4). `cr` 1: a REP string instruction of `length` bytes, which
     /// makes no access and completes when ECX is 0; else `cr` is 0 and `length` is not used.
     pub const NULL_SEGMENT: u32 = 0x52;
+    /// M2 task 3b, 32- and 16-bit code only (numbered apart: 0x53..=0x58). LDS/LES/LSS/LFS/LGS r, m16:16/32 (`c5`, `c4`,
+    /// `0f b2`, `0f b4`, `0f b5`): `cr` the segment register, `reg` the destination, `size` the offset width (2, 4).
+    pub const LOAD_FAR: u32 = 0x53;
+    /// ARPL r/m16, r16 (`63`): `cr` the source register, `reg` a register destination (16 bits whatever the operand size).
+    pub const ARPL: u32 = 0x54;
+    /// BOUND r, m16&16/m32&32 (`62`, memory): `cr` the index register, `size` 2 or 4; #BR when out of bounds.
+    pub const BOUND: u32 = 0x55;
+    /// PUSHA/PUSHAD, POPA/POPAD (`60`, `61`): `size` 2 or 4, eight slots at ESP.
+    pub const PUSHA: u32 = 0x56;
+    pub const POPA: u32 = 0x57;
+    /// AAM imm8 (`d4`): `cr` the immediate; #DE for 0.
+    pub const AAM: u32 = 0x58;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
@@ -3078,7 +3091,7 @@ pub mod system {
     /// Defined masked counts0..16 execute; larger counts retain the profile's undefined-result refusal.
     pub const DOUBLE_SHIFT16: u32 = 0x7e;
     /// ENTER: `size` the pushed operand width (2 or 8; 4 from 32- and 16-bit code), `cr` the nesting level modulo 32,
-    /// `disp` the unsigned 16-bit allocation. Stack addresses remain 64-bit.
+    /// `disp` the unsigned 16-bit allocation. Stack addresses are 64-bit, or wrap at 4 GiB in 32-bit code (M2 task 3b).
     pub const ENTER: u32 = 0x7f;
     /// [`super::System::prefixes`] bits. I10: [`ADDRESS32`] on any memory operand of 32-bit address size (0x67 in 64-bit
     /// mode): the effective address is truncated to 32 bits and zero-extended before the segment base; [`ADDRESS16`]
@@ -3143,8 +3156,25 @@ pub mod system {
                     SLDT..=MOV_FROM_SREG => rm && self.cr < 8 && matches!(self.size, 2 | 4 | 8),
                     LLDT..=MOV_TO_SREG => rm && self.cr < 8,
                     JMP_FAR..=CALL_FAR => {
-                        self.memory == 1 && address && matches!(self.size, 2 | 4 | 8)
+                        (self.memory == 1 && address && matches!(self.size, 2 | 4 | 8))
+                            || (rm
+                                && self.memory == 0
+                                && self.cr <= 0xffff
+                                && (0..=0xffff_ffff).contains(&self.disp)
+                                && matches!(self.size, 2 | 4))
                     }
+                    LOAD_FAR => {
+                        self.memory == 1
+                            && address
+                            && reg(self.reg)
+                            && self.cr as usize <= super::SREG_GS
+                            && self.cr as usize != super::SREG_CS
+                            && matches!(self.size, 2 | 4)
+                    }
+                    ARPL => rm && reg(self.cr),
+                    BOUND => self.memory == 1 && address && reg(self.cr) && matches!(self.size, 2 | 4),
+                    PUSHA | POPA => matches!(self.size, 2 | 4),
+                    AAM => self.cr < 256,
                     RET_FAR..=IRET => {
                         matches!(self.size, 2 | 4 | 8)
                             && (self.kind == IRET || (0..=0xffff).contains(&self.disp))

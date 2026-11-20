@@ -71,7 +71,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             ymm(&s.cpu, (i.cr & 15) as usize),
         )
     };
-    let at = address(&s.cpu, &i);
+    let at = address(&s.cpu, &i)?;
     let nc = noncanonical(&i);
     let on = |j: usize| mask[ew * j + ew - 1] & 0x80 != 0;
     let element = |j: usize| at.wrapping_add((ew * j) as u64);

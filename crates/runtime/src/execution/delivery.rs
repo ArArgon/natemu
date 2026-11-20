@@ -226,7 +226,7 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
     };
     let slots = [
         error.unwrap_or(0),
-        c.rip.wrapping_add(length),
+        segments::wrap(&c, c.rip.wrapping_add(length)), // M2 task 3b: EIP wraps at 4 GiB
         u64::from(c.seg[SREG_CS].selector),
         c.rflags & !RF | rf,
         c.gpr[4],

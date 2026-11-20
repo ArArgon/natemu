@@ -21,6 +21,7 @@ use crate::cache::{self, Block, Mapped};
 use core::sync::atomic::Ordering::SeqCst;
 use natemu_abi::execution::cache::fast_decline;
 use natemu_abi::execution::perf::SysFastDecline;
+mod compat;
 mod delivery;
 mod events;
 mod fp;
@@ -2601,7 +2602,26 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             return Ok(());
         }
         // REFUSED: a form natemu cannot run yet, delivered as #UD (the recorded deviation; the host logged it).
+        // M2 task 3b: INTO (32- and 16-bit code; the host decodes `ce` as #UD in 64-bit mode): with OF set, #OF delivered as
+        // INT 4 is (a trap, the gate's DPL checked); else it completes.
+        system::INTO if s.cpu.code_mode() != Some(CodeMode::Bits64) => {
+            if s.cpu.rflags >> 11 & 1 == 0 {
+                return Ok(commit(s, i, false));
+            }
+            deliver(
+                s,
+                Event::Software {
+                    vector: 4,
+                    length: u64::from(i.length),
+                },
+            );
+            return Ok(());
+        }
         system::INTO | system::UD | system::REFUSED => return Err(UD),
+        system::ARPL..=system::AAM => {
+            compat::execute(s, i)?;
+            return Ok(commit(s, i, false));
+        }
         // X1c: a Reserved-NOP cell: completes, nothing accessed (LOCK was #UD above).
         system::RESERVED_NOP => return Ok(commit(s, i, false)),
         // Perf chunk 12: no-operation instructions before a system instruction, completed at once (`find` goes on at it).
@@ -2770,7 +2790,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         | system::CALL_FAR
         | system::RET_FAR
         | system::IRET => true,
-        system::PUSH_SREG | system::POP_SREG => true,
+        system::PUSH_SREG | system::POP_SREG | system::LOAD_FAR => true,
         system::RDPMC => c.cr4 & CR4_PCE != 0,
         _ => false,
     };
@@ -2859,7 +2879,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             let mut buf = (c.cr0 as u16).to_le_bytes();
             segments::linear(
                 s,
-                segments::address(&c, &i),
+                segments::address(&c, &i)?,
                 &mut buf,
                 true,
                 false,
@@ -2881,7 +2901,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
                 let mut buf = [0u8; 2];
                 segments::linear(
                     s,
-                    segments::address(&c, &i),
+                    segments::address(&c, &i)?,
                     &mut buf,
                     false,
                     false,
@@ -2943,7 +2963,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // The profile has no performance counters (CPUID.0AH = 0): every ECX names an invalid counter (SDM Vol.2 RDPMC).
         system::RDPMC => return Err(GP),
         system::INVLPG => {
-            let address = segments::address(&c, &i); // INVLPG drops segment overrides (system::decode)
+            let address = segments::address(&c, &i)?; // INVLPG drops segment overrides (system::decode)
             // A non-canonical address invalidates nothing.
             if paging::canonical(address) {
                 let t0 = ticks();
@@ -3037,7 +3057,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         // Descriptor tables, segment registers and far transfers ([`segments`]). The resident has no jump tables (an
         // unlisted `br` fails tests/static/check_resident_stack.py; the runtime target builds with `-C jump-tables=no`), and
         // the kinds are grouped in ranges besides.
-        system::LGDT..=system::IRET | system::PUSH_SREG | system::POP_SREG => {
+        system::LGDT..=system::IRET | system::PUSH_SREG | system::POP_SREG | system::LOAD_FAR => {
             match segments::execute(s, i) {
                 Ok(None) => false,
                 // A far transfer: RIP is the target (nothing to add), and the mode check of [`commit`] applies.
@@ -3067,7 +3087,7 @@ fn commit(s: &mut State, i: System, flush_all: bool) {
     if flush_all {
         tlb(s, true);
     }
-    s.cpu.rip = s.cpu.rip.wrapping_add(u64::from(i.length));
+    s.cpu.rip = segments::wrap(&s.cpu, s.cpu.rip.wrapping_add(u64::from(i.length)));
 }
 const LARGE_PAGE: u64 = 0x20_0000;
 
