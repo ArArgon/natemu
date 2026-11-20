@@ -25,7 +25,8 @@
 //! **Serial.** `--serial FILE` writes COM1 to that file, so `--serial stdout` is a file named `stdout`; the keyword form is
 //! `[serial] output = "stdout"` (or `--set serial.output=stdout`), which means standard output. Without either, COM1 goes
 //! to standard output. The stop of the vCPU that ended the run is written to standard error, after each vCPU's report
-//! (`natemu::execution`'s diagnostics: guest RIP, mode, CPL, instruction bytes, registers, code identity; none at a power-off).
+//! (`natemu::execution`'s diagnostics: guest RIP, mode, CPL, instruction bytes, registers, code identity; none at a power-off,
+//! a reset or a cancel).
 //! SIGINFO (Ctrl-T) prints every vCPU's report while the run goes on (`debug.inspect`, on by default); `debug.watchdog`
 //! (seconds, default 60) bounds a vCPU's stay in guest code without a host exit and in the host outside a compile.
 //!

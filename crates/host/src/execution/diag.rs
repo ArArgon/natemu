@@ -92,7 +92,8 @@ pub(crate) fn report(area: Area, what: &str, at: At) -> String {
             }
         }
     };
-    let p = format!("natemu: vCPU {v}");
+    // (Not `natemu: `: runners read each such line as a stop.)
+    let p = format!("natemu vCPU {v}");
     let mut out = format!("{p}: {what}\n{p}: {place}\n");
     out += &format!("{p}: rip {:#x} ({rip_note}), {}, CPL {}\n", cpu.rip, mode(&cpu), cpu.cpl);
     out += &format!("{p}: bytes at rip: {}\n", bytes(area, &cpu));
