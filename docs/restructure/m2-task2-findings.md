@@ -1,8 +1,7 @@
 # M2 task 2: 32-bit code compiles and passes admission offline
 
 November 20, 2026. Task 2 of [the M2 plan](m2-32bit-design.md): the compiler and the host's admission check accept 32-bit
-code. Nothing runs it yet: no code mode asks for it (task 1's code mode is not merged here; see "What task 3a needs"),
-and the shim does not know the mode. 64-bit output is unchanged (see "64-bit output").
+code. Nothing runs it yet: the resident still stops before it asks for a block of 32-bit code (see "What task 3a needs"). 64-bit output is unchanged (see "64-bit output").
 
 ## What was built
 
@@ -20,8 +19,8 @@ and the shim does not know the mode. 64-bit output is unchanged (see "64-bit out
   loads of the ES, CS, SS and DS base fields are allowed (in 32-bit code only). `admit` is the 64-bit entry, unchanged.
 - **Host compiler (`Compiler::bits32`).** A 32-bit request sends `--bitness 32`, never `--push-run`, is admitted under
   the 32-bit rules and is always compiled: its answer is not kept in memory (so never moved to another address), not
-  read from or written to the persistent cache, and never offered as a template for reuse. The field is false until a
-  code mode sets it.
+  read from or written to the persistent cache, and never offered as a template for reuse. The field follows the code
+  segment's mode (`Cpu::code_mode`).
 - **Offline admission tool.** `natemu-host unused admit-corpus DIR` admits every `NAME.obj` in a folder (compiled from
   `NAME.src`), with the code-shape check, and prints the time per block. The old ignored `corpus` test calls the same
   function.
@@ -58,7 +57,7 @@ host's second map is `natemu_abi::execution::SRA32`; admission pins it for 32-bi
 
 Evidence that the rest of the chain takes the second map without change:
 
-- Admission, with the code-shape check, admitted all 715 blocks of FEX's 32-bit suite and the unit test's forms. Its
+- Admission, with the code-shape check, admitted all 719 blocks of FEX's 32-bit suite and the unit test's forms. Its
   rules name x0-x3, x25, x28 and "not a scratch register", never a guest register's number.
 - Our precision and site checkers read the map from the compiler's report. On 32-bit code: 2,545 compiles, 5,267 access
   sites, no violation.
@@ -85,7 +84,7 @@ cannot tell "untouched" from "written with the same low half" when it saves the 
 - **The replay check**, now a framework case (`static/fexc/fexc-replay`): it boots the Debian kernel and installer
   initrd once at 1 vCPU with the persistent cache off, records every request the host sends to the compiler, and has
   the compiler of the checkout's merge base with `main` and the checkout's own compiler answer them. Result here:
-  53,907 requests, 0 differences (33 s). The base compiler is built by the framework (`testkit.artifacts.fexc_at`).
+  about 54,000 requests (53,907 and 53,650 in two runs), 0 differences (33 s). The base compiler is built by the framework (`testkit.artifacts.fexc_at`).
 - The 64 fixture programs under three sets of options (192 compiles): identical reports and code.
 - The whole `static` and `unit` families pass (they hold the pinned 64-bit bodies and shapes).
 
@@ -93,8 +92,8 @@ cannot tell "untouched" from "written with the same low half" when it saves the 
 
 The framework now extracts `unittests/32Bit_ASM` beside `unittests/ASM`. `run_asm.py --compile32` (case
 `static/fexc/fexc-asm32`) builds each of the 245 tests as FEX does, finds the reachable code from the entry, compiles
-every block for 32-bit code and has the host admit every object. Result: 245 pass; 715 blocks, 3,349 instructions
-translated; 715 admitted. Blocks end at instructions the shim runs: segment register moves 528, the tests' final `hlt`
+every block for 32-bit code and has the host admit every object. Result: 245 pass; 719 blocks, 3,365 instructions
+translated; 719 admitted. Blocks end at instructions the shim runs: segment register moves 528, the tests' final `hlt`
 245, x87 control and state instructions 160, gathers 32, ARPL 19, and a few each of segment pushes and pops, PUSHA/POPA,
 AAM, far transfers. Refused forms met: 0x67 addressing in 9 places and one `REPNE MOVS`, which 64-bit code refuses too.
 
@@ -102,9 +101,10 @@ Running the tests (and comparing their results) waits for 32-bit code in the VM,
 
 ## What task 3a needs
 
-- **Mode wiring.** After the rebase onto task 1: `compiler.bits32 = cpu.code_mode() == Compat32` where the other
-  per-request flags are set (`crates/host/src/execution.rs`, beside `compiler.cpl0`), and the instructions the shim
-  runs decoded in 32-bit mode.
+- **Mode wiring.** The compiler's mode follows `Cpu::code_mode` (set beside the other per-request flags in
+  `crates/host/src/execution.rs`), but no request comes from 32-bit code while the resident stops
+  `unsupported_code_mode` there. Task 3a lifts those stops, and has the instructions the shim runs decoded in 32-bit
+  mode (task 1's decoder takes the mode).
 - **State load and save around 32-bit code** (`crates/runtime/src/execution.rs`: the entry frame built from `SRA`, the
   save reading it back; `execution/sse.rs` for XMM): load EAX..EDI zero-extended into x4..x11 and XMM0-7 into v16-v23
   only; leave x12-x17, x19, x29 and v24-v31 out of both directions, so R8-R15 and XMM8-15 keep their values in the CPU
