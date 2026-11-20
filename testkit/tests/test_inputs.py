@@ -228,9 +228,10 @@ def test_container_builds_run_natively_on_the_x86_builder(monkeypatch, tmp_path)
     monkeypatch.setattr(inputs.artifacts, '_run', lambda cmd, **kw: run(cmd, text=True, **kw))
     inputs._in_container('t', recipe, work)
     remote = [c[-1] for c in seen if c[:1] == ['ssh']]
+    assert any('--cpus $(n=$(nproc); echo $((n < 8 ? n : 8)))' in r for r in remote)      # fits the machine, 8 at most
     assert any(r.startswith(inputs._slot_wait() + 'docker run --rm') and inputs.artifacts.BENCH_BUILDER in r and
                '-v /home/u/.natemu-build-1/recipe:/recipe:ro' in r and 'bash /recipe/container.sh' in r for r in remote)
-    assert 'flock -n 9' in inputs._slot_wait() and inputs.BUILD_SLOTS == 2      # waits for one of two build slots
+    assert 'flock -n 9' in inputs._slot_wait() and 'nproc' in inputs.BUILD_SLOTS   # one slot per 4 CPUs there
     assert any("tar -C /home/u/.natemu-build-1/work --exclude='._*' -cf -" in r for r in remote)  # the work folder back
     # no AppleDouble ._NAME files either way: the Mac's tar runs with COPYFILE_DISABLE, the builder's excludes them
     assert tar_envs and all(e.get('COPYFILE_DISABLE') == '1' for e in tar_envs)
