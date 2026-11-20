@@ -5714,7 +5714,6 @@ mod tests {
         ); // sti; swapgs: both inline
         for kept in [
             &[0x48, 0x0f, 0x01, 0xf8, 0xc3][..],
-            &[0xf0, 0x0f, 0x01, 0xf8, 0xc3],
             &[0x66, 0x0f, 0x01, 0xf8, 0xc3],
         ] {
             assert_eq!(
@@ -5723,6 +5722,11 @@ mod tests {
                 "{kept:02x?}"
             );
         }
+        // LOCK SWAPGS: kept too, and #UD (no instruction).
+        assert_eq!(
+            block(&mut c, &[0xf0, 0x0f, 0x01, 0xf8, 0xc3]).err(),
+            Some(exec::system::UD)
+        );
         c.cpl0 = false;
         assert_eq!(
             block(&mut c, &[0x0f, 0x01, 0xf8, 0xc3]).err(),
