@@ -130,19 +130,18 @@ pub unsafe fn start() -> ! {
     unsafe { (*shared()).initial = NativeFrame::ZERO };
     fp::reset();
     let mut s = unsafe { load() };
-    let code64 = s.cpu.code_mode() == Some(CodeMode::Bits64);
-    if !guest_state_alias_valid(cache::control().guest_state_va)
+    let unusable = !guest_state_alias_valid(cache::control().guest_state_va)
         || s.cpu.paging().is_none()
-        || !code64
         || s.request != NONE
         || s.vcpu >= s.vcpus
-        || s.vcpus as usize > cache::MAX_VCPUS
-    {
-        // Before anything is shadowed or marked (and before the vCPU number is known to be valid). As [`controls`].
-        s.stop = if s.cpu.paging().is_some() && !code64 {
-            stop::UNSUPPORTED_CODE_MODE
-        } else {
+        || s.vcpus as usize > cache::MAX_VCPUS;
+    if unusable || s.cpu.code_mode() != Some(CodeMode::Bits64) {
+        // Before anything is shadowed or marked (and before the vCPU number is known to be valid). The code segment is
+        // named only when all else is usable (as [`controls`]).
+        s.stop = if unusable {
             stop::UNSUPPORTED_MODE
+        } else {
+            stop::UNSUPPORTED_CODE_MODE
         };
         unsafe { write_record(record(), &s) };
         stop(SUCCESS, s.stop)

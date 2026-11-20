@@ -484,6 +484,54 @@ VIF_TAIL = """    mov rax, rsp
 """
 
 
+# FS.base and GS.base are one value each (M2 task 1): a load's descriptor base, the MSRs, WRFSBASE/RDGSBASE and SWAPGS
+# all read and write it, and an outer-level LRETQ that nulls FS and GS (DPL 0 data at CPL 3) keeps the bases (segment_model
+# B5). At CPL 0, after FS/GS = 0x50 (base 0x12345678 + i), into C: +0x50 IA32_FS_BASE, +0x58 [gs:0] and +0x60 RDGSBASE after
+# SWAPGS (KERNEL_GS_BASE = C + 0x88), +0x68 IA32_FS_BASE after WRFSBASE (C + 0x80); then at CPL 3: rbx = [fs:0] (the
+# marker at C + 0x80), rcx = RDFSBASE (GS's base at CPL 3 is the start-up one, which QEMU's stub and the driver set apart).
+# The CMP before LRETQ defines the flags the user code reads (the OR before it leaves AF undefined).
+FS_BASE_BODY = SETUP + """    mov eax, 0x70
+    ltr ax
+    mov eax, 0x10
+    mov ds, eax
+    mov eax, 0x50
+    mov es, eax
+    mov fs, eax
+    mov gs, eax
+    mov rax, cr4
+    bts rax, 16
+    mov cr4, rax
+""" + rdmsr(0xc0000100, 'rax') + """    mov [{c:#x}+0x50], rax
+    mov rax, 0x0123456789abcdef
+    mov [{c:#x}+0x80], rax
+    mov rax, 0x1122334455667788
+    mov [{c:#x}+0x88], rax
+    mov ecx, 0xc0000102
+    mov eax, {c:#x}+0x88
+    xor edx, edx
+    wrmsr
+    swapgs
+    mov rax, [gs:0]
+    mov [{c:#x}+0x58], rax
+    rdgsbase rax
+    mov [{c:#x}+0x60], rax
+    swapgs
+    mov eax, {c:#x}+0x80
+    wrfsbase rax
+""" + rdmsr(0xc0000100, 'rax') + """    mov [{c:#x}+0x68], rax
+""" + RESTORE_GS + """    cmp eax, eax
+    push 0x1b
+    push {us:#x}
+    push 0x23
+    push {u:#x}
+    o64 retf
+"""
+FS_BASE_USER = USER + """    mov rbx, [fs:0]
+    rdfsbase rcx
+    mov rax, cr0
+"""
+
+
 def ltr_race(n):
     """Every CPU loads TR from one TSS descriptor (CPU 0's GDT) after a start barrier: LTR's busy write is a
     compare-exchange, so exactly one CPU succeeds and every other takes #GP(0x70) at its LTR (natemu only: QEMU's LTR is
@@ -513,5 +561,6 @@ def programs(cpus=(1, 2, 4)):
             ps.append(program(f'seg-{kind}-cpl3@{n}', body, user, n=n))
     body, user = to_user('lret', tail=VIF_TAIL)
     ps.append(program('seg-iret-vif-cpl3@1', body, user))
+    ps.append(program('seg-fs-gs-base-cpl3@1', FS_BASE_BODY, FS_BASE_USER))
     ps += [ltr_race(n) for n in (2, 4)]
     return ps + fault_programs()
