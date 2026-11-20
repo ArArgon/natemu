@@ -438,7 +438,7 @@ class Slice1Cutting(unittest.TestCase):
         self.assertEqual({r['guest_rip'] for r in d['code']['relocations'] if r['kind'] == 'guest_rip_move'}, {'0x0'})
 
     def test_32_bit_null_fs_gs(self):
-        """M2 task 3a: with --fs-null (--gs-null) an access through FS (GS) in 32-bit code is a system cut, which the host
+        """M2 task 3a: with --fs-null (--gs-null, --ds-null, --es-null) an access through FS (GS, DS, ES) in 32-bit code is a system cut, which the host
         reads at the instruction's own RIP as cut_gated "null_segment" (#GP in the resident); a prefix on an instruction that makes no access through the
         segment is not, nor the other segment's, nor anything in 64-bit code or without the argument."""
         pre, post = '01d8' + '31c9', '40'
@@ -472,6 +472,23 @@ class Slice1Cutting(unittest.TestCase):
             plain, _ = run(pre + prefix + '8b03')
             d, rc = run(pre + prefix + '8b03', RIP, arg)
             self.assertEqual((rc, region(d)), (0, region(plain)))
+        # DS, the default segment of an access without a prefix unless its ModRM base is EBP or ESP (SS), and ES, the
+        # segment of every string destination: cut at the instruction's RIP under --ds-null, --es-null, or not.
+        gate = lambda x, *args: run32(x + post, *args)[0]['guest']['end'].get('cut_gated')
+        ds = {'[ebx]': '8b03', 'moffs': 'a110000000', '[disp32]': '8b0d10000000', '[ebx+esi]': '8b0433', '[esi*2+disp32]': '8b047510000000',
+              '[ebp+esi] base in the index': '8b042e', 'xlat': 'd7', 'movsd': 'a5', 'lodsb': 'ac', 'ds: [ebp]': '3e8b4500', 'ds: [esp]': '3e8b0424'}
+        not_ds = {'[ebp]': '8b4500', '[ebp+disp32]': '8b8510000000', '[esp]': '8b0424', '[esp+4]': '8b442404', '[ebp+esi*4]': '8b44b500',
+                  'es: [ebx]': '268b03', 'ss: [ebx]': '368b03', 'cs: [ebx]': '2e8b03', 'fs: [ebx]': '648b03', 'stosd': 'ab', 'scasb': 'ae',
+                  'lea': '8d03', 'push eax': '50', 'push [esp]': 'ff3424', 'ret': 'c3'}
+        es = {'stosd': 'ab', 'movsd': 'a5', 'scasb': 'ae', 'cmpsd': 'a7', 'rep stosb': 'f3aa', 'es: [ebx]': '268b03', 'es: [ebp]': '268b4500'}
+        not_es = {'[ebx]': '8b03', 'lodsd': 'ad', 'xlat': 'd7', '[ebp]': '8b4500', 'ds: [ebx]': '3e8b03'}
+        for arg, cut, kept in (('--ds-null', ds, not_ds), ('--es-null', es, not_es)):
+            for name, x in cut.items():
+                with self.subTest(name=name, arg=arg):
+                    self.assertEqual((gate(x, arg), gate(x)), ('null_segment', None), name)
+            for name, x in kept.items():
+                with self.subTest(name=name, arg=arg, kept=True):
+                    self.assertEqual(gate(x, arg), None, name)
         # Of several segment prefixes the last applies; an SSE form gated by CR0/CR4 keeps its #UD/#NM.
         d, _ = run32('6465' + '8b03', '--gs-null')
         self.assertEqual(d['guest']['end'].get('cut_gated'), 'null_segment')

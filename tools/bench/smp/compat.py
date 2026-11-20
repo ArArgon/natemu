@@ -4,7 +4,7 @@ CR2, the general registers and segment selectors as the handler found them, on r
 and either return to the 32-bit code (IRETQ, SYSRETL) or end the run from CPL 0. Positive programs are compared with
 pinned QEMU system mode, run as an Intel processor (natemu presents one: SYSCALL is #UD outside 64-bit mode, SYSENTER
 runs in it). `cases` are single instructions judged by segment_model and syscall_model (`params.model`, as
-segments.py's): what QEMU does not model (no fault through a null FS or GS, no segment limit) is listed in
+segments.py's): what QEMU does not model (no fault through a null segment, no segment limit) is listed in
 run_slice3_vm.QEMU_DIFFERS, and natemu's deviation for segments it does not run is natemu's alone.
 
 Registers: 32-bit code leaves the upper halves of RAX..RDI zero in natemu (decided, m2-task3a-findings) and unchanged
@@ -61,9 +61,10 @@ def gate(vector, label, dpl=0):
 REGS64 = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
 HEAD = (S.SETUP + '    mov eax, 0x70\n    ltr ax\n').format(**F) + f'    sidt [{IDTR + 0x10:#x}]\n' + \
     gate(6, '.v6') + gate(13, '.v13') + gate(14, '.v14') + gate(0x80, '.v128', 3) + f'    lidt [{IDTR:#x}]\n'
-# The user's flat data segments and null FS/GS (an outer IRETQ nulls a DPL 0 one), then IRETQ to `cs`:U on the user
-# stack with RFLAGS = 2. RAX is free until the frame is built: `regs` then sets what the 32-bit code starts with.
-ENTER = lambda regs='', cs=0xdb, rsp=US: f"""    mov eax, 0x1b
+# The user's flat data segments (`data`; 0: null) and null FS/GS (an outer IRETQ nulls a DPL 0 one), then IRETQ to
+# `cs`:U on the user stack with RFLAGS = 2. RAX is free until the frame is built: `regs` then sets what the 32-bit code
+# starts with.
+ENTER = lambda regs='', cs=0xdb, rsp=US, data=0x1b: f"""    mov eax, {data:#x}
     mov ds, eax
     mov es, eax
     xor eax, eax
@@ -340,8 +341,37 @@ WRAP_USER = f"""    mov ecx, 0x33
 """
 
 
+# ---- 32-bit code with a null DS and ES that never uses them --------------------------------------------------------------
+# x86 faults at the first access through a null segment, not before: registers, the stack (ESP and EBP bases, an SS
+# override on an EBX base), a call, LEA and a DS prefix on a register form all run.
+NULL_BODY = ENTER(data=0) + handlers()
+NULL_USER = """    mov eax, 0x11
+    mov ebx, esp
+    mov ecx, 0x33
+    mov edx, 0x44
+    mov esi, 0x55
+    mov edi, 0x66
+    push eax
+    push ecx
+    mov ebp, esp
+    add eax, [ebp+4]
+    mov [esp], eax
+    add edx, [ss:ebx-4]
+    call .f
+    pop esi
+    pop edi
+    lea ecx, [ebx+8]
+    db 0x3e, 0x01, 0xc8
+    cmp eax, eax
+    int 0x80
+.f:
+    inc edx
+    ret
+"""
+
+
 def positive():
-    return [program('c32-roundtrip@1', ROUND_BODY, ROUND_USER),
+    return [program('c32-roundtrip@1', ROUND_BODY, ROUND_USER), program('c32-null-ds@1', NULL_BODY, NULL_USER),
             program('c32-fault@1', FAULT_BODY, FAULT_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)] + NOT_MAPPED),
             program('c32-sysenter@1', SYSENTER_BODY, SYSENTER_USER),
             program('c32-wrap@1', WRAP_BODY, WRAP_USER, WRAP)]
@@ -365,6 +395,12 @@ def cases():
         # SYSCALL is #UD outside 64-bit mode on the Intel processor natemu presents, EFER.SCE or not.
         ('syscall-ud', '', 'syscall', lambda s: sc.syscall(s), []),
         # An access through a null FS or GS; a prefix on an instruction that accesses nothing is covered by c32-roundtrip.
+        # DS and ES loaded with null in the 32-bit code, which runs on (the stack, a DS access while only ES is null)
+        # until the first access through the null one: a load through DS, a string store through ES.
+        ('ds-null', '    xor eax, eax\n    mov ds, eax\n    push 0xc\n    pop ecx\n    add ecx, 4\n', 'mov eax, [ecx]',
+         lambda s: sm.null_access(_null(s, 'ds'), 'ds'), NOT_MAPPED),
+        ('es-null', f'    xor eax, eax\n    mov es, eax\n    mov edx, [{W:#x}]\n    mov edi, 0x10\n', 'stosd',
+         lambda s: sm.null_access(_null(s, 'es'), 'es'), NOT_MAPPED),
         ('fs-null', '', 'mov eax, [fs:0x10]', lambda s: sm.null_access(s, 'fs'), NOT_MAPPED),
         ('gs-null', '    mov ebx, 0x10\n', 'add [gs:ebx], eax', lambda s: sm.null_access(s, 'gs'), NOT_MAPPED),
         ('gs-null-string', f'    mov esi, {W:#x}\n    mov edi, {W + 8:#x}\n', 'gs movsd', lambda s: sm.null_access(s, 'gs'), NOT_MAPPED),
@@ -376,8 +412,12 @@ def cases():
          TOP_ONLY[:-1] + [P.zero(HIGH, 0xff8), last], 0xFFFF_FFFF),
         # natemu's deviation: DS loaded with a segment that has a base, in 32-bit code: #GP(0x28) before the next instruction.
         ('ds-based', '    mov eax, 0x2b\n', 'mov ds, eax', lambda s: sm.load(s, 'ds', 0x2b), []),
-        ('es-null', '    xor eax, eax\n', 'mov es, eax', lambda s: sm.load(s, 'es', 0), []),
     ]
+
+
+def _null(s, sreg):
+    s['seg'][sreg] = (0, 0)
+    return s
 
 
 def fault_programs():

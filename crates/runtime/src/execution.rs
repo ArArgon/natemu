@@ -210,7 +210,7 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
             // [`access_aborted`]), and a system instruction's end may pass 4 GiB ([`commit`]).
             s.cpu.rip &= 0xffff_ffff;
             // Compatibility-mode code this boundary would run that translated code cannot run right (a 16-bit or
-            // non-flat segment, [`Cpu::compat_refused`]): #GP(that selector) here, where the code identity is chosen,
+            // non-flat segment, not a null one, [`Cpu::compat_refused`]): #GP(that selector) here, where the code identity is chosen,
             // whatever loaded the segments (IRET, SYSRET, a segment load in 32-bit code). The recorded deviation.
             if let Some(selector) = s.cpu.compat_refused() {
                 deliver(s, Event::Exception([13, u64::from(selector & 0xfffc), 0]));

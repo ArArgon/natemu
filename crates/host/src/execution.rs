@@ -2014,7 +2014,7 @@ impl Reply {
 
 /// What fexc answered (errors are not kept): an object, or no code with its end reason and, when the instruction at the RIP
 /// cut the block, its opcode map and opcode and whether its gating cut it (`Some`: "mmx" for an MMX form, "null_segment"
-/// for an access through a null FS or GS in 32-bit code, else ""), or (`ud`, I10) whether
+/// for an access through a null segment in 32-bit code, else ""), or (`ud`, I10) whether
 /// fexc found an encoding the presented CPU raises #UD for (reserved or unadvertised: `cut_ud`).
 #[derive(Clone, Debug, PartialEq)]
 enum Answer {
@@ -2568,10 +2568,10 @@ pub struct Compiler {
     /// persistent cache, no template for the pool or the resident, and no `--push-run` (it assumes 8-byte stack slots).
     /// The answers kept in memory are keyed without the mode, which is why 32-bit requests stay out of them.
     pub(crate) bits32: bool,
-    /// M2 task 3a, 32-bit requests only: FS, GS hold a null selector ([`exec::Cpu::null_segment`], code identity bits 5
-    /// and 6): fexc's `--fs-null` and `--gs-null` cut every access through that segment, which the resident raises as
+    /// M2 task 3a, 32-bit requests only: FS, GS, DS, ES hold a null selector ([`exec::NULL_SREGS`], code identity bits
+    /// 5 to 8): fexc's `--fs-null` .. `--es-null` cut every access through that segment, which the resident raises as
     /// #GP(0) ([`exec::system::NULL_SEGMENT`]). Not gating values of the kept answers: 32-bit requests keep none.
-    pub(crate) null_segments: [bool; 2],
+    pub(crate) null_segments: [bool; 4],
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
@@ -2761,7 +2761,7 @@ impl Compiler {
             bulk: false,
             push_run: true,
             bits32: false,
-            null_segments: [false; 2],
+            null_segments: [false; 4],
             perf: None,
             read: 0,
             halved: false,
@@ -3181,7 +3181,7 @@ impl Compiler {
                 // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
                 // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
                 // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone. M2 task 3a: an access through a
-                // null FS or GS in 32-bit code ("null_segment"): #GP(0).
+                // null segment in 32-bit code ("null_segment"): #GP(0).
                 let gated_kind = |(map, op): (u8, u8), gate: &str| {
                     let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
                     let kind = if gate == "null_segment" {
@@ -3312,7 +3312,7 @@ impl Compiler {
         if self.bits32 {
             arg(&mut body, b"--bitness");
             arg(&mut body, b"32");
-            for (on, a) in self.null_segments.into_iter().zip([&b"--fs-null"[..], b"--gs-null"]) {
+            for (on, a) in self.null_segments.into_iter().zip([&b"--fs-null"[..], b"--gs-null", b"--ds-null", b"--es-null"]) {
                 if on {
                     arg(&mut body, a);
                 }
@@ -4253,9 +4253,9 @@ fn translation(
         compiler.x87 = x87_args(&state.cpu, compiler.supported);
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
         // M2: the code segment's mode (the resident asks only for 64-bit code and, at CPL 3, 32-bit code with flat
-        // segments: `Cpu::compat_refused`), and in 32-bit code the null FS and GS.
+        // segments: `Cpu::compat_refused`), and in 32-bit code the null FS, GS, DS and ES.
         compiler.bits32 = state.cpu.code_mode() == Some(exec::CodeMode::Compat32);
-        compiler.null_segments = [exec::SREG_FS, exec::SREG_GS].map(|r| state.cpu.null_segment(r));
+        compiler.null_segments = exec::NULL_SREGS.map(|r| state.cpu.null_segment(r));
         // (The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode; fexc refuses them with --bitness 32.)
         compiler.cpl0 = state.cpu.cpl == 0 && !step && !compiler.bits32;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
@@ -5332,12 +5332,14 @@ mod tests {
         assert_eq!(kind(&mut c, &[0x8e, 0xe8]).map(|k| k.0), Some(exec::system::MOV_TO_SREG)); // mov gs, eax
         let load = [0x64, 0x8b, 0x03, 0xc3]; // mov eax, fs:[ebx]; ret
         assert_eq!(kind(&mut c, &load), None);
-        c.null_segments = [false, true];
+        c.null_segments = [false, true, true, true];
         assert_eq!(kind(&mut c, &load), None);
-        c.null_segments = [true, false];
+        assert_eq!(kind(&mut c, &load[1..]), Some((exec::system::NULL_SEGMENT, 0))); // mov eax, [ebx]: DS
+        c.null_segments = [true, false, false, false];
         let args = String::from_utf8_lossy(&c.body(&load, 0x1000, None)).replace('\0', " ");
-        assert!(args.contains("--fs-null") && !args.contains("--gs-null"), "{args}");
+        assert!(args.contains("--fs-null") && !args.contains("--gs-null") && !args.contains("--ds-null"), "{args}");
         assert_eq!(kind(&mut c, &load), Some((exec::system::NULL_SEGMENT, 0)));
+        assert_eq!(kind(&mut c, &load[1..]), None);
         c.bits32 = false;
         assert_eq!(kind(&mut c, &load), None);
         assert!(!String::from_utf8_lossy(&c.body(&load, 0x1000, None)).contains("--fs-null"));

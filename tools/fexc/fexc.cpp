@@ -402,7 +402,7 @@ struct Setup {
   // The gating arguments (shim FexcArg values; Arm sets them for each request).
   bool sse_gated = false, avx_gated = false, alignment_gated = false, x87_gated = false, wait_gated = false, cpl0 = false, tsc = false, bulk = false, daz = false, ftz = false, accurate = false, push_run = false, narrow_cmp = false;
   uint64_t x87_fpcr = 0, simd_unmasked = 0, x87_unmasked = 0;
-  uint8_t null_segments = 0;   // M2 task 3a (--fs-null 1, --gs-null 2): 32-bit code only
+  uint8_t null_segments = 0;   // M2 task 3a (--fs-null 1, --gs-null 2, --ds-null 4, --es-null 8): 32-bit code only
   std::vector<std::pair<Config::ConfigOption, std::string>> sets;   // the Config values (ParseArgs)
   // Configure:
   HostFeatures hf {};
@@ -443,7 +443,9 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else if (a == "--narrow-cmp") s.narrow_cmp = true; // (slice1; the host always asks) 8/16-bit compares with an inline constant (fexc_hook.h)
     else if (a == "--tsc") s.tsc = true;               // slice1 (perf chunk 15): CPL 0, a 24 MHz counter: RDTSC inline
     else if (a == "--fs-null") s.null_segments |= 1;   // slice1 (M2 task 3a), 32-bit code: FS is null: an access through it is a system cut (#GP)
-    else if (a == "--gs-null") s.null_segments |= 2;   // the same for GS
+    else if (a == "--gs-null") s.null_segments |= 2;   // the same for GS,
+    else if (a == "--ds-null") s.null_segments |= 4;   // DS (the default segment of most accesses)
+    else if (a == "--es-null") s.null_segments |= 8;   // and ES (string destinations)
     else if (a == "--wait-gated") s.wait_gated = true; // slice1 (I6): CR0.TS and CR0.MP: WAIT/FWAIT is a system cut (#NM)
     else if (a == "--x87-fpcr") s.x87_fpcr = strtoull(next(), nullptr, 0);   // slice1 (I6): FPCR of x87 arithmetic when MXCSR's differs
     else if (a == "--simd-unmasked") s.simd_unmasked = strtoull(next(), nullptr, 0) & 0x3f;   // slice1 (I5c): MXCSR's unmasked exceptions
@@ -458,7 +460,7 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
     else return Fail("unknown argument " + a);
   }
   if (!missing.empty()) return Fail(missing + " needs a value");
-  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--fs-null] [--gs-null] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
+  if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--fs-null] [--gs-null] [--ds-null] [--es-null] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
   s.slice1 = st.profile == "slice1";
   // M2: the push-run stack option assumes 8-byte stack slots (fexc_hook.h); the host does not ask for it in 32-bit code.
