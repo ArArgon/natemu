@@ -471,8 +471,6 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
   if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--fs-null] [--gs-null] [--ds-null] [--es-null] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
   s.slice1 = st.profile == "slice1";
-  // M2: the push-run stack option assumes 8-byte stack slots (fexc_hook.h); the host does not ask for it in 32-bit code.
-  if (s.push_run && s.bitness != 64) return Fail("--push-run is 64-bit only");
   // The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode, MOV r64, CR2 is a 64-bit load, and the
   // inline CLI/STI, VERW and RDTSC are untested there. In 32-bit code they stay the resident's.
   if ((s.cpl0 || s.tsc) && s.bitness != 64) return Fail("--cpl0 and --tsc are 64-bit only");

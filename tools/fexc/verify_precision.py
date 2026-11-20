@@ -335,10 +335,12 @@ def guards(d, dis, order):
         t = check_at.get(x['native_offset'])
         B = x['base_reg']
         return t if t is not None and x['imm'] == 0 and dis.get(t) == f'cbnz x0, {x["native_offset"]:#x}' and \
-            dis.get(t - 4) == f'and x0, x{B}, #0x7' else None
+            dis.get(t - 4) == f'and x0, x{B}, #{SLOT - 1:#x}' else None
     # --push-run: the registers known 8-byte aligned before each word (admission's Verifier::aligned): the entry has none; a
     # stack check's fall-through adds its base; writebacks of 8n keep a base; add/sub #8n and mov copy it; other writes clear;
     # branch targets meet their sources; svc clears all; a back edge clears what its loop writes.
+    # M2 task 4, 32-bit code: the slot is 4 bytes, the check `and x0, xB, #0x3`, and the 32-bit add/sub/mov forms carry it too.
+    SLOT, XW = (4, '[xw]') if BITS else (8, 'x')
     aligned_at = {}
     est = {tx: x['base_reg'] for x in stubs.values() if x['kind'] == 'stack' for tx in [stack_check(x)] if tx is not None}
     pend, mm, dead = {}, 0, False
@@ -356,11 +358,11 @@ def guards(d, dis, order):
         if (ww := re.search(r'\[x(\d+)(?:, #(-?(?:0x)?[0-9a-f]+))?\]!$', tx)) or (ww := re.search(r'\[x(\d+)\], #(-?(?:0x)?[0-9a-f]+)$', tx)):
             R, dd = int(ww[1]), int(ww[2] or '0', 0)
             loads_base = tx.startswith('ld') and re.match(rf'ld\w* (?:x{R}|[wx]\d+, x{R}),', tx)
-            if mm >> R & 1 and dd % 8 == 0 and not loads_base: nxt |= bit(R)
+            if mm >> R & 1 and dd % SLOT == 0 and not loads_base: nxt |= bit(R)
             elif mm >> R & 1: nxt &= ~bit(R)
-        if (aa := re.fullmatch(r'(?:add|sub)s? x(\d+), x(\d+), #((?:0x)?[0-9a-f]+)(, lsl #12)?', tx)) and mm >> int(aa[2]) & 1 and (aa[4] or int(aa[3], 0) % 8 == 0):
+        if (aa := re.fullmatch(rf'(?:add|sub)s? {XW}(\d+), {XW}(\d+), #((?:0x)?[0-9a-f]+)(, lsl #12)?', tx)) and mm >> int(aa[2]) & 1 and (aa[4] or int(aa[3], 0) % SLOT == 0):
             nxt |= bit(int(aa[1]))
-        if (aa := re.fullmatch(r'mov x(\d+), x(\d+)', tx)) and mm >> int(aa[2]) & 1:
+        if (aa := re.fullmatch(rf'mov {XW}(\d+), {XW}(\d+)', tx)) and mm >> int(aa[2]) & 1:
             nxt |= bit(int(aa[1]))
         if o in est: nxt |= bit(est[o])
         if (br := BRANCH.match(tx)):
@@ -429,7 +431,7 @@ def guards(d, dis, order):
         S = s['base_reg']
         # (--push-run: a store of 2/4/8 bytes at an aligned base + k*width, no index, may have the stack alignment check
         # `and x0, xB, #0x7; cbnz x0, stub` (then only x0/x1 written) or none while B is known aligned there (aligned_at).)
-        natural = pure and not sp and ix is None and s['width'] in (2, 4, 8) and s['imm'] % s['width'] == 0 and \
+        natural = pure and not sp and ix is None and s['width'] in (2, 4, 8) and s['width'] <= SLOT and s['imm'] % s['width'] == 0 and \
             s['kind'] in ('store', 'push') and not re.match(r'st[np]', dis.get(at, ''))
         if natural:
             if len(st) > 1:
@@ -1032,7 +1034,7 @@ def main():
         SHARD = (i, n)
     scan_skips.FEXC = FEXC
     if '--bits32' in args:
-        BITS[:] = ['--bitness', '32']
+        BITS[:] = ['--bitness', '32', '--push-run']   # (the stack check runs as the host asks for them: M2 task 4)
         bad = 0
         with tempfile.TemporaryDirectory() as t:
             for label, progs in corpora32():

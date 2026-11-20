@@ -76,6 +76,7 @@ pub mod kind {
     /// at the stub it clears the byte and exits to the dispatcher at the stub's instruction, the state before it, as at any site.
     pub const DENORM: u8 = 19;
     /// Stack check runs (fexc --push-run): the 8-byte alignment check (`brk #10`) of a run of naturally aligned 2-, 4- or 8-byte stores (pushes, frame stores) on one base register, `and x0, xS, #7; cbnz x0` (S is x2 or above)
+    /// (32-bit code, M2 task 4: the slot is 4 bytes: `and x0, xS, #3`, covering 2- and 4-byte stores)
     /// before the first push of a run, recorded like a split stub of that push (address `base_reg` = S, `imm` 0). While S stays
     /// 8-byte aligned no store of the run can cross a page, so the run's pushes carry no split check. At the stub (S not aligned)
     /// the state is the state before the push: the resident steps the push alone (its one-instruction block has the split check).

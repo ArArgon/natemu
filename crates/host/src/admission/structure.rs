@@ -1659,8 +1659,10 @@ impl<'a> Verifier<'a> {
             // Stack check runs (fexc --push-run): a store of 2, 4 or 8 bytes at base + k*width, its base known 8-byte aligned
             // ([`Verifier::aligned`]), is naturally aligned and stays inside its page: it may have instead of the split check
             // its own stack alignment check, or none.
+            // M2 task 4: in 32-bit code the stack slot is 4 bytes: "aligned" means 4-byte aligned ([`Self::slot`]), the check is
+            // `and x0, xB, #3`, and an 8-byte store keeps its split check.
             let natural = store
-                && (2..=8).contains(&size)
+                && (2..=self.slot()).contains(&u64::from(size))
                 && !bulk
                 && splits.is_empty()
                 && addr.index.is_none()
@@ -1718,8 +1720,12 @@ impl<'a> Verifier<'a> {
             && st.imm == 0
             && c.cond == Some(CBNZ_X)
             && c.start == c.end
-            && self.word(and) == 0x9240_0800 | u32::from(st.base_reg) << 5)
+            && self.word(and) == (if self.c.bits32 { 0x9240_0400 } else { 0x9240_0800 }) | u32::from(st.base_reg) << 5)
             .then_some(and)
+    }
+    /// The stack slot's bytes, which the stack check's "aligned" means: 8, or 4 in 32-bit code (M2 task 4).
+    fn slot(&self) -> u64 {
+        if self.c.bits32 { 4 } else { 8 }
     }
     /// Stack check runs (fexc --push-run): per word, the registers known 8-byte aligned before it (bit 31 and x0/x1 never). A forward
     /// dataflow from the entry (nothing aligned): a stack alignment check's fall-through adds its register; a load/store
@@ -1734,6 +1740,8 @@ impl<'a> Verifier<'a> {
             .filter(|&i| self.stack_check(i).is_some())
             .map(|i| (self.checks[i].end, self.c.stubs[i].base_reg))
             .collect();
+        // (32-bit code: multiples of 4, and the 32-bit forms `add|sub{s} wD, wN, #imm` and `mov wD, wN` too: the low bits are the same.)
+        let (slot, sf) = (self.slot() as i64, if self.c.bits32 { 0x7fff_ffffu32 } else { !0 });
         let (mut m, mut dead) = (0u32, false);
         for i in ENTRY_OFFSET as usize / 4..n {
             let at = i as u32 * 4;
@@ -1755,7 +1763,7 @@ impl<'a> Verifier<'a> {
             match insn {
                 Insn::Mem(x) if matches!(x.form, Form::Pre | Form::Post) => {
                     if m & bit(u32::from(x.addr.base)) != 0
-                        && x.delta % 8 == 0
+                        && i64::from(x.delta) % slot == 0
                         && !(x.load && !x.vector && (x.rt == x.addr.base || x.rt2 == Some(x.addr.base)))
                     {
                         next |= bit(u32::from(x.addr.base));
@@ -1764,8 +1772,8 @@ impl<'a> Verifier<'a> {
                 Insn::Data(Some(d)) => {
                     let (rn, rm) = (w >> 5 & 31, w >> 16 & 31);
                     let imm = (w >> 10 & 0xfff) << (12 * (w >> 22 & 1));
-                    if (w & 0x9f80_0000 == 0x9100_0000 && m & bit(rn) != 0 && imm % 8 == 0)
-                        || (w & 0xffe0_ffe0 == 0xaa00_03e0 && m & bit(rm) != 0)
+                    if (w & 0x9f80_0000 & sf == 0x9100_0000 & sf && m & bit(rn) != 0 && i64::from(imm) % slot == 0)
+                        || (w & 0xffe0_ffe0 & sf == 0xaa00_03e0 & sf && m & bit(rm) != 0)
                     {
                         next |= bit(u32::from(d));
                     }

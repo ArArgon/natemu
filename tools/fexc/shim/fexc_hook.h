@@ -61,7 +61,7 @@ enum FexcSiteKind : uint8_t {
   FEXC_SITE_FMA = 18,                       // slice1 (AFP accurate plan, chunk 4): the NaN check of a fused multiply-add, in the body (FexcFmaCheck)
   FEXC_SITE_DENORM = 19,                    // slice1 stub (in-block DE screen skip): the resident's FP trap handler left a denormal result since the
                                             // last check; exit to the dispatcher at this instruction (no access, no address, the state before it)
-  FEXC_SITE_STACK = 20,                     // slice1 stub (--push-run): the guest RSP is not 8-byte aligned at a store it would cover; the
+  FEXC_SITE_STACK = 20,                     // slice1 stub (--push-run): the guest RSP is not 8-byte aligned (32-bit code: ESP not 4-byte aligned) at a store it would cover; the
                                             // resident steps the instruction alone (its step unit has the split check)
 };
 inline constexpr uint32_t FEXC_NONE32 = 0xFFFFFFFFu;
@@ -125,7 +125,7 @@ inline int fexc_ext_stop = -1;
 inline bool (*fexc_ext_abandon)(FEXCore::IR::IRListView&) = nullptr;
 inline bool fexc_ext_abandoned = false;
 // Request arguments (the host always sends them; fexc's own default is off): --push-run drops the split check of 2/4/8-byte stores at an 8-byte aligned base +
-// 8k, the guest RSP's alignment checked once (shim/fexc_sites.inc FexcBeforeOp, FexcAlignedAfter); --narrow-cmp compares 8/16-bit
+// 8k, the guest RSP's alignment checked once (shim/fexc_sites.inc FexcBeforeOp, FexcAlignedAfter; in 32-bit code the slot is 4 bytes: 2/4-byte stores at a 4-byte aligned base); --narrow-cmp compares 8/16-bit
 // operands with a constant without materialising it (FEX Flags.cpp CalculateFlags_SUB, JIT ALUOps.cpp SubNZCV). fexc_step_unit:
 // the request is a step (--max-insts 1), whose split checks stay (the resident steps an instruction whose alignment check fails).
 inline bool fexc_narrow_cmp = false, fexc_step_unit = false;

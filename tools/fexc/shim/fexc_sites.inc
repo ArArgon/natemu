@@ -45,10 +45,13 @@ FexcAddr FexcDecodeAddr(uint32_t w) {
 }
 // FEXC_PUSH_RUN: the registers known 8-byte aligned after word `w` (a bit per register; x0/x1 and sp never), given `m` before it.
 // Kept: a load/store writeback of a multiple of 8 on an aligned base. Set: `add|sub{s} xD, xN, #imm{, lsl #12}` (64-bit) of a
-// multiple of 8 on an aligned xN, `mov xD, xN` of an aligned xN. Every other write clears its register, conservatively: a
+// multiple of 8 on an aligned xN, `mov xD, xN` of an aligned xN. In 32-bit code (M2 task 4) the stack slot is 4 bytes: "aligned"
+// means 4-byte aligned, the multiples are of 4, and the 32-bit forms `add|sub{s} wD, wN, #imm` and `mov wD, wN` set D too (FEX
+// computes `sub esp, 4n` in 32 bits: the low two bits are the same, the upper half zero). Every other write clears its register, conservatively: a
 // non-memory word naming it as Rd (bits 0-4: every A64 general-register write but loads, branch with link and the exclusive and
 // atomic status registers names Rd there), a load/store naming it as Rt, Rt2 or Rs/Rm, a branch with link x30; `svc` clears all.
 // (Branches are the caller's: FexcAfterOp.)
+inline int FexcSlot() { return fexc_bits32 ? 4 : 8; }   // the stack slot: what "aligned" means
 uint32_t FexcAlignedAfter(uint32_t w, uint32_t m) {
   const auto bit = [](uint32_t r) { return r < 31 ? 1u << r : 0u; };
   if ((w & 0xffe0001fu) == 0xd4000001u) return 0;
@@ -56,17 +59,18 @@ uint32_t FexcAlignedAfter(uint32_t w, uint32_t m) {
   const uint32_t rd = w & 31, rn = (w >> 5) & 31;
   if (FexcIsMemWord(w)) {
     const FexcAddr A = FexcDecodeAddr(w);
-    if (A.wb && !((m >> rn & 1) && A.delta % 8 == 0)) m &= ~bit(rn);   // (delta: the amount's low 8 bits, the same residue mod 8)
+    if (A.wb && !((m >> rn & 1) && A.delta % FexcSlot() == 0)) m &= ~bit(rn);   // (delta: the amount's low 8 bits, the same residue mod 8)
     m &= ~bit(rd);
     if (((w >> 27) & 7) == 5) m &= ~bit((w >> 10) & 31);
     if (!A.imm_form) m &= ~bit((w >> 16) & 31);
     return m & ~3u;
   }
   bool set = false;
-  if ((w & 0x9f800000u) == 0x91000000u) {   // add/adds/sub/subs xD, xN, #imm{, lsl #12}
+  const uint32_t sf = fexc_bits32 ? 0x7fffffffu : 0xffffffffu;   // (32-bit code: the wD forms too)
+  if ((w & 0x9f800000u & sf) == (0x91000000u & sf)) {   // add/adds/sub/subs xD, xN, #imm{, lsl #12}
     const uint32_t imm = ((w >> 10) & 0xfff) << (12 * ((w >> 22) & 1));
-    set = (m >> rn & 1) && imm % 8 == 0;
-  } else if ((w & 0xffe0ffe0u) == 0xaa0003e0u) {   // mov xD, xM (orr xD, xzr, xM)
+    set = (m >> rn & 1) && imm % FexcSlot() == 0;
+  } else if ((w & 0xffe0ffe0u & sf) == (0xaa0003e0u & sf)) {   // mov xD, xM (orr xD, xzr, xM)
     set = m >> ((w >> 16) & 31) & 1;
   }
   m &= ~bit(rd);
@@ -1332,12 +1336,14 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   // it so (FexcAlignedAfter: pushes, pops, `add/sub rsp, 8n`, `mov rbp, rsp`). At the stub (B not aligned) the state is the state
   // before the instruction, as at a split stub; the resident steps it alone, in a max-insts 1 unit, which has the split check as
   // before (fexc_step_unit); so each store of a misaligned run faults at its own instruction with the earlier ones done.
-  if (fexc_push_run && !fexc_step_unit && Split && !Index && !Pair && !Align && W <= 8 && Imm % int64_t(W) == 0) {
+  // M2 task 4, 32-bit code: the slot is 4 bytes, so the check is `and x0, xB, #3` and covers stores of 2 or 4 bytes; an 8-byte
+  // store (an x87 double on the stack) keeps its split check.
+  if (fexc_push_run && !fexc_step_unit && Split && !Index && !Pair && !Align && W <= FexcSlot() && Imm % int64_t(W) == 0) {
     const uint32_t R = Base.Idx();
     if (R > 1 && R < 31 && (FexcAlignedMask >> R & 1)) return;
     if (StaticRegisters.size() > 4 && Base == StaticRegisters[4]) {   // the guest RSP
       auto* L = Stub(Base, 0, FEXC_SITE_STACK);
-      and_(ARMEmitter::Size::i64Bit, TMP1, Base, 7);
+      and_(ARMEmitter::Size::i64Bit, TMP1, Base, FexcSlot() - 1);
       cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, L);
       FexcAlignedMask |= 1u << R;
       return;

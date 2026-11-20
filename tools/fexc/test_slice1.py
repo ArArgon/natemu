@@ -690,8 +690,8 @@ class Slice1Cutting(unittest.TestCase):
         self.assertEqual((rc, d['guest']['instructions_translated'], d['guest']['end']['reason']), (0, 2, 'partial_decode'))
 
     def test_profile_rules(self):
-        # M2: 32-bit code is accepted, but not with the push-run stack option (8-byte stack slots) or the CPL-0 options
-        for flag, rc in (([], 0), (['--push-run'], 2), (['--cpl0'], 2), (['--tsc'], 2)):   # (the inline CPL-0 forms are 64-bit code's)
+        # M2: 32-bit code is accepted, with the push-run stack option (task 4: 4-byte stack slots) but not with the CPL-0 options
+        for flag, rc in (([], 0), (['--push-run'], 0), (['--cpl0'], 2), (['--tsc'], 2)):   # (the inline CPL-0 forms are 64-bit code's)
             r = subprocess.run([FEXC, '--profile', 'slice1', '--bitness', '32', *flag, '--hex', '90', '--rip', '0x1000'], capture_output=True, text=True)
             self.assertEqual(r.returncode, rc, flag)
         for flag in ('--multiblock', '--no-end-marker'):   # --no-end-marker is a no-op, but --multiblock must be refused
