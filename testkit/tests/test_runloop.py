@@ -119,6 +119,25 @@ def test_a_unit_with_unrecorded_items_is_estimated_from_its_suite(monkeypatch, t
     assert [u.req.expected for u in units if u.items[0].suite.name == "t"] == [None]   # nothing recorded: still unknown
 
 
+def test_units_that_never_ran_here_go_first(tmp_path, monkeypatch):
+    """A new case's length is only its suite's mean: started late, a long one ends the run (seen: a 9-minute case
+    estimated at a minute started 22 minutes into a gate)."""
+    from types import SimpleNamespace as NS
+    from testkit import runloop
+    from testkit.sched.policy import Config
+    suite = NS(name='s', batch=1, kind='runner', params={})
+    fam, var = NS(name='f'), NS(id='', params={})
+    items = [NS(nodeid=f'n{i}', unit_key=('f', 's', ''), suite=suite, fam=fam, variant=var, case=f'c{i}',
+                harness=object(), place=NS(env={})) for i in range(4)]
+    monkeypatch.setattr(runloop.durations, 'load', lambda: {'n0': 300.0, 'n1': 10.0, 'n3': 200.0})    # n2: never ran
+    monkeypatch.setattr(runloop, 'run_dir', lambda c: tmp_path)
+    monkeypatch.setattr(runloop, 'it_needs', lambda it: NS(cores=1, exclusive=False, perf=False, dedicated=False))
+    pool = NS(cfg=Config(p_cores=8, e_cores=4), unsatisfiable=lambda r: False)
+    units, _ = runloop.build_units(items, NS(getoption=lambda k: None), pool)
+    assert [u.items[0].nodeid for u in units] == ['n2', 'n0', 'n3', 'n1']
+    assert [u.req.asked for u in units] == sorted(u.req.asked for u in units)        # granted in that order
+
+
 def _alive(pid):
     try: os.kill(pid, 0); return True
     except ProcessLookupError: return False
@@ -221,10 +240,10 @@ def test_an_orphaned_worker_gives_its_handlers_time_then_kills_its_group(tmp_pat
         runloop.WORKER_GRACE = 2
         vm = subprocess.Popen(['sleep', '60'], start_new_session=True)
         campaign._LIVE.add(vm); campaign._on_term()
-        stubborn = subprocess.Popen([sys.executable, '-c',
-                                     'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])
-        print(vm.pid, stubborn.pid, flush=True)
-        time.sleep(1)                      # the stubborn child ignores SIGTERM before the controller is found dead
+        stubborn = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, '
+                                     'signal.SIG_IGN); print(flush=True); time.sleep(60)'], stdout=subprocess.PIPE)
+        assert stubborn.stdout.readline() == b'\\n'  # it ignores SIGTERM before the controller is found dead (not a fixed sleep:
+        print(vm.pid, stubborn.pid, flush=True)    # a slow start would have let SIGTERM kill it, and the test pass untested)
         threading.Thread(target=runloop.Worker.watch, args=({dead.pid},), daemon=True).start()
         time.sleep(60)
     '''))
@@ -255,3 +274,18 @@ def test_kill_waits_longer_than_a_campaign_stop(tmp_path):
     class U: proc, ended = p, None
     runloop.Controller.kill(None, U())
     assert mark.exists()
+
+
+def test_a_unit_on_an_efficiency_core_records_performance_core_durations(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    from testkit import durations, runloop
+    from testkit.sched.policy import Config
+    got = []
+    monkeypatch.setattr(durations, 'record_many', lambda d: got.append(d))
+    (tmp_path / '0.jsonl').write_text('\n'.join(json.dumps({'kind': 'report', 'data': {'nodeid': n, 'duration': t}})
+                                                for n, t in (('a', 30.0), ('a', 6.0), ('b', 9.0), ('other', 1.0))))
+    ctl = NS(dir=tmp_path, pool=NS(cfg=Config(p_cores=8, e_cores=4, e_slowdown=3.0)))
+    for cls, want in (('E', {'a': 12.0, 'b': 3.0}), ('P', {'a': 36.0, 'b': 9.0})):
+        u = NS(n=0, items=[NS(nodeid='a'), NS(nodeid='b')], grant=NS(core_class=cls))
+        runloop.Controller.record_durations(ctl, u)
+        assert got.pop() == want

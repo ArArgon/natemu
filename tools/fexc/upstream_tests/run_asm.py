@@ -43,6 +43,7 @@ import argparse, collections, concurrent.futures as cf, json, pathlib, re, shuti
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / 'tools'))
+sys.path.insert(0, str(ROOT / 'tests' / 'lib')); import testenv  # noqa: E402,F401 (tests/README.md: the test scripts)
 import run_slice1_vm as vm1  # noqa: E402
 
 CODE = 0x10000

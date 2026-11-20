@@ -114,8 +114,8 @@ def main():
 
     value = os.environ.get("NATEMU_RAW_ROOT")
     if not value:
-        report(False, "NATEMU_RAW_ROOT", "unset; suggested durable sibling: {} "
-               "(not created or selected)".format(REPO.parent / "natemu-raw"))
+        print("INFO NATEMU_RAW_ROOT unset: tools/natemu-test does not need it (it keeps its inputs in its own cache); "
+              "the scripts outside the test framework default to {}".format(REPO.parent / "natemu-raw"))
     else:
         try:
             root = external_root(value)

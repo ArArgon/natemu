@@ -11,7 +11,7 @@
 //! Physical map: INV-03-03 claim 69 (the selected cold-boot manifest), parameterised by the end of low RAM `L` and the
 //! size of high RAM `H` above 4 GiB ([`Layout`]); M1 grows guest RAM, L2 places the ACPI tables in the NVS range and
 //! passes the tables built by [`acpi`] ([`Inputs::acpi`]), X4 uses the NVS boot-service scratch. The independent judge of the result is
-//! `tools/models/bootproto.py` (`tools/run_l1.py`).
+//! `tools/models/bootproto.py` (`tests/boot/run_l1.py`).
 use crate::pci::platform::WINDOW;
 use natemu_abi::execution::{self as exec, Cpu, Segment, Table};
 use natemu_abi::guest_memory::GuestRam;
@@ -73,7 +73,7 @@ const TYPE_OF_LOADER: u8 = 0xff;
 const E820_MAX: usize = 128;
 
 /// Why an image or a load was refused. The header codes and their order are those of `tools/models/bootproto.py`'s
-/// `parse_bzimage` (checked by `tools/run_l1.py rejections`); the others are the loader's own.
+/// `parse_bzimage` (checked by `tests/boot/run_l1.py rejections`); the others are the loader's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadError {
     TruncatedHeader(usize),

@@ -113,7 +113,8 @@ def status(rid: str | None) -> str:
     from testkit.sched.pool import Pool
     p = Pool()
     st = p.snapshot()
-    out = [f'machine: {p.cfg.p_cores} performance + {p.cfg.e_cores} efficiency cores; window budget {p.cfg.window_budget:.0f} s']
+    slow = f' ({p.cfg.e_slowdown:.1f}x as slow)' if p.cfg.e_cores else ''
+    out = [f'machine: {p.cfg.p_cores} performance + {p.cfg.e_cores} efficiency cores{slow}; window budget {p.cfg.window_budget:.0f} s']
     for g in st.held:
         r = g.request
         out.append(f'  running  {r.label:40} {g.core_class}{r.cores:<2} {r.worktree:20} {time.time() - g.start:6.0f} s')

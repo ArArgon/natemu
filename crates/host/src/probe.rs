@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 /// `hv_feature_reg_t` of each [`ID_REGISTERS`] entry (ISAR0, ISAR1, PFR0, MMFR0, MMFR1, MMFR2), for the config view.
 const CONFIG_REGISTERS: [u32; ID_REGISTERS.len()] = [2, 3, 7, 4, 5, 6];
 
-/// The startup lines' topics, in print order; `tools/io_common.py` `STARTUP_TOPICS` is the same list (a test compares them).
+/// The startup lines' topics, in print order; `tests/lib/io_common.py` `STARTUP_TOPICS` is the same list (a test compares them).
 pub(crate) const TOPICS: [&str; 5] = ["cpu", "fp", "acceleration", "meltdown", "code cache"];
 
 /// The launch options that change generated code or its reuse (see [`Probe::lines`]).
@@ -218,9 +218,9 @@ mod tests {
     /// The topics are the tools' list, and every line printed is one of them.
     #[test]
     fn topics_match_the_tools_list() {
-        let tools = include_str!("../../../tools/io_common.py");
+        let tools = include_str!("../../../tests/lib/io_common.py");
         let list = TOPICS.map(|t| format!("'{t}'")).join(", ");
-        assert!(tools.contains(&format!("STARTUP_TOPICS = ({list})")), "tools/io_common.py STARTUP_TOPICS differs from {list}");
+        assert!(tools.contains(&format!("STARTUP_TOPICS = ({list})")), "tests/lib/io_common.py STARTUP_TOPICS differs from {list}");
         let lines = probe(|_| {}).lines(&LAUNCH);
         for (line, topic) in lines.iter().zip(TOPICS) {
             assert!(line.starts_with(&format!("natemu: {topic}: ")), "{line}");

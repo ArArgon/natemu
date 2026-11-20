@@ -397,7 +397,7 @@ def cases():
     c.append(('iret-compat-cpl3',) + iret([0x110000, 0xdb, 2, d + USTACK, 0x1b]))
     c.append(('iret-compat16-cpl3',) + iret([0x110000, 0xd3, 2, d + USTACK, 0x1b]))
     c.append(('lret-compat-cpl3',) + ret([0x110000, 0xdb, d + USTACK, 0x1b]))
-    # (An IRETQ loading TF is no longer a refusal: its single-step trap is S4's, tools/run_s4.py `s4-popf-iret`.)
+    # (An IRETQ loading TF is no longer a refusal: its single-step trap is S4's, tests/system/run_s4.py `s4-popf-iret`.)
     c.append(('iret-null-ss-rpl',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x1]))
     c.append(('iret-dpl3-ss',) + iret([0x110000, 0x08, 2, P.STACK(0), 0x18]))
     c.append(('iret-ss-not-present',) + iret([0x110000, 0x08, 2, P.STACK(0), 0xc8]))

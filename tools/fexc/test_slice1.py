@@ -27,6 +27,11 @@ import scan_skips  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1])); from raw_root import RAW_ROOT  # noqa: E402
 FEXC = os.environ.get('FEXC', str(RAW_ROOT / 'fexc-native-20261026-01/series20/obj/fexc'))
+# Tests that run the M4's code (afp=1, FPCR.AH/FIZ set) natively as their reference need a host with FEAT_AFP: without it
+# the FPCR bits do nothing, so the reference itself is wrong (seen on an M2 Max: 12 such tests failed). The afp=0 code
+# the M2 runs is checked by the tests without this mark.
+HOST_AFP = subprocess.run(['sysctl', '-n', 'hw.optional.arm.FEAT_AFP'], capture_output=True, text=True).stdout.strip() == '1'
+needs_afp_host = unittest.skipUnless(HOST_AFP, "runs the M4's afp=1 code natively as the reference: this Mac has no FEAT_AFP")
 REPO = HERE.parents[1]
 RIP = 0x102000
 PRE = '4801d8' + '4831c9'   # add rax, rbx ; xor rcx, rcx
@@ -976,6 +981,7 @@ class AfpDenormal(unittest.TestCase):
         self.assertGreater(positive, 500)
         self.assertGreater(n - positive, 1500)
 
+    @needs_afp_host
     def test_simd_denormal_flag_is_the_m4s_idc(self):
         """The same forms compiled for a host with AFP and run under the M4's FPCR (AH, NEP: natemu's FPCR on the M4) raise IDC in hardware:
         the software flag of the code without AFP, run under an M2's FPCR, is that bit for every operand class (the plan's M2 = M4)."""
@@ -1040,6 +1046,7 @@ class AfpDenormal(unittest.TestCase):
             if native_run(words[:end], v=v, fpcr=fpcr, buf=buf)[0][0] & 0x80: return n
         return None
 
+    @needs_afp_host
     def test_dpps_and_dppd_add_levels_flag_denormal_products_and_sums_as_the_m4_does(self):
         rnd = random.Random(7)
         tiny32, tiny64 = 0x1c800000, 0x1f70000000000000   # 2^-70 and 2^-520: their square is an exact denormal, no UE
@@ -1121,6 +1128,7 @@ class AfpDenormal(unittest.TestCase):
                     n += 1
         self.assertGreater(n, 400)
 
+    @needs_afp_host
     def test_x87_denormal_flag_is_the_m4s_idc_except_where_the_m4_deviates(self):
         """As the SIMD test: the M4's x87 code (a host with AFP) under the M4's FPCR raises IDC for the same memory operands, but where the M4
         deviates from x86 (below); a denormal double in ST0 is left out: the M4 reports DE for it (deviation 4 of the boot-features plan)."""
@@ -1180,6 +1188,7 @@ class AfpDenormal(unittest.TestCase):
                     n += 1
         self.assertGreater(n, 2000)
 
+    @needs_afp_host
     def test_fma_ie_is_the_m4s_ioc(self):
         """The IE of the FMA forms without AFP (sanitized) is the M4's hardware IOC (AH = 1), for every combination of operand classes."""
         n = 0
@@ -1375,6 +1384,7 @@ class AfpX87(unittest.TestCase):
         if mem is not None: buf[0x1000:0x1000 + e] = mem.to_bytes(e, 'little')
         return native_run(words[:i], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=6 if afp else 0)[2][:0x500]
 
+    @needs_afp_host
     def test_memory_operands_follow_the_m4_and_x86(self):
         n = 0
         for name, op, form, e in self.MEM:
@@ -1392,11 +1402,13 @@ class AfpX87(unittest.TestCase):
                     n += 1
         self.assertGreater(n, 2000)
 
+    @needs_afp_host
     def test_register_forms_follow_the_m4(self):
         for form in self.REG:
             for (a, st0), (b, st1) in itertools.product(self.D.items(), repeat=2):
                 self.assertEqual(self.run_form(form, False, st0, st1, None, 8), self.run_form(form, True, st0, st1, None, 8), (form, a, b))
 
+    @needs_afp_host
     def test_integer_operands_follow_the_m4(self):
         for form, e in (('da03', 4), ('da0b', 4), ('da2b', 4), ('da33', 4), ('de03', 2), ('de3b', 2), ('da13', 4), ('db03', 4)):
             for a, st0 in self.D.items():
@@ -1515,6 +1527,7 @@ class AfpAccurateDe(unittest.TestCase):
             if a != b and not fp_class(int.from_bytes(a, 'little'), e)['nan']: return False
         return True
 
+    @needs_afp_host
     def test_oracle(self):
         trials = int(os.environ.get('ORACLE_TRIALS', 60))
         rnd = random.Random(2026)
@@ -1540,6 +1553,7 @@ class AfpAccurateDe(unittest.TestCase):
     NEG_FORMS = ('addsubps', 'addsubpd', 'vaddsubps ymm', 'vfmsub231ps ymm', 'vfnmsub231ps', 'vfnmsub231pd', 'vfmaddsub231ps xmm', 'vfmaddsub231ps ymm',
                  'vfmsubadd231pd xmm', 'vfmsubadd231ps', 'vfmsub231ps', 'vfmsub231pd', 'vfnmsub231ps ymm', 'vfmsubadd231ps ymm')
 
+    @needs_afp_host
     def test_nan_beside_denormal_in_one_lane(self):
         """x86 sets no DE when the other operand of the lane is a NaN: a NaN in one of xmm1..xmm3 and a denormal in another, in every lane
         (every register-role assignment), M4 against the afp=0 accurate code (the internal negation multiplies are not guest operations)."""
@@ -1900,6 +1914,7 @@ class AfpNegation(unittest.TestCase):
                for v in ('', 'v') for t in ('ps', 'pd')]
         return fma, add
 
+    @needs_afp_host
     def test_negations_keep_a_nans_sign_and_every_other_result_and_flag(self):
         fma, add = self.forms()
         bad, n = self.compare(FEXC, fma + add)
@@ -1932,6 +1947,7 @@ class AfpNegation(unittest.TestCase):
     def lanes(self, fexc, text, ops, afp, e=4):
         return self.exec(fexc, x86_asm([text]), e, [tuple(ops)] * (16 // e), (), afp)
 
+    @needs_afp_host
     def test_nan_corner_cases_are_pinned(self):
         """The cases the sweep above skips, each against the M4's code (the x86 result). Fast mode's documented differences: the addend of the
         packed VFMSUB/VFNMSUB and the subtracted lanes of VFMADDSUB/VFMSUBADD reach the FMA quieted (by the multiply: IE is raised for an
@@ -2034,6 +2050,7 @@ class AfpUpperZero(unittest.TestCase):
         self.assertEqual(ins(['movsd xmm0, qword ptr [rax]', 'addsd xmm0, xmm1'], '--daz', '--ftz'), 0)   # through the flushes
         self.assertEqual(self.ins(uz_block(FEXC, x86_asm(['movsd xmm0, qword ptr [rax]', 'addsd xmm0, xmm1']))[1]), 0)   # AFP: no insert at all
 
+    @needs_afp_host
     def test_sequences_keep_every_bit(self):
         rnd = random.Random(11)
         old = os.environ.get('FEXC_OLD')
@@ -2325,7 +2342,7 @@ class Slice1SelfLoopsAndStop(unittest.TestCase):
 class ApproxSdm(unittest.TestCase):
     """RCPPS/RCPSS/RSQRTPS/RSQRTSS and their VEX forms get the Intel SDM's fixed results (a denormal source counts as 0.0, RCP's tiny
     results are 0.0) from integer words around FEX's exact op (shim/fexc_sites.inc, FexcApproxScalar), the same with and without AFP, in
-    both FP modes and under every DAZ/FTZ key. The values are tools/run_approx_special.py's (also under DAZ, FTZ and every rounding
+    both FP modes and under every DAZ/FTZ key. The values are tests/fp/run_approx_special.py's (also under DAZ, FTZ and every rounding
     mode); here the shape: which words go where (a source the result overwrites, a source that survives), that they are integer words
     inside the FPSR save/restore, and that only one or two of them wait for the op's result."""
     H = ['shl', 'movi', 'add', 'ushr', 'cmeq', 'ushr']                          # RCP: the source lanes whose result is 0.0 (v1)

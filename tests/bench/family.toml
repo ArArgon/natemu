@@ -1,13 +1,13 @@
-# Benchmarks (spec R3.6): the existing tools/bench scripts, wrapped, each alone on the machine; run only when named
+# Benchmarks (spec R3.6): the tools/bench scripts and tests/bench/run_m1_perf.py, each alone on the machine; run only when named
 # (`--tier bench`). Numbers are kept per machine and never compared across machines. The guest benchmarks' initramfs is
 # built on the Mac from tools/bench/image (testkit/artifacts.py:bench_image); the kernel is Debian's pinned package.
 [family]
 name = "bench"
-covers = ["tools/bench/**"]
+covers = ["tools/bench/**", "tests/bench/**", "tests/io/**", "tests/lib/**"]
 
 [[suite]]
 name = "bench"
-kind = "legacy"
+kind = "bench"
 harness = "bench"
 tier = "bench"
 params = { timeout = 7200 }
@@ -99,14 +99,14 @@ argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "avx", "--e
 argv = ["python3", "tools/bench/run.py", "--out", "{out}", "--name", "zstd", "--emu", "qemu-multi", "--vcpus", "1", "--bench", "zstd",
         "--kernel", "{kernel}", "--initrd", "{bench_image}"]
 
-# The M1 performance check (docs/m1-config-and-qcow2-design.md, "Performance check"; tools/run_m1_perf.py): natemu at
+# The M1 performance check (docs/m1-config-and-qcow2-design.md, "Performance check"; tests/bench/run_m1_perf.py): natemu at
 # the baseline commit against this checkout's build, in fio matrix runs on raw, qcow2 and overlay disks plus IO5, judged
 # by the driver (exit 0 only on PASS). About 80 minutes and 3-4 GiB of free disk. A suite of its own, so that preparing
 # the other benchmarks never builds the baseline or the IO5 image. Its results folder ({resume_dir}) is kept per machine
 # for these builds and inputs: running the case again resumes (finished runs are kept, failed ones are run again).
 [[suite]]
 name = "m1-perf"
-kind = "legacy"
+kind = "bench"
 harness = "bench"
 tier = "bench"
 params = { timeout = 7200 }
@@ -114,7 +114,7 @@ params = { timeout = 7200 }
 [suite.cases.m1-perf]
 baseline = "ecec5d77"           # = run_m1_perf.py BASELINE_COMMIT; {natemu_baseline} is artifacts.natemu_at(baseline)
 pieces = true                   # one case per planned run (`m1-perf/piece-NN`, --limit 1): about 2-15 min windows, not 80
-argv = ["python3", "tools/run_m1_perf.py", "full", "--dir", "{resume_dir}", "--retry-failed", "--baseline-build", "{natemu_baseline}",
+argv = ["python3", "tests/bench/run_m1_perf.py", "full", "--dir", "{resume_dir}", "--retry-failed", "--baseline-build", "{natemu_baseline}",
         "--final-build", "{natemu_entry}", "--fexc", "{fexc}", "--fio-prep", "{fio_prep}", "--block-inputs", "{block_inputs}",
         "--inputs", "{resume_dir}/matrix-inputs", "--io5-inputs", "{io5_inputs}"]
 env = { NATEMU_QEMU_IMG = "{qemu_img}" }

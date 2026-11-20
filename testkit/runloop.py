@@ -78,7 +78,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
     # An item with no recorded duration is estimated from its suite's recorded items (their mean), so one new case does
     # not make its whole unit unknown, which keeps it out of every drain backfill (rule 3; seen: 9 of 12 cores idle while
     # a window drained, the gate's 220 units all unknown because 45 of its thousands of fault cases had a duration).
-    known = {}
+    known, new = {}, set()          # new: units with an item never recorded here, ordered first (below)
     for it in items:
         t = table.get(it.nodeid)
         if t is not None: known.setdefault(it.unit_key, []).append(t)
@@ -88,6 +88,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
         for i in range(0, len(g), max(1, s.batch)):
             chunk = g[i:i + s.batch]
             exp = [table.get(it.nodeid, it.harness.expected(it.case) if hasattr(it.harness, 'expected') else None) for it in chunk]
+            unrecorded = any(table.get(it.nodeid) is None for it in chunk)
             if None in exp and known.get(k):
                 mean = sum(known[k]) / len(known[k])
                 exp = [mean if e is None else e for e in exp]
@@ -96,7 +97,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
             req = Request(id=f'{run}:{uuid.uuid4().hex}', owner_pid=os.getpid(), cores=_cores(nd.cores, pool.cfg),
                           exclusive=nd.exclusive, perf=nd.perf or nd.dedicated, priority=prio,
                           asked=time.time(), expected=None if None in exp else sum(exp),
-                          label=f'{g[0].fam.name}/{s.name}' + (f'/{chunk[0].case}' if s.kind == 'legacy' else '')
+                          label=f'{g[0].fam.name}/{s.name}' + (f'/{chunk[0].case}' if s.kind == 'bench' else '')
                                 + (f'[{g[0].variant.id}]' if g[0].variant.params else ''),
                           worktree=paths.repo_root().name, run=run)
             if getattr(nd, 'mixed', False) and pool.unsatisfiable(req) and req.cores <= pool.cfg.p_cores + pool.cfg.e_cores \
@@ -107,17 +108,28 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
                                                  f'performance and {pool.cfg.e_cores} efficiency cores') for it in chunk]
                 continue
             env = dict(g[0].place.env)
-            if s.kind != 'legacy': env.update(NO_RAW_CACHES)
+            if s.kind != 'bench': env.update(NO_RAW_CACHES)
             h = chunk[0].harness                            # a case may set its own timeout (runner cases: `timeout = N`)
             own = [h.case_timeout(it.fam, it.suite, it.case) for it in chunk] if hasattr(h, 'case_timeout') else []
             timeout = max([float(x) for x in own if x] or [float(s.params.get('timeout', 3600))])
             units.append(Unit(len(units), chunk, req, env, timeout))
-    units.sort(key=lambda u: -(u.req.expected if u.req.expected is not None else 1e9))
+            if unrecorded: new.add(units[-1].n)
+    # The queue grants in ask order (testkit.sched.policy rule 7), so the order is stamped after sorting: claims of a whole
+    # core class first, while the machine is still empty (later they wait for every core of it to free), then longest
+    # first. (Stamped at creation, the units were granted in collection order: the unit family, last alphabetically,
+    # started its longest units at the end of every gate.) A unit with an item that never ran on this machine goes
+    # before the others: its length is only estimated (its suite's mean), and a long one started late is the run's tail
+    # (seen: a new 9-minute case estimated at a minute started 22 minutes into a gate and ended it).
+    whole = lambda u: u.req.cores >= (pool.cfg.p_cores if u.req.perf else max(pool.cfg.p_cores, pool.cfg.e_cores))
+    units.sort(key=lambda u: (0 if whole(u) else 1, 0 if u.n in new else 1,
+                              -(u.req.expected if u.req.expected is not None else 1e9)))
+    t0 = time.time()
+    for i, u in enumerate(units): u.req = dataclasses.replace(u.req, asked=t0 + i * 1e-6)
     return units, refused
 
 
 def it_needs(item):
-    """A suite's claims, or per case where the harness knows them (wrapped legacy steps)."""
+    """A suite's claims, or per case where the harness knows them (benchmarks)."""
     h = item.harness
     return h.case_needs(item.fam, item.suite, item.case) if hasattr(h, 'case_needs') else item.suite.needs
 
@@ -325,7 +337,9 @@ class Controller:
             ev = json.loads(line)
             if ev['kind'] == 'report':
                 d = ev['data']; total[d['nodeid']] = total.get(d['nodeid'], 0) + d.get('duration', 0)
-        durations.record_many({k: v for k, v in total.items() if k in {i.nodeid for i in u.items}})
+        # performance-core seconds (testkit.sched.policy rule 5): a unit on an efficiency core ran e_slowdown times as long
+        scale = 1 / self.pool.cfg.e_slowdown if u.grant and u.grant.core_class == 'E' else 1.0
+        durations.record_many({k: v * scale for k, v in total.items() if k in {i.nodeid for i in u.items}})
 
     def kill(self, *us: Unit, why: str = 'run interrupted') -> None:
         """SIGTERM to each unit's worker group, then SIGKILL to the groups whose worker is still there after

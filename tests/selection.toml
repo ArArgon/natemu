@@ -2,6 +2,7 @@
 # every family's smoke cases run. Families declare what they cover in their own family.toml (`covers`).
 shared = [
     "testkit/**",
+    "tests/lib/testenv.py",
     "pytest.ini",
     "tests/features.toml",
     "tests/resources.toml",

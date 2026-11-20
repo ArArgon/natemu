@@ -804,7 +804,7 @@ def sys_program(name, n=1):
 # as a wrmsr_safe probe; QEMU accepts unknown MSRs, so rdmsr_safe's PLATFORM_INFO probe is a `run_slice3_vm.py delivery`
 # case) is skipped with r13 = -1;
 # DIV by 0 (#DE) is skipped. INT3 runs once more with DF set. Registers and the log are compared with QEMU;
-# tools/run_slice3_vm.py checks the logged frames against delivery_model. (Pinned QEMU keeps RF after an IRETQ that loaded
+# tests/smp/run_slice3_vm.py checks the logged frames against delivery_model. (Pinned QEMU keeps RF after an IRETQ that loaded
 # it until a later event, so an INT3 after a fault's return logs RF = 1 there; the SDM clears RF when the next instruction
 # completes and INT n pushes RF = 0: no INT follows a fault's return here.)
 DLV = lambda i: SYS_D(i) + 0x8000

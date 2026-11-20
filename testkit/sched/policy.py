@@ -12,9 +12,19 @@ blocks and keeps no hidden state, so it is tested with a fake clock (testkit/tes
    expected duration is known and it ends by the drain horizon: the latest expected end of the shared work running.
    A starved request (7) is the exception: it is granted anyway, and the window waits for it (seen: a campaign part
    with no recorded duration waited 48 minutes while a stream of exclusive tests kept a window pending).
-4. Shared requests by priority, then the fair-share order (7); strict: one that cannot be granted now blocks those after it of the same or
-   lower priority, so a large claim is not starved by small ones.
-5. `perf` requests use performance cores only; others use performance cores if free, else efficiency cores.
+4. Shared requests by priority, then the fair-share order (7). The first one that cannot be granted now (a large claim
+   while cores are busy) reserves the time its cores free up (from the running grants' expected ends); a request after
+   it is granted only where that cannot delay it: on a core class the reserved claim cannot use (efficiency cores, for
+   a `perf` claim), or with a known expected duration that ends before the reserved time (backfill). So a large claim
+   is not starved by small ones, and cores it cannot use or would only hold idle do not wait with it.
+5. `perf` requests use performance cores only; others use performance cores if free, else efficiency cores, where
+   work takes `e_slowdown` times as long (expected durations are performance-core seconds). A request with a known
+   duration goes to an efficiency core only if it ends there before it would on the next performance core to free up
+   (counting the requests already waiting for one, in order; a grant past its expected end is taken to overrun as much
+   again, and a claim rule 4 reserved holds its cores from when they free up); otherwise it waits for that core. Where
+   rule 4 lets a request backfill the reserved claim's performance cores, it takes them before an efficiency core.
+   So a long unit is not
+   started on a slow core at the end of a run, where it alone decides when the run ends.
 6. A request no core class can ever hold is unsatisfiable; it is never granted (the caller reports it not runnable).
 7. Fair share between runs: within a priority, requests of the run that has had the least machine time so far
    (core-seconds, held grants counted up to now, an exclusive grant as the whole machine) go first, then by age. So
@@ -60,6 +70,7 @@ class Config:
     window_budget: float = 600.0
     min_shared: float = 120.0
     starve_after: float = 1800.0
+    e_slowdown: float = 1.0         # how many times as long work takes on an efficiency core (rule 5); 1: no difference
 
 
 @dataclasses.dataclass
@@ -156,23 +167,75 @@ def _decide(state: State, cfg: Config, now: float, external_busy: bool) -> Decis
     if pending and external_busy and not shared_held:
         pending = False             # the window waits for something outside the pool; do not starve shared work meanwhile
 
-    horizon = max((g.start + (g.request.expected if g.request.expected is not None else math.inf) for g in shared_held),
-                  default=now)
+    slow = lambda c: cfg.e_slowdown if c == 'E' else 1.0
+    held_end = lambda g: g.start + (g.request.expected * slow(g.core_class) if g.request.expected is not None else math.inf)
+    horizon = max((held_end(g) for g in shared_held), default=now)
     used = {'P': sum(g.request.cores for g in shared_held if g.core_class == 'P'),
             'E': sum(g.request.cores for g in shared_held if g.core_class == 'E')}
     cap = {'P': cfg.p_cores, 'E': cfg.e_cores}
-    grants, blocked_at = [], None
+    grants, reserved = [], None              # reserved: (core classes the blocked claim can use, the time they free up)
+    ends = [(g.core_class, held_end(g), g.request.cores) for g in shared_held]
+    # rule 5: when each performance core is free, counting the requests this decision granted or left waiting for one.
+    # A grant past its expected end is taken to overrun as much again as it has so far: not to free its cores in the past
+    # (then nothing would ever look better on an efficiency core than waiting for it, seen in review: short work waited
+    # beside idle efficiency cores behind grants 20 times over their estimate), nor never (most overrun by a little).
+    p_end = lambda g: e if (e := held_end(g)) >= now else now + (now - e)
+    pslots = sorted([now] * (cfg.p_cores - used['P']) + [p_end(g) for g in shared_held if g.core_class == 'P'
+                                                         for _ in range(g.request.cores)])[:cfg.p_cores]
     cands = [r for r in state.waiting if not r.exclusive and not unsatisfiable(r, cfg)]
     starved = lambda r: now - state.last_grant.get(run_of(r), r.asked) >= cfg.starve_after
+    known_end = lambda r, c='P': now + r.expected * slow(c) if r.expected is not None else math.inf
+
+    def book_p(r, start):
+        """Rule 5's plan: r takes the r.cores performance cores that free first, from `start` (never before now), until
+        it ends."""
+        start = max(start, now)
+        del pslots[:r.cores]
+        pslots.extend([start + r.expected if r.expected is not None else math.inf] * r.cores); pslots.sort()
+
+    def frees_at(r, classes):
+        """The earliest time `r` fits in one of `classes`, from the expected ends of what holds them."""
+        best = math.inf
+        for c in classes:
+            free = cap[c] - used[c]
+            for _, end, n in sorted(e for e in ends if e[0] == c):
+                if free >= r.cores: break
+                free += n
+                if free >= r.cores: best = min(best, end); break
+            else:
+                if free >= r.cores: best = now
+        return best
+
     while cands:
         r = min(cands, key=key); cands.remove(r)            # re-ranked after every grant: shares grow as cores go out
-        if blocked_at is not None and r.priority <= blocked_at: break
-        if pending and not starved(r) and (r.expected is None or now + r.expected > horizon):
-            blocked_at = r.priority; continue
-        cls = next((c for c in (('P',) if r.perf else ('P', 'E')) if used[c] + r.cores <= cap[c]), None)
-        if cls is None:
-            blocked_at = r.priority; continue
+        if pending and not starved(r) and known_end(r) > horizon:
+            continue                                         # rule 3: it would hold the window back (even on P)
+        classes = ('P',) if r.perf else ('P', 'E')
+        if reserved is None:
+            cls = next((c for c in classes if used[c] + r.cores <= cap[c]), None)
+            if cls is None:
+                reserved = (classes, frees_at(r, classes))
+                if 'P' in classes and r.cores <= len(pslots):    # rule 5's plan: its cores, from when the plan
+                    book_p(r, pslots[r.cores - 1])                 # frees them (overruns counted, unlike frees_at)
+                continue
+        else:                                                # rule 4's backfill: never on the reserved claim's cores
+            own, at = reserved                               # unless it ends before they free up
+            order = [c for c in classes if c not in own] + [c for c in classes if c in own]
+            if cfg.e_slowdown > 1: order = list(classes)     # rule 5: a backfill that may use a performance core is
+            cls = next((c for c in order if used[c] + r.cores <= cap[c] and (c not in own or known_end(r, c) <= at)), None)
+            if cls is None:                                  # faster there
+                if 'P' in classes and r.cores <= len(pslots): book_p(r, pslots[r.cores - 1])   # rule 5: queued for P
+                continue
+        if cls == 'E' and 'P' in classes and r.expected is not None and not starved(r) and cfg.e_slowdown > 1:
+            p_at = pslots[r.cores - 1] if r.cores <= len(pslots) else math.inf
+            if p_at + r.expected <= known_end(r, 'E'):
+                book_p(r, p_at); continue                    # rule 5: it ends sooner waiting for a performance core
+        if pending and not starved(r) and known_end(r, cls) > horizon:
+            continue
+        if cls == 'P' and not (reserved is not None and 'P' in reserved[0]):
+            book_p(r, now)                                   # (a backfill ends before the claim's booked cores free)
         used[cls] += r.cores
+        ends.append((cls, known_end(r, cls), r.cores))
         share[run_of(r)] = share.get(run_of(r), 0.0) + (r.expected if r.expected is not None else 60.0) * r.cores
         grants.append((r, cls))
     return Decision(grants, open_since, last_closed)

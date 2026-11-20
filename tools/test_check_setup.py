@@ -13,21 +13,18 @@ import check_setup
 
 
 class SetupChecks(unittest.TestCase):
-    def test_project_launcher_default_override_and_exit(self):
-        launcher = str(check_setup.REPO / "tools" / "with-env")
-        env = dict(os.environ)
-        env.pop("NATEMU_RAW_ROOT", None)
-        command = ["sh", launcher, sys.executable, "-B", "-c",
-                   "import os; print(os.environ['NATEMU_RAW_ROOT'])"]
-        # The default belongs to the project, not the caller's current directory or where this checkout lives: build a
-        # plain checkout and a linked worktree of it in a temporary folder. A plain checkout uses its own sibling
+    def test_raw_root_default_is_the_main_checkouts_sibling(self):
+        # raw_root.py's default belongs to the project, not the caller's current directory or where this checkout lives:
+        # build a plain checkout and a linked worktree of it in a temporary folder. A plain checkout uses its own sibling
         # natemu-raw; a linked worktree uses the MAIN checkout's sibling; NATEMU_RAW_ROOT wins over both.
         git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+        raw_root = (check_setup.REPO / "tools" / "raw_root.py").read_bytes()
+        env = {k: v for k, v in os.environ.items() if k not in ("NATEMU_RAW_ROOT", "NATEMU_STATE_ROOT")}
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()
             main = base / "main"
             (main / "tools").mkdir(parents=True)
-            (main / "tools" / "with-env").write_bytes((check_setup.REPO / "tools" / "with-env").read_bytes())
+            (main / "tools" / "raw_root.py").write_bytes(raw_root)
             subprocess.run(git + ["init", "-q"], cwd=main, check=True)
             subprocess.run(git + ["add", "."], cwd=main, check=True)
             subprocess.run(git + ["commit", "-q", "-m", "x"], cwd=main, check=True)
@@ -35,20 +32,12 @@ class SetupChecks(unittest.TestCase):
             subprocess.run(git + ["worktree", "add", "-q", "--detach", str(tree)], cwd=main, check=True)
 
             def default(root, **extra):
-                run = subprocess.run(["sh", str(root / "tools" / "with-env"), sys.executable, "-B", "-c",
-                                      "import os; print(os.environ['NATEMU_RAW_ROOT'])"],
-                                     cwd=directory, env=dict(env, **extra), capture_output=True, text=True, check=True)
+                run = subprocess.run([sys.executable, "-B", "-c", "from raw_root import RAW_ROOT; print(RAW_ROOT)"],
+                                     cwd=root / "tools", env=dict(env, **extra), capture_output=True, text=True, check=True)
                 return Path(run.stdout.strip()).resolve()
             self.assertEqual(default(main), base / "natemu-raw")
             self.assertEqual(default(tree), base / "natemu-raw")
             self.assertEqual(default(tree, NATEMU_RAW_ROOT=str(base / "x")), base / "x")
-            env["NATEMU_RAW_ROOT"] = directory
-            result = subprocess.run(command, env=env, capture_output=True,
-                                    text=True, check=True)
-            self.assertEqual(result.stdout.strip(), directory)
-        result = subprocess.run(["sh", launcher, sys.executable, "-B", "-c",
-                                 "raise SystemExit(7)"], env=env)
-        self.assertEqual(result.returncode, 7)
 
     def test_resolved_output_boundary(self):
         with tempfile.TemporaryDirectory() as directory:

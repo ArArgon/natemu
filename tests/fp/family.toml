@@ -3,7 +3,7 @@
 [family]
 name = "fp"
 covers = ["crates/runtime/src/**/fp*", "crates/runtime/src/fp/**", "crates/abi/src/fptrap.rs", "third_party/FEX",
-          "tools/fexc/**", "tools/fp_deviations.py", "tools/reference/gen_i8.py", "tools/reference/gen_i5a.py"]
+          "tools/fexc/**", "tests/fp/**", "tests/lib/fp_deviations.py", "tests/lib/run_slice1_vm.py", "tests/lib/asmcache.py", "tests/lib/testenv.py", "tools/reference/gen_i8.py", "tools/reference/gen_i5a.py"]
 
 [input.i8]
 generator = "tools/reference/gen_i8.py"
@@ -39,13 +39,13 @@ judge = "approx"
 matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false], "engine.max_block" = [0, 1] }
 batch = 64
 smoke = ["i8-forms-000"]
-# QEMU 7.2's two-NaN choices depart from x86 in these (run_suite.py I8B_KNOWN), so they take another reference (R2.13a):
+# QEMU 7.2's two-NaN choices depart from x86 in these (the old suite's I8B_KNOWN), so they take another reference (R2.13a):
 # real x86 where AMD and Intel agree; the Intel-SDM model (tools/models/afp_fp) for the three where the AMD box returns
 # another NaN than the SDM's (HADDPS, MAXPD and FMA two-NaN choices; natemu and the model agree there).
 reference_overrides = { "i8-forms-001" = "x86", "i8-random-067" = "x86", "i8-random-077" = "x86", "i8-random-126" = "x86", "i8-forms-045" = "model", "i8-random-097" = "model", "i8-random-111" = "model" }
 
 # RCP/RSQRT on the inputs whose result the Intel SDM fixes, with the expected bits written in the runner
-# (tools/run_approx_special.py): no reference machine. The approximations themselves are checked against the bound.
+# (tests/fp/run_approx_special.py): no reference machine. The approximations themselves are checked against the bound.
 [[suite]]
 name = "approx-special"
 kind = "judged"
@@ -53,10 +53,10 @@ harness = "runner"
 needs = { cores = 1 }
 
 [suite.cases.approx-special-accurate]
-argv = ["tools/run_approx_special.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/fp/run_approx_special.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
 env = { NATEMU_FP = "accurate" }
 smoke = true
 
 [suite.cases.approx-special-fast]
-argv = ["tools/run_approx_special.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
+argv = ["tests/fp/run_approx_special.py", "--host", "{natemu_host}", "--runtime", "{natemu_runtime}", "--fexc", "{fexc}", "--out", "{out}"]
 env = { NATEMU_FP = "fast" }

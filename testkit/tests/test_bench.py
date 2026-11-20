@@ -51,7 +51,7 @@ def test_m1_perf_baseline_is_the_runners():
     import re
     from testkit import paths
     _, suites = _bench_family()
-    src = (paths.repo_root() / 'tools' / 'run_m1_perf.py').read_text()
+    src = (paths.repo_root() / 'tests' / 'bench' / 'run_m1_perf.py').read_text()
     assert suites['m1-perf'].extra['cases']['m1-perf']['baseline'] == re.search(r"^BASELINE_COMMIT = '(\w+)'", src, re.M)[1]
 
 
@@ -82,7 +82,7 @@ def _m1_perf_harness(monkeypatch, tmp_path):
     monkeypatch.setattr('testkit.sched.pool.raw_root', lambda: None)
     seen, real, codes = {}, subprocess.run, {'rc': 0}
     def fake(argv, **kw):
-        if 'tools/run_m1_perf.py' not in argv: return real(argv, **kw)       # the clones' cp
+        if 'tests/bench/run_m1_perf.py' not in argv: return real(argv, **kw)       # the clones' cp
         seen.update(argv=argv, env=kw['env']); return SimpleNamespace(returncode=codes['rc'])
     monkeypatch.setattr(subprocess, 'run', fake)
     item = SimpleNamespace(suite=suites['m1-perf'], case='m1-perf', nodeid='m1')
@@ -102,7 +102,7 @@ def test_m1_perf_argv_gets_framework_builds_and_inputs(monkeypatch, tmp_path):
     a, env, out, res = _m1_perf_harness(monkeypatch, tmp_path)('run1')
     assert res.outcome == 'passed', res
     val = lambda opt: a[a.index(opt) + 1]
-    assert a[1:3] == ['tools/run_m1_perf.py', 'full'] and '--retry-failed' in a
+    assert a[1:3] == ['tests/bench/run_m1_perf.py', 'full'] and '--retry-failed' in a
     assert val('--baseline-build') == str(tmp_path / 'base-ecec5d77') and val('--final-build') == str(tmp_path / 'final')
     assert val('--fexc') == str(tmp_path / 'fexc')
     assert val('--inputs') == val('--dir') + '/matrix-inputs'
@@ -159,8 +159,8 @@ def test_m1_perf_resume_folder_changes_with_its_scripts(monkeypatch, tmp_path):
     run = _m1_perf_harness(monkeypatch, tmp_path)
     val = lambda a, opt: a[a.index(opt) + 1]
     a1, *_ = run('run1')
-    script = tmp_path / 'tools' / 'run_io_matrix.py'; script.parent.mkdir(); script.write_text('v1')
-    monkeypatch.setattr(bench, 'RESUME_SCRIPTS', ('tools/run_io_matrix.py',))
+    script = tmp_path / 'tests' / 'io' / 'run_io_matrix.py'; script.parent.mkdir(parents=True); script.write_text('v1')
+    monkeypatch.setattr(bench, 'RESUME_SCRIPTS', ('tests/io/run_io_matrix.py',))
     monkeypatch.setattr(bench.paths, 'repo_root', lambda: tmp_path)
     a2, *_ = run('run2')
     script.write_text('v2')
@@ -242,4 +242,4 @@ def test_a_failing_piece_count_is_loud(monkeypatch, tmp_path):
     monkeypatch.setattr(bench, '_PIECES', {})
     monkeypatch.setattr(bench.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=1, stdout='', stderr='boom'))
     with pytest.raises(RuntimeError, match='no piece count'):
-        bench._piece_count({'argv': ['python3', 'tools/run_m1_perf.py', 'full']})
+        bench._piece_count({'argv': ['python3', 'tests/bench/run_m1_perf.py', 'full']})

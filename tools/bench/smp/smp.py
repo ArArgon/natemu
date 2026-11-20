@@ -100,7 +100,7 @@ def answer_key(prog, img, mode='multi', extra=(), cpu=None):
 
 def run_image(prog, img, work, mode='multi', timeout=120, extra=(), cpu=None, hang_ok=False):
     """`extra`: more QEMU arguments (L3: `-serial file:PATH` gives the machine COM1 at 3F8H, in place of `-serial none`);
-    `cpu`: a QEMU CPU model other than `default_cpu(prog)` (tools/run_i5b.py); `hang_ok`: a timeout is the expected answer.
+    `cpu`: a QEMU CPU model other than `default_cpu(prog)` (tests/system/run_i5b.py); `hang_ok`: a timeout is the expected answer.
     NATEMU_ANSWERS seed/locked: the dump is an answers.Dump carrying the key (locked: QEMU is not run, the exit status is
     the lock's, the dump empty)."""
     if not answers.active(): return _run_image(prog, img, work, mode, timeout, extra, cpu)

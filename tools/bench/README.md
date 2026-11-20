@@ -83,7 +83,7 @@ thermal) is recorded at start and end.
 
 ## natemu (`run_natemu.py`, S2c measurement)
 
-    tools/with-env python3 tools/bench/run_natemu.py --fexc FEXC --out DIR [--reps 5] [--scale 1.0] [--bench int,mem64] [--max-block N]
+    python3 tools/bench/run_natemu.py --fexc FEXC --out DIR [--reps 5] [--scale 1.0] [--bench int,mem64] [--max-block N]
 
 The same `benchmarks.json` programs through natemu's program driver (`natemu-host RUNTIME run-program`, the general execution
 path: resident code cache, linking, dispatcher), at N and 2N (`n_default` x `--scale`), interleaved, `--reps` rounds after a

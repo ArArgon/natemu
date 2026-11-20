@@ -15,7 +15,7 @@ clang); their QEMU answers are read from `RAW/<corpus key>/expected.json` (defau
 The model's QEMU rules (fp.Q) must reproduce every QEMU answer, else this exits 1. A program is tagged when the model's
 fast-mode state differs from QEMU's answer and every cause is a NaN class: a cause is a class whose switching off alone (from
 FAST) or on alone (from the M4's rules) changes the program's final state. Tags come from the model alone, never from a natemu
-run. `--run` (optional) is a run of the corpora in M2 emulation (`run_suite.py --only i8,i8b` with NATEMU_FEXC_FEATURE_OFF=afp:
+run. `--run` (optional) is a run of the corpora in M2 emulation (the fp family's i8 and i8b suites with NATEMU_FEXC_FEATURE_OFF=afp:
 `OUT_DIR/out/i8/results.json` and `out/i8b/`); it only checks that the model reproduces natemu's final state on every program
 (a difference exits 1: a natemu bug or a model gap). The output holds, per tagged program, its classes (registry names) and the
 predicted final state (GPRs, RFLAGS, RIP; each memory region as a SHA-256).

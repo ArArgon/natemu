@@ -63,7 +63,7 @@ def test_corpus_hash_ignores_header():
 def test_rules_exclude_tagged_fast_no_afp():
     import sys
     from testkit import family
-    sys.path.insert(0, str(paths.repo_root() / 'tools'))
+    paths.use_test_scripts()
     import fp_deviations
     fam = family.load(paths.repo_root() / 'tests' / 'fp' / 'family.toml')
     vs = {v.id: v for v in family.expand(fam.suite('i8'))}

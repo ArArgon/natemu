@@ -12,19 +12,33 @@ import subprocess
 import time
 
 from testkit import host, paths
+from testkit.sched import speed
 from testkit.sched.policy import (Config, Grant, Request, State, cost, decide, granted, order_key, run_of, shares,
                                   unsatisfiable, window_pending)
 
 KEEP_SHARE = 600.0      # s a run's share and starvation clock outlive its last request (between prepare and its units)
 
 
-def default_config() -> Config:
-    if v := os.environ.get('NATEMU_TEST_CORES'):          # "P,E": a test or a deliberately smaller budget
+def default_config(state_dir: pathlib.Path | None = None) -> Config:
+    """This machine's cores and its efficiency cores' slowdown (testkit.sched.speed: measured once, cached in the state
+    folder), unless NATEMU_TEST_CORES gives the cores (a test, or a deliberately smaller budget; the slowdown is then
+    NATEMU_TEST_E_SLOWDOWN or the default, never measured)."""
+    budget, min_shared = (float(x) for x in os.environ.get('NATEMU_TEST_WINDOW', '600,120').split(','))
+    if v := os.environ.get('NATEMU_TEST_CORES'):
         p, e = (int(x) for x in v.split(','))
+        slow = (speed.override() or speed.DEFAULT) if e else 1.0
     else:
         h = host.detect(); p, e = h.p_cores, h.e_cores
-    budget, min_shared = (float(x) for x in os.environ.get('NATEMU_TEST_WINDOW', '600,120').split(','))
-    return Config(p_cores=p, e_cores=e, window_budget=budget, min_shared=min_shared)
+        d = state_dir or paths.state_dir()
+        slow = speed.e_slowdown(d, h, lambda: _idle(d, p))
+    return Config(p_cores=p, e_cores=e, window_budget=budget, min_shared=min_shared, e_slowdown=slow)
+
+
+def _idle(state_dir: pathlib.Path, p_cores: int) -> bool:
+    """Free to measure: the framework runs and queues nothing here, and the load is under half the performance cores."""
+    try: raw = json.loads((state_dir / 'pool.json').read_text())
+    except (OSError, ValueError): raw = {}
+    return not raw.get('held') and not raw.get('waiting') and os.getloadavg()[0] < p_cores / 2
 
 
 _FIELDS = {f.name for f in dataclasses.fields(Request)}
@@ -61,7 +75,7 @@ class Pool:
     def __init__(self, state_dir: pathlib.Path | None = None, cfg: Config | None = None):
         self.dir = state_dir or paths.state_dir()
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.cfg = cfg or default_config()
+        self.cfg = cfg or default_config(self.dir)
 
     @contextlib.contextmanager
     def _state(self):
@@ -161,6 +175,10 @@ class Pool:
             if window_pending(st, self.cfg, now) and ahead:
                 return f'window pending: {len(ahead)} exclusive test(s) ahead ({ahead[0].label} from {ahead[0].worktree or "?"})'
             used = sum(g.request.cores for g in st.held if g.core_class == 'P')
+            e_used = sum(g.request.cores for g in st.held if g.core_class == 'E')
+            if not me.perf and e_used + me.cores <= self.cfg.e_cores and me.expected is not None and self.cfg.e_slowdown > 1:
+                return (f'waiting for a performance core ({used}/{self.cfg.p_cores} in use): it ends sooner there than '
+                        f'on a free efficiency core, {self.cfg.e_slowdown:g}x as slow')
             return f'waiting for cores: {used}/{self.cfg.p_cores} performance cores in use'
 
 
@@ -199,7 +217,7 @@ VM_CHECKS = (['pgrep', '-x', 'natemu-host'], ['pgrep', '-x', 'natemu'], ['pgrep'
 
 
 def outside_vms() -> list[str]:
-    """natemu and QEMU VM processes running now (by process name, as tools/run_suite.py:idle checks). The framework's own
+    """natemu and QEMU VM processes running now (by process name). The framework's own
     tests set TESTKIT_IGNORE_OUTSIDE_VMS: their private pools must not wait for the machine's real VMs."""
     if os.environ.get('TESTKIT_IGNORE_OUTSIDE_VMS'): return []
     found = []

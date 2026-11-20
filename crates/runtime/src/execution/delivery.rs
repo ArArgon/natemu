@@ -72,7 +72,7 @@ fn class(e: Event) -> Class {
 }
 
 /// Delivers `event` from the banked state; on return the bank is at the handler. A shutdown halts. Not inlined: one
-/// frame for every caller (the resident's stack bound, tools/check_resident_stack.py).
+/// frame for every caller (the resident's stack bound, tests/static/check_resident_stack.py).
 #[inline(never)]
 pub(super) fn deliver(s: &mut State, event: Event) {
     let p = crate::perf::enter(crate::perf::DELIVERY);

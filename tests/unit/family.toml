@@ -1,21 +1,33 @@
-# Unit tests (spec R3.8, R6.3a): every tier runs all of them. Rust through cargo-nextest; the Python tool tests that
-# `unittest discover -s tools` finds, one file per case, each test reported on its own.
+# Unit tests (spec R3.8, R6.3a): every tier runs all of them. Rust through cargo-nextest; the Python tests (the test_*.py
+# files under tools/, tests/lib and the family folders), one file per case, each test reported on its own.
 [family]
 name = "unit"
 
+# The Rust tests, with the compiler attached (FEXC): a test that needs it returns early without it, so one run with it
+# checks everything. Split three ways so the disk-heavy qcow tests and the one long FP sweep (about 160 s) do not hold
+# eight cores: rust-qcow and rust-fp name their tests; rust runs every test their filters leave (testkit.harness.units).
+# Performance cores only, as `cores = "all"` placed them before: on efficiency cores (background QoS) the channel tests'
+# wake-latency bounds (under 10 ms) and the qcow tests' disk I/O would be throttled.
 [[suite]]
 name = "rust"
 kind = "units"
 harness = "units"
-params = { tool = "nextest" }
-needs = { cores = "all" }
+params = { tool = "nextest", fexc = true, rest_of = ["rust-qcow", "rust-fp"] }
+needs = { cores = 4, perf = true }
 
 [[suite]]
-name = "rust-fexc"
+name = "rust-qcow"
 kind = "units"
 harness = "units"
-params = { tool = "nextest", fexc = true }
-needs = { cores = "all" }
+params = { tool = "nextest", fexc = true, filter = "package(natemu-qcow) | test(/^disk::qcow::/)" }
+needs = { cores = 2, perf = true }
+
+[[suite]]
+name = "rust-fp"
+kind = "units"
+harness = "units"
+params = { tool = "nextest", fexc = true, filter = "test(/afp/)" }
+needs = { cores = 1, perf = true }
 
 [[suite]]
 name = "rust-afp"
@@ -45,7 +57,7 @@ batch = 8
 
 [[suite]]
 name = "python-timed"
-# test_vm_lock sleeps and test_check_setup has a 50 ms deadline: performance cores only (as run_suite kept them).
+# test_vm_lock sleeps and test_check_setup has a 50 ms deadline: performance cores only.
 kind = "units"
 harness = "units"
 params = { tool = "pytest", include = ["tools/test_vm_lock.py", "tools/test_check_setup.py"], fexc = true }

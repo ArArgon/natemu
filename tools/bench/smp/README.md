@@ -87,7 +87,7 @@ per CPU); and a PTE change without INVLPG (either history is legal: not compared
 0..4 MiB with A/D preset except on its test pages (their A/D are compared). Bodies end by restoring the start-up controls. Fault cases
 (`sysfault-*`, `params.fault_at` = the instruction under test): reserved CR0/CR3/CR4 bits, PCIDE, SMAP, clearing PE/PG/PAE, NW without CD,
 LOCK, CR1/CR5, CPL3 forms, reserved EFER bits, LME cleared with paging on, unknown MSRs. QEMU 11.1.2 is not a reference for most of these
-(it accepts some writes the SDM faults and hangs on others); `tools/run_slice3_vm.py system` judges them with `tools/system_fault_model.py`.
+(it accepts some writes the SDM faults and hangs on others); `tests/smp/run_slice3_vm.py system` judges them with `tests/lib/system_fault_model.py`.
 S1 adds MSR read-backs compared with QEMU (`sys-msr-syscall`: STAR/LSTAR/CSTAR/FMASK, SYSENTER, FS/GS/KERNEL_GS_BASE, TSC_AUX, per-CPU
 values, the stub's GS base saved and restored; `sys-msr-mtrr`: PAT, MTRR_DEF_TYPE, variable and fixed MTRRs) and fault cases for more
 profile MSR rules and LOCK CPUID/RDTSC. CPUID values, MSR reset values and the like are natemu's CPU, not QEMU's: the runner judges them
@@ -117,7 +117,7 @@ then never finishes `stale` (2 of 8 runs at 3 CPUs, 1 of 10 at 4); the runner re
 
 ## (f) Shared guest page-table programs (`sharedpt.py`; S3f)
 
-Generated at run time (no json), judged by `tools/run_slice3_vm.py sharedpt` against `tools/models/coherence_model.py` (walks, `Cache`,
+Generated at run time (no json), judged by `tests/smp/run_slice3_vm.py sharedpt` against `tools/models/coherence_model.py` (walks, `Cache`,
 `access_outcomes`, `check_observation`) and, for what is schedule-independent, QEMU. Every program is a system program (CPL0) with ONE shared body
 and ONE shared table set (identity map of 0..4 MiB, 4 KiB pages, A/D preset except on the test pages) loaded by every CPU; CPU `rbx` logs what it saw in
 a private log area (not captured) and the judge replays the logs through the model. Handshakes are plain stores and loads.

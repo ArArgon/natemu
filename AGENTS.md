@@ -24,10 +24,12 @@ runs what your change concerns, `--tier smoke` one small case of everything, `--
 before a change that can alter what natemu or the tests do merges into `main` or an integration branch; docs-only
 changes and pushes of work branches need none, and the user may explicitly bypass it.
 [When the gate is needed](docs/testing.md#when-the-gate-is-needed) and [how much to run](docs/testing.md#how-much-to-run)
-give the details: iterate on narrow runs and keep heavy runs (gate, stress, benchmarks) to once per change set. A new test is a case in a family under `tests/`, not a new script. Do not run
-`tools/run_suite.py` or start VMs outside the framework's queue, and do not read test inputs from `natemu-raw`: the
-framework builds or downloads them into its cache. Older pages under `docs/restructure/` that say to run
-`run_suite.py` predate this.
+give the details: iterate on narrow runs and keep heavy runs (gate, stress, benchmarks) to once per change set. A new
+test is a case in a family under `tests/`, not a new script; the scripts a family runs live in its folder or
+`tests/lib` ([tests/README.md](tests/README.md)) and refuse to start outside the framework. Do not start VMs outside the
+framework's queue, and do not read test inputs from `natemu-raw`: the framework builds or downloads them into its cache.
+Older pages under `docs/restructure/` that run `tools/run_suite.py` or scripts under `tools/` are historical records;
+those commands no longer run ([docs/restructure/README.md](docs/restructure/README.md)).
 
 ## README
 

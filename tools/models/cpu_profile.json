@@ -320,10 +320,10 @@
       ],
       "simd_fp": true,
       "tests": [
-       "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
-       "tools/run_i5c.py",
-       "tools/run_i6_faults.py"
+       "tests/lib/run_i5a_faults.py",
+       "tests/smp/run_vector_ac.py",
+       "tests/faults/run_i5c.py",
+       "tests/faults/run_i6_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -348,7 +348,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i9_faults.py"
+       "tests/faults/run_i9_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -410,8 +410,8 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_i9_faults.py"
+       "tests/lib/run_i5a_faults.py",
+       "tests/faults/run_i9_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
@@ -439,8 +439,8 @@
       "simd_fp": true,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i8_faults.py",
-       "tools/run_i5c.py"
+       "tests/faults/run_i8_faults.py",
+       "tests/faults/run_i5c.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
@@ -458,9 +458,9 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py",
-       "tools/run_nostop.py"
+       "tests/faults/run_slice1_faults.py",
+       "tests/faults/run_i10_faults.py",
+       "tests/system/run_nostop.py"
       ],
       "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; CMPXCHG8B/16B: admission accepts only LSE atomics"
      },
@@ -503,9 +503,9 @@
       "simd_fp": true,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_i5c.py",
-       "tools/run_i5a_de.py"
+       "tests/lib/run_i5a_faults.py",
+       "tests/faults/run_i5c.py",
+       "tests/faults/run_i5a_de.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
@@ -530,8 +530,8 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_i6b.py"
+       "tests/lib/run_i5a_faults.py",
+       "tests/faults/run_i6b.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -561,9 +561,9 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_i10_faults.py",
-       "tools/run_i9_faults.py"
+       "tests/faults/run_slice1_faults.py",
+       "tests/faults/run_i10_faults.py",
+       "tests/faults/run_i9_faults.py"
       ]
      },
      "23": {
@@ -575,7 +575,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py"
+       "tests/faults/run_slice1_faults.py"
       ]
      },
      "24": {
@@ -607,8 +607,8 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i9_faults.py",
-       "tools/run_i8_faults.py"
+       "tests/faults/run_i9_faults.py",
+       "tests/faults/run_i8_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -625,7 +625,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5b.py"
+       "tests/system/run_i5b.py"
       ],
       "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
@@ -662,9 +662,9 @@
       "simd_fp": true,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i8_faults.py",
-       "tools/run_vector_ac.py",
-       "tools/run_i5c.py"
+       "tests/faults/run_i8_faults.py",
+       "tests/smp/run_vector_ac.py",
+       "tests/faults/run_i5c.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
@@ -683,8 +683,8 @@
       "simd_fp": true,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i8_faults.py",
-       "tools/run_i5c.py"
+       "tests/faults/run_i8_faults.py",
+       "tests/faults/run_i5c.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
@@ -700,7 +700,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_k2.py"
+       "tests/system/run_k2.py"
       ]
      },
      "31": {
@@ -732,9 +732,9 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i6_faults.py",
-       "tools/run_i6b.py",
-       "tools/run_i5c.py"
+       "tests/faults/run_i6_faults.py",
+       "tests/faults/run_i6b.py",
+       "tests/faults/run_i5c.py"
       ],
       "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -789,7 +789,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice3_vm.py"
+       "tests/smp/run_slice3_vm.py"
       ],
       "baseline": true,
       "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
@@ -803,7 +803,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice3_vm.py"
+       "tests/smp/run_slice3_vm.py"
       ],
       "baseline": true
      },
@@ -843,8 +843,8 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py",
-       "tools/run_nostop.py"
+       "tests/faults/run_slice1_faults.py",
+       "tests/system/run_nostop.py"
       ],
       "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; CMPXCHG8B/16B: admission accepts only LSE atomics"
      },
@@ -930,7 +930,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice1_faults.py"
+       "tests/faults/run_slice1_faults.py"
       ]
      },
      "16": {
@@ -970,8 +970,8 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_i5b.py"
+       "tests/lib/run_i5a_faults.py",
+       "tests/system/run_i5b.py"
       ],
       "baseline": true
      },
@@ -992,9 +992,9 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i9_faults.py",
-       "tools/run_maskmovq.py",
-       "tools/run_i5c.py"
+       "tests/faults/run_i9_faults.py",
+       "tests/system/run_maskmovq.py",
+       "tests/faults/run_i5c.py"
       ]
      },
      "24": {
@@ -1009,7 +1009,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5b.py"
+       "tests/system/run_i5b.py"
       ],
       "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
@@ -1042,10 +1042,10 @@
       "simd_fp": true,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
-       "tools/run_i5c.py",
-       "tools/run_i5a_de.py"
+       "tests/lib/run_i5a_faults.py",
+       "tests/smp/run_vector_ac.py",
+       "tests/faults/run_i5c.py",
+       "tests/faults/run_i5a_de.py"
       ],
       "source": "host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on; cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature); requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); SSE requires FXSR: SDM Vol.1 sec. 11.6.2"
      },
@@ -1075,10 +1075,10 @@
       "simd_fp": true,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i5a_faults.py",
-       "tools/run_vector_ac.py",
-       "tools/run_i5c.py",
-       "tools/run_i5a_de.py"
+       "tests/lib/run_i5a_faults.py",
+       "tests/smp/run_vector_ac.py",
+       "tests/faults/run_i5c.py",
+       "tests/faults/run_i5a_de.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -1248,7 +1248,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice3_vm.py"
+       "tests/smp/run_slice3_vm.py"
       ],
       "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
@@ -1280,7 +1280,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i8_faults.py"
+       "tests/faults/run_i8_faults.py"
       ]
      },
      "4": {
@@ -1306,8 +1306,8 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i8_faults.py",
-       "tools/run_vector_ac.py"
+       "tests/faults/run_i8_faults.py",
+       "tests/smp/run_vector_ac.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names)"
      },
@@ -1343,8 +1343,8 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i8_faults.py",
-       "tools/run_i9_faults.py"
+       "tests/faults/run_i8_faults.py",
+       "tests/faults/run_i9_faults.py"
       ]
      },
      "9": {
@@ -1424,7 +1424,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i9_faults.py"
+       "tests/faults/run_i9_faults.py"
       ]
      },
      "20": {
@@ -1461,7 +1461,7 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/run_i5b.py"
+       "tests/system/run_i5b.py"
       ]
      },
      "24": {
@@ -1475,7 +1475,7 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/run_i5b.py"
+       "tests/system/run_i5b.py"
       ]
      },
      "25": {
@@ -1515,7 +1515,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_i9_faults.py"
+       "tests/faults/run_i9_faults.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); host: plan docs/restructure/cpu-features-plan.md appendix, what the core guest features rely on"
      },
@@ -1560,7 +1560,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_x1.py"
+       "tests/system/run_x1.py"
       ],
       "source": "cr4: SDM Vol.3 sec. 2.5 (the control register bit is reserved without the feature)"
      },
@@ -1957,7 +1957,7 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/run_i5b.py"
+       "tests/system/run_i5b.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); resident: where natemu itself branches on the feature; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
@@ -1980,7 +1980,7 @@
       ],
       "simd_fp": false,
       "tests": [
-       "tools/run_i5b.py"
+       "tests/system/run_i5b.py"
       ],
       "source": "requires: SDM Vol.1 ch.12-14 and Vol.2A CPUID 01H/07H/0DH enumeration text (each feature is detected on top of the one it names); resident: where natemu itself branches on the feature; layout: SDM Vol.1 sec. 13.2-13.3 and Vol.3 sec. 13 (XCR0 valid values, CPUID 0DH, the XSAVE image)"
      },
@@ -2135,7 +2135,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice3_vm.py"
+       "tests/smp/run_slice3_vm.py"
       ]
      },
      "20": {
@@ -2175,7 +2175,7 @@
       "simd_fp": false,
       "tests": [
        "tools/fexc/test_slice1.py",
-       "tools/run_slice3_vm.py"
+       "tests/smp/run_slice3_vm.py"
       ],
       "source": "msrs: SDM Vol.4 ch.2 (the MSR exists only with the feature); moved from cpu_profile.py FEATURE_MSRS/ABSENT_WHEN_CLEAR"
      },
@@ -2692,7 +2692,7 @@
     "0": {
      "name": "RDCL_NO",
      "value": "1 only with the speculation-barrier switch on and host FEAT_CSV3 (both; default switch off so 0)",
-     "why": "\"not susceptible to Rogue Data Cache Load\". Translated CPL-3 code runs at EL0 in the user shadow space, which holds only translations the walker granted at CPL 3 (a supervisor page has no EL0 mapping); the resident's private region with the guest-RAM alias is EL1-only; FEAT_CSV3 keeps a faulting load's data from feeding speculative execution. With the barrier switch on, every resident access on the guest's behalf uses an address paging::walk returned, and walk masks each non-leaf level's next-table base with a conditional select to 0 plus CSDB (checking present, the reserved bits 51:40 and PS) and ends the leaf's permission check in an Arm SB. Coupled (owner, Nov 5): advertised only when the barriers run, and off by default, so a default command line keeps PTI (expected). See the PCID plan P1 'Measured (P1)' and tools/check_resident_barriers.py."
+     "why": "\"not susceptible to Rogue Data Cache Load\". Translated CPL-3 code runs at EL0 in the user shadow space, which holds only translations the walker granted at CPL 3 (a supervisor page has no EL0 mapping); the resident's private region with the guest-RAM alias is EL1-only; FEAT_CSV3 keeps a faulting load's data from feeding speculative execution. With the barrier switch on, every resident access on the guest's behalf uses an address paging::walk returned, and walk masks each non-leaf level's next-table base with a conditional select to 0 plus CSDB (checking present, the reserved bits 51:40 and PS) and ends the leaf's permission check in an Arm SB. Coupled (owner, Nov 5): advertised only when the barriers run, and off by default, so a default command line keeps PTI (expected). See the PCID plan P1 'Measured (P1)' and tests/static/check_resident_barriers.py."
     },
     "1": {
      "name": "IBRS_ALL",

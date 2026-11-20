@@ -16,7 +16,8 @@ def req(**kw):
 
 
 def simulate(reqs, durations, cfg=CFG, horizon=1e6):
-    """Advance a fake clock event by event. Returns the list of (request, start, end, class)."""
+    """Advance a fake clock event by event. Returns the list of (request, start, end, class). A grant on an efficiency
+    core takes cfg.e_slowdown times its duration."""
     pending = sorted(reqs, key=lambda r: r.asked)
     st_ = State()
     now, done, running = 0.0, [], []       # running: (end, Grant)
@@ -26,7 +27,7 @@ def simulate(reqs, durations, cfg=CFG, horizon=1e6):
         st_.window_open_since, st_.last_window_closed = d.window_open_since, d.last_window_closed
         for r, cls in d.grants:
             st_.waiting.remove(r)
-            g = Grant(r, now, cls); st_.held.append(g); running.append((now + durations[r.id], g)); granted(st_, r, now)
+            g = Grant(r, now, cls); st_.held.append(g); running.append((now + durations[r.id] * (cfg.e_slowdown if cls == 'E' else 1), g)); granted(st_, r, now)
         nxt = [e for e, _ in running] + ([pending[0].asked] if pending else [])
         if d.grants: continue                  # decide again at the same instant
         if not nxt: break                      # only unsatisfiable requests left
@@ -142,14 +143,16 @@ workload = st.lists(st.tuples(st.integers(1, 6), st.booleans(), st.booleans(), s
 
 
 @settings(max_examples=300, deadline=None)
-@given(workload)
-def test_random_workloads_invariants(w):
+@given(workload, st.sampled_from([1.0, 3.0]))
+def test_random_workloads_invariants(w, slowdown):
+    cfg = Config(p_cores=CFG.p_cores, e_cores=CFG.e_cores, window_budget=CFG.window_budget, min_shared=CFG.min_shared,
+                 e_slowdown=slowdown)
     rs, durs = [], {}
     for cores, excl, perf, dur, prio, asked, known in w:
         r = req(cores=cores, exclusive=excl and asked % 5 == 0, perf=perf, priority=prio, asked=float(asked),
                 expected=float(dur) if known else None)
         rs.append(r); durs[r.id] = dur
-    done, final = simulate(rs, durs)
+    done, final = simulate(rs, durs, cfg)
     check_invariants(done)
     satisfiable = [r for r in rs if not unsatisfiable(r, CFG)]
     assert {x[0].id for x in done} == {r.id for r in satisfiable}           # nothing waits forever
@@ -274,3 +277,147 @@ def test_a_starved_request_is_not_held_back_by_a_pending_window():
                 waiting=[req(exclusive=True, expected=10, asked=900.0, run='partc'), part])
     assert decide(st_, cfg, 1010.0).grants == []                                   # not starved yet: it waits
     assert [(r.id, c) for r, c in decide(st_, cfg, 1900.0).grants] == [(part.id, 'P')]   # starved: granted anyway
+
+
+def test_a_blocked_perf_claim_lets_work_run_on_efficiency_cores():
+    """Rule 4: a perf claim waiting for every performance core does not hold the efficiency cores idle."""
+    busy = req(cores=2, perf=True, asked=0, expected=50)
+    wide = req(cores=4, perf=True, asked=1, expected=5)
+    small = req(cores=1, asked=2, expected=None)          # unknown length: it may still use cores the claim cannot
+    st_ = State(held=[Grant(busy, 0.0, 'P')], waiting=[wide, small])
+    d = decide(st_, CFG, 10.0)
+    assert [(r.id, c) for r, c in d.grants] == [(small.id, 'E')]
+
+
+def test_backfill_on_the_reserved_cores_only_when_it_ends_before_they_free():
+    busy = req(cores=2, perf=True, asked=0, expected=50)          # frees two performance cores at t=50
+    wide = req(cores=4, perf=True, asked=1, expected=5)
+    short = req(cores=1, perf=True, asked=2, expected=30)         # ends at 40 < 50: cannot delay the claim
+    long_ = req(cores=1, perf=True, asked=3, expected=60)         # would end at 70 > 50: would delay it
+    st_ = State(held=[Grant(busy, 0.0, 'P')], waiting=[wide, short, long_])
+    d = decide(st_, CFG, 10.0)
+    assert [r.id for r, _ in d.grants] == [short.id]
+
+
+def test_a_wide_claim_starts_when_its_cores_free_despite_backfill():
+    busy = req(cores=2, perf=True, asked=0)
+    wide = req(cores=4, perf=True, asked=1)
+    smalls = [req(cores=1, perf=True, asked=2 + i) for i in range(6)]
+    dur = {busy.id: 50, wide.id: 5, **{s.id: 10 for s in smalls}}
+    for r in (busy, wide, *smalls): r.expected = dur[r.id]
+    done, _ = simulate([busy, wide, *smalls], dur)
+    start = {r.id: s for r, s, _, _ in done}
+    assert start[wide.id] == 50                                  # not later than when busy's cores free
+
+
+SLOW = Config(p_cores=4, e_cores=2, window_budget=100, min_shared=20, e_slowdown=3.0)
+
+
+def test_a_long_unit_waits_for_a_performance_core_rather_than_a_slow_one():
+    """Rule 5: on a free efficiency core it would end at 10 + 3 * 100; on the performance core free at 20, at 120."""
+    busy = [req(cores=1, asked=0, expected=20) for _ in range(4)]
+    long_ = req(cores=1, asked=1, expected=100)
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[long_])
+    assert decide(st_, SLOW, 10.0).grants == []
+    assert [(r.id, c) for r, c in decide(st_, CFG, 10.0).grants] == [(long_.id, 'E')]     # no slowdown: as before
+
+
+def test_a_short_unit_still_uses_a_free_efficiency_core():
+    busy = [req(cores=1, asked=0, expected=20) for _ in range(4)]
+    short = req(cores=1, asked=1, expected=2)                     # ends at 16 there, 22 on the next performance core
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[short])
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 10.0).grants] == [(short.id, 'E')]
+
+
+def test_the_plan_counts_the_units_already_waiting_for_a_performance_core():
+    """Performance cores free at 20, 40, 60, 80; four 25 s units would end at 75 on an efficiency core. The first three
+    end sooner waiting (45, 65, 70); the fourth would get the core free at 60 only, ending at 85, so it takes the slow one."""
+    busy = [req(cores=1, asked=0, expected=e) for e in (20, 40, 60, 80)]
+    w = [req(cores=1, asked=1 + i, expected=25) for i in range(4)]
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=list(w))
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 0.0).grants] == [(w[3].id, 'E')]
+
+
+def test_unknown_lengths_and_perf_claims_are_not_held_back_by_rule_5():
+    busy = [req(cores=1, asked=0, expected=20) for _ in range(4)]
+    unknown = req(cores=1, asked=1, expected=None)
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[unknown])
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 10.0).grants] == [(unknown.id, 'E')]
+
+
+def test_slow_cores_shorten_the_run_when_long_units_come_last():
+    """Four performance cores busy until 10, then a 100 s unit: started on the free efficiency core at 1 it would end at
+    301; it waits for a performance core and ends at 110."""
+    first = [req(cores=1, asked=0, expected=10) for _ in range(4)]
+    long_ = req(cores=1, asked=1, expected=100)
+    done, _ = simulate([*first, long_], {r.id: r.expected for r in (*first, long_)}, SLOW)
+    assert [(x[1], x[2], x[3]) for x in done if x[0] is long_] == [(10, 110, 'P')]
+
+
+def test_a_performance_grant_past_its_expected_end_does_not_hold_work_off_free_efficiency_cores():
+    """Review: overrun grants put the plan's free times in the past, so every known-length request waited for them."""
+    overrun = [req(cores=1, asked=0, expected=30) for _ in range(4)]          # expected to end at 30; still running
+    short = req(cores=1, asked=1, expected=20)
+    st_ = State(held=[Grant(g, 0.0, 'P') for g in overrun], waiting=[short])
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 100.0).grants] == [(short.id, 'E')]
+
+
+def test_a_reserved_performance_claim_lets_short_work_backfill_its_cores():
+    """Review: rule 5 waited for performance cores rule 4 had reserved, and never backfilled them. The claim holds
+    all four from 300 to 350: a long request compares an efficiency core (ends 100 + 3 * 100) with 350 + 100."""
+    busy = [req(cores=1, perf=True, asked=0, expected=300) for _ in range(2)]   # 2 of 4 P cores busy until 300
+    wide = req(cores=4, perf=True, asked=1, expected=50)                        # reserves all four from 300
+    short = req(cores=1, asked=2, expected=10)                                  # ends at 110 < 300 on P: backfill
+    mid = req(cores=1, asked=3, expected=150)                                   # ends at 250 < 300: the other one
+    long_ = req(cores=1, asked=4, expected=400)                                 # 1300 on E > 750: waits for P
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[wide, short, mid, long_])
+    assert sorted((r.id, c) for r, c in decide(st_, SLOW, 100.0).grants) == sorted([(short.id, 'P'), (mid.id, 'P')])
+    soon = req(cores=1, asked=4, expected=40)                                   # 220 on E < 390 after the claim
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[wide, short, mid, soon])
+    assert (soon.id, 'E') in [(r.id, c) for r, c in decide(st_, SLOW, 100.0).grants]
+
+
+def test_rule_5_stays_on_behind_a_queued_performance_request():
+    """Review: switching rule 5 off under any reservation put long units on efficiency cores behind every queued perf
+    request. The perf request takes the core free at 120 (until 180); the long one waits for the next, ending at 220."""
+    busy = [req(cores=1, asked=0, expected=120) for _ in range(4)]
+    perf = req(cores=1, perf=True, asked=1, expected=60)
+    long_ = req(cores=1, asked=2, expected=100)
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[perf, long_])
+    assert decide(st_, SLOW, 100.0).grants == []
+    # a long queue of perf requests ahead: every one is in the plan, so waiting no longer pays and it takes E
+    queue = [req(cores=1, perf=True, asked=1 + i / 100, expected=60) for i in range(16)]   # P busy until 360
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[*queue, long_])
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 100.0).grants] == [(long_.id, 'E')]
+
+
+def test_rule_5_plans_multi_core_requests_on_the_cores_that_free_first():
+    busy = [req(cores=1, asked=0, expected=e) for e in (20, 20, 90, 90)]
+    two = req(cores=2, asked=1, expected=40)          # two P cores free at 20: ends at 60 < 10 + 120 on E
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[two])
+    assert decide(st_, SLOW, 10.0).grants == []
+    late = [req(cores=1, asked=0, expected=e) for e in (20, 200, 200, 200)]
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in late], waiting=[two])       # two free only at 200: E is sooner
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 10.0).grants] == [(two.id, 'E')]
+
+
+def test_rule_5_keeps_rule_3s_drain_horizon_on_efficiency_cores():
+    busy = [req(cores=1, asked=0, expected=60) for _ in range(4)]               # horizon 60
+    ex = req(exclusive=True, asked=1, expected=5)
+    fits_p_only = req(cores=1, asked=2, expected=30)    # ends at 40 on P but 100 on E: past the horizon there
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy[:3]], waiting=[ex, fits_p_only])
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 10.0).grants] == [(fits_p_only.id, 'P')]
+    short = req(cores=1, asked=3, expected=10)          # all P busy: ends at 40 on E (before 60), 70 waiting for P
+    mid = req(cores=1, asked=4, expected=20)            # E (70) beats waiting (80), but 70 is past the horizon
+    st_ = State(held=[Grant(b, 0.0, 'P') for b in busy], waiting=[ex, short, mid])
+    assert [(r.id, c) for r, c in decide(st_, SLOW, 10.0).grants] == [(short.id, 'E')]
+
+
+def test_a_perf_request_queued_behind_overdue_grants_does_not_hold_short_work_off_efficiency_cores():
+    """Review: the queued claim was booked at its cores' free time from the unadjusted expected ends, in the past."""
+    overrun = [req(cores=1, asked=0, expected=50) for _ in range(4)]          # expected to end at 50; still running
+    perf = req(cores=1, perf=True, asked=1, expected=50)
+    small = [req(cores=1, asked=2, expected=10), req(cores=1, asked=3, expected=1)]
+    for now in (200.0, 1000.0):
+        st_ = State(held=[Grant(g, 0.0, 'P') for g in overrun], waiting=[perf, *small])
+        assert sorted(r.id for r, _ in decide(st_, SLOW, now).grants) == sorted(r.id for r in small)

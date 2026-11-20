@@ -44,20 +44,6 @@ def test_missing_or_unknown_gives_none(tmp_path):
     assert write(tmp_path, {'something': 'else'}) is None
 
 
-def test_migration_maps_every_step():
-    import pathlib, sys
-    from testkit import migrate, paths, family
-    sys.path.insert(0, str(paths.repo_root() / 'tools'))
-    import run_suite
-    steps = {s.name for s in run_suite.steps('F', pathlib.Path('/O'))}
-    covered = {s for v in migrate.COVERED.values() for s in v}
-    in_families = set()
-    for fam in ('static', 'boot', 'io', 'faults', 'smp', 'system'):
-        f = family.load(paths.repo_root() / 'tests' / fam / 'family.toml')
-        in_families |= set(f.suite(fam).extra['cases'])
-    assert steps == covered | in_families and not (covered & in_families)
-
-
 def test_case_timeout_overrides_the_suite(tmp_path):
     from testkit import family
     d = tmp_path / 'tests' / 'f'; d.mkdir(parents=True)
@@ -102,20 +88,28 @@ def test_diff_rerun_only_for_hash_only_answers():
     assert 'natemu-test run --diff' in answers.HASH_ONLY
 
 
-def test_hand_written_io_suites_survive_regeneration():
-    """testkit.migrate rewrites tests/io/family.toml with the generated `io` suite only; these suites are added by hand."""
-    from testkit import paths, family
-    f = family.load(paths.repo_root() / 'tests' / 'io' / 'family.toml')
-    want = {'io-selfcheck': {'io-stress-selfcheck', 'lifecycle-stress-selfcheck', 'virtio-net-selfcheck', 'io-pending-compiler-selfcheck'},
-            'io-program': {'virtio-net', 'io-windows', 'io-window-cases', 'io-pending-compiler'},
-            'io-campaign': {'io-stress-n2', 'io-stress-n4', 'lifecycle-reset', 'lifecycle-disable', 'lifecycle-corrupt-control',
-                            'serial-unpaced', 'serial-paced', 'serial-loaded', 'soak'}}
-    for suite, cases in want.items():
-        assert cases <= set(f.suite(suite).extra['cases']), suite
-    f = family.load(paths.repo_root() / 'tests' / 'static' / 'family.toml')
-    assert {'fexc-smoke', 'fexc-sites', 'fexc-sites-slice1', 'fexc-precision', 'fexc-skips', 'fexc-serve',
-            'fexc-channel', 'fexc-unit', 'fexc-slice1'} <= set(f.suite('fexc').extra['cases'])
-    f = family.load(paths.repo_root() / 'tests' / 'smp' / 'family.toml')
-    assert 'capacity-apic-selfcheck' in f.suite('capacity-selfcheck').extra['cases']
-    assert {'capacity', 'capacity-apic'} <= set(f.suite('capacity').extra['cases'])
-
+def test_a_current_target_is_not_installed_again_so_no_exclusive_build_lock_wait(tmp_path, monkeypatch):
+    """Every running runner case holds the build lock shared: with target/ current, preparation must not wait for it."""
+    import fcntl, threading
+    from types import SimpleNamespace as NS
+    from testkit.harness import runner
+    entry, target = tmp_path / 'entry', tmp_path / 'target'
+    for rel in runner.LAYOUT:
+        (entry / rel).parent.mkdir(parents=True, exist_ok=True); (entry / rel).write_bytes(b'signed ' + rel.encode())
+    monkeypatch.setattr(runner.artifacts, 'natemu', lambda: NS(entry=entry))
+    monkeypatch.setattr(runner.paths, 'repo_root', lambda: tmp_path)
+    monkeypatch.setenv('CARGO_TARGET_DIR', str(target))
+    runner.resolve_target(None)                                   # first time: installs, nothing else holds the lock
+    assert runner.installed(NS(entry=entry))
+    lock = (tmp_path / '.natemu' / 'build.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_SH)                              # a running case of another run
+    try:
+        t = threading.Thread(target=runner.resolve_target, args=(None,), daemon=True); t.start(); t.join(5)
+        assert not t.is_alive(), 'a current target/ waited for the exclusive build lock'
+        (target / runner.LAYOUT[0]).write_bytes(b'stale')        # a builder case's own build left behind
+        t = threading.Thread(target=runner.resolve_target, args=(None,), daemon=True); t.start(); t.join(1)
+        assert t.is_alive(), 'a stale target/ must be installed under the exclusive lock'
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+    t.join(5)
+    assert not t.is_alive() and runner.installed(NS(entry=entry))

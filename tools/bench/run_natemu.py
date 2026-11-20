@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Steady-state ns per guest instruction of the benchmarks (benchmarks.json) under natemu: a measurement, no tuning.
 
-    tools/with-env python3 tools/bench/run_natemu.py --fexc FEXC --out DIR [--reps 5] [--scale 1.0] [--bench int,mem64]
+    python3 tools/bench/run_natemu.py --fexc FEXC --out DIR [--reps 5] [--scale 1.0] [--bench int,mem64]
                                                        [--max-block N]
 
 Each benchmark runs through the program driver (`natemu-host RUNTIME run-program`) at N and 2N iterations (N = n_default x
@@ -14,6 +14,7 @@ import argparse, json, pathlib, statistics, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent)); sys.path.insert(0, str(HERE.parent / 'reference'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / 'tests' / 'lib')); import testenv  # noqa: E402 (tests/README.md: the test scripts)
 import build_bench as bench, run_slice1_vm as vm, ref  # noqa: E402
 from run_qemu import host_state  # noqa: E402
 

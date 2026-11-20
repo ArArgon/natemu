@@ -2986,7 +2986,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
             }
         }
         // Descriptor tables, segment registers and far transfers ([`segments`]). The resident has no jump tables (an
-        // unlisted `br` fails tools/check_resident_stack.py; the runtime target builds with `-C jump-tables=no`), and
+        // unlisted `br` fails tests/static/check_resident_stack.py; the runtime target builds with `-C jump-tables=no`), and
         // the kinds are grouped in ranges besides.
         system::LGDT..=system::IRET | system::PUSH_SREG | system::POP_SREG => {
             match segments::execute(s, i) {

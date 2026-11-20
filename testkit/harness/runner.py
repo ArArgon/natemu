@@ -1,4 +1,4 @@
-"""Runner scripts as migrated families (spec R13.2): a case runs one tools/run_*.py invocation, unchanged in what it
+"""Runner scripts (spec R13.2): a case runs one tests/<family>/run_*.py invocation, unchanged in what it
 checks, with its inputs from the framework's input root (testkit.inputs; NATEMU_RAW_ROOT points there, never at
 natemu-raw), its writable state in the machine's state folder (NATEMU_STATE_ROOT), and its QEMU answers in locked mode
 (NATEMU_ANSWERS=locked, the family's tests.lock [answers]): it never starts QEMU. Seeding is a run with
@@ -9,7 +9,7 @@ writes per-case results (`adapters` below); a runner that writes none is judged 
 A passed case's output folder is deleted when it ends (`drop_outputs`); a failed case's stays in <run>/out/<case>.
 
     [[suite]] kind = "judged"  harness = "runner"
-    [suite.cases.<name>]  argv = ["tools/run_x.py", "--fexc", "{fexc}", "--out", "{out}", ...]   (also {raw},
+    [suite.cases.<name>]  argv = ["tests/<family>/run_x.py", "--fexc", "{fexc}", "--out", "{out}", ...]   (also {raw}: the input root,
                           {natemu_entry}, {natemu_host}, {natemu_stub}, {natemu_runtime}: the framework's builds; {fex_asm}: FEX's
                           unittests/ASM at the pin)
                           needs = {...}  smoke = true  judge = "judges:name"  results = "results.json"
@@ -20,6 +20,9 @@ With --diff, a case that failed on an answer locked as a hash only (answers.HASH
 locked mode can say only that it differs) runs once more with live QEMU answers (NATEMU_ANSWERS=live), whose
 field-by-field comparison says what differs; that rerun's log is added to the message and its verdict is not counted.
 """
+import contextlib
+import fcntl
+import filecmp
 import fnmatch
 import json
 import os
@@ -32,7 +35,56 @@ import time
 from testkit import artifacts, paths
 from testkit.family import Needs
 from testkit.harness import CaseResult, Requirement, SubResult
-from testkit.harness import legacy
+
+# The signed binaries of the framework's natemu build, where runners that build natemu themselves (`builds = true`: l1,
+# l2, l2-iasl, boot-smoke) leave theirs: the worktree's target/. Those cases hold the worktree's build lock exclusively
+# and put the signed binaries back afterwards; every other case holds it shared.
+TARGET = Requirement('target', 'signed')
+LAYOUT = ('release/natemu-host', 'release/natemu', 'aarch64-unknown-none/release/natemu-runtime')
+
+
+def target_dir() -> pathlib.Path:
+    return pathlib.Path(os.environ.get('CARGO_TARGET_DIR', paths.repo_root() / 'target'))
+
+
+def install_signed(n) -> None:
+    """Put the artifact's signed binaries into the worktree's target/ (clones, no copy cost)."""
+    t = target_dir()
+    for rel in LAYOUT:
+        dst = t / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_name(dst.name + f'.testkit-{os.getpid()}')
+        subprocess.run(['cp', '-c', str(n.entry / rel), str(tmp)], check=True)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dst)
+
+
+@contextlib.contextmanager
+def build_lock(exclusive: bool):
+    f = paths.repo_root() / '.natemu' / 'build.lock'
+    f.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(f, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH); yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+
+
+def installed(n) -> bool:
+    """The worktree's target/ already holds exactly the artifact's signed binaries."""
+    t = target_dir()
+    return all((t / rel).is_file() and filecmp.cmp(n.entry / rel, t / rel, shallow=False) for rel in LAYOUT)
+
+
+def resolve_target(req) -> list:
+    """Install the signed binaries, under the build lock held exclusively, unless they are in place already. Every
+    running runner case holds that lock shared, so while another run is going an exclusive wait may not end (seen: a
+    boot run's preparation waited 71 s behind a gate's cases): a run whose target/ is current does not wait at all."""
+    n = artifacts.natemu()
+    if installed(n): return []
+    with build_lock(True):
+        if not installed(n): install_signed(n)
+    return []
 
 
 def _state_root() -> pathlib.Path:
@@ -109,11 +161,6 @@ def drop_outputs(o: pathlib.Path) -> None:
         shutil.rmtree(d, ignore_errors=True)
 
 
-def legacy_raw():
-    from testkit.sched.pool import raw_root
-    return raw_root() or '/nonexistent-natemu-raw'
-
-
 class Runner:
     def cases(self, fam, suite):
         return list(suite.extra.get('cases', {}))
@@ -133,7 +180,7 @@ class Runner:
         return False
 
     def requirements(self, fam, suite, variant):
-        reqs = [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'), Requirement('legacy', 'target'),
+        reqs = [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'), TARGET,
                 Requirement('artifact', 'qemu-system'), Requirement('artifact', 'fex-asm')]
         return reqs + [Requirement('input-root', 'root')]
 
@@ -141,7 +188,8 @@ class Runner:
         if req.kind == 'input-root':
             r = _input_root()
             return [r] if r else []
-        return legacy.HARNESS.resolve(req)
+        if req == TARGET: return resolve_target(req)
+        return artifacts.resolve(req.name)
 
     def run(self, batch, config):
         from testkit import runloop
@@ -149,12 +197,13 @@ class Runner:
         n, fexc = artifacts.natemu(), artifacts.fexc()
         rundir = runloop.run_dir(config)
         root = _input_root()
+        if root is None: raise RuntimeError('the input root (testkit.inputs) is not available: runner cases need it')
         for it in batch:
             spec = self._spec(it.suite, it.case)
             o = rundir / 'out' / it.case
             extra = {'fex_asm': artifacts.fex_asm()}        # FEX's unittests/ASM at the pin ({fex_asm}, NATEMU_FEX_ASM)
             argv = [a.format(fexc=fexc, out=o, natemu_entry=n.entry, natemu_host=n.host, natemu_stub=n.stub, natemu_runtime=n.runtime,
-                             raw=root or legacy_raw(), **extra) for a in spec['argv']]
+                             raw=root, **extra) for a in spec['argv']]
             if argv[0].endswith('.py'): argv = [sys.executable, *argv]
             env = dict(os.environ, NATEMU_PREBUILT='1', NATEMU_VM_LOCK_HELD='1', NATEMU_STATE_ROOT=str(_state_root()),
                        NATEMU_ANSWERS='locked', NATEMU_ANSWERS_LOCK=str(it.fam.dir / 'tests.lock'),
@@ -178,9 +227,9 @@ class Runner:
             attempts = 2 if spec.get('rerun', it.suite.rerun) else 1
             notes, ok = [], False
             for k in range(attempts):
-                with legacy.build_lock(builder):
+                with build_lock(builder):
                     ok, note = self.once(argv, env, o, rundir, it.case, k, spec, it)
-                    if builder: legacy.install_signed(n)
+                    if builder: install_signed(n)
                 notes.append(note)
                 if ok: break
             last = rundir / 'runner' / (it.case + ('.rerun' if k else '') + '.log')
@@ -217,6 +266,7 @@ class Runner:
         if attempt and o.exists(): o.rename(o.with_name(o.name + '.first'))
         t0 = time.time()
         with open(log, 'wb') as f:
+            f.write(command_header(argv, env).encode()); f.flush()
             r = subprocess.run(argv, cwd=paths.repo_root(), env=env, stdout=f, stderr=subprocess.STDOUT)
         took = f'{time.time() - t0:.0f} s'
         text = log.read_text(errors='replace')
@@ -231,6 +281,14 @@ class Runner:
             ok, why = j(o)
             return ok, (f'judged: {why} ({took})' if ok else f'judge: {why}; log {log}')
         return False, f'exit {r.returncode} after {took}; log {log}'
+
+
+def command_header(argv, env) -> str:
+    """The log's first lines: the command and the settings the framework gave it (what to look at when debugging a case)."""
+    import shlex
+    keys = sorted(k for k in env if k.startswith(('NATEMU_', 'TESTKIT_')) or k == 'CARGO_TARGET_DIR')
+    return ('# testkit ran: ' + shlex.join(map(str, argv)) + '\n'
+            + ''.join(f'#   {k}={env[k]}\n' for k in keys) + '\n')
 
 
 DIFF_LINES = 40

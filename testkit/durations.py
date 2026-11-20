@@ -1,4 +1,5 @@
-"""Recorded durations per item (spec R6.5), per machine: longest-first ordering and the backfill rule use them."""
+"""Recorded durations per item (spec R6.5), per machine, in performance-core seconds (an item run on an efficiency core
+is recorded divided by its slowdown, testkit.runloop): longest-first ordering, backfill and core placement use them."""
 import contextlib
 import fcntl
 import json

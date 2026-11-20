@@ -38,5 +38,12 @@ def test_load_reads_recorded_runs(tmp_path):
         {'asked': 0, 'granted': 5, 'ended': 6, 'cores': 1, 'core_class': 'X'},
         {'asked': 0, 'granted': None, 'ended': None, 'cores': 1, 'core_class': ''}]}))
     runs = replay.load([tmp_path])
-    assert runs == [{'id': 'r1', 'gate': True, 'units': [{'ask': 0, 'dur': 3, 'cores': 2, 'excl': False},
-                                                         {'ask': 0, 'dur': 1, 'cores': 1, 'excl': True}]}]
+    assert runs == [{'id': 'r1', 'gate': True, 'units': [{'ask': 0, 'dur': 3, 'cores': 2, 'excl': False, 'cls': 'P'},
+                                                         {'ask': 0, 'dur': 1, 'cores': 1, 'excl': True, 'cls': 'X'}]}]
+
+
+def test_a_unit_recorded_on_an_efficiency_core_replays_at_its_performance_core_length():
+    from testkit.sched.policy import Config
+    run = {'id': 'r', 'gate': False, 'units': [{'ask': 0.0, 'dur': 30.0, 'cores': 1, 'excl': False, 'cls': 'E'}]}
+    assert replay.simulate([run], Config(p_cores=1, e_cores=1, e_slowdown=3.0))['r']['turnaround'] == 10.0
+    assert replay.simulate([run], Config(p_cores=1, e_cores=1))['r']['turnaround'] == 30.0

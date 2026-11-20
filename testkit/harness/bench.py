@@ -1,8 +1,8 @@
-"""Benchmarks (spec R3.6, R3.7), wrapped: each runs its existing tools/bench script unchanged, alone on the machine, and
+"""Benchmarks (spec R3.6, R3.7): each runs its tools/bench script (or tests/bench/run_m1_perf.py) unchanged, alone on the machine, and
 reports where its numbers are. Numbers are kept per machine (<run>/bench/<machine>/<case>/) and never compared across
 machines. Baseline caching and the drift canary (R3.7) are not part of this wrapper yet.
 
-    [[suite]] kind = "legacy"  harness = "bench"  tier = "bench"  params = { timeout = SECONDS }
+    [[suite]] kind = "bench"  harness = "bench"  tier = "bench"  params = { timeout = SECONDS }
     [suite.cases.<name>]  argv = [...]  needs = ["{raw}/..."]  env = { NAME = "..." }  baseline = "REV"
 Placeholders (in argv, env and needs): {out} {fexc} {natemu} {runtime} {host} {kernel} {raw}, and these, each built only
 when a case of the suite uses it (and then prepared before the run starts):
@@ -24,7 +24,7 @@ import time
 
 from testkit import artifacts, cache, host, inputs, paths, resources
 from testkit.family import Needs
-from testkit.harness import CaseResult, Requirement
+from testkit.harness import CaseResult, Requirement, runner
 
 INPUTS = {'fio_prep': 'fio-prep', 'block_inputs': 'block-inputs', 'io5_inputs': 'io5-inputs'}     # placeholder -> input name
 INPUT_FNS = {'fio-prep': lambda: inputs.fio_prep(), 'block-inputs': lambda: inputs.block_inputs(),
@@ -44,8 +44,8 @@ def _uses(spec, name) -> bool:
 
 # The scripts a resumable case runs: their contents key the resume folder too (a changed job list, profile or metric
 # must not mix with old records or meet inputs prepared by the old script).
-RESUME_SCRIPTS = ('tools/run_m1_perf.py', 'tools/run_io_matrix.py', 'tools/run_fio_admission.py', 'tools/run_fio_baselines.py',
-                  'tools/run_io5.py', 'tools/io_common.py', 'tools/run_virtio_block.py')
+RESUME_SCRIPTS = ('tests/bench/run_m1_perf.py', 'tests/io/run_io_matrix.py', 'tests/io/run_fio_admission.py', 'tests/io/run_fio_baselines.py',
+                  'tests/io/run_io5.py', 'tests/lib/io_common.py', 'tests/io/run_virtio_block.py')
 RESUME_KEEP_DAYS = 14         # `natemu-test clean` removes resume folders untouched this long; purge removes all
 
 
@@ -111,7 +111,7 @@ class Bench:
 
     def requirements(self, fam, suite, variant):
         reqs = [Requirement('artifact', 'natemu'), Requirement('artifact', 'fexc'), Requirement('resource', 'debian-kernel'),
-                Requirement('legacy', 'target')]
+                runner.TARGET]
         for spec in suite.extra.get('cases', {}).values():
             if _uses(spec, 'bench_image'): reqs.append(Requirement('artifact', 'bench-image'))
             if _uses(spec, 'natemu_baseline'): reqs.append(Requirement('natemu-at', spec['baseline']))
@@ -121,9 +121,7 @@ class Bench:
 
     def resolve(self, req):
         if req.kind == 'resource': return [resources.fetch(req.name)]
-        if req.kind == 'legacy':
-            from testkit.harness import legacy
-            return legacy.HARNESS.resolve(req)
+        if req == runner.TARGET: return runner.resolve_target(req)
         if req.kind == 'natemu-at': return [artifacts.natemu_at(req.name).entry]
         if req.kind == 'input': return [INPUT_FNS[req.name]()]
         return artifacts.resolve(req.name)

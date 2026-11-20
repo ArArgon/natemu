@@ -1,4 +1,4 @@
-"""No tool computes its own `<checkout>/../natemu-raw` default: they use raw_root.py (tools/with-env for shell), which also
+"""No tool computes its own `<checkout>/../natemu-raw` default: they use raw_root.py, which also
 finds the main checkout's sibling from inside a worktree."""
 import pathlib, re, unittest
 

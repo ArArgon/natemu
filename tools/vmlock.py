@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run a command under the shared VM lock, for anything that starts a VM outside run_suite (which takes it itself).
+"""Run a command under the shared VM lock, for anything that starts a VM outside tools/natemu-test (which takes it itself).
 
     python3 tools/vmlock.py shared|exclusive COMMAND [ARG ...]      lock: NATEMU_STATE_ROOT/.vm.lock (default NATEMU_RAW_ROOT)
 
 First it queues in the test framework's scheduler (testkit.sched.pool, the machine's one queue; `tools/natemu-test
 status` shows it) as a run of its own: exclusive for `exclusive`, one core for `shared`. So VMs started this way wait
 their turn in order with every framework run instead of racing it for the lock. Once granted it takes the lock
-without blocking; if an old runner (run_suite, `lockf -k`) holds it for 10 s, it gives the grant back unused and
+without blocking; if a process outside the queue (`lockf -k`) holds it for 10 s, it gives the grant back unused and
 queues again, so it never holds the machine while waiting for something outside the queue. Inside a framework unit
 (NATEMU_VM_LOCK_HELD=1 or a framework worker) the framework already holds both: the command just runs. Without the
 framework (no testkit, unreadable pool) it takes the lock alone, as it always did.
@@ -17,7 +17,8 @@ on this file. Shared: many parallel, correctness-only VM runs. Exclusive: timing
 `lockf -k` takes).
 
 The grant is held by this process id, which the command keeps (exec), so it lasts until the command exits; the
-scheduler then drops it as it drops any grant whose owner has died."""
+scheduler then drops it as it drops any grant whose owner has died. The command gets NATEMU_VMLOCK_HELD=shared|exclusive:
+the scripts under tests/ that no suite runs refuse to start without it (tests/lib/testenv.py)."""
 import fcntl, os, pathlib, sys, time, uuid
 from raw_root import STATE_ROOT
 
@@ -72,7 +73,7 @@ def main():
                 since = time.time()
                 while not take(fd, mode, blocking=False) and time.time() - since < GIVE_BACK: time.sleep(0.2)
                 if take(fd, mode, blocking=False): break
-                print('vmlock: an old runner holds the lock: grant given back, queued again', file=sys.stderr, flush=True)
+                print('vmlock: a process outside the queue holds the lock: grant given back, queued again', file=sys.stderr, flush=True)
                 pool.release(req.id, account=False); pool.submit(req)
         except Exception as e:                         # the queue failed mid-way: the lock alone, as before
             print(f'vmlock: the test framework queue failed ({type(e).__name__}: {e}); taking the lock only', file=sys.stderr)
@@ -80,6 +81,7 @@ def main():
             except Exception: pass
             take(fd, mode, blocking=True)
     os.set_inheritable(fd, True)
+    os.environ['NATEMU_VMLOCK_HELD'] = mode
     os.execvp(command[0], command)   # the command inherits the locked descriptor, so the lock lasts until it (and its children) exit
 
 
