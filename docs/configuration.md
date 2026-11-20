@@ -71,6 +71,8 @@ check_reuse = false
 page_currency = "on"         # on, off or check
 writable_on_read = true
 perf_log = "perf.log"
+inspect = true               # SIGINFO (Ctrl-T) prints each vCPU's state; the run goes on
+watchdog = 60                # seconds; a hang ends the run with the vCPU's report
 ```
 
 ## Sections and defaults
@@ -105,6 +107,8 @@ Every table rejects unknown keys, so a misspelled key is an error, not silently 
 | | `page_currency` | `"on"` | `on`, `off` or `check` |
 | | `writable_on_read` | `true` | Map a page writable on a demand read of a dirty entry |
 | | `perf_log` | none | Write the timing log to a file |
+| | `inspect` | `true` | SIGINFO (Ctrl-T in a terminal, `kill -INFO`) prints every vCPU's state and the run goes on |
+| | `watchdog` | `60` | Seconds a vCPU may run guest code without a host exit, or wait in the host outside a compile, before the run ends with its report |
 
 The `[debug]` keys are experiment and measurement switches; leave them alone for normal use.
 

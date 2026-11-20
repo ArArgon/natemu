@@ -757,6 +757,7 @@ impl Prepared {
             compiler.writable_on_read = self.writable_on_read;
             compiler.shape = self.code_shape;
             compiler.accurate_fp = self.accurate_fp;
+            compiler.report = true; // M2 task D: stop reports and the host-side progress check
             let mut requests = execution::Requests {
                 devices: Some(self.devices.clone()),
                 ..Default::default()
