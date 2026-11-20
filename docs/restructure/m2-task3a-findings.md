@@ -40,8 +40,11 @@ Each is the session's unless marked; all are reversible.
    for #GP at level 3 for a non-flat CS/DS/ES/SS or a 16-bit code or stack segment, "checked where the code identity is
    chosen". The check is one function (`Cpu::compat_refused`) called where the resident looks up the next block. So
    whatever produced the state (IRET, SYSRETL, SYSEXIT, a segment load inside 32-bit code), the transfer or load
-   completes and the next instruction takes #GP with the offending selector as error code (0 for a null one). Before,
-   IRET to 32-bit code faulted at the IRET itself, in the kernel. Linux turns both into a SIGSEGV for the program.
+   completes and the next instruction takes #GP with the offending selector as error code. Before, IRET to 32-bit
+   code faulted at the IRET itself, in the kernel. Linux turns both into a SIGSEGV for the program. The fault comes
+   after anything the boundary owes first (a single-step trap from the IRET, a pending interrupt it unmasked). One
+   visible consequence: an IRET whose return address lies outside a code segment limit below 4 GiB gets #GP(selector)
+   at the target, where hardware gives #GP(0) at the IRET; both are inside this recorded deviation.
 2. **What counts as flat.** CS: 32-bit, base 0, limit 4 GiB. SS: the same, a writable expand-up data segment, 32-bit
    stack. DS and ES: null, or base 0, limit 4 GiB, writable, expand-up data. A read-only or expand-down DS is refused
    too, because translated code checks neither.
@@ -51,7 +54,8 @@ Each is the session's unless marked; all are reversible.
    every memory operand without a prefix whose base is not EBP or ESP, plus the string source; for ES every string
    destination. The first version of this task refused a null DS or ES before the first instruction; that is gone.
    Cost: none in 32-bit Linux processes (DS and ES are never null there); under a null DS nearly every block is one
-   instruction long, which is right for code about to fault.
+   instruction long, which is right for code about to fault. A REP string instruction whose count is 0 makes no
+   access, so under the gate the resident completes it instead of faulting.
 4. **The null-segment gate is a cut, not a new stub.** Under `--fs-null` the compiler ends the block before any
    instruction that accesses memory through FS, exactly as it does for an SSE instruction when SSE is switched off, and
    the resident raises #GP(0) there. This reuses the existing "gated instruction" path end to end: nothing new in
@@ -61,8 +65,11 @@ Each is the session's unless marked; all are reversible.
    the upper half of a register the 32-bit code never wrote. The tests therefore never compare such a half.
 6. **Scratch registers are entered as zero**, not with R8-R15's values. Either is correct; zero means the round-trip
    test cannot pass by accident.
-7. **An access that runs across 4 GiB raises #GP(0)** (#SS(0) through the stack segment). This is the manual's rule
-   for a segment limit; QEMU does not check limits.
+7. **An access that runs across 4 GiB raises #GP(0)** (#SS(0) through the stack segment). The manual's limit rule
+   gives that fault, but for a limit of exactly 4 GiB it says such accesses "may or may not" fault, depending on the
+   processor (Vol. 3A, "Limit Checking"). So the fault is natemu's choice among the permitted outcomes, and the model
+   lists both. It is the choice that never touches unexpected memory, and it is what the AMD reference machine does
+   (appendix). QEMU makes the access wrapped.
 8. **IRET to 32-bit code is real from level 3 too**, not only from the kernel. It is the same instruction and the
    same code. The other user-level ways into 32-bit code (far JMP, CALL, RET) wait for task 5.
 
@@ -79,7 +86,9 @@ displacement folded into the Arm addressing mode (`[ebp-8]`), and the stack poin
   fault follows, with the 32-bit address.
 - A page-crossing store, which the resident completes itself, is made at the wrapped address.
 - **Limit:** in a process that has user memory above 4 GiB (a 64-bit process running 32-bit code, checkpoint C), the
-  first access would not abort and would silently reach the wrong address. Task 2 already put that decision at
+  first access would not abort and would silently reach the wrong address. The same holds for pure 32-bit code under
+  an OS that maps a user page in the 32 KiB just above 4 GiB (or at the very top of the address space): Linux does
+  not. Task 2 already put that decision at
   checkpoint C (32-bit address arithmetic for these two forms in translated code, one more instruction each).
 
 ## Tests
@@ -90,14 +99,15 @@ All through the framework. New case `system/compat32` (`tests/smp/run_slice3_vm.
 | Program | What it shows | Judged by |
 | --- | --- | --- |
 | `c32-roundtrip` | IRETQ into 32-bit code, INT 0x80 out, back in, out again: R8-R15 and XMM8-15 as the kernel left them; the kernel's changes to R8 and XMM8 survive the second stretch; ESP zero-extended; one-byte INC/DEC, call, push/pop, string move, PUSHFD, MOVD; an FS or GS prefix on an instruction that accesses nothing does not fault | QEMU |
-| `c32-fault` | three page faults retried after the handler maps the page (a store mid-block, a store to a read-only page, a PUSH with ESP unchanged in the frame), then a fault at FFFF_FFFCH reached as `[ebp-8]` with EBP = 4: the fault address is the 32-bit one | QEMU |
-| `c32-sysenter` | SYSENTER out of 32-bit code, SYSRETL back, INT 0x80 with the SYSRETL selectors in its frame | QEMU |
-| `c32-wrap` | `%gs:` with negative offsets (immediate and register); a GS base just below 4 GiB with offsets past it; `[ebp-12]` with EBP = 4; EBX = FFFF_FFF0H plus 40H; PUSH at ESP = 0; POP at ESP = FFFF_FFFCH and stores above the wrapped ESP, one across a page | QEMU |
+| `c32-iret-cpl3` | IRETQ executed by 64-bit user code into 32-bit code (decision 8), INT 0x80 out | QEMU |
+| `c32-fault` | three page faults retried after the handler maps the page (a store mid-block, a store to a read-only page, a PUSH with ESP unchanged in the frame), then a fault at FFFF_FFFCH reached as `[ebp-8]` with EBP = 4: the fault address is the 32-bit one; R8-R15 and XMM8-15 as the kernel left them in every fault's record | QEMU |
+| `c32-sysenter` | SYSENTER out of 32-bit code, SYSRETL back with RCX's upper half set (only ECX is the return address), INT 0x80 with the SYSRETL selectors in its frame | QEMU |
+| `c32-wrap` | `%gs:` with negative offsets (immediate and register); a GS base just below 4 GiB with offsets past it; `[ebp-12]` with EBP = 4; EBX = FFFF_FFF0H plus 40H; PUSH at ESP = 0; POP at ESP = FFFF_FFFCH and stores above the wrapped ESP, the first across a page (the resident's own store, made wrapped) | QEMU |
 | `c32-syscall-ud` | SYSCALL from 32-bit code with SYSCALL enabled: #UD | model and QEMU |
-| `c32-null-ds` | IRETQ into 32-bit code with DS and ES null that never uses them: registers, the stack (ESP and EBP bases, an SS override), a call, LEA, a DS prefix on a register form, INT 0x80 | QEMU |
+| `c32-null-ds` | IRETQ into 32-bit code with DS and ES null that never uses them: registers, the stack (ESP and EBP bases, an SS override), a call, REP string instructions with a zero count, LEA, a DS prefix on a register form, INT 0x80 | QEMU |
 | `c32-fs-null`, `c32-gs-null`, `c32-gs-null-string` | a load, a read-modify-write and a string source through a null FS or GS: #GP(0) | model (QEMU does not check) |
 | `c32-ds-null`, `c32-es-null` | DS, ES loaded with null inside 32-bit code, which runs on (stack use; a DS access while only ES is null) until a load through DS, a string store through ES: #GP(0) there | model (QEMU does not check) |
-| `c32-limit`, `c32-limit-ss`, `c32-limit-fetch` | a load, a stack-segment store and an instruction that run across 4 GiB: #GP(0), #SS(0), #GP(0) | model (QEMU does not check) |
+| `c32-limit`, `c32-limit-ss`, `c32-limit-fetch` | a load, a stack-segment store and an instruction that run across 4 GiB: #GP(0), #SS(0), #GP(0) (natemu's choice; the model also permits the access, decision 7) | model (QEMU makes the access) |
 | `c32-ds-based` | natemu's deviation: DS loaded with a based segment inside 32-bit code: #GP before the next instruction | model (natemu only) |
 
 QEMU runs these as an Intel processor (`vendor=GenuineIntel`; a program may now name its QEMU CPU model), because its
@@ -140,7 +150,9 @@ Results are in the task's report (commands and counts); the gate has not run (th
 The shim executes these with 64-bit rules today; in 32-bit code each needs its 32-bit behaviour. None is needed by
 task 3a's tests, which use register forms and the kernel side's 64-bit instructions.
 
-- **The effective address of a memory operand** of any instruction the shim executes: 32-bit wrap of base + index +
+- **The effective address of a memory operand** of any instruction the shim executes (segment loads and stores to
+  memory, the x87 and SSE control and state forms, CLFLUSH, MASKMOVQ/MASKMOVDQU/VMASKMOV, the gathers, INS/OUTS, BT
+  under alignment checking, memory RCL/RCR): 32-bit wrap of base + index +
   displacement and then of segment base + offset; the CS/DS/ES/SS base (0 while flat); **#GP(0) through a null FS,
   GS, DS or ES** (the compiler's gate covers translated instructions only; a shim-executed instruction with a memory
   operand is cut earlier, as a system instruction, and does not check); #GP/#SS at the 4 GiB limit instead of the canonical check.
@@ -158,10 +170,24 @@ task 3a's tests, which use register forms and the kernel side's 64-bit instructi
   half zero-extended, which is right).
 - **Single-step and breakpoints** in 32-bit code are untested.
 
+## Appendix: the 4 GiB limit on the reference machine
+
+AMD Ryzen 7 8845HS, Linux 7.0. A 32-bit Linux process cannot map the page just below 4 GiB, so the check ran from a
+static 64-bit program that maps FFFF_F000H and 1_0000_0000H (page 0 left unmapped), far-jumps to the 32-bit code segment
+0x23, loads DS with 0x2b and reads four bytes at FFFF_FFFEH, once as `mov eax, [0xfffffffe]` and once through SS
+(`mov eax, [ss:esi]`). A control without the read returns normally.
+
+```
+DS:  SIGSEGV, trap 13 (#GP), error 0, at the load
+SS:  SIGBUS,  trap 12 (#SS), error 0, at the load
+```
+
+So this processor raises the limit fault even with mapped memory on both sides. Intel hardware was not checked.
+
 ## Effort
 
 Approximate, from the session that did the work (it has no clock): reading the plan, the findings and the code about
 2.5 agent hours; the model about 0.5; resident, host and compiler about 2; the test programs, the runner entry and the
 QEMU seeding about 2; unit tests, this page and review of the diff about 1. About 8 in all, against the plan's 18-30
-for 3a. The register save and the model were each a few lines; most of the saving came from reusing the existing
+for 3a; the null DS/ES gate and the review's fixes added about 2. The register save and the model were each a few lines; most of the saving came from reusing the existing
 "gated instruction" path for the null FS/GS gate and the existing S2b test machinery for the new programs.

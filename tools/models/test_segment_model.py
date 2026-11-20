@@ -211,7 +211,8 @@ class Transfers(unittest.TestCase):
         self.assertEqual(m.null_access(m.load(s, 'gs', 0x53)['state'], 'gs')['outcome'], 'done')
         self.assertEqual(m.null_access(machine(3), 'fs')['outcome'], 'done')
         self.assertEqual(m.flat_access(s, 0xFFFF_FFFC, 4)['outcome'], 'done')
-        self.assertEqual(m.flat_access(s, 0xFFFF_FFFE, 4)['fault'][:2], (dm.GP, 0))
+        r = m.flat_access(s, 0xFFFF_FFFE, 4)                                           # B10: the fault, or not
+        self.assertEqual((r['fault'][:2], r['permitted']), ((dm.GP, 0), {('fault', (dm.GP, 0, 0)), ('done', None)}))
         self.assertEqual(m.flat_access(s, 0xFFFF_FFFD, 4, stack=True)['fault'][:2], (dm.SS, 0))
 
     def test_iretq_agrees_with_the_delivery_model(self):

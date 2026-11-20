@@ -171,10 +171,10 @@ def program(name, body, user, memory=(), params=None):
 # and GS on instructions that access nothing, and reads its selectors; the handler logs R8..R15 and XMM8..15 as it finds
 # them, changes R8 and XMM8 and returns; the second INT 0x80 ends the run.
 UPPER = lambda k: (0x1111_1111 * (k + 1) & 0xFFFF_FFFF) << 32 | 0x100 + k
-ROUND_BODY = """    mov rax, cr4
-    bts rax, 9
-    mov cr4, rax
-""" + ''.join(f'    movdqu xmm{k}, [{XMM + 16 * k:#x}]\n' for k in range(16)) + ENTER(
+# SSE on (CR4.OSFXSR) and XMM0..15 patterns; distinct values in R8..R15 (set after ENTER's frame is built).
+XMMS = '    mov rax, cr4\n    bts rax, 9\n    mov cr4, rax\n' + ''.join(f'    movdqu xmm{k}, [{XMM + 16 * k:#x}]\n' for k in range(16))
+HIGH_REGS = ''.join(f'    mov {r}, {UPPER(k):#x}\n' for k, r in enumerate(REGS64) if k >= 8)
+ROUND_BODY = XMMS + ENTER(
     ''.join(f'    mov {r}, {UPPER(k):#x}\n' for k, r in enumerate(REGS64) if r != 'rsp'), rsp=0x5555_5555_0000_0000 | US) + handlers(f"""    cmp qword [{LOG:#x}], 2
     jae .fin
     inc r8
@@ -229,11 +229,12 @@ ROUND_USER = f"""    mov eax, eax
 # A store to a page not present in the middle of a block, a store to a read-only page, a PUSH onto a page not present
 # (ESP unchanged in the frame), each retried after the handler maps the page; then a load at FFFF_FFFCH, where nothing is
 # mapped, reached as [EBP-8] with EBP = 4: CR2 is the 32-bit address. The handler ends the run at a fault above 4 MiB.
+# Each record holds R8..R15 and XMM8..15 as the fault's handler found them: the body's values.
 FAULT_BODY = f"""    and qword [{PTE(VPAGE):#x}], -2
     invlpg [{VPAGE:#x}]
     and qword [{PTE(XPAGE):#x}], -2
     invlpg [{XPAGE:#x}]
-""" + ENTER() + handlers(f"""    cmp qword [rsp], 14
+""" + XMMS + ENTER(HIGH_REGS) + handlers(f"""    cmp qword [rsp], 14
     jne .fin
     mov rax, cr2
     cmp rax, 0x400000
@@ -242,7 +243,7 @@ FAULT_BODY = f"""    and qword [{PTE(VPAGE):#x}], -2
     shr rax, 12
     or qword [{PTE(0):#x} + rax*8], 3
     jmp .resume
-""")
+""", xmm=True)
 FAULT_USER = f"""    mov eax, 0x11
     mov ebx, 0x22
     mov ecx, 0x33
@@ -266,7 +267,8 @@ FAULT_USER = f"""    mov eax, 0x11
 
 # ---- SYSENTER out of 32-bit code, SYSRETL back, INT 0x80 -----------------------------------------------------------------
 # The user passes its return address in EDX and its stack in EBP (Linux's convention); the handler returns by SYSRETL (CS
-# 0x13, SS 0x1b from STAR; R11 = ZF PF), and the INT 0x80 that follows logs those selectors in its frame.
+# 0x13, SS 0x1b from STAR; R11 = ZF PF; RCX with its upper half set: RIP := ECX), and the INT 0x80 that follows logs
+# those selectors in its frame.
 SYSENTER_BODY = '    ' + SC.EFER_SCE + SC.wrmsr(0xc0000081, SC.STAR) + SC.wrmsr(0x174, 0x08) + SC.wrmsr(0x175, KSTACK) + """    lea rax, [rel .sysenter]
     mov rdx, rax
     shr rdx, 32
@@ -278,7 +280,8 @@ SYSENTER_BODY = '    ' + SC.EFER_SCE + SC.wrmsr(0xc0000081, SC.STAR) + SC.wrmsr(
     jne .fin
     mov rax, [{REC + 0x40:#x} + rbx]
     mov rbx, [{REC + 0x58:#x} + rbx]
-    mov ecx, edx
+    mov rcx, 0x7777777700000000
+    or rcx, rdx
     mov r11d, 0x46
     mov esp, ebp
     sysret
@@ -292,6 +295,7 @@ SYSENTER_USER = f"""    mov eax, 0x1234
     mov ebp, esp
     sysenter
 .back:
+    mov ecx, 0x33
     mov ebp, cs
     mov [{W:#x}], ebp
     mov ebp, ss
@@ -306,8 +310,8 @@ SYSENTER_USER = f"""    mov eax, 0x1234
 # ---- addresses that wrap at 4 GiB ----------------------------------------------------------------------------------------
 # Segment base plus offset (GS at TLS, negative offsets as immediate and in a register, as static i386 programs reach
 # thread-local data; GS at FFFF_F000H with offsets that pass 4 GiB), base register plus displacement (EBP = 4 minus 12;
-# EBX = FFFF_FFF0H plus 40H), and the stack pointer (PUSH at ESP = 0; POP at ESP = FFFF_FFFCH, then stores above ESP = 0,
-# one of them across a page).
+# EBX = FFFF_FFF0H plus 40H), and the stack pointer (PUSH at ESP = 0; POP at ESP = FFFF_FFFCH, then stores above ESP = 0:
+# first one across a page, which the resident completes itself, then one within a page).
 WRAP_BODY = ENTER() + handlers()
 WRAP_USER = f"""    mov ecx, 0x33
     mov edx, 0x44
@@ -333,8 +337,8 @@ WRAP_USER = f"""    mov ecx, 0x33
     push 0x77777777
     mov esi, esp
     pop eax
-    mov dword [esp+0x40], 0x88888888
     mov dword [esp+0xffe], 0x99999999
+    mov dword [esp+0x40], 0x88888888
     mov ebx, esp
     mov esp, edi
     int 0x80
@@ -343,7 +347,8 @@ WRAP_USER = f"""    mov ecx, 0x33
 
 # ---- 32-bit code with a null DS and ES that never uses them --------------------------------------------------------------
 # x86 faults at the first access through a null segment, not before: registers, the stack (ESP and EBP bases, an SS
-# override on an EBX base), a call, LEA and a DS prefix on a register form all run.
+# override on an EBX base), a call, REP string instructions with a zero count (no access), LEA and a DS prefix on a
+# register form all run.
 NULL_BODY = ENTER(data=0) + handlers()
 NULL_USER = """    mov eax, 0x11
     mov ebx, esp
@@ -360,6 +365,10 @@ NULL_USER = """    mov eax, 0x11
     call .f
     pop esi
     pop edi
+    xor ecx, ecx
+    rep movsb
+    rep stosd
+    repe cmpsb
     lea ecx, [ebx+8]
     db 0x3e, 0x01, 0xc8
     cmp eax, eax
@@ -370,8 +379,38 @@ NULL_USER = """    mov eax, 0x11
 """
 
 
+# ---- IRETQ from 64-bit code at CPL 3 into 32-bit code --------------------------------------------------------------------
+# The body enters 64-bit user code (CS 0x23), which builds the frame itself; the 32-bit code then leaves by INT 0x80.
+USER_IRET_BODY = ENTER(cs=0x23) + handlers()
+USER_IRET_USER = f"""bits 64
+    mov ebx, 0x22
+    mov ecx, 0x33
+    mov edx, 0x44
+    mov esi, 0x55
+    mov edi, 0x66
+    mov ebp, 0x77
+    push 0x1b
+    push {US - 0x100:#x}
+    push 0x46
+    push 0xdb
+    mov eax, .in32
+    push rax
+    iretq
+bits 32
+.in32:
+    pushfd
+    pop eax
+    mov ebx, cs
+    mov ecx, esp
+    push eax
+    pop edx
+    int 0x80
+"""
+
+
 def positive():
     return [program('c32-roundtrip@1', ROUND_BODY, ROUND_USER), program('c32-null-ds@1', NULL_BODY, NULL_USER),
+            program('c32-iret-cpl3@1', USER_IRET_BODY, USER_IRET_USER),
             program('c32-fault@1', FAULT_BODY, FAULT_USER, [P.zero(VPAGE, 0x1000), P.zero(XPAGE, 0x1000)] + NOT_MAPPED),
             program('c32-sysenter@1', SYSENTER_BODY, SYSENTER_USER),
             program('c32-wrap@1', WRAP_BODY, WRAP_USER, WRAP)]

@@ -2634,7 +2634,8 @@ impl Cpu {
     /// the code identity is chosen (the resident's `find`), not at segment loads: a based DS loaded in 64-bit code is
     /// legal.
     pub fn compat_refused(&self) -> Option<u16> {
-        if self.code_mode() == Some(CodeMode::Bits64) {
+        // (At CPL 0 compatibility-mode code is the resident's stop, not a guest fault.)
+        if self.cpl != 3 || self.code_mode() == Some(CodeMode::Bits64) {
             return None;
         }
         let flat = |s: &Segment| s.base == 0 && s.limit == u32::MAX;
@@ -2959,7 +2960,8 @@ pub mod system {
     /// comes first (fexc reports `partial_decode` there); the 16th byte is never fetched (natemu policy).
     pub const TOO_LONG: u32 = 48;
     /// M2 task 3a: an access through FS, GS, DS or ES while it holds a null selector, in 32-bit code (fexc cut it,
-    /// `--fs-null` .. `--es-null`): #GP(0) (SDM Vol.3 3.4.4; `length` is not used).
+    /// `--fs-null` .. `--es-null`): #GP(0) (SDM Vol.3 3.4.4). `cr` 1: a REP string instruction of `length` bytes, which
+    /// makes no access and completes when ECX is 0; else `cr` is 0 and `length` is not used.
     pub const NULL_SEGMENT: u32 = 0x52;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
@@ -3194,7 +3196,8 @@ pub mod system {
                             && (0..=0xffff).contains(&self.disp)
                     }
                     INT => self.cr < 256,
-                    INT3 | INT1 | INTO | UD | TOO_LONG | NULL_SEGMENT | REFUSED => true,
+                    INT3 | INT1 | INTO | UD | TOO_LONG | REFUSED => true,
+                    NULL_SEGMENT => self.cr <= 1,
                     SWAPGS | SYSCALL | WBINVD | CLTS | SYSENTER => true,
                     SMSW => rm && matches!(self.size, 2 | 4 | 8),
                     LMSW => rm,
@@ -5157,6 +5160,10 @@ mod tests {
         let mut long = with(SREG_DS, 0x53, 0x12cf_f300_0000_ffff);
         (long.seg[SREG_CS], long.seg[SREG_FS], long.seg[SREG_ES]) = (flat_segments(3)[SREG_CS], Segment::NULL, Segment::NULL);
         assert_eq!((long.compat_refused(), long.code_context() & 0x1ff), (None, 3 | 1 << 2));
+        // At CPL 0 nothing is refused here: compatibility-mode code there is the resident's stop.
+        let mut kernel = with(SREG_CS, 0x53, 0x000f_fb00_0000_ffff);
+        kernel.cpl = 0;
+        assert_eq!(kernel.compat_refused(), None);
     }
 
     /// M2 task 1: a segment load keeps the descriptor's base and limit for every register (the resident stores
