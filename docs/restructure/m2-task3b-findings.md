@@ -14,8 +14,12 @@ applies only when the code segment is not 64-bit.
   with a memory operand goes through this one function. Two forms add their own segment base, the gathers and INS/OUTS;
   they now call the same two helpers.
 - **The 4 GiB limit:** an explicit access of 32-bit code that runs across 4 GiB raises #GP(0), or #SS(0) through SS.
-  The check is made once, in `pages`, which every explicit access passes through. Implicit accesses keep 64-bit rules:
-  the descriptor tables, the TSS, and the 64-bit interrupt frame written when 32-bit code is interrupted.
+  One helper (`segments::outside`) makes the canonical test and this one; `pages`, which every access passes through,
+  and every check that comes before #AC use it, so the limit fault comes before an alignment-check fault. Implicit
+  accesses keep 64-bit rules: the descriptor tables and the TSS, and the interrupt frame written when 32-bit code is
+  interrupted (a 64-bit frame: it is written under the new code segment, even at privilege level 3, where an IST stack
+  lies above 4 GiB). FXSAVE/FXRSTOR and XSAVE/XRSTOR check their whole operand (512 bytes, or the area XCR0 sizes)
+  against the limit, though they touch fewer bytes in 32-bit code. OUTS with an SS override raises #SS(0).
 - **Stack and instruction pointer:** ESP wraps at 4 GiB in PUSH/POP of segment registers, POPF, ENTER (its nesting
   reads through EBP too), far CALL and RET, IRET and the new PUSHA/POPA. The return address a far CALL pushes and the
   EIP an INT n frame holds wrap at 4 GiB, as does the instruction pointer after every instruction the resident runs.
@@ -58,8 +62,9 @@ Each one is the session's; all are reversible.
    offset past the limit whose linear address does not cross 4 GiB is accessed. The code marks this with a `ponytail:`
    comment. Translated code (task 3a) checks the same way.
 2. **Multi-slot stack accesses are one access.** PUSHA/POPA, a far CALL's frame, and the pops of RET and IRET are each
-   checked as one range. When ESP is so close to 0 that the frame would wrap across 4 GiB (ESP below 32 for PUSHAD),
-   natemu raises #SS(0). x86 wraps each slot. No program puts ESP there.
+   checked as one range. For RET and IRET that is the SDM's rule: their pseudocode checks the whole frame against the
+   limit. For PUSHA and a far CALL, when ESP is so close to 0 that the frame would wrap across 4 GiB (ESP below 32 for
+   PUSHAD), natemu raises #SS(0) where x86 makes each push at its wrapped address. No program puts ESP there.
 3. **PUSH of a segment register at 32 bits stores the selector zero-extended,** as QEMU does and as the 64-bit forms
    already did. The SDM also allows a 16-bit store, which recent Intel processors make. Software cannot rely on either.
 4. **ARPL with a memory operand always writes it back,** even when the RPL is unchanged, as QEMU does. A read-only page
@@ -72,9 +77,8 @@ Each one is the session's; all are reversible.
    before. Lifting that is one guard plus a test, if 64-bit code ever needs it.
 8. **The instruction pointer is also cut at the commit,** not only at the next lookup (task 3a). A single-step trap
    delivered between the two would otherwise push the uncut value.
-9. **Fault order inside one instruction:** where a form checks alignment (#AC) before its access, a misaligned access
-   that also crosses 4 GiB raises #AC instead of #GP. Both would be faults of a broken program; the SDM gives no order
-   between them.
+9. **Fault order inside one instruction:** segmentation comes first. A misaligned access that also crosses 4 GiB raises
+   #GP(0) or #SS(0), not #AC: the checks before #AC include the limit (decision of the review).
 
 ## QEMU's mistakes the tests avoid
 
@@ -111,7 +115,8 @@ kernel with the installer initrd, appends a small static 32-bit program to the i
 assembled by the runner with nasm), and runs it from busybox at 1 vCPU. The program checks its own results. It makes
 system calls through INT 0x80 and through the kernel's SYSENTER entry (AT_SYSINFO), uses thread-local data through GS
 after `set_thread_area`, PUSH/POP of segment registers, PUSHAD/POPAD, ARPL, BOUND, LDS, x87 (FSQRT, FISTP,
-FNSAVE/FRSTOR), signals from #BR, #OF and #DE whose handlers step past the instruction through sigreturn, SIGUSR1 from
+FNSAVE/FRSTOR), signals from #BR, #OF and #DE (the handler checks the saved EIP: the instruction's for the faults, the
+next one's for INTO's trap) whose handlers step past the instruction through sigreturn, SIGUSR1 from
 `kill`, and a far call to its own code segment. The case passes when the program prints its lines and exits 42. The
 same binary prints the same lines and exits 42 on the x86 reference machine (AMD Ryzen, Ubuntu 26.04).
 

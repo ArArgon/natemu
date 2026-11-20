@@ -241,15 +241,21 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
     for (k, v) in slots.iter().enumerate() {
         frame[8 * k..8 * k + 8].copy_from_slice(&v.to_le_bytes());
     }
-    // At the new CPL (A3): an implicit-supervisor-like walk at CPL 0, else explicit at CPL 3 (the CPL stays 3).
-    segments::linear(
+    // At the new CPL (A3): an implicit-supervisor-like walk at CPL 0, else explicit at CPL 3 (the CPL stays 3). M2 task 3b:
+    // the frame is a 64-bit one even when 32-bit code is interrupted, so it is written under the new (64-bit) CS: the 4 GiB
+    // limit of 32-bit code does not apply to it (an IST stack is above 4 GiB). CS is restored for a fault.
+    let cs = s.cpu.seg[SREG_CS];
+    s.cpu.seg[SREG_CS] = Segment::loaded(selector & 0xfffc | new_cpl as u16, cs_raw | 1 << 40);
+    let written = segments::linear(
         s,
         low,
         &mut frame[..8 * slots.len()],
         true,
         new_cpl == 0,
         [12, ext, 0],
-    )?;
+    );
+    s.cpu.seg[SREG_CS] = cs;
+    written?;
     super::watch::access(s, low, 8 * slots.len() as u64, true);
     segments::accessed(s, cs_va, cs_raw)?;
     s.cpu.gpr[4] = low;

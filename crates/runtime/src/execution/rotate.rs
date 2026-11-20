@@ -38,8 +38,7 @@ pub(super) fn memory(
     let va = segments::address(&s.cpu, &i)?;
     let n = u64::from(i.size);
     let nc = segments::noncanonical(&i);
-    let last = va.wrapping_add(n - 1);
-    if !paging::canonical(va) || !paging::canonical(last) || last < va {
+    if segments::outside(&s.cpu, va, n) {
         return Err(nc);
     }
     if s.cpu.alignment_check() && va & (n - 1) != 0 {

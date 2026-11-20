@@ -4,8 +4,7 @@ use segments::{Exception, linear, pages, wrap};
 
 fn word(s: &mut State, at: u64, width: u64, write: bool, value: u64) -> Result<u64, Exception> {
     const SS: Exception = [12, 0, 0];
-    let last = at.wrapping_add(width - 1);
-    if !paging::canonical(at) || !paging::canonical(last) || last < at {
+    if segments::outside(&s.cpu, at, width) {
         return Err(SS);
     }
     if s.cpu.alignment_check() && at & (width - 1) != 0 {

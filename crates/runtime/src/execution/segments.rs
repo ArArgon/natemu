@@ -248,6 +248,18 @@ pub(super) fn wrap(c: &Cpu, v: u64) -> u64 {
         v as u32 as u64
     }
 }
+/// Whether the explicit access `[va, va + n)` cannot be made by address: not canonical or wrapping past 2^64, or in 32-bit
+/// code (M2 task 3b) across 4 GiB, outside the flat segment's limit (SDM Vol.3 5.3: #GP(0), #SS(0) through SS). Every
+/// check before #AC uses it, so segmentation comes before alignment checking. ponytail: checked on the linear address,
+/// which for a based FS or GS is not the offset the limit applies to; an access whose linear address wraps across 4 GiB
+/// faults here where x86 wraps it. Check the offset when based segments matter.
+pub(super) fn outside(c: &Cpu, va: u64, n: u64) -> bool {
+    let last = va.wrapping_add(n - 1);
+    !paging::canonical(va)
+        || !paging::canonical(last)
+        || last < va
+        || (last >> 32 != 0 && c.code_mode() != Some(CodeMode::Bits64))
+}
 /// A non-canonical memory operand: #SS(0) for an SS reference (the host gives an RSP or RBP base with no FS/GS override
 /// SS: it ignores CS/DS/ES/SS prefixes, owner decision of November 3), else #GP(0) (FS/GS, I7).
 pub(super) fn noncanonical(i: &System) -> Exception {
@@ -286,8 +298,7 @@ pub(super) fn linear(
             2 => 2,
             _ => 1,
         };
-        let last = va.wrapping_add(n - 1);
-        if va & (align - 1) != 0 && paging::canonical(va) && paging::canonical(last) && last >= va {
+        if va & (align - 1) != 0 && !outside(&s.cpu, va, n) {
             return Err([17, 0, 0]);
         }
     }
@@ -349,14 +360,8 @@ pub(super) fn pages(
     noncanonical: Exception,
 ) -> Result<[u64; 2], Exception> {
     let last = va.wrapping_add(n - 1);
-    if !paging::canonical(va) || !paging::canonical(last) || last < va {
-        return Err(noncanonical);
-    }
-    // M2 task 3b: an explicit access of 32-bit code that runs across 4 GiB is outside the flat segment's limit (SDM Vol.3
-    // 5.3): #GP(0), or #SS(0) through SS. Implicit ones (descriptor tables, the TSS, a 64-bit interrupt frame) are 64-bit.
-    // ponytail: checked on the linear address, which for a based FS or GS is not the offset the limit applies to; an access
-    // whose linear address wraps across 4 GiB faults here where x86 wraps it. Check the offset when based segments matter.
-    if !supervisor && last >> 32 != 0 && s.cpu.code_mode() != Some(CodeMode::Bits64) {
+    // Implicit accesses (descriptor tables, the TSS) are 64-bit ones whatever the code's mode.
+    if !paging::canonical(va) || !paging::canonical(last) || last < va || (!supervisor && outside(&s.cpu, va, n)) {
         return Err(noncanonical);
     }
     let mut control = controls(s);
@@ -832,8 +837,7 @@ pub(super) fn aligned_operand(
     write: bool,
     nc: Exception,
 ) -> Result<(), Exception> {
-    let last = at.wrapping_add(bytes.len() as u64 - 1);
-    if !paging::canonical(at) || !paging::canonical(last) || last < at {
+    if outside(&s.cpu, at, bytes.len() as u64) {
         return Err(nc);
     }
     if s.cpu.alignment_check() && at & (alignment - 1) != 0 {
