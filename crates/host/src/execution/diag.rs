@@ -81,7 +81,9 @@ pub(crate) fn report(area: Area, what: &str, at: At) -> String {
         At::Forced(vcpu) => {
             let (pc, cpsr) = (vcpu.reg(PC).unwrap_or(0), vcpu.reg(CPSR).unwrap_or(0));
             if cpsr & 0xf == 0 {
-                for (i, r) in exec::SRA[..16].iter().enumerate() {
+                // (32-bit code holds EAX..EDI only: the registers of R8..R15 are its scratch registers, `SRA32`.)
+                let held = if cpu.code_mode() == Some(exec::CodeMode::Bits64) { 16 } else { 8 };
+                for (i, r) in exec::SRA[..held].iter().enumerate() {
                     cpu.gpr[i] = vcpu.reg(u32::from(*r)).unwrap_or(0);
                 }
                 let note = match locate(area, pc) {

@@ -33,7 +33,8 @@ enum Kind : uint8_t { ALLOW, SYSTEM, UNSUPPORTED };
 // FMA/F16C form, gated by CR4.OSXSAVE, XCR0[2:1] and CR0.TS; `align32`: its 32-byte memory operand must be 32-byte aligned.
 // `mmx` (I9): an MMX form on MM registers only (gated by CR0.EM: #UD, and CR0.TS: #NM; not by CR4.OSFXSR).
 struct Verdict { Kind kind; bool branch; const char* why; bool simd = false; bool align = false; uint8_t x87 = 0; bool gated = false;
-                 bool avx = false; bool align32 = false; bool mmx = false; bool ud = false; bool mmreg = false; };
+                 bool avx = false; bool align32 = false; bool mmx = false; bool ud = false; bool mmreg = false; bool null_segment = false; };
+// `null_segment` (M2 task 3a): an access through a null FS or GS in 32-bit code (#GP; the host's `cut_gated` "null_segment").
 // `mmreg` (I5c): an instruction on MMX registers (MMX, EMMS, CVTPI2PS and the like): #MF for a pending x87 exception first.
 
 inline Verdict Allow(bool branch = false) { return {ALLOW, branch, ""}; }
@@ -755,6 +756,18 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
   if (v.simd && fexc_sse_gated) { v = Sys("SSE gated by CR0.EM/TS or CR4.OSFXSR (#UD/#NM)"); v.simd = true; return v; }
   // I9: an MMX form (EMMS included) under CR0.EM or CR0.TS (the host's --x87-gated): #UD or #NM (the host's MMX_GATED).
   if (v.mmx && fexc_x87_gated) { v = Sys("MMX gated by CR0.EM/TS (#UD/#NM)"); v.mmx = true; v.gated = true; return v; }
+  // M2 task 3a: in 32-bit code an access through FS or GS while it holds a null selector (the host's --fs-null, --gs-null) is
+  // #GP(0), after the #UD and #NM above. The access is the explicit memory operand the prefix overrides ("Segment prefixes"
+  // below; of several segment prefixes the last applies): a ModRM memory operand (not LEA's, nor a prefetch's or a multi-byte
+  // NOP's, which access nothing), moffs, XLAT, the DS:ESI source of movs/cmps/lods. (An instruction the resident runs is cut
+  // before this: its null check is the resident's.)
+  if (const uint32_t seg = f & DecodeFlags::FLAG_SEGMENTS; fexc_bits32 &&
+      ((seg == DecodeFlags::FLAG_FS_PREFIX && (fexc_null_segments & 1)) || (seg == DecodeFlags::FLAG_GS_PREFIX && (fexc_null_segments & 2)))) {
+    const bool one = d.FexcMap == FEXC_MAP_PRIMARY, two = d.FexcMap >= FEXC_MAP_TWO && d.FexcMap <= FEXC_MAP_TWO_66;
+    const bool modrm = has_modrm && mod != 3 && !(one && op == 0x8D) && !(two && (op == 0x0D || (op >= 0x18 && op <= 0x1F)));
+    const bool implicit = one && ((op >= 0xA0 && op <= 0xA7) || op == 0xAC || op == 0xAD || op == 0xD7);
+    if (modrm || implicit) { v = Sys("access through a null FS or GS in 32-bit code (#GP)"); v.null_segment = true; return v; }
+  }
   // X2: BT/BTS/BTR/BTC m, r and m, imm8 (0f a3/ab/b3/bb, 0f ba /4../7) under alignment checking (the host's --alignment-gated):
   // the resident checks the operand-size alignment (#AC), then steps the instruction compiled without this flag.
   // (The form first: fexc_alignment_gated is read only for the forms it gates; see FexcArg.)
@@ -1027,6 +1040,7 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
               bool(d.Flags & DecodeFlags::FLAG_DECODED_MODRM), d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "?", v.why};
   fexc_cut.gated = v.kind == SYSTEM && (v.simd || v.gated);
   fexc_cut.gated_mmx = fexc_cut.gated && v.mmx;
+  fexc_cut.gated_null = v.kind == SYSTEM && v.null_segment;
   fexc_cut.ud = v.kind == SYSTEM && v.ud;
   return true;
 }

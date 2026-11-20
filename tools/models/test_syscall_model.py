@@ -25,6 +25,13 @@ def machine(cpl=0, ro=False):
     return s
 
 
+def machine_null_ds():
+    s = machine()
+    s['gpr'].update(rcx=0x40_0000, r11=0x202)
+    s['seg']['ds'] = (0, 0)
+    return s
+
+
 def done(t, r):
     t.assertEqual((r['outcome'], r['diff']), ('done', {}))
     return r['state']
@@ -77,12 +84,15 @@ class FastCalls(unittest.TestCase):
         self.assertEqual(m.sysret(dict(s, efer=0xD00, cpl=3))['fault'], UD)               # #UD before the CPL check
         self.assertEqual(m.sysret(dict(s, cpl=3))['fault'], GP)
         self.assertEqual(m.sysret(dict(s, cpl=3), width=4)['fault'], GP)
-        r = m.sysret(s, width=4)                                                        # compatibility mode: the deviation
-        self.assertEqual((r['fault'][:2], r['deviation'], r['fault_rip']), ((GP[0], (s['msrs']['star'] >> 48 | 3) & 0xFFFC), True, 0x40_0000))
+        r = m.sysret(s, width=4)                # SYSRETL with DS = ES = a DPL 0 flat data segment: 32-bit code runs
+        self.assertEqual((r['outcome'], r['state']['rip'], r['state']['seg']['cs'], r['state']['seg']['ss']),
+                         ('done', 0x40_0000, (0x23, 0xC0FB), (0x2B, 0xC0F3)))
+        r = m.sysret(machine_null_ds(), width=4)                                        # a null DS: natemu's deviation
+        self.assertEqual((r['fault'][:2], r['deviation'], r['fault_rip'], r['state']['cpl']), ((GP[0], 0), True, 0x40_0000, 3))
         bad = machine()
         bad['gpr'].update(rcx=0x0000_8000_0000_0000, r11=0x302)
         self.assertEqual(m.sysret(bad)['fault'], GP)                                    # non-canonical before TF
-        self.assertEqual(m.sysret(bad, width=4)['fault_rip'], 0)                        # SYSRETL: no RCX check, ECX
+        self.assertEqual(m.sysret(bad, width=4)['state']['rip'], 0)                     # SYSRETL: no RCX check, ECX
         s['gpr']['r11'] = 0x302
         self.assertEqual(done(self, m.sysret(s))['rflags'], 0x302)                     # TF after (C3)
         s['gpr']['r11'] = 0x202

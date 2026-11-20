@@ -57,7 +57,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from models.delivery_model import Fault, canonical, GP, UD, TF, RF
-from models.segment_model import Deviation, Refused, _run as _segment_run, _operand, descriptor, fields, limit
+from models.segment_model import Deviation, Refused, _run as _segment_run, _operand, _refuse_shape, descriptor, fields, limit
 from models import cpu_profile
 
 PROFILE = cpu_profile.load()
@@ -125,26 +125,27 @@ def syscall(state):
 def sysret(state, width=8):
     """Vol. 2B SYSRET: #UD unless 64-bit mode and EFER.SCE; #GP(0) at CPL != 0; 64-bit: #GP(0) for non-canonical RCX,
     RIP := RCX, RFLAGS := (R11 & 3C7FD7H) | 2, CS := (STAR[63:48] + 16) | 3, SS := (STAR[63:48] + 8) | 3, CPL := 3.
-    width 4 (to compatibility mode, not built): natemu's recorded deviation (owner decision, November 6) after the CPL
-    check: the return completes, then its target (ECX) takes #GP(STAR[63:48] | 3) at CPL 3 (a `Deviation` raised at that
-    RIP). Reads gpr rcx/r11, rflags, efer, msrs, cr0, cpl; writes rip, rflags, cs, ss, seg cs/ss, cpl."""
+    width 4 (SYSRETL, M2 task 3a): RIP := ECX, CS := STAR[63:48] | 3 (flat 32-bit code); when DS or ES is then a segment
+    natemu does not run 32-bit code with, its deviation at the target (segment_model `refused_shape`).
+    Reads gpr rcx/r11, rflags, efer, msrs, cr0, cpl; writes rip, rflags, cs, ss, seg cs/ss, cpl."""
     def body(s, bus, alts):
         _mode64(s)
         if not s['efer'] & SCE:
             raise Fault(UD)
         if s['cpl']:
             raise Fault(GP, 0)
-        if width != 8:
-            raise Deviation(GP, (s['msrs']['star'] >> 48 | 3) & 0xFFFC, rip=s['gpr']['rcx'] & 0xFFFFFFFF)
-        rcx = s['gpr']['rcx']
+        rcx = s['gpr']['rcx'] & (1 << 8 * width) - 1
         if not canonical(rcx):
             raise Fault(GP, 0)                                      # C4
         flags = s['gpr']['r11'] & SYSRET_FLAGS | 2
         base = s['msrs']['star'] >> 48 & 0xFFFF
         s['rip'], s['rflags'], s['cpl'] = rcx, flags, 3
-        s['cs'], s['ss'] = (base + 16 | 3) & 0xFFFF, (base + 8 | 3) & 0xFFFF
-        s['seg']['cs'] = (s['cs'], 0xA0FB)                          # type B, S, DPL 3, P; G, L
+        s['cs'], s['ss'] = (base + (16 if width == 8 else 0) | 3) & 0xFFFF, (base + 8 | 3) & 0xFFFF
+        s['seg']['cs'] = (s['cs'], 0xA0FB if width == 8 else 0xC0FB)   # type B, S, DPL 3, P; G, L (SYSRETL: D)
         s['seg']['ss'] = (s['ss'], 0xC0F3)                          # type 3, S, DPL 3, P; G, B
+        for r in ('cs', 'ss'):
+            s.get('shape', {}).pop(r, None)                         # fixed flat segments, whatever was loaded before
+        _refuse_shape(s, rcx)
     return _run(state, body)
 
 

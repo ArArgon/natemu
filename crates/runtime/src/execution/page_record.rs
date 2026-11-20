@@ -39,9 +39,6 @@ pub(crate) fn invalidated(address: u64) {
 /// through the answer: a revalidation compares frame numbers and a placement's bytes are copied by the host after the `hvc`).
 #[inline(always)]
 fn probe(s: &State, va: u64) -> Option<(u64, u32)> {
-    if s.cpu.code_mode() != Some(CodeMode::Bits64) {
-        return None; // no answer outside 64-bit code either: the walk then stops ([`fetch_walk`])
-    }
     let control = s.cpu.paging()?;
     let c = cache::control();
     let (page, flags, _) = ps::probe(

@@ -109,6 +109,10 @@ inline uint32_t fexc_spill_bytes = 0;             // bytes the entry prologue su
 inline bool fexc_slice1 = false;
 // M2: the request is for 32-bit code (--bitness 32; its own FEX context). Not a FexcArg: the host's code identity holds the mode.
 inline bool fexc_bits32 = false;
+// M2 task 3a, 32-bit code: FS (bit 0), GS (bit 1) hold a null selector (--fs-null, --gs-null, from the host's code identity):
+// an access through that segment is cut as a system instruction, which the resident raises as #GP(0) (SDM Vol.3 3.4.4). Not
+// FexcArgs: the host keeps no answer of a 32-bit request.
+inline uint8_t fexc_null_segments = 0;
 // Extended blocks (--ext-conds N): after a conditional branch (jcc, loop, jrcxz) the decoder goes on with the
 // fall-through instructions in the same unit while the unit has fewer than N conditional branches and the fall-through
 // starts in the unit's first page; the taken edge stays an ordinary exit. 0: off (FEX's single basic block).
@@ -156,6 +160,7 @@ struct FexcCut {
   uint8_t status = 0;
   bool gated = false;             // I5a: an SSE instruction cut because the vCPU's CR0/CR4 gate it (#UD or #NM; --sse-gated)
   bool gated_mmx = false;         // I9: an MMX instruction cut by CR0.EM/TS (#UD or #NM; --x87-gated): reported as cut_gated "mmx"
+  bool gated_null = false;        // M2 task 3a: an access through a null FS or GS in 32-bit code (#GP): cut_gated "null_segment"
   bool ud = false;                // I10: an encoding the presented CPU raises #UD for (reserved or unadvertised): reported as cut_ud
 };
 inline FexcCut fexc_cut {};

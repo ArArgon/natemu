@@ -121,7 +121,9 @@ def adversarial():
     codes = [bytes.fromhex(h) for h in ('4801d84883c001c3', '4801d84883c001', '4801d8', '4829d84883e801c3', '480fafc3c3', '4831c04889d8c3',
                                         '488b03c3', '488903c3', 'f7f3c3', '48f7f3c3', 'd9c0d9c9c3', '0f05',
                                         # P3: forms each gating argument gates: MOVAPS, VADDPS ymm, BT m, FADD, FWAIT
-                                        '0f28c1c3', 'c5fc58c1c3', '0fa303c3', 'd8c1c3', '9bc3')]
+                                        '0f28c1c3', 'c5fc58c1c3', '0fa303c3', 'd8c1c3', '9bc3',
+                                        # M2 task 3a: an access through FS, through GS (the null-segment arguments, 32-bit code)
+                                        '648b03c3', '658903c3')]
     variants = [[], FIXED, ['--max-insts', '1'], FIXED + ['--max-insts', '1'], ['--max-insts', '2'], FIXED + ['--max-insts', '2'],
                 FIXED + ['--feature', 'atomics_lse=0'], FIXED + ['--feature', 'flagm=0'], ['--feature', 'flagm=0'], ['--feature', 'x86_avx=0'],
                 ['--bitness', '32'], ['--no-tso'], ['--multiblock'], ['--sparse-pc'], ['--no-end-marker'],
@@ -129,7 +131,10 @@ def adversarial():
                 # P3: the gating arguments (slice1), alone and together, and an x87 FPCR
                 FIXED + ['--sse-gated'], FIXED + ['--avx-gated'], FIXED + ['--alignment-gated'], FIXED + ['--x87-gated'],
                 FIXED + ['--x87-gated', '--wait-gated'], FIXED + ['--x87-fpcr', '0x400000'],
-                FIXED + ['--sse-gated', '--avx-gated', '--alignment-gated', '--x87-gated', '--wait-gated', '--x87-fpcr', '0xc00000']]
+                FIXED + ['--sse-gated', '--avx-gated', '--alignment-gated', '--x87-gated', '--wait-gated', '--x87-fpcr', '0xc00000'],
+                # M2 task 3a: slice1 32-bit code and its null FS/GS arguments (which 64-bit code ignores), between 64-bit requests
+                FIXED + ['--bitness', '32'], FIXED + ['--bitness', '32', '--fs-null'], FIXED + ['--bitness', '32', '--fs-null', '--gs-null'],
+                FIXED + ['--gs-null']]
     return [(f'adv {c.hex()} {" ".join(v)}', v + ['--rip', '0x1000'], c) for c in codes for v in variants]
 
 
