@@ -72,11 +72,23 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Result<Option<System>, Trunc
     padded[..bytes.len().min(15)].copy_from_slice(&bytes[..bytes.len().min(15)]);
     // The Reserved-NOP cells (0f 0d, 0f 18..1f) decode as such whatever prefetch, CET or MPX form they also are.
     let i = Decoder::new(bitness, &padded, DecoderOptions::FORCE_RESERVED_NOP).decode();
-    if i.len() > bytes.len() {
+    // A one-byte opcode with no 64-bit form (SDM Vol.2 Table A-2 "i64", and D6): #UD by the opcode alone, though iced reads
+    // a ModRM byte after it (one at the end of the bytes is no wait for the next page).
+    let at = opcode_at(bytes).0;
+    let i64_opcode = bitness == 64
+        && i.is_invalid()
+        && bytes.get(at).is_some_and(|op| {
+            matches!(
+                op,
+                0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f | 0x27 | 0x2f | 0x37 | 0x3f | 0x60 | 0x61 | 0x82 | 0x9a
+                    | 0xce | 0xd4 | 0xd5 | 0xd6 | 0xea
+            )
+        });
+    if i.len() > bytes.len() && !i64_opcode {
         return Err(Truncated);
     }
     // #UD leaves RIP at the instruction: no operand is used.
-    let length = i.len() as u32;
+    let length = if i64_opcode { at as u32 + 1 } else { i.len() as u32 };
     let ud = Some(System {
         kind: UD,
         length,
@@ -2047,6 +2059,9 @@ mod tests {
         assert_eq!(super::dec(&[0xcd, 0x80], 64), s(INT, 0x80, 2));
         assert_eq!(super::dec(&[0xcd], 64), None); // truncated immediate
         assert_eq!(super::dec(&[0xce, 0x90], 64).map(|s| s.kind), Some(UD)); // INTO: no 64-bit form
+        assert_eq!(super::dec(&[0xce], 64), s(UD, 0, 1)); // the last byte supplied: no wait for the next one
+        assert_eq!(super::dec(&[0x66, 0x41, 0x06], 64), s(UD, 0, 3)); // PUSH ES, prefixed
+        assert_eq!(super::dec(&[0x8d], 64), None); // LEA: its ModRM decides (truncated)
         assert_eq!(super::dec(&[0x0f, 0x0b], 64), s(UD, 0, 2));
         assert_eq!(super::dec(&[0x0f, 0xb9, 0xc0], 64), s(UD, 0, 3));
         assert_eq!(
