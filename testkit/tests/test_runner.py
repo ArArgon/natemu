@@ -86,3 +86,30 @@ def test_diff_rerun_only_for_hash_only_answers():
     assert runner.needs_diff(f'step 3: {answers.HASH_ONLY}: qemu-system/abc')
     assert not runner.needs_diff('x differs: 1 != 2 (QEMU 2)')
     assert 'natemu-test run --diff' in answers.HASH_ONLY
+
+
+def test_a_current_target_is_not_installed_again_so_no_exclusive_build_lock_wait(tmp_path, monkeypatch):
+    """Every running runner case holds the build lock shared: with target/ current, preparation must not wait for it."""
+    import fcntl, threading
+    from types import SimpleNamespace as NS
+    from testkit.harness import runner
+    entry, target = tmp_path / 'entry', tmp_path / 'target'
+    for rel in runner.LAYOUT:
+        (entry / rel).parent.mkdir(parents=True, exist_ok=True); (entry / rel).write_bytes(b'signed ' + rel.encode())
+    monkeypatch.setattr(runner.artifacts, 'natemu', lambda: NS(entry=entry))
+    monkeypatch.setattr(runner.paths, 'repo_root', lambda: tmp_path)
+    monkeypatch.setenv('CARGO_TARGET_DIR', str(target))
+    runner.resolve_target(None)                                   # first time: installs, nothing else holds the lock
+    assert runner.installed(NS(entry=entry))
+    lock = (tmp_path / '.natemu' / 'build.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_SH)                              # a running case of another run
+    try:
+        t = threading.Thread(target=runner.resolve_target, args=(None,), daemon=True); t.start(); t.join(5)
+        assert not t.is_alive(), 'a current target/ waited for the exclusive build lock'
+        (target / runner.LAYOUT[0]).write_bytes(b'stale')        # a builder case's own build left behind
+        t = threading.Thread(target=runner.resolve_target, args=(None,), daemon=True); t.start(); t.join(1)
+        assert t.is_alive(), 'a stale target/ must be installed under the exclusive lock'
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+    t.join(5)
+    assert not t.is_alive() and runner.installed(NS(entry=entry))

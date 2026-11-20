@@ -22,6 +22,7 @@ field-by-field comparison says what differs; that rerun's log is added to the me
 """
 import contextlib
 import fcntl
+import filecmp
 import fnmatch
 import json
 import os
@@ -69,8 +70,20 @@ def build_lock(exclusive: bool):
         fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
 
 
+def installed(n) -> bool:
+    """The worktree's target/ already holds exactly the artifact's signed binaries."""
+    t = target_dir()
+    return all((t / rel).is_file() and filecmp.cmp(n.entry / rel, t / rel, shallow=False) for rel in LAYOUT)
+
+
 def resolve_target(req) -> list:
-    with build_lock(True): install_signed(artifacts.natemu())
+    """Install the signed binaries, under the build lock held exclusively, unless they are in place already. Every
+    running runner case holds that lock shared, so while another run is going an exclusive wait may not end (seen: a
+    boot run's preparation waited 71 s behind a gate's cases): a run whose target/ is current does not wait at all."""
+    n = artifacts.natemu()
+    if installed(n): return []
+    with build_lock(True):
+        if not installed(n): install_signed(n)
     return []
 
 
