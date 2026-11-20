@@ -710,7 +710,8 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
 /// plain step, wanted stop, posted invalidation, LAPIC expiry or backlog, takeable event), the exit is an ordinary one of
 /// a live block, and the decode at its RIP is a kept SYSCALL or SYSRET that is current (looked up without a walk,
 /// [`cache::current_at`]) and commits (EFER.SCE, no LOCK; SYSRET: CPL 0, REX.W, a canonical RCX: the transaction's own
-/// checks, so it never faults here; SYSCALL from 64-bit code only: it is #UD from 32-bit code). Else it returns
+/// checks, so it never faults here; SYSCALL from 64-bit code only: it is #UD from 32-bit code; M2 task 4: also SYSENTER,
+/// which the kernel's helper page makes 32-bit programs' system calls with, and SYSRETL, the kernel's return to them). Else it returns
 /// having changed only what `linker` then does again to the same effect (the bank from the same frame and page, RIP, RF
 /// cleared): nothing before the commit walks or writes guest memory, so no A-bit write can kill the block that ran (the
 /// linker would then find it dead). The instruction runs as [`system`] runs it ([`syscalls::execute`]). After it,
@@ -742,7 +743,7 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     let Some(i) = found
         .filter(|b| b.flags & cache::SYSTEM != 0)
         .map(cache::system_of)
-        .filter(|i| matches!(i.kind, system::SYSCALL | system::SYSRET))
+        .filter(|i| matches!(i.kind, system::SYSCALL | system::SYSRET | system::SYSENTER))
     else {
         return declined(s, rip, SysFastDecline::NotCurrent);
     };
@@ -776,11 +777,14 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     if !events::none(s) {
         return declined(s, rip, SysFastDecline::Boundary);
     }
+    // (M2 task 4: SYSENTER, the kernel's 32-bit helper, commits with a non-null IA32_SYSENTER_CS, whatever EFER.SCE; SYSRETL,
+    // without REX.W, returns to ECX, which is always canonical.)
+    let sce = s.cpu.efer & EFER_SCE != 0;
     let commits = i.lock == 0
-        && s.cpu.efer & EFER_SCE != 0
         && match i.kind {
-            system::SYSCALL => s.cpu.code_mode() == Some(CodeMode::Bits64),
-            system::SYSRET => s.cpu.cpl == 0 && i.size == 8 && paging::canonical(s.cpu.gpr[1]),
+            system::SYSCALL => sce && s.cpu.code_mode() == Some(CodeMode::Bits64),
+            system::SYSRET => sce && s.cpu.cpl == 0 && (i.size != 8 || paging::canonical(s.cpu.gpr[1])),
+            system::SYSENTER => msr_get(cpu::msr(cpu::MSR_SYSENTER_CS).unwrap()) & 0xfffc != 0,
             _ => false,
         };
     if !commits {
@@ -790,7 +794,12 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     s.linker += 1;
     s.l2_hits += 1;
     system(s, i);
-    if s.debug != 0 || s.cpu.rflags & RFLAGS_TF != 0 || !events::none(s) {
+    // (SYSRETL into 32-bit code whose segments translated code cannot run, `Cpu::compat_refused`: `find` raises its #GP.)
+    if s.debug != 0
+        || s.cpu.rflags & RFLAGS_TF != 0
+        || !events::none(s)
+        || (s.cpu.seg[SREG_CS].attributes & ATTR_L == 0 && s.cpu.compat_refused().is_some())
+    {
         declined(s, rip, SysFastDecline::After);
         unsafe { after_system(ran, generation) }
     }
@@ -950,7 +959,7 @@ fn declined(s: &State, rip: u64, reason: SysFastDecline) {
     {
         let syscall = |b: &Block| {
             b.flags & cache::SYSTEM != 0
-                && matches!(cache::system_of(b).kind, system::SYSCALL | system::SYSRET)
+                && matches!(cache::system_of(b).kind, system::SYSCALL | system::SYSRET | system::SYSENTER)
         };
         if reason == SysFastDecline::After
             || cache::kept_at(rip, s.cpu.code_context()).is_some_and(syscall)
