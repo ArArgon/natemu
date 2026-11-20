@@ -40,8 +40,20 @@ argv = ["tools/fexc/check_sites.py", "--known-ok", "{fexc}"]
 argv = ["tools/fexc/check_sites.py", "--slice1", "{fexc}"]
 smoke = true
 
-[suite.cases."fexc-precision"]
-argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py"]
+# verify_precision.py in four shards (--shard I/N: every 4th program of each corpus): the programs are checked one by one,
+# independently, and as one case the check ran 6 to 7 minutes on one core.
+[suite.cases."fexc-precision-0"]
+argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--shard", "0/4"]
+
+[suite.cases."fexc-precision-1"]
+argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--shard", "1/4"]
+
+[suite.cases."fexc-precision-2"]
+argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--shard", "2/4"]
+
+[suite.cases."fexc-precision-3"]
+argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--shard", "3/4"]
+
 
 [suite.cases."fexc-skips"]
 argv = ["tools/fexc/scan_skips.py", "{fexc}"]

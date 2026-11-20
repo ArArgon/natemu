@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """S1b1 check: the slice-1 precision guarantee, verified statically on the code fexc emits (profile slice1).
 
-usage: verify_precision.py [--before FEXC0] [CORPUS.json ...]      (fexc from $FEXC, else the series20 build)
+usage: verify_precision.py [--before FEXC0] [--shard I/N] [CORPUS.json ...]      (fexc from $FEXC, else the series20 build)
+
+--shard I/N checks every N-th program of each corpus from the I-th (0-based), so N cases can run the check in parallel
+(tests/static: fexc-precision-0..3); each program is checked on its own, so the N shards together check what one run does.
 
 Corpora: fixtures/slice1/programs.json, the single-instruction matrix of scan_skips.py, the adversarial programs below
 (one per precision patch), and every CORPUS.json given (gen_slice1.py format, e.g. a fresh `--seed` corpus).
@@ -915,11 +918,15 @@ def adversarial():
     return progs
 
 
+SHARD = (0, 1)     # (I, N): every N-th program from the I-th (--shard)
+
+
 def run_corpus(label, progs, tmp, before=None):
     """Verify every program; returns (violations, compiled, totals)."""
     bad, ok, sites = 0, 0, 0
     tot = {'g': 0, 'i': 0, 'b': 0, 'g0': 0, 'i0': 0, 'b0': 0, 'guard': 0, 'split': 0, 'branch': 0, 'stub': 0}
     progs = [q for p in progs for q in (check_sites.blocks(p) if 'asm' in p else [p])]   # I2: a REP ends its block
+    progs = progs[SHARD[0]::SHARD[1]]
     for p in progs:
         d = compile_(FEXC, p['code'], p['rip'])
         if d['status'] != 'ok':
@@ -956,11 +963,15 @@ def run_corpus(label, progs, tmp, before=None):
 
 
 def main():
-    global FEXC
+    global FEXC, SHARD
     args = sys.argv[1:]
     before = None
     if '--before' in args:
         k = args.index('--before'); before = args[k + 1]; del args[k:k + 2]
+    if '--shard' in args:
+        k = args.index('--shard'); i, n = map(int, args[k + 1].split('/')); del args[k:k + 2]
+        if not 0 <= i < n: sys.exit(f'--shard {i}/{n}: I must be in 0..N-1')
+        SHARD = (i, n)
     scan_skips.FEXC = FEXC
     fixtures = check_sites.fixture_programs()
     matrix = [{'name': n, 'code': h, 'rip': '0x102000'} for n, h in scan_skips.matrix().items()]
