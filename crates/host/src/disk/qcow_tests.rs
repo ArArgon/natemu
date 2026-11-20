@@ -1339,7 +1339,12 @@ fn other_container_formats_made_by_qemu_img_are_refused_by_name() {
         .status()
         .is_ok_and(|s| s.success())
     {
-        assert!(error(&dmg, true, None).contains("looks like a DMG image"));
+        // hdiutil's helper can keep its lock on the new image for seconds after `create` returns (seen with several
+        // hdiutil runs at once: 70 of 480 opens were refused as "held by another process"); a copy is a new file.
+        let copy = dir.at("copy.dmg");
+        std::fs::copy(&dmg, &copy).unwrap();
+        let e = error(&copy, true, None);
+        assert!(e.contains("looks like a DMG image"), "dmg: {e}");
     } else {
         eprintln!("skipped: DMG fixture: hdiutil failed");
     }
