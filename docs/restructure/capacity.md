@@ -54,6 +54,10 @@ and all 25 file members were independently checked against its
 [hash manifest](../../../natemu-raw/capacity-20261107-01/apic-01.tar.manifest.json).
 This is an internal architectural oracle, without a native/QEMU comparison.
 
+Since November 19 both runners are the `capacity` suite of the smp family, in the campaign tier (not in the gate):
+`tools/natemu-test run --tier campaign tests/smp/family.toml -k capacity`. On the M2 Max all 14 internal checks and all
+6 APIC checks passed again that day (about 2 min 20 s and 25 s).
+
 ## Linux resident-memory check
 
 Both [Linux runs](../../../natemu-raw/capacity-20261107-01/linux-02/capacity-linux.json)

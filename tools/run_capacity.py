@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Capacity regressions: CPU63 ownership, cross-page atomics, high-GPA code/tables and final RAM page.
 
-Run under natemu-raw/.vm.lock. Large-RAM cases sparsely touch boundary pages;
+Run with nothing else on the machine (64 vCPUs): `tools/natemu-test run --tier campaign tests/smp/family.toml -k capacity`
+runs it so (suite capacity). Large-RAM cases sparsely touch boundary pages;
 they do not claim that the host can sustain the full allocation in physical RAM.
 """
 import argparse
@@ -138,10 +139,12 @@ def main():
                     if c['stop'] != 'reached' or got != want:
                         errors.append(f'cpu{v}: stop={c["stop"]}, r8/r9/r10={got}, want={want}')
                     errors += [f'cpu{v}: {e}' for e in vm.per_vcpu_checks(c)]
-            row = dict(name=name, n=n, ram_bytes=ram, place=place, block=block, rc=rc, errors=errors)
+            # name and outcome: the per-case row the test framework reads (testkit/harness/runner.py)
+            row = dict(name=f'{name}-b{block}', case=name, n=n, ram_bytes=ram, place=place, block=block, rc=rc, errors=errors,
+                       outcome='fail' if errors else 'match')
             rows.append(row)
             print(json.dumps(row), flush=True)
-            (a.out / 'results.json').write_text(json.dumps(rows, indent=2) + '\n')
+            (a.out / 'results.json').write_text(json.dumps({'results': rows}, indent=2) + '\n')
             if rc == 'timeout': return 1  # Inspect child cleanup before another VM.
     return int(not rows or any(r['errors'] for r in rows))
 

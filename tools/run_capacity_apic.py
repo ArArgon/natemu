@@ -239,7 +239,8 @@ def main():
                     problems.append(f'malformed/incomplete output: {exc}')
             else:
                 problems.append(f'driver result {rc}; raw stdout/stderr retained')
-            row = dict(kind=kind, max_block=limit, returncode=rc, seconds=time.monotonic() - start,
+            # name and outcome: the per-case row the test framework reads (testkit/harness/runner.py)
+            row = dict(name=f'{kind}-{limit or "default"}', outcome='fail' if problems else 'match', kind=kind, max_block=limit, returncode=rc, seconds=time.monotonic() - start,
                        status='fail' if problems else 'pass', problems=problems, oracle=detail,
                        hashes={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in work.iterdir() if p.is_file()})
             report['results'].append(row)
