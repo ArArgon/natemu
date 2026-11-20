@@ -46,9 +46,17 @@ def test_collect_reports_excluded_with_reason(pytester, family_dir, monkeypatch)
     assert 'excluded: nan-results' in out and 'not-runnable: needs afp' in out
 
 
-def test_gate_fails_on_not_runnable(pytester, family_dir, monkeypatch):
+def test_gate_needs_a_person_to_pass_without_not_runnable(pytester, family_dir, monkeypatch):
     monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=0')
     family_dir('fam')
     assert pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', 'tests').ret == 0
     r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', 'tests')
-    assert r.ret == 1 and 'gate: not passed: 6 not-runnable' in r.stdout.str()
+    assert r.ret == 1 and 'BUT 6 TESTS DID NOT RUN ON THIS MACHINE' in r.stdout.str() and 'gate: not passed: incomplete' in r.stdout.str()
+    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', '--accept-not-runnable', 'tests')
+    assert r.ret == 0 and 'BUT 6 TESTS DID NOT RUN ON THIS MACHINE' in r.stdout.str() and 'passed WITHOUT them' in r.stdout.str()
+
+
+def test_m1_efficiency_cores_have_no_tso():
+    from testkit import host
+    assert host.efficiency_cores_lack_tso('Apple M1') and host.efficiency_cores_lack_tso('Apple M1 Max')
+    assert not host.efficiency_cores_lack_tso('Apple M2') and not host.efficiency_cores_lack_tso('Apple M4 Pro')

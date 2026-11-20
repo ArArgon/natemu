@@ -57,7 +57,7 @@ Besides passed and failed (a failure fails every run, exit status 1):
 | Result | Meaning | Fails the run |
 | --- | --- | --- |
 | excluded | the family's rule says this case does not apply to this variant (the reason is shown) | no |
-| not-runnable | this machine cannot run it, for example a variant that needs AFP on a Mac without it | only a gate (`--gate`), unless covered (below) |
+| not-runnable | this machine cannot run it, for example a variant that needs AFP on a Mac without it | a gate, unless covered or accepted by a person (below) |
 | stale-lock | the test's locked answer no longer fits its inputs, or the case has no answer yet: re-seed | yes |
 | build-failure | an input built here differs from the locked one, or a build failed | yes |
 | unpreparable | a download or other preparation failed (no network, upstream gone) | yes |
@@ -88,7 +88,20 @@ tests/correctness/family.toml -k stress` is the original full-size stress-ng cam
 `TESTKIT_PART_ARGS='stress:scale=1,timeout=240;litmus:'` runs both at full size. A value without `SUITE:` applies to
 every suite of the run that no entry names.
 
-A Mac with every feature (an M4) can pass a gate alone. On a Mac without one, combine runs of the same commit:
+A Mac with every feature (an M4) runs everything alone. On a Mac without one, a gate in which everything that ran passed ends
+not passed, under a red line such as `ALL TESTS PASSED, BUT 8 TESTS DID NOT RUN ON THIS MACHINE`, the list of them and three
+ways to close it, each a later command. Nothing is asked while the run goes (a prompt would block a run nobody watches); an
+agent that ran the gate hands the choice to the user and then runs the command for it:
+
+1. **Ignore those tests (risk: high).** Nothing has checked them on this commit. `tools/natemu-test run --gate --complete
+   RUN --accept-not-runnable` on the same machine runs nothing again and passes the gate without them; the flag records a
+   person's decision and is never a default.
+2. **Run only those tests on a machine that can (risk: medium-low).** There, on the same commit: `tools/natemu-test run
+   --gate --complete RUN` (RUN being the first machine's run folder, copied over) runs only what that run reported
+   not-runnable and gives the verdict of both runs together.
+3. **Run the whole gate again on that machine (risk: low).**
+
+The other way round, a gate can count another machine's run of the same commit:
 `--gate --with-run .natemu/runs/<id-from-the-M4>` counts the variants this Mac cannot run as covered where they passed
 in that run. `--require-real afp` places "AFP absent" variants only on a Mac that really lacks AFP instead of hiding it
 on one that has it.
@@ -114,10 +127,14 @@ harness = "programs"                            # a module in testkit/harness, o
 input = "i8"
 reference = "qemu"                              # what produces the answers when seeding: qemu or x86
 matrix = { "engine.fp" = ["fast", "accurate"], "host.afp" = [true, false] }
-needs = { cores = 1 }                           # or exclusive = true + why, perf = true, dedicated = true
+needs = { cores = 1 }                           # or exclusive = true + why, perf = true, dedicated = true, mixed = true
 smoke = ["i8-forms-000"]
 batch = 64
 ```
+
+`mixed = true` beside `perf = true` lets a case that claims more cores than the Mac has performance cores take the whole
+machine instead, so its vCPU threads also run on efficiency cores (`smp` and `litmus`: two 4-vCPU VMs at once). Not on an
+M1, whose efficiency cores have no TSO: there such a case is not-runnable unless the Mac has that many performance cores.
 
 Each combination of matrix values is its own test, named like `i8-forms-000[afp=False,fp=fast]`. `engine.*` and
 `machine.*` keys are natemu settings; `host.<feature>` keys are requirements on the Mac (features are listed in

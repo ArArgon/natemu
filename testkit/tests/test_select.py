@@ -58,10 +58,34 @@ def test_gate_combines_coverage_across_runs(pytester, family_dir, monkeypatch, t
     monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=0')               # "the M2": the afp=True variants are not runnable
     monkeypatch.setenv('TESTKIT_RUN_DIR', str(tmp_path / 'm2'))
     (tmp_path / 'm2').mkdir()
-    assert pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', 'tests').ret == 1
+    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', 'tests')
+    assert r.ret == 1 and 'DID NOT RUN ON THIS MACHINE' in r.stdout.str(), r.stdout.str()     # not covered: needs a person's acceptance
     r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', '--rootdir', str(pytester.path),
                                       '--with-run', str(tmp_path / 'm4'), 'tests')
-    assert r.ret == 0, r.stdout.str()
+    assert r.ret == 0 and 'DID NOT RUN ON THIS MACHINE' not in r.stdout.str(), r.stdout.str() # covered by the M4's run: nothing to accept
+
+
+def test_a_capable_machine_completes_a_gate_by_running_only_what_was_missing(pytester, family_dir, monkeypatch, tmp_path):
+    family_dir('fam')
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=0')               # "the M2": the afp=True variants are not runnable
+    monkeypatch.setenv('TESTKIT_RUN_DIR', str(tmp_path / 'm2'))
+    (tmp_path / 'm2').mkdir()
+    assert pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', 'tests').ret == 1
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=1')               # "the M4" runs just those
+    monkeypatch.setenv('TESTKIT_RUN_DIR', str(tmp_path / 'm4'))
+    (tmp_path / 'm4').mkdir()
+    r = pytester.runpytest_subprocess('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', '--rootdir', str(pytester.path),
+                                      '--complete', str(tmp_path / 'm2'), 'tests')
+    out = r.stdout.str()
+    assert r.ret == 0 and '6 of its 6 not-runnable tests selected here' in out and '6 passed' in out and 'DID NOT RUN ON THIS MACHINE' not in out, out
+    # option 1, on the first machine again: nothing runs, the acceptance closes its own gate
+    monkeypatch.setenv('NATEMU_TEST_HOST_FEATURES', 'afp=0')
+    monkeypatch.setenv('TESTKIT_RUN_DIR', str(tmp_path / 'm2b'))
+    (tmp_path / 'm2b').mkdir()
+    args = ('-p', 'testkit.plugin', '--testkit-inprocess', '--gate', '--rootdir', str(pytester.path), '--complete', str(tmp_path / 'm2'))
+    assert pytester.runpytest_subprocess(*args, 'tests').ret == 1
+    r = pytester.runpytest_subprocess(*args, '--accept-not-runnable', 'tests')
+    assert r.ret == 0 and 'passed WITHOUT them' in r.stdout.str() and ' passed' not in r.stdout.str().split('DID NOT RUN')[0].split('short test summary')[-1], r.stdout.str()
 
 
 def test_double_star_matches_zero_folders():

@@ -23,9 +23,9 @@ CATEGORIES = {
     'stale-entry': ('!', 'STALE ENTRY'),                # an `expected`/`flaky` entry naming no test of the image: fails
 }
 # Fail every run, gate or not: something the selection asked for could not run here, and no other run is to blame
-# (not-runnable, the machine being too small, fails only the gate, which may cover it with another machine's run).
+# (not-runnable, the machine being too small or lacking a feature, is not a failure: a gate then passes only when another machine's run covers it or a person accepts it, plugin.accepted_without).
 RUN_FAILS = ('stale-lock', 'build-failure', 'unpreparable', 'exclusion-changed')
-GATE_FAILS = ('failed', 'error', 'stale-lock', 'build-failure', 'unpreparable', 'not-runnable', 'exclusion-changed',
+GATE_FAILS = ('failed', 'error', 'stale-lock', 'build-failure', 'unpreparable', 'exclusion-changed',
               'missing', 'unexpected-pass', 'stale-entry')
 
 

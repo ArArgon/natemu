@@ -169,7 +169,10 @@ class Runner:
                 env.update(NATEMU_ANSWERS='seed', NATEMU_ANSWERS_LOG=str(rundir / 'answers' / f'{it.case}.jsonl'))
             qbin = artifacts.qemu_system()           # the pinned QEMU 11.1.2 build (system mode and qemu-img)
             env.update(NATEMU_QEMU_SYSTEM=str(qbin / 'qemu-system-x86_64'), NATEMU_QEMU_IMG=str(qbin / 'qemu-img'),
-                       NATEMU_QEMU_PIN='qemu-system 11.1.2 src', PATH=f'{qbin}:{env.get("PATH", "")}')
+                       NATEMU_QEMU_PIN='qemu-system 11.1.2 src',
+                       # this interpreter's folder too: a case written `env X=... python3 tools/run_x.py` and a runner's own `python3` children
+                       # must not get an older system python3 (/usr/bin's 3.9 has no tomllib, which locked answers read)
+                       PATH=f'{qbin}:{pathlib.Path(sys.executable).parent}:{env.get("PATH", "")}')
             builder = spec.get('builds', False)
             if not builder: env['CARGO_TARGET_DIR'] = str(n.entry)   # runners that find natemu in the target folder get this build
             attempts = 2 if spec.get('rerun', it.suite.rerun) else 1

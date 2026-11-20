@@ -43,6 +43,9 @@ class Needs:
     perf: bool = False
     dedicated: bool = False
     network: bool = False
+    # with `perf` and more cores than the Mac has performance cores: take the whole machine instead (vCPU threads then run on
+    # efficiency cores too). Never on an M1, whose efficiency cores have no TSO: there the claim stays unsatisfiable.
+    mixed: bool = False
 
 
 @dataclasses.dataclass

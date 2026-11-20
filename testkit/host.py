@@ -46,3 +46,10 @@ def _detect() -> Host:
     uuid = re.search(r'"IOPlatformUUID" = "([0-9A-F-]{36})"', _out('ioreg', '-rd1', '-c', 'IOPlatformExpertDevice'))[1]
     return Host(machine_id=uuid, chip=chip.strip(), p_cores=int(p), e_cores=int(e),
                 os_build=_out('sw_vers', '-buildVersion').strip(), features=parse_sysctl(_out('sysctl', 'hw.optional.arm')))
+
+
+def efficiency_cores_lack_tso(chip: str) -> bool:
+    """The M1 family (M1, M1 Pro/Max/Ultra): its efficiency cores have no TSO mode, so guest vCPU threads must stay on
+    performance cores there. Every later chip's efficiency cores have it."""
+    return re.search(r'\bM1\b', chip) is not None
+

@@ -7,6 +7,7 @@ controller replays into its own session, so pytest's terminal output, JUnit and 
 will not run (excluded, not runnable, stale lock, unpreparable) are reported by the controller itself.
 """
 import contextlib
+import dataclasses
 import fcntl
 import json
 import os
@@ -21,7 +22,7 @@ import uuid
 import pytest
 from _pytest.reports import TestReport
 
-from testkit import contention, durations, known_bugs, paths
+from testkit import contention, durations, host, known_bugs, paths
 from testkit.collect import CaseItem
 from testkit.sched import pool as poolmod
 from testkit.sched.policy import GATE, INTERACTIVE, Request
@@ -98,6 +99,9 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
                           label=f'{g[0].fam.name}/{s.name}' + (f'/{chunk[0].case}' if s.kind == 'legacy' else '')
                                 + (f'[{g[0].variant.id}]' if g[0].variant.params else ''),
                           worktree=paths.repo_root().name, run=run)
+            if getattr(nd, 'mixed', False) and pool.unsatisfiable(req) and req.cores <= pool.cfg.p_cores + pool.cfg.e_cores \
+                    and not host.efficiency_cores_lack_tso(host.detect().chip):
+                req = dataclasses.replace(req, exclusive=True)
             if pool.unsatisfiable(req):
                 refused += [(it, 'not-runnable', f'needs {req.cores} cores; this machine has {pool.cfg.p_cores} '
                                                  f'performance and {pool.cfg.e_cores} efficiency cores') for it in chunk]

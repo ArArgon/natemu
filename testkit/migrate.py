@@ -62,6 +62,7 @@ def main() -> int:
         else:
             if s.w > 1 or s.name in CORES: needs['cores'] = CORES.get(s.name, s.w)
             if not any(fnmatch.fnmatch(s.name, p) for p in run_suite.E_OK): needs['perf'] = True
+            if s.name in CORES: needs['mixed'] = True      # the whole machine where performance cores are too few (not an M1)
         case = {'argv': argv, 'needs': needs, 'smoke': any(fnmatch.fnmatch(s.name, p) for p in run_suite.QUICK),
                 'builds': s.name in BUILDERS, 'rerun': s.phase == 'ser'}
         if s.judge: case['judge'] = f'judges:{s.judge.__name__}'

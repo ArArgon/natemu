@@ -257,8 +257,10 @@ Anti-goals (would make the refactor a failure even if it technically works):
   gate that missed one is incomplete, not passed. Coverage may be combined across runs of the same tested commit, so
   machines used one after another can complete a gate together. **[proposed]**
 - R5.8 A gate passes only when every selected test passed: a stale lock, a seeding or build failure, an unpreparable
-  resource, a not-runnable variant or an unexpected change in a family's exclusions (R2.13) each mean the gate did not
-  pass, and the report says which. **[review call]**
+  resource or an unexpected change in a family's exclusions (R2.13) each mean the gate did not pass, and the report
+  says which. **[review call]** A test this machine cannot run (not-runnable: too few cores, a missing feature) does
+  not pass silently either: unless another machine's run covers them (R5.7), the gate ends incomplete, lists them loudly with the ways
+  to close it and their risk, and passes without those results only on a person's explicit decision (no prompt: a later command). **[owner, November 19]**
 
 ### R6. Selection and iteration
 

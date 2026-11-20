@@ -90,6 +90,11 @@ def pytest_collection_modifyitems(session, config, items):
                 tr.write_line(f'testkit: {len(unmapped)} changed file(s) no family covers (widen with --tier gate or name them):')
                 for f in unmapped[:20]: tr.write_line(f'    {f}')
     kept = [i for i in items if not isinstance(i, CaseItem) or keep(i, tier, chosen)]
+    from testkit import plugin
+    if (first := plugin.run_to_complete(config)) is not None:     # --complete RUN: only what that run could not run
+        missing = {n for n, o in first.items() if o == 'not-runnable'}
+        kept = [i for i in kept if i.nodeid in missing]
+        if tr: tr.write_line(f'testkit: completing {config.getoption("complete")}: {len(kept)} of its {len(missing)} not-runnable tests selected here')
     dropped = [i for i in items if i not in kept]
     if dropped: config.hook.pytest_deselected(items=dropped)
     items[:] = kept
