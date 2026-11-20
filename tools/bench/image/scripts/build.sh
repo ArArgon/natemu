@@ -33,6 +33,9 @@ rm -f ./*.deb; apt-get download -qq $P
 sha256sum ./*.deb > "$B/out/debs.sha256"
 rm -rf "$S"; mkdir -p "$S"; for d in ./*.deb; do dpkg -x "$d" "$S"; done
 for l in lib lib64 bin sbin; do ln -sfn usr/$l "$S/$l"; done
+# (gcc's 32-bit multilib, for the 32-bit builds below: the packages' /lib32 goes under usr like lib and lib64)
+if [ -d "$S/lib32" ] && [ ! -L "$S/lib32" ]; then mkdir -p "$S/usr/lib32"; cp -a "$S/lib32/." "$S/usr/lib32/"; rm -rf "$S/lib32"; fi
+ln -sfn usr/lib32 "$S/lib32"
 
 # 2. Sources and input, checked against pinned hashes.
 cd "$B/src"
@@ -78,6 +81,11 @@ CC="x86_64-linux-gnu-gcc-14 --sysroot=$S"; CXX="x86_64-linux-gnu-g++-14 --sysroo
 $CC -O2 -static -pthread -o "$B/out/bin/locks" locks.c
 rm -rf rt-tests-2.8; tar xzf rt-tests-2.8.tar.gz
 $CC -O2 -static -pthread -DVERSION=2.8 -Wno-incompatible-pointer-types -o "$B/out/bin/hackbench" rt-tests-2.8/src/hackbench/hackbench.c
+# 32-bit builds of three of the programs (M2: 32-bit code under the 64-bit kernel), as Debian builds its i386 packages: gcc -m32 is
+# i686 with x87 floating point, no SSE. They are not run here (an amd64 container on a Mac cannot run 32-bit code), so their
+# outputs have no pinned hash: the guest prints them and checks the exit status.
+CC32="$CC -m32"
+$CC32 -O2 -static -pthread -DVERSION=2.8 -Wno-incompatible-pointer-types -o "$B/out/bin/hackbench32" rt-tests-2.8/src/hackbench/hackbench.c
 rm -rf zstd-prog; mkdir zstd-prog; tar xzf zstd-1.5.7.tar.gz -C zstd-prog --strip-components=1
 make -s -C zstd-prog/programs -j4 zstd CC="$CC" HAVE_ZLIB=0 HAVE_LZMA=0 HAVE_LZ4=0 LDFLAGS=-static
 cp zstd-prog/programs/zstd "$B/out/bin/"
@@ -95,6 +103,7 @@ rm -rf cray-src; mkdir cray-src; tar xzf c-ray-1.1.tar.gz -C cray-src --strip-co
 $CC -O3 -ffast-math -msse4.2 -static -o "$B/out/bin/c-ray-mt" cray-src/c-ray-mt.c -lm -lpthread
 # c-ray-strict: the same source without -ffast-math (so no crtfastmath/set_fast_math: MXCSR DAZ and FTZ stay clear).
 $CC -O3 -msse4.2 -static -o "$B/out/bin/c-ray-mt-strict" cray-src/c-ray-mt.c -lm -lpthread
+$CC32 -O3 -ffast-math -static -o "$B/out/bin/c-ray-mt32" cray-src/c-ray-mt.c -lm -lpthread
 cp cray-src/sphfract "$B/out/sphfract"
 # 7-Zip 25.01 (Debian's +dfsg orig tarball, no unRAR): the `7zz` console program, C++ with the C fallbacks (no assembler: USE_ASM
 # unset), static; AES-NI/SHA/CRC code selected at run time by CPUID. `7zz b` is not used: it sizes its passes by measured time.
@@ -107,6 +116,8 @@ rm -rf sqlite-src; mkdir sqlite-src; tar xJf sqlite3_3.46.1.orig.tar.xz -C sqlit
 (cd sqlite-src && ./configure CC="$CC" BCC="$CC" --disable-tcl >/dev/null 2>&1 && make sqlite3.c >/dev/null 2>&1 && sha256sum sqlite3.c > "$B/out/sqlite3.c.sha256")
 $CC -O2 -static -DSQLITE_OMIT_LOAD_EXTENSION -Isqlite-src -o sqlite-src/speedtest1 sqlite-src/test/speedtest1.c sqlite-src/sqlite3.c -lm -lpthread 2>/dev/null
 x86_64-linux-gnu-strip -o "$B/out/bin/speedtest1" sqlite-src/speedtest1
+$CC32 -O2 -static -DSQLITE_OMIT_LOAD_EXTENSION -Isqlite-src -o sqlite-src/speedtest1-32 sqlite-src/test/speedtest1.c sqlite-src/sqlite3.c -lm -lpthread 2>/dev/null
+x86_64-linux-gnu-strip -o "$B/out/bin/speedtest1-32" sqlite-src/speedtest1-32
 # x264 0.164.3108 (git 31e19f9; Debian's orig tarball): 8-bit, static, with its nasm assembly (nasm from the Debian package);
 # the CPU feature set is chosen at run time by CPUID.
 rm -rf x264-src; mkdir x264-src; tar xzf x264_0.164.3108+git31e19f9.orig.tar.gz -C x264-src --strip-components=1

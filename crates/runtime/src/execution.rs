@@ -2573,12 +2573,11 @@ fn system(s: &mut State, i: System) {
     if let Err(e) = transaction(s, i) {
         deliver(s, Event::Exception(e))
     }
+    cache::control().system_counts[(i.kind & 127) as usize] += 1;
     #[cfg(feature = "perf")]
     {
         let c = cache::control();
-        let k = (i.kind & 127) as usize;
-        c.system_counts[k] += 1;
-        c.system_ticks[k] += perf_ticks().wrapping_sub(t0);
+        c.system_ticks[(i.kind & 127) as usize] += perf_ticks().wrapping_sub(t0);
         c.system_from[(p & 31) as usize] += 1;
     }
     crate::perf::leave(p);
@@ -3666,6 +3665,7 @@ unsafe fn aborted(f: &NativeFrame) -> ! {
             // (Each firing counts: from [`natemu_abi::execution::STACK_TRAP_LIMIT`] on this vCPU's code context asks for code without the run check.)
             object::kind::STACK if b.flags & cache::STEP == 0 => {
                 s.cpu.stack_traps += 1;
+                cache::control().stack_checks += 1;
                 step_from(s, f, b, &site)
             }
             _ => access_aborted(s, f, b, &site, [esr, far, elr, spsr]),

@@ -770,8 +770,9 @@ pub mod cache {
         pub reuse_copies: u64,
         pub reuse_refused: [u64; 5],
         pub reuse_checks: u64,
-        /// Perf chunk 12 (written by a `perf` resident only): system instructions executed, by kind
-        /// ([`super::System::kind`] modulo 128), with the CNTVCT ticks of their transactions; by the perf bucket current
+        /// Perf chunk 12: system instructions executed, by kind ([`super::System::kind`] modulo 128; a plain increment in
+        /// every build, the fast paths' SYSCALL/SYSRET-class instructions not included), and, written by a `perf` resident
+        /// only, the CNTVCT ticks of their transactions; by the perf bucket current
         /// when each began (the resident entry that reached it: `link`, `miss`, ...; modulo 32); and those that followed
         /// another system instruction in the same block search (no block between them).
         pub system_counts: [u64; 128],
@@ -910,6 +911,9 @@ pub mod cache {
         /// (`crate::writers::count`).
         pub writer_epochs: [u64; 3],
         pub writers: [u64; crate::writers::count::COUNT],
+        /// M2 task 4: firings of the stack alignment check ([`super::Cpu::stack_traps`] is the same count per address
+        /// space). A plain counter in every build. Appended.
+        pub stack_checks: u64,
     }
     /// A segment of the code area while splitting (hot/cold layout): its hot zone (the dense hot copies, from the segment's
     /// start) and then the whole code of its blocks, up to the segment's end; every word of one is within a `tbz`'s reach (32
