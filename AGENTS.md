@@ -20,8 +20,11 @@ names it. Before creating or revising error or learning records, read
 ## Testing
 
 Run tests only through `tools/natemu-test`; read [the testing page](docs/testing.md) first. `tools/natemu-test run`
-runs what your change concerns, `--tier smoke` one small case of everything, `--gate` everything; a push or merge needs
-a passing gate at that exact commit. A new test is a case in a family under `tests/`, not a new script. Do not run
+runs what your change concerns, `--tier smoke` one small case of everything, `--gate` everything. The gate is needed
+before a change that can alter what natemu or the tests do merges into `main` or an integration branch; docs-only
+changes and pushes of work branches need none, and the user may explicitly bypass it.
+[When the gate is needed](docs/testing.md#when-the-gate-is-needed) and [how much to run](docs/testing.md#how-much-to-run)
+give the details: iterate on narrow runs and keep heavy runs (gate, stress, benchmarks) to once per change set. A new test is a case in a family under `tests/`, not a new script. Do not run
 `tools/run_suite.py` or start VMs outside the framework's queue, and do not read test inputs from `natemu-raw`: the
 framework builds or downloads them into its cache. Older pages under `docs/restructure/` that say to run
 `run_suite.py` predate this.

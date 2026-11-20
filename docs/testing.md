@@ -10,7 +10,7 @@ checkouts; later runs reuse it. Nothing has to be copied from another machine. T
 ```sh
 tools/natemu-test run                     # the tests your change concerns (the "affected" tier)
 tools/natemu-test run --tier smoke        # one small case of everything, plus all unit tests
-tools/natemu-test run --gate              # everything: what must pass before a push or merge
+tools/natemu-test run --gate              # everything: what must pass before a merge that needs it (below)
 tools/natemu-test run tests/fp            # one family; any pytest selection works (-k, node ids)
 ```
 
@@ -49,6 +49,43 @@ At the end of every run a `times` section says where the time went: start-up and
 built and what came from the cache), the tests themselves, and the report, with each family's share and its longest
 unit. `tools/natemu-test times [RUN] --detail` shows it again later with the cleanup after the run, every unit split
 into queue, start-up and test time, and the slowest requirements to prepare.
+
+## When the gate is needed
+
+The full gate (`--gate`, passing at that exact commit) is for changes that can alter what natemu or the tests do,
+before they merge into `main` or an integration branch:
+
+- code on a shared path: code identity, dispatcher and lookup tables, resident entry and exit, register save,
+  admission, the FEX fork or fexc's output;
+- the build: toolchain or dependency pins, build flags, the FEX submodule;
+- the test framework itself: `testkit/`, harnesses, locks, generators;
+- a change set that closes a plan's task or checkpoint.
+
+Everything else gets `tools/natemu-test run` (the affected families plus every family's smoke cases): a change confined
+to one area the framework attributes to its families, and new or changed test cases. If `run` lists files no family
+claims, attribute them or run the gate.
+
+No gate at all for docs, comments, plans and READMEs, or for pushing a work branch; its gate comes when it merges.
+
+**Exception:** the user may explicitly bypass the gate for a given merge or push. Record the bypass (in the commit
+message or the merge description) and the tier that did run.
+
+## How much to run
+
+Iterate quickly and run heavy tests rarely, without giving up the gate:
+
+- **While iterating:** run the family or the cases the change concerns (`tools/natemu-test run tests/fp -k ...`), plus
+  the cases the change adds or alters.
+- **At the end of each task, and at once after a change to something every block or exit passes through** (code
+  identity, dispatcher and lookup tables, resident entry and exit, register save, admission, the FEX fork's output):
+  `tools/natemu-test run`, which adds every family's smoke cases and the affected families. A narrow run cannot see
+  how far such a change reaches.
+- **Heavy runs, once per change set, in the queue:** `--gate`, multi-vCPU stress, campaign boots and benchmarks run
+  when a change set's fixes are all in, not between fixes. Where the gate is needed (above), it passes at that exact
+  commit unless the user explicitly bypasses it.
+- **Benchmarks where they decide something,** and at the milestones a plan names.
+- **A failure in a heavy run** sends the work back to quick iteration, with the failing case added to the narrow set.
+- **Report which tier ran.** A narrow or affected pass never stands in for the gate.
 
 ## What a result means
 

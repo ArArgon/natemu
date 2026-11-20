@@ -126,9 +126,11 @@ left in MU. If a P3 item turns out to have a dependency, it is promoted to P1 or
 
 - **P1** Test and results hygiene (item 1), qcow2 (item 2).
 - **P1** Merge the ready branches (CPU features, floating-point fast mode).
-- **P1** Finish accurate floating-point mode and the 80-bit x87 path (in progress).
+- **P1** Finish accurate floating-point mode (in progress): the exact behaviours hosts without Arm's alternate
+  floating-point feature (AFP) need.
 - **P1** Configuration format and device list (item 4), with multi-disk including
   read-only ISO disks (M3 and M4 need them).
+- **P3** An accurate 80-bit x87 path (optional; fast mode keeps x87 in double precision).
 - **P3** The deferred correctness pass: large-scale differential testing against real
   x86 behaviour, real workloads, re-checking decisions inferred from QEMU.
 - **P3** Disk-only snapshots, which come with qcow2 backing files if that stays cheap.

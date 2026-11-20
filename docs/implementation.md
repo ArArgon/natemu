@@ -346,7 +346,8 @@ contain). Each takes `--fexc FEXC --out DIR` and runs under `./tools/with-env`.
 
 **Running the suite.** Every test runs through `tools/natemu-test` ([docs/testing.md](testing.md)), on any Apple Silicon
 Mac: `tools/natemu-test run` for the tests a change concerns, `--tier smoke` for one small case of everything, and
-`tools/natemu-test run --gate` for everything. A passing gate at the exact commit is what a push or merge needs. Do not
+`tools/natemu-test run --gate` for everything. A passing gate at the exact commit is what a merge of a behaviour-changing change needs ([when the gate is
+needed](testing.md#when-the-gate-is-needed)). Do not
 run `tools/run_suite.py`: nothing is judged by it any more. The file stays only because its step list is what
 `python3 -m testkit.migrate` generates the runner families from, and the benchmark family and a few `tools/test_*.py`
 tests still import it. The single runners above can still be run directly while debugging one of them. The framework
