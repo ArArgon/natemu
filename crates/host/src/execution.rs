@@ -4245,6 +4245,9 @@ fn translation(
         compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
         compiler.push_run = state.cpu.stack_traps < exec::STACK_TRAP_LIMIT;
+        // M2: the code segment's mode. (No request is made from 32-bit code yet: the resident stops
+        // `unsupported_code_mode` before asking, until it runs 32-bit code, task 3.)
+        compiler.bits32 = state.cpu.code_mode() == Some(exec::CodeMode::Compat32);
         if !step {
             compiler.note_gating(state.cpu.code_context())?;
         }
