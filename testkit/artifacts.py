@@ -197,7 +197,8 @@ def fexc_at(rev: str) -> pathlib.Path:
             shutil.rmtree(scratch, ignore_errors=True)
             subprocess.run(['git', '-C', str(root / 'third_party/FEX'), 'worktree', 'prune'], capture_output=True)
 
-    return cache.get_or_build('fexc-at', cache.key('fexc-at-v1', tree, pin), build) / 'fexc'
+    # (this checkout's build.sh builds it, so it is part of the key)
+    return cache.get_or_build('fexc-at', cache.key('fexc-at-v1', tree, pin, (root / 'tools/fexc/build.sh').read_bytes()), build) / 'fexc'
 
 
 def base_rev() -> str:
