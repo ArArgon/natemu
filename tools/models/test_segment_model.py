@@ -179,12 +179,14 @@ class Transfers(unittest.TestCase):
         self.assertEqual((r['fault'][:2], r['deviation'], r['state']['cpl']), ((dm.GP, 0), False, 0))
         # Segments natemu does not run 32-bit code with: the deviation, #GP(selector) at the target after the IRET.
         deviation = lambda r: (r['fault'][:2], r['deviation'], r['fault_rip'], r['state']['cpl'], r['state']['rsp'])
-        for state, selector in ((self.compat(ds=(0x10, 0xC093)), 0),                    # DS (DPL 0) nulled by the return
-                                (self.compat(cs=m.code(3, l=0, d=0)), 0x48),              # a 16-bit code segment
+        for state, selector in ((self.compat(cs=m.code(3, l=0, d=0)), 0x48),              # a 16-bit code segment
                                 (self.compat(es=(0x1B, 0xC0F1)), 0x18),                   # ES read-only
                                 (dict(self.compat(), shape={'ds': (0x1000, 0xFFFFFFFF)}), 0x18)):   # DS with a base
             self.assertEqual(deviation(m.iret(push(state, 0x40_2000, 0x4B, 0x202, 0x7000, 0x1B))),
                              ((dm.GP, selector), True, 0x40_2000, 3, 0x7000))
+        # A DS the return nulls (DPL 0) runs: its first use faults (null_access).
+        r = m.iret(push(self.compat(ds=(0x10, 0xC093)), 0x40_2000, 0x4B, 0x202, 0x7000, 0x1B))
+        self.assertEqual((r['outcome'], r['state']['seg']['ds'], m.null_access(r['state'], 'ds')['fault'][:2]), ('done', (0, 0), (dm.GP, 0)))
         # A stack segment with a base (0x50 at DPL 3): the same, naming SS.
         s = self.compat()
         dm.place(s['memory'], GDT + 0x50, m.data(3, base=0x1234_5678).to_bytes(8, 'little'))

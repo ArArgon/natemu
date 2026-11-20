@@ -106,7 +106,7 @@ Accepted (FEX's behaviour, or ours already):
   through it must #GP, not read at base 0. **Recommended (owner: gate it):** a translation-time gate, like the existing
   feature gates in the code identity: in 32-bit code, "FS null" and "GS null" are identity bits, and an FS- or
   GS-prefixed access under them compiles to a #GP stub. Exact, nothing at run time; bits 3-8 of the identity are free.
-  The flat check covers CS/DS/ES/SS only.
+  The flat check covers CS/DS/ES/SS only. (Built in task 3a, and for a null DS and ES as well: identity bits 5 to 8.)
 - **Default segments are flat and limits are never checked**, as in FEX. That matches 32-bit Linux exactly.
 - **x87 arithmetic keeps honouring the x87 rounding mode** after the cast fix (see the cast problem), so the fix adds
   no deviation.

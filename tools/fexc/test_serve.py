@@ -133,7 +133,7 @@ def adversarial():
                 FIXED + ['--x87-gated', '--wait-gated'], FIXED + ['--x87-fpcr', '0x400000'],
                 FIXED + ['--sse-gated', '--avx-gated', '--alignment-gated', '--x87-gated', '--wait-gated', '--x87-fpcr', '0xc00000'],
                 # M2 task 3a: slice1 32-bit code and its null FS/GS arguments (which 64-bit code ignores), between 64-bit requests
-                FIXED + ['--bitness', '32'], FIXED + ['--bitness', '32', '--fs-null'], FIXED + ['--bitness', '32', '--fs-null', '--gs-null'],
+                FIXED + ['--bitness', '32'], FIXED + ['--bitness', '32', '--fs-null'], FIXED + ['--bitness', '32', '--fs-null', '--gs-null'], FIXED + ['--bitness', '32', '--ds-null', '--es-null'],
                 FIXED + ['--gs-null']]
     return [(f'adv {c.hex()} {" ".join(v)}', v + ['--rip', '0x1000'], c) for c in codes for v in variants]
 

@@ -835,6 +835,8 @@ QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimple
                 'c32-fs-null@1': 'QEMU reads through the null FS at base 0 (a #PF there); SDM Vol.3 3.4.4: #GP(0) for an access through a null segment outside 64-bit mode',
                 'c32-gs-null@1': 'QEMU accesses memory through the null GS at base 0 (a #PF there); SDM: #GP(0)',
                 'c32-gs-null-string@1': 'QEMU reads the string source through the null GS at base 0; SDM: #GP(0)',
+                'c32-ds-null@1': 'QEMU reads through the null DS at base 0 (a #PF there); SDM: #GP(0)',
+                'c32-es-null@1': 'QEMU stores the string element through the null ES at base 0 (a #PF there); SDM: #GP(0)',
                 'c32-limit@1': 'QEMU checks no segment limit (the load runs past 4 GiB into a page fault); SDM Vol.3 5.3: #GP(0) for a doubleword at an offset above the limit - 3',
                 'c32-limit-ss@1': 'QEMU checks no segment limit (the store runs past 4 GiB into a page fault); SDM Vol.3 5.3: #SS(0) through SS',
                 'c32-limit-fetch@1': 'QEMU checks no segment limit (the fetch runs past 4 GiB into a page fault); SDM Vol.3 5.3: #GP(0)'}
@@ -1637,8 +1639,8 @@ def cmd_compat(a, host, runtime):
     """M2 task 3a (tools/bench/smp/compat.py): 32-bit code at CPL 3 under a 64-bit kernel body, judged as S2b's programs
     are (`segment_runs`): the positive programs against QEMU system mode run as an Intel processor (IRETQ into 32-bit
     code and the 64 -> 32 -> 64 round trip of R8..R15 and XMM8..15, exact page faults, SYSENTER/SYSRETL and INT 0x80,
-    addresses that wrap at 4 GiB), single instructions against segment_model and syscall_model (SYSCALL's #UD, a null FS
-    or GS, the 4 GiB limit, natemu's deviation for a segment it does not run)."""
+    addresses that wrap at 4 GiB, a null DS and ES never used), single instructions against segment_model and
+    syscall_model (SYSCALL's #UD, a null FS, GS, DS or ES, the 4 GiB limit, natemu's deviation for a segment it does not run)."""
     import compat
     report, failures = [], []
     segment_runs(a, host, runtime, system_qemu(a), report, failures, compat.programs())

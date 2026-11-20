@@ -1070,11 +1070,13 @@ The shim sets `fexc_bits32` for the request (not a gating argument: the host's c
   that should wrap at 4 GiB does not. The shim handles both since task 3a (it enters 32-bit code with the registers
   zero-extended and makes an access that aborted above 4 GiB again at the wrapped address:
   [task 3a's findings](../../docs/restructure/m2-task3a-findings.md)).
-- `--fs-null` and `--gs-null` (task 3a; 32-bit code only, from the host's code identity): FS, GS holds a null selector, so
-  an access through it is #GP(0). Such an instruction is a system cut reported as `cut_gated: "null_segment"`, which the
-  resident raises. The access is the explicit memory operand the prefix overrides (a ModRM memory operand but LEA's, a
-  prefetch's or a multi-byte NOP's; moffs; XLAT; the DS:ESI source of MOVS, CMPS and LODS); a prefix on anything else
-  is ignored as before. Not `FexcArg`s: the host keeps no answer of a 32-bit request.
+- `--fs-null`, `--gs-null`, `--ds-null` and `--es-null` (task 3a; 32-bit code only, from the host's code identity): that
+  segment register holds a null selector, so an access through it is #GP(0). Such an instruction is a system cut
+  reported as `cut_gated: "null_segment"`, which the resident raises. An instruction's accesses: the explicit memory
+  operand (a ModRM memory operand but LEA's, a prefetch's or a multi-byte NOP's; moffs; XLAT; the ESI source of MOVS,
+  CMPS and LODS) through the segment of its last segment prefix, else SS for an EBP or ESP base and DS otherwise; the
+  EDI destination of MOVS, CMPS, STOS and SCAS through ES. A prefix on anything else is ignored as before. Not
+  `FexcArg`s: the host keeps no answer of a 32-bit request.
 
 ## Checks
 
