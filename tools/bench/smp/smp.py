@@ -88,7 +88,7 @@ def qemu_args(n, mode, dbg, img, cpu='max', extra=()):
             '-debugcon', f'file:{dbg}', '-kernel', str(img), *extra]
 
 
-def default_cpu(prog): return SYSTEM_CPU if prog.get('system') else 'max'
+def default_cpu(prog): return prog.get('cpu') or (SYSTEM_CPU if prog.get('system') else 'max')   # `cpu`: the program's own model (compat.py)
 
 
 def answer_key(prog, img, mode='multi', extra=(), cpu=None):

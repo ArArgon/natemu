@@ -8,8 +8,8 @@
 //!   SS := STAR[47:32] + 8 (unmasked, as the SDM writes it) with the SDM's fixed flat attributes (no descriptor is read), CPL 0, RIP := IA32_LSTAR. No stack switch.
 //! - SYSRET (#UD without EFER.SCE, then #GP(0) at CPL > 0, then #GP(0) for a non-canonical RCX, Intel's check at CPL 0
 //!   before any change): RIP := RCX, RFLAGS := R11 & 3C7FD7H | 2, CS := (STAR[63:48] + 16) | 3 (64-bit) and SS :=
-//!   (STAR[63:48] + 8) | 3 with the fixed attributes, CPL 3. SYSRETL returns to compatibility mode, which is not built
-//!   ([`compatibility`]: it completes, then its target takes #GP(CS) at CPL 3, a recorded deviation). CR0.AM with an AC from R11
+//!   (STAR[63:48] + 8) | 3 with the fixed attributes, CPL 3. SYSRETL (M2 task 3a) returns to 32-bit code: RIP := ECX, CS :=
+//!   STAR[63:48] | 3 with the fixed flat 32-bit attributes. SYSCALL from 32-bit code is #UD (Intel). CR0.AM with an AC from R11
 //!   turns alignment checking on (X2): the SYSRET completes and the next misaligned access at CPL 3 is #AC(0).
 //! - S4, single-step: SYSCALL and SYSRET trap (#DB, DR6.BS) right after themselves when the TF they leave is 1, not when
 //!   TF was 1 at their start: a SYSCALL whose FMASK clears TF enters CPL 0 without a trap, and a SYSRET loading TF = 1
@@ -23,7 +23,7 @@
 //!   RSP := IA32_SYSENTER_ESP, RIP := IA32_SYSENTER_EIP (both canonical: WRMSR checks them).
 //! - SYSEXIT (X1c): #GP(0) when IA32_SYSENTER_CS[15:2] = 0 or CPL > 0, then (REX.W) for a non-canonical RCX or RDX; RSP :=
 //!   RCX, RIP := RDX, CS := (SYSENTER_CS + 32) | 3 (64-bit) and SS := CS + 8, DPL 3, CPL 3; RFLAGS unchanged. Without REX.W
-//!   it returns to compatibility mode (not built): [`compatibility`], as SYSRETL.
+//!   it returns to 32-bit code, which is not built for SYSEXIT (Linux never uses it; M2 task 5): [`compatibility`].
 //! - RDFSBASE..WRGSBASE (#UD without CR4.FSGSBASE, any CPL): 32-bit forms read the low half zero-extended and write the
 //!   zero-extended low half; a 64-bit write of a non-canonical value is #GP(0).
 //! - RDRAND: the next word of the vCPU's entropy pool ([`Entropy`], filled by the host): CF = 1, OF SF ZF AF PF = 0, the
@@ -54,6 +54,8 @@ const SYSRET_FLAGS: u64 = 0x3c_7fd7;
 /// The fixed hidden attributes SYSCALL and SYSRET load (SDM Vol.2 SYSCALL, SYSRET; `Segment::attributes` encoding):
 /// execute/read accessed code, S, P, G and L (64-bit); read/write accessed data, S, P, B, G; DPL 0 or 3.
 const CS64: u16 = 0xa09b;
+/// SYSRETL's: execute/read accessed code, S, P, G and D (32-bit).
+const CS32: u16 = 0xc09b;
 const SS_FLAT: u16 = 0xc093;
 const DPL3: u16 = 3 << 5;
 
@@ -70,7 +72,7 @@ fn flat(selector: u16, attributes: u16) -> Segment {
 }
 
 /// Executes `i` (SWAPGS ..= CLFLUSH, SYSENTER, SYSEXIT). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: SYSCALL or SYSRET
-/// committed to `rip`. On `Err` nothing changed, but after a SYSRET or SYSEXIT to compatibility mode ([`compatibility`]).
+/// committed to `rip`. On `Err` nothing changed, but after a SYSEXIT to compatibility mode ([`compatibility`]).
 pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception> {
     // Perf chunk 12: the fields read, not a copy of the bank (every value is read before the first write).
     let (cpl, efer, cr4, rip, rflags) = (s.cpu.cpl, s.cpu.efer, s.cpu.cr4, s.cpu.rip, s.cpu.rflags);
@@ -85,7 +87,8 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             msr_set(at, gs_base);
         }
         system::SYSCALL => {
-            if efer & EFER_SCE == 0 {
+            // #UD outside 64-bit mode (SDM Vol.2 SYSCALL: the presented CPU is Intel's; AMD's run it from 32-bit code).
+            if efer & EFER_SCE == 0 || s.cpu.code_mode() != Some(CodeMode::Bits64) {
                 return Err(UD);
             }
             let selector = (msr_get(slot(cpu::MSR_STAR)) >> 32) as u16;
@@ -123,10 +126,12 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             let base = (msr_get(slot(cpu::MSR_STAR)) >> 48) as u16;
             s.cpu.rflags = rflags;
             s.cpu.seg[SREG_SS] = flat(base.wrapping_add(8) | 3, SS_FLAT | DPL3);
-            if !wide {
-                return compatibility(s, base | 3, rip);
-            }
-            s.cpu.seg[SREG_CS] = flat(base.wrapping_add(16) | 3, CS64 | DPL3);
+            // SYSRETL (M2 task 3a): CS := STAR[63:48] | 3, a flat 32-bit code segment; RIP := ECX.
+            s.cpu.seg[SREG_CS] = if wide {
+                flat(base.wrapping_add(16) | 3, CS64 | DPL3)
+            } else {
+                flat(base | 3, CS32 | DPL3)
+            };
             set_cpl(s, 3);
             s.debug = s.debug & !debug::STEP
                 | if rflags & RFLAGS_TF != 0 {
@@ -227,7 +232,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
     }
     Ok(None)
 }
-/// SYSRET or SYSEXIT to compatibility mode (owner decision, November 6; compatibility mode is not built): the return
+/// SYSEXIT to compatibility mode (owner decision, November 6; not built until M2 task 5: SYSRETL and IRET are): the return
 /// completes (RFLAGS, SS and RSP as loaded, CPL 3, RIP its target), then the first instruction there takes #GP(`selector`, the
 /// 32-bit CS): a recorded deviation (x86 runs it) that the OS sees as a fault in its program. Not at the instruction, as far
 /// transfers are ([`segments`]): an OS returns by SYSRET with the user's stack and GS base already loaded, so a fault at CPL 0

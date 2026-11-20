@@ -2583,8 +2583,9 @@ pub const EFER_NXE: u64 = 1 << 11;
 pub enum CodeMode {
     /// 64-bit mode: CS.L = 1, CS.D = 0.
     Bits64 = 1,
-    /// Compatibility mode, CS.L = 0, with CS.D = 1 (32-bit) or 0 (16-bit). Not run yet (M2): every place that needs a
-    /// 64-bit CS stops `unsupported_code_mode` ([`stop::UNSUPPORTED_CODE_MODE`]) on these.
+    /// Compatibility mode, CS.L = 0, with CS.D = 1 (32-bit) or 0 (16-bit). 32-bit code runs at CPL 3 with flat segments
+    /// (M2 task 3a, [`Cpu::compat_refused`]); at CPL 0 either stops `unsupported_code_mode`
+    /// ([`stop::UNSUPPORTED_CODE_MODE`]).
     Compat32 = 2,
     Compat16 = 3,
 }
@@ -2621,6 +2622,28 @@ impl Cpu {
             _ => None,
         }
     }
+    /// M2 task 3a: why compatibility-mode code at CPL 3 cannot run under the bank's segments, as the selector to name in
+    /// the #GP that ends it (a recorded deviation: x86 runs such code, translated code would run it wrongly without a
+    /// sign), or `None` when it can (and in 64-bit mode, which ignores these fields). Translated 32-bit code adds no
+    /// CS/DS/ES/SS base and checks no limit or access right, so it runs only 32-bit code (CS.D = 1) on a 32-bit stack
+    /// (SS.B = 1) with all four flat: base 0, limit 4 GiB, and for SS/DS/ES a present, writable, expand-up data segment
+    /// (a null DS or ES, which x86 faults on at its first use, is refused here before any). Checked where the code
+    /// identity is chosen (the resident's `find`), not at segment loads: a based DS loaded in 64-bit code is legal.
+    pub fn compat_refused(&self) -> Option<u16> {
+        if self.code_mode() == Some(CodeMode::Bits64) {
+            return None;
+        }
+        let flat = |s: &Segment| s.base == 0 && s.limit == u32::MAX;
+        let data = |s: &Segment| flat(s) && s.attributes & 0x9e == 0x92;
+        let (cs, ss) = (&self.seg[SREG_CS], &self.seg[SREG_SS]);
+        if self.code_mode() != Some(CodeMode::Compat32) || !flat(cs) {
+            return Some(cs.selector);
+        }
+        if !data(ss) || ss.attributes & ATTR_D == 0 {
+            return Some(ss.selector);
+        }
+        [SREG_DS, SREG_ES].into_iter().map(|r| &self.seg[r]).find(|s| !data(s)).map(|s| s.selector)
+    }
     /// x86 alignment checking is on (SDM Vol.3 7.15 #AC: CR0.AM, RFLAGS.AC and CPL 3; X2).
     pub fn alignment_check(&self) -> bool {
         self.cr0 & CR0_AM != 0 && self.rflags & RFLAGS_AC != 0 && self.cpl == 3
@@ -2646,7 +2669,10 @@ impl Cpu {
     }
     /// What code at a RIP is compiled and cached under besides the RIP and its source bytes (K1: not CR3; a block's
     /// guest-physical source pages are checked against the current tables instead): a word of the CPL, the code mode
-    /// (bits 4:2, [`CodeMode`]: 64-bit is 1, the bit 2 every identity had before the field; 0 when there is none), and
+    /// (bits 4:2, [`CodeMode`]: 64-bit is 1, the bit 2 every identity had before the field; 0 when there is none), in
+    /// 32-bit code a null FS and a null GS (bits 5 and 6, M2 task 3a: an access through a null segment is #GP(0) there,
+    /// SDM Vol.3 3.4.4, so a translation cuts every FS- or GS-prefixed access under them; 64-bit mode uses a null
+    /// segment's base, so no bit), and
     /// the SSE gating bits (I5a: CR0.EM, CR0.TS, CR4.OSFXSR; a translation cuts every SSE form when they gate it, so a
     /// block is never entered under other gating than it was made for, even should a control change ever keep the
     /// code), CR0.MP (I6: WAIT's gating with TS), the x87 rounding when it differs from MXCSR's (bit 14 and FCW.RC in
@@ -2657,11 +2683,17 @@ impl Cpu {
     pub fn avx_enabled(&self) -> bool {
         self.cr4 & CR4_OSXSAVE != 0 && self.xcr0 & 6 == 6
     }
+    /// M2 task 3a: `sreg` (FS or GS) holds a null selector while 32-bit code runs ([`Self::code_context`] bits 5, 6).
+    pub fn null_segment(&self, sreg: usize) -> bool {
+        self.code_mode() == Some(CodeMode::Compat32) && self.seg[sreg].attributes & ATTR_P == 0
+    }
     pub fn code_context(&self) -> u64 {
         let bit = |on: bool, n: u32| u64::from(on) << n;
         let word = self.cpl & 3
             | self.code_mode().map_or(0, |m| m as u64) << 2
-            // (Bits 5-8 are free. Bits 3-8 held CR0.PG/WP, CR4.PGE/PCIDE/SMEP and EFER.NXE before K1: a change of one is
+            | bit(self.null_segment(SREG_FS), 5)
+            | bit(self.null_segment(SREG_GS), 6)
+            // (Bits 7-8 are free. Bits 3-8 held CR0.PG/WP, CR4.PGE/PCIDE/SMEP and EFER.NXE before K1: a change of one is
             // a global TLB flush, after which a block's fetch is walked again under the new controls before it runs.)
             | bit(self.cr0 & CR0_EM != 0, 9)
             | bit(self.cr0 & CR0_TS != 0, 10)
@@ -2918,6 +2950,9 @@ pub mod system {
     /// "Exceeding the instruction length limit of 15 bytes"; `length` is not used). A fetch fault within its first 15 bytes
     /// comes first (fexc reports `partial_decode` there); the 16th byte is never fetched (natemu policy).
     pub const TOO_LONG: u32 = 48;
+    /// M2 task 3a: an access through FS or GS while it holds a null selector, in 32-bit code (fexc cut it, `--fs-null`,
+    /// `--gs-null`): #GP(0) (SDM Vol.3 3.4.4; `length` is not used).
+    pub const NULL_SEGMENT: u32 = 0x52;
     /// `System::base` of a RIP-relative operand (relative to the next instruction).
     pub const RIP: u32 = 16;
     pub const NO_REG: u32 = 0xff;
@@ -3151,7 +3186,7 @@ pub mod system {
                             && (0..=0xffff).contains(&self.disp)
                     }
                     INT => self.cr < 256,
-                    INT3 | INT1 | INTO | UD | TOO_LONG | REFUSED => true,
+                    INT3 | INT1 | INTO | UD | TOO_LONG | NULL_SEGMENT | REFUSED => true,
                     SWAPGS | SYSCALL | WBINVD | CLTS | SYSENTER => true,
                     SMSW => rm && matches!(self.size, 2 | 4 | 8),
                     LMSW => rm,
@@ -5062,9 +5097,57 @@ mod tests {
             assert_eq!(c.code_mode(), mode, "{attributes:#x}");
             assert_eq!(c.paging(), cpu.paging(), "{attributes:#x}");
             assert_eq!(c.code_context() >> 2 & 7, mode.map_or(0, |m| m as u64));
-            assert_eq!(c.code_context() & !(7 << 2), cpu.code_context() & !(7 << 2));
+            // (Bits 5 and 6: the null FS and GS of `flat_segments`, in 32-bit code only.)
+            let null = if mode == Some(CodeMode::Compat32) { 3 << 5 } else { 0 };
+            assert_eq!(c.code_context() & !(7 << 2), cpu.code_context() & !(7 << 2) | null);
         }
         assert_eq!(cpu.code_context() & 0x1ff, 3 | 1 << 2); // CPL 3, 64-bit: unchanged by the field
+    }
+
+    /// M2 task 3a: 32-bit code runs at CPL 3 only with flat CS/SS/DS/ES (else the selector the deviation's #GP names);
+    /// a null FS or GS is a code identity bit there, and FS and GS may have any base.
+    #[test]
+    fn compat_segments_that_run() {
+        // SAFETY: `Cpu` is plain integers.
+        let mut cpu: Cpu = unsafe { core::mem::zeroed() };
+        (cpu.cr0, cpu.cr4, cpu.efer, cpu.cpl) = (CR0_PE | CR0_PG, CR4_PAE, EFER_LME | EFER_LMA, 3);
+        let data = Segment::loaded(0x2b, 0x00cf_f300_0000_ffff);
+        cpu.seg = [data; 6];
+        cpu.seg[SREG_CS] = Segment::loaded(0x23, 0x00cf_fb00_0000_ffff);
+        assert_eq!((cpu.code_mode(), cpu.compat_refused()), (Some(CodeMode::Compat32), None));
+        assert_eq!(cpu.code_context() & 0x7f, 3 | 2 << 2);
+        let with = |sreg: usize, selector: u16, raw: u64| {
+            let mut c = cpu;
+            c.seg[sreg] = Segment::loaded(selector, raw);
+            c
+        };
+        for (sreg, raw) in [
+            (SREG_CS, 0x000f_fb00_0000_ffffu64), // 16-bit code
+            (SREG_CS, 0x00cf_fb00_0010_ffff),    // a base
+            (SREG_CS, 0x004f_fb00_0000_ffff),    // a 1 MiB limit
+            (SREG_SS, 0x008f_f300_0000_ffff),    // a 16-bit stack (B = 0)
+            (SREG_SS, 0x01cf_f300_0000_ffff),    // a base
+            (SREG_DS, 0x00cf_f100_0000_ffff),    // read-only
+            (SREG_DS, 0x00cf_f700_0000_ffff),    // expand-down
+            (SREG_ES, 0x00cf_fb00_0000_ffff),    // code
+            (SREG_ES, 0x00cf_7300_0000_ffff),    // not present
+        ] {
+            assert_eq!(with(sreg, 0x53, raw).compat_refused(), Some(0x53), "{sreg} {raw:#x}");
+        }
+        // A null DS (as an outer return leaves a DPL 0 one) is refused; null FS and GS are identity bits; a base in
+        // either is fine. 64-bit code ignores all of it.
+        let mut null = cpu;
+        null.seg[SREG_DS] = Segment::NULL;
+        assert_eq!(null.compat_refused(), Some(0));
+        (null.seg[SREG_DS], null.seg[SREG_FS]) = (data, Segment::NULL);
+        assert_eq!((null.compat_refused(), null.code_context() >> 5 & 3), (None, 1));
+        null.seg[SREG_GS] = Segment { base: 0x1000, ..Segment::NULL };
+        assert_eq!(null.code_context() >> 5 & 3, 3);
+        let based = with(SREG_GS, 0x53, 0x12cf_f300_0000_ffff);
+        assert_eq!((based.compat_refused(), based.code_context() >> 5 & 3), (None, 0));
+        let mut long = with(SREG_DS, 0x53, 0x12cf_f300_0000_ffff);
+        (long.seg[SREG_CS], long.seg[SREG_FS]) = (flat_segments(3)[SREG_CS], Segment::NULL);
+        assert_eq!((long.compat_refused(), long.code_context() & 0x7f), (None, 3 | 1 << 2));
     }
 
     /// M2 task 1: a segment load keeps the descriptor's base and limit for every register (the resident stores

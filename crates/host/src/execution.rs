@@ -2013,7 +2013,8 @@ impl Reply {
 }
 
 /// What fexc answered (errors are not kept): an object, or no code with its end reason and, when the instruction at the RIP
-/// cut the block, its opcode map and opcode and whether its gating cut it (`Some(mmx)`: an MMX form), or (`ud`, I10) whether
+/// cut the block, its opcode map and opcode and whether its gating cut it (`Some`: "mmx" for an MMX form, "null_segment"
+/// for an access through a null FS or GS in 32-bit code, else ""), or (`ud`, I10) whether
 /// fexc found an encoding the presented CPU raises #UD for (reserved or unadvertised: `cut_ud`).
 #[derive(Clone, Debug, PartialEq)]
 enum Answer {
@@ -2021,7 +2022,7 @@ enum Answer {
     Cut {
         reason: String,
         cut: Option<(u8, u8)>,
-        gated: Option<bool>,
+        gated: Option<&'static str>,
         ud: bool,
     },
 }
@@ -2036,7 +2037,11 @@ impl Answer {
             .end;
         Ok(Answer::Cut {
             cut: end.system_cut(rip),
-            gated: end.cut_gated.map(|v| v.as_str() == Some("mmx")),
+            gated: end.cut_gated.map(|v| match v.as_str() {
+                Some("mmx") => "mmx",
+                Some("null_segment") => "null_segment",
+                _ => "",
+            }),
             ud: end.cut_ud.is_some(),
             reason: end.reason,
         })
@@ -2563,6 +2568,10 @@ pub struct Compiler {
     /// persistent cache, no template for the pool or the resident, and no `--push-run` (it assumes 8-byte stack slots).
     /// The answers kept in memory are keyed without the mode, which is why 32-bit requests stay out of them.
     pub(crate) bits32: bool,
+    /// M2 task 3a, 32-bit requests only: FS, GS hold a null selector ([`exec::Cpu::null_segment`], code identity bits 5
+    /// and 6): fexc's `--fs-null` and `--gs-null` cut every access through that segment, which the resident raises as
+    /// #GP(0) ([`exec::system::NULL_SEGMENT`]). Not gating values of the kept answers: 32-bit requests keep none.
+    pub(crate) null_segments: [bool; 2],
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
@@ -2752,6 +2761,7 @@ impl Compiler {
             bulk: false,
             push_run: true,
             bits32: false,
+            null_segments: [false; 2],
             perf: None,
             read: 0,
             halved: false,
@@ -3170,10 +3180,13 @@ impl Compiler {
             } => {
                 // An SSE form cut by its gating (I5a): no operand matters, the resident raises #UD or #NM.
                 // I6: an x87 form or WAIT (primary d8..df, 9b) cut by its gating: #NM. I8: a VEX form (fexc's map 8): #UD or #NM.
-                // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone.
-                let gated_kind = |(map, op): (u8, u8), mmx: bool| {
+                // I9: an MMX form (fexc's `cut_gated` "mmx"): #UD or #NM by CR0.EM/TS alone. M2 task 3a: an access through a
+                // null FS or GS in 32-bit code ("null_segment"): #GP(0).
+                let gated_kind = |(map, op): (u8, u8), gate: &str| {
                     let x87 = map == 0 && matches!(op, 0xd8..=0xdf | 0x9b);
-                    let kind = if mmx {
+                    let kind = if gate == "null_segment" {
+                        exec::system::NULL_SEGMENT
+                    } else if gate == "mmx" {
                         exec::system::MMX_GATED
                     } else if x87 {
                         exec::system::X87_GATED
@@ -3188,14 +3201,15 @@ impl Compiler {
                         ..exec::System::NONE
                     })
                 };
-                // A system cut: the host's decode of it, in 64-bit code only (the resident runs no other mode yet,
-                // `Cpu::code_mode`). FEX and iced reading different instructions there is refused (logged); one that reads
+                // A system cut: the host's decode of it in the request's mode (64-bit code, or 32-bit code: M2 task 3a).
+                // FEX and iced reading different instructions there is refused (logged); one that reads
                 // past the bytes waits for the next page (its fetch fault comes before any #UD).
+                let bitness = if self.bits32 { 32 } else { 64 };
                 let decoded = match cut {
                     Some(c) if gated.is_none() && !*ud => {
-                        let decoded = crate::system::decode(bytes, 64);
+                        let decoded = crate::system::decode(bytes, bitness);
                         if reason == "system_instruction" {
-                            if !crate::system::cut_matches(bytes, 64, *c) {
+                            if !crate::system::cut_matches(bytes, bitness, *c) {
                                 return Ok(Ok(Self::refused("system_opcode_mismatch", bytes, rip)));
                             }
                             if decoded.is_err() {
@@ -3214,7 +3228,7 @@ impl Compiler {
                 });
                 match ud.or_else(|| {
                     cut.and_then(|cut| match gated {
-                        Some(mmx) => gated_kind(cut, *mmx),
+                        Some(gate) => gated_kind(cut, gate),
                         None => decoded,
                     })
                 }) {
@@ -3227,7 +3241,8 @@ impl Compiler {
                     })),
                     // X1c: a form fexc refuses at this RIP that x86 defines as an exception: a direct branch to a non-canonical
                     // target (#GP(0) when taken), or an encoding #UD whatever its operands ([`crate::system::undefined`]).
-                    _ if reason == "unsupported_form" && cut.is_some() => {
+                    // (64-bit code's: a 32-bit target wraps, and the encodings #UD there differ; a refused 32-bit form is logged.)
+                    _ if reason == "unsupported_form" && cut.is_some() && !self.bits32 => {
                         match crate::system::branch(bytes, rip)
                             .or_else(|| crate::system::undefined(bytes))
                         {
@@ -3297,6 +3312,11 @@ impl Compiler {
         if self.bits32 {
             arg(&mut body, b"--bitness");
             arg(&mut body, b"32");
+            for (on, a) in self.null_segments.into_iter().zip([&b"--fs-null"[..], b"--gs-null"]) {
+                if on {
+                    arg(&mut body, a);
+                }
+            }
         }
         if let Some(n) = limit {
             arg(&mut body, b"--max-insts");
@@ -4232,9 +4252,10 @@ fn translation(
         compiler.avx_gated = avx_gated(&state.cpu);
         compiler.x87 = x87_args(&state.cpu, compiler.supported);
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
-        // M2: the code segment's mode. (No request is made from 32-bit code yet: the resident stops
-        // `unsupported_code_mode` before asking, until it runs 32-bit code, task 3.)
+        // M2: the code segment's mode (the resident asks only for 64-bit code and, at CPL 3, 32-bit code with flat
+        // segments: `Cpu::compat_refused`), and in 32-bit code the null FS and GS.
         compiler.bits32 = state.cpu.code_mode() == Some(exec::CodeMode::Compat32);
+        compiler.null_segments = [exec::SREG_FS, exec::SREG_GS].map(|r| state.cpu.null_segment(r));
         // (The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode; fexc refuses them with --bitness 32.)
         compiler.cpl0 = state.cpu.cpl == 0 && !step && !compiler.bits32;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
@@ -4261,6 +4282,7 @@ fn translation(
                 let nop_run = match &code {
                     Code::Block(b)
                         if !step
+                            && !compiler.bits32
                             && b.end_reason
                                 == natemu_abi::code_object::end_reason::SYSTEM_INSTRUCTION
                             && b.guest_bytes <= exec::system::MAX_NOP_RUN =>
@@ -5300,6 +5322,25 @@ mod tests {
         c.bits32 = true;
         assert_eq!(insns(&mut c, 0x1000), 3);
         assert_eq!((c.compiles, c.hits), (5, 0));
+        // M2 task 3a: system cuts are decoded in 32-bit mode (40 is INC EAX before the INT, not a REX prefix), and an
+        // access through a null FS or GS is the #GP cut; the other segment's, and 64-bit code's, are translated.
+        let kind = |c: &mut super::Compiler, code: &[u8]| match c.compile(code, 0x1000, false, &mut ()).unwrap() {
+            Code::System(s) => Some((s.kind, s.cr)),
+            _ => None,
+        };
+        assert_eq!(kind(&mut c, &[0xcd, 0x80]), Some((exec::system::INT, 0x80)));
+        assert_eq!(kind(&mut c, &[0x8e, 0xe8]).map(|k| k.0), Some(exec::system::MOV_TO_SREG)); // mov gs, eax
+        let load = [0x64, 0x8b, 0x03, 0xc3]; // mov eax, fs:[ebx]; ret
+        assert_eq!(kind(&mut c, &load), None);
+        c.null_segments = [false, true];
+        assert_eq!(kind(&mut c, &load), None);
+        c.null_segments = [true, false];
+        let args = String::from_utf8_lossy(&c.body(&load, 0x1000, None)).replace('\0', " ");
+        assert!(args.contains("--fs-null") && !args.contains("--gs-null"), "{args}");
+        assert_eq!(kind(&mut c, &load), Some((exec::system::NULL_SEGMENT, 0)));
+        c.bits32 = false;
+        assert_eq!(kind(&mut c, &load), None);
+        assert!(!String::from_utf8_lossy(&c.body(&load, 0x1000, None)).contains("--fs-null"));
     }
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {

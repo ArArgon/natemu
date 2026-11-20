@@ -6,16 +6,17 @@
 //! CR0.WP decides writes to read-only pages); operand and stack accesses are explicit, at the CPL. The SDM's
 //! accessed-bit write on a segment load and LTR's busy-bit write are real guest writes: a clear A bit in a read-only
 //! GDT page faults, as on hardware. Flat 64-bit only (plan D1, owner decision 3): every load keeps the descriptor's
-//! base and limit (M2 task 1), of which 64-bit mode uses the FS and GS bases alone. Compatibility mode is not built
-//! (owner decision 3): a transfer to a compatibility-mode code segment (CS.L = 0, or L = D = 1) that would run CPL 3
-//! code (JMP/CALL far at CPL 3, RET far or IRET whose new CS has RPL 3, from any CPL) raises #GP(that selector) at the
-//! instruction before any change (owner decision, November 6: a recorded deviation, x86 would run the code; the OS sees
-//! a bad transfer and ends the program: an IRET from CPL 0 faults in the kernel, where Linux's bad-IRET fixup turns it
-//! into the user's #GP); one that would run CPL 0 code stops `unsupported_code_mode` with that CS in the record and RIP
-//! at the instruction, nothing else changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector)
-//! at CPL 3 (the same deviation: no CPL-3 transfer stops the machine). `tools/models/segment_model.py` (and
-//! `delivery_model.py`'s IRETQ) is the oracle; the check order follows it where the SDM lists several conditions
-//! without a priority.
+//! base and limit (M2 task 1), of which 64-bit mode uses the FS and GS bases alone. Compatibility mode (M2 task 3a):
+//! IRET to a compatibility-mode code segment (CS.L = 0) with RPL 3 is a real load: the frame's RIP must lie within 4
+//! GiB (#GP(0): the limit of the flat segment that runs; a segment that does not run takes its #GP before its first
+//! instruction, `Cpu::compat_refused`, the recorded deviation) and RSP is loaded zero-extended from its low half. The
+//! other transfers to one are not built (task 5): JMP/CALL far at CPL 3 and RET far whose new CS has RPL 3, and any
+//! transfer to L = D = 1, raise #GP(that selector) at the instruction before any change (owner decision, November 6: a
+//! recorded deviation, x86 would run the code; the OS sees a bad transfer and ends the program); one that would run
+//! CPL 0 code stops `unsupported_code_mode` with that CS in the record and RIP at the instruction, nothing else
+//! changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no
+//! CPL-3 transfer stops the machine). `tools/models/segment_model.py` (and `delivery_model.py`'s IRETQ) is the oracle;
+//! the check order follows it where the SDM lists several conditions without a priority.
 use super::*;
 
 /// An exception a transaction raises: vector, error code, CR2.
@@ -526,11 +527,10 @@ fn far_target(s: &mut State, selector: u16) -> Result<(u64, u64), Exception> {
     }
     Ok((va, raw))
 }
-/// Loads CS with `selector` (RPL as given) from `raw`, refusing a compatibility-mode segment: the record then holds
-/// that CS (the stop's cause) with RIP still at the instruction.
+/// Loads CS with `selector` (RPL as given) from `raw` (a segment that runs: [`refuse_compatibility`], and the commit's
+/// and [`set_cpl`]'s mode check).
 fn load_cs(s: &mut State, selector: u16, raw: u64) {
     s.cpu.seg[SREG_CS] = Segment::loaded(selector, raw | 1 << 40);
-    controls(s);
 }
 /// When `raw` is not a 64-bit code segment (L = 1, D = 0), before any effect: #GP(`selector`) when the code it would run is
 /// at CPL 3 (`cpl`, the new CPL), else halts `unsupported_code_mode` (module doc).
@@ -591,7 +591,8 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
 /// RET far (`size`-byte pops, imm16 `disp` released) and IRET (SDM Vol.2 RET, IRET, IA-32e mode): IRET #GP(0) with
 /// RFLAGS.NT; the pops (#SS(0) when not canonical); the return CS: #GP(0) null, #GP(selector) outside the table, not
 /// code, RPL < CPL, conforming with DPL > RPL, nonconforming with DPL != RPL, #NP(selector) not present; a
-/// compatibility-mode CS is #GP(selector) for RPL 3, else refused ([`refuse_compatibility`]); then, for IRET and for a return to an outer level, SS:RSP from the stack: a null SS
+/// compatibility-mode CS with RPL 3 is loaded by IRET (module doc) and #GP(selector) for RET, else refused
+/// ([`refuse_compatibility`]); then, for IRET and for a return to an outer level, SS:RSP from the stack: a null SS
 /// only for a new CPL < 3 with RPL = the new CPL (SDM IRET/RET 64-bit mode #GP(0)), else #GP(selector) unless RPL = DPL =
 /// the new CPL and a writable data segment, #SS(selector) not present; #GP(0) for a non-canonical RIP, checked before SS
 /// for IRET (delivery_model's order) and after it for RET (its pseudocode; segment_model B4). A return to CPL 1 or 2 is
@@ -635,8 +636,13 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     if !present {
         return Err(np(selector));
     }
-    refuse_compatibility(s, selector, raw, rpl)?;
-    if iret && !paging::canonical(rip) {
+    // IRET to 32-bit or 16-bit code at CPL 3 (M2 task 3a); its RIP is checked against the 4 GiB limit.
+    let compat = iret && rpl == 3 && raw >> 53 & 1 == 0;
+    if !compat {
+        refuse_compatibility(s, selector, raw, rpl)?;
+    }
+    let bad_rip = if compat { rip >> 32 != 0 } else { !paging::canonical(rip) };
+    if iret && bad_rip {
         return Err(GP0);
     }
     let outer = rpl > cpl;
@@ -672,7 +678,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
         };
         stack = Some((rsp, ss_selector, ss_segment));
     }
-    if !iret && !paging::canonical(rip) {
+    if !iret && bad_rip {
         return Err(GP0);
     }
     // CPL 1 and 2 are not built ([`Cpu::paging`]): refused with nothing changed.
@@ -708,7 +714,8 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
                     ..Segment::NULL
                 },
             };
-            s.cpu.gpr[4] = rsp.wrapping_add(if iret { 0 } else { release });
+            let rsp = rsp.wrapping_add(if iret { 0 } else { release });
+            s.cpu.gpr[4] = if compat { rsp as u32 as u64 } else { rsp };
         }
         None => s.cpu.gpr[4] = c.gpr[4].wrapping_add(2 * w + release),
     }

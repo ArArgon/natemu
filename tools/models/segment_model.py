@@ -10,12 +10,18 @@ Descriptors" (accessed bit), "Segment Descriptor Tables", "System Descriptor Typ
 TSS available/busy, C = call gate), "TSS Descriptor in 64-bit Mode" and "LDT" (16-byte descriptors, upper type field 0),
 "Privilege Checks" (data segment DPL vs max(CPL, RPL); stack segment RPL = DPL = CPL), "Implicit supervisor accesses".
 
-Scope: IA-32e mode, CS a 64-bit code segment (L = 1, D = 0). Compatibility mode is not built (natemu's owner decision 3):
-a far transfer or return whose target CS is not a 64-bit code segment (L = 0, or L = D = 1) is `refused`, after the
-descriptor checks the SDM makes before the mode matters; so is a 64-bit call gate (not built). Owner decision of November 6:
-where the code would run at CPL 3 (JMP/CALL far at CPL 3, RET far/IRET to RPL 3; a call gate at CPL 3) it is instead
-natemu's recorded deviation, #GP(selector) with nothing changed (a `Deviation` fault: the result's `deviation` is True;
-x86 would run the code, so no x86 reference applies). An IRET loading TF is
+Scope: IA-32e mode, CS a 64-bit code segment (L = 1, D = 0), and what enters compatibility mode from it. M2 task 3a: IRET
+whose new CS is a compatibility-mode code segment (L = 0) with RPL 3 is done: the frame's RIP is checked against the 4 GiB
+limit of the flat segment natemu runs (#GP(0)), RSP is loaded zero-extended from its low half. natemu runs 32-bit code
+only with flat segments (`refused_shape`): where the state after such an IRET (or after a segment load in 32-bit code,
+`load`) is one it does not run, its recorded deviation is #GP(the offending selector) before the next instruction (a
+`Deviation` at that RIP with the completed state; x86 would run the code, so no x86 reference applies). The other
+transfers to compatibility mode are not built (task 5): a far JMP, CALL or RET whose target CS is not a 64-bit code segment
+(L = 0), and any transfer to L = D = 1, is `refused`, after the descriptor checks the SDM makes before the mode matters; so
+is a 64-bit call gate (not built). Owner decision of November 6: where that code would run at CPL 3 (JMP/CALL far at CPL
+3, RET far to RPL 3; a call gate at CPL 3) it is instead the deviation #GP(selector) with nothing changed (a `Deviation`
+fault: the result's `deviation` is True). `null_access` and `flat_access` are the two faults of a 32-bit access that
+translated code must still raise (a null FS or GS, the 4 GiB limit). An IRET loading TF is
 done (its single-step trap after the next instruction is natemu's S4). Paging is delivery_model's abstraction (`memory`: page number -> {'data', 'write',
 'user'}); descriptor-table and TSS-descriptor accesses are implicit supervisor accesses (CPL 0 rights, U/S = 0 in a #PF),
 operand and stack accesses are made at the CPL.
@@ -24,7 +30,8 @@ State dict (delivery_model's keys plus segments): rip (the instruction), length 
 address), rsp, rflags, cpl, cs, ss (selectors), cr0, gdtr = (base, limit), idtr, ldtr = (selector, base, limit) or None
 (null), tr = (selector, base, limit) or None, seg = {'es'|'ds'|'fs'|'gs'|'ss'|'cs': (selector, attributes)} where
 attributes are descriptor bits 47:40 | bits 55:52 << 12 (natemu's `Segment::attributes`; 0 = null), fs_base, gs_base,
-memory. Every operation returns {'outcome': 'done' | 'fault' | 'refused', 'state', 'diff': {address: bytes},
+memory; optionally shape = {sreg: (base, limit)} of the segments loaded with other than base 0 and a 4 GiB limit (every
+load here records it; a state without the key has flat segments). Every operation returns {'outcome': 'done' | 'fault' | 'refused', 'state', 'diff': {address: bytes},
 'fault': (vector, error, cr2) or None, 'reason': text for 'refused', 'permitted': frozenset of (outcome, fault)}; a fault
 leaves the state as it was (the SDM lets a failed segment load set the accessed bit; the model commits no write: B1).
 `outcome`/`fault` are the model's single choice; `permitted` is every result the SDM allows (it differs from
@@ -67,10 +74,42 @@ class Refused(Exception):
 
 class Deviation(Fault):
     """natemu's recorded deviation where x86 would run compatibility-mode code at CPL 3: #GP(selector). `rip`: where it is
-    raised when not at the instruction (SYSRET/SYSEXIT to compatibility mode: at the target, syscall_model)."""
-    def __init__(self, vector, error, rip=None):
+    raised when not at the instruction (after an instruction that completed, whose final state is `state`: an IRET or
+    SYSRET into code natemu does not run, at its target; a segment load in 32-bit code, at the next instruction)."""
+    def __init__(self, vector, error, rip=None, state=None):
         super().__init__(vector, error)
-        self.rip = rip
+        self.rip, self.state = rip, state
+
+
+def refused_shape(s):
+    """The selector natemu's deviation names when compatibility-mode code at CPL 3 cannot run under `s` (None: it runs):
+    natemu's `Cpu::compat_refused`. 32-bit code (CS.D = 1) on a 32-bit stack (SS.B = 1), CS/SS/DS/ES with base 0 and a 4
+    GiB limit, SS/DS/ES present writable expand-up data (so not null)."""
+    shape = s.get('shape', {})
+    flat = lambda r: shape.get(r, (0, 0xFFFFFFFF)) == (0, 0xFFFFFFFF)
+    data = lambda r: flat(r) and s['seg'][r][1] & 0x9E == 0x92
+    cs, ss = s['seg']['cs'], s['seg']['ss']
+    if cs[1] >> 13 & 3 != 2 or not flat('cs'):
+        return cs[0]
+    if not data('ss') or not ss[1] >> 14 & 1:
+        return ss[0]
+    return next((s['seg'][r][0] for r in ('ds', 'es') if not data(r)), None)
+
+
+def _loaded(s, sreg, sel, raw):
+    """`sreg` := `sel` with the descriptor `raw` (accessed), its base and limit recorded when not flat."""
+    s['seg'][sreg] = (sel, attributes(raw) | 1)
+    s.setdefault('shape', {})[sreg] = (base32(raw), limit(raw))
+
+
+def _compat(s):
+    return s['cpl'] == 3 and not s['seg']['cs'][1] >> 13 & 1
+
+
+def _refuse_shape(s, rip):
+    """The deviation at `rip` when `s`, a completed state, is compatibility-mode code at CPL 3 natemu does not run."""
+    if _compat(s) and refused_shape(s) is not None:
+        raise Deviation(GP, refused_shape(s) & 0xFFFC, rip=rip, state=copy.deepcopy(s))
 
 
 def attributes(raw):
@@ -148,7 +187,7 @@ def _run(state, body):
         body(s, bus)
     except Fault as f:
         fault = (f.vector, f.error, f.cr2 or 0)
-        return dict(outcome='fault', state=copy.deepcopy(state), diff={}, fault=fault, reason=None,
+        return dict(outcome='fault', state=getattr(f, 'state', None) or copy.deepcopy(state), diff={}, fault=fault, reason=None,
                     permitted=frozenset({('fault', fault)}) | getattr(f, 'permitted', frozenset()),
                     deviation=isinstance(f, Deviation), fault_rip=getattr(f, 'rip', None))
     except Refused as r:
@@ -239,19 +278,43 @@ def _load(s, bus, sreg, sel):
         if not p:
             raise _np(sel)
     _accessed(bus, addr, raw)
-    s['seg'][sreg] = (sel, attributes(raw) | 1)
+    _loaded(s, sreg, sel, raw)
     if sreg in ('fs', 'gs'):
         s[sreg + '_base'] = base32(raw)
 
 
 def load(state, sreg, sel):
-    """MOV sreg, r/m16 with the selector already read (MOV to CS is #UD: not a case here)."""
-    return _run(state, lambda s, bus: _load(s, bus, sreg, sel))
+    """MOV sreg, r/m16 with the selector already read (MOV to CS is #UD: not a case here). In 32-bit code at CPL 3 a load
+    that leaves segments natemu does not run is its deviation at the next instruction (`refused_shape`)."""
+    def body(s, bus):
+        _load(s, bus, sreg, sel)
+        _refuse_shape(s, s['rip'] + s['length'])
+    return _run(state, body)
 
 
-def _refuse_compatibility(raw, sel, cpl):
-    """`cpl`: the CPL the target code would run at."""
+def null_access(state, sreg):
+    """A memory access through FS or GS (`sreg`) in compatibility mode: #GP(0) while it holds a null selector (Vol. 3A
+    "Segment Loading Instructions in IA-32e Mode": a null selector's segment faults on use outside 64-bit mode)."""
+    def body(s, bus):
+        if not s['seg']['cs'][1] >> 13 & 1 and not s['seg'][sreg][1] & 0x80:
+            raise Fault(GP, 0)
+    return _run(state, body)
+
+
+def flat_access(state, addr, n, stack=False):
+    """An `n`-byte access at offset `addr` of a flat 4 GiB segment in compatibility mode: #GP(0), or #SS(0) through SS,
+    when it would run past the limit (Vol. 3A "Limit Checking": a doubleword at an offset above the limit - 3)."""
+    def body(s, bus):
+        if addr + n > 1 << 32:
+            raise Fault(SS if stack else GP, 0)
+    return _run(state, body)
+
+
+def _refuse_compatibility(raw, sel, cpl, iret=False):
+    """`cpl`: the CPL the target code would run at. `iret`: IRET, which loads a compatibility-mode CS with RPL 3."""
     _, _, _, _, l, d = fields(raw)
+    if iret and cpl == 3 and not l:
+        return
     if not l or d:
         if cpl == 3:
             raise Deviation(GP, sel & 0xFFFC)
@@ -288,7 +351,7 @@ def far(state, kind, addr, width=8, stack=False):
             bus.write(rsp, frame, cpl)
             s['rsp'] = rsp
         s['cs'] = sel & ~3 | cpl
-        s['seg']['cs'] = (s['cs'], attributes(raw) | 1)
+        _loaded(s, 'cs', s['cs'], raw)
         s['rip'] = rip
     return _run(state, body)
 
@@ -312,8 +375,10 @@ def ret(state, width=8, release=0, iret=False):
             raise _gp(sel)
         if not p:
             raise _np(sel)
-        _refuse_compatibility(raw, sel, rpl)
-        if iret and not canonical(rip):
+        _refuse_compatibility(raw, sel, rpl, iret)
+        compat = not fields(raw)[4]                                # (IRET to RPL 3 only: every other one was refused)
+        bad_rip = rip >> 32 != 0 if compat else not canonical(rip)  # the flat 32-bit segment's limit, or 64-bit canonical
+        if iret and bad_rip:
             raise Fault(GP, 0)                                     # B4: IRETQ checks RIP before SS
         outer = rpl > cpl
         stack = None
@@ -336,7 +401,7 @@ def ret(state, width=8, release=0, iret=False):
                     raise _widen(_ss(ss_sel), [(NP, ss_sel & 0xFFFC, 0)])   # B9
                 ss = (saddr, sraw)
             stack = (rsp, ss_sel, ss)
-        if not iret and not canonical(rip):
+        if not iret and bad_rip:
             raise Fault(GP, 0)                                     # B4: RET checks RIP after SS
         if iret:
             mask = IRET_ALWAYS | (IF if cpl <= (s['rflags'] & IOPL) >> 12 else 0) | (IOPL | VIF | VIP if cpl == 0 else 0)
@@ -346,12 +411,16 @@ def ret(state, width=8, release=0, iret=False):
         if stack and stack[2]:
             _accessed(bus, *stack[2])
         s.update(rip=rip, cs=sel, cpl=rpl)
-        s['seg']['cs'] = (sel, attributes(raw) | 1)
+        _loaded(s, 'cs', sel, raw)
         if stack:
             rsp, ss_sel, ss = stack
             s['rsp'] = rsp + (0 if iret else release)
+            if compat:
+                s['rsp'] &= 0xFFFFFFFF                             # ESP: the stack pointer of a 32-bit stack segment
             s['ss'] = ss_sel
-            s['seg']['ss'] = (ss_sel, attributes(ss[1]) | 1 if ss else 0)
+            s['seg']['ss'] = (ss_sel, 0)
+            if ss:
+                _loaded(s, 'ss', ss_sel, ss[1])
         else:
             s['rsp'] += 2 * width + release
         if outer:
@@ -359,6 +428,7 @@ def ret(state, width=8, release=0, iret=False):
                 sel_r, a = s['seg'][r]
                 if not a & 0x80 or ((not a & 8 or not a & 4) and (a >> 5 & 3) < rpl):
                     s['seg'][r] = (0, 0)
+        _refuse_shape(s, rip)
     return _run(state, body)
 
 

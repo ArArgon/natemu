@@ -12,6 +12,10 @@ guest-visible recorded deviation. Evidence and scripts: `natemu-raw/nostop-20261
 
 ## 1. Compatibility-mode entry at CPL 3 is contained (owner decision, November 6)
 
+(Since [M2 task 3a](m2-task3a-findings.md), November 20: IRET and SYSRETL into 32-bit code with flat segments run it.
+What follows still holds for far JMP, CALL and RET, for SYSEXIT and for call gates; for IRET and SYSRETL into segments
+natemu does not run, the fault now comes at the target, as it did for SYSRETL.)
+
 Found by the kernel x86 selftests ([correctness-x86-litmus.md](correctness-x86-litmus.md), finding 2): four 64-bit tests
 reach 32-bit code at CPL 3 and stopped the machine with `unsupported_mode`.
 

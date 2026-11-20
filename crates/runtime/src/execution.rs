@@ -110,12 +110,14 @@ fn halt(s: &State, reason: u64) -> ! {
     stop(SUCCESS, reason)
 }
 
-/// The bank's walk controls ([`Cpu::paging`]) while its code segment is a 64-bit one ([`Cpu::code_mode`]), the only
-/// mode that runs yet (M2 task 1 split the two checks; 32-bit code is a later task): else it stops, `unsupported_mode`
-/// for the paging mode or CPL, `unsupported_code_mode` for the code segment.
+/// The bank's walk controls ([`Cpu::paging`]) while its code segment is one that runs ([`Cpu::code_mode`]): a 64-bit
+/// one, or at CPL 3 a compatibility-mode one (M2 task 3a: 32-bit code with flat segments runs; any other shape takes a
+/// #GP before its first instruction, [`find`]); else it stops, `unsupported_mode` for the paging mode or CPL,
+/// `unsupported_code_mode` for the code segment (compatibility-mode code at CPL 0).
 fn controls(s: &State) -> paging::Control {
     match (s.cpu.paging(), s.cpu.code_mode()) {
         (Some(c), Some(CodeMode::Bits64)) => c,
+        (Some(c), Some(_)) if c.cpl == 3 => c,
         (None, _) => halt(s, stop::UNSUPPORTED_MODE),
         _ => halt(s, stop::UNSUPPORTED_CODE_MODE),
     }
@@ -202,6 +204,19 @@ unsafe fn find_from(s: &mut State, after_system: bool) -> Option<&'static Block>
     #[cfg(not(feature = "perf"))]
     let _ = after_system;
     loop {
+        if s.cpu.seg[SREG_CS].attributes & ATTR_L == 0 {
+            // M2 task 3a: EIP is 32 bits. A computed branch's target is its register whole in FEX's 32-bit code, upper
+            // half included (nonzero after a POP at FFFF_FFFCH, or an access made again at a wrapped address,
+            // [`access_aborted`]), and a system instruction's end may pass 4 GiB ([`commit`]).
+            s.cpu.rip &= 0xffff_ffff;
+            // Compatibility-mode code this boundary would run that translated code cannot run right (a 16-bit or
+            // non-flat segment, [`Cpu::compat_refused`]): #GP(that selector) here, where the code identity is chosen,
+            // whatever loaded the segments (IRET, SYSRET, a segment load in 32-bit code). The recorded deviation.
+            if let Some(selector) = s.cpu.compat_refused() {
+                deliver(s, Event::Exception([13, u64::from(selector & 0xfffc), 0]));
+                continue;
+            }
+        }
         io_checkpoint(s);
         take_invalidations(s);
         // X3: the LAPIC timer's expiries due by now (its virtual-timer doorbell only stopped the vCPU).
@@ -687,7 +702,7 @@ unsafe fn linker(frame: &NativeFrame, elr: u64) -> ! {
 /// plain step, wanted stop, posted invalidation, LAPIC expiry or backlog, takeable event), the exit is an ordinary one of
 /// a live block, and the decode at its RIP is a kept SYSCALL or SYSRET that is current (looked up without a walk,
 /// [`cache::current_at`]) and commits (EFER.SCE, no LOCK; SYSRET: CPL 0, REX.W, a canonical RCX: the transaction's own
-/// checks, so it never faults here; compatibility mode cannot reach it, the bank is in 64-bit mode). Else it returns
+/// checks, so it never faults here; SYSCALL from 64-bit code only: it is #UD from 32-bit code). Else it returns
 /// having changed only what `linker` then does again to the same effect (the bank from the same frame and page, RIP, RF
 /// cleared): nothing before the commit walks or writes guest memory, so no A-bit write can kill the block that ran (the
 /// linker would then find it dead). The instruction runs as [`system`] runs it ([`syscalls::execute`]). After it,
@@ -756,7 +771,7 @@ unsafe fn sys_fast(frame: &NativeFrame, elr: u64) {
     let commits = i.lock == 0
         && s.cpu.efer & EFER_SCE != 0
         && match i.kind {
-            system::SYSCALL => true,
+            system::SYSCALL => s.cpu.code_mode() == Some(CodeMode::Bits64),
             system::SYSRET => s.cpu.cpl == 0 && i.size == 8 && paging::canonical(s.cpu.gpr[1]),
             _ => false,
         };
@@ -1004,7 +1019,13 @@ unsafe fn ask(s: &mut State, kind: u64) -> Reply {
         if s.fetch[0] == u64::MAX || s.fetch[1] != u64::MAX || s.fetch_fault[0] != fetch::NONE {
             halt(s, stop::BAD_REPLY)
         }
-        fetch_page(s, page.wrapping_add(4096), 1, block);
+        // M2 task 3a: 32-bit code ends at 4 GiB (the flat CS's limit): an instruction that runs past it is #GP(0) (SDM
+        // Vol.3 5.3), and the host's bytes never cross it (the compiler refuses such a window).
+        if s.cpu.code_mode() != Some(CodeMode::Bits64) && page == 0xffff_f000 {
+            s.fetch_fault = fetch::encode(Fault::Noncanonical);
+        } else {
+            fetch_page(s, page.wrapping_add(4096), 1, block);
+        }
     }
     if s.reply == REPLY_PARK {
         halt(s, stop::PARKED)
@@ -1985,8 +2006,15 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     // The frame generated code is entered with, built in place: these fields are written unconditionally at every
     // entry (never on some paths only: the zero check cannot see a stale one), and nothing writes the others, so they stay zero (zeroed at `start`; the host checks it at every stop, `entry_frame_rest_zero`).
     let f = unsafe { &mut (*shared()).initial };
-    for (&reg, &value) in SRA.iter().zip(&s.cpu.gpr) {
-        f.x[reg as usize] = value;
+    // M2 task 3a: 32-bit code has EAX..EDI zero-extended (FEX uses the whole register as an address); the registers
+    // R8..R15 live in are its compiler's scratch registers ([`SRA32`]): zero, and never banked ([`bank`]).
+    let compat = s.cpu.code_mode() != Some(CodeMode::Bits64);
+    for (i, (&reg, &value)) in SRA.iter().zip(&s.cpu.gpr).enumerate() {
+        f.x[reg as usize] = match (compat, i < 8) {
+            (false, _) => value,
+            (true, true) => value as u32 as u64,
+            (true, false) => 0,
+        };
     }
     let (nzcv, pf, af) = native_flags(s.cpu.rflags);
     f.x[SRA[16] as usize] = pf;
@@ -2574,7 +2602,7 @@ fn transaction(s: &mut State, i: System) -> Result<(), [u64; 3]> {
         system::RESERVED_NOP => return Ok(commit(s, i, false)),
         // Perf chunk 12: no-operation instructions before a system instruction, completed at once (`find` goes on at it).
         system::NOP_RUN => return Ok(commit(s, i, false)),
-        system::TOO_LONG => return Err(GP),
+        system::TOO_LONG | system::NULL_SEGMENT => return Err(GP),
         // X1c: a direct branch to a non-canonical target (host `system::branch`): #GP(0) when taken, with nothing changed
         // (a fault, SDM Vol.3 7.5: LOOP's count is not decremented; CALL checks before its push); not taken, it completes
         // (LOOPcc decrements its count; with 0x67 ECX, written zero-extended as every 32-bit register result).
@@ -3086,10 +3114,15 @@ pub fn set_cpl(s: &mut State, cpl: u64) {
 /// through here, and every entry ([`enter`]) writes both bytes from the bank, so the page holds the instruction stream's IF.
 /// IF only at CPL 0 (the CPL of the code that ran: no CPL changes inside a block): only CPL-0 blocks may write it, and a
 /// CPL-3 store into the page (the recorded deviation at the per-VM alias) must not change IF, which CPL 3 may not.
+/// M2 task 3a, after 32-bit code (the bank's code segment: no mode changes inside a block): EAX..EDI and XMM0..XMM7
+/// only, the general registers zero-extended (decided: the upper halves of RAX..RDI are zero after 32-bit code, which the
+/// SDM leaves undefined); R8..R15 and XMM8..XMM15 keep the bank's values, since their native registers are scratch
+/// registers of 32-bit code ([`SRA32`]).
 fn bank(cpu: &mut Cpu, f: &NativeFrame, nzcv: u64, cf_inverted: bool) {
     let reg = |i: usize| f.x[SRA[i] as usize];
-    for (i, value) in cpu.gpr.iter_mut().enumerate() {
-        *value = reg(i);
+    let compat = cpu.code_mode() != Some(CodeMode::Bits64);
+    for (i, value) in cpu.gpr.iter_mut().enumerate().take(if compat { 8 } else { 16 }) {
+        *value = if compat { reg(i) as u32 as u64 } else { reg(i) };
     }
     // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA.
     let byte = |at: u32| unsafe { (FRAME_VA as *const u8).add(at as usize).read_volatile() };
@@ -3648,6 +3681,26 @@ unsafe fn access_aborted(
     let write = site.intent == object::INTENT_WRITE;
     let address = site_address(site, f);
     let width = u64::from(site.width);
+    // M2 task 3a: 32-bit code's addresses wrap at 4 GiB, but FEX adds a small displacement, and steps ESP for PUSH and
+    // POP, with 64-bit arithmetic (`[ebp-8]` with EBP = 4 reaches FFFF_FFFF_FFFF_FFFCH; ESP = 1_0000_0000H after a POP at
+    // FFFF_FFFCH), so the access aborts above 4 GiB, where a 32-bit process has nothing mapped. It is made again at the
+    // wrapped address: the base register is moved by the multiple of 4 GiB that puts the access there (its low half,
+    // all a 32-bit register holds, is unchanged), and the word runs again. An access that would run across 4 GiB is
+    // outside the flat segment's limit (SDM Vol.3 5.3): #GP(0), or #SS(0) through SS.
+    if s.cpu.code_mode() != Some(CodeMode::Bits64) {
+        if address >> 32 != 0 && site.base_reg < 31 {
+            unsafe {
+                let frame = &raw mut (*shared()).captured;
+                let base = &mut (*frame).x[site.base_reg as usize];
+                *base = base.wrapping_sub(address & !0xffff_ffff);
+                write_record(record(), &s);
+                resume(&s, frame, elr, spsr)
+            }
+        }
+        if address.saturating_add(width) > 1 << 32 {
+            guest_fault(s, f, b, site, noncanonical(site))
+        }
+    }
     let touched = pages(address, width);
     let alignment = esr & 63 == 0x21 && esr >> 26 == 0x24;
     // CMPXCHG16B (a 16-byte caspal) on an operand that is not 16-byte aligned: #GP(0) (SDM CMPXCHG16B), checked before the
@@ -3897,7 +3950,15 @@ unsafe fn split(
     {
         halt(&s, stop::SITE_MISMATCH)
     }
-    let address = site_address(stub, f);
+    let mut address = site_address(stub, f);
+    // M2 task 3a: 32-bit code's store wraps at 4 GiB and may not run across it ([`access_aborted`]); the store and its
+    // writeback below are made from the wrapped address.
+    if s.cpu.code_mode() != Some(CodeMode::Bits64) {
+        address &= 0xffff_ffff;
+        if address + width as u64 > 1 << 32 {
+            guest_fault(s, f, b, stub, noncanonical(stub))
+        }
+    }
     // S4: a page-crossing store meeting a data breakpoint traps after its instruction: run alone (its step block's split
     // records the bits).
     if s.cpu.dr[5] & DR7_ENABLES != 0 && data_hits(&s.cpu.dr, address, width as u64, true) != 0 {
