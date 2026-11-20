@@ -24,7 +24,10 @@
 //!
 //! **Serial.** `--serial FILE` writes COM1 to that file, so `--serial stdout` is a file named `stdout`; the keyword form is
 //! `[serial] output = "stdout"` (or `--set serial.output=stdout`), which means standard output. Without either, COM1 goes
-//! to standard output. The stop of the vCPU that ended the run is written to standard error.
+//! to standard output. The stop of the vCPU that ended the run is written to standard error, after each vCPU's report
+//! (`natemu::execution`'s diagnostics: guest RIP, mode, CPL, instruction bytes, registers, code identity; none at a power-off).
+//! SIGINFO (Ctrl-T) prints every vCPU's report while the run goes on (`debug.inspect`, on by default); `debug.watchdog`
+//! (seconds, default 60) bounds a vCPU's stay in guest code without a host exit and in the host outside a compile.
 //!
 //! **Environment variables (deprecated).** Ten flags still fall back to a variable: `NATEMU_SERIAL_STDIN`,
 //! `NATEMU_SPECULATION_BARRIERS`, `NATEMU_FP`, `NATEMU_PAGE_CURRENCY`, `NATEMU_WRITABLE_ON_READ`, `NATEMU_POOL`,
@@ -362,6 +365,10 @@ fn boot(cli: Cli) -> natemu::Result<Stop> {
     let prepared = report_prepared(boot.prepare(), &summary, &mut std::io::stderr().lock())?;
     // SIGINT/SIGTERM cancel the run (a second one exits at once).
     prepared.canceller().on_signals();
+    // M2 task D: SIGINFO (Ctrl-T) prints every vCPU's state and the run goes on; `debug.inspect = false` turns it off.
+    if cfg.inspect {
+        natemu::execution::inspect_on_signal();
+    }
     if cfg.serial_stdin {
         prepared.serial_input(natemu::linux::serial_stdin()); // raw mode only once the signals are handled
     }
