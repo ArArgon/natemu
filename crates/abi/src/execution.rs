@@ -1627,6 +1627,14 @@ pub mod frame {
     /// every entry), and the flags the x87 ops of the current x87 instruction raised so far (folded into
     /// [`X87_EXCEPTIONS`] at the instruction's end; anything left there at a resident entry belongs to an instruction that did
     /// not complete and is dropped). Both are 0 while every exception is masked.
+    /// M2 task 4, x87 runs (tools/fexc/shim/fexc_hook.h): 1 while generated code is inside a run of x87 instructions that
+    /// switched FPSR (and the x87 FPCR) once for all of them, in FEX's X87FLAG_UE_LOC byte (no FEX code uses it): FPSR then
+    /// holds x87's flags, not MXCSR's ([`SIMD_FLAGS`] took those at the run's start), so a bank inside a run leaves FPSR
+    /// out. Generated code sets and clears it; the resident clears it at every entry. [`X87_FPCR`]: the FPCR a run under
+    /// its own x87 FPCR started with (4 bytes in FEX's `callret_sp`, unused in slice1), which the run's end loads back.
+    /// Guest-writable like the rest of the page: a forged value changes only the guest's own floating-point state.
+    pub const X87_RUN: u32 = FLAGS + 36;
+    pub const X87_FPCR: u32 = 0xb0;
     pub const SIMD_FLAGS: u32 = FLAGS + 33;
     pub const X87_PENDING: u32 = FLAGS + 34;
     /// FEX's X87FLAG_OE_LOC byte (no FEX code uses it): 1 when the resident's FP trap handler (accurate mode without AFP, DAZ and FTZ
@@ -1641,7 +1649,9 @@ pub mod frame {
     /// Guest-state fields `(offset, bytes)` admitted code may read through x28: the segment bases, the RFLAGS bytes
     /// above, the x87 state (I6) and the YMM upper halves (I8). MXCSR is the bank's (perf chunk 25: its entry value readable,
     /// [`MXCSR`]). Every other x28 access is refused.
-    pub const GUEST_STATE: [(u32, u32); 19] = [
+    pub const GUEST_STATE: [(u32, u32); 21] = [
+        (X87_FPCR, 4),
+        (X87_RUN, 1),
         (TSC_OFFSET, 8),
         (AVX_HIGH, 256),
         (MXCSR, 4),
@@ -1665,7 +1675,9 @@ pub mod frame {
     /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IOPL, NT, AC, VIF,
     /// VIP and ID are the resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions); IF too but in a CPL-0
     /// block's CLI and STI ([`IF`]).
-    pub const GUEST_STATE_WRITABLE: [(u32, u32); 9] = [
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 11] = [
+        (X87_FPCR, 4),
+        (X87_RUN, 1),
         (AVX_HIGH, 256),
         (DF, 1),
         (X87_IE, 1),

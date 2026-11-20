@@ -698,6 +698,10 @@ GUEST_STATE_BASES = ((0x3e0, 8), (0x3e8, 8))
 X87_STATE = ((0x412, 1), (0x410, 1), (0x415, 2), (0x418, 4), (0x41e, 1), (0x4b2, 1), (0x4b4, 4))
 X87_FCW = (0x4b0, 2)
 X87_PENDING = 0x412
+# M2 task 4, x87 runs (shim/fexc_hook.h): the SIMD flag byte (FPSR's flags move into it at a run's start: MXCSR is their OR
+# either way), the run byte and the FPCR the run started with. Bookkeeping, not guest state: a store of one before a fault
+# site changes nothing the guest can see.
+X87_RUN_STATE = ((0x411, 1), (0x414, 1), (0xb0, 4))
 # I8: the YMM upper halves (abi `frame::AVX_HIGH`, FEX's avx_high[16][2]), read and written (single or paired Q, `stp xzr`).
 AVX_HIGH = ((0xc0, 256),)
 
@@ -716,7 +720,7 @@ def entry_and_branches(d, dis, order):
         guest_state = guest_state or (acc and acc[2] == 'x28' and acc[0] == 'load' and acc[3] is None and acc[5] == 'none' and
                                       any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES + (((976, 16),) if BITS else ())))   # M2: 32-bit code also loads es/cs/ss/ds_cached (frame::LEGACY_BASES)
         inside = lambda fields: acc and acc[3] is None and acc[5] == 'none' and any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in fields)
-        guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or inside(AVX_HIGH) or (acc[0] == 'load' and inside((X87_FCW,)))))
+        guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or inside(X87_RUN_STATE) or inside(AVX_HIGH) or (acc[0] == 'load' and inside((X87_FCW,)))))
         if acc and acc[2] in ('x28', 'sp') and not guest_state:
             out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
         if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):
@@ -782,6 +786,8 @@ def verify(d, tmp, insns=None):
                 first_nzcv = off
             if acc and acc[:5] == ('store', 1, 'x28', None, X87_PENDING) and acc[5] == 'none':
                 pass   # Private per-instruction flags; discarded on a fault, committed only at the instruction's end.
+            elif acc and acc[0] == 'store' and acc[2:4] == ('x28', None) and acc[5] == 'none' and (acc[4], acc[1]) in X87_RUN_STATE:
+                pass   # an x87 run's bookkeeping (X87_RUN_STATE)
             elif acc and acc[0] == 'store':
                 out.append(f'{tag}: store +{off} "{text}" before the site')
             bad = dests & sra

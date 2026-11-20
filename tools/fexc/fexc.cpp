@@ -387,7 +387,7 @@ static void ResetGlobals() {
   fexc_align16.clear(); fexc_align32.clear(); fexc_avx_gated = false; fexc_sse_gated = false; fexc_alignment_gated = false; fexc_fp_signal.clear(); fexc_fp_quiet.clear(); fexc_round_inexact.clear(); fexc_mmio.clear();
   fexc_x87_gated = false; fexc_wait_gated = false; fexc_cpl0 = false; fexc_tsc = false; fexc_bulk = false; fexc_x87_fpcr = 0; fexc_x87.clear();
   fexc_simd_unmasked = 0; fexc_x87_unmasked = 0; fexc_daz = false; fexc_ftz = false; fexc_no_afp = false; fexc_accurate = false; fexc_x87_waiting.clear(); fexc_x87_store.clear(); fexc_x87_m32.clear(); fexc_x87_length.clear(); fexc_simd_checked.clear(); fexc_simd_de_masked.clear(); fexc_x87_extra.clear(); FexcKeepList.clear();
-  fexc_args_read = 0; Extent = 0; fexc_null_segments = 0;
+  fexc_args_read = 0; Extent = 0; fexc_null_segments = 0; fexc_x87_run = FEXC_RUN_CLOSED;
   fexc_request_arena.release();   // (after the clears above: every table on the arena is empty now)
 }
 
@@ -701,8 +701,11 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
     for (int ext = st.ext_conds;;) {
       fexc_ext_conds = ext; fexc_ext_stop = -1;
       thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(thread, rip, max);
+      // (32-bit code under an identity with x87 runs: a run may be open at the unit's entry; shim/fexc_hook.h)
+      fexc_x87_run = fexc_bits32 && fexc_slice1 && !fexc_no_afp && s.x87_unmasked == 0 ? FEXC_RUN_UNKNOWN : FEXC_RUN_CLOSED;
       int blocks = 0, links = 0;
       const bool compiled = Attempt(impl, thread, rip, max, ext > 1, blocks, links);
+      if (!fexc_bits32 && fexc_x87_run != FEXC_RUN_CLOSED) std::abort();   // a hard check: an x87 run left open at the unit's end (shim/fexc_hook.h)
       thread->CPUBackend->ClearRelocations();
       impl->GetLatest()->Reset();
       if (ext <= 1) break;   // (1 keeps one decoded block: the plain block)

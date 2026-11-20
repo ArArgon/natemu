@@ -303,6 +303,31 @@ inline std::vector<std::pair<uint32_t, uint8_t>> FexcKeepList;
 // flag order: the MXCSR flags SIMD-checked instructions raised since the last resident entry (folded there into MXCSR), and the
 // flags the x87 ops of the current x87 instruction raised so far (folded into the x87 exception word at its end).
 constexpr uint32_t FEXC_SIMD_FLAGS = 0x3f0 + 33, FEXC_X87_PENDING = 0x3f0 + 34;
+// M2 task 4: x87 runs. Writing FPSR costs about 11 ns on an M4 and the wrapper above wrote it twice per x87 op (and FPCR twice
+// more under `fexc_x87_fpcr`), which was 86% of an x87-heavy program's time. With every x87 exception masked on a host with AFP,
+// FPSR (and the x87 FPCR) is switched once per run instead: from the first x87 floating-point op to the next op that is not
+// x87's and reads or writes FPSR or FPCR (an SSE/AVX floating-point op, a check, STMXCSR) or the block's next jump or exit.
+// At the run's start FPSR's flags (MXCSR's) move into the SIMD flag byte, which the resident ORs into MXCSR at every entry,
+// and FPSR is cleared; each x87 op then only reads FPSR into the pending byte (flags are sticky and are committed to the x87
+// exception word at each instruction's end, so reading the run's flags again commits nothing new); the run's end clears FPSR.
+// FEXC_X87_RUN (FEX's X87FLAG_UE_LOC byte, which no FEX code uses) is 1 during a run: at a fault inside one the resident does
+// not take FPSR for MXCSR's flags. FEXC_X87_FPCR (FEX's callret_sp, unused in slice1): the FPCR the run started with.
+// A stack fault drops its instruction's own flags; inside a run they stay in FPSR, but with AFP the only flag such an
+// instruction's ops can raise is IOC (an SNaN beside the substituted QNaN, a compare or integer conversion of it), and the
+// stack fault itself sets IE, so nothing changes. An instruction converting an m32 operand has a DE fix-up that reads its
+// own ops' DZC and IDC: it clears FPSR first when the run left one of them set. Kept per op, as before: hosts without AFP
+// (their NaN and DE fix-ups read each op's flags) and unmasked exceptions.
+// 64-bit code: a run ends at its IR block's end (every block of SSE code is entered with FPSR holding MXCSR's flags, as
+// before, and no SSE code changes). 32-bit code, where x87 is the usual floating point: a run stays open across blocks (links
+// and the dispatcher's hits keep FPSR, FPCR and the byte), each IR block's first x87 op asking the byte whether to start one
+// and its first FPSR or FPCR user that is not x87's whether to end one: a load and a branch per block. Every full entry from
+// the resident starts closed (FPSR clear, MXCSR's FPCR, the byte 0), and every change of mode or identity is one.
+// ponytail: 64-bit code pays two FPSR writes per block with x87; the 32-bit scheme there would put the load and branch in
+// every block of SSE code.
+constexpr uint32_t FEXC_X87_RUN = 0x3f0 + 36, FEXC_X87_FPCR = 0xb0;
+enum : int { FEXC_RUN_CLOSED, FEXC_RUN_OPEN, FEXC_RUN_UNKNOWN };
+inline int fexc_x87_run = FEXC_RUN_CLOSED;     // whether an x87 run is open at the emit cursor (unknown: 32-bit code, at an IR block's start)
+inline bool fexc_x87_m32_convert = false;      // the op being emitted is an x87 instruction's m32 convert (FexcX87Begin)
 // FEX's X87FLAG_OE_LOC byte (no FEX code uses it): set by the resident's FP trap handler when it writes a result that may be a denormal
 // (DAZ and FTZ clear), cleared by the resident at a DENORM stub; the in-block DE screen skip's check reads it (`frame::DE_PENDING`).
 constexpr uint32_t FEXC_DE_PENDING = 0x3f0 + 35;

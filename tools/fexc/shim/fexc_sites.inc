@@ -191,7 +191,69 @@ bool Arm64JITCore::FexcX87Op(const IR::IROp_Header* IROp) {
   default: return false;
   }
 }
+// M2 task 4 (fexc_hook.h, "x87 runs"): whether x87 ops run in runs here; the start and the end of a run (x0 and x1 are free
+// before an op). `fexc_x87_run`: what is known at the emit cursor, FEXC_RUN_CLOSED, _OPEN, or (32-bit code, at an IR block's
+// start) _UNKNOWN: the run byte says, and the start or end is skipped by a branch when it is already so.
+static bool FexcX87Runs() { return fexc_slice1 && !fexc_no_afp && uint64_t(fexc_x87_unmasked) == 0; }
+static void FexcX87RunEnd(Arm64JITCore& J) {
+  if (fexc_x87_run == FEXC_RUN_CLOSED) return;
+  ARMEmitter::ForwardLabel Closed;
+  if (fexc_x87_run == FEXC_RUN_UNKNOWN) {
+    J.ldrb(TMP1.W(), STATE, FEXC_X87_RUN);
+    (void)J.cbz(ARMEmitter::Size::i32Bit, TMP1, &Closed);
+  }
+  if (fexc_x87_fpcr) {
+    J.ldr(TMP1.W(), STATE, FEXC_X87_FPCR);
+    J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
+  }
+  J.msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
+  J.strb(ARMEmitter::WReg::zr, STATE, FEXC_X87_RUN);
+  (void)J.Bind(&Closed);
+  fexc_x87_run = FEXC_RUN_CLOSED;
+}
+static void FexcX87RunStart(Arm64JITCore& J) {
+  if (fexc_x87_run == FEXC_RUN_OPEN) return;
+  ARMEmitter::ForwardLabel Open, Clean;
+  if (fexc_x87_run == FEXC_RUN_UNKNOWN) {
+    J.ldrb(TMP1.W(), STATE, FEXC_X87_RUN);
+    (void)J.cbnz(ARMEmitter::Size::i32Bit, TMP1, &Open);
+  }
+  // MXCSR's flags so far go to the SIMD flag byte (none, usually: then FPSR is not written).
+  J.mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+  (void)J.cbz(ARMEmitter::Size::i32Bit, TMP1, &Clean);
+  J.ldrb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
+  J.orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
+  J.strb(TMP2.W(), STATE, FEXC_SIMD_FLAGS);
+  J.msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
+  (void)J.Bind(&Clean);
+  J.movz(ARMEmitter::Size::i32Bit, TMP1, 1);
+  J.strb(TMP1.W(), STATE, FEXC_X87_RUN);
+  if (fexc_x87_fpcr) {
+    J.mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
+    J.str(TMP1.W(), STATE, FEXC_X87_FPCR);
+    J.LoadConstant(ARMEmitter::Size::i64Bit, TMP1, uint64_t(fexc_x87_fpcr) & 0xffffffffull);
+    J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
+  }
+  (void)J.Bind(&Open);
+  fexc_x87_run = FEXC_RUN_OPEN;
+}
 void Arm64JITCore::FexcX87Begin() {
+  if (FexcX87Runs()) {
+    FexcX87RunStart(*this);
+    // An m32 operand's convert, the first floating-point op of its instruction: the DE fix-up after the instruction's next op
+    // (FexcAfterOp) reads that op's DZC and the instruction's IDC, so neither may be left from earlier in the run. Every flag
+    // in FPSR here is of a completed instruction, committed already: when one of the two is set FPSR is cleared (rare).
+    if (fexc_x87_m32_convert) {
+      ARMEmitter::ForwardLabel Set, Clear;
+      mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
+      (void)tbnz(TMP1, 1, &Set);     // DZC
+      (void)tbz(TMP1, 7, &Clear);    // IDC
+      (void)Bind(&Set);
+      msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
+      (void)Bind(&Clear);
+    }
+    return;
+  }
   mrs(TMP4, ARMEmitter::SystemRegister::FPSR);
   msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
   if (fexc_x87_fpcr) {
@@ -234,9 +296,10 @@ void Arm64JITCore::FexcStringSvc(const IR::IROp_Header* IROp, IR::Ref Node) {
 }
 
 void Arm64JITCore::FexcX87End() {
-  if (fexc_x87_fpcr) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
+  const bool Run = fexc_x87_run == FEXC_RUN_OPEN;   // (the run's flags so far: sticky, so committed already but for this op's)
+  if (fexc_x87_fpcr && !Run) msr(ARMEmitter::SystemRegister::FPCR, TMP3);
   mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
-  msr(ARMEmitter::SystemRegister::FPSR, TMP4);
+  if (!Run) msr(ARMEmitter::SystemRegister::FPSR, TMP4);
   // Flags commit at the x87 instruction's end, after any store and stack-fault precedence, even when every exception is masked.
   ldrb(TMP2.W(), STATE, FEXC_X87_PENDING);
   orr(ARMEmitter::Size::i32Bit, TMP2, TMP2, TMP1);
@@ -1212,6 +1275,17 @@ void Arm64JITCore::FexcCheckTarget(IR::Ref Node) {
 
 void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
   using IR::IROps;
+  if (fexc_x87_run != FEXC_RUN_CLOSED || FexcX87Op(IROp)) {   // M2 task 4: where an x87 run ends (fexc_hook.h)
+    const bool X87 = fexc_x87.count(Entry + FexcGuest) != 0;
+    const std::string_view Name = IR::GetName(IROp->Op);
+    fexc_x87_m32_convert = X87 && IROp->Op == IROps::OP_FLOAT_FTOF && IR::OpSizeToSize(IROp->C<IR::IROp_Float_FToF>()->SrcElementSize) == 4;
+    const bool Leaves = IROp->Op == IROps::OP_JUMP || IROp->Op == IROps::OP_CONDJUMP || IROp->Op == IROps::OP_EXITFUNCTION || IROp->Op == IROps::OP_BREAK;
+    const bool Other = !X87 && (FexcPrecision::SimdFPOp(IROp->Op) || Name.starts_with("Fexc") || Name.find("RoundingMode") != Name.npos);
+    // 64-bit code: a run ends where its IR block does (a block of SSE code is entered with FPSR its own, unchecked).
+    // 32-bit code, where x87 is the usual floating point: the run stays open across blocks, and the next IR block asks the byte.
+    if (Other || (Leaves && !fexc_bits32)) FexcX87RunEnd(*this);
+    if (Leaves && fexc_bits32 && FexcX87Runs()) fexc_x87_run = FEXC_RUN_UNKNOWN;
+  }
   if (fexc_push_run) {   // the aligned registers each jump carries to its target block (JIT.cpp FexcCarried)
     if (IROp->Op == IROps::OP_JUMP) FexcCarryJump(IROp->C<IR::IROp_Jump>()->TargetBlock);
     if (IROp->Op == IROps::OP_CONDJUMP) {
