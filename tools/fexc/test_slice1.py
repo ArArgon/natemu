@@ -119,7 +119,7 @@ LOCK_UD = {
     'lock adcx ecx,[rax]': 'f0660f38f608', 'lock adox rcx,[rax]': 'f0f3480f38f608', 'lock cmpxchg rcx,rdx': 'f0480fb1d1', 'lock lea rax,[rax]': 'f0488d00', 'lock movaps': 'f00f2800', 'lock endbr64': 'f0f30f1efa',
 }
 
-# I8: a 66, F2 or F3 prefix before VEX, or a REX right before it, is #UD whatever the instruction (a system cut, the host's vex_ud).
+# I8: a 66, F2 or F3 prefix before VEX, or a REX right before it, is #UD whatever the instruction (a system cut, the host's decode).
 VEX_UD = {'rex andn': '48c4e278f2c1', 'o16 andn': '66c4e278f2c1', 'o16 vzeroupper': '66c5f877', 'f3 vaddps': 'f3c5f458c2',
           'f2 vpbroadcastb': 'f2c4e27d78ff'}
 
