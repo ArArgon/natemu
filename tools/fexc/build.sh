@@ -16,7 +16,8 @@ pin=2c5835344cf9feb070e02ec92d2054a41fb5e43d   # == third_party/FEX gitlink: dba
 # the pin is then not this checkout's gitlink, and that copy's smoke check (which reads the checkout around it) is not run.
 other=${FEXC_PIN:+1}
 pin=${FEXC_PIN:-$pin}
-tools=${FEXC_TOOLS:-$here}
+tools=$here
+[ -z "$other" ] || tools=${FEXC_TOOLS:?FEXC_PIN needs FEXC_TOOLS}
 externals="fmt xxhash unordered_dense"
 # A symlinked third_party/FEX (a git worktree sharing the main checkout's initialised submodule) is used as it is: git refuses to
 # update a submodule path that is a symlink. The pin check below still applies.

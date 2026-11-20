@@ -1063,7 +1063,8 @@ The shim sets `fexc_bits32` for the request (not a gating argument: the host's c
   (`es_cached`..`ds_cached` at 976..991, `frame::LEGACY_BASES`; 0 while only flat segments run), and ES's base to every
   string destination (the fork's `FexcStringOp`, which also steps ESI, EDI and ECX in 32 bits there). A site's segment is SS
   for an explicit SS prefix or an EBP/ESP base without a prefix, as before; the report names all six overrides.
-- `--push-run` with `--bitness 32` is refused (the option assumes 8-byte stack slots).
+- `--push-run` with `--bitness 32` is refused (the option assumes 8-byte stack slots), and so are `--cpl0` and `--tsc`
+  (the inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode, MOV r64, CR2 is a 64-bit load).
 - FEX's 32-bit code takes the upper halves of the eight registers as zero (it addresses memory with the whole Arm
   register), and adds a small displacement and moves ESP in PUSH and POP with 64-bit arithmetic: an address or an ESP
   that should wrap at 4 GiB does not. Both are the shim's to handle when 32-bit code runs (findings, "What task 3a needs").
