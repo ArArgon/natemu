@@ -63,8 +63,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         s.cpu.gpr[i.base as usize]
     };
     let segment = match i.segment as usize {
-        SREG_FS => s.cpu.fs_base,
-        SREG_GS => s.cpu.gs_base,
+        sreg @ (SREG_FS | SREG_GS) => s.cpu.seg[sreg].base,
         _ => 0,
     };
     let nc = noncanonical(&i);

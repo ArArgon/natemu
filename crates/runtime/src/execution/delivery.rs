@@ -179,7 +179,7 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
     }
     let new_cpl = if kind & 4 != 0 { c.cpl } else { cs_dpl };
     if matches!(new_cpl, 1 | 2) {
-        halt(s, stop::UNSUPPORTED_MODE) // CPL 1 and 2 are not built ([`Cpu::control`])
+        halt(s, stop::UNSUPPORTED_MODE) // CPL 1 and 2 are not built ([`Cpu::paging`])
     }
     // The stack: IST n, or RSPn of the new level when it changes (§7.14.4, §7.14.5), else the current one.
     let rsp = if ist != 0 || new_cpl != c.cpl {
@@ -254,10 +254,7 @@ fn attempt(s: &mut State, event: Event) -> Result<(), Exception> {
     segments::accessed(s, cs_va, cs_raw)?;
     s.cpu.gpr[4] = low;
     s.cpu.rip = offset;
-    s.cpu.seg[SREG_CS] = Segment {
-        base: 0,
-        ..Segment::loaded(selector & 0xfffc | new_cpl as u16, cs_raw | 1 << 40)
-    };
+    s.cpu.seg[SREG_CS] = Segment::loaded(selector & 0xfffc | new_cpl as u16, cs_raw | 1 << 40);
     if new_cpl != c.cpl {
         s.cpu.seg[SREG_SS] = Segment {
             selector: new_cpl as u16,

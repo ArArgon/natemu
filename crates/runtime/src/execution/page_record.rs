@@ -39,7 +39,10 @@ pub(crate) fn invalidated(address: u64) {
 /// through the answer: a revalidation compares frame numbers and a placement's bytes are copied by the host after the `hvc`).
 #[inline(always)]
 fn probe(s: &State, va: u64) -> Option<(u64, u32)> {
-    let control = s.cpu.control()?;
+    if s.cpu.code_mode() != Some(CodeMode::Bits64) {
+        return None; // no answer outside 64-bit code either: the walk then stops ([`fetch_walk`])
+    }
+    let control = s.cpu.paging()?;
     let c = cache::control();
     let (page, flags, _) = ps::probe(
         table(),
@@ -86,7 +89,7 @@ fn record(s: &State, va: u64, gpa: u64, flags: u32) {
         cache::control().page_split_2m += 1;
         return;
     }
-    let Some(control) = s.cpu.control() else { return };
+    let Some(control) = s.cpu.paging() else { return };
     let c = cache::control();
     let r = ps::record(va, gpa, u64::from(flags), control.cpl == 3, c.epoch);
     ps::insert(

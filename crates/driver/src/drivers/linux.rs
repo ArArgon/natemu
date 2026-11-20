@@ -668,8 +668,8 @@ impl CpuReport {
             efer: Hex(c.efer),
             cpl: c.cpl,
             seg: c.seg.iter().map(|s| Hex(s.selector.into())).collect(),
-            fs_base: Hex(c.fs_base),
-            gs_base: Hex(c.gs_base),
+            fs_base: Hex(c.seg[exec::SREG_FS].base),
+            gs_base: Hex(c.seg[exec::SREG_GS].base),
             gdtr: [Hex(c.gdtr.base), Hex(c.gdtr.limit)],
             idtr: [Hex(c.idtr.base), Hex(c.idtr.limit)],
         }
@@ -700,8 +700,8 @@ mod tests {
             hex(c.efer),
             c.cpl,
             seg.join(","),
-            hex(c.fs_base),
-            hex(c.gs_base),
+            hex(c.seg[exec::SREG_FS].base),
+            hex(c.seg[exec::SREG_GS].base),
             hex(c.gdtr.base),
             hex(c.gdtr.limit),
             hex(c.idtr.base),
@@ -741,7 +741,8 @@ mod tests {
         c.gpr = std::array::from_fn(|i| seed << 8 | i as u64);
         (c.rip, c.rflags, c.cr0, c.cr2, c.cr3, c.cr4, c.efer, c.cpl) =
             (seed + 1, 2, 0x8000_0011, 0, 0x1000, 0x20, 0x500, 3);
-        (c.fs_base, c.gs_base, c.gdtr.base, c.gdtr.limit) = (u64::MAX, 7, 0x9000, 0xffff);
+        (c.seg[exec::SREG_FS].base, c.seg[exec::SREG_GS].base) = (u64::MAX, 7);
+        (c.gdtr.base, c.gdtr.limit) = (0x9000, 0xffff);
         c.seg[1].selector = 0x10;
         c
     }
