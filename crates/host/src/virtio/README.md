@@ -242,7 +242,7 @@ backend writes `net {"backend_dropped":N,"guest_lost":M}` at exit (frames droppe
 that cap, and frames the device dropped because the guest had no RX buffer). It ends when the device stops or drains, after giving any accepted TX packet
 its result. Slirp's state survives device resets, as in QEMU.
 
-Checked by `tools/run_net_linux.py` (suite step `net-linux`): stock Debian Linux at
+Checked by `tests/io/run_net_linux.py` (suite step `net-linux`): stock Debian Linux at
 1/2/4 vCPUs gets its lease, pings the gateway, downloads a host file byte-exact over
 HTTP, runs iperf3 TCP both ways and UDP, survives a driver unbind/rebind under a
 receive stream (three times), ends cleanly at guest reboot, powers off with the

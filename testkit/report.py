@@ -9,7 +9,6 @@ CATEGORIES = {
     'unpreparable': ('U', 'UNPREPARABLE'),
     'reused': ('R', 'REUSED'),
     'unsupported': ('u', 'UNSUPPORTED'),
-    'wrapped': ('W', 'WRAPPED'),
     'measured': ('M', 'MEASURED'),
     'exclusion-changed': ('C', 'EXCLUSION CHANGED'),
     'known-bug': ('k', 'KNOWN BUG'),                    # testkit/known_bugs.py: reported, never a gate failure
@@ -36,7 +35,6 @@ def category(report) -> str | None:
 def teststatus(report):
     c = category(report)
     if c is None: return None
-    if c == 'wrapped' and report.failed: return None        # a failing wrapped step is a failure like any other
     if report.when == 'call' or (report.when == 'setup' and report.skipped):
         letter, word = CATEGORIES[c]
         return c, letter, word

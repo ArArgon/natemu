@@ -2325,7 +2325,7 @@ class Slice1SelfLoopsAndStop(unittest.TestCase):
 class ApproxSdm(unittest.TestCase):
     """RCPPS/RCPSS/RSQRTPS/RSQRTSS and their VEX forms get the Intel SDM's fixed results (a denormal source counts as 0.0, RCP's tiny
     results are 0.0) from integer words around FEX's exact op (shim/fexc_sites.inc, FexcApproxScalar), the same with and without AFP, in
-    both FP modes and under every DAZ/FTZ key. The values are tools/run_approx_special.py's (also under DAZ, FTZ and every rounding
+    both FP modes and under every DAZ/FTZ key. The values are tests/fp/run_approx_special.py's (also under DAZ, FTZ and every rounding
     mode); here the shape: which words go where (a source the result overwrites, a source that survives), that they are integer words
     inside the FPSR save/restore, and that only one or two of them wait for the op's result."""
     H = ['shl', 'movi', 'add', 'ushr', 'cmeq', 'ushr']                          # RCP: the source lanes whose result is 0.0 (v1)

@@ -171,7 +171,7 @@ fn descend_base(value: u64) -> u64 {
 /// P1), are outside RDCL's paging definition and are recorded as a correctness-pass gap (plan 2.4; boot-handoff 6a).
 /// `barriers` (PCID plan P1, owner November 5: off by default; the resident passes its `Control`'s flag, set by
 /// the host at VM start) chooses the `B = true` or `B = false` monomorphisation once per walk (not per level), so the two
-/// come from one source and cannot drift. `walk_once` is not inlined, so `tools/check_resident_barriers.py` can find each
+/// come from one source and cannot drift. `walk_once` is not inlined, so `tests/static/check_resident_barriers.py` can find each
 /// `B = true` instance in the resident and check it (and that the `B = false` ones carry no barrier). RDCL_NO is
 /// advertised only when `barriers` is on (and the host has FEAT_CSV3): the host couples the two, so a guest that reads
 /// "not susceptible to Meltdown" is always running the barriers.

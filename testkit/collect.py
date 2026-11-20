@@ -39,7 +39,7 @@ class CaseItem(pytest.Item):
     def __init__(self, *, fam, suite, case, variant, place, harness, lock_status, **kw):
         super().__init__(**kw)
         self.fam, self.suite, self.case, self.variant, self.place, self.harness = fam, suite, case, variant, place, harness
-        self.unit_key = (fam.name, suite.name, variant.id) + ((case,) if suite.kind == 'legacy' else ())
+        self.unit_key = (fam.name, suite.name, variant.id) + ((case,) if suite.kind == 'bench' else ())
         if suite.smoke is True or (isinstance(suite.smoke, list) and case in suite.smoke) or \
                 (hasattr(harness, 'is_smoke') and harness.is_smoke(case)) or \
                 suite.extra.get('cases', {}).get(case, {}).get('smoke') is True:

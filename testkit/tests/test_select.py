@@ -9,7 +9,7 @@ def fam(name, covers):
     return Family(name, pathlib.Path('.'), covers, None, [], {}, {})
 
 
-FAMS = [fam('fp', ['crates/runtime/src/**/fp*', 'tools/fp_deviations.py']), fam('io', ['crates/host/src/virtio/**'])]
+FAMS = [fam('fp', ['crates/runtime/src/**/fp*', 'tests/lib/fp_deviations.py']), fam('io', ['crates/host/src/virtio/**'])]
 
 
 def test_affected_by_path():

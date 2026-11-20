@@ -24,7 +24,7 @@ single step (POPF), INT 0x12 (#GP(0x92): DPL 0 gate), INT 0x40 (#NP(0x202) deliv
 #NP(0x5b): #DF), then LSL of 0x7b, RDGSBASE and [gs:0] into its result slots, and INT 0x81, whose handler continues at
 CPL 0: a self NMI (and its second), INT 0x12, UD2 with RSP 8 off 16, INT1, and SWAPGS + INT 0x40 (#DF) + SWAPGS. RFLAGS
 starts at 2 (IF = 0, IOPL 0) on both machines; the run restores the start-up IDT and GS base before its end.
-`expected(i)` lists the events in order as delivery_model events (tools/run_x1.py judges each logged frame with it)."""
+`expected(i)` lists the events in order as delivery_model events (tests/system/run_x1.py judges each logged frame with it)."""
 import pathlib
 import sys
 

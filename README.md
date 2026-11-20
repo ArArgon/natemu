@@ -57,7 +57,7 @@ git submodule update --init
 Check your machine (this installs nothing and starts no VM):
 
 ```sh
-./tools/with-env python3 -B tools/check_setup.py
+python3 -B tools/check_setup.py
 ```
 
 ### 2. Build natemu

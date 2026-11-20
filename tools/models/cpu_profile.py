@@ -38,7 +38,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 # Legacy SSE has classes 1-5 and 7; VEX Types 6, 8 and 11-13 exist for VEX only.
 EXCEPTION_CLASS = re.compile(r'none|GP|SYS|X87|MMX|SSE Type [1-57]|VEX Type [1-9]\d?')
 # The corpora that deliver and judge #XM (an unmasked SIMD floating-point exception, before the destination is written).
-XM_TESTS = frozenset({'tools/run_i5c.py'})
+XM_TESTS = frozenset({'tests/faults/run_i5c.py'})
 # x86-64-v1..v3 (x86-64 psABI, "x86-64 Microarchitecture Levels"), by catalogue name; the baseline's own SYSCALL and the
 # dynamic OSXSAVE are not capability bits and are left out.
 V3 = ('CMOV', 'CX8', 'FPU', 'FXSR', 'MMX', 'SSE', 'SSE2', 'CX16', 'LAHF', 'POPCNT', 'SSE3', 'SSE4_1', 'SSE4_2', 'SSSE3', 'AVX',

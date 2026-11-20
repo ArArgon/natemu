@@ -44,9 +44,18 @@ def pytest_configure(config):
     import importlib
     config.pluginmanager.register(importlib.import_module('testkit.runloop'), 'testkit-runloop')
     config.pluginmanager.register(importlib.import_module('testkit.select'), 'testkit-select')
-    for m in ('smoke: a smoke case', 'deterministic: locked answer', 'judged: judged by code', 'legacy: wrapped legacy step',
+    for m in ('smoke: a smoke case', 'deterministic: locked answer', 'judged: judged by code', 'bench: a benchmark',
               'units: unit test suite'):
         config.addinivalue_line('markers', m)
+
+
+def pytest_ignore_collect(collection_path: pathlib.Path, config):
+    """tests/ holds family.toml files and the scripts they run; its test_*.py files are unit tests the unit family runs in
+    its own pytest (testkit.harness.units), never collected here as plain pytest modules."""
+    if collection_path.suffix == '.py' and collection_path.name.startswith('test_'):
+        from testkit import paths
+        if collection_path.resolve().is_relative_to(paths.repo_root() / 'tests'): return True
+    return None
 
 
 def pytest_collect_file(parent, file_path: pathlib.Path):
@@ -71,7 +80,7 @@ class Summary:
         from testkit import report as rep
         c = rep.category(report)
         if report.when == 'call' or (report.when == 'setup' and not report.passed) or (report.when == 'teardown' and report.failed):
-            self.outcome[report.nodeid] = c if c and not (c == 'wrapped' and report.failed) else report.outcome
+            self.outcome[report.nodeid] = c if c else report.outcome
         if c and (report.when == 'call' or (report.when == 'setup' and report.skipped)):
             reason = report.longrepr[2] if report.skipped and isinstance(report.longrepr, tuple) else \
                 dict(report.user_properties).get('testkit-note', '')
@@ -90,7 +99,7 @@ class Summary:
             terminalreporter.write_line('  (cleanup and per-unit detail: tools/natemu-test times %s --detail)' % t['run'])
         groups = {}
         for c, nodeid, reason in self.items:
-            if c in ('reused', 'wrapped'): continue
+            if c == 'reused': continue
             if c == 'measured': reason = nodeid.rsplit('/', 1)[-1] + ': ' + reason
             groups.setdefault((c, reason.removeprefix('Skipped: ')), []).append(nodeid)
         if not groups: return
@@ -170,7 +179,7 @@ def covered_elsewhere(session) -> set:
         if not f.exists(): continue
         c = json.loads(f.read_text())
         if c['commit'] != commit: continue          # same commit and the same uncommitted changes only
-        out |= {n for n, o in c['items'].items() if o in ('passed', 'reused', 'wrapped')}
+        out |= {n for n, o in c['items'].items() if o in ('passed', 'reused')}
     return out
 
 

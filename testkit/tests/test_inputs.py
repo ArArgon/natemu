@@ -198,7 +198,7 @@ def test_io5_downloads_are_the_runners_pins():
     """The resources io5_inputs fetches are the files run_io5.py names and pins (prepare checks the image's sha512)."""
     import re
     from testkit import paths
-    src = (paths.repo_root() / 'tools' / 'run_io5.py').read_text()
+    src = (paths.repo_root() / 'tests' / 'io' / 'run_io5.py').read_text()
     val = lambda name: re.search(rf"^{name} = '([^']+)'", src, re.M)[1]
     decl = resources.declarations()
     assert decl['debian-cloud-nocloud']['urls'][0].endswith('/' + val('IMAGE') + '.tar.xz')

@@ -10,7 +10,7 @@ covers; a family's `rules.py` decides which cases apply to a variant (R2.13); th
     sources = ["tools/reference/gen_slice1.py"]        # repo files the generator imports (fingerprinted)
     [[suite]]
     name = "i8"
-    kind = "deterministic"                             # deterministic | judged | legacy | units
+    kind = "deterministic"                             # deterministic | judged | bench | units
     harness = "programs"                               # a testkit.harness module, or "file.py:Class" in this folder
     input = "i8"
     reference = "qemu"                                 # qemu | x86 (seeding only)
@@ -100,7 +100,7 @@ class Variant:
 
 
 SUITE_KEYS = {f.name for f in dataclasses.fields(Suite)} - {'extra', 'needs'}
-KINDS = {'deterministic', 'judged', 'legacy', 'units'}
+KINDS = {'deterministic', 'judged', 'bench', 'units'}
 
 
 def _load_module(path: pathlib.Path, name: str):

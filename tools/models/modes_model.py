@@ -2,7 +2,7 @@
 
 Vendor profile: Intel. WRMSR EFER raises #GP(0) for a nonzero EDX (EFER bits 63:32 are reserved) and for any EAX bit
 outside EFER_DEFINED (SCE, LME, LMA, NXE; AMD would add SVME, LMSLE, FFXSR and TCE); a write to LMA is ignored. These
-match the resident's WRMSR (`crates/runtime/src/execution.rs` `system`) and `tools/system_fault_model.py`.
+match the resident's WRMSR (`crates/runtime/src/execution.rs` `system`) and `tests/lib/system_fault_model.py`.
 
 The programs start in 32-bit protected mode (contracts 28-31), which the general path does not run: owner decision 3
 moved 32-bit support to the boot phase, so the rest of contracts §3's fixes wait for it there. Open for that reuse:

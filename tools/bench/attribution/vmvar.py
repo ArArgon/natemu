@@ -4,6 +4,7 @@ usage: vmvar.py FEXC OUT REPS N STRIDE:PAGES:BASEOFF [...]"""
 import json, pathlib, statistics, subprocess, sys, time
 S = pathlib.Path(__file__).resolve().parent; ROOT = S.parent.parent.parent
 sys.path.insert(0, str(ROOT / 'tools/bench')); sys.path.insert(0, str(ROOT / 'tools')); sys.path.insert(0, str(ROOT / 'tools/reference'))
+sys.path.insert(0, str(ROOT / 'tests' / 'lib')); import testenv  # noqa: E402 (tests/README.md: the test scripts)
 import build_bench as bench, run_slice1_vm as vm, ref
 fexc, out, reps, n = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 specs = [tuple(int(x, 0) for x in s.split(':')) for s in sys.argv[5:]]

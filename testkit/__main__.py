@@ -16,6 +16,7 @@
     tools/natemu-test -m pytest ...            plain pytest (the framework's own tests)
 """
 import argparse
+import os
 import sys
 
 COMMANDS = {
@@ -36,6 +37,7 @@ COMMANDS = {
 
 
 def main(argv: list[str]) -> int:
+    os.environ.setdefault('NATEMU_TESTKIT', '1')   # what tests/lib/testenv.py's guard looks for in everything started from here
     if argv[:2] == ['-m', 'pytest']:
         import pytest
         return pytest.main(argv[2:])

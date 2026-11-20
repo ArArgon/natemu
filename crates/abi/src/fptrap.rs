@@ -549,7 +549,7 @@ pub unsafe fn slot(base: *const u32, w: u32, o: &Op) -> Option<*const u32> {
 /// # Safety
 /// `at` is a slot of a [`TABLE`] copy in executable memory; the pointers are valid for 16 bytes.
 #[cfg(target_arch = "aarch64")]
-#[inline(never)] // one `blr`, at a known place: tools/check_resident_stack.py lists it
+#[inline(never)] // one `blr`, at a known place: tests/static/check_resident_stack.py lists it
 pub unsafe fn exec(at: *const u32, fpcr: u64, d: *mut [u8; 16], n: *const [u8; 16], m: *const [u8; 16], a: *const [u8; 16]) -> u64 {
     let fpsr: u64;
     // SAFETY: as documented; the slot's `ret` returns here (x30); every register the slot or the caller's ABI may clobber is declared.

@@ -44,20 +44,6 @@ def test_missing_or_unknown_gives_none(tmp_path):
     assert write(tmp_path, {'something': 'else'}) is None
 
 
-def test_migration_maps_every_step():
-    import pathlib, sys
-    from testkit import migrate, paths, family
-    sys.path.insert(0, str(paths.repo_root() / 'tools'))
-    import run_suite
-    steps = {s.name for s in run_suite.steps('F', pathlib.Path('/O'))}
-    covered = {s for v in migrate.COVERED.values() for s in v}
-    in_families = set()
-    for fam in ('static', 'boot', 'io', 'faults', 'smp', 'system'):
-        f = family.load(paths.repo_root() / 'tests' / fam / 'family.toml')
-        in_families |= set(f.suite(fam).extra['cases'])
-    assert steps == covered | in_families and not (covered & in_families)
-
-
 def test_case_timeout_overrides_the_suite(tmp_path):
     from testkit import family
     d = tmp_path / 'tests' / 'f'; d.mkdir(parents=True)
@@ -100,22 +86,3 @@ def test_diff_rerun_only_for_hash_only_answers():
     assert runner.needs_diff(f'step 3: {answers.HASH_ONLY}: qemu-system/abc')
     assert not runner.needs_diff('x differs: 1 != 2 (QEMU 2)')
     assert 'natemu-test run --diff' in answers.HASH_ONLY
-
-
-def test_hand_written_io_suites_survive_regeneration():
-    """testkit.migrate rewrites tests/io/family.toml with the generated `io` suite only; these suites are added by hand."""
-    from testkit import paths, family
-    f = family.load(paths.repo_root() / 'tests' / 'io' / 'family.toml')
-    want = {'io-selfcheck': {'io-stress-selfcheck', 'lifecycle-stress-selfcheck', 'virtio-net-selfcheck', 'io-pending-compiler-selfcheck'},
-            'io-program': {'virtio-net', 'io-windows', 'io-window-cases', 'io-pending-compiler'},
-            'io-campaign': {'io-stress-n2', 'io-stress-n4', 'lifecycle-reset', 'lifecycle-disable', 'lifecycle-corrupt-control',
-                            'serial-unpaced', 'serial-paced', 'serial-loaded', 'soak'}}
-    for suite, cases in want.items():
-        assert cases <= set(f.suite(suite).extra['cases']), suite
-    f = family.load(paths.repo_root() / 'tests' / 'static' / 'family.toml')
-    assert {'fexc-smoke', 'fexc-sites', 'fexc-sites-slice1', 'fexc-precision', 'fexc-skips', 'fexc-serve',
-            'fexc-channel', 'fexc-unit', 'fexc-slice1'} <= set(f.suite('fexc').extra['cases'])
-    f = family.load(paths.repo_root() / 'tests' / 'smp' / 'family.toml')
-    assert 'capacity-apic-selfcheck' in f.suite('capacity-selfcheck').extra['cases']
-    assert {'capacity', 'capacity-apic'} <= set(f.suite('capacity').extra['cases'])
-

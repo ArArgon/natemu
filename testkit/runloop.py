@@ -96,7 +96,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
             req = Request(id=f'{run}:{uuid.uuid4().hex}', owner_pid=os.getpid(), cores=_cores(nd.cores, pool.cfg),
                           exclusive=nd.exclusive, perf=nd.perf or nd.dedicated, priority=prio,
                           asked=time.time(), expected=None if None in exp else sum(exp),
-                          label=f'{g[0].fam.name}/{s.name}' + (f'/{chunk[0].case}' if s.kind == 'legacy' else '')
+                          label=f'{g[0].fam.name}/{s.name}' + (f'/{chunk[0].case}' if s.kind == 'bench' else '')
                                 + (f'[{g[0].variant.id}]' if g[0].variant.params else ''),
                           worktree=paths.repo_root().name, run=run)
             if getattr(nd, 'mixed', False) and pool.unsatisfiable(req) and req.cores <= pool.cfg.p_cores + pool.cfg.e_cores \
@@ -107,7 +107,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
                                                  f'performance and {pool.cfg.e_cores} efficiency cores') for it in chunk]
                 continue
             env = dict(g[0].place.env)
-            if s.kind != 'legacy': env.update(NO_RAW_CACHES)
+            if s.kind != 'bench': env.update(NO_RAW_CACHES)
             h = chunk[0].harness                            # a case may set its own timeout (runner cases: `timeout = N`)
             own = [h.case_timeout(it.fam, it.suite, it.case) for it in chunk] if hasattr(h, 'case_timeout') else []
             timeout = max([float(x) for x in own if x] or [float(s.params.get('timeout', 3600))])
@@ -124,7 +124,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
 
 
 def it_needs(item):
-    """A suite's claims, or per case where the harness knows them (wrapped legacy steps)."""
+    """A suite's claims, or per case where the harness knows them (benchmarks)."""
     h = item.harness
     return h.case_needs(item.fam, item.suite, item.case) if hasattr(h, 'case_needs') else item.suite.needs
 

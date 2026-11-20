@@ -18,6 +18,7 @@ logged event, the set of permitted (vector, frame RIP label) pairs, judged on bo
 import pathlib, sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / 'tests' / 'lib')); import testenv  # noqa: E402 (tests/README.md: the test scripts)
 from programs import BODY0, STACK, cpu, ref_assemble  # noqa: E402
 
 EV = lambda i: 0x300000 + 0x10000 * i       # IDT (one page), then IDTR operand at +0x1000, log cursor at +0x1010

@@ -2356,7 +2356,7 @@ pub const fn fsw_summary(fsw: u64, fcw: u64) -> u64 {
 /// MXCSR exception flags for the FPSR cumulative flags generated code raised under `mxcsr`: IOC -> IE, DZC -> ZE, OFC -> OE,
 /// UFC -> UE, IXC -> PE, and IDC -> DE unless DAZ. With FPCR.AH = 1 and FIZ = 0 the M4 sets IDC for a denormal input it
 /// does not flush, with x86's precedence (none beside an IE or ZE of the same operation or a NaN operand; not for FP to
-/// integer conversions, FRINT* or the reciprocal estimates; the I5a review's measurements, `tools/run_i5a_de.py`). Under DAZ
+/// integer conversions, FRINT* or the reciprocal estimates; the I5a review's measurements, `tests/faults/run_i5a_de.py`). Under DAZ
 /// (FIZ = 1) IDC marks a flushed input, where x86 sets no DE. With `no_afp` ([`Cpu::no_afp`]) an FZ flush sets UFC without IXC
 /// (inventory 1.7, 1.8), so under effective FTZ (FZ with UM masked, the condition [`fpcr`] uses) UFC also sets PE, as x86 does
 /// for a flushed result; without FTZ a UFC comes with IXC already.
@@ -2814,7 +2814,7 @@ pub mod system {
     /// RDPMC (the profile has no performance counters: always #GP(0) or #UD).
     pub const RDPMC: u32 = 12;
     /// LGDT/LIDT m16&64, SGDT/SIDT m (memory operand). The resident dispatches these by ranges of kinds (the runtime
-    /// may not use jump tables, `tools/check_resident_stack.py`): keep each group contiguous.
+    /// may not use jump tables, `tests/static/check_resident_stack.py`): keep each group contiguous.
     pub const LGDT: u32 = 13;
     pub const LIDT: u32 = 14;
     pub const SGDT: u32 = 15;

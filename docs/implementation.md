@@ -278,7 +278,7 @@ host resources and disclosed cache/build conditions. Attribute codegen, runtime
 and I/O costs separately where possible; boot time is not a general compiler score.
 
 **Published numbers.** [benchmarks.md](benchmarks.md) and the README's speed-up sentence show the latest full benchmark
-round (every program at 1 and 4 vCPUs, `tools/bench/run.py`), the Debian cloud-image workload (`tools/run_io5.py`) and
+round (every program at 1 and 4 vCPUs, `tools/bench/run.py`), the Debian cloud-image workload (`tests/io/run_io5.py`) and
 the mitigations comparison. Whenever one of these is rerun on the merge head, or the QEMU baseline changes, update them in
 the same change set: the tables, geometric means and ranges, the date and the setup line. Per-change subsets and
 development timings do not update them. Both pages are user-facing: plain language, no internal stage names.
@@ -293,7 +293,7 @@ not remove the project's required device set or establish a diverse workload res
 From the repository root, run:
 
 ```sh
-./tools/with-env python3 -B tools/check_setup.py
+python3 -B tools/check_setup.py
 ```
 
 This read-only diagnostic checks known local host/Rust prerequisites and the raw
@@ -332,30 +332,28 @@ fill the local Cargo cache once with network access; the `--offline` commands th
 ```sh
 git submodule update --init
 cargo fetch --locked
-./tools/with-env cargo test --offline --locked
-./tools/with-env cargo build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
-python3 -B -m unittest discover -s tools -p 'test_*.py'
+cargo build --offline --locked --release -p natemu-runtime --target aarch64-unknown-none
+tools/natemu-test run --tier smoke
 ```
 
-The general execution path's runners, which the test families call (run one directly only to debug it; each runner's docstring gives its options; the slice contracts give what they
-check): `tools/run_slice1_vm.py` (fixtures and seeded corpora vs QEMU), `tools/run_slice1_faults.py` (precise faults and
-paging cells), `tools/run_slice2_vm.py` (control flow), `tools/run_slice2_faults.py` (loop faults),
-`tools/run_slice2_probes.py` (code cache, linking, self-modifying code), `tools/fexc/upstream_tests/run_asm.py` (FEX's
-ASM suite) and `tools/run_slice3_vm.py` (N vCPUs: corpora, smp, limits, kicks, system, coherence, sharedpt, litmus,
-contain). Each takes `--fexc FEXC --out DIR` and runs under `./tools/with-env`.
+The general execution path's runners live with the families that run them ([tests/README.md](../tests/README.md); each
+runner's docstring gives its options, the slice contracts what they check): `tests/lib/run_slice1_vm.py` (fixtures and
+seeded corpora vs QEMU), `tests/faults/run_slice1_faults.py` (precise faults and paging cells),
+`tests/faults/run_slice2_faults.py` (loop faults), `tests/faults/run_slice2_probes.py` (code cache, linking,
+self-modifying code), `tools/fexc/upstream_tests/run_asm.py` (FEX's ASM suite) and `tests/smp/run_slice3_vm.py` (N vCPUs:
+corpora, smp, limits, kicks, system, coherence, sharedpt, litmus, contain). Control flow runs in the `programs` family.
+A runner refuses to start outside the framework; to debug one, run its case: `tools/natemu-test run tests/faults -k
+slice1-faults --keep-outputs` (its log starts with the exact command and settings).
 
 **Running the suite.** Every test runs through `tools/natemu-test` ([docs/testing.md](testing.md)), on any Apple Silicon
 Mac: `tools/natemu-test run` for the tests a change concerns, `--tier smoke` for one small case of everything, and
-`tools/natemu-test run --gate` for everything. A passing gate at the exact commit is what a merge of a behaviour-changing change needs ([when the gate is
-needed](testing.md#when-the-gate-is-needed)). Do not
-run `tools/run_suite.py`: nothing is judged by it any more. The file stays only because its step list is what
-`python3 -m testkit.migrate` generates the runner families from, and the benchmark family and a few `tools/test_*.py`
-tests still import it. The single runners above can still be run directly while debugging one of them. The framework
-schedules the work (cores, exclusive windows, several runs on one machine); none of the old `-j`, `-e`, `--quick`
+`tools/natemu-test run --gate` for everything. A passing gate at the exact commit is what a merge of a behaviour-changing
+change needs ([when the gate is needed](testing.md#when-the-gate-is-needed)). The framework schedules the work (cores,
+exclusive windows, several runs on one machine); none of the old `-j`, `-e`, `--quick`
 or `--shard` handling is needed. The runners keep their own caches: QEMU reference results are cached per program (`NATEMU_RAW_ROOT/ref-cache.sqlite`, keyed by program,
 pinned QEMU hash and the `tools/reference` sources; `NATEMU_REF_CACHE=off` forces fresh references, e.g. for a final gate). Two more caches live
-beside it: `asm-cache.sqlite` (`tools/asmcache.py`: clang's bytes per assembly text; the fault runners assemble thousands of
-one-line programs and every shard repeated it; `NATEMU_ASM_CACHE=off`) and `qemu-cache.sqlite` (`tools/qemucache.py`: QEMU
+beside it: `asm-cache.sqlite` (`tests/lib/asmcache.py`: clang's bytes per assembly text; the fault runners assemble thousands of
+one-line programs and every shard repeated it; `NATEMU_ASM_CACHE=off`) and `qemu-cache.sqlite` (`tests/lib/qemucache.py`: QEMU
 system-mode reference runs of K1, slice 3 and i5b by image, arguments and QEMU binary; finished runs only; a hang only for the cases listed in `QEMU_HANGS`, after two fresh timeouts (the 8 hanging
 system guests cost their 10 s on the first two runs); `NATEMU_QEMU_CACHE=off` for a final gate). The first run after a change to an image or a runner fills
 them, so its times are the old ones. Runners that run a prefix-only baseline per case (`instruction-gaps`, `frame-alias`) run
@@ -370,13 +368,13 @@ publication only; `--check-reuse` (`NATEMU_CHECK_REUSE=1`) also asks the host fo
 
 **Translated code.** The dispatcher's data tables, extended blocks, the hot/cold layout, one stack check per run of stack stores and narrow compares are how natemu translates and runs code; see `docs/restructure/translated-code-layout.md`.
 
-**The VM lock.** `NATEMU_RAW_ROOT/.vm.lock` is taken with BSD `flock(2)` and nothing else: Python `fcntl.flock`, the suite and
-the I/O runners, `/usr/bin/lockf -k` (macOS `lockf` is flock-based and has no shared mode) and `tools/vmlock.py` all exclude
-each other (`tools/test_vm_lock.py`). Never use `fcntl.lockf` or `F_SETLK` on it: on macOS record locks and flock do not
-exclude each other. Shared (suite `pre`/`par` phases, `vmlock.py shared CMD`): correctness-only VM runs, many at once.
-Exclusive (`lockf -k`, `vmlock.py exclusive CMD`, the suite's `ser` steps, benchmarks): timing-sensitive runs, alone. Any
-ad-hoc VM run outside the suite takes the lock too (`python3 tools/vmlock.py shared CMD`); one that does not can spoil another
-agent's timing run, and its own timings are unreliable.
+**The VM lock.** `.vm.lock` in the state root (`NATEMU_STATE_ROOT`, else `NATEMU_RAW_ROOT`) is taken with BSD `flock(2)` and
+nothing else: the framework's scheduler, the I/O runners, `/usr/bin/lockf -k` (macOS `lockf` is flock-based and has no
+shared mode) and `tools/vmlock.py` all exclude each other (`tools/test_vm_lock.py`). Never use `fcntl.lockf` or `F_SETLK` on
+it: on macOS record locks and flock do not exclude each other. Shared (`vmlock.py shared CMD`): correctness-only VM runs,
+many at once. Exclusive (`vmlock.py exclusive CMD`, the framework's exclusive windows, benchmarks): timing-sensitive runs,
+alone. A VM run outside `tools/natemu-test` goes through `python3 tools/vmlock.py shared|exclusive CMD`, which queues it with
+the framework's work; the scripts under `tests/` that no suite runs refuse to start without it.
 
 **Benchmark baselines.** `tools/bench/canary.py record NAME --exe-dir BASEDIR --attach RESULTS...` stores a baseline build's
 full results with a few-minute drift canary (boot, CPython slice, micro benchmarks); `canary.py check NAME [--tol 0.05]`
@@ -592,15 +590,12 @@ claim aggregate milestone acceptance; that judgment belongs to the
 The separate QEMU comparison (`fixtures/i4v-qemu`, deleted at S3i) bound passed native
 reports and has its own producing snapshot, checksums and bounded execution.
 
-Use `./tools/with-env COMMAND ...` for project builds, checks and runs. It supplies
-the durable sibling `../natemu-raw` as `NATEMU_RAW_ROOT`, independently of the
-caller's working directory, and preserves a nonempty explicit override. It
-creates no directories and changes no parent/global shell settings. Runners and
-the diagnostic still enforce their output-root checks. To use tools directly
-instead, from the repository root:
+The test framework needs no raw root: it keeps its inputs in its own cache. The scripts outside it that keep results
+(`tools/bench`, `tools/correctness`, the diagnostics under `tests/` that no suite runs) use `NATEMU_RAW_ROOT`, by default
+`natemu-raw` beside the main checkout (`tools/raw_root.py`; from a worktree too). To use another folder:
 
 ```sh
-export NATEMU_RAW_ROOT="$PWD/../natemu-raw"
+export NATEMU_RAW_ROOT=/path/to/raw-root
 ```
 
 If a workspace sandbox reports that this external directory is unwritable, run

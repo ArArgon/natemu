@@ -2,7 +2,7 @@
 # xsave: instructions or flags the pinned QEMU lacks) or FEX (x87). Every corpus is generated here; nothing is stored.
 [family]
 name = "programs"
-covers = ["crates/**", "third_party/FEX", "tools/fexc/**", "tools/reference/**"]
+covers = ["crates/**", "third_party/FEX", "tools/fexc/**", "tools/reference/**", "tests/lib/run_slice1_vm.py", "tests/lib/asmcache.py", "tests/lib/fp_deviations.py", "tests/lib/testenv.py"]
 
 [input.fix]
 generator = "tools/reference/gen_slice1.py"

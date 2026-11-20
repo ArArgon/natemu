@@ -200,7 +200,7 @@ QEMU_WHEELS = ['setuptools-wheel', 'wheel-wheel']        # resources configure's
 
 def qemu_system() -> pathlib.Path:
     """The bin folder of QEMU 11.1.2 built from the pinned release tarball (resource qemu-src): qemu-system-x86_64 and
-    qemu-img, with the firmware in <entry>/share/qemu (where QEMU and tools/qemucache.py look for it). Built in a scratch
+    qemu-img, with the firmware in <entry>/share/qemu (where QEMU and tests/lib/qemucache.py look for it). Built in a scratch
     folder, installed into the entry; Homebrew's libraries are the build dependencies, their versions in build-info.txt."""
     import inspect
     if p := _pinned('qemu-system'): return pathlib.Path(p)

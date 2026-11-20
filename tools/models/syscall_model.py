@@ -27,7 +27,7 @@ C1  SYSCALL's R11 image of RF: pseudocode "R11 := RFLAGS" (model: RF as it was);
 C2  SYSCALL SS selector = STAR[47:32] + 8, RPL bits not masked (SDM pseudocode; AMD APM and KVM agree); QEMU masks it to
     RPL 0. Not widened (the SDM is explicit), but QEMU differs: compare against QEMU only with STAR[33:32] = 0.
 C3  Single-step: TF changes neither instruction (the SYSCALL/SYSRET pages say nothing of it). Whether a #DB trap follows
-    them is outside this model (natemu's S4, tools/run_s4.py: after SYSCALL or SYSRET when the TF they leave is 1, pinned
+    them is outside this model (natemu's S4, tests/system/run_s4.py: after SYSCALL or SYSRET when the TF they leave is 1, pinned
     QEMU's rule and the behaviour Linux's entry_64.S describes for SYSRET).
 C4  SYSRET to 64-bit mode with non-canonical RCX: #GP(0) at CPL 0 before any change (Intel). AMD completes SYSRET and
     faults at CPL 3 on the fetch; AMD also leaves stale SS attributes. Neither widened (Intel profile).

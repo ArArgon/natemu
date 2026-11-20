@@ -40,8 +40,19 @@ def _tools() -> pathlib.Path:
     return paths.repo_root() / 'tools'
 
 
-def _runner(script: str, *args) -> None:
-    artifacts._run([sys.executable, '-B', _tools() / script, *map(str, args)], cwd=paths.repo_root())
+def _io() -> pathlib.Path:
+    """The io family's scripts (their `prepare` commands build these inputs) and tests/lib, which they import."""
+    return paths.repo_root() / 'tests' / 'io'
+
+
+def _lib() -> pathlib.Path:
+    return paths.repo_root() / 'tests' / 'lib'
+
+
+def _runner(script, *args) -> None:
+    """Run a build step's script: a path, or a name in tests/io (the io scripts' `prepare` commands), else under tools/."""
+    path = script if pathlib.Path(script).is_absolute() else _io() / script if (_io() / script).is_file() else _tools() / script
+    artifacts._run([sys.executable, '-B', path, *map(str, args)], cwd=paths.repo_root())
 
 
 def _clang() -> str:
@@ -58,14 +69,14 @@ def _rng_recipe(out: pathlib.Path, inputs: list) -> None:
 
 
 def rng_inputs() -> pathlib.Path:
-    """tools/run_virtio_rng.py prepare's folder: the netboot kernel, stock modules from the netboot initrd, Debian's BusyBox."""
-    t = _tools()
+    """tests/io/run_virtio_rng.py prepare's folder: the netboot kernel, stock modules from the netboot initrd, Debian's BusyBox."""
+    t, io, lib = _tools(), _io(), _lib()
     srcs = [str(resources.fetch(n)) for n in ('debian-netboot-linux', 'debian-netboot-initrd', 'busybox-static-deb')]
-    return resources.derived('io-rng-inputs', _rng_recipe, srcs + [t / 'run_virtio_rng.py', t / 'io_common.py', t / 'play/mkcpio.py']) / 'rng'
+    return resources.derived('io-rng-inputs', _rng_recipe, srcs + [io / 'run_virtio_rng.py', lib / 'io_common.py', t / 'play/mkcpio.py']) / 'rng'
 
 
 def e2fsprogs() -> tuple[pathlib.Path, str]:
-    """Homebrew's e2fsprogs (its Cellar folder, as tools/run_virtio_block.py records it) and its version."""
+    """Homebrew's e2fsprogs (its Cellar folder, as tests/io/run_virtio_block.py records it) and its version."""
     prefix = pathlib.Path(os.environ.get('NATEMU_E2FSPROGS') or E2FSPROGS).resolve()
     if not all((prefix / 'sbin' / n).is_file() for n in ('mke2fs', 'e2fsck', 'debugfs')):
         raise BuildFailure('e2fsprogs', f'no mke2fs, e2fsck and debugfs under {prefix}/sbin: brew install e2fsprogs')
@@ -78,15 +89,15 @@ def _block_recipe(out: pathlib.Path, inputs: list) -> None:
 
 
 def block_inputs() -> pathlib.Path:
-    """tools/run_virtio_block.py prepare's folder (mmio): the ext4 root image and its boot initramfs."""
-    t = _tools()
+    """tests/io/run_virtio_block.py prepare's folder (mmio): the ext4 root image and its boot initramfs."""
+    t, io, lib = _tools(), _io(), _lib()
     prefix, version = e2fsprogs()
     conf = prefix.parent.parent / 'etc/mke2fs.conf'         # the configuration prepare copies (its own fallback order)
     conf = conf if conf.exists() else pathlib.Path('/opt/homebrew/etc/mke2fs.conf')
     host = [prefix / 'sbin' / n for n in ('mke2fs', 'e2fsck', 'debugfs')] + ([conf] if conf.exists() else [])
     srcs = [str(rng_inputs()), str(resources.fetch('debian-kernel-deb')), str(prefix), version, _clang()]
     return resources.derived('io-block-inputs', _block_recipe,
-                             srcs + host + [t / 'run_virtio_block.py', t / 'run_virtio_rng.py', t / 'io_common.py',
+                             srcs + host + [io / 'run_virtio_block.py', io / 'run_virtio_rng.py', lib / 'io_common.py',
                                             t / 'play/mkcpio.py', t / 'reference/ref.py']) / 'inputs-01'
 
 
@@ -101,7 +112,7 @@ def _network_recipe(out: pathlib.Path, inputs: list) -> None:
 
 
 def network_rootfs() -> pathlib.Path:
-    """The iperf3/curl/openssl tree tools/run_net_linux.py copies into its guest: tools/io/network-rootfs, pinned Debian
+    """The iperf3/curl/openssl tree tests/io/run_net_linux.py copies into its guest: tools/io/network-rootfs, pinned Debian
     packages unpacked in an amd64 Debian container (the bench image's builder)."""
     recipe = _tools() / 'io' / 'network-rootfs'
     return resources.derived('io-network-rootfs', _network_recipe, [recipe, artifacts.build_env()]) / 'rootfs'
@@ -248,13 +259,13 @@ def _matrix_recipe(out: pathlib.Path, inputs: list) -> None:
 
 
 def matrix_inputs() -> pathlib.Path:
-    """tools/run_io_matrix.py prepare's folder (mmio): the block inputs' root plus fio, on a 2 GiB ext4 image. Its
+    """tests/io/run_io_matrix.py prepare's folder (mmio): the block inputs' root plus fio, on a 2 GiB ext4 image. Its
     inputs.json, linux and rootfs/bin/busybox are what run_serial_stress.py and run_io_soak.py read."""
-    t = _tools()
+    t, io, lib = _tools(), _io(), _lib()
     srcs = [str(fio_prep()), str(block_inputs()), inspect.getsource(writable_clone)]
     return resources.derived('io-matrix-inputs', _matrix_recipe,
-                             srcs + [t / 'run_io_matrix.py', t / 'run_fio_admission.py', t / 'run_fio_baselines.py',
-                                     t / 'run_virtio_block.py', t / 'run_virtio_rng.py', t / 'io_common.py']) / 'inputs'
+                             srcs + [io / 'run_io_matrix.py', io / 'run_fio_admission.py', io / 'run_fio_baselines.py',
+                                     io / 'run_virtio_block.py', io / 'run_virtio_rng.py', lib / 'io_common.py']) / 'inputs'
 
 
 def _io5_recipe(out: pathlib.Path, inputs: list) -> None:
@@ -266,14 +277,14 @@ def _io5_recipe(out: pathlib.Path, inputs: list) -> None:
 
 
 def io5_inputs() -> pathlib.Path:
-    """tools/run_io5.py prepare's folder: the Debian 13 nocloud image's disk.raw with its /boot kernel and initramfs
+    """tests/io/run_io5.py prepare's folder: the Debian 13 nocloud image's disk.raw with its /boot kernel and initramfs
     (taken out with Homebrew's debugfs) and the CPython 3.13.18 source, from the two pinned downloads
     (debian-cloud-nocloud, cpython-src). prepare checks the image's sha512 and the kernel's sha256 itself."""
-    t = _tools()
+    t, io, lib = _tools(), _io(), _lib()
     prefix, version = e2fsprogs()
     srcs = [str(resources.fetch('debian-cloud-nocloud')), str(resources.fetch('cpython-src')), str(prefix), version]   # paths: keyed by their pins
     return resources.derived('io5-inputs', _io5_recipe,
-                             srcs + [t / 'run_io5.py', t / 'io_common.py', t / 'run_net_linux.py', t / 'raw_root.py']) / 'inputs'
+                             srcs + [io / 'run_io5.py', lib / 'io_common.py', io / 'run_net_linux.py', t / 'raw_root.py']) / 'inputs'
 
 
 def recipe_sha256(recipe: pathlib.Path) -> str:
@@ -421,7 +432,7 @@ def campaign_image(suite: str) -> pathlib.Path:
     amd64 Debian builder (common.sh): a folder with <suite>.cpio.zst, <suite>-cases.txt (`PART TEST` per test, PART the
     kernel's part= word; also /ct/<suite>-cases.txt in the image), manifest.json (every download with its URL and sha256,
     the recipe files' hashes), log/ and, where the recipe writes one, oracle/ (litmus: herd7's states)."""
-    t = _tools()
+    t, io, lib = _tools(), _io(), _lib()
     pairs = [x for rel in campaign_sources(suite) for x in (rel, t / rel)]
     return resources.derived(f'campaign-{suite}', _campaign_recipe,
                              [suite, artifacts.build_env(), inspect.getsource(campaign_manifest) + inspect.getsource(read_pins), *pairs])

@@ -57,7 +57,7 @@ class Text:
 def build(name, t, memory=lambda i: [], rflags_regs=None, **kw):
     extra = lambda i: [{'addr': f'0x{DATA(i):x}', 'size': 0x1000, 'fill': 'zero'}] + memory(i)
     body = f'    mov rbx, {{data}}\n' + t.text()
-    return dict(events.build(name, body, memory_extra=extra, regs=rflags_regs, **kw), body=body)    # (`body`: tools/l3_expected.py)
+    return dict(events.build(name, body, memory_extra=extra, regs=rflags_regs, **kw), body=body)    # (`body`: tests/system/l3_expected.py)
 
 
 # ---- the UART: every width, the 8250 driver's probe, earlyprintk, loopback with FIFO ---------------------------------

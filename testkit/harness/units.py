@@ -2,7 +2,13 @@
 own result under the suite's item.
 
     [[suite]] harness = "units"  params = { tool = "nextest", fexc = true }
+    [[suite]] harness = "units"  params = { tool = "nextest", filter = "package(x) | test(/y/)" }      # those tests only
+    [[suite]] harness = "units"  params = { tool = "nextest", rest_of = ["SUITE", ...] }   # every test their filters leave
     [[suite]] harness = "units"  params = { tool = "pytest", include = [...], exclude = [...] }
+
+A nextest suite runs as many test threads as it claims cores. `filter` and `rest_of` split one test list into suites
+that run side by side (the slow disk tests on two cores, the rest on four) without a test falling between them: the rest
+is computed from the other suites' own filters.
 """
 import fnmatch
 import json
@@ -19,15 +25,18 @@ from testkit.harness import CaseResult, Requirement, SubResult
 
 
 def python_test_files() -> list[str]:
-    """The files `unittest discover -s tools -p 'test_*.py'` loads: tools/ itself, and packages below it."""
-    tools = paths.repo_root() / 'tools'
+    """The Python unit tests: what `unittest discover -s tools -p 'test_*.py'` loads (tools/ itself, and packages below
+    it), and the test_*.py files of tests/lib and of the family folders, next to the scripts they test."""
+    root = paths.repo_root()
+    tools = root / 'tools'
     out = [p for p in tools.glob('test_*.py')]
 
     def walk(d):
         for sub in sorted(x for x in d.iterdir() if x.is_dir() and (x / '__init__.py').exists()):
             out.extend(sub.glob('test_*.py')); walk(sub)
     walk(tools)
-    return sorted(str(p.relative_to(paths.repo_root())) for p in out)
+    out += (root / 'tests').glob('*/test_*.py')
+    return sorted(str(p.relative_to(root)) for p in out)
 
 
 def parse_libtest_json(text: str) -> list[SubResult]:
@@ -56,7 +65,9 @@ def parse_junit(path: pathlib.Path) -> list[SubResult]:
 
 class Units:
     def cases(self, fam, suite):
-        if suite.params.get('tool') == 'nextest': return ['all']
+        if suite.params.get('tool') == 'nextest':
+            self.nextest_filter(fam, suite)          # a misconfigured filter fails collection, not the run
+            return ['all']
         inc, exc = suite.params.get('include'), suite.params.get('exclude', [])
         files = python_test_files()
         if inc: files = [f for f in files if any(fnmatch.fnmatch(f, g) for g in inc)]
@@ -80,12 +91,30 @@ class Units:
         if it.suite.params.get('fexc'): env['FEXC'] = str(artifacts.fexc())
         return env
 
+    @staticmethod
+    def nextest_filter(fam, suite) -> list[str]:
+        """The `-E` argument of a nextest suite's `filter` or `rest_of` (nextest ORs several -E, so this is one). A
+        mistake in them is a configuration error, raised when the family is collected (`cases`)."""
+        p = suite.params
+        parts = [f'({p["filter"]})'] if p.get('filter') else []
+        for n in p.get('rest_of', []):
+            other = next((s for s in fam.suites if s.name == n), None)
+            if other is None or not other.params.get('filter'):
+                raise ValueError(f'{fam.name}/{suite.name}: rest_of names {n!r}, which is not a suite of this family with a filter')
+            parts.append(f'not ({other.params["filter"]})')
+        if parts and '-E' in p.get('args', []):
+            raise ValueError(f'{fam.name}/{suite.name}: -E in args beside filter/rest_of would widen the filter (nextest ORs them)')
+        return ['-E', ' & '.join(parts)] if parts else []
+
     def nextest(self, it) -> CaseResult:
         env = self._env(it)
         env['PATH'] = f'{artifacts.nextest().parent}:{env["PATH"]}'
         env['NEXTEST_EXPERIMENTAL_LIBTEST_JSON'] = '1'
+        cores = it.suite.needs.cores
+        threads = ['--test-threads', str(cores)] if isinstance(cores, int) else []     # "all": nextest's default
         r = subprocess.run(['cargo', '+1.97.0', 'nextest', 'run', '--offline', '--locked', '--no-fail-fast',
-                            '--message-format', 'libtest-json', *it.suite.params.get('args', [])],
+                            '--message-format', 'libtest-json', *threads, *self.nextest_filter(it.fam, it.suite),
+                            *it.suite.params.get('args', [])],
                            cwd=paths.repo_root(), env=env, capture_output=True, text=True)
         subs = parse_libtest_json(r.stdout)
         if not subs:

@@ -11,7 +11,7 @@ import dataclasses
 class CaseResult:
     outcome: str                    # passed | failed | skipped
     message: str = ''
-    category: str | None = None     # a testkit category (reused, unsupported, wrapped, build-failure, ...)
+    category: str | None = None     # a testkit category (reused, unsupported, build-failure, ...)
     sub: list = dataclasses.field(default_factory=list)      # [SubResult]: per-test results of a units suite
     output: bytes | None = None     # the normalized output (deterministic suites), for reuse
     own: bool = False               # failed for a reason of its own, not only through its sub-results (known_bugs)

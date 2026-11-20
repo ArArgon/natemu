@@ -20,8 +20,7 @@ from testkit.harness import CaseResult, Requirement
 from testkit.prepare import BuildFailure
 
 REF = paths.repo_root() / 'tools' / 'reference'
-for p in (REF, paths.repo_root() / 'tools'):
-    if str(p) not in sys.path: sys.path.insert(0, str(p))
+paths.use_test_scripts()          # run_slice1_vm (tests/lib) and the reference tool
 
 
 from testkit.harness.normalize_programs import _ref, answer, corpus_hash, mask_of, normalize  # noqa: E402,F401
@@ -264,7 +263,7 @@ class Programs:
         h = host.detect()
         return cache.key('outputs', n.key, artifacts.fexc().parent.name, locked.get('input', ''), it.case, it.variant.id,
                          h.chip, json.dumps(it.place.met), h.os_build, *sources(), pathlib.Path(__file__),
-                         paths.repo_root() / 'tools' / 'run_slice1_vm.py')
+                         paths.repo_root() / 'tests' / 'lib' / 'run_slice1_vm.py')
 
     @staticmethod
     def _reused(key) -> bytes | None:

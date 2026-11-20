@@ -9,7 +9,7 @@ The minimum is macOS 15: natemu uses Hypervisor.framework's interrupt-controller
 ## Fast mode on a Mac without FEAT_AFP
 
 On a Mac without FEAT_AFP (M1, M2) natemu's default floating-point mode, fast, keeps x86 results exact except for these
-documented deviations (the M4 has none; the names are the ones `tools/fp_deviations.py` and the test runners use):
+documented deviations (the M4 has none; the names are the ones `tests/lib/fp_deviations.py` and the test runners use):
 
 - `masked-sse-de`: with DE masked, an SSE or AVX instruction on a denormal operand does not set MXCSR.DE (the result is right).
 - `nan-results`: a NaN result can differ from x86 in sign or choice: the default NaN is positive, the one-instruction negated FMA forms (the scalar ones, the packed FNMADD and the first multiplicand of FNMSUB) flip a NaN's sign, two-NaN and three-NaN choices follow Arm's order (the addend of the packed FMSUB and FNMSUB and the subtracted lanes of FMADDSUB and FMSUBADD arrive quieted, so an SNaN there takes no priority), RSQRT's NaN has the other sign.
@@ -39,5 +39,5 @@ The price is speed, only where a program really hits those cases or is built to 
 
 Fast mode stays the default: making only the underflow or only the NaN fixes always-on cost +16% to +18% on average, which was too much.
 
-To check a Mac, run `sh tools/fp_check/run.sh` from a checkout (after the setup below): it builds into `$TMPDIR`, runs the trap probe
-and the floating-point test runners in both modes, and writes `$TMPDIR/fp_check/report.txt`.
+To check a Mac, run `sh tools/fp_check/run.sh` from a checkout (after the setup below): it runs the trap probe and the test
+framework's floating-point and fault families (`tests/fp`, `tests/faults`) in both modes, and writes `$TMPDIR/fp_check/report.txt`.

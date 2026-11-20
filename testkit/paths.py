@@ -9,6 +9,14 @@ def repo_root() -> pathlib.Path:
     return _REPO
 
 
+def use_test_scripts() -> None:
+    """Make the test scripts importable here (tests/lib/testenv.py: tests/lib, the family folders, tools, tools/reference)."""
+    import sys
+    lib = str(_REPO / 'tests' / 'lib')
+    if lib not in sys.path: sys.path.insert(0, lib)
+    import testenv  # noqa: F401
+
+
 def cache_root() -> pathlib.Path:
     v = os.environ.get('NATEMU_TEST_CACHE')
     return pathlib.Path(v) if v else pathlib.Path.home() / 'Library/Caches/natemu/testkit'
