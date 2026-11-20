@@ -1,0 +1,1 @@
+test_math: SUCCESS rc=0

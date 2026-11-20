@@ -37,8 +37,6 @@ everything, and these are the differences from hardware measured with Debian's i
   large arguments; for ordinary arguments results agree with hardware to ten digits and more.
 - The precision-control field of the x87 control word does nothing. A program that sets it to double (CPython does,
   around float formatting) gets the same results as on hardware.
-- A program that only passes on hardware through the x87's excess precision, or only fails through it, can behave
-  the other way round.
 
 Ordinary double arithmetic, casts to integers, the four rounding modes, comparisons, exception flags, and saving and
 restoring the x87 state (signal frames included) match hardware.
