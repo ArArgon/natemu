@@ -459,6 +459,9 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
   s.slice1 = st.profile == "slice1";
   // M2: the push-run stack option assumes 8-byte stack slots (fexc_hook.h); the host does not ask for it in 32-bit code.
   if (s.push_run && s.bitness != 64) return Fail("--push-run is 64-bit only");
+  // The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode, MOV r64, CR2 is a 64-bit load, and the
+  // inline CLI/STI, VERW and RDTSC are untested there. In 32-bit code they stay the resident's.
+  if ((s.cpl0 || s.tsc) && s.bitness != 64) return Fail("--cpl0 and --tsc are 64-bit only");
   if (st.ext_conds && (!s.slice1 || st.ext_conds < 0 || st.ext_conds > 8)) return Fail("--ext-conds needs profile slice1 and N in 0..8");
   if (s.slice1 && s.sparse_flag) return Fail("profile slice1 needs the dense PC table (sites would be attributed to the previous instruction)");
   if (s.slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");

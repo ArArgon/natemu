@@ -4232,14 +4232,15 @@ fn translation(
         compiler.avx_gated = avx_gated(&state.cpu);
         compiler.x87 = x87_args(&state.cpu, compiler.supported);
         compiler.alignment_gated = state.cpu.bit_tests_cut() && !(step && state.plain_step != 0);
-        compiler.cpl0 = state.cpu.cpl == 0 && !step;
+        // M2: the code segment's mode. (No request is made from 32-bit code yet: the resident stops
+        // `unsupported_code_mode` before asking, until it runs 32-bit code, task 3.)
+        compiler.bits32 = state.cpu.code_mode() == Some(exec::CodeMode::Compat32);
+        // (The inline CPL-0 forms are 64-bit code's: SWAPGS is #UD outside 64-bit mode; fexc refuses them with --bitness 32.)
+        compiler.cpl0 = state.cpu.cpl == 0 && !step && !compiler.bits32;
         compiler.tsc = compiler.cpl0 && crate::clock::frequency() == 24_000_000;
         compiler.cpl3 = state.cpu.cpl == 3;
         compiler.bulk = !step && !compiler.alignment_gated;
         compiler.push_run = state.cpu.stack_traps < exec::STACK_TRAP_LIMIT;
-        // M2: the code segment's mode. (No request is made from 32-bit code yet: the resident stops
-        // `unsupported_code_mode` before asking, until it runs 32-bit code, task 3.)
-        compiler.bits32 = state.cpu.code_mode() == Some(exec::CodeMode::Compat32);
         if !step {
             compiler.note_gating(state.cpu.code_context())?;
         }

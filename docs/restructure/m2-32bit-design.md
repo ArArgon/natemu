@@ -156,7 +156,8 @@ the combination FEX tests upstream.
   state save and restore.
 - Checked in task 2 ([findings](m2-task2-findings.md)): FEX's 32-bit code does assume the upper halves of the general
   registers are zero. Real hardware keeps the upper half of a register 32-bit code does not write and zeroes it on a
-  32-bit write. **Open (owner):** what the shim saves for them after 32-bit code (the findings give the options).
+  32-bit write. Task 3a saves them as zero after 32-bit code (the session's decision, reversible; the findings give the
+  alternatives).
 
 ## Segments
 

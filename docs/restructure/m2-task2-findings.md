@@ -60,7 +60,10 @@ Evidence that the rest of the chain takes the second map without change:
 - Admission, with the code-shape check, admitted all 719 blocks of FEX's 32-bit suite and the unit test's forms. Its
   rules name x0-x3, x25, x28 and "not a scratch register", never a guest register's number.
 - Our precision and site checkers read the map from the compiler's report. On 32-bit code: 2,545 compiles, 5,267 access
-  sites, no violation.
+  sites, no violation. Under `--bits32` the checker leaves out its comparison of each site with a model of the x86
+  instruction's accesses (P7b: the model knows 64-bit instructions), so 32-bit site records are checked against the
+  emitted code only (every access is a site of the right width, base and offset) until task 3 runs them against a
+  reference.
 
 **Does FEX's 32-bit code assume the upper halves of the general registers are zero? Yes.** It uses the whole 64-bit Arm
 register as an address (`ldr w20, [x9, #8]` for `[ebp+8]`, `str w9, [x8, #-4]!` for a push, `mov x0, x4` for
@@ -77,7 +80,9 @@ registers zero-extended.
 - 32-bit stack instructions work with a non-zero upper half of RSP: only ESP is used.
 
 So hardware keeps the upper half of an untouched register, and FEX needs it zero while 32-bit code runs. The shim
-cannot tell "untouched" from "written with the same low half" when it saves the state. See the open decision below.
+cannot tell "untouched" from "written with the same low half" when it saves the state. See the decision under "What
+task 3a needs". (The measurement is of an AMD processor; natemu presents an Intel one, whose manual calls the bits
+undefined.)
 
 ## 64-bit output
 
@@ -109,13 +114,16 @@ Running the tests (and comparing their results) waits for 32-bit code in the VM,
   save reading it back; `execution/sse.rs` for XMM): load EAX..EDI zero-extended into x4..x11 and XMM0-7 into v16-v23
   only; leave x12-x17, x19, x29 and v24-v31 out of both directions, so R8-R15 and XMM8-15 keep their values in the CPU
   state (`entry_frame_rest_zero` then has to allow or zero them). A test that they survive 64 -> 32 -> 64.
-- **Open decision (owner): the upper halves of RAX..RDI after 32-bit code.** Option 1: always save them as zero.
-  Simple; differs from hardware and QEMU for a register the 32-bit code never wrote. Option 2: keep the old upper half
-  when the low half is unchanged. Matches hardware for untouched registers, but is wrong when 32-bit code writes the
-  value a register already had (`xor eax, eax` on a zero low half keeps a stale upper half), silently. Exact behaviour
-  would need translated code to track which registers it wrote. The manuals leave these bits undefined, and no real
-  code can rely on them (any `push ebx` / `pop ebx` pair zeroes RBX's upper half on hardware). The round-trip test's
-  locked QEMU answers must be written to match the choice.
+- **The upper halves of RAX..RDI after 32-bit code. Decided (the orchestrating session's decision, reversible; the
+  owner is informed): the shim saves them as zero.** R8-R15 and XMM8-15 are preserved exactly. The alternatives were:
+  keep the old upper half when the low half is unchanged (matches the measured hardware for an untouched register, but
+  is silently wrong when 32-bit code writes the value a register already had, such as `xor eax, eax` on a zero low
+  half, and would have to exempt RSP, which the measurement shows zero-extended even when untouched); or exact
+  behaviour, which needs translated code to track which registers it wrote. Zero differs from the measured hardware and
+  from QEMU only for a register the 32-bit code never wrote. The Intel manual calls these bits undefined after a switch
+  to 32-bit code, the measurement is of an AMD processor while natemu presents an Intel one, and no real code can rely
+  on them (any `push ebx` / `pop ebx` pair zeroes RBX's upper half on hardware). The round-trip test's locked QEMU
+  answers must be written for this choice (no expectation on the upper half of an untouched legacy register).
 - **Addresses that wrap at 4 GiB.** FEX adds a small displacement with 64-bit addressing (`[ebp-8]` with EBP = 4
   reaches 0xFFFF_FFFF_FFFF_FFFC, not 0xFFFF_FFFC), and PUSH and POP move ESP with a 64-bit update (POP at
   ESP = 0xFFFF_FFFC leaves 0x1_0000_0000). The plan already gives task 3a "the 32-bit wrap of base plus offset and a
@@ -123,6 +131,19 @@ Running the tests (and comparing their results) waits for 32-bit code in the VM,
   faults and the shim can redo it at the wrapped address from the site record. In a process that also has memory above
   4 GiB (checkpoint C) the access could silently succeed at the wrong address: decide there whether these forms need
   32-bit address arithmetic in translated code (one more instruction per PUSH/POP).
+- **Fetching near 4 GiB.** The host fetches a window of up to two pages for a block. The compiler refuses a window
+  that crosses 4 GiB in 32-bit code (`CheckWindow` in `fexc.cpp`), so the host must end the window at 4 GiB there (and
+  let the instruction that runs off the end wrap or fault as x86 does), or a block near the top fails to compile.
+- **A displacement to a wrapped target.** Admission's check of a guest address built in the code (`displacement_ok` in
+  `admission/structure.rs`) takes a 64-bit difference, so an address that is the instruction's end plus a displacement
+  and wraps past 4 GiB is refused. It fails safe (a loud refusal), and 32-bit code has no RIP-relative operands, so only
+  a pushed return address or an exit target meets it, which other rules prove; revisit if a refusal shows up.
+- **Replay with both modes.** The replay case's stream is 64-bit only. Once 32-bit code runs, record a stream that
+  mixes both, or add a check that a 64-bit request answered after a 32-bit one by the same compiler process is
+  byte-identical to the same request answered first (the two modes are separate FEX contexts in one process).
+- **The inline CPL-0 forms** (CLI/STI, SWAPGS, MOV from CR2, VERW, RDTSC) are 64-bit code's: the compiler refuses
+  `--cpl0` and `--tsc` with `--bitness 32` and the host does not send them, so in 32-bit CPL-0 code they are the
+  shim's (SWAPGS is #UD outside 64-bit mode).
 - **Instructions the shim must run in 32-bit code**, beyond the 64-bit set: ARPL, LES/LDS, BOUND, PUSHA/POPA, AAM, INTO,
   POP DS/ES/SS and PUSH of every segment register; IRET, far transfers and software interrupts with 32-bit sizes.
 - **Segment bases.** The four fields (`frame::LEGACY_BASES`) are never written, so they are 0. When non-flat segments
