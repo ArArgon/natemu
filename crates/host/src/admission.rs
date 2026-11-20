@@ -11,7 +11,7 @@
 //! exits are returned as link points and the computed exit's branch for the resident to relocate.
 use natemu_abi::code_object::{self as object, Header, PcEntry, Reloc, Site};
 use natemu_abi::execution::{
-    ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, PRE_NZCV_REG, SRA, STAGING_BYTES,
+    ENTRY_OFFSET, LinkPoint, MAX_LINK_POINTS, PRE_NZCV_REG, SRA, SRA32, STAGING_BYTES,
     cache::MAX_BLOCK_BYTES,
 };
 
@@ -323,6 +323,11 @@ fn branch_target(insn: &[u8], end: u64) -> Option<u64> {
     Some(end.wrapping_add(rel as u64))
 }
 
+/// M2: a guest address of 32-bit code (`bits32`) wraps at 4 GiB, as fexc compiles its branch targets and return addresses.
+pub(super) fn wrap(address: u64, bits32: bool) -> u64 {
+    if bits32 { address & 0xffff_ffff } else { address }
+}
+
 /// Whether `insn` is a REP/REPE/REPNE string instruction (movs, cmps, stos, lods, scas): legacy prefixes including F2 or
 /// F3 (and REX bytes, [`crate::system::opcode_at`]), then a4-a7/aa-af as the instruction's last byte. Such an instruction ends its block and exits to its own RIP while RCX is
 /// not 0 (I2), so that RIP is a proven literal-exit target.
@@ -368,7 +373,21 @@ pub(crate) fn admit(
     shape: bool,
     cpl0: bool,
 ) -> Result<Admitted, String> {
-    let (mut admitted, parts) = admit_records(bytes, rip, source, supported, cpl0)?;
+    admit_mode(bytes, rip, source, supported, shape, cpl0, false)
+}
+
+/// [`admit`] for the code mode the request was made in: `bits32` for 32-bit code (M2: fexc's `--bitness 32`, FEX's
+/// compact register plan with the static map [`SRA32`], targets that wrap at 4 GiB, the ES/CS/SS/DS base loads).
+pub(crate) fn admit_mode(
+    bytes: &[u8],
+    rip: u64,
+    source: &[u8],
+    supported: u64,
+    shape: bool,
+    cpl0: bool,
+    bits32: bool,
+) -> Result<Admitted, String> {
+    let (mut admitted, parts) = admit_records(bytes, rip, source, supported, cpl0, bits32)?;
     let h = &parts.header;
     let code = &admitted.object[h.code_offset as usize..][..h.code_region_end as usize];
     let (fma, rest): (Vec<Site>, Vec<Site>) = parts.sites.iter().partition(|s| s.kind == object::kind::FMA);
@@ -388,6 +407,7 @@ pub(crate) fn admit(
         targets: &parts.targets,
         shape,
         cpl0,
+        bits32,
     };
     let (links, dispatch_exit, bulk) =
         structure::check(&c).map_err(|e| format!("object refused: {e}"))?;
@@ -399,6 +419,41 @@ pub(crate) fn admit(
     }
     (admitted.links, admitted.dispatch_exit, admitted.bulk) = (links, dispatch_exit, bulk);
     Ok(admitted)
+}
+
+/// Admits every object in `dir` (`NAME.obj`: fexc's `--object`, compiled from `NAME.src` at its header's RIP and in its
+/// header's code mode) for a vCPU with every feature, with the code-shape check, as a CPL-0 or a CPL-3 request: a
+/// summary with the admission time per block, and one line per refused object. The offline admission check of a set of
+/// compiled blocks (the driver's `admit-corpus`; the ignored `corpus` test).
+pub fn corpus(dir: &std::path::Path, cpl0: bool) -> (String, Vec<String>) {
+    let (mut n, mut words, mut time) = (0u64, 0u64, std::time::Duration::ZERO);
+    let mut refused = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+    entries.sort();
+    for obj in entries.iter().filter(|p| p.extension().is_some_and(|e| e == "obj")) {
+        let name = obj.file_name().unwrap().to_string_lossy();
+        let (bytes, source) = (std::fs::read(obj).unwrap(), std::fs::read(obj.with_extension("src")).unwrap());
+        n += 1;
+        if bytes.len() < size_of::<Header>() {
+            refused.push(format!("{name}: shorter than a header"));
+            continue;
+        }
+        let h: Header = record(&bytes, 0);
+        let t = std::time::Instant::now();
+        let r = admit_mode(&bytes, h.guest_rip, &source, u64::MAX, true, cpl0, h.guest_bitness == 32);
+        time += t.elapsed();
+        words += u64::from(h.code_region_end) / 4;
+        if let Err(e) = r {
+            refused.push(format!("{name}: {e}"));
+        }
+    }
+    let summary = format!(
+        "{n} objects, {} refused; {:.1} us per block, {:.1} ns per code word",
+        refused.len(),
+        time.as_secs_f64() * 1e6 / n.max(1) as f64,
+        time.as_secs_f64() * 1e9 / words.max(1) as f64
+    );
+    (summary, refused)
 }
 
 /// The records of an object [`admit_records`] accepted.
@@ -501,6 +556,7 @@ fn admit_records(
     source: &[u8],
     supported: u64,
     cpl0: bool,
+    bits32: bool,
 ) -> Result<(Admitted, Parts), String> {
     let fail = |what: &str| Err(format!("object refused: {what}"));
     if bytes.len() < size_of::<Header>() || bytes.len() > STAGING_BYTES {
@@ -514,7 +570,7 @@ fn admit_records(
     {
         return fail("magic, version or size");
     }
-    if h.guest_bitness != 64
+    if h.guest_bitness != if bits32 { 32 } else { 64 }
         || h.profile != object::PROFILE_SLICE1
         || h.settings != object::SETTING_DENSE_PC
     {
@@ -560,7 +616,7 @@ fn admit_records(
     if region < 4 || bytes[code..code + 4] != region.to_le_bytes() {
         return fail("code layout: head word is not the code region end");
     }
-    if h.sra_gpr[..h.sra_count as usize] != SRA {
+    if h.sra_gpr.get(..h.sra_count as usize) != Some(if bits32 { &SRA32[..] } else { &SRA[..] }) {
         return fail("static register map");
     }
     let sites: Vec<Site> = table(bytes, h.sites_offset, h.sites_count, code_end, bytes.len())?;
@@ -669,7 +725,7 @@ fn admit_records(
     }
     // Literal values: the block's own RIP (FEX's tail), its end, or the direct target
     // of a branch that ends it.
-    let end = rip.wrapping_add(h.guest_bytes as u64);
+    let end = wrap(rip.wrapping_add(h.guest_bytes as u64), bits32);
     let last = pcs
         .iter()
         .map(|p| p.guest_offset)
@@ -678,7 +734,8 @@ fn admit_records(
         .unwrap_or(0) as usize;
     let target = (h.end_reason == object::end_reason::BLOCK_ENDING_INSTRUCTION)
         .then(|| branch_target(&source[last..h.guest_bytes as usize], end))
-        .flatten();
+        .flatten()
+        .map(|t| wrap(t, bits32));
     let plausible = |v: u64| {
         (v == rip || v == end || Some(v) == target) && (structure::canonical(v) || v == end)
     };
@@ -741,6 +798,7 @@ fn admit_records(
         // (the last instruction too: a unit whose last branch's fall-through is a cut ends `system_instruction`)
         let next = starts.get(i + 1).copied().unwrap_or(h.guest_bytes);
         branch_target(&source[g as usize..next as usize], rip.wrapping_add(u64::from(next)))
+            .map(|t| wrap(t, bits32))
     });
     let targets = [Some(end), target, own]
         .into_iter()
@@ -934,7 +992,7 @@ mod tests {
 
     /// The record checks only: the synthetic object's code is no real block (`structure` tests use fexc output).
     fn admit(bytes: &[u8], rip: u64, source: &[u8], supported: u64) -> Result<Admitted, String> {
-        admit_records(bytes, rip, source, supported, false).map(|(a, _)| a)
+        admit_records(bytes, rip, source, supported, false, false).map(|(a, _)| a)
     }
 
     const RIP: u64 = 0x10_0000;
@@ -2082,45 +2140,14 @@ mod tests {
         );
     }
 
-    /// Every object in `$NATEMU_ADMIT_CORPUS` (`NAME.obj` compiled at its header RIP from `NAME.src`) is admitted with
-    /// the code-shape check;
-    /// prints the admission time per block. `cargo test --release -p natemu-host corpus -- --ignored --nocapture`.
+    /// Every object in `$NATEMU_ADMIT_CORPUS` is admitted ([`super::corpus`], as CPL-0 requests); prints the admission
+    /// time per block. `cargo test --release -p natemu-host corpus -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn corpus() {
         let dir = std::env::var("NATEMU_ADMIT_CORPUS").expect("NATEMU_ADMIT_CORPUS");
-        let (mut n, mut bad, mut words, mut time) = (0, 0, 0, std::time::Duration::ZERO);
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
-        entries.sort();
-        for obj in entries
-            .iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "obj"))
-        {
-            let (bytes, source) = (
-                std::fs::read(obj).unwrap(),
-                std::fs::read(obj.with_extension("src")).unwrap(),
-            );
-            let h: Header = record(&bytes, 0);
-            let t = std::time::Instant::now();
-            let r = super::admit(&bytes, h.guest_rip, &source, ALL, true, true);
-            time += t.elapsed();
-            n += 1;
-            words += h.code_region_end as u64 / 4;
-            if let Err(e) = r {
-                bad += 1;
-                if bad <= 40 {
-                    println!("{}: {e}", obj.file_name().unwrap().to_string_lossy());
-                }
-            }
-        }
-        println!(
-            "{n} objects, {bad} refused; {:.1} us per block, {:.1} ns per code word",
-            time.as_secs_f64() * 1e6 / n as f64,
-            time.as_secs_f64() * 1e9 / words as f64
-        );
-        assert_eq!(bad, 0);
+        let (summary, refused) = super::corpus(std::path::Path::new(&dir), true);
+        println!("{summary}");
+        assert!(refused.is_empty(), "{}", refused.join("\n"));
     }
 }

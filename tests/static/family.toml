@@ -54,6 +54,25 @@ argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--sh
 [suite.cases."fexc-precision-3"]
 argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--shard", "3/4"]
 
+# M2: the same checks on 32-bit code (--bitness 32): its own single-instruction forms and programs (PROGRAMS32).
+[suite.cases."fexc-precision-32"]
+argv = ["env", "FEXC={fexc}", "python3", "tools/fexc/verify_precision.py", "--bits32"]
+
+# M2: FEX's 32-bit ASM suite (245 tests), offline: every reachable block compiled for 32-bit code and admitted by the
+# host with the code-shape check. Running them waits for 32-bit code in the VM (M2 task 3).
+[suite.cases."fexc-asm32"]
+argv = ["tools/fexc/upstream_tests/run_asm.py", "--compile32", "--jobs", "4", "--fexc", "{fexc}", "--host", "{natemu_host}", "--out", "{out}",
+        "--src", "{fex_asm}/../32Bit_ASM"]
+needs = { cores = 4 }
+smoke = true
+
+# The replay gate (tools/fexc/README.md): the requests of one recorded boot (1 vCPU, to a busybox power-off), answered by
+# the compiler of this checkout's merge base with main and by this checkout's: every reply identical. A change that means
+# to alter 64-bit output fails here by design; such a change says so and is judged by the other suites.
+[suite.cases."fexc-replay"]
+argv = ["tools/fexc/replay.py", "--fexc", "{fexc}", "--old", "{fexc_base}", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}",
+        "--kernel", "{raw}/kernel-census-20261028-01/dl/linux", "--initrd", "{raw}/kernel-census-20261028-01/dl/initrd.gz", "--out", "{out}"]
+needs = { cores = 2, perf = true }
 
 [suite.cases."fexc-skips"]
 argv = ["tools/fexc/scan_skips.py", "{fexc}"]

@@ -222,7 +222,9 @@ int CfInverted(uint64_t guest, uint64_t native) {
 
 int SegmentOverride(uint32_t flags) {
   const uint32_t s = flags & X86Tables::DecodeFlags::FLAG_SEGMENTS;
-  return s == X86Tables::DecodeFlags::FLAG_FS_PREFIX ? 4 : s == X86Tables::DecodeFlags::FLAG_GS_PREFIX ? 5 : 0;
+  // (FEX's decoder records ES/CS/SS/DS prefixes only in 32-bit code, where they apply: x86's segment register numbers.)
+  using namespace X86Tables::DecodeFlags;
+  return s == FLAG_FS_PREFIX ? 4 : s == FLAG_GS_PREFIX ? 5 : s == FLAG_ES_PREFIX ? 6 : s == FLAG_CS_PREFIX ? 1 : s == FLAG_SS_PREFIX ? 2 : s == FLAG_DS_PREFIX ? 3 : 0;
 }
 // Join each site with FEX's own decode of its guest instruction: segment (stack ops use SS, which decides #SS(0) vs #GP(0)
 // for a non-canonical address; an explicit operand uses SS with an RSP/RBP base, else DS: CS/DS/ES/SS prefixes are ignored,
@@ -240,7 +242,8 @@ void JoinSites(uint64_t rip) {
         s.kind == FEXC_SITE_LOAD_PAIR || s.kind == FEXC_SITE_STORE_PAIR)   // (I5a: MOVAPS m128's X pair: its operand's segment)
       for (auto& i : Cap.insts) if (i.pc - rip == s.guest_offset) {
         const bool stack_base = i.mem.base == 4 || i.mem.base == 5;
-        if (!i.mem.present ? i.sets_rip || i.name == "LEAVE" : !i.seg && stack_base) s.segment = 1;
+        // (M2, 32-bit code: an explicit SS prefix too; ES is reported as 6, its number 0 being "none".)
+        if (!i.mem.present ? i.sets_rip || i.name == "LEAVE" : i.seg ? i.seg == 2 : stack_base) s.segment = 1;
         break;
       }
   }
@@ -454,7 +457,8 @@ static int ParseArgs(const std::vector<std::string>& args, Setup& s, bool serve)
   if (!s.have_rip || (!serve && s.hex.empty() == s.file.empty())) return Fail("usage: fexc (--hex HEX | --file PATH) --rip N [--bitness 32|64] [--max-insts N] [--profile default|slice1] [--multiblock] [--sparse-pc] [--no-end-marker] [--no-tso] [--sse-gated] [--avx-gated] [--alignment-gated] [--x87-gated] [--wait-gated] [--cpl0] [--tsc] [--bulk] [--x87-fpcr V] [--simd-unmasked M] [--x87-unmasked M] [--daz] [--ftz] [--feature NAME=0|1] [--config NAME=VALUE] [--out FILE] [--object FILE]");
   if (s.bitness != 32 && s.bitness != 64) return Fail("--bitness must be 32 or 64");
   s.slice1 = st.profile == "slice1";
-  if (s.slice1 && s.bitness != 64) return Fail("profile slice1 is 64-bit only");
+  // M2: the push-run stack option assumes 8-byte stack slots (fexc_hook.h); the host does not ask for it in 32-bit code.
+  if (s.push_run && s.bitness != 64) return Fail("--push-run is 64-bit only");
   if (st.ext_conds && (!s.slice1 || st.ext_conds < 0 || st.ext_conds > 8)) return Fail("--ext-conds needs profile slice1 and N in 0..8");
   if (s.slice1 && s.sparse_flag) return Fail("profile slice1 needs the dense PC table (sites would be attributed to the previous instruction)");
   if (s.slice1 && (st.tso || st.multiblock || st.end_marker)) return Fail("profile slice1 fixes TSO emulation off, multiblock off and no end marker");
@@ -496,6 +500,7 @@ static void Arm(const Setup& s) {
   fexc_guest_bytes = [](uint64_t a, uint64_t n) -> const uint8_t* { return InWindow(a, n) ? W.bytes + (a - W.base) : nullptr; };
   fexc_dense_pc_table = s.st.dense_pc;
   fexc_slice1 = s.slice1;
+  fexc_bits32 = s.bitness == 32;
 }
 
 // FEX's Config is process-global: rebuilt from nothing (Shutdown, Initialize, then `sets`) whenever a request needs other values
@@ -902,7 +907,7 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       if (in && (s.kind == FEXC_SITE_LOAD || s.kind == FEXC_SITE_STORE || s.kind == FEXC_SITE_SWAP || s.kind == FEXC_SITE_ATOMIC)) {
         const auto* m = &in->mem;
         j.obj("x86").kv("rip_relative", m->rip_relative).kv("base", m->base).kv("index", m->index).kv("scale", m->scale).kv("disp", m->disp);
-        if (in->seg) j.kv("segment_override", in->seg == 4 ? "fs" : "gs"); else j.null("segment_override");
+        if (in->seg) j.kv("segment_override", in->seg == 4 ? "fs" : in->seg == 5 ? "gs" : in->seg == 6 ? "es" : in->seg == 1 ? "cs" : in->seg == 2 ? "ss" : "ds"); else j.null("segment_override");
         j.end_obj();
       } else j.null("x86");
       j.end_obj();

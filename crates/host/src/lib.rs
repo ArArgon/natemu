@@ -9,6 +9,7 @@ use std::{ffi::c_void, fs, ptr};
 use vm::*;
 
 mod admission;
+pub use admission::corpus as admit_corpus;
 pub mod boot;
 pub mod clock;
 pub mod compile_cache;

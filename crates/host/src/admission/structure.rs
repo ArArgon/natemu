@@ -654,6 +654,15 @@ pub(super) struct Code<'a> {
     pub shape: bool,
     /// The request was at CPL 0 (perf chunk 15): IF's flag byte is writable, by CLI and STI only ([`Verifier::frame_access`]).
     pub cpl0: bool,
+    /// M2: 32-bit code: guest addresses wrap at 4 GiB and the ES/CS/SS/DS bases may be loaded ([`Verifier::frame_access`]).
+    pub bits32: bool,
+}
+
+impl Code<'_> {
+    /// The guest address `offset` bytes into the block.
+    fn address(&self, offset: u64) -> u64 {
+        super::wrap(self.rip.wrapping_add(offset), self.bits32)
+    }
 }
 
 pub(super) fn canonical(a: u64) -> bool {
@@ -1029,7 +1038,7 @@ impl<'a> Verifier<'a> {
             return false;
         };
         let insn = self.guest_insn(g);
-        let disp = value.wrapping_sub(self.c.rip.wrapping_add(g as u64 + insn.len() as u64)) as i64;
+        let disp = value.wrapping_sub(self.c.address(g as u64 + insn.len() as u64)) as i64;
         disp == 0
             || i32::try_from(disp).is_ok_and(|d| insn.windows(4).any(|b| b == d.to_le_bytes()))
     }
@@ -1271,8 +1280,12 @@ impl<'a> Verifier<'a> {
                 .any(|&f| (offset, m.size) == (i64::from(f), 8));
             m.load && self.c.cpl0 && field && (!self.c.shape || insn.is_some_and(x86_verw))
         };
+        // M2: 32-bit code loads the ES, CS, SS and DS bases (FEX adds a named segment's base, and ES's for every string
+        // destination): `frame::LEGACY_BASES`, which the resident holds at 0 while only flat segments run.
+        let legacy = self.c.bits32 && m.load && inside(&frame::LEGACY_BASES);
         if matches!(m.form, Form::Unsigned | Form::Pair)
             && (fields.iter().any(inside)
+                || legacy
                 || flag()
                 || (m.form == Form::Unsigned && (swapgs() || cr2() || verw())))
         {
@@ -1874,11 +1887,12 @@ impl<'a> Verifier<'a> {
                     return Err(format!("exit at {at:#x}: its branch is outside the PC table"));
                 };
                 let insn = self.guest_insn(g);
-                let end = self.c.rip.wrapping_add(g as u64 + insn.len() as u64);
-                let own = self.c.rip.wrapping_add(g as u64);
+                let end = self.c.address(g as u64 + insn.len() as u64);
+                let own = self.c.address(g as u64);
                 // (An exit owned by the unit's end, past the last instruction, goes to the end RIP: `own` there.)
                 let retry = target == own && (g >= self.c.guest_bytes || super::retries_own_rip(insn));
-                if Some(g) != last && !retry && super::branch_target(insn, end) != Some(target) {
+                let direct = super::branch_target(insn, end).map(|t| super::wrap(t, self.c.bits32));
+                if Some(g) != last && !retry && direct != Some(target) {
                     return Err(format!(
                         "exit at {at:#x}: literal {target:#x} is not the direct target of the branch instruction reaching it (guest {insn:02x?} at {own:#x}, branch at {})",
                         src.map_or("none: reached by falling through".into(), |s| format!("{s:#x}"))
@@ -2550,6 +2564,62 @@ mod tests {
         let h: Header = super::super::record(object, 0);
         super::super::admit(object, h.guest_rip, source, u64::MAX, shape, cpl0).map(|_| ())
     }
+    /// M2, with `FEXC` set: 32-bit code (`--bitness 32`) is admitted under its mode only, with FEX's compact register map,
+    /// branch targets and return addresses that wrap at 4 GiB, and the ES/CS/SS/DS base loads; a 64-bit object is refused
+    /// under the 32-bit mode, and a base load patched into 64-bit code stays refused (`frame_fields`).
+    #[test]
+    fn code_of_32_bit_mode_is_admitted_under_its_mode_only() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("natemu-admit32-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compile = |hex: &str, rip: &str, bits: &str| -> (Vec<u8>, Vec<u8>) {
+            let object = dir.join("o");
+            let out = std::process::Command::new(&fexc)
+                .args(["--hex", hex, "--rip", rip, "--profile", "slice1", "--bitness", bits, "--narrow-cmp", "--ext-conds", "4"])
+                .arg("--object")
+                .arg(&object)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{hex} at {rip}");
+            let source = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+            (std::fs::read(&object).unwrap(), source)
+        };
+        let admit = |(object, source): &(Vec<u8>, Vec<u8>), bits32: bool| {
+            let h: Header = super::super::record(object, 0);
+            super::super::admit_mode(object, h.guest_rip, source, u64::MAX, true, false, bits32).map(|a| a.links.len())
+        };
+        // (hex, RIP): a frame set-up with inc/dec r32; string instructions (DS and ES bases); every segment prefix; a pushed
+        // return address and a call target that wrap (call +0 ending at 4 GiB); a jcc whose fall-through is 4 GiB; a jmp to
+        // 4 GiB; a wrapping backward jmp at the bottom; an indirect call and a ret; x87 and SSE forms; DAA.
+        for (hex, rip) in [
+            ("5589e58b450840894424044f5dc3", "0x8048000"),
+            ("a5aa66adaf", "0x8048000"),
+            ("f3a5", "0x8048000"),
+            ("268b032e8b0b368b133e8b4500648b03658b0d10000000", "0x8048000"),
+            ("e800000000", "0xfffffffb"),
+            ("7402ebfe", "0xfffffffc"),
+            ("eb7e", "0xffffff80"),
+            ("e9fbfffffe", "0x10"),
+            ("ff10", "0x8048000"),
+            ("c20800", "0x8048000"),
+            ("d900dc03db1fdf2cdf7c2438", "0x8048000"),
+            ("0f28000f580b660fefc0f20f2a17", "0x8048000"),
+            ("27d50a", "0x8048000"),
+        ] {
+            let block = compile(hex, rip, "32");
+            admit(&block, true).unwrap_or_else(|e| panic!("{hex} at {rip}: {e}"));
+            let e = admit(&block, false).expect_err("32-bit code admitted as 64-bit code");
+            assert!(e.contains("profile or settings"), "{hex}: {e}");
+        }
+        let e = admit(&compile("4889d8c3", "0x8048000", "64"), true).expect_err("64-bit code admitted as 32-bit code");
+        assert!(e.contains("profile or settings"), "{e}");
+        // The link points of the wrapping exits carry the wrapped RIPs (0, not 4 GiB).
+        assert_eq!(admit(&compile("7402ebfe", "0xfffffffc", "32"), true), Ok(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// `fixture` with the code word at `at` (which must be `old`) replaced by `new`.
     fn patched(fixture: (&[u8], &[u8]), at: u32, old: u32, new: u32) -> Vec<u8> {
         let h: Header = super::super::record(fixture.0, 0);

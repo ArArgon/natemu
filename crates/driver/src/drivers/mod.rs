@@ -2,7 +2,7 @@
 //! bytes, initial state, test devices) and calls the emulator mechanisms (vm, memory, owners, execution) through their
 //! ordinary operations; its test-only behaviour (tampers, the logging IDT, CPL switches, event sources) is its
 //! `execution::Hook`, so no library module knows a test case. `boot-linux` runs a bzImage on the library's boot entry
-//! ([`natemu::linux::Boot`]), with no fixture or hook.
+//! ([`natemu::linux::Boot`]), with no fixture or hook. `admit-corpus` runs admission alone on a folder of fexc objects (no VM).
 use crate::*;
 
 mod linux;
@@ -30,6 +30,8 @@ enum Command {
     RunProgram(program::Args),
     #[command(args_override_self = true)]
     BootLinux(linux::Args),
+    /// Admit every fexc object of a folder (NAME.obj compiled from NAME.src), offline; RUNTIME is `unused`
+    AdmitCorpus { dir: std::path::PathBuf },
 }
 
 /// Dispatches the host CLI (`natemu-host RUNTIME.elf run-program|boot-linux ...`) to its driver. A refused command line
@@ -43,6 +45,11 @@ pub(crate) fn run() -> Result<()> {
     match cli.command {
         Command::RunProgram(args) => program::run(&cli.runtime, args),
         Command::BootLinux(args) => linux::run(&cli.runtime, args),
+        Command::AdmitCorpus { dir } => {
+            let (summary, refused) = natemu::admit_corpus(&dir, false);
+            println!("{summary}");
+            if refused.is_empty() { Ok(()) } else { Err(refused.join("\n").into()) }
+        }
     }
 }
 

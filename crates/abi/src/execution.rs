@@ -1551,6 +1551,11 @@ pub mod frame {
     /// writes it, [`KERNEL_GS_BASE`]).
     pub const GS_BASE: u32 = FLAGS - 16;
     pub const FS_BASE: u32 = FLAGS - 8;
+    /// M2: FEX's `es_cached`, `cs_cached`, `ss_cached` and `ds_cached` (4 bytes each, in that order, right before
+    /// [`GS_BASE`]): the bases FEX adds in 32-bit code to an address that names the segment, and ES's to every string
+    /// destination. Admission lets 32-bit code load them. Nothing writes them: they are 0 with the rest of the page, which
+    /// is right while 32-bit code runs with flat segments only (a non-flat one does not reach translated code).
+    pub const LEGACY_BASES: (u32, u32) = (GS_BASE - 16, 16);
     /// Perf chunk 17: IA32_KERNEL_GS_BASE while a CPL-0 block runs, 8 bytes in FEX's `L1Pointer` (no generated code uses it),
     /// written by the resident at every entry (0 at CPL > 0, so CPL 3 never reads the kernel's value there). A CPL-0
     /// translation's inline SWAPGS exchanges it with [`GS_BASE`] (admission allows those loads and stores only in a CPL-0
@@ -2136,6 +2141,9 @@ pub const MAX_LINK_POINTS: usize = 4;
 pub const SRA: [u8; 18] = [
     4, 7, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 29, 26, 27,
 ];
+/// M2: the static-register map of 32-bit code (FEX `x32::SRA`, its compact plan): EAX..EDI, then PF and AF. The native
+/// registers [`SRA`] gives R8..R15 (x12..x17, x19, x29) and XMM8..XMM15 (v24..v31) are scratch registers there.
+pub const SRA32: [u8; 10] = [4, 7, 5, 6, 8, 9, 10, 11, 26, 27];
 /// The native frame a block is entered with (`Shared::initial`) is built in place: at every entry the resident writes
 /// the static registers ([`SRA`]: GPRs, PF, AF), x28, SP, v16..v31, FPCR and FPSR, and nothing writes the rest, which
 /// the host zeroes and the resident's start zeroes again. Whether that rest is zero (the host checks it at every stop).

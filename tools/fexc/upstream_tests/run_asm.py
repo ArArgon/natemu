@@ -3,6 +3,7 @@
 
 usage: run_asm.py --fexc FEXC --out DIR [--src .../unittests/ASM] [--only SUBSTR] [--limit N] [--jobs N] [--keep]
        run_asm.py --fexc FEXC --out DIR --selftest
+       run_asm.py --fexc FEXC --out DIR --compile32 --host NATEMU_HOST --src .../unittests/32Bit_ASM   (offline; see REFUSED32)
 
 Conventions, copied from FEX (CMakeLists.txt in unittests/ASM, Scripts/json_asm_config_parse.py,
 Source/Tools/TestHarnessRunner, CommonTools/HarnessHelpers.h) and checked against them:
@@ -434,6 +435,110 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
         if not keep: shutil.rmtree(work, ignore_errors=True)
 
 
+# M2 task 2: FEX's 32-bit suite (unittests/32Bit_ASM, every test `Mode` 32BIT) offline: natemu does not run 32-bit code
+# yet (task 3), so each test is only compiled, then admitted. Built as FEX's CMake does (BITS 32, org 10000h, the DS and ES
+# loads before the test, `ret` after it). The reachable code is found from the entry: each block fexc compiles
+# (`--bitness 32 --profile slice1`, the host's request less its mode-dependent gating) leads to its fall-through, its direct
+# branch target and, after an instruction the resident runs (a cut), the next instruction; an `hlt` ends a path, as do
+# indirect branches and returns. A test fails when fexc crashes or answers no report, when a block ends at an
+# `unsupported_form` outside REFUSED32 (the forms 32-bit code is refused by decision), at a decoder error, or when the
+# host's admission (`natemu-host admit-corpus`, with the code-shape check) refuses one of its objects.
+REFUSED32 = ('16-bit addressing (0x67) in 32-bit code', '16-bit near branch (66) in 32-bit code', 'group 1 alias 82 in 32-bit code',
+             'REPNE prefix on movs/stos/lods', 'fbld/fbstp', 'undocumented')
+def direct_target(insn, end):
+    """The direct branch target of the 32-bit instruction `insn` ending at `end` and whether it also falls through."""
+    op = insn.lstrip(bytes(LEGACY))
+    if op[:1] in (b'\xeb', b'\xe9') or 0x70 <= op[0] <= 0x7f or 0xe0 <= op[0] <= 0xe3 or op[:1] == b'\xe8' or (op[0] == 0x0f and 0x80 <= op[1] <= 0x8f):
+        rel = int.from_bytes(op[1:2] if len(op) == 2 else op[-4:], 'little', signed=True)
+        return (end + rel) & 0xffffffff, op[0] not in (0xeb, 0xe9)
+    return None, op[0] == 0xff and len(op) > 1 and op[1] >> 3 & 7 == 2   # an indirect call returns to its fall-through
+
+
+def compile32(fexc, src, out, path, objects):
+    name = str(path.relative_to(src))
+    work = out / 'work' / name.replace('/', '__')
+    work.mkdir(parents=True, exist_ok=True)
+    rec = {'test': name, 'blocks': 0, 'insns': 0, 'cuts': collections.Counter()}
+    fail = lambda why, detail='': {**rec, 'cuts': dict(rec['cuts']), 'outcome': 'fail', 'reason': why, 'detail': detail}
+    (work / 't.asm').write_text('BITS 32\norg 10000h\nmov eax, 0x17\nmov ds, ax\nmov es, ax\n' + path.read_text() + '\nret\n')
+    n = subprocess.run(['nasm', '-i', str(src / 'Includes') + '/', work / 't.asm', '-o', work / 't.bin'], capture_output=True, text=True)
+    if n.returncode: return fail('harness: nasm failed', n.stderr[-500:])
+    binary = (work / 't.bin').read_bytes()
+    todo, seen = [0], set()
+    while todo:
+        at = todo.pop()
+        if at in seen or not 0 <= at < len(binary): continue
+        seen.add(at)
+        stem = f"{name.replace('/', '__')}-{at:05x}"
+        (objects / f'{stem}.src').write_bytes(binary[at:at + 4096])
+        r = subprocess.run([fexc, '--file', objects / f'{stem}.src', '--rip', hex(CODE + at), '--bitness', '32', '--profile', 'slice1', '--narrow-cmp',
+                            '--ext-conds', '4', '--object', objects / f'{stem}.obj', '--out', work / 'j'], capture_output=True, text=True, timeout=60)
+        if r.returncode not in (0, 1): return fail('fexc crashed', f'at {CODE + at:#x} ({binary[at:at + 15].hex()}): exit {r.returncode} {r.stderr[-300:]}')
+        d = json.loads((work / 'j').read_text())
+        if 'guest' not in d: return fail('fexc: no code and no cut', f"at {CODE + at:#x} ({binary[at:at + 15].hex()}): {d.get('error')} {d.get('diagnostics')}")
+        g = d['guest']; end = g['end']; stop = int(end['rip'], 0) - CODE
+        if d['status'] != 'ok': (objects / f'{stem}.src').unlink(); (objects / f'{stem}.obj').unlink(missing_ok=True)
+        else: rec['blocks'] += 1; rec['insns'] += g['instructions_translated']
+        sizes = {int(i['rip'], 0) - CODE: i['size'] for i in g.get('instructions', [])}
+        # (extended blocks: every conditional branch inside the unit leads somewhere too)
+        for i in g.get('instructions', []):
+            o = int(i['rip'], 0) - CODE
+            if i['translated'] and i['sets_rip']:
+                target, falls = direct_target(binary[o:o + i['size']], CODE + o + i['size'])
+                todo += ([target - CODE] if target is not None else []) + ([o + i['size']] if falls else [])
+        reason = end['reason']
+        if reason == 'end_of_input' or (reason == 'block_ending_instruction' and end['detail'] in ('RET', 'JMP', 'CALL', 'JMPF', 'CALLF')):
+            continue   # (their targets were added above)
+        if reason in ('block_ending_instruction', 'max_instructions', 'fex_instruction_limit'):
+            todo.append(stop)
+            continue
+        if reason not in ('system_instruction', 'unsupported_form'):
+            return fail(f'no code: {reason}', f"at {CODE + stop:#x} ({binary[stop:stop + 15].hex()}): {end.get('detail')}")
+        if reason == 'unsupported_form' and not any(x in end['detail'] for x in REFUSED32):
+            return fail('unsupported_form outside REFUSED32', f"at {CODE + stop:#x} ({binary[stop:stop + 15].hex()}): {end['detail']}")
+        rec['cuts'][end['detail'].split(' (opcode map')[0]] += 1
+        if binary[stop] == 0xf4: continue   # hlt: the test's end
+        length = sizes.get(stop)
+        if not length:   # (an instruction FEX does not decode: LES, LDS, BOUND, a far call)
+            dis = subprocess.run(['ndisasm', '-b', '32', '-o', hex(CODE + stop), '-e', str(stop), work / 't.bin'], capture_output=True, text=True).stdout.splitlines()
+            length = len(dis[0].split()[1]) // 2 if dis else 1
+        todo.append(stop + length)
+    shutil.rmtree(work, ignore_errors=True)
+    return {**rec, 'cuts': dict(rec['cuts']), 'outcome': 'pass'}
+
+
+def main32(a):
+    objects = a.out / 'objects'
+    shutil.rmtree(objects, ignore_errors=True); objects.mkdir(parents=True)
+    tests = sorted(p for p in a.src.rglob('*.asm') if 'Includes' not in p.parts and header(p.read_text()).get('MODE', '').upper() == '32BIT')
+    if a.only: tests = [t for t in tests if a.only in str(t.relative_to(a.src))]
+    if not tests: sys.exit(f'no 32-bit ASM tests found under {a.src}')
+    with cf.ThreadPoolExecutor(a.jobs) as ex:
+        results = list(ex.map(lambda p: compile32(a.fexc, a.src, a.out, p, objects), tests))
+    # Admission, offline: every object of every test, with the code-shape check.
+    adm = subprocess.run([a.host, 'unused', 'admit-corpus', objects], capture_output=True, text=True)
+    refused = collections.defaultdict(list)
+    for line in adm.stderr.splitlines():
+        if '.obj: ' in line: refused[line.rsplit('-', 1)[0]].append(line)
+    for r in results:
+        bad = refused.get(r['test'].replace('/', '__'))
+        if bad and r['outcome'] == 'pass': r.update(outcome='fail', reason='admission refused a block', detail='; '.join(bad[:3]))
+    (a.out / 'results.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in results))
+    (a.out / 'results.json').write_text(json.dumps({'results': [
+        {'name': r['test'], 'outcome': 'match' if r['outcome'] == 'pass' else 'fail',
+         'diffs': [f"{r.get('reason')} {r.get('detail', '')}"] if r['outcome'] != 'pass' else []} for r in results]}, indent=1) + '\n')
+    cuts = collections.Counter()
+    for r in results: cuts.update(r['cuts'])
+    bad = [r for r in results if r['outcome'] != 'pass']
+    print(f"{len(results)} 32-bit tests compiled offline: {len(results) - len(bad)} pass, {len(bad)} fail; "
+          f"{sum(r['blocks'] for r in results)} blocks, {sum(r['insns'] for r in results)} instructions translated")
+    print('admission:', adm.stdout.strip() or adm.stderr.strip()[-300:])
+    for why, n in cuts.most_common(): print(f'  cut {n:5}  {why}')
+    for r in bad: print('FAIL', r['test'], r.get('reason'), r.get('detail', ''))
+    if not a.keep: shutil.rmtree(objects, ignore_errors=True)
+    sys.exit(1 if bad or (adm.returncode and not refused) else 0)
+
+
 def category(reason):
     """Coarse family of an unsupported reason, for the summary."""
     return reason.split(': ')[1] if reason.startswith('refused form') else reason.split(' (')[0]
@@ -487,8 +592,11 @@ def main():
     ap.add_argument('--no-build', action='store_true', help='use the binaries already in target/')
     ap.add_argument('--keep', action='store_true', help='keep per-test work dirs')
     ap.add_argument('--selftest', action='store_true')
+    ap.add_argument('--compile32', action='store_true', help="FEX's 32-bit suite (--src .../unittests/32Bit_ASM), compiled and admitted offline; needs --host")
+    ap.add_argument('--host', type=pathlib.Path, help='natemu-host (its admit-corpus), for --compile32')
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
+    if a.compile32: return main32(a)
     if a.selftest:
         a.src = pathlib.Path(tempfile.mkdtemp(dir=a.out))
         (a.src / 'Includes').mkdir()

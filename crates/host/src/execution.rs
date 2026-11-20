@@ -2558,6 +2558,11 @@ pub struct Compiler {
     /// fexc's `--push-run` (the default; false for a vCPU past [`exec::STACK_TRAP_LIMIT`] stack-check firings: part of the
     /// code context, bit 33, and the last gating argument).
     pub(crate) push_run: bool,
+    /// M2: a request for 32-bit code (the code segment's mode): fexc's `--bitness 32` and admission's 32-bit rules
+    /// ([`admission::admit_mode`]). Such a request is always compiled: no kept answer (so none relocated to another RIP), no
+    /// persistent cache, no template for the pool or the resident, and no `--push-run` (it assumes 8-byte stack slots).
+    /// The answers kept in memory are keyed without the mode, which is why 32-bit requests stay out of them.
+    pub(crate) bits32: bool,
     /// The performance log's record of this vCPU (`perf::on`; [`Compiler::finish`]).
     pub perf: Option<Box<crate::perf::Recorder>>,
     /// The last compile's answer: how many guest bytes it read (fexc's extent, at most the bytes given), and whether a
@@ -2746,6 +2751,7 @@ impl Compiler {
             cpl3: false,
             bulk: false,
             push_run: true,
+            bits32: false,
             perf: None,
             read: 0,
             halved: false,
@@ -2828,7 +2834,7 @@ impl Compiler {
     ) -> Result<std::result::Result<Code, (u32, &'static str)>> {
         let gating = self.gating();
         let t = self.stamp();
-        let (found, waited) = self.answers.find(bytes, rip, limit, &gating);
+        let (found, waited) = if self.bits32 { (None, 0) } else { self.answers.find(bytes, rip, limit, &gating) };
         self.waited(waited);
         self.charge(crate::perf::LOOKUP, t);
         if let Some(e) = &found {
@@ -2848,7 +2854,7 @@ impl Compiler {
         }
         // Nothing kept, or an answer kept for another RIP that is not fexc's here: the persistent cache only in the first
         // case (it is keyed as memory is, so it would hold the same answer).
-        let mut disk = found.is_none();
+        let mut disk = found.is_none() && !self.bits32;
         loop {
             let (compiles, disk_hits) = (self.compiles, self.disk_hits);
             let (reply, at) = self.ask(bytes, rip, limit, disk, hook)?;
@@ -2870,7 +2876,7 @@ impl Compiler {
                 kept: Default::default(),
                 published: AtomicU64::new(0),
             });
-            let (held, waited) = self.answers.insert(limit, entry.clone(), bytes, rip);
+            let (held, waited) = if self.bits32 { (None, 0) } else { self.answers.insert(limit, entry.clone(), bytes, rip) };
             self.waited(waited);
             // Perf chunk 13: the lookup found nothing and another vCPU kept a matching answer while this one compiled.
             if disk && self.compiles > compiles && held.is_some_and(|o| o != self.vcpu) {
@@ -2878,7 +2884,7 @@ impl Compiler {
             }
             // PIC study: fexc compiled again an answer the map had dropped (by this vCPU's own: `.1`).
             let mut recompiled = false;
-            if self.compiles > compiles {
+            if self.compiles > compiles && !self.bits32 {
                 if let Some(owner) = self.answers.recompiled(limit, &entry) {
                     self.recompiled[0] += 1;
                     self.recompiled[1] += u64::from(owner == self.vcpu);
@@ -2899,7 +2905,7 @@ impl Compiler {
             };
             match self.reuse(&entry, bytes, rip, limit, hook, Some(origin))? {
                 Some(code) => {
-                    if self.pool.is_some() {
+                    if self.pool.is_some() && !self.bits32 {
                         self.last = Some(entry);
                     }
                     return Ok(code);
@@ -3125,13 +3131,14 @@ impl Compiler {
                     let mut admitted = match skipped {
                         Some(a) if !self.check_reuse => a,
                         skipped => {
-                            let a = admission::admit(
+                            let a = admission::admit_mode(
                                 object,
                                 rip,
                                 bytes,
                                 self.supported,
                                 self.shape,
                                 self.cpl0,
+                                self.bits32,
                             )?;
                             // The reuse check: the kept form is admission's.
                             if skipped.is_some_and(|s| s != a) {
@@ -3287,12 +3294,16 @@ impl Compiler {
         for a in [&b"--profile"[..], b"slice1", b"--rip", rip.as_bytes()] {
             arg(&mut body, a);
         }
+        if self.bits32 {
+            arg(&mut body, b"--bitness");
+            arg(&mut body, b"32");
+        }
         if let Some(n) = limit {
             arg(&mut body, b"--max-insts");
             arg(&mut body, n.to_string().as_bytes());
         }
         body.extend_from_slice(&self.feature_args);
-        if self.push_run {
+        if self.push_run && !self.bits32 {
             arg(&mut body, b"--push-run");
         }
         arg(&mut body, b"--narrow-cmp");
@@ -3330,7 +3341,7 @@ impl Compiler {
         _hook: &mut impl Hook,
     ) -> Result<(Reply, u64)> {
         let t = self.stamp();
-        let cache = self.disk.clone().filter(|_| self.cpl3);
+        let cache = self.disk.clone().filter(|_| self.cpl3 && !self.bits32);
         let key = cache
             .as_ref()
             .filter(|d| disk && !d.is_empty())
@@ -4322,6 +4333,7 @@ fn translation(
     let last = rip.wrapping_add(u64::from(block.guest_bytes).max(1) - 1) >> 12;
     let template = !step
         && !cut
+        && !compiler.bits32
         && !compiler.halved
         && block.end_reason != natemu_abi::code_object::end_reason::UNSUPPORTED_FORM
         && compiler.read < bytes_len
@@ -5254,6 +5266,36 @@ mod tests {
                 }
             }
         }
+    }
+    /// M2, with `FEXC` set: a request for 32-bit code asks fexc for `--bitness 32` without `--push-run`, is admitted under
+    /// the 32-bit rules, and is compiled every time: its answer is not kept, so it is neither found again nor moved to
+    /// another RIP, and a 64-bit request for the same bytes at the same RIP gets its own compile.
+    #[test]
+    fn requests_for_32_bit_code_are_always_compiled() {
+        let Some(fexc) = std::env::var_os("FEXC") else {
+            return;
+        };
+        let mut c = super::Compiler::with_features(std::path::Path::new(&fexc), u64::MAX, None);
+        c.shape = true;
+        c.bits32 = true;
+        let body = c.body(&[0x90], 0x1000, None);
+        let args = String::from_utf8_lossy(&body[4..body.len() - 1]).replace('\0', " ");
+        assert!(args.contains("--bitness 32") && !args.contains("--push-run"), "{args}");
+        let code = [0x40, 0x01, 0xd8, 0xc3]; // inc eax; add eax, ebx; ret (64-bit code: REX add; ret)
+        let mut insns = |c: &mut super::Compiler, rip| match c.compile(&code, rip, false, &mut ()).unwrap() {
+            Code::Block(b) => b.guest_insns,
+            _ => panic!("no block"),
+        };
+        assert_eq!(insns(&mut c, 0x1000), 3);
+        assert_eq!(insns(&mut c, 0x1000), 3);
+        assert_eq!(insns(&mut c, 0x2000), 3);
+        assert_eq!((c.compiles, c.hits, c.relocated, c.disk_hits), (3, 0, 0, 0));
+        c.bits32 = false;
+        assert_eq!(insns(&mut c, 0x1000), 2);
+        assert_eq!((c.compiles, c.hits), (4, 0));
+        c.bits32 = true;
+        assert_eq!(insns(&mut c, 0x1000), 3);
+        assert_eq!((c.compiles, c.hits), (5, 0));
     }
     #[test]
     fn compiler_keys_answers_by_what_fexc_read() {
