@@ -61,7 +61,12 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         return Err(NM);
     }
     let rfbm = xcr0 & (rdx << 32 | rax & 0xffff_ffff);
-    let va = address(&s.cpu, &i);
+    // M2 task 3b: 32-bit code has XMM0..7 (SDM Vol.1 10.5.1, 13.5.2: the XMM8..15 fields and YMM8..15's upper halves are
+    // neither stored nor loaded outside 64-bit mode; the bank keeps the 64-bit side's): the SSE part ends at `xmm_end`,
+    // the AVX part at `avx_end`.
+    let xmms = super::sse::held(&s.cpu);
+    let (xmm_end, avx_end) = (160 + 16 * xmms, AVX + 16 * xmms);
+    let va = address(&s.cpu, &i)?;
     let nc = noncanonical(&i);
     if i.memory == 1 && va & if fx { 15 } else { 63 } != 0 {
         return Err(GP);
@@ -75,14 +80,14 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     match i.kind {
         system::FXSAVE => {
             legacy(&s.cpu, &mut img);
-            linear(s, va, &mut img[..LEGACY], true, false, nc)?;
+            linear(s, va, &mut img[..xmm_end], true, false, nc)?;
         }
         system::FXRSTOR => {
-            linear(s, va, &mut img[..LEGACY], false, false, nc)?;
+            linear(s, va, &mut img[..xmm_end], false, false, nc)?;
             let mxcsr = mxcsr(&img)?;
             load_x87(s, &img);
             s.cpu.mxcsr = mxcsr;
-            load_xmm(&mut s.cpu, Some(&img));
+            load_xmm(&mut s.cpu, Some(&img), xmms);
         }
         system::XSAVE | system::XSAVEC => {
             let compact = i.kind == system::XSAVEC;
@@ -96,9 +101,9 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 (rfbm & 1 != 0, 0, 24),
                 (rfbm & 1 != 0, 32, 160),
                 (rfbm & if compact { 2 } else { 6 } != 0, 24, 32),
-                (rfbm & 2 != 0, 160, LEGACY),
+                (rfbm & 2 != 0, 160, xmm_end),
                 (true, HEADER, HEADER + if compact { 16 } else { 8 }),
-                (rfbm & 4 != 0, AVX, AREA),
+                (rfbm & 4 != 0, AVX, avx_end),
             ];
             let (lo, hi) = parts
                 .iter()
@@ -192,7 +197,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 LEGACY
             };
             let hi = if restore & 2 != 0 {
-                LEGACY
+                xmm_end
             } else if restore & 1 != 0 {
                 160
             } else if mx {
@@ -214,7 +219,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 linear(
                     s,
                     va.wrapping_add(AVX as u64),
-                    &mut img[AVX..AREA],
+                    &mut img[AVX..avx_end],
                     false,
                     false,
                     nc,
@@ -240,10 +245,10 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
                 s.cpu.mxcsr = m;
             }
             if rfbm & 2 != 0 {
-                load_xmm(&mut s.cpu, (restore & 2 != 0).then_some(&img[..]));
+                load_xmm(&mut s.cpu, (restore & 2 != 0).then_some(&img[..]), xmms);
             }
             if rfbm & 4 != 0 {
-                (0..32).for_each(|q| {
+                (0..2 * xmms).for_each(|q| {
                     set_ymm_hi(
                         q,
                         if restore & 4 != 0 {
@@ -338,9 +343,9 @@ fn load_x87(s: &mut State, img: &[u8]) {
         );
     }
 }
-/// XMM0..15 from the image, or zero (their initial configuration).
-fn load_xmm(c: &mut Cpu, img: Option<&[u8]>) {
-    for (r, x) in c.xmm.iter_mut().enumerate() {
+/// XMM0..`n` from the image, or zero (their initial configuration).
+fn load_xmm(c: &mut Cpu, img: Option<&[u8]>, n: usize) {
+    for (r, x) in c.xmm.iter_mut().enumerate().take(n) {
         let q =
             |at: usize| img.map_or(0, |b| u64::from_le_bytes(b[at..at + 8].try_into().unwrap()));
         *x = [q(160 + 16 * r), q(168 + 16 * r)];

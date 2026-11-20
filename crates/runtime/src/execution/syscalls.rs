@@ -225,7 +225,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         }
         system::CLFLUSH => {
             // The walk of a byte load (its faults; M3: a device page passes, uncached, nothing to flush).
-            let address = segments::address(&s.cpu, &i);
+            let address = segments::address(&s.cpu, &i)?;
             segments::pages(s, address, 1, false, false, segments::noncanonical(&i))?;
         }
         _ => halt(s, stop::BAD_REPLY),

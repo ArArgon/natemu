@@ -842,7 +842,15 @@ QEMU_DIFFERS = {'sysfault-rdpmc@1': 'QEMU raises #UD for RDPMC at CPL 0 (unimple
                 # here is not an outcome the model lists.)
                 'c32-limit@1': 'QEMU checks no segment limit: it makes the load, which page-faults on what lies past 4 GiB here (nothing is mapped there); the model permits #GP(0) or the completed access',
                 'c32-limit-ss@1': 'QEMU checks no segment limit: it makes the store, which page-faults past 4 GiB here; the model permits #SS(0) or the completed access',
-                'c32-limit-fetch@1': 'QEMU checks no segment limit: its fetch page-faults past 4 GiB here; the model permits #GP(0) or the instruction fetched wrapped'}
+                'c32-limit-fetch@1': 'QEMU checks no segment limit: its fetch page-faults past 4 GiB here; the model permits #GP(0) or the instruction fetched wrapped',
+                # M2 task 3b: the same for the resident's forms.
+                'c32-fldcw-fs-null@1': 'QEMU reads the FLDCW operand through the null FS at base 0 (a #PF there); SDM Vol.3 3.4.4: #GP(0)',
+                'c32-movsreg-gs-null@1': 'QEMU stores the selector through the null GS at base 0 (a #PF there); SDM: #GP(0)',
+                'c32-lds-fs-null@1': 'QEMU reads the far pointer through the null FS at base 0 (a #PF there); SDM: #GP(0)',
+                'c32-fldcw-limit@1': 'QEMU checks no segment limit: it makes the load, which page-faults past 4 GiB here; the model permits #GP(0) or the completed access',
+                'c32-fxsave-limit@1': 'QEMU checks no segment limit: it makes the stores, which page-fault past 4 GiB here; the model permits #GP(0) or the completed access',
+                'c32-popfd-limit@1': 'QEMU checks no segment limit: it makes the pop, which page-faults past 4 GiB here; the model permits #SS(0) or the completed access',
+                'c32-pop-ds-limit@1': 'QEMU checks no segment limit: it makes the pop, which page-faults past 4 GiB here; the model permits #SS(0) or the completed access'}
 
 
 # ---- S1: the presented CPU, judged by tools/models/cpu_profile.py (QEMU presents its own CPU) --------------------------------
