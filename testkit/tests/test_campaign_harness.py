@@ -906,9 +906,9 @@ def test_a_terminated_worker_stops_its_natemu(tmp_path):
     w = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
     child = int(w.stdout.readline())
     w.terminate(); w.wait(20)
-    time.sleep(0.5)
-    alive = subprocess.run(['kill', '-0', str(child)], capture_output=True).returncode == 0
-    assert not alive
+    deadline = time.time() + 20                     # killed and reaped (by launchd: its parent is gone) within a while
+    while subprocess.run(['kill', '-0', str(child)], capture_output=True).returncode == 0:
+        assert time.time() < deadline, 'the child outlived its worker'; time.sleep(0.05)
 
 
 def paths_root():

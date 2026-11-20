@@ -221,10 +221,10 @@ def test_an_orphaned_worker_gives_its_handlers_time_then_kills_its_group(tmp_pat
         runloop.WORKER_GRACE = 2
         vm = subprocess.Popen(['sleep', '60'], start_new_session=True)
         campaign._LIVE.add(vm); campaign._on_term()
-        stubborn = subprocess.Popen([sys.executable, '-c',
-                                     'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])
-        print(vm.pid, stubborn.pid, flush=True)
-        time.sleep(1)                      # the stubborn child ignores SIGTERM before the controller is found dead
+        stubborn = subprocess.Popen([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, '
+                                     'signal.SIG_IGN); print(flush=True); time.sleep(60)'], stdout=subprocess.PIPE)
+        assert stubborn.stdout.readline() == b'\\n'  # it ignores SIGTERM before the controller is found dead (not a fixed sleep:
+        print(vm.pid, stubborn.pid, flush=True)    # a slow start would have let SIGTERM kill it, and the test pass untested)
         threading.Thread(target=runloop.Worker.watch, args=({dead.pid},), daemon=True).start()
         time.sleep(60)
     '''))
