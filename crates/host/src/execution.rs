@@ -2528,7 +2528,7 @@ pub struct Compiler {
     /// Admission's code-shape debug check ([`admission`]); off unless the caller sets it (the program driver's
     /// `--code-shape`).
     pub shape: bool,
-    /// M2 task D: a Linux boot's diagnostics ([`diag`]): each stop but a power-off prints the vCPU's report on standard error,
+    /// M2 task D: a Linux boot's diagnostics ([`diag`]): each stop but a power-off, reset or cancel prints the vCPU's report on standard error,
     /// and a vCPU in the host for the watchdog's time outside a translation (whose wait has its own deadline) ends the
     /// process with its report, exit status 2. Off unless the caller sets it (`linux::Prepared::run` does).
     pub report: bool,
@@ -3882,11 +3882,12 @@ pub fn run(
         let stop = serve(
             cpu, area, compiler, stop_at, requests, stops, entered, inspect, cancelled, hook,
         );
-        // M2 task D: the stop's report (not a power-off's). A vCPU forced out of translated code (the watchdog, a cancel)
-        // has the guest's registers in its own; the bank is current at every other stop.
+        // M2 task D: the stop's report; none for a power-off or reset the guest asked for, nor for a cancel (another vCPU's
+        // stop, which has its own report, or the user's). A vCPU forced out of translated code (the watchdog) has the guest's
+        // registers in its own; the bank is current at every other stop.
         if let Ok(stop) = &stop
             && report
-            && !matches!(stop, Stop::Power(crate::pm::POWEROFF))
+            && !matches!(stop, Stop::Power(_) | Stop::Cancelled)
         {
             let el0 = cpu.reg(CPSR).is_ok_and(|c| c & 0xf == 0);
             let at = if el0 || matches!(stop, Stop::Watchdog { .. }) { diag::At::Forced(cpu) } else { diag::At::Stopped };

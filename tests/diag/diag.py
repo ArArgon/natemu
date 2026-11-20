@@ -112,10 +112,10 @@ def main():
 
 
 def reports(text: str) -> list:
-    """Each vCPU report: from a `natemu: vCPU N: <what>` line through its `code identity` line."""
+    """Each vCPU report: from a `natemu vCPU N: <what>` line through its `code identity` line."""
     out, cur = [], None
     for line in text.splitlines():
-        if cur is None and line.startswith('natemu: vCPU ') and line.count(':') >= 2 and 'code identity' not in line:
+        if cur is None and line.startswith('natemu vCPU ') and 'code identity' not in line:
             cur = [line]
         elif cur is not None:
             cur.append(line)
