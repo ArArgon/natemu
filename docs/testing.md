@@ -339,7 +339,11 @@ that reproduce it (supplier, pin, program or image hash, arguments).
 
 The compiler's own checks under `tools/fexc` (the smoke check, `check_sites.py`, `verify_precision.py`, `scan_skips.py`,
 the serve and channel tests and the unittest files `test_fexc.py` and `test_slice1.py`) are the `fexc` suite of
-`tests/static`, each case one script judged by its exit status.
+`tests/static`, each case one script judged by its exit status. Three of its cases are not plain script runs:
+`fexc-replay` shows that a compiler change left 64-bit output alone (it records the compile requests of one boot and
+compares the answers of the compiler at the checkout's merge base with `main`, which the framework builds, with the
+checkout's own; a change meant to alter 64-bit output fails it by design); `fexc-asm32` compiles FEX's 245 32-bit
+tests offline and has the host admit every block; `fexc-precision-32` runs the precision and site checks on 32-bit code.
 
 When an answer kept only as a hash differs, the failure can say only that it differs. Run the case again with
 `tools/natemu-test run ... --diff`: a case that failed that way runs once more with live QEMU answers, and the message

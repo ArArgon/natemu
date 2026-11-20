@@ -444,6 +444,7 @@ def one(host, runtime, fexc, src, out, path, known, disabled, keep, max_block=No
 # `unsupported_form` outside REFUSED32 (the forms 32-bit code is refused by decision), at a decoder error, or when the
 # host's admission (`natemu-host admit-corpus`, with the code-shape check) refuses one of its objects.
 REFUSED32 = ('16-bit addressing (0x67) in 32-bit code', '16-bit near branch (66) in 32-bit code', 'group 1 alias 82 in 32-bit code',
+             'VEX form FEX does not decode in 32-bit code',
              'REPNE prefix on movs/stos/lods', 'fbld/fbstp', 'undocumented')
 def direct_target(insn, end):
     """The direct branch target of the 32-bit instruction `insn` ending at `end` and whether it also falls through."""
@@ -536,7 +537,7 @@ def main32(a):
     for why, n in cuts.most_common(): print(f'  cut {n:5}  {why}')
     for r in bad: print('FAIL', r['test'], r.get('reason'), r.get('detail', ''))
     if not a.keep: shutil.rmtree(objects, ignore_errors=True)
-    sys.exit(1 if bad or (adm.returncode and not refused) else 0)
+    sys.exit(1 if bad or adm.returncode else 0)
 
 
 def category(reason):

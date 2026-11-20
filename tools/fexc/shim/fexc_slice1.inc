@@ -620,7 +620,10 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     if (!GF_3DNOW && d.FexcMap == FEXC_MAP_3DNOW) return Ud("3DNow! (not advertised: #UD)");
     // A VEX prefix FEX does not decode (an opcode no VEX feature FEX implements defines: AVX-VNNI, AMX, AVX-512 mask forms...):
     // none advertised, #UD; a 66/F2/F3/REX before it is #UD too (I8's vex_ud).
-    if (!decoded && d.FexcMap == FEXC_MAP_VEX) return Ud("VEX form FEX does not decode: not advertised (#UD)");
+    // (M2: not in 32-bit code, where FEX's decoder also fails on forms the processor runs: VEX.vvvv[3] and VEX.W are
+    // ignored there, SDM Vol.2 2.3.5.6 and 2.3.6.1, but FEX calls them invalid. Refused instead of a wrong #UD.)
+    if (!decoded && d.FexcMap == FEXC_MAP_VEX)
+      return fexc_bits32 ? Uns("VEX form FEX does not decode in 32-bit code") : Ud("VEX form FEX does not decode: not advertised (#UD)");
   }
   // SSE (I5a): the mandatory prefix from the bytes (FEX takes the last of 66/F2/F3, x86 lets F2/F3 win over 66).
   // (Only a decoded instruction: after a decoder failure its size, so its prefix bytes, are unknown.)
