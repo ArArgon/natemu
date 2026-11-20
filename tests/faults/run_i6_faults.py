@@ -127,6 +127,19 @@ def cases():
                         mem[0x220:0x228] == struct.pack('<Q', sse) or f'sse 1/3 {mem[0x220:0x228][::-1].hex()}',
                         int(vm['mxcsr'], 0) == mxcsr | 0x20 or f"mxcsr {vm['mxcsr']} (x87 ZE/PE must not reach it)",
                         int(vm['x87']['exceptions'], 0) & 0x12 == 0x12 or f"x87 exceptions {vm['x87']['exceptions']} (want ZE and PE)")})
+    # M2 task 4, x87 runs (tools/fexc/shim/fexc_hook.h): a fault inside a run of x87 instructions. Before it an SSE divide
+    # set MXCSR.PE and an x87 divide FSW.ZE; the faulting instruction is a load form (nothing of it ran) or a narrowing store
+    # whose convert already raised PE (dropped with the instruction). At the fault MXCSR holds PE alone and FSW ZE alone.
+    inexact = struct.pack('<d', 1 + 2.0 ** -40).hex()
+    for tag, insn, write in (('load', 'fadd qword ptr [rsi]', False), ('store', 'fst dword ptr [rsi]', True)):
+        out.append({'name': f'run-fault-{tag}', 'lines': ['fninit', 'divsd xmm1, qword ptr [rdi + 8]', 'fld1', 'fldz', 'fdivp st(1), st(0)',
+                    'fld qword ptr [rdi + 16]', insn] + AFTER,
+                    'setup': [f'xmm 1 {ONE:#x} 0', f'memory {D + 0x208:#x} {third}{inexact}', f'unmap {D + 0x1000:#x}'],
+                    'want': PF(D + 0x1000, write, False), 'cpl': 3, 'mem_check': None, 'x87': None, 'insn': insn,
+                    'check': lambda vm, mem: (
+                        int(vm['mxcsr'], 0) == 0x1fa0 or f"mxcsr {vm['mxcsr']}, want 1FA0H (PE from the SSE divide; no x87 flag)",
+                        int(vm['x87']['exceptions'], 0) == 2 or f"x87 exceptions {vm['x87']['exceptions']}, want ZE alone",
+                        vm['x87']['top'] == 6 or f"top {vm['x87']['top']}, want 6")})
     # FIST of a NaN or out of range: the integer indefinite and IE, never PE (patch 0019); in range and inexact: PE alone.
     for tag, value, insn, n, want, fsw in (('fistp16-range', 40000.5, 'fistp word ptr [rdi + 16]', 2, 0x8000, 0x0001),
                                           ('fistp32-range', 3e9 + 0.5, 'fistp dword ptr [rdi + 16]', 4, 0x80000000, 0x0001),

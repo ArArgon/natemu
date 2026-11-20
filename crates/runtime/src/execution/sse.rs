@@ -37,7 +37,11 @@ pub(super) fn bank(c: &mut Cpu, f: &NativeFrame) {
         let v = u128::from_le_bytes(*q);
         *x = [v as u64, (v >> 64) as u64];
     }
-    c.mxcsr |= mxcsr_flags(f.fpsr | checked(), c.mxcsr, c.no_afp != 0);
+    // M2 task 4: inside an x87 run ([`frame::X87_RUN`]) FPSR holds the run's x87 flags, each committed to the x87 exception
+    // word at its instruction's end; MXCSR's flags up to the run are in the SIMD flag byte.
+    // SAFETY: the frame page is mapped EL1 read/write at FRAME_VA; the byte lies inside it.
+    let run = unsafe { (FRAME_VA as *const u8).add(frame::X87_RUN as usize).read_volatile() } != 0;
+    c.mxcsr |= mxcsr_flags(if run { 0 } else { f.fpsr } | checked(), c.mxcsr, c.no_afp != 0);
 }
 /// I5c: the SIMD flag byte (FPSR order): the flags of the instructions checked for unmasked SIMD exceptions since the entry.
 fn checked() -> u64 {

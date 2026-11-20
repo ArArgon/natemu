@@ -2060,7 +2060,7 @@ unsafe fn enter(s: &mut State, block: &Block) -> ! {
     };
     // I5c: the SIMD flag byte (banked into MXCSR at every resident entry) and the x87 instruction's pending flags (an
     // instruction that did not complete leaves its own there) start empty.
-    for at in [frame::SIMD_FLAGS, frame::X87_PENDING] {
+    for at in [frame::SIMD_FLAGS, frame::X87_PENDING, frame::X87_RUN] {
         unsafe { (FRAME_VA as *mut u8).add(at as usize).write_volatile(0) };
     }
     post_pending(s, true);
