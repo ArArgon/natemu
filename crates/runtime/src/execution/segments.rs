@@ -15,8 +15,11 @@
 //! recorded deviation, x86 would run the code; the OS sees a bad transfer and ends the program); one that would run
 //! CPL 0 code stops `unsupported_code_mode` with that CS in the record and RIP at the instruction, nothing else
 //! changed. A call gate stops `unsupported_system` at CPL 0 and is #GP(its selector) at CPL 3 (the same deviation: no
-//! CPL-3 transfer stops the machine). `tools/models/segment_model.py` (and `delivery_model.py`'s IRETQ) is the oracle;
-//! the check order follows it where the SDM lists several conditions without a priority.
+//! CPL-3 transfer stops the machine). M2 task 3b, executed in 32-bit code: operands at 32-bit addresses in their segment
+//! ([`address`]), the stack at 32 bits (ESP wraps, 4-byte slots), JMP/CALL/RET far within 32-bit code (to 64-bit code:
+//! #GP(selector), task 5), IRET's three pops at the same level, the 32-bit-only far-pointer loads. `tools/models/segment_model.py`
+//! (and `delivery_model.py`'s IRETQ) is the oracle; the check order follows it where the SDM lists several conditions
+//! without a priority.
 use super::*;
 
 /// An exception a transaction raises: vector, error code, CR2.
@@ -41,7 +44,7 @@ const RFLAGS_VM: u64 = 1 << 17;
 const IRET_ALWAYS: u64 = 0x25_4dd5;
 const IRET_CPL0: u64 = RFLAGS_IOPL | 3 << 19;
 
-/// Executes `i` (LGDT ..= IRET, PUSH_SREG, POP_SREG). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: a far transfer committed to
+/// Executes `i` (LGDT ..= IRET, PUSH_SREG, POP_SREG, LOAD_FAR). `Ok(None)`: committed, RIP moves past it; `Ok(Some(rip))`: a far transfer committed to
 /// `rip`. On `Err` the vCPU's state is unchanged (guest memory may hold an accessed bit a failed load set, as the SDM
 /// allows).
 pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception> {
@@ -51,7 +54,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             return Ok(c.gpr[i.reg as usize] as u16);
         }
         let mut b = [0u8; 2];
-        linear(s, address(&c, &i), &mut b, false, false, noncanonical(&i))?;
+        linear(s, address(&c, &i)?, &mut b, false, false, noncanonical(&i))?;
         Ok(u16::from_le_bytes(b))
     };
     match i.kind {
@@ -59,7 +62,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
         system::LGDT..=system::LIDT => {
             let mut b = [0u8; 10];
             let n = if i.size == 8 { 10 } else { 6 };
-            linear(s, address(&c, &i), &mut b[..n], false, false, noncanonical(&i))?;
+            linear(s, address(&c, &i)?, &mut b[..n], false, false, noncanonical(&i))?;
             let base = u64::from_le_bytes(b[2..].try_into().unwrap());
             let table = Table {
                 base: if i.size == 2 { base & 0xff_ffff } else { base },
@@ -85,7 +88,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             b[..2].copy_from_slice(&(t.limit as u16).to_le_bytes());
             b[2..].copy_from_slice(&t.base.to_le_bytes());
             let n = if i.size == 8 { 10 } else { 6 };
-            linear(s, address(&c, &i), &mut b[..n], true, false, noncanonical(&i))?;
+            linear(s, address(&c, &i)?, &mut b[..n], true, false, noncanonical(&i))?;
         }
         system::SLDT..=system::MOV_FROM_SREG => {
             let v = match i.kind {
@@ -96,7 +99,7 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             if i.memory == 1 {
                 linear(
                     s,
-                    address(&c, &i),
+                    address(&c, &i)?,
                     &mut v.to_le_bytes(),
                     true,
                     false,
@@ -143,12 +146,14 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             load_data(s, i.cr as usize, selector)?;
             s.cpu.mov_ss = u64::from(i.cr as usize == SREG_SS);
         }
-        // X1c: PUSH FS/GS: the selector zero-extended to the operand size (SDM Vol.2 PUSH), at RSP - size (#SS(0) when
-        // not canonical). POP FS/GS: the popped selector loaded as MOV Sreg does (#GP/#NP checks, FS/GS base from the
-        // descriptor), then RSP + size; a fault leaves RSP unchanged.
+        // X1c: PUSH FS/GS: the selector zero-extended to the operand size (SDM Vol.2 PUSH; for a 32-bit push the SDM
+        // also allows a 16-bit store, which recent Intel processors make: natemu zero-extends, as QEMU), at RSP - size
+        // (#SS(0) when not canonical). POP FS/GS: the popped selector loaded as MOV Sreg does (#GP/#NP checks, FS/GS base
+        // from the descriptor), then RSP + size; a fault leaves RSP unchanged. M2 task 3b: from 32-bit code also ES, CS,
+        // SS and DS, with ESP wrapping at 4 GiB; POP SS sets the MOV SS shadow (SDM Vol.2 POP).
         system::PUSH_SREG => {
             let n = i.size as usize;
-            let rsp = c.gpr[4].wrapping_sub(u64::from(i.size));
+            let rsp = wrap(&c, c.gpr[4].wrapping_sub(u64::from(i.size)));
             let mut b = u64::from(c.seg[i.cr as usize].selector).to_le_bytes();
             linear(s, rsp, &mut b[..n], true, false, SS0)?;
             s.cpu.gpr[4] = rsp;
@@ -158,7 +163,28 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
             let mut b = [0u8; 8];
             linear(s, c.gpr[4], &mut b[..n], false, false, SS0)?;
             load_data(s, i.cr as usize, u16::from_le_bytes([b[0], b[1]]))?;
-            s.cpu.gpr[4] = c.gpr[4].wrapping_add(u64::from(i.size));
+            s.cpu.gpr[4] = wrap(&c, c.gpr[4].wrapping_add(u64::from(i.size)));
+            s.cpu.mov_ss = u64::from(i.cr as usize == SREG_SS);
+        }
+        // M2 task 3b: LDS, LES, LSS, LFS, LGS (32- and 16-bit code; SDM Vol.2 LDS/LES/LFS/LGS/LSS): the far pointer m16:16 or
+        // m16:32, its selector loaded as MOV Sreg does, then the offset into `reg` (16 bits merged, 32 zero-extended).
+        system::LOAD_FAR => {
+            let w = i.size as usize;
+            let mut pointer = [0u8; 6];
+            aligned_operand(
+                s,
+                address(&c, &i)?,
+                &mut pointer[..w + 2],
+                w,
+                if w == 2 { 2 } else { 4 },
+                false,
+                noncanonical(&i),
+            )?;
+            load_data(s, i.cr as usize, u16::from_le_bytes([pointer[w], pointer[w + 1]]))?;
+            let mut offset = [0u8; 8];
+            offset[..w].copy_from_slice(&pointer[..w]);
+            let (v, r) = (u64::from_le_bytes(offset), &mut s.cpu.gpr[i.reg as usize]);
+            *r = if w == 2 { *r & !0xffff | v } else { v };
         }
         system::JMP_FAR..=system::CALL_FAR => return far_transfer(s, i).map(Some),
         system::RET_FAR..=system::IRET => return far_return(s, i).map(Some),
@@ -168,8 +194,9 @@ pub(super) fn execute(s: &mut State, i: System) -> Result<Option<u64>, Exception
 }
 
 /// The linear address of `i`'s memory operand: base + index * scale + displacement (I10: truncated to 32 bits with 0x67,
-/// RIP-relative included) at its address size, plus the FS/GS base of an override.
-pub(super) fn address(c: &Cpu, i: &System) -> u64 {
+/// RIP-relative included) at its address size, in its segment ([`linear_of`]; #GP(0) through a null one in 32-bit code,
+/// [`usable`]).
+pub(super) fn address(c: &Cpu, i: &System) -> Result<u64, Exception> {
     let base = match i.base {
         system::RIP => c.rip.wrapping_add(u64::from(i.length)),
         system::NO_REG => 0,
@@ -180,17 +207,46 @@ pub(super) fn address(c: &Cpu, i: &System) -> u64 {
     } else {
         c.gpr[i.index as usize] << i.scale
     };
-    let segment = match i.segment as usize {
-        sreg @ (SREG_FS | SREG_GS) => c.seg[sreg].base,
-        _ => 0,
-    };
     let ea = base.wrapping_add(index).wrapping_add(i.disp as u64);
     let ea = match i.prefixes & (system::ADDRESS32 | system::ADDRESS16) {
         system::ADDRESS32 => ea as u32 as u64,
         system::ADDRESS16 => ea as u16 as u64,
         _ => ea,
     };
-    ea.wrapping_add(segment)
+    if i.memory == 1 {
+        usable(c, i.segment)?;
+    }
+    Ok(linear_of(c, i.segment, ea))
+}
+/// The linear address of offset `ea` in segment `sreg`: in 64-bit mode plus the FS or GS base (the others' are ignored);
+/// in 32-bit code (M2 task 3b) plus the segment's base, wrapped at 4 GiB (the limit check is [`pages`]').
+pub(super) fn linear_of(c: &Cpu, sreg: u32, ea: u64) -> u64 {
+    let sreg = sreg as usize;
+    if c.code_mode() == Some(CodeMode::Bits64) {
+        return match sreg {
+            SREG_FS | SREG_GS => ea.wrapping_add(c.seg[sreg].base),
+            _ => ea,
+        };
+    }
+    ea.wrapping_add(c.seg[sreg].base) as u32 as u64
+}
+/// M2 task 3b: #GP(0) for an access through a null segment in 32-bit code (SDM Vol.3 3.4.4; translated code's is the
+/// compiler's cut, [`Cpu::null_segment`]).
+pub(super) fn usable(c: &Cpu, sreg: u32) -> Result<(), Exception> {
+    if c.null_segment(sreg as usize) {
+        Err(GP0)
+    } else {
+        Ok(())
+    }
+}
+/// M2 task 3b: a stack pointer or instruction pointer value at the code's width: cut to 32 bits in 32-bit code (ESP
+/// and EIP wrap at 4 GiB; its stack is always a 32-bit one, `Cpu::compat_refused`), else unchanged.
+pub(super) fn wrap(c: &Cpu, v: u64) -> u64 {
+    if c.code_mode() == Some(CodeMode::Bits64) {
+        v
+    } else {
+        v as u32 as u64
+    }
 }
 /// A non-canonical memory operand: #SS(0) for an SS reference (the host gives an RSP or RBP base with no FS/GS override
 /// SS: it ignores CS/DS/ES/SS prefixes, owner decision of November 3), else #GP(0) (FS/GS, I7).
@@ -294,6 +350,13 @@ pub(super) fn pages(
 ) -> Result<[u64; 2], Exception> {
     let last = va.wrapping_add(n - 1);
     if !paging::canonical(va) || !paging::canonical(last) || last < va {
+        return Err(noncanonical);
+    }
+    // M2 task 3b: an explicit access of 32-bit code that runs across 4 GiB is outside the flat segment's limit (SDM Vol.3
+    // 5.3): #GP(0), or #SS(0) through SS. Implicit ones (descriptor tables, the TSS, a 64-bit interrupt frame) are 64-bit.
+    // ponytail: checked on the linear address, which for a based FS or GS is not the offset the limit applies to; an access
+    // whose linear address wraps across 4 GiB faults here where x86 wraps it. Check the offset when based segments matter.
+    if !supervisor && last >> 32 != 0 && s.cpu.code_mode() != Some(CodeMode::Bits64) {
         return Err(noncanonical);
     }
     let mut control = controls(s);
@@ -546,30 +609,48 @@ fn refuse_compatibility(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<
     Ok(())
 }
 
+/// M2 task 3b: a far transfer that keeps the code's mode: from 64-bit code [`refuse_compatibility`]; from 32-bit code
+/// (CPL 3 only) a target that is not compatibility-mode code (L = 1) is #GP(`selector`) before any change (between 32-
+/// and 64-bit code: task 5, the deviation of the module doc).
+fn same_mode(s: &State, selector: u16, raw: u64, cpl: u64) -> Result<(), Exception> {
+    if s.cpu.code_mode() == Some(CodeMode::Bits64) {
+        refuse_compatibility(s, selector, raw, cpl)
+    } else if raw >> 53 & 1 != 0 {
+        Err(gp(selector))
+    } else {
+        Ok(())
+    }
+}
+
 /// JMP/CALL far through an m16:`size` pointer to a code segment at the same CPL (SDM Vol.2 JMP, CALL): the target checks
 /// ([`far_target`]), then for CALL #SS(0) when the return address (CS and RIP, `size` bytes each) would not be canonical,
 /// #GP(0) for a non-canonical offset, the accessed bit, CALL's pushes; CS = selector with RPL = CPL.
 fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
     let c = s.cpu;
     let w = i.size as usize;
-    let mut pointer = [0u8; 10];
-    aligned_operand(
-        s,
-        address(&c, &i),
-        &mut pointer[..w + 2],
-        w,
-        if w == 2 { 2 } else { 4 },
-        false,
-        noncanonical(&i),
-    )?;
-    let (mut offset, mut word) = ([0u8; 8], [0u8; 2]);
-    offset[..w].copy_from_slice(&pointer[..w]);
-    word.copy_from_slice(&pointer[w..w + 2]);
-    let (rip, selector) = (u64::from_le_bytes(offset), u16::from_le_bytes(word));
+    let (rip, selector) = if i.memory == 0 {
+        // M2 task 3b: the immediate pointer of 32- and 16-bit code (`9a`, `ea`).
+        (i.disp as u64, i.cr as u16)
+    } else {
+        let mut pointer = [0u8; 10];
+        aligned_operand(
+            s,
+            address(&c, &i)?,
+            &mut pointer[..w + 2],
+            w,
+            if w == 2 { 2 } else { 4 },
+            false,
+            noncanonical(&i),
+        )?;
+        let (mut offset, mut word) = ([0u8; 8], [0u8; 2]);
+        offset[..w].copy_from_slice(&pointer[..w]);
+        word.copy_from_slice(&pointer[w..w + 2]);
+        (u64::from_le_bytes(offset), u16::from_le_bytes(word))
+    };
     let (va, raw) = far_target(s, selector)?;
-    refuse_compatibility(s, selector, raw, c.cpl)?;
+    same_mode(s, selector, raw, c.cpl)?;
     let call = i.kind == system::CALL_FAR;
-    let rsp = c.gpr[4].wrapping_sub(if call { 2 * w as u64 } else { 0 });
+    let rsp = wrap(&c, c.gpr[4].wrapping_sub(if call { 2 * w as u64 } else { 0 }));
     if call && (!paging::canonical(rsp) || !paging::canonical(c.gpr[4].wrapping_sub(1))) {
         return Err(SS0);
     }
@@ -579,7 +660,7 @@ fn far_transfer(s: &mut State, i: System) -> Result<u64, Exception> {
     accessed(s, va, raw)?;
     if call {
         let mut frame = [0u8; 16];
-        frame[..w].copy_from_slice(&c.rip.wrapping_add(u64::from(i.length)).to_le_bytes()[..w]);
+        frame[..w].copy_from_slice(&wrap(&c, c.rip.wrapping_add(u64::from(i.length))).to_le_bytes()[..w]);
         frame[w..2 * w].copy_from_slice(&u64::from(c.seg[SREG_CS].selector).to_le_bytes()[..w]);
         aligned_operand(s, rsp, &mut frame[..2 * w], w, w as u64, true, SS0)?;
         s.cpu.gpr[4] = rsp;
@@ -617,7 +698,11 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
         }
         Ok(words)
     };
-    let words = pops(s, c.gpr[4], if iret { 5 } else { 2 })?;
+    // M2 task 3b: IRET from 32-bit code pops EIP, CS and EFLAGS, and SS:ESP only for a return to an outer level (SDM
+    // Vol.2 IRET, IA-32e mode: RETURN-TO-SAME-PRIVILEGE-LEVEL outside 64-bit mode); from 64-bit code all five.
+    let bits64 = c.code_mode() == Some(CodeMode::Bits64);
+    let frame = if !iret { 2 } else if bits64 { 5 } else { 3 };
+    let words = pops(s, c.gpr[4], frame)?;
     let (rip, selector) = (words[0], words[1] as u16);
     if selector & 0xfffc == 0 {
         return Err(GP0);
@@ -636,9 +721,13 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     if !present {
         return Err(np(selector));
     }
-    // IRET to 32-bit or 16-bit code at CPL 3 (M2 task 3a); its RIP is checked against the 4 GiB limit.
-    let compat = iret && rpl == 3 && raw >> 53 & 1 == 0;
+    // IRET to 32-bit or 16-bit code at CPL 3 (M2 task 3a), and RET far within 32-bit code (task 3b); its RIP is checked
+    // against the 4 GiB limit. RET far from 32-bit to 64-bit code is #GP(selector) (task 5: [`same_mode`]).
+    let compat = (iret || !bits64) && rpl == 3 && raw >> 53 & 1 == 0;
     if !compat {
+        if !iret && !bits64 {
+            return Err(gp(selector));
+        }
         refuse_compatibility(s, selector, raw, rpl)?;
     }
     let bad_rip = if compat { rip >> 32 != 0 } else { !paging::canonical(rip) };
@@ -647,11 +736,11 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
     }
     let outer = rpl > cpl;
     let mut stack = None;
-    if iret || outer {
-        let [rsp, ss_selector, ..] = if iret {
+    if frame == 5 || outer {
+        let [rsp, ss_selector, ..] = if frame == 5 {
             [words[3], words[4], 0, 0, 0]
         } else {
-            pops(s, c.gpr[4].wrapping_add(2 * w + release), 2)?
+            pops(s, wrap(&c, c.gpr[4].wrapping_add(frame as u64 * w + release)), 2)?
         };
         let ss_selector = ss_selector as u16;
         let ss_segment = if ss_selector & 0xfffc == 0 {
@@ -717,7 +806,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
             let rsp = rsp.wrapping_add(if iret { 0 } else { release });
             s.cpu.gpr[4] = if compat { rsp as u32 as u64 } else { rsp };
         }
-        None => s.cpu.gpr[4] = c.gpr[4].wrapping_add(2 * w + release),
+        None => s.cpu.gpr[4] = wrap(&c, c.gpr[4].wrapping_add(frame as u64 * w + release)),
     }
     if outer {
         for sreg in [SREG_ES, SREG_DS, SREG_FS, SREG_GS] {
@@ -734,7 +823,7 @@ fn far_return(s: &mut State, i: System) -> Result<u64, Exception> {
 }
 
 /// Far pointers and stack frames have alignment independent of the aggregate byte count (SDM Vol.3A Table 7-7).
-fn aligned_operand(
+pub(super) fn aligned_operand(
     s: &mut State,
     at: u64,
     bytes: &mut [u8],
@@ -836,7 +925,7 @@ pub(super) fn inspect(s: &mut State, i: System) -> Result<(), Exception> {
         c.gpr[i.reg as usize] as u16
     } else {
         let mut b = [0u8; 2];
-        linear(s, address(&c, &i), &mut b, false, false, noncanonical(&i))?;
+        linear(s, address(&c, &i)?, &mut b, false, false, noncanonical(&i))?;
         u16::from_le_bytes(b)
     };
     let found = if selector & 0xfffc == 0 {

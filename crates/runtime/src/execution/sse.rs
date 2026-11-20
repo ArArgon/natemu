@@ -18,7 +18,7 @@ const NM: Exception = [7, 0, 0];
 
 /// The XMM registers generated code holds: all 16, or XMM0..XMM7 in 32-bit code (M2 task 3a: v24..v31 are its
 /// compiler's scratch registers, entered zero and never banked).
-fn held(c: &Cpu) -> usize {
+pub(super) fn held(c: &Cpu) -> usize {
     if c.code_mode() == Some(CodeMode::Bits64) { 16 } else { 8 }
 }
 /// XMM and MXCSR into the frame generated code is entered with: v16..v31, FPCR from MXCSR, FPSR clear.
@@ -88,7 +88,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         // The host cut it as gated under these very controls.
         halt(s, stop::BAD_REPLY)
     }
-    let va = address(&s.cpu, &i);
+    let va = address(&s.cpu, &i)?;
     let noncanonical = super::segments::noncanonical(&i);
     if matches!(i.kind, system::LDMXCSR | system::VLDMXCSR) {
         let mut buf = [0; 4];

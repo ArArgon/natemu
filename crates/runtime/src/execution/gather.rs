@@ -62,10 +62,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     } else {
         s.cpu.gpr[i.base as usize]
     };
-    let segment = match i.segment as usize {
-        sreg @ (SREG_FS | SREG_GS) => s.cpu.seg[sreg].base,
-        _ => 0,
-    };
+    super::segments::usable(&s.cpu, i.segment)?;
     let nc = noncanonical(&i);
     for j in 0..n {
         if m[ew * j + ew - 1] & 0x80 != 0 {
@@ -84,7 +81,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
             let mut buf = [0; 8];
             if let Err(e) = copy(
                 s,
-                ea.wrapping_add(segment),
+                super::segments::linear_of(&s.cpu, i.segment, ea),
                 &mut buf[..ew],
                 false,
                 false,

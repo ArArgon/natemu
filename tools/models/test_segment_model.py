@@ -215,6 +215,34 @@ class Transfers(unittest.TestCase):
         self.assertEqual((r['fault'][:2], r['permitted']), ((dm.GP, 0), {('fault', (dm.GP, 0, 0)), ('done', None)}))
         self.assertEqual(m.flat_access(s, 0xFFFF_FFFD, 4, stack=True)['fault'][:2], (dm.SS, 0))
 
+    def test_32_bit_far_transfers(self):
+        # M2 task 3b, in 32-bit code at CPL 3: far transfers to 32-bit code run, with 4-byte slots and ESP wrapping; to
+        # 64-bit code they are natemu's deviation (task 5); IRET pops three words at the same level.
+        s = self.compat()
+        s.update(cpl=3, cs=0x4B, ss=0x1B, rip=0x40_0000, length=6, rsp=0)
+        s['seg'].update(cs=(0x4B, 0xC0FB), ss=(0x1B, 0xC0F3))
+        for page in (0, 0xFFFFF):
+            s['memory'][page] = dm.page(user=True)
+        r = m.far(self.pointer(s, 0x40_1000, 0x4B, 4), 'call', PTR, 4)
+        self.assertEqual((r['outcome'], r['state']['rip'], r['state']['rsp']), ('done', 0x40_1000, 0xFFFF_FFF8))
+        self.assertEqual(r['diff'], {0xFFFF_FFF8: (0x40_0006).to_bytes(4, 'little') + (0x4B).to_bytes(4, 'little')})
+        r = m.far(self.pointer(dict(s, rsp=4), 0x40_1000, 0x4B, 4), 'call', PTR, 4)
+        self.assertEqual(r['fault'][:2], (dm.SS, 0))                                  # the frame across 4 GiB
+        r = m.far(self.pointer(s, 0x1000, 0x23, 4), 'jmp', PTR, 4)
+        self.assertEqual((r['fault'][:2], r['deviation']), ((dm.GP, 0x20), True))
+        frame = lambda *w: b''.join(x.to_bytes(4, 'little') for x in w)
+        s = dict(s, rsp=0x5800)
+        dm.place(s['memory'], 0x5800, frame(0x40_2000, 0x4B, 0x8D7))
+        r = m.iret(s, 4)
+        self.assertEqual((r['outcome'], r['state']['rip'], r['state']['rsp'], r['state']['rflags']), ('done', 0x40_2000, 0x580C, 0xAD7))
+        dm.place(s['memory'], 0x5800, frame(0x40_2000, 0x23, 0x202))
+        r = m.iret(s, 4)
+        self.assertEqual((r['outcome'], r['state']['rsp'], r['state']['cs']), ('done', 0x580C, 0x23))   # to 64-bit code: no SS:ESP
+        r = m.ret(s, 4)
+        self.assertEqual((r['fault'][:2], r['deviation']), ((dm.GP, 0x20), True))
+        dm.place(s['memory'], 0x5800, frame(0x40_2000, 0x4B))
+        self.assertEqual(m.ret(s, 4, release=8)['state']['rsp'], 0x5810)
+
     def test_iretq_agrees_with_the_delivery_model(self):
         frames = [(0x40_2000, 0x08, 0x246, STACK + 0x100, 0x10), (0x40_2000, 0x23, 0x3246, 0x7000, 0x1B),
                   (0x40_2000, 0x08, 0x202, STACK, 0), (0x40_2000, 0x23, 0x202, 0x7000, 3), (0x40_2000, 0x10, 2, 0, 0x10),

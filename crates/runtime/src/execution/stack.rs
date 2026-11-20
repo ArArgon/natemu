@@ -1,6 +1,6 @@
 //! ENTER frame construction. Register state commits only after the final stack permission probe.
 use super::*;
-use segments::{Exception, linear, pages};
+use segments::{Exception, linear, pages, wrap};
 
 fn word(s: &mut State, at: u64, width: u64, write: bool, value: u64) -> Result<u64, Exception> {
     const SS: Exception = [12, 0, 0];
@@ -55,8 +55,10 @@ pub(super) fn enter(s: &mut State, i: System) -> Result<(), Exception> {
     let width = u64::from(i.size);
     let bp = s.cpu.gpr[5];
     let mut sp = s.cpu.gpr[4];
+    // M2 task 3b: 32-bit code's stack is a 32-bit one (`Cpu::compat_refused`): ESP and EBP wrap at 4 GiB.
+    let c = s.cpu;
     let push = |s: &mut State, sp: &mut u64, value: u64| -> Result<(), Exception> {
-        let next = sp.wrapping_sub(width);
+        let next = wrap(&c, sp.wrapping_sub(width));
         word(s, next, width, true, value)?;
         *sp = next;
         Ok(())
@@ -69,7 +71,7 @@ pub(super) fn enter(s: &mut State, i: System) -> Result<(), Exception> {
         for level in 1..i.cr {
             let value = word(
                 s,
-                bp.wrapping_sub(u64::from(level) * width),
+                wrap(&c, bp.wrapping_sub(u64::from(level) * width)),
                 width,
                 false,
                 0,
@@ -78,7 +80,7 @@ pub(super) fn enter(s: &mut State, i: System) -> Result<(), Exception> {
         }
         push(s, &mut sp, frame)?;
     }
-    sp = sp.wrapping_sub(i.disp as u64);
+    sp = wrap(&c, sp.wrapping_sub(i.disp as u64));
     // SDM Vol.3C 31.4.4: ENTER faults as if writing the byte at final SP. This is a permission probe, not a store
     // or a data-breakpoint access; it applies even when nesting is zero.
     pages(s, sp, 1, true, false, SS)?;

@@ -296,6 +296,11 @@ def load(state, sreg, sel):
     return _run(state, body)
 
 
+def _compat(s):
+    """The code runs in compatibility mode (CS.L = 0)."""
+    return not s['seg']['cs'][1] >> 13 & 1
+
+
 def null_access(state, sreg):
     """A memory access through FS, GS, DS or ES (`sreg`) in compatibility mode: #GP(0) while it holds a null selector (Vol. 3A
     "Segment Loading Instructions in IA-32e Mode": a null selector's segment faults on use outside 64-bit mode)."""
@@ -346,15 +351,22 @@ def far(state, kind, addr, width=8, stack=False):
             raise _gp(sel)
         if not p:
             raise _np(sel)
-        _refuse_compatibility(raw, sel, cpl)
-        rsp = s['rsp'] - (2 * width if kind == 'call' else 0)
-        if kind == 'call' and not (canonical(rsp) and canonical(s['rsp'] - 1)):
+        compat = _compat(s)
+        if not compat:
+            _refuse_compatibility(raw, sel, cpl)
+        elif l:
+            raise Deviation(GP, sel & 0xFFFC)                      # 32- to 64-bit code: task 5 (natemu's deviation)
+        wrap = 0xFFFFFFFF if compat else (1 << 64) - 1             # 32-bit code: ESP and EIP wrap at 4 GiB
+        rsp = s['rsp'] - (2 * width if kind == 'call' else 0) & wrap
+        if compat and kind == 'call' and rsp + 2 * width > 1 << 32:
+            raise Fault(SS, 0)                                     # the frame across the flat stack's limit
+        if not compat and kind == 'call' and not (canonical(rsp) and canonical(s['rsp'] - 1)):
             raise Fault(SS, 0)
         if not canonical(rip):
             raise Fault(GP, 0)
         _accessed(bus, daddr, raw)
         if kind == 'call':
-            frame = (s['rip'] + s['length']).to_bytes(8, 'little')[:width] + s['cs'].to_bytes(8, 'little')[:width]
+            frame = (s['rip'] + s['length'] & wrap).to_bytes(8, 'little')[:width] + s['cs'].to_bytes(8, 'little')[:width]
             bus.write(rsp, frame, cpl)
             s['rsp'] = rsp
         s['cs'] = sel & ~3 | cpl
@@ -369,7 +381,11 @@ def ret(state, width=8, release=0, iret=False):
         cpl = s['cpl']
         if iret and s['rflags'] & NT:
             raise Fault(GP, 0)
-        n = 5 if iret else 2
+        # M2 task 3b: IRET from 32-bit code pops three words, and SS:ESP only for an outer return (SDM IRET, IA-32e mode).
+        from32 = _compat(s)
+        n = 2 if not iret else 3 if from32 else 5
+        if from32 and s['rsp'] + n * width > 1 << 32:
+            raise Fault(SS, 0)
         raw_words = _operand(s, bus, s['rsp'], n * width, stack=True)
         words = [int.from_bytes(raw_words[k * width:(k + 1) * width], 'little') for k in range(n)]
         rip, sel = words[0], words[1] & 0xFFFF
@@ -382,18 +398,20 @@ def ret(state, width=8, release=0, iret=False):
             raise _gp(sel)
         if not p:
             raise _np(sel)
-        _refuse_compatibility(raw, sel, rpl, iret)
-        compat = not fields(raw)[4]                                # (IRET to RPL 3 only: every other one was refused)
+        if from32 and not iret and fields(raw)[4]:
+            raise Deviation(GP, sel & 0xFFFC)                      # RET far from 32- to 64-bit code: task 5
+        _refuse_compatibility(raw, sel, rpl, iret or from32)
+        compat = not fields(raw)[4]                                # (to RPL 3 only: every other one was refused)
         bad_rip = rip >> 32 != 0 if compat else not canonical(rip)  # the flat 32-bit segment's limit, or 64-bit canonical
         if iret and bad_rip:
             raise Fault(GP, 0)                                     # B4: IRETQ checks RIP before SS
         outer = rpl > cpl
         stack = None
-        if iret or outer:
-            if iret:
+        if n == 5 or outer:
+            if n == 5:
                 rsp, ss_sel = words[3], words[4] & 0xFFFF
             else:
-                tail = _operand(s, bus, s['rsp'] + 2 * width + release, 2 * width, stack=True)
+                tail = _operand(s, bus, s['rsp'] + n * width + release, 2 * width, stack=True)
                 rsp, ss_sel = int.from_bytes(tail[:width], 'little'), int.from_bytes(tail[width:], 'little') & 0xFFFF
             ss = None
             if ss_sel & 0xFFFC == 0:
@@ -429,7 +447,7 @@ def ret(state, width=8, release=0, iret=False):
             if ss:
                 _loaded(s, 'ss', ss_sel, ss[1])
         else:
-            s['rsp'] += 2 * width + release
+            s['rsp'] = s['rsp'] + n * width + release & (0xFFFFFFFF if from32 else (1 << 64) - 1)
         if outer:
             for r in ('es', 'ds', 'fs', 'gs'):                     # B5
                 sel_r, a = s['seg'][r]

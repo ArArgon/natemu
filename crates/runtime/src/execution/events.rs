@@ -167,7 +167,8 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     }
 }
 
-/// POPF/POPFQ (SDM Vol.2 POPF, 64-bit mode, VM = 0): pops 8 bytes (2 with a 66 prefix) at RSP (#SS(0) non-canonical,
+/// POPF/POPFQ (SDM Vol.2 POPF, 64-bit mode, VM = 0; POPFD from 32-bit code, ESP wrapping, M2 task 3b): pops 8 bytes (4
+/// in 32-bit code, 2 with a 66 prefix) at RSP (#SS(0) non-canonical or across 4 GiB,
 /// #PF, #AC at CPL 3) and writes the flags the CPL allows: at CPL 0 every flag of [`POPF_FLAGS`]; above CPL 0 not IOPL,
 /// and not IF when CPL > IOPL (both stay as they were, no fault). RF, VM, VIF and VIP are unaffected (RF then ends with
 /// the instruction, `commit`). A TF it sets takes effect after the next instruction (S4: `find` reads TF at each start).
@@ -188,7 +189,7 @@ fn popf(s: &mut State, i: System) -> Result<(), Exception> {
         }
     }
     s.cpu.rflags = s.cpu.rflags & !mask | u64::from_le_bytes(b) & mask | 2;
-    s.cpu.gpr[4] = rsp.wrapping_add(n as u64);
+    s.cpu.gpr[4] = super::segments::wrap(&s.cpu, rsp.wrapping_add(n as u64));
     Ok(())
 }
 
@@ -214,7 +215,7 @@ pub(super) fn bit_test(s: &mut State, i: System) -> Result<(), Exception> {
             .disp
             .wrapping_add((offset >> (size * 8).trailing_zeros()).wrapping_mul(size as i64));
     }
-    let unit = super::segments::address(&s.cpu, &operand);
+    let unit = super::segments::address(&s.cpu, &operand)?;
     let last = unit.wrapping_add(size - 1);
     // S4: the complete operand-sized unit meets data breakpoints. The following native step now accesses that same
     // unit; duplicate hit bits are harmless and a fault suppresses the pending data-breakpoint trap.

@@ -30,12 +30,12 @@ pub(super) unsafe fn store(p: *mut u8, n: u64, value: u64) {
     }
 }
 
-fn memory(
+pub(super) fn memory(
     s: &mut State,
     i: System,
     update: impl FnOnce(u64) -> (u64, u64),
 ) -> Result<(), segments::Exception> {
-    let va = segments::address(&s.cpu, &i);
+    let va = segments::address(&s.cpu, &i)?;
     let n = u64::from(i.size);
     let nc = segments::noncanonical(&i);
     let last = va.wrapping_add(n - 1);

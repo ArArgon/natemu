@@ -10,7 +10,7 @@ use iced_x86::{
     Code, CpuidFeature, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register,
 };
 use natemu_abi::cpu_gates as gf;
-use natemu_abi::execution::{SREG_DS, SREG_ES, SREG_SS, System, system};
+use natemu_abi::execution::{SREG_DS, SREG_ES, SREG_FS, SREG_GS, SREG_SS, System, system};
 
 /// The legacy prefixes as x86 reads them, with REX bytes among them: the opcode's index in `insn` and the REX in force
 /// (0: none). Only a REX immediately before the opcode counts, the last of several; one followed by a legacy prefix is
@@ -230,6 +230,51 @@ pub(crate) fn decode(bytes: &[u8], bitness: u32) -> Result<Option<System>, Trunc
         | Popd_GS | Popq_FS | Popq_GS => {
             s.cr = gpr(0);
             (POP_SREG, operand_size(i.code()))
+        }
+        // M2 task 3b: forms only 32- and 16-bit code has (their opcodes are #UD or other instructions in 64-bit mode, and the
+        // 64-bit LSS/LFS/LGS stay refused). LDS/LES/LSS/LFS/LGS: the segment register in `cr`, the destination in `reg`.
+        Les_r16_m1616 | Les_r32_m1632 | Lds_r16_m1616 | Lds_r32_m1632 | Lss_r16_m1616
+        | Lss_r32_m1632 | Lfs_r16_m1616 | Lfs_r32_m1632 | Lgs_r16_m1616 | Lgs_r32_m1632
+            if bitness != 64 =>
+        {
+            s.reg = gpr(0);
+            s.cr = match i.mnemonic() {
+                Mnemonic::Les => SREG_ES,
+                Mnemonic::Lds => SREG_DS,
+                Mnemonic::Lss => SREG_SS,
+                Mnemonic::Lfs => SREG_FS,
+                _ => SREG_GS,
+            } as u32;
+            (LOAD_FAR, width(0))
+        }
+        // ARPL r/m16, r16 (a 32-bit operand size changes nothing): the source in `cr`.
+        Arpl_rm16_r16 | Arpl_r32m16_r32 => {
+            (s.reg, s.cr) = (rm_reg(0), gpr(1));
+            (ARPL, 2)
+        }
+        Bound_r16_m1616 | Bound_r32_m3232 => {
+            s.cr = gpr(0);
+            (BOUND, width(0))
+        }
+        Pushaw => (PUSHA, 2),
+        Pushad => (PUSHA, 4),
+        Popaw => (POPA, 2),
+        Popad => (POPA, 4),
+        Aam_imm8 => {
+            s.cr = u32::from(i.immediate8());
+            (AAM, 0)
+        }
+        // JMP/CALL far ptr16:16/32: the offset in `disp`, the selector in `cr` (`memory` 0).
+        Jmp_ptr1616 | Jmp_ptr1632 | Call_ptr1616 | Call_ptr1632 => {
+            let short = matches!(i.code(), Jmp_ptr1616 | Call_ptr1616);
+            s.cr = u32::from(i.far_branch_selector());
+            s.disp = if short {
+                i64::from(i.far_branch16())
+            } else {
+                i64::from(i.far_branch32())
+            };
+            let jmp = matches!(i.code(), Jmp_ptr1616 | Jmp_ptr1632);
+            (if jmp { JMP_FAR } else { CALL_FAR }, if short { 2 } else { 4 })
         }
         // SYSEXIT and SYSRET: REX.W to 64-bit mode, else compatibility mode.
         Sysexitd => (SYSEXIT, 4),
@@ -1527,6 +1572,56 @@ mod tests {
         );
         assert_eq!(at(32, "ce"), k(INTO, 0, 0, 1));
         assert_eq!(at(32, "0f22d8"), Some(mov(MOV_TO_CR, 3, 0, 3, 0)));
+        // M2 task 3b: lds esi, [ebx+4]; les ax, [eax] (66); lgs edi, [ebx] (64-bit mode: refused); arpl [eax], dx;
+        // arpl cx, bx; bound eax, [ebx]; pusha (66), popad; aam 10; jmp 0x23:0x1234, call 0x1b:0x5678 (66)
+        assert_eq!(
+            at(32, "c57304"),
+            Some(System {
+                cr: SREG_DS as u32,
+                reg: 6,
+                size: 4,
+                ..m32(LOAD_FAR, 3, 4, 3)
+            })
+        );
+        assert_eq!(
+            at(32, "66c400").map(|s| (s.kind, s.cr, s.reg, s.size)),
+            Some((LOAD_FAR, SREG_ES as u32, 0, 2))
+        );
+        assert_eq!(
+            at(32, "0fb53b").map(|s| (s.kind, s.cr, s.reg)),
+            Some((LOAD_FAR, SREG_GS as u32, 7))
+        );
+        assert_eq!(at(64, "0fb53b"), None);
+        assert_eq!(
+            at(32, "6310"),
+            Some(System {
+                cr: 2,
+                size: 2,
+                ..m32(ARPL, 0, 0, 2)
+            })
+        );
+        assert_eq!(
+            at(32, "63d9").map(|s| (s.kind, s.memory, s.reg, s.cr)),
+            Some((ARPL, 0, 1, 3))
+        );
+        assert_eq!(
+            at(32, "6203"),
+            Some(System {
+                size: 4,
+                ..m32(BOUND, 3, 0, 2)
+            })
+        );
+        assert_eq!(at(32, "6660"), k(PUSHA, 2, 0, 2));
+        assert_eq!(at(32, "61"), k(POPA, 4, 0, 1));
+        assert_eq!(at(32, "d40a"), k(AAM, 0, 10, 2));
+        assert_eq!(
+            at(32, "ea341200002300").map(|s| (s.kind, s.memory, s.size, s.cr, s.disp, s.length)),
+            Some((JMP_FAR, 0, 4, 0x23, 0x1234, 7))
+        );
+        assert_eq!(
+            at(32, "669a78561b00").map(|s| (s.kind, s.memory, s.size, s.cr, s.disp, s.length)),
+            Some((CALL_FAR, 0, 2, 0x1b, 0x5678, 6))
+        );
         // INC EAX is no prefix and no system instruction; SWAPGS is 64-bit only.
         assert_eq!(at(32, "40"), None);
         assert_eq!(at(32, "0f01f8").map(|s| s.kind), Some(UD));
