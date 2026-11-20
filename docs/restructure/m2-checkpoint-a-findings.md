@@ -146,10 +146,60 @@ inspection report, which was only an interrupt arriving in the entry code). A pt
 faulting instruction and DS = 6BH; the `segs` program is that test with a flat segment, and passes. The program
 is not on the skip list because it does not stop the VM; the runner gives it 60 s instead of 300.
 
+## The gate and the benchmark round
+
+**Gate** (`tools/natemu-test run --gate`, commit 522e142b, on the M4): passed. 85,816 passed, none failed; 909 skipped
+(variants this machine does not run), 18 expected failures (the six x87 tests of `i386` at three vCPU counts), 2
+known-bug results that were on `main` before.
+
+**64-bit speed, `main` against this branch.** The standing 11 benchmarks, warm run (the second of each boot), 1 and
+4 vCPUs, three interleaved rounds (all of A, then all of B, per round), same image, kernel and settings, every run
+alone on the machine; no run was contended. A is `main` at f0feda92 (`TESTKIT_BENCH_AT`, natemu and its compiler built
+from that commit), B this branch. Seconds: median (lowest to highest of three).
+
+| Benchmark | A, 1 vCPU | B, 1 vCPU | B/A | A, 4 vCPUs | B, 4 vCPUs | B/A |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `build` | 6.28 (6.13-6.89) | 6.15 (6.07-6.19) | 0.98 | 2.26 (2.26-2.27) | 2.29 (2.25-2.33) | 1.02 |
+| `zstd` | 2.53 (2.51-2.54) | 2.49 (2.48-2.50) | 0.99 | 1.17 (1.13-1.20) | 1.17 (1.14-1.22) | 1.01 |
+| `hackbench` | 10.73 (10.71-11.02) | 11.62 (10.91-11.76) | **1.08** | 3.05 (3.04-3.58) | 3.47 (3.41-3.52) | **1.14** |
+| `locks` | 3.29 (3.28-3.36) | 3.39 (3.36-3.46) | 1.03 | 5.82 (5.81-6.34) | 5.64 (5.62-5.82) | 0.97 |
+| `luajit` | 3.07 (3.04-3.13) | 3.10 (3.04-3.10) | 1.01 | 1.12 (1.11-1.14) | 1.08 (1.06-1.09) | 0.96 |
+| `luajit-interp` | 3.37 (3.37-3.42) | 3.44 (3.32-3.45) | 1.02 | 0.95 (0.89-0.97) | 0.96 (0.87-0.96) | 1.01 |
+| `mem` | 6.99 (6.82-7.85) | 7.02 (6.81-7.03) | 1.00 | 2.15 (2.13-2.23) | 2.15 (2.08-2.18) | 1.00 |
+| `cray` | 3.01 (2.96-3.03) | 3.03 (3.02-3.05) | 1.01 | 0.99 (0.96-1.02) | 0.98 (0.97-1.02) | 1.00 |
+| `7zip` | 3.35 (3.33-3.38) | 3.44 (3.30-3.45) | 1.03 | 1.41 (1.40-1.48) | 1.42 (1.38-1.73) | 1.01 |
+| `sqlite` | 6.18 (6.05-6.43) | 6.16 (6.04-6.18) | 1.00 | 6.24 (6.18-6.51) | 6.24 (6.17-6.54) | 1.00 |
+| `avx` | 8.18 (8.04-8.54) | 8.15 (8.01-8.15) | 1.00 | 3.12 (3.10-3.16) | 3.10 (3.10-3.11) | 1.00 |
+| geometric mean | | | 1.013 | | | 1.008 |
+
+- **M2 costs `hackbench` time, beyond its spread:** 8% at 1 vCPU and 14% at 4 in the warm run (5% and none in the
+  cold run of the same boots, so the size is uncertain; the direction at 1 vCPU is not). `locks` at 1 vCPU is 3%
+  slower, just outside its spread. Everything else is within spread. So `main`'s dispatcher work did help `hackbench`
+  (10.7 s against the 11.9 s of November 16), and M2 gives a part of it back, which is why task 4's baseline on this
+  branch looked unchanged.
+- **Where:** `hackbench` and `locks` alone at 1 vCPU, three more interleaved rounds over the tasks' heads (warm
+  medians): `main` 10.76 and 3.28 s; tasks D and 1 integrated (766e37af) 11.14 and 3.39; task 2 (43e6159c) 10.93 and
+  3.34; task 3a (47aafca2) 11.18 and 3.44; task 3b (c659a43a) 11.11 and 3.38. The step is there at tasks D and 1
+  (the diagnostics' per-exit work, the code-mode split, the new decoder for instructions the resident runs) and
+  does not clearly grow afterwards, but single runs of one build vary by 4%, so three rounds cannot separate the
+  later tasks' candidates (task 3a's mode tests on entry and state save, the null-segment bits of the code
+  identity, the system-call fast path's extra compare). Nothing was tuned.
+
+**32-bit against 64-bit, the same program** (`cpuint` and `cpufp` of the `i386` suite, the runner's wall seconds for
+the whole process, 1 vCPU; the natively run numbers are the reference machine's, an AMD Ryzen 7 8845HS, and too
+short to be more than an order of magnitude):
+
+| Program | native, 64-bit | native, 32-bit | natemu, 64-bit | natemu, 32-bit |
+| --- | ---: | ---: | ---: | ---: |
+| `cpuint` (hashing, sorting, 64-bit arithmetic) | 0.20 | 0.22 | 0.25 | 0.35 |
+| `cpufp` (double arithmetic, square roots, casts to integers) | 0.03 | 0.06 | 0.04 | 4.19 |
+
+Integer 32-bit code runs at about 1.4 times its 64-bit build's time. x87 code is about a hundred times slower than
+the SSE build: every cast traps twice and every x87 operation pays its wrapper, the plan's first two items for task 4.
+
 ## Not done
 
 - **Speed** (task 4): nothing was measured or tuned.
-- **A 32-bit benchmark.** The checkpoint's benchmark round and the full gate wait for the review (the owner's order).
 - **C++ and larger userlands** (a 32-bit toolchain build) are checkpoint B's.
 - **The stream of a whole 32-bit userland boot** for the replay check: the recorded boot runs one static program.
   The campaign image would give a stream of several GiB; not worth a gate case.
