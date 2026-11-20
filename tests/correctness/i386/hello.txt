@@ -1,0 +1,12 @@
+hello argc=2 argv1=one env=set
+sizes long=4 ptr=4 longlong=8 longdouble=12
+machine x86_64
+int80 getpid ok
+AT_SYSINFO present, getppid through it ok
+vdso present pagesz 4096
+3.142 3.333333e+09 0.3  -2.2|42      |0000beef|+7
+2.7182818284590451 0.001
+sorted 1 2 467 998
+u64 8116566219967299728 19173961 9781021041 40992764608243447
+heap 138240 len 15
+path/386

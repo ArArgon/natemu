@@ -1,7 +1,9 @@
 """Linux workload campaigns (plan docs/superpowers/plans/2026-11-18-campaign-onboarding.md, Task 6-7): each case boots one
 part of a campaign image under natemu, with tools/correctness/boot.py's command line, and every test the image lists
 for that part is judged by the campaign's own verdict on its `CT-RESULT` line. Nothing is compared with a reference
-run and nothing is locked: no QEMU, no x86 machine.
+run and nothing is locked: no QEMU, no x86 machine. The exception is a suite with `reference = "x86"` (i386), whose
+verdict compares each test's output with one recorded on the x86 reference machine: a run with TESTKIT_SEED_ANSWERS=1
+and NATEMU_X86_HOST=user@host runs each part there instead of under natemu (native() below), and the verdict records.
 
     [[suite]] kind = "judged"  harness = "campaign"  tier = "campaign"
     parts = N                   cases part-0 ... part-(N-1): the image's parts, in the order its list names them
@@ -132,6 +134,22 @@ def boot(image: pathlib.Path, suite: str, part: str, vcpus: int, work: pathlib.P
         tail = _read(work / 'stderr.txt').strip()[-400:]
         if tail: note += f'; natemu stderr: {tail}'
     return BootResult(end_of(text) is not None, text, note)
+
+
+def native(image: pathlib.Path, suite: str, part: str, host: str, cap: float) -> BootResult:
+    """One part run on the x86 machine `host` (ssh, passwordless sudo) instead of under natemu: the image unpacked into
+    a temporary folder there, the guest's runner run in it as root (chroot, with /proc and /dev), the folder removed.
+    The output has the lines a boot's serial console has."""
+    script = ('set -e; d=$(mktemp -d); trap \'sudo umount "$d/r/proc" "$d/r/dev" 2>/dev/null; sudo rm -rf "$d"\' EXIT; '
+              'mkdir "$d/r"; zstd -dc | (cd "$d/r" && sudo cpio -idm --quiet); '
+              'sudo mount -t proc proc "$d/r/proc"; sudo mount --bind /dev "$d/r/dev"; '
+              f'echo "CT-BEGIN suite={suite} part={part} native kernel=$(uname -r)"; '
+              'sudo chroot "$d/r" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C TZ=UTC '
+              f'/ct/run-{suite}.sh /ct {part} 2>&1 || true; echo "CT-END suite={suite} part={part} rc=0"')
+    with open(image, 'rb') as f:
+        r = subprocess.run(['ssh', '-o', 'BatchMode=yes', host, script], stdin=f, capture_output=True, timeout=cap)
+    text = r.stdout.decode(errors='replace')
+    return BootResult(end_of(text) is not None, text, f'run natively on {host}' + (f': {r.stderr.decode(errors="replace")[-400:]}' if r.returncode else ''))
 
 
 _LIVE: set = set()          # natemu processes this worker started (each in its own session: a worker's group kill misses them)
@@ -413,7 +431,11 @@ class Campaign:
             got = judge(br, fn, img)
             return got if fill is None else {**unreported(br, fill, tests, got), **got}
 
-        first = boot(cpio, ct, booted, vcpus, work / 'boot-1', cap, **how)
+        if suite.reference == 'x86' and os.environ.get('TESTKIT_SEED_ANSWERS'):     # record, on the reference machine
+            if not os.environ.get('NATEMU_X86_HOST'): return CaseResult('failed', 'seeding needs NATEMU_X86_HOST=user@host')
+            first = native(cpio, ct, booted, os.environ['NATEMU_X86_HOST'], cap)
+        else:
+            first = boot(cpio, ct, booted, vcpus, work / 'boot-1', cap, **how)
         got = results(first)
         listed = set(tests)
         missing = 'listed in the image for part ' + part + ' but not in the output' + \

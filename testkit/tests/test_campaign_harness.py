@@ -433,6 +433,32 @@ def test_libm_77_is_unsupported():
     assert v.gstr('test-strlen', {'rc': '0'}, [])[0] == 'passed'
 
 
+def test_reference_compared_verdicts(tmp_path, monkeypatch):
+    """i386 and torture32 (reference = "x86"): seeding records the reference machine's answers and never passes; a run
+    passes only with the recorded output (i386: static and dynamic builds share one file) or status and hash
+    (torture32: status alone for a signal, and for output that differed between two seeding runs)."""
+    v = verdicts()
+    monkeypatch.setattr(v, 'I386', tmp_path / 'i386'); monkeypatch.setattr(v, 'TORTURE32', tmp_path / 't32.txt')
+    out = lambda n, *lines: [f'CT-LOG {n} | {ln}'.rstrip() for ln in lines] + ['CT-DMESG noise']
+    monkeypatch.setenv('TESTKIT_SEED_ANSWERS', '1')
+    assert v.i386('x.dyn', {'rc': '0'}, out('x.dyn', 'a', '', 'b'))[0] == 'unverified'
+    assert (tmp_path / 'i386/x.txt').read_text() == 'a\n\nb\n'
+    assert v.i386('x.static', {'rc': '0'}, out('x.static', 'a'))[0] == 'failed'         # differs from the dynamic build
+    assert v.i386('y', {'rc': '1'}, [])[0] == 'failed'
+    for _ in range(2): assert v.torture32('t.O0', {'rc': '0', 'out': 'aa'}, [])[0] == 'unverified'
+    v.torture32('addr.O0', {'rc': '0', 'out': 'aa'}, []); v.torture32('addr.O0', {'rc': '0', 'out': 'bb'}, [])
+    v.torture32('abort.O0', {'rc': '134', 'out': 'cc'}, [])
+    assert (tmp_path / 't32.txt').read_text() == 'abort.O0 134\naddr.O0 0 *\nt.O0 0 aa\n'
+    monkeypatch.delenv('TESTKIT_SEED_ANSWERS')
+    assert v.i386('x.static', {'rc': '0'}, out('x.static', 'a', '', 'b'))[0] == 'passed'
+    assert v.i386('x.dyn', {'rc': '0'}, out('x.dyn', 'a', '', 'c'))[0] == 'failed'
+    assert v.i386('x.dyn', {'rc': '1'}, out('x.dyn', 'a', '', 'b'))[0] == 'failed'
+    assert v.i386('unknown', {'rc': '0'}, [])[0] == 'failed'
+    t = lambda n, rc, o: v.torture32(n, {'rc': rc, 'out': o}, [])[0]
+    assert [t('t.O0', '0', 'aa'), t('t.O0', '0', 'zz'), t('t.O0', '1', 'aa'), t('new.O0', '0', 'aa')] == ['passed', 'failed', 'failed', 'failed']
+    assert [t('addr.O0', '0', 'zz'), t('addr.O0', '1', 'zz'), t('abort.O0', '134', 'zz'), t('abort.O0', '0', 'cc')] == ['passed', 'failed', 'passed', 'failed']
+
+
 def test_x86st_fail_count_fails():
     v = verdicts()
     f = lambda **kw: dict({'rc': '0', 'ok': '4', 'fail': '0', 'skip': '0', 'out': '0123456789ab'}, **kw)
