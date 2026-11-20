@@ -205,8 +205,7 @@ fn gate(c: &Cpu) -> Result<(), Exception> {
 /// #AC(0) under alignment checking for an x87 memory operand that is not `align`-aligned (SDM Vol.3 Table 7-7), after the
 /// canonical check (which [`linear`] makes first otherwise).
 fn aligned(s: &State, va: u64, n: u64, align: u64, i: &System) -> Result<(), Exception> {
-    let last = va.wrapping_add(n - 1);
-    if !paging::canonical(va) || !paging::canonical(last) || last < va {
+    if super::segments::outside(&s.cpu, va, n) {
         return Err(noncanonical(i));
     }
     if alignment_check(&s.cpu) != 0 && va & (align - 1) != 0 {

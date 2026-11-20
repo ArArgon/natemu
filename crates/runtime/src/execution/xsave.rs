@@ -71,6 +71,12 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
     if i.memory == 1 && va & if fx { 15 } else { 63 } != 0 {
         return Err(GP);
     }
+    // M2 task 3b: in 32-bit code the whole operand (512 bytes, or the XSAVE area XCR0 sizes, CPUID.0DH.0:EBX) must lie
+    // within the 4 GiB limit, though fewer bytes are touched there.
+    let operand: usize = if fx { 512 } else if xcr0 & 4 != 0 { AREA } else { AVX };
+    if i.memory == 1 && xmms == 8 && super::segments::outside(&s.cpu, va, operand as u64) {
+        return Err(nc);
+    }
     // The canonical check (#GP(0), or #SS(0) for an SS-class reference; a range wrapping past 2^64 is non-canonical) is
     // made on each range below before its walk, by `linear` and `pages`: FX* bytes 0..415, XSAVE the span from its first
     // to its last stored byte, XRSTOR first the base through the header's 64 bytes (the base checked though only the header
@@ -148,8 +154,7 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         system::XRSTOR => {
             // The header (all 64 bytes, in the area's first page with the 64-byte alignment) is read first, but its canonical
             // check starts at the area's base: a non-canonical base is #GP/#SS before a #PF on the header's page.
-            let last = va.wrapping_add(HEADER as u64 + 63);
-            if !paging::canonical(va) || !paging::canonical(last) || last < va {
+            if super::segments::outside(&s.cpu, va, HEADER as u64 + 64) {
                 return Err(nc);
             }
             linear(
