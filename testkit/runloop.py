@@ -78,7 +78,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
     # An item with no recorded duration is estimated from its suite's recorded items (their mean), so one new case does
     # not make its whole unit unknown, which keeps it out of every drain backfill (rule 3; seen: 9 of 12 cores idle while
     # a window drained, the gate's 220 units all unknown because 45 of its thousands of fault cases had a duration).
-    known = {}
+    known, new = {}, set()          # new: units with an item never recorded here, ordered first (below)
     for it in items:
         t = table.get(it.nodeid)
         if t is not None: known.setdefault(it.unit_key, []).append(t)
@@ -88,6 +88,7 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
         for i in range(0, len(g), max(1, s.batch)):
             chunk = g[i:i + s.batch]
             exp = [table.get(it.nodeid, it.harness.expected(it.case) if hasattr(it.harness, 'expected') else None) for it in chunk]
+            unrecorded = any(table.get(it.nodeid) is None for it in chunk)
             if None in exp and known.get(k):
                 mean = sum(known[k]) / len(known[k])
                 exp = [mean if e is None else e for e in exp]
@@ -112,12 +113,16 @@ def build_units(items, config, pool) -> tuple[list[Unit], list[tuple[CaseItem, s
             own = [h.case_timeout(it.fam, it.suite, it.case) for it in chunk] if hasattr(h, 'case_timeout') else []
             timeout = max([float(x) for x in own if x] or [float(s.params.get('timeout', 3600))])
             units.append(Unit(len(units), chunk, req, env, timeout))
+            if unrecorded: new.add(units[-1].n)
     # The queue grants in ask order (testkit.sched.policy rule 7), so the order is stamped after sorting: claims of a whole
     # core class first, while the machine is still empty (later they wait for every core of it to free), then longest
     # first. (Stamped at creation, the units were granted in collection order: the unit family, last alphabetically,
-    # started its longest units at the end of every gate.)
+    # started its longest units at the end of every gate.) A unit with an item that never ran on this machine goes
+    # before the others: its length is only estimated (its suite's mean), and a long one started late is the run's tail
+    # (seen: a new 9-minute case estimated at a minute started 22 minutes into a gate and ended it).
     whole = lambda u: u.req.cores >= (pool.cfg.p_cores if u.req.perf else max(pool.cfg.p_cores, pool.cfg.e_cores))
-    units.sort(key=lambda u: (0 if whole(u) else 1, -(u.req.expected if u.req.expected is not None else 1e9)))
+    units.sort(key=lambda u: (0 if whole(u) else 1, 0 if u.n in new else 1,
+                              -(u.req.expected if u.req.expected is not None else 1e9)))
     t0 = time.time()
     for i, u in enumerate(units): u.req = dataclasses.replace(u.req, asked=t0 + i * 1e-6)
     return units, refused

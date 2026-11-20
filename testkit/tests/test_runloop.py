@@ -119,6 +119,25 @@ def test_a_unit_with_unrecorded_items_is_estimated_from_its_suite(monkeypatch, t
     assert [u.req.expected for u in units if u.items[0].suite.name == "t"] == [None]   # nothing recorded: still unknown
 
 
+def test_units_that_never_ran_here_go_first(tmp_path, monkeypatch):
+    """A new case's length is only its suite's mean: started late, a long one ends the run (seen: a 9-minute case
+    estimated at a minute started 22 minutes into a gate)."""
+    from types import SimpleNamespace as NS
+    from testkit import runloop
+    from testkit.sched.policy import Config
+    suite = NS(name='s', batch=1, kind='runner', params={})
+    fam, var = NS(name='f'), NS(id='', params={})
+    items = [NS(nodeid=f'n{i}', unit_key=('f', 's', ''), suite=suite, fam=fam, variant=var, case=f'c{i}',
+                harness=object(), place=NS(env={})) for i in range(4)]
+    monkeypatch.setattr(runloop.durations, 'load', lambda: {'n0': 300.0, 'n1': 10.0, 'n3': 200.0})    # n2: never ran
+    monkeypatch.setattr(runloop, 'run_dir', lambda c: tmp_path)
+    monkeypatch.setattr(runloop, 'it_needs', lambda it: NS(cores=1, exclusive=False, perf=False, dedicated=False))
+    pool = NS(cfg=Config(p_cores=8, e_cores=4), unsatisfiable=lambda r: False)
+    units, _ = runloop.build_units(items, NS(getoption=lambda k: None), pool)
+    assert [u.items[0].nodeid for u in units] == ['n2', 'n0', 'n3', 'n1']
+    assert [u.req.asked for u in units] == sorted(u.req.asked for u in units)        # granted in that order
+
+
 def _alive(pid):
     try: os.kill(pid, 0); return True
     except ProcessLookupError: return False
