@@ -62,6 +62,11 @@ pub struct Config {
     pub page_currency: u64,
     pub writable_on_read: bool,
     pub perf_log: Option<PathBuf>,
+    /// SIGINFO (Ctrl-T) prints every vCPU's state and the run goes on (`natemu::execution::inspect_on_signal`).
+    pub inspect: bool,
+    /// Seconds a vCPU may stay in the guest without a host exit, or in the host outside a translation, before the run ends
+    /// with its report; None = the library's 60 s.
+    pub watchdog: Option<u64>,
 }
 
 impl Config {
@@ -96,6 +101,8 @@ impl Config {
             page_currency: natemu::execution::parse_page_currency("on").unwrap(),
             writable_on_read: true,
             perf_log: None,
+            inspect: true,
+            watchdog: None,
         }
     }
     /// The prefix of this configuration's error messages: the config file's name as given, or `config` when there is none.
@@ -200,6 +207,8 @@ struct FDebug {
     page_currency: Option<String>,
     writable_on_read: Option<bool>,
     perf_log: Option<PathBuf>,
+    inspect: Option<bool>,
+    watchdog: Option<u64>,
 }
 
 /// A file value's path: relative ones are taken from the file's folder.
@@ -342,6 +351,8 @@ fn apply_file(cfg: &mut Config, f: FileConfig, base: &Path) -> Res<()> {
         }
         cfg.writable_on_read = d.writable_on_read.unwrap_or(cfg.writable_on_read);
         cfg.perf_log = d.perf_log.map(|p| rel(base, &p)).or(cfg.perf_log.take());
+        cfg.inspect = d.inspect.unwrap_or(cfg.inspect);
+        cfg.watchdog = d.watchdog.or(cfg.watchdog);
     }
     Ok(())
 }
@@ -543,7 +554,7 @@ fn apply_flags(
 
 /// Every setting name `--set` accepts besides the per-device `disk.ID.*` and `nic.ID.*` (`set` has a handler for each; a test
 /// walks this table, and `apply_flags` asserts each name it claims is here or is a device key).
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 24] = [
     "machine.ram",
     "machine.vcpus",
     "machine.transport",
@@ -566,6 +577,8 @@ const KEYS: [&str; 22] = [
     "debug.page_currency",
     "debug.writable_on_read",
     "debug.perf_log",
+    "debug.inspect",
+    "debug.watchdog",
 ];
 const DEVICE_KEYS: &str =
     "disk.ID.{path,readonly,backing,snapshot}, nic.ID.{forward,host_loopback}";
@@ -712,6 +725,10 @@ fn set(cfg: &mut Config, arg: &str, seen: &mut BTreeSet<String>) -> Res<()> {
             cfg.writable_on_read = natemu::execution::parse_writable_on_read(text).map_err(err)?
         }
         "debug.perf_log" => cfg.perf_log = Some(path()),
+        "debug.inspect" => cfg.inspect = boolish(text).map_err(err)?,
+        "debug.watchdog" => {
+            cfg.watchdog = Some(text.parse().map_err(|_| err(format!("bad seconds {text:?}")))?)
+        }
         _ => return Err(err("internal error: no handler for this key".into())),
     }
     Ok(())
@@ -916,6 +933,9 @@ pub fn to_boot(
     boot.cmdline = cfg.cmdline.clone();
     boot.ram = cfg.ram.unwrap_or(boot.ram);
     boot.vcpus = cfg.vcpus.unwrap_or(boot.vcpus);
+    if let Some(s) = cfg.watchdog {
+        boot.watchdog = std::time::Duration::from_secs(s.max(1));
+    }
     Ok(boot)
 }
 

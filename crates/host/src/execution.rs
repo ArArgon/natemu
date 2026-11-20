@@ -24,6 +24,8 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod diag;
+pub use diag::inspect_on_signal;
 pub mod io;
 #[cfg(feature = "io-test-hooks")]
 pub mod io_test;
@@ -2518,6 +2520,10 @@ pub struct Compiler {
     /// Admission's code-shape debug check ([`admission`]); off unless the caller sets it (the program driver's
     /// `--code-shape`).
     pub shape: bool,
+    /// M2 task D: a Linux boot's diagnostics ([`diag`]): each stop but a power-off prints the vCPU's report on standard error,
+    /// and a vCPU in the host for the watchdog's time outside a translation (whose wait has its own deadline) ends the
+    /// process with its report, exit status 2. Off unless the caller sets it (`linux::Prepared::run` does).
+    pub report: bool,
     /// The vCPU's controls gate SSE (I5a: CR0.EM, CR0.TS or no CR4.OSFXSR, [`sse_gated`]): fexc cuts every SSE form as a
     /// system instruction, which the resident raises as #UD or #NM. Set per request (part of the request, so of the cache key).
     pub(crate) sse_gated: bool,
@@ -2729,6 +2735,7 @@ impl Compiler {
             deadline: COMPILE_DEADLINE,
             slowest: Duration::ZERO,
             shape: false,
+            report: false,
             sse_gated: false,
             avx_gated: false,
             alignment_gated: false,
@@ -3792,9 +3799,12 @@ pub fn run(
             ],
         );
     }
-    // When the vCPU last entered the guest (`perf::now`), 0 while it is in the host: two stores per exit, which the watchdog
-    // samples (perf chunk 7; a channel send at each entry and exit woke it twice per exit). Dropping `done` ends it.
-    let entered = &AtomicU64::new(0);
+    // When the vCPU last entered the guest (`perf::now`), or [`IN_HOST`] with its exit count while it is in the host: two
+    // stores per exit, which the watchdog samples (perf chunk 7; a channel send at each entry and exit woke it twice per
+    // exit). Dropping `done` ends it. `inspect`: the watchdog thread forced the vCPU out for an inspection (M2 task D).
+    let entered = &AtomicU64::new(IN_HOST);
+    let inspect = &AtomicBool::new(false);
+    let report = compiler.report;
     let (done, ended) = std::sync::mpsc::channel::<()>();
     let id = cpu.id();
     // A halted vCPU (X2: parked in the VM by HLT) is idle, not stuck: the watchdog waits on; the driver decides when a
@@ -3808,19 +3818,43 @@ pub fn run(
     std::thread::scope(move |scope| {
         scope.spawn(move || {
             let limit = u64::try_from(watchdog.as_nanos()).unwrap_or(u64::MAX);
-            // The entry last seen, when it is next checked, and the wait after a check that found it still in the guest:
-            // `limit`, then 100 ms (a request racing its entry into `hv_vcpu_run` might not stop it).
-            let (mut seen, mut due, mut again) = (0, 0, limit);
+            // The entry (or host stay) last seen, when it is next checked, the wait after a check that found it still in the
+            // guest (`limit`, then 100 ms: a request racing its entry into `hv_vcpu_run` might not stop it), when it was
+            // first seen, and the inspection requests answered.
+            let (mut seen, mut due, mut again, mut since) = (0, 0, limit, 0);
+            let mut asked = diag::INSPECT.load(SeqCst);
+            let request = || area.read_record::<u64>(exec::STATE_OFFSET + std::mem::offset_of!(State, request));
             loop {
                 let (t, now) = (entered.load(SeqCst), crate::perf::now());
+                let host = t & IN_HOST != 0;
                 if t != seen {
-                    (seen, due, again) = (t, t.saturating_add(limit), limit);
+                    // In the host it is checked `limit` after it was first seen there.
+                    (seen, due, again, since) = (t, if host { now } else { t }.saturating_add(limit), limit, now);
                 }
-                // In the host it looks again after `limit` (at least 1 ms); an entry it then finds is checked at entry + `limit`.
-                let wait = if t == 0 {
-                    limit.max(1_000_000)
-                } else if now < due {
+                let secs = (now - since) as f64 / 1e9;
+                if diag::INSPECTING.load(Relaxed) && diag::INSPECT.load(SeqCst) != asked {
+                    asked = diag::INSPECT.load(SeqCst);
+                    if host {
+                        eprint!("{}", diag::report(area, "inspected (it runs on)", diag::At::Host { request: request(), secs }));
+                    } else {
+                        // `serve` reports it at the forced exit and resumes it.
+                        inspect.store(true, SeqCst);
+                        exit_vcpus(&mut [id]);
+                    }
+                }
+                let wait = if now < due {
                     due - now
+                } else if host {
+                    let r = request();
+                    if report && !matches!(r, exec::REQUEST_TRANSLATE | exec::REQUEST_STEP) {
+                        let what = format!("the host-side progress check: no return to the guest for {secs:.1} s; natemu exits");
+                        eprint!("{}", diag::report(area, &what, diag::At::Host { request: r, secs }));
+                        // ponytail: the stuck thread cannot be unwound, so the process ends (status 2, a stop); an embedder
+                        // that must survive this needs the host wait itself to be cancellable.
+                        std::process::exit(2);
+                    }
+                    due = now.saturating_add(limit);
+                    limit.max(1_000_000)
                 } else {
                     if halted.load(SeqCst) == 0 {
                         exit_vcpus(&mut [id]);
@@ -3829,6 +3863,7 @@ pub fn run(
                     due = now.saturating_add(again);
                     again
                 };
+                let wait = if diag::INSPECTING.load(Relaxed) { wait.min(diag::INSPECT_POLL) } else { wait };
                 if ended.recv_timeout(Duration::from_nanos(wait))
                     != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                 {
@@ -3837,14 +3872,30 @@ pub fn run(
             }
         });
         let stop = serve(
-            cpu, area, compiler, stop_at, requests, stops, entered, cancelled, hook,
+            cpu, area, compiler, stop_at, requests, stops, entered, inspect, cancelled, hook,
         );
+        // M2 task D: the stop's report (not a power-off's). A vCPU forced out of translated code (the watchdog, a cancel)
+        // has the guest's registers in its own; the bank is current at every other stop.
+        if let Ok(stop) = &stop
+            && report
+            && !matches!(stop, Stop::Power(crate::pm::POWEROFF))
+        {
+            let el0 = cpu.reg(CPSR).is_ok_and(|c| c & 0xf == 0);
+            let at = if el0 || matches!(stop, Stop::Watchdog { .. }) { diag::At::Forced(cpu) } else { diag::At::Stopped };
+            let name = match stop {
+                Stop::Resident { stop, .. } => format!(" ({})", exec::stop::name(*stop)),
+                _ => String::new(),
+            };
+            eprint!("{}", diag::report(area, &format!("stop {stop:?}{name}"), at));
+        }
         // ponytail: a cancel the watchdog sent just as the guest exited stays pending on the vCPU and would end its next
         // `hv_vcpu_run` at once; harmless while a vCPU serves one run. Drain it (a zero-length run) if vCPUs get reused.
         drop(done);
         stop
     })
 }
+/// [`run`]'s `entered` word while the vCPU is in the host (with its exit count below, so each stay is told apart).
+const IN_HOST: u64 = 1 << 63;
 fn serve(
     cpu: &Vcpu,
     area: Area,
@@ -3853,12 +3904,14 @@ fn serve(
     requests: &mut Requests,
     stops: &Stops,
     entered: &AtomicU64,
+    inspect: &AtomicBool,
     cancelled: &AtomicBool,
     hook: &mut impl Hook,
 ) -> Result<Stop> {
     // The host's own stop, once decided: the vCPU was told to park (it drops its shadows first).
     let mut parked = None;
     let v = area.vcpu;
+    let mut exits = 0u64;
     // The performance log: each part of the loop is charged to its kind (`perf::Recorder::lap`).
     let lap = |compiler: &mut Compiler, k: usize| {
         if let Some(r) = &mut compiler.perf {
@@ -3875,11 +3928,17 @@ fn serve(
         let exit = cpu.run_until_exit();
         lap(compiler, crate::perf::RUN);
         stops.in_host[v].store(true, SeqCst);
-        entered.store(0, SeqCst);
+        exits += 1;
+        entered.store(IN_HOST | exits, SeqCst);
         lap(compiler, crate::perf::SIGNAL);
         let exit = match exit? {
             vm::Exit::Hvc(immediate) => immediate,
             vm::Exit::Cancelled if cancelled.load(SeqCst) => return Ok(Stop::Cancelled),
+            // M2 task D: an inspection's forced exit; Hypervisor.framework resumes the vCPU unchanged.
+            vm::Exit::Cancelled if inspect.swap(false, SeqCst) => {
+                eprint!("{}", diag::report(area, "inspected (it runs on)", diag::At::Forced(cpu)));
+                continue;
+            }
             vm::Exit::Cancelled => {
                 let asked = (0..cache::MAX_VCPUS)
                     .filter(|&p| {
