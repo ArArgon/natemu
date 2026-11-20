@@ -213,7 +213,7 @@ def df_stores(d, insns, dis, order):
 
 STUBS = check_sites.STUBS
 BRANCH = re.compile(r'(b|b\.\w+|cbz|cbnz|tbz|tbnz)\s+(?:([wx]\d+),\s+)?(?:#(0x[0-9a-f]+|\d+),\s+)?0x([0-9a-f]+)$')
-STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa'}
+STUB_WORD = {'guard': 'brk #0x1', 'split': 'brk #0x2', 'divide': 'brk #0x3', 'align': 'brk #0x4', 'stack': 'brk #0xa', 'fldcw': 'brk #0xb'}
 M64 = (1 << 64) - 1
 
 
@@ -295,6 +295,13 @@ def guards(d, dis, order):
             out.append(f'stub +{at} ({s["kind"]}) reached by {len(refs.get(at, []))} branches')
         else:
             check_at[at] = refs[at][0]
+            # M2 task 4, a translated FLDCW: `ldrh w0, [x28, #0x4b0]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0, stub`.
+            t = refs[at][0]
+            if s['kind'] == 'fldcw' and not (dis.get(t) == f'cbnz w0, {at:#x}' and dis.get(t - 4) == 'and w0, w0, #0x3f' and
+                                             re.fullmatch(r'eor w0, w0, w\d+', dis.get(t - 8, '')) and dis.get(t - 12) == 'ldrh w0, [x28, #0x4b0]'):
+                out.append(f'stub +{at} (fldcw): its check is not `ldrh w0, [x28, #0x4b0]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0`')
+            elif s['kind'] == 'fldcw':
+                ok.add(t)
     cost['stub'] = len(stubs)
     if {o for o in order if dis[o].startswith('brk')} != set(stubs):
         out.append('brk words and stub sites differ')
@@ -720,7 +727,7 @@ def entry_and_branches(d, dis, order):
         guest_state = guest_state or (acc and acc[2] == 'x28' and acc[0] == 'load' and acc[3] is None and acc[5] == 'none' and
                                       any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in GUEST_STATE_BASES + (((976, 16),) if BITS else ())))   # M2: 32-bit code also loads es/cs/ss/ds_cached (frame::LEGACY_BASES)
         inside = lambda fields: acc and acc[3] is None and acc[5] == 'none' and any(f <= acc[4] and acc[4] + acc[1] <= f + n for f, n in fields)
-        guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or inside(X87_RUN_STATE) or inside(AVX_HIGH) or (acc[0] == 'load' and inside((X87_FCW,)))))
+        guest_state = guest_state or (acc and acc[2] == 'x28' and (inside(X87_STATE) or inside(X87_RUN_STATE) or inside(AVX_HIGH) or inside((X87_FCW,))))   # (FCW: a translated FLDCW stores it, M2 task 4)
         if acc and acc[2] in ('x28', 'sp') and not guest_state:
             out.append(f'+{off} "{dis[off]}" accesses emulator data ({acc[2]})')
         if re.fullmatch(r'ldr\w* \w+, 0x[0-9a-f]+', dis[off]):

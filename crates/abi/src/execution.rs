@@ -1672,10 +1672,13 @@ pub mod frame {
         (X87_MM, 128),
         (X87_FCW, 8),
     ];
-    /// The fields admitted code may also write: DF, the x87 state but FCW, and the YMM upper halves. TF, IOPL, NT, AC, VIF,
-    /// VIP and ID are the resident's, and so is FCW (FLDCW, FNINIT, FLDENV, FRSTOR are transactions); IF too but in a CPL-0
+    /// The fields admitted code may also write: DF, the x87 state, and the YMM upper halves. TF, IOPL, NT, AC, VIF,
+    /// VIP and ID are the resident's. FCW (M2 task 4): a translated FLDCW stores a word that keeps the exception masks, and the
+    /// resident reads the rounding and precision controls back at every bank (FNINIT, FLDENV, FRSTOR and a FLDCW changing the
+    /// masks are transactions); IF too but in a CPL-0
     /// block's CLI and STI ([`IF`]).
-    pub const GUEST_STATE_WRITABLE: [(u32, u32); 11] = [
+    pub const GUEST_STATE_WRITABLE: [(u32, u32); 12] = [
+        (X87_FCW, 2),
         (X87_FPCR, 4),
         (X87_RUN, 1),
         (AVX_HIGH, 256),
@@ -2426,7 +2429,13 @@ pub const X87_FPCR_EXPLICIT: u64 = 1 << 32;
 /// The FPCR x87 arithmetic runs under for `fcw` (I6): AH and NEP as for SSE (clear with `no_afp`), RMode from FCW.RC (bits
 /// 11:10, the same encoding as MXCSR.RC), no flush to zero; 0 when it equals MXCSR's ([`fpcr`]), which blocks are entered
 /// with. With `no_afp` a word that differs carries [`X87_FPCR_EXPLICIT`], so it is never 0 (a bare 0 would be that "equal").
+/// M2 task 4: 0 too on a host with AFP while every x87 exception is masked: translated code then switches FPCR once per run of
+/// x87 instructions and makes the word from FCW.RC as it is when the run starts (tools/fexc/shim/fexc_hook.h, "x87 runs"), so
+/// neither the rounding control nor MXCSR's flush bits key the code, and FLDCW is translated.
 pub const fn x87_fpcr(fcw: u64, mxcsr: u64, no_afp: bool, mode: u64) -> u64 {
+    if !no_afp && x87_unmasked(fcw) == 0 {
+        return 0;
+    }
     let afp = if no_afp { 0 } else { 1 << 1 | 1 << 2 };
     let x87 = afp | [0, 2, 1, 3][(fcw >> 10 & 3) as usize] << 22;
     if x87 == fpcr_run(mxcsr, no_afp, mode) {
@@ -4491,13 +4500,12 @@ mod tests {
         ]) {
             assert!(inside(&frame::GUEST_STATE_WRITABLE, at), "{at:#x}");
         }
-        assert!(
-            inside(&frame::GUEST_STATE, frame::X87_FCW + 1)
-                && !inside(&frame::GUEST_STATE_WRITABLE, frame::X87_FCW)
-        );
+        // (M2 task 4: a translated FLDCW writes FCW.)
+        assert!(inside(&frame::GUEST_STATE, frame::X87_FCW + 1) && inside(&frame::GUEST_STATE_WRITABLE, frame::X87_FCW + 1));
         assert!(
             !inside(&frame::GUEST_STATE, frame::X87_MM + 128)
-                && !inside(&frame::GUEST_STATE, frame::X87_IE + 4)
+                && !inside(&frame::GUEST_STATE, frame::X87_IE + 7) // (X87_IE + 4 is the x87 run byte, M2 task 4)
+                && inside(&frame::GUEST_STATE_WRITABLE, frame::X87_RUN)
         );
         // The DE-pending byte (FEX's OE flag byte): readable by generated code, written only by the resident.
         assert_eq!(frame::DE_PENDING, 0x413);
@@ -4622,20 +4630,25 @@ mod tests {
     }
     #[test]
     fn x87_fpcr_differs_only_when_it_must() {
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET, false, 0), 0);
+        // M2 task 4: with AFP and every x87 exception masked there is no keyed x87 word at all (x87 runs make it from FCW.RC).
         for rc in 0..4u64 {
-            assert_eq!(x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | rc << 13, false, 0), 0);
+            for mxcsr in [MXCSR_RESET | rc << 13, MXCSR_RESET | (rc ^ 1) << 13, MXCSR_RESET | 1 << 15, MXCSR_RESET | MXCSR_DAZ] {
+                assert_eq!(x87_fpcr(FCW_INIT | rc << 10, mxcsr, false, 0), 0);
+            }
+        }
+        // An unmasked x87 exception keeps the per-operation wrapper and its keyed word, as before.
+        let unmasked = FCW_INIT & !1;
+        assert_eq!(x87_fpcr(unmasked, MXCSR_RESET, false, 0), 0);
+        for rc in 0..4u64 {
+            assert_eq!(x87_fpcr(unmasked | rc << 10, MXCSR_RESET | rc << 13, false, 0), 0);
             assert_eq!(
-                x87_fpcr(FCW_INIT | rc << 10, MXCSR_RESET | (rc ^ 1) << 13, false, 0),
+                x87_fpcr(unmasked | rc << 10, MXCSR_RESET | (rc ^ 1) << 13, false, 0),
                 fpcr(MXCSR_RESET | rc << 13, false)
             );
         }
-        assert_eq!(x87_fpcr(FCW_INIT, MXCSR_RESET | 1 << 15, false, 0), fpcr(MXCSR_RESET, false)); // FTZ
-        assert_eq!(
-            x87_fpcr(FCW_INIT, MXCSR_RESET | MXCSR_DAZ, false, 0),
-            fpcr(MXCSR_RESET, false)
-        );
-        assert_eq!(x87_fpcr(FCW_INIT & !0x300, MXCSR_RESET, false, 0), 0); // precision control has no FPCR effect (doubles throughout)
+        assert_eq!(x87_fpcr(unmasked, MXCSR_RESET | 1 << 15, false, 0), fpcr(MXCSR_RESET, false)); // FTZ
+        assert_eq!(x87_fpcr(unmasked, MXCSR_RESET | MXCSR_DAZ, false, 0), fpcr(MXCSR_RESET, false));
+        assert_eq!(x87_fpcr(unmasked & !0x300, MXCSR_RESET, false, 0), 0); // precision control has no FPCR effect (doubles throughout)
     }
 
     /// AFP fallback chunks 1 and 3a: without AFP no AFP bit (AH 1, NEP 2, FIZ 0) is ever written: FPCR holds RMode and FZ only,

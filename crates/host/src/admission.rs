@@ -886,7 +886,7 @@ fn is_stub(s: &Site) -> bool {
 fn addressless(s: &Site) -> bool {
     matches!(
         s.kind,
-        object::kind::DIVIDE | object::kind::SIMD | object::kind::X87 | object::kind::PENDING | object::kind::DENORM
+        object::kind::DIVIDE | object::kind::SIMD | object::kind::X87 | object::kind::PENDING | object::kind::DENORM | object::kind::FLDCW
     )
 }
 /// `brk #1` (branch target), `brk #2` (split), `brk #3` (divide), `brk #4` (alignment, I5a), and (I5c) `brk #5` (SIMD
@@ -902,6 +902,7 @@ pub(crate) fn stub_word(kind: u8) -> u32 {
         object::kind::PENDING => 8,
         object::kind::DENORM => 9,
         object::kind::STACK => 10,
+        object::kind::FLDCW => 11,
         _ => 3,
     };
     0xd420_0000 | imm << 5

@@ -2306,7 +2306,7 @@ impl Verifier<'_> {
         use object::kind::*;
         for i in 0..self.c.stubs.len() {
             let (st, c) = (self.c.stubs[i], self.checks[i]);
-            if !matches!(st.kind, SIMD | X87 | PENDING | DENORM) {
+            if !matches!(st.kind, SIMD | X87 | PENDING | DENORM | FLDCW) {
                 continue;
             }
             let at = st.native_offset;
@@ -2361,6 +2361,18 @@ impl Verifier<'_> {
                         return fail();
                     }
                     c.start - if plain { 12 } else { 20 }
+                }
+                FLDCW => {
+                    // M2 task 4, a translated FLDCW: `ldrh w0, [x28, #FCW]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0, stub`.
+                    let ok = c.cond == Some(CBNZ_W) && c.start == c.end && words(3).is_some_and(|w| {
+                        w[0] == 0x7940_0000 | (frame::X87_FCW / 2) << 10 | 28 << 5
+                            && w[1] & 0xffe0_ffff == 0x4a00_0000
+                            && w[2] == 0x1200_1400
+                    });
+                    if !ok {
+                        return fail();
+                    }
+                    c.start - 12
                 }
                 DENORM => {
                     // The in-block DE screen skip's check: `ldrb w0, [x28, #DE_PENDING]; cbnz w0, stub`, before its instruction's first floating-point

@@ -202,10 +202,8 @@ static void FexcX87RunEnd(Arm64JITCore& J) {
     J.ldrb(TMP1.W(), STATE, FEXC_X87_RUN);
     (void)J.cbz(ARMEmitter::Size::i32Bit, TMP1, &Closed);
   }
-  if (fexc_x87_fpcr) {
-    J.ldr(TMP1.W(), STATE, FEXC_X87_FPCR);
-    J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
-  }
+  J.ldr(TMP1.W(), STATE, FEXC_X87_FPCR);
+  J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
   J.msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::zr);
   J.strb(ARMEmitter::WReg::zr, STATE, FEXC_X87_RUN);
   (void)J.Bind(&Closed);
@@ -228,12 +226,16 @@ static void FexcX87RunStart(Arm64JITCore& J) {
   (void)J.Bind(&Clean);
   J.movz(ARMEmitter::Size::i32Bit, TMP1, 1);
   J.strb(TMP1.W(), STATE, FEXC_X87_RUN);
-  if (fexc_x87_fpcr) {
-    J.mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
-    J.str(TMP1.W(), STATE, FEXC_X87_FPCR);
-    J.LoadConstant(ARMEmitter::Size::i64Bit, TMP1, uint64_t(fexc_x87_fpcr) & 0xffffffffull);
-    J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
-  }
+  // The x87 FPCR: AH and NEP as SSE's, RMode from FCW.RC as it is now (x86 01 down, 10 up are Arm's RM 10, RP 01: the two
+  // bits swapped, which `rbit` does), FZ and FIZ clear. Written always: a write of the value FPCR holds costs about 2 ns.
+  J.mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
+  J.str(TMP1.W(), STATE, FEXC_X87_FPCR);
+  J.ldrh(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, FCW));
+  J.rbit(ARMEmitter::Size::i32Bit, TMP1, TMP1);
+  J.ubfx(ARMEmitter::Size::i32Bit, TMP1, TMP1, 20, 2);
+  J.movz(ARMEmitter::Size::i32Bit, TMP2, 6);
+  J.orr(ARMEmitter::Size::i32Bit, TMP1, TMP2, TMP1, ARMEmitter::ShiftType::LSL, 22);
+  J.msr(ARMEmitter::SystemRegister::FPCR, TMP1);
   (void)J.Bind(&Open);
   fexc_x87_run = FEXC_RUN_OPEN;
 }
@@ -266,6 +268,17 @@ void Arm64JITCore::FexcX87Begin() {
 // x87 state in the guest-state page: `movz w0, #fn; svc #X87`, fn the D9 opcode's second byte. No register changes (x0 is FEX's
 // TMP1); the resident leaves NZCV and every register as they were, and admission accepts the svc only right after that movz in
 // that very instruction.
+// M2 task 4: FLDCW. `ldrh w0, [x28, #fcw]; eor w0, w0, wN; and w0, w0, #0x3f; cbnz w0, K; strh wN, [x28, #fcw]`: a word with
+// other exception masks is the resident's (K, a FLDCW stub: the state before the instruction; the masks are in the code
+// identity and unmasking a set flag makes an exception pending); else only the rounding and precision controls change.
+DEF_OP(FexcFldcw) {
+  const auto New = GetReg(IROp->C<IR::IROp_FexcFldcw>()->FCW);
+  ldrh(TMP1.W(), STATE, offsetof(FEXCore::Core::CPUState, FCW));
+  eor(ARMEmitter::Size::i32Bit, TMP1, TMP1, New);
+  and_(ARMEmitter::Size::i32Bit, TMP1, TMP1, 0x3f);
+  cbnz_OrRestart(ARMEmitter::Size::i32Bit, TMP1, FexcStub(FEXC_SITE_FLDCW, false));
+  strh(New.W(), STATE, offsetof(FEXCore::Core::CPUState, FCW));
+}
 DEF_OP(FexcX87Svc) {
   const auto Op = IROp->C<IR::IROp_FexcX87Svc>();
   movz(ARMEmitter::Size::i32Bit, TMP1, Op->Function);
@@ -1223,7 +1236,7 @@ void Arm64JITCore::FexcRecordOp(const IR::IROp_Header* IROp, IR::Ref Node, uint3
 // ---------------------------------------------------------------------------------------------
 namespace {
 constexpr bool FexcCanonical(uint64_t A) { return uint64_t(int64_t(A << 16) >> 16) == A; }
-constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
+constexpr uint32_t FexcBrkGuard = 1, FexcBrkSplit = 2, FexcBrkDivide = 3, FexcBrkAlign = 4, FexcBrkSimd = 5, FexcBrkX87 = 7, FexcBrkPending = 8, FexcBrkDenorm = 9, FexcBrkStack = 10, FexcBrkFldcw = 11;   // brk immediates (the runtime keys on the PC); 1: branch target (6 is the resident's stop word)
 } // namespace
 
 // A new guard/split site for the current guest instruction, recorded like an access site at this point (width, intent,
@@ -1247,7 +1260,7 @@ ARMEmitter::ForwardLabel* Arm64JITCore::FexcStub(uint8_t Kind, bool Link) {
   S.located = 1;
   S.access_native_offset = FEXC_NONE32;
   S.ir_op = Kind == FEXC_SITE_SPLIT ? "split" : Kind == FEXC_SITE_DIVIDE ? "divide" : Kind == FEXC_SITE_ALIGN ? "align" :
-            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : "guard";
+            Kind == FEXC_SITE_SIMD ? "simd" : Kind == FEXC_SITE_X87 ? "x87" : Kind == FEXC_SITE_PENDING ? "pending" : Kind == FEXC_SITE_DENORM ? "denorm" : Kind == FEXC_SITE_STACK ? "stack" : Kind == FEXC_SITE_FLDCW ? "fldcw" : "guard";
   const size_t Index = fexc_sites.size();
   fexc_sites.push_back(S);
   if (Link) FexcPendingLink.push_back(Index);
@@ -1283,7 +1296,8 @@ void Arm64JITCore::FexcBeforeOp(const IR::IROp_Header* IROp, IR::Ref Node) {
     const bool Other = !X87 && (FexcPrecision::SimdFPOp(IROp->Op) || Name.starts_with("Fexc") || Name.find("RoundingMode") != Name.npos);
     // 64-bit code: a run ends where its IR block does (a block of SSE code is entered with FPSR its own, unchecked).
     // 32-bit code, where x87 is the usual floating point: the run stays open across blocks, and the next IR block asks the byte.
-    if (Other || (Leaves && !fexc_bits32)) FexcX87RunEnd(*this);
+    // (FLDCW: the next x87 op starts a run under the new rounding control.)
+    if (Other || IROp->Op == IROps::OP_FEXCFLDCW || (Leaves && !fexc_bits32)) FexcX87RunEnd(*this);
     if (Leaves && fexc_bits32 && FexcX87Runs()) fexc_x87_run = FEXC_RUN_UNKNOWN;
   }
   if (fexc_push_run) {   // the aligned registers each jump carries to its target block (JIT.cpp FexcCarried)
@@ -1456,7 +1470,7 @@ void Arm64JITCore::FexcEmitStubs() {
     BindOrRestart(&Label);
     fexc_sites[Index].native_offset = uint32_t(GetCursorAddress<uint8_t*>() - CodeData.BlockBegin);
     const uint8_t K = fexc_sites[Index].kind;
-    brk(K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
+    brk(K == FEXC_SITE_FLDCW ? FexcBrkFldcw : K == FEXC_SITE_STACK ? FexcBrkStack : K == FEXC_SITE_SPLIT ? FexcBrkSplit : K == FEXC_SITE_DIVIDE ? FexcBrkDivide : K == FEXC_SITE_ALIGN ? FexcBrkAlign :
         K == FEXC_SITE_SIMD ? FexcBrkSimd : K == FEXC_SITE_X87 ? FexcBrkX87 : K == FEXC_SITE_PENDING ? FexcBrkPending : K == FEXC_SITE_DENORM ? FexcBrkDenorm : FexcBrkGuard);
   }
 }
