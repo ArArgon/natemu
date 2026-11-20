@@ -68,10 +68,13 @@ smoke = true
 
 # The replay gate (tools/fexc/README.md): the requests of one recorded boot (1 vCPU, to a busybox power-off), answered by
 # the compiler of this checkout's merge base with main and by this checkout's: every reply identical. A change that means
-# to alter 64-bit output fails here by design; such a change says so and is judged by the other suites.
+# to alter 64-bit output fails here by design; such a change says so and is judged by the other suites. The boot also
+# runs boot-i386's 32-bit program (M2 checkpoint A): the stream mixes both modes, the new compiler answers all of it
+# and the old one the 64-bit requests (replay.py, --program32).
 [suite.cases."fexc-replay"]
 argv = ["tools/fexc/replay.py", "--fexc", "{fexc}", "--old", "{fexc_base}", "--stub", "{natemu_stub}", "--runtime", "{natemu_runtime}",
-        "--kernel", "{raw}/kernel-census-20261028-01/dl/linux", "--initrd", "{raw}/kernel-census-20261028-01/dl/initrd.gz", "--out", "{out}"]
+        "--kernel", "{raw}/kernel-census-20261028-01/dl/linux", "--initrd", "{raw}/kernel-census-20261028-01/dl/initrd.gz", "--out", "{out}",
+        "--program32", "tests/boot/i386_static.asm"]
 needs = { cores = 2, perf = true }
 
 [suite.cases."fexc-skips"]

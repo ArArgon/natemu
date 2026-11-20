@@ -1,0 +1,1 @@
+test_signal: SUCCESS rc=0

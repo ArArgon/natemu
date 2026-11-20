@@ -1,0 +1,17 @@
+store to 0x10: sig 11 code 1 trap 14 err 6 addr 10 cr2 10 eip insn+0
+idiv by zero: sig 8 code 1 trap 0 err 0 addr insn+0 cr2 10 eip insn+0
+ud2: sig 4 code 2 trap 6 err 0 addr insn+0 cr2 10 eip insn+0
+int3: sig 5 code 128 trap 3 err 0 addr 0 cr2 10 eip insn+0
+single step: sig 5 code 2 trap 1 err 0 addr insn+0 cr2 10 eip insn+0
+call 0x20: sig 11 addr 20 err 14
+read of 0: sig 11 addr 0 err 4
+frame: cw 37f top 6 magic 0 mxcsr 1f80 st0 3fffc000000000000000 st1 3fff8000000000000000 xmm0 11223344
+after sigreturn: st0 2.5 st1 1 xmm0 11223399 esi 51
+nested 1234
+alternate stack 1 si_code 0 si_pid 1
+blocked a2b pending 1
+kernel trampolines: sigreturn 10 rt_sigreturn 12
+SIGCHLD code 1 status 7
+restarted read 1 'r'
+interrupted read -1 errno 4
+x87 under timer signals: same 1 signals 1

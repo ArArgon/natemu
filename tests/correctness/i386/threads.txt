@@ -1,0 +1,10 @@
+shared 160000 a32 160000 a64 7ffffffffff75300 joined 84 main-me -1
+thread 0 sum 19995 tls 1 key 1 mode 1
+thread 1 sum 8566 tls 1 key 1 mode 1
+thread 2 sum 28566 tls 1 key 1 mode 1
+thread 3 sum 17138 tls 1 key 1 mode 1
+thread 4 sum 19995 tls 1 key 1 mode 1
+thread 5 sum 8566 tls 1 key 1 mode 1
+thread 6 sum 28566 tls 1 key 1 mode 1
+thread 7 sum 17138 tls 1 key 1 mode 1
+pings 4000 round 1

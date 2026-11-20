@@ -1,0 +1,7 @@
+1 -> 1
+ffffffffffffffff -> ffffffffffffffff
+20000000000001 -> 20000000000001
+7fffffffffffffff -> 7fffffffffffffff
+123456789abcdef1 -> 123456789abcdef1
+8123456789abcdef -> 8123456789abcdef
+changed 0

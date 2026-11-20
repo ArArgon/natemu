@@ -1,0 +1,17 @@
+#!/bin/sh
+# busybox: Debian's static i386 BusyBox (busybox-static:i386, glibc linked in): its shell, pipes and child processes,
+# integer and floating-point tools. Run by run-i386.sh from an empty directory.
+B=${0%/*}/../bin/busybox
+$B uname -m
+$B sh -c 'i=0; s=0; while [ $i -lt 3000 ]; do s=$((s + i * i % 7)); i=$((i + 1)); done; echo loop $s $((0x7fffffff + 1))'
+$B seq 1 3000 | $B awk '{ s += $1 * 1.5; n++ } END { printf "awk %d %.3f %.6f %d\n", n, s, s / 7, int(s / 7) }'
+$B seq 1 20000 | $B md5sum
+$B seq 1 20000 | $B sha256sum
+$B seq 1 20000 | $B gzip | $B gunzip | $B wc -l
+$B seq 1 500 | $B sort -rn | $B sed -n '1p;250p;$p' | $B tr '\n' ' '; echo
+$B printf '%05.2f %x %s\n' 3.14159 255 str
+$B expr 123456 \* 789
+$B sh -c 'for i in 1 2 3 4; do (echo sub $i) & done; wait' | $B sort
+$B date -u -d @86400 +%Y-%m-%d
+$B sh -c 'trap "echo trapped" USR1; kill -USR1 $$; echo after'
+$B find "${0%/*}" -name '*.static' | $B wc -l

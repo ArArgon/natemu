@@ -368,11 +368,23 @@ paths baked into the image match the reference builds) and gives a folder with `
 (one `PART TEST` line per test, PART being the kernel's `part=` word) and `manifest.json` (every download with its URL
 and sha256). Every downloaded file is checked against a pin file in `tools/correctness/recipes` (`common/` for what all
 suites share). A build that finds no pin file writes the hashes it saw to the state folder's `repin/` and stops
-before building; check them and copy them into the recipes. Recipes: openssl, torture, ltp, stress, litmus, cpyt/cpyb,
-public, libm, gstr and x86st. The glibc math (`libm`) and string (`gstr`) recipes run
+before building; check them and copy them into the recipes. Recipes: openssl, torture, torture32, ltp, stress, litmus,
+cpyt/cpyb, public, libm, gstr, x86st and i386. The glibc math (`libm`) and string (`gstr`) recipes run
 glibc's own `make check` once in the container, only to record each test's exact command, which the guest then runs;
 the kernel x86 selftests' (`x86st`) list of tests not run (those that would stop the VM) is
 `tools/correctness/x86st-skip.txt`.
+
+Two campaigns of 32-bit programs compare with the x86 reference machine instead of judging each test by itself
+(`reference = "x86"` on the suite): `i386` (small 32-bit C programs built static and dynamic, Debian's i386 BusyBox and
+CPython with part of its regression tests, and 32- and 64-bit programs at once; in the gate, at 1, 2 and 4 vCPUs) and
+`torture32` (the torture suite built for i686; campaign tier). Their recipes share `tools/correctness/i386.sh` (gcc's
+32-bit multilib in the sysroot, Debian's i386 packages through a third private apt), which the `x86st` recipe also uses
+for the kernel selftests' `*_32` programs. The answers are files in the repo: each `i386` test's whole output in
+`tests/correctness/i386/`, each `torture32` program's exit status and output hash in `tests/correctness/torture32.txt`.
+To record them after changing a program or the recipe, run the suite with `TESTKIT_SEED_ANSWERS=1
+NATEMU_X86_HOST=user@host` (an x86-64 Linux machine with `zstd`, `cpio` and passwordless `sudo`): each part then runs
+there instead of under natemu, in the image's own root (`chroot`), and the verdict writes the answer files; commit
+them with the change. Such a run reports every test as unverified, never as passed.
 
 A recipe may also write `<suite>-boot.txt`, one `PART [kernel=FILE] WORD...` line per part: the kernel that part boots
 (a file it built into the image folder, instead of the stock Debian kernel) and words added to its kernel command line.
