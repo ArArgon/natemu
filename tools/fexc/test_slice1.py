@@ -1488,7 +1488,9 @@ class AfpX87(unittest.TestCase):
         buf[0x420:0x428] = st0.to_bytes(8, 'little')
         if st1 is not None: buf[0x430:0x438] = st1.to_bytes(8, 'little')
         if mem is not None: buf[0x1000:0x1000 + e] = mem.to_bytes(e, 'little')
-        return native_run(words[:i], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=6 if afp else 0)[2][:0x500]
+        out = bytearray(native_run(words[:i], buf=bytes(buf), ptrs=[(6, 0x1000)], fpcr=6 if afp else 0)[2][:0x500])
+        out[0xb0:0xb4] = bytes(4); out[0x411] = 0; out[0x414] = 0   # an x87 run's bookkeeping (hosts with AFP only: M2 task 4)
+        return bytes(out)
 
     @needs_afp_host
     def test_memory_operands_follow_the_m4_and_x86(self):

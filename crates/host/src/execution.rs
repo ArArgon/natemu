@@ -6637,6 +6637,10 @@ mod tests {
             1 << 1 | 1 << 2 | (mxcsr >> 6 & 1) | (mxcsr >> 15 & mxcsr >> 11 & 1) << 24 | rmode << 22
         }
         pub const fn x87_fpcr(fcw: u64, mxcsr: u64) -> u64 {
+            // (M2 task 4: no keyed x87 word while every x87 exception is masked: x87 runs make it from FCW.RC.)
+            if !fcw & 0x3f == 0 {
+                return 0;
+            }
             let x87 = 1 << 1 | 1 << 2 | [0, 2, 1, 3][(fcw >> 10 & 3) as usize] << 22;
             if x87 == fpcr(mxcsr) { 0 } else { x87 }
         }

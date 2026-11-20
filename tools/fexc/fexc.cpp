@@ -725,6 +725,9 @@ static int CompileRequest(const Setup& s, uint64_t rip, const uint8_t* data, siz
       ResetGlobals();
       W = w; Extent = extent; fexc_args_read = read;
       Arm(s);
+      // (ResetGlobals cleared it and Arm does not set it: before M2 task 4 a retried unit was compiled as for a host with AFP
+      // on a host without one: no NaN or DE fix-up for its x87 ops, no software flush under DAZ or FTZ alone.)
+      fexc_no_afp = !hf.SupportsAFP;
     }
     fexc_ext_conds = 0;
   }
