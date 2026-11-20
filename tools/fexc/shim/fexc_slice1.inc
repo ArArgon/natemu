@@ -94,11 +94,17 @@ inline Verdict Primary(uint8_t op, bool has_modrm, uint8_t mod, uint8_t reg) {
   // Invalid in 64-bit mode (SDM Vol.2 each: "#UD If in 64-bit mode"; opcode map "i64"): DAA, DAS, AAA, AAS, PUSHA, POPA, AAM, AAD,
   // 82 (group 1 alias); 62 is the EVEX prefix there (AVX-512 not advertised: #UD) (I10).
   case 0x27: case 0x2F: case 0x37: case 0x3F: case 0x60: case 0x61: case 0xD4: case 0xD5: case 0x82:
+    // M2, 32-bit code: FEX's DAA, DAS, AAA, AAS and AAD. PUSHA/POPA are the resident's (FEX moves ESP between their
+    // accesses, so a fault in the middle would not be precise), and so is AAM (#DE for a zero immediate). FEX decodes the
+    // group 1 alias 82 but cannot translate it ("Unknown ALU Op"): refused.
+    if (fexc_bits32) return op == 0x60 || op == 0x61 ? Sys("pusha/popa") : op == 0xD4 ? Sys("aam (#DE for a zero immediate)") :
+                            op == 0x82 ? Uns("group 1 alias 82 in 32-bit code (FEX does not translate it)") : Allow();
     return Ud("invalid in 64-bit mode (#UD)");
   // (EVEX "not built": a placeholder, unreachable while the validator refuses advertising AVX-512)
   case 0x62: return GF_AVX512F ? Uns("EVEX: AVX-512 not built") : Ud("EVEX (AVX-512 not advertised: #UD)");
   default: break;
   }
+  if (fexc_bits32 && ((op >= 0x40 && op <= 0x4F) || op == 0xD6)) return Allow();   // M2: inc/dec r32 (REX in 64-bit code), salc
   if (op >= 0x50 && op <= 0x5F) return Allow();                     // push/pop r
   if (op >= 0x70 && op <= 0x7F) return Allow(true);                 // jcc rel8
   if (op >= 0x90 && op <= 0x97) return Allow();                     // nop, xchg rax,r
@@ -560,7 +566,25 @@ inline Verdict Undefined0F38(const DecodedInst& d, bool decoded, bool has_modrm,
   return {UNSUPPORTED, false, nullptr};
 }
 
+// M2: forms of 32-bit code that are the resident's and that the rows below would take for their 64-bit meaning, from the
+// bytes (FEX's decoder fails on LES, LDS and BOUND: it knows C4, C5 and 62 only as the VEX and EVEX prefixes, which they
+// are when the next byte's top two bits are set): ARPL (63, MOVSXD in 64-bit code) checks and writes a selector's RPL, LES
+// and LDS load a segment register, BOUND raises #BR. `why` is null for every other instruction.
+inline Verdict Bits32(const DecodedInst& d) {
+  auto byte = [&](unsigned i) -> int { const uint8_t* p = fexc_guest_bytes ? fexc_guest_bytes(d.PC + i, 1) : nullptr; return p ? *p : -1; };
+  auto prefix = [](int b) { return b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67 ||
+                                   b == 0xF0 || b == 0xF2 || b == 0xF3; };
+  unsigned i = 0;
+  while (i < 15 && prefix(byte(i))) ++i;
+  const int op = byte(i), next = byte(i + 1);
+  if (op == 0x63) return Sys("arpl");
+  if ((op == 0xC4 || op == 0xC5) && next >= 0 && (next & 0xC0) != 0xC0) return Sys("les/lds");
+  if (op == 0x62 && next >= 0 && (next & 0xC0) != 0xC0) return Sys("bound");
+  return {UNSUPPORTED, false, nullptr};
+}
+
 inline Verdict Classify(const DecodedInst& d, bool decoded) {
+  if (fexc_bits32) if (Verdict v = Bits32(d); v.why) return v;
   const bool has_modrm = d.Flags & DecodeFlags::FLAG_DECODED_MODRM;
   const uint8_t mod = d.ModRM >> 6, reg = (d.ModRM >> 3) & 7;
   const uint8_t op = d.OPRaw;
@@ -720,6 +744,10 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
     return v;
   }
   if (!decoded) return Uns("did not decode");
+  // M2, 32-bit code: 0x67 selects 16-bit addressing (and SI/DI/CX for strings, LOOP and JCXZ) and 66 on a near branch a
+  // 16-bit EIP; neither is built (our string code, the site records and admission know 32- and 64-bit addresses only).
+  if (fexc_bits32 && (f & DecodeFlags::FLAG_ADDRESS_SIZE)) return Uns("16-bit addressing (0x67) in 32-bit code");
+  if (fexc_bits32 && v.branch && (f & DecodeFlags::FLAG_OPERAND_SIZE)) return Uns("16-bit near branch (66) in 32-bit code");
   // CR0.EM, CR0.TS or no CR4.OSFXSR (the host's --sse-gated): the resident raises #UD or #NM before the instruction.
   if (v.simd && fexc_sse_gated) { v = Sys("SSE gated by CR0.EM/TS or CR4.OSFXSR (#UD/#NM)"); v.simd = true; return v; }
   // I9: an MMX form (EMMS included) under CR0.EM or CR0.TS (the host's --x87-gated): #UD or #NM (the host's MMX_GATED).
@@ -800,7 +828,7 @@ inline Verdict Classify(const DecodedInst& d, bool decoded) {
 inline unsigned FexcUdLength(uint64_t rip) {
   auto byte = [&](unsigned i) -> int { const uint8_t* p = fexc_guest_bytes ? fexc_guest_bytes(rip + i, 1) : nullptr; return p ? *p : -1; };
   auto prefix = [](int b) { return b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67 ||
-                                   b == 0xF0 || b == 0xF2 || b == 0xF3 || (b >= 0x40 && b <= 0x4F); };
+                                   b == 0xF0 || b == 0xF2 || b == 0xF3 || (!fexc_bits32 && b >= 0x40 && b <= 0x4F); };
   unsigned i = 0;
   bool o16 = false;
   while (i < 15 && prefix(byte(i))) o16 |= byte(i++) == 0x66;
@@ -891,7 +919,7 @@ inline bool Follows(const DecodedInst* n, bool failed) {
   const bool rel = (primary && ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xE8 || op == 0xE9 || op == 0xEB)) ||
                    (n->FexcMap == FEXC_MAP_TWO && op >= 0x80 && op <= 0x8F);
   const uint64_t target = n->PC + n->InstSize + n->Src[0].Literal();
-  return !string && !lock_neg && (!rel || uint64_t(int64_t(target << 16) >> 16) == target);
+  return !string && !lock_neg && (!rel || fexc_bits32 || uint64_t(int64_t(target << 16) >> 16) == target);
 }
 
 inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, bool first, const DecodedInst& d, uint64_t rip,
@@ -988,7 +1016,8 @@ inline bool Cut(const Frontend::Decoder::DecodedBlockStatus status, bool last, b
       if ((d.FexcMap == FEXC_MAP_TWO || d.FexcMap == FEXC_MAP_TWO_F3) && (op == 0x52 || op == 0x53)) fexc_fp_quiet.insert(rip);
       if (d.FexcMap == FEXC_MAP_0F3A && op >= 0x08 && op <= 0x0B && !(b[d.InstSize - 1] & 8)) fexc_round_inexact.insert(rip);
     }
-    if (!rel || uint64_t(int64_t(target << 16) >> 16) == target) return false;
+    // (M2: a 32-bit target wraps at 4 GiB, FEX's own truncation, so it is never refused here.)
+    if (!rel || fexc_bits32 || uint64_t(int64_t(target << 16) >> 16) == target) return false;
     v = Uns("direct branch to a non-canonical target");
   }
   fexc_cut = {v.kind == SYSTEM ? FEXC_CUT_SYSTEM : FEXC_CUT_UNSUPPORTED, rip, d.FexcMap, d.FexcMap == FEXC_MAP_VEX ? d.FexcVexOp : d.OPRaw, d.ModRM,

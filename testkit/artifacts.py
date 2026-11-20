@@ -174,6 +174,39 @@ def fexc() -> pathlib.Path:
     return f
 
 
+def fexc_at(rev: str) -> pathlib.Path:
+    """fexc as committed at `rev` (the replay check's old compiler, tools/fexc/replay.py): built by this checkout's build.sh
+    from that revision's FEX pin and a `git archive` of its tools/fexc; keyed by both, so revisions that share them share
+    one build."""
+    root = paths.repo_root()
+    ids = [subprocess.run(['git', '-C', str(root), 'rev-parse', '--verify', '--quiet', f'{rev}:{p}'], capture_output=True, text=True)
+           for p in ('tools/fexc', 'third_party/FEX')]
+    if any(r.returncode for r in ids): raise BuildFailure(f'fexc@{rev}', 'no such revision, or no compiler in it')
+    tree, pin = (r.stdout.strip() for r in ids)
+
+    def build(out: pathlib.Path):
+        scratch = paths.cache_root() / 'build-tmp' / f'fexc-at-{tree[:12]}-{os.getpid()}'
+        shutil.rmtree(scratch, ignore_errors=True); (scratch / 'tools').mkdir(parents=True)
+        try:
+            arc = subprocess.run(['git', '-C', str(root), 'archive', '--format=tar', tree], capture_output=True, check=True)
+            subprocess.run(['tar', '-x', '-C', str(scratch / 'tools')], input=arc.stdout, check=True)
+            _run(['sh', root / 'tools/fexc/build.sh', scratch / 'build'], cwd=root,
+                 env=dict(os.environ, FEXC_PIN=pin, FEXC_TOOLS=str(scratch / 'tools')))
+            cache.clone(scratch / 'build/obj/fexc', out / 'fexc')
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+            subprocess.run(['git', '-C', str(root / 'third_party/FEX'), 'worktree', 'prune'], capture_output=True)
+
+    return cache.get_or_build('fexc-at', cache.key('fexc-at-v1', tree, pin), build) / 'fexc'
+
+
+def base_rev() -> str:
+    """The commit this checkout's work started from: its merge base with `main` (HEAD itself on main)."""
+    r = subprocess.run(['git', '-C', str(paths.repo_root()), 'merge-base', 'HEAD', 'main'], capture_output=True, text=True)
+    if r.returncode: raise BuildFailure('base revision', 'no merge base with main: ' + r.stderr.strip()[-300:])
+    return r.stdout.strip()
+
+
 def nextest() -> pathlib.Path:
     return resources.fetch('cargo-nextest')
 
@@ -347,8 +380,8 @@ def bench_image() -> pathlib.Path:
 
 
 def fex_asm() -> pathlib.Path:
-    """FEX's upstream ASM unit tests (unittests/ASM: the .asm files, Includes and the known-failure lists) at the committed
-    FEX pin, extracted from the submodule's git objects, which every worktree shares through the main repository, so a
+    """FEX's upstream ASM unit tests (unittests/ASM: the .asm files, Includes and the known-failure lists; beside it
+    unittests/32Bit_ASM, the 32-bit suite, which a case reaches as `{fex_asm}/../32Bit_ASM`) at the committed FEX pin, extracted from the submodule's git objects, which every worktree shares through the main repository, so a
     fresh worktree's empty third_party/FEX needs no fetch. Initialises the submodule only if those objects are missing."""
     if p := _pinned('fex-asm'): return pathlib.Path(p)
     try: return _fex_asm()
@@ -368,10 +401,10 @@ def _fex_asm() -> pathlib.Path:
             _run(['git', '-C', root, 'submodule', 'update', '--init', '--depth', '1', 'third_party/FEX'], cwd=root)
             gd = pathlib.Path(subprocess.run(['git', '-C', str(root / 'third_party/FEX'), 'rev-parse', '--absolute-git-dir'],
                                              capture_output=True, text=True, check=True).stdout.strip())
-        arc = subprocess.run(['git', f'--git-dir={gd}', 'archive', pin, 'unittests/ASM'], capture_output=True, check=True).stdout
+        arc = subprocess.run(['git', f'--git-dir={gd}', 'archive', pin, 'unittests/ASM', 'unittests/32Bit_ASM'], capture_output=True, check=True).stdout
         subprocess.run(['tar', 'x', '-C', str(out)], input=arc, check=True)
 
-    d = cache.get_or_build('fex-asm', hashlib.sha256(f'fex-asm {pin}'.encode()).hexdigest(), build) / 'unittests' / 'ASM'
+    d = cache.get_or_build('fex-asm', hashlib.sha256(f'fex-asm+32 {pin}'.encode()).hexdigest(), build) / 'unittests' / 'ASM'
     pin_for_run('fex-asm', str(d))
     return d
 
