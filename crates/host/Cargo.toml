@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
+iced-x86.workspace = true
 
 [features]
 # Test drivers only (crates/driver): raw writes into a vCPU's records and code cache, and the hook's reply, object and

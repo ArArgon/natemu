@@ -130,10 +130,10 @@ pub(super) fn transaction(s: &mut State, i: System) -> Result<(), Exception> {
         return Ok(());
     }
     let rep = i.prefixes & system::REP != 0;
-    let wide = if i.prefixes & system::ADDRESS32 != 0 {
-        0xffff_ffff
-    } else {
-        u64::MAX
+    let wide = match i.prefixes & (system::ADDRESS32 | system::ADDRESS16) {
+        system::ADDRESS32 => 0xffff_ffff,
+        system::ADDRESS16 => 0xffff,
+        _ => u64::MAX,
     };
     let port = c.gpr[2] & 0xffff;
     permitted(s, port, size)?;
